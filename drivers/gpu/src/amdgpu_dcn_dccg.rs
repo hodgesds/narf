@@ -289,6 +289,11 @@ impl Dccg {
     /// and must not let another client reprogram the same dividers.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
         let profile = Profile::resolve(gpu)?;
+        // DCN 3.1.5 builds dccg31, which has neither DTBCLK_P_CNTL nor
+        // OTG_PIXEL_RATE_DIV (both dccg314). Refused until that is ported.
+        if profile == Profile::Dcn315 {
+            return Err(Error::Unsupported);
+        }
         let base = profile.bank(gpu, 1, LAST_REG)?; // linux-lit: 1=mmDENTIST_DISPCLK_CNTL_BASE_IDX
                                                     // linux-ctx: reset
         Ok(Self(Engine {

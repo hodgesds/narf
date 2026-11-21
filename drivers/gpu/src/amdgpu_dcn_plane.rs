@@ -801,7 +801,7 @@ impl<I: Io> Block<I> {
                     Profile::Navi22 => 3,
                     Profile::Dcn302 => 2,
                     Profile::Dcn303 => 1,
-                    Profile::Dcn314 => 0,
+                    Profile::Dcn314 | Profile::Dcn315 => 0,
                 };
                 for unit in 0..units {
                     let shift = 8 * unit;

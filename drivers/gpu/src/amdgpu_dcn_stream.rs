@@ -388,6 +388,11 @@ impl Stream {
         instance: u8,
     ) -> Result<Self, Error> {
         let profile = Profile::resolve(gpu)?;
+        // DCN 3.1.5 builds dcn30's DIO stream encoder (DIG_FE_CNTL.DIG_START),
+        // not dcn314's (DIG_FE_ENABLE_CNTL). Refused until that is ported.
+        if profile == Profile::Dcn315 {
+            return Err(Error::Unsupported);
+        }
         if instance >= profile.streams() {
             return Err(Error::Invalid);
         }

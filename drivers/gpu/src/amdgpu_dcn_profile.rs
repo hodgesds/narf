@@ -1,5 +1,14 @@
-//! Display layouts verified against Linux dcn_3_0_0/dcn_3_1_4 headers and
-//! dcn30/dcn314 resource tables. Register compatibility is block-specific.
+//! Display layouts verified against Linux dcn_3_0_0/dcn_3_1_4/dcn_3_1_5
+//! headers and dcn30/dcn314/dcn315 resource tables. Register compatibility
+//! is block-specific.
+//!
+//! DCN 3.1.5 (Raphael) is "DCN31 proper": `dcn315_resource.c` builds hubp31,
+//! dpp3, mpc31, opp31 and hubbub31 exactly as `dcn314_resource.c` does, and
+//! the HUBP/DPP/MPC/OPP registers sit at the same offsets in both headers, so
+//! those blocks take [`Profile::Dcn315`] on their DCN 3.1.4 path. The timing
+//! generator (optc31, not optc314), DCCG (dccg31, not dccg314), DIO stream
+//! encoder (dcn30's, not dcn314's) and clock manager (SMU 13.0.5 mailbox)
+//! differ, and their constructors refuse it until each is ported.
 use crate::{amdgpu, amdgpu_dcn_clk::Error, amdgpu_discovery as ip};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8,6 +17,8 @@ pub(crate) enum Profile {
     Dcn302,
     Dcn303,
     Dcn314,
+    /// Raphael (`1002:164E`). See the module doc for which blocks admit it.
+    Dcn315,
 }
 
 #[cfg(feature = "kernel-test")]
@@ -114,6 +125,65 @@ mod tests {
         "drivers/gpu/dcn-profile",
         dcn_rdna2_constructors_follow_physical_capacity
     );
+    /// DCN 3.1.5 binds only on Raphael, admits the four blocks whose Linux
+    /// implementation and offsets it shares with DCN 3.1.4 (four pipes, as
+    /// `res_cap_dcn315`), and refuses the three whose layouts differ.
+    fn dcn315_admits_shared_blocks_and_refuses_unported_ones() -> TestResult {
+        use crate::{amdgpu, amdgpu_dcn_dccg::Dccg};
+        let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        let mut dcn = gpu.ip_blocks[0];
+        dcn.hw_id = ip::HW_ID_DCN;
+        dcn.instance = 0;
+        dcn.major = 3;
+        dcn.minor = 1;
+        dcn.revision = 5;
+        dcn.num_bases = 4;
+        dcn.base_addrs[..4].copy_from_slice(&[0, 0x1000, 0x4000, 0x9000]);
+        gpu.ip_blocks.push(dcn);
+        // Another id carrying DCN 3.1.5 is not Raphael and is not admitted.
+        if Profile::resolve(&gpu).is_ok() {
+            return TestResult::Fail("DCN 3.1.5 admitted on a non-Raphael id");
+        }
+        gpu.chip = amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, amdgpu::RAPHAEL)
+            .expect("Raphael identity");
+        let Ok(profile) = Profile::resolve(&gpu) else {
+            return TestResult::Fail("Raphael's DCN 3.1.5 did not resolve");
+        };
+        if profile != Profile::Dcn315
+            || profile.is_dcn30()
+            || profile.is_dcn314()
+            || (profile.pipes(), profile.streams(), profile.channels()) != (4, 5, 5)
+            || !profile.has_plane_power_gating()
+        {
+            return TestResult::Fail("DCN 3.1.5 resource caps are not dcn315_resource.c's");
+        }
+        let cap = Cap::bootstrap();
+        // SAFETY: constructors only validate the inert maps, never access them.
+        unsafe {
+            for index in 0..=4 {
+                let accepted = [
+                    Hubp::new(&gpu, cap, index).is_ok(),
+                    Dpp::new(&gpu, cap, index).is_ok(),
+                    Mpc::new(&gpu, cap, index).is_ok(),
+                    Opp::new(&gpu, cap, index).is_ok(),
+                ];
+                if accepted.iter().any(|ok| *ok != (index < 4)) {
+                    return TestResult::Fail("DCN 3.1.5 shared-block capacity");
+                }
+            }
+            if !matches!(Otg::new(&gpu, cap, 0), Err(Error::Unsupported))
+                || !matches!(Stream::new(&gpu, cap, 0), Err(Error::Unsupported))
+                || !matches!(Dccg::new(&gpu, cap), Err(Error::Unsupported))
+            {
+                return TestResult::Fail("an unported DCN 3.1.4 layout admitted DCN 3.1.5");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dcn-profile",
+        dcn315_admits_shared_blocks_and_refuses_unported_ones
+    );
 }
 impl Profile {
     pub fn is_dcn30(self) -> bool {
@@ -124,8 +194,15 @@ impl Profile {
             Self::Navi22 => 6,
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
-            Self::Dcn314 => 5,
+            // linux: n/a (literal in dcn315_resource.c: res_cap_dcn315.num_ddc)
+            Self::Dcn314 | Self::Dcn315 => 5,
         }
+    }
+    /// Whether this profile's timing generator, DCCG, stream encoder and
+    /// clock manager are the DCN 3.1.4 implementations. False on DCN 3.1.5,
+    /// whose blocks are the DCN31 originals at different offsets.
+    pub fn is_dcn314(self) -> bool {
+        self == Self::Dcn314
     }
     pub fn has_plane_power_gating(self) -> bool {
         self != Self::Dcn303
@@ -161,6 +238,11 @@ impl Profile {
                 Ok(Self::Dcn303)
             }
             (3, 1, 4) => Ok(Self::Dcn314), // linux: n/a (DCN 3.1.4 path)
+            // Bound to the one id that carries it, as the RDNA2 profiles are:
+            // Linux's DCN 3.1.5 case covers no other shipping part.
+            (3, 1, 5) if gpu.chip.vid == amdgpu::AMD_VENDOR && gpu.chip.did == amdgpu::RAPHAEL => {
+                Ok(Self::Dcn315)
+            }
             _ => Err(Error::Unsupported),
         }
     }
@@ -171,6 +253,8 @@ impl Profile {
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
             Self::Dcn314 => 4, // linux: n/a (DCN 3.1.4 path)
+            // linux: n/a (literal in dcn315_resource.c: res_cap_dcn315.num_timing_generator)
+            Self::Dcn315 => 4,
         }
     }
     pub fn streams(self) -> u8 {
@@ -180,6 +264,8 @@ impl Profile {
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
             Self::Dcn314 => 5, // linux: n/a (DCN 3.1.4 path)
+            // linux: n/a (literal in dcn315_resource.c: res_cap_dcn315.num_stream_encoder)
+            Self::Dcn315 => 5,
         }
     }
     pub fn bank(self, gpu: &amdgpu::AmdGpu, index: usize, last: u32) -> Result<u64, Error> {
@@ -188,6 +274,7 @@ impl Profile {
             Self::Dcn303 => &[(3, 0, 3)],
             Self::Navi22 => &[(3, 0, 0)], // linux: n/a (DCE_HWIP IP_VERSION(3, 0, 0))
             Self::Dcn314 => &[(3, 1, 4)], // linux: n/a (DCN 3.1.4 path)
+            Self::Dcn315 => &[(3, 1, 5)], // linux: n/a (DCE_HWIP IP_VERSION(3, 1, 5))
         };
         crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_DCN, versions, index, last)
             .map_err(|_| Error::Unsupported)

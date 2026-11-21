@@ -149,7 +149,9 @@ impl Routing {
     }
     fn backend(self) -> (u64, u64) {
         match self {
-            Self::Legacy(Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303) => {
+            // dcn_3_1_5_offset.h regDIG0_DIG_BE_EN_CNTL is 0x20b1, DCN30's
+            // offset, not DCN 3.1.4's 0x20b2; the stride is the same 0x100.
+            Self::Legacy(Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 | Profile::Dcn315) => {
                 (DIG_BE_EN_CNTL - 1, DIG_STRIDE)
             }
             Self::Legacy(Profile::Dcn314) => (DIG_BE_EN_CNTL, DIG_STRIDE),

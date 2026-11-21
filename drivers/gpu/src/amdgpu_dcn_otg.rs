@@ -496,6 +496,13 @@ impl Otg {
         instance: u8,
     ) -> Result<Self, Error> {
         let profile = Profile::resolve(gpu)?;
+        // DCN 3.1.5 runs optc31, not optc314: its clock and global-sync
+        // quartet (OTG_CLOCK_CONTROL..OTG_VREADY_PARAM) and static-screen
+        // control sit one dword above DCN 3.1.4's, and it has no
+        // OTG_INTERRUPT_CONTROL. Refused until that layout is ported.
+        if profile == Profile::Dcn315 {
+            return Err(Error::Unsupported);
+        }
         if instance >= profile.pipes() {
             return Err(Error::Invalid);
         }
