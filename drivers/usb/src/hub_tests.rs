@@ -23,6 +23,8 @@ struct HubFirmware {
     late_change: AtomicBool,
     /// The status-change endpoint as configured and submitted.
     status_ep: IrqSafeSpinLock<Option<(EndpointConfig, u8, u32)>>,
+    /// Ports whose C_PORT_SUSPEND is set (bit N = port N).
+    suspend_change: AtomicU16,
 }
 
 /// The downstream port whose device connects only after the first walk.
@@ -40,6 +42,7 @@ impl HubFirmware {
             late_reads: AtomicU16::new(0),
             late_change: AtomicBool::new(false),
             status_ep: IrqSafeSpinLock::new(None),
+            suspend_change: AtomicU16::new(0),
         }
     }
 }
@@ -65,6 +68,9 @@ impl HubTransport for HubFirmware {
                 if self.late_change.load(Ordering::Acquire) {
                     status |= 1 << 16;
                 }
+            }
+            if self.suspend_change.load(Ordering::Acquire) & (1 << request.index) != 0 {
+                status |= 1 << 18;
             }
             data.copy_from_slice(&status.to_le_bytes());
             return Ok(4);
@@ -120,6 +126,16 @@ impl HubTransport for HubFirmware {
                 index: LATE_PORT,
             } => {
                 self.late_change.store(false, Ordering::Release);
+                Ok(0)
+            }
+            HubRequest {
+                kind: 0x23,
+                code: 1,
+                value: C_PORT_SUSPEND,
+                index: port @ 1..=4,
+            } => {
+                self.suspend_change
+                    .fetch_and(!(1 << port), Ordering::AcqRel);
                 Ok(0)
             }
             HubRequest {
@@ -363,18 +379,21 @@ fn smoke_hub_late_connect_is_found_and_acknowledged() -> TestResult {
     let Some(hub) = single_tt_hub(&mut firmware) else {
         return TestResult::Fail("single-TT hub attach failed");
     };
-    let first = narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware));
+    let first =
+        narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware, 0));
     if !first.is_empty() {
         return TestResult::Fail("a port reported connected before its device arrived");
     }
-    let second = narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware));
+    let second =
+        narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware, 0));
     if second != [LATE_PORT as u8] {
         return TestResult::Fail("the late-connecting port was not found by the next walk");
     }
     if firmware.late_change.load(Ordering::Acquire) {
         return TestResult::Fail("C_PORT_CONNECTION was never acknowledged");
     }
-    let third = narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware));
+    let third =
+        narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware, 0));
     if third != [LATE_PORT as u8] {
         return TestResult::Fail("a connected port dropped out after its change was acknowledged");
     }
@@ -383,4 +402,37 @@ fn smoke_hub_late_connect_is_found_and_acknowledged() -> TestResult {
 kernel_test_in!(
     "drivers/usb/hub",
     smoke_hub_late_connect_is_found_and_acknowledged
+);
+
+/// A host resume ends with the hub setting C_PORT_SUSPEND (USB 2.0
+/// §11.24.2.7.2.3): on a port the host considers awake that change is
+/// only the resume completing, and the walk acknowledges it (Linux
+/// `port_event` clears C_SUSPEND); left set, the hub would report the port
+/// on its status-change endpoint every interval and the supervisor would
+/// walk it forever. A suspended port's C_PORT_SUSPEND is a remote wakeup
+/// and stays for the wake watches (`suspend_change_set`).
+fn smoke_hub_walk_acks_resume_completion_on_awake_port() -> TestResult {
+    let mut firmware = HubFirmware::new(true);
+    let Some(hub) = single_tt_hub(&mut firmware) else {
+        return TestResult::Fail("single-TT hub attach failed");
+    };
+    firmware
+        .suspend_change
+        .store((1 << 3) | (1 << 4), Ordering::Release);
+    let suspended = 1u64 << 4;
+    let _ = narf_scheduler::block_on_spin(
+        hub.connected_downstream_ports_transport(&firmware, suspended),
+    );
+    let left = firmware.suspend_change.load(Ordering::Acquire);
+    if left & (1 << 3) != 0 {
+        return TestResult::Fail("an awake port's C_PORT_SUSPEND was left set");
+    }
+    if left & (1 << 4) == 0 {
+        return TestResult::Fail("a suspended port's remote-wakeup change was cleared");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/hub",
+    smoke_hub_walk_acks_resume_completion_on_awake_port
 );
