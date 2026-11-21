@@ -430,7 +430,7 @@ fn raphael_gpu() -> AmdGpu {
         ip(d::HW_ID_NBIF, (7, 7, 1), [0, 0, 0x3000]),
         ip(d::HW_ID_DCN, (3, 1, 5), [0, 0, 0x4000]),
         ip(d::HW_ID_HDP, (5, 2, 1), [0x5000, 0, 0]),
-        ip(d::HW_ID_GC, (10, 3, 6), [0, 0, 0]),
+        ip(d::HW_ID_GC, (10, 3, 6), [0x6000, 0x7000, 0]),
     ];
     gpu
 }
@@ -453,6 +453,8 @@ fn psp_raphael_layout_uses_mp0_segment_zero_and_dcn315() -> TestResult {
                 (0x4000 + 0x477) * 4,
             )
         || layout.invalidate_reg.is_some()
+        // CP_STAT (GC index 0) and RLC_RLCS_BOOTLOAD_STATUS (GC index 1).
+        || layout.gfx_status_regs != Some(((0x6000 + 0xf40) * 4, (0x7000 + 0x4e8d) * 4))
     {
         return TestResult::Fail("Raphael PSP banks");
     }

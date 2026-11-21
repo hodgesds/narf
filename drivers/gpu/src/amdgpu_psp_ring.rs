@@ -527,6 +527,15 @@ impl Kind {
             _ => None,
         }
     }
+    /// The RDNA2 graphics set this ring may load: a discrete profile, or
+    /// Raphael's. Unlike [`Self::rdna2_profile`] this is not the discrete
+    /// test, so it gates only the graphics upload and the RLC boot wait.
+    fn graphics_profile(self) -> Option<&'static crate::amdgpu_rdna2::Profile> {
+        match self {
+            Self::Raphael => Some(&crate::amdgpu_rdna2::RAPHAEL),
+            _ => self.rdna2_profile(),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmcState {
@@ -560,6 +569,9 @@ struct Session<I: Io> {
     tmr: Option<Reservation>,
     tmr_ready: bool,
     smc_state: SmcState,
+    /// An APU's PMFW is BIOS-resident (`smu_v13_0_5_ppt.c` loads no
+    /// microcode): no SMC upload is possible, and none is awaited.
+    smc_resident: bool,
     gfx_state: GfxLoadState,
     gfx_status: Option<GfxBootStatus>,
     media_firmware: MediaFirmware,
@@ -887,7 +899,10 @@ impl Layout {
         if kind.rdna2_profile().is_some() && (ip.major, ip.minor) != (5, 0) {
             return Err(Error::Unsupported);
         }
-        let gfx_status_regs = if let Some(profile) = kind.rdna2_profile() {
+        // gfx_v10_0_wait_for_rlc_autoload_complete reads CP_STAT and
+        // RLC_RLCS_BOOTLOAD_STATUS from gc_10_3_0_offset.h on every GC 10.3
+        // part, Raphael's 10.3.6 included.
+        let gfx_status_regs = if let Some(profile) = kind.graphics_profile() {
             let r = crate::amdgpu_rdna2::PSP_GC_REGISTERS;
             let cp = bank(
                 gpu,
@@ -1137,6 +1152,7 @@ impl Psp {
                 tmr: None,
                 tmr_ready: false,
                 smc_state: SmcState::Absent,
+                smc_resident: kind == Kind::Raphael,
                 gfx_state: GfxLoadState::Absent,
                 gfx_status: None,
                 media_firmware: MediaFirmware::default(),
@@ -1334,13 +1350,14 @@ impl Psp {
         let images = firmware.images().map_err(|_| Error::Invalid)?;
         self.session.load_gfx(&images).await
     }
-    /// Submit this RDNA2 ASIC's prepared graphics set after SMC/TMR setup.
+    /// Submit this RDNA2 ASIC's prepared graphics set after TMR setup and the
+    /// SMC load (or, on Raphael, with its BIOS-resident PMFW).
     /// Acceptance is not proof of working engines or initialized queues.
     pub async fn load_gfx_rdna2(
         &mut self,
         firmware: &crate::amdgpu_gfx_navi22::Firmware,
     ) -> Result<(), Error> {
-        if self.kind.rdna2_profile() != Some(firmware.profile()) {
+        if self.kind.graphics_profile() != Some(firmware.profile()) {
             return Err(Error::Unsupported);
         }
         let images = firmware.images().map_err(|error| {
@@ -1460,7 +1477,7 @@ impl Psp {
     /// Observe CP idle and RLC boot completion for the accepted RDNA2 autoload.
     /// Performs no GC writes and does not advertise acceleration.
     pub async fn wait_gfx_boot_rdna2(&mut self) -> Result<GfxBootStatus, Error> {
-        if self.kind.rdna2_profile().is_none() {
+        if self.kind.graphics_profile().is_none() {
             return Err(Error::Unsupported);
         }
         self.session.wait_gfx_boot().await
@@ -1604,7 +1621,14 @@ impl<I: Io> Session<I> {
         self.release_payload();
         result
     }
+    /// Whether the SMU firmware the graphics autoload needs is running.
+    fn smc_ready(&self) -> bool {
+        self.smc_resident || self.smc_state == SmcState::Loaded
+    }
     async fn load_smc(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.smc_resident {
+            return Err(Error::Unsupported);
+        }
         if self.smc_state != SmcState::Absent
             || !self.tmr_ready
             || self.engine.state != State::Ready
@@ -1625,6 +1649,9 @@ impl<I: Io> Session<I> {
     /// LOAD_IP_FW after LOAD_TOC/TMR reservation but before SETUP_TMR, which
     /// follows immediately (psp_hw_start).
     async fn load_smc_centralized(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.smc_resident {
+            return Err(Error::Unsupported);
+        }
         if self.smc_state != SmcState::Absent
             || self.tmr.is_none()
             || self.tmr_ready
@@ -1651,7 +1678,7 @@ impl<I: Io> Session<I> {
     ) -> Result<(), Error> {
         use crate::amdgpu_gfx_firmware::Source;
         if self.gfx_state != GfxLoadState::Absent
-            || self.smc_state != SmcState::Loaded
+            || !self.smc_ready()
             || !self.tmr_ready
             || self.engine.state != State::Ready
             || self.payload.is_some()
@@ -1861,7 +1888,7 @@ impl<I: Io> Session<I> {
         if self.gfx_state != GfxLoadState::Accepted
             || self.engine.state != State::Ready
             || !self.tmr_ready
-            || self.smc_state != SmcState::Loaded
+            || !self.smc_ready()
         {
             return Err(Error::Busy);
         }

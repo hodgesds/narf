@@ -20,6 +20,37 @@ pub(crate) fn fixture_for(profile: &'static crate::amdgpu_rdna2::Profile) -> Fir
         ..fixture()
     }
 }
+/// Raphael's set: Navi22's synthetic containers, with the DMCUB declaring
+/// DCN 3.1 as `dcn_3_1_5_dmcub.bin` does.
+pub(crate) fn raphael_fixture() -> Firmware {
+    let mut firmware = fixture_for(&crate::amdgpu_rdna2::RAPHAEL);
+    let dmcub = Source::ORDER
+        .iter()
+        .position(|s| *s == Source::Dmcub)
+        .unwrap();
+    crate::amdgpu_gfx_firmware::tests::put(firmware.bytes[dmcub].as_mut().unwrap(), 12, 0x10003);
+    firmware
+}
+/// DMCUB's container identity follows the profile's DCN: Raphael's 3.1 blob
+/// parses under Raphael only, and a DCN 3.0 blob only under a discrete part.
+fn rdna2_dmcub_container_identity_follows_the_profile_dcn() -> TestResult {
+    if raphael_fixture().images().is_err() || fixture().images().is_err() {
+        return TestResult::Fail("matching DMCUB identity refused");
+    }
+    let swapped = Firmware {
+        profile: &crate::amdgpu_rdna2::NAVI22,
+        ..raphael_fixture()
+    };
+    let dcn30_on_raphael = fixture_for(&crate::amdgpu_rdna2::RAPHAEL);
+    if swapped.images().is_ok() || dcn30_on_raphael.images().is_ok() {
+        return TestResult::Fail("DMCUB accepted for another DCN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/rdna2",
+    rdna2_dmcub_container_identity_follows_the_profile_dcn
+);
 fn navi22_graphics_set_requires_all_images_except_missing_mec2() -> TestResult {
     for i in 0..Source::ORDER.len() {
         let mut firmware = fixture();

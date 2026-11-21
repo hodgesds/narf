@@ -63,6 +63,46 @@ fn check_rdna2_device(gpu: &AmdGpu) -> Result<&'static crate::amdgpu_rdna2::Prof
     vcn_instances(gpu)?;
     Ok(profile)
 }
+/// Raphael's preparation gate: the exact APU profile, then every IP its
+/// containers belong to — GC 10.3.6, MP1 13.0.5, SDMA 5.2.6, one VCN 3.1.2
+/// and DCN 3.1.5. Like [`check_rdna2_device`] this authorizes no hardware path.
+fn check_raphael_device(gpu: &AmdGpu) -> Result<&'static crate::amdgpu_rdna2::Profile, Error> {
+    let profile = crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+        .ok_or(Error::Unsupported)?;
+    for (id, versions) in [
+        (
+            discovery::HW_ID_GC,
+            core::slice::from_ref(&profile.gc_version),
+        ),
+        (
+            discovery::HW_ID_MP1,
+            core::slice::from_ref(&profile.psp_version),
+        ),
+        (
+            discovery::HW_ID_SDMA0,
+            core::slice::from_ref(&profile.sdma_version),
+        ),
+        (discovery::HW_ID_VCN, profile.vcn_versions),
+        (
+            discovery::HW_ID_DCN,
+            core::slice::from_ref(&profile.dcn_version),
+        ),
+    ] {
+        crate::amdgpu_psp_ring::bank(gpu, id, versions, 0, 0).map_err(|_| Error::Unsupported)?;
+    }
+    // Linux counts VCN instances from discovery
+    // (`amdgpu_discovery_reg_base_init`). This preparation is bounded to the
+    // single VCN 3.1.2 instance 0 and refuses any other shape rather than
+    // guess which payload a second instance would take.
+    let mut vcn = gpu
+        .ip_blocks
+        .iter()
+        .filter(|ip| ip.hw_id == discovery::HW_ID_VCN);
+    match (vcn.next(), vcn.next()) {
+        (Some(ip), None) if ip.instance == 0 => Ok(profile),
+        _ => Err(Error::Unsupported),
+    }
+}
 /// Discovered VCN instances as a mask (bit i = instance i). Navy Flounder
 /// publishes VCN 3.0.0 (instance 0) and usually 3.0.1 (instance 1); Linux
 /// keys firmware and IP selection on instance 0's version only. Duplicate or
@@ -186,6 +226,29 @@ impl Firmware {
             vcn,
         })
     }
+    /// Prepare Raphael's set: the same UCODE_ID order and container formats
+    /// (`gfx_v10_0`, `sdma_v5_2`, `vcn_v3_0`, DCN31 DMCUB) under its own names.
+    /// Touches no hardware and authorizes no load.
+    pub fn open_raphael(
+        gpu: &AmdGpu,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, Error> {
+        let profile = check_raphael_device(gpu)?;
+        let mut bytes = core::array::from_fn(|_| None);
+        for (slot, source) in bytes.iter_mut().zip(Source::ORDER) {
+            *slot = optional(
+                source,
+                authority
+                    .invoke(Open(source, profile))
+                    .map_err(|_| Error::Revoked)?,
+            )?;
+        }
+        Ok(Self {
+            profile,
+            bytes,
+            vcn: 1,
+        })
+    }
     /// Drop harvested VCN instances (`adev->vcn.harvest_config`) before any
     /// device I/O. With both harvested Linux disables the VCN block, so no
     /// VCN payload is sent; the image itself is still validated.
@@ -210,7 +273,8 @@ impl Firmware {
         let mut images = [None; Source::ORDER.len()];
         for ((slot, bytes), source) in images.iter_mut().zip(&self.bytes).zip(Source::ORDER) {
             if let Some(bytes) = bytes {
-                let mut image = Image::parse(source, bytes).map_err(|e| Error::Image(source, e))?;
+                let mut image = Image::parse_for(source, bytes, self.profile)
+                    .map_err(|e| Error::Image(source, e))?;
                 if source == Source::Vcn {
                     image = image
                         .for_vcn_instances(self.vcn)

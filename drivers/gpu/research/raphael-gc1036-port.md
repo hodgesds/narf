@@ -87,10 +87,22 @@ as now.
 
 ## Order of work
 
-1. Identity: `amdgpu_rdna2::RAPHAEL`, a profile that `for_pci_id` never
-   returns, so no discrete path admits it; `golden_settings_gc_10_3_6`.
-2. PSP: load the graphics bundle on the PSP 13.0.5 ring and wait for the RLC
-   autoload.
+1. ~~Identity: `amdgpu_rdna2::RAPHAEL`, a profile that `for_pci_id` never
+   returns, so no discrete path admits it; `golden_settings_gc_10_3_6`~~
+   (done).
+2. ~~PSP: load the graphics bundle on the PSP 13.0.5 ring and wait for the RLC
+   autoload~~ (done).
+   - `gfx::Firmware::open_raphael` prepares the set under Raphael's names,
+     bounded to GC 10.3.6, MP1 13.0.5, SDMA 5.2.6, DCN 3.1.5 and one VCN
+     3.1.2 instance.
+   - Raphael's containers match Navi22's formats: CP and RLC declare GC 10.3,
+     SDMA 5.2, VCN 3. The RLC header is v2.2 where Navi22's is v2.4.
+   - `dcn_3_1_5_dmcub.bin` declares DCN 3.1, so the DMCUB identity is now
+     checked against the profile's DCN rather than DCN 3.0's.
+   - The Raphael PSP session treats PMFW as resident: an SMC upload is refused,
+     and the graphics set goes up after the TMR alone. The RLC autoload wait
+     reads GC 10.3's `CP_STAT` and `RLC_RLCS_BOOTLOAD_STATUS`.
+   - Nothing calls the load yet. That is the coordinator (step 8).
 3. SMU 13.0.5 graphics mailbox over SMN: versions, the driver interface check,
    GFXOFF control, VCN/JPEG power.
 4. NBIO 7.2/7.7: doorbell apertures, `ih_control`, the HDP flush register.
