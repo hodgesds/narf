@@ -2448,6 +2448,80 @@ fn smoke_abi_fsx2_mount_setattr_oversize_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_setattr_oversize_neg);
 
+/// `mount_setattr(fd, "", AT_EMPTY_PATH | AT_RECURSIVE, attr)` changes the
+/// mount the fd names AND every mount below it: `mount_setattr_prepare` and
+/// `mount_setattr_commit` walk `for (m = mnt; m; m = next_mnt(m, mnt))`
+/// when AT_RECURSIVE is set, and only the named mount without it.
+///
+/// bubblewrap 0.13 makes a whole `--bind` tree nosuid exactly this way; the
+/// flag reached the top mount alone, so every submount of the sandbox root
+/// still honoured set-user-ID binaries.
+fn smoke_abi_fsx2_mount_setattr_recursive_reaches_submounts() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_PATH: u64 = 0o10000000;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        const AT_RECURSIVE: u64 = 0x8000;
+        const MOUNT_ATTR_NOSUID: u64 = 0x2;
+        const MOUNT_ATTR_NODEV: u64 = 0x4;
+        let nosuid = narf_filesystem::mnt_flags::NOSUID;
+        let nodev = narf_filesystem::mnt_flags::NODEV;
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        if mount_fstype(b"/abi-msa-rec\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-msa-rec/sub".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-msa-rec/sub\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-msa-rec/sub/deep".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-msa-rec/sub/deep\0", b"tmpfs\0") != Some(0)
+        {
+            return Err("the tmpfs tree under /abi-msa-rec was not mounted");
+        }
+        let setattr = |path: &core::ffi::CStr, flags: u64, set: u64| -> Option<i64> {
+            let fd = call_open(path.as_ptr() as u64, O_PATH).filter(|fd| *fd >= 0)? as u64;
+            let attr = [set, 0u64, 0, 0];
+            let r = call(
+                Syscall::MountSetattr.raw(),
+                SyscallArgs {
+                    arg0: fd,
+                    arg1: c"".as_ptr() as u64,
+                    arg2: AT_EMPTY_PATH | flags,
+                    arg3: attr.as_ptr() as u64,
+                    arg4: 32,
+                    arg5: 0,
+                },
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            r
+        };
+        let flags = |path: &str| crate::handlers::current_mount_flags_exact(path).unwrap_or(0);
+        if setattr(c"/abi-msa-rec", AT_RECURSIVE, MOUNT_ATTR_NOSUID) != Some(0) {
+            return Err("mount_setattr(AT_EMPTY_PATH|AT_RECURSIVE) failed");
+        }
+        for path in ["/abi-msa-rec", "/abi-msa-rec/sub", "/abi-msa-rec/sub/deep"] {
+            if flags(path) & nosuid == 0 {
+                return Err("AT_RECURSIVE did not make every mount of the tree nosuid");
+            }
+        }
+        // Without AT_RECURSIVE only the named mount changes.
+        if setattr(c"/abi-msa-rec/sub", 0, MOUNT_ATTR_NODEV) != Some(0) {
+            return Err("mount_setattr(AT_EMPTY_PATH) failed");
+        }
+        if flags("/abi-msa-rec/sub") & nodev == 0 {
+            return Err("mount_setattr did not make the named mount nodev");
+        }
+        if flags("/abi-msa-rec/sub/deep") & nodev != 0 || flags("/abi-msa-rec") & nodev != 0 {
+            return Err("mount_setattr without AT_RECURSIVE changed another mount");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mount-setattr-rec",
+    smoke_abi_fsx2_mount_setattr_recursive_reaches_submounts
+);
+
 // ── mount: fstype breadth for systemd's early-boot pseudo-filesystems ──
 //
 // systemd mounts many pseudo-filesystems (proc, sysfs, tmpfs, securityfs,
