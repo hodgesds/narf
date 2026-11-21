@@ -9508,3 +9508,396 @@ kernel_test_in!(
     "drivers/input",
     smoke_synaptics_bad_byte_drops_partial_packet
 );
+
+// ── Synaptics AGM / multi-finger (#2250) ────────────────────────────────────
+//
+// Fixtures built from Linux `drivers/input/mouse/synaptics.c`
+// (`synaptics_set_advanced_gesture_mode`, `synaptics_parse_agm`,
+// `synaptics_process_packet`, `synaptics_report_semi_mt_data`),
+// never from impl constants. Packet vectors are worked out from
+// the Linux formulas in the test comments, and the wire bytes
+// from the sliced-command encoding pinned by the #1675 test.
+
+fn smoke_synaptics_agm_mode_wire_sequence() -> TestResult {
+    use crate::psmouse;
+    // Same pad as the #1675 wire test, but a multifinger AGM pad:
+    // caps 0xC04702 (extended, 4 ext requests, submodel 0x47,
+    // multifinger bit 1), ext caps 0x0c 0x080000 (ADV_GESTURE
+    // bit 19).
+    let replies = [
+        0x05, 0x47, 0x04, // detect: byte 1 == 0x47 → Synaptics
+        0x05, 0x47, 0x04, // identify: minor 5, major 4
+        0x01, 0x00, 0x80, // model: sensor 1, NEWABS (bit 7)
+        0x00, 0x07, 0x05, // firmware 0x000705
+        0x3B, 0x47, 0x00, // modes: board id 0xE47
+        0xC0, 0x47, 0x02, // caps: extended, 4 ext requests, multifinger
+        0x00, 0x00, 0x00, // ext caps: none
+        0x08, 0x00, 0x00, // ext caps 0x0c: ADV_GESTURE
+        85, 0x80, 94, // resolution: 85 x 94 units/mm
+    ];
+    let mut fake = FakePs2::new(&replies);
+    let hw = match psmouse::synaptics_enable_absolute(&mut fake, psmouse::SYNAPTICS_RATE) {
+        Ok(hw) => hw,
+        Err(_e) => return TestResult::Fail("enablement must succeed on an AGM pad"),
+    };
+    if hw.mode != 0xC5 || hw.ext_cap_0c != 0x080000 || !psmouse::synaptics_has_agm(hw.ext_cap_0c) {
+        return TestResult::Fail("AGM pad must decode ext_cap_0c + has_agm");
+    }
+    // Exact wire: the #1675 sequence, then the AGM mode set
+    // (Linux `synaptics_set_advanced_gesture_mode`): sliced
+    // `SYN_QUE_MODEL` (0x03) + `SETRATE(0xC8)`.
+    let mut want = alloc::vec::Vec::new();
+    for _ in 0..4 {
+        want.extend_from_slice(&[0xE8, 0x00]);
+    }
+    want.push(0xE9);
+    for q in [0x00, 0x03, 0x0a, 0x01, 0x02, 0x09, 0x0c, 0x08] {
+        want.extend_from_slice(&syn_query_wire(q));
+    }
+    want.extend_from_slice(&syn_query_wire(0xC5)[..9]);
+    want.extend_from_slice(&[0xF3, 0x14]);
+    want.extend_from_slice(&syn_query_wire(0x03)[..9]);
+    want.extend_from_slice(&[0xF3, 0xC8]);
+    if fake.sent != want {
+        return TestResult::Fail("AGM wire sequence must append sliced 0x03 + SETRATE 0xC8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_agm_mode_wire_sequence);
+
+fn smoke_synaptics_agm_mode_failure_is_fatal() -> TestResult {
+    use crate::psmouse;
+    // Same AGM pad; the first AGM-mode-set byte (send #101: the
+    // `0xE6` of the sliced `SYN_QUE_MODEL`) fails, so enablement
+    // must fail with `ModeSet` and re-assert mode 0
+    // (sliced 0x00 + `SETRATE(0x14)`) as its last 11 wire bytes.
+    let replies = [
+        0x05, 0x47, 0x04, 0x05, 0x47, 0x04, 0x01, 0x00, 0x80, 0x00, 0x07, 0x05, 0x3B, 0x47, 0x00,
+        0xC0, 0x47, 0x02, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 85, 0x80, 94,
+    ];
+    let mut fake = FakePs2::failing(&replies, 101);
+    match psmouse::synaptics_enable_absolute(&mut fake, psmouse::SYNAPTICS_RATE) {
+        Err(psmouse::SynapticsEnableError::ModeSet) => {}
+        _ => return TestResult::Fail("AGM mode-set failure must be ModeSet"),
+    }
+    let mut want_tail = alloc::vec::Vec::new();
+    want_tail.extend_from_slice(&syn_query_wire(0x00)[..9]);
+    want_tail.extend_from_slice(&[0xF3, 0x14]);
+    if fake.sent.len() < 11 || fake.sent[fake.sent.len() - 11..] != want_tail[..] {
+        return TestResult::Fail("AGM failure must end with the mode-0 re-assert");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_agm_mode_failure_is_fatal);
+
+fn smoke_synaptics_agm_parse_and_slots() -> TestResult {
+    use crate::psmouse::{
+        parse_synaptics_agm, syn_cap_adv_gesture, syn_cap_image_sensor, synaptics_has_agm,
+        synaptics_num_fingers, synaptics_semi_mt_slots, SynapticsAgmState, SynapticsHwState,
+    };
+    // `synaptics_has_agm`: ADV_GESTURE (bit 19) or IMAGE_SENSOR
+    // (bit 11) in ext_cap_0c; neither → false.
+    if !synaptics_has_agm(0x080000)
+        || !synaptics_has_agm(0x000800)
+        || synaptics_has_agm(0)
+        || !syn_cap_adv_gesture(0x080000)
+        || !syn_cap_image_sensor(0x000800)
+    {
+        return TestResult::Fail("has_agm must be adv_gesture || image_sensor");
+    }
+    // AGM gesture packet (Linux `synaptics_parse_agm`, type 1):
+    // [0x84, 0xDC, 0xD0, 0xF0, 0x75, 0x12] — type
+    // `(0x12 & 0x30) >> 4 == 1`; x = (((0x75 & 0x0f) << 8) |
+    // 0xDC) << 1 = 3000, y = (((0x75 & 0xf0) << 4) | 0xD0) << 1
+    // = 4000, z = ((0xF0 & 0x30) | (0x12 & 0x0f)) << 1 = 100.
+    let mut st = SynapticsAgmState::new();
+    parse_synaptics_agm(&[0x84, 0xDC, 0xD0, 0xF0, 0x75, 0x12], 2, &mut st);
+    if st.agm.x != 3000 || st.agm.y != 4000 || st.agm.z != 100 || st.agm.w != 2 {
+        return TestResult::Fail("gesture packet must decode x=3000 y=4000 z=100 w=2");
+    }
+    if st.agm_count != 0 {
+        return TestResult::Fail("gesture packet must not touch agm_count");
+    }
+    // AGM-CONTACT packet (type 2): [0x84, 0x03, 0x00, 0xC0, 0x00,
+    // 0x20] — type `(0x20 & 0x30) >> 4 == 2`; count is `buf[1]`.
+    parse_synaptics_agm(&[0x84, 0x03, 0x00, 0xC0, 0x00, 0x20], 2, &mut st);
+    if st.agm_count != 3 {
+        return TestResult::Fail("AGM-CONTACT packet must set agm_count=3");
+    }
+    if st.agm.x != 3000 || st.agm.y != 4000 {
+        return TestResult::Fail("AGM-CONTACT packet must not touch the gesture state");
+    }
+    // Unknown AGM type (type 0) is ignored whole.
+    parse_synaptics_agm(&[0x84, 0x00, 0x00, 0xC0, 0x00, 0x00], 2, &mut st);
+    if st.agm_count != 3 || st.agm.x != 3000 {
+        return TestResult::Fail("unknown AGM type must be ignored");
+    }
+    // Finger count (Linux `synaptics_process_packet`): the
+    // multifinger caps word is extended (bit 23) + multifinger
+    // (bit 1).
+    let sgm = |w: u8| SynapticsHwState {
+        x: 1000,
+        y: 2000,
+        z: 50,
+        w,
+        left: false,
+        right: false,
+    };
+    if synaptics_num_fingers(&sgm(0), 0x800002) != 2
+        || synaptics_num_fingers(&sgm(1), 0x800002) != 3
+        || synaptics_num_fingers(&sgm(2), 0x800002) != 1
+        || synaptics_num_fingers(&sgm(5), 0x800002) != 1
+    {
+        return TestResult::Fail("w 0/1/2/5 must give 2/3/1/1 fingers on a multifinger pad");
+    }
+    if synaptics_num_fingers(&sgm(1), 0x800000) != 1 || synaptics_num_fingers(&sgm(1), 0) != 1 {
+        return TestResult::Fail("w=1 without multifinger/extended caps must give 1 finger");
+    }
+    if synaptics_num_fingers(
+        &SynapticsHwState {
+            x: 1000,
+            y: 2000,
+            z: 0,
+            w: 1,
+            left: false,
+            right: false,
+        },
+        0x800002,
+    ) != 0
+        || synaptics_num_fingers(
+            &SynapticsHwState {
+                x: 1,
+                y: 2000,
+                z: 50,
+                w: 1,
+                left: false,
+                right: false,
+            },
+            0x800002,
+        ) != 0
+    {
+        return TestResult::Fail("z=0 or x<=1 must give 0 fingers");
+    }
+    // Semi-MT slots (Linux `synaptics_report_semi_mt_data`): SGM
+    // (1000, 2000) + AGM (3000, 4000), 3 fingers → slot 0 is the
+    // min corner (1000, 5856-2000=3856), slot 1 the max corner
+    // (3000, 5856-4000=1856). One finger → slot 0 only; none →
+    // neither.
+    let slots = synaptics_semi_mt_slots(&sgm(1), &st.agm, 3);
+    if !slots[0].active
+        || slots[0].x != 1000
+        || slots[0].y != 3856
+        || !slots[1].active
+        || slots[1].x != 3000
+        || slots[1].y != 1856
+    {
+        return TestResult::Fail("3-finger slots must be the min/max corners");
+    }
+    let slots = synaptics_semi_mt_slots(&sgm(1), &st.agm, 1);
+    if !slots[0].active || slots[0].x != 1000 || slots[0].y != 3856 || slots[1].active {
+        return TestResult::Fail("1-finger slots must be SGM only");
+    }
+    let slots = synaptics_semi_mt_slots(&sgm(1), &st.agm, 0);
+    if slots[0].active || slots[1].active {
+        return TestResult::Fail("0-finger slots must both be inactive");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_agm_parse_and_slots);
+
+fn smoke_synaptics_agm_irq_path() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, abs,
+        btn::{BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP},
+        cursor_abs_px,
+        evdev::{key, EventType, ROUTER},
+        init_global_ring, pop_global, set_scanout_dims, InputEvent, TouchState,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    set_scanout_dims(1024, 768);
+    let (id, _node, reader) = synaptics_attach_evdev_for_test();
+    // AGM multifinger pad: NEWABS, extended + multifinger caps,
+    // ADV_GESTURE in ext_cap_0c.
+    let hw = crate::psmouse::SynapticsHw {
+        identity: 0x054704,
+        model_id: 0x010080,
+        capabilities: 0xC04702,
+        ext_cap_0c: 0x080000,
+        newabs: true,
+        ..crate::psmouse::SynapticsHw::default()
+    };
+    i8042_mouse::set_synaptics_agm_for_test(&hw);
+
+    // AGM gesture packet first: it updates the second-contact
+    // state and produces no frame at all — no evdev events, no
+    // ring events.
+    for b in [0x84, 0xDC, 0xD0, 0xF0, 0x75, 0x12] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    if !drain_evdev(&reader).is_empty() || pop_global().is_some() {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("AGM gesture packet must emit nothing");
+    }
+
+    // SGM packet: x=1000, y=2000 (→ 3856 inverted), z=50, w=1,
+    // left — 3 fingers on this pad, so both semi-MT slots go
+    // live: slot 0 (1000, 3856), slot 1 (3000, 1856).
+    for b in [0x81, 0x73, 50, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_MT_SLOT, 0)
+        && has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 0)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_X, 1000)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 3856)
+        && has(EventType::Abs, abs::ABS_MT_SLOT, 1)
+        && has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 1)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_X, 3000)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 1856)
+        && has(EventType::Abs, abs::ABS_X, 1000)
+        && has(EventType::Abs, abs::ABS_Y, 3856)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 50)
+        && has(EventType::Key, key::BTN_TOUCH, 1)
+        && has(EventType::Key, key::BTN_LEFT, 1)
+        && has(EventType::Key, key::BTN_TOOL_FINGER, 0)
+        && has(EventType::Key, BTN_TOOL_DOUBLETAP, 0)
+        && has(EventType::Key, BTN_TOOL_TRIPLETAP, 1)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_PRESSURE)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 2;
+    if !ok {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("3-finger AGM frame missing slots/pressure/tool keys/2xSYN");
+    }
+    // Ring: two Touch Down events, one per slot.
+    match (pop_global(), pop_global()) {
+        (Some(InputEvent::Touch(t0)), Some(InputEvent::Touch(t1)))
+            if t0.slot == 0
+                && t0.state == TouchState::Down
+                && t0.x == 1000
+                && t0.y == 3856
+                && t1.slot == 1
+                && t1.state == TouchState::Down
+                && t1.x == 3000
+                && t1.y == 1856 => {}
+        _ => {
+            ROUTER.unregister_device(id);
+            i8042_mouse::__reset_for_test();
+            return TestResult::Fail("ring must carry two Touch Down events");
+        }
+    }
+    // First finger-down sample: cursor publishes at the SGM
+    // position, no legacy delta yet.
+    if cursor_abs_px() != Some((0, 618)) || i8042_mouse::take_rel_delta() != (0, 0) {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("AGM frame must still drive the legacy bridge from SGM");
+    }
+
+    // Finger lifts (z=0): both slots release (tracking -1),
+    // touch/left release, pressure 0, tool keys all 0, no X/Y.
+    for b in [0x80, 0x73, 0, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let n_released = events
+        .iter()
+        .filter(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_TRACKING_ID && e.value == -1)
+        .count();
+    let ok = n_released == 2
+        && has(EventType::Key, key::BTN_TOUCH, 0)
+        && has(EventType::Key, key::BTN_LEFT, 0)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 0)
+        && has(EventType::Key, key::BTN_TOOL_FINGER, 0)
+        && has(EventType::Key, BTN_TOOL_TRIPLETAP, 0)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && (e.code == abs::ABS_X || e.code == abs::ABS_Y))
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 2;
+    if !ok {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        return TestResult::Fail("lift frame must release both slots without X/Y");
+    }
+    match (pop_global(), pop_global()) {
+        (Some(InputEvent::Touch(t0)), Some(InputEvent::Touch(t1)))
+            if t0.slot == 0
+                && t0.state == TouchState::Up
+                && t0.x == 1000
+                && t0.y == 3856
+                && t1.slot == 1
+                && t1.state == TouchState::Up
+                && t1.x == 3000
+                && t1.y == 1856 => {}
+        _ => {
+            ROUTER.unregister_device(id);
+            i8042_mouse::__reset_for_test();
+            return TestResult::Fail("ring must carry two Touch Up events at last positions");
+        }
+    }
+    ROUTER.unregister_device(id);
+    i8042_mouse::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_agm_irq_path);
+
+fn smoke_synaptics_w2_without_agm_is_single_finger() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, abs,
+        evdev::{key, EventType, ROUTER},
+        init_global_ring,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    let (id, _node, reader) = synaptics_attach_evdev_for_test();
+    // Plain absolute pad (no negotiated info → no AGM): a NEWABS
+    // `w == 2` packet is an ordinary single-finger packet, not
+    // an AGM packet — Linux only routes `w == 2` through
+    // `synaptics_parse_agm` when the pad has AGM.
+    i8042_mouse::set_synaptics_absolute_for_test(true);
+    for b in [0x84, 0x73, 50, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_X, 1000)
+        && has(EventType::Abs, abs::ABS_Y, 3856)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 50)
+        && has(EventType::Key, key::BTN_TOUCH, 1)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_SLOT)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+    ROUTER.unregister_device(id);
+    i8042_mouse::__reset_for_test();
+    if !ok {
+        return TestResult::Fail("w==2 without AGM must stay a single-finger frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_synaptics_w2_without_agm_is_single_finger
+);

@@ -39,8 +39,21 @@
 //!   (`X_MAX_POSITIVE` 8176: `== 8176` clamps to 6143, above it wraps
 //!   negative).
 //!
-//! MT / AGM is out of scope here: no AGM mode set, no `w == 2` decode,
-//! single-finger SGM only.
+//! * Synaptics AGM (advanced gesture mode) + multi-finger — the
+//!   `synaptics_set_advanced_gesture_mode` sequence (sliced
+//!   `SYN_QUE_MODEL` + `SETRATE(0xC8)`, from Linux
+//!   `synaptics_set_mode`), the `w == 2` AGM packet decode (Linux
+//!   `synaptics_parse_agm`: gesture packets carry the second contact
+//!   at half resolution, AGM-CONTACT packets carry the finger count),
+//!   the SGM finger count (Linux `synaptics_process_packet`: `w`
+//!   0..=1 → `w + 2` fingers on multifinger pads, `w == 2` is the
+//!   AGM marker), and the two-slot semi-MT report (Linux
+//!   `synaptics_report_semi_mt_data`: min/max corners). Image-sensor
+//!   pads (`SYN_CAP_IMAGE_SENSOR`) share the AGM mode set and the
+//!   `w == 2` decode, but their full-MT path (Linux
+//!   `synaptics_image_sensor_process` + `synaptics_report_mt_data`,
+//!   slot assignment via `input_mt_assign_slots`) is a follow-up:
+//!   they keep the single-finger report for now.
 //!
 //! Probe order follows Linux `psmouse_extensions()`: Synaptics, then
 //! ALPS, then Elantech, then a full reset to defaults (the vendor probes
@@ -66,10 +79,13 @@
 //!   `SYN_PS_SET_MODE2 = 0x14`.
 //! * Linux `drivers/input/mouse/synaptics.c` — `synaptics_detect`,
 //!   `synaptics_send_cmd`, `synaptics_query_hardware`,
-//!   `synaptics_set_mode`, `synaptics_mode_cmd`,
-//!   `synaptics_parse_hw_state`, `synaptics_validate_byte`,
+//!   `synaptics_set_mode`, `synaptics_set_advanced_gesture_mode`,
+//!   `synaptics_mode_cmd`, `synaptics_parse_hw_state`,
+//!   `synaptics_parse_agm`, `synaptics_validate_byte`,
 //!   `synaptics_process_packet` (BTN_TOUCH hysteresis `z > 30` /
-//!   `z < 25`, X/Y reported only when `z > 0 && x > 1`),
+//!   `z < 25`, X/Y reported only when `z > 0 && x > 1`,
+//!   `w == 2` AGM packets, `w` 0..=1 → `w + 2` fingers on
+//!   multifinger pads), `synaptics_report_semi_mt_data`,
 //!   `synaptics_invert_y`, `__synaptics_init`.
 //! * Linux `Documentation/input/alps.txt` — "E6 report"
 //!   (`E8-E6-E6-E6-E9` → `00-00-0A` or `00-00-64`) and "E7 report"
@@ -192,6 +208,10 @@ pub const SYN_BIT_W_MODE: u8 = 0x01;
 pub const SYN_PS_SET_MODE2: u8 = 0x14;
 /// `SETRATE` argument for the pass-through port.
 pub const SYN_PS_CLIENT_CMD: u8 = 0x28;
+/// `SETRATE` argument that enters advanced gesture mode (Linux
+/// `synaptics_set_advanced_gesture_mode`: sliced `SYN_QUE_MODEL`
+/// then `SETRATE(0xC8)`).
+pub const SYN_AGM_SET_RATE: u8 = 0xC8;
 
 /// Sample rate the pad runs at after reset (PS/2 default); the
 /// mode byte takes `HIGH_RATE` when the rate is >= 80 (Linux
@@ -219,6 +239,18 @@ pub const fn syn_model_pen(model_id: u32) -> bool {
 /// bits present, which also means W mode is supported.
 pub const fn syn_cap_extended(capabilities: u32) -> bool {
     capabilities & (1 << 23) != 0
+}
+
+/// `SYN_CAP_MULTIFINGER(c)`: capability bit 1 — the pad reports
+/// more than one finger (Linux `synaptics_has_multifinger`).
+pub const fn syn_cap_multifinger(capabilities: u32) -> bool {
+    capabilities & (1 << 1) != 0
+}
+
+/// `SYN_CAP_PALMDETECT(c)`: capability bit 0 — the pad reports
+/// palm width in `w` (4..=15).
+pub const fn syn_cap_palm_detect(capabilities: u32) -> bool {
+    capabilities & (1 << 0) != 0
 }
 
 /// `SYN_CAP_SUBMODEL_ID(c)`: capability bits 15–8.
@@ -257,6 +289,13 @@ pub const fn syn_cap_adv_gesture(ext_cap_0c: u32) -> bool {
 /// `SYN_CAP_IMAGE_SENSOR(ex0c)`: ext-cap-0x0c bit 11.
 pub const fn syn_cap_image_sensor(ext_cap_0c: u32) -> bool {
     ext_cap_0c & 0x000800 != 0
+}
+
+/// `synaptics_has_agm(priv)` (Linux `synaptics.c`): the pad sends
+/// AGM packets — advanced-gesture pads and image-sensor pads both
+/// do, so both take the AGM mode set and the `w == 2` decode.
+pub const fn synaptics_has_agm(ext_cap_0c: u32) -> bool {
+    syn_cap_adv_gesture(ext_cap_0c) || syn_cap_image_sensor(ext_cap_0c)
 }
 
 /// `SYN_ID_MAJOR(i)`: identify low nibble of the third byte.
@@ -444,12 +483,16 @@ pub fn packet_len() -> usize {
 /// Record the negotiation result. Called once from
 /// `i8042_mouse::init`, before IRQ 12 is armed. Clears the
 /// Elantech info unless the negotiated hardware is Elantech, so
-/// "info present" always implies "Elantech active".
+/// "info present" always implies "Elantech active"; same for the
+/// Synaptics info below.
 pub fn set_detected(hw: PsmouseHardware, proto: PsmouseProtocol) {
     HARDWARE.store(hw as u8, Ordering::Release);
     PROTOCOL.store(proto as u8, Ordering::Release);
     if hw != PsmouseHardware::Elantech {
         clear_elantech_info();
+    }
+    if hw != PsmouseHardware::Synaptics {
+        clear_synaptics_info();
     }
 }
 
@@ -458,6 +501,49 @@ pub fn set_detected(hw: PsmouseHardware, proto: PsmouseProtocol) {
 /// restores `Standard`.
 pub fn set_protocol_for_test(proto: PsmouseProtocol) {
     PROTOCOL.store(proto as u8, Ordering::Release);
+}
+
+// ── Synaptics negotiated info ─────────────────────────────────────────────
+
+/// The two queried words the IRQ path needs after enablement:
+/// `capabilities` (multifinger / extended, for the SGM finger
+/// count) and `ext_cap_0c` (AGM / image sensor, for the `w == 2`
+/// decode and the semi-MT report). Stored like the Elantech info
+/// above — write-once at init, before IRQ 12 is armed.
+static SYNAPTICS_CAPABILITIES: AtomicU32 = AtomicU32::new(0);
+static SYNAPTICS_EXT_CAP_0C: AtomicU32 = AtomicU32::new(0);
+
+/// Queried capabilities word of the negotiated Synaptics pad
+/// (0 when no Synaptics pad was negotiated).
+pub fn synaptics_capabilities() -> u32 {
+    SYNAPTICS_CAPABILITIES.load(Ordering::Acquire)
+}
+
+/// Queried extended-capabilities-0x0c word of the negotiated
+/// Synaptics pad (0 when no Synaptics pad was negotiated).
+pub fn synaptics_ext_cap_0c() -> u32 {
+    SYNAPTICS_EXT_CAP_0C.load(Ordering::Acquire)
+}
+
+/// Record the negotiated Synaptics hardware. Called from
+/// `i8042_mouse` right after a successful
+/// [`synaptics_enable_absolute`]; the IRQ path reads it back via
+/// [`synaptics_capabilities`] / [`synaptics_ext_cap_0c`].
+pub fn set_synaptics_info(hw: &SynapticsHw) {
+    SYNAPTICS_CAPABILITIES.store(hw.capabilities, Ordering::Release);
+    SYNAPTICS_EXT_CAP_0C.store(hw.ext_cap_0c, Ordering::Release);
+}
+
+/// Test-only: install Synaptics info directly (lets packet
+/// fixtures feed AGM packets without a device). Cleared by
+/// `set_detected` with non-Synaptics hardware.
+pub fn set_synaptics_info_for_test(hw: &SynapticsHw) {
+    set_synaptics_info(hw);
+}
+
+fn clear_synaptics_info() {
+    SYNAPTICS_CAPABILITIES.store(0, Ordering::Release);
+    SYNAPTICS_EXT_CAP_0C.store(0, Ordering::Release);
 }
 
 // ── Elantech negotiated info ──────────────────────────────────────────────
@@ -851,6 +937,19 @@ pub fn synaptics_mode_cmd<T: Ps2Transport>(t: &mut T, mode: u8) -> bool {
     t.send_param(CMD_SET_RATE, SYN_PS_SET_MODE2)
 }
 
+/// Enter advanced gesture mode (Linux
+/// `synaptics_set_advanced_gesture_mode`, called from
+/// `synaptics_set_mode` when the pad has AGM): the model query as
+/// a sliced command, then `SETRATE(0xC8)`. Without it an AGM pad
+/// never sends `w == 2` packets, so the multi-finger state
+/// machine below would stay empty.
+pub fn synaptics_set_advanced_gesture_mode<T: Ps2Transport>(t: &mut T) -> bool {
+    if !t.sliced_command(SYN_QUE_MODEL) {
+        return false;
+    }
+    t.send_param(CMD_SET_RATE, SYN_AGM_SET_RATE)
+}
+
 /// Compose the absolute-mode byte (Linux `synaptics_set_mode`):
 /// `ABSOLUTE`, plus `HIGH_RATE` when the report rate is >= 80,
 /// plus `W_MODE` when the pad reports extended capabilities, plus
@@ -896,6 +995,15 @@ pub fn synaptics_enable_absolute<T: Ps2Transport>(
         // Best-effort: force the pad back to relative mode so a
         // half-committed mode byte cannot leave the IRQ path
         // parsing 3-byte packets from an absolute-mode pad.
+        let _ = synaptics_mode_cmd(t, 0);
+        return Err(SynapticsEnableError::ModeSet);
+    }
+    // AGM pads need the extra mode set (Linux `synaptics_set_mode`
+    // calls `synaptics_set_advanced_gesture_mode` right after the
+    // mode byte when `absolute_mode && synaptics_has_agm(priv)`).
+    // A failure here is fatal the same way: the pad stays in
+    // relative mode.
+    if synaptics_has_agm(hw.ext_cap_0c) && !synaptics_set_advanced_gesture_mode(t) {
         let _ = synaptics_mode_cmd(t, 0);
         return Err(SynapticsEnableError::ModeSet);
     }
@@ -1994,8 +2102,9 @@ pub const SYN_MAX_POSITIVE: i32 = 8176;
 pub const SYN_ABS_POS_BITS: u32 = 13;
 
 /// One decoded Synaptics absolute packet (single-finger fields;
-/// the AGM / multi-finger state machine is a follow-up lane).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// on AGM pads the second contact rides in [`SynapticsAgmState`]
+/// and the finger count comes from [`synaptics_num_fingers`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SynapticsHwState {
     /// Absolute X (0..6143 nominal, before Y-style inversion — X is not inverted).
     pub x: i32,
@@ -2009,6 +2118,21 @@ pub struct SynapticsHwState {
     pub w: u8,
     pub left: bool,
     pub right: bool,
+}
+
+impl SynapticsHwState {
+    /// Zero state (no contact); the const form of `Default`, for
+    /// static initializers.
+    pub const fn new() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            z: 0,
+            w: 0,
+            left: false,
+            right: false,
+        }
+    }
 }
 
 /// Wrap-around conversion (Linux `synaptics_parse_hw_state` tail):
@@ -2152,6 +2276,161 @@ pub fn synaptics_detect_pkt_type(buf: &[u8; 6]) -> SynapticsPktType {
         }
     }
     SynapticsPktType::NewAbsStrict
+}
+
+// ── Synaptics AGM / multi-finger (pure) ────────────────────────────────────
+//
+// From Linux `synaptics_parse_agm` + `synaptics_process_packet` +
+// `synaptics_report_semi_mt_data` (`drivers/input/mouse/synaptics.c`).
+// Only NEWABS pads take this path: Linux checks `w == 2` inside
+// the `SYN_MODEL_NEWABS` branch of `synaptics_parse_hw_state`,
+// and only when the pad has AGM (`synaptics_has_agm`).
+
+/// AGM state that survives across packets (Linux `priv->agm` +
+/// `priv->agm_count` in `struct synaptics_data`): the second
+/// contact's position from the last AGM gesture packet, and the
+/// finger count from the last AGM-CONTACT packet. An AGM packet
+/// (`w == 2`) updates this state and produces no report itself;
+/// the next SGM packet reports both contacts together.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SynapticsAgmState {
+    /// Second-contact state (gesture packet, type 1). `x`/`y`
+    /// are raw pad orientation like [`SynapticsHwState`]; the
+    /// reporter inverts Y.
+    pub agm: SynapticsHwState,
+    /// Finger count from the last AGM-CONTACT packet (type 2);
+    /// 0 until one arrives.
+    pub agm_count: u8,
+}
+
+impl SynapticsAgmState {
+    /// Empty state (no second contact, no count); the const form
+    /// of `Default`, for static initializers.
+    pub const fn new() -> Self {
+        Self {
+            agm: SynapticsHwState::new(),
+            agm_count: 0,
+        }
+    }
+}
+
+/// One slot of the two-slot semi-MT report (Linux
+/// `synaptics_report_semi_mt_data`). Y is already inverted to
+/// userspace orientation via [`synaptics_invert_y`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SynapticsMtSlot {
+    /// The slot carries a live contact in this frame.
+    pub active: bool,
+    /// Absolute X (not inverted).
+    pub x: i32,
+    /// Absolute Y, inverted.
+    pub y: i32,
+}
+
+impl SynapticsMtSlot {
+    /// Inactive slot; the const form of `Default`, for static
+    /// initializers.
+    pub const fn new() -> Self {
+        Self {
+            active: false,
+            x: 0,
+            y: 0,
+        }
+    }
+}
+
+/// AGM packet decode (Linux `synaptics_parse_agm`, verbatim):
+/// the packet type is `(buf[5] & 0x30) >> 4`. Type 1 is a gesture
+/// packet — the second contact at half resolution, so the
+/// coordinates double back (`x`/`y`) and the pressure too (`z`);
+/// type 2 is an AGM-CONTACT packet — only the count in `buf[1]`
+/// matters; any other type is ignored. `w` is the packet's own
+/// `w` (2 at every call site — the caller only routes `w == 2`
+/// packets here). Unlike the SGM decode, Linux applies no wrap
+/// conversion to AGM coordinates.
+pub fn parse_synaptics_agm(buf: &[u8; 6], w: u8, state: &mut SynapticsAgmState) {
+    match (buf[5] & 0x30) >> 4 {
+        1 => {
+            state.agm.w = w;
+            state.agm.x = (((buf[4] & 0x0f) as i32) << 8 | buf[1] as i32) << 1;
+            state.agm.y = (((buf[4] & 0xf0) as i32) << 4 | buf[2] as i32) << 1;
+            state.agm.z = ((buf[3] & 0x30) | (buf[5] & 0x0f)) << 1;
+        }
+        2 => {
+            state.agm_count = buf[1];
+        }
+        _ => {}
+    }
+}
+
+/// Finger count for one SGM packet (Linux `synaptics_process_packet`,
+/// verbatim): 0 when there is no finger (`z == 0 || x <= 1`); 1 by
+/// default; on extended-capability pads `w` 0..=1 means `w + 2`
+/// fingers when the pad reports multifinger, `w == 2` is the AGM
+/// marker (one finger — the second contact rides in the AGM
+/// state), and `w` 4..=15 is a palm (count stays 1; the width is
+/// the palm width, which NARF does not report as `ABS_TOOL_WIDTH`
+/// yet). Non-extended pads always report 1.
+pub fn synaptics_num_fingers(hw: &SynapticsHwState, capabilities: u32) -> u8 {
+    if hw.z == 0 || hw.x <= 1 {
+        return 0;
+    }
+    if !syn_cap_extended(capabilities) {
+        return 1;
+    }
+    match hw.w {
+        0 | 1 => {
+            if syn_cap_multifinger(capabilities) {
+                hw.w + 2
+            } else {
+                1
+            }
+        }
+        _ => 1,
+    }
+}
+
+/// The two semi-MT slots for an AGM pad (Linux
+/// `synaptics_report_semi_mt_data`, verbatim): with 2+ fingers
+/// slot 0 is the min-X/min-Y corner and slot 1 the max-X/max-Y
+/// corner (positions are the SGM contact and the AGM second
+/// contact, whichever is smaller/larger per axis); with 1 finger
+/// only slot 0 is live (the SGM contact) and slot 1 is released;
+/// with 0 fingers neither is live. Linux clamps the finger count
+/// to 2 slots (`clamp_val(num_fingers, 0, 2)`), so a 3-finger
+/// report still fills both slots. Y is inverted here, as Linux
+/// inverts inside `synaptics_report_semi_mt_slot`.
+pub fn synaptics_semi_mt_slots(
+    sgm: &SynapticsHwState,
+    agm: &SynapticsHwState,
+    num_fingers: u8,
+) -> [SynapticsMtSlot; 2] {
+    let nsemi = num_fingers.clamp(0, 2);
+    if nsemi >= 2 {
+        [
+            SynapticsMtSlot {
+                active: true,
+                x: sgm.x.min(agm.x),
+                y: synaptics_invert_y(sgm.y.min(agm.y)),
+            },
+            SynapticsMtSlot {
+                active: true,
+                x: sgm.x.max(agm.x),
+                y: synaptics_invert_y(sgm.y.max(agm.y)),
+            },
+        ]
+    } else if nsemi == 1 {
+        [
+            SynapticsMtSlot {
+                active: true,
+                x: sgm.x,
+                y: synaptics_invert_y(sgm.y),
+            },
+            SynapticsMtSlot::new(),
+        ]
+    } else {
+        [SynapticsMtSlot::new(), SynapticsMtSlot::new()]
+    }
 }
 
 pub fn register_initcalls() {
