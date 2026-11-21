@@ -248,7 +248,7 @@ pub fn register_initcalls() {
             }
             cppc::InitOutcome::NotSupported => match pstate::init_or_gp() {
                 pstate::InitOutcome::HwpProgrammed => {
-                    String::from("CPU: HWP programmed (balanced EPP)")
+                    String::from("CPU: HWP programmed (autonomous performance selection)")
                 }
                 pstate::InitOutcome::HwpEnableGp => {
                     String::from("CPU: HWP enable #GP'd (BIOS lock) — firmware default")
@@ -279,7 +279,7 @@ pub fn register_initcalls() {
         // `pstate::init_or_gp` for the actual MSR programming.
         // The Intel path is read+write: caps read, `IA32_PM_ENABLE`
         // set, `IA32_HWP_REQUEST` programmed with (min=lowest,
-        // max=highest, desired=0, EPP=balanced). `IA32_PM_ENABLE`
+        // max=highest, desired=0, balanced EPP where supported). `IA32_PM_ENABLE`
         // is sticky, so this is idempotent on the second initcall
         // run that happens under the kernel-test harness.
         let _ = hwp::intel_hwp_summary();
@@ -380,7 +380,7 @@ pub fn register_initcalls() {
     // CPUFreq governor bring-up. Runs after `cpu-pstate` (Stage::Subsys)
     // so the one-shot HWP/CPPC capabilities + initial request are
     // already programmed; this lights up the periodic governor that
-    // re-writes `desired_perf` based on per-CPU utilisation.
+    // applies policy and thermal limits on the CPU that owns each request.
     // `enable()` is GP-safe (rdmsr_or_gp / wrmsr_or_gp under the
     // hood) so a BIOS-locked MSR returns `Err(CapabilitiesGp)` /
     // `Err(RequestGp)` instead of wedging boot.

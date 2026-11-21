@@ -107,6 +107,7 @@ fn read_counters(cpu: usize) -> Option<Counters> {
 }
 
 async fn worker(cpu: usize) {
+    narf_filesystem::procfs::record_current_cpu_info();
     if !supported() {
         return;
     }
@@ -142,6 +143,7 @@ pub fn start() {
     if STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    narf_filesystem::procfs::record_current_cpu_info();
     for cpu in 0..narf_lib::percpu::MAX_CPUS {
         if !narf_lib::smp::is_online(cpu as u32) {
             continue;

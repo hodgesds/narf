@@ -206,9 +206,14 @@ the new target sits inside the hysteresis band.
 initcall only after `enable()` succeeds — with no live backend
 there is nothing to throttle and no device is published.
 
-On x86_64, `Balanced` is the default schedutil-style policy over Intel
-HWP or AMD CPPC. One hard-pinned worker per online CPU samples that CPU's
-scheduler run queue every 100 ms and writes only that CPU's request MSR.
+On x86_64, `Balanced` is the default CPU frequency policy. Each online CPU
+programs its own request MSR. Intel HWP starts in autonomous mode
+(`desired_perf = 0`) on each CPU. Under `Balanced` and `Powersave`,
+hardware selects the operating point within that CPU's policy and thermal
+bounds. The pinned worker applies changes to those bounds or EPP even when
+desired performance stays zero. CPUs that advertise EPP receive the policy's
+preference. AMD CPPC samples the local scheduler run queue every 100 ms
+to select a desired performance level.
 The syscall bridge rejects remote-CPU policy/EPP writes until an IPI
 rendezvous path can execute the operation on the named CPU.
 `Performance` requests highest with a nominal floor and EPP 0;

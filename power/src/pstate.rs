@@ -181,7 +181,8 @@ pub unsafe fn hwp_enable() {
 /// # Safety
 /// CPL = 0; HWP enabled.
 pub unsafe fn hwp_set(min: u8, max: u8, desired: u8, epp: u8) {
-    let v = (min as u64) | ((max as u64) << 8) | ((desired as u64) << 16) | ((epp as u64) << 24);
+    let epp = crate::hwp::HwpFeatures::probe().epp.then_some(epp);
+    let v = u64::from(crate::hwp::request_value(min, max, desired, epp));
     // SAFETY: caller-asserted.
     unsafe {
         wrmsr(MSR_IA32_HWP_REQUEST, v);
@@ -343,7 +344,9 @@ pub fn init_or_gp() -> InitOutcome {
             let caps = unsafe { hwp_capabilities() };
             // bits 0..7 = min, 8..15 = max, 16..23 = desired (0 =
             // autonomous, left unset), 24..31 = EPP (0x80 balanced).
-            let v = (caps.min_perf as u64) | ((caps.max_perf as u64) << 8) | (0x80u64 << 24);
+            let epp = crate::hwp::HwpFeatures::probe().epp
+                .then_some(crate::hwp::EPP_BALANCED_PERFORMANCE);
+            let v = u64::from(crate::hwp::request_value(caps.min_perf, caps.max_perf, 0, epp));
             if wrmsr_or_gp(MSR_IA32_HWP_REQUEST, v).is_err() {
                 return InitOutcome::HwpRequestGp;
             }

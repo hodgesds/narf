@@ -4,10 +4,9 @@
 //! `cppc.rs` (AMD): those modules read capabilities + program a
 //! one-shot bring-up request at Stage::Subsys, leaving the hardware
 //! to autonomously pick a P-state inside the supplied window. This
-//! module layers a periodic governor on top: it samples per-CPU
-//! utilisation, computes a target performance value, and re-writes
-//! `desired_perf` so the hardware aims at a specific point inside
-//! the (min, max) window instead of leaving it to firmware policy.
+//! module applies policy and thermal bounds on the owning CPU. Intel HWP
+//! selects performance autonomously within that window under Balanced and
+//! Powersave. The software-selected backends also update desired performance.
 //!
 //! ## Backend priority
 //!
@@ -33,7 +32,7 @@
 //!
 //! ## Governor algorithm
 //!
-//! Schedutil-style: every tick the governor reads a per-CPU
+//! On the software-selected backends, the governor reads a per-CPU
 //! scheduler-demand proxy and computes
 //!
 //! ```text
@@ -120,7 +119,7 @@ pub enum Backend {
 pub enum Policy {
     /// Request highest performance with a nominal floor.
     Performance,
-    /// Scale across the full hardware range from scheduler load.
+    /// Scale across the full hardware range, autonomously on Intel HWP.
     #[default]
     Balanced,
     /// Scale only up to nominal performance with an energy-biased EPP.
@@ -171,7 +170,7 @@ pub struct PerfState {
     /// Some backends don't expose a status MSR here; in that case
     /// the field mirrors `desired`.
     pub current: u8,
-    /// Energy-performance preference last programmed for this CPU.
+    /// Policy EPP, programmed on CPUs that support energy-performance preference.
     pub epp: u8,
     /// Active software policy.
     pub policy: Policy,
@@ -194,6 +193,9 @@ static ENABLED: AtomicU8 = AtomicU8::new(0);
 struct PerCpu {
     /// Last `desired_perf` byte we wrote, for hysteresis.
     last_desired: u8,
+    /// Last successfully applied Intel request, including its thermal ceiling.
+    last_hwp_request: Option<u32>,
+    hwp_epp_supported: bool,
     /// Hardware capability bounds cached on the owning CPU.
     hw_min_perf: u8,
     nominal_perf: u8,
@@ -209,6 +211,8 @@ const MAX_CPUS: usize = 64;
 static PERCPU: IrqSafeSpinLock<[PerCpu; MAX_CPUS]> = IrqSafeSpinLock::new(
     [PerCpu {
         last_desired: 0,
+        last_hwp_request: None,
+        hwp_epp_supported: false,
         hw_min_perf: 0,
         nominal_perf: 0,
         hw_max_perf: 0,
@@ -448,7 +452,9 @@ fn tick_cpu(cpu: usize) -> Result<u32, CpuFreqError> {
         return Err(CpuFreqError::NoSuchCpu);
     }
     TICK_COUNT.fetch_add(1, Ordering::AcqRel);
-    let util = sample_utilization(cpu);
+    if b == Backend::IntelHwp {
+        return sync_hwp_policy(cpu);
+    }
     let (min, max, prev, policy) = {
         let pc = PERCPU.lock();
         let s = pc[cpu];
@@ -464,7 +470,7 @@ fn tick_cpu(cpu: usize) -> Result<u32, CpuFreqError> {
     let max = thermal_capped_max(min, max);
     let target = match policy {
         Policy::Performance => max,
-        Policy::Balanced | Policy::Powersave => target_perf(util, min, max),
+        Policy::Balanced | Policy::Powersave => target_perf(sample_utilization(cpu), min, max),
         Policy::Userspace => 0,
     };
     // Hysteresis suppression — except when the previously written
@@ -503,7 +509,9 @@ pub fn set_policy_current(policy: Policy) -> Result<(), CpuFreqError> {
         apply_policy_to_slot(s, policy);
         // Force the next tick to write the new policy even when its
         // desired byte happens to fall inside the hysteresis band.
-        s.last_desired = 0;
+        if backend() != Backend::IntelHwp {
+            s.last_desired = 0;
+        }
     }
     tick_cpu(cpu).map(|_| ())
 }
@@ -635,12 +643,23 @@ fn vendor_amd() -> bool {
 // ── Backend seeding ────────────────────────────────────────────────
 
 fn seed_intel_hwp_current() -> Result<(), CpuFreqError> {
+    // MSRs and their fault-recovery slots belong to the executing CPU.
+    let mut slots = PERCPU.lock();
+    let cpu = narf_lib::percpu::current_cpu();
+    let slot = slots.get_mut(cpu).ok_or(CpuFreqError::NoSuchCpu)?;
     wrmsr_or_gp(MSR_IA32_PM_ENABLE, 1).map_err(|_| CpuFreqError::EnableGp)?;
     let raw = rdmsr_or_gp(MSR_IA32_HWP_CAPABILITIES).map_err(|_| CpuFreqError::CapabilitiesGp)?;
     let caps = HwpCapabilities::decode(raw);
     validate_window(caps.lowest_perf, caps.guaranteed_perf, caps.highest_perf)?;
-    seed_current_window(caps.lowest_perf, caps.guaranteed_perf, caps.highest_perf);
-    Ok(())
+    seed_slot(
+        slot,
+        caps.lowest_perf,
+        caps.guaranteed_perf,
+        caps.highest_perf,
+    );
+    slot.hwp_epp_supported = crate::hwp::HwpFeatures::probe().epp;
+    // Apply the initial range on each logical CPU before its first timer tick.
+    program_hwp(slot).map(|_| ())
 }
 
 fn seed_amd_cppc_current() -> Result<(), CpuFreqError> {
@@ -657,6 +676,9 @@ fn seed_current_cpu(cpu: usize) -> Result<(), CpuFreqError> {
         return Err(CpuFreqError::NoSuchCpu);
     }
     match backend() {
+        // enable() already seeded the BSP. Its worker must preserve a policy
+        // or EPP change made between enable() and its first poll.
+        Backend::IntelHwp if PERCPU.lock()[cpu].last_hwp_request.is_some() => Ok(()),
         Backend::IntelHwp => seed_intel_hwp_current(),
         Backend::AmdCppc => seed_amd_cppc_current(),
         Backend::AcpiPss => {
@@ -734,6 +756,7 @@ fn seed_slot(slot: &mut PerCpu, lowest: u8, nominal: u8, highest: u8) {
     slot.min_perf = lowest;
     slot.max_perf = highest;
     slot.last_desired = 0;
+    slot.last_hwp_request = None;
     slot.epp = cppc_epp::BALANCED_PERFORMANCE;
     slot.policy = Policy::Balanced;
 }
@@ -796,25 +819,53 @@ fn write_desired(b: Backend, cpu: usize, desired: u8) -> Result<(), CpuFreqError
         return Err(CpuFreqError::NoSuchCpu);
     }
     match b {
-        Backend::IntelHwp => write_desired_hwp(cpu, desired),
+        Backend::IntelHwp => sync_hwp_policy(cpu).map(|_| ()),
         Backend::AmdCppc => write_desired_cppc(cpu, desired),
         Backend::AcpiPss => write_desired_pss(desired),
         Backend::None => Err(CpuFreqError::NoBackend),
     }
 }
 
-fn write_desired_hwp(cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
-    let pc = PERCPU.lock();
-    let (min, max, epp) = (pc[cpu].min_perf, pc[cpu].max_perf, pc[cpu].epp);
-    drop(pc);
-    // The request's max field carries the thermal ceiling too: HWP
-    // selects autonomously anywhere inside [min, max], so capping
-    // only `desired` would not bind it.
-    let max = thermal_capped_max(min, max);
-    // Build `IA32_HWP_REQUEST` with the policy's current
-    // (min, max, desired, EPP) tuple.
-    let req = (min as u64) | ((max as u64) << 8) | ((desired as u64) << 16) | ((epp as u64) << 24);
-    wrmsr_or_gp(MSR_IA32_HWP_REQUEST, req).map_err(|_| CpuFreqError::RequestGp)
+/// Serialize the cached request and its MSR write on the owning CPU.
+fn sync_hwp_policy(cpu: usize) -> Result<u32, CpuFreqError> {
+    let mut slots = PERCPU.lock();
+    if cpu != narf_lib::percpu::current_cpu() {
+        return Err(CpuFreqError::NoSuchCpu);
+    }
+    let slot = slots.get_mut(cpu).ok_or(CpuFreqError::NoSuchCpu)?;
+    if slot.hw_max_perf == 0 {
+        return Err(CpuFreqError::NoSuchCpu);
+    }
+    program_hwp(slot)
+}
+
+fn program_hwp(slot: &mut PerCpu) -> Result<u32, CpuFreqError> {
+    update_hwp_request(slot, thermal_limit_permille(), |request| {
+        wrmsr_or_gp(MSR_IA32_HWP_REQUEST, u64::from(request)).map_err(|_| CpuFreqError::RequestGp)
+    })
+}
+
+fn update_hwp_request(
+    slot: &mut PerCpu,
+    thermal_limit: u16,
+    write: impl FnOnce(u32) -> Result<(), CpuFreqError>,
+) -> Result<u32, CpuFreqError> {
+    let max = capped_max(slot.min_perf, slot.max_perf, thermal_limit);
+    // A running task can have an empty ready queue. Hardware observes its
+    // demand directly when desired performance is zero.
+    let desired = match slot.policy {
+        Policy::Performance => max,
+        Policy::Balanced | Policy::Powersave | Policy::Userspace => 0,
+    };
+    let epp = slot.hwp_epp_supported.then_some(slot.epp);
+    let request = crate::hwp::request_value(slot.min_perf, max, desired, epp);
+    if slot.last_hwp_request == Some(request) {
+        return Ok(0);
+    }
+    write(request)?;
+    slot.last_hwp_request = Some(request);
+    slot.last_desired = desired;
+    Ok(1)
 }
 
 fn write_desired_cppc(cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
@@ -940,6 +991,75 @@ pub fn __force_backend_for_test(b: Backend) {
 mod smoke_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    // Exercise the worker's actual request encoder and write cache without
+    // requiring the hypervisor to expose Intel HWP MSRs.
+    fn smoke_intel_hwp_autonomous_window() -> TestResult {
+        let mut slot = PerCpu::default();
+        seed_slot(&mut slot, 1, 13, 56);
+        slot.hwp_epp_supported = true;
+        let mut writes = alloc::vec::Vec::new();
+        let mut write = |value: u32| {
+            writes.push(value.to_le_bytes());
+            Ok(())
+        };
+        if update_hwp_request(&mut slot, 1000, &mut write) != Ok(1)
+            || update_hwp_request(&mut slot, 1000, &mut write) != Ok(0)
+            || update_hwp_request(&mut slot, 980, &mut write) != Ok(1)
+            || update_hwp_request(&mut slot, 1000, &mut write) != Ok(1)
+        {
+            return TestResult::Fail("HWP must write both thermal window transitions exactly once");
+        }
+        slot.epp = 0x40;
+        if update_hwp_request(&mut slot, 1000, &mut write) != Ok(1) {
+            return TestResult::Fail("EPP-only change must reach the MSR in autonomous mode");
+        }
+        let balanced = cppc_epp::BALANCED_PERFORMANCE;
+        if writes.as_slice()
+            != [
+                [1, 56, 0, balanced],
+                [1, 54, 0, balanced],
+                [1, 56, 0, balanced],
+                [1, 56, 0, 0x40],
+            ]
+        {
+            return TestResult::Fail("wrong Intel HWP min/max/desired/EPP bytes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/cpufreq", smoke_intel_hwp_autonomous_window);
+
+    fn smoke_intel_hwp_policy_and_retry() -> TestResult {
+        let mut slot = PerCpu::default();
+        seed_slot(&mut slot, 1, 13, 56);
+        for (policy, limit, expected) in [
+            (Policy::Performance, 1000, [13, 56, 56, 0]),
+            (Policy::Performance, 500, [13, 34, 34, 0]),
+            (Policy::Powersave, 1000, [1, 13, 0, 0]),
+            (Policy::Userspace, 0, [1, 1, 0, 0]),
+        ] {
+            apply_policy_to_slot(&mut slot, policy);
+            let previous = (slot.last_hwp_request, slot.last_desired);
+            if update_hwp_request(&mut slot, limit, |_| Err(CpuFreqError::RequestGp))
+                != Err(CpuFreqError::RequestGp)
+                || (slot.last_hwp_request, slot.last_desired) != previous
+            {
+                return TestResult::Fail("failed Intel request changed hardware-state cache");
+            }
+            let mut actual = None;
+            if update_hwp_request(&mut slot, limit, |request| {
+                actual = Some(request.to_le_bytes());
+                Ok(())
+            }) != Ok(1)
+                || actual != Some(expected)
+                || slot.last_desired != expected[2]
+            {
+                return TestResult::Fail("retry must apply the policy with reserved EPP zero");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("power/cpufreq", smoke_intel_hwp_policy_and_retry);
 
     /// HWP capabilities decode: bit-position pins per Intel SDM
     /// Vol 4 §2.16. `IA32_HWP_CAPABILITIES` (MSR 0x771):

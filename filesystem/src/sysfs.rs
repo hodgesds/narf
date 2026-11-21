@@ -120,28 +120,32 @@ fn numa_online_list() -> String {
 }
 
 fn node_mask_list(mask: u64) -> String {
+    bitmap_list(mask, narf_memory::FRAME_MAX_NUMA_NODES)
+}
+
+fn bitmap_list(mask: u64, bits: usize) -> String {
     let mut out = String::new();
-    let mut node = 0usize;
+    let mut bit = 0usize;
     let mut first = true;
-    while node < narf_memory::FRAME_MAX_NUMA_NODES {
-        if mask & (1u64 << node) == 0 {
-            node += 1;
+    while bit < bits {
+        if mask & (1u64 << bit) == 0 {
+            bit += 1;
             continue;
         }
-        let start = node;
-        while node + 1 < narf_memory::FRAME_MAX_NUMA_NODES && mask & (1u64 << (node + 1)) != 0 {
-            node += 1;
+        let start = bit;
+        while bit + 1 < bits && mask & (1u64 << (bit + 1)) != 0 {
+            bit += 1;
         }
         if !first {
             out.push(',');
         }
         first = false;
-        if start == node {
+        if start == bit {
             out.push_str(&format!("{start}"));
         } else {
-            out.push_str(&format!("{start}-{node}"));
+            out.push_str(&format!("{start}-{bit}"));
         }
-        node += 1;
+        bit += 1;
     }
     out.push('\n');
     out
@@ -2990,77 +2994,93 @@ fn cpu_range_string(n: u32) -> String {
     }
 }
 
-/// The `%*pb` mask of a single CPU `cpu` over `nr_cpu_ids` bits — what
-/// Linux emits for `topology/core_cpus` / `thread_siblings`.
-/// Linux ref: `drivers/base/cpu.c` `show_cpumap`.
-fn single_cpu_mask_string(cpu: u32) -> String {
-    let mask: u128 = 1u128 << (cpu & 127);
-    format!("{}\n", cpumask_pb(mask, smp::cpu_count().max(1)))
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CpuLocation {
+    package: u32,
+    core: u32,
 }
 
-/// The `%*pb` mask of all CPUs in [0, n) over `n` bits.
-/// Used for `topology/package_cpus`.
-/// Linux ref: `drivers/base/cpu.c` `show_cpumap`.
-fn all_cpus_mask_string(n: u32) -> String {
-    // Build mask with bits 0..n-1 set (capped at 127 for the 128-bit field).
-    let n_capped = n.min(128);
-    let mask: u128 = if n_capped == 128 {
-        u128::MAX
-    } else {
-        (1u128 << n_capped) - 1
-    };
-    format!("{}\n", cpumask_pb(mask, n.max(1)))
+impl CpuLocation {
+    // Linux topo_set_ids(): a package-relative core number from the
+    // system-wide APIC address layout. Gaps in APIC IDs are significant.
+    #[cfg(target_arch = "x86_64")]
+    fn from_apic(apic: u32, smt_shift: u8, package_shift: u8) -> Self {
+        Self {
+            package: apic >> package_shift,
+            core: (apic & ((1u32 << package_shift) - 1)) >> smt_shift,
+        }
+    }
 }
 
-/// Populate `/sys/devices/system/cpu/` with the Linux CPU topology subtree.
-///
-/// Entries created:
-/// - `online`, `possible`, `present` — range strings ("0" or "0-{N-1}").
-/// - `kernel_max`                     — "{N-1}" (maximum addressable cpu id).
-/// - `cpu<N>/` for each possible CPU, each with:
-///   - `online` (omitted for cpu0 following Linux convention)
-///   - `topology/core_id`             — `N` (no SMT info available)
-///   - `topology/physical_package_id` — `0`
-///   - `topology/core_cpus`           — hex mask of just bit N
-///   - `topology/core_cpus_list`      — `"N"`
-///   - `topology/thread_siblings`     — same as `core_cpus`
-///   - `topology/thread_siblings_list`— `"N"`
-///   - `topology/package_cpus`        — mask of all possible CPUs
-///   - `topology/package_cpus_list`   — `"0"` or `"0-{max}"`
-///
-/// Data source: `narf_lib::smp::cpu_count()` (same source
-/// [[/proc/cpuinfo]] and `/sys/devices/system/node/` use).
-///
-/// Cache/index* directories are **not** populated: there is no
-/// clean cross-arch cache-topology API reachable from this crate
-/// today (CPUID leaf 4 / 0x1F are x86-only, aarch64 uses CCSIDR —
-/// neither is abstracted behind a `narf-arch` or `narf-lib` surface).
-///
-/// Linux ref: `drivers/base/cpu.c` (`register_cpu`, `cpu_add_dev_symlinks`),
-/// `arch/x86/kernel/topology.c`, `Documentation/ABI/stable/sysfs-devices-system-cpu`.
+#[cfg(target_arch = "x86_64")]
+fn cpu_locations(n: u32) -> Option<Vec<CpuLocation>> {
+    use narf_arch::x86_64::topology::{discover, LevelKind};
+    let layout = discover();
+    let mut smt_shift = None;
+    let mut package_shift = 0;
+    let mut has_core = false;
+    for level in layout.levels.iter().flatten() {
+        if level.logical_at_this_level == 0 || level.apic_shift < package_shift {
+            return None;
+        }
+        package_shift = level.apic_shift;
+        match level.kind {
+            LevelKind::Smt => smt_shift = Some(level.apic_shift),
+            LevelKind::Core => has_core = true,
+            _ => {}
+        }
+    }
+    let smt_shift = smt_shift.filter(|_| has_core)?;
+    (0..n)
+        .map(|cpu| {
+            let apic = narf_interrupts::apic_id_of_cpu(cpu as usize)?;
+            Some(CpuLocation::from_apic(apic, smt_shift, package_shift))
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_locations(_: u32) -> Option<Vec<CpuLocation>> {
+    None
+}
+
+/// Populate CPU IDs, online state, and the modern and legacy Linux sibling
+/// masks. Extended x86 topology and the MADT logical CPU map distinguish
+/// sockets and SMT siblings, including sparse APIC IDs on hybrid CPUs.
 pub fn populate_cpu_devices() {
-    let root = get_root();
-    let devices = get_or_create_child(&root, "devices");
+    let n = smp::cpu_count().clamp(1, u64::BITS);
+    let locations = cpu_locations(n).unwrap_or_else(|| flat_cpu_locations(n));
+    populate_cpu_devices_with(&get_root(), &locations, smp::online_bitmap);
+}
+
+fn flat_cpu_locations(n: u32) -> Vec<CpuLocation> {
+    (0..n)
+        .map(|core| CpuLocation { package: 0, core })
+        .collect()
+}
+
+pub(super) fn populate_test_cpu_devices() {
+    let locations = flat_cpu_locations(smp::cpu_count().max(1));
+    populate_cpu_devices_with(&get_root(), &locations, || u64::MAX);
+}
+
+fn populate_cpu_devices_with(
+    root: &Arc<Kobject>,
+    locations: &[CpuLocation],
+    online_mask: fn() -> u64,
+) {
+    let devices = get_or_create_child(root, "devices");
     let system = get_or_create_child(&devices, "system");
     let cpu_dir = get_or_create_child(&system, "cpu");
 
-    let n = smp::cpu_count().max(1);
+    let n = locations.len() as u32;
 
     // ── /sys/devices/system/cpu/online|possible|present ──────────────
-    // "possible" == "present" == "online" when only a static count
-    // is available (no hot-plug model yet).
-    let range = cpu_range_string(n);
-    {
-        let r = range.clone();
-        kobject_add_attr(&cpu_dir, "online", move || r.clone());
-    }
-    {
-        let r = range.clone();
-        kobject_add_attr(&cpu_dir, "possible", move || r.clone());
-    }
-    {
-        let r = range.clone();
-        kobject_add_attr(&cpu_dir, "present", move || r.clone());
+    kobject_add_attr(&cpu_dir, "online", move || {
+        bitmap_list(online_mask(), n as usize)
+    });
+    for name in ["possible", "present"] {
+        kobject_add_attr(&cpu_dir, name, move || cpu_range_string(n));
     }
 
     // ── /sys/devices/system/cpu/kernel_max ───────────────────────────
@@ -3070,9 +3090,6 @@ pub fn populate_cpu_devices() {
     kobject_add_attr(&cpu_dir, "kernel_max", move || kmax.clone());
 
     // ── /sys/devices/system/cpu/cpu<N>/ ──────────────────────────────
-    let pkg_mask = all_cpus_mask_string(n);
-    let pkg_list = cpu_range_string(n);
-
     for cpu in 0..n {
         let cpu_name = format!("cpu{}", cpu);
         let cpu_kobj = get_or_create_child(&cpu_dir, &cpu_name);
@@ -3085,55 +3102,104 @@ pub fn populate_cpu_devices() {
             cpu_kobj.add_symlink(node_name.clone(), format!("../../node/{node_name}"));
         }
 
-        // `online` — read-only "1".  Linux omits it for cpu0 (the boot CPU
+        // Linux omits the per-CPU online attribute for cpu0 (the boot CPU
         // is always online and has no hotplug sysfs interface).
         // Linux ref: `drivers/base/cpu.c` `register_cpu(hotpluggable=false)`
         // for cpu0 on most arches.
         if cpu != 0 {
-            kobject_add_attr(&cpu_kobj, "online", || "1\n".to_string());
+            kobject_add_attr(&cpu_kobj, "online", move || {
+                format!("{}\n", u8::from(online_mask() & (1u64 << cpu) != 0))
+            });
         }
 
         // ── topology/ ────────────────────────────────────────────────
         let topo = get_or_create_child(&cpu_kobj, "topology");
 
-        // core_id: logical cpu index (no SMT disambiguation available).
-        kobject_add_attr(&topo, "core_id", move || format!("{}\n", cpu));
-
-        // physical_package_id: always 0 (single-socket model).
-        kobject_add_attr(&topo, "physical_package_id", || "0\n".to_string());
-
-        // core_cpus / thread_siblings: mask with only this CPU's bit set.
-        let this_mask = single_cpu_mask_string(cpu);
-        let this_list = format!("{}\n", cpu);
-        {
-            let m = this_mask.clone();
-            kobject_add_attr(&topo, "core_cpus", move || m.clone());
+        let location = locations[cpu as usize];
+        kobject_add_attr(&topo, "core_id", move || format!("{}\n", location.core));
+        kobject_add_attr(&topo, "physical_package_id", move || {
+            format!("{}\n", location.package)
+        });
+        let mut core = 0u64;
+        let mut package = 0u64;
+        for (peer, &other) in locations.iter().enumerate() {
+            if other.package == location.package {
+                package |= 1u64 << peer;
+                if other.core == location.core {
+                    core |= 1u64 << peer;
+                }
+            }
         }
-        {
-            let l = this_list.clone();
-            kobject_add_attr(&topo, "core_cpus_list", move || l.clone());
-        }
-        {
-            let m = this_mask.clone();
-            kobject_add_attr(&topo, "thread_siblings", move || m.clone());
-        }
-        {
-            let l = this_list.clone();
-            kobject_add_attr(&topo, "thread_siblings_list", move || l.clone());
-        }
-
-        // package_cpus / package_cpus_list: all possible CPUs
-        // (single-socket, so the package contains every CPU).
-        {
-            let m = pkg_mask.clone();
-            kobject_add_attr(&topo, "package_cpus", move || m.clone());
-        }
-        {
-            let l = pkg_list.clone();
-            kobject_add_attr(&topo, "package_cpus_list", move || l.clone());
+        for (name, list, mask) in [
+            ("core_cpus", "core_cpus_list", core),
+            ("thread_siblings", "thread_siblings_list", core),
+            ("package_cpus", "package_cpus_list", package),
+            ("core_siblings", "core_siblings_list", package),
+        ] {
+            let online_peers = move || {
+                let online = online_mask();
+                if online & (1u64 << cpu) != 0 {
+                    mask & online
+                } else {
+                    0
+                }
+            };
+            kobject_add_attr(&topo, name, move || {
+                format!("{}\n", cpumask_pb(online_peers().into(), n))
+            });
+            kobject_add_attr(&topo, list, move || bitmap_list(online_peers(), n as usize));
         }
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_sysfs_lscpu_siblings() -> TestResult {
+    // Two sockets, sparse APIC IDs, BSP-first logical ordering, an SMT pair
+    // and a single-threaded core. Logical CPU 4 is offline.
+    let locations = [18, 0, 1, 16, 17].map(|id| CpuLocation::from_apic(id, 1, 4));
+    let root = Kobject::new_root("sys");
+    populate_cpu_devices_with(&root, &locations, || 0b01111);
+    let cpu_dir = root
+        .get_child("devices")
+        .unwrap()
+        .get_child("system")
+        .unwrap()
+        .get_child("cpu")
+        .unwrap();
+    if cpu_dir.attr_show("online").as_deref() != Some("0-3\n") {
+        return TestResult::Fail("lscpu online list includes an offline CPU");
+    }
+    for (cpu, core, socket, threads, package, package_list) in [
+        (0, "1\n", "1\n", "01\n", "09\n", "0,3\n"),
+        (1, "0\n", "0\n", "06\n", "06\n", "1-2\n"),
+        (2, "0\n", "0\n", "06\n", "06\n", "1-2\n"),
+        (3, "0\n", "1\n", "08\n", "09\n", "0,3\n"),
+        (4, "0\n", "1\n", "00\n", "00\n", "\n"),
+    ] {
+        let topo = cpu_dir
+            .get_child(&format!("cpu{cpu}"))
+            .unwrap()
+            .get_child("topology")
+            .unwrap();
+        for (attr, value) in [
+            ("core_id", core),
+            ("physical_package_id", socket),
+            ("thread_siblings", threads),
+            ("core_cpus", threads),
+            ("core_siblings", package),
+            ("package_cpus", package),
+            ("core_siblings_list", package_list),
+            ("package_cpus_list", package_list),
+        ] {
+            if topo.attr_show(attr).as_deref() != Some(value) {
+                return TestResult::Fail("lscpu core/package ID or online sibling mask is wrong");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("filesystem/sysfs/lscpu", smoke_sysfs_lscpu_siblings);
 
 /// Populate the Linux perf event-source discovery tree.
 ///

@@ -70,6 +70,11 @@ pub(crate) fn hook_thread_list(pid: u64) -> Option<Vec<u64>> {
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
+#[cfg(target_arch = "x86_64")]
+mod x86_cpuinfo;
+#[cfg(target_arch = "x86_64")]
+pub use x86_cpuinfo::record_current_cpu_info;
+
 pub mod aggregate;
 pub mod bus;
 pub mod kallsyms;
@@ -3065,30 +3070,33 @@ fn gen_cpuinfo_with(online: u64, frequency: impl Fn(u32) -> Option<u64>) -> Stri
     #[cfg(target_arch = "x86_64")]
     {
         use narf_arch::x86_64::ident;
-        let id = ident::read();
-        let vendor_str = match id.vendor {
-            ident::Vendor::Intel => "GenuineIntel",
-            ident::Vendor::Amd => "AuthenticAMD",
-            ident::Vendor::Hygon => "HygonGenuine",
-            ident::Vendor::Centaur => "CentaurHauls",
-            ident::Vendor::Via => "VIA VIA VIA ",
-            ident::Vendor::Zhaoxin => "  Shanghai  ",
-            ident::Vendor::Other(_) => "Unknown",
-        };
-        let brand = ident::brand_str(&id);
-        let model_name = if brand.is_empty() { "(unknown)" } else { brand };
-        // Identity is shared on the currently supported homogeneous systems;
-        // frequency must be indexed by the reported CPU, never the reader's.
+        let fallback = ident::read();
         for cpu in 0..narf_lib::percpu::MAX_CPUS as u32 {
             if online & (1u64 << cpu) == 0 {
                 continue;
             }
+            let info = x86_cpuinfo::get(cpu);
+            let id = info.as_ref().map(|sample| &sample.id).unwrap_or(&fallback);
+            let vendor_str = match id.vendor {
+                ident::Vendor::Intel => "GenuineIntel",
+                ident::Vendor::Amd => "AuthenticAMD",
+                ident::Vendor::Hygon => "HygonGenuine",
+                ident::Vendor::Centaur => "CentaurHauls",
+                ident::Vendor::Via => "VIA VIA VIA ",
+                ident::Vendor::Zhaoxin => "  Shanghai  ",
+                ident::Vendor::Other(_) => "Unknown",
+            };
+            let brand = ident::brand_str(id);
+            let model_name = if brand.is_empty() { "(unknown)" } else { brand };
             let _ = writeln!(s, "processor\t: {}", cpu);
             let _ = writeln!(s, "vendor_id\t: {}", vendor_str);
             let _ = writeln!(s, "cpu family\t: {}", id.family);
             let _ = writeln!(s, "model\t\t: {}", id.model);
             let _ = writeln!(s, "model name\t: {}", model_name);
             let _ = writeln!(s, "stepping\t: {}", id.stepping);
+            if let Some(info) = info {
+                info.write_fields(&mut s);
+            }
             write_cpu_frequency(&mut s, frequency(cpu));
             let _ = writeln!(s);
         }
