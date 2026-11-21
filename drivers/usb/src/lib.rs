@@ -510,6 +510,12 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
 
             // ── Phase 1: try ONE root-hub port, then move on. ──────
             SUPERVISOR_PHASE.store(3, core::sync::atomic::Ordering::Relaxed);
+            // Acknowledge every root port's change bits (Linux: the hub
+            // driver's ClearPortFeature(C_*) → `xhci_clear_port_change_bit`)
+            // so the next change raises a new Port Status Change Event.
+            for p in 1..=c.max_ports() {
+                let _ = c.ack_root_port_changes(p);
+            }
             let connected_root: alloc::vec::Vec<u8> =
                 c.connected_ports().iter().map(|(p, _)| *p).collect();
             SUPERVISOR_PHASE.store(4, core::sync::atomic::Ordering::Relaxed);
