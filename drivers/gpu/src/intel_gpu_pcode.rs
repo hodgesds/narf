@@ -1,9 +1,13 @@
-//! GT pcode mailbox codec — Gen12 display reads.
+//! GT pcode mailbox codec — Gen12 display reads and the CDCLK
+//! frequency-request write.
 //!
 //! The pcode (punit) mailbox is how the display engine asks the
 //! power controller for platform data. Lane Q6 (#1024) needs two
 //! reads from it: the memory-latency table that drives the
-//! watermark algorithm, and the SAGV block time.
+//! watermark algorithm, and the SAGV block time. The Gen12 CDCLK
+//! change sequence (`intel_gpu_gen12_cdclk`) needs one write:
+//! the display-engine frequency request that lets the punit set
+//! the voltage for the new CDCLK before the PLL is reprogrammed.
 //!
 //! ## Protocol (i915 `display/intel_pcode.c::__snb_pcode_rw`)
 //!
@@ -60,6 +64,15 @@ pub const PCODE_CMD_READ_MEM_LATENCY: u32 = 0x06;
 /// `GEN12_PCODE_READ_SAGV_BLOCK_TIME_US` (0x23). Returns the
 /// SAGV block time in microseconds in DATA0.
 pub const PCODE_CMD_READ_SAGV_BLOCK_TIME_US: u32 = 0x23;
+
+/// `HSW_PCODE_DE_WRITE_FREQ_REQ` (0x17, `i915_reg.h`): the
+/// display-engine frequency request. DATA0-in carries the
+/// request: 0x80000000 for a pre-change notification (the punit
+/// raises the voltage for the new CDCLK), or the target voltage
+/// level for the post-change notification (`bxt_cdclk_pcode_pre_notify`
+/// / `bxt_cdclk_pcode_post_notify` in `display/intel_cdclk.c`).
+/// The punit answers with no data dwords.
+pub const PCODE_CMD_DE_WRITE_FREQ_REQ: u32 = 0x17;
 
 /// Documented pcode status codes from `intel_pcode_regs.h`.
 /// Codes not in this list fall through to success, mirroring
@@ -137,6 +150,43 @@ pub fn pcode_read<M: MmioWindow + ?Sized>(
     }
     check_status(final_mailbox)?;
     Ok((mmio.read32(PCODE_DATA0), mmio.read32(PCODE_DATA1)))
+}
+
+/// Run one pcode write transaction: `data0_in` / `data1_in` are
+/// the input dwords; no data dwords come back. Same mailbox
+/// protocol as [`pcode_read`], with the 2 ms budget Linux's
+/// `intel_parent_pcode_write_timeout` uses
+/// (`display/intel_pcode.c`).
+pub fn pcode_write<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    cmd: u32,
+    param1: u32,
+    param2: u32,
+    data0_in: u32,
+    data1_in: u32,
+) -> Result<(), PcodeError> {
+    let _transaction = TRANSACTION.try_lock().ok_or(PcodeError::Busy)?;
+    if mmio.read32(PCODE_MAILBOX) & PCODE_READY != 0 {
+        return Err(PcodeError::Busy);
+    }
+    mmio.write32(PCODE_DATA0, data0_in);
+    mmio.write32(PCODE_DATA1, data1_in);
+    mmio.write32(PCODE_MAILBOX, mailbox_word(cmd, param1, param2));
+    compiler_fence(Ordering::SeqCst);
+
+    // The port is polled and never depends on another executor task. Keep
+    // the bounded source timeout while servicing the common console pumps.
+    let mut final_mailbox = PCODE_READY;
+    if !narf_scheduler::responsive_spin_until(
+        || {
+            final_mailbox = mmio.read32(PCODE_MAILBOX);
+            final_mailbox & PCODE_READY == 0
+        },
+        narf_time::Deadline::after_ms(2),
+    ) {
+        return Err(PcodeError::Timeout);
+    }
+    check_status(final_mailbox)
 }
 
 /// Read the 8-entry memory-latency table (microseconds per
@@ -246,6 +296,11 @@ pub mod tests {
                                 *self.data0.borrow_mut() = self.sagv_block_time;
                                 0
                             }
+                            PCODE_CMD_DE_WRITE_FREQ_REQ => {
+                                // The frequency request is accepted;
+                                // the punit answers with no data dwords.
+                                0
+                            }
                             _ => 0x1, // GEN6_PCODE_ILLEGAL_CMD
                         },
                     };
@@ -350,4 +405,41 @@ pub mod tests {
         }
     }
     kernel_test_in!("drivers/gpu/intel_gpu_pcode", smoke_pcode_busy_and_timeout);
+
+    fn smoke_pcode_write_freq_req() -> TestResult {
+        let mmio = PcodeMmio::new([0; 8], 0);
+        // Pre-change notify: DATA0 0x80000000.
+        if pcode_write(&mmio, PCODE_CMD_DE_WRITE_FREQ_REQ, 0, 0, 0x8000_0000, 0).is_err() {
+            return TestResult::Fail("frequency-request pre-notify must succeed");
+        }
+        // Post-change notify: DATA0 = voltage level 2.
+        if pcode_write(&mmio, PCODE_CMD_DE_WRITE_FREQ_REQ, 0, 0, 2, 0).is_err() {
+            return TestResult::Fail("frequency-request post-notify must succeed");
+        }
+        let w = mmio.writes.borrow();
+        let mailbox_writes: Vec<u32> = w
+            .iter()
+            .filter(|(o, _)| *o == PCODE_MAILBOX)
+            .map(|(_, v)| *v)
+            .collect();
+        if mailbox_writes != alloc::vec![0x8000_0017, 0x8000_0017] {
+            return TestResult::Fail("expected two frequency-request commands (0x17)");
+        }
+        let data0_writes: Vec<u32> = w
+            .iter()
+            .filter(|(o, _)| *o == PCODE_DATA0)
+            .map(|(_, v)| *v)
+            .collect();
+        if data0_writes != alloc::vec![0x8000_0000, 2] {
+            return TestResult::Fail("frequency-request DATA0 values wrong");
+        }
+        // A refused request surfaces the status (forced 0x11).
+        let mut mmio = PcodeMmio::new([0; 8], 0);
+        mmio.forced_status = Some(0x11);
+        match pcode_write(&mmio, PCODE_CMD_DE_WRITE_FREQ_REQ, 0, 0, 0x8000_0000, 0) {
+            Err(PcodeError::Status(0x11)) => TestResult::Pass,
+            _ => TestResult::Fail("rejected frequency request must surface Status(0x11)"),
+        }
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_pcode", smoke_pcode_write_freq_req);
 }

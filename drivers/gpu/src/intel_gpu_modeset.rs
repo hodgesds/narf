@@ -266,6 +266,13 @@ pub enum ModesetError {
     AuxFailure(AuxError),
     /// DPLL didn't lock within the spec-mandated 1 ms window.
     PllLockTimeout,
+    /// The Gen12 CDCLK sequence (`intel_gpu_gen12_cdclk`)
+    /// could not establish the floor clock: the pcode
+    /// pre-notify was refused, the CDCLK PLL never locked, or
+    /// the programmed clock did not read back. A pre-notify
+    /// refusal leaves the previous clock untouched; a later
+    /// failure may leave it mid-change, so the modeset stops.
+    CdclkUnavailable,
     /// DP link training failed at clock-recovery phase.
     LinkTrainingCr,
     /// DP link training failed at channel-equalization phase.
@@ -654,7 +661,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.enable_pg1()?;
         self.disable_pipeline();
         self.program_dpll_coeffs(&coeffs)?;
-        self.program_cdclk_floor(mode);
+        self.program_cdclk_floor(mode)?;
         self.program_dpclka_routing()?;
         self.enable_pipe_power_well(self.pipe)?;
         self.program_transcoder(mode);
@@ -788,9 +795,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
         // Step 4b (lane 1, #1010): raise CDCLK to the floor this
         // pixel clock needs — PRM: "Pipe maximum pixel rate =
-        // 2 * CDCLK frequency" with CD2X divider 1. Only raises;
-        // a faster firmware CDCLK is left alone.
-        self.program_cdclk_floor(&mode);
+        // 2 * CDCLK frequency". The TGL model programs the DE
+        // PLL ratio and CD2X divider for the smallest
+        // `icl_cdclk_table` rung at or above the floor, with
+        // pcode frequency-request notifies. Only raises; a
+        // faster firmware CDCLK is left alone.
+        self.program_cdclk_floor(&mode)?;
 
         // Step 4c (lane 1): route this DDI's DPLL to the DDI in
         // DPCLKA_CFGCR0 — select the PLL and turn the DDI clock
@@ -1492,24 +1502,38 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         Ok(())
     }
 
-    /// Raise CDCLK to the floor for `mode`'s pixel clock.
-    fn program_cdclk_floor(&mut self, mode: &Mode) {
-        let cur = self.mmio.read32(CDCLK_CTL);
-        let cur_khz = cdclk_decode_khz(cur);
+    /// Raise CDCLK to the floor for `mode`'s pixel clock
+    /// (PRM rule `pixel_clock <= 2 * CDCLK`, floor =
+    /// `pixel_clock / 2`), via the TGL CDCLK model
+    /// (`intel_gpu_gen12_cdclk`: `icl_cdclk_table` rung by the
+    /// DSSM reference strap, DE PLL ratio + CD2X divider, pcode
+    /// frequency-request notifies). Only raises; a faster
+    /// firmware CDCLK is left alone, and a floor past the table
+    /// leaves the firmware clock alone too. A refused pcode
+    /// pre-notify degrades the same way (leave the firmware
+    /// clock; the modeset proceeds — the standing contract in
+    /// this file is that pcode failure degrades, it does not
+    /// fail the modeset). A PLL lock timeout, lost access or
+    /// readback mismatch fails the modeset.
+    fn program_cdclk_floor(&mut self, mode: &Mode) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen12_cdclk as cdclk;
+        let current =
+            cdclk::Current::read(self.mmio).map_err(|_| ModesetError::CdclkUnavailable)?;
         let floor_khz = mode.pixel_clock_khz.div_ceil(2);
-        if floor_khz <= cur_khz {
-            return;
+        if let Some(known) = current.known {
+            if known.cdclk_khz >= floor_khz {
+                return Ok(());
+            }
         }
-        let (freq_khz, sel, decimal) = match cdclk_for_pixel_clock(mode.pixel_clock_khz) {
-            Some(v) => v,
-            None => return, // beyond the ladder; leave firmware CDCLK
+        let target = match cdclk::calc_cdclk(current.refclk_khz, floor_khz) {
+            Some(r) => r,
+            None => return Ok(()), // beyond the table; leave firmware CDCLK
         };
-        let _ = freq_khz;
-        let val = (sel << CDCLK_FREQ_SEL_SHIFT)
-            | CDCLK_SSA_PRECHARGE
-            | (decimal & CDCLK_FREQ_DECIMAL_MASK);
-        self.mmio.write32(CDCLK_CTL, val);
-        compiler_fence(Ordering::SeqCst);
+        match cdclk::program(self.mmio, &current, target) {
+            Ok(()) => Ok(()),
+            Err(cdclk::CdclkError::Pcode(_)) => Ok(()),
+            Err(_) => Err(ModesetError::CdclkUnavailable),
+        }
     }
 
     /// Program the DP data/link M/N registers for this run's
@@ -1847,41 +1871,6 @@ fn mode_to_display_timing(mode: &Mode) -> crate::intel_gpu_pipes::DisplayTiming 
         vsync_end: mode.v_sync_end,
         vtotal: mode.v_total,
     }
-}
-
-// ── CDCLK (TGL PRM Vol. 12 §"Clocks"; CDCLK_CTL at 0x46000) ────
-
-const CDCLK_CTL: u64 = 0x4_6000;
-const CDCLK_FREQ_SEL_SHIFT: u32 = 26;
-const CDCLK_FREQ_DECIMAL_MASK: u32 = 0x7FF;
-const CDCLK_SSA_PRECHARGE: u32 = 1 << 16;
-
-/// CDCLK ladder for the 19.2/38.4 MHz reference family:
-/// (frequency kHz, FREQ_SEL value). FREQ_SEL bands: 0 =
-/// 450/432 MHz, 1 = 540, 2 = 337.5/307.2, 3 = 675/617.28. The
-/// band for each ladder rung is the voltage level that rung
-/// requires; the decimal field carries the exact frequency as
-/// (kHz - 1000) / 500.
-const CDCLK_LADDER: &[(u32, u32)] = &[(337_500, 2), (432_000, 0), (540_000, 1), (675_000, 3)];
-
-/// Smallest ladder CDCLK that satisfies the PRM floor
-/// `pixel_clock <= 2 * CDCLK` for `pixel_clock_khz`, as
-/// (freq_khz, freq_sel, decimal_field). `None` past the ladder.
-fn cdclk_for_pixel_clock(pixel_clock_khz: u32) -> Option<(u32, u32, u32)> {
-    let floor_khz = pixel_clock_khz.div_ceil(2);
-    for (freq, sel) in CDCLK_LADDER {
-        if *freq >= floor_khz {
-            let decimal = (freq - 1000 + 250) / 500;
-            return Some((*freq, *sel, decimal));
-        }
-    }
-    None
-}
-
-/// Decode the current CDCLK frequency (kHz) from CDCLK_CTL's
-/// decimal field: freq = decimal * 500 + 1000 (Hz-scaled x1000).
-fn cdclk_decode_khz(ctl: u32) -> u32 {
-    (ctl & CDCLK_FREQ_DECIMAL_MASK) * 500 + 1000
 }
 
 // ── Watermark / DBUF allocation registers (plane 1, pipe A) ────
@@ -2838,27 +2827,6 @@ pub mod tests {
         smoke_enable_ddi_buffer_writes_lane_and_enable
     );
 
-    fn smoke_cdclk_floor_ladder() -> TestResult {
-        // 65 MHz pixel clock: floor 32.5 MHz -> lowest rung.
-        match super::cdclk_for_pixel_clock(65_000) {
-            Some((337_500, 2, 673)) => {}
-            _ => return TestResult::Fail("65 MHz must pick 337.5 MHz CDCLK (sel 2, decimal 673)"),
-        }
-        // 1 GHz pixel clock: floor 500 MHz -> 540 MHz rung.
-        match super::cdclk_for_pixel_clock(1_000_000) {
-            Some((540_000, 1, 1078)) => {}
-            _ => return TestResult::Fail("1 GHz must pick 540 MHz CDCLK (sel 1, decimal 1078)"),
-        }
-        if super::cdclk_for_pixel_clock(1_400_000).is_some() {
-            return TestResult::Fail("beyond-ladder pixel clock must be None");
-        }
-        if super::cdclk_decode_khz(673) != 337_500 {
-            return TestResult::Fail("CDCLK decimal decode round-trip");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!("drivers/gpu/intel_gpu_modeset", smoke_cdclk_floor_ladder);
-
     fn smoke_program_mn_writes_link_n_last() -> TestResult {
         use crate::intel_gpu_pipes::Transcoder;
         let mmio = FakeMmio::new();
@@ -3303,6 +3271,11 @@ pub mod tests {
                     self.pcode_data.borrow_mut()[0] = self.sagv_block_time;
                     *self.pcode_mailbox.borrow_mut() = 0;
                 }
+                crate::intel_gpu_pcode::PCODE_CMD_DE_WRITE_FREQ_REQ => {
+                    // The frequency request is accepted; the punit
+                    // answers with no data dwords.
+                    *self.pcode_mailbox.borrow_mut() = 0;
+                }
                 _ => *self.pcode_mailbox.borrow_mut() = 0x1, // ILLEGAL_CMD
             }
         }
@@ -3409,6 +3382,17 @@ pub mod tests {
                         v |= super::PLL_LOCK;
                     }
                     v
+                }
+                o if o == crate::intel_gpu_gen12_cdclk::DE_PLL_ENABLE => {
+                    // CDCLK PLL LOCK follows ENABLE (same shape as
+                    // the DPLL arm above).
+                    use crate::intel_gpu_gen12_cdclk::{PLL_ENABLE, PLL_LOCK};
+                    let stored = self.get(off);
+                    if stored & PLL_ENABLE != 0 {
+                        stored | PLL_LOCK
+                    } else {
+                        stored & !PLL_LOCK
+                    }
                 }
                 o if o == Pipe::A.base() + PIPECONF_OFFSET => {
                     let stored = self.get(off);
@@ -3548,6 +3532,24 @@ pub mod tests {
         let cfgcr0 = mmio.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
         if cfgcr0 != alloc::vec![0x01C0_01A5] {
             return TestResult::Fail("CFGCR0 must be the 19.2-family RBR row");
+        }
+        // CDCLK: 148.5 MHz pixel clock, floor 74.25 MHz, 19.2 MHz
+        // strap -> the 172.8 MHz icl rung (ratio 18, DIV_SEL_1,
+        // decimal 344), with pcode pre + post notifies (0x17).
+        use crate::intel_gpu_gen12_cdclk::{CDCLK_CTL, DE_PLL_ENABLE};
+        if mmio.writes_to(DE_PLL_ENABLE) != alloc::vec![0, 18, 0x8000_0012] {
+            return TestResult::Fail("CDCLK PLL must disable, then enable at ratio 18");
+        }
+        if mmio.writes_to(CDCLK_CTL) != alloc::vec![(7 << 19) | 344] {
+            return TestResult::Fail("CDCLK_CTL must be pipe-none + decimal 344");
+        }
+        let freq_req = mmio
+            .writes_to(crate::intel_gpu_pcode::PCODE_MAILBOX)
+            .into_iter()
+            .filter(|w| *w == 0x8000_0017)
+            .count();
+        if freq_req != 2 {
+            return TestResult::Fail("CDCLK change must send pre + post frequency requests");
         }
         // Watermarks: the values hand-computed from the
         // algorithm for this mode + the sink's latency table.
