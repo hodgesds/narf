@@ -479,9 +479,8 @@ async fn bind_mouse_addressed_slot(
 }
 
 /// Lock-free count of bound mice. Same rationale as
-/// `hid::ATTACHED_KEYBOARD_COUNT` — pump_all holds MICE for the
-/// duration of every interrupt-IN read; the diagnostic path
-/// must not contend on it.
+/// `hid::ATTACHED_KEYBOARD_COUNT`: `pump_all` moves the bindings out
+/// of MICE while it pumps them.
 pub static ATTACHED_MOUSE_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -501,9 +500,10 @@ pub fn hub_ports(controller: u8) -> alloc::vec::Vec<(u8, u8)> {
 /// Drain one report from each attached mouse. Returns total events
 /// emitted across all mice.
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
-    let mut g = MICE.of(xhci_dev.id()).lock();
     let mut total = 0usize;
-    for m in g.iter_mut() {
+    // The ring drain, pointer routing and console notes run with the
+    // registry unlocked (`super::pump_unlocked`).
+    super::pump_unlocked(MICE.of(xhci_dev.id()), |m| {
         let result = m.pump_once(xhci_dev);
         let got = matches!(result, Ok(n) if n > 0);
         super::note_pump(
@@ -516,7 +516,7 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
         if let Ok(n) = result {
             total += n;
         }
-    }
+    });
     total
 }
 
