@@ -1634,7 +1634,7 @@ fn smoke_sysfs_cpu_range_attrs() -> TestResult {
     let _topo = narf_lib::smp::__reset_for_test_scoped();
 
     // Default: 1 CPU → "0\n"
-    crate::sysfs::populate_cpu_devices();
+    crate::sysfs::populate_test_cpu_devices();
     let root = crate::sysfs::sysfs_root();
     let cpu_dir = match root
         .get_child("devices")
@@ -1665,7 +1665,7 @@ fn smoke_sysfs_cpu_range_attrs() -> TestResult {
     // Bump to 4 CPUs and re-populate.
     crate::sysfs::__reset_for_test();
     narf_lib::smp::set_cpu_count(4);
-    crate::sysfs::populate_cpu_devices();
+    crate::sysfs::populate_test_cpu_devices();
 
     let root = crate::sysfs::sysfs_root();
     let cpu_dir = match root
@@ -1695,7 +1695,7 @@ fn smoke_sysfs_cpu_range_attrs() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_sysfs_cpu_range_attrs);
+kernel_test_in!("filesystem/sysfs/cpu", smoke_sysfs_cpu_range_attrs);
 
 /// Test 11: cpu0 dir exists; cpu0 has no `online` attr (Linux convention);
 /// cpuN dirs exist for all CPUs in the possible set.
@@ -1704,7 +1704,7 @@ fn smoke_sysfs_cpu_dirs_and_online_attr() -> TestResult {
     // Scoped — see smoke_sysfs_cpu_range_attrs.
     let _topo = narf_lib::smp::__reset_for_test_scoped();
     narf_lib::smp::set_cpu_count(3);
-    crate::sysfs::populate_cpu_devices();
+    crate::sysfs::populate_test_cpu_devices();
 
     let root = crate::sysfs::sysfs_root();
     let cpu_dir = match root
@@ -1743,7 +1743,7 @@ fn smoke_sysfs_cpu_dirs_and_online_attr() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_sysfs_cpu_dirs_and_online_attr);
+kernel_test_in!("filesystem/sysfs/cpu", smoke_sysfs_cpu_dirs_and_online_attr);
 
 /// Test 12: topology attrs render correct values for cpu2 with 4 CPUs.
 ///
@@ -1757,7 +1757,7 @@ fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
     // Scoped — see smoke_sysfs_cpu_range_attrs.
     let _topo = narf_lib::smp::__reset_for_test_scoped();
     narf_lib::smp::set_cpu_count(4);
-    crate::sysfs::populate_cpu_devices();
+    crate::sysfs::populate_test_cpu_devices();
 
     let root = crate::sysfs::sysfs_root();
     let cpu2_topo = match root
@@ -1791,7 +1791,7 @@ fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_sysfs_cpu_topology_attrs);
+kernel_test_in!("filesystem/sysfs/cpu", smoke_sysfs_cpu_topology_attrs);
 
 /// Test 13: hex masks are Linux `%*pb` over `nr_cpu_ids` bits — 32-bit
 /// chunks high first, the leading chunk only as wide as its bits need.
@@ -1808,7 +1808,7 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
     // Scoped — see smoke_sysfs_cpu_range_attrs.
     let _topo = narf_lib::smp::__reset_for_test_scoped();
     narf_lib::smp::set_cpu_count(4);
-    crate::sysfs::populate_cpu_devices();
+    crate::sysfs::populate_test_cpu_devices();
 
     let root = crate::sysfs::sysfs_root();
     let cpu2_topo = match root
@@ -1849,7 +1849,7 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
     // 40 CPUs: an 8-bit leading chunk, then a full 32-bit one.
     crate::sysfs::__reset_for_test();
     narf_lib::smp::set_cpu_count(40);
-    crate::sysfs::populate_cpu_devices();
+    crate::sysfs::populate_test_cpu_devices();
     let pkg40 = crate::sysfs::sysfs_root()
         .get_child("devices")
         .and_then(|d| d.get_child("system"))
@@ -1863,7 +1863,7 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_sysfs_cpu_hex_mask_format);
+kernel_test_in!("filesystem/sysfs/cpu", smoke_sysfs_cpu_hex_mask_format);
 
 /// The shared `%*pb` formatter behind every cpumask file (topology masks,
 /// node `cpumap`, `Cpus_allowed`), case by case against Linux
@@ -1886,7 +1886,7 @@ fn smoke_sysfs_cpumask_pb_format() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem", smoke_sysfs_cpumask_pb_format);
+kernel_test_in!("filesystem/sysfs/cpu", smoke_sysfs_cpumask_pb_format);
 
 /// Linux perf discovers PMU type numbers and raw-event bitfields through
 /// `/sys/bus/event_source/devices`.

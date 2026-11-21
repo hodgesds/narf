@@ -1245,6 +1245,20 @@ Open file descriptions retain the mount ID visible at open time, including for
 ancestor mount ID as each entry's parent for `/proc/<pid>/mountinfo`.
 The procfs view hides mounts outside the queried task's root and projects that
 root to `/`, so a chrooted task never sees backing prefixes such as `/mnt`.
+CPU sysfs exposes the online logical CPU list and, for each CPU, its
+package-relative core ID, physical package ID and sibling masks in Linux
+hexadecimal and CPU-list formats. `thread_siblings` aliases `core_cpus`;
+`core_siblings` aliases `package_cpus`. Both include online members only.
+On x86 with extended CPUID topology and a complete MADT logical CPU map,
+socket and SMT membership follow the hardware APIC address layout. Other
+targets retain the single-package, one-logical-CPU-per-core fallback.
+
+On x86 the CPU telemetry worker snapshots CPUID once on its owning CPU,
+including identity, address widths, CLFLUSH size and Linux feature names.
+The long-mode flag supplies the x86-64 operating mode to `lscpu`. AVX-family
+flags require OSXSAVE and enabled XMM/YMM state. Unavailable address widths
+and CLFLUSH sizes are omitted.
+
 `/proc/cpuinfo` emits one record per online logical CPU, preserving sparse
 CPU IDs. `install_cpu_frequency_hook(fn(u32) -> Option<u64>)` supplies cached
 per-CPU busy frequency in kHz; procfs formats `cpu MHz` with three decimal
