@@ -12,16 +12,19 @@
 //!
 //! - A `DDI_BUF_CTL` register with the port-enable bit, lane
 //!   count, and link-up status.
-//! - A `DDI_BUF_TRANS` table programming the analog voltage-swing
-//!   and pre-emphasis coefficients (per HBR rate, per swing
-//!   level).
+//! - Voltage-swing / pre-emphasis programming, which Gen12 does
+//!   NOT do through `DDI_BUF_TRANS` (`has_buf_trans_select` is
+//!   DISPLAY_VER < 10): the combo PHY is programmed through
+//!   PORT_TX_DW2/DW4/DW5/DW7 in `intel_gpu_gen12_combo_phy`.
+//!   (`DDI_BUF_TRANS` registers exist on the DDI block but the
+//!   hardware ignores them on Gen12.)
 //! - Optionally a `DDI_AUX_CTL` for native DP AUX transactions
 //!   (the Stage-2 DP AUX framing in `dp_aux` produces the wire
 //!   bytes; this block is the transport).
 //!
-//! Stage-2 ships the `DDI_BUF_CTL` codec, the lane-count enum,
-//! and the documented DP HBR voltage-swing table. The actual
-//! MMIO writes happen in the Stage-3 driver core.
+//! Stage-2 ships the `DDI_BUF_CTL` codec and the lane-count
+//! enum. The actual MMIO writes happen in the Stage-3 driver
+//! core.
 
 use core::convert::TryFrom;
 
@@ -65,9 +68,6 @@ impl Ddi {
 
 /// `DDI_BUF_CTL` offset relative to the DDI base.
 pub const DDI_BUF_CTL_OFFSET: u64 = 0x0000;
-/// `DDI_BUF_TRANS_LO[N]` offset for swing-table entry N (each
-/// entry is 8 bytes: low + high dword).
-pub const DDI_BUF_TRANS_BASE_OFFSET: u64 = 0x0010;
 
 /// `DDI_BUF_CTL[31]` — buffer enable.
 pub const DDI_BUF_CTL_ENABLE: u32 = 1 << 31;
@@ -98,102 +98,6 @@ impl LaneCount {
 /// programs the top-level enable + lane count.
 pub fn build_ddi_buf_ctl(lanes: LaneCount) -> u32 {
     DDI_BUF_CTL_ENABLE | lanes.encode()
-}
-
-// ── DDI_BUF_TRANS — DP voltage-swing / pre-emphasis ──────────────
-//
-// Source: TGL PRM Vol. 12 §"DDI Buffer Translation Tables for DP".
-//
-// The PRM publishes voltage-swing / pre-emphasis coefficient
-// tables per link rate (RBR 1.62, HBR 2.7, HBR2 5.4, HBR3 8.1
-// Gbps). Each entry is two 32-bit words written to
-// `DDI_BUF_TRANS_LO/HI[N]`.
-//
-// The values below are the Combo-PHY HBR2 default table for
-// Tiger Lake — the *most-conservative* set the PRM documents.
-// Real hardware works through the table from index 0 (lowest
-// swing) upward when DP link training requests escalation.
-// Per-product board files override these for non-default trace
-// lengths; the table here is the public-default fallback.
-
-/// One DP voltage-swing / pre-emphasis pair.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct DpBufTrans {
-    pub lo: u32,
-    pub hi: u32,
-}
-
-/// HBR2 swing table for Combo PHY DDIs on Tiger Lake. PRM Vol. 12
-/// §"DP HBR2 — DDI Buffer Translation".
-///
-/// Index ↔ DPCD voltage-swing levels:
-/// 0 → 400 mV   no  pre-emphasis
-/// 1 → 600 mV   3.5 dB pre-emphasis
-/// 2 → 800 mV   6.0 dB pre-emphasis
-/// 3 → 1200 mV  0.0 dB pre-emphasis (max swing, used for long traces)
-pub const HBR2_BUF_TRANS: [DpBufTrans; 4] = [
-    DpBufTrans {
-        lo: 0x0000_00A2,
-        hi: 0x0000_0018,
-    },
-    DpBufTrans {
-        lo: 0x0000_00A4,
-        hi: 0x0000_0034,
-    },
-    DpBufTrans {
-        lo: 0x0000_00A2,
-        hi: 0x0000_0030,
-    },
-    DpBufTrans {
-        lo: 0x0000_0034,
-        hi: 0x0000_0030,
-    },
-];
-
-/// HBR3 swing table for Combo PHY DDIs on Tiger Lake. PRM Vol. 12
-/// §"DP HBR3 — DDI Buffer Translation".
-pub const HBR3_BUF_TRANS: [DpBufTrans; 4] = [
-    DpBufTrans {
-        lo: 0x0000_00A1,
-        hi: 0x0000_0019,
-    },
-    DpBufTrans {
-        lo: 0x0000_00A3,
-        hi: 0x0000_0035,
-    },
-    DpBufTrans {
-        lo: 0x0000_00A1,
-        hi: 0x0000_0031,
-    },
-    DpBufTrans {
-        lo: 0x0000_0033,
-        hi: 0x0000_0030,
-    },
-];
-
-/// Resolve the swing table for a DP link rate.
-pub fn dp_buf_trans_table(link_bw_set: u8) -> Option<&'static [DpBufTrans; 4]> {
-    // `link_bw_set` is the DPCD value (0x06 = RBR, 0x0A = HBR,
-    // 0x14 = HBR2, 0x1E = HBR3). Source: VESA DP 1.4a §2.9.3.2.
-    //
-    // RBR and HBR resolve to the HBR2 table: the analog swing
-    // coefficients in a DDI_BUF_TRANS table are indexed by the
-    // voltage-swing / pre-emphasis *level* link training
-    // negotiates over DPCD, not by link rate, and the Gen12
-    // combo-PHY DP translation is a single table per VccIO
-    // (TGL PRM Vol. 12 publishes per-protocol PORT_TX tables for
-    // the TC PHYs, whose level rows for "DP up to HBR" and
-    // "DP HBR2" share the same swing levels). Before lane 1
-    // RBR/HBR returned `None` and — like HBR2/HBR3 — had no
-    // writer at all; lane 1 adds the writer in the modeset and
-    // this resolution for the fallback rates. If a board file
-    // later publishes distinct RBR/HBR coefficients, they
-    // replace this fallback in exactly this one place.
-    match link_bw_set {
-        0x06 | 0x0A | 0x14 => Some(&HBR2_BUF_TRANS),
-        0x1E => Some(&HBR3_BUF_TRANS),
-        _ => None,
-    }
 }
 
 impl TryFrom<u8> for Ddi {
@@ -244,24 +148,4 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_ddi", smoke_buf_ctl_encoding);
-
-    fn smoke_buf_trans_table_resolution() -> TestResult {
-        if dp_buf_trans_table(0x14).is_none() {
-            return TestResult::Fail("HBR2 not resolved");
-        }
-        if dp_buf_trans_table(0x1E).is_none() {
-            return TestResult::Fail("HBR3 not resolved");
-        }
-        if dp_buf_trans_table(0x06).is_none() || dp_buf_trans_table(0x0A).is_none() {
-            return TestResult::Fail("RBR/HBR must resolve (lane 1 fallback table)");
-        }
-        if dp_buf_trans_table(0xFF).is_some() {
-            return TestResult::Fail("unknown rate must be None");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "drivers/gpu/intel_gpu_ddi",
-        smoke_buf_trans_table_resolution
-    );
 }

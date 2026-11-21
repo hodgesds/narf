@@ -775,6 +775,9 @@ pub mod intel_gpu_forcewake;
 pub mod intel_gpu_gem;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_gen12_cdclk;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_gen12_combo_phy;
+#[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_gen12_cursor_resources;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen12_tc;

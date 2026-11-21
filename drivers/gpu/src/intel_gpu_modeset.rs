@@ -396,6 +396,12 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// pre-boot single-pipe programming.
     dbuf_share: Option<(u16, u16)>,
     gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
+    /// Tiger Lake UY (GT2) part — selects the UY HBR2
+    /// combo-PHY table (`intel_gpu_gen12_combo_phy::is_tgl_uy`).
+    /// Set from the PCI device ID by `modeset_display_for_chip`
+    /// (the one site that knows it); default false (the
+    /// standard TGL table) everywhere else.
+    tgl_uy: bool,
     tc_width: u8,
 }
 
@@ -425,12 +431,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             pipe,
             dbuf_share: None,
             gen12_family: mmio.gen12_display_family(),
+            tgl_uy: false,
             tc_width: 4,
         }
     }
 
     pub(crate) fn set_gen12_family(&mut self, family: crate::intel_gpu_gt::Gen12Platform) {
         self.gen12_family = Some(family);
+    }
+
+    pub(crate) fn set_tgl_uy(&mut self, uy: bool) {
+        self.tgl_uy = uy;
     }
 
     pub(crate) fn set_typec_width(&mut self, width: u8) {
@@ -671,8 +682,19 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.enable_dbuf_slices()?;
         self.program_watermarks(mode, primary_fb);
         self.program_plane(primary_fb, mode);
-        // No step 9: no BUF_TRANS table load, no link training
-        // on a TMDS link.
+        // No step 9: no link training on a TMDS link — but the
+        // combo PHY still gets its signal levels: the ICL HDMI
+        // table's default entry, programmed before the DDI
+        // buffer enables (Linux `intel_ddi_pre_enable_hdmi`
+        // calls `set_signal_levels`; the old "no BUF_TRANS
+        // load" note predates the combo-PHY model).
+        let phy = crate::intel_gpu_gen12_combo_phy::ComboPhy::new(
+            self.ddi,
+            self.gen12_family,
+            self.tgl_uy,
+            false,
+        )?;
+        phy.set_hdmi_default_levels(self.mmio, mode.pixel_clock_khz)?;
         self.enable_ddi_buffer(4);
         self.enable_transcoder();
         self.enable_pipe();
@@ -886,28 +908,19 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // reads). Failure surfaces as
         // ModesetError::LinkTrainingCr/Eq; the panel stays dark.
         //
-        // Lane 1: load the DDI_BUF_TRANS swing table for the
-        // rate training starts at before training — the source
-        // PHY needs its coefficients while training runs. If
-        // training settles on a different rate, reload.
+        // The combo path programs its PHY levels inside
+        // `train_dp_link` (prepare at the start rate, then
+        // per-iteration updates from the sink's level requests
+        // via `TrainingAux`) — there is no preloaded table to
+        // reload when training settles elsewhere; the callback
+        // already re-selected the table for the settled rate.
         //
         // An MST secondary stream skips the whole step: the
-        // link is already trained and BUF_TRANS already loaded
+        // link is already trained and the PHY already programmed
         // by the primary stream's run on this DDI.
         let trained_link = match already_trained {
             Some(link) => Some(link),
-            None if dekel => self.train_dp_link(plan)?.1,
-            None => {
-                let start_rate = plan
-                    .map(|p| to_pll_rate(p.rate))
-                    .unwrap_or(LinkRate::DpHbr2);
-                self.load_combo_buf_trans(start_rate)?;
-                let (pll, trained) = self.train_dp_link(plan)?;
-                if pll != start_rate {
-                    self.load_combo_buf_trans(pll)?;
-                }
-                trained
-            }
+            None => self.train_dp_link(plan)?.1,
         };
 
         if let Some(t) = trained_link {
@@ -1389,7 +1402,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         plan: Option<LinkPlan>,
     ) -> Result<(LinkRate, Option<crate::dp_link_training::TrainedLink>), ModesetError> {
         use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
-        let mut aux = IntelAux::new(self.mmio, self.ddi);
+        let aux = IntelAux::new(self.mmio, self.ddi);
         // The legacy path starts at HBR2/4-lane and falls back
         // via `train_link`'s policy — the broadest envelope a
         // modern eDP panel will accept. The plan path starts at
@@ -1430,7 +1443,42 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             }
             result
         } else {
-            train_link(&mut aux, initial_rate, lanes, |_us| core::hint::spin_loop())
+            // Combo PHY (DDI A–C): program the (0, 0) levels and
+            // enable DP_TP_CTL with pattern 1, then let the sink
+            // drive per-iteration level updates through the same
+            // `TrainingAux` callback shape the Type-C branch
+            // uses. DDI A is the eDP panel port on Gen12
+            // laptops; VBT HOBL/low-vswing are not plumbed into
+            // the modeset yet (see `intel_gpu_gen12_combo_phy`).
+            let phy = crate::intel_gpu_gen12_combo_phy::ComboPhy::new(
+                self.ddi,
+                self.gen12_family,
+                self.tgl_uy,
+                self.ddi == Ddi::A,
+            )?;
+            phy.prepare(
+                self.mmio,
+                self.transcoder(),
+                to_pll_rate(initial_rate),
+                lanes,
+            )?;
+            let mut failure = None;
+            let mut aux = training::TrainingAux::new(
+                aux,
+                training::State::new(to_pll_rate(initial_rate), lanes),
+                |state: &training::State, change| {
+                    phy.training_update(self.mmio, self.transcoder(), state, change)
+                        .map_err(|error| {
+                            failure = Some(error);
+                            AuxError::Nacked
+                        })
+                },
+            );
+            let result = train_link(&mut aux, initial_rate, lanes, |_us| core::hint::spin_loop());
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            result
         };
         match result {
             Ok(trained) => {
@@ -1452,29 +1500,6 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     }
 
     // ── Lane-1 display correctness core ─────────────────────
-
-    /// Load the DDI_BUF_TRANS voltage-swing table for `rate`
-    /// into this DDI's translation registers (two dwords per
-    /// entry at DDI base + 0x10 + n*8). Before lane 1 the tables
-    /// in `intel_gpu_ddi` had zero writers tree-wide.
-    fn load_combo_buf_trans(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
-        use crate::intel_gpu_ddi::{dp_buf_trans_table, DDI_BUF_TRANS_BASE_OFFSET};
-        let bw = match rate.dpcd_link_bw_set() {
-            Some(b) => b,
-            None => return Err(ModesetError::PhyBusFailure),
-        };
-        let table = match dp_buf_trans_table(bw) {
-            Some(t) => t,
-            None => return Err(ModesetError::PhyBusFailure),
-        };
-        for (i, entry) in table.iter().enumerate() {
-            let off = self.ddi.base() + DDI_BUF_TRANS_BASE_OFFSET + (i as u64) * 8;
-            self.mmio.write32(off, entry.lo);
-            self.mmio.write32(off + 4, entry.hi);
-        }
-        compiler_fence(Ordering::SeqCst);
-        Ok(())
-    }
 
     /// Program DPCLKA_CFGCR0 routing: this DDI's DPLL
     /// (`dpll_index_for`) → this DDI, clock on, in the PRM's two
@@ -2026,7 +2051,7 @@ pub(crate) fn modeset_display<M: MmioWindow + ?Sized>(
     fb: &Framebuffer,
     mode: Option<&Mode>,
 ) -> Result<Mode, ModesetError> {
-    modeset_display_family(mmio, generation, None, fb, mode)
+    modeset_display_family(mmio, generation, None, false, fb, mode)
 }
 
 /// Exact known PCI family; no P/S/N inference from the broad generation.
@@ -2070,13 +2095,21 @@ pub(crate) fn modeset_display_for_chip<M: MmioWindow + ?Sized>(
     {
         return Err(ModesetError::UnsupportedGeneration);
     }
-    modeset_display_family(mmio, chip.generation, family, fb, mode)
+    modeset_display_family(
+        mmio,
+        chip.generation,
+        family,
+        crate::intel_gpu_gen12_combo_phy::is_tgl_uy(chip.did),
+        fb,
+        mode,
+    )
 }
 
 fn modeset_display_family<M: MmioWindow + ?Sized>(
     mmio: &M,
     generation: crate::intel_gpu::Generation,
     family: Option<crate::intel_gpu_gt::Gen12Platform>,
+    tgl_uy: bool,
     fb: &Framebuffer,
     mode: Option<&Mode>,
 ) -> Result<Mode, ModesetError> {
@@ -2092,6 +2125,7 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
             if let Some(family) = family {
                 ms.set_gen12_family(family);
             }
+            ms.set_tgl_uy(tgl_uy);
             match mode {
                 Some(mode) => ms.modeset_fixed(fb, mode),
                 None => ms.modeset(fb, None),
@@ -2942,27 +2976,6 @@ pub mod tests {
         smoke_gen12_tc_sst_refuses_insufficient_payload_before_writes
     );
 
-    fn smoke_load_buf_trans_writes_table() -> TestResult {
-        use crate::intel_gpu_ddi::{DDI_BUF_TRANS_BASE_OFFSET, HBR2_BUF_TRANS};
-        let mmio = FakeMmio::new();
-        let mut ms = Modeset::new(&mmio, Ddi::A);
-        ms.load_combo_buf_trans(crate::intel_gpu_pll::LinkRate::DpHbr2)
-            .unwrap();
-        for (i, e) in HBR2_BUF_TRANS.iter().enumerate() {
-            let off = Ddi::A.base() + DDI_BUF_TRANS_BASE_OFFSET + (i as u64) * 8;
-            if mmio.writes_to(off) != alloc::vec![e.lo]
-                || mmio.writes_to(off + 4) != alloc::vec![e.hi]
-            {
-                return TestResult::Fail("BUF_TRANS entry not written");
-            }
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "drivers/gpu/intel_gpu_modeset",
-        smoke_load_buf_trans_writes_table
-    );
-
     fn smoke_modeset_power_well_timeout() -> TestResult {
         // No state bits ever assert: PG1 grant times out.
         let mmio = FakeMmio::new();
@@ -3459,7 +3472,28 @@ pub mod tests {
                         self.set(off, val);
                     }
                 }
-                _ => self.set(off, val),
+                _ => {
+                    self.set(off, val);
+                    // Group aperture: a GRP write lands on all
+                    // four lanes, so a later LN0 read sees it —
+                    // the hardware behavior Linux's
+                    // read-LN0/write-GRP sequence relies on (the
+                    // combo-PHY step-6 training-enable set must
+                    // not clobber step 5's scaling program). The
+                    // writes log still records exactly what the
+                    // driver wrote.
+                    for base in [0x162000u64, 0x6C000, 0x160000, 0x161000, 0x16B000] {
+                        for (grp, ln) in
+                            [(base + 0x604, base + 0x804), (base + 0x694, base + 0x894)]
+                        {
+                            if off == grp {
+                                for lane in 0..4u64 {
+                                    self.set(ln + lane * 0x100, val);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -3602,6 +3636,51 @@ pub mod tests {
         }
         if sink.tunes.iter().any(|t| t & 0x3 != 1) {
             return TestResult::Fail("sink-requested swing 1 must be applied on all lanes");
+        }
+        // Combo-PHY signal levels (PHY_A, 0x162000): the sink
+        // trained at HBR2 and asked for swing 1, so the final
+        // program is preset 4 of the TGL HBR2 table
+        // {0xA, 0x47, 0x3F, 0x00, 0x00}.
+        let phy = 0x162000u64;
+        if mmio.writes_to(phy + 0x604).last() != Some(&0x0400_0000) {
+            return TestResult::Fail("PCS_DW1 must end with COMMON_KEEPER_EN set");
+        }
+        if mmio.writes_to(phy + 0x14).last() != Some(&0x3) {
+            return TestResult::Fail("CL_DW5 must carry SUS_CLOCK_CONFIG");
+        }
+        let cl_dw10 = mmio.writes_to(phy + 0x28);
+        if cl_dw10.is_empty() || cl_dw10.iter().any(|w| *w != 0) {
+            return TestResult::Fail("eDP must clear the CL_DW10 HOBL override");
+        }
+        if mmio.writes_to(phy + 0x694).last() != Some(&0xA008_0030) {
+            return TestResult::Fail("DW5 must end with scaling programmed + training enable");
+        }
+        if mmio.writes_to(phy + 0x888).last() != Some(&0x9098) {
+            return TestResult::Fail("DW2 LN0 must carry the preset-4 swing");
+        }
+        if mmio.writes_to(phy + 0x890).last() != Some(&0x3F)
+            || mmio.writes_to(phy + 0x990).last() != Some(&0x8000_003F)
+        {
+            return TestResult::Fail("DW4 must carry the preset-4 cursor + loadgen");
+        }
+        if mmio.writes_to(phy + 0x89C).last() != Some(&0x4700_0000) {
+            return TestResult::Fail("DW7 LN0 must carry the preset-4 N-scalar");
+        }
+        // DP_TP_CTL returns to NORMAL once training ends with
+        // pattern off (ENABLE + ENHANCED_FRAME stay set).
+        let tp = crate::intel_gpu_pipes::Transcoder::A.base() + 0x540;
+        if mmio.writes_to(tp).last() != Some(&0x8004_0300) {
+            return TestResult::Fail("DP_TP_CTL must end at NORMAL");
+        }
+        // Gen12 never writes DDI_BUF_TRANS: the old 4-entry
+        // tables are deleted with the combo-PHY model.
+        if mmio
+            .writes
+            .borrow()
+            .iter()
+            .any(|(o, _)| (0x64010..0x64030).contains(o))
+        {
+            return TestResult::Fail("DDI_BUF_TRANS must not be written on Gen12");
         }
         TestResult::Pass
     }
