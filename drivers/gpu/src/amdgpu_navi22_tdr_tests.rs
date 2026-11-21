@@ -112,3 +112,60 @@ kernel_test_in!(
     "drivers/gpu/navi22-recovery",
     navi22_tdr_automatic_recovery_budget_is_bounded
 );
+
+struct Count(core::sync::atomic::AtomicUsize);
+impl alloc::task::Wake for Count {
+    fn wake(self: alloc::sync::Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// drm_sched arms the job timeout when a job starts on the hardware
+/// (`drm_sched_start_timeout`) and cancels it once the ring has nothing
+/// pending; nothing runs while no job is in flight. With every queue idle
+/// the detector arms nothing and an emitted job wakes it at once; a job in
+/// flight is sampled at its timeout, a stuck one is reported, and a reported
+/// hang arms nothing more.
+fn navi22_tdr_arms_nothing_without_a_job_and_times_out_a_stuck_one() -> TestResult {
+    use core::{future::Future, task::Context};
+    let mut w = Watchdog::new(TIMEOUT_MS);
+    for engine in [
+        Engine::Gfx,
+        Engine::Kiq,
+        Engine::Compute,
+        Engine::Sdma0,
+        Engine::Sdma1,
+    ] {
+        if w.observe(p(engine, 5, 5), 0) != Verdict::Idle {
+            return TestResult::Fail("idle queue not idle");
+        }
+    }
+    if next_sample(&w, 0).is_some() {
+        return TestResult::Fail("the hang monitor wakes with no job in flight (every PERIOD_MS)");
+    }
+    let count = alloc::sync::Arc::new(Count(core::sync::atomic::AtomicUsize::new(0)));
+    let waker = core::task::Waker::from(count.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut wait = core::pin::pin!(job_emitted_wait());
+    let _ = wait.as_mut().poll(&mut cx);
+    job_emitted();
+    if count.0.load(Ordering::SeqCst) == 0 || wait.as_mut().poll(&mut cx).is_pending() {
+        return TestResult::Fail("an emitted job did not wake the parked hang monitor");
+    }
+    if w.observe(p(Engine::Gfx, 6, 5), 0) != Verdict::Busy || next_sample(&w, 0) != Some(TIMEOUT_MS)
+    {
+        return TestResult::Fail("a job in flight is not timed from its start");
+    }
+    match w.observe(p(Engine::Gfx, 6, 5), TIMEOUT_MS) {
+        Verdict::Hung(hang) if hang.engine == Engine::Gfx => {}
+        _ => return TestResult::Fail("a stuck job did not time out"),
+    }
+    if next_sample(&w, TIMEOUT_MS).is_some() {
+        return TestResult::Fail("a reported hang keeps the monitor sampling");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-tdr/timer",
+    navi22_tdr_arms_nothing_without_a_job_and_times_out_a_stuck_one
+);
