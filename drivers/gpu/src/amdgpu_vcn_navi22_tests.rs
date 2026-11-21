@@ -1810,6 +1810,94 @@ kernel_test_in!(
     vcn_navi22_client_jobs_are_sampled_for_the_job_timeout
 );
 
+/// A ring that never finishes is reported with what Linux's VCN 3.0 dump
+/// reads (`vcn_reg_list_3_0`, `amdgpu_vcn_dump_ip_state`: power and PGFSM
+/// state, the DPG LMA window and pause, the VCPU context id and its last
+/// GPCOM command and data, every ring's base, size and pointers), the LMI
+/// and VCPU control state, the fw_shared queue modes and decode pointers
+/// the firmware works from, and the command at the stuck read pointer.
+/// That separates a firmware wedged inside a command from one that never
+/// fetched the ring.
+fn vcn_navi22_ring_timeout_snapshot_reads_linux_vcn3_dump() -> TestResult {
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    if run(e.start(firmware(1), None, &mut psp)).is_err() {
+        return TestResult::Fail("DPG start");
+    }
+    // Encode ring 0 passed its ring test, then stops fetching.
+    e.hw.io.stalled[1] = true;
+    if run(e.test_ib()) != Err(Error::Timeout) {
+        return TestResult::Fail("the stalled encode IB test passed");
+    }
+    let Ok(s) = e.ring_snapshot(0, 1) else {
+        return TestResult::Fail("snapshot refused");
+    };
+    let inst = e.vcn[0].as_ref().unwrap();
+    let ring0 = inst.address(ENC_RING[0]);
+    let ib = inst.address(IBS[2]);
+    let value = |name: &str| {
+        TIMEOUT_REGS
+            .iter()
+            .position(|(n, _)| *n == name)
+            .map(|k| s.regs[k])
+    };
+    for name in [
+        "POWER_STATUS",
+        "STATUS",
+        "CONTEXT_ID",
+        "CONTEXT_ID2",
+        "GPCOM_VCPU_DATA0",
+        "GPCOM_VCPU_DATA1",
+        "GPCOM_VCPU_CMD",
+        "RB_BASE_HI",
+        "RB_BASE_LO",
+        "RB_BASE_HI2",
+        "RB_BASE_LO2",
+        "RB_RPTR",
+        "RB_WPTR",
+        "RB_RPTR2",
+        "RB_WPTR2",
+        "RB_SIZE",
+        "RB_SIZE2",
+        "PGFSM_CONFIG",
+        "PGFSM_STATUS",
+        "DPG_LMA_CTL",
+        "DPG_LMA_DATA",
+        "DPG_LMA_MASK",
+        "DPG_PAUSE",
+        "RBC_RB_RPTR",
+        "RBC_RB_WPTR",
+        "VCPU_CNTL",
+        "SOFT_RESET",
+        "LMI_CTRL2",
+        "LMI_STATUS",
+    ] {
+        if value(name).is_none() {
+            return TestResult::Fail("the timeout report lacks a VCN 3.0 dump register");
+        }
+    }
+    if (s.rptr, s.wptr, s.observed, s.shadow) != (0x40, 0xc0, 0, 0xc0)
+        || value("RB_BASE_LO") != Some(ring0 as u32)
+        || value("RB_SIZE") != Some(RING_DW)
+        || value("RB_RPTR2") != Some(0xc0)
+        || value("RBC_RB_RPTR") != Some(0x50)
+    {
+        return TestResult::Fail("timeout snapshot registers");
+    }
+    // fw_shared: no ring reset pending, the decode pointers the firmware
+    // restores from; then the VCN_ENC_CMD_IB the encoder sits on.
+    if s.shared != [0, 0, 0x50] {
+        return TestResult::Fail("timeout snapshot fw_shared modes and decode pointers");
+    }
+    if s.at_rptr != [cmd::ENC_IB, 0, ib as u32, (ib >> 32) as u32, 13] {
+        return TestResult::Fail("timeout snapshot of the command at the read pointer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/timeout-report",
+    vcn_navi22_ring_timeout_snapshot_reads_linux_vcn3_dump
+);
+
 fn dpg_engine(instances: u8) -> (Pool, Engine<Model>, FakePsp) {
     let model = Model::new();
     let psp = FakePsp::new(&model);

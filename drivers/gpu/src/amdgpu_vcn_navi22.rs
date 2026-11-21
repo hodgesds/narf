@@ -1266,6 +1266,34 @@ impl Jpeg {
     }
 }
 
+/// Instance registers of a ring-timeout snapshot, after the ring's own
+/// read and write pointers.
+pub(crate) const TIMEOUT_REGS: [(&str, Reg); 8] = [
+    ("STATUS", STATUS),
+    ("POWER_STATUS", POWER_STATUS),
+    ("PGFSM_STATUS", PGFSM_STATUS),
+    ("DPG_PAUSE", DPG_PAUSE),
+    ("RB_ARB_CTRL", RB_ARB_CTRL),
+    ("SCRATCH2", SCRATCH2),
+    ("SCRATCH9", SCRATCH9),
+    ("MASTINT_EN", MASTINT_EN),
+];
+/// One ring's timeout evidence (`Engine::ring_snapshot`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RingSnapshot {
+    pub rptr: u32,
+    pub wptr: u32,
+    /// The ring's fence writeback and shadow wptr.
+    pub observed: u32,
+    pub shadow: u32,
+    /// `TIMEOUT_REGS`, in order.
+    pub regs: [u32; TIMEOUT_REGS.len()],
+    /// fw_shared dword 56 (`pad1`, `multi_queue` modes), `rb.rptr`, `rb.wptr`.
+    pub shared: [u32; 3],
+    /// The ring dwords at the hardware read pointer.
+    pub at_rptr: [u32; 5],
+}
+
 #[derive(Debug)]
 pub(crate) struct Engine<I: Io> {
     pub runtime: idle::Runtime,
@@ -2193,44 +2221,44 @@ impl<I: Io> Engine<I> {
     fn report_ib_timeout(&mut self, i: usize, slot: usize, seq: u32) {
         self.report_ring_timeout(i, slot, seq, "IB fence timeout");
     }
+    /// Timeout evidence of ring `slot` (0 decode, 1 + j encode) of instance
+    /// `i`: its pointers, fence and shadow wptr and `TIMEOUT_REGS`.
+    pub(crate) fn ring_snapshot(&mut self, i: usize, slot: usize) -> Result<RingSnapshot, Error> {
+        let instance = self.vcn[i].as_ref().ok_or(Error::Invalid)?;
+        let (ring, rptr, wptr) = if slot == 0 {
+            (&instance.dec, RBC_RB_RPTR, RBC_RB_WPTR)
+        } else {
+            let j = (slot - 1) & 1;
+            (&instance.enc[j], RB_RPTR[j], RB_WPTR[j])
+        };
+        let (map, shadow) = (instance.memory.mapping(), ring.shadow);
+        let mut s = RingSnapshot::default();
+        self.hw.access(|io, l| {
+            s.rptr = io.read(l.reg(i, rptr));
+            s.wptr = io.read(l.reg(i, wptr));
+            for (value, (_, reg)) in s.regs.iter_mut().zip(TIMEOUT_REGS) {
+                *value = io.read(l.reg(i, reg));
+            }
+            invalidate(io, l);
+            s.observed = io.read_memory(map, FENCE[slot]);
+            s.shadow = io.read_memory(map, shadow);
+            Ok(())
+        })?;
+        Ok(s)
+    }
     /// The snapshot of ring `slot` (0 decode, 1 + j encode) of instance `i`
     /// whose fence `seq` did not land, labelled `what`.
     fn report_ring_timeout(&mut self, i: usize, slot: usize, seq: u32, what: &str) {
         use core::fmt::Write;
+        let snapshot = self.ring_snapshot(i, slot);
         let Some(instance) = self.vcn[i].as_ref() else {
             return;
         };
-        let (ring, rptr, wptr) = if slot == 0 {
-            (&instance.dec, RBC_RB_RPTR, RBC_RB_WPTR)
+        let ring = if slot == 0 {
+            &instance.dec
         } else {
-            let j = slot - 1;
-            (&instance.enc[j], RB_RPTR[j], RB_WPTR[j])
+            &instance.enc[(slot - 1) & 1]
         };
-        let map = instance.memory.mapping();
-        let regs = [
-            ("RPTR", rptr),
-            ("WPTR", wptr),
-            ("STATUS", STATUS),
-            ("POWER_STATUS", POWER_STATUS),
-            ("PGFSM_STATUS", PGFSM_STATUS),
-            ("DPG_PAUSE", DPG_PAUSE),
-            ("RB_ARB_CTRL", RB_ARB_CTRL),
-            ("SCRATCH2", SCRATCH2),
-            ("SCRATCH9", SCRATCH9),
-            ("MASTINT_EN", MASTINT_EN),
-        ];
-        let mut values = [0u32; 10];
-        let mut observed = 0;
-        let mut shadow = 0;
-        let read = self.hw.access(|io, l| {
-            for (value, (_, reg)) in values.iter_mut().zip(regs) {
-                *value = io.read(l.reg(i, reg));
-            }
-            invalidate(io, l);
-            observed = io.read_memory(map, FENCE[slot]);
-            shadow = io.read_memory(map, ring.shadow);
-            Ok(())
-        });
         let mut w = narf_console::Writer;
         let _ = write!(
             w,
@@ -2242,10 +2270,14 @@ impl<I: Io> Engine<I> {
             ring.wptr,
             instance.address(FENCE[slot]),
         );
-        match read {
-            Ok(()) => {
-                let _ = write!(w, " observed={observed:#x} shadow_wptr={shadow:#x}");
-                for ((name, _), value) in regs.iter().zip(values) {
+        match snapshot {
+            Ok(s) => {
+                let _ = write!(
+                    w,
+                    " observed={:#x} shadow_wptr={:#x} RPTR={:#x} WPTR={:#x}",
+                    s.observed, s.shadow, s.rptr, s.wptr
+                );
+                for ((name, _), value) in TIMEOUT_REGS.iter().zip(s.regs) {
                     let _ = write!(w, " {name}={value:#x}");
                 }
             }
