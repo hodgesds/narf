@@ -372,7 +372,7 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
     let fence = 0x8_0080_3000u64;
     let frame = |ring, flush: bool, ibs: &'static [Ib]| MediaFrame {
         ring,
-        mmhub: MMHUB,
+        hub: crate::amdgpu_navi22_submit::MediaHub::mmhub_v2_0(MMHUB),
         engine: ring.inv_engine(1),
         flush: flush.then_some(vm(3)),
         pasid_map: flush.then_some((LUT, 0x42)),
@@ -585,7 +585,7 @@ fn vcn_navi22_cs_media_grant_maps_pasid_only_with_a_flush() -> TestResult {
     }];
     let words = encode_media(&MediaFrame {
         ring: MediaRing::Enc(0),
-        mmhub: MMHUB,
+        hub: crate::amdgpu_navi22_submit::MediaHub::mmhub_v2_0(MMHUB),
         engine: 1,
         flush: None,
         pasid_map: None,

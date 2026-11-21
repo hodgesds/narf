@@ -45,6 +45,8 @@ pub enum Error {
     /// The SMU runs MM_DPM_PG: Linux would send PowerUpVcn first.
     PowerGated,
     Power(crate::amdgpu_smu_navi22::Error),
+    /// SMU 13.0.5 (Raphael) refused or missed a VCN power message.
+    Pmfw(crate::amdgpu_smu_raphael::Error),
     /// The discovery harvest table could not be trusted.
     Harvest(ip::DiscoveryError),
     /// PSP refused the DPG register list (`amdgpu_vcn_psp_update_sram`).
@@ -2503,8 +2505,8 @@ pub(crate) const JPEG_FENCE: u64 = RING_BYTES + 64; // linux: n/a (NARF layout)
 /// Client-submission state of the media owner.
 #[derive(Debug)]
 pub(crate) struct Client {
-    /// MMHUB segment-0 dword base, for the ring-side VM flush.
-    pub mmhub: u32,
+    /// The MMHUB registers of the ring-side VM flush.
+    pub hub: submit::MediaHub,
     /// OSSSYS segment-0 dword base, for the MMHUB IH VMID LUT.
     pub oss: u32,
     /// Unharvested VCN instances (MMHUB invalidation-engine order).
@@ -2514,20 +2516,43 @@ pub(crate) struct Client {
 }
 impl Client {
     fn new(gpu: &AmdGpu, pool: &Pool, instances: u8, jpeg: bool) -> Option<Self> {
-        // linux: n/a (MMHUB 2.1.0 discovery version)
-        let base = crate::amdgpu_psp_ring::bank(
-            gpu,
-            ip::HW_ID_MMHUB,
-            crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS,
-            0,
-            submit::MM_PTB_HI,
-        )
-        .ok()?;
-        // linux: n/a (OSSSYS 5.0.3 discovery version)
+        let raphael = crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            == Some(&crate::amdgpu_rdna2::RAPHAEL);
+        let hub = if raphael {
+            // amdgpu_discovery.c gives MMHUB 2.3.0/2.4.x mmhub_v2_3: its
+            // registers on base index 1, strides of 8.
+            let base = crate::amdgpu_psp_ring::bank(
+                gpu,
+                ip::HW_ID_MMHUB,
+                &[(2, 3, 0), (2, 4, 0), (2, 4, 1)],
+                1,
+                submit::MM23_LAST,
+            )
+            .ok()?;
+            submit::MediaHub::mmhub_v2_3(u32::try_from(base / 4).ok()?)
+        } else {
+            // linux: n/a (MMHUB 2.1.0 discovery version)
+            let base = crate::amdgpu_psp_ring::bank(
+                gpu,
+                ip::HW_ID_MMHUB,
+                crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS,
+                0,
+                submit::MM_PTB_HI,
+            )
+            .ok()?;
+            submit::MediaHub::mmhub_v2_0(u32::try_from(base / 4).ok()?)
+        };
+        // navi10_ih's osssys_5_0_0 registers, which APUs' 5.2.x keep.
+        let oss_versions = if raphael {
+            crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS
+        } else {
+            // linux: n/a (OSSSYS 5.0.3 discovery version)
+            crate::amdgpu_rdna2::IH_OSSSYS_VERSIONS
+        };
         let oss = crate::amdgpu_psp_ring::bank(
             gpu,
             ip::HW_ID_OSSSYS,
-            crate::amdgpu_rdna2::IH_OSSSYS_VERSIONS,
+            oss_versions,
             0,
             submit::IH_VMID_LUT_LAST,
         )
@@ -2544,7 +2569,7 @@ impl Client {
             None
         };
         Some(Self {
-            mmhub: u32::try_from(base / 4).ok()?,
+            hub,
             oss: u32::try_from(oss / 4).ok()?,
             instances,
             jpeg_ibs,
@@ -2686,7 +2711,7 @@ impl<I: Io> Engine<I> {
         }
         let frame = submit::MediaFrame {
             ring,
-            mmhub: client.mmhub,
+            hub: client.hub,
             engine,
             flush: vm.flush.then_some(vm),
             pasid_map: (vm.flush && vm.map_pasid).then_some((

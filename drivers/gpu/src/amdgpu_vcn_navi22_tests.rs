@@ -1400,7 +1400,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     let mut jpeg_ibs = pool.reserve(JPEG_IB_SLOT * 2).unwrap();
     jpeg_ibs.publish();
     let client = Client {
-        mmhub: 0x1a000,
+        hub: submit::MediaHub::mmhub_v2_0(0x1a000),
         oss: 0x10a0,
         instances: 1,
         jpeg_ibs: Some(jpeg_ibs),
@@ -1434,7 +1434,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     for (k, (seq, words, to)) in frames.iter().enumerate() {
         let want = encode_media(&MediaFrame {
             ring: MediaRing::Dec,
-            mmhub: 0x1a000,
+            hub: submit::MediaHub::mmhub_v2_0(0x1a000),
             engine: 0,
             flush: (k == 0).then_some(vm(true)),
             pasid_map: (k == 0).then_some((0x10a0 + 0x10 + 3, 0x42)),
@@ -2151,9 +2151,94 @@ fn raphael_vcn_layout_and_3_1_x_rules() -> TestResult {
             "Raphael VCN admitted another shape, or the discrete layout took it",
         );
     }
+    // Raphael's media clients flush through mmhub_v2_3's registers, on
+    // MMHUB base index 1, and take OSSSYS 5.2.1's IH LUT (navi10_ih keeps
+    // osssys_5_0_0's offsets). The discrete MMHUB 2.1 is not Raphael's.
+    let with_mmhub = |mmhub: (u8, u8, u8)| {
+        let mut gpu = gpu();
+        let mut b = gpu.ip_blocks[0];
+        b.hw_id = ip::HW_ID_MMHUB;
+        b.instance = 0;
+        (b.major, b.minor, b.revision) = mmhub;
+        b.num_bases = 2;
+        b.base_addrs[0] = 0x1a000;
+        b.base_addrs[1] = 0x1b000;
+        gpu.ip_blocks.push(b);
+        gpu
+    };
+    let p = pool(1 << 20);
+    if Client::new(&with_mmhub((2, 3, 0)), &p, 1, true).map(|c| c.hub)
+        != Some(submit::MediaHub::mmhub_v2_3(0x1b000))
+        || Client::new(&with_mmhub((2, 1, 0)), &p, 1, true).is_some()
+    {
+        return TestResult::Fail("Raphael media clients took the wrong MMHUB");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/vcn-raphael",
     raphael_vcn_layout_and_3_1_x_rules
+);
+
+/// A media ring's VM flush names its hub's registers: on MMHUB 2.0/2.1
+/// (Navi22) CONTEXT0 PTB 0x72b and ENG0 SEM/REQ/ACK 0x6d1/0x6e3/0x6f5 with
+/// strides 2 and 1; on MMHUB 2.3 (Raphael) 0x940 and 0xa00/0xa01/0xa02 with
+/// strides 8 (`gmc_v10_0_emit_flush_gpu_tlb` over `adev->vmhub`).
+fn media_flush_follows_the_hub_registers() -> TestResult {
+    use crate::amdgpu_navi22_submit::{encode_media, Ib, MediaFrame, MediaRing, VmRef};
+    let ibs = [Ib {
+        va: 0x7000_0010_0000,
+        dwords: 16,
+        flags: 0,
+    }];
+    let (vmid, engine, base) = (5u32, 3u32, 0x1b000u32);
+    let frame = |hub| {
+        encode_media(&MediaFrame {
+            ring: MediaRing::Dec,
+            hub,
+            engine,
+            flush: Some(VmRef {
+                vmid: vmid as u8,
+                page_table_base: 0x1_2345_6001,
+                pasid: 0x42,
+                flush: true,
+                map_pasid: false,
+            }),
+            pasid_map: None,
+            vmid: vmid as u8,
+            ibs: &ibs,
+            fence: 0x4000,
+            seq: 1,
+            ring_base: 0x8000,
+        })
+    };
+    // vcn_v2_0_dec_ring_emit_wreg/reg_wait carry the register as `reg << 2`.
+    let names = |words: &[u32], regs: [u32; 5]| regs.iter().all(|r| words.contains(&(r << 2)));
+    let mm20 = [
+        base + 0x6d1 + engine,
+        base + 0x72b + 2 * vmid,
+        base + 0x72c + 2 * vmid,
+        base + 0x6e3 + engine,
+        base + 0x6f5 + engine,
+    ];
+    let mm23 = [
+        base + 0xa00 + 8 * engine,
+        base + 0x940 + 8 * vmid,
+        base + 0x941 + 8 * vmid,
+        base + 0xa01 + 8 * engine,
+        base + 0xa02 + 8 * engine,
+    ];
+    let navi22 = frame(submit::MediaHub::mmhub_v2_0(base));
+    let raphael = frame(submit::MediaHub::mmhub_v2_3(base));
+    if !names(&navi22, mm20)
+        || !names(&raphael, mm23)
+        || mm20.iter().any(|r| raphael.contains(&(r << 2)))
+    {
+        return TestResult::Fail("media flush named another hub's registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-raphael",
+    media_flush_follows_the_hub_registers
 );

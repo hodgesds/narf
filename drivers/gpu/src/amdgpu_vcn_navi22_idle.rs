@@ -374,11 +374,11 @@ pub(crate) fn start() {
             if EPOCH.load(Ordering::Acquire) != epoch {
                 return;
             }
-            let mut owner = crate::amdgpu_navi22_platform::owner().await;
+            let mut owner = crate::amdgpu_rdna2_client::lock().await;
             if EPOCH.load(Ordering::Acquire) != epoch {
                 return;
             }
-            let Some(boot) = owner.as_mut() else {
+            let Some(mut boot) = owner.media() else {
                 return;
             };
             if let Err(error) = boot.idle_media(narf_time::monotonic_ns()).await {

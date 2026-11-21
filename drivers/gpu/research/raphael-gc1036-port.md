@@ -289,12 +289,32 @@ route those modules to it, not to write a second client backend.
        - the client frames drop the HDP read-cache invalidate.
        All of it is unproven on silicon: the tests cover the layouts,
        frames and INFO replies, not a Mesa context.
-    4. Media rings: VCN decode/encode and JPEG for clients. `begin_use` /
-       idle power goes through SMU 13.0.5 (`PowerUpVcn` / `PowerDownVcn`)
-       where Navi22 uses SMU 11.
-    5. Hangs. CP faults fail the faulting job, as on Navi22, but nothing
-       recovers the rings (APU mode-2 reset is not ported). A hung ring
-       times admissions out, and suspend stays refused.
+    4. ~~Media rings~~ (done): VCN decode/encode and JPEG for clients.
+       - The media frames' VM flush follows the hub's registers
+         (`submit::MediaHub`, as `adev->vmhub` holds them). Before, it
+         hard-coded MMHUB 2.0's offsets: CONTEXT0 PTB 0x72b, ENG0
+         SEM/REQ/ACK 0x6d1/0x6e3/0x6f5, engine stride 1. `mmhub_v2_3`
+         moved them (0x940, 0xa00/0xa01/0xa02) onto base index 1, with
+         engine and context strides of 8. A vcn-raphael test pins both
+         hubs' absolute registers.
+       - `vcn::Client` takes Raphael's MMHUB 2.3/2.4 and OSSSYS 5.2.1
+         (`navi10_ih` keeps osssys_5_0_0's IH VMID LUT).
+       - Power: `PowerUpVcn` / `PowerDownVcn` through SMU 13.0.5 for the
+         idle work and `begin_use` (always sent: no MM_DPM_PG to consult).
+         The DPG register lists go through the display loader's PSP
+         session. JPEG stays powered across a VCN idle gate, as on Navi22.
+       - The VCN client submit and the idle task take the
+         `amdgpu_rdna2_client` guard. Its media view carries Raphael's
+         coordinator with that PSP session, and returns Navi22's
+         cold-boot errors so the callers read the same.
+       - `register_raphael` publishes the rings and starts the idle work.
+    5. Hangs: what exists, no code yet. A CP privileged or bad-opcode
+       fault fails its job through `route_fences`, as on Navi22. Nothing
+       recovers the rings: Navi22's watchdog and recovery are not
+       registered for Raphael, and APU mode-2 reset is not ported. A hung
+       ring makes later admissions fail with EBUSY at the 10 s throttle
+       deadline. Suspend stays refused while graphics is up
+       (`Loader::stop`).
 
 ## Open
 

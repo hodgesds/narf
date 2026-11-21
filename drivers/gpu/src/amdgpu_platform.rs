@@ -1027,6 +1027,17 @@ impl Graphics {
     pub(crate) fn get(&mut self) -> Option<&mut crate::amdgpu_raphael_boot::ColdBoot> {
         self.0.as_mut()?.graphics.as_mut()
     }
+    /// The coordinator with the PSP session that loaded its VCN.
+    pub(crate) fn media(
+        &mut self,
+    ) -> Option<(
+        &mut crate::amdgpu_raphael_boot::ColdBoot,
+        &mut crate::amdgpu_psp_ring::Psp,
+    )> {
+        let display = self.0.as_mut()?;
+        let psp = display.loader.media_psp()?;
+        Some((display.graphics.as_mut()?, psp))
+    }
 }
 pub(crate) async fn graphics_owner() -> Graphics {
     Graphics(DISPLAY.lock().await)

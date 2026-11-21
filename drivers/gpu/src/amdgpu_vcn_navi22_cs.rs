@@ -325,12 +325,22 @@ pub fn rings() -> u8 {
 /// client VMIDs `amdgpu_gmc_navi22` lent; a fresh MMHUB manager flushes and
 /// remaps each before its first media job.
 pub fn register(boot: &crate::amdgpu_navi22_boot::ColdBoot, first: u8, last: u8) {
+    match boot.client_media() {
+        Some((rings, reader)) => register_rings("navi22", rings, reader, first, last),
+        None => unregister(),
+    }
+}
+/// [`register`] for an owner's verified media `rings` and their `reader`;
+/// `who` names the card in the console line.
+pub(crate) fn register_rings(
+    who: &str,
+    rings: u8,
+    reader: crate::amdgpu_vcn_navi22::MediaFenceReader,
+    first: u8,
+    last: u8,
+) {
     use core::fmt::Write;
     *SESSIONS.lock() = Sessions::new();
-    let Some((rings, reader)) = boot.client_media() else {
-        unregister();
-        return;
-    };
     // Every client ring is instance 0's, so VCN0 is never harvested here;
     // `vcn_v3_0_limit_sched`'s refusal stays in `check_dec_msg`.
     *MEDIA.lock() = Some(Registered {
@@ -342,7 +352,7 @@ pub fn register(boot: &crate::amdgpu_navi22_boot::ColdBoot, first: u8, last: u8)
     crate::amdgpu_info::publish_navi22_media_rings(rings);
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: navi22 media rings for clients {rings:#x} (dec/enc0/enc1/jpeg)"
+        "amdgpu: {who} media rings for clients {rings:#x} (dec/enc0/enc1/jpeg)"
     );
 }
 /// Withdraw the media rings (recovery or shutdown).
@@ -514,8 +524,8 @@ async fn queue(
     loop {
         let observed = crate::amdgpu_fence_navi22::change_sequence();
         let wait_for = {
-            let mut owner = crate::amdgpu_navi22_platform::owner().await;
-            let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+            let mut owner = crate::amdgpu_rdna2_client::lock().await;
+            let mut boot = owner.media().ok_or(FsError::NoDevice)?;
             let completed = progress().ok_or(FsError::NoDevice)?;
             let done = |t| job_done(epoch, completed, t);
             let grant = MEDIA

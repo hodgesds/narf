@@ -316,6 +316,61 @@ impl ColdBoot {
             },
         ))
     }
+    /// Client media rings (bit `MediaRing::index()`) and their fence reader,
+    /// once `run_media` started VCN and JPEG.
+    pub fn client_media(&self) -> Option<(u8, vcn::MediaFenceReader)> {
+        let media = self.media.as_ref()?;
+        let rings = media.client_rings();
+        (rings != 0).then(|| (rings, media.fence_reader()))
+    }
+    /// `amdgpu_vcn_ring_begin_use` (power VCN up and restart it after an idle
+    /// gate), then the client job. `psp` is the session that loaded VCN.
+    pub(crate) async fn submit_media(
+        &mut self,
+        psp: &mut crate::amdgpu_psp_ring::Psp,
+        ring: crate::amdgpu_navi22_submit::MediaRing,
+        vm: crate::amdgpu_navi22_submit::VmRef,
+        ibs: &[crate::amdgpu_navi22_submit::Ib],
+        copies: &[alloc::vec::Vec<u32>],
+    ) -> Result<u32, vcn::Error> {
+        let media = self.media.as_mut().ok_or(vcn::Error::Invalid)?;
+        let mut power = MediaPower {
+            smu: &mut self.smu,
+            psp,
+        };
+        media
+            .begin_use(&mut power, ring, narf_time::monotonic_ns())
+            .await?;
+        media.submit(ring, vm, ibs, copies)
+    }
+    pub(crate) fn media_fences(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::MediaRing,
+    ) -> Result<(u32, u32), vcn::Error> {
+        self.media
+            .as_mut()
+            .ok_or(vcn::Error::Invalid)?
+            .client_fences(ring)
+    }
+    /// The VCN idle work: stop VCN and send `PowerDownVcn` once its rings are
+    /// idle (`amdgpu_vcn_idle_work_handler`). JPEG stays up, as on Navi22.
+    pub(crate) async fn idle_media(
+        &mut self,
+        psp: &mut crate::amdgpu_psp_ring::Psp,
+        now: u64,
+    ) -> Result<bool, vcn::Error> {
+        let Some(media) = self.media.as_mut() else {
+            return Ok(false);
+        };
+        let mut power = MediaPower {
+            smu: &mut self.smu,
+            psp,
+        };
+        media.idle(&mut power, now).await
+    }
+    pub(crate) fn media_idle_recheck(&self, now: u64) -> Option<u64> {
+        self.media.as_ref()?.idle_recheck(now)
+    }
     /// `AMDGPU_INFO_READ_MMR_REG` from nv.c's allow-list. GFXOFF stays
     /// disallowed after the Smu stage, so GC answers without a reference.
     pub(crate) fn read_mmr(
@@ -507,6 +562,30 @@ impl ColdBoot {
             }
         }
         Ok(())
+    }
+}
+
+/// VCN power for the idle work and `begin_use`: PMFW 13.0.5's
+/// `PowerUpVcn`/`PowerDownVcn` (`smu_v13_0_5_dpm_set_vcn_enable`; always
+/// sent, there is no MM_DPM_PG feature to consult), and the DPG register
+/// lists through the PSP session that loaded VCN.
+struct MediaPower<'a> {
+    smu: &'a mut smu::Smu,
+    psp: &'a mut crate::amdgpu_psp_ring::Psp,
+}
+impl vcn::SramLoader for MediaPower<'_> {
+    async fn load_sram(&mut self, instance: usize, words: &[u32]) -> Result<(), vcn::Error> {
+        vcn::SramLoader::load_sram(&mut *self.psp, instance, words).await
+    }
+}
+impl vcn::idle::Control for MediaPower<'_> {
+    async fn power(&mut self, instances: [bool; 2], on: bool) -> Result<bool, vcn::Error> {
+        // Raphael has one VCN instance; nothing else to power.
+        if !instances[0] {
+            return Ok(false);
+        }
+        self.smu.set_vcn_power(on).await.map_err(vcn::Error::Pmfw)?;
+        Ok(true)
     }
 }
 

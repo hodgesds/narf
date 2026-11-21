@@ -12,7 +12,8 @@
 //! serves clients at a time: the submitter, its VMIDs and the fence
 //! generation are single-instance.
 use crate::amdgpu_cp_navi22 as cp;
-use crate::amdgpu_navi22_submit::{Ib, Ring, RingState, VmRef};
+use crate::amdgpu_navi22_boot::Error as BootError;
+use crate::amdgpu_navi22_submit::{Ib, MediaRing, Ring, RingState, VmRef};
 use core::sync::atomic::{AtomicU8, Ordering};
 
 /// What a client job needs from its engine owner, under that owner's lock.
@@ -68,6 +69,65 @@ impl Guard {
         match self {
             Self::Navi22(guard) => guard.as_mut().map(|boot| boot as &mut dyn Owner),
             Self::Raphael(guard) => guard.get().map(|boot| boot as &mut dyn Owner),
+        }
+    }
+    /// The media owner, with what its power transitions need: Raphael's
+    /// coordinator comes with the display loader's PSP session, the one that
+    /// loaded VCN and takes its DPG register lists.
+    pub(crate) fn media(&mut self) -> Option<Media<'_>> {
+        match self {
+            Self::Navi22(guard) => guard.as_mut().map(Media::Navi22),
+            Self::Raphael(guard) => guard.media().map(|(boot, psp)| Media::Raphael(boot, psp)),
+        }
+    }
+}
+
+/// The media half of a locked owner, for `amdgpu_vcn_navi22_cs` and the VCN
+/// idle work. Its methods are Navi22's cold-boot ones, errors included, so
+/// those callers read the same either way.
+pub(crate) enum Media<'a> {
+    Navi22(&'a mut crate::amdgpu_navi22_boot::ColdBoot),
+    Raphael(
+        &'a mut crate::amdgpu_raphael_boot::ColdBoot,
+        &'a mut crate::amdgpu_psp_ring::Psp,
+    ),
+}
+impl Media<'_> {
+    /// `amdgpu_vcn_ring_begin_use`, then the job on `ring`: its sequence.
+    pub(crate) async fn submit_media(
+        &mut self,
+        ring: MediaRing,
+        vm: VmRef,
+        ibs: &[Ib],
+        copies: &[alloc::vec::Vec<u32>],
+    ) -> Result<u32, BootError> {
+        match self {
+            Self::Navi22(boot) => boot.submit_media(ring, vm, ibs, copies).await,
+            Self::Raphael(boot, psp) => boot
+                .submit_media(psp, ring, vm, ibs, copies)
+                .await
+                .map_err(BootError::Media),
+        }
+    }
+    /// (last completed, throttle) sequences of client media `ring`.
+    pub(crate) fn media_fences(&mut self, ring: MediaRing) -> Result<(u32, u32), BootError> {
+        match self {
+            Self::Navi22(boot) => boot.media_fences(ring),
+            Self::Raphael(boot, _) => boot.media_fences(ring).map_err(BootError::Media),
+        }
+    }
+    /// The VCN idle work: gate VCN once its rings are idle.
+    pub(crate) async fn idle_media(&mut self, now: u64) -> Result<bool, BootError> {
+        match self {
+            Self::Navi22(boot) => boot.idle_media(now).await,
+            Self::Raphael(boot, psp) => boot.idle_media(psp, now).await.map_err(BootError::Media),
+        }
+    }
+    /// When the idle work should look again; `None` until the next use.
+    pub(crate) fn media_idle_recheck(&self, now: u64) -> Option<u64> {
+        match self {
+            Self::Navi22(boot) => boot.media_idle_recheck(now),
+            Self::Raphael(boot, _) => boot.media_idle_recheck(now),
         }
     }
 }

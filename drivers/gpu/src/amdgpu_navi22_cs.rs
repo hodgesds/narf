@@ -597,9 +597,10 @@ fn install(
 }
 
 /// Raphael's [`register`]: the graphics coordinator's verified queues, the
-/// GFXHUB client VMIDs it lends, and a client heap from its carve-out pool.
-/// An APU has no hidden VRAM to transfer through, its media rings are not
-/// published, and its GFXOFF stays disallowed (no GC access needs a
+/// client VMIDs it lends (GFXHUB for the graphics rings, the same numbers on
+/// MMHUB for the media rings), a client heap from its carve-out pool, and
+/// its media rings once VCN runs. An APU has no hidden VRAM to transfer
+/// through, and its GFXOFF stays disallowed (no GC access needs a
 /// reference). Called by the display owner, which holds the coordinator,
 /// after a completed graphics boot. Failures are reported, never fatal.
 pub fn register_raphael(boot: &mut crate::amdgpu_raphael_boot::ColdBoot) {
@@ -645,8 +646,19 @@ pub fn register_raphael(boot: &mut crate::amdgpu_raphael_boot::ColdBoot) {
             );
         }
     }
+    let media = boot.client_media();
+    match media {
+        Some((rings, reader)) => {
+            crate::amdgpu_vcn_navi22_cs::register_rings("raphael", rings, reader, first, last)
+        }
+        None => crate::amdgpu_vcn_navi22_cs::unregister(),
+    }
     crate::amdgpu_rdna2_client::set_backend(crate::amdgpu_rdna2_client::Backend::Raphael);
     install(card, reader, vmids);
+    if media.is_some() {
+        // VCN_IDLE_TIMEOUT after each use, through the coordinator's guard.
+        crate::amdgpu_vcn_navi22::idle::start();
+    }
 }
 
 /// Stop accepting client work (recovery is about to rebuild the owner). The

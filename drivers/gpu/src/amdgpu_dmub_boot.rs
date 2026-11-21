@@ -699,6 +699,14 @@ impl Loader {
         })
         .ok()
     }
+    /// The PSP session that loaded VCN, for its later power transitions (DPG
+    /// register lists after an idle gate). Only after a graphics boot.
+    pub(crate) fn media_psp(&mut self) -> Option<&mut crate::amdgpu_psp_ring::Psp> {
+        if !self.graphics_booted {
+            return None;
+        }
+        self.psp.as_mut()
+    }
     /// Whether `boot` loaded the graphics set and the RLC autoload completed.
     pub fn graphics_booted(&self) -> bool {
         self.graphics_booted
