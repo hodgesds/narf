@@ -611,8 +611,9 @@ static STRIX_FW: &[FwEntry] = &[
 /// Order is `enum AMDGPU_UCODE_ID`: SDMA0, CP_CE, CP_PFP, CP_ME, CP_MEC1,
 /// CP_MEC2, RLC_G, VCN, DMCUB — the order `psp_load_non_psp_fw` sends them
 /// in. No SMU entry: an APU's PMFW is BIOS-resident.
-// Unused: the mapping routes Raphael to `UNAUDITED_FW` until the PSP 13.0.5
-// load path exists. Kept correct so that work starts from Linux's names.
+// Unused: the mapping routes Raphael to `UNAUDITED_FW` until its graphics
+// bring-up exists; the PSP 13.0.5 ring loads only the display's TOC and DMCUB
+// (`amdgpu_platform`). Kept correct so that work starts from Linux's names.
 #[allow(dead_code)]
 pub(crate) static RAPHAEL_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_13_0_5_toc.bin"),

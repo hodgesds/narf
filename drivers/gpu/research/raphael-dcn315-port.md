@@ -22,7 +22,8 @@ it came from.
 `AMDGPU_FAMILY_GC_10_3_6`; APU by the GC list. The firmware table is
 `amdgpu::RAPHAEL_FW`, in `enum AMDGPU_UCODE_ID` order, and is pinned by
 `smoke_amdgpu_raphael_identity_matches_linux`. The chip is still routed to
-`UNAUDITED_FW` until a PSP 13.0.5 load path exists.
+`UNAUDITED_FW`: the PSP 13.0.5 ring (step 9) loads only the display's TOC and
+DMCUB, and the graphics, SDMA and media blobs wait for a GC 10.3.6 bring-up.
 
 ## DCN 3.1.5 against the DCN 3.1.4 code
 
@@ -247,6 +248,10 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
      2.3.0/2.4.0/2.4.1 are `mmhub_v2_3` (`mmMMVM_CONTEXT0_CNTL` 0x0740,
      index 1). A VBIOS missing from VFCT is read from the APU's VRAM shadow,
      as on Renoir and Phoenix.
+   - DCN 3.1.5 has no USB4 DPIA (`dcn315_resource.c` sets no
+     `usb4_dpia_count`), so the sink scan sends its firmware no DPIA HPD
+     query; one it did not answer would have ended the scan before any
+     native sink was read.
    - The Late worker (`amdgpu_usbc::start` → `amdgpu_platform::start`)
      already runs for every probed non-Navi22 GPU, so Raphael now takes the
      native path; anything refused falls back to attaching to the running
