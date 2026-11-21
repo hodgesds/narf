@@ -724,7 +724,11 @@ pub(crate) fn completed<I: Io>(hw: &mut Hw<I>, queue: &Queue) -> Result<u32, Err
 //    `gmc_v10_0_use_invalidate_semaphore`), write the VMID's page-table base
 //    LO/HI, write the invalidate request and wait for its ACK bit, release
 //    the semaphore — followed by the ring's wait for the PTB LO write;
-// 2. decode/JPEG `insert_start`, one `emit_ib` per IB with the job's VMID;
+// 2. decode/JPEG `insert_start`, the HDP flush (`amdgpu_device_flush_hdp`:
+//    these rings have no `emit_hdp_flush`, so `amdgpu_hdp_generic_flush`
+//    writes the remapped HDP_MEM_FLUSH_CNTL through `emit_wreg`), one
+//    `emit_ib` per IB with the job's VMID, then the HDP read-cache
+//    invalidate (`hdp_v5_0_invalidate_hdp` through `emit_wreg`);
 // 3. the job fence (`emit_fence`), then decode/JPEG `insert_end` or the
 //    encoder's VCN_ENC_CMD_END.
 //
@@ -1040,6 +1044,12 @@ pub(crate) fn encode_media(f: &MediaFrame<'_>) -> Vec<u32> {
         }
     }
     media_start(f.ring, &mut w);
+    // amdgpu_device_flush_hdp: no emit_hdp_flush on these rings, so
+    // amdgpu_hdp_generic_flush writes the remapped HDP_MEM_FLUSH_CNTL
+    // through the ring's emit_wreg. An APU returns first.
+    if f.hdp.is_some() {
+        wreg(&mut w, HDP_REMAP_MEM_FLUSH / 4, 0);
+    }
     let vmid = u32::from(f.vmid);
     for ib in f.ibs {
         let (low, high) = (ib.gpu_addr() as u32, (ib.gpu_addr() >> 32) as u32);
@@ -1100,6 +1110,10 @@ pub(crate) fn encode_media(f: &MediaFrame<'_>) -> Vec<u32> {
                 ]);
             }
         }
+    }
+    // amdgpu_device_invalidate_hdp: hdp_v5_0_invalidate_hdp's emit_wreg.
+    if let Some(hdp) = f.hdp {
+        wreg(&mut w, hdp + HDP_READ_CACHE_INVALIDATE, 1);
     }
     match f.ring {
         MediaRing::Dec => {

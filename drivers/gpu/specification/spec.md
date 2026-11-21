@@ -12189,9 +12189,18 @@ validate_media, media_grant, MEDIA_MAX_IBS}` frame them as Linux's
 flushes, (decode/JPEG `insert_start`,) the MMHUB
 `gmc_v10_0_emit_flush_gpu_tlb` (invalidation semaphore acquire, PTB LO/HI,
 request/ACK, release), the ring's PTB-write wait and, when the grant remaps
-the PASID, the `IH_VMID_<vmid>_LUT_MM` write; then `insert_start`, the IBs under the VMID
-(`vcn_v2_0_dec/enc_ring_emit_ib`, `jpeg_v2_0_dec_ring_emit_ib`), the fence on
-the kernel ring's sequence and `insert_end`/`VCN_ENC_CMD_END`. MMHUB
+the PASID, the `IH_VMID_<vmid>_LUT_MM` write; then `insert_start`, the HDP flush
+(`amdgpu_device_flush_hdp` → `amdgpu_hdp_generic_flush` through the ring's
+`emit_wreg`: 0 to the remapped `HDP_MEM_FLUSH_CNTL` at byte 0x7f000), the
+IBs under the VMID (`vcn_v2_0_dec/enc_ring_emit_ib`,
+`jpeg_v2_0_dec_ring_emit_ib`), the HDP read-cache invalidate
+(`hdp_v5_0_invalidate_hdp`: 1 to `HDP_READ_CACHE_INVALIDATE` at
+`MediaFrame::hdp`, the HDP segment-0 base), the fence on the kernel ring's
+sequence and `insert_end`/`VCN_ENC_CMD_END`; JPEG reaches both HDP
+registers through `JRBC_DEC_EXTERNAL_REG_WRITE_ADDR`. These are in
+addition to the CPU HDP flush before the doorbell. An APU's frame (Raphael:
+`MediaFrame::hdp` is `None`, HDP 5.2.1 has no read cache) carries neither,
+as `amdgpu_device_{flush,invalidate}_hdp` return early on x86_64. MMHUB
 invalidation engines follow `amdgpu_gmc_allocate_vm_inv_eng` over ring order
 (dec 0, enc 1/4, JPEG 5 with VCN1 harvested, 8 otherwise). JPEG IBs run from
 a kernel copy (`JPEG_IB_SLOT`, 64 KiB per outstanding job) at VMID 0 with
