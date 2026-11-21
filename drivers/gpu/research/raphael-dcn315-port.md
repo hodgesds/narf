@@ -143,10 +143,19 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
    `PIPE0_DTO_SRC_SEL = 1` (2 bits on 3.1.4, 1 bit on 3.1.5). NARF never
    set it, so a pipe the GOP left idle had no programmed pixel clock. The
    reference comes from `ClockManager::dprefclk_khz`: 600 MHz on DCN 3.1.4,
-   and from SMU `GetDprefclkFreq` on DCN 3.1.5 once step 7 lands. Open:
-   DCN 3.1.4's spread-spectrum adjustment of that reference
-   (`dcn314_is_spll_ssc_enabled`, VBIOS SS table,
-   `dce_adjust_dp_ref_freq_for_ss`) is not made.
+   and from SMU `GetDprefclkFreq` on DCN 3.1.5 once step 7 lands.
+
+   On DCN 3.1.4, while the SPLL spreads (`CLK6_0_CLK6_spll_field_8.spll_ssc_en`),
+   `dcn314_init_clocks` lowers that reference by half the spread
+   (`dce_adjust_dp_ref_freq_for_ss`). The spread is the VBIOS DP entry
+   (`dce_clock_read_ss_info`; GPU_PLL is unsupported on atomfirmware, so
+   the DISPLAY_PORT entry is used: dce_info 4.1 own fields, 4.2–4.4
+   `smu_info`, 4.5 integrated info 2.2/2.3). `dcn314_read_ss_info_from_lut`
+   then replaces it, even with zero, whenever `CLK2_BYPASS_SEL` < 5
+   (`ss_info_table` = {0, 0, 375, 375, 375} thousandths of a percent).
+   NARF reproduces this, including Linux's 31.32 fixed-point rounding:
+   0.375 % on 600 MHz is 598 874 kHz, not 598 875. DCN 3.1.5's clock
+   manager makes no such adjustment.
 7. Clock manager: `dcn315_smu.c` mailbox (indirect message write) and
    `dcn315_clk_mgr.c` DPM table parse.
 8. DML: dml31 with the dcn315 SoC bounding box; HUBBUB DET/COMPBUF offsets.

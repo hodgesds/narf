@@ -429,3 +429,46 @@ kernel_test_in!(
     "drivers/gpu/dcn-clk",
     dcn_clk_bounds_requests_by_dpm_and_tolerates_dcfclk_refusal
 );
+
+/// `dce_adjust_dp_ref_freq_for_ss` in Linux's 31.32 fixed point: the values
+/// below are what Linux programs, computed by running its
+/// `dc_fixpt_from_fraction` / `dc_fixpt_mul` sequence, not exact arithmetic.
+fn clk_dp_dto_reference_follows_linux_fixed_point() -> TestResult {
+    let spread = |percentage| {
+        Some(Spread {
+            percentage,
+            divider: 1000,
+        })
+    };
+    for (percentage, want) in [
+        // The LUT's 0.375 %: exact is 598 875, Linux's rounding gives 598 874.
+        (375, 598_874),
+        (250, 599_250),
+        (500, 598_500),
+        (0, 600_000),
+    ] {
+        if dp_dto_reference_khz(600_000, spread(percentage)) != want {
+            return TestResult::Fail("spread-adjusted DPREFCLK is not Linux's");
+        }
+    }
+    if dp_dto_reference_khz(598_000, spread(375)) != 596_878 {
+        return TestResult::Fail("spread-adjusted reference off 600 MHz");
+    }
+    // No spread, or a zero divider (Linux's guard), leaves the clock alone.
+    if dp_dto_reference_khz(600_000, None) != 600_000
+        || dp_dto_reference_khz(
+            600_000,
+            Some(Spread {
+                percentage: 375,
+                divider: 0,
+            }),
+        ) != 600_000
+    {
+        return TestResult::Fail("unspread reference changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-clk",
+    clk_dp_dto_reference_follows_linux_fixed_point
+);

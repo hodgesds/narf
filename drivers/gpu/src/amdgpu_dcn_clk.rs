@@ -44,9 +44,58 @@ const DF_PSTATES: usize = 4; // linux: n/a (DCN 3.1.4 path)
 
 /// DCN314 drives DP reference and DTB from a fixed 600 MHz source
 /// (`dcn314_clk_mgr_construct`). When the boot firmware leaves the SPLL
-/// spreading, Linux lowers the DP DTO's reference by half the spread; that
-/// adjustment is not made here (see `amdgpu_dcn_dccg`'s `set_dp_dto`).
+/// spreading, the DP DTO's reference is lowered by half the spread
+/// ([`dp_dto_reference_khz`]).
 pub const DPREFCLK_KHZ: u32 = 600_000; // linux: n/a (DCN 3.1.4 path)
+
+/// A DPREFCLK downspread of `percentage / divider` percent — Linux's
+/// `dprefclk_ss_percentage` and `dprefclk_ss_divider`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spread {
+    pub percentage: u32,
+    pub divider: u32,
+}
+
+/// The reference the DP DTO divides: `dce_adjust_dp_ref_freq_for_ss`, which
+/// `dcn314_init_clocks` applies while the SPLL spreads, lowers DPREFCLK by
+/// half the downspread so the synthesised pixel clock is right on average.
+///
+/// Computed bit for bit in Linux's 31.32 fixed point rather than exactly:
+/// `dc_fixpt_from_fraction` rounds 0.375 % / 200 up, so the LUT's 0.375 %
+/// spread on 600 MHz gives 598 874 kHz where exact arithmetic gives 598 875,
+/// and the DTO must match the clock Linux would program.
+pub fn dp_dto_reference_khz(dprefclk_khz: u32, spread: Option<Spread>) -> u32 {
+    const ONE: u64 = 1 << 32; // linux: n/a (dc_fixpt_one, 31.32 fixed point)
+    let Some(spread) = spread.filter(|s| s.divider != 0) else {
+        return dprefclk_khz;
+    };
+    let percent = fixpt_from_fraction(u64::from(spread.percentage), u64::from(spread.divider));
+    // dc_fixpt_div_int(x, 200) is dc_fixpt_from_fraction(x.value, 200 << 32).
+    // linux-lit: 200=literal divisor in dce_adjust_dp_ref_freq_for_ss
+    let half_spread = fixpt_from_fraction(percent, 200 * ONE);
+    let Some(factor) = ONE.checked_sub(half_spread) else {
+        return dprefclk_khz;
+    };
+    // dc_fixpt_mul_int by an integer has no fractional cross term, and
+    // dc_fixpt_floor drops the fraction.
+    ((u128::from(factor) * u128::from(dprefclk_khz)) >> 32) as u32
+}
+
+/// `dc_fixpt_from_fraction` for non-negative operands: long division to 32
+/// fractional bits, then round the last bit half up.
+fn fixpt_from_fraction(numerator: u64, denominator: u64) -> u64 {
+    let mut value = numerator / denominator;
+    let mut remainder = numerator % denominator;
+    for _ in 0..32 {
+        remainder <<= 1;
+        value <<= 1;
+        if remainder >= denominator {
+            value |= 1;
+            remainder -= denominator;
+        }
+    }
+    value + u64::from(remainder << 1 >= denominator)
+}
 pub const DTBCLK_KHZ: u32 = 600_000; // linux: n/a (DCN 3.1.4 path)
 /// Linux clamps DPPCLK to 100 MHz to keep an eDP panel plus a 4K monitor from
 /// underflowing when the global clock drops.

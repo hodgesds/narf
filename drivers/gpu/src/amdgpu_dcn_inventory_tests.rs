@@ -957,3 +957,118 @@ kernel_test_in!(
     "drivers/gpu/dcn-inventory",
     inventory_encoder_caps_read_the_encoder_record_list
 );
+
+const SMU: usize = 0x880;
+
+/// `dce_clock_read_ss_info` + `dcn314_read_ss_info_from_lut`: nothing unless
+/// the SPLL spreads; a DPREFCLK source the LUT covers replaces the VBIOS
+/// figure (even with its zero); a centre spread keeps the clock but adjusts
+/// nothing; sources 5..7 keep the VBIOS downspread.
+fn inventory_dpref_spread_merges_vbios_and_lut_as_dcn314() -> TestResult {
+    let spread = |percentage| {
+        Some(Spread {
+            percentage,
+            divider: 1000,
+        })
+    };
+    let cases = [
+        // (SPLL spreading, CLK2_BYPASS_SEL, VBIOS, expected)
+        (false, 2, Some((250, false)), None),
+        (true, 2, None, spread(375)),
+        (true, 4, Some((250, false)), spread(375)),
+        // LUT entry 0 overwrites the VBIOS figure, but the VBIOS spread
+        // already marked the clock spread: an adjustment of nothing.
+        (true, 0, Some((250, false)), spread(0)),
+        (true, 1, None, None),
+        (true, 5, Some((250, false)), spread(250)),
+        (true, 7, Some((250, true)), spread(0)),
+        (true, 6, Some((0, false)), None),
+    ];
+    for (ssc, sel, vbios, want) in cases {
+        if dpref_spread(ssc, sel, vbios) != want {
+            return TestResult::Fail("DPREFCLK spread merge is not dcn314's");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_dpref_spread_merges_vbios_and_lut_as_dcn314
+);
+
+/// `get_ss_info_v4_1` / `_v4_2` / `_v4_5` for AS_SIGNAL_TYPE_DISPLAY_PORT,
+/// against synthetic tables at the `atomfirmware.h` offsets: dce_info
+/// dp_ss_percentage 24 / dp_ss_mode 30, smu_info_v3_1 gpuclk_ss_mode 7 /
+/// gpuclk_ss_percentage 12, integrated_system_info_v2_2 gpuclk_ss_percentage
+/// 20 / gpuclk_ss_type 22.
+fn inventory_vbios_dp_spread_follows_the_dce_info_revision() -> TestResult {
+    let set16 = |image: &mut Image, at: usize, value: u16| {
+        image.0[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    };
+    let mut image = Image::new();
+    set16(&mut image, DCE + 24, 300);
+    image.0[DCE + 30] = 0;
+    // 4.1: dce_info's own fields.
+    if vbios_dp_spread(image.bytes()) != Ok(Some((300, false))) {
+        return TestResult::Fail("dce_info 4.1 DP spread");
+    }
+    image.0[DCE + 30] = ATOM_SS_CENTRE_SPREAD_MODE;
+    if vbios_dp_spread(image.bytes()) != Ok(Some((300, true))) {
+        return TestResult::Fail("dce_info 4.1 centre spread");
+    }
+    // 4.2: smu_info's gpuclk spread, and no answer without smu_info.
+    image.0[DCE + 3] = 2;
+    if vbios_dp_spread(image.bytes()) != Ok(None) {
+        return TestResult::Fail("dce_info 4.2 without smu_info");
+    }
+    image.point(TABLE_SMU_INFO, SMU);
+    set16(&mut image, SMU, 28);
+    image.0[SMU + 2] = 3;
+    image.0[SMU + 3] = 1;
+    set16(&mut image, SMU + 12, 425);
+    image.0[SMU + 7] = 0;
+    if vbios_dp_spread(image.bytes()) != Ok(Some((425, false))) {
+        return TestResult::Fail("dce_info 4.2 smu_info spread");
+    }
+    // 4.5: the integrated system info when Linux builds one (2.2 here).
+    image.0[DCE + 3] = 5;
+    set16(&mut image, INTEGRATED + 20, 375);
+    set16(&mut image, INTEGRATED + 22, 2); // only bit 0 is CENTER_MODE
+    if vbios_dp_spread(image.bytes()) != Ok(Some((375, false))) {
+        return TestResult::Fail("dce_info 4.5 integrated-info spread");
+    }
+    // 2.1 is built but carries no spread.
+    image.0[INTEGRATED + 3] = 1;
+    if vbios_dp_spread(image.bytes()) != Ok(Some((0, false))) {
+        return TestResult::Fail("integrated info 2.1 copies no spread");
+    }
+    // A revision Linux does not build falls back to dce_info's fields.
+    image.0[INTEGRATED + 3] = 4;
+    if vbios_dp_spread(image.bytes()) != Ok(Some((300, true))) {
+        return TestResult::Fail("unbuilt integrated info falls back to dce_info");
+    }
+    image.unpoint(TABLE_INTEGRATED_SYSTEM_INFO);
+    if vbios_dp_spread(image.bytes()) != Ok(Some((300, true))) {
+        return TestResult::Fail("absent integrated info falls back to dce_info");
+    }
+    // No dce_info, or one Linux does not parse, is no spread.
+    image.0[DCE + 2] = 3;
+    if vbios_dp_spread(image.bytes()) != Ok(None) {
+        return TestResult::Fail("unknown dce_info format");
+    }
+    image.unpoint(TABLE_DCE_INFO);
+    if vbios_dp_spread(image.bytes()) != Ok(None) {
+        return TestResult::Fail("absent dce_info");
+    }
+    // A table too short for its own fields fails closed.
+    let mut short = Image::new();
+    set16(&mut short, DCE, 30);
+    if vbios_dp_spread(short.bytes()) != Err(Error::Invalid) {
+        return TestResult::Fail("truncated dce_info accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_vbios_dp_spread_follows_the_dce_info_revision
+);

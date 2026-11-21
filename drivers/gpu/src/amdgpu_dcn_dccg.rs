@@ -232,13 +232,8 @@ impl<I: Io> Engine<I> {
     /// pixel clock and modulo the DPREFCLK it is synthesised from (the
     /// video-optimized ratio where one applies), then DP_DTO0_ENABLE with
     /// PIPE0_DTO_SRC_SEL = 1. Navi22 programs its own in `amdgpu_navi22_modeset`.
-    ///
-    /// LINUX-GAP: with the SPLL spreading, DCN 3.1.4 lowers the reference by
-    /// half the VBIOS spread (`dcn314_init_clocks` →
-    /// `dce_adjust_dp_ref_freq_for_ss`). That needs the CLK6 SSC bit and the
-    /// SS table, which nothing here reads yet, so a spread SPLL leaves the
-    /// pixel clock high by half the spread; the sink's M/N auto-measurement
-    /// keeps the link valid, but the refresh runs that much fast.
+    /// `reference_khz` is the spread-adjusted DPREFCLK
+    /// (`amdgpu_dcn_clk::dp_dto_reference_khz`).
     fn set_dp_dto(&mut self, otg: u8, pixel_khz: u32, reference_khz: u32) -> Result<(), Error> {
         if self.profile.is_dcn30() {
             return Err(Error::Unsupported);

@@ -322,6 +322,9 @@ pub struct Platform {
     pub memory: Memory,
     pub dchub_refclk_khz: u32,
     pub dentist_vco_khz: u32,
+    /// The DPREFCLK spread the DP DTO's reference is lowered by, when the
+    /// SPLL spreads (DCN 3.1.4 only).
+    pub dpref_spread: Option<clk::Spread>,
 }
 
 impl Pipeline {
@@ -505,7 +508,7 @@ impl Pipeline {
         }
         let plan = self.plan(timing, scanout, platform)?;
         match self
-            .bring_up(loader, scanout, timing, &plan, depth, sink_caps)
+            .bring_up(loader, scanout, timing, &plan, platform, depth, sink_caps)
             .await
         {
             Ok(()) => {
@@ -521,12 +524,14 @@ impl Pipeline {
             }
         }
     }
+    #[allow(clippy::too_many_arguments)]
     async fn bring_up(
         &mut self,
         loader: &mut Loader,
         scanout: &Scanout,
         timing: &Timing,
         plan: &Plan,
+        platform: &Platform,
         depth: Depth,
         sink_caps: [u8; 16],
     ) -> Result<(), Error> {
@@ -554,11 +559,10 @@ impl Pipeline {
         }
         // dcn31_program_pix_clk: a DP stream's pixel clock is its OTG's DP
         // DTO, which nothing else sets for a pipe the boot firmware left idle.
-        self.dccg.set_dp_dto(
-            self.pipe,
-            timing.pixel_clock_khz,
-            self.clocks.dprefclk_khz(),
-        )?;
+        let reference =
+            clk::dp_dto_reference_khz(self.clocks.dprefclk_khz(), platform.dpref_spread);
+        self.dccg
+            .set_dp_dto(self.pipe, timing.pixel_clock_khz, reference)?;
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
             self.dccg.set_dp_stream_clock(
                 self.route.aux,
