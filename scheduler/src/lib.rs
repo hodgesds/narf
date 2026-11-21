@@ -3056,12 +3056,16 @@ pub(crate) fn resched_remote_force(target_cpu: u32) {
 /// Timer-tick half of the idle balance: ask one idle CPU to come and look
 /// (Linux `sched_balance_trigger` -> `nohz_balancer_kick` -> `kick_ilb`).
 ///
-/// An idle CPU pulls staged wakes only when it runs a balance pass, and a
-/// halted CPU with nothing queued may not run one for a long time. So the CPU
-/// that is holding the wakes speaks up: when its tick finds wakes staged and
-/// its executor has passed no scheduling point since the previous tick that
-/// found the same, it sends one reschedule kick to a halted CPU that could run
-/// one of them. The kick carries no task; the woken CPU's ordinary steal pass
+/// An idle CPU pulls work only when it runs a balance pass, and a halted CPU
+/// with nothing queued may not run one for a long time. So the CPU that is
+/// holding the work speaks up: when its tick finds wakes staged or runnable
+/// tasks queued ([`idle_balance_work_held`]) and its executor has passed no
+/// scheduling point since the previous tick that found the same, it sends one
+/// reschedule kick to a halted CPU that could run one of them. Queued tasks
+/// count as staged wakes do: a task its own drain activated just before the
+/// CPU went into a long poll, or into executor maintenance, waits for it just
+/// as long (Linux kicks on `nr_running >= 2` and on a runnable task whose CPU
+/// lost its capacity, `check_cpu_capacity`). The kick carries no task; the woken CPU's ordinary steal pass
 /// decides what, if anything, it may take. A CPU making progress (its pass
 /// counter moves between ticks) drains its own inbox and never kicks.
 ///
@@ -3098,7 +3102,7 @@ pub(crate) fn resched_remote_force(target_cpu: u32) {
 /// CPU for it ([`wake_place_and_kick`], [`kick_idle_puller`]).
 pub(crate) fn kick_idle_balance_from_tick() {
     let cpu = narf_lib::percpu::current_cpu();
-    if cpu >= narf_lib::percpu::MAX_CPUS || !wake_list_pending(cpu) {
+    if cpu >= narf_lib::percpu::MAX_CPUS || !idle_balance_work_held(cpu) {
         return;
     }
     let telemetry = &SCHEDULER_TELEMETRY[cpu];
@@ -3111,9 +3115,14 @@ pub(crate) fn kick_idle_balance_from_tick() {
     if !STEAL_ENABLED.load(Ordering::Acquire) {
         return;
     }
+    let queued = READY[cpu]
+        .try_lock()
+        .and_then(|ready| ready.as_ref().map(|queue| queue.len()))
+        .unwrap_or(0);
     let staged = WAKE_INBOX_LEN[cpu]
         .load(Ordering::Relaxed)
-        .saturating_add(PARKED_WAKE_INBOX[cpu].len.load(Ordering::Relaxed));
+        .saturating_add(PARKED_WAKE_INBOX[cpu].len.load(Ordering::Relaxed))
+        .saturating_add(queued);
     let (state, due) = staged_kick_backoff(
         telemetry.staged_kick.load(Ordering::Relaxed),
         staged.min(u32::MAX as usize) as u32,
@@ -3122,7 +3131,7 @@ pub(crate) fn kick_idle_balance_from_tick() {
     if !due {
         return;
     }
-    let candidates = staged_pull_mask(cpu) & narf_lib::smp::online_bitmap();
+    let candidates = idle_pull_mask(cpu) & narf_lib::smp::online_bitmap();
     if candidates == 0 {
         return;
     }
@@ -3137,6 +3146,47 @@ pub(crate) fn kick_idle_balance_from_tick() {
     if let Some(target) = idle_balance_kick_target(cpu, candidates, ready) {
         resched_remote(target);
     }
+}
+
+/// Whether `cpu` holds work an idle CPU could take from it: staged wakes, or
+/// a runnable task in its ready queue (the owner's conservative runnable-peer
+/// hint; [`idle_pull_mask`] then looks at the tasks themselves). Linux's
+/// `nohz_balancer_kick` likewise looks at the run queue (`nr_running >= 2`,
+/// or a runnable task on a CPU that lost capacity), not at how its tasks got
+/// there. Two loads per tick.
+#[inline]
+fn idle_balance_work_held(cpu: usize) -> bool {
+    wake_list_pending(cpu)
+        || RUNNABLE_STATE
+            .get(cpu)
+            .is_some_and(|state| state.peer.load(Ordering::Acquire))
+}
+
+/// CPUs other than `cpu` that may run work `cpu` holds: its staged wakes
+/// ([`staged_pull_mask`]) and its ready queue ([`ready_pull_mask`]).
+fn idle_pull_mask(cpu: usize) -> u64 {
+    staged_pull_mask(cpu) | ready_pull_mask(cpu)
+}
+
+/// The ready-queue half of [`idle_pull_mask`]: the hard affinity masks of the
+/// runnable tasks among the first [`STAGED_STEAL_SCAN`] of `READY[cpu]`,
+/// with the same user-task rule as [`staged_pull_mask`]. `try_lock`: from the
+/// tick on `cpu` itself the lock cannot be held by what it interrupted (it
+/// masks interrupts), and a holder elsewhere just contributes nothing this
+/// tick.
+fn ready_pull_mask(cpu: usize) -> u64 {
+    let user_smp = user_task_smp_enabled();
+    let mut mask = 0u64;
+    if let Some(ready) = READY.get(cpu).and_then(|ready| ready.try_lock()) {
+        if let Some(queue) = ready.as_ref() {
+            for slot in queue.iter().take(STAGED_STEAL_SCAN) {
+                if slot.awake.executor_runnable() && (user_smp || slot.addr_space.is_none()) {
+                    mask |= slot.spec.affinity.allowed.bits();
+                }
+            }
+        }
+    }
+    mask & !(1u64 << cpu)
 }
 
 /// Advance the kick's back-off for one more stalled tick that found `staged`
@@ -4589,12 +4639,45 @@ fn parked_wake_push(cell: &WakeCell) -> Option<u32> {
             // Kick the CPU actually owning this queued node. Migration may change
             // cell.cpu before the raw waker issues its ordinary placement kick.
             if CURRENT_TASK[cpu].0.load(Ordering::Acquire) != cell.task {
-                notify_wake_cpu(cpu as u32);
+                if !masked_wake_pulled(cpu, cell) {
+                    notify_wake_cpu(cpu as u32);
+                }
                 return Some(cpu as u32);
             }
             return None;
         }
     }
+}
+
+/// Placement for a wake issued with interrupts masked — an interrupt
+/// handler's (every device completion lands on its MSI's CPU), or a hard
+/// hrtimer's — when the CPU the woken task is parked on has passed no
+/// scheduling point for [`NOT_RESCHEDULING_NS`]: the interrupt may be what is
+/// holding it. Linux places such a wake from interrupt context too
+/// (`try_to_wake_up` → `select_idle_sibling`). Moving the slot here could
+/// allocate (the destination's inbox grows) and would run policy callbacks,
+/// so the move is left to an idle allowed CPU, which this IPIs
+/// ([`kick_idle_puller`]); its steal pass takes the staged wake, lifting the
+/// floor and the cache-hot window for the stalled victim
+/// (`try_steal_staged`). The owner keeps its notification without an IPI —
+/// one does nothing for a CPU that is not rescheduling — so a wake still
+/// sends one IPI at most. Allocation-free: one affinity lookup under its
+/// IRQ-safe shard lock. Returns whether an idle CPU was kicked.
+#[inline]
+fn masked_wake_pulled(cpu: usize, cell: &WakeCell) -> bool {
+    if narf_arch::interrupts_enabled()
+        || !STEAL_ENABLED.load(Ordering::Acquire)
+        || !cpu_not_rescheduling(cpu, narf_time::now_cycles())
+    {
+        return false;
+    }
+    let allowed = task_affinity(TaskId(cell.task)).map_or(u64::MAX, |set| set.bits());
+    if !kick_idle_puller(cpu, allowed & !(1u64 << cpu)) {
+        return false;
+    }
+    WAKE_PENDING[cpu].store(true, Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    true
 }
 
 /// Linux's local ttwu_do_activate shape: an exact synchronous wake can publish
@@ -8728,10 +8811,16 @@ fn try_steal_among(
 /// Whether an idle thief may take one dispatchable slot without emptying the
 /// victim of runnable work. Linux's idle load balancer applies the same floor
 /// through `rq->nr_running <= 1`; NARF's queued count excludes the task
-/// currently executing, so that task must be included explicitly.
+/// currently executing, so that task must be included explicitly. A victim
+/// that is not rescheduling ([`cpu_not_rescheduling`]) is busy in the same
+/// sense whether or not a task is current — in a long poll, or in executor
+/// maintenance — and its last queued task waits for it: Linux moves a CPU's
+/// only CFS task to an idle CPU when the source's capacity is taken by
+/// something else (`need_active_balance`: `h_nr_runnable == 1` and
+/// `check_cpu_capacity`).
 #[inline]
-fn victim_has_stealable_surplus(victim_running: bool, dispatchable: usize) -> bool {
-    dispatchable + usize::from(victim_running) > 1
+fn victim_has_stealable_surplus(victim_busy: bool, dispatchable: usize) -> bool {
+    dispatchable + usize::from(victim_busy) > 1
 }
 
 const MIGRATION_COST_NS: u64 = 500_000;
@@ -8785,6 +8874,12 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
         let now = narf_time::now_cycles();
         let migration_cost = narf_time::ns_to_cycles(MIGRATION_COST_NS);
         let victim_running = cpu_running_task(victim_id);
+        // A victim past no scheduling point for `NOT_RESCHEDULING_NS` gives
+        // its queue nothing back, as for staged wakes (`try_steal_staged`):
+        // its last task is taken, and so is a cache-hot one (Linux migrates a
+        // hot task once balancing on its behalf keeps failing,
+        // `nr_balance_failed > cache_nice_tries`).
+        let stalled = cpu_not_rescheduling(victim, now);
         let mut dispatchable = 0usize;
         let mut pos = None;
         for (index, slot) in q.iter().enumerate() {
@@ -8793,7 +8888,7 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
             }
             dispatchable += 1;
             let last_run = slot.awake.last_run_cycles.load(Ordering::Acquire);
-            if pos.is_none() && !task_is_migration_hot(last_run, now, migration_cost) {
+            if pos.is_none() && (stalled || !task_is_migration_hot(last_run, now, migration_cost)) {
                 let meta = crate::policy::TaskMeta::from_slot(slot);
                 if strategy.allow_steal(thief, &meta) {
                     pos = Some(index);
@@ -8801,7 +8896,7 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
             }
         }
         ready_dispatchable = Some(dispatchable);
-        if !victim_has_stealable_surplus(victim_running, dispatchable) {
+        if !victim_has_stealable_surplus(victim_running || stalled, dispatchable) {
             return None;
         }
         match pos {
