@@ -214,9 +214,10 @@ also consult upstream Linux GPL sources.
   (`hub_irq` → `kick_hub_wq`). `connected_downstream_ports(xhci,
   suspended)` acknowledges each port's C_PORT_CONNECTION, C_PORT_ENABLE,
   C_PORT_OVER_CURRENT, C_PORT_RESET and (USB 3.x hubs) C_BH_PORT_RESET,
-  C_PORT_LINK_STATE and C_PORT_CONFIG_ERROR; C_PORT_SUSPEND stays with the
-  remote-wakeup watch (`suspended`, the hub's `suspended_downstream`, is
-  not acted on yet). `HubBinding::walk_pending` marks a hub whose ports must be walked
+  C_PORT_LINK_STATE and C_PORT_CONFIG_ERROR, and C_PORT_SUSPEND on a port
+  not in `suspended` (the hub's `suspended_downstream`): there it only
+  marks a host resume completing (Linux `port_event`). A suspended port's
+  C_PORT_SUSPEND is a remote wakeup and stays with the wake watches. `HubBinding::walk_pending` marks a hub whose ports must be walked
   (set at bind, by a status-change report, and kept while a port attempt
   failed with retry budget left; `attach::set_walk_pending`);
   `attach::hubs_to_walk` selects the hubs a cycle walks: those with a walk
