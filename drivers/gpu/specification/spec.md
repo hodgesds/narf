@@ -12006,7 +12006,11 @@ all-ones reads still fail rather than proving readiness.
 `jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
 create/destroy message pair and the encoder session initialize/close pair on
 every started ring and waits (1 s) for the fences; register waits are bounded
-by 100 ms. An IB-test fence timeout emits one bounded, capability-checked
+by 100 ms. As `amdgpu_ib_ring_tests`, each ring is tested on its own: a ring
+that fails is not ready (its `Proof::{dec_ib, enc_ib}` stays 0, so it takes no
+client job and is left out of idle accounting) while the rings that passed
+serve; the engine is Verified when any ring passed and `test_ib` returns the
+first failure. Device loss or revoked authority ends the tests. An IB-test fence timeout emits one bounded, capability-checked
 snapshot identifying the instance/ring, expected and observed fence, submitted
 and shadow write pointers, hardware read/write pointers, status, power and DPG
 state. The polling path does no logging. A timeout does not release the IB,
@@ -12020,9 +12024,14 @@ published memory. `status()` returns `Status { state, jpeg, proof }`.
 (client 0x10/0x0e: 124 decode, 119/120 encode) and JPEG (153) sources and
 forwards them to `amdgpu_fence_navi22::Engine::{Vcn0, Vcn1, Jpeg}`.
 
-The retained platform owner also runs VCN3 idle work at 100 ms intervals,
-with Linux's 1 s idle delay. It checks physical decode/encode writebacks
-on every active instance, independently of API error signalling. Encode
+The retained platform owner also runs VCN3 idle work as Linux's
+`amdgpu_vcn_idle_work_handler`: VCN_IDLE_TIMEOUT (1 s) after the last use,
+again one timeout later while fences remain (`Engine::idle_recheck`,
+`ColdBoot::media_idle_recheck`), and not at all once gated or unusable until
+the next begin-use. It checks physical decode/encode writebacks of the ready
+rings on every active instance, independently of API error signalling; a ring
+that failed its IB test is not counted, and the DPG stop only warns if such a
+ring does not drain (Linux's SOC15_WAIT_ON_RREG). Encode
 completion releases DPG pause even while decode remains busy. Once all VCN
 work drains it runs the hardware stop and, only when SMU11 MM_DPM_PG is
 running, sends PowerDownVcn (0x2b, instance in bits 16+).

@@ -2224,6 +2224,11 @@ impl ColdBoot {
         };
         media.idle(&mut control, now).await.map_err(Error::Media)
     }
+    /// When the VCN idle work should look again; `None`: not until the next
+    /// media use (`Engine::idle_recheck`).
+    pub(crate) fn media_idle_recheck(&self, now: u64) -> Option<u64> {
+        self.sequence.backend.media.as_ref()?.idle_recheck(now)
+    }
     /// Stop owned media hardware before asking PMFW to gate VCN islands.
     /// # Safety
     /// Block new media publication and drain all JPEG jobs before this
