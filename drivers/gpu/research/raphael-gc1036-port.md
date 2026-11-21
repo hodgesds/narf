@@ -539,11 +539,43 @@ since the submitter is replaced. Raphael's port:
     6. `amdgpu.ppfeaturemask` is Linux's knob. Its default (`0xfff7bfff`)
        has `PP_GFXOFF_MASK`. A mask without it keeps every GFXOFF request
        inert, while power gating still follows GATE and UNGATE, as in Linux.
-    Not done: clock gating (`gfx_v10_0_set_clockgating_state` and the other
-    IPs' MGCG/CGCG/LS). Linux gates clocks before power, and CGPG engages
-    only after CGCG has been active for the hysteresis, so RLC's power
-    gating may do little until then. Whether PMFW's GFXOFF engages without
-    clock gating has not been measured.
+    Clock gating, which CGPG's hysteresis counts from, is step 16.
+
+## Clock gating
+
+16. ~~Clock gating~~ (done, `Gating::new_raphael`). Linux's late init runs
+    `amdgpu_device_set_cg_state(GATE)` over every IP before
+    `set_pg_state(GATE)`, and `amdgpu_device_ip_suspend_phase1` ungates
+    power before clocks. `nv_common_early_init` gives GC 10.3.6 its own
+    set: GFX MGCG, MGLS, CGCG, CGLS, 3D CGCG/CGLS, RLC and CP light sleep,
+    FGCG; MC MGCG/LS; SDMA LS; HDP MGCG/LS; ATHUB MGCG/LS; IH; VCN and JPEG
+    MGCG. Raphael is a resolution of the discrete RDNA2 gating engine:
+    - nv_common: nothing. `nv_common_set_clockgating_state` acts only on
+      NBIO 2.3.x and 3.3.x, and Raphael's is 7.2, so Linux never reaches
+      its HDP or SMUIO gating.
+    - GMC: `mmhub_v2_3` on MMHUB 2.3.0/2.4.x, all on bank 1. Medium grain
+      is the `MM_ATC_L2_CGTT_CLK_CTRL` soft override and DAGB0's six CG
+      disables; light sleep is the ATC L2 MGLS override and DAGB0's write
+      and read LS overrides. Then ATHUB by version: `athub_v2_1` (2.1.0-2.1.2,
+      2.4.0) at 0x0009, `athub_v2_0` (1.3.1, 2.0.0, 2.0.2) at 0x000a with bits
+      18/19, any other version untouched. Raphael's ATHUB revision is
+      unconfirmed. ATHUB_MGCG/LS are informational: both files test MC_MGCG,
+      MC_LS and HDP_LS.
+    - IH: `navi10_ih`, Navi22's register on every `navi10_ih` OSSSYS.
+    - GFX: `gfx_v10_0_update_gfx_clock_gating` in RLC safe mode, the
+      sequences Navi22 runs. Raphael also sets MGLS (RLC and CP memory
+      light sleep), 3D CGLS and FGCG, which those sequences already follow
+      Linux for.
+    - SDMA: `sdma_v5_2` over its one instance. With no SDMA_MGCG the
+      clocks stay forced on, and SDMA_LS sets the memory power override.
+    - VCN and JPEG: the media owner programs their gating in its start and
+      stop (`vcn_v3_0_clock_gating_dpg_mode`, `vcn_v3_0_enable_clock_gating`,
+      JPEG's pair). Linux's late-init `vcn_v3_0_set_clockgating_state(GATE)`
+      is not repeated here.
+    `amdgpu.cg_mask` (Linux's knob) masks the flags. Clock gating runs with
+    GFX powered: at GATE before GFXOFF is allowed, at UNGATE after it is
+    disallowed. A re-arm returns the owner to Idle, since the reset left
+    every gating register at its default.
 
 ## Open
 

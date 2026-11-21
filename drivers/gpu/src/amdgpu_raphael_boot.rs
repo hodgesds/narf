@@ -31,6 +31,7 @@
 //! that preceded it is unaffected. After a completed run the display owner
 //! hands the verified queues to clients (`amdgpu_navi22_cs::register_raphael`,
 //! through `amdgpu_rdna2_client`).
+use crate::amdgpu_navi22_gating as gating;
 use crate::amdgpu_raphael_gfxoff as gfxoff;
 use crate::{
     amdgpu::AmdGpu, amdgpu_cp_navi22 as cp, amdgpu_gmc_navi22 as gmc, amdgpu_ih_navi22 as ih,
@@ -106,6 +107,8 @@ pub enum Error {
     Media(vcn::Error),
     /// A GFXOFF transition failed; GFX power is unknown.
     GfxOff(gfxoff::Error),
+    /// A clock-gating transition failed or the gating owner is missing.
+    ClockGating(gating::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +159,9 @@ pub struct ColdBoot {
     state: State,
     /// GFX power gating and GFXOFF for this lifetime (`amdgpu_raphael_gfxoff`).
     gfxoff: gfxoff::GfxOff,
+    /// Clock gating (`amdgpu_device_set_cg_state`); `None` if its banks did
+    /// not resolve, and the clocks then stay ungated.
+    gating: Option<gating::Gating>,
 }
 /// PMFW's GFXOFF messages and RLC's power gating, for `gfxoff`.
 struct GcPower<'a> {
@@ -212,6 +218,19 @@ impl ColdBoot {
                 .map_err(Error::Queues)?;
             let queues = sdma_queues::Sdma::new_raphael(&gpu, authority, pool, doorbells)
                 .map_err(Error::Queues)?;
+            let options = crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw());
+            // This coordinator alone writes the gating registers; no access.
+            let gating = match gating::Gating::new_raphael(&gpu, authority, options.cg_mask) {
+                Ok(gating) => Some(gating),
+                Err(error) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: raphael clock gating unavailable: {error:?}"
+                    );
+                    None
+                }
+            };
             Ok(Self {
                 gpu,
                 authority,
@@ -230,10 +249,8 @@ impl ColdBoot {
                 proof: None,
                 topology: None,
                 state: State::Prepared,
-                gfxoff: gfxoff::GfxOff::new(
-                    crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw())
-                        .gfxoff,
-                ),
+                gfxoff: gfxoff::GfxOff::new(options.gfxoff),
+                gating,
             })
         }
     }
@@ -440,30 +457,55 @@ impl ColdBoot {
         self.release_gc();
         snapshot
     }
-    /// `gfx_v10_0_set_powergating_state(GATE)` once graphics serves
-    /// clients: RLC power gating on, then GFXOFF allowed [`gfxoff::DELAY_MS`]
-    /// later. A second GATE does nothing.
+    /// `amdgpu_device_ip_late_init` once graphics serves clients:
+    /// `set_cg_state(GATE)` over every block, then
+    /// `gfx_v10_0_set_powergating_state(GATE)` (RLC power gating on, then
+    /// GFXOFF allowed [`gfxoff::DELAY_MS`] later). A clock-gating failure is
+    /// returned after power gating ran; a second GATE does nothing.
     pub(crate) async fn gate_gfx(&mut self) -> Result<(), Error> {
         if !self.queues_verified() {
             return Err(Error::Busy);
         }
+        // GFX is powered: the count is still 1 until the GATE below.
+        let clocks = self.set_clock_gating(true).await;
         let mut hw = GcPower {
             smu: &mut self.smu,
             gfx: &mut self.gfx,
         };
         let allow = self.gfxoff.gate(&mut hw).await.map_err(Error::GfxOff)?;
         schedule(allow);
-        Ok(())
+        clocks
     }
-    /// `gfx_v10_0_set_powergating_state(UNGATE)`, before S3 and before a
-    /// mode 2 reset: GFXOFF disallowed, then RLC power gating off. GFX is
-    /// powered on `Ok`.
+    /// `amdgpu_device_ip_suspend_phase1`, before S3 and before a mode 2
+    /// reset: `set_pg_state(UNGATE)` (GFXOFF disallowed, then RLC power
+    /// gating off), then `set_cg_state(UNGATE)` in reverse block order. GFX
+    /// is powered on `Ok`.
     pub(crate) async fn ungate_gfx(&mut self) -> Result<(), Error> {
         let mut hw = GcPower {
             smu: &mut self.smu,
             gfx: &mut self.gfx,
         };
-        self.gfxoff.ungate(&mut hw).await.map_err(Error::GfxOff)
+        self.gfxoff.ungate(&mut hw).await.map_err(Error::GfxOff)?;
+        self.set_clock_gating(false).await
+    }
+    /// `amdgpu_device_set_cg_state` over every block. GFX must be powered.
+    async fn set_clock_gating(&mut self, gate: bool) -> Result<(), Error> {
+        let Some(gating) = self.gating.as_mut() else {
+            return Ok(());
+        };
+        let all = gating::Blocks::SOC.union(gating::Blocks::GFX);
+        let ungated = gating.state() == gating::State::Idle
+            || gating.state() == gating::State::Gated(gating::Blocks::NONE);
+        if (!gate && ungated) || (gate && gating.state() == gating::State::Gated(all)) {
+            return Ok(());
+        }
+        // SAFETY: the coordinator owns every gated block; GFXOFF is
+        // disallowed for the call (the count is 1 before GATE, and UNGATE
+        // ran first), RLC runs once the rings are verified, and
+        // `amdgpu.cg_mask` admitted the flags.
+        unsafe { gating.set_clockgating(gate, all) }
+            .await
+            .map_err(Error::ClockGating)
     }
     /// `amdgpu_device_delay_enable_gfx_off` for an allow this coordinator
     /// scheduled; `Ok(false)` when it was cancelled or is from a lifetime
@@ -533,6 +575,11 @@ impl ColdBoot {
         // A new lifetime: the count back at 1 (the SMU stage disallows), and
         // a delayed allow from before lands nowhere.
         self.gfxoff = gfxoff::GfxOff::new(self.gfxoff.enabled());
+        if let Some(gating) = self.gating.as_mut() {
+            // SAFETY: forwarded; the reset left every gating register at its
+            // default and no transition is in flight.
+            unsafe { gating.rearm() };
+        }
         Ok(())
     }
     /// Recovery's quiesce before a mode 2 reset (Navi22's `quiesce_for_reset`):

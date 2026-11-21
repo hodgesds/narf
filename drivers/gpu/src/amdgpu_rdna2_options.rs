@@ -65,6 +65,9 @@ pub struct BootOptions<'a> {
     /// GFXOFF. Linux's default mask, `0xfff7bfff`, sets it; a mask without it
     /// keeps GFX powered. Navi22's GFXOFF follows `amdgpu.rdna2_pg` instead.
     pub gfxoff: bool,
+    /// Linux `amdgpu.cg_mask`: the clock-gating flags Raphael keeps
+    /// (`cg_flags &= amdgpu_cg_mask`). Every bit by default.
+    pub cg_mask: u32,
 }
 /// `amdgpu_pp_feature_mask`'s default (amdgpu_drv.c).
 // linux-lit: 0xfff7bfff=amdgpu_pp_feature_mask default
@@ -147,6 +150,10 @@ impl<'a> BootOptions<'a> {
                 _ => PP_FEATURE_MASK,
             } & PP_GFXOFF_MASK
                 != 0,
+            cg_mask: match value("amdgpu.cg_mask") {
+                Some(Some(v)) => parse_uint(v).unwrap_or(u32::MAX),
+                _ => u32::MAX,
+            },
         }
     }
 }
@@ -213,6 +220,9 @@ mod tests {
         ] {
             assert_eq!(BootOptions::parse(raw).gfxoff, want, "{raw}");
         }
+        assert_eq!(default.cg_mask, u32::MAX);
+        assert_eq!(BootOptions::parse("amdgpu.cg_mask=0xfffffffb").cg_mask, !4);
+        assert_eq!(BootOptions::parse("amdgpu.cg_mask=nope").cg_mask, u32::MAX);
         for (raw, want) in [
             ("amdgpu.rdna2_connector=dp", Connector::DisplayPort),
             ("amdgpu.rdna2_connector=hdmi", Connector::Hdmi),

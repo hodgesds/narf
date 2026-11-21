@@ -111,6 +111,9 @@ fn engine() -> Engine<Fake> {
         cg_flags: NAVY_FLOUNDER_CG,
         sdma_count: 2,
         rom_force_on: true,
+        hub: Hub::V2_0,
+        athub: Athub::V2_1,
+        common: true,
         in_safe_mode: false,
         state: State::Idle,
     }
@@ -523,4 +526,259 @@ fn rdna2_gating_all_profiles_and_discovered_engines() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_gating_all_profiles_and_discovered_engines
+);
+
+// ── Raphael (GC 10.3.6) ─────────────────────────────────────────────────
+/// `Fake::new` plus Raphael's MMHUB 2.3 registers (the test MMHUB base), the
+/// ATHUB 2.0 offset, and SDMA0_POWER_CNTL with its memory override clear.
+fn raphael_engine(athub: Athub) -> Engine<Fake> {
+    let mut io = Fake::new();
+    io.regs.extend([
+        (0x1a6cf, 0xff00_8000), // MM_ATC_L2_CGTT_CLK_CTRL: overrides on
+        (0x1a096, 0xfc),        // DAGB0_CNTL_MISC2: CG disabled
+        (0x1a065, 0xf800_0000), // DAGB0_WR_CGTT_CLK_CTRL: LS overrides on
+        (0x1a024, 0xf800_0000), // DAGB0_RD_CGTT_CLK_CTRL
+        (0xc0a, 0),             // ATHUB 2.0's ATHUB_MISC_CNTL
+    ]);
+    if let Some(slot) = io.regs.iter_mut().find(|(r, _)| *r == 0x127a) {
+        slot.1 = 0;
+    }
+    Engine {
+        io,
+        authority: Cap::bootstrap(),
+        cg_flags: RAPHAEL_CG,
+        sdma_count: 1,
+        rom_force_on: false,
+        hub: Hub::V2_3,
+        athub,
+        common: false,
+        in_safe_mode: false,
+        state: State::Idle,
+    }
+}
+/// Linux's GATE pass for GC 10.3.6 (nv.c's flags), in IP order common,
+/// gmc, ih, gfx, sdma. NBIO 7.2 gives nv_common nothing to do.
+const RAPHAEL_GATE: &[(u32, u32)] = &[
+    // mmhub_v2_3: medium grain (ATC L2 soft override, DAGB0 CG disables),
+    // then light sleep (ATC L2 MGLS, DAGB0 write and read LS overrides).
+    (0x1a6cf, 0x0000_8000),
+    (0x1a096, 0),
+    (0x1a6cf, 0),
+    (0x1a065, 0),
+    (0x1a024, 0),
+    // athub_v2_1 CG + LS.
+    (0xc09, 0x40),
+    (0xc09, 0xc0),
+    // navi10_ih IH_CG.
+    (0x117b, 0),
+    // gfx_v10_0 in RLC safe mode: FGCG first (its override, then the RLC
+    // SRAM clock gater override).
+    (0xeca0, 0x3),
+    (0xec48, 0x0001_00fe),
+    (0xfb31, 0),
+    // MGCG, then MGLS: RLC and CP memory light sleep.
+    (0xc200, 0xe000_0000),
+    (0xf086, 0xff00_0000),
+    (0xf084, 0xff00_0000),
+    (0xf085, 0xff00_0000),
+    (0xec48, 0x0000_0098),
+    (0xec06, 1),
+    (0x3079, 1),
+    // 3D CGCG + CGLS: FSM 0x363F, IDLE_POLL_COUNT.
+    (0xec48, 0x0000_0018),
+    (0xecc5, 0x0000_363f),
+    (0x21c2, 0x0090_0100),
+    // CGCG + CGLS.
+    (0xec48, 0),
+    (0xec49, 0x0000_363f),
+    (0x306a, 0x043c_0000),
+    (0x306b, 0x003c_0000),
+    (0xeca0, 0x1),
+    // sdma_v5_2, one instance: no SDMA_MGCG (clocks forced on), SDMA_LS on.
+    (0x127b, 0xfc00_0100),
+    (0x127a, 0x100),
+];
+/// UNGATE in reverse order sdma, gfx, ih, gmc, after RAPHAEL_GATE.
+const RAPHAEL_UNGATE: &[(u32, u32)] = &[
+    (0x127a, 0),
+    (0xeca0, 0x3),
+    (0xec49, 0x0000_363c),
+    (0xecc5, 0x0000_363c),
+    (0xec48, 0x0001_0166),
+    (0x3079, 0),
+    (0xec06, 0),
+    // FGCG last: its override is already back; the SRAM gater override.
+    (0xfb31, 0x100),
+    (0x306a, 0x0400_0000),
+    (0x306b, 0),
+    (0xeca0, 0x1),
+    (0x117b, 0xf800_0000),
+    (0x1a6cf, 0xff00_0000),
+    (0x1a096, 0xfc),
+    (0x1a6cf, 0xff00_8000),
+    (0x1a065, 0xf800_0000),
+    (0x1a024, 0xf800_0000),
+    (0xc09, 0x80),
+    (0xc09, 0),
+];
+
+/// Raphael's clock gating against Linux: mmhub_v2_3 and athub_v2_1 for the
+/// GMC, navi10_ih, every GFX10 flag GC 10.3.6 sets (MGLS, RLC and CP light
+/// sleep, 3D CGLS and FGCG beside Navi22's), one SDMA with light sleep, and
+/// no HDP, SMUIO or second-SDMA access at all.
+fn raphael_clock_gating_matches_linux_order_and_values() -> TestResult {
+    let mut e = raphael_engine(Athub::V2_1);
+    if run(e.set_clockgating(true, ALL)).is_err() || e.state != State::Gated(ALL) {
+        return TestResult::Fail("gate failed");
+    }
+    if e.io.writes != RAPHAEL_GATE || e.io.unexpected {
+        return TestResult::Fail("gate writes differ from Linux");
+    }
+    let untouched = [0xff4, 0xff8, 0x168e4, 0x187a, 0x187b, 0x1a070];
+    if e.io.reads.iter().any(|r| untouched.contains(r)) {
+        return TestResult::Fail("HDP, SMUIO, SDMA1 or MMHUB 2.1 accessed");
+    }
+    e.io.writes.clear();
+    if run(e.set_clockgating(false, ALL)).is_err() || e.state != State::Gated(Blocks::NONE) {
+        return TestResult::Fail("ungate failed");
+    }
+    if e.io.writes != RAPHAEL_UNGATE || e.io.unexpected {
+        return TestResult::Fail("ungate writes differ from Linux");
+    }
+    // A re-armed owner (after a reset) gates again from Idle.
+    e.state = State::Failed;
+    e.rearm();
+    if e.state != State::Idle || run(e.set_clockgating(true, ALL)).is_err() {
+        return TestResult::Fail("re-arm kept the gating state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/raphael-gating",
+    raphael_clock_gating_matches_linux_order_and_values
+);
+
+/// ATHUB by version, as gmc_v10_0_set_clockgating_state chooses: 2.0 at
+/// 0x000a with bits 18/19, skipping a step whose flags are missing; 2.1
+/// clears such a bit instead; any other version is never touched.
+fn raphael_athub_follows_its_version() -> TestResult {
+    let mut e = raphael_engine(Athub::V2_0);
+    if run(e.set_clockgating(true, ALL)).is_err()
+        || !e.io.writes.contains(&(0xc0a, 0x4_0000))
+        || !e.io.writes.contains(&(0xc0a, 0xc_0000))
+        || e.io.reads.contains(&0xc09)
+    {
+        return TestResult::Fail("athub_v2_0 gate");
+    }
+    // amdgpu.cg_mask without MC_MGCG: 2.0 skips its CG step entirely.
+    for (athub, cg_read) in [(Athub::V2_0, false), (Athub::V2_1, true)] {
+        let mut e = raphael_engine(athub);
+        e.cg_flags &= !cg::MC_MGCG;
+        let misc = abs(athub.register().unwrap());
+        if run(e.set_clockgating(true, ALL)).is_err()
+            || e.io.reads.iter().filter(|r| **r == misc).count() != 1 + usize::from(cg_read)
+        {
+            return TestResult::Fail("athub step without MC_MGCG");
+        }
+    }
+    let mut e = raphael_engine(Athub::None);
+    if run(e.set_clockgating(true, ALL)).is_err()
+        || e.io.reads.iter().any(|r| *r == 0xc09 || *r == 0xc0a)
+    {
+        return TestResult::Fail("an unlisted ATHUB was accessed");
+    }
+    for (version, want) in [
+        (Some((2, 1, 2)), Athub::V2_1),
+        (Some((2, 4, 0)), Athub::V2_1),
+        (Some((2, 0, 2)), Athub::V2_0),
+        (Some((1, 3, 1)), Athub::V2_0),
+        (Some((2, 3, 0)), Athub::None),
+        (None, Athub::None),
+    ] {
+        if Athub::for_version(version) != want {
+            return TestResult::Fail("ATHUB version table");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/raphael-gating",
+    raphael_athub_follows_its_version
+);
+
+/// Raphael's resolution: nv.c's 10.3.6 flags under amdgpu.cg_mask, MMHUB
+/// 2.3's bank 1, ATHUB by version, one SDMA; MMHUB 2.1, a second SDMA0 and
+/// a discrete GPU are refused.
+fn raphael_gating_resolves_raphaels_blocks() -> TestResult {
+    use crate::amdgpu_discovery as d;
+    let build = |mmhub: (u8, u8, u8), athub: Option<(u8, u8, u8)>, sdmas: usize| {
+        let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        gpu.chip =
+            crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::RAPHAEL).unwrap();
+        let template = gpu.ip_blocks[0];
+        let block = |id, v: (u8, u8, u8), bases: &[u32]| {
+            let mut b = template;
+            b.hw_id = id;
+            (b.major, b.minor, b.revision) = v;
+            b.num_bases = bases.len() as u8;
+            b.base_addrs[..bases.len()].copy_from_slice(bases);
+            b
+        };
+        gpu.ip_blocks = alloc::vec![
+            block(d::HW_ID_GC, (10, 3, 6), &[0x1260, 0xa000]),
+            block(d::HW_ID_MMHUB, mmhub, &[0, 0x1a000]),
+            block(d::HW_ID_OSSSYS, (5, 2, 1), &[0x10a0]),
+        ];
+        if let Some(v) = athub {
+            gpu.ip_blocks.push(block(d::HW_ID_ATHUB, v, &[0xc00]));
+        }
+        for _ in 0..sdmas {
+            gpu.ip_blocks
+                .push(block(d::HW_ID_SDMA0, (5, 2, 6), &[0x1260]));
+        }
+        gpu
+    };
+    // SAFETY: resolution performs no register access.
+    let resolve = |gpu: &AmdGpu, mask| unsafe { Gating::new_raphael(gpu, Cap::bootstrap(), mask) };
+    let Ok(g) = resolve(&build((2, 3, 0), Some((2, 1, 2)), 1), u32::MAX) else {
+        return TestResult::Fail("Raphael gating refused");
+    };
+    let e = &g.engine;
+    if (e.hub, e.athub, e.common, e.sdma_count, e.cg_flags)
+        != (Hub::V2_3, Athub::V2_1, false, 1, RAPHAEL_CG)
+        || e.io.mmhub != 0x1a000 * 4
+        || e.io.athub != 0xc00 * 4
+        || e.io.hdp.is_some()
+        || e.io.smuio.is_some()
+        || e.io.gc2.is_some()
+    {
+        return TestResult::Fail("Raphael gating banks or flags");
+    }
+    match resolve(&build((2, 4, 1), Some((2, 3, 0)), 1), !(cg::MC_MGCG as u32)) {
+        Ok(g)
+            if g.engine.athub == Athub::None
+                && g.engine.io.athub == 0
+                && g.engine.cg_flags == RAPHAEL_CG & !cg::MC_MGCG => {}
+        _ => return TestResult::Fail("cg_mask, or an unlisted ATHUB"),
+    }
+    for (gpu, why) in [
+        (build((2, 1, 0), Some((2, 1, 2)), 1), "took MMHUB 2.1"),
+        (build((2, 3, 0), None, 2), "took a second SDMA0"),
+        (build((2, 3, 0), None, 0), "took no SDMA0"),
+    ] {
+        if resolve(&gpu, u32::MAX).is_ok() {
+            return TestResult::Fail(why);
+        }
+    }
+    let mut navi22 = build((2, 3, 0), None, 1);
+    navi22.chip =
+        crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::NAVI22).unwrap();
+    if resolve(&navi22, u32::MAX).is_ok() {
+        return TestResult::Fail("Raphael gating took a discrete GPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/raphael-gating",
+    raphael_gating_resolves_raphaels_blocks
 );
