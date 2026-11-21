@@ -266,6 +266,15 @@ therefore leaves the root unchanged, as on Linux — pacman runs every hook
 with `chroot("/")` inside PID 1's root, and `ldconfig -r .` adds its own
 `chroot(".")`.
 
+`pivot_root(new_root, put_old)` attaches the old root at `put_old` with every
+mount below it except the new root's own subtree, as Linux `path_pivot_root`
+moves the whole old root tree: right after `pivot_root("/tmp", "oldroot")` the
+old root's procfs is at `/oldroot/proc`, and `/proc/self/fd/N` read through it
+names files relative to the caller's new root. The mount table is path-keyed,
+so the attachment copies each entry (filesystem, root, flags, peer group,
+source); the originals stay at their old paths outside the new root, where
+only a descriptor opened before the pivot still reaches them.
+
 `narf_user_runtime::execve` does not return on success and returns the kernel's
 positive Linux errno on failure. `narf-libc::execve` publishes that exact value
 through thread-local `errno`; it must not collapse path-resolution failures,

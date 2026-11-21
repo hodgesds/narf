@@ -125,18 +125,35 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EBUSY));
         return;
     }
-    // Bind-mount prior_root at put_old_resolved so the old root is
-    // still reachable from inside the new root. Route through the
-    // namespace-aware helper: when the caller unshared CLONE_NEWNS (every
-    // systemd service sandbox does, before pivot_root), the put_old bind
-    // must land in that task's PRIVATE mount table, not the global registry.
-    // Binding into the global registry leaked each executor's put_old into
-    // every other task's view, so the per-service root assembly became
-    // order-dependent — a fresh executor's find_executable() intermittently
-    // hit ENOENT (203/EXIT_EXEC) while a later one, snapshotting the polluted
-    // global table, happened to succeed.
-    let auth = narf_filesystem::bootstrap_mount_authority();
-    let _ = current_bind_mount(&auth, &prior_root, &put_old_resolved);
+    // `path_pivot_root` attaches the old root mount at put_old with its
+    // whole tree — `attach_mnt(root_mnt, old_mnt, old_mp)` moves root_mnt,
+    // and every mount below it moves with it — after `umount_mnt(new_mnt)`
+    // took the new root's subtree out of that tree. bubblewrap reads
+    // `/oldroot/proc/self/fd/N` and binds `/oldroot/proc` right after its
+    // first pivot; attaching the root filesystem alone left `/oldroot/proc`
+    // an empty directory, so both failed ENOENT ("Can't bind mount /oldroot/
+    // on /newroot/").
+    //
+    // Route through the namespace-aware helper: when the caller unshared
+    // CLONE_NEWNS (every systemd service sandbox does, before pivot_root),
+    // the attachment must land in that task's PRIVATE mount table, not the
+    // global registry. Attaching into the global registry leaked each
+    // executor's put_old into every other task's view, so the per-service
+    // root assembly became order-dependent — a fresh executor's
+    // find_executable() intermittently hit ENOENT (203/EXIT_EXEC) while a
+    // later one, snapshotting the polluted global table, happened to succeed.
+    let trim = |path: &str| -> alloc::string::String {
+        if path.len() > 1 {
+            alloc::string::String::from(path.trim_end_matches('/'))
+        } else {
+            alloc::string::String::from(path)
+        }
+    };
+    let _ = current_attach_old_root(
+        &trim(&prior_root),
+        &trim(&new_root_resolved),
+        &trim(&put_old_resolved),
+    );
     // Install the new root.
     set_root_dir(task, new_root_resolved.clone());
     // The cwd directory is physically unchanged, but the root moved — recompute
