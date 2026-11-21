@@ -106,6 +106,7 @@ pub use tx_ba_power::Request as TxBaRequest;
 #[cfg(feature = "kernel-test")]
 mod rx_ba_tests;
 pub use rx_ba_power::Request as RxBaRequest;
+mod chip_bridge;
 #[cfg(feature = "kernel-test")]
 mod ht_tests;
 pub(super) mod interface;

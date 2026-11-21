@@ -26,6 +26,7 @@
 use core::future::Future;
 
 pub mod mac;
+pub mod phy;
 
 /// Terminal result of a chip register operation. Register programming only
 /// needs to distinguish the handful of outcomes the bring-up acts on; richer
