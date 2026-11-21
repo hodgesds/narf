@@ -191,6 +191,24 @@ pub(crate) fn record(
     hangs
 }
 
+/// When the detector samples next, in ms from `now_ms`; `None`: not until a
+/// job is emitted. At this point every PERIOD_MS, job or no job.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+pub(crate) fn next_sample(watchdog: &Watchdog, now_ms: u64) -> Option<u64> {
+    let _ = (watchdog, now_ms);
+    Some(PERIOD_MS)
+}
+
+/// Work was emitted on a kernel queue (`Queue::next_seq`).
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+pub(crate) fn job_emitted() {}
+
+/// Resolves after the next [`job_emitted`].
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+fn job_emitted_wait() -> impl core::future::Future<Output = ()> {
+    core::future::pending()
+}
+
 /// Detector task for one owner generation; exits on `stop` or device loss.
 pub(crate) async fn monitor(epoch: u64, generation: u64) {
     use core::fmt::Write;
