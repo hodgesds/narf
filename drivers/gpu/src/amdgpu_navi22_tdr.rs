@@ -340,13 +340,25 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
                 }
             }
             if raphael {
-                // Soft recovery failed and no later rung is ported for the
-                // APU: the hang fails every job and stops the submitter.
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "amdgpu: raphael ring not recovered; client submission stopped"
-                );
-                continue;
+                // The last rung: the whole-device mode 2 reset, under the
+                // same per-boot budget as Navi22's recovery.
+                if !crate::amdgpu_platform::gpu_recovery_enabled() {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: raphael GPU recovery disabled (amdgpu.gpu_recovery=0)"
+                    );
+                    continue;
+                }
+                if !claim_automatic_recovery() {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: raphael GPU recovery limit ({MAX_AUTOMATIC_RECOVERIES} per boot) reached; the GPU stays hung"
+                    );
+                    continue;
+                }
+                let result = crate::amdgpu_platform::recover().await;
+                let _ = writeln!(narf_console::Writer, "amdgpu: raphael recovery {result:?}");
+                return; // a recovered owner starts a fresh detector
             }
             if AUTOMATIC.load(Ordering::Acquire) {
                 if claim_automatic_recovery() {

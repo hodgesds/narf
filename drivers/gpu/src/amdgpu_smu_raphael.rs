@@ -37,6 +37,8 @@ const MSG_POWER_UP_JPEG: u32 = 19; // linux: PPSMC_MSG_PowerUpJpeg
 const MSG_ALLOW_GFXOFF: u32 = 22; // linux: PPSMC_MSG_AllowGfxOff
 const MSG_DISALLOW_GFXOFF: u32 = 23; // linux: PPSMC_MSG_DisallowGfxOff
 const MSG_GET_DRIVER_IF_VERSION: u32 = 25; // linux: PPSMC_MSG_GetDriverIfVersion
+const MSG_GFX_DEVICE_DRIVER_RESET: u32 = 10; // linux: PPSMC_MSG_GfxDeviceDriverReset
+const MODE2_RESET: u32 = 2; // linux: MODE2_RESET
 
 const RESP_NONE: u32 = 0; // linux: SMU_RESP_NONE
 const RESP_OK: u32 = 1; // linux: PPSMC_Result_OK
@@ -219,10 +221,13 @@ impl<I: Io> Engine<I> {
         Ok(versions)
     }
     async fn started(&mut self, message: u32) -> Result<(), Error> {
+        self.started_with(message, 0).await
+    }
+    async fn started_with(&mut self, message: u32, argument: u32) -> Result<(), Error> {
         if self.versions.is_none() {
             return Err(Error::NotStarted);
         }
-        self.send(message, 0).await.map(|_| ())
+        self.send(message, argument).await.map(|_| ())
     }
 }
 
@@ -283,6 +288,18 @@ impl Smu {
             MSG_POWER_DOWN_JPEG
         };
         self.0.started(message).await
+    }
+    /// `smu_v13_0_5_mode2_reset`: GfxDeviceDriverReset(MODE2_RESET). PMFW
+    /// resets the graphics, SDMA and multimedia engines; nothing they ran
+    /// survives.
+    ///
+    /// # Safety
+    /// Every owner of those engines is quiesced and will be rebuilt, as
+    /// `amdgpu_raphael_reset::mode2` requires.
+    pub async unsafe fn mode2_reset(&mut self) -> Result<(), Error> {
+        self.0
+            .started_with(MSG_GFX_DEVICE_DRIVER_RESET, MODE2_RESET)
+            .await
     }
 }
 

@@ -377,9 +377,39 @@ since the submitter is replaced. Raphael's port:
          - the KIQ remaps it (ENGINE_SEL 4), and the GFX owner ring-tests it.
          A kernel job (VMID 0) is not reset. Ring 1 carries no client work
          and is left alone.
-    5. Mode 2 (`GfxDeviceDriverReset(SMU_RESET_MODE_2)`), for SDMA hangs,
-       kernel-job hangs and failed queue resets. Not started. It re-initializes every IP, display included,
-       so the display owner's DMUB and PSP session must come back with it.
+    5. ~~Mode 2~~ (done), for SDMA hangs, kernel-job hangs and failed
+       queue resets: `amdgpu_platform::recover`, after
+       `amdgpu_device_gpu_recover`. Linux recovers APUs by default
+       (`amdgpu_gpu_recovery` -1); `amdgpu.gpu_recovery=0` turns it off, and
+       Navi22's per-boot budget applies.
+       1. Quiesce: the client path withdrawn (every job fails), the watchdog
+          stopped, the IH ring disabled, every fence wait abandoned, the
+          stream disabled.
+       2. `psp_suspend`: DMUB stopped, the TMR released, the PSP ring stopped
+          (`Loader::stop_for_reset`; a plain stop still refuses with
+          graphics up).
+       3. `nv_asic_mode2_reset` (`amdgpu_raphael_reset`):
+          - the engine-hung scratch bit set;
+          - bus mastering off, with the command register and BARs cached;
+          - PMFW `GfxDeviceDriverReset(MODE2_RESET)` (message 10, argument 2);
+          - the cached state restored;
+          - MEMSIZE alive;
+          - the scratch bit cleared.
+       4. Re-initialization:
+          - the PSP session booted again, which reloads the graphics set and
+            runs the RLC autoload;
+          - DMUB notifications;
+          - a new graphics coordinator, then media, then client registration;
+          - the recovery counter (`amdgpu_ctx::recoveries`) moves, so older
+            contexts see the reset.
+          The old coordinator is kept, quarantined: each recovery leaks its
+          carve-out, as on Navi22.
+       5. The stream put back on its validated mode, as `resume` does. The
+          scanout is not cleared: `amdgpu_device_check_vram_lost` reports no
+          loss for mode 2.
+       Unproven on silicon. In particular, what mode 2 resets on 13.0.5
+       (whether the PSP and DCN come back on their own) follows Linux's
+       order rather than a measurement.
 
 ## Open
 

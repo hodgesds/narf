@@ -412,6 +412,40 @@ impl ColdBoot {
         }
         self.gfx.hang_snapshot()
     }
+    /// Recovery's quiesce before a mode 2 reset (Navi22's `quiesce_for_reset`):
+    /// the IH ring disabled, so every subscriber ends, and quarantined with
+    /// its vector. The engines are left to the reset.
+    ///
+    /// # Safety
+    /// Recovery's contract: no client work is admitted, and the owner is
+    /// rebuilt rather than reused after the reset.
+    pub(crate) async unsafe fn quiesce_for_reset(&mut self) -> Result<(), Error> {
+        // SAFETY: forwarded; nothing depends on IH delivery any more.
+        unsafe { self.ih.disable() }
+            .await
+            .map_err(Error::Interrupts)
+    }
+    /// `nv_asic_mode2_reset` through this owner's SMU mailbox and `device`,
+    /// its PCI function. The owner is spent afterwards: keep it (its memory
+    /// stays quarantined) and build a new one.
+    ///
+    /// # Safety
+    /// `quiesce_for_reset` completed, the PSP released its TMR, and the
+    /// caller rebuilds every engine before use (`amdgpu_raphael_reset::mode2`).
+    pub(crate) async unsafe fn mode2_reset(
+        &mut self,
+        device: &BusDevice,
+    ) -> Result<(), crate::amdgpu_raphael_reset::Error> {
+        self.state = State::Failed {
+            stage: Stage::Smu,
+            error: Error::Busy,
+        };
+        // SAFETY: forwarded.
+        unsafe {
+            crate::amdgpu_raphael_reset::mode2(&self.gpu, &self.authority, device, &mut self.smu)
+        }
+        .await
+    }
     /// Client media rings (bit `MediaRing::index()`) and their fence reader,
     /// once `run_media` started VCN and JPEG.
     pub fn client_media(&self) -> Option<(u8, vcn::MediaFenceReader)> {

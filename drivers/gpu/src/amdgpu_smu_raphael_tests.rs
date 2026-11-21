@@ -128,6 +128,38 @@ kernel_test_in!(
     smu_raphael_start_reads_versions_in_linux_order
 );
 
+/// `smu_v13_0_5_mode2_reset`: PPSMC_MSG_GfxDeviceDriverReset (10) with
+/// MODE2_RESET (2) as its argument, only once PMFW's versions are known.
+fn smu_raphael_mode2_reset_message() -> TestResult {
+    if (MSG_GFX_DEVICE_DRIVER_RESET, MODE2_RESET) != (10, 2) {
+        return TestResult::Fail("GfxDeviceDriverReset message or argument");
+    }
+    let mut cold = engine(&[Some((RESP_OK, 0))]);
+    if run(cold.started_with(MSG_GFX_DEVICE_DRIVER_RESET, MODE2_RESET)) != Err(Error::NotStarted)
+        || !cold.io.log.is_empty()
+    {
+        return TestResult::Fail("mode 2 sent before start");
+    }
+    let mut e = engine(&[
+        Some((RESP_OK, 5)),
+        Some((RESP_OK, 0x0050_4800)),
+        Some((RESP_OK, 0)),
+    ]);
+    if run(e.start()).is_err()
+        || run(e.started_with(MSG_GFX_DEVICE_DRIVER_RESET, MODE2_RESET)).is_err()
+        || e.io.log[e.io.log.len() - 3..]
+            != [
+                (RESPONSE, 0),
+                (ARGUMENT, 2),
+                (MSG, MSG_GFX_DEVICE_DRIVER_RESET),
+            ]
+    {
+        return TestResult::Fail("mode 2 reset message");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/smu-raphael", smu_raphael_mode2_reset_message);
+
 /// Nothing is sent before PMFW is proven running, and nothing but `start`
 /// before the versions are read.
 fn smu_raphael_refuses_messages_before_running_firmware() -> TestResult {

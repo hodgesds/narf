@@ -650,6 +650,8 @@ pub mod amdgpu_nbio_v7_2;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_raphael_boot;
 #[cfg(feature = "amdgpu")]
+pub(crate) mod amdgpu_raphael_reset;
+#[cfg(feature = "amdgpu")]
 pub(crate) mod amdgpu_rdna2_client;
 #[path = "amdgpu_vcn_navi22.rs"]
 #[cfg(feature = "amdgpu")]

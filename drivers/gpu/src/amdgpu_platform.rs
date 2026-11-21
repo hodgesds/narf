@@ -791,6 +791,144 @@ async fn media_boot(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot, loader:
         }
     }
 }
+/// Completed mode 2 recoveries since boot (`amdgpu_ctx::recoveries` adds
+/// them, so contexts from before a reset see their jobs cancelled).
+static RECOVERIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) fn recoveries() -> u64 {
+    RECOVERIES.load(core::sync::atomic::Ordering::Acquire)
+}
+/// Linux's `amdgpu_gpu_recovery`: -1 (the default) recovers an APU like
+/// Raphael; `amdgpu.gpu_recovery=0` turns it off.
+pub(crate) fn gpu_recovery_enabled() -> bool {
+    narf_boot::args().value("amdgpu.gpu_recovery") != Some("0")
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryError {
+    /// No display owner with a completed graphics boot to recover.
+    Busy,
+    Quiesce(crate::amdgpu_raphael_boot::Error),
+    Display(crate::amdgpu_dcn_display::Error),
+    Psp(crate::amdgpu_dmub_boot::Error),
+    Reset(crate::amdgpu_raphael_reset::Error),
+    /// The PSP session came back without the graphics set loaded.
+    NoGraphics,
+    /// The rebuilt graphics owner did not complete its boot.
+    Graphics,
+}
+/// Raphael's `amdgpu_device_gpu_recover` with a mode 2 reset, for a hang no
+/// ring-level rung recovered:
+/// 1. Quiesce: the client path withdrawn (every job fails), the watchdog
+///    stopped, the IH ring disabled, every fence wait abandoned, the stream
+///    disabled.
+/// 2. `psp_suspend`: DMUB stopped, the TMR released, the PSP ring stopped.
+/// 3. The mode 2 reset (`nv_asic_mode2_reset`).
+/// 4. Re-initialization, as `amdgpu_device_reinit_after_reset`:
+///    - the PSP session booted again, which loads the graphics set and runs
+///      the RLC autoload;
+///    - DMUB notifications;
+///    - a new graphics coordinator, then media, then client registration.
+///
+///    The old coordinator is kept, quarantined.
+/// 5. The stream put back on the mode it was validated for (DM's resume).
+///    The carve-out survives a mode 2 reset (`amdgpu_device_check_vram_lost`
+///    reports no loss), so the scanout is not cleared.
+///
+/// A failure after the quiesce leaves graphics stopped. The display is
+/// left as far as it got.
+pub(crate) async fn recover() -> Result<(), RecoveryError> {
+    use core::fmt::Write as _;
+    let mut guard = DISPLAY.lock().await;
+    let display = guard.as_mut().ok_or(RecoveryError::Busy)?;
+    let device = crate::amdgpu::pci_device().ok_or(RecoveryError::Busy)?;
+    if !display
+        .graphics
+        .as_ref()
+        .is_some_and(crate::amdgpu_raphael_boot::ColdBoot::queues_verified)
+    {
+        return Err(RecoveryError::Busy);
+    }
+    let _ = writeln!(narf_console::Writer, "amdgpu: raphael MODE2 reset");
+    // 1. Quiesce.
+    crate::amdgpu_navi22_cs::unregister();
+    crate::amdgpu_navi22_tdr::stop();
+    let Display {
+        loader,
+        pool,
+        stream,
+        graphics,
+        retired,
+        ..
+    } = display;
+    let old = graphics.as_mut().ok_or(RecoveryError::Busy)?;
+    // SAFETY: the client path is withdrawn; `old` is retired below.
+    unsafe { old.quiesce_for_reset() }
+        .await
+        .map_err(RecoveryError::Quiesce)?;
+    crate::amdgpu_fence_navi22::abandon_all();
+    if let Some(running) = stream.as_mut() {
+        running
+            .pipeline
+            .disable(loader)
+            .await
+            .map_err(RecoveryError::Display)?;
+    }
+    // 2-3. psp_suspend, then the reset of everything that ran from the TMR.
+    // SAFETY: the mode 2 reset follows at once, and the loader boots again
+    // before the display or graphics are used.
+    unsafe { loader.stop_for_reset() }
+        .await
+        .map_err(RecoveryError::Psp)?;
+    // SAFETY: quiesced above, TMR released; everything is rebuilt below.
+    unsafe { old.mode2_reset(&device) }
+        .await
+        .map_err(RecoveryError::Reset)?;
+    if let Some(old) = graphics.take() {
+        retired.push(old);
+    }
+    // 4. Re-initialization.
+    loader
+        .boot(Default::default())
+        .await
+        .map_err(RecoveryError::Psp)?;
+    loader
+        .enable_notifications()
+        .await
+        .map_err(RecoveryError::Psp)?;
+    if !loader.graphics_booted() {
+        return Err(RecoveryError::NoGraphics);
+    }
+    let firmware = loader.graphics_versions();
+    *graphics = alloc::boxed::Box::pin(graphics_boot(pool, firmware)).await;
+    let new = graphics
+        .as_mut()
+        .filter(|g| g.queues_verified())
+        .ok_or(RecoveryError::Graphics)?;
+    alloc::boxed::Box::pin(media_boot(new, loader)).await;
+    // Contexts from before the reset now see it (amdgpu_ctx::recoveries).
+    RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    serve_clients(new);
+    // 5. The stream, as `resume` puts it back.
+    if let Some(running) = stream.as_mut() {
+        running
+            .pipeline
+            .start()
+            .await
+            .map_err(RecoveryError::Display)?;
+        running
+            .pipeline
+            .enable(
+                loader,
+                &running.scanout,
+                &running.timing,
+                &running.platform,
+                running.depth,
+                running.caps,
+            )
+            .await
+            .map_err(RecoveryError::Display)?;
+    }
+    Ok(())
+}
 /// Publish a completed Raphael graphics boot to clients: its submitter,
 /// VMIDs and heap, then `ACCEL_WORKING`. `graphics` loaded the set only with
 /// `amdgpu.rdna2_accel` on, the switch the discrete boot turns this on with.
@@ -1015,6 +1153,10 @@ struct Display {
     /// Raphael's graphics engines, retained whether or not their bring-up
     /// finished: an engine may still reach memory it published.
     graphics: Option<crate::amdgpu_raphael_boot::ColdBoot>,
+    /// Graphics owners a mode 2 recovery replaced. Kept, never reused, so
+    /// the memory they published stays quarantined (Navi22's policy: each
+    /// recovery leaks its old owners' carve-out).
+    retired: Vec<crate::amdgpu_raphael_boot::ColdBoot>,
 }
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
 
@@ -1076,6 +1218,7 @@ pub(crate) fn start() -> bool {
         stream: None,
         attempted: false,
         graphics: None,
+        retired: Vec::new(),
     });
     drop(owner);
     crate::amdgpu_usbc::observe_connectors();

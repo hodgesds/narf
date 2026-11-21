@@ -791,6 +791,25 @@ impl Loader {
         }
         Ok(())
     }
+    /// `psp_suspend` ahead of a mode 2 reset: DMUB stopped, then the TMR
+    /// released and the PSP ring stopped while the RLC and CP still run from
+    /// the TMR, as Linux's suspend before the reset does. A later `boot`
+    /// loads the graphics set again.
+    ///
+    /// # Safety
+    /// The caller resets every engine running from the TMR (mode 2) before
+    /// anything else runs, and boots this loader again before the display or
+    /// graphics are used.
+    pub(crate) async unsafe fn stop_for_reset(&mut self) -> Result<(), Error> {
+        self.graphics_booted = false;
+        self.transport = None;
+        self.engine.stop().await?;
+        if let Some(psp) = self.psp.as_mut() {
+            // SAFETY: DMCUB is reset above; the caller resets the rest.
+            unsafe { psp.stop().await }.map_err(Error::Psp)?;
+        }
+        Ok(())
+    }
     pub async fn enable_notifications(&mut self) -> Result<(), Error> {
         let dmub = self.transport.as_mut().ok_or(Error::Busy)?;
         authorized(&self.engine.authority, dmub.enable_notifications()).await
