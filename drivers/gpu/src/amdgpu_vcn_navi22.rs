@@ -719,6 +719,20 @@ fn update_vcpu<I: Io>(
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
+/// `vcn_v3_0_enable_clock_gating`: DYN_CLOCK_MODE only with
+/// `AMD_CG_SUPPORT_VCN_MGCG` ([`cgc_ctrl`]).
+fn enable_clock_gating<I: Io>(io: &mut I, l: Layout, i: usize, mgcg: bool) -> Result<(), Error> {
+    let r = |x: Reg| l.reg(i, x);
+    let ctrl = checked(io.read(r(CGC_CTRL)))?;
+    io.write(r(CGC_CTRL), ctrl | cgc_ctrl(mgcg));
+    update(io, r(CGC_CTRL), CGC_CTRL_MODES, CGC_CTRL_MODES)?;
+    update(
+        io,
+        r(SUVD_CGC_CTRL),
+        SUVD_CGC_CTRL_MODES,
+        SUVD_CGC_CTRL_MODES,
+    )
+}
 /// CPU VRAM writes leave the HDP write cache before an engine fetches them.
 fn flush<I: Io>(io: &mut I, l: Layout) {
     barrier(Ordering::SeqCst);
@@ -2108,6 +2122,7 @@ impl<I: Io> Engine<I> {
         let map = instance.memory.mapping();
         let dec = instance.address(DEC_RING);
         let enc = [instance.address(ENC_RING[0]), instance.address(ENC_RING[1])];
+        let enc_wptr = [instance.enc[0].wptr, instance.enc[1].wptr];
         let wptr = self.hw.access(|io, l| {
             let r = |reg: Reg| l.reg(i, reg);
             update(io, r(MASTINT_EN), MASTINT_VCPU_EN, MASTINT_VCPU_EN)?;
@@ -2130,8 +2145,10 @@ impl<I: Io> Engine<I> {
             modes(io, 0);
             for j in 0..enc_count {
                 modes(io, shared::RING_RESET << shared::ENCODE_SHIFT[j]);
-                io.write(r(RB_RPTR[j]), 0);
-                io.write(r(RB_WPTR[j]), 0);
+                // Both pointers at the ring's write pointer, as
+                // vcn_v3_0_start does: a restart runs nothing twice.
+                io.write(r(RB_RPTR[j]), enc_wptr[j]);
+                io.write(r(RB_WPTR[j]), enc_wptr[j]);
                 io.write(r(RB_BASE_LO[j]), enc[j] as u32);
                 io.write(r(RB_BASE_HI[j]), (enc[j] >> 32) as u32);
                 io.write(r(RB_SIZE[j]), RING_DW);
@@ -2498,73 +2515,70 @@ impl<I: Io> Engine<I> {
             return Ok(());
         }
         let instances: alloc::vec::Vec<usize> = self.active().collect();
-        let (vcn_pg, mgcg) = (self.pg.vcn, self.cg.vcn);
         for i in instances {
             if self.mode == StartMode::Dpg {
                 self.stop_dpg(i).await?;
                 continue;
             }
-            let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
-            let reg = |l: Layout, r: Reg| l.reg(i, r);
-            let (status, lmi) = (reg(self.hw.layout, STATUS), reg(self.hw.layout, LMI_STATUS));
-            // linux: n/a (literal 0x7, vcn_v3_0_stop)
-            self.hw.wait_reg(engine, status, STATUS_IDLE, 0x7).await?;
+            self.stop_static(i).await?;
+        }
+        Ok(())
+    }
+    /// `vcn_v3_0_stop` without DPG for instance `i`: wait for idle and a
+    /// clean LMI, stall UMC, block the VCPU and hold it in reset, soft-reset
+    /// the LMI, clear the status, enable clock gating and, with
+    /// `AMD_PG_SUPPORT_VCN`, power every tile off.
+    pub(crate) async fn stop_static(&mut self, i: usize) -> Result<(), Error> {
+        let (vcn_pg, mgcg) = (self.pg.vcn, self.cg.vcn);
+        let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
+        let reg = |l: Layout, r: Reg| l.reg(i, r);
+        let (status, lmi) = (reg(self.hw.layout, STATUS), reg(self.hw.layout, LMI_STATUS));
+        // linux: n/a (literal 0x7, vcn_v3_0_stop)
+        self.hw.wait_reg(engine, status, STATUS_IDLE, 0x7).await?;
+        self.hw
+            .wait_reg(engine, lmi, LMI_STATUS_CLEAN, LMI_STATUS_CLEAN)
+            .await?;
+        self.hw.access(|io, l| {
+            update(
+                io,
+                reg(l, LMI_CTRL2),
+                LMI_CTRL2_STALL_ARB_UMC,
+                LMI_CTRL2_STALL_ARB_UMC,
+            )
+        })?;
+        self.hw
+            .wait_reg(engine, lmi, LMI_STATUS_UMC_CLEAN, LMI_STATUS_UMC_CLEAN)
+            .await?;
+        self.hw.access(|io, l| {
+            let r = |x: Reg| reg(l, x);
+            update(io, r(RB_ARB_CTRL), RB_ARB_VCPU_DIS, RB_ARB_VCPU_DIS)?;
+            update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST)?;
+            update_vcpu(io, l, i, VCPU_CLK_EN, 0)?;
+            update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
+            update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
+            io.write(r(STATUS), 0);
+            enable_clock_gating(io, l, i, mgcg)?;
+            if !vcn_pg {
+                checked(io.read(r(STATUS)))?;
+                return Ok(());
+            }
+            // vcn_v3_0_enable_static_power_gating, AMD_PG_SUPPORT_VCN:
+            // the tiles-off indicator, then every tile off.
+            update(io, r(POWER_STATUS), POWER_STATUS_MASK, POWER_TILES_OFF)?;
+            io.write(r(PGFSM_CONFIG), PGFSM_ALL_OFF);
+            Ok(())
+        })?;
+        if vcn_pg {
+            let pgfsm = reg(self.hw.layout, PGFSM_STATUS);
             self.hw
-                .wait_reg(engine, lmi, LMI_STATUS_CLEAN, LMI_STATUS_CLEAN)
+                .wait_reg(engine, pgfsm, PGFSM_ALL_OFF, PGFSM_STATUS_MASK)
                 .await?;
+            // The read-back that orders the writes. UVD_STATUS is in the
+            // gated domain now, so its value proves nothing.
             self.hw.access(|io, l| {
-                update(
-                    io,
-                    reg(l, LMI_CTRL2),
-                    LMI_CTRL2_STALL_ARB_UMC,
-                    LMI_CTRL2_STALL_ARB_UMC,
-                )
-            })?;
-            self.hw
-                .wait_reg(engine, lmi, LMI_STATUS_UMC_CLEAN, LMI_STATUS_UMC_CLEAN)
-                .await?;
-            self.hw.access(|io, l| {
-                let r = |x: Reg| reg(l, x);
-                update(io, r(RB_ARB_CTRL), RB_ARB_VCPU_DIS, RB_ARB_VCPU_DIS)?;
-                update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST)?;
-                update_vcpu(io, l, i, VCPU_CLK_EN, 0)?;
-                update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
-                update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
-                io.write(r(STATUS), 0);
-                // vcn_v3_0_enable_clock_gating. Without
-                // AMD_CG_SUPPORT_VCN_MGCG it ORs in 0: DYN_CLOCK_MODE stays
-                // as read.
-                let ctrl = checked(io.read(r(CGC_CTRL)))?;
-                io.write(r(CGC_CTRL), ctrl | cgc_ctrl(mgcg));
-                update(io, r(CGC_CTRL), CGC_CTRL_MODES, CGC_CTRL_MODES)?;
-                update(
-                    io,
-                    r(SUVD_CGC_CTRL),
-                    SUVD_CGC_CTRL_MODES,
-                    SUVD_CGC_CTRL_MODES,
-                )?;
-                if !vcn_pg {
-                    checked(io.read(r(STATUS)))?;
-                    return Ok(());
-                }
-                // vcn_v3_0_enable_static_power_gating, AMD_PG_SUPPORT_VCN:
-                // the tiles-off indicator, then every tile off.
-                update(io, r(POWER_STATUS), POWER_STATUS_MASK, POWER_TILES_OFF)?;
-                io.write(r(PGFSM_CONFIG), PGFSM_ALL_OFF);
+                io.read(reg(l, STATUS));
                 Ok(())
             })?;
-            if vcn_pg {
-                let pgfsm = reg(self.hw.layout, PGFSM_STATUS);
-                self.hw
-                    .wait_reg(engine, pgfsm, PGFSM_ALL_OFF, PGFSM_STATUS_MASK)
-                    .await?;
-                // The read-back that orders the writes. UVD_STATUS is in the
-                // gated domain now, so its value proves nothing.
-                self.hw.access(|io, l| {
-                    io.read(reg(l, STATUS));
-                    Ok(())
-                })?;
-            }
         }
         Ok(())
     }
@@ -3462,6 +3476,15 @@ impl Media {
     /// See `Engine::report_client_timeout`.
     pub(crate) fn report_client_timeout(&mut self, ring: MediaRing, seq: u32) {
         self.engine.report_client_timeout(ring, seq);
+    }
+    /// The per-queue reset of VCN instance `i` (`Engine::reset_instance`).
+    pub(crate) async fn reset_engine(
+        &mut self,
+        control: &mut impl idle::Control,
+        i: usize,
+        cancel: impl FnOnce(&[idle::Cancelled]),
+    ) -> Result<(), Error> {
+        self.engine.reset_instance(control, i, cancel).await
     }
 }
 

@@ -1902,6 +1902,26 @@ impl ColdBoot {
         }
         Ok(samples)
     }
+    /// The per-queue reset of VCN instance `i` after a client job timed out
+    /// (`amdgpu_vcn_reset_engine`), with PMFW power and the PSP DPG register
+    /// list as in begin-use; `cancel` receives the outstanding client work
+    /// the reset force-completes.
+    pub(crate) async fn reset_media(
+        &mut self,
+        i: usize,
+        cancel: impl FnOnce(&[crate::amdgpu_vcn_navi22::idle::Cancelled]),
+    ) -> Result<(), Error> {
+        let h = &mut self.sequence.backend;
+        let media = h.media.as_mut().ok_or(Error::Invalid)?;
+        let mut control = crate::amdgpu_vcn_navi22::idle::Owned {
+            smu: h.smu.as_mut(),
+            psp: h.psp.as_mut().ok_or(Error::Invalid)?,
+        };
+        media
+            .reset_engine(&mut control, i, cancel)
+            .await
+            .map_err(Error::Media)
+    }
     /// Timeout-only evidence of a client media job that never completed
     /// (`Media::report_client_timeout`); nothing without a media owner.
     pub(crate) fn media_timeout_report(

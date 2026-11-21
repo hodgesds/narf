@@ -443,6 +443,26 @@ pub(crate) async fn queue_progress(
     owner.as_mut().ok_or(boot::Error::Invalid)?.queue_progress()
 }
 
+/// `amdgpu_vcn_reset_engine` for VCN instance `instance` after a client job
+/// timed out. The owner is held throughout, so no media job is submitted
+/// meanwhile; the cancelled jobs are recorded before their fences are
+/// forced, and their waiters are woken afterwards.
+pub(crate) async fn reset_media_engine(
+    instance: usize,
+    generation: u64,
+) -> Result<(), boot::Error> {
+    let result = {
+        let mut owner = OWNER.lock().await;
+        let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+        boot.reset_media(instance, |cancelled| {
+            crate::amdgpu_navi22_cs::media_reset(cancelled, generation)
+        })
+        .await
+    };
+    crate::amdgpu_fence_navi22::notify_all();
+    result
+}
+
 /// Sample only after a graphics timeout. Unlike queue progress this reads GC
 /// registers, so it holds a GFXOFF reference with the owner. The caller
 /// prints after both guards drop.

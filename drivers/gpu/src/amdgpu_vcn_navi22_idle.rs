@@ -251,17 +251,135 @@ impl<I: Io> Engine<I> {
 /// (ring, last completed sequence, last emitted sequence).
 pub(crate) type Cancelled = (MediaRing, u32, u32);
 impl<I: Io> Engine<I> {
-    /// `amdgpu_vcn_reset_engine` for VCN instance `i` (VCN 3.0
-    /// `AMDGPU_RESET_TYPE_PER_QUEUE`); `cancel` receives what it
-    /// force-completes.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    /// `amdgpu_vcn_ring_reset` -> `amdgpu_vcn_reset_engine` for VCN
+    /// instance `i` after a job on one of its rings timed out (VCN 3.0's
+    /// `AMDGPU_RESET_TYPE_PER_QUEUE`). The caller holds the media owner, so
+    /// no job reaches the instance meanwhile (`drm_sched_wqueue_stop`).
+    /// `vcn_v3_0_reset`, the decode and encode ring tests, then
+    /// `amdgpu_fence_driver_force_completion` on each of the instance's
+    /// rings: `cancel` first receives every client ring's outstanding
+    /// sequences, which end with `-ECANCELED`, and the fences are written
+    /// afterwards. A failure leaves the engine failed and forces nothing.
     pub(crate) async fn reset_instance(
         &mut self,
-        _pm: &mut impl Control,
-        _i: usize,
-        _cancel: impl FnOnce(&[Cancelled]),
+        pm: &mut impl Control,
+        i: usize,
+        cancel: impl FnOnce(&[Cancelled]),
     ) -> Result<(), Error> {
-        Err(Error::Unsupported)
+        if self.state != State::Verified
+            || self.runtime.phase != Phase::Awake
+            || self.vcn.get(i).is_none_or(Option::is_none)
+        {
+            return Err(Error::Busy);
+        }
+        // Like the idle work: a cancelled reset is never replayed.
+        self.runtime.phase = Phase::Quiescing;
+        let result = self.reset_inner(pm, i, cancel).await;
+        if result.is_ok() {
+            self.runtime.phase = Phase::Awake;
+        } else {
+            self.runtime.phase = Phase::Failed;
+            self.state = State::Failed;
+        }
+        result
+    }
+    async fn reset_inner(
+        &mut self,
+        pm: &mut impl Control,
+        i: usize,
+        cancel: impl FnOnce(&[Cancelled]),
+    ) -> Result<(), Error> {
+        let only = [i == 0, i == 1];
+        // vcn_v3_0_reset: vcn_v3_0_stop, whose amdgpu_dpm_enable_vcn(false)
+        // sends PowerDownVcn while MM_DPM_PG runs.
+        match self.mode {
+            StartMode::Dpg => self.stop_dpg(i).await?,
+            StartMode::Static => self.stop_static(i).await?,
+        }
+        pm.power(only, false).await?;
+        let mgcg = self.cg.vcn;
+        self.hw
+            .access(|io, l| enable_clock_gating(io, l, i, mgcg))?;
+        if self.mode == StartMode::Dpg {
+            // vcn_v3_0_enable_static_power_gating (AMD_PG_SUPPORT_VCN, the
+            // DPG configuration): every tile but UVDJ off.
+            let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
+            self.hw.access(|io, l| {
+                update(
+                    io,
+                    l.reg(i, POWER_STATUS),
+                    POWER_STATUS_MASK,
+                    POWER_TILES_OFF,
+                )?;
+                io.write(l.reg(i, PGFSM_CONFIG), PGFSM_ALL_OFF);
+                Ok(())
+            })?;
+            let status = self.hw.layout.reg(i, PGFSM_STATUS);
+            self.hw
+                .wait_reg(engine, status, PGFSM_ALL_OFF, PGFSM_STATUS_MASK)
+                .await?;
+        }
+        // vcn_v3_0_start: amdgpu_dpm_enable_vcn(true) (PowerUpVcn), then
+        // the DPG or static start with the cached images and tiling.
+        pm.power(only, true).await?;
+        let gb = self.runtime.gb;
+        match self.mode {
+            StartMode::Dpg => self.start_instance_dpg(i, gb, pm).await?,
+            StartMode::Static => {
+                let image = self.runtime.images[i].ok_or(Error::Invalid)?;
+                self.start_instance(i, image, gb).await?
+            }
+        }
+        // amdgpu_ring_test_ring: decode, then each encode ring, whose
+        // begin_use pauses DPG and so programs the encode rings.
+        self.test_dec_ring(i).await?;
+        if self.mode == StartMode::Dpg && self.enc_count > 0 {
+            self.pause_dpg(i).await?;
+        }
+        for j in 0..self.enc_count {
+            self.test_enc_ring(i, j).await?;
+        }
+        self.force_completion(i, cancel)
+    }
+    /// `amdgpu_fence_driver_force_completion` on each ring of instance `i`:
+    /// the client rings' outstanding sequences go to `cancel` before every
+    /// ring's fence is written with its last emitted sequence.
+    fn force_completion(
+        &mut self,
+        i: usize,
+        cancel: impl FnOnce(&[Cancelled]),
+    ) -> Result<(), Error> {
+        let rings = 1 + self.enc_count;
+        let instance = self.vcn[i].as_ref().ok_or(Error::Invalid)?;
+        let map = instance.memory.mapping();
+        let emitted = [instance.dec.seq, instance.enc[0].seq, instance.enc[1].seq];
+        let mut done = [0u32; 3];
+        self.hw.access(|io, l| {
+            invalidate(io, l);
+            checked(io.read(l.liveness()))?;
+            for (slot, value) in done.iter_mut().enumerate().take(rings) {
+                *value = io.read_memory(map, FENCE[slot]);
+            }
+            Ok(())
+        })?;
+        // Client rings live on instance 0 only.
+        let mut cancelled = alloc::vec::Vec::new();
+        if i == 0 {
+            let client = [MediaRing::Dec, MediaRing::Enc(0), MediaRing::Enc(1)];
+            for (slot, &ring) in client.iter().enumerate().take(rings) {
+                if self.client_ready(ring) && !fence::signaled(done[slot], emitted[slot]) {
+                    cancelled.push((ring, done[slot], emitted[slot]));
+                }
+            }
+        }
+        cancel(&cancelled);
+        self.hw.access(|io, l| {
+            for (slot, &seq) in emitted.iter().enumerate().take(rings) {
+                io.write_memory(map, FENCE[slot], seq);
+            }
+            flush(io, l);
+            Ok(())
+        })
     }
 }
 

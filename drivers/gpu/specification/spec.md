@@ -11840,19 +11840,37 @@ sequence and its fence writeback after an HDP invalidate
 (`ColdBoot::queue_progress`; an all-ones read-back is device loss). Media
 rings are timed with Linux's `video_timeout` (also 2 s), one timer per ring
 although VCN0's rings share fence engine `Vcn0`. A media timeout is
-`amdgpu_job_timedout` on a video ring: it logs `ring <engine> <ring> timeout,
-signaled seq=…, emitted seq=…` and the VCN register line (or JRBC pointers and
-JPEG power state) of `Media::report_client_timeout`, then
-`amdgpu_navi22_cs::media_hung` fails the oldest pending job of that ring with
-`TimedOut` (`-ETIME`, its context guilty) and the other jobs of that engine's
-rings (`media_rings`: VCN0 decode and both encode rings, or JPEG) with
-`Canceled`, as Linux's `amdgpu_vcn_reset_engine` force-completes them; jobs
-published there later are canceled too. Graphics, compute and SDMA jobs keep
-running. Linux then resets the VCN instance alone (VCN 3.0's per-queue reset);
-NARF has no per-engine VCN reset and does not start a whole-GPU recovery for
-a media timeout: `amdgpu_vcn_navi22_cs::withdraw` removes the engine's rings
-from clients and `AMDGPU_INFO` until the next recovery or boot, while their
-fences stay readable so a late completion still retires its memory. The sample
+`amdgpu_job_timedout` on a VCN or JPEG ring, bare metal: it logs `ring
+<linux name> timeout, signaled seq=…, emitted seq=…` (`vcn_dec_0`,
+`vcn_enc_0.0`, `vcn_enc_0.1`, `jpeg_dec`) and the VCN register line (or JRBC
+pointers and JPEG power state) of `Media::report_client_timeout`, then takes
+`tdr::media_action`. With `amdgpu.gpu_recovery=0` nothing is reset: the job
+reports `-ETIME` once its fence lands and waits meanwhile, its context's next
+submission fails (`Jobs::time_out`, `drm_sched_suspend_timeout`). Otherwise a
+VCN ring resets its instance (VCN 3.0's `AMDGPU_RESET_TYPE_PER_QUEUE`,
+`amdgpu_vcn_ring_reset` → `amdgpu_vcn_reset_engine`,
+`amdgpu_navi22_platform::reset_media_engine` → `ColdBoot::reset_media` →
+`Engine::reset_instance`), holding the media owner so no job reaches the
+instance: `vcn_v3_0_reset` (`vcn_v3_0_stop`, PowerDownVcn while MM_DPM_PG runs,
+`vcn_v3_0_enable_clock_gating`, in DPG mode `vcn_v3_0_enable_static_power_gating`
+with every tile but UVDJ off, PowerUpVcn, the DPG or static start), the decode
+ring test, the DPG pause and both encode ring tests, then
+`amdgpu_fence_driver_force_completion` on each of the instance's rings: every
+outstanding client job (`idle::Cancelled`, recorded in the submitter by
+`amdgpu_navi22_cs::media_reset` before the fences are written) ends with
+`Canceled` (`-ECANCELED`), the timed-out job's included, and keeps that error
+after its forced fence retires its memory; their contexts' next submissions
+fail and no context is guilty. The rings stay offered to clients and the log
+reads `Starting <ring> ring reset` and `Ring <ring> reset succeeded`. A reset
+that fails (`Ring <ring> reset failed (…)`; the engine is left failed) or a
+JPEG timeout (NARF has no JPEG ring reset, which in Linux backs up and
+re-emits other contexts' work) takes Linux's `-ETIME` and
+`amdgpu_device_gpu_recover` branch exactly as a kernel-queue hang does: the
+job is guilty, every other job abandoned and `recover()` runs within the same
+`tdr::MAX_AUTOMATIC_RECOVERIES`; past that budget the job waits as with
+recovery disabled. The static start restores each encode ring's pointers to
+the ring's write pointer, as `vcn_v3_0_start` does, so a restart re-runs
+nothing. The sample
 reads no GC register, so like Linux's fence timeout it takes no GFXOFF
 reference and never wakes an idle GPU. The per-engine
 timer starts when unsignalled work is first seen and restarts on every fence
@@ -12147,8 +12165,9 @@ reservation. Two jobs outstanding per ring; frames are bounded to half the
 ring. Not emitted: the post-flush VM fence (Linux bookkeeping; the job's own
 fence stands in, as on the kernel queues). A client media job that never
 completes times out after 2 s on its own ring (hang detection,
-`amdgpu_navi22_tdr`): the client sees `-ETIME`/`-ECANCELED` and the engine's
-rings are withdrawn.
+`amdgpu_navi22_tdr`): a VCN timeout resets the VCN instance and its
+outstanding jobs end with `-ECANCELED`; a failed reset or a JPEG timeout
+recovers the GPU.
 
 `amdgpu_vcn_navi22_cs::{media_ring, ring_id, completed, rings, register,
 unregister, forget_owner, submit, dec_ib_messages, check_dec_msg,
