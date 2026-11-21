@@ -195,7 +195,23 @@ also consult upstream Linux GPL sources.
   Descriptor capability. `Xhci::mark_as_hub(slot, ports, multi_tt, ttt)`
   programs Hub, MTT, Number of Ports and (high-speed hubs) TT Think Time with
   Configure Endpoint on a copy of the slot context; its failure prevents
-  publication of the hub and downstream children. Hub port power-on waits
+  publication of the hub and downstream children. After it,
+  `UsbHub::activate(xhci)` adds the hub's status-change interrupt-IN
+  endpoint (the interface's first endpoint, `hub::status_endpoint`; transfer
+  `min(wMaxPacketSize, 8)` bytes, `UsbHub::status`) and submits it (Linux
+  `hub_activate`); failure leaves `status` empty and the hub on the walk
+  alone. In its inter-cycle wait the supervisor consumes completed
+  status-change transfers (`attach::hub_status_changed`, which resubmits
+  them and clears C_HUB_LOCAL_POWER / C_HUB_OVER_CURRENT for a hub-level
+  change) and starts the next cycle at once when one reported a change
+  (`hub_irq` → `kick_hub_wq`). `connected_downstream_ports` acknowledges
+  each port's C_PORT_CONNECTION, C_PORT_ENABLE, C_PORT_OVER_CURRENT,
+  C_PORT_RESET and (USB 3.x hubs) C_BH_PORT_RESET, C_PORT_LINK_STATE and
+  C_PORT_CONFIG_ERROR (C_PORT_SUSPEND stays with the remote-wakeup
+  watch). The
+  supervisor tries one root port per cycle but does not park while another
+  connected, unclaimed port with retry budget remains
+  (`enumeration_wait::root_ports_to_attempt`). Hub port power-on waits
   `bPwrOn2PwrGood` (at least 100 ms); a hub port reset waits 10 ms before the
   first status read, allows 800 ms and then 50 ms of reset recovery.
 - `hid::BootKeyboard::attach(..., identity: InputId)` publishes an evdev

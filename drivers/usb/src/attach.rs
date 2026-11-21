@@ -292,6 +292,31 @@ pub fn hub_index_for_slot(controller: u8, slot_id: u8) -> Option<usize> {
     g.iter().position(|h| h.hub.slot_id == slot_id)
 }
 
+/// Consume every completed hub status-change transfer on `xhci_dev`
+/// (each is resubmitted) and acknowledge hub-level changes. True when
+/// any hub reported a change, so the supervisor walks the hubs' ports
+/// now — Linux `hub_irq` → `kick_hub_wq` → `hub_event`.
+pub async fn hub_status_changed(xhci_dev: &crate::xhci::Xhci) -> bool {
+    let hubs: Vec<UsbHub> = HUBS
+        .of(xhci_dev.id())
+        .lock()
+        .iter()
+        .filter(|h| h.hub.status.is_some())
+        .map(|h| h.hub)
+        .collect();
+    let mut changed = false;
+    for hub in &hubs {
+        let Some(bits) = hub.take_status_change(xhci_dev) else {
+            continue;
+        };
+        if bits & 1 != 0 {
+            hub.clear_hub_change(xhci_dev).await;
+        }
+        changed |= bits != 0;
+    }
+    changed
+}
+
 /// Pure per-port suspend decision behind [`idle_suspend_pass`]:
 /// a port is idle-expired when its last-activity tick is at least
 /// [`IDLE_SUSPEND_NS`] old. The `u64::MAX` sentinel (stamped by
@@ -1025,15 +1050,15 @@ async fn dispatch_after_address(
             let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
-        let bound = match UsbHub::attach(xhci_dev, slot_id, iface, dev_protocol, speed, &full).await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                note_attach_failure(xhci_dev.id(), root_port, this_route, "hub_attach", &e);
-                let _ = release_slot(xhci_dev, slot_id).await;
-                return AttachOutcome::UnknownClass;
-            }
-        };
+        let mut bound =
+            match UsbHub::attach(xhci_dev, slot_id, iface, dev_protocol, speed, &full).await {
+                Ok(b) => b,
+                Err(e) => {
+                    note_attach_failure(xhci_dev.id(), root_port, this_route, "hub_attach", &e);
+                    let _ = release_slot(xhci_dev, slot_id).await;
+                    return AttachOutcome::UnknownClass;
+                }
+            };
         // Flip the slot context's Hub bit + Number of Ports so the
         // controller sizes its TT-routing state for downstream
         // enumeration (xHCI 1.2 §6.2.2 dword0[26], dword1[31:24]).
@@ -1050,6 +1075,17 @@ async fn dispatch_after_address(
             note_attach_failure(xhci_dev.id(), root_port, this_route, "mark_as_hub", &e);
             let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
+        }
+        // Submit the status-change transfer (Linux `hub_activate`). A
+        // hub without it still works through the supervisor's walk.
+        if let Err(e) = bound.activate(xhci_dev).await {
+            note_attach_failure(
+                xhci_dev.id(),
+                root_port,
+                this_route,
+                "hub_status_endpoint",
+                &e,
+            );
         }
         // Tier of THIS hub = number of 4-bit nibbles already
         // populated in `this_route`. For a tier-0 hub the route is
