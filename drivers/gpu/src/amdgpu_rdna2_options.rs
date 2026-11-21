@@ -61,6 +61,25 @@ pub struct BootOptions<'a> {
     /// first, otherwise). Diagnostic: lets either output be tested with
     /// both cables attached.
     pub connector: Connector,
+    /// Linux `amdgpu.ppfeaturemask`'s `PP_GFXOFF_MASK` (bit 15): Raphael's
+    /// GFXOFF. Linux's default mask, `0xfff7bfff`, sets it; a mask without it
+    /// keeps GFX powered. Navi22's GFXOFF follows `amdgpu.rdna2_pg` instead.
+    pub gfxoff: bool,
+}
+/// `amdgpu_pp_feature_mask`'s default (amdgpu_drv.c).
+// linux-lit: 0xfff7bfff=amdgpu_pp_feature_mask default
+const PP_FEATURE_MASK: u32 = 0xfff7_bfff;
+const PP_GFXOFF_MASK: u32 = 0x8000; // linux: PP_GFXOFF_MASK
+/// A `uint` module parameter (`kstrtouint` base 0): `0x` hex, a leading `0`
+/// octal, else decimal.
+fn parse_uint(v: &str) -> Option<u32> {
+    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else if v.len() > 1 && v.starts_with('0') {
+        u32::from_str_radix(&v[1..], 8).ok()
+    } else {
+        v.parse().ok()
+    }
 }
 /// [`BootOptions::connector`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -121,6 +140,13 @@ impl<'a> BootOptions<'a> {
                 Some(Some("hdmi" | "HDMI")) => Connector::Hdmi,
                 _ => Connector::Any,
             },
+            // A malformed mask keeps Linux's default, as a failed parse
+            // leaves the module parameter at its default.
+            gfxoff: match value("amdgpu.ppfeaturemask") {
+                Some(Some(v)) => parse_uint(v).unwrap_or(PP_FEATURE_MASK),
+                _ => PP_FEATURE_MASK,
+            } & PP_GFXOFF_MASK
+                != 0,
         }
     }
 }
@@ -175,6 +201,18 @@ mod tests {
         let typo = BootOptions::parse("amdgpu.rdna2_multi=maybe amdgpu.rdna2_accel=nope");
         assert!(!typo.multi && typo.accel);
         assert_eq!(default.connector, Connector::Any);
+        // Raphael's GFXOFF follows Linux's feature mask, on by default.
+        assert!(default.gfxoff);
+        for (raw, want) in [
+            ("amdgpu.ppfeaturemask=0xffff7fff", false),
+            ("amdgpu.ppfeaturemask=0x8000", true),
+            ("amdgpu.ppfeaturemask=32768", true),
+            ("amdgpu.ppfeaturemask=0100000", true),
+            ("amdgpu.ppfeaturemask=0", false),
+            ("amdgpu.ppfeaturemask=bad", true),
+        ] {
+            assert_eq!(BootOptions::parse(raw).gfxoff, want, "{raw}");
+        }
         for (raw, want) in [
             ("amdgpu.rdna2_connector=dp", Connector::DisplayPort),
             ("amdgpu.rdna2_connector=hdmi", Connector::Hdmi),

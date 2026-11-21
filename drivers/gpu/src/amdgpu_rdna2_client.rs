@@ -79,15 +79,15 @@ pub(crate) async fn queue_progress(
         }
     }
 }
-/// GC evidence after a graphics timeout. Navi22's takes a GFXOFF reference
-/// with its owner; Raphael's GFXOFF stays disallowed.
+/// GC evidence after a graphics timeout. Both hold GFXOFF off for the reads:
+/// Navi22 with a reference beside its owner, Raphael inside its coordinator.
 pub(crate) async fn gfx_hang_snapshot() -> Result<cp::GfxHangSnapshot, BootError> {
     match backend() {
         Backend::Navi22 => crate::amdgpu_navi22_platform::gfx_hang_snapshot().await,
         Backend::Raphael => {
             let mut owner = crate::amdgpu_platform::graphics_owner().await;
             let boot = owner.get().ok_or(BootError::Invalid)?;
-            boot.gfx_hang_snapshot().map_err(queue_error)
+            boot.gfx_hang_snapshot().await.map_err(queue_error)
         }
     }
 }

@@ -1215,6 +1215,11 @@ const RLC_ENABLE_F32: u32 = 1 << 0; // linux: RLC_CNTL__RLC_ENABLE_F32_MASK@gc10
 const SAFE_MODE_CMD: u32 = 1 << 0; // linux: RLC_SAFE_MODE__CMD_MASK@gc101
 const SAFE_MODE_MESSAGE_SHIFT: u32 = 1; // linux: RLC_SAFE_MODE__MESSAGE__SHIFT@gc101
 const SAFE_MODE_TIMEOUT_MS: u64 = 100; // linux: AMDGPU_MAX_USEC_TIMEOUT / 1000
+const GFX_POWER_GATING_ENABLE: u32 = 1 << 0; // linux: RLC_PG_CNTL__GFX_POWER_GATING_ENABLE_MASK@gc101
+/// `RLC_PG_DELAY_3.CGCG_ACTIVE_BEFORE_CGPG`: 200 us of refclk, the RLC
+/// team's CGPG hysteresis for the APU group (16 bits on its firmware).
+// linux-lit: 0x4E20=0x4E20 & RLC_PG_DELAY_3__CGCG_ACTIVE_BEFORE_CGPG_MASK_Vangogh
+const CGPG_HYSTERESIS: u32 = 0x4E20 & 0xffff;
 /// `gfx_v10_0_ring_soft_recovery`'s SQ_CMD: kill (CMD 3), broadcast (MODE
 /// 1), only the waves of `vmid` (CHECK_VMID).
 pub(crate) fn sq_kill(vmid: u8) -> u32 {
@@ -1312,6 +1317,33 @@ impl<I: Io> GfxEngine<I> {
             exit_safe_mode(&mut self.hw)?;
         }
         killed
+    }
+    /// `gfx_v10_cntl_pg` for the APU group (GC 10.3.1/3/6/7), with
+    /// `AMD_PG_SUPPORT_GFX_PG`: in RLC safe mode, `RLC_PG_CNTL`'s GFX power
+    /// gating enable set or cleared, and on enable the CGPG hysteresis in
+    /// `RLC_PG_DELAY_3`. GFXOFF itself is PMFW's (`amdgpu_gfx_off_ctrl`).
+    pub(crate) async fn set_power_gating(&mut self, enable: bool) -> Result<(), Error> {
+        if self.state != GfxState::Verified {
+            return Err(Error::Busy);
+        }
+        let safe = enter_safe_mode(&mut self.hw).await?;
+        let written = self.hw.access(|io, l| {
+            let cntl = checked(io.read(l.reg(RLC_PG_CNTL)))?;
+            let cntl = if enable {
+                cntl | GFX_POWER_GATING_ENABLE
+            } else {
+                cntl & !GFX_POWER_GATING_ENABLE
+            };
+            io.write(l.reg(RLC_PG_CNTL), cntl);
+            if enable {
+                io.write(l.reg(RLC_PG_DELAY_3), CGPG_HYSTERESIS);
+            }
+            Ok(())
+        });
+        if safe {
+            exit_safe_mode(&mut self.hw)?;
+        }
+        written
     }
     /// The state is stored outside the future: cancellation leaves `busy`
     /// and blocks every later step, so no sequence is ever replayed.
@@ -1843,6 +1875,10 @@ impl Gfx {
     /// See `GfxEngine::kill_waves`.
     pub(crate) async fn kill_waves(&mut self, vmid: u8) -> Result<(), Error> {
         self.engine.kill_waves(vmid).await
+    }
+    /// See `GfxEngine::set_power_gating`.
+    pub(crate) async fn set_power_gating(&mut self, enable: bool) -> Result<(), Error> {
+        self.engine.set_power_gating(enable).await
     }
     /// See `GfxEngine::begin_reset`.
     pub(crate) fn begin_reset(&mut self) -> Result<GfxQueueMap, Error> {

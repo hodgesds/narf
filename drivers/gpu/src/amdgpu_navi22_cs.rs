@@ -690,8 +690,9 @@ fn install(
 /// client VMIDs it lends (GFXHUB for the graphics rings, the same numbers on
 /// MMHUB for the media rings), a client heap from its carve-out pool, and
 /// its media rings once VCN runs. An APU has no hidden VRAM to transfer
-/// through, and its GFXOFF stays disallowed (no GC access needs a
-/// reference). Called by the display owner, which holds the coordinator,
+/// through. Its GFXOFF is the coordinator's (`amdgpu_raphael_gfxoff`):
+/// submission takes nothing, as on Navi22. Called by the display owner,
+/// which holds the coordinator,
 /// after a completed graphics boot. Failures are reported, never fatal.
 pub fn register_raphael(boot: &mut crate::amdgpu_raphael_boot::ColdBoot) {
     use core::fmt::Write;

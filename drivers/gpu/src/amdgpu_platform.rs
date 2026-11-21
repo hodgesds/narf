@@ -876,6 +876,10 @@ pub(crate) async fn recover() -> Result<(), RecoveryError> {
         ..
     } = display;
     let old = graphics.as_mut().ok_or(RecoveryError::Busy)?;
+    // amdgpu_device_ip_suspend's UNGATE: GFX powered for what follows.
+    if let Err(error) = old.ungate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: raphael GFX ungate {error:?}");
+    }
     // SAFETY: the client path is withdrawn; `old` is re-armed below.
     unsafe { old.quiesce_for_reset() }
         .await
@@ -991,6 +995,7 @@ async fn rebuild_graphics(
         RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     }
     serve_clients(new);
+    gate_graphics(new).await;
     // A rebuild that could not re-arm quarantined the old owners; say what
     // is left.
     let _ = writeln!(
@@ -1093,6 +1098,10 @@ async fn prepare_graphics_suspend() {
     // The media session table stays for the restored firmware context.
     crate::amdgpu_navi22_cs::suspend();
     crate::amdgpu_navi22_tdr::stop();
+    // amdgpu_device_ip_suspend_phase1's UNGATE: GFX powered for the rest.
+    if let Err(error) = graphics.ungate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: raphael GFX ungate {error:?}");
+    }
     // vcn_v3_0_suspend: stopped, with each VCPU BO saved. A failure leaves
     // the resume to start media with no sessions.
     if let Err(error) = graphics.suspend_media().await {
@@ -1192,6 +1201,39 @@ impl narf_power::system_pm::AsyncSystemPm for GraphicsSystemPm {
 /// Publish a completed Raphael graphics boot to clients: its submitter,
 /// VMIDs and heap, then `ACCEL_WORKING`. `graphics` loaded the set only with
 /// `amdgpu.rdna2_accel` on, the switch the discrete boot turns this on with.
+/// `amdgpu_device_ip_late_init`'s `set_pg_state(GATE)` for GFX, once clients
+/// are served: power gating on and GFXOFF allowed after its delay. Failure is
+/// reported; graphics stays up with GFX powered.
+async fn gate_graphics(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
+    use core::fmt::Write as _;
+    if !graphics.queues_verified() {
+        return;
+    }
+    if let Err(error) = graphics.gate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: raphael GFX gate {error:?}");
+    }
+}
+/// `gfx_off_delay_work`: deliver `allow` [`DELAY_MS`] from now to the
+/// coordinator that scheduled it. A disable request in between, or a newer
+/// coordinator lifetime, makes it a no-op.
+///
+/// [`DELAY_MS`]: crate::amdgpu_raphael_gfxoff::DELAY_MS
+pub(crate) fn schedule_gfx_off(allow: crate::amdgpu_raphael_gfxoff::Allow) {
+    narf_scheduler::spawn(async move {
+        use core::fmt::Write as _;
+        let delay = crate::amdgpu_raphael_gfxoff::DELAY_MS;
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(delay).as_instant()).await;
+        let mut owner = graphics_owner().await;
+        if let Some(boot) = owner.get() {
+            if let Err(error) = boot.delayed_gfx_off(allow).await {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael GFXOFF allow {error:?}"
+                );
+            }
+        }
+    });
+}
 fn serve_clients(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
     if !graphics.queues_verified() {
         return;
@@ -1518,6 +1560,7 @@ pub(crate) fn start() -> bool {
                 if let Some(graphics) = display.graphics.as_mut() {
                     alloc::boxed::Box::pin(media_boot(graphics, &mut display.loader)).await;
                     serve_clients(graphics);
+                    gate_graphics(graphics).await;
                 }
             }
         }

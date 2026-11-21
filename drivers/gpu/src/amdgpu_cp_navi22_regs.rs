@@ -57,6 +57,10 @@ pub const RLC_CNTL: Reg = Reg(1, 0x4c00); // linux: mmRLC_CNTL@gc101
                                           // linux: mmRLC_SAFE_MODE_Sienna_Cichlid@gc101
 pub const RLC_SAFE_MODE: Reg = Reg(1, 0x4ca0);
 
+// GFX power gating (gfx_v10_cntl_power_gating, the APU group)
+pub const RLC_PG_CNTL: Reg = Reg(1, 0x4c43); // linux: mmRLC_PG_CNTL@gc101
+pub const RLC_PG_DELAY_3: Reg = Reg(1, 0x4c78); // linux: mmRLC_PG_DELAY_3@gc101
+
 // RLC (rlc_resume with PSP autoload, kiq_setting)
 pub const RLC_SPM_MC_CNTL: Reg = Reg(1, 0x4c71); // linux: mmRLC_SPM_MC_CNTL@gc101
 pub const RLC_SRM_CNTL: Reg = Reg(1, 0x4c80); // linux: mmRLC_SRM_CNTL@gc101

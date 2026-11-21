@@ -22,14 +22,16 @@
 //! GFXOFF is disallowed before any GC register is touched. Linux starts with
 //! its GFXOFF request count at one, so PMFW never powers GFX down during
 //! `hw_init`; sending `DisallowGfxOff` makes that independent of how the BIOS
-//! left PMFW. Nothing here allows it again: no GFXOFF or power-gating policy is
-//! ported, so GFX stays powered.
+//! left PMFW. Once clients are served the display owner gates GFX
+//! (`gate_gfx`: power gating, then GFXOFF after its delay, see
+//! `amdgpu_raphael_gfxoff`), and ungates it before S3 or a mode 2 reset.
 //!
 //! Construction reserves memory and maps the doorbell page but performs no
 //! register I/O. A failure stops the sequence at its stage; the display path
 //! that preceded it is unaffected. After a completed run the display owner
 //! hands the verified queues to clients (`amdgpu_navi22_cs::register_raphael`,
 //! through `amdgpu_rdna2_client`).
+use crate::amdgpu_raphael_gfxoff as gfxoff;
 use crate::{
     amdgpu::AmdGpu, amdgpu_cp_navi22 as cp, amdgpu_gmc_navi22 as gmc, amdgpu_ih_navi22 as ih,
     amdgpu_kiq_navi22 as kiq, amdgpu_sdma_navi22 as sdma, amdgpu_sdma_navi22_queues as sdma_queues,
@@ -102,6 +104,8 @@ pub enum Error {
     Queues(cp::Error),
     Topology(crate::amdgpu_gfx10_topology::Error),
     Media(vcn::Error),
+    /// A GFXOFF transition failed; GFX power is unknown.
+    GfxOff(gfxoff::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +154,23 @@ pub struct ColdBoot {
     proof: Option<sdma::Proof>,
     topology: Option<crate::amdgpu_gfx10_topology::Topology>,
     state: State,
+    /// GFX power gating and GFXOFF for this lifetime (`amdgpu_raphael_gfxoff`).
+    gfxoff: gfxoff::GfxOff,
+}
+/// PMFW's GFXOFF messages and RLC's power gating, for `gfxoff`.
+struct GcPower<'a> {
+    smu: &'a mut smu::Smu,
+    gfx: &'a mut cp::Gfx,
+}
+impl crate::amdgpu_navi22_gfxoff::Control for GcPower<'_> {
+    async fn control(&mut self, allow: bool) -> Result<(), ()> {
+        self.smu.set_gfxoff(allow).await.map_err(drop)
+    }
+}
+impl gfxoff::PowerGating for GcPower<'_> {
+    async fn set_power_gating(&mut self, enable: bool) -> Result<(), ()> {
+        self.gfx.set_power_gating(enable).await.map_err(drop)
+    }
 }
 impl ColdBoot {
     /// Reserve every owner: no register I/O. Refused unless every engine
@@ -209,6 +230,10 @@ impl ColdBoot {
                 proof: None,
                 topology: None,
                 state: State::Prepared,
+                gfxoff: gfxoff::GfxOff::new(
+                    crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw())
+                        .gfxoff,
+                ),
             })
         }
     }
@@ -404,13 +429,75 @@ impl ColdBoot {
             Ring::Sdma(_) => Err(cp::Error::Unsupported),
         }
     }
-    /// GC registers after a graphics timeout (`gfx_v10_0_dump_ip_state`).
-    /// GFXOFF stays disallowed, so no reference is taken.
-    pub(crate) fn gfx_hang_snapshot(&mut self) -> Result<cp::GfxHangSnapshot, cp::Error> {
+    /// GC registers after a graphics timeout (`gfx_v10_ip_dump`), with
+    /// GFXOFF disallowed for the reads.
+    pub(crate) async fn gfx_hang_snapshot(&mut self) -> Result<cp::GfxHangSnapshot, cp::Error> {
         if !self.queues_verified() {
             return Err(cp::Error::Busy);
         }
-        self.gfx.hang_snapshot()
+        self.hold_gc().await.map_err(|_| cp::Error::Busy)?;
+        let snapshot = self.gfx.hang_snapshot();
+        self.release_gc();
+        snapshot
+    }
+    /// `gfx_v10_0_set_powergating_state(GATE)` once graphics serves
+    /// clients: RLC power gating on, then GFXOFF allowed [`gfxoff::DELAY_MS`]
+    /// later. A second GATE does nothing.
+    pub(crate) async fn gate_gfx(&mut self) -> Result<(), Error> {
+        if !self.queues_verified() {
+            return Err(Error::Busy);
+        }
+        let mut hw = GcPower {
+            smu: &mut self.smu,
+            gfx: &mut self.gfx,
+        };
+        let allow = self.gfxoff.gate(&mut hw).await.map_err(Error::GfxOff)?;
+        schedule(allow);
+        Ok(())
+    }
+    /// `gfx_v10_0_set_powergating_state(UNGATE)`, before S3 and before a
+    /// mode 2 reset: GFXOFF disallowed, then RLC power gating off. GFX is
+    /// powered on `Ok`.
+    pub(crate) async fn ungate_gfx(&mut self) -> Result<(), Error> {
+        let mut hw = GcPower {
+            smu: &mut self.smu,
+            gfx: &mut self.gfx,
+        };
+        self.gfxoff.ungate(&mut hw).await.map_err(Error::GfxOff)
+    }
+    /// `amdgpu_device_delay_enable_gfx_off` for an allow this coordinator
+    /// scheduled; `Ok(false)` when it was cancelled or is from a lifetime
+    /// before a re-arm.
+    pub(crate) async fn delayed_gfx_off(&mut self, allow: gfxoff::Allow) -> Result<bool, Error> {
+        let mut hw = GcPower {
+            smu: &mut self.smu,
+            gfx: &mut self.gfx,
+        };
+        self.gfxoff
+            .delayed(allow, &mut hw)
+            .await
+            .map_err(Error::GfxOff)
+    }
+    /// `amdgpu_gfx_off_ctrl(false)` around a driver read of GC registers.
+    async fn hold_gc(&mut self) -> Result<(), Error> {
+        let mut hw = GcPower {
+            smu: &mut self.smu,
+            gfx: &mut self.gfx,
+        };
+        self.gfxoff.hold(&mut hw).await.map_err(Error::GfxOff)
+    }
+    /// The read's `amdgpu_gfx_off_ctrl(true)`.
+    fn release_gc(&mut self) {
+        match self.gfxoff.release() {
+            Ok(allow) => schedule(allow),
+            Err(error) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael GFXOFF release {error:?}"
+                );
+            }
+        }
     }
     /// Every engine owner back to Prepared on its own reservations after a
     /// reset, so `run` (and `run_media`) bring the same buffers up again:
@@ -443,6 +530,9 @@ impl ColdBoot {
         self.proof = None;
         self.topology = None;
         self.state = State::Prepared;
+        // A new lifetime: the count back at 1 (the SMU stage disallows), and
+        // a delayed allow from before lands nowhere.
+        self.gfxoff = gfxoff::GfxOff::new(self.gfxoff.enabled());
         Ok(())
     }
     /// Recovery's quiesce before a mode 2 reset (Navi22's `quiesce_for_reset`):
@@ -563,17 +653,22 @@ impl ColdBoot {
             media.forget_saved();
         }
     }
-    /// `AMDGPU_INFO_READ_MMR_REG` from nv.c's allow-list. GFXOFF stays
-    /// disallowed after the Smu stage, so GC answers without a reference.
-    pub(crate) fn read_mmr(
-        &self,
+    /// `AMDGPU_INFO_READ_MMR_REG` from nv.c's allow-list, with GFXOFF
+    /// disallowed for the reads, as `amdgpu_info_ioctl` does.
+    pub(crate) async fn read_mmr(
+        &mut self,
         payload: [u32; 4],
         cached_gb: Option<u32>,
     ) -> Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> {
         if !self.queues_verified() {
             return Err(narf_filesystem::FsError::NoDevice);
         }
-        crate::amdgpu_rdna2_mmr::read(&self.gpu, &self.authority, payload, cached_gb)
+        self.hold_gc()
+            .await
+            .map_err(|_| narf_filesystem::FsError::NoDevice)?;
+        let reply = crate::amdgpu_rdna2_mmr::read(&self.gpu, &self.authority, payload, cached_gb);
+        self.release_gc();
+        reply
     }
     /// Run every stage once. A failed or cancelled run cannot be replayed:
     /// the state records the stage before it starts.
@@ -838,6 +933,13 @@ fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
         backlight_percent: None,
         fw_loaded: false,
     })
+}
+
+/// Hand a delayed `AllowGfxOff` to the display owner's task.
+fn schedule(allow: Option<gfxoff::Allow>) {
+    if let Some(allow) = allow {
+        crate::amdgpu_platform::schedule_gfx_off(allow);
+    }
 }
 
 #[cfg(feature = "kernel-test")]

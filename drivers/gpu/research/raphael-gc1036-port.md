@@ -502,10 +502,55 @@ since the submitter is replaced. Raphael's port:
     matters because a start zeroes the BO, and it keeps the suspend
     independent of that.
 
+## GFX power gating and GFXOFF
+
+15. ~~GFXOFF~~ (done, `amdgpu_raphael_gfxoff`). Before this, GFX stayed
+    powered: the SMU stage disallows GFXOFF and nothing allowed it again.
+    Linux's late init gates every IP. On GC 10.3.6,
+    `gfx_v10_0_set_powergating_state(GATE)` runs `gfx_v10_cntl_pg(true)`
+    and then `amdgpu_gfx_off_ctrl(true)`; UNGATE runs the disable request
+    first, then `gfx_v10_cntl_pg(false)`. Here:
+    1. `gfx_v10_cntl_pg` (`Gfx::set_power_gating`): in RLC safe mode,
+       `RLC_PG_CNTL.GFX_POWER_GATING_ENABLE` set or cleared. On enable,
+       `RLC_PG_DELAY_3` gets the APU group's CGPG hysteresis (`0x4E20`,
+       200 us), since Raphael has `AMD_PG_SUPPORT_GFX_PG`.
+    2. The request count is Linux's `amdgpu_gfx_off_ctrl`, through Navi22's
+       controller. It starts at 1, GATE takes it to 0, and PMFW's
+       `AllowGfxOff` (message 22) follows 100 ms later
+       (`GFX_OFF_DELAY_ENABLE`). A disable request before then cancels it;
+       one while GFXOFF is in effect sends `DisallowGfxOff` (23) first.
+    3. GATE runs once clients are served, after the first boot and after
+       every rebuild. UNGATE runs before S3 (after the drain and the client
+       withdrawal) and before a mode 2 reset, as `amdgpu_device_ip_suspend`
+       does.
+    4. Driver reads of GC registers hold a disable request:
+       - READ_MMR_REG, as `amdgpu_info_ioctl` does;
+       - the hang snapshot, as `gfx_v10_ip_dump` does.
+       Submission writes only memory and the doorbell, which wakes GFX
+       itself; progress sampling reads memory and NBIO. Soft recovery and
+       the queue resets act on a busy, so powered, engine. None of these
+       take anything, as in Linux. JPEG reads `GB_ADDR_CONFIG` only at
+       start, before GATE, and the VCN wake uses the cached value.
+    5. Each coordinator lifetime has its own count under the display
+       owner's lock. A re-armed coordinator starts at 1 again, and a delayed
+       allow from before carries an epoch no later lifetime has.
+       (Navi22's controller is one global, which cannot restart once
+       stopped.)
+    6. `amdgpu.ppfeaturemask` is Linux's knob. Its default (`0xfff7bfff`)
+       has `PP_GFXOFF_MASK`. A mask without it keeps every GFXOFF request
+       inert, while power gating still follows GATE and UNGATE, as in Linux.
+    Not done: clock gating (`gfx_v10_0_set_clockgating_state` and the other
+    IPs' MGCG/CGCG/LS). Linux gates clocks before power, and CGPG engages
+    only after CGCG has been active for the hysteresis, so RLC's power
+    gating may do little until then. Whether PMFW's GFXOFF engages without
+    clock gating has not been measured.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table
   nothing here has read; NBIO is inferred to be `nbio_v7_2`'s from Linux's
   history (step 4).
 - PMFW's initial GFXOFF state on 13.0.5: Linux starts with a GFXOFF request
-  count of 1 (disallowed) and never sends `DisallowGfxOff` at init.
+  count of 1 (disallowed) and never sends `DisallowGfxOff` at init. This
+  port sends it at the SMU stage, before any GC access, and allows GFXOFF
+  only at GATE (step 15).

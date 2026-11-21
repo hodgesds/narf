@@ -1836,7 +1836,7 @@ pub(crate) async fn dispatch_live(card: u32, cmd: u32, arg: usize) -> Option<Res
             let reply = if raphael {
                 let mut graphics = crate::amdgpu_platform::graphics_owner().await;
                 let boot = graphics.get().ok_or(FsError::NoDevice)?;
-                boot.read_mmr(payload, cached_gb)?
+                boot.read_mmr(payload, cached_gb).await?
             } else {
                 let (_power, owner) = crate::amdgpu_navi22_platform::gc_owner().await?;
                 let boot = owner.as_ref().ok_or(FsError::NoDevice)?;

@@ -1892,3 +1892,49 @@ fn raphael_gfx_rearm_reuses_its_rings() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/cp-raphael", raphael_gfx_rearm_reuses_its_rings);
+
+/// gfx_v10_cntl_pg on GC 10.3.6: in RLC safe mode, RLC_PG_CNTL's GFX power
+/// gating bit set with the 200 us CGPG hysteresis, or cleared alone; the
+/// register's other bits kept. Refused before the rings are verified.
+fn raphael_gfx_power_gating_follows_gfx_v10_cntl_pg() -> TestResult {
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut engine) = gfx(enabled());
+    engine.hw.layout = resolved;
+    engine.hw.io.no_read_cache = true;
+    if run(engine.set_power_gating(true)) != Err(Error::Busy) {
+        return TestResult::Fail("power gating before the rings were verified");
+    }
+    engine.golden().unwrap();
+    run(engine.configure()).unwrap();
+    run(engine.start()).unwrap();
+    run(engine.test_ib()).unwrap();
+    let (safe, cntl, delay) = (
+        resolved.reg(RLC_SAFE_MODE),
+        resolved.reg(RLC_PG_CNTL),
+        resolved.reg(RLC_PG_DELAY_3),
+    );
+    engine.hw.io.regs.insert(resolved.reg(RLC_CNTL), 1);
+    engine.hw.io.regs.insert(cntl, 0x10);
+    let writes = |engine: &mut GfxEngine<Model>, enable: bool| {
+        let from = engine.hw.io.writes.len();
+        run(engine.set_power_gating(enable)).map(|()| engine.hw.io.writes[from..].to_vec())
+    };
+    if writes(&mut engine, true)
+        != Ok(alloc::vec![
+            (safe, 0x3),
+            (cntl, 0x11),
+            (delay, 0x4e20),
+            (safe, 0x1)
+        ])
+    {
+        return TestResult::Fail("power gating enable sequence");
+    }
+    if writes(&mut engine, false) != Ok(alloc::vec![(safe, 0x3), (cntl, 0x10), (safe, 0x1)]) {
+        return TestResult::Fail("power gating disable sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_gfx_power_gating_follows_gfx_v10_cntl_pg
+);
