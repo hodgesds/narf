@@ -4260,7 +4260,8 @@ configuration, detected clock, all three channel locks, and scrambler status
 when scrambling is enabled. Legacy SCDC links also read reception flags.
 
 The display monitor checks running single-stream and multi-stream HDMI
-outputs at most once per second, with no IRQ lock held across DDC awaits.
+outputs on its passes (events only, see the Navi 22 hot-plug section), at
+most once per second, with no IRQ lock held across DDC awaits.
 `LinkMonitor` requests one ordinary withdrawal/relight after three consecutive
 observed failures per connection. Further sustained failures report a fault
 and suspend automatic recovery while retaining the context, so other working
@@ -6985,8 +6986,8 @@ runs `stop_modeset` and relights through `modeset_display_mode`, which
 selects that timing when the sink lists it and it fits, else the preferred
 one. If the requested mode fails to light, the preferred mode is lit and
 the request cleared. The last DRM file closing returns to the preferred
-mode. Mode changes are therefore asynchronous to the ioctl (the next monitor
-pass, up to a second). The teardown sequence now has its own progress and
+mode. Mode changes are therefore asynchronous to the ioctl (the monitor pass
+the request wakes). The teardown sequence now has its own progress and
 fault/cancellation models; partial activation recovery remains open. Unplug (and `stop_modeset`)
 publish the connector disconnected, with no modes, no EDID, and no mode
 accepted. The CRTC is disabled with its framebuffer cleared, and open
@@ -13119,7 +13120,12 @@ retains each connector's verified link keyed by its receiver caps
 `aux_timeout(index, us)`. `ColdBoot::{display_hpd_senses(),
 forget_display_link(i), display_link_cap(i, dpcd), check_display_link(),
 retrain_display(), stop_unplugged_display()}` serve the platform display
-monitor, which each pass (1 s, or woken by HPD/HPD-RX vectors): tears the lit
+monitor. It runs a pass only for an event, as Linux's HPD interrupt and atomic
+commit do: an HPD or HPD-RX vector, a DRM request or a recovery
+(`amdgpu_navi22_kms::wake`, which wakes the parked monitor). It arms a timer
+only where Linux polls: every 10 s (DRM_OUTPUT_POLL_PERIOD) while a connector
+has no HPD line or HPD interrupts could not be armed, and every second while
+BTR frame insertion runs (`ColdBoot::display_lfc_active`). Each pass tears the lit
 display down without AUX when its HPD falls (connector disconnected),
 re-detects every connector when any HPD changes or pulses (EDID inventory of
 dark connectors; a pulsed lit sink is stopped and relit), checks the lit DP

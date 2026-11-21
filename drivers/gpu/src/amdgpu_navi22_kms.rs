@@ -482,16 +482,31 @@ pub(crate) static KMS: narf_lib::sync::IrqSafeSpinLock<Kms> =
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// A DRM request (or a recovery) is waiting for the display monitor.
 static PENDING: AtomicBool = AtomicBool::new(false);
+/// The display monitor while it waits for a request.
+static MONITOR_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }
-/// Ask the display monitor to run a pass now.
+/// Ask the display monitor to run a pass now (a DRM request, an HPD vector,
+/// a recovery): Linux's hotplug work and atomic commit, never a timer.
 pub fn wake() {
     PENDING.store(true, Ordering::Release);
+    let waker = MONITOR_WAKER.lock().take();
+    if let Some(w) = waker {
+        w.wake();
+    }
 }
 pub(crate) fn take_pending() -> bool {
     PENDING.swap(false, Ordering::AcqRel)
+}
+/// Wake `waker` at the next [`wake`].
+pub(crate) fn set_monitor_waker(waker: &core::task::Waker) {
+    let mut slot = MONITOR_WAKER.lock();
+    if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {
+        *slot = Some(waker.clone());
+    }
 }
 
 /// The pipe behind a native CRTC id (CRTC k is pipe k).
