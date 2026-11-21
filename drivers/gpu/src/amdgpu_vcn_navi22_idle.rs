@@ -234,6 +234,10 @@ static LAST_GATE: narf_lib::sync::IrqSafeSpinLock<Option<GateTrace>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// The most recent gate attempt.
+///
+/// Test-only observability: the only callers are the kernel-test-gated VCN
+/// tests, so without `kernel-test` this is dead code.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn last_gate() -> Option<GateTrace> {
     *LAST_GATE.lock()
 }

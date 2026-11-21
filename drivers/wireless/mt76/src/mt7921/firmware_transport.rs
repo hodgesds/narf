@@ -232,8 +232,7 @@ fn poll_boot_keys_in(
     if work.poll(cx).is_pending() {
         return Poll::Pending;
     }
-    let Some(mut owner) = acquire(&BOOT_OWNER, locks.as_deref_mut().map(|l| &mut l.owner), cx)
-    else {
+    let Some(mut owner) = acquire(&BOOT_OWNER, locks.map(|l| &mut l.owner), cx) else {
         return Poll::Pending;
     };
     if owner.is_some() {

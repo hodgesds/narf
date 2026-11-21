@@ -75,7 +75,7 @@ fn background_join_off_a_stuck_boot_cpu() -> Result<(), &'static str> {
     let vol = mount_writable(dev).map_err(|_| "fixture did not mount")?;
     // Something for the commit to do, so it has to close the transaction.
     {
-        use narf_filesystem::{DirOps, FileOps, FsInstance};
+        use narf_filesystem::FsInstance;
         let file = poll_once(vol.root().create("background"))
             .and_then(|r| r.ok())
             .ok_or("create failed")?;
