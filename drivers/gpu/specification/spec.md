@@ -11543,7 +11543,25 @@ MMHUB `amdgpu_mmhub_client_name(cid, rw)` over the table
 `Gmc::status_line(hub, status) -> StatusLine` formats
 `status=… hub=GFX|MM client=NAME (CID) more=… walker=… permission=…
 mapping=… rw=… vmid=…`, which the fault service prints after each of the
-first 16 faults it logs.
+first 16 faults it logs. For each of those charged to a lent client VMID
+(`FaultOwner::Client`) it also prints `Gmc::client_fault_report(Fault) ->
+ClientFaultReport`, gathered under the same owner lock right after
+`handle_fault`: `amdgpu_vm::describe_fault(pasid, va) -> Option<FaultVa>`
+finds the card-registered address space holding the IV's PASID (spaces
+without a PASID match nothing) and reports, at the hole-stripped address,
+the covering mapping (VA, size, handle, offset, flags), whether its buffer
+is system memory, the root `root_pde` gives the VM flush and the table
+entries read root first down to the PTE (`FaultVa::translates`: all levels
+VALID); `ContextRegs { cntl, base, start, end }` are both hubs' context
+registers for the VMID, faulting hub first. `ClientFaultReport::cause()`
+names the first explanation in walk order — `NoSpace`, `Unmapped`,
+`NotTranslated`, `ContextDisabled`, `ContextRange`, `ContextElsewhere`
+(the hub's base is not the client's root: the flush did not land) or
+`HubWalk` (mapped, translated, and the context points at the root) — and
+the report prints three `amdgpu: navi22 GPU page fault` lines: `va=… pasid=…:
+mapped va=…+… handle=… offset=… flags=… system|vram root=… walk=…` (or
+`unmapped …`, or `no address space holds this PASID`), `vmid=… MM cntl=…
+base=… start=… end=…, GFX …`, and `cause: …`.
 `ColdBoot::memory()` exposes this owner after `FirmwareReady`/`Released`.
 
 ### Shared discrete RDNA2 SDMA0 execution proof
