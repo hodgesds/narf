@@ -669,9 +669,10 @@ impl IntelHda {
     /// `get_eld_ati`: build an ELD from the codec's copy of what the display
     /// driver wrote into the Azalia endpoint. `None` without a speaker
     /// allocation or without any audio descriptor.
-    fn ati_eld(&self, cad: u8, pin: u8, rev3: bool) -> Result<Option<Vec<u8>>, HdaError> {
-        let verb = |verb: u32| self.verb(cad, pin, verb);
-        let spkalloc = verb(GET_SPEAKER_ALLOCATION << 8)?;
+    async fn ati_eld(&self, cad: u8, pin: u8, rev3: bool) -> Result<Option<Vec<u8>>, HdaError> {
+        let spkalloc = self
+            .verb_async(cad, pin, GET_SPEAKER_ALLOCATION << 8)
+            .await?;
         if spkalloc as i32 <= 0 {
             return Ok(None);
         }
@@ -684,25 +685,23 @@ impl IntelHda {
         let mut pos = ELD_FIXED_BYTES;
         let mut mnl = 0;
         if rev3 {
-            let info = |index: u32| -> Result<u32, HdaError> {
-                verb((SET_SINK_INFO_INDEX << 8) | index)?;
-                verb(GET_SINK_INFO_DATA << 8)
-            };
-            buf[8..12].copy_from_slice(&info(3)?.to_le_bytes());
-            buf[12..16].copy_from_slice(&info(4)?.to_le_bytes());
-            buf[16..18].copy_from_slice(&(info(0)? as u16).to_le_bytes());
-            buf[18..20].copy_from_slice(&(info(1)? as u16).to_le_bytes());
-            mnl = (info(2)? as usize).min(ELD_MAX_MNL);
+            let info = |index: u32| self.sink_info(cad, pin, index);
+            buf[8..12].copy_from_slice(&info(3).await?.to_le_bytes());
+            buf[12..16].copy_from_slice(&info(4).await?.to_le_bytes());
+            buf[16..18].copy_from_slice(&(info(0).await? as u16).to_le_bytes());
+            buf[18..20].copy_from_slice(&(info(1).await? as u16).to_le_bytes());
+            mnl = (info(2).await? as usize).min(ELD_MAX_MNL);
             buf[4] |= mnl as u8;
             for i in 0..mnl {
-                buf[pos] = info(5 + i as u32)? as u8;
+                buf[pos] = info(5 + i as u32).await? as u8;
                 pos += 1;
             }
         }
         // LPCM..WMAPRO, skipping SACD and DST which the codec cannot report.
         for coding in (1..=15u32).filter(|c| *c != 9 && *c != 11) {
-            verb((SET_AUDIO_DESCRIPTOR << 8) | (coding << 3))?;
-            let sad = verb(GET_AUDIO_DESCRIPTOR << 8)?;
+            self.verb_async(cad, pin, (SET_AUDIO_DESCRIPTOR << 8) | (coding << 3))
+                .await?;
+            let sad = self.verb_async(cad, pin, GET_AUDIO_DESCRIPTOR << 8).await?;
             if sad as i32 <= 0 {
                 continue;
             }
@@ -723,7 +722,9 @@ impl IntelHda {
             return Ok(None);
         }
         // HDMI VSDB latencies (x - 1) * 2 ms -> HDA video-after-audio x * 2.
-        let sync = verb(GET_AUDIO_VIDEO_DELAY << 8)?;
+        let sync = self
+            .verb_async(cad, pin, GET_AUDIO_VIDEO_DELAY << 8)
+            .await?;
         let (video, audio) = (sync & 0xff, (sync >> 8) & 0xff);
         if video != 0 && audio != 0 && video <= 0xfb && audio <= 0xfb && video > audio {
             buf[6] = (video - audio) as u8;
@@ -734,10 +735,18 @@ impl IntelHda {
         Ok(Some(buf[..pos].to_vec()))
     }
 
+    /// One rev3 sink-info word (`SET_SINK_INFO_INDEX` then
+    /// `GET_SINK_INFO_DATA`).
+    async fn sink_info(&self, cad: u8, pin: u8, index: u32) -> Result<u32, HdaError> {
+        self.verb_async(cad, pin, (SET_SINK_INFO_INDEX << 8) | index)
+            .await?;
+        self.verb_async(cad, pin, GET_SINK_INFO_DATA << 8).await
+    }
+
     /// `hdmi_present_sense_via_verbs` + `update_eld` for every port: pin
     /// sense, then the ELD while it reads valid. Returns the ports whose
     /// presence or ELD changed.
-    fn sense_hdmi(&self) -> Result<Vec<usize>, HdaError> {
+    async fn sense_hdmi(&self) -> Result<Vec<usize>, HdaError> {
         let mut changed = Vec::new();
         let count = self.hdmi.lock().len();
         for index in 0..count {
@@ -745,7 +754,7 @@ impl IntelHda {
             let path = &self.outputs[output];
             let graph = &self.graphs[path.codec];
             let pin = path.nodes.pin_nid;
-            let sense = self.verb(graph.addr, pin, GET_PIN_SENSE << 8)?;
+            let sense = self.verb_async(graph.addr, pin, GET_PIN_SENSE << 8).await?;
             let present = sense & PINSENSE_PRESENCE != 0;
             let eldv = present && sense & PINSENSE_ELDV != 0;
             {
@@ -756,7 +765,8 @@ impl IntelHda {
                 }
             }
             let sink = if eldv {
-                self.ati_eld(graph.addr, pin, hda_codec::ati_hdmi_rev3(graph))?
+                self.ati_eld(graph.addr, pin, hda_codec::ati_hdmi_rev3(graph))
+                    .await?
                     .and_then(|eld| parse_eld(&eld))
             } else {
                 None
@@ -1094,11 +1104,15 @@ impl IntelHda {
     /// re-set-up each port that just gained a valid ELD (Linux update_eld's
     /// `eld_valid && !old_eld_valid && per_pin->setup`).
     pub(super) fn refresh_hdmi(&self, reconfigure: bool) -> Result<(), HdaError> {
+        narf_scheduler::block_on_spin(self.refresh_hdmi_async(reconfigure))
+    }
+    /// [`Self::refresh_hdmi`] whose commands sleep on the response.
+    pub(super) async fn refresh_hdmi_async(&self, reconfigure: bool) -> Result<(), HdaError> {
         if self.hdmi.lock().is_empty() {
             return Ok(());
         }
         let before: Vec<bool> = self.hdmi.lock().iter().map(|p| p.sink.is_some()).collect();
-        let changed = self.sense_hdmi()?;
+        let changed = self.sense_hdmi().await?;
         if changed.is_empty() {
             return Ok(());
         }

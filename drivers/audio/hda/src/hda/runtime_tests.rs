@@ -3183,3 +3183,107 @@ kernel_test_in!(
     "audio/hda",
     native_hda_pm_reinit_does_not_reapply_parse_coef
 );
+
+/// Two futures sharing one CPU the way two tasks share an executor: each is
+/// polled only after its own waker fired, hrtimers expire between polls.
+struct Pair {
+    flags: [Arc<PairFlag>; 2],
+}
+struct PairFlag(AtomicBool);
+impl alloc::task::Wake for PairFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+impl Pair {
+    fn new() -> Self {
+        Self {
+            flags: [
+                Arc::new(PairFlag(AtomicBool::new(true))),
+                Arc::new(PairFlag(AtomicBool::new(true))),
+            ],
+        }
+    }
+    fn run_for(
+        &self,
+        mut a: core::pin::Pin<&mut dyn Future<Output = ()>>,
+        mut b: core::pin::Pin<&mut dyn Future<Output = ()>>,
+        ms: u64,
+    ) {
+        let wakers = [
+            Waker::from(self.flags[0].clone()),
+            Waker::from(self.flags[1].clone()),
+        ];
+        let deadline = Deadline::after_ms(ms);
+        let mut done = [false; 2];
+        while !deadline.expired() {
+            if !done[0] && self.flags[0].0.swap(false, Ordering::SeqCst) {
+                done[0] = a
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&wakers[0]))
+                    .is_ready();
+            }
+            if !done[1] && self.flags[1].0.swap(false, Ordering::SeqCst) {
+                done[1] = b
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&wakers[1]))
+                    .is_ready();
+            }
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Jack detection never stalls the CPU its task runs on: with a codec that
+/// stops answering (RIRBWP never advances), a 1 ms ticker sharing the CPU
+/// with the jack service keeps its pace (no gap near the 100 ms command
+/// timeout). Linux re-reads jack state from a
+/// workqueue that sleeps on the response (`azx_rirb_get_response`), never by
+/// spinning a CPU for the 100 ms command timeout.
+fn native_hda_jack_service_never_stalls_its_cpu() -> TestResult {
+    let mut fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if dev.hdmi.lock().is_empty() {
+        return TestResult::Fail("fixture has no HDMI jack");
+    }
+    fixture.model.stall = true;
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    let posted = unsafe { dev.bar0.read16(REG_CORBWP) };
+    let last = core::cell::Cell::new(narf_time::monotonic_ns());
+    let worst = core::cell::Cell::new(0u64);
+    let end = Deadline::after_ms(300);
+    let ticker = async {
+        while !end.expired() {
+            narf_time::SleepUntil::new(Deadline::after_ms(1).as_instant()).await;
+            let now = narf_time::monotonic_ns();
+            worst.set(worst.get().max(now.saturating_sub(last.get())));
+            last.set(now);
+        }
+    };
+    let jacks = super::jack_service(Arc::downgrade(&dev));
+    let mut ticker = pin!(ticker);
+    let mut jacks = pin!(jacks);
+    Pair::new().run_for(jacks.as_mut(), ticker.as_mut(), 250);
+    // SAFETY: as above.
+    if unsafe { dev.bar0.read16(REG_CORBWP) } == posted {
+        return TestResult::Fail("jack service never asked the codec");
+    }
+    // The stall this catches is the 100 ms command timeout spun inside one
+    // poll; 25 ms leaves room for a preempted vCPU on a loaded host.
+    if worst.get() > 25_000_000 {
+        narf_console::write_str(&alloc::format!(
+            "hda jack test: worst ticker gap {} us\n",
+            worst.get() / 1000
+        ));
+        return TestResult::Fail("jack service held the CPU over 25 ms waiting for the codec");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/jack",
+    native_hda_jack_service_never_stalls_its_cpu
+);
