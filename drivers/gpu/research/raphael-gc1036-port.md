@@ -134,6 +134,32 @@ as now.
    - `dcn315_resource.c` gives Raphael's NBIO segments: 0x0, 0x14, 0xd20,
      0x10400, 0x241b000, 0x4040000.
 5. GMC: `gfxhub_v2_1` on 10.3.6, `mmhub_v2_3`, a 1 GiB GART in the carve-out.
+   What it takes, against `amdgpu_gmc_navi22`:
+   - **MMHUB 2.3 programming is MMHUB 2.0's.** A body-by-body diff of
+     `mmhub_v2_3.c` against `mmhub_v2_0.c` differs only in RLC-routed against
+     plain writes and SR-IOV branches. The register table is different:
+     every register is on `_BASE_IDX` 1, most are +128 dwords, and the
+     per-context and per-engine registers are interleaved. Context 1's
+     page-table base is 8 dwords after context 0's (MMHUB 2.0: 2), and
+     invalidation engine *n*'s REQ and ADDR_RANGE are 8 dwords apart (2.0: 1
+     and 2). NARF's global `CTX_ADDR_DISTANCE` and the `inv_range + index * 2`
+     stride become per-hub fields, an `amdgpu_gmc_navi22` change.
+   - **HDP 5.2** has no `init_registers` and no invalidate. Its flush is the
+     generic one NARF already does: write the 0x7f000 remap hole, then read
+     MEMSIZE.
+   - **NBIO 7.2 `init_registers`** sets `CI_SWUS_MAX_READ_REQUEST_SIZE_MODE/PRIV`
+     to 1 in a port register on segment 5: `PCIE_CONFIG_CNTL` (0x420011) on
+     7.2.0, `BIF1_PCIE_MST_CTRL_3` (0x4601c6, `nbio_v7_2.c`'s own define) on
+     7.2.1/7.3.0/7.5.0. 7.3.0 and 7.5.1 also clear `STRAP_NO_SOFT_RESET_DEV2_F0`
+     in `RCC_DEV2_EPF0_STRAP2` (0xd802, segment 5, SMN). Navi22 writes
+     `smnPCIE_CONFIG_CNTL` through PCIE_INDEX2/DATA2 instead, without the
+     shared lock; on Raphael the display worker shares the latch, so this goes
+     through `amdgpu_smn`.
+   - **APU GMC** (`gmc_v10_0_mc_init`): VRAM is MEMSIZE as on Navi22, the GART
+     is 1 GiB for the APU group ("DCE SG support"; NARF's discrete GART is the
+     512 MiB default), and Linux's x86_64 CPU access goes through the carve-out's
+     physical address instead of the BAR, where NARF's pool keeps its own
+     mapping.
 6. IH on NBIO 7.x.
 7. GFX setup and topology (disabled shader arrays, CAM remapping), CP, KIQ,
    compute and GFX rings, SDMA 5.2.6 queues, IB tests and fences.
