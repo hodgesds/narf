@@ -12050,6 +12050,11 @@ writebacks and logical fence sequences; cached GB_ADDR_CONFIG avoids GC
 MMIO during resume. JPEG stays independent of VCN idle.
 Quiescing/Waking markers precede the first await; cancellation, failed
 shutdown or failed restore prevents replay and keeps client VCN closed.
+A failed idle work run (`idle::gate_failed`) also withdraws the media rings
+from clients (`AMDGPU_INFO`), and graphics, compute and SDMA submission keep
+running: Linux's `amdgpu_vcn_idle_work_handler` ignores `set_pg_state`'s
+result. Device loss is left to the hang detector and the submitter's fence
+sampling.
 Recovery stops the worker before replacing the owner. Owned full shutdown
 uses `unsafe ColdBoot::stop_media().await`: callers block new publication,
 drain JPEG and retain all mappings/TMR; hardware stop precedes conditional

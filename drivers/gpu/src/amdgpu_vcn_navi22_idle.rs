@@ -342,12 +342,18 @@ pub(crate) fn stop() {
     }
 }
 /// The idle work failed (the engine is already `Failed`); its task ends.
+/// Linux's `amdgpu_vcn_idle_work_handler` ignores `set_pg_state`'s result:
+/// a VCN that cannot gate is a video failure, never the GPU's. Video is
+/// withdrawn from clients (`AMDGPU_INFO` stops offering the rings) and
+/// graphics keeps running. A GPU that really stopped answering is found by
+/// the paths that own graphics: the hang detector's HDP read-back and the
+/// submitter's fence sampling.
 pub(crate) fn gate_failed(error: &crate::amdgpu_navi22_boot::Error) {
-    crate::amdgpu_navi22_cs::abandon(narf_filesystem::FsError::NoDevice);
+    crate::amdgpu_vcn_navi22_cs::unregister();
     use core::fmt::Write;
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: navi22 VCN idle failed: {error:?}"
+        "amdgpu: navi22 VCN idle failed: {error:?}; video closed, graphics continue"
     );
 }
 pub(crate) fn start() {
