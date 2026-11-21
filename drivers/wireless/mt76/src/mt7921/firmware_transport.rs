@@ -141,9 +141,89 @@ impl<T> KeyWork<T> {
 static KEY_WORK: narf_lib::mutex::Mutex<Option<KeyWork<Transport>>> =
     narf_lib::mutex::Mutex::new(None);
 
+/// The bound of a parked owner wait: an interrupt-driven owner re-polls at
+/// least this often (a lost event or a hung MCU still reaches the wait's own
+/// timeout), and a polled owner samples its condition at this period.
+const PACE_MS: u64 = 10;
+
+/// One owner wait's sleep of [`PACE_MS`].
+#[derive(Default)]
+pub(super) struct Pace(Option<core::pin::Pin<alloc::boxed::Box<narf_time::SleepUntil>>>);
+
+impl core::fmt::Debug for Pace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Pace").field(&self.0.is_some()).finish()
+    }
+}
+
+impl Pace {
+    /// True while the period runs, `cx` registered for its end; false once
+    /// it ended (the next call starts another).
+    pub(super) fn sleep(&mut self, cx: &mut core::task::Context<'_>) -> bool {
+        use core::future::Future;
+        let timer = self.0.get_or_insert_with(|| {
+            alloc::boxed::Box::pin(narf_time::sleep_until(narf_time::Deadline::after_ms(
+                PACE_MS,
+            )))
+        });
+        if timer.as_mut().poll(cx).is_ready() {
+            self.0 = None;
+            return false;
+        }
+        true
+    }
+}
+
+/// [`Backend::park`] for an owner with no interrupt line. Linux's
+/// `wait_event_timeout(dev->mcu.wait, ...)` is a timed sleep, so the wait
+/// samples its condition once per [`PACE_MS`] instead of waking itself every
+/// executor round for its whole timeout; a period that ended starts the next
+/// at once, so each period costs one poll.
+pub(super) fn polled_park(pace: &mut Pace, cx: &mut core::task::Context<'_>) -> bool {
+    pace.sleep(cx) || pace.sleep(cx)
+}
+
+/// The owner-lock waits of one async [`finish_boot_keys`].
+#[derive(Default)]
+struct KeyLocks {
+    work: Option<narf_lib::mutex::LockFuture<'static, Option<KeyWork<Transport>>>>,
+    owner: Option<narf_lib::mutex::LockFuture<'static, Option<Transport>>>,
+}
+
+/// Without `wait`, `mutex_trylock`. With it, `mutex_lock`: queue on the
+/// mutex, whose release hands the lock over and wakes `cx`, instead of
+/// re-polling every executor round while another party (a synchronous
+/// network drain advancing the work, a scan holding the owner) has it.
+fn acquire<T: 'static>(
+    mutex: &'static narf_lib::mutex::Mutex<T>,
+    wait: Option<&mut Option<narf_lib::mutex::LockFuture<'static, T>>>,
+    cx: &mut core::task::Context<'_>,
+) -> Option<narf_lib::mutex::MutexGuard<'static, T>> {
+    use core::future::Future;
+    let Some(wait) = wait else {
+        return mutex.try_lock();
+    };
+    let lock = wait.get_or_insert_with(|| mutex.lock());
+    match core::pin::Pin::new(lock).poll(cx) {
+        Poll::Ready(guard) => {
+            *wait = None;
+            Some(guard)
+        }
+        Poll::Pending => None,
+    }
+}
+
+/// One synchronous step of the retained work: `Pending` while another party
+/// holds an owner lock (the caller reports `Busy`).
 fn poll_boot_keys(cx: &mut core::task::Context<'_>) -> Poll<Result<(), Error>> {
-    let Some(mut slot) = KEY_WORK.try_lock() else {
-        cx.waker().wake_by_ref();
+    poll_boot_keys_in(cx, None)
+}
+
+fn poll_boot_keys_in(
+    cx: &mut core::task::Context<'_>,
+    mut locks: Option<&mut KeyLocks>,
+) -> Poll<Result<(), Error>> {
+    let Some(mut slot) = acquire(&KEY_WORK, locks.as_deref_mut().map(|l| &mut l.work), cx) else {
         return Poll::Pending;
     };
     let Some(work) = slot.as_mut() else {
@@ -152,8 +232,8 @@ fn poll_boot_keys(cx: &mut core::task::Context<'_>) -> Poll<Result<(), Error>> {
     if work.poll(cx).is_pending() {
         return Poll::Pending;
     }
-    let Some(mut owner) = BOOT_OWNER.try_lock() else {
-        cx.waker().wake_by_ref();
+    let Some(mut owner) = acquire(&BOOT_OWNER, locks.as_deref_mut().map(|l| &mut l.owner), cx)
+    else {
         return Poll::Pending;
     };
     if owner.is_some() {
@@ -269,7 +349,8 @@ pub(super) fn provision_after_reprobe() {
 }
 
 async fn finish_boot_keys() -> Result<(), Error> {
-    poll_fn(poll_boot_keys).await
+    let mut locks = KeyLocks::default();
+    poll_fn(|cx| poll_boot_keys_in(cx, Some(&mut locks))).await
 }
 
 /// Continue initial firmware provisioning on the same parked PCI binding.
@@ -1607,8 +1688,9 @@ trait Backend {
     /// Sleep an owner wait until the device's next event instead of
     /// re-polling at once (Linux `mt76_mcu_get_response` sleeps on
     /// `mcu.wait`, woken by the MCU RX NAPI). True when `cx` is registered
-    /// for that wake; false re-polls at once (a pure model, or an event
-    /// already pending).
+    /// for that wake (or, with no interrupt line, for the [`PACE_MS`]
+    /// timer: [`polled_park`]); false re-polls at once (a pure model, or an
+    /// event already pending).
     fn park(&mut self, _cx: &mut core::task::Context<'_>) -> bool {
         false
     }
@@ -2221,7 +2303,7 @@ impl<B: Backend> Session<B> {
     }
 
     /// One pause of a polling owner loop (the associated scan): until the
-    /// device's next event, or at once without an interrupt line.
+    /// device's next event, or one [`PACE_MS`] without an interrupt line.
     async fn park_once(&mut self) {
         let mut parked = false;
         poll_fn(|cx| {

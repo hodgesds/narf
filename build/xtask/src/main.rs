@@ -754,6 +754,31 @@ fn limine_conf_with_cmdline(conf: &str, apply: impl Fn(&str) -> Result<String>) 
 }
 
 #[cfg(test)]
+mod qemu_append_tests {
+    use super::*;
+
+    #[test]
+    fn joins_the_non_empty_parts() {
+        let parts = ["a=1".to_string(), String::new(), "b".to_string()];
+        assert_eq!(qemu_append(&parts).unwrap(), "a=1 b");
+        assert_eq!(qemu_append(&[String::new()]).unwrap(), "");
+    }
+
+    #[test]
+    fn refuses_a_command_line_the_kernel_would_cut() {
+        let cap = narf_boot_protocol::CMDLINE_CAP;
+        // The kernel keeps CMDLINE_CAP - 1 bytes: that much is accepted.
+        let fits = "x".repeat(cap - 1);
+        assert_eq!(qemu_append(&[fits.clone()]).unwrap(), fits);
+        // One byte more would lose the tail, as a long `test_subsystem=`
+        // list did: refused, naming the size.
+        let filter = format!("test_subsystem={}", "a/b,".repeat(cap / 4));
+        let err = qemu_append(&["console=ttyS0".to_string(), filter]).unwrap_err();
+        assert!(err.to_string().contains("dropped silently"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod disk_policy_tests {
     use super::*;
 
@@ -2170,15 +2195,11 @@ impl Arch {
                 // pass runtime knobs the kernel parses from
                 // `narf_boot::cmdline()` — e.g. `mt_echo_threads=N` for the
                 // mt-echo benchmark — without rebuilding the kernel.
-                let append = [
+                let append = qemu_append(&[
                     std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
                     extra_bootargs.to_string(),
                     btrfs_smoke_bootarg().to_string(),
-                ]
-                .into_iter()
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
+                ])?;
                 if !append.is_empty() {
                     args.push("-append".into());
                     args.push(append);
@@ -2391,15 +2412,11 @@ impl Arch {
                 // `qemu_virt_dtb_path_with_cmdline` therefore bakes the string
                 // into `/chosen/bootargs` when it generates the blob, which is
                 // where `boot/src/aarch64` already parses it from.
-                let append = [
+                let append = qemu_append(&[
                     std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
                     extra_bootargs.to_string(),
                     btrfs_smoke_bootarg().to_string(),
-                ]
-                .into_iter()
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
+                ])?;
                 let initrd = TEST_INITRD.lock().ok().and_then(|g| g.clone());
                 let template = qemu_virt_dtb_path_with_cmdline(&append, initrd.as_deref());
                 // The DTB sits immediately above the kernel image's
@@ -5019,6 +5036,34 @@ fn qemu_boot_args(args: &BuildArgs, kernel: &Path) -> Result<Vec<String>> {
     }
     qemu_args.extend(vfio_args);
     Ok(qemu_args)
+}
+
+/// The kernel command line QEMU passes (`-append`), from its non-empty
+/// parts, refused when the kernel would not keep all of it.
+///
+/// Both kernels copy their command line into a fixed buffer of
+/// [`narf_boot_protocol::CMDLINE_CAP`] bytes and keep only the first
+/// `CMDLINE_CAP - 1`. On x86_64 the cut is silent, so a long
+/// `test_subsystem=` list lost its trailing prefixes and their tests simply
+/// never ran, while the run still reported all-pass for the rest. Refusing
+/// here names the overflow instead.
+fn qemu_append(parts: &[String]) -> Result<String> {
+    let append = parts
+        .iter()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if append.len() >= narf_boot_protocol::CMDLINE_CAP {
+        bail!(
+            "the kernel command line is {} bytes, but the kernel keeps only the first {}: \
+             the rest (e.g. trailing `test_subsystem=` prefixes) would be dropped silently. \
+             Split the run, or shorten `--subsystem`.",
+            append.len(),
+            narf_boot_protocol::CMDLINE_CAP - 1
+        );
+    }
+    Ok(append)
 }
 
 /// Remove explicit emulated displays as well as the default VGA adapter.

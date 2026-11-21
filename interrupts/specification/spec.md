@@ -353,6 +353,57 @@ firmware-owned GPE/PME routing (`narf-power` `pci_wake`), and an aarch64
 system-PM owner must keep armed SPIs enabled and consume the latch the same
 way before it offers a wake-capable sleep state.
 
+**Soft-mask arrivals** (`dispatch`, for the stall watchdog's hard-IRQ share).
+
+```rust
+pub fn masked_fire_count(vector: u8) -> u64;
+pub fn masked_arrivals_on_cpu(cpu: usize) -> u64;
+pub fn handler_name_try(vector: u8) -> Option<&'static str>;
+```
+
+A soft-masked (`disable_irq`) delivery still runs no handler and moves no
+fire count, but is counted in `masked_fire_count(vector)` and
+`masked_arrivals_on_cpu(cpu)`: the soft mask does not reach the hardware,
+and an interrupt it drops still costs its CPU the entry. `handler_name_try`
+names a vector's first handler without waiting for its lock, for a dump
+that may run while a wedged CPU holds it.
+
+**Unhandled-IRQ detector** (`dispatch`, Linux `kernel/irq/spurious.c`
+`note_interrupt` / `__report_bad_irq`).
+
+```rust
+pub const SPURIOUS_WINDOW: u32 = 100_000;
+pub const SPURIOUS_THRESHOLD: u32 = 99_900;
+pub const UNHANDLED_GAP_NS: u64 = 100_000_000;     // Linux HZ/10
+pub struct SpuriousState;
+impl SpuriousState { pub fn note(&self, handled: bool, now: u64, gap: u64) -> Option<u32>; }
+pub fn set_irqdebug(enabled: bool);                // `noirqdebug` clears it
+pub struct HwMask { pub kind: &'static str, pub mask: fn(u64, bool), pub cookie: u64 }
+pub fn set_hw_mask(vector: u8, mask: HwMask);
+pub fn clear_hw_mask(vector: u8);
+pub fn hw_mask(vector: u8) -> Option<HwMask>;
+pub fn spurious_disabled(vector: u8) -> bool;
+```
+
+Every delivery to a device vector (`vector::allocatable`) with at least one
+handler runs `note_interrupt` under the vector's handler lock, as Linux runs
+it under `desc->lock`. An unhandled delivery more than `UNHANDLED_GAP_NS`
+after the previous one restarts the unhandled count at 1; once a vector has
+an unhandled delivery, every delivery counts toward a window of
+`SPURIOUS_WINDOW`, and a window ending with more than `SPURIOUS_THRESHOLD`
+unhandled disables the vector: it is soft-masked, its source is masked in
+hardware (its registered `HwMask` — `bus/` registers the MSI-X entry's
+Vector Control word when it programs an entry and the MSI Mask Bits bit when
+the capability has per-vector masking — else every IOAPIC pin routed to the
+vector, `narf_acpi::ioapic::mask_entries_for_vector`), and one report is
+printed: `irq V: nobody cared (U of the last 100000 interrupts unhandled;
+"noirqdebug" disables this check)`, `handlers:`, one `[<fn>] name
+cookie=C` line per handler, `Disabling IRQ #V (how)`. A healthy vector pays
+one load per delivery. `enable_irq` on a disabled vector unmasks its source
+again; `vector::alloc`/`reserve` reset the detector state and the hardware
+mask for the new owner and `vector::free` forgets the hardware mask. The
+local timer, IPIs and the other fixed vectors are never judged.
+
 ## 4. Invariants & safety properties
 
 - Every IRQ has exactly one `target` at any time.

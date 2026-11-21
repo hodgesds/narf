@@ -1653,11 +1653,16 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
                     && !narf_time::periodic_tick_wanted(cpu))
         })
     });
+    // Both probes are in hand before stealing is on: the parked one's waker,
+    // and the one to enqueue, built pinned to this CPU so that no idle CPU
+    // takes it off this (never rescheduling) CPU before it is moved.
+    let parked_waker = take_waker(0);
+    let slot = take_probe_here(1, 0, None);
     crate::enable_work_stealing();
     let placements = crate::__test_wake_placements();
 
     // The wake: issued at once, while the held CPU is running a task.
-    let woke = take_waker(0).map(|waker| {
+    let woke = parked_waker.map(|waker| {
         let ipis = crate::__test_resched_ipis_sent(me);
         waker.wake();
         crate::__test_resched_ipis_sent(me).wrapping_sub(ipis)
@@ -1666,8 +1671,6 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
     // The enqueue: once the held CPU has passed no scheduling point for longer
     // than the not-rescheduling threshold.
     narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
-    crate::spawn_with_spec(Probe { slot: 1, parks: 0 }, any_cpu_preferring(me));
-    let slot = crate::READY[me].lock().as_mut().and_then(|q| q.pop_front());
     let enqueued = slot.map(|slot| {
         let ipis = crate::__test_resched_ipis_sent(me);
         crate::enqueue_on(held, slot, TaskEnqueueReason::Requeued);
@@ -1713,4 +1716,433 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
 kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere
+);
+
+/// A fresh probe's slot, taken off this CPU's ready queue, with `affinity`
+/// (any CPU, preferring this one, when `None`) applied once it is in hand.
+///
+/// The probe is spawned pinned to this CPU. The test thread passes no
+/// scheduling point, so an idle CPU may count this CPU as stalled and take an
+/// unpinned task from its queue at any moment, as it should; pinned, the
+/// probe stays until the test moves it.
+fn take_probe_here(
+    slot: usize,
+    parks: usize,
+    affinity: Option<Affinity>,
+) -> Option<crate::TaskSlot> {
+    let me = narf_lib::percpu::current_cpu();
+    let pinned = TaskSpec {
+        affinity: Affinity::pinned(CpuId(me as u32)),
+        ..TaskSpec::kernel_any()
+    };
+    let id = crate::spawn_with_spec(Probe { slot, parks }, pinned);
+    let mut task = crate::READY[me].lock().as_mut().and_then(|q| {
+        let at = q.iter().position(|task| task.id == id)?;
+        q.remove(at)
+    })?;
+    let affinity = affinity.unwrap_or(any_cpu_preferring(me).affinity);
+    task.spec.affinity = affinity;
+    task.affinity_generation = crate::register_task_affinity(id, affinity, false);
+    Some(task)
+}
+
+/// Put a fresh probe straight into `cpu`'s ready queue, as that CPU's own
+/// round-start activation of a woken task does (`activate_wake_list`): no
+/// enqueue kick. Returns its wake cell.
+fn ready_probe_on(slot: usize, cpu: usize, affinity: Option<Affinity>) -> Option<Arc<WakeCell>> {
+    let task = take_probe_here(slot, 0, affinity)?;
+    let id = task.id;
+    task.awake.cpu.store(cpu as u32, Ordering::Release);
+    let cell = task.awake.clone();
+    crate::note_runnable_peer(cpu as u32, id.raw());
+    crate::READY[cpu].lock().as_mut()?.push_back(task);
+    Some(cell)
+}
+
+/// A CPU stuck outside a task poll (executor maintenance: sleep pumps,
+/// deferred wakes, the timer wheel) with one runnable task in its ready queue
+/// gives that task up once it has passed no scheduling point for the
+/// not-rescheduling threshold, as it already does a staged wake. Linux moves a
+/// CPU's only CFS task to an idle CPU when the source's capacity is taken by
+/// something else (`need_active_balance`: `h_nr_runnable == 1` and
+/// `check_cpu_capacity`). A healthy CPU keeps it (`nr_running <= 1`).
+fn smoke_scheduler_stalled_cpu_gives_up_its_only_ready_task() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    stuck.set_running(false);
+    if ready_probe_on(0, stuck.0, None).is_none() {
+        stuck.release();
+        return TestResult::Fail("could not queue the probe on the stuck CPU");
+    }
+    stuck.pass_scheduling_point();
+    let took_from_healthy = pull(stuck.0, me);
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+    let took_from_stalled = pull(stuck.0, me);
+    crate::poll_one_round();
+    let ran = polls(0);
+    stuck.release();
+    if took_from_healthy {
+        return TestResult::Fail("a healthy CPU's only queued task was pulled");
+    }
+    if !took_from_stalled || ran != 1 {
+        return TestResult::Fail(
+            "the only queued task of a CPU stalled outside a task poll was never pulled",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_stalled_cpu_gives_up_its_only_ready_task
+);
+
+/// The cache-hot window protects a warm cache a task gets back shortly. A
+/// stalled CPU gives it nothing back, so a queued task that ran there a moment
+/// ago is pulled anyway, as the staged-wake pull already does (Linux migrates a
+/// hot task once balancing keeps failing, `nr_balance_failed >
+/// cache_nice_tries`). From a healthy CPU it is not.
+fn smoke_scheduler_stalled_cpu_gives_up_a_cache_hot_ready_task() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let Some(cell) = ready_probe_on(0, stuck.0, None) else {
+        stuck.release();
+        return TestResult::Fail("could not queue the probe on the stuck CPU");
+    };
+    stuck.pass_scheduling_point();
+    cell.last_run_cycles
+        .store(narf_time::now_cycles(), Ordering::Release);
+    let took_hot_from_healthy = pull(stuck.0, me);
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+    cell.last_run_cycles
+        .store(narf_time::now_cycles(), Ordering::Release);
+    let took_hot_from_stalled = pull(stuck.0, me);
+    crate::poll_one_round();
+    let ran = polls(0);
+    stuck.release();
+    if took_hot_from_healthy {
+        return TestResult::Fail("a cache-hot task was pulled from a healthy CPU");
+    }
+    if !took_hot_from_stalled || ran != 1 {
+        return TestResult::Fail("a cache-hot task stayed queued on a stalled CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_stalled_cpu_gives_up_a_cache_hot_ready_task
+);
+
+/// The tick-side idle-balance kick sees a stalled CPU's ready queue, not only
+/// its staged wakes: Linux's `nohz_balancer_kick` kicks on `nr_running >= 2`
+/// and on a runnable task whose CPU lost capacity, whatever woke it. A task
+/// only the stalled CPU may run asks nobody to come.
+fn smoke_scheduler_tick_kick_sees_ready_queue_work() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let pinned = Affinity::pinned(CpuId(stuck.0 as u32));
+    let queued_pinned = ready_probe_on(0, stuck.0, Some(pinned)).is_some();
+    let for_pinned = crate::idle_pull_mask(stuck.0);
+    let queued_free = ready_probe_on(1, stuck.0, None).is_some();
+    let held = crate::idle_balance_work_held(stuck.0);
+    let for_free = crate::idle_pull_mask(stuck.0);
+    let stuck_bit = 1u64 << stuck.0;
+    stuck.release();
+    if !queued_pinned || !queued_free {
+        return TestResult::Fail("could not queue the probes on the stuck CPU");
+    }
+    if for_pinned != 0 {
+        return TestResult::Fail("a queued task pinned to the stalled CPU asked for a kick");
+    }
+    if !held {
+        return TestResult::Fail("the tick did not see work queued on its CPU");
+    }
+    if for_free & (1u64 << me) == 0 || for_free & stuck_bit != 0 {
+        return TestResult::Fail(
+            "a queued task any CPU may run did not ask the other CPUs to come",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_tick_kick_sees_ready_queue_work
+);
+
+static MAINT_PROBE: IrqSafeSpinLock<Option<crate::TaskSlot>> = IrqSafeSpinLock::new(None);
+static MAINT_STARTED: AtomicBool = AtomicBool::new(false);
+static MAINT_RELEASE: AtomicBool = AtomicBool::new(false);
+static MAINT_DONE: AtomicBool = AtomicBool::new(false);
+static MAINT_HOLDER_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+static MAINT_HOLDER_DONE: AtomicBool = AtomicBool::new(false);
+static MAINT_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// A deferred wake whose callback keeps its CPU in executor maintenance (no
+/// task current, interrupts on) after making the probe runnable there the way
+/// the CPU's own activation does.
+struct MaintenanceSpin;
+
+impl alloc::task::Wake for MaintenanceSpin {
+    fn wake(self: Arc<Self>) {
+        let cpu = narf_lib::percpu::current_cpu();
+        let task = MAINT_PROBE.lock().take();
+        if let Some(task) = task {
+            task.awake.cpu.store(cpu as u32, Ordering::Release);
+            crate::note_runnable_peer(cpu as u32, task.id.raw());
+            if let Some(queue) = crate::READY[cpu].lock().as_mut() {
+                queue.push_back(task);
+            }
+        }
+        MAINT_STARTED.store(true, Ordering::Release);
+        wait_for(HOLD_LIMIT_NS, || MAINT_RELEASE.load(Ordering::Acquire));
+        MAINT_DONE.store(true, Ordering::Release);
+    }
+}
+
+/// Stashes a [`MaintenanceSpin`] on its CPU's deferred-wake queue and parks;
+/// the CPU then reaches that queue in its idle path with nothing current.
+struct MaintenanceHolder {
+    pushed: bool,
+}
+
+impl Future for MaintenanceHolder {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this.pushed {
+            MAINT_HOLDER_DONE.store(true, Ordering::Release);
+            return Poll::Ready(());
+        }
+        this.pushed = true;
+        *MAINT_HOLDER_WAKER.lock() = Some(cx.waker().clone());
+        let spin = Waker::from(Arc::new(MaintenanceSpin));
+        if narf_lib::deferred_wake::try_push_one(spin).is_ok() {
+            MAINT_PUSHED.store(true, Ordering::Release);
+        }
+        Poll::Pending
+    }
+}
+
+/// End to end on real CPUs, tickless idle on: an AP sits in executor
+/// maintenance with interrupts enabled and nothing current, holding one
+/// runnable task any CPU may run in its ready queue — a task its own drain
+/// activated. Every other AP is idle with its tick stopped, and this CPU does
+/// not steal. The held AP's tick must have an idle CPU take the task within a
+/// couple of tick periods (Linux `nohz_balancer_kick` → `kick_ilb`, and the
+/// kicked CPU's `need_active_balance` for a CPU whose capacity is gone).
+fn smoke_scheduler_ready_task_behind_cpu_in_maintenance_runs_elsewhere() -> TestResult {
+    reset_probes();
+    let me = narf_lib::percpu::current_cpu();
+    let live = live_aps();
+    let mut aps = (0..MAX_CPUS).filter(|cpu| live & (1u64 << cpu) != 0);
+    let (Some(held), Some(_)) = (aps.next(), aps.next()) else {
+        return TestResult::Skip("needs two APs that really came up");
+    };
+    if !enter_tickless_idle(live) {
+        leave_tickless_idle(live);
+        return TestResult::Skip("no AP stopped its tick: no tickless clockevent");
+    }
+    for flag in [
+        &MAINT_STARTED,
+        &MAINT_RELEASE,
+        &MAINT_DONE,
+        &MAINT_HOLDER_DONE,
+        &MAINT_PUSHED,
+    ] {
+        flag.store(false, Ordering::Release);
+    }
+    let Some(task) = take_probe_here(0, 0, None) else {
+        leave_tickless_idle(live);
+        reset_probes();
+        return TestResult::Fail("spawned probe not found on this CPU");
+    };
+    *MAINT_PROBE.lock() = Some(task);
+    crate::enable_work_stealing();
+    crate::spawn_with_spec(
+        MaintenanceHolder { pushed: false },
+        TaskSpec {
+            affinity: Affinity::pinned(CpuId(held as u32)),
+            ..TaskSpec::kernel_any()
+        },
+    );
+    let started = wait_for(1_000_000_000, || MAINT_STARTED.load(Ordering::Acquire));
+    // This CPU does not poll: only an AP can run the probe.
+    let ran = started && wait_for(WAKE_BOUND_NS, || polls(0) == 1);
+    let held_throughout = !MAINT_DONE.load(Ordering::Acquire);
+    let ran_on = PROBE_LAST_CPU[0].load(Ordering::Acquire);
+    MAINT_RELEASE.store(true, Ordering::Release);
+    let released = wait_for(1_000_000_000, || MAINT_DONE.load(Ordering::Acquire));
+    let holder = MAINT_HOLDER_WAKER.lock().take();
+    if let Some(waker) = holder {
+        waker.wake();
+    }
+    let holder_done = wait_for(1_000_000_000, || MAINT_HOLDER_DONE.load(Ordering::Acquire));
+    // A probe nobody took still runs once the held CPU is free.
+    let _ = wait_for(1_000_000_000, || polls(0) == 1);
+    let stray = MAINT_PROBE.lock().take();
+    drop(stray);
+    crate::disable_work_stealing();
+    leave_tickless_idle(live);
+    reset_probes();
+    if !MAINT_PUSHED.load(Ordering::Acquire) || !started {
+        return TestResult::Fail("the AP did not enter the maintenance section");
+    }
+    if !released || !holder_done {
+        return TestResult::Fail("the maintenance section never finished");
+    }
+    if !ran {
+        return TestResult::Fail(
+            "a runnable task stayed stranded behind a CPU stuck in executor maintenance",
+        );
+    }
+    if !held_throughout {
+        return TestResult::Fail("the AP left its maintenance section before the check");
+    }
+    if ran_on == held || ran_on == me {
+        return TestResult::Fail("the task ran on a CPU that could not have run it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_ready_task_behind_cpu_in_maintenance_runs_elsewhere
+);
+
+/// A wake issued with interrupts masked — from an interrupt handler, as every
+/// device completion is — for a task whose CPU has passed no scheduling point
+/// for the not-rescheduling threshold asks an idle CPU to come and take it, as
+/// Linux's `try_to_wake_up` → `select_idle_sibling` places a wake from
+/// interrupt context. It must not wait for the stalled CPU's own tick.
+#[cfg(feature = "kernel-test")]
+fn smoke_scheduler_masked_wake_for_stalled_cpu_kicks_an_idle_cpu() -> TestResult {
+    reset_probes();
+    let live = live_aps();
+    if live == 0 {
+        return TestResult::Skip("needs an AP that really came up");
+    }
+    if narf_arch::interrupts_enabled() {
+        return TestResult::Skip("the harness runs with interrupts enabled");
+    }
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    if park_probe_on(0, 1, stuck.0, None).is_none() {
+        stuck.release();
+        return TestResult::Fail("could not park the probe on the stuck CPU");
+    }
+    let_cool();
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+    let idle_ap = wait_for(100_000_000, || {
+        (0..MAX_CPUS).any(|cpu| live & (1u64 << cpu) != 0 && crate::cpu_halted_and_schedulable(cpu))
+    });
+    crate::enable_work_stealing();
+    let before = crate::__test_wake_placements();
+    let woke = take_waker(0).map(Waker::wake).is_some();
+    let after = crate::__test_wake_placements();
+    crate::disable_work_stealing();
+    stuck.release();
+    if !woke {
+        return TestResult::Fail("probe published no waker");
+    }
+    if !idle_ap {
+        return TestResult::Skip("no AP was idle");
+    }
+    if after.1 == before.1 {
+        return TestResult::Fail(
+            "a masked wake for a stalled CPU asked no idle CPU to take the task",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_masked_wake_for_stalled_cpu_kicks_an_idle_cpu
+);
+
+/// The stall watchdog's runnable-task probe (Linux `wq_watchdog_timer_fn`
+/// per task): a task runnable on a CPU that never dispatches it is named in
+/// whichever place the CPU holds it, with the instant it became runnable,
+/// and a task that has never run at all is as visible as a woken one. A
+/// parked task nobody woke is not runnable and is never named.
+fn smoke_scheduler_oldest_runnable_names_stranded_task() -> TestResult {
+    use crate::RunnableHold;
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let pinned = Affinity::pinned(CpuId(stuck.0 as u32));
+
+    let Some((parked_id, _cell)) = park_probe_on(0, 1, stuck.0, Some(pinned)) else {
+        stuck.release();
+        return TestResult::Fail("could not park the pinned probe on the stuck CPU");
+    };
+    if crate::dbg_oldest_runnable(stuck.0).is_some() {
+        stuck.release();
+        return TestResult::Fail("a parked task nobody woke was reported runnable");
+    }
+    let woke_at = narf_time::now_cycles();
+    let Some(waker) = take_waker(0) else {
+        stuck.release();
+        return TestResult::Fail("probe published no waker");
+    };
+    waker.wake();
+    let woken = crate::dbg_oldest_runnable(stuck.0);
+    // Never dispatched: the stamp stays put while time passes.
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(20_000_000));
+    let later = crate::dbg_oldest_runnable(stuck.0);
+    stuck.release();
+    match woken {
+        Some(o) if o.task == parked_id.raw() && o.hold == RunnableHold::ParkedWake => {
+            if o.since_cycles < woke_at || !o.allowed {
+                return TestResult::Fail("woken parked task named with a wrong stamp or affinity");
+            }
+            if later.map(|l| (l.task, l.since_cycles)) != Some((o.task, o.since_cycles)) {
+                return TestResult::Fail("an undispatched task's runnable stamp moved");
+            }
+        }
+        _ => {
+            return TestResult::Fail("a woken task parked on a CPU that never drains was not named")
+        }
+    }
+
+    // A task spawned and enqueued onto the stuck CPU, which never runs it.
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let spawned_at = narf_time::now_cycles();
+    let queued_id = crate::spawn_with_spec(Probe { slot: 1, parks: 0 }, any_cpu_preferring(me));
+    let Some(mut slot) = crate::READY[me].lock().as_mut().and_then(|q| q.pop_front()) else {
+        stuck.release();
+        return TestResult::Fail("spawned probe not found on this CPU");
+    };
+    slot.spec.affinity = pinned;
+    slot.affinity_generation = crate::register_task_affinity(queued_id, pinned, false);
+    crate::enqueue_on(stuck.0, slot, TaskEnqueueReason::Requeued);
+    let queued = crate::dbg_oldest_runnable(stuck.0);
+    stuck.release();
+    match queued {
+        Some(o)
+            if o.task == queued_id.raw()
+                && o.hold == RunnableHold::WakeInbox
+                && o.since_cycles >= spawned_at
+                && o.since_cycles <= narf_time::now_cycles() =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("a spawned task that never ran was not named on its CPU"),
+    }
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_oldest_runnable_names_stranded_task
 );

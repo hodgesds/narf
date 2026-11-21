@@ -298,7 +298,7 @@ struct Hardware {
     irq: Option<crate::mt7921::irq::Binding>,
     /// The parked owner wait's bound (`park`): a lost event or a hung MCU
     /// still re-polls, so the wait's own timeout runs.
-    pace: Option<core::pin::Pin<alloc::boxed::Box<narf_time::SleepUntil>>>,
+    pace: super::Pace,
 }
 impl Drop for Hardware {
     /// An owner dropped while its rings are still published (dead firmware,
@@ -1105,9 +1105,8 @@ impl Backend for Hardware {
     /// 10 ms timer bounds the sleep.
     fn park(&mut self, cx: &mut core::task::Context<'_>) -> bool {
         use crate::mt7921::irq::LINE;
-        use core::future::Future;
         if self.irq.is_none() {
-            return false;
+            return super::polled_park(&mut self.pace, cx);
         }
         let seen = LINE.raised();
         let pending = self.acknowledge_interrupts();
@@ -1122,14 +1121,7 @@ impl Backend for Hardware {
         if self.interrupts_end().is_err() {
             return false;
         }
-        let pace = self.pace.get_or_insert_with(|| {
-            alloc::boxed::Box::pin(narf_time::sleep_until(narf_time::Deadline::after_ms(10)))
-        });
-        if pace.as_mut().poll(cx).is_ready() {
-            self.pace = None;
-            return false;
-        }
-        true
+        self.pace.sleep(cx)
     }
     fn progress(&mut self, stage: super::Stage) {
         use core::fmt::Write;
@@ -2021,7 +2013,7 @@ impl Transport {
                         sequence_reset: SequenceReset::None,
                         wake: wake::Wake::default(),
                         irq: None,
-                        pace: None,
+                        pace: super::Pace::default(),
                     },
                     firmware,
                 ),

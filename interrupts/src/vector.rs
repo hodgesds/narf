@@ -83,6 +83,7 @@ fn split(vector: u8) -> (usize, u64) {
 /// otherwise hand the next owner a vector `on_irq` silently drops.
 fn start_enabled(vector: u8) {
     crate::dispatch::enable_irq(vector);
+    crate::dispatch::reset_vector_state(vector);
 }
 
 /// Reserve and return a free vector in `ALLOC_BASE..=ALLOC_MAX`.
@@ -219,6 +220,8 @@ pub fn free(vector: u8) -> Result<(), VectorError> {
     if prev & bit == 0 {
         Err(VectorError::AlreadyFree)
     } else {
+        // The source's hardware mask belongs to the owner that freed it.
+        crate::dispatch::clear_hw_mask(vector);
         Ok(())
     }
 }

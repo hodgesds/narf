@@ -115,6 +115,7 @@ impl<T: ?Sized> Mutex<T> {
             mutex: self,
             waiter_id: None,
             site: core::panic::Location::caller(),
+            blocked: crate::hung_task::BlockedWait::new(),
         }
     }
 
@@ -229,6 +230,10 @@ pub struct LockFuture<'a, T: ?Sized> {
     waiter_id: Option<WaiterId>,
     /// Where `lock()` was called, for [`note_wait_site`].
     site: &'static core::panic::Location<'static>,
+    /// The hung-task detector's record of this wait (Linux's
+    /// `TASK_UNINTERRUPTIBLE` in `__mutex_lock_common`), from the first
+    /// `Pending` until the lock is taken or the future is dropped.
+    blocked: crate::hung_task::BlockedWait,
 }
 
 impl<T: ?Sized> fmt::Debug for LockFuture<'_, T> {
@@ -255,6 +260,8 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
             if let Some(id) = this.waiter_id.take() {
                 inner.waiters.retain(|(wid, _)| *wid != id);
             }
+            drop(inner);
+            this.blocked.wake();
             return Poll::Ready(MutexGuard { mutex: this.mutex });
         }
 
@@ -262,6 +269,8 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
         if this.waiter_id.is_some() && inner.granted == this.waiter_id {
             inner.granted = None;
             this.waiter_id = None;
+            drop(inner);
+            this.blocked.wake();
             return Poll::Ready(MutexGuard { mutex: this.mutex });
         }
 
@@ -294,13 +303,18 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
                 }
             }
         }
+        drop(inner);
         note_wait_site(this.site);
-        if let (Some(WaiterId(id)), Some(slot)) = (
-            this.waiter_id,
-            WAIT_WAITER.get(crate::percpu::current_cpu()),
-        ) {
-            slot.store(id, Ordering::Relaxed);
+        let waiter = this.waiter_id.map_or(0, |WaiterId(id)| id);
+        if let Some(slot) = WAIT_WAITER.get(crate::percpu::current_cpu()) {
+            slot.store(waiter, Ordering::Relaxed);
         }
+        this.blocked.block(
+            &crate::hung_task::MUTEX,
+            this.site,
+            core::ptr::from_ref(this.mutex).cast::<()>() as usize,
+            waiter,
+        );
         Poll::Pending
     }
 }

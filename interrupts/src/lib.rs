@@ -32,6 +32,7 @@ mod ipi_smp_tests;
 #[path = "its_tests.rs"]
 mod its_tests;
 mod lapic_oneshot_tests;
+mod spurious_tests;
 mod tests;
 mod timer_rate_tests;
 

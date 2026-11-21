@@ -831,3 +831,76 @@ kernel_test_in!(
     "lib/deferred_wake",
     smoke_deferred_wake_presence_survives_reentrant_enqueue
 );
+
+/// An async `Mutex` waiter is an uninterruptible kernel wait (Linux
+/// `__mutex_lock_common` sleeps in TASK_UNINTERRUPTIBLE): it is recorded
+/// for the hung-task detector from its first `Pending`, naming the lock,
+/// the `lock()` call site and its waiter id, and leaves the record when it
+/// takes the lock or is dropped. An uncontended lock records nothing.
+fn smoke_lib_mutex_waiter_recorded_for_hung_task() -> TestResult {
+    use crate::hung_task::{for_each_blocked, MUTEX};
+    use crate::mutex::Mutex;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, Waker};
+
+    struct Nop;
+    impl Wake for Nop {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker: Waker = Arc::new(Nop).into();
+    let mut cx = Context::from_waker(&waker);
+    let m: Mutex<u32> = Mutex::new(0);
+    let addr = core::ptr::from_ref(&m) as usize;
+    let records = || {
+        let mut out = alloc::vec::Vec::new();
+        for_each_blocked(|w| {
+            if w.object == addr {
+                out.push((w.kind.name, w.site.map(|s| s.line()), w.detail, w.since_ns));
+            }
+        });
+        out
+    };
+
+    let holder = m.try_lock().unwrap();
+    let line = line!() + 1;
+    let mut waiter = m.lock();
+    if !matches!(Pin::new(&mut waiter).poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("poll on a held lock should be Pending");
+    }
+    let first = records();
+    let [(kind, site, detail, since)] = first[..] else {
+        return TestResult::Fail("a blocked mutex waiter was not recorded exactly once");
+    };
+    if kind != MUTEX.name || site != Some(line) || detail == 0 || since == 0 {
+        return TestResult::Fail("the mutex wait was recorded without its lock() site or waiter");
+    }
+    // A re-poll is the same wait: one record, the same start.
+    let _ = Pin::new(&mut waiter).poll(&mut cx);
+    if records() != first {
+        return TestResult::Fail("a re-polled wait was recorded as a new one");
+    }
+    drop(holder);
+    if !matches!(Pin::new(&mut waiter).poll(&mut cx), Poll::Ready(_)) {
+        return TestResult::Fail("the waiter did not take the released lock");
+    }
+    if !records().is_empty() {
+        return TestResult::Fail("a waiter that took the lock stayed recorded");
+    }
+    // A cancelled wait leaves too.
+    let holder = m.try_lock().unwrap();
+    let mut cancelled = m.lock();
+    let _ = Pin::new(&mut cancelled).poll(&mut cx);
+    drop(cancelled);
+    drop(holder);
+    if !records().is_empty() {
+        return TestResult::Fail("a dropped waiter stayed recorded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "lib/hung_task",
+    smoke_lib_mutex_waiter_recorded_for_hung_task
+);

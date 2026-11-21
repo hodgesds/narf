@@ -236,6 +236,11 @@ struct Model {
     p2p_tx: Option<Arc<p2p_management_model::Observer>>,
     ticks: Cell<u64>,
     tick_step_ns: u64,
+    /// Model the native owner with no interrupt line (`Hardware::irq`
+    /// `None`): `park` is the hardware's polled-owner sleep, and time is
+    /// the monotonic clock rather than ticks.
+    polled_owner: bool,
+    pace: super::Pace,
     management_stall_after: Option<usize>,
     ba_error_tag: Option<u16>,
     tx_ba_offer: Option<(u16, u16)>,
@@ -470,6 +475,8 @@ impl Model {
             lost_replies: 0,
             unacked_status: VecDeque::new(),
             assoc_refusals: VecDeque::new(),
+            polled_owner: false,
+            pace: super::Pace::default(),
         }
     }
 }
@@ -505,9 +512,15 @@ impl Backend for Model {
         }
     }
     fn now_ns(&self) -> u64 {
+        if self.polled_owner {
+            return narf_time::wall::monotonic_ns();
+        }
         let now = self.ticks.get();
         self.ticks.set(now + self.tick_step_ns);
         now
+    }
+    fn park(&mut self, cx: &mut core::task::Context<'_>) -> bool {
+        self.polled_owner && super::polled_park(&mut self.pace, cx)
     }
     fn check(&self) -> Result<(), Error> {
         if self.live {
@@ -4389,3 +4402,107 @@ kernel_test_in!(
 /// issue #706): the net-stack half of the station fixtures.
 #[path = "dhcp_composition_tests.rs"]
 mod dhcp_composition;
+
+/// Polls a future only after its waker fired, expiring hrtimers between polls
+/// as an executor round does, and counts the polls: a wait that wakes itself
+/// every round is polled every pass here, as a task would be.
+struct Woken {
+    flag: Arc<WokenFlag>,
+    waker: Waker,
+    polls: Cell<usize>,
+}
+struct WokenFlag(AtomicBool);
+impl alloc::task::Wake for WokenFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+impl Woken {
+    fn new() -> Self {
+        let flag = Arc::new(WokenFlag(AtomicBool::new(true)));
+        Self {
+            waker: Waker::from(flag.clone()),
+            flag,
+            polls: Cell::new(0),
+        }
+    }
+    fn run_for<F: Future + ?Sized>(
+        &self,
+        mut f: core::pin::Pin<&mut F>,
+        ms: u64,
+    ) -> Option<F::Output> {
+        let deadline = narf_time::Deadline::after_ms(ms);
+        loop {
+            if self.flag.0.swap(false, Ordering::SeqCst) {
+                self.polls.set(self.polls.get() + 1);
+                if let Poll::Ready(v) = f.as_mut().poll(&mut Context::from_waker(&self.waker)) {
+                    return Some(v);
+                }
+            }
+            if deadline.expired() {
+                return None;
+            }
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// A native owner with no interrupt line (`Hardware::irq` `None`) waits as
+/// Linux's `wait_event_timeout(dev->mcu.wait, ...)` does, a timed sleep:
+/// it samples a condition that never comes true about once per 10 ms
+/// `Pace` until the wait's timeout, rather than waking itself every
+/// executor round and keeping CPU0 busy for the whole timeout.
+fn mcu_polled_owner_wait_sleeps_on_the_pace() -> TestResult {
+    let mut model = Model::new();
+    model.polled_owner = true;
+    let mut session = Session::new(model, firmware(32));
+    let samples = Cell::new(0usize);
+    let driver = Woken::new();
+    let wait = pin!(session.wait(100, |_| {
+        samples.set(samples.get() + 1);
+        Ok(None::<()>)
+    }));
+    if driver.run_for(wait, 300) != Some(Err(Error::Timeout)) {
+        return TestResult::Fail("polled owner wait did not reach its timeout");
+    }
+    // 100 ms at one sample per 10 ms, with slack for a late timer.
+    if samples.get() > 20 || driver.polls.get() > 20 {
+        return TestResult::Fail("polled owner re-sampled every round instead of every 10 ms");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport/pace",
+    mcu_polled_owner_wait_sleeps_on_the_pace
+);
+
+/// Retained boot work whose owner lock another party holds (a synchronous
+/// network drain advancing it) waits for that lock's release, as
+/// `mutex_lock` sleeps, instead of re-polling every executor round.
+fn boot_keys_wait_for_a_contended_owner_without_spinning() -> TestResult {
+    let Some(held) = KEY_WORK.try_lock() else {
+        return TestResult::Skip("boot key work in use");
+    };
+    if held.is_some() {
+        return TestResult::Skip("boot key work retained");
+    }
+    let driver = Woken::new();
+    let mut finish = pin!(finish_boot_keys());
+    if driver.run_for(finish.as_mut(), 20).is_some() {
+        return TestResult::Fail("finished while the owner lock was held");
+    }
+    let spun = driver.polls.get();
+    drop(held);
+    if driver.run_for(finish.as_mut(), 10) != Some(Ok(())) {
+        return TestResult::Fail("release of the owner lock did not resume the wait");
+    }
+    if spun > 2 {
+        return TestResult::Fail("contended owner lock was re-polled every round");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport/pace",
+    boot_keys_wait_for_a_contended_owner_without_spinning
+);

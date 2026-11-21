@@ -254,7 +254,10 @@ an already-established process root: it resolves a filesystem-backed
 `PT_INTERP` beneath an explicit mounted-root prefix, and the caller installs
 that same root on the reserved task before making it runnable. This permits a
 dynamic service manager to be the direct PID 1 without a userspace chroot
-launcher.
+launcher. `user_task::init_task_spec()` is the scheduling spec that PID 1
+starts with: `TaskSpec::user_task()`, allowed on every online CPU, as Linux
+moves init off the boot CPU (`sched_init_smp`). It is not pinned to the
+boot CPU.
 
 A task root is stored as a directory's canonical host path (no trailing `/`
 except `/` itself, no empty or dot components), and a task's `/` joins to

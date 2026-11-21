@@ -143,9 +143,14 @@ fn drain_dump_write(write: OwnedDumpWrite) {
     // A pending filesystem write may own DMA or transaction resources. Keep
     // its owned file and buffer alive until terminal completion; this task
     // never refers to the dying process's address space or borrowed memory.
-    narf_scheduler::spawn(async move {
-        let _ = write.await;
-    });
+    // On any CPU, like the dumping task it finishes for: it may hold the
+    // filesystem's transaction.
+    narf_scheduler::spawn_with_spec(
+        async move {
+            let _ = write.await;
+        },
+        narf_scheduler::TaskSpec::kernel_any(),
+    );
 }
 
 /// One already-authorized file write, with a SIGKILL wake independent of

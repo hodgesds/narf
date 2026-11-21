@@ -3,7 +3,7 @@
 
 use super::*;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -17,7 +17,16 @@ struct HubFirmware {
     powered: AtomicU16,
     reject_select: bool,
     requests: IrqSafeSpinLock<Vec<HubRequest>>,
+    /// GET_STATUS reads of `LATE_PORT`; it connects on the second.
+    late_reads: AtomicU16,
+    /// C_PORT_CONNECTION of `LATE_PORT` is set.
+    late_change: AtomicBool,
+    /// The status-change endpoint as configured and submitted.
+    status_ep: IrqSafeSpinLock<Option<(EndpointConfig, u8, u32)>>,
 }
+
+/// The downstream port whose device connects only after the first walk.
+const LATE_PORT: u16 = 2;
 
 impl HubFirmware {
     fn new(reject_select: bool) -> Self {
@@ -28,6 +37,9 @@ impl HubFirmware {
             powered: AtomicU16::new(0),
             reject_select,
             requests: IrqSafeSpinLock::new(Vec::new()),
+            late_reads: AtomicU16::new(0),
+            late_change: AtomicBool::new(false),
+            status_ep: IrqSafeSpinLock::new(None),
         }
     }
 }
@@ -39,6 +51,24 @@ impl HubTransport for HubFirmware {
         request: HubRequest,
         data: &'a mut [u8],
     ) -> Result<usize, xhci::XhciError> {
+        if slot == 7 && request.kind == 0xa3 && request.code == 0 && data.len() == 4 {
+            // GET_STATUS(port): LATE_PORT's device connects between the
+            // first and second read, latching C_PORT_CONNECTION.
+            let mut status = 0u32;
+            if request.index == LATE_PORT {
+                if self.late_reads.fetch_add(1, Ordering::AcqRel) == 1 {
+                    self.late_change.store(true, Ordering::Release);
+                }
+                if self.late_reads.load(Ordering::Acquire) >= 2 {
+                    status |= u32::from(PSTAT_CONNECTION);
+                }
+                if self.late_change.load(Ordering::Acquire) {
+                    status |= 1 << 16;
+                }
+            }
+            data.copy_from_slice(&status.to_le_bytes());
+            return Ok(4);
+        }
         if slot != 7
             || request
                 != (HubRequest {
@@ -83,7 +113,46 @@ impl HubTransport for HubFirmware {
                 self.powered.fetch_or(1 << port, Ordering::AcqRel);
                 Ok(0)
             }
+            HubRequest {
+                kind: 0x23,
+                code: 1,
+                value: C_PORT_CONNECTION,
+                index: LATE_PORT,
+            } => {
+                self.late_change.store(false, Ordering::Release);
+                Ok(0)
+            }
+            HubRequest {
+                kind: 0x23,
+                code: 1,
+                ..
+            } => Ok(0),
             _ => Err(xhci::XhciError::CmdFailed(6)),
+        }
+    }
+
+    async fn configure_status(
+        &self,
+        slot: u8,
+        endpoint: EndpointConfig,
+    ) -> Result<(), xhci::XhciError> {
+        if slot != 7 {
+            return Err(xhci::XhciError::CmdFailed(0xfd));
+        }
+        *self.status_ep.lock() = Some((endpoint, 0, 0));
+        Ok(())
+    }
+
+    fn arm_status(&self, slot: u8, dci: u8, len: u32) -> Result<(), xhci::XhciError> {
+        let mut g = self.status_ep.lock();
+        match g.as_mut() {
+            Some(entry) if slot == 7 => {
+                entry.1 = dci;
+                entry.2 = len;
+                Ok(())
+            }
+            // Submitting before the endpoint exists fails on hardware.
+            _ => Err(xhci::XhciError::NotReady),
         }
     }
 }
@@ -234,4 +303,84 @@ fn smoke_hub_selects_advertised_interface_and_alternate() -> TestResult {
 kernel_test_in!(
     "drivers/usb/hub",
     smoke_hub_selects_advertised_interface_and_alternate
+);
+
+fn single_tt_hub(firmware: &mut HubFirmware) -> Option<UsbHub> {
+    firmware.wanted_alternate = 0;
+    narf_scheduler::block_on_spin(UsbHub::attach_transport(
+        firmware,
+        7,
+        0,
+        HUB_PROTOCOL_SINGLE_TT,
+        PortSpeed::High,
+        &VIA_DESCRIPTORS[18..],
+    ))
+    .ok()
+}
+
+/// Linux `hub_activate` submits the hub's status-change interrupt URB,
+/// so a port change arrives as a Transfer Event (`hub_irq` →
+/// `kick_hub_wq`) rather than waiting for a timer-driven walk. The VIA
+/// hub's first interface endpoint is that endpoint (0x81, interrupt,
+/// 1-byte bitmap, bInterval 12): it is added to the slot, then armed.
+fn smoke_hub_activate_submits_status_change_endpoint() -> TestResult {
+    let mut firmware = HubFirmware::new(true);
+    let Some(mut hub) = single_tt_hub(&mut firmware) else {
+        return TestResult::Fail("single-TT hub attach failed");
+    };
+    let Some(status) = hub.status else {
+        return TestResult::Fail("hub's status-change endpoint not found");
+    };
+    if status.endpoint.ep_addr != 0x81
+        || status.endpoint.kind != EndpointKind::InterruptIn
+        || status.endpoint.interval != 12
+        || status.dci != 3
+        || status.len != 1
+    {
+        return TestResult::Fail("status-change endpoint decoded wrong");
+    }
+    if narf_scheduler::block_on_spin(hub.activate_transport(&firmware)).is_err() {
+        return TestResult::Fail("hub activation failed");
+    }
+    match *firmware.status_ep.lock() {
+        Some((endpoint, 3, 1)) if endpoint == status.endpoint => {}
+        _ => return TestResult::Fail("status-change endpoint was not configured and submitted"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/hub",
+    smoke_hub_activate_submits_status_change_endpoint
+);
+
+/// A device that connects only after the hub's first walk is found by
+/// the next walk, and its C_PORT_CONNECTION is acknowledged (Linux
+/// `port_event` / `hub_port_connect_change`): a change bit left set
+/// keeps the hub reporting the port on its status-change endpoint every
+/// interval. No controller event is involved — only GET_STATUS.
+fn smoke_hub_late_connect_is_found_and_acknowledged() -> TestResult {
+    let mut firmware = HubFirmware::new(true);
+    let Some(hub) = single_tt_hub(&mut firmware) else {
+        return TestResult::Fail("single-TT hub attach failed");
+    };
+    let first = narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware));
+    if !first.is_empty() {
+        return TestResult::Fail("a port reported connected before its device arrived");
+    }
+    let second = narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware));
+    if second != [LATE_PORT as u8] {
+        return TestResult::Fail("the late-connecting port was not found by the next walk");
+    }
+    if firmware.late_change.load(Ordering::Acquire) {
+        return TestResult::Fail("C_PORT_CONNECTION was never acknowledged");
+    }
+    let third = narf_scheduler::block_on_spin(hub.connected_downstream_ports_transport(&firmware));
+    if third != [LATE_PORT as u8] {
+        return TestResult::Fail("a connected port dropped out after its change was acknowledged");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/hub",
+    smoke_hub_late_connect_is_found_and_acknowledged
 );

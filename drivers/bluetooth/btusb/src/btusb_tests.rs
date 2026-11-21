@@ -514,3 +514,58 @@ fn smoke_btusb_local_version_skips_status() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/btusb", smoke_btusb_local_version_skips_status);
+
+/// The transport's SCO paths are called from inside executor polls —
+/// the HCI pump task's `pump_once` calls `recv_sco` every step — where
+/// the halting `block_on` panics ("called from inside executor poll").
+/// They poll a staged iso TD or bridge with `block_on_spin`, as the ACL
+/// paths do, so each returns inside a task poll. The device is absent
+/// (an idle slot), so every transfer fails fast.
+fn smoke_btusb_sco_paths_run_inside_an_executor_poll() -> TestResult {
+    use crate::btusb::__test_transport_with_sco;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_bluetooth::hci::Event;
+    use narf_bluetooth::transport::HciTransport;
+
+    let Some(c) = crate::xhci::first_controller() else {
+        return TestResult::Skip("no xHCI controller");
+    };
+    let slot = c.max_slots();
+    if c.device_generation(slot).is_some() {
+        return TestResult::Skip("no idle slot");
+    }
+    let t = Arc::new(__test_transport_with_sco(c.id(), slot));
+    // A SCO link is up, so `recv_sco` stages an iso-IN TD.
+    t.__test_note_event(&Event {
+        code: 0x2c,
+        params: alloc::vec![0, 0x40, 0x00, 1, 2, 3, 4, 5, 6, 0x02, 0, 0, 0, 0, 0, 0, 0],
+    });
+    let done = Arc::new(AtomicUsize::new(0));
+    {
+        let t = t.clone();
+        let done = done.clone();
+        let _ = narf_scheduler::spawn(async move {
+            let _ = t.recv_sco();
+            let _ = t.send_sco(&[0x40, 0x00, 1, 0xAA]);
+            // Switching down to alt 2 issues SET_INTERFACE.
+            let _ = t.select_sco_alt_setting(0);
+            done.store(1, Ordering::Release);
+        });
+    }
+    let finished = narf_scheduler::responsive_spin_until(
+        || {
+            let _ = narf_scheduler::poll_one_round();
+            done.load(Ordering::Acquire) == 1
+        },
+        narf_time::Deadline::after_ms(3_000),
+    );
+    if !finished {
+        return TestResult::Fail("SCO transport calls did not return inside an executor poll");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/btusb/sco",
+    smoke_btusb_sco_paths_run_inside_an_executor_poll
+);

@@ -118,6 +118,14 @@ const VERB_SET_CONVERTER_FORMAT: u32 = 0x2 << 16;
 const VERB_SET_CONVERTER_STREAM: u32 = 0x706 << 8;
 /// Set Pin Widget Control. Payload bit 6 (out-enable), bit 7 (HP-amp).
 const VERB_SET_PIN_WIDGET_CONTROL: u32 = 0x707 << 8;
+/// `AC_VERB_SET_UNSOLICITED_ENABLE` with `AC_USRSP_EN`; the tag goes in bits 5:0.
+const VERB_SET_UNSOLICITED_ENABLE: u32 = (0x708 << 8) | 0x80;
+/// `AC_PINCAP_PRES_DETECT`.
+const PINCAP_PRES_DETECT: u32 = 1 << 2;
+/// `AC_DEFCFG_MISC_NO_PRESENCE` (pin config Misc bit 0).
+const DEFCFG_MISC_NO_PRESENCE: u8 = 1;
+/// `AZX_RIRB_EX_UNSOL_EV`: the response is unsolicited.
+const RIRB_EX_UNSOL: u32 = 1 << 4;
 /// Set Amp Gain/Mute. Payload encodes output(15)/input(14)/L(13)/R(12)
 /// + index (8..11) + mute (7) + gain (0..6).
 const VERB_SET_AMP_GAIN_MUTE: u32 = 0x3 << 16;

@@ -91,6 +91,16 @@ pub struct IntelHda {
     /// The stream service task, parked while no stream runs; a stream
     /// start (and teardown) wakes it.
     service_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Jack state to re-read (Linux `hda_jack_tbl.jack_dirty`): set at
+    /// probe and resume (`snd_hda_jack_set_dirty_all`), by an unsolicited
+    /// response (`snd_hda_jack_unsol_event`) and by the jackpoll of a
+    /// controller without an interrupt.
+    jack_dirty: AtomicBool,
+    /// The jack service while it waits for a jack event.
+    jack_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Unsolicited-response tags given to jack pins (bit per tag): a
+    /// response with any other tag is no jack's (`snd_hda_jack_tbl_get_from_tag`).
+    jack_tags: core::sync::atomic::AtomicU64,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -101,6 +111,10 @@ impl core::fmt::Debug for IntelHda {
             .finish()
     }
 }
+
+/// A codec command's response timeout (Linux `azx_rirb_get_response`
+/// waits up to 1 s before falling back to polling; NARF bounds it at 100 ms).
+const COMMAND_TIMEOUT_MS: u64 = 100;
 
 pub(super) fn wait(mut predicate: impl FnMut() -> bool, ms: u64) -> bool {
     narf_scheduler::responsive_spin_until(&mut predicate, Deadline::after_ms(ms))
@@ -258,6 +272,9 @@ impl IntelHda {
             card: AtomicU32::new(u32::MAX),
             suspended: AtomicBool::new(false),
             service_waker: IrqSafeSpinLock::new(None),
+            jack_dirty: AtomicBool::new(true),
+            jack_waker: IrqSafeSpinLock::new(None),
+            jack_tags: core::sync::atomic::AtomicU64::new(0),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -437,6 +454,7 @@ impl IntelHda {
                 },
             );
         }
+        let _ = dev.enable_jack_events();
         Ok(dev)
     }
 
@@ -692,6 +710,20 @@ impl IntelHda {
             pending: false,
         })
     }
+    /// The command lease for an async command (`bus->cmd_mutex`): sleep,
+    /// not spin, while another command is in flight, bounded by the command
+    /// timeout, so a jack re-read that meets an ALSA command is not lost.
+    async fn acquire_command_async(&self) -> Result<CommandLease<'_>, HdaError> {
+        let deadline = Deadline::after_ms(COMMAND_TIMEOUT_MS);
+        loop {
+            match self.acquire_command() {
+                Err(HdaError::Busy) if !deadline.expired() => {
+                    narf_time::SleepUntil::new(Deadline::after_ms(1).as_instant()).await;
+                }
+                result => return result,
+            }
+        }
+    }
     fn post(&self, verb: u32) -> Result<(), HdaError> {
         let mut state = self.commands.lock();
         let next = (state.wp + 1) & 255;
@@ -718,7 +750,18 @@ impl IntelHda {
         }
         Ok(())
     }
+    /// `snd_hdac_bus_update_rirb` for one command: the reply for `cad`, if
+    /// posted. An unsolicited response met on the way is a jack event
+    /// (`snd_hdac_bus_queue_event`).
     fn response(&self, cad: u8) -> Result<Option<u32>, HdaError> {
+        let mut unsolicited = false;
+        let reply = self.scan_rirb(cad, &mut unsolicited);
+        if unsolicited {
+            self.note_jack_event();
+        }
+        reply
+    }
+    fn scan_rirb(&self, cad: u8, unsolicited: &mut bool) -> Result<Option<u32>, HdaError> {
         if self.irq.failed.load(Ordering::Acquire) {
             return Err(HdaError::DeviceFailed);
         }
@@ -749,9 +792,13 @@ impl IntelHda {
                 let p = self.rirb.cpu_ptr::<u32>().add(state.rp as usize * 2);
                 (p.read_volatile(), p.add(1).read_volatile())
             };
-            // Unsolicited jack events advance RIRB independently of CORB.
-            // Jack state is refreshed by the service task; never use this as a reply.
-            if extra & 0x10 == 0 && extra as u8 & 15 == cad {
+            // Unsolicited jack events advance RIRB independently of CORB:
+            // never a reply; the jack service re-reads the jack.
+            if extra & RIRB_EX_UNSOL != 0 {
+                *unsolicited |= self.is_jack_tag(value);
+                continue;
+            }
+            if extra as u8 & 15 == cad {
                 return Ok(Some(value));
             }
         }
@@ -769,56 +816,181 @@ impl IntelHda {
                 reply = self.response((verb >> 28) as u8);
                 !matches!(reply, Ok(None))
             },
-            100,
+            COMMAND_TIMEOUT_MS,
         );
         if !done {
-            narf_console::write_str(&alloc::format!(
-                "hda: verb {:#x} timeout: CORB wp/rp={:#x}/{:#x} RIRB wp={:#x} ctl={:#x}/{:#x}\n",
-                verb,
-                // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-                unsafe { self.bar0.read16(REG_CORBWP) },
-                // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-                unsafe { self.bar0.read16(REG_CORBRP) },
-                // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-                unsafe { self.bar0.read16(REG_RIRBWP) },
-                // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-                unsafe { self.bar0.read8(REG_CORBCTL) },
-                // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-                unsafe { self.bar0.read8(REG_RIRBCTL) },
-            ));
+            self.report_timeout(verb);
             return Err(HdaError::CommandTimeout);
         }
         let value = reply?.ok_or(HdaError::CommandTimeout)?;
         lease.pending = false;
         Ok(value)
     }
-    /// Bounded IRQ/timer wait. Cancellation poisons the transport until reset,
+    /// `azx_get_response` timed out: the command and ring state.
+    fn report_timeout(&self, verb: u32) {
+        narf_console::write_str(&alloc::format!(
+            "hda: verb {:#x} timeout: CORB wp/rp={:#x}/{:#x} RIRB wp={:#x} ctl={:#x}/{:#x}\n",
+            verb,
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            unsafe { self.bar0.read16(REG_CORBWP) },
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            unsafe { self.bar0.read16(REG_CORBRP) },
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            unsafe { self.bar0.read16(REG_RIRBWP) },
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            unsafe { self.bar0.read8(REG_CORBCTL) },
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            unsafe { self.bar0.read8(REG_RIRBCTL) },
+        ));
+    }
+    /// Bounded IRQ/timer wait (`azx_rirb_get_response` sleeps on
+    /// `bus->rirb_wq`). Every poll re-reads the ring, so a caller that
+    /// re-polls at once (`block_on_spin`) sees the reply as soon as the codec
+    /// posts it, while a task sleeps until the controller's interrupt or the
+    /// 1 ms period. Cancellation poisons the transport until reset,
     /// preventing a late response from being assigned to a subsequent command.
     /// # Safety
     /// Same exclusive device ownership as send_verb.
     pub async unsafe fn send_verb_async(&self, verb: u32) -> Result<u32, HdaError> {
-        let mut lease = self.acquire_command()?;
+        use core::{future::Future, task::Poll};
+        enum Step {
+            Reply(u32),
+            Expired,
+            Rearm,
+        }
+        let mut lease = self.acquire_command_async().await?;
         self.post(verb)?;
         lease.pending = true;
-        let deadline = Deadline::after_ms(100);
+        let deadline = Deadline::after_ms(COMMAND_TIMEOUT_MS);
+        let cad = (verb >> 28) as u8;
         loop {
             // Arm before checking the ring to close the completion/wake race.
             let waiter = self
                 .irq_vector
                 .map(|v| narf_interrupts::wait_for_irq_until(v, Deadline::after_ms(1)));
-            if let Some(value) = self.response((verb >> 28) as u8)? {
-                lease.pending = false;
-                return Ok(value);
-            }
-            if deadline.expired() {
-                return Err(HdaError::CommandTimeout);
-            }
-            if let Some(waiter) = waiter {
-                let _ = waiter.await;
-            } else {
-                narf_time::SleepUntil::new(Deadline::after_ms(1).as_instant()).await;
+            let timer = waiter
+                .is_none()
+                .then(|| narf_time::SleepUntil::new(Deadline::after_ms(1).as_instant()));
+            let mut waiter = core::pin::pin!(waiter);
+            let mut timer = core::pin::pin!(timer);
+            let step = core::future::poll_fn(|cx| {
+                match self.response(cad) {
+                    Err(error) => return Poll::Ready(Err(error)),
+                    Ok(Some(value)) => return Poll::Ready(Ok(Step::Reply(value))),
+                    Ok(None) => {}
+                }
+                if deadline.expired() {
+                    return Poll::Ready(Ok(Step::Expired));
+                }
+                let ended = if let Some(waiter) = waiter.as_mut().as_pin_mut() {
+                    waiter.poll(cx).is_ready()
+                } else if let Some(timer) = timer.as_mut().as_pin_mut() {
+                    timer.poll(cx).is_ready()
+                } else {
+                    true
+                };
+                if ended {
+                    Poll::Ready(Ok(Step::Rearm))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await?;
+            match step {
+                Step::Reply(value) => {
+                    lease.pending = false;
+                    return Ok(value);
+                }
+                Step::Expired => {
+                    self.report_timeout(verb);
+                    return Err(HdaError::CommandTimeout);
+                }
+                Step::Rearm => {}
             }
         }
+    }
+    /// A jack's state changed or must be re-read: mark it and wake the jack
+    /// service.
+    pub(super) fn note_jack_event(&self) {
+        self.jack_dirty.store(true, Ordering::Release);
+        let waker = self.jack_waker.lock().take();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+    /// `snd_hdac_bus_update_rirb` with no command in flight: consume what
+    /// the codecs posted since the last command. An unsolicited response is
+    /// a jack event; a solicited one is a late reply to a command that
+    /// already timed out (Linux logs it as spurious and drops it).
+    pub(super) fn drain_unsolicited(&self) {
+        let Ok(lease) = self.acquire_command() else {
+            return;
+        };
+        let mut unsolicited = false;
+        {
+            let mut state = self.commands.lock();
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            let wp = unsafe { self.bar0.read16(REG_RIRBWP) };
+            if wp != u16::MAX {
+                // SAFETY: as above; acknowledge as `response` does so a
+                // controller counting against RINTCNT keeps writing.
+                unsafe {
+                    let status = self.bar0.read8(REG_RIRBSTS);
+                    self.bar0.write8(REG_RIRBSTS, status & 1);
+                }
+                while state.rp != (wp & 255) {
+                    state.rp = (state.rp + 1) & 255;
+                    if self.noncoherent {
+                        self.rirb.sync(state.rp as usize * 8, 8);
+                    }
+                    fence(Ordering::Acquire);
+                    // SAFETY: Masked RIRB index is within the owned 256-entry coherent completion ring.
+                    let (res, extra) = unsafe {
+                        let p = self.rirb.cpu_ptr::<u32>().add(state.rp as usize * 2);
+                        (p.read_volatile(), p.add(1).read_volatile())
+                    };
+                    unsolicited |= extra & RIRB_EX_UNSOL != 0 && self.is_jack_tag(res);
+                }
+            }
+        }
+        drop(lease);
+        if unsolicited {
+            self.note_jack_event();
+        }
+    }
+    /// Whether an unsolicited response carries a jack's tag
+    /// (`AC_UNSOL_RES_TAG`, bits 31:26).
+    fn is_jack_tag(&self, res: u32) -> bool {
+        let tag = (res >> 26) & 0x3f;
+        tag != 0 && self.jack_tags.load(Ordering::Acquire) & (1 << tag) != 0
+    }
+    /// `snd_hda_jack_detect_enable` for every jack-detectable pin
+    /// (`is_jack_detectable`: presence detect, no NO_PRESENCE override,
+    /// unsolicited capable), tagged in discovery order from 1 as Linux
+    /// allocates jack tags.
+    pub(super) fn enable_jack_events(&self) -> Result<(), HdaError> {
+        let mut pins: Vec<(u8, u8)> = Vec::new();
+        for path in self.outputs.iter().chain(self.inputs.iter()) {
+            let graph = &self.graphs[path.codec];
+            let Some(pin) = graph.widget(path.nodes.pin_nid) else {
+                continue;
+            };
+            let detectable = pin.pin_caps.unwrap_or(0) & PINCAP_PRES_DETECT != 0
+                && pin
+                    .pin_config
+                    .is_none_or(|config| config.misc & DEFCFG_MISC_NO_PRESENCE == 0)
+                && pin.caps.unsol_capable();
+            if detectable && !pins.contains(&(graph.addr, pin.nid)) {
+                pins.push((graph.addr, pin.nid));
+            }
+        }
+        // Tags are 6 bits and 0 is none.
+        for (index, (cad, nid)) in pins.into_iter().enumerate().take(63) {
+            let tag = index as u32 + 1;
+            self.jack_tags.fetch_or(1 << tag, Ordering::AcqRel);
+            self.verb(cad, nid, VERB_SET_UNSOLICITED_ENABLE | tag)?;
+        }
+        Ok(())
     }
     pub fn stream_counts(&self) -> (u8, u8, u8) {
         self.counts
@@ -929,6 +1101,102 @@ impl core::future::Future for StreamsIdle<'_> {
             return core::task::Poll::Ready(Some(()));
         }
         core::task::Poll::Pending
+    }
+}
+
+/// Linux `jackpoll_interval` for a controller that takes no interrupt
+/// (`AZX_DRIVER_LOONGSON`, `bus->not_use_interrupts`: 1500 ms). Any other
+/// controller is driven by unsolicited responses alone (`jackpoll_ms`
+/// defaults to 0).
+const JACKPOLL_MS: u64 = 1500;
+
+/// The controller's jack presence service (Linux `hda_jack`): an unsolicited
+/// response marks the jacks dirty (`snd_hda_jack_unsol_event`) and their
+/// state is re-read (`snd_hda_jack_report_sync`) with commands that sleep on
+/// the response (`send_verb_async`), so a codec that stopped answering never
+/// holds the CPU. Every jack is re-read once at start, as
+/// `snd_hda_jack_report_sync` runs at codec build.
+pub(super) async fn jack_service(weak: alloc::sync::Weak<IntelHda>) {
+    loop {
+        let (irq, poll) = {
+            let Some(dev) = weak.upgrade() else {
+                return;
+            };
+            // Armed before the drain: a response posted after it raises the
+            // interrupt that ends the wait.
+            let irq = dev.irq_vector.map(narf_interrupts::wait_for_irq);
+            dev.drain_unsolicited();
+            let poll = dev
+                .irq_vector
+                .is_none()
+                .then(|| narf_time::SleepUntil::new(Deadline::after_ms(JACKPOLL_MS).as_instant()));
+            (irq, poll)
+        };
+        if (JackWait {
+            weak: &weak,
+            irq,
+            poll,
+        })
+        .await
+        .is_none()
+        {
+            return;
+        }
+        let Some(dev) = weak.upgrade() else {
+            return;
+        };
+        if !dev.suspended.load(Ordering::Acquire) && dev.jack_dirty.swap(false, Ordering::AcqRel) {
+            let _ = dev.refresh_jacks_async().await;
+        }
+    }
+}
+
+/// Parks the jack service until a jack is dirty, the controller interrupts
+/// (its RIRB may hold an unsolicited response) or, without an interrupt,
+/// the jackpoll period ends. `None` once the controller is gone. Holds no
+/// strong reference while parked.
+struct JackWait<'a> {
+    weak: &'a alloc::sync::Weak<IntelHda>,
+    irq: Option<narf_interrupts::WaitForIrq>,
+    poll: Option<narf_time::SleepUntil>,
+}
+
+impl core::future::Future for JackWait<'_> {
+    type Output = Option<()>;
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<()>> {
+        use core::task::Poll;
+        let this = self.get_mut();
+        let Some(dev) = this.weak.upgrade() else {
+            return Poll::Ready(None);
+        };
+        let ready = |dev: &IntelHda| {
+            dev.jack_dirty.load(Ordering::Acquire) && !dev.suspended.load(Ordering::Acquire)
+        };
+        if ready(&dev) {
+            return Poll::Ready(Some(()));
+        }
+        // Register, then re-check, so an event racing this poll wakes us.
+        *dev.jack_waker.lock() = Some(cx.waker().clone());
+        if ready(&dev) {
+            dev.jack_waker.lock().take();
+            return Poll::Ready(Some(()));
+        }
+        if let Some(irq) = this.irq.as_mut() {
+            if core::pin::Pin::new(irq).poll(cx).is_ready() {
+                return Poll::Ready(Some(()));
+            }
+        }
+        if let Some(timer) = this.poll.as_mut() {
+            if core::pin::Pin::new(timer).poll(cx).is_ready() {
+                // Polling re-reads every jack (`snd_hda_jack_set_dirty_all`).
+                dev.jack_dirty.store(true, Ordering::Release);
+                return Poll::Ready(Some(()));
+            }
+        }
+        Poll::Pending
     }
 }
 
@@ -1182,7 +1450,9 @@ impl IntelHda {
                 }
             }
         }
+        let _ = self.enable_jack_events();
         self.suspended.store(false, Ordering::Release);
+        self.note_jack_event();
         Ok(())
     }
 
@@ -1284,8 +1554,12 @@ impl Drop for CommandLease<'_> {
 }
 impl Drop for IntelHda {
     fn drop(&mut self) {
-        // The parked service task sees the controller gone and exits.
+        // The parked service tasks see the controller gone and exit.
         self.kick_service();
+        let waker = self.jack_waker.lock().take();
+        if let Some(w) = waker {
+            w.wake();
+        }
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         unsafe {
             self.bar0.write32(REG_INTCTL, 0);
@@ -1425,18 +1699,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             dev.service();
         }
     });
-    let weak = Arc::downgrade(&dev);
-    narf_scheduler::spawn(async move {
-        loop {
-            narf_time::SleepUntil::new(Deadline::after_ms(100).as_instant()).await;
-            let Some(dev) = weak.upgrade() else {
-                break;
-            };
-            if !dev.suspended.load(Ordering::Acquire) {
-                let _ = dev.refresh_jacks();
-            }
-        }
-    });
+    narf_scheduler::spawn(jack_service(Arc::downgrade(&dev)));
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: "hda".into(),
         kind: narf_drivers::BoundKind::Audio,

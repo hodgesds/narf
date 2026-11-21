@@ -30,6 +30,14 @@
 //!   reached it. The soft and hard detectors cannot see it, since the CPU is
 //!   halted.
 //!
+//! * **Runnable but not dispatched** — Linux's workqueue watchdog again
+//!   (`wq_watchdog_timer_fn`, `show_cpu_pool_hog`), at task granularity: a
+//!   task that has sat runnable on one CPU (its ready queue, wake inbox or
+//!   woken-parked set) for `workqueue.watchdog_thresh` seconds without being
+//!   dispatched. The executor-lockup detector judges only halted CPUs and the
+//!   run-delay report fires only at dispatch, so a task that never runs on an
+//!   awake CPU is seen by neither. [`RunnableWatch`] reports it once per stall.
+//!
 //! Reports follow Linux: a soft lockup is re-reported every soft threshold
 //! while it lasts (`update_report_ts`), a hard lockup once per episode
 //! (`watchdog_hardlockup_warned`).
@@ -234,6 +242,235 @@ impl<const CPUS: usize> LockupWatch<CPUS> {
 }
 
 impl<const CPUS: usize> Default for LockupWatch<CPUS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── runnable-but-not-dispatched (Linux `wq_watchdog_timer_fn`) ──────────
+
+/// Default for `workqueue.watchdog_thresh`, seconds: how long a task may
+/// sit runnable on a CPU without being dispatched before it is reported.
+/// Linux's workqueue default is 30 s; NARF's executor dispatches every
+/// runnable task within a scheduling round, so a third of that is already
+/// a stall.
+pub const RUNNABLE_THRESH_SECS: u64 = 10;
+
+/// One CPU's oldest runnable-but-not-dispatched task, as sampled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RunnableSample {
+    /// The task's scheduler id.
+    pub task: u64,
+    /// When it became runnable without running since, on the same clock
+    /// as the `now` and `thresh` it is judged against (the caller's choice:
+    /// the scheduler stamps cycles). Zero is never a valid stamp.
+    pub since: u64,
+}
+
+#[derive(Debug)]
+struct RunnableCpu {
+    task: AtomicU64,
+    since: AtomicU64,
+    reported: AtomicBool,
+}
+
+impl RunnableCpu {
+    const fn new() -> Self {
+        Self {
+            task: AtomicU64::new(0),
+            since: AtomicU64::new(0),
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    fn clear(&self) {
+        self.task.store(0, Ordering::Relaxed);
+        self.since.store(0, Ordering::Relaxed);
+        self.reported.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Per-CPU state of the runnable-task watchdog: which stall each CPU was
+/// last seen in and whether it has been reported.
+///
+/// A stall is one task runnable since one instant. It is reported once,
+/// when it has lasted the threshold and was already seen, unchanged, by the
+/// previous round: a single sample can catch a wake between setting its
+/// task's runnable bit and stamping the time, so one sighting is never
+/// enough. The task running (the CPU's oldest runnable task or its stamp
+/// changing) ends the stall; a later one is reported again.
+#[derive(Debug)]
+pub struct RunnableWatch<const CPUS: usize> {
+    cpus: [RunnableCpu; CPUS],
+}
+
+impl<const CPUS: usize> RunnableWatch<CPUS> {
+    /// Fresh state: nothing seen.
+    pub const fn new() -> Self {
+        Self {
+            cpus: [const { RunnableCpu::new() }; CPUS],
+        }
+    }
+
+    /// Judge `cpu`'s oldest runnable task `sample` (`None`: nothing
+    /// runnable is waiting) at `now` against `thresh`
+    /// (`workqueue.watchdog_thresh`; zero disables), all on one clock.
+    /// Returns how long the task has waited when this stall is due its one
+    /// report.
+    pub fn observe(
+        &self,
+        cpu: usize,
+        sample: Option<RunnableSample>,
+        now: u64,
+        thresh: u64,
+    ) -> Option<u64> {
+        let c = self.cpus.get(cpu)?;
+        let Some(s) = sample.filter(|s| thresh != 0 && s.since != 0) else {
+            c.clear();
+            return None;
+        };
+        if c.task.load(Ordering::Relaxed) != s.task || c.since.load(Ordering::Relaxed) != s.since {
+            c.task.store(s.task, Ordering::Relaxed);
+            c.since.store(s.since, Ordering::Relaxed);
+            c.reported.store(false, Ordering::Relaxed);
+            return None;
+        }
+        let waited = now.saturating_sub(s.since);
+        if waited < thresh || c.reported.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        Some(waited)
+    }
+}
+
+impl<const CPUS: usize> Default for RunnableWatch<CPUS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── per-CPU hard-IRQ share and interrupt storms ─────────────────────────
+
+/// Vectors an [`IrqShare`] keeps, busiest first.
+pub const IRQ_TOP_N: usize = 3;
+
+/// One CPU's interrupts over one watchdog window: how many, and the
+/// busiest vectors. Built by [`Self::add`]ing each vector's count; no
+/// allocation, so the timer interrupt can build it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct IrqShare {
+    /// Interrupts of every vector in the window.
+    pub total: u64,
+    /// `(vector, count)`, busiest first; unused entries have count 0.
+    pub top: [(u8, u64); IRQ_TOP_N],
+}
+
+impl IrqShare {
+    /// Count `count` interrupts of `vector`.
+    pub fn add(&mut self, vector: u8, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.total = self.total.saturating_add(count);
+        let Some(at) = self.top.iter().position(|&(_, c)| count > c) else {
+            return;
+        };
+        self.top.copy_within(at..IRQ_TOP_N - 1, at + 1);
+        self.top[at] = (vector, count);
+    }
+
+    /// The busiest vector, if any interrupt was counted.
+    pub fn busiest(&self) -> Option<(u8, u64)> {
+        Some(self.top[0]).filter(|&(_, c)| c != 0)
+    }
+}
+
+/// `count` events over `elapsed_ns` as a rate per second (0 for an empty
+/// window).
+pub fn per_sec(count: u64, elapsed_ns: u64) -> u64 {
+    if elapsed_ns == 0 {
+        return 0;
+    }
+    ((count as u128 * 1_000_000_000) / elapsed_ns as u128).min(u64::MAX as u128) as u64
+}
+
+/// `part` of `whole` in tenths of a percent, capped at 1000.
+pub fn permille(part: u64, whole: u64) -> u64 {
+    if whole == 0 {
+        return 0;
+    }
+    ((part as u128 * 1000) / whole as u128).min(1000) as u64
+}
+
+/// A single vector at or above this many interrupts a second on one CPU is
+/// a storm worth naming: far past any timer, and past what a busy device
+/// with interrupt moderation raises.
+pub const IRQ_STORM_RATE: u64 = 100_000;
+
+/// Consecutive watchdog windows (about a second each) a storm must last
+/// before it is reported.
+pub const IRQ_STORM_WINDOWS: u64 = 5;
+
+#[derive(Debug)]
+struct StormCpu {
+    /// Vector + 1 of the storm being watched, 0 for none.
+    vector: AtomicU64,
+    windows: AtomicU64,
+    reported: AtomicBool,
+}
+
+/// Per-CPU interrupt-storm detector: a CPU whose busiest vector stays at
+/// or above [`IRQ_STORM_RATE`] for [`IRQ_STORM_WINDOWS`] windows is
+/// reported once per episode. It only reports; the unhandled-IRQ detector
+/// is what disables a vector. A storm of handled interrupts is a device
+/// doing what it was told, too often, and starves whatever else that CPU
+/// runs, which is what the report is for.
+#[derive(Debug)]
+pub struct IrqStormWatch<const CPUS: usize> {
+    cpus: [StormCpu; CPUS],
+}
+
+impl<const CPUS: usize> IrqStormWatch<CPUS> {
+    /// Fresh state: no storm.
+    pub const fn new() -> Self {
+        Self {
+            cpus: [const {
+                StormCpu {
+                    vector: AtomicU64::new(0),
+                    windows: AtomicU64::new(0),
+                    reported: AtomicBool::new(false),
+                }
+            }; CPUS],
+        }
+    }
+
+    /// Judge `cpu`'s busiest vector over the window just ended,
+    /// `(vector, rate per second)`. Returns `(vector, windows)` when the
+    /// storm is due its one report.
+    pub fn observe(&self, cpu: usize, busiest: Option<(u8, u64)>) -> Option<(u8, u64)> {
+        let c = self.cpus.get(cpu)?;
+        let Some((vector, _)) = busiest.filter(|&(_, rate)| rate >= IRQ_STORM_RATE) else {
+            c.vector.store(0, Ordering::Relaxed);
+            c.windows.store(0, Ordering::Relaxed);
+            c.reported.store(false, Ordering::Relaxed);
+            return None;
+        };
+        let key = vector as u64 + 1;
+        if c.vector.swap(key, Ordering::Relaxed) != key {
+            c.windows.store(1, Ordering::Relaxed);
+            c.reported.store(false, Ordering::Relaxed);
+        } else {
+            c.windows.fetch_add(1, Ordering::Relaxed);
+        }
+        let windows = c.windows.load(Ordering::Relaxed);
+        if windows < IRQ_STORM_WINDOWS || c.reported.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        Some((vector, windows))
+    }
+}
+
+impl<const CPUS: usize> Default for IrqStormWatch<CPUS> {
     fn default() -> Self {
         Self::new()
     }

@@ -1366,6 +1366,108 @@ pub fn check_hung_tasks(now_ns: u64, timeout_ns: u64, warnings: &AtomicU64) -> u
     hung
 }
 
+/// The kernel half of Linux `check_hung_uninterruptible_tasks`: report
+/// every uninterruptible kernel wait ([`narf_lib::hung_task`] — an async
+/// mutex waiter, a btrfs transaction join or close) that has lasted
+/// `timeout_ns` (0 disables), sharing `warnings` with [`check_hung_tasks`].
+/// Returns how many were hung this round, reported or not.
+///
+/// A user task parked in an uninterruptible syscall wait is
+/// [`check_hung_tasks`]'s to report (with its pid and park site) and is
+/// skipped here. Each report names the task (a kernel task by its future's
+/// function, as Linux names a kthread), how long, the kind of wait, the
+/// call that waits, the lock or gate, and the kind's detail — the waiter
+/// id, the closing task, the operations still joined.
+///
+/// Runs from the stall watchdog's timer tick: the registry scan is
+/// lock-free and nothing here allocates or waits for a lock.
+pub fn check_hung_kernel_tasks(now_ns: u64, timeout_ns: u64, warnings: &AtomicU64) -> usize {
+    use core::fmt::Write as _;
+    if timeout_ns == 0 {
+        return 0;
+    }
+    let mut hung = 0;
+    narf_lib::hung_task::for_each_blocked(|w| {
+        let blocked_ns = now_ns.saturating_sub(w.since_ns);
+        if blocked_ns < timeout_ns {
+            return;
+        }
+        let anonymous = narf_lib::hung_task::owner_is_anonymous(w.owner);
+        let user = if anonymous {
+            None
+        } else {
+            try_with_task(w.owner, |t| {
+                (in_uninterruptible_park(t), t.pid.load(Ordering::Relaxed))
+            })
+        };
+        if user.is_some_and(|(parked, _)| parked) {
+            return;
+        }
+        hung += 1;
+        let left = warnings.load(Ordering::Relaxed);
+        if left == 0 {
+            return;
+        }
+        if left != u64::MAX {
+            warnings.store(left - 1, Ordering::Relaxed);
+        }
+        let origin = if anonymous || user.is_some() {
+            None
+        } else {
+            narf_scheduler::dbg_task_origin(w.owner)
+        };
+        let secs = blocked_ns / 1_000_000_000;
+        let mut out = narf_console::TrapWriter;
+        let _ = match (anonymous, user, origin) {
+            (true, _, _) => writeln!(
+                out,
+                "INFO: task block_on/{}:0 blocked for more than {secs} seconds.",
+                w.owner & !(1 << 63)
+            ),
+            (false, Some((_, pid)), _) => {
+                let mut comm = [0u8; 16];
+                let n = crate::handlers::proc_comm_of_task_into(w.owner, &mut comm);
+                let comm = core::str::from_utf8(&comm[..n]).unwrap_or("?");
+                writeln!(
+                    out,
+                    "INFO: task {comm}:{pid} blocked for more than {secs} seconds."
+                )
+            }
+            (false, None, origin) => writeln!(
+                out,
+                "INFO: task {}:{} blocked for more than {secs} seconds.",
+                origin.map_or("kworker", |(o, _)| narf_scheduler::origin_comm(o)),
+                w.owner
+            ),
+        };
+        let (site_file, site_line) = w.site.map_or(("?", 0), |s| (s.file(), s.line()));
+        let _ = writeln!(
+            out,
+            "      task={} state=D wait=\"{}\" at {site_file}:{site_line} object={:#x} {}={}",
+            w.owner, w.kind.name, w.object, w.kind.detail, w.detail
+        );
+        if let Some((origin, spawned)) = origin {
+            let _ = writeln!(
+                out,
+                "      kernel task {origin} spawned at {}:{}",
+                spawned.file(),
+                spawned.line()
+            );
+        }
+        let _ = writeln!(
+            out,
+            "\"sysctl.kernel.hung_task_timeout_secs=0\" on the kernel command line disables this message."
+        );
+        if left == 1 {
+            let _ = writeln!(
+                out,
+                "Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings"
+            );
+        }
+    });
+    hung
+}
+
 /// Parked tasks whose epoll set already reports a ready descriptor —
 /// `(tid, pid, epfd)` for each.
 ///

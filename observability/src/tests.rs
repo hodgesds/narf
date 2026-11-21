@@ -1135,3 +1135,148 @@ fn smoke_obs_watchdog_gap_and_disable() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("observability/watchdog", smoke_obs_watchdog_gap_and_disable);
+
+/// Runnable-but-not-dispatched (Linux `wq_watchdog_timer_fn` per task): a
+/// task runnable since one instant is reported once, when it has waited the
+/// threshold and the previous round already saw the same stall; it running
+/// (a new stamp) or leaving ends the stall, and a later one reports again.
+/// A single sighting never reports, and a zero threshold disables it.
+fn smoke_obs_watchdog_runnable_task_reported_once_per_stall() -> TestResult {
+    use crate::watchdog::{RunnableSample, RunnableWatch, RUNNABLE_THRESH_SECS};
+    let thresh = RUNNABLE_THRESH_SECS * WD_SEC;
+    let w: RunnableWatch<2> = RunnableWatch::new();
+    let stuck = Some(RunnableSample {
+        task: 42,
+        since: WD_SEC,
+    });
+    let mut reports = alloc::vec::Vec::new();
+    for t in 1..=40u64 {
+        if let Some(waited) = w.observe(0, stuck, t * WD_SEC, thresh) {
+            reports.push((t, waited));
+        }
+        // The other CPU keeps running its work: a fresh stamp every round.
+        let fresh = Some(RunnableSample {
+            task: 7,
+            since: t * WD_SEC,
+        });
+        if w.observe(1, fresh, t * WD_SEC + 1, thresh).is_some() {
+            return TestResult::Fail("a task that keeps running was reported");
+        }
+    }
+    if reports[..] != [(11, 10 * WD_SEC)][..] {
+        return TestResult::Fail("a stranded runnable task was not reported exactly once");
+    }
+    // A stall seen for the first time past the threshold (the probe missed
+    // the earlier rounds) waits one round for confirmation.
+    let late = Some(RunnableSample {
+        task: 9,
+        since: 50 * WD_SEC,
+    });
+    if w.observe(0, late, 100 * WD_SEC, thresh).is_some() {
+        return TestResult::Fail("reported on a single sighting");
+    }
+    if w.observe(0, late, 101 * WD_SEC, thresh) != Some(51 * WD_SEC) {
+        return TestResult::Fail("a confirmed new stall was not reported");
+    }
+    // The task ran and the CPU emptied; the same task stranded again later
+    // is a new stall.
+    let _ = w.observe(0, None, 102 * WD_SEC, thresh);
+    let again = Some(RunnableSample {
+        task: 9,
+        since: 103 * WD_SEC,
+    });
+    let _ = w.observe(0, again, 110 * WD_SEC, thresh);
+    if w.observe(0, again, 113 * WD_SEC, thresh) != Some(10 * WD_SEC) {
+        return TestResult::Fail("a second stall of the same task was not reported");
+    }
+    let off: RunnableWatch<1> = RunnableWatch::new();
+    for t in 1..=100u64 {
+        if off.observe(0, stuck, t * WD_SEC, 0).is_some() {
+            return TestResult::Fail("workqueue.watchdog_thresh=0 must disable the report");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_runnable_task_reported_once_per_stall
+);
+
+/// The per-CPU hard-IRQ share every stall dump prints: the window's total,
+/// its busiest vectors in order, rates per second over the measured window
+/// and the hard-IRQ time fraction in tenths of a percent.
+fn smoke_obs_watchdog_irq_share_ranks_vectors_and_rates() -> TestResult {
+    use crate::watchdog::{per_sec, permille, IrqShare};
+    let mut share = IrqShare::default();
+    for (vector, count) in [
+        (32u8, 1_000u64),
+        (65, 250_000),
+        (0xF1, 40),
+        (70, 0),
+        (66, 3_000),
+    ] {
+        share.add(vector, count);
+    }
+    if share.total != 254_040 || share.top != [(65, 250_000), (66, 3_000), (32, 1_000)] {
+        return TestResult::Fail("busiest vectors not ranked, or the total is wrong");
+    }
+    if share.busiest() != Some((65, 250_000)) || IrqShare::default().busiest().is_some() {
+        return TestResult::Fail("busiest vector of a window wrong");
+    }
+    // A 2 s window: half the count per second; an empty window is no rate.
+    if per_sec(250_000, 2 * WD_SEC) != 125_000 || per_sec(5, 0) != 0 {
+        return TestResult::Fail("per-second rate over the measured window wrong");
+    }
+    if permille(873, 1000) != 873 || permille(5, 4) != 1000 || permille(1, 0) != 0 {
+        return TestResult::Fail("hard-IRQ time fraction wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_irq_share_ranks_vectors_and_rates
+);
+
+/// An interrupt storm (one vector at `IRQ_STORM_RATE` or more on one CPU for
+/// `IRQ_STORM_WINDOWS` windows) is reported once per episode; a storm that
+/// moves to another vector, or pauses, starts a new episode; a busy but
+/// ordinary rate never reports.
+fn smoke_obs_watchdog_irq_storm_reported_once() -> TestResult {
+    use crate::watchdog::{IrqStormWatch, IRQ_STORM_RATE, IRQ_STORM_WINDOWS};
+    let w: IrqStormWatch<2> = IrqStormWatch::new();
+    let storm = Some((65u8, IRQ_STORM_RATE * 3));
+    let mut reports = alloc::vec::Vec::new();
+    for window in 1..=20u64 {
+        if let Some(r) = w.observe(0, storm) {
+            reports.push((window, r));
+        }
+        if w.observe(1, Some((32, IRQ_STORM_RATE - 1))).is_some() {
+            return TestResult::Fail("a rate under the storm threshold was reported");
+        }
+    }
+    if reports[..] != [(IRQ_STORM_WINDOWS, (65, IRQ_STORM_WINDOWS))][..] {
+        return TestResult::Fail("a sustained storm was not reported exactly once");
+    }
+    // The storm moves to another vector: a new episode.
+    let mut moved = None;
+    for window in 1..=IRQ_STORM_WINDOWS {
+        if let Some(r) = w.observe(0, Some((66, IRQ_STORM_RATE))) {
+            moved = Some((window, r));
+        }
+    }
+    if moved != Some((IRQ_STORM_WINDOWS, (66, IRQ_STORM_WINDOWS))) {
+        return TestResult::Fail("a storm on a new vector was not a new episode");
+    }
+    // A quiet window ends it; a short burst after does not report.
+    let _ = w.observe(0, None);
+    for _ in 1..IRQ_STORM_WINDOWS {
+        if w.observe(0, Some((66, IRQ_STORM_RATE))).is_some() {
+            return TestResult::Fail("a burst shorter than the storm window was reported");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_irq_storm_reported_once
+);

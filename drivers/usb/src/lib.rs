@@ -593,17 +593,20 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // their ports before the first such pump, just as in Phase 7.
             resume_bound_ports(c).await;
             let mut attempted = false;
-            for step in 0..connected_root.len() {
-                let idx = (next_root_idx + step) % connected_root.len();
-                let p = connected_root[idx];
+            // One port per cycle, so the hubs' ports (Phase 2) are walked
+            // between root ports; the cycle does not park while another
+            // port is still to be tried (see the end of the loop).
+            let attempts = enumeration_wait::root_ports_to_attempt(
+                &connected_root,
+                claimed_root,
+                &root_fail_count,
+                MAX_PER_PORT_RETRIES,
+                next_root_idx,
+            );
+            if let Some(&p) = attempts.first() {
+                let idx = connected_root.iter().position(|q| *q == p).unwrap_or(0);
                 let bit = 1u128 << (p as u32 & 127);
                 let pi = (p as usize) & 127;
-                if claimed_root & bit != 0 {
-                    continue;
-                }
-                if root_fail_count[pi] >= MAX_PER_PORT_RETRIES {
-                    continue;
-                }
                 SUPERVISOR_PHASE.store(5, core::sync::atomic::Ordering::Relaxed);
                 SUPERVISOR_ATTACHING_PORT.store(p, core::sync::atomic::Ordering::Relaxed);
                 let timeouts_before = c.timeout_count();
@@ -659,7 +662,6 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                 }
                 next_root_idx = idx + 1;
                 attempted = true;
-                break;
             }
             if !attempted && !connected_root.is_empty() {
                 // All ports either bound or burned out; reset
@@ -861,6 +863,23 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
             // suspended; an idle USB stick / hub does.
             attach::idle_suspend_pass(c).await;
             SUPERVISOR_PHASE.store(9, core::sync::atomic::Ordering::Relaxed);
+            // Another root port is still to be tried: start the next
+            // cycle now instead of parking between ports (Linux
+            // `hub_event` handles every port with a change in one pass).
+            // A connected port must not wait on a timer wake behind its
+            // neighbour.
+            if !enumeration_wait::root_ports_to_attempt(
+                &connected_root,
+                claimed_root,
+                &root_fail_count,
+                MAX_PER_PORT_RETRIES,
+                next_root_idx,
+            )
+            .is_empty()
+            {
+                narf_scheduler::yield_now().await;
+                continue;
+            }
             // Inter-cycle event-driven pump (matching Linux's `usbhid`
             // `hid_irq_in` -> `input_event` + `usb_submit_urb` flow in
             // `drivers/hid/usbhid/hid-core.c:273-325`):
@@ -901,6 +920,11 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                 })
                 .await;
                 pump_bound_devices(c);
+                // A hub's status-change transfer completed: walk its
+                // ports now (Linux `hub_irq` → `kick_hub_wq`).
+                if attach::hub_status_changed(c).await {
+                    break;
+                }
                 if xhci::USB_PSCE_EVENTS.load(core::sync::atomic::Ordering::Acquire) != seen_psce {
                     break;
                 }

@@ -224,28 +224,47 @@ kernel_test_in!(
     smoke_xhci_command_receipts_clear_for_recovery
 );
 
-/// #884: a timed-out waiter retires its own receipt instead of
-/// leaking it. Fixture is built from the xHCI event format
-/// itself (§6.4.2.2: a Command Completion Event names its
-/// command TRB by pointer in dwords 0..1 with TRB type 33): the
-/// retire drops the reservation, the entry re-reserves, and a
-/// full small ring keeps turning over after a timeout instead
-/// of wedging with CmdRingFull at wrap.
+fn completion(pointer: u64, code: u8, slot: u8) -> Event {
+    [
+        pointer as u32,
+        (pointer >> 32) as u32,
+        u32::from(code) << 24,
+        33 << 10 | u32::from(slot) << 24,
+    ]
+}
+
+/// #884: a timed-out waiter abandons its receipt. The command TRB is
+/// still on the ring and the controller executes the ring in order, so
+/// the entry stays reserved — never reused while the controller may
+/// still fetch it — until the controller's completion for it arrives
+/// (here Command Aborted after a ring abort, or the No Op it was turned
+/// into), which is swallowed and releases the entry. A full small ring
+/// then turns over again.
 fn smoke_xhci_command_receipt_retires_on_timeout() -> TestResult {
     let mut commands = Commands::new(2);
     if commands.reserve(0, 0x3000, 5) != Ok(()) || !commands.active() {
         return TestResult::Fail("receipt did not reserve");
     }
-    if !commands.retire_pointer(0x3000) || commands.active() {
-        return TestResult::Fail("timeout retire left the receipt active");
+    if !commands.retire_pointer(0x3000) {
+        return TestResult::Fail("timeout did not abandon the receipt");
+    }
+    if commands.reserve(0, 0x3000, 5) != Err(Conflict) || !commands.active() {
+        return TestResult::Fail("abandoned entry was reusable before the controller dequeued it");
+    }
+    if commands.abandoned_entries() != [0] {
+        return TestResult::Fail("abandoned entry not reported for the ring abort");
+    }
+    // Retiring twice, an unknown pointer, or a consumed receipt is a
+    // no-op — never drops a live receipt.
+    if commands.retire_pointer(0x3000) || commands.retire_pointer(0x9999) {
+        return TestResult::Fail("retire claimed an abandoned or unknown pointer");
+    }
+    // Command Aborted (slot 0) for the abandoned TRB releases it.
+    if !commands.record(completion(0x3000, 25, 0)) || commands.active() {
+        return TestResult::Fail("aborted completion did not release the abandoned entry");
     }
     if commands.reserve(0, 0x3000, 5) != Ok(()) {
-        return TestResult::Fail("retired entry did not reserve again");
-    }
-    // Retiring an unknown pointer, or one whose receipt was
-    // already consumed, is a no-op — never drops a live receipt.
-    if commands.retire_pointer(0x9999) {
-        return TestResult::Fail("retire claimed an unknown pointer");
+        return TestResult::Fail("released entry did not reserve again");
     }
     commands.reserve(1, 0x3010, 5).unwrap();
     commands.record(command(0x3010));
@@ -255,17 +274,13 @@ fn smoke_xhci_command_receipt_retires_on_timeout() -> TestResult {
     if commands.retire_pointer(0x3010) {
         return TestResult::Fail("retire dropped an already-consumed receipt");
     }
-    // The #884 wedge, in miniature: a 2-entry ring with one
-    // timed-out entry still accepts the next command at wrap.
-    let mut ring = Commands::new(2);
-    ring.reserve(0, 0x3000, 5).unwrap();
-    ring.reserve(1, 0x3010, 5).unwrap();
-    if ring.reserve(0, 0x3000, 5) != Err(Conflict) {
-        return TestResult::Fail("live entry was overwritten before retire");
-    }
-    ring.retire_pointer(0x3000);
-    if ring.reserve(0, 0x3000, 5) != Ok(()) {
-        return TestResult::Fail("ring wedged at wrap after timeout retire");
+    // Commands execute in ring order: a completion for a later command
+    // releases an abandoned earlier one whose own completion was lost.
+    commands.reserve(1, 0x3010, 5).unwrap();
+    commands.retire_pointer(0x3000);
+    commands.record(command(0x3010));
+    if commands.reserve(0, 0x3000, 5) != Ok(()) {
+        return TestResult::Fail("an executed abandoned command kept its entry after a lost CCE");
     }
     TestResult::Pass
 }
@@ -274,17 +289,18 @@ kernel_test_in!(
     smoke_xhci_command_receipt_retires_on_timeout
 );
 
-/// #884: a CCE that arrives after its waiter timed out is
-/// swallowed at the demux instead of landing in the lossy
-/// command-event queue, where it could be misattributed to the
-/// next command recycled onto the same ring entry. Once the
-/// entry is re-reserved the tombstone lifts, and the new
-/// command's own CCE latches normally.
+/// #884: a CCE that arrives after its waiter timed out is swallowed at
+/// the demux instead of landing in the lossy command-event queue, and
+/// no waiter can take it. Once it released the entry, the next command
+/// on that entry latches its own CCE normally.
 fn smoke_xhci_late_cce_after_retire_is_swallowed() -> TestResult {
     let mut commands = Commands::new(1);
     commands.reserve(0, 0x3000, 5).unwrap();
     if !commands.retire_pointer(0x3000) {
-        return TestResult::Fail("retire did not drop the receipt");
+        return TestResult::Fail("retire did not abandon the receipt");
+    }
+    if commands.take_matching(&mut |_| true) != Ok(None) {
+        return TestResult::Fail("an abandoned receipt was takeable");
     }
     if !commands.record(command(0x3000)) {
         return TestResult::Fail("late CCE was not swallowed after retire");
@@ -293,7 +309,7 @@ fn smoke_xhci_late_cce_after_retire_is_swallowed() -> TestResult {
         return TestResult::Fail("swallowed CCE left a receipt behind");
     }
     if commands.reserve(0, 0x3000, 5) != Ok(()) {
-        return TestResult::Fail("retired entry did not reserve again");
+        return TestResult::Fail("released entry did not reserve again");
     }
     commands.record(command(0x3000));
     if commands.take_matching(&mut |_| true) != Ok(Some(command(0x3000))) {
@@ -306,10 +322,40 @@ kernel_test_in!(
     smoke_xhci_late_cce_after_retire_is_swallowed
 );
 
-/// Recovery must drop the retired-pointer tombstones along with
-/// the receipts: ring pointers repeat after the cursors restart
-/// at zero, and a stale tombstone would swallow the recycled
-/// entry's own completion forever.
+/// A Command Ring Stopped completion (code 24) names the ring's dequeue
+/// pointer — the next command to execute — and completes nothing
+/// (Linux `handle_cmd_completion`). It must not latch into the receipt
+/// of the live command at that pointer; it is reported to the abort
+/// instead, and that command's real completion still arrives.
+fn smoke_xhci_command_ring_stopped_completes_no_command() -> TestResult {
+    let mut commands = Commands::new(2);
+    commands.reserve(0, 0x3000, 0).unwrap();
+    if !commands.record(completion(0x3000, 24, 0)) {
+        return TestResult::Fail("Command Ring Stopped reached the lossy queue");
+    }
+    if commands.take_matching(&mut |_| true) != Ok(None) {
+        return TestResult::Fail(
+            "Command Ring Stopped completed the command at the dequeue pointer",
+        );
+    }
+    if !commands.take_ring_stopped() || commands.take_ring_stopped() {
+        return TestResult::Fail("Command Ring Stopped was not reported exactly once");
+    }
+    let done = completion(0x3000, 1, 3);
+    commands.record(done);
+    if commands.take_matching(&mut |_| true) != Ok(Some(done)) {
+        return TestResult::Fail("the command's own completion was lost after the stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_command_ring_stopped_completes_no_command
+);
+
+/// Recovery must drop abandoned receipts along with the live ones:
+/// ring pointers repeat after the cursors restart at zero, and a stale
+/// abandoned receipt would swallow the recycled entry's own completion.
 fn smoke_xhci_clear_drops_retired_pointers() -> TestResult {
     let mut commands = Commands::new(1);
     commands.reserve(0, 0x3000, 5).unwrap();

@@ -77,12 +77,17 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod bulk_owner;
 mod bulk_stop;
 mod bulk_stop_native;
+mod cmd_abort;
 mod completion;
 mod control_cancel;
 #[cfg(feature = "kernel-test")]
 #[path = "control_tests.rs"]
 mod control_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "demux_tests.rs"]
+mod demux_tests;
 mod event_wait;
+mod irq;
 #[cfg(feature = "kernel-test")]
 #[path = "isoch_tests.rs"]
 mod isoch_tests;
@@ -143,6 +148,11 @@ const OP_PAGESIZE: u64 = 0x08; // u32
 const OP_CRCR: u64 = 0x18; // u64
 const OP_DCBAAP: u64 = 0x30; // u64
 const OP_CONFIG: u64 = 0x38; // u32
+
+// CRCR bits (xHCI 1.2 §5.4.5).
+const CRCR_RCS: u32 = 1 << 0; // Ring Cycle State
+const CRCR_CA: u32 = 1 << 2; // Command Abort
+const CRCR_CRR: u32 = 1 << 3; // Command Ring Running (RO)
 
 /// Port Register Set base (relative to operational base, §5.4.8).
 /// Each port is a 16-byte block: PORTSC / PORTPMSC / PORTLI / PORTHLPMC.
@@ -526,6 +536,8 @@ pub struct Xhci {
     er_ccs: IrqSafeSpinLock<u32>,
     /// Next TRB index to dequeue on the event ring.
     er_dequeue: IrqSafeSpinLock<usize>,
+    /// Events consumed since ERDP was last written.
+    er_unpublished: core::sync::atomic::AtomicUsize,
     /// Per-slot device state. Indexed by slot id (1-based); slot 0
     /// is unused. Sized lazily on first `address_device` so we
     /// don't burn `MaxSlots+1` empty slots up-front.
@@ -545,6 +557,9 @@ pub struct Xhci {
     /// visibility must imply its preceding forced TEs already quarantined.
     demux_publication: IrqSafeSpinLock<()>,
     events_overflowed: core::sync::atomic::AtomicU32,
+    /// Transfer Events dropped because nothing could ever take them
+    /// (`unowned_transfer_route`).
+    stray_events: core::sync::atomic::AtomicU32,
     /// Command and control-stage waits that expired since bring-up.
     /// The supervisor samples it around an enumeration attempt so a
     /// timed-out attempt is charged more of the port's retry budget
@@ -589,6 +604,18 @@ pub struct Xhci {
     /// an endpoint's owner when a Transfer Event for it arrives, the shape
     /// of a Linux URB completion handler (`btusb_intr_complete`).
     endpoint_wakers: IrqSafeSpinLock<Vec<(u8, u8, core::task::Waker)>>,
+    /// A command-ring abort is in progress (`cmd_abort`): new commands
+    /// are queued without ringing the doorbell, as Linux's
+    /// `CMD_RING_STATE_ABORTED` suppresses `xhci_ring_cmd_db`, and a
+    /// second timed-out waiter leaves the abort to the first.
+    cmd_abort_active: core::sync::atomic::AtomicBool,
+    /// TRB pointer of the last command the controller completed: the
+    /// command after it is the one the ring is executing.
+    cmd_last_completion: AtomicU64,
+    /// The controller must be reset (a Stop Endpoint timed out, a
+    /// command-ring abort failed, or USBSTS reported HSE/HCE): the
+    /// supervisor runs `recover_controller` (Linux `xhci_hc_died`).
+    fatal_error: core::sync::atomic::AtomicBool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -761,7 +788,7 @@ pub struct EndpointConfig {
 
 impl EndpointConfig {
     /// DCI = (endpoint number * 2) + (1 if IN else 0). §4.8.1.
-    fn dci(self) -> u8 {
+    pub fn dci(self) -> u8 {
         let num = self.ep_addr & 0x0F;
         let in_bit = if self.kind.is_in() { 1 } else { 0 };
         (num * 2) + in_bit
@@ -1061,7 +1088,7 @@ impl Xhci {
             mmio.write32(ir0 + IR_ERDP_HI, (er_phys >> 32) as u32);
             mmio.write32(ir0 + IR_ERSTBA_LO, erst_phys as u32);
             mmio.write32(ir0 + IR_ERSTBA_HI, (erst_phys >> 32) as u32);
-            mmio.write32(ir0 + IR_IMOD, 0);
+            mmio.write32(ir0 + IR_IMOD, irq::IMODI);
             mmio.write32(ir0 + IR_IMAN, IMAN_IP | IMAN_IE);
         }
 
@@ -1158,7 +1185,23 @@ impl Xhci {
     /// poll this to decide between `soft_recover` (no slots owned)
     /// and `recover_controller` (slots owned).
     pub fn needs_recovery(&self) -> bool {
-        self.usbsts() & USBSTS_HCE != 0
+        self.fatal_error.load(Ordering::Acquire) || self.usbsts() & USBSTS_HCE != 0
+    }
+
+    /// Mark the controller dead until `recover_controller` resets it
+    /// (Linux `xhci_hc_died`), and wake the supervisor that runs the
+    /// recovery.
+    fn request_recovery(&self, why: &str) {
+        if !self.fatal_error.swap(true, Ordering::AcqRel) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci{}: {} — controller reset requested",
+                self.id,
+                why
+            );
+        }
+        self.wake_supervisor();
     }
 
     /// Number of completed full controller recoveries since
@@ -1240,12 +1283,14 @@ impl Xhci {
         drop(drained);
 
         self.command_completions.lock().clear();
+        self.cmd_last_completion.store(0, Ordering::Release);
         slots.reset();
         // `slots` stays in scope until the restart completes, so the
         // reservation is held across `reprogram_and_restart` as the
         // fn-level contract states.
         self.reprogram_and_restart()?;
 
+        self.fatal_error.store(false, Ordering::Release);
         let epoch = self.recovery_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(epoch)
     }
@@ -1713,7 +1758,7 @@ impl Xhci {
             mmio.write32(ir0 + IR_ERDP_HI, (er_phys >> 32) as u32);
             mmio.write32(ir0 + IR_ERSTBA_LO, erst_phys as u32);
             mmio.write32(ir0 + IR_ERSTBA_HI, (erst_phys >> 32) as u32);
-            mmio.write32(ir0 + IR_IMOD, 0);
+            mmio.write32(ir0 + IR_IMOD, irq::IMODI);
             // Leave IE=0 and INTE=0 until the IDT vector is installed and
             // this controller is published in CONTROLLERS (arm_interrupts).
             mmio.write32(ir0 + IR_IMAN, IMAN_IP);
@@ -1944,6 +1989,7 @@ impl Xhci {
             // wrap-toggle path; otherwise CCS stays 1 because the
             // drain only stops on the first cycle=0 slot.
             er_ccs: IrqSafeSpinLock::new(if drained_evs >= ER_SEG_TRBS { 0 } else { 1 }),
+            er_unpublished: core::sync::atomic::AtomicUsize::new(0),
             er_dequeue: IrqSafeSpinLock::new(if drained_evs >= ER_SEG_TRBS {
                 0
             } else {
@@ -1964,6 +2010,7 @@ impl Xhci {
             transfer_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::with_capacity(64)),
             demux_publication: IrqSafeSpinLock::new(()),
             events_overflowed: core::sync::atomic::AtomicU32::new(0),
+            stray_events: core::sync::atomic::AtomicU32::new(0),
             timeouts: core::sync::atomic::AtomicU32::new(0),
             recovery_epoch: core::sync::atomic::AtomicU64::new(0),
             running: true,
@@ -1974,6 +2021,9 @@ impl Xhci {
             bus_addr: device.addr,
             supervisor_waker: IrqSafeSpinLock::new(None),
             endpoint_wakers: IrqSafeSpinLock::new(Vec::new()),
+            cmd_abort_active: core::sync::atomic::AtomicBool::new(false),
+            cmd_last_completion: AtomicU64::new(0),
+            fatal_error: core::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2002,7 +2052,9 @@ impl Xhci {
                 .write32(self.op_off + OP_USBCMD, cmd | USBCMD_INTE);
         }
         compiler_fence(Ordering::SeqCst);
-        service_interrupt(self);
+        // Drain and acknowledge whatever latched during bring-up, EINT
+        // or not, so edge-triggered MSI/MSI-X never wedges with IP=1.
+        let _ = irq::service(&InterruptRegs(self), true);
     }
 
     /// This controller's index (`xhci<N>`); see [`controller_by_id`].
@@ -2041,9 +2093,14 @@ impl Xhci {
 
     /// Drop endpoint `dci` of `slot_id`'s completion waker.
     pub fn clear_endpoint_waker(&self, slot_id: u8, dci: u8) {
-        self.endpoint_wakers
-            .lock()
-            .retain(|e| !(e.0 == slot_id && e.1 == dci));
+        let stale = {
+            let mut wakers = self.endpoint_wakers.lock();
+            wakers
+                .iter()
+                .position(|e| e.0 == slot_id && e.1 == dci)
+                .map(|index| wakers.swap_remove(index))
+        };
+        drop(stale);
     }
 
     /// Whether this controller's events reach the demux from an interrupt
@@ -2576,13 +2633,20 @@ impl Xhci {
         *enq_g += 1;
         drop(enq_g);
         drop(pcs_g);
-        self.ring_command_doorbell();
+        // While an abort stops the ring the TRB stays queued; the
+        // abort's restart rings the doorbell (Linux `xhci_ring_cmd_db`
+        // returns early unless the ring state is Running).
+        if !self.cmd_abort_active.load(Ordering::Acquire) {
+            self.ring_command_doorbell();
+        }
         Ok(trb_addr)
     }
 
     /// Poll the Event Ring for the next event whose cycle matches
     /// the consumer cycle state. Returns the four TRB dwords and
-    /// advances the dequeue pointer + ERDP. Spec § 4.9.4.
+    /// advances the software dequeue pointer; ERDP follows every half
+    /// segment and at the end of a drain (`publish_dequeue`).
+    /// Spec § 4.9.4.
     fn poll_event(&self) -> Option<[u32; 4]> {
         let mut deq_g = self.er_dequeue.lock();
         let mut ccs_g = self.er_ccs.lock();
@@ -2614,18 +2678,38 @@ impl Xhci {
             *deq_g = 0;
             *ccs_g ^= TRB_CYCLE_BIT;
         }
-        // Update ERDP — write the new dequeue phys address (4-byte
-        // aligned) with EHB set to clear the busy flag.
-        let new_deq_phys = self.event_ring.dma_addr().raw() + (*deq_g as u64) * 16;
+        // ERDP is written once per drain with EHB cleared
+        // (`publish_dequeue`), and every half segment without it so the
+        // controller sees the room (Linux `xhci_handle_events`).
+        let unpublished = self.er_unpublished.fetch_add(1, Ordering::AcqRel) + 1;
+        if unpublished >= ER_SEG_TRBS / 2 {
+            self.write_erdp(*deq_g, false);
+        }
+        Some([d0, d1, d2, d3])
+    }
+
+    /// Write ERDP with dequeue index `deq`, clearing EHB when
+    /// `clear_ehb` (Linux `xhci_update_erst_dequeue`). Caller holds the
+    /// event-ring dequeue lock.
+    fn write_erdp(&self, deq: usize, clear_ehb: bool) {
+        self.er_unpublished.store(0, Ordering::Release);
+        let new_deq_phys = self.event_ring.dma_addr().raw() + (deq as u64) * 16;
+        let ehb = if clear_ehb { ERDP_EHB as u32 } else { 0 };
         let ir0 = self.rts_off + IR_BASE_OFF;
         // SAFETY: identity-mapped MMIO.
         unsafe {
             self.mmio
                 .write32(ir0 + IR_ERDP_HI, (new_deq_phys >> 32) as u32);
             self.mmio
-                .write32(ir0 + IR_ERDP_LO, (new_deq_phys as u32) | (ERDP_EHB as u32));
+                .write32(ir0 + IR_ERDP_LO, (new_deq_phys as u32) | ehb);
         }
-        Some([d0, d1, d2, d3])
+    }
+
+    /// End of a drain: publish the dequeue pointer and clear EHB so the
+    /// controller may interrupt again.
+    fn publish_dequeue(&self) {
+        let deq_g = self.er_dequeue.lock();
+        self.write_erdp(*deq_g, true);
     }
 
     /// Snapshot USBSTS and clear any RW1C error bits, returning a
@@ -2669,20 +2753,41 @@ impl Xhci {
     /// gets stashed for whichever waiter does want it. Returns the
     /// event so direct callers can also inspect.
     fn demux_one_event(&self) -> Option<[u32; 4]> {
+        let ev = self.demux_next();
+        if ev.is_none() && self.er_unpublished.load(Ordering::Acquire) != 0 {
+            // A task drained the ring: it ends the drain the interrupt
+            // handler would have ended.
+            self.publish_dequeue();
+        }
+        ev
+    }
+
+    /// Demux one event without ending the drain (the interrupt handler
+    /// writes ERDP once after its whole drain).
+    fn demux_next(&self) -> Option<[u32; 4]> {
         // No await/pump/slot reservation occurs under this short IRQ-safe
         // guard. Ring locks release before devices/latches; no reverse order.
-        let _publication = self.demux_publication.lock();
+        let publication = self.demux_publication.lock();
         let ev = self.poll_event()?;
+        self.route_event(ev, publication);
+        Some(ev)
+    }
+
+    /// Publish one event taken off the ring: latch it into its owner,
+    /// route a Port Status Change to the supervisor, queue it for a
+    /// waiter, or drop it. `publication` is the demux reservation held
+    /// since the event was popped.
+    fn route_event(&self, ev: [u32; 4], publication: narf_lib::sync::IrqSafeSpinLockGuard<'_, ()>) {
         // Short, blocking ownership locks are deliberate: falling back to
         // the lossy queues on another CPU's lock contention loses live TDs.
         // poll_event released its ring locks before this call. No await or
         // reservation-lock acquisition occurs while devices is held.
         if self.latch_owned_event(ev) {
-            drop(_publication);
+            drop(publication);
             if (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT == TRB_TYPE_TRANSFER_EVENT {
                 self.wake_endpoint(&ev);
             }
-            return Some(ev);
+            return;
         }
         let ty = (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
         // Route Port Status Change Events (xHCI 1.2 §6.4.2.3, TRB
@@ -2698,31 +2803,60 @@ impl Xhci {
             USB_PSCE_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Release);
             // The counter publication is ordered already. Invoke arbitrary
             // registered wakers after releasing the demux reservation.
-            drop(_publication);
+            drop(publication);
             self.wake_supervisor();
-            return Some(ev);
+            return;
+        }
+        if ty == TRB_TYPE_TRANSFER_EVENT && unowned_transfer_route(&ev) == EventRoute::Drop {
+            // No control TD owns it, and nothing takes EP0 events from
+            // the shared queue: queued, it would sit there until slot
+            // reclaim and keep the supervisor's wait from ever parking.
+            self.stray_events.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         let queue: &IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>> = match ty {
             t if t == TRB_TYPE_CMD_COMPLETION => &self.cmd_events,
             t if t == TRB_TYPE_TRANSFER_EVENT => &self.transfer_events,
-            _ => return Some(ev),
+            _ => return,
         };
         let mut g = queue.lock();
         if event_wait::enqueue(&mut g, ev) {
             self.events_overflowed.fetch_add(1, Ordering::Relaxed);
         }
         drop(g);
-        drop(_publication);
+        drop(publication);
         if ty == TRB_TYPE_TRANSFER_EVENT {
             self.wake_endpoint(&ev);
             self.wake_supervisor();
         }
-        Some(ev)
+    }
+
+    /// Route `ev` exactly as if the demux had just popped it off the
+    /// event ring (fixtures inject events a live controller would post).
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_route_event(&self, ev: [u32; 4]) {
+        let publication = self.demux_publication.lock();
+        self.route_event(ev, publication);
+    }
+
+    /// Transfer Events for `slot_id` waiting in the shared queue.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_queued_transfer_events(&self, slot_id: u8) -> usize {
+        self.transfer_events
+            .lock()
+            .iter()
+            .filter(|event| event[3] >> 24 == u32::from(slot_id))
+            .count()
     }
 
     fn latch_owned_event(&self, event: event_wait::Event) -> bool {
         let kind = (event[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
         if kind == TRB_TYPE_CMD_COMPLETION {
+            if (event[2] >> 24) as u8 != cmd_abort::CC_COMMAND_RING_STOPPED {
+                let origin = u64::from(event[0]) | u64::from(event[1]) << 32;
+                self.cmd_last_completion
+                    .store(origin & !15, Ordering::Release);
+            }
             return self.command_completions.lock().record(event);
         }
         if kind != TRB_TYPE_TRANSFER_EVENT {
@@ -2852,13 +2986,14 @@ impl Xhci {
 
     /// Await a Command Completion Event for a submitted command
     /// TRB (`command` is the phys address `submit_command_record`
-    /// returned). On timeout the receipt is retired (#884): the
-    /// waiter gives up the ring entry instead of leaving it
-    /// reserved forever, which would wedge the ring at wrap and
-    /// keep `soft_recover` refusing while `active()`. Only
-    /// `CmdTimeout` retires — a consumed event already released
-    /// the receipt, and other errors leave the receipt for the
-    /// recovery paths to clear.
+    /// returned). On timeout the waiter abandons its receipt (#884)
+    /// and the command ring is aborted (`handle_command_timeout`):
+    /// the controller stops executing the command, the abandoned
+    /// commands on the ring become No Ops, and the ring restarts, so
+    /// the entries are released by their completions instead of
+    /// wedging the ring. Only `CmdTimeout` abandons — a consumed
+    /// event already released the receipt, and other errors leave the
+    /// receipt for the recovery paths to clear.
     async fn await_command_event(
         &self,
         command: u64,
@@ -2867,17 +3002,152 @@ impl Xhci {
         match self.await_event(event_wait::Wait::Command, predicate).await {
             Ok(event) => Ok(event),
             Err(XhciError::CmdTimeout) => {
+                let kind = self.command_trb_type(command);
                 self.retire_command_receipt(command);
+                self.handle_command_timeout(command, kind).await;
                 Err(XhciError::CmdTimeout)
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Drop the command-ring receipt for `command` and purge any
-    /// already-queued CCE naming it (one the ISR demuxed after
-    /// the waiter's last scan). A CCE that arrives later still is
-    /// swallowed by the tombstone `retire_pointer` leaves behind.
+    /// TRB type of the command published at `command` (read before any
+    /// No Op rewrite).
+    fn command_trb_type(&self, command: u64) -> u32 {
+        // SAFETY: `command` is a TRB pointer inside the identity-mapped
+        // command ring page this controller published it on.
+        let d3 = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(command + 12).kernel_ptr::<u32>())
+        };
+        (d3 & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT
+    }
+
+    /// A command did not complete within its wait: abort the command
+    /// ring so the controller stops executing it and the commands
+    /// queued behind it can run (Linux `xhci_handle_command_timeout`).
+    /// A second waiter timing out during an abort leaves it to the
+    /// first: its abandoned command is turned into a No Op by that
+    /// abort, or by the next timeout if it was queued later.
+    async fn handle_command_timeout(&self, command: u64, kind: u32) {
+        // A controller already marked dead is reset by its supervisor;
+        // aborting again would only stall its waiters.
+        if self.fatal_error.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .cmd_abort_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let outcome = cmd_abort::handle_timeout(&CommandRingAbort { xhci: self }, kind).await;
+        self.cmd_abort_active.store(false, Ordering::Release);
+        if self.timeouts.load(Ordering::Relaxed) <= TIMEOUT_REPORT_LIMIT {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci{}: command trb={:#x} type={} timed out: command ring {:?}",
+                self.id,
+                command,
+                kind,
+                outcome
+            );
+        }
+    }
+
+    /// Write CRCR with Command Abort. CRCR's pointer field is ignored
+    /// while the ring runs, but some controllers need all 64 bits
+    /// written, and if the ring stops between the two halves the
+    /// pointer takes effect, so it names the command the ring is
+    /// executing (Linux `xhci_abort_cmd_ring` keeps it valid the same
+    /// way): if it is abandoned it becomes a No Op before the restart.
+    fn write_command_abort(&self) {
+        let ring = self.cmd_ring.dma_addr().raw();
+        let last = self.cmd_last_completion.load(Ordering::Acquire);
+        let mut head = if last >= ring && last < ring + (CMD_RING_TRBS * 16) as u64 {
+            ((last - ring) / 16) as usize + 1
+        } else {
+            0
+        };
+        if head >= CMD_RING_TRBS - 1 {
+            head = 0;
+        }
+        let (enqueue, pcs) = {
+            let enq_g = self.cmd_enqueue.lock();
+            let pcs_g = self.cmd_pcs.lock();
+            (*enq_g, *pcs_g)
+        };
+        let enqueue = if enqueue >= CMD_RING_TRBS - 1 {
+            0
+        } else {
+            enqueue
+        };
+        let pointer = ring + (head * 16) as u64;
+        let cycle = if head == enqueue {
+            pcs & TRB_CYCLE_BIT
+        } else {
+            // SAFETY: `pointer` names a TRB of the identity-mapped
+            // command ring page.
+            let d3 = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(pointer + 12).kernel_ptr::<u32>(),
+                )
+            };
+            d3 & TRB_CYCLE_BIT
+        };
+        // SAFETY: identity-mapped MMIO; CRCR is a 64-bit operational
+        // register written low dword first, as `bring_up` does.
+        unsafe {
+            self.mmio.write32(
+                self.op_off + OP_CRCR,
+                (pointer as u32 & !0x3F) | CRCR_CA | (cycle & CRCR_RCS),
+            );
+            self.mmio
+                .write32(self.op_off + OP_CRCR + 4, (pointer >> 32) as u32);
+        }
+    }
+
+    /// Rewrite every abandoned command still on the ring as a No Op
+    /// Command TRB, keeping its cycle bit (Linux `trb_to_noop`), so the
+    /// restarted ring completes it instead of executing it.
+    fn noop_abandoned_commands(&self) -> usize {
+        // Serialize with command publication (`submit_command_record`
+        // takes the enqueue lock before the receipts).
+        let _enq_g = self.cmd_enqueue.lock();
+        let entries = self.command_completions.lock().abandoned_entries();
+        let ring = self.cmd_ring.dma_addr().raw();
+        for &entry in &entries {
+            let trb = ring + (entry * 16) as u64;
+            // SAFETY: identity-mapped DMA; `entry` is a data TRB of the
+            // command ring the controller is stopped on.
+            unsafe {
+                let d3 = core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(trb + 12).kernel_ptr::<u32>(),
+                );
+                for offset in [0u64, 4, 8] {
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(trb + offset).kernel_mut_ptr::<u32>(),
+                        0,
+                    );
+                }
+                self.cmd_ring.sync(entry * 16, 16);
+                device_dma_barrier();
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(trb + 12).kernel_mut_ptr::<u32>(),
+                    (cmd_abort::TRB_NO_OP_COMMAND << TRB_TYPE_SHIFT) | (d3 & TRB_CYCLE_BIT),
+                );
+            }
+            self.cmd_ring.sync(entry * 16, 16);
+            device_dma_barrier();
+        }
+        entries.len()
+    }
+
+    /// Abandon the command-ring receipt for `command` and purge any
+    /// already-queued CCE naming it. The entry stays reserved until
+    /// the controller's completion for it (normal, Command Aborted or
+    /// No Op) arrives; `record` swallows that completion.
     fn retire_command_receipt(&self, command: u64) {
         self.command_completions.lock().retire_pointer(command);
         self.cmd_events
@@ -2972,6 +3242,34 @@ impl Xhci {
                     && event[3] >> 24 == u32::from(slot_id))
             });
         }
+        // The slot's endpoint owners went with its device: a waker left
+        // here would be woken by the next occupant's completions (Linux
+        // kills a device's URBs, completion handlers included, before
+        // its slot is freed). Dropped after the lock is released.
+        let stale: Vec<(u8, u8, core::task::Waker)> = {
+            let mut wakers = self.endpoint_wakers.lock();
+            let mut stale = Vec::new();
+            let mut index = 0;
+            while index < wakers.len() {
+                if wakers[index].0 == slot_id {
+                    stale.push(wakers.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            stale
+        };
+        drop(stale);
+    }
+
+    /// Endpoint completion wakers registered for `slot_id`.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_endpoint_wakers(&self, slot_id: u8) -> usize {
+        self.endpoint_wakers
+            .lock()
+            .iter()
+            .filter(|entry| entry.0 == slot_id)
+            .count()
     }
 
     /// Reclaim a disabled slot so its id can be handed out again —
@@ -5461,6 +5759,30 @@ impl Xhci {
             .map_err(bulk_error)
     }
 
+    /// Poll an already-published iso-IN TD without waiting (the shape of
+    /// [`Self::poll_bulk_in`]): `Ok(None)` keeps the TD and its page
+    /// staged; `Ok(Some(n))` retires it with `n` bytes copied to `out`.
+    pub fn poll_isoch_in(
+        &self,
+        token: &IsochToken,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, XhciError> {
+        if token.direction() != BulkDirection::In || out.len() < token.length() {
+            return Err(XhciError::CmdFailed(0xF9));
+        }
+        self.validate_isoch(token)?;
+        match event_wait::poll_batch(
+            || self.take_matching_event(&mut |event| token.matches(event)),
+            || self.demux_one_event().is_some(),
+            || false,
+        ) {
+            Ok(Some(event)) => self.complete_isoch(token, &event, Some(out)),
+            Ok(None) => Ok(None),
+            Err(event_wait::PollError::Source(error)) => Err(error),
+            Err(event_wait::PollError::TimedOut) => Err(XhciError::CmdTimeout),
+        }
+    }
+
     pub(crate) async fn wait_isoch_in(
         &self,
         token: &IsochToken,
@@ -5980,6 +6302,29 @@ impl Xhci {
 
 static NEXT_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Where a Transfer Event no owner latched goes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EventRoute {
+    /// The shared queue, for `poll_interrupt_in` / `take_matching_event`.
+    Queue,
+    /// Dropped: nothing can consume it.
+    Drop,
+}
+
+/// Route of a Transfer Event that no owner latched. EP0 (DCI 1)
+/// events belong to control TDs, whose receipts latch them: one that
+/// no receipt claims (a late event for a completed or cancelled TD, or
+/// for a slot without a device) can never be taken, as Linux
+/// `handle_tx_event` drops an event that matches no queued TD.
+/// Interrupt, bulk and isochronous events stay queued for their pumps.
+pub(crate) fn unowned_transfer_route(event: &[u32; 4]) -> EventRoute {
+    if (event[3] >> 16) & 0x1f == DCI_CONTROL_EP {
+        EventRoute::Drop
+    } else {
+        EventRoute::Queue
+    }
+}
+
 fn next_device_generation() -> Result<u64, XhciError> {
     NEXT_DEVICE_GENERATION
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -6091,6 +6436,44 @@ impl control_cancel::Bus for ControlCancel<'_> {
         device.ctrl_pcs = plan.cycle;
         device.endpoint_configuration = false;
         Ok(())
+    }
+}
+
+/// xHCI adapter for the command-ring abort coordinator
+/// (`cmd_abort::handle_timeout`).
+struct CommandRingAbort<'a> {
+    xhci: &'a Xhci,
+}
+impl cmd_abort::Bus for CommandRingAbort<'_> {
+    fn ring_running(&self) -> bool {
+        // SAFETY: identity-mapped MMIO; CRCR reads return CRR (the
+        // pointer field reads as zero).
+        unsafe { self.xhci.mmio.read32(self.xhci.op_off + OP_CRCR) & CRCR_CRR != 0 }
+    }
+    fn write_abort(&self) {
+        self.xhci.write_command_abort();
+    }
+    fn take_ring_stopped(&self) -> bool {
+        self.xhci.drain_events();
+        self.xhci.command_completions.lock().take_ring_stopped()
+    }
+    fn noop_abandoned(&self) -> usize {
+        self.xhci.noop_abandoned_commands()
+    }
+    fn restart(&self) {
+        if self.xhci.command_completions.lock().active() {
+            self.xhci.ring_command_doorbell();
+        }
+    }
+    fn fatal(&self) {
+        self.xhci
+            .request_recovery("command ring did not stop or a Stop Endpoint timed out");
+    }
+    fn now_ms(&self) -> u64 {
+        narf_time::wall::monotonic_ns() / 1_000_000
+    }
+    async fn pause(&self) {
+        narf_scheduler::yield_now().await;
     }
 }
 
@@ -6571,24 +6954,13 @@ pub fn first_controller() -> Option<Arc<Xhci>> {
 
 /// xHCI ISR — runs in IRQ context.
 ///
-/// Two responsibilities per xHCI base spec §5.5.2.3.3 +
-/// §4.17.5:
-/// 1. Acknowledge the level-triggered IRQ at the interrupter
-///    by writing 1 to IMAN.IP (the bit is RW1C). Without this,
-///    INTx-routed controllers re-assert the line forever and
-///    every other CPU also gets the same vector.
-/// 2. Drain pending event-ring TRBs so subsequent IRQs see a
-///    fresh ring rather than re-firing on stale events. The
-///    supervisor pump still inspects device state via
-///    `pump_all`, which is what produces user-visible HID
-///    events; this ISR just keeps the ring + IRQ-ack hygiene
-///    correct.
-///
-/// Bounded: drains at most 64 events per IRQ to keep handler
-/// latency predictable. A storm of events spreads across
-/// successive ISR invocations; the IMAN.IP write keeps the
-/// IRQ live until the ring is empty (next-tick if we hit the
-/// per-IRQ cap).
+/// Per controller, in Linux's `xhci_irq` order (`irq::service`): skip
+/// a controller whose USBSTS.EINT is clear (shared line), treat
+/// HCE/HSE as fatal, acknowledge EINT and IMAN.IP before draining (an
+/// event posted during the drain pends a new interrupt), drain at most
+/// `irq::MAX_EVENTS_PER_IRQ` events, then write ERDP once with EHB
+/// cleared. The supervisor pump still inspects device state via
+/// `pump_all`, which is what produces user-visible HID events.
 fn xhci_isr() {
     // Brief Arc clone, then drop the registry lock — the ISR no
     // longer races the supervisor for the outer mutex. Each
@@ -6607,28 +6979,46 @@ fn xhci_isr() {
 }
 
 fn service_interrupt(xhci: &Xhci) {
-    // Demux up to N events into the per-class queues so any
-    // waiter (await_event) sees its event regardless of
-    // whether the ISR or the waiter dequeued it from the ring.
-    // Pre-fix the ISR called poll_event and dropped the result,
-    // racing with await_event for the very Transfer Event the
-    // waiter expected — surfaced as CmdTimeout under MSI-X
-    // load (audit #11).
-    const MAX_DRAIN_PER_IRQ: usize = 64;
-    for _ in 0..MAX_DRAIN_PER_IRQ {
-        if xhci.demux_one_event().is_none() {
-            break;
+    // Demux into the per-class queues so any waiter (await_event) sees
+    // its event regardless of whether the ISR or the waiter dequeued it
+    // from the ring (audit #11), acknowledging in Linux's order
+    // (`irq::service`).
+    let _ = irq::service(&InterruptRegs(xhci), false);
+}
+
+/// Interrupter 0 of one controller, for `irq::service`.
+struct InterruptRegs<'a>(&'a Xhci);
+impl irq::Regs for InterruptRegs<'_> {
+    fn usbsts(&self) -> u32 {
+        self.0.usbsts()
+    }
+    fn clear_usbsts(&self, bits: u32) {
+        // SAFETY: identity-mapped MMIO; USBSTS change bits are RW1C, so
+        // only `bits` clear.
+        unsafe { self.0.mmio.write32(self.0.op_off + OP_USBSTS, bits) }
+    }
+    fn iman(&self) -> u32 {
+        // SAFETY: identity-mapped MMIO.
+        unsafe { self.0.mmio.read32(self.0.rts_off + IR_BASE_OFF + IR_IMAN) }
+    }
+    fn write_iman(&self, value: u32) {
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.0
+                .mmio
+                .write32(self.0.rts_off + IR_BASE_OFF + IR_IMAN, value)
         }
     }
-    // Acknowledge IMAN.IP for interrupter 0. Read-modify-write:
-    // preserve IE, write 1 to IP (W1C).
-    let ir0 = xhci.rts_off + IR_BASE_OFF;
-    // SAFETY: identity-mapped MMIO; xhci stays alive for the
-    // duration of the lock guard.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        let cur = xhci.mmio.read32(ir0 + IR_IMAN);
-        // Mask to (IE | IP) to W1C the IP bit while keeping IE set.
-        xhci.mmio.write32(ir0 + IR_IMAN, cur | IMAN_IP);
+    fn demux(&self) -> bool {
+        self.0.demux_next().is_some()
+    }
+    fn finish(&self) {
+        self.0.publish_dequeue();
+    }
+    fn fatal(&self, _usbsts: u32) {
+        // Interrupt context: no console output; the supervisor resets
+        // the controller (Linux `xhci_halt` / `xhci_hc_died`).
+        self.0.fatal_error.store(true, Ordering::Release);
+        self.0.wake_supervisor();
     }
 }

@@ -806,6 +806,7 @@ fn fake_hub_binding(slot_id: u8, num_ports: u8) -> crate::attach::HubBinding {
             device_protocol: 1,
             interface_alt: 0,
             interface_protocol: 1,
+            status: None,
         },
         route_string: 0,
         tier: 0,
@@ -8169,6 +8170,7 @@ fn smoke_usb_hub_multi_tt_child_topology() -> TestResult {
         device_protocol: HUB_PROTOCOL_MULTI_TT,
         interface_alt: 1,
         interface_protocol: HUB_PROTOCOL_MULTI_TT,
+        status: None,
     };
     if !hub.is_multi_tt() {
         return TestResult::Fail("protocol 2 hub was not classified multi-TT");

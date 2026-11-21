@@ -201,6 +201,27 @@ impl<const CPUS: usize> LockupWatch<CPUS> {
     pub fn begin_round(&self, now_ns: u64, thresh_ns: u64) -> bool;
     pub fn observe(&self, cpu: usize, s: &CpuSample, now_ns: u64, thresh_ns: u64) -> Option<Lockup>;
 }
+
+pub const RUNNABLE_THRESH_SECS: u64 = 10;          // workqueue.watchdog_thresh
+pub struct RunnableSample { pub task: u64, pub since: u64 }
+pub struct RunnableWatch<const CPUS: usize>;
+impl<const CPUS: usize> RunnableWatch<CPUS> {
+    pub fn observe(&self, cpu: usize, sample: Option<RunnableSample>,
+                   now: u64, thresh: u64) -> Option<u64>;   // waited, once per stall
+}
+
+pub const IRQ_TOP_N: usize = 3;
+pub struct IrqShare { pub total: u64, pub top: [(u8, u64); IRQ_TOP_N] }
+impl IrqShare { pub fn add(&mut self, vector: u8, count: u64);
+                pub fn busiest(&self) -> Option<(u8, u64)>; }
+pub fn per_sec(count: u64, elapsed_ns: u64) -> u64;
+pub fn permille(part: u64, whole: u64) -> u64;
+pub const IRQ_STORM_RATE: u64 = 100_000;            // per second, one vector, one CPU
+pub const IRQ_STORM_WINDOWS: u64 = 5;
+pub struct IrqStormWatch<const CPUS: usize>;
+impl<const CPUS: usize> IrqStormWatch<CPUS> {
+    pub fn observe(&self, cpu: usize, busiest: Option<(u8, u64)>) -> Option<(u8, u64)>;
+}
 ```
 
 Pure decision logic of Linux's `kernel/watchdog.c` over samples the caller
@@ -216,6 +237,51 @@ reported with the soft cadence when such a CPU passes no scheduling point
 for `2 * thresh`. `thresh == 0` disables all three. `begin_round` returns
 `false` (and re-baselines every CPU) when the previous round is more than
 `2 * thresh` old — the checker itself did not run (suspend, paused VM).
+
+`RunnableWatch` is Linux's workqueue watchdog (`wq_watchdog_timer_fn`,
+`show_cpu_pool_hog`) at task granularity: the caller samples, per CPU, the
+task that has been runnable longest without being dispatched
+(`narf_scheduler::dbg_oldest_runnable`: ready queue, wake inbox, woken
+parked set; `since` is the later of its last wake and the end of its last
+run, a new task counting from its creation). A stall — one task runnable
+since one instant — is reported once, when it has waited `thresh` and the
+previous round saw the same stall (one sighting can catch a wake between its
+runnable bit and its stamp). The task running or leaving ends the stall.
+`thresh == 0` disables it.
+
+`IrqShare` accumulates one CPU's interrupts over a window and keeps the
+`IRQ_TOP_N` busiest vectors (ties keep the earlier vector); `per_sec` and
+`permille` turn counts into the window's rate and hard-IRQ time fraction.
+`IrqStormWatch` reports a CPU whose busiest vector stays at or above
+`IRQ_STORM_RATE` for `IRQ_STORM_WINDOWS` consecutive windows, once per
+episode; a different vector or a quieter window starts a new one. It never
+masks anything (the unhandled-IRQ detector in `interrupts/` §3 does).
+
+**Reports** (`frame/` stall watchdog, `--features stall-watchdog`, from the
+per-CPU watchdog hrtimer; checks once a second on one CPU; lock-free or
+try-lock reads only):
+
+| Report | Linux | Threshold (boot parameter) |
+| --- | --- | --- |
+| `BUG: soft lockup - CPU#N stuck for Ns! [comm:pid]` | `watchdog_timer_fn` | `2 * watchdog_thresh` |
+| `CPUr: Watchdog detected hard LOCKUP on cpu N (...)` | buddy detector | `watchdog_thresh` (10 s) |
+| `BUG: executor lockup - CPU#N idle with runnable work for Ns! [comm:pid]` | workqueue lockup | `2 * watchdog_thresh` |
+| `BUG: CPU#N: task [comm:pid] runnable for Ns without running` | `wq_watchdog_timer_fn` per task | `workqueue.watchdog_thresh` (10 s; Linux's workqueue default is 30) |
+| `INFO: task comm:pid blocked for more than N seconds.` (user and kernel tasks) | `check_hung_uninterruptible_tasks` | `sysctl.kernel.hung_task_timeout_secs` (120), `sysctl.kernel.hung_task_warnings` (10) |
+| `irq storm: CPU#N vector V (handler) at R/s for W windows` | — | `IRQ_STORM_RATE` for `IRQ_STORM_WINDOWS` |
+
+A kernel task is named `comm:id`, `comm` being the function its future came
+from (`narf_scheduler::origin_comm`), as Linux names a kthread. The
+runnable report adds the task's holding place, spawn site and affinity and
+the CPU's current task, scheduling-point count and last-tick RIP with its
+symbol; the kernel hung-task report adds the kind of wait
+(`narf_lib::hung_task`: `mutex`, `btrfs txn join`, `btrfs txn close`), the
+waiting call's site, the lock or gate address and the kind's detail (waiter
+id, closing task, operations joined). Every lockup line and every
+`STALL-WD` dump prints each CPU's hard-IRQ share over the last window:
+`STALL-WD   irq cpu=N rate=R/s hardirq=P% masked_arrivals=M/s window_ms=W
+top=V:R/s(handler) ...`, from the dispatch table's per-CPU fire counts,
+`narf_scheduler::hardirq_cycles` and the soft-mask arrival counters.
 
 ## 4. Invariants & safety properties
 

@@ -26,6 +26,32 @@ where
     .await
 }
 
+/// Root ports still to be tried, in port order from cursor `start`:
+/// every connected port that is not claimed and still has retry budget.
+/// The supervisor attempts the first and, while any remain, starts its
+/// next cycle at once instead of parking (Linux `hub_event` handles
+/// every port whose change bit is set in one pass); parking left the
+/// next connected port waiting for the cycle's timer wake.
+pub(crate) fn root_ports_to_attempt(
+    connected: &[u8],
+    claimed: u128,
+    fail_count: &[u8; 128],
+    max_retries: u8,
+    start: usize,
+) -> alloc::vec::Vec<u8> {
+    let mut ports = alloc::vec::Vec::new();
+    for step in 0..connected.len() {
+        let port = connected[(start + step) % connected.len()];
+        if claimed & (1u128 << (port as u32 & 127)) != 0
+            || fail_count[usize::from(port) & 127] >= max_retries
+        {
+            continue;
+        }
+        ports.push(port);
+    }
+    ports
+}
+
 /// Enumeration attempts a port gets when its failures are timeouts.
 pub(crate) const TIMEOUT_ATTEMPTS: u8 = 2;
 
@@ -147,5 +173,27 @@ mod tests {
     kernel_test_in!(
         "drivers/usb/enumeration_wait",
         smoke_enumeration_timeouts_exhaust_retry_budget_early
+    );
+
+    /// Every unclaimed connected root port with budget left is still to
+    /// be tried, in order from the cursor, so the supervisor does not
+    /// park between them: the device on port 2 is attempted right after
+    /// the hub on port 1 instead of after the cycle's timer wake.
+    fn smoke_supervisor_attempts_every_unclaimed_root_port() -> TestResult {
+        let mut fails = [0u8; 128];
+        fails[4] = 8;
+        let claimed = 1u128 << 3;
+        let order = root_ports_to_attempt(&[1, 2, 3, 4, 5], claimed, &fails, 8, 1);
+        if order != [2, 5, 1] {
+            return TestResult::Fail("a cycle did not attempt every unclaimed root port");
+        }
+        if !root_ports_to_attempt(&[], 0, &fails, 8, 0).is_empty() {
+            return TestResult::Fail("ports attempted with nothing connected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/enumeration_wait",
+        smoke_supervisor_attempts_every_unclaimed_root_port
     );
 }

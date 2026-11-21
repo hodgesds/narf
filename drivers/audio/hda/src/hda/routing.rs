@@ -137,6 +137,11 @@ impl IntelHda {
         // SAFETY: this object's lifetime owns the controller and command ring.
         unsafe { self.send_verb(make_verb(cad, nid, verb)) }
     }
+    /// [`Self::verb`] that sleeps on the response instead of spinning.
+    pub(super) async fn verb_async(&self, cad: u8, nid: u8, verb: u32) -> Result<u32, HdaError> {
+        // SAFETY: this object's lifetime owns the controller and command ring.
+        unsafe { self.send_verb_async(make_verb(cad, nid, verb)) }.await
+    }
     pub(super) fn configure_paths(&self, capture: bool, params: HwParams) -> Result<(), HdaError> {
         if capture {
             let path = self.input.lock().clone().ok_or(HdaError::NoOutputStream)?;
@@ -381,15 +386,20 @@ impl IntelHda {
         Ok(ca)
     }
     pub(super) fn refresh_jacks(&self) -> Result<(), HdaError> {
+        narf_scheduler::block_on_spin(self.refresh_jacks_async())
+    }
+    /// `snd_hda_jack_report_sync`: re-read every jack and apply it (HDMI
+    /// sinks, capture source, headphone automute).
+    pub(super) async fn refresh_jacks_async(&self) -> Result<(), HdaError> {
         // HDMI/DP sinks come and go whether or not a stream is prepared.
-        self.refresh_hdmi(true)?;
+        self.refresh_hdmi_async(true).await?;
         // Capture-source selection runs on every tick, independent of
         // playback state: a headset mic plugged while nothing plays
         // must already be the selected source when capture opens.
         // A sense failure keeps the current selection (fail-closed);
         // a running capture stream keeps its configured source until
         // its next configure, which reads the new selection.
-        self.select_capture_source();
+        self.select_capture_source().await;
         if !self.streams[0]
             .lock()
             .ring
@@ -406,7 +416,8 @@ impl IntelHda {
             if pin.pin_config.is_some_and(|p| p.default_device == 2)
                 && pin.pin_caps.unwrap_or(0) & 4 != 0
             {
-                headphones |= self.verb(graph.addr, pin.nid, 0xf09 << 8)? & (1 << 31) != 0;
+                headphones |=
+                    self.verb_async(graph.addr, pin.nid, 0xf09 << 8).await? & (1 << 31) != 0;
             }
         }
         for path in &self.outputs {
@@ -420,7 +431,8 @@ impl IntelHda {
             } else {
                 0x40
             };
-            self.verb(graph.addr, pin.nid, VERB_SET_PIN_WIDGET_CONTROL | ctl)?;
+            self.verb_async(graph.addr, pin.nid, VERB_SET_PIN_WIDGET_CONTROL | ctl)
+                .await?;
         }
         Ok(())
     }
@@ -432,7 +444,7 @@ impl IntelHda {
     /// is plugged and never displace a plugged pin. A sense failure
     /// keeps the current selection. The selection takes effect at
     /// the next capture configure; a running stream is untouched.
-    pub(super) fn select_capture_source(&self) {
+    pub(super) async fn select_capture_source(&self) {
         if self.inputs.is_empty() {
             return;
         }
@@ -452,7 +464,7 @@ impl IntelHda {
                 plugged.push(false);
                 continue;
             }
-            match self.verb(graph.addr, pin.nid, 0xf09 << 8) {
+            match self.verb_async(graph.addr, pin.nid, 0xf09 << 8).await {
                 Ok(reply) => plugged.push(reply & (1 << 31) != 0),
                 Err(_) => return,
             }

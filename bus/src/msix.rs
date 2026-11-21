@@ -98,6 +98,16 @@ impl From<BarError> for MsixError {
     }
 }
 
+/// [`narf_interrupts::dispatch::HwMask`] for one MSI-X entry: `cookie` is
+/// the kernel VA of its Vector Control dword. Bit 0 is the per-entry mask;
+/// the rest are reserved and written 0, as `mask_vector` does.
+fn msix_entry_mask(cookie: u64, masked: bool) {
+    // SAFETY: `program_vector` registered the VA of a live, retained MSI-X
+    // table mapping; a write to Vector Control has no side effect beyond
+    // the mask.
+    unsafe { narf_arch::mmio::write32(cookie, masked as u32) }
+}
+
 /// Snapshot of a device's MSI-X table after `enable_msix`. Holding
 /// this type is the type-level proof that the device had MSI-X
 /// discovered and that the caller holds a live authority cap at the
@@ -360,6 +370,18 @@ impl MsixTable {
             region.write32(entry_off + 8, words[2]);
             region.write32(entry_off + 12, words[3]);
         }
+        // Linux `pci_msi_mask_irq` for this vector: its entry's Vector
+        // Control mask bit, for the unhandled-IRQ detector to silence a
+        // source nobody claims. The table mapping is retained for the
+        // table's life; freeing the vector forgets the registration.
+        narf_interrupts::dispatch::set_hw_mask(
+            irq_vector,
+            narf_interrupts::dispatch::HwMask {
+                kind: "msix-entry",
+                mask: msix_entry_mask,
+                cookie: region.virt + entry_off + 12,
+            },
+        );
 
         Ok(MsixVector {
             vector: vector_idx,

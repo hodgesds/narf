@@ -205,7 +205,62 @@ pub unsafe fn program_msi(
             cfg_write16(cfg.cfg_phys, cfg.cap_offset + 8, data as u16);
         }
     }
+    if cfg.per_vec_mask && crate::vmd_domain::domain_for_device(&cfg.device).is_none() {
+        register_maskbits(cfg, base_irq);
+    }
     Ok(addr)
+}
+
+/// Kernel VA of the Mask Bits register of the MSI function each vector was
+/// programmed on, and the vector's bit in it (Linux `msi_desc::pci.mask_pos`
+/// and the vector's bit of `msi_mask`).
+static MSI_MASK_VA: [core::sync::atomic::AtomicU64; 256] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 256];
+static MSI_MASK_BIT: [core::sync::atomic::AtomicU8; 256] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; 256];
+
+/// Register the per-vector mask of every vector `cfg` delivers (`base_irq`
+/// + i), for the unhandled-IRQ detector (Linux `pci_msi_mask_irq`).
+fn register_maskbits(cfg: &MsiConfig, base_irq: u8) {
+    let mask_off = cfg.cap_offset + if cfg.is_64bit { 0x10 } else { 0x0C };
+    let Some(va) = crate::ecam::ptr_for(cfg.cfg_phys, mask_off) else {
+        return;
+    };
+    for i in 0..cfg.vectors_enabled().min(32) {
+        let Some(vector) = base_irq.checked_add(i as u8) else {
+            break;
+        };
+        MSI_MASK_BIT[vector as usize].store(i as u8, Ordering::Relaxed);
+        MSI_MASK_VA[vector as usize].store(va as u64, Ordering::Release);
+        narf_interrupts::dispatch::set_hw_mask(
+            vector,
+            narf_interrupts::dispatch::HwMask {
+                kind: "msi-maskbit",
+                mask: msi_maskbit,
+                cookie: vector as u64,
+            },
+        );
+    }
+}
+
+/// [`narf_interrupts::dispatch::HwMask`] for one MSI vector: set or clear
+/// its bit in the function's Mask Bits register. `cookie` is the vector.
+fn msi_maskbit(cookie: u64, masked: bool) {
+    let vector = (cookie & 0xFF) as usize;
+    let va = MSI_MASK_VA[vector].load(Ordering::Acquire);
+    if va == 0 {
+        return;
+    }
+    let bit = 1u32 << MSI_MASK_BIT[vector].load(Ordering::Relaxed);
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: `register_maskbits` stored the ECAM VA of this function's
+    // 4-byte-aligned Mask Bits register, which stays mapped.
+    unsafe {
+        let p = va as *mut u32;
+        let cur = core::ptr::read_volatile(p);
+        core::ptr::write_volatile(p, if masked { cur | bit } else { cur & !bit });
+    }
+    compiler_fence(Ordering::SeqCst);
 }
 
 /// Flip the MSI Enable bit (Message Control bit 0). Also writes the

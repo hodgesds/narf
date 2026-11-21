@@ -195,7 +195,23 @@ also consult upstream Linux GPL sources.
   Descriptor capability. `Xhci::mark_as_hub(slot, ports, multi_tt, ttt)`
   programs Hub, MTT, Number of Ports and (high-speed hubs) TT Think Time with
   Configure Endpoint on a copy of the slot context; its failure prevents
-  publication of the hub and downstream children. Hub port power-on waits
+  publication of the hub and downstream children. After it,
+  `UsbHub::activate(xhci)` adds the hub's status-change interrupt-IN
+  endpoint (the interface's first endpoint, `hub::status_endpoint`; transfer
+  `min(wMaxPacketSize, 8)` bytes, `UsbHub::status`) and submits it (Linux
+  `hub_activate`); failure leaves `status` empty and the hub on the walk
+  alone. In its inter-cycle wait the supervisor consumes completed
+  status-change transfers (`attach::hub_status_changed`, which resubmits
+  them and clears C_HUB_LOCAL_POWER / C_HUB_OVER_CURRENT for a hub-level
+  change) and starts the next cycle at once when one reported a change
+  (`hub_irq` → `kick_hub_wq`). `connected_downstream_ports` acknowledges
+  each port's C_PORT_CONNECTION, C_PORT_ENABLE, C_PORT_OVER_CURRENT,
+  C_PORT_RESET and (USB 3.x hubs) C_BH_PORT_RESET, C_PORT_LINK_STATE and
+  C_PORT_CONFIG_ERROR (C_PORT_SUSPEND stays with the remote-wakeup
+  watch). The
+  supervisor tries one root port per cycle but does not park while another
+  connected, unclaimed port with retry budget remains
+  (`enumeration_wait::root_ports_to_attempt`). Hub port power-on waits
   `bPwrOn2PwrGood` (at least 100 ms); a hub port reset waits 10 ms before the
   first status read, allows 800 ms and then 50 ms of reset recovery.
 - `hid::BootKeyboard::attach(..., identity: InputId)` publishes an evdev
@@ -234,6 +250,11 @@ also consult upstream Linux GPL sources.
   opening a fresh idle window — a suspended port gates the very
   interrupt endpoint the pump polls, so the resume has to come
   from the supervisor side of the pump, not from report traffic.
+  No pump holds its per-controller registry lock (IRQ-safe) across a
+  binding: the boot keyboard and boot mouse pumps move the bindings out
+  for the pass (`hid::pump_unlocked`), the others snapshot them, so the
+  event-ring drain, input routing and the pumps' console notes run with
+  interrupts enabled.
 - USB-HID RMI4 / Elan touchpads (issue #1681): after the PTP branch
   in the attach cascade, `hid::rmi_elan` classifies by VID/PID
   against the existing `RMI_DEVICE_TABLE` / `ELAN_DEVICE_TABLE`
@@ -439,11 +460,27 @@ also consult upstream Linux GPL sources.
   Linux `usb_kill_urb` → `xhci_urb_dequeue` → `xhci_handle_cmd_stop_ep`. The
   first 16 timeouts per controller also log the EP0 output-context state and
   dequeue, USBSTS, PORTSC, the TD's receipts and any unmatched Transfer
-  Events for the slot. A timed-out *command* is still only retired
-  (tombstoned); Command Abort (CRCR.CA) is not issued.
+  Events for the slot.
+- A timed-out *command* abandons its receipt and aborts the command ring
+  (Linux `xhci_handle_command_timeout`): a timed-out Stop Endpoint is
+  controller-fatal (`needs_recovery()` turns true and the supervisor runs
+  `recover_controller`); otherwise, with CRCR.CRR set, CRCR.CA is written
+  (full 64-bit write naming the executing command), CRR must clear within
+  5 s and the Command Ring Stopped completion follow within 2 s, else the
+  controller is reset. Once stopped, every abandoned command still on the
+  ring is rewritten as a No Op Command TRB (cycle bit kept) and the
+  doorbell restarts the ring; new commands queue without a doorbell while
+  the abort runs. An abandoned receipt keeps its ring entry reserved until
+  the controller completes the command (normally, Command Aborted, or as
+  the No Op) or completes a later command (execution is in ring order, so
+  a lost completion cannot pin the entry), so an entry is never reused
+  while the controller may fetch it. A Command Ring Stopped completion
+  completes no receipt.
 - Root-port reset waits 50 ms (TRSTRCY 10 ms + 40 ms, Linux `hub_port_reset`,
   same as the hub-class reset) before the first SETUP, and Address Device
   waits 10 ms after its successful completion (Linux `hub_port_init`).
+- `Xhci::poll_isoch_in(token, out)` polls a TD from `begin_isoch_in`
+  without waiting, as `poll_bulk_in` does: `None` keeps it staged.
 - `USBDevice::{begin_bulk_in,begin_bulk_out}` submit one 1..4096-byte TD
   and return a `BulkToken`; `poll_bulk_in(token, out)` / `poll_bulk_out(token)`
   return `None` while the same TD remains active. A receive buffer must cover
@@ -695,6 +732,23 @@ also consult upstream Linux GPL sources.
   CPU's contention cannot send an owned completion into a lossy fallback.
   Identical duplicates are idempotent; conflicting results poison reuse.
   Command-ring entries cannot overwrite an unconsumed or abandoned receipt.
+- A Transfer Event for EP0 that no control receipt latches (a late event
+  for a completed or cancelled TD, or a slot without a device) is dropped
+  and counted, never queued: nothing takes EP0 events from the shared
+  queue, and one sitting there kept `has_pending_transfer_events()` true
+  for good (Linux `handle_tx_event` drops an event matching no TD).
+  Unlatched interrupt, bulk and isochronous events still queue for their
+  pumps.
+- The interrupt handler services each controller in Linux `xhci_irq`
+  order: USBSTS all-ones, HCE or HSE is fatal (no event handled, recovery
+  requested); without USBSTS.EINT the interrupt is not that controller's;
+  otherwise EINT then IMAN.IP are acknowledged before the drain, at most 64
+  events are drained, and ERDP is written once with EHB cleared. Ring
+  pollers in task context write ERDP with EHB when they find the ring
+  empty after consuming events, and every drain updates ERDP (EHB kept)
+  every half segment. Interrupt moderation is 40 µs (IMODI 160).
+- Reclaiming a slot (`purge_slot_events`) also drops the endpoint
+  completion wakers registered for it.
 - `class_registry::dispatch_probe(device, config)` evaluates exact VID/PID
   entries against the device descriptor and class-triple entries against
   Interface Descriptors in `config`. A class-only entry is an explicit
@@ -980,9 +1034,18 @@ also consult upstream Linux GPL sources.
   interface; bind configures the largest-budget complete alternate
   together with the base three endpoints and SET_INTERFACEs to it
   after SET_CONFIGURATION, and the registered transport carries SCO
-  over `isoch_out` / `isoch_in` (`send_sco` / `recv_sco`), with
+  over isochronous TDs (`send_sco` / `recv_sco`), with
   `select_sco_alt_setting` switching down to the smallest alternate
-  that fits a given payload. A device with no isoch endpoints still
+  that fits a given payload. These run inside executor polls (the HCI
+  pump), so none uses the halting `block_on`: `recv_sco` polls an iso-IN
+  TD kept staged between polls (`Xhci::poll_isoch_in`) — staged only
+  while a SCO/eSCO link is up, as tracked from the Connection Complete /
+  Synchronous Connection Complete / Disconnection Complete events
+  `recv_event` hands up (Linux `btusb_work` submits isoc IN URBs only
+  while `sco_num` is non-zero) — and `send_sco` / `select_sco_alt_setting`
+  bridge with `block_on_spin`. `clear_rx_waker` clears the endpoint
+  wakers on the controller `register_rx_waker` installed them on, even
+  if it has left the registry. A device with no isoch endpoints still
   binds; its transport refuses SCO with
   `TransportError::Unsupported`, never routing it to bulk-OUT.
 - `MSC_DEVICES` entries are tombstoned on detach, never shifted: a bind

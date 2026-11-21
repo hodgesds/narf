@@ -2405,3 +2405,37 @@ kernel_test_in!(
     "interrupts/timer",
     smoke_next_arm_target_wheel_earlier_than_periodic
 );
+
+/// The soft mask does not reach the hardware, so a source behind it keeps
+/// interrupting its CPU: each such arrival is counted, per vector and per
+/// CPU, without running a handler or moving the fire count.
+fn smoke_irq_masked_arrivals_counted_per_cpu() -> TestResult {
+    let Ok(v) = crate::vector::alloc() else {
+        return TestResult::Fail("no free vector");
+    };
+    let cpu = narf_lib::percpu::current_cpu();
+    crate::disable_irq(v);
+    let fired = crate::fire_count(v);
+    // Lifetime counters: a vector's earlier owners may have left counts.
+    let vector_before = crate::dispatch::masked_fire_count(v);
+    let per_cpu = crate::dispatch::masked_arrivals_on_cpu(cpu);
+    for _ in 0..25 {
+        crate::on_irq(v);
+    }
+    let dropped = crate::dispatch::masked_fire_count(v) - vector_before;
+    let arrivals = crate::dispatch::masked_arrivals_on_cpu(cpu) - per_cpu;
+    let moved = crate::fire_count(v) != fired;
+    crate::enable_irq(v);
+    let _ = crate::vector::free(v);
+    if moved {
+        return TestResult::Fail("a soft-masked arrival moved the fire count");
+    }
+    if dropped != 25 || arrivals != 25 {
+        return TestResult::Fail("soft-masked arrivals were not counted per vector and per CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "interrupts/irq_share",
+    smoke_irq_masked_arrivals_counted_per_cpu
+);
