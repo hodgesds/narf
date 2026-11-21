@@ -348,3 +348,56 @@ impl<const CPUS: usize> Default for RunnableWatch<CPUS> {
         Self::new()
     }
 }
+
+// ── per-CPU hard-IRQ share ──────────────────────────────────────────────
+
+/// Vectors an [`IrqShare`] keeps, busiest first.
+pub const IRQ_TOP_N: usize = 3;
+
+/// One CPU's interrupts over one watchdog window: how many, and the
+/// busiest vectors. Built by [`Self::add`]ing each vector's count; no
+/// allocation, so the timer interrupt can build it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct IrqShare {
+    /// Interrupts of every vector in the window.
+    pub total: u64,
+    /// `(vector, count)`, busiest first; unused entries have count 0.
+    pub top: [(u8, u64); IRQ_TOP_N],
+}
+
+impl IrqShare {
+    /// Count `count` interrupts of `vector`.
+    pub fn add(&mut self, vector: u8, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.total = self.total.saturating_add(count);
+        let Some(at) = self.top.iter().position(|&(_, c)| count > c) else {
+            return;
+        };
+        self.top.copy_within(at..IRQ_TOP_N - 1, at + 1);
+        self.top[at] = (vector, count);
+    }
+
+    /// The busiest vector, if any interrupt was counted.
+    pub fn busiest(&self) -> Option<(u8, u64)> {
+        Some(self.top[0]).filter(|&(_, c)| c != 0)
+    }
+}
+
+/// `count` events over `elapsed_ns` as a rate per second (0 for an empty
+/// window).
+pub fn per_sec(count: u64, elapsed_ns: u64) -> u64 {
+    if elapsed_ns == 0 {
+        return 0;
+    }
+    ((count as u128 * 1_000_000_000) / elapsed_ns as u128).min(u64::MAX as u128) as u64
+}
+
+/// `part` of `whole` in tenths of a percent, capped at 1000.
+pub fn permille(part: u64, whole: u64) -> u64 {
+    if whole == 0 {
+        return 0;
+    }
+    ((part as u128 * 1000) / whole as u128).min(1000) as u64
+}

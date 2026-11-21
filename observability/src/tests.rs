@@ -1201,3 +1201,38 @@ kernel_test_in!(
     "observability/watchdog",
     smoke_obs_watchdog_runnable_task_reported_once_per_stall
 );
+
+/// The per-CPU hard-IRQ share every stall dump prints: the window's total,
+/// its busiest vectors in order, rates per second over the measured window
+/// and the hard-IRQ time fraction in tenths of a percent.
+fn smoke_obs_watchdog_irq_share_ranks_vectors_and_rates() -> TestResult {
+    use crate::watchdog::{per_sec, permille, IrqShare};
+    let mut share = IrqShare::default();
+    for (vector, count) in [
+        (32u8, 1_000u64),
+        (65, 250_000),
+        (0xF1, 40),
+        (70, 0),
+        (66, 3_000),
+    ] {
+        share.add(vector, count);
+    }
+    if share.total != 254_040 || share.top != [(65, 250_000), (66, 3_000), (32, 1_000)] {
+        return TestResult::Fail("busiest vectors not ranked, or the total is wrong");
+    }
+    if share.busiest() != Some((65, 250_000)) || IrqShare::default().busiest().is_some() {
+        return TestResult::Fail("busiest vector of a window wrong");
+    }
+    // A 2 s window: half the count per second; an empty window is no rate.
+    if per_sec(250_000, 2 * WD_SEC) != 125_000 || per_sec(5, 0) != 0 {
+        return TestResult::Fail("per-second rate over the measured window wrong");
+    }
+    if permille(873, 1000) != 873 || permille(5, 4) != 1000 || permille(1, 0) != 0 {
+        return TestResult::Fail("hard-IRQ time fraction wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_irq_share_ranks_vectors_and_rates
+);

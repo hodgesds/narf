@@ -243,6 +243,11 @@ pub struct Slot {
     /// expected vector doesn't move — the discrepancy points at a
     /// stale or mis-routed Waker registration.
     pub wakes_invoked: AtomicU64,
+    /// Deliveries that arrived while soft-masked and were dropped. The
+    /// soft mask does not reach the hardware, so a source that keeps
+    /// firing behind it costs its CPU an interrupt each time; counted so
+    /// that cost stays visible.
+    pub masked_fired: AtomicU64,
 }
 
 impl core::fmt::Debug for Slot {
@@ -267,6 +272,7 @@ impl Slot {
             handlers: IrqSafeSpinLock::new(Vec::new()),
             wakers: IrqSafeSpinLock::new(Vec::new()),
             wakes_invoked: AtomicU64::new(0),
+            masked_fired: AtomicU64::new(0),
         }
     }
 }
@@ -481,8 +487,12 @@ pub fn on_irq_with_user_state(
 ) {
     let s = &SLOTS[vector as usize];
 
-    // Soft mask check FIRST — gives `disable_irq` strict semantics.
+    // Soft mask check FIRST — gives `disable_irq` strict semantics: no
+    // handler, waker or fire count. The arrival itself is still counted,
+    // apart, because the soft mask leaves the source firing.
     if s.masked.load(Ordering::Acquire) {
+        s.masked_fired.fetch_add(1, Ordering::Relaxed);
+        MASKED_ARRIVALS[current_cpu_index()].fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -623,6 +633,33 @@ fn current_cpu_index() -> usize {
         0
     }
 }
+
+// ── Soft-mask arrivals and handler names (stall diagnostics) ───────
+
+/// Deliveries `cpu` took on soft-masked vectors since boot.
+pub fn masked_arrivals_on_cpu(cpu: usize) -> u64 {
+    MASKED_ARRIVALS
+        .get(cpu)
+        .map_or(0, |c| c.load(Ordering::Relaxed))
+}
+
+/// Deliveries of `vector` dropped by its soft mask since boot.
+pub fn masked_fire_count(vector: u8) -> u64 {
+    SLOTS[vector as usize].masked_fired.load(Ordering::Relaxed)
+}
+
+/// The first handler name on `vector`, without waiting for its lock (a
+/// stall dump may run while a wedged CPU holds it).
+pub fn handler_name_try(vector: u8) -> Option<&'static str> {
+    SLOTS[vector as usize]
+        .handlers
+        .try_lock()
+        .and_then(|g| g.first().map(|h| h.name))
+}
+
+/// Per-CPU count of deliveries dropped by a soft mask.
+static MASKED_ARRIVALS: [AtomicU64; PERCPU_FIRES_MAX] =
+    [const { AtomicU64::new(0) }; PERCPU_FIRES_MAX];
 
 // ── Counters ───────────────────────────────────────────────────────
 
