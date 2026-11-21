@@ -1,8 +1,17 @@
-//! Navi22 DCN3.0 and Phoenix DCN3.1.4 DCCG: the per-DPP clock dividers, the OTG pixel rate dividers and
-//! the DP stream clock routing a USB4 DPIA needs. Register offsets and fields
-//! are `dcn_3_1_4_offset.h`/`dcn_3_1_4_sh_mask.h` at DCCG base index 1;
-//! sequencing follows Linux `dcn314_dccg.c`, `dcn20_dccg.c` and
+//! Navi22 DCN3.0, Phoenix DCN3.1.4 and Raphael DCN3.1.5 DCCG: the per-DPP
+//! clock dividers, the OTG pixel rate dividers and the DP stream clock routing
+//! a USB4 DPIA needs. Register offsets and fields are
+//! `dcn_3_1_4_offset.h`/`dcn_3_1_4_sh_mask.h` at DCCG base index 1; sequencing
+//! follows Linux `dcn314_dccg.c`, `dcn31_dccg.c`, `dcn20_dccg.c` and
 //! `dcn314_hwseq.c::dcn314_calculate_dccg_k1_k2_values`.
+//!
+//! DCN 3.1.5 builds `dccg31`, not `dccg314`. Every register this module
+//! shares with it sits at the same offset in `dcn_3_1_5_offset.h`, and
+//! `dccg31_update_dpp_dto` is `dccg2_update_dpp_dto` plus an early return for
+//! a root-gated DPP clock, which nothing here gates. `dccg31_funcs` has no
+//! `set_pixel_rate_div`, `set_dtbclk_p_src` or `trigger_dio_fifo_resync`
+//! (DTBCLK_P_CNTL and OTG_PIXEL_RATE_DIV do not exist), and dcn315 has no
+//! USB4 DPIA, so those operations are DCN 3.1.4's alone.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_dcn_clk::{Clocks, Consumers, Error},
@@ -12,8 +21,9 @@ use core::future::Future;
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-// Profile selects DCN30 or DCN314; shared ids below were compared against
-// both Linux offset and mask headers. Generation differences stay explicit.
+// Profile selects DCN30, DCN314 or DCN315; shared ids below were compared
+// against each Linux offset and mask header. Generation differences stay
+// explicit.
 // linux-ctx: hdr=dcn seg=1
 const DPSTREAMCLK_CNTL: u64 = 0x004a; // linux: n/a (DCN 3.1.4 path; refused on Navi22)
 const DTBCLK_P_CNTL: u64 = 0x0068; // linux: n/a (DCN 3.1.4 path; refused on Navi22)
@@ -152,7 +162,7 @@ impl<I: Io> Engine<I> {
     /// The OTG pixel rate dividers. A DisplayPort 8b/10b stream with one pixel
     /// per container and no ODM combine divides by one then four.
     fn set_pixel_rate_div(&mut self, otg: u8, k1: Divider, k2: Divider) -> Result<(), Error> {
-        if self.profile.is_dcn30() {
+        if !self.profile.is_dcn314() {
             return Err(Error::Unsupported);
         }
         if otg >= self.profile.pipes() {
@@ -171,7 +181,7 @@ impl<I: Io> Engine<I> {
     /// selects DPREFCLK, so an enable alone routes the wrong clock. Three bits
     /// per OTG, a two-bit select then the enable.
     fn set_dtbclk_p_src(&mut self, otg: u8, source: StreamClock) -> Result<(), Error> {
-        if self.profile.is_dcn30() {
+        if !self.profile.is_dcn314() {
             return Err(Error::Unsupported);
         }
         if otg >= self.profile.pipes() {
@@ -193,7 +203,7 @@ impl<I: Io> Engine<I> {
     /// every DPIA takes OTG 0, so a stream on any other pipe runs at the wrong
     /// pixel rate. Four bits per DPIA, a three-bit OTG select then the enable.
     fn set_dp_stream_clock(&mut self, dpia: u8, otg: u8, source: StreamClock) -> Result<(), Error> {
-        if self.profile.is_dcn30() {
+        if !self.profile.is_dcn314() {
             return Err(Error::Unsupported);
         }
         if dpia >= self.profile.pipes() || otg >= self.profile.pipes() {
@@ -217,6 +227,10 @@ impl<I: Io> Engine<I> {
         Ok((value & 0x7f, (value >> 8) & 0x7f))
     }
     fn resync_dio_fifo(&mut self) -> Result<(), Error> {
+        // dccg31 has no trigger_dio_fifo_resync.
+        if self.profile == Profile::Dcn315 {
+            return Err(Error::Unsupported);
+        }
         let (_, read_divider) = self.dispclk_dividers()?;
         // linux-lit: 0x7f=DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_WDIVIDER_MASK
         self.update(DENTIST_DISPCLK_CNTL, 0x7f, read_divider)
@@ -277,7 +291,7 @@ impl<I: Io> Engine<I> {
     }
 }
 
-/// The sole owner of the DCN314 clock generator. Holding it does not grant the
+/// The sole owner of the DCN314/DCN315 clock generator. Holding it does not grant the
 /// display clock mailbox: the global DISPCLK/DPPCLK still belong to
 /// [`crate::amdgpu_dcn_clk::ClockManager`], and this only divides them.
 #[derive(Debug)]
@@ -289,11 +303,6 @@ impl Dccg {
     /// and must not let another client reprogram the same dividers.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
         let profile = Profile::resolve(gpu)?;
-        // DCN 3.1.5 builds dccg31, which has neither DTBCLK_P_CNTL nor
-        // OTG_PIXEL_RATE_DIV (both dccg314). Refused until that is ported.
-        if profile == Profile::Dcn315 {
-            return Err(Error::Unsupported);
-        }
         let base = profile.bank(gpu, 1, LAST_REG)?; // linux-lit: 1=mmDENTIST_DISPCLK_CNTL_BASE_IDX
                                                     // linux-ctx: reset
         Ok(Self(Engine {
@@ -305,6 +314,11 @@ impl Dccg {
             reference_dppclk_khz: 0,
             profile,
         }))
+    }
+    /// Whether this DCCG has the OTG K1/K2 pixel rate dividers. Linux skips
+    /// `set_pixel_rate_div` where `dccg->funcs` has none — dccg31 (DCN 3.1.5).
+    pub fn has_pixel_rate_div(&self) -> bool {
+        self.0.profile.is_dcn314()
     }
     pub fn set_pixel_rate_div(&mut self, otg: u8, k1: Divider, k2: Divider) -> Result<(), Error> {
         self.0.set_pixel_rate_div(otg, k1, k2)

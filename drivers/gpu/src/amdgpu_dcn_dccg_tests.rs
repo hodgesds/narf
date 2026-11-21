@@ -273,3 +273,36 @@ kernel_test_in!(
     "drivers/gpu/dcn-dccg",
     dccg_navi22_dentist_waits_for_both_clock_changes
 );
+
+/// DCN 3.1.5 (`dccg31_funcs`): the DPP DTOs are DCN 3.1.4's registers
+/// (`dcn_3_1_5_offset.h` regDPPCLK0_DTO_PARAM 0x0099, regDPPCLK_DTO_CTRL
+/// 0x00b6), four of them; the K1/K2 dividers, DTBCLK_P mux, DPIA stream clock
+/// and DIO FIFO resync are dccg314's and are refused without a write.
+fn dccg_dcn315_keeps_dpp_dtos_and_refuses_dccg314_only_operations() -> TestResult {
+    let mut dccg = dccg();
+    dccg.profile = Profile::Dcn315;
+    dccg.reference_dppclk_khz = 600_000;
+    if dccg.dpp_dto(3, 300_000).is_err()
+        || dccg.io.values[0x9c] != 128 | 0xff << 16
+        || dccg.io.values[0xb6] & 0x3000 != 0x1000
+    {
+        return TestResult::Fail("DCN 3.1.5 fourth DPP DTO");
+    }
+    if dccg.dpp_dto(4, 300_000) != Err(Error::Invalid) {
+        return TestResult::Fail("DCN 3.1.5 has four DPPs");
+    }
+    let count = dccg.io.writes.len();
+    if dccg.set_pixel_rate_div(0, Divider::By1, Divider::By4) != Err(Error::Unsupported)
+        || dccg.set_dtbclk_p_src(0, StreamClock::Dtbclk) != Err(Error::Unsupported)
+        || dccg.set_dp_stream_clock(0, 0, StreamClock::Dtbclk) != Err(Error::Unsupported)
+        || dccg.resync_dio_fifo() != Err(Error::Unsupported)
+        || dccg.io.writes.len() != count
+    {
+        return TestResult::Fail("a dccg314-only operation ran on DCN 3.1.5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-dccg",
+    dccg_dcn315_keeps_dpp_dtos_and_refuses_dccg314_only_operations
+);

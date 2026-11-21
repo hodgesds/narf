@@ -547,8 +547,11 @@ impl Pipeline {
         self.clocks.update(requested, false, &mut consumers).await?;
         self.clocks.enter_mission_mode().await?;
         // A DisplayPort stream with one pixel per container and no ODM combine.
-        self.dccg
-            .set_pixel_rate_div(self.pipe, Divider::By1, Divider::By4)?;
+        // dccg31 (DCN 3.1.5) has no K1/K2 dividers, and Linux skips the call.
+        if self.dccg.has_pixel_rate_div() {
+            self.dccg
+                .set_pixel_rate_div(self.pipe, Divider::By1, Divider::By4)?;
+        }
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
             self.dccg.set_dp_stream_clock(
                 self.route.aux,

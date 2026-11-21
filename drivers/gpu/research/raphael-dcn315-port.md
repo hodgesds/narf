@@ -37,7 +37,7 @@ it came from.
 | Connector inventory | DIG BE at 0x20b2 | DIG BE at 0x20b1 | admitted on the DCN30 arm |
 | HUBBUB | hubbub31 | hubbub31 | DET/COMPBUF/CRC registers +0x11 — audit before use |
 | OTG | **optc314** | optc31 | ported (`layout_shift`, optc31 disable) |
-| DCCG | **dccg314** | dccg31 | refused (`Dccg::new`) |
+| DCCG | **dccg314** | dccg31 | ported (DPP DTOs; dccg314-only operations refused) |
 | DIO stream encoder | **dcn314** | dcn30 | ported (enc2 unblank with DIG_START) |
 | DIO link encoder | dcn31 | dcn31 | ported (`DIG_WINDOWS`: DIG_BE_CNTL/EN_CNTL −1); PHY commands still need DMUB |
 | Clock manager | dcn314 + SMU 13.0.4 | dcn315 + SMU 13.0.5 | refused (SMU version list) |
@@ -129,7 +129,11 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
      drops the enable, waits up to 100.2 ms for `DP_VID_STREAM_STATUS` to clear,
      then sets `DP_STEER_FIFO_RESET`. NARF now does the same, except that a
      timeout is an error and the steering reset is then withheld.
-6. DCCG: `dccg31.c` pixel-rate and DTBCLK paths.
+6. ~~DCCG~~ (done). Every shared DCCG register keeps its DCN 3.1.4 offset;
+   `dccg31_update_dpp_dto` is dccg2's plus a root-gating early return.
+   `dccg31_funcs` lacks `set_pixel_rate_div`, `set_dtbclk_p_src` and
+   `trigger_dio_fifo_resync`, so the display skips the K1/K2 dividers as Linux
+   does. dcn315 has no USB4 DPIA (dcn314: `usb4_dpia_count = 4`).
 7. Clock manager: `dcn315_smu.c` mailbox (indirect message write) and
    `dcn315_clk_mgr.c` DPM table parse.
 8. DML: dml31 with the dcn315 SoC bounding box; HUBBUB DET/COMPBUF offsets.

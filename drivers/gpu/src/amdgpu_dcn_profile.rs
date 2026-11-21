@@ -8,8 +8,9 @@
 //! those blocks take [`Profile::Dcn315`] on their DCN 3.1.4 path. The timing
 //! generator (optc31, not optc314) has its own register layout in
 //! `amdgpu_dcn_otg::layout_shift`; the DIO stream encoder (dcn30's, not
-//! dcn314's) takes the DCN30 unblank. The DCCG (dccg31, not dccg314) and
-//! clock manager (SMU 13.0.5 mailbox) differ, and refuse it until ported.
+//! dcn314's) takes the DCN30 unblank; the DCCG (dccg31, not dccg314) offers
+//! only the operations dccg31 has. The clock manager (SMU 13.0.5 mailbox)
+//! differs, and refuses it until ported.
 use crate::{amdgpu, amdgpu_dcn_clk::Error, amdgpu_discovery as ip};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,8 +179,9 @@ mod tests {
             if Stream::new(&gpu, cap, 4).is_err() || Stream::new(&gpu, cap, 5).is_ok() {
                 return TestResult::Fail("DCN 3.1.5 stream encoder capacity");
             }
-            if !matches!(Dccg::new(&gpu, cap), Err(Error::Unsupported)) {
-                return TestResult::Fail("an unported DCN 3.1.4 layout admitted DCN 3.1.5");
+            match Dccg::new(&gpu, cap) {
+                Ok(dccg) if !dccg.has_pixel_rate_div() => {}
+                _ => return TestResult::Fail("DCN 3.1.5 DCCG is dccg31, without K1/K2"),
             }
         }
         TestResult::Pass
