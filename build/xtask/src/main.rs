@@ -769,7 +769,7 @@ mod qemu_append_tests {
         let cap = narf_boot_protocol::CMDLINE_CAP;
         // The kernel keeps CMDLINE_CAP - 1 bytes: that much is accepted.
         let fits = "x".repeat(cap - 1);
-        assert_eq!(qemu_append(&[fits.clone()]).unwrap(), fits);
+        assert_eq!(qemu_append(std::slice::from_ref(&fits)).unwrap(), fits);
         // One byte more would lose the tail, as a long `test_subsystem=`
         // list did: refused, naming the size.
         let filter = format!("test_subsystem={}", "a/b,".repeat(cap / 4));

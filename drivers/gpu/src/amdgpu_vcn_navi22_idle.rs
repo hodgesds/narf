@@ -233,7 +233,8 @@ const GATE_SLOW_NS: u64 = 100_000_000;
 static LAST_GATE: narf_lib::sync::IrqSafeSpinLock<Option<GateTrace>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// The most recent gate attempt.
+/// The most recent gate attempt. Read only by the gated idle tests.
+#[allow(dead_code)]
 pub(crate) fn last_gate() -> Option<GateTrace> {
     *LAST_GATE.lock()
 }

@@ -223,7 +223,7 @@ fn poll_boot_keys_in(
     cx: &mut core::task::Context<'_>,
     mut locks: Option<&mut KeyLocks>,
 ) -> Poll<Result<(), Error>> {
-    let Some(mut slot) = acquire(&KEY_WORK, locks.as_deref_mut().map(|l| &mut l.work), cx) else {
+    let Some(mut slot) = acquire(&KEY_WORK, locks.as_mut().map(|l| &mut l.work), cx) else {
         return Poll::Pending;
     };
     let Some(work) = slot.as_mut() else {
@@ -232,8 +232,7 @@ fn poll_boot_keys_in(
     if work.poll(cx).is_pending() {
         return Poll::Pending;
     }
-    let Some(mut owner) = acquire(&BOOT_OWNER, locks.as_deref_mut().map(|l| &mut l.owner), cx)
-    else {
+    let Some(mut owner) = acquire(&BOOT_OWNER, locks.as_mut().map(|l| &mut l.owner), cx) else {
         return Poll::Pending;
     };
     if owner.is_some() {
