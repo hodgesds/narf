@@ -51,6 +51,10 @@ kernel-test = [
 [dependencies]
 narf-driver-macros = { path = "../../../driver-macros" }
 async-trait        = "0.1"
+# Transport-agnostic chip register-programming core (`RegIo`). Kernel-crate-
+# free, so it links in the `module` build too; the MAC/PHY/RF/station bring-up
+# migrates onto it (see the datapath design doc).
+narf-drivers-wireless-rtl-chip = { path = "../rtl-chip" }
 
 narf-bus          = { path = "../../../bus", optional = true }
 narf-capabilities = { path = "../../../capabilities", optional = true }

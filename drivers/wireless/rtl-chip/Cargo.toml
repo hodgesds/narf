@@ -1,0 +1,28 @@
+# Shared, transport-agnostic Realtek chip register-programming core.
+#
+# The builtin rtw88 MAC/PHY/RF/station bring-up is written against a register
+# I/O trait; this crate holds that abstraction (`RegIo`) so the same register
+# sequences can run from the builtin driver (over its native transport) AND
+# from the loadable `.ko` (over the `narf_usb_*` C-ABI). Kernel-crate-free
+# (`core` only), so a `module`-feature `.ko` can link it — see
+# drivers/wireless/specification/rtw88-usb-module-datapath.md (Model A, the
+# "extract an Io-generic core" refactor).
+#
+# Stage 1 (this crate's initial contents): the `RegIo` trait + `ChipError`.
+# The MAC/PHY/RF/station register programming moves onto it in later slices.
+
+[package]
+name         = "narf-drivers-wireless-rtl-chip"
+description  = "Transport-agnostic Realtek chip register-programming core (RegIo)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless_rtl_chip"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

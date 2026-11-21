@@ -20,6 +20,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use narf_drivers_wireless_rtl_chip::{ChipError, RegIo};
+
 /// `usb_device_id` VID/PID match (`narf_bus::module_usb::MATCH_VENDOR_PRODUCT`).
 const MATCH_VENDOR_PRODUCT: u16 = 1 << 0;
 
@@ -625,6 +627,47 @@ fn reg_poll32(t: u64, a: u16, mask: u32, target: u32) -> Option<()> {
         }
     }
     None
+}
+
+/// [`RegIo`] over the `.ko`'s synchronous `narf_usb_*` EP0 control path.
+///
+/// The MAC/PHY/RF/station bring-up is migrating into
+/// `narf-drivers-wireless-rtl-chip` generic over `RegIo`; in the module build
+/// it will run against this adapter (the builtin driver supplies its own
+/// `RegIo` over the native transport). The firmware download above uses the
+/// free `reg_*`/`ctl_*` helpers today and moves onto the trait with that work.
+struct UsbRegIo {
+    token: u64,
+}
+
+impl RegIo for UsbRegIo {
+    fn read8(&mut self, reg: u16) -> Result<u8, ChipError> {
+        reg_read8(self.token, reg).ok_or(ChipError::Access)
+    }
+    fn read16(&mut self, reg: u16) -> Result<u16, ChipError> {
+        reg_read16(self.token, reg).ok_or(ChipError::Access)
+    }
+    fn read32(&mut self, reg: u16) -> Result<u32, ChipError> {
+        reg_read32(self.token, reg).ok_or(ChipError::Access)
+    }
+    fn write8(&mut self, reg: u16, value: u8) -> Result<(), ChipError> {
+        reg_write8(self.token, reg, value).ok_or(ChipError::Access)
+    }
+    fn write16(&mut self, reg: u16, value: u16) -> Result<(), ChipError> {
+        reg_write16(self.token, reg, value).ok_or(ChipError::Access)
+    }
+    fn write32(&mut self, reg: u16, value: u32) -> Result<(), ChipError> {
+        reg_write32(self.token, reg, value).ok_or(ChipError::Access)
+    }
+    fn delay_us(&mut self, us: u32) {
+        // Coarse busy delay; the bring-up's real pacing is register readback.
+        // The volatile counter keeps the loop from being optimised away.
+        let mut spin = 0u32;
+        for _ in 0..us.saturating_mul(40) {
+            // SAFETY: `spin` is a local; the volatile access just blocks DCE.
+            unsafe { core::ptr::write_volatile(&mut spin, spin.wrapping_add(1)) };
+        }
+    }
 }
 
 // ── Freestanding mem intrinsics ─────────────────────────────────────────────

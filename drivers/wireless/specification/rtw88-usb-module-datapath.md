@@ -119,6 +119,33 @@ version, never by silently repurposing an opcode):
 (The exact wire layout is specified per-opcode in a follow-up once the first two
 stages land; keeping it minimal avoids over-committing the contract.)
 
+## MAC/PHY/RF/station via an extracted `RegIo` core
+
+MAC/PHY/RF/IQK/station bring-up is ~2–3k lines of chip register programming.
+The builtin driver already writes it against a register-I/O trait, so rather
+than reimplement it in the module (a huge, QEMU-untestable transcription), the
+register-programming code is **extracted into a kernel-crate-free crate both
+sides share**: `narf-drivers-wireless-rtl-chip`. The builtin driver drives it
+over its native transport; the `.ko` supplies a `RegIo` impl over the
+`narf_usb_*` EP0 path (`module_usb::UsbRegIo`). No duplication.
+
+Staged, each slice non-breaking (the builtin re-exports what moves):
+
+1. **`RegIo` + `ChipError`** (done) — the register-I/O abstraction (read/write
+   8/16/32 + `delay_us`; provided `update*`/`poll32`) + the module's
+   `UsbRegIo`. Kernel-crate-free (`core` only), so it links in the `.ko`.
+2. **MAC** — move `mac.rs` + `mac/values.rs` + the chip tables onto `RegIo`.
+   Its one `narf_time` use becomes a `RegIo::poll32` attempt count; the
+   `super::usb` queue/page lookups are passed in as plain `MacParams` so the
+   core stays transport- and kernel-crate-free.
+3. **PHY** (`phy.rs`) and **RF** (`radio.rs`) + IQK calibration.
+4. **Station** bring-up, then the netdev + cfg80211 control plane (the native
+   family host — see the resolved decisions above).
+
+Only register-level helpers move onto `RegIo`; the datapath-specific transport
+(bulk reserved-page firmware writes, `narf_firmware_*`, `narf_netif_*`) stays in
+the `.ko`.
+
 ## Staging (each stage independently reviewable + testable)
 
 1. **USB transport adapter + enumerate/firmware proof.** `module_usb` implements
