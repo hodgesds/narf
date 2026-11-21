@@ -55,11 +55,11 @@ use super::{
     admission, ar9003, calibration, channels, interface, packet, packet_native, phy, station,
     BringUpError, RetainedRadio, CLAIMED_ADDRESS, CONTROL,
 };
-use crate::qualcomm_regulatory::Factory;
 use alloc::{boxed::Box, sync::Arc};
 use core::fmt::Write as _;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+use narf_drivers_wireless_ath_core::qualcomm_regulatory::Factory;
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 use super::identity::{self, RegisterIo};
@@ -473,13 +473,13 @@ pub(super) fn probe(
         previous
     };
     let occupied = previous.is_some();
-    crate::qualcomm_pci::park(&device, &cap, false, previous)?;
+    narf_drivers_wireless_ath_core::qualcomm_pci::park(&device, &cap, false, previous)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath9k singleton already owns another radio",
         ));
     }
-    let mmio = crate::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
+    let mmio = narf_drivers_wireless_ath_core::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
     if mmio.len < REQUIRED_BAR {
         return Err(narf_bus::ProbeError::BadDevice);
     }

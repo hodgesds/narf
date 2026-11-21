@@ -29,19 +29,17 @@
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::{minor, open_loop, MODAL_2G, MODAL_5G};
-use crate::{
-    ath9k::{
-        chips::{Chip, MAP_DEF},
-        identity::{eeprom_word, BringUpError, Identity, RegisterIo},
-        phy::{
-            channel::Tune,
-            power::{indices, interpolate, vpd},
-            rates::{initial_ctl, initial_ctl_5ghz, limit_with},
-            rmw,
-        },
+use crate::ath9k::{
+    chips::{Chip, MAP_DEF},
+    identity::{eeprom_word, BringUpError, Identity, RegisterIo},
+    phy::{
+        channel::Tune,
+        power::{indices, interpolate, vpd},
+        rates::{initial_ctl, initial_ctl_5ghz, limit_with},
+        rmw,
     },
-    qualcomm_regulatory::Factory,
 };
+use narf_drivers_wireless_ath_core::qualcomm_regulatory::Factory;
 
 const TX_MASK: usize = 19;
 const PWR_TABLE_OFFSET: usize = 41;

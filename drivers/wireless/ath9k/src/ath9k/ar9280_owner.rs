@@ -168,13 +168,13 @@ pub(super) fn probe(
         previous
     };
     let occupied = previous.is_some();
-    crate::qualcomm_pci::park(&device, &cap, false, previous)?;
+    narf_drivers_wireless_ath_core::qualcomm_pci::park(&device, &cap, false, previous)?;
     if occupied {
         return Err(narf_bus::ProbeError::Other(
             "ath9k singleton already owns another radio",
         ));
     }
-    let mmio = crate::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
+    let mmio = narf_drivers_wireless_ath_core::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
     if mmio.len < phy::REQUIRED_BAR {
         return Err(narf_bus::ProbeError::BadDevice);
     }
