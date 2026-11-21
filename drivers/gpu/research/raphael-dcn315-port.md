@@ -38,8 +38,8 @@ it came from.
 | HUBBUB | hubbub31 | hubbub31 | DET/COMPBUF/CRC registers +0x11 — audit before use |
 | OTG | **optc314** | optc31 | ported (`layout_shift`, optc31 disable) |
 | DCCG | **dccg314** | dccg31 | refused (`Dccg::new`) |
-| DIO stream encoder | **dcn314** | dcn30 | refused (`Stream::new`) |
-| DIO link encoder | dcn31 | dcn31 | refused (`amdgpu_dio` version list); DIG_BE_CNTL/EN_CNTL −1 |
+| DIO stream encoder | **dcn314** | dcn30 | ported (enc2 unblank with DIG_START) |
+| DIO link encoder | dcn31 | dcn31 | ported (`DIG_WINDOWS`: DIG_BE_CNTL/EN_CNTL −1); PHY commands still need DMUB |
 | Clock manager | dcn314 + SMU 13.0.4 | dcn315 + SMU 13.0.5 | refused (SMU version list) |
 | DMUB | DCN314 | DCN31 functions | refused (`amdgpu_dmub` version list) |
 | DML | dml314 | dml31 + dcn315 SoC BB (`dcn31_fpu.c`) | not started |
@@ -103,8 +103,25 @@ concentrated in DIG (225), OTG (200), DC perfmon (190), VPG (70) and DCHUBBUB
    Open question for the Phoenix path: NARF's DCN 3.1.4 `disable()` also
    parks segments and clears `OPTC_MEM_SEL`, which is optc31's sequence;
    Linux's `optc314_disable_crtc` does neither. It was left unchanged here.
-4. DIO link encoder and inventory: DIG BE −1, behind a DCN315 version entry.
-5. Stream encoder: `dcn30_dio_stream_encoder.c` enable/start sequence.
+4. ~~DIO link encoder: DIG BE −1, behind a DCN315 version entry~~ (done).
+   Every DP0 register and mask the module uses is identical in the 3.1.5
+   headers. Both DCNs set `dmub_command_table`, so PHY control goes through
+   DMUB's VBIOS transmitter command on both; nothing reaches it on Raphael
+   until step 9.
+5. ~~Stream encoder~~ (done). `dcn30_str_enc_funcs`: `enc2` unblank pulses
+   `DIG_FE_CNTL.DIG_START` (0x208b, mask 0x400) before the steering-FIFO
+   reset; there is no `DP_PIXEL_PER_CYCLE_PROCESSING_MODE` field.
+
+   Two open questions on the shared DCN 3.1.4 path, found while diffing and
+   not changed here:
+   - `enc314_stream_encoder_dp_unblank` ends with `enc314_enable_fifo`
+     (`DIG_FIFO_CTRL0`: READ_START_LEVEL 7, reset pulse, `DIG_FIFO_ENABLE`),
+     "now needs to be explicitly enabled ... per HW docs". NARF's DCN 3.1.4
+     unblank never enables the DIG FIFO, so a DIG the GOP did not leave
+     running may never emit video.
+   - `enc1_stream_encoder_dp_blank` (both DCNs) sets
+     `DP_VID_STREAM_DIS_DEFER = 2`, waits up to about 102 ms and then sets
+     `DP_STEER_FIFO_RESET`. NARF's `blank` waits 50 ms and does neither.
 6. DCCG: `dccg31.c` pixel-rate and DTBCLK paths.
 7. Clock manager: `dcn315_smu.c` mailbox (indirect message write) and
    `dcn315_clk_mgr.c` DPM table parse.

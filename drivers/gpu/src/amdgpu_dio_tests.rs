@@ -86,6 +86,7 @@ fn encoder(route: Route) -> Encoder<Regs> {
         io: Regs::new(),
         cap: Cap::bootstrap(),
         route,
+        dig: DCN_3_1_4_DIG,
         state: State::Disabled,
         settings: None,
     }
@@ -461,4 +462,41 @@ fn dio_register_window_matches_the_amd_headers() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dio",
     dio_register_window_matches_the_amd_headers
+);
+
+/// DCN 3.1.5's DIG backend pair, read off `dcn/dcn_3_1_5_offset.h`
+/// (`regDIG0_DIG_BE_CNTL` 0x20b0, `regDIG0_DIG_BE_EN_CNTL` 0x20b1, DIG1 at
+/// +0x100), and the encoder addressing through it: on Raphael, DIG1's
+/// backend control is 0x21b0 and its enable 0x21b1 — DCN 3.1.4's control.
+fn dio_dcn315_dig_backend_sits_one_dword_lower() -> TestResult {
+    if DCN_3_1_5_DIG.be_cntl != 0x20b0
+        || DCN_3_1_5_DIG.be_en_cntl != 0x20b1
+        || DCN_3_1_5_DIG.version != (3, 1, 5)
+        || DCN_3_1_4_DIG.version != (3, 1, 4)
+        || DIG_WINDOWS.len() != 2
+    {
+        return TestResult::Fail("DCN 3.1.5 DIG window does not match dcn_3_1_5_offset.h");
+    }
+    let mut source = encoder(route());
+    source.dig = DCN_3_1_5_DIG;
+    source.settings = Some(settings());
+    source.state = State::Trained;
+    source.io.values[0x21b0] = 0x7f00;
+    source.io.values[0x21b1] = 0; // PHY already down.
+    let mut fw = Fw::default();
+    if run(source.disable(&mut fw)).is_err()
+        || source.io.values[0x21b0] & 0x7f00 != 0
+        || source.state() != State::Disabled
+    {
+        return TestResult::Fail("DCN 3.1.5 disable must detach DIG1 at 0x21b0");
+    }
+    // Nothing went to DCN 3.1.4's DIG1 enable/control pair above it.
+    if source.io.writes.iter().any(|(r, _)| *r == 0x21b2) {
+        return TestResult::Fail("DCN 3.1.5 wrote DCN 3.1.4's DIG_BE_EN_CNTL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dio",
+    dio_dcn315_dig_backend_sits_one_dword_lower
 );

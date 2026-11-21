@@ -14,8 +14,11 @@ use crate::{
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-// Profile selects DCN30 or DCN314; shared ids below were compared against
-// both Linux offset and mask headers. Generation differences stay explicit.
+// Profile selects DCN30, DCN314 or DCN315; shared ids below were compared
+// against each Linux offset and mask header. Generation differences stay
+// explicit. DCN 3.1.5 builds dcn30's stream encoder (`dcn30_str_enc_funcs`:
+// enc2 unblank, enc1 blank) at DCN 3.1.4's DP offsets, so it takes the DCN30
+// behaviour below and has no DP_PIXEL_PER_CYCLE_PROCESSING_MODE field.
 // linux-ctx: hdr=dcn seg=2
 const DP_PIXEL_FORMAT: u64 = 0x2109; // linux: mmDP0_DP_PIXEL_FORMAT
 const DP_MSA_COLORIMETRY: u64 = 0x210a; // linux: mmDP0_DP_MSA_COLORIMETRY
@@ -319,8 +322,9 @@ impl<I: Io> Engine<I> {
             }
             delay_us(1000).await;
         }
-        if self.profile.is_dcn30() {
-            // enc2_stream_encoder_dp_unblank also resets the DIG frontend.
+        if !self.profile.is_dcn314() {
+            // enc2_stream_encoder_dp_unblank also resets the DIG frontend
+            // (DCN30 and DCN 3.1.5; "DIG_START is removed" on DCN 3.1.4).
             // linux-lit: 0x208b=mmDIG0_DIG_FE_CNTL; 10=DIG0_DIG_FE_CNTL__DIG_START__SHIFT
             self.update(0x208b, 1 << 10, 1 << 10)?; // DIG_FE_CNTL.DIG_START
             delay_us(1).await;
@@ -374,7 +378,7 @@ impl<I: Io> Engine<I> {
     }
 }
 
-/// One owned DCN30/DCN314 DisplayPort stream encoder.
+/// One owned DCN30/DCN314/DCN315 DisplayPort stream encoder.
 #[derive(Debug)]
 pub struct Stream(Engine<Mmio>);
 impl Stream {
@@ -388,11 +392,6 @@ impl Stream {
         instance: u8,
     ) -> Result<Self, Error> {
         let profile = Profile::resolve(gpu)?;
-        // DCN 3.1.5 builds dcn30's DIO stream encoder (DIG_FE_CNTL.DIG_START),
-        // not dcn314's (DIG_FE_ENABLE_CNTL). Refused until that is ported.
-        if profile == Profile::Dcn315 {
-            return Err(Error::Unsupported);
-        }
         if instance >= profile.streams() {
             return Err(Error::Invalid);
         }

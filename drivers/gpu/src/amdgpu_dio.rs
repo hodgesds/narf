@@ -1,4 +1,4 @@
-//! DCN314 DIO link encoder and DMUB PHY commands for SST DisplayPort.
+//! DCN314/DCN315 DIO link encoder and DMUB PHY commands for SST DisplayPort.
 //! Register fields follow Linux dcn10_link_encoder.c/dcn31_dio_link_encoder.c;
 //! firmware payloads follow dmub_cmd.h and atomfirmware.h.
 use crate::{
@@ -17,8 +17,44 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 /// 0x20b2→0x20bd, `regDP0_DP_LINK_CNTL` 0x2108→0x211e — the same +0x16 shift
 /// `amdgpu_dcn_stream` sees on the stream half. Another generation needs its
 /// own ids, selected per version the way `amdgpu_platform::SURFACE_WINDOWS`
-/// does it.
-const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+/// does it — which [`DIG_WINDOWS`] does for the two DIG backend registers.
+///
+/// DCN 3.1.5 (Raphael) builds the same dcn31 link encoder; every DP0 register
+/// and mask here is identical in `dcn_3_1_5_offset.h`/`_sh_mask.h`, and only
+/// the DIG backend pair sits one dword lower (`regDIG0_DIG_BE_CNTL` 0x20b0,
+/// `regDIG0_DIG_BE_EN_CNTL` 0x20b1).
+///
+/// The DIG backend registers this encoder reads and writes, per DCN version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DigWindow {
+    version: (u8, u8, u8),
+    be_cntl: u64,
+    be_en_cntl: u64,
+}
+impl crate::amdgpu_psp_ring::RegWindow for DigWindow {
+    fn version(&self) -> (u8, u8, u8) {
+        self.version
+    }
+    fn base_idx(&self) -> usize {
+        2 // linux-lit: 2=regDIG0_DIG_BE_CNTL_BASE_IDX
+    }
+    fn last(&self) -> u32 {
+        LAST_REG
+    }
+}
+/// `dcn/dcn_3_1_4_offset.h` — Phoenix.
+const DCN_3_1_4_DIG: DigWindow = DigWindow {
+    version: (3, 1, 4),
+    be_cntl: DIG_BE_CNTL,
+    be_en_cntl: DIG_BE_EN_CNTL,
+};
+/// `dcn/dcn_3_1_5_offset.h` — Raphael.
+const DCN_3_1_5_DIG: DigWindow = DigWindow {
+    version: (3, 1, 5),
+    be_cntl: 0x20b0,    // linux: regDIG0_DIG_BE_CNTL
+    be_en_cntl: 0x20b1, // linux: regDIG0_DIG_BE_EN_CNTL
+};
+const DIG_WINDOWS: &[DigWindow] = &[DCN_3_1_4_DIG, DCN_3_1_5_DIG];
 
 // ── The DIG / DP link window ──────────────────────────────────────
 //
@@ -26,9 +62,9 @@ const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
 // the one `dcn_3_1_4_sh_mask.h` gives for the named field. Instance N is
 // `+ N * DIG_STRIDE`, which is why the bank bound is `DP4_DP_DPHY_SCRAM_CNTL`.
 
-/// `regDIG0_DIG_BE_CNTL`.
+/// `regDIG0_DIG_BE_CNTL` (DCN 3.1.4; see [`DIG_WINDOWS`]).
 const DIG_BE_CNTL: u64 = 0x20b1;
-/// `regDIG0_DIG_BE_EN_CNTL`.
+/// `regDIG0_DIG_BE_EN_CNTL` (DCN 3.1.4; see [`DIG_WINDOWS`]).
 const DIG_BE_EN_CNTL: u64 = 0x20b2;
 /// `regDP0_DP_LINK_CNTL`.
 const DP_LINK_CNTL: u64 = 0x2108;
@@ -190,6 +226,8 @@ struct Encoder<I: Io> {
     io: I,
     cap: Cap<BusDeviceCap, Write>,
     route: Route,
+    /// This DCN's DIG backend register pair.
+    dig: DigWindow,
     state: State,
     settings: Option<Settings>,
 }
@@ -233,14 +271,9 @@ impl Encoder<Mmio> {
         if !valid(route) {
             return Err(Error::Invalid);
         }
-        let base = crate::amdgpu_psp_ring::bank(
-            gpu,
-            crate::amdgpu_discovery::HW_ID_DCN,
-            DCN_VERSIONS,
-            2,
-            LAST_REG,
-        )
-        .map_err(|_| Error::Source)?;
+        let (base, dig) =
+            crate::amdgpu_psp_ring::bank_for(gpu, crate::amdgpu_discovery::HW_ID_DCN, DIG_WINDOWS)
+                .map_err(|_| Error::Source)?;
         let mut source = Self {
             io: Mmio {
                 regs: gpu.regs,
@@ -248,10 +281,11 @@ impl Encoder<Mmio> {
             },
             cap,
             route,
+            dig,
             state: State::Disabled,
             settings: None,
         };
-        if source.read(DIG_BE_EN_CNTL)? & DIG_ENABLE != 0 {
+        if source.read(source.dig.be_en_cntl)? & DIG_ENABLE != 0 {
             return Err(Error::Source);
         }
         Ok(source)
@@ -369,16 +403,16 @@ impl<I: Io> Encoder<I> {
             enhanced: false,
         });
         phy.command(phy_command(self.route, settings, 0, 0)).await?;
-        if self.read(DIG_BE_EN_CNTL)? & DIG_ENABLE != 0 {
+        if self.read(self.dig.be_en_cntl)? & DIG_ENABLE != 0 {
             return Err(Error::Source);
         }
-        self.update(DIG_BE_CNTL, DIG_FE_SOURCE_SELECT, 0)?;
+        self.update(self.dig.be_cntl, DIG_FE_SOURCE_SELECT, 0)?;
         self.settings = None;
         self.state = State::Disabled;
         Ok(())
     }
 }
-/// The one owned DCN314 link encoder. Construction proves nothing about the
+/// The one owned DCN314/DCN315 link encoder. Construction proves nothing about the
 /// sink: only a completed `train` establishes a link.
 #[derive(Debug)]
 pub struct Source(Encoder<Mmio>);
@@ -460,7 +494,7 @@ impl<I: Io, P: Phy> LinkIo for Adapter<'_, I, P> {
         source.settings = Some(settings);
         // One-hot front end plus `DIG_MODE` cleared, which is DP SST.
         source.update(
-            DIG_BE_CNTL,
+            source.dig.be_cntl,
             DIG_FE_SOURCE_SELECT | DIG_MODE,
             (1u32 << source.route.frontend) << DIG_FE_SOURCE_SELECT_SHIFT,
         )?;
@@ -475,7 +509,7 @@ impl<I: Io, P: Phy> LinkIo for Adapter<'_, I, P> {
         self.phy
             .command(phy_command(source.route, settings, 1, 0))
             .await?;
-        if source.read(DIG_BE_EN_CNTL)? & DIG_ENABLE == 0 {
+        if source.read(source.dig.be_en_cntl)? & DIG_ENABLE == 0 {
             return Err(Error::Source);
         }
         Ok(())

@@ -332,3 +332,47 @@ kernel_test_in!(
     "drivers/gpu/dcn-stream",
     stream_rejects_timings_the_attributes_cannot_describe
 );
+
+/// DCN 3.1.5 runs `enc2_stream_encoder_dp_unblank` (`dcn30_str_enc_funcs`):
+/// the DIG_FE_CNTL.DIG_START pulse precedes the steering-FIFO reset and the
+/// stream enable, and nothing touches DP_PIXEL_PER_CYCLE_PROCESSING_MODE,
+/// which `dcn_3_1_5_sh_mask.h` does not define. DIG1_DIG_FE_CNTL is 0x218b.
+fn stream_dcn315_unblank_pulses_dig_start_like_dcn30() -> TestResult {
+    let mut stream = engine(1);
+    stream.profile = Profile::Dcn315;
+    stream.io.values[(DP_PIXEL_FORMAT + STRIDE) as usize] = DP_PIXEL_PER_CYCLE_PROCESSING_MODE;
+    stream.program(&timing(), Depth::Bpc8).unwrap();
+    stream.program_rate(148_500, 0x14).unwrap();
+    run(stream.unblank()).unwrap();
+    if stream.io.values[(DP_PIXEL_FORMAT + STRIDE) as usize] & DP_PIXEL_PER_CYCLE_PROCESSING_MODE
+        == 0
+    {
+        return TestResult::Fail("DCN 3.1.5 cleared a bit its header does not define");
+    }
+    let writes = &stream.io.writes;
+    let at = |want: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(r, v)| want(r, v));
+    let (Some(reset), Some(release), Some(steer), Some(enable)) = (
+        at(&|r, v| r == 0x218b && v & 0x400 != 0),
+        at(&|r, v| r == 0x218b && v & 0x400 == 0),
+        at(&|r, v| r == DP_STEER_FIFO + STRIDE && v & 1 != 0),
+        at(&|r, v| r == DP_VID_STREAM_CNTL + STRIDE && v & 1 != 0),
+    ) else {
+        return TestResult::Fail("DCN 3.1.5 unblank skipped a step");
+    };
+    if !(reset < release && release < steer && steer < enable) {
+        return TestResult::Fail("DCN 3.1.5 DIG/steering reset order");
+    }
+    // DCN 3.1.4 has no DIG_START ("removed from the register spec").
+    let mut phoenix = engine(1);
+    phoenix.program(&timing(), Depth::Bpc8).unwrap();
+    phoenix.program_rate(148_500, 0x14).unwrap();
+    run(phoenix.unblank()).unwrap();
+    if phoenix.io.writes.iter().any(|&(r, _)| r == 0x218b) {
+        return TestResult::Fail("DCN 3.1.4 pulsed the removed DIG_START");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-stream",
+    stream_dcn315_unblank_pulses_dig_start_like_dcn30
+);
