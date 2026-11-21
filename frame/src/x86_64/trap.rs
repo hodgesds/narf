@@ -72,6 +72,13 @@ unsafe fn signal_copy_bytes_to_user(dst: u64, src: &[u8]) -> bool {
 ///   halt over (a pending wake, a dispatchable task) and no scheduling point
 ///   for 20 s: `BUG: executor lockup - CPU#N idle with runnable work for
 ///   Ns!`, Linux's workqueue lockup. A wake whose kick never reached it.
+/// * **Runnable, not dispatched** — the task on a CPU that has been runnable
+///   longest without running (ready queue, wake inbox, woken-parked set),
+///   once it has waited `workqueue.watchdog_thresh` (10 s): `BUG: CPU#N:
+///   task [comm:pid] runnable for Ns without running`, once per stall, with
+///   the CPU's state and the dump. Linux's workqueue watchdog at task
+///   granularity; it sees an awake CPU that has stopped serving a task,
+///   which the run-delay report (written at dispatch) never can.
 /// * **RCU stall** — a CPU holding a grace period open; one report.
 /// * **Stranded wakeup** — a parked task whose own epoll or poll set is
 ///   ready, window after window: a lost wakeup, which no idle system shows.
@@ -84,8 +91,9 @@ unsafe fn signal_copy_bytes_to_user(dst: u64, src: &[u8]) -> bool {
 /// Boot parameters keep Linux's names: `watchdog_thresh=N` (0 or
 /// `nowatchdog` disables both lockup detectors), `softlockup_panic=1`,
 /// `hung_task_panic=1`, `sysctl.kernel.hung_task_timeout_secs=N` (0
-/// disables), `sysctl.kernel.hung_task_warnings=N` (-1 unlimited), and
-/// `rcu_stall_panic`. Nothing panics by default, as in Linux.
+/// disables), `sysctl.kernel.hung_task_warnings=N` (-1 unlimited),
+/// `workqueue.watchdog_thresh=N` (0 disables) and `rcu_stall_panic`.
+/// Nothing panics by default, as in Linux.
 ///
 /// Off by default — build with `--features stall-watchdog`. Per tick it
 /// costs a few relaxed stores; the checks run once per second on one CPU.
@@ -94,7 +102,10 @@ mod stall_wd {
     use core::fmt::Write as _;
     use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
     use narf_console::TrapWriter;
-    use narf_observability::watchdog::{CpuSample, Lockup, LockupWatch, WATCHDOG_THRESH_SECS};
+    use narf_observability::watchdog::{
+        CpuSample, Lockup, LockupWatch, RunnableSample, RunnableWatch, RUNNABLE_THRESH_SECS,
+        WATCHDOG_THRESH_SECS,
+    };
 
     const MAXC: usize = 16;
     // Last interrupted RIP / CPL per CPU, recorded every tick.
@@ -174,6 +185,7 @@ mod stall_wd {
     static WINDOWS: AtomicU64 = AtomicU64::new(0);
     static RCU_REPORTED: AtomicBool = AtomicBool::new(false);
     static LOCKUP: LockupWatch<MAXC> = LockupWatch::new();
+    static RUNNABLE: RunnableWatch<MAXC> = RunnableWatch::new();
     /// Monotonic ns of the last hung-task scan (0 before the first).
     static HUNG_LAST_SCAN_NS: AtomicU64 = AtomicU64::new(0);
     /// `sysctl_hung_task_warnings`: reports left (set from [`params`]).
@@ -208,6 +220,9 @@ mod stall_wd {
         thresh_ns: u64,
         /// `hung_task_timeout_secs` in ns; 0 disables the hung-task check.
         hung_timeout_ns: u64,
+        /// `workqueue.watchdog_thresh` in ns; 0 disables the
+        /// runnable-but-not-dispatched report.
+        runnable_thresh_ns: u64,
         softlockup_panic: bool,
         hung_task_panic: bool,
         /// Linux's `rcu_cpu_stall_panic` (warn-and-continue by default).
@@ -236,9 +251,12 @@ mod stall_wd {
                 |v| if v < 0 { u64::MAX } else { v as u64 },
             );
             HUNG_WARNINGS.store(warnings, Ordering::Relaxed);
+            let runnable_secs =
+                num("workqueue.watchdog_thresh").map_or(RUNNABLE_THRESH_SECS, |v| v.max(0) as u64);
             Params {
                 thresh_ns: thresh_secs.saturating_mul(1_000_000_000),
                 hung_timeout_ns: hung_secs.saturating_mul(1_000_000_000),
+                runnable_thresh_ns: runnable_secs.saturating_mul(1_000_000_000),
                 softlockup_panic: on("softlockup_panic"),
                 hung_task_panic: on("hung_task_panic"),
                 rcu_stall_panic: args.has_flag("rcu_stall_panic")
@@ -390,6 +408,7 @@ mod stall_wd {
             }
         }
         lockup_check(now_ns, &p);
+        runnable_check(&p);
         long_run_delay_check();
         hung_task_check(now_ns, &p);
         // Past boot (window 20 ≈ 20 s uptime): early-boot readiness churn is
@@ -424,6 +443,29 @@ mod stall_wd {
                 // Not a user task (or its registry shard is busy).
                 None => write!(f, "task-{}:0", self.0),
             }
+        }
+    }
+
+    /// `comm:pid` of a scheduler task for a report: a user task's comm and
+    /// pid, or for a kernel task (no comm) the last path segment of its
+    /// future's type name and its task id, as Linux names a kthread.
+    /// `origin` is the type name when the caller already has it. Never
+    /// waits for a lock.
+    struct KTaskName {
+        task: u64,
+        origin: Option<&'static str>,
+    }
+
+    impl core::fmt::Display for KTaskName {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            if self.task == 0 || narf_userspace::task::try_with_task(self.task, |_| ()).is_some() {
+                return core::fmt::Display::fmt(&TaskName(self.task), f);
+            }
+            let origin = self
+                .origin
+                .or_else(|| narf_scheduler::dbg_task_origin(self.task).map(|(o, _)| o))
+                .unwrap_or("kworker");
+            write!(f, "{}:{}", narf_scheduler::origin_comm(origin), self.task)
         }
     }
 
@@ -527,6 +569,70 @@ mod stall_wd {
                     ns / 1_000_000
                 );
             }
+        }
+    }
+
+    /// Linux's workqueue watchdog (`wq_watchdog_timer_fn`) per task: on each
+    /// CPU, the task that has been runnable longest without being
+    /// dispatched, once it has waited `workqueue.watchdog_thresh`. Reported
+    /// once per stall, with the CPU's state and the full dump (whose NMI
+    /// sample names where the CPU is instead): Linux follows a workqueue
+    /// lockup with `show_cpu_pool_hog`'s backtrace of what holds the CPU.
+    fn runnable_check(p: &Params) {
+        let thresh = narf_scheduler::narf_time::ns_to_cycles(p.runnable_thresh_ns);
+        let now = narf_scheduler::narf_time::now_cycles();
+        let mut dump_due = false;
+        for cpu in 0..MAXC {
+            let online = cpu == 0 || narf_lib::smp::is_online(cpu as u32);
+            let oldest = if online && p.runnable_thresh_ns != 0 {
+                narf_scheduler::dbg_oldest_runnable(cpu)
+            } else {
+                None
+            };
+            let sample = oldest.map(|o| RunnableSample {
+                task: o.task,
+                since: o.since_cycles,
+            });
+            let (Some(o), Some(waited)) = (oldest, RUNNABLE.observe(cpu, sample, now, thresh))
+            else {
+                continue;
+            };
+            let _ = writeln!(
+                TrapWriter,
+                "BUG: CPU#{cpu}: task [{}] runnable for {}s without running",
+                KTaskName {
+                    task: o.task,
+                    origin: Some(o.origin),
+                },
+                narf_scheduler::narf_time::cycles_to_ns(waited) / 1_000_000_000
+            );
+            let current = narf_scheduler::dbg_cpu_current_task(cpu);
+            let (passes, halted) = narf_scheduler::dbg_cpu_sched_passes(cpu);
+            let _ = writeln!(
+                TrapWriter,
+                "      task={} queued={} spawned={}:{} affinity={:#x} allowed_here={} origin={}",
+                o.task,
+                o.hold.as_str(),
+                o.site.file(),
+                o.site.line(),
+                o.affinity,
+                o.allowed,
+                o.origin
+            );
+            let _ = writeln!(
+                TrapWriter,
+                "      CPU#{cpu}: current=[{}] halted={halted} sched_passes={passes} last_tick_rip={:#x} ({})",
+                KTaskName {
+                    task: current,
+                    origin: None,
+                },
+                LAST_RIP[cpu].load(Ordering::Relaxed),
+                Sym(LAST_RIP[cpu].load(Ordering::Relaxed)),
+            );
+            dump_due = true;
+        }
+        if dump_due {
+            dump();
         }
     }
 

@@ -1135,3 +1135,69 @@ fn smoke_obs_watchdog_gap_and_disable() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("observability/watchdog", smoke_obs_watchdog_gap_and_disable);
+
+/// Runnable-but-not-dispatched (Linux `wq_watchdog_timer_fn` per task): a
+/// task runnable since one instant is reported once, when it has waited the
+/// threshold and the previous round already saw the same stall; it running
+/// (a new stamp) or leaving ends the stall, and a later one reports again.
+/// A single sighting never reports, and a zero threshold disables it.
+fn smoke_obs_watchdog_runnable_task_reported_once_per_stall() -> TestResult {
+    use crate::watchdog::{RunnableSample, RunnableWatch, RUNNABLE_THRESH_SECS};
+    let thresh = RUNNABLE_THRESH_SECS * WD_SEC;
+    let w: RunnableWatch<2> = RunnableWatch::new();
+    let stuck = Some(RunnableSample {
+        task: 42,
+        since: WD_SEC,
+    });
+    let mut reports = alloc::vec::Vec::new();
+    for t in 1..=40u64 {
+        if let Some(waited) = w.observe(0, stuck, t * WD_SEC, thresh) {
+            reports.push((t, waited));
+        }
+        // The other CPU keeps running its work: a fresh stamp every round.
+        let fresh = Some(RunnableSample {
+            task: 7,
+            since: t * WD_SEC,
+        });
+        if w.observe(1, fresh, t * WD_SEC + 1, thresh).is_some() {
+            return TestResult::Fail("a task that keeps running was reported");
+        }
+    }
+    if reports[..] != [(11, 10 * WD_SEC)][..] {
+        return TestResult::Fail("a stranded runnable task was not reported exactly once");
+    }
+    // A stall seen for the first time past the threshold (the probe missed
+    // the earlier rounds) waits one round for confirmation.
+    let late = Some(RunnableSample {
+        task: 9,
+        since: 50 * WD_SEC,
+    });
+    if w.observe(0, late, 100 * WD_SEC, thresh).is_some() {
+        return TestResult::Fail("reported on a single sighting");
+    }
+    if w.observe(0, late, 101 * WD_SEC, thresh) != Some(51 * WD_SEC) {
+        return TestResult::Fail("a confirmed new stall was not reported");
+    }
+    // The task ran and the CPU emptied; the same task stranded again later
+    // is a new stall.
+    let _ = w.observe(0, None, 102 * WD_SEC, thresh);
+    let again = Some(RunnableSample {
+        task: 9,
+        since: 103 * WD_SEC,
+    });
+    let _ = w.observe(0, again, 110 * WD_SEC, thresh);
+    if w.observe(0, again, 113 * WD_SEC, thresh) != Some(10 * WD_SEC) {
+        return TestResult::Fail("a second stall of the same task was not reported");
+    }
+    let off: RunnableWatch<1> = RunnableWatch::new();
+    for t in 1..=100u64 {
+        if off.observe(0, stuck, t * WD_SEC, 0).is_some() {
+            return TestResult::Fail("workqueue.watchdog_thresh=0 must disable the report");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "observability/watchdog",
+    smoke_obs_watchdog_runnable_task_reported_once_per_stall
+);

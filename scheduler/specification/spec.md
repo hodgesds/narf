@@ -214,6 +214,16 @@ pub fn dbg_slot_state(task: u64)
     -> Option<(bool, u32, usize, u64, u32, bool)>;
 pub fn dbg_ready_slots(cpu: usize)
     -> Vec<(u64, bool, u32, u64, bool)>;
+pub enum RunnableHold { Ready, WakeInbox, ParkedWake }
+pub struct OldestRunnable { pub task: u64, pub since_cycles: u64, pub hold: RunnableHold,
+                            pub origin: &'static str,
+                            pub site: &'static core::panic::Location<'static>,
+                            pub affinity: u64, pub allowed: bool }
+pub fn dbg_oldest_runnable(cpu: usize) -> Option<OldestRunnable>;
+pub fn dbg_cpu_current_task(cpu: usize) -> u64;
+pub fn dbg_task_origin(task: u64)
+    -> Option<(&'static str, &'static core::panic::Location<'static>)>;
+pub fn origin_comm(origin: &'static str) -> &'static str;
 ```
 
 Executor internals are per-CPU queues plus global stealing. The dispatch
@@ -439,11 +449,19 @@ Forward-progress and remote-reschedule telemetry is cache-line-isolated per CPU
 on update and aggregated across CPUs only for watchdog or test snapshots.
 Ordinary background task polls deliberately do not advance it: scheduler churn
 must not hide a foreground task that has stopped making useful progress.
-The three `dbg_*` functions are bounded, read-only fatal-watchdog snapshots.
+The `dbg_*` functions are bounded, read-only fatal-watchdog snapshots.
 They use nonblocking queue acquisition and report current queue ownership,
 awake state, affinity, and CPU idle/lock state. They deliberately maintain no
 per-poll, per-pop, per-requeue, or global per-wake counters on the normal
-scheduling path.
+scheduling path. `dbg_oldest_runnable(cpu)` is the stall watchdog's
+runnable-task probe (Linux `wq_watchdog_timer_fn` per task): the
+dispatchable task on `cpu`'s ready queue, wake inbox or woken parked set
+whose `since_cycles` — the later of its wake stamp (the run-delay stamp a
+fresh wake already takes, and a task's creation, as Linux's
+`wake_up_new_task` stamps `sched_info.last_queued`) and the end of its last
+run — is oldest, allocation-free. `dbg_task_origin` names a queued or parked
+task's future and spawn site; `origin_comm` is the kthread-style name the
+reports print for a kernel task.
 
 Cross-CPU wakes publish owned task slots or pinned, intrusive parked-wake nodes
 before setting the target's `WAKE_PENDING` notification. Its false-to-true edge

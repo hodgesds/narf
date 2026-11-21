@@ -2049,3 +2049,82 @@ kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_masked_wake_for_stalled_cpu_kicks_an_idle_cpu
 );
+
+/// The stall watchdog's runnable-task probe (Linux `wq_watchdog_timer_fn`
+/// per task): a task runnable on a CPU that never dispatches it is named in
+/// whichever place the CPU holds it, with the instant it became runnable,
+/// and a task that has never run at all is as visible as a woken one. A
+/// parked task nobody woke is not runnable and is never named.
+fn smoke_scheduler_oldest_runnable_names_stranded_task() -> TestResult {
+    use crate::RunnableHold;
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let pinned = Affinity::pinned(CpuId(stuck.0 as u32));
+
+    let Some((parked_id, _cell)) = park_probe_on(0, 1, stuck.0, Some(pinned)) else {
+        stuck.release();
+        return TestResult::Fail("could not park the pinned probe on the stuck CPU");
+    };
+    if crate::dbg_oldest_runnable(stuck.0).is_some() {
+        stuck.release();
+        return TestResult::Fail("a parked task nobody woke was reported runnable");
+    }
+    let woke_at = narf_time::now_cycles();
+    let Some(waker) = take_waker(0) else {
+        stuck.release();
+        return TestResult::Fail("probe published no waker");
+    };
+    waker.wake();
+    let woken = crate::dbg_oldest_runnable(stuck.0);
+    // Never dispatched: the stamp stays put while time passes.
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(20_000_000));
+    let later = crate::dbg_oldest_runnable(stuck.0);
+    stuck.release();
+    match woken {
+        Some(o) if o.task == parked_id.raw() && o.hold == RunnableHold::ParkedWake => {
+            if o.since_cycles < woke_at || !o.allowed {
+                return TestResult::Fail("woken parked task named with a wrong stamp or affinity");
+            }
+            if later.map(|l| (l.task, l.since_cycles)) != Some((o.task, o.since_cycles)) {
+                return TestResult::Fail("an undispatched task's runnable stamp moved");
+            }
+        }
+        _ => {
+            return TestResult::Fail("a woken task parked on a CPU that never drains was not named")
+        }
+    }
+
+    // A task spawned and enqueued onto the stuck CPU, which never runs it.
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let spawned_at = narf_time::now_cycles();
+    let queued_id = crate::spawn_with_spec(Probe { slot: 1, parks: 0 }, any_cpu_preferring(me));
+    let Some(mut slot) = crate::READY[me].lock().as_mut().and_then(|q| q.pop_front()) else {
+        stuck.release();
+        return TestResult::Fail("spawned probe not found on this CPU");
+    };
+    slot.spec.affinity = pinned;
+    slot.affinity_generation = crate::register_task_affinity(queued_id, pinned, false);
+    crate::enqueue_on(stuck.0, slot, TaskEnqueueReason::Requeued);
+    let queued = crate::dbg_oldest_runnable(stuck.0);
+    stuck.release();
+    match queued {
+        Some(o)
+            if o.task == queued_id.raw()
+                && o.hold == RunnableHold::WakeInbox
+                && o.since_cycles >= spawned_at
+                && o.since_cycles <= narf_time::now_cycles() =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("a spawned task that never ran was not named on its CPU"),
+    }
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_oldest_runnable_names_stranded_task
+);
