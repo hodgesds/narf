@@ -299,7 +299,7 @@ fn pcie_probe_reports_memory_and_identity() -> TestResult {
         {
             return TestResult::Fail("Navi 22 DEV_INFO family or FUSION flag");
         }
-        gpu.ip_blocks[0].revision = 6; // Rembrandt cannot use Navi 22's UAPI family.
+        gpu.ip_blocks[0].revision = 6; // GC 10.3.6 (Raphael) cannot use Navi 22's UAPI family.
         if query_against(&Snapshot::from_gpu(&gpu), u::AMDGPU_INFO_DEV_INFO, [0; 4]).is_ok() {
             return TestResult::Fail("unsupported GC version got Navi 22 DEV_INFO");
         }
