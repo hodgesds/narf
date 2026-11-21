@@ -3672,13 +3672,20 @@ pub mod tests {
         if mmio.writes_to(tp).last() != Some(&0x8004_0300) {
             return TestResult::Fail("DP_TP_CTL must end at NORMAL");
         }
-        // Gen12 never writes DDI_BUF_TRANS: the old 4-entry
-        // tables are deleted with the combo-PHY model.
+        // Gen12 never writes DDI_BUF_TRANS: the combo-PHY model
+        // programs signal levels through PORT_TX_DW2/DW4/DW5/DW7,
+        // and Linux selects DDI_BUF_TRANS only for DISPLAY_VER
+        // < 10 (`has_buf_trans_select` in intel_ddi.c). The
+        // register file is at 0x64E00 for DDI A — 10 LO/HI
+        // entries, `DDI_BUF_TRANS_LO/HI(port, i)` in
+        // intel_display_regs.h — NOT 0x64010, which is the DP AUX
+        // channel block (`_DPA_AUX_CH_CTL`), written legitimately
+        // on every AUX transaction during link training.
         if mmio
             .writes
             .borrow()
             .iter()
-            .any(|(o, _)| (0x64010..0x64030).contains(o))
+            .any(|(o, _)| (0x64E00..0x64E50).contains(o))
         {
             return TestResult::Fail("DDI_BUF_TRANS must not be written on Gen12");
         }
