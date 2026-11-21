@@ -344,9 +344,15 @@ pub fn init_or_gp() -> InitOutcome {
             let caps = unsafe { hwp_capabilities() };
             // bits 0..7 = min, 8..15 = max, 16..23 = desired (0 =
             // autonomous, left unset), 24..31 = EPP (0x80 balanced).
-            let epp = crate::hwp::HwpFeatures::probe().epp
+            let epp = crate::hwp::HwpFeatures::probe()
+                .epp
                 .then_some(crate::hwp::EPP_BALANCED_PERFORMANCE);
-            let v = u64::from(crate::hwp::request_value(caps.min_perf, caps.max_perf, 0, epp));
+            let v = u64::from(crate::hwp::request_value(
+                caps.min_perf,
+                caps.max_perf,
+                0,
+                epp,
+            ));
             if wrmsr_or_gp(MSR_IA32_HWP_REQUEST, v).is_err() {
                 return InitOutcome::HwpRequestGp;
             }
