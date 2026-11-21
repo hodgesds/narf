@@ -411,6 +411,39 @@ since the submitter is replaced. Raphael's port:
        (whether the PSP and DCN come back on their own) follows Linux's
        order rather than a measurement.
 
+## Suspend and resume
+
+12. ~~S3 with graphics up~~ (done). Before this, the display's suspend
+    refused with graphics loaded: `Loader::stop` will not release the TMR
+    while the RLC and CP run from it. Linux's `amdgpu_device_suspend` and
+    `amdgpu_device_resume` take every IP down and back up, and for an APU
+    the carve-out stays in place (`amdgpu_device_evict_resources` skips
+    VRAM eviction unless going to S4). The work is split across the
+    system-PM phases (`GraphicsPm`):
+    1. Async prepare, with the executor and interrupts live:
+       - the rings drained (`amdgpu_fence_driver_hw_fini`, up to 10 s);
+       - the client path withdrawn;
+       - the IH ring disabled;
+       - every fence wait abandoned.
+    2. Sync suspend: the stream disabled, then, with graphics quiesced,
+       `psp_suspend` (TMR and ring released). S3 powers the engines off,
+       which is the reset that release needs.
+    3. Sync resume: unchanged. The PSP session boots again (reloading the
+       graphics set and running the RLC autoload), and the stream is
+       replayed.
+    4. Async resume: a new coordinator, then media and clients, via the
+       rebuild helper shared with mode 2 recovery. A suspend that aborted
+       before the PSP stopped never powered the GPU off, so that resume
+       runs the mode 2 reset first.
+    Contexts survive: no recovery count, and the rings were drained. Lost
+    across S3:
+    - VCN sessions (Linux saves the VCPU buffer; this does not);
+    - each cycle's coordinator reservations, quarantined as a recovery's
+      are. The rebuild logs how much of the carve-out remains. Re-running
+      the owners on their own reservations, as Linux's hw_init does on its
+      BOs, would end the leak, but needs every RDNA2 owner to return to
+      Prepared.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table

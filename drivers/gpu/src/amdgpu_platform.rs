@@ -882,9 +882,6 @@ pub(crate) async fn recover() -> Result<(), RecoveryError> {
     unsafe { old.mode2_reset(&device) }
         .await
         .map_err(RecoveryError::Reset)?;
-    if let Some(old) = graphics.take() {
-        retired.push(old);
-    }
     // 4. Re-initialization.
     loader
         .boot(Default::default())
@@ -894,19 +891,8 @@ pub(crate) async fn recover() -> Result<(), RecoveryError> {
         .enable_notifications()
         .await
         .map_err(RecoveryError::Psp)?;
-    if !loader.graphics_booted() {
-        return Err(RecoveryError::NoGraphics);
-    }
-    let firmware = loader.graphics_versions();
-    *graphics = alloc::boxed::Box::pin(graphics_boot(pool, firmware)).await;
-    let new = graphics
-        .as_mut()
-        .filter(|g| g.queues_verified())
-        .ok_or(RecoveryError::Graphics)?;
-    alloc::boxed::Box::pin(media_boot(new, loader)).await;
-    // Contexts from before the reset now see it (amdgpu_ctx::recoveries).
-    RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    serve_clients(new);
+    // Contexts from before the reset see it (amdgpu_ctx::recoveries).
+    rebuild_graphics(loader, pool, graphics, retired, true).await?;
     // 5. The stream, as `resume` puts it back.
     if let Some(running) = stream.as_mut() {
         running
@@ -929,6 +915,217 @@ pub(crate) async fn recover() -> Result<(), RecoveryError> {
     }
     Ok(())
 }
+/// After the PSP session loaded the graphics set again (a recovery, or the
+/// display's S3 resume): retire the spent coordinator, quarantined, and run
+/// a new one, then media and client registration. `reset` moves the recovery
+/// counter first, so contexts from before see their work cancelled; an S3
+/// resume keeps them (Linux drains the rings before suspending, and the
+/// carve-out survives).
+async fn rebuild_graphics(
+    loader: &mut Loader,
+    pool: &Pool,
+    graphics: &mut Option<crate::amdgpu_raphael_boot::ColdBoot>,
+    retired: &mut Vec<crate::amdgpu_raphael_boot::ColdBoot>,
+    reset: bool,
+) -> Result<(), RecoveryError> {
+    use core::fmt::Write as _;
+    if let Some(old) = graphics.take() {
+        retired.push(old);
+    }
+    if !loader.graphics_booted() {
+        return Err(RecoveryError::NoGraphics);
+    }
+    let firmware = loader.graphics_versions();
+    *graphics = alloc::boxed::Box::pin(graphics_boot(pool, firmware)).await;
+    let new = graphics
+        .as_mut()
+        .filter(|g| g.queues_verified())
+        .ok_or(RecoveryError::Graphics)?;
+    alloc::boxed::Box::pin(media_boot(new, loader)).await;
+    if reset {
+        RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+    serve_clients(new);
+    // Each rebuild quarantines the old owners' reservations; say what is left.
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: raphael graphics rebuilt ({} retired owners, {} MiB of the carve-out free)",
+        retired.len(),
+        pool.available() >> 20
+    );
+    Ok(())
+}
+
+/// Raphael's graphics across S3 (`amdgpu_device_suspend` /
+/// `amdgpu_device_resume` with graphics up), split between the system-PM
+/// phases:
+/// 1. Async prepare: the rings drained, the client path withdrawn, the IH
+///    ring disabled, every fence wait abandoned.
+/// 2. Sync suspend: the stream disabled, and the PSP `psp_suspend` (TMR and
+///    ring) with graphics quiesced. S3 powers the engines off, which is the
+///    reset that release needs.
+/// 3. Sync resume: the PSP session booted again (the graphics set reloaded,
+///    the RLC autoload run), then the stream replayed.
+/// 4. Async resume: a new coordinator, then media and clients. A suspend
+///    that aborted before the PSP stopped never powered the GPU off, so
+///    that resume runs a mode 2 reset first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GraphicsPm {
+    Running,
+    /// Prepared for suspend: client path withdrawn, IH disabled.
+    Quiesced,
+    /// The PSP released the TMR for S3.
+    Stopped,
+}
+/// What the async resume must do from the state suspend left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeWork {
+    Nothing,
+    /// The sync resume reloaded the graphics set: build a new coordinator.
+    Rebuild,
+    /// The GPU never lost power: reset it (mode 2), then rebuild.
+    ResetThenRebuild,
+}
+pub(crate) fn resume_work(state: GraphicsPm) -> ResumeWork {
+    match state {
+        GraphicsPm::Running => ResumeWork::Nothing,
+        GraphicsPm::Stopped => ResumeWork::Rebuild,
+        GraphicsPm::Quiesced => ResumeWork::ResetThenRebuild,
+    }
+}
+/// How long the prepare hook waits for submitted jobs (the GFX job timeout,
+/// as Navi22's suspend drain).
+const RING_DRAIN_MS: u64 = 10_000; // linux: n/a (NARF policy, amdgpu_fence_wait_empty bound)
+/// Whether every kernel queue's submitted jobs completed within `ms`.
+async fn rings_idle(ms: u64) -> bool {
+    let deadline = narf_time::Deadline::after_ms(ms);
+    loop {
+        match crate::amdgpu_rdna2_client::queue_progress().await {
+            Ok(samples)
+                if samples
+                    .iter()
+                    .all(|p| crate::amdgpu_fence_navi22::signaled(p.signaled, p.emitted)) =>
+            {
+                return true
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        if deadline.expired() {
+            return false;
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+    }
+}
+async fn prepare_graphics_suspend() {
+    use core::fmt::Write as _;
+    if crate::amdgpu_rdna2_client::backend() != crate::amdgpu_rdna2_client::Backend::Raphael {
+        return;
+    }
+    // amdgpu_fence_driver_hw_fini waits for the rings to empty first.
+    if !rings_idle(RING_DRAIN_MS).await {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: raphael rings still busy at suspend; their jobs fail"
+        );
+    }
+    let mut guard = DISPLAY.lock().await;
+    let Some(display) = guard.as_mut() else {
+        return;
+    };
+    let Some(graphics) = display.graphics.as_mut().filter(|g| g.queues_verified()) else {
+        return;
+    };
+    crate::amdgpu_navi22_cs::unregister();
+    crate::amdgpu_navi22_tdr::stop();
+    // SAFETY: the client path is withdrawn; the coordinator is retired at
+    // resume and a new one built.
+    if let Err(error) = unsafe { graphics.quiesce_for_reset() }.await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: raphael IH quiesce {error:?}");
+    }
+    crate::amdgpu_fence_navi22::abandon_all();
+    display.graphics_pm = GraphicsPm::Quiesced;
+}
+async fn resume_graphics() {
+    use core::fmt::Write as _;
+    let mut guard = DISPLAY.lock().await;
+    let Some(display) = guard.as_mut() else {
+        return;
+    };
+    let work = resume_work(display.graphics_pm);
+    if work == ResumeWork::Nothing {
+        return;
+    }
+    let Display {
+        loader,
+        pool,
+        graphics,
+        retired,
+        graphics_pm,
+        ..
+    } = display;
+    let result = async {
+        if work == ResumeWork::ResetThenRebuild {
+            let device = crate::amdgpu::pci_device().ok_or(RecoveryError::Busy)?;
+            let old = graphics.as_mut().ok_or(RecoveryError::Busy)?;
+            // SAFETY: quiesced at prepare; the reset follows the TMR release
+            // at once and everything is rebuilt below.
+            unsafe { loader.stop_for_reset() }
+                .await
+                .map_err(RecoveryError::Psp)?;
+            // SAFETY: as above; the TMR is released and graphics quiesced.
+            unsafe { old.mode2_reset(&device) }
+                .await
+                .map_err(RecoveryError::Reset)?;
+            loader
+                .boot(Default::default())
+                .await
+                .map_err(RecoveryError::Psp)?;
+            loader
+                .enable_notifications()
+                .await
+                .map_err(RecoveryError::Psp)?;
+        }
+        rebuild_graphics(loader, pool, graphics, retired, false).await
+    }
+    .await;
+    *graphics_pm = GraphicsPm::Running;
+    if let Err(error) = result {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: raphael graphics not resumed: {error:?}; display only"
+        );
+    }
+}
+/// The async system-PM phase for Raphael's graphics; registered once its
+/// clients are served.
+struct GraphicsSystemPm;
+impl narf_power::system_pm::AsyncSystemPm for GraphicsSystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            prepare_graphics_suspend().await;
+            Ok::<(), narf_power::device_pm::DevicePmError>(())
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            // Retained: a cancelled resume still finishes the rebuild rather
+            // than leave the coordinator half-built.
+            crate::suspend_transition::Retained::new(
+                async {
+                    resume_graphics().await;
+                    Ok::<(), narf_power::device_pm::DevicePmError>(())
+                },
+                alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+                |cleanup| {
+                    narf_scheduler::spawn(cleanup);
+                },
+            )
+            .await
+        })
+    }
+}
+
 /// Publish a completed Raphael graphics boot to clients: its submitter,
 /// VMIDs and heap, then `ACCEL_WORKING`. `graphics` loaded the set only with
 /// `amdgpu.rdna2_accel` on, the switch the discrete boot turns this on with.
@@ -943,6 +1140,11 @@ fn serve_clients(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
     {
         crate::amdgpu_info_navi22::set_accel(true);
     }
+    // S3 with graphics up (`GraphicsPm`). Replaced by name on a rebuild.
+    narf_power::system_pm::register_async_system_pm(
+        "amdgpu-raphael-graphics",
+        alloc::sync::Arc::new(GraphicsSystemPm),
+    );
 }
 /// On Raphael, hand the loader the graphics set so its PSP session loads every
 /// non-PSP firmware in Linux's order (`psp_load_non_psp_fw`) and starts the RLC
@@ -1157,6 +1359,8 @@ struct Display {
     /// the memory they published stays quarantined (Navi22's policy: each
     /// recovery leaks its old owners' carve-out).
     retired: Vec<crate::amdgpu_raphael_boot::ColdBoot>,
+    /// Where an S3 transition left the graphics (`GraphicsPm`).
+    graphics_pm: GraphicsPm,
 }
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
 
@@ -1219,6 +1423,7 @@ pub(crate) fn start() -> bool {
         attempted: false,
         graphics: None,
         retired: Vec::new(),
+        graphics_pm: GraphicsPm::Running,
     });
     drop(owner);
     crate::amdgpu_usbc::observe_connectors();
@@ -1298,7 +1503,12 @@ pub(crate) fn suspend() -> bool {
     if narf_scheduler::current_task_id().raw() != 0 {
         return false;
     }
-    let Display { loader, stream, .. } = display;
+    let Display {
+        loader,
+        stream,
+        graphics_pm,
+        ..
+    } = display;
     // Stop the stream before the firmware: a pipe left fetching across a GPU
     // suspend would read scanout memory the resume path has not re-established.
     // The stream itself is kept, with the mode it was validated for, so resume
@@ -1307,6 +1517,21 @@ pub(crate) fn suspend() -> bool {
         if narf_scheduler::block_on_spin(stream.pipeline.disable(loader)).is_err() {
             return false;
         }
+    }
+    if *graphics_pm == GraphicsPm::Quiesced {
+        // The async prepare quiesced graphics. S3 powers the engines off,
+        // which is the reset releasing the TMR under them needs.
+        // SAFETY: as above; `resume` boots the loader again before use.
+        // Boxed: block_on_spin holds its future by value, and the PSP stop's
+        // state has no business in this frame.
+        let stopped = narf_scheduler::block_on_spin(alloc::boxed::Box::pin(unsafe {
+            loader.stop_for_reset()
+        }))
+        .is_ok();
+        if stopped {
+            *graphics_pm = GraphicsPm::Stopped;
+        }
+        return stopped;
     }
     narf_scheduler::block_on_spin(loader.stop()).is_ok()
 }
@@ -1377,6 +1602,22 @@ mod tests {
         }
         regs
     }
+    /// Raphael's S3 resume does what suspend left undone: nothing for running
+    /// graphics, a rebuild once the PSP released the TMR (the GPU lost
+    /// power), and a mode 2 reset first when suspend stopped at the quiesce.
+    fn raphael_s3_resume_work_follows_the_suspend_state() -> TestResult {
+        if resume_work(GraphicsPm::Running) != ResumeWork::Nothing
+            || resume_work(GraphicsPm::Stopped) != ResumeWork::Rebuild
+            || resume_work(GraphicsPm::Quiesced) != ResumeWork::ResetThenRebuild
+        {
+            return TestResult::Fail("S3 resume work");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/raphael-reset",
+        raphael_s3_resume_work_follows_the_suspend_state
+    );
     /// Every literal here is read off the AMD header, never off the row it
     /// checks. One case per row, so adding a GPU means adding a case: a new
     /// row with no case is a window nothing has verified.
