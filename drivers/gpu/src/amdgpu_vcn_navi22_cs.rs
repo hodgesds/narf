@@ -321,26 +321,36 @@ pub fn rings() -> u8 {
 
 /// Offer `boot`'s verified media rings to clients (with the owner held,
 /// from `amdgpu_navi22_cs::register`). Sessions start empty: a recovery
-/// rebuilt the firmware, which lost every session. `first..=last` are the
+/// rebuilt the firmware, which lost every session. (Raphael's S3 resume
+/// keeps them, through `register_rings`.) `first..=last` are the
 /// client VMIDs `amdgpu_gmc_navi22` lent; a fresh MMHUB manager flushes and
 /// remaps each before its first media job.
 pub fn register(boot: &crate::amdgpu_navi22_boot::ColdBoot, first: u8, last: u8) {
     match boot.client_media() {
-        Some((rings, reader)) => register_rings("navi22", rings, reader, first, last),
+        Some((rings, reader)) => register_rings("navi22", rings, reader, first, last, false),
         None => unregister(),
     }
 }
 /// [`register`] for an owner's verified media `rings` and their `reader`;
-/// `who` names the card in the console line.
+/// `who` names the card in the console line. `sessions_kept`: the owner's
+/// start put back the firmware context [`suspend`] left, so the session
+/// table from before carries over; otherwise it starts empty.
 pub(crate) fn register_rings(
     who: &str,
     rings: u8,
     reader: crate::amdgpu_vcn_navi22::MediaFenceReader,
     first: u8,
     last: u8,
+    sessions_kept: bool,
 ) {
     use core::fmt::Write;
-    *SESSIONS.lock() = Sessions::new();
+    let kept = {
+        let mut sessions = SESSIONS.lock();
+        if !sessions_kept {
+            *sessions = Sessions::new();
+        }
+        sessions.count()
+    };
     // Every client ring is instance 0's, so VCN0 is never harvested here;
     // `vcn_v3_0_limit_sched`'s refusal stays in `check_dec_msg`.
     *MEDIA.lock() = Some(Registered {
@@ -352,13 +362,18 @@ pub(crate) fn register_rings(
     crate::amdgpu_info::publish_navi22_media_rings(rings);
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: {who} media rings for clients {rings:#x} (dec/enc0/enc1/jpeg)"
+        "amdgpu: {who} media rings for clients {rings:#x} (dec/enc0/enc1/jpeg), {kept} sessions kept"
     );
 }
 /// Withdraw the media rings (recovery or shutdown).
 pub fn unregister() {
-    *MEDIA.lock() = None;
+    suspend();
     *SESSIONS.lock() = Sessions::new();
+}
+/// Withdraw the media rings before S3, keeping the session table for a
+/// resume that restores the firmware context (`register_rings`).
+pub(crate) fn suspend() {
+    *MEDIA.lock() = None;
     crate::amdgpu_info::publish_navi22_media_rings(0);
 }
 /// An address space closed: its sessions go with it.

@@ -535,6 +535,34 @@ impl ColdBoot {
     pub(crate) fn media_idle_recheck(&self, now: u64) -> Option<u64> {
         self.media.as_ref()?.idle_recheck(now)
     }
+    /// Whether every media ring signalled its last job (no media: true).
+    pub(crate) fn media_signalled(&mut self) -> Result<bool, vcn::Error> {
+        self.media
+            .as_mut()
+            .map_or(Ok(true), |media| media.fences_signalled())
+    }
+    /// S3's `vcn_v3_0_suspend`: VCN and JPEG stopped and each VCPU BO saved,
+    /// so the resume's media start puts the firmware's sessions back.
+    /// `Ok(false)`: no media owner.
+    pub(crate) async fn suspend_media(&mut self) -> Result<bool, vcn::Error> {
+        let Some(media) = self.media.as_mut() else {
+            return Ok(false);
+        };
+        media.suspend().await.map(|()| true)
+    }
+    /// Whether the last media start carried the firmware's sessions over.
+    pub(crate) fn media_sessions_restored(&self) -> bool {
+        self.media
+            .as_ref()
+            .is_some_and(|media| media.sessions_restored())
+    }
+    /// Drop a saved VCPU BO, so the next media start begins with no
+    /// sessions (a recovery's).
+    pub(crate) fn forget_media_sessions(&mut self) {
+        if let Some(media) = self.media.as_mut() {
+            media.forget_saved();
+        }
+    }
     /// `AMDGPU_INFO_READ_MMR_REG` from nv.c's allow-list. GFXOFF stays
     /// disallowed after the Smu stage, so GC answers without a reference.
     pub(crate) fn read_mmr(

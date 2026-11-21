@@ -2281,3 +2281,57 @@ kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_rearm_restarts_the_same_rings
 );
+
+/// `vcn_v3_0_suspend`, then a resume: the VCPU BO saved after the stop goes
+/// back at the next start even onto memory the reset lost, so a firmware
+/// session survives. A start with nothing saved zeroes what the memory kept.
+fn vcn_navi22_suspend_carries_the_vcpu_bo_to_the_next_start() -> TestResult {
+    const SESSION_WORD: u64 = CONTEXT + 0x100; // linux: n/a (test session word)
+    const SESSION: u32 = 0x5e55_1011; // linux: n/a (test pattern)
+    let up = |e: &mut Engine<Model>| {
+        run(e.start(firmware(1), None, &mut NoSram)).is_ok()
+            && run(e.start_jpeg()).is_ok()
+            && run(e.test_ib()).is_ok()
+    };
+    let (_pool, mut e) = engine(Model::new(), 1);
+    if run(e.suspend()) != Err(Error::Busy) {
+        return TestResult::Fail("an unstarted owner saved its BO");
+    }
+    if !up(&mut e) {
+        return TestResult::Fail("first media bring-up");
+    }
+    let map = e.vcn[0].as_ref().unwrap().memory.mapping();
+    // State the firmware keeps for an open session.
+    e.hw.io.mem.insert(mc(map, SESSION_WORD), SESSION);
+    let saved = |e: &Engine<Model>| e.vcn[0].as_ref().unwrap().saved.as_ref().map(|s| s.len());
+    if run(e.suspend()).is_err()
+        || e.state != State::Stopped
+        || saved(&e) != Some((VCPU_BYTES / 4) as usize)
+    {
+        return TestResult::Fail("suspend did not stop and save the VCPU BO");
+    }
+    // SAFETY: the model is replaced below, as the S3 power-off would.
+    unsafe { e.rearm() };
+    // The model lost its memory: only the saved copy has the session.
+    e.hw.io = Model::new();
+    if !up(&mut e)
+        || e.hw.io.word(mc(map, SESSION_WORD)) != SESSION
+        || e.hw.io.word(mc(map, SHARED + shared::PRESENT_FLAG_0)) != shared::PRESENT
+        || !e.sessions_restored()
+        || saved(&e).is_some()
+    {
+        return TestResult::Fail("the saved VCPU BO did not come back once");
+    }
+    // SAFETY: as above.
+    unsafe { e.rearm() };
+    e.hw.io = Model::new();
+    e.hw.io.mem.insert(mc(map, SESSION_WORD), SESSION);
+    if !up(&mut e) || e.hw.io.word(mc(map, SESSION_WORD)) != 0 || e.sessions_restored() {
+        return TestResult::Fail("a start with nothing saved kept the old context");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_suspend_carries_the_vcpu_bo_to_the_next_start
+);

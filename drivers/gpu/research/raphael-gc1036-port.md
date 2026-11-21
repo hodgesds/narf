@@ -420,8 +420,10 @@ since the submitter is replaced. Raphael's port:
     VRAM eviction unless going to S4). The work is split across the
     system-PM phases (`GraphicsPm`):
     1. Async prepare, with the executor and interrupts live:
-       - the rings drained (`amdgpu_fence_driver_hw_fini`, up to 10 s);
+       - the rings drained (`amdgpu_fence_driver_hw_fini`, up to 10 s),
+         the media rings included (step 14);
        - the client path withdrawn;
+       - VCN stopped and its VCPU buffer saved (step 14);
        - the IH ring disabled;
        - every fence wait abandoned.
     2. Sync suspend: the stream disabled, then, with graphics quiesced,
@@ -432,12 +434,10 @@ since the submitter is replaced. Raphael's port:
        replayed.
     4. Async resume: the coordinator re-armed and run again (step 13),
        then media and clients, via the rebuild helper shared with mode 2
-       recovery. A suspend that aborted
-       before the PSP stopped never powered the GPU off, so that resume
-       runs the mode 2 reset first.
-    Contexts survive: no recovery count, and the rings were drained. Lost
-    across S3:
-    - VCN sessions (Linux saves the VCPU buffer; this does not).
+       recovery. A suspend that aborted before the PSP stopped never
+       powered the GPU off, so that resume runs the mode 2 reset first.
+    Contexts survive: no recovery count, and the rings were drained. VCN
+    sessions survive too (step 14).
 
 ## Owner re-init
 
@@ -470,6 +470,37 @@ since the submitter is replaced. Raphael's port:
     coordinator whose re-arm is refused is retired and a new one built, as
     before. The rebuild logs whether it re-armed, how many owners are
     retired and how much of the carve-out is free.
+
+## VCN sessions across S3
+
+14. ~~VCN sessions across S3~~ (done). Before this, the resume's media start
+    zeroed the VCPU buffer (stack, context, fw_shared), so every decode and
+    encode session the firmware held was gone, and the client path's
+    session table was dropped with it. Linux's `vcn_v3_0_suspend` runs
+    `vcn_v3_0_hw_fini` and then `amdgpu_vcn_suspend`, which copies the VCPU
+    BO to system memory. `vcn_v3_0_resume` copies it back
+    (`amdgpu_vcn_resume`) before `vcn_v3_0_hw_init`. Here:
+    1. The prepare's drain waits on the VCN and JPEG rings too, as
+       `amdgpu_fence_driver_hw_fini` does on every ring.
+    2. The client path is withdrawn with its decode-session table kept
+       (`amdgpu_navi22_cs::suspend`).
+    3. `ColdBoot::suspend_media` stops a running VCN and JPEG (an owner the
+       idle work gated is already stopped), then copies each instance's VCPU
+       BO, all 644 KiB, to the heap in 64 KiB steps between yields.
+    4. At resume, the re-armed media start writes the saved copy back in
+       place of zeroing the BO and setting fw_shared's flags. The image
+       carries those flags. The rings and buffers after the BO are zeroed
+       as before, and `vcn_v3_0_start` resets the queue pointers in
+       fw_shared.
+    5. Registration keeps the session table only when every instance's
+       BO came back. Otherwise it starts empty, as the firmware does.
+    A failed save is logged, and that resume starts media with no
+    sessions. A mode 2 recovery drops any saved copy: the contexts are told
+    of the reset. Linux saves and restores there too (its full-reset path
+    suspends every IP first), but this recovery does not stop a VCN that
+    may be hung. On an APU the carve-out survives S3 itself; the copy
+    matters because a start zeroes the BO, and it keeps the suspend
+    independent of that.
 
 ## Open
 

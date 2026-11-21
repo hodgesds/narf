@@ -738,9 +738,14 @@ pub fn register_raphael(boot: &mut crate::amdgpu_raphael_boot::ColdBoot) {
     }
     let media = boot.client_media();
     match media {
-        Some((rings, reader)) => {
-            crate::amdgpu_vcn_navi22_cs::register_rings("raphael", rings, reader, first, last)
-        }
+        Some((rings, reader)) => crate::amdgpu_vcn_navi22_cs::register_rings(
+            "raphael",
+            rings,
+            reader,
+            first,
+            last,
+            boot.media_sessions_restored(),
+        ),
         None => crate::amdgpu_vcn_navi22_cs::unregister(),
     }
     crate::amdgpu_rdna2_client::set_backend(crate::amdgpu_rdna2_client::Backend::Raphael);
@@ -757,6 +762,14 @@ pub fn register_raphael(boot: &mut crate::amdgpu_raphael_boot::ColdBoot) {
 /// lent VMIDs belonged to the old memory owner and are dropped with it; the
 /// next `register` starts a fresh manager (every VMID flushes again).
 pub fn unregister() {
+    withdraw(false);
+}
+/// [`unregister`] before S3: the media session table stays, for a resume
+/// whose media start restores the firmware's sessions.
+pub(crate) fn suspend() {
+    withdraw(true);
+}
+fn withdraw(keep_media_sessions: bool) {
     crate::amdgpu_vcn_navi22::idle::stop();
     abandon(FsError::Canceled);
     crate::amdgpu_rdna2_vram::suspend();
@@ -764,7 +777,11 @@ pub fn unregister() {
         crate::amdgpu_cs::unregister_submitter(card);
         crate::amdgpu_gem::unregister_vram_heap(card);
     }
-    crate::amdgpu_vcn_navi22_cs::unregister();
+    if keep_media_sessions {
+        crate::amdgpu_vcn_navi22_cs::suspend();
+    } else {
+        crate::amdgpu_vcn_navi22_cs::unregister();
+    }
     // Its owner is being replaced; the handle must not reach the new one.
     let _ = CLIENT_VMIDS.lock().take();
 }

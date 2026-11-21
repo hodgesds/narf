@@ -950,6 +950,12 @@ async fn rebuild_graphics(
     if !loader.graphics_booted() {
         return Err(RecoveryError::NoGraphics);
     }
+    if reset {
+        // Contexts are told of the reset; media starts with no sessions.
+        if let Some(old) = graphics.as_mut() {
+            old.forget_media_sessions();
+        }
+    }
     let firmware = loader.graphics_versions();
     let rearmed = match graphics.as_mut() {
         // SAFETY: the device was reset (mode 2 or S3) since the coordinator
@@ -1037,20 +1043,27 @@ pub(crate) fn resume_work(state: GraphicsPm) -> ResumeWork {
 /// How long the prepare hook waits for submitted jobs (the GFX job timeout,
 /// as Navi22's suspend drain).
 const RING_DRAIN_MS: u64 = 10_000; // linux: n/a (NARF policy, amdgpu_fence_wait_empty bound)
-/// Whether every kernel queue's submitted jobs completed within `ms`.
+/// Whether every kernel queue's and media ring's submitted jobs completed
+/// within `ms` (`amdgpu_fence_driver_hw_fini` waits on every ring).
 async fn rings_idle(ms: u64) -> bool {
     let deadline = narf_time::Deadline::after_ms(ms);
     loop {
-        match crate::amdgpu_rdna2_client::queue_progress().await {
-            Ok(samples)
-                if samples
-                    .iter()
-                    .all(|p| crate::amdgpu_fence_navi22::signaled(p.signaled, p.emitted)) =>
-            {
-                return true
-            }
-            Ok(_) => {}
+        let queues = match crate::amdgpu_rdna2_client::queue_progress().await {
+            Ok(samples) => samples
+                .iter()
+                .all(|p| crate::amdgpu_fence_navi22::signaled(p.signaled, p.emitted)),
             Err(_) => return false,
+        };
+        let media = {
+            let mut owner = graphics_owner().await;
+            match owner.get().map(|boot| boot.media_signalled()) {
+                Some(Ok(done)) => done,
+                Some(Err(_)) => return false,
+                None => true,
+            }
+        };
+        if queues && media {
+            return true;
         }
         if deadline.expired() {
             return false;
@@ -1077,8 +1090,17 @@ async fn prepare_graphics_suspend() {
     let Some(graphics) = display.graphics.as_mut().filter(|g| g.queues_verified()) else {
         return;
     };
-    crate::amdgpu_navi22_cs::unregister();
+    // The media session table stays for the restored firmware context.
+    crate::amdgpu_navi22_cs::suspend();
     crate::amdgpu_navi22_tdr::stop();
+    // vcn_v3_0_suspend: stopped, with each VCPU BO saved. A failure leaves
+    // the resume to start media with no sessions.
+    if let Err(error) = graphics.suspend_media().await {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: raphael media sessions not saved: {error:?}"
+        );
+    }
     // SAFETY: the client path is withdrawn; the coordinator is re-armed at
     // resume.
     if let Err(error) = unsafe { graphics.quiesce_for_reset() }.await {

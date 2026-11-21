@@ -319,6 +319,12 @@ pub(crate) const CONTEXT: u64 = STACK + STACK_SIZE as u64;
 pub(crate) const SHARED: u64 = CONTEXT + CONTEXT_SIZE as u64;
 // linux: n/a (AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_fw_shared)) = 4096; struct not in probe)
 pub(crate) const SHARED_SIZE: u32 = 4096;
+/// The VCPU BO proper, the part `amdgpu_vcn_suspend` saves: stack, context
+/// and fw_shared. The rings and buffers after it are reset at every start.
+// linux: n/a (amdgpu_bo_size(vcpu_bo) with PSP load, amdgpu_vcn_sw_init)
+pub(crate) const VCPU_BYTES: u64 = SHARED + SHARED_SIZE as u64;
+/// Bytes copied per step of a save, between yields to the executor.
+const SAVE_CHUNK: u64 = 64 << 10; // linux: n/a (NARF policy)
 pub(crate) const DEC_RING: u64 = SHARED + SHARED_SIZE as u64;
 pub(crate) const ENC_RING: [u64; 2] = [DEC_RING + 4096, DEC_RING + 8192];
 pub(crate) const WB: u64 = DEC_RING + 12288;
@@ -1071,6 +1077,12 @@ pub(crate) struct Instance {
     pub dec: Ring,
     pub enc: [Ring; 2],
     pub engine: fence::Engine,
+    /// The VCPU BO as `save_vcpu` copied it (`adev->vcn.inst[i].saved_bo`),
+    /// until the next start puts it back.
+    pub saved: Option<alloc::boxed::Box<[u32]>>,
+    /// Whether the last start put a saved VCPU BO back, so the firmware's
+    /// sessions from before carried over.
+    pub restored: bool,
 }
 impl Instance {
     pub(crate) fn new(pool: &Pool, i: u32) -> Result<Self, Error> {
@@ -1102,6 +1114,8 @@ impl Instance {
                 ring(ENC_RING[1], Kind::Enc, doorbell::enc(i, 1), WPTR[2]),
             ],
             engine: [fence::Engine::Vcn0, fence::Engine::Vcn1][i as usize],
+            saved: None,
+            restored: false,
         })
     }
     fn address(&self, offset: u64) -> u64 {
@@ -1285,6 +1299,96 @@ impl<I: Io> Engine<I> {
     fn active(&self) -> impl Iterator<Item = usize> + '_ {
         (0..2).filter(|&i| self.vcn[i].is_some())
     }
+    /// `amdgpu_fence_driver_hw_fini`'s wait, sampled once: whether every
+    /// counted VCN ring and a verified JPEG ring signalled its last job.
+    pub(crate) fn fences_signalled(&mut self) -> Result<bool, Error> {
+        if !matches!(self.state, State::Running | State::Verified) {
+            return Ok(true);
+        }
+        let counted: [[bool; 3]; 2] =
+            core::array::from_fn(|i| core::array::from_fn(|slot| self.ring_counted(i, slot)));
+        let jpeg = self
+            .jpeg
+            .as_ref()
+            .filter(|_| self.jpeg_state == JpegState::Verified)
+            .map(|j| (j.memory.mapping(), j.ring.seq));
+        let (instances, enc_count) = (&self.vcn, self.enc_count);
+        self.hw.access(|io, l| {
+            invalidate(io, l);
+            checked(io.read(l.liveness()))?;
+            let mut all = true;
+            for (i, inst) in instances.iter().enumerate() {
+                let Some(inst) = inst else {
+                    continue;
+                };
+                let map = inst.memory.mapping();
+                let rings = core::iter::once(&inst.dec).chain(&inst.enc[..enc_count]);
+                for (slot, ring) in rings.enumerate() {
+                    if counted[i][slot] {
+                        all &= fence::signaled(io.read_memory(map, FENCE[slot]), ring.seq);
+                    }
+                }
+            }
+            if let Some((map, seq)) = jpeg {
+                all &= fence::signaled(io.read_memory(map, JPEG_FENCE), seq);
+            }
+            checked(io.read(l.liveness()))?;
+            Ok(all)
+        })
+    }
+    /// `vcn_v3_0_suspend`: `vcn_v3_0_hw_fini` (the `stop` of a running
+    /// owner; one the idle work gated is already stopped), then
+    /// `amdgpu_vcn_suspend` (`save_vcpu`). `Busy` for an owner that never
+    /// started, or failed.
+    pub(crate) async fn suspend(&mut self) -> Result<(), Error> {
+        match self.state {
+            State::Running | State::Verified => self.stop().await?,
+            State::Stopped => {}
+            _ => return Err(Error::Busy),
+        }
+        self.save_vcpu().await
+    }
+    /// `amdgpu_vcn_save_vcpu_bo_inst` for each instance: its VCPU BO (stack,
+    /// context, fw_shared) copied to the heap, so the next start puts the
+    /// firmware's sessions back. Requires a stopped owner.
+    pub(crate) async fn save_vcpu(&mut self) -> Result<(), Error> {
+        if self.state != State::Stopped {
+            return Err(Error::Busy);
+        }
+        let instances: alloc::vec::Vec<usize> = self.active().collect();
+        for i in instances {
+            let map = self.vcn[i].as_ref().ok_or(Error::Invalid)?.memory.mapping();
+            let mut image = alloc::vec::Vec::new();
+            image
+                .try_reserve_exact((VCPU_BYTES / 4) as usize)
+                .map_err(|_| Error::Allocation)?;
+            for start in (0..VCPU_BYTES).step_by(SAVE_CHUNK as usize) {
+                let end = (start + SAVE_CHUNK).min(VCPU_BYTES);
+                self.hw.access(|io, l| {
+                    invalidate(io, l);
+                    image.extend((start..end).step_by(4).map(|at| io.read_memory(map, at)));
+                    // A read that fell off the bus reads as all ones too.
+                    checked(io.read(l.liveness())).map(drop)
+                })?;
+                narf_scheduler::yield_now().await;
+            }
+            if let Some(instance) = self.vcn[i].as_mut() {
+                instance.saved = Some(image.into_boxed_slice());
+            }
+        }
+        Ok(())
+    }
+    /// Drop every saved VCPU BO: the next start begins with no sessions.
+    pub(crate) fn forget_saved(&mut self) {
+        for instance in self.vcn.iter_mut().flatten() {
+            instance.saved = None;
+        }
+    }
+    /// Whether the last start put every instance's saved VCPU BO back.
+    pub(crate) fn sessions_restored(&self) -> bool {
+        let mut instances = self.vcn.iter().flatten().peekable();
+        instances.peek().is_some() && instances.all(|i| i.restored)
+    }
     /// `vcn_v3_0_hw_init` (non-SR-IOV): per unharvested instance, the NBIO
     /// MMSCH doorbell range, then `amdgpu_ring_test_helper` on the decode
     /// ring (whose begin_use runs `vcn_v3_0_start`) and both encode rings.
@@ -1361,27 +1465,44 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    /// `amdgpu_vcn_resume` (PSP: zero the whole VCPU BO) and the fw_shared
-    /// flags `vcn_v3_0_sw_init` sets, then the doorbell range.
+    /// `amdgpu_vcn_resume`, then the doorbell range. A VCPU BO `save_vcpu`
+    /// copied goes back whole, fw_shared's flags with it, so the firmware
+    /// finds its sessions. Otherwise (PSP load) the BO is zeroed and
+    /// fw_shared gets the flags `vcn_v3_0_sw_init` sets. The rings and
+    /// buffers after the BO are zeroed either way.
     fn prepare_instance(&mut self, i: usize) -> Result<(), Error> {
         let instance = self.vcn[i].as_mut().ok_or(Error::Invalid)?;
         let map = instance.memory.mapping();
         let index = instance.dec.doorbell;
         let nbio_v7_2 = self.nbio_v7_2;
+        // Taken whatever happens next: a failed start leaves the BO unknown.
+        let saved = instance.saved.take();
+        instance.restored = false;
         self.hw.access(|io, l| {
             // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
             if checked(io.read(l.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
                 // Doorbells stage did not open the NBIF aperture.
                 return Err(Error::Invalid);
             }
-            io.zero_memory(map, 0, INSTANCE_BYTES);
-            io.write_memory(map, SHARED + shared::PRESENT_FLAG_0, shared::PRESENT);
-            if let Some(kind) = l.smu_interface_type() {
-                io.write_memory(map, SHARED + shared::SMU_INTERFACE_INFO, kind);
+            match saved.as_deref() {
+                Some(image) => {
+                    for (at, &word) in (0..VCPU_BYTES).step_by(4).zip(image) {
+                        io.write_memory(map, at, word);
+                    }
+                    io.zero_memory(map, VCPU_BYTES, INSTANCE_BYTES - VCPU_BYTES);
+                }
+                None => {
+                    io.zero_memory(map, 0, INSTANCE_BYTES);
+                    io.write_memory(map, SHARED + shared::PRESENT_FLAG_0, shared::PRESENT);
+                    if let Some(kind) = l.smu_interface_type() {
+                        io.write_memory(map, SHARED + shared::SMU_INTERFACE_INFO, kind);
+                    }
+                }
             }
             flush(io, l);
             vcn_doorbell_range(io, l, nbio_v7_2, i, index)
         })?;
+        instance.restored = saved.is_some();
         // Published before the VCPU can learn any of these addresses.
         instance.memory.publish();
         for ring in [&mut instance.dec]
@@ -2521,6 +2642,22 @@ impl Media {
     pub(crate) unsafe fn rearm(&mut self) {
         // SAFETY: forwarded.
         unsafe { self.engine.rearm() }
+    }
+    /// See `Engine::fences_signalled`.
+    pub(crate) fn fences_signalled(&mut self) -> Result<bool, Error> {
+        self.engine.fences_signalled()
+    }
+    /// See `Engine::suspend`.
+    pub(crate) async fn suspend(&mut self) -> Result<(), Error> {
+        self.engine.suspend().await
+    }
+    /// See `Engine::forget_saved`.
+    pub(crate) fn forget_saved(&mut self) {
+        self.engine.forget_saved()
+    }
+    /// See `Engine::sessions_restored`.
+    pub(crate) fn sessions_restored(&self) -> bool {
+        self.engine.sessions_restored()
     }
 }
 

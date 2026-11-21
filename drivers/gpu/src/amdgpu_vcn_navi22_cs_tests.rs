@@ -604,3 +604,37 @@ kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_cs_media_grant_maps_pasid_only_with_a_flush
 );
+
+/// S3 withdraws the media rings but keeps the session table (the firmware
+/// context is saved with it); a recovery's or shutdown's withdrawal empties it.
+fn vcn_navi22_cs_suspend_keeps_the_session_table() -> TestResult {
+    if MEDIA.lock().is_some() {
+        return TestResult::Skip("a card registered its media rings");
+    }
+    let before = *SESSIONS.lock();
+    let mut table = Sessions::new();
+    let create = Message {
+        kind: MSG_CREATE,
+        handle: 7,
+    };
+    if table.apply(create, 1).is_err() {
+        return TestResult::Fail("session create");
+    }
+    *SESSIONS.lock() = table;
+    suspend();
+    let kept = *SESSIONS.lock() == table && rings() == 0;
+    unregister();
+    let emptied = SESSIONS.lock().count() == 0;
+    *SESSIONS.lock() = before;
+    if !kept {
+        return TestResult::Fail("suspend dropped the sessions or kept the rings");
+    }
+    if !emptied {
+        return TestResult::Fail("unregister kept the sessions");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_cs_suspend_keeps_the_session_table
+);
