@@ -94,6 +94,9 @@ impl<I: Io> Engine<I> {
         if now.saturating_sub(last) < IDLE_NS {
             return Ok(false);
         }
+        // `amdgpu_fence_count_emitted` over the rings that are ready.
+        let counted: [[bool; 3]; 2] =
+            core::array::from_fn(|i| core::array::from_fn(|slot| self.ring_counted(i, slot)));
         let instances = &self.vcn;
         let enc_count = self.enc_count;
         let (all_done, enc_done) = self.hw.access(|io, l| {
@@ -106,9 +109,14 @@ impl<I: Io> Engine<I> {
                     continue;
                 };
                 let map = inst.memory.mapping();
-                all &= fence::signaled(io.read_memory(map, FENCE[0]), inst.dec.seq);
+                if counted[i][0] {
+                    all &= fence::signaled(io.read_memory(map, FENCE[0]), inst.dec.seq);
+                }
                 for j in 0..enc_count {
-                    enc[i] &= fence::signaled(io.read_memory(map, FENCE[j + 1]), inst.enc[j].seq);
+                    if counted[i][j + 1] {
+                        enc[i] &=
+                            fence::signaled(io.read_memory(map, FENCE[j + 1]), inst.enc[j].seq);
+                    }
                 }
                 all &= enc[i];
             }
@@ -149,10 +157,26 @@ impl<I: Io> Engine<I> {
         MEDIA_ASLEEP.store(true, Ordering::Release);
         Ok(true)
     }
-    /// When the idle work should look again: every 100 ms until gated.
-    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-    pub(crate) fn idle_recheck(&self, _now: u64) -> Option<u64> {
-        (self.runtime.phase == Phase::Awake).then_some(100_000_000)
+    /// When the idle work should look again. Linux queues `idle_work`
+    /// VCN_IDLE_TIMEOUT after a ring's last use and re-queues it one timeout
+    /// later while fences remain emitted: the rest of the timeout after a
+    /// recent use, a full timeout while busy, and `None` once gated or
+    /// unusable, until the next `begin_use`.
+    pub(crate) fn idle_recheck(&self, now: u64) -> Option<u64> {
+        if self.runtime.phase != Phase::Awake
+            || !matches!(self.state, State::Running | State::Verified)
+        {
+            return None;
+        }
+        let since = self
+            .runtime
+            .last_use
+            .map_or(0, |last| now.saturating_sub(last));
+        Some(if since < IDLE_NS {
+            IDLE_NS - since
+        } else {
+            IDLE_NS
+        })
     }
     pub(crate) async fn begin_use(
         &mut self,
@@ -321,11 +345,16 @@ pub(crate) fn start() {
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     MEDIA_ASLEEP.store(false, Ordering::Release);
     narf_scheduler::spawn(async move {
+        // Linux queues `idle_work` VCN_IDLE_TIMEOUT after a ring's last use.
+        let mut delay = IDLE_NS;
         loop {
-            // Gated media: no idle work until the next use (Linux queues
-            // `idle_work` from `ring_end_use` only).
-            media_in_use(epoch).await;
-            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(100).as_instant()).await;
+            // Gated or unusable media: no idle work until the next use
+            // (Linux queues `idle_work` from `ring_end_use` only).
+            if MEDIA_ASLEEP.load(Ordering::Acquire) {
+                media_in_use(epoch).await;
+                delay = IDLE_NS;
+            }
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ns(delay).as_instant()).await;
             if EPOCH.load(Ordering::Acquire) != epoch {
                 return;
             }
@@ -344,6 +373,12 @@ pub(crate) fn start() {
                     "amdgpu: navi22 VCN idle failed: {error:?}"
                 );
                 return;
+            }
+            match boot.media_idle_recheck(narf_time::monotonic_ns()) {
+                Some(ns) => delay = ns,
+                // Parked under the owner, which `begin_use` also holds, so its
+                // `wake_idle_work` cannot fall between this and the park.
+                None => MEDIA_ASLEEP.store(true, Ordering::Release),
             }
         }
     });
