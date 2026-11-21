@@ -164,10 +164,23 @@ also consult upstream Linux GPL sources.
 - Each supervisor waits between cycles in `supervisor_wait::park`, which
   ends on a kick of its controller: `Xhci::kick_supervisor()` (an API
   caller with work for the supervisor's pumps), and internally every Port
-  Status Change Event, queued Transfer Event and controller error.
+  Status Change Event, queued Transfer Event (a HID report, a hub
+  status-change completion) and controller error.
   `Xhci::supervisor_kicks()` counts kicks and
   `Xhci::port_status_events()` that controller's Port Status Change
-  Events. The wait also ends every 8 ms on a timer-wheel sleep.
+  Events. As Linux's `hub_wq`, the supervisor arms a timer only for a
+  deadline of its own (`supervisor_wait::next_deadline`, an hrtimer at
+  exactly that time): the earliest idle-suspend window ending
+  (`attach::next_idle_suspend_ns`; a vetoed or refused suspend restamps
+  the port, so it waits a new window), a re-sample every 8 ms on a
+  controller without MSI-X/MSI/INTx or every 250 ms while a hub has no
+  status-change endpoint, and a 100 ms retry of a controller reset that
+  could not run. With none of these it parks with no timer. A kick that
+  is only pump work (input, serial TX) runs the pumps and parks again; a
+  Port Status Change Event of its controller, a hub status-change report,
+  a deadline or a controller error runs a full cycle. A cycle does not
+  park while a root port or a hub port still has an attempt to make.
+  System resume kicks every supervisor (Linux `hub_activate(HUB_RESUME)`).
 - Runtime suspend dispatch is
   `class_registry::dispatch_suspend(controller, hub_slot, port)`;
   `UsbSuspendFn` receives the same three coordinates. r8152, CDC-NCM,
