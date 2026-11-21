@@ -326,6 +326,39 @@ pub unsafe fn set_gsi_masked(gsi: u32, masked: bool) -> bool {
     false
 }
 
+/// Mask every unmasked redirection entry that delivers `vector`, in every
+/// MADT IOAPIC, leaving the rest of each entry unchanged; returns how many
+/// were masked. Linux `mask_ioapic_irq` for the line behind an interrupt the
+/// spurious-IRQ detector disables (`note_interrupt`): the dispatch layer
+/// knows only the vector, so it finds the pin by its programmed vector.
+/// Safe from hard-IRQ context, as [`set_gsi_masked`].
+///
+/// # Safety
+/// MADT IOAPIC mappings must be initialized and live, and the caller must
+/// own the decision to silence every line routed to `vector`.
+pub unsafe fn mask_entries_for_vector(vector: u8) -> u32 {
+    let mut ioapics = [crate::IoApic::default(); crate::MAX_IOAPICS];
+    let n = crate::copy_ioapics(&mut ioapics);
+    let mut masked = 0;
+    for io in &ioapics[..n] {
+        // SAFETY: IOAPIC base comes from the validated MADT.
+        let h = unsafe { probe(io.address as u64, io.gsi_base) };
+        let _guard = IOAPIC_LOCK.lock();
+        for gsi in h.gsi_base..=h.gsi_end {
+            let index = IDX_IOREDTBL_BASE + 2 * (gsi - h.gsi_base);
+            // SAFETY: in-range redirection entry, selector/window pair locked.
+            unsafe {
+                let low = read_reg_locked(h.base_phys, index);
+                if low as u8 == vector && low & MASKED == 0 {
+                    write_reg_locked(h.base_phys, index, low | MASKED);
+                    masked += 1;
+                }
+            }
+        }
+    }
+    masked
+}
+
 /// Read the existing routing of a GSI without reprogramming it. Drivers use
 /// this to join a shared level-triggered line instead of stealing its vector.
 /// Returns `(vector, destination_apic, low_dword)` or None outside MADT ranges.

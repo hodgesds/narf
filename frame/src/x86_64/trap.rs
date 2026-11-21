@@ -84,6 +84,11 @@ unsafe fn signal_copy_bytes_to_user(dst: u64, src: &[u8]) -> bool {
 /// * **RCU stall** — a CPU holding a grace period open; one report.
 /// * **Stranded wakeup** — a parked task whose own epoll or poll set is
 ///   ready, window after window: a lost wakeup, which no idle system shows.
+/// * **Interrupt storm** — one vector at `IRQ_STORM_RATE` (100,000/s) or
+///   more on one CPU for `IRQ_STORM_WINDOWS` (5) windows: `irq storm: CPU#N
+///   vector V (handler) at R/s for W windows`, once per episode. Reported,
+///   not masked; the dispatch layer's unhandled-IRQ detector ("irq N: nobody
+///   cared") is what disables a vector.
 ///
 /// A report carries one bounded state dump ([`dump`]): per-CPU state (an
 /// NMI samples the RIP of every awake CPU with work) with each CPU's
@@ -108,8 +113,8 @@ mod stall_wd {
     use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
     use narf_console::TrapWriter;
     use narf_observability::watchdog::{
-        per_sec, permille, CpuSample, IrqShare, Lockup, LockupWatch, RunnableSample, RunnableWatch,
-        IRQ_TOP_N, RUNNABLE_THRESH_SECS, WATCHDOG_THRESH_SECS,
+        per_sec, permille, CpuSample, IrqShare, IrqStormWatch, Lockup, LockupWatch, RunnableSample,
+        RunnableWatch, IRQ_TOP_N, RUNNABLE_THRESH_SECS, WATCHDOG_THRESH_SECS,
     };
 
     const MAXC: usize = 16;
@@ -526,14 +531,16 @@ mod stall_wd {
     static IRQ_TOP: [[AtomicU64; IRQ_TOP_N]; MAXC] =
         [const { [const { AtomicU64::new(0) }; IRQ_TOP_N] }; MAXC];
     static IRQ_WINDOW_MS: AtomicU64 = AtomicU64::new(0);
+    static IRQ_STORM: IrqStormWatch<MAXC> = IrqStormWatch::new();
 
     /// Pack a top-vector entry: vector in the top byte, rate below.
     fn pack_top(vector: u8, rate: u64) -> u64 {
         ((vector as u64) << 56) | rate.min((1 << 56) - 1)
     }
 
-    /// Sample every CPU's interrupts over the window just ended.
-    /// Lock-free reads and relaxed stores only; no allocation.
+    /// Sample every CPU's interrupts over the window just ended and report
+    /// a sustained storm. Lock-free reads and relaxed stores only; no
+    /// allocation.
     fn irq_sample() {
         let now = narf_scheduler::narf_time::now_cycles();
         let last = IRQ_LAST_CYC.swap(now, Ordering::Relaxed);
@@ -570,6 +577,18 @@ mod stall_wd {
             IRQ_MASKED_RATE[cpu].store(per_sec(masked_delta, elapsed_ns), Ordering::Relaxed);
             for (slot, &(v, count)) in IRQ_TOP[cpu].iter().zip(share.top.iter()) {
                 slot.store(pack_top(v, per_sec(count, elapsed_ns)), Ordering::Relaxed);
+            }
+            let busiest = share
+                .busiest()
+                .map(|(v, count)| (v, per_sec(count, elapsed_ns)));
+            if let Some((v, windows)) = IRQ_STORM.observe(cpu, busiest) {
+                let rate = busiest.map_or(0, |(_, r)| r);
+                let _ = writeln!(
+                    TrapWriter,
+                    "irq storm: CPU#{cpu} vector {v} ({}) at {rate}/s for {windows} windows",
+                    narf_interrupts::dispatch::handler_name_try(v).unwrap_or("?"),
+                );
+                irq_line(cpu);
             }
         }
     }

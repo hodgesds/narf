@@ -248,6 +248,10 @@ pub struct Slot {
     /// firing behind it costs its CPU an interrupt each time; counted so
     /// that cost stays visible.
     pub masked_fired: AtomicU64,
+    /// Linux `note_interrupt` state for the unhandled-IRQ detector.
+    unhandled: SpuriousState,
+    /// The detector disabled this vector ("nobody cared").
+    pub spurious_disabled: AtomicBool,
 }
 
 impl core::fmt::Debug for Slot {
@@ -273,6 +277,8 @@ impl Slot {
             wakers: IrqSafeSpinLock::new(Vec::new()),
             wakes_invoked: AtomicU64::new(0),
             masked_fired: AtomicU64::new(0),
+            unhandled: SpuriousState::new(),
+            spurious_disabled: AtomicBool::new(false),
         }
     }
 }
@@ -399,9 +405,16 @@ pub fn disable_irq(vector: u8) {
 /// Inverse of `disable_irq`. Subsequent `on_irq(vector)` calls
 /// resume full dispatch.
 pub fn enable_irq(vector: u8) {
-    SLOTS[vector as usize]
-        .masked
-        .store(false, Ordering::Release);
+    let s = &SLOTS[vector as usize];
+    // Re-enabling a vector the unhandled-IRQ detector disabled unmasks its
+    // source again (Linux `enable_irq` after `note_interrupt`'s disable).
+    if s.spurious_disabled.swap(false, Ordering::Relaxed) {
+        s.unhandled.reset();
+        if let Some(m) = hw_mask(vector) {
+            (m.mask)(m.cookie, false);
+        }
+    }
+    s.masked.store(false, Ordering::Release);
 }
 
 /// Returns true if the vector is currently soft-masked.
@@ -534,6 +547,7 @@ pub fn on_irq_with_user_state(
         // check_no_reentry rather than a silent deadlock.
         let mut any_handled = false;
         let chain_was_nonempty;
+        let mut bad: Option<(u32, BadIrqHandlers)> = None;
         {
             let g = s.handlers.lock();
             chain_was_nonempty = !g.is_empty();
@@ -545,9 +559,28 @@ pub fn on_irq_with_user_state(
                     IrqStatus::None => {}
                 }
             }
+            // Linux `note_interrupt`, under the same lock that serialises
+            // the chain (Linux's `desc->lock`): a handled interrupt on a
+            // vector with no recent unhandled one costs one load.
+            if chain_was_nonempty && irqdebug_applies(vector) {
+                let now = if any_handled {
+                    0
+                } else {
+                    narf_time::now_cycles()
+                };
+                if let Some(unhandled) =
+                    s.unhandled
+                        .note(any_handled, now, narf_time::ns_to_cycles(UNHANDLED_GAP_NS))
+                {
+                    bad = Some((unhandled, BadIrqHandlers::copy(&g)));
+                }
+            }
         }
         if chain_was_nonempty && !any_handled {
             s.spurious.fetch_add(1, Ordering::Release);
+        }
+        if let Some((unhandled, handlers)) = bad {
+            report_bad_irq(vector, unhandled, &handlers);
         }
 
         // Wake registered futures. Two paths:
@@ -660,6 +693,234 @@ pub fn handler_name_try(vector: u8) -> Option<&'static str> {
 /// Per-CPU count of deliveries dropped by a soft mask.
 static MASKED_ARRIVALS: [AtomicU64; PERCPU_FIRES_MAX] =
     [const { AtomicU64::new(0) }; PERCPU_FIRES_MAX];
+
+// ── Unhandled-IRQ detector (Linux `kernel/irq/spurious.c`) ──────────
+
+/// Linux `note_interrupt`'s window: every this many interrupts on a vector
+/// that has had an unhandled one, the unhandled count is judged and reset.
+pub const SPURIOUS_WINDOW: u32 = 100_000;
+
+/// More than this many unhandled interrupts in one window disables the
+/// vector ("irq N: nobody cared").
+pub const SPURIOUS_THRESHOLD: u32 = 99_900;
+
+/// An unhandled interrupt more than this long after the previous one
+/// restarts the unhandled count (Linux `HZ/10`): sparse unhandled
+/// interrupts on a shared line are normal.
+pub const UNHANDLED_GAP_NS: u64 = 100_000_000;
+
+/// Linux's per-descriptor `irq_count` / `irqs_unhandled` /
+/// `last_unhandled`. Updated only under the vector's handler lock, which
+/// serialises it like `desc->lock`; atomics only so it can live in a
+/// static.
+#[derive(Debug)]
+pub struct SpuriousState {
+    irq_count: AtomicU32,
+    irqs_unhandled: AtomicU32,
+    last_unhandled: AtomicU64,
+}
+
+impl SpuriousState {
+    pub const fn new() -> Self {
+        Self {
+            irq_count: AtomicU32::new(0),
+            irqs_unhandled: AtomicU32::new(0),
+            last_unhandled: AtomicU64::new(0),
+        }
+    }
+
+    /// Linux `note_interrupt` for one delivery: `handled` is whether any
+    /// handler claimed it, `now` the cycle counter (read only when it was
+    /// unhandled), `gap` [`UNHANDLED_GAP_NS`] in cycles. Returns the
+    /// unhandled count when a window has just ended with more than
+    /// [`SPURIOUS_THRESHOLD`] of its [`SPURIOUS_WINDOW`] interrupts
+    /// unhandled: the vector must be disabled.
+    pub fn note(&self, handled: bool, now: u64, gap: u64) -> Option<u32> {
+        if !handled {
+            let last = self.last_unhandled.load(Ordering::Relaxed);
+            let unhandled = if last == 0 || now.saturating_sub(last) > gap {
+                1
+            } else {
+                self.irqs_unhandled
+                    .load(Ordering::Relaxed)
+                    .saturating_add(1)
+            };
+            self.irqs_unhandled.store(unhandled, Ordering::Relaxed);
+            self.last_unhandled.store(now.max(1), Ordering::Relaxed);
+        }
+        let unhandled = self.irqs_unhandled.load(Ordering::Relaxed);
+        if unhandled == 0 {
+            return None;
+        }
+        let count = self.irq_count.load(Ordering::Relaxed) + 1;
+        if count < SPURIOUS_WINDOW {
+            self.irq_count.store(count, Ordering::Relaxed);
+            return None;
+        }
+        self.irq_count.store(0, Ordering::Relaxed);
+        self.irqs_unhandled.store(0, Ordering::Relaxed);
+        (unhandled > SPURIOUS_THRESHOLD).then_some(unhandled)
+    }
+
+    fn reset(&self) {
+        self.irq_count.store(0, Ordering::Relaxed);
+        self.irqs_unhandled.store(0, Ordering::Relaxed);
+        self.last_unhandled.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for SpuriousState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Linux `noirqdebug` clears this: no unhandled-IRQ detection.
+static IRQDEBUG: AtomicBool = AtomicBool::new(true);
+
+/// Turn the unhandled-IRQ detector on or off (`noirqdebug` turns it off).
+pub fn set_irqdebug(enabled: bool) {
+    IRQDEBUG.store(enabled, Ordering::Relaxed);
+}
+
+/// The detector judges device vectors only — what Linux keeps an
+/// `irq_desc` with actions for. The local timer, IPIs and the other fixed
+/// vectors are not device lines and are never disabled.
+#[inline]
+fn irqdebug_applies(vector: u8) -> bool {
+    IRQDEBUG.load(Ordering::Relaxed) && crate::vector::allocatable(vector)
+}
+
+/// How a vector's source is masked in hardware — Linux `irq_chip::irq_mask`
+/// for the chip behind it. Registered by whoever programs the source (the
+/// MSI-X table entry, the MSI capability); `mask(cookie, true)` masks it.
+/// `mask` runs in hard-IRQ context and must not block or allocate.
+#[derive(Clone, Copy)]
+pub struct HwMask {
+    /// What is masked, for the report (`msix-entry`, `msi-maskbit`).
+    pub kind: &'static str,
+    pub mask: fn(cookie: u64, masked: bool),
+    pub cookie: u64,
+}
+
+impl core::fmt::Debug for HwMask {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HwMask")
+            .field("kind", &self.kind)
+            .field("cookie", &self.cookie)
+            .finish_non_exhaustive()
+    }
+}
+
+static HW_MASK: [IrqSafeSpinLock<Option<HwMask>>; NUM_VECTORS] =
+    [const { IrqSafeSpinLock::new(None) }; NUM_VECTORS];
+
+/// Record how `vector`'s source is masked in hardware.
+pub fn set_hw_mask(vector: u8, mask: HwMask) {
+    *HW_MASK[vector as usize].lock() = Some(mask);
+}
+
+/// Forget `vector`'s hardware mask (its source was reprogrammed or freed).
+pub fn clear_hw_mask(vector: u8) {
+    *HW_MASK[vector as usize].lock() = None;
+}
+
+/// The hardware mask registered for `vector`.
+pub fn hw_mask(vector: u8) -> Option<HwMask> {
+    *HW_MASK[vector as usize].lock()
+}
+
+/// A new owner of `vector` starts with no hardware mask, no unhandled
+/// history and no "nobody cared" mark (Linux `irq_startup` on a fresh
+/// request).
+pub(crate) fn reset_vector_state(vector: u8) {
+    clear_hw_mask(vector);
+    let s = &SLOTS[vector as usize];
+    s.unhandled.reset();
+    s.spurious_disabled.store(false, Ordering::Relaxed);
+}
+
+/// The first handlers of a vector being disabled, copied out under its
+/// handler lock so the report runs without it.
+#[derive(Clone, Copy)]
+struct BadIrqHandlers {
+    entries: [Option<HandlerEntry>; 8],
+    total: usize,
+}
+
+impl BadIrqHandlers {
+    fn copy(chain: &[HandlerEntry]) -> Self {
+        let mut entries = [None; 8];
+        for (slot, h) in entries.iter_mut().zip(chain) {
+            *slot = Some(*h);
+        }
+        Self {
+            entries,
+            total: chain.len(),
+        }
+    }
+}
+
+/// Linux `__report_bad_irq` + the disable in `note_interrupt`: soft-mask
+/// the vector, mask its source in hardware, and say so once.
+#[cold]
+#[inline(never)]
+fn report_bad_irq(vector: u8, unhandled: u32, handlers: &BadIrqHandlers) {
+    use core::fmt::Write as _;
+    let s = &SLOTS[vector as usize];
+    s.spurious_disabled.store(true, Ordering::Relaxed);
+    s.masked.store(true, Ordering::Release);
+    let how = mask_in_hardware(vector);
+    let mut out = narf_console::TrapWriter;
+    let _ = writeln!(
+        out,
+        "irq {vector}: nobody cared ({unhandled} of the last {SPURIOUS_WINDOW} interrupts unhandled; \"noirqdebug\" disables this check)"
+    );
+    let _ = writeln!(out, "handlers:");
+    for h in handlers.entries.iter().flatten() {
+        let _ = writeln!(
+            out,
+            "[<{:#x}>] {} cookie={:#x}",
+            h.handler as usize, h.name, h.cookie
+        );
+    }
+    if handlers.total > handlers.entries.len() {
+        let _ = writeln!(
+            out,
+            "... and {} more",
+            handlers.total - handlers.entries.len()
+        );
+    }
+    let _ = writeln!(out, "Disabling IRQ #{vector} ({how})");
+}
+
+/// Mask `vector`'s source in hardware: through its registered [`HwMask`],
+/// else (x86_64) every IOAPIC pin routed to it. Returns what was done.
+fn mask_in_hardware(vector: u8) -> &'static str {
+    // try_lock: a registration racing this disable keeps its lock for a
+    // store; the vector stays soft-masked either way.
+    if let Some(m) = HW_MASK[vector as usize].try_lock().and_then(|g| *g) {
+        (m.mask)(m.cookie, true);
+        return m.kind;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the IOAPICs are mapped once the MADT is parsed (an
+        // unparsed MADT lists none), and this vector's lines are being
+        // silenced by the detector's decision.
+        if unsafe { narf_acpi::ioapic::mask_entries_for_vector(vector) } != 0 {
+            return "ioapic";
+        }
+    }
+    "no hardware mask known; soft-disabled only"
+}
+
+/// Whether the unhandled-IRQ detector disabled `vector`.
+pub fn spurious_disabled(vector: u8) -> bool {
+    SLOTS[vector as usize]
+        .spurious_disabled
+        .load(Ordering::Relaxed)
+}
 
 // ── Counters ───────────────────────────────────────────────────────
 
