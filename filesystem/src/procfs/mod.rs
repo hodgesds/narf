@@ -3426,7 +3426,7 @@ fn ns_vfsmnt_rows(pid: u64) -> Vec<(String, String, String, String)> {
         }
     }
     crate::registry()
-        .list_mountinfo()
+        .list_mountinfo_from("/")
         .into_iter()
         .map(
             |(_, _, path, fs_name, mnt_opts, show_options, super_opts, source, _)| {

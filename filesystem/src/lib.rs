@@ -4129,8 +4129,15 @@ pub type MountInfoRow = (
 );
 
 fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
+    mountinfo_rows_of(&mounts.iter().collect::<Vec<_>>())
+}
+
+/// [`mountinfo_rows`] over a chosen subset of a table, still in attachment
+/// order; parents are found among the same subset.
+fn mountinfo_rows_of(mounts: &[&Mount]) -> Vec<MountInfoRow> {
     mounts
         .iter()
+        .copied()
         .enumerate()
         .map(|(index, mount)| {
             // Mounts normally arrive parent-first, but boot-time discovery can
@@ -4142,6 +4149,7 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
             // layer in that stack, never a layer attached above them later.
             let parent = mounts
                 .iter()
+                .copied()
                 .enumerate()
                 .filter(|(candidate_index, candidate)| {
                     if *candidate_index == index {
@@ -4323,12 +4331,23 @@ pub struct VfsRegistry {
 
 /// One `pivot_root`: the old root's tree at `old_root`, minus the new root's
 /// subtree at `new_root`, is attached at `put_old` as mount `attachment`.
+///
+/// Each copy in `copies` and the entry it was made from in `originals` are
+/// one Linux mount: `attach_mnt` moved it. A listing shows it once, at the
+/// place the reader's root reaches (see [`VfsRegistry::list_mountinfo_from`]).
 #[derive(Debug)]
 struct PivotedRoot {
     old_root: String,
     new_root: String,
     put_old: String,
     attachment: u64,
+    /// The topmost mount at `new_root` when the pivot ran — the new root
+    /// mount — if `new_root` was a mount point.
+    new_root_mount: Option<u64>,
+    /// Ids of the attachment at `put_old` and every copy made with it.
+    copies: Vec<u64>,
+    /// Ids of the entries those copies were made from.
+    originals: Vec<u64>,
 }
 
 static REGISTRY: VfsRegistry = VfsRegistry {
@@ -5234,6 +5253,11 @@ impl MountNamespace {
         mountinfo_rows(&self.store().inner.lock())
     }
 
+    /// [`VfsRegistry::list_mountinfo_from`] in this namespace's table.
+    pub fn list_mountinfo_from(&self, root: &str) -> Vec<MountInfoRow> {
+        self.store().list_mountinfo_from(root)
+    }
+
     /// ID of the newest visible mount covering `abs`.
     pub fn mount_id_at(&self, abs: &str) -> Option<u64> {
         self.store()
@@ -6073,6 +6097,51 @@ impl VfsRegistry {
         mountinfo_rows(&self.inner.lock())
     }
 
+    /// [`Self::list_mountinfo`] as a reader whose root is `root` sees it:
+    /// each mount once.
+    ///
+    /// `pivot_root` moves mounts (`attach_mnt`), and this table represents a
+    /// moved mount twice — the copy at put_old and the entry it came from
+    /// (see [`Self::attach_old_root`]). `show_mountinfo` and `listmount` walk
+    /// the one tree the reader's root reaches (`seq_path_root`,
+    /// `is_path_reachable`), so which entry is the mount depends on where
+    /// that root is:
+    ///
+    /// * at or below the pivot's new root — every task the pivot was made
+    ///   for: the copies are the mounts, and the entries at their former
+    ///   paths are stale, before and after a lazy unmount of put_old;
+    /// * anywhere else — a task still rooted in the old root, which Linux's
+    ///   `chroot_fs_refs` would have moved but NARF leaves alone: it sees the
+    ///   old root's tree as it was, so neither the attachment at put_old (a
+    ///   second view of that tree) nor the new root's subtree (above the old
+    ///   root, unreachable from it) while the attachment is mounted.
+    ///
+    /// Mount ids stay unique and the order stays attachment order, which is
+    /// what `listmount`'s cursor relies on.
+    pub fn list_mountinfo_from(&self, root: &str) -> alloc::vec::Vec<MountInfoRow> {
+        let q = self.inner.lock();
+        let pivots = self.pivots.lock();
+        let under = |path: &str, base: &str| path == base || path_is_proper_descendant(path, base);
+        let mut hidden = alloc::collections::BTreeSet::new();
+        for pivot in pivots.iter() {
+            if under(root, &pivot.new_root) {
+                hidden.extend(pivot.originals.iter().copied());
+            } else if q.iter().any(|m| m.id == pivot.attachment) {
+                hidden.extend(pivot.copies.iter().copied());
+                if let Some(new_root_mount) = pivot.new_root_mount {
+                    hidden.extend(
+                        q.iter()
+                            .filter(|m| m.id >= new_root_mount && under(&m.path, &pivot.new_root))
+                            .map(|m| m.id),
+                    );
+                }
+            }
+        }
+        drop(pivots);
+        let visible: Vec<&Mount> = q.iter().filter(|m| !hidden.contains(&m.id)).collect();
+        mountinfo_rows_of(&visible)
+    }
+
     /// `pivot_root`'s `attach_mnt(root_mnt, old_mnt, old_mp)`: attach the old
     /// root at `put_old` WITH every mount below it, as `fs/namespace.c`'s
     /// `path_pivot_root` moves the whole `root_mnt` tree there. Only the new
@@ -6132,6 +6201,7 @@ impl VfsRegistry {
                             || path_is_proper_descendant(&mount.path, new_root)))
             })
         };
+        let mut originals = Vec::new();
         let root_copy = match bind_root {
             Some((fs, devname)) => Mount {
                 path: String::from(put_old),
@@ -6150,6 +6220,7 @@ impl VfsRegistry {
                     .iter()
                     .rposition(|m| m.path == old_root)
                     .ok_or(FsError::NotFound)?;
+                originals.push(q[top].id);
                 q[top].attached_copy(String::from(put_old))
             }
         };
@@ -6160,18 +6231,31 @@ impl VfsRegistry {
             .filter(|(index, mount)| {
                 path_is_proper_descendant(&mount.path, old_root) && !in_new_root(*index, mount)
             })
-            .map(|(_, mount)| mount.attached_copy(relocate(&mount.path)))
+            .map(|(_, mount)| {
+                originals.push(mount.id);
+                mount.attached_copy(relocate(&mount.path))
+            })
             .collect();
+        let mut copies = alloc::vec![root_id];
+        copies.extend(below.iter().map(|mount| mount.id));
+        let new_root_mount = new_top.map(|top| q[top].id);
         q.push(root_copy);
         q.extend(below);
         {
             let mut pivots = self.pivots.lock();
-            pivots.retain(|pivot| q.iter().any(|m| m.id == pivot.attachment));
+            // A record matters while either view of its mounts exists.
+            pivots.retain(|pivot| {
+                q.iter()
+                    .any(|m| pivot.copies.contains(&m.id) || pivot.originals.contains(&m.id))
+            });
             pivots.push(PivotedRoot {
                 old_root: String::from(old_root),
                 new_root: String::from(new_root),
                 put_old: String::from(put_old),
                 attachment: root_id,
+                new_root_mount,
+                copies,
+                originals,
             });
         }
         self.publish_lookup_locked(&q);
