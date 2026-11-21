@@ -1370,12 +1370,13 @@ pub(crate) fn dec_msg(create: bool) -> [u32; 14] {
         [0x28, 0x18, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     }
 }
-/// `amdgpu_vcn_enc_get_create_msg` / `_destroy_msg` IB (16 dwords, no
-/// unified-queue header on VCN 3.0): session info, task info, op.
-pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 16] {
-    let mut ib = [0; 16];
+/// `amdgpu_vcn_enc_get_create_msg` / `_destroy_msg` packages (no
+/// unified-queue header on VCN 3.0): session info, task info, op. Linux
+/// zeroes the rest of its 16-dword allocation but submits `ib->length_dw`,
+/// these 13 dwords: the firmware walks every dword the IB names as packages.
+pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 13] {
     // linux: n/a (IB literals in amdgpu_vcn.c:amdgpu_vcn_enc_get_create_msg/_destroy_msg)
-    ib[..13].copy_from_slice(&[
+    [
         0x18,
         1,
         1,
@@ -1389,8 +1390,7 @@ pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 16] {
         0,
         8,
         if create { 0x0800_0001 } else { 0x0800_0002 },
-    ]);
-    ib
+    ]
 }
 
 impl<I: Io> Engine<I> {
@@ -2287,7 +2287,8 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     /// `amdgpu_vcn_enc_ring_test_ib`: initialize then close session 1 on
-    /// ring j (`vcn_v2_0_enc_ring_emit_ib/_fence`, insert_end).
+    /// ring j (`vcn_v2_0_enc_ring_emit_ib/_fence`, insert_end). Each
+    /// VCN_ENC_CMD_IB names the IB's package dwords (`ib->length_dw`).
     async fn test_enc_ib(&mut self, i: usize, j: usize) -> Result<(), Error> {
         let instance = self.vcn[i].as_mut().ok_or(Error::Invalid)?;
         let map = instance.memory.mapping();
@@ -2301,10 +2302,16 @@ impl<I: Io> Engine<I> {
             last = seq;
             self.hw.access(|io, l| {
                 checked(io.read(l.reg(i, STATUS)))?;
-                for (at, &word) in enc_msg_ib(session, create).iter().enumerate() {
+                let words = enc_msg_ib(session, create);
+                for (at, &word) in words.iter().enumerate() {
                     io.write_memory(map, IBS[k] + at as u64 * 4, word);
                 }
-                ring.emit(io, map, &[cmd::ENC_IB, 0, ib as u32, (ib >> 32) as u32, 16])?;
+                let dwords = words.len() as u32;
+                ring.emit(
+                    io,
+                    map,
+                    &[cmd::ENC_IB, 0, ib as u32, (ib >> 32) as u32, dwords],
+                )?;
                 ring.emit(
                     io,
                     map,
