@@ -124,6 +124,22 @@ pub trait TrapContext {
     /// no-op; real trap frames override it. Used to symbolize a faulting
     /// instruction's operands (e.g. a corrupted heap pointer held in r13/r15).
     fn dump_gprs(&self) {}
+
+    /// Linux `in_ia32_syscall()` (`TS_COMPAT`): this context is servicing an
+    /// i386 system call — x86_64 `int 0x80`, from a 32-bit or a 64-bit task
+    /// alike. `args()` are then ebx, ecx, edx, esi, edi, ebp zero-extended
+    /// and `set_return` writes only eax. Handlers shared with the native
+    /// table check it to pick the compat ABI (`compat32`).
+    fn in_ia32_syscall(&self) -> bool {
+        false
+    }
+
+    /// The trapping user code ran in compatibility mode (CS = `__USER32_CS`,
+    /// Linux `!user_64bit_mode(regs)`). fork/clone copy it into the child's
+    /// `UserProcess::ia32` so the child resumes in the same mode.
+    fn in_compat_mode(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3705,6 +3721,23 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         // is available and that 0 is its ring fd.
         ctx.set_return(SyscallReturn::not_implemented());
     }
+}
+
+/// Run the installed native handler for `variant` on `ctx`, with no number
+/// lookup, seccomp or accounting around it: the i386 table
+/// (`compat32::table`) serves a compat syscall whose arguments already
+/// match a native handler this way, after `compat32::dispatch` has done the
+/// entry work for the i386 number.
+pub fn dispatch_native(variant: Syscall, ctx: &mut dyn TrapContext) {
+    let p = GLOBAL_TABLE.load(Ordering::Acquire);
+    if p.is_null() {
+        ctx.set_return(SyscallReturn::not_implemented());
+        return;
+    }
+    // SAFETY: as in `kernel_syscall_entry`: `p` was published by
+    // `install_global` from a leaked Box that is never freed while installed.
+    let table = unsafe { &*p };
+    table.dispatch_ctx_versioned(variant, 0, ctx);
 }
 
 /// Comm selector for the `syscall-trace` feature. Set from the kernel cmdline

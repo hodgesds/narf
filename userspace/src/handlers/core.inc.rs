@@ -12850,6 +12850,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         // No page-in plan (#740): nothing was loaded for this task —
         // its pages are the parent's, already resident or shared.
         page_in_plan: alloc::vec::Vec::new(),
+        // 64-bit child state. The IA-32 clone path copies the parent's mode
+        // and segments and applies CLONE_SETTLS through
+        // `compat32::tls::clone_settls`.
+        ia32: false,
+        segs: crate::UserSegments::default(),
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 

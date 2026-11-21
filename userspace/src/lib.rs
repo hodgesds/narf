@@ -44,6 +44,10 @@ pub mod container;
 pub mod linux_compat;
 
 pub mod anon_reclaim;
+/// IA-32 (i386) system calls: the `int 0x80` dispatch hook, TLS and the
+/// i386 table.
+#[cfg(target_arch = "x86_64")]
+pub mod compat32;
 pub(crate) mod bpf_iter;
 pub mod coredump;
 pub mod elf;
@@ -270,7 +274,7 @@ pub use loader::{
 };
 pub use process::{
     init_sysv_stack, load_user_process, load_user_process_with, load_user_process_with_root,
-    load_user_process_with_root_file, ProcessLoadError, SysVStackError, UserProcess,
+    load_user_process_with_root_file, ProcessLoadError, SysVStackError, UserProcess, UserSegments,
     DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES, DEFAULT_USER_STACK_RESERVED,
     DEFAULT_USER_STACK_TOP,
 };

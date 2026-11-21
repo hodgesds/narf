@@ -206,6 +206,8 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
         page_in_plan: alloc::vec::Vec::new(),
+        ia32: false,
+        segs: crate::UserSegments::default(),
     };
     let pending = crate::user_task::prepare_user_process_initial(
         process(),

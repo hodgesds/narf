@@ -122,6 +122,33 @@ pub struct UserProcess {
     /// test asserting a computed address) must read this rather than a
     /// constant — the base is drawn per exec.
     pub program_bias: u64,
+    /// x86_64: enter (or, for a fork/clone child, resume) this task's user
+    /// code in compatibility mode, CS = `__USER32_CS` (0x23) — Linux
+    /// `start_thread_ia32` for an ELF32 image, the parent's CS for a child
+    /// (`TrapContext::in_compat_mode`). A fresh image starts with DS = ES =
+    /// SS = `__USER_DS` and FS = GS = 0. `entry_arg` is not delivered: the
+    /// i386 ABI has no register argument at entry. Ignored on aarch64.
+    pub ia32: bool,
+    /// The segment state the task starts with (x86_64): empty for a fresh
+    /// image, the parent's (`compat32::tls::current_segments`) for
+    /// fork/clone, with `clone(CLONE_SETTLS)`'s descriptor applied by
+    /// `compat32::tls::clone_settls`. Applied on the first entry, before the
+    /// FS/GS bases; from then on the scheduler saves and restores it across
+    /// every switch.
+    pub segs: UserSegments,
+}
+
+/// A task's x86 user segment state (Linux `thread_struct`'s `tls_array`
+/// and `ds`/`es`/`fsindex`/`gsindex`). Plain data on every architecture;
+/// only x86_64 applies it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserSegments {
+    /// GDT TLS descriptors for slots 12..=14 (`set_thread_area`).
+    pub tls: [u64; 3],
+    pub ds: u16,
+    pub es: u16,
+    pub fs: u16,
+    pub gs: u16,
 }
 
 /// Errors from `load_user_process`.
@@ -921,6 +948,9 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         loaded_mappings,
         program_bias,
         page_in_plan,
+        // A native ELF64 image; the ELF32 loader sets `ia32`.
+        ia32: false,
+        segs: UserSegments::default(),
     })
 }
 

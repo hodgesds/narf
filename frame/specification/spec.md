@@ -211,6 +211,78 @@ pub unsafe fn register_cpu_gdt(cpu: usize, gdt: *mut u64);
 pub fn cpu_gdt(cpu: usize) -> *mut u64;
 ```
 
+**The i386 system-call hook.** `int 0x80` from user mode is the i386 ABI
+for every task (Linux `do_int80_emulation`). The gate builds a
+`TrapContext` over the trap frame whose `args()` are ebx, ecx, edx, esi,
+edi, ebp zero-extended, whose `set_return` writes rax with
+`compat32::user_rax` and nothing else, and whose `in_ia32_syscall()` is
+true, and calls `compat32::dispatch` with eax. `compat32` (userspace)
+runs seccomp for `AUDIT_ARCH_I386`, the TLS calls, then
+`compat32::table::dispatch` (the i386 table, owned by the IA-32 userspace
+work), and delivers signals with restart semantics. If the call parked to
+be re-executed (RIP rewound onto `int 0x80`), the gate restores eax to the
+number (Linux `orig_ax`).
+
+```rust
+// narf_userspace::compat32
+pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext);
+pub fn user_rax(ret: SyscallReturn) -> u64;
+pub mod table {
+    pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall>;
+    pub fn forward(ctx: &mut dyn TrapContext, variant: Syscall) -> Option<Syscall>;
+}
+pub mod tls {
+    pub fn sys_set_thread_area(ctx: &mut dyn TrapContext); // i386 243
+    pub fn sys_get_thread_area(ctx: &mut dyn TrapContext); // i386 244
+    pub fn current_segments() -> UserSegments;             // fork/clone copy
+    pub fn set_child_tls(segs: &mut UserSegments, gs_base: &mut u64,
+                         fs_base: &mut Option<u64>, info: &UserDesc) -> i64;
+    pub fn clone_settls(segs: &mut UserSegments, gs_base: &mut u64,
+                        fs_base: &mut Option<u64>, u_info: u64) -> i64;
+}
+// narf_userspace::syscall
+pub fn dispatch_native(variant: Syscall, ctx: &mut dyn TrapContext);
+trait TrapContext {
+    fn in_ia32_syscall(&self) -> bool { false } // TS_COMPAT
+    fn in_compat_mode(&self) -> bool { false }  // trapping CS == __USER32_CS
+}
+```
+
+**Entering a 32-bit task.** `UserProcess::ia32` asks the first entry (and a
+fork/clone child's first resume) for CS = `__USER32_CS`; a fresh image gets
+DS = ES = SS = `__USER_DS`, FS = GS = 0 with zero bases (Linux
+`start_thread_ia32`). `UserProcess::segs: UserSegments` is the task's
+initial TLS descriptors and DS/ES/FS/GS selectors (empty for an image, the
+parent's for fork/clone), applied before the FS/GS bases.
+
+**Per-task segment state.** The scheduler keeps each task's TLS
+descriptors and selectors (Linux `thread.tls_array`, `ds`, `es`,
+`fsindex`, `gsindex`). Switch-out saves the live selectors; switch-in loads
+the task's descriptors into the running CPU's slots 12..=14, then its
+selectors (GS through `load_gs_index`'s `swapgs` bracket with interrupts
+masked; a selector whose descriptor is no longer loadable becomes null),
+then the FS/GS bases.
+
+```rust
+// narf_scheduler::stackful (x86_64)
+pub fn set_current_user_tls_desc(slot: usize, desc: u64);
+pub fn current_user_tls() -> [u64; 3];
+pub fn current_user_segments() -> ([u64; 3], UserSelectors);
+pub fn set_current_user_segments(tls: [u64; 3], sel: UserSelectors);
+// narf_arch::x86_64::segments
+pub struct UserDesc { entry_number, base_addr, limit, flags }
+pub fn tls_desc_okay(&UserDesc) -> bool;   pub fn fill_ldt(&UserDesc) -> u64;
+pub fn fill_user_desc(idx: u32, desc: u64) -> UserDesc;
+pub fn ldt_empty(&UserDesc) -> bool;       pub fn ldt_zero(&UserDesc) -> bool;
+pub fn get_free_idx(&[u64; 3]) -> Option<u32>;
+pub struct UserSelectors { ds, es, fs, gs }
+pub fn read_user_selectors() -> UserSelectors;  pub fn cpu_tls() -> [u64; 3];
+pub fn selector_loadable(sel: u16, tls: &[u64; 3]) -> bool;
+pub unsafe fn load_tls(&[u64; 3]);         pub unsafe fn load_gs_index(u16);
+pub unsafe fn load_user_selectors(UserSelectors, &[u64; 3]);
+pub unsafe fn reload_selector_users(modified: u16, &[u64; 3]);
+```
+
 ## 4. Invariants & safety properties
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.

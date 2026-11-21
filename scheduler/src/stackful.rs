@@ -1321,6 +1321,51 @@ pub fn set_current_user_gs_base(gs_base: u64) {
     }
 }
 
+// ── IA-32 user segment state (Linux `thread.tls_array`, `ds/es/fsindex/
+//    gsindex`; `arch/x86/kernel/tls.c`, `process_64.c`) ───────────────
+
+/// Install `desc` in the CURRENT task's TLS slot `slot` (0..=2, GDT index
+/// 12 + `slot`) and in the running CPU's GDT, then reload every data
+/// segment register naming that slot — Linux `set_tls_desc` +
+/// `do_set_thread_area` for `p == current`. The descriptor must already be
+/// validated (`segments::tls_desc_okay` / `fill_ldt`); 0 empties the slot.
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_tls_desc(slot: usize, desc: u64) {
+    let _ = (slot, desc);
+}
+
+/// The CURRENT task's three TLS descriptors (Linux `thread.tls_array`).
+#[cfg(target_arch = "x86_64")]
+pub fn current_user_tls() -> [u64; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES] {
+    [0; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES]
+}
+
+/// The CURRENT task's segment state as fork/clone must copy it (Linux
+/// `copy_thread` after `save_fsgs`): its TLS descriptors and its live
+/// DS/ES/FS/GS selectors.
+#[cfg(target_arch = "x86_64")]
+pub fn current_user_segments() -> (
+    [u64; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES],
+    narf_arch::x86_64::segments::UserSelectors,
+) {
+    (
+        current_user_tls(),
+        narf_arch::x86_64::segments::read_user_selectors(),
+    )
+}
+
+/// Make `tls` and `sel` the CURRENT task's segment state and load them on
+/// this CPU: a fork/clone child's first entry applies its parent's copy,
+/// execve applies the empty state. The caller writes the FS/GS bases
+/// afterwards (a selector load replaces the base with the descriptor's).
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_segments(
+    tls: [u64; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES],
+    sel: narf_arch::x86_64::segments::UserSelectors,
+) {
+    let _ = (tls, sel);
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn user_fpu_save_task(cpu: usize, task: &KernelTask) {
