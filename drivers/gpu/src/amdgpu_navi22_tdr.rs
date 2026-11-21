@@ -358,6 +358,25 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
     }
 }
 
+/// What `amdgpu_job_timedout` does first with a client media ring's
+/// timeout on bare metal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MediaAction {
+    /// Fail the engine's jobs and withdraw its rings (NARF today).
+    Withdraw,
+    /// `amdgpu_gpu_recovery=0` (or recovery spent): `-ETIME` on the job and
+    /// `drm_sched_suspend_timeout`; the job waits for its fence.
+    Suspend,
+    /// The per-queue reset of the VCN instance (`amdgpu_vcn_ring_reset`).
+    ResetEngine,
+    /// No per-queue reset: `-ETIME` and `amdgpu_device_gpu_recover`.
+    Recover,
+}
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+pub(crate) fn media_action(_automatic: bool, _ring: MediaRing) -> MediaAction {
+    MediaAction::Withdraw
+}
+
 /// A client job on media ring `ring` timed out: Linux `amdgpu_job_timedout`
 /// on a video ring. Its job fails with `-ETIME` and the other jobs of that
 /// engine's rings with `-ECANCELED` (`amdgpu_navi22_cs::media_hung`), so the
