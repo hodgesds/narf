@@ -1477,6 +1477,42 @@ fn dispatch_inner(
 
 // ── Page-table materialisation ──────────────────────────────────────────
 
+// ── Page-table placement (`amdgpu_vm_pt_create`) ───────────────────────
+
+/// Flushes a card's HDP write cache, `amdgpu_device_flush_hdp(adev, NULL)`:
+/// CPU stores through the VRAM BAR reach memory before the GPU reads it.
+pub trait HdpFlush: Send + Sync + core::fmt::Debug {
+    fn flush(&self) -> Result<(), FsError>;
+}
+
+/// A dGPU card's page-table memory: CPU-visible VRAM and what places and
+/// commits tables in it.
+#[derive(Clone, Debug)]
+pub struct TableHeap {
+    /// CPU-visible VRAM (the card's client heap).
+    pub pool: crate::amdgpu_vram::Pool,
+    /// `vram_start` and `vram_base_offset`: an MC address `mc` is PA
+    /// `mc - fb_base + fb_offset` (`amdgpu_gmc_vram_mc2pa`).
+    pub fb_base: u64,
+    pub fb_offset: u64,
+    pub hdp: Arc<dyn HdpFlush>,
+}
+
+/// Cards whose client page tables live in VRAM, and their heaps.
+static TABLE_HEAPS: IrqSafeSpinLock<Vec<(u32, TableHeap)>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Give DRM card `card` VRAM page tables.
+pub fn register_table_heap(card: u32, heap: TableHeap) {
+    let mut heaps = TABLE_HEAPS.lock();
+    heaps.retain(|(c, _)| *c != card);
+    heaps.push((card, heap));
+}
+
+/// Withdraw card `card`'s table heap (recovery, suspend).
+pub fn unregister_table_heap(card: u32) {
+    TABLE_HEAPS.lock().retain(|(c, _)| *c != card);
+}
+
 /// One allocated page table: `entries_at(level)` 64-bit entries.
 ///
 /// Every level's table is one GPU page here. That is exact for GMC 11, where
@@ -2014,3 +2050,7 @@ where
         .map_err(ActivateError::Tlb)?;
     Ok(vmid)
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_vm_tables_tests.rs"]
+mod tables_tests;
