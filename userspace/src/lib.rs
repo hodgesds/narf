@@ -146,6 +146,7 @@ mod abi_coherence_9p_tests;
 mod abi_coherence_btrfs_tests;
 mod abi_coherence_exfat_tests;
 mod abi_coherence_minix_tests;
+mod abi_compat32_tests;
 mod abi_creds_tests;
 mod abi_device_mmap_tests;
 mod abi_drm_prime_tests;
