@@ -2777,6 +2777,67 @@ pub fn note_forward_progress() {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Per CPU: whether it is inside its executor — a dispatch loop
+/// ([`run_forever`], [`run_until_empty`]) or a driven round
+/// ([`poll_one_round`]), including every task poll those make — and since
+/// when. A CPU outside its executor runs synchronous code that does not
+/// serve its queue by design: the boot CPU's initcalls, a kernel-test
+/// harness, a `block_on` bridge before the executor starts. The stall
+/// watchdog judges a CPU's queue only while this says it is being served,
+/// as Linux's workqueue watchdog judges pools only once workqueues run.
+/// Written on executor entry and exit only, never per poll.
+#[repr(C, align(64))]
+struct ExecutorPresence {
+    /// Executor scopes this CPU is inside (they nest: a task poll may
+    /// drive a round of its own).
+    depth: AtomicU32,
+    /// Cycle counter when the outermost scope was entered.
+    entered: AtomicU64,
+}
+
+static EXECUTOR_PRESENCE: [ExecutorPresence; narf_lib::percpu::MAX_CPUS] = [const {
+    ExecutorPresence {
+        depth: AtomicU32::new(0),
+        entered: AtomicU64::new(0),
+    }
+};
+    narf_lib::percpu::MAX_CPUS];
+
+/// This CPU is inside its executor until the scope drops.
+struct ExecutorScope {
+    cpu: usize,
+}
+
+impl ExecutorScope {
+    #[inline]
+    fn enter(cpu: usize) -> Self {
+        let presence = &EXECUTOR_PRESENCE[cpu];
+        if presence.depth.load(Ordering::Relaxed) == 0 {
+            presence
+                .entered
+                .store(narf_time::now_cycles(), Ordering::Relaxed);
+        }
+        presence.depth.fetch_add(1, Ordering::Release);
+        Self { cpu }
+    }
+}
+
+impl Drop for ExecutorScope {
+    #[inline]
+    fn drop(&mut self) {
+        EXECUTOR_PRESENCE[self.cpu]
+            .depth
+            .fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// The cycle at which `cpu` entered its executor, or `None` while it is
+/// outside it (see [`ExecutorPresence`]). Two loads; never blocks.
+pub fn dbg_cpu_in_executor(cpu: usize) -> Option<u64> {
+    let presence = EXECUTOR_PRESENCE.get(cpu)?;
+    (presence.depth.load(Ordering::Acquire) != 0).then(|| presence.entered.load(Ordering::Relaxed))
+}
+
 /// Count one scheduling point on `cpu`: a dispatch round started, a polled
 /// task returned to the executor, or one task handed the CPU directly to
 /// another. Only the owning CPU writes the counter and its time stamp, so
@@ -7093,6 +7154,7 @@ pub fn poll_one_round() -> usize {
     } else {
         0
     };
+    let _executor = ExecutorScope::enter(cpu);
 
     // An executor round is this CPU's softirq context: expire its due
     // hrtimers (soft ones, and hard ones whose interrupt has not been taken —
@@ -7651,6 +7713,7 @@ pub fn run_until_empty() {
     } else {
         0
     };
+    let _executor = ExecutorScope::enter(cpu);
     #[cfg(target_arch = "x86_64")]
     let _fpu_trap_scope = stackful::executor_fpu_trap_guard();
 
@@ -8730,8 +8793,8 @@ pub struct OldestRunnable {
     /// Its scheduler id.
     pub task: u64,
     /// The cycle since which it has been runnable without running: the
-    /// later of its last wake (Linux `sched_info.last_queued`) and the end
-    /// of its last run.
+    /// latest of its last wake (Linux `sched_info.last_queued`), the end
+    /// of its last run, and its CPU's entry into the executor.
     pub since_cycles: u64,
     /// Which of the CPU's holding places it is in.
     pub hold: RunnableHold,
@@ -8765,6 +8828,15 @@ fn runnable_since(slot: &TaskSlot, now: u64) -> u64 {
 /// dispatched, wherever the CPU holds it — its ready queue, its wake inbox,
 /// or its parked set (woken, awaiting activation).
 ///
+/// Only a CPU inside its executor ([`dbg_cpu_in_executor`]) is judged: one
+/// outside it — the boot CPU running initcalls, a kernel-test harness, a CPU
+/// whose executor never started — leaves its queue unserved by design, and
+/// Linux's workqueue watchdog likewise judges pools only once workqueues
+/// run. A stamp older than the CPU's entry into its executor counts from the
+/// entry (Linux re-bases every pool when its watchdog starts,
+/// `wq_watchdog_reset_touched`). A CPU stuck inside its executor — a task
+/// poll that never returns — stays judged: that is the stall.
+///
 /// `try_lock` throughout, as [`dbg_cpu_stall`]: the CPU under investigation
 /// may hold any of these locks, and a busy one is skipped, not waited on.
 /// No allocation; one pass over each container.
@@ -8772,11 +8844,15 @@ pub fn dbg_oldest_runnable(cpu: usize) -> Option<OldestRunnable> {
     if cpu >= narf_lib::percpu::MAX_CPUS {
         return None;
     }
+    let entered = dbg_cpu_in_executor(cpu)?;
     let now = narf_time::now_cycles();
     let mut best: Option<OldestRunnable> = None;
     let mut consider = |slot: &TaskSlot, hold: RunnableHold| {
-        let since = runnable_since(slot, now);
-        if since == 0 || best.is_some_and(|b| b.since_cycles <= since) {
+        let since = match runnable_since(slot, now) {
+            0 => return,
+            since => since.max(entered),
+        };
+        if best.is_some_and(|b| b.since_cycles <= since) {
             return;
         }
         let allowed = slot.spec.affinity.allowed;
@@ -9557,6 +9633,8 @@ pub fn run_forever() -> ! {
     // execution availability even if the first queue is empty; the first
     // run_until_empty pass then emits the matching Idle edge before halt.
     policy::notify_cpu_state(CpuId(cpu as u32), CpuState::Active, None);
+    // Inside the executor for good, idle halts included.
+    let _executor = ExecutorScope::enter(cpu);
     loop {
         if park_for_cpu_lifecycle(cpu) {
             continue;
