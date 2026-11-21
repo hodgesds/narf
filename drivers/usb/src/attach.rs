@@ -336,11 +336,16 @@ pub fn set_walk_pending(controller: u8, hub_slot: u8, pending: bool) {
     }
 }
 
-/// Slot ids of the hubs whose ports the supervisor walks this cycle.
-///
-/// Every bound hub is walked on every cycle.
+/// Slot ids of the hubs whose ports the supervisor walks this cycle:
+/// those with a walk pending (just bound, a status-change report, a port
+/// to retry — Linux `hub_event` for a hub whose `event_bits` are set),
+/// and hubs without a status-change endpoint, whose changes nothing
+/// reports.
 pub(crate) fn hubs_to_walk(hubs: &[HubBinding]) -> Vec<u8> {
-    hubs.iter().map(|h| h.hub.slot_id).collect()
+    hubs.iter()
+        .filter(|h| h.walk_pending || h.hub.status.is_none())
+        .map(|h| h.hub.slot_id)
+        .collect()
 }
 
 /// Pure per-port suspend decision behind [`idle_suspend_pass`]:
