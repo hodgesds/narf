@@ -115,7 +115,11 @@ supported, since the command line splits on whitespace.
 **Cmdline store contract (per-arch `parse_raw`):** the bootloader-supplied
 command line is copied into a static 2048-byte buffer (`CMDLINE_CAP`,
 matching Linux's `COMMAND_LINE_SIZE`); the store keeps at most
-`CMDLINE_CAP - 1` bytes. On aarch64 the source is the FDT
+`CMDLINE_CAP - 1` bytes. On x86_64 both readers hand the store the whole
+string up to that buffer: multiboot2 up to its tag size, PVH (QEMU
+`-kernel`) up to `CMDLINE_CAP`, as Linux's PVH entry feeds `cmdline_paddr`
+to the same `COMMAND_LINE_SIZE` copy (a 512-byte PVH scan previously cut
+long `test_subsystem=` lists silently). On aarch64 the source is the FDT
 `/chosen/bootargs`, extracted by `narf-firmware-fdt` at the same 2048-byte
 cap (`BOOTARGS_CAP`). Truncation is never silent: the aarch64 store
 records it (`narf_boot::aarch64::cmdline_truncated()`) and prints a
