@@ -18504,7 +18504,7 @@ pub(crate) use {
     handler_sys_munmap::sys_munmap,
     handler_sys_noop_ok::sys_noop_ok,
     handler_sys_open_linux::sys_open_linux,
-    handler_sys_openat::sys_openat,
+    handler_sys_openat::{openat_path, sys_openat},
     handler_sys_openat2::sys_openat2,
     handler_sys_pause::sys_pause,
     handler_sys_personality::sys_personality,

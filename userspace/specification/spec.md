@@ -1262,6 +1262,9 @@ directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
 Intermediate symlinks can cross mounts in the caller's mount namespace.
 The resolved inode's mount supplies the read-only check.
+`openat2` with `RESOLVE_IN_ROOT` walks from the dirfd as its root — a leading
+`/` and a `..` at the top both stay at the dirfd — whatever the caller's own
+(chroot or pivoted) root.
 Every new inode, symlinks included, belongs to the creator as Linux's
 `inode_init_owner` assigns it: the filesystem UID, and the filesystem GID or
 the parent directory's group when that directory is setgid. A filesystem that
