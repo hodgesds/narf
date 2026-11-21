@@ -329,8 +329,20 @@ impl<I: Io> Engine<I> {
 }
 
 pub(crate) fn resolve_rdna2(gpu: &AmdGpu) -> Result<(Layout, usize), Error> {
+    engines(gpu, Layout::resolve_rdna2(gpu)?)
+}
+/// Raphael's one SDMA 5.2.6 engine; a second is refused (NBIO 7.2 has one
+/// SDMA doorbell range).
+pub(crate) fn resolve_raphael(gpu: &AmdGpu) -> Result<(Layout, usize), Error> {
+    let (layout, count) = engines(gpu, Layout::resolve_raphael(gpu)?)?;
+    if count != 1 {
+        return Err(Error::Unsupported);
+    }
+    Ok((layout, count))
+}
+/// The contiguous discovered SDMA engines of `layout`'s profile.
+fn engines(gpu: &AmdGpu, mut layout: Layout) -> Result<(Layout, usize), Error> {
     use crate::amdgpu_discovery as ip;
-    let mut layout = Layout::resolve_rdna2(gpu)?;
     let mut mask = 0u8;
     for block in &gpu.ip_blocks {
         // Discovery instance numbers are local to a HWID. Navi22 exposes
@@ -425,6 +437,20 @@ impl Sdma {
         doorbells: Doorbells,
     ) -> Result<Self, Error> {
         let (layout, count) = resolve_rdna2(gpu)?;
+        Self::with_layout(gpu, authority, pool, doorbells, layout, count)
+    }
+    /// Reserve Raphael's single SDMA 5.2.6 queue, whose doorbell range is
+    /// NBIO 7.2's GDC0 one.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        let (layout, count) = resolve_raphael(gpu)?;
         Self::with_layout(gpu, authority, pool, doorbells, layout, count)
     }
     fn with_layout(

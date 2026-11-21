@@ -185,7 +185,7 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
         layout: Layout {
             gc: GC,
             nbio: NBIO,
-            hdp: HDP,
+            hdp: Some(HDP),
             // The RX 6750 XT: 12272 MiB, below the 12 GiB FB_LOCATION_TOP.
             vram_size: 12272 << 20,
         },
@@ -535,7 +535,7 @@ fn rdna2_sdma_exact_layout_precedes_allocation_and_keeps_native_gate() -> TestRe
         for &did in profile.pci_ids {
             let gpu = rdna2_gpu(profile, did);
             let layout = Layout::resolve_rdna2(&gpu).unwrap();
-            if layout.gc != GC || layout.nbio != NBIO || layout.hdp != HDP {
+            if layout.gc != GC || layout.nbio != NBIO || layout.hdp != Some(HDP) {
                 return TestResult::Fail("RDNA2 SDMA used the wrong bank or standalone SDMA base");
             }
             let (pool, engine, _, _) = fixture();
@@ -618,4 +618,54 @@ fn rdna2_sdma_executes_translated_copy_and_fence_with_resolved_layout() -> TestR
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_sdma_executes_translated_copy_and_fence_with_resolved_layout
+);
+
+/// Raphael's SDMA proof owner: its single SDMA 5.2.6 in GC 10.3.6's bank
+/// zero, NBIO 7.2's segment 2 and no HDP read cache; Navi22's SDMA, a second
+/// SDMA0 instance and a discrete GPU are refused, and the discrete layout
+/// refuses Raphael.
+fn raphael_sdma_layout_takes_only_raphaels_blocks() -> TestResult {
+    use crate::amdgpu_discovery as d;
+    let gpu = crate::amdgpu_cp_navi22::tests::raphael_cp_gpu();
+    let Ok(layout) = Layout::resolve_raphael(&gpu) else {
+        return TestResult::Fail("Raphael SDMA layout refused");
+    };
+    if layout.gc != 0x1260 * 4 || layout.nbio != 0xd20 * 4 || layout.hdp.is_some() {
+        return TestResult::Fail("Raphael SDMA banks");
+    }
+    let mut navi22_sdma = crate::amdgpu_cp_navi22::tests::raphael_cp_gpu();
+    for b in navi22_sdma
+        .ip_blocks
+        .iter_mut()
+        .filter(|b| b.hw_id == d::HW_ID_SDMA0)
+    {
+        (b.major, b.minor, b.revision) = (5, 2, 2);
+    }
+    let mut two = crate::amdgpu_cp_navi22::tests::raphael_cp_gpu();
+    let sdma = *two
+        .ip_blocks
+        .iter()
+        .find(|b| b.hw_id == d::HW_ID_SDMA0)
+        .unwrap();
+    two.ip_blocks.push(sdma);
+    let mut navi22 = crate::amdgpu_cp_navi22::tests::raphael_cp_gpu();
+    navi22.chip =
+        crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::NAVI22).unwrap();
+    for (bad, why) in [
+        (navi22_sdma, "Raphael SDMA took SDMA 5.2.2"),
+        (two, "Raphael SDMA took a second SDMA0"),
+        (navi22, "Raphael SDMA took a discrete GPU"),
+    ] {
+        if Layout::resolve_raphael(&bad).is_ok() {
+            return TestResult::Fail(why);
+        }
+    }
+    if Layout::resolve_rdna2(&gpu).is_ok() {
+        return TestResult::Fail("the discrete SDMA layout took Raphael");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-raphael",
+    raphael_sdma_layout_takes_only_raphaels_blocks
 );

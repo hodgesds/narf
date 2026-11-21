@@ -291,6 +291,35 @@ pub unsafe fn read_revision(
         .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout)))
         .map_err(|_| Error::Revoked)?
 }
+/// Raphael's revision strap, from the register its NBIO 7.2 version uses.
+///
+/// # Safety
+/// As `read_revision`.
+pub unsafe fn read_revision_raphael(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<u8, Error> {
+    let layout = Layout::resolve_raphael(gpu).map_err(|_| Error::Unsupported)?;
+    authority
+        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout)))
+        .map_err(|_| Error::Revoked)?
+}
+/// Sample and derive Raphael's topology, skipping the shader arrays
+/// `gfx_v10_3_get_disabled_sa` reports.
+///
+/// # Safety
+/// As `read`, for Raphael.
+pub unsafe fn read_raphael(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<Topology, Error> {
+    let limits = Limits::from_gc(gpu.gc_info.as_ref().ok_or(Error::Invalid)?)?;
+    let layout = Layout::resolve_raphael(gpu).map_err(|_| Error::Unsupported)?;
+    let raw = authority
+        .invoke(Op(|| sample(&mut Mmio(gpu.regs), &layout, limits)))
+        .map_err(|_| Error::Revoked)??;
+    derive(limits, &raw)
+}
 /// Sample and derive this board's topology.
 ///
 /// # Safety

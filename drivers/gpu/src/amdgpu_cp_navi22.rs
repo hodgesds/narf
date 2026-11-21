@@ -118,6 +118,17 @@ impl Doorbells {
         // doorbell page; caller supplies its exclusive permanent mapping contract.
         unsafe { Self::map_navi22(device) }
     }
+    /// Map Raphael's BAR2 doorbell page: `amdgpu_doorbell_init` takes BAR2 on
+    /// APUs as on discrete parts.
+    ///
+    /// # Safety
+    /// As `map_rdna2`, for Raphael.
+    pub unsafe fn map_raphael(device: &narf_bus::BusDevice) -> Result<Self, Error> {
+        crate::amdgpu_rdna2::apu_for_pci_id(device.id.vendor, device.id.device)
+            .ok_or(Error::Unsupported)?;
+        // SAFETY: the same BAR2 doorbell page; forwarded mapping contract.
+        unsafe { Self::map_navi22(device) }
+    }
     pub fn bus_address(&self) -> u64 {
         self.bus
     }
@@ -1423,6 +1434,25 @@ impl Gfx {
     ) -> Result<Self, Error> {
         Self::with_layout(gpu, authority, pool, doorbells, Layout::resolve_rdna2(gpu)?)
     }
+    /// Reserve Raphael's privileged GFX ring: GC 10.3.6's golden table, the
+    /// APU CAM rule and HDP-less frames. No queue is started.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            Layout::resolve_raphael(gpu)?,
+        )
+    }
     fn with_layout(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
@@ -1574,6 +1604,23 @@ pub unsafe fn enable_doorbell_apertures_rdna2(
     };
     hw.access(|io, l| enable_doorbells(io, l, doorbells.bus))
 }
+/// Raphael's doorbell and self-ring apertures: NBIO 7.2 keeps them at NBIO
+/// 2.3's segment-2 offsets with the same fields (`nbio_v7_2_enable_doorbell_*`).
+///
+/// # Safety
+/// As `enable_doorbell_apertures_rdna2`, for Raphael.
+pub unsafe fn enable_doorbell_apertures_raphael(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let mut hw = Hw {
+        layout: Layout::resolve_raphael(gpu)?,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(|io, l| enable_doorbells(io, l, doorbells.bus))
+}
 
 /// `TIME_STAMP_INT_ENABLE` in CP_INT_CNTL_RING0 / CP_ME1_PIPE0_INT_CNTL.
 const TIME_STAMP_INT_ENABLE: u32 = 1 << 26; // linux: CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK
@@ -1648,6 +1695,23 @@ pub unsafe fn enable_fence_interrupts_rdna2(
     doorbells: Doorbells,
 ) -> Result<(), Error> {
     let (layout, count) = crate::amdgpu_sdma_navi22_queues::resolve_rdna2(gpu)?;
+    let mut hw = Hw {
+        layout,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(|io, l| enable_fence_irqs_for(io, l, count))
+}
+/// Arm Raphael's GFX/compute and single SDMA completion sources.
+///
+/// # Safety
+/// As `enable_fence_interrupts_rdna2`, for Raphael.
+pub unsafe fn enable_fence_interrupts_raphael(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let (layout, count) = crate::amdgpu_sdma_navi22_queues::resolve_raphael(gpu)?;
     let mut hw = Hw {
         layout,
         io: Mmio::new(gpu, doorbells),

@@ -414,6 +414,25 @@ impl Compute {
     ) -> Result<Self, Error> {
         Self::with_layout(gpu, authority, pool, doorbells, Layout::resolve_rdna2(gpu)?)
     }
+    /// Reserve Raphael's KIQ and kernel-compute rings: GC 10.3.6 shares the
+    /// GC10.3 MEC queue geometry (`gfx_v10_0_sw_init`'s Sienna Cichlid group).
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            Layout::resolve_raphael(gpu)?,
+        )
+    }
     fn with_layout(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
