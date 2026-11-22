@@ -39,12 +39,13 @@
 //! - **Lane 1 (#1010)** — identification is a single canonical
 //!   device table (registration and classification both derive
 //!   from it, pinned by a census fixture); probe is panic-free
-//!   and owns its scanout allocation; display programming is
-//!   gated to Gen12 — Meteor Lake / Panther Lake identify and
-//!   announce, but skip modeset (their display engines are
-//!   #1016's lane). Gen11 (Ice Lake / Elkhart Lake / Jasper
-//!   Lake) identifies and announces the same way — its BAR0
-//!   partitioning and GuC firmware family are modelled, its
+//!   and owns its scanout allocation; display programming on the
+//!   shared probe path is gated to Gen12 + Meteor Lake — Lunar
+//!   Lake / Panther Lake identify and announce, and drive
+//!   display only through their opted-in per-device routes
+//!   (display 20 / display 30). Gen11 (Ice Lake / Elkhart Lake /
+//!   Jasper Lake) identifies and announces the same way — its
+//!   BAR0 partitioning and GuC firmware family are modelled, its
 //!   presence test is the pre-GMD config-space re-read — but
 //!   display and GT execution stay gated until the Gen11 lanes
 //!   land (PTE format, execlists, display clocks, modeset).
@@ -78,8 +79,12 @@ impl Generation {
     /// shares that partitioning (`__gen11_fw_ranges`) and maps
     /// to its own `RegionGeneration::Gen11` table, whose contents
     /// are the verified Gen12 table carried over; Meteor Lake maps
-    /// to the Xe-LPG region table (#1016); Panther Lake's Xe3-LPD
-    /// map is not modelled yet.
+    /// to the Xe-LPG region table (#1016); Lunar Lake maps to the
+    /// Xe2-LPD table (display 20) and Panther Lake to the
+    /// Xe3-LPD table (display 30) — separate tables sharing the
+    /// Xe-LPG BAR0 layout (one Linux forcewake table,
+    /// `__mtl_fw_ranges`, covers all three), so the display IPs
+    /// are never conflated.
     pub const fn region_generation(self) -> Option<RegionGeneration> {
         match self {
             Generation::IceLake => Some(RegionGeneration::Gen11),
@@ -87,7 +92,8 @@ impl Generation {
                 Some(RegionGeneration::Gen12)
             }
             Generation::MeteorLake => Some(RegionGeneration::XeLpg),
-            Generation::LunarLake | Generation::PantherLake => None,
+            Generation::LunarLake => Some(RegionGeneration::Xe2Lpd),
+            Generation::PantherLake => Some(RegionGeneration::Xe3Lpd),
         }
     }
 
@@ -103,13 +109,22 @@ impl Generation {
     }
 
     /// Whether this lane programs the display engine for the
-    /// generation. Gen12 (TGL/ADL/RPL) and Meteor Lake (Xe-LPG,
-    /// #1016) have validated register sequences. Panther Lake
-    /// stays gated off: Xe3-LPD is a different display IP
-    /// generation from Xe-LPG (its own PHY arrangement, PLL
-    /// tables, and widened clock-select fields), so claiming it
-    /// from the MTL sequence would claim support that cannot be
-    /// driven — the exact failure this gate exists to prevent.
+    /// generation through the Gen12/Meteor Lake probe path.
+    /// Gen12 (TGL/ADL/RPL) and Meteor Lake (Xe-LPG, #1016) have
+    /// validated register sequences on that path. Lunar Lake
+    /// (Xe2-LPD, display 20) and Panther Lake (Xe3-LPD, display
+    /// 30) stay `false` here deliberately even though their
+    /// display is driven: each has its own opted-in per-device
+    /// route (`intel_gpu_xe2lpd::probe_route` /
+    /// `intel_gpu_xe3lpd::probe_route`, `narf.intel.lnl_display`
+    /// / `narf.intel.ptl_display`) with its own owned modeset,
+    /// and this predicate gates the Gen12/MTL probe branch,
+    /// which precedes those routes in `probe` — flipping it
+    /// would run the Gen12 takeover (which returns
+    /// `UnsupportedGeneration` for both) instead of the owned
+    /// route, and would arm PSR below, which both display IPs
+    /// refuse. A flip needs a probe restructure plus hardware
+    /// validation, not a one-line gate change.
     pub const fn display_supported(self) -> bool {
         matches!(
             self,
@@ -3326,13 +3341,19 @@ pub mod tests {
             return TestResult::Fail("Gen12 generations must allow display programming");
         }
         // #1016: Meteor Lake's Xe-LPG sequence is implemented, so
-        // the gate opens for MTL. Panther Lake (Xe3-LPD, a
-        // different display IP) must stay gated off.
+        // the gate opens for MTL. Lunar Lake (Xe2-LPD) and Panther
+        // Lake (Xe3-LPD) stay gated off on this predicate even
+        // though their display is driven: each has its own
+        // opted-in per-device route, and this predicate gates the
+        // Gen12/MTL probe branch that precedes those routes —
+        // flipping it would run the Gen12 takeover (which refuses
+        // both) instead of the owned route, and arm refused PSR.
         if !Generation::MeteorLake.display_supported() {
             return TestResult::Fail("MTL must allow display programming (#1016)");
         }
-        if Generation::PantherLake.display_supported() {
-            return TestResult::Fail("PTL must skip display programming (Xe3-LPD not modelled)");
+        if Generation::LunarLake.display_supported() || Generation::PantherLake.display_supported()
+        {
+            return TestResult::Fail("LNL/PTL must skip the Gen12/MTL probe path (owned routes)");
         }
         if Generation::RocketLake.display_supported()
             || Generation::RocketLake.external_display_supported()
@@ -3371,11 +3392,15 @@ pub mod tests {
         {
             return TestResult::Fail("backlight gate must be Gen12-only pending #1037");
         }
-        // Region generations follow the same split.
+        // Region generations follow the same split, with Lunar
+        // Lake on the Xe2-LPD table (display 20) and Panther Lake
+        // on the Xe3-LPD table (display 30) — separate tables
+        // sharing the Xe-LPG BAR0 layout.
         if Generation::MeteorLake.region_generation() != Some(RegionGeneration::XeLpg)
-            || Generation::PantherLake.region_generation().is_some()
+            || Generation::LunarLake.region_generation() != Some(RegionGeneration::Xe2Lpd)
+            || Generation::PantherLake.region_generation() != Some(RegionGeneration::Xe3Lpd)
         {
-            return TestResult::Fail("region generation map wrong for MTL/PTL");
+            return TestResult::Fail("region generation map wrong for MTL/LNL/PTL");
         }
         TestResult::Pass
     }

@@ -476,6 +476,20 @@ Gen12 orchestrator use.
 proofs. Recognition grants no programming authority: `DisplayIp::{Xelpdp,
 Xe2Lpd}` comes from `decode`/`read` of `GMD_ID_DISPLAY`, with 30.00 and 30.02
 admitted only through the explicitly opted-in `decode_all` route.
+`Generation::region_generation` maps Lunar Lake to the Xe2-LPD region table
+and Panther Lake to the Xe3-LPD table (`intel_gpu_regions`): separate tables
+sharing the Xe-LPG BAR0 layout (display block `[0x40000, 0x80000)`, PICA
+block `[0x16F000, 0x170000)`, no DPLL region), because Linux 7.4-rc2 assigns
+the single `__mtl_fw_ranges` table for every graphics version at or above
+12.70 and the display-14/20/30 chain shares one register map. The probe
+announce therefore reports a real region count for both instead of zero, and
+the media inventory sees the mapping (but still attaches no media engines —
+the media GT is unmodelled for all three). `Generation::display_supported`
+still refuses both deliberately: it gates the Gen12/MTL probe branch, which
+precedes the owned per-device routes, so flipping it would run the Gen12
+takeover (which refuses both) instead of the owned route and arm PSR, which
+both display IPs refuse; a flip needs a probe restructure plus hardware
+validation.
 `DisplayIp::WildcatLake` carries the exact resource, Pipe-A modeset and
 external profile:
 display-30 VRR/watermark/PM rules, the shared Xe3_LPD CDCLK table capped at
