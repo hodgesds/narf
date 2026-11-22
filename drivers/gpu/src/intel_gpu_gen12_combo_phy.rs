@@ -1945,7 +1945,7 @@ mod tests {
         io.regs
             .borrow_mut()
             .insert(crate::intel_gpu_pll::DSSM, 1 << 29);
-        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true).unwrap();
+        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true, false, false).unwrap();
         let trans = Transcoder::A;
         let tp = trans.base() + 0x540;
         // Prepare at HBR2, then bring the DPLL up at HBR2 the
