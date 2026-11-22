@@ -450,6 +450,81 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         )
     }
 
+    /// `set_posix_acl` → `btrfs_set_acl` for the ACL named by `ty`: `Some`
+    /// sets it from its uapi `value`, `None` (removexattr, or an empty or
+    /// zero-entry value) removes it.
+    ///
+    /// * The value decodes first (`do_set_acl`): a bad header or entry is
+    ///   `EINVAL`, an unknown version `EOPNOTSUPP`.
+    /// * A default ACL on a non-directory is `EACCES` (`set_posix_acl`,
+    ///   before any other check), its removal a no-op.
+    /// * The ACL must be valid (`posix_acl_valid`): `EINVAL`.
+    /// * An access ACL sets the mode (`posix_acl_update_mode`): the mode's
+    ///   permission bits become the ACL's, setgid goes unless the caller is
+    ///   in the group or holds `CAP_FSETID`, and an ACL the mode expresses
+    ///   exactly is removed rather than stored.
+    /// * The xattr and the inode item (mode, ctime) are written in one
+    ///   commit, as `btrfs_setxattr_trans` does; removing an absent ACL
+    ///   succeeds (`btrfs_setxattr` without `XATTR_REPLACE`).
+    async fn set_acl(
+        &self,
+        ty: narf_filesystem::AclType,
+        value: Option<&[u8]>,
+    ) -> Result<(), FsError> {
+        use narf_filesystem::{AclType, PosixAcl};
+        if self.tree_root.is_some() {
+            return Err(FsError::ReadOnly);
+        }
+        let acl = match value {
+            Some(v) if !v.is_empty() => PosixAcl::from_xattr(v)?,
+            _ => None,
+        };
+        let vol = self.volume()?;
+        // Linux `inode_lock` around `set_posix_acl`.
+        let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
+        let inode = self.inode();
+        if ty == AclType::Default && !inode.is_dir() {
+            return match acl {
+                Some(_) => Err(FsError::PermissionDenied),
+                None => Ok(()),
+            };
+        }
+        let (stored, perms) = match acl {
+            Some(acl) => {
+                acl.valid()?;
+                if ty == AclType::Access {
+                    let (mode, stored) = narf_filesystem::posix_acl_update_mode(
+                        inode.perms(),
+                        acl,
+                        narf_filesystem::caller_in_group_or_capable(inode.uid, inode.gid),
+                    )?;
+                    (stored, Some(mode))
+                } else {
+                    (Some(acl), None)
+                }
+            }
+            None => (None, None),
+        };
+        let blob = stored.map(|acl| acl.to_xattr());
+        autogrow!(
+            vol,
+            async {
+                let _update = self.begin_inode_update();
+                let updated = crate::write::set_acl_xattr_item(
+                    &vol,
+                    self.ino,
+                    ty.xattr_name(),
+                    blob.as_deref(),
+                    perms,
+                )
+                .await?;
+                self.cache_inode(updated);
+                Ok(())
+            }
+            .await
+        )
+    }
+
     fn volume(&self) -> Result<Arc<BtrfsVolume<B>>, FsError> {
         self.vol.upgrade().ok_or(FsError::NotFound)
     }
@@ -1336,8 +1411,15 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         })
     }
 
+    /// `btrfs_xattr_handlers`: the two POSIX ACL names go through
+    /// [`Self::set_acl`] (`btrfs_set_acl`, which ignores `XATTR_CREATE` /
+    /// `XATTR_REPLACE` as `do_set_acl` does); every other name is stored as
+    /// given.
     fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(ty) = narf_filesystem::AclType::from_xattr_name(name) {
+                return self.set_acl(ty, Some(value)).await;
+            }
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
@@ -1350,8 +1432,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         })
     }
 
+    /// `vfs_remove_acl` → `btrfs_set_acl(NULL)` for an ACL name (absent is
+    /// not an error); `ENODATA` for any other absent name.
     fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(ty) = narf_filesystem::AclType::from_xattr_name(name) {
+                return self.set_acl(ty, None).await;
+            }
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
@@ -1910,11 +1997,27 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     }
 
     /// The directory's own xattr store, which is the inode's — the same
-    /// items [`FileOps::set_xattr`] writes. `mkdir` stores a new
-    /// directory's inherited access and default ACLs here
+    /// items [`FileOps::set_xattr`] writes, ACL names included. `mkdir`
+    /// stores a new directory's inherited access and default ACLs here
     /// (`btrfs_init_inode_security`); answering `Unsupported` dropped them.
     fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
         <Self as FileOps>::set_xattr(self, name, value, flags)
+    }
+
+    /// Linux's btrfs serves a directory's xattrs with the same handlers as
+    /// a file's. This is what `acl_of_dir` reads for `may_create` /
+    /// `may_delete`: answering `Unsupported` made every btrfs directory's
+    /// access ACL invisible to them.
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        <Self as FileOps>::get_xattr(self, name)
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        <Self as FileOps>::list_xattr(self)
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        <Self as FileOps>::remove_xattr(self, name)
     }
 }
 
