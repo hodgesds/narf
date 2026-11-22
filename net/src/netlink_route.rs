@@ -465,23 +465,7 @@ fn remaining_lifetime(deadline_ns: u64, now_ns: u64) -> u32 {
 
 /// The 32-bit `inet6_ifaddr.flags` for an address.
 fn ipv6_ifa_flags(addr: &crate::ipv6::addrs::Ipv6IfAddr) -> u32 {
-    use crate::ipv6::addrs::AddrState;
-    let mut flags = match addr.state {
-        AddrState::Tentative => IFA_F_TENTATIVE,
-        AddrState::Deprecated => IFA_F_DEPRECATED,
-        AddrState::Preferred | AddrState::Invalid => 0,
-    };
-    if addr.temporary {
-        flags |= IFA_F_TEMPORARY;
-    }
-    // A statically configured address — one with no lifetime at all — is
-    // IFA_F_PERMANENT (`inet6_addr_add` → `ifa_flags |= IFA_F_PERMANENT`
-    // when `valid_lft == INFINITY_LIFE_TIME`); SLAAC addresses carry their
-    // router-advertised lifetimes instead.
-    if addr.valid_deadline_ns == u64::MAX && addr.preferred_deadline_ns == u64::MAX {
-        flags |= IFA_F_PERMANENT;
-    }
-    flags
+    crate::ipv6::addrs::ifa_flags(addr)
 }
 
 fn build_newaddr_v6(
@@ -490,19 +474,17 @@ fn build_newaddr_v6(
     seq: u32,
     pid: u32,
 ) -> Vec<u8> {
-    use crate::ipv6::addrs::AddrScope;
-
     let mut body = Vec::new();
     body.push(AF_INET6);
     body.push(addr.prefix_len);
     let flags = ipv6_ifa_flags(addr);
     // `put_ifaddrmsg`: the legacy u8 field carries the low byte.
     body.push(flags as u8);
-    body.push(match addr.scope {
-        AddrScope::Host => 254, // RT_SCOPE_HOST
-        AddrScope::Global | AddrScope::UniqueLocal => 0,
-        AddrScope::LinkLocal => 0x20,
-    });
+    // `put_ifaddrmsg(..., rt_scope(ifa->scope), ...)`: an RT_SCOPE_* value
+    // (RT_SCOPE_LINK for fe80::/10), not the IPV6_ADDR_* scope bits.
+    body.push(crate::ipv6::addrs::rt_scope(
+        crate::ipv6::addrs::ipv6_addr_scope(&addr.addr),
+    ));
     body.extend_from_slice(&ifindex.to_ne_bytes());
     push_rtattr(&mut body, IFA_ADDRESS, &addr.addr);
     // `inet6_fill_ifaddr` order: IFA_ADDRESS, IFA_CACHEINFO, IFA_FLAGS.
@@ -832,16 +814,7 @@ fn ipv4_addrs_of(iface: &str) -> Vec<([u8; 4], u8)> {
 }
 
 fn builtin_loopback_ipv6() -> crate::ipv6::addrs::Ipv6IfAddr {
-    crate::ipv6::addrs::Ipv6IfAddr {
-        iface: alloc::string::String::from("lo"),
-        addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-        prefix_len: 128,
-        state: crate::ipv6::addrs::AddrState::Preferred,
-        scope: crate::ipv6::addrs::AddrScope::Host,
-        preferred_deadline_ns: u64::MAX,
-        valid_deadline_ns: u64::MAX,
-        temporary: false,
-    }
+    crate::ipv6::addrs::loopback_ifaddr()
 }
 
 fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {

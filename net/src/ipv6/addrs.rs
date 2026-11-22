@@ -164,12 +164,100 @@ pub fn list_all_in(net_ns_id: u64) -> Vec<Ipv6IfAddr> {
 pub struct Ipv6IfAddrSnapshot {
     pub iface: String,
     pub addr: [u8; 16],
+    /// The device's ifindex (`ifp->idev->dev->ifindex`).
     pub ifindex: u32,
     pub prefix_len: u8,
-    /// Linux scope byte: 0=Global, 0x10=LinkLocal, 0x20=SiteLocal.
+    /// `ifp->scope`: Linux's [`ipv6_addr_scope`] bits (0 global, 0x10
+    /// loopback, 0x20 link-local, 0x40 site-local).
     pub scope: u8,
-    /// IFA_F_* bitmap: Tentative=0x40, Permanent=0x80, Deprecated=0x20.
+    /// `(u8)ifp->flags`, the low byte of [`ifa_flags`].
     pub flags: u8,
+}
+
+/// The loopback address `::1`.
+pub const LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+/// `IPV6_ADDR_LOOPBACK` / `IFA_HOST`.
+pub const IFA_HOST: u8 = 0x10;
+/// `IPV6_ADDR_LINKLOCAL` / `IFA_LINK`.
+pub const IFA_LINK: u8 = 0x20;
+/// `IPV6_ADDR_SITELOCAL` / `IFA_SITE`.
+pub const IFA_SITE: u8 = 0x40;
+
+/// Linux `ipv6_addr_scope()` (`include/net/ipv6.h`) for a unicast address:
+/// `__ipv6_addr_type(addr) & IPV6_ADDR_SCOPE_MASK`. `::1` is
+/// IPV6_ADDR_LOOPBACK, fe80::/10 IPV6_ADDR_LINKLOCAL, fec0::/10
+/// IPV6_ADDR_SITELOCAL; every other unicast address, a ULA (fc00::/7)
+/// included, is global scope and has no scope bit. This is the value
+/// `inet6_ifaddr.scope` holds and `/proc/net/if_inet6` prints.
+pub fn ipv6_addr_scope(addr: &[u8; 16]) -> u8 {
+    if *addr == LOOPBACK {
+        IFA_HOST
+    } else if addr[0] == 0xfe && addr[1] & 0xc0 == 0x80 {
+        IFA_LINK
+    } else if addr[0] == 0xfe && addr[1] & 0xc0 == 0xc0 {
+        IFA_SITE
+    } else {
+        0
+    }
+}
+
+/// Linux `rt_scope()` (`include/net/addrconf.h`): the `RT_SCOPE_*` value
+/// `inet6_fill_ifaddr` puts in `ifa_scope` for an [`ipv6_addr_scope`].
+pub fn rt_scope(ifa_scope: u8) -> u8 {
+    const RT_SCOPE_UNIVERSE: u8 = 0;
+    const RT_SCOPE_SITE: u8 = 200;
+    const RT_SCOPE_LINK: u8 = 253;
+    const RT_SCOPE_HOST: u8 = 254;
+    if ifa_scope & IFA_HOST != 0 {
+        RT_SCOPE_HOST
+    } else if ifa_scope & IFA_LINK != 0 {
+        RT_SCOPE_LINK
+    } else if ifa_scope & IFA_SITE != 0 {
+        RT_SCOPE_SITE
+    } else {
+        RT_SCOPE_UNIVERSE
+    }
+}
+
+/// The 32-bit `inet6_ifaddr.flags` (IFA_F_*) of an address: TENTATIVE (0x40)
+/// while DAD runs, DEPRECATED (0x20) past its preferred lifetime, TEMPORARY
+/// (0x01) for an RFC 8981 address, and PERMANENT (0x80) for an address with
+/// no lifetime at all (`inet6_addr_add` sets it when `valid_lft ==
+/// INFINITY_LIFE_TIME`). A SLAAC address carries its router-advertised
+/// lifetimes and is not permanent (`addrconf_prefix_rcv_add_addr`).
+pub fn ifa_flags(addr: &Ipv6IfAddr) -> u32 {
+    const IFA_F_TEMPORARY: u32 = 0x01;
+    const IFA_F_DEPRECATED: u32 = 0x20;
+    const IFA_F_TENTATIVE: u32 = 0x40;
+    const IFA_F_PERMANENT: u32 = 0x80;
+    let mut flags = match addr.state {
+        AddrState::Tentative => IFA_F_TENTATIVE,
+        AddrState::Deprecated => IFA_F_DEPRECATED,
+        AddrState::Preferred | AddrState::Invalid => 0,
+    };
+    if addr.temporary {
+        flags |= IFA_F_TEMPORARY;
+    }
+    if addr.valid_deadline_ns == u64::MAX && addr.preferred_deadline_ns == u64::MAX {
+        flags |= IFA_F_PERMANENT;
+    }
+    flags
+}
+
+/// The loopback device's `::1/128` (`init_loopback` → `add_addr(idev,
+/// &in6addr_loopback, 128, IFA_HOST)`, IFA_F_PERMANENT).
+pub fn loopback_ifaddr() -> Ipv6IfAddr {
+    Ipv6IfAddr {
+        iface: String::from("lo"),
+        addr: LOOPBACK,
+        prefix_len: 128,
+        state: AddrState::Preferred,
+        scope: AddrScope::Host,
+        preferred_deadline_ns: u64::MAX,
+        valid_deadline_ns: u64::MAX,
+        temporary: false,
+    }
 }
 
 /// Snapshot every IPv6 address bound to any interface.
@@ -177,51 +265,33 @@ pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
     snapshot_in(0)
 }
 
+/// `/proc/net/if_inet6` (`if6_seq_show`) for `net_ns_id`: `::1` on lo, then
+/// every configured address, with the device's ifindex, its
+/// [`ipv6_addr_scope`] and the low byte of its [`ifa_flags`].
 pub fn snapshot_in(net_ns_id: u64) -> Vec<Ipv6IfAddrSnapshot> {
-    let g = ADDRS.lock();
-    let mut out = Vec::with_capacity(g.len());
-    // Assign a per-iface index starting at 1. Real ifindex
-    // allocation needs to live in iface.rs once that surface
-    // exists; until then index by iface-name ordinal.
-    let mut idx_for_iface: alloc::collections::BTreeMap<&str, u32> =
-        alloc::collections::BTreeMap::new();
-    let mut next_idx: u32 = 1;
-    for e in g
-        .iter()
-        .filter(|entry| entry.net_ns_id == net_ns_id)
-        .map(|entry| &entry.addr)
-    {
-        let ifindex = *idx_for_iface.entry(e.iface.as_str()).or_insert_with(|| {
-            let i = next_idx;
-            next_idx += 1;
-            i
-        });
-        let scope = match e.scope {
-            AddrScope::Host => 0x10,
-            AddrScope::Global => 0x00,
-            AddrScope::LinkLocal => 0x20,
-            AddrScope::UniqueLocal => 0x40,
-        };
-        let mut flags: u8 = 0;
-        if e.state == AddrState::Tentative {
-            flags |= 0x40;
-        }
-        if e.state == AddrState::Deprecated {
-            flags |= 0x20;
-        }
-        if e.state == AddrState::Preferred {
-            flags |= 0x80;
-        }
-        out.push(Ipv6IfAddrSnapshot {
-            iface: e.iface.clone(),
-            addr: e.addr,
-            ifindex,
+    // Copy the table out before resolving ifindexes: the interface registry
+    // has its own lock, which is never taken under ADDRS.
+    let entries: Vec<Ipv6IfAddr> = core::iter::once(loopback_ifaddr())
+        .chain(
+            ADDRS
+                .lock()
+                .iter()
+                .filter(|entry| entry.net_ns_id == net_ns_id)
+                .map(|entry| entry.addr.clone()),
+        )
+        .collect();
+    entries
+        .into_iter()
+        .filter(|e| e.state != AddrState::Invalid)
+        .map(|e| Ipv6IfAddrSnapshot {
+            ifindex: crate::iface::ifindex_of(&e.iface).unwrap_or(0),
             prefix_len: e.prefix_len,
-            scope,
-            flags,
-        });
-    }
-    out
+            scope: ipv6_addr_scope(&e.addr),
+            flags: ifa_flags(&e) as u8,
+            addr: e.addr,
+            iface: e.iface,
+        })
+        .collect()
 }
 
 /// True iff `addr` is bound to *any* interface.

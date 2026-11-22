@@ -584,7 +584,15 @@ caches, the canonical local/main/default IPv4 policy rules, and each
 interface's direct-ring `noqueue` discipline respectively,
 echo the request sequence, identify the kernel sender with port ID zero, carry
 `NLM_F_MULTI`, and terminate with `NLMSG_DONE`. Unsupported request types return
-`NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests follow
+`NLMSG_ERROR(-EOPNOTSUPP)`. An IPv6 address's scope and flags have one
+source, `ipv6::addrs`: `ipv6_addr_scope(addr)` is Linux's IPV6_ADDR_* scope
+bits (0x10 `::1`, 0x20 fe80::/10, 0x40 fec0::/10, 0 otherwise, ULAs
+included), `rt_scope()` maps them to the `RT_SCOPE_*` value RTM_NEWADDR
+carries in `ifa_scope` (254 / 253 / 200 / 0, `inet6_fill_ifaddr`), and
+`ifa_flags()` is the IFA_F_* word (PERMANENT only for an address with no
+lifetime). `/proc/net/if_inet6` (`addrs::snapshot_in`) prints the device's
+ifindex, `ipv6_addr_scope` and `(u8)ifa_flags`, starting with `::1` on lo
+(`addrs::loopback_ifaddr`). Rtnetlink mutation requests follow
 `rtnetlink_rcv_msg`: a non-GET request needs
 `netlink_net_capable(skb, CAP_NET_ADMIN)` — CAP_NET_ADMIN over the socket's
 network namespace (its owning user namespace), held both by the socket's

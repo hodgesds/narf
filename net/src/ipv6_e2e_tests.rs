@@ -1219,9 +1219,11 @@ fn smoke_v6_proc_if_inet6_reflects_slaac() -> TestResult {
         return TestResult::Fail("/proc/net/if_inet6: scope byte != 0x00 (Global)");
     }
 
-    // Flags: 0x80 (Preferred / permanent) — as Linux sets IFA_F_PERMANENT.
-    if entry.flags & 0x80 == 0 {
-        return TestResult::Fail("/proc/net/if_inet6: Preferred flag not set");
+    // Flags: `(u8)ifp->flags`. A SLAAC address carries the RA's lifetimes,
+    // so it is not IFA_F_PERMANENT (0x80), and it is no longer
+    // IFA_F_TENTATIVE (0x40) once DAD passed.
+    if entry.flags & 0xc0 != 0 {
+        return TestResult::Fail("/proc/net/if_inet6: SLAAC addr flagged permanent/tentative");
     }
 
     // Verify the 32-hex-addr format would round-trip correctly.
