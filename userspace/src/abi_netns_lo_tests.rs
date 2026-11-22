@@ -276,10 +276,7 @@ fn sockaddr_in(addr: [u8; 4], port: u16) -> [u8; 16] {
 }
 
 /// RTM_GETLINK dump: `(ifindex, name, ifi_flags)` per link.
-fn dump_links(
-    fd: u64,
-    seq: u32,
-) -> Result<alloc::vec::Vec<(i32, String, u32)>, &'static str> {
+fn dump_links(fd: u64, seq: u32) -> Result<alloc::vec::Vec<(i32, String, u32)>, &'static str> {
     let replies = exchange(
         fd,
         &rtnl_request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, seq, &[0u8; 16]),
