@@ -161,6 +161,39 @@ pub fn neigh_output_in(net_ns_id: u64, nexthop: [u8; 4], len: usize, cont: arp_c
     }
 }
 
+/// [`neigh_output_in`] for a next hop in `iface_name`'s neighbour table (a
+/// route with `flowi4_oif`): only that device's entry answers, and the
+/// request goes out that device.
+pub fn neigh_output_on(
+    net_ns_id: u64,
+    iface_name: &str,
+    nexthop: [u8; 4],
+    len: usize,
+    cont: arp_cache::NeighCont,
+) {
+    if let Some(mac) = arp_cache::lookup(iface_name, nexthop) {
+        cont(Some(mac));
+        return;
+    }
+    if arp_cache::resolution_failed(iface_name, nexthop) {
+        cont(None);
+        return;
+    }
+    let resolving = matches!(
+        arp_cache::entry_state(iface_name, nexthop),
+        Some(arp_cache::ArpState::Incomplete)
+    );
+    arp_cache::queue_pending(net_ns_id, iface_name, nexthop, len, cont);
+    if !resolving {
+        arp_cache::mark_incomplete(iface_name, nexthop);
+        neigh_add_timer(net_ns_id, iface_name, nexthop);
+        let _ = send_arp_request_on(net_ns_id, iface_name, nexthop);
+    }
+    if let Some(mac) = arp_cache::lookup(iface_name, nexthop) {
+        neigh_resolved(net_ns_id, iface_name, nexthop, mac);
+    }
+}
+
 /// Start resolving `nexthop` unless that is already under way, without
 /// waiting: the cached MAC if it is known, else `None` after the request is
 /// out. For callers with their own queue of frames for the neighbour.
@@ -919,7 +952,18 @@ fn local_deliver_finish(net_ns_id: u64, iface_in: &str, body: &[u8], csum_verifi
             // is why SO_BINDTODEVICE could not be checked on receive.
             iface::ifindex_of(iface_in).unwrap_or(0),
         ),
-        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx_in(net_ns_id, ip.src_ip, ip.dst_ip, payload),
+        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx_meta(
+            net_ns_id,
+            ip.src_ip,
+            ip.dst_ip,
+            payload,
+            crate::icmp_sock::EchoRxMeta {
+                ttl,
+                tos,
+                ifindex: iface::ifindex_of(iface_in).unwrap_or(0),
+                dst: ip.dst_ip,
+            },
+        ),
         _ => {}
     }
 }

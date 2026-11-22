@@ -8973,13 +8973,29 @@ impl SocketFile {
                 // A connected ping socket numbers its datagrams from
                 // `inet_id` (`ip_select_ident_segs` keys on `inet_daddr`).
                 let connected = self.icmp_echo.lock().peer.is_some();
-                match narf_net::icmp_sock::icmp_echo_send(
+                // `ping_v4_sendmsg`: `ipc.oif = sk_bound_dev_if`, else
+                // IP_UNICAST_IF; the source is the bound address.
+                let opts = {
+                    let o = self.options.lock();
+                    let state = self.icmp_echo.lock();
+                    narf_net::icmp_sock::EchoSendOpts {
+                        src: (state.bound && state.local_addr != 0)
+                            .then(|| state.local_addr.to_be_bytes()),
+                        oif: if o.bindtodevice_index != 0 {
+                            o.bindtodevice_index
+                        } else {
+                            o.ext.ip_uc_index
+                        },
+                    }
+                };
+                match narf_net::icmp_sock::icmp_echo_send_with(
                     &echo,
                     target.to_be_bytes(),
                     sequence,
                     &buf[8..],
                     pmtudisc,
                     connected.then_some(&self.inet_id),
+                    opts,
                 ) {
                     Ok(()) => SocketOpResult::Ok(buf.len() as u64),
                     Err(narf_net::icmp_sock::IcmpError2::MsgTooLong)
@@ -9016,9 +9032,22 @@ impl SocketFile {
                 }
                 let peek = flags & MSG_PEEK != 0;
                 if let Some(echo) = self.icmp_echo_socket() {
-                    if let Some((sequence, peer_ip, payload, _rtt_ns)) =
-                        narf_net::icmp_sock::icmp_echo_recv_reply(&echo, peek)
+                    if let Some((sequence, peer_ip, payload, _rtt_ns, rx)) =
+                        narf_net::icmp_sock::icmp_echo_recv_reply_meta(&echo, peek)
                     {
+                        // `ping_recvmsg` → `ip_cmsg_recv`: IP_TTL / IP_TOS /
+                        // IP_PKTINFO from the reply's header and arrival.
+                        let dst = u32::from_be_bytes(rx.dst);
+                        self.stash_inet4_recv_ancillary(Some(Inet4RxInfo {
+                            dst,
+                            dport: 0,
+                            ifindex: rx.ifindex,
+                            spec_dst: dst,
+                            ttl: rx.ttl,
+                            tos: rx.tos,
+                            gso_size: 0,
+                            tstamp_ns: rx_tstamp_now_ns(),
+                        }));
                         let full_len = 8 + payload.len();
                         let mut reply = Vec::with_capacity(full_len);
                         reply.extend_from_slice(&[

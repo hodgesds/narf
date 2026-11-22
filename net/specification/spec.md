@@ -1012,6 +1012,14 @@ socket's pending-reply queue and readiness state under its own lock; it never
 holds a registry lock while waking a waiter. This permits unrelated echo flows
 to complete concurrently on distinct RX CPUs while retaining namespace-safe
 lookup when a flow moves between NIC queues.
+`icmp_sock::icmp_echo_send_with(.., EchoSendOpts { src, oif })` is
+`ping_v4_sendmsg`'s routing: with an `oif` (SO_BINDTODEVICE, else
+IP_UNICAST_IF) only that device's routes count and its neighbour table
+resolves the next hop (`tcp_stack::neigh_output_on`), and a bound address
+is the source. `on_icmp_rx_meta` records each Echo Reply's TTL, TOS,
+arrival device and destination (`EchoRxMeta`), which
+`icmp_echo_recv_reply_meta` returns for `ip_cmsg_recv` (IP_TTL, IP_TOS,
+IP_PKTINFO).
 `iface::is_local_addr_in(ns, ip)` reports whether `ip` is one of the
 namespace's addresses (or in 127.0.0.0/8); `iface::is_broadcast_in(ns, ip)`
 reports the limited broadcast or a local subnet's `prefix | ~mask` for
