@@ -4,12 +4,15 @@
 pub const INTEL_VENDOR: u16 = 0x8086;
 
 // Tiger Lake (Gen12 Xe-LP) — public `pci.ids` Intel rows.
-pub const TGL_9A40: u16 = 0x9A40;
+// GT split per Linux `INTEL_TGL_GT1_IDS` / `INTEL_TGL_GT2_IDS`
+// (`include/drm/intel/pciids.h`, Linux 7.4-rc2): GT1 = 9A60, 9A68,
+// 9A70; GT2 = 9A40, 9A49, 9A59, 9A78, 9AC0, 9AC9, 9AD9, 9AF8.
+pub const TGL_GT2_9A40: u16 = 0x9A40;
 pub const TGL_U_GT2_9A49: u16 = 0x9A49;
 pub const TGL_U_GT2_9A59: u16 = 0x9A59;
 pub const TGL_H_GT1_9A60: u16 = 0x9A60;
-pub const TGL_H_GT2_9A68: u16 = 0x9A68;
-pub const TGL_H_GT2_9A70: u16 = 0x9A70;
+pub const TGL_H_GT1_9A68: u16 = 0x9A68;
+pub const TGL_H_GT1_9A70: u16 = 0x9A70;
 pub const TGL_GT2_9A78: u16 = 0x9A78;
 pub const TGL_GT2_9AC0: u16 = 0x9AC0;
 pub const TGL_GT2_9AC9: u16 = 0x9AC9;
@@ -242,7 +245,7 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
     // Tiger Lake (Gen12 Xe-LP).
     DeviceEntry {
         name: "intel-gpu-tgl-9A40",
-        did: TGL_9A40,
+        did: TGL_GT2_9A40,
         generation: Generation::TigerLake,
         asic: "tigerlake",
     },
@@ -266,13 +269,13 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
     },
     DeviceEntry {
         name: "intel-gpu-tgl-9A68",
-        did: TGL_H_GT2_9A68,
+        did: TGL_H_GT1_9A68,
         generation: Generation::TigerLake,
         asic: "tigerlake",
     },
     DeviceEntry {
         name: "intel-gpu-tgl-9A70",
-        did: TGL_H_GT2_9A70,
+        did: TGL_H_GT1_9A70,
         generation: Generation::TigerLake,
         asic: "tigerlake",
     },
