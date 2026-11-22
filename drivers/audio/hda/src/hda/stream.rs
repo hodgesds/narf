@@ -298,6 +298,16 @@ impl PcmDevice for Card {
     fn codec_proc(&self) -> alloc::vec::Vec<(u8, alloc::string::String)> {
         self.0.codec_proc()
     }
+    fn components(&self) -> Option<alloc::string::String> {
+        self.0.components()
+    }
+    fn pcm_name(&self, capture: bool, device: u32) -> Option<alloc::string::String> {
+        // patch_hdmi: "HDMI %d" by PCM index.
+        match self.0.pcm_slot(device).filter(|_| !capture)? {
+            super::hdmi::PcmSlot::Hdmi(pcm) => Some(alloc::format!("HDMI {}", pcm)),
+            _ => None,
+        }
+    }
     fn get_control(
         &self,
         id: narf_drivers_sound::mixer::ControlId,

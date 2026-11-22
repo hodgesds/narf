@@ -1379,6 +1379,24 @@ impl IntelHda {
             .find(|codec| codec.afg_node_id.is_some())
             .map(|codec| codec_name(codec.vendor_id))
     }
+    /// Linux `card->components`: "HDA:<vendor>,<subsystem>,<revision>" for
+    /// each codec with a function group, space separated and without
+    /// repeats (`snd_hda_codec_device_new` -> `snd_component_add`).
+    pub(super) fn components(&self) -> Option<alloc::string::String> {
+        let mut words: Vec<alloc::string::String> = Vec::new();
+        for codec in self.codecs.iter().filter(|c| c.afg_node_id.is_some()) {
+            let word = alloc::format!(
+                "HDA:{:08x},{:08x},{:08x}",
+                codec.vendor_id,
+                codec.subsystem_id.unwrap_or(0),
+                codec.revision_id
+            );
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+        (!words.is_empty()).then(|| words.join(" "))
+    }
     /// `/proc/asound/cardN/codec#A` for every codec: Linux
     /// `print_codec_core_info`'s header, from the values probe read.
     pub(super) fn codec_proc(&self) -> Vec<(u8, alloc::string::String)> {

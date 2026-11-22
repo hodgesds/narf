@@ -153,7 +153,9 @@ HDMI PCM has its own "HDMI/DP,pcm=N Jack" (CARD interface,
 `hdmi_create_eld_ctl`), IEC958 set (MIXER interface at the PCM's index,
 `snd_hda_create_dig_out_ctls`) and "Playback Channel Map" (PCM interface at
 device N), placed in the ALSA id space through `PcmDevice::control_wire`.
-An HDMI-only codec has no Master controls.
+An HDMI-only codec has no Master controls. HDMI PCM i is named "HDMI i"
+(`PcmDevice::pcm_name`), and the card's components list
+"HDA:vendor,subsystem,revision" for each codec (`snd_component_add`).
 
 GPU codecs expose Linux's digital-output controls per HDMI PCM, over one
 shared IEC958 state (only one stream plays at a time):
