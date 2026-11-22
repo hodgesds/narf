@@ -280,7 +280,10 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
   `tx_acquire_ipv6_flow`). Only an egress without the contract uses the flow
   hash (`ipv4_flow_queue`, the one its driver posts by) or round-robin. A
   frame built in one queue's pool and posted on another moves a buffer between
-  pools at every completion, draining the first.
+  pools at every completion, draining the first. A pool frame that is not
+  transmitted — dropped by netfilter, copied onto an unresolved neighbour's
+  queue (`NetIfaceSnapshot::tx_return`), or rejected or refused by the driver —
+  returns its buffer to the pool it came from; it is never freed.
 - Resolved interface snapshots retain references to their TX recyclers. The
   routing/TCP fast path acquires from that snapshot, not by taking the global
   interface-registry lock once per packet.

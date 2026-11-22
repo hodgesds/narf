@@ -812,6 +812,14 @@ impl Igc {
     fn queues(&self) -> Arc<Vec<Arc<Queue>>> {
         self.queues.lock().clone()
     }
+    /// Return a frame no ring took to the pool of the queue it was built
+    /// for, exactly as that queue's completion would (`Queue::recycle`).
+    fn give_back(&self, frame: Frame) {
+        let queues = self.queues();
+        if let Some(queue) = queues.get(usize::from(frame.queue())) {
+            queue.recycle(frame.into_parts().0);
+        }
+    }
     /// Each queue's own TX pool, in queue order, for the stack's zero-copy
     /// acquire: a frame is built in the pool of the queue it is sent on.
     fn tx_pools(&self) -> Vec<Arc<narf_io::pool::DmaPool>> {
@@ -1185,14 +1193,14 @@ impl Igc {
     /// `queue` is the stack's choice for a backpressure-aware sender (Linux
     /// `skb->queue_mapping`); such a frame is refused with
     /// [`IgcError::TxBusy`] instead of using the stopped queue's reserve.
-    fn submit_frame_on(
+    /// The ring `frame` goes to and its launch-time / timestamp options:
+    /// everything `submit_frame_on` decides before the frame is posted.
+    fn tx_setup(
         &self,
-        frame: Frame,
-        meta: TxMeta,
+        frame: &Frame,
         queue: Option<usize>,
-    ) -> Result<(), IgcError> {
-        let _operation = self.operation()?;
-        let timing = frame.tx_timing();
+        timing: narf_net::TxTiming,
+    ) -> Result<(usize, crate::queue::TxOptions), IgcError> {
         let q = queue.unwrap_or_else(|| {
             timing.queue.map_or_else(
                 || self.settings.lock().rss.rx_queue(frame.payload()),
@@ -1222,6 +1230,33 @@ impl Igc {
             // its fast clock until it is delivered.
             self.kick_maintenance();
         }
+        Ok((q, options))
+    }
+    fn submit_frame_on(
+        &self,
+        frame: Frame,
+        meta: TxMeta,
+        queue: Option<usize>,
+    ) -> Result<(), IgcError> {
+        // An error before the frame reaches a ring gives its buffer back to
+        // the queue it was built for (`Frame::queue`), as `post_options`
+        // does for the errors it returns; dropping it shrank that queue's
+        // zero-copy pool.
+        let _operation = match self.operation() {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.give_back(frame);
+                return Err(error);
+            }
+        };
+        let timing = frame.tx_timing();
+        let (q, options) = match self.tx_setup(&frame, queue, timing) {
+            Ok(setup) => setup,
+            Err(error) => {
+                self.give_back(frame);
+                return Err(error);
+            }
+        };
         let result = self.queues()[q].post_options(&self.hw, q, frame, meta, self.mtu(), options);
         if result.is_err() && timing.timestamp_cookie.is_some() {
             self.ptp.lock().pending[q] = None;

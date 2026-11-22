@@ -512,7 +512,16 @@ fn emit_tcb_frame_on(
         let tcb = arc.lock();
         (tcb.net_ns_id, tcb.is_ipv6)
     };
+    // A frame that is not transmitted gives its pool buffer back to the pool
+    // it came from (`NetIfaceSnapshot::tx_return`); dropped, the buffer was
+    // freed and the queue's zero-copy pool shrank for good.
+    let discard = |frame: TxFrame| {
+        if let TxFrame::Dma(f) = frame {
+            dev.tx_return(f);
+        }
+    };
     if frame.len() < crate::pkt::ETH_HDR_LEN {
+        discard(frame);
         return Ok(());
     }
     let accepted = is_ipv6
@@ -522,6 +531,7 @@ fn emit_tcb_frame_on(
             &mut frame.bytes_mut()[crate::pkt::ETH_HDR_LEN..],
         ) == crate::netfilter::Verdict::Accept;
     if !accepted {
+        discard(frame);
         return Ok(());
     }
     // `ip_finish_output2` → `neigh_output`: an unresolved next hop queues the
@@ -533,8 +543,13 @@ fn emit_tcb_frame_on(
     if let Some(nexthop) = unresolved {
         let mut v = match frame {
             TxFrame::Owned(v) => v,
-            // A DMA pool buffer must not sit on a neighbour queue.
-            TxFrame::Dma(f) => f.payload().to_vec(),
+            // A DMA pool buffer must not sit on a neighbour queue: the queue
+            // holds a copy and the buffer goes back to its pool.
+            TxFrame::Dma(f) => {
+                let v = f.payload().to_vec();
+                dev.tx_return(f);
+                v
+            }
         };
         let tcb = arc.clone();
         let dev = dev.clone();

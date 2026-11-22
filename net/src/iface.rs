@@ -1804,6 +1804,19 @@ impl NetIfaceSnapshot {
         self.tx_acquire_from_pool(len, pools.acquire_pool_on(usize::from(queue))?)
     }
 
+    /// Give back a frame acquired from this interface's zero-copy pools that
+    /// will not be transmitted (a netfilter drop, a copy queued on an
+    /// unresolved neighbour): its buffer returns to the queue-local pool it
+    /// was drawn from, through the pools this snapshot holds — no registry
+    /// lock. Dropping the frame instead freed the buffer and shrank that
+    /// pool for good.
+    pub(crate) fn tx_return(&self, frame: crate::Frame) {
+        let (buf, _offset, _len, queue) = frame.into_parts_with_offset_and_queue();
+        if let Some(pool) = self.tx_pools.as_ref().and_then(|pools| pools.pool(queue)) {
+            pool.release(buf);
+        }
+    }
+
     /// Number of per-queue zero-copy pools; 0 when zero-copy TX is off.
     pub(crate) fn tx_pool_queues(&self) -> usize {
         self.tx_pools.as_ref().map_or(0, |pools| pools.pools.len())
