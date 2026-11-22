@@ -7841,7 +7841,7 @@ const PROFILES: [[[u8; 5]; 3]; 16] = [
     [[0, 1, 2, 5, 11], [0, 1, 3, 6, 12], [0, 1, 4, 7, 13]],
     [[0, 1, 2, 5, 11], [0, 1, 3, 6, 12], [0, 1, 4, 7, 13]],
 ];
-pub(super) fn select(cut: u8, rfe: u8, kind: usize) -> Option<&'static [(u16, u32)]> {
+pub fn select(cut: u8, rfe: u8, kind: usize) -> Option<&'static [(u16, u32)]> {
     let rfe = match rfe {
         2 => 0,
         3 => 1,

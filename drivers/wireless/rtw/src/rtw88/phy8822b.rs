@@ -1,29 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Factory-selected inactive RTL8822BE ("B22") PHY tables.
-//!
-//! `rtw8822b.c::rtw8822b_phy_set_param` through `rtw_phy_load_tables`, the
-//! crystal cap, the post-table `REG_RXPSEL` reset release and the
-//! `radio8822b::finish_set_param` tail (TRX mode, `rtw_phy_init`, RFE,
-//! power-tracking and beamforming init). Tables are the verbatim
-//! `rtw8822b_table.c` rows selected for PCIe by `phy.c::rtw_parse_tbl_phy_cond`.
-//! Channel programming and calibration are separate continuations; MAC TX/RX
-//! and TXPAUSE remain closed.
+//! Factory-selected inactive RTL8822BE ("B22") PHY tables. The table byte
+//! stream lives in `narf-drivers-wireless-rtl-chip` (`phy_b22`, generic over
+//! `RegIo`), shared by the builtin driver and the loadable `.ko`; this shim
+//! derives the factory [`Info`], bridges the native `Io`, and keeps the SIPI
+//! RF write the native radio path uses. Channel programming and calibration
+//! are separate continuations; MAC TX/RX and TXPAUSE remain closed.
+use super::chip_bridge::bridge;
 use super::{
     efuse8822b::Factory8822b,
     firmware_transport::{Error, Io},
     hardware::Features,
 };
-#[path = "phy/rtl8822b_tables.rs"]
-mod tables;
+use narf_drivers_wireless_rtl_chip::phy_b22::{self as chip_phy_b22, B22PhyParams};
 
-const REG_SYS_FUNC_EN: u16 = 0x0002;
-const BIT_FEN_BB: u8 = 0x03; // BIT_FEN_BB_GLB_RST | BIT_FEN_BB_RSTB
-const REG_RF_CTRL: u16 = 0x001f;
-const BIT_RF_ALL: u8 = 0x07; // BIT_RF_EN | BIT_RF_RSTB | BIT_RF_SDM_RSTB
-const REG_WLRF1: u16 = 0x00ec;
-const BIT_WLRF1_BBRF_EN: u32 = 7 << 24;
-const REG_RXPSEL: u16 = 0x0808;
-const BIT_RX_PSEL_RST: u32 = 3 << 28;
 /// `rtw8822b_hw_spec.rf_sipi_addr`.
 const RF_SIPI: [u16; 2] = [0x0c90, 0x0e90];
 
@@ -62,29 +51,16 @@ impl Info {
         })
     }
 }
-/// The exact preselected rows `apply_table` programs for `info`.
+/// The exact preselected rows the table programming applies for `info`.
 pub(super) fn rows(info: Info, kind: usize) -> Option<&'static [(u16, u32)]> {
-    tables::select(info.cut, info.rfe, kind)
+    chip_phy_b22::select(info.cut, info.rfe, kind)
 }
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn tables_for_test(cut: u8, rfe: u8, kind: usize) -> Option<&'static [(u16, u32)]> {
-    tables::select(cut, rfe, kind)
+    chip_phy_b22::select(cut, rfe, kind)
 }
-async fn update(io: &mut impl Io, reg: u16, clear: u32, set: u32) -> Result<(), Error> {
-    let value = io.read32(reg).await?;
-    if value == u32::MAX {
-        return Err(Error::Gone);
-    }
-    io.write32(reg, value & !clear | set).await
-}
-async fn update8(io: &mut impl Io, reg: u16, set: u8) -> Result<(), Error> {
-    let value = io.read8(reg).await?;
-    if value == 255 {
-        return Err(Error::Gone);
-    }
-    io.write8(reg, value | set).await
-}
-/// `phy.c::rtw_phy_write_rf_reg_sipi` with the full `RFREG_MASK`.
+/// `phy.c::rtw_phy_write_rf_reg_sipi` with the full `RFREG_MASK`; kept native
+/// for the `radio8822b` channel/calibration path's SIPI writes.
 pub(super) async fn rf_write(
     io: &mut impl Io,
     path: u8,
@@ -99,55 +75,18 @@ pub(super) async fn rf_write(
     io.delay_us(13).await;
     Ok(())
 }
-/// One table through its Linux `do_cfg`: 0 `rtw_phy_cfg_mac`, 1
-/// `rtw_phy_cfg_bb`, 2 `rtw_phy_cfg_agc`, 3/4 `rtw_phy_cfg_rf` path A/B.
-pub(super) async fn apply_table(io: &mut impl Io, info: Info, kind: usize) -> Result<(), Error> {
-    let rows = tables::select(info.cut, info.rfe, kind).ok_or(Error::Unsupported)?;
-    for &(address, data) in rows {
-        match kind {
-            0 => io.write8(address, data as u8).await?,
-            1 => match address {
-                0xfe => io.delay_us(50000).await,
-                0xfd => io.delay_us(5000).await,
-                0xfc => io.delay_us(1000).await,
-                0xfb => io.delay_us(50).await,
-                0xfa => io.delay_us(5).await,
-                0xf9 => io.delay_us(1).await,
-                _ => io.write32(address, data).await?,
-            },
-            2 => io.write32(address, data).await?,
-            3 | 4 => match address {
-                0xffe => io.delay_us(50000).await,
-                0xfe => io.delay_us(100).await,
-                _ => {
-                    rf_write(io, (kind - 3) as u8, address, data).await?;
-                    io.delay_us(1).await;
-                }
-            },
-            _ => return Err(Error::Unsupported),
-        }
-    }
-    Ok(())
-}
+/// `rtw8822b_phy_set_param` (`phy_b22::prepare`), returning the derived IGI /
+/// default OFDM swing captured into `info`.
 pub(super) async fn prepare(io: &mut impl Io, mut info: Info) -> Result<Info, Error> {
-    // power on BB/RF domain
-    update8(io, REG_SYS_FUNC_EN, BIT_FEN_BB).await?;
-    update8(io, REG_RF_CTRL, BIT_RF_ALL).await?;
-    update(io, REG_WLRF1, 0, BIT_WLRF1_BBRF_EN).await?;
-    // pre init before header files config
-    update(io, REG_RXPSEL, BIT_RX_PSEL_RST, 0).await?;
-    // rtw_phy_load_tables: mac, bb, agc (no rfk_init_tbl on 8822B), RF A, B.
-    for kind in 0..5 {
-        apply_table(io, info, kind).await?;
-    }
-    let crystal = u32::from(info.crystal);
-    update(io, 0x24, 0x7e00_0000, crystal << 25).await?;
-    update(io, 0x28, 0x7e, crystal << 1).await?;
-    // post init after header files config
-    update(io, REG_RXPSEL, 0, BIT_RX_PSEL_RST).await?;
-    // config_trx_mode(BB_PATH_AB, BB_PATH_AB, false), rtw_phy_init, RFE,
-    // power-tracking and beamforming init (`radio8822b`).
-    let init = super::radio8822b::finish_set_param(io, info).await?;
+    let params = B22PhyParams {
+        cut: info.cut,
+        rfe: info.rfe,
+        crystal: info.crystal,
+    };
+    let mut b = bridge(io);
+    let init = chip_phy_b22::prepare(&mut b, params)
+        .await
+        .map_err(|e| b.err(e))?;
     info.igi = init.igi;
     info.default_ofdm_index = init.default_ofdm_index;
     Ok(info)
