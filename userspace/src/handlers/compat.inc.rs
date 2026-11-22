@@ -10746,16 +10746,34 @@ fn futex_timeout_deadline(
     timeout_ptr: u64,
     absolute: bool,
     realtime: bool,
+    time32: bool,
 ) -> Result<Option<u64>, i64> {
     if timeout_ptr == 0 {
         return Ok(None);
     }
-    let mut bytes = [0u8; 16];
-    // SAFETY: the syscall supplied a `const struct timespec *`; uaccess
-    // validates the range and SMAP-brackets the fixed-size read.
-    unsafe { copy_from_user(&mut bytes, timeout_ptr) }.map_err(|_| EFAULT)?;
-    let seconds = i64::from_ne_bytes(bytes[0..8].try_into().unwrap());
-    let nanoseconds = i64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+    // `get_timespec64` reads a `struct __kernel_timespec`; the i386
+    // `futex` (240, `sys_futex_time32`) has `get_old_timespec32` read an
+    // 8-byte `struct old_timespec32` instead. Both then pass the same
+    // `timespec64_valid` check.
+    let (seconds, nanoseconds) = if time32 {
+        let mut bytes = [0u8; 8];
+        // SAFETY: the syscall supplied a `const struct old_timespec32 *`;
+        // uaccess validates the range and SMAP-brackets the read.
+        unsafe { copy_from_user(&mut bytes, timeout_ptr) }.map_err(|_| EFAULT)?;
+        (
+            i64::from(i32::from_ne_bytes(bytes[0..4].try_into().unwrap())),
+            i64::from(i32::from_ne_bytes(bytes[4..8].try_into().unwrap())),
+        )
+    } else {
+        let mut bytes = [0u8; 16];
+        // SAFETY: the syscall supplied a `const struct timespec *`; uaccess
+        // validates the range and SMAP-brackets the fixed-size read.
+        unsafe { copy_from_user(&mut bytes, timeout_ptr) }.map_err(|_| EFAULT)?;
+        (
+            i64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            i64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+        )
+    };
     if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
         return Err(EINVAL);
     }

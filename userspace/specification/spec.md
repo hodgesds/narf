@@ -2804,6 +2804,27 @@ mmap, munmap, mprotect, uname, personality, getpid, getppid, gettid,
 getuid32, getgid32, geteuid32, getegid32, set_tid_address, sched_yield,
 kill, tkill, tgkill, clock_gettime (time32), clock_gettime64.
 
+Phase-2 coverage (dynamic glibc): stat64, lstat64, fstat64 and fstatat64
+write the packed 96-byte `struct stat64` (`put_linux_stat` under
+`in_ia32_syscall()`, `cp_stat64`); statx, getdents64, access, faccessat,
+faccessat2, readlink, readlinkat, unlink, unlinkat, mkdir, mkdirat, rmdir,
+rename, madvise, mremap, getrandom, getresuid32, getresgid32 pass through;
+lseek sign-extends its `compat_off_t`; `_llseek` and `pread64`/`pwrite64`
+assemble their 64-bit offsets from two registers; `fcntl64`/`fcntl` select
+`Ia32Flock::Compat` (F_GETLK/F_SETLK/F_SETLKW, 16-byte `compat_flock`,
+EOVERFLOW past `COMPAT_OFF_T_MAX`) or `Compat64` (F_*LK64 renamed to
+F_*LK, F_OFD_*, packed 24-byte `compat_flock64`; EINVAL from plain
+`fcntl`); futex reads an `old_timespec32` timeout (`Ia32Abi::time32`) and
+futex_time64 the native one; set_robust_list accepts only the 12-byte
+`compat_robust_list_head`, and the exit walk reads a list registered that
+way with 32-bit pointers and offset; rt_sigaction reads and writes the
+20-byte `compat_sigaction`; rt_sigprocmask passes through (8-byte sets);
+prlimit64 passes through; sched_getaffinity accepts a length in 4-byte
+`compat_ulong_t` units and copies `min(len, cpumask_size())`; the 16-bit
+getuid/getgid/geteuid/getegid go through `high2lowuid` (65534 for an id
+past 16 bits); arch_prctl serves the CPUID and XSTATE-permission options
+and answers EINVAL for the rest; rseq is -ENOSYS.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

@@ -26,6 +26,15 @@ pub(crate) fn read_user(ptr: u64, buf: &mut [u8]) -> Result<(), i64> {
     unsafe { crate::handlers::copy_from_user(buf, ptr) }.map_err(|_| crate::errno::EFAULT)
 }
 
+/// Copy `bytes` to the i386 user address `ptr`; errors as [`read_user`].
+pub(crate) fn write_user(ptr: u64, bytes: &[u8]) -> Result<(), i64> {
+    if ptr == 0 || !user_range_ok(ptr, bytes.len()) {
+        return Err(crate::errno::EFAULT);
+    }
+    // SAFETY: as `read_user`.
+    unsafe { crate::handlers::copy_to_user(ptr, bytes) }.map_err(|_| crate::errno::EFAULT)
+}
+
 /// The little-endian `u32` at byte `index * 4` of `raw`.
 #[inline]
 pub(crate) fn word(raw: &[u8], index: usize) -> u32 {

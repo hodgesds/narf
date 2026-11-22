@@ -1,5 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
+use crate::syscall::Ia32Flock;
 
 /// `F_UNLCK` from `include/uapi/asm-generic/fcntl.h` (`#define F_UNLCK 2`),
 /// as returned by the `!CONFIG_FILE_LOCKING` `fcntl_getlease` stub to mean
@@ -8,19 +9,104 @@ use super::*;
 /// point of the F_GETLEASE arm below is that those two must not coincide.
 const F_UNLCK_LEASE: u64 = 2;
 
-fn write_flock_to_user(ptr: u64, flock: &UFlock) -> Result<(), ()> {
-    let mut bytes = alloc::vec![0u8; flock_size()];
-    // SAFETY: `UFlock` is repr(C) and `bytes` has the architecture's
-    // exported flock size.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            flock as *const _ as *const u8,
-            bytes.as_mut_ptr(),
-            flock_size(),
-        );
-    }
+/// `COMPAT_OFF_T_MAX`: the largest offset a 32-bit `struct compat_flock`
+/// can carry.
+const COMPAT_OFF_T_MAX: i64 = 0x7FFF_FFFF;
+
+/// Store `flock` at the user `ptr` in `layout`: the native `struct flock`,
+/// or for an i386 call `put_compat_flock` (16 bytes, after
+/// `fixup_compat_flock`: EOVERFLOW for an `l_start` past `COMPAT_OFF_T_MAX`,
+/// `l_len` clamped to it) or `put_compat_flock64` (packed, 24 bytes).
+/// The error is the errno to return.
+fn write_flock_to_user(layout: Ia32Flock, ptr: u64, flock: &UFlock) -> Result<(), i64> {
+    let bytes: alloc::vec::Vec<u8> = match layout {
+        Ia32Flock::Native => {
+            let mut bytes = alloc::vec![0u8; flock_size()];
+            // SAFETY: `UFlock` is repr(C) and `bytes` has the architecture's
+            // exported flock size.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    flock as *const _ as *const u8,
+                    bytes.as_mut_ptr(),
+                    flock_size(),
+                );
+            }
+            bytes
+        }
+        Ia32Flock::Compat => {
+            if flock.l_start > COMPAT_OFF_T_MAX {
+                return Err(EOVERFLOW);
+            }
+            let len = flock.l_len.min(COMPAT_OFF_T_MAX);
+            let mut bytes = alloc::vec::Vec::with_capacity(16);
+            bytes.extend_from_slice(&flock.l_type.to_le_bytes());
+            bytes.extend_from_slice(&flock.l_whence.to_le_bytes());
+            bytes.extend_from_slice(&(flock.l_start as i32).to_le_bytes());
+            bytes.extend_from_slice(&(len as i32).to_le_bytes());
+            bytes.extend_from_slice(&flock.l_pid.to_le_bytes());
+            bytes
+        }
+        Ia32Flock::Compat64 => {
+            let mut bytes = alloc::vec::Vec::with_capacity(24);
+            bytes.extend_from_slice(&flock.l_type.to_le_bytes());
+            bytes.extend_from_slice(&flock.l_whence.to_le_bytes());
+            bytes.extend_from_slice(&flock.l_start.to_le_bytes());
+            bytes.extend_from_slice(&flock.l_len.to_le_bytes());
+            bytes.extend_from_slice(&flock.l_pid.to_le_bytes());
+            bytes
+        }
+    };
     // SAFETY: the syscall supplied `ptr`; copy_to_user validates the range.
-    unsafe { copy_to_user(ptr, &bytes) }.map_err(|_| ())
+    unsafe { copy_to_user(ptr, &bytes) }.map_err(|_| EFAULT)
+}
+
+/// Load the `struct flock` at the user `ptr` in `layout` (`get_compat_flock`
+/// / `get_compat_flock64` for an i386 call). `Err` is a faulting copy.
+fn read_flock_from_user(layout: Ia32Flock, ptr: u64) -> Result<UFlock, ()> {
+    let size = match layout {
+        Ia32Flock::Native => flock_size(),
+        Ia32Flock::Compat => 16,
+        Ia32Flock::Compat64 => 24,
+    };
+    let mut bytes = alloc::vec![0u8; size];
+    // SAFETY: `ptr` is the user `struct flock` pointer; copy_from_user
+    // range-validates it and SMAP-brackets the read into the sized `bytes`.
+    unsafe { copy_from_user(&mut bytes, ptr) }.map_err(|_| ())?;
+    let i16_at = |o: usize| i16::from_le_bytes([bytes[o], bytes[o + 1]]);
+    let i32_at = |o: usize| i32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let i64_at = |o: usize| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap_or([0; 8]));
+    Ok(match layout {
+        Ia32Flock::Native => {
+            let mut tmp = UFlock::default();
+            // SAFETY: `bytes` holds exactly `flock_size()` validated bytes
+            // and `tmp` is a repr(C) UFlock of that size; the copy
+            // reinterprets the wire layout into the struct.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    &mut tmp as *mut _ as *mut u8,
+                    flock_size(),
+                );
+            }
+            tmp
+        }
+        Ia32Flock::Compat => UFlock {
+            l_type: i16_at(0),
+            l_whence: i16_at(2),
+            l_start: i64::from(i32_at(4)),
+            l_len: i64::from(i32_at(8)),
+            l_pid: i32_at(12),
+            ..UFlock::default()
+        },
+        Ia32Flock::Compat64 => UFlock {
+            l_type: i16_at(0),
+            l_whence: i16_at(2),
+            l_start: i64_at(4),
+            l_len: i64_at(12),
+            l_pid: i32_at(20),
+            ..UFlock::default()
+        },
+    })
 }
 
 #[repr(C)]
@@ -325,6 +411,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let cmd = args.arg1 as u32 as u64;
     let arg = args.arg2;
     let task = current_task_id();
+    // The record-lock commands' `struct flock` layout: native, or the i386
+    // `compat_flock`/`compat_flock64` the i386 table selected
+    // (`do_compat_fcntl64`).
+    let flock_layout = ctx.ia32_abi().flock;
 
     if cmd == F_GETFD {
         ctx.set_return(match fd::lookup(task, fd) {
@@ -824,27 +914,14 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 .flatten()
                 .unwrap_or(0)
                 & crate::fd::O_ACCMODE;
-            // Pull the `struct flock` from user memory.
-            let mut bytes = alloc::vec![0u8; flock_size()];
-            // SAFETY: `arg` is the user `struct flock` pointer; copy_from_user
-            // range-validates it and SMAP-brackets the read into the sized `bytes`.
-            // SAFETY: Valid memory or trusted environment
-            if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
-                ctx.set_return(errno_ret(EFAULT));
-                return;
-            }
-            // SAFETY: `bytes` holds exactly `flock_size()` validated bytes and
-            // `tmp` is a default-initialized UFlock with at least that many bytes;
-            // the copy reinterprets the wire layout into the repr(C) struct.
-            // SAFETY: Valid memory or trusted environment
-            let uf: UFlock = unsafe {
-                let mut tmp = UFlock::default();
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    &mut tmp as *mut _ as *mut u8,
-                    flock_size(),
-                );
-                tmp
+            // Pull the `struct flock` from user memory, in the layout of the
+            // entry point that was called (`get_compat_flock{,64}` for i386).
+            let uf: UFlock = match read_flock_from_user(flock_layout, arg) {
+                Ok(uf) => uf,
+                Err(()) => {
+                    ctx.set_return(errno_ret(EFAULT));
+                    return;
+                }
             };
             // `flock_to_posix_lock`: l_start is relative to l_whence, and
             // all three origins are legal. This used to accept only
@@ -992,10 +1069,9 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                             task,
                             task_to_pid_raw(lock.pid as u64).unwrap_or(lock.pid as u64),
                         ) as i32;
-                        if write_flock_to_user(arg, &out).is_err() {
-                            ctx.set_return(errno_ret(EFAULT));
-                        } else {
-                            ctx.set_return(SyscallReturn::ok(0));
+                        match write_flock_to_user(flock_layout, arg, &out) {
+                            Err(errno) => ctx.set_return(errno_ret(errno)),
+                            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
                         }
                         return;
                     }
@@ -1027,8 +1103,8 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         };
                     }
                 }
-                if write_flock_to_user(arg, &out).is_err() {
-                    ctx.set_return(errno_ret(EFAULT));
+                if let Err(errno) = write_flock_to_user(flock_layout, arg, &out) {
+                    ctx.set_return(errno_ret(errno));
                     return;
                 }
                 ctx.set_return(SyscallReturn::ok(0));

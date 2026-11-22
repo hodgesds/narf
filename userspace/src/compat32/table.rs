@@ -21,6 +21,7 @@ use narf_memory::AddressSpace;
 use super::conv;
 use super::ctx::Ia32ArgsCtx;
 use crate::errno::{to_ret, EBADF, EINVAL, ENOMEM, ENOTTY};
+use crate::syscall::Ia32Flock;
 use crate::syscall::{Ia32Abi, Syscall, SyscallArgs, SyscallReturn, TrapContext};
 
 /// i386 system-call numbers (`syscall_32.tbl`).
@@ -30,40 +31,81 @@ pub mod nr {
     pub const WRITE: u32 = 4;
     pub const OPEN: u32 = 5;
     pub const CLOSE: u32 = 6;
+    pub const UNLINK: u32 = 10;
     pub const CHDIR: u32 = 12;
+    pub const LSEEK: u32 = 19;
     pub const GETPID: u32 = 20;
+    pub const GETUID: u32 = 24;
+    pub const ACCESS: u32 = 33;
     pub const KILL: u32 = 37;
+    pub const RENAME: u32 = 38;
+    pub const MKDIR: u32 = 39;
+    pub const RMDIR: u32 = 40;
     pub const DUP: u32 = 41;
     pub const PIPE: u32 = 42;
     pub const BRK: u32 = 45;
+    pub const GETGID: u32 = 47;
+    pub const GETEUID: u32 = 49;
+    pub const GETEGID: u32 = 50;
     pub const IOCTL: u32 = 54;
+    pub const FCNTL: u32 = 55;
     pub const UMASK: u32 = 60;
     pub const DUP2: u32 = 63;
     pub const GETPPID: u32 = 64;
+    pub const READLINK: u32 = 85;
     pub const MMAP: u32 = 90;
     pub const MUNMAP: u32 = 91;
     pub const UNAME: u32 = 122;
     pub const MPROTECT: u32 = 125;
     pub const PERSONALITY: u32 = 136;
+    pub const LLSEEK: u32 = 140;
     pub const READV: u32 = 145;
     pub const WRITEV: u32 = 146;
     pub const SCHED_YIELD: u32 = 158;
+    pub const MREMAP: u32 = 163;
+    pub const RT_SIGACTION: u32 = 174;
+    pub const RT_SIGPROCMASK: u32 = 175;
+    pub const PREAD64: u32 = 180;
+    pub const PWRITE64: u32 = 181;
     pub const GETCWD: u32 = 183;
     pub const MMAP2: u32 = 192;
+    pub const STAT64: u32 = 195;
+    pub const LSTAT64: u32 = 196;
+    pub const FSTAT64: u32 = 197;
     pub const GETUID32: u32 = 199;
     pub const GETGID32: u32 = 200;
     pub const GETEUID32: u32 = 201;
     pub const GETEGID32: u32 = 202;
+    pub const GETRESUID32: u32 = 209;
+    pub const GETRESGID32: u32 = 211;
+    pub const MADVISE: u32 = 219;
+    pub const GETDENTS64: u32 = 220;
+    pub const FCNTL64: u32 = 221;
     pub const GETTID: u32 = 224;
     pub const TKILL: u32 = 238;
+    pub const FUTEX: u32 = 240;
+    pub const SCHED_GETAFFINITY: u32 = 242;
     pub const EXIT_GROUP: u32 = 252;
     pub const SET_TID_ADDRESS: u32 = 258;
     pub const CLOCK_GETTIME: u32 = 265;
     pub const TGKILL: u32 = 270;
     pub const OPENAT: u32 = 295;
+    pub const MKDIRAT: u32 = 296;
+    pub const FSTATAT64: u32 = 300;
+    pub const UNLINKAT: u32 = 301;
+    pub const READLINKAT: u32 = 305;
+    pub const FACCESSAT: u32 = 307;
+    pub const SET_ROBUST_LIST: u32 = 311;
     pub const DUP3: u32 = 330;
     pub const PIPE2: u32 = 331;
+    pub const PRLIMIT64: u32 = 340;
+    pub const GETRANDOM: u32 = 355;
+    pub const STATX: u32 = 383;
+    pub const ARCH_PRCTL: u32 = 384;
+    pub const RSEQ: u32 = 386;
     pub const CLOCK_GETTIME64: u32 = 403;
+    pub const FUTEX_TIME64: u32 = 422;
+    pub const FACCESSAT2: u32 = 439;
 }
 
 /// i386 `exit`.
@@ -111,12 +153,43 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
         CHDIR => forward(ctx, Syscall::Chdir),
         GETCWD => forward(ctx, Syscall::Getcwd),
         UMASK => forward(ctx, Syscall::Umask),
+        // `compat_sys_lseek` takes a `compat_off_t`; `sys_llseek` and the
+        // `sys_ia32_p{read,write}64` wrappers carry a 64-bit offset in two
+        // registers.
+        LSEEK => forward_sx(ctx, Syscall::Lseek, 0b10),
+        LLSEEK => sys_llseek(ctx),
+        PREAD64 => sys_ia32_pread_pwrite(ctx, Syscall::Pread64),
+        PWRITE64 => sys_ia32_pread_pwrite(ctx, Syscall::Pwrite64),
+        GETDENTS64 => forward(ctx, Syscall::Getdents64),
+        // `compat_sys_fcntl64` / `compat_sys_fcntl` (`do_compat_fcntl64`).
+        FCNTL64 => compat_sys_fcntl64(ctx, true),
+        FCNTL => compat_sys_fcntl64(ctx, false),
+        // fs/stat.c via `cp_stat64` (`put_linux_stat` under
+        // `in_ia32_syscall()`): `compat_sys_ia32_{stat,lstat,fstat,fstatat}64`.
+        STAT64 => forward(ctx, Syscall::Stat),
+        LSTAT64 => forward(ctx, Syscall::Lstat),
+        FSTAT64 => forward(ctx, Syscall::Fstat),
+        FSTATAT64 => forward_sx(ctx, Syscall::Newfstatat, 0b1),
+        STATX => forward_sx(ctx, Syscall::Statx, 0b1),
+        ACCESS => forward(ctx, Syscall::Access),
+        FACCESSAT => forward_sx(ctx, Syscall::Faccessat, 0b1),
+        FACCESSAT2 => forward_sx(ctx, Syscall::Faccessat2, 0b1),
+        READLINK => forward(ctx, Syscall::Readlink),
+        READLINKAT => forward_sx(ctx, Syscall::Readlinkat, 0b1001),
+        UNLINK => forward(ctx, Syscall::Unlink),
+        UNLINKAT => forward_sx(ctx, Syscall::Unlinkat, 0b101),
+        MKDIR => forward(ctx, Syscall::Mkdir),
+        MKDIRAT => forward_sx(ctx, Syscall::Mkdirat, 0b1),
+        RMDIR => forward(ctx, Syscall::Rmdir),
+        RENAME => forward(ctx, Syscall::Rename),
         // mm/
         BRK => forward(ctx, Syscall::Brk),
         MMAP2 => sys_mmap_pgoff(ctx),
         MMAP => compat_sys_ia32_mmap(ctx),
         MUNMAP => forward(ctx, Syscall::Munmap),
         MPROTECT => forward(ctx, Syscall::MProtect),
+        MADVISE => forward(ctx, Syscall::Madvise),
+        MREMAP => forward(ctx, Syscall::Mremap),
         // kernel/sys.c, kernel/exec_domain.c
         UNAME => forward(ctx, Syscall::Uname),
         PERSONALITY => forward(ctx, Syscall::Personality),
@@ -127,12 +200,47 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
         GETGID32 => forward(ctx, Syscall::GetGid),
         GETEUID32 => forward(ctx, Syscall::Geteuid),
         GETEGID32 => forward(ctx, Syscall::Getegid),
+        GETRESUID32 => forward(ctx, Syscall::Getresuid),
+        GETRESGID32 => forward(ctx, Syscall::Getresgid),
+        // The 16-bit uid calls (`sys_getuid16`, ...): `high2lowuid`.
+        GETUID => uid16(ctx, Syscall::GetUid),
+        GETGID => uid16(ctx, Syscall::GetGid),
+        GETEUID => uid16(ctx, Syscall::Geteuid),
+        GETEGID => uid16(ctx, Syscall::Getegid),
+        // kernel/sys.c, kernel/resource: `struct rlimit64` is two u64s in
+        // both ABIs.
+        PRLIMIT64 => forward_sx(ctx, Syscall::Prlimit64, 0b1),
+        GETRANDOM => forward(ctx, Syscall::GetRandom),
+        // `compat_sys_sched_getaffinity`: the length unit is
+        // `compat_ulong_t` (the native handler checks `in_ia32_syscall`).
+        SCHED_GETAFFINITY => forward_sx(ctx, Syscall::SchedGetaffinity, 0b1),
+        ARCH_PRCTL => sys_arch_prctl(ctx),
+        // NARF has no IA-32 rseq ABI (a `struct rseq` registered from compat
+        // mode needs the 32-bit `rseq_cs` handling); -ENOSYS is what a kernel
+        // without CONFIG_RSEQ answers, and glibc then runs without rseq.
+        RSEQ => {
+            ctx.set_return(SyscallReturn::not_implemented());
+            None
+        }
         // kernel/fork.c, kernel/sched/syscalls.c, kernel/signal.c
         SET_TID_ADDRESS => forward(ctx, Syscall::SetTidAddress),
         SCHED_YIELD => forward(ctx, Syscall::Yield),
         KILL => forward_sx(ctx, Syscall::Kill, 0b11),
         TKILL => forward_sx(ctx, Syscall::Tkill, 0b11),
         TGKILL => forward_sx(ctx, Syscall::Tgkill, 0b111),
+        // kernel/signal.c: `compat_sys_rt_sigaction` reads a
+        // `struct compat_sigaction` (the native handler checks
+        // `in_ia32_syscall`); a `compat_sigset_t` is the same 8 bytes as
+        // `sigset_t` on little-endian x86, so `rt_sigprocmask` is unchanged.
+        RT_SIGACTION => forward(ctx, Syscall::RtSigaction),
+        RT_SIGPROCMASK => forward_sx(ctx, Syscall::Sigprocmask, 0b1),
+        // kernel/futex/syscalls.c: `sys_futex_time32` reads an
+        // `old_timespec32` timeout, `sys_futex` (futex_time64) a
+        // `__kernel_timespec`; `compat_sys_set_robust_list` takes the 12-byte
+        // compat head (the native handler checks `in_ia32_syscall`).
+        FUTEX => forward_abi(ctx, Syscall::Futex, 0, TIME32),
+        FUTEX_TIME64 => forward(ctx, Syscall::Futex),
+        SET_ROBUST_LIST => forward(ctx, Syscall::SetRobustList),
         // kernel/time/posix-timers.c: `clock_gettime32` writes an
         // `old_timespec32`, `clock_gettime` (the time64 entry) a
         // `__kernel_timespec`.
@@ -318,6 +426,148 @@ fn compat_mmap(
         ctx.set_return(ret);
     }
     Some(Syscall::Mmap)
+}
+
+// ── files ────────────────────────────────────────────────────────────
+
+/// `_llseek(fd, offset_high, offset_low, loff_t *result, whence)` (i386 140,
+/// `sys_llseek`):
+///
+/// ```text
+/// offset = vfs_llseek(fd_file(f), ((loff_t) offset_high << 32) | offset_low,
+///                     whence);
+/// retval = (int)offset;
+/// if (offset >= 0) {
+///         retval = -EFAULT;
+///         if (!copy_to_user(result, &offset, sizeof(offset)))
+///                 retval = 0;
+/// }
+/// ```
+fn sys_llseek(ctx: &mut dyn TrapContext) -> Option<Syscall> {
+    let a = *ctx.args();
+    let args = SyscallArgs {
+        arg0: a.arg0,
+        arg1: (a.arg1 << 32) | (a.arg2 & 0xFFFF_FFFF),
+        arg2: a.arg4,
+        ..SyscallArgs::default()
+    };
+    let Some(ret) = call_native(ctx, Syscall::Lseek, args, Ia32Abi::default()) else {
+        return Some(Syscall::Lseek);
+    };
+    if !succeeded(&ret) {
+        ctx.set_return(ret);
+        return Some(Syscall::Lseek);
+    }
+    match conv::write_user(a.arg3, &ret.value.to_le_bytes()) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(errno) => ctx.set_return(to_ret(errno)),
+    }
+    Some(Syscall::Lseek)
+}
+
+/// `sys_ia32_pread64(fd, buf, count, poslo, poshi)` and its pwrite twin
+/// (`arch/x86/kernel/sys_ia32.c`): the position is
+/// `((u64)poshi << 32) | poslo`.
+fn sys_ia32_pread_pwrite(ctx: &mut dyn TrapContext, variant: Syscall) -> Option<Syscall> {
+    let a = *ctx.args();
+    let args = SyscallArgs {
+        arg0: a.arg0,
+        arg1: a.arg1,
+        arg2: a.arg2,
+        arg3: (a.arg4 << 32) | (a.arg3 & 0xFFFF_FFFF),
+        ..SyscallArgs::default()
+    };
+    forward_args(ctx, variant, args, Ia32Abi::default())
+}
+
+/// `compat_sys_fcntl64(fd, cmd, arg)` / `compat_sys_fcntl` (`fs/fcntl.c`,
+/// `do_compat_fcntl64`). The record-lock commands carry an i386 structure:
+/// F_GETLK/F_SETLK/F_SETLKW a `struct compat_flock` (32-bit offsets),
+/// F_GETLK64/F_SETLK64/F_SETLKW64 (12-14, renamed to 5-7 by
+/// `convert_fcntl_cmd`) and the F_OFD_* commands a packed
+/// `struct compat_flock64`. The plain `fcntl` (55) refuses the 64-bit lock
+/// commands with EINVAL. `F_SETOWN`'s argument is an `int` (a negative one
+/// names a process group); every other argument passes as the register.
+fn compat_sys_fcntl64(ctx: &mut dyn TrapContext, fcntl64: bool) -> Option<Syscall> {
+    const F_GETLK: u32 = 5;
+    const F_SETLK: u32 = 6;
+    const F_SETLKW: u32 = 7;
+    const F_SETOWN: u32 = 8;
+    const F_GETLK64: u32 = 12;
+    const F_SETLK64: u32 = 13;
+    const F_SETLKW64: u32 = 14;
+    const F_OFD_GETLK: u32 = 36;
+    const F_OFD_SETLK: u32 = 37;
+    const F_OFD_SETLKW: u32 = 38;
+    let cmd = ctx.args().arg1 as u32;
+    let (native_cmd, flock) = match cmd {
+        F_GETLK | F_SETLK | F_SETLKW => (cmd, Ia32Flock::Compat),
+        F_GETLK64 | F_SETLK64 | F_SETLKW64 => (cmd - (F_GETLK64 - F_GETLK), Ia32Flock::Compat64),
+        F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => (cmd, Ia32Flock::Compat64),
+        _ => (cmd, Ia32Flock::Native),
+    };
+    if !fcntl64 && flock == Ia32Flock::Compat64 {
+        ctx.set_return(to_ret(EINVAL));
+        return Some(Syscall::Fcntl);
+    }
+    let mut args = *ctx.args();
+    args.arg1 = u64::from(native_cmd);
+    if native_cmd == F_SETOWN {
+        args.arg2 = conv::sext(args.arg2);
+    }
+    let abi = Ia32Abi {
+        time32: false,
+        flock,
+    };
+    forward_args(ctx, Syscall::Fcntl, args, abi)
+}
+
+// ── identity and arch ────────────────────────────────────────────────
+
+/// `DEFAULT_OVERFLOWUID` / `DEFAULT_OVERFLOWGID`: what a 16-bit uid call
+/// reports for an id that does not fit 16 bits.
+const OVERFLOW_ID: u64 = 65534;
+
+/// `sys_getuid16` and its siblings: the 32-bit answer through
+/// `high2lowuid` / `high2lowgid`.
+fn uid16(ctx: &mut dyn TrapContext, variant: Syscall) -> Option<Syscall> {
+    let args = *ctx.args();
+    let Some(ret) = call_native(ctx, variant, args, Ia32Abi::default()) else {
+        return Some(variant);
+    };
+    if succeeded(&ret) && ret.value > 0xFFFF {
+        ctx.set_return(SyscallReturn::ok(OVERFLOW_ID));
+    } else {
+        ctx.set_return(ret);
+    }
+    Some(variant)
+}
+
+/// `arch_prctl(option, arg2)` from an i386 call (`arch/x86/kernel/
+/// process.c`): the CPUID-faulting and XSTATE-permission options are
+/// served as for a 64-bit task; everything else — the FS/GS base
+/// operations above all — is `-EINVAL` when `in_ia32_syscall()`.
+fn sys_arch_prctl(ctx: &mut dyn TrapContext) -> Option<Syscall> {
+    const ARCH_GET_CPUID: u64 = 0x1011;
+    const ARCH_SET_CPUID: u64 = 0x1012;
+    const ARCH_GET_XCOMP_SUPP: u64 = 0x1021;
+    const ARCH_GET_XCOMP_PERM: u64 = 0x1022;
+    const ARCH_REQ_XCOMP_PERM: u64 = 0x1023;
+    const ARCH_GET_XCOMP_GUEST_PERM: u64 = 0x1024;
+    const ARCH_REQ_XCOMP_GUEST_PERM: u64 = 0x1025;
+    match ctx.args().arg0 {
+        ARCH_GET_CPUID
+        | ARCH_SET_CPUID
+        | ARCH_GET_XCOMP_SUPP
+        | ARCH_GET_XCOMP_PERM
+        | ARCH_REQ_XCOMP_PERM
+        | ARCH_GET_XCOMP_GUEST_PERM
+        | ARCH_REQ_XCOMP_GUEST_PERM => forward(ctx, Syscall::ArchPrctl),
+        _ => {
+            ctx.set_return(to_ret(EINVAL));
+            Some(Syscall::ArchPrctl)
+        }
+    }
 }
 
 // ── ioctl ────────────────────────────────────────────────────────────

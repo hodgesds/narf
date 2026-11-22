@@ -90,15 +90,8 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
             return;
         }
         let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
-        // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size.
-        let bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                &out as *const linux_compat::Stat as *const u8,
-                core::mem::size_of::<linux_compat::Stat>(),
-            )
-        };
-        // SAFETY: `out_ptr` null-checked above; copy_to_user range-validates it.
-        if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+        // `cp_new_stat`, or `cp_stat64` for an i386 call: see `put_linux_stat`.
+        if put_linux_stat(&*ctx, out_ptr as u64, &out).is_err() {
             ctx.set_return(errno_ret(EFAULT));
             return;
         }

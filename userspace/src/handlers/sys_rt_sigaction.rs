@@ -34,6 +34,12 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
     //      action and install the new one under one lock,
     //   4. if `oact`: copy the prior action out (-EFAULT) — written LAST and
     //      only when no earlier step errored.
+    // An i386 call (174, `compat_sys_rt_sigaction`) carries a
+    // `struct compat_sigaction { compat_uptr_t sa_handler; compat_ulong_t
+    // sa_flags; compat_uptr_t sa_restorer; compat_sigset_t sa_mask; }` — 20
+    // bytes — and `sizeof(compat_sigset_t)` is 8, as `sigset_t` is here.
+    let compat = ctx.in_ia32_syscall();
+    let act_size = if compat { 20 } else { 32 };
     if signum == 0 || signum >= NSIG || sigsetsize != 8 {
         ctx.set_return(errno_ret(EINVAL));
         return;
@@ -51,14 +57,22 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
     let new_action: Option<Option<SigAction>> = if act_ptr != 0 {
         let mut buf = [0u8; 32]; // sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8)
         // SAFETY: `act_ptr` is the user sigaction pointer (non-zero, checked);
-        // copy_from_user range-validates it and SMAP-brackets the 32-byte read.
-        if unsafe { copy_from_user(&mut buf, act_ptr) }.is_err() {
+        // copy_from_user range-validates it and SMAP-brackets the read of
+        // the ABI's struct size.
+        if unsafe { copy_from_user(&mut buf[..act_size], act_ptr) }.is_err() {
             ctx.set_return(errno_ret(EFAULT));
             return;
         }
-        let handler = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
-        let flags = u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as u32;
-        let restorer = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
+        let (handler, flags, restorer) = if compat {
+            let word = |i: usize| u64::from(u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap()));
+            (word(0), word(4) as u32, word(8))
+        } else {
+            (
+                u64::from_ne_bytes(buf[0..8].try_into().unwrap()),
+                u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as u32,
+                u64::from_ne_bytes(buf[16..24].try_into().unwrap()),
+            )
+        };
         Some(if handler == 0 {
             None
         } else {
@@ -113,13 +127,22 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
     if oact_ptr != 0 {
         let mut out = [0u8; 32];
         if let Some(a) = prior {
-            out[0..8].copy_from_slice(&a.handler.to_ne_bytes());
-            out[8..16].copy_from_slice(&u64::from(a.flags).to_ne_bytes());
-            out[16..24].copy_from_slice(&a.restorer.to_ne_bytes());
+            if compat {
+                // `ptr_to_compat`: an i386 task's handler and restorer are
+                // 32-bit addresses.
+                out[0..4].copy_from_slice(&(a.handler as u32).to_ne_bytes());
+                out[4..8].copy_from_slice(&a.flags.to_ne_bytes());
+                out[8..12].copy_from_slice(&(a.restorer as u32).to_ne_bytes());
+            } else {
+                out[0..8].copy_from_slice(&a.handler.to_ne_bytes());
+                out[8..16].copy_from_slice(&u64::from(a.flags).to_ne_bytes());
+                out[16..24].copy_from_slice(&a.restorer.to_ne_bytes());
+            }
         }
         // SAFETY: `oact_ptr` is the user oldact pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
-        if unsafe { copy_to_user(oact_ptr, &out) }.is_err() {
+        // copy_to_user range-validates it and SMAP-brackets the write of the
+        // ABI's struct size.
+        if unsafe { copy_to_user(oact_ptr, &out[..act_size]) }.is_err() {
             ctx.set_return(errno_ret(EFAULT));
             return;
         }

@@ -4140,6 +4140,67 @@ fn linux_stat_from_fs(
     }
 }
 
+/// `cp_new_stat` / `cp_stat64`: copy `st` to the user `out_ptr` in the
+/// layout of the ABI the call arrived through. A native call gets the
+/// arch's `struct stat`; an i386 one (`in_ia32_syscall()`) gets the packed
+/// 96-byte `struct stat64` (`arch/x86/include/asm/ia32.h`), which is what
+/// every stat entry the i386 table serves writes (`stat64`, `lstat64`,
+/// `fstat64`, `fstatat64` — the old `newstat` family is not served). The
+/// values are the same `kstat`; only the encoding differs.
+fn put_linux_stat(
+    ctx: &dyn TrapContext,
+    out_ptr: u64,
+    st: &linux_compat::Stat,
+) -> Result<(), u64> {
+    #[cfg(target_arch = "x86_64")]
+    if ctx.in_ia32_syscall() {
+        let bytes = stat64_bytes(st);
+        // SAFETY: copy_to_user range-validates and fault-brackets the
+        // caller's statbuf.
+        return unsafe { copy_to_user(out_ptr, &bytes) };
+    }
+    let _ = ctx;
+    // SAFETY: `st` is a live repr(C) Stat; the slice spans exactly its size.
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            st as *const linux_compat::Stat as *const u8,
+            core::mem::size_of::<linux_compat::Stat>(),
+        )
+    };
+    // SAFETY: copy_to_user range-validates and fault-brackets the caller's
+    // statbuf.
+    unsafe { copy_to_user(out_ptr, bytes) }
+}
+
+/// `cp_stat64` (`arch/x86/kernel/sys_ia32.c`): the i386 `struct stat64`
+/// image of `st`. `__st_ino` carries the inode truncated to 32 bits and
+/// `st_ino` the whole of it (`STAT64_HAS_BROKEN_ST_INO`); the times are
+/// 32-bit; `st_dev`/`st_rdev` are the `huge_encode_dev` words native
+/// `struct stat` also carries.
+#[cfg(target_arch = "x86_64")]
+fn stat64_bytes(st: &linux_compat::Stat) -> [u8; 96] {
+    let mut b = [0u8; 96];
+    let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, &st.st_dev.to_le_bytes());
+    put(12, &(st.st_ino as u32).to_le_bytes());
+    put(16, &st.st_mode.to_le_bytes());
+    put(20, &(st.st_nlink as u32).to_le_bytes());
+    put(24, &st.st_uid.to_le_bytes());
+    put(28, &st.st_gid.to_le_bytes());
+    put(32, &st.st_rdev.to_le_bytes());
+    put(44, &st.st_size.to_le_bytes());
+    put(52, &(st.st_blksize as u32).to_le_bytes());
+    put(56, &st.st_blocks.to_le_bytes());
+    put(64, &(st.st_atim.tv_sec as u32).to_le_bytes());
+    put(68, &(st.st_atim.tv_nsec as u32).to_le_bytes());
+    put(72, &(st.st_mtim.tv_sec as u32).to_le_bytes());
+    put(76, &(st.st_mtim.tv_nsec as u32).to_le_bytes());
+    put(80, &(st.st_ctim.tv_sec as u32).to_le_bytes());
+    put(84, &(st.st_ctim.tv_nsec as u32).to_le_bytes());
+    put(88, &st.st_ino.to_le_bytes());
+    b
+}
+
 // Linux-ABI sys_stat: writes the arch's uapi `struct stat`. Same path-
 // resolution as the NARF-shape sys_stat, only the wire layout
 // changes.
@@ -4222,15 +4283,8 @@ fn stat_linux_ops(
         return;
     }
     let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
-    // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size.
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            &out as *const linux_compat::Stat as *const u8,
-            core::mem::size_of::<linux_compat::Stat>(),
-        )
-    };
-    // SAFETY: `out_ptr` null-checked above; copy_to_user range-validates it.
-    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+    // `cp_new_stat`, or `cp_stat64` for an i386 call: see `put_linux_stat`.
+    if put_linux_stat(&*ctx, out_ptr as u64, &out).is_err() {
         ctx.set_return(errno_ret(EFAULT));
         return;
     }
@@ -4376,19 +4430,8 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // libudev validate a device's type from a path stat before opening it, so
     // a 0 rdev makes them reject evdev nodes (weston input never opens).
     let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
-    // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
-    // and borrows it for the duration of the copy below.
-    // SAFETY: Valid memory or trusted environment
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            &out as *const linux_compat::Stat as *const u8,
-            core::mem::size_of::<linux_compat::Stat>(),
-        )
-    };
-    // SAFETY: `out_ptr` is the user Stat pointer (null-checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+    // `cp_new_stat`, or `cp_stat64` for an i386 call: see `put_linux_stat`.
+    if put_linux_stat(&*ctx, out_ptr as u64, &out).is_err() {
         ctx.set_return(errno_ret(EFAULT)); // -EFAULT
         return;
     }
@@ -6222,13 +6265,19 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
     /// Linux ROBUST_LIST_LIMIT — bounds a malicious/corrupt circular list.
     const ROBUST_LIST_LIMIT: usize = 2048;
 
-    let head = {
+    let (head, head_len) = {
         let g = ROBUST_LIST_TABLE.lock();
         match g.as_ref().and_then(|m| m.get(&tid)) {
-            Some(&(head, _len)) if head != 0 => head,
+            Some(&(head, len)) if head != 0 => (head, len),
             _ => return,
         }
     };
+    // A head registered through the i386 `set_robust_list` is a
+    // `struct compat_robust_list_head`: 32-bit pointers and a 32-bit
+    // `futex_offset` (`compat_exit_robust_list`, `compat_uptr_t` /
+    // `compat_long_t`). Its recorded length says so.
+    let compat = head_len == handler_sys_set_robust_list::COMPAT_ROBUST_LIST_HEAD_SIZE;
+    let word = if compat { 4u64 } else { 8u64 };
 
     // The robust-list head and every node/lock pointer are fully
     // user-controlled and may be bogus (robust_smoke deliberately registers
@@ -6251,25 +6300,31 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
             .unwrap_or(false)
     };
 
-    let read_u64 = |uaddr: u64| -> Option<u64> {
+    // One list word: a pointer, or the signed `futex_offset`, as stored.
+    let read_word = |uaddr: u64| -> Option<u64> {
         if !user_mapped(uaddr) {
             return None;
         }
         let mut b = [0u8; 8];
         // SAFETY: mapping-probed above; copy_from_user range-validates +
         // SMAP-brackets the read.
-        unsafe { copy_from_user(&mut b, uaddr).ok()? };
+        unsafe { copy_from_user(&mut b[..word as usize], uaddr).ok()? };
         Some(u64::from_le_bytes(b))
     };
 
-    let futex_offset = match read_u64(head.wrapping_add(8)) {
+    let futex_offset = match read_word(head.wrapping_add(word)) {
+        Some(v) if compat => i64::from(v as u32 as i32),
         Some(v) => v as i64,
         None => return,
     };
-    let pending = read_u64(head.wrapping_add(16)).unwrap_or(0);
+    let pending = read_word(head.wrapping_add(2 * word)).unwrap_or(0);
 
     let handle_lock = |entry: u64| {
-        let uaddr = entry.wrapping_add(futex_offset as u64);
+        let mut uaddr = entry.wrapping_add(futex_offset as u64);
+        if compat {
+            // `compat_ptr(entry) + futex_offset`, a 32-bit user address.
+            uaddr &= 0xFFFF_FFFF;
+        }
         if uaddr == 0 || uaddr & 3 != 0 {
             return;
         }
@@ -6302,7 +6357,7 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
 
     // Walk the list. Termination: `next == head` (the head's own list
     // node is the sentinel); 0/unreadable ends the walk defensively.
-    let mut entry = match read_u64(head) {
+    let mut entry = match read_word(head) {
         Some(e) => e,
         None => return,
     };
@@ -6313,7 +6368,7 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
         if entry != pending {
             handle_lock(entry);
         }
-        entry = match read_u64(entry) {
+        entry = match read_word(entry) {
             Some(e) => e,
             None => break,
         };
