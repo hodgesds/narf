@@ -3872,6 +3872,318 @@ kernel_test_in!(
     smoke_abi_pathx_getdents_errno_order_and_small_buffer
 );
 
+// ── getdents: `.` and `..` come first, in every directory ─────────────
+//
+// `dir_emit_dots` puts `.` at position 0 and `..` at position 1 — for
+// dcache_readdir (tmpfs, ramfs, devtmpfs), btrfs_real_readdir,
+// proc_readdir_de, proc_pid_readdir, kernfs_fop_readdir and the FAT root —
+// with `d_ino` the directory's own inode and its parent's (`parent_ino`).
+// ext2 and FAT subdirectories hold the two entries on disk and report them
+// in the same place. A filesystem's root dentry is its own parent, so at the
+// root of a mount `..` names the directory itself. The positions are what
+// `d_off` reports, so lseek(0) rewinds onto `.` and seekdir to a d_off
+// resumes after the entry that reported it.
+
+/// One `struct linux_dirent64`: `(d_ino, d_off, d_type, d_name)`.
+type Dirent64 = (u64, u64, u8, alloc::string::String);
+
+fn parse_dirents64(buf: &[u8]) -> Option<alloc::vec::Vec<Dirent64>> {
+    let mut out = alloc::vec::Vec::new();
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let rec = buf.get(pos..)?;
+        let reclen = u16::from_ne_bytes(rec.get(16..18)?.try_into().ok()?) as usize;
+        if reclen < 20 || reclen > rec.len() {
+            return None;
+        }
+        let ino = u64::from_ne_bytes(rec.get(..8)?.try_into().ok()?);
+        let off = u64::from_ne_bytes(rec.get(8..16)?.try_into().ok()?);
+        let name = &rec[19..reclen];
+        let name = &name[..name.iter().position(|b| *b == 0)?];
+        let name = alloc::string::String::from(core::str::from_utf8(name).ok()?);
+        out.push((ino, off, rec[18], name));
+        pos += reclen;
+    }
+    Some(out)
+}
+
+/// Every record of directory `fd` from its current position on, read with
+/// `count`-byte getdents64 calls.
+fn read_dirents64(fd: u64, count: usize) -> Result<alloc::vec::Vec<Dirent64>, &'static str> {
+    let mut all = alloc::vec::Vec::new();
+    let mut buf = alloc::vec![0u8; count];
+    for _ in 0..4096 {
+        match call(
+            Syscall::Getdents64.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, count as u64),
+        ) {
+            Some(0) => return Ok(all),
+            Some(n) if n > 0 => {
+                all.extend(parse_dirents64(&buf[..n as usize]).ok_or("malformed linux_dirent64")?)
+            }
+            _ => return Err("getdents64 failed"),
+        }
+    }
+    Err("getdents64 never reached the end of the directory")
+}
+
+/// `st_ino` of a raw `struct stat` (offset 8 on x86_64 and arm64).
+fn stat_ino_of(sb: &[u8]) -> u64 {
+    u64::from_ne_bytes([sb[8], sb[9], sb[10], sb[11], sb[12], sb[13], sb[14], sb[15]])
+}
+
+/// `.` then `..` at positions 0 and 1 with their inode numbers, and neither
+/// name anywhere else in the listing.
+fn check_dots(listing: &[Dirent64], own: u64, parent: u64) -> Result<(), &'static str> {
+    const DT_DIR: u8 = 4;
+    let (Some(dot), Some(dotdot)) = (listing.first(), listing.get(1)) else {
+        return Err("getdents64 listed fewer than two entries");
+    };
+    if dot.3 != "." || dot.1 != 1 || dot.2 != DT_DIR {
+        return Err("the first entry is not `.` (d_off 1, DT_DIR)");
+    }
+    if dotdot.3 != ".." || dotdot.1 != 2 || dotdot.2 != DT_DIR {
+        return Err("the second entry is not `..` (d_off 2, DT_DIR)");
+    }
+    if dot.0 != own {
+        return Err("`.` does not carry the directory's own inode number");
+    }
+    if dotdot.0 != parent {
+        return Err("`..` does not carry the parent directory's inode number");
+    }
+    if listing[2..].iter().any(|e| e.3 == "." || e.3 == "..") {
+        return Err("`.` or `..` is listed a second time");
+    }
+    Ok(())
+}
+
+fn open_dir(path: &core::ffi::CStr) -> Result<u64, &'static str> {
+    const O_DIRECTORY: u64 = 0o200_000;
+    match call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, path.as_ptr() as u64, O_DIRECTORY, 0),
+    ) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("open(O_DIRECTORY) failed"),
+    }
+}
+
+fn smoke_abi_pathx_getdents64_lists_dot_and_dotdot_first() -> TestResult {
+    with_memfs("/p2", "p2", &[("a", b"x"), ("b", b"y")], || {
+        use core::fmt::Write as _;
+        if call_mkdir(c"/p2/sub".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir /p2/sub failed");
+        }
+        let mut sb = [0u8; STAT_SIZE];
+        let mut ino_at = |path: &core::ffi::CStr| -> Result<u64, &'static str> {
+            match call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+                Some(0) => Ok(stat_ino_of(&sb)),
+                _ => Err("stat of a listed directory failed"),
+            }
+        };
+        let p2 = ino_at(c"/p2")?;
+        let sub = ino_at(c"/p2/sub")?;
+        let proc_root = ino_at(c"/proc")?;
+        let sys = ino_at(c"/sys")?;
+        let dev = ino_at(c"/dev")?;
+        let tmp = ino_at(c"/tmp")?;
+        let proc_self = ino_at(c"/proc/self")?;
+        // (directory, its inode, its parent's): a mount root is its own
+        // parent; a directory below one has the directory above it.
+        for (path, own, parent) in [
+            (c"/p2", p2, p2),
+            (c"/p2/sub", sub, p2),
+            (c"/proc", proc_root, proc_root),
+            (c"/proc/self", proc_self, proc_root),
+            (c"/sys", sys, sys),
+            (c"/dev", dev, dev),
+            (c"/tmp", tmp, tmp),
+        ] {
+            let fd = open_dir(path)?;
+            let listing = read_dirents64(fd, 4096);
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            let checked = listing.and_then(|listing| check_dots(&listing, own, parent));
+            if let Err(why) = checked {
+                let _ = writeln!(narf_console::Writer, "getdents64 {path:?}: {why}");
+                return Err(why);
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents-dots",
+    smoke_abi_pathx_getdents64_lists_dot_and_dotdot_first
+);
+
+fn smoke_abi_pathx_getdents64_dot_positions_rewind_and_seek() -> TestResult {
+    with_memfs(
+        "/p2",
+        "p2",
+        &[("a", b"x"), ("bb", b"y"), ("ccc", b"z")],
+        || {
+            const SEEK_SET: u64 = 0;
+            let fd = open_dir(c"/p2")?;
+            let result = (|| {
+                let whole = read_dirents64(fd, 4096)?;
+                let names: alloc::vec::Vec<&str> = whole.iter().map(|e| e.3.as_str()).collect();
+                if names.len() != 5 || names[0] != "." || names[1] != ".." {
+                    return Err("/p2 did not list `.`, `..` and its three files");
+                }
+                // rewinddir.
+                if call(Syscall::Lseek.raw(), a2(fd, 0, SEEK_SET)) != Some(0) {
+                    return Err("lseek(dir, 0, SEEK_SET) failed");
+                }
+                if read_dirents64(fd, 4096)? != whole {
+                    return Err("rewinding the directory did not list it again from `.`");
+                }
+                // Buffers that hold one record, one and a half, two: the dots
+                // split across calls the same way any other entries would.
+                for count in [24usize, 32, 48] {
+                    if call(Syscall::Lseek.raw(), a2(fd, 0, SEEK_SET)) != Some(0) {
+                        return Err("lseek(dir, 0, SEEK_SET) failed");
+                    }
+                    if read_dirents64(fd, count)? != whole {
+                        return Err("small getdents64 buffers listed the directory differently");
+                    }
+                }
+                // telldir/seekdir: each d_off resumes at the entry after it, and
+                // position 0 is `.` again.
+                let mut resume = 0u64;
+                for entry in &whole {
+                    if call(Syscall::Lseek.raw(), a2(fd, resume, SEEK_SET)) != Some(resume as i64) {
+                        return Err("lseek(dir, d_off, SEEK_SET) failed");
+                    }
+                    let next = read_dirents64(fd, 24)?;
+                    if next.first() != Some(entry) {
+                        return Err("seekdir to a d_off did not resume at the following entry");
+                    }
+                    resume = entry.1;
+                }
+                Ok(())
+            })();
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            result
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi/getdents-dots",
+    smoke_abi_pathx_getdents64_dot_positions_rewind_and_seek
+);
+
+/// The legacy x86_64 getdents reports the same two entries first, with
+/// d_type in the record's last byte.
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_pathx_getdents_legacy_lists_dot_and_dotdot_first() -> TestResult {
+    with_memfs("/p2", "p2", &[("a", b"x")], || {
+        const DT_DIR: u8 = 4;
+        let fd = open_dir(c"/p2")?;
+        let mut buf = [0u8; 256];
+        let got = call(
+            Syscall::Getdents.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let n = match got {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("getdents(dir fd) returned nothing"),
+        };
+        let mut pos = 0usize;
+        for (want, d_off) in [(&b"."[..], 1u64), (&b".."[..], 2)] {
+            if pos + 20 > n {
+                return Err("getdents returned fewer than two records");
+            }
+            let off = u64::from_ne_bytes(buf[pos + 8..pos + 16].try_into().unwrap());
+            let reclen = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            let name = &buf[pos + 18..pos + 18 + want.len() + 1];
+            if off != d_off || &name[..want.len()] != want || name[want.len()] != 0 {
+                return Err("legacy getdents did not start with `.` and `..`");
+            }
+            if buf[pos + reclen - 1] != DT_DIR {
+                return Err("legacy getdents `.`/`..` d_type (last byte) is not DT_DIR");
+            }
+            pos += reclen;
+        }
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "syscall_abi/getdents-dots",
+    smoke_abi_pathx_getdents_legacy_lists_dot_and_dotdot_first
+);
+
+/// A directory whose filesystem lists `.` and `..` itself, as ext2 and FAT
+/// subdirectories read them off the disk.
+struct OnDiskDotsDir;
+
+impl narf_filesystem::DirOps for OnDiskDotsDir {
+    fn ino(&self) -> u64 {
+        77
+    }
+    fn lookup(&self, _name: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+        None
+    }
+    fn iter<'a>(
+        &'a self,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = narf_filesystem::DirEntry> + 'a> {
+        let entry = |name: &'static str, file_type| narf_filesystem::DirEntry {
+            name: alloc::borrow::Cow::Borrowed(name),
+            file_type,
+        };
+        alloc::boxed::Box::new(
+            [
+                entry(".", narf_filesystem::FileType::Dir),
+                entry("..", narf_filesystem::FileType::Dir),
+                entry("x", narf_filesystem::FileType::File),
+            ]
+            .into_iter(),
+        )
+    }
+}
+
+struct OnDiskDotsFs;
+
+impl narf_filesystem::FsInstance for OnDiskDotsFs {
+    fn root(&self) -> alloc::sync::Arc<dyn narf_filesystem::DirOps> {
+        alloc::sync::Arc::new(OnDiskDotsDir)
+    }
+    fn name(&self) -> &str {
+        "ext2"
+    }
+}
+
+fn smoke_abi_pathx_getdents64_does_not_repeat_on_disk_dots() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        // A private namespace, so the mount does not outlive the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let auth = bootstrap_mount_authority();
+        let fs = alloc::sync::Arc::new(OnDiskDotsFs);
+        if crate::handlers::current_mount_arc(&auth, "/abi-gdd-ondisk", fs).is_err() {
+            return Err("could not mount the on-disk-dots fixture");
+        }
+        let fd = open_dir(c"/abi-gdd-ondisk")?;
+        let listing = read_dirents64(fd, 4096);
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let listing = listing?;
+        // The mount root: `..` is the directory itself.
+        check_dots(&listing, 77, 77)?;
+        let rest: alloc::vec::Vec<&str> = listing[2..].iter().map(|e| e.3.as_str()).collect();
+        if rest != ["x"] {
+            return Err("the filesystem's own entries were not listed once, after the dots");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents-dots",
+    smoke_abi_pathx_getdents64_does_not_repeat_on_disk_dots
+);
+
 // ── listdir (NARF-native path_ptr, path_len, cursor, out, out_len) ──
 //
 // Path-based readdir: serialises the cursor-th entry as
