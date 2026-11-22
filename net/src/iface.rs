@@ -2949,9 +2949,7 @@ pub fn is_local_addr_in(net_ns_id: u64, ip: [u8; 4]) -> bool {
     if ip[0] == 127 {
         return true;
     }
-    if namespace_loopback(net_ns_id)
-        .is_some_and(|lo| lo.ipv4.iter().any(|(a, _)| *a == ip))
-    {
+    if namespace_loopback(net_ns_id).is_some_and(|lo| lo.ipv4.iter().any(|(a, _)| *a == ip)) {
         return true;
     }
     snapshot_all_in(net_ns_id).iter().any(|i| {

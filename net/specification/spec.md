@@ -597,8 +597,12 @@ SIOCSIFFLAGS/SIOCSIFMTU on that namespace's `lo` call it, and require
 CAP_NET_ADMIN over the namespace. No delegated `AdminHandle` names it.
 Setting its hardware address is `-EOPNOTSUPP`.
 `netlink_route::iface_name_for_index_in(ns, ifindex)` and
-`ifindex_for_name_in(ns, name)` resolve rtnetlink device references within
-the sender's namespace (`__dev_get_by_index(net, ...)`).
+`ifindex_for_name_in(ns, name)` resolve every rtnetlink device reference
+(link, address, route, neighbour and qdisc requests) within the sender's
+namespace (`__dev_get_by_index(net, ...)`). The kernel handle for the name
+`lo` is the initial namespace's device. Route, neighbour and qdisc requests
+on a namespace's own `lo` therefore answer `-EOPNOTSUPP` (a LINUX-GAP)
+rather than changing the initial namespace.
 
 ### 3.5 Stack-daemon attach (Stage 4)
 

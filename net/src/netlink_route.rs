@@ -1517,7 +1517,7 @@ fn apply_qdisc_mutation(
     }
     let handle = u32::from_ne_bytes(request[24..28].try_into().map_err(|_| EINVAL)?);
     let parent = u32::from_ne_bytes(request[28..32].try_into().map_err(|_| EINVAL)?);
-    let iface_name = iface_name_for_index(ifindex as u32).ok_or(ENODEV)?;
+    let iface_name = iface_name_for_index_in(authority.net_ns_id, ifindex as u32).ok_or(ENODEV)?;
     let admin = authority.for_iface(&iface_name)?;
     let target = admin.iface_name();
     let kind = find_attr(request, 20, TCA_KIND).map(|raw| raw.strip_suffix(&[0]).unwrap_or(raw));
@@ -1897,6 +1897,18 @@ impl MutationAuthority<'_> {
             if iface != "lo" && crate::iface::lookup_in(self.net_ns_id, iface).is_none() {
                 return Err(ENODEV);
             }
+            // The kernel handle for "lo" is the initial namespace's device. A
+            // namespace with its own `lo` must never reach it through the
+            // shared name; its address and link changes go through
+            // `own_loopback` instead.
+            // LINUX-GAP: routes, neighbours and qdiscs on a namespace's own
+            // `lo` are refused rather than kept in that namespace.
+            if iface == "lo"
+                && self.net_ns_id != 0
+                && crate::iface::namespace_loopback(self.net_ns_id).is_some()
+            {
+                return Err(EOPNOTSUPP);
+            }
             return crate::stack::kernel_admin(iface).ok_or(ENODEV);
         }
         Err(EPERM)
@@ -2182,7 +2194,7 @@ fn apply_mutation(
                 return Err(EINVAL);
             }
             let ifindex = u32::from_ne_bytes(oif.try_into().map_err(|_| EINVAL)?);
-            let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
+            let iface_name = iface_name_for_index_in(authority.net_ns_id, ifindex).ok_or(ENODEV)?;
             let admin = authority.for_iface(&iface_name)?;
             if family == AF_INET6 {
                 if table != crate::route::TABLE_MAIN {
@@ -2318,7 +2330,7 @@ fn apply_mutation(
             }
             let family = request[NLMSG_HDRLEN];
             let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
-            let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
+            let iface_name = iface_name_for_index_in(authority.net_ns_id, ifindex).ok_or(ENODEV)?;
             let admin = authority.for_iface(&iface_name)?;
             let state = u16::from_ne_bytes(request[24..26].try_into().map_err(|_| EINVAL)?);
             let flags = request[26];
