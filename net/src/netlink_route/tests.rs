@@ -502,6 +502,63 @@ narf_kernel_test::kernel_test_in!(
     ipv6_address_message_uses_linux_ifaddr_layout
 );
 
+/// `inet6_fill_ifaddr` → `put_ifaddrmsg(skb, plen, flags, rt_scope(ifa->scope),
+/// ifindex)` (`net/ipv6/addrconf.c`): `ifa_scope` is an `RT_SCOPE_*` value,
+/// not the `IPV6_ADDR_*` scope bits `/proc/net/if_inet6` prints. `rt_scope()`
+/// (`include/net/addrconf.h`) maps IFA_HOST → RT_SCOPE_HOST (254), IFA_LINK →
+/// RT_SCOPE_LINK (253), IFA_SITE → RT_SCOPE_SITE (200), anything else →
+/// RT_SCOPE_UNIVERSE (0). A ULA (fc00::/7) is global scope
+/// (`__ipv6_addr_type`). iproute2 prints 0x20 as "scope 32".
+fn ipv6_address_scope_is_an_rt_scope() -> narf_kernel_test::TestResult {
+    use crate::ipv6::addrs::{AddrScope, AddrState, Ipv6IfAddr};
+    let mk = |addr: [u8; 16], scope: AddrScope| Ipv6IfAddr {
+        iface: "eth0".into(),
+        addr,
+        prefix_len: 64,
+        state: AddrState::Preferred,
+        scope,
+        preferred_deadline_ns: u64::MAX,
+        valid_deadline_ns: u64::MAX,
+        temporary: false,
+    };
+    let cases: [([u8; 16], AddrScope, u8); 5] = [
+        (
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x55, 0x65, 0x7b, 0x7b, 0x9a, 0xbe, 0xb7, 0xb1,
+            ],
+            AddrScope::LinkLocal,
+            253,
+        ),
+        (
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            AddrScope::Host,
+            254,
+        ),
+        (
+            [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            AddrScope::Global,
+            0,
+        ),
+        (
+            [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            AddrScope::UniqueLocal,
+            0,
+        ),
+        // fec0::/10 is IPV6_ADDR_SITELOCAL → RT_SCOPE_SITE.
+        (
+            [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            AddrScope::Global,
+            200,
+        ),
+    ];
+    for (addr, scope, want) in cases {
+        let msg = build_newaddr_v6(&mk(addr, scope), 2, 1, 0);
+        narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN + 3], want);
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("net/ipv6-ifa-scope", ipv6_address_scope_is_an_rt_scope);
+
 fn ipv6_route_message_reports_gateway_and_oif() -> narf_kernel_test::TestResult {
     let route = crate::ipv6::route::Route {
         prefix: [0; 16],

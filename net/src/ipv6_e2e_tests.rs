@@ -1237,6 +1237,71 @@ fn smoke_v6_proc_if_inet6_reflects_slaac() -> TestResult {
 }
 kernel_test_in!("net/ipv6_e2e", smoke_v6_proc_if_inet6_reflects_slaac);
 
+// ── /proc/net/if_inet6 columns are Linux's ──────────────────────────
+//
+// Linux ref: `if6_seq_show` (`net/ipv6/addrconf.c`) prints
+//   `ifp->idev->dev->ifindex` (the device's real ifindex),
+//   `ifp->scope` = `ipv6_addr_scope(addr)` = `__ipv6_addr_type(addr) &
+//   IPV6_ADDR_SCOPE_MASK` (LOOPBACK 0x10, LINKLOCAL 0x20, SITELOCAL 0x40;
+//   a ULA fc00::/7 is global, 0x00), and `(u8)ifp->flags`, the same
+//   IFA_F_* word RTM_NEWADDR carries: a SLAAC address with finite lifetimes
+//   is not IFA_F_PERMANENT. The loopback ::1 is listed on lo (ifindex 1).
+fn smoke_v6_if_inet6_reports_linux_scope_ifindex_and_flags() -> TestResult {
+    const IFACE: &str = "v6ifinet6-0";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x77];
+    reset_v6(IFACE, MAC);
+    let Some(ifindex) = iface::ifindex_of(IFACE) else {
+        return TestResult::Fail("test iface has no ifindex");
+    };
+    let mk = |addr: [u8; 16], scope, deadline: u64| addrs::Ipv6IfAddr {
+        iface: String::from(IFACE),
+        addr,
+        prefix_len: 64,
+        state: addrs::AddrState::Preferred,
+        scope,
+        preferred_deadline_ns: deadline,
+        valid_deadline_ns: deadline,
+        temporary: false,
+    };
+    let ll = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77];
+    let ula = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77];
+    let slaac = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77,
+    ];
+    addrs::add(mk(ll, addrs::AddrScope::LinkLocal, u64::MAX));
+    addrs::add(mk(ula, addrs::AddrScope::UniqueLocal, u64::MAX));
+    addrs::add(mk(slaac, addrs::AddrScope::Global, u64::MAX - 1));
+    let snap = addrs::snapshot();
+    let find = |a: [u8; 16]| snap.iter().find(|s| s.addr == a).cloned();
+    let (Some(l), Some(u), Some(s)) = (find(ll), find(ula), find(slaac)) else {
+        return TestResult::Fail("if_inet6 snapshot is missing an address");
+    };
+    if (l.ifindex, u.ifindex, s.ifindex) != (ifindex, ifindex, ifindex) {
+        return TestResult::Fail("if_inet6 ifindex is not the device's ifindex");
+    }
+    if l.scope != 0x20 || u.scope != 0x00 || s.scope != 0x00 {
+        return TestResult::Fail("if_inet6 scope is not ipv6_addr_scope()");
+    }
+    // IFA_F_PERMANENT (0x80) only for the addresses with no lifetime.
+    if l.flags != 0x80 || u.flags != 0x80 || s.flags != 0x00 {
+        return TestResult::Fail("if_inet6 flags are not (u8)ifa_flags");
+    }
+    let lo_line = snap
+        .iter()
+        .find(|e| e.iface == "lo" && e.addr == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    match lo_line {
+        Some(e) if e.ifindex == 1 && e.prefix_len == 128 && e.scope == 0x10 && e.flags == 0x80 => {
+            TestResult::Pass
+        }
+        Some(_) => TestResult::Fail("if_inet6 ::1 line has the wrong columns"),
+        None => TestResult::Fail("if_inet6 does not list ::1 on lo"),
+    }
+}
+kernel_test_in!(
+    "net/ipv6-ifinet6",
+    smoke_v6_if_inet6_reports_linux_scope_ifindex_and_flags
+);
+
 // ── Smoke 18: /proc/net/ipv6_route reflects default route ───────────
 //
 // After Smoke 6's RA, ipv6::route::snapshot() must contain the
