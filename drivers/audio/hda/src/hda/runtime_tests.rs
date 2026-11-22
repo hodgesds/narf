@@ -3376,3 +3376,60 @@ kernel_test_in!(
     "audio/hda/pm-unsol",
     native_hda_pm_reinit_accepts_unsolicited_responses
 );
+
+/// Nothing posts into a parked controller's command rings. The jack service
+/// runs beside the PCM stop that parks the controller; an unsolicited-response
+/// drain or a jack re-read that lands after the park must leave the rings
+/// alone: a controller held in reset reads RIRBWP 0, so a drain walked the
+/// driver's read cursor through every stale RIRB slot down to 0, and a jack
+/// command waited out the 100 ms timeout and poisoned the transport. Linux
+/// never reaches a suspended controller's rings: `codec_exec_verb` powers the
+/// codec up first and runtime PM serialises suspend against the command path.
+fn native_hda_pm_parked_rings_take_no_command() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("park the idle controller");
+    }
+    // What the parked hardware reads: pointers at their reset values.
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    unsafe {
+        dev.bar0.write16(REG_RIRBWP, 0);
+        dev.bar0.write16(REG_CORBWP, 0);
+        dev.bar0.write16(REG_CORBRP, 0);
+    }
+    dev.commands.lock().rp = 0x40;
+    dev.drain_unsolicited();
+    if dev.commands.lock().rp != 0x40 {
+        return TestResult::Fail("the jack drain walked a parked controller's stale RIRB");
+    }
+    let start = narf_time::monotonic_ns();
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    let sensed =
+        narf_scheduler::block_on_spin(unsafe { dev.send_verb_async(make_verb(0, 3, 0xf09 << 8)) });
+    let elapsed = narf_time::monotonic_ns().saturating_sub(start);
+    // SAFETY: as above.
+    let posted = unsafe { dev.bar0.read16(REG_CORBWP) };
+    if sensed.is_ok() || posted != 0 || dev.irq.failed.load(Ordering::Acquire) {
+        return TestResult::Fail("a jack command must not be posted into parked rings");
+    }
+    if elapsed > 50_000_000 {
+        return TestResult::Fail("a jack command on a parked controller waited for the timeout");
+    }
+    // A synchronous command wakes the controller first (codec_exec_verb's
+    // snd_hda_power_up_pm) and gets the codec's own answer.
+    // SAFETY: as above.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x1002aa01)
+        || dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("a command wakes the parked controller before it is posted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-parked",
+    native_hda_pm_parked_rings_take_no_command
+);
