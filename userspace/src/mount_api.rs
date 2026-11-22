@@ -1305,6 +1305,7 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
                 match crate::handlers::current_move_mount(&auth, &source, &target) {
                     Ok(()) => ok(0),
                     Err(FsError::Busy) => err(EBUSY),
+                    Err(FsError::SymlinkLoop) => err(ELOOP),
                     Err(_) => err(EINVAL),
                 },
             );

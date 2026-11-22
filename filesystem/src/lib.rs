@@ -4241,6 +4241,12 @@ fn mount_covers_path(mount_path: &str, abs: &str) -> bool {
 /// of the table: it is now the newest attachment at `target`, above whatever
 /// was mounted there or below it before.
 fn move_mount_tree(mounts: &mut Vec<Mount>, source: &str, target: &str) -> Result<(), FsError> {
+    // `for (; mnt_has_parent(p); p = p->mnt_parent) if (p == old) goto out;`
+    // with -ELOOP: the target may not lie in the tree being moved, which
+    // starts at the mount itself.
+    if target == source || path_is_proper_descendant(target, source) {
+        return Err(FsError::SymlinkLoop);
+    }
     let top = mounts
         .iter()
         .rposition(|m| m.path == source)

@@ -142,7 +142,10 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // existing non-mountpoint EPERM. This handler had no privilege check at
     // all, so any task could unmount anything.
     let mount_list = current_mount_list();
-    let mounted = mount_list.iter().any(|m| m == &target);
+    // `path_mounted`: the target must be the root of the mount the walk
+    // reaches there, the topmost one covering it. A mount covered by a later
+    // one over a directory above it is not reachable by any path.
+    let mounted = current_covering_mount_info(&target).is_some_and(|(path, _)| path == target);
     if !mounted && stat_path_dir_aware(target.as_str()).is_none() {
         ctx.set_return(fail(ENOENT));
         return;
