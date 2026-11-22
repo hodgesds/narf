@@ -548,6 +548,8 @@ struct FixtureConfig {
     codec_mask: u16,
     /// Coef registers (nid, index, value) the codec holds before probe.
     seed_coef: &'static [(u8, u16, u16)],
+    /// STATESTS reads 0: the link has no codec at all.
+    no_codecs: bool,
 }
 
 struct Fixture {
@@ -674,6 +676,7 @@ impl Fixture {
             hp_plugged,
             codec_mask,
             seed_coef,
+            no_codecs,
         } = config;
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -687,7 +690,12 @@ impl Fixture {
         // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
         unsafe {
             mmio.write16(REG_GCAP, 0x1101);
-            mmio.write16(REG_STATESTS, if codec_mask == 0 { 1 } else { codec_mask });
+            let statests = match (no_codecs, codec_mask) {
+                (true, _) => 0,
+                (false, 0) => 1,
+                (false, mask) => mask,
+            };
+            mmio.write16(REG_STATESTS, statests);
             mmio.write8(REG_CORBSIZE, 0x40);
             mmio.write8(REG_RIRBSIZE, 0x40);
         }
@@ -4200,4 +4208,39 @@ fn native_hda_hdmi_iec958_state_per_pcm() -> TestResult {
 kernel_test_in!(
     "audio/hda/hdmi-iec958",
     native_hda_hdmi_iec958_state_per_pcm
+);
+
+/// Linux azx_probe_continue on a link with no codec logs "no codecs
+/// found!" and keeps running: interrupts, the card registration and runtime
+/// PM, with a card that has no PCMs. RETRY_PROBE retries only a codec that
+/// fails to configure, not an empty link. This host's Linux shows exactly
+/// that for the 1022:15e3 controller: "snd_hda_intel 0000:12:00.6: no
+/// codecs found!" at boot, with no retries, and card 2 "Generic" holding
+/// only an id file. NARF failed the bring-up with NoCodecs, retried it for
+/// a minute on AMD platform controllers and registered no card.
+fn native_hda_no_codec_link_still_comes_up() -> TestResult {
+    let fixture = match Fixture::build_model(FixtureConfig {
+        no_codecs: true,
+        ..Default::default()
+    }) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if !dev.codecs().is_empty()
+        || !dev.outputs.is_empty()
+        || dev.input.lock().is_some()
+        || !dev.ready
+    {
+        return TestResult::Fail("a codec-less controller comes up ready for an empty card");
+    }
+    let card = super::super::stream::Card(dev.clone());
+    if card.open(false, 0).is_ok() || card.open(true, 0).is_ok() || !card.controls().is_empty() {
+        return TestResult::Fail("the empty card has no PCMs and no controls");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/no-codecs",
+    native_hda_no_codec_link_still_comes_up
 );
