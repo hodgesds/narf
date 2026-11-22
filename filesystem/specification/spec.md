@@ -1878,9 +1878,9 @@ under `/sys/devices`, with class and character-device discovery symlinks,
 writable uevents, and physical PCI parent links where applicable. Registry
 teardown removes these links and the canonical card subtree; `Kobject::remove_symlink`
 supports discovery-link removal alongside `remove_child`.
-Block devices have canonical kobjects at
-`/sys/devices/virtual/block/<name>`; `/sys/class/block` and `/sys/block` are
-discovery views. Each view provides a Linux `stat` file with the same 17
+Each disk has a canonical kobject at `/sys/devices/virtual/block/<disk>`.
+Numbered partitions with a registered parent appear beneath that disk.
+`/sys/block` links to disks, and `/sys/class/block` links to disks and partitions. Each view provides a Linux `stat` file with the same 17
 counters as `/proc/diskstats`, including 512-byte sectors and milliseconds
 spent doing I/O. Device numbers match devfs, numbered partitions expose
 `partition`, and whole disks report flush completions. Block `add` uevents and `/sys/dev/block/<major>:<minor>`
@@ -2107,7 +2107,7 @@ derives parentage from the finished tree rather than requiring parent-first
 registration. The boot initcall runs before PID 1 so systemd observes the
 existing fstab target through its mount table. After late block sysfs
 population, boot marks a bounded replay window and queues canonical
-`/devices/virtual/block/<name>` ADD events. udevd replays only that finished
+disk and partition ADD events under `/devices/virtual/block/`. udevd replays only that finished
 projection, not arbitrary earlier bring-up events; this lets it create the ESP
 UUID device unit even if its userspace trigger helper is unavailable during
 early setup.
