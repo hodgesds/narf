@@ -16,6 +16,13 @@
 //! Reference: Linux `napi_poll` / `napi_complete_done`; Intel dynamic ITR
 //! (`ixgbe`/`igb` `update_itr`).
 
+use core::{
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+    task::Waker,
+};
+use narf_lib::sync::IrqSafeSpinLock;
+
 /// Default per-poll frame budget. Linux uses 64; one poll round processes at
 /// most this many frames before yielding so one busy queue cannot starve the
 /// others sharing a core.
@@ -252,6 +259,61 @@ pub fn rx_deferral_spec(cpu: u32) -> Option<narf_scheduler::TaskSpec> {
     Some(spec)
 }
 
+/// One queue's ownership between its receive pump and its deferral task:
+/// `NAPI_STATE_SCHED` held across `wakeup_softirqd`. Exactly one of the two
+/// polls the queue; the queue's interrupt stays masked while the deferral
+/// task holds it, and the pump re-enables it once the queue comes back.
+#[derive(Debug)]
+pub struct SoftirqHandoff {
+    deferred: AtomicBool,
+    deferral: IrqSafeSpinLock<Option<Waker>>,
+    pump: IrqSafeSpinLock<Option<Waker>>,
+}
+
+impl Default for SoftirqHandoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SoftirqHandoff {
+    /// A queue its pump holds.
+    pub const fn new() -> Self {
+        Self {
+            deferred: AtomicBool::new(false),
+            deferral: IrqSafeSpinLock::new(None),
+            pump: IrqSafeSpinLock::new(None),
+        }
+    }
+
+    /// Whether the deferral task holds the queue.
+    pub fn is_deferred(&self) -> bool {
+        self.deferred.load(Ordering::Acquire)
+    }
+
+    /// Pump: the softirq bound is spent with work left; hand the queue to
+    /// the deferral task and stop polling until [`returned`] resolves.
+    ///
+    /// [`returned`]: SoftirqHandoff::returned
+    pub fn defer(&self) {
+        let _ = (&self.deferral, &self.pump);
+    }
+
+    /// Deferral task: resolves once the pump has handed the queue over.
+    pub fn taken(&self) -> impl Future<Output = ()> + '_ {
+        core::future::pending()
+    }
+
+    /// Deferral task: the queue is drained; give it back to the pump, which
+    /// completes it (`napi_complete_done`) and re-enables its interrupt.
+    pub fn hand_back(&self) {}
+
+    /// Pump: resolves once the deferral task has handed the queue back.
+    pub fn returned(&self) -> impl Future<Output = ()> + '_ {
+        core::future::ready(())
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod softirq_tests {
     //! The receive pump's policy on one CPU, simulated against NARF's
@@ -260,7 +322,8 @@ mod softirq_tests {
     //! runnable on the queue's CPU, as in the desktop reproduction (a busy
     //! loop pinned to each queue CPU dropped RQDPC on igc queue 2).
     use super::*;
-    use alloc::vec::Vec;
+    use alloc::{sync::Arc, vec::Vec};
+    use core::{pin::Pin, sync::atomic::AtomicU32};
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_scheduler::SchedClass;
 
@@ -499,7 +562,79 @@ mod softirq_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("net/napi-softirq", smoke_softirq_flood_defers_and_never_starves);
+    kernel_test_in!(
+        "net/napi-softirq",
+        smoke_softirq_flood_defers_and_never_starves
+    );
+
+    struct Wakes(AtomicU32);
+    impl alloc::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn poll_once<F: Future<Output = ()>>(f: Pin<&mut F>, w: &Waker) -> bool {
+        let mut cx = core::task::Context::from_waker(w);
+        f.poll(&mut cx).is_ready()
+    }
+
+    /// The pump defers: the deferral task is woken and owns the queue; the
+    /// pump waits until it is handed back, is woken then, and owns it again.
+    fn smoke_softirq_handoff_passes_the_queue_both_ways() -> TestResult {
+        let handoff = SoftirqHandoff::new();
+        let deferral_wakes = Arc::new(Wakes(AtomicU32::new(0)));
+        let pump_wakes = Arc::new(Wakes(AtomicU32::new(0)));
+        let deferral_waker = Waker::from(deferral_wakes.clone());
+        let pump_waker = Waker::from(pump_wakes.clone());
+        for _ in 0..2 {
+            // The deferral task parks until it is handed the queue.
+            let mut taken = core::pin::pin!(handoff.taken());
+            if poll_once(taken.as_mut(), &deferral_waker) {
+                return TestResult::Fail("the deferral task took a queue its pump holds");
+            }
+            let before = deferral_wakes.0.load(Ordering::Acquire);
+            handoff.defer();
+            if !handoff.is_deferred() {
+                return TestResult::Fail("defer did not hand the queue to the deferral task");
+            }
+            if deferral_wakes.0.load(Ordering::Acquire) != before + 1 {
+                return TestResult::Fail("defer did not wake the deferral task");
+            }
+            if !poll_once(taken.as_mut(), &deferral_waker) {
+                return TestResult::Fail("the woken deferral task did not get the queue");
+            }
+            // The pump waits for the queue to come back.
+            let mut returned = core::pin::pin!(handoff.returned());
+            if poll_once(returned.as_mut(), &pump_waker) {
+                return TestResult::Fail("the pump resumed while the deferral task held the queue");
+            }
+            let before = pump_wakes.0.load(Ordering::Acquire);
+            handoff.hand_back();
+            if handoff.is_deferred() {
+                return TestResult::Fail("hand_back left the queue with the deferral task");
+            }
+            if pump_wakes.0.load(Ordering::Acquire) != before + 1 {
+                return TestResult::Fail("hand_back did not wake the pump");
+            }
+            if !poll_once(returned.as_mut(), &pump_waker) {
+                return TestResult::Fail("the woken pump did not get the queue back");
+            }
+        }
+        // Handed over before the deferral task parks: it takes the queue at
+        // once, without a wake.
+        handoff.defer();
+        let mut taken = core::pin::pin!(handoff.taken());
+        if !poll_once(taken.as_mut(), &deferral_waker) {
+            return TestResult::Fail("a deferral task arriving late missed the hand-over");
+        }
+        handoff.hand_back();
+        TestResult::Pass
+    }
+    kernel_test_in!("net/napi-softirq", smoke_softirq_handoff_passes_the_queue_both_ways);
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
