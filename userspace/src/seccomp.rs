@@ -94,6 +94,10 @@ pub const SYS_SECCOMP: i32 = 1;
 pub const AUDIT_ARCH_NATIVE: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 #[cfg(not(target_arch = "aarch64"))]
 pub const AUDIT_ARCH_NATIVE: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+/// `AUDIT_ARCH_I386`: what an i386 system call (x86_64 `int 0x80`,
+/// `TrapContext::in_ia32_syscall`) reports, with its `syscall_32.tbl`
+/// number, exactly as Linux's compat entry does.
+pub const AUDIT_ARCH_I386: u32 = 0x4000_0003;
 
 /// `BPF_MAXINSNS`.
 const BPF_MAXINSNS: usize = 4096;
@@ -109,6 +113,17 @@ const SECCOMP_DATA_SIZE: u32 = 64;
 const STRICT_ALLOWED: [u32; 4] = [63, 64, 93, 139];
 #[cfg(not(target_arch = "aarch64"))]
 const STRICT_ALLOWED: [u32; 4] = [0, 1, 60, 15];
+/// The i386 mode-1 set (`mode1_syscalls_32[]`): read, write, exit, sigreturn.
+const STRICT_ALLOWED_I386: [u32; 4] = [3, 4, 1, 119];
+
+/// The `seccomp_data.arch` a call through `ctx` reports.
+fn syscall_arch(ctx: &dyn TrapContext) -> u32 {
+    if cfg!(target_arch = "x86_64") && ctx.in_ia32_syscall() {
+        AUDIT_ARCH_I386
+    } else {
+        AUDIT_ARCH_NATIVE
+    }
+}
 
 // ── classic BPF (`include/uapi/linux/filter.h`, `bpf_common.h`) ──
 
@@ -1158,8 +1173,18 @@ pub enum Verdict {
     UserNotif(Arc<UserNotifListener>),
 }
 
-/// The decision for syscall `nr` of `task`, without acting on it.
+/// The decision for native syscall `nr` of `task`, without acting on it.
 pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
+    evaluate_arch(task, nr, AUDIT_ARCH_NATIVE, ip, args)
+}
+
+/// [`evaluate`] for a call of `arch` (`AUDIT_ARCH_NATIVE`, or
+/// `AUDIT_ARCH_I386` for an x86_64 `int 0x80` call, whose `nr` is an
+/// i386 number). The constant-action cache describes native numbers only,
+/// so an i386 call always runs the filters (Linux keeps a separate compat
+/// bitmap; NARF has none yet), and strict mode admits the i386 set.
+pub fn evaluate_arch(task: u64, nr: u32, arch: u32, ip: u64, args: [u64; 6]) -> Verdict {
+    let native = arch == AUDIT_ARCH_NATIVE;
     let st = {
         let map = shard(task).lock();
         let Some(st) = map.get(&task) else {
@@ -1167,7 +1192,9 @@ pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
         };
         // `seccomp_cache_check_allow`: decided without running BPF, and
         // without bouncing the shared filter's reference count.
-        if st.mode == SECCOMP_MODE_FILTER && st.filter.as_ref().is_some_and(|f| f.cache_allows(nr))
+        if native
+            && st.mode == SECCOMP_MODE_FILTER
+            && st.filter.as_ref().is_some_and(|f| f.cache_allows(nr))
         {
             return Verdict::Allow;
         }
@@ -1176,7 +1203,12 @@ pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
     match st.mode {
         SECCOMP_MODE_DISABLED => Verdict::Allow,
         SECCOMP_MODE_STRICT => {
-            if STRICT_ALLOWED.contains(&nr) {
+            let allowed: &[u32] = if native {
+                &STRICT_ALLOWED
+            } else {
+                &STRICT_ALLOWED_I386
+            };
+            if allowed.contains(&nr) {
                 Verdict::Allow
             } else {
                 Verdict::StrictKill
@@ -1189,7 +1221,7 @@ pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
             };
             let sd = SeccompData {
                 nr: nr as i32,
-                arch: AUDIT_ARCH_NATIVE,
+                arch,
                 instruction_pointer: ip,
                 args,
             };
@@ -1321,7 +1353,8 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
     }
     let a = *ctx.args();
     let args = [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5];
-    match evaluate(task, nr, ctx.rip(), args) {
+    let arch = syscall_arch(ctx);
+    match evaluate_arch(task, nr, arch, ctx.rip(), args) {
         Verdict::Allow => Some(nr),
         Verdict::Return(v) => {
             ctx.set_return(SyscallReturn::ok(v as u64));
@@ -1331,13 +1364,13 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
             // `syscall_rollback`: the handler sees the original registers,
             // the syscall number in the return register included.
             ctx.set_return(SyscallReturn::ok(u64::from(nr)));
-            crate::handlers::force_sigsys_seccomp(ctx, task, nr, AUDIT_ARCH_NATIVE, data, false);
+            crate::handlers::force_sigsys_seccomp(ctx, task, nr, arch, data, false);
             None
         }
         Verdict::KillProcess(data) => {
             mark_dead(task);
             ctx.set_return(SyscallReturn::ok(u64::from(nr)));
-            crate::handlers::force_sigsys_seccomp(ctx, task, nr, AUDIT_ARCH_NATIVE, data, true);
+            crate::handlers::force_sigsys_seccomp(ctx, task, nr, arch, data, true);
             None
         }
         Verdict::KillThread => {
@@ -1360,7 +1393,7 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
                     let new_nr = new_nr as u32;
                     let a = *ctx.args();
                     let args = [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5];
-                    match evaluate(task, new_nr, ctx.rip(), args) {
+                    match evaluate_arch(task, new_nr, arch, ctx.rip(), args) {
                         Verdict::Allow | Verdict::TraceEvent(_) => Some(new_nr),
                         _ => {
                             // A recheck that is not ALLOW skips without a
@@ -1378,7 +1411,7 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
             task,
             SeccompData {
                 nr: nr as i32,
-                arch: AUDIT_ARCH_NATIVE,
+                arch,
                 instruction_pointer: ctx.rip(),
                 args,
             },

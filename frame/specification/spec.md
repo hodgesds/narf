@@ -227,7 +227,10 @@ in-tree runtime (`narf-user-runtime`) and fixtures use it.
 `compat32::user_rax` is the value sign-extended; a non-Ok NARF status
 reads as its errno when the value carries one, else -EINVAL. A task parked
 in an `int 0x80` call reports eax and ebx..ebp as its number and arguments
-(`/proc/<pid>/syscall`).
+(`/proc/<pid>/syscall`). Seccomp sees these calls with `AUDIT_ARCH_I386`
+and the i386 number (`seccomp_data`, `si_arch`, user notifications); they
+never take the native constant-action cache, and strict mode admits the
+i386 set (read 3, write 4, exit 1, sigreturn 119).
 
 ```rust
 // narf_userspace::compat32
