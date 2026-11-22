@@ -26,6 +26,8 @@
 //! Raphael's owner follows Linux's `pg_flags` under `amdgpu.pg_mask`
 //! instead: DPG with `AMD_PG_SUPPORT_VCN_DPG`, otherwise the static path,
 //! and the PGFSM steps of both blocks' static power gating ([`StaticPg`]).
+//! Its `cg_flags` under `amdgpu.cg_mask` give the media clock gating
+//! ([`Mgcg`]).
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_fence_navi22 as fence, amdgpu_vram::Pool,
     amdgpu_vram::Reservation,
@@ -212,6 +214,7 @@ pub(crate) mod bits {
     /// DYN_CLOCK_MODE (VCN_MGCG) | CLK_GATE_DLY_TIMER 1 | CLK_OFF_DELAY 4.
     // linux: (1 << UVD_CGC_CTRL__DYN_CLOCK_MODE__SHIFT) | (1 << UVD_CGC_CTRL__CLK_GATE_DLY_TIMER__SHIFT) | (4 << UVD_CGC_CTRL__CLK_OFF_DELAY__SHIFT)
     pub const CGC_CTRL_DYN: u32 = 1 | (1 << 2) | (4 << 6);
+    pub const CGC_DYN_CLOCK_MODE: u32 = 1; // linux: UVD_CGC_CTRL__DYN_CLOCK_MODE_MASK
     /// SYS..MMSCH gates of UVD_CGC_GATE cleared.
     // linux: UVD_CGC_GATE__SYS_MASK | UVD_CGC_GATE__UDEC_MASK | UVD_CGC_GATE__MPEG2_MASK | UVD_CGC_GATE__REGS_MASK | UVD_CGC_GATE__RBC_MASK | UVD_CGC_GATE__LMI_MC_MASK | UVD_CGC_GATE__LMI_UMC_MASK | UVD_CGC_GATE__IDCT_MASK | UVD_CGC_GATE__MPRD_MASK | UVD_CGC_GATE__MPC_MASK | UVD_CGC_GATE__LBSI_MASK | UVD_CGC_GATE__LRBBM_MASK | UVD_CGC_GATE__UDEC_RE_MASK | UVD_CGC_GATE__UDEC_CM_MASK | UVD_CGC_GATE__UDEC_IT_MASK | UVD_CGC_GATE__UDEC_DB_MASK | UVD_CGC_GATE__UDEC_MP_MASK | UVD_CGC_GATE__WCB_MASK | UVD_CGC_GATE__VCPU_MASK | UVD_CGC_GATE__MMSCH_MASK
     pub const CGC_GATE_ALL: u32 = 0x0017_ffff;
@@ -244,7 +247,8 @@ pub(crate) mod bits {
     /// DYN_CLOCK_MODE (JPEG_MGCG) | CLK_GATE_DLY_TIMER 1 | CLK_OFF_DELAY 4.
     // linux: (1 << JPEG_CGC_CTRL__DYN_CLOCK_MODE__SHIFT) | (1 << JPEG_CGC_CTRL__CLK_GATE_DLY_TIMER__SHIFT) | (4 << JPEG_CGC_CTRL__CLK_OFF_DELAY__SHIFT)
     pub const JPEG_CGC_CTRL_DYN: u32 = 1 | (1 << 1) | (4 << 5);
-    // linux: JPEG_CGC_GATE__JPEG_DEC_MASK | JPEG_CGC_GATE__JPEG2_DEC_MASK | JPEG_CGC_GATE__JPEG_ENC_MASK | JPEG_CGC_GATE__JMCIF_MASK | JPEG_CGC_GATE__JRBBM_MASK
+    pub const JPEG_CGC_DYN_CLOCK_MODE: u32 = 1; // linux: JPEG_CGC_CTRL__DYN_CLOCK_MODE_MASK
+                                                // linux: JPEG_CGC_GATE__JPEG_DEC_MASK | JPEG_CGC_GATE__JPEG2_DEC_MASK | JPEG_CGC_GATE__JPEG_ENC_MASK | JPEG_CGC_GATE__JMCIF_MASK | JPEG_CGC_GATE__JRBBM_MASK
     pub const JPEG_CGC_GATE_ALL: u32 = 0x1f;
     /// JPEG_DEC | JPEG2_DEC | JMCIF | JRBBM mode bits.
     // linux: JPEG_CGC_CTRL__JPEG_DEC_MODE_MASK | JPEG_CGC_CTRL__JPEG2_DEC_MODE_MASK | JPEG_CGC_CTRL__JMCIF_MODE_MASK | JPEG_CGC_CTRL__JRBBM_MODE_MASK
@@ -850,6 +854,43 @@ impl StaticPg {
     }
 }
 
+/// Linux's `AMD_CG_SUPPORT_VCN_MGCG` and `AMD_CG_SUPPORT_JPEG_MGCG`: whether
+/// the starts and stops put the media clocks in dynamic mode
+/// (`DYN_CLOCK_MODE` in UVD_CGC_CTRL and JPEG_CGC_CTRL). Linux's late init
+/// skips VCN and JPEG (`amdgpu_device_set_cg_state`), so these steps are
+/// all the media clock gating there is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mgcg {
+    pub vcn: bool,
+    pub jpeg: bool,
+}
+impl Mgcg {
+    /// The discrete owners' fixed policy: both set, as Navy Flounder's
+    /// flags carry them.
+    pub(crate) const NAVI22: Self = Self {
+        vcn: true,
+        jpeg: true,
+    };
+    /// Linux's `cg_flags` (Raphael's, under `amdgpu.cg_mask`).
+    pub(crate) fn linux(cg_flags: u64) -> Self {
+        use crate::amdgpu_navi22_gating::cg;
+        Self {
+            vcn: cg_flags & cg::VCN_MGCG != 0,
+            jpeg: cg_flags & cg::JPEG_MGCG != 0,
+        }
+    }
+}
+/// UVD_CGC_CTRL's DYN_CLOCK_MODE, CLK_GATE_DLY_TIMER and CLK_OFF_DELAY as
+/// `vcn_v3_0_{disable,enable}_clock_gating` and `_clock_gating_dpg_mode`
+/// set them: DYN_CLOCK_MODE only with `AMD_CG_SUPPORT_VCN_MGCG`.
+const fn cgc_ctrl(mgcg: bool) -> u32 {
+    if mgcg {
+        CGC_CTRL_DYN
+    } else {
+        CGC_CTRL_DYN & !CGC_DYN_CLOCK_MODE
+    }
+}
+
 /// `amdgpu_vcn_psp_update_sram`: PSP writes one instance's DPG register
 /// list (offset/value pairs) into that instance's DPG SRAM.
 pub(crate) trait SramLoader {
@@ -911,6 +952,7 @@ pub(crate) fn dpg_list(
     i: usize,
     base: u64,
     gb_addr_config: u32,
+    mgcg: bool,
 ) -> alloc::vec::Vec<u32> {
     let mut l = DpgList {
         words: alloc::vec::Vec::with_capacity(DPG_SRAM_DW),
@@ -918,7 +960,7 @@ pub(crate) fn dpg_list(
         instance: i,
     };
     // vcn_v3_0_clock_gating_dpg_mode(sram_sel 0)
-    l.write(CGC_CTRL, CGC_CTRL_DYN);
+    l.write(CGC_CTRL, cgc_ctrl(mgcg));
     l.write(CGC_GATE, 0);
     l.write(SUVD_CGC_GATE, 1);
     l.write(SUVD_CGC_CTRL, 0);
@@ -1223,6 +1265,8 @@ pub(crate) struct Engine<I: Io> {
     pub mode: StartMode,
     /// The static power gating ([`StaticPg`]).
     pub pg: StaticPg,
+    /// The media clock gating ([`Mgcg`]).
+    pub cg: Mgcg,
     /// DPG instances paused for encode (`pause_state.fw_based`).
     pub paused: [bool; 2],
     pub state: State,
@@ -1605,6 +1649,7 @@ impl<I: Io> Engine<I> {
         } else {
             (PGFSM_ALL_ON, 0, 0)
         };
+        let mgcg = self.cg.vcn;
         self.hw.access(|io, l| {
             // UVD_STATUS belongs to the gated domain. Like vcn_v3_0_start,
             // power the tiles first; GC and NBIO liveness were checked before
@@ -1620,9 +1665,13 @@ impl<I: Io> Engine<I> {
             update(io, r(l, POWER_STATUS), POWER_STATUS_CLEAR, power)?;
             // set VCN status busy
             update(io, r(l, STATUS), STATUS_UVD_BUSY, STATUS_UVD_BUSY)?;
-            // vcn_v3_0_disable_clock_gating with AMD_CG_SUPPORT_VCN_MGCG
+            // vcn_v3_0_disable_clock_gating: DYN_CLOCK_MODE set with
+            // AMD_CG_SUPPORT_VCN_MGCG, cleared without it.
             let ctrl = checked(io.read(r(l, CGC_CTRL)))?;
-            io.write(r(l, CGC_CTRL), ctrl | CGC_CTRL_DYN);
+            io.write(
+                r(l, CGC_CTRL),
+                (ctrl & !CGC_DYN_CLOCK_MODE) | cgc_ctrl(mgcg),
+            );
             update(io, r(l, CGC_GATE), CGC_GATE_ALL, 0)?;
             Ok(())
         })?;
@@ -1768,7 +1817,7 @@ impl<I: Io> Engine<I> {
             io.write(r(l, POWER_STATUS), power | POWER_PG_MODE | POWER_PG_EN);
             Ok(())
         })?;
-        let list = dpg_list(self.hw.layout, i, base, gb_addr_config);
+        let list = dpg_list(self.hw.layout, i, base, gb_addr_config, self.cg.vcn);
         if list.len() > DPG_SRAM_DW {
             return Err(Error::Invalid);
         }
@@ -2320,7 +2369,7 @@ impl<I: Io> Engine<I> {
             return Ok(());
         }
         let instances: alloc::vec::Vec<usize> = self.active().collect();
-        let vcn_pg = self.pg.vcn;
+        let (vcn_pg, mgcg) = (self.pg.vcn, self.cg.vcn);
         for i in instances {
             if self.mode == StartMode::Dpg {
                 self.stop_dpg(i).await?;
@@ -2353,9 +2402,11 @@ impl<I: Io> Engine<I> {
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
                 io.write(r(STATUS), 0);
-                // vcn_v3_0_enable_clock_gating
+                // vcn_v3_0_enable_clock_gating. Without
+                // AMD_CG_SUPPORT_VCN_MGCG it ORs in 0: DYN_CLOCK_MODE stays
+                // as read.
                 let ctrl = checked(io.read(r(CGC_CTRL)))?;
-                io.write(r(CGC_CTRL), ctrl | CGC_CTRL_DYN);
+                io.write(r(CGC_CTRL), ctrl | cgc_ctrl(mgcg));
                 update(io, r(CGC_CTRL), CGC_CTRL_MODES, CGC_CTRL_MODES)?;
                 update(
                     io,
@@ -2408,7 +2459,7 @@ impl<I: Io> Engine<I> {
         let jpeg = self.jpeg.as_mut().ok_or(Error::Invalid)?;
         let (map, address) = (jpeg.memory.mapping(), jpeg.memory.address());
         let r = |l: Layout, reg: Reg| l.reg(0, reg);
-        let (nbio_v7_2, power_on) = (self.nbio_v7_2, self.pg.jpeg_on);
+        let (nbio_v7_2, power_on, mgcg) = (self.nbio_v7_2, self.pg.jpeg_on, self.cg.jpeg);
         let present = self.hw.access(|io, l| {
             if l.jpeg_reads_harvesting() {
                 let harvest = checked(io.read(r(l, CC_UVD_HARVESTING)))?;
@@ -2448,9 +2499,17 @@ impl<I: Io> Engine<I> {
             // anti-hang off, static PG mode
             update(io, r(l, JPEG_POWER_STATUS), JPEG_POWER_STATUS_MASK, 0)?;
             update(io, r(l, JPEG_POWER_STATUS), JPEG_PG_MODE, 0)?;
-            // jpeg_v3_0_disable_clock_gating with AMD_CG_SUPPORT_JPEG_MGCG
+            // jpeg_v3_0_disable_clock_gating: DYN_CLOCK_MODE set with
+            // AMD_CG_SUPPORT_JPEG_MGCG. Without it Linux clears
+            // `~JPEG_CGC_CTRL__DYN_CLOCK_MODE__SHIFT`, which is `~0`, so
+            // DYN_CLOCK_MODE stays as read; this follows it.
             let ctrl = checked(io.read(r(l, JPEG_CGC_CTRL)))?;
-            io.write(r(l, JPEG_CGC_CTRL), ctrl | JPEG_CGC_CTRL_DYN);
+            let set = if mgcg {
+                JPEG_CGC_CTRL_DYN
+            } else {
+                JPEG_CGC_CTRL_DYN & !JPEG_CGC_DYN_CLOCK_MODE
+            };
+            io.write(r(l, JPEG_CGC_CTRL), ctrl | set);
             update(io, r(l, JPEG_CGC_GATE), JPEG_CGC_GATE_ALL, 0)?;
             update(io, r(l, JPEG_CGC_CTRL), JPEG_CGC_CTRL_MODES, 0)?;
             let gb = checked(io.read(l.gc + u64::from(GB_ADDR_CONFIG) * 4))?;
@@ -2614,7 +2673,7 @@ impl Media {
             firmware_bytes,
             layout,
             None,
-            (mode, StaticPg::NAVI22),
+            (mode, StaticPg::NAVI22, Mgcg::NAVI22),
         )
     }
     /// Reserve Raphael's one VCN 3.1.2 instance and its JPEG: the same
@@ -2623,7 +2682,8 @@ impl Media {
     /// have powered VCN and JPEG up (`PowerUpVcn`/`PowerUpJpeg`) before
     /// `start`. `pg_flags` (Linux's, under `amdgpu.pg_mask`) choose the
     /// start ([`StartMode::linux`]) and the static power gating
-    /// ([`StaticPg::linux`]).
+    /// ([`StaticPg::linux`]); `cg_flags` (under `amdgpu.cg_mask`) the
+    /// media clock gating ([`Mgcg::linux`]).
     ///
     /// # Safety
     /// As `new`, for Raphael.
@@ -2634,6 +2694,7 @@ impl Media {
         doorbells: crate::amdgpu_cp_navi22::Doorbells,
         firmware_bytes: usize,
         pg_flags: u32,
+        cg_flags: u64,
     ) -> Result<Self, Error> {
         let (layout, nbio) = Layout::resolve_raphael(gpu, 1)?;
         Self::with_layout(
@@ -2645,7 +2706,11 @@ impl Media {
             firmware_bytes,
             layout,
             Some(nbio),
-            (StartMode::linux(pg_flags), StaticPg::linux(pg_flags)),
+            (
+                StartMode::linux(pg_flags),
+                StaticPg::linux(pg_flags),
+                Mgcg::linux(cg_flags),
+            ),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -2658,7 +2723,7 @@ impl Media {
         firmware_bytes: usize,
         layout: Layout,
         nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
-        (mode, pg): (StartMode, StaticPg),
+        (mode, pg, cg): (StartMode, StaticPg, Mgcg),
     ) -> Result<Self, Error> {
         let firmware_bytes = u32::try_from(firmware_bytes).map_err(|_| Error::Invalid)?;
         if firmware_bytes == 0 || firmware_bytes > 4 << 20 {
@@ -2706,6 +2771,7 @@ impl Media {
                 timing: LINUX_TIMING,
                 mode,
                 pg,
+                cg,
                 paused: [false; 2],
                 state: State::Prepared,
                 proof: Proof {

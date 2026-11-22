@@ -569,9 +569,17 @@ since the submitter is replaced. Raphael's port:
     - SDMA: `sdma_v5_2` over its one instance. With no SDMA_MGCG the
       clocks stay forced on, and SDMA_LS sets the memory power override.
     - VCN and JPEG: the media owner programs their gating in its start and
-      stop (`vcn_v3_0_clock_gating_dpg_mode`, `vcn_v3_0_enable_clock_gating`,
-      JPEG's pair). Linux's late-init `vcn_v3_0_set_clockgating_state(GATE)`
-      is not repeated here.
+      stop (`vcn_v3_0_clock_gating_dpg_mode`, `vcn_v3_0_{disable,enable}_clock_gating`,
+      JPEG's pair). Linux's late init skips both blocks
+      (`amdgpu_device_set_cg_state` excludes VCN and JPEG), so nothing else
+      gates them. VCN_MGCG and JPEG_MGCG decide only DYN_CLOCK_MODE (the
+      owner's `Mgcg`). Without VCN_MGCG:
+      - the static start clears DYN_CLOCK_MODE;
+      - the DPG register list writes it clear;
+      - the static stop leaves it as read (Linux ORs in 0).
+      Without JPEG_MGCG the JPEG start leaves it as read too. Linux's clear
+      there masks with `~JPEG_CGC_CTRL__DYN_CLOCK_MODE__SHIFT`, and that
+      shift is 0, so the clear does nothing. This port follows Linux.
     `amdgpu.cg_mask` (Linux's knob) masks the flags. Clock gating runs with
     GFX powered: at GATE before GFXOFF is allowed, at UNGATE after it is
     disallowed. A re-arm returns the owner to Idle, since the reset left

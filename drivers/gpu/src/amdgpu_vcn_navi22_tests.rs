@@ -607,6 +607,7 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
             timing: FAST,
             mode: StartMode::Static,
             pg: StaticPg::NAVI22,
+            cg: Mgcg::NAVI22,
             paused: [false; 2],
             state: State::Prepared,
             proof: Proof {
@@ -2269,6 +2270,80 @@ fn raphael_media_follows_pg_mask() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/vcn-raphael", raphael_media_follows_pg_mask);
+
+/// Raphael's media clock gating under `amdgpu.cg_mask`. nv.c's GC 10.3.6
+/// `cg_flags` carry VCN_MGCG and JPEG_MGCG. Without VCN_MGCG:
+/// - the static start clears UVD_CGC_CTRL's DYN_CLOCK_MODE;
+/// - the static stop leaves it as read (`vcn_v3_0_enable_clock_gating`
+///   ORs in 0);
+/// - the DPG register list writes it clear.
+///
+/// Without JPEG_MGCG the JPEG start leaves JPEG_CGC_CTRL's DYN_CLOCK_MODE
+/// as read: Linux's clear masks with the field's shift, which is 0.
+fn raphael_media_clock_gating_follows_cg_mask() -> TestResult {
+    use crate::amdgpu_navi22_gating::{cg, RAPHAEL_CG};
+    let off = Mgcg {
+        vcn: false,
+        jpeg: false,
+    };
+    if Mgcg::linux(RAPHAEL_CG) != Mgcg::NAVI22
+        || Mgcg::linux(RAPHAEL_CG & !cg::VCN_MGCG)
+            != (Mgcg {
+                vcn: false,
+                ..Mgcg::NAVI22
+            })
+        || Mgcg::linux(RAPHAEL_CG & !cg::JPEG_MGCG)
+            != (Mgcg {
+                jpeg: false,
+                ..Mgcg::NAVI22
+            })
+        || Mgcg::linux(RAPHAEL_CG & u64::from(0u32)) != off
+    {
+        return TestResult::Fail("cg_flags to the media owner's clock gating");
+    }
+    let mut model = Model::new();
+    model
+        .regs
+        .insert(v(0, CGC_CTRL), 0x1fc0_0000 | CGC_DYN_CLOCK_MODE);
+    model
+        .regs
+        .insert(v(0, JPEG_CGC_CTRL), JPEG_CGC_DYN_CLOCK_MODE);
+    let (_pool, mut e) = engine(model, 1);
+    e.cg = off;
+    if run(e.start(firmware(1), None, &mut NoSram)).is_err()
+        || run(e.start_jpeg()).is_err()
+        || run(e.test_ib()).is_err()
+        || e.hw.io.reg(v(0, CGC_CTRL)) != CGC_CTRL_DYN & !CGC_DYN_CLOCK_MODE
+        || e.hw.io.reg(v(0, JPEG_CGC_CTRL)) != JPEG_CGC_CTRL_DYN
+    {
+        return TestResult::Fail("static and JPEG starts without MGCG");
+    }
+    let dyn_set = e.hw.io.reg(v(0, CGC_CTRL)) | CGC_DYN_CLOCK_MODE;
+    e.hw.io.regs.insert(v(0, CGC_CTRL), dyn_set);
+    if run(e.stop()).is_err() || e.hw.io.reg(v(0, CGC_CTRL)) != CGC_CTRL_DYN | CGC_CTRL_MODES {
+        return TestResult::Fail("the static stop without VCN_MGCG cleared DYN_CLOCK_MODE");
+    }
+    let list = |mgcg| dpg_list(layout(1), 0, 0x8_0000_0000, GB_ADDR, mgcg);
+    let (on, without) = (list(true), list(false));
+    if on[..2] != [0x0a, CGC_CTRL_DYN]
+        || without[..2] != [0x0a, CGC_CTRL_DYN & !CGC_DYN_CLOCK_MODE]
+        || on[2..] != without[2..]
+    {
+        return TestResult::Fail("DPG clock gating without VCN_MGCG");
+    }
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    e.cg = off;
+    if run(e.start(firmware(1), None, &mut psp)).is_err()
+        || e.hw.io.sram.borrow()[&0][..2] != without[..2]
+    {
+        return TestResult::Fail("the DPG start ignored the owner's clock gating");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-raphael",
+    raphael_media_clock_gating_follows_cg_mask
+);
 
 /// A media ring's VM flush names its hub's registers: on MMHUB 2.0/2.1
 /// (Navi22) CONTEXT0 PTB 0x72b and ENG0 SEM/REQ/ACK 0x6d1/0x6e3/0x6f5 with

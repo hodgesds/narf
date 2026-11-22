@@ -162,9 +162,11 @@ pub struct ColdBoot {
     /// Clock gating (`amdgpu_device_set_cg_state`); `None` if its banks did
     /// not resolve, and the clocks then stay ungated.
     gating: Option<gating::Gating>,
-    /// `adev->pg_flags`: [`gating::RAPHAEL_PG`] under `amdgpu.pg_mask`
-    /// (`amdgpu_device_ip_early_init`).
+    /// `adev->pg_flags` and `cg_flags`: [`gating::RAPHAEL_PG`] and
+    /// [`gating::RAPHAEL_CG`] under `amdgpu.pg_mask` and `amdgpu.cg_mask`
+    /// (`amdgpu_device_ip_early_init`). The media owner reads both.
     pg_flags: u32,
+    cg_flags: u64,
 }
 /// PMFW's GFXOFF messages and RLC's power gating, for `gfxoff`.
 struct GcPower<'a> {
@@ -223,6 +225,7 @@ impl ColdBoot {
                 .map_err(Error::Queues)?;
             let options = crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw());
             let pg_flags = gating::RAPHAEL_PG & options.pg_mask;
+            let cg_flags = gating::RAPHAEL_CG & u64::from(options.cg_mask);
             // This coordinator alone writes the gating registers; no access.
             let gating = match gating::Gating::new_raphael(&gpu, authority, options.cg_mask) {
                 Ok(gating) => Some(gating),
@@ -256,6 +259,7 @@ impl ColdBoot {
                 gfxoff: gfxoff::GfxOff::new(options.gfxoff, pg_flags & gating::pg::GFX_PG != 0),
                 gating,
                 pg_flags,
+                cg_flags,
             })
         }
     }
@@ -785,6 +789,7 @@ impl ColdBoot {
                         self.doorbells,
                         vcn_bytes,
                         self.pg_flags,
+                        self.cg_flags,
                     )
                 }
                 .map_err(Error::Media)?;

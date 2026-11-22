@@ -4543,6 +4543,10 @@ GC 10.3.6 flags. Its `pg_flags` decide three things:
 - the VCN and JPEG PGFSM steps of the static power gating
   (`amdgpu_vcn_navi22::StaticPg`; Navi22 keeps its fixed policy).
 
+Its `cg_flags` also reach the media owner: `VCN_MGCG` and `JPEG_MGCG`
+decide `DYN_CLOCK_MODE` in the VCN and JPEG starts and stops
+(`amdgpu_vcn_navi22::Mgcg`). The discrete owners keep both set.
+
 Clock/power capability flags come from each profile's Linux
 `nv_common_early_init` selection. Navi21/22/23 share the existing capability
 set; Navi24 omits JPEG CG/PG. Gating resolves exact PCI/GC/MP1/SDMA identity,
