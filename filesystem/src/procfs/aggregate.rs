@@ -39,9 +39,7 @@
 //!
 //! ## Deferred wiring notes
 //!
-//! Per-block-device I/O counters (reads/writes/sectors/latency in
-//! /proc/diskstats) are zeroed until the block layer exposes per-device
-//! counters.  Most /proc/vmstat counters are also zeroed today — wiring
+//! Most /proc/vmstat counters are zeroed today — wiring
 //! them requires adding tracking atomics throughout the MM subsystem.
 //!
 //! /proc/modules is an empty body until Wave-21 (LKM agent) registers its
@@ -178,25 +176,38 @@ fn gen_sysvipc_shm() -> Vec<u8> {
 // ── /proc/diskstats ──────────────────────────────────────────────────
 //
 // Linux: block/genhd.c diskstats_show
-// Format (Linux kernel 4.18+ with 18 fields):
-//   major minor name reads_completed reads_merged sectors_read_ms
-//   read_ms writes_completed writes_merged sectors_written write_ms
-//   ios_in_progress total_io_ms weighted_io_ms
-//   [discards_completed discards_merged sectors_discarded discard_ms]
-//
-// NARF block layer tracks no I/O counters today. All counters are zero.
-// DEFERRED: wire per-device counters in narf-block registry.
+// The same 17 fields follow the dev_t and name here and stand alone in sysfs.
+pub(crate) fn disk_stat_line(stats: &narf_block::stats::DiskStats, partition: bool) -> String {
+    let mut fields = stats.linux_fields();
+    if partition {
+        // Linux reports flushes on the whole disk only.
+        fields[15..].fill(0);
+    }
+    let mut line = String::new();
+    for (index, value) in fields.iter().enumerate() {
+        if index != 0 {
+            line.push(' ');
+        }
+        let _ = write!(line, "{value}");
+    }
+    line.push('\n');
+    line
+}
 
 fn gen_diskstats() -> Vec<u8> {
     let mut s = String::new();
-    for (i, dev) in narf_block::block_devices().iter().enumerate() {
-        let major = 8u32; // sda-style SCSI/NVMe placeholder major
-        let minor = (i * 16) as u32;
-        let _ = writeln!(
+    for (minor, dev) in narf_block::block_devices().iter().enumerate() {
+        let _ = write!(
             s,
-            "{:4} {:7} {:<20} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
-            major, minor, dev.name,
+            "{:4} {:7} {} ",
+            crate::devfs_block::BLOCK_EXT_MAJOR,
+            minor,
+            dev.name
         );
+        s.push_str(&disk_stat_line(
+            &dev.stats,
+            dev.partno.is_some() || dev.partition.is_some(),
+        ));
     }
     s.into_bytes()
 }
@@ -1450,52 +1461,83 @@ fn read_registered(path: &[&str]) -> Option<Vec<u8>> {
     }
 }
 
-/// /proc/diskstats: one line per registered block device.
+/// Exercise the same sector fields and device ordering htop reads. Both raw
+/// and guarded partition backing must contribute exactly once to the disk.
 fn smoke_diskstats_one_line_per_device() -> TestResult {
     use narf_block::registry::{__reset_for_test, __restore_for_test, __snapshot_for_test};
-    let saved = __snapshot_for_test();
-    __reset_for_test();
-    // Register two synthetic devices.
-    use alloc::sync::Arc;
-    use narf_block::registry::{register_block_device, BlockDeviceSync, BlockIoError};
-    struct NullDev;
-    impl BlockDeviceSync for NullDev {
+    use narf_block::{register_block_device, BlockDeviceSync, BlockIoError};
+    struct MbrDisk;
+    impl BlockDeviceSync for MbrDisk {
         fn lba_size(&self) -> u32 {
-            512
+            4096
         }
         fn capacity(&self) -> u64 {
-            2048
+            128
         }
-        fn read(&self, _: u64, _: u16, _: &mut [u8]) -> Result<(), BlockIoError> {
+        fn read(&self, lba: u64, _: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
+            out.fill(0);
+            if lba == 0 {
+                out[510..512].copy_from_slice(&[0x55, 0xaa]);
+                out[450] = 0x83;
+                out[454..458].copy_from_slice(&1u32.to_le_bytes());
+                out[458..462].copy_from_slice(&64u32.to_le_bytes());
+            }
             Ok(())
         }
         fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> {
             Ok(())
         }
     }
-    register_block_device("smoke0", Arc::new(NullDev));
-    register_block_device("smoke1", Arc::new(NullDev));
-    register_all();
-    let body = match read_registered(&["diskstats"]) {
-        Some(b) => b,
-        None => {
-            __restore_for_test(saved);
-            return TestResult::Fail("diskstats not registered");
+    let saved = __snapshot_for_test();
+    __reset_for_test();
+    let test = (|| {
+        for guarded in [false, true] {
+            let raw: Arc<dyn BlockDeviceSync> = Arc::new(MbrDisk);
+            register_block_device("statsdisk", raw.clone());
+            let backing = if guarded {
+                narf_block::find_block_device("statsdisk").ok_or("missing disk")?
+            } else {
+                raw
+            };
+            narf_block::partition::scan_and_register_partitions(backing, "statsdisk")
+                .map_err(|_| "MBR scan failed")?;
+            let devs = narf_block::block_devices();
+            let disk = &devs[0];
+            let part = devs.get(1).ok_or("missing partition")?;
+            let before = disk.stats.linux_fields();
+            let mut buf = alloc::vec![0; 8192];
+            part.dev
+                .read(1, 2, &mut buf)
+                .map_err(|_| "partition read failed")?;
+            if part.dev.read(64, 2, &mut buf).is_ok() {
+                return Err("out-of-range request succeeded");
+            }
+            let fields = disk.stats.linux_fields();
+            if fields[0] != before[0] + 1 || fields[2] != before[2] + 16 {
+                return Err("whole-disk rollup must count the successful partition read once");
+            }
+            register_all();
+            let body = read_registered(&["diskstats"]).ok_or("missing diskstats")?;
+            let text = core::str::from_utf8(&body).map_err(|_| "invalid diskstats")?;
+            let line: Vec<_> = text
+                .lines()
+                .nth(1)
+                .ok_or("missing partition row")?
+                .split_whitespace()
+                .collect();
+            if line.len() != 20
+                || line[..6] != ["259", "1", "statsdiskp1", "1", "0", "16"]
+                || line[11] != "0"
+            {
+                return Err("partition dev_t, successful reads, sector units or in-flight count");
+            }
         }
-    };
-    let text = match String::from_utf8(body) {
-        Ok(t) => t,
-        Err(_) => {
-            __restore_for_test(saved);
-            return TestResult::Fail("diskstats not utf-8");
-        }
-    };
-    let line_count = text.lines().count();
+        Ok(())
+    })();
     __restore_for_test(saved);
-    if line_count >= 2 {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("diskstats: expected ≥2 lines for 2 devices")
+    match test {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
     }
 }
 kernel_test_in!(

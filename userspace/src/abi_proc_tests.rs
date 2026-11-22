@@ -10,6 +10,82 @@
 
 use crate::abi_test_support::*;
 
+// A block request bypasses the VFS character counters. Exercise the
+// production submitter lookup and both raw and guarded partition windows.
+fn smoke_process_storage_io() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_block::{BlockDeviceSync, BlockIoError};
+    struct Disk;
+    impl BlockDeviceSync for Disk {
+        fn capacity(&self) -> u64 {
+            16
+        }
+        fn lba_size(&self) -> u32 {
+            4096
+        }
+        fn read(&self, _: u64, _: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
+            out.fill(0);
+            Ok(())
+        }
+        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> {
+            Ok(())
+        }
+    }
+
+    with_setup(|| {
+        let raw: Arc<dyn BlockDeviceSync> = Arc::new(Disk);
+        narf_block::register_block_device("task-io-test", raw.clone());
+        narf_block::disk_policy::__set_policy_for_test(Some(
+            narf_block::disk_policy::DiskPolicy::All,
+        ));
+        let result = (|| {
+            let mut buf = alloc::vec![0; 8192];
+            let disk = narf_block::find_block_device("task-io-test").ok_or("missing disk")?;
+            for registered in [true, false] {
+                if !registered {
+                    narf_block::unregister_block_device("task-io-test");
+                }
+                for backing in [raw.clone(), disk.clone()] {
+                    let before = crate::handlers::io_accounting_for_pid(FAKE_TASK);
+                    narf_block::register_partition_device(
+                        "task-io-testp1",
+                        "task-io-test",
+                        Arc::new(narf_block::partition::PartitionBlockDevice::new(
+                            backing, 1, 8,
+                        )),
+                        None,
+                    );
+                    let part = narf_block::find_block_device("task-io-testp1")
+                        .ok_or("missing partition")?;
+                    part.read(0, 2, &mut buf)
+                        .map_err(|_| "storage read failed")?;
+                    part.write(0, 1, &buf[..4096])
+                        .map_err(|_| "storage write failed")?;
+                    if part.write(8, 1, &buf[..4096]).is_ok() {
+                        return Err("partition overrun succeeded");
+                    }
+                    let after = crate::handlers::io_accounting_for_pid(FAKE_TASK);
+                    if after.read_bytes != before.read_bytes + 8192
+                        || after.write_bytes != before.write_bytes + 4096
+                        || after.rchar != before.rchar
+                        || after.wchar != before.wchar
+                    {
+                        return Err(
+                            "one completed storage transfer per process, independent of character I/O",
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        narf_block::disk_policy::__set_policy_for_test(None);
+        narf_block::unregister_block_device("task-io-testp1");
+        narf_block::unregister_block_device("task-io-test");
+        result
+    })
+}
+kernel_test_in!("userspace/io_accounting", smoke_process_storage_io);
+
 // ── getppid(2) — infallible, returns parent visible pid (0 if none) ──
 
 fn smoke_abi_proc_getppid_pos() -> TestResult {

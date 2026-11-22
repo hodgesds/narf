@@ -136,6 +136,21 @@ async fn worker(cpu: usize) {
     }
 }
 
+// Register once on the BSP, so creating the shared CPU hierarchy cannot
+// race another telemetry worker. The read itself is local cache access.
+fn install_sysfs_reader(
+    cpu_dir: &alloc::sync::Arc<narf_filesystem::sysfs::Kobject>,
+    cpu: u32,
+    measure: fn(u32) -> Option<u64>,
+) {
+    use narf_filesystem::sysfs::{get_or_create_child, kobject_add_attr};
+    let device = get_or_create_child(cpu_dir, &alloc::format!("cpu{cpu}"));
+    let policy = get_or_create_child(&device, "cpufreq");
+    kobject_add_attr(&policy, "scaling_cur_freq", move || {
+        measure(cpu).map_or_else(alloc::string::String::new, |khz| alloc::format!("{khz}\n"))
+    });
+}
+
 /// Install the proc reader and start read-only telemetry independently of
 /// whether a writable HWP/CPPC governor backend was admitted.
 pub fn start() {
@@ -144,9 +159,18 @@ pub fn start() {
         return;
     }
     narf_filesystem::procfs::record_current_cpu_info();
+    let cpu_dir = supported().then(|| {
+        use narf_filesystem::sysfs::{get_or_create_child, get_root};
+        let devices = get_or_create_child(&get_root(), "devices");
+        let system = get_or_create_child(&devices, "system");
+        get_or_create_child(&system, "cpu")
+    });
     for cpu in 0..narf_lib::percpu::MAX_CPUS {
         if !narf_lib::smp::is_online(cpu as u32) {
             continue;
+        }
+        if let Some(dir) = &cpu_dir {
+            install_sysfs_reader(dir, cpu as u32, current_khz);
         }
         let mut spec = narf_scheduler::TaskSpec::unthrottled();
         spec.affinity =
@@ -159,6 +183,25 @@ pub fn start() {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_scaling_cur_freq_exposes_measured_khz() -> TestResult {
+        let root = narf_filesystem::sysfs::Kobject::new_root("cpu");
+        for cpu in [0, 1] {
+            install_sysfs_reader(&root, cpu, |id| (id == 1).then_some(2_345_678));
+            let value = root
+                .get_child(&alloc::format!("cpu{cpu}"))
+                .and_then(|dev| dev.get_child("cpufreq"))
+                .and_then(|policy| policy.attr_show("scaling_cur_freq"));
+            if value.as_deref() != Some(if cpu == 1 { "2345678\n" } else { "" }) {
+                return TestResult::Fail("scaling_cur_freq must use this CPU's fresh kHz sample");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "power/frequency",
+        smoke_scaling_cur_freq_exposes_measured_khz
+    );
 
     fn smoke_frequency_uses_busy_counter_deltas() -> TestResult {
         let previous = Counters {

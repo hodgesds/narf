@@ -1880,13 +1880,23 @@ teardown removes these links and the canonical card subtree; `Kobject::remove_sy
 supports discovery-link removal alongside `remove_child`.
 Block devices have canonical kobjects at
 `/sys/devices/virtual/block/<name>`; `/sys/class/block` and `/sys/block` are
-discovery views. Block `add` uevents and `/sys/dev/block/<major>:<minor>`
+discovery views. Each view provides a Linux `stat` file with the same 17
+counters as `/proc/diskstats`, including 512-byte sectors and milliseconds
+spent doing I/O. Device numbers match devfs, numbered partitions expose
+`partition`, and whole disks report flush completions. Block `add` uevents and `/sys/dev/block/<major>:<minor>`
 links name the canonical device kobject, so systemd-udevd can construct an
 `sd_device`, apply filesystem-identification rules, and satisfy fstab UUID
 mount dependencies. Partition events with a discovered filesystem UUID carry
 both the existing `DEVLINKS=/dev/disk/by-uuid/<uuid>` path and the matching
 `SYSTEMD_ALIAS`; systemd device units are driven by the udev database rather
 than by probing whether the devfs symlink resolves.
+The task layer supplies `procfs::ProcessIo` for `/proc/<pid>/io`. Read and
+write syscall counts include completed errors. Storage bytes count successful
+block transfers issued on behalf of the process, including its threads.
+Cached reads and memory files do not issue disk transfers. Kernel-originated
+background I/O appears in disk totals, and `cancelled_write_bytes` is zero
+until dirty-page cancellation is tracked.
+
 Network devices have canonical kobjects below `/sys/devices`: a PCI-backed
 interface lives at `/sys/devices/pci<segment>:<bus>/<BDF>/net/<dev>`, with
 matching PCI identity, driver, and `/sys/bus/pci/devices` links, while only a

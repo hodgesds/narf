@@ -109,6 +109,7 @@ pub struct Task {
     /// The thread group's CPU time (`signal_struct`): live members, released
     /// threads and reaped children. Shared by every `CLONE_THREAD` sibling.
     pub(crate) process_cputime: Arc<crate::proc_cpu_time::ProcessCputime>,
+    pub(crate) storage_io: Arc<narf_block::stats::ProcessStorageIo>,
     /// Run slices this task has completed — Linux's third
     /// `/proc/<pid>/schedstat` field (`se.statistics` "timeslices"), folded
     /// at the slice boundary of the legacy (non-own-stack) user path.
@@ -235,10 +236,10 @@ impl Task {
         // first image) starts a group.
         let cputime = narf_scheduler::user_task_cputime(narf_scheduler::TaskId(tid))
             .unwrap_or_else(|| Arc::new(narf_scheduler::TaskCputime::new()));
-        let process_cputime = crate::handlers::pid_to_task_raw(pid)
+        let (process_cputime, storage_io) = crate::handlers::pid_to_task_raw(pid)
             .filter(|&leader| leader != tid)
             .and_then(task_get)
-            .map(|leader| leader.process_cputime.clone())
+            .map(|leader| (leader.process_cputime.clone(), leader.storage_io.clone()))
             .unwrap_or_default();
         process_cputime.join(&cputime);
         #[cfg(feature = "native-ring")]
@@ -264,6 +265,7 @@ impl Task {
             exit_code: AtomicI32::new(0),
             cputime,
             process_cputime,
+            storage_io,
             timeslices: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),

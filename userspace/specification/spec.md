@@ -2569,6 +2569,13 @@ stime), CPU itimers, RLIMIT_CPU (thread-group total) and the perf task clock
 all read these. Off-CPU time of a parked or preempted task, interrupt time and
 idle are never charged.
 
+### 3.6 Process I/O accounting
+
+`handlers::io_accounting_for_pid` resolves the visible process to its registered
+task and provides `procfs::ProcessIo`. Both syscall dispatch paths contribute
+completed read/write-family calls. Block submission retains the issuing thread
+group's storage counters across asynchronous completion and process exit.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

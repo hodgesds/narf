@@ -289,8 +289,40 @@ pub fn start_workers() {
 }
 
 async fn worker(cpu: usize) {
-    if seed_current_cpu(cpu).is_err() {
+    use core::fmt::Write as _;
+    if let Err(err) = seed_current_cpu(cpu) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  cpufreq: cpu{cpu} {:?} init failed: {err:?}",
+            backend()
+        );
         return;
+    }
+    if backend() == Backend::IntelHwp {
+        // A successful WRMSR records intent. Read the hardware on its owning
+        // CPU once so a low measured rate can be compared to the actual window.
+        let (requested, observed) = {
+            let slots = PERCPU.lock();
+            (
+                slots[cpu].last_hwp_request,
+                rdmsr_or_gp(MSR_IA32_HWP_REQUEST),
+            )
+        };
+        match (requested, observed) {
+            (Some(requested), Ok(observed)) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  cpufreq: cpu{cpu} HWP requested={requested:#010x} readback={observed:#018x}"
+                );
+            }
+            (_, Err(err)) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  cpufreq: cpu{cpu} HWP request readback failed: {err:?}"
+                );
+            }
+            (None, Ok(_)) => {}
+        }
     }
     loop {
         // A deferrable timer, as the ondemand/conservative governors' `dbs`
