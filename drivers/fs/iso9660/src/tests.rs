@@ -284,6 +284,42 @@ fn build_iso9660_image() -> (Vec<u8>, &'static [u8]) {
     (img, payload)
 }
 
+/// `isofs_statfs`: the logical block is the block, the volume's zones are
+/// `f_blocks`, nothing is free and no inode count is known (`s_ninodes` is
+/// 0), and names are `NAME_MAX` long.
+fn smoke_iso9660_statfs_reports_the_volume() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Iso9660Volume;
+
+    let (img, _) = build_iso9660_image();
+    let device = RamBlockDevice::from_image(SECTOR_SIZE as u32, img);
+    let volume = match poll_once(Iso9660Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("Iso9660Volume::mount failed"),
+    };
+    let stat = match poll_once(volume.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("statfs failed"),
+    };
+    if stat.block_size != 2048 || stat.fragment_size != 2048 || stat.blocks != 24 {
+        return TestResult::Fail("statfs did not report the volume's 24 2048-byte blocks");
+    }
+    if stat.blocks_free != 0 || stat.blocks_available != 0 || stat.files != 0 {
+        return TestResult::Fail("statfs of a read-only ISO 9660 volume reported free space");
+    }
+    if stat.name_len != 255 {
+        return TestResult::Fail("statfs f_namelen is not NAME_MAX");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/iso9660/statfs",
+    smoke_iso9660_statfs_reports_the_volume
+);
+
 fn smoke_iso9660_mount_ramblock_round_trip() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::{FileType, FsInstance};
