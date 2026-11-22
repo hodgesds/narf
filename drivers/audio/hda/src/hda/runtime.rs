@@ -126,6 +126,9 @@ pub struct IntelHda {
     /// The codecs are in D3 while the controller stays up (the autosuspend
     /// of a controller without `runtime_pm`); a command resumes them first.
     codecs_suspended: AtomicBool,
+    /// Linux `codec->cvt_setups` with a stream assigned: the converters a
+    /// configure gave a stream tag and format, cleared at codec suspend.
+    cvt_setups: IrqSafeSpinLock<Vec<(u8, u8)>>,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -150,6 +153,11 @@ const PM_WAIT_MS: u64 = 1000;
 /// `CONFIG_SND_HDA_POWER_SAVE_DEFAULT` (10 s in the host's Linux config), set
 /// on each codec with `pm_runtime_set_autosuspend_delay`.
 const AUTOSUSPEND_MS: u64 = 10_000;
+/// How often the autosuspend service looks for a codec wake (STATESTS
+/// under WAKEEN) while the controller is parked. Linux takes the wake as a
+/// PCI PME; a NARF park keeps the function in D0 with the link in reset,
+/// where no interrupt can arrive, so the resume-well status is polled.
+const WAKE_POLL_MS: u64 = 100;
 /// `STATESTS_INT_MASK` (include/sound/hda_register.h): the codec wake bits
 /// for `HDA_MAX_CODECS` (8) codecs.
 const STATESTS_INT_MASK: u16 = 0xff;
@@ -410,6 +418,7 @@ impl IntelHda {
             long_name: IrqSafeSpinLock::new(alloc::string::String::new()),
             runtime_pm: AtomicBool::new(true),
             codecs_suspended: AtomicBool::new(false),
+            cvt_setups: IrqSafeSpinLock::new(Vec::new()),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -1656,6 +1665,9 @@ impl IntelHda {
     /// widget. On failure the codecs already switched are rolled
     /// back to D0, so a half-switched controller never escapes.
     fn set_codec_power(&self, d3: bool) -> Result<(), HdaError> {
+        if d3 {
+            self.cleanup_all_streams();
+        }
         let mut switched = Vec::new();
         for codec in &self.codecs {
             let Some(nid) = codec.afg_node_id else {
@@ -1688,13 +1700,13 @@ impl IntelHda {
     /// park). Idempotent: already-suspended is Ok. Refuses with
     /// Busy when any stream is running or prepared.
     fn quiesce(&self) -> Result<(), HdaError> {
-        self.quiesce_if(|| true)
+        self.quiesce_with(|| true, false)
     }
 
     /// [`Self::quiesce`] that also refuses while `idle` is false, checked
     /// again under the command lease right before the park (the autosuspend
     /// passes "no power reference held").
-    fn quiesce_if(&self, idle: impl Fn() -> bool) -> Result<(), HdaError> {
+    fn quiesce_with(&self, idle: impl Fn() -> bool, arm_wake: bool) -> Result<(), HdaError> {
         let _pm = self.lock_pm()?;
         if self.suspended.load(Ordering::Acquire) {
             return Ok(());
@@ -1722,6 +1734,17 @@ impl IntelHda {
         // reset acknowledges, and a half-parked controller must take the
         // full reinit on the next wake rather than be trusted.
         self.suspended.store(true, Ordering::Release);
+        if arm_wake {
+            // `azx_runtime_suspend`: WAKEEN for every codec slot, so a codec
+            // state change while parked sets STATESTS (resume well).
+            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+            unsafe {
+                self.bar0
+                    .write16(REG_WAKEEN, self.bar0.read16(REG_WAKEEN) | STATESTS_INT_MASK);
+                self.bar0
+                    .write16(REG_STATESTS, self.bar0.read16(REG_STATESTS));
+            }
+        }
         // SAFETY: Controller owns this live BAR; fixed register
         // offsets are inside the validated window. Mirrors Drop
         // minus ring handling: the rings stay owned for resume.
@@ -1860,6 +1883,17 @@ impl IntelHda {
         let _lease = self.acquire_command_blocking()?;
         // The codecs are already known; the wake does not re-probe them.
         reset_link(self.bar0)?;
+        // `azx_int_clear` clears STATESTS after the link reset, and
+        // `azx_runtime_resume` disarms the codec wake.
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        unsafe {
+            self.bar0
+                .write16(REG_STATESTS, self.bar0.read16(REG_STATESTS));
+            self.bar0.write16(
+                REG_WAKEEN,
+                self.bar0.read16(REG_WAKEEN) & !STATESTS_INT_MASK,
+            );
+        }
         // The shadow cursors restart with the ring pointers inside.
         self.init_cmd_io()?;
         // SAFETY: Controller owns this live BAR; fixed register
@@ -1911,6 +1945,36 @@ impl IntelHda {
             .store(narf_time::monotonic_ns(), Ordering::Release);
     }
 
+    /// Record a converter a configure gave a stream (Linux `hda_cvt_setup`).
+    pub(super) fn note_cvt_setup(&self, cad: u8, nid: u8) {
+        let mut setups = self.cvt_setups.lock();
+        if !setups.contains(&(cad, nid)) {
+            setups.push((cad, nid));
+        }
+    }
+
+    /// Linux `hda_cleanup_all_streams` at codec suspend: every converter
+    /// still assigned a stream gets SET_CHANNEL_STREAMID 0 and
+    /// SET_STREAM_FORMAT 0 (`really_cleanup_stream`). Best effort, as in
+    /// Linux: a failed write does not stop the suspend.
+    fn cleanup_all_streams(&self) {
+        let setups = core::mem::take(&mut *self.cvt_setups.lock());
+        for (cad, nid) in setups {
+            let _ = self.pm_verb(cad, nid, VERB_SET_CONVERTER_STREAM);
+            let _ = self.pm_verb(cad, nid, VERB_SET_CONVERTER_FORMAT);
+        }
+    }
+
+    /// Whether a codec signalled a state change the park armed a wake for
+    /// (STATESTS under WAKEEN, both in the resume well the link reset does
+    /// not clear).
+    fn codec_wake_pending(&self) -> bool {
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        let (status, wake) =
+            unsafe { (self.bar0.read16(REG_STATESTS), self.bar0.read16(REG_WAKEEN)) };
+        status != u16::MAX && status & wake & STATESTS_INT_MASK != 0
+    }
+
     /// Linux `snd_hda_power_up` (`pm_runtime_get_sync`): take a power
     /// reference, then wake the controller. A PCM open holds one until close
     /// (`azx_pcm_open` / `azx_pcm_close`).
@@ -1949,8 +2013,17 @@ impl IntelHda {
     /// `hda_codec_runtime_suspend` before `azx_runtime_suspend`. A park that
     /// cannot run now is retried a whole delay later.
     pub(super) fn autosuspend(&self) -> Autosuspend {
-        if self.suspended.load(Ordering::Acquire) || self.codecs_suspended.load(Ordering::Acquire) {
+        if self.suspended.load(Ordering::Acquire) {
+            // `azx_runtime_resume` on a codec wake: a state change while
+            // parked (a hotplug) wakes the controller and its codecs, which
+            // re-read their jacks; the delay then runs again.
+            if self.codec_wake_pending() && self.ensure_active().is_ok() {
+                return Autosuspend::Wait(self.autosuspend_ms.load(Ordering::Acquire));
+            }
             return Autosuspend::Parked;
+        }
+        if self.codecs_suspended.load(Ordering::Acquire) {
+            return Autosuspend::CodecsSuspended;
         }
         if self.power_refs.load(Ordering::Acquire) != 0 || !self.streams_idle() {
             return Autosuspend::Held;
@@ -1966,12 +2039,15 @@ impl IntelHda {
         // `azx_runtime_idle`: without AZX_DCAPS_PM_RUNTIME the controller
         // stays up and only the codecs suspend.
         let parked = if self.runtime_pm.load(Ordering::Acquire) {
-            self.quiesce_if(unheld)
+            // `azx_runtime_suspend` arms the codec wake first.
+            self.quiesce_with(unheld, true)
+                .map(|()| Autosuspend::Parked)
         } else {
             self.suspend_codecs_if(unheld)
+                .map(|()| Autosuspend::CodecsSuspended)
         };
         match parked {
-            Ok(()) => Autosuspend::Parked,
+            Ok(step) => step,
             Err(_) => {
                 self.mark_last_busy();
                 Autosuspend::Wait(delay)
@@ -1987,8 +2063,10 @@ pub(super) enum Autosuspend {
     Held,
     /// Idle, but not for the whole delay yet: look again in this many ms.
     Wait(u64),
-    /// Parked.
+    /// Parked (codecs D3, link in reset), watched for a codec wake.
     Parked,
+    /// Only the codecs are suspended; the controller stays up.
+    CodecsSuspended,
 }
 
 /// The controller's autosuspend timer (Linux runtime PM's autosuspend for
@@ -2007,7 +2085,11 @@ pub(super) async fn autosuspend_service(weak: alloc::sync::Weak<IntelHda>) {
             Autosuspend::Wait(ms) => {
                 narf_time::SleepUntil::new(Deadline::after_ms(ms.max(1)).as_instant()).await;
             }
-            Autosuspend::Held | Autosuspend::Parked => {
+            // A parked controller is watched for a codec wake.
+            Autosuspend::Parked => {
+                narf_time::SleepUntil::new(Deadline::after_ms(WAKE_POLL_MS).as_instant()).await;
+            }
+            Autosuspend::Held | Autosuspend::CodecsSuspended => {
                 if PmIdle(&weak).await.is_none() {
                     return;
                 }

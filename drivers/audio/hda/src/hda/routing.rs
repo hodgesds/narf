@@ -293,6 +293,8 @@ impl IntelHda {
             converter.nid,
             VERB_SET_CONVERTER_STREAM | if capture { 0x20 } else { 0x10 },
         )?;
+        // Linux `hda_cvt_setup`: remembered for the cleanup at codec suspend.
+        self.note_cvt_setup(cad, converter.nid);
         Ok(())
     }
     /// Linux atihdmi_init plus snd_hda_hdmi_generic_pcm_prepare and

@@ -327,7 +327,13 @@ the controller busy, and the autosuspend service (`autosuspend`) parks it
 (10 s, Linux `power_save`) with no reference and no running stream; a controller
 without Linux `AZX_DCAPS_PM_RUNTIME` (`ids::runtime_pm`; 1002:1640, the ICH
 parts, the older ATI HDMI functions) suspends only its codecs (D3) and stays
-up, and the next command or jack event resumes the codecs first. A stop
+up, and the next command or jack event resumes the codecs first. The autosuspend park arms
+WAKEEN for every codec slot (`azx_runtime_suspend`); while parked, the
+autosuspend service checks STATESTS under WAKEEN every 100 ms (the link is in
+reset with the function in D0, so no PME or interrupt can arrive) and a codec
+state change wakes the controller, which disarms WAKEEN and re-reads every jack.
+Before D3 every converter still assigned a stream is cleared
+(`hda_cleanup_all_streams`: stream id and format 0). A stop
 with the PCM still open does not park it. Polled jack detection marks it
 busy every 1.5 s and so keeps it up, as Linux jackpoll does. Park and wake
 serialise on a PM lock, the park runs
