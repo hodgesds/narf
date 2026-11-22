@@ -139,6 +139,10 @@ fn parse_for(platform: DmcPlatform, blob: &[u8]) -> Result<DmcFirmware<'_>, DmcE
         DmcPlatform::WildcatLake => parse_dmc_firmware_wildcat_lake(blob, b'*', b'*'),
         DmcPlatform::Xe3pLpd => parse_dmc_firmware_xe3p_lpd(blob, b'*', b'*'),
         DmcPlatform::Gen12 | DmcPlatform::Xelpdp => parse_dmc_firmware_xelpdp(blob, b'*', b'*'),
+        // The DC-states service never runs on display 11 (its
+        // platform is always display >= 14); the arm is here for
+        // exhaustiveness, and parses with the Gen11 rules.
+        DmcPlatform::Gen11 => crate::intel_gpu_dmc::parse_dmc_firmware_gen11(blob, b'*', b'*'),
     }
 }
 
@@ -150,6 +154,8 @@ fn firmware_path(platform: DmcPlatform) -> &'static str {
         DmcPlatform::WildcatLake => "i915/xe3lpd_3002_dmc.bin",
         DmcPlatform::Xe3pLpd => "i915/xe3p_lpd_dmc.bin",
         DmcPlatform::Gen12 | DmcPlatform::Xelpdp => MTL_DMC_FIRMWARE,
+        // See parse_for: the service never runs on display 11.
+        DmcPlatform::Gen11 => crate::intel_gpu_dmc::ICL_DMC_FIRMWARE,
     }
 }
 

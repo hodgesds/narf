@@ -46,9 +46,14 @@
 //!   (display 20 / display 30). Gen11 (Ice Lake / Elkhart Lake /
 //!   Jasper Lake) identifies and announces the same way — its
 //!   BAR0 partitioning and GuC firmware family are modelled, its
-//!   presence test is the pre-GMD config-space re-read — but
-//!   display and GT execution stay gated until the Gen11 lanes
-//!   land (PTE format, execlists, display clocks, modeset).
+//!   presence test is the pre-GMD config-space re-read — and
+//!   since Lane 5 its internal-panel modeset is admitted on the
+//!   shared probe path (display clocks, DPLL, watermarks, DDI
+//!   tables, first light on the internal display,
+//!   fixture-validated, silicon untested). External display and
+//!   backlight stay gated (Lane 8 owns external outputs), and
+//!   GT execution stays gated until the Gen11 lanes land
+//!   (PTE format, execlists, GuC load).
 
 #[path = "intel_gpu_external_stop.rs"]
 pub(crate) mod external_stop;
@@ -111,7 +116,11 @@ impl Generation {
     /// Whether this lane programs the display engine for the
     /// generation through the Gen12/Meteor Lake probe path.
     /// Gen12 (TGL/ADL/RPL) and Meteor Lake (Xe-LPG, #1016) have
-    /// validated register sequences on that path. Lunar Lake
+    /// validated register sequences on that path. Gen11 (Ice
+    /// Lake, Lane 5) joins them for the internal panel only:
+    /// its modeset (ICL CDCLK / DPLL / watermarks / DDI tables)
+    /// is fixture-validated and silicon untested, and external
+    /// display + backlight stay gated below. Lunar Lake
     /// (Xe2-LPD, display 20) and Panther Lake (Xe3-LPD, display
     /// 30) stay `false` here deliberately even though their
     /// display is driven: each has its own opted-in per-device
@@ -128,7 +137,10 @@ impl Generation {
     pub const fn display_supported(self) -> bool {
         matches!(
             self,
-            Generation::TigerLake | Generation::AlderLake | Generation::MeteorLake
+            Generation::TigerLake
+                | Generation::AlderLake
+                | Generation::MeteorLake
+                | Generation::IceLake
         )
     }
 
@@ -834,6 +846,30 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     }
 
+    // Gen11 DMC load (Lane 5): the same `intel_dmc_init` shape
+    // for `i915/icl_dmc_ver1_09.bin` — best-effort, non-fatal,
+    // and independent of the modeset (DMC gates DC5/DC6 entry,
+    // not first light). A missing or malformed blob only
+    // disables runtime PM; the load logs its own outcome and
+    // the probe continues to modeset either way.
+    if let Some(platform) = crate::intel_gpu_modeset::gen11_family_for_chip(dev.chip) {
+        let window = dev.mode_window();
+        let authority: Option<Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>> =
+            narf_firmware::trusted_loader_authority().and_then(|write| write.derive().ok());
+        match authority {
+            Some(authority) => {
+                let _ = crate::intel_gpu_gen11_dmc::load_for_display(&window, platform, &authority);
+            }
+            None => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu: no usable firmware registry authority; DMC not loaded, runtime power management disabled"
+                );
+            }
+        }
+    }
+
     let external_only =
         crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip).is_some_and(|family| {
             crate::intel_gpu_vbt::gen12_ddc_overrides().external_only_for(family)
@@ -1131,9 +1167,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // on and produced a real mode. Every failure path inside
     // leaves the panel running plain eDP. Display 14 PSR is not
     // the Gen12 register layout: it is enabled only by the KMS owner
-    // (`intel_gpu_psr`), never on the console.
+    // (`intel_gpu_psr`), never on the console. Gen11 PSR is
+    // excluded too (Lane 5): the display-11 PSR layout is
+    // unverified — `PsrLayout::from_generation` falls back to
+    // the TigerLake table for IceLake, and the stored layout is
+    // inert until a lane grounds the real one — so the panel
+    // runs plain eDP.
     if let Some(mode) = panel_mode.filter(|_| {
-        dev.chip.generation.display_supported() && dev.chip.generation != Generation::MeteorLake
+        dev.chip.generation.display_supported()
+            && dev.chip.generation != Generation::MeteorLake
+            && dev.chip.generation != Generation::IceLake
     }) {
         crate::intel_gpu_edp::enable_psr_for_panel(&dev, &mode);
     }
@@ -3390,19 +3433,23 @@ pub mod tests {
         {
             return TestResult::Fail("RKL must admit Gen12 GT regions while display stays gated");
         }
-        // Gen11 (Lane 1): identity + probe only. The BAR0 region
-        // map is admitted (Gen11 shares Gen12's partitioning) and
-        // the part is explicitly pre-GMD, but display, external
-        // display and backlight all stay gated until the display
-        // lanes land.
-        if Generation::IceLake.display_supported()
+        // Gen11 (Lane 5): identity + probe + internal-panel
+        // modeset. The BAR0 region map is admitted (Gen11 shares
+        // Gen12's partitioning) and the part is explicitly
+        // pre-GMD, display is admitted for the internal panel
+        // (fixture-validated, silicon untested), and external
+        // display + backlight stay gated (Lane 8 owns external
+        // outputs).
+        if !Generation::IceLake.display_supported()
             || Generation::IceLake.external_display_supported()
             || Generation::IceLake.backlight_supported()
             || Generation::IceLake.region_generation() != Some(RegionGeneration::Gen11)
             || Generation::IceLake.has_gmd_id()
             || !Generation::TigerLake.has_gmd_id()
         {
-            return TestResult::Fail("Gen11 must admit regions while display and GMD stay gated");
+            return TestResult::Fail(
+                "Gen11 must admit regions + internal display while external/backlight and GMD stay gated",
+            );
         }
         if !Generation::TigerLake.external_display_supported()
             || !Generation::AlderLake.external_display_supported()

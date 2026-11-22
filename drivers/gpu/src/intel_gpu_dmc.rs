@@ -201,6 +201,11 @@ pub const DMC_V3_MAX_MMIO_COUNT: usize = 20;
 /// ICL_DMC_MAX_FW_SIZE), in bytes. Callers pass their
 /// platform's value to the parser; this is the Gen12 one.
 pub const DMC_MAX_FW_SIZE_GEN12: usize = 0x6000;
+/// Per-program payload ceiling on Gen11 (`ICL_DMC_MAX_FW_SIZE`),
+/// in bytes — the same 0x6000 as Gen12.
+pub const ICL_DMC_MAX_FW_SIZE: usize = 0x6000;
+/// The display-11 DMC container name (`ICL_DMC_PATH`).
+pub const ICL_DMC_FIRMWARE: &str = "i915/icl_dmc_ver1_09.bin";
 /// Load address for v1 programs (no start field in v1).
 pub const DMC_V1_LOAD_ADDR: u32 = 0x80000;
 /// MMIO sanity range for v1 headers (any id).
@@ -264,6 +269,14 @@ pub const DG1_DMC_DEBUG_DC5_COUNT: u64 = 0x134154;
 pub enum DmcPlatform {
     /// Display 12 (TGL-class): TGL ranges and event fixups.
     Gen12,
+    /// Display 11 (ICL/EHL/JSL): the Gen12 DMC geometry (main
+    /// 0x8F000, pipes 0x92000 + 0x400·(id−1), 0x6000 payload
+    /// ceiling) with the TGL/ADL-S event fixups switched off —
+    /// `fixup_dmc_evt` rewrites the HRR handler on TGL/ADL-S only
+    /// — v3 program headers refused (`dmc_mmio_addr_sanity_check`
+    /// has no range for them on display 11), and PipeD skipped
+    /// (ICL has pipes A–C).
+    Gen11,
     /// Display 14 (MTL/ARL): display >= 13 pipe geometry, the
     /// 0x7000 payload ceiling, no TGL/ADL-S event fixups, and
     /// Wa_16015201720 around load/disable.
@@ -290,7 +303,10 @@ pub enum DmcPlatform {
 
 impl DmcPlatform {
     const fn uses_xelpdp_layout(self) -> bool {
-        !matches!(self, Self::Gen12)
+        matches!(
+            self,
+            Self::Xelpdp | Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake | Self::Xe3pLpd
+        )
     }
 
     const fn has_display20_pipe_hooks(self) -> bool {
@@ -406,7 +422,7 @@ impl DmcId {
     /// display >= 13 main 0x8F000 and pipes 0x5F000 + 0x400·(id−1).
     pub fn evt_reg_base_for(self, platform: DmcPlatform) -> Option<u32> {
         match platform {
-            DmcPlatform::Gen12 => self.evt_reg_base(),
+            DmcPlatform::Gen11 | DmcPlatform::Gen12 => self.evt_reg_base(),
             DmcPlatform::Xelpdp
             | DmcPlatform::Xe2Lpd
             | DmcPlatform::Xe3Lpd
@@ -572,6 +588,11 @@ pub enum DmcError {
     BadSignature(u32),
     /// A program header's version is neither 1 nor 3.
     BadHeaderVersion(u8),
+    /// A program header's version is not usable on this
+    /// platform: v3 on display 11. Linux's
+    /// `dmc_mmio_addr_sanity_check` has no MMIO range for a
+    /// v3 header below display 12 and refuses the container.
+    HeaderVersionUnsupported { header_ver: u8 },
     /// A program header's length field does not equal the
     /// version's header size, in bytes. (For v1 the field
     /// is in bytes already; for v3 it is dwords × 4.)
@@ -756,6 +777,11 @@ fn parse_program<'a>(
             DmcPlatform::Gen12 => id
                 .mmio_range_v3()
                 .ok_or(DmcError::MmioOutOfRange { addr: mmioaddr[0] })?,
+            // dmc_mmio_addr_sanity_check has no range for a v3
+            // header on display 11: refused outright.
+            DmcPlatform::Gen11 => {
+                return Err(DmcError::HeaderVersionUnsupported { header_ver });
+            }
             // dmc_mmio_addr_sanity_check: main uses the TGL main
             // window, display >= 13 pipes the ADL-P pipe window.
             _ if id == DmcId::Main => TGL_MAIN_MMIO_RANGE,
@@ -783,6 +809,9 @@ fn parse_program<'a>(
     let window = match platform {
         DmcPlatform::Gen12 if header_ver == 3 => Some(id.program_range()),
         DmcPlatform::Gen12 => None,
+        // Gen11 v1 programs load at 0x80000 unwidowed, like
+        // Gen12; v3 headers are refused above.
+        DmcPlatform::Gen11 => None,
         // Both header versions are windowed on display 14 (a v1
         // program loads at 0x80000; a v1 pipe program therefore
         // never fits its pipe window).
@@ -831,6 +860,29 @@ pub fn parse_dmc_firmware<'a>(
     max_fw_size: usize,
 ) -> Result<DmcFirmware<'a>, DmcError> {
     parse_for(blob, DmcPlatform::Gen12, stepping, substepping, max_fw_size)
+}
+
+/// Parse and validate a display-11 (Ice Lake / Elkhart Lake /
+/// Jasper Lake) container — `i915/icl_dmc_ver1_09.bin` — against
+/// the pinned `intel_dmc.c` rules for DISPLAY_VER == 11: the
+/// `ICL_DMC_MAX_FW_SIZE` (0x6000) payload ceiling, v1 headers in
+/// the shared 0x80000–0x8FFFF window, v3 headers refused
+/// (`dmc_mmio_addr_sanity_check` has no range for them on display
+/// 11), no TGL/ADL-S event fixups, PipeD skipped (ICL has pipes
+/// A–C). The shipped blob is a v1 package, so every entry is the
+/// main DMC.
+pub fn parse_dmc_firmware_gen11(
+    blob: &[u8],
+    stepping: u8,
+    substepping: u8,
+) -> Result<DmcFirmware<'_>, DmcError> {
+    parse_for(
+        blob,
+        DmcPlatform::Gen11,
+        stepping,
+        substepping,
+        ICL_DMC_MAX_FW_SIZE,
+    )
 }
 
 /// Parse and validate a display-14 (Meteor Lake / Arrow Lake)
@@ -1014,6 +1066,8 @@ fn parse_for(
         };
         let skipped = match platform {
             DmcPlatform::Gen12 => matches!(id, DmcId::PipeC | DmcId::PipeD),
+            // ICL has pipes A–C: only PipeD is skipped.
+            DmcPlatform::Gen11 => matches!(id, DmcId::PipeD),
             DmcPlatform::Xelpdp
             | DmcPlatform::Xe2Lpd
             | DmcPlatform::Xe3Lpd
@@ -1115,13 +1169,15 @@ pub fn load_mmiodata(id: DmcId, addr: u32, data: u32) -> u32 {
 }
 
 /// Platform-aware `dmc_mmiodata`: Gen12 is [`load_mmiodata`]. On
-/// display 14 only the platform-independent rule applies — pipe
-/// event entries are written disabled — because the main-DMC
-/// CLK_MSEC and VBLANK_DELAYED_A disables are TGL/ADL-S only.
+/// display 11 and display 14 only the platform-independent rule
+/// applies — pipe event entries are written disabled — because the
+/// main-DMC CLK_MSEC and VBLANK_DELAYED_A disables are TGL/ADL-S
+/// only.
 pub fn load_mmiodata_for(platform: DmcPlatform, id: DmcId, addr: u32, data: u32) -> u32 {
     match platform {
         DmcPlatform::Gen12 => load_mmiodata(id, addr, data),
-        DmcPlatform::Xelpdp
+        DmcPlatform::Gen11
+        | DmcPlatform::Xelpdp
         | DmcPlatform::Xe2Lpd
         | DmcPlatform::Xe3Lpd
         | DmcPlatform::WildcatLake

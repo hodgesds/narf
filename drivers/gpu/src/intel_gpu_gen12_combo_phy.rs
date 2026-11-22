@@ -60,7 +60,7 @@
 //! state, which does not exist yet.
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
-use crate::intel_gpu_gt::Gen12Platform;
+use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform};
 use crate::intel_gpu_modeset::ModesetError;
 use crate::intel_gpu_pll::LinkRate;
 use core::sync::atomic::{compiler_fence, Ordering};
@@ -639,8 +639,12 @@ const fn n_scalar(v: u8) -> u32 {
     (v as u32 & 0x7F) << 24
 }
 /// `DP_TP_CTL` (TGL variant: transcoder base + 0x540;
-/// `intel_display_regs.h`).
+/// `intel_display_regs.h`). On Gen11 the register is
+/// port-based, not transcoder-based: DDI base + 0x40
+/// (`_DP_TP_CTL_A` = 0x64040).
 const DP_TP_CTL_OFFSET: u64 = 0x540;
+/// `DP_TP_CTL` offset from the DDI base on Gen11 (ICL).
+const DP_TP_CTL_OFFSET_GEN11: u64 = 0x40;
 const DP_TP_CTL_ENABLE: u32 = 1 << 31;
 const DP_TP_CTL_ENHANCED_FRAME_ENABLE: u32 = 1 << 18;
 const DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
@@ -696,11 +700,20 @@ struct LevelProgram<'a> {
 // ── Combo PHY ────────────────────────────────────────────────
 
 /// One Gen12 combo PHY: the DDI's PORT_CL/PCS/TX register block
-/// plus the table-selection inputs for this modeset run.
+/// plus the table-selection inputs for this modeset run. The
+/// same six-step programmer serves Gen11 (`gen11` set): the PHY
+/// register block and the level program are generation-shared,
+/// and only the table selection, the `DP_TP_CTL` address and the
+/// DPLL retune differ (see `new_gen11`).
 #[derive(Copy, Clone, Debug)]
 pub struct ComboPhy {
     ddi: Ddi,
     family: Gen12Platform,
+    /// Gen11 platform when this PHY drives a Gen11 modeset
+    /// (Lane 5). `family` is then unused — the table selection
+    /// branches on this field first — and keeps its TigerLake
+    /// default so the struct has one shape for both paths.
+    gen11: Option<Gen11Platform>,
     tgl_uy: bool,
     is_edp: bool,
     /// eDP HOBL (VBT `panel.edp.hobl`, parsed in
@@ -738,11 +751,52 @@ impl ComboPhy {
         Ok(Self {
             ddi,
             family: family.unwrap_or(Gen12Platform::TigerLake),
+            gen11: None,
             tgl_uy,
             is_edp,
             hobl,
             low_vswing,
         })
+    }
+
+    /// Build the combo PHY for `ddi` on Gen11. The PHY register
+    /// block and the six-step level program are the same as on
+    /// Gen12; the differences are the DDI table selection
+    /// (`intel_gpu_gen11_ddi::select_table`, `is_hobl` always
+    /// false — there is no HOBL table on ICL), the port-based
+    /// `DP_TP_CTL` (DDI base + 0x40), and the ICL DPLL retune
+    /// (`intel_gpu_gen11_dpll`). `low_vswing` is the built-in
+    /// eDP panel's VBT bit, as in `new`. Type-C DDIs (D and up)
+    /// are owned by `DklPort`, not this module.
+    pub(crate) fn new_gen11(
+        ddi: Ddi,
+        platform: Gen11Platform,
+        is_edp: bool,
+        low_vswing: bool,
+    ) -> Result<Self, ModesetError> {
+        if ddi as u8 >= Ddi::D as u8 {
+            return Err(ModesetError::UnsupportedGeneration);
+        }
+        Ok(Self {
+            ddi,
+            family: Gen12Platform::TigerLake,
+            gen11: Some(platform),
+            tgl_uy: false,
+            is_edp,
+            hobl: false,
+            low_vswing,
+        })
+    }
+
+    /// `DP_TP_CTL` address for this PHY: the TGL
+    /// transcoder-based register (transcoder base + 0x540) on
+    /// Gen12, the ICL port-based register (DDI base + 0x40)
+    /// on Gen11.
+    const fn tp_ctl_off(self, trans: crate::intel_gpu_pipes::Transcoder) -> u64 {
+        match self.gen11 {
+            Some(_) => self.ddi.base() + DP_TP_CTL_OFFSET_GEN11,
+            None => trans.base() + DP_TP_CTL_OFFSET,
+        }
     }
 
     /// Combo-PHY base for this DDI (`intel_port_to_phy` on
@@ -898,14 +952,35 @@ impl ComboPhy {
         lanes: u8,
     ) -> Result<(), ModesetError> {
         let port_clock = port_clock_khz(rate).ok_or(ModesetError::PhyBusFailure)?;
-        let (table, is_hobl) = select_combo_buf_trans(
-            self.family,
-            self.is_edp,
-            port_clock,
-            self.tgl_uy,
-            self.hobl,
-            self.low_vswing,
-        );
+        let (table, is_hobl) = match self.gen11 {
+            Some(platform) => {
+                // Gen11: the ICL DDI tables, `is_hobl` always
+                // false — `is_hobl_buf_trans` is true only for
+                // the TGL HOBL table, and ICL has none.
+                let output = if self.is_edp {
+                    crate::intel_gpu_gen11_ddi::Output::Edp
+                } else {
+                    crate::intel_gpu_gen11_ddi::Output::Dp
+                };
+                (
+                    crate::intel_gpu_gen11_ddi::select_table(
+                        platform,
+                        output,
+                        port_clock,
+                        self.low_vswing,
+                    ),
+                    false,
+                )
+            }
+            None => select_combo_buf_trans(
+                self.family,
+                self.is_edp,
+                port_clock,
+                self.tgl_uy,
+                self.hobl,
+                self.low_vswing,
+            ),
+        };
         self.set_levels(
             io,
             LevelProgram {
@@ -968,7 +1043,7 @@ impl ComboPhy {
         lanes: u8,
     ) -> Result<(), ModesetError> {
         self.set_signal_levels(io, rate, &[(0, 0); 4], lanes)?;
-        let tp = trans.base() + DP_TP_CTL_OFFSET;
+        let tp = self.tp_ctl_off(trans);
         self.rmw(
             io,
             tp,
@@ -1011,7 +1086,7 @@ impl ComboPhy {
                     self.retune_dpll(io, trans, state.rate)?;
                     self.prepare(io, trans, state.rate, state.lanes)?;
                 }
-                let tp = trans.base() + DP_TP_CTL_OFFSET;
+                let tp = self.tp_ctl_off(trans);
                 let bits = state
                     .pattern_bits()
                     .map_err(|_| ModesetError::PhyBusFailure)?;
@@ -1119,7 +1194,13 @@ impl ComboPhy {
             true,
             10,
         )?;
-        self.rmw(io, trans.base() + DP_TP_CTL_OFFSET, DP_TP_CTL_ENABLE, 0);
+        self.rmw(io, self.tp_ctl_off(trans), DP_TP_CTL_ENABLE, 0);
+        // Gen11 takes the ICL disable/enable pair from here:
+        // the DPLL re-program below writes the TGL CFGCR0
+        // (0x164284), which must never be used on Gen11.
+        if self.gen11.is_some() {
+            return self.retune_dpll_gen11(io, coeffs);
+        }
         // 2. Disable the DPLL.
         let cur = self.read(io, enable) & !DPLL_STATUS_BITS;
         self.write(io, enable, cur & !DPLL_PLL_ENABLE);
@@ -1146,6 +1227,35 @@ impl ComboPhy {
         let cur = self.read(io, enable) & !DPLL_STATUS_BITS;
         self.write(io, enable, cur | DPLL_PLL_ENABLE);
         self.wait(io, enable, DPLL_PLL_LOCK, true, 1)
+    }
+
+    /// The Gen11 half of `retune_dpll`: steps 2–3 through the
+    /// ICL `combo_pll_disable` + `combo_pll_enable` pair
+    /// (`icl_pll_disable` + `icl_pll_enable` in Linux's
+    /// `intel_dpll.c`), with the state from
+    /// `gen11_dpll::calc_dpll_state`. The EHL/JSL div-fraction
+    /// workaround is off: it applies only at a 38.4 MHz
+    /// reference on EHL B0+ steppings, which this driver does
+    /// not model — a remainder, not a guess. DDI C fails
+    /// closed: ICL has no DPLL2 (Gen12's DDI C PLL), and
+    /// DPLL4 is EHL/JSL-only with an ungrounded port mapping.
+    fn retune_dpll_gen11(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+        coeffs: crate::intel_gpu_pll::DpllCoeffs,
+    ) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen11_dpll::{
+            calc_dpll_state, combo_pll_disable, combo_pll_enable, IclDpllId,
+        };
+        let id = match self.ddi {
+            Ddi::A => IclDpllId::Dpll0,
+            Ddi::B => IclDpllId::Dpll1,
+            _ => return Err(ModesetError::UnsupportedGeneration),
+        };
+        let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
+        combo_pll_disable(io, id).map_err(|_| ModesetError::PllLockTimeout)?;
+        combo_pll_enable(io, id, cfgcr0, cfgcr1).map_err(|_| ModesetError::PllLockTimeout)?;
+        Ok(())
     }
 }
 
@@ -2097,5 +2207,73 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gen12_combo_phy",
         smoke_combo_phy_dw7_n_scalar_full_range
+    );
+
+    fn smoke_gen11_combo_phy_set_signal_levels_uses_icl_table() -> TestResult {
+        use Gen11Platform::IceLake;
+        let io = Model::new();
+        let phy = match ComboPhy::new_gen11(Ddi::B, IceLake, false, false) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("DDI B must build a Gen11 combo PHY"),
+        };
+        if ComboPhy::new_gen11(Ddi::D, IceLake, false, false).is_ok() {
+            return TestResult::Fail("Gen11 combo PHY must refuse TC DDIs");
+        }
+        // HBR2, levels (1, 0) on all lanes: preset 4 of the ICL
+        // DP HBR2 / eDP HBR3 table {0xA, 0x4C, ...} — the
+        // N-scalar 0x4C distinguishes it from the TGL table's
+        // preset 4 (0x47).
+        if phy
+            .set_signal_levels(&io, LinkRate::DpHbr2, &[(1, 0); 4], 4)
+            .is_err()
+        {
+            return TestResult::Fail("Gen11 set_signal_levels must succeed");
+        }
+        let base = 0x6C000u64; // PHY_B
+        if io.last_write_to(base + 0xA9C) != Some(0x4C00_0000) {
+            return TestResult::Fail("DW7 must carry the ICL preset-4 N-scalar");
+        }
+        // DW2 LN1: swing 0xA → upper 1, lower 2, RCOMP 0x98.
+        if io.last_write_to(base + 0x988) != Some(0x9098) {
+            return TestResult::Fail("DW2 must carry the preset-4 swing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_combo_phy",
+        smoke_gen11_combo_phy_set_signal_levels_uses_icl_table
+    );
+
+    fn smoke_gen11_combo_phy_prepare_uses_port_tp_ctl() -> TestResult {
+        use crate::intel_gpu_pipes::Transcoder;
+        use Gen11Platform::IceLake;
+        let io = Model::new();
+        let phy = ComboPhy::new_gen11(Ddi::A, IceLake, true, false).unwrap();
+        let trans = Transcoder::A;
+        // Prepare: (0, 0) levels + DP_TP_CTL enable with PAT1.
+        if phy.prepare(&io, trans, LinkRate::DpHbr2, 4).is_err() {
+            return TestResult::Fail("Gen11 prepare must succeed");
+        }
+        // ICL DP_TP_CTL is port-based: DDI A base + 0x40
+        // (0x64040), never the TGL transcoder-based 0x60540.
+        if io.last_write_to(0x64040) != Some(0x8004_0080) {
+            return TestResult::Fail("Gen11 prepare must enable the port DP_TP_CTL with PAT1");
+        }
+        if !io.writes_to(0x60540).is_empty() {
+            return TestResult::Fail("Gen11 must never write the TGL transcoder DP_TP_CTL");
+        }
+        // (0, 0) → preset 0 of the ICL table: N-scalar 0x35.
+        if io.last_write_to(0x162000 + 0x89C) != Some(0x3500_0000) {
+            return TestResult::Fail("Gen11 prepare must program the (0, 0) levels");
+        }
+        // eDP with no HOBL table: CL_DW10 override cleared.
+        if io.writes_to(0x162000 + 0x28) != alloc::vec![0u32] {
+            return TestResult::Fail("Gen11 eDP must clear the CL_DW10 HOBL override");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_combo_phy",
+        smoke_gen11_combo_phy_prepare_uses_port_tp_ctl
     );
 }
