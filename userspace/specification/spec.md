@@ -2768,6 +2768,42 @@ pub mod compat32::mm {
 }
 ```
 
+**The i386 table.** `compat32::dispatch` (frame §3.1) hands every call it
+does not serve itself to `compat32::table::dispatch(nr, ctx)`, which maps
+`syscall_32.tbl` numbers onto the native handlers: `forward` for a call
+whose zero-extended registers are the native arguments, `compat32::ctx::
+Ia32ArgsCtx` for one that needs signed arguments sign-extended
+(`__SC_COMPAT_CAST`: `int dfd`, `pid_t`, `clockid_t`), other values, or a
+captured return, and its own function where Linux has a compat entry point
+(`sys_mmap_pgoff`, `compat_sys_ia32_mmap`, `compat_sys_ioctl`). A number
+without an entry is -ENOSYS. Shared handlers choose the i386 layout from
+`TrapContext::in_ia32_syscall()` (iovecs: `import_rw_iovecs_abi`) or, where
+one handler serves several i386 entry points, from `TrapContext::ia32_abi()`
+(`time32`: `clock_gettime32`'s `struct old_timespec32`). `uname` reports
+machine "i686" to a task whose personality domain is PER_LINUX32, on either
+ABI. `compat_sys_ioctl` passes the inode-flags pair (renumbered) and the
+layout-compatible generic and tty commands, and answers ENOTTY (after EBADF)
+for every other command until its `compat_ioctl` conversion exists. i386
+mmap keeps every result below `TASK_SIZE_32` (ENOMEM for a fixed range past
+it; a mapping a 64-bit address space hands back above it is undone).
+
+```rust
+pub trait TrapContext { /* ... */ fn ia32_abi(&self) -> Ia32Abi { Ia32Abi::default() } }
+pub struct Ia32Abi { pub time32: bool, pub flock: Ia32Flock }
+pub enum Ia32Flock { Native, Compat, Compat64 }
+pub mod compat32::table {
+    pub mod nr;                                  // syscall_32.tbl numbers
+    pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall>;
+    pub fn forward(ctx: &mut dyn TrapContext, variant: Syscall) -> Option<Syscall>;
+}
+```
+
+Phase-1 coverage: exit, exit_group, read, write, readv, writev, open, openat,
+close, pipe, pipe2, dup, dup2, dup3, ioctl, chdir, getcwd, umask, brk, mmap2,
+mmap, munmap, mprotect, uname, personality, getpid, getppid, gettid,
+getuid32, getgid32, geteuid32, getegid32, set_tid_address, sched_yield,
+kill, tkill, tgkill, clock_gettime (time32), clock_gettime64.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

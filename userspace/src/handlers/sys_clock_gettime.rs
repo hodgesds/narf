@@ -1,11 +1,34 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `put_timespec64` / `put_old_timespec32`: store `sec`/`nsec` at the user
+/// `buf` in the layout of the entry point that was called. The i386
+/// `clock_gettime` (265, `clock_gettime32`) writes `struct old_timespec32`
+/// — two `s32`, truncated as Linux truncates them — and nothing past it;
+/// every other caller writes the 16-byte `__kernel_timespec`.
+fn put_user_timespec(time32: bool, buf: u64, sec: i64, nsec: i64) -> Result<(), u64> {
+    if time32 {
+        let mut kbuf = [0u8; 8];
+        kbuf[..4].copy_from_slice(&(sec as i32).to_ne_bytes());
+        kbuf[4..].copy_from_slice(&(nsec as i32).to_ne_bytes());
+        // SAFETY: copy_to_user range-validates and fault-brackets the
+        // caller's timespec.
+        return unsafe { copy_to_user(buf, &kbuf) };
+    }
+    let mut kbuf = [0u8; 16];
+    kbuf[..8].copy_from_slice(&sec.to_ne_bytes());
+    kbuf[8..].copy_from_slice(&nsec.to_ne_bytes());
+    // SAFETY: copy_to_user range-validates and fault-brackets the caller's
+    // timespec.
+    unsafe { copy_to_user(buf, &kbuf) }
+}
+
 pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
     let buf = args.arg1;
-    if let Some(result) = super::phc::gettime(id as i32, buf) {
+    let time32 = ctx.ia32_abi().time32;
+    if let Some(result) = super::phc::gettime(id as i32, buf, time32) {
         ctx.set_return(SyscallReturn::ok(result as u64));
         return;
     }
@@ -22,12 +45,8 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
             return;
         };
         let ns = cpu_clock_sample_ns(task, target, cpu_clock & 3);
-        let mut kbuf = [0u8; 16];
-        kbuf[..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_ne_bytes());
-        kbuf[8..].copy_from_slice(&((ns % 1_000_000_000) as i64).to_ne_bytes());
-        // SAFETY: copy_to_user range-validates and fault-brackets the
-        // caller's timespec.
-        if buf == 0 || unsafe { copy_to_user(buf, &kbuf) }.is_err() {
+        let (sec, nsec) = ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64);
+        if buf == 0 || put_user_timespec(time32, buf, sec, nsec).is_err() {
             ctx.set_return(errno_ret(EFAULT));
             return;
         }
@@ -92,14 +111,9 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EFAULT));
         return;
     }
-    // Write the timespec (two i64s: tv_sec, tv_nsec) under the SMAP bracket.
-    let mut kbuf = [0u8; 16];
-    kbuf[..8].copy_from_slice(&sec.to_ne_bytes());
-    kbuf[8..].copy_from_slice(&nsec.to_ne_bytes());
-    // SAFETY: `buf` is the user timespec pointer (non-zero and 8-aligned, checked above);
-    // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
+    // Write the timespec (tv_sec, tv_nsec) under the SMAP bracket, in the
+    // caller's layout.
+    if put_user_timespec(time32, buf, sec, nsec).is_err() {
         // Faulting timespec buffer → EFAULT.
         ctx.set_return(errno_ret(EFAULT));
         return;

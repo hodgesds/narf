@@ -19,6 +19,8 @@
 //! later syscalls (`fs/compat_binfmt_elf.c`: `start_brk`, the exec-time
 //! `READ_IMPLIES_EXEC`).
 
+pub(crate) mod conv;
+pub(crate) mod ctx;
 pub mod mm;
 pub mod table;
 pub mod tls;

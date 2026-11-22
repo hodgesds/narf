@@ -5851,29 +5851,54 @@ struct ImportedRwIovec {
 }
 
 fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<ImportedRwIovec>, u64> {
+    import_rw_iovecs_abi(iov_ptr, iovcnt, false)
+}
+
+/// [`import_rw_iovecs`] for the ABI the call arrived through: `compat` reads
+/// 8-byte `struct compat_iovec { compat_uptr_t iov_base; compat_size_t
+/// iov_len; }` (`lib/iov_iter.c::copy_compat_iovec_from_user`, chosen by
+/// `in_compat_syscall()`), whose `iov_len` is refused when negative as a
+/// `compat_ssize_t`.
+fn import_rw_iovecs_abi(
+    iov_ptr: u64,
+    iovcnt: usize,
+    compat: bool,
+) -> Result<alloc::vec::Vec<ImportedRwIovec>, u64> {
     if iovcnt == 0 {
         return Ok(alloc::vec::Vec::new());
     }
     if iovcnt > LINUX_IOV_MAX {
         return Err(EINVAL as u64);
     }
+    let stride = if compat { 8 } else { 16 };
+    // (base, signed length) of one array element.
+    let decode = |slot: &[u8]| -> (u64, i64) {
+        if compat {
+            (
+                u64::from(u32::from_ne_bytes(slot[..4].try_into().unwrap())),
+                i64::from(i32::from_ne_bytes(slot[4..8].try_into().unwrap())),
+            )
+        } else {
+            (
+                u64::from_ne_bytes(slot[..8].try_into().unwrap()),
+                u64::from_ne_bytes(slot[8..16].try_into().unwrap()) as i64,
+            )
+        }
+    };
     // SAFETY: 1024 native iovecs occupy 16 KiB, below MAX_USER_COPY.
-    let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * 16) }?;
+    let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * stride) }?;
     // `lib/iov_iter.c::copy_iovec_from_user` rejects an iov_len with the
     // ssize_t sign bit set (-EINVAL) while copying the array — before
     // `__import_iovec` runs a single access_ok, so a negative length outranks
     // a bad base in an earlier element.
-    if raw
-        .chunks_exact(16)
-        .any(|slot| (u64::from_ne_bytes(slot[8..].try_into().unwrap()) as i64) < 0)
-    {
+    if raw.chunks_exact(stride).any(|slot| decode(slot).1 < 0) {
         return Err(EINVAL as u64);
     }
     let mut out = alloc::vec::Vec::with_capacity(iovcnt);
     let mut remaining = LINUX_MAX_RW_COUNT;
-    for slot in raw.chunks_exact(16) {
-        let base = u64::from_ne_bytes(slot[..8].try_into().unwrap());
-        let requested = u64::from_ne_bytes(slot[8..].try_into().unwrap()) as usize;
+    for slot in raw.chunks_exact(stride) {
+        let (base, requested) = decode(slot);
+        let requested = requested as usize;
         // A one-element vector takes `__import_iovec_ubuf` -> `import_ubuf`,
         // which clamps to MAX_RW_COUNT BEFORE access_ok; the multi-element
         // loop checks the full length first.

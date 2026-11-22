@@ -140,6 +140,44 @@ pub trait TrapContext {
     fn in_compat_mode(&self) -> bool {
         false
     }
+
+    /// Which i386 entry point an `in_ia32_syscall()` call came through, where
+    /// one native handler serves several with different user layouts —
+    /// Linux's `clock_gettime32` vs `clock_gettime`, or `fcntl64`'s
+    /// `F_GETLK64` vs `F_GETLK`. The i386 table (`compat32::table`) sets it
+    /// on the context it hands the native handler; every other context,
+    /// the gate's own included, reports [`Ia32Abi::default`].
+    fn ia32_abi(&self) -> Ia32Abi {
+        Ia32Abi::default()
+    }
+}
+
+/// The layout choices an i386 call makes beyond `in_ia32_syscall()`. All
+/// `false`/native by default.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ia32Abi {
+    /// User timespecs are `struct old_timespec32` (two `s32`), not
+    /// `struct __kernel_timespec`: the y2038-limited i386 entry points
+    /// (`clock_gettime` 265, `futex` 240, ...), as opposed to their `*_time64`
+    /// twins.
+    pub time32: bool,
+    /// The `struct flock` an `fcntl` record-lock command reads and writes.
+    pub flock: Ia32Flock,
+}
+
+/// `fcntl` lock-structure layout of an i386 call (`fs/fcntl.c`
+/// `do_compat_fcntl64`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Ia32Flock {
+    /// The native `struct flock` (any 64-bit call).
+    #[default]
+    Native,
+    /// `struct compat_flock`: 32-bit `l_start`/`l_len` (F_GETLK/F_SETLK/
+    /// F_SETLKW), with `fixup_compat_flock`'s EOVERFLOW on the way out.
+    Compat,
+    /// `struct compat_flock64`, packed, 24 bytes (F_GETLK64/F_SETLK64/
+    /// F_SETLKW64 and the F_OFD_* commands).
+    Compat64,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
