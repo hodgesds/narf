@@ -314,6 +314,29 @@ fn ensure_mount_target_for(num: u32, args: &SyscallArgs) {
     });
 }
 
+/// Make a case's root-level mount points, and the writable root they live
+/// in, before the case copies or measures the mount tree.
+///
+/// The writable root [`ensure_mount_target_for`] stands in for is the root a
+/// real system pivoted to before anything ran, so it, and the directories
+/// its image would have shipped, belong to the state a case starts from.
+/// The fixture otherwise mounts that root on the first `mount(2)` of the
+/// boot, wherever that falls:
+///
+/// - after `unshare(CLONE_NEWNS)`, which copies the caller's tree as it
+///   stands (`copy_mnt_ns`): the copy keeps the read-only `boot-initramfs`
+///   root, so the case's own `mkdir` in it fails;
+/// - after a case's first mount listing, which then gains a mount the case
+///   never made.
+///
+/// Either way the case passed or failed on whether an earlier case had
+/// already issued a `mount(2)`.
+pub fn root_mount_points(paths: &[&str]) {
+    for path in paths {
+        narf_filesystem::__test_ensure_mount_target(path);
+    }
+}
+
 /// Mount targets under this prefix are NOT created by the fixture, so a case
 /// can assert the -ENOENT a missing target produces.
 pub const MOUNT_TARGET_ABSENT_PREFIX: &str = "/absent-";

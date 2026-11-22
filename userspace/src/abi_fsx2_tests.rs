@@ -2536,12 +2536,11 @@ fn smoke_abi_fsx2_ms_move_carries_submounts() -> TestResult {
         const MS_MOVE: u64 = 0x2000;
         const O_WRONLY: u64 = 0o1;
         const O_CREAT: u64 = 0o100;
+        root_mount_points(&["/abi-mvt-src", "/abi-mvt-dst"]);
         // A private namespace, so nothing here outlives the case.
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-mvt-src".as_ptr() as u64, 0o755);
-        let _ = call_mkdir(c"/abi-mvt-dst".as_ptr() as u64, 0o755);
         if mount_fstype(b"/abi-mvt-src\0", b"tmpfs\0") != Some(0)
             || call_mkdir(c"/abi-mvt-src/sub".as_ptr() as u64, 0o755) != Some(0)
             || mount_fstype(b"/abi-mvt-src/sub\0", b"tmpfs\0") != Some(0)
@@ -2605,11 +2604,11 @@ fn smoke_abi_fsx2_new_mount_covers_earlier_submounts() -> TestResult {
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const O_WRONLY: u64 = 0o1;
         const O_CREAT: u64 = 0o100;
+        root_mount_points(&["/abi-cover"]);
         // A private namespace, so nothing here outlives the case.
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-cover".as_ptr() as u64, 0o755);
         if mount_fstype(b"/abi-cover\0", b"tmpfs\0") != Some(0)
             || call_mkdir(c"/abi-cover/dev".as_ptr() as u64, 0o755) != Some(0)
             || mount_fstype(b"/abi-cover/dev\0", b"tmpfs\0") != Some(0)
@@ -2676,10 +2675,10 @@ kernel_test_in!(
 fn smoke_abi_fsx2_umount2_of_a_covered_mount_misses_it() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
+        root_mount_points(&["/abi-ucov"]);
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-ucov".as_ptr() as u64, 0o755);
         if mount_fstype(b"/abi-ucov\0", b"tmpfs\0") != Some(0)
             || call_mkdir(c"/abi-ucov/dev".as_ptr() as u64, 0o755) != Some(0)
             || mount_fstype(b"/abi-ucov/dev\0", b"tmpfs\0") != Some(0)
@@ -2722,10 +2721,10 @@ fn smoke_abi_fsx2_ms_move_into_its_own_tree_is_eloop() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const MS_MOVE: u64 = 0x2000;
+        root_mount_points(&["/abi-mvl"]);
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-mvl".as_ptr() as u64, 0o755);
         if mount_fstype(b"/abi-mvl\0", b"tmpfs\0") != Some(0)
             || call_mkdir(c"/abi-mvl/sub".as_ptr() as u64, 0o755) != Some(0)
         {
@@ -2800,6 +2799,7 @@ fn smoke_abi_fsx2_mount_listings_print_linux_fs_types() -> TestResult {
         let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
             crate::handlers::proc_ns_mountinfo,
         );
+        root_mount_points(&["/abi-fstn-bind"]);
         // A private namespace, so nothing here outlives the case.
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
@@ -2854,7 +2854,6 @@ fn smoke_abi_fsx2_mount_listings_print_linux_fs_types() -> TestResult {
             }
         }
         // A bind prints its source's type.
-        let _ = call_mkdir(c"/abi-fstn-bind".as_ptr() as u64, 0o755);
         let bound = call(
             Syscall::Mount.raw(),
             a4(
@@ -4251,6 +4250,7 @@ fn smoke_abi_fsx2_mount_listings_after_a_global_pivot_root() -> TestResult {
             );
         };
 
+        root_mount_points(&["/abi-pvl-new"]);
         let before = mount_points(&read_all(c"/proc/self/mountinfo")?);
         let before_ids = list_paged()?;
         // The pivot, as smoke_abi_fsx_pivot_root_pos makes it.
@@ -4424,6 +4424,7 @@ fn smoke_abi_fsx2_mount_listings_drop_an_orphaned_old_root() -> TestResult {
             >::bootstrap();
             let _ = registry().unmount(&handle, path);
         };
+        root_mount_points(&["/abi-pvo-new"]);
         let before = mount_points(&read_mount_listing(c"/proc/self/mountinfo")?);
         let before_ids = listmount_paged_ids()?;
         let mounted = call(
