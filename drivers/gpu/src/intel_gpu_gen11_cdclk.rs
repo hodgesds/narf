@@ -576,14 +576,21 @@ pub mod tests {
                 o if o == PCODE_MAILBOX => {
                     if val & PCODE_READY != 0 {
                         let cmd = val & 0xFF;
-                        // Pre-notify (DATA0 0x3) replies with the
-                        // ready bit; anything else completes with
-                        // DATA0 untouched.
+                        // The punit answers a pre-notify (DATA0 0x3) in
+                        // DATA0: READY_FOR_CHANGE when it grants the
+                        // change, a reply without that bit when it does
+                        // not. An untouched DATA0 would still read as
+                        // ready: 0x3 has bit 0 set, and Linux's
+                        // `(request & reply_mask) == reply` accepts it.
+                        // Anything else completes with DATA0 untouched.
                         if cmd == PCODE_CMD_CDCLK_CONTROL
                             && *self.pcode_data0.borrow() == SKL_CDCLK_PREPARE_FOR_CHANGE
-                            && self.grant_ready
                         {
-                            *self.pcode_data0.borrow_mut() = SKL_CDCLK_READY_FOR_CHANGE;
+                            *self.pcode_data0.borrow_mut() = if self.grant_ready {
+                                SKL_CDCLK_READY_FOR_CHANGE
+                            } else {
+                                0
+                            };
                         }
                         *self.pcode_mailbox.borrow_mut() = self.pcode_status as u32;
                     } else {
