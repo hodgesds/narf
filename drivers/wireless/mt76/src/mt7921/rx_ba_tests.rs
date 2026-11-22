@@ -882,6 +882,115 @@ fn rekey() -> Result<(), &'static str> {
     }
     Ok(())
 }
+/// mac80211 tears block-ack sessions down only for a PTK rekey
+/// (`ieee80211_pairwise_rekey` → `ieee80211_sta_tear_down_BA_sessions(sta,
+/// AGG_STOP_LOCAL_REQUEST)`), and then tells the originator: each recipient
+/// session ends with a DELBA (`__ieee80211_stop_rx_ba_session(.., tx=true)`,
+/// WLAN_REASON_QSTA_LEAVE_QBSS = 36). A Group Key Handshake installs a GTK
+/// and leaves every agreement running. NARF retired its recipient
+/// agreements on every EAPOL exchange, GTK rekeys included, without a DELBA,
+/// so the AP kept aggregating into agreements the station no longer had.
+fn gtk_rekey() -> Result<(), &'static str> {
+    use narf_wireless::eapol as e;
+    let mut session = joined(6, true, true)?;
+    session.backend.access_point = None;
+    session.backend.psk = [0x55; 32];
+    session.backend.own_mac = OWN;
+    session.backend.ap_mac = AP;
+    session.backend.anonce = [0x55; 32];
+    let pairwise_m1 = |replay: u64| {
+        let mut m1 = e::KeyFrame::empty(16);
+        m1.key_information = 2 | (1 << 3) | (1 << 7);
+        m1.key_length = 16;
+        m1.replay_counter = replay;
+        m1.key_nonce = [0x55; 32];
+        descriptor(&ap_eapol_frame(OWN, AP, &m1.into_eapol()))
+    };
+    // A PTK rekey through the model's authenticator, so its KCK/KEK are known.
+    session.backend.packets.push_back(pairwise_m1(7));
+    consume(&mut session, "PTK rekey M1 capture")?;
+    run(session.service_keys()).map_err(|_| "PTK rekey M2")?;
+    consume(&mut session, "PTK rekey M3 capture")?;
+    run(session.service_keys()).map_err(|_| "PTK rekey M3/M4")?;
+    let (kck, kek) = (session.backend.kck.clone(), session.backend.kek.clone());
+    let Ok(kek) = <[u8; 16]>::try_from(kek.as_slice()) else {
+        return Err("model kept no KEK from the PTK rekey");
+    };
+    establish(&mut session, 0, 50, 0)?;
+
+    // Group Key Handshake message 1/2: GTK id 2 under the PTK's KEK/KCK.
+    let mut g1 = e::KeyFrame::empty(16);
+    g1.descriptor_type = e::KEY_DESCRIPTOR_RSN;
+    g1.key_information = e::KI_KEY_ACK
+        | e::KI_KEY_MIC
+        | e::KI_SECURE
+        | e::KI_ENCRYPTED_KEY_DATA
+        | e::KI_VERSION_HMAC_SHA1_AES;
+    g1.key_length = 0;
+    g1.replay_counter = 9;
+    let mut clear = vec![0xdd, 22, 0, 0x0f, 0xac, 1, 2, 0];
+    clear.extend_from_slice(&[0x88; 16]);
+    clear.push(0xdd);
+    while clear.len() % 8 != 0 {
+        clear.push(0);
+    }
+    g1.key_data = narf_crypto::aes_kw::aes_wrap(&kek, &clear).ok_or("GTK key wrap")?;
+    let mut g1 = g1.into_eapol();
+    let mic = narf_crypto::pbkdf2_sha1::hmac_sha1(&kck, &g1);
+    g1[81..97].copy_from_slice(&mic[..16]);
+    session
+        .backend
+        .packets
+        .push_back(descriptor(&ap_eapol_frame(OWN, AP, &g1)));
+    if session.receive_ethernet() != Ok(None) || !session.keys_pending() {
+        return Err("group rekey EAPOL capture");
+    }
+    let before = session.backend.frames.len();
+    run(session.service_keys()).map_err(|_| "group rekey M2")?;
+    let frames = &session.backend.frames[before..];
+    let delba = |f: &Vec<u8>| f.first() == Some(&0xd0) && f.get(24..26) == Some(&[3, 2][..]);
+    let ba_disable = |f: &Vec<u8>| {
+        f.len() == 68 && f.get(56..60) == Some(&[6, 0, 12, 0][..]) && f.get(63) == Some(&0)
+    };
+    if !session.station.rx_ba.active(0) || frames.iter().any(|(_, f)| ba_disable(f) || delba(f)) {
+        return Err("a GTK rekey tore down the recipient BA agreement");
+    }
+    // Reordering continues across the GTK rekey.
+    session.backend.packets.push_back(data(0, 51, Some(2), 2));
+    session.backend.packets.push_back(data(0, 50, Some(1), 1));
+    for n in [1, 2] {
+        if session.receive_ethernet() != Ok(expected(n)) {
+            return Err("BA reordering stopped after a GTK rekey");
+        }
+    }
+
+    // A PTK rekey retires the agreement and sends the recipient DELBA.
+    let before = session.backend.frames.len();
+    session.backend.packets.push_back(pairwise_m1(10));
+    consume(&mut session, "second PTK rekey M1 capture")?;
+    run(session.service_keys()).map_err(|_| "second PTK rekey M2")?;
+    let sent: Vec<&Vec<u8>> = session.backend.frames[before..]
+        .iter()
+        .map(|(_, f)| f)
+        .filter(|&f| delba(f))
+        .collect();
+    if session.station.rx_ba.owns(0)
+        || sent.len() != 1
+        || sent[0].get(4..10) != Some(&AP[..])
+        || sent[0].get(26..30) != Some(&[0, 0, 36, 0][..])
+    {
+        return Err("a PTK rekey did not retire the agreement with one DELBA (36)");
+    }
+    Ok(())
+}
+fn mt76_rx_ba_gtk_rekey_keeps_agreements_and_ptk_rekey_sends_delba() -> TestResult {
+    gtk_rekey().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx-ba-gtk-rekey",
+    mt76_rx_ba_gtk_rekey_keeps_agreements_and_ptk_rekey_sends_delba
+);
+
 fn mt76_rx_ba_rekey_receipts_fence_old_windows_before_ptk_and_reset() -> TestResult {
     rekey().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
