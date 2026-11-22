@@ -453,6 +453,20 @@ impl IntelHda {
     /// as the new command's response.
     fn init_cmd_io(&self) -> Result<(), HdaError> {
         let bar = self.bar0;
+        // `snd_hdac_bus_stop_cmd_io`: the ring bases and pointers may only
+        // change with both DMA engines stopped. After a link reset they
+        // already are; a ring restart on a running controller stops them
+        // here, and nothing in flight survives.
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        unsafe {
+            bar.write8(REG_RIRBCTL, 0);
+            bar.write8(REG_CORBCTL, 0);
+        }
+        // `hdac_wait_for_cmd_dmas`: bounded, and like Linux not an error.
+        // SAFETY: as above.
+        wait(|| unsafe { bar.read8(REG_RIRBCTL) } & RIRBCTL_RUN == 0, 100);
+        // SAFETY: as above.
+        wait(|| unsafe { bar.read8(REG_CORBCTL) } & CORBCTL_RUN == 0, 100);
         // SAFETY: Controller owns this live BAR and its retained CORB/RIRB
         // buffers; fixed register offsets are inside the validated window.
         unsafe {
@@ -878,14 +892,21 @@ impl IntelHda {
     /// # Safety
     /// This object exclusively owns the controller command transport.
     pub unsafe fn send_verb(&self, verb: u32) -> Result<u32, HdaError> {
+        let mut result = Err(HdaError::Suspended);
         for _ in 0..2 {
             self.ensure_active()?;
-            match self.exec_verb(verb, true) {
-                Err(HdaError::Suspended) => continue,
-                result => return result,
+            result = self.exec_verb(verb, true);
+            // A parked controller is woken and the command tried again; so
+            // is a lost response, on restarted rings, as
+            // `azx_rirb_get_response` retries after each fallback.
+            if !matches!(
+                result,
+                Err(HdaError::Suspended | HdaError::CommandTimeout | HdaError::DeviceFailed)
+            ) {
+                break;
             }
         }
-        Err(HdaError::Suspended)
+        result
     }
     /// A command issued by a PM transition or by probe (Linux `codec_in_pm`):
     /// no power-up and no `suspended` gate, the caller owns the transition.
@@ -900,9 +921,7 @@ impl IntelHda {
         if gated && self.suspended.load(Ordering::Acquire) {
             return Err(HdaError::Suspended);
         }
-        if self.irq.failed.load(Ordering::Acquire) {
-            return Err(HdaError::DeviceFailed);
-        }
+        self.ready_transport()?;
         self.post(verb)?;
         lease.pending = true;
         let mut reply = Ok(None);
@@ -920,6 +939,46 @@ impl IntelHda {
         let value = reply?.ok_or(HdaError::CommandTimeout)?;
         lease.pending = false;
         Ok(value)
+    }
+    /// Make the command rings usable for the next command; the caller holds
+    /// the command lease.
+    ///
+    /// A command that timed out or was cancelled leaves `irq.failed` set: a
+    /// late reply may still land and be taken as the next command's. Linux
+    /// `azx_rirb_get_response` falls back instead of giving up (polling
+    /// mode, MSI off, then a bus reset or single_cmd mode, which stops the
+    /// rings with `snd_hdac_bus_stop_cmd_io`). Here both rings restart
+    /// (`init_cmd_io`), which drops whatever was in flight; the link, the
+    /// codecs and the stream DMA are left alone. Before, nothing but the
+    /// resume of a parked controller cleared the flag, so one lost
+    /// response failed every later command on a running controller.
+    ///
+    /// A controller whose command engine stopped without a park lost its
+    /// state (a function reset or power loss, which reads like the parked
+    /// rings: pointers and controls 0): with the link in reset it is
+    /// marked parked, so the next wake re-initialises it and the codecs.
+    fn ready_transport(&self) -> Result<(), HdaError> {
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        let control = unsafe { self.bar0.read8(REG_CORBCTL) };
+        if control == u8::MAX {
+            // The function no longer decodes its BAR.
+            return Err(HdaError::DeviceFailed);
+        }
+        if control & CORBCTL_RUN == 0 {
+            // SAFETY: as above.
+            if unsafe { self.bar0.read32(REG_GCTL) } & GCTL_CRST == 0 {
+                narf_console::write_str("hda: controller lost its state; re-initialising\n");
+                self.suspended.store(true, Ordering::Release);
+                return Err(HdaError::Suspended);
+            }
+            self.irq.failed.store(true, Ordering::Release);
+        }
+        if self.irq.failed.load(Ordering::Acquire) {
+            self.init_cmd_io()?;
+            self.irq.failed.store(false, Ordering::Release);
+            narf_console::write_str("hda: command rings restarted after a lost response\n");
+        }
+        Ok(())
     }
     /// `azx_get_response` timed out: the command and ring state.
     fn report_timeout(&self, verb: u32) {
@@ -942,8 +1001,9 @@ impl IntelHda {
     /// `bus->rirb_wq`). Every poll re-reads the ring, so a caller that
     /// re-polls at once (`block_on_spin`) sees the reply as soon as the codec
     /// posts it, while a task sleeps until the controller's interrupt or the
-    /// 1 ms period. Cancellation poisons the transport until reset,
-    /// preventing a late response from being assigned to a subsequent command.
+    /// 1 ms period. Cancellation poisons the transport until the next command
+    /// restarts the rings (`ready_transport`), so a late response is never
+    /// assigned to a subsequent command.
     /// # Safety
     /// Same exclusive device ownership as send_verb.
     pub async unsafe fn send_verb_async(&self, verb: u32) -> Result<u32, HdaError> {
@@ -959,9 +1019,7 @@ impl IntelHda {
         if self.suspended.load(Ordering::Acquire) {
             return Err(HdaError::Suspended);
         }
-        if self.irq.failed.load(Ordering::Acquire) {
-            return Err(HdaError::DeviceFailed);
-        }
+        self.ready_transport()?;
         self.post(verb)?;
         lease.pending = true;
         let deadline = Deadline::after_ms(COMMAND_TIMEOUT_MS);
@@ -1532,13 +1590,26 @@ impl IntelHda {
         Ok(())
     }
 
-    /// PCM bring-up entry: reinit a parked controller before any
-    /// path that sends verbs or programs streams.
+    /// Linux `snd_hda_power_up_pm`: wake a parked controller, and restart a
+    /// failed command transport, before any path that sends verbs or
+    /// programs streams.
     pub(super) fn ensure_active(&self) -> Result<(), HdaError> {
-        if !self.suspended.load(Ordering::Acquire) {
-            return Ok(());
+        if self.suspended.load(Ordering::Acquire) {
+            self.reinit()?;
         }
-        self.reinit()
+        // A failed transport (a lost response, a latched controller error)
+        // is restarted here too: the stream paths refuse one, and nothing
+        // else may come by to restart it before the next open or prepare.
+        if self.irq.failed.load(Ordering::Acquire) {
+            let lease = self.acquire_command_blocking()?;
+            let ready = self.ready_transport();
+            drop(lease);
+            if ready == Err(HdaError::Suspended) {
+                return self.reinit();
+            }
+            ready?;
+        }
+        Ok(())
     }
 
     /// Best-effort idle transition for the PCM stop path: quiesce
