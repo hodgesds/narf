@@ -416,7 +416,10 @@ Intel PCH"), the id its last word (`card_id`, made unique by the registry,
 so "HDMI", "Generic", "Generic_1"), the long name "<short name> at 0x<BAR> irq
 <n>", the mixer name "<vendor> <chip>" of the first AFG codec, and
 `codec#A` opening with `print_codec_core_info`'s header. The free-running playback position adds
-the ring wraps the elapsed time implies at the stream's own rate.
+the ring wraps the elapsed time implies at the stream's own rate. An SDnLPIB
+at or past the buffer size reads as 0 (Linux `azx_get_position`; the spec
+counts LPIB "from 0 to the value in CBL"), a lap's end, never an xrun. HDA
+PCMs offer interleaved access only (`azx_pcm_hw`).
 
 ALSA stream hooks preserve DMA position and storage across pause/resume. HDA
 supports rewriting queued cyclic slots and delegates stop-threshold/silence
@@ -436,7 +439,8 @@ must restore controller programming before ALSA RESUME.
   slots. Capture validates against the pre-copy consumer position again
   after copying to detect overwrite races.
 - Underrun/overrun stops the stream and requires stop/prepare recovery.
-  HDA rejects a position sample gap long enough to hide a whole ring wrap.
+  HDA rejects a position sample gap long enough to hide a whole ring wrap
+  outside free-running mode; an LPIB reading of CBL is the end of a lap.
 - No HDA command is posted into a parked controller's rings, and nothing
   walks a parked controller's RIRB: the `suspended` check runs under the
   command lease, and the park sets it under the same lease.
