@@ -25,6 +25,7 @@ pub mod amd_aoac;
 /// AMD ASF (Alert Standard Format) transport scaffold.
 pub mod amd_asf;
 pub mod amd_pmc;
+pub mod amd_pmc_quirks;
 /// Battery / lid / buttons all consume the EC's platform-event
 /// feed. On aarch64 the equivalent path goes through SoC-specific
 /// PMIC drivers (not yet ported) — gate these on x86_64 too.
