@@ -3529,6 +3529,24 @@ impl core::future::Future for UserTaskFuture {
         // task's mm. Taking the slot makes a fault one-shot as well: put_user
         // failure does not make clone fail and is not retried.
         complete_set_child_tid(&mut this.set_child_tid, &this.task);
+        // The segment state the task starts with (`UserProcess::segs`: empty
+        // for a fresh image, the parent's for fork/clone): TLS descriptors
+        // and DS/ES/FS/GS, before the FS/GS bases below since a selector load
+        // replaces the base. Own-stack runs this poll once per task; from then
+        // on the scheduler's per-task copy is saved and restored on every
+        // switch.
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            let segs = this.process.segs;
+            narf_scheduler::stackful::set_current_user_segments(
+                segs.tls,
+                narf_arch::x86_64::segments::UserSelectors {
+                    ds: segs.ds,
+                    es: segs.es,
+                    fs: segs.fs,
+                    gs: segs.gs,
+                },
+            );
+        }
         // Program the per-task TLS thread pointer. Done after CR3
         // is in place — `IA32_FS_BASE` doesn't depend on the
         // page-table root, but pairing the writes here keeps the

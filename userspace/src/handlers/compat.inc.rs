@@ -3307,6 +3307,15 @@ fn do_execve_resolved(
         // the plan came from loading the image mapped in it.
         unsafe { crate::loader::page_in_plan(&new_as, &page_in_plan) };
         drop(page_in_plan);
+        // execve empties the TLS slots and nulls DS/ES/FS/GS (Linux
+        // `flush_thread` clears `tls_array`, `start_thread_common` loads null
+        // selectors) before the new image's FS/GS bases below: an i386
+        // image's %gs descriptor must not survive into its successor.
+        #[cfg(target_arch = "x86_64")]
+        narf_scheduler::stackful::set_current_user_segments(
+            [0; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES],
+            narf_arch::x86_64::segments::UserSelectors::default(),
+        );
         #[cfg(target_arch = "x86_64")]
         if let Some(fb) = fs_base {
             // SAFETY: canonical user vaddr from the new image's TLS staging.

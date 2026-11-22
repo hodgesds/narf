@@ -270,7 +270,21 @@ descriptors and selectors (Linux `thread.tls_array`, `ds`, `es`,
 the task's descriptors into the running CPU's slots 12..=14, then its
 selectors (GS through `load_gs_index`'s `swapgs` bracket with interrupts
 masked; a selector whose descriptor is no longer loadable becomes null),
-then the FS/GS bases.
+then the FS/GS bases. A register is reloaded only when it or its
+replacement is non-null, so 64-bit-only switches reload nothing. A nested
+poll restores the outer task's whole segment state after the inner task
+yields. The first own-stack poll applies `UserProcess::segs`; execve
+empties the slots and nulls the selectors.
+
+`set_thread_area` (i386 243) and `get_thread_area` (244) follow
+`arch/x86/kernel/tls.c`: `tls_desc_okay` (no 16-bit, code or non-present
+segments; `LDT_empty`/`LDT_zero` clear a slot), entry -1 allocates the
+first empty slot and writes its index back (-ESRCH when none), indexes
+outside 12..=14 are -EINVAL, `fill_ldt` never sets L, and a data segment
+register naming the rewritten slot is reloaded. `clone_settls` /
+`set_child_tls` apply a `CLONE_SETTLS` descriptor to a child's
+`UserSegments` (no allocation) and set the child's FS or GS base when its
+selector names the slot.
 
 ```rust
 // narf_scheduler::stackful (x86_64)

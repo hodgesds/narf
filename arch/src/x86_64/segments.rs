@@ -26,7 +26,8 @@
 //! scheduler's switch-in can rewrite the running CPU's TLS slots without
 //! depending on `frame`.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::arch::asm;
+use core::sync::atomic::{compiler_fence, AtomicPtr, Ordering};
 
 /// Descriptors in every CPU's GDT (Linux `GDT_ENTRIES`).
 pub const GDT_ENTRIES: usize = 16;
@@ -166,31 +167,81 @@ impl UserDesc {
 }
 
 /// Linux `LDT_empty`: the explicit "no segment" request.
-pub fn ldt_empty(_info: &UserDesc) -> bool {
-    false
+pub fn ldt_empty(info: &UserDesc) -> bool {
+    info.base_addr == 0
+        && info.limit == 0
+        && info.contents() == 0
+        && info.read_exec_only() == 1
+        && info.seg_32bit() == 0
+        && info.limit_in_pages() == 0
+        && info.seg_not_present() == 1
+        && info.useable() == 0
 }
 
 /// Linux `LDT_zero`: an all-zero request, also read as "no segment".
-pub fn ldt_zero(_info: &UserDesc) -> bool {
-    false
+pub fn ldt_zero(info: &UserDesc) -> bool {
+    info.base_addr == 0
+        && info.limit == 0
+        && info.contents() == 0
+        && info.read_exec_only() == 0
+        && info.seg_32bit() == 0
+        && info.limit_in_pages() == 0
+        && info.seg_not_present() == 0
+        && info.useable() == 0
 }
 
-/// Linux `tls_desc_okay`: may `info` be installed in a TLS slot?
-pub fn tls_desc_okay(_info: &UserDesc) -> bool {
-    false
+/// Linux `tls_desc_okay`: may `info` be installed in a TLS slot? A "no
+/// segment" request always may; otherwise only a present 32-bit data
+/// segment: 16-bit segments need espfix (LDT only), code segments do not
+/// belong in the TLS array, and non-present DPL-3 segments are refused as
+/// attack surface.
+pub fn tls_desc_okay(info: &UserDesc) -> bool {
+    if ldt_empty(info) || ldt_zero(info) {
+        return true;
+    }
+    info.seg_32bit() != 0 && info.contents() <= 1 && info.seg_not_present() == 0
 }
 
 /// Linux `fill_ldt`: the GDT descriptor `info` asks for (DPL 3, accessed,
 /// never long mode).
-pub fn fill_ldt(_info: &UserDesc) -> u64 {
-    0
+pub fn fill_ldt(info: &UserDesc) -> u64 {
+    let limit = u64::from(info.limit);
+    let base = u64::from(info.base_addr);
+    // Type: writable unless read_exec_only, the contents bits, and the
+    // accessed bit set so the CPU never has to write the descriptor.
+    let ty = (u64::from(info.read_exec_only() ^ 1) << 1) | (u64::from(info.contents()) << 2) | 1;
+    (limit & 0xFFFF)
+        | ((base & 0xFF_FFFF) << 16)
+        | (ty << 40)
+        | (1 << 44) // S: code/data
+        | (3 << 45) // DPL 3
+        | (u64::from(info.seg_not_present() ^ 1) << 47)
+        | (((limit >> 16) & 0xF) << 48)
+        | (u64::from(info.useable()) << 52)
+        // L (bit 53) stays 0: `lm` is never honoured.
+        | (u64::from(info.seg_32bit()) << 54)
+        | (u64::from(info.limit_in_pages()) << 55)
+        | (((base >> 24) & 0xFF) << 56)
 }
 
 /// Linux `fill_user_desc`: report TLS slot `idx` (12..=14) holding `desc`.
-pub fn fill_user_desc(idx: u32, _desc: u64) -> UserDesc {
+pub fn fill_user_desc(idx: u32, desc: u64) -> UserDesc {
+    let bit = |n: u32| ((desc >> n) & 1) as u32;
+    let ty = ((desc >> 40) & 0xF) as u32;
+    let base = ((desc >> 16) & 0xFF_FFFF) | (((desc >> 56) & 0xFF) << 24);
+    let limit = (desc & 0xFFFF) | (((desc >> 48) & 0xF) << 16);
+    let flags = bit(54) // seg_32bit = D
+        | ((ty >> 2) << 1) // contents
+        | ((((ty >> 1) & 1) ^ 1) << 3) // read_exec_only = !(type & 2)
+        | (bit(55) << 4) // limit_in_pages = G
+        | ((bit(47) ^ 1) << 5) // seg_not_present = !P
+        | (bit(52) << 6) // useable = AVL
+        | (bit(53) << 7); // lm = L
     UserDesc {
         entry_number: idx,
-        ..UserDesc::default()
+        base_addr: base as u32,
+        limit: limit as u32,
+        flags,
     }
 }
 
@@ -200,8 +251,10 @@ pub const fn desc_empty(desc: u64) -> bool {
 }
 
 /// Linux `get_free_idx`: the GDT index of the first empty TLS slot.
-pub fn get_free_idx(_tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) -> Option<u32> {
-    None
+pub fn get_free_idx(tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) -> Option<u32> {
+    tls.iter()
+        .position(|desc| desc_empty(*desc))
+        .map(|slot| (GDT_ENTRY_TLS_MIN + slot) as u32)
 }
 
 // ── Data-segment selectors (`__switch_to`, `save_fsgs`) ─────────────
@@ -238,19 +291,72 @@ impl UserSelectors {
 
 /// The live DS/ES/FS/GS selectors (Linux `savesegment`).
 pub fn read_user_selectors() -> UserSelectors {
-    UserSelectors::default()
+    let (ds, es, fs, gs): (u16, u16, u16, u16);
+    // SAFETY: moves from segment registers have no side effect.
+    unsafe {
+        asm!(
+            "mov {d:x}, ds",
+            "mov {e:x}, es",
+            "mov {f:x}, fs",
+            "mov {g:x}, gs",
+            d = out(reg) ds,
+            e = out(reg) es,
+            f = out(reg) fs,
+            g = out(reg) gs,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    UserSelectors { ds, es, fs, gs }
 }
 
 /// The running CPU's TLS slots 12..=14, or zeros before its GDT is
 /// registered.
 pub fn cpu_tls() -> [u64; GDT_ENTRY_TLS_ENTRIES] {
-    [0; GDT_ENTRY_TLS_ENTRIES]
+    let mut tls = [0; GDT_ENTRY_TLS_ENTRIES];
+    let gdt = cpu_gdt(crate::x86_64::cpu::current_cpu() as usize);
+    if gdt.is_null() {
+        return tls;
+    }
+    for (slot, desc) in tls.iter_mut().enumerate() {
+        // SAFETY: a registered GDT has GDT_ENTRIES descriptors and
+        // GDT_ENTRY_TLS_MIN + slot < GDT_ENTRIES.
+        *desc = unsafe { core::ptr::read_volatile(gdt.add(GDT_ENTRY_TLS_MIN + slot)) };
+    }
+    tls
+}
+
+/// Is `desc` a present DPL-3 code/data descriptor a data segment register
+/// may hold (data, or readable code)?
+fn desc_user_loadable(desc: u64) -> bool {
+    let present = desc & (1 << 47) != 0;
+    let code_or_data = desc & (1 << 44) != 0;
+    let dpl3 = (desc >> 45) & 3 == 3;
+    let code = desc & (1 << 43) != 0;
+    let readable = desc & (1 << 41) != 0;
+    present && code_or_data && dpl3 && (!code || readable)
 }
 
 /// Would loading `sel` into a data segment register at CPL 0 succeed, with
-/// `tls` in the TLS slots?
-pub fn selector_loadable(_sel: u16, _tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) -> bool {
-    false
+/// `tls` in the TLS slots? True for the null selector (any RPL), the three
+/// static user segments, and a TLS selector whose slot holds a present
+/// DPL-3 descriptor. Everything else — kernel and system descriptors, empty
+/// slots, LDT selectors (no LDT is ever installed), indexes past the table —
+/// is reported unloadable, and the reload paths load null instead (what
+/// Linux's `loadsegment` / `asm_load_gs_index` fault fixups do).
+pub fn selector_loadable(sel: u16, tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) -> bool {
+    if sel & !3 == 0 {
+        return true;
+    }
+    if sel & 4 != 0 {
+        return false;
+    }
+    match usize::from(sel >> 3) {
+        GDT_ENTRY_DEFAULT_USER32_CS | GDT_ENTRY_DEFAULT_USER_DS | GDT_ENTRY_DEFAULT_USER_CS => true,
+        index @ GDT_ENTRY_TLS_MIN..=GDT_ENTRY_TLS_MAX => {
+            desc_user_loadable(tls[index - GDT_ENTRY_TLS_MIN])
+        }
+        _ => false,
+    }
 }
 
 /// Linux `native_load_tls`: copy `tls` into the running CPU's slots 12..=14.
@@ -258,7 +364,83 @@ pub fn selector_loadable(_sel: u16, _tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) -> bool
 /// # Safety
 /// CPL 0, and the caller keeps this CPU (interrupts masked) until it has
 /// loaded the selectors that depend on the new slots.
-pub unsafe fn load_tls(_tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) {}
+pub unsafe fn load_tls(tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) {
+    let gdt = cpu_gdt(crate::x86_64::cpu::current_cpu() as usize);
+    if gdt.is_null() {
+        return;
+    }
+    compiler_fence(Ordering::SeqCst);
+    for (slot, desc) in tls.iter().enumerate() {
+        // SAFETY: a registered GDT has GDT_ENTRIES writable descriptors and
+        // only its own CPU writes its TLS slots; the caller holds this CPU.
+        unsafe { core::ptr::write_volatile(gdt.add(GDT_ENTRY_TLS_MIN + slot), *desc) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// `mov ds, sel`.
+///
+/// # Safety
+/// CPL 0; `sel` loadable ([`selector_loadable`]).
+unsafe fn load_ds(sel: u16) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees the load cannot fault; 64-bit kernel
+    // code ignores DS.
+    unsafe { asm!("mov ds, {s:x}", s = in(reg) sel, options(nostack, preserves_flags)) };
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// `mov es, sel`.
+///
+/// # Safety
+/// As [`load_ds`].
+unsafe fn load_es(sel: u16) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: as `load_ds`.
+    unsafe { asm!("mov es, {s:x}", s = in(reg) sel, options(nostack, preserves_flags)) };
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// `mov fs, sel`. Replaces the FS base with the descriptor's; the caller
+/// writes the base it wants afterwards.
+///
+/// # Safety
+/// As [`load_ds`]; FS is user state only (the kernel's per-CPU base is GS).
+unsafe fn load_fs(sel: u16) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: as `load_ds`.
+    unsafe { asm!("mov fs, {s:x}", s = in(reg) sel, options(nostack, preserves_flags)) };
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Load the user's GS selector without disturbing the kernel's GS base
+/// (Linux `asm_load_gs_index`): `swapgs` so the user base is the live one,
+/// `mov gs`, then `swapgs` back, with interrupts masked across the bracket
+/// so no interrupt runs on the user GS base. The descriptor's base ends up
+/// as the user (inactive) base. `mfence` as Linux's
+/// `X86_BUG_SWAPGS_FENCE` alternative.
+///
+/// # Safety
+/// CPL 0 with the kernel GS base live; `sel` loadable.
+unsafe fn swapgs_load_gs(sel: u16) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees the load cannot fault and that the
+    // kernel GS base is live on entry, so the two `swapgs` leave it live
+    // again; pushfq/popfq restore the caller's IF.
+    unsafe {
+        asm!(
+            "pushfq",
+            "cli",
+            "swapgs",
+            "mov gs, {s:x}",
+            "mfence",
+            "swapgs",
+            "popfq",
+            s = in(reg) sel,
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
 
 /// Linux `load_gs_index`: load the user's GS selector while the kernel GS
 /// base is live, leaving the descriptor's base as the user (inactive) GS
@@ -268,22 +450,77 @@ pub unsafe fn load_tls(_tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) {}
 /// CPL 0 with the kernel GS base live. A selector that is not loadable
 /// ([`selector_loadable`] against the running CPU's slots) is replaced by
 /// the null selector, as Linux's fault fixup does.
-pub unsafe fn load_gs_index(_sel: u16) {}
+pub unsafe fn load_gs_index(sel: u16) {
+    let sel = if selector_loadable(sel, &cpu_tls()) {
+        sel
+    } else {
+        0
+    };
+    // SAFETY: the caller's contract; `sel` is loadable.
+    unsafe { swapgs_load_gs(sel) };
+}
 
 /// The segment-register half of Linux `__switch_to`: load `next`'s DS, ES,
-/// FS and GS (the caller writes the FS/GS bases afterwards).
+/// FS and GS (the caller writes the FS/GS bases afterwards). A register is
+/// reloaded only when it or its replacement is non-null (the common
+/// 64-bit-to-64-bit switch reloads nothing); a selector whose descriptor is
+/// no longer loadable becomes null.
 ///
 /// # Safety
 /// CPL 0 with the kernel GS base live and interrupts masked; `tls` must be
 /// what [`load_tls`] just put in this CPU's slots.
-pub unsafe fn load_user_selectors(_next: UserSelectors, _tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) {}
+pub unsafe fn load_user_selectors(next: UserSelectors, tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) {
+    let cur = read_user_selectors();
+    let sanitize = |sel: u16| if selector_loadable(sel, tls) { sel } else { 0 };
+    // SAFETY: every selector below is sanitized, so no load faults; the
+    // caller's contract covers the GS bracket.
+    unsafe {
+        if (cur.ds | next.ds) != 0 {
+            load_ds(sanitize(next.ds));
+        }
+        if (cur.es | next.es) != 0 {
+            load_es(sanitize(next.es));
+        }
+        if (cur.fs | next.fs) != 0 {
+            load_fs(sanitize(next.fs));
+        }
+        if (cur.gs | next.gs) != 0 {
+            swapgs_load_gs(sanitize(next.gs));
+        }
+    }
+}
 
 /// Linux `do_set_thread_area`'s refresh: reload every data segment register
-/// whose selector is `modified` (a TLS slot just rewritten in `tls`).
+/// whose selector is `modified` (a TLS slot just rewritten in `tls`), so its
+/// hidden base and limit follow the new descriptor; an emptied slot leaves
+/// the register null.
 ///
 /// # Safety
 /// As [`load_user_selectors`].
-pub unsafe fn reload_selector_users(_modified: u16, _tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) {}
+pub unsafe fn reload_selector_users(modified: u16, tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) {
+    let cur = read_user_selectors();
+    let target = if selector_loadable(modified, tls) {
+        modified
+    } else {
+        0
+    };
+    // SAFETY: `target` is loadable; the caller's contract covers the GS
+    // bracket.
+    unsafe {
+        if cur.ds == modified {
+            load_ds(target);
+        }
+        if cur.es == modified {
+            load_es(target);
+        }
+        if cur.fs == modified {
+            load_fs(target);
+        }
+        if cur.gs == modified {
+            swapgs_load_gs(target);
+        }
+    }
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 

@@ -1331,13 +1331,59 @@ pub fn set_current_user_gs_base(gs_base: u64) {
 /// validated (`segments::tls_desc_okay` / `fill_ldt`); 0 empties the slot.
 #[cfg(target_arch = "x86_64")]
 pub fn set_current_user_tls_desc(slot: usize, desc: u64) {
-    let _ = (slot, desc);
+    use narf_arch::x86_64::segments;
+    if slot >= segments::GDT_ENTRY_TLS_ENTRIES {
+        return;
+    }
+    // Interrupts masked (Linux `get_cpu`): no preemption or migration between
+    // the slot write, the GDT load and the selector refresh.
+    narf_lib::sync::without_interrupts(|| {
+        let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+        let mut tls = if p.is_null() {
+            segments::cpu_tls()
+        } else {
+            // SAFETY: CURRENT names the in-flight task on this CPU.
+            task_user_tls(unsafe { &*p })
+        };
+        tls[slot] = desc;
+        if !p.is_null() {
+            // SAFETY: as above.
+            unsafe { (*p).user_tls[slot].store(desc, Ordering::Relaxed) };
+        }
+        let modified = (((segments::GDT_ENTRY_TLS_MIN + slot) << 3) | 3) as u16;
+        // SAFETY: CPL0 with the kernel GS live (syscall context) and IRQs
+        // masked; `tls` is what this CPU's slots hold after `load_tls`.
+        unsafe {
+            segments::load_tls(&tls);
+            segments::reload_selector_users(modified, &tls);
+        }
+        if !p.is_null() {
+            // A GS refresh replaced the user GS base with the descriptor's;
+            // keep the per-task slot current, as `set_current_user_gs_base`.
+            // SAFETY: CPL0, kernel GS live; CURRENT is the in-flight task.
+            unsafe {
+                (*p).user_gs_base.store(
+                    narf_arch::x86_64::user_mode::user_gs_base(),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    });
 }
 
-/// The CURRENT task's three TLS descriptors (Linux `thread.tls_array`).
+/// The CURRENT task's three TLS descriptors (Linux `thread.tls_array`), or
+/// the running CPU's slots when no stackful task is current.
 #[cfg(target_arch = "x86_64")]
 pub fn current_user_tls() -> [u64; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES] {
-    [0; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES]
+    narf_lib::sync::without_interrupts(|| {
+        let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+        if p.is_null() {
+            narf_arch::x86_64::segments::cpu_tls()
+        } else {
+            // SAFETY: CURRENT names the in-flight task on this CPU.
+            task_user_tls(unsafe { &*p })
+        }
+    })
 }
 
 /// The CURRENT task's segment state as fork/clone must copy it (Linux
@@ -1363,7 +1409,76 @@ pub fn set_current_user_segments(
     tls: [u64; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES],
     sel: narf_arch::x86_64::segments::UserSelectors,
 ) {
-    let _ = (tls, sel);
+    narf_lib::sync::without_interrupts(|| {
+        let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+        if !p.is_null() {
+            // SAFETY: CURRENT names the in-flight task on this CPU.
+            let task = unsafe { &*p };
+            for (cell, desc) in task.user_tls.iter().zip(tls.iter()) {
+                cell.store(*desc, Ordering::Relaxed);
+            }
+            task.user_sel.store(sel.pack(), Ordering::Relaxed);
+        }
+        // SAFETY: CPL0 with the kernel GS live and IRQs masked; the
+        // selectors are checked against the slots just loaded.
+        unsafe {
+            narf_arch::x86_64::segments::load_tls(&tls);
+            narf_arch::x86_64::segments::load_user_selectors(sel, &tls);
+        }
+    });
+}
+
+/// A task's three TLS descriptors (GDT slots 12..=14).
+#[cfg(target_arch = "x86_64")]
+type UserTls = [u64; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES];
+
+/// `task`'s TLS descriptors.
+#[cfg(target_arch = "x86_64")]
+fn task_user_tls(task: &KernelTask) -> UserTls {
+    let mut tls: UserTls = [0; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES];
+    for (desc, cell) in tls.iter_mut().zip(task.user_tls.iter()) {
+        *desc = cell.load(Ordering::Relaxed);
+    }
+    tls
+}
+
+/// The segment half of Linux `__switch_to` for `task`, which is about to
+/// run on this CPU: its TLS descriptors into the GDT slots (`load_TLS`),
+/// then its DS/ES/FS/GS (`load_seg_legacy`; GS through the `swapgs`
+/// bracket). The caller writes the FS/GS bases afterwards, since a selector
+/// load replaces the base with the descriptor's.
+#[cfg(target_arch = "x86_64")]
+fn load_user_segments(task: &KernelTask) {
+    let tls = task_user_tls(task);
+    let sel =
+        narf_arch::x86_64::segments::UserSelectors::unpack(task.user_sel.load(Ordering::Relaxed));
+    narf_lib::sync::without_interrupts(|| {
+        // SAFETY: every switch path runs at CPL0 with the kernel GS live;
+        // IRQs are masked across the slot writes and the GS bracket, and the
+        // selectors are checked against the slots just loaded.
+        unsafe {
+            narf_arch::x86_64::segments::load_tls(&tls);
+            narf_arch::x86_64::segments::load_user_selectors(sel, &tls);
+        }
+    });
+}
+
+/// Put `task`'s whole user segment state back on this CPU: descriptors,
+/// selectors, then the GS base and (once published) the FS base. For the
+/// outer task of a nested poll, whose state the inner task's switch-in
+/// replaced while the outer continuation is still in the kernel.
+#[cfg(target_arch = "x86_64")]
+fn restore_user_segment_state(task: &KernelTask) {
+    load_user_segments(task);
+    // SAFETY: CPL0 with the kernel GS live; this task's own saved values.
+    unsafe {
+        narf_arch::x86_64::user_mode::set_user_gs_base(task.user_gs_base.load(Ordering::Relaxed));
+    }
+    if task.user_tls_valid.load(Ordering::Acquire) {
+        let fs_base = task.user_fs_base.load(Ordering::Relaxed);
+        // SAFETY: as above; a canonical base this task published.
+        unsafe { narf_arch::x86_64::user_mode::set_user_fs_base(fs_base) };
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1382,6 +1497,13 @@ fn user_fpu_save_task(cpu: usize, task: &KernelTask) {
     // SAFETY: CPL0 on a scheduler path, so the kernel GS is the live one.
     let gs_base = unsafe { narf_arch::x86_64::user_mode::user_gs_base() };
     task.user_gs_base.store(gs_base, Ordering::Relaxed);
+    // And the selectors (Linux `save_fsgs` / `savesegment`): user code loads
+    // them without a syscall (i386 glibc's `mov gs, 0x63`), and the kernel
+    // never changes them on the way in, so the live registers are the task's.
+    task.user_sel.store(
+        narf_arch::x86_64::segments::read_user_selectors().pack(),
+        Ordering::Relaxed,
+    );
     // PKRU is user task state but is not guarded by CR0.TS: a task can execute
     // WRPKRU before it uses FP/SIMD. Save it even when the lazy FPU image was
     // never materialized, otherwise its rights would leak to the next task.
@@ -1587,6 +1709,9 @@ pub(crate) fn request_current_sync_requeue(target_cpu: u32) {
 unsafe fn prepare_direct_arch_state(task: &KernelTask) {
     let top = ((task.stack.as_ptr() as u64) + task.stack.len() as u64) & !0xFu64;
     crate::retarget_kernel_stack(top);
+    // TLS slots and selectors first: a selector load replaces the base the
+    // writes below then set.
+    load_user_segments(task);
     // SAFETY: CPL0 with the kernel GS live; the value is the task's own user
     // GS base (zero until it sets one), which only `swapgs` on the way out
     // makes visible.
@@ -2628,6 +2753,18 @@ pub struct KernelTask {
     /// unconditionally is what keeps another task's value from leaking in.
     #[cfg(target_arch = "x86_64")]
     user_gs_base: AtomicU64,
+    /// The task's IA-32 TLS descriptors for GDT slots 12..=14 (Linux
+    /// `thread.tls_array`), written by `set_thread_area`
+    /// ([`set_current_user_tls_desc`]) and loaded into the running CPU's GDT
+    /// on every switch-in (`load_TLS`). Zero (empty) for a fresh task.
+    #[cfg(target_arch = "x86_64")]
+    user_tls: [AtomicU64; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES],
+    /// The task's DS/ES/FS/GS selectors (Linux `thread.ds`, `es`, `fsindex`,
+    /// `gsindex`), `UserSelectors::pack`ed: saved from the live registers at
+    /// every switch-out, reloaded at every switch-in before the FS/GS bases.
+    /// Zero (all null) for a fresh task, as for a 64-bit Linux task.
+    #[cfg(target_arch = "x86_64")]
+    user_sel: AtomicU64,
     /// Owning scheduler wake cell. Its raw `stackful` back-pointer is cleared
     /// synchronously before this task is retired, while this Arc keeps the
     /// cell and direct address-space owner alive across a handoff.
@@ -2766,6 +2903,11 @@ impl KernelTask {
             user_fs_base: AtomicU64::new(0),
             #[cfg(target_arch = "x86_64")]
             user_gs_base: AtomicU64::new(0),
+            #[cfg(target_arch = "x86_64")]
+            user_tls: [const { AtomicU64::new(0) };
+                narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES],
+            #[cfg(target_arch = "x86_64")]
+            user_sel: AtomicU64::new(0),
             user_tls_valid: AtomicBool::new(false),
             wake_cell: narf_lib::sync::IrqSafeSpinLock::new(None),
             wake_cell_ptr: AtomicPtr::new(core::ptr::null_mut()),
@@ -3070,6 +3212,10 @@ impl KernelTask {
             // The user GS base likewise: unconditional, since zero is every
             // task's initial value and skipping it would hand this task the
             // previous task's GS.
+            // The TLS slots and selectors go first (Linux `load_TLS` before
+            // the segment loads): a selector load replaces the base the
+            // writes here then set.
+            load_user_segments(self);
             // SAFETY: CPL0 with the kernel GS live; this task's own value.
             unsafe {
                 narf_arch::x86_64::user_mode::set_user_gs_base(
@@ -3195,6 +3341,12 @@ impl KernelTask {
                 // before the outer kernel continuation resumes.
                 // SAFETY: same pinned outer-task invariant as the save above.
                 user_fpu_restore_task(cpu, unsafe { &*saved_current });
+                // The inner switch-in loaded the inner task's TLS slots,
+                // selectors and bases; the outer task returns to user mode
+                // from here, so it needs its own back (saved on entry).
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: same pinned outer-task invariant as the save above.
+                restore_user_segment_state(unsafe { &*saved_current });
                 #[cfg(feature = "instruction-quantum")]
                 // SAFETY: the same pinned outer continuation is resuming on this CPU.
                 instruction_switch(unsafe { &*saved_current }, true);
