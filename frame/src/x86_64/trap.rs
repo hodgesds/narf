@@ -1694,6 +1694,37 @@ unsafe extern "C" fn call_on_stack(arg: *mut u8, f: usize, top: u64) {
     );
 }
 
+/// Test-only observation point for the trap-entry AC invariant (#1303).
+///
+/// `common_trap` must clear EFLAGS.AC before any Rust runs, so a trap
+/// taken inside a STAC/CLAC user-access window (or from user code that
+/// set AC via POPF) never lets the handler touch user pages with SMAP
+/// enforcement off. The interrupted RFLAGS lives in the CPU-pushed
+/// frame and `iretq` restores it, so only the *live* flags inside the
+/// handler prove the entry sanitised anything — `frame.rflags` always
+/// shows the interrupted AC set. This hook samples the live flags at
+/// the top of `rust_trap_handler` while armed and records whether AC
+/// was set.
+///
+/// Compiled only under `kernel-test`: production builds pay nothing
+/// (no load, no branch) on the trap path.
+#[cfg(feature = "kernel-test")]
+static TRAP_ENTRY_AC_OBSERVE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "kernel-test")]
+static TRAP_ENTRY_AC_OBSERVED_SET: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Sample the live EFLAGS.AC inside the trap handler when the #1303
+/// observation is armed; one-shot (disarms after the first trap).
+#[cfg(feature = "kernel-test")]
+fn observe_trap_entry_ac() {
+    use core::sync::atomic::Ordering;
+    if TRAP_ENTRY_AC_OBSERVE_ARMED.swap(false, Ordering::Relaxed) {
+        TRAP_ENTRY_AC_OBSERVED_SET.store(narf_arch::x86_64::smap::read_ac(), Ordering::Relaxed);
+    }
+}
+
 /// Rust-side trap dispatch. Called from `common_trap` in `trap_entry.S`
 /// with a mutable pointer to the `TrapFrame` on the trap stack.
 ///
@@ -1708,6 +1739,8 @@ unsafe extern "C" fn call_on_stack(arg: *mut u8, f: usize, top: u64) {
 ///     does not return.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
+    #[cfg(feature = "kernel-test")]
+    observe_trap_entry_ac();
     dispatch_trap(frame);
     if scheduler_user_return_allowed(frame.cs, frame.vector) {
         if frame.vector == 128 {
@@ -4216,3 +4249,90 @@ kernel_test_in!(
     "frame/x86_64",
     smoke_scheduler_return_excludes_ist_exceptions
 );
+
+/// #1303: `common_trap` must clear EFLAGS.AC before the Rust handler
+/// runs, so a trap taken inside a STAC/CLAC window never lets the
+/// handler touch user pages with SMAP enforcement off.
+///
+/// Exercises the real entry path: arms the trap-entry AC observation,
+/// masks IRQs so no other trap can consume it, then faults inside
+/// `copy_user_guarded`'s own STAC window on a deliberately unmapped
+/// user address. The #PF enters through `common_trap`; the probe
+/// fixup returns the copy to its recovery label with `Err`, and the
+/// test asserts the handler observed AC clear. Without the `clac`
+/// in `common_trap` the handler observes AC set and this fails.
+///
+/// The interrupted window itself is untouched: `iretq` restores the
+/// saved RFLAGS (AC set) and the copy's recovery label sits before
+/// its own `clac`, so the faulting copy still closes its window.
+#[cfg(feature = "kernel-test")]
+fn smoke_trap_entry_clears_ac() -> TestResult {
+    use narf_arch::x86_64::smap;
+
+    if !smap::supported() {
+        return TestResult::Skip("SMAP not advertised by CPUID");
+    }
+    let was_enabled = smap::is_enabled();
+    // SAFETY: SMAP supported; CR4 toggle benign at CPL=0.
+    unsafe {
+        smap::enable();
+    }
+    if !smap::is_enabled() {
+        return TestResult::Fail("CR4.SMAP did not stick after enable()");
+    }
+    let result = trap_entry_ac_after_guarded_fault();
+    if !was_enabled {
+        // SAFETY: restore prior CR4 state for tests-only.
+        unsafe {
+            smap::disable_for_test();
+        }
+    }
+    result
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!("frame/x86_64", smoke_trap_entry_clears_ac);
+
+/// Arm the #1303 trap-entry AC observation, then fault inside a
+/// `copy_user_guarded` STAC window on an unmapped user address and
+/// report whether the trap handler ran with EFLAGS.AC set. IRQs stay
+/// masked from arming to the fault so no other trap can consume the
+/// one-shot observation first.
+#[cfg(feature = "kernel-test")]
+fn trap_entry_ac_after_guarded_fault() -> TestResult {
+    use core::arch::asm;
+    use core::sync::atomic::Ordering;
+    use narf_arch::x86_64::smap;
+
+    // Save IF, then CLI: the observation is one-shot, so a timer IRQ
+    // landing between arming and the fault would consume it.
+    let saved_rflags: u64;
+    // SAFETY: pushfq/pop/cli are always legal at CPL=0. Not `nostack`
+    // (pushfq uses the stack); not `preserves_flags` (cli clears IF).
+    unsafe {
+        asm!("pushfq", "pop {f}", "cli", f = out(reg) saved_rflags);
+    }
+    TRAP_ENTRY_AC_OBSERVE_ARMED.store(true, Ordering::Relaxed);
+    TRAP_ENTRY_AC_OBSERVED_SET.store(false, Ordering::Relaxed);
+    let mut dst = [0u8; 1];
+    // SAFETY: `0x1000` is a deliberately unmapped user address;
+    // `copy_user_guarded` accepts an arbitrary/faulting user-side
+    // pointer by design and returns `Err` via the probe fixup.
+    let copied = unsafe { smap::copy_user_guarded(dst.as_mut_ptr(), 0x1000 as *const u8, 1) };
+    // Restore IF exactly as found.
+    if saved_rflags & (1 << 9) != 0 {
+        // SAFETY: re-enabling interrupts we disabled above.
+        unsafe {
+            asm!("sti", options(nostack));
+        }
+    }
+    if copied.is_ok() {
+        return TestResult::Fail("guarded copy from unmapped 0x1000 unexpectedly succeeded");
+    }
+    if TRAP_ENTRY_AC_OBSERVE_ARMED.load(Ordering::Relaxed) {
+        return TestResult::Fail("no trap fired inside the guarded copy window");
+    }
+    if TRAP_ENTRY_AC_OBSERVED_SET.load(Ordering::Relaxed) {
+        return TestResult::Fail("trap handler ran with EFLAGS.AC set (common_trap did not clac)");
+    }
+    TestResult::Pass
+}
