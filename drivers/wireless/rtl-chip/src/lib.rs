@@ -29,6 +29,7 @@ pub mod band5;
 pub mod efuse;
 pub mod mac;
 pub mod phy;
+pub mod phy_b22;
 pub mod radio;
 
 /// Terminal result of a chip register operation. Register programming only

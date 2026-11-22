@@ -50,7 +50,7 @@ pub struct Init {
 }
 
 /// `rtw_phy_write_rf_reg_sipi` for 8822B (RF0/RF1 SIPI aperture).
-async fn rf_write(io: &mut impl Io, path: u8, address: u16, data: u32) -> Result<(), Error> {
+pub async fn rf_write(io: &mut impl Io, path: u8, address: u16, data: u32) -> Result<(), Error> {
     if path > 1 || data & !0xfffff != 0 {
         return Err(Error::Unsupported);
     }
