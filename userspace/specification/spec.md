@@ -2835,6 +2835,19 @@ image's class: a 64-bit image clears READ_IMPLIES_EXEC
 READ_IMPLIES_EXEC when the image has no PT_GNU_STACK
 (`elf_read_implies_exec`, from `compat32::mm`).
 
+**Fork and clone.** i386 `fork` (2), `vfork` (190) and `clone3` (435) pass
+through; `clone` (120, `compat_sys_ia32_clone`) is CONFIG_CLONE_BACKWARDS —
+flags, newsp, parent_tid, tls, child_tid — and swaps tls and child_tid into
+the x86_64 order; `waitpid` (7) is `wait4` with no rusage. Every fork/clone
+child, of either ABI, starts as Linux `copy_thread` leaves it: in the
+caller's mode (`UserProcess::ia32 = TrapContext::in_compat_mode()`) with the
+caller's TLS descriptors and DS/ES/FS/GS (`UserProcess::segs =
+compat32::tls::current_segments()`) and FS/GS bases. CLONE_SETTLS from an
+i386 call (`in_ia32_syscall()`, `set_new_tls`) installs the `struct
+user_desc` at `tls` through `compat32::tls::clone_settls` — an explicit
+slot, no allocation — and fails the clone with its EINVAL/EFAULT before any
+child state is built; from a 64-bit call `tls` stays the FS base.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

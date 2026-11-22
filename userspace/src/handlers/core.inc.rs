@@ -12431,6 +12431,22 @@ fn child_tls_base(flags: u64, tls: u64) -> Option<u64> {
     }
 }
 
+/// The segment state a fork/clone child starts with: the parent's TLS
+/// descriptors and DS/ES/FS/GS selectors (Linux `copy_thread` after
+/// `save_fsgs`; `dup_task_struct` already copied `thread.tls_array`). A
+/// 64-bit task has them too — `set_thread_area` through `int 0x80` is open
+/// to it. Empty on aarch64, which has no segments.
+fn child_user_segments() -> crate::UserSegments {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::compat32::tls::current_segments()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        crate::UserSegments::default()
+    }
+}
+
 /// Test hook for [`child_tls_base`]: `CLONE_SETTLS` is implemented but was
 /// covered by nothing, so a regression in it would have stayed silent until a
 /// threaded program ran.
@@ -12503,6 +12519,39 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
+
+    // The child's thread state (Linux `copy_thread`): the parent's segment
+    // state and FS/GS bases, with CLONE_SETTLS applied — through `set_new_tls`,
+    // which for an i386 call (`in_ia32_syscall()`) installs the `struct
+    // user_desc` at `tls` in the child's TLS slots (`do_set_thread_area(p, -1,
+    // utls, 0)`) rather than taking it as an FS base. A bad descriptor fails
+    // the clone; it is checked here, before any child state exists, so that
+    // failure has nothing to undo.
+    #[cfg(target_arch = "x86_64")]
+    let (child_segs, child_fs_base, child_gs_base) = {
+        let mut segs = child_user_segments();
+        // SAFETY: CPL0 syscall context, kernel GS live.
+        let mut gs_base = unsafe { narf_arch::x86_64::user_mode::user_gs_base() };
+        if ctx.in_ia32_syscall() && flags & CLONE_SETTLS != 0 {
+            let mut fs_base = current_user_tls_base();
+            let ret = crate::compat32::tls::clone_settls(
+                &mut segs,
+                &mut gs_base,
+                &mut fs_base,
+                ca.tls,
+            );
+            if ret != 0 {
+                ctx.set_return(SyscallReturn::ok(ret as u64));
+                return;
+            }
+            (segs, fs_base, gs_base)
+        } else {
+            (segs, child_tls_base(flags, ca.tls), gs_base)
+        }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let (child_segs, child_fs_base, child_gs_base) =
+        (child_user_segments(), child_tls_base(flags, ca.tls), 0u64);
 
     // CLONE_VM: share AS via Arc::clone. Without it, this would be a
     // full fork — but pthread always passes CLONE_VM so the no-VM
@@ -12912,14 +12961,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         address_space: child_as.clone(),
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(rsp),
-        fs_base: child_tls_base(flags, ca.tls),
-        // Linux `copy_thread` copies the parent's GS base into the child (fork
-        // and threads alike); CLONE_SETTLS only replaces FS.
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: CPL0 syscall context, kernel GS live.
-        gs_base: unsafe { narf_arch::x86_64::user_mode::user_gs_base() },
-        #[cfg(not(target_arch = "x86_64"))]
-        gs_base: 0,
+        // Computed above with the segment state: the parent's bases, which a
+        // 64-bit CLONE_SETTLS replaces FS of and an i386 one may replace
+        // either of (whichever selector names the slot it rewrites).
+        fs_base: child_fs_base,
+        gs_base: child_gs_base,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
         // Zero sentinel, like `entry` above: a cloned task resumes from
@@ -12930,11 +12976,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         // No page-in plan (#740): nothing was loaded for this task —
         // its pages are the parent's, already resident or shared.
         page_in_plan: alloc::vec::Vec::new(),
-        // 64-bit child state. The IA-32 clone path copies the parent's mode
-        // and segments and applies CLONE_SETTLS through
-        // `compat32::tls::clone_settls`.
-        ia32: false,
-        segs: crate::UserSegments::default(),
+        // The caller's mode (`copy_thread` copies its saved CS) and the
+        // segment state computed above.
+        ia32: ctx.in_compat_mode(),
+        segs: child_segs,
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 

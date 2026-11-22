@@ -27,10 +27,12 @@ use crate::syscall::{Ia32Abi, Syscall, SyscallArgs, SyscallReturn, TrapContext};
 /// i386 system-call numbers (`syscall_32.tbl`).
 pub mod nr {
     pub const EXIT: u32 = 1;
+    pub const FORK: u32 = 2;
     pub const READ: u32 = 3;
     pub const WRITE: u32 = 4;
     pub const OPEN: u32 = 5;
     pub const CLOSE: u32 = 6;
+    pub const WAITPID: u32 = 7;
     pub const UNLINK: u32 = 10;
     pub const EXECVE: u32 = 11;
     pub const CHDIR: u32 = 12;
@@ -56,6 +58,7 @@ pub mod nr {
     pub const READLINK: u32 = 85;
     pub const MMAP: u32 = 90;
     pub const MUNMAP: u32 = 91;
+    pub const CLONE: u32 = 120;
     pub const UNAME: u32 = 122;
     pub const MPROTECT: u32 = 125;
     pub const PERSONALITY: u32 = 136;
@@ -69,6 +72,7 @@ pub mod nr {
     pub const PREAD64: u32 = 180;
     pub const PWRITE64: u32 = 181;
     pub const GETCWD: u32 = 183;
+    pub const VFORK: u32 = 190;
     pub const MMAP2: u32 = 192;
     pub const STAT64: u32 = 195;
     pub const LSTAT64: u32 = 196;
@@ -106,6 +110,7 @@ pub mod nr {
     pub const ARCH_PRCTL: u32 = 384;
     pub const RSEQ: u32 = 386;
     pub const CLOCK_GETTIME64: u32 = 403;
+    pub const CLONE3: u32 = 435;
     pub const FUTEX_TIME64: u32 = 422;
     pub const FACCESSAT2: u32 = 439;
 }
@@ -138,6 +143,17 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
         // `in_ia32_syscall`); the image may be either class.
         EXECVE => forward(ctx, Syscall::Execve),
         EXECVEAT => forward_sx(ctx, Syscall::Execveat, 0b10001),
+        // kernel/fork.c. The child returns to user mode in the caller's mode
+        // with its segment state (`copy_thread`), and an i386 CLONE_SETTLS
+        // names a `struct user_desc` (`set_new_tls`): the native handlers
+        // read both from the context.
+        FORK => forward(ctx, Syscall::Fork),
+        VFORK => forward(ctx, Syscall::Vfork),
+        CLONE => compat_sys_ia32_clone(ctx),
+        CLONE3 => forward(ctx, Syscall::Clone3),
+        // kernel/exit.c: `sys_waitpid` is `kernel_wait4(pid, stat_addr,
+        // options, NULL)`.
+        WAITPID => sys_waitpid(ctx),
         EXIT_GROUP => forward(ctx, Syscall::ExitGroup),
         // fs/read_write.c, fs/open.c, fs/pipe.c, fs/file.c
         READ => forward(ctx, Syscall::Read),
@@ -314,6 +330,39 @@ fn call_native(
     let mut native = Ia32ArgsCtx::capturing(ctx, args, abi);
     crate::syscall::dispatch_native(variant, &mut native);
     native.take_return()
+}
+
+// ── processes ────────────────────────────────────────────────────────
+
+/// `clone(flags, newsp, parent_tidptr, tls, child_tidptr)` (i386 120,
+/// `compat_sys_ia32_clone`): the 32-bit ABI is CONFIG_CLONE_BACKWARDS, TLS
+/// before the child tid where x86_64's `clone` takes the child tid first,
+/// so the two swap on the way to the native handler. `tls` is then a
+/// `struct user_desc` pointer, which the handler sees through
+/// `in_ia32_syscall()`. The flags are `unsigned long`: zero-extended.
+fn compat_sys_ia32_clone(ctx: &mut dyn TrapContext) -> Option<Syscall> {
+    let a = *ctx.args();
+    let args = SyscallArgs {
+        arg3: a.arg4,
+        arg4: a.arg3,
+        ..a
+    };
+    forward_args(ctx, Syscall::Clone, args, Ia32Abi::default())
+}
+
+/// `waitpid(pid, stat_addr, options)` (i386 7): `kernel_wait4` with no
+/// rusage. `pid` and `options` are `int`.
+fn sys_waitpid(ctx: &mut dyn TrapContext) -> Option<Syscall> {
+    let a = *ctx.args();
+    let args = SyscallArgs {
+        arg0: conv::sext(a.arg0),
+        arg1: a.arg1,
+        arg2: conv::sext(a.arg2),
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
+    };
+    forward_args(ctx, Syscall::Wait4, args, Ia32Abi::default())
 }
 
 /// `args` with the arguments `signed` names sign-extended from 32 bits.

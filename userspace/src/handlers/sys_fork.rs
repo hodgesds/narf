@@ -326,11 +326,12 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
         // No page-in plan (#740): the child's pages are the parent's —
         // already resident or shared — so there is nothing to cluster.
         page_in_plan: alloc::vec::Vec::new(),
-        // 64-bit child state. The IA-32 fork path copies the parent's mode
-        // (`ctx.in_compat_mode()`) and segments
-        // (`compat32::tls::current_segments`).
-        ia32: false,
-        segs: crate::UserSegments::default(),
+        // Linux `copy_thread`: the child returns to user mode in the
+        // parent's mode — its saved CS, so a compatibility-mode parent's
+        // child resumes with `__USER32_CS` — and with the parent's TLS
+        // descriptors and data selectors.
+        ia32: ctx.in_compat_mode(),
+        segs: child_user_segments(),
     };
 
     // Register the child under its TaskId but defer scheduler publication
