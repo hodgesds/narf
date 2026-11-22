@@ -320,6 +320,61 @@ impl SoftirqHandoff {
     }
 }
 
+/// What ended a [`softirq_run`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoftirqEnd {
+    /// A poll left the ring empty and the queue was completed: its
+    /// interrupt is enabled again.
+    Completed,
+    /// The softirq bound was spent with work left: the deferral task holds
+    /// the queue, and its interrupt stays masked.
+    Deferred,
+}
+
+/// One softirq run of a receive queue, from one IRQ wake: `__do_softirq`
+/// running `net_rx_action`.
+///
+/// `poll` is the queue's NAPI poll with [`DEFAULT_BUDGET`]: the frames it
+/// processed and whether the ring still holds work. When a poll leaves the
+/// ring empty the run calls `complete` (`napi_complete_done` and the
+/// driver's interrupt re-enable), which returns whether a frame landed
+/// meanwhile and the queue must be polled again. While work is left the
+/// run polls again, yielding to its own class in between, until its
+/// [`SoftirqBudget`] is spent; then it hands the queue to the deferral task
+/// through `handoff`.
+pub async fn softirq_run(
+    mut poll: impl FnMut() -> (u32, bool),
+    mut complete: impl FnMut() -> bool,
+    handoff: &SoftirqHandoff,
+    now_ns: impl Fn() -> u64,
+) -> SoftirqEnd {
+    let _ = handoff;
+    let _ = now_ns();
+    loop {
+        let (_, pending) = poll();
+        if !pending {
+            if complete() {
+                continue;
+            }
+            return SoftirqEnd::Completed;
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+
+/// The deferral task's turn with a queue the pump handed over: ksoftirqd.
+/// Polls in runs with the same [`SoftirqBudget`] as the pump (ksoftirqd runs
+/// `__do_softirq` with its bound), yielding the CPU to the tasks it shares
+/// it with between runs (`cond_resched`), until a poll leaves the ring
+/// empty; then hands the queue back to the pump, which completes it.
+pub async fn deferral_run(
+    poll: impl FnMut() -> (u32, bool),
+    handoff: &SoftirqHandoff,
+    now_ns: impl Fn() -> u64,
+) {
+    let _ = (poll, handoff, now_ns);
+}
+
 fn wake(slot: &IrqSafeSpinLock<Option<Waker>>) {
     // Taken under the lock, woken after it is released.
     let waker = slot.lock().take();
@@ -585,10 +640,8 @@ mod softirq_tests {
             return TestResult::Fail("the deferral task never polled the queue");
         }
         // Not before the bound: ten full rounds, or 2 ms.
-        if out.softirq_frames_before_defer
-            < u64::from(MAX_SOFTIRQ_RESTART) * u64::from(NETDEV_BUDGET)
-            && first < MAX_SOFTIRQ_TIME_NS
-        {
+        let bound_frames = u64::from(MAX_SOFTIRQ_RESTART) * u64::from(NETDEV_BUDGET);
+        if out.softirq_frames_before_defer < bound_frames && first < MAX_SOFTIRQ_TIME_NS {
             return TestResult::Fail("the queue was deferred before the softirq bound");
         }
         if out.max_softirq_stretch_ns > MAX_SOFTIRQ_TIME_NS + 64 * POLL_NS_PER_FRAME {
@@ -671,7 +724,176 @@ mod softirq_tests {
         handoff.hand_back();
         TestResult::Pass
     }
-    kernel_test_in!("net/napi-softirq", smoke_softirq_handoff_passes_the_queue_both_ways);
+    kernel_test_in!(
+        "net/napi-softirq",
+        smoke_softirq_handoff_passes_the_queue_both_ways
+    );
+
+    /// A receive ring model: `ring` frames waiting, `refill` frames landing
+    /// after each of the first `refill_polls` polls, and a clock advanced by
+    /// each poll's cost.
+    struct Ring {
+        ring: core::cell::Cell<u32>,
+        refill: u32,
+        refill_polls: u32,
+        clock: core::cell::Cell<u64>,
+        polls: core::cell::Cell<u32>,
+        completes: core::cell::Cell<u32>,
+        /// Frames that land while `complete` re-enables the interrupt.
+        land_at_complete: core::cell::Cell<u32>,
+    }
+
+    impl Ring {
+        fn new(ring: u32, refill: u32) -> Self {
+            Self {
+                ring: core::cell::Cell::new(ring),
+                refill,
+                refill_polls: u32::MAX,
+                clock: core::cell::Cell::new(0),
+                polls: core::cell::Cell::new(0),
+                completes: core::cell::Cell::new(0),
+                land_at_complete: core::cell::Cell::new(0),
+            }
+        }
+        fn poll(&self) -> (u32, bool) {
+            let n = self.ring.get().min(DEFAULT_BUDGET);
+            let refill = if self.polls.get() < self.refill_polls {
+                self.refill
+            } else {
+                0
+            };
+            self.ring.set(self.ring.get() - n + refill);
+            self.polls.set(self.polls.get() + 1);
+            let cost = u64::from(n.max(1)) * POLL_NS_PER_FRAME;
+            self.clock.set(self.clock.get() + cost);
+            (n, self.ring.get() != 0)
+        }
+        fn complete(&self) -> bool {
+            self.completes.set(self.completes.get() + 1);
+            let landed = self.land_at_complete.replace(0);
+            self.ring.set(self.ring.get() + landed);
+            self.ring.get() != 0
+        }
+    }
+
+    /// Poll `f` to completion by hand, at most `limit` times; returns its
+    /// output and how many times it yielded.
+    fn drive<F: Future>(f: F, limit: u32) -> Option<(F::Output, u32)> {
+        let wakes = Arc::new(Wakes(AtomicU32::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut f = core::pin::pin!(f);
+        for _ in 0..limit {
+            if let core::task::Poll::Ready(out) = f.as_mut().poll(&mut cx) {
+                return Some((out, wakes.0.load(Ordering::Acquire)));
+            }
+        }
+        None
+    }
+
+    /// A burst the ring holds: polled until drained, completed once, never
+    /// deferred. A flood: the run ends at the softirq bound with the queue
+    /// handed to the deferral task, uncompleted (its interrupt stays masked).
+    fn smoke_softirq_run_completes_a_burst_and_defers_a_flood() -> TestResult {
+        let ring = Ring::new(100, 0);
+        let handoff = SoftirqHandoff::new();
+        let run = softirq_run(
+            || ring.poll(),
+            || ring.complete(),
+            &handoff,
+            || ring.clock.get(),
+        );
+        let Some((end, _)) = drive(run, 1_000) else {
+            return TestResult::Fail("a 100-frame burst never completed");
+        };
+        if end != SoftirqEnd::Completed || handoff.is_deferred() {
+            return TestResult::Fail("a drained queue was deferred");
+        }
+        if ring.polls.get() != 2 || ring.completes.get() != 1 {
+            return TestResult::Fail("a 100-frame burst did not take two polls and one completion");
+        }
+        // A frame landing while the interrupt is re-enabled is polled in
+        // the same run (`napi_complete_done` finding NAPIF_STATE_MISSED).
+        let ring = Ring::new(10, 0);
+        ring.land_at_complete.set(3);
+        let run = softirq_run(
+            || ring.poll(),
+            || ring.complete(),
+            &handoff,
+            || ring.clock.get(),
+        );
+        match drive(run, 1_000) {
+            Some((SoftirqEnd::Completed, _)) if ring.completes.get() == 2 => {}
+            _ => return TestResult::Fail("work found at completion was not polled again"),
+        }
+        let ring = Ring::new(256, DEFAULT_BUDGET);
+        let run = softirq_run(
+            || ring.poll(),
+            || ring.complete(),
+            &handoff,
+            || ring.clock.get(),
+        );
+        let Some((end, yields)) = drive(run, 10_000) else {
+            return TestResult::Fail("a flooded queue kept its softirq run going");
+        };
+        if end != SoftirqEnd::Deferred || !handoff.is_deferred() {
+            return TestResult::Fail("the flood was not handed to the deferral task");
+        }
+        // Ten 300-packet rounds of 64-frame polls, well inside 2 ms.
+        if ring.polls.get() != 50 {
+            return TestResult::Fail("the run did not end after ten 300-packet rounds");
+        }
+        if ring.completes.get() != 0 {
+            return TestResult::Fail("a deferred queue was completed");
+        }
+        if yields != 49 {
+            return TestResult::Fail("the run did not yield to its class between polls");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/napi-softirq",
+        smoke_softirq_run_completes_a_burst_and_defers_a_flood
+    );
+
+    /// The deferral task polls the queue it was handed until it drains, in
+    /// softirq-bounded runs with a yield of the CPU between them, then gives
+    /// it back to the pump without completing it.
+    fn smoke_softirq_deferral_run_drains_and_hands_back() -> TestResult {
+        // 60 polls keep the ring full, four more drain it.
+        let mut ring = Ring::new(256, DEFAULT_BUDGET);
+        ring.refill_polls = 60;
+        let handoff = SoftirqHandoff::new();
+        handoff.defer();
+        let pump_wakes = Arc::new(Wakes(AtomicU32::new(0)));
+        let pump_waker = Waker::from(pump_wakes.clone());
+        let mut returned = core::pin::pin!(handoff.returned());
+        if poll_once(returned.as_mut(), &pump_waker) {
+            return TestResult::Fail("the pump resumed before the deferral task ran");
+        }
+        let run = deferral_run(|| ring.poll(), &handoff, || ring.clock.get());
+        let Some(((), yields)) = drive(run, 1_000) else {
+            return TestResult::Fail("the deferral task never finished a drainable queue");
+        };
+        if ring.ring.get() != 0 || ring.polls.get() != 64 {
+            return TestResult::Fail("the deferral task did not drain the queue");
+        }
+        // One full run of 50 polls, a yield, then the 14 that drain it.
+        if yields != 1 {
+            return TestResult::Fail("the deferral task did not yield once per softirq run");
+        }
+        if handoff.is_deferred() || pump_wakes.0.load(Ordering::Acquire) != 1 {
+            return TestResult::Fail("the drained queue was not handed back to the pump");
+        }
+        if !poll_once(returned.as_mut(), &pump_waker) || ring.completes.get() != 0 {
+            return TestResult::Fail("the pump did not get the queue back uncompleted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/napi-softirq",
+        smoke_softirq_deferral_run_drains_and_hands_back
+    );
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
