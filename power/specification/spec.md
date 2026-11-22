@@ -1493,6 +1493,38 @@ The snapshot covers all known RAM, ACPI NVS included. Linux saves only
 `E820_TYPE_RAM` and saves NVS separately (`suspend_nvs_save`), with the
 same effect. The resume refuses a changed memory map.
 
+#### 3.6.0d Hibernation payload
+
+```rust
+// narf_power::suspend_service
+pub trait ImageSource { fn len(&self) -> u64; fn is_empty(&self) -> bool; fn read_at(&self, offset: u64, out: &mut [u8]); }
+impl ImageSource for &[u8];
+SuspendService::seal_source_registered(&mut self, store, policy, image: &dyn ImageSource)
+    -> Result<([u8; 16], SealFanoutReport), ServiceError>;
+// narf_power::hibernate::payload
+pub struct PayloadHeader { pub page_count: u64, pub kernel_virt_base: u64, pub kernel_phys: (u64, u64),
+                           pub ram_hash: [u8; 32], pub arch: [u8; ARCH_RECORD_LEN] }   // swsusp_info
+impl PayloadHeader { pub fn for_running_kernel(page_count: u64) -> Self; pub fn encode(&self) -> [u8; 4096];
+                     pub fn decode(page: &[u8]) -> Result<Self, PayloadError>; }
+pub fn ram_layout_hash(ranges: &[(u64, u64)]) -> [u8; 32];
+pub trait Pages { fn count(&self) -> usize; fn pfn(&self, i: usize) -> u64; fn page(&self, i: usize) -> &[u8; 4096]; }
+pub struct PayloadSource<'a, P: Pages + ?Sized>;   // impl ImageSource
+pub const fn frame_table_offset() -> u64; pub const fn pages_offset(n: u64) -> u64; pub const fn payload_len(n: u64) -> u64;
+pub fn decode_frame_table(bytes: &[u8], page_count: u64) -> Vec<u64>;
+```
+
+The sealed writer reads its plaintext a chunk at a time through
+`ImageSource`, reusing one 1 MiB buffer. Slices keep working unchanged.
+
+The hibernation payload is that plaintext:
+- a header page: magic `NARFSNAP`, version, page count, the kernel's
+  virtual base and physical bounds, the RAM-layout hash, and lane 8's arch
+  restore record;
+- the frame table, page-padded;
+- the pages in table order.
+
+`PayloadSource` streams it from a `Snapshot`.
+
 #### 3.6.1 Power-off paths vs Linux
 
 Linux line numbers are against the reference tree at `~/git/linux`

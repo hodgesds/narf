@@ -237,6 +237,32 @@ pub(crate) fn manifest_root(tags: &[[u8; TAG_LEN]]) -> [u8; 32] {
     level[0]
 }
 
+/// The plaintext an image seals, read one chunk at a time. Hibernation
+/// streams its snapshot through this rather than holding the image in
+/// one buffer.
+pub trait ImageSource {
+    /// Plaintext bytes.
+    fn len(&self) -> u64;
+    /// An empty source, which no image may seal.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Fill `out` with the plaintext at `offset`. The writer asks only
+    /// within `len()`.
+    fn read_at(&self, offset: u64, out: &mut [u8]);
+}
+
+impl ImageSource for &[u8] {
+    fn len(&self) -> u64 {
+        <[u8]>::len(self) as u64
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) {
+        let start = offset as usize;
+        out.copy_from_slice(&self[start..start + out.len()]);
+    }
+}
+
 /// Byte-range storage for one suspend image: the writer/reader's
 /// view of the suspend partition (or of one partition device). All
 /// offsets are relative to the start of the image region.

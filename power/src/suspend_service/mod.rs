@@ -79,7 +79,7 @@ pub use anchor::{AnchorError, AnchorKind, KeyCustodyAnchor, UnwrapCtx, WrapCtx, 
 pub use custody::Secret32;
 pub use early_blk::{EarlyBlkError, EarlyTransport, PolledBlkReader};
 pub use entropy::{HwKeyEntropy, KeyEntropy};
-pub use format::{BlockStore, ImageClaims, ImageStore, PolicyLevel, RecordedPolicy};
+pub use format::{BlockStore, ImageClaims, ImageSource, ImageStore, PolicyLevel, RecordedPolicy};
 pub use hooks::{
     decode_hook_region, encode_hook_region, register_suspend_state_hook, registered_hooks,
     run_unseal_fanout, suspend_state_hook_count, unseal_registered, BlobOutcome, BlobRef, HookBlob,
@@ -374,7 +374,7 @@ impl<E: KeyEntropy> SuspendService<E> {
         policy: RecordedPolicy,
         image: &[u8],
     ) -> Result<[u8; 16], ServiceError> {
-        let (image_id, _report) = self.seal_image_hooked(store, policy, image, &[])?;
+        let (image_id, _report) = self.seal_image_hooked(store, policy, &image, &[])?;
         Ok(image_id)
     }
 
@@ -392,7 +392,7 @@ impl<E: KeyEntropy> SuspendService<E> {
         image: &[u8],
         hooks: &[Arc<dyn SuspendStateHook>],
     ) -> Result<([u8; 16], SealFanoutReport), ServiceError> {
-        self.seal_image_hooked(store, policy, image, hooks)
+        self.seal_image_hooked(store, policy, &image, hooks)
     }
 
     /// [`Self::seal_image_with_hooks`] over the global hook
@@ -405,6 +405,18 @@ impl<E: KeyEntropy> SuspendService<E> {
         image: &[u8],
     ) -> Result<([u8; 16], SealFanoutReport), ServiceError> {
         let hooks = registered_hooks();
+        self.seal_image_hooked(store, policy, &image, &hooks)
+    }
+
+    /// [`Self::seal_image_registered`] over a streamed plaintext: the
+    /// hibernation image, read from the snapshot a chunk at a time.
+    pub fn seal_source_registered(
+        &mut self,
+        store: &mut dyn ImageStore,
+        policy: RecordedPolicy,
+        image: &dyn ImageSource,
+    ) -> Result<([u8; 16], SealFanoutReport), ServiceError> {
+        let hooks = registered_hooks();
         self.seal_image_hooked(store, policy, image, &hooks)
     }
 
@@ -412,7 +424,7 @@ impl<E: KeyEntropy> SuspendService<E> {
         &mut self,
         store: &mut dyn ImageStore,
         policy: RecordedPolicy,
-        image: &[u8],
+        image: &dyn ImageSource,
         hooks: &[Arc<dyn SuspendStateHook>],
     ) -> Result<([u8; 16], SealFanoutReport), ServiceError> {
         let smk = Secret32::mint(self.draw::<32>()?);
