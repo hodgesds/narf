@@ -1382,8 +1382,13 @@ table holds `gc_thresh1` entries, drop FAILED entries and unused ones past
 `iface::rx_batch(name)` resolves the ingress device once per receive poll and
 returns an `RxBatch`; `RxBatch::receive(frame, timestamp)` delivers a frame
 whose native XDP action was PASS without touching the interface registry,
-and the batch's packet, byte and multicast counts are added to the interface
-when it is dropped. `iface::on_native_rx_timestamped` remains for callers
+and the batch's packet, byte and multicast counts are added to the
+interface's per-CPU receive counters (Linux `dev->tstats`) when it is
+dropped; every counter reader folds them into the interface totals. A
+receive path that keeps an `iface::RxHandle` (as a driver holds its
+`net_device`) gets its batches from `RxHandle::batch()`, which reads the
+registry only after a writer changed it (the registry's generation, bumped
+by every mutable borrow): a steady-state poll takes no global lock. `iface::on_native_rx_timestamped` remains for callers
 that deliver single frames by name.
 
 IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,

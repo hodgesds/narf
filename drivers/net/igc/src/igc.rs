@@ -2315,18 +2315,38 @@ pub(crate) fn napi_complete(queue: Option<&Queue>, hw: &impl Registers, index: O
 /// the queue, hand its frames to the stack, and resume the connections its
 /// transmit completions freed. Returns the packets cleaned and whether the
 /// ring still holds work.
+/// What one receive task keeps across its polls: its queue, its interface
+/// and whether the interface's mirror is attached, each re-read only after
+/// it changed.
+#[derive(Debug)]
+struct RxPollState {
+    queue: crate::queue_set::QueueHandle,
+    iface: narf_net::iface::RxHandle,
+    mirror: crate::publish::RxMirrorState,
+}
+
+impl RxPollState {
+    fn new(rx: &Igc, q: usize) -> Self {
+        Self {
+            queue: rx.queues.handle(q),
+            iface: narf_net::iface::RxHandle::new(rx.name()),
+            mirror: crate::publish::RxMirrorState::new(),
+        }
+    }
+}
+
 fn rx_napi_poll(
     rx: &Igc,
     q: usize,
     producer: &IrqSafeSpinLock<Producer<Frame, RX_RING_N>>,
-    handle: &mut crate::queue_set::QueueHandle,
+    state: &mut RxPollState,
 ) -> (u32, bool) {
     // The clean is one operation on this queue alone; a reconfiguration
     // waits for it (as `napi_disable` waits for a running poll), so the
     // queue the handle holds cannot change under it.
     let op = rx.queue_operation(q);
     // Only a reset replaces the queue; the handle re-reads it only then.
-    let queue = handle.current(&rx.queues).cloned();
+    let queue = state.queue.current(&rx.queues).cloned();
     let (frames, drops) = match (op.as_ref(), queue.as_ref()) {
         (Ok(_), Some(queue)) => {
             let (f, drops) = napi_clean(queue, &rx.hw, q, rx.mtu());
@@ -2345,8 +2365,8 @@ fn rx_napi_poll(
         // One interface lookup and one mirror check for the whole poll;
         // frame and byte counts are folded in when the batch ends.
         let name = rx.name();
-        let mut batch = narf_net::iface::rx_batch(name);
-        let mirrored = crate::publish::rx_mirror_attached(name);
+        let mirrored = state.mirror.attached(name);
+        let mut batch = state.iface.batch();
         for mut frame in frames {
             use narf_net::bypass::classifier::XdpAction;
             crate::publish::mirror_rx(&frame, mirrored, |f| {
@@ -2435,9 +2455,9 @@ fn spawn_pumps(
             let handoff = handoff.clone();
             narf_scheduler::spawn_with_spec(
                 async move {
-                    let mut handle = rx.queues.handle(q);
+                    let mut state = RxPollState::new(&rx, q);
                     while rx.until_removed(handoff.taken()).await.is_some() {
-                        let poll = || rx_napi_poll(&rx, q, &producer, &mut handle);
+                        let poll = || rx_napi_poll(&rx, q, &producer, &mut state);
                         deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
                     }
                 },
@@ -2451,7 +2471,7 @@ fn spawn_pumps(
                 // This vector's interval and the queue's work counters when
                 // it was last set (`igc_update_ring_itr` state).
                 let mut itr = (u32::MAX, crate::itr::START_ITR, crate::itr::Work::default());
-                let mut handle = rx.queues.handle(q);
+                let mut state = RxPollState::new(&rx, q);
                 while !rx.removed.load(Ordering::Acquire) {
                     let route = rx.route(q);
                     // NAPI: the queue's interrupt alone schedules the next
@@ -2460,7 +2480,7 @@ fn spawn_pumps(
                     // interrupt after that wakes this task.
                     let waiter = route.map(|r| narf_interrupts::wait_for_irq(r.vector));
                     let end = softirq_run(
-                        || rx_napi_poll(&rx, q, &producer, &mut handle),
+                        || rx_napi_poll(&rx, q, &producer, &mut state),
                         || rx_napi_done(&rx, q, route, &mut itr),
                         &handoff,
                         narf_time::monotonic_ns,
@@ -2472,7 +2492,7 @@ fn spawn_pumps(
                             // task polls; the next run completes the queue.
                             let _ = rx.until_removed(handoff.returned()).await;
                         } else {
-                            let poll = || rx_napi_poll(&rx, q, &producer, &mut handle);
+                            let poll = || rx_napi_poll(&rx, q, &producer, &mut state);
                             deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
                         }
                         continue;

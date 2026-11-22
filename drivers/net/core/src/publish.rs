@@ -251,8 +251,13 @@ pub fn note_rx_mirror_attached(name: &'static str) {
     let mut attached = RX_MIRROR_ATTACHED.lock();
     if !attached.contains(&name) {
         attached.push(name);
+        RX_MIRROR_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
     }
 }
+
+/// Bumped by every attach and clear, so a pump's [`RxMirrorState`] reads
+/// the registry again only after it changed.
+static RX_MIRROR_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Acquisitions of the mirror registry's lock, so a test can show the
 /// receive path takes none.
@@ -271,18 +276,36 @@ pub fn rx_mirror_attached(name: &str) -> bool {
 }
 
 /// A receive pump's view of whether its interface's mirror is attached,
-/// kept across polls.
-#[derive(Debug, Default)]
-pub struct RxMirrorState {}
+/// kept across polls and read again only after an attach or a clear.
+#[derive(Debug)]
+pub struct RxMirrorState {
+    generation: u64,
+    attached: bool,
+}
+
+impl Default for RxMirrorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RxMirrorState {
     pub const fn new() -> Self {
-        Self {}
+        Self {
+            generation: u64::MAX,
+            attached: false,
+        }
     }
 
-    /// Whether `name`'s frame-ring consumer has attached.
+    /// Whether `name`'s frame-ring consumer has attached. The pump's
+    /// interface name is fixed for its lifetime.
     pub fn attached(&mut self, name: &str) -> bool {
-        rx_mirror_attached(name)
+        let generation = RX_MIRROR_GENERATION.load(core::sync::atomic::Ordering::Acquire);
+        if generation != self.generation {
+            self.attached = rx_mirror_attached(name);
+            self.generation = generation;
+        }
+        self.attached
     }
 }
 
@@ -303,6 +326,7 @@ impl RxMirrorState {
 /// detach path must call it alongside unregistering.
 pub fn clear_rx_mirror_attached(name: &str) {
     RX_MIRROR_ATTACHED.lock().retain(|n| *n != name);
+    RX_MIRROR_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
 }
 
 /// The RX fan-out every dual-published family's pump runs per frame —

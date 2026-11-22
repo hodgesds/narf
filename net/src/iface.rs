@@ -272,6 +272,9 @@ pub struct NetIfaceEntry {
     /// rtnetlink. Driver-specific error paths can add to these through the
     /// accounting helpers below as they gain detailed hardware reporting.
     pub stats: IfaceCounterSnapshot,
+    /// Frames, bytes and multicast frames received through [`RxBatch`],
+    /// counted per CPU (Linux `dev->tstats`); readers add them to `stats`.
+    rx_counters: Arc<RxCounters>,
     /// Transmit/receive offloads the driver's send path honors. Default is
     /// none; a driver that implements offloads calls [`set_offloads`] after
     /// [`register`]. The stack consults this to decide whether to request a
@@ -804,6 +807,8 @@ pub(crate) struct Registry {
 pub(crate) struct RegistryGuard<'a> {
     guard: narf_lib::sync::IrqSafeSpinLockGuard<'a, Option<Vec<NetIfaceEntry>>>,
     generation: &'a AtomicU64,
+    /// Whether a mutable borrow counts as a change of the device view.
+    tracked: bool,
     changed: bool,
 }
 
@@ -821,6 +826,20 @@ impl Registry {
         RegistryGuard {
             guard: self.entries.lock(),
             generation: &self.generation,
+            tracked: true,
+            changed: false,
+        }
+    }
+
+    /// The lock for a counter update. Counters are not part of the device
+    /// view a receive path caches ([`RxHandle`]), so a per-frame transmit
+    /// or drop count does not make every handle read the registry again.
+    fn lock_counters(&self) -> RegistryGuard<'_> {
+        self.locks.fetch_add(1, Ordering::Relaxed);
+        RegistryGuard {
+            guard: self.entries.lock(),
+            generation: &self.generation,
+            tracked: false,
             changed: false,
         }
     }
@@ -840,7 +859,7 @@ impl core::ops::Deref for RegistryGuard<'_> {
 
 impl core::ops::DerefMut for RegistryGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.changed = true;
+        self.changed |= self.tracked;
         &mut self.guard
     }
 }
@@ -856,6 +875,27 @@ impl Drop for RegistryGuard<'_> {
 }
 
 static IFACES: Registry = Registry::new();
+
+/// Per-CPU receive counters of one interface: frames, bytes, multicast.
+pub(crate) type RxCounters = narf_lib::percpu::PerCpuCounterBank<3>;
+const RX_PACKETS: usize = 0;
+const RX_BYTES: usize = 1;
+const RX_MULTICAST: usize = 2;
+
+fn new_rx_counters() -> Arc<RxCounters> {
+    Arc::new(RxCounters::new())
+}
+
+/// `entry`'s counters with its per-CPU receive counters added, as
+/// `dev_get_stats` folds `dev->tstats` into the device totals.
+fn stats_of(entry: &NetIfaceEntry) -> IfaceCounterSnapshot {
+    let mut stats = entry.stats.clone();
+    let rx = entry.rx_counters.snapshot();
+    stats.rx_packets = stats.rx_packets.wrapping_add(rx.get(RX_PACKETS));
+    stats.rx_bytes = stats.rx_bytes.wrapping_add(rx.get(RX_BYTES));
+    stats.rx_multicast = stats.rx_multicast.wrapping_add(rx.get(RX_MULTICAST));
+    stats
+}
 
 /// Interface-registry lock acquisitions so far (tests).
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1140,6 +1180,9 @@ fn register_inner(
         phy_type,
         phy_type_name,
         stats,
+        rx_counters: old
+            .as_ref()
+            .map_or_else(new_rx_counters, |old| old.rx_counters.clone()),
         offloads: old
             .as_ref()
             .map_or_else(Default::default, |old| old.offloads),
@@ -1303,7 +1346,7 @@ fn counters_for_namespace(entries: &[NetIfaceEntry], net_ns_id: u64) -> Vec<Ifac
     entries
         .iter()
         .filter(|e| e.net_ns_id == net_ns_id)
-        .map(|e| e.stats.clone())
+        .map(stats_of)
         .collect()
 }
 
@@ -1402,7 +1445,7 @@ pub fn send(frame: &[u8]) -> Result<(), ()> {
 }
 
 fn with_stats_mut(name: &str, update: impl FnOnce(&mut IfaceCounterSnapshot)) {
-    let mut guard = IFACES.lock();
+    let mut guard = IFACES.lock_counters();
     if let Some(entry) = guard
         .as_mut()
         .and_then(|entries| entries.iter_mut().find(|entry| entry.name == name))
@@ -1751,7 +1794,7 @@ pub fn namespace_loopback(net_ns_id: u64) -> Option<NamespaceLoopback> {
         up: lo.entry.link_up,
         ipv4: lo.ipv4.clone(),
         mtu: lo.entry.mtu,
-        stats: lo.entry.stats.clone(),
+        stats: stats_of(&lo.entry),
     })
 }
 
@@ -1890,6 +1933,7 @@ fn namespace_loopback_entry(net_ns_id: u64) -> NetIfaceEntry {
         phy_type: None,
         phy_type_name: None,
         stats: IfaceCounterSnapshot::empty("lo"),
+        rx_counters: new_rx_counters(),
         offloads: Default::default(),
         offload_hardware: Default::default(),
         feature_wanted: None,
@@ -2007,6 +2051,7 @@ pub struct NetIfaceSnapshot {
     /// #867). Family-defined; see the entry field.
     pub phy_type_name: Option<&'static str>,
     pub stats: IfaceCounterSnapshot,
+    rx_counters: Arc<RxCounters>,
     /// Offloads this interface's send path honors; the stack requests them
     /// via [`crate::TxMeta`] rather than computing in software.
     pub offloads: crate::OffloadCapabilities,
@@ -2344,7 +2389,8 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         media_available: entry.media_available,
         phy_type: entry.phy_type,
         phy_type_name: entry.phy_type_name,
-        stats: entry.stats.clone(),
+        stats: stats_of(entry),
+        rx_counters: entry.rx_counters.clone(),
         offloads: entry.offloads,
         software_gro: entry.software_gro,
         send_frame: entry.send_frame,
@@ -3155,8 +3201,8 @@ pub(crate) static RX_BATCH_LOOKUPS: core::sync::atomic::AtomicU64 =
 /// multicast counts are added to the interface under one lock acquisition
 /// when the batch is dropped.
 #[derive(Debug)]
-pub struct RxBatch {
-    dev: Option<NetIfaceSnapshot>,
+pub struct RxBatch<'a> {
+    dev: Option<BatchDev<'a>>,
     /// Set when the name is not registered: frames then take the by-name
     /// path, as before.
     unknown: Option<String>,
@@ -3167,10 +3213,13 @@ pub struct RxBatch {
 
 /// A receive path's view of its interface, kept across polls (Linux: the
 /// driver holds its `net_device`, and NAPI delivers with `skb->dev` set,
-/// without a registry lookup).
+/// without a registry lookup). The snapshot is read again only after the
+/// registry changed.
 #[derive(Debug)]
 pub struct RxHandle {
     name: String,
+    generation: u64,
+    dev: Option<NetIfaceSnapshot>,
 }
 
 impl RxHandle {
@@ -3178,33 +3227,66 @@ impl RxHandle {
     pub fn new(name: &str) -> Self {
         Self {
             name: String::from(name),
+            generation: u64::MAX,
+            dev: None,
         }
     }
 
-    /// Start a receive batch.
-    pub fn batch(&mut self) -> RxBatch {
-        rx_batch(&self.name)
+    /// Start a receive batch: no registry lock unless the registry changed
+    /// since the last one (or the name was not registered then).
+    pub fn batch(&mut self) -> RxBatch<'_> {
+        let generation = IFACES.generation();
+        if generation != self.generation || self.dev.is_none() {
+            #[cfg(any(test, feature = "kernel-test"))]
+            RX_BATCH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+            self.dev = lookup(&self.name);
+            self.generation = generation;
+        }
+        RxBatch {
+            dev: self.dev.as_ref().map(BatchDev::Borrowed),
+            unknown: self.dev.is_none().then(|| self.name.clone()),
+            packets: 0,
+            bytes: 0,
+            multicast: 0,
+        }
+    }
+}
+
+/// The device a batch delivers for: its own snapshot ([`rx_batch`]) or a
+/// handle's ([`RxHandle::batch`]).
+#[derive(Debug)]
+enum BatchDev<'a> {
+    Owned(alloc::boxed::Box<NetIfaceSnapshot>),
+    Borrowed(&'a NetIfaceSnapshot),
+}
+
+impl BatchDev<'_> {
+    fn get(&self) -> &NetIfaceSnapshot {
+        match self {
+            BatchDev::Owned(dev) => dev,
+            BatchDev::Borrowed(dev) => dev,
+        }
     }
 }
 
 /// Start a receive batch for `name`: one registry lookup per poll.
-pub fn rx_batch(name: &str) -> RxBatch {
+pub fn rx_batch(name: &str) -> RxBatch<'static> {
     #[cfg(any(test, feature = "kernel-test"))]
     RX_BATCH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
     let dev = lookup(name);
     RxBatch {
         unknown: dev.is_none().then(|| String::from(name)),
-        dev,
+        dev: dev.map(|dev| BatchDev::Owned(alloc::boxed::Box::new(dev))),
         packets: 0,
         bytes: 0,
         multicast: 0,
     }
 }
 
-impl RxBatch {
+impl RxBatch<'_> {
     /// The batch's device MTU, `None` when the name is not registered.
     pub fn mtu(&self) -> Option<u32> {
-        self.dev.as_ref().map(|dev| dev.mtu)
+        self.dev.as_ref().map(|dev| dev.get().mtu)
     }
 
     /// Deliver one frame whose native XDP action was PASS.
@@ -3212,12 +3294,13 @@ impl RxBatch {
         let handler = NATIVE_RX_RESOLVED_HANDLER.load(Ordering::Acquire);
         let Some(dev) = self.dev.as_ref().filter(|_| handler != 0) else {
             let name = match (&self.dev, &self.unknown) {
-                (Some(dev), _) => dev.name.as_str(),
+                (Some(dev), _) => dev.get().name.as_str(),
                 (None, Some(name)) => name.as_str(),
                 (None, None) => return,
             };
             return on_native_rx_timestamped(name, frame, timestamp);
         };
+        let dev = dev.get();
         self.packets += 1;
         self.bytes += frame.len() as u64;
         // Linux's multicast counter excludes the all-ones broadcast address.
@@ -3230,7 +3313,7 @@ impl RxBatch {
     }
 }
 
-impl Drop for RxBatch {
+impl Drop for RxBatch<'_> {
     fn drop(&mut self) {
         let Some(dev) = self.dev.as_ref() else {
             return;
@@ -3238,12 +3321,11 @@ impl Drop for RxBatch {
         if self.packets == 0 {
             return;
         }
-        let (packets, bytes, multicast) = (self.packets, self.bytes, self.multicast);
-        with_stats_mut(&dev.name, |stats| {
-            stats.rx_packets = stats.rx_packets.saturating_add(packets);
-            stats.rx_bytes = stats.rx_bytes.saturating_add(bytes);
-            stats.rx_multicast = stats.rx_multicast.saturating_add(multicast);
-        });
+        // This CPU's counters only: no lock, no shared cache line.
+        let counters = &dev.get().rx_counters;
+        counters.add(RX_PACKETS, self.packets);
+        counters.add(RX_BYTES, self.bytes);
+        counters.add(RX_MULTICAST, self.multicast);
     }
 }
 /// Deliver a packet whose native XDP action was PASS. The native handler
