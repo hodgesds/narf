@@ -1383,7 +1383,9 @@ impl PcmDevice for NamedPcms {
         (!capture).then(|| alloc::format!("HDMI {}", pcm))
     }
 }
-test!(alsa_card_components_and_pcm_names, {
+// Fails by TestResult, not by panic, so a regression cannot end the boot for
+// every test after it.
+fn alsa_card_components_and_pcm_names() -> TestResult {
     let card = crate::register_hardware_card(
         crate::CardInfo {
             index: 0,
@@ -1395,26 +1397,44 @@ test!(alsa_card_components_and_pcm_names, {
         },
         Arc::new(NamedPcms),
     );
-    let f = crate::devfs_bridge::SoundControlFile::new(card)
+    let result = card_components_and_pcm_names(card);
+    crate::unregister_hardware_card(card);
+    result
+}
+fn card_components_and_pcm_names(card: u32) -> TestResult {
+    let Some(f) = crate::devfs_bridge::SoundControlFile::new(card)
         .open_instance_checked(true)
-        .unwrap()
-        .unwrap();
+        .ok()
+        .flatten()
+    else {
+        return TestResult::Fail("open the control device");
+    };
     let m = Memory::new();
-    // SNDRV_CTL_IOCTL_CARD_INFO: components[128] at 248.
-    run(f.ioctl_user(command(b'U', 1, 2, 376), 0, &m)).unwrap();
+    // SNDRV_CTL_IOCTL_CARD_INFO into user memory at 1024 (0 is the null
+    // pointer the test memory refuses): components[128] at 248.
+    if run(f.ioctl_user(command(b'U', 1, 2, 376), 1024, &m)).is_err() {
+        return TestResult::Fail("SNDRV_CTL_IOCTL_CARD_INFO");
+    }
     let components = b"HDA:1002aa01,00aa0100,00100800\0";
-    assert_eq!(m.bytes.lock()[248..248 + components.len()], *components);
+    if m.bytes.lock()[1024 + 248..1024 + 248 + components.len()] != *components {
+        return TestResult::Fail("CARD_INFO components are the backend's");
+    }
     // SNDRV_CTL_IOCTL_PCM_INFO for device 7: id[64] at 16, name[80] at 80.
     let mut info = alloc::vec![0; 288];
     put32(&mut info, 0, 7);
-    m.put(512, &info);
-    ctl(f.as_ref(), &m, 0x31, 288, 512).unwrap();
-    let bytes = m.bytes.lock()[512..800].to_vec();
-    assert_eq!(bytes[16..23], *b"HDMI 1\0");
-    assert_eq!(bytes[80..87], *b"HDMI 1\0");
+    m.put(2048, &info);
+    if ctl(f.as_ref(), &m, 0x31, 288, 2048).is_err() {
+        return TestResult::Fail("SNDRV_CTL_IOCTL_PCM_INFO for device 7");
+    }
+    let bytes = m.bytes.lock()[2048..2048 + 288].to_vec();
+    if bytes[16..23] != *b"HDMI 1\0" || bytes[80..87] != *b"HDMI 1\0" {
+        return TestResult::Fail("PCM_INFO id and name are the PCM's own");
+    }
     // /proc/asound/cardN/pcm7p/info.
     let text = crate::procfs_bridge::render_pcm_info(card, 7, false);
-    assert!(text.contains("id: HDMI 1\nname: HDMI 1\n"));
-    drop(f);
-    crate::unregister_hardware_card(card);
-});
+    if !text.contains("id: HDMI 1\nname: HDMI 1\n") {
+        return TestResult::Fail("pcm7p/info carries the PCM's id and name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/sound/alsa", alsa_card_components_and_pcm_names);
