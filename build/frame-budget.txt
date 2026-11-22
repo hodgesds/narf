@@ -27,7 +27,6 @@
 13848 narf_time::timer::timers_prepare_cpu
 13688 narf_drivers_wireless_ath10k::ath10k::interface::publish_with_mac
 13656 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
-12424 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::draw_inputs
 11896 narf_drivers_wireless_ath10k::ath10k::interface::ap::<impl narf_drivers_wireless_ath10k::ath10k::interface::Device<T>>::ap_control::{{closure}}
 11144 narf_drivers_wireless_brcm::cyw43439::interface::attach_runtime::{{closure}}
 11016 narf_drivers_gpu::amdgpu_dcn401_otg::dp_phy::training::frontend::video::<impl narf_drivers_gpu::amdgpu_dcn401_otg::Engine<I>>::dp_audio_verify_transport
