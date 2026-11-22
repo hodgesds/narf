@@ -3545,3 +3545,43 @@ kernel_test_in!(
     "audio/hda/codec-probe",
     native_hda_codec_probe_skips_a_silent_slot
 );
+
+/// A free-running playback position (ALSA owns the stop threshold) is LPIB
+/// plus the whole ring wraps the elapsed time implies when a position sample
+/// comes late, as Linux checks a late period against `hw_ptr_jiffies` in
+/// `snd_pcm_update_hw_ptr0`. The wrap period is the stream's own: with
+/// 48 kHz hard-coded, a 96 kHz HDMI stream counted half its wraps, so its
+/// clock lost a whole ring on every late sample.
+fn native_hda_position_wraps_follow_the_stream_rate() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open");
+    };
+    let mut params = super::super::stream::default_params();
+    params.rate = narf_drivers_sound::format::SampleRate::R96000;
+    if playback.configure(params).is_err()
+        || playback.free_running(true).is_err()
+        || playback.prepare().is_err()
+        || playback.start().is_err()
+    {
+        return TestResult::Fail("96 kHz HDMI playback");
+    }
+    // LPIB stays 0, so only the elapsed time can account for the wraps:
+    // about 2.1 of them at 96 kHz, 1.03 had the ring run at 48 kHz.
+    let frames = u64::from(params.period_size) * u64::from(params.periods);
+    let wrap_ms = frames * 1000 / 96_000;
+    super::wait(|| false, 2 * wrap_ms + wrap_ms / 10);
+    if playback.pointer() != 2 * frames {
+        return TestResult::Fail("a 96 kHz ring wraps every 42.7 ms, not every 85.3 ms");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/position-rate",
+    native_hda_position_wraps_follow_the_stream_rate
+);
