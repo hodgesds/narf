@@ -285,6 +285,53 @@ This profile forwards only the required bus/ACPI/AML wake fixtures; it does
 not activate token/TPM fixture providers. The existing `kernel-test` profile
 retains those independent providers and includes the wake tests as well.
 
+#### LPS0 notifications around suspend-to-idle
+
+`lps0` is Linux's `drivers/acpi/x86/s2idle.c` LPS0 half:
+
+```rust
+pub trait Dsm { fn call(&mut self, uuid: [u8; 16], revision: u64, function: u32) -> Option<narf_aml::Value>; }
+pub struct Lps0 { pub amd: bool, pub vendor: Option<u32>, pub microsoft: Option<u32> }
+impl Lps0 {
+    pub fn attach(dsm: &mut impl Dsm, amd: bool, hid: Option<&str>) -> Option<Self>;
+    pub fn prepare_late(&self, dsm: &mut impl Dsm);
+    pub fn restore_early(&self, dsm: &mut impl Dsm);
+}
+pub trait Handler: Sync { fn name(&self) -> &'static str; fn prepare(&self) {} fn check(&self) {} fn restore(&self) {} }
+pub fn setup() -> bool;              // lps0_device_attach, x86_64 Subsys initcall
+pub fn attached() -> bool;
+pub fn register(handler: &'static dyn Handler);   // acpi_register_lps0_dev
+pub fn has_handler(name: &str) -> bool;
+pub fn prepare_late(); pub fn check(); pub fn restore_early();
+```
+
+`setup` attaches the first device whose `_HID` or `_CID` is `PNP0D80`. The
+masks are each UUID's function-0 buffer of one to four bytes:
+- the Microsoft UUID;
+- AMD's UUID on AMD CPUs, otherwise Intel's.
+
+`None` is a failed evaluation. With both failed, nothing attaches. On AMD
+the Picasso HIDs (`AMD0004`, `AMD0005`, `AMDI0005`) shift a vendor mask
+above 0x3 left by one and set bit 0. Calls after function 0 use revision 0
+on AMD and 1 on Intel, and a function runs only if its mask lists it.
+
+Suspend-to-idle calls `prepare_late` after the device fan-out and the
+framebuffer blank, before the IRQ mask:
+- screen off;
+- LPS0 entry (on AMD the vendor entry comes before the Microsoft Modern
+  Standby pair, on Intel after it);
+- each handler's `prepare`.
+
+`check` runs each handler's `check` before every park iteration.
+`restore_early` runs before any device resumes:
+- each handler's `restore`;
+- LPS0 exit;
+- the Microsoft exit, display-on intent and Modern Standby exit;
+- screen on.
+
+Without an attached device all three do nothing. The constraint checks
+(`lpi_check_constraints`, which only log) are not done.
+
 ### 3.3a Typed PCI firmware policy metadata
 
 `pci_firmware::PciMetadata::discover(&Cap<BusDeviceCap, Write>, BusDevice)`

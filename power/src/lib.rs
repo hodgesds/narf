@@ -31,6 +31,7 @@ pub mod cpu_idle;
 mod cpu_idle_tests;
 pub mod device_pm;
 pub mod laptop_state;
+pub mod lps0;
 pub mod monitor;
 pub mod orderly;
 pub mod pci_firmware;
@@ -203,6 +204,13 @@ pub fn register_initcalls() {
     // device-PM fan-out runs from the asm continuation. Must run
     // before any suspend() can be issued; Stage::Subsys gives us
     // that ordering relative to driver bring-up.
+    // `lps0_device_attach`: the LPS0 device's `_DSM` masks, before any
+    // suspend-to-idle and before platform drivers register their handlers.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "lps0", || {
+        lps0::setup();
+        InitResult::Ok
+    });
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "s3-resume-hook", || {
         narf_arch::x86_64::s3_resume::set_resume_hook(s3_resume_hook_entry);
