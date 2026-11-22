@@ -112,6 +112,8 @@ kernel_test_in!(
 
 fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResult {
     use core::cell::Cell;
+    // Each end of the window is a TSC read, an HPET read and a TSC read
+    // (`tsc_read_refs`): the first two TSC reads bracket the opening sample.
     let sample = |start: u64, end: u64, cycles: u64| {
         let hpet_reads = Cell::new(0);
         let tsc_reads = Cell::new(0);
@@ -130,7 +132,7 @@ fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResu
             || {
                 let n = tsc_reads.get();
                 tsc_reads.set(n + 1);
-                if n == 0 {
+                if n < 2 {
                     100
                 } else {
                     100 + cycles
@@ -153,14 +155,15 @@ fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResu
         || {
             let n = tsc_reads.get();
             tsc_reads.set(n + 1);
-            if n == 0 {
+            if n < 2 {
                 0
             } else {
                 6_500_000_001
             }
         },
     );
-    if stalled.is_some() || tsc_reads.get() != 2 {
+    // The opening sample's two reads, then the bound check that ends it.
+    if stalled.is_some() || tsc_reads.get() != 3 {
         return TestResult::Fail("stalled HPET calibration ignored its TSC safety bound");
     }
     for (frequency, window) in [(0, 200), (100_000_000, 0)] {

@@ -1139,24 +1139,61 @@ pub unsafe fn calibrate_tsc_at(base: u64) -> Option<u64> {
     )
 }
 
+/// `MAX_RETRIES` (`arch/x86/kernel/tsc.c`): how many times a disturbed
+/// reference read is retried before the sample is given up.
+const REF_READ_RETRIES: u32 = 5;
+
+/// `TSC_DEFAULT_THRESHOLD` (`arch/x86/kernel/tsc.c`): the widest TSC
+/// bracket a reference read may take while the TSC rate is unknown.
+const REF_READ_THRESHOLD_CYCLES: u64 = 0x20000;
+
+/// `tsc_read_refs`: read the reference counter between two TSC reads and
+/// return `(tsc, reference)`, the TSC taken after the reference, when the
+/// two TSC reads are less than `thresh` cycles apart. A wider pair means
+/// something — an SMI, an NMI, a hypervisor exit — ran between the
+/// reference latching its count and the TSC read, so the sample is retried,
+/// up to [`REF_READ_RETRIES`] times; `None` after that.
+fn read_refs(
+    hpet: &mut impl FnMut() -> u64,
+    tsc: &mut impl FnMut() -> u64,
+    thresh: u64,
+) -> Option<(u64, u64)> {
+    for _ in 0..REF_READ_RETRIES {
+        let t1 = tsc();
+        let reference = hpet();
+        let t2 = tsc();
+        if t2.wrapping_sub(t1) < thresh {
+            return Some((t2, reference));
+        }
+    }
+    None
+}
+
 /// Shared sampler, including a read bound for an inert counter. These are
 /// early calibration reads, before an IRQ-based deadline can be established.
+///
+/// Both ends of the window are [`read_refs`] samples, as Linux takes them in
+/// `tsc_refine_calibration_work` and `pit_hpet_ptimer_calibrate_cpu`: an SMI
+/// between an HPET read and the TSC read after it once moved that end by its
+/// whole length, which in a 100 ms window is thousands of ppm.
 pub(crate) fn measure_tsc(
     hpet_hz: u64,
     window: u64,
     mut hpet: impl FnMut() -> u64,
     mut tsc: impl FnMut() -> u64,
 ) -> Option<u64> {
+    let thresh = REF_READ_THRESHOLD_CYCLES;
     if hpet_hz == 0 || window == 0 {
         return None;
     }
-    let hpet_t0 = hpet();
-    let tsc_t0 = tsc();
+    let (tsc_t0, hpet_t0) = read_refs(&mut hpet, &mut tsc, thresh)?;
     let mut end = None;
     for _ in 0..10_000_000 {
+        // The wait needs no bracket: only the sample that closes the window
+        // is part of the measurement.
         let now = hpet();
         if now.wrapping_sub(hpet_t0) >= window {
-            end = Some(now);
+            end = read_refs(&mut hpet, &mut tsc, thresh);
             break;
         }
         // No calibrated wall clock exists here. At every frequency this
@@ -1167,8 +1204,7 @@ pub(crate) fn measure_tsc(
         }
         core::hint::spin_loop();
     }
-    let hpet_t1 = end?;
-    let tsc_t1 = tsc();
+    let (tsc_t1, hpet_t1) = end?;
     let d_hpet = hpet_t1.wrapping_sub(hpet_t0);
     let d_tsc = tsc_t1.wrapping_sub(tsc_t0);
     if d_hpet == 0 {

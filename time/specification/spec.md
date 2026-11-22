@@ -89,6 +89,11 @@ an uncached HPET mapping exclusively. It enables and samples a 64-bit main
 counter without publishing the singleton, changing the physical-base override
 or programming comparators. Both this path and singleton calibration bound
 counter reads and return unavailable for a stopped counter or invalid ratio.
+Each end of an HPET calibration window is a Linux `tsc_read_refs` sample:
+the HPET read sits between two TSC reads, the later one is the TSC end of
+the window, and a pair `TSC_DEFAULT_THRESHOLD` (0x20000) cycles or more
+apart — an SMI or NMI between the HPET latch and the TSC read — is retried,
+at most `MAX_RETRIES` (5) times before the measurement is unavailable.
 
 `hpet::init` takes exclusive boot ownership: it disables inherited comparator
 interrupts and legacy replacement routing, acknowledges all channel latches,
