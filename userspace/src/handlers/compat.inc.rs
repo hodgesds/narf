@@ -4434,13 +4434,20 @@ fn statfs_f_flags(mnt: u64, sb: u64) -> u64 {
 /// Errors are POSITIVE errnos. The destination is only touched after the
 /// filesystem answered — `user_statfs`/`fd_statfs` run `vfs_statfs` first and
 /// `copy_to_user` last — so a bad `buf` never hides a lookup error.
-fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> Result<(), i64> {
+fn fill_statfs_for_path(path: &str, buf_ptr: u64, follow: bool) -> Result<(), i64> {
     // Both statfs(path) and fstatfs(fd) hand us a path in the caller's
     // namespace: fds deliberately retain a chroot-relative path so
     // /proc/self/fd can expose a reopenable link. Re-root it before finding
     // the backing mount, otherwise a chrooted PID 1's /run resolves against
     // NARF's host root rather than /mnt/run.
     let path = resolve_cwd_path(current_task_id(), path);
+    // `user_statfs` looks the name up with LOOKUP_FOLLOW, so a final symlink
+    // answers for its target's filesystem. A descriptor names its file.
+    let path = if follow {
+        resolve_vfs_symlink_path(&path, true).unwrap_or(path)
+    } else {
+        path
+    };
     // `statfs_by_dentry`: the superblock behind `path` answers. Its
     // `->statfs` reports `sb->s_magic` as `f_type` — `FsInstance::magic`,
     // which callers detect the filesystem by (elogind's CGROUP2_SUPER_MAGIC
@@ -4465,8 +4472,16 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> Result<(), i64> {
         current_mount_flags_at(&path),
         narf_filesystem::sb_flags::of(&fs),
     );
+    // `u64_to_fsid(huge_encode_dev(sb->s_dev))` unless the filesystem
+    // derives its own; `huge_encode_dev` is the encoding `st_dev` reports.
+    let f_fsid = fs.statfs_fsid().unwrap_or_else(|| {
+        stat_ino_path_dir_aware(&path)
+            .map(|stat| stat.5.dev)
+            .unwrap_or(0)
+    });
     let stat = StatfsBuf {
         f_type: fs.magic(),
+        f_fsid,
         f_bsize,
         f_blocks: fs_stat.blocks,
         f_bfree: fs_stat.blocks_free,

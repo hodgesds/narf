@@ -2699,6 +2699,15 @@ impl<B: BlockDevice + 'static> FsInstance for Ext2Volume<B> {
         "ext2"
     }
 
+    /// `ext2_statfs`: `buf->f_fsid = uuid_to_fsid(es->s_uuid)`, the two
+    /// little-endian halves of the UUID XORed.
+    fn statfs_fsid(&self) -> Option<u64> {
+        let uuid = self.superblock.uuid;
+        let lo = u64::from_le_bytes(uuid[..8].try_into().ok()?);
+        let hi = u64::from_le_bytes(uuid[8..].try_into().ok()?);
+        Some(lo ^ hi)
+    }
+
     /// `ext4_reconfigure`, after the VFS took its own keys out. See
     /// [`super::mount_opts::validate_remount`].
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {

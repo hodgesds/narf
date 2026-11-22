@@ -283,6 +283,10 @@ impl FsInstance for OverlayFs {
         }
     }
 
+    fn statfs_fsid(&self) -> Option<u64> {
+        self.pinned.first().and_then(|lower| lower.statfs_fsid())
+    }
+
     /// `ovl_statfs` reports `OVERLAYFS_SUPER_MAGIC`. The overlay that owns
     /// its lower instance stands in for that filesystem instead — the
     /// session-writable root over an installed btrfs root is that btrfs to

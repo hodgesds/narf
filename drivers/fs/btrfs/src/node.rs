@@ -2132,6 +2132,19 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
         "btrfs"
     }
 
+    /// `btrfs_statfs`: the big-endian words of the filesystem UUID folded
+    /// in pairs, with the subvolume's root id mixed in so subvolumes differ
+    /// (the mounted subvolume's; a nested subvolume below it reports the
+    /// same here).
+    fn statfs_fsid(&self) -> Option<u64> {
+        let fsid = self.fsid();
+        let word = |i: usize| u32::from_be_bytes(fsid[i..i + 4].try_into().unwrap_or([0; 4]));
+        let root = self.mounted_subvol_id();
+        let val0 = word(0) ^ word(8) ^ (root >> 32) as u32;
+        let val1 = word(4) ^ word(12) ^ root as u32;
+        Some(u64::from(val0) | (u64::from(val1) << 32))
+    }
+
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
         Box::pin(async move {
             let block_size = self.sectorsize();

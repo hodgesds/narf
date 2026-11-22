@@ -3046,6 +3046,14 @@ pub trait FsInstance: Send + Sync + 'static {
         super_magic::for_fs_type(self.fs_type())
     }
 
+    /// `statfs`'s `f_fsid` when the filesystem derives its own: ext2 and
+    /// btrfs from their UUIDs, FUSE none at all. `None` — the default, and
+    /// `simple_statfs` / every block filesystem's rule — is
+    /// `huge_encode_dev(sb->s_dev)`, the `st_dev` of the files on it.
+    fn statfs_fsid(&self) -> Option<u64> {
+        None
+    }
+
     /// The inode number of the directory above this mount's root inside its
     /// filesystem — `parent_ino(mnt_root)`, what `..` at the mount's root
     /// lists. A filesystem mounted at its own root has none (its root dentry
@@ -5618,6 +5626,9 @@ impl FsInstance for BindMount {
     fn fs_type(&self) -> &str {
         self.source.fs_type()
     }
+    fn statfs_fsid(&self) -> Option<u64> {
+        self.source.statfs_fsid()
+    }
     /// The bound directory's parent in the source filesystem: walk to it from
     /// the source's root, or ask the source when this binds its root.
     fn root_parent_ino<'a>(&'a self) -> FsFuture<'a, u64> {
@@ -5729,6 +5740,9 @@ impl FsInstance for FileMount {
     }
     fn fs_type(&self) -> &str {
         self.source.fs_type()
+    }
+    fn statfs_fsid(&self) -> Option<u64> {
+        self.source.statfs_fsid()
     }
     fn magic(&self) -> u64 {
         self.source.magic()

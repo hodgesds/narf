@@ -30,7 +30,7 @@ pub(crate) fn sys_statfs(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(errno));
         return;
     }
-    match fill_statfs_for_path(&path, args.arg1) {
+    match fill_statfs_for_path(&path, args.arg1, true) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(errno) => ctx.set_return(errno_ret(errno)),
     }

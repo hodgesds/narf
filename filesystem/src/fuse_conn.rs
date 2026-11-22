@@ -2703,6 +2703,12 @@ impl FsInstance for FuseFs {
         &self.fs_type
     }
 
+    /// `fuse_statfs` zero-fills the result and `convert_fuse_statfs` copies
+    /// no fsid from the daemon.
+    fn statfs_fsid(&self) -> Option<u64> {
+        Some(0)
+    }
+
     /// `fuse_fill_super`: `sb->s_magic = FUSE_SUPER_MAGIC` whatever the
     /// subtype this instance is named by.
     fn magic(&self) -> u64 {
