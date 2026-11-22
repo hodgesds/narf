@@ -638,3 +638,66 @@ fn smoke_procfs_asound_vfs_lookup() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/sound", smoke_procfs_asound_vfs_lookup);
+
+// ── #37: /proc/asound/cardN/id and pcm*/sub0/* ───────────────────────
+
+fn read_proc(file: &alloc::sync::Arc<dyn narf_filesystem::FileOps>) -> alloc::string::String {
+    let mut buf = [0u8; 512];
+    match crate::tests_support::poll_once(file.read(0, &mut buf)) {
+        Ok(n) => alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned(),
+        Err(_) => alloc::string::String::new(),
+    }
+}
+
+/// Linux publishes `cardN/id` (`snd_card_id_read`) and, per substream,
+/// `pcmMx/sub0/{info,hw_params,sw_params,status}`
+/// (`snd_pcm_substream_proc_init`); a substream without an open runtime
+/// reads `closed`. PipeWire and the ALSA debugging tools read them; NARF
+/// had only `codec#0` and `pcmMx/info`.
+fn smoke_procfs_asound_card_id_and_substreams() -> TestResult {
+    use narf_filesystem::FsInstance;
+    crate::__reset_for_test();
+    mixer::__reset_for_test();
+    register_card("HDA-Intel", "PCH", "HDA Intel PCH", 0, 1, 1);
+    crate::procfs_bridge::register_procfs_asound();
+    let root = narf_filesystem::procfs::ProcFs.root();
+    let Some(card) = root
+        .lookup_dir("asound")
+        .and_then(|asound| asound.lookup_dir("card0"))
+    else {
+        return TestResult::Fail("/proc/asound/card0 directory lookup failed");
+    };
+    if card
+        .lookup("id")
+        .is_none_or(|file| read_proc(&file) != "PCH\n")
+    {
+        return TestResult::Fail("/proc/asound/card0/id must read the card id");
+    }
+    for stream in ["pcm0p", "pcm0c"] {
+        let Some(sub) = card
+            .lookup_dir(stream)
+            .and_then(|pcm| pcm.lookup_dir("sub0"))
+        else {
+            return TestResult::Fail("/proc/asound/card0/pcm0[pc]/sub0 lookup failed");
+        };
+        if !sub
+            .lookup("info")
+            .is_some_and(|file| read_proc(&file).contains("subdevice: 0\n"))
+        {
+            return TestResult::Fail("sub0/info must describe the substream");
+        }
+        for name in ["hw_params", "sw_params", "status"] {
+            if sub
+                .lookup(name)
+                .is_none_or(|file| read_proc(&file) != "closed\n")
+            {
+                return TestResult::Fail("sub0 of a closed substream must read 'closed'");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sound/procfs-pcm",
+    smoke_procfs_asound_card_id_and_substreams
+);
