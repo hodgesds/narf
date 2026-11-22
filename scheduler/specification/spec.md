@@ -1274,13 +1274,14 @@ control callback.
 | --- | --- |
 | `struct work_struct`, `INIT_WORK`, `work_func_t` | `WorkStruct::new(WorkFn::Sync(fn) \| WorkFn::Async(fn -> future))`; the function gets a `WorkRef` (pointer) and may free its work |
 | `struct delayed_work`, `INIT_(DEFERRABLE_)DELAYED_WORK` | `DelayedWork::new(fn, deferrable)`: a work and a timer-wheel `timer_list` |
-| `alloc_workqueue(name, flags, max_active)`, `alloc_ordered_workqueue` | same; `WQ_UNBOUND`, `WQ_HIGHPRI`, `WQ_MEM_RECLAIM`, `WQ_FREEZABLE` (accepted), `WQ_POWER_EFFICIENT` (unbound) |
+| `alloc_workqueue(name, flags, max_active)`, `alloc_ordered_workqueue` | same; `WQ_UNBOUND`, `WQ_HIGHPRI`, `WQ_MEM_RECLAIM`, `WQ_FREEZABLE`, `WQ_POWER_EFFICIENT` (unbound) |
 | `system_wq`, `system_highpri_wq`, `system_long_wq`, `system_unbound_wq`, `system_power_efficient_wq` | same, created at `workqueue_init` (scheduler `init`) |
 | `queue_work(_on)`, `schedule_work`, `queue_delayed_work(_on)`, `schedule_delayed_work`, `mod_delayed_work(_on)` | same; never allocate or block (callable from timer callbacks and interrupt handlers) |
 | `cancel_work_sync`, `cancel_delayed_work(_sync)`, `flush_work` | same, async; `*_blocking` forms drive nested executor rounds |
 | per-CPU normal / highpri `worker_pool`s, unbound pool | same; per-CPU workers are pinned tasks, unbound ones run anywhere |
 | concurrency management (`nr_running`, `wq_worker_sleeping`, `kick_pool`) | per-CPU pools only: a pending async work puts its worker to sleep; queued work with no running worker gets a new worker (from interrupt context: the pool's manager timer, next jiffy). The unbound pool is not concurrency managed (`WORKER_UNBOUND`): queued work always wakes an idle worker, and a worker about to run a work kicks the pool so the rest go to other workers (`process_one_work` → `kick_pool`) |
 | `max_active`, inactive list | per workqueue, queue order kept |
+| `freeze_workqueues_begin`, `freeze_workqueues_busy`, `thaw_workqueues` | same: a `WQ_FREEZABLE` workqueue's active limit is 0 while frozen (also for one created during a freeze), so new work waits on its inactive list and active work finishes; the thaw restores `max_active`. Called by `narf_power::freezer::freeze_kernel_threads` |
 | rescuer, `send_mayday` | a pool at `MAX_WORKERS_PER_POOL` sends its `WQ_MEM_RECLAIM` work to the workqueue's rescuer task |
 | `may_start_working` / `manage_workers` | a worker about to run a work makes sure the pool keeps an idle worker in reserve |
 | `WORKER_IDLE`, `idle_list`, `idle_worker_timeout`, `too_many_workers`, `IDLE_WORKER_TIMEOUT` (300 s) | idle workers park on the pool's idle list; the pool's idle timer reaps those beyond the reserve (more than 2 idle, idle ≥ busy / 4) after 300 s |

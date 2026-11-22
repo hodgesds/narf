@@ -37,11 +37,11 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
    unless the machine sets ICH9's `disable_s4=0`. The end-to-end test
    (lane 9) needs it to exercise the platform mode. The coordinator that
    claims the transition beside S3 and s2idle comes with lane 3.
-2. **Freezer.** ~~User tasks~~ done (`narf_power::freezer`, spec
+2. ~~**Freezer.**~~ Done (`narf_power::freezer`, spec
    §3.6.0b). Its freeze points are in `narf-userspace`'s user-task poll and
    park loops, so the executor core is untouched. `verification/freezer`
    freezes a real user task in user mode on each arch.
-   `freeze_kernel_threads` (freezable workqueues) remains.
+   `freeze_kernel_threads` freezes the `WQ_FREEZABLE` workqueues.
 3. ~~**Device callbacks.**~~ Done (`freeze_all_devices` and the rest,
    `HibernationFns`, `hibernate_is_recovering`). amdgpu follows
    `amdgpu_pmops_*`: freeze is the suspend, thaw resumes only while

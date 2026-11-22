@@ -1408,7 +1408,7 @@ resume environment (`power/research/s4-hibernation-plan.md`, lane 8).
 ```rust
 pub const FREEZE_TIMEOUT_MS: u64 = 20_000;                  // freeze_timeout_msecs
 pub struct Hooks { pub live: fn() -> Vec<u64>, pub kick: fn(u64) }
-pub enum FreezeError { InProgress, Timeout { refusing: Vec<u64> } }
+pub enum FreezeError { InProgress, Timeout { refusing: Vec<u64> }, WorkqueuesBusy }
 pub fn install(hooks: Hooks) -> Option<Hooks>;          // returns the replaced hooks
 pub fn freezing() -> bool;                                  // pm_freezing
 pub fn try_to_freeze(task: u64, waker: &Waker) -> bool;     // a freeze point
@@ -1416,6 +1416,13 @@ pub fn frozen(task: u64) -> bool;
 pub async fn freeze_processes() -> Result<(), FreezeError>;
 pub async fn freeze_processes_within(timeout_ns: u64) -> Result<(), FreezeError>;
 pub fn thaw_processes();
+pub async fn freeze_kernel_threads() -> Result<(), FreezeError>;
+pub async fn freeze_kernel_threads_within(timeout_ns: u64) -> Result<(), FreezeError>;
+pub fn thaw_kernel_threads();
+// narf_scheduler::workqueue
+pub fn freeze_workqueues_begin();                           // WQ_FREEZABLE: limit 0
+pub fn freeze_workqueues_busy() -> bool;
+pub fn thaw_workqueues();
 ```
 
 `narf_power::freezer` holds the state; `narf-userspace` supplies the tasks.
@@ -1440,6 +1447,15 @@ synchronous filesystem read, a lock) is not a freeze point. The freezer
 waits for the task to leave it, so no frozen task holds a lock that device
 freezing or the image writer needs. S3 and s2idle do not freeze yet; the
 S4 coordinator is the first caller.
+
+`freeze_kernel_threads` covers kernel work. NARF's kernel tasks are
+executor futures, not threads, so freezable work means the `WQ_FREEZABLE`
+workqueues (writeback). `freeze_workqueues_begin` sets each one's active
+limit to 0, so new work waits on the inactive list; a freezable workqueue
+created during a freeze starts frozen. Work already active runs to
+completion, and `freeze_kernel_threads` waits for it on the same timeout
+loop. `thaw_workqueues` restores `max_active` and starts the work that
+waited.
 
 #### 3.6.1 Power-off paths vs Linux
 

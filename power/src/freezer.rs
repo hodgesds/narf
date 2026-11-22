@@ -52,6 +52,9 @@ pub enum FreezeError {
     /// These tasks did not reach a freeze point within the timeout
     /// (Linux's "tasks refusing to freeze").
     Timeout { refusing: Vec<u64> },
+    /// A freezable workqueue's running work did not finish in time
+    /// (`wq_busy`).
+    WorkqueuesBusy,
 }
 
 static HOOKS: IrqSafeSpinLock<Option<Hooks>> = IrqSafeSpinLock::new(None);
@@ -125,17 +128,52 @@ pub async fn freeze_processes_within(timeout_ns: u64) -> Result<(), FreezeError>
     if FREEZING.swap(true, Ordering::AcqRel) {
         return Err(FreezeError::InProgress);
     }
+    let todo = || {
+        let todo = pass();
+        (!todo.is_empty()).then_some(todo)
+    };
+    wait_for(timeout_ns, todo).await.map_err(|refusing| {
+        thaw_processes();
+        FreezeError::Timeout { refusing }
+    })
+}
+
+/// `freeze_kernel_threads`. NARF's kernel tasks are executor futures, not
+/// threads, and its freezable kernel work is `WQ_FREEZABLE` workqueue
+/// work: new work waits, and this waits up to [`FREEZE_TIMEOUT_MS`] for
+/// the running work to finish. On a timeout it thaws them again.
+pub async fn freeze_kernel_threads() -> Result<(), FreezeError> {
+    freeze_kernel_threads_within(FREEZE_TIMEOUT_MS * 1_000_000).await
+}
+
+/// [`freeze_kernel_threads`] with its timeout in nanoseconds.
+pub async fn freeze_kernel_threads_within(timeout_ns: u64) -> Result<(), FreezeError> {
+    use narf_scheduler::workqueue;
+    workqueue::freeze_workqueues_begin();
+    let busy = || workqueue::freeze_workqueues_busy().then_some(());
+    wait_for(timeout_ns, busy).await.map_err(|()| {
+        thaw_kernel_threads();
+        FreezeError::WorkqueuesBusy
+    })
+}
+
+/// `thaw_kernel_threads`: start the workqueue work the freeze held.
+pub fn thaw_kernel_threads() {
+    narf_scheduler::workqueue::thaw_workqueues();
+}
+
+/// `try_to_freeze_tasks`' loop: run `pass` until it reports nothing left
+/// (`None`), sleeping 1 ms doubling to 8 ms between passes. After
+/// `timeout_ns`, the last pass's remainder is the error.
+async fn wait_for<T>(timeout_ns: u64, mut pass: impl FnMut() -> Option<T>) -> Result<(), T> {
     let start = narf_time::monotonic_ns();
-    // `try_to_freeze_tasks`: sleep between passes, 1 ms doubling to 8 ms.
     let mut sleep_us = 1_000;
     loop {
-        let todo = pass();
-        if todo.is_empty() {
+        let Some(left) = pass() else {
             return Ok(());
-        }
+        };
         if narf_time::monotonic_ns().saturating_sub(start) >= timeout_ns {
-            thaw_processes();
-            return Err(FreezeError::Timeout { refusing: todo });
+            return Err(left);
         }
         narf_time::usleep_range(sleep_us / 2, sleep_us).await;
         if sleep_us < 8_000 {
@@ -154,6 +192,7 @@ pub fn thaw_processes() {
 }
 
 /// Clear the freezer and its hooks for a test, returning the hooks it had.
+/// Workqueues are left alone.
 #[cfg(feature = "kernel-test")]
 #[doc(hidden)]
 pub fn __test_reset() -> Option<Hooks> {
