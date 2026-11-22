@@ -925,8 +925,8 @@ kernel_test_in!(
 /// `BDB_LFP_POWER` with the `hobl` bit set for `panel`: the u16
 /// at block offset 54 (`struct bdb_lfp_power`: `features` (1 B)
 /// + `als[5]` (20 B) + `lace_aggressiveness_profile` (1 B) +
-/// seven u16 fields + `lace_enabled_status` (2 B) +
-/// `aggressiveness[16]` (16 B)).
+///   seven u16 fields + `lace_enabled_status` (2 B) +
+///   `aggressiveness[16]` (16 B)).
 fn lfp_power_block(panel: usize) -> Vec<u8> {
     let mut w = alloc::vec![0u8; 136];
     w[54..56].copy_from_slice(&(1u16 << panel).to_le_bytes());
