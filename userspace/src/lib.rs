@@ -44,11 +44,11 @@ pub mod container;
 pub mod linux_compat;
 
 pub mod anon_reclaim;
+pub(crate) mod bpf_iter;
 /// IA-32 (i386) system calls: the `int 0x80` dispatch hook, TLS and the
 /// i386 table.
 #[cfg(target_arch = "x86_64")]
 pub mod compat32;
-pub(crate) mod bpf_iter;
 pub mod coredump;
 pub mod elf;
 pub mod ephemeral_port;

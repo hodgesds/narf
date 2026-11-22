@@ -2699,7 +2699,7 @@ task and provides `procfs::ProcessIo`. Both syscall dispatch paths contribute
 completed read/write-family calls. Block submission retains the issuing thread
 group's storage counters across asynchronous completion and process exit.
 
-### 3.6 IA-32 compat ABI (x86_64)
+### 3.7 IA-32 compat ABI (x86_64)
 
 NARF runs i386 Linux programs the way Linux does with `CONFIG_IA32_EMULATION`
 (`fs/compat_binfmt_elf.c`, `arch/x86/entry/syscalls/syscall_32.tbl`).
