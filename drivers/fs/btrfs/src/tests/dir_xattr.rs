@@ -184,3 +184,115 @@ kernel_test_in!(
     "drivers/fs/btrfs/dir-xattr",
     smoke_btrfs_directory_xattrs_and_acls_follow_btrfs_set_acl
 );
+
+/// The `ACL_MASK` entry of `access`, or `ACL_GROUP_OBJ` without one.
+fn group_class_perm(access: &[u8]) -> Option<u16> {
+    let acl = PosixAcl::from_xattr(access).ok()??;
+    let mask = acl.entries.iter().find(|e| e.tag == ACL_MASK);
+    let group = acl.entries.iter().find(|e| e.tag == ACL_GROUP_OBJ);
+    mask.or(group).map(|e| e.perm)
+}
+
+/// `btrfs_setattr` → `posix_acl_chmod`: a chmod pushes the new group bits
+/// into the access ACL's mask (`__posix_acl_chmod_masq`), and the owner
+/// and other bits into its owner and other entries, so the ACL that
+/// permission checks read keeps agreeing with the mode. Left alone, the old
+/// mask kept granting what the chmod took away: `chmod 750` on a directory
+/// whose ACL gives a group rwx left that group able to create in it.
+fn smoke_btrfs_chmod_remasks_the_access_acl() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let root = vol.root();
+    let dir = match poll_once(root.mkdir("shared")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("mkdir shared failed"),
+    };
+    let blob = shared_group_acl(998).to_xattr();
+    if !matches!(poll_once(dir.set_xattr(ACCESS, &blob, 0)), Some(Ok(())))
+        || dir.dir_mode() & 0o777 != 0o770
+    {
+        return TestResult::Fail("setting the directory's access ACL failed");
+    }
+    if !matches!(poll_once(dir.set_dir_mode_async(0o750)), Some(Ok(())))
+        || dir.dir_mode() & 0o777 != 0o750
+    {
+        return TestResult::Fail("chmod 750 of the directory failed");
+    }
+    let access = poll_once(dir.get_xattr(ACCESS))
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if group_class_perm(&access) != Some(5) {
+        return TestResult::Fail("chmod 750 did not re-mask the directory's ACL to r-x");
+    }
+    // The named entry keeps its grant; only the mask caps it.
+    let named = PosixAcl::from_xattr(&access)
+        .ok()
+        .flatten()
+        .and_then(|acl| {
+            acl.entries
+                .iter()
+                .find(|e| e.tag == ACL_GROUP && e.id == 998)
+                .map(|e| e.perm)
+        });
+    if named != Some(7) {
+        return TestResult::Fail("chmod must leave the named group entry as it was");
+    }
+
+    // A file: chmod 700 masks the group class to nothing.
+    let file = match poll_once(dir.create("f")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("create shared/f failed"),
+    };
+    if !matches!(poll_once(file.set_xattr(ACCESS, &blob, 0)), Some(Ok(())))
+        || !matches!(poll_once(file.set_perms(0o700)), Some(Ok(())))
+    {
+        return TestResult::Fail("setting the file's ACL or mode failed");
+    }
+    let file_access = poll_once(file.get_xattr(ACCESS))
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if group_class_perm(&file_access) != Some(0) {
+        return TestResult::Fail("chmod 700 did not mask the file's ACL to ---");
+    }
+
+    // chmod of an inode without an ACL gives it none.
+    let plain = match poll_once(dir.create("plain")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("create shared/plain failed"),
+    };
+    if !matches!(poll_once(plain.set_perms(0o640)), Some(Ok(())))
+        || !matches!(
+            poll_once(plain.get_xattr(ACCESS)),
+            Some(Err(FsError::NotFound))
+        )
+    {
+        return TestResult::Fail("chmod of an inode without an ACL must not create one");
+    }
+
+    let _ = poll_once(vol.sync_to_disk());
+    let remount = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let dir = match poll_once(remount.root().lookup_dir_async("shared")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("shared lookup after remount failed"),
+    };
+    let access = poll_once(dir.get_xattr(ACCESS))
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if dir.dir_mode() & 0o777 != 0o750 || group_class_perm(&access) != Some(5) {
+        return TestResult::Fail("the re-masked ACL did not survive a remount");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/acl-chmod",
+    smoke_btrfs_chmod_remasks_the_access_acl
+);
