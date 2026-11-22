@@ -1746,3 +1746,109 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_limits_affinity_and_arch_prctl
 );
+
+// ── exec ─────────────────────────────────────────────────────────────
+
+/// The static fixture without its PT_GNU_STACK header (PT_NULL in place).
+fn i386_static_image_without_gnu_stack() -> Vec<u8> {
+    let mut b = i386_static_image();
+    put32(&mut b, EHDR32 + 3 * PHDR32, 0);
+    b
+}
+
+/// An i386 `execve` (11, `compat_sys_execve`) and `execveat` (358) read
+/// `argv`/`envp` as arrays of 32-bit `compat_uptr_t` (`get_user_arg_ptr`
+/// under `in_compat_syscall()`), so the image they publish carries those
+/// strings. The harness has no user-task context, so a load that succeeds
+/// ends in the kernel-test bail (-ENOSYS) after `/proc/<pid>/cmdline` is
+/// set; the cmdline is what tells a real exec from an unlisted number.
+fn smoke_compat32_execve_reads_32bit_argv_and_envp() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["exec"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs(
+        "/compat32-x",
+        "compat32-x",
+        &[("hello", image.as_slice())],
+        || {
+            install_compat_as(&proc);
+            with_live_as(&proc, || {
+                let base = u64::from(STATIC_DATA_VA);
+                put_user(base, b"/compat32-x/hello\0")?;
+                put_user(base + 0x40, b"one\0two\0E=1\0")?;
+                // argv = { "one", "two", NULL }, envp = { "E=1", NULL }; a
+                // word past each terminator that a 64-bit reader would take
+                // for the high half of a pointer.
+                let mut arrays = Vec::new();
+                for w in [base as u32 + 0x40, base as u32 + 0x44, 0, 0xDEAD_BEEF] {
+                    arrays.extend_from_slice(&w.to_le_bytes());
+                }
+                for w in [base as u32 + 0x48, 0, 0xDEAD_BEEF] {
+                    arrays.extend_from_slice(&w.to_le_bytes());
+                }
+                put_user(base + 0x80, &arrays)?;
+                let pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid failed")? as u64;
+                for (nr, regs) in [
+                    (11u32, [base, base + 0x80, base + 0x90, 0, 0, 0]),
+                    (358, [AT_FDCWD32, base, base + 0x80, base + 0x90, 0, 0]),
+                ] {
+                    crate::handlers::set_proc_argv(FAKE_TASK, &["stale"]);
+                    let r = call32(nr, regs);
+                    if r != ENOSYS {
+                        return Err("an i386 execve of an i386 image did not reach the load");
+                    }
+                    if !crate::handlers::proc_argv_of(pid).starts_with(b"one\0two") {
+                        return Err("an i386 execve must read argv as 32-bit pointers");
+                    }
+                }
+                Ok(())
+            })
+        },
+    );
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_execve_reads_32bit_argv_and_envp
+);
+
+/// `load_elf_binary` for an IA-32 image: `SET_PERSONALITY` is
+/// `set_personality_ia32`, which leaves `READ_IMPLIES_EXEC` alone, and
+/// `elf_read_implies_exec` (`mmap_is_ia32() && executable_stack ==
+/// EXSTACK_DEFAULT`) then sets it for an image without PT_GNU_STACK. A
+/// 64-bit exec always clears it (`set_personality_64bit`).
+fn smoke_compat32_exec_without_gnu_stack_reads_implies_exec() -> TestResult {
+    const READ_IMPLIES_EXEC: i64 = 0x0040_0000;
+    let legacy = i386_static_image_without_gnu_stack();
+    let modern = i386_static_image();
+    with_memfs(
+        "/compat32-rie",
+        "compat32-rie",
+        &[("legacy", legacy.as_slice()), ("modern", modern.as_slice())],
+        || {
+            let query = || call(Syscall::Personality.raw(), a0(0xFFFF_FFFF));
+            let _ = call(Syscall::Personality.raw(), a0(0));
+            let path = b"/compat32-rie/modern\0";
+            let _ = call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0));
+            if query().ok_or("personality query failed")? & READ_IMPLIES_EXEC != 0 {
+                return Err("an IA-32 image with PT_GNU_STACK must not get READ_IMPLIES_EXEC");
+            }
+            let path = b"/compat32-rie/legacy\0";
+            let _ = call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0));
+            let persona = query().ok_or("personality query failed")?;
+            let _ = call(Syscall::Personality.raw(), a0(0));
+            if persona & READ_IMPLIES_EXEC == 0 {
+                return Err("an IA-32 image without PT_GNU_STACK must run READ_IMPLIES_EXEC");
+            }
+            Ok(())
+        },
+    )
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_exec_without_gnu_stack_reads_implies_exec
+);
