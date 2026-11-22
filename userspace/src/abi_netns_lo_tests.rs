@@ -15,6 +15,8 @@
 //! NLM_F_ACK, each acknowledged with error 0 to the bound port id.
 use crate::abi_test_support::*;
 
+use alloc::string::String;
+
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
 const AF_NETLINK: u64 = 16;
@@ -38,6 +40,8 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLMSG_HDRLEN: usize = 16;
@@ -53,8 +57,10 @@ const IFA_F_PERMANENT: u8 = 0x80;
 const RT_SCOPE_HOST: u8 = 254;
 const RTNL_AF_UNSPEC: u8 = 0;
 const RTNL_AF_INET: u8 = 2;
+const RTNL_AF_INET6: u8 = 10;
 
 const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+const LOOPBACK6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 fn sys(n: Syscall, args: SyscallArgs) -> Option<i64> {
     call(n.raw(), args)
@@ -123,13 +129,13 @@ fn set_ifflags(fd: u64, name: &str, flags: u32) -> Option<i64> {
 }
 
 /// `if_indextoname`: SIOCGIFNAME; the errno on failure.
-fn ifname(fd: u64, index: i32) -> Result<alloc::string::String, i64> {
+fn ifname(fd: u64, index: i32) -> Result<String, i64> {
     let mut ifr = [0u8; 40];
     ifr[16..20].copy_from_slice(&index.to_ne_bytes());
     match sys(Syscall::Ioctl, a2(fd, SIOCGIFNAME, ifr.as_mut_ptr() as u64)) {
         Some(0) => {
             let end = ifr[..16].iter().position(|b| *b == 0).unwrap_or(16);
-            Ok(alloc::string::String::from_utf8_lossy(&ifr[..end]).into_owned())
+            Ok(String::from_utf8_lossy(&ifr[..end]).into_owned())
         }
         Some(e) => Err(e),
         None => Err(i64::MIN),
@@ -267,7 +273,7 @@ fn sockaddr_in(addr: [u8; 4], port: u16) -> [u8; 16] {
 fn dump_links(
     fd: u64,
     seq: u32,
-) -> Result<alloc::vec::Vec<(i32, alloc::string::String, u32)>, &'static str> {
+) -> Result<alloc::vec::Vec<(i32, String, u32)>, &'static str> {
     let replies = exchange(
         fd,
         &rtnl_request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, seq, &[0u8; 16]),
@@ -278,13 +284,10 @@ fn dump_links(
             RTM_NEWLINK => {
                 let index = i32::from_ne_bytes(m[20..24].try_into().unwrap());
                 let flags = u32::from_ne_bytes(m[24..28].try_into().unwrap());
-                let name = attr(m, 16, IFLA_IFNAME).ok_or("RTM_NEWLINK without IFLA_IFNAME")?;
+                let name = attr(m, 16, IFLA_IFNAME).ok_or("no IFLA_IFNAME")?;
                 let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
-                links.push((
-                    index,
-                    alloc::string::String::from_utf8_lossy(&name[..end]).into_owned(),
-                    flags,
-                ));
+                let name = String::from_utf8_lossy(&name[..end]).into_owned();
+                links.push((index, name, flags));
             }
             NLMSG_DONE => return Ok(links),
             _ => return Err("RTM_GETLINK dump carried an unexpected message"),
@@ -319,6 +322,30 @@ fn dump_addrs(fd: u64, seq: u32, family: u8) -> Result<alloc::vec::Vec<AddrEntry
         }
     }
     Err("RTM_GETADDR dump did not end with NLMSG_DONE")
+}
+
+/// RTM_GETROUTE dump for `family`: how many routes it lists.
+fn dump_routes(fd: u64, seq: u32, family: u8) -> Result<usize, &'static str> {
+    let mut body = [0u8; 12];
+    body[0] = family;
+    let replies = exchange(
+        fd,
+        &rtnl_request(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, seq, &body),
+    )?;
+    let mut routes = 0;
+    for m in &replies {
+        match msg_type(m) {
+            RTM_NEWROUTE => routes += 1,
+            NLMSG_DONE => return Ok(routes),
+            _ => return Err("RTM_GETROUTE dump carried an unexpected message"),
+        }
+    }
+    Err("RTM_GETROUTE dump did not end with NLMSG_DONE")
+}
+
+fn initial_lo_up() -> bool {
+    narf_net::iface::lookup_in(0, "lo")
+        .is_some_and(|lo| lo.link_up)
 }
 
 /// A fresh network namespace has its own `lo`: ifindex 1, `IFF_LOOPBACK`
@@ -361,10 +388,7 @@ fn smoke_abi_netns_lo_new_namespace_has_down_loopback() -> TestResult {
             dump_addrs(route, 2, RTNL_AF_INET)?.is_empty(),
             "a new network namespace's lo has an IPv4 address before it is configured",
         )?;
-        expect(
-            narf_net::iface::lookup_in(0, "lo").is_some_and(|lo| lo.link_up),
-            "the initial namespace's lo went down",
-        )?;
+        expect(initial_lo_up(), "the initial namespace's lo went down")?;
         close(route);
         close(unix);
         Ok(())
@@ -394,7 +418,7 @@ fn smoke_abi_netns_lo_bwrap_loopback_setup() -> TestResult {
             "unshare(CLONE_NEWNET)",
         )?;
         let unix = open(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0)?;
-        let lo = ifindex(unix, "lo").map_err(|_| "loopback: Failed to look up lo")?;
+        let lo = ifindex(unix, "lo").map_err(|_| "if_nametoindex(lo)")?;
         let (route, pid) = open_route()?;
 
         let mut addr = alloc::vec![RTNL_AF_INET, 8, IFA_F_PERMANENT, RT_SCOPE_HOST];
@@ -446,7 +470,7 @@ fn smoke_abi_netns_lo_bwrap_loopback_setup() -> TestResult {
             "SIOCSIFFLAGS did not take the namespace's lo down",
         )?;
         expect(
-            narf_net::iface::lookup_in(0, "lo").is_some_and(|lo| lo.link_up),
+            initial_lo_up(),
             "taking a namespace's lo down took the initial namespace's lo down",
         )?;
         expect(
@@ -505,4 +529,110 @@ fn smoke_abi_netns_lo_bwrap_loopback_setup() -> TestResult {
 kernel_test_in!(
     "syscall_abi/netns-lo",
     smoke_abi_netns_lo_bwrap_loopback_setup
+);
+
+fn outer_send(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    Ok(())
+}
+
+const OUTER_V4: [u8; 4] = [10, 77, 0, 1];
+const OUTER_V6: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77, 0x01];
+
+/// The initial namespace's devices are not part of a new namespace: an
+/// Ethernet device registered there, with an IPv4 and an IPv6 address, is
+/// unknown to SIOCGIFINDEX and SIOCGIFNAME inside it (`dev_get_by_name_rcu`
+/// / `dev_get_by_index_rcu` over the socket's `net`), and absent from its
+/// RTM_GETLINK, RTM_GETADDR (both families) and RTM_GETROUTE dumps. The
+/// namespace's down `lo` has no address and no route either. Once
+/// `loopback_setup` brings it up, its only IPv6 address is `::1/128`
+/// (`init_loopback`).
+fn smoke_abi_netns_lo_outer_devices_are_invisible() -> TestResult {
+    with_setup(|| {
+        narf_net::iface::register_loopback_iface();
+        let outer = narf_net::iface::register("nslo%d", [0x02, 0, 0, 0x77, 0, 1], outer_send);
+        narf_net::iface::add_addr(&outer, OUTER_V4, 24);
+        narf_net::ipv6::addrs::add_in(
+            0,
+            narf_net::ipv6::addrs::Ipv6IfAddr {
+                iface: outer.clone(),
+                addr: OUTER_V6,
+                prefix_len: 64,
+                state: narf_net::ipv6::addrs::AddrState::Preferred,
+                scope: narf_net::ipv6::addrs::scope_of(&OUTER_V6),
+                preferred_deadline_ns: u64::MAX,
+                valid_deadline_ns: u64::MAX,
+                temporary: false,
+            },
+        );
+        let result = (|| {
+            let outer_index = narf_net::iface::ifindex_of(&outer).ok_or("outer ifindex")?;
+            expect(
+                sys(Syscall::Unshare, a0(CLONE_NEWNET)) == Some(0),
+                "unshare(CLONE_NEWNET)",
+            )?;
+            let unix = open(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0)?;
+            expect(
+                ifindex(unix, &outer) == Err(ENODEV),
+                "SIOCGIFINDEX found an initial-namespace device in a new namespace",
+            )?;
+            expect(
+                ifname(unix, outer_index as i32) == Err(ENODEV),
+                "SIOCGIFNAME named an initial-namespace device in a new namespace",
+            )?;
+            let (route, pid) = open_route()?;
+            expect(
+                dump_links(route, 20)?.iter().all(|link| link.0 == 1),
+                "RTM_GETLINK in a new namespace lists another namespace's device",
+            )?;
+            expect(
+                dump_addrs(route, 21, RTNL_AF_INET)?.is_empty(),
+                "RTM_GETADDR(AF_INET) in a new namespace lists an address",
+            )?;
+            expect(
+                dump_addrs(route, 22, RTNL_AF_INET6)?.is_empty(),
+                "RTM_GETADDR(AF_INET6) in a new namespace lists an address before lo is up",
+            )?;
+            expect(
+                dump_routes(route, 23, RTNL_AF_INET)? == 0,
+                "RTM_GETROUTE(AF_INET) in a new namespace lists a route before lo is up",
+            )?;
+
+            let mut link = alloc::vec![RTNL_AF_UNSPEC, 0, 0, 0];
+            link.extend_from_slice(&1i32.to_ne_bytes());
+            link.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_flags
+            link.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_change
+            let replies = exchange(
+                route,
+                &rtnl_request(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK, 24, &link),
+            )?;
+            expect(
+                ack_error(&replies, 24, pid)? == 0,
+                "RTM_NEWLINK IFF_UP on a new namespace's lo",
+            )?;
+            let addrs6 = dump_addrs(route, 25, RTNL_AF_INET6)?;
+            expect(
+                addrs6.len() == 1 && addrs6[0] == (1, 128, LOOPBACK6.to_vec()),
+                "an up namespace lo's IPv6 addresses are not exactly ::1/128",
+            )?;
+            expect(
+                dump_addrs(route, 26, RTNL_AF_INET)? == [(1, 8, LOOPBACK.to_vec())],
+                "an up namespace lo's IPv4 addresses are not exactly 127.0.0.1/8",
+            )?;
+            expect(
+                dump_routes(route, 27, RTNL_AF_INET)? > 0,
+                "an up, configured namespace lo has no IPv4 route",
+            )?;
+            close(route);
+            close(unix);
+            Ok(())
+        })();
+        narf_net::ipv6::addrs::remove_in(0, &outer, &OUTER_V6);
+        narf_net::iface::del_addr(&outer, OUTER_V4, 24);
+        narf_net::iface::unregister(&outer);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/netns-lo",
+    smoke_abi_netns_lo_outer_devices_are_invisible
 );
