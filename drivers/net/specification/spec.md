@@ -378,6 +378,10 @@ Hardware waits never retain a queue or global spinlock.
 ring/channel/RSS/coalescing configuration, link advertising/forced 10/100,
 pause negotiation, EEE, wake policy, cumulative hardware/per-queue counters,
 register snapshots, read-only bounded NVM access, diagnostics and link restart.
+The netdev counters follow Linux `igc_update_stats`: each queue's RQDPC and
+MPC add to `rx_fifo_errors` (`iface::note_rx_fifo_errors`), MPC alone is
+`rx_missed_errors` (`iface::note_rx_missed`), CRCERRS counts toward
+`rx_errors` (`iface::note_rx_crc_error`), and `rx_over_errors` stays 0.
 The Linux ethtool ioctl bridge supplies these controls, names/stats, channel
 and ring queries, timestamp capabilities and Ethernet/VLAN-priority receive
 flow rules. EtherType (eight), destination-MAC (available RARs) and VLAN

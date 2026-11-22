@@ -1384,6 +1384,24 @@ pub fn note_rx_overrun(name: &str, n: u64) {
     });
 }
 
+/// Record `n` receive FIFO errors, Linux `rx_fifo_errors` alone: frames a
+/// queue dropped because its ring had no free descriptor (igc RQDPC with
+/// SRRCTL.DROP_EN) or the packet FIFO overflowed (igc also adds MPC here,
+/// `igc_update_stats`). Neither is an error of the frame itself.
+pub fn note_rx_fifo_errors(name: &str, n: u64) {
+    with_stats_mut(name, |stats| {
+        stats.rx_fifo = stats.rx_fifo.saturating_add(n);
+    });
+}
+
+/// Record `n` frames the device missed for lack of receive buffer space in
+/// its packet FIFO (MPC): Linux `rx_missed_errors`.
+pub fn note_rx_missed(name: &str, n: u64) {
+    with_stats_mut(name, |stats| {
+        stats.rx_missed_errors = stats.rx_missed_errors.saturating_add(n);
+    });
+}
+
 /// Hardware CRC failures, reported separately from software packet counters.
 pub fn note_rx_crc_error(name: &str, n: u64) {
     with_stats_mut(name, |stats| {

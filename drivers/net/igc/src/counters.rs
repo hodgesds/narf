@@ -76,10 +76,17 @@ const COUNTERS: &[(&str, u64, bool)] = &[
 /// Fold one sample's receive errors into `name`'s netdev counters: `crc`
 /// (CRCERRS), `missed` (MPC) and `fifo` (the queues' RQDPC). Returns what
 /// the sample adds to the device's missed-packet count.
+///
+/// Linux `igc_update_stats`: `rx_fifo_errors += rqdpc` per queue and
+/// `+= mpc`, `rx_missed_errors = mpc`, `rx_over_errors` never assigned,
+/// `rx_errors` from the hardware error counters. A ring that ran out of
+/// descriptors is a FIFO error only; it is neither an overrun nor an error
+/// of the frame.
 pub(crate) fn publish_rx_errors(name: &str, crc: u64, missed: u64, fifo: u64) -> u64 {
     narf_net::iface::note_rx_crc_error(name, crc);
-    narf_net::iface::note_rx_overrun(name, missed + fifo);
-    missed + fifo
+    narf_net::iface::note_rx_missed(name, missed);
+    narf_net::iface::note_rx_fifo_errors(name, fifo + missed);
+    missed
 }
 
 impl Counters {
