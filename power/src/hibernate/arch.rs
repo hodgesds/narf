@@ -152,7 +152,9 @@ fn save_cpu_state() {
 pub unsafe fn fix_cpu_after_restore() {
     for (msr, slot) in SAVED_MSRS.iter().zip(&MSR_VALUES) {
         // SAFETY: the values this CPU held when it took the snapshot.
-        unsafe { narf_arch::x86_64::msr::wrmsr(*msr, slot.load(core::sync::atomic::Ordering::Relaxed)) };
+        unsafe {
+            narf_arch::x86_64::msr::wrmsr(*msr, slot.load(core::sync::atomic::Ordering::Relaxed))
+        };
     }
     let tss = (narf_arch::x86_64::segments::GDT_ENTRY_TSS * 8) as u16;
     // SAFETY: the image's GDT is live and holds its TSS at that entry.

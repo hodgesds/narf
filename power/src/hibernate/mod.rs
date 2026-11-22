@@ -213,7 +213,10 @@ fn snapshot_and_write(
         let rtc_before = rtc_seconds();
         #[cfg(target_arch = "x86_64")]
         narf_acpi::ioapic::save_all(&mut ioapic);
-        (arch::capture(|record| (prealloc.take(), record)), rtc_before)
+        (
+            arch::capture(|record| (prealloc.take(), record)),
+            rtc_before,
+        )
     };
     RESTORING.store(false, Ordering::Release);
     if matches!(captured, Ok(Captured::Restored)) {
@@ -224,7 +227,9 @@ fn snapshot_and_write(
             narf_acpi::ioapic::restore_all(&ioapic);
         }
         let slept = match (rtc_before, rtc_seconds()) {
-            (Some(before), Some(after)) if after > before => (after - before) as u64 * 1_000_000_000,
+            (Some(before), Some(after)) if after > before => {
+                (after - before) as u64 * 1_000_000_000
+            }
             _ => 0,
         };
         narf_time::timekeeping_resume_after_reset(slept);
