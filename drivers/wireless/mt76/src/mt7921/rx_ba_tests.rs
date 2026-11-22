@@ -720,6 +720,69 @@ kernel_test_in!(
     mt76_rx_ba_delba_and_inactivity_retire_both_native_records
 );
 
+/// Linux mt76 `mt76_rx_aggr_reorder` (`agg-rx.c`) queues every frame for
+/// delivery first; an A-MPDU subframe on a TID with no recipient agreement
+/// (`wcid->aggr[tidno] == NULL`) or with one being torn down
+/// (`tid->stopped`) stays queued, unreordered, and goes on to the PN check.
+/// mac80211 `ieee80211_rx_reorder_ampdu` does the same (`dont_reorder`) and,
+/// for a Block Ack policy subframe on a TID with no session, sends one DELBA
+/// (WLAN_BACK_RECIPIENT, WLAN_REASON_QSTA_REQUIRE_SETUP = 38) until a
+/// session starts again (`ampdu_mlme.unexpected_agg`). An AP whose
+/// agreement the station dropped keeps aggregating, so discarding those
+/// subframes loses every unicast frame on the link while broadcasts flow.
+fn no_session() -> Result<(), &'static str> {
+    for secured in [false, true] {
+        let mut session = joined(6, false, secured)?;
+        let pn = |n: u64| secured.then_some(n);
+        session.backend.packets.push_back(data(0, 7, pn(1), 1));
+        if session.receive_ethernet() != Ok(expected(1)) {
+            return Err("A-MPDU subframe on a TID without a BA agreement was dropped");
+        }
+        // Block Ack policy subframes (QoS ack policy 0x60) without a session.
+        let qos = if secured { 64 } else { 48 };
+        for (sequence, counter, value) in [(8u16, 2u64, 2u8), (9, 3, 3)] {
+            let mut explicit = data(0, sequence, pn(counter), value);
+            explicit[qos] |= 0x60;
+            session.backend.packets.push_back(explicit);
+            if session.receive_ethernet() != Ok(expected(value)) {
+                return Err("block-ack policy subframe without a BA agreement was dropped");
+            }
+        }
+        let before = session.backend.frames.len();
+        run(session.service_keys()).map_err(|_| "unexpected-aggregation DELBA service")?;
+        let delbas: Vec<&Vec<u8>> = session.backend.frames[before..]
+            .iter()
+            .map(|(_, f)| f)
+            .filter(|f| f.first() == Some(&0xd0) && f.get(24..26) == Some(&[3, 2][..]))
+            .collect();
+        if delbas.len() != 1
+            || delbas[0].get(4..10) != Some(&AP[..])
+            || delbas[0].get(10..16) != Some(&OWN[..])
+            || delbas[0].get(26..30) != Some(&[0, 0, 38, 0][..])
+        {
+            return Err("unexpected aggregation did not send exactly one recipient DELBA (38)");
+        }
+        // After the peer's DELBA retires the agreement, its subframes are
+        // still delivered.
+        establish(&mut session, 0, 20, 0)?;
+        session.backend.packets.push_back(delba(0));
+        consume(&mut session, "peer DELBA fixture")?;
+        run(session.service_keys()).map_err(|_| "peer DELBA retirement")?;
+        session.backend.packets.push_back(data(0, 30, pn(4), 4));
+        if session.receive_ethernet() != Ok(expected(4)) {
+            return Err("A-MPDU subframe after the agreement was retired was dropped");
+        }
+    }
+    Ok(())
+}
+fn mt76_rx_ba_subframes_without_an_agreement_are_delivered_unreordered() -> TestResult {
+    no_session().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx-ba-nosession",
+    mt76_rx_ba_subframes_without_an_agreement_are_delivered_unreordered
+);
+
 fn rekey() -> Result<(), &'static str> {
     let mut session = joined(6, true, true)?;
     establish(&mut session, 0, 1, 0)?;
