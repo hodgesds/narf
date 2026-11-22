@@ -649,6 +649,123 @@ fn ipv6_address_scope_is_an_rt_scope() -> narf_kernel_test::TestResult {
 }
 narf_kernel_test::kernel_test_in!("net/ipv6-ifa-scope", ipv6_address_scope_is_an_rt_scope);
 
+/// `rt6_add_dflt_router` installs an RA's default route with RTPROT_RA,
+/// metric `accept_ra_defrtr_metric` (IP6_RT_PRIO_USER, 1024), RTF_EXPIRES
+/// and the RA's router preference; `rt6_fill_node` reports `rtm_protocol`
+/// as installed, RTA_PREF on every route and the remaining lifetime in
+/// RTA_CACHEINFO, so iproute2 prints `proto ra metric 1024 expires ...
+/// pref high`. An RTM_NEWROUTE keeps its `rtm_protocol` (NetworkManager
+/// installs its RA routes as `proto ra`), and without RTA_PRIORITY gets
+/// metric 1024 (`ip6_route_info_create`). NARF reported every IPv6 route as
+/// `proto kernel` without a preference or lifetime, and stored metric 0.
+fn ipv6_ra_and_requested_routes_keep_protocol_metric_and_pref() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const RTPROT_RA: u8 = 9;
+    const RTA_PREF: u16 = 20;
+    const RTA_CACHEINFO: u16 = 12;
+    let name = "rtnl-v6-ra0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 9, 1], discard);
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+    let router = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x84, 0x43, 0x42, 0xff, 0xfe, 0xa5, 0x25, 0x61,
+    ];
+    // RA: hop limit 64, router preference high (prf 01), lifetime 1800 s.
+    let mut ra = [0u8; 16];
+    ra[0] = 134;
+    ra[4] = 64;
+    ra[5] = 0x08;
+    ra[6..8].copy_from_slice(&1800u16.to_be_bytes());
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let _ = crate::ipv6::ndp::on_ra_in(0, name, router, &ra, now);
+
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    let prefix = [0x20, 1, 0x0d, 0xb8, 0, 0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut body = vec![
+        AF_INET6,
+        64,
+        0,
+        0,
+        crate::route::TABLE_MAIN,
+        RTPROT_RA,
+        0,
+        RTN_UNICAST,
+    ];
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    push_rtattr(&mut body, RTA_DST, &prefix);
+    push_rtattr(&mut body, RTA_OIF, &ifindex.to_ne_bytes());
+    let request = frame_message(
+        RTM_NEWROUTE,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        211,
+        1,
+        &body,
+    );
+    let added = build_replies_authorized(&request, Some(&admin)).unwrap();
+    narf_kernel_test::kt_assert_eq!(
+        i32::from_ne_bytes(added[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()),
+        0
+    );
+
+    let mut dump = vec![AF_INET6, 0, 0, 0, 0, 0, 0, 0];
+    dump.extend_from_slice(&0u32.to_ne_bytes());
+    let msgs = build_dump(&frame_message(
+        RTM_GETROUTE,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        212,
+        1,
+        &dump,
+    ));
+    let ours = |m: &&Vec<u8>| {
+        hdr_of(m).1 == RTM_NEWROUTE
+            && find_rtattr(m, 12, RTA_OIF).as_deref() == Some(&ifindex.to_ne_bytes()[..])
+    };
+    let default = msgs
+        .iter()
+        .filter(ours)
+        .find(|m| find_rtattr(m, 12, RTA_GATEWAY).as_deref() == Some(&router[..]))
+        .cloned();
+    let requested = msgs
+        .iter()
+        .filter(ours)
+        .find(|m| find_rtattr(m, 12, RTA_DST).as_deref() == Some(&prefix[..]))
+        .cloned();
+    crate::ipv6::route::remove(&[0; 16], 0, name);
+    crate::ipv6::route::remove(&prefix, 64, name);
+    let (Some(default), Some(requested)) = (default, requested) else {
+        return narf_kernel_test::TestResult::Fail("RA default or requested route missing");
+    };
+    let priority = |m: &Vec<u8>| {
+        find_rtattr(m, 12, RTA_PRIORITY).map(|v| u32::from_ne_bytes(v[..4].try_into().unwrap()))
+    };
+    if default[NLMSG_HDRLEN + 5] != RTPROT_RA || priority(&default) != Some(1024) {
+        return narf_kernel_test::TestResult::Fail("RA default route is not proto ra metric 1024");
+    }
+    if find_rtattr(&default, 12, RTA_PREF).as_deref() != Some(&[1][..]) {
+        return narf_kernel_test::TestResult::Fail("RA default route lost the router preference");
+    }
+    let expires = find_rtattr(&default, 12, RTA_CACHEINFO)
+        .map(|ci| u32::from_ne_bytes(ci[8..12].try_into().unwrap()));
+    if expires.is_none_or(|e| e == 0) {
+        return narf_kernel_test::TestResult::Fail("RA default route reports no lifetime");
+    }
+    if requested[NLMSG_HDRLEN + 5] != RTPROT_RA || priority(&requested) != Some(1024) {
+        return narf_kernel_test::TestResult::Fail(
+            "RTM_NEWROUTE lost rtm_protocol or the IP6_RT_PRIO_USER default metric",
+        );
+    }
+    if find_rtattr(&requested, 12, RTA_PREF).as_deref() != Some(&[0][..]) {
+        return narf_kernel_test::TestResult::Fail("IPv6 route has no RTA_PREF (medium)");
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/ipv6-ra-route",
+    ipv6_ra_and_requested_routes_keep_protocol_metric_and_pref
+);
+
 fn ipv6_route_message_reports_gateway_and_oif() -> narf_kernel_test::TestResult {
     let route = crate::ipv6::route::Route {
         prefix: [0; 16],
