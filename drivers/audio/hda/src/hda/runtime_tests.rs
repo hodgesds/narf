@@ -543,6 +543,9 @@ struct FixtureConfig {
     seed_alc256_coef: bool,
     codec_id: u32,
     hp_plugged: bool,
+    /// STATESTS at probe (0 = codec 0 only). Only codec 0 answers: the
+    /// model tags every response with address 0.
+    codec_mask: u16,
 }
 
 struct Fixture {
@@ -667,6 +670,7 @@ impl Fixture {
             seed_alc256_coef,
             codec_id,
             hp_plugged,
+            codec_mask,
         } = config;
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -680,7 +684,7 @@ impl Fixture {
         // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
         unsafe {
             mmio.write16(REG_GCAP, 0x1101);
-            mmio.write16(REG_STATESTS, 1);
+            mmio.write16(REG_STATESTS, if codec_mask == 0 { 1 } else { codec_mask });
             mmio.write8(REG_CORBSIZE, 0x40);
             mmio.write8(REG_RIRBSIZE, 0x40);
         }
@@ -3499,4 +3503,45 @@ fn native_hda_cmd_recover_after_lost_response() -> TestResult {
 kernel_test_in!(
     "audio/hda/cmd-recover",
     native_hda_cmd_recover_after_lost_response
+);
+
+/// Linux `azx_probe_codecs`: a STATESTS bit whose codec never answers ("Some
+/// BIOSen give you wrong codec addresses that don't exist") is dropped from
+/// the codec mask, the controller is reset back to a sane state, and the
+/// codecs that do answer are probed. Before, the silent slot's vendor read
+/// timed out and failed the whole controller, so one spurious bit cost the
+/// board all of its audio.
+fn native_hda_codec_probe_skips_a_silent_slot() -> TestResult {
+    let fixture = match Fixture::build_model(FixtureConfig {
+        codec_mask: 0b11,
+        ..Default::default()
+    }) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if !fixture
+        .model
+        .verbs
+        .contains(&make_verb(1, 0, VERB_GET_PARAMETER))
+    {
+        return TestResult::Fail("codec #1 is in the mask and must be probed");
+    }
+    if dev.codecs().len() != 1
+        || dev.codecs()[0].addr != 0
+        || dev.codecs()[0].vendor_id != 0x10ec0287
+        || dev.outputs.is_empty()
+    {
+        return TestResult::Fail("the answering codec #0 comes up beside the silent slot");
+    }
+    // The reset after the failed probe left a working transport.
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x10ec0287) {
+        return TestResult::Fail("commands after a failed slot probe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/codec-probe",
+    native_hda_codec_probe_skips_a_silent_slot
 );
