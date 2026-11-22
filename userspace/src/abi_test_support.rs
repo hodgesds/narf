@@ -302,7 +302,16 @@ fn ensure_mount_target_for(num: u32, args: &SyscallArgs) {
         return;
     }
     let resolved = crate::handlers::apply_chroot_for_test(path);
-    narf_filesystem::__test_ensure_mount_target(&resolved);
+    // `user_path_at` walks the CALLER's namespace, so that is where the
+    // mount point has to be. Made in the initial namespace's view instead, a
+    // target below a mount only the caller's namespace has (a tmpfs it
+    // mounted after `unshare(CLONE_NEWNS)`) landed in the root filesystem
+    // the two namespaces share, under that mount: invisible until the mount
+    // moved or went away, and then a directory the case never made.
+    narf_filesystem::__test_ensure_writable_root();
+    let _ = crate::handlers::current_resolve_absolute(&resolved, |fs, _root, rel| {
+        narf_filesystem::__test_make_dirs(fs, rel)
+    });
 }
 
 /// Mount targets under this prefix are NOT created by the fixture, so a case
