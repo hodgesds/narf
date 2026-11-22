@@ -970,7 +970,14 @@ fn local_deliver_finish(net_ns_id: u64, iface_in: &str, body: &[u8], csum_verifi
                 rx_csum::TCP_CSUM_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return;
             }
-            crate::tcp::core::handle_segment_in(net_ns_id, ip.src_ip, ip.dst_ip, payload)
+            // The arrival device (`inet_iif`) for SO_BINDTODEVICE matching.
+            crate::tcp::core::handle_segment_on(
+                net_ns_id,
+                ip.src_ip,
+                ip.dst_ip,
+                payload,
+                iface::ifindex_of(iface_in).unwrap_or(0),
+            )
         }
         IP_PROTO_UDP => handle_udp(
             net_ns_id,

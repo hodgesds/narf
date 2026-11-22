@@ -4722,6 +4722,22 @@ pub fn handle_segment(src: [u8; 4], dst: [u8; 4], segment: &[u8]) {
 }
 
 pub fn handle_segment_in(net_ns_id: u64, src: [u8; 4], dst: [u8; 4], segment: &[u8]) {
+    handle_segment_on(net_ns_id, src, dst, segment, 0);
+}
+
+/// `inet_sk_bound_dev_eq` without an L3 master: a socket bound to a device
+/// (`sk_bound_dev_if`) matches only segments that arrived on it. `dif` 0 is
+/// a caller that does not know the arrival device, and matches any socket.
+fn bound_dev_matches(tcb: &Arc<IrqSafeSpinLock<Tcb>>, dif: u32) -> bool {
+    if dif == 0 {
+        return true;
+    }
+    let bound = tcb.lock().oif;
+    bound == 0 || bound == dif
+}
+
+/// [`handle_segment_in`] for a segment that arrived on device `dif`.
+pub fn handle_segment_on(net_ns_id: u64, src: [u8; 4], dst: [u8; 4], segment: &[u8], dif: u32) {
     let (hdr, _hdr_len) = match TcpHeader::decode(segment) {
         Ok(t) => t,
         Err(_) => return,
@@ -4731,9 +4747,10 @@ pub fn handle_segment_in(net_ns_id: u64, src: [u8; 4], dst: [u8; 4], segment: &[
     let listener = || {
         listen_index_group(net_ns_id, dst, hdr.dst_port)
             .into_iter()
-            .next()
+            .find(|listen| bound_dev_matches(listen, dif))
     };
     if let Some(arc) = conn_index_lookup(conn_key(net_ns_id, src, hdr.src_port, dst, hdr.dst_port))
+        .filter(|arc| bound_dev_matches(arc, dif))
     {
         if time_wait_accepts_syn(&arc, &hdr, segment) {
             if let Some(listen_arc) = listener() {
@@ -4748,10 +4765,7 @@ pub fn handle_segment_in(net_ns_id: u64, src: [u8; 4], dst: [u8; 4], segment: &[
     // LISTEN bucket: any listener on (dst | 0.0.0.0, dst_port) drives the
     // passive open. The accept-enqueue (add_to_listener_accept_queue)
     // re-selects within the SO_REUSEPORT group by flow hash.
-    if let Some(listen_arc) = listen_index_group(net_ns_id, dst, hdr.dst_port)
-        .into_iter()
-        .next()
-    {
+    if let Some(listen_arc) = listener() {
         accept_into_listen(&listen_arc, src, dst, &hdr, segment);
         return;
     }
