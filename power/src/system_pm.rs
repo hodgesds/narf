@@ -25,12 +25,22 @@ use crate::device_pm::DevicePmError;
 pub type SystemPmFuture<'a> = Pin<Box<dyn Future<Output = Result<(), DevicePmError>> + Send + 'a>>;
 
 /// Actual system transition requested by the coordinator. Firmware _DSW
-/// uses S0 for suspend-to-idle and S3 for suspend-to-RAM; a driver must not
-/// guess the target from callback ordering or a register observation.
+/// uses S0 for suspend-to-idle, S3 for suspend-to-RAM and S4 for
+/// hibernation; a driver must not guess the target from callback ordering or
+/// a register observation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SystemSleepState {
     S0Idle,
     S3,
+    /// Hibernation. Preparation is Linux's `freeze`: the device is quiesced
+    /// and whatever must outlive power loss is moved into system memory,
+    /// which the image captures. Nothing runs between the snapshot and power
+    /// off, so the device stays frozen while the image is written (Linux's
+    /// `thaw` and `poweroff` for a normal hibernation). The paired resume is
+    /// `restore` in the resumed image, or `thaw` after a failed snapshot or
+    /// image write: either way the device may have lost power and must be
+    /// rebuilt from what preparation saved. No coordinator enters S4 yet.
+    S4,
 }
 
 /// A driver phase that must run outside the interrupt-gated

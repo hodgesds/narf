@@ -63,6 +63,15 @@ fn endpoint_bounds() -> Result<(), &'static str> {
     if admit(&ns, Some(endpoint), SleepState::S3, WakeState::D3Hot) != Err(WakeError::Unsupported) {
         return Err("contradictory firmware D-state bounds manufactured a permitted state");
     }
+    // S4 reads its own _S4D/_S4W, never S3's contradictory pair above.
+    if admit(&ns, Some(endpoint), SleepState::S4, WakeState::D3Hot) != Ok(()) {
+        return Err("S4 admission read the S3 D-state bounds");
+    }
+    ns.values
+        .insert(format!("{endpoint}._S4W"), Value::Integer(2));
+    if admit(&ns, Some(endpoint), SleepState::S4, WakeState::D3Hot) != Err(WakeError::Unsupported) {
+        return Err("an endpoint _S4W wake ceiling was ignored");
+    }
     Ok(())
 }
 

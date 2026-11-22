@@ -46,6 +46,7 @@ pub(super) fn admit(
     let minimum = match sleep {
         SleepState::S0Idle => None,
         SleepState::S3 => optional_state(ns, path, "_S3D")?,
+        SleepState::S4 => optional_state(ns, path, "_S4D")?,
     };
     let minimum_number = minimum.unwrap_or(0);
     let maximum = optional_state(
@@ -54,6 +55,7 @@ pub(super) fn admit(
         match sleep {
             SleepState::S0Idle => "_S0W",
             SleepState::S3 => "_S3W",
+            SleepState::S4 => "_S4W",
         },
     )?
     // Linux/ACPI: with _SxD but no _SxW, do not choose a deeper state

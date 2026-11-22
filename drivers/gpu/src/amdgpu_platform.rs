@@ -1257,6 +1257,10 @@ impl narf_power::system_pm::AsyncSystemPm for GraphicsSystemPm {
             match target {
                 SystemSleepState::S3 => prepare_graphics_suspend().await,
                 SystemSleepState::S0Idle => prepare_graphics_idle().await,
+                // Graphics in the carve-out would be lost: not yet.
+                SystemSleepState::S4 => {
+                    return Err(narf_power::device_pm::DevicePmError::NotImplemented)
+                }
             }
             Ok::<(), narf_power::device_pm::DevicePmError>(())
         })

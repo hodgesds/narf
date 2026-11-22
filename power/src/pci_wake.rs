@@ -68,6 +68,7 @@ impl SleepState {
         match self {
             Self::S0Idle => 0,
             Self::S3 => 3,
+            Self::S4 => 4,
         }
     }
 }
