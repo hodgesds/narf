@@ -9901,3 +9901,551 @@ kernel_test_in!(
     "drivers/input",
     smoke_synaptics_w2_without_agm_is_single_finger
 );
+
+fn smoke_synaptics_image_sensor_num_fingers() -> TestResult {
+    use crate::psmouse::{synaptics_image_sensor_num_fingers, SynapticsHwState};
+    let sgm = |z: u8, w: u8| SynapticsHwState {
+        x: 1000,
+        y: 2000,
+        z,
+        w,
+        left: false,
+        right: false,
+    };
+    // Linux `synaptics_image_sensor_process`: z == 0 → 0 whatever
+    // `w` says; w >= 4 (palm) → 1; w == 0 → 2; w == 1 → the
+    // AGM-CONTACT count (3 while none arrived); anything else
+    // (w == 2 / w == 3) → 4.
+    let cases: [(u8, u8, u8, u8); 14] = [
+        (0, 0, 0, 0),
+        (0, 1, 3, 0),
+        (0, 3, 0, 0),
+        (0, 5, 0, 0),
+        (50, 4, 0, 1),
+        (50, 15, 0, 1),
+        (50, 0, 0, 2),
+        (50, 1, 0, 3),
+        (50, 1, 1, 1),
+        (50, 1, 2, 2),
+        (50, 1, 3, 3),
+        (50, 1, 4, 4),
+        (50, 2, 0, 4),
+        (50, 3, 0, 4),
+    ];
+    for (z, w, agm_count, want) in cases {
+        if synaptics_image_sensor_num_fingers(&sgm(z, w), agm_count) != want {
+            return TestResult::Fail("image-sensor finger count mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_image_sensor_num_fingers);
+
+fn smoke_synaptics_image_sensor_slots_and_assign() -> TestResult {
+    use crate::psmouse::{
+        synaptics_image_mt_slots, synaptics_mt_assign_slots, synaptics_mt_tool_keys,
+        SynapticsHwState, SynapticsMtSlot,
+    };
+    let sgm = SynapticsHwState {
+        x: 1000,
+        y: 2000,
+        z: 50,
+        w: 1,
+        left: false,
+        right: false,
+    };
+    let agm = SynapticsHwState {
+        x: 3000,
+        y: 4000,
+        z: 100,
+        w: 2,
+        left: false,
+        right: false,
+    };
+    // Contacts (Linux `synaptics_report_mt_data`): slot 0 is the
+    // SGM contact, slot 1 the AGM contact, Y inverted
+    // (5856 - y); the count clamps to 2 slots.
+    let slots = synaptics_image_mt_slots(&sgm, &agm, 3);
+    if !slots[0].active
+        || slots[0].x != 1000
+        || slots[0].y != 3856
+        || !slots[1].active
+        || slots[1].x != 3000
+        || slots[1].y != 1856
+    {
+        return TestResult::Fail("3-finger image slots must be SGM then AGM, Y inverted");
+    }
+    let slots = synaptics_image_mt_slots(&sgm, &agm, 4);
+    if !slots[0].active || !slots[1].active {
+        return TestResult::Fail("4-finger image slots must fill both slots");
+    }
+    let slots = synaptics_image_mt_slots(&sgm, &agm, 1);
+    if !slots[0].active || slots[1].active {
+        return TestResult::Fail("1-finger image slots must be SGM only");
+    }
+    let slots = synaptics_image_mt_slots(&sgm, &agm, 0);
+    if slots[0].active || slots[1].active {
+        return TestResult::Fail("0-finger image slots must both be inactive");
+    }
+    // Slot assignment (Linux `input_mt_assign_slots`, DMAX * x_res
+    // with x_res = 10 → dmax = 100, mu = 20000). Positions here
+    // are already Y-inverted, as the report path passes them.
+    let slot = |x: i32, y: i32| SynapticsMtSlot { active: true, x, y };
+    let empty = [SynapticsMtSlot::new(); 2];
+    let two = synaptics_image_mt_slots(&sgm, &agm, 2);
+    // No live slots: contacts take slots in order.
+    if synaptics_mt_assign_slots(&empty, &two, 100) != [0, 1] {
+        return TestResult::Fail("first frame must assign slots 0 then 1");
+    }
+    // Small moves stay on their slots.
+    let prev = [slot(1000, 3856), slot(3000, 1856)];
+    let mut moved = two;
+    moved[0] = slot(1050, 3806);
+    if synaptics_mt_assign_slots(&prev, &moved, 100) != [0, 1] {
+        return TestResult::Fail("nearby moves must keep their slots");
+    }
+    // Crossed contacts swap slots: the SGM contact is now near
+    // the old slot 1 and the AGM contact near the old slot 0.
+    let prev = [slot(1050, 3806), slot(3000, 1856)];
+    let mut crossed = two;
+    crossed[0] = slot(3050, 1806);
+    crossed[1] = slot(1100, 3756);
+    if synaptics_mt_assign_slots(&prev, &crossed, 100) != [1, 0] {
+        return TestResult::Fail("crossed contacts must swap slots");
+    }
+    // One live slot, two contacts: the near one keeps the slot,
+    // the far one takes the free slot — whichever order they
+    // arrive in.
+    let one = [slot(1000, 3856), SynapticsMtSlot::new()];
+    if synaptics_mt_assign_slots(&one, &two, 100) != [0, 1] {
+        return TestResult::Fail("one live slot must keep the near contact");
+    }
+    let mut swapped = two;
+    swapped[0] = slot(3000, 1856);
+    swapped[1] = slot(1050, 3806);
+    if synaptics_mt_assign_slots(&one, &swapped, 100) != [1, 0] {
+        return TestResult::Fail("one live slot must take the near contact in either order");
+    }
+    // Both contacts far from every live slot: Linux leaves both
+    // unassigned (-1) — the IRQ path re-homes them to free slots.
+    let mut far = two;
+    far[0] = slot(5000, 5000);
+    far[1] = slot(5500, 5500);
+    if synaptics_mt_assign_slots(&prev, &far, 100) != [-1, -1] {
+        return TestResult::Fail("teleported contacts must be unassigned (-1, -1)");
+    }
+    // Unqueried resolution (dmax 0 = unbounded): even a far
+    // contact keeps its slot.
+    if synaptics_mt_assign_slots(&one, &far, 0) != [0, 1] {
+        return TestResult::Fail("dmax 0 must keep the slot for any displacement");
+    }
+    // Tool keys (Linux `input_mt_report_finger_count`).
+    if synaptics_mt_tool_keys(0) != [false; 5]
+        || synaptics_mt_tool_keys(1) != [true, false, false, false, false]
+        || synaptics_mt_tool_keys(2) != [false, true, false, false, false]
+        || synaptics_mt_tool_keys(3) != [false, false, true, false, false]
+        || synaptics_mt_tool_keys(4) != [false, false, false, true, false]
+        || synaptics_mt_tool_keys(5) != [false, false, false, false, true]
+        || synaptics_mt_tool_keys(6) != [false; 5]
+    {
+        return TestResult::Fail("tool keys must follow the finger count 1..=5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input",
+    smoke_synaptics_image_sensor_slots_and_assign
+);
+
+fn smoke_synaptics_image_sensor_irq_path() -> TestResult {
+    use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, abs,
+        btn::{BTN_TOOL_DOUBLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_QUINTTAP, BTN_TOOL_TRIPLETAP},
+        cursor_abs_px,
+        evdev::{key, EventType, ROUTER},
+        init_global_ring, pop_global, set_scanout_dims, InputEvent, TouchState,
+    };
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+    set_scanout_dims(1024, 768);
+    let (id, _node, reader) = synaptics_attach_evdev_for_test();
+    // Image-sensor pad (no ADV_GESTURE bit): NEWABS, extended +
+    // multifinger caps, IMAGE_SENSOR in ext_cap_0c, x_res = 10
+    // (dmax = DMAX * x_res = 100).
+    let hw = crate::psmouse::SynapticsHw {
+        identity: 0x054704,
+        model_id: 0x010080,
+        capabilities: 0xC04702,
+        ext_cap_0c: 0x000800,
+        x_res: 10,
+        newabs: true,
+        ..crate::psmouse::SynapticsHw::default()
+    };
+    i8042_mouse::set_synaptics_agm_for_test(&hw);
+    let fail = |id, msg: &'static str| {
+        ROUTER.unregister_device(id);
+        i8042_mouse::__reset_for_test();
+        TestResult::Fail(msg)
+    };
+
+    // AGM gesture + AGM-CONTACT packets update the second-contact
+    // state / finger count and produce no frame at all.
+    for b in [0x84, 0xDC, 0xD0, 0xF0, 0x75, 0x12] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    for b in [0x84, 0x03, 0x00, 0xC0, 0x00, 0x20] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    if !drain_evdev(&reader).is_empty() || pop_global().is_some() {
+        return fail(id, "AGM packets must emit nothing on an image-sensor pad");
+    }
+
+    // SGM packet, w=1, agm_count=3 → 3 fingers: slot 0 is the SGM
+    // contact (1000, 3856, pressure 50), slot 1 the AGM contact
+    // (3000, 1856, pressure 100), tracking ids 0 and 1.
+    for b in [0x81, 0x73, 50, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_MT_SLOT, 0)
+        && has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 0)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_X, 1000)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 3856)
+        && has(EventType::Abs, abs::ABS_MT_PRESSURE, 50)
+        && has(EventType::Abs, abs::ABS_MT_SLOT, 1)
+        && has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 1)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_X, 3000)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 1856)
+        && has(EventType::Abs, abs::ABS_MT_PRESSURE, 100)
+        && has(EventType::Abs, abs::ABS_X, 1000)
+        && has(EventType::Abs, abs::ABS_Y, 3856)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 50)
+        && has(EventType::Key, key::BTN_TOUCH, 1)
+        && has(EventType::Key, key::BTN_LEFT, 1)
+        && has(EventType::Key, key::BTN_TOOL_FINGER, 0)
+        && has(EventType::Key, BTN_TOOL_DOUBLETAP, 0)
+        && has(EventType::Key, BTN_TOOL_TRIPLETAP, 1)
+        && has(EventType::Key, BTN_TOOL_QUADTAP, 0)
+        && has(EventType::Key, BTN_TOOL_QUINTTAP, 0)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 2;
+    if !ok {
+        return fail(
+            id,
+            "3-finger image frame missing slots/pressures/tool keys/2xSYN",
+        );
+    }
+    match (pop_global(), pop_global()) {
+        (Some(InputEvent::Touch(t0)), Some(InputEvent::Touch(t1)))
+            if t0.slot == 0
+                && t0.tracking_id == Some(0)
+                && t0.id == 0
+                && t0.state == TouchState::Down
+                && t0.x == 1000
+                && t0.y == 3856
+                && t0.pressure == 50
+                && t1.slot == 1
+                && t1.tracking_id == Some(1)
+                && t1.id == 1
+                && t1.state == TouchState::Down
+                && t1.x == 3000
+                && t1.y == 1856
+                && t1.pressure == 100 => {}
+        _ => {
+            return fail(
+                id,
+                "ring must carry two Touch Down events with tracking ids",
+            )
+        }
+    }
+    if cursor_abs_px() != Some((0, 618)) || i8042_mouse::take_rel_delta() != (0, 0) {
+        return fail(
+            id,
+            "image frame must still drive the legacy bridge from SGM",
+        );
+    }
+
+    // Same positions, w=0 → 2 fingers: nothing moves, so the MT
+    // frame emits nothing; only the tool keys change (one SYN).
+    for b in [0x81, 0x73, 50, 0xC0, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Key, BTN_TOOL_DOUBLETAP, 1)
+        && has(EventType::Key, BTN_TOOL_TRIPLETAP, 0)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_POSITION_X)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_TRACKING_ID)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+    if !ok {
+        return fail(id, "2-finger frame must only flip the tool keys");
+    }
+    match (pop_global(), pop_global(), pop_global()) {
+        (
+            Some(InputEvent::Touch(t0)),
+            Some(InputEvent::Touch(t1)),
+            Some(InputEvent::Pointer(p)),
+        ) if t0.slot == 0
+            && t0.state == TouchState::Move
+            && t0.x == 1000
+            && t0.y == 3856
+            && t1.slot == 1
+            && t1.state == TouchState::Move
+            && t1.x == 3000
+            && t1.y == 1856
+            && p.dx == 0
+            && p.dy == 0 => {}
+        _ => {
+            return fail(
+                id,
+                "ring must carry two Touch Moves and a zero Pointer delta",
+            )
+        }
+    }
+
+    // SGM moves to (1050, 2050): slot 0 follows, tracking id 0
+    // stays — no new tracking id is issued.
+    for b in [0x81, 0x84, 50, 0xC0, 0x1A, 0x02] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_MT_POSITION_X, 1050)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 3806)
+        && has(EventType::Abs, abs::ABS_X, 1050)
+        && has(EventType::Abs, abs::ABS_Y, 3806)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_TRACKING_ID)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+    if !ok {
+        return fail(id, "moved contact must keep its slot and tracking id");
+    }
+    match (pop_global(), pop_global(), pop_global()) {
+        (
+            Some(InputEvent::Touch(t0)),
+            Some(InputEvent::Touch(t1)),
+            Some(InputEvent::Pointer(p)),
+        ) if t0.slot == 0
+            && t0.state == TouchState::Move
+            && t0.x == 1050
+            && t0.y == 3806
+            && t1.slot == 1
+            && t1.state == TouchState::Move
+            && t1.x == 3000
+            && t1.y == 1856
+            && p.dx == 0
+            && p.dy == -13 => {}
+        _ => return fail(id, "ring must carry the move and the bridge delta (0, -13)"),
+    }
+
+    // Contacts cross: the AGM gesture moves to (1100, 2100) and
+    // the SGM packet to (3050, 4050). The slots swap — slot 1
+    // carries the SGM contact now — but the tracking ids stay
+    // with their slots (0 and 1), and each slot reports its new
+    // contact's pressure.
+    for b in [0x84, 0x26, 0x1A, 0xF0, 0x42, 0x12] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    for b in [0x81, 0xFB, 60, 0xC0, 0xEA, 0xD2] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_MT_POSITION_X, 1100)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 3756)
+        && has(EventType::Abs, abs::ABS_MT_PRESSURE, 100)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_X, 3050)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 1806)
+        && has(EventType::Abs, abs::ABS_MT_PRESSURE, 60)
+        && has(EventType::Abs, abs::ABS_X, 1100)
+        && has(EventType::Abs, abs::ABS_Y, 3756)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 60)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_TRACKING_ID)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 2;
+    if !ok {
+        return fail(id, "crossed frame must swap slots without new tracking ids");
+    }
+    match (pop_global(), pop_global(), pop_global()) {
+        (
+            Some(InputEvent::Touch(t0)),
+            Some(InputEvent::Touch(t1)),
+            Some(InputEvent::Pointer(p)),
+        ) if t0.slot == 0
+            && t0.tracking_id == Some(0)
+            && t0.state == TouchState::Move
+            && t0.x == 1100
+            && t0.y == 3756
+            && t1.slot == 1
+            && t1.tracking_id == Some(1)
+            && t1.state == TouchState::Move
+            && t1.x == 3050
+            && t1.y == 1806
+            && p.dx == 403
+            && p.dy == -505 => {}
+        _ => return fail(id, "ring must carry the crossed moves and the bridge delta"),
+    }
+
+    // Finger lifts (z=0): both slots release (tracking -1),
+    // touch/left release, pressure 0, tool keys all 0, no X/Y.
+    for b in [0x80, 0xFB, 0, 0xC0, 0xEA, 0xD2] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let n_released = events
+        .iter()
+        .filter(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_TRACKING_ID && e.value == -1)
+        .count();
+    let ok = n_released == 2
+        && has(EventType::Key, key::BTN_TOUCH, 0)
+        && has(EventType::Key, key::BTN_LEFT, 0)
+        && has(EventType::Abs, abs::ABS_PRESSURE, 0)
+        && has(EventType::Key, key::BTN_TOOL_FINGER, 0)
+        && has(EventType::Key, BTN_TOOL_DOUBLETAP, 0)
+        && has(EventType::Key, BTN_TOOL_TRIPLETAP, 0)
+        && has(EventType::Key, BTN_TOOL_QUADTAP, 0)
+        && has(EventType::Key, BTN_TOOL_QUINTTAP, 0)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && (e.code == abs::ABS_X || e.code == abs::ABS_Y))
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 2;
+    if !ok {
+        return fail(id, "lift frame must release both slots without X/Y");
+    }
+    match (pop_global(), pop_global()) {
+        (Some(InputEvent::Touch(t0)), Some(InputEvent::Touch(t1)))
+            if t0.slot == 0
+                && t0.state == TouchState::Up
+                && t0.x == 1100
+                && t0.y == 3756
+                && t1.slot == 1
+                && t1.state == TouchState::Up
+                && t1.x == 3050
+                && t1.y == 1806 => {}
+        _ => return fail(id, "ring must carry two Touch Up events at last positions"),
+    }
+
+    // w=3 → 4 fingers: fresh tracking ids 2 and 3 on the freed
+    // slots, QUADTAP pressed.
+    for b in [0x85, 0x73, 50, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Abs, abs::ABS_MT_SLOT, 0)
+        && has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 2)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_X, 1000)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 3856)
+        && has(EventType::Abs, abs::ABS_MT_PRESSURE, 50)
+        && has(EventType::Abs, abs::ABS_MT_SLOT, 1)
+        && has(EventType::Abs, abs::ABS_MT_TRACKING_ID, 3)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_X, 1100)
+        && has(EventType::Abs, abs::ABS_MT_POSITION_Y, 3756)
+        && has(EventType::Abs, abs::ABS_MT_PRESSURE, 100)
+        && has(EventType::Key, BTN_TOOL_QUADTAP, 1)
+        && has(EventType::Key, BTN_TOOL_QUINTTAP, 0)
+        && has(EventType::Key, key::BTN_TOOL_FINGER, 0)
+        && has(EventType::Key, BTN_TOOL_DOUBLETAP, 0)
+        && has(EventType::Key, BTN_TOOL_TRIPLETAP, 0)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 2;
+    if !ok {
+        return fail(id, "4-finger frame must issue fresh ids 2/3 and QUADTAP");
+    }
+    match (pop_global(), pop_global()) {
+        (Some(InputEvent::Touch(t0)), Some(InputEvent::Touch(t1)))
+            if t0.slot == 0
+                && t0.tracking_id == Some(2)
+                && t0.state == TouchState::Down
+                && t0.x == 1000
+                && t0.y == 3856
+                && t1.slot == 1
+                && t1.tracking_id == Some(3)
+                && t1.state == TouchState::Down
+                && t1.x == 1100
+                && t1.y == 3756 => {}
+        _ => return fail(id, "ring must carry two Touch Downs with ids 2 and 3"),
+    }
+
+    // AGM-CONTACT count=5, then w=1 → 5 fingers: only the tool
+    // keys change (QUADTAP off, QUINTTAP on), one SYN.
+    for b in [0x84, 0x05, 0x00, 0xC0, 0x00, 0x20] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    if !drain_evdev(&reader).is_empty() || pop_global().is_some() {
+        return fail(id, "AGM-CONTACT packet must emit nothing");
+    }
+    for b in [0x81, 0x73, 50, 0xC4, 0xE8, 0xD0] {
+        i8042_mouse::feed_byte_for_test(b);
+    }
+    let events = drain_evdev(&reader);
+    let has = |type_: EventType, code: u16, value: i32| {
+        events
+            .iter()
+            .any(|e| e.type_ == type_ && e.code == code && e.value == value)
+    };
+    let ok = has(EventType::Key, BTN_TOOL_QUADTAP, 0)
+        && has(EventType::Key, BTN_TOOL_QUINTTAP, 1)
+        && !events
+            .iter()
+            .any(|e| e.type_ == EventType::Abs && e.code == abs::ABS_MT_POSITION_X)
+        && events.iter().filter(|e| e.type_ == EventType::Syn).count() == 1;
+    if !ok {
+        return fail(id, "5-finger frame must only flip QUADTAP to QUINTTAP");
+    }
+    match (pop_global(), pop_global(), pop_global()) {
+        (
+            Some(InputEvent::Touch(t0)),
+            Some(InputEvent::Touch(t1)),
+            Some(InputEvent::Pointer(p)),
+        ) if t0.slot == 0
+            && t0.state == TouchState::Move
+            && t1.slot == 1
+            && t1.state == TouchState::Move
+            && p.dx == 0
+            && p.dy == 0 => {}
+        _ => {
+            return fail(
+                id,
+                "ring must carry two Touch Moves and a zero Pointer delta",
+            )
+        }
+    }
+
+    ROUTER.unregister_device(id);
+    i8042_mouse::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_synaptics_image_sensor_irq_path);
