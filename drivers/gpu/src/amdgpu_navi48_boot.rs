@@ -676,6 +676,21 @@ fn driver_reserve(aperture: u64, available: u64) -> u64 {
         .min(available)
 }
 
+/// Publish card `card`'s client VRAM heap for GEM placements; `hdp` is the
+/// card's HDP flush for page-table updates.
+pub(crate) fn publish_heap(
+    card: u32,
+    heap: &crate::amdgpu_gem::VramHeap,
+    hdp: Option<alloc::sync::Arc<dyn crate::amdgpu_vm::HdpFlush>>,
+) {
+    let _ = hdp;
+    crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+}
+/// Withdraw what [`publish_heap`] published (suspend, recovery).
+pub(crate) fn withdraw_heap(card: u32) {
+    crate::amdgpu_gem::unregister_vram_heap(card);
+}
+
 pub(crate) fn reserve_client_chunk(pool: &Pool) -> Result<crate::amdgpu_vram::Reservation, Error> {
     const ALIGN: u64 = 2 << 20;
     let available = pool.available();
@@ -1095,8 +1110,15 @@ impl ColdBoot {
     }
     pub(crate) fn republish_client_vram(&self) {
         if let (Some(card), Some(heap)) = (Self::drm_card(), &self.client_heap) {
-            crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+            publish_heap(card, heap, self.hdp_flusher());
         }
+    }
+    /// The GMC owner's HDP flush, for client page-table updates.
+    fn hdp_flusher(&self) -> Option<alloc::sync::Arc<dyn crate::amdgpu_vm::HdpFlush>> {
+        self.sequence.backend.gmc.as_ref().map(|gmc| {
+            alloc::sync::Arc::new(gmc.hdp_flusher())
+                as alloc::sync::Arc<dyn crate::amdgpu_vm::HdpFlush>
+        })
     }
     pub fn state(&self) -> State {
         self.sequence.state
@@ -1575,7 +1597,7 @@ impl ColdBoot {
         // Evictions see every buffer of the card, framebuffer-only ones
         // included, as TTM's LRU does.
         crate::amdgpu_gem::set_lru_eviction(card, true);
-        crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+        publish_heap(card, &heap, self.hdp_flusher());
         self.client_heap = Some(heap);
         self.client_vram = Some(chunk);
         Ok(size)

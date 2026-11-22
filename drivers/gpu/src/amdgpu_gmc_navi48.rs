@@ -113,6 +113,26 @@ impl Io for Mmio {
         unsafe { map.write32(offset, value) };
     }
 }
+/// `Gmc::hdp_flusher`: `amdgpu_device_flush_hdp(adev, NULL)` for CPU
+/// page-table updates (`amdgpu_vm_cpu_commit`), usable without the owner.
+#[derive(Clone, Copy, Debug)]
+pub struct HdpFlusher {
+    regs: MmioRegion,
+    nbio: u64,
+    authority: Cap<BusDeviceCap, Write>,
+}
+impl crate::amdgpu_vm::HdpFlush for HdpFlusher {
+    fn flush(&self) -> Result<(), narf_filesystem::FsError> {
+        // The remapped flush write and NBIO read-back are idempotent and
+        // safe beside the owner's own MMIO.
+        let mut io = Mmio(self.regs);
+        let nbio = self.nbio;
+        self.authority
+            .invoke(Op(|| flush(&mut io, nbio)))
+            .map_err(|_| narf_filesystem::FsError::NoDevice)?
+            .map_err(|_| narf_filesystem::FsError::NoDevice)
+    }
+}
 struct Op<F>(F);
 impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
     type Output = T;
@@ -595,6 +615,15 @@ impl Gmc {
     }
     pub fn state(&self) -> State {
         self.engine.state
+    }
+    /// The HDP flush (the remapped HDP_MEM_FLUSH_CNTL write and NBIO
+    /// read-back `flush` does) under this owner's live PCI authority.
+    pub fn hdp_flusher(&self) -> HdpFlusher {
+        HdpFlusher {
+            regs: self.engine.io.0,
+            nbio: self.engine.layout.nbio,
+            authority: self.engine.authority,
+        }
     }
     pub fn aperture(&self) -> Option<Aperture> {
         self.engine.aperture

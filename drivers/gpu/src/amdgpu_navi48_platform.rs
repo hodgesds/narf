@@ -819,7 +819,7 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
         }
     }
     // No new VRAM placement while the old ones leave.
-    crate::amdgpu_gem::unregister_vram_heap(card);
+    boot::withdraw_heap(card);
     let (domains, evicted) = crate::amdgpu_gem::evict_all(&placement).await;
     let republish = || async {
         if let Some(boot) = OWNER.lock().await.as_ref() {
@@ -1176,7 +1176,7 @@ async unsafe fn quiesce(
     }
     if let Some(card) = boot::ColdBoot::drm_card() {
         crate::amdgpu_cs::unregister_submitter(card);
-        crate::amdgpu_gem::unregister_vram_heap(card);
+        boot::withdraw_heap(card);
     }
     let old_clearer = ResetClearer {
         clearer: CLEARER.lock().take(),

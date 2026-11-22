@@ -351,3 +351,97 @@ kernel_test_in!(
     "drivers/gpu/amdgpu-vm/vram-tables",
     vm_tables_move_to_vram_and_survive_vram_loss
 );
+
+/// A GFX12 hub walking a 4-level context (GC 12.0.x, 48-bit) through VRAM
+/// only. Besides VALID and SYSTEM, a directory entry must not carry
+/// `AMDGPU_PDE_PTE_GFX12` (bit 63), which would make the hub take it for a
+/// leaf. Returns each entry read.
+fn hub_walk_gfx12(vram: &Vram, base: u64, va: u64) -> Result<Vec<u64>, &'static str> {
+    let mut entry = base;
+    let mut read = Vec::new();
+    for level in [Level::Pdb2, Level::Pdb1, Level::Pdb0, Level::Ptb] {
+        if entry & PTE_VALID == 0 {
+            return Err("invalid directory entry");
+        }
+        if entry & (PTE_SYSTEM | PDE_PTE_GFX12) != 0 {
+            return Err("directory entry points at system memory or is a leaf");
+        }
+        let index = Geometry::GMC12.index_at(va, level);
+        entry = vram
+            .read((entry & ADDRESS) + index * 8)
+            .ok_or("directory entry points outside VRAM")?;
+        read.push(entry);
+    }
+    Ok(read)
+}
+
+struct Navi48Heap(u32);
+impl Drop for Navi48Heap {
+    fn drop(&mut self) {
+        crate::amdgpu_navi48_boot::withdraw_heap(self.0);
+    }
+}
+
+/// Navi48 (GC 12.0.x, gmc_v12_0) is a dGPU too: `amdgpu_vm_pt_create` puts
+/// its client tables in VRAM, and `gmc_v12_0_get_vm_pde` gives a VRAM
+/// directory `vram_base_offset + mc - vram_start` with VALID; GMC12 never
+/// sets `translate_further`, so no BFS/TF bits, and a directory that points
+/// at a table carries no `AMDGPU_PDE_PTE_GFX12`. Publishing the card's
+/// client heap (`amdgpu_navi48_boot::publish_heap`, with the GMC's HDP flush)
+/// gives its spaces those tables; withdrawing and publishing it again after
+/// a VRAM loss (S3) rewrites them.
+fn vm_tables_live_in_vram_on_navi48_like_gmc_v12_0() -> TestResult {
+    const CARD: u32 = 0xfa17_0103;
+    const VA: u64 = 0xffff_8001_0000_0000;
+    let mut vram = Vram::new();
+    let _registered = Registered(CARD);
+    let _published = Navi48Heap(CARD);
+    let heap = crate::amdgpu_gem::VramHeap {
+        pool: vram.pool.clone(),
+        fb_base: FB_BASE,
+        fb_offset: FB_OFFSET,
+        unmapped: None,
+    };
+    let flushes = vram.flushes.clone();
+    let hdp = || Some(flushes.clone() as Arc<dyn HdpFlush>);
+    crate::amdgpu_navi48_boot::publish_heap(CARD, &heap, hdp());
+    let gem = crate::amdgpu_gem::GemState::new();
+    let vm = VmState::build(Geometry::GMC12, Some(CARD));
+    map_gtt(&gem, &vm, VA, 2);
+    let root = vm.root_pde();
+    if !vram_root(root) || root.is_some_and(|root| root & PDE_PTE_GFX12 != 0) {
+        return TestResult::Fail("the GFX12 root is not a VRAM directory entry");
+    }
+    for level in [Level::Pdb2, Level::Pdb1, Level::Pdb0] {
+        let entry = vm.directory_entry(strip_hole(VA), level).unwrap_or(0);
+        if entry & (PTE_VALID | PTE_SYSTEM | PTE_SNOOPED | PDE_PTE_GFX12) != PTE_VALID {
+            return TestResult::Fail("a GFX12 directory entry is not a VRAM PDE");
+        }
+    }
+    let walks = |vram: &Vram| {
+        [VA, VA + 4096].iter().all(|&va| {
+            let va = strip_hole(va);
+            hub_walk_gfx12(vram, vm.root_pde().unwrap_or(0), va).is_ok_and(|read| {
+                read == vm.describe_va(va).walk
+                    && read[3] & (PTE_VALID | PTE_SYSTEM | PTE_SNOOPED)
+                        == PTE_VALID | PTE_SYSTEM | PTE_SNOOPED
+            })
+        })
+    };
+    if !walks(&vram) || vram.flushes() == 0 {
+        return TestResult::Fail("a GFX12 walk through VRAM, or the HDP flush");
+    }
+    // S3: the heap is withdrawn, VRAM is lost, the heap is published again.
+    crate::amdgpu_navi48_boot::withdraw_heap(CARD);
+    vram.lose();
+    crate::amdgpu_navi48_boot::publish_heap(CARD, &heap, hdp());
+    if vm.root_pde() != root || !walks(&vram) {
+        return TestResult::Fail("GFX12 tables were not rewritten after a VRAM loss");
+    }
+    drop(vm);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu-vm/vram-tables-gfx12",
+    vm_tables_live_in_vram_on_navi48_like_gmc_v12_0
+);
