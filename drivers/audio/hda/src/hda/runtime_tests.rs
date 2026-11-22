@@ -3964,3 +3964,92 @@ kernel_test_in!(
     "audio/hda/pm-wake",
     native_hda_pm_codec_suspend_cleans_up_converters
 );
+
+/// Linux patch_hdmi with atihdmi's `static_pcm_mapping`: one PCM per pin
+/// (`min(num_cvts, num_pins)`), device numbers from `get_empty_pcm_device`
+/// (3, 7, 8, 9, 10, ...), pin i bound to PCM i. Per PCM, the
+/// "HDMI/DP,pcm=N Jack" on CARD (`generic_hdmi_build_jack`), the "ELD" on
+/// PCM at device N (`hdmi_create_eld_ctl`), the IEC958 Con Mask, Pro Mask,
+/// Default and Switch on MIXER at the PCM's index
+/// (`snd_hda_create_dig_out_ctls`) and the "Playback Channel Map" on PCM at
+/// device N (`snd_hdac_add_chmap_ctls`). An HDMI-only codec has no "Master
+/// Playback Switch". NARF had one PCM at device 0 that mirrored every port,
+/// one control set at device 0, index 0, and a Master switch.
+fn native_hda_hdmi_pcm_per_pin_at_linux_devices() -> TestResult {
+    use narf_drivers_sound::mixer::ControlKind;
+    let fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    if card.pcm_devices(false) != Some(alloc::vec![3, 7]) || card.pcm_devices(true).is_some() {
+        return TestResult::Fail("one playback PCM per HDMI pin at devices 3 and 7");
+    }
+    let wires: Vec<(ControlKind, u32, u32, Option<alloc::string::String>)> = card
+        .controls()
+        .into_iter()
+        .map(|id| match card.control_wire(id) {
+            Some(wire) => (id.kind, wire.device, wire.index, wire.name),
+            None => (id.kind, 0, 0, None),
+        })
+        .collect();
+    let has = |kind: ControlKind, device: u32, index: u32, name: Option<&str>| {
+        wires
+            .iter()
+            .any(|w| w.0 == kind && w.1 == device && w.2 == index && w.3.as_deref() == name)
+    };
+    for (pcm, device) in [(0u32, 3u32), (1, 7)] {
+        let jack = alloc::format!("HDMI/DP,pcm={} Jack", device);
+        if !has(ControlKind::HdmiJack, 0, 0, Some(&jack))
+            || !has(ControlKind::Eld, device, 0, None)
+            || !has(ControlKind::ChannelMap, device, 0, None)
+        {
+            return TestResult::Fail("per-PCM jack, ELD and channel map at Linux's ids");
+        }
+        for kind in [
+            ControlKind::Iec958ConMask,
+            ControlKind::Iec958ProMask,
+            ControlKind::Iec958Default,
+            ControlKind::Iec958Switch,
+        ] {
+            if !has(kind, 0, pcm, None) {
+                return TestResult::Fail("per-PCM IEC958 set at the PCM's index");
+            }
+        }
+    }
+    if card
+        .controls()
+        .iter()
+        .any(|id| id.kind == ControlKind::MasterMute)
+    {
+        return TestResult::Fail("an HDMI-only codec has no Master Playback Switch");
+    }
+    if card.open(false, 0).is_ok() {
+        return TestResult::Fail("an HDMI-only card has no PCM device 0");
+    }
+    // Device 7 is pin 5's PCM: its converter takes the stream, pin 3's
+    // converter does not.
+    let Ok(mut playback) = card.open(false, 7) else {
+        return TestResult::Fail("open HDMI PCM device 7");
+    };
+    let first = fixture.model.verbs.len();
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure device 7");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    if !verbs.contains(&make_verb(0, 4, VERB_SET_CONVERTER_STREAM | 0x10))
+        || verbs.contains(&make_verb(0, 2, VERB_SET_CONVERTER_STREAM | 0x10))
+    {
+        return TestResult::Fail("device 7 streams to pin 5's converter only");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/hdmi-pcm",
+    native_hda_hdmi_pcm_per_pin_at_linux_devices
+);

@@ -1228,3 +1228,129 @@ test!(alsa_iec958_and_channel_map_controls, {
     drop(f);
     crate::unregister_hardware_card(card);
 });
+
+/// Two HDMI PCMs the way Linux HDA numbers and names them: devices 3 and 7
+/// (`get_empty_pcm_device`), one jack per PCM named after its device, the
+/// ELD on the PCM interface at that device, the IEC958 set at the PCM's
+/// index.
+#[derive(Debug)]
+struct PerPcmHdmi;
+impl PcmDevice for PerPcmHdmi {
+    fn open(&self, _: bool, _: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
+        Err(SoundError::NoSuchDevice)
+    }
+    fn pcm_devices(&self, capture: bool) -> Option<Vec<u32>> {
+        (!capture).then(|| alloc::vec![3, 7])
+    }
+    fn controls(&self) -> Vec<ControlId> {
+        [
+            ControlKind::HdmiJack,
+            ControlKind::HdmiJack,
+            ControlKind::Eld,
+            ControlKind::Eld,
+            ControlKind::Iec958Default,
+            ControlKind::Iec958Default,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| ControlId {
+            index: index as u32,
+            kind,
+        })
+        .collect()
+    }
+    fn control_wire(&self, id: ControlId) -> Option<ControlWire> {
+        let pcm = id.index % 2;
+        let device = [3, 7][pcm as usize];
+        Some(match id.kind {
+            ControlKind::HdmiJack => ControlWire {
+                device: 0,
+                index: 0,
+                name: Some(alloc::format!("HDMI/DP,pcm={} Jack", device)),
+            },
+            ControlKind::Eld => ControlWire {
+                device,
+                index: 0,
+                name: None,
+            },
+            _ => ControlWire {
+                device: 0,
+                index: pcm,
+                name: None,
+            },
+        })
+    }
+    fn get_control(&self, id: ControlId) -> Result<ControlValue, SoundError> {
+        Ok(match id.kind {
+            ControlKind::Eld => ControlValue::bytes(&[]),
+            _ => ControlValue::boolean(false),
+        })
+    }
+}
+// alsa-lib's cards/HDA-Intel.conf opens `hdmi:CARD,M` as hw device 3, 7,
+// ... and writes "IEC958 Playback Default" at index M; ACP finds the jack
+// and the ELD by the device it opened. The sound core numbered every card's
+// PCMs 0..count and put every control at device 0, index 0, under its
+// kind's name, so none of these lookups could succeed.
+test!(alsa_hdmi_pcms_at_linux_device_numbers, {
+    use narf_filesystem::DirOps as _;
+    let card = crate::register_hardware_card(
+        crate::CardInfo {
+            index: 0,
+            driver: "alsa-test",
+            id: "HDMI",
+            name: "HDMI PCM layout test",
+            playback_count: 2,
+            capture_count: 0,
+        },
+        Arc::new(PerPcmHdmi),
+    );
+    let dir = crate::devfs_bridge::DevSndDir;
+    let node = |device: u32| {
+        dir.lookup(&alloc::format!("pcmC{}D{}p", card, device))
+            .is_some()
+    };
+    assert_eq!(
+        [node(3), node(7), node(0), node(1)],
+        [true, true, false, false]
+    );
+    let f = crate::devfs_bridge::SoundControlFile::new(card)
+        .open_instance_checked(true)
+        .unwrap()
+        .unwrap();
+    let m = Memory::new();
+    // SNDRV_CTL_IOCTL_PCM_NEXT_DEVICE walks 3, 7, then -1.
+    let next = |previous: i32| {
+        m.put(64, &previous.to_ne_bytes());
+        run(f.ioctl_user(command(b'U', 0x30, 2, 4), 64, &m)).unwrap();
+        get32(&m.bytes.lock(), 64) as i32
+    };
+    assert_eq!([next(-1), next(3), next(7)], [3, 7, -1]);
+    // SNDRV_CTL_IOCTL_PCM_INFO answers for device 7, not for device 0.
+    let mut info = alloc::vec![0; 288];
+    put32(&mut info, 0, 7);
+    m.put(512, &info);
+    assert!(ctl(f.as_ref(), &m, 0x31, 288, 512).is_ok());
+    put32(&mut info, 0, 0);
+    m.put(512, &info);
+    assert!(ctl(f.as_ref(), &m, 0x31, 288, 512).is_err());
+    // Controls looked up by Linux's ids.
+    let numid = |iface: u32, device: u32, index: u32, name: &str| {
+        let mut id = alloc::vec![0; 272];
+        put32(&mut id, 4, iface);
+        put32(&mut id, 8, device);
+        put32(&mut id, 60, index);
+        id[16..16 + name.len()].copy_from_slice(name.as_bytes());
+        m.put(1024, &id);
+        ctl(f.as_ref(), &m, 0x11, 272, 1024)
+            .ok()
+            .map(|_| get32(&m.bytes.lock(), 1024))
+    };
+    assert_eq!(numid(1, 0, 0, "HDMI/DP,pcm=7 Jack"), Some(2));
+    assert_eq!(numid(3, 7, 0, "ELD"), Some(4));
+    assert_eq!(numid(2, 0, 1, "IEC958 Playback Default"), Some(6));
+    assert_eq!(numid(1, 0, 0, "HDMI/DP,pcm=0 Jack"), None);
+    assert_eq!(numid(3, 0, 0, "ELD"), None);
+    drop(f);
+    crate::unregister_hardware_card(card);
+});
