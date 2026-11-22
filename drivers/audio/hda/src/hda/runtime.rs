@@ -1894,21 +1894,94 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    let dev = Arc::new(
-        // SAFETY: Bus probing has exclusively claimed this function and its BAR.
-        unsafe { IntelHda::bring_up(&device, &cap) }.map_err(|error| {
-            narf_bus::ProbeError::Other(match error {
-                HdaError::BarMapFailed => "HDA BAR invalid",
-                HdaError::ResetTimeout => "HDA controller reset timed out",
-                HdaError::CorbResetTimeout => "HDA CORB reset timed out",
-                HdaError::NoCodecs => "HDA no codecs responded",
-                HdaError::DmaAllocFailed => "HDA DMA allocation failed",
-                HdaError::CommandTimeout => "HDA codec command timed out",
-                HdaError::DeviceFailed => "HDA command engine failed",
-                _ => "HDA initialization failed",
-            })
-        })?,
-    );
+    // SAFETY: Bus probing has exclusively claimed this function and its BAR.
+    let brought_up = unsafe { IntelHda::bring_up(&device, &cap) };
+    match brought_up {
+        Ok(dev) => register_controller(&device, dev),
+        Err(error) if retries_probe(&device, error) => {
+            narf_console::write_str(&alloc::format!(
+                "hda: {:04x}:{:04x} codec probe failed ({:?}); retrying every second\n",
+                device.id.vendor,
+                device.id.device,
+                error
+            ));
+            // Linux returns 0 from the probe and keeps the device ("keep
+            // things up") while the delayed probe work retries.
+            narf_scheduler::spawn(retry_probe(device, cap));
+            Ok(())
+        }
+        Err(error) => Err(probe_error(error)),
+    }
+}
+
+fn probe_error(error: HdaError) -> narf_bus::ProbeError {
+    narf_bus::ProbeError::Other(match error {
+        HdaError::BarMapFailed => "HDA BAR invalid",
+        HdaError::ResetTimeout => "HDA controller reset timed out",
+        HdaError::CorbResetTimeout => "HDA CORB reset timed out",
+        HdaError::NoCodecs => "HDA no codecs responded",
+        HdaError::DmaAllocFailed => "HDA DMA allocation failed",
+        HdaError::CommandTimeout => "HDA codec command timed out",
+        HdaError::DeviceFailed => "HDA command engine failed",
+        _ => "HDA initialization failed",
+    })
+}
+
+/// Linux `AZX_DCAPS_RETRY_PROBE` (the AMD SB preset): a codec probe that
+/// fails on an AMD platform controller is retried rather than final.
+fn retries_probe(device: &BusDevice, error: HdaError) -> bool {
+    super::amd_sb_preset(device.id.vendor, device.id.device)
+        && matches!(error, HdaError::NoCodecs | HdaError::CommandTimeout)
+}
+
+/// Linux `azx_probe_continue`: `++hda->probe_retry < 60`, one second apart.
+const PROBE_ATTEMPTS: u32 = 60;
+
+/// The delayed probe work of an AMD platform controller whose codecs did
+/// not come up at boot: bring the controller up again every second until a
+/// codec answers, as Linux re-runs `azx_codec_configure` from `probe_work`.
+async fn retry_probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
+    let (vendor, id) = (device.id.vendor, device.id.device);
+    for attempt in 1..PROBE_ATTEMPTS {
+        narf_time::SleepUntil::new(Deadline::after_ms(1000).as_instant()).await;
+        // SAFETY: probe handed this task the claimed function and its BAR;
+        // nothing else drives the controller until it registers.
+        match unsafe { IntelHda::bring_up(&device, &cap) } {
+            Ok(dev) => {
+                let result = register_controller(&device, dev);
+                narf_console::write_str(&alloc::format!(
+                    "hda: {:04x}:{:04x} codec probe retry {}: {:?}\n",
+                    vendor,
+                    id,
+                    attempt,
+                    result
+                ));
+                return;
+            }
+            Err(error) if retries_probe(&device, error) => {}
+            Err(error) => {
+                narf_console::write_str(&alloc::format!(
+                    "hda: {:04x}:{:04x} codec probe retry {} failed: {:?}\n",
+                    vendor,
+                    id,
+                    attempt,
+                    error
+                ));
+                return;
+            }
+        }
+    }
+    narf_console::write_str(&alloc::format!(
+        "hda: {:04x}:{:04x} cannot probe codecs, giving up\n",
+        vendor,
+        id
+    ));
+}
+
+/// Publish a brought-up controller: sound card, service tasks, bound-driver
+/// record and system PM.
+fn register_controller(device: &BusDevice, dev: IntelHda) -> Result<(), narf_bus::ProbeError> {
+    let dev = Arc::new(dev);
     if !dev.ready {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }

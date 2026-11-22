@@ -273,4 +273,26 @@ mod renoir_bind_tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/hda/amd-sb", native_hda_amd_platform_controllers_bind);
+
+    /// The AMD SB preset (and with it `AZX_DCAPS_RETRY_PROBE`) covers the
+    /// platform controllers only: the GPU HD-Audio functions take the ATI
+    /// HDMI presets, and the vendor gate keeps another vendor's 0x15e3 out.
+    fn native_hda_amd_sb_preset_retries_platform_probes() -> TestResult {
+        for device in [0x1457u16, 0x1487, 0x15e3] {
+            if !amd_sb_preset(HDA_AMD_VENDOR, device) {
+                return TestResult::Fail("AMD platform controller without the AMD SB preset");
+            }
+        }
+        if amd_sb_preset(HDA_AMD_RADEON_VENDOR, HDA_AMD_RADEON_DEVICE)
+            || amd_sb_preset(HDA_AMD_RADEON_VENDOR, 0xab28)
+            || amd_sb_preset(0x8086, HDA_AMD_ZEN_DEVICE)
+        {
+            return TestResult::Fail("the AMD SB preset is for 1022 platform controllers only");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/hda/amd-sb",
+        native_hda_amd_sb_preset_retries_platform_probes
+    );
 }

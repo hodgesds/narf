@@ -6,9 +6,32 @@
 
 // ── PCI device ids ─────────────────────────────────────────────────
 
-/// AMD Ryzen / Phoenix Family-19h HD Audio Controller.
-pub const HDA_AMD_PHOENIX_VENDOR: u16 = 0x1022;
-pub const HDA_AMD_PHOENIX_DEVICE: u16 = 0x15e3;
+/// AMD platform (FCH / SoC) HD-Audio controllers: the board's analog codec.
+pub const HDA_AMD_VENDOR: u16 = 0x1022;
+/// The Family 17h/19h HD-Audio controller. Linux lists it as "AMD Raven",
+/// the first part it shipped on, but the same function carries the analog
+/// codec on Renoir, Cezanne, Rembrandt and Phoenix APUs and on the Ryzen 7000
+/// (Raphael / Granite Ridge, AM5) desktop, such as a Ryzen 5 7600X board.
+pub const HDA_AMD_ZEN_DEVICE: u16 = 0x15e3;
+/// Linux "AMD, X370 & co": the Zen 1/Zen+ desktop chipset's HD-Audio.
+pub const HDA_AMD_X370_DEVICE: u16 = 0x1457;
+/// Linux "AMD, X570 & co": the Zen 2/Zen 3 desktop HD-Audio.
+pub const HDA_AMD_X570_DEVICE: u16 = 0x1487;
+
+/// Whether `vendor:device` is one Linux binds with `AZX_DCAPS_PRESET_AMD_SB`
+/// (sound/hda/controllers/intel.c): ATI snoop (PCI 0x42), no TCSEL, the
+/// FIFO position fix (LPIB, 32-frame delay) and, in particular
+/// `AZX_DCAPS_RETRY_PROBE`: Linux retries the codec probe every second, up
+/// to 60 times, because "a few recent AMD systems show the codec
+/// configuration errors at the early boot, while loading the driver at a
+/// later stage works magically" (commit c0f1886de7e1).
+pub const fn amd_sb_preset(vendor: u16, device: u16) -> bool {
+    vendor == HDA_AMD_VENDOR
+        && matches!(
+            device,
+            HDA_AMD_X370_DEVICE | HDA_AMD_X570_DEVICE | HDA_AMD_ZEN_DEVICE
+        )
+}
 
 /// AMD Radeon HD Audio Controller — found on integrated Radeon GPUs.
 pub const HDA_AMD_RADEON_VENDOR: u16 = 0x1002;
@@ -101,12 +124,10 @@ pub const HDA_INTEL_TIGER_LAKE_GFX_DEVICE_D: u16 = 0x9A0C;
 /// Every named HDA controller `(match name, vendor, device)`; each binds
 /// the same vendor-agnostic probe.
 pub const HDA_PCI_IDS: &[(&str, u16, u16)] = &[
-    // AMD — Family-19h Phoenix HD Audio + Radeon HD Audio iGPU.
-    (
-        "hda-amd-phoenix",
-        HDA_AMD_PHOENIX_VENDOR,
-        HDA_AMD_PHOENIX_DEVICE,
-    ),
+    // AMD platform HD-Audio (the board codec) + Radeon HD Audio iGPU.
+    ("hda-amd-zen", HDA_AMD_VENDOR, HDA_AMD_ZEN_DEVICE),
+    ("hda-amd-x370", HDA_AMD_VENDOR, HDA_AMD_X370_DEVICE),
+    ("hda-amd-x570", HDA_AMD_VENDOR, HDA_AMD_X570_DEVICE),
     (
         "hda-amd-radeon",
         HDA_AMD_RADEON_VENDOR,
