@@ -139,8 +139,10 @@ fn park_timer_target(
     {
         return (ClockId::Monotonic, deadline, deadline);
     }
-    let offset = narf_scheduler::narf_time::wall_offset_ns();
-    let mono = (realtime as i128 - offset as i128).clamp(1, (u64::MAX - 1) as i128) as u64;
+    // Wall time is the NTP-steered clock plus the wall offset.
+    let offset = i128::from(narf_scheduler::narf_time::wall_offset_ns())
+        + i128::from(narf_scheduler::narf_time::steer::offset_ns());
+    let mono = (realtime as i128 - offset).clamp(1, (u64::MAX - 1) as i128) as u64;
     if mono != deadline
         && uc
             .sleep_deadline_ns
@@ -1412,8 +1414,10 @@ mod realtime_park_tests {
         let uc = UserTaskCtx::new();
         let saved = narf_scheduler::narf_time::wall_offset_ns();
         let now = narf_scheduler::narf_time::monotonic_ns();
-        let realtime = (now as i64 + saved + 60_000_000_000) as u64;
-        let mono = (realtime as i64 - saved) as u64;
+        // Wall time is the steered clock plus the wall offset.
+        let lead = saved + narf_scheduler::narf_time::steer::offset_ns();
+        let realtime = (now as i64 + lead + 60_000_000_000) as u64;
+        let mono = (realtime as i64 - lead) as u64;
         note_realtime_park(&uc, mono, realtime);
         uc.sleep_deadline_ns.store(mono, Ordering::Release);
         let before = park_timer_target(&uc, mono);

@@ -1300,7 +1300,23 @@ Linux-compatibility shim; capability-based filesystem authority remains the
 security boundary.
 `clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
 CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
-calling task's accumulated user and kernel accounting.
+calling task's accumulated user and kernel accounting. CLOCK_MONOTONIC,
+CLOCK_BOOTTIME and CLOCK_REALTIME are the NTP-steered clock
+(`narf_time::steer::monotonic_ns`, plus `offs_boot` or the wall offset) and
+follow `adjtimex`'s frequency and slews; CLOCK_MONOTONIC_RAW is the counter
+clock (`narf_time::monotonic_ns`) and never does, as Linux's `tkr_raw`.
+`clock_settime` and `settimeofday` set the wall offset against the steered
+clock. timerfds and POSIX timers on CLOCK_MONOTONIC run on the
+MONOTONIC_STEERED hrtimer base; an absolute CLOCK_MONOTONIC `clock_nanosleep`
+or futex timeout is converted to the kernel's counter clock
+(`steer::offset_ns`), and `clock_nanosleep` re-derives it after every wake,
+as it does a CLOCK_REALTIME expiry, so it never ends before the clock the
+program reads gets there (a futex timeout is converted once, so it may end
+up to the NTP rate times its length early or late). The vDSO's vvar page
+publishes the steered timekeeper — `mult`/`shift` (16/20), `cycle_last`
+(40), `base_ns` (48) — and the counter's `raw_mult`/`raw_shift` (56/60),
+republished on every NTP re-anchor (`steer::set_vsyscall_notifier`), and the
+vDSO reads the counter inside its seqlock section.
 The scheduling-policy syscalls (`sched_setscheduler`, `sched_setparam`,
 `sched_setattr`, getters and `sched_rr_get_interval`) publish accepted policy,
 nice, RT priority and custom fair slice to the live scheduler before committing

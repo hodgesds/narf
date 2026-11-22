@@ -5722,9 +5722,9 @@ const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
 const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
 const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
-// Wave-73: CLOCK_MONOTONIC_RAW skips NTP slew (we have no NTP, so
-// RAW == MONOTONIC for now). CLOCK_BOOTTIME counts wall time across
-// suspend (no suspend support → same as MONOTONIC).
+// CLOCK_MONOTONIC_RAW is the counter at its own rate; CLOCK_MONOTONIC and
+// CLOCK_BOOTTIME are the NTP-steered clock (`narf_time::steer`), BOOTTIME
+// plus the time spent suspended.
 const CLOCK_MONOTONIC_RAW: u64 = 4;
 const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
@@ -10668,7 +10668,11 @@ fn futex_timeout_deadline(
         return Ok(Some(monotonic_now.saturating_add(requested)));
     }
     if !realtime {
-        return Ok(Some(requested));
+        // An absolute CLOCK_MONOTONIC timeout is in the steered clock the
+        // program reads; the wait runs on the kernel's counter clock.
+        let lead = i128::from(narf_scheduler::narf_time::steer::offset_ns());
+        let deadline = (i128::from(requested) - lead).clamp(0, i128::from(u64::MAX)) as u64;
+        return Ok(Some(deadline));
     }
     let wall_now = narf_scheduler::narf_time::now_wall().as_nanos();
     let remaining = i128::from(requested).saturating_sub(wall_now);

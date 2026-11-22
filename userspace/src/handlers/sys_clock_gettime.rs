@@ -39,13 +39,20 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
             let w = narf_scheduler::narf_time::now_wall();
             (w.secs, w.nanos as i64)
         }
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+        // `tk->tkr_mono`: the NTP-steered clock.
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_COARSE => {
+            let ns: u64 = narf_scheduler::narf_time::steer::monotonic_ns();
+            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+        }
+        // `tk->tkr_raw`: the counter at its own rate, never steered.
+        CLOCK_MONOTONIC_RAW => {
             let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
         // CLOCK_BOOTTIME counts time spent suspended (`offs_boot`).
         CLOCK_BOOTTIME => {
-            let ns: u64 = narf_scheduler::narf_time::boottime_ns();
+            let ns: u64 = narf_scheduler::narf_time::steer::monotonic_ns()
+                .saturating_add(narf_scheduler::narf_time::boot_offset_ns());
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {

@@ -255,7 +255,8 @@ fn clock_base_of(clockid: i32) -> ClockId {
         CLOCKID_REALTIME | CLOCKID_REALTIME_ALARM => ClockId::Realtime,
         CLOCKID_BOOTTIME | CLOCKID_BOOTTIME_ALARM => ClockId::Boottime,
         CLOCKID_TAI => ClockId::Tai,
-        _ => ClockId::Monotonic,
+        // CLOCK_MONOTONIC as the program reads it: NTP-steered.
+        _ => ClockId::MonotonicSteered,
     }
 }
 
@@ -1147,7 +1148,10 @@ fn nanosleep_common(
             }
             mono
         }
-        None if absolute => target_ns,
+        // An absolute CLOCK_MONOTONIC / BOOTTIME expiry is in the steered
+        // clock the program reads; the park runs on the kernel's counter
+        // clock, and the expiry is re-derived after every wake below.
+        None if absolute => steered_to_mono(target_ns),
         None => now.saturating_add(target_ns),
     };
     if deadline <= now {
@@ -1162,20 +1166,12 @@ fn nanosleep_common(
             // SAFETY: the in-flight task's poller-pinned ctx, live for this
             // trap; the own-stack park returns here when the sleep ends.
             let uc = unsafe { &*uctx };
-            let realtime_target = if absolute && clockid == CLOCK_REALTIME {
-                target_ns.max(1)
-            } else {
-                0
+            let target = match (absolute, clockid == CLOCK_REALTIME) {
+                (false, _) => SleepTarget::Relative,
+                (true, true) => SleepTarget::Realtime(target_ns.max(1)),
+                (true, false) => SleepTarget::Steered(target_ns.max(1)),
             };
-            nanosleep_block(
-                ctx,
-                uc,
-                deadline,
-                req_ptr,
-                rem_ptr,
-                absolute,
-                realtime_target,
-            );
+            nanosleep_block(ctx, uc, deadline, req_ptr, rem_ptr, target);
             return;
         }
     }
@@ -1237,10 +1233,44 @@ fn nanosleep_common(
 ///
 /// Only a signal this thread can take ends the sleep early: the park loop
 /// re-parks on a blocked one, and an ignored one is discarded when sent.
-/// The monotonic time at which wall time reaches `realtime_ns`.
+/// The kernel (counter) time at which wall time reaches `realtime_ns`: wall
+/// time is the NTP-steered clock plus the wall offset.
 fn realtime_to_mono(realtime_ns: u64) -> u64 {
-    let offset = narf_scheduler::narf_time::wall_offset_ns();
-    (realtime_ns as i128 - offset as i128).clamp(0, u64::MAX as i128) as u64
+    let offset = i128::from(narf_scheduler::narf_time::wall_offset_ns())
+        + i128::from(narf_scheduler::narf_time::steer::offset_ns());
+    (realtime_ns as i128 - offset).clamp(0, u64::MAX as i128) as u64
+}
+
+/// The kernel (counter) time at which the steered CLOCK_MONOTONIC reaches
+/// `steered_ns`.
+fn steered_to_mono(steered_ns: u64) -> u64 {
+    let offset = i128::from(narf_scheduler::narf_time::steer::offset_ns());
+    (steered_ns as i128 - offset).clamp(0, u64::MAX as i128) as u64
+}
+
+/// What a `clock_nanosleep` waits for.
+#[derive(Copy, Clone)]
+enum SleepTarget {
+    /// A relative sleep: its kernel-time deadline is fixed.
+    Relative,
+    /// An absolute CLOCK_REALTIME expiry: the deadline follows clock steps,
+    /// re-derived from it on every pass.
+    Realtime(u64),
+    /// An absolute steered CLOCK_MONOTONIC / BOOTTIME expiry: re-derived on
+    /// every pass, so the sleep ends when the clock the program reads gets
+    /// there, whatever the NTP rate did meanwhile (never early).
+    Steered(u64),
+}
+
+impl SleepTarget {
+    /// The kernel-time deadline now, or `None` for a relative sleep.
+    fn deadline(self) -> Option<u64> {
+        match self {
+            SleepTarget::Relative => None,
+            SleepTarget::Realtime(t) => Some(realtime_to_mono(t)),
+            SleepTarget::Steered(t) => Some(steered_to_mono(t)),
+        }
+    }
 }
 
 fn nanosleep_block(
@@ -1249,17 +1279,17 @@ fn nanosleep_block(
     deadline: u64,
     req_ptr: u64,
     rem_ptr: u64,
-    absolute: bool,
-    // Absolute CLOCK_REALTIME expiry (0 = none): the deadline follows clock
-    // steps, re-derived from it on every pass.
-    realtime_target: u64,
+    target: SleepTarget,
 ) {
     let task = current_task_id();
+    let absolute = !matches!(target, SleepTarget::Relative);
     let mut deadline = deadline;
     loop {
-        if realtime_target != 0 {
-            deadline = realtime_to_mono(realtime_target);
-            crate::user_task::note_realtime_park(uc, deadline, realtime_target);
+        if let Some(d) = target.deadline() {
+            deadline = d;
+        }
+        if let SleepTarget::Realtime(realtime) = target {
+            crate::user_task::note_realtime_park(uc, deadline, realtime);
         }
         uc.sleep_deadline_ns.store(deadline, Ordering::Release);
         // SAFETY: `uc` is this task's live ctx; the saved frame is what the
@@ -1270,8 +1300,8 @@ fn nanosleep_block(
         }
         crate::handlers::own_stack_block(ctx);
         uc.sleep_deadline_ns.store(0, Ordering::Release);
-        if realtime_target != 0 {
-            deadline = realtime_to_mono(realtime_target);
+        if let Some(d) = target.deadline() {
+            deadline = d;
         }
         let now = narf_scheduler::narf_time::monotonic_ns();
         if now >= deadline {
@@ -1937,7 +1967,12 @@ pub fn __test_itimer_cpu_next_fire(task: u64, which: usize) -> u64 {
 /// signals via the existing `raise_signal_pending` path. Re-arms
 /// periodic timers. Counts missed expiries into `overrun`.
 fn posix_timer_pump() {
-    posix_timer_pump_at(narf_scheduler::narf_time::monotonic_ns());
+    // Each POSIX timer's own clock (`clock_now`), as its callback reads it;
+    // ITIMER_REAL runs on the kernel's counter clock.
+    pump_timers(
+        hrtimer::clock_now,
+        narf_scheduler::narf_time::monotonic_ns(),
+    );
 }
 
 /// Test-only: run every POSIX timer's and ITIMER_REAL's expiry step at a
@@ -1948,12 +1983,19 @@ fn posix_timer_pump() {
 /// so a case that waited for wall time would assert on however many
 /// intervals happened to elapse. Production expiry is the callbacks.
 fn posix_timer_pump_at(now: u64) {
+    pump_timers(|_| now, now);
+}
+
+/// The expiry step of every POSIX timer at `timer_now(its clock)` and of
+/// every ITIMER_REAL at `itimer_now`.
+fn pump_timers(timer_now: impl Fn(ClockId) -> u64, itimer_now: u64) {
     let mut deliveries: Vec<(u64, u32, bool)> = Vec::new();
     {
         let mut g = TIMERS.lock();
         if let Some(map) = g.as_mut() {
             for table in map.values_mut() {
                 for t in table.by_id.values_mut() {
+                    let now = timer_now(t.clock);
                     if let Some(d) = expire_posix_timer(t, now) {
                         deliveries.push(d);
                     }
@@ -1961,7 +2003,7 @@ fn posix_timer_pump_at(now: u64) {
             }
         }
     }
-    itimer_pump_collect(now, &mut deliveries);
+    itimer_pump_collect(itimer_now, &mut deliveries);
     for (task, signum, thread_directed) in deliveries {
         deliver_timer_signal(task, signum, thread_directed);
     }
