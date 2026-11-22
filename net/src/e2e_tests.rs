@@ -3570,3 +3570,109 @@ kernel_test_in!(
     "net/rp-filter",
     smoke_rp_filter_strict_and_loose_follow_linux
 );
+
+/// A TCP socket bound to a device (`SO_BINDTODEVICE`) matches only segments
+/// that arrive on that device: `__inet_lookup_established` and the
+/// listener lookup test `inet_sk_bound_dev_eq(net, sk_bound_dev_if, dif,
+/// sdif)`. On this host a connect from enp14s0's address bound to wlan0
+/// times out: the SYN leaves wlan0, the SYN-ACK to enp14s0's address comes
+/// back on enp14s0, finds no socket, and is answered with a RST.
+fn smoke_tcp_bound_device_matches_only_its_own_arrivals() -> TestResult {
+    const A: &str = "e2e-tbdev-a";
+    const B: &str = "e2e-tbdev-b";
+    const A_IP: [u8; 4] = [10, 35, 3, 165];
+    const A_GW: [u8; 4] = [10, 35, 3, 1];
+    const A_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x05];
+    const B_IP: [u8; 4] = [10, 35, 1, 211];
+    const B_GW: [u8; 4] = [10, 35, 1, 254];
+    const B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x35, 0x0b];
+    const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x35, 0xfe];
+    const REMOTE: [u8; 4] = [1, 1, 1, 1];
+    static B_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+    fn capture_b(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    let tcp_flags = |f: &Vec<u8>| -> Option<(u16, u32, u8)> {
+        if f.len() < ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN
+            || f[12..14] != ETHERTYPE_IPV4.to_be_bytes()
+            || f[ETH_HDR_LEN + 9] != IP_PROTO_TCP
+        {
+            return None;
+        }
+        let tcp = &f[ETH_HDR_LEN + IPV4_HDR_LEN..];
+        let port = u16::from_be_bytes([tcp[0], tcp[1]]);
+        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+        Some((port, seq, tcp[13]))
+    };
+
+    full_reset(A, A_IP, A_GW);
+    iface::register(B, B_MAC, capture_b);
+    iface::set_link_state(B, true);
+    iface::set_iface_ipv4_fields(B, B_IP, B_GW);
+    iface::add_addr(B, B_IP, 22);
+    arp_cache::insert(B, B_GW, GW_MAC);
+    let Some(b_index) = iface::ifindex_of(B) else {
+        return TestResult::Fail("second test device has no ifindex");
+    };
+    drain_captured();
+    B_TX.lock().clear();
+
+    let opts = core::ConnectOptions {
+        oif: b_index,
+        local_addr: Some(A_IP),
+        ..core::ConnectOptions::default()
+    };
+    let Ok(id) = core::connect_start_in(0, REMOTE, 443, opts) else {
+        return TestResult::Fail("a connect bound to B with A's address was refused");
+    };
+    let on_b = ::core::mem::take(&mut *B_TX.lock());
+    let Some((port, iss, _)) = on_b
+        .iter()
+        .filter_map(tcp_flags)
+        .find(|&(_, _, flags)| flags & FLAG_SYN != 0)
+    else {
+        return TestResult::Fail("the bound connect's SYN did not leave B");
+    };
+    let syn_ack = |dst_mac: [u8; 6]| {
+        build_tcp_frame(TcpFrameSpec {
+            src_mac: GW_MAC,
+            dst_mac,
+            src_ip: REMOTE,
+            dst_ip: A_IP,
+            src_port: 443,
+            dst_port: port,
+            seq: 9000,
+            ack: iss.wrapping_add(1),
+            flags: FLAG_SYN | FLAG_ACK,
+            window: 65535,
+            payload: &[],
+        })
+    };
+    // The answer to A's address comes back on A.
+    crate::tcp_stack::rx_handler(A, &mut syn_ack(A_MAC));
+    let after_a = lookup_tcb(id).map(|t| t.lock().state);
+    let rst = drain_captured()
+        .iter()
+        .chain(B_TX.lock().iter())
+        .filter_map(tcp_flags)
+        .any(|(_, _, flags)| flags & 0x04 != 0);
+    // The same segment arriving on B completes it.
+    crate::tcp_stack::rx_handler(B, &mut syn_ack(B_MAC));
+    let after_b = lookup_tcb(id).map(|t| t.lock().state);
+    let _ = close(id);
+    if after_a != Some(TcpState::SynSent) {
+        return TestResult::Fail("a SYN-ACK arriving on A completed a connection bound to B");
+    }
+    if !rst {
+        return TestResult::Fail("the SYN-ACK that found no socket on A was not reset");
+    }
+    if after_b != Some(TcpState::Established) {
+        return TestResult::Fail("the SYN-ACK arriving on B did not complete the connection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp-bound-dev-rx",
+    smoke_tcp_bound_device_matches_only_its_own_arrivals
+);
