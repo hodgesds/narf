@@ -24,6 +24,13 @@
 //! | `conf/<dev>/forwarding`        | ditto, per ingress interface           |
 //! | `conf/<dev>/send_redirects`    | `net::ip_forward` redirect generation  |
 //! | `conf/{all,<dev>}/rp_filter`   | `net::tcp_stack` `reverse_path_ok`     |
+//! | `ipv6/conf/<dev>/accept_ra`    | `net::ipv6_stack` RA processing        |
+//! | `ipv6/conf/<dev>/autoconf`     | ditto, SLAAC on a PIO                  |
+//! | `ipv6/conf/<dev>/use_tempaddr` | ditto, RFC 8981 temporary addresses    |
+//!
+//! `ipv6/conf/*/{disable_ipv6, addr_gen_mode, hop_limit, mtu}` are stored
+//! with Linux's bounds and read by nothing yet (`conf/all/disable_ipv6`
+//! reaches every device's value, as `addrconf_disable_ipv6` does).
 //! | `ip_default_ttl`               | `net::pkt::write_ipv4_header`          |
 //! | `icmp_echo_ignore_all`         | `net::icmp_sock::handle_echo_request`  |
 //! | `icmp_echo_ignore_broadcasts`  | ditto                                  |
@@ -150,11 +157,24 @@ static TCP_ALLOWED_CONG: IrqSafeSpinLock<[u8; 32]> =
 // ── net.ipv6 atomics ────────────────────────────────────────────────────
 
 pub static IPV6_FORWARDING: AtomicU32 = AtomicU32::new(0);
-static IPV6_ACCEPT_RA: AtomicU32 = AtomicU32::new(1);
-static IPV6_AUTOCONF: AtomicU32 = AtomicU32::new(1);
-static IPV6_USE_TEMPADDR: AtomicU32 = AtomicU32::new(2);
-static IPV6_DISABLE_IPV6: AtomicU32 = AtomicU32::new(0);
 static IPV6_BINDV6ONLY: AtomicU32 = AtomicU32::new(0);
+// `conf.{all,default,<dev>}.{accept_ra, autoconf, use_tempaddr,
+// disable_ipv6, addr_gen_mode, hop_limit, mtu}` live in
+// `narf_lib::sysctl::ipv6`, where the IPv6 stack reads them.
+
+fn read_i32(v: i32) -> String {
+    format!("{v}\n")
+}
+
+/// A write to an IPv6 conf key, within the key's `proc_handler` bounds.
+fn parse_ipv6_conf(key: narf_lib::sysctl::ipv6::Key, s: &str) -> Result<i32, FsError> {
+    let v = s.trim().parse::<i32>().map_err(|_| FsError::InvalidData)?;
+    let (min, max) = key.bounds();
+    if !(min..=max).contains(&v) {
+        return Err(FsError::InvalidData);
+    }
+    Ok(v)
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -683,30 +703,65 @@ pub fn register_all() {
         write: Some(|s| write_bool_atomic(&IPV6_FORWARDING, s)),
         perms: 0o644,
     });
-    register_sysctl(SysctlEntry {
-        path: "net/ipv6/conf/all/accept_ra",
-        read: || read_atomic(&IPV6_ACCEPT_RA),
-        write: Some(|s| write_bool_atomic(&IPV6_ACCEPT_RA, s)),
-        perms: 0o644,
-    });
-    register_sysctl(SysctlEntry {
-        path: "net/ipv6/conf/all/autoconf",
-        read: || read_atomic(&IPV6_AUTOCONF),
-        write: Some(|s| write_bool_atomic(&IPV6_AUTOCONF, s)),
-        perms: 0o644,
-    });
-    register_sysctl(SysctlEntry {
-        path: "net/ipv6/conf/all/use_tempaddr",
-        read: || read_atomic(&IPV6_USE_TEMPADDR),
-        write: Some(|s| write_atomic(&IPV6_USE_TEMPADDR, s)),
-        perms: 0o644,
-    });
-    register_sysctl(SysctlEntry {
-        path: "net/ipv6/conf/all/disable_ipv6",
-        read: || read_atomic(&IPV6_DISABLE_IPV6),
-        write: Some(|s| write_bool_atomic(&IPV6_DISABLE_IPV6, s)),
-        perms: 0o644,
-    });
+    // conf/all/* and conf/default/*: one entry per key and table.
+    macro_rules! ipv6_conf {
+        ($all:literal, $default:literal, $key:expr) => {
+            register_sysctl(SysctlEntry {
+                path: $all,
+                read: || read_i32(narf_lib::sysctl::ipv6::all($key)),
+                write: Some(|s| {
+                    narf_lib::sysctl::ipv6::set_all($key, parse_ipv6_conf($key, s)?);
+                    Ok(())
+                }),
+                perms: 0o644,
+            });
+            register_sysctl(SysctlEntry {
+                path: $default,
+                read: || read_i32(narf_lib::sysctl::ipv6::default_value($key)),
+                write: Some(|s| {
+                    narf_lib::sysctl::ipv6::set_default($key, parse_ipv6_conf($key, s)?);
+                    Ok(())
+                }),
+                perms: 0o644,
+            });
+        };
+    }
+    use narf_lib::sysctl::ipv6::Key as V6;
+    ipv6_conf!(
+        "net/ipv6/conf/all/accept_ra",
+        "net/ipv6/conf/default/accept_ra",
+        V6::AcceptRa
+    );
+    ipv6_conf!(
+        "net/ipv6/conf/all/autoconf",
+        "net/ipv6/conf/default/autoconf",
+        V6::Autoconf
+    );
+    ipv6_conf!(
+        "net/ipv6/conf/all/use_tempaddr",
+        "net/ipv6/conf/default/use_tempaddr",
+        V6::UseTempaddr
+    );
+    ipv6_conf!(
+        "net/ipv6/conf/all/disable_ipv6",
+        "net/ipv6/conf/default/disable_ipv6",
+        V6::DisableIpv6
+    );
+    ipv6_conf!(
+        "net/ipv6/conf/all/addr_gen_mode",
+        "net/ipv6/conf/default/addr_gen_mode",
+        V6::AddrGenMode
+    );
+    ipv6_conf!(
+        "net/ipv6/conf/all/hop_limit",
+        "net/ipv6/conf/default/hop_limit",
+        V6::HopLimit
+    );
+    ipv6_conf!(
+        "net/ipv6/conf/all/mtu",
+        "net/ipv6/conf/default/mtu",
+        V6::Mtu
+    );
     register_sysctl(SysctlEntry {
         path: "net/ipv6/bindv6only",
         read: || read_atomic(&IPV6_BINDV6ONLY),
@@ -1112,6 +1167,30 @@ impl super::ProcFile for DevConfFile {
     }
 }
 
+/// One `/proc/sys/net/ipv6/conf/<iface>/<key>` file.
+#[derive(Debug)]
+struct Dev6ConfFile {
+    iface: alloc::string::String,
+    key: narf_lib::sysctl::ipv6::Key,
+}
+
+impl super::ProcFile for Dev6ConfFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        read_i32(narf_lib::sysctl::ipv6::device(&self.iface, self.key)).into_bytes()
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn write(&self, buf: &[u8]) -> Result<usize, FsError> {
+        let s = core::str::from_utf8(buf).map_err(|_| FsError::InvalidData)?;
+        let v = parse_ipv6_conf(self.key, s)?;
+        narf_lib::sysctl::ipv6::set_device(&self.iface, self.key, v);
+        Ok(buf.len())
+    }
+}
+
 fn dev_conf_path(iface: &str, key: DevKey) -> alloc::string::String {
     let k = key.name();
     alloc::format!("sys/net/ipv4/conf/{iface}/{k}")
@@ -1121,6 +1200,19 @@ fn dev_conf_path(iface: &str, key: DevKey) -> alloc::string::String {
 /// settings from the matching `conf.default` keys.
 pub fn register_dev_conf(iface: &str) {
     narf_lib::sysctl::ipv4::init_device_conf(iface);
+    // `ipv6_add_dev`: the device's IPv6 conf, seeded from conf.default.
+    // Its `mtu` starts at the Ethernet default until the stack sets it.
+    narf_lib::sysctl::ipv6::init_device_conf(iface, 1500);
+    for key in narf_lib::sysctl::ipv6::Key::ALL {
+        let name = key.name();
+        super::register_proc(
+            &alloc::format!("sys/net/ipv6/conf/{iface}/{name}"),
+            alloc::sync::Arc::new(Dev6ConfFile {
+                iface: alloc::string::String::from(iface),
+                key,
+            }),
+        );
+    }
     for key in [DevKey::Forwarding, DevKey::SendRedirects, DevKey::RpFilter] {
         super::register_proc(
             &dev_conf_path(iface, key),

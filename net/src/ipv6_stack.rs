@@ -1998,21 +1998,35 @@ fn handle_icmp6(
             _ => true,
         },
         ICMPV6_ROUTER_ADVERTISEMENT => {
-            let now = narf_scheduler::narf_time::monotonic_ns();
-            if let Some(info) = ndp::on_ra(iface, src_ip, body, now) {
-                // Run SLAAC over each autonomous PIO.
-                let mac = match crate::iface::lookup(iface) {
-                    Some(s) => s.mac,
-                    None => [0u8; 6],
-                };
-                let cfg = slaac::SlaacConfig::default();
-                for pio in &info.prefixes {
-                    if pio.autonomous {
-                        slaac::process_pio(iface, mac, pio, cfg, now);
+            // `ndisc_router_discovery`: a device whose `accept_ra` is off
+            // takes no router, route, prefix or MTU from the RA
+            // (`ipv6_accept_ra`). NetworkManager turns it off on the
+            // devices it manages and reads the RA itself, from the raw
+            // socket below.
+            if narf_lib::sysctl::ipv6::accept_ra(iface) {
+                let now = narf_scheduler::narf_time::monotonic_ns();
+                if let Some(info) = ndp::on_ra(iface, src_ip, body, now) {
+                    // `addrconf_prefix_rcv`: SLAAC over each autonomous
+                    // PIO while the device's `autoconf` is on, with RFC 8981
+                    // temporary addresses while `use_tempaddr` is above 0.
+                    if narf_lib::sysctl::ipv6::autoconf(iface) {
+                        let mac = match crate::iface::lookup(iface) {
+                            Some(s) => s.mac,
+                            None => [0u8; 6],
+                        };
+                        let cfg = slaac::SlaacConfig {
+                            privacy_extensions: narf_lib::sysctl::ipv6::use_tempaddr(iface) > 0,
+                            ..slaac::SlaacConfig::default()
+                        };
+                        for pio in &info.prefixes {
+                            if pio.autonomous {
+                                slaac::process_pio(iface, mac, pio, cfg, now);
+                            }
+                        }
                     }
                 }
-                icmp6_sock::on_rx_on(ifindex, hop_limit, src_ip, dst_ip, hdr.typ, hdr.code, body);
             }
+            icmp6_sock::on_rx_on(ifindex, hop_limit, src_ip, dst_ip, hdr.typ, hdr.code, body);
             true
         }
         ICMPV6_ROUTER_SOLICITATION => {
