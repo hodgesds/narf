@@ -2442,6 +2442,12 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
         cleanup_gd();
         return TestResult::Fail("walk did not cover the written length exactly");
     }
+    // `dir_emit_dots`: `.` and `..` lead every listing.
+    if names.len() < 2 || names[0] != "." || names[1] != ".." {
+        cleanup_gd();
+        return TestResult::Fail("getdents64 did not start with `.` and `..`");
+    }
+    let mut names = names.split_off(2);
     names.sort();
     if names.as_slice() != ["alpha", "beta", "gamma"] {
         cleanup_gd();

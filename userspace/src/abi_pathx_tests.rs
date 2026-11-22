@@ -3791,14 +3791,31 @@ fn smoke_abi_pathx_getdents_pos() -> TestResult {
         if reclen == 0 || reclen > n || reclen % 8 != 0 {
             return Err("getdents d_reclen must be a non-zero 8-aligned length");
         }
+        // `.` and `..` lead the listing (`dir_emit_dots`); the first seed
+        // follows them. Records are walked by d_reclen.
+        let mut pos = 0usize;
+        for _ in 0..2 {
+            let len = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            if len == 0 || pos + len > n {
+                return Err("getdents returned fewer records than `.`, `..` and a seed");
+            }
+            pos += len;
+        }
+        if pos + 20 > n {
+            return Err("getdents returned fewer records than `.`, `..` and a seed");
+        }
+        let reclen = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+        if reclen == 0 || pos + reclen > n {
+            return Err("getdents d_reclen of the first seed is out of range");
+        }
         // Name starts at offset 18 and is NUL-terminated; the first seed
         // enumerated is "a" (single byte name).
-        if buf[18] != b'a' || buf[19] != 0 {
-            return Err("getdents first entry name should be \"a\\0\"");
+        if buf[pos + 18] != b'a' || buf[pos + 19] != 0 {
+            return Err("getdents first seed name should be \"a\\0\"");
         }
         // Legacy d_type is the LAST byte of the record — DT_REG (8) for a
         // regular file seed.
-        if buf[reclen - 1] != 8 {
+        if buf[pos + reclen - 1] != 8 {
             return Err("getdents d_type (at reclen-1) should be DT_REG (8)");
         }
         Ok(())
