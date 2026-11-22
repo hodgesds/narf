@@ -381,9 +381,21 @@ DDI pre-enable → transcoder/pipe/M-N/FUNC_CTL → DBUF +
 watermarks → plane → link training → DDI buffer → enables),
 fixture-validated, silicon untested. The plane admission is the
 SKL rule: 256 KiB surface alignment, 32 KiB stride cap.
-External display, backlight, execlists submission and GuC load
-stay gated: those are the Gen11 Lanes 3 and 6–8. Gen9 stays
-excluded (§6).
+External display and backlight stay gated: that is Gen11 Lane 8.
+Execlists submission (Lane 3) is admitted — a Gen11
+batch executes on RCS with no GuC loaded — and GuC/HuC load
+(Lane 7) is admitted: the GuC profiles are `i915/icl_guc_70.1.1.bin`
+and `i915/ehl_guc_70.1.1.bin`, both at minimum 70.1.1, and the HuC
+profiles are `i915/icl_huc_9.0.0.bin` and `i915/ehl_huc_9.0.0.bin`
+(`gt/uc/intel_uc_fw.c` `INTEL_GUC_FIRMWARE_DEFS` /
+`INTEL_HUC_FIRMWARE_DEFS`); the 9.0.0 is the HuC filename version,
+not an enforced minimum, because Linux applies no version matching
+to HuC. The WOPCM plan for Gen11 is the 2 MiB total
+(`gt/intel_wopcm.c` `GEN11_WOPCM_SIZE`), with the 36 KiB ICL
+hardware-context reservation at the top. GuC submission stays
+optional on Gen11 by design (execlists is the submission path);
+the GuC is loaded where a GuC owner exists, which is what HuC
+authentication requires. Gen9 stays excluded (§6).
 
 Remainder (EHL/JSL 36-bit PPGTT): Linux `i915_pci.c` sets
 `.__runtime.ppgtt_size = 36` for Elkhart Lake and Jasper Lake only;

@@ -158,6 +158,7 @@ impl GuCFirmware {
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
+    use crate::intel_gpu_gt::Gen11Platform;
     use crate::intel_gpu_uapi::put32;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -239,5 +240,63 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_firmware",
         smoke_xelpg_firmware_authority_and_version
+    );
+
+    fn smoke_gen11_guc_firmware_minimum_version() -> TestResult {
+        // Lane 7 item 1: Lane 1's Gen11 profiles, verified against Linux
+        // `gt/uc/intel_uc_fw.c` `INTEL_GUC_FIRMWARE_DEFS` —
+        // `guc_mmp(icl, 70, 1, 1)` / `guc_mmp(ehl, 70, 1, 1)`. For a
+        // legacy `_mmp` entry the triple is both the filename suffix and
+        // the minimum version (Linux `intel_uc_fw.c` `got_wanted`:
+        // selected >= wanted), the same rule the TGL (70, 44, 1) pin
+        // follows for its major-only blob.
+        let mut bytes = alloc::vec![0; 528];
+        for (offset, value) in [
+            (0, 6),
+            (4, 225),
+            (8, 0x10000),
+            (16, 0x8086),
+            (24, 229),
+            (28, 96),
+            (32, 96),
+            (36, 1),
+            (64, 0x0046_0101),
+        ] {
+            put32(&mut bytes, offset, value);
+        }
+        for platform in [
+            GtPlatform::Gen11(Gen11Platform::IceLake),
+            GtPlatform::Gen11(Gen11Platform::ElkhartLake),
+            GtPlatform::Gen11(Gen11Platform::JasperLake),
+        ] {
+            if GuCFirmware::from_fixture(platform, &bytes).is_err() {
+                return TestResult::Fail("Gen11 GuC 70.1.1 firmware rejected");
+            }
+        }
+        // One patch below the minimum is refused on every Gen11 profile.
+        put32(&mut bytes, 64, 0x0046_0100);
+        for platform in [
+            GtPlatform::Gen11(Gen11Platform::IceLake),
+            GtPlatform::Gen11(Gen11Platform::ElkhartLake),
+            GtPlatform::Gen11(Gen11Platform::JasperLake),
+        ] {
+            if !matches!(
+                GuCFirmware::from_fixture(platform, &bytes),
+                Err(FirmwareError::Image(GuCError::FirmwareVersion))
+            ) {
+                return TestResult::Fail("Gen11 GuC 70.1.0 firmware admitted");
+            }
+        }
+        // A newer patch is accepted: the tuple is a minimum, not an
+        // exact pin.
+        put32(&mut bytes, 64, 0x0046_0102);
+        if GuCFirmware::from_fixture(GtPlatform::Gen11(Gen11Platform::IceLake), &bytes).is_err() {
+            return TestResult::Fail("Gen11 GuC 70.1.2 firmware rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_firmware",
+        smoke_gen11_guc_firmware_minimum_version
     );
 }

@@ -3705,15 +3705,22 @@ or fairness promise. A single VIDEO ignores selector bits, matching source.
 If no VIDEO engine is published, selection refuses before allocation/DMA.
 HuC/codec acceptance is separate.
 
-### Intel exact-TGL HuC upload and authentication
+### Intel exact-TGL and Gen11 HuC upload and authentication
 
 Default-off `narf.intel.huc=1` enables source-qualified HuC upload/authentication
-on exact physical Gen12Platform::TigerLake, as described here, and, together
+on exact physical Gen12Platform::TigerLake and on the Gen11 sub-platforms
+(Ice Lake `i915/icl_huc_9.0.0.bin`, Elkhart/Jasper Lake
+`i915/ehl_huc_9.0.0.bin`; Linux `gt/uc/intel_uc_fw.c`
+`INTEL_HUC_FIRMWARE_DEFS`: `huc_mmp(icl, 9, 0, 0)`,
+`huc_mmp(ehl, 9, 0, 0)` — the 9.0.0 is the filename version, not an
+enforced minimum, because Linux applies no version matching to HuC),
+as described here, and, together
 with `narf.intel.media_gt=1`, on the MTL/Arrow media GT (see the media GT
 opt-in below). On TGL the retained main-GT worker
 acquires the authorized immutable canonical `i915/tgl_huc.bin` before WOPCM
 planning, retains its real upload/RSA backing through both boot passes and full
-shutdown, and uploads HuC before each GuC upload. Other platforms add no
+shutdown, and uploads HuC before each GuC upload. The Gen11 main-GT worker
+does the same with its sub-platform's blob. Other platforms add no
 HuC firmware/DMA or positive query. TGL runtime autosuspend is armed but its
 owned panel's display wakeref keeps the function active.
 Existing system-sleep/reset hooks close publication before stop and require a

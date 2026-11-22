@@ -242,6 +242,20 @@ impl WopcmLayout {
         Self::plan_total(upload, huc, 0x400000)
     }
 
+    /// WOPCM plan for `platform`. The total is per-generation (Linux
+    /// `gt/intel_wopcm.c` `intel_wopcm_init_early`): 2 MiB from Gen11
+    /// (`GEN11_WOPCM_SIZE`), which Gen12 and the headless families share;
+    /// the xe-era families staged here take the 4 MiB `plan` total.
+    /// Gen11 takes the 2 MiB total (Lane 7): planning 4 MiB on a 2 MiB
+    /// WOPCM would program a GuC region past the WOPCM top.
+    fn plan_for(platform: GtPlatform, upload: u32, huc: u32) -> Result<Self, BootError> {
+        if platform.is_gen12() || platform.is_gen11() || platform.is_headless_integrated() {
+            Self::plan_total(upload, huc, 0x200000)
+        } else {
+            Self::plan(upload, huc)
+        }
+    }
+
     fn plan_total(upload: u32, huc: u32, total: u32) -> Result<Self, BootError> {
         let base = huc.checked_add(0x7fff).ok_or(BootError::Wopcm)? & !0x3fff;
         let size = total
@@ -408,8 +422,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         huc: &crate::intel_gpu_huc::Firmware,
         mut config: BootConfig,
     ) -> Result<Self, BootError> {
-        if firmware.platform() != crate::intel_gpu_huc::PLATFORM
-            || huc.platform() != crate::intel_gpu_huc::PLATFORM
+        // The staged GuC and HuC must belong to the same primary GT, and
+        // that GT must have a primary-GT HuC profile: exact TGL, or a
+        // Gen11 sub-platform (Lane 7 — `icl_huc_9.0.0` / `ehl_huc_9.0.0`).
+        if firmware.platform() != huc.platform()
+            || crate::intel_gpu_huc::firmware_name(firmware.platform()).is_none()
         {
             return Err(BootError::Unsupported);
         }
@@ -436,7 +453,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         Self::stage_loads(mmio, allocator, platform, image, config, None, false)
     }
 
-    /// The exact-TGL main-GT HuC profile over a parsed CSS image.
+    /// The exact-TGL main-GT HuC profile over a parsed CSS image, and the
+    /// Gen11 main-GT HuC profiles (Lane 7) over the same whole-file CSS.
     #[cfg(any(test, feature = "kernel-test"))]
     fn stage_images(
         mmio: M,
@@ -446,7 +464,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         config: BootConfig,
         huc: Option<crate::intel_gpu_huc::Image<'_>>,
     ) -> Result<Self, BootError> {
-        if huc.is_some() && platform != crate::intel_gpu_huc::PLATFORM {
+        if huc.is_some() && crate::intel_gpu_huc::firmware_name(platform).is_none() {
             return Err(BootError::Unsupported);
         }
         let huc = huc.map(crate::intel_gpu_huc::Load::from);
@@ -483,11 +501,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Err(BootError::Cache);
         }
         let upload = u32::try_from(image.upload.len()).map_err(|_| BootError::Address)?;
-        if platform.is_gen12() || platform.is_headless_integrated() {
-            WopcmLayout::plan_total(upload, config.huc_upload_bytes, 0x200000)?;
-        } else {
-            WopcmLayout::plan(upload, config.huc_upload_bytes)?;
-        }
+        // WOPCM total per generation (Linux `gt/intel_wopcm.c`:
+        // `intel_wopcm_init_early` — 2 MiB from Gen11, 1 MiB before it;
+        // the xe-era families staged here take the 4 MiB `plan` total).
+        WopcmLayout::plan_for(platform, upload, config.huc_upload_bytes)?;
         let image_pages = (upload + 384).div_ceil(PAGE);
         let ads_pages = (ADS_PRIVATE + image.private_data_bytes).div_ceil(PAGE);
         let mut allocations: Vec<A::Backing> = Vec::new();
@@ -997,11 +1014,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                 result => result,
             };
         }
-        let layout = if self.platform.is_gen12() || self.platform.is_headless_integrated() {
-            WopcmLayout::plan_total(self.upload, self.config.huc_upload_bytes, 0x200000)?
-        } else {
-            WopcmLayout::plan(self.upload, self.config.huc_upload_bytes)?
-        };
+        // Same per-generation WOPCM total as the staging preflight above
+        // (Linux `gt/intel_wopcm.c`: 2 MiB from Gen11).
+        let layout =
+            WopcmLayout::plan_for(self.platform, self.upload, self.config.huc_upload_bytes)?;
         self.mmio.write32(0xc050, layout.size);
         if self.mmio.read32(0xc050) != layout.size | 1 {
             return Err(BootError::Wopcm);
@@ -2649,6 +2665,43 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_boot",
         smoke_boot_locked_wopcm_and_address_bounds
+    );
+
+    fn smoke_boot_gen11_wopcm_total_is_two_mib() -> TestResult {
+        // Lane 7 item 4: Linux `gt/intel_wopcm.c` `intel_wopcm_init_early`
+        // sizes the WOPCM at 2 MiB from Gen11 (`GEN11_WOPCM_SIZE`), with
+        // the 36 KiB ICL hardware-context reservation at the top — the
+        // same 0x9000 `WopcmLayout::validate` reserves. The 4 MiB xe-era
+        // total would program a GuC region past the WOPCM top.
+        use crate::intel_gpu_gt::Gen11Platform;
+        let icl = GtPlatform::Gen11(Gen11Platform::IceLake);
+        let layout = match WopcmLayout::plan_for(icl, 0x10000, 0) {
+            Ok(layout) => layout,
+            Err(_) => return TestResult::Fail("Gen11 small GuC upload refused a WOPCM plan"),
+        };
+        if u64::from(layout.base) + u64::from(layout.size) > 0x200000 - 0x9000 {
+            return TestResult::Fail(
+                "Gen11 WOPCM plan exceeds the 2 MiB WOPCM minus context reservation",
+            );
+        }
+        // A ~2 MiB upload fits the 4 MiB xe-era total but not Gen11's
+        // 2 MiB: the plan must fail for Gen11 and pass for Alchemist.
+        if WopcmLayout::plan_for(icl, 0x1f0000, 0).is_ok()
+            || WopcmLayout::plan_for(GtPlatform::Alchemist, 0x1f0000, 0).is_err()
+            || WopcmLayout::plan_for(
+                GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake),
+                0x1f0000,
+                0,
+            )
+            .is_ok()
+        {
+            return TestResult::Fail("Gen11 WOPCM total is not 2 MiB");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_boot",
+        smoke_boot_gen11_wopcm_total_is_two_mib
     );
 
     fn smoke_discrete_ct_needs_coherent_mapping() -> TestResult {

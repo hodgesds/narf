@@ -2918,15 +2918,27 @@ pub fn production_idle() -> bool {
     }
 }
 
+/// Generations whose execlists submission is admitted without any GuC.
+/// GuC submission is optional on Gen11 (Linux: execlists works without
+/// GuC; GuC is required only for HuC auth and GuC submission), and the
+/// Gen12 path here predates the GuC owner the same way. Admission takes
+/// only the generation — no GuC profile, image or owner is consulted —
+/// so a Gen11 part submits on RCS with no GuC loaded; a GuC claim, if
+/// one ever exists for the function, still excludes the legacy path
+/// through the ownership registry below.
+pub(crate) const fn legacy_submission_generation(generation: crate::intel_gpu::Generation) -> bool {
+    matches!(
+        generation,
+        crate::intel_gpu::Generation::TigerLake
+            | crate::intel_gpu::Generation::AlderLake
+            | crate::intel_gpu::Generation::IceLake
+    )
+}
+
 pub(crate) fn legacy_submission_lease(
 ) -> Result<crate::intel_gpu_gt::ownership::LegacyLease, SubmitError> {
     crate::intel_gpu::with_controller(|gpu| {
-        if !matches!(
-            gpu.chip_info().generation,
-            crate::intel_gpu::Generation::TigerLake
-                | crate::intel_gpu::Generation::AlderLake
-                | crate::intel_gpu::Generation::IceLake
-        ) {
+        if !legacy_submission_generation(gpu.chip_info().generation) {
             return Err(SubmitError::NoEngine);
         }
         // Capture identity and reserve while the same controller guard is
@@ -4020,6 +4032,24 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_rcs",
         smoke_gen11_batch_executes_on_rcs
+    );
+
+    fn smoke_gen11_legacy_submission_needs_no_guc() -> TestResult {
+        // Lane 7 item 3: execlists admission for Gen11 takes only the
+        // generation — no GuC profile, image or owner is consulted — so a
+        // Gen11 part submits with no GuC loaded. Execution evidence is
+        // `smoke_gen11_batch_executes_on_rcs` above.
+        if !legacy_submission_generation(crate::intel_gpu::Generation::IceLake)
+            || legacy_submission_generation(crate::intel_gpu::Generation::MeteorLake)
+            || legacy_submission_generation(crate::intel_gpu::Generation::LunarLake)
+        {
+            return TestResult::Fail("Gen11 legacy submission admission");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_gen11_legacy_submission_needs_no_guc
     );
 
     fn smoke_csb_parse() -> TestResult {
