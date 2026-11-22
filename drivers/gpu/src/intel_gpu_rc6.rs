@@ -33,7 +33,11 @@
 //! Derived from i915, the authoritative restatement of the
 //! PRM this crate uses everywhere (see `intel_gpu_regions`'
 //! header). Files consulted at torvalds/linux master,
-//! 2026-10-27:
+//! 2026-10-27; the Gen11 values were re-verified against
+//! Linux 7.4-rc2 (commit 7475ea8b) by the Gen11 power lane,
+//! which found two Gen11/Gen12 divergences and fixed them
+//! (see `GUC_MAX_IDLE_COUNT` and `pg_enable_value_gen11`
+//! below):
 //!
 //! - `drivers/gpu/drm/i915/gt/intel_rc6.c`:
 //!   `gen11_rc6_enable` (used for GRAPHICS_VER ≥ 11, so it is
@@ -48,10 +52,12 @@
 //!   `GEN9_MEDIA_PG_IDLE_HYSTERESIS` = 60 and
 //!   `GEN9_RENDER_PG_IDLE_HYSTERESIS` = 60 (the Gen11 values;
 //!   Gen9 used 250), and finally `GEN9_PG_ENABLE` =
-//!   render + media + media-sampler power-gate enables, plus
-//!   per present video engine the VDN HCP/MFX power-gate
-//!   enables. `intel_rc6_enable` runs the whole sequence with
-//!   FORCEWAKE_ALL held. The sanitize/disable path
+//!   render + media + media-sampler power-gate enables, plus —
+//!   on Gen12 only (`GRAPHICS_VER >= 12 && !IS_DG1`) — per
+//!   present video engine the VDN HCP/MFX power-gate enables.
+//!   Gen11 programs render + media + media-sampler only
+//!   (`pg_enable_value_gen11`). `intel_rc6_enable` runs the
+//!   whole sequence with FORCEWAKE_ALL held. The sanitize/disable path
 //!   (`__intel_rc6_disable`, also run at init) zeroes
 //!   `GEN9_PG_ENABLE`, `GEN6_RC_CONTROL` and `GEN6_RC_STATE`.
 //!   Park (`intel_rc6_park`) writes `GEN6_RC_CONTROL` =
@@ -78,14 +84,20 @@
 //! GEN6_RC_CTL_RC6_ENABLE | GEN6_RC_CTL_EI_MODE(1)`.
 //! NARF has no GuC (unscoped — see the queue record), so the
 //! host owns RC6 fully and this module always uses the
-//! host-owned value, 0x8804_0000. One write from i915's
-//! sequence is deliberately absent: `GUC_MAX_IDLE_COUNT`
-//! programs the *GuC's* engine-idle policy. There is no GuC
-//! to consume it, and the register's offset could not be
-//! grounded from the sources above (it lives in the GuC
-//! register header), so rather than fabricate an offset the
-//! write is omitted; if a GuC lane ever lands, it brings
-//! the register with it.
+//! host-owned value, 0x8804_0000. (Polarity check against
+//! Linux 7.4-rc2, `gt/intel_rc6.c::gen11_rc6_enable` +
+//! `gt/uc/intel_guc_rc.c::intel_guc_rc_enable`: that function
+//! *enables* GuC RC and returns 0 on success, so
+//! `!intel_guc_rc_enable(...)` is true exactly when GuC RC
+//! is active and the host sets the RC6 bit alone; a failure
+//! — including no GuC at all, this driver's case — takes the
+//! full host value. The in-tree value is the host-owned one.)
+//! `GUC_MAX_IDLE_COUNT` (0xC3E4, `gt/uc/intel_guc_reg.h:62`)
+//! is written with 0xA after the `RING_MAX_IDLE` writes, in
+//! the host-owned branch of `gen11_rc6_enable` — it programs
+//! the GuC's engine-idle policy, so with no GuC it has no
+//! consumer here, but the sequence mirrors Linux's write
+//! rather than omitting a step the reference performs.
 //!
 //! ## Discipline (this implementation)
 //!
@@ -153,6 +165,9 @@ pub const GEN9_MEDIA_PG_IDLE_HYSTERESIS: u64 = 0xA0C4;
 pub const GEN9_RENDER_PG_IDLE_HYSTERESIS: u64 = 0xA0C8;
 /// GEN9_PG_ENABLE — coarse power-gating enables.
 pub const GEN9_PG_ENABLE: u64 = 0xA210;
+/// GUC_MAX_IDLE_COUNT — the GuC's engine-idle-count policy
+/// register (`gt/uc/intel_guc_reg.h:62`).
+pub const GUC_MAX_IDLE_COUNT: u64 = 0xC3E4;
 /// GEN6_GT_GFX_RC6_LOCKED — RC6 residency, locked sample.
 pub const GEN6_GT_GFX_RC6_LOCKED: u64 = 0x138104;
 /// GEN6_GT_GFX_RC6 — RC6 residency counter (1.28 µs units
@@ -234,6 +249,8 @@ pub const RC6_THRESHOLD_VALUE: u32 = 50_000;
 /// Gen11 coarse power-gating idle hysteresis (media and
 /// render).
 pub const PG_IDLE_HYSTERESIS_VALUE: u32 = 60;
+/// GUC_MAX_IDLE_COUNT value (`gen11_rc6_enable` writes 0xA).
+pub const GUC_MAX_IDLE_COUNT_VALUE: u32 = 0xA;
 
 /// The Gen12 GT's only video engine base a fixture needs:
 /// VCS0, `GEN6_BSD_RING_BASE` in i915_reg.h (the VCS0 ring
@@ -293,13 +310,25 @@ impl Rc6 {
     /// The GEN9_PG_ENABLE value for a GT with `vcs_count`
     /// video engines: render + media + media-sampler coarse
     /// gating, plus the per-VCS VDN HCP/MFX enables
-    /// (gen11_rc6_enable).
+    /// (gen11_rc6_enable). Gen12 only: Linux gates the VDN
+    /// bits on `GRAPHICS_VER >= 12 && !IS_DG1` — Gen11 callers
+    /// must use [`Self::pg_enable_value_gen11`] instead.
     pub fn pg_enable_value(vcs_count: u8) -> u32 {
         let mut v = PG_RENDER_ENABLE | PG_MEDIA_ENABLE | PG_MEDIA_SAMPLER_ENABLE;
         for n in 0..vcs_count {
             v |= pg_vdn_hcp_enable(n) | pg_vdn_mfx_enable(n);
         }
         v
+    }
+
+    /// The GEN9_PG_ENABLE value on Gen11: render + media +
+    /// media-sampler coarse gating only, however many video
+    /// engines are present. Linux's `gen11_rc6_enable` sets
+    /// the per-VCS VDN HCP/MFX bits only at
+    /// `GRAPHICS_VER >= 12` (and not on DG1), so a Gen11
+    /// enable never carries them.
+    pub const fn pg_enable_value_gen11() -> u32 {
+        PG_RENDER_ENABLE | PG_MEDIA_ENABLE | PG_MEDIA_SAMPLER_ENABLE
     }
 
     /// Acquire every aggregate forcewake domain
@@ -370,15 +399,47 @@ impl Rc6 {
     /// each present engine that takes a `RING_MAX_IDLE`
     /// write, in probe order (production: `&[RCS_BASE]`);
     /// `vcs_count` is the number of present video engines,
-    /// feeding the VDN power-gate bits. If acquiring the
-    /// holds fails, nothing is programmed and `enabled` is
-    /// unchanged.
+    /// feeding the VDN power-gate bits. Gen12 only: Gen11
+    /// callers must use [`Self::enable_gen11`], whose
+    /// `GEN9_PG_ENABLE` value carries no VDN bits. If
+    /// acquiring the holds fails, nothing is programmed and
+    /// `enabled` is unchanged.
     pub fn enable<M: MmioWindow>(
         &mut self,
         fw: &mut Forcewake,
         regs: &M,
         engines: &[u64],
         vcs_count: u8,
+    ) -> Result<(), Rc6Error> {
+        self.enable_inner(fw, regs, engines, vcs_count, false)
+    }
+
+    /// The Gen11 enable sequence: the same thresholds and
+    /// hysteresis as [`Self::enable`], but `GEN9_PG_ENABLE`
+    /// is the Gen11 value (render + media + media-sampler
+    /// only — no VDN bits, whatever video engines are
+    /// present). `engines` lists the register base of each
+    /// present engine that takes a `RING_MAX_IDLE` write, in
+    /// probe order (Gen11 production: RCS plus each present
+    /// VCS engine's base). No production caller wires it yet — the
+    /// Gen12 PM seam owns the only live enable — so this is
+    /// the sequence the Gen11 PM wiring will call.
+    pub fn enable_gen11<M: MmioWindow>(
+        &mut self,
+        fw: &mut Forcewake,
+        regs: &M,
+        engines: &[u64],
+    ) -> Result<(), Rc6Error> {
+        self.enable_inner(fw, regs, engines, 0, true)
+    }
+
+    fn enable_inner<M: MmioWindow>(
+        &mut self,
+        fw: &mut Forcewake,
+        regs: &M,
+        engines: &[u64],
+        vcs_count: u8,
+        gen11: bool,
     ) -> Result<(), Rc6Error> {
         Self::acquire_all(fw, regs)?;
         regs.write32(GEN6_RC6_WAKE_RATE_LIMIT, RC6_WAKE_RATE_LIMIT_VALUE);
@@ -388,11 +449,17 @@ impl Rc6 {
         for base in engines {
             regs.write32(base + RING_MAX_IDLE_OFFSET, RING_MAX_IDLE_VALUE);
         }
+        regs.write32(GUC_MAX_IDLE_COUNT, GUC_MAX_IDLE_COUNT_VALUE);
         regs.write32(GEN6_RC_SLEEP, 0);
         regs.write32(GEN6_RC6_THRESHOLD, RC6_THRESHOLD_VALUE);
         regs.write32(GEN9_MEDIA_PG_IDLE_HYSTERESIS, PG_IDLE_HYSTERESIS_VALUE);
         regs.write32(GEN9_RENDER_PG_IDLE_HYSTERESIS, PG_IDLE_HYSTERESIS_VALUE);
-        regs.write32(GEN9_PG_ENABLE, Self::pg_enable_value(vcs_count));
+        let pg_enable = if gen11 {
+            Self::pg_enable_value_gen11()
+        } else {
+            Self::pg_enable_value(vcs_count)
+        };
+        regs.write32(GEN9_PG_ENABLE, pg_enable);
         self.enabled = true;
         Self::release_all(fw, regs)
     }
@@ -711,6 +778,14 @@ pub mod tests {
         if GEN6_GT_GFX_RC6 != 0x138108 || GEN6_GT_GFX_RC6_LOCKED != 0x138104 {
             return TestResult::Fail("residency counter offsets diverge from intel_gt_regs.h");
         }
+        // GUC_MAX_IDLE_COUNT (intel_guc_reg.h:62) and the
+        // Gen11 PG_ENABLE value (no VDN bits on Gen11).
+        if GUC_MAX_IDLE_COUNT != 0xC3E4 || GUC_MAX_IDLE_COUNT_VALUE != 0xA {
+            return TestResult::Fail("GUC_MAX_IDLE_COUNT diverges from intel_guc_reg.h");
+        }
+        if Rc6::pg_enable_value_gen11() != 0x7 {
+            return TestResult::Fail("Gen11 PG_ENABLE must be render|media|sampler only");
+        }
         // The host-owned control value: HW_ENABLE (bit31) |
         // EI_MODE(1) (bit27) | RC6_ENABLE (bit18).
         if RC6_CTL_HOST != 0x8804_0000 {
@@ -775,6 +850,7 @@ pub mod tests {
         expected.push((GEN6_RC_EVALUATION_INTERVAL, 125_000));
         expected.push((GEN6_RC_IDLE_HYSTERSIS, 25));
         expected.push((RCS_BASE + RING_MAX_IDLE_OFFSET, 10));
+        expected.push((GUC_MAX_IDLE_COUNT, 0xA));
         expected.push((GEN6_RC_SLEEP, 0));
         expected.push((GEN6_RC6_THRESHOLD, 50_000));
         expected.push((GEN9_MEDIA_PG_IDLE_HYSTERESIS, 60));
@@ -793,6 +869,44 @@ pub mod tests {
         "drivers/gpu/intel_gpu_rc6",
         smoke_enable_conversation_rcs_only
     );
+
+    fn smoke_enable_gen11_conversation() -> TestResult {
+        // The Gen11 enable sequence, pinned end to end:
+        // the same thresholds as the Gen12 sequence, but
+        // PG_ENABLE is 0x7 even with a video engine present
+        // — Linux gates the VDN HCP/MFX bits on
+        // GRAPHICS_VER >= 12, so they never appear here.
+        // This is the masking-defeating case for a
+        // version-blind pg_enable_value(vcs_count) call.
+        let fake = FakeGt::new();
+        let mut fw = Forcewake::new();
+        let mut rc6 = Rc6::new();
+        if rc6.enable_gen11(&mut fw, &fake, &[RCS_BASE, VCS0_BASE]) != Ok(()) {
+            return TestResult::Fail("Gen11 enable failed against the fake GT");
+        }
+        let mut expected = fw_acquire_writes();
+        expected.push((GEN6_RC6_WAKE_RATE_LIMIT, 0x0036_0055));
+        expected.push((GEN10_MEDIA_WAKE_RATE_LIMIT, 150));
+        expected.push((GEN6_RC_EVALUATION_INTERVAL, 125_000));
+        expected.push((GEN6_RC_IDLE_HYSTERSIS, 25));
+        expected.push((RCS_BASE + RING_MAX_IDLE_OFFSET, 10));
+        expected.push((VCS0_BASE + RING_MAX_IDLE_OFFSET, 10));
+        expected.push((GUC_MAX_IDLE_COUNT, 0xA));
+        expected.push((GEN6_RC_SLEEP, 0));
+        expected.push((GEN6_RC6_THRESHOLD, 50_000));
+        expected.push((GEN9_MEDIA_PG_IDLE_HYSTERESIS, 60));
+        expected.push((GEN9_RENDER_PG_IDLE_HYSTERESIS, 60));
+        expected.push((GEN9_PG_ENABLE, 0x7));
+        expected.extend(fw_release_writes());
+        if fake.writes() != expected {
+            return TestResult::Fail("Gen11 enable conversation diverges from gen11_rc6_enable");
+        }
+        if !rc6.is_enabled() {
+            return TestResult::Fail("Gen11 enable must mark RC6 enabled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rc6", smoke_enable_gen11_conversation);
 
     fn smoke_enable_conversation_with_vcs() -> TestResult {
         // A second engine present: its RING_MAX_IDLE write
@@ -817,6 +931,12 @@ pub mod tests {
         }
         if !writes.contains(&(GEN9_PG_ENABLE, 0x1F)) {
             return TestResult::Fail("PG_ENABLE must carry VDN HCP/MFX bits for one VCS");
+        }
+        // The Gen12 sequence also carries the GuC idle-count
+        // write (this fixture is the Gen12 path — the Gen11
+        // path pins its own sequence separately).
+        if !writes.contains(&(GUC_MAX_IDLE_COUNT, 0xA)) {
+            return TestResult::Fail("enable must write GUC_MAX_IDLE_COUNT = 0xA");
         }
         TestResult::Pass
     }
