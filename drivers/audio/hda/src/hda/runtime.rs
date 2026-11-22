@@ -27,6 +27,10 @@ pub enum HdaError {
     FirmwarePatchMalformed,
     Busy,
     DeviceFailed,
+    /// The controller is parked (#779); a command that may not wake it
+    /// (the jack service) is refused instead of posted into rings held
+    /// in reset.
+    Suspended,
 }
 #[derive(Debug, Default)]
 struct Commands {
@@ -101,6 +105,8 @@ pub struct IntelHda {
     /// Unsolicited-response tags given to jack pins (bit per tag): a
     /// response with any other tag is no jack's (`snd_hda_jack_tbl_get_from_tag`).
     jack_tags: core::sync::atomic::AtomicU64,
+    /// Held by a park or a wake (`lock_pm`).
+    pm: AtomicBool,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -115,6 +121,12 @@ impl core::fmt::Debug for IntelHda {
 /// A codec command's response timeout (Linux `azx_rirb_get_response`
 /// waits up to 1 s before falling back to polling; NARF bounds it at 100 ms).
 const COMMAND_TIMEOUT_MS: u64 = 100;
+/// How long a synchronous command waits for another command to finish
+/// (the timeout of the one in flight, its retry and slack).
+const LEASE_WAIT_MS: u64 = 3 * COMMAND_TIMEOUT_MS;
+/// How long a park or wake waits for another one: a wake runs the codec
+/// init again, up to the ALC28x headphone tails' 200 ms of settle time.
+const PM_WAIT_MS: u64 = 1000;
 
 pub(super) fn wait(mut predicate: impl FnMut() -> bool, ms: u64) -> bool {
     narf_scheduler::responsive_spin_until(&mut predicate, Deadline::after_ms(ms))
@@ -275,6 +287,7 @@ impl IntelHda {
             jack_dirty: AtomicBool::new(true),
             jack_waker: IrqSafeSpinLock::new(None),
             jack_tags: core::sync::atomic::AtomicU64::new(0),
+            pm: AtomicBool::new(false),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -523,12 +536,12 @@ impl IntelHda {
     /// Plain coef write: SET_COEF_INDEX then SET_PROC_COEF
     /// (Linux `alc_write_coef_idx`).
     fn write_coef_idx(&self, cad: u8, nid: u8, idx: u16, value: u16) -> Result<(), HdaError> {
-        self.verb(
+        self.pm_verb(
             cad,
             nid,
             crate::hda_codec::verb::SET_COEF_INDEX | u32::from(idx),
         )?;
-        self.verb(
+        self.pm_verb(
             cad,
             nid,
             crate::hda_codec::verb::SET_PROC_COEF | u32::from(value),
@@ -539,12 +552,12 @@ impl IntelHda {
     /// Read one coef value: SET_COEF_INDEX then GET_PROC_COEF
     /// (Linux `alc_read_coef_idx`).
     fn read_coef_idx(&self, cad: u8, nid: u8, idx: u16) -> Result<u32, HdaError> {
-        self.verb(
+        self.pm_verb(
             cad,
             nid,
             crate::hda_codec::verb::SET_COEF_INDEX | u32::from(idx),
         )?;
-        self.verb(cad, nid, crate::hda_codec::verb::GET_PROC_COEF)
+        self.pm_verb(cad, nid, crate::hda_codec::verb::GET_PROC_COEF)
     }
 
     /// Masked coef update (Linux `alc_update_coef_idx` /
@@ -563,12 +576,12 @@ impl IntelHda {
             return Ok(());
         };
         let next = (current & !u32::from(mask)) | u32::from(value);
-        self.verb(
+        self.pm_verb(
             cad,
             nid,
             crate::hda_codec::verb::SET_COEF_INDEX | u32::from(idx),
         )?;
-        self.verb(
+        self.pm_verb(
             cad,
             nid,
             crate::hda_codec::verb::SET_PROC_COEF | (next & 0xFFFF),
@@ -582,7 +595,7 @@ impl IntelHda {
     /// reset drops the coef state the sequence programs.
     fn apply_quirk_seq(&self, cad: u8, quirk: &super::quirks::Quirk) -> Result<(), HdaError> {
         for step in quirk.coef_seq {
-            self.verb(cad, step.nid, step.verb)?;
+            self.pm_verb(cad, step.nid, step.verb)?;
         }
         Ok(())
     }
@@ -592,7 +605,7 @@ impl IntelHda {
     /// the HP tail still issues its verbs, only the sleeps are
     /// skipped — so a sense failure never fails probe or reinit.
     fn jack_present(&self, cad: u8, pin: u8) -> bool {
-        self.verb(cad, pin, crate::hda_codec::verb::GET_PIN_SENSE)
+        self.pm_verb(cad, pin, crate::hda_codec::verb::GET_PIN_SENSE)
             .is_ok_and(|sense| sense & PIN_SENSE_PRESENCE != 0)
     }
 
@@ -634,7 +647,7 @@ impl IntelHda {
         if sense {
             delay_us(2_000);
         }
-        self.verb(
+        self.pm_verb(
             cad,
             hp_pin,
             crate::hda_codec::verb::SET_AMP_GAIN_MUTE | AMP_OUT_MUTE,
@@ -642,7 +655,7 @@ impl IntelHda {
         if sense {
             delay_us(85_000);
         }
-        self.verb(
+        self.pm_verb(
             cad,
             hp_pin,
             crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL
@@ -672,7 +685,7 @@ impl IntelHda {
         // Index 0x43 Direct Drive HP AMP LPM Control 1 —
         // headphone capless set to high power mode.
         self.write_coef_idx(cad, super::quirks::COEF_NODE, 0x43, 0x9004)?;
-        self.verb(
+        self.pm_verb(
             cad,
             hp_pin,
             crate::hda_codec::verb::SET_AMP_GAIN_MUTE | AMP_OUT_MUTE,
@@ -680,7 +693,7 @@ impl IntelHda {
         if sense {
             delay_us(85_000);
         }
-        self.verb(
+        self.pm_verb(
             cad,
             hp_pin,
             crate::hda_codec::verb::SET_PIN_WIDGET_CONTROL
@@ -720,10 +733,10 @@ impl IntelHda {
             .collect();
     }
 
+    /// Try for the command lease. The lease alone: a caller that issues a
+    /// command checks the transport (`irq.failed`) under it, and the wake
+    /// takes it to restart a failed transport.
     fn acquire_command(&self) -> Result<CommandLease<'_>, HdaError> {
-        if self.irq.failed.load(Ordering::Acquire) {
-            return Err(HdaError::DeviceFailed);
-        }
         self.busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| HdaError::Busy)?;
@@ -731,6 +744,38 @@ impl IntelHda {
             dev: self,
             pending: false,
         })
+    }
+    /// The command lease for a synchronous command (`bus->cmd_mutex`):
+    /// spin, bounded, while another command is in flight, as
+    /// `codec_exec_verb` sleeps on the mutex, so a control read that meets
+    /// a jack re-read waits for it instead of failing with `Busy`.
+    fn acquire_command_blocking(&self) -> Result<CommandLease<'_>, HdaError> {
+        let mut result = self.acquire_command();
+        if matches!(result, Err(HdaError::Busy)) {
+            wait(
+                || {
+                    result = self.acquire_command();
+                    !matches!(result, Err(HdaError::Busy))
+                },
+                LEASE_WAIT_MS,
+            );
+        }
+        result
+    }
+    /// The PM lock (Linux serialises runtime suspend and resume in the PM
+    /// core): one park or wake at a time, so two threads that both find
+    /// the controller parked do not reset it under each other.
+    fn lock_pm(&self) -> Result<PmLock<'_>, HdaError> {
+        let take = || {
+            self.pm
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        if take() || wait(take, PM_WAIT_MS) {
+            Ok(PmLock(self))
+        } else {
+            Err(HdaError::Busy)
+        }
     }
     /// The command lease for an async command (`bus->cmd_mutex`): sleep,
     /// not spin, while another command is in flight, bounded by the command
@@ -826,10 +871,38 @@ impl IntelHda {
         }
         Ok(None)
     }
+    /// A command (Linux `codec_exec_verb`): power the controller up
+    /// (`snd_hda_power_up_pm`), then take the command lease (`cmd_mutex`)
+    /// and run it. A PCM stop may park the controller between the two; the
+    /// command then sees `suspended` under the lease and wakes it again.
     /// # Safety
     /// This object exclusively owns the controller command transport.
     pub unsafe fn send_verb(&self, verb: u32) -> Result<u32, HdaError> {
-        let mut lease = self.acquire_command()?;
+        for _ in 0..2 {
+            self.ensure_active()?;
+            match self.exec_verb(verb, true) {
+                Err(HdaError::Suspended) => continue,
+                result => return result,
+            }
+        }
+        Err(HdaError::Suspended)
+    }
+    /// A command issued by a PM transition or by probe (Linux `codec_in_pm`):
+    /// no power-up and no `suspended` gate, the caller owns the transition.
+    fn pm_verb(&self, cad: u8, nid: u8, verb: u32) -> Result<u32, HdaError> {
+        self.exec_verb(make_verb(cad, nid, verb), false)
+    }
+    /// One command under the command lease. `gated` refuses a parked
+    /// controller (`Suspended`) instead of posting into rings held in reset;
+    /// only the PM transitions themselves issue ungated commands.
+    fn exec_verb(&self, verb: u32, gated: bool) -> Result<u32, HdaError> {
+        let mut lease = self.acquire_command_blocking()?;
+        if gated && self.suspended.load(Ordering::Acquire) {
+            return Err(HdaError::Suspended);
+        }
+        if self.irq.failed.load(Ordering::Acquire) {
+            return Err(HdaError::DeviceFailed);
+        }
         self.post(verb)?;
         lease.pending = true;
         let mut reply = Ok(None);
@@ -881,6 +954,14 @@ impl IntelHda {
             Rearm,
         }
         let mut lease = self.acquire_command_async().await?;
+        // The jack service never wakes a parked controller: its rings are
+        // held in reset, and the resume marks every jack dirty anyway.
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(HdaError::Suspended);
+        }
+        if self.irq.failed.load(Ordering::Acquire) {
+            return Err(HdaError::DeviceFailed);
+        }
         self.post(verb)?;
         lease.pending = true;
         let deadline = Deadline::after_ms(COMMAND_TIMEOUT_MS);
@@ -948,6 +1029,11 @@ impl IntelHda {
         let Ok(lease) = self.acquire_command() else {
             return;
         };
+        // A parked controller reads RIRBWP 0: walking to it would consume
+        // every stale slot. The resume restarts the rings and the cursors.
+        if self.suspended.load(Ordering::Acquire) || self.irq.failed.load(Ordering::Acquire) {
+            return;
+        }
         let mut unsolicited = false;
         {
             let mut state = self.commands.lock();
@@ -1010,7 +1096,7 @@ impl IntelHda {
         for (index, (cad, nid)) in pins.into_iter().enumerate().take(63) {
             let tag = index as u32 + 1;
             self.jack_tags.fetch_or(1 << tag, Ordering::AcqRel);
-            self.verb(cad, nid, VERB_SET_UNSOLICITED_ENABLE | tag)?;
+            self.pm_verb(cad, nid, VERB_SET_UNSOLICITED_ENABLE | tag)?;
         }
         Ok(())
     }
@@ -1270,25 +1356,20 @@ impl IntelHda {
             let Some(nid) = codec.afg_node_id else {
                 continue;
             };
-            // SAFETY: Controller owns this live BAR and its command
-            // rings; the verb targets the codec's own AFG node.
+            // The verb targets the codec's own AFG node.
             let verb = make_verb(
                 codec.addr,
                 nid,
                 crate::hda_codec::verb::SET_POWER_STATE | if d3 { 3 } else { 0 },
             );
-            // SAFETY: Controller owns this live BAR and its command rings.
-            if let Err(e) = unsafe { self.send_verb(verb) } {
+            // Part of a PM transition: no power-up, no `suspended` gate.
+            if let Err(e) = self.exec_verb(verb, false) {
                 for (addr, nid) in switched {
                     // Best-effort rollback; the original error wins.
-                    // SAFETY: Controller owns this live BAR and its command rings.
-                    let _ = unsafe {
-                        self.send_verb(make_verb(
-                            addr,
-                            nid,
-                            crate::hda_codec::verb::SET_POWER_STATE,
-                        ))
-                    };
+                    let _ = self.exec_verb(
+                        make_verb(addr, nid, crate::hda_codec::verb::SET_POWER_STATE),
+                        false,
+                    );
                 }
                 return Err(e);
             }
@@ -1302,6 +1383,7 @@ impl IntelHda {
     /// park). Idempotent: already-suspended is Ok. Refuses with
     /// Busy when any stream is running or prepared.
     fn quiesce(&self) -> Result<(), HdaError> {
+        let _pm = self.lock_pm()?;
         if self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -1309,6 +1391,25 @@ impl IntelHda {
             return Err(HdaError::Busy);
         }
         self.set_codec_power(true)?;
+        // Park under the command lease: a command either finished before
+        // this point or, once it holds the lease, sees `suspended` and never
+        // posts into the rings the reset below stops.
+        let lease = match self.acquire_command_blocking() {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = self.set_codec_power(false);
+                return Err(error);
+            }
+        };
+        if !self.streams_idle() {
+            drop(lease);
+            let _ = self.set_codec_power(false);
+            return Err(HdaError::Busy);
+        }
+        // Set before the reset: the engines stop below whether or not the
+        // reset acknowledges, and a half-parked controller must take the
+        // full reinit on the next wake rather than be trusted.
+        self.suspended.store(true, Ordering::Release);
         // SAFETY: Controller owns this live BAR; fixed register
         // offsets are inside the validated window. Mirrors Drop
         // minus ring handling: the rings stay owned for resume.
@@ -1319,17 +1420,13 @@ impl IntelHda {
             self.bar0.write32(REG_GCTL, 0);
         }
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 == 0, 100) {
-            // The engines are already off and the codecs D3: this
-            // is a parked controller even though the reset did not
-            // acknowledge, so mark it suspended — the next
-            // ensure_active (or system resume) runs the full
-            // reinit rather than trusting a half-parked controller.
-            self.suspended.store(true, Ordering::Release);
-            return Err(HdaError::ResetTimeout);
+        let reset = wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 == 0, 100);
+        drop(lease);
+        if reset {
+            Ok(())
+        } else {
+            Err(HdaError::ResetTimeout)
         }
-        self.suspended.store(true, Ordering::Release);
-        Ok(())
     }
 
     /// Reverse of quiesce: reset the controller, reprogram the
@@ -1339,49 +1436,20 @@ impl IntelHda {
     /// running or prepared streams, so every stream needs a fresh
     /// prepare after resume. Clears the sticky command-transport
     /// failure: the rings were reset, so a pre-suspend verb timeout
-    /// must not poison post-resume verbs (`acquire_command`
-    /// refuses while `irq.failed` is set). Idempotent.
+    /// must not poison post-resume verbs (`exec_verb` refuses
+    /// while `irq.failed` is set). Idempotent; serialised with
+    /// `quiesce` by the PM lock.
     fn reinit(&self) -> Result<(), HdaError> {
+        // One wake at a time: a second caller that also found the
+        // controller parked waits here, then finds it awake.
+        let _pm = self.lock_pm()?;
         if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
-        // SAFETY: Controller owns this live BAR; fixed register
-        // offsets are inside the validated window.
-        unsafe {
-            self.bar0.write32(REG_GCTL, 0);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 == 0, 100) {
-            return Err(HdaError::ResetTimeout);
-        }
-        delay_us(100);
-        // SAFETY: Controller owns this live BAR; fixed register
-        // offsets are inside the validated window.
-        unsafe {
-            self.bar0.write32(REG_GCTL, GCTL_CRST);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 != 0, 100) {
-            return Err(HdaError::ResetTimeout);
-        }
-        delay_us(1000);
-        // The shadow cursors restart with the ring pointers inside.
-        self.init_cmd_io()?;
-        // SAFETY: Controller owns this live BAR; fixed register
-        // offsets are inside the validated window.
-        unsafe {
-            self.bar0.write32(
-                REG_INTCTL,
-                if self.route.is_some() {
-                    INTCTL_GIE | INTCTL_CIE
-                } else {
-                    0
-                },
-            );
-        }
-        // The rings are reset; a pre-suspend verb timeout no longer
-        // describes the transport.
-        self.irq.failed.store(false, Ordering::Release);
+        // `suspended` stays set until the codecs are back, so a jack
+        // command in between is refused rather than sent to a codec the
+        // restart has not re-initialised yet.
+        self.restart_controller()?;
         self.set_codec_power(false)?;
         // #776 / #1496: the controller reset dropped the codecs'
         // coef state (Linux re-runs the init hook on resume for the
@@ -1420,9 +1488,56 @@ impl IntelHda {
         Ok(())
     }
 
+    /// The hardware half of a wake: link reset, command I/O and interrupt
+    /// enables, under the command lease so no command is in flight across
+    /// the reset. Clears the command-transport failure: the rings were
+    /// restarted, so an earlier timeout no longer describes them.
+    fn restart_controller(&self) -> Result<(), HdaError> {
+        let _lease = self.acquire_command_blocking()?;
+        // SAFETY: Controller owns this live BAR; fixed register
+        // offsets are inside the validated window.
+        unsafe {
+            self.bar0.write32(REG_GCTL, 0);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 == 0, 100) {
+            return Err(HdaError::ResetTimeout);
+        }
+        delay_us(100);
+        // SAFETY: Controller owns this live BAR; fixed register
+        // offsets are inside the validated window.
+        unsafe {
+            self.bar0.write32(REG_GCTL, GCTL_CRST);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 != 0, 100) {
+            return Err(HdaError::ResetTimeout);
+        }
+        delay_us(1000);
+        // The shadow cursors restart with the ring pointers inside.
+        self.init_cmd_io()?;
+        // SAFETY: Controller owns this live BAR; fixed register
+        // offsets are inside the validated window.
+        unsafe {
+            self.bar0.write32(
+                REG_INTCTL,
+                if self.route.is_some() {
+                    INTCTL_GIE | INTCTL_CIE
+                } else {
+                    0
+                },
+            );
+        }
+        self.irq.failed.store(false, Ordering::Release);
+        Ok(())
+    }
+
     /// PCM bring-up entry: reinit a parked controller before any
     /// path that sends verbs or programs streams.
     pub(super) fn ensure_active(&self) -> Result<(), HdaError> {
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.reinit()
     }
 
@@ -1507,6 +1622,13 @@ impl narf_power::runtime_pm::RuntimePmOps for HdaRuntimePm {
 struct CommandLease<'a> {
     dev: &'a IntelHda,
     pending: bool,
+}
+/// Held by a park or a wake ([`IntelHda::lock_pm`]).
+struct PmLock<'a>(&'a IntelHda);
+impl Drop for PmLock<'_> {
+    fn drop(&mut self) {
+        self.0.pm.store(false, Ordering::Release);
+    }
 }
 impl Drop for CommandLease<'_> {
     fn drop(&mut self) {

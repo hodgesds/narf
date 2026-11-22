@@ -386,6 +386,9 @@ impl IntelHda {
         Ok(ca)
     }
     pub(super) fn refresh_jacks(&self) -> Result<(), HdaError> {
+        // As `refresh_hdmi`: wake a parked controller before the async
+        // commands, which refuse one.
+        self.ensure_active()?;
         narf_scheduler::block_on_spin(self.refresh_jacks_async())
     }
     /// `snd_hda_jack_report_sync`: re-read every jack and apply it (HDMI

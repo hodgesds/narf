@@ -1104,6 +1104,9 @@ impl IntelHda {
     /// re-set-up each port that just gained a valid ELD (Linux update_eld's
     /// `eld_valid && !old_eld_valid && per_pin->setup`).
     pub(super) fn refresh_hdmi(&self, reconfigure: bool) -> Result<(), HdaError> {
+        // The async commands below never wake a parked controller; a
+        // synchronous caller does, as `snd_hda_power_up_pm` would.
+        self.ensure_active()?;
         narf_scheduler::block_on_spin(self.refresh_hdmi_async(reconfigure))
     }
     /// [`Self::refresh_hdmi`] whose commands sleep on the response.
