@@ -706,6 +706,89 @@ impl ColdBoot {
             .as_ref()
             .is_some_and(|media| media.sessions_restored())
     }
+    /// The engine half of Linux's s0ix suspend, after the display, in its
+    /// reverse IP order:
+    /// - `smu_disable_dpms`'s RLC halt (`gfx_v10_0_rlc_stop`);
+    /// - `navi10_ih_hw_fini`;
+    /// - MMHUB's `gart_disable`;
+    /// - `nv_common_hw_fini`'s doorbell apertures.
+    ///
+    /// GFX, SDMA and the PSP are left alone: GFX stays in GFXOFF and the
+    /// TMR stays loaded. Every step runs even if one before it failed, as
+    /// Linux logs and goes on; the first error is returned.
+    ///
+    /// # Safety
+    /// Clients are paused, every ring has drained, media is suspended, and
+    /// nothing touches the GPU until `resume_s0ix`.
+    pub(crate) async unsafe fn suspend_s0ix(&mut self) -> Result<(), Error> {
+        let rlc = self.gfx.stop_rlc().map_err(Error::Queues);
+        // SAFETY: forwarded; nothing waits on IH delivery until the resume.
+        let ih = unsafe { self.ih.suspend() }
+            .await
+            .map_err(Error::Interrupts);
+        // SAFETY: forwarded; no MMHUB client runs until the resume.
+        let mmhub = unsafe { self.gmc.suspend_mmhub() }.map_err(Error::MemoryHubs);
+        // SAFETY: forwarded; nothing rings a doorbell until the resume.
+        let doorbells = unsafe {
+            cp::disable_doorbell_apertures_raphael(&self.gpu, self.authority, self.doorbells)
+        }
+        .map_err(Error::Queues);
+        rlc.and(ih).and(mmhub).and(doorbells)
+    }
+    /// The engine half of Linux's s0ix resume, before the display:
+    /// - COMMON: `nv_common_hw_init`'s NBIO init, then the doorbell
+    ///   apertures with `nv_common_late_init`'s self-ring;
+    /// - GMC: MMHUB's `gart_enable`;
+    /// - IH, on its ring with its subscriptions.
+    ///
+    /// An owner whose suspend did not run refuses its resume (`Busy`),
+    /// and that refusal is not an error here.
+    ///
+    /// # Safety
+    /// `suspend_s0ix` ran and nothing has touched the GPU since.
+    pub(crate) async unsafe fn resume_s0ix(&mut self) -> Result<(), Error> {
+        // SAFETY: forwarded.
+        let nbio = unsafe { self.gmc.resume_nbio() }.map_err(Error::MemoryHubs);
+        // SAFETY: forwarded; the apertures come back on the same BAR.
+        let doorbells = unsafe {
+            cp::enable_doorbell_apertures_raphael(&self.gpu, self.authority, self.doorbells)
+        }
+        .map_err(Error::Queues);
+        let not_suspended = |r: &Result<(), Error>| {
+            matches!(
+                r,
+                Err(Error::MemoryHubs(gmc::Error::Busy) | Error::Interrupts(ih::Error::Busy))
+            )
+        };
+        // SAFETY: forwarded.
+        let mut mmhub = unsafe { self.gmc.resume_mmhub() }
+            .await
+            .map_err(Error::MemoryHubs);
+        if not_suspended(&mmhub) {
+            mmhub = Ok(());
+        }
+        // SAFETY: forwarded; the same ring and route.
+        let mut ih = unsafe { self.ih.resume() }
+            .await
+            .map(drop)
+            .map_err(Error::Interrupts);
+        if not_suspended(&ih) {
+            ih = Ok(());
+        }
+        nbio.and(doorbells).and(mmhub).and(ih)
+    }
+    /// The media owner back to Prepared after the s0ix suspend stopped it
+    /// with its VCPU saved, so `run_media` starts it again and the firmware
+    /// finds its sessions.
+    ///
+    /// # Safety
+    /// `suspend_media` stopped every instance; no media work is in flight.
+    pub(crate) unsafe fn media_after_s0ix(&mut self) {
+        if let Some(media) = self.media.as_mut() {
+            // SAFETY: forwarded; the stopped VCPUs reach no memory.
+            unsafe { media.rearm() };
+        }
+    }
     /// Drop a saved VCPU BO, so the next media start begins with no
     /// sessions (a recovery's).
     pub(crate) fn forget_media_sessions(&mut self) {

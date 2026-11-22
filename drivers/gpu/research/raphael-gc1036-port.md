@@ -701,7 +701,7 @@ since the submitter is replaced. Raphael's port:
 
 ## S0ix
 
-20. s0ix (in progress). `power::lps0` and the AMD PMC driver now send the
+20. ~~s0ix~~ (done, with the gaps listed below). `power::lps0` and the AMD PMC driver now send the
     LPS0 `_DSM` calls and the S0i3 OS hint, so `amdgpu_acpi_is_s0ix_active`'s
     PMC condition can hold (`lps0::has_handler("amd_pmc")`). Linux's s0ix
     cycle for Raphael (`amdgpu_device_suspend` with `in_s0ix`):
@@ -732,15 +732,35 @@ since the submitter is replaced. Raphael's port:
       The RLC restarts with the GFXOFF exit, not from amdgpu.
 
     NARF's S3 path tears graphics down and rebuilds it. s0ix suspends and
-    resumes these owners in place instead:
-    - IH: done (`Ih::suspend`/`resume`, subscriptions kept).
-    - GMC: MMHUB-only disable and full re-enable, to its current GART and
-      VMID configuration.
-    - Doorbells: aperture disable and re-enable.
-    - RLC stop.
-    - SMU: the s0ix suspend.
-    - Coordinator: a `GraphicsPm` s0ix state that drives these in order,
-      with the display and media cycles, when the S0Idle checks pass.
+    resumes these owners in place instead (`GraphicsPm::S0ix`), when an
+    S0Idle prepare finds GFXOFF allowed, `LOW_POWER_S0` set and `amd_pmc`
+    bound:
+    - **Async prepare.** Drain the rings. Pause the client path
+      (`navi22_cs::pause`), which keeps the lent VMIDs and the media
+      session table. Stop TDR. Suspend media.
+    - **Sync suspend.** Blank the stream. Then `ColdBoot::suspend_s0ix`:
+      the RLC stop (`Gfx::stop_rlc`; SMU 13.0.5 sends nothing),
+      `Ih::suspend` with the subscriptions kept, `Gmc::suspend_mmhub`, and
+      the doorbell apertures off. The loader is not stopped.
+    - **Sync resume.** `ColdBoot::resume_s0ix`: `Gmc::resume_nbio` and the
+      apertures, `Gmc::resume_mmhub`, `Ih::resume`. Then the stream replays
+      without a loader boot and without clearing the scanout (APU VRAM
+      survives).
+    - **Async resume.** Media restarts with its saved sessions, and
+      `register_raphael` serves the clients again on the kept VMIDs.
+
+    Not done (Linux steps without a NARF counterpart yet):
+    - DC's and DMUB's power states (`dc_set_power_state` D3/D0,
+      `dc_dmub_srv_set_power_state`), and `dm_resume`'s `dm_dmub_hw_resume`.
+    - The PG/CG ungate before the suspend and the late-init gate after it,
+      for the blocks that are not GFX or SDMA (IH CG; MMHUB CG, which
+      Linux keeps on DF newer than 3.0.2).
+    - `amdgpu_gfx_off_ctrl`'s immediate allow, and cancelling GFX's
+      delayed idle work.
+    - `amdgpu_fence_driver_hw_fini`'s fence-interrupt handling.
+
+    None of this has run on hardware. Raphael desktop boards rarely set
+    `LOW_POWER_S0`; the laptops on the same die do.
 
 ## Open
 

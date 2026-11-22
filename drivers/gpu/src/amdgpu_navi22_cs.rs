@@ -796,7 +796,10 @@ pub fn register_raphael(boot: &mut crate::amdgpu_raphael_boot::ColdBoot) {
     let Some(reader) = boot.client_fence_reader() else {
         return;
     };
-    let lent = match boot.reserve_client_vmids() {
+    // VMIDs kept by `pause` belong to this same owner: reuse them, since a
+    // lending is never returned.
+    let kept = CLIENT_VMIDS.lock().take();
+    let lent = match kept.map_or_else(|| boot.reserve_client_vmids(), Ok) {
         Ok(lent) => lent,
         Err(error) => {
             let _ = writeln!(
@@ -864,7 +867,15 @@ pub fn unregister() {
 pub(crate) fn suspend() {
     withdraw(true);
 }
+/// [`suspend`] for an s0ix cycle, which keeps the memory owner: the lent
+/// VMIDs stay too, and the next `register_raphael` reuses them.
+pub(crate) fn pause() {
+    withdraw_keeping(true, true);
+}
 fn withdraw(keep_media_sessions: bool) {
+    withdraw_keeping(keep_media_sessions, false);
+}
+fn withdraw_keeping(keep_media_sessions: bool, keep_vmids: bool) {
     crate::amdgpu_vcn_navi22::idle::stop();
     abandon(FsError::Canceled);
     crate::amdgpu_rdna2_vram::suspend();
@@ -878,8 +889,10 @@ fn withdraw(keep_media_sessions: bool) {
     } else {
         crate::amdgpu_vcn_navi22_cs::unregister();
     }
-    // Its owner is being replaced; the handle must not reach the new one.
-    let _ = CLIENT_VMIDS.lock().take();
+    if !keep_vmids {
+        // Its owner is being replaced; the handle must not reach the new one.
+        let _ = CLIENT_VMIDS.lock().take();
+    }
 }
 
 #[cfg(feature = "kernel-test")]
