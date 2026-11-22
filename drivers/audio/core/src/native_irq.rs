@@ -54,11 +54,14 @@ impl State {
                     }
                     for index in 0..30 {
                         if cause & (1 << index) != 0 && 0x84 + index * 32 <= self.mmio.len {
+                            // Acknowledge completion, FIFO and descriptor
+                            // errors alike. Like Linux
+                            // snd_hdac_bus_handle_stream_irq, a stream error
+                            // does not mark the controller failed: `failed`
+                            // is the command transport's, and the stream's
+                            // own position check sees a dead DMA engine.
                             let status = self.mmio.read8(0x83 + index * 32);
                             self.mmio.write8(0x83 + index * 32, status & 0x1c);
-                            if status & 0x18 != 0 {
-                                self.failed.store(true, Ordering::Release);
-                            }
                         }
                     }
                     self.pending.fetch_or(cause, Ordering::Release);

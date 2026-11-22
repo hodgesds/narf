@@ -2,7 +2,6 @@
 use super::*;
 use crate::native_pcm::Ring;
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::Ordering;
 use narf_drivers_sound::{
     format::{pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate},
     hardware::{PcmDevice, PcmHardware},
@@ -46,7 +45,8 @@ impl Stream {
         }
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
         if !super::runtime::wait(|| unsafe { dev.bar0.read8(sd) } & 2 == 0, 100) {
-            dev.irq.failed.store(true, Ordering::Release);
+            // A stream that will not stop fails its own operation only: the
+            // command transport is unaffected (Linux snd_hdac_stream_stop).
             return Err(SoundError::BadState);
         }
         if let Some(ring) = self.ring.as_mut() {
@@ -93,9 +93,6 @@ impl Stream {
     }
     fn prepare(&mut self, dev: &IntelHda) -> Result<(), SoundError> {
         self.stop(dev)?;
-        if dev.irq.failed.load(Ordering::Acquire) {
-            return Err(SoundError::BadState);
-        }
         let ring = self.ring.as_mut().ok_or(SoundError::BadState)?;
         let sd = sd_base(self.index);
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
@@ -146,7 +143,7 @@ impl Stream {
         // written yet starts DMA on the reset-zeroed buffer (silence),
         // and the restart sequence (fresh prepare, then start) must
         // not need a preceding write. The other guards still apply.
-        if !ring.prepared || ring.running || ring.xrun || dev.irq.failed.load(Ordering::Acquire) {
+        if !ring.prepared || ring.running || ring.xrun {
             return Err(SoundError::BadState);
         }
         let sd = sd_base(self.index);
@@ -191,7 +188,6 @@ impl Stream {
         if position >= ring.bytes as u32
             || (!ring.free_running
                 && now.wrapping_sub(self.last_sample) >= narf_time::wall::ns_to_cycles(wrap_ns))
-            || dev.irq.failed.load(Ordering::Acquire)
         {
             ring.xrun = true;
             let _ = self.stop(dev);
