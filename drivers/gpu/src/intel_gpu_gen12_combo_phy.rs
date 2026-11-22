@@ -936,22 +936,27 @@ mod tests {
         }
     }
 
+    /// One row of the table-selection smoke test: (family, is_edp,
+    /// port_clock, uy, hobl, low_vswing) → (first entry, table
+    /// length, is_hobl).
+    type ComboPhyTableCase = (
+        Gen12Platform,
+        bool,
+        u32,
+        bool,
+        bool,
+        bool,
+        IclEntry,
+        usize,
+        bool,
+    );
+
     fn smoke_combo_phy_table_selection() -> TestResult {
         use Gen12Platform::*;
         // (family, is_edp, port_clock, uy, hobl, low_vswing) →
         // (first entry, table length, is_hobl).
         let first = |t: &[IclEntry]| t[0];
-        let cases: [(
-            Gen12Platform,
-            bool,
-            u32,
-            bool,
-            bool,
-            bool,
-            IclEntry,
-            usize,
-            bool,
-        ); 18] = [
+        let cases: [ComboPhyTableCase; 18] = [
             // Tiger Lake DP: 270 MHz boundary is the low table.
             (
                 TigerLake,
