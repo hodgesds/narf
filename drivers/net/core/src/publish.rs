@@ -254,10 +254,36 @@ pub fn note_rx_mirror_attached(name: &'static str) {
     }
 }
 
+/// Acquisitions of the mirror registry's lock, so a test can show the
+/// receive path takes none.
+static RX_MIRROR_LOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Mirror-registry lock acquisitions so far.
+pub fn rx_mirror_locks() -> u64 {
+    RX_MIRROR_LOCKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// True once [`note_rx_mirror_attached`] has fired for `name` — the
 /// pump-side query, mirroring e1000's `rx_mirror_enabled` load.
 pub fn rx_mirror_attached(name: &str) -> bool {
+    RX_MIRROR_LOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     RX_MIRROR_ATTACHED.lock().contains(&name)
+}
+
+/// A receive pump's view of whether its interface's mirror is attached,
+/// kept across polls.
+#[derive(Debug, Default)]
+pub struct RxMirrorState {}
+
+impl RxMirrorState {
+    pub const fn new() -> Self {
+        Self {}
+    }
+
+    /// Whether `name`'s frame-ring consumer has attached.
+    pub fn attached(&mut self, name: &str) -> bool {
+        rx_mirror_attached(name)
+    }
 }
 
 /// Forget a previous [`note_rx_mirror_attached`] for `name`,

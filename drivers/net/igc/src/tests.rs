@@ -3709,3 +3709,39 @@ kernel_test_in!(
     "drivers/net/igc-queues",
     smoke_igc_queue_fast_paths_are_per_queue
 );
+
+/// The receive pump's mirror check takes no global lock per poll once it
+/// has read the mirror registry, and sees an attach after it happens.
+fn smoke_igc_rx_mirror_check_takes_no_global_lock() -> TestResult {
+    const NAME: &str = "igc-mirror-locks";
+    let mut state = crate::publish::RxMirrorState::new();
+    check!(
+        !state.attached(NAME),
+        "a mirror was attached before any consumer"
+    );
+    let locks = crate::publish::rx_mirror_locks();
+    for _ in 0..64 {
+        check!(
+            !state.attached(NAME),
+            "a mirror was attached before any consumer"
+        );
+    }
+    let taken = crate::publish::rx_mirror_locks() - locks;
+    crate::publish::note_rx_mirror_attached(NAME);
+    let attached = state.attached(NAME);
+    crate::publish::clear_rx_mirror_attached(NAME);
+    let cleared = !state.attached(NAME);
+    check!(
+        taken == 0,
+        "the mirror check took the mirror registry lock per poll"
+    );
+    check!(
+        attached && cleared,
+        "the mirror check did not see an attach or a clear"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-rx-locks",
+    smoke_igc_rx_mirror_check_takes_no_global_lock
+);

@@ -2499,6 +2499,68 @@ kernel_test_in!(
     smoke_rx_batch_resolves_device_once_per_poll
 );
 
+static RX_HANDLE_SEEN: ::core::sync::atomic::AtomicU64 = ::core::sync::atomic::AtomicU64::new(0);
+
+fn rx_handle_count(_dev: &iface::NetIfaceSnapshot, _frame: &mut [u8], _ts: Option<u64>) {
+    RX_HANDLE_SEEN.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+}
+
+/// A receive path that keeps its interface in an [`iface::RxHandle`] takes
+/// no registry lock per batch once it has read the device (Linux NAPI
+/// delivers with `skb->dev`, and counts into per-CPU stats that readers
+/// sum); it re-reads the device after the registry changes, and the
+/// interface's counters still add up.
+fn smoke_rx_handle_takes_no_registry_lock_per_batch() -> TestResult {
+    use ::core::sync::atomic::Ordering;
+    const BATCHES: u64 = 16;
+    const FRAMES: u64 = 8;
+    let local = [10, 94, 0, 1];
+    let peer = reset("rxhandle0", local);
+    iface::install_native_rx_resolved_handler(rx_handle_count);
+    let counters = || {
+        iface::lookup("rxhandle0").map_or((0, 0), |dev| (dev.stats.rx_packets, dev.stats.rx_bytes))
+    };
+    let before = counters();
+    let seen = RX_HANDLE_SEEN.load(Ordering::Relaxed);
+    let mut handle = iface::RxHandle::new("rxhandle0");
+    // The first batch reads the device.
+    drop(handle.batch());
+    let locks = iface::registry_locks();
+    for _ in 0..BATCHES {
+        let mut batch = handle.batch();
+        for _ in 0..FRAMES {
+            batch.receive(&mut arp_request(peer, local), None);
+        }
+    }
+    let taken = iface::registry_locks() - locks;
+    // A registry change is seen by the next batch.
+    let resized = iface::set_mtu("rxhandle0", 1400);
+    let mtu = handle.batch().mtu();
+    iface::install_native_rx_resolved_handler(crate::tcp_stack::rx_handler_native_resolved);
+    if taken != 0 {
+        return TestResult::Fail("a receive batch took the interface registry lock");
+    }
+    if RX_HANDLE_SEEN.load(Ordering::Relaxed) - seen != BATCHES * FRAMES {
+        return TestResult::Fail("a frame of a batch did not reach the stack with its device");
+    }
+    if counters()
+        != (
+            before.0 + BATCHES * FRAMES,
+            before.1 + BATCHES * FRAMES * 60,
+        )
+    {
+        return TestResult::Fail("the interface's counters do not add up to the batches' frames");
+    }
+    if !resized || mtu != Some(1400) {
+        return TestResult::Fail("a batch after a registry change used the old device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/iface-rx-handle",
+    smoke_rx_handle_takes_no_registry_lock_per_batch
+);
+
 /// Zero-copy hook of the `txpool-neigh` interface: a synchronous driver
 /// whose transmit completes at once and recycles into the frame's pool.
 fn txpool_neigh_send(frame: crate::Frame, _meta: crate::TxMeta) -> Result<(), ()> {

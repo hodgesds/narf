@@ -790,7 +790,78 @@ fn next_ownership_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::new(None);
+/// The interface registry: the entries behind one lock, and a generation a
+/// writer bumps so a receive path that cached a snapshot ([`RxHandle`])
+/// knows when to read the registry again.
+pub(crate) struct Registry {
+    entries: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>>,
+    generation: AtomicU64,
+    /// Lock acquisitions, so a test can show a path takes none.
+    locks: AtomicU64,
+}
+
+/// The registry lock; a mutable borrow marks the registry changed.
+pub(crate) struct RegistryGuard<'a> {
+    guard: narf_lib::sync::IrqSafeSpinLockGuard<'a, Option<Vec<NetIfaceEntry>>>,
+    generation: &'a AtomicU64,
+    changed: bool,
+}
+
+impl Registry {
+    const fn new() -> Self {
+        Self {
+            entries: IrqSafeSpinLock::new(None),
+            generation: AtomicU64::new(0),
+            locks: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> RegistryGuard<'_> {
+        self.locks.fetch_add(1, Ordering::Relaxed);
+        RegistryGuard {
+            guard: self.entries.lock(),
+            generation: &self.generation,
+            changed: false,
+        }
+    }
+
+    /// Bumped by every writer, read with Acquire by cached receive paths.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+impl core::ops::Deref for RegistryGuard<'_> {
+    type Target = Option<Vec<NetIfaceEntry>>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl core::ops::DerefMut for RegistryGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.changed = true;
+        &mut self.guard
+    }
+}
+
+impl Drop for RegistryGuard<'_> {
+    fn drop(&mut self) {
+        // Before the lock is released: a reader that sees the old
+        // generation after this writer's unlock cannot exist.
+        if self.changed {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+static IFACES: Registry = Registry::new();
+
+/// Interface-registry lock acquisitions so far (tests).
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn registry_locks() -> u64 {
+    IFACES.locks.load(Ordering::Relaxed)
+}
 
 /// Loopback transmit: a frame sent on "lo" is immediately received on
 /// "lo". Linux does the same thing — `loopback_xmit` hands the skb straight
@@ -3094,6 +3165,28 @@ pub struct RxBatch {
     multicast: u64,
 }
 
+/// A receive path's view of its interface, kept across polls (Linux: the
+/// driver holds its `net_device`, and NAPI delivers with `skb->dev` set,
+/// without a registry lookup).
+#[derive(Debug)]
+pub struct RxHandle {
+    name: String,
+}
+
+impl RxHandle {
+    /// The view of the interface registered as `name`.
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: String::from(name),
+        }
+    }
+
+    /// Start a receive batch.
+    pub fn batch(&mut self) -> RxBatch {
+        rx_batch(&self.name)
+    }
+}
+
 /// Start a receive batch for `name`: one registry lookup per poll.
 pub fn rx_batch(name: &str) -> RxBatch {
     #[cfg(any(test, feature = "kernel-test"))]
@@ -3109,6 +3202,11 @@ pub fn rx_batch(name: &str) -> RxBatch {
 }
 
 impl RxBatch {
+    /// The batch's device MTU, `None` when the name is not registered.
+    pub fn mtu(&self) -> Option<u32> {
+        self.dev.as_ref().map(|dev| dev.mtu)
+    }
+
     /// Deliver one frame whose native XDP action was PASS.
     pub fn receive(&mut self, frame: &mut [u8], timestamp: Option<u64>) {
         let handler = NATIVE_RX_RESOLVED_HANDLER.load(Ordering::Acquire);
