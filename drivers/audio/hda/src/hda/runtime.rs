@@ -1866,7 +1866,8 @@ impl IntelHda {
     /// The wake of a controller that only suspended its codecs.
     fn resume_codecs_only(&self) -> Result<(), HdaError> {
         let _pm = self.lock_pm()?;
-        if !self.codecs_suspended.load(Ordering::Acquire) || self.suspended.load(Ordering::Acquire) {
+        if !self.codecs_suspended.load(Ordering::Acquire) || self.suspended.load(Ordering::Acquire)
+        {
             return Ok(());
         }
         self.resume_codecs()?;
