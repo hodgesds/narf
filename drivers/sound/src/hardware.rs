@@ -98,6 +98,13 @@ pub trait PcmDevice: Send + Sync + core::fmt::Debug {
     fn pcm_name(&self, _capture: bool, _device: u32) -> Option<alloc::string::String> {
         None
     }
+    /// Whether HW_REFINE offers non-interleaved access for this device
+    /// (`SNDRV_PCM_INFO_NONINTERLEAVED`; the sound core de-interleaves
+    /// planar transfers itself). Linux HDA offers interleaved access only
+    /// (`azx_pcm_hw`).
+    fn noninterleaved(&self) -> bool {
+        true
+    }
     /// The card's PCM device numbers in one direction, when they are not
     /// `0..count` (Linux HDA numbers its PCMs through `get_empty_pcm_device`:
     /// analog 0, 2, 4, 5, HDMI 3, 7, 8, 9, 10, ...). The list must hold
