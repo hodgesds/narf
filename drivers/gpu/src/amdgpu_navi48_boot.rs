@@ -676,19 +676,33 @@ fn driver_reserve(aperture: u64, available: u64) -> u64 {
         .min(available)
 }
 
-/// Publish card `card`'s client VRAM heap for GEM placements; `hdp` is the
-/// card's HDP flush for page-table updates.
+/// Publish card `card`'s client VRAM heap for GEM placements and, as
+/// `amdgpu_vm_pt_create` places a dGPU's tables in VRAM, for its clients'
+/// page tables, committed with `hdp` (the GMC's HDP flush). Registering the
+/// table heap rewrites tables a VRAM loss (S3) took, before jobs run again.
+/// Without a GMC owner the tables stay where they are.
 pub(crate) fn publish_heap(
     card: u32,
     heap: &crate::amdgpu_gem::VramHeap,
     hdp: Option<alloc::sync::Arc<dyn crate::amdgpu_vm::HdpFlush>>,
 ) {
-    let _ = hdp;
     crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+    if let Some(hdp) = hdp {
+        crate::amdgpu_vm::register_table_heap(
+            card,
+            crate::amdgpu_vm::TableHeap {
+                pool: heap.pool.clone(),
+                fb_base: heap.fb_base,
+                fb_offset: heap.fb_offset,
+                hdp,
+            },
+        );
+    }
 }
 /// Withdraw what [`publish_heap`] published (suspend, recovery).
 pub(crate) fn withdraw_heap(card: u32) {
     crate::amdgpu_gem::unregister_vram_heap(card);
+    crate::amdgpu_vm::unregister_table_heap(card);
 }
 
 pub(crate) fn reserve_client_chunk(pool: &Pool) -> Result<crate::amdgpu_vram::Reservation, Error> {

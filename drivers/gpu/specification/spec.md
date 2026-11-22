@@ -12325,8 +12325,17 @@ the card in line before the card takes jobs: system-RAM tables (mapped
 before the heap existed) move into VRAM bottom-up, VRAM tables lost to S3
 or a recovery are rewritten from the copy; either bumps the space's TLB
 sequence. While the heap is withdrawn a VRAM space takes no new tables
-(`Busy`). Cards that register no table heap (Navi48, Phoenix) keep
-system-RAM tables with per-entry cache flushes.
+(`Busy`). Navi48 (GC 12.0.x, `gmc_v12_0`) does the same through
+`amdgpu_navi48_boot::{publish_heap, withdraw_heap}`: its client heap and
+`amdgpu_gmc_navi48::Gmc::hdp_flusher()` become the card's table heap on
+first publication and on every republication after S3, and the suspend and
+recovery teardowns withdraw it. GFX12 VRAM directories are
+`vram_base_offset + mc - vram_start | VALID` (`gmc_v12_0_get_vm_pde`; GMC12
+never sets `translate_further`, so no BFS/TF bits) and never carry
+`AMDGPU_PDE_PTE_GFX12`, which marks only a leaf directory. Phoenix registers
+no table heap and keeps system-RAM tables with per-entry cache flushes
+(LINUX-GAP: Linux uses GTT tables only for `is_app_apu` parts; Phoenix's go
+to its carve-out VRAM).
 
 Job fences carry Linux's `dma_fence.timestamp`: the jobs tracker stamps
 every job the sample that completes it with `CLOCK_MONOTONIC` now (as
