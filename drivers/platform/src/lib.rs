@@ -24,6 +24,7 @@ pub mod alienware_wmi;
 pub mod amd_aoac;
 /// AMD ASF (Alert Standard Format) transport scaffold.
 pub mod amd_asf;
+pub mod amd_pmc;
 /// Battery / lid / buttons all consume the EC's platform-event
 /// feed. On aarch64 the equivalent path goes through SoC-specific
 /// PMIC drivers (not yet ported) — gate these on x86_64 too.
@@ -171,6 +172,21 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "tpm", || {
         tpm::try_init_default();
+        InitResult::Ok
+    });
+    // `amd_pmc_probe`, once PCI enumeration has listed the root complex: the
+    // S0i3 OS hint around suspend-to-idle, through the LPS0 handler list.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Device, "amd-pmc", || {
+        if let Err(error) = amd_pmc::init() {
+            if !matches!(
+                error,
+                amd_pmc::PmcError::Absent | amd_pmc::PmcError::UnknownCpu(_)
+            ) {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "amd_pmc: not bound: {error:?}");
+            }
+        }
         InitResult::Ok
     });
     #[cfg(target_arch = "x86_64")]
