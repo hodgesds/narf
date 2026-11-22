@@ -136,6 +136,10 @@ pub enum ProcessLoadError {
     /// and the process dies at rip=0 before its first instruction of
     /// real code. execve maps this to -ENOENT (Linux semantics).
     InterpUnavailable,
+    /// The `PT_INTERP` interpreter lives on a `noexec` mount: `open_exec`'s
+    /// `do_open_execat` refuses it with -EACCES (`path_noexec`), as it
+    /// refuses an image there.
+    InterpNoExec,
     StackAllocFailed,
     StackMapFailed,
     StackMaterializeFailed,
@@ -386,6 +390,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // does would restart the link at the root of the filesystem holding it.
     // The image itself and `#!` interpreters already resolve this way
     // (`do_execve_resolved`'s `read_exec`).
+    let mut interp_noexec = false;
     let interp_fs_owned: Option<(
         alloc::vec::Vec<u8>,
         alloc::sync::Arc<dyn narf_filesystem::FileOps>,
@@ -402,8 +407,20 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
                     true,
                 )?,
             };
+            // `do_open_execat`: `if (path_noexec(&file->f_path)) goto exit;`
+            // with -EACCES, on the mount the interpreter was opened from.
+            let noexec = narf_filesystem::mnt_flags::NOEXEC;
+            if narf_filesystem::any_restricted_mounts()
+                && crate::handlers::current_mount_flags_at(&resolved) & noexec != 0
+            {
+                interp_noexec = true;
+                return None;
+            }
             read_path_and_file_from_vfs(&resolved)
         });
+    if interp_noexec {
+        return Err(ProcessLoadError::InterpNoExec);
+    }
 
     if let Some(name) = image.interp.as_deref() {
         let registered: Option<&[u8]> = interp::lookup_interpreter(name).map(|s| s as &[u8]);

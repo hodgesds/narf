@@ -3143,6 +3143,11 @@ fn do_execve_resolved(
             ctx.set_return(errno_ret(ENOENT)); // -ENOENT
             return;
         }
+        // `open_exec` of the interpreter failed `path_noexec`.
+        Err(crate::process::ProcessLoadError::InterpNoExec) => {
+            ctx.set_return(errno_ret(EACCES));
+            return;
+        }
         Err(_) => {
             // Malformed ELF (bad magic, unsupported class, etc.) → ENOEXEC.
             ctx.set_return(errno_ret(ENOEXEC));
