@@ -70,7 +70,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 /// `{dw2_swing_sel, dw7_n_scalar, dw4_cursor_coeff,
 /// dw4_post_cursor_2, dw4_post_cursor_1}`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct IclEntry {
+pub struct IclEntry {
     pub dw2_swing_sel: u8,
     pub dw7_n_scalar: u8,
     pub dw4_cursor_coeff: u8,

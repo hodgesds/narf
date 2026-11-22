@@ -74,6 +74,22 @@ pub const PCODE_CMD_READ_SAGV_BLOCK_TIME_US: u32 = 0x23;
 /// The punit answers with no data dwords.
 pub const PCODE_CMD_DE_WRITE_FREQ_REQ: u32 = 0x17;
 
+/// `SKL_PCODE_CDCLK_CONTROL` (0x7, `intel_pcode_regs.h`): the
+/// Skylake CDCLK-control mailbox command used by
+/// `skl_cdclk_pcode_pre_notify` / `skl_cdclk_pcode_post_notify`
+/// in `display/intel_cdclk.c` — the notify protocol the Gen11
+/// (`icl_cdclk_funcs` / `ehl_cdclk_funcs`) CDCLK change uses,
+/// as opposed to the `HSW_PCODE_DE_WRITE_FREQ_REQ` protocol
+/// the BXT/TGL funcs use. Pre-notify writes DATA0
+/// `SKL_CDCLK_PREPARE_FOR_CHANGE` and the reply DATA0 must
+/// carry `SKL_CDCLK_READY_FOR_CHANGE`; post-notify writes
+/// DATA0 = the target voltage level.
+pub const PCODE_CMD_CDCLK_CONTROL: u32 = 0x7;
+/// `SKL_CDCLK_PREPARE_FOR_CHANGE` (0x3, `intel_pcode_regs.h`).
+pub const SKL_CDCLK_PREPARE_FOR_CHANGE: u32 = 0x3;
+/// `SKL_CDCLK_READY_FOR_CHANGE` (0x1, `intel_pcode_regs.h`).
+pub const SKL_CDCLK_READY_FOR_CHANGE: u32 = 0x1;
+
 /// Documented pcode status codes from `intel_pcode_regs.h`.
 /// Codes not in this list fall through to success, mirroring
 /// i915's `gen7_check_mailbox_status` default arm.
