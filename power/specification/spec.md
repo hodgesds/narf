@@ -236,7 +236,7 @@ pub trait AsyncSystemPm: Send + Sync {
     fn prepare_suspend_target(&self, target: SystemSleepState) -> SystemPmFuture<'_>;
     fn resume_from_suspend(&self) -> SystemPmFuture<'_>;
 }
-pub enum SystemSleepState { S0Idle, S3 }
+pub enum SystemSleepState { S0Idle, S3, S4 }
 pub fn register_async_system_pm(name: &str, ops: Arc<dyn AsyncSystemPm>);
 pub async fn prepare_async_system_pm_for(target: SystemSleepState) -> AsyncSystemPmTransition;
 pub async fn suspend_async(cap: &Cap<Power, Invoke>) -> Result<(), SuspendError>;
@@ -263,8 +263,14 @@ failed prepare must leave its own device usable; the coordinator resumes every
 earlier successful hook before it returns `SuspendError::Aborted`.
 
 The coordinator passes its actual target: s2idle uses `S0Idle`, suspend-to-RAM
-uses `S3`. `prepare_suspend_target` defaults to the existing no-argument
-preparation so current drivers retain their behavior. The legacy
+uses `S3`, hibernation `S4`. For `S4`, preparation is Linux's `freeze`: the
+device is quiesced and whatever must outlive power loss is moved into system
+memory, which the image captures. Nothing runs between the snapshot and power
+off (Linux's `thaw` and `poweroff` for a normal hibernation leave a frozen
+device alone). The paired resume is `restore` in the resumed image, or `thaw`
+after a failed snapshot or write; the device may have lost power either way.
+No coordinator enters `S4` yet. `prepare_suspend_target` defaults to the
+existing no-argument preparation so current drivers retain their behavior. The legacy
 `prepare_async_system_pm()` entry remains the S3 wrapper. Firmware wake
 owners use the target for `_DSW(enable,Sx,Dx)` instead of guessing it from
 callback order. Platform composition schedules the asynchronous entry from

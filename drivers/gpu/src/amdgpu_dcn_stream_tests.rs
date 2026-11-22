@@ -7,6 +7,8 @@ struct Fake {
     writes: Vec<(u64, u32)>,
     /// The stream never reports stopped, to exercise the timeouts.
     stuck: bool,
+    /// DIG_FIFO_RESET_DONE stops following DIG_FIFO_RESET.
+    fifo_stuck: bool,
 }
 impl Fake {
     fn new() -> Self {
@@ -14,6 +16,7 @@ impl Fake {
             values: vec![0; LAST_REG as usize + 1],
             writes: Vec::new(),
             stuck: false,
+            fifo_stuck: false,
         }
     }
 }
@@ -34,6 +37,16 @@ impl Io for Fake {
     }
     fn write(&mut self, reg: u64, value: u32) {
         self.writes.push((reg, value));
+        let mut value = value;
+        // The FIFO reports a reset done once it has seen the reset.
+        if reg % STRIDE == DIG_FIFO_CTRL0 % STRIDE && !self.fifo_stuck {
+            value = value & !DIG_FIFO_RESET_DONE
+                | if value & DIG_FIFO_RESET != 0 {
+                    DIG_FIFO_RESET_DONE
+                } else {
+                    0
+                };
+        }
         self.values[reg as usize] = value;
     }
 }
@@ -272,6 +285,8 @@ fn stream_unblank_resets_the_steering_fifo_first() -> TestResult {
     // treated as quiet while it is still sending.
     let mut stuck = engine(2);
     stuck.program(&timing(), Depth::Bpc8).unwrap();
+    // Live: enabled, and its status never drops.
+    stuck.io.values[cntl as usize] |= DP_VID_STREAM_ENABLE;
     stuck.io.stuck = true;
     if run(stuck.blank()) != Err(Error::Timeout) {
         return TestResult::Fail("live stream reported as stopped");
@@ -331,4 +346,207 @@ fn stream_rejects_timings_the_attributes_cannot_describe() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-stream",
     stream_rejects_timings_the_attributes_cannot_describe
+);
+
+/// DCN 3.1.5 runs `enc2_stream_encoder_dp_unblank` (`dcn30_str_enc_funcs`):
+/// the DIG_FE_CNTL.DIG_START pulse precedes the steering-FIFO reset and the
+/// stream enable, and nothing touches DP_PIXEL_PER_CYCLE_PROCESSING_MODE,
+/// which `dcn_3_1_5_sh_mask.h` does not define. DIG1_DIG_FE_CNTL is 0x218b.
+fn stream_dcn315_unblank_pulses_dig_start_like_dcn30() -> TestResult {
+    let mut stream = engine(1);
+    stream.profile = Profile::Dcn315;
+    stream.io.values[(DP_PIXEL_FORMAT + STRIDE) as usize] = DP_PIXEL_PER_CYCLE_PROCESSING_MODE;
+    stream.program(&timing(), Depth::Bpc8).unwrap();
+    stream.program_rate(148_500, 0x14).unwrap();
+    run(stream.unblank()).unwrap();
+    if stream.io.values[(DP_PIXEL_FORMAT + STRIDE) as usize] & DP_PIXEL_PER_CYCLE_PROCESSING_MODE
+        == 0
+    {
+        return TestResult::Fail("DCN 3.1.5 cleared a bit its header does not define");
+    }
+    let writes = &stream.io.writes;
+    let at = |want: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(r, v)| want(r, v));
+    let (Some(reset), Some(release), Some(steer), Some(enable)) = (
+        at(&|r, v| r == 0x218b && v & 0x400 != 0),
+        at(&|r, v| r == 0x218b && v & 0x400 == 0),
+        at(&|r, v| r == DP_STEER_FIFO + STRIDE && v & 1 != 0),
+        at(&|r, v| r == DP_VID_STREAM_CNTL + STRIDE && v & 1 != 0),
+    ) else {
+        return TestResult::Fail("DCN 3.1.5 unblank skipped a step");
+    };
+    if !(reset < release && release < steer && steer < enable) {
+        return TestResult::Fail("DCN 3.1.5 DIG/steering reset order");
+    }
+    // DCN 3.1.4 has no DIG_START ("removed from the register spec").
+    let mut phoenix = engine(1);
+    phoenix.program(&timing(), Depth::Bpc8).unwrap();
+    phoenix.program_rate(148_500, 0x14).unwrap();
+    run(phoenix.unblank()).unwrap();
+    if phoenix.io.writes.iter().any(|&(r, _)| r == 0x218b) {
+        return TestResult::Fail("DCN 3.1.4 pulsed the removed DIG_START");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-stream",
+    stream_dcn315_unblank_pulses_dig_start_like_dcn30
+);
+
+/// `enc314_stream_encoder_dp_unblank` ends with `enc314_enable_fifo`, after
+/// DP_VID_STREAM_ENABLE "per HW docs": read start level 7, a reset pulse whose
+/// edges wait for DIG_FIFO_RESET_DONE while DIG_SYMCLK_FE_ON, then
+/// DIG_FIFO_ENABLE. `setup_dio_stream_encoder` sets one pixel per container,
+/// and `reset` (`reset_dio_stream_encoder`) disables the FIFO again. DIG2's
+/// DIG_FIFO_CTRL0 is 0x2291 (`dcn_3_1_4_offset.h` regDIG0 0x2091 + 2 * 0x100).
+fn stream_dcn314_unblank_enables_the_dig_fifo_after_the_stream() -> TestResult {
+    let ctrl = (DIG_FIFO_CTRL0 + 2 * STRIDE) as usize;
+    if ctrl != 0x2291 || DIG_FE_CNTL + 2 * STRIDE != 0x228b {
+        return TestResult::Fail("DIG FIFO register ids");
+    }
+    let mut stream = engine(2);
+    // A boot firmware that left two pixels per container and the FIFO off.
+    stream.io.values[ctrl] = DIG_FIFO_OUTPUT_PIXEL_MODE;
+    stream.io.values[(DIG_FE_CNTL + 2 * STRIDE) as usize] = DIG_SYMCLK_FE_ON;
+    stream.program(&timing(), Depth::Bpc8).unwrap();
+    if stream.io.values[ctrl] & DIG_FIFO_OUTPUT_PIXEL_MODE != 0 {
+        return TestResult::Fail("input mode not one pixel per container");
+    }
+    stream.program_rate(148_500, 20).unwrap();
+    stream.io.writes.clear();
+    if run(stream.unblank()).is_err() || stream.state != State::Streaming {
+        return TestResult::Fail("unblank with the DIG FIFO");
+    }
+    let writes = &stream.io.writes;
+    let at = |want: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(r, v)| want(r, v));
+    let cntl = DP_VID_STREAM_CNTL + 2 * STRIDE;
+    let ctrl = ctrl as u64;
+    let (Some(video), Some(reset), Some(release), Some(enable)) = (
+        at(&|r, v| r == cntl && v & 1 != 0),
+        at(&|r, v| r == ctrl && v & DIG_FIFO_RESET != 0),
+        writes
+            .iter()
+            .rposition(|&(r, v)| r == ctrl && v & DIG_FIFO_RESET == 0 && v & DIG_FIFO_ENABLE == 0),
+        at(&|r, v| r == ctrl && v & DIG_FIFO_ENABLE != 0),
+    ) else {
+        return TestResult::Fail("DIG FIFO enable skipped a step");
+    };
+    if !(video < reset && reset < release && release < enable) {
+        return TestResult::Fail("DIG FIFO must reset and enable after the video stream");
+    }
+    let value = stream.io.values[ctrl as usize];
+    if value & DIG_FIFO_READ_START_LEVEL != 7 << 2
+        || value & (DIG_FIFO_ENABLE | DIG_FIFO_RESET) != DIG_FIFO_ENABLE
+    {
+        return TestResult::Fail("DIG FIFO read start level or final state");
+    }
+    // Teardown releases it.
+    run(stream.blank()).unwrap();
+    if stream.reset().is_err() || stream.io.values[ctrl as usize] & DIG_FIFO_ENABLE != 0 {
+        return TestResult::Fail("reset left the DIG FIFO enabled");
+    }
+
+    // With the symbol clock running, a reset that never reports done times out.
+    let mut stuck = engine(2);
+    stuck.io.values[(DIG_FE_CNTL + 2 * STRIDE) as usize] = DIG_SYMCLK_FE_ON;
+    stuck.io.fifo_stuck = true;
+    stuck.program(&timing(), Depth::Bpc8).unwrap();
+    stuck.program_rate(148_500, 20).unwrap();
+    if run(stuck.unblank()) != Err(Error::Timeout) {
+        return TestResult::Fail("a stuck DIG FIFO reset was treated as done");
+    }
+    // Without it, Linux only waits 10 µs per edge: no RESET_DONE poll.
+    let mut cold = engine(2);
+    cold.io.fifo_stuck = true;
+    cold.program(&timing(), Depth::Bpc8).unwrap();
+    cold.program_rate(148_500, 20).unwrap();
+    if run(cold.unblank()).is_err() || cold.io.values[ctrl as usize] & DIG_FIFO_ENABLE == 0 {
+        return TestResult::Fail("DIG FIFO without a symbol clock");
+    }
+
+    // DCN30 and DCN 3.1.5 have no explicit FIFO enable: DIG_START resets it.
+    for profile in [Profile::Navi22, Profile::Dcn315] {
+        let mut other = engine(2);
+        other.profile = profile;
+        other.program(&timing(), Depth::Bpc8).unwrap();
+        other.program_rate(148_500, 20).unwrap();
+        run(other.unblank()).unwrap();
+        if other.reset().is_err() || other.io.writes.iter().any(|&(r, _)| r == ctrl) {
+            return TestResult::Fail("a non-DCN 3.1.4 encoder touched DIG_FIFO_CTRL0");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-stream",
+    stream_dcn314_unblank_enables_the_dig_fifo_after_the_stream
+);
+
+/// `enc1_stream_encoder_dp_blank`, on every profile: an enabled stream gets
+/// DP_VID_STREAM_DIS_DEFER = 2 (next vertical blank) before the enable drops,
+/// and DP_STEER_FIFO_RESET only once DP_VID_STREAM_STATUS reads 0. A stream
+/// that is not enabled is not touched, and a blank never makes an
+/// unprogrammed encoder programmed.
+fn stream_blank_defers_to_vblank_and_resets_steering_after_stop() -> TestResult {
+    for profile in [Profile::Navi22, Profile::Dcn314, Profile::Dcn315] {
+        let mut stream = engine(1);
+        stream.profile = profile;
+        stream.program(&timing(), Depth::Bpc8).unwrap();
+        stream.program_rate(148_500, 20).unwrap();
+        run(stream.unblank()).unwrap();
+        stream.io.writes.clear();
+        if run(stream.blank()).is_err() || stream.state != State::Programmed {
+            return TestResult::Fail("blank of a live stream");
+        }
+        let cntl = DP_VID_STREAM_CNTL + STRIDE;
+        let steer = DP_STEER_FIFO + STRIDE;
+        let writes = &stream.io.writes;
+        let at = |want: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(r, v)| want(r, v));
+        let (Some(defer), Some(stop), Some(reset)) = (
+            at(&|r, v| r == cntl && v & DP_VID_STREAM_DIS_DEFER == 2 << 8 && v & 1 != 0),
+            at(&|r, v| r == cntl && v & 1 == 0),
+            at(&|r, v| r == steer && v & DP_STEER_FIFO_RESET != 0),
+        ) else {
+            return TestResult::Fail("blank skipped the defer, stop or steering reset");
+        };
+        if !(defer < stop && stop < reset) {
+            return TestResult::Fail("steering reset must follow the confirmed stop");
+        }
+        if stream.io.values[cntl as usize] & (DP_VID_STREAM_ENABLE | DP_VID_STREAM_DIS_DEFER)
+            != 2 << 8
+            || stream.io.values[steer as usize] & DP_STEER_FIFO_RESET == 0
+        {
+            return TestResult::Fail("blanked encoder state");
+        }
+        // A second blank finds the stream already off and writes nothing.
+        stream.io.writes.clear();
+        if run(stream.blank()).is_err() || !stream.io.writes.is_empty() {
+            return TestResult::Fail("blank touched a stream that was not enabled");
+        }
+        // Blanking an encoder nobody programmed leaves it unprogrammed.
+        let mut idle = engine(1);
+        idle.profile = profile;
+        if run(idle.blank()).is_err()
+            || idle.state != State::Idle
+            || run(idle.unblank()) != Err(Error::Busy)
+        {
+            return TestResult::Fail("blank made an unprogrammed encoder programmed");
+        }
+        // A stream that never reports stopped times out, and the steering
+        // FIFO is not reset over it.
+        let mut stuck = engine(1);
+        stuck.profile = profile;
+        stuck.program(&timing(), Depth::Bpc8).unwrap();
+        stuck.io.values[cntl as usize] |= DP_VID_STREAM_ENABLE;
+        stuck.io.stuck = true;
+        if run(stuck.blank()) != Err(Error::Timeout)
+            || stuck.io.writes.iter().any(|&(r, _)| r == steer)
+        {
+            return TestResult::Fail("steering reset issued over a live stream");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-stream",
+    stream_blank_defers_to_vblank_and_resets_steering_after_stop
 );

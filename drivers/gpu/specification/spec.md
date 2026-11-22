@@ -4511,7 +4511,8 @@ compatibility.
 
 `amdgpu_rdna2::options::BootOptions::parse(cmdline)` yields
 `{native_display, accel, multi, hw_cursor, gpu_recovery, power_saving,
-dmub_tables, atom_pixclk, connector}`. Switches
+dmub_tables, atom_pixclk, vcn_smu_pg, vcn_dpg, connector, gfxoff, cg_mask,
+pg_mask}`. Switches
 `amdgpu.native_display`, `amdgpu.rdna2_accel`, `amdgpu.rdna2_multi` and
 `amdgpu.rdna2_hw_cursor` accept a bare flag or `=1|on|y|yes|true` (on) and
 `=0|off|n|no|false` (off); any other value keeps the default. The
@@ -4530,7 +4531,21 @@ the ATOM interpreter instead of DMCUB. `amdgpu.rdna2_connector=dp|hdmi`
 (`options::Connector`; anything else is `Any`) makes the single-display
 Navi22 boot modeset light that kind of sink first when one is connected
 (`amdgpu_navi22_modeset::set_connector_preference`, `choose_preferring`);
-`Any` keeps Linux's order, HDMI first.
+`Any` keeps Linux's order, HDMI first. Raphael takes Linux's own knobs:
+`gfxoff` is `amdgpu.ppfeaturemask`'s `PP_GFXOFF_MASK`, and `cg_mask` and
+`pg_mask` are `amdgpu.cg_mask` and `amdgpu.pg_mask`. Each is a `uint`
+(`0x` hex, a leading `0` octal, otherwise decimal), and a malformed value
+keeps Linux's default (`0xfff7bfff`, all ones, all ones). Raphael keeps
+`RAPHAEL_CG & cg_mask` and `RAPHAEL_PG & pg_mask` of `nv_common_early_init`'s
+GC 10.3.6 flags. Its `pg_flags` decide three things:
+- whether GATE sets RLC's CGPG enable (`AMD_PG_SUPPORT_GFX_PG`);
+- whether VCN starts in DPG or on the static path (`AMD_PG_SUPPORT_VCN_DPG`);
+- the VCN and JPEG PGFSM steps of the static power gating
+  (`amdgpu_vcn_navi22::StaticPg`; Navi22 keeps its fixed policy).
+
+Its `cg_flags` also reach the media owner: `VCN_MGCG` and `JPEG_MGCG`
+decide `DYN_CLOCK_MODE` in the VCN and JPEG starts and stops
+(`amdgpu_vcn_navi22::Mgcg`). The discrete owners keep both set.
 
 Clock/power capability flags come from each profile's Linux
 `nv_common_early_init` selection. Navi21/22/23 share the existing capability
@@ -11968,7 +11983,10 @@ resolves each instance's VCN BASE_IDX 0/1 banks from discovery (3.0.0 at
 0x7800/0x7E00, 3.0.1 at 0x7B00/0x12000), GC/NBIO/HDP, and reserves per instance
 the VCPU BO (128 KiB stack, 512 KiB context, 4 KiB fw_shared), 4 KiB decode and
 two encode rings, writeback and IB-test buffers (below 2^40), plus an 8 KiB JPEG
-ring when instance 0 exists. No I/O. Doorbells are 32-bit: decode
+ring when instance 0 exists and its VCN has a JPEG engine (`Layout::has_jpeg`).
+Linux's discovery pairs `jpeg_v3_0` with UVD 3.0.0, 3.0.2, 3.0.16, 3.1.1 and
+3.1.2, ignoring the revision's capability bits, but not with Navi24's 3.0.33.
+That owner has no JPEG ring, interrupt source or client ring. No I/O. Doorbells are 32-bit: decode
 `0x310 + 8i`, encode j `0x312 + j + 8i`, JPEG `0x311`, with NBIO MMSCH0/1
 ranges (size 8). `unsafe start(MediaFirmware, Option<PowerStatus>, &mut Psp)`
 refuses a missing per-instance TMR address or a running SMU MM_DPM_PG feature
@@ -14602,7 +14620,8 @@ are rejected. The Lib1 offset bounds the VBIOS sequence when present.
 validate structure and identity, not cryptographic authenticity.
 
 GPU probe retains this snapshot in `AmdGpu::vbios`. If VFCT has no image,
-Renoir/Phoenix APUs may use the firmware shadow in the first 256 KiB of the
+Renoir/Phoenix APUs and Raphael (`1002:164E`, an APU despite its coarse Navi2
+family) may use the firmware shadow in the first 256 KiB of the
 mapped framebuffer BAR, requiring a matching PCIR vendor/device record.
 Navi22 uses a bounded SMUIO11 ROM-register fallback and retains the complete
 declared ATOM image as `Source::RomRegisters`. Discovery must identify
@@ -14626,7 +14645,8 @@ the probe's unsafe acquisition operation.
 ### AMD DCN 3.1.4 USB-C display transport
 
 `amdgpu_dmub::Firmware::open(&AmdGpu, &Cap<FirmwareRegistry, Read>)`
-selects `amdgpu/dcn_3_1_4_dmcub.bin` from exact DCN IP discovery, rejecting
+selects `amdgpu/dcn_3_1_4_dmcub.bin` (DCN 3.1.4) or
+`amdgpu/dcn_3_1_5_dmcub.bin` (DCN 3.1.5) from exact DCN IP discovery, rejecting
 missing, duplicate or unsupported DCN instances. It does not use the coarse
 PCI family's firmware list. The firmware registry owns authentication.
 Registry lookup and copying the bounded image use `Cap::invoke`; the returned
@@ -14638,7 +14658,7 @@ splits the PSP-signed payload from the executable and BSS/data, and locates
 legacy or combined DAL metadata with 256/512-byte PSP footers. It rejects
 missing metadata and unbounded state/trace sizes. The header CRC field is
 not treated as authentication. `Firmware::prepare(vbios)` produces the
-DCN314 seven-window layout with 256-byte region starts, 64-byte sizes and
+DCN 3.1.x seven-window layout with 256-byte region starts, 64-byte sizes and
 4096-byte total alignment. Separate BSS/shared-state mappings remain
 unsupported for this hardware path. The caller supplies a compatible,
 validated VBIOS; preparation checks its storage size, not ATOM semantics.
@@ -14675,7 +14695,7 @@ pool-relative range permanently, as `amdgpu_bo_create_kernel_at` pins a
 firmware range: it may cover protected ranges (merged with them) but is
 `Busy` over any live or retired reservation and `Invalid` past the pool.
 
-`amdgpu_vram_boot::Plan::read` snapshots the DCN314 FB base/top/offset through
+`amdgpu_vram_boot::Plan::read` snapshots the DCN 3.1.x FB base/top/offset through
 live PCI authority and builds a read-only VRAM inventory. It requires the
 bootloader framebuffer's bus-physical byte range and explicit GPU-address
 ranges for other clients. It retains the entire framebuffer prefix (at least
@@ -14718,7 +14738,7 @@ firmware reservation. `Plan::training()` reports these VRAM-relative offsets;
 it does not attest completed training or authorize a training command. Exclusions
 remain correct with a small BAR0 or Resizable BAR exposing all 12 GiB.
 
-`amdgpu_dmub_boot::Loader::new` validates exact DCN314 discovery, the PCI
+`amdgpu_dmub_boot::Loader::new` validates exact DCN 3.1.4/3.1.5 discovery, the PCI
 capability, register bounds and the pool's CPU/GPU address correspondence,
 reserves its image storage, and claims exclusive DMUB/PM ownership. Its unsafe
 contract requires the matching authenticated image, validated GPU-specific
@@ -14738,8 +14758,8 @@ until `boot` is explicitly awaited. The reservation retains its pool for the
 loader's lifetime, including failed-stop quarantine. This constructor does
 not supply the platform boot inventory or enable automatic firmware loading.
 
-`amdgpu_psp_ring::Psp::new` is unsafe: it claims the sole Phoenix PSP 13.0.4
-GPCOM ring, its HDP remap hole and the exclusive right to replace the TMR, and
+`amdgpu_psp_ring::Psp::new` is unsafe: it claims the sole PSP 13.0.4 (Phoenix)
+or PSP 13.0.5 (Raphael, accepted only beside DCN 3.1.5) GPCOM ring, its HDP remap hole and the exclusive right to replace the TMR, and
 reserves its ring/fence buffer from the caller's pool. `start().await` requires
 live SOS firmware, verifies the HDP remap before publishing any device memory,
 zeroes and flushes the ring, then creates it with Linux's register sequence and
@@ -14763,7 +14783,9 @@ by the PSP: they are verified as enabled rather than programmed, and are never
 cleared by mailbox teardown. A failed PSP load does not fall back to direct
 load, and a dropped boot future cannot start a second attempt. Phoenix now
 rejects the legacy and multi-firmware PSP load helpers outright, so no other
-path can race this ring.
+path can race this ring. The TOC is the one named for the discovered PSP
+version (`psp_13_0_4_toc.bin` or `psp_13_0_5_toc.bin`); any other version
+stops the native path before a registry lookup.
 
 `amdgpu_platform` assembles the one platform display owner. `fb`'s generic
 registration records the physical boot framebuffer geometry before fbdev
@@ -14791,7 +14813,7 @@ The stream pipeline that a booted loader would drive remains open.
 
 `amdgpu_dmub::Dmub::attach(&AmdGpu)` is unsafe: the caller must retain exclusive
 mailbox and GPU power/firmware ownership for its lifetime. It requires exact
-DCN 3.1.4 IP discovery, running DAL firmware and bounded VRAM inbox/outbox
+DCN 3.1.4 or 3.1.5 IP discovery, running DAL firmware and bounded VRAM inbox/outbox
 windows. Async HPD, Type-C PHY state and AUX commands serialize mailbox access,
 validate replies, and poison the channel after timeout or cancellation.
 
@@ -14872,12 +14894,21 @@ that left DCFCLK DPM disabled refuses the two floor messages without aborting
 the modeset, since the boot clock already satisfies the request. The DCCG
 dividers and the DMCUB clock notification are supplied by the caller through
 `Consumers`, because neither the DCCG bank nor the firmware mailbox belongs to
-this module. DPREFCLK and DTBCLK are the fixed 600 MHz DCN314 sources; spread
-spectrum is not enabled.
+this module. On DCN 3.1.4, DPREFCLK and DTBCLK are the fixed 600 MHz sources;
+`dprefclk_khz()` is the reference the DP DTOs divide. While the SPLL spreads,
+`dp_dto_reference_khz(dprefclk, spread)` lowers that reference by half the
+downspread (`dce_adjust_dp_ref_freq_for_ss`). It is computed in Linux's 31.32
+fixed point rather than exactly, so the DTO is programmed to the clock Linux
+would program. The spread is the VBIOS figure, kept only for a downspread, then
+replaced by the `dcn314_read_ss_info_from_lut` entry while the SPLL spreads.
+DISPCLK asked of the firmware is raised to Linux's 100 MHz `min_disp_clk_khz`.
+`set_pstate_support(supported)` records whether the mode can take a DRAM clock
+change; DCN 3.1.4's manager ignores it, as Linux's does.
 
 `amdgpu_dml` derives the geometry, buffer and clock requirements Linux gets
 from DML, using `dcn3_14_ip`/`dcn3_14_soc` parameters and the
-`display_mode_vba_314.c` algorithms. It computes in fixed point rather than
+`display_mode_vba_314.c` algorithms, or `dcn3_15_ip`/`dcn3_15_soc` and
+`display_mode_vba_31.c` where `Config::dcn` is `Dcn::Dcn315`. It computes in fixed point rather than
 DML's `double`, because kernel floating point is unavailable: `x86_64`'s
 soft-float target and `arch/x86_64/kernel_ctx.rs` deliberately keep no FP state
 across a kernel context switch, and the aarch64 switch preserves no `d8..d15`
@@ -14894,6 +14925,9 @@ shape the boot handoff already accepts. `Config::geometry` returns the swath
 width, its 256-byte-request upper bound, the swath height and the DET
 allocation, refusing a viewport that exceeds the detile buffer, the linear
 8192-pixel swath ceiling or the line buffer instead of approximating it.
+`geometry_with_det(kbytes)` does the same against the DET the hub actually
+gives the pipe rather than the IP default, since every later figure depends
+on it.
 `Config::watermarks` returns the urgent, p-state-change, stutter and Z8 stutter
 watermarks in microseconds, leaving the reference-clock scaling to the register
 layer. Each is a latency plus the shared extra latency, which itself is the
@@ -14906,6 +14940,17 @@ default. The WM_A entry of Linux's per-memory-type table overrides the three
 non-Z8 latencies, so DDR5 and LPDDR5 differ; the Z8 times stay from the SOC
 bounding box. GPUVM and HostVM are both off for a kernel-owned physical scanout,
 so the page-table terms are zero rather than estimated.
+`watermarks_with_pstate_latency(.., latency)` recomputes them with another
+DRAM-change latency (`DUMMY_PSTATE_LATENCY_US`, 10 µs, on DCN 3.1.5).
+
+`Config::dram_clock_change(geometry, watermarks, prefetch, unbounded,
+compbuf_kbytes)` is DML's `DRAMClockChangeSupport` for one plane: the
+line-buffer hiding time (at most 12 lines) plus the time the whole DET buffers
+(including the compressed buffer under unbounded requesting), less the scaler
+delay and the urgent and DRAM-change watermarks. A positive margin is
+`Vactive`; with one timing generator anything else is `Vblank`. As
+`dcn31_calculate_wm_and_dlg_fp`, DCN 3.1.x allows the DRAM clock to change only
+in vactive.
 
 `Config::prefetch` returns the prefetch schedule. It retries from DML's minimum
 VStartup upward, as the mode-support loop does, and reports the first line count
@@ -14943,6 +14988,14 @@ the global DISPCLK and DPPCLK still belong to the clock manager, and this only
 divides them. `set_pixel_rate_div` programs one OTG's three-bit divider pair; a
 DisplayPort 8b/10b stream with one pixel per container and no ODM combine
 divides by one then four, and the divide-by-four code is 3, not 4.
+`has_pixel_rate_div()` is false on DCN 3.1.5, whose dccg31 has no K1/K2
+dividers, and the bring-up skips the call as Linux does.
+`set_dp_dto(otg, pixel_khz, reference_khz)` is `dcn31_program_pix_clk` for a
+DisplayPort 8b/10b stream: phase is the pixel clock and modulo the
+spread-adjusted DPREFCLK (the video-optimized ratio where one applies), then
+the DTO enable and the OTG's DTO source select. A pixel clock above the
+reference is refused rather than programmed, since one segment without ODM
+combine cannot carry it.
 `update_dpp_dto` programs a pipe's DPPCLK divider as a phase over a full 8-bit
 modulo, rounded up so the pipe is never starved, and refuses a request above the
 global clock. A pipe with no reference clock or a zero request is parked rather
@@ -15006,6 +15059,27 @@ deadline half; `set_viewport(x, y, w, h)` is `min_set_viewport` (primary,
 stereo-secondary and chroma viewports all the RGB luma rectangle, 14-bit
 fields checked before any write); `set_pitch(pitch)` is `hubp2_program_size`
 for linear RGB without DCC (pitch - 1, meta pitch 0).
+`set_unbounded_requesting(enable)` (DCN 3.1.x) is
+`hubp31_set_unbounded_requesting`: a lone pipe may also return data through the
+compressed buffer, and cursor requests always start early in the prefetch.
+
+`amdgpu_dcn_hubbub::Hubbub::new` is unsafe: it claims the DCN 3.1.x DCHUBBUB
+arbiter and the return-buffer (CRB) split, which also serve any pipe the boot
+firmware left scanning out. Holding it grants no pipe; the caller changes only
+the DET of a pipe it owns. hubbub31 serves both DCNs. The arbiter registers
+share offsets, and the DET/COMPBUF block is 0x11 dwords higher on DCN 3.1.5.
+`plan(pipe, width, pixel_khz, max_dispclk_khz)` follows
+`populate_dml_pipes_from_context`. A lone pipe with a surface at most 5120 wide
+(on DCN 3.1.5 also below the DPM DISPCLK ceiling over 1.0038) gets 192 KB with
+unbounded requesting. Beside live pipes it gets 384 KB (DCN 3.1.4) or an even
+share of 896 KB capped at 384 (DCN 3.1.5). A live pipe keeps its DET, and a
+split that does not fit beside it is refused. `program_det_size`,
+`wait_for_det_apply` and `program_compbuf_size` change the split in Linux's
+order. `program_watermarks(watermarks, mode)` writes all four sets as
+`ns × refclk_MHz / 1000` cycles, refusing a value its field cannot hold rather
+than clamping it. `Mode::Raise` only raises the values the hardware holds;
+`Mode::Exact`, which also allows self-refresh, is for when this pipe is the
+hub's only user, since the plane model cannot see another one.
 
 `amdgpu_dcn_plane` programs the rest of the plane path. The DPP and OPP banks are
 DCN base index 2 while the MPC bank is index 3. `Dpp::program` enables the pipe
@@ -15058,9 +15132,18 @@ and N are written because auto-measurement needs a full symbol cycle to take
 over, and refusing a stream faster than its link rather than programming a
 wrapped ratio. `unblank` stops the stream, resets the steering FIFO so a mode
 transition's overflow cannot persist, lets the logic prime and then enables;
-the hardware starts sending at the next vblank edge. Reprogramming a live stream
-is refused, and both blank and unblank wait for the encoder to confirm it
-stopped rather than assuming it did.
+the hardware starts sending at the next vblank edge. On DCN 3.1.4 it then
+enables the DIG FIFO (`enc314_enable_fifo`: read start level 7, a full reset
+pulse, then the enable); DCN30 and DCN 3.1.5 reset it through DIG_START and
+have no enable. `blank` is `enc1_stream_encoder_dp_blank`: an enabled stream's
+disable is deferred to the next vertical blank, the wait covers a whole 10 Hz
+frame, and only once the encoder reports stopped is the steering FIFO reset
+set, because setting it earlier leaves the stream status stuck. A stream that
+never reports stopped is a `Timeout`, and that reset is not issued (Linux only
+logs it). `reset()` releases the front end after the link is down, disabling
+the DCN 3.1.4 DIG FIFO and its input mode even after a failed blank.
+Reprogramming a live stream is refused, and both blank and unblank wait for the
+encoder to confirm it stopped rather than assuming it did.
 
 `amdgpu_dcn_display` is the bring-up sequence and owns no registers of its own.
 `timing_from_edid` converts a sink's detailed timing into the shared `Timing`,
@@ -15072,15 +15155,27 @@ line never straddles a partial one; dropping it returns the memory, so it must
 outlive every pipe fetching from it. `Pipeline::plan` derives the clocks, the
 HUBP registers and the global sync without touching hardware, and refuses a mode
 needing more than the firmware's own DPM ceiling before any register is written.
+It also derives the DET split beside any live pipe, the mode math on that DET,
+the arbiter watermarks and the vactive DRAM-change decision. On DCN 3.1.5 a mode
+that cannot change the DRAM clock in vactive is recomputed with the dummy
+p-state latency, and the clock manager locks p-state for it. Linux picks the
+latency from the previous validation, so such a mode alternates between commits;
+this takes the locked pairing every time.
 
 `Pipeline::enable` drives the blocks in Linux's enable-stream order, and the
-order is the substance: clocks and dividers, then timing, then the plane
+order is the substance: watermarks raised and the compressed buffer shrunk
+(`dcn20_prepare_bandwidth`), clocks and dividers with the OTG's DP DTO, then
+timing, then the plane
 programmed and deliberately blanked, then the pipe with this surface's
 deadlines, then the timing generator — which from that point sends blanked
 frames, which is what a sink needs to see during training — then link training,
 then the stream attributes at the rate training settled on, and only then the
 pipe, encoder and formatter unblanked in that order so the sink never sees a
-frame the pipe was not yet fetching for. A failure at any step tears the stream
+frame the pipe was not yet fetching for. The pipe is programmed on the DET the
+mode math was done for. Finally the compressed buffer grows back once every DET
+has applied, and the watermarks are written exactly when no other pipe is live
+(`dcn20_optimize_bandwidth`). Teardown takes the link down before releasing the
+stream front end and returns the pipe's DET. A failure at any step tears the stream
 back down rather than leaving a block fetching from memory the caller is about
 to release, and teardown continues past a failing step for the same reason.
 
@@ -15149,7 +15244,8 @@ built, because building one reserves pool memory and a rejected candidate must
 not cost any. A tunnelled route carries no hot-plug line, since the tunnel
 reports presence itself, and its AUX index is the tunnelling endpoint rather than
 a transmitter. `Pipeline::for_sink` and `Pipeline::platform` feed these into the
-bring-up, so a caller no longer assembles a route by hand.
+bring-up, so a caller no longer assembles a route by hand. DCN 3.1.5 has no
+DPIA, so on Raphael only native routes exist.
 
 A tunnelled stream additionally needs DTBCLK and its endpoint's stream clock
 routed, which the bring-up requests and programs.
@@ -15224,6 +15320,54 @@ The implementation references local Linux `amdgpu_ucode.h`,
 `amdgpu_psp.c`, `hdp_v5_0.c`, `dcn10_link_encoder.c`,
 `dcn31_dio_link_encoder.c`, `link_dp_training_8b_10b.c`,
 `link_dp_training_dpia.c` and DCN 3.1.4 register headers.
+
+### AMD DCN 3.1.5 (Raphael) display
+
+Raphael (`1002:164E`: the Ryzen 7000/9000 desktop and 7045HX iGPU; GC 10.3.6,
+DCN 3.1.5, PSP and SMU 13.0.5) takes the DCN 3.1.4 path above through
+`amdgpu_dcn_profile::Profile::Dcn315`. That profile is resolved only from exact
+DCN 3.1.5 discovery on that PCI ID, and admits only the blocks whose DCN 3.1.5
+layout has been checked. `dcn315_resource.c` is DCN31 proper where
+`dcn314_resource.c` forks several blocks, so each shared block keys its
+differences on the profile rather than a renumbering:
+
+- **Timing generator** (optc31): DCN 3.1.5 inserts `OTG_CRC_CNTL2` at 0x1b69
+  and drops `OTG_INTERRUPT_CONTROL`, so every DCN 3.1.4 OTG register at or
+  above 0x1b69 is one dword higher. `disable` also clears the OPTC underflow.
+- **DIO**: the DIG backend registers are one dword lower; the stream encoder is
+  `dcn30_str_enc_funcs`, which resets the DIG FIFO through DIG_START and has
+  no FIFO enable.
+- **DCCG** (dccg31): no OTG K1/K2 pixel-rate dividers and no DPIA stream clocks.
+  Each DP stream is clocked from its OTG's DP DTO, with DTO source select 1
+  rather than DCN 3.1.4's 3.
+- **Clock manager**: chosen only when discovery reports MP1 13.0.5 beside
+  DCN 3.1.5, and refused unless MP1 segment 0 is the 0x16000 Linux hard-codes.
+  The VBIOSSMC message id goes to SMN `MP1_C2PMSG_3` through NBIO
+  `PCIE_INDEX2/DATA2`, read back and retried up to five times; parameter and
+  response are C2PMSG_37/38. `start` asks `GetDprefclkFreq` for the DP DTO's
+  reference and latches the 176-byte `DpmClocks_315_t`. A mode that cannot
+  change the DRAM clock in vactive locks p-state with Linux's
+  `UNSUPPORTED_DCFCLK` request. The spread-spectrum adjustment applies only on
+  DCN 3.1.4.
+- **Mode math**: `dcn3_15_ip`/`dcn3_15_soc` with dml31's maximum VStartup (the
+  whole vblank less one line) and `MIN_DST_Y_NEXT_START` (the vblank start).
+  The `dcn315_clk_mgr.c` WM_A row gives 129/11.5/14.5 µs for DDR5 and LPDDR5.
+- **DCHUBBUB**: hubbub31, as on DCN 3.1.4, with its DET/COMPBUF block 0x11
+  dwords higher and the 896 KB split described above.
+- **DMUB and PSP**: `dcn_3_1_5_dmcub.bin` under the DCN31 sequence, loaded
+  through the PSP 13.0.5 ring (`psp_v13_0`): MP0 on `_BASE_IDX` 0, NBIO 7.2/7.7
+  for the HDP remap, and no bootloader wait.
+- **Boot inventory**: DCN 3.1.4's surface window; GC 10.3.6 `gfxhub_v2_1`
+  (`GCVM_CONTEXT0_CNTL` 0x15fc, index 0); MMHUB 2.3.0/2.4.0/2.4.1
+  `mmhub_v2_3` (`MMVM_CONTEXT0_CNTL` 0x0740, index 1).
+
+DCN 3.1.5 has no USB4 DPIA (`dcn315_resource.c` sets no `usb4_dpia_count`).
+Only native routes exist, and no DPIA command is sent to its firmware.
+Raphael's graphics, SDMA and media firmware (`RAPHAEL_FW`) is not loaded: this
+is the display path only. None of it has run on Raphael hardware, and the exact
+NBIO and MMHUB revisions are accepted as every version Linux serves with the
+same functions. `drivers/gpu/research/raphael-dcn315-port.md` maps each block
+to the Linux file it follows.
 
 ### Laptop DCN display-audio lifecycle (DCN 2.0 / 3.1.4)
 

@@ -42,7 +42,8 @@ fn layout(instances: u8) -> Layout {
         ],
         gc: GC,
         nbio: NBIO,
-        hdp: HDP,
+        hdp: core::num::NonZeroU64::new(HDP),
+        vcn_version: (3, 0, 0),
     }
 }
 fn pool(len: u64) -> Pool {
@@ -266,7 +267,9 @@ impl Model {
         }
         let window = self.pair(v(i, LMI_VCPU_CACHE_BAR_LOW), v(i, LMI_VCPU_CACHE_BAR_HIGH));
         let size = self.reg(v(i, VCPU_CACHE_SIZE0));
-        let powered = self.reg(v(i, PGFSM_STATUS)) & PGFSM_STATUS_MASK == 0;
+        // Every tile on, or (AMD_PG_SUPPORT_VCN) the core tiles alone.
+        let tiles = self.reg(v(i, PGFSM_STATUS)) & PGFSM_STATUS_MASK;
+        let powered = tiles == 0 || tiles == PGFSM_VCN_PG_ON_STATUS;
         if window != TMR[i] || size != (FW_BYTES + 4 + 4095) & !4095 || !powered {
             return;
         }
@@ -580,9 +583,15 @@ impl SramLoader for NoSram {
     }
 }
 fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
+    engine_on(model, layout(instances))
+}
+/// The owner `with_layout` builds on `layout`: JPEG with instance 0, where
+/// the VCN has one.
+fn engine_on(model: Model, layout: Layout) -> (Pool, Engine<Model>) {
+    let instances = u8::from(layout.vcn[0].is_some()) | u8::from(layout.vcn[1].is_some()) << 1;
     let pool = pool(4 << 20);
     let vcn = [0, 1].map(|i| (instances & (1 << i) != 0).then(|| Instance::new(&pool, i).unwrap()));
-    let jpeg = (instances & 1 != 0).then(|| Jpeg::new(&pool).unwrap());
+    let jpeg = (instances & 1 != 0 && layout.has_jpeg()).then(|| Jpeg::new(&pool).unwrap());
     (
         pool,
         Engine {
@@ -591,7 +600,7 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
             hw: Hw {
                 io: model,
                 authority: Cap::bootstrap(),
-                layout: layout(instances),
+                layout,
             },
             vcn,
             jpeg_state: if jpeg.is_some() {
@@ -603,12 +612,15 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
             firmware_bytes: FW_BYTES,
             timing: FAST,
             mode: StartMode::Static,
+            pg: StaticPg::NAVI22,
+            cg: Mgcg::NAVI22,
             paused: [false; 2],
             state: State::Prepared,
             proof: Proof {
                 instances,
                 ..Proof::default()
             },
+            nbio_v7_2: None,
         },
     )
 }
@@ -617,19 +629,80 @@ fn owned(instances: u8) -> u64 {
     u64::from(instances.count_ones()) * ((INSTANCE_BYTES + 4095) & !4095) + jpeg
 }
 
+/// Navi24 (Beige Goby, VCN 3.0.33) decodes only, and has no JPEG owner:
+/// Linux's discovery adds `vcn_v3_0` alone for it. Nothing reaches UVDJ's
+/// PGFSM field, the JPEG registers or the JPEG doorbell, and no JPEG ring or
+/// interrupt source is offered.
 fn vcn_navi24_decode_only() -> TestResult {
-    let (_pool, mut e) = engine(Model::new(), 1);
+    let navi24 = Layout {
+        vcn_version: (3, 0, 33),
+        ..layout(1)
+    };
+    let (_pool, mut e) = engine_on(Model::new(), navi24);
     e.enc_count = 0;
+    if e.jpeg.is_some() || e.jpeg_state != JpegState::Absent {
+        return TestResult::Fail("Navi24 reserved a JPEG owner");
+    }
     if run(e.start(firmware(1), None, &mut NoSram)).is_err()
-        || run(e.start_jpeg()).is_err()
+        || run(e.start_jpeg()) != Err(Error::Busy)
         || run(e.test_ib()).is_err()
         || e.proof.dec_ring != [true, false]
         || e.proof.dec_ib != [2, 0]
         || e.proof.enc_ring != [[false; 2]; 2]
         || e.proof.enc_ib != [[0; 2]; 2]
-        || !e.proof.jpeg_ring
+        || e.proof.jpeg_ring
     {
-        return TestResult::Fail("decode-only VCN/JPEG proofs");
+        return TestResult::Fail("decode-only VCN proofs, or a JPEG start");
+    }
+    let jpeg_regs = [
+        JPEG_CGC_CTRL,
+        JPEG_CGC_GATE,
+        JPEG_POWER_STATUS,
+        JRBC_RB_CNTL,
+        JMI_CNTL,
+    ];
+    let m = &e.hw.io;
+    if m.writes.iter().any(|&(a, x)| {
+        jpeg_regs.iter().any(|&r| a == v(0, r))
+            || (a == v(0, PGFSM_CONFIG) && x & PGFSM_UVDJ_STATUS != 0)
+    }) || m
+        .doorbells
+        .iter()
+        .any(|&(index, _)| index == doorbell::JPEG)
+    {
+        return TestResult::Fail("Navi24 touched the JPEG engine");
+    }
+    let sources = interrupt_sources(Status {
+        state: e.state,
+        jpeg: e.jpeg_state,
+        proof: e.proof,
+    });
+    if sources.contains(&crate::amdgpu_ih_navi22::source::JPEG_DEC)
+        || !sources.contains(&crate::amdgpu_ih_navi22::source::VCN0_DEC)
+    {
+        return TestResult::Fail("Navi24's interrupt routes");
+    }
+    // Every VCN 3.x that Linux pairs with jpeg_v3_0, with and without the
+    // capability bits in the revision.
+    for (version, jpeg) in [
+        ((3, 0, 0), true),
+        ((3, 0, 64), true),
+        ((3, 0, 192), true),
+        ((3, 0, 2), true),
+        ((3, 0, 16), true),
+        ((3, 1, 1), true),
+        ((3, 1, 2), true),
+        ((3, 0, 33), false),
+    ] {
+        if (Layout {
+            vcn_version: version,
+            ..layout(1)
+        })
+        .has_jpeg()
+            != jpeg
+        {
+            return TestResult::Fail("the VCN versions that carry a JPEG engine");
+        }
     }
     for regs in [RB_BASE_LO, RB_BASE_HI, RB_SIZE, RB_RPTR, RB_WPTR] {
         if regs
@@ -1398,7 +1471,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     let mut jpeg_ibs = pool.reserve(JPEG_IB_SLOT * 2).unwrap();
     jpeg_ibs.publish();
     let client = Client {
-        mmhub: 0x1a000,
+        hub: submit::MediaHub::mmhub_v2_0(0x1a000),
         oss: 0x10a0,
         instances: 1,
         jpeg_ibs: Some(jpeg_ibs),
@@ -1432,7 +1505,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     for (k, (seq, words, to)) in frames.iter().enumerate() {
         let want = encode_media(&MediaFrame {
             ring: MediaRing::Dec,
-            mmhub: 0x1a000,
+            hub: submit::MediaHub::mmhub_v2_0(0x1a000),
             engine: 0,
             flush: (k == 0).then_some(vm(true)),
             pasid_map: (k == 0).then_some((0x10a0 + 0x10 + 3, 0x42)),
@@ -2099,4 +2172,398 @@ fn vcn3_failed_gate_closes_video_not_graphics() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22/gate-failure",
     vcn3_failed_gate_closes_video_not_graphics
+);
+
+/// Raphael's VCN: its one VCN 3.1.2 instance, NBIO 7.2 and no HDP read cache.
+/// `vcn_v3_0`/`jpeg_v3_0` key their 3.1.x rules on that version:
+/// `smu_interface_type` 2 in the firmware-shared block, and no
+/// `CC_UVD_HARVESTING` read before JPEG. Navi22's VCN 3.0 keeps neither.
+fn raphael_vcn_layout_and_3_1_x_rules() -> TestResult {
+    let gpu = || {
+        let mut gpu = crate::amdgpu_cp_navi22::tests::raphael_cp_gpu();
+        let mut b = gpu.ip_blocks[0];
+        b.hw_id = ip::HW_ID_VCN;
+        b.instance = 0;
+        (b.major, b.minor, b.revision) = (3, 1, 2);
+        b.num_bases = 2;
+        b.base_addrs[0] = (VCN[0][0] / 4) as u32;
+        b.base_addrs[1] = (VCN[0][1] / 4) as u32;
+        gpu.ip_blocks.push(b);
+        gpu
+    };
+    let Ok((l, banks)) = Layout::resolve_raphael(&gpu(), 1) else {
+        return TestResult::Fail("Raphael VCN layout refused");
+    };
+    if l.vcn != [Some(VCN[0]), None]
+        || (l.gc, l.nbio) != (GC, NBIO)
+        || l.hdp.is_some()
+        || banks.version != (7, 2, 1)
+        || l.vcn_version != (3, 1, 2)
+        || l.smu_interface_type() != Some(2)
+        || l.jpeg_reads_harvesting()
+        || l.liveness() != NBIO + 0xc3 * 4
+    {
+        return TestResult::Fail("Raphael VCN banks or 3.1.2 rules");
+    }
+    let navi22 = layout(1);
+    if navi22.smu_interface_type().is_some()
+        || !navi22.jpeg_reads_harvesting()
+        || navi22.liveness() != HDP + 0xd1 * 4
+    {
+        return TestResult::Fail("Navi22 VCN took a 3.1.x rule");
+    }
+    let mut vcn30 = gpu();
+    vcn30.ip_blocks.last_mut().unwrap().minor = 0;
+    if Layout::resolve_raphael(&gpu(), 3).is_ok()
+        || Layout::resolve_raphael(&vcn30, 1).is_ok()
+        || Layout::resolve(&gpu(), 1).is_ok()
+    {
+        return TestResult::Fail(
+            "Raphael VCN admitted another shape, or the discrete layout took it",
+        );
+    }
+    // Raphael's media clients flush through mmhub_v2_3's registers, on
+    // MMHUB base index 1, and take OSSSYS 5.2.1's IH LUT (navi10_ih keeps
+    // osssys_5_0_0's offsets). The discrete MMHUB 2.1 is not Raphael's.
+    let with_mmhub = |mmhub: (u8, u8, u8)| {
+        let mut gpu = gpu();
+        let mut b = gpu.ip_blocks[0];
+        b.hw_id = ip::HW_ID_MMHUB;
+        b.instance = 0;
+        (b.major, b.minor, b.revision) = mmhub;
+        b.num_bases = 2;
+        b.base_addrs[0] = 0x1a000;
+        b.base_addrs[1] = 0x1b000;
+        gpu.ip_blocks.push(b);
+        gpu
+    };
+    let p = pool(1 << 20);
+    if Client::new(&with_mmhub((2, 3, 0)), &p, 1, true).map(|c| c.hub)
+        != Some(submit::MediaHub::mmhub_v2_3(0x1b000))
+        || Client::new(&with_mmhub((2, 1, 0)), &p, 1, true).is_some()
+    {
+        return TestResult::Fail("Raphael media clients took the wrong MMHUB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-raphael",
+    raphael_vcn_layout_and_3_1_x_rules
+);
+
+/// Raphael's media under `amdgpu.pg_mask`. nv.c's GC 10.3.6 `pg_flags` start
+/// VCN in DPG. Without `AMD_PG_SUPPORT_VCN_DPG` the static path runs, and
+/// with `AMD_PG_SUPPORT_VCN` it powers only UVDM, UVDU and UVDLM on (UVD_PG_EN
+/// set) and, at stop, raises the tiles-off indicator before powering every
+/// tile off. `AMD_PG_SUPPORT_JPEG` powers UVDJ on at the JPEG start and off
+/// at its stop. With `pg_mask=0` every tile is powered on and stays on, and
+/// UVDJ is never commanded.
+fn raphael_media_follows_pg_mask() -> TestResult {
+    use crate::amdgpu_navi22_gating::{pg, RAPHAEL_PG};
+    let all = StaticPg {
+        vcn: true,
+        jpeg_on: true,
+        jpeg_off: true,
+    };
+    let no_jpeg = StaticPg {
+        jpeg_on: false,
+        jpeg_off: false,
+        ..all
+    };
+    if RAPHAEL_PG != pg::GFX_PG | pg::VCN | pg::VCN_DPG | pg::JPEG
+        || (StartMode::linux(RAPHAEL_PG), StaticPg::linux(RAPHAEL_PG)) != (StartMode::Dpg, all)
+        || StartMode::linux(RAPHAEL_PG & !pg::VCN_DPG) != StartMode::Static
+        || StaticPg::linux(RAPHAEL_PG & !pg::JPEG) != no_jpeg
+        || StaticPg::linux(0)
+            != (StaticPg {
+                vcn: false,
+                ..no_jpeg
+            })
+    {
+        return TestResult::Fail("pg_flags to the media owner's policy");
+    }
+    let configs = |m: &Model| -> Vec<u32> {
+        m.writes
+            .iter()
+            .filter(|&&(a, _)| a == v(0, PGFSM_CONFIG))
+            .map(|&(_, value)| value)
+            .collect()
+    };
+    let cycle = |e: &mut Engine<Model>| {
+        run(e.start(firmware(1), None, &mut NoSram)).is_ok()
+            && run(e.start_jpeg()).is_ok()
+            && run(e.test_ib()).is_ok()
+    };
+    let (_pool, mut e) = engine(Model::new(), 1);
+    e.pg = StaticPg::linux(RAPHAEL_PG & !pg::VCN_DPG);
+    if !cycle(&mut e)
+        || configs(&e.hw.io) != [PGFSM_VCN_PG_ON, PGFSM_UVDJ_ON]
+        || e.hw.io.reg(v(0, POWER_STATUS)) != POWER_PG_EN | POWER_UVDM_UVDU_ON
+    {
+        return TestResult::Fail("static power-up with AMD_PG_SUPPORT_VCN");
+    }
+    let from = e.hw.io.writes.len();
+    if run(e.stop()).is_err() {
+        return TestResult::Fail("static stop with AMD_PG_SUPPORT_VCN");
+    }
+    let m = &e.hw.io;
+    let at = |want: (u64, u32)| m.writes[from..].iter().position(|&w| w == want);
+    let (indicator, off) = (
+        at((v(0, POWER_STATUS), POWER_PG_EN | POWER_TILES_OFF)),
+        at((v(0, PGFSM_CONFIG), PGFSM_ALL_OFF)),
+    );
+    if configs(m)[2..] != [PGFSM_UVDJ_OFF, PGFSM_ALL_OFF]
+        || !matches!((indicator, off), (Some(a), Some(b)) if a < b)
+        || m.reg(v(0, PGFSM_STATUS)) & PGFSM_STATUS_MASK != PGFSM_ALL_OFF
+        || m.reg(v(0, PGFSM_STATUS)) & PGFSM_UVDJ_STATUS != PGFSM_UVDJ_OFF
+    {
+        return TestResult::Fail("static power-down with AMD_PG_SUPPORT_VCN and JPEG");
+    }
+    // pg_mask=0: UVDJ is never commanded, so it must already be on.
+    let mut model = Model::new();
+    model
+        .regs
+        .insert(v(0, PGFSM_STATUS), 0xaaaa_aaaa & !PGFSM_UVDJ_STATUS);
+    let (_pool, mut e) = engine(model, 1);
+    e.pg = StaticPg::linux(0);
+    if !cycle(&mut e)
+        || run(e.stop()).is_err()
+        || configs(&e.hw.io) != [PGFSM_ALL_ON]
+        || e.hw.io.reg(v(0, POWER_STATUS)) != 0
+        || e.hw.io.reg(v(0, PGFSM_STATUS)) & PGFSM_STATUS_MASK != 0
+    {
+        return TestResult::Fail("pg_mask=0 power gated a media tile");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/vcn-raphael", raphael_media_follows_pg_mask);
+
+/// Raphael's media clock gating under `amdgpu.cg_mask`. nv.c's GC 10.3.6
+/// `cg_flags` carry VCN_MGCG and JPEG_MGCG. Without VCN_MGCG:
+/// - the static start clears UVD_CGC_CTRL's DYN_CLOCK_MODE;
+/// - the static stop leaves it as read (`vcn_v3_0_enable_clock_gating`
+///   ORs in 0);
+/// - the DPG register list writes it clear.
+///
+/// Without JPEG_MGCG the JPEG start leaves JPEG_CGC_CTRL's DYN_CLOCK_MODE
+/// as read: Linux's clear masks with the field's shift, which is 0.
+fn raphael_media_clock_gating_follows_cg_mask() -> TestResult {
+    use crate::amdgpu_navi22_gating::{cg, RAPHAEL_CG};
+    let off = Mgcg {
+        vcn: false,
+        jpeg: false,
+    };
+    if Mgcg::linux(RAPHAEL_CG) != Mgcg::NAVI22
+        || Mgcg::linux(RAPHAEL_CG & !cg::VCN_MGCG)
+            != (Mgcg {
+                vcn: false,
+                ..Mgcg::NAVI22
+            })
+        || Mgcg::linux(RAPHAEL_CG & !cg::JPEG_MGCG)
+            != (Mgcg {
+                jpeg: false,
+                ..Mgcg::NAVI22
+            })
+        || Mgcg::linux(RAPHAEL_CG & u64::from(0u32)) != off
+    {
+        return TestResult::Fail("cg_flags to the media owner's clock gating");
+    }
+    let mut model = Model::new();
+    model
+        .regs
+        .insert(v(0, CGC_CTRL), 0x1fc0_0000 | CGC_DYN_CLOCK_MODE);
+    model
+        .regs
+        .insert(v(0, JPEG_CGC_CTRL), JPEG_CGC_DYN_CLOCK_MODE);
+    let (_pool, mut e) = engine(model, 1);
+    e.cg = off;
+    if run(e.start(firmware(1), None, &mut NoSram)).is_err()
+        || run(e.start_jpeg()).is_err()
+        || run(e.test_ib()).is_err()
+        || e.hw.io.reg(v(0, CGC_CTRL)) != CGC_CTRL_DYN & !CGC_DYN_CLOCK_MODE
+        || e.hw.io.reg(v(0, JPEG_CGC_CTRL)) != JPEG_CGC_CTRL_DYN
+    {
+        return TestResult::Fail("static and JPEG starts without MGCG");
+    }
+    let dyn_set = e.hw.io.reg(v(0, CGC_CTRL)) | CGC_DYN_CLOCK_MODE;
+    e.hw.io.regs.insert(v(0, CGC_CTRL), dyn_set);
+    if run(e.stop()).is_err() || e.hw.io.reg(v(0, CGC_CTRL)) != CGC_CTRL_DYN | CGC_CTRL_MODES {
+        return TestResult::Fail("the static stop without VCN_MGCG cleared DYN_CLOCK_MODE");
+    }
+    let list = |mgcg| dpg_list(layout(1), 0, 0x8_0000_0000, GB_ADDR, mgcg);
+    let (on, without) = (list(true), list(false));
+    if on[..2] != [0x0a, CGC_CTRL_DYN]
+        || without[..2] != [0x0a, CGC_CTRL_DYN & !CGC_DYN_CLOCK_MODE]
+        || on[2..] != without[2..]
+    {
+        return TestResult::Fail("DPG clock gating without VCN_MGCG");
+    }
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    e.cg = off;
+    if run(e.start(firmware(1), None, &mut psp)).is_err()
+        || e.hw.io.sram.borrow()[&0][..2] != without[..2]
+    {
+        return TestResult::Fail("the DPG start ignored the owner's clock gating");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-raphael",
+    raphael_media_clock_gating_follows_cg_mask
+);
+
+/// A media ring's VM flush names its hub's registers: on MMHUB 2.0/2.1
+/// (Navi22) CONTEXT0 PTB 0x72b and ENG0 SEM/REQ/ACK 0x6d1/0x6e3/0x6f5 with
+/// strides 2 and 1; on MMHUB 2.3 (Raphael) 0x940 and 0xa00/0xa01/0xa02 with
+/// strides 8 (`gmc_v10_0_emit_flush_gpu_tlb` over `adev->vmhub`).
+fn media_flush_follows_the_hub_registers() -> TestResult {
+    use crate::amdgpu_navi22_submit::{encode_media, Ib, MediaFrame, MediaRing, VmRef};
+    let ibs = [Ib {
+        va: 0x7000_0010_0000,
+        dwords: 16,
+        flags: 0,
+    }];
+    let (vmid, engine, base) = (5u32, 3u32, 0x1b000u32);
+    let frame = |hub| {
+        encode_media(&MediaFrame {
+            ring: MediaRing::Dec,
+            hub,
+            engine,
+            flush: Some(VmRef {
+                vmid: vmid as u8,
+                page_table_base: 0x1_2345_6001,
+                pasid: 0x42,
+                flush: true,
+                map_pasid: false,
+            }),
+            pasid_map: None,
+            vmid: vmid as u8,
+            ibs: &ibs,
+            fence: 0x4000,
+            seq: 1,
+            ring_base: 0x8000,
+        })
+    };
+    // vcn_v2_0_dec_ring_emit_wreg/reg_wait carry the register as `reg << 2`.
+    let names = |words: &[u32], regs: [u32; 5]| regs.iter().all(|r| words.contains(&(r << 2)));
+    let mm20 = [
+        base + 0x6d1 + engine,
+        base + 0x72b + 2 * vmid,
+        base + 0x72c + 2 * vmid,
+        base + 0x6e3 + engine,
+        base + 0x6f5 + engine,
+    ];
+    let mm23 = [
+        base + 0xa00 + 8 * engine,
+        base + 0x940 + 8 * vmid,
+        base + 0x941 + 8 * vmid,
+        base + 0xa01 + 8 * engine,
+        base + 0xa02 + 8 * engine,
+    ];
+    let navi22 = frame(submit::MediaHub::mmhub_v2_0(base));
+    let raphael = frame(submit::MediaHub::mmhub_v2_3(base));
+    if !names(&navi22, mm20)
+        || !names(&raphael, mm23)
+        || mm20.iter().any(|r| raphael.contains(&(r << 2)))
+    {
+        return TestResult::Fail("media flush named another hub's registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-raphael",
+    media_flush_follows_the_hub_registers
+);
+
+/// Re-armed after a reset (a fresh model), VCN and JPEG start and pass their
+/// tests again on the instance and JPEG buffers they already hold, every
+/// sequence from zero.
+fn vcn_navi22_rearm_restarts_the_same_rings() -> TestResult {
+    let up = |e: &mut Engine<Model>| {
+        run(e.start(firmware(1), None, &mut NoSram)).is_ok()
+            && run(e.start_jpeg()).is_ok()
+            && run(e.test_ib()).is_ok()
+    };
+    let seqs = |e: &Engine<Model>| {
+        let vcn = e.vcn[0].as_ref().unwrap();
+        let jpeg = e.jpeg.as_ref().unwrap();
+        [vcn.dec.seq, vcn.enc[0].seq, vcn.enc[1].seq, jpeg.ring.seq]
+    };
+    let (pool, mut e) = engine(Model::new(), 1);
+    if !up(&mut e) {
+        return TestResult::Fail("first media bring-up");
+    }
+    let (states, before, free) = ((e.state, e.jpeg_state), seqs(&e), pool.available());
+    // SAFETY: the model is replaced below, as a device reset would.
+    unsafe { e.rearm() };
+    if (e.state, e.jpeg_state) != (State::Prepared, JpegState::Prepared) || seqs(&e) != [0; 4] {
+        return TestResult::Fail("re-arm kept the last run's state");
+    }
+    e.hw.io = Model::new();
+    if !up(&mut e)
+        || (e.state, e.jpeg_state) != states
+        || seqs(&e) != before
+        || pool.available() != free
+    {
+        return TestResult::Fail("re-armed media differs or reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_rearm_restarts_the_same_rings
+);
+
+/// `vcn_v3_0_suspend`, then a resume: the VCPU BO saved after the stop goes
+/// back at the next start even onto memory the reset lost, so a firmware
+/// session survives. A start with nothing saved zeroes what the memory kept.
+fn vcn_navi22_suspend_carries_the_vcpu_bo_to_the_next_start() -> TestResult {
+    const SESSION_WORD: u64 = CONTEXT + 0x100; // linux: n/a (test session word)
+    const SESSION: u32 = 0x5e55_1011; // linux: n/a (test pattern)
+    let up = |e: &mut Engine<Model>| {
+        run(e.start(firmware(1), None, &mut NoSram)).is_ok()
+            && run(e.start_jpeg()).is_ok()
+            && run(e.test_ib()).is_ok()
+    };
+    let (_pool, mut e) = engine(Model::new(), 1);
+    if run(e.suspend()) != Err(Error::Busy) {
+        return TestResult::Fail("an unstarted owner saved its BO");
+    }
+    if !up(&mut e) {
+        return TestResult::Fail("first media bring-up");
+    }
+    let map = e.vcn[0].as_ref().unwrap().memory.mapping();
+    // State the firmware keeps for an open session.
+    e.hw.io.mem.insert(mc(map, SESSION_WORD), SESSION);
+    let saved = |e: &Engine<Model>| e.vcn[0].as_ref().unwrap().saved.as_ref().map(|s| s.len());
+    if run(e.suspend()).is_err()
+        || e.state != State::Stopped
+        || saved(&e) != Some((VCPU_BYTES / 4) as usize)
+    {
+        return TestResult::Fail("suspend did not stop and save the VCPU BO");
+    }
+    // SAFETY: the model is replaced below, as the S3 power-off would.
+    unsafe { e.rearm() };
+    // The model lost its memory: only the saved copy has the session.
+    e.hw.io = Model::new();
+    if !up(&mut e)
+        || e.hw.io.word(mc(map, SESSION_WORD)) != SESSION
+        || e.hw.io.word(mc(map, SHARED + shared::PRESENT_FLAG_0)) != shared::PRESENT
+        || !e.sessions_restored()
+        || saved(&e).is_some()
+    {
+        return TestResult::Fail("the saved VCPU BO did not come back once");
+    }
+    // SAFETY: as above.
+    unsafe { e.rearm() };
+    e.hw.io = Model::new();
+    e.hw.io.mem.insert(mc(map, SESSION_WORD), SESSION);
+    if !up(&mut e) || e.hw.io.word(mc(map, SESSION_WORD)) != 0 || e.sessions_restored() {
+        return TestResult::Fail("a start with nothing saved kept the old context");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22",
+    vcn_navi22_suspend_carries_the_vcpu_bo_to_the_next_start
 );

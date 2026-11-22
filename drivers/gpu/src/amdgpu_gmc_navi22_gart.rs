@@ -50,6 +50,19 @@ pub(super) struct Gart {
     enabled: bool,
 }
 impl Gart {
+    /// Whether only the boot pages are in use: no GTT binding is live or
+    /// quarantined, so nothing would lose its entries when `enable_gart`
+    /// zeroes the table again.
+    pub(super) fn only_boot_pages(&self) -> bool {
+        (0..self.used.len() as u64 * 64)
+            .filter(|&page| self.used[(page / 64) as usize] & (1 << (page % 64)) != 0)
+            .all(|page| page < BOOT_PAGES)
+    }
+    /// Disabled on the same table; `enable_gart` zeroes it and maps the boot
+    /// pages again.
+    pub(super) fn rearm(&mut self) {
+        self.enabled = false;
+    }
     pub(super) fn info(&self) -> Option<GartInfo> {
         self.enabled.then_some(self.info)
     }
@@ -223,7 +236,7 @@ impl<I: Io> Engine<I> {
         let table = geometry.physical(info.table) | PTE_VALID;
         let root = geometry.physical(gart.empty_root()) | PTE_VALID;
         invoke(authority, io, |io| {
-            for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
+            for (base, r) in layout.bases.into_iter().zip(layout.hubs) {
                 // init_gart_aperture_regs: PDE-form table base, page numbers.
                 pair(io, base, r.pt_base, table);
                 pair(io, base, r.pt_start, info.start >> 12);
@@ -233,21 +246,16 @@ impl<I: Io> Engine<I> {
                 // contexts at an all-invalid root so stray use only faults.
                 for step in 1..16u32 {
                     // linux: n/a (VMIDs 1..15, setup_vmid_config i <= 14)
-                    pair(io, base, r.pt_base + step * regs::CTX_ADDR_DISTANCE, root);
+                    pair(io, base, r.pt_base + step * r.ctx_addr_distance, root);
                     update(
                         io,
                         base,
-                        r.ctx + step * regs::CTX_DISTANCE,
+                        r.ctx + step * r.ctx_distance,
                         CTX_MASK,
                         CTX_VALUE | irqs,
                     )?;
-                    pair(io, base, r.pt_start + step * regs::CTX_ADDR_DISTANCE, 0);
-                    pair(
-                        io,
-                        base,
-                        r.pt_end + step * regs::CTX_ADDR_DISTANCE,
-                        MAX_PFN - 1,
-                    );
+                    pair(io, base, r.pt_start + step * r.ctx_addr_distance, 0);
+                    pair(io, base, r.pt_end + step * r.ctx_addr_distance, MAX_PFN - 1);
                 }
             }
             Ok(())

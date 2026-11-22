@@ -286,14 +286,23 @@ impl Registers {
             crq_expansion_mode: 1,
         };
 
-        // MIN_DST_Y_NEXT_START follows DML's final pass, which uses the maximum
-        // VStartup rather than the one the prefetch search settled on. A larger
-        // VStartup moves the next frame's fetch earlier, so this is the
-        // conservative choice of the two.
-        let min_dst_y_next_start = (config.timing.v_total as u64 + config.timing.v_total as u64)
-            .saturating_sub(config.timing.v_front_porch as u64)
-            .saturating_sub(config.timing.v_active as u64)
-            .saturating_sub(prefetch.max_v_startup as u64);
+        // DCN 3.1.4: MIN_DST_Y_NEXT_START follows DML's final pass, which
+        // uses the maximum VStartup rather than the one the prefetch search
+        // settled on. A larger VStartup moves the next frame's fetch earlier,
+        // so this is the conservative choice of the two.
+        // DCN 3.1.5: display_rq_dlg_calc_31.c ignores the VBA value and
+        // programs the vblank start, `v_total - v_front_porch`
+        // (`dest.vblank_start`, dcn20_fpu.c).
+        let min_dst_y_next_start = match config.dcn {
+            crate::amdgpu_dml::Dcn::Dcn314 => (config.timing.v_total as u64
+                + config.timing.v_total as u64)
+                .saturating_sub(config.timing.v_front_porch as u64)
+                .saturating_sub(config.timing.v_active as u64)
+                .saturating_sub(prefetch.max_v_startup as u64),
+            crate::amdgpu_dml::Dcn::Dcn315 => {
+                (config.timing.v_total as u64).saturating_sub(config.timing.v_front_porch as u64)
+            }
+        };
         let vready_sum = (prefetch.v_ready_offset_pix
             + prefetch.v_update_width_pix
             + prefetch.v_update_offset_pix) as u64;

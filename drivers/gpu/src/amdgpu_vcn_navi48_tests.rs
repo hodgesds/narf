@@ -725,7 +725,11 @@ fn power() -> crate::amdgpu_smu_navi48::PowerStatus {
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
-    narf_scheduler::block_on_spin(future)
+    // Boxed: block_on_spin holds its future by value, and the largest of
+    // these engine futures put block_on_inner past the kernel frame budget
+    // in some builds and under it in others (the budget counts that generic
+    // frame whatever calls it).
+    narf_scheduler::block_on_spin(alloc::boxed::Box::pin(future))
 }
 
 fn vcn5_static_boot_windows_fence_and_retirement_follow_linux() -> TestResult {

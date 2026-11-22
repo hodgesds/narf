@@ -651,3 +651,54 @@ kernel_test_in!(
     "drivers/gpu/psp-ring",
     psp_navi48_interrupted_upload_preserves_ownership
 );
+
+/// Raphael's PMFW is BIOS-resident: its session refuses an SMC upload, sends
+/// the graphics set after the TMR alone — Linux's UCODE_ID order, RLC autoload
+/// straight after RLC_G — and then waits for the RLC boot as Navi22's does.
+/// Stopping keeps it resident rather than awaiting an SMC.
+fn psp_raphael_graphics_loads_beside_resident_pmfw() -> TestResult {
+    let firmware = crate::amdgpu_gfx_navi22::tests::raphael_fixture();
+    let images = firmware.images().unwrap();
+    let (pool, mut s) = session();
+    s.smc_resident = true;
+    run(s.engine.start()).unwrap();
+    run(s.setup_tmr_payload(None)).unwrap();
+    let sent = s.engine.io.submissions.len();
+    if run(s.load_smc(&[1, 2, 3, 4])) != Err(Error::Unsupported)
+        || run(s.load_smc_centralized(&[1, 2, 3, 4])) != Err(Error::Unsupported)
+        || s.engine.io.submissions.len() != sent
+    {
+        return TestResult::Fail("SMC upload attempted beside resident PMFW");
+    }
+    if run(s.load_gfx(&images)).is_err() || s.gfx_state != GfxLoadState::Accepted {
+        return TestResult::Fail("graphics set refused beside resident PMFW");
+    }
+    let commands = &s.engine.io.submissions[sent..];
+    let autoload = commands.iter().position(|c| c[2] == 0x21);
+    // 19 payloads with MEC2. The autoload follows RLC_G, the RLC container's
+    // last (17th) payload, ahead of VCN and DMCUB.
+    if commands.len() != 20 || autoload != Some(17) || s.media_firmware.dmcub.is_none() {
+        return TestResult::Fail("Raphael graphics order or autoload differs from Navi22's");
+    }
+    s.engine.io.gfx_samples = vec![GfxBootStatus {
+        cp_stat: 0,
+        rlc_bootload: 1 << 31,
+    }];
+    if run(s.wait_gfx_boot()).is_err() || s.gfx_state != GfxLoadState::BootComplete {
+        return TestResult::Fail("RLC boot wait refused beside resident PMFW");
+    }
+    // SAFETY: no real firmware consumers in the model.
+    unsafe { run(s.stop()) }.unwrap();
+    if !s.smc_resident || run(s.load_smc(&[1, 2, 3, 4])) != Err(Error::Unsupported) {
+        return TestResult::Fail("stopped Raphael session expects an SMC");
+    }
+    drop(s);
+    if pool.available() != 16 << 20 {
+        return TestResult::Fail("Raphael graphics session leaked after verified stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_raphael_graphics_loads_beside_resident_pmfw
+);

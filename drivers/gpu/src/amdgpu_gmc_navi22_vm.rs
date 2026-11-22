@@ -318,6 +318,14 @@ pub(super) struct Vms {
     lent: u16,
 }
 impl Vms {
+    /// Whether no VM holds a slot.
+    pub(super) fn idle(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+    /// No VMID lent: a re-armed owner lends them again.
+    pub(super) fn rearm(&mut self) {
+        self.lent = 0;
+    }
     pub(super) fn new() -> Self {
         Self {
             slots: core::array::from_fn(|_| None),
@@ -456,11 +464,11 @@ impl<I: Io> Engine<I> {
     fn set_base(&mut self, vmid: u8, value: u64) -> Result<(), Error> {
         let layout = self.layout;
         self.access(|io| {
-            for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
+            for (base, r) in layout.bases.into_iter().zip(layout.hubs) {
                 pair(
                     io,
                     base,
-                    r.pt_base + u32::from(vmid) * regs::CTX_ADDR_DISTANCE,
+                    r.pt_base + u32::from(vmid) * r.ctx_addr_distance,
                     value,
                 );
             }
@@ -703,10 +711,12 @@ impl<I: Io> Engine<I> {
             // linux: n/a (16 VMIDs)
             return Err(Error::Invalid);
         }
-        let (index, r) = match fault.hub {
-            Hub::Gfx => (0, GFX),
-            Hub::Mm => (1, MM),
+        let index = match fault.hub {
+            Hub::Gfx => 0,
+            Hub::Mm => 1,
         };
+        // The hub's own table: MMHUB 2.3 (Raphael) moved its fault registers.
+        let r = self.layout.hubs[index];
         let base = self.layout.bases[index];
         let status = self.access(|io| {
             let status = checked(io.read(base + u64::from(r.fault_status) * 4))?;
@@ -761,7 +771,8 @@ impl<I: Io> Engine<I> {
         }
         let layout = self.layout;
         self.access(|io| {
-            for (base, r) in [(layout.bases[1], MM), (layout.bases[0], GFX)] {
+            for index in [1, 0] {
+                let (base, r) = (layout.bases[index], layout.hubs[index]);
                 update(
                     io,
                     base,
@@ -776,7 +787,7 @@ impl<I: Io> Engine<I> {
                     update(
                         io,
                         base,
-                        r.ctx + context * regs::CTX_DISTANCE,
+                        r.ctx + context * r.ctx_distance,
                         CTX_FAULT_IRQS,
                         if enable { CTX_FAULT_IRQS } else { 0 },
                     )?;

@@ -462,6 +462,11 @@ pub struct Loader {
     psp: Option<crate::amdgpu_psp_ring::Psp>,
     signed_instructions: Vec<u8>,
     toc: Vec<u8>,
+    dpias: u8,
+    /// Raphael's graphics set, loaded through the PSP in place of DMCUB alone.
+    graphics: Option<crate::amdgpu_gfx_navi22::Firmware>,
+    /// The graphics set was accepted and the RLC autoload completed.
+    graphics_booted: bool,
 }
 impl Loader {
     /// Provision firmware storage using VBIOS reservations, current DMUB
@@ -506,7 +511,7 @@ impl Loader {
         pool: &Pool,
         prepared: &Prepared<'_>,
     ) -> Result<Self, Error> {
-        let ip = amdgpu_dmub::dcn314_ip(gpu).map_err(|_| Error::Unsupported)?;
+        let ip = amdgpu_dmub::dcn31x_ip(gpu).map_err(|_| Error::Unsupported)?;
         if ip.num_bases < 3 {
             return Err(Error::Unsupported);
         }
@@ -592,6 +597,9 @@ impl Loader {
             transport: None,
             ownership: Some(ownership),
             psp: None,
+            dpias: amdgpu_dmub::dpia_count(ip),
+            graphics: None,
+            graphics_booted: false,
             signed_instructions: Vec::new(),
             toc: Vec::new(),
         })
@@ -639,6 +647,88 @@ impl Loader {
     pub fn state(&self) -> State {
         self.engine.state
     }
+    /// Load Raphael's whole graphics set through this loader's PSP session at
+    /// `boot`, in place of DMCUB alone, as Linux's `psp_load_non_psp_fw` does
+    /// for every non-PSP firmware (SDMA, CE, PFP, ME, MEC, MEC2, RLC with its
+    /// autoload, VCN, DMCUB). The set's DMCUB payload must be the signed
+    /// instructions this loader prepared, so the DMUB boot that follows runs
+    /// exactly what the display path validated.
+    pub fn set_graphics(
+        &mut self,
+        graphics: crate::amdgpu_gfx_navi22::Firmware,
+    ) -> Result<(), Error> {
+        use crate::amdgpu_gfx_firmware::Source;
+        if self.psp.is_none() || self.engine.state != State::Prepared || self.graphics.is_some() {
+            return Err(Error::Busy);
+        }
+        if graphics.profile() != &crate::amdgpu_rdna2::RAPHAEL {
+            return Err(Error::Unsupported);
+        }
+        let images = graphics.images().map_err(|_| Error::Invalid)?;
+        let dmcub = Source::ORDER
+            .iter()
+            .position(|s| *s == Source::Dmcub)
+            .and_then(|i| images[i])
+            .and_then(|image| image.payloads().next())
+            .ok_or(Error::Invalid)?;
+        if dmcub.bytes() != self.signed_instructions.as_slice() {
+            return Err(Error::Invalid);
+        }
+        self.graphics = Some(graphics);
+        Ok(())
+    }
+    /// `AMDGPU_INFO_FW_VERSION`'s view of the graphics set this loader holds:
+    /// its CP, RLC, SDMA, VCN and DMCUB headers, and the TOC its PSP session
+    /// took. SOS is the BIOS's, which Linux reports as 0.
+    pub(crate) fn graphics_versions(&self) -> Option<crate::amdgpu_info_navi22::Firmware> {
+        use crate::amdgpu_gfx_firmware::Source;
+        let set = self.graphics.as_ref()?;
+        let g = |source| set.source_bytes(source);
+        crate::amdgpu_info_navi22::Firmware::parse(&crate::amdgpu_info_navi22::Files {
+            me: g(Source::Me)?,
+            pfp: g(Source::Pfp)?,
+            ce: g(Source::Ce)?,
+            mec: g(Source::Mec)?,
+            mec2: g(Source::Mec2),
+            rlc: g(Source::Rlc)?,
+            sdma: g(Source::Sdma)?,
+            sos: None,
+            toc: (!self.toc.is_empty()).then_some(self.toc.as_slice()),
+            vcn: g(Source::Vcn)?,
+            dmcub: g(Source::Dmcub)?,
+        })
+        .ok()
+    }
+    /// The PSP session that loaded VCN, for its later power transitions (DPG
+    /// register lists after an idle gate). Only after a graphics boot.
+    pub(crate) fn media_psp(&mut self) -> Option<&mut crate::amdgpu_psp_ring::Psp> {
+        if !self.graphics_booted {
+            return None;
+        }
+        self.psp.as_mut()
+    }
+    /// Whether `boot` loaded the graphics set and the RLC autoload completed.
+    pub fn graphics_booted(&self) -> bool {
+        self.graphics_booted
+    }
+    /// After a graphics boot, what VCN's start needs from the PSP session
+    /// that loaded it: the session itself (for the DPG register lists it
+    /// writes into VCN's SRAM), the VCN TMR addresses it recorded, and the
+    /// VCN container's size, which sizes VCPU cache window 0.
+    pub(crate) fn media(
+        &mut self,
+    ) -> Option<(
+        &mut crate::amdgpu_psp_ring::Psp,
+        crate::amdgpu_psp_ring::MediaFirmware,
+        usize,
+    )> {
+        if !self.graphics_booted {
+            return None;
+        }
+        let size = self.graphics.as_ref()?.vcn_size()?;
+        let firmware = self.psp.as_ref()?.media_firmware();
+        Some((self.psp.as_mut()?, firmware, size))
+    }
     pub async fn boot(&mut self, options: BootOptions) -> Result<(), Error> {
         if self.psp.is_some() {
             if !matches!(self.engine.state, State::Prepared | State::Stopped) {
@@ -650,9 +740,17 @@ impl Loader {
             let psp = self.psp.as_mut().unwrap();
             psp.start().await.map_err(Error::Psp)?;
             psp.setup_tmr(&self.toc).await.map_err(Error::Psp)?;
-            psp.load_dmub(&self.signed_instructions)
-                .await
-                .map_err(Error::Psp)?;
+            match self.graphics.as_ref() {
+                Some(graphics) => {
+                    psp.load_gfx_rdna2(graphics).await.map_err(Error::Psp)?;
+                    psp.wait_gfx_boot_rdna2().await.map_err(Error::Psp)?;
+                    self.graphics_booted = true;
+                }
+                None => psp
+                    .load_dmub(&self.signed_instructions)
+                    .await
+                    .map_err(Error::Psp)?,
+            }
             self.engine.state = State::Stopped;
         }
         self.engine.boot(options).await?;
@@ -662,7 +760,7 @@ impl Loader {
             .authority
             .invoke(IoOp(|| {
                 // SAFETY: this loader owns the verified running DCN314 and all mappings.
-                unsafe { Dmub::attach_regions(io.regs, self.fb, io.base) }
+                unsafe { Dmub::attach_regions(io.regs, self.fb, io.base, self.dpias) }
             }))
             .map_err(|_| Error::Revoked)
             .and_then(|result| result.map_err(Error::Transport));
@@ -678,10 +776,36 @@ impl Loader {
         }
     }
     pub async fn stop(&mut self) -> Result<(), Error> {
+        // Releasing the TMR needs every engine running from it reset. After a
+        // graphics boot the RLC and CP do, and nothing here resets them, so
+        // the loader stays up (and a suspend is refused) rather than pull the
+        // TMR from under them.
+        if self.graphics_booted {
+            return Err(Error::Busy);
+        }
         self.transport = None;
         self.engine.stop().await?;
         if let Some(psp) = self.psp.as_mut() {
             // SAFETY: verified DMCUB reset precedes release of its secure TMR.
+            unsafe { psp.stop().await }.map_err(Error::Psp)?;
+        }
+        Ok(())
+    }
+    /// `psp_suspend` ahead of a mode 2 reset: DMUB stopped, then the TMR
+    /// released and the PSP ring stopped while the RLC and CP still run from
+    /// the TMR, as Linux's suspend before the reset does. A later `boot`
+    /// loads the graphics set again.
+    ///
+    /// # Safety
+    /// The caller resets every engine running from the TMR (mode 2) before
+    /// anything else runs, and boots this loader again before the display or
+    /// graphics are used.
+    pub(crate) async unsafe fn stop_for_reset(&mut self) -> Result<(), Error> {
+        self.graphics_booted = false;
+        self.transport = None;
+        self.engine.stop().await?;
+        if let Some(psp) = self.psp.as_mut() {
+            // SAFETY: DMCUB is reset above; the caller resets the rest.
             unsafe { psp.stop().await }.map_err(Error::Psp)?;
         }
         Ok(())

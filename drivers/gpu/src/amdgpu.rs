@@ -27,9 +27,10 @@
 //! | VID / DID | family             | board              |
 //! |-----------|--------------------|--------------------|
 //! | 1002:1900 | Phoenix HawkPoint1 | Ryzen 7 PRO 8840HS iGPU (the user's laptop) |
-//! | 1002:15BF | Strix Point        | Ryzen AI 9 HX 370 iGPU |
-//! | 1002:164E | Raphael            | Ryzen 7000 iGPU |
-//! | 1002:1681 | Phoenix discrete   | mobile-only Phoenix d-iGPU |
+//! | 1002:15BF | Phoenix1           | Ryzen 7040 iGPU (Radeon 780M) |
+//! | 1002:150E | Strix Point        | Ryzen AI 9 HX 370 iGPU |
+//! | 1002:164E | Raphael            | Ryzen 7000 / 9000 desktop, 7045HX iGPU |
+//! | 1002:1681 | Rembrandt          | Ryzen 6000 iGPU (Radeon 680M) |
 //! | 1002:13F9 | Cezanne            | Ryzen 5000 iGPU |
 //! | 1002:1638 | Renoir             | Ryzen 4000 iGPU |
 //! | 1002:73DF | Navi 22 (RX 6750)  | RDNA2 desktop |
@@ -116,13 +117,25 @@ pub const PHOENIX2: u16 = 0x15C8;
 /// Strix Point (Radeon 880M / 890M). GFX **11.5.0**, DCN **3.5**,
 /// PSP 14.0.1 — a different IP stack from Phoenix, not a Phoenix variant.
 pub const STRIX_POINT: u16 = 0x150E;
-/// Rembrandt (Radeon 680M, Ryzen 6000 series). GFX **10.3.6**, DCN 3.1.2 —
-/// RDNA2, one whole architecture before Phoenix.
+/// Rembrandt (Radeon 680M, Ryzen 6000 series). GFX **10.3.3**
+/// (`AMDGPU_FAMILY_YC`, "yellow_carp"), DCN 3.1.2 — RDNA2, one whole
+/// architecture before Phoenix.
+///
+/// Was documented as GFX 10.3.6, which is Raphael's GC.
 ///
 /// Was labelled `PHOENIX_DISCRETE` and mapped to the Phoenix family and
 /// firmware. It is neither discrete nor Phoenix.
 pub const REMBRANDT: u16 = 0x1681;
-/// Raphael.
+/// Raphael — the Zen4 desktop iGPU ("AMD Radeon Graphics", 2 CU): Ryzen
+/// 7000 desktop, Ryzen 7045HX (Dragon Range), and Ryzen 9000 (Granite Ridge),
+/// which reuses the same graphics die under the same id.
+///
+/// GFX **10.3.6** (`AMDGPU_FAMILY_GC_10_3_6`), DCN **3.1.5**, PSP **13.0.5**,
+/// SMU 13.0.5, SDMA 5.2.6, VCN 3.1.2 — RDNA2, per `amdgpu_discovery.c`.
+///
+/// This is *not* the Ryzen 7040 mobile part: that is Phoenix ([`PHOENIX1`]),
+/// RDNA3. Raphael was mapped to `Family::Navi3` and so given GFX11 register
+/// tables and VCN 4.0.5; neither is its silicon.
 pub const RAPHAEL: u16 = 0x164E;
 /// Lucienne — Renoir refresh / low-cost variant (Ryzen 5000U some
 /// SKUs). Same GFX9 + DCN 2.0 IP set as Renoir; uses the same
@@ -259,12 +272,10 @@ pub enum Family {
     Navi2,
     /// Navi 3x — RDNA3 (RX 7000-series desktop, Navi31/32/33).
     Navi3,
-    /// Phoenix / HawkPoint / Strix-Point — Zen4/Zen5 APUs whose
-    /// display IP is DCN 3.5 (RDNA 3.5 iGPU). Kept distinct from
-    /// `Navi3` because the DCN 3.5 modeset register layout differs
-    /// from DCN 3.2 (Navi31): OTG block has shifted V_BLANK /
-    /// V_SYNC / OTG_CONTROL / INTERRUPT_CONTROL offsets per
-    /// `drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_3_5_0_offset.h`.
+    /// Phoenix / HawkPoint — Zen4 APUs, GFX 11.0.1 with DCN 3.1.4
+    /// (`dcn_3_1_4_offset.h`). Kept distinct from `Navi3` because the
+    /// DCN 3.1.4 register layout differs from DCN 3.2 (Navi31). Strix
+    /// (GFX 11.5 / DCN 3.5) is held here only so it is refused, never driven.
     Phoenix,
     /// Navi 4x — RDNA4. Separate from both the RDNA3 APUs and Navi3.
     Navi4,
@@ -588,6 +599,36 @@ static STRIX_FW: &[FwEntry] = &[
     FwEntry::ta("amdgpu/psp_14_0_1_ta.bin"),
 ];
 
+/// Raphael — GFX **10.3.6**, DCN **3.1.5**, PSP **13.0.5**, SDMA 5.2.6,
+/// VCN 3.1.2.
+///
+/// Every name is Linux's `MODULE_FIRMWARE` for this IP set: `psp_v13_0.c`
+/// (TOC + TA, the same 13.0.x APU shape as Phoenix's 13.0.4), `gfx_v10_0.c`,
+/// `sdma_v5_2.c`, `amdgpu_vcn.c` (`FIRMWARE_VCN_3_1_2`) and
+/// `amdgpu_dm_dmub.h` (`FIRMWARE_DCN_315_DMUB`). GFX10 still has the CE and
+/// a separate MEC2 image, and no MES or IMU.
+///
+/// Order is `enum AMDGPU_UCODE_ID`: SDMA0, CP_CE, CP_PFP, CP_ME, CP_MEC1,
+/// CP_MEC2, RLC_G, VCN, DMCUB — the order `psp_load_non_psp_fw` sends them
+/// in. No SMU entry: an APU's PMFW is BIOS-resident.
+// Unused: the mapping routes Raphael to `UNAUDITED_FW` until its graphics
+// bring-up exists; the PSP 13.0.5 ring loads only the display's TOC and DMCUB
+// (`amdgpu_platform`). Kept correct so that work starts from Linux's names.
+#[allow(dead_code)]
+pub(crate) static RAPHAEL_FW: &[FwEntry] = &[
+    FwEntry::toc("amdgpu/psp_13_0_5_toc.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_5_2_6.bin"),
+    FwEntry::ip_fw("amdgpu/gc_10_3_6_ce.bin"),
+    FwEntry::ip_fw("amdgpu/gc_10_3_6_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/gc_10_3_6_me.bin"),
+    FwEntry::ip_fw("amdgpu/gc_10_3_6_mec.bin"),
+    FwEntry::ip_fw("amdgpu/gc_10_3_6_mec2.bin"),
+    FwEntry::ip_fw("amdgpu/gc_10_3_6_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/vcn_3_1_2.bin"),
+    FwEntry::ip_fw("amdgpu/dcn_3_1_5_dmcub.bin"),
+    FwEntry::ta("amdgpu/psp_13_0_5_ta.bin"),
+];
+
 /// Renoir — GFX9, DCN 2.0, PSP 12.0. APU; SMU PMFW is BIOS-
 /// resident (no smu blob on disk). MEC carries CP_MEC1_JT in the
 /// same blob; jump-table extraction happens at parse time.
@@ -685,7 +726,7 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         // and has had no bring-up. Claiming it by handing it the Phoenix
         // family would put DCN 3.1.4 register sequences on DCN 3.5 silicon.
         STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", UNAUDITED_FW),
-        // Rembrandt is RDNA2 (GFX 10.3.6 / DCN 3.1.2) — not Phoenix, and
+        // Rembrandt is RDNA2 (GFX 10.3.3 / DCN 3.1.2) — not Phoenix, and
         // not a generation this driver has any path for.
         REMBRANDT => (
             Family::Navi2,
@@ -693,7 +734,12 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             "amdgpu/rembrandt.bin",
             UNAUDITED_FW,
         ),
-        RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
+        // Raphael is RDNA2 too (GFX 10.3.6 / DCN 3.1.5), and like Rembrandt
+        // sits in the coarse Navi2 register family beside discrete parts;
+        // `ChipInfo::is_apu` and the GC list say it is an APU. Its firmware
+        // set is `RAPHAEL_FW`, but no PSP 13.0.5 load path exists yet, so it
+        // is routed to `UNAUDITED_FW` as Strix is.
+        RAPHAEL => (Family::Navi2, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
         CEZANNE => (
             Family::Renoir,
             "cezanne",

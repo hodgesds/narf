@@ -27,6 +27,7 @@ impl AsyncSystemPm for TargetDriver {
                 match target {
                     SystemSleepState::S0Idle => 1,
                     SystemSleepState::S3 => 3,
+                    SystemSleepState::S4 => 4,
                 },
                 Ordering::Release,
             );
@@ -74,7 +75,11 @@ fn ready<F: Future>(future: F) -> F::Output {
 }
 
 fn actual_sleep_target_preserves_prepare_resume_order_and_legacy_callbacks() -> TestResult {
-    for target in [SystemSleepState::S0Idle, SystemSleepState::S3] {
+    for target in [
+        SystemSleepState::S0Idle,
+        SystemSleepState::S3,
+        SystemSleepState::S4,
+    ] {
         let order = Arc::new(AtomicU64::new(0));
         let observed = Arc::new(AtomicU8::new(0));
         let entries = alloc::vec![
@@ -102,10 +107,10 @@ fn actual_sleep_target_preserves_prepare_resume_order_and_legacy_callbacks() -> 
             },
         ];
         let transition = ready(prepare_entries(entries, target));
-        let expected_target = if target == SystemSleepState::S0Idle {
-            1
-        } else {
-            3
+        let expected_target = match target {
+            SystemSleepState::S0Idle => 1,
+            SystemSleepState::S3 => 3,
+            SystemSleepState::S4 => 4,
         };
         if !transition.succeeded()
             || observed.load(Ordering::Acquire) != expected_target

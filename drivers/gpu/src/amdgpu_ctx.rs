@@ -78,6 +78,7 @@ pub struct Context {
 pub fn recoveries() -> u64 {
     crate::amdgpu_navi22_recovery::recoveries()
         .wrapping_add(crate::amdgpu_navi48_platform::recoveries())
+        .wrapping_add(crate::amdgpu_platform::recoveries())
 }
 
 /// What became of a context's jobs: the engine records a hang here, and

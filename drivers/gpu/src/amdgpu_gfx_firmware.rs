@@ -118,16 +118,28 @@ fn record(ranges: &mut [Span; 17], count: &mut usize, next: Span) -> Result<(), 
 }
 impl<'a> Image<'a> {
     pub fn parse(source: Source, bytes: &'a [u8]) -> Result<Self, Error> {
-        Self::parse_for_gc(source, bytes, 0x3000a)
+        Self::parse_for_gc(source, bytes, 0x3000a, 3)
+    }
+    /// As [`Self::parse`], with DMCUB's IP identity taken from `profile`'s DCN:
+    /// a DCN 3.0.x container (Navi21–24) declares 3.0, Raphael's
+    /// `dcn_3_1_5_dmcub.bin` declares 3.1. The GC containers all declare 10.3.
+    pub fn parse_for(
+        source: Source,
+        bytes: &'a [u8],
+        profile: &crate::amdgpu_rdna2::Profile,
+    ) -> Result<Self, Error> {
+        let (major, minor, _) = profile.dcn_version;
+        let dcn = u32::from(major) | u32::from(minor) << 16;
+        Self::parse_for_gc(source, bytes, 0x3000a, dcn)
     }
     /// GC12 retains the RLC v2.2 layout, but carries a different IP identity.
     pub(crate) fn parse_rlc12(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() < 32 || word(bytes, 8) != 0x20002 {
             return Err(Error::Unsupported);
         }
-        Self::parse_for_gc(Source::Rlc, bytes, 12)
+        Self::parse_for_gc(Source::Rlc, bytes, 12, 3)
     }
-    fn parse_for_gc(source: Source, bytes: &'a [u8], gc: u32) -> Result<Self, Error> {
+    fn parse_for_gc(source: Source, bytes: &'a [u8], gc: u32, dcn: u32) -> Result<Self, Error> {
         // linux-lit: 32=sizeof(struct common_firmware_header)
         if bytes.len() < 32 || bytes.len() > MAX_CONTAINER {
             return Err(Error::Invalid);
@@ -139,7 +151,7 @@ impl<'a> Image<'a> {
             // linux-lit: 12=offsetof(struct common_firmware_header, ip_version_major); 32=sizeof(struct common_firmware_header)
             Source::Vcn if version == 1 && word(bytes, 12) == 3 => 32,
             // linux-lit: 12=offsetof(struct common_firmware_header, ip_version_major); 40=sizeof(struct dmcub_firmware_header_v1_0)
-            Source::Dmcub if version == 1 && word(bytes, 12) == 3 => 40,
+            Source::Dmcub if version == 1 && word(bytes, 12) == dcn => 40,
             // linux-lit: 12=offsetof(struct common_firmware_header, ip_version_major); 48=sizeof(struct sdma_firmware_header_v1_0)
             Source::Sdma if version == 1 && word(bytes, 12) == 0x20005 => 48,
             Source::Rlc

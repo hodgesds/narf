@@ -51,14 +51,14 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyToc {
         })())
     }
 }
-struct OpenToc;
+struct OpenToc(&'static str);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenToc {
     type Output = Result<Vec<u8>, Error>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open("amdgpu/psp_13_0_4_toc.bin", cap) {
+        let blob = match narf_firmware::open(self.0, cap) {
             Ok(blob) => blob,
             Err(_) => return Ok(Err(Error::Invalid)),
         };
@@ -144,6 +144,12 @@ const GFXHUB_WINDOWS: &[VmWindow] = &[
         base_idx: 0,
         ctx0_cntl: 0x15fc,
     },
+    // Raphael: gmc_v10_0.c gives GC 10.3.6 gfxhub_v2_1, gc_10_3_0_offset.h.
+    VmWindow {
+        version: (10, 3, 6),
+        base_idx: 0,
+        ctx0_cntl: 0x15fc,
+    },
     // Navi22, gc_10_3_0_offset.h: CONTEXT0..15 at 0x15fc..0x160b.
     VmWindow {
         version: (10, 3, 2),
@@ -205,6 +211,24 @@ const MMHUB_WINDOWS: &[VmWindow] = &[
         version: (2, 1, 2),
         base_idx: 0,
         ctx0_cntl: 0x06c0,
+    },
+    // Raphael's MMHUB is one of the versions gmc_v10_0.c gives mmhub_v2_3,
+    // which includes mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_CNTL 0x0740 on
+    // _BASE_IDX 1.
+    VmWindow {
+        version: (2, 3, 0),
+        base_idx: 1,
+        ctx0_cntl: 0x0740,
+    },
+    VmWindow {
+        version: (2, 4, 0),
+        base_idx: 1,
+        ctx0_cntl: 0x0740,
+    },
+    VmWindow {
+        version: (2, 4, 1),
+        base_idx: 1,
+        ctx0_cntl: 0x0740,
     },
     // GMC10's MMHUB2.1 uses mmhub_v2_0 / mmhub_2_0_0_offset.h.
     VmWindow {
@@ -314,6 +338,13 @@ const DCN_3_1_4: SurfaceWindow = SurfaceWindow {
     sw_mode_mask: 0x1f,
 };
 
+/// `dcn/dcn_3_1_5_offset.h` — Raphael. Every HUBP, cursor and OTG_CONTROL
+/// register the scan reads keeps its DCN 3.1.4 offset, and every mask agrees.
+const DCN_3_1_5: SurfaceWindow = SurfaceWindow {
+    version: (3, 1, 5),
+    ..DCN_3_1_4
+};
+
 /// `dcn/dcn_3_5_0_offset.h` — Strix / HawkPoint, the other display generation
 /// `amdgpu_dcn` carries a modeset table for.
 ///
@@ -372,7 +403,7 @@ const DCN_3_0_3: SurfaceWindow = SurfaceWindow {
     ..DCN_3_0_0
 };
 const SURFACE_WINDOWS: &[SurfaceWindow] = &[
-    DCN_3_0_2, DCN_3_0_3, DCN_3_1_4, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0,
+    DCN_3_0_2, DCN_3_0_3, DCN_3_1_4, DCN_3_1_5, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0,
 ];
 
 // Field masks. `dcn_3_1_4_sh_mask.h` and `dcn_3_5_0_sh_mask.h` agree on every
@@ -613,9 +644,26 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
             .ok_or(Error::Revoked)
             .and_then(|a| a.derive().map_err(|_| Error::Revoked)),
     )?;
+    // psp_init_toc_microcode: the TOC is named for the PSP's own version.
+    let toc_name = crate::amdgpu::with_controller(|gpu| {
+        let mp0 = crate::amdgpu_discovery::find_ip(
+            &gpu.ip_blocks,
+            crate::amdgpu_discovery::HW_ID_MP0,
+            0,
+        )?;
+        match (mp0.major, mp0.minor, mp0.revision) {
+            (13, 0, 4) => Some("amdgpu/psp_13_0_4_toc.bin"),
+            (13, 0, 5) => Some("amdgpu/psp_13_0_5_toc.bin"),
+            _ => None,
+        }
+    })
+    .flatten();
+    let toc_name = stage_failed("psp-version", toc_name.ok_or(Error::Unsupported))?;
     let toc = stage_failed(
         "psp-toc-open",
-        fw_cap.invoke(OpenToc).map_err(|_| Error::Revoked)?,
+        fw_cap
+            .invoke(OpenToc(toc_name))
+            .map_err(|_| Error::Revoked)?,
     )?;
     crate::amdgpu::with_controller(|gpu| {
         let firmware = stage_failed(
@@ -636,9 +684,10 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
         )?);
         // SAFETY: exact GPU, authenticated containers, lifetime mappings and
         // exclusive PSP/DMUB ownership are retained by the loader and pool.
-        let loader = stage_failed("psp-loader", unsafe {
+        let mut loader = stage_failed("psp-loader", unsafe {
             Loader::new_psp(gpu, cap, &pool, &firmware, &toc)
         })?;
+        graphics(gpu, &fw_cap, &mut loader);
         Ok((loader, pool))
     })
     .ok_or(Error::Unsupported)
@@ -651,6 +700,797 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
     })?
 }
 
+/// Bring Raphael's graphics engines up on the display path's pool, once its
+/// PSP session loaded the graphics set and the RLC autoload completed. A
+/// failure is reported and leaves the display as it is; the owner is returned
+/// either way, since an engine may still reach memory it published.
+async fn graphics_boot(
+    pool: &Pool,
+    firmware: Option<crate::amdgpu_info_navi22::Firmware>,
+) -> Option<crate::amdgpu_raphael_boot::ColdBoot> {
+    use core::fmt::Write as _;
+    let authority = crate::amdgpu::pci_authority()?;
+    let device = crate::amdgpu::pci_device()?;
+    let boot = crate::amdgpu::with_controller(|gpu| {
+        crate::amdgpu_info::sample_raphael_board(gpu, &authority, &device);
+        // SAFETY: this display owner holds the whole GPU after the boot
+        // handoff: no other graphics owner exists, the pool is its free
+        // carve-out, and the PSP has loaded the graphics set. Construction
+        // performs no register I/O.
+        unsafe { crate::amdgpu_raphael_boot::ColdBoot::new(gpu, authority, pool, device) }
+    })?;
+    let mut boot = match boot {
+        Ok(boot) => boot,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael graphics refused: {error:?}"
+            );
+            return None;
+        }
+    };
+    // SAFETY: as above, and the RLC autoload has completed.
+    unsafe { run_graphics(&mut boot, firmware) }.await;
+    Some(boot)
+}
+/// Run `boot`'s stages, report them, and publish the loaded firmware's
+/// versions after a completed run.
+///
+/// # Safety
+/// `ColdBoot::run`'s: the owner is new or re-armed, this display owner holds
+/// the whole GPU, and the RLC autoload has completed.
+async unsafe fn run_graphics(
+    boot: &mut crate::amdgpu_raphael_boot::ColdBoot,
+    firmware: Option<crate::amdgpu_info_navi22::Firmware>,
+) {
+    use core::fmt::Write as _;
+    // SAFETY: forwarded.
+    match unsafe { boot.run() }.await {
+        Ok(report) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael graphics up: smu {:#x}, {} CUs, RB mask {:#x}",
+                report.smu.smu,
+                report.topology.active_cus,
+                report.topology.enabled_rb_mask
+            );
+            // AMDGPU_INFO_FW_VERSION describes what loaded. The rings stay
+            // unadvertised until a client submitter registers.
+            if let Some(firmware) = firmware {
+                crate::amdgpu_info::publish_navi22_boot(crate::amdgpu_info_navi22::Boot {
+                    firmware,
+                    smc: report.smu.smu,
+                    gfx_mhz: None,
+                    queues_verified: true,
+                    sdma_rings: 1,
+                });
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael graphics failed: {error:?}"
+            );
+        }
+    }
+}
+/// VCN and JPEG on a completed Raphael graphics boot, through the PSP session
+/// that loaded them. Failure is reported and leaves graphics and display be.
+async fn media_boot(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot, loader: &mut Loader) {
+    use core::fmt::Write as _;
+    if !matches!(
+        graphics.state(),
+        crate::amdgpu_raphael_boot::State::Ready(_)
+    ) {
+        return;
+    }
+    let Some((psp, firmware, vcn_bytes)) = loader.media() else {
+        return;
+    };
+    // SAFETY: the display owner holds the whole GPU; graphics completed and
+    // `psp` is the session that loaded the VCN image, still holding its TMR.
+    match unsafe { graphics.run_media(psp, firmware, vcn_bytes) }.await {
+        Ok(status) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael media up: {:?}",
+                status.state
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael media failed: {error:?}"
+            );
+        }
+    }
+}
+/// Completed mode 2 recoveries since boot (`amdgpu_ctx::recoveries` adds
+/// them, so contexts from before a reset see their jobs cancelled).
+static RECOVERIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) fn recoveries() -> u64 {
+    RECOVERIES.load(core::sync::atomic::Ordering::Acquire)
+}
+/// Linux's `amdgpu_gpu_recovery`: -1 (the default) recovers an APU like
+/// Raphael; `amdgpu.gpu_recovery=0` turns it off.
+pub(crate) fn gpu_recovery_enabled() -> bool {
+    narf_boot::args().value("amdgpu.gpu_recovery") != Some("0")
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryError {
+    /// No display owner with a completed graphics boot to recover.
+    Busy,
+    Quiesce(crate::amdgpu_raphael_boot::Error),
+    Display(crate::amdgpu_dcn_display::Error),
+    Psp(crate::amdgpu_dmub_boot::Error),
+    Reset(crate::amdgpu_raphael_reset::Error),
+    /// The PSP session came back without the graphics set loaded.
+    NoGraphics,
+    /// The rebuilt graphics owner did not complete its boot.
+    Graphics,
+}
+/// Raphael's `amdgpu_device_gpu_recover` with a mode 2 reset, for a hang no
+/// ring-level rung recovered:
+/// 1. Quiesce: the client path withdrawn (every job fails), the watchdog
+///    stopped, the IH ring disabled, every fence wait abandoned, the stream
+///    disabled.
+/// 2. `psp_suspend`: DMUB stopped, the TMR released, the PSP ring stopped.
+/// 3. The mode 2 reset (`nv_asic_mode2_reset`).
+/// 4. Re-initialization, as `amdgpu_device_reinit_after_reset`:
+///    - the PSP session booted again, which loads the graphics set and runs
+///      the RLC autoload;
+///    - DMUB notifications;
+///    - the graphics coordinator re-armed and run again on its own
+///      reservations, then media, then client registration.
+///
+///    Only a coordinator that cannot be re-armed is kept, quarantined, and
+///    a new one built.
+/// 5. The stream put back on the mode it was validated for (DM's resume).
+///    The carve-out survives a mode 2 reset (`amdgpu_device_check_vram_lost`
+///    reports no loss), so the scanout is not cleared.
+///
+/// A failure after the quiesce leaves graphics stopped. The display is
+/// left as far as it got.
+pub(crate) async fn recover() -> Result<(), RecoveryError> {
+    use core::fmt::Write as _;
+    let mut guard = DISPLAY.lock().await;
+    let display = guard.as_mut().ok_or(RecoveryError::Busy)?;
+    let device = crate::amdgpu::pci_device().ok_or(RecoveryError::Busy)?;
+    if !display
+        .graphics
+        .as_ref()
+        .is_some_and(crate::amdgpu_raphael_boot::ColdBoot::queues_verified)
+    {
+        return Err(RecoveryError::Busy);
+    }
+    let _ = writeln!(narf_console::Writer, "amdgpu: raphael MODE2 reset");
+    // 1. Quiesce.
+    crate::amdgpu_navi22_cs::unregister();
+    crate::amdgpu_navi22_tdr::stop();
+    let Display {
+        loader,
+        pool,
+        stream,
+        graphics,
+        retired,
+        ..
+    } = display;
+    let old = graphics.as_mut().ok_or(RecoveryError::Busy)?;
+    // amdgpu_device_ip_suspend's UNGATE: GFX powered for what follows.
+    if let Err(error) = old.ungate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: raphael GFX ungate {error:?}");
+    }
+    // SAFETY: the client path is withdrawn; `old` is re-armed below.
+    unsafe { old.quiesce_for_reset() }
+        .await
+        .map_err(RecoveryError::Quiesce)?;
+    crate::amdgpu_fence_navi22::abandon_all();
+    if let Some(running) = stream.as_mut() {
+        running
+            .pipeline
+            .disable(loader)
+            .await
+            .map_err(RecoveryError::Display)?;
+    }
+    // 2-3. psp_suspend, then the reset of everything that ran from the TMR.
+    // SAFETY: the mode 2 reset follows at once, and the loader boots again
+    // before the display or graphics are used.
+    unsafe { loader.stop_for_reset() }
+        .await
+        .map_err(RecoveryError::Psp)?;
+    // SAFETY: quiesced above, TMR released; everything is rebuilt below.
+    unsafe { old.mode2_reset(&device) }
+        .await
+        .map_err(RecoveryError::Reset)?;
+    // 4. Re-initialization.
+    loader
+        .boot(Default::default())
+        .await
+        .map_err(RecoveryError::Psp)?;
+    loader
+        .enable_notifications()
+        .await
+        .map_err(RecoveryError::Psp)?;
+    // Contexts from before the reset see it (amdgpu_ctx::recoveries).
+    rebuild_graphics(loader, pool, graphics, retired, true).await?;
+    // 5. The stream, as `resume` puts it back.
+    if let Some(running) = stream.as_mut() {
+        running
+            .pipeline
+            .start()
+            .await
+            .map_err(RecoveryError::Display)?;
+        running
+            .pipeline
+            .enable(
+                loader,
+                &running.scanout,
+                &running.timing,
+                &running.platform,
+                running.depth,
+                running.caps,
+            )
+            .await
+            .map_err(RecoveryError::Display)?;
+    }
+    Ok(())
+}
+/// After the PSP session loaded the graphics set again (a recovery, or the
+/// display's S3 resume): bring graphics up again, then media and client
+/// registration. The spent coordinator is re-armed and run on its own
+/// reservations, as Linux's hw_init reuses its buffers. Only if it cannot be
+/// re-armed is it retired, quarantined, and a new one built. `reset` moves
+/// the recovery counter first, so contexts from before see their work
+/// cancelled; an S3 resume keeps them (Linux drains the rings before
+/// suspending, and the carve-out survives).
+async fn rebuild_graphics(
+    loader: &mut Loader,
+    pool: &Pool,
+    graphics: &mut Option<crate::amdgpu_raphael_boot::ColdBoot>,
+    retired: &mut Vec<crate::amdgpu_raphael_boot::ColdBoot>,
+    reset: bool,
+) -> Result<(), RecoveryError> {
+    use core::fmt::Write as _;
+    if !loader.graphics_booted() {
+        return Err(RecoveryError::NoGraphics);
+    }
+    if reset {
+        // Contexts are told of the reset; media starts with no sessions.
+        if let Some(old) = graphics.as_mut() {
+            old.forget_media_sessions();
+        }
+    }
+    let firmware = loader.graphics_versions();
+    let rearmed = match graphics.as_mut() {
+        // SAFETY: the device was reset (mode 2 or S3) since the coordinator
+        // last ran, it was quiesced, and the PSP has reloaded the set.
+        Some(old) => match unsafe { old.rearm() }.await {
+            Ok(()) => true,
+            Err(error) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael graphics not re-armed ({error:?}); a new owner"
+                );
+                false
+            }
+        },
+        None => false,
+    };
+    if rearmed {
+        let boot = graphics.as_mut().ok_or(RecoveryError::Graphics)?;
+        // SAFETY: re-armed above; this display owner holds the GPU.
+        alloc::boxed::Box::pin(unsafe { run_graphics(boot, firmware) }).await;
+    } else {
+        if let Some(old) = graphics.take() {
+            retired.push(old);
+        }
+        *graphics = alloc::boxed::Box::pin(graphics_boot(pool, firmware)).await;
+    }
+    let new = graphics
+        .as_mut()
+        .filter(|g| g.queues_verified())
+        .ok_or(RecoveryError::Graphics)?;
+    alloc::boxed::Box::pin(media_boot(new, loader)).await;
+    if reset {
+        RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+    serve_clients(new);
+    gate_graphics(new).await;
+    // A rebuild that could not re-arm quarantined the old owners; say what
+    // is left.
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: raphael graphics {} ({} retired owners, {} MiB of the carve-out free)",
+        if rearmed { "re-armed" } else { "rebuilt" },
+        retired.len(),
+        pool.available() >> 20
+    );
+    Ok(())
+}
+
+/// Raphael's graphics across S3 (`amdgpu_device_suspend` /
+/// `amdgpu_device_resume` with graphics up), split between the system-PM
+/// phases:
+/// 1. Async prepare: the rings drained, the client path withdrawn, the IH
+///    ring disabled, every fence wait abandoned.
+/// 2. Sync suspend: the stream disabled, and the PSP `psp_suspend` (TMR and
+///    ring) with graphics quiesced. S3 powers the engines off, which is the
+///    reset that release needs.
+/// 3. Sync resume: the PSP session booted again (the graphics set reloaded,
+///    the RLC autoload run), then the stream replayed.
+/// 4. Async resume: a new coordinator, then media and clients. A suspend
+///    that aborted before the PSP stopped never powered the GPU off, so
+///    that resume runs a mode 2 reset first.
+///
+/// Suspend-to-idle takes none of this: see [`GraphicsPm::Idle`]. Hibernation
+/// takes all of it, with the carve-out emptied first and a reset after the
+/// PSP stops: see [`prepare_graphics_hibernate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GraphicsPm {
+    Running,
+    /// Prepared for suspend: client path withdrawn, IH disabled.
+    Quiesced,
+    /// The PSP released the TMR for S3.
+    Stopped,
+    /// Suspend-to-idle without s0ix: graphics and the display are left
+    /// running through the park, and the PSP keeps its TMR, as Linux's
+    /// amdgpu does when `amdgpu_acpi_is_s0ix_active` is false.
+    Idle,
+    /// Prepared for hibernation: as `Quiesced`, with every unpinned client
+    /// buffer moved out of the carve-out.
+    Freezing,
+    /// Frozen for hibernation: the TMR released and the GPU reset (mode 2),
+    /// as `amdgpu_pmops_freeze` leaves an APU while the image is written.
+    Frozen,
+}
+/// Why Raphael would not take Linux's s0ix path for a suspend-to-idle
+/// (`amdgpu_acpi_is_s0ix_active` for an APU, in its order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum S0ix {
+    Active,
+    /// `amdgpu.ppfeaturemask` has no `PP_GFXOFF_MASK`.
+    NoGfxoff,
+    /// The FADT lacks `LOW_POWER_S0`: "BIOS has not been configured for
+    /// suspend-to-idle".
+    NoLowPowerS0,
+    /// No AMD PMC driver takes the SoC into S0i3 (Linux without
+    /// `CONFIG_AMD_PMC`).
+    NoPmc,
+}
+/// Whether an AMD PMC driver exists to send the SoC its S0i3 OS hint and
+/// run the LPS0 `_DSM` calls. None does yet.
+const AMD_PMC: bool = false;
+pub(crate) fn s0ix(gfxoff: bool, low_power_s0: bool, pmc: bool) -> S0ix {
+    if !gfxoff {
+        S0ix::NoGfxoff
+    } else if !low_power_s0 {
+        S0ix::NoLowPowerS0
+    } else if !pmc {
+        S0ix::NoPmc
+    } else {
+        S0ix::Active
+    }
+}
+/// What the async resume must do from the state suspend left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeWork {
+    Nothing,
+    /// The sync resume reloaded the graphics set: build a new coordinator.
+    Rebuild,
+    /// The GPU never lost power: reset it (mode 2), then rebuild.
+    ResetThenRebuild,
+}
+pub(crate) fn resume_work(state: GraphicsPm) -> ResumeWork {
+    match state {
+        GraphicsPm::Running | GraphicsPm::Idle => ResumeWork::Nothing,
+        // A restored image finds the GPU power-cycled, a failed image write
+        // finds it reset: the sync resume booted the PSP either way.
+        GraphicsPm::Stopped | GraphicsPm::Frozen => ResumeWork::Rebuild,
+        GraphicsPm::Quiesced | GraphicsPm::Freezing => ResumeWork::ResetThenRebuild,
+    }
+}
+/// Where the sync suspend leaves graphics once the PSP stop has run, and
+/// whether the suspend may go on. S3's power-off is the reset releasing the
+/// TMR needs; a hibernation writes its image first, so it resets now, as
+/// `amdgpu_pmops_freeze` does (`amdgpu_acpi_should_gpu_reset`). `reset` runs
+/// only then. A failed reset fails the freeze, as Linux's does.
+pub(crate) fn after_psp_stop(
+    state: GraphicsPm,
+    stopped: bool,
+    reset: impl FnOnce() -> bool,
+) -> (GraphicsPm, bool) {
+    match state {
+        _ if !stopped => (state, false),
+        GraphicsPm::Freezing if reset() => (GraphicsPm::Frozen, true),
+        GraphicsPm::Freezing => (GraphicsPm::Stopped, false),
+        _ => (GraphicsPm::Stopped, true),
+    }
+}
+/// How long the prepare hook waits for submitted jobs (the GFX job timeout,
+/// as Navi22's suspend drain).
+const RING_DRAIN_MS: u64 = 10_000; // linux: n/a (NARF policy, amdgpu_fence_wait_empty bound)
+/// Whether every kernel queue's and media ring's submitted jobs completed
+/// within `ms` (`amdgpu_fence_driver_hw_fini` waits on every ring).
+async fn rings_idle(ms: u64) -> bool {
+    let deadline = narf_time::Deadline::after_ms(ms);
+    loop {
+        let queues = match crate::amdgpu_rdna2_client::queue_progress().await {
+            Ok(samples) => samples
+                .iter()
+                .all(|p| crate::amdgpu_fence_navi22::signaled(p.signaled, p.emitted)),
+            Err(_) => return false,
+        };
+        let media = {
+            let mut owner = graphics_owner().await;
+            match owner.get().map(|boot| boot.media_signalled()) {
+                Some(Ok(done)) => done,
+                Some(Err(_)) => return false,
+                None => true,
+            }
+        };
+        if queues && media {
+            return true;
+        }
+        if deadline.expired() {
+            return false;
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+    }
+}
+/// Suspend-to-idle with graphics up. Linux's amdgpu suspends an APU for
+/// s2idle only on its s0ix path, which needs the SoC to reach S0i3 (it
+/// halts the RLC and relies on GFXOFF exit to restart it). Without that,
+/// `amdgpu_pmops_prepare` and `_suspend` leave the device alone. NARF has
+/// no AMD PMC driver, so that is always the case here: the device is marked
+/// [`GraphicsPm::Idle`] and nothing else changes. The S3 sequence is no
+/// substitute: it releases the TMR under GFX, which is sound only because
+/// S3 then cuts power.
+async fn prepare_graphics_idle() {
+    use core::fmt::Write as _;
+    if crate::amdgpu_rdna2_client::backend() != crate::amdgpu_rdna2_client::Backend::Raphael {
+        return;
+    }
+    let gfxoff = crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw()).gfxoff;
+    let low_power_s0 = narf_acpi::fadt_pm().is_some_and(|fadt| fadt.low_power_s0);
+    let why = s0ix(gfxoff, low_power_s0, AMD_PMC);
+    let mut guard = DISPLAY.lock().await;
+    let Some(display) = guard.as_mut() else {
+        return;
+    };
+    if !display
+        .graphics
+        .as_ref()
+        .is_some_and(|g| g.queues_verified())
+    {
+        return;
+    }
+    display.graphics_pm = GraphicsPm::Idle;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: raphael s2idle without s0ix ({why:?}): graphics and display stay up"
+    );
+}
+async fn prepare_graphics_suspend() {
+    if crate::amdgpu_rdna2_client::backend() != crate::amdgpu_rdna2_client::Backend::Raphael {
+        return;
+    }
+    // amdgpu_fence_driver_hw_fini waits for the rings to empty first.
+    drain_rings().await;
+    quiesce_graphics(GraphicsPm::Quiesced, Vec::new()).await;
+}
+async fn drain_rings() {
+    use core::fmt::Write as _;
+    if !rings_idle(RING_DRAIN_MS).await {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: raphael rings still busy at suspend; their jobs fail"
+        );
+    }
+}
+/// Hibernation with graphics up (`amdgpu_pmops_freeze` on an APU): the S3
+/// preparation, with the carve-out emptied first. S4 loses it, and an APU's
+/// VRAM is evicted only for S4 (`amdgpu_device_evict_resources`), so every
+/// unpinned client buffer moves to system memory, which the image captures.
+/// Pinned ones (a scanned-out framebuffer) stay and lose their contents, as
+/// in Linux. Kernel state needs nothing: the rings, MQDs, GART table and
+/// scanout are rebuilt or cleared at resume, firmware is staged again from
+/// system memory, and VCN's buffer is saved as for S3. The sync suspend then
+/// resets the GPU after the PSP stops ([`after_psp_stop`]).
+///
+/// Placement is excluded first, in clients' order (before the display
+/// owner), and held until the client path is withdrawn, so no submission or
+/// placement lands in the carve-out after its buffers left. A failed
+/// eviction puts the heap back and refuses the hibernation with graphics
+/// still running.
+async fn prepare_graphics_hibernate() -> Result<(), narf_power::device_pm::DevicePmError> {
+    use core::fmt::Write as _;
+    if crate::amdgpu_rdna2_client::backend() != crate::amdgpu_rdna2_client::Backend::Raphael {
+        return Ok(());
+    }
+    let Some(card) = crate::amdgpu_navi22_cs::drm_card() else {
+        drain_rings().await;
+        quiesce_graphics(GraphicsPm::Freezing, Vec::new()).await;
+        return Ok(());
+    };
+    let gate = crate::amdgpu_gem::lock_placement_live(card)
+        .await
+        .map_err(|_| narf_power::device_pm::DevicePmError::Busy)?;
+    drain_rings().await;
+    let heap = crate::amdgpu_navi22_cs::client_heap();
+    let evicted = match evict_for_hibernation(&gate, heap).await {
+        Ok(evicted) => evicted,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael hibernation refused: client VRAM not evicted ({error:?})"
+            );
+            return Err(narf_power::device_pm::DevicePmError::Busy);
+        }
+    };
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: raphael hibernation: {} client buffers out of the carve-out",
+        evicted.len()
+    );
+    quiesce_graphics(GraphicsPm::Freezing, evicted).await;
+    drop(gate);
+    Ok(())
+}
+/// `amdgpu_ttm_evict_resources(TTM_PL_VRAM)` for `gate`'s card: the heap is
+/// withdrawn, so nothing new lands in it, then every unpinned buffer moves to
+/// system memory with its bytes. Returns the buffers whose allowed domains
+/// the move widened, for [`crate::amdgpu_gem::restore_domains`] at resume.
+/// On failure their domains are put back and `heap` registered again.
+pub(crate) async fn evict_for_hibernation(
+    gate: &crate::amdgpu_gem::PlacementGuard,
+    heap: Option<crate::amdgpu_gem::VramHeap>,
+) -> Result<Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>, narf_filesystem::FsError> {
+    let card = gate.card();
+    crate::amdgpu_gem::unregister_vram_heap(card);
+    let (touched, evicted) = crate::amdgpu_gem::evict_all(gate).await;
+    match evicted {
+        Ok(()) => Ok(touched),
+        Err(error) => {
+            crate::amdgpu_gem::restore_domains(touched);
+            if let Some(heap) = heap {
+                crate::amdgpu_gem::register_vram_heap(card, heap);
+            }
+            Err(error)
+        }
+    }
+}
+/// The S3 preparation from the drained rings on, leaving `next`. `evicted`
+/// is kept for the resume; with no running graphics to quiesce it is put
+/// back now.
+async fn quiesce_graphics(
+    next: GraphicsPm,
+    evicted: Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>,
+) {
+    use core::fmt::Write as _;
+    let mut guard = DISPLAY.lock().await;
+    let display = guard
+        .as_mut()
+        .filter(|d| d.graphics.as_ref().is_some_and(|g| g.queues_verified()));
+    let Some(display) = display else {
+        crate::amdgpu_gem::restore_domains(evicted);
+        return;
+    };
+    display.evicted = evicted;
+    let Some(graphics) = display.graphics.as_mut() else {
+        return;
+    };
+    // The media session table stays for the restored firmware context.
+    crate::amdgpu_navi22_cs::suspend();
+    crate::amdgpu_navi22_tdr::stop();
+    // amdgpu_device_ip_suspend_phase1's UNGATE: GFX powered for the rest.
+    if let Err(error) = graphics.ungate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: raphael GFX ungate {error:?}");
+    }
+    // vcn_v3_0_suspend: stopped, with each VCPU BO saved. A failure leaves
+    // the resume to start media with no sessions.
+    if let Err(error) = graphics.suspend_media().await {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: raphael media sessions not saved: {error:?}"
+        );
+    }
+    // SAFETY: the client path is withdrawn; the coordinator is re-armed at
+    // resume.
+    if let Err(error) = unsafe { graphics.quiesce_for_reset() }.await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: raphael IH quiesce {error:?}");
+    }
+    crate::amdgpu_fence_navi22::abandon_all();
+    display.graphics_pm = next;
+}
+async fn resume_graphics() {
+    use core::fmt::Write as _;
+    let mut guard = DISPLAY.lock().await;
+    let Some(display) = guard.as_mut() else {
+        return;
+    };
+    let work = resume_work(display.graphics_pm);
+    if work == ResumeWork::Nothing {
+        // A suspend-to-idle left everything running.
+        display.graphics_pm = GraphicsPm::Running;
+        return;
+    }
+    let Display {
+        loader,
+        pool,
+        graphics,
+        retired,
+        graphics_pm,
+        evicted,
+        ..
+    } = display;
+    let result = async {
+        if work == ResumeWork::ResetThenRebuild {
+            let device = crate::amdgpu::pci_device().ok_or(RecoveryError::Busy)?;
+            let old = graphics.as_mut().ok_or(RecoveryError::Busy)?;
+            // SAFETY: quiesced at prepare; the reset follows the TMR release
+            // at once and everything is rebuilt below.
+            unsafe { loader.stop_for_reset() }
+                .await
+                .map_err(RecoveryError::Psp)?;
+            // SAFETY: as above; the TMR is released and graphics quiesced.
+            unsafe { old.mode2_reset(&device) }
+                .await
+                .map_err(RecoveryError::Reset)?;
+            loader
+                .boot(Default::default())
+                .await
+                .map_err(RecoveryError::Psp)?;
+            loader
+                .enable_notifications()
+                .await
+                .map_err(RecoveryError::Psp)?;
+        }
+        rebuild_graphics(loader, pool, graphics, retired, false).await
+    }
+    .await;
+    *graphics_pm = GraphicsPm::Running;
+    // After a hibernation: back to their own domains, in system memory until
+    // validation brings each into the heap the rebuild registered again.
+    crate::amdgpu_gem::restore_domains(core::mem::take(evicted));
+    if let Err(error) = result {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: raphael graphics not resumed: {error:?}; display only"
+        );
+    }
+}
+/// The async system-PM phase for Raphael's graphics; registered once its
+/// clients are served.
+struct GraphicsSystemPm;
+impl narf_power::system_pm::AsyncSystemPm for GraphicsSystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            prepare_graphics_suspend().await;
+            Ok::<(), narf_power::device_pm::DevicePmError>(())
+        })
+    }
+    fn prepare_suspend_target<'a>(
+        &'a self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> narf_power::system_pm::SystemPmFuture<'a> {
+        use narf_power::system_pm::SystemSleepState;
+        alloc::boxed::Box::pin(async move {
+            match target {
+                SystemSleepState::S3 => prepare_graphics_suspend().await,
+                SystemSleepState::S0Idle => prepare_graphics_idle().await,
+                SystemSleepState::S4 => prepare_graphics_hibernate().await?,
+            }
+            Ok::<(), narf_power::device_pm::DevicePmError>(())
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            // Retained: a cancelled resume still finishes the rebuild rather
+            // than leave the coordinator half-built.
+            crate::suspend_transition::Retained::new(
+                async {
+                    resume_graphics().await;
+                    Ok::<(), narf_power::device_pm::DevicePmError>(())
+                },
+                alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+                |cleanup| {
+                    narf_scheduler::spawn(cleanup);
+                },
+            )
+            .await
+        })
+    }
+}
+
+/// Publish a completed Raphael graphics boot to clients: its submitter,
+/// VMIDs and heap, then `ACCEL_WORKING`. `graphics` loaded the set only with
+/// `amdgpu.rdna2_accel` on, the switch the discrete boot turns this on with.
+/// `amdgpu_device_ip_late_init`'s `set_pg_state(GATE)` for GFX, once clients
+/// are served: power gating on and GFXOFF allowed after its delay. Failure is
+/// reported; graphics stays up with GFX powered.
+async fn gate_graphics(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
+    use core::fmt::Write as _;
+    if !graphics.queues_verified() {
+        return;
+    }
+    if let Err(error) = graphics.gate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: raphael GFX gate {error:?}");
+    }
+}
+/// `gfx_off_delay_work`: deliver `allow` [`DELAY_MS`] from now to the
+/// coordinator that scheduled it. A disable request in between, or a newer
+/// coordinator lifetime, makes it a no-op.
+///
+/// [`DELAY_MS`]: crate::amdgpu_raphael_gfxoff::DELAY_MS
+pub(crate) fn schedule_gfx_off(allow: crate::amdgpu_raphael_gfxoff::Allow) {
+    narf_scheduler::spawn(async move {
+        use core::fmt::Write as _;
+        let delay = crate::amdgpu_raphael_gfxoff::DELAY_MS;
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(delay).as_instant()).await;
+        let mut owner = graphics_owner().await;
+        if let Some(boot) = owner.get() {
+            if let Err(error) = boot.delayed_gfx_off(allow).await {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael GFXOFF allow {error:?}"
+                );
+            }
+        }
+    });
+}
+fn serve_clients(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
+    if !graphics.queues_verified() {
+        return;
+    }
+    crate::amdgpu_navi22_cs::register_raphael(graphics);
+    if crate::amdgpu_navi22_cs::drm_card()
+        .and_then(crate::amdgpu_cs::submitter)
+        .is_some()
+    {
+        crate::amdgpu_info_navi22::set_accel(true);
+    }
+    // S3 with graphics up (`GraphicsPm`). Replaced by name on a rebuild.
+    narf_power::system_pm::register_async_system_pm(
+        "amdgpu-raphael-graphics",
+        alloc::sync::Arc::new(GraphicsSystemPm),
+    );
+}
+/// On Raphael, hand the loader the graphics set so its PSP session loads every
+/// non-PSP firmware in Linux's order (`psp_load_non_psp_fw`) and starts the RLC
+/// autoload, instead of DMCUB alone; `amdgpu_raphael_boot` then brings the
+/// engines up. `amdgpu.rdna2_accel=0` keeps the display-only load. A set that
+/// cannot be opened or does not match the DMCUB the loader validated leaves
+/// the display path as it was, and says why.
+fn graphics(
+    gpu: &AmdGpu,
+    fw_cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    loader: &mut Loader,
+) {
+    use core::fmt::Write as _;
+    if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did).is_none() {
+        return;
+    }
+    if !crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw()).accel {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: graphics firmware not loaded (amdgpu.rdna2_accel=0)"
+        );
+        return;
+    }
+    let result = crate::amdgpu_gfx_navi22::Firmware::open_raphael(gpu, fw_cap)
+        .map_err(|e| alloc::format!("{e:?}"))
+        .and_then(|set| {
+            loader
+                .set_graphics(set)
+                .map_err(|e| alloc::format!("{e:?}"))
+        });
+    if let Err(why) = result {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: graphics firmware not loaded ({why}); display only"
+        );
+    }
+}
 /// A hub pixel pipe is free when it is blanked and its timing generator is
 /// stopped; claiming one that is not would disturb a live scanout. These are the
 /// same two signals the boot inventory uses to decide a surface is in use.
@@ -821,8 +1661,45 @@ struct Display {
     pool: Arc<Pool>,
     stream: Option<Stream>,
     attempted: bool,
+    /// Raphael's graphics engines, retained whether or not their bring-up
+    /// finished: an engine may still reach memory it published.
+    graphics: Option<crate::amdgpu_raphael_boot::ColdBoot>,
+    /// Graphics owners a mode 2 recovery replaced. Kept, never reused, so
+    /// the memory they published stays quarantined (Navi22's policy: each
+    /// recovery leaks its old owners' carve-out).
+    retired: Vec<crate::amdgpu_raphael_boot::ColdBoot>,
+    /// Where a system transition left the graphics (`GraphicsPm`).
+    graphics_pm: GraphicsPm,
+    /// The client buffers a hibernation moved out of the carve-out, with
+    /// the allowed domains to put back at resume.
+    evicted: Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>,
 }
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
+
+/// The display owner, locked for Raphael's client path
+/// (`amdgpu_rdna2_client`): the graphics coordinator lives beside the PSP
+/// session that loaded it, so a client job takes the same lock the display
+/// task holds across its bring-up and modesets.
+pub(crate) struct Graphics(narf_lib::mutex::MutexGuard<'static, Option<Display>>);
+impl Graphics {
+    pub(crate) fn get(&mut self) -> Option<&mut crate::amdgpu_raphael_boot::ColdBoot> {
+        self.0.as_mut()?.graphics.as_mut()
+    }
+    /// The coordinator with the PSP session that loaded its VCN.
+    pub(crate) fn media(
+        &mut self,
+    ) -> Option<(
+        &mut crate::amdgpu_raphael_boot::ColdBoot,
+        &mut crate::amdgpu_psp_ring::Psp,
+    )> {
+        let display = self.0.as_mut()?;
+        let psp = display.loader.media_psp()?;
+        Some((display.graphics.as_mut()?, psp))
+    }
+}
+pub(crate) async fn graphics_owner() -> Graphics {
+    Graphics(DISPLAY.lock().await)
+}
 
 pub(crate) fn start() -> bool {
     // Every `false` below means "the native path did not take"; the caller
@@ -856,6 +1733,10 @@ pub(crate) fn start() -> bool {
         pool,
         stream: None,
         attempted: false,
+        graphics: None,
+        retired: Vec::new(),
+        graphics_pm: GraphicsPm::Running,
+        evicted: Vec::new(),
     });
     drop(owner);
     crate::amdgpu_usbc::observe_connectors();
@@ -877,6 +1758,18 @@ pub(crate) fn start() -> bool {
                 // Retain both the owner and busy phase after a partial boot.
                 // No attach fallback can race an outstanding PSP command.
                 return;
+            }
+            if display.loader.graphics_booted() {
+                // Boxed: these futures hold the whole bring-up, which inline
+                // would make this task's own frame and future too large.
+                let firmware = display.loader.graphics_versions();
+                display.graphics =
+                    alloc::boxed::Box::pin(graphics_boot(&display.pool, firmware)).await;
+                if let Some(graphics) = display.graphics.as_mut() {
+                    alloc::boxed::Box::pin(media_boot(graphics, &mut display.loader)).await;
+                    serve_clients(graphics);
+                    gate_graphics(graphics).await;
+                }
             }
         }
         crate::amdgpu_usbc::finish_cycle();
@@ -924,7 +1817,17 @@ pub(crate) fn suspend() -> bool {
     if narf_scheduler::current_task_id().raw() != 0 {
         return false;
     }
-    let Display { loader, stream, .. } = display;
+    let Display {
+        loader,
+        stream,
+        graphics,
+        graphics_pm,
+        ..
+    } = display;
+    if *graphics_pm == GraphicsPm::Idle {
+        // s2idle without s0ix: Linux suspends nothing, the display included.
+        return true;
+    }
     // Stop the stream before the firmware: a pipe left fetching across a GPU
     // suspend would read scanout memory the resume path has not re-established.
     // The stream itself is kept, with the mode it was validated for, so resume
@@ -933,6 +1836,33 @@ pub(crate) fn suspend() -> bool {
         if narf_scheduler::block_on_spin(stream.pipeline.disable(loader)).is_err() {
             return false;
         }
+    }
+    if matches!(*graphics_pm, GraphicsPm::Quiesced | GraphicsPm::Freezing) {
+        // The async prepare quiesced graphics. S3 powers the engines off,
+        // which is the reset releasing the TMR under them needs; a
+        // hibernation resets them here (`after_psp_stop`).
+        // SAFETY: as above; `resume` boots the loader again before use.
+        // Boxed: block_on_spin holds its future by value, and the PSP stop's
+        // state has no business in this frame.
+        let stopped = narf_scheduler::block_on_spin(alloc::boxed::Box::pin(unsafe {
+            loader.stop_for_reset()
+        }))
+        .is_ok();
+        let reset = || {
+            let (Some(device), Some(graphics)) = (crate::amdgpu::pci_device(), graphics.as_mut())
+            else {
+                return false;
+            };
+            // SAFETY: quiesced at prepare and the TMR released just above;
+            // the resume rebuilds every engine.
+            narf_scheduler::block_on_spin(alloc::boxed::Box::pin(unsafe {
+                graphics.mode2_reset(&device)
+            }))
+            .is_ok()
+        };
+        let (next, proceed) = after_psp_stop(*graphics_pm, stopped, reset);
+        *graphics_pm = next;
+        return proceed;
     }
     narf_scheduler::block_on_spin(loader.stop()).is_ok()
 }
@@ -947,7 +1877,16 @@ pub(crate) fn resume() -> bool {
         return false;
     }
     use core::fmt::Write as _;
-    let Display { loader, stream, .. } = display;
+    let Display {
+        loader,
+        stream,
+        graphics_pm,
+        ..
+    } = display;
+    if *graphics_pm == GraphicsPm::Idle {
+        // Nothing was suspended (see `prepare_graphics_idle`).
+        return true;
+    }
     if narf_scheduler::block_on_spin(async {
         loader.boot(Default::default()).await?;
         loader.enable_notifications().await
@@ -1003,6 +1942,179 @@ mod tests {
         }
         regs
     }
+    /// Raphael's S3 resume does what suspend left undone: nothing for running
+    /// graphics, a rebuild once the PSP released the TMR (the GPU lost
+    /// power), and a mode 2 reset first when suspend stopped at the quiesce.
+    fn raphael_s3_resume_work_follows_the_suspend_state() -> TestResult {
+        if resume_work(GraphicsPm::Running) != ResumeWork::Nothing
+            || resume_work(GraphicsPm::Stopped) != ResumeWork::Rebuild
+            || resume_work(GraphicsPm::Quiesced) != ResumeWork::ResetThenRebuild
+        {
+            return TestResult::Fail("S3 resume work");
+        }
+        // A suspend-to-idle suspended nothing, so its resume does nothing:
+        // no rebuild (the GPU was never reset) and no mode 2 reset.
+        if resume_work(GraphicsPm::Idle) != ResumeWork::Nothing {
+            return TestResult::Fail("s2idle resume work");
+        }
+        // A hibernation that froze resumes like S3 (restore or thaw find
+        // the GPU power-cycled or reset); one whose PSP never stopped needs
+        // the reset first.
+        if resume_work(GraphicsPm::Frozen) != ResumeWork::Rebuild
+            || resume_work(GraphicsPm::Freezing) != ResumeWork::ResetThenRebuild
+        {
+            return TestResult::Fail("S4 resume work");
+        }
+        TestResult::Pass
+    }
+    /// amdgpu_pmops_freeze resets an APU after amdgpu_device_suspend: the
+    /// sync suspend resets only a hibernation, only once the PSP stopped,
+    /// and a failed reset fails the freeze.
+    fn raphael_s4_freeze_resets_after_the_psp_stop() -> TestResult {
+        use core::cell::Cell;
+        use GraphicsPm::{Freezing, Frozen, Quiesced, Stopped};
+        let resets = Cell::new(0);
+        let run = |state, stopped, ok| {
+            resets.set(0);
+            let next = after_psp_stop(state, stopped, || {
+                resets.set(resets.get() + 1);
+                ok
+            });
+            (next, resets.get())
+        };
+        // S3: the power-off is the reset.
+        if run(Quiesced, true, true) != ((Stopped, true), 0)
+            || run(Quiesced, false, true) != ((Quiesced, false), 0)
+        {
+            return TestResult::Fail("S3 sync suspend reset");
+        }
+        // S4: reset once the PSP stopped; a failed reset fails the freeze.
+        if run(Freezing, true, true) != ((Frozen, true), 1)
+            || run(Freezing, true, false) != ((Stopped, false), 1)
+            || run(Freezing, false, true) != ((Freezing, false), 0)
+        {
+            return TestResult::Fail("S4 freeze reset");
+        }
+        TestResult::Pass
+    }
+    /// After the freeze's eviction the carve-out may be lost (S4 powers it
+    /// off, and firmware may reuse it before the image is restored): every
+    /// unpinned client buffer's bytes are already in system memory, and
+    /// nothing new can be placed in the withdrawn heap.
+    fn raphael_s4_eviction_empties_the_carve_out() -> TestResult {
+        use crate::amdgpu_gem::{GemState, VramHeap};
+        const CARD: u32 = 0xe1c5; // linux: n/a (test card index)
+        const BASE: u64 = 0x8_0000_0000; // linux: n/a (test carve-out MC address)
+        struct Registered;
+        impl Drop for Registered {
+            fn drop(&mut self) {
+                crate::amdgpu_gem::unregister_vram_heap(CARD);
+            }
+        }
+        let mut memory = vec![0u8; 16 * 4096];
+        let map = narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0xb900_0000),
+            virt: memory.as_mut_ptr() as u64,
+            len: memory.len() as u64,
+            kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+        };
+        // SAFETY: this test exclusively owns memory until the registered heap
+        // and every object have been dropped; no hardware reaches it.
+        let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, BASE) }.unwrap();
+        let heap = VramHeap {
+            pool: pool.clone(),
+            fb_base: BASE,
+            fb_offset: BASE,
+            unmapped: None,
+        };
+        let _registered = Registered;
+        crate::amdgpu_gem::register_vram_heap(CARD, heap.clone());
+        let state = GemState::for_card(CARD);
+        let full = pool.available();
+        let Some(object) = state
+            .create_dumb(64, 4, 32)
+            .ok()
+            .and_then(|(handle, _, _)| state.object(handle))
+        else {
+            return TestResult::Fail("client buffer in the carve-out");
+        };
+        let Some(at) = object.placement().gpu_at(0x123) else {
+            return TestResult::Fail("client buffer address");
+        };
+        let at = (at - BASE) as usize;
+        memory[at..at + 4].copy_from_slice(&0x00c0_ffeeu32.to_le_bytes());
+        let mut back = [0u8; 4];
+        if object.system()
+            || object.placement().read_bytes(0x123, &mut back).is_none()
+            || back != 0x00c0_ffeeu32.to_le_bytes()
+        {
+            return TestResult::Fail("client buffer not in the carve-out");
+        }
+        let evicted = narf_scheduler::block_on_spin(async {
+            let gate = crate::amdgpu_gem::lock_placement(CARD).await;
+            evict_for_hibernation(&gate, Some(heap.clone())).await
+        });
+        let Ok(evicted) = evicted else {
+            return TestResult::Fail("hibernation eviction");
+        };
+        if !object.system() || evicted.len() != 1 || pool.available() != full {
+            return TestResult::Fail("the eviction left a buffer in the carve-out");
+        }
+        if state
+            .create_dumb(64, 4, 32)
+            .is_ok_and(|(handle, _, _)| state.object(handle).is_some_and(|o| !o.system()))
+        {
+            return TestResult::Fail("a buffer was placed in the withdrawn heap");
+        }
+        // S4: the carve-out's contents are gone.
+        memory.fill(0);
+        back = [0; 4];
+        if object.placement().read_bytes(0x123, &mut back).is_none()
+            || back != 0x00c0_ffeeu32.to_le_bytes()
+        {
+            return TestResult::Fail("client bytes did not survive the carve-out");
+        }
+        crate::amdgpu_gem::restore_domains(evicted);
+        drop(object);
+        drop(state);
+        TestResult::Pass
+    }
+    /// amdgpu_acpi_is_s0ix_active for an APU suspending to idle, in Linux's
+    /// order: GFXOFF allowed, the FADT's LOW_POWER_S0, then AMD PMC. NARF has
+    /// no PMC driver, so s0ix is never active yet.
+    fn raphael_s0ix_follows_amdgpu_acpi_is_s0ix_active() -> TestResult {
+        for (gfxoff, lps0, pmc, want) in [
+            (false, true, true, S0ix::NoGfxoff),
+            (true, false, true, S0ix::NoLowPowerS0),
+            (true, true, false, S0ix::NoPmc),
+            (true, true, true, S0ix::Active),
+            (false, false, false, S0ix::NoGfxoff),
+        ] {
+            if s0ix(gfxoff, lps0, pmc) != want {
+                return TestResult::Fail("s0ix decision order");
+            }
+        }
+        if s0ix(true, true, AMD_PMC) == S0ix::Active {
+            return TestResult::Fail("s0ix active without an AMD PMC driver");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/raphael-reset",
+        raphael_s3_resume_work_follows_the_suspend_state
+    );
+    kernel_test_in!(
+        "drivers/gpu/raphael-reset",
+        raphael_s0ix_follows_amdgpu_acpi_is_s0ix_active
+    );
+    kernel_test_in!(
+        "drivers/gpu/raphael-reset",
+        raphael_s4_freeze_resets_after_the_psp_stop
+    );
+    kernel_test_in!(
+        "drivers/gpu/raphael-reset",
+        raphael_s4_eviction_empties_the_carve_out
+    );
     /// Every literal here is read off the AMD header, never off the row it
     /// checks. One case per row, so adding a GPU means adding a case: a new
     /// row with no case is a window nothing has verified.
@@ -1038,6 +2150,13 @@ mod tests {
             },
             VmWindow {
                 version: (10, 3, 5),
+                base_idx: 0,
+                ctx0_cntl: 0x15fc,
+            },
+            // gc_10_3_0_offset.h: mmGCVM_CONTEXT0_CNTL 0x15fc _BASE_IDX 0;
+            // gmc_v10_0.c gives GC 10.3.6 (Raphael) gfxhub_v2_1.
+            VmWindow {
+                version: (10, 3, 6),
                 base_idx: 0,
                 ctx0_cntl: 0x15fc,
             },
@@ -1089,6 +2208,23 @@ mod tests {
                 version: (2, 1, 2),
                 base_idx: 0,
                 ctx0_cntl: 0x06c0,
+            },
+            // mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_CNTL 0x0740 _BASE_IDX 1;
+            // gmc_v10_0.c gives MMHUB 2.3.0, 2.4.0 and 2.4.1 mmhub_v2_3.
+            VmWindow {
+                version: (2, 3, 0),
+                base_idx: 1,
+                ctx0_cntl: 0x0740,
+            },
+            VmWindow {
+                version: (2, 4, 0),
+                base_idx: 1,
+                ctx0_cntl: 0x0740,
+            },
+            VmWindow {
+                version: (2, 4, 1),
+                base_idx: 1,
+                ctx0_cntl: 0x0740,
             },
             VmWindow {
                 version: (2, 1, 0),
@@ -1185,6 +2321,12 @@ mod tests {
                     ..dcn300_expected
                 },
                 dcn314_expected,
+                // dcn/dcn_3_1_5_offset.h: every id above at the same offset on
+                // _BASE_IDX 2 (HUBP1 0x6c1, OTG1/3_OTG_CONTROL 0x1bc1/0x1cc1).
+                SurfaceWindow {
+                    version: (3, 1, 5),
+                    ..dcn314_expected
+                },
                 dcn350_expected,
                 dcn300_expected,
                 dcn401_expected,

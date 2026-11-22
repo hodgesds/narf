@@ -211,7 +211,9 @@ fn kernel_words(
             offset += count;
         }
     }
-    words.extend(sdma_wreg(bank_reg(l.hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    if let Some(hdp) = l.hdp.map(core::num::NonZeroU64::get) {
+        words.extend(sdma_wreg(bank_reg(hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    }
     words.extend(pm4::sdma_fence(address, seq));
     Ok(words)
 }
@@ -523,7 +525,10 @@ pub(crate) fn encode_cp(l: Layout, f: &Frame<'_>) -> Vec<u32> {
     if gfx {
         w.extend([packet3(PACKET3_FRAME_CONTROL, 0), 1 << 28]);
     }
-    w.extend(cp_wreg(gfx, bank_reg(l.hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    // amdgpu_ring_emit_hdp_invalidate: nothing where HDP has no read cache.
+    if let Some(hdp) = l.hdp.map(core::num::NonZeroU64::get) {
+        w.extend(cp_wreg(gfx, bank_reg(hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    }
     w.extend(pm4::release_mem(f.fence, f.seq));
     if gfx {
         // amdgpu_ib_schedule: emit_switch_buffer after the job fence
@@ -603,7 +608,9 @@ pub(crate) fn encode_sdma(l: Layout, f: &Frame<'_>) -> Vec<u32> {
             0,
         ]);
     }
-    w.extend(sdma_wreg(bank_reg(l.hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    if let Some(hdp) = l.hdp.map(core::num::NonZeroU64::get) {
+        w.extend(sdma_wreg(bank_reg(hdp, HDP_READ_CACHE_INVALIDATE), 1));
+    }
     w.extend(pm4::sdma_fence(f.fence, f.seq));
     w
 }
@@ -783,6 +790,59 @@ pub(crate) const MM_INV_REQ: u32 = 0x6e3; // linux: mmMMVM_INVALIDATE_ENG0_REQ
 pub(crate) const MM_INV_ACK: u32 = 0x6f5; // linux: mmMMVM_INVALIDATE_ENG0_ACK
 
 // linux-ctx: reset
+
+/// MMHUB 2.3 (`mmhub_v2_3`, Raphael) moved the same registers, onto base
+/// index 1, with `ctx_addr_distance` and `eng_distance` 8.
+pub(crate) const MM23_PTB_LO: u32 = 0x940; // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32)
+pub(crate) const MM23_INV_SEM: u32 = 0xa00; // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_INVALIDATE_ENG0_SEM)
+pub(crate) const MM23_INV_REQ: u32 = 0xa01; // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_INVALIDATE_ENG0_REQ)
+pub(crate) const MM23_INV_ACK: u32 = 0xa02; // linux: n/a (mmhub_2_3_0_offset.h: mmMMVM_INVALIDATE_ENG0_ACK)
+/// The highest MMHUB 2.3 register a media flush can name: engine 17's ACK.
+pub(crate) const MM23_LAST: u32 = MM23_INV_ACK + 17 * 8;
+
+/// The MMHUB registers a media ring's VM flush writes, as the hub's init
+/// function sets them (`ctx0_ptb_addr_lo32`, `vm_inv_eng0_sem/req/ack`,
+/// `ctx_addr_distance`, `eng_distance`): absolute register dwords.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MediaHub {
+    pub ptb_lo: u32,
+    pub inv_sem: u32,
+    pub inv_req: u32,
+    pub inv_ack: u32,
+    pub ctx_addr_distance: u32,
+    pub eng_distance: u32,
+}
+impl MediaHub {
+    /// `mmhub_v2_0_init` (MMHUB 2.0/2.1), from MMHUB segment 0's dword base.
+    pub(crate) const fn mmhub_v2_0(base: u32) -> Self {
+        Self {
+            ptb_lo: base + MM_PTB_LO,
+            inv_sem: base + MM_INV_SEM,
+            inv_req: base + MM_INV_REQ,
+            inv_ack: base + MM_INV_ACK,
+            ctx_addr_distance: 2, // linux: n/a (mmhub_2_0_0_offset.h: CONTEXT1 - CONTEXT0 PAGE_TABLE_BASE_ADDR_LO32)
+            eng_distance: 1,      // linux: n/a (mmhub_2_0_0_offset.h: ENG1_REQ - ENG0_REQ)
+        }
+    }
+    /// `mmhub_v2_3_init` (MMHUB 2.3/2.4), from MMHUB segment 1's dword base.
+    pub(crate) const fn mmhub_v2_3(base: u32) -> Self {
+        Self {
+            ptb_lo: base + MM23_PTB_LO,
+            inv_sem: base + MM23_INV_SEM,
+            inv_req: base + MM23_INV_REQ,
+            inv_ack: base + MM23_INV_ACK,
+            ctx_addr_distance: 8, // linux: n/a (mmhub_2_3_0_offset.h: 0x948 - 0x940)
+            eng_distance: 8,      // linux: n/a (mmhub_2_3_0_offset.h: 0xa09 - 0xa01)
+        }
+    }
+    fn ptb(self, vmid: u32) -> (u32, u32) {
+        let lo = self.ptb_lo + self.ctx_addr_distance * vmid;
+        (lo, lo + 1)
+    }
+    fn engine(self, reg: u32, engine: u32) -> u32 {
+        reg + self.eng_distance * engine
+    }
+}
 /// `AMDGPU_VMHUB_INV_ENG_BITMAP`: engines 2 and 3 stay with KFD/firmware.
 pub(crate) const INV_ENG_BITMAP: u32 = 0x1fff3; // linux: AMDGPU_VMHUB_INV_ENG_BITMAP@amdgpu
 /// Largest IB count per media job: `amdgpu_ring_max_ibs(VCN_JPEG)`, and the
@@ -848,8 +908,8 @@ impl MediaRing {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MediaFrame<'a> {
     pub ring: MediaRing,
-    /// MMHUB segment-0 dword base (`adev->reg_offset[MMHUB_HWIP][0][0]`).
-    pub mmhub: u32,
+    /// The hub's flush registers (`adev->vmhub[AMDGPU_MMHUB0(0)]`).
+    pub hub: MediaHub,
     pub engine: u32,
     pub flush: Option<VmRef>,
     /// IH LUT write after the flush: (absolute `IH_VMID_<vmid>_LUT_MM`
@@ -950,24 +1010,26 @@ pub(crate) fn encode_media(f: &MediaFrame<'_>) -> Vec<u32> {
     };
     if let Some(vm) = f.flush {
         let v = u32::from(vm.vmid);
-        let reg = |offset: u32| f.mmhub + offset;
+        let hub = f.hub;
+        let (ptb_lo, ptb_hi) = hub.ptb(v);
+        let (sem, req, ack) = (
+            hub.engine(hub.inv_sem, f.engine),
+            hub.engine(hub.inv_req, f.engine),
+            hub.engine(hub.inv_ack, f.engine),
+        );
         let (lo, hi) = (vm.page_table_base as u32, (vm.page_table_base >> 32) as u32);
         media_start(f.ring, &mut w);
         // gmc_v10_0_emit_flush_gpu_tlb: semaphore acquire (reads 1).
-        wait(&mut w, reg(MM_INV_SEM) + f.engine, 1, 1);
-        wreg(&mut w, reg(MM_PTB_LO) + 2 * v, lo);
-        wreg(&mut w, reg(MM_PTB_HI) + 2 * v, hi);
+        wait(&mut w, sem, 1, 1);
+        wreg(&mut w, ptb_lo, lo);
+        wreg(&mut w, ptb_hi, hi);
         // amdgpu_ring_emit_reg_write_reg_wait_helper
-        wreg(
-            &mut w,
-            reg(MM_INV_REQ) + f.engine,
-            invalidate_request(vm.vmid),
-        );
-        wait(&mut w, reg(MM_INV_ACK) + f.engine, 1 << v, 1 << v);
+        wreg(&mut w, req, invalidate_request(vm.vmid));
+        wait(&mut w, ack, 1 << v, 1 << v);
         // semaphore release
-        wreg(&mut w, reg(MM_INV_SEM) + f.engine, 0);
+        wreg(&mut w, sem, 0);
         // the ring's own emit_vm_flush tail: wait for the PTB write
-        wait(&mut w, reg(MM_PTB_LO) + 2 * v, lo, u32::MAX);
+        wait(&mut w, ptb_lo, lo, u32::MAX);
         if let Some((lut, pasid)) = f.pasid_map {
             // gmc_v10_0_emit_pasid_mapping through the ring's emit_wreg.
             wreg(&mut w, lut, u32::from(pasid));

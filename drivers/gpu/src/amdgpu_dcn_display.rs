@@ -302,6 +302,7 @@ fn publish(scanout: Option<GenericFb>) {
 pub struct Pipeline {
     clocks: ClockManager,
     dccg: Dccg,
+    hubbub: crate::amdgpu_dcn_hubbub::Hubbub,
     otg: Otg,
     hubp: Hubp,
     dpp: Dpp,
@@ -309,6 +310,8 @@ pub struct Pipeline {
     opp: Opp,
     stream: Stream,
     source: amdgpu_dio::Source,
+    /// The DML parameters and rules this pipe's DCN follows.
+    dcn: crate::amdgpu_dml::Dcn,
     pipe: u8,
     route: Route,
     streaming: bool,
@@ -322,6 +325,9 @@ pub struct Platform {
     pub memory: Memory,
     pub dchub_refclk_khz: u32,
     pub dentist_vco_khz: u32,
+    /// The DPREFCLK spread the DP DTO's reference is lowered by, when the
+    /// SPLL spreads (DCN 3.1.4 only).
+    pub dpref_spread: Option<clk::Spread>,
 }
 
 impl Pipeline {
@@ -340,11 +346,17 @@ impl Pipeline {
         pipe: u8,
         route: Route,
     ) -> Result<Self, Error> {
+        let dcn = match crate::amdgpu_dcn_profile::Profile::resolve(gpu)? {
+            crate::amdgpu_dcn_profile::Profile::Dcn314 => crate::amdgpu_dml::Dcn::Dcn314,
+            crate::amdgpu_dcn_profile::Profile::Dcn315 => crate::amdgpu_dml::Dcn::Dcn315,
+            _ => return Err(Error::Hardware(clk::Error::Unsupported)),
+        };
         // SAFETY: every claim below is covered by this constructor's contract.
         unsafe {
             Ok(Self {
                 clocks: ClockManager::new(gpu, authority, pool)?,
                 dccg: Dccg::new(gpu, authority)?,
+                hubbub: crate::amdgpu_dcn_hubbub::Hubbub::new(gpu, authority)?,
                 otg: Otg::new(gpu, authority, pipe)?,
                 hubp: Hubp::new(gpu, authority, pipe)?,
                 dpp: Dpp::new(gpu, authority, pipe)?,
@@ -352,6 +364,7 @@ impl Pipeline {
                 opp: Opp::new(gpu, authority, pipe)?,
                 stream: Stream::new(gpu, authority, route.frontend)?,
                 source: amdgpu_dio::Source::new(gpu, authority, route).map_err(Error::Link)?,
+                dcn,
                 pipe,
                 route,
                 streaming: false,
@@ -427,13 +440,22 @@ impl Pipeline {
     /// mode that needs more than the firmware's own DPM ceiling is refused here
     /// rather than part way through programming.
     pub fn plan(
-        &self,
+        &mut self,
         timing: &Timing,
         scanout: &Scanout,
         platform: &Platform,
     ) -> Result<Plan, Error> {
         let levels = self.clocks.levels().ok_or(Error::Invalid)?;
+        // The DET this pipe will be given, beside any pipe already live; the
+        // mode math has to be done against that, not the IP default.
+        let crb = self.hubbub.plan(
+            self.pipe,
+            scanout.width,
+            timing.pixel_clock_khz,
+            levels.max_dispclk_khz(),
+        )?;
         let config = Config {
+            dcn: self.dcn,
             timing: *timing,
             plane: Plane {
                 format: scanout.format,
@@ -449,7 +471,7 @@ impl Pipeline {
             dentist_vco_khz: platform.dentist_vco_khz,
             cursors: 0,
         };
-        let geometry = config.geometry()?;
+        let geometry = config.geometry_with_det(u64::from(crb.det_kbytes))?;
         let requirements = config.requirements(&geometry, levels.max_dispclk_khz())?;
         // `requirements` reports the real need even when it exceeds the ceiling,
         // so the refusal is ours to make.
@@ -468,6 +490,58 @@ impl Pipeline {
         };
         let watermarks = config.watermarks(&platform.memory, &clocks)?;
         let prefetch = config.prefetch(&geometry, &clocks, &watermarks)?;
+        // "For 31x apu pstate change is only supported if possible in
+        // vactive" (dcn31_calculate_wm_and_dlg_fp), on the DET and compressed
+        // buffer this pipe is given.
+        let dram_change = config.dram_clock_change(
+            &geometry,
+            &watermarks,
+            &prefetch,
+            crb.unbounded,
+            u64::from(crb.compbuf_kbytes),
+        );
+        let pstate_supported = dram_change.support == crate::amdgpu_dml::DramClockChange::Vactive;
+        // dcn315_update_soc_for_wm_a: otherwise DCN 3.1.5 computes with the
+        // dummy p-state latency, and its clock manager locks p-state (see
+        // `ClockManager::set_pstate_support`). DCN 3.1.4 keeps its latency.
+        //
+        // LINUX-GAP: Linux picks the latency from the previous validation's
+        // result, so a mode that cannot hide 129 us alternates between commits.
+        // This takes the pairing that comment describes, deterministically.
+        let (watermarks, prefetch) =
+            if self.dcn == crate::amdgpu_dml::Dcn::Dcn315 && !pstate_supported {
+                let watermarks = config.watermarks_with_pstate_latency(
+                    &platform.memory,
+                    &clocks,
+                    Some(crate::amdgpu_dml::Fx::int(
+                        crate::amdgpu_dml::DUMMY_PSTATE_LATENCY_US,
+                    )),
+                )?;
+                let prefetch = config.prefetch(&geometry, &clocks, &watermarks)?;
+                (watermarks, prefetch)
+            } else {
+                (watermarks, prefetch)
+            };
+        // FractionOfUrgentBandwidth for one linear plane without VM, DCC,
+        // cursor or chroma: the larger of the active read and the prefetch
+        // pixel bandwidth, over the return bandwidth, in thousandths.
+        let frac_urg_bw_nom = crate::amdgpu_dml::Fx::int(1000)
+            .times(
+                requirements
+                    .read_bandwidth_bytes_per_us
+                    .max(prefetch.required_prefetch_bandwidth_bytes_per_us),
+            )
+            .over(watermarks.return_bandwidth_bytes_per_us)
+            .floor()
+            .clamp(0, u32::MAX as i64) as u32;
+        let arbiter = crate::amdgpu_dcn_hubbub::Watermarks::from_dml(
+            match self.dcn {
+                crate::amdgpu_dml::Dcn::Dcn314 => crate::amdgpu_dcn_profile::Profile::Dcn314,
+                crate::amdgpu_dml::Dcn::Dcn315 => crate::amdgpu_dcn_profile::Profile::Dcn315,
+            },
+            &watermarks,
+            frac_urg_bw_nom,
+        );
         let registers = Registers::new(
             &config,
             &geometry,
@@ -479,6 +553,9 @@ impl Pipeline {
         Ok(Plan {
             clocks,
             registers,
+            crb,
+            arbiter,
+            pstate_supported,
             sync: GlobalSync {
                 v_startup_lines: prefetch.v_startup,
                 v_update_offset_pix: prefetch.v_update_offset_pix,
@@ -505,7 +582,7 @@ impl Pipeline {
         }
         let plan = self.plan(timing, scanout, platform)?;
         match self
-            .bring_up(loader, scanout, timing, &plan, depth, sink_caps)
+            .bring_up(loader, scanout, timing, &plan, platform, depth, sink_caps)
             .await
         {
             Ok(()) => {
@@ -521,12 +598,14 @@ impl Pipeline {
             }
         }
     }
+    #[allow(clippy::too_many_arguments)]
     async fn bring_up(
         &mut self,
         loader: &mut Loader,
         scanout: &Scanout,
         timing: &Timing,
         plan: &Plan,
+        platform: &Platform,
         depth: Depth,
         sink_caps: [u8; 16],
     ) -> Result<(), Error> {
@@ -544,11 +623,32 @@ impl Pipeline {
             deep_sleep_dcfclk_khz: plan.clocks.deep_sleep_dcfclk_khz,
             dtbclk_enabled: self.route.channel == crate::amdgpu_dmub::Channel::Dpia,
         };
+        self.clocks.set_pstate_support(plan.pstate_supported);
         self.clocks.update(requested, false, &mut consumers).await?;
         self.clocks.enter_mission_mode().await?;
+        // dcn20_prepare_bandwidth: raise the arbiter watermarks, and shrink
+        // the compressed buffer so the DET below fits beside it.
+        let refclk_mhz = platform.dchub_refclk_khz / 1000;
+        self.hubbub.program_watermarks(
+            &plan.arbiter,
+            refclk_mhz,
+            crate::amdgpu_dcn_hubbub::Mode::Raise,
+        )?;
+        self.hubbub
+            .program_compbuf_size(plan.crb.prepare_compbuf_kbytes, false)
+            .await?;
         // A DisplayPort stream with one pixel per container and no ODM combine.
+        // dccg31 (DCN 3.1.5) has no K1/K2 dividers, and Linux skips the call.
+        if self.dccg.has_pixel_rate_div() {
+            self.dccg
+                .set_pixel_rate_div(self.pipe, Divider::By1, Divider::By4)?;
+        }
+        // dcn31_program_pix_clk: a DP stream's pixel clock is its OTG's DP
+        // DTO, which nothing else sets for a pipe the boot firmware left idle.
+        let reference =
+            clk::dp_dto_reference_khz(self.clocks.dprefclk_khz(), platform.dpref_spread);
         self.dccg
-            .set_pixel_rate_div(self.pipe, Divider::By1, Divider::By4)?;
+            .set_dp_dto(self.pipe, timing.pixel_clock_khz, reference)?;
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
             self.dccg.set_dp_stream_clock(
                 self.route.aux,
@@ -569,7 +669,11 @@ impl Pipeline {
             .program(Encoding::Rgb, scanout.width, scanout.height)?;
         self.opp.set_blank(true)?;
 
-        // 4. The pipe, still blanked, with the deadlines this surface needs.
+        // 4. The pipe, still blanked, with the deadlines this surface needs, on
+        // the DET the mode math was done for (dcn20_program_pipe).
+        self.hubbub
+            .program_det_size(self.pipe, plan.crb.det_kbytes)?;
+        self.hubp.set_unbounded_requesting(plan.crb.unbounded)?;
         self.hubp.program(&scanout.surface(), &plan.registers)?;
         self.hubp.blank().await?;
 
@@ -623,6 +727,20 @@ impl Pipeline {
         self.hubp.unblank().await?;
         self.stream.unblank().await?;
         self.opp.set_blank(false)?;
+
+        // 10. dcn20_optimize_bandwidth: grow the compressed buffer once every
+        // DET has applied, and — when this is the hub's only live pipe, so the
+        // values describe everything it serves — program the arbiter exactly.
+        if !self.hubbub.others_live(self.pipe)? {
+            self.hubbub.program_watermarks(
+                &plan.arbiter,
+                refclk_mhz,
+                crate::amdgpu_dcn_hubbub::Mode::Exact,
+            )?;
+        }
+        self.hubbub
+            .program_compbuf_size(plan.crb.compbuf_kbytes, true)
+            .await?;
         Ok(())
     }
     /// Take the stream down in the reverse order, and keep going past a failing
@@ -638,6 +756,9 @@ impl Pipeline {
         record(self.stream.blank().await.map_err(Error::Hardware));
         record(self.hubp.blank().await.map_err(Error::Hardware));
         record(self.source.disable(loader).await.map_err(Error::Link));
+        // Linux's DP 8b/10b SST order: link down first so the sink never sees
+        // TPS1, then `disable_stream` releases the front end's FIFO.
+        record(self.stream.reset().map_err(Error::Hardware));
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
             // Hand the tunnel's bandwidth back, or the other endpoints on this
             // router never see it again.
@@ -648,6 +769,24 @@ impl Pipeline {
             );
         }
         record(self.otg.disable().await.map_err(Error::Hardware));
+        // A disabled pipe gives its DET back (dcn20_prepare_bandwidth's
+        // program_det_size(.., 0)) and stops unbounded requesting.
+        record(
+            self.hubbub
+                .program_det_size(self.pipe, 0)
+                .map_err(Error::Hardware),
+        );
+        record(
+            self.hubbub
+                .wait_for_det_apply(self.pipe)
+                .await
+                .map_err(Error::Hardware),
+        );
+        record(
+            self.hubp
+                .set_unbounded_requesting(false)
+                .map_err(Error::Hardware),
+        );
         record(self.mpc.release(self.pipe).map_err(Error::Hardware));
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
             record(
@@ -676,6 +815,12 @@ impl Pipeline {
 pub struct Plan {
     pub clocks: ClockState,
     pub registers: Registers,
+    /// This pipe's share of the return buffer, and the compressed buffer.
+    pub crb: crate::amdgpu_dcn_hubbub::Plan,
+    /// The DCHUBBUB arbiter watermarks for this plane.
+    pub arbiter: crate::amdgpu_dcn_hubbub::Watermarks,
+    /// Whether the DRAM clock may change: only when it fits in vactive.
+    pub pstate_supported: bool,
     pub sync: GlobalSync,
 }
 

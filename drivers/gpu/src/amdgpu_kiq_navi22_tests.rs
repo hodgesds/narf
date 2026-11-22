@@ -1,7 +1,7 @@
 use super::*;
 use crate::amdgpu_cp_navi22::{
     tests::{cancel_at, enabled, hw, pool, r, run, Model},
-    FENCE, QUEUE_BYTES, SCRATCH,
+    FENCE, QUEUE_BYTES, SCRATCH, VM_FENCE,
 };
 use core::sync::atomic::Ordering;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -18,6 +18,7 @@ fn engine(model: Model) -> (Pool, Engine<Model>) {
             compute,
             state: State::Prepared,
             proof: Proof::default(),
+            mqd_backup: None,
         },
     )
 }
@@ -112,6 +113,115 @@ kernel_test_in!(
     "drivers/gpu/kiq-navi22",
     kiq_navi22_maps_compute_queue_and_runs_ring_and_ib_tests
 );
+
+/// gfx_v10_0_reset_kcq on a hung compute ring: KIQ UNMAP_QUEUES
+/// (RESET_QUEUES), the HQD inactive, the MQD restored from its map-time
+/// backup with an empty ring, MAP_QUEUES and both ring tests. The stalled
+/// job never runs; force completion then shows the ring's last sequence on
+/// both fences, and the queue executes again.
+fn kiq_compute_reset_restores_an_empty_queue() -> TestResult {
+    let (_pool, mut e) = engine(enabled());
+    if run(e.init_kiq()).is_err() || run(e.map_compute()).is_err() || run(e.test_ib()).is_err() {
+        return TestResult::Fail("compute bring-up");
+    }
+    let mqd = |e: &Engine<Model>| -> alloc::vec::Vec<u32> {
+        (0..mqd::DWORDS as u64)
+            .map(|i| e.hw.io.word(e.compute.address(MQD + i * 4)))
+            .collect()
+    };
+    let backup = mqd(&e);
+    if e.mqd_backup.as_deref() != Some(&backup[..]) {
+        return TestResult::Fail("MQD backup differs from the mapped MQD");
+    }
+    // A job the engine never runs, and HQD state an unmap would save.
+    e.hw.io.stalled[2] = true;
+    let seq = e.compute.next_seq();
+    let (hw, compute) = (&mut e.hw, &mut e.compute);
+    hw.access(|io, l| {
+        compute.emit(io, &pm4::release_mem(compute.address(FENCE), seq))?;
+        compute.commit(io, l);
+        Ok(())
+    })
+    .unwrap();
+    e.hw.io
+        .mem
+        .insert(e.compute.address(MQD + 4 * 4), 0x0bad_0bad);
+    e.hw.io.stalled[2] = false;
+    e.hw.io.regs.insert(r(RLC_CNTL), 1);
+    let unmapped = e.hw.io.unmapped;
+    if run(e.reset_compute()).is_err() || e.state != State::Verified {
+        return TestResult::Fail("compute reset failed");
+    }
+    let m = &e.hw.io;
+    if m.unmapped != unmapped + 1
+        || m.mapped.len() != 1
+        || (m.mapped[0].me, m.mapped[0].doorbell) != (1, 6)
+        || mqd(&e) != backup
+        || m.word(e.compute.address(FENCE)) != seq - 1
+        || m.writes.iter().filter(|w| w.0 == r(RLC_SAFE_MODE)).count() != 2
+    {
+        return TestResult::Fail("reset kept the hung queue's state or ran its job");
+    }
+    if e.force_complete_compute().is_err()
+        || e.hw.io.word(e.compute.address(FENCE)) != seq
+        || e.hw.io.word(e.compute.address(VM_FENCE)) != seq
+    {
+        return TestResult::Fail("force completion");
+    }
+    if run(crate::amdgpu_cp_navi22::ring_test(
+        &mut e.hw,
+        &mut e.compute,
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("reset compute ring does not execute");
+    }
+    // A second reset needs the backup only; a failed one is terminal.
+    e.hw.io.stalled[2] = true;
+    if run(e.reset_compute()).is_ok() || e.state != State::Failed {
+        return TestResult::Fail("a reset whose ring test fails left the queue usable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/kiq-navi22",
+    kiq_compute_reset_restores_an_empty_queue
+);
+
+/// gfx_v10_0_reset_kgq's KIQ half: CP_VMID_RESET for the VMID and the
+/// mapped gfx queue, the MQD and register waits, the KIQ ring test; then
+/// the queue's MAP_QUEUES (ENGINE_SEL 4). The KIQ stays verified.
+fn kiq_resets_and_remaps_a_gfx_queue() -> TestResult {
+    let (pool, mut e) = engine(enabled());
+    if run(e.init_kiq()).is_err() || run(e.map_compute()).is_err() || run(e.test_ib()).is_err() {
+        return TestResult::Fail("compute bring-up");
+    }
+    let gfx = Queue::new(&pool, Kind::Cp, doorbell::GFX_RING0, fence::Engine::Gfx).unwrap();
+    let map = crate::amdgpu_cp_navi22::GfxQueueMap {
+        pipe: 0,
+        doorbell: gfx.doorbell,
+        mqd: gfx.address(crate::amdgpu_cp_navi22::GFX_MQD),
+        wptr: gfx.address(WPTR),
+    };
+    e.state = State::Mapped;
+    if run(e.map_gfx(&[map])).is_err() {
+        return TestResult::Fail("gfx map");
+    }
+    e.state = State::Verified;
+    let gfx_mapped = |e: &Engine<Model>| e.hw.io.mapped.iter().filter(|q| q.me == 0).count();
+    if run(e.reset_gfx_vmid(3, map)).is_err()
+        || e.hw.io.vmid_resets != [1 << 3 | 1 << 16]
+        || gfx_mapped(&e) != 0
+        || e.state != State::Verified
+    {
+        return TestResult::Fail("KIQ VMID reset");
+    }
+    if run(e.remap_gfx(map)).is_err() || gfx_mapped(&e) != 1 || e.state != State::Verified {
+        return TestResult::Fail("KIQ gfx remap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/kiq-navi22", kiq_resets_and_remaps_a_gfx_queue);
 
 fn kiq_navi22_dequeues_inherited_kiq_or_stops_bounded() -> TestResult {
     for stuck in [false, true] {
@@ -290,4 +400,41 @@ fn kiq_navi22_maps_gfx_queues_with_engine_sel_4() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/kiq-navi22",
     kiq_navi22_maps_gfx_queues_with_engine_sel_4
+);
+
+/// Re-armed after a reset (a fresh model), the KIQ and compute owner maps
+/// the same two queues again: sequences from zero, the same MQD backed up,
+/// nothing more reserved.
+fn kiq_rearm_maps_the_same_queues_again() -> TestResult {
+    let up = |e: &mut Engine<Model>| {
+        run(e.init_kiq()).is_ok()
+            && run(e.map_compute()).is_ok()
+            && run(e.test_ib()).is_ok()
+            && e.state == State::Verified
+    };
+    let (pool, mut e) = engine(enabled());
+    if !up(&mut e) {
+        return TestResult::Fail("first compute bring-up");
+    }
+    let (seq, free, backup) = (e.compute.seq, pool.available(), e.mqd_backup.clone());
+    // SAFETY: the model is replaced below, as a device reset would.
+    unsafe { e.rearm() };
+    if e.state != State::Prepared
+        || (e.kiq.seq, e.compute.seq, e.compute.wptr) != (0, 0, 0)
+        || e.mqd_backup.is_some()
+    {
+        return TestResult::Fail("re-arm kept the last run's state");
+    }
+    e.hw.io = enabled();
+    if !up(&mut e) {
+        return TestResult::Fail("re-armed compute bring-up");
+    }
+    if e.compute.seq != seq || e.mqd_backup != backup || pool.available() != free {
+        return TestResult::Fail("re-armed compute left its queues or reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/kiq-navi22",
+    kiq_rearm_maps_the_same_queues_again
 );

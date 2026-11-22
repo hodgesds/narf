@@ -21,6 +21,60 @@ const DST_MC: u64 = 0x9_2000_0000;
 
 const PASID: u16 = 0x0042;
 
+/// Raphael's client frames keep HDP's write flush (NBIO 7.2's request/done
+/// pair sits at NBIO 2.3's offsets) and drop the read-cache invalidate that
+/// HDP 5.2.1 does not have, on the CP and SDMA rings alike.
+fn raphael_client_frames_drop_the_hdp_invalidate() -> TestResult {
+    let navi22 = crate::amdgpu_cp_navi22::tests::layout();
+    let raphael = crate::amdgpu_cp_navi22::Layout {
+        hdp: None,
+        ..navi22
+    };
+    let ibs = [Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: 0,
+    }];
+    let frame = Frame {
+        gfx: true,
+        engine: 4,
+        sync: None,
+        flush: None,
+        pasid_map: None,
+        vm_fence: None,
+        vmid: VMID,
+        context_switch: false,
+        gds_max_wave_id: None,
+        ibs: &ibs,
+        fence: 0x4000,
+        seq: 2,
+        wptr: 0,
+    };
+    let sdma = Frame {
+        gfx: false,
+        engine: 13,
+        ..frame
+    };
+    let hdp = 0xf20 + 0xd1;
+    for (with, without) in [
+        (encode_cp(navi22, &frame), encode_cp(raphael, &frame)),
+        (encode_sdma(navi22, &sdma), encode_sdma(raphael, &sdma)),
+    ] {
+        let flush = 6;
+        if !with.contains(&hdp)
+            || without.contains(&hdp)
+            || with.get(..flush) != without.get(..flush)
+        {
+            return TestResult::Fail("Raphael client frames kept the HDP invalidate");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/raphael",
+    raphael_client_frames_drop_the_hdp_invalidate
+);
+
 fn navi22_client_hdp_commands_bracket_ibs() -> TestResult {
     let layout = crate::amdgpu_cp_navi22::tests::layout();
     let ibs = [Ib {
@@ -403,6 +457,7 @@ fn gfx_engine() -> (crate::amdgpu_vram::Pool, GfxEngine<Model>) {
         state: GfxState::Prepared,
         proof: GfxProof::default(),
         golden: false,
+        mqd_backup: None,
     };
     assert!(run(e.configure()).is_ok() && run(e.start()).is_ok() && run(e.test_ib()).is_ok());
     (pool, e)
@@ -490,6 +545,7 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
         compute: Queue::new(&vram, Kind::Cp, doorbell::MEC_RING0, fence::Engine::Compute).unwrap(),
         state: crate::amdgpu_kiq_navi22::State::Prepared,
         proof: Default::default(),
+        mqd_backup: None,
     };
     if run(c.init_kiq()).is_err() || run(c.map_compute()).is_err() || run(c.test_ib()).is_err() {
         return TestResult::Fail("compute bring-up");
@@ -533,6 +589,7 @@ fn navi22_submit_compute_and_sdma_user_vmid_ibs_execute() -> TestResult {
         .into(),
         state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
         proof: Default::default(),
+        nbio_v7_2: None,
     };
     if run(s.start()).is_err() || run(s.test_ib()).is_err() {
         return TestResult::Fail("SDMA bring-up");
@@ -1064,6 +1121,7 @@ fn navi22_vmid_clients_on_two_rings_keep_their_own_translations() -> TestResult 
         .into(),
         state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
         proof: Default::default(),
+        nbio_v7_2: None,
     };
     if run(s.start()).is_err() || run(s.test_ib()).is_err() {
         return TestResult::Fail("SDMA bring-up");
@@ -1300,7 +1358,7 @@ fn rdna2_sequences_wrap_without_zero_or_false_device_loss() -> TestResult {
     e.queue.seq = u32::MAX;
     e.hw.io.mem.insert(e.queue.address(FENCE), u32::MAX);
     e.hw.io.revoke = Some((
-        crate::amdgpu_cp_navi22::tests::layout().hdp + 0xd1 * 4,
+        crate::amdgpu_cp_navi22::tests::layout().hdp.unwrap().get() + 0xd1 * 4,
         1,
         e.hw.authority,
     ));
@@ -1335,6 +1393,7 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
         ],
         state: crate::amdgpu_sdma_navi22_queues::State::Prepared,
         proof: Default::default(),
+        nbio_v7_2: None,
     };
     if run(engine.start()).is_err() || run(engine.test_ib()).is_err() {
         return TestResult::Fail("kernel SDMA setup");
@@ -1425,7 +1484,7 @@ fn rdna2_kernel_sdma_fill_copy_and_validation() -> TestResult {
         || words[tail - 3..tail]
             != [
                 14 | (0xf << 28),
-                bank_reg(layout.hdp, HDP_READ_CACHE_INVALIDATE),
+                bank_reg(layout.hdp.unwrap().get(), HDP_READ_CACHE_INVALIDATE),
                 1,
             ]
         || words[tail..] != fence_words[..]

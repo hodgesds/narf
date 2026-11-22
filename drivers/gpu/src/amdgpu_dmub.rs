@@ -26,14 +26,14 @@ pub struct Firmware {
     bytes: Vec<u8>,
 }
 
-struct OpenFirmware;
+struct OpenFirmware(&'static str);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenFirmware {
     type Output = Result<Vec<u8>, FirmwareError>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(firmware::DCN314_FIRMWARE, cap) {
+        let blob = match narf_firmware::open(self.0, cap) {
             Ok(blob) => blob,
             Err(error) => return Ok(Err(FirmwareError::Registry(error))),
         };
@@ -68,7 +68,7 @@ impl Firmware {
         &'a self,
         gpu: &'a AmdGpu,
     ) -> Result<firmware::Prepared<'a>, FirmwareError> {
-        dcn314_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
         let vbios = gpu.vbios.as_ref().ok_or(FirmwareError::VbiosUnavailable)?;
         self.prepare(vbios.bytes())
     }
@@ -78,8 +78,12 @@ impl Firmware {
         gpu: &AmdGpu,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
-        dcn314_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
-        let bytes = authority.invoke(OpenFirmware).map_err(|_| {
+        let ip = dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        let name = match (ip.major, ip.minor, ip.revision) {
+            (3, 1, 5) => firmware::DCN315_FIRMWARE,
+            _ => firmware::DCN314_FIRMWARE,
+        };
+        let bytes = authority.invoke(OpenFirmware(name)).map_err(|_| {
             FirmwareError::Registry(narf_firmware::FirmwareError::AuthorityRevoked)
         })??;
         Ok(Self { bytes })
@@ -102,9 +106,16 @@ impl Firmware {
 /// itself is named per version. Supporting another generation means another
 /// blob and its own `dmub_dcn*` sequence, so this list stays in step with the
 /// firmware this module actually knows how to hand over to.
-const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+///
+/// DCN 3.1.5 (Raphael) is the same sequence: `dmub_srv.c` gives
+/// `DMUB_ASIC_DCN315` every `dmub_dcn31_*` function DCN 3.1.4 uses, with only
+/// the register table (`dmub_srv_dcn315_regs`) built from its own header, and
+/// every DMCUB register both headers define sits at the same offset. DCN 3.1.5
+/// lacks `DMCUB_EXT_INTERRUPT_STATUS` and `DMCUB_GPINT_DATAIN2..5`, which this
+/// module does not use.
+const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4), (3, 1, 5)];
 
-pub(crate) fn dcn314_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
+pub(crate) fn dcn31x_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
     let mut blocks = gpu
         .ip_blocks
         .iter()
@@ -144,19 +155,29 @@ pub struct Dmub {
     write: u32,
     read: u32,
     poisoned: bool,
+    dpias: u8,
+}
+/// The USB4 DPIAs this DCN's firmware serves: `dcn314_resource.c` sets
+/// `usb4_dpia_count = 4`; `dcn315_resource.c` sets none, so Linux never sends
+/// Raphael's firmware a DPIA command, and neither does this.
+pub(crate) fn dpia_count(ip: &crate::amdgpu_discovery::IpBlock) -> u8 {
+    match (ip.major, ip.minor, ip.revision) {
+        (3, 1, 4) => 4,
+        _ => 0,
+    }
 }
 impl Dmub {
     /// # Safety
     /// Caller exclusively owns the GPU's DMUB mailbox for the returned
     /// object's lifetime, including power management and firmware replacement.
     pub unsafe fn attach(gpu: &AmdGpu) -> Result<Self, Error> {
-        let ip = dcn314_ip(gpu)?;
+        let ip = dcn31x_ip(gpu)?;
         if ip.num_bases < 3 {
             return Err(Error::Unsupported);
         }
         let base = ip.base_addrs[2] as u64 * 4;
         // SAFETY: inherited mapping and exclusive mailbox ownership.
-        unsafe { Self::attach_regions(gpu.regs, gpu.fb_bar, base) }
+        unsafe { Self::attach_regions(gpu.regs, gpu.fb_bar, base, dpia_count(ip)) }
     }
     /// # Safety
     /// Valid DCN314 mappings and exclusive DMUB ownership must outlive Self.
@@ -164,6 +185,7 @@ impl Dmub {
         regs: MmioRegion,
         fb: MmioRegion,
         base: u64,
+        dpias: u8,
     ) -> Result<Self, Error> {
         if base.checked_add(0x478 * 4).is_none_or(|end| end > regs.len) {
             return Err(Error::Invalid);
@@ -179,6 +201,7 @@ impl Dmub {
             write: 0,
             read: 0,
             poisoned: false,
+            dpias,
         };
         if d.reg(0x1f6) & (1 << 16) == 0 || d.reg(0x1e3) & 3 != 3 {
             return Err(Error::NotReady);
@@ -331,6 +354,10 @@ impl Dmub {
         let mut command = header(71, 0, 4);
         command[4] = 1;
         self.command(command).await.map(|_| ())
+    }
+    /// How many DPIAs the firmware serves (see [`dpia_count`]).
+    pub(crate) fn dpias(&self) -> u8 {
+        self.dpias
     }
     pub async fn hpd(&mut self, instance: u8, channel: Channel) -> Result<bool, Error> {
         let mut command = header(82, 0, 12);
@@ -550,7 +577,7 @@ pub(crate) mod tests {
             return TestResult::Fail("firmware preparation ignored revoked registry authority");
         }
         gpu.ip_blocks.push(ip);
-        if dcn314_ip(&gpu).is_ok() {
+        if dcn31x_ip(&gpu).is_ok() {
             return TestResult::Fail("ambiguous DCN discovery accepted");
         }
         gpu.ip_blocks.pop();
@@ -614,6 +641,7 @@ pub(crate) mod tests {
             write: 0,
             read: 0,
             poisoned: false,
+            dpias: 4,
         };
         let mut cx = Context::from_waker(Waker::noop());
         for next in [64u32, 0, 64] {
@@ -689,4 +717,27 @@ pub(crate) mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/amdgpu-dmub", dmub_mailbox_bounds);
+
+    /// DCN 3.1.4 serves four DPIAs (`dcn314_resource.c`); DCN 3.1.5 serves none
+    /// (`dcn315_resource.c` sets no `usb4_dpia_count`), so the sink scan sends
+    /// Raphael's firmware no DPIA command.
+    fn dmub_dpia_count_follows_the_dcn() -> TestResult {
+        use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
+        let ip = |revision| IpBlock {
+            hw_id: HW_ID_DCN,
+            instance: 0,
+            major: 3,
+            minor: 1,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: [0; MAX_BASE_ADDRS],
+            num_bases: 3,
+        };
+        if dpia_count(&ip(4)) != 4 || dpia_count(&ip(5)) != 0 {
+            return TestResult::Fail("DPIA count per DCN");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/amdgpu-dmub", dmub_dpia_count_follows_the_dcn);
 }

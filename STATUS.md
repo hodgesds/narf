@@ -1035,6 +1035,10 @@ The DCN314 stream pipeline is now implemented end to end. A fixed-point port
 of DML derives the detile geometry, the required clocks, the urgent, p-state and
 stutter watermarks and the prefetch schedule, and encodes them into the HUBP
 request, latency and throttle registers, refusing any value a field cannot hold.
+The DCHUBBUB arbiter receives the same watermarks, and the pipe's detile buffer
+and the compressed buffer are split as Linux splits them (192 KB with unbounded
+requesting for a lone pipe). Beside a pipe the boot firmware left live, the
+watermarks are only raised and that pipe keeps its detile buffer.
 The display clock manager latches the firmware's own DPM table and applies
 clocks in Linux's order; the clock generator divides them per pipe and routes a
 tunnelled stream's clock. The timing generator, hub pixel pipe, DPP, combiner,
@@ -1067,6 +1071,13 @@ display through an observer the framebuffer layer installs, and returns to the
 boot framebuffer when the stream goes away. A stream survives suspend: the mode it
 was validated for is retained and replayed on resume, with the clock levels
 re-latched and the surface re-cleared.
+Raphael (`1002:164E`, the Ryzen 7000/9000 desktop iGPU: RDNA2, DCN 3.1.5,
+PSP 13.0.5) takes the same native DisplayPort path. It has its own timing
+generator layout, DCCG, stream-encoder unblank, SMU 13.0.5 display-clock
+mailbox, dml31 parameters, PSP ring kind, DMCUB firmware and boot-inventory
+rows. Raphael has no USB4 DPIA. The port map is
+`drivers/gpu/research/raphael-dcn315-port.md`; nothing in it has run on Raphael
+hardware.
 **The one remaining gap is silicon.** Physical Lenovo 50ee USB-C/USB4 validation
 is pending; nothing in this path has run on real hardware, so the watermarks,
 deadlines and link training are unconfirmed.

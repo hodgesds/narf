@@ -14,7 +14,7 @@
 //! board. Every value is read, never assumed: one PCI ID ships in several
 //! harvest configurations. GC 10.3.2 is not one of the versions whose
 //! `gfx_v10_3_get_disabled_sa` whole-SA skip applies (10.3.0/3/6/7), so every
-//! SA is sampled, as Linux does.
+//! SA is sampled, as Linux does; Raphael's 10.3.6 is.
 //!
 //! The derivation is a pure function of the raw samples ([`derive`]) so the
 //! values Mesa sees are tested against hand-derived Linux results without a
@@ -214,8 +214,13 @@ fn checked(v: u32) -> Result<u32, Error> {
         Ok(v)
     }
 }
-fn sample_revision(io: &mut impl Io, layout: &Layout) -> Result<u8, Error> {
-    Ok(((checked(io.read(layout.nbio(RCC_DEV0_EPF0_STRAP0)))? >> 24) & 0xf) as u8)
+fn sample_revision(io: &mut impl Io, layout: &Layout, strap: u32) -> Result<u8, Error> {
+    Ok(((checked(io.read(layout.nbio(strap)))? >> 24) & 0xf) as u8)
+}
+/// The GC revisions whose `gfx_v10_0_setup_rb` and `gfx_v10_0_get_cu_info`
+/// skip the shader arrays `gfx_v10_3_get_disabled_sa` reports.
+fn skips_disabled_sa(gc: (u8, u8, u8)) -> bool {
+    matches!(gc, (10, 3, 0) | (10, 3, 3) | (10, 3, 6) | (10, 3, 7))
 }
 fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, Error> {
     let index = layout.reg(GRBM_GFX_INDEX);
@@ -224,7 +229,7 @@ fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, E
         gb_addr_config: checked(io.read(layout.reg(GB_ADDR_CONFIG)))?,
         ..Sample::default()
     };
-    if layout.profile.gc_version == (10, 3, 0) {
+    if skips_disabled_sa(layout.profile.gc_version) {
         raw.disabled_sa = (((checked(io.read(layout.reg(CC_GC_SA_UNIT_DISABLE)))?
             | checked(io.read(layout.reg(GC_USER_SA_UNIT_DISABLE)))?)
             >> 8)
@@ -280,8 +285,42 @@ pub unsafe fn read_revision(
 ) -> Result<u8, Error> {
     let layout = Layout::resolve_rdna2(gpu).map_err(|_| Error::Unsupported)?;
     authority
-        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout)))
+        .invoke(Op(|| {
+            sample_revision(&mut Mmio(gpu.regs), &layout, RCC_DEV0_EPF0_STRAP0)
+        }))
         .map_err(|_| Error::Revoked)?
+}
+/// Raphael's revision strap, from the register its NBIO 7.2 version uses.
+///
+/// # Safety
+/// As `read_revision`.
+pub unsafe fn read_revision_raphael(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<u8, Error> {
+    let layout = Layout::resolve_raphael(gpu).map_err(|_| Error::Unsupported)?;
+    // nbio_v7_2_get_rev_id's strap register depends on the NBIO version.
+    let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+    let strap = crate::amdgpu_nbio_v7_2::strap0(banks.version);
+    authority
+        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout, strap)))
+        .map_err(|_| Error::Revoked)?
+}
+/// Sample and derive Raphael's topology, skipping the shader arrays
+/// `gfx_v10_3_get_disabled_sa` reports.
+///
+/// # Safety
+/// As `read`, for Raphael.
+pub unsafe fn read_raphael(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<Topology, Error> {
+    let limits = Limits::from_gc(gpu.gc_info.as_ref().ok_or(Error::Invalid)?)?;
+    let layout = Layout::resolve_raphael(gpu).map_err(|_| Error::Unsupported)?;
+    let raw = authority
+        .invoke(Op(|| sample(&mut Mmio(gpu.regs), &layout, limits)))
+        .map_err(|_| Error::Revoked)??;
+    derive(limits, &raw)
 }
 /// Sample and derive this board's topology.
 ///

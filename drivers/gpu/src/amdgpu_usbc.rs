@@ -258,9 +258,10 @@ async fn edid(dmub: &mut Dmub, channel: Channel, instance: u8) -> Result<Vec<u8>
 pub(crate) async fn scan(dmub: &mut Dmub) -> Result<Vec<Sink>, Error> {
     let mut result = Vec::new();
     // DCN314 exposes four DPIAs (dcn314_resource.c), independently of the
-    // number of NHI PCI functions or physical receptacles. Native AUX channels
-    // are probed directly, without assuming an HPD-to-DDC wiring map.
-    for (channel, count) in [(Channel::Legacy, 6), (Channel::Dpia, 4)] {
+    // number of NHI PCI functions or physical receptacles; DCN315 has none.
+    // Native AUX channels are probed directly, without assuming an
+    // HPD-to-DDC wiring map.
+    for (channel, count) in [(Channel::Legacy, 6), (Channel::Dpia, dmub.dpias())] {
         for instance in 0..count {
             if channel == Channel::Dpia {
                 match dmub.hpd(instance, channel).await {

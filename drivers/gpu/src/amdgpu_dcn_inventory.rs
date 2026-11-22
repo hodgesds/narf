@@ -18,7 +18,7 @@
 //! the VCO read follows `dcn314_clk_mgr.c::get_vco_frequency_from_reg`.
 use crate::{
     amdgpu::AmdGpu,
-    amdgpu_dcn_clk::Levels,
+    amdgpu_dcn_clk::{Levels, Spread},
     amdgpu_dcn_display::Platform,
     amdgpu_dcn_profile::Profile,
     amdgpu_dml::{Memory, MemoryKind},
@@ -35,6 +35,8 @@ const TABLE_DISPLAY_OBJECT_INFO: u16 = 22;
 const TABLE_GPIO_PIN_LUT: u16 = 12;
 // linux: offsetof(struct atom_master_list_of_data_tables_v2_1, dce_info) / 2
 const TABLE_DCE_INFO: u16 = 27;
+// linux: offsetof(struct atom_master_list_of_data_tables_v2_1, smu_info) / 2
+const TABLE_SMU_INFO: u16 = 8;
 // linux: offsetof(struct atom_master_list_of_data_tables_v2_1, integratedsysteminfo) / 2
 const TABLE_INTEGRATED_SYSTEM_INFO: u16 = 30;
 
@@ -149,7 +151,9 @@ impl Routing {
     }
     fn backend(self) -> (u64, u64) {
         match self {
-            Self::Legacy(Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303) => {
+            // dcn_3_1_5_offset.h regDIG0_DIG_BE_EN_CNTL is 0x20b1, DCN30's
+            // offset, not DCN 3.1.4's 0x20b2; the stride is the same 0x100.
+            Self::Legacy(Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 | Profile::Dcn315) => {
                 (DIG_BE_EN_CNTL - 1, DIG_STRIDE)
             }
             Self::Legacy(Profile::Dcn314) => (DIG_BE_EN_CNTL, DIG_STRIDE),
@@ -183,6 +187,32 @@ const CHANNEL_COUNT_OFFSET: usize = 27; // linux: n/a (DCN 3.1.4 path)
 /// range-checked before being believed.
 const CLK_BASE_DWORD: u64 = 0x0001_6c00; // linux: n/a (DCN 3.1.4 path)
 const CLK1_CLK_PLL_REQ: u64 = 0x0237; // linux: n/a (DCN 3.1.4 path)
+/// `regCLK6_0_CLK6_spll_field_8` (`dcn314_clk_mgr.c`, CLK segment 0) and
+/// its `spll_ssc_en` bit: the boot firmware left the SPLL spreading.
+const CLK6_SPLL_FIELD_8: u64 = 0x464b; // linux: n/a (DCN 3.1.4 path)
+const SPLL_SSC_EN: u32 = 0x0000_2000; // linux: n/a (DCN 3.1.4 path)
+/// `regCLK1_CLK2_BYPASS_CNTL.CLK2_BYPASS_SEL`, the DPREFCLK source that
+/// indexes the spread LUT.
+const CLK1_CLK2_BYPASS_CNTL: u64 = 0x029c; // linux: n/a (DCN 3.1.4 path)
+const CLK2_BYPASS_SEL: u32 = 0x0000_0007; // linux: n/a (DCN 3.1.4 path)
+/// `ss_info_table` in `dcn314_clk_mgr.c`: the spread per DPREFCLK source, in
+/// thousandths of a percent.
+const SS_LUT: [u32; 5] = [0, 0, 375, 375, 375]; // linux: n/a (DCN 3.1.4 path)
+/// `ss_info_table.ss_divider`, and the divider every atomfirmware
+/// `get_ss_info_v4_*` reports.
+const SS_DIVIDER: u32 = 1000; // linux: n/a (DCN 3.1.4 path)
+/// `dp_ss_percentage` and `dp_ss_mode` in `atom_display_controller_info_v4_1`,
+/// `_v4_2` and `_v4_5` alike.
+const DCE_DP_SS_PERCENTAGE_OFFSET: usize = 24; // linux: offsetof(struct atom_display_controller_info_v4_1, dp_ss_percentage)
+const DCE_DP_SS_MODE_OFFSET: usize = 30; // linux: offsetof(struct atom_display_controller_info_v4_1, dp_ss_mode)
+/// `gpuclk_ss_mode` and `gpuclk_ss_percentage` in `atom_smu_info_v3_1`.
+const SMU_GPUCLK_SS_MODE_OFFSET: usize = 7; // linux: offsetof(struct atom_smu_info_v3_1, gpuclk_ss_mode)
+const SMU_GPUCLK_SS_PERCENTAGE_OFFSET: usize = 12; // linux: offsetof(struct atom_smu_info_v3_1, gpuclk_ss_percentage)
+/// `gpuclk_ss_percentage` and `gpuclk_ss_type` in
+/// `atom_integrated_system_info_v2_1` and `_v2_2`.
+const ISI_GPUCLK_SS_PERCENTAGE_OFFSET: usize = 20; // linux: offsetof(struct atom_integrated_system_info_v2_2, gpuclk_ss_percentage)
+const ISI_GPUCLK_SS_TYPE_OFFSET: usize = 22; // linux: offsetof(struct atom_integrated_system_info_v2_2, gpuclk_ss_type)
+const ATOM_SS_CENTRE_SPREAD_MODE: u8 = 0x01; // linux: ATOM_SS_CENTRE_SPREAD_MODE
 /// `dfs_ref_freq_khz` for DCN314.
 const DFS_REF_KHZ: u64 = 48_000; // linux: n/a (DCN 3.1.4 path)
 /// The DENTIST VCO is a few GHz; anything outside this cannot be one, and a
@@ -647,6 +677,18 @@ pub fn lttpr_caps(vbios: &[u8]) -> Result<(bool, bool), Error> {
     ))
 }
 
+/// `atom_integrated_system_info_v2_*`'s raw `memorytype` and
+/// `umachannelnumber`, at the same offsets in content revisions 1 to 3
+/// (`amdgpu_atomfirmware_get_integrated_system_info`'s frev 2 arms).
+pub(crate) fn integrated_memory(vbios: &[u8]) -> Option<(u8, u8)> {
+    let info = table(vbios, TABLE_INTEGRATED_SYSTEM_INFO).ok()?;
+    header(info, 2, &[1, 2, 3]).ok()?;
+    if (u16_at(info, 0) as usize) < CHANNEL_COUNT_OFFSET + 1 {
+        return None;
+    }
+    Some((info[MEMORY_TYPE_OFFSET], info[CHANNEL_COUNT_OFFSET]))
+}
+
 /// The memory configuration, from `atom_integrated_system_info_v2_*` for the
 /// type and channel count and from the firmware's own DPM table for the data
 /// rate. A zero channel count is refused: Linux substitutes four, but that is a
@@ -839,6 +881,27 @@ pub(crate) fn vco_from_pll_request(request: u32) -> Option<u32> {
     let khz = u32::try_from(khz).ok()?;
     (VCO_MIN_KHZ..=VCO_MAX_KHZ).contains(&khz).then_some(khz)
 }
+/// Read one register of the CLK block, which discovery does not describe.
+///
+/// # Safety
+/// Same contract as [`dentist_vco_khz`].
+unsafe fn clk_read(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+    reg: u64,
+) -> Result<u32, Error> {
+    let offset = (CLK_BASE_DWORD + reg) * 4;
+    if offset + 4 > gpu.regs.len {
+        return Err(Error::Unsupported);
+    }
+    let regs: MmioRegion = gpu.regs;
+    authority
+        .invoke(Op(|| {
+            // SAFETY: bounds checked against the mapping above.
+            unsafe { regs.read32(offset) }
+        }))
+        .map_err(|_| Error::Revoked)
+}
 /// Read the DENTIST VCO.
 ///
 /// # Safety
@@ -848,18 +911,136 @@ pub unsafe fn dentist_vco_khz(
     gpu: &AmdGpu,
     authority: &Cap<BusDeviceCap, Write>,
 ) -> Result<u32, Error> {
-    let offset = (CLK_BASE_DWORD + CLK1_CLK_PLL_REQ) * 4;
-    if offset + 4 > gpu.regs.len {
-        return Err(Error::Unsupported);
-    }
-    let regs: MmioRegion = gpu.regs;
-    let request = authority
-        .invoke(Op(|| {
-            // SAFETY: bounds checked against the mapping above.
-            unsafe { regs.read32(offset) }
-        }))
-        .map_err(|_| Error::Revoked)?;
+    // SAFETY: forwarded unchanged from this function's contract.
+    let request = unsafe { clk_read(gpu, authority, CLK1_CLK_PLL_REQ) }?;
     vco_from_pll_request(request).ok_or(Error::DeviceGone)
+}
+
+/// The DPREFCLK spread the VBIOS reports, as `dce_clock_read_ss_info` asks
+/// for it on atomfirmware: `AS_SIGNAL_TYPE_GPU_PLL` is unsupported by every
+/// `get_ss_info_v4_*`, so the answer is the `AS_SIGNAL_TYPE_DISPLAY_PORT`
+/// entry. Returns (thousandths of a percent, centre spread); `None` is
+/// Linux's failed lookup, which leaves the clock unspread.
+///
+/// - dce_info 4.1: its own `dp_ss_percentage` / `dp_ss_mode`.
+/// - 4.2 to 4.4: `smu_info`'s `gpuclk_ss_percentage` / `gpuclk_ss_mode`,
+///   and no answer without that table.
+/// - 4.5: the integrated system info's `gpuclk_ss_*` when Linux builds one
+///   ([`integrated_spread`]), otherwise dce_info's own fields.
+pub(crate) fn vbios_dp_spread(vbios: &[u8]) -> Result<Option<(u32, bool)>, Error> {
+    let info = match table(vbios, TABLE_DCE_INFO) {
+        Ok(info) => info,
+        Err(Error::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match header(info, 4, &[1, 2, 3, 4, 5]) {
+        Ok(()) => {}
+        Err(Error::Unsupported) => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let own = || -> Result<Option<(u32, bool)>, Error> {
+        if (u16_at(info, 0) as usize) < DCE_DP_SS_MODE_OFFSET + 1 {
+            return Err(Error::Invalid);
+        }
+        Ok(Some((
+            u32::from(u16_at(info, DCE_DP_SS_PERCENTAGE_OFFSET)),
+            info[DCE_DP_SS_MODE_OFFSET] & ATOM_SS_CENTRE_SPREAD_MODE != 0,
+        )))
+    };
+    // linux-lit: 3=offsetof(struct atom_common_table_header, content_revision)
+    match info[3] {
+        1 => own(),
+        2..=4 => {
+            let smu = match table(vbios, TABLE_SMU_INFO) {
+                Ok(smu) => smu,
+                Err(Error::Missing) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let size = if smu.len() >= 2 {
+                u16_at(smu, 0) as usize
+            } else {
+                0
+            };
+            if size < SMU_GPUCLK_SS_PERCENTAGE_OFFSET + 2 || size > smu.len() {
+                return Err(Error::Invalid);
+            }
+            Ok(Some((
+                u32::from(u16_at(smu, SMU_GPUCLK_SS_PERCENTAGE_OFFSET)),
+                smu[SMU_GPUCLK_SS_MODE_OFFSET] & ATOM_SS_CENTRE_SPREAD_MODE != 0,
+            )))
+        }
+        _ => match integrated_spread(vbios)? {
+            Some(spread) => Ok(Some(spread)),
+            None => own(),
+        },
+    }
+}
+
+/// `bp->base.integrated_info`'s `gpuclk_ss_percentage` / `gpuclk_ss_type`,
+/// or `None` when `construct_integrated_info` would not build one (no table,
+/// or a revision other than 1.11, 1.12, 2.1, 2.2 or 2.3). Only
+/// `get_integrated_info_v2_2` (2.2 and 2.3) copies the spread; the others
+/// leave the zeroed allocation's 0. The type is assigned to a one-bit
+/// `CENTER_MODE` field, so only its low bit counts.
+fn integrated_spread(vbios: &[u8]) -> Result<Option<(u32, bool)>, Error> {
+    let info = match table(vbios, TABLE_INTEGRATED_SYSTEM_INFO) {
+        Ok(info) => info,
+        Err(Error::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // linux-lit: 4=sizeof(struct atom_common_table_header)
+    if info.len() < 4 {
+        return Ok(None);
+    }
+    // linux-lit: 2=offsetof(struct atom_common_table_header, format_revision)
+    // linux-lit: 3=offsetof(struct atom_common_table_header, content_revision)
+    match (info[2], info[3]) {
+        (1, 11 | 12) | (2, 1) => Ok(Some((0, false))),
+        (2, 2 | 3) => {
+            let size = u16_at(info, 0) as usize;
+            if size < ISI_GPUCLK_SS_TYPE_OFFSET + 2 || size > info.len() {
+                return Err(Error::Invalid);
+            }
+            Ok(Some((
+                u32::from(u16_at(info, ISI_GPUCLK_SS_PERCENTAGE_OFFSET)),
+                u16_at(info, ISI_GPUCLK_SS_TYPE_OFFSET) & 1 != 0,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The spread the DP DTO's reference is lowered by: `dce_clock_read_ss_info`
+/// (the VBIOS figure, kept only for a downspread) then
+/// `dcn314_read_ss_info_from_lut`, which — while the SPLL spreads and the
+/// DPREFCLK source indexes its table — replaces that figure with the LUT's,
+/// even a zero one. `dcn314_init_clocks` applies nothing unless the SPLL
+/// spreads.
+pub(crate) fn dpref_spread(
+    spll_spreading: bool,
+    bypass_sel: u32,
+    vbios: Option<(u32, bool)>,
+) -> Option<Spread> {
+    if !spll_spreading {
+        return None;
+    }
+    let (mut on, mut percentage) = (false, 0);
+    if let Some((reported, centre)) = vbios {
+        if reported != 0 {
+            on = true;
+            if !centre {
+                percentage = reported;
+            }
+        }
+    }
+    if let Some(&lut) = SS_LUT.get(bypass_sel as usize) {
+        percentage = lut;
+        on |= lut != 0;
+    }
+    on.then_some(Spread {
+        percentage,
+        divider: SS_DIVIDER,
+    })
 }
 
 /// Gather the platform constants the mode math needs.
@@ -881,10 +1062,32 @@ pub unsafe fn platform(
     let dchub_refclk_khz = dchub_refclk_khz(vbios)?;
     // SAFETY: forwarded unchanged from this function's contract.
     let dentist_vco_khz = unsafe { dentist_vco_khz(gpu, authority) }?;
+    // Only DCN 3.1.4's clock manager adjusts the DP DTO reference
+    // (`dcn314_init_clocks`); the CLK registers below are its.
+    let dpref_spread = if Profile::resolve(gpu) == Ok(Profile::Dcn314) {
+        // SAFETY: forwarded unchanged from this function's contract.
+        let ssc = unsafe { clk_read(gpu, authority, CLK6_SPLL_FIELD_8) }?;
+        if ssc == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        if ssc & SPLL_SSC_EN != 0 {
+            // SAFETY: as above.
+            let bypass = unsafe { clk_read(gpu, authority, CLK1_CLK2_BYPASS_CNTL) }?;
+            if bypass == u32::MAX {
+                return Err(Error::DeviceGone);
+            }
+            dpref_spread(true, bypass & CLK2_BYPASS_SEL, vbios_dp_spread(vbios)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok(Platform {
         memory,
         dchub_refclk_khz,
         dentist_vco_khz,
+        dpref_spread,
     })
 }
 

@@ -28,7 +28,7 @@ pub(crate) fn layout() -> Layout {
         sdma_high: None,
         gc: [GC0, GC1],
         nbio: NBIO,
-        hdp: HDP,
+        hdp: core::num::NonZeroU64::new(HDP),
         oss: OSS,
     }
 }
@@ -83,6 +83,8 @@ pub(crate) struct Model {
     pub doorbells: Vec<(u32, u64)>,
     dirty: bool,
     stale: bool,
+    /// HDP 5.2.1 (Raphael): no read cache, so CPU reads need no invalidate.
+    pub no_read_cache: bool,
     /// Hardware already remaps the VGT/SPI UMD aliases.
     pub cam_remapped: bool,
     pub cam: Vec<u32>,
@@ -97,6 +99,10 @@ pub(crate) struct Model {
     pub clear_states: u32,
     pub resources: Vec<u64>,
     pub mapped: Vec<Mapped>,
+    /// UNMAP_QUEUES (RESET_QUEUES) packets the KIQ executed.
+    pub unmapped: u32,
+    /// CP_VMID_RESET values the KIQ wrote.
+    pub vmid_resets: Vec<u32>,
     pub traps: u32,
     pub sdma_count: u32,
     rptr: [u64; 8],
@@ -138,6 +144,7 @@ impl Model {
             doorbells: Vec::new(),
             dirty: false,
             stale: false,
+            no_read_cache: false,
             cam_remapped: false,
             cam: Vec::new(),
             stalled: [false; 8],
@@ -148,6 +155,8 @@ impl Model {
             clear_states: 0,
             resources: Vec::new(),
             mapped: Vec::new(),
+            unmapped: 0,
+            vmid_resets: Vec::new(),
             traps: 0,
             sdma_count: 2,
             rptr: [0; 8],
@@ -286,6 +295,26 @@ impl Model {
                     let reg = 0xc000 + body[0];
                     self.regs.insert(u64::from(reg) * 4, body[1]);
                 }
+                0x37 if engine == 1 && body[0] == 1 << 16 => {
+                    // gfx_v10_0_ring_emit_wreg on the KIQ. CP_VMID_RESET
+                    // dequeues the named gfx queues (their MQDs read
+                    // inactive) and reads back 0 once done.
+                    self.engine_wreg(body[1], body[3]);
+                    if u64::from(body[1]) * 4 == r(CP_VMID_RESET) {
+                        self.vmid_resets.push(body[3]);
+                        let pipe0 = (body[3] >> 16) & 0xff;
+                        let pipe1 = (body[3] >> 24) & 0xff;
+                        for q in self.mapped.clone() {
+                            let named = if q.pipe == 0 { pipe0 } else { pipe1 };
+                            if q.me == 0 && named & (1 << q.queue) != 0 {
+                                self.put(q.mqd + 130 * 4, 0);
+                                self.mapped.retain(|m| m.doorbell != q.doorbell);
+                                self.rptr[if q.pipe == 0 { 0 } else { 7 }] = 0;
+                            }
+                        }
+                        self.regs.insert(r(CP_VMID_RESET), 0);
+                    }
+                }
                 0x37 if body[0] & 0xf00 == 0 => {
                     // WRITE_DATA to a register: ENGINE_SEL(1) on gfx only.
                     let want = if engine == 0 {
@@ -320,6 +349,13 @@ impl Model {
                                 self.word(address) & body[4],
                                 body[3],
                                 "pipeline sync would hang"
+                            );
+                        }
+                        (0, 0) => {
+                            assert_eq!(
+                                self.reg(u64::from(body[1]) * 4) & body[4],
+                                body[3],
+                                "register wait would hang"
                             );
                         }
                         (0, 1) => {
@@ -392,6 +428,13 @@ impl Model {
                         assert_ne!(body[0] & (1 << 18), 0, "gfx ME0 is ME field 1");
                     }
                     let mqd = u64::from(body[2]) | (u64::from(body[3]) << 32);
+                    if engine_sel == 0 {
+                        let select = ((body[0] >> 16) & 3)
+                            | (u32::from(body[0] & (1 << 18) != 0) + 1) << 2
+                            | ((body[0] >> 13) & 7) << 8;
+                        self.regs
+                            .insert(r(CP_HQD_ACTIVE) | u64::from(select) << 40, 1);
+                    }
                     // v10 compute and gfx MQDs both keep the rptr report
                     // address at dwords 139/140.
                     let rptr = u64::from(self.word(mqd + 139 * 4))
@@ -411,6 +454,35 @@ impl Model {
                         wptr: u64::from(body[4]) | (u64::from(body[5]) << 32),
                         rptr,
                     });
+                }
+                0xa3 => {
+                    // gfx10_kiq_unmap_queues: by doorbell, one queue, no
+                    // preemption fence. RESET_QUEUES dequeues the HQD and
+                    // its read pointer restarts.
+                    assert_eq!(engine, 1, "UNMAP_QUEUES outside KIQ");
+                    assert_eq!((n, body[0] & 0xf), (4, 1), "UNMAP_QUEUES RESET_QUEUES form");
+                    assert_eq!(body[0] & 0xf0, 0, "QUEUE_SEL by doorbell");
+                    assert_eq!(body[0] >> 29, 1, "NUM_QUEUES");
+                    let doorbell = body[1] >> 2;
+                    let at = self
+                        .mapped
+                        .iter()
+                        .position(|q| q.doorbell == doorbell)
+                        .expect("UNMAP_QUEUES of an unmapped queue");
+                    let q = self.mapped.remove(at);
+                    let select = q.pipe | q.me << 2 | q.queue << 8;
+                    self.regs
+                        .insert(r(CP_HQD_ACTIVE) | u64::from(select) << 40, 0);
+                    self.rptr[if q.me == 0 {
+                        if q.pipe == 0 {
+                            0
+                        } else {
+                            7
+                        }
+                    } else {
+                        2
+                    }] = 0;
+                    self.unmapped += 1;
                 }
                 _ => panic!("unexpected PM4 opcode {op:#x}"),
             }
@@ -714,6 +786,10 @@ impl Io for Model {
         }
         let key = self.key(self.cam_target(address));
         self.regs.insert(key, value);
+        // The RLC acknowledges a safe-mode request by clearing CMD.
+        if address == r(RLC_SAFE_MODE) {
+            self.regs.insert(key, value & !1);
+        }
         if address == r(CP_HQD_DEQUEUE_REQUEST) && value == 1 && !self.stuck_hqd {
             let active = self.key(r(CP_HQD_ACTIVE));
             self.regs.insert(active, 0);
@@ -725,7 +801,10 @@ impl Io for Model {
         }
     }
     fn read_memory(&mut self, map: MmioRegion, offset: u64) -> u32 {
-        assert!(!self.stale, "CPU read without HDP invalidate");
+        assert!(
+            self.no_read_cache || !self.stale,
+            "CPU read without HDP invalidate"
+        );
         self.word(mc(map, offset))
     }
     fn write_memory(&mut self, map: MmioRegion, offset: u64, value: u32) {
@@ -788,6 +867,7 @@ fn gfx(model: Model) -> (Pool, GfxEngine<Model>) {
             state: GfxState::Prepared,
             proof: GfxProof::default(),
             golden: false,
+            mqd_backup: None,
         },
     )
 }
@@ -804,6 +884,18 @@ impl GfxEngine<Model> {
             .collect();
         self.hw.io.pm4(&words, 1, false, 0);
         self.start_mapped().await
+    }
+    /// gfx_v10_0_reset_kgq against the model: the gfx owner's halves around
+    /// the KIQ's CP_VMID_RESET sequence and MAP_QUEUES, decoded by the
+    /// model's KIQ as the coordinator's KIQ owner would send them.
+    pub(crate) async fn reset_kgq(&mut self, vmid: u8) -> Result<(), Error> {
+        let map = self.begin_reset()?;
+        let reset = pm4::gfx_vmid_reset(self.hw.layout.dword(CP_VMID_RESET), vmid, &map);
+        self.hw.io.pm4(&reset, 1, false, 0);
+        self.restore_queue()?;
+        let words = pm4::map_queues_engine(0, map.pipe, 0, map.doorbell, map.mqd, map.wptr, 4);
+        self.hw.io.pm4(&words, 1, false, 0);
+        self.end_reset().await
     }
 }
 
@@ -1459,7 +1551,7 @@ fn rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs() -> TestRes
             return TestResult::Fail("RDNA2 GFX clear-state/ring/IB proof failed");
         }
     }
-    for version in [(10, 3, 1), (10, 3, 3), (10, 3, 6), (11, 0, 1), (12, 0, 1)] {
+    for version in [(10, 3, 1), (10, 3, 3), (10, 3, 7), (11, 0, 1), (12, 0, 1)] {
         if crate::amdgpu_rdna2::golden::for_gc(version).is_some() {
             return TestResult::Fail("golden sequence guessed for another architecture/APU");
         }
@@ -1469,4 +1561,380 @@ fn rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs() -> TestRes
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs
+);
+
+/// Raphael's CP discovery: Navi22's banks (NBIO segments 0..2 are where
+/// Raphael's are) under GC 10.3.6, SDMA 5.2.6, NBIO 7.2.1 with segments 3..5,
+/// HDP 5.2.1 and OSSSYS 5.2.1.
+pub(crate) fn raphael_cp_gpu() -> AmdGpu {
+    use crate::amdgpu_discovery as d;
+    let mut gpu = navi22_gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::RAPHAEL).unwrap();
+    for b in gpu.ip_blocks.iter_mut() {
+        let version = match b.hw_id {
+            d::HW_ID_GC => (10, 3, 6),
+            d::HW_ID_SDMA0 => (5, 2, 6),
+            d::HW_ID_HDP => (5, 2, 1),
+            d::HW_ID_OSSSYS => (5, 2, 1),
+            d::HW_ID_NBIF => {
+                b.num_bases = 6;
+                b.base_addrs[3..6].copy_from_slice(&[0x10400, 0x241_b000, 0x404_0000]);
+                (7, 2, 1)
+            }
+            _ => continue,
+        };
+        (b.major, b.minor, b.revision) = version;
+    }
+    gpu
+}
+
+/// Raphael's CP layout keeps Navi22's GC, NBIO segment-2 and OSSSYS banks, has
+/// no HDP read cache and carries the NBIO 7.2 banks; HDP 5.0, NBIO 2.3 and a
+/// discrete GPU are refused, and the discrete layout refuses Raphael.
+fn raphael_cp_layout_takes_only_raphaels_blocks() -> TestResult {
+    let gpu = raphael_cp_gpu();
+    let expected = Layout {
+        profile: &crate::amdgpu_rdna2::RAPHAEL,
+        hdp: None,
+        ..layout()
+    };
+    if Layout::resolve_raphael(&gpu) != Ok(expected)
+        || expected.hdp_invalidate().is_some()
+        || expected.liveness() != NBIO + 0xc3 * 4
+        || layout().liveness() != layout().hdp_invalidate().unwrap()
+    {
+        return TestResult::Fail("Raphael CP layout or its HDP registers");
+    }
+    let swap = |id, v: (u8, u8, u8)| {
+        let mut g = raphael_cp_gpu();
+        for b in g.ip_blocks.iter_mut().filter(|b| b.hw_id == id) {
+            (b.major, b.minor, b.revision) = v;
+        }
+        g
+    };
+    let mut navi22 = raphael_cp_gpu();
+    navi22.chip =
+        crate::amdgpu::__test_chip_info_for_pci_id(0x1002, crate::amdgpu::NAVI22).unwrap();
+    for (bad, why) in [
+        (swap(ip::HW_ID_HDP, (5, 0, 0)), "Raphael CP took HDP 5.0"),
+        (swap(ip::HW_ID_NBIF, (2, 3, 0)), "Raphael CP took NBIO 2.3"),
+        (
+            swap(ip::HW_ID_SDMA0, (5, 2, 2)),
+            "Raphael CP took Navi22's SDMA",
+        ),
+        (navi22, "Raphael CP took a discrete GPU"),
+    ] {
+        if Layout::resolve_raphael(&bad).is_ok() {
+            return TestResult::Fail(why);
+        }
+    }
+    if Layout::resolve_rdna2(&gpu).is_ok() {
+        return TestResult::Fail("the discrete CP layout took Raphael");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_cp_layout_takes_only_raphaels_blocks
+);
+
+/// GFX bring-up on Raphael's layout: the 10.3.6 golden sequence, then no CAM
+/// probe or setup (the APU group reports the CAM remapped), and ring and IB
+/// proofs whose frames carry no HDP invalidate.
+fn raphael_gfx_golden_cam_and_frames_follow_the_apu_group() -> TestResult {
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut engine) = gfx(enabled());
+    engine.hw.layout = resolved;
+    engine.hw.io.no_read_cache = true;
+    engine.golden().unwrap();
+    let golden = engine.hw.io.writes.len();
+    if golden != crate::amdgpu_rdna2::golden::RAPHAEL.len() {
+        return TestResult::Fail("Raphael golden sequence");
+    }
+    run(engine.configure()).unwrap();
+    let cam = [
+        VGT_ESGS_RING_SIZE,
+        VGT_ESGS_RING_SIZE_UMD,
+        GRBM_CAM_INDEX,
+        GRBM_CAM_DATA,
+    ]
+    .map(|r| resolved.reg(r));
+    if engine.hw.io.writes[golden..]
+        .iter()
+        .any(|w| cam.contains(&w.0))
+        || engine.hw.io.reads.iter().any(|r| cam.contains(r))
+        || !engine.proof.cam_remapped
+    {
+        return TestResult::Fail("Raphael probed or programmed the GRBM CAM");
+    }
+    run(engine.start()).unwrap();
+    run(engine.test_ib()).unwrap();
+    // Navi22's run invalidates HDP's read cache before the CPU samples an
+    // engine write; Raphael's HDP 5.2.1 has none to invalidate. (The ring and
+    // IB tests put no HDP packet in their frames; client jobs do.)
+    let hdp = HDP + 0xd1 * 4;
+    let (_navi22_pool, mut navi22) = gfx(enabled());
+    navi22.golden().unwrap();
+    run(navi22.configure()).unwrap();
+    run(navi22.start()).unwrap();
+    run(navi22.test_ib()).unwrap();
+    if engine.state != GfxState::Verified
+        || engine.hw.io.writes.iter().any(|w| w.0 == hdp)
+        || !navi22.hw.io.writes.iter().any(|w| w.0 == hdp)
+    {
+        return TestResult::Fail("Raphael GFX proof failed or invalidated an HDP it lacks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_gfx_golden_cam_and_frames_follow_the_apu_group
+);
+
+/// gfx_v10_0_ring_soft_recovery: SQ_CMD kill (CMD 3), broadcast (MODE 1) and
+/// CHECK_VMID with the job's VMID, inside RLC safe mode (requested with
+/// message 1, acknowledged, left with message 0) while the RLC runs; with
+/// the RLC stopped, SQ_CMD alone (amdgpu_gfx_rlc_enter_safe_mode's check).
+fn raphael_soft_recovery_kills_one_vmid_in_safe_mode() -> TestResult {
+    if sq_kill(5) != 0x5000_0093 || sq_kill(0x1f) != 0xf000_0093 {
+        return TestResult::Fail("SQ_CMD fields");
+    }
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut engine) = gfx(enabled());
+    engine.hw.layout = resolved;
+    engine.hw.io.no_read_cache = true;
+    engine.golden().unwrap();
+    run(engine.configure()).unwrap();
+    run(engine.start()).unwrap();
+    run(engine.test_ib()).unwrap();
+    let (safe, sq) = (resolved.reg(RLC_SAFE_MODE), resolved.reg(SQ_CMD));
+    let kill = |engine: &mut GfxEngine<Model>, rlc: u32, vmid: u8| {
+        engine.hw.io.regs.insert(resolved.reg(RLC_CNTL), rlc);
+        let from = engine.hw.io.writes.len();
+        run(engine.kill_waves(vmid)).map(|()| engine.hw.io.writes[from..].to_vec())
+    };
+    if kill(&mut engine, 1, 5) != Ok(alloc::vec![(safe, 0x3), (sq, 0x5000_0093), (safe, 0x1)])
+        || kill(&mut engine, 0, 2) != Ok(alloc::vec![(sq, sq_kill(2))])
+    {
+        return TestResult::Fail("soft recovery outside RLC safe mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_soft_recovery_kills_one_vmid_in_safe_mode
+);
+
+/// gfx_v10_0_reset_kgq on a hung GFX ring 0: CP_VMID_RESET for the job's
+/// VMID and pipe 0's queue 0, the MQD inactive, the register clear; the MQD
+/// restored from its map-time backup with an empty ring, MAP_QUEUES and the
+/// ring test. The stalled job never runs; force completion shows the ring's
+/// last sequence, ring 1 is untouched, and ring 0 executes again.
+fn raphael_gfx_queue_reset_restores_ring_0() -> TestResult {
+    if pm4::gfx_vmid_reset(
+        0x1e53,
+        5,
+        &GfxQueueMap {
+            pipe: 0,
+            doorbell: 0,
+            mqd: 0x1000,
+            wptr: 0,
+        },
+    )[..5]
+        != [
+            packet3(PACKET3_WRITE_DATA, 3),
+            0x1_0000,
+            0x1e53,
+            0,
+            1 << 5 | 1 << 16,
+        ]
+    {
+        return TestResult::Fail("CP_VMID_RESET write");
+    }
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut e) = gfx(enabled());
+    e.hw.layout = resolved;
+    e.hw.io.no_read_cache = true;
+    e.golden().unwrap();
+    run(e.configure()).unwrap();
+    run(e.start()).unwrap();
+    run(e.test_ib()).unwrap();
+    let mqd = |e: &GfxEngine<Model>| -> Vec<u32> {
+        (0..512u64)
+            .map(|i| e.hw.io.word(e.queue.address(GFX_MQD + i * 4)))
+            .collect()
+    };
+    let backup = mqd(&e);
+    if e.mqd_backup.as_deref() != Some(&backup[..]) {
+        return TestResult::Fail("gfx MQD backup differs from the mapped MQD");
+    }
+    let fence = e.hw.io.word(e.queue.address(FENCE));
+    e.hw.io.stalled[0] = true;
+    let seq = e.queue.next_seq();
+    let (hw, queue) = (&mut e.hw, &mut e.queue);
+    hw.access(|io, l| {
+        queue.emit(io, &pm4::release_mem(queue.address(FENCE), seq))?;
+        queue.commit(io, l);
+        Ok(())
+    })
+    .unwrap();
+    e.hw.io.stalled[0] = false;
+    let pipe1 =
+        e.hw.io
+            .mapped
+            .iter()
+            .filter(|q| q.me == 0 && q.pipe == 1)
+            .count();
+    if run(e.reset_kgq(5)).is_err() || e.state != GfxState::Verified {
+        return TestResult::Fail("gfx queue reset failed");
+    }
+    let m = &e.hw.io;
+    if m.vmid_resets != [1 << 5 | 1 << 16]
+        || m.reg(resolved.reg(CP_VMID_RESET)) != 0
+        || m.mapped.iter().filter(|q| q.me == 0 && q.pipe == 0).count() != 1
+        || m.mapped.iter().filter(|q| q.me == 0 && q.pipe == 1).count() != pipe1
+        || mqd(&e) != backup
+        || m.word(e.queue.address(FENCE)) != fence
+    {
+        return TestResult::Fail("gfx reset kept the hung queue's state or ran its job");
+    }
+    if e.force_complete().is_err()
+        || e.hw.io.word(e.queue.address(FENCE)) != seq
+        || e.hw.io.word(e.queue.address(VM_FENCE)) != seq
+        || run(ring_test(&mut e.hw, &mut e.queue)).is_err()
+    {
+        return TestResult::Fail("forced fences or the reset ring's execution");
+    }
+    // A claimed ring is not claimed twice; a failed KIQ step leaves it dead.
+    if e.begin_reset().is_err() || e.begin_reset().is_ok() {
+        return TestResult::Fail("a claimed ring was claimed again");
+    }
+    e.fail_reset();
+    if e.state != GfxState::Failed || run(e.end_reset()).is_ok() {
+        return TestResult::Fail("a failed reset left ring 0 usable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_gfx_queue_reset_restores_ring_0
+);
+
+/// `port_update`: the address through the port index, read back, data read,
+/// then the new value written back whether or not it changed.
+fn raphael_port_update_follows_amdgpu_device_pcie_port_wreg() -> TestResult {
+    let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(&raphael_cp_gpu()).unwrap();
+    let (index, data) = banks.port_pair();
+    let reg = crate::amdgpu_nbio_v7_2::GDC0_SDMA0_DOORBELL_RANGE;
+    let address = banks.port_address(reg).unwrap();
+    let mut model = Model::new();
+    model.regs.insert(data, 0x0002_0040);
+    if port_update(&mut model, banks, reg, |v| v).is_err()
+        || model.writes != alloc::vec![(index, address), (index, address), (data, 0x0002_0040)]
+    {
+        return TestResult::Fail("NBIO 7.2 port update sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_port_update_follows_amdgpu_device_pcie_port_wreg
+);
+
+/// Re-armed after a reset (a fresh model), Raphael's GFX owner brings the
+/// same two rings up again: golden settings, configure, start and the IB
+/// test rerun on the reservations it already holds, the sequence from zero
+/// and the MQD backup retaken.
+fn raphael_gfx_rearm_reuses_its_rings() -> TestResult {
+    let reset = || {
+        let mut model = enabled();
+        model.no_read_cache = true;
+        model
+    };
+    let up = |e: &mut GfxEngine<Model>| {
+        e.golden().is_ok()
+            && run(e.configure()).is_ok()
+            && run(e.start()).is_ok()
+            && run(e.test_ib()).is_ok()
+            && e.state == GfxState::Verified
+    };
+    let (pool, mut e) = gfx(reset());
+    e.hw.layout = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    if !up(&mut e) {
+        return TestResult::Fail("first GFX bring-up");
+    }
+    let (seq, free, rings) = (
+        e.queue.seq,
+        pool.available(),
+        [e.queue.address(0), e.pipe1.address(0)],
+    );
+    let backup = e.mqd_backup.clone();
+    // SAFETY: the model is replaced below, as a device reset would.
+    unsafe { e.rearm() };
+    if e.state != GfxState::Prepared
+        || (e.queue.seq, e.queue.wptr, e.pipe1.wptr) != (0, 0, 0)
+        || e.golden
+        || e.mqd_backup.is_some()
+    {
+        return TestResult::Fail("re-arm kept the last run's state");
+    }
+    e.hw.io = reset();
+    if !up(&mut e) {
+        return TestResult::Fail("re-armed GFX bring-up");
+    }
+    if e.queue.seq != seq
+        || e.mqd_backup != backup
+        || [e.queue.address(0), e.pipe1.address(0)] != rings
+        || pool.available() != free
+    {
+        return TestResult::Fail("re-armed GFX left its rings or reserved more");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/cp-raphael", raphael_gfx_rearm_reuses_its_rings);
+
+/// gfx_v10_cntl_pg on GC 10.3.6: in RLC safe mode, RLC_PG_CNTL's GFX power
+/// gating bit set with the 200 us CGPG hysteresis, or cleared alone; the
+/// register's other bits kept. Refused before the rings are verified.
+fn raphael_gfx_power_gating_follows_gfx_v10_cntl_pg() -> TestResult {
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut engine) = gfx(enabled());
+    engine.hw.layout = resolved;
+    engine.hw.io.no_read_cache = true;
+    if run(engine.set_power_gating(true)) != Err(Error::Busy) {
+        return TestResult::Fail("power gating before the rings were verified");
+    }
+    engine.golden().unwrap();
+    run(engine.configure()).unwrap();
+    run(engine.start()).unwrap();
+    run(engine.test_ib()).unwrap();
+    let (safe, cntl, delay) = (
+        resolved.reg(RLC_SAFE_MODE),
+        resolved.reg(RLC_PG_CNTL),
+        resolved.reg(RLC_PG_DELAY_3),
+    );
+    engine.hw.io.regs.insert(resolved.reg(RLC_CNTL), 1);
+    engine.hw.io.regs.insert(cntl, 0x10);
+    let writes = |engine: &mut GfxEngine<Model>, enable: bool| {
+        let from = engine.hw.io.writes.len();
+        run(engine.set_power_gating(enable)).map(|()| engine.hw.io.writes[from..].to_vec())
+    };
+    if writes(&mut engine, true)
+        != Ok(alloc::vec![
+            (safe, 0x3),
+            (cntl, 0x11),
+            (delay, 0x4e20),
+            (safe, 0x1)
+        ])
+    {
+        return TestResult::Fail("power gating enable sequence");
+    }
+    if writes(&mut engine, false) != Ok(alloc::vec![(safe, 0x3), (cntl, 0x10), (safe, 0x1)]) {
+        return TestResult::Fail("power gating disable sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_gfx_power_gating_follows_gfx_v10_cntl_pg
 );

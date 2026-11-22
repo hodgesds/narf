@@ -509,6 +509,12 @@ pub struct MediaFirmware {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Phoenix,
+    /// PSP 13.0.5: Linux's generic `psp_v13_0` rather than `psp_v13_0_4`, but
+    /// the same ring create/stop/destroy and write-pointer registers, whose
+    /// `bootloader` wait it skips (`wait_for_bootloader_steady_state` waits
+    /// only on 13.0.6/12/14/15). Every MP0 C2PMSG register sits at the same
+    /// offset on `_BASE_IDX` 0 instead of 1 (`mp_13_0_5_offset.h`).
+    Raphael,
     Navi22,
     Rdna2(&'static crate::amdgpu_rdna2::Profile),
     Navi48(u8),
@@ -519,6 +525,15 @@ impl Kind {
             Self::Navi22 => Some(&crate::amdgpu_rdna2::NAVI22),
             Self::Rdna2(profile) => Some(profile),
             _ => None,
+        }
+    }
+    /// The RDNA2 graphics set this ring may load: a discrete profile, or
+    /// Raphael's. Unlike [`Self::rdna2_profile`] this is not the discrete
+    /// test, so it gates only the graphics upload and the RLC boot wait.
+    fn graphics_profile(self) -> Option<&'static crate::amdgpu_rdna2::Profile> {
+        match self {
+            Self::Raphael => Some(&crate::amdgpu_rdna2::RAPHAEL),
+            _ => self.rdna2_profile(),
         }
     }
 }
@@ -554,6 +569,9 @@ struct Session<I: Io> {
     tmr: Option<Reservation>,
     tmr_ready: bool,
     smc_state: SmcState,
+    /// An APU's PMFW is BIOS-resident (`smu_v13_0_5_ppt.c` loads no
+    /// microcode): no SMC upload is possible, and none is awaited.
+    smc_resident: bool,
     gfx_state: GfxLoadState,
     gfx_status: Option<GfxBootStatus>,
     media_firmware: MediaFirmware,
@@ -784,6 +802,33 @@ impl Layout {
                 let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, 0x477)?;
                 (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
             }
+            Kind::Raphael => {
+                // linux-lit: 0=regMP0_SMN_C2PMSG_81_BASE_IDX (mp_13_0_5_offset.h)
+                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 5)], 0, SOS)?;
+                // REMAP_HDP_MEM_FLUSH_CNTL 0x12d and RCC_CONFIG_MEMSIZE 0xc3 on
+                // _BASE_IDX 2 in both nbio_7_2_0 and nbio_7_7_0. Discovery gives
+                // nbio_v7_2 (which reads nbio_7_2_0_offset.h) NBIO 7.2.0, 7.2.1,
+                // 7.3.0, 7.5.0 and 7.5.1.
+                let nbio = bank(
+                    gpu,
+                    discovery::HW_ID_NBIF,
+                    &[
+                        (7, 2, 0),
+                        (7, 2, 1),
+                        (7, 3, 0),
+                        (7, 5, 0),
+                        (7, 5, 1),
+                        (7, 7, 0),
+                        (7, 7, 1),
+                    ],
+                    2,
+                    0x12d,
+                )?;
+                // regDCN_VM_FB_LOCATION_BASE/TOP and regDCN_VM_FB_OFFSET are
+                // 0x475..0x477 in dcn_3_1_5_offset.h too.
+                let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 5)], 2, 0x477)?;
+                (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
+            }
             Kind::Navi22 | Kind::Rdna2(_) => {
                 let profile = kind.rdna2_profile().ok_or(Error::Unsupported)?;
                 if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did) != Some(profile)
@@ -854,7 +899,10 @@ impl Layout {
         if kind.rdna2_profile().is_some() && (ip.major, ip.minor) != (5, 0) {
             return Err(Error::Unsupported);
         }
-        let gfx_status_regs = if let Some(profile) = kind.rdna2_profile() {
+        // gfx_v10_0_wait_for_rlc_autoload_complete reads CP_STAT and
+        // RLC_RLCS_BOOTLOAD_STATUS from gc_10_3_0_offset.h on every GC 10.3
+        // part, Raphael's 10.3.6 included.
+        let gfx_status_regs = if let Some(profile) = kind.graphics_profile() {
             let r = crate::amdgpu_rdna2::PSP_GC_REGISTERS;
             let cp = bank(
                 gpu,
@@ -1003,8 +1051,21 @@ impl Psp {
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
     ) -> Result<Self, Error> {
+        // PSP 13.0.5 is Raphael's, and only with DCN 3.1.5 beside it.
+        let kind = if crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 5)], 0, 0)
+            .is_ok()
+        {
+            if crate::amdgpu_dcn_profile::Profile::resolve(gpu)
+                != Ok(crate::amdgpu_dcn_profile::Profile::Dcn315)
+            {
+                return Err(Error::Unsupported);
+            }
+            Kind::Raphael
+        } else {
+            Kind::Phoenix
+        };
         // SAFETY: forwarded exclusive device/mapping/pool contract.
-        unsafe { Self::with_kind(gpu, authority, pool, Kind::Phoenix) }
+        unsafe { Self::with_kind(gpu, authority, pool, kind) }
     }
     /// Claim the Navi22 PSP11 ring after SOS bootstrap (or verified resident SOS).
     /// Validates GMC10 GPU VRAM addresses against the caller's BAR0 pool.
@@ -1091,6 +1152,7 @@ impl Psp {
                 tmr: None,
                 tmr_ready: false,
                 smc_state: SmcState::Absent,
+                smc_resident: kind == Kind::Raphael,
                 gfx_state: GfxLoadState::Absent,
                 gfx_status: None,
                 media_firmware: MediaFirmware::default(),
@@ -1111,7 +1173,7 @@ impl Psp {
     /// Phoenix's standalone authenticated TOC container. Navi22 uses the
     /// embedded TOC from the SOS container through `setup_tmr_navi22`.
     pub async fn setup_tmr(&mut self, toc: &[u8]) -> Result<(), Error> {
-        if self.kind != Kind::Phoenix {
+        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael) {
             return Err(Error::Unsupported);
         }
         self.session
@@ -1200,7 +1262,7 @@ impl Psp {
     /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
     /// The DCN314 loader is the currently audited consumer of this operation.
     pub async fn load_dmub(&mut self, signed_instructions: &[u8]) -> Result<(), Error> {
-        if self.kind != Kind::Phoenix {
+        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael) {
             return Err(Error::Unsupported);
         }
         self.session
@@ -1213,7 +1275,7 @@ impl Psp {
     /// GFX_FW_TYPE_VCN0_RAM / VCN1_RAM, which PSP writes into that
     /// instance's DPG SRAM. The instance's firmware must already be loaded.
     pub async fn load_vcn_sram(&mut self, instance: usize, words: &[u32]) -> Result<(), Error> {
-        if self.kind.rdna2_profile().is_none() {
+        if self.kind.graphics_profile().is_none() {
             return Err(Error::Unsupported);
         }
         let firmware = self.session.media_firmware;
@@ -1288,13 +1350,14 @@ impl Psp {
         let images = firmware.images().map_err(|_| Error::Invalid)?;
         self.session.load_gfx(&images).await
     }
-    /// Submit this RDNA2 ASIC's prepared graphics set after SMC/TMR setup.
+    /// Submit this RDNA2 ASIC's prepared graphics set after TMR setup and the
+    /// SMC load (or, on Raphael, with its BIOS-resident PMFW).
     /// Acceptance is not proof of working engines or initialized queues.
     pub async fn load_gfx_rdna2(
         &mut self,
         firmware: &crate::amdgpu_gfx_navi22::Firmware,
     ) -> Result<(), Error> {
-        if self.kind.rdna2_profile() != Some(firmware.profile()) {
+        if self.kind.graphics_profile() != Some(firmware.profile()) {
             return Err(Error::Unsupported);
         }
         let images = firmware.images().map_err(|error| {
@@ -1414,7 +1477,7 @@ impl Psp {
     /// Observe CP idle and RLC boot completion for the accepted RDNA2 autoload.
     /// Performs no GC writes and does not advertise acceleration.
     pub async fn wait_gfx_boot_rdna2(&mut self) -> Result<GfxBootStatus, Error> {
-        if self.kind.rdna2_profile().is_none() {
+        if self.kind.graphics_profile().is_none() {
             return Err(Error::Unsupported);
         }
         self.session.wait_gfx_boot().await
@@ -1558,7 +1621,14 @@ impl<I: Io> Session<I> {
         self.release_payload();
         result
     }
+    /// Whether the SMU firmware the graphics autoload needs is running.
+    fn smc_ready(&self) -> bool {
+        self.smc_resident || self.smc_state == SmcState::Loaded
+    }
     async fn load_smc(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.smc_resident {
+            return Err(Error::Unsupported);
+        }
         if self.smc_state != SmcState::Absent
             || !self.tmr_ready
             || self.engine.state != State::Ready
@@ -1579,6 +1649,9 @@ impl<I: Io> Session<I> {
     /// LOAD_IP_FW after LOAD_TOC/TMR reservation but before SETUP_TMR, which
     /// follows immediately (psp_hw_start).
     async fn load_smc_centralized(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.smc_resident {
+            return Err(Error::Unsupported);
+        }
         if self.smc_state != SmcState::Absent
             || self.tmr.is_none()
             || self.tmr_ready
@@ -1605,7 +1678,7 @@ impl<I: Io> Session<I> {
     ) -> Result<(), Error> {
         use crate::amdgpu_gfx_firmware::Source;
         if self.gfx_state != GfxLoadState::Absent
-            || self.smc_state != SmcState::Loaded
+            || !self.smc_ready()
             || !self.tmr_ready
             || self.engine.state != State::Ready
             || self.payload.is_some()
@@ -1815,7 +1888,7 @@ impl<I: Io> Session<I> {
         if self.gfx_state != GfxLoadState::Accepted
             || self.engine.state != State::Ready
             || !self.tmr_ready
-            || self.smc_state != SmcState::Loaded
+            || !self.smc_ready()
         {
             return Err(Error::Busy);
         }

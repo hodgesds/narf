@@ -74,7 +74,8 @@ fn firmware() -> Firmware {
         mec2: None,
         rlc: &rlc,
         sdma: &sdma,
-        sos: &sos,
+        sos: Some(&sos),
+        toc: None,
         vcn: &vcn,
         dmcub: &dmcub,
     })
@@ -139,6 +140,107 @@ fn decode<T: Copy + Default>(bytes: &[u8]) -> T {
 fn u32_at(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap())
 }
+
+/// Raphael through the RDNA2 replies, with `amdgpu_kms.c`'s APU rules:
+/// AMDGPU_FAMILY_GC_10_3_6, external_rev = rev + 1 (nv_common_early_init),
+/// FUSION, no MALL, one SDMA firmware index, SOS 0 and the TOC the PSP took,
+/// and nv.c's Yellow Carp decode table for VCN 3.1.2.
+fn raphael_info_follows_the_apu_rules() -> TestResult {
+    let mut published = booted(true);
+    let toc = file(0x0022_0c11, 0x15, 36);
+    let mut fw = firmware();
+    fw.sos = Version::default();
+    fw.toc = Firmware::parse(&Files {
+        me: &file(1, 1, 44),
+        pfp: &file(1, 1, 44),
+        ce: &file(1, 1, 44),
+        mec: &file(1, 1, 44),
+        mec2: None,
+        rlc: &file(1, 1, 44),
+        sdma: &file(1, 1, 44),
+        sos: None,
+        toc: Some(&toc),
+        vcn: &file(1, 1, 44),
+        dmcub: &file(1, 1, 44),
+    })
+    .map(|f| f.toc)
+    .unwrap_or_default();
+    published.boot = published.boot.map(|b| Boot {
+        firmware: fw,
+        sdma_rings: 1,
+        ..b
+    });
+    published.chip_revision = Some(2);
+    let mut s = snap(published);
+    s.did = 0x164e;
+    s.is_apu = true;
+    s.ip_blocks = vec![
+        ip(HW_ID_GC, (10, 3, 6), 0x1260),
+        ip(HW_ID_SDMA0, (5, 2, 6), 0x1260),
+        ip(HW_ID_VCN, (3, 1, 2), 0x7800),
+        ip(HW_ID_NBIF, (7, 2, 1), 0),
+    ];
+    let d: uapi::DrmAmdgpuInfoDevice =
+        decode(&ask(&s, Submission::NotWired, uapi::AMDGPU_INFO_DEV_INFO, [0; 4]).unwrap());
+    if d.family != uapi::AMDGPU_FAMILY_GC_10_3_6
+        || d.chip_rev != 2
+        || d.external_rev != 3
+        || d.ids_flags != u64::from(uapi::AMDGPU_IDS_FLAGS_FUSION)
+        || d.mall_size != 0
+    {
+        return TestResult::Fail("Raphael DEV_INFO identity");
+    }
+    let fw = |t, idx| ask(&s, SUBMISSION, uapi::AMDGPU_INFO_FW_VERSION, [t, 0, idx, 0]);
+    let v = |t, idx| fw(t, idx).map(|b| (u32_at(&b, 0), u32_at(&b, 1)));
+    if v(uapi::AMDGPU_INFO_FW_SDMA, 0) != Ok((80, 60))
+        || fw(uapi::AMDGPU_INFO_FW_SDMA, 1) != Err(FsError::InvalidData)
+        || v(uapi::AMDGPU_INFO_FW_SOS, 0) != Ok((0, 0))
+        || v(uapi::AMDGPU_INFO_FW_TOC, 0) != Ok((0x0022_0c11, 0x15))
+    {
+        return TestResult::Fail("Raphael firmware versions");
+    }
+    let caps = |kind| {
+        ask(
+            &s,
+            SUBMISSION,
+            uapi::AMDGPU_INFO_VIDEO_CAPS,
+            [kind, 0, 0, 0],
+        )
+        .map(|b| decode::<uapi::DrmAmdgpuInfoVideoCaps>(&b))
+    };
+    let (Ok(decode_caps), Ok(encode_caps)) = (
+        caps(uapi::AMDGPU_INFO_VIDEO_CAPS_DECODE),
+        caps(uapi::AMDGPU_INFO_VIDEO_CAPS_ENCODE),
+    ) else {
+        return TestResult::Fail("Raphael video caps refused");
+    };
+    let valid = |c: &uapi::DrmAmdgpuInfoVideoCaps, i: u32| c.codec_info[i as usize].valid == 1;
+    if !valid(&decode_caps, uapi::AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1)
+        || valid(&decode_caps, uapi::AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_MPEG2)
+        || valid(&decode_caps, uapi::AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VC1)
+        || !valid(&encode_caps, uapi::AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC)
+    {
+        return TestResult::Fail("Raphael codecs are not Yellow Carp's");
+    }
+    // The discrete Navi22 keeps its own identity.
+    let navi22: uapi::DrmAmdgpuInfoDevice = decode(
+        &ask(
+            &snap(booted(true)),
+            Submission::NotWired,
+            uapi::AMDGPU_INFO_DEV_INFO,
+            [0; 4],
+        )
+        .unwrap(),
+    );
+    if navi22.family != uapi::AMDGPU_FAMILY_NV || navi22.ids_flags != 0 {
+        return TestResult::Fail("Navi22 identity changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/raphael",
+    raphael_info_follows_the_apu_rules
+);
 
 fn navi22_dev_info_matches_linux() -> TestResult {
     let s = snap(booted(true));
@@ -392,7 +494,8 @@ fn navi22_fw_version_reports_the_loaded_set() -> TestResult {
         mec2: None,
         rlc: &[0; 12],
         sdma: &[],
-        sos: &[],
+        sos: Some(&[]),
+        toc: None,
         vcn: &[],
         dmcub: &[],
     })

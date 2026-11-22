@@ -459,7 +459,8 @@ fn mes12_hw_validates_discovery_and_refuses_separate_kiq_firmware() -> TestResul
     ih.minor = 0;
     ih.revision = 0;
     ih.num_bases = 1;
-    ih.base_addrs = [0x12000, 0, 0, 0, 0];
+    ih.base_addrs = [0; crate::amdgpu_discovery::MAX_BASE_ADDRS];
+    ih.base_addrs[0] = 0x12000;
     gpu.ip_blocks.push(ih);
     assert!(Layout::resolve(&gpu).is_ok());
     (
@@ -706,7 +707,8 @@ fn mes12_hw_layout_resolves_on_every_rdna4_profile() -> TestResult {
         let mut ih = gpu.ip_blocks[0];
         (ih.hw_id, ih.major, ih.minor, ih.revision) = (ip::HW_ID_OSSSYS, 7, 0, 0);
         ih.num_bases = 1;
-        ih.base_addrs = [0x12000, 0, 0, 0, 0];
+        ih.base_addrs = [0; crate::amdgpu_discovery::MAX_BASE_ADDRS];
+        ih.base_addrs[0] = 0x12000;
         gpu.ip_blocks.push(ih);
         profile.apply(&mut gpu);
         if Layout::resolve(&gpu).is_err() {

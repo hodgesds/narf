@@ -10073,7 +10073,7 @@ kernel_test_in!(
 ///   * `0x15BF` was labelled Strix Point. It is Phoenix1 — the Radeon 780M —
 ///     so every 780M asked the PSP for Strix firmware.
 ///   * `0x1681` was labelled a "Phoenix discrete sibling". It is Rembrandt,
-///     RDNA2 (GFX 10.3.6), an architecture earlier.
+///     RDNA2 (GFX 10.3.3), an architecture earlier.
 ///   * `PHOENIX_FW` held the Strix bundle outright (GFX 11.5, DCN 3.5,
 ///     PSP 14.0.1), under a doc comment that said so.
 #[cfg(feature = "amdgpu")]
@@ -10195,7 +10195,7 @@ fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
     }
 
     // Silicon with no bring-up must not borrow another family's firmware.
-    for did in [amdgpu::STRIX_POINT, amdgpu::REMBRANDT] {
+    for did in [amdgpu::STRIX_POINT, amdgpu::REMBRANDT, amdgpu::RAPHAEL] {
         match amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, did) {
             Some(info) if info.fw_list.is_empty() => {}
             Some(_) => return TestResult::Fail("unaudited silicon was given a firmware bundle"),
@@ -10206,6 +10206,74 @@ fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
 }
 #[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_phoenix_identity_matches_linux);
+
+/// Raphael (`1002:164E`) — the Ryzen 7000 / 9000 desktop iGPU — is RDNA2:
+/// GC 10.3.6 with DCN 3.1.5, per `amdgpu_discovery.c`. It used to resolve to
+/// `Family::Navi3`, which handed it GFX11 register tables and VCN 4.0.5.
+///
+/// `RAPHAEL_FW` is checked against Linux's `MODULE_FIRMWARE` names and the
+/// `enum AMDGPU_UCODE_ID` load order even though nothing loads it yet, so the
+/// PSP 13.0.5 work starts from a table already proven right.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_raphael_identity_matches_linux() -> TestResult {
+    use crate::{amdgpu, amdgpu_video::VcnVersion};
+    if amdgpu::RAPHAEL != 0x164E {
+        return TestResult::Fail("Raphael is 0x164E in pci.ids");
+    }
+    let Some(info) = amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, amdgpu::RAPHAEL)
+    else {
+        return TestResult::Fail("Raphael's device id resolves to no chip");
+    };
+    // The coarse RDNA2 register family, as Rembrandt; never RDNA3.
+    if info.family != amdgpu::Family::Navi2 {
+        return TestResult::Fail("Raphael is RDNA2 (GC 10.3.6), not Navi3");
+    }
+    // An APU by id before discovery, and by GC version after it.
+    if !info.is_apu() || !amdgpu::gc_version_is_apu(10, 3, 6) {
+        return TestResult::Fail("Raphael must be an APU");
+    }
+    // VCN 3.1.2 is driven by Linux's vcn_v3_0 block, never VCN 4.
+    if VcnVersion::from_family(info.family) != Some(VcnVersion::V3_0) {
+        return TestResult::Fail("Raphael's VCN is the 3.x line");
+    }
+    // Discrete RDNA2 bring-up must not claim it.
+    if crate::amdgpu_rdna2::for_pci_id(amdgpu::AMD_VENDOR, amdgpu::RAPHAEL).is_some()
+        || crate::amdgpu_rdna2::native_start_available(amdgpu::AMD_VENDOR, amdgpu::RAPHAEL)
+    {
+        return TestResult::Fail("a discrete RDNA2 profile claimed Raphael");
+    }
+    let want: &[&str] = &[
+        "amdgpu/psp_13_0_5_toc.bin",
+        "amdgpu/sdma_5_2_6.bin",
+        "amdgpu/gc_10_3_6_ce.bin",
+        "amdgpu/gc_10_3_6_pfp.bin",
+        "amdgpu/gc_10_3_6_me.bin",
+        "amdgpu/gc_10_3_6_mec.bin",
+        "amdgpu/gc_10_3_6_mec2.bin",
+        "amdgpu/gc_10_3_6_rlc.bin",
+        "amdgpu/vcn_3_1_2.bin",
+        "amdgpu/dcn_3_1_5_dmcub.bin",
+        "amdgpu/psp_13_0_5_ta.bin",
+    ];
+    let table = amdgpu::RAPHAEL_FW;
+    if table.len() != want.len()
+        || table
+            .iter()
+            .zip(want)
+            .any(|(entry, name)| entry.name != *name)
+    {
+        return TestResult::Fail("a Raphael firmware blob name or position is not Linux's");
+    }
+    if table
+        .iter()
+        .any(|e| e.cmd == amdgpu::SMU_LOAD_PMFW_MP1 || e.name.contains("gc_11"))
+    {
+        return TestResult::Fail("Raphael carries an SMU blob or RDNA3 firmware");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu", smoke_amdgpu_raphael_identity_matches_linux);
 
 /// Build a discovery blob carrying a `gc_info` v1.2 table describing a
 /// Radeon 780M: 1 shader engine, 2 shader arrays, 3 WGPs per bank per array.

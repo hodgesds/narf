@@ -49,11 +49,25 @@ pub(crate) struct Engine<I: Io> {
     pub queues: Vec<Queue>,
     pub state: State,
     pub proof: Proof,
+    /// NBIO 7.2's banks, whose single SDMA doorbell range is GDC0's; `None`
+    /// on NBIO 2.3, which has one range per engine on segment 2.
+    pub nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
 }
 fn reg(l: Layout, instance: u32, r: Reg) -> u64 {
     l.sdma(instance, r)
 }
 impl<I: Io> Engine<I> {
+    /// See `Sdma::rearm`.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        self.queues.iter_mut().for_each(Queue::rearm);
+        self.state = State::Prepared;
+        self.proof = Proof::default();
+    }
     pub(crate) async fn start(&mut self) -> Result<(), Error> {
         if self.state != State::Prepared {
             return Err(Error::Busy);
@@ -166,6 +180,7 @@ impl<I: Io> Engine<I> {
         let q = &mut self.queues[i as usize];
         let (base, rptr, wptr, index) =
             (q.address(0), q.address(RPTR), q.address(WPTR), q.doorbell);
+        let nbio_v7_2 = self.nbio_v7_2;
         self.hw.access(|io, l| {
             let r = |reg_: Reg| reg(l, i, reg_);
             io.write(r(SDMA0_SEM_WAIT_FAIL_TIMER_CNTL), 0);
@@ -199,24 +214,42 @@ impl<I: Io> Engine<I> {
             // linux-lit: 0x0fff_fffc=SDMA0_GFX_DOORBELL_OFFSET__OFFSET_MASK@gc
             // linux-lit: 2=SDMA0_GFX_DOORBELL_OFFSET__OFFSET__SHIFT@gc
             update(io, r(SDMA0_GFX_DOORBELL_OFFSET), 0x0fff_fffc, index << 2)?;
-            // nbio_v2_3_sdma_doorbell_range: OFFSET[11:2], SIZE[20:16]
-            let range = l.nbio(
-                [
-                    NBIO_SDMA0_DOORBELL_RANGE,
-                    NBIO_SDMA1_DOORBELL_RANGE,
-                    NBIO_SDMA2_DOORBELL_RANGE,
-                    NBIO_SDMA3_DOORBELL_RANGE,
-                ][i as usize],
-            );
-            update(
-                io,
-                range,
-                // linux-lit: 0x001f_0ffc=BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK | BIF_SDMA0_DOORBELL_RANGE__SIZE_MASK
-                0x001f_0ffc,
-                // linux-lit: 2=BIF_SDMA0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK
-                // linux-lit: 16=BIF_SDMA0_DOORBELL_RANGE__SIZE__SHIFT
-                ((index << 2) & 0xffc) | (doorbell::SDMA_RANGE << 16),
-            )?;
+            match nbio_v7_2 {
+                None => {
+                    // nbio_v2_3_sdma_doorbell_range: OFFSET[11:2], SIZE[20:16]
+                    let range = l.nbio(
+                        [
+                            NBIO_SDMA0_DOORBELL_RANGE,
+                            NBIO_SDMA1_DOORBELL_RANGE,
+                            NBIO_SDMA2_DOORBELL_RANGE,
+                            NBIO_SDMA3_DOORBELL_RANGE,
+                        ][i as usize],
+                    );
+                    update(
+                        io,
+                        range,
+                        // linux-lit: 0x001f_0ffc=BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK | BIF_SDMA0_DOORBELL_RANGE__SIZE_MASK
+                        0x001f_0ffc,
+                        // linux-lit: 2=BIF_SDMA0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK
+                        // linux-lit: 16=BIF_SDMA0_DOORBELL_RANGE__SIZE__SHIFT
+                        ((index << 2) & 0xffc) | (doorbell::SDMA_RANGE << 16),
+                    )?;
+                }
+                // nbio_v7_2_sdma_doorbell_range: one GDC0 range, whatever the
+                // instance, through the port pair. NBIO 7.2 parts have one SDMA.
+                Some(banks) if i == 0 => crate::amdgpu_cp_navi22::port_update(
+                    io,
+                    banks,
+                    crate::amdgpu_nbio_v7_2::GDC0_SDMA0_DOORBELL_RANGE,
+                    |old| {
+                        crate::amdgpu_nbio_v7_2::sdma_doorbell_range(
+                            old,
+                            Some((index, doorbell::SDMA_RANGE)),
+                        )
+                    },
+                )?,
+                Some(_) => return Err(Error::Unsupported),
+            }
             io.write(r(SDMA0_GFX_MINOR_PTR_UPDATE), 0);
             // linux-lit: 0x22=SDMA0_CNTL__UTC_L1_ENABLE_MASK@gc | SDMA0_CNTL__MIDCMD_PREEMPT_ENABLE_MASK@gc
             update(io, r(SDMA0_CNTL), 0x22, 0x22)?; // UTC_L1_ENABLE | MIDCMD_PREEMPT
@@ -311,8 +344,20 @@ impl<I: Io> Engine<I> {
 }
 
 pub(crate) fn resolve_rdna2(gpu: &AmdGpu) -> Result<(Layout, usize), Error> {
+    engines(gpu, Layout::resolve_rdna2(gpu)?)
+}
+/// Raphael's one SDMA 5.2.6 engine; a second is refused (NBIO 7.2 has one
+/// SDMA doorbell range).
+pub(crate) fn resolve_raphael(gpu: &AmdGpu) -> Result<(Layout, usize), Error> {
+    let (layout, count) = engines(gpu, Layout::resolve_raphael(gpu)?)?;
+    if count != 1 {
+        return Err(Error::Unsupported);
+    }
+    Ok((layout, count))
+}
+/// The contiguous discovered SDMA engines of `layout`'s profile.
+fn engines(gpu: &AmdGpu, mut layout: Layout) -> Result<(Layout, usize), Error> {
     use crate::amdgpu_discovery as ip;
-    let mut layout = Layout::resolve_rdna2(gpu)?;
     let mut mask = 0u8;
     for block in &gpu.ip_blocks {
         // Discovery instance numbers are local to a HWID. Navi22 exposes
@@ -381,6 +426,16 @@ pub struct Sdma {
     engine: Engine<Mmio>,
 }
 impl Sdma {
+    /// Return to Prepared on the same reservations (hw_init after a reset).
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
     /// Reserve both rings without device I/O.
     ///
     /// # Safety
@@ -407,6 +462,20 @@ impl Sdma {
         doorbells: Doorbells,
     ) -> Result<Self, Error> {
         let (layout, count) = resolve_rdna2(gpu)?;
+        Self::with_layout(gpu, authority, pool, doorbells, layout, count)
+    }
+    /// Reserve Raphael's single SDMA 5.2.6 queue, whose doorbell range is
+    /// NBIO 7.2's GDC0 one.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        let (layout, count) = resolve_raphael(gpu)?;
         Self::with_layout(gpu, authority, pool, doorbells, layout, count)
     }
     fn with_layout(
@@ -446,6 +515,11 @@ impl Sdma {
                 queues,
                 state: State::Prepared,
                 proof: Proof::default(),
+                nbio_v7_2: if layout.profile == &crate::amdgpu_rdna2::RAPHAEL {
+                    Some(crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?)
+                } else {
+                    None
+                },
             },
         })
     }

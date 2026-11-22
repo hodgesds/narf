@@ -380,8 +380,23 @@ pub struct Status {
 struct Layout {
     oss: u64,
     nbio: u64,
-    hdp: u64,
+    /// HDP 5.0's read cache, invalidated before each ring read. HDP 5.2.1
+    /// has none: no `HDP_READ_CACHE_INVALIDATE`, and no cache fields left in
+    /// `HDP_MISC_CNTL` (`hdp_5_2_1_sh_mask.h`), as `hdp_v5_2_funcs` has no
+    /// `invalidate_hdp`.
+    hdp: Option<u64>,
+    /// NBIO 7.2, whose IH doorbell range is the GDC0 register reached through
+    /// the PCIe port pair. NBIO 2.3's is `BIF_IH_DOORBELL_RANGE` in `nbio`.
+    nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
     self_wptr_update: bool,
+}
+/// Linux force_update_wptr_for_self_int is a no-op before 5.0.3.
+fn self_wptr_update(gpu: &AmdGpu) -> bool {
+    gpu.ip_blocks.iter().any(|b| {
+        b.hw_id == ip::HW_ID_OSSSYS
+            && b.instance == 0
+            && (b.major, b.minor, b.revision) >= (5, 0, 3)
+    })
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -408,12 +423,8 @@ impl Layout {
         };
         Ok(Self {
             oss: resolve(ip::HW_ID_OSSSYS, oss_versions, 0, IH_CNTL2)?,
-            // Linux force_update_wptr_for_self_int is a no-op before 5.0.3.
-            self_wptr_update: gpu.ip_blocks.iter().any(|b| {
-                b.hw_id == ip::HW_ID_OSSSYS
-                    && b.instance == 0
-                    && (b.major, b.minor, b.revision) >= (5, 0, 3)
-            }),
+            self_wptr_update: self_wptr_update(gpu),
+            nbio_v7_2: None,
             nbio: resolve(
                 ip::HW_ID_NBIF,
                 &[
@@ -428,12 +439,41 @@ impl Layout {
                 2,
                 IH_DOORBELL_RANGE,
             )?,
-            hdp: resolve(
+            hdp: Some(resolve(
                 ip::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                 0,
                 HDP_READ_CACHE_INVALIDATE,
+            )?),
+        })
+    }
+    /// Raphael: GC 10.3.6 with `navi10_ih` on OSSSYS 5.0.x/5.2.x, NBIO 7.2 and
+    /// HDP 5.2.1. NBIO 7.2 keeps `INTERRUPT_CNTL`/`2` and the HDP remap at
+    /// their NBIO 2.3 offsets on segment 2; only the doorbell range moves.
+    fn resolve_raphael(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::RAPHAEL)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let resolve = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        resolve(ip::HW_ID_GC, &[(10, 3, 6)], 0, 0)?;
+        resolve(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        Ok(Self {
+            oss: resolve(
+                ip::HW_ID_OSSSYS,
+                crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS,
+                0,
+                IH_CNTL2,
             )?,
+            nbio: banks.bif,
+            hdp: None,
+            nbio_v7_2: Some(banks),
+            self_wptr_update: self_wptr_update(gpu),
         })
     }
 }
@@ -521,6 +561,26 @@ impl<I: Io> Engine<I> {
         let next = (checked(io.read(address))? & !mask) | value;
         io.write(address, next);
         Ok(next)
+    }
+    /// `nbio_v7_2_ih_doorbell_range(use_doorbell = false)`: read the GDC0
+    /// range through the port pair and write it back with SIZE cleared, under
+    /// the index latch Raphael's display clock manager shares.
+    fn port_doorbell_off(io: &mut I, banks: crate::amdgpu_nbio_v7_2::Banks) -> Result<(), Error> {
+        use crate::amdgpu_nbio_v7_2 as nbio;
+        let address = banks
+            .port_address(nbio::GDC0_IH_DOORBELL_RANGE)
+            .ok_or(Error::Invalid)?;
+        let (index, data) = banks.port_pair();
+        crate::amdgpu_smn::with_latch(|| {
+            io.write(index, address);
+            io.read(index);
+            let old = checked(io.read(data))?;
+            io.write(index, address);
+            io.read(index);
+            io.write(data, nbio::ih_doorbell_range(old, None));
+            io.read(data);
+            Ok(())
+        })
     }
     /// Read-only checks; must succeed before any host routing or writes.
     fn preflight(&mut self) -> Result<(), Error> {
@@ -634,7 +694,12 @@ impl<I: Io> Engine<I> {
             io.write(Self::reg(l, RB_WPTR), 0);
             io.write(Self::reg(l, RB_RPTR), 0);
             io.write(Self::reg(l, DOORBELL_RPTR), 0);
-            Self::update(io, Self::nbio(l, IH_DOORBELL_RANGE), DOORBELL_SIZE, 0)?;
+            match l.nbio_v7_2 {
+                None => {
+                    Self::update(io, Self::nbio(l, IH_DOORBELL_RANGE), DOORBELL_SIZE, 0)?;
+                }
+                Some(banks) => Self::port_doorbell_off(io, banks)?,
+            }
             Self::toggle(io, l, true)?;
             Self::self_int(io, l, true)
         })?;
@@ -673,8 +738,10 @@ impl<I: Io> Engine<I> {
         let map = self.memory.mapping();
         let mut rptr = self.rptr;
         let batch = self.access(|io, l| {
-            io.write(l.hdp + u64::from(HDP_READ_CACHE_INVALIDATE) * 4, 1);
-            io.read(l.hdp + u64::from(HDP_READ_CACHE_INVALIDATE) * 4);
+            if let Some(hdp) = l.hdp {
+                io.write(hdp + u64::from(HDP_READ_CACHE_INVALIDATE) * 4, 1);
+                io.read(hdp + u64::from(HDP_READ_CACHE_INVALIDATE) * 4);
+            }
             fence(Ordering::SeqCst);
             let (wptr, overflow) = Self::wptr(io, l, map, &mut rptr)?;
             let mut batch = Batch {
@@ -787,6 +854,15 @@ impl Hub {
     fn record_interrupt(&self) {
         self.interrupts.fetch_add(1, Ordering::Relaxed);
         self.pending.store(true, Ordering::Release);
+    }
+    /// Open again after `disable` for a re-armed ring: every subscription
+    /// slot is dropped (their generations are never reused, so an old
+    /// subscription's next poll finds none and ends `Revoked`), then the
+    /// terminal reason is cleared.
+    fn reopen(&self) {
+        self.table.lock().slots.clear();
+        self.pending.store(false, Ordering::Release);
+        self.closed.store(0, Ordering::Release);
     }
     fn closed(&self) -> Result<(), Closed> {
         match self.closed.load(Ordering::Acquire) {
@@ -904,6 +980,19 @@ trait Port: Send + Sync {
 struct Shared<I: Io> {
     hub: Hub,
     engine: Mutex<Engine<I>>,
+}
+impl<I: Io> Shared<I> {
+    /// The engine back to Prepared with its read pointer at 0, and the hub
+    /// reopened with no subscriber (`Ih::rearm`).
+    async fn rearm(&self) {
+        {
+            let mut engine = self.engine.lock().await;
+            engine.state = State::Prepared;
+            engine.rptr = 0;
+            engine.inherited = false;
+        }
+        self.hub.reopen();
+    }
 }
 impl<I: Io> Port for Shared<I> {
     fn hub(&self) -> &Hub {
@@ -1328,6 +1417,23 @@ impl Ih {
         let layout = Layout::resolve_rdna2(gpu)?;
         Self::with_layout(gpu, authority, pool, device, layout)
     }
+    /// Reserve Raphael's RB0 ring: GC 10.3.6, `navi10_ih` on OSSSYS 5.0.x/5.2.x,
+    /// NBIO 7.2 and HDP 5.2.1. The ring is in the carve-out, read through BAR0
+    /// with no HDP invalidate (HDP 5.2.1 has no read cache). No device I/O or
+    /// interrupt routing occurs during construction.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael. NBIO's index pairs are shared through
+    /// `amdgpu_smn`.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        device: BusDevice,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve_raphael(gpu)?;
+        Self::with_layout(gpu, authority, pool, device, layout)
+    }
     fn with_layout(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
@@ -1378,8 +1484,13 @@ impl Ih {
             let mut engine = shared.engine.lock().await;
             match engine.preflight() {
                 Ok(()) => {
-                    // SAFETY: forwarded exclusive PCI function ownership.
-                    let delivery = unsafe { self.route() };
+                    let delivery = if matches!(self.route, Route::None) {
+                        // SAFETY: forwarded exclusive PCI function ownership.
+                        unsafe { self.route() }
+                    } else {
+                        // SAFETY: as above, on the route `route` took before.
+                        unsafe { self.reroute() }
+                    };
                     self.shared.hub.set_delivery(delivery);
                     let msi = !matches!(delivery, Delivery::Polling);
                     engine.program(msi).map(|()| delivery).inspect_err(|_| {
@@ -1464,6 +1575,76 @@ impl Ih {
         {
             Delivery::Polling
         }
+    }
+    /// The route an earlier `initialize` took, for a re-armed ring: the same
+    /// vector and handler, its MSI-X entry or MSI address written again (the
+    /// reset may have cleared them) and enabled. Polling if that fails.
+    ///
+    /// # Safety
+    /// As `route`.
+    unsafe fn reroute(&mut self) -> Delivery {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let Some(vector) = self.shared.hub.vector() else {
+                return Delivery::Polling;
+            };
+            let (cap, device) = (&self.authority, &self.device);
+            if narf_bus::pci::set_command(cap, device, narf_bus::pci::cmd::BUS_MASTER).is_err() {
+                return Delivery::Polling;
+            }
+            // SAFETY: APIC initialization precedes device initcalls.
+            let target = unsafe { narf_interrupts::current_cpu_target_id() };
+            if target > 255 {
+                return Delivery::Polling;
+            }
+            let delivery = match &mut self.route {
+                Route::MsiX(table) => {
+                    // SAFETY: owned function and vector; IH sources are disabled.
+                    let programmed = unsafe { table.program_vector(0, target, vector) }.is_ok();
+                    // SAFETY: same owned table, its entry programmed above.
+                    (programmed && unsafe { table.enable() }.is_ok())
+                        .then_some(Delivery::MsiX { vector })
+                }
+                Route::Msi(cfg) => {
+                    // SAFETY: owned config space; the vector's handler stays installed.
+                    let programmed =
+                        unsafe { narf_bus::msi::program_msi(cfg, target, vector) }.is_ok();
+                    // SAFETY: same owned config space.
+                    (programmed && unsafe { narf_bus::msi::enable(cfg) }.is_ok())
+                        .then_some(Delivery::Msi { vector })
+                }
+                Route::None => None,
+            };
+            match delivery {
+                Some(delivery) => {
+                    narf_interrupts::dispatch::enable_irq(vector);
+                    delivery
+                }
+                None => Delivery::Polling,
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Delivery::Polling
+        }
+    }
+    /// Re-arm a disabled ring on its own memory and vector, for
+    /// navi10_ih_hw_init after a reset: the engine back to Prepared with its
+    /// read pointer at 0, the hub reopened with no subscriber, so
+    /// `initialize` programs the same ring again and re-enables the same
+    /// vector rather than allocating new ones.
+    ///
+    /// # Safety
+    /// The GPU was reset since the ring was disabled, and no future of this
+    /// owner is alive.
+    pub async unsafe fn rearm(&mut self) -> Result<(), Error> {
+        if !matches!(self.state, State::Disabled | State::Failed) {
+            return Err(Error::Busy);
+        }
+        self.shared.rearm().await;
+        self.state = State::Prepared;
+        self.proof = None;
+        Ok(())
     }
     /// Bounded navi10_ih_irq_disable; every waiter receives `Disabled`.
     /// The ring stays quarantined and the vector stays reserved.

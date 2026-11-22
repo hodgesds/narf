@@ -1,11 +1,13 @@
-//! Discrete RDNA2 clock gating: `nv_common`, GMC10, navi10 IH, GFX10
-//! and SDMA5.2 sequences selected by each ASIC's `nv_common_early_init`
-//! flags. VCN/JPEG idle work remains owned by the media engine. SDMA uses
-//! the validated discovered engine count and GC segments 0/2.
+//! RDNA2 clock gating: `nv_common`, GMC10, navi10 IH, GFX10 and SDMA5.2
+//! sequences selected by each ASIC's `nv_common_early_init` flags.
+//! VCN/JPEG idle work remains owned by the media engine. SDMA uses the
+//! validated discovered engine count and GC segments 0/2.
 //!
-//! Runs only after the explicit `amdgpu.rdna2_pg` opt-in (legacy
-//! `amdgpu.navi22_pg` is an alias) and policy admission. GC must be powered
-//! for every GFX transition; RLC safe mode brackets those writes.
+//! The discrete parts ([`Gating::new`]) run only after the explicit
+//! `amdgpu.rdna2_pg` opt-in (legacy `amdgpu.navi22_pg` is an alias) and
+//! policy admission. Raphael ([`Gating::new_raphael`]) gates with its
+//! graphics coordinator, as Linux's late init does. GC must be powered for
+//! every GFX transition; RLC safe mode brackets those writes.
 use crate::{amdgpu::AmdGpu, amdgpu_discovery as discovery};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
@@ -33,6 +35,8 @@ pub mod cg {
     pub const HDP_DS: u64 = 1 << 25; // linux: AMD_CG_SUPPORT_HDP_DS
     pub const HDP_SD: u64 = 1 << 26; // linux: AMD_CG_SUPPORT_HDP_SD
     pub const IH_CG: u64 = 1 << 27; // linux: AMD_CG_SUPPORT_IH_CG
+    pub const ATHUB_LS: u64 = 1 << 28; // linux: AMD_CG_SUPPORT_ATHUB_LS
+    pub const ATHUB_MGCG: u64 = 1 << 29; // linux: AMD_CG_SUPPORT_ATHUB_MGCG
     pub const JPEG_MGCG: u64 = 1 << 30; // linux: AMD_CG_SUPPORT_JPEG_MGCG
     pub const GFX_FGCG: u64 = 1 << 31; // linux: AMD_CG_SUPPORT_GFX_FGCG
 }
@@ -62,6 +66,36 @@ pub const NAVY_FLOUNDER_CG: u64 = cg::GFX_MGCG
 /// and GFX power gating is GFXOFF through PMFW (`amdgpu_navi22_gfxoff`).
 /// MMHUB/ATHUB PG are PMFW features (`FEATURE_MMHUB_PG/ATHUB_PG`).
 pub const NAVY_FLOUNDER_PG: u32 = pg::VCN | pg::VCN_DPG | pg::JPEG | pg::ATHUB | pg::MMHUB;
+
+/// nv.c `nv_common_early_init`, `case IP_VERSION(10, 3, 6)` (Raphael).
+/// Its HDP flags take no effect: `nv_common_set_clockgating_state` acts
+/// only on NBIO 2.3.x/3.3.x, and Raphael's is 7.2. ATHUB_MGCG/LS are
+/// informational; `athub_v2_*` test MC_MGCG, MC_LS and HDP_LS. VCN/JPEG
+/// MGCG is the media owner's.
+pub const RAPHAEL_CG: u64 = cg::GFX_MGCG
+    | cg::GFX_MGLS
+    | cg::GFX_CGCG
+    | cg::GFX_CGLS
+    | cg::GFX_3D_CGCG
+    | cg::GFX_3D_CGLS
+    | cg::GFX_RLC_LS
+    | cg::GFX_CP_LS
+    | cg::GFX_FGCG
+    | cg::MC_MGCG
+    | cg::MC_LS
+    | cg::SDMA_LS
+    | cg::HDP_MGCG
+    | cg::HDP_LS
+    | cg::ATHUB_MGCG
+    | cg::ATHUB_LS
+    | cg::IH_CG
+    | cg::VCN_MGCG
+    | cg::JPEG_MGCG;
+
+/// The same case's `pg_flags`: RLC's CGPG (`gfx_v10_cntl_pg`), VCN's DPG
+/// start and both media blocks' static PGFSM power gating. GFXOFF itself
+/// follows `PP_GFXOFF_MASK`, not these.
+pub const RAPHAEL_PG: u32 = pg::GFX_PG | pg::VCN | pg::VCN_DPG | pg::JPEG;
 
 /// `nv_common_early_init` flags for bare-metal discrete RDNA2.
 pub fn profile_flags(profile: &crate::amdgpu_rdna2::Profile) -> (u64, u32) {
@@ -128,9 +162,21 @@ pub(crate) const SDMA_CLK_CTRL: [Reg; 2] = [reg(Block::Gc0, 0x001b), reg(Block::
 /// mmhub_v2_0.c `mmDAGB0_CNTL_MISC2_Sienna_Cichlid` (MMHUB 2.1.x).
 // linux-lit: 0x0070=mmDAGB0_CNTL_MISC2_Sienna_Cichlid
 pub(crate) const DAGB0_CNTL_MISC2: Reg = reg(Block::Mmhub, 0x0070);
+/// mmhub_2_3_0_offset.h, all on `_BASE_IDX` 1 (the bank Raphael resolves).
+// linux-lit: 0x06cf=mmMM_ATC_L2_CGTT_CLK_CTRL@mmhub23
+pub(crate) const MM23_ATC_L2_CGTT_CLK_CTRL: Reg = reg(Block::Mmhub, 0x06cf);
+// linux-lit: 0x0096=mmDAGB0_CNTL_MISC2@mmhub23
+pub(crate) const MM23_DAGB0_CNTL_MISC2: Reg = reg(Block::Mmhub, 0x0096);
+// linux-lit: 0x0065=mmDAGB0_WR_CGTT_CLK_CTRL@mmhub23
+pub(crate) const MM23_DAGB0_WR_CGTT_CLK_CTRL: Reg = reg(Block::Mmhub, 0x0065);
+// linux-lit: 0x0024=mmDAGB0_RD_CGTT_CLK_CTRL@mmhub23
+pub(crate) const MM23_DAGB0_RD_CGTT_CLK_CTRL: Reg = reg(Block::Mmhub, 0x0024);
 /// athub_2_1_0_offset.h.
 // linux-lit: 0x0009=mmATHUB_MISC_CNTL
 pub(crate) const ATHUB_MISC_CNTL: Reg = reg(Block::Athub, 0x0009);
+/// athub_2_0_0_offset.h.
+// linux-lit: 0x000a=mmATHUB_MISC_CNTL@athub20
+pub(crate) const ATHUB20_MISC_CNTL: Reg = reg(Block::Athub, 0x000a);
 /// hdp_5_0_0_offset.h.
 // linux-lit: 0x00d4=mmHDP_MEM_POWER_CTRL
 pub(crate) const HDP_MEM_POWER_CTRL: Reg = reg(Block::Hdp, 0x00d4);
@@ -196,7 +242,15 @@ const SDMA_MEM_POWER_OVERRIDE: u32 = 1 << 8; // linux: SDMA0_POWER_CNTL__MEM_POW
 const DAGB_DISABLE_CG: u32 = 0xfc;
 const ATHUB_CG_ENABLE: u32 = 1 << 6; // linux: ATHUB_MISC_CNTL__CG_ENABLE_MASK
 const ATHUB_CG_MEM_LS_ENABLE: u32 = 1 << 7; // linux: ATHUB_MISC_CNTL__CG_MEM_LS_ENABLE_MASK
-                                            // linux: HDP_CLK_CNTL__IPH_MEM_CLK_SOFT_OVERRIDE_MASK
+const ATHUB20_CG_ENABLE: u32 = 1 << 18; // linux: ATHUB_MISC_CNTL__CG_ENABLE_MASK@athub20
+const ATHUB20_CG_MEM_LS_ENABLE: u32 = 1 << 19; // linux: ATHUB_MISC_CNTL__CG_MEM_LS_ENABLE_MASK@athub20
+/// MM_ATC_L2_CGTT_CLK_CTRL SOFT_OVERRIDE (mmhub_2_3_0_sh_mask.h).
+const ATC_L2_SOFT_OVERRIDE: u32 = 0xff00_0000; // linux: MM_ATC_L2_CGTT_CLK_CTRL__SOFT_OVERRIDE_MASK@mmhub23
+const ATC_L2_MGLS_OVERRIDE: u32 = 1 << 15; // linux: MM_ATC_L2_CGTT_CLK_CTRL__MGLS_OVERRIDE_MASK@mmhub23
+/// DAGB0_{WR,RD}_CGTT_CLK_CTRL LS_OVERRIDE, _WRITE, _READ, _RETURN, _REGISTER.
+// linux: DAGB0_WR_CGTT_CLK_CTRL__LS_OVERRIDE_MASK@mmhub23 | DAGB0_WR_CGTT_CLK_CTRL__LS_OVERRIDE_WRITE_MASK@mmhub23 | DAGB0_WR_CGTT_CLK_CTRL__LS_OVERRIDE_READ_MASK@mmhub23 | DAGB0_WR_CGTT_CLK_CTRL__LS_OVERRIDE_RETURN_MASK@mmhub23 | DAGB0_WR_CGTT_CLK_CTRL__LS_OVERRIDE_REGISTER_MASK@mmhub23
+const DAGB_LS_OVERRIDES: u32 = 0xf800_0000;
+// linux: HDP_CLK_CNTL__IPH_MEM_CLK_SOFT_OVERRIDE_MASK
 const HDP_IPH_MEM_CLK_SOFT_OVERRIDE: u32 = 1 << 26;
 // linux: HDP_CLK_CNTL__RC_MEM_CLK_SOFT_OVERRIDE_MASK
 const HDP_RC_MEM_CLK_SOFT_OVERRIDE: u32 = 1 << 27;
@@ -299,9 +353,10 @@ struct Mmio {
     gc2: Option<u64>,
     mmhub: u64,
     athub: u64,
-    hdp: u64,
+    /// Discrete only: nv_common's HDP and SMUIO banks.
+    hdp: Option<u64>,
     osssys: u64,
-    smuio: u64,
+    smuio: Option<u64>,
 }
 impl Mmio {
     fn at(&self, reg: Reg) -> u64 {
@@ -311,9 +366,9 @@ impl Mmio {
             Block::Gc2 => self.gc2.expect("validated SDMA2/3 bank"),
             Block::Mmhub => self.mmhub,
             Block::Athub => self.athub,
-            Block::Hdp => self.hdp,
+            Block::Hdp => self.hdp.expect("validated HDP bank"),
             Block::Osssys => self.osssys,
-            Block::Smuio => self.smuio,
+            Block::Smuio => self.smuio.expect("validated SMUIO bank"),
         };
         base + u64::from(reg.offset) * 4
     }
@@ -378,6 +433,44 @@ impl<I: Io> Seq<'_, I> {
     }
 }
 
+/// The `mmhub` functions `gmc_v10_0_set_clockgating_state` calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hub {
+    /// `mmhub_v2_0` on MMHUB 2.1.x: `DAGB0_CNTL_MISC2_Sienna_Cichlid` only.
+    V2_0,
+    /// `mmhub_v2_3`: MM_ATC_L2 and DAGB0 medium grain, then their light sleep.
+    V2_3,
+}
+/// The `athub` functions it calls after the hub, by ATHUB version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Athub {
+    /// `athub_v2_0` (1.3.1, 2.0.0, 2.0.2): `ATHUB_MISC_CNTL` at 0x000a; each
+    /// step returns without its flags.
+    V2_0,
+    /// `athub_v2_1` (2.1.0-2.1.2, 2.4.0): at 0x0009.
+    V2_1,
+    /// Any other version: both `set_clockgating` switches fall through.
+    None,
+}
+impl Athub {
+    /// `gmc_v10_0_set_clockgating_state`'s choice and each file's switch.
+    fn for_version(version: Option<(u8, u8, u8)>) -> Self {
+        match version {
+            Some((2, 1, 0..=2) | (2, 4, 0)) => Self::V2_1,
+            Some((1, 3, 1) | (2, 0, 0 | 2)) => Self::V2_0,
+            _ => Self::None,
+        }
+    }
+    /// The register its offset table names, if it writes one.
+    fn register(self) -> Option<Reg> {
+        match self {
+            Self::V2_0 => Some(ATHUB20_MISC_CNTL),
+            Self::V2_1 => Some(ATHUB_MISC_CNTL),
+            Self::None => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
@@ -385,6 +478,10 @@ struct Engine<I: Io> {
     cg_flags: u64,
     sdma_count: usize,
     rom_force_on: bool,
+    hub: Hub,
+    athub: Athub,
+    /// `nv_common_set_clockgating_state` acts (NBIO 2.3.x/3.3.x).
+    common: bool,
     /// `adev->gfx.rlc.in_safe_mode[0]`.
     in_safe_mode: bool,
     state: State,
@@ -399,9 +496,17 @@ impl<I: Io> Engine<I> {
     fn has(&self, flags: u64) -> bool {
         self.cg_flags & flags != 0
     }
+    /// See `Gating::rearm`.
+    fn rearm(&mut self) {
+        self.state = State::Idle;
+        self.in_safe_mode = false;
+    }
 
     // ── nv_common: nbio_v2_3, hdp_v5_0, smuio_v11_0_6 ───────────────────
     fn common(&mut self, enable: bool) -> Result<(), Error> {
+        if !self.common {
+            return Ok(());
+        }
         // nbio_v2_3_update_medium_grain_clock_gating / _light_sleep return
         // without BIF_MGCG / BIF_LS. Their SMN (PCIE index/data) accesses are
         // the SMU owner's; a flag set that needs them is refused.
@@ -419,39 +524,28 @@ impl<I: Io> Engine<I> {
             Ok(())
         })?
     }
-    // ── gmc_v10_0: mmhub_v2_0 (2.1.0), athub_v2_1 ───────────────────────
+    // ── gmc_v10_0: mmhub_v2_0 (2.1.0) or mmhub_v2_3, then athub ─────────
     fn gmc(&mut self, enable: bool) -> Result<(), Error> {
-        let flags = self.cg_flags;
+        let (flags, hub, athub) = (self.cg_flags, self.hub, self.athub);
         self.access(|s| {
-            // mmhub_v2_0_update_medium_grain_clock_gating, MMHUB 2.1.x: only
-            // DAGB0_CNTL_MISC2_Sienna_Cichlid; light sleep returns ("There is
-            // no ATCL2 in MMHUB for 2.1.x").
-            if flags & cg::MC_MGCG != 0 {
-                let def = s.rd(DAGB0_CNTL_MISC2)?;
-                let data = if enable {
-                    def & !DAGB_DISABLE_CG
-                } else {
-                    def | DAGB_DISABLE_CG
-                };
-                s.update(DAGB0_CNTL_MISC2, def, data);
+            match hub {
+                // mmhub_v2_0_update_medium_grain_clock_gating, MMHUB 2.1.x:
+                // only DAGB0_CNTL_MISC2_Sienna_Cichlid; light sleep returns
+                // ("There is no ATCL2 in MMHUB for 2.1.x").
+                Hub::V2_0 => {
+                    if flags & cg::MC_MGCG != 0 {
+                        let def = s.rd(DAGB0_CNTL_MISC2)?;
+                        let data = if enable {
+                            def & !DAGB_DISABLE_CG
+                        } else {
+                            def | DAGB_DISABLE_CG
+                        };
+                        s.update(DAGB0_CNTL_MISC2, def, data);
+                    }
+                }
+                Hub::V2_3 => mmhub_v2_3(s, flags, enable)?,
             }
-            // athub_v2_1_update_medium_grain_clock_gating.
-            let def = s.rd(ATHUB_MISC_CNTL)?;
-            let data = if enable && flags & cg::MC_MGCG != 0 {
-                def | ATHUB_CG_ENABLE
-            } else {
-                def & !ATHUB_CG_ENABLE
-            };
-            s.update(ATHUB_MISC_CNTL, def, data);
-            // athub_v2_1_update_medium_grain_light_sleep.
-            let def = s.rd(ATHUB_MISC_CNTL)?;
-            let data = if enable && flags & cg::MC_LS != 0 && flags & cg::HDP_LS != 0 {
-                def | ATHUB_CG_MEM_LS_ENABLE
-            } else {
-                def & !ATHUB_CG_MEM_LS_ENABLE
-            };
-            s.update(ATHUB_MISC_CNTL, def, data);
-            Ok(())
+            athub_gating(s, athub, flags, enable)
         })?
     }
     // ── navi10_ih_update_clockgating_state ──────────────────────────────
@@ -609,6 +703,83 @@ fn sdma_register(instance: usize, low: [Reg; 2]) -> Reg {
         // sdma_v5_2_get_reg_offset: instances 2/3 use GC segment 2, stride 0x400.
         reg(Block::Gc2, low[0].offset + (instance as u32 - 2) * 0x400)
     }
+}
+
+// ── mmhub_v2_3, athub_v2_0 / athub_v2_1 ─────────────────────────────────
+/// `mmhub_v2_3_set_clockgating`: medium grain (the ATC L2 soft override and
+/// DAGB0's six CG disables), then light sleep (the ATC L2 MGLS override and
+/// DAGB0's write and read LS overrides). Without MC_MGCG / MC_LS each takes
+/// its ungate branch on GATE as well.
+fn mmhub_v2_3<I: Io>(s: &mut Seq<'_, I>, flags: u64, enable: bool) -> Result<(), Error> {
+    let (atc, misc) = (
+        s.rd(MM23_ATC_L2_CGTT_CLK_CTRL)?,
+        s.rd(MM23_DAGB0_CNTL_MISC2)?,
+    );
+    let (atc_cg, misc_cg) = if enable && flags & cg::MC_MGCG != 0 {
+        (atc & !ATC_L2_SOFT_OVERRIDE, misc & !DAGB_DISABLE_CG)
+    } else {
+        (atc | ATC_L2_SOFT_OVERRIDE, misc | DAGB_DISABLE_CG)
+    };
+    s.update(MM23_ATC_L2_CGTT_CLK_CTRL, atc, atc_cg);
+    s.update(MM23_DAGB0_CNTL_MISC2, misc, misc_cg);
+    let atc = s.rd(MM23_ATC_L2_CGTT_CLK_CTRL)?;
+    let wr = s.rd(MM23_DAGB0_WR_CGTT_CLK_CTRL)?;
+    let rd = s.rd(MM23_DAGB0_RD_CGTT_CLK_CTRL)?;
+    let (atc_ls, wr_ls, rd_ls) = if enable && flags & cg::MC_LS != 0 {
+        (
+            atc & !ATC_L2_MGLS_OVERRIDE,
+            wr & !DAGB_LS_OVERRIDES,
+            rd & !DAGB_LS_OVERRIDES,
+        )
+    } else {
+        (
+            atc | ATC_L2_MGLS_OVERRIDE,
+            wr | DAGB_LS_OVERRIDES,
+            rd | DAGB_LS_OVERRIDES,
+        )
+    };
+    s.update(MM23_ATC_L2_CGTT_CLK_CTRL, atc, atc_ls);
+    s.update(MM23_DAGB0_WR_CGTT_CLK_CTRL, wr, wr_ls);
+    s.update(MM23_DAGB0_RD_CGTT_CLK_CTRL, rd, rd_ls);
+    Ok(())
+}
+/// `athub_v2_{0,1}_set_clockgating`: CG_ENABLE with MC_MGCG, then
+/// CG_MEM_LS_ENABLE with MC_LS and HDP_LS. ATHUB 2.1 clears a bit whose
+/// flags are missing; 2.0 leaves the register alone.
+fn athub_gating<I: Io>(
+    s: &mut Seq<'_, I>,
+    athub: Athub,
+    flags: u64,
+    enable: bool,
+) -> Result<(), Error> {
+    let Some(misc) = athub.register() else {
+        return Ok(());
+    };
+    let (cg_bit, ls_bit) = match athub {
+        Athub::V2_0 => (ATHUB20_CG_ENABLE, ATHUB20_CG_MEM_LS_ENABLE),
+        _ => (ATHUB_CG_ENABLE, ATHUB_CG_MEM_LS_ENABLE),
+    };
+    let mgcg = flags & cg::MC_MGCG != 0;
+    let ls = flags & cg::MC_LS != 0 && flags & cg::HDP_LS != 0;
+    if athub == Athub::V2_1 || mgcg {
+        let def = s.rd(misc)?;
+        let data = if enable && mgcg {
+            def | cg_bit
+        } else {
+            def & !cg_bit
+        };
+        s.update(misc, def, data);
+    }
+    if athub == Athub::V2_1 || ls {
+        let def = s.rd(misc)?;
+        let data = if enable && ls {
+            def | ls_bit
+        } else {
+            def & !ls_bit
+        };
+        s.update(misc, def, data);
+    }
+    Ok(())
 }
 
 // ── hdp_v5_0 ────────────────────────────────────────────────────────────
@@ -918,12 +1089,12 @@ impl Gating {
                 0,
                 ATHUB_MISC_CNTL.offset,
             )?,
-            hdp: bank(
+            hdp: Some(bank(
                 discovery::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                 0,
                 HDP_CLK_CNTL.offset,
-            )?,
+            )?),
             osssys: bank(
                 discovery::HW_ID_OSSSYS,
                 crate::amdgpu_rdna2::IH_OSSSYS_VERSIONS,
@@ -932,7 +1103,7 @@ impl Gating {
             )?,
             // smuio_v11_0_6 forces the ROM clock on without ROM_MGCG;
             // smuio_v11_0 returns before touching its different ROM offset.
-            smuio,
+            smuio: Some(smuio),
         };
         Ok(Self {
             engine: Engine {
@@ -941,10 +1112,104 @@ impl Gating {
                 cg_flags: profile_flags(profile).0,
                 sdma_count: count,
                 rom_force_on,
+                hub: Hub::V2_0,
+                athub: Athub::V2_1,
+                common: true,
                 in_safe_mode: false,
                 state: State::Idle,
             },
         })
+    }
+    /// Raphael (GC 10.3.6): nv.c's flags for 10.3.6 under Linux's
+    /// `amdgpu.cg_mask`, `mmhub_v2_3` on MMHUB 2.3.0/2.4.x (bank 1), ATHUB
+    /// by version, `navi10_ih`, and its one SDMA 5.2.6 in GC segment 0.
+    /// NBIO 7.2 leaves `nv_common` nothing to do. No register access.
+    ///
+    /// # Safety
+    /// Caller is Raphael's graphics coordinator: it exclusively owns the GPU's
+    /// engines with permanent mappings, and no other code writes these
+    /// clock-gating registers for the owner's lifetime.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        cg_mask: u32,
+    ) -> Result<Self, Error> {
+        let profile = &crate::amdgpu_rdna2::RAPHAEL;
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did) != Some(profile) {
+            return Err(Error::Unsupported);
+        }
+        let bank = |id, versions: &[(u8, u8, u8)], index, last| {
+            crate::amdgpu_psp_ring::bank(gpu, id, versions, index, last)
+                .map_err(|_| Error::Unsupported)
+        };
+        let mut sdma = gpu
+            .ip_blocks
+            .iter()
+            .filter(|b| b.hw_id == discovery::HW_ID_SDMA0 && b.instance == 0);
+        if sdma
+            .next()
+            .is_none_or(|b| (b.major, b.minor, b.revision) != profile.sdma_version)
+            || sdma.next().is_some()
+        {
+            return Err(Error::Unsupported);
+        }
+        let athub_ip = gpu
+            .ip_blocks
+            .iter()
+            .find(|b| b.hw_id == discovery::HW_ID_ATHUB && b.instance == 0)
+            .map(|b| (b.major, b.minor, b.revision));
+        let athub = Athub::for_version(athub_ip);
+        let io = Mmio {
+            regs: gpu.regs,
+            writes: 0,
+            gc0: bank(discovery::HW_ID_GC, &[profile.gc_version], 0, GC0_LAST)?,
+            gc1: bank(discovery::HW_ID_GC, &[profile.gc_version], 1, GC1_LAST)?,
+            gc2: None,
+            mmhub: bank(
+                discovery::HW_ID_MMHUB,
+                &[(2, 3, 0), (2, 4, 0), (2, 4, 1)],
+                1,
+                MM23_ATC_L2_CGTT_CLK_CTRL.offset,
+            )?,
+            athub: match (athub.register(), athub_ip) {
+                (Some(misc), Some(version)) => {
+                    bank(discovery::HW_ID_ATHUB, &[version], 0, misc.offset)?
+                }
+                _ => 0,
+            },
+            hdp: None,
+            osssys: bank(
+                discovery::HW_ID_OSSSYS,
+                crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS,
+                0,
+                IH_CLK_CTRL.offset,
+            )?,
+            smuio: None,
+        };
+        Ok(Self {
+            engine: Engine {
+                io,
+                authority,
+                // amdgpu_device_ip_early_init: cg_flags &= amdgpu_cg_mask.
+                cg_flags: RAPHAEL_CG & u64::from(cg_mask),
+                sdma_count: 1,
+                rom_force_on: false,
+                hub: Hub::V2_3,
+                athub,
+                common: false,
+                in_safe_mode: false,
+                state: State::Idle,
+            },
+        })
+    }
+    /// Back to Idle after a reset (mode 2, or S3's power-off), which left
+    /// every gating register at its default, so a re-armed coordinator
+    /// gates again.
+    ///
+    /// # Safety
+    /// The GPU was reset since the last transition, and none is in flight.
+    pub(crate) unsafe fn rearm(&mut self) {
+        self.engine.rearm();
     }
 
     pub fn state(&self) -> State {

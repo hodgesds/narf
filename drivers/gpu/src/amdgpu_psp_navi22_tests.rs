@@ -27,6 +27,7 @@ fn session_with_pool(mapping: narf_bus::MmioRegion, address: u64) -> (Pool, Sess
             tmr: None,
             tmr_ready: false,
             smc_state: SmcState::Absent,
+            smc_resident: false,
             gfx_state: GfxLoadState::Absent,
             gfx_status: None,
             media_firmware: MediaFirmware::default(),

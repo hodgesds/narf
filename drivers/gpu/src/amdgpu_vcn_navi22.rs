@@ -22,6 +22,12 @@
 //! runs unannounced is refused before any write. Firmware images come from
 //! the PSP-loaded TMR (`AMDGPU_FW_LOAD_PSP`). Client submissions use lent
 //! MMHUB VMIDs; startup proofs use VMID0.
+//!
+//! Raphael's owner follows Linux's `pg_flags` under `amdgpu.pg_mask`
+//! instead: DPG with `AMD_PG_SUPPORT_VCN_DPG`, otherwise the static path,
+//! and the PGFSM steps of both blocks' static power gating ([`StaticPg`]).
+//! Its `cg_flags` under `amdgpu.cg_mask` give the media clock gating
+//! ([`Mgcg`]).
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_fence_navi22 as fence, amdgpu_vram::Pool,
     amdgpu_vram::Reservation,
@@ -45,6 +51,8 @@ pub enum Error {
     /// The SMU runs MM_DPM_PG: Linux would send PowerUpVcn first.
     PowerGated,
     Power(crate::amdgpu_smu_navi22::Error),
+    /// SMU 13.0.5 (Raphael) refused or missed a VCN power message.
+    Pmfw(crate::amdgpu_smu_raphael::Error),
     /// The discovery harvest table could not be trusted.
     Harvest(ip::DiscoveryError),
     /// PSP refused the DPG register list (`amdgpu_vcn_psp_update_sram`).
@@ -190,12 +198,23 @@ pub(crate) mod bits {
     pub const PGFSM_ALL_ON: u32 = 0x1515_5555;
     // linux: n/a (literal 0x3F3FFFFF in vcn_v3_0_disable_static_power_gating)
     pub const PGFSM_STATUS_MASK: u32 = 0x3f3f_ffff;
+    /// UVDM, UVDU and UVDLM set to 1 (on), every other tile except UVDJ to
+    /// 2 (off): the `AMD_PG_SUPPORT_VCN` branch of
+    /// `vcn_v3_0_disable_static_power_gating`.
+    // linux: (1 << UVD_PGFSM_CONFIG__UVDM_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDU_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDF_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDC_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDB_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDIRL_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDLM_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDTD_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDTE_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDE_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDAB_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDATD_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDNA_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDNB_PWR_CONFIG__SHIFT)
+    pub const PGFSM_VCN_PG_ON: u32 = 0x2a2a_9aa5;
+    pub const PGFSM_VCN_PG_ON_STATUS: u32 = 0x2a2a_8aa0; // linux: UVD_PGFSM_STATUS__UVDM_UVDU_UVDLM_PWR_ON_3_0
+    /// Every tile except UVDJ set to 2 (off), and the status that reports
+    /// it: `vcn_v3_0_enable_static_power_gating`.
+    // linux: (2 << UVD_PGFSM_CONFIG__UVDM_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDU_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDF_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDC_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDB_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDIRL_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDLM_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDTD_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDTE_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDE_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDAB_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDATD_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDNA_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDNB_PWR_CONFIG__SHIFT)
+    pub const PGFSM_ALL_OFF: u32 = 0x2a2a_aaaa;
     /// UVD_POWER_STATUS bits cleared with PG disabled (POWER_STATUS, PG_EN).
     // linux: UVD_POWER_STATUS__UVD_PG_EN_MASK | UVD_POWER_STATUS__UVD_POWER_STATUS_MASK
     pub const POWER_STATUS_CLEAR: u32 = 0x103;
     /// DYN_CLOCK_MODE (VCN_MGCG) | CLK_GATE_DLY_TIMER 1 | CLK_OFF_DELAY 4.
     // linux: (1 << UVD_CGC_CTRL__DYN_CLOCK_MODE__SHIFT) | (1 << UVD_CGC_CTRL__CLK_GATE_DLY_TIMER__SHIFT) | (4 << UVD_CGC_CTRL__CLK_OFF_DELAY__SHIFT)
     pub const CGC_CTRL_DYN: u32 = 1 | (1 << 2) | (4 << 6);
+    pub const CGC_DYN_CLOCK_MODE: u32 = 1; // linux: UVD_CGC_CTRL__DYN_CLOCK_MODE_MASK
     /// SYS..MMSCH gates of UVD_CGC_GATE cleared.
     // linux: UVD_CGC_GATE__SYS_MASK | UVD_CGC_GATE__UDEC_MASK | UVD_CGC_GATE__MPEG2_MASK | UVD_CGC_GATE__REGS_MASK | UVD_CGC_GATE__RBC_MASK | UVD_CGC_GATE__LMI_MC_MASK | UVD_CGC_GATE__LMI_UMC_MASK | UVD_CGC_GATE__IDCT_MASK | UVD_CGC_GATE__MPRD_MASK | UVD_CGC_GATE__MPC_MASK | UVD_CGC_GATE__LBSI_MASK | UVD_CGC_GATE__LRBBM_MASK | UVD_CGC_GATE__UDEC_RE_MASK | UVD_CGC_GATE__UDEC_CM_MASK | UVD_CGC_GATE__UDEC_IT_MASK | UVD_CGC_GATE__UDEC_DB_MASK | UVD_CGC_GATE__UDEC_MP_MASK | UVD_CGC_GATE__WCB_MASK | UVD_CGC_GATE__VCPU_MASK | UVD_CGC_GATE__MMSCH_MASK
     pub const CGC_GATE_ALL: u32 = 0x0017_ffff;
@@ -220,13 +239,16 @@ pub(crate) mod bits {
     pub const CC_UVD_DISABLE: u32 = 1 << 1; // linux: CC_UVD_HARVESTING__UVD_DISABLE_MASK
     pub const PGFSM_UVDJ_ON: u32 = 1 << 22; // linux: 1 << UVD_PGFSM_CONFIG__UVDJ_PWR_CONFIG__SHIFT
     pub const PGFSM_UVDJ_STATUS: u32 = 0x00c0_0000; // linux: UVD_PGFSM_STATUS__UVDJ_PWR_STATUS_MASK
+    /// UVDJ set to 2 (off), and its status once off.
+    pub const PGFSM_UVDJ_OFF: u32 = 2 << 22; // linux: 2 << UVD_PGFSM_CONFIG__UVDJ_PWR_CONFIG__SHIFT
     /// linux: UVD_JPEG_POWER_STATUS__JPEG_POWER_STATUS_MASK
     pub const JPEG_POWER_STATUS_MASK: u32 = 1;
     pub const JPEG_PG_MODE: u32 = 1 << 4; // linux: UVD_JPEG_POWER_STATUS__JPEG_PG_MODE_MASK
     /// DYN_CLOCK_MODE (JPEG_MGCG) | CLK_GATE_DLY_TIMER 1 | CLK_OFF_DELAY 4.
     // linux: (1 << JPEG_CGC_CTRL__DYN_CLOCK_MODE__SHIFT) | (1 << JPEG_CGC_CTRL__CLK_GATE_DLY_TIMER__SHIFT) | (4 << JPEG_CGC_CTRL__CLK_OFF_DELAY__SHIFT)
     pub const JPEG_CGC_CTRL_DYN: u32 = 1 | (1 << 1) | (4 << 5);
-    // linux: JPEG_CGC_GATE__JPEG_DEC_MASK | JPEG_CGC_GATE__JPEG2_DEC_MASK | JPEG_CGC_GATE__JPEG_ENC_MASK | JPEG_CGC_GATE__JMCIF_MASK | JPEG_CGC_GATE__JRBBM_MASK
+    pub const JPEG_CGC_DYN_CLOCK_MODE: u32 = 1; // linux: JPEG_CGC_CTRL__DYN_CLOCK_MODE_MASK
+                                                // linux: JPEG_CGC_GATE__JPEG_DEC_MASK | JPEG_CGC_GATE__JPEG2_DEC_MASK | JPEG_CGC_GATE__JPEG_ENC_MASK | JPEG_CGC_GATE__JMCIF_MASK | JPEG_CGC_GATE__JRBBM_MASK
     pub const JPEG_CGC_GATE_ALL: u32 = 0x1f;
     /// JPEG_DEC | JPEG2_DEC | JMCIF | JRBBM mode bits.
     // linux: JPEG_CGC_CTRL__JPEG_DEC_MODE_MASK | JPEG_CGC_CTRL__JPEG2_DEC_MODE_MASK | JPEG_CGC_CTRL__JMCIF_MODE_MASK | JPEG_CGC_CTRL__JRBBM_MODE_MASK
@@ -242,6 +264,8 @@ pub(crate) mod bits {
     pub const POWER_STALL_DPG: u32 = 1 << 31;
     /// UVD_POWER_STATUS once a paused instance is powered back up.
     pub const POWER_UVDM_UVDU_ON: u32 = 2; // linux: UVD_PGFSM_CONFIG__UVDM_UVDU_PWR_ON
+    /// The indicator set before the static path powers the tiles off.
+    pub const POWER_TILES_OFF: u32 = 1; // linux: UVD_POWER_STATUS__UVD_POWER_STATUS_TILES_OFF
     pub const DPG_PAUSE_REQ: u32 = 1 << 2; // linux: UVD_DPG_PAUSE__NJ_PAUSE_DPG_REQ_MASK
     pub const DPG_PAUSE_ACK: u32 = 1 << 3; // linux: UVD_DPG_PAUSE__NJ_PAUSE_DPG_ACK_MASK
     /// PRB_TIMEOUT_VAL 0xff | CLK_EN, the DPG VCPU control word.
@@ -317,6 +341,12 @@ pub(crate) const CONTEXT: u64 = STACK + STACK_SIZE as u64;
 pub(crate) const SHARED: u64 = CONTEXT + CONTEXT_SIZE as u64;
 // linux: n/a (AMDGPU_GPU_PAGE_ALIGN(sizeof(struct amdgpu_fw_shared)) = 4096; struct not in probe)
 pub(crate) const SHARED_SIZE: u32 = 4096;
+/// The VCPU BO proper, the part `amdgpu_vcn_suspend` saves: stack, context
+/// and fw_shared. The rings and buffers after it are reset at every start.
+// linux: n/a (amdgpu_bo_size(vcpu_bo) with PSP load, amdgpu_vcn_sw_init)
+pub(crate) const VCPU_BYTES: u64 = SHARED + SHARED_SIZE as u64;
+/// Bytes copied per step of a save, between yields to the executor.
+const SAVE_CHUNK: u64 = 64 << 10; // linux: n/a (NARF policy)
 pub(crate) const DEC_RING: u64 = SHARED + SHARED_SIZE as u64;
 pub(crate) const ENC_RING: [u64; 2] = [DEC_RING + 4096, DEC_RING + 8192];
 pub(crate) const WB: u64 = DEC_RING + 12288;
@@ -342,6 +372,9 @@ pub(crate) mod shared {
     pub const PRESENT_FLAG_0: u64 = 0; // linux: n/a (offsetof amdgpu_fw_shared.present_flag_0)
     pub const RB_RPTR: u64 = 48; // linux: n/a (offsetof amdgpu_fw_shared.rb.rptr = 48)
     pub const RB_WPTR: u64 = 52; // linux: n/a (offsetof amdgpu_fw_shared.rb.wptr = 52)
+    /// `smu_interface_info.smu_interface_type` and its padding, after
+    /// `multi_queue` (57), `sw_ring` (65) and the 4-aligned `fw_log` (72).
+    pub const SMU_INTERFACE_INFO: u64 = 88; // linux: n/a (offsetof amdgpu_fw_shared.smu_interface_info = 88)
     /// Dword holding pad1 and the multi_queue decode/encode-GP/encode-LL
     /// mode bytes (offsets 57, 58, 59).
     pub const QUEUE_MODES: u64 = 56; // linux: n/a (offsetof amdgpu_fw_shared.pad1 = 56)
@@ -409,11 +442,19 @@ pub(crate) struct Layout {
     pub vcn: [Option<[u64; 2]>; 2],
     pub gc: u64,
     pub nbio: u64,
-    pub hdp: u64,
+    /// HDP 5.0's bank; `None` on HDP 5.2.1, which has no read cache.
+    /// Nonzero, so the option costs no space in a layout every register
+    /// access copies.
+    pub hdp: Option<core::num::NonZeroU64>,
+    /// Instance 0's VCN (`UVD_HWIP`) version, which `vcn_v3_0` and
+    /// `jpeg_v3_0` key their 3.1.x differences on.
+    pub vcn_version: (u8, u8, u8),
 }
-fn vcn_bases(gpu: &AmdGpu, instance: u8) -> Result<[u64; 2], Error> {
-    let profile =
-        crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did).ok_or(Error::Unsupported)?;
+fn vcn_bases(
+    gpu: &AmdGpu,
+    profile: &crate::amdgpu_rdna2::Profile,
+    instance: u8,
+) -> Result<[u64; 2], Error> {
     let mut found = gpu
         .ip_blocks
         .iter()
@@ -455,11 +496,12 @@ impl Layout {
         let mut vcn = [None; 2];
         for (i, slot) in vcn.iter_mut().enumerate() {
             if instances & (1 << i) != 0 {
-                *slot = Some(vcn_bases(gpu, i as u8)?);
+                *slot = Some(vcn_bases(gpu, profile, i as u8)?);
             }
         }
         Ok(Self {
             vcn,
+            vcn_version: vcn_version(gpu)?,
             gc: bank(ip::HW_ID_GC, &[profile.gc_version], 0, GB_ADDR_CONFIG)?,
             nbio: bank(
                 ip::HW_ID_NBIF,
@@ -475,13 +517,82 @@ impl Layout {
                 2,
                 LAST_NBIO,
             )?,
-            hdp: bank(
-                ip::HW_ID_HDP,
-                &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
-                0,
-                0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-            )?,
+            hdp: Some(
+                core::num::NonZeroU64::new(bank(
+                    ip::HW_ID_HDP,
+                    &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
+                    0,
+                    0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+                )?)
+                .ok_or(Error::Unsupported)?,
+            ),
         })
+    }
+    /// Raphael: its one VCN 3.1.2 (`vcn_v3_0`, `vcn_3_0_0_offset.h` like
+    /// Navi22's), GC 10.3.6, NBIO 7.2 and HDP 5.2.1. NBIO 7.2's banks come
+    /// back beside the layout: its single VCN doorbell range is GDC0's,
+    /// through the PCIe port pair, where NBIO 2.3 has MMSCH ranges.
+    pub(crate) fn resolve_raphael(
+        gpu: &AmdGpu,
+        instances: u8,
+    ) -> Result<(Self, crate::amdgpu_nbio_v7_2::Banks), Error> {
+        let profile = crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .filter(|p| *p == &crate::amdgpu_rdna2::RAPHAEL)
+            .ok_or(Error::Unsupported)?;
+        if gpu.regs.len < 0x7f004 || instances != 1 {
+            return Err(Error::Unsupported);
+        }
+        let bank = |id, versions: &[(u8, u8, u8)], index, last| {
+            crate::amdgpu_psp_ring::bank(gpu, id, versions, index, last)
+                .map_err(|_| Error::Unsupported)
+        };
+        bank(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        let layout = Self {
+            vcn: [Some(vcn_bases(gpu, profile, 0)?), None],
+            gc: bank(ip::HW_ID_GC, &[profile.gc_version], 0, GB_ADDR_CONFIG)?,
+            nbio: nbio.bif,
+            hdp: None,
+            vcn_version: vcn_version(gpu)?,
+        };
+        Ok((layout, nbio))
+    }
+    /// HDP 5.0's `HDP_READ_CACHE_INVALIDATE`, if this HDP has a read cache.
+    pub(crate) fn hdp_invalidate(&self) -> Option<u64> {
+        // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+        self.hdp.map(|hdp| hdp.get() + 0xd1 * 4)
+    }
+    /// A register whose all-ones read means the device is gone: HDP 5.0's
+    /// invalidate, or NBIO's RCC_CONFIG_MEMSIZE where HDP has no read cache.
+    pub(crate) fn liveness(&self) -> u64 {
+        self.hdp_invalidate()
+            .unwrap_or(self.nbio(NBIO_CONFIG_MEMSIZE))
+    }
+    /// `fw_shared->smu_interface_info.smu_interface_type` (`vcn_v3_0_sw_init`):
+    /// 2 on VCN 3.1.2, 1 on 3.1.1, unset otherwise.
+    pub(crate) fn smu_interface_type(&self) -> Option<u32> {
+        match self.vcn_version {
+            (3, 1, 2) => Some(2),
+            (3, 1, 1) => Some(1),
+            _ => None,
+        }
+    }
+    /// Whether the VCN has a JPEG engine to drive.
+    /// `amdgpu_discovery_set_mm_ip_blocks` adds `jpeg_v3_0` beside
+    /// `vcn_v3_0` for UVD 3.0.0, 3.0.2, 3.0.16, 3.1.1 and 3.1.2, but not for
+    /// Beige Goby's (Navi24) 3.0.33. Discovery compares the revision without
+    /// its encode/decode capability bits [7:6], as here.
+    pub(crate) fn has_jpeg(&self) -> bool {
+        let (major, minor, revision) = self.vcn_version;
+        matches!(
+            (major, minor, revision & 0x3f),
+            (3, 0, 0) | (3, 0, 2) | (3, 0, 16) | (3, 1, 1) | (3, 1, 2)
+        )
+    }
+    /// `jpeg_v3_0_early_init` reads `CC_UVD_HARVESTING` except on VCN
+    /// 3.1.1/3.1.2.
+    pub(crate) fn jpeg_reads_harvesting(&self) -> bool {
+        !matches!(self.vcn_version, (3, 1, 1) | (3, 1, 2))
     }
     /// BAR5 byte address of `r` in VCN instance `i`. Instances are validated
     /// at construction; an unresolved instance maps to an unused zero base.
@@ -610,9 +721,61 @@ fn flush<I: Io>(io: &mut I, l: Layout) {
 }
 /// HDP read-cache invalidate before the CPU samples engine writes.
 fn invalidate<I: Io>(io: &mut I, l: Layout) {
-    io.write(l.hdp + 0xd1 * 4, 1); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-    io.read(l.hdp + 0xd1 * 4); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+    if let Some(invalidate) = l.hdp_invalidate() {
+        io.write(invalidate, 1);
+        io.read(invalidate);
+    }
     barrier(Ordering::SeqCst);
+}
+/// Instance 0's discovered VCN version.
+fn vcn_version(gpu: &AmdGpu) -> Result<(u8, u8, u8), Error> {
+    gpu.ip_blocks
+        .iter()
+        .find(|b| b.hw_id == ip::HW_ID_VCN && b.instance == 0)
+        .map(|b| (b.major, b.minor, b.revision))
+        .ok_or(Error::Unsupported)
+}
+/// Claim `index`'s doorbells for VCN instance `i` (and JPEG, on instance 0):
+/// `nbio_v2_3_vcn_doorbell_range` on NBIO 2.3's MMSCH range, or on NBIO 7.2
+/// `nbio_v7_2_vcn_doorbell_range`'s single GDC0 range through the port pair,
+/// under the index latch the display clock manager shares. Both claim eight.
+fn vcn_doorbell_range<I: Io>(
+    io: &mut I,
+    l: Layout,
+    nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
+    i: usize,
+    index: u32,
+) -> Result<(), Error> {
+    let Some(banks) = nbio_v7_2 else {
+        // nbio_v2_3_vcn_doorbell_range: OFFSET[11:2] = index, SIZE 8.
+        return update(
+            io,
+            l.nbio(NBIO_MMSCH_DOORBELL_RANGE[i]),
+            // linux-lit: 0x001f_0ffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK | BIF_MMSCH0_DOORBELL_RANGE__SIZE_MASK
+            0x001f_0ffc,
+            // linux-lit: 2=BIF_MMSCH0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK; 16=BIF_MMSCH0_DOORBELL_RANGE__SIZE__SHIFT
+            ((index << 2) & 0xffc) | (doorbell::RANGE << 16),
+        )
+        .map(|_| ());
+    };
+    if i != 0 {
+        return Err(Error::Unsupported);
+    }
+    use crate::amdgpu_nbio_v7_2 as nbio;
+    let address = banks
+        .port_address(nbio::GDC0_VCN0_DOORBELL_RANGE)
+        .ok_or(Error::Invalid)?;
+    let (port_index, data) = banks.port_pair();
+    crate::amdgpu_smn::with_latch(|| {
+        io.write(port_index, address);
+        io.read(port_index);
+        let old = checked(io.read(data))?;
+        io.write(port_index, address);
+        io.read(port_index);
+        io.write(data, nbio::vcn_doorbell_range(old, Some(index)));
+        io.read(data);
+        Ok(())
+    })
 }
 /// `adev->usec_timeout` (100 ms) for register waits and ring tests.
 pub(crate) const REG_TIMEOUT_MS: u64 = 100; // linux: n/a (adev->usec_timeout)
@@ -653,6 +816,93 @@ pub enum StartMode {
 static DPG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 pub fn set_dpg(enabled: bool) {
     DPG.store(enabled, Ordering::Relaxed);
+}
+impl StartMode {
+    /// `vcn_v3_0_start`'s choice under Linux's `pg_flags`.
+    pub(crate) fn linux(pg_flags: u32) -> Self {
+        if pg_flags & crate::amdgpu_navi22_gating::pg::VCN_DPG != 0 {
+            Self::Dpg
+        } else {
+            Self::Static
+        }
+    }
+}
+
+/// The PGFSM power gating an owner applies around its engines' static
+/// starts and stops (`vcn_v3_0_{disable,enable}_static_power_gating`,
+/// `jpeg_v3_0_{disable,enable}_static_power_gating`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StaticPg {
+    /// `AMD_PG_SUPPORT_VCN`: the static start powers UVDM, UVDU and UVDLM on
+    /// with UVD_PG_EN set, the other tiles off, and the static stop powers
+    /// every tile off. Without it the start powers every tile on and the
+    /// stop leaves them on.
+    pub vcn: bool,
+    /// The JPEG start powers UVDJ on.
+    pub jpeg_on: bool,
+    /// The JPEG stop powers UVDJ off.
+    pub jpeg_off: bool,
+}
+impl StaticPg {
+    /// Navi22's fixed policy, which every discrete owner takes: the static
+    /// path with `AMD_PG_SUPPORT_VCN` clear, and UVDJ powered on for JPEG
+    /// and left on. (The Navi21-23 Linux flags carry `AMD_PG_SUPPORT_JPEG`,
+    /// whose stop also powers UVDJ off. Navi24's lack it, and it has no JPEG
+    /// owner.)
+    pub(crate) const NAVI22: Self = Self {
+        vcn: false,
+        jpeg_on: true,
+        jpeg_off: false,
+    };
+    /// Linux's `pg_flags`: `AMD_PG_SUPPORT_VCN`, and `AMD_PG_SUPPORT_JPEG`
+    /// for both UVDJ steps.
+    pub(crate) fn linux(pg_flags: u32) -> Self {
+        use crate::amdgpu_navi22_gating::pg;
+        let jpeg = pg_flags & pg::JPEG != 0;
+        Self {
+            vcn: pg_flags & pg::VCN != 0,
+            jpeg_on: jpeg,
+            jpeg_off: jpeg,
+        }
+    }
+}
+
+/// Linux's `AMD_CG_SUPPORT_VCN_MGCG` and `AMD_CG_SUPPORT_JPEG_MGCG`: whether
+/// the starts and stops put the media clocks in dynamic mode
+/// (`DYN_CLOCK_MODE` in UVD_CGC_CTRL and JPEG_CGC_CTRL). Linux's late init
+/// skips VCN and JPEG (`amdgpu_device_set_cg_state`), so these steps are
+/// all the media clock gating there is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mgcg {
+    pub vcn: bool,
+    pub jpeg: bool,
+}
+impl Mgcg {
+    /// The discrete owners' fixed policy: both set, as the Navi21, Navi22
+    /// and Navi23 flags carry them. Navi24's lack JPEG_MGCG, and it has no
+    /// JPEG owner ([`Layout::has_jpeg`]).
+    pub(crate) const NAVI22: Self = Self {
+        vcn: true,
+        jpeg: true,
+    };
+    /// Linux's `cg_flags` (Raphael's, under `amdgpu.cg_mask`).
+    pub(crate) fn linux(cg_flags: u64) -> Self {
+        use crate::amdgpu_navi22_gating::cg;
+        Self {
+            vcn: cg_flags & cg::VCN_MGCG != 0,
+            jpeg: cg_flags & cg::JPEG_MGCG != 0,
+        }
+    }
+}
+/// UVD_CGC_CTRL's DYN_CLOCK_MODE, CLK_GATE_DLY_TIMER and CLK_OFF_DELAY as
+/// `vcn_v3_0_{disable,enable}_clock_gating` and `_clock_gating_dpg_mode`
+/// set them: DYN_CLOCK_MODE only with `AMD_CG_SUPPORT_VCN_MGCG`.
+const fn cgc_ctrl(mgcg: bool) -> u32 {
+    if mgcg {
+        CGC_CTRL_DYN
+    } else {
+        CGC_CTRL_DYN & !CGC_DYN_CLOCK_MODE
+    }
 }
 
 /// `amdgpu_vcn_psp_update_sram`: PSP writes one instance's DPG register
@@ -716,6 +966,7 @@ pub(crate) fn dpg_list(
     i: usize,
     base: u64,
     gb_addr_config: u32,
+    mgcg: bool,
 ) -> alloc::vec::Vec<u32> {
     let mut l = DpgList {
         words: alloc::vec::Vec::with_capacity(DPG_SRAM_DW),
@@ -723,7 +974,7 @@ pub(crate) fn dpg_list(
         instance: i,
     };
     // vcn_v3_0_clock_gating_dpg_mode(sram_sel 0)
-    l.write(CGC_CTRL, CGC_CTRL_DYN);
+    l.write(CGC_CTRL, cgc_ctrl(mgcg));
     l.write(CGC_GATE, 0);
     l.write(SUVD_CGC_GATE, 1);
     l.write(SUVD_CGC_CTRL, 0);
@@ -948,6 +1199,12 @@ pub(crate) struct Instance {
     pub dec: Ring,
     pub enc: [Ring; 2],
     pub engine: fence::Engine,
+    /// The VCPU BO as `save_vcpu` copied it (`adev->vcn.inst[i].saved_bo`),
+    /// until the next start puts it back.
+    pub saved: Option<alloc::boxed::Box<[u32]>>,
+    /// Whether the last start put a saved VCPU BO back, so the firmware's
+    /// sessions from before carried over.
+    pub restored: bool,
 }
 impl Instance {
     pub(crate) fn new(pool: &Pool, i: u32) -> Result<Self, Error> {
@@ -979,6 +1236,8 @@ impl Instance {
                 ring(ENC_RING[1], Kind::Enc, doorbell::enc(i, 1), WPTR[2]),
             ],
             engine: [fence::Engine::Vcn0, fence::Engine::Vcn1][i as usize],
+            saved: None,
+            restored: false,
         })
     }
     fn address(&self, offset: u64) -> u64 {
@@ -1018,11 +1277,17 @@ pub(crate) struct Engine<I: Io> {
     pub firmware_bytes: u32,
     pub timing: Timing,
     pub mode: StartMode,
+    /// The static power gating ([`StaticPg`]).
+    pub pg: StaticPg,
+    /// The media clock gating ([`Mgcg`]).
+    pub cg: Mgcg,
     /// DPG instances paused for encode (`pause_state.fw_based`).
     pub paused: [bool; 2],
     pub state: State,
     pub jpeg_state: JpegState,
     pub proof: Proof,
+    /// NBIO 7.2's banks (Raphael), for its single GDC0 VCN doorbell range.
+    pub nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
 }
 /// `vcn_v2_0_dec_ring_emit_fence`: context_id = seq, fence then trap.
 pub(crate) fn dec_fence(address: u64, seq: u32) -> [u32; 14] {
@@ -1129,8 +1394,126 @@ pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 16] {
 }
 
 impl<I: Io> Engine<I> {
+    /// See `Media::rearm`.
+    ///
+    /// # Safety
+    /// As `Media::rearm`.
+    pub(crate) unsafe fn rearm(&mut self) {
+        for instance in self.vcn.iter_mut().flatten() {
+            for ring in core::iter::once(&mut instance.dec).chain(instance.enc.iter_mut()) {
+                ring.wptr = 0;
+                ring.seq = 0;
+            }
+        }
+        if let Some(jpeg) = self.jpeg.as_mut() {
+            jpeg.ring.wptr = 0;
+            jpeg.ring.seq = 0;
+        }
+        self.runtime = idle::Runtime::new();
+        self.paused = [false; 2];
+        self.state = State::Prepared;
+        self.jpeg_state = if self.jpeg.is_some() {
+            JpegState::Prepared
+        } else {
+            JpegState::Absent
+        };
+        self.proof = Proof {
+            instances: self.proof.instances,
+            ..Proof::default()
+        };
+    }
     fn active(&self) -> impl Iterator<Item = usize> + '_ {
         (0..2).filter(|&i| self.vcn[i].is_some())
+    }
+    /// `amdgpu_fence_driver_hw_fini`'s wait, sampled once: whether every
+    /// counted VCN ring and a verified JPEG ring signalled its last job.
+    pub(crate) fn fences_signalled(&mut self) -> Result<bool, Error> {
+        if !matches!(self.state, State::Running | State::Verified) {
+            return Ok(true);
+        }
+        let counted: [[bool; 3]; 2] =
+            core::array::from_fn(|i| core::array::from_fn(|slot| self.ring_counted(i, slot)));
+        let jpeg = self
+            .jpeg
+            .as_ref()
+            .filter(|_| self.jpeg_state == JpegState::Verified)
+            .map(|j| (j.memory.mapping(), j.ring.seq));
+        let (instances, enc_count) = (&self.vcn, self.enc_count);
+        self.hw.access(|io, l| {
+            invalidate(io, l);
+            checked(io.read(l.liveness()))?;
+            let mut all = true;
+            for (i, inst) in instances.iter().enumerate() {
+                let Some(inst) = inst else {
+                    continue;
+                };
+                let map = inst.memory.mapping();
+                let rings = core::iter::once(&inst.dec).chain(&inst.enc[..enc_count]);
+                for (slot, ring) in rings.enumerate() {
+                    if counted[i][slot] {
+                        all &= fence::signaled(io.read_memory(map, FENCE[slot]), ring.seq);
+                    }
+                }
+            }
+            if let Some((map, seq)) = jpeg {
+                all &= fence::signaled(io.read_memory(map, JPEG_FENCE), seq);
+            }
+            checked(io.read(l.liveness()))?;
+            Ok(all)
+        })
+    }
+    /// `vcn_v3_0_suspend`: `vcn_v3_0_hw_fini` (the `stop` of a running
+    /// owner; one the idle work gated is already stopped), then
+    /// `amdgpu_vcn_suspend` (`save_vcpu`). `Busy` for an owner that never
+    /// started, or failed.
+    pub(crate) async fn suspend(&mut self) -> Result<(), Error> {
+        match self.state {
+            State::Running | State::Verified => self.stop().await?,
+            State::Stopped => {}
+            _ => return Err(Error::Busy),
+        }
+        self.save_vcpu().await
+    }
+    /// `amdgpu_vcn_save_vcpu_bo_inst` for each instance: its VCPU BO (stack,
+    /// context, fw_shared) copied to the heap, so the next start puts the
+    /// firmware's sessions back. Requires a stopped owner.
+    pub(crate) async fn save_vcpu(&mut self) -> Result<(), Error> {
+        if self.state != State::Stopped {
+            return Err(Error::Busy);
+        }
+        let instances: alloc::vec::Vec<usize> = self.active().collect();
+        for i in instances {
+            let map = self.vcn[i].as_ref().ok_or(Error::Invalid)?.memory.mapping();
+            let mut image = alloc::vec::Vec::new();
+            image
+                .try_reserve_exact((VCPU_BYTES / 4) as usize)
+                .map_err(|_| Error::Allocation)?;
+            for start in (0..VCPU_BYTES).step_by(SAVE_CHUNK as usize) {
+                let end = (start + SAVE_CHUNK).min(VCPU_BYTES);
+                self.hw.access(|io, l| {
+                    invalidate(io, l);
+                    image.extend((start..end).step_by(4).map(|at| io.read_memory(map, at)));
+                    // A read that fell off the bus reads as all ones too.
+                    checked(io.read(l.liveness())).map(drop)
+                })?;
+                narf_scheduler::yield_now().await;
+            }
+            if let Some(instance) = self.vcn[i].as_mut() {
+                instance.saved = Some(image.into_boxed_slice());
+            }
+        }
+        Ok(())
+    }
+    /// Drop every saved VCPU BO: the next start begins with no sessions.
+    pub(crate) fn forget_saved(&mut self) {
+        for instance in self.vcn.iter_mut().flatten() {
+            instance.saved = None;
+        }
+    }
+    /// Whether the last start put every instance's saved VCPU BO back.
+    pub(crate) fn sessions_restored(&self) -> bool {
+        let mut instances = self.vcn.iter().flatten().peekable();
+        instances.peek().is_some() && instances.all(|i| i.restored)
     }
     /// `vcn_v3_0_hw_init` (non-SR-IOV): per unharvested instance, the NBIO
     /// MMSCH doorbell range, then `amdgpu_ring_test_helper` on the decode
@@ -1208,31 +1591,44 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    /// `amdgpu_vcn_resume` (PSP: zero the whole VCPU BO) and the fw_shared
-    /// flags `vcn_v3_0_sw_init` sets, then the doorbell range.
+    /// `amdgpu_vcn_resume`, then the doorbell range. A VCPU BO `save_vcpu`
+    /// copied goes back whole, fw_shared's flags with it, so the firmware
+    /// finds its sessions. Otherwise (PSP load) the BO is zeroed and
+    /// fw_shared gets the flags `vcn_v3_0_sw_init` sets. The rings and
+    /// buffers after the BO are zeroed either way.
     fn prepare_instance(&mut self, i: usize) -> Result<(), Error> {
         let instance = self.vcn[i].as_mut().ok_or(Error::Invalid)?;
         let map = instance.memory.mapping();
         let index = instance.dec.doorbell;
+        let nbio_v7_2 = self.nbio_v7_2;
+        // Taken whatever happens next: a failed start leaves the BO unknown.
+        let saved = instance.saved.take();
+        instance.restored = false;
         self.hw.access(|io, l| {
             // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
             if checked(io.read(l.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
                 // Doorbells stage did not open the NBIF aperture.
                 return Err(Error::Invalid);
             }
-            io.zero_memory(map, 0, INSTANCE_BYTES);
-            io.write_memory(map, SHARED + shared::PRESENT_FLAG_0, shared::PRESENT);
+            match saved.as_deref() {
+                Some(image) => {
+                    for (at, &word) in (0..VCPU_BYTES).step_by(4).zip(image) {
+                        io.write_memory(map, at, word);
+                    }
+                    io.zero_memory(map, VCPU_BYTES, INSTANCE_BYTES - VCPU_BYTES);
+                }
+                None => {
+                    io.zero_memory(map, 0, INSTANCE_BYTES);
+                    io.write_memory(map, SHARED + shared::PRESENT_FLAG_0, shared::PRESENT);
+                    if let Some(kind) = l.smu_interface_type() {
+                        io.write_memory(map, SHARED + shared::SMU_INTERFACE_INFO, kind);
+                    }
+                }
+            }
             flush(io, l);
-            // nbio_v2_3_vcn_doorbell_range: OFFSET[11:2] = index, SIZE 8.
-            update(
-                io,
-                l.nbio(NBIO_MMSCH_DOORBELL_RANGE[i]),
-                // linux-lit: 0x001f_0ffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK | BIF_MMSCH0_DOORBELL_RANGE__SIZE_MASK
-                0x001f_0ffc,
-                // linux-lit: 2=BIF_MMSCH0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK; 16=BIF_MMSCH0_DOORBELL_RANGE__SIZE__SHIFT
-                ((index << 2) & 0xffc) | (doorbell::RANGE << 16),
-            )
+            vcn_doorbell_range(io, l, nbio_v7_2, i, index)
         })?;
+        instance.restored = saved.is_some();
         // Published before the VCPU can learn any of these addresses.
         instance.memory.publish();
         for ring in [&mut instance.dec]
@@ -1256,25 +1652,40 @@ impl<I: Io> Engine<I> {
         // linux: n/a (AMDGPU_GPU_PAGE_ALIGN(fw->size + 4), vcn_v3_0_mc_resume)
         let cache0 = (self.firmware_bytes + 4 + 4095) & !4095;
         let r = move |l: Layout, reg: Reg| l.reg(i, reg);
-        // vcn_v3_0_disable_static_power_gating, !AMD_PG_SUPPORT_VCN branch.
+        // vcn_v3_0_disable_static_power_gating: with AMD_PG_SUPPORT_VCN the
+        // core tiles alone, UVD_PG_EN set; without it every tile.
+        let (config, powered, power) = if self.pg.vcn {
+            (
+                PGFSM_VCN_PG_ON,
+                PGFSM_VCN_PG_ON_STATUS,
+                POWER_UVDM_UVDU_ON | POWER_PG_EN,
+            )
+        } else {
+            (PGFSM_ALL_ON, 0, 0)
+        };
+        let mgcg = self.cg.vcn;
         self.hw.access(|io, l| {
             // UVD_STATUS belongs to the gated domain. Like vcn_v3_0_start,
             // power the tiles first; GC and NBIO liveness were checked before
             // reaching here. A gated status read is not proof of device loss.
-            io.write(r(l, PGFSM_CONFIG), PGFSM_ALL_ON);
+            io.write(r(l, PGFSM_CONFIG), config);
             Ok(())
         })?;
         let status = self.hw.layout.reg(i, PGFSM_STATUS);
         self.hw
-            .wait_reg(engine, status, 0, PGFSM_STATUS_MASK)
+            .wait_reg(engine, status, powered, PGFSM_STATUS_MASK)
             .await?;
         self.hw.access(|io, l| {
-            update(io, r(l, POWER_STATUS), POWER_STATUS_CLEAR, 0)?;
+            update(io, r(l, POWER_STATUS), POWER_STATUS_CLEAR, power)?;
             // set VCN status busy
             update(io, r(l, STATUS), STATUS_UVD_BUSY, STATUS_UVD_BUSY)?;
-            // vcn_v3_0_disable_clock_gating with AMD_CG_SUPPORT_VCN_MGCG
+            // vcn_v3_0_disable_clock_gating: DYN_CLOCK_MODE set with
+            // AMD_CG_SUPPORT_VCN_MGCG, cleared without it.
             let ctrl = checked(io.read(r(l, CGC_CTRL)))?;
-            io.write(r(l, CGC_CTRL), ctrl | CGC_CTRL_DYN);
+            io.write(
+                r(l, CGC_CTRL),
+                (ctrl & !CGC_DYN_CLOCK_MODE) | cgc_ctrl(mgcg),
+            );
             update(io, r(l, CGC_GATE), CGC_GATE_ALL, 0)?;
             Ok(())
         })?;
@@ -1420,7 +1831,7 @@ impl<I: Io> Engine<I> {
             io.write(r(l, POWER_STATUS), power | POWER_PG_MODE | POWER_PG_EN);
             Ok(())
         })?;
-        let list = dpg_list(self.hw.layout, i, base, gb_addr_config);
+        let list = dpg_list(self.hw.layout, i, base, gb_addr_config, self.cg.vcn);
         if list.len() > DPG_SRAM_DW {
             return Err(Error::Invalid);
         }
@@ -1938,13 +2349,31 @@ impl<I: Io> Engine<I> {
     }
     async fn stop_inner(&mut self) -> Result<(), Error> {
         if self.jpeg_state == JpegState::Verified {
+            let off = self.pg.jpeg_off;
             self.hw.access(|io, l| {
                 let r = |reg: Reg| l.reg(0, reg);
                 update(io, r(JMI_CNTL), JMI_SOFT_RESET, JMI_SOFT_RESET)?;
-                // jpeg_v3_0_enable_clock_gating; anti-hang on, no PGFSM.
+                // jpeg_v3_0_enable_clock_gating, then
+                // jpeg_v3_0_enable_static_power_gating: anti-hang on, and
+                // UVDJ off where the owner powers it off.
                 update(io, r(JPEG_CGC_GATE), JPEG_CGC_GATE_ALL, JPEG_CGC_GATE_ALL)?;
-                update(io, r(JPEG_POWER_STATUS), JPEG_POWER_STATUS_MASK, 1)
+                update(io, r(JPEG_POWER_STATUS), JPEG_POWER_STATUS_MASK, 1)?;
+                if off {
+                    io.write(r(PGFSM_CONFIG), PGFSM_UVDJ_OFF);
+                }
+                Ok(())
             })?;
+            if off {
+                let status = self.hw.layout.reg(0, PGFSM_STATUS);
+                self.hw
+                    .wait_reg(
+                        fence::Engine::Jpeg,
+                        status,
+                        PGFSM_UVDJ_OFF,
+                        PGFSM_UVDJ_STATUS,
+                    )
+                    .await?;
+            }
             self.jpeg_state = JpegState::Stopped;
         }
         self.stop_instances().await
@@ -1954,6 +2383,7 @@ impl<I: Io> Engine<I> {
             return Ok(());
         }
         let instances: alloc::vec::Vec<usize> = self.active().collect();
+        let (vcn_pg, mgcg) = (self.pg.vcn, self.cg.vcn);
         for i in instances {
             if self.mode == StartMode::Dpg {
                 self.stop_dpg(i).await?;
@@ -1986,9 +2416,11 @@ impl<I: Io> Engine<I> {
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
                 io.write(r(STATUS), 0);
-                // vcn_v3_0_enable_clock_gating
+                // vcn_v3_0_enable_clock_gating. Without
+                // AMD_CG_SUPPORT_VCN_MGCG it ORs in 0: DYN_CLOCK_MODE stays
+                // as read.
                 let ctrl = checked(io.read(r(CGC_CTRL)))?;
-                io.write(r(CGC_CTRL), ctrl | CGC_CTRL_DYN);
+                io.write(r(CGC_CTRL), ctrl | cgc_ctrl(mgcg));
                 update(io, r(CGC_CTRL), CGC_CTRL_MODES, CGC_CTRL_MODES)?;
                 update(
                     io,
@@ -1996,9 +2428,28 @@ impl<I: Io> Engine<I> {
                     SUVD_CGC_CTRL_MODES,
                     SUVD_CGC_CTRL_MODES,
                 )?;
-                checked(io.read(r(STATUS)))?;
+                if !vcn_pg {
+                    checked(io.read(r(STATUS)))?;
+                    return Ok(());
+                }
+                // vcn_v3_0_enable_static_power_gating, AMD_PG_SUPPORT_VCN:
+                // the tiles-off indicator, then every tile off.
+                update(io, r(POWER_STATUS), POWER_STATUS_MASK, POWER_TILES_OFF)?;
+                io.write(r(PGFSM_CONFIG), PGFSM_ALL_OFF);
                 Ok(())
             })?;
+            if vcn_pg {
+                let pgfsm = reg(self.hw.layout, PGFSM_STATUS);
+                self.hw
+                    .wait_reg(engine, pgfsm, PGFSM_ALL_OFF, PGFSM_STATUS_MASK)
+                    .await?;
+                // The read-back that orders the writes. UVD_STATUS is in the
+                // gated domain now, so its value proves nothing.
+                self.hw.access(|io, l| {
+                    io.read(reg(l, STATUS));
+                    Ok(())
+                })?;
+            }
         }
         Ok(())
     }
@@ -2022,10 +2473,13 @@ impl<I: Io> Engine<I> {
         let jpeg = self.jpeg.as_mut().ok_or(Error::Invalid)?;
         let (map, address) = (jpeg.memory.mapping(), jpeg.memory.address());
         let r = |l: Layout, reg: Reg| l.reg(0, reg);
+        let (nbio_v7_2, power_on, mgcg) = (self.nbio_v7_2, self.pg.jpeg_on, self.cg.jpeg);
         let present = self.hw.access(|io, l| {
-            let harvest = checked(io.read(r(l, CC_UVD_HARVESTING)))?;
-            if harvest & CC_UVD_DISABLE != 0 {
-                return Ok(false);
+            if l.jpeg_reads_harvesting() {
+                let harvest = checked(io.read(r(l, CC_UVD_HARVESTING)))?;
+                if harvest & CC_UVD_DISABLE != 0 {
+                    return Ok(false);
+                }
             }
             // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
             if checked(io.read(l.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
@@ -2033,27 +2487,25 @@ impl<I: Io> Engine<I> {
             }
             io.zero_memory(map, 0, JPEG_BYTES);
             flush(io, l);
-            // jpeg_v3_0_hw_init: MMSCH0 range starts at the VCN0 ring base.
-            update(
-                io,
-                l.nbio(NBIO_MMSCH_DOORBELL_RANGE[0]),
-                // linux-lit: 0x001f_0ffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK | BIF_MMSCH0_DOORBELL_RANGE__SIZE_MASK
-                0x001f_0ffc,
-                // linux-lit: 2=BIF_MMSCH0_DOORBELL_RANGE__OFFSET__SHIFT; 0xffc=BIF_MMSCH0_DOORBELL_RANGE__OFFSET_MASK; 16=BIF_MMSCH0_DOORBELL_RANGE__SIZE__SHIFT
-                ((doorbell::VCN_BASE << 2) & 0xffc) | (doorbell::RANGE << 16),
-            )?;
-            // jpeg_v3_0_disable_static_power_gating: power UVDJ on
-            io.write(r(l, PGFSM_CONFIG), PGFSM_UVDJ_ON);
+            // jpeg_v3_0_hw_init: the VCN0 range starts at the VCN0 ring base.
+            vcn_doorbell_range(io, l, nbio_v7_2, 0, doorbell::VCN_BASE)?;
+            // jpeg_v3_0_disable_static_power_gating: power UVDJ on, where
+            // the owner powers it (AMD_PG_SUPPORT_JPEG).
+            if power_on {
+                io.write(r(l, PGFSM_CONFIG), PGFSM_UVDJ_ON);
+            }
             Ok(true)
         })?;
         if !present {
             return Ok(false);
         }
         jpeg.memory.publish();
-        let status = self.hw.layout.reg(0, PGFSM_STATUS);
-        self.hw
-            .wait_reg(fence::Engine::Jpeg, status, 0, PGFSM_UVDJ_STATUS)
-            .await?;
+        if power_on {
+            let status = self.hw.layout.reg(0, PGFSM_STATUS);
+            self.hw
+                .wait_reg(fence::Engine::Jpeg, status, 0, PGFSM_UVDJ_STATUS)
+                .await?;
+        }
         let jpeg = self.jpeg.as_mut().ok_or(Error::Invalid)?;
         let ring = &mut jpeg.ring;
         ring.reset();
@@ -2061,9 +2513,17 @@ impl<I: Io> Engine<I> {
             // anti-hang off, static PG mode
             update(io, r(l, JPEG_POWER_STATUS), JPEG_POWER_STATUS_MASK, 0)?;
             update(io, r(l, JPEG_POWER_STATUS), JPEG_PG_MODE, 0)?;
-            // jpeg_v3_0_disable_clock_gating with AMD_CG_SUPPORT_JPEG_MGCG
+            // jpeg_v3_0_disable_clock_gating: DYN_CLOCK_MODE set with
+            // AMD_CG_SUPPORT_JPEG_MGCG. Without it Linux clears
+            // `~JPEG_CGC_CTRL__DYN_CLOCK_MODE__SHIFT`, which is `~0`, so
+            // DYN_CLOCK_MODE stays as read; this follows it.
             let ctrl = checked(io.read(r(l, JPEG_CGC_CTRL)))?;
-            io.write(r(l, JPEG_CGC_CTRL), ctrl | JPEG_CGC_CTRL_DYN);
+            let set = if mgcg {
+                JPEG_CGC_CTRL_DYN
+            } else {
+                JPEG_CGC_CTRL_DYN & !JPEG_CGC_DYN_CLOCK_MODE
+            };
+            io.write(r(l, JPEG_CGC_CTRL), ctrl | set);
             update(io, r(l, JPEG_CGC_GATE), JPEG_CGC_GATE_ALL, 0)?;
             update(io, r(l, JPEG_CGC_CTRL), JPEG_CGC_CTRL_MODES, 0)?;
             let gb = checked(io.read(l.gc + u64::from(GB_ADDR_CONFIG) * 4))?;
@@ -2197,7 +2657,8 @@ impl Media {
     }
     /// Reserve per-instance VCPU/ring/IB storage without device I/O.
     /// `instances` is the unharvested VCN mask whose firmware PSP loads;
-    /// JPEG exists when instance 0 does (`num_jpeg_inst = 1`).
+    /// JPEG exists when instance 0 does (`num_jpeg_inst = 1`) and the VCN
+    /// has one ([`Layout::has_jpeg`]: not on Navi24).
     ///
     /// # Safety
     /// Caller exclusively owns this physical Navi22 GPU's VCN/JPEG blocks,
@@ -2212,18 +2673,85 @@ impl Media {
         instances: u8,
         firmware_bytes: usize,
     ) -> Result<Self, Error> {
+        let layout = Layout::resolve(gpu, instances)?;
+        let mode = if DPG.load(Ordering::Relaxed) {
+            StartMode::Dpg
+        } else {
+            StartMode::Static
+        };
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            instances,
+            firmware_bytes,
+            layout,
+            None,
+            (mode, StaticPg::NAVI22, Mgcg::NAVI22),
+        )
+    }
+    /// Reserve Raphael's one VCN 3.1.2 instance and its JPEG: the same
+    /// `vcn_v3_0`/`jpeg_v3_0` start, with NBIO 7.2's doorbell range, no HDP
+    /// read cache, `smu_interface_type` 2 and no JPEG harvest read. PMFW must
+    /// have powered VCN and JPEG up (`PowerUpVcn`/`PowerUpJpeg`) before
+    /// `start`. `pg_flags` (Linux's, under `amdgpu.pg_mask`) choose the
+    /// start ([`StartMode::linux`]) and the static power gating
+    /// ([`StaticPg::linux`]); `cg_flags` (under `amdgpu.cg_mask`) the
+    /// media clock gating ([`Mgcg::linux`]).
+    ///
+    /// # Safety
+    /// As `new`, for Raphael.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: crate::amdgpu_cp_navi22::Doorbells,
+        firmware_bytes: usize,
+        pg_flags: u32,
+        cg_flags: u64,
+    ) -> Result<Self, Error> {
+        let (layout, nbio) = Layout::resolve_raphael(gpu, 1)?;
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            1,
+            firmware_bytes,
+            layout,
+            Some(nbio),
+            (
+                StartMode::linux(pg_flags),
+                StaticPg::linux(pg_flags),
+                Mgcg::linux(cg_flags),
+            ),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn with_layout(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: crate::amdgpu_cp_navi22::Doorbells,
+        instances: u8,
+        firmware_bytes: usize,
+        layout: Layout,
+        nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
+        (mode, pg, cg): (StartMode, StaticPg, Mgcg),
+    ) -> Result<Self, Error> {
         let firmware_bytes = u32::try_from(firmware_bytes).map_err(|_| Error::Invalid)?;
         if firmware_bytes == 0 || firmware_bytes > 4 << 20 {
             return Err(Error::Invalid);
         }
-        let layout = Layout::resolve(gpu, instances)?;
         let mut vcn = [None, None];
         for (i, slot) in vcn.iter_mut().enumerate() {
             if instances & (1 << i) != 0 {
                 *slot = Some(Instance::new(pool, i as u32)?);
             }
         }
-        let jpeg = if instances & 1 != 0 {
+        // JPEG exists with instance 0, where the VCN has one.
+        let jpeg = if instances & 1 != 0 && layout.has_jpeg() {
             Some(Jpeg::new(pool)?)
         } else {
             None
@@ -2257,17 +2785,16 @@ impl Media {
                 jpeg,
                 firmware_bytes,
                 timing: LINUX_TIMING,
-                mode: if DPG.load(Ordering::Relaxed) {
-                    StartMode::Dpg
-                } else {
-                    StartMode::Static
-                },
+                mode,
+                pg,
+                cg,
                 paused: [false; 2],
                 state: State::Prepared,
                 proof: Proof {
                     instances,
                     ..Proof::default()
                 },
+                nbio_v7_2,
             },
         })
     }
@@ -2316,6 +2843,33 @@ impl Media {
             proof: self.engine.proof,
         }
     }
+    /// Return to Prepared on the same instance, JPEG and client buffers, for
+    /// vcn_v3_0_hw_init after a reset: every ring empty with no sequence, the
+    /// idle runtime fresh, no instance paused. `start` clears the memory.
+    ///
+    /// # Safety
+    /// The GPU was reset since this owner last ran, so nothing can still
+    /// reach its memory, and no future of its steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
+    /// See `Engine::fences_signalled`.
+    pub(crate) fn fences_signalled(&mut self) -> Result<bool, Error> {
+        self.engine.fences_signalled()
+    }
+    /// See `Engine::suspend`.
+    pub(crate) async fn suspend(&mut self) -> Result<(), Error> {
+        self.engine.suspend().await
+    }
+    /// See `Engine::forget_saved`.
+    pub(crate) fn forget_saved(&mut self) {
+        self.engine.forget_saved()
+    }
+    /// See `Engine::sessions_restored`.
+    pub(crate) fn sessions_restored(&self) -> bool {
+        self.engine.sessions_restored()
+    }
 }
 
 // ── Client submission (append-only) ─────────────────────────────────────
@@ -2338,8 +2892,8 @@ pub(crate) const JPEG_FENCE: u64 = RING_BYTES + 64; // linux: n/a (NARF layout)
 /// Client-submission state of the media owner.
 #[derive(Debug)]
 pub(crate) struct Client {
-    /// MMHUB segment-0 dword base, for the ring-side VM flush.
-    pub mmhub: u32,
+    /// The MMHUB registers of the ring-side VM flush.
+    pub hub: submit::MediaHub,
     /// OSSSYS segment-0 dword base, for the MMHUB IH VMID LUT.
     pub oss: u32,
     /// Unharvested VCN instances (MMHUB invalidation-engine order).
@@ -2349,20 +2903,43 @@ pub(crate) struct Client {
 }
 impl Client {
     fn new(gpu: &AmdGpu, pool: &Pool, instances: u8, jpeg: bool) -> Option<Self> {
-        // linux: n/a (MMHUB 2.1.0 discovery version)
-        let base = crate::amdgpu_psp_ring::bank(
-            gpu,
-            ip::HW_ID_MMHUB,
-            crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS,
-            0,
-            submit::MM_PTB_HI,
-        )
-        .ok()?;
-        // linux: n/a (OSSSYS 5.0.3 discovery version)
+        let raphael = crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            == Some(&crate::amdgpu_rdna2::RAPHAEL);
+        let hub = if raphael {
+            // amdgpu_discovery.c gives MMHUB 2.3.0/2.4.x mmhub_v2_3: its
+            // registers on base index 1, strides of 8.
+            let base = crate::amdgpu_psp_ring::bank(
+                gpu,
+                ip::HW_ID_MMHUB,
+                &[(2, 3, 0), (2, 4, 0), (2, 4, 1)],
+                1,
+                submit::MM23_LAST,
+            )
+            .ok()?;
+            submit::MediaHub::mmhub_v2_3(u32::try_from(base / 4).ok()?)
+        } else {
+            // linux: n/a (MMHUB 2.1.0 discovery version)
+            let base = crate::amdgpu_psp_ring::bank(
+                gpu,
+                ip::HW_ID_MMHUB,
+                crate::amdgpu_rdna2::GMC_MMHUB_VERSIONS,
+                0,
+                submit::MM_PTB_HI,
+            )
+            .ok()?;
+            submit::MediaHub::mmhub_v2_0(u32::try_from(base / 4).ok()?)
+        };
+        // navi10_ih's osssys_5_0_0 registers, which APUs' 5.2.x keep.
+        let oss_versions = if raphael {
+            crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS
+        } else {
+            // linux: n/a (OSSSYS 5.0.3 discovery version)
+            crate::amdgpu_rdna2::IH_OSSSYS_VERSIONS
+        };
         let oss = crate::amdgpu_psp_ring::bank(
             gpu,
             ip::HW_ID_OSSSYS,
-            crate::amdgpu_rdna2::IH_OSSSYS_VERSIONS,
+            oss_versions,
             0,
             submit::IH_VMID_LUT_LAST,
         )
@@ -2379,7 +2956,7 @@ impl Client {
             None
         };
         Some(Self {
-            mmhub: u32::try_from(base / 4).ok()?,
+            hub,
             oss: u32::try_from(oss / 4).ok()?,
             instances,
             jpeg_ibs,
@@ -2392,7 +2969,9 @@ impl Client {
 #[derive(Clone, Copy, Debug)]
 pub struct MediaFenceReader {
     regs: MmioRegion,
-    hdp_invalidate: u64,
+    hdp_invalidate: Option<u64>,
+    /// `Layout::liveness`.
+    liveness: u64,
     slots: [Option<(MmioRegion, u64)>; 4],
     authority: Cap<BusDeviceCap, Write>,
 }
@@ -2402,15 +2981,17 @@ impl MediaFenceReader {
         let Some((slot, offset)) = self.slots[ring.index()] else {
             return Ok(None);
         };
-        let (regs, hdp) = (self.regs, self.hdp_invalidate);
+        let (regs, hdp, liveness) = (self.regs, self.hdp_invalidate, self.liveness);
         self.authority
             .invoke(Op(|| {
-                // SAFETY: the HDP register lies in the BAR5 bank Layout
-                // bounded; the slot is a published, permanent ring
+                // SAFETY: the HDP and liveness registers lie in the BAR5 banks
+                // Layout bounded; the slot is a published, permanent ring
                 // reservation whose fence dword is in bounds.
                 unsafe {
-                    regs.write32(hdp, 1);
-                    checked(regs.read32(hdp))?;
+                    if let Some(hdp) = hdp {
+                        regs.write32(hdp, 1);
+                    }
+                    checked(regs.read32(liveness))?;
                     barrier(Ordering::SeqCst);
                     Ok(Some(slot.read32(offset)))
                 }
@@ -2449,7 +3030,7 @@ impl<I: Io> Engine<I> {
         let throttle = r.seq.wrapping_sub(submit::HW_SUBMISSIONS - 1);
         let completed = self.hw.access(|io, l| {
             invalidate(io, l);
-            checked(io.read(l.hdp + 0xd1 * 4))?;
+            checked(io.read(l.liveness()))?;
             Ok(io.read_memory(map, fence_at))
         })?;
         Ok((completed, throttle))
@@ -2517,7 +3098,7 @@ impl<I: Io> Engine<I> {
         }
         let frame = submit::MediaFrame {
             ring,
-            mmhub: client.mmhub,
+            hub: client.hub,
             engine,
             flush: vm.flush.then_some(vm),
             pasid_map: (vm.flush && vm.map_pasid).then_some((
@@ -2636,7 +3217,8 @@ impl Media {
         }
         MediaFenceReader {
             regs: self.engine.hw.io.regs,
-            hdp_invalidate: self.engine.hw.layout.hdp + 0xd1 * 4, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+            hdp_invalidate: self.engine.hw.layout.hdp_invalidate(),
+            liveness: self.engine.hw.layout.liveness(),
             slots,
             authority: self.engine.hw.authority,
         }

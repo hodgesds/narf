@@ -70,7 +70,8 @@ impl Firmware {
             mec2: g(Source::Mec2),
             rlc: g(Source::Rlc)?,
             sdma: g(Source::Sdma)?,
-            sos: self.sos.bytes(),
+            sos: Some(self.sos.bytes()),
+            toc: None,
             vcn: g(Source::Vcn)?,
             dmcub: g(Source::Dmcub)?,
         })
@@ -524,8 +525,9 @@ static CP_FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 
 /// One task per source forwards completions or reports CP errors. Subscribe
 /// to every source before unmasking hardware. A terminal IH error wakes all
-/// waiters so each re-samples and observes device loss.
-fn route_fences(
+/// waiters so each re-samples and observes device loss. Raphael's graphics
+/// coordinator routes through this too (its SDMA1-3 sources never fire).
+pub(crate) fn route_fences(
     ih: &crate::amdgpu_ih_navi22::Handle,
 ) -> Result<(), crate::amdgpu_ih_navi22::Error> {
     use crate::amdgpu_ih_navi22::source;

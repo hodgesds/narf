@@ -101,7 +101,7 @@ impl<I: Io> Engine<I> {
         let enc_count = self.enc_count;
         let (all_done, enc_done) = self.hw.access(|io, l| {
             invalidate(io, l);
-            checked(io.read(l.hdp + 0xd1 * 4))?;
+            checked(io.read(l.liveness()))?;
             let mut all = true;
             let mut enc = [true; 2];
             for (i, inst) in instances.iter().enumerate() {
@@ -120,7 +120,7 @@ impl<I: Io> Engine<I> {
                 }
                 all &= enc[i];
             }
-            checked(io.read(l.hdp + 0xd1 * 4))?;
+            checked(io.read(l.liveness()))?;
             Ok((all, enc))
         })?;
         self.runtime.phase = Phase::Quiescing;
@@ -262,7 +262,6 @@ const GATE_SLOW_NS: u64 = 100_000_000;
 static LAST_GATE: narf_lib::sync::IrqSafeSpinLock<Option<GateTrace>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-
 /// The most recent gate attempt (read by the kernel tests).
 #[cfg(feature = "kernel-test")]
 pub(crate) fn last_gate() -> Option<GateTrace> {
@@ -375,11 +374,11 @@ pub(crate) fn start() {
             if EPOCH.load(Ordering::Acquire) != epoch {
                 return;
             }
-            let mut owner = crate::amdgpu_navi22_platform::owner().await;
+            let mut owner = crate::amdgpu_rdna2_client::lock().await;
             if EPOCH.load(Ordering::Acquire) != epoch {
                 return;
             }
-            let Some(boot) = owner.as_mut() else {
+            let Some(mut boot) = owner.media() else {
                 return;
             };
             if let Err(error) = boot.idle_media(narf_time::monotonic_ns()).await {

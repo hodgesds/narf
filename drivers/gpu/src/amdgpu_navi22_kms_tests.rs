@@ -522,6 +522,7 @@ fn navi22_display_admission_reports_only_what_dml30_proved() -> TestResult {
         dchub_refclk_khz: 50_000,
     };
     let config = crate::amdgpu_dml::Config {
+        dcn: crate::amdgpu_dml::Dcn::Dcn314,
         timing: hd(),
         plane: crate::amdgpu_dml::Plane {
             format: crate::amdgpu_dml::Format::Rgb32,

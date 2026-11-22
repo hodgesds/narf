@@ -705,3 +705,83 @@ kernel_test_in!(
     "drivers/gpu/dcn-otg",
     otg_dcn30_live_global_sync_follows_dcn20_program_tg
 );
+
+/// DCN 3.1.5 (optc31): the timing block and OTG_CONTROL are DCN 3.1.4's, the
+/// clock and global-sync quartet sits one dword higher (`dcn_3_1_5_offset.h`
+/// regOTG0_OTG_CLOCK_CONTROL 0x1b86 .. regOTG0_OTG_VREADY_PARAM 0x1b89), and
+/// disable clears the OPTC underflow after the generator idles.
+fn otg_dcn315_moves_sync_quartet_and_clears_underflow_on_disable() -> TestResult {
+    let mut otg = engine(1);
+    otg.profile = Profile::Dcn315;
+    let stride = OTG_STRIDE;
+    if otg.otg(OTG_H_TOTAL) != 0x1b2a + stride
+        || otg.otg(OTG_CONTROL) != 0x1b41 + stride
+        || otg.otg(OTG_CLOCK_CONTROL) != 0x1b86 + stride
+        || otg.otg(OTG_VSTARTUP_PARAM) != 0x1b87 + stride
+        || otg.otg(OTG_VUPDATE_PARAM) != 0x1b88 + stride
+        || otg.otg(OTG_VREADY_PARAM) != 0x1b89 + stride
+    {
+        return TestResult::Fail("DCN 3.1.5 OTG register layout");
+    }
+    // The inserted register is the boundary: the one below it is unmoved.
+    if layout_shift(Profile::Dcn315, DCN315_INSERTED - 1) != 0
+        || layout_shift(Profile::Dcn315, DCN315_INSERTED) != 1
+        || layout_shift(Profile::Dcn314, OTG_VREADY_PARAM) != 0
+        || layout_shift(Profile::Navi22, OTG_VREADY_PARAM) != 1
+    {
+        return TestResult::Fail("layout shift boundaries");
+    }
+    if otg.program_timing(&timing(), &sync()).is_err() {
+        return TestResult::Fail("timing rejected");
+    }
+    let reg = |otg: &Engine<Fake>, r: u64| otg.io.values[otg.otg(r) as usize];
+    if reg(&otg, OTG_VSTARTUP_PARAM) != 9
+        || reg(&otg, OTG_VUPDATE_PARAM) != 550 | 247 << 16
+        || reg(&otg, OTG_VREADY_PARAM) != 328
+        // Nothing landed at DCN 3.1.4's quartet offsets.
+        || otg.io.values[(OTG_VSTARTUP_PARAM + stride) as usize] != 0
+    {
+        return TestResult::Fail("DCN 3.1.5 global sync");
+    }
+    // Segment fields are DCN31's (SEG0 at bit 16), as on DCN 3.1.4.
+    if otg.io.values[(OPTC_DATA_SOURCE_SELECT + ODM_STRIDE) as usize]
+        != 1 << 16 | SEGMENT_PARKED << 20 | SEGMENT_PARKED << 24 | SEGMENT_PARKED << 28
+    {
+        return TestResult::Fail("DCN 3.1.5 segment select");
+    }
+    otg.enable().unwrap();
+    if reg(&otg, OTG_CONTROL) & 0x301 != 2 << 8 | 1 {
+        return TestResult::Fail("DCN 3.1.5 disable point");
+    }
+    if run(otg.disable()).is_err() || otg.state != State::Idle {
+        return TestResult::Fail("DCN 3.1.5 disable");
+    }
+    let underflow = (OPTC_INPUT_GLOBAL_CONTROL + ODM_STRIDE) as usize;
+    if otg.io.values[underflow] & OPTC_UNDERFLOW_CLEAR == 0
+        || otg.io.values[(OPTC_DATA_SOURCE_SELECT + ODM_STRIDE) as usize]
+            != SEGMENT_PARKED << 16
+                | SEGMENT_PARKED << 20
+                | SEGMENT_PARKED << 24
+                | SEGMENT_PARKED << 28
+    {
+        return TestResult::Fail("DCN 3.1.5 disable must park segments and clear underflow");
+    }
+    // DCN 3.1.4 does not touch the underflow latch.
+    let mut phoenix = engine(1);
+    phoenix.program_timing(&timing(), &sync()).unwrap();
+    phoenix.enable().unwrap();
+    run(phoenix.disable()).unwrap();
+    if phoenix
+        .io
+        .writes
+        .iter()
+        .any(|(r, _)| *r == underflow as u64)
+    {
+        return TestResult::Fail("DCN 3.1.4 wrote the OPTC underflow latch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    otg_dcn315_moves_sync_quartet_and_clears_underflow_on_disable
+);

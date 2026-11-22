@@ -58,7 +58,8 @@ pub struct Proof {
 struct Layout {
     gc: u64,
     nbio: u64,
-    hdp: u64,
+    /// HDP 5.0's bank; `None` on HDP 5.2.1, which has no read cache.
+    hdp: Option<u64>,
     /// RCC_CONFIG_MEMSIZE (`gmc.mc_vram_size`): the FB aperture's length.
     vram_size: u64,
 }
@@ -112,12 +113,47 @@ impl Layout {
                 2,     // linux-lit: 2=mmREMAP_HDP_MEM_FLUSH_CNTL_BASE_IDX
                 0x12d, // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
             )?,
-            hdp: resolve(
+            hdp: Some(resolve(
                 ip::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                 0,    // linux-lit: 0=mmHDP_READ_CACHE_INVALIDATE_BASE_IDX
                 0xd1, // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-            )?,
+            )?),
+        })
+    }
+    /// Raphael: its one SDMA 5.2.6 in GC 10.3.6's bank zero, NBIO 7.2's
+    /// segment 2 (the HDP remap and MEMSIZE keep their NBIO 2.3 offsets), and
+    /// HDP 5.2.1, which has no read cache to invalidate.
+    fn resolve_raphael(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::RAPHAEL)
+            // linux: n/a (BAR5 bound: MMIO_REG_HOLE_OFFSET + 4)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let profile = &crate::amdgpu_rdna2::RAPHAEL;
+        let mut blocks = gpu
+            .ip_blocks
+            .iter()
+            .filter(|b| b.hw_id == ip::HW_ID_SDMA0 && b.instance == 0);
+        let sdma = blocks.next().ok_or(Error::Unsupported)?;
+        if blocks.next().is_some()
+            || (sdma.major, sdma.minor, sdma.revision) != profile.sdma_version
+        {
+            return Err(Error::Unsupported);
+        }
+        let resolve = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        resolve(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        Ok(Self {
+            vram_size: gpu.vram.size,
+            // linux-lit: 0=mmGCMC_VM_FB_LOCATION_TOP_BASE_IDX@gc; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP@gc
+            gc: resolve(ip::HW_ID_GC, &[profile.gc_version], 0, 0x16fd)?,
+            nbio: nbio.bif,
+            hdp: None,
         })
     }
 }
@@ -188,8 +224,10 @@ fn flush<I: Io>(io: &mut I, l: Layout) {
     fence(Ordering::SeqCst);
 }
 fn invalidate<I: Io>(io: &mut I, l: Layout) {
-    io.write(l.hdp + 0xd1 * 4, 1); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
-    io.read(l.hdp + 0xd1 * 4); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+    if let Some(hdp) = l.hdp {
+        io.write(hdp + 0xd1 * 4, 1); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+        io.read(hdp + 0xd1 * 4); // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
+    }
     fence(Ordering::SeqCst);
 }
 fn packets(aperture: gmc::Aperture) -> [u32; 32] {
@@ -233,6 +271,17 @@ struct Engine<I: Io> {
     trapped: bool,
 }
 impl<I: Io> Engine<I> {
+    /// See `Sdma::rearm`.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        self.state = State::Prepared;
+        self.proof = None;
+        self.trapped = false;
+    }
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
         let io = &mut self.io;
         self.authority
@@ -516,6 +565,16 @@ pub struct Sdma {
     engine: Engine<Mmio>,
 }
 impl Sdma {
+    /// Return to Prepared on the same ring and writeback page.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
     /// Reserve a VRAM ring and writeback page without I/O.
     /// # Safety
     /// Caller owns this physical Navi22 GPU, SDMA0/GC/HDP/PM/reset and the
@@ -539,6 +598,18 @@ impl Sdma {
         pool: &Pool,
     ) -> Result<Self, Error> {
         Self::with_layout(gpu.regs, authority, pool, Layout::resolve_rdna2(gpu)?)
+    }
+    /// Reserve Raphael's SDMA0 proof ring: SDMA 5.2.6 on GC 10.3.6, NBIO 7.2,
+    /// HDP 5.2.1 (no read cache). No device writes occur during construction.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        Self::with_layout(gpu.regs, authority, pool, Layout::resolve_raphael(gpu)?)
     }
     fn with_layout(
         registers: MmioRegion,

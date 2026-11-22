@@ -101,6 +101,17 @@ impl Profile {
 
 /// Compatible navi10_ih backends; discovery remains authoritative per board.
 pub const IH_OSSSYS_VERSIONS: &[(u8, u8, u8)] = &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3)];
+/// Every OSSSYS revision `amdgpu_discovery.c` gives `navi10_ih`, which reads
+/// `osssys_5_0_0_offset.h` for all of them: the discrete parts' and APUs'
+/// 5.2.0/5.2.1.
+pub const NAVI10_IH_OSSSYS_VERSIONS: &[(u8, u8, u8)] = &[
+    (5, 0, 0),
+    (5, 0, 1),
+    (5, 0, 2),
+    (5, 0, 3),
+    (5, 2, 0),
+    (5, 2, 1),
+];
 
 /// Linux's SMUIO11 ROM callback selection. The newer callback forces ROM
 /// clocks on when ROM_MGCG is absent; the older callback performs no I/O.
@@ -241,6 +252,50 @@ pub(crate) const PSP_GC_REGISTERS: PspGcRegisters = PspGcRegisters {
 pub const GMC_MMHUB_VERSIONS: &[(u8, u8, u8)] = &[(2, 1, 0), (2, 1, 1), (2, 1, 2)];
 
 pub const PROFILES: &[Profile] = &[NAVI21, NAVI22, NAVI23, NAVI24];
+
+/// Raphael (`1002:164E`), the RDNA2 APU in Ryzen 7000/9000 desktop and 7045HX
+/// parts. Not in [`PROFILES`]: [`for_pci_id`] is the discrete-RDNA2 test, and
+/// every path behind it assumes a card — trained VRAM, a driver-loaded SOS and
+/// SMC, PSP 11 and SMU 11. A backend serves Raphael only once it resolves
+/// [`apu_for_pci_id`] itself, after its APU differences are ported.
+///
+/// `sos` and `smc` are empty: an APU's PSP secure OS and PMFW are
+/// BIOS-resident (`psp_v13_0` loads only `psp_13_0_5_{toc,ta}.bin`;
+/// `smu_v13_0_5_ppt.c` loads no microcode). The other names are Linux's
+/// `MODULE_FIRMWARE` declarations in `sdma_v5_2.c`, `gfx_v10_0.c`,
+/// `amdgpu_vcn.c` and `amdgpu_dm_dmub.c`, and agree with `amdgpu::RAPHAEL_FW`.
+pub const RAPHAEL: Profile = Profile {
+    asic: "raphael",
+    pci_ids: &[0x164e],
+    firmware: Firmware {
+        sos: "",
+        smc: "",
+        sdma: "amdgpu/sdma_5_2_6.bin",
+        ce: "amdgpu/gc_10_3_6_ce.bin",
+        pfp: "amdgpu/gc_10_3_6_pfp.bin",
+        me: "amdgpu/gc_10_3_6_me.bin",
+        mec: "amdgpu/gc_10_3_6_mec.bin",
+        mec2: "amdgpu/gc_10_3_6_mec2.bin",
+        rlc: "amdgpu/gc_10_3_6_rlc.bin",
+        vcn: "amdgpu/vcn_3_1_2.bin",
+        dmcub: "amdgpu/dcn_3_1_5_dmcub.bin",
+    },
+    gc_version: (10, 3, 6),
+    psp_version: (13, 0, 5),
+    sdma_version: (5, 2, 6),
+    dcn_version: (3, 1, 5),
+    vcn_versions: &[(3, 1, 2)],
+};
+
+pub const APU_PROFILES: &[Profile] = &[RAPHAEL];
+
+/// Exact vendor/device lookup for an RDNA2 APU; never one [`for_pci_id`] returns.
+pub fn apu_for_pci_id(vendor: u16, device: u16) -> Option<&'static Profile> {
+    if vendor != 0x1002 {
+        return None;
+    }
+    APU_PROFILES.iter().find(|p| p.pci_ids.contains(&device))
+}
 
 /// Exact vendor/device lookup: never infer an ASIC from a PCI-ID range.
 pub fn for_pci_id(vendor: u16, device: u16) -> Option<&'static Profile> {

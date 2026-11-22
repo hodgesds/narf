@@ -66,6 +66,7 @@ fn timing() -> Timing {
 }
 fn config() -> Config {
     Config {
+        dcn: crate::amdgpu_dml::Dcn::Dcn314,
         timing: timing(),
         plane: Plane {
             format: Format::Rgb32,

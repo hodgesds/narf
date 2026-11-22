@@ -25,6 +25,14 @@
   firmware, protocol, authorization and validation gates; HDCP remains unsupported
   and unadvertised.
 
+- [Raphael DCN 3.1.5 port map](raphael-dcn315-port.md) — Ryzen 7000/9000
+  desktop iGPU IP set, DCN 3.1.5 vs 3.1.4 block and register differences, the
+  SMU 13.0.5 clock mailbox, and the order of remaining work.
+- [Raphael GC 10.3.6 graphics port map](raphael-gc1036-port.md) — what the
+  RDNA2 APU's graphics needs beyond the discrete Navi22 cold boot: GC 10.3.6
+  against 10.3.2 in `gfx_v10_0.c`, PSP/SMU 13.0.5, MMHUB 2.3, NBIO 7.x, who
+  owns the PSP, and the order of work.
+
 ## Open research questions
 
 - Which GPU class is realistic as NARF's first real graphics target.

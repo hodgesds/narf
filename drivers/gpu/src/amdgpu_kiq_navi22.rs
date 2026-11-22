@@ -176,6 +176,9 @@ pub(crate) struct Engine<I: Io> {
     pub compute: Queue,
     pub state: State,
     pub proof: Proof,
+    /// The compute MQD as first mapped (`adev->gfx.mec.mqd_backup`), which a
+    /// queue reset restores: unmapping saves the HQD's live state into it.
+    pub mqd_backup: Option<alloc::boxed::Box<[u32]>>,
 }
 impl<I: Io> Engine<I> {
     fn begin(&mut self, from: State, busy: State) -> Result<(), Error> {
@@ -308,11 +311,13 @@ impl<I: Io> Engine<I> {
         })?;
         delay(50).await; // linux: n/a (udelay(50) in gfx_v10_0_cp_compute_enable)
         let kiq = &mut self.kiq;
+        let backup = &mut self.mqd_backup;
         self.hw.access(|io, l| {
             grbm_select(io, l, me, pipe, queue, 0);
             let m = compute_mqd(io, l, compute, false);
             grbm_select(io, l, 0, 0, 0, 0);
             let m = m?;
+            *backup = Some(alloc::boxed::Box::from(&m[..]));
             for (i, &word) in m.iter().enumerate() {
                 io.write_memory(compute.map(), MQD + i as u64 * 4, word);
             }
@@ -341,6 +346,143 @@ impl<I: Io> Engine<I> {
         ring_test(&mut self.hw, &mut self.compute).await?;
         self.proof.compute_ring = true;
         Ok(())
+    }
+    /// Return to Prepared on the same reservations (hw_init after a reset).
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) {
+        self.kiq.rearm();
+        self.compute.rearm();
+        self.state = State::Prepared;
+        self.proof = Proof::default();
+        self.mqd_backup = None;
+    }
+    /// `gfx_v10_0_reset_kcq`: reset the compute ring alone.
+    /// 1. KIQ UNMAP_QUEUES (RESET_QUEUES), then the KIQ ring test.
+    /// 2. The HQD going inactive, in RLC safe mode under GRBM select.
+    /// 3. `gfx_v10_0_kcq_init_queue(ring, true)`: the MQD restored from its
+    ///    map-time backup, the ring cleared, both pointers zeroed.
+    /// 4. MAP_QUEUES and the KIQ ring test, then the compute ring's own test
+    ///    (`amdgpu_ring_reset_helper_end`).
+    ///
+    /// Every job the ring held is dropped. Its fences are left to the caller
+    /// (`force_complete_compute`), which records those jobs' errors first.
+    pub(crate) async fn reset_compute(&mut self) -> Result<(), Error> {
+        self.begin(State::Verified, State::Mapping)?;
+        let result = self.reset_compute_inner().await;
+        self.finish(result, State::Verified)
+    }
+    async fn reset_compute_inner(&mut self) -> Result<(), Error> {
+        let (me, pipe, queue) = COMPUTE_QUEUE;
+        if self.mqd_backup.is_none() {
+            return Err(Error::Invalid);
+        }
+        let (kiq, compute) = (&mut self.kiq, &self.compute);
+        self.hw.access(|io, l| {
+            kiq.emit(
+                io,
+                &pm4::unmap_queues(pm4::RESET_QUEUES, 0, compute.doorbell),
+            )?;
+            kiq.commit(io, l);
+            Ok(())
+        })?;
+        ring_test(&mut self.hw, &mut self.kiq).await?;
+        let safe = crate::amdgpu_cp_navi22::enter_safe_mode(&mut self.hw).await?;
+        let inactive = self
+            .hw
+            .poll(self.compute.engine, REG_TIMEOUT_MS, |io, l| {
+                grbm_select(io, l, me, pipe, queue, 0);
+                let active = checked(io.read(l.reg(CP_HQD_ACTIVE)));
+                grbm_select(io, l, 0, 0, 0, 0);
+                // linux-lit: 1=CP_HQD_ACTIVE__ACTIVE_MASK
+                Ok((active? & 1 == 0).then_some(()))
+            })
+            .await;
+        if safe {
+            crate::amdgpu_cp_navi22::exit_safe_mode(&mut self.hw)?;
+        }
+        inactive?;
+        let (compute, backup) = (&mut self.compute, self.mqd_backup.as_deref());
+        self.hw.access(|io, l| {
+            for (i, &word) in backup.into_iter().flatten().enumerate() {
+                io.write_memory(compute.map(), MQD + i as u64 * 4, word);
+            }
+            compute.reset_ring(io);
+            flush(io, l);
+            Ok(())
+        })?;
+        let (kiq, compute) = (&mut self.kiq, &self.compute);
+        self.hw.access(|io, l| {
+            kiq.emit(
+                io,
+                &pm4::map_queues(
+                    me,
+                    pipe,
+                    queue,
+                    compute.doorbell,
+                    compute.address(MQD),
+                    compute.address(WPTR),
+                ),
+            )?;
+            kiq.commit(io, l);
+            Ok(())
+        })?;
+        ring_test(&mut self.hw, &mut self.kiq).await?;
+        ring_test(&mut self.hw, &mut self.compute).await
+    }
+    /// `gfx_v10_0_reset_kgq`'s KIQ half: CP_VMID_RESET for `vmid` on `map`'s
+    /// pipe, the MQD showing the queue inactive, the register cleared, and the
+    /// KIQ ring test proving all three were consumed.
+    pub(crate) async fn reset_gfx_vmid(
+        &mut self,
+        vmid: u8,
+        map: crate::amdgpu_cp_navi22::GfxQueueMap,
+    ) -> Result<(), Error> {
+        self.begin(State::Verified, State::Mapping)?;
+        let kiq = &mut self.kiq;
+        let result = self.hw.access(|io, l| {
+            kiq.emit(io, &pm4::gfx_vmid_reset(l.dword(CP_VMID_RESET), vmid, &map))?;
+            kiq.commit(io, l);
+            Ok(())
+        });
+        let result = match result {
+            Ok(()) => ring_test(&mut self.hw, &mut self.kiq).await,
+            Err(error) => Err(error),
+        };
+        self.finish(result, State::Verified)
+    }
+    /// The reset gfx queue's MAP_QUEUES (ENGINE_SEL 4) and KIQ ring test.
+    pub(crate) async fn remap_gfx(
+        &mut self,
+        map: crate::amdgpu_cp_navi22::GfxQueueMap,
+    ) -> Result<(), Error> {
+        self.begin(State::Verified, State::Mapping)?;
+        let kiq = &mut self.kiq;
+        let result = self.hw.access(|io, l| {
+            kiq.emit(
+                io,
+                // linux: n/a (ENGINE_SEL literal 4 for AMDGPU_RING_TYPE_GFX in gfx10_kiq_map_queues)
+                &pm4::map_queues_engine(0, map.pipe, 0, map.doorbell, map.mqd, map.wptr, 4),
+            )?;
+            kiq.commit(io, l);
+            Ok(())
+        });
+        let result = match result {
+            Ok(()) => ring_test(&mut self.hw, &mut self.kiq).await,
+            Err(error) => Err(error),
+        };
+        self.finish(result, State::Verified)
+    }
+    /// After a compute reset: the ring's fences show its last sequence.
+    pub(crate) fn force_complete_compute(&mut self) -> Result<(), Error> {
+        let compute = &self.compute;
+        self.hw.access(|io, _| {
+            compute.force_complete(io);
+            Ok(())
+        })
     }
     /// `amdgpu_gfx_enable_kgq`: HDP flush, one KIQ MAP_QUEUES (ENGINE_SEL 4,
     /// ME0) per kernel gfx ring, then the KIQ ring test proves the packets
@@ -414,6 +556,25 @@ impl Compute {
     ) -> Result<Self, Error> {
         Self::with_layout(gpu, authority, pool, doorbells, Layout::resolve_rdna2(gpu)?)
     }
+    /// Reserve Raphael's KIQ and kernel-compute rings: GC 10.3.6 shares the
+    /// GC10.3 MEC queue geometry (`gfx_v10_0_sw_init`'s Sienna Cichlid group).
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            Layout::resolve_raphael(gpu)?,
+        )
+    }
     fn with_layout(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
@@ -434,6 +595,7 @@ impl Compute {
                 compute: Queue::new(pool, Kind::Cp, doorbell::MEC_RING0, fence::Engine::Compute)?,
                 state: State::Prepared,
                 proof: Proof::default(),
+                mqd_backup: None,
             },
         })
     }
@@ -502,6 +664,37 @@ impl Compute {
         self.engine.proof
     }
     /// Fence progress of the KIQ and the compute queue (hang detection only).
+    /// See `Engine::rearm`.
+    ///
+    /// # Safety
+    /// As `Engine::rearm`.
+    pub(crate) unsafe fn rearm(&mut self) {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
+    /// See `Engine::reset_compute`.
+    pub(crate) async fn reset_compute(&mut self) -> Result<(), Error> {
+        self.engine.reset_compute().await
+    }
+    /// See `Engine::reset_gfx_vmid`.
+    pub(crate) async fn reset_gfx_vmid(
+        &mut self,
+        vmid: u8,
+        map: crate::amdgpu_cp_navi22::GfxQueueMap,
+    ) -> Result<(), Error> {
+        self.engine.reset_gfx_vmid(vmid, map).await
+    }
+    /// See `Engine::remap_gfx`.
+    pub(crate) async fn remap_gfx(
+        &mut self,
+        map: crate::amdgpu_cp_navi22::GfxQueueMap,
+    ) -> Result<(), Error> {
+        self.engine.remap_gfx(map).await
+    }
+    /// See `Engine::force_complete_compute`.
+    pub(crate) fn force_complete_compute(&mut self) -> Result<(), Error> {
+        self.engine.force_complete_compute()
+    }
     pub(crate) fn progress(&mut self) -> Result<[crate::amdgpu_navi22_tdr::Progress; 2], Error> {
         if self.engine.state != State::Verified {
             return Err(Error::Busy);

@@ -1,7 +1,8 @@
-//! Discrete RDNA2 memory hubs: VMID0 bring-up for an owned VRAM test aperture, then
+//! RDNA2 memory hubs: VMID0 bring-up for an owned VRAM test aperture, then
 //! the GART (`gart` child) and per-client GPUVM contexts (`vm` child).
-//! Linux gfxhub_v2_1.c / mmhub_v2_0.c / gmc_v10_0.c. No clock gating, KIQ/MES
-//! invalidation, retry-fault recovery or implicit reset.
+//! Linux gfxhub_v2_1.c / mmhub_v2_0.c / gmc_v10_0.c, and on Raphael
+//! mmhub_v2_3.c (the same programming over its own register table). No clock
+//! gating, KIQ/MES invalidation, retry-fault recovery or implicit reset.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip,
@@ -17,7 +18,7 @@ mod regs;
 #[path = "amdgpu_gmc_navi22_vm.rs"]
 mod vm;
 pub use gart::{GartInfo, Gtt, GART_SIZE};
-use regs::{HubRegs, GFX, MM};
+use regs::{HubRegs, GFX, MM, MM23};
 pub use vm::{
     Buffer, ClientVmids, Fault, FaultInfo, FaultOwner, Mapping, Vm, VmInfo, FIRST_KFD_VMID,
 };
@@ -93,10 +94,22 @@ pub struct Aperture {
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     bases: [u64; 2],
+    /// The GC hub's and the MM hub's register tables, in `bases` order.
+    hubs: [HubRegs; 2],
     nbio: u64,
-    /// NBIO BASE_IDX 0 (PCIE_INDEX2/PCIE_DATA2) and HDP BASE_IDX 0.
-    pcie: u64,
-    hdp: u64,
+    init: NbioInit,
+    /// HDP 5.0's HDP_MISC_CNTL. HDP 5.2 (`hdp_v5_2_funcs`) has no
+    /// `init_registers`, so there is nothing to program.
+    hdp: Option<u64>,
+}
+/// Which `nbio_*_init_registers` the hubs follow.
+#[derive(Clone, Copy, Debug)]
+enum NbioInit {
+    /// `nbio_v2_3_init_registers`: `smnPCIE_CONFIG_CNTL` through NBIO
+    /// segment 0's PCIE_INDEX2/DATA2.
+    Smn { pcie: u64 },
+    /// `nbio_v7_2_init_registers`, through the shared index latch.
+    V7_2(crate::amdgpu_nbio_v7_2::Banks),
 }
 /// nbio_v2_3.c smnPCIE_CONFIG_CNTL and its CI_SWUS_MAX_READ_REQUEST_SIZE_MODE
 /// (bit 27) / _PRIV (bits 29:28) fields (nbio_2_3_sh_mask.h).
@@ -157,15 +170,51 @@ impl Layout {
                 // linux-lit: 0x873=mmMMMC_VM_MX_L1_TLB_CNTL
                 reg(ip::HW_ID_MMHUB, mmhub_versions, 0, 0x873)?,
             ],
+            hubs: [GFX, MM],
             // linux-lit: 0x12d=mmREMAP_HDP_MEM_FLUSH_CNTL
             nbio: reg(ip::HW_ID_NBIF, &nbif, 2, 0x12d)?,
-            pcie: reg(ip::HW_ID_NBIF, &nbif, 0, PCIE_DATA2 as u32)?,
-            hdp: reg(
+            init: NbioInit::Smn {
+                pcie: reg(ip::HW_ID_NBIF, &nbif, 0, PCIE_DATA2 as u32)?,
+            },
+            hdp: Some(reg(
                 ip::HW_ID_HDP,
                 &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
                 0,
                 HDP_MISC_CNTL as u32,
-            )?,
+            )?),
+        })
+    }
+    /// Raphael: GC 10.3.6's gfxhub_v2_1 (Navi22's), mmhub_v2_3 on MMHUB
+    /// 2.3.0/2.4.0/2.4.1 (`gmc_v10_0_set_mmhub_funcs`), NBIO 7.2 and HDP 5.2.1.
+    fn resolve_raphael(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::RAPHAEL)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let reg = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        // The highest MM23 register: engine 17's ADDR_RANGE_HI32.
+        let mm_last = MM23.inv_range + 17 * MM23.eng_addr_distance + 1;
+        reg(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        Ok(Self {
+            bases: [
+                // linux-lit: 0x1703=mmGCMC_VM_MX_L1_TLB_CNTL@gc
+                reg(ip::HW_ID_GC, &[(10, 3, 6)], 0, 0x1703)?,
+                reg(
+                    ip::HW_ID_MMHUB,
+                    &[(2, 3, 0), (2, 4, 0), (2, 4, 1)],
+                    1,
+                    mm_last,
+                )?,
+            ],
+            hubs: [GFX, MM23],
+            nbio: nbio.bif,
+            init: NbioInit::V7_2(nbio),
+            hdp: None,
         })
     }
 }
@@ -289,9 +338,57 @@ fn flush<I: Io>(io: &mut I, nbio: u64) {
     io.read(nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
+fn init_nbio<I: Io>(io: &mut I, init: NbioInit) -> Result<(), Error> {
+    match init {
+        NbioInit::Smn { pcie } => init_nbio_v2_3(io, pcie),
+        // Raphael's display clock manager shares these index pairs.
+        NbioInit::V7_2(banks) => crate::amdgpu_smn::with_latch(|| init_nbio_v7_2(io, banks)),
+    }
+}
+/// `nbio_v7_2_init_registers`: the read-request register through the port
+/// pair, written only on change; then, on 7.3.0/7.5.1, DEV2's no-soft-reset
+/// strap cleared through PCIE_INDEX2/DATA2, written unconditionally.
+fn init_nbio_v7_2<I: Io>(io: &mut I, banks: crate::amdgpu_nbio_v7_2::Banks) -> Result<(), Error> {
+    use crate::amdgpu_nbio_v7_2 as nbio;
+    let indirect = |io: &mut I, (index, data): (u64, u64), address, value: Option<u32>| {
+        io.write(index, address);
+        io.read(index);
+        match value {
+            Some(value) => {
+                io.write(data, value);
+                io.read(data);
+                Ok(value)
+            }
+            None => checked(io.read(data)),
+        }
+    };
+    let port = banks.port_pair();
+    let address = banks
+        .seg5_address(nbio::read_request_register(banks.version))
+        .ok_or(Error::Invalid)?;
+    let old = indirect(io, port, address, None)?;
+    let new = nbio::read_request_size(old);
+    if new != old {
+        indirect(io, port, address, Some(new))?;
+    }
+    if nbio::clears_dev2_soft_reset_strap(banks.version) {
+        let smn = banks.smn_pair();
+        let address = banks
+            .seg5_address(nbio::RCC_DEV2_EPF0_STRAP2)
+            .ok_or(Error::Invalid)?;
+        let strap = indirect(io, smn, address, None)?;
+        indirect(
+            io,
+            smn,
+            address,
+            Some(strap & !nbio::STRAP_NO_SOFT_RESET_DEV2_F0),
+        )?;
+    }
+    Ok(())
+}
 /// nbio_v2_3_init_registers (nv_common_hw_init, before any GMC block):
 /// RREG32_PCIE/WREG32_PCIE through PCIE_INDEX2/DATA2, written only on change.
-fn init_nbio<I: Io>(io: &mut I, pcie: u64) -> Result<(), Error> {
+fn init_nbio_v2_3<I: Io>(io: &mut I, pcie: u64) -> Result<(), Error> {
     let index = pcie + PCIE_INDEX2 * 4;
     let data = pcie + PCIE_DATA2 * 4;
     io.write(index, SMN_PCIE_CONFIG_CNTL);
@@ -388,9 +485,14 @@ fn program<I: Io>(
     update(io, base, r.fault_cntl, 0xffff_fffc, 0x1ffc)?;
     for index in 0..18 {
         // linux: n/a (literal 18 engines in gfxhub_v2_1_program_invalidation)
-        // linux-lit: 2=mmGCVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 - mmGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+        // Engine n's range is the hub's `eng_addr_distance` past engine 0's.
         // linux: n/a (0x1f_ffffffff = LO32 0xffffffff / HI32 0x1f literals in program_invalidation)
-        pair(io, base, r.inv_range + index * 2, 0x1f_ffffffff);
+        pair(
+            io,
+            base,
+            r.inv_range + index * r.eng_addr_distance,
+            0x1f_ffffffff,
+        );
     }
     // Only privileged VMID0: flat PT, no retry, default-page fault responses.
     // linux-lit: 1=GCVM_CONTEXT0_CNTL__ENABLE_CONTEXT_MASK
@@ -493,7 +595,9 @@ impl<I: Io> Engine<I> {
     /// because the invalidation may still be outstanding.
     async fn flush_tlb(&mut self, vmid: u8, boot: bool) -> Result<(), Error> {
         let layout = self.layout;
-        for (index, hub, r) in [(0, Hub::Gfx, GFX), (1, Hub::Mm, MM)] {
+        for (index, hub) in [(0, Hub::Gfx), (1, Hub::Mm)] {
+            // Each hub's own table: MMHUB 2.3 (Raphael) moved engine 17.
+            let r = layout.hubs[index];
             if boot {
                 self.state = State::Invalidating(hub);
             }
@@ -520,6 +624,28 @@ impl<I: Io> Engine<I> {
     }
     /// Admit one post-boot operation after its host-only validation and
     /// allocation succeeded. Only `finish` returns the latch to Idle.
+    /// See `Gmc::rearm`.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) -> Result<(), Error> {
+        if !self.vms.idle() || self.gart.as_ref().is_some_and(|g| !g.only_boot_pages()) {
+            return Err(Error::Busy);
+        }
+        self.vms.rearm();
+        if let Some(gart) = self.gart.as_mut() {
+            gart.rearm();
+        }
+        self.state = State::Prepared;
+        self.runtime = Runtime::Idle;
+        self.aperture = None;
+        self.geometry = None;
+        self.fault_irqs = false;
+        self.token = owner_token();
+        Ok(())
+    }
     fn begin(&mut self) -> Result<(), Error> {
         if self.state != State::Ready || self.runtime != Runtime::Idle {
             return Err(Error::Busy);
@@ -574,7 +700,7 @@ impl<I: Io> Engine<I> {
                 size,
                 address,
             )?;
-            for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
+            for (base, r) in layout.bases.into_iter().zip(layout.hubs) {
                 // Both hubs must agree on the inherited FB base. TOP is not
                 // read (gmc_v10_0_vram_gtt_location uses MEMSIZE).
                 // linux-lit: 0xffffff=GCMC_VM_FB_LOCATION_BASE__FB_BASE_MASK
@@ -596,7 +722,7 @@ impl<I: Io> Engine<I> {
             }
             Ok(g)
         })?;
-        self.access(|io| init_nbio(io, layout.pcie))?;
+        self.access(|io| init_nbio(io, layout.init))?;
         let map = self.memory.mapping();
         self.access(|io| {
             for offset in (0..BYTES).step_by(4) {
@@ -616,12 +742,15 @@ impl<I: Io> Engine<I> {
         self.aperture = Some(geometry.aperture);
         self.geometry = Some(geometry);
         self.access(|io| {
-            for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
+            for (base, r) in layout.bases.into_iter().zip(layout.hubs) {
                 program(io, base, r, geometry, address)?;
             }
             // flush_tlb's leading HDP flush is Linux's "Flush HDP after it is
             // initialized".
-            init_hdp(io, layout.hdp)
+            match layout.hdp {
+                Some(hdp) => init_hdp(io, hdp),
+                None => Ok(()),
+            }
         })?;
         self.flush_tlb(0, true).await?;
         Ok(geometry.aperture)
@@ -632,6 +761,21 @@ pub struct Gmc {
     engine: Engine<Mmio>,
 }
 impl Gmc {
+    /// Return to Prepared on the same boot aperture and GART table, for
+    /// gmc_v10_0_hw_init over its existing buffers after a reset. The owner
+    /// token changes, so client VMIDs lent before can no longer be used
+    /// against it. Refused (`Busy`), unchanged, while a VM still holds a
+    /// context or a GTT binding holds GART pages: the re-enabled table would
+    /// drop their entries.
+    ///
+    /// # Safety
+    /// The GPU was reset (mode 2, or S3's power-off) since this owner last
+    /// ran, so nothing can still reach its memory, and no future of its
+    /// steps is alive.
+    pub(crate) unsafe fn rearm(&mut self) -> Result<(), Error> {
+        // SAFETY: forwarded.
+        unsafe { self.engine.rearm() }
+    }
     /// Reserve backing pages without I/O. Only the physical Navi22 PF is supported.
     /// # Safety
     /// Caller owns both hubs, HDP, VRAM and the matching permanent pool,
@@ -661,6 +805,29 @@ impl Gmc {
         pool: &Pool,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve_rdna2(gpu)?;
+        Ok(Self {
+            engine: Engine::new(Mmio(gpu.regs), authority, layout, pool, gpu.vram.size)?,
+        })
+    }
+    /// Reserve backing for Raphael's VMID0/GART/GPUVM support: GC 10.3.6's
+    /// gfxhub_v2_1, mmhub_v2_3 (MMHUB 2.3.0/2.4.x), NBIO 7.2 and HDP 5.2.1 are
+    /// validated before allocation. Construction performs no I/O. VRAM is the
+    /// BIOS carve-out (`RCC_CONFIG_MEMSIZE`, as on Navi22).
+    ///
+    /// LINUX-GAP: Linux gives the APU group a 1 GiB GART for display
+    /// scatter-gather (`gmc_v10_0_mc_init`, "DCE SG support"); NARF's display
+    /// scans out of the carve-out, and this keeps the 512 MiB discrete GART.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Raphael: exclusive hubs, HDP, carve-out and
+    /// permanent pool, with queues/VMs, GFXOFF, hub gating, reset and PM
+    /// inactive. NBIO's index pairs are shared through `amdgpu_smn`.
+    pub unsafe fn new_raphael(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve_raphael(gpu)?;
         Ok(Self {
             engine: Engine::new(Mmio(gpu.regs), authority, layout, pool, gpu.vram.size)?,
         })

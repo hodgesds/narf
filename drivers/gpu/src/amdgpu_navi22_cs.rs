@@ -1,6 +1,7 @@
-//! The Navi 22 card backend of the generic `AMDGPU_CS` / GEM / VA path:
-//! an `amdgpu_cs::Submitter` over the cold boot's verified kernel queues
-//! (`amdgpu_navi22_submit`), and the card's client VRAM heap
+//! The RDNA2 card backend of the generic `AMDGPU_CS` / GEM / VA path:
+//! an `amdgpu_cs::Submitter` over the verified kernel queues
+//! (`amdgpu_navi22_submit`) of Navi 22's cold boot or Raphael's graphics
+//! coordinator (`amdgpu_rdna2_client`), and the card's client VRAM heap
 //! (`amdgpu_gem::register_vram_heap`).
 //!
 //! Clients' address spaces are the generic per-open `amdgpu_vm::VmState`
@@ -412,8 +413,8 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                     // the doorbell, which wakes GC from GFXOFF itself. A
                     // lease here sent DisallowGfxOff/AllowGfxOff around every
                     // job, the AllowGfxOff landing while the job ran.
-                    let mut owner = crate::amdgpu_navi22_platform::owner().await;
-                    let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                    let mut owner = crate::amdgpu_rdna2_client::lock().await;
+                    let boot = owner.owner().ok_or(FsError::NoDevice)?;
                     if health.reset_epoch() != crate::amdgpu_ctx::recoveries() {
                         health.mark_canceled();
                         return Err(FsError::Canceled);
@@ -455,15 +456,15 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                                 ticket,
                                 ticket | (1 << 63),
                             );
-                            self.jobs.lock().emitted(ticket, health);
+                            self.jobs.lock().emitted_on(ticket, health, grant.vmid);
                             break seq;
                         }
-                        Err(crate::amdgpu_navi22_boot::Error::Queues(
-                            crate::amdgpu_cp_navi22::Error::Busy,
-                        )) => boot.fences(ring).map_err(|_| FsError::NoDevice)?.1,
-                        Err(crate::amdgpu_navi22_boot::Error::Queues(
-                            crate::amdgpu_cp_navi22::Error::Invalid,
-                        )) => return Err(FsError::InvalidData),
+                        Err(crate::amdgpu_cp_navi22::Error::Busy) => {
+                            boot.fences(ring).map_err(|_| FsError::NoDevice)?.1
+                        }
+                        Err(crate::amdgpu_cp_navi22::Error::Invalid) => {
+                            return Err(FsError::InvalidData)
+                        }
                         Err(_) => return Err(FsError::NoDevice),
                     }
                 };
@@ -491,16 +492,24 @@ impl crate::amdgpu_cs::Submitter for Submitter {
 static CLIENT_VRAM: IrqSafeSpinLock<
     Option<(crate::amdgpu_vram::Reservation, crate::amdgpu_gem::VramHeap)>,
 > = IrqSafeSpinLock::new(None);
+/// The client heap, for a hibernation that must put it back after a refused
+/// eviction.
+pub(crate) fn client_heap() -> Option<crate::amdgpu_gem::VramHeap> {
+    CLIENT_VRAM.lock().as_ref().map(|(_, heap)| heap.clone())
+}
 /// The client VMIDs lent by the memory owner, kept for its lifetime.
 static CLIENT_VMIDS: IrqSafeSpinLock<Option<crate::amdgpu_gmc_navi22::ClientVmids>> =
     IrqSafeSpinLock::new(None);
 
-/// The DRM card index of the bound Navi 22.
+/// The DRM card index of the bound RDNA2 card: a discrete part or Raphael.
 pub fn drm_card() -> Option<u32> {
     (0..crate::drm_registry::count() as u32).find(|&i| {
         crate::drm_registry::driver_name(i) == Some("amdgpu")
-            && crate::drm_registry::pci_id(i)
-                .is_some_and(|(vid, did)| crate::amdgpu_rdna2::for_pci_id(vid, did).is_some())
+            && crate::drm_registry::pci_id(i).is_some_and(|(vid, did)| {
+                crate::amdgpu_rdna2::for_pci_id(vid, did).is_some()
+                    || crate::amdgpu_rdna2::apu_for_pci_id(vid, did)
+                        == Some(&crate::amdgpu_rdna2::RAPHAEL)
+            })
     })
 }
 
@@ -562,6 +571,111 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
         }
     }
     crate::amdgpu_vcn_navi22_cs::register(boot, first, last);
+    crate::amdgpu_rdna2_client::set_backend(crate::amdgpu_rdna2_client::Backend::Navi22);
+    install(card, reader, vmids);
+    crate::amdgpu_navi22_gfxoff::declare_submission_guarded();
+    // A recovery also replays the still-unsignalled front clear. The queue's
+    // pulse closes the race with a drain noticing the old fence generation.
+    crate::amdgpu_rdna2_vram::engine().kick();
+}
+
+/// `amdgpu_ring_soft_recovery` on Raphael's GFX or compute ring: kill the
+/// timed-out job's waves (`gfx_v10_0_ring_soft_recovery`) until its fence
+/// signals, for 10 ms at most, then fail that job alone. False when no
+/// client job is to blame (a kernel job, VMID 0), the fence did not signal,
+/// or the owner is gone; the caller then treats the hang as terminal.
+pub(crate) async fn soft_recover(
+    engine: crate::amdgpu_fence_navi22::Engine,
+    generation: u64,
+) -> bool {
+    use crate::amdgpu_fence_navi22::Engine;
+    let id = match engine {
+        Engine::Gfx => 0,
+        Engine::Compute => 1,
+        _ => return false,
+    };
+    let Some(ring) = RINGS[id] else {
+        return false;
+    };
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    let Some(current) = current.filter(|current| current.epoch == generation) else {
+        return false;
+    };
+    let _ = current.progress();
+    let Some((ticket, vmid)) = current.jobs.lock().oldest(id) else {
+        return false;
+    };
+    if vmid == 0 {
+        return false;
+    }
+    let recovered = {
+        let mut owner = crate::amdgpu_platform::graphics_owner().await;
+        let Some(boot) = owner.get() else {
+            return false;
+        };
+        boot.soft_recovery(ring, vmid, ticket as u32).await == Ok(true)
+    };
+    if recovered {
+        current.jobs.lock().recovered(ticket);
+        let _ = current.progress();
+        crate::amdgpu_fence_navi22::notify_all();
+    }
+    recovered
+}
+
+/// `amdgpu_ring_reset` on Raphael's `engine` ring, the rung after a failed
+/// soft recovery: reset that queue alone, fail its timed-out job and cancel
+/// the jobs behind it (`Jobs::reset`), then force its fences. Other rings
+/// and the submitter carry on. False when the queue reset is not ported for
+/// the ring (SDMA), the GFX job is a kernel one, the reset fails, or the
+/// owner is gone; the caller then treats the hang as terminal.
+pub(crate) async fn reset_queue(
+    engine: crate::amdgpu_fence_navi22::Engine,
+    generation: u64,
+) -> bool {
+    use crate::amdgpu_fence_navi22::Engine;
+    let id = match engine {
+        Engine::Gfx => 0,
+        Engine::Compute => 1,
+        _ => return false,
+    };
+    let Some(ring) = RINGS[id] else {
+        return false;
+    };
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    let Some(current) = current.filter(|current| current.epoch == generation) else {
+        return false;
+    };
+    let _ = current.progress();
+    let Some((ticket, vmid)) = current.jobs.lock().oldest(id) else {
+        return false;
+    };
+    {
+        let mut owner = crate::amdgpu_platform::graphics_owner().await;
+        let Some(boot) = owner.get() else {
+            return false;
+        };
+        if boot.reset_queue(ring, vmid).await.is_err() {
+            return false;
+        }
+        // The errors are on record before the fences move.
+        current.jobs.lock().reset(id, ticket);
+        if boot.force_complete(ring).is_err() {
+            return false;
+        }
+    }
+    let _ = current.progress();
+    crate::amdgpu_fence_navi22::notify_all();
+    true
+}
+
+/// Register the card's submitter over `reader`'s queues, with `vmids` lent
+/// by the memory owner.
+fn install(
+    card: u32,
+    reader: crate::amdgpu_cp_navi22::FenceReader,
+    vmids: crate::amdgpu_vmid::VmidManager,
+) {
     let submitter = Arc::new(Submitter {
         card,
         // The fence generation advances during quiesce, before restart
@@ -575,16 +689,93 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
     });
     *CURRENT.lock() = Some(Arc::downgrade(&submitter));
     crate::amdgpu_cs::register_submitter(card, submitter);
-    crate::amdgpu_navi22_gfxoff::declare_submission_guarded();
-    // A recovery also replays the still-unsignalled front clear. The queue's
-    // pulse closes the race with a drain noticing the old fence generation.
-    crate::amdgpu_rdna2_vram::engine().kick();
+}
+
+/// Raphael's [`register`]: the graphics coordinator's verified queues, the
+/// client VMIDs it lends (GFXHUB for the graphics rings, the same numbers on
+/// MMHUB for the media rings), a client heap from its carve-out pool, and
+/// its media rings once VCN runs. An APU has no hidden VRAM to transfer
+/// through. Its GFXOFF is the coordinator's (`amdgpu_raphael_gfxoff`):
+/// submission takes nothing, as on Navi22. Called by the display owner,
+/// which holds the coordinator,
+/// after a completed graphics boot. Failures are reported, never fatal.
+pub fn register_raphael(boot: &mut crate::amdgpu_raphael_boot::ColdBoot) {
+    use core::fmt::Write;
+    let Some(card) = drm_card() else {
+        return;
+    };
+    let Some(reader) = boot.client_fence_reader() else {
+        return;
+    };
+    let lent = match boot.reserve_client_vmids() {
+        Ok(lent) => lent,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael no client VMIDs: {error:?}"
+            );
+            return;
+        }
+    };
+    let vmids = vmid_manager(&lent);
+    let (first, last) = lent.range();
+    *CLIENT_VMIDS.lock() = Some(lent);
+    {
+        let mut client = CLIENT_VRAM.lock();
+        if client.is_none() {
+            match boot.reserve_client_vram() {
+                Ok(heap) => *client = Some(heap),
+                Err(error) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: raphael no client VRAM heap: {error:?}"
+                    );
+                }
+            }
+        }
+        if let Some((chunk, heap)) = client.as_ref() {
+            crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael client VRAM heap {} MiB, VMIDs {first}-{last}",
+                chunk.size() >> 20
+            );
+        }
+    }
+    let media = boot.client_media();
+    match media {
+        Some((rings, reader)) => crate::amdgpu_vcn_navi22_cs::register_rings(
+            "raphael",
+            rings,
+            reader,
+            first,
+            last,
+            boot.media_sessions_restored(),
+        ),
+        None => crate::amdgpu_vcn_navi22_cs::unregister(),
+    }
+    crate::amdgpu_rdna2_client::set_backend(crate::amdgpu_rdna2_client::Backend::Raphael);
+    install(card, reader, vmids);
+    if media.is_some() {
+        // VCN_IDLE_TIMEOUT after each use, through the coordinator's guard.
+        crate::amdgpu_vcn_navi22::idle::start();
+    }
+    // drm_sched's job timeout, sampling the coordinator's queues.
+    crate::amdgpu_navi22_tdr::start();
 }
 
 /// Stop accepting client work (recovery is about to rebuild the owner). The
 /// lent VMIDs belonged to the old memory owner and are dropped with it; the
 /// next `register` starts a fresh manager (every VMID flushes again).
 pub fn unregister() {
+    withdraw(false);
+}
+/// [`unregister`] before S3: the media session table stays, for a resume
+/// whose media start restores the firmware's sessions.
+pub(crate) fn suspend() {
+    withdraw(true);
+}
+fn withdraw(keep_media_sessions: bool) {
     crate::amdgpu_vcn_navi22::idle::stop();
     abandon(FsError::Canceled);
     crate::amdgpu_rdna2_vram::suspend();
@@ -592,7 +783,11 @@ pub fn unregister() {
         crate::amdgpu_cs::unregister_submitter(card);
         crate::amdgpu_gem::unregister_vram_heap(card);
     }
-    crate::amdgpu_vcn_navi22_cs::unregister();
+    if keep_media_sessions {
+        crate::amdgpu_vcn_navi22_cs::suspend();
+    } else {
+        crate::amdgpu_vcn_navi22_cs::unregister();
+    }
     // Its owner is being replaced; the handle must not reach the new one.
     let _ = CLIENT_VMIDS.lock().take();
 }

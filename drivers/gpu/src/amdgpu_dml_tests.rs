@@ -30,6 +30,7 @@ fn plane_1080p() -> Plane {
 }
 fn config_1080p() -> Config {
     Config {
+        dcn: Dcn::Dcn314,
         timing: timing_1080p(),
         plane: plane_1080p(),
         dentist_vco_khz: DEFAULT_DENTIST_VCO_KHZ,
@@ -535,4 +536,157 @@ fn dml_prefetch_refuses_a_vblank_that_cannot_hold_it() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dml",
     dml_prefetch_refuses_a_vblank_that_cannot_hold_it
+);
+
+/// DCN 3.1.5 takes `dcn3_15_ip` / `dcn3_15_soc` and dml31's whole-vblank
+/// maximum VStartup: a 192 KB DET (`DCN3_15_DEFAULT_DET_SIZE`), 0.38 %
+/// downspread, nine tile repeaters, Z8 times of 50/50 µs, and the
+/// `dcn315_clk_mgr.c` WM_A row (129 µs p-state, 11.5/14.5 µs self-refresh).
+fn dml_dcn315_uses_dcn3_15_parameters_and_the_whole_vblank() -> TestResult {
+    let phoenix = config_1080p();
+    let raphael = Config {
+        dcn: Dcn::Dcn315,
+        ..phoenix
+    };
+    if (
+        Dcn::Dcn315.det_buffer_kbytes(),
+        Dcn::Dcn314.det_buffer_kbytes(),
+    ) != (192, 384)
+        || Dcn::Dcn315.max_inter_dcn_tile_repeaters() != 9
+        || Dcn::Dcn315.downspread_hundredths() != 38
+        || Dcn::Dcn315.z8_us() != (50, 50)
+    {
+        return TestResult::Fail("dcn3_15 parameters");
+    }
+    let (Ok(g314), Ok(g315)) = (phoenix.geometry(), raphael.geometry()) else {
+        return TestResult::Fail("geometry");
+    };
+    if g315.det_buffer_bytes != 192 * 1024 || g314.det_buffer_bytes != 384 * 1024 {
+        return TestResult::Fail("DET size");
+    }
+    let (Ok(r314), Ok(r315)) = (
+        phoenix.requirements(&g314, 1_200_000),
+        raphael.requirements(&g315, 1_200_000),
+    ) else {
+        return TestResult::Fail("requirements");
+    };
+    // A smaller downspread can never require a faster DISPCLK.
+    if r315.dispclk_khz > r314.dispclk_khz {
+        return TestResult::Fail("0.38 % downspread asked for more DISPCLK");
+    }
+    let clocks = clocks_1080p();
+    let Ok(wm) = raphael.watermarks(&memory_ddr5(), &clocks) else {
+        return TestResult::Fail("watermarks");
+    };
+    if wm.pstate_latency_us != Fx::int(129)
+        || wm.sr_exit_us != Fx::ratio(115, 10)
+        || wm.sr_enter_plus_exit_us != Fx::ratio(145, 10)
+        || wm.pstate_change_us != Fx::int(129).plus(wm.urgent_us)
+        || wm.z8_stutter_exit_us.minus(wm.stutter_exit_us) != Fx::int(50).minus(Fx::ratio(115, 10))
+    {
+        return TestResult::Fail("dcn315 WM_A row and Z8 times");
+    }
+    // LPDDR5 shares the DDR5 row on DCN 3.1.5.
+    let lpddr5 = Memory {
+        kind: MemoryKind::Lpddr5,
+        ..memory_ddr5()
+    };
+    if raphael
+        .watermarks(&lpddr5, &clocks)
+        .map(|w| w.pstate_latency_us)
+        != Ok(Fx::int(129))
+    {
+        return TestResult::Fail("dcn315 LPDDR5 row");
+    }
+    // dml31 bounds VStartup by the whole vblank less one line; dml314 also by
+    // the 668 us nominal blank (44 lines here).
+    let mut roomy314 = phoenix;
+    roomy314.timing.v_total = roomy314.timing.v_active + 200;
+    let roomy315 = Config {
+        dcn: Dcn::Dcn315,
+        ..roomy314
+    };
+    if (roomy314.max_v_startup(), roomy315.max_v_startup()) != (44, 199) {
+        return TestResult::Fail("dml31 max VStartup");
+    }
+    if raphael.prefetch(&g315, &clocks, &wm).is_err() {
+        return TestResult::Fail("dcn315 prefetch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml",
+    dml_dcn315_uses_dcn3_15_parameters_and_the_whole_vblank
+);
+
+/// `DRAMClockChangeSupport` for one 1080p linear RGB plane on DCN 3.1.5:
+/// 8 line-buffer lines (789504 / 48 / 1920), 25 DET lines on 192 KB, and with
+/// unbounded requesting the 832 KB compressed buffer as well, 136 lines. The
+/// margin falls by the DRAM-change watermark; a watermark the buffers cannot
+/// cover leaves the change to vblank. The dummy latency replaces 129 us.
+fn dml_dram_clock_change_counts_det_line_buffer_and_compbuf() -> TestResult {
+    let config = Config {
+        dcn: Dcn::Dcn315,
+        ..config_1080p()
+    };
+    let clocks = clocks_1080p();
+    let (Ok(geometry), Ok(wm)) = (
+        config.geometry_with_det(192),
+        config.watermarks(&memory_ddr5(), &clocks),
+    ) else {
+        return TestResult::Fail("dcn315 geometry or watermarks");
+    };
+    let Ok(prefetch) = config.prefetch(&geometry, &clocks, &wm) else {
+        return TestResult::Fail("dcn315 prefetch");
+    };
+    let line = config.line_time_us();
+    let bounded = config.dram_clock_change(&geometry, &wm, &prefetch, false, 832);
+    let unbounded = config.dram_clock_change(&geometry, &wm, &prefetch, true, 832);
+    let after_scaler = Fx::ratio(prefetch.dst_x_after_scaler as i64, 2200)
+        .plus(Fx::int(prefetch.dst_y_after_scaler as i64))
+        .times(line);
+    let want = Fx::int(8 + 25)
+        .times(line)
+        .minus(after_scaler)
+        .minus(wm.urgent_us)
+        .minus(wm.pstate_change_us);
+    let close = |a: Fx, b: Fx| (a.raw() - b.raw()).abs() <= 4;
+    if !close(bounded.margin_us, want) || bounded.support != DramClockChange::Vactive {
+        return TestResult::Fail("bounded vactive margin");
+    }
+    if !close(
+        unbounded.margin_us.minus(bounded.margin_us),
+        Fx::int(136 - 25).times(line),
+    ) {
+        return TestResult::Fail("the compressed buffer is not counted under unbounded requests");
+    }
+    // A DRAM change the buffers cannot hide goes to vblank.
+    let slow = Watermarks {
+        pstate_change_us: Fx::int(2000),
+        ..wm
+    };
+    if config
+        .dram_clock_change(&geometry, &slow, &prefetch, false, 832)
+        .support
+        != DramClockChange::Vblank
+    {
+        return TestResult::Fail("an unhidable DRAM change stayed in vactive");
+    }
+    // dcn315_update_soc_for_wm_a's dummy latency.
+    match config.watermarks_with_pstate_latency(
+        &memory_ddr5(),
+        &clocks,
+        Some(Fx::int(DUMMY_PSTATE_LATENCY_US)),
+    ) {
+        Ok(dummy)
+            if dummy.pstate_latency_us == Fx::int(10)
+                && dummy.pstate_change_us == Fx::int(10).plus(dummy.urgent_us)
+                && dummy.urgent_us == wm.urgent_us => {}
+        _ => return TestResult::Fail("dummy p-state latency"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml",
+    dml_dram_clock_change_counts_det_line_buffer_and_compbuf
 );

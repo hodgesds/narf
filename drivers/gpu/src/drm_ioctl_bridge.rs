@@ -9903,15 +9903,20 @@ pub fn amdgpu_cursor_bo(
 }
 
 /// `struct drm_version` for the amdgpu driver: `amdgpu`, `20150101`,
-/// `AMD GPU`, `KMS_DRIVER_*` — 3.64.0 on a Navi 22 whose submission path is
-/// wired, the base 3.0.0 otherwise.
+/// `AMD GPU`, `KMS_DRIVER_*` — 3.64.0 on a Navi 22 or Raphael whose
+/// submission path is wired, the base 3.0.0 otherwise.
 #[cfg(feature = "amdgpu")]
 fn amdgpu_version(card_index: u32, arg: usize) -> Result<u64, FsError> {
     // SAFETY: `arg` is the ioctl struct pointer; drm_version is 64 bytes.
     let mut b = unsafe { copy_in(arg, 64)? };
-    let navi22 = crate::drm_registry::pci_id(card_index)
-        == Some((crate::amdgpu::AMD_VENDOR, crate::amdgpu::NAVI22));
-    let (major, minor, patch) = if navi22 {
+    let rdna2 = matches!(
+        crate::drm_registry::pci_id(card_index),
+        Some((
+            crate::amdgpu::AMD_VENDOR,
+            crate::amdgpu::NAVI22 | crate::amdgpu::RAPHAEL
+        ))
+    );
+    let (major, minor, patch) = if rdna2 {
         crate::amdgpu_info_navi22::drm_version()
     } else {
         (3, 0, 0)
