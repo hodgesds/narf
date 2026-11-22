@@ -1547,6 +1547,88 @@ reconfiguration and display-stepping selection are not implemented. PCI runtime 
 lit panel stays refused, as Linux's display wakeref keeps the function in D0;
 DC5/DC6 is the lit-panel idle power path.
 
+### 12.2 Gen11 power (Lane 6)
+
+Gen11 idle power, verified against Linux 7.4-rc2 (commit
+7475ea8b) rather than reused from the Gen12 modules:
+
+- RC6 (`intel_gpu_rc6`): the Gen11/Gen12 enable sequence was
+  already implemented; the lane re-verified every value
+  against `gt/intel_rc6.c::gen11_rc6_enable` and fixed two
+  divergences. `GUC_MAX_IDLE_COUNT` (0xC3E4,
+  `gt/uc/intel_guc_reg.h:62`) = 0xA is now written after the
+  `RING_MAX_IDLE` writes, as Linux does in the host-owned
+  branch — the earlier omission (offset ungrounded) is gone.
+  `GEN9_PG_ENABLE` on Gen11 is render + media + media-sampler
+  only (0x7): Linux gates the per-VCS VDN HCP/MFX bits on
+  `GRAPHICS_VER >= 12 && !IS_DG1`, so `Rc6::enable_gen11`
+  programs no VDN bits however many video engines are
+  present. All other values check out (wake-rate limit
+  54<<16|85, media wake-rate 150, evaluation interval 125000,
+  idle hysteresis 25, `RING_MAX_IDLE` 10, `RC_SLEEP` 0,
+  RC6 threshold 50000, PG idle hysteresis 60/60 — the Gen11
+  values, Gen9 used 250). The host-owned control value
+  0x88040000 is correct for a driver with no GuC
+  (`intel_guc_rc_enable` *enables* GuC RC and returns 0 on
+  success, so the host-only branch is the failure arm).
+  `enable_gen11` has no production caller yet — the Gen12 PM
+  seam owns the only live enable; the Gen11 PM wiring calls
+  it when it lands.
+- DC states (`intel_gpu_gen11_dc_states`): display 11 has its
+  own mask, derived from
+  `display/intel_display_power_well.c::gen9_dc_mask`
+  (DISPLAY_VER == 11 adds UPTO_DC6 | DC9 to the UPTO_DC5
+  base) and
+  `display/intel_display_power.c::get_allowed_dc_mask`
+  (max_dc 2, DC9 unconditional at ver >= 11, requested 2
+  adds UPTO_DC6). The mask is UPTO_DC5 | UPTO_DC6 | DC9 =
+  0xB, the allowed mask is DC9 | UPTO_DC6 = 0xA, the target
+  is DC6. The grounding's "DC5|DC6 only" recollection is
+  wrong — DC9 is in the mask; DC3CO joins only at display
+  >= 12 and is stripped from tracking. The module is the mask
+  + target + sticky-write core only: no `DC_off`
+  refcounting, no DMC program lifecycle (those are the
+  display-14 service's), and DC6 is armed only with a loaded
+  ICL DMC program (`icl_dmc_ver1_09`, Lane 5's load).
+- Forcewake (`intel_gpu_media`): the per-VDBox/VEBox
+  sub-domains (`FORCEWAKE_MEDIA_VDBOX_GEN11(n)` 0xA540+4n,
+  ack 0x0D50+4n; `FORCEWAKE_MEDIA_VEBOX_GEN11(n)` 0xA560+4n,
+  ack 0x0D70+4n — `gt/intel_gt_regs.h:54-55, 922-923`) were
+  already modelled generically over the instance, so no new
+  domain code was needed. What was missing was the Gen11
+  engine table: `GEN11_MEDIA_ENGINES` is VCS0/VCS2/VECS0
+  (`i915_pci.c::icl_info`), VCS2 at `GEN11_BSD3_RING_BASE`
+  0x1d0000 (`gt/intel_engine_cs.c`), taking `VdBox(2)`
+  (request 0xA548, ack 0x0D58). `media_engines_for(Gen11)`
+  now serves it, which wires the probe announce and
+  `attach_media`; per-SKU fusing (a part with VCS2 fused
+  off) is still unmodelled.
+- SAGV (`intel_gpu_gen11_sagv`, `intel_gpu_gen11_wm`):
+  on display 11 SAGV is controlled by restricting QGV
+  points through `ICL_PCODE_SAGV_DE_MEM_SS_CONFIG` (0xe),
+  not `GEN9_PCODE_SAGV_CONTROL` (0x21) — that is the
+  pre-ICL (display 9) mechanism, and the Lane 4 watermark
+  header's "(0x21)" is corrected here.
+  `restrict_qgv_points` sends the allowed-points mask
+  (bits [7:0]) and decodes the reply (SAFE 0 / POLL 1 /
+  REJECTED 2), retrying POLL inside a 51 ms budget
+  (Linux's 1 ms base + 50 ms fallback). Per-level admission
+  is `can_sagv = latency >= sagv_block_time_us`
+  (`display/skl_watermark.c::skl_compute_wm_levels`, only
+  where there is no SAGV watermark register and the block
+  time is nonzero), annotated by `apply_sagv_admission`;
+  `can_enable_sagv` is the single-plane form of
+  `skl_crtc_can_enable_sagv` (the highest enabled level must
+  admit SAGV). Not done: the bandwidth-state machine that
+  computes the QGV mask (QGV point inventory, data-rate
+  calculation) and the pre/post-plane-update sequencing —
+  `restrict_qgv_points` is the primitive it will call.
+- D3cold / runtime PM: no Gen11 arm was needed.
+  `intel_gpu_d3cold` is generation-independent (root-port
+  PME + ACPI `_PR3` + VRAM threshold) and
+  `intel_gpu_runtime_power` carries no generation gating;
+  both were verified, not changed.
+
 ## 13. Suspend/resume + D-states (Stage 5 — `intel_gpu_pm`, #1015)
 
 System power for the GPU: the device-PM quiesce/D3/restore
@@ -2281,9 +2363,10 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
   different manager); ICL PHY register programming of the
   selected DDI entries (Lane 5 wiring); `display_supported()`
   stays unflipped for Gen11 (Lane 5 flips it); the SAGV
-  *control* pcode command and per-level SAGV admission feed
-  the power manager (Lane 6); the cursor DDB allocation
-  special case belongs to the cursor lane.
+  *control* pcode command and per-level SAGV admission were
+  delivered by the Gen11 power lane (Lane 6:
+  `intel_gpu_gen11_sagv`, `apply_sagv_admission`); the cursor
+  DDB allocation special case belongs to the cursor lane.
 
 ### 10.5 Xe2_LPD — Lunar Lake display 20 (`intel_gpu_xe2lpd`)
 
@@ -2508,7 +2591,11 @@ Public interface:
   `GEN12_MEDIA_ENGINES` and `media_engines_for(gen)` are the
   inventory. The probe path announces exactly this set for a
   probed Gen12 part; no engine-query UAPI exists in the tree
-  yet, and none is claimed here.
+  yet, and none is claimed here. Gen11 (Lane 6) serves
+  `GEN11_MEDIA_ENGINES` — VCS0/VCS2/VECS0, VCS2 at
+  `0x1d0000` (`GEN11_BSD3_RING_BASE`) taking forcewake
+  `VdBox(2)` — never the Gen12 set, which would announce a
+  VCS1 the part does not have.
 - Descriptor — `context_descriptor_for(spec, lrca, sw_id)`
   in `intel_gpu_rcs`: SW id at bits 37:47, engine instance
   at bits 48:53, engine class at bits 61:63 with the

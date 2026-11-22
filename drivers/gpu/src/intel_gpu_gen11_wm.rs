@@ -27,8 +27,9 @@
 //!   `HAS_SAGV_WM` is DISPLAY_VER >= 12, so `skl_build_plane_wm_single`
 //!   never computes one here — `PlaneWatermarks` has no `sagv` /
 //!   `sagv_trans` fields. (`can_sagv`, the per-level SAGV-admission
-//!   flag, feeds the power manager's SAGV enable decision; that is
-//!   Lane 6 work, not a watermark register.)
+//!   flag, feeds the power manager's SAGV enable decision; the
+//!   Gen11 power lane annotates it with [`apply_sagv_admission`]
+//!   — it is not a watermark register.)
 //! - **WaWmMemoryReadLatency adds 2 µs, not 3.** `wm_read_latency`
 //!   returns 2 below DISPLAY_VER 12 (3 on Gen12, 6 on Gen14+).
 //! - **The 16 Gb-DIMM workaround applies on Gen11.**
@@ -74,12 +75,16 @@
 //!    trans_amount 10, DISPLAY_VER ≥ 11).
 //!
 //! Deliberately NOT transcribed: the DG2 ×2 latency multiply
-//! (discrete part), the memory-bandwidth SAGV *control* pcode
-//! command (0x21) — enabling SAGV itself is the bandwidth
-//! manager's call; this module only computes the levels — and the
-//! cursor-allocation special case (`skl_cursor_allocation`,
-//! min 32 blocks single-pipe / 8 multi-pipe), which belongs to
-//! the cursor lane.
+//! (discrete part) and the cursor-allocation special case
+//! (`skl_cursor_allocation`, min 32 blocks single-pipe / 8
+//! multi-pipe), which belongs to the cursor lane. The SAGV
+//! *control* pcode command belongs to the power manager
+//! (`intel_gpu_gen11_sagv`): on display 11 it is the QGV-point
+//! restriction via `ICL_PCODE_SAGV_DE_MEM_SS_CONFIG` (0xe),
+//! not `GEN9_PCODE_SAGV_CONTROL` (0x21) — that is the
+//! pre-ICL (display 9) mechanism. This module only computes
+//! the levels; the per-level SAGV admission flag (`can_sagv`)
+//! is annotated by [`apply_sagv_admission`].
 //!
 //! ## DBUF_CTL power sequencing
 //!
@@ -191,6 +196,12 @@ pub struct WmLevel {
     /// Minimum DDB allocation this level needs to be usable;
     /// compared against the plane's allocation at validation.
     pub min_ddb_alloc: u16,
+    /// Per-level SAGV admission (`skl_compute_wm_levels`):
+    /// this level tolerates the SAGV block time. Annotated by
+    /// [`apply_sagv_admission`], not by the level computation
+    /// itself — the block time comes from the pcode read, not
+    /// the watermark inputs.
+    pub can_sagv: bool,
 }
 
 /// The full watermark set for one plane on Gen11: 8 latency
@@ -342,6 +353,9 @@ fn narrow(raw: RawLevel) -> WmLevel {
         blocks: raw.blocks as u16,
         lines: raw.lines as u16,
         min_ddb_alloc: raw.min_ddb_alloc as u16,
+        // SAGV admission is annotated separately by
+        // apply_sagv_admission; a fresh level admits nothing.
+        can_sagv: false,
     }
 }
 
@@ -390,6 +404,45 @@ pub fn validate_watermarks(wm: &mut PlaneWatermarks, ddb_size: u16) {
         check_level(level, ddb_size);
     }
     check_level(&mut wm.trans, ddb_size);
+}
+
+// ── Per-level SAGV admission (Gen11 power lane) ─────────────
+
+/// Annotate each level's SAGV admission from the adjusted
+/// latency table and the pcode SAGV block time
+/// (`skl_compute_wm_levels`: `if (!HAS_SAGV_WM(display) &&
+/// display->sagv.block_time_us) result->can_sagv = latency >=
+/// display->sagv.block_time_us`). Gen11 has no SAGV watermark
+/// register (`HAS_SAGV_WM` is DISPLAY_VER >= 12), so the
+/// admission flag is the whole SAGV story at the watermark
+/// layer: a level admits SAGV exactly when its latency covers
+/// the block time. A zero block time means the punit has no
+/// SAGV (or SAGV is disabled in BIOS) and no level admits it.
+/// The flag is per level and independent of whether the level
+/// is enabled — Linux sets it while computing the level, before
+/// validation disables levels the DDB cannot satisfy.
+pub fn apply_sagv_admission(
+    wm: &mut PlaneWatermarks,
+    latencies: &[u16; NUM_WM_LEVELS],
+    sagv_block_time_us: u32,
+) {
+    for (level, &latency) in wm.levels.iter_mut().zip(latencies.iter()) {
+        level.can_sagv = sagv_block_time_us != 0 && (latency as u32) >= sagv_block_time_us;
+    }
+}
+
+/// Whether SAGV may be enabled with this plane's watermarks
+/// (`skl_crtc_can_enable_sagv`, single-plane form): every
+/// enabled plane must have a common enabled watermark level
+/// that tolerates latencies above the SAGV block time, i.e.
+/// the plane's *highest* enabled level must admit SAGV. A
+/// plane with no enabled level imposes nothing (Linux skips
+/// disabled planes), so it admits SAGV.
+pub fn can_enable_sagv(wm: &PlaneWatermarks) -> bool {
+    match wm.levels.iter().rposition(|level| level.enable) {
+        None => true,
+        Some(highest) => wm.levels[highest].can_sagv,
+    }
 }
 
 // ── Register encodings ───────────────────────────────────────
@@ -621,6 +674,72 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gen11_wm",
         smoke_compute_zero_latency_and_validation
+    );
+
+    fn smoke_sagv_admission_per_level() -> TestResult {
+        // Latencies [6, 9, 13, 18, 24, 31, 40, 52], SAGV
+        // block time 20 µs: a level admits SAGV exactly when
+        // its latency covers the block time.
+        let lat = [6, 9, 13, 18, 24, 31, 40, 52];
+        let mut wm = compute_plane_watermarks(&params_1080p(), &lat);
+        // Fresh levels admit nothing before annotation.
+        if wm.levels.iter().any(|l| l.can_sagv) {
+            return TestResult::Fail("fresh levels must not admit SAGV");
+        }
+        apply_sagv_admission(&mut wm, &lat, 20);
+        let want = [false, false, false, false, true, true, true, true];
+        for (level, &w) in wm.levels.iter().zip(&want) {
+            if level.can_sagv != w {
+                return TestResult::Fail("per-level SAGV admission wrong");
+            }
+        }
+        // The highest enabled level (L7) admits SAGV, so the
+        // plane admits it.
+        if !can_enable_sagv(&wm) {
+            return TestResult::Fail("plane must admit SAGV when its top level does");
+        }
+        // A 60 µs block time admits no level at all.
+        apply_sagv_admission(&mut wm, &lat, 60);
+        if wm.levels.iter().any(|l| l.can_sagv) || can_enable_sagv(&wm) {
+            return TestResult::Fail("no level may admit SAGV past the longest latency");
+        }
+        // A zero block time (no SAGV in the punit) admits
+        // nothing either.
+        apply_sagv_admission(&mut wm, &lat, 0);
+        if wm.levels.iter().any(|l| l.can_sagv) || can_enable_sagv(&wm) {
+            return TestResult::Fail("a zero block time must admit no SAGV");
+        }
+        // Admission is per level, not per enablement: a level
+        // disabled by validation keeps its flag, but the
+        // enable decision reads the highest *enabled* level.
+        // Block time 26 µs admits L5..L7; validating against
+        // a 20-block DDB leaves only L0/L1 enabled (19 blocks
+        // each), neither of which admits SAGV at 26 µs.
+        apply_sagv_admission(&mut wm, &lat, 26);
+        validate_watermarks(&mut wm, 20);
+        if !wm.levels[0].enable || wm.levels[5].enable {
+            return TestResult::Fail("validation fixture shape wrong");
+        }
+        // L5's flag survives validation (it was annotated
+        // before validation ran).
+        if !wm.levels[5].can_sagv {
+            return TestResult::Fail("validation must not clear the admission flag");
+        }
+        if can_enable_sagv(&wm) {
+            return TestResult::Fail(
+                "SAGV must be refused when the top enabled level cannot take it",
+            );
+        }
+        // No enabled level at all imposes nothing.
+        validate_watermarks(&mut wm, 0);
+        if !can_enable_sagv(&wm) {
+            return TestResult::Fail("a plane with no enabled level must not block SAGV");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_wm",
+        smoke_sagv_admission_per_level
     );
 
     fn smoke_buf_cfg_encoding() -> TestResult {

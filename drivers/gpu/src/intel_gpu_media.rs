@@ -107,9 +107,9 @@
 //!   engines; BCS is a follow-on.
 //! - MTL / LNL / PTL media: the Xe-LPG GT is a different engine
 //!   generation (GuC-era submission); `media_engines_for`
-//!   returns engines only for the Gen12 region generation.
-//!   (Their region tables are modelled; only the media engines
-//!   are not.)
+//!   returns engines only for the Gen12 and Gen11 region
+//!   generations. (Their region tables are modelled; only the
+//!   media engines are not.)
 //! - Codec programming itself (VDBox bitstream control,
 //!   SFC) sits above submission, with the future media
 //!   userspace; this lane delivers the engines, contexts and
@@ -130,6 +130,9 @@ use crate::intel_gpu_regions::RegionGeneration;
 pub const VCS0_BASE: u64 = 0x1C_0000;
 /// VCS1 register block base (i915 `GEN11_BSD2_RING_BASE`).
 pub const VCS1_BASE: u64 = 0x1C_4000;
+/// VCS2 register block base (i915 `GEN11_BSD3_RING_BASE`,
+/// the Gen11 second video-decode engine).
+pub const VCS2_BASE: u64 = 0x1D_0000;
 /// VECS0 register block base (i915 `GEN11_VEBOX_RING_BASE`).
 pub const VECS0_BASE: u64 = 0x1C_8000;
 
@@ -155,6 +158,15 @@ pub const VCS1_SPEC: EngineSpec = EngineSpec {
     base: VCS1_BASE,
     image_pages: MEDIA_IMAGE_PAGES,
 };
+/// VCS2: video-decode class, instance 2 (Gen11 only — ICL
+/// carries VCS0/VCS2, not VCS1).
+pub const VCS2_SPEC: EngineSpec = EngineSpec {
+    name: "vcs2",
+    class: EngineClass::VideoDecode,
+    instance: 2,
+    base: VCS2_BASE,
+    image_pages: MEDIA_IMAGE_PAGES,
+};
 /// VECS0: video-enhancement class, instance 0.
 pub const VECS0_SPEC: EngineSpec = EngineSpec {
     name: "vecs0",
@@ -168,27 +180,36 @@ pub const VECS0_SPEC: EngineSpec = EngineSpec {
 /// order.
 pub const GEN12_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS1_SPEC, VECS0_SPEC];
 
-/// The media engines a region generation carries. Only Gen12
-/// is served: MTL/LNL/PTL GT support does not exist in the tree
-/// (their media engines sit on a separate media GT, not
-/// modelled), so no other generation can be asked about — when a
-/// second generation lands, its (possibly different) set goes
-/// here, not in a second table somewhere else.
+/// The media engines of the Gen11 (Ice Lake / Elkhart Lake /
+/// Jasper Lake) GT, in instance order: VCS0/VCS2/VECS0
+/// (Linux `i915_pci.c::icl_info` engine mask
+/// `RCS0 | BCS0 | VECS0 | VCS0 | VCS2`). VCS2's base is
+/// `GEN11_BSD3_RING_BASE` (0x1d0000,
+/// `gt/intel_engine_cs.c`: VCS2 instance 2 takes the
+/// graphics-ver-11 BSD3 base).
+pub const GEN11_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS2_SPEC, VECS0_SPEC];
+
+/// The media engines a region generation carries. Gen12 and
+/// Gen11 are served; MTL/LNL/PTL GT support does not exist
+/// in the tree (their media engines sit on a separate media
+/// GT, not modelled), so no other generation can be asked
+/// about — when a second generation lands, its (possibly
+/// different) set goes here, not in a second table
+/// somewhere else.
 ///
-/// Gen11 maps to no engines yet, deliberately: ICL's engine
-/// mask is VCS0/VCS2/VECS0 (Linux `i915_pci.c::icl_info`) while
-/// the Gen12 table is VCS0/VCS1/VECS0 and there is no VCS2
-/// selector to express the Gen11 set. The Gen11 media table
-/// lands with the execlists lane, which models the engine set;
-/// until then the probe announce stays silent and `attach_media`
-/// is a no-op on Gen11 rather than claiming a VCS1 that does
-/// not exist on the part.
+/// Gen11's set is VCS0/VCS2/VECS0 (Linux
+/// `i915_pci.c::icl_info`), not the Gen12 VCS0/VCS1/VECS0
+/// set: claiming the Gen12 table would announce a VCS1 the
+/// part does not have. The per-VDBox forcewake sub-domains
+/// (`MediaFwDomain`) are generic over the instance, so VCS2
+/// takes `VdBox(2)` (request 0xA548, ack 0x0D58) with no new
+/// domain code.
 pub fn media_engines_for(gen: RegionGeneration) -> &'static [EngineSpec] {
     match gen {
         RegionGeneration::Gen12 => &GEN12_MEDIA_ENGINES,
         // MTL's media engines sit on a separate media GT, not modelled.
         RegionGeneration::XeLpg => &[],
-        RegionGeneration::Gen11 => &[],
+        RegionGeneration::Gen11 => &GEN11_MEDIA_ENGINES,
         // Lunar Lake (Xe2-LPD) and Panther Lake (Xe3-LPD): their
         // region tables are modelled, but their media engines
         // sit on the same separate media GT as MTL's.
@@ -201,20 +222,24 @@ pub fn media_engines_for(gen: RegionGeneration) -> &'static [EngineSpec] {
 pub enum MediaEngineId {
     /// First video command streamer.
     Vcs0,
-    /// Second video command streamer.
+    /// Second video command streamer (Gen12).
     Vcs1,
+    /// Third video command streamer (Gen11 — ICL carries
+    /// VCS0/VCS2, not VCS1).
+    Vcs2,
     /// Video enhancement command streamer.
     Vecs0,
 }
 
 impl MediaEngineId {
     /// Every media engine, in table order.
-    pub const ALL: [MediaEngineId; 3] = [Self::Vcs0, Self::Vcs1, Self::Vecs0];
+    pub const ALL: [MediaEngineId; 4] = [Self::Vcs0, Self::Vcs1, Self::Vcs2, Self::Vecs0];
     /// The engine's identity.
     pub const fn spec(self) -> EngineSpec {
         match self {
             MediaEngineId::Vcs0 => VCS0_SPEC,
             MediaEngineId::Vcs1 => VCS1_SPEC,
+            MediaEngineId::Vcs2 => VCS2_SPEC,
             MediaEngineId::Vecs0 => VECS0_SPEC,
         }
     }
@@ -1074,14 +1099,25 @@ pub mod tests {
         if media_engines_for(RegionGeneration::Gen12).len() != 3 {
             return TestResult::Fail("inventory for Gen12");
         }
-        // Gen11 serves no media engines yet: its set is
-        // VCS0/VCS2/VECS0, which the Gen12 table cannot express
-        // (no VCS2 selector). Claiming the Gen12 set here would
-        // announce a VCS1 the part does not have.
-        if !media_engines_for(RegionGeneration::Gen11).is_empty() {
-            return TestResult::Fail(
-                "Gen11 media set must stay unmodelled until the execlists lane",
-            );
+        // Gen11 serves VCS0/VCS2/VECS0 (icl_info) — never
+        // the Gen12 VCS0/VCS1/VECS0 set, which would announce
+        // a VCS1 the part does not have.
+        let gen11 = media_engines_for(RegionGeneration::Gen11);
+        if gen11.len() != 3
+            || gen11[0] != VCS0_SPEC
+            || gen11[1] != VCS2_SPEC
+            || gen11[2] != VECS0_SPEC
+        {
+            return TestResult::Fail("Gen11 media set must be VCS0/VCS2/VECS0");
+        }
+        if VCS2_SPEC.class != EngineClass::VideoDecode
+            || VCS2_SPEC.instance != 2
+            || VCS2_SPEC.base != 0x1D_0000
+        {
+            return TestResult::Fail("VCS2 identity wrong (GEN11_BSD3_RING_BASE)");
+        }
+        if VCS2_SPEC.elsp() != 0x1D_0230 || VCS2_SPEC.hws_pga() != 0x1D_0080 {
+            return TestResult::Fail("VCS2 derived engine registers wrong");
         }
         // Derived register addresses land in each engine's own
         // 0x4000 slot.
@@ -1092,8 +1128,12 @@ pub mod tests {
             return TestResult::Fail("derived engine registers");
         }
         // Forcewake sub-domain mapping + register formulas.
+        // VdBox(2) is the Gen11 second decode engine: the
+        // domain table is generic over the instance, so no new
+        // domain code was needed to cover it.
         if MediaFwDomain::of(&VCS0_SPEC) != Some(MediaFwDomain::VdBox(0))
             || MediaFwDomain::of(&VCS1_SPEC) != Some(MediaFwDomain::VdBox(1))
+            || MediaFwDomain::of(&VCS2_SPEC) != Some(MediaFwDomain::VdBox(2))
             || MediaFwDomain::of(&VECS0_SPEC) != Some(MediaFwDomain::VeBox(0))
             || MediaFwDomain::of(&RCS0_SPEC).is_some()
         {
@@ -1101,6 +1141,8 @@ pub mod tests {
         }
         if MediaFwDomain::VdBox(1).set_reg() != 0xA544
             || MediaFwDomain::VdBox(1).ack_reg() != 0x0D54
+            || MediaFwDomain::VdBox(2).set_reg() != 0xA548
+            || MediaFwDomain::VdBox(2).ack_reg() != 0x0D58
             || MediaFwDomain::VeBox(0).set_reg() != 0xA560
             || MediaFwDomain::VeBox(0).ack_reg() != 0x0D70
         {
