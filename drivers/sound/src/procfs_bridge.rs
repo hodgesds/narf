@@ -183,10 +183,88 @@ impl ProcFile for AsoundPcmInfoFile {
     }
 }
 
+/// `/proc/asound/card<N>/id` (Linux `snd_card_id_read`).
+#[derive(Debug)]
+struct AsoundCardIdFile {
+    card_index: u32,
+}
+
+impl ProcFile for AsoundCardIdFile {
+    fn read(&self) -> Vec<u8> {
+        list_cards()
+            .iter()
+            .find(|c| c.index == self.card_index)
+            .map_or_else(Vec::new, |c| format!("{}\n", c.id).into_bytes())
+    }
+}
+
+/// `/proc/asound/card<N>/pcm<M><p|c>/sub0/{hw_params,sw_params,status}`
+/// (Linux `snd_pcm_substream_proc_init`), rendered from the open runtime.
+#[derive(Debug)]
+struct AsoundSubstreamFile {
+    card_index: u32,
+    device: u32,
+    is_capture: bool,
+    file: crate::alsa::SubstreamFile,
+}
+
+impl ProcFile for AsoundSubstreamFile {
+    fn read(&self) -> Vec<u8> {
+        crate::alsa::proc_substream(self.card_index, self.device, self.is_capture, self.file)
+            .into_bytes()
+    }
+}
+
+/// The `sub0` directory of one substream: `info` as the stream's, plus the
+/// three runtime files.
+fn register_substream_procfs(card_index: u32, device: u32, is_capture: bool) {
+    let dir = format!(
+        "asound/card{}/pcm{}{}/sub0",
+        card_index,
+        device,
+        if is_capture { 'c' } else { 'p' }
+    );
+    register_proc(
+        &format!("{}/info", dir),
+        Arc::new(AsoundPcmInfoFile {
+            card_index,
+            device,
+            is_capture,
+        }),
+    );
+    for (name, file) in [
+        ("hw_params", crate::alsa::SubstreamFile::HwParams),
+        ("sw_params", crate::alsa::SubstreamFile::SwParams),
+        ("status", crate::alsa::SubstreamFile::Status),
+    ] {
+        register_proc(
+            &format!("{}/{}", dir, name),
+            Arc::new(AsoundSubstreamFile {
+                card_index,
+                device,
+                is_capture,
+                file,
+            }),
+        );
+    }
+}
+
 // ── Registration entry points ─────────────────────────────────────────
 
 /// Register `/proc/asound/card<N>/*` entries for a single card.
 pub fn register_card_procfs(card: &crate::CardInfo) {
+    register_proc(
+        &format!("asound/card{}/id", card.index),
+        Arc::new(AsoundCardIdFile {
+            card_index: card.index,
+        }),
+    );
+    for m in 0..card.playback_count {
+        register_substream_procfs(card.index, m, false);
+    }
+    for m in 0..card.capture_count {
+        register_substream_procfs(card.index, m, true);
+    }
     for codec in 0..1u32 {
         register_proc(
             &format!("asound/card{}/codec#{}", card.index, codec),

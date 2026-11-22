@@ -14,6 +14,7 @@ pub(crate) use control::Control;
 use narf_filesystem::{FsError, IoctlContext};
 pub(crate) use pcm::suspend_card;
 pub(crate) use pcm::Pcm;
+pub(crate) use pcm::{proc_substream, SubstreamFile};
 
 pub(crate) fn get32(b: &[u8], at: usize) -> u32 {
     u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())

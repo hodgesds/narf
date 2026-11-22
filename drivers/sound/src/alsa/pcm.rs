@@ -289,6 +289,135 @@ impl core::fmt::Debug for Pcm {
     }
 }
 static STREAMS: IrqSafeSpinLock<Vec<Weak<Pcm>>> = IrqSafeSpinLock::new(Vec::new());
+
+/// A `/proc/asound/cardN/pcmMx/sub0` runtime file.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum SubstreamFile {
+    HwParams,
+    SwParams,
+    Status,
+}
+
+/// `snd_pcm_substream_proc_{hw_params,sw_params,status}_read`
+/// (sound/core/pcm.c) for the open runtime of one substream: `closed`
+/// without one, `no setup` before HW_PARAMS. A runtime in the middle of an
+/// ioctl reads `busy` rather than blocking the proc reader on it.
+pub(crate) fn proc_substream(
+    card: u32,
+    device: u32,
+    capture: bool,
+    file: SubstreamFile,
+) -> alloc::string::String {
+    let streams = STREAMS.lock().clone();
+    for pcm in streams.iter().filter_map(Weak::upgrade) {
+        if pcm.card != card
+            || pcm.device != device
+            || pcm.capture != capture
+            || pcm.closed.load(Ordering::Acquire)
+        {
+            continue;
+        }
+        return match pcm.runtime.try_lock() {
+            Some(r) => r.proc_text(capture, file),
+            None => "busy\n".into(),
+        };
+    }
+    "closed\n".into()
+}
+
+/// `snd_pcm_state_names`.
+fn state_name(state: u32) -> &'static str {
+    match state {
+        OPEN => "OPEN",
+        SETUP => "SETUP",
+        PREPARED => "PREPARED",
+        RUNNING => "RUNNING",
+        XRUN => "XRUN",
+        DRAINING => "DRAINING",
+        PAUSED => "PAUSED",
+        SUSPENDED => "SUSPENDED",
+        _ => "DISCONNECTED",
+    }
+}
+
+/// `snd_pcm_access_names`.
+fn access_name(access: u32) -> &'static str {
+    match access {
+        0 => "MMAP_INTERLEAVED",
+        1 => "MMAP_NONINTERLEAVED",
+        2 => "MMAP_COMPLEX",
+        3 => "RW_INTERLEAVED",
+        _ => "RW_NONINTERLEAVED",
+    }
+}
+
+/// `snd_pcm_format_names` for the formats the sound core carries.
+fn format_name(format: crate::format::SampleFormat) -> &'static str {
+    use crate::format::SampleFormat;
+    match format {
+        SampleFormat::S16LE => "S16_LE",
+        SampleFormat::S20LE => "S20_LE",
+        SampleFormat::S24LE => "S24_LE",
+        SampleFormat::S32LE => "S32_LE",
+    }
+}
+
+impl Runtime {
+    /// The body of one `sub0` runtime file, in Linux's layout. Lines Linux
+    /// prints from state this runtime does not keep (`owner_pid`,
+    /// `avail_max`, `tstamp_mode`, `period_step`) are left out rather than
+    /// filled with made-up values.
+    fn proc_text(&self, capture: bool, file: SubstreamFile) -> alloc::string::String {
+        let Some(params) = self.params.filter(|_| self.state != OPEN) else {
+            return "no setup\n".into();
+        };
+        match file {
+            SubstreamFile::HwParams => alloc::format!(
+                "access: {}\nformat: {}\nsubformat: STD\nchannels: {}\nrate: {} ({}/1)\n\
+                 period_size: {}\nbuffer_size: {}\n",
+                access_name(self.access),
+                format_name(params.format),
+                params.channels.count(),
+                params.rate.hz(),
+                params.rate.hz(),
+                params.period_size,
+                self.frames()
+            ),
+            SubstreamFile::SwParams => alloc::format!(
+                "avail_min: {}\nstart_threshold: {}\nstop_threshold: {}\n\
+                 silence_threshold: {}\nsilence_size: {}\nboundary: {}\n",
+                self.avail_min,
+                self.start_threshold,
+                self.stop_threshold,
+                self.silence_threshold,
+                self.silence_size,
+                self.boundary
+            ),
+            SubstreamFile::Status => {
+                let delay = if capture {
+                    self.hw.saturating_sub(self.appl)
+                } else {
+                    self.appl.saturating_sub(self.hw)
+                };
+                let now = self.timestamp();
+                alloc::format!(
+                    "state: {}\ntrigger_time: {}.{:09}\ntstamp      : {}.{:09}\n\
+                     delay       : {}\navail       : {}\n-----\n\
+                     hw_ptr      : {}\nappl_ptr    : {}\n",
+                    state_name(self.state),
+                    self.trigger_ns / 1_000_000_000,
+                    self.trigger_ns % 1_000_000_000,
+                    now / 1_000_000_000,
+                    now % 1_000_000_000,
+                    delay,
+                    self.avail(capture),
+                    self.hw % self.boundary,
+                    self.appl % self.boundary
+                )
+            }
+        }
+    }
+}
 static PUMP_INSTALLED: AtomicBool = AtomicBool::new(false);
 fn pump() {
     let streams = {
