@@ -2555,3 +2555,102 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_time_precision_clock_fd_and_permissions
 );
+
+// ── NTP steering of the clocks programs read ──────────────────────────
+
+fn clock_gettime_ns(clock: u64) -> Option<i128> {
+    let mut ts = [0i64; 2];
+    match call(
+        Syscall::ClockGetTime.raw(),
+        a1(clock, ts.as_mut_ptr() as u64),
+    ) {
+        Some(0) => Some(i128::from(ts[0]) * 1_000_000_000 + i128::from(ts[1])),
+        _ => None,
+    }
+}
+
+/// One `(reference, clock)` reading: `reference` read on both sides of
+/// `clock` and averaged; of five tries the tightest bracket wins, so an
+/// interrupt between the reads costs nothing.
+fn bracketed(clock: u64, reference: &dyn Fn() -> Option<i128>) -> Option<(i128, i128)> {
+    let mut best: Option<(i128, i128, i128)> = None;
+    for _ in 0..5 {
+        let r1 = reference()?;
+        let c = clock_gettime_ns(clock)?;
+        let r2 = reference()?;
+        if best.is_none_or(|(spread, _, _)| r2 - r1 < spread) {
+            best = Some((r2 - r1, (r1 + r2) / 2, c));
+        }
+    }
+    best.map(|(_, r, c)| (r, c))
+}
+
+/// How much faster than `reference` the syscall clock `clock` advances over
+/// a 50 ms busy wait, in ppm.
+fn clock_rate_ppm(clock: u64, reference: &dyn Fn() -> Option<i128>) -> Result<i64, &'static str> {
+    let (r0, c0) = bracketed(clock, reference).ok_or("clock_gettime failed")?;
+    while reference().ok_or("clock_gettime failed")? < r0 + 50_000_000 {
+        core::hint::spin_loop();
+    }
+    let (r1, c1) = bracketed(clock, reference).ok_or("clock_gettime failed")?;
+    Ok((((c1 - c0) - (r1 - r0)) * 1_000_000 / (r1 - r0)) as i64)
+}
+
+/// `adjtimex(ADJ_FREQUENCY)` steers CLOCK_MONOTONIC, CLOCK_BOOTTIME and
+/// CLOCK_REALTIME and leaves CLOCK_MONOTONIC_RAW alone, as Linux does:
+/// `timekeeping_adjust` scales `tk->tkr_mono.mult`, which all three share,
+/// while `tkr_raw` keeps the clocksource's own multiplier. NARF answered
+/// CLOCK_MONOTONIC (and RAW, and BOOTTIME) from the counter clock, so a
+/// time daemon's frequency correction never reached it.
+fn smoke_abi_time_ntp_frequency_steers_monotonic_not_raw() -> TestResult {
+    with_setup(|| {
+        let set_freq = |scaled_ppm: i64| {
+            let mut tx = [0u64; TX_WORDS];
+            tx[TX_MODES] = ADJ_FREQUENCY;
+            tx[TX_FREQ] = scaled_ppm as u64;
+            call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64))
+        };
+        let raw = || clock_gettime_ns(CLOCK_MONOTONIC_RAW);
+        let kernel = || Some(i128::from(narf_scheduler::narf_time::monotonic_ns()));
+        if set_freq(500 << 16).is_none() {
+            return Err("adjtimex(ADJ_FREQUENCY) failed");
+        }
+        let verdict = (|| {
+            for (clock, what) in [
+                (
+                    CLOCK_MONOTONIC,
+                    "ADJ_FREQUENCY +500 ppm did not steer CLOCK_MONOTONIC",
+                ),
+                (
+                    CLOCK_BOOTTIME,
+                    "ADJ_FREQUENCY +500 ppm did not steer CLOCK_BOOTTIME",
+                ),
+                (
+                    CLOCK_REALTIME,
+                    "ADJ_FREQUENCY +500 ppm did not steer CLOCK_REALTIME",
+                ),
+            ] {
+                if !(480..=520).contains(&clock_rate_ppm(clock, &raw)?) {
+                    return Err(what);
+                }
+            }
+            if clock_rate_ppm(CLOCK_MONOTONIC_RAW, &kernel)?.abs() > 20 {
+                return Err("CLOCK_MONOTONIC_RAW must keep the counter's rate");
+            }
+            Ok(())
+        })();
+        let restored = set_freq(0);
+        verdict?;
+        if restored.is_none() {
+            return Err("restoring frequency 0 failed");
+        }
+        if clock_rate_ppm(CLOCK_MONOTONIC, &raw)?.abs() > 20 {
+            return Err("frequency 0 must return CLOCK_MONOTONIC to the counter's rate");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/clock-steer",
+    smoke_abi_time_ntp_frequency_steers_monotonic_not_raw
+);

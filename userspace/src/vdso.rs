@@ -251,3 +251,89 @@ fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
         core::ptr::write_volatile(seq_ptr, (seq | 1).wrapping_add(1)); // even
     }
 }
+
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// `update_vsyscall` publishes the steered timekeeper, the clock data the
+    /// vDSO's CLOCK_MONOTONIC, BOOTTIME and REALTIME are computed from
+    /// (`vdso_clock`'s `cycle_last`, `basetime`, `mult`, `shift`), and the
+    /// counter's own scale for CLOCK_MONOTONIC_RAW. `struct vvar` in
+    /// `verification/data/vdso/vdso.c`: `mult`/`shift` at 16/20 are the steered
+    /// pair, `cycle_last` at 40, `base_ns` at 48, `raw_mult`/`raw_shift` at
+    /// 56/60. While `adjtimex` holds +500 ppm, the published multiplier must be
+    /// the steered one, and the vDSO's arithmetic on the page must agree with
+    /// the kernel's CLOCK_MONOTONIC and CLOCK_MONOTONIC_RAW.
+    fn smoke_vdso_vvar_publishes_the_steered_clock() -> TestResult {
+        use narf_scheduler::narf_time;
+        let Some(frame) = VDSO.lock().as_ref().map(|img| img.vvar_frame) else {
+            return TestResult::Skip("no vDSO image registered");
+        };
+        let read_u64 = |off: usize| {
+            // SAFETY: identity-mapped vvar frame; off+8 <= 4096.
+            unsafe { core::ptr::read_volatile(frame.kernel_ptr::<u8>().add(off) as *const u64) }
+        };
+        narf_time::ntp::__test_reset();
+        let mut tx = narf_time::ntp::Timex {
+            modes: narf_time::ntp::ADJ_FREQUENCY,
+            freq: 500 << 16,
+            ..Default::default()
+        };
+        let _ = narf_time::ntp::adjtimex(&mut tx, 0, 0);
+        let verdict = (|| {
+            let (raw_mult, raw_shift) = narf_time::cyc_to_ns_mult_shift();
+            // One consistent copy of the page, under its seqlock.
+            let (mult, shift, cycle_last, base_ns, vraw_mult, vraw_shift) = loop {
+                let seq = read_u32(frame, VVAR_SEQ);
+                if seq & 1 != 0 {
+                    continue;
+                }
+                fence(Ordering::Acquire);
+                let page = (
+                    read_u32(frame, VVAR_MULT),
+                    read_u32(frame, VVAR_SHIFT),
+                    read_u64(40),
+                    read_u64(48),
+                    read_u32(frame, 56),
+                    read_u32(frame, 60),
+                );
+                fence(Ordering::Acquire);
+                if read_u32(frame, VVAR_SEQ) == seq {
+                    break page;
+                }
+            };
+            let want = u64::from(raw_mult) + u64::from(raw_mult) / 2000;
+            if u64::from(mult).abs_diff(want) > 2 {
+                return Err("the vvar multiplier is not the +500 ppm steered one");
+            }
+            if vraw_mult != raw_mult || vraw_shift != raw_shift {
+                return Err("the vvar raw scale is not the counter's");
+            }
+            let (mono, raw, cyc) = narf_lib::sync::without_interrupts(|| {
+                let cyc = narf_time::now_cycles();
+                (
+                    narf_time::steer::monotonic_ns(),
+                    narf_time::monotonic_ns(),
+                    cyc,
+                )
+            });
+            let since = u128::from(cyc.saturating_sub(cycle_last));
+            let vdso_mono = base_ns + ((since * u128::from(mult)) >> shift) as u64;
+            let vdso_raw = ((u128::from(cyc) * u128::from(vraw_mult)) >> vraw_shift) as u64;
+            if vdso_mono.abs_diff(mono) > 2_000 {
+                return Err("the vDSO's CLOCK_MONOTONIC disagrees with the kernel's");
+            }
+            if vdso_raw.abs_diff(raw) > 2_000 {
+                return Err("the vDSO's CLOCK_MONOTONIC_RAW disagrees with the kernel's");
+            }
+            Ok(())
+        })();
+        narf_time::ntp::__test_reset();
+        match verdict {
+            Ok(()) => TestResult::Pass,
+            Err(why) => TestResult::Fail(why),
+        }
+    }
+    kernel_test_in!("vdso/steer", smoke_vdso_vvar_publishes_the_steered_clock);
+}
