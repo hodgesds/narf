@@ -243,15 +243,21 @@ fn mt76_ht20_amsdu_receive_and_unsolicited_ampdu_never_consume_pn() -> TestResul
         } else {
             native_data_packet(true)
         };
+        // mt76_rx_aggr_reorder: an A-MPDU subframe with no BA agreement is
+        // delivered unreordered and consumes its PN like any other MPDU.
         let mut aggregate = valid.clone();
         aggregate[8..12].copy_from_slice(&0u32.to_le_bytes());
         session.backend.packets.push_back(aggregate);
-        if session.receive_ethernet() != Ok(None) {
-            return TestResult::Fail("unsolicited HT A-MPDU bypassed absent BA/reorder owner");
+        if session.receive_ethernet().ok().flatten().is_none() {
+            return TestResult::Fail("HT A-MPDU subframe without a BA agreement was dropped");
         }
         session.backend.packets.push_back(valid);
-        if session.receive_ethernet().ok().flatten().is_none() {
-            return TestResult::Fail("rejected A-MPDU consumed the ordinary frame's PN");
+        let replayed = session.receive_ethernet().ok().flatten();
+        if secured && replayed.is_some() {
+            return TestResult::Fail("A-MPDU subframe did not consume its PN");
+        }
+        if !secured && replayed.is_none() {
+            return TestResult::Fail("ordinary open-network frame after an A-MPDU was dropped");
         }
     }
     TestResult::Pass

@@ -5,6 +5,26 @@ use super::{ba, scan::NativeRx, station::Command, Backend, Error, Session};
 use alloc::vec;
 
 impl<B: Backend> Session<B> {
+    /// A unicast A-MPDU subframe from the AP on `tid` with no active
+    /// recipient agreement; `qos` is its first QoS control octet. mt76
+    /// delivers it unreordered (`mt76_rx_aggr_reorder`), and mac80211
+    /// `ieee80211_rx_reorder_ampdu` answers a Block Ack policy subframe on a
+    /// TID with no session with one recipient DELBA
+    /// (WLAN_REASON_QSTA_REQUIRE_SETUP) per TID until a session starts, so
+    /// the originator stops aggregating or negotiates again.
+    pub(super) fn unexpected_aggregate(&mut self, tid: u8, qos: u8, own: [u8; 6], peer: [u8; 6]) {
+        const IEEE80211_QOS_CTL_ACK_POLICY_MASK: u8 = 0x60;
+        const IEEE80211_QOS_CTL_ACK_POLICY_BLOCKACK: u8 = 0x60;
+        if qos & IEEE80211_QOS_CTL_ACK_POLICY_MASK != IEEE80211_QOS_CTL_ACK_POLICY_BLOCKACK {
+            return;
+        }
+        if self.station.control_pending.len() < 4 && self.station.rx_ba.unexpected(tid) {
+            self.station
+                .control_pending
+                .push_back(ba::Owner::unexpected_delba(tid, own, peer));
+        }
+    }
+
     /// Process only this AP's exact, unfragmented native action/BAR profile.
     pub(super) fn receive_ba_control(
         &mut self,

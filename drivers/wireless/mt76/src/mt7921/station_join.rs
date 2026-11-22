@@ -825,19 +825,27 @@ impl<B: Backend> Session<B> {
             receiver.clear();
             return None;
         };
-        let tid = usize::from(*qos & 15);
-        if native.ampdu && !self.station.rx_ba.amsdu(tid as u8) {
+        let qos = *qos;
+        let tid = usize::from(qos & 15);
+        let active = self.station.rx_ba.active(tid as u8);
+        // A-MSDU inside an A-MPDU needs an agreement that negotiated it.
+        if native.ampdu && active && !self.station.rx_ba.amsdu(tid as u8) {
             receiver.clear();
             return None;
         }
-        if self.station.rx_ba.owns(tid as u8)
-            && (!self.station.rx_ba.active(tid as u8)
-                || native.wcid != u16::from(self.station.link.peer())
+        if active
+            && (native.wcid != u16::from(self.station.link.peer())
                 || usize::from(native.tid) != tid)
         {
             receiver.clear();
             return None;
         }
+        // mt76 `mt76_rx_aggr_reorder`: with no active agreement the MPDU is
+        // delivered unreordered (see `receive_ethernet`).
+        if native.ampdu && !active && native.frame.get(4..10) == Some(&own[..]) {
+            self.unexpected_aggregate(tid as u8, qos, own, peer);
+        }
+        let receiver = self.station.ht20_rx.as_mut()?;
         // A frame the hardware decrypted under another cipher is dropped.
         if let (Some(ccmp), Some(security)) = (native.ccmp, self.station.security.as_ref()) {
             if !security.decrypted_by(&ccmp) {
@@ -1546,15 +1554,22 @@ impl<B: Backend> Session<B> {
             let qos = (header[0] == 0x88).then(|| frame.get(24..26)).flatten();
             let tid = qos.map(|qos| qos[0] & 15);
             let reordered = tid.is_some_and(|tid| self.station.rx_ba.active(tid));
-            if (native.ampdu || tid.is_some_and(|tid| self.station.rx_ba.owns(tid)))
-                && (!reordered
-                    || native.wcid != u16::from(self.station.link.peer())
+            if reordered
+                && (native.wcid != u16::from(self.station.link.peer())
                     || tid != Some(native.tid)
                     || header[4..10] != own
                     || header[22] & 15 != 0
                     || qos.is_none_or(|q| q[1] != 0 || !matches!(q[0] & 0xe0, 0 | 0x60)))
             {
                 continue;
+            }
+            // mt76 `mt76_rx_aggr_reorder`: with no active agreement on the
+            // TID (none, still being set up, or stopped) the subframe is
+            // delivered unreordered and still meets the PN check below.
+            if native.ampdu && !reordered && header[4..10] == own {
+                if let (Some(tid), Some(q)) = (tid, qos) {
+                    self.unexpected_aggregate(tid, q[0], own, peer);
+                }
             }
             let protected = header[1] & 0x40 != 0;
             let mut normalized;

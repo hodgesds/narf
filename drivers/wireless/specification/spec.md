@@ -1213,6 +1213,14 @@ key and TID, and advances only after valid peer/address/body admission. The
 shared RSNA engine handles subsequent PTK and GTK exchanges; fresh installed
 keys reset only their own PN windows.
 
+An A-MPDU subframe is reordered only under an active recipient agreement for
+its TID. With none (never negotiated, still being set up, or retired) it is
+delivered unreordered and meets the same PN check, as `mt76_rx_aggr_reorder`
+leaves it queued; a Block Ack policy subframe on a TID with no agreement
+queues one recipient DELBA (WLAN_REASON_QSTA_REQUIRE_SETUP) per TID until an
+agreement activates again (mac80211 `ieee80211_rx_reorder_ampdu`,
+`unexpected_agg`).
+
 Matching AP deauthentication/disassociation closes packet admission and queues
 firmware teardown. Disconnect waits for pending TX retirement, removes keys
 and resets both WTBL entries, updates the BSS and returns to `ScanReady` only

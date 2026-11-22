@@ -705,9 +705,11 @@ fn retirement() -> Result<(), &'static str> {
         {
             return Err("BA native disable/reset/recipient DELBA order");
         }
+        // mt76_rx_aggr_reorder: with the agreement gone the subframe is
+        // delivered unreordered, after the PN check.
         session.backend.packets.push_back(data(0, 1, Some(1), 1));
-        if session.receive_ethernet() != Ok(None) {
-            return Err("retired BA accepted unsolicited A-MPDU");
+        if session.receive_ethernet() != Ok(expected(1)) {
+            return Err("retired BA dropped a later A-MPDU subframe");
         }
     }
     Ok(())
