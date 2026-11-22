@@ -462,6 +462,18 @@ fn hw_ip_count(snap: &Snapshot, submission: Submission, ip: u32) -> Result<Vec<u
             "AMDGPU_INFO_HW_IP_COUNT: no such IP block on this ASIC, EINVAL on Linux too (amdgpu_info_ioctl)",
         ));
     }
+    // `amdgpu_ip_get_block_type`: without a JPEG block (Navi24's VCN
+    // 3.0.33), a JPEG query names the VCN block, whose count is
+    // `num_vcn_inst`. The count then follows that block's rings.
+    let ip = match discovery::find_ip(&snap.ip_blocks, discovery::HW_ID_VCN, 0) {
+        Some(vcn)
+            if ip == uapi::AMDGPU_HW_IP_VCN_JPEG
+                && !crate::amdgpu_vcn_navi22::has_jpeg((vcn.major, vcn.minor, vcn.revision)) =>
+        {
+            uapi::AMDGPU_HW_IP_VCN_DEC
+        }
+        _ => ip,
+    };
     let count = if available_rings(&snap.navi22, submission, ip) == 0 {
         0
     } else {

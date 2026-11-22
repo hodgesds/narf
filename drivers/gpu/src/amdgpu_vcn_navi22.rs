@@ -586,17 +586,9 @@ impl Layout {
             _ => None,
         }
     }
-    /// Whether the VCN has a JPEG engine to drive.
-    /// `amdgpu_discovery_set_mm_ip_blocks` adds `jpeg_v3_0` beside
-    /// `vcn_v3_0` for UVD 3.0.0, 3.0.2, 3.0.16, 3.1.1 and 3.1.2, but not for
-    /// Beige Goby's (Navi24) 3.0.33. Discovery compares the revision without
-    /// its encode/decode capability bits [7:6], as here.
+    /// Whether the VCN has a JPEG engine to drive ([`has_jpeg`]).
     pub(crate) fn has_jpeg(&self) -> bool {
-        let (major, minor, revision) = self.vcn_version;
-        matches!(
-            (major, minor, revision & 0x3f),
-            (3, 0, 0) | (3, 0, 2) | (3, 0, 16) | (3, 1, 1) | (3, 1, 2)
-        )
+        has_jpeg(self.vcn_version)
     }
     /// `jpeg_v3_0_early_init` reads `CC_UVD_HARVESTING` except on VCN
     /// 3.1.1/3.1.2.
@@ -749,6 +741,17 @@ fn invalidate<I: Io>(io: &mut I, l: Layout) {
         io.read(invalidate);
     }
     barrier(Ordering::SeqCst);
+}
+/// Whether a VCN of discovered `version` has a JPEG engine.
+/// `amdgpu_discovery_set_mm_ip_blocks` adds `jpeg_v3_0` beside `vcn_v3_0`
+/// for UVD 3.0.0, 3.0.2, 3.0.16, 3.1.1 and 3.1.2, but not for Beige Goby's
+/// (Navi24) 3.0.33. Discovery compares the revision without its
+/// encode/decode capability bits [7:6], as here.
+pub(crate) fn has_jpeg((major, minor, revision): (u8, u8, u8)) -> bool {
+    matches!(
+        (major, minor, revision & 0x3f),
+        (3, 0, 0) | (3, 0, 2) | (3, 0, 16) | (3, 1, 1) | (3, 1, 2)
+    )
 }
 /// Instance 0's discovered VCN version.
 fn vcn_version(gpu: &AmdGpu) -> Result<(u8, u8, u8), Error> {
