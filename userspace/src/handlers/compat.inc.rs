@@ -4657,6 +4657,13 @@ pub(crate) fn current_clone_mount_subtree(
         if !seen.insert(relative.clone()) {
             continue;
         }
+        // A mount covered by a later one over a directory above it is out of
+        // reach from the source, and `current_fs_arc_at` would answer for
+        // its path with the covering filesystem instead.
+        let covering = current_covering_mount_info(&mount_path);
+        if covering.is_none_or(|(path, _)| path != mount_path) {
+            continue;
+        }
         if let Some(fs) = current_fs_arc_at(&mount_path) {
             descendants.push((relative, fs));
         }
@@ -4735,10 +4742,12 @@ pub(crate) fn current_mount_arc_with_source(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
+    // `graft_tree`: a mount a task makes goes on top of whatever is mounted
+    // at or below `path`, and covers it.
     let r = if let Some(ns) = current_mount_namespace() {
-        ns.mount_arc_with_source(authority, path, fs, flags, devname)
+        ns.mount_arc_on_top(authority, path, fs, flags, devname)
     } else {
-        narf_filesystem::registry().mount_arc_with_source(authority, path, fs, flags, devname)
+        narf_filesystem::registry().mount_arc_on_top(authority, path, fs, flags, devname)
     };
     // Mount propagation: a filesystem mount attached under a shared mount is
     // mirrored into every peer namespace (Linux `propagate_mnt`). No-op unless
@@ -4967,7 +4976,13 @@ fn propagate_new_mount(new_path: &str) {
             continue;
         }
         let child = join(&peer_path);
-        let _ = narf_filesystem::registry().mount_arc_with_flags(&auth, &child, fs.clone(), flags);
+        let _ = narf_filesystem::registry().mount_arc_on_top(
+            &auth,
+            &child,
+            fs.clone(),
+            flags,
+            None,
+        );
     }
     // Peers in every distinct private namespace.
     for ns in unique_private_mount_namespaces() {
@@ -4979,7 +4994,7 @@ fn propagate_new_mount(new_path: &str) {
                 continue;
             }
             let child = join(&peer_path);
-            let _ = ns.mount_arc_with_flags(&auth, &child, fs.clone(), flags);
+            let _ = ns.mount_arc_on_top(&auth, &child, fs.clone(), flags, None);
         }
     }
 }
@@ -4992,10 +5007,11 @@ fn current_bind_mount(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
+    // On top, as `do_loopback` grafts it (see `current_mount_arc_with_source`).
     let r = if let Some(ns) = current_mount_namespace() {
-        ns.bind_mount(authority, source, target)
+        ns.bind_mount_on_top(authority, source, target)
     } else {
-        narf_filesystem::registry().bind_mount(authority, source, target)
+        narf_filesystem::registry().bind_mount_on_top(authority, source, target)
     };
     // Mount propagation: a bind attached under a shared mount is mirrored into
     // every peer namespace (Linux `propagate_mnt`). Only fires when the parent
