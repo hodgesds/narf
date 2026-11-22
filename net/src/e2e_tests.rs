@@ -2839,6 +2839,114 @@ fn smoke_udp_first_datagram_flushes_after_arp_reply() -> TestResult {
 }
 kernel_test_in!("net/e2e", smoke_udp_first_datagram_flushes_after_arp_reply);
 
+// ── ARP replies leave the device the request arrived on ─────────────────────
+//
+// Two NICs on one subnet (the desktop's eth0 192.168.3.165/22 and wlan0
+// 192.168.1.211/22). Linux `arp_process` with the defaults arp_ignore=0 and
+// arp_filter=0 answers a request for ANY local address from the receiving
+// device, with that device's own MAC:
+//   arp_send_dst(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip, sha, dev->dev_addr, sha)
+// A DAD probe (sender 0.0.0.0, RFC 2131) for a local address is answered the
+// same way and teaches the cache nothing. NARF answered from the device that
+// owns the address — its MAC, transmitted on the other NIC — and cached the
+// probe's 0.0.0.0 sender.
+fn smoke_arp_reply_leaves_the_ingress_device() -> TestResult {
+    use crate::pkt::{write_arp, ArpPacket, ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP};
+    const A: &str = "e2e-arp-in-a";
+    const B: &str = "e2e-arp-in-b";
+    const A_IP: [u8; 4] = [10, 31, 3, 165];
+    const B_IP: [u8; 4] = [10, 31, 1, 211];
+    const GW: [u8; 4] = [10, 31, 1, 1];
+    const A_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x05];
+    const B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x31, 0x0b];
+    const ROUTER_MAC: [u8; 6] = [0x86, 0x43, 0x42, 0xa5, 0x25, 0x61];
+    const PROBER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x31, 0x99];
+    static B_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+    fn capture_b(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn arp_body(op: u16, sha: [u8; 6], spa: [u8; 4], tpa: [u8; 4]) -> [u8; 28] {
+        let mut body = [0u8; 28];
+        let _ = write_arp(
+            &mut body,
+            &ArpPacket {
+                op,
+                sha,
+                spa,
+                tha: [0; 6],
+                tpa,
+            },
+        );
+        body
+    }
+    fn arp_frames(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .filter(|f| f.len() >= ETH_HDR_LEN + 28 && f[12..14] == ETHERTYPE_ARP.to_be_bytes())
+            .cloned()
+            .collect()
+    }
+
+    full_reset(A, A_IP, GW);
+    iface::set_iface_ipv4_fields(A, A_IP, GW);
+    iface::register(B, B_MAC, capture_b);
+    iface::set_link_state(B, true);
+    iface::set_iface_ipv4_fields(B, B_IP, GW);
+    iface::add_addr(B, B_IP, 22);
+    drain_captured();
+    B_TX.lock().clear();
+
+    // The router asks for B's address; the broadcast reaches A first.
+    let request = arp_body(ARP_OP_REQUEST, ROUTER_MAC, GW, B_IP);
+    crate::tcp_stack::handle_arp_on_in(&request, 0, Some(A));
+    let on_a = arp_frames(&drain_captured());
+    let on_b = arp_frames(&::core::mem::take(&mut *B_TX.lock()));
+    if !on_b.is_empty() {
+        return TestResult::Fail("ARP request on A was answered on B");
+    }
+    let [reply] = on_a.as_slice() else {
+        return TestResult::Fail("ARP request on A for a local address got no single reply on A");
+    };
+    let arp = &reply[ETH_HDR_LEN..];
+    if reply[..6] != ROUTER_MAC
+        || reply[6..12] != A_MAC
+        || u16::from_be_bytes([arp[6], arp[7]]) != ARP_OP_REPLY
+        || arp[8..14] != A_MAC
+        || arp[14..18] != B_IP
+        || arp[18..24] != ROUTER_MAC
+        || arp[24..28] != GW
+    {
+        return TestResult::Fail("ARP reply on A is not from A's MAC for the requested address");
+    }
+
+    // A DAD probe for A's address arrives on B.
+    let probe = arp_body(ARP_OP_REQUEST, PROBER_MAC, [0; 4], A_IP);
+    crate::tcp_stack::handle_arp_on_in(&probe, 0, Some(B));
+    let on_a = arp_frames(&drain_captured());
+    let on_b = arp_frames(&::core::mem::take(&mut *B_TX.lock()));
+    if !on_a.is_empty() {
+        return TestResult::Fail("DAD probe on B was answered on A");
+    }
+    let [reply] = on_b.as_slice() else {
+        return TestResult::Fail("DAD probe for a local address got no single reply on B");
+    };
+    let arp = &reply[ETH_HDR_LEN..];
+    if reply[..6] != PROBER_MAC
+        || arp[8..14] != B_MAC
+        || arp[14..18] != A_IP
+        || arp[18..24] != PROBER_MAC
+        || arp[24..28] != [0; 4]
+    {
+        return TestResult::Fail("DAD probe reply is not from B's MAC to the prober");
+    }
+    if arp_cache::lookup(B, [0; 4]).is_some() {
+        return TestResult::Fail("a DAD probe taught the ARP cache a 0.0.0.0 neighbour");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/arp-ingress", smoke_arp_reply_leaves_the_ingress_device);
+
 fn smoke_udp_pending_datagram_dropped_on_iface_namespace_move() -> TestResult {
     const IFACE: &str = "e2e-udp-netns-move";
     const LOCAL_IP: [u8; 4] = [10, 24, 0, 15];
