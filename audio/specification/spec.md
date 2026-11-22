@@ -311,6 +311,38 @@ INTx. A direct _PRT GSI can join an existing compatible shared vector;
 named interrupt-link routes fall back to polling. A 2 ms service timer
 handles DMA accounting even without IRQ routing; jack refresh runs at 100 ms.
 
+HDA command and power model (Linux `codec_exec_verb`, `azx_rirb_get_response`,
+`azx_runtime_suspend`/`resume`). `IntelHda::send_verb` wakes a parked
+controller (`ensure_active`, Linux `snd_hda_power_up_pm`), then runs the
+command under the command lease, which a synchronous caller waits for
+(bounded) instead of failing `Busy`. A command that finds the controller
+parked under the lease is refused with `HdaError::Suspended` and wakes it
+again; `send_verb_async` (the jack service) never wakes one and returns
+`Suspended`. `Card::open`, `refresh_hdmi` and `refresh_jacks` wake the
+controller before sensing pins. The last PCM stop parks the controller
+(codecs D3, link reset); park and wake serialise on a PM lock, the park runs
+under the command lease and sets `suspended` before the reset, and the
+wake restarts the link and command I/O under the lease before the codecs
+are re-initialised with ungated commands. A command that times out or is
+cancelled poisons the transport; the next command, or `ensure_active`,
+restarts both rings (`init_cmd_io`, after `snd_hdac_bus_stop_cmd_io` /
+`snd_hdac_bus_init_cmd_io`, GCTL.UNSOL included) and a synchronous command
+is retried once, so one lost response never disables the controller. A
+command engine found stopped with the link in reset outside a park (a
+function reset or power loss) marks the controller parked for a full
+re-initialisation.
+
+Probe follows `snd_hdac_bus_reset_link` (STATESTS cleared while the link is
+up, 1 ms in reset, 1.2 ms for codec wake) and `azx_probe_codecs`: the vendor
+id of every slot in the codec mask (four slots) is read first, a slot that
+does not answer is dropped and the controller reset, then the answering
+codecs are enumerated. The AMD platform controllers 1022:1457, 1022:1487
+and 1022:15e3 (`HDA_AMD_*_DEVICE`, `amd_sb_preset`; Linux
+`AZX_DCAPS_PRESET_AMD_SB`) get ATI snooping and `AZX_DCAPS_RETRY_PROBE`: a
+probe that finds no usable codec keeps the device and retries the bring-up
+once a second, up to 59 more times. The free-running playback position adds
+the ring wraps the elapsed time implies at the stream's own rate.
+
 ALSA stream hooks preserve DMA position and storage across pause/resume. HDA
 supports rewriting queued cyclic slots and delegates stop-threshold/silence
 policy to ALSA in free-running mode; raw native clients retain underrun checks.
@@ -330,6 +362,11 @@ must restore controller programming before ALSA RESUME.
   after copying to detect overwrite races.
 - Underrun/overrun stops the stream and requires stop/prepare recovery.
   HDA rejects a position sample gap long enough to hide a whole ring wrap.
+- No HDA command is posted into a parked controller's rings, and nothing
+  walks a parked controller's RIRB: the `suspended` check runs under the
+  command lease, and the park sets it under the same lease.
+- A command-transport failure is recoverable: the rings restart before the
+  next command; only a function that reads all-ones fails it.
 - No IRQ-safe lock crosses an await. Synchronous register waits use the
   scheduler's bounded responsive polling; timer waits release all guards.
 - IRQ handlers acknowledge their device sources and report unhandled shared
