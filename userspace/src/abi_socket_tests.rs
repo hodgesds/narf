@@ -12845,6 +12845,100 @@ kernel_test_in!(
     smoke_abi_socket_icmp6_raw_ra_reports_ingress_device_and_hoplimit
 );
 
+/// IP_UNICAST_IF is the output device of an unbound socket's unicast
+/// traffic: `ip4_datagram_connect` and `udp_sendmsg` take `inet->uc_index`
+/// as `oif` when `sk_bound_dev_if` is 0, so the route, and with it the
+/// source address, are that device's. systemd-resolved scopes its per-link
+/// DNS sockets this way. NARF stored the option and never read it.
+fn smoke_abi_socket_ip_unicast_if_picks_the_output_device() -> TestResult {
+    const A: &str = "abi-ucif-a";
+    const B: &str = "abi-ucif-b";
+    const A_IP: [u8; 4] = [10, 42, 3, 165];
+    const A_GW: [u8; 4] = [10, 42, 3, 1];
+    const B_IP: [u8; 4] = [10, 42, 1, 211];
+    const DST: [u8; 4] = [198, 18, 42, 9];
+    fn discard(_: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    fn local_addr(fd: u64) -> Result<[u8; 4], &'static str> {
+        let mut out = [0u8; 16];
+        let mut outlen = (out.len() as u32).to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("getsockname failed");
+        }
+        Ok([out[4], out[5], out[6], out[7]])
+    }
+    fn connect_dst(fd: u64) -> Result<(), &'static str> {
+        let sa = sockaddr_in(u32::from_be_bytes(DST), 53);
+        match call(
+            Syscall::SocketConnect.raw(),
+            a2(fd, sa.as_ptr() as u64, sa.len() as u64),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("UDP connect failed"),
+        }
+    }
+    let net = narf_net::route::Ipv4Net {
+        addr: narf_net::ipv4::Ipv4Addr([198, 18, 42, 0]),
+        prefix_len: 24,
+    };
+    with_setup(|| {
+        for (name, mac, ip) in [(A, 0xa1, A_IP), (B, 0xb1, B_IP)] {
+            narf_net::iface::register(name, [0x02, 0, 0, 0, 0x2a, mac], discard);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_iface_ipv4_fields(name, ip, [0; 4]);
+            narf_net::iface::add_addr(name, ip, 24);
+        }
+        narf_net::route::route_add(narf_net::route::Route {
+            net_ns_id: 0,
+            dst: net,
+            gateway: Some(narf_net::ipv4::Ipv4Addr(A_GW)),
+            iface: alloc::string::String::from(A),
+            src_hint: None,
+            metric: 0,
+            scope: narf_net::route::Scope::Universe,
+            table: narf_net::route::TABLE_MAIN,
+            protocol: narf_net::route::RTPROT_KERNEL,
+        });
+        let result = (|| -> Result<(), &'static str> {
+            let b_index = narf_net::iface::ifindex_of(B).ok_or("B has no ifindex")?;
+            let plain = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+            connect_dst(plain)?;
+            if local_addr(plain)? != A_IP {
+                return Err("baseline: the route's device A did not source the socket");
+            }
+            let scoped = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+            if sockopt_set_int(
+                scoped,
+                so::IPPROTO_IP,
+                so::IP_UNICAST_IF,
+                b_index.to_be() as i32,
+            )? != 0
+            {
+                return Err("IP_UNICAST_IF(B) failed");
+            }
+            connect_dst(scoped)?;
+            if local_addr(scoped)? != B_IP {
+                return Err("IP_UNICAST_IF did not make B the output device and source");
+            }
+            sockopt_close(&[plain, scoped]);
+            Ok(())
+        })();
+        narf_net::route::route_delete(net, A, narf_net::route::TABLE_MAIN);
+        narf_net::iface::del_addr(A, A_IP, 24);
+        narf_net::iface::del_addr(B, B_IP, 24);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/ip-unicast-if",
+    smoke_abi_socket_ip_unicast_if_picks_the_output_device
+);
+
 /// systemd-resolved's `link_address_update_rtnl` reads IFA_FLAGS from every
 /// RTM_NEWADDR and fails the whole manager with ENODATA when it is absent
 /// ("Could not create manager: No data available"). Linux always emits it
