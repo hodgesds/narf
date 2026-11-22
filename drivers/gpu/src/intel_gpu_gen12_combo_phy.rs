@@ -35,16 +35,21 @@
 //! PCI device ID — external-DP/HDMI/MST paths keep the standard
 //! TGL table until the DID reaches them.
 //!
-//! Not covered here, by design: the mid-training DPLL retune on
-//! a fallback (the combo `train_link` loop falls back rate/lanes
-//! but the DPLL is only reprogrammed after training, and only
-//! when a plan was given — the modeset's existing
-//! `program_dpll_with_rate` after step 9). The TC path restarts
-//! via `start_training(retune)`; the combo equivalent needs an
-//! io-taking DPLL retune helper and is a noted follow-up. No
-//! regression: a fallback cannot succeed on the combo path today
-//! either (the source/sink rate mismatch persists either way);
-//! this change strictly improves the first attempt.
+//! Mid-training DPLL retune on fallback: when the `train_link`
+//! ladder opens a retry attempt at a lower rate, the training
+//! callback reprograms the combo DPLL for the new link clock
+//! before the sink sees TPS1 at that rate
+//! (`ComboPhy::training_update`, pattern 1 after a dirty
+//! Configure) — the combo equivalent of the Type-C
+//! `DklPort::start_training(retune)` restart. Without it the
+//! retry drives the new rate on the old link clock and can
+//! never lock; the post-training `program_dpll_with_rate` in
+//! the modeset only covers the plan path, so a legacy-path
+//! fallback settled at the wrong clock. M/N needs no
+//! mid-training step: the transcoder is not enabled until
+//! after training, and the modeset already reprograms M/N to
+//! the trained configuration on every path before the DDI
+//! buffer enables.
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_gt::Gen12Platform;
@@ -549,6 +554,24 @@ const DP_TP_CTL_ENHANCED_FRAME_ENABLE: u32 = 1 << 18;
 const DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
 const DP_TP_CTL_SCRAMBLE_DISABLE: u32 = 1 << 7;
 
+/// DPLL enable registers (Tiger Lake PRM Vol. 11 §"DPLL
+/// Enable"): `_DPLL0_ENABLE` = 0x46010, `_DPLL1_ENABLE` =
+/// 0x46014, `_DPLL2_ENABLE` = 0x46018 — the same registers and
+/// bit positions as `intel_gpu_modeset::program_dpll_coeffs`
+/// (and `intel_gpu_dp`'s `DPLL_ENABLES`); this module keeps
+/// its own copies because the modeset's are private.
+/// `PLL_LOCK` (bit 30) and `PLL_POWER_STATE` (bit 26) are
+/// read-only status, stripped on read-modify-write by
+/// `retune_dpll`.
+const DPLL0_ENABLE: u64 = 0x4_6010;
+const DPLL1_ENABLE: u64 = 0x4_6014;
+const DPLL2_ENABLE: u64 = 0x4_6018;
+const DPLL_PLL_ENABLE: u32 = 1 << 31;
+const DPLL_PLL_LOCK: u32 = 1 << 30;
+const DPLL_PLL_POWER_ENABLE: u32 = 1 << 27;
+const DPLL_PLL_POWER_STATE: u32 = 1 << 26;
+const DPLL_STATUS_BITS: u32 = DPLL_PLL_LOCK | DPLL_PLL_POWER_STATE;
+
 /// `icl_combo_phy_loadgen_select`: above 6 GHz no loadgen on
 /// any lane; 4 lanes load lanes 1–3; otherwise lanes 1–2.
 fn loadgen_select(port_clock_khz: u32, lanes: u8, lane: u8) -> u32 {
@@ -633,6 +656,17 @@ impl ComboPhy {
             Ddi::B => 0x06C_000,
             Ddi::C => 0x160_000,
             _ => 0x160_000,
+        }
+    }
+
+    /// The DPLL enable register for this DDI's DPLL: Combo PHY
+    /// DDIs A/B/C use DPLL 0/1/2 (the DPCLKA default assignment
+    /// — the same mapping as `intel_gpu_modeset::dpll_index_for`).
+    const fn dpll_enable_off(self) -> u64 {
+        match self.ddi {
+            Ddi::A => DPLL0_ENABLE,
+            Ddi::B => DPLL1_ENABLE,
+            _ => DPLL2_ENABLE,
         }
     }
 
@@ -849,16 +883,16 @@ impl ComboPhy {
     /// Configure → nothing; Levels (clean) → reprogram the PHY
     /// at the state's rate; Levels (dirty) → nothing (the sink
     /// is about to rewrite the levels); Pattern → retune the
-    /// DP_TP_CTL pattern field. The pattern-0 write at the end
-    /// of training is what returns DP_TP_CTL to NORMAL
-    /// (`LINK_TRAIN_NORMAL` = 3), so there is no separate
-    /// finish step — mirroring the TC path.
-    ///
-    /// Deliberately unlike the TC branch, a pattern-1 change
-    /// after a dirty Configure does NOT retune the DPLL
-    /// mid-training: that is the documented follow-up (see the
-    /// module note); the modeset's post-training
-    /// `program_dpll_with_rate` covers the settled rate.
+    /// DP_TP_CTL pattern field. A pattern-1 write after a dirty
+    /// Configure opens a retry attempt at a lower rate/lanes,
+    /// so the DPLL is reprogrammed for the new link clock and
+    /// the PHY re-prepared (levels + DP_TP_CTL PAT1) before the
+    /// pattern field is rewritten — the mid-training retune,
+    /// mirroring the TC branch's `start_training(retune)`.
+    /// The pattern-0 write at the end of training is what
+    /// returns DP_TP_CTL to NORMAL (`LINK_TRAIN_NORMAL` = 3),
+    /// so there is no separate finish step — mirroring the TC
+    /// path.
     pub(crate) fn training_update(
         self,
         io: &(impl MmioWindow + ?Sized),
@@ -874,6 +908,10 @@ impl ComboPhy {
             }
             Change::Levels => Ok(()),
             Change::Pattern => {
+                if state.pattern == 1 && state.dirty {
+                    self.retune_dpll(io, trans, state.rate)?;
+                    self.prepare(io, trans, state.rate, state.lanes)?;
+                }
                 let tp = trans.base() + DP_TP_CTL_OFFSET;
                 let bits = state
                     .pattern_bits()
@@ -887,6 +925,128 @@ impl ComboPhy {
                 Ok(())
             }
         }
+    }
+
+    /// Poll an MMIO register's `mask` bits until they assert
+    /// (when `set`) or deassert, with a `ms` cap. Mirrors
+    /// `DklPort::wait_timeout` (`intel_gpu_gen12_tc`).
+    fn wait(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+        off: u64,
+        mask: u32,
+        set: bool,
+        ms: u64,
+    ) -> Result<(), ModesetError> {
+        let done = narf_scheduler::responsive_spin_until(
+            || {
+                let v = self.read(io, off);
+                if set {
+                    v & mask == mask
+                } else {
+                    v & mask == 0
+                }
+            },
+            narf_time::Deadline::after_ms(ms),
+        );
+        if done {
+            Ok(())
+        } else {
+            Err(ModesetError::PllLockTimeout)
+        }
+    }
+
+    /// Reprogram this DDI's combo DPLL for `rate` mid-training:
+    /// the `train_link` fallback ladder's retry attempt at a
+    /// lower rate. Mirrors the Type-C
+    /// `DklPort::start_training(retune)` restart, minus the
+    /// clock re-route — DPCLKA routing selects the DPLL index,
+    /// which a rate change does not alter — and Linux's
+    /// `icl_pll_disable` + `icl_pll_enable` pair
+    /// (`intel_dpll.c`):
+    ///
+    ///   1. Stop the DDI buffer (already off while training;
+    ///      the clear + idle wait is the same defensive step
+    ///      the TC retune takes) and the training-pattern
+    ///      driver (`DP_TP_CTL` ENABLE off).
+    ///   2. Disable the DPLL (PLL_ENABLE off, wait LOCK clear;
+    ///      POWER_ENABLE off, wait POWER_STATE clear).
+    ///   3. Bring it back up at the new rate with the standard
+    ///      program sequence (power, CFGCR0/1 from
+    ///      `combo_coeffs` under the DSSM reference family,
+    ///      enable, wait LOCK) — the same steps as
+    ///      `intel_gpu_modeset::program_dpll_coeffs`.
+    ///
+    /// The coefficients resolve before any register is touched,
+    /// so an unrepresentable rate fails closed without
+    /// disturbing the running PLL. The caller re-prepares the
+    /// PHY levels + `DP_TP_CTL` PAT1 after this returns
+    /// (`prepare`), so the retry attempt drives TPS1 at the new
+    /// link clock. A lock or idle timeout aborts training with
+    /// `PllLockTimeout`.
+    ///
+    /// Status bits are read-only: the read-modify-writes below
+    /// strip `PLL_LOCK` / `PLL_POWER_STATE` from the read value
+    /// before writing it back, so a store-everything fixture
+    /// does not latch them as programmed bits (the running
+    /// `program_dpll_coeffs` never waits on a clear, so it
+    /// never needed the strip).
+    fn retune_dpll(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+        trans: crate::intel_gpu_pipes::Transcoder,
+        rate: LinkRate,
+    ) -> Result<(), ModesetError> {
+        use crate::intel_gpu_ddi::{
+            DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
+        };
+        use crate::intel_gpu_pll::{combo_coeffs, decode_refclk_family, encode_cfgcr0, DSSM};
+        let coeffs = match combo_coeffs(rate, decode_refclk_family(self.read(io, DSSM))) {
+            Some(c) => c,
+            None => return Err(ModesetError::PllLockTimeout),
+        };
+        let enable = self.dpll_enable_off();
+        // 1. Stop the DDI buffer + the pattern driver.
+        self.rmw(
+            io,
+            self.ddi.base() + DDI_BUF_CTL_OFFSET,
+            DDI_BUF_CTL_ENABLE,
+            0,
+        );
+        self.wait(
+            io,
+            self.ddi.base() + DDI_BUF_CTL_OFFSET,
+            DDI_BUF_CTL_IDLE_STATUS,
+            true,
+            10,
+        )?;
+        self.rmw(io, trans.base() + DP_TP_CTL_OFFSET, DP_TP_CTL_ENABLE, 0);
+        // 2. Disable the DPLL.
+        let cur = self.read(io, enable) & !DPLL_STATUS_BITS;
+        self.write(io, enable, cur & !DPLL_PLL_ENABLE);
+        self.wait(io, enable, DPLL_PLL_LOCK, false, 1)?;
+        let cur = self.read(io, enable) & !DPLL_STATUS_BITS;
+        self.write(io, enable, cur & !DPLL_PLL_POWER_ENABLE);
+        self.wait(io, enable, DPLL_PLL_POWER_STATE, false, 1)?;
+        // 3. Bring it back up at the new rate.
+        let cur = self.read(io, enable) & !DPLL_STATUS_BITS;
+        self.write(io, enable, cur | DPLL_PLL_POWER_ENABLE);
+        self.wait(io, enable, DPLL_PLL_POWER_STATE, true, 1)?;
+        let cfgcr0_off = match self.ddi {
+            Ddi::A => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
+            Ddi::B => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL1,
+            _ => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL2,
+        };
+        self.write(io, cfgcr0_off, encode_cfgcr0(&coeffs));
+        self.write(
+            io,
+            crate::intel_gpu_pll::dpll_cfgcr1(cfgcr0_off),
+            coeffs.cfgcr1,
+        );
+        compiler_fence(Ordering::SeqCst);
+        let cur = self.read(io, enable) & !DPLL_STATUS_BITS;
+        self.write(io, enable, cur | DPLL_PLL_ENABLE);
+        self.wait(io, enable, DPLL_PLL_LOCK, true, 1)
     }
 }
 
@@ -924,7 +1084,34 @@ mod tests {
     }
     impl MmioWindow for Model {
         fn read32(&self, off: u64) -> u32 {
-            self.regs.borrow().get(&off).copied().unwrap_or(0)
+            let stored = self.regs.borrow().get(&off).copied().unwrap_or(0);
+            match off {
+                // DPLL enable: LOCK follows ENABLE and
+                // POWER_STATE follows POWER_ENABLE — the same
+                // computed-bits shape the modeset's
+                // ScriptedSinkMmio serves, so the retune's
+                // waits see a live PLL.
+                0x4_6010 | 0x4_6014 | 0x4_6018 => {
+                    let mut v = stored;
+                    if stored & (1 << 27) != 0 {
+                        v |= 1 << 26;
+                    }
+                    if stored & (1 << 31) != 0 {
+                        v |= 1 << 30;
+                    }
+                    v
+                }
+                // DDI_BUF_CTL (DDI base + 0): IDLE_STATUS
+                // asserts exactly while the buffer is off.
+                o if o == Ddi::A.base() || o == Ddi::B.base() || o == Ddi::C.base() => {
+                    if stored & (1 << 31) != 0 {
+                        stored & !(1 << 7)
+                    } else {
+                        stored | (1 << 7)
+                    }
+                }
+                _ => stored,
+            }
         }
         fn write32(&self, off: u64, value: u32) {
             self.writes.borrow_mut().push((off, value));
@@ -1492,6 +1679,119 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gen12_combo_phy",
         smoke_combo_phy_prepare_and_training_update
+    );
+
+    fn smoke_combo_phy_fallback_retunes_dpll_before_sink_pattern() -> TestResult {
+        use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
+        use crate::intel_gpu_modeset::training::{State, TrainingAux};
+        use crate::intel_gpu_pipes::Transcoder;
+        use Gen12Platform::TigerLake;
+        // A sink stub that acks every AUX transaction — but on
+        // a TPS1 write it first checks the source already
+        // retuned the DPLL for the fallback rate: the retune
+        // must precede the sink's pattern write, never follow
+        // it (`TrainingAux` runs the source callback before
+        // forwarding the write).
+        struct Sink<'a>(&'a Model);
+        impl AuxChannel for Sink<'_> {
+            fn transact<'a>(
+                &mut self,
+                request: &AuxRequest<'_>,
+                reply: &'a mut [u8],
+            ) -> Result<AuxResponse<'a>, AuxError> {
+                if request.cmd == AuxCommand::NativeWrite
+                    && request.address == 0x102
+                    && request.data[0] & 7 == 1
+                {
+                    // HBR CFGCR1: KDIV_2 | PDIV_3 | CFREQ_8_4_GHZ.
+                    if self.0.last_write_to(0x164288) != Some(0x8B) {
+                        return Err(AuxError::Nacked);
+                    }
+                }
+                Ok(AuxResponse {
+                    status: AuxStatus::Ack,
+                    data: &reply[..0],
+                })
+            }
+        }
+        let io = Model::new();
+        // DSSM strap: 19.2 MHz (field 1).
+        io.regs
+            .borrow_mut()
+            .insert(crate::intel_gpu_pll::DSSM, 1 << 29);
+        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true).unwrap();
+        let trans = Transcoder::A;
+        let tp = trans.base() + 0x540;
+        // Prepare at HBR2, then bring the DPLL up at HBR2 the
+        // way the modeset's step 4 does, so the retune has a
+        // running PLL to take down (CFGCR1 HBR2: KDIV_1 |
+        // PDIV_3 | CFREQ_8_4_GHZ = 0x4B).
+        if phy.prepare(&io, trans, LinkRate::DpHbr2, 4).is_err() {
+            return TestResult::Fail("prepare must succeed");
+        }
+        io.write32(0x4_6010, 1 << 27);
+        io.write32(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0, 0x01C0_01A5);
+        io.write32(0x164288, 0x4B);
+        io.write32(0x4_6010, (1 << 27) | (1 << 31));
+        let mut aux = TrainingAux::new(
+            Sink(&io),
+            State::new(LinkRate::DpHbr2, 4),
+            |state: &State, change| {
+                phy.training_update(&io, trans, state, change)
+                    .map_err(|_| AuxError::Nacked)
+            },
+        );
+        // Fallback: the sink is told HBR (LINK_BW_SET 0x0A),
+        // then TPS1. The TPS1 write must succeed — which it
+        // only does if the DPLL was already retuned to HBR
+        // when the sink stub inspected it.
+        if aux.dpcd_write(0x100, &[0x0A]).is_err() {
+            return TestResult::Fail("LINK_BW_SET fallback write must succeed");
+        }
+        if aux.dpcd_write(0x102, &[1]).is_err() {
+            return TestResult::Fail(
+                "TPS1 after fallback must succeed — the DPLL retune must precede it",
+            );
+        }
+        // CFGCR1 walked HBR2 → HBR; CFGCR0 was rewritten with
+        // the same DCO row (the DCO is rate-independent inside
+        // one reference family).
+        if io.writes_to(0x164288) != alloc::vec![0x4B, 0x8B] {
+            return TestResult::Fail("fallback must reprogram CFGCR1 to the HBR row");
+        }
+        if io.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0)
+            != alloc::vec![0x01C0_01A5, 0x01C0_01A5]
+        {
+            return TestResult::Fail("fallback must rewrite CFGCR0 with the retuned rate");
+        }
+        // DPLL enable cycled: power, enable, then the retune's
+        // disable (enable off, power off) + bring-up.
+        if io.writes_to(0x4_6010)
+            != alloc::vec![
+                0x0800_0000,
+                0x8800_0000,
+                0x0800_0000,
+                0,
+                0x0800_0000,
+                0x8800_0000
+            ]
+        {
+            return TestResult::Fail("fallback must disable then re-enable the DPLL");
+        }
+        // Levels were re-prepared at HBR: preset 0 of the TGL
+        // HBR table, N-scalar 0x32 (not the HBR2 0x35).
+        if io.last_write_to(0x162000 + 0x89C) != Some(0x3200_0000) {
+            return TestResult::Fail("fallback must re-prepare levels at the retuned rate");
+        }
+        // DP_TP_CTL ends enabled with PAT1.
+        if io.last_write_to(tp) != Some(0x8004_0080) {
+            return TestResult::Fail("fallback must leave DP_TP_CTL enabled with PAT1");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_combo_phy",
+        smoke_combo_phy_fallback_retunes_dpll_before_sink_pattern
     );
 
     fn smoke_combo_phy_edp_hbr3_aliases_dp_table() -> TestResult {

@@ -914,6 +914,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // via `TrainingAux`) — there is no preloaded table to
         // reload when training settles elsewhere; the callback
         // already re-selected the table for the settled rate.
+        // The callback also retunes the DPLL mid-training when
+        // the fallback ladder opens a retry attempt at a lower
+        // rate (`ComboPhy::training_update`, pattern 1 after a
+        // dirty Configure), so the settled rate's link clock is
+        // already programmed when training completes; the
+        // plan-path re-program below then rewrites the same
+        // rate, kept as a safety net.
         //
         // An MST secondary stream skips the whole step: the
         // link is already trained and the PHY already programmed
@@ -3123,6 +3130,13 @@ pub mod tests {
         pattern: u8,
         pattern_history: Vec<u8>,
         tunes: [u8; 4],
+        /// TPS1 entries so far (one per training attempt).
+        cr_attempts: u32,
+        /// Test knob: fail clock recovery for the first this
+        /// many TPS1 entries, then let CR lock — drives the
+        /// fallback ladder from a fixture. 0 (default) never
+        /// fails.
+        fail_cr_attempts: u8,
     }
 
     impl SinkState {
@@ -3134,17 +3148,21 @@ pub mod tests {
         fn lane_nibble(&self, lane: usize) -> u8 {
             match self.pattern {
                 // TPS1 (CR): locks once the sink's requested
-                // swing (1) has been applied.
+                // swing (1) has been applied — unless the
+                // fixture is failing this CR attempt.
                 1 => {
-                    if self.lane_swing(lane) >= 1 {
+                    if self.cr_attempts <= u32::from(self.fail_cr_attempts) {
+                        0
+                    } else if self.lane_swing(lane) >= 1 {
                         0x1 // CR_DONE
                     } else {
                         0
                     }
                 }
-                // TPS3 (EQ at HBR2): CR held + EQ done +
-                // symbol locked once CR's swing is in place.
-                3 => {
+                // TPS2 (EQ at RBR/HBR) and TPS3 (EQ at HBR2+):
+                // CR held + EQ done + symbol locked once CR's
+                // swing is in place.
+                2 | 3 => {
                     if self.lane_swing(lane) >= 1 {
                         0x7
                     } else {
@@ -3170,7 +3188,7 @@ pub mod tests {
             req(pair * 2) | (req(pair * 2 + 1) << 4)
         }
         fn align_byte(&self) -> u8 {
-            if self.pattern == 3 && (0..4).all(|l| self.lane_swing(l) >= 1) {
+            if matches!(self.pattern, 2 | 3) && (0..4).all(|l| self.lane_swing(l) >= 1) {
                 1 // INTERLANE_ALIGN_DONE
             } else {
                 0
@@ -3183,6 +3201,9 @@ pub mod tests {
                     0x102 => {
                         self.pattern = b;
                         self.pattern_history.push(b);
+                        if b == 1 {
+                            self.cr_attempts += 1;
+                        }
                     }
                     a @ 0x103..=0x106 => self.tunes[(a - 0x103) as usize] = b,
                     _ => {}
@@ -3694,6 +3715,73 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_modeset_full_run_scripted_sink
+    );
+
+    fn smoke_modeset_fallback_retunes_combo_dpll() -> TestResult {
+        // DSSM strap: 19.2 MHz (field 1), EDID 1080p60 mode.
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        // Fail clock recovery on the first attempt (HBR2) so
+        // the ladder falls back to HBR; the second attempt
+        // trains.
+        mmio.sink.borrow_mut().fail_cr_attempts = 1;
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        if ms.modeset(&fb_1080p(), None).is_err() {
+            return TestResult::Fail(
+                "modeset with a first-attempt CR failure must fall back and succeed",
+            );
+        }
+        // Two attempts: TPS1, off (CR failed), TPS1, TPS2
+        // (HBR EQ), off.
+        if mmio.sink.borrow().pattern_history != alloc::vec![1u8, 0, 1, 2, 0] {
+            return TestResult::Fail("fallback must retry training at the lower rate");
+        }
+        // DPLL: programmed at the RBR floor row for the 1080p
+        // mode (CFGCR1 KDIV_2 | PDIV_5 | CFREQ = 0x93), then
+        // retuned mid-training to HBR (KDIV_2 | PDIV_3 |
+        // CFREQ = 0x8B) when the fallback retry opened. CFGCR0
+        // is the same DCO row at both rates, so CFGCR1 is the
+        // rate witness.
+        let cfgcr1 = crate::intel_gpu_pll::dpll_cfgcr1(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
+        if mmio.writes_to(cfgcr1) != alloc::vec![0x93, 0x8B] {
+            return TestResult::Fail(
+                "fallback must reprogram CFGCR1 from the RBR row to the HBR row",
+            );
+        }
+        // DPLL enable cycled by the retune: step-4 power +
+        // enable, then disable (enable off, power off) +
+        // bring-up.
+        if mmio.writes_to(super::DPLL0_ENABLE)
+            != alloc::vec![
+                0x0800_0000,
+                0x8C00_0000,
+                0x0800_0000,
+                0,
+                0x0800_0000,
+                0x8800_0000
+            ]
+        {
+            return TestResult::Fail("fallback must disable then re-enable the DPLL");
+        }
+        // M/N carries the settled link: HBR symbol clock
+        // (2_700_000 / 10 = 270_000 kHz) over 4 lanes.
+        use crate::intel_gpu_pipes::{dp_mn, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET};
+        let (_, _, lm, ln) = dp_mn(148_500, 270_000, 4, 3);
+        let trans_base = crate::intel_gpu_pipes::Transcoder::A.base();
+        if mmio.writes_to(trans_base + PIPE_LINK_M1_OFFSET).last() != Some(&lm)
+            || mmio.writes_to(trans_base + PIPE_LINK_N1_OFFSET).last() != Some(&ln)
+        {
+            return TestResult::Fail("fallback must reprogram M/N for the settled HBR link");
+        }
+        // DP_TP_CTL returns to NORMAL once training ends.
+        let tp = crate::intel_gpu_pipes::Transcoder::A.base() + 0x540;
+        if mmio.writes_to(tp).last() != Some(&0x8004_0300) {
+            return TestResult::Fail("DP_TP_CTL must end at NORMAL after fallback training");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_fallback_retunes_combo_dpll
     );
 
     fn smoke_modeset_full_run_ref24_pll_row() -> TestResult {
