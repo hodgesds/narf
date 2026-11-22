@@ -1677,6 +1677,33 @@ impl IntelHda {
     /// prepared. A prepared-but-idle ring still blocks quiesce:
     /// its BDL is published and its SD state would go stale across
     /// a command-ring restart, so the owner must stop it first.
+    /// The power state a failed suspend reports.
+    fn pm_state(&self) -> alloc::string::String {
+        let streams: Vec<(bool, bool, bool)> = self
+            .streams
+            .iter()
+            .map(|s| {
+                let state = s.lock();
+                let ring = state.ring.as_ref();
+                (
+                    state.claimed,
+                    ring.is_some_and(|r| r.prepared),
+                    ring.is_some_and(|r| r.running),
+                )
+            })
+            .collect();
+        alloc::format!(
+            "suspended {}, codecs suspended {}, power refs {}, pm lock {}, lease {}, \
+             streams (claimed, prepared, running) {:?}",
+            self.suspended.load(Ordering::Acquire),
+            self.codecs_suspended.load(Ordering::Acquire),
+            self.power_refs.load(Ordering::Acquire),
+            self.pm.load(Ordering::Acquire),
+            self.busy.load(Ordering::Acquire),
+            streams
+        )
+    }
+
     fn streams_idle(&self) -> bool {
         self.streams.iter().all(|s| {
             !s.lock()
@@ -2176,10 +2203,19 @@ impl narf_power::device_pm::DevicePmOps for HdaSystemPm {
             .map(|(_, dev, _)| dev.clone())
             .collect();
         for dev in devs {
-            dev.quiesce().map_err(|e| match e {
-                HdaError::Busy => E::Busy,
-                _ => E::DriverError,
-            })?;
+            if let Err(error) = dev.quiesce() {
+                // What a refused system suspend needs on the console.
+                narf_console::write_str(&alloc::format!(
+                    "hda: system suspend of {:#x} failed: {:?}; {}\n",
+                    dev.bar0.phys.raw(),
+                    error,
+                    dev.pm_state()
+                ));
+                return Err(match error {
+                    HdaError::Busy => E::Busy,
+                    _ => E::DriverError,
+                });
+            }
         }
         Ok(())
     }

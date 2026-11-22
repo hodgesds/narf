@@ -22,7 +22,7 @@ pub(super) struct Stream {
     pub ring: Option<Ring>,
     index: u8,
     capture: bool,
-    claimed: bool,
+    pub(super) claimed: bool,
     last_position: u32,
     last_sample: u64,
 }

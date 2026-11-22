@@ -1960,8 +1960,13 @@ fn native_hda_pm_system_fanout_suspends_and_resumes() -> TestResult {
         0,
     ));
     narf_power::device_pm::register_device_pm_ops("hda", Arc::new(HdaSystemPm));
-    if !narf_power::device_pm::suspend_all_devices().ok() || !dev.suspended.load(Ordering::Acquire)
-    {
+    let report = narf_power::device_pm::suspend_all_devices();
+    if !report.ok() || !dev.suspended.load(Ordering::Acquire) {
+        narf_console::write_str(&alloc::format!(
+            "hda: fanout suspend {:?}; fixture {}\n",
+            report.outcomes,
+            dev.pm_state()
+        ));
         return TestResult::Fail("fanout suspend parks the controller");
     }
     if !narf_power::device_pm::resume_all_devices().ok() || dev.suspended.load(Ordering::Acquire) {
