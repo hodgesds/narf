@@ -261,6 +261,46 @@ mod tests {
         "drivers/gpu/navi22-tdr/media",
         rdna2_suspended_media_timeout_keeps_the_job_waiting
     );
+    /// `amdgpu_fence_process` signals a job's fence when the engine's fence
+    /// processing first sees its sequence written, and
+    /// `dma_fence_signal_timestamp` records that instant: the job's
+    /// `dma_fence.timestamp`, the same however late a client asks for it.
+    /// A pending job has none; a ticket of another recovery epoch has none.
+    fn rdna2_jobs_record_their_signal_time() -> TestResult {
+        let mut jobs = Jobs::new(21);
+        let (first, media) = (ticket(21, 0, 5), ticket(21, 4, 2));
+        jobs.emitted(first, &Arc::default());
+        jobs.emitted(media, &Arc::default());
+        if jobs.signal_time(first).is_some() || jobs.signal_time(media).is_some() {
+            return TestResult::Fail("a pending job has a signal time");
+        }
+        let mut completed = [0; RING_IDS];
+        completed[0] = 5;
+        let before = narf_time::wall::monotonic_ns();
+        jobs.observe(completed);
+        let after = narf_time::wall::monotonic_ns();
+        let Some(at) = jobs.signal_time(first) else {
+            return TestResult::Fail("a completed job has no signal time");
+        };
+        if at < before || at > after || jobs.signal_time(media).is_some() {
+            return TestResult::Fail("the signal time is not the observation that completed it");
+        }
+        // Later samples neither move it nor stamp what they did not complete.
+        jobs.observe(completed);
+        completed[4] = 2;
+        jobs.observe(completed);
+        if jobs.signal_time(first) != Some(at)
+            || jobs.signal_time(media).is_none_or(|media| media < at)
+            || jobs.signal_time(ticket(20, 0, 5)).is_some()
+        {
+            return TestResult::Fail("signal times moved or crossed epochs");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/fence-time",
+        rdna2_jobs_record_their_signal_time
+    );
 }
 impl Jobs {
     pub fn new(epoch: u64) -> Self {
@@ -386,6 +426,11 @@ impl Jobs {
             health.mark_guilty();
             self.timed_out.push(*ticket);
         }
+    }
+    /// When job `ticket` was seen complete (`Submitter::signal_time`).
+    pub fn signal_time(&self, ticket: u64) -> Option<u64> {
+        let _ = ticket;
+        None
     }
     pub fn error(&self, ticket: u64) -> Option<FsError> {
         if let Some(&(_, error)) = self.failed.iter().find(|(t, _)| *t == ticket) {

@@ -550,6 +550,13 @@ pub trait Submitter: Send + Sync {
     fn error(&self, _ticket: u64) -> Option<FsError> {
         None
     }
+    /// Linux `dma_fence.timestamp` of job `ticket`: the `CLOCK_MONOTONIC` ns
+    /// at which the engine's fence processing saw it complete
+    /// (`dma_fence_signal_timestamp` from `amdgpu_fence_process`). `None`
+    /// while pending or when the engine kept no record.
+    fn signal_time(&self, _ticket: u64) -> Option<u64> {
+        None
+    }
     /// The ring index (a ticket's high 32 bits) that runs `ip_type`
     /// instance `ip_instance`, ring `ring`, if this engine has one.
     fn ring_for(&self, ip_type: u32, ip_instance: u32, ring: u32) -> Option<u32>;
