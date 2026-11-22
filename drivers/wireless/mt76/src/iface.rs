@@ -2073,6 +2073,13 @@ pub(crate) fn register_scan_iface_profile(
 
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Mt76Iface>>> = IrqSafeSpinLock::new(None);
 
+/// The task specs of the station data-queue poll (Linux `napi[MT_RXQ_MAIN]`)
+/// and of its deferral task. The function's one MSI vector is delivered to
+/// the boot CPU.
+pub(crate) fn data_task_specs() -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
+    (narf_scheduler::TaskSpec::unthrottled(), None)
+}
+
 /// The permanent module host retains this exact publication, never a name
 /// which could be reused by a later native binding.
 pub(crate) fn module_active() -> Option<Arc<Mt76Iface>> {
@@ -2300,6 +2307,30 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/irq",
         mt76_worker_sleeps_until_interrupt_or_timed_work
+    );
+
+    /// The station data queue has its own poll on the softirq model
+    /// (`narf_net::napi`), as Linux polls `napi[MT_RXQ_MAIN]` apart from the
+    /// MCU queue and the tasklet: an Interactive-class pump with a
+    /// Default-class deferral task, both on the boot CPU the MSI reaches.
+    fn mt76_data_queue_polls_like_napi_in_softirq() -> TestResult {
+        use narf_scheduler::affinity::{Affinity, CpuId};
+        use narf_scheduler::SchedClass;
+        let (pump, deferral) = data_task_specs();
+        if pump.class != SchedClass::Interactive || pump.affinity != Affinity::pinned(CpuId::BOOT) {
+            return TestResult::Fail("the data-queue poll does not run ahead of boot CPU tasks");
+        }
+        let Some(deferral) = deferral else {
+            return TestResult::Fail("the data-queue poll has no deferral task");
+        };
+        if deferral.class != SchedClass::Default || deferral.affinity != pump.affinity {
+            return TestResult::Fail("the deferral task is not Default class on the boot CPU");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/data-napi",
+        mt76_data_queue_polls_like_napi_in_softirq
     );
     fn radio() -> RadioInfo {
         RadioInfo {
