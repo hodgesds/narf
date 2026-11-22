@@ -3585,6 +3585,75 @@ fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
 }
 kernel_test_in!("frame/x86_64", smoke_x86_64_sa_restart_rewinds_saved_rip);
 
+/// An `int 0x80` call that parked for re-execution (RIP already rewound onto
+/// the gate, `prerewound_syscall`) and is then interrupted by a handled
+/// signal gets Linux `handle_signal`'s two outcomes over `-ERESTARTSYS`: with
+/// SA_RESTART the frame resumes ON `int 0x80` with eax reloaded from the
+/// call number (`regs->ax = regs->orig_ax`), whatever the park left in rax;
+/// without it the call completes as -EINTR past the instruction. A rewind of
+/// the already-rewound RIP would land two bytes inside the previous
+/// instruction.
+fn smoke_x86_64_int80_restart_pending_frame_reloads_eax_or_is_eintr() -> TestResult {
+    const GATE_RIP: u64 = 0x0040_1234;
+    // eax = i386 read (3), with a 64-bit caller's garbage above it.
+    const ENTRY_RAX: u64 = 0xDEAD_0000_0000_0003;
+    let mcontext = |field: usize| core::mem::offset_of!(UContext, uc_mcontext) + field;
+    for (flags, want_rip, want_rax) in [
+        (SA_SIGINFO | SA_RESTART, GATE_RIP, 3u64),
+        (SA_SIGINFO, GATE_RIP + 2, (-4i64) as u64),
+    ] {
+        let stack = SmokeStack::new();
+        let mut frame = smoke_signal_trap_frame(GATE_RIP, stack.top());
+        frame.rax = ENTRY_RAX;
+        let params = SigDeliveryParams {
+            handler: 0xCAFE_F00D,
+            restorer: 0,
+            signum: 10,
+            flags,
+            altstack_sp: 0,
+            altstack_size: 0,
+            restartable_syscall: true,
+            prerewound_syscall: true,
+            si_code: 0,
+            si_addr: 0,
+            si_value: 0,
+            si_pid: 0,
+        };
+        let mut ctx = X86TrapContext::from_int80_ia32(&mut frame);
+        // What a handler may leave behind before it parks.
+        ctx.set_return(SyscallReturn::invalid_op());
+        if !ctx.deliver_signal(&params) {
+            return TestResult::Fail("deliver_signal returned false");
+        }
+        let uc = frame.rdx;
+        // SAFETY: the frame writer just laid the ucontext at `uc`, inside
+        // this test's kernel-resident stack buffer.
+        let (rip, rax) = unsafe {
+            (
+                ((uc + mcontext(core::mem::offset_of!(McContext, rip)) as u64) as *const u64)
+                    .read_unaligned(),
+                ((uc + mcontext(core::mem::offset_of!(McContext, rax)) as u64) as *const u64)
+                    .read_unaligned(),
+            )
+        };
+        if rip != want_rip {
+            return TestResult::Fail(
+                "a restart-pending int 0x80 frame saved the wrong RIP (re-rewound or not completed)",
+            );
+        }
+        if rax != want_rax {
+            return TestResult::Fail(
+                "a restart-pending int 0x80 frame saved the wrong rax (not orig eax / -EINTR)",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/x86_64-int80-restart",
+    smoke_x86_64_int80_restart_pending_frame_reloads_eax_or_is_eintr
+);
+
 /// Robustness: when a signal is delivered to a *real* user task (an active
 /// address space is present) but the target stack range can't be backed —
 /// a stack overflow during delivery, e.g. a SIGSEGV handler that itself
