@@ -1753,6 +1753,38 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     }
 }
 
+/// Keep the `int 0x80` return `iretq` from faulting at CPL 0 on the user's
+/// SS. A task may have loaded SS with a TLS selector and then emptied or
+/// narrowed that slot with `set_thread_area` (the only call that changes a
+/// slot under a running task); `iretq` reloads SS from the GDT, and its #GP
+/// would land after common_trap's exit `swapgs`, on the kernel stack with
+/// the user GS base. Linux turns that fault into a SIGSEGV for the task
+/// (`fixup_bad_iret`); NARF has no bad-IRET fixup, so an SS that is no
+/// longer a valid user stack segment becomes `__USER_DS` (the only other
+/// stack segment a user can hold).
+fn sanitize_user_ss(frame: &mut TrapFrame) {
+    use narf_arch::x86_64::segments::{cpu_tls, GDT_ENTRY_TLS_MAX, GDT_ENTRY_TLS_MIN};
+    let ss = frame.ss as u16;
+    if ss == super::gdt::UDATA_SEL || frame.cs & 3 != 3 {
+        return;
+    }
+    let index = usize::from(ss >> 3);
+    // A stack segment at CPL 3: GDT (TI 0), RPL 3, and a present DPL-3
+    // writable data descriptor.
+    let valid = ss & 7 == 3 && (GDT_ENTRY_TLS_MIN..=GDT_ENTRY_TLS_MAX).contains(&index) && {
+        let desc = cpu_tls()[index - GDT_ENTRY_TLS_MIN];
+        let present = desc & (1 << 47) != 0;
+        let code_or_data = desc & (1 << 44) != 0;
+        let dpl3 = (desc >> 45) & 3 == 3;
+        let data = desc & (1 << 43) == 0;
+        let writable = desc & (1 << 41) != 0;
+        present && code_or_data && dpl3 && data && writable
+    };
+    if !valid {
+        frame.ss = u64::from(super::gdt::UDATA_SEL);
+    }
+}
+
 /// IST continuations must return on their exception stack without scheduling.
 /// In particular, NMI handling is not an ordinary interrupt-exit boundary.
 const fn scheduler_user_return_allowed(cs: u64, vector: u64) -> bool {
@@ -1801,6 +1833,7 @@ fn dispatch_trap(frame: &mut TrapFrame) {
         if frame.rip == entry_rip.wrapping_sub(2) {
             frame.rax = orig_eax;
         }
+        sanitize_user_ss(frame);
         return;
     }
 

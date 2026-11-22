@@ -344,7 +344,11 @@ pub unsafe fn reload_selector_users(modified: u16, &[u64; 3]);
   built only by `fill_ldt` from requests `tls_desc_okay` accepts: DPL 3,
   32-bit, data, present, never L — no 16-bit stack segment (no espfix
   leak), no call-gate or system descriptor.
-- `int 0x80` serves user tasks only; a kernel-mode `int 0x80` panics.
+- `int 0x80` serves user tasks only; a kernel-mode `int 0x80` panics. Its
+  return replaces a user SS that no longer names a present DPL-3 writable
+  data segment (a TLS slot emptied or narrowed under it) with `__USER_DS`,
+  so the `iretq` cannot fault at CPL 0 (Linux delivers SIGSEGV through
+  `fixup_bad_iret`; NARF has no bad-IRET fixup).
 - **x86_64 trap entry clears the live direction flag before executing any
   compiler-generated code.** CPL3 may be interrupted between `std` and `cld`;
   the CPU-pushed RFLAGS retains that user state for `iretq`, while the kernel
