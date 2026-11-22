@@ -400,7 +400,10 @@ Mount listings print each mount's Linux filesystem type
 (`FsInstance::fs_type`: `vfat`, `fuse.<subtype>`, `tmpfs` for an in-memory
 tree, the source's type for a bind), and `/proc/filesystems` lists only
 registered Linux types, not the aliases mount(2) also accepts (`shm`,
-`procfs`, `fat32`, ...).
+`procfs`, `fat32`, ...). `statmount(2)` splits that type as Linux keeps it:
+`STATMOUNT_FS_TYPE` is the type name alone (`fuse`) and
+`STATMOUNT_FS_SUBTYPE` the subtype (`portal`), whose mask bit comes back
+clear for a filesystem that has none.
 `statfs(2)` and `fstatfs(2)` report the filesystem's Linux superblock magic as
 `f_type` (`FsInstance::magic`: `BTRFS_SUPER_MAGIC`, `MSDOS_SUPER_MAGIC` for
 every FAT width, `0xEF53` for ext2/3/4, `DEVPTS_SUPER_MAGIC`, ...; a bind
