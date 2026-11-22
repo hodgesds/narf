@@ -117,10 +117,10 @@ impl Generation {
     /// generation through the Gen12/Meteor Lake probe path.
     /// Gen12 (TGL/ADL/RPL) and Meteor Lake (Xe-LPG, #1016) have
     /// validated register sequences on that path. Gen11 (Ice
-    /// Lake, Lane 5) joins them for the internal panel only:
-    /// its modeset (ICL CDCLK / DPLL / watermarks / DDI tables)
-    /// is fixture-validated and silicon untested, and external
-    /// display + backlight stay gated below. Lunar Lake
+    /// Lake, Lanes 5 + 8) joins them for the internal panel and
+    /// the external outputs: its modeset (ICL CDCLK / DPLL /
+    /// watermarks / DDI tables / MG PLL / HDMI) is
+    /// fixture-validated and silicon untested. Lunar Lake
     /// (Xe2-LPD, display 20) and Panther Lake (Xe3-LPD, display
     /// 30) stay `false` here deliberately even though their
     /// display is driven: each has its own opted-in per-device
@@ -144,21 +144,45 @@ impl Generation {
         )
     }
 
-    /// The external sessions and HPD block currently implement Gen12 only.
-    /// Xe-LPG's internal-panel sequence does not validate these registers.
+    /// The modeset-level external outputs are implemented for
+    /// Gen12 and for Gen11 Ice Lake (Lane 8: combo-PHY A/B DP +
+    /// HDMI, TC1–TC4 MG PLL + DP + HDMI, fixture-validated,
+    /// silicon untested). The HPD / external-session layer
+    /// (`enable_external_hpd`, `dp_connect`, `hdmi_connect`,
+    /// `mst_connect`) still implements Gen12 only and fails
+    /// closed for Gen11 — its Gen12 gates return `None` on a
+    /// Gen11 adapter — so flipping this predicate does not
+    /// arm any session path; threading that layer for Gen11
+    /// is a follow-up lane.
     pub const fn external_display_supported(self) -> bool {
-        matches!(self, Generation::TigerLake | Generation::AlderLake)
+        matches!(
+            self,
+            Generation::TigerLake | Generation::AlderLake | Generation::IceLake
+        )
     }
 
     /// Whether the backlight PWM install is valid for the
-    /// generation. The install programs the Gen12 BXT-style PWM
-    /// block; MTL's backlight path is owned by the backlight
-    /// composition lane (PR #1037, #947/#949/#951), which flips
-    /// this predicate when the MTL registers land. Keeping it
-    /// separate from `display_supported` lets the MTL modeset
-    /// ship without claiming a backlight it cannot drive.
+    /// generation. The install programs the BXT-style PWM
+    /// block (`BXT_BLC_PWM_CTL1`/`FREQ1`/`DUTY1` 0xC8250/54/58
+    /// + `SOUTH_CHICKEN1` 0xC2000 bit 25), which Ice Lake
+    /// shares: Linux drives ICL through the same
+    /// `cnp_pwm_funcs` (`bxt_set_backlight` /
+    /// `bxt_get_backlight`, `display/intel_backlight.c`) —
+    /// "CNP has the BXT implementation of backlight, but with
+    /// only one controller". MTL's backlight path is owned by
+    /// the backlight composition lane (PR #1037, #947/#949/#951),
+    /// which flips this predicate when the MTL registers land.
+    /// Keeping it separate from `display_supported` lets the
+    /// MTL modeset ship without claiming a backlight it cannot
+    /// drive. The install's controller-1 hardcoding is
+    /// pre-existing Gen12 behavior (Linux takes the VBT
+    /// controller, defaulting to 0); on a VBT-controller-0
+    /// part FREQ1 may read 0 and the install no-ops harmlessly.
     pub const fn backlight_supported(self) -> bool {
-        matches!(self, Generation::TigerLake | Generation::AlderLake)
+        matches!(
+            self,
+            Generation::TigerLake | Generation::AlderLake | Generation::IceLake
+        )
     }
 }
 
@@ -3433,39 +3457,43 @@ pub mod tests {
         {
             return TestResult::Fail("RKL must admit Gen12 GT regions while display stays gated");
         }
-        // Gen11 (Lane 5): identity + probe + internal-panel
-        // modeset. The BAR0 region map is admitted (Gen11 shares
-        // Gen12's partitioning) and the part is explicitly
-        // pre-GMD, display is admitted for the internal panel
-        // (fixture-validated, silicon untested), and external
-        // display + backlight stay gated (Lane 8 owns external
-        // outputs).
+        // Gen11 (Lanes 5 + 8): identity + probe + internal-panel
+        // modeset + external outputs + backlight. The BAR0 region
+        // map is admitted (Gen11 shares Gen12's partitioning)
+        // and the part is explicitly pre-GMD; display, external
+        // display and backlight are admitted (fixture-validated,
+        // silicon untested). The HPD/session layer still fails
+        // closed for Gen11 (its own Gen12 gates), so this flip
+        // arms no session path.
         if !Generation::IceLake.display_supported()
-            || Generation::IceLake.external_display_supported()
-            || Generation::IceLake.backlight_supported()
+            || !Generation::IceLake.external_display_supported()
+            || !Generation::IceLake.backlight_supported()
             || Generation::IceLake.region_generation() != Some(RegionGeneration::Gen11)
             || Generation::IceLake.has_gmd_id()
             || !Generation::TigerLake.has_gmd_id()
         {
             return TestResult::Fail(
-                "Gen11 must admit regions + internal display while external/backlight and GMD stay gated",
+                "Gen11 must admit regions + display + external + backlight while GMD stays gated",
             );
         }
         if !Generation::TigerLake.external_display_supported()
             || !Generation::AlderLake.external_display_supported()
+            || !Generation::IceLake.external_display_supported()
             || Generation::MeteorLake.external_display_supported()
             || Generation::PantherLake.external_display_supported()
         {
-            return TestResult::Fail("external display sequences must remain Gen12-only");
+            return TestResult::Fail("external display sequences must remain Gen12 + Gen11");
         }
-        // Backlight stays Gen12-only until the composition lane
+        // Backlight stays Gen12 + Gen11 (Lane 8: ICL shares
+        // the BXT-style PWM block) until the composition lane
         // (PR #1037) lands the MTL PWM path.
         if !Generation::TigerLake.backlight_supported()
             || !Generation::AlderLake.backlight_supported()
+            || !Generation::IceLake.backlight_supported()
             || Generation::MeteorLake.backlight_supported()
             || Generation::PantherLake.backlight_supported()
         {
-            return TestResult::Fail("backlight gate must be Gen12-only pending #1037");
+            return TestResult::Fail("backlight gate must be Gen12 + Gen11 pending #1037");
         }
         // Region generations follow the same split, with Lunar
         // Lake on the Xe2-LPD table (display 20) and Panther Lake

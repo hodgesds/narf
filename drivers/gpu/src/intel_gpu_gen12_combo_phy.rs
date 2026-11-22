@@ -766,8 +766,11 @@ impl ComboPhy {
     /// false — there is no HOBL table on ICL), the port-based
     /// `DP_TP_CTL` (DDI base + 0x40), and the ICL DPLL retune
     /// (`intel_gpu_gen11_dpll`). `low_vswing` is the built-in
-    /// eDP panel's VBT bit, as in `new`. Type-C DDIs (D and up)
-    /// are owned by `DklPort`, not this module.
+    /// eDP panel's VBT bit, as in `new`. Type-C DDIs (ICL C and
+    /// up) are owned by `MgPort`, not this module; EHL/JSL
+    /// PORT_D is also refused here — it shares combo PHY A
+    /// with PORT_A and has no fixed DPLL assignment (see
+    /// `intel_gpu_gen11_dpll::combo_dpll_id`).
     pub(crate) fn new_gen11(
         ddi: Ddi,
         platform: Gen11Platform,
@@ -1245,12 +1248,18 @@ impl ComboPhy {
         coeffs: crate::intel_gpu_pll::DpllCoeffs,
     ) -> Result<(), ModesetError> {
         use crate::intel_gpu_gen11_dpll::{
-            calc_dpll_state, combo_pll_disable, combo_pll_enable, IclDpllId,
+            calc_dpll_state, combo_dpll_id, combo_pll_disable, combo_pll_enable,
         };
-        let id = match self.ddi {
-            Ddi::A => IclDpllId::Dpll0,
-            Ddi::B => IclDpllId::Dpll1,
-            _ => return Err(ModesetError::UnsupportedGeneration),
+        // The fixed combo-PLL assignment (ICL A/B, EHL/JSL
+        // A/B/C); TC ports never reach this path — the modeset
+        // dispatches them to MgPort — and EHL/JSL PORT_D has no
+        // fixed assignment (shared PHY A, see `combo_dpll_id`).
+        let id = match self
+            .gen11
+            .and_then(|platform| combo_dpll_id(platform, self.ddi))
+        {
+            Some(id) => id,
+            None => return Err(ModesetError::UnsupportedGeneration),
         };
         let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
         combo_pll_disable(io, id).map_err(|_| ModesetError::PllLockTimeout)?;

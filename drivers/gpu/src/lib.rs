@@ -800,6 +800,8 @@ pub(crate) mod intel_gpu_gen11_dmc;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen11_dpll;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_gen11_mg_phy;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gen11_sagv;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen11_wm;
