@@ -3310,6 +3310,68 @@ kernel_test_in!(
     smoke_abi_pathx_statfs_flags_follow_the_mount
 );
 
+/// `user_statfs` looks the path up with LOOKUP_FOLLOW, so a final symlink
+/// answers for the filesystem its target is on. `f_fsid` is the
+/// superblock's: `simple_statfs` and the block filesystems encode its device
+/// (`u64_to_fsid(huge_encode_dev(sb->s_dev))`), the `st_dev` every file on
+/// it reports; a bind is the same superblock.
+fn smoke_abi_pathx_statfs_follows_links_and_reports_the_fsid() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"x")], || {
+        const MS_BIND: u64 = 0x1000;
+        let link = c"/p2/to-proc";
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(c"/proc".as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("symlink /p2/to-proc -> /proc failed");
+        }
+        let Some(st) = statfs_words(Syscall::Statfs.raw(), link.as_ptr() as u64) else {
+            return Err("statfs through the symlink failed");
+        };
+        if st[0] != 0x9fa0 {
+            return Err("statfs did not follow a final symlink into procfs");
+        }
+        // f_fsid is the st_dev of the filesystem, through the link too.
+        let mut sb = [0u8; STAT_SIZE];
+        if call_stat(c"/proc".as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("stat /proc failed");
+        }
+        let proc_dev = u64::from_ne_bytes(sb[..8].try_into().unwrap());
+        if proc_dev == 0 || st[7] != proc_dev {
+            return Err("statfs f_fsid is not the encoded device of the superblock");
+        }
+        let _ = call_mkdir(c"/abi-sff-bind".as_ptr() as u64, 0o755);
+        let bound = call(
+            Syscall::Mount.raw(),
+            a4(
+                c"/p2".as_ptr() as u64,
+                c"/abi-sff-bind".as_ptr() as u64,
+                0,
+                MS_BIND,
+                0,
+            ),
+        );
+        let through_bind = statfs_words(Syscall::Statfs.raw(), c"/abi-sff-bind".as_ptr() as u64);
+        let direct = statfs_words(Syscall::Statfs.raw(), c"/p2".as_ptr() as u64);
+        if bound == Some(0) {
+            let _ = call(
+                Syscall::Umount2.raw(),
+                a1(c"/abi-sff-bind".as_ptr() as u64, 0),
+            );
+        }
+        match (bound, through_bind, direct) {
+            (Some(0), Some(b), Some(d)) if b[7] == d[7] => Ok(()),
+            (Some(0), ..) => Err("a bind does not report its source's f_fsid"),
+            _ => Err("bind of /p2 failed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/statfs-fsid",
+    smoke_abi_pathx_statfs_follows_links_and_reports_the_fsid
+);
+
 // ── quotactl(cmd, special, id, addr) — Linux disk-quota control ─────
 //
 // cmd = (subcmd << 8) | type. `if_dqblk` limits are in 1 KiB quota blocks;
