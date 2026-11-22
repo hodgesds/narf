@@ -243,7 +243,13 @@ ctime, transid, sequence) in one commit (`btrfs_setxattr_trans`). An empty
 value or `removexattr` removes the ACL, and removing an absent one succeeds;
 `XATTR_CREATE` / `XATTR_REPLACE` do not apply to ACL names. Test:
 `smoke_btrfs_directory_xattrs_and_acls_follow_btrfs_set_acl`
-(`drivers/fs/btrfs/dir-xattr`).
+(`drivers/fs/btrfs/dir-xattr`). A chmod (`FileOps::set_perms`,
+`DirOps::set_dir_mode_async`) ends with `posix_acl_chmod` under the same
+hold of the inode lock (`btrfs_setattr` with `ATTR_MODE`): the stored access
+ACL takes the new owner and other bits, its mask (or `group::` without one)
+the group bits, named entries stay, and it is stored as `btrfs_set_acl`
+stores one; an inode without an access ACL gets none. Test:
+`smoke_btrfs_chmod_remasks_the_access_acl` (`drivers/fs/btrfs/acl-chmod`).
 
 ## 4. Invariants
 

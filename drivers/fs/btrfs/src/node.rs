@@ -450,6 +450,51 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         )
     }
 
+    /// `chmod`/`fchmod` (`btrfs_setattr` with `ATTR_MODE`): the permission
+    /// and special bits, ctime, then `posix_acl_chmod` — all under one hold
+    /// of the inode lock, as Linux holds `inode_lock` across `notify_change`.
+    async fn chmod(&self, perms: u16) -> Result<(), FsError> {
+        if self.tree_root.is_some() {
+            return Err(FsError::ReadOnly);
+        }
+        let vol = self.volume()?;
+        let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
+        let change = crate::write::AttrChange {
+            perms: Some(perms),
+            ..Default::default()
+        };
+        autogrow!(
+            vol,
+            async {
+                let _update = self.begin_inode_update();
+                let updated = crate::write::set_inode_attrs(&vol, self.ino, change).await?;
+                self.cache_inode(updated);
+                Ok(())
+            }
+            .await
+        )?;
+        self.acl_chmod_locked(&vol, perms).await
+    }
+
+    /// `posix_acl_chmod`, with the inode lock held: after a mode change to
+    /// `perms`, rewrite the stored access ACL with `__posix_acl_chmod_masq`
+    /// — owner and other entries from the outer triplets, the group triplet
+    /// on the mask (on `group::` without one), named entries untouched — and
+    /// store it as `btrfs_set_acl` does. No ACL, nothing to do.
+    async fn acl_chmod_locked(&self, vol: &Arc<BtrfsVolume<B>>, perms: u16) -> Result<(), FsError> {
+        use narf_filesystem::{AclType, PosixAcl};
+        let raw = match <Self as FileOps>::get_xattr(self, AclType::Access.xattr_name()).await {
+            Ok(raw) => raw,
+            Err(FsError::NotFound) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let Some(mut acl) = PosixAcl::from_xattr(&raw)? else {
+            return Ok(());
+        };
+        acl.chmod_masq(perms)?;
+        self.set_acl_locked(vol, AclType::Access, Some(acl)).await
+    }
+
     /// `set_posix_acl` → `btrfs_set_acl` for the ACL named by `ty`: `Some`
     /// sets it from its uapi `value`, `None` (removexattr, or an empty or
     /// zero-entry value) removes it.
@@ -471,17 +516,27 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         ty: narf_filesystem::AclType,
         value: Option<&[u8]>,
     ) -> Result<(), FsError> {
-        use narf_filesystem::{AclType, PosixAcl};
         if self.tree_root.is_some() {
             return Err(FsError::ReadOnly);
         }
         let acl = match value {
-            Some(v) if !v.is_empty() => PosixAcl::from_xattr(v)?,
+            Some(v) if !v.is_empty() => narf_filesystem::PosixAcl::from_xattr(v)?,
             _ => None,
         };
         let vol = self.volume()?;
         // Linux `inode_lock` around `set_posix_acl`.
         let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
+        self.set_acl_locked(&vol, ty, acl).await
+    }
+
+    /// [`Self::set_acl`] with the decoded ACL and the inode lock held.
+    async fn set_acl_locked(
+        &self,
+        vol: &Arc<BtrfsVolume<B>>,
+        ty: narf_filesystem::AclType,
+        acl: Option<narf_filesystem::PosixAcl>,
+    ) -> Result<(), FsError> {
+        use narf_filesystem::AclType;
         let inode = self.inode();
         if ty == AclType::Default && !inode.is_dir() {
             return match acl {
@@ -506,6 +561,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             None => (None, None),
         };
         let blob = stored.map(|acl| acl.to_xattr());
+        let vol = Arc::clone(vol);
         autogrow!(
             vol,
             async {
@@ -1335,12 +1391,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     }
 
     /// `chmod`/`fchmod`: the permission and special bits; the file type in
-    /// `S_IFMT` never changes. ctime moves.
+    /// `S_IFMT` never changes. ctime moves. Then, as `btrfs_setattr` ends
+    /// with `posix_acl_chmod`, the access ACL follows the new mode.
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
-        Box::pin(self.change_attrs(crate::write::AttrChange {
-            perms: Some(perms),
-            ..Default::default()
-        }))
+        Box::pin(self.chmod(perms))
     }
 
     /// `utimensat`/`futimens` (`None` = `UTIME_OMIT`). ctime moves.
