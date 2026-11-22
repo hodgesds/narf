@@ -1157,3 +1157,97 @@ fn smoke_ntp_update_offset_learns_frequency() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time", smoke_ntp_update_offset_learns_frequency);
+
+/// How much faster than the counter clock `now_wall()` advances over a
+/// `window_ns` busy wait, in ppm: `(Δwall − Δraw) / Δraw · 1e6`. Each end
+/// reads the two clocks back to back with interrupts masked, so the pair's
+/// own spread is the same at both ends and cancels.
+fn wall_rate_ppm(window_ns: u64) -> i64 {
+    let pair = || {
+        narf_lib::sync::without_interrupts(|| {
+            let raw = crate::cycles_to_ns(crate::now_cycles());
+            (raw, crate::now_wall().as_nanos())
+        })
+    };
+    let (raw0, wall0) = pair();
+    while crate::monotonic_ns() < raw0 + window_ns {
+        core::hint::spin_loop();
+    }
+    let (raw1, wall1) = pair();
+    let d_raw = (raw1 - raw0) as i128;
+    let d_wall = wall1 - wall0;
+    ((d_wall - d_raw) * 1_000_000 / d_raw) as i64
+}
+
+/// The frequency `adjtimex` holds steers the clock, as Linux's
+/// `ntp_tick_length()` → `timekeeping_adjust()` scales the timekeeper's
+/// `mult`: `ADJ_FREQUENCY` +250 ppm runs CLOCK_REALTIME 250 ppm fast of the
+/// counter, a +600 ppm request is clamped to `MAXFREQ_SCALED` (500 ppm) and
+/// steers 500 ppm, and an `ADJ_OFFSET` phase is a slew: `second_overflow()`
+/// adds one chunk of it (`time_offset >> (SHIFT_PLL + time_constant)`, here
+/// 50 ms >> 4 = 3.125 ms) to the next second's tick length, so the clock
+/// runs ~3125 ppm fast for that second and the wall offset — a step — does
+/// not move. Before this, `time_freq` was stored and reported but steered
+/// nothing, and the phase was stepped into the wall offset once a second:
+/// timesyncd sat at its +500 ppm limit, polling every 32 s, while REALTIME
+/// and MONOTONIC kept the counter's rate.
+fn smoke_ntp_frequency_and_slew_steer_the_clock_rate() -> TestResult {
+    use crate::ntp::{
+        adjtimex, tick_second, Timex, ADJ_FREQUENCY, ADJ_OFFSET, ADJ_STATUS, STA_PLL,
+    };
+    use crate::{ntp, wall};
+    const NOW_SEC: i64 = 1_700_000_000;
+    const WINDOW_NS: u64 = 20_000_000;
+    let set = |modes: u32, freq: i64, offset: i64, status: i32| {
+        let mut tx = Timex {
+            modes,
+            freq,
+            offset,
+            status,
+            ..Timex::default()
+        };
+        let _ = adjtimex(&mut tx, NOW_SEC, 0);
+        tx
+    };
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    let result = (|| {
+        let _ = set(ADJ_FREQUENCY, 250 << 16, 0, 0);
+        if !(230..=270).contains(&wall_rate_ppm(WINDOW_NS)) {
+            return TestResult::Fail("ADJ_FREQUENCY +250 ppm did not run the clock 250 ppm fast");
+        }
+        let tx = set(ADJ_FREQUENCY, 600 << 16, 0, 0);
+        if tx.freq != 500 << 16 {
+            return TestResult::Fail("ADJ_FREQUENCY +600 ppm must read back as the 500 ppm limit");
+        }
+        if !(480..=520).contains(&wall_rate_ppm(WINDOW_NS)) {
+            return TestResult::Fail("a frequency clamped to 500 ppm must steer 500 ppm");
+        }
+        let _ = set(ADJ_FREQUENCY, 0, 0, 0);
+        if wall_rate_ppm(WINDOW_NS).abs() > 20 {
+            return TestResult::Fail("frequency 0 must return the clock to the counter's rate");
+        }
+        // Slew only: PLL on, then a +50 ms phase (µs units).
+        let _ = set(ADJ_STATUS, 0, 0, STA_PLL);
+        let _ = set(ADJ_OFFSET, 0, 50_000, 0);
+        let stepped = wall::wall_offset_ns();
+        tick_second();
+        if wall::wall_offset_ns() != stepped {
+            return TestResult::Fail("an ADJ_OFFSET slew stepped the wall offset");
+        }
+        // One chunk is 3125 ppm; a live tick crossing a second boundary
+        // mid-measurement may already apply the next, 2930 ppm.
+        if !(2_700..=3_300).contains(&wall_rate_ppm(WINDOW_NS)) {
+            return TestResult::Fail("a 50 ms slew did not run the clock ~3125 ppm fast");
+        }
+        TestResult::Pass
+    })();
+    ntp::__test_reset();
+    wall::__test_reset();
+    result
+}
+kernel_test_in!(
+    "time/ntp-steer",
+    smoke_ntp_frequency_and_slew_steer_the_clock_rate
+);
