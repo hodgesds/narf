@@ -138,6 +138,22 @@ impl Program {
         }
         out
     }
+
+    /// Read results from the data page's frame as the run left it. A
+    /// program that forked shared the page copy-on-write, so its first store
+    /// afterwards may have moved it to a new frame; `_space` still maps it.
+    fn follow_data_page(&mut self) -> Result<(), &'static str> {
+        let region = self
+            ._space
+            .lookup(VirtAddr::new(DATA_VADDR))
+            .ok_or("the data page is no longer mapped")?;
+        let frame = region.backing_at(0);
+        if frame.as_u64() == 0 {
+            return Err("the data page lost its backing");
+        }
+        self.data = frame;
+        Ok(())
+    }
 }
 
 /// A fast periodic timer for the duration of a run, so user loops are
@@ -753,4 +769,198 @@ fn smoke_ia32_emptied_ss_slot_does_not_fault_iret() -> TestResult {
 kernel_test_in!(
     "verification/ia32-tls-ss",
     smoke_ia32_emptied_ss_slot_does_not_fault_iret
+);
+
+// ── fork / vfork / clone from a compatibility-mode task ─────────────
+
+/// i386 system call `nr` (eax), arguments already in ebx..ebp.
+fn i386_call(a: &mut Asm, nr: u32) {
+    a.op_imm(&[0xB8], nr).op(&[0xCD, 0x80]);
+}
+
+const CLONE_SETTLS: u32 = 0x0008_0000;
+const SIGCHLD: u32 = 17;
+
+/// The child half of the fork tests (edi = DATA): CS, GS and `%gs:[0]`
+/// stored at DATA+0x80.. and written to the pipe's write end (fds[1] at
+/// DATA+8), then `exit_group(0)`. The bytes mean the same as 64-bit code (no
+/// 0x40-0x4F, no push/pop, no absolute-disp32 ModRM), so a child resumed in
+/// the wrong mode reports that instead of hanging the run.
+fn child_report(a: &mut Asm) {
+    a.op(&[0x31, 0xC0, 0x66, 0x8C, 0xC8]) //            mov ax, cs
+        .op_imm(&[0x89, 0x87], 0x80) //                 [edi+0x80]
+        .op(&[0x31, 0xC0, 0x66, 0x8C, 0xE8]) //         mov ax, gs
+        .op_imm(&[0x89, 0x87], 0x84) //                 [edi+0x84]
+        .op(&[0x31, 0xDB, 0x65, 0x8B, 0x03]) //         mov eax, gs:[ebx = 0]
+        .op_imm(&[0x89, 0x87], 0x88) //                 [edi+0x88]
+        .op(&[0x8B, 0x5F, 0x08]) //                     ebx = fds[1]
+        .op_imm(&[0x8D, 0x8F], 0x80) //                 ecx = DATA+0x80
+        .op_imm(&[0xBA], 12); //                        edx = 12
+    i386_call(a, 4); //                                 write
+    a.op_imm(&[0xB8], 252)
+        .op(&[0x31, 0xDB, 0xCD, 0x80, 0x0F, 0x0B]); //  exit_group(0)
+}
+
+/// The parent half (eax = the child's pid): close its write end, read the
+/// child's 12-byte report into DATA+0x40, reap the child with `waitpid`
+/// (i386 7) into DATA+0x20, and read its own `%gs:[0]` into DATA+0x24.
+fn parent_collect(a: &mut Asm) {
+    a.op(&[0x89, 0x47, 0x10]) //                        [edi+0x10] = pid
+        .op(&[0x8B, 0x5F, 0x08]); //                    ebx = fds[1]
+    i386_call(a, 6); //                                 close
+    a.op(&[0x89, 0x47, 0x14])
+        .op(&[0x8B, 0x5F, 0x04]) //                     ebx = fds[0]
+        .op(&[0x8D, 0x4F, 0x40]) //                     ecx = DATA+0x40
+        .op_imm(&[0xBA], 12);
+    i386_call(a, 3); //                                 read
+    a.op(&[0x89, 0x47, 0x18])
+        .op(&[0x8B, 0x5F, 0x10]) //                     ebx = pid
+        .op(&[0x8D, 0x4F, 0x20]) //                     ecx = &status
+        .op(&[0x31, 0xD2]); //                          edx = 0
+    i386_call(a, 7); //                                 waitpid
+    a.op(&[0x89, 0x47, 0x1C])
+        .op(&[0x31, 0xDB, 0x65, 0x8B, 0x03]) //         mov eax, gs:[ebx = 0]
+        .op(&[0x89, 0x47, 0x24]);
+    i386_exit(a);
+}
+
+/// Take TLS slot 12 for the block at DATA+0x200 (the `user_desc` at INPUT),
+/// load %gs with it and open a pipe into DATA+4.
+fn tls_and_pipe(a: &mut Asm) {
+    let data = DATA_VADDR as u32;
+    a.op_imm(&[0xBF], data).op_imm(&[0xBB], data + INPUT as u32);
+    i386_set_thread_area(a);
+    a.op(&[0x89, 0x47, 0x0C]) //                        [edi+12] = ret
+        .op_imm(&[0xB8], 0x63)
+        .op(&[0x8E, 0xE8]) //                           mov gs, ax
+        .op(&[0x8D, 0x5F, 0x04]); //                    ebx = &fds
+    i386_call(a, 42); //                                pipe
+    a.op(&[0x89, 0x07]); //                             [edi] = ret
+}
+
+const MAGIC_PARENT: u32 = 0xA5A5_0012;
+const MAGIC_CHILD: u32 = 0x5A5A_0013;
+
+/// Check what `parent_collect` gathered: the child reported (CS, GS,
+/// `%gs:[0]`) = (0x23, 0x63, `child_tls`), exited 0 and was reaped, and the
+/// parent still reads its own block.
+fn check_child_report(p: &Program, child_tls: u32) -> Result<(), &'static str> {
+    if p.u32_at(0x0C) != 0 || p.u32_at(0) != 0 {
+        return Err("set_thread_area or pipe failed in the parent");
+    }
+    let pid = p.u32_at(0x10);
+    if pid as i32 <= 0 || u64::from(pid) == p.pid {
+        return Err("the i386 fork/vfork/clone did not return a child pid");
+    }
+    if p.u32_at(0x18) != 12 {
+        return Err("the parent did not receive the child's 12-byte report");
+    }
+    if p.u32_at(0x40) != 0x23 {
+        return Err("the child did not resume in compatibility mode (CS 0x23)");
+    }
+    if p.u32_at(0x44) != 0x63 {
+        return Err("the child did not keep the parent's %gs selector");
+    }
+    if p.u32_at(0x48) != child_tls {
+        return Err("the child's %gs did not read the TLS block it should have");
+    }
+    if p.u32_at(0x1C) != pid || p.u32_at(0x20) != 0 {
+        return Err("i386 waitpid did not reap the child's exit(0)");
+    }
+    if p.u32_at(0x24) != MAGIC_PARENT {
+        return Err("the parent's %gs changed under the child's TLS");
+    }
+    Ok(())
+}
+
+/// fork (i386 2) and vfork (i386 190) from a compatibility-mode task: the
+/// child returns to user mode in the parent's mode with the parent's TLS
+/// descriptors and selectors (Linux `copy_thread`: `dup_task_struct` copied
+/// `tls_array`, `save_fsgs` the selectors), so it runs i386 code with %gs
+/// still reading the parent's block. It reports CS, GS and `%gs:[0]` through
+/// a pipe; the parent reaps it with i386 `waitpid` (7).
+fn smoke_ia32_fork_child_resumes_compat_with_parent_tls() -> TestResult {
+    let data = DATA_VADDR as u32;
+    let desc = user_desc(u32::MAX, data + 0x200, 0xF_FFFF, TLS_FLAGS);
+    let magic = MAGIC_PARENT.to_le_bytes();
+    for nr in [2u32, 190] {
+        let mut a = Asm(Vec::new());
+        tls_and_pipe(&mut a);
+        i386_call(&mut a, nr);
+        a.op(&[0x85, 0xC0]); //                         test eax, eax
+        let parent = a.branch_fwd(JNE);
+        child_report(&mut a);
+        a.land(parent);
+        parent_collect(&mut a);
+        let inputs = [(INPUT, desc.as_slice()), (0x200, magic.as_slice())];
+        let mut programs = match build(&a.0, true, &inputs) {
+            Ok(p) => [p],
+            Err(why) => return TestResult::Fail(why),
+        };
+        if let Err(why) = run(&mut programs, false) {
+            return TestResult::Fail(why);
+        }
+        if let Err(why) = programs[0].follow_data_page() {
+            return TestResult::Fail(why);
+        }
+        if let Err(why) = check_child_report(&programs[0], MAGIC_PARENT) {
+            return TestResult::Fail(why);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "verification/ia32-fork",
+    smoke_ia32_fork_child_resumes_compat_with_parent_tls
+);
+
+/// i386 `clone(flags, newsp, parent_tid, tls, child_tid)` (120,
+/// `compat_sys_ia32_clone`: CONFIG_CLONE_BACKWARDS, TLS in esi before the
+/// child tid in edi) with CLONE_SETTLS: `tls` is a `struct user_desc` and
+/// the child gets it in its own TLS slot (Linux `set_new_tls` →
+/// `do_set_thread_area(p, -1, utls, 0)`), so the inherited %gs 0x63 reads
+/// the new block in the child while the parent keeps its own.
+fn smoke_ia32_clone_settls_gives_the_child_its_own_gs_base() -> TestResult {
+    let data = DATA_VADDR as u32;
+    let mut a = Asm(Vec::new());
+    tls_and_pipe(&mut a);
+    a.op_imm(&[0xBB], CLONE_SETTLS | SIGCHLD) //        ebx = flags
+        .op(&[0x31, 0xC9]) //                           ecx = newsp = 0
+        .op(&[0x31, 0xD2]) //                           edx = parent_tid = 0
+        .op_imm(&[0xBE], data + INPUT as u32 + 0x10) // esi = tls = &desc_b
+        .op(&[0x31, 0xFF]); //                          edi = child_tid = 0
+    i386_call(&mut a, 120);
+    a.op_imm(&[0xBF], data).op(&[0x85, 0xC0]); //       edi = DATA; test eax
+    let parent = a.branch_fwd(JNE);
+    child_report(&mut a);
+    a.land(parent);
+    parent_collect(&mut a);
+    let desc_a = user_desc(u32::MAX, data + 0x200, 0xF_FFFF, TLS_FLAGS);
+    let desc_b = user_desc(12, data + 0x300, 0xF_FFFF, TLS_FLAGS);
+    let magic_a = MAGIC_PARENT.to_le_bytes();
+    let magic_b = MAGIC_CHILD.to_le_bytes();
+    let inputs = [
+        (INPUT, desc_a.as_slice()),
+        (INPUT + 0x10, desc_b.as_slice()),
+        (0x200, magic_a.as_slice()),
+        (0x300, magic_b.as_slice()),
+    ];
+    let mut programs = match build(&a.0, true, &inputs) {
+        Ok(p) => [p],
+        Err(why) => return TestResult::Fail(why),
+    };
+    if let Err(why) = run(&mut programs, false) {
+        return TestResult::Fail(why);
+    }
+    if let Err(why) = programs[0].follow_data_page() {
+        return TestResult::Fail(why);
+    }
+    match check_child_report(&programs[0], MAGIC_CHILD) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "verification/ia32-fork",
+    smoke_ia32_clone_settls_gives_the_child_its_own_gs_base
 );
