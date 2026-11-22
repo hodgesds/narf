@@ -1129,10 +1129,14 @@ impl<M: ScanoutIo> Presenter<M> {
         // other planes' flip-done and the DMC flip queue, respectively).
         // Display 20 (gen8_de_pipe_fault_mask, DISPLAY_VER >= 20) keeps the
         // plane ATS fault and drops both PIPEDMC faults.
+        // Display 11 (Gen11) has no PIPEDMC fault: GEN12_PIPEDMC_FAULT
+        // (bit 25) is TGL+ (display 12+); the display-11 mask is only the
+        // cursor/plane faults, which collapse into PLANE_FAULT here.
         match self.format {
             PteFormat::Xe2 => FIFO_UNDERRUN | PLANE_FAULT | (1 << 18),
             PteFormat::XeLpg => FIFO_UNDERRUN | PLANE_FAULT | (1 << 25) | (1 << 18) | (1 << 24),
             PteFormat::Gen12 => FIFO_UNDERRUN | PLANE_FAULT | (1 << 25),
+            PteFormat::Gen8 => FIFO_UNDERRUN | PLANE_FAULT,
         }
     }
 

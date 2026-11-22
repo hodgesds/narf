@@ -1,4 +1,4 @@
-//! Gen12 / Xe-LPG GPU page-table codecs.
+//! Gen11 / Gen12 / Xe-LPG GPU page-table codecs.
 //!
 //! References: Intel PRM Memory Views; the MIT-licensed i915
 //! `gt/intel_gtt.h`, `gt/gen8_ppgtt.c` and `gt/intel_ggtt.c` in Linux v6.12.
@@ -6,7 +6,7 @@
 //!
 //! ## GTT vs PPGTT
 //!
-//! Gen12 has two page-table machineries:
+//! Every generation has two page-table machineries:
 //!
 //! - **Global GTT** (GGTT) — a single flat page table mapping the
 //!   GPU virtual address space to host physical addresses. Used
@@ -18,10 +18,10 @@
 //! Both use 64-bit entries, with different fields:
 //!
 //! ```text
-//!                         Gen12                 Xe-LPG
-//! GGTT system memory      physical | PRESENT    + PAT[1:0] in bits53:52
-//! PPGTT 4KiB system       PRESENT, RW,           + PAT[3] in bit62
-//!                         PAT[2:0] in bits7,4,3
+//!                         Gen8 (Gen11)          Gen12                 Xe-LPG
+//! GGTT system memory      physical | PRESENT    physical | PRESENT    + PAT[1:0] in bits53:52
+//! PPGTT 4KiB system       PRESENT, RW, legacy   PRESENT, RW,           + PAT[3] in bit62
+//!                         PPAT in bits7,4,3     PAT[2:0] in bits7,4,3
 //! PPGTT intermediate      physical | PRESENT | RW | PAT[1:0] in bits4:3
 //! ```
 //!
@@ -144,6 +144,18 @@ pub const PTE_PAT2: u64 = 1 << 7;
 pub const PTE_PAT3: u64 = 1 << 62;
 /// Xe2 PPGTT PAT index bit 4 (MIT xe_gtt_defs.h: XELPG_PPGTT_PTE_PAT4).
 pub const PTE_PAT4: u64 = 1 << 61;
+/// Legacy Gen8 (Gen11) PPGTT PPAT encodings (Linux `gt/intel_gtt.h:135-138`):
+/// `PPAT_UNCACHED = _PAGE_PWT | _PAGE_PCD`, `PPAT_DISPLAY_ELLC = _PAGE_PCD`,
+/// `PPAT_CACHED = _PAGE_PAT`. On 4 KiB pages the x86 cache bits are
+/// PWT = bit 3, PCD = bit 4, PAT = bit 7 — the same bit positions as
+/// `PTE_PAT0/1/2` above — so the legacy levels reuse those constants.
+pub const PPAT_UNCACHED: u64 = PTE_PAT0 | PTE_PAT1;
+/// Legacy Gen8 write-through eLLC level (`PPAT_DISPLAY_ELLC`).
+pub const PPAT_DISPLAY_ELLC: u64 = PTE_PAT1;
+/// Legacy Gen8 cached level (`PPAT_CACHED`, WB LLCeLLC).
+pub const PPAT_CACHED: u64 = PTE_PAT2;
+/// Legacy Gen8 PDE (non-leaf) cached policy: `PPAT_CACHED_PDE = 0`.
+pub const PPAT_CACHED_PDE: u64 = 0;
 /// Conservative common system-memory address field (bits 45:12).
 /// Source: MIT i915 gt/intel_gtt.h GEN12_GGTT_PTE_ADDR_MASK.
 pub const PTE_PHYS_MASK: u64 = 0x0000_3FFF_FFFF_F000;
@@ -152,6 +164,11 @@ pub const PTE_PHYS_MASK: u64 = 0x0000_3FFF_FFFF_F000;
 /// cache encoding; neither has the x86 NX bit previously emitted here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PteFormat {
+    /// Gen11 legacy PPAT encode (`gt/gen8_ppgtt.c::gen8_pte_encode`):
+    /// the PPGTT leaf `pat_index` is an `i915_cache_level`, not a PAT
+    /// index, and the GGTT has no PAT bits
+    /// (`gt/intel_ggtt.c::gen8_ggtt_pte_encode`).
+    Gen8,
     Gen12,
     XeLpg,
     /// Xe2 five-bit PPGTT PAT; GGTT still has only two PAT bits.
@@ -165,7 +182,7 @@ impl PteFormat {
             return Err(GttError::InvalidPatIndex);
         }
         let pat = match self {
-            Self::Gen12 => 0, // Gen8/Gen12 GGTT has no PAT index fields.
+            Self::Gen8 | Self::Gen12 => 0, // Gen8/Gen12 GGTT has no PAT index fields.
             Self::XeLpg | Self::Xe2 => {
                 ((pat_index as u64 & 1) << 52) | ((pat_index as u64 & 2) << 52)
             }
@@ -180,7 +197,7 @@ impl PteFormat {
     /// `stolen_base`, 8 MiB above GSMBASE, plus the DSM offset). Only the
     /// GSC private object is mapped this way; earlier formats have no DM bit.
     pub fn encode_ggtt_stolen(self, gsm_offset: u64, pat_index: u8) -> Result<u64, GttError> {
-        if self == Self::Gen12 {
+        if matches!(self, Self::Gen8 | Self::Gen12) {
             return Err(GttError::InvalidPatIndex);
         }
         Ok(self.encode_ggtt(gsm_offset, pat_index)? | PTE_DM)
@@ -192,9 +209,17 @@ impl PteFormat {
         Ok(self.encode_ggtt(vram_phys, pat_index)? | PTE_DM)
     }
 
+    /// Encode a PPGTT leaf. For Gen12/Xe-LPG/Xe2 `pat_index` is a PAT
+    /// index naming a programmed PAT entry (three bits on Gen12, four on
+    /// Xe-LPG, five on Xe2). For Gen8 it is an `i915_cache_level`
+    /// (`gem/i915_gem_object_types.h`: NONE = 0, LLC = 1, L3_LLC = 2,
+    /// WT = 3) translated by Linux `gt/gen8_ppgtt.c::gen8_pte_encode`
+    /// into the legacy PPAT bits (`gt/intel_gtt.h:135-138`).
     pub fn encode_ppgtt(self, phys: u64, pat_index: u8, writable: bool) -> Result<u64, GttError> {
         validate_phys(phys)?;
         let max = match self {
+            // `I915_MAX_CACHE_LEVEL - 1`: cache levels 0..=3.
+            Self::Gen8 => 3,
             Self::Gen12 => 7,
             Self::XeLpg => 15,
             Self::Xe2 => 31,
@@ -202,11 +227,28 @@ impl PteFormat {
         if pat_index > max {
             return Err(GttError::InvalidPatIndex);
         }
-        let pat = ((pat_index as u64 & 1) << 3)
-            | ((pat_index as u64 & 2) << 3)
-            | ((pat_index as u64 & 4) << 5)
-            | ((pat_index as u64 & 8) << 59)
-            | ((pat_index as u64 & 16) << 57);
+        let pat = match self {
+            Self::Gen8 => {
+                // Legacy Gen8 leaf encode: the cache level selects the
+                // PPAT bits directly — there is no PAT table to index.
+                // `I915_CACHE_NONE` (0) is uncached, `I915_CACHE_WT`
+                // (3) is write-through eLLC, and every other level
+                // (`I915_CACHE_LLC`, `I915_CACHE_L3_LLC`) is cached,
+                // matching `gen8_pte_encode`'s `default:` arm.
+                match pat_index {
+                    0 => PPAT_UNCACHED,
+                    3 => PPAT_DISPLAY_ELLC,
+                    _ => PPAT_CACHED,
+                }
+            }
+            _ => {
+                ((pat_index as u64 & 1) << 3)
+                    | ((pat_index as u64 & 2) << 3)
+                    | ((pat_index as u64 & 4) << 5)
+                    | ((pat_index as u64 & 8) << 59)
+                    | ((pat_index as u64 & 16) << 57)
+            }
+        };
         Ok(phys | PTE_PRESENT | if writable { PTE_RW } else { 0 } | pat)
     }
 }
@@ -269,11 +311,12 @@ pub enum GttError {
     InvalidPatIndex,
 }
 
-/// Display-only address policy. Gen12 integrated scanout shares the PCI
-/// function's39-bit DMA mask (xe_pci.c / xe_set_dma_info). The common codec
+/// Display-only address policy. Gen11/Gen12 integrated scanout shares the
+/// PCI function's 39-bit DMA mask (xe_pci.c / xe_set_dma_info; Gen11's
+/// 39-bit mask is `i915_pci.c` GEN11_FEATURES via GEN9/GEN8). The common codec
 /// stays wider for DG2 execution; this helper never admits Arc display.
 pub(crate) fn encode_display_pte(format: PteFormat, phys: u64, pat: u8) -> Result<u64, GttError> {
-    if format == PteFormat::Gen12 && phys >> 39 != 0 {
+    if matches!(format, PteFormat::Gen8 | PteFormat::Gen12) && phys >> 39 != 0 {
         return Err(GttError::PhysOutOfRange);
     }
     format.encode_ggtt(phys, pat)
@@ -776,6 +819,58 @@ pub mod tests {
         "drivers/gpu/intel_gpu_gtt",
         smoke_xelpg_and_gen12_page_table_vectors
     );
+
+    fn smoke_gen8_legacy_ppat_vectors() -> TestResult {
+        // Linux `gt/gen8_ppgtt.c::gen8_pte_encode` + `gt/intel_gtt.h:135-138`:
+        // the leaf `pat_index` is an `i915_cache_level` (NONE = 0, LLC = 1,
+        // L3_LLC = 2, WT = 3): NONE -> PWT|PCD (bits 3,4), WT -> PCD (bit 4),
+        // anything else cached -> PAT (bit 7). The GGTT has no PAT bits:
+        // `gt/intel_ggtt.c::gen8_ggtt_pte_encode` returns addr | PRESENT for
+        // every pre-MTL generation, Gen11 included (the two PAT bits at
+        // 53:52 belong to `mtl_ggtt_pte_encode`, selected only at
+        // `GRAPHICS_VER_FULL >= IP_VER(12, 70)`).
+        let phys = 0x0000_0123_4567_8000;
+        let cases = [
+            (
+                PteFormat::Gen8.encode_ppgtt(phys, 0, true),
+                0x0000_0123_4567_801b,
+            ),
+            (
+                PteFormat::Gen8.encode_ppgtt(phys, 1, true),
+                0x0000_0123_4567_8083,
+            ),
+            (
+                PteFormat::Gen8.encode_ppgtt(phys, 2, true),
+                0x0000_0123_4567_8083,
+            ),
+            (
+                PteFormat::Gen8.encode_ppgtt(phys, 3, true),
+                0x0000_0123_4567_8013,
+            ),
+            (
+                PteFormat::Gen8.encode_ppgtt(phys, 1, false),
+                0x0000_0123_4567_8081,
+            ),
+            (PteFormat::Gen8.encode_ggtt(phys, 3), 0x0000_0123_4567_8001),
+            (PteFormat::Gen8.encode_ggtt(phys, 0), 0x0000_0123_4567_8001),
+        ];
+        for (actual, expected) in cases {
+            if actual != Ok(expected) {
+                return TestResult::Fail("Gen11 legacy PPAT reference vector");
+            }
+        }
+        if PteFormat::Gen8.encode_ppgtt(phys, 4, true) != Err(GttError::InvalidPatIndex)
+            || PteFormat::Gen8.encode_ggtt(phys, 4) != Err(GttError::InvalidPatIndex)
+            || PteFormat::Gen8.encode_ggtt_stolen(0x1000, 0) != Err(GttError::InvalidPatIndex)
+        {
+            return TestResult::Fail("unrepresentable Gen8 PAT index admitted");
+        }
+        if encode_display_pte(PteFormat::Gen8, 0x8000000000, 0) != Err(GttError::PhysOutOfRange) {
+            return TestResult::Fail("Gen8 display PTE must keep the 39-bit DMA mask");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gtt", smoke_gen8_legacy_ppat_vectors);
 
     fn smoke_pte_rejects_unaligned_phys() -> TestResult {
         match encode_scanout_pte(0x1234, PatSlot::Slot2) {

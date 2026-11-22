@@ -111,6 +111,11 @@ impl ExecRequest {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
+            // Gen11 legacy PPAT: the leaf `pat` is an `i915_cache_level`
+            // (`gen8_pte_encode`), and cached is the Linux default on
+            // shared-LLC Gen11 (`I915_CACHE_LLC` = 1 -> `PPAT_CACHED`).
+            // The table policy is the legacy cached PDE (`PPAT_CACHED_PDE` = 0).
+            GtPlatform::Gen11(_) => (PteFormat::Gen8, 1, 0),
             GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             _ if platform.is_dg2() => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::Xe2, 2, 2),
@@ -637,6 +642,10 @@ impl ResidentBatch {
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
                 (PteFormat::XeLpg, 3, 2)
             }
+            // Gen11 legacy PPAT (see `prepare_for_gt`): leaf 1 is
+            // `I915_CACHE_LLC` -> `PPAT_CACHED`; table policy 0 is the
+            // legacy cached PDE (`PPAT_CACHED_PDE`).
+            GtPlatform::Gen11(_) => (PteFormat::Gen8, 1, 0),
             GtPlatform::Gen12(_) => (PteFormat::Gen12, 0, 0),
             _ if platform.is_dg2() => (PteFormat::Gen12, 0, 0),
             GtPlatform::Battlemage => (PteFormat::Xe2, 2, 2),
@@ -1114,4 +1123,52 @@ impl Drop for AddressSpace {
             tables.teardown(&mut self.memory);
         }
     }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_gen11_exec_maps_to_gen8_and_gen12_unchanged() -> TestResult {
+        // `ResidentBatch::from_vm` builds the platform's address space,
+        // so its recorded format pins the platform -> PTE format mapping
+        // of both `from_vm` and (by the shared match) `prepare_for_gt`.
+        let no_mappings: &[VmMapping] = &[];
+        for (platform, expected) in [
+            (
+                GtPlatform::Gen11(crate::intel_gpu_gt::Gen11Platform::IceLake),
+                PteFormat::Gen8,
+            ),
+            (
+                GtPlatform::Gen11(crate::intel_gpu_gt::Gen11Platform::ElkhartLake),
+                PteFormat::Gen8,
+            ),
+            (
+                GtPlatform::Gen11(crate::intel_gpu_gt::Gen11Platform::JasperLake),
+                PteFormat::Gen8,
+            ),
+            (
+                GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake),
+                PteFormat::Gen12,
+            ),
+            (
+                GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+                PteFormat::XeLpg,
+            ),
+        ] {
+            let batch = match ResidentBatch::from_vm(platform, no_mappings, None, false, None) {
+                Ok(batch) => batch,
+                Err(_) => return TestResult::Fail("from_vm refused a platform mapping"),
+            };
+            if batch.format() != expected {
+                return TestResult::Fail("platform must select its PTE format");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_exec",
+        smoke_gen11_exec_maps_to_gen8_and_gen12_unchanged
+    );
 }
