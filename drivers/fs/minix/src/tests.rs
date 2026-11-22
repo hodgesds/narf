@@ -467,6 +467,56 @@ fn smoke_minix_mount_ramblock_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/minix", smoke_minix_mount_ramblock_round_trip);
 
+/// `minix_statfs`: `f_blocks = (s_nzones - s_firstdatazone) <<
+/// s_log_zone_size`, `f_bfree = f_bavail` the clear bits of the zone bitmap
+/// (`minix_count_free_blocks`), `f_files = s_ninodes`, `f_ffree` the clear
+/// bits of the inode bitmap, and `f_namelen` the version's name length.
+/// `count_free` counts every bit of the bitmap blocks, so the image pads the
+/// bits past the last inode and zone as set, as mkfs.minix does.
+fn smoke_minix_statfs_counts_the_bitmaps() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    const BS: usize = 1024;
+    let mut img = build_minix3_image(b"hello minix\n");
+    // 32 inodes: bits 0..=32 are real. Zones 5..32: bits 0..=27 are real.
+    for (block, real_bits) in [(2usize, 33usize), (3, 28)] {
+        for bit in real_bits..BS * 8 {
+            img[BS * block + bit / 8] |= 1 << (bit % 8);
+        }
+    }
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("MinixVolume::mount failed"),
+    };
+    let stat = match poll_once(volume.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("statfs failed"),
+    };
+    if stat.block_size != 1024 || stat.fragment_size != 1024 || stat.blocks != 27 {
+        return TestResult::Fail("statfs did not report the 27 1024-byte data zones");
+    }
+    // Bits 0..=2 of each bitmap are set: 25 zones and 30 inodes are free.
+    if stat.blocks_free != 25 || stat.blocks_available != 25 {
+        return TestResult::Fail("statfs did not count the zone bitmap's free bits");
+    }
+    if stat.files != 32 || stat.files_free != 30 {
+        return TestResult::Fail("statfs did not count the inode bitmap's free bits");
+    }
+    if stat.name_len != 60 {
+        return TestResult::Fail("statfs f_namelen is not the V3 name length");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix/statfs",
+    smoke_minix_statfs_counts_the_bitmaps
+);
+
 // ── Write smoke tests ───────────────────────────────────────────────
 
 /// Build a fresh V3 image with enough room for write-path exercise.
