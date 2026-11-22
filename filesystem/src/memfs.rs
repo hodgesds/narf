@@ -4121,6 +4121,18 @@ impl FsInstance for MemFs {
         self.name
     }
 
+    /// A MemFs named after a Linux pseudo-filesystem it stands in for
+    /// (`securityfs`, `tracefs`, `configfs`, ...) lists as that type; any
+    /// other — `/dev/shm`, `/tmp`, a labelled tree — is what Linux serves
+    /// such trees from, `tmpfs`.
+    fn fs_type(&self) -> &str {
+        if crate::super_magic::for_fs_type(self.name) == crate::super_magic::TMPFS_MAGIC {
+            "tmpfs"
+        } else {
+            self.name
+        }
+    }
+
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
         Box::pin(async move { Ok(self.superblock.statfs()) })
     }

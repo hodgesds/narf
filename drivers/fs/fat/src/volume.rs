@@ -946,4 +946,10 @@ impl<B: BlockDevice + 'static> FsInstance for FatVolume<B> {
             FatVersion::Fat32 => "fat32",
         }
     }
+
+    /// Linux mounts every FAT width through `vfat` (long names), the type
+    /// the mount listings print.
+    fn fs_type(&self) -> &str {
+        "vfat"
+    }
 }

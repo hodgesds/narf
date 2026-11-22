@@ -274,6 +274,15 @@ impl FsInstance for OverlayFs {
         self.name
     }
 
+    /// `overlay`, except that the overlay owning its lower instance stands in
+    /// for that filesystem (see `magic`).
+    fn fs_type(&self) -> &str {
+        match self.pinned.first() {
+            Some(lower) => lower.fs_type(),
+            None => "overlay",
+        }
+    }
+
     /// `ovl_statfs` reports `OVERLAYFS_SUPER_MAGIC`. The overlay that owns
     /// its lower instance stands in for that filesystem instead — the
     /// session-writable root over an installed btrfs root is that btrfs to

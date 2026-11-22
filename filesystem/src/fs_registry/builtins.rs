@@ -44,27 +44,25 @@ fn cgroup(_r: &MountRequest<'_>) -> Built {
 pub(super) fn types() -> Vec<FileSystemType> {
     let mut types = alloc::vec![
         FileSystemType::new("tmpfs", tmpfs),
-        FileSystemType::new("shmfs", tmpfs),
-        FileSystemType::new("shm", tmpfs),
+        FileSystemType::new("shmfs", tmpfs).alias(),
+        FileSystemType::new("shm", tmpfs).alias(),
         FileSystemType::new("ramfs", ramfs),
         FileSystemType::new("proc", |_| Ok(Arc::new(crate::procfs::ProcFs))),
-        FileSystemType::new("procfs", |_| Ok(Arc::new(crate::procfs::ProcFs))),
+        FileSystemType::new("procfs", |_| Ok(Arc::new(crate::procfs::ProcFs))).alias(),
         FileSystemType::new("sysfs", |_| Ok(Arc::new(crate::SysFs::new()))),
         FileSystemType::new("devtmpfs", |_| Ok(Arc::new(crate::DevFs::new()))),
-        FileSystemType::new("devfs", |_| Ok(Arc::new(crate::DevFs::new()))),
+        FileSystemType::new("devfs", |_| Ok(Arc::new(crate::DevFs::new()))).alias(),
         FileSystemType::new("cgroup2", cgroup),
         FileSystemType::new("cgroup", cgroup),
         FileSystemType::new("bpf", |_| Ok(Arc::new(crate::bpffs::BpfFs::new()))),
-        FileSystemType::new("bpffs", |_| Ok(Arc::new(crate::bpffs::BpfFs::new()))),
+        FileSystemType::new("bpffs", |_| Ok(Arc::new(crate::bpffs::BpfFs::new()))).alias(),
         FileSystemType::new("devpts", devpts),
         FileSystemType::new("debugfs", |_| Ok(Arc::new(crate::debugfs::DebugFs::new()))),
         FileSystemType::new("efivarfs", efivarfs),
     ];
     // Existing compatibility placeholders remain explicitly registered. They
     // provide directories only, not the semantics of their Linux namesakes.
-    types.push(FileSystemType::new("memfs", |_| {
-        Ok(Arc::new(crate::MemFs::new("memfs")))
-    }));
+    types.push(FileSystemType::new("memfs", |_| Ok(Arc::new(crate::MemFs::new("memfs")))).alias());
     types.push(FileSystemType::new("securityfs", |_| {
         Ok(Arc::new(crate::MemFs::new("securityfs")))
     }));

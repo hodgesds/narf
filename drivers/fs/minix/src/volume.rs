@@ -1558,6 +1558,11 @@ impl<B: BlockDevice + 'static> FsInstance for MinixVolume<B> {
         }
     }
 
+    /// Linux's one `minix` type serves every version.
+    fn fs_type(&self) -> &str {
+        "minix"
+    }
+
     /// `minix_statfs`: `buf->f_type = sb->s_magic`, the on-disk magic, which
     /// also tells the name length apart.
     fn magic(&self) -> u64 {

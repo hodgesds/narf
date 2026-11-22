@@ -139,8 +139,9 @@ pub use devfs::{
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile, UinputControlFile};
 pub use efivarfs::EfivarFs;
 pub use fs_registry::{
-    lookup_fstype, register_block_fstype, register_block_fstype_ctx, register_fs_type,
-    register_fstype, registered_fstypes, FileSystemType, FsBuilder, FsInit, MountRequest,
+    lookup_fstype, register_block_fstype, register_block_fstype_alias_ctx,
+    register_block_fstype_ctx, register_fs_type, register_fstype, registered_fstypes,
+    FileSystemType, FsBuilder, FsInit, MountRequest,
 };
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
@@ -3024,14 +3025,25 @@ pub trait FsInstance: Send + Sync + 'static {
         String::from("/")
     }
 
+    /// The filesystem type the mount listings print: Linux's `show_type`,
+    /// `sb->s_type->name` plus `.<subtype>` for a superblock that has one
+    /// (`fuse.portal`). It is the registered Linux type, where [`Self::name`]
+    /// is this instance's own label — a FAT volume is named by its FAT width
+    /// and lists as `vfat`, an in-memory tree under a label lists as `tmpfs`.
+    /// The default is the name, for the filesystems whose name already is
+    /// their Linux type.
+    fn fs_type(&self) -> &str {
+        self.name()
+    }
+
     /// The superblock magic `statfs(2)` reports as `f_type`: Linux's
     /// `sb->s_magic`, which every filesystem's `->statfs` copies into
-    /// `buf->f_type`. The default derives it from [`Self::name`], the type
-    /// name `/proc/mounts` prints ([`super_magic::for_fs_type`]). A
-    /// filesystem whose magic depends on the volume (minix), or that is
-    /// another filesystem's superblock seen through a bind, answers itself.
+    /// `buf->f_type`. The default derives it from [`Self::fs_type`]
+    /// ([`super_magic::for_fs_type`]). A filesystem whose magic depends on
+    /// the volume (minix), or that is another filesystem's superblock seen
+    /// through a bind, answers itself.
     fn magic(&self) -> u64 {
-        super_magic::for_fs_type(self.name())
+        super_magic::for_fs_type(self.fs_type())
     }
 
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
@@ -4172,7 +4184,7 @@ fn mountinfo_rows_of(mounts: &[&Mount]) -> Vec<MountInfoRow> {
                 mount.id,
                 parent,
                 mount.path.clone(),
-                String::from(mount.fs.name()),
+                String::from(mount.fs.fs_type()),
                 mnt_flags::render(mount.flags()),
                 mount.fs.show_options(),
                 sb_flags::render(sb_flags::of(&mount.fs)),
@@ -5588,6 +5600,9 @@ impl FsInstance for BindMount {
     fn backing_identity(&self) -> usize {
         self.backing_identity
     }
+    fn fs_type(&self) -> &str {
+        self.source.fs_type()
+    }
     /// A bind is the source's superblock: `statfs_by_dentry` reaches the
     /// same `->statfs` through either path.
     fn magic(&self) -> u64 {
@@ -5673,6 +5688,9 @@ impl FsInstance for FileMount {
     }
     fn root_file(&self) -> Option<Arc<dyn FileOps>> {
         Some(self.file.clone())
+    }
+    fn fs_type(&self) -> &str {
+        self.source.fs_type()
     }
     fn magic(&self) -> u64 {
         self.source.magic()
@@ -6922,6 +6940,10 @@ impl FsInstance for Initramfs {
     fn name(&self) -> &str {
         self.name
     }
+    /// The unpacked initramfs is Linux's `rootfs` (`init_rootfs`).
+    fn fs_type(&self) -> &str {
+        "rootfs"
+    }
 }
 
 struct InitramfsRoot {
@@ -7468,6 +7490,9 @@ impl FsInstance for VirtiofsMount {
     }
     fn name(&self) -> &str {
         self.name
+    }
+    fn fs_type(&self) -> &str {
+        "virtiofs"
     }
 }
 

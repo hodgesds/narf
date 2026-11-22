@@ -3618,7 +3618,9 @@ fn gen_filesystems() -> String {
     let mut types = crate::registered_fstypes();
     types.sort_by_key(|entry| entry.name);
     let mut text = String::new();
-    for entry in types {
+    // `/proc/filesystems` lists the registered Linux types; a NARF alias
+    // that mount(2) also accepts is not one.
+    for entry in types.into_iter().filter(|entry| entry.listed) {
         let prefix = if entry.requires_device { "" } else { "nodev" };
         let _ = writeln!(text, "{}\t{}", prefix, entry.name);
     }

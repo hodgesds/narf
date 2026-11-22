@@ -2544,6 +2544,8 @@ impl DirOps for FuseDir {
 /// well-known nodeid 1.
 pub struct FuseFs {
     name: String,
+    /// `fuse`, or `fuse.<subtype>` (`show_type` appends `sb->s_subtype`).
+    fs_type: String,
     conn: Arc<FuseConnection>,
 }
 
@@ -2560,10 +2562,19 @@ impl FuseFs {
     /// Build a `FuseFs` over an existing connection (recovered from the
     /// mount's `fd=N`). The FUSE_INIT handshake must be driven separately
     /// via [`FuseFs::init`] before the FS is usable.
+    ///
+    /// `name` is the subtype (`portal` for a `fuse.portal` mount), or `fuse`
+    /// / `fuseblk` for a mount without one; the listed type follows from it.
     pub fn new(name: impl Into<String>, conn: Arc<FuseConnection>) -> Self {
         conn.ensure_sysfs();
+        let name = name.into();
+        let fs_type = match name.as_str() {
+            "fuse" | "fuseblk" => name.clone(),
+            subtype => alloc::format!("fuse.{subtype}"),
+        };
         FuseFs {
-            name: name.into(),
+            name,
+            fs_type,
             conn,
         }
     }
@@ -2669,6 +2680,10 @@ impl FsInstance for FuseFs {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn fs_type(&self) -> &str {
+        &self.fs_type
     }
 
     /// `fuse_fill_super`: `sb->s_magic = FUSE_SUPER_MAGIC` whatever the
