@@ -3743,7 +3743,15 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_pivot_root_same_root_busy_neg);
 // arms above cannot be tightened into rejecting a legitimate pivot.
 fn smoke_abi_fsx_pivot_root_pos() -> TestResult {
     with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MNT_DETACH: u64 = 2;
         crate::handlers::__test_root_dir_reset();
+        // pivot_root rearranges the caller's whole mount namespace; in a
+        // private one the rearrangement goes with the case instead of
+        // staying in the initial namespace every later case reads.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
         let source = b"none\0";
         let new_root = b"/abi-pvr-ok\0";
         let fstype = b"tmpfs\0";
@@ -3774,11 +3782,20 @@ fn smoke_abi_fsx_pivot_root_pos() -> TestResult {
         );
         let installed = crate::handlers::root_dir_of(FAKE_TASK);
         let installed_ok = installed.as_deref() == Some("/abi-pvr-ok");
+        // Then what a pivoting init does next: detach the old root from
+        // put_old (`umount2(put_old, MNT_DETACH)`), seen from the new root.
+        let detached = (r == Some(0)).then(|| {
+            call(
+                Syscall::Umount2.raw(),
+                a1(c"/old".as_ptr() as u64, MNT_DETACH),
+            )
+        });
         crate::handlers::__test_root_dir_reset();
         crate::handlers::__test_cwd_reset();
-        match (r, installed_ok) {
-            (Some(0), true) => Ok(()),
-            (Some(0), false) => Err("pivot_root returned 0 without installing the new root"),
+        match (r, installed_ok, detached) {
+            (Some(0), true, Some(Some(0))) => Ok(()),
+            (Some(0), false, _) => Err("pivot_root returned 0 without installing the new root"),
+            (Some(0), true, _) => Err("umount2(put_old, MNT_DETACH) after pivot_root failed"),
             _ => Err("pivot_root into a real directory mount must return 0"),
         }
     })

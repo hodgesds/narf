@@ -3784,8 +3784,9 @@ kernel_test_in!(
 );
 
 /// Each mount is listed once after a `pivot_root` the caller steps back out
-/// of — what `smoke_abi_fsx_pivot_root_pos` leaves behind in the initial
-/// mount namespace: it pivots into a tmpfs and then resets its root to "/".
+/// of: a task pivots the initial mount namespace into a tmpfs and then resets
+/// its root to "/" (what `smoke_abi_fsx_pivot_root_pos` left behind before it
+/// moved into a mount namespace of its own).
 ///
 /// `pivot_root` moves the old root's mounts to put_old (`attach_mnt`); NARF's
 /// path-keyed table holds them twice, as the copies at put_old and the
@@ -4020,10 +4021,11 @@ fn listmount_paged_ids() -> Result<alloc::vec::Vec<u64>, &'static str> {
     }
 }
 
-/// The same state after the cleanup the `userspace/mount` pivot smokes use:
-/// they pop the topmost mount at put_old and the new root straight from the
-/// registry, which takes the old root's attachment but not the mounts that
-/// were attached below it.
+/// The same state after a raw registry pop of the topmost mount at put_old
+/// and of the new root — the kernel-internal `VfsRegistry::unmount`, which
+/// the `userspace/mount` pivot smokes cleaned up with before they used
+/// `umount2(MNT_DETACH)` — which takes the old root's attachment but not the
+/// mounts that were attached below it.
 ///
 /// Linux cannot get there — `umount_tree` takes an attachment's children
 /// with it, and a plain umount of a mount with children is -EBUSY — so the
