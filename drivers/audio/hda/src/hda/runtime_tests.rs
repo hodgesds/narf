@@ -1522,27 +1522,33 @@ fn native_hda_hdmi_passthrough_and_channel_map() -> TestResult {
     {
         return TestResult::Fail("initial IEC958 state");
     }
-    // The switch is DIGEN on every port's converter.
+    // With the PCM closed its IEC958 state is unassigned
+    // (snd_hda_spdif_ctls_unassign): the switch and the status are kept for
+    // the next open and reach no converter.
+    let digital = |verbs: &[u32]| {
+        verbs
+            .iter()
+            .any(|v| matches!((v >> 8) & 0xfff, 0x70d | 0x70e))
+    };
     let first = fixture.model.verbs.len();
     if card
         .set_control(switch, ControlValue::boolean(false))
         .is_err()
-        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70d00))
-        || !fixture.model.verbs[first..].contains(&make_verb(0, 4, 0x70d00))
         || card.get_control(switch) != Ok(ControlValue::boolean(false))
         || card
             .set_control(switch, ControlValue::boolean(true))
             .is_err()
+        || digital(&fixture.model.verbs[first..])
     {
         return TestResult::Fail("IEC958 switch");
     }
-    // Non-audio status: DIG1 NONAUDIO | DIGEN and DIG2 category.
+    // Non-audio status: DIG1 NONAUDIO | DIGEN and DIG2 category at the next
+    // prepare.
     let first = fixture.model.verbs.len();
     if card
         .set_control(status, ControlValue::iec958(&[0x06, 0x02]))
         .is_err()
-        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70d21))
-        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70e02))
+        || digital(&fixture.model.verbs[first..])
         || card.get_control(status) != Ok(ControlValue::iec958(&[0x06, 0x02]))
     {
         return TestResult::Fail("IEC958 non-audio status");
@@ -4083,4 +4089,115 @@ fn native_hda_components_and_hdmi_pcm_names() -> TestResult {
 kernel_test_in!(
     "audio/hda/pcm-names",
     native_hda_components_and_hdmi_pcm_names
+);
+
+/// Linux keeps one hda_spdif_out per HDMI PCM (snd_hda_create_dig_out_ctls
+/// for each PCM, its DIG1/DIG2 read from cvt_nids[0]) and leaves it
+/// unassigned until the PCM opens (hdmi_pcm_open: snd_hda_spdif_ctls_assign
+/// to the PCM's converter; close: unassign). A closed PCM's IEC958 write is
+/// only stored; an open PCM's reaches its own converter. The channel map is
+/// the pin's: without an open stream a write is ignored and the map reads
+/// zeros. NARF shared one state between all PCMs and wrote it to every
+/// port's converter. On this host's Linux, `amixer -c0` shows "IEC958
+/// Playback Default" index 0 at AES1 0x82 (in use) and indices 1..5 at 0.
+fn native_hda_hdmi_iec958_state_per_pcm() -> TestResult {
+    use narf_drivers_sound::mixer::{ControlId, ControlKind, ControlValue};
+    let fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let id = |index, kind| ControlId { index, kind };
+    // PCM 0 (device 3) keeps indices 5..9; PCM 1 (device 7) has 34..38.
+    let status = [
+        id(7, ControlKind::Iec958Default),
+        id(36, ControlKind::Iec958Default),
+    ];
+    let switch = [
+        id(8, ControlKind::Iec958Switch),
+        id(37, ControlKind::Iec958Switch),
+    ];
+    let chmap = [
+        id(9, ControlKind::ChannelMap),
+        id(38, ControlKind::ChannelMap),
+    ];
+    // SET_DIGI_CONVERT_1/2 to converter `nid`.
+    let digital = |verbs: &[u32], nid: u32| {
+        verbs
+            .iter()
+            .any(|v| (v >> 20) & 0x7f == nid && matches!((v >> 8) & 0xfff, 0x70d | 0x70e))
+    };
+    let first = fixture.model.verbs.len();
+    if card
+        .set_control(status[1], ControlValue::iec958(&[0x04, 0x05]))
+        .is_err()
+        || card
+            .set_control(switch[1], ControlValue::boolean(false))
+            .is_err()
+        || digital(&fixture.model.verbs[first..], 2)
+        || digital(&fixture.model.verbs[first..], 4)
+    {
+        return TestResult::Fail("a closed PCM's IEC958 write reaches no converter");
+    }
+    if card.get_control(status[1]) != Ok(ControlValue::iec958(&[0x04, 0x05]))
+        || card.get_control(switch[1]) != Ok(ControlValue::boolean(false))
+        || card.get_control(status[0]) != Ok(ControlValue::iec958(&[0x04, 0x02]))
+        || card.get_control(switch[0]) != Ok(ControlValue::boolean(true))
+    {
+        return TestResult::Fail("each HDMI PCM keeps its own IEC958 state");
+    }
+    // Opening device 7 assigns PCM 1 to pin 5's converter: the prepare
+    // writes PCM 1's DIG1 (DIGEN off) and DIG2 (category 5) there only.
+    let Ok(mut playback) = card.open(false, 7) else {
+        return TestResult::Fail("open device 7");
+    };
+    let first = fixture.model.verbs.len();
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("prepare device 7");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    if !verbs.contains(&make_verb(0, 4, 0x70d00))
+        || !verbs.contains(&make_verb(0, 4, 0x70e05))
+        || digital(verbs, 2)
+    {
+        return TestResult::Fail("the open PCM's converter takes that PCM's DIG1/DIG2");
+    }
+    // The open PCM's write reaches its converter; the closed PCM's does not.
+    let first = fixture.model.verbs.len();
+    if card
+        .set_control(switch[1], ControlValue::boolean(true))
+        .is_err()
+        || !fixture.model.verbs[first..].contains(&make_verb(0, 4, 0x70d01))
+        || card
+            .set_control(switch[0], ControlValue::boolean(false))
+            .is_err()
+        || digital(&fixture.model.verbs[first..], 2)
+    {
+        return TestResult::Fail("only the open PCM's IEC958 write reaches a converter");
+    }
+    // Each PCM reports its own pin's channel map.
+    if card
+        .set_control(chmap[0], ControlValue::integers(&[4, 3, 0, 0, 0, 0, 0, 0]))
+        .is_err()
+        || card.get_control(chmap[0]) != Ok(ControlValue::integers(&[0; 8]))
+        || card.get_control(chmap[1]) != Ok(ControlValue::integers(&[3, 4, 0, 0, 0, 0, 0, 0]))
+    {
+        return TestResult::Fail("each PCM reports its own pin's channel map");
+    }
+    drop(playback);
+    if card.get_control(chmap[1]) != Ok(ControlValue::integers(&[0; 8]))
+        || card.get_control(status[1]) != Ok(ControlValue::iec958(&[0x04, 0x05]))
+    {
+        return TestResult::Fail("close resets the map and keeps the IEC958 state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/hdmi-iec958",
+    native_hda_hdmi_iec958_state_per_pcm
 );
