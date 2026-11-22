@@ -348,16 +348,21 @@ pub async fn softirq_run(
     handoff: &SoftirqHandoff,
     now_ns: impl Fn() -> u64,
 ) -> SoftirqEnd {
-    let _ = handoff;
-    let _ = now_ns();
+    let mut budget = SoftirqBudget::start(now_ns());
     loop {
-        let (_, pending) = poll();
+        let (processed, pending) = poll();
         if !pending {
             if complete() {
                 continue;
             }
             return SoftirqEnd::Completed;
         }
+        if budget.account(processed, now_ns()) == SoftirqNext::Defer {
+            handoff.defer();
+            return SoftirqEnd::Deferred;
+        }
+        // The CPU's other receive pumps get their turn, as net_rx_action
+        // rotates its poll list; tasks of lower classes do not.
         narf_scheduler::yield_now().await;
     }
 }
@@ -368,11 +373,24 @@ pub async fn softirq_run(
 /// it with between runs (`cond_resched`), until a poll leaves the ring
 /// empty; then hands the queue back to the pump, which completes it.
 pub async fn deferral_run(
-    poll: impl FnMut() -> (u32, bool),
+    mut poll: impl FnMut() -> (u32, bool),
     handoff: &SoftirqHandoff,
     now_ns: impl Fn() -> u64,
 ) {
-    let _ = (poll, handoff, now_ns);
+    loop {
+        let mut budget = SoftirqBudget::start(now_ns());
+        loop {
+            let (processed, pending) = poll();
+            if !pending {
+                handoff.hand_back();
+                return;
+            }
+            if budget.account(processed, now_ns()) == SoftirqNext::Defer {
+                break;
+            }
+        }
+        narf_scheduler::yield_now().await;
+    }
 }
 
 fn wake(slot: &IrqSafeSpinLock<Option<Waker>>) {
