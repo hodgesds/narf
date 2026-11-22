@@ -1304,3 +1304,445 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_time_and_uname_layouts
 );
+
+// ── Phase 2: what a dynamically linked i386 glibc needs ───────────────
+
+const AT_FDCWD32: u64 = 0xFFFF_FF9C;
+const AT_EMPTY_PATH: u64 = 0x1000;
+const P2_FILE: &[u8] = b"abcdef";
+
+/// Run `body` in an IA-32 address space with `/compat32-p2/f` (`P2_FILE`)
+/// mounted; `body` gets the data-segment scratch base.
+fn with_p2_fixture(body: impl FnOnce(u64) -> Result<(), &'static str>) -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["p2"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-p2", "compat32-p2", &[("f", P2_FILE)], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            put_user(base + 0xF00, b"/compat32-p2/f\0")?;
+            put_user(base + 0xF20, b"/compat32-p2\0")?;
+            put_user(base + 0xF40, b"\0")?;
+            body(base)
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+
+fn get_u64(va: u64) -> Result<u64, &'static str> {
+    let b = get_user(va, 8)?;
+    Ok(u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8])))
+}
+
+/// The i386 stat family writes `struct stat64` (`arch/x86/include/asm/
+/// ia32.h`, packed, 96 bytes) through `cp_stat64`: `st_dev` at 0, the
+/// truncated `__st_ino` at 12, `st_mode` 16, `st_nlink` 20, `st_size` 44,
+/// `st_blksize` 52, `st_blocks` 56, the 32-bit times from 64 and the full
+/// `st_ino` at 88 — for `fstat64` (197), `stat64` (195), `lstat64` (196)
+/// and `fstatat64` (300, with AT_FDCWD and with AT_EMPTY_PATH). The values
+/// are the native `newfstatat`'s. `statx` (383) shares the native layout.
+fn smoke_compat32_table_stat64_and_statx_layouts() -> TestResult {
+    with_p2_fixture(|base| {
+        let path = base + 0xF00;
+        let native_path = b"/compat32-p2/f\0";
+        let mut nsb = [0u8; 144];
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(
+                (-100i64) as u64,
+                native_path.as_ptr() as u64,
+                nsb.as_mut_ptr() as u64,
+                0,
+            ),
+        ) != Some(0)
+        {
+            return Err("native newfstatat of the fixture failed");
+        }
+        let n64 = |off: usize| u64::from_le_bytes(nsb[off..off + 8].try_into().unwrap_or([0; 8]));
+        let n32 = |off: usize| u32::from_le_bytes(nsb[off..off + 4].try_into().unwrap_or([0; 4]));
+        let fd = call32(5, [path, 0, 0, 0, 0, 0]);
+        if fd < 0 {
+            return Err("i386 open of the fixture failed");
+        }
+        let sb = base + 0x100;
+        let check = |what: &'static str| -> Result<(), &'static str> {
+            let s = get_user(sb, 104)?;
+            let s64 = |off: usize| u64::from_le_bytes(s[off..off + 8].try_into().unwrap_or([0; 8]));
+            let s32 = |off: usize| u32::from_le_bytes(s[off..off + 4].try_into().unwrap_or([0; 4]));
+            if s64(0) != n64(0)
+                || s32(12) != n64(8) as u32
+                || s32(16) != n32(24)
+                || s32(20) != n64(16) as u32
+                || s64(44) != P2_FILE.len() as u64
+                || s32(52) != n64(56) as u32
+                || s64(88) != n64(8)
+                || s[96..104] != [0xAA; 8]
+            {
+                return Err(what);
+            }
+            Ok(())
+        };
+        let calls: [(&'static str, u32, [u64; 6]); 5] = [
+            (
+                "fstat64 must write a 96-byte struct stat64",
+                197,
+                [fd as u64, sb, 0, 0, 0, 0],
+            ),
+            (
+                "stat64 must write a 96-byte struct stat64",
+                195,
+                [path, sb, 0, 0, 0, 0],
+            ),
+            (
+                "lstat64 must write a 96-byte struct stat64",
+                196,
+                [path, sb, 0, 0, 0, 0],
+            ),
+            (
+                "fstatat64(AT_FDCWD) must write a 96-byte struct stat64",
+                300,
+                [AT_FDCWD32, path, sb, 0, 0, 0],
+            ),
+            (
+                "fstatat64(fd, \"\", AT_EMPTY_PATH) must write a struct stat64",
+                300,
+                [fd as u64, base + 0xF40, sb, AT_EMPTY_PATH, 0, 0],
+            ),
+        ];
+        for (what, nr, regs) in calls {
+            put_user(sb, &[0xAA; 104])?;
+            if call32(nr, regs) != 0 {
+                return Err(what);
+            }
+            check(what)?;
+        }
+        // statx(dfd, path, flags, mask, struct statx *): stx_size at 40.
+        const STATX_BASIC_STATS: u64 = 0x7FF;
+        if call32(
+            383,
+            [AT_FDCWD32, path, 0, STATX_BASIC_STATS, base + 0x200, 0],
+        ) != 0
+            || get_u64(base + 0x200 + 40)? != P2_FILE.len() as u64
+        {
+            return Err("i386 statx must fill the native struct statx");
+        }
+        let _ = call32(6, [fd as u64, 0, 0, 0, 0, 0]);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_stat64_and_statx_layouts
+);
+
+/// File offsets, locks, directories and path probes:
+///
+///   * `_llseek` (140) assembles `offset_high:offset_low` and stores the
+///     64-bit result through its pointer, returning 0; `lseek` (19) takes a
+///     `compat_off_t`, so -1 from SEEK_END is one byte before the end;
+///   * `pread64` (180) is `sys_ia32_pread64(fd, buf, count, poslo, poshi)`;
+///   * `fcntl64` (221): plain commands pass through; `F_OFD_SETLK`/
+///     `F_OFD_GETLK` read and write the packed 24-byte `compat_flock64` and
+///     plain `F_GETLK` the 16-byte `compat_flock` (`do_compat_fcntl64`);
+///   * `getdents64` (220) passes through; `access` (33), `faccessat` (307),
+///     `readlink` (85) and `readlinkat` (305) take i386 pointers and a
+///     sign-extended AT_FDCWD.
+fn smoke_compat32_table_offsets_locks_and_paths() -> TestResult {
+    const SEEK_SET: u64 = 0;
+    const SEEK_END: u64 = 2;
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_GETLK: u64 = 5;
+    const F_OFD_GETLK: u64 = 36;
+    const F_OFD_SETLK: u64 = 37;
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    with_p2_fixture(|base| {
+        let path = base + 0xF00;
+        let fd = call32(5, [path, 0, 0, 0, 0, 0]);
+        let fd2 = call32(5, [path, 0, 0, 0, 0, 0]);
+        if fd < 0 || fd2 < 0 {
+            return Err("i386 open of the fixture failed");
+        }
+        let (fd, fd2) = (fd as u64, fd2 as u64);
+        if call32(140, [fd, 0, 2, base + 0x100, SEEK_SET, 0]) != 0 || get_u64(base + 0x100)? != 2 {
+            return Err("_llseek must store the 64-bit offset and return 0");
+        }
+        if call32(3, [fd, base + 0x110, 1, 0, 0, 0]) != 1 || get_user(base + 0x110, 1)? != b"c" {
+            return Err("the offset _llseek set is not the one read uses");
+        }
+        if call32(19, [fd, 0xFFFF_FFFF, SEEK_END, 0, 0, 0]) != P2_FILE.len() as i64 - 1 {
+            return Err("i386 lseek's compat_off_t offset must be sign-extended");
+        }
+        if call32(180, [fd, base + 0x120, 2, 4, 0, 0]) != 2 || get_user(base + 0x120, 2)? != b"ef" {
+            return Err("pread64 must take its position as poslo, poshi");
+        }
+        if call32(180, [fd, base + 0x120, 2, 4, 1, 0]) != 0 {
+            return Err("pread64 at 4 GiB + 4 must read nothing");
+        }
+        if call32(221, [fd, F_SETFD, 1, 0, 0, 0]) != 0
+            || call32(221, [fd, F_GETFD, 0, 0, 0, 0]) != 1
+        {
+            return Err("fcntl64 F_SETFD/F_GETFD must pass through");
+        }
+        // struct compat_flock64 (packed): type, whence, start@4, len@12, pid@20.
+        let flock64 = |ty: i16, start: i64, len: i64| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&0i16.to_le_bytes());
+            b.extend_from_slice(&start.to_le_bytes());
+            b.extend_from_slice(&len.to_le_bytes());
+            b.extend_from_slice(&0i32.to_le_bytes());
+            b
+        };
+        put_user(base + 0x200, &flock64(F_RDLCK, 0, 10))?;
+        if call32(221, [fd, F_OFD_SETLK, base + 0x200, 0, 0, 0]) != 0 {
+            return Err("fcntl64 F_OFD_SETLK with a compat_flock64 failed");
+        }
+        put_user(base + 0x240, &flock64(F_WRLCK, 0, 0))?;
+        put_user(base + 0x240 + 24, &[0xAA; 8])?;
+        if call32(221, [fd2, F_OFD_GETLK, base + 0x240, 0, 0, 0]) != 0 {
+            return Err("fcntl64 F_OFD_GETLK with a compat_flock64 failed");
+        }
+        let got = get_user(base + 0x240, 32)?;
+        let i16_at = |o: usize| i16::from_le_bytes([got[o], got[o + 1]]);
+        let i64_at = |o: usize| i64::from_le_bytes(got[o..o + 8].try_into().unwrap_or([0; 8]));
+        let i32_at = |o: usize| i32::from_le_bytes(got[o..o + 4].try_into().unwrap_or([0; 4]));
+        if i16_at(0) != F_RDLCK
+            || i64_at(4) != 0
+            || i64_at(12) != 10
+            || i32_at(20) != -1
+            || got[24..32] != [0xAA; 8]
+        {
+            return Err("F_OFD_GETLK must report the lock in the packed compat_flock64");
+        }
+        // struct compat_flock: type, whence, start@4 (s32), len@8, pid@12.
+        let mut flock = Vec::new();
+        flock.extend_from_slice(&F_WRLCK.to_le_bytes());
+        flock.extend_from_slice(&0i16.to_le_bytes());
+        for v in [0i32, 0, 0] {
+            flock.extend_from_slice(&v.to_le_bytes());
+        }
+        put_user(base + 0x280, &flock)?;
+        put_user(base + 0x280 + 16, &[0xAA; 8])?;
+        if call32(221, [fd2, F_GETLK, base + 0x280, 0, 0, 0]) != 0 {
+            return Err("fcntl64 F_GETLK with a compat_flock failed");
+        }
+        let got = get_user(base + 0x280, 24)?;
+        if i16::from_le_bytes([got[0], got[1]]) != F_RDLCK
+            || i32::from_le_bytes([got[8], got[9], got[10], got[11]]) != 10
+            || got[16..24] != [0xAA; 8]
+        {
+            return Err("F_GETLK must report the lock in the 16-byte compat_flock");
+        }
+        let dir = call32(5, [base + 0xF20, 0x1_0000, 0, 0, 0, 0]);
+        if dir < 0 || call32(220, [dir as u64, base + 0x400, 512, 0, 0, 0]) <= 0 {
+            return Err("i386 getdents64 of the fixture directory failed");
+        }
+        if call32(33, [path, 0, 0, 0, 0, 0]) != 0
+            || call32(307, [AT_FDCWD32, path, 4, 0, 0, 0]) != 0
+        {
+            return Err("i386 access/faccessat of an existing file failed");
+        }
+        put_user(base + 0x500, b"/compat32-p2/missing\0")?;
+        if call32(307, [AT_FDCWD32, base + 0x500, 0, 0, 0, 0]) != ENOENT {
+            return Err("i386 faccessat of a missing file must be ENOENT");
+        }
+        let target = b"/compat32-p2/f\0";
+        let link = b"/compat32-p2/l\0";
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(
+                target.as_ptr() as u64,
+                (-100i64) as u64,
+                link.as_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("symlink fixture failed");
+        }
+        put_user(base + 0x540, link)?;
+        let want = target.len() as i64 - 1;
+        if call32(85, [base + 0x540, base + 0x580, 64, 0, 0, 0]) != want
+            || call32(305, [AT_FDCWD32, base + 0x540, base + 0x5C0, 64, 0, 0]) != want
+            || get_user(base + 0x5C0, want as usize)? != target[..want as usize]
+        {
+            return Err("i386 readlink/readlinkat through 32-bit pointers failed");
+        }
+        for f in [fd, fd2, dir as u64] {
+            let _ = call32(6, [f, 0, 0, 0, 0, 0]);
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_offsets_locks_and_paths
+);
+
+/// Synchronisation and signal state an i386 libc sets up:
+///
+///   * `futex` (240, `sys_futex_time32`) reads an 8-byte `old_timespec32`
+///     timeout — {0, 1e9} is an invalid one (EINVAL) before the value
+///     compare (EAGAIN) — and `futex_time64` (422) a 16-byte one;
+///   * `set_robust_list` (311) takes `sizeof(struct compat_robust_list_head)`
+///     = 12; the 64-bit 24 is EINVAL (`compat_sys_set_robust_list`);
+///   * `rt_sigaction` (174) reads and writes the 20-byte
+///     `struct compat_sigaction` {handler, flags, restorer, mask[2]}, with
+///     `sizeof(compat_sigset_t)` = 8; `rt_sigprocmask` (175) passes through.
+fn smoke_compat32_table_futex_robust_list_and_sigaction() -> TestResult {
+    const FUTEX_WAIT_PRIVATE: u64 = 128;
+    const FUTEX_WAKE_PRIVATE: u64 = 129;
+    const SIGUSR1: u64 = 10;
+    const SA_SIGINFO: u32 = 0x4;
+    const SA_RESTORER: u32 = 0x0400_0000;
+    const SIG_BLOCK: u64 = 0;
+    with_p2_fixture(|base| {
+        let word = base + 0x100;
+        put_user(word, &5u32.to_le_bytes())?;
+        let mut ts32 = Vec::new();
+        ts32.extend_from_slice(&0i32.to_le_bytes());
+        ts32.extend_from_slice(&1_000_000_000i32.to_le_bytes());
+        ts32.extend_from_slice(&[0; 8]);
+        put_user(base + 0x120, &ts32)?;
+        if call32(240, [word, FUTEX_WAIT_PRIVATE, 7, base + 0x120, 0, 0]) != EINVAL {
+            return Err("futex (time32) must decode an 8-byte old_timespec32");
+        }
+        let mut ts64 = Vec::new();
+        ts64.extend_from_slice(&0i64.to_le_bytes());
+        ts64.extend_from_slice(&1_000_000_000i64.to_le_bytes());
+        put_user(base + 0x140, &ts64)?;
+        if call32(422, [word, FUTEX_WAIT_PRIVATE, 7, base + 0x140, 0, 0]) != EINVAL {
+            return Err("futex_time64 must decode a 16-byte __kernel_timespec");
+        }
+        put_user(base + 0x140, &[0; 16])?;
+        if call32(422, [word, FUTEX_WAIT_PRIVATE, 7, base + 0x140, 0, 0]) != EAGAIN
+            || call32(240, [word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0]) != 0
+        {
+            return Err("i386 futex WAIT (value mismatch) / WAKE wrong");
+        }
+        if call32(311, [base + 0x200, 12, 0, 0, 0, 0]) != 0 {
+            return Err("set_robust_list must accept the 12-byte compat head");
+        }
+        if call32(311, [base + 0x200, 24, 0, 0, 0, 0]) != EINVAL {
+            return Err("set_robust_list from i386 must refuse the 64-bit head size");
+        }
+        // struct compat_sigaction { handler, flags, restorer, mask[2] }.
+        let mut act = Vec::new();
+        for w in [0x0804_8200u32, SA_SIGINFO | SA_RESTORER, 0x0804_8300, 0, 0] {
+            act.extend_from_slice(&w.to_le_bytes());
+        }
+        put_user(base + 0x300, &act)?;
+        if call32(174, [SIGUSR1, base + 0x300, 0, 8, 0, 0]) != 0 {
+            return Err("i386 rt_sigaction with a compat_sigaction failed");
+        }
+        put_user(base + 0x340, &[0xAA; 28])?;
+        if call32(174, [SIGUSR1, 0, base + 0x340, 8, 0, 0]) != 0 {
+            return Err("i386 rt_sigaction query failed");
+        }
+        let old = get_user(base + 0x340, 28)?;
+        let w = |i: usize| {
+            u32::from_le_bytes([old[i * 4], old[i * 4 + 1], old[i * 4 + 2], old[i * 4 + 3]])
+        };
+        if w(0) != 0x0804_8200
+            || w(1) & SA_SIGINFO == 0
+            || w(2) != 0x0804_8300
+            || old[20..28] != [0xAA; 8]
+        {
+            return Err("rt_sigaction must report the action as a 20-byte compat_sigaction");
+        }
+        if call32(174, [SIGUSR1, 0, base + 0x340, 16, 0, 0]) != EINVAL {
+            return Err("an i386 rt_sigaction sigsetsize other than 8 must be EINVAL");
+        }
+        put_user(base + 0x300, &[0; 20])?;
+        let _ = call32(174, [SIGUSR1, base + 0x300, 0, 8, 0, 0]);
+        put_user(base + 0x380, &[0; 8])?;
+        if call32(175, [SIG_BLOCK, base + 0x380, base + 0x390, 8, 0, 0]) != 0 {
+            return Err("i386 rt_sigprocmask failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_futex_robust_list_and_sigaction
+);
+
+/// Limits, randomness, CPU affinity and identity:
+///
+///   * `prlimit64` (340) and `getrandom` (355) pass through; `rseq` (386)
+///     is -ENOSYS, which glibc takes as "no rseq";
+///   * `sched_getaffinity` (242) takes a length that is a multiple of
+///     `sizeof(compat_ulong_t)` = 4 (`compat_sys_sched_getaffinity`);
+///   * `getresuid32` (209) passes through, and the 16-bit `getuid` (24)
+///     returns the uid through `high2lowuid`;
+///   * `arch_prctl` (384) refuses the 64-bit FS/GS operations with EINVAL
+///     (`in_ia32_syscall()`) but serves ARCH_GET_CPUID like the native call.
+fn smoke_compat32_table_limits_affinity_and_arch_prctl() -> TestResult {
+    const RLIMIT_NOFILE: u64 = 7;
+    const ARCH_SET_FS: u64 = 0x1002;
+    const ARCH_GET_CPUID: u64 = 0x1011;
+    with_p2_fixture(|base| {
+        let mut native = [0u8; 16];
+        if call(
+            Syscall::Prlimit64.raw(),
+            a3(0, RLIMIT_NOFILE, 0, native.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("native prlimit64 failed");
+        }
+        if call32(340, [0, RLIMIT_NOFILE, 0, base + 0x100, 0, 0]) != 0
+            || get_user(base + 0x100, 16)? != native
+        {
+            return Err("i386 prlimit64 must report the native rlimit64");
+        }
+        if call32(355, [base + 0x200, 16, 0, 0, 0, 0]) != 16 {
+            return Err("i386 getrandom failed");
+        }
+        if call32(386, [base + 0x300, 32, 0, 0x5305_3053, 0, 0]) != ENOSYS {
+            return Err("i386 rseq must be -ENOSYS");
+        }
+        let native_len8 = call(
+            Syscall::SchedGetaffinity.raw(),
+            a2(0, 8, native.as_mut_ptr() as u64),
+        )
+        .ok_or("native sched_getaffinity failed")?;
+        if call32(242, [0, 8, base + 0x400, 0, 0, 0]) != native_len8 {
+            return Err("i386 sched_getaffinity(len 8) must match the native call");
+        }
+        let want4 = if native_len8 == 8 { 4 } else { native_len8 };
+        if call32(242, [0, 4, base + 0x400, 0, 0, 0]) != want4 {
+            return Err("i386 sched_getaffinity must accept a 4-byte compat_ulong mask");
+        }
+        if call32(242, [0, 6, base + 0x400, 0, 0, 0]) != EINVAL {
+            return Err("i386 sched_getaffinity length not a multiple of 4 must be EINVAL");
+        }
+        let uid = call(Syscall::GetUid.raw(), a0(0)).ok_or("native getuid failed")?;
+        if call32(209, [base + 0x500, base + 0x504, base + 0x508, 0, 0, 0]) != 0
+            || i64::from(get_u32(base + 0x500)?) != uid
+        {
+            return Err("i386 getresuid32 failed");
+        }
+        if call32(24, [0; 6]) != uid {
+            return Err("i386 getuid (16-bit) must return the uid");
+        }
+        if call32(384, [ARCH_SET_FS, base, 0, 0, 0, 0]) != EINVAL {
+            return Err("i386 arch_prctl(ARCH_SET_FS) must be EINVAL");
+        }
+        let native_cpuid = call(Syscall::ArchPrctl.raw(), a1(ARCH_GET_CPUID, 0))
+            .ok_or("native arch_prctl failed")?;
+        if call32(384, [ARCH_GET_CPUID, 0, 0, 0, 0, 0]) != native_cpuid {
+            return Err("i386 arch_prctl(ARCH_GET_CPUID) must match the native call");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_limits_affinity_and_arch_prctl
+);
