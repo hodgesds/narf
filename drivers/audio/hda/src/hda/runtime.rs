@@ -1578,8 +1578,11 @@ impl core::future::Future for JackWait<'_> {
         }
         if let Some(timer) = this.poll.as_mut() {
             if core::pin::Pin::new(timer).poll(cx).is_ready() {
-                // Polling re-reads every jack (`snd_hda_jack_set_dirty_all`).
+                // Polling re-reads every jack (`snd_hda_jack_set_dirty_all`),
+                // and like `hda_jackpoll_work`'s power up/down it marks the
+                // controller busy, so a polled controller stays up.
                 dev.jack_dirty.store(true, Ordering::Release);
+                dev.mark_last_busy();
                 return Poll::Ready(Some(()));
             }
         }
