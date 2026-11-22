@@ -1261,6 +1261,19 @@ Public interface:
 - `set_dc_target(fw, DcTarget)` — RMW of `DC_STATE_EN`'s
   field; DC5/DC6 refused (`NoMainProgram`) with no main
   program loaded.
+- `intel_gpu_gen12_dmc::load_for_display(mmio, family,
+  authority)` — the probe-time wiring (`intel_dmc_init` +
+  `dmc_load_work_fn`): resolves the platform blob name
+  (TGL `i915/tgl_dmc_ver2_12.bin`, RKL
+  `i915/rkl_dmc_ver2_03.bin`, ADL-S `i915/adls_dmc_ver2_01.bin`,
+  ADL-P `i915/adlp_dmc.bin` with fallback
+  `i915/adlp_dmc_ver2_16.bin`; ADL-N takes the ADL-P pair as
+  its subplatform), fetches it from the firmware registry,
+  parses/loads/verifies via the interface above, and
+  registers the resident copy with the PM core for the
+  resume reload. Non-fatal: any failure only disables
+  runtime power management and the display still modesets.
+  DG1 has no Gen12 modeset path and is not wired.
 
 Invariants:
 
@@ -1295,7 +1308,11 @@ machines the controller (and the future runtime-PM lane)
 compose next to the RCS engine's forcewake state. The
 firmware blob arrives as a byte slice; sourcing blobs
 from storage is the platform's business, not this
-module's.
+module's — the Gen12 probe wiring
+(`intel_gpu_gen12_dmc`) is the one production consumer
+so far: it runs before the first modeset on the
+integrated display path and registers the resident copy
+with the PM core, so suspend/resume reloads it.
 
 Out of scope here: GuC-owned RC and `GUC_MAX_IDLE_COUNT`
 (separate retained GuC owner); RC6p/RC6pp (absent on Gen12); runtime

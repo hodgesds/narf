@@ -723,6 +723,30 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     }
 
+    // DMC firmware load (`intel_dmc_init`): the Gen12 display
+    // loads its DMC blob before the first modeset, so the DC
+    // states the program enables are available to runtime PM.
+    // Non-fatal — a missing or malformed blob only disables
+    // runtime PM; the load logs its own outcome and the probe
+    // continues to modeset either way.
+    if let Some(family) = crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip) {
+        let window = dev.mode_window();
+        let authority: Option<Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>> =
+            narf_firmware::trusted_loader_authority().and_then(|write| write.derive().ok());
+        match authority {
+            Some(authority) => {
+                let _ = crate::intel_gpu_gen12_dmc::load_for_display(&window, family, &authority);
+            }
+            None => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu: no usable firmware registry authority; DMC not loaded, runtime power management disabled"
+                );
+            }
+        }
+    }
+
     let external_only =
         crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip).is_some_and(|family| {
             crate::intel_gpu_vbt::gen12_ddc_overrides().external_only_for(family)
