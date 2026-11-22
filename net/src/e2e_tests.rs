@@ -3074,6 +3074,63 @@ kernel_test_in!(
     smoke_udp_bound_device_routes_and_resolves_on_that_device
 );
 
+// ── IPv4 multicast goes to the group MAC, never through ARP ─────────────────
+//
+// Linux: a multicast destination's neighbour is NUD_NOARP with the address
+// `arp_mc_map` → `ip_eth_mc_map` derives (01:00:5e + the low 23 bits of the
+// group), so `ip_finish_output2` transmits at once and no ARP request is ever
+// sent for a group. NARF ARPed for 224.0.0.251 (the desktop's /proc/net/arp
+// shows it INCOMPLETE on eth0) and, with a default route, sent mDNS to the
+// gateway's unicast MAC.
+fn smoke_udp_multicast_uses_the_group_mac() -> TestResult {
+    const IFACE: &str = "e2e-mc-mac";
+    const LOCAL_IP: [u8; 4] = [10, 33, 0, 7];
+    const GATEWAY: [u8; 4] = [10, 33, 0, 1];
+    const GROUP: [u8; 4] = [224, 0, 0, 251];
+    full_reset(IFACE, LOCAL_IP, GATEWAY);
+    let Some(index) = iface::ifindex_of(IFACE) else {
+        return TestResult::Fail("test device has no ifindex");
+    };
+    drain_captured();
+    let payload = b"mdns-query";
+    // The socket layer hands a multicast send its egress device.
+    let opts = UdpOptions {
+        bind_to_device: index,
+        ip_ttl: 255,
+        ..UdpOptions::default()
+    };
+    let sent = crate::udp_sock::udp_send_from(
+        0,
+        5353,
+        SocketAddrV4::new(GROUP, 5353),
+        payload,
+        &opts,
+        None,
+    );
+    if sent != Ok(payload.len()) {
+        return TestResult::Fail("multicast UDP send failed");
+    }
+    let frames = drain_captured();
+    if frames
+        .iter()
+        .any(|f| f.len() >= 14 && f[12..14] == crate::pkt::ETHERTYPE_ARP.to_be_bytes())
+    {
+        return TestResult::Fail("a multicast send ARPed for its group");
+    }
+    let Some(frame) = frames.iter().find(|f| {
+        f.len() >= ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN && f[ETH_HDR_LEN + 9] == IP_PROTO_UDP
+    }) else {
+        return TestResult::Fail("multicast datagram was not transmitted at once");
+    };
+    if frame[..6] != [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb]
+        || frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20] != GROUP
+    {
+        return TestResult::Fail("multicast datagram is not addressed to the group MAC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp-mcast-mac", smoke_udp_multicast_uses_the_group_mac);
+
 fn smoke_udp_pending_datagram_dropped_on_iface_namespace_move() -> TestResult {
     const IFACE: &str = "e2e-udp-netns-move";
     const LOCAL_IP: [u8; 4] = [10, 24, 0, 15];
