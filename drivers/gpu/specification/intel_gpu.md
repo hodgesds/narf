@@ -370,18 +370,24 @@ so its region table carries the verified Gen12 contents; it has a
 forcewake ACK at 0x130044, and no HWCONFIG table (i915 requires
 graphics 12.55+). Gen11 predates GMD_ID, so Stage 1 presence
 re-reads PCI config space (all-ones refuses) instead of reading
-0xD8C/0xFF8, and `gmd_id` is `None` on Gen11. Display clocks
-(Lane 4) and the internal-panel modeset (Lane 5) are admitted:
-CDCLK (pcode command 0x7, per-product voltage levels), the ICL
-combo DPLL (CFGCR0 0x164000 + pll·0x80), the 8-level watermark
-algorithm (no SAGV watermark), the ICL DDI tables, the DMC load
+0xD8C/0xFF8, and `gmd_id` is `None` on Gen11. Display clocks (Lane 4), the internal-panel modeset (Lane 5)
+and the external outputs (Lane 8) are admitted: CDCLK (pcode
+command 0x7, per-product voltage levels), the ICL combo DPLL
+(CFGCR0 0x164000 + pll·0x80), the 8-level watermark algorithm
+(no SAGV watermark), the ICL DDI tables, the DMC load
 (`i915/icl_dmc_ver1_09.bin`, best-effort), and the first modeset
 on the internal display — in Linux's ICL order (CDCLK → DPLL →
 DDI pre-enable → transcoder/pipe/M-N/FUNC_CTL → DBUF +
 watermarks → plane → link training → DDI buffer → enables),
 fixture-validated, silicon untested. The plane admission is the
-SKL rule: 256 KiB surface alignment, 32 KiB stride cap.
-External display and backlight stay gated: that is Gen11 Lane 8.
+SKL rule: 256 KiB surface alignment, 32 KiB stride cap. Lane 8
+adds the Gen11 port map (combo PHY A/B + TC1–TC4 MG, §12.3),
+the MG PLL divisor search + TC-port programming, the TBT PLL
+fixed rows, external DP on combo-PHY/TC ports, HDMI on combo
+and TC ports, and the backlight PWM install (BXT-style block,
+shared with Gen12 — §12.3). `external_display_supported()` and
+`backlight_supported()` are flipped for Ice Lake; the HPD /
+external-session layer still fails closed for Gen11 (§7).
 Execlists submission (Lane 3) is admitted — a Gen11
 batch executes on RCS with no GuC loaded — and GuC/HuC load
 (Lane 7) is admitted: the GuC profiles are `i915/icl_guc_70.1.1.bin`
@@ -720,8 +726,9 @@ generation gates below.
   (Ice Lake / Jasper Lake / Elkhart Lake) was excluded under this
   bullet until Gen11 Lane 1 lifted it for identity + probe
   (26 IDs in §5) and Lane 2 extended the lift to GEM mapping via
-  the legacy Gen8 PTE format; its display model is still a separate
-  lane programme, and external display stays gated (Lane 8). GT execution
+  the legacy Gen8 PTE format; its display model is a separate
+  lane programme, and external display was gated until Lane 8
+  admitted it (§4, §12.3). GT execution
   (execlists submission on RCS) was admitted by the Gen11
   execlists lane (§8).
 - Arrow Lake display — identification landed (#1023, §5);
@@ -829,8 +836,12 @@ validated before pipeline teardown. This does not enable Xe-LPG PM or
 establish physical display/suspend acceptance.
 The external-session gate is separate: combo HPD enable/poll, DP, HDMI,
 MST and USB-C DP Alt Mode remain Gen12-only until their Xe-LPG port
-sequences exist. Unsupported generations return before HPD register
-access; enabling the Xe-LPG internal panel must not enable Gen12 ports.
+sequences exist. The modeset-level external outputs are implemented for
+Gen11 Ice Lake (Lane 8, §12.3) — `external_display_supported()` is
+flipped for it — but the session layer's Gen12 gates still return `None`
+on a Gen11 adapter, so no session path arms there. Unsupported generations
+return before HPD register access; enabling the Xe-LPG internal panel
+must not enable Gen12 ports.
 The Gen12 gate is necessary but insufficient: physical combo-B HPD/SST also
 requires exact TGL/ADL-P/N GPU and actually observed matching PCH policy.
 
@@ -1641,6 +1652,91 @@ Gen11 idle power, verified against Linux 7.4-rc2 (commit
   `intel_gpu_runtime_power` carries no generation gating;
   both were verified, not changed.
 
+### 12.3 Gen11 external outputs (Lane 8)
+
+The eighth and final Gen11 lane: the modeset-level external
+outputs for Ice Lake, verified against Linux 7.4-rc2
+(`drivers/gpu/drm/i915/display/`) and fixture-validated,
+silicon untested. The 26-ID census (Lane 1) is unchanged —
+no new fixture family was needed beyond the port-map and
+register pins below.
+
+- **Port map** (`intel_gpu_gen11_ddi::phy_for_port`):
+  Ice Lake A/B are combo PHYs (DPLL0/DPLL1); C–F are Type-C
+  ports TC1–TC4, each with its own MG PLL
+  (`intel_port_to_phy`, `intel_phy_is_combo`,
+  `intel_phy_is_tc`, `intel_port_to_tc`,
+  `display/intel_display.c`; `icl_desc` port masks).
+  Elkhart/Jasper Lake correct the task premise: A/B/C are
+  combo PHYs and D shares PHY A with PORT_A
+  (`intel_port_to_phy` special case); EHL/JSL have NO TC
+  ports and NO MG PLLs (`ehl_plls[]` is DPLL0, DPLL1, DPLL4
+  only). `DDI_BUF_CTL` addressing (0x64000 + port·0x100)
+  is shared with Gen12 and reused. PORT_F exists only on
+  `port_f` subplatform SKUs — the map describes the port
+  when present; this driver does not model ICL subplatforms.
+- **MG PLL** (`intel_gpu_gen11_dpll::mg_pll_state`,
+  `mg_pll_write`, `mg_pll_enable`): the divisor search
+  (`icl_mg_pll_find_divisors`: div1 ∈ {7, 5, 3, 2}, div2
+  10→1, DCO = div1·div2·clock·5; DP forces the DCO to
+  exactly 8.1 GHz, HDMI takes [7.992, 10] GHz) and the
+  ICL MG packing (`icl_calc_mg_pll_state`, non-DKL branch,
+  `use_ssc` false) into DIV0/DIV1/LF/FRAC_LOCK/SSC/BIAS/
+  TDC_COLDST_BIAS at 0x168A00 + tc·0x1000, with the 38.4 MHz
+  refclk write masks (BIAS untouched, COLDSTART only).
+  The packing differs from the Dekel (DKL) layout — the
+  divisor math is shared, the registers are not.
+- **TBT PLL** (`tbt_pll_coeffs`, `tbt_pll_enable`): the
+  fixed rows (`icl_tbt_pll_24MHz_values` /
+  `icl_tbt_pll_19_2MHz_values`: 24 MHz → DCO 0x151/0x4000,
+  19.2/38.4 MHz → 0x1A5/0x7000, P/5 K/1) at CFGCR0/1
+  0x164100/0x164104 with `TBT_PLL_ENABLE` 0x46020. Alt-mode
+  entry/exit (the TC subsystem side) is not in this lane.
+- **MG PHY** (`intel_gpu_gen11_mg_phy::MgPort`): the Dekel
+  port's public shape (`enable` / `route_clock` /
+  `start_training` / `training_update` / `stop_transport` /
+  `disable`) with Gen11 specifics — direct MMIO at
+  0x168xxx + (tc−1)·0x1000 (no HIP bank, no FIA), the
+  display-11 transcoder clock `(port+1) << 29`
+  (`intel_ddi_enable_transcoder_clock`), the port-based
+  `DP_TP_CTL` (DDI base + 0x40), the MG signal-level tables
+  (`icl_get_mg_buf_trans`: RBR/HBR vs HBR2/HBR3 at 270 MHz,
+  HDMI default entry 9), and `DDI_CLK_SEL_MG` + DPCLKA
+  TC_CLK_OFF routing (`icl_ddi_tc_enable_clock`).
+- **DP training reuse**: the training state machine
+  (`display/intel_dp_link_training.c`) is generation-shared
+  — no ICL-specific branches — and NARF mirrors it: the
+  same `TrainingAux` callback shape serves combo and MG
+  ports; only `set_signal_levels` dispatches by PHY. The
+  modeset dispatches by `is_tc_port()` (Gen11 ICL C+,
+  Gen12 D+).
+- **HDMI**: `modeset_hdmi` no longer refuses Gen11. Combo
+  ports take the WRPLL coefficients into the ICL combo PLL
+  (DPLL0/1/4 by `combo_dpll_id`) with the ICL HDMI default
+  levels; TC ports take the MG PLL (HDMI DCO rule at the
+  TMDS clock) with the MG HDMI default levels.
+- **Flips**: `external_display_supported()` and
+  `backlight_supported()` admit Ice Lake. The backlight
+  flip is grounded in Linux driving ICL through the same
+  `cnp_pwm_funcs` (`bxt_set_backlight` /
+  `bxt_get_backlight`): "CNP has the BXT implementation of
+  backlight, but with only one controller" — CTL1/FREQ1/
+  DUTY1 0xC8250/54/58, the block the install already
+  programs. The install's controller-1 hardcoding is
+  pre-existing Gen12 behavior (Linux takes the VBT
+  controller, defaulting to 0).
+- **Remainders**: the HPD / external-session layer
+  threading for Gen11 (`DpConnection` / `HdmiConnection`
+  family fields, VRR gating, `Gen12DdcOverrides`, the ICP
+  HPD profile) is a follow-up lane — the session layer
+  fails closed for Gen11 today. EHL/JSL PORT_D has no fixed
+  DPLL assignment (shares PHY A; Linux arbitrates the
+  {0, 1, 4} pool per commit) and refuses. TBT alt-mode
+  entry/exit, the MG `CRI_LOADGEN_SEL` FIXME (Linux does
+  not program it either), and the VBT AFC-startup `div0`
+  override are unmodelled. The EHL div-frac WA stays off
+  (38.4 MHz ref on EHL B0+, stepping unmodelled).
+
 ## 13. Suspend/resume + D-states (Stage 5 — `intel_gpu_pm`, #1015)
 
 System power for the GPU: the device-PM quiesce/D3/restore
@@ -2369,16 +2465,17 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
   were already in the census; only their display gate moved.
 - Gen11 Lane 4 remainders (clocking/watermark prerequisites
   for modeset, Lane 5): MG PLL divisor search + TC-port
-  programming (Lane 8); TBT PLL fixed rows; the VBT
-  AFC-startup `div0` (VBT fields not parsed); the SKL WRPLL
-  search + CFGCR1/2 (Gen9 lane — `DPLL_CTRL1` on Gen9 is a
-  different manager); ICL PHY register programming of the
-  selected DDI entries (Lane 5 wiring); `display_supported()`
-  stays unflipped for Gen11 (Lane 5 flips it); the SAGV
-  *control* pcode command and per-level SAGV admission were
-  delivered by the Gen11 power lane (Lane 6:
-  `intel_gpu_gen11_sagv`, `apply_sagv_admission`); the cursor
-  DDB allocation special case belongs to the cursor lane.
+  programming and the TBT PLL fixed rows were delivered by
+  Lane 8 (§12.3); the VBT AFC-startup `div0` (VBT fields not
+  parsed); the SKL WRPLL search + CFGCR1/2 (Gen9 lane —
+  `DPLL_CTRL1` on Gen9 is a different manager); ICL PHY
+  register programming of the selected DDI entries (Lane 5
+  wiring); `display_supported()` stays unflipped for Gen11
+  (Lane 5 flips it); the SAGV *control* pcode command and
+  per-level SAGV admission were delivered by the Gen11 power
+  lane (Lane 6: `intel_gpu_gen11_sagv`,
+  `apply_sagv_admission`); the cursor DDB allocation special
+  case belongs to the cursor lane.
 
 ### 10.5 Xe2_LPD — Lunar Lake display 20 (`intel_gpu_xe2lpd`)
 

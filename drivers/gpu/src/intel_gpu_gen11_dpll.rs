@@ -63,16 +63,21 @@
 //!
 //! ## Not ported (remainders)
 //!
-//! - MG PLL divisor search (`icl_mg_pll_find_divisors`) and the
-//!   MG register programming for Type-C ports — Lane 8.
-//! - TBT PLL fixed rows (`icl_tbt_pll_24MHz_values` /
-//!   `icl_tbt_pll_19_2MHz_values`) — Thunderbolt lane.
 //! - The VBT AFC-startup `div0` override
 //!   (`vbt.override_afc_startup`) — needs a VBT field this driver
 //!   does not parse; default path writes no `div0`.
+//!
+//! MG PLL divisor search (`icl_mg_pll_find_divisors`), the MG
+//! register programming for Type-C ports, and the TBT PLL fixed
+//! rows (`icl_tbt_pll_24MHz_values` /
+//! `icl_tbt_pll_19_2MHz_values`) landed in Lane 8 below.
 
 use crate::intel_gpu_aux::MmioWindow;
-use crate::intel_gpu_pll::{encode_cfgcr0, DpllCoeffs};
+use crate::intel_gpu_ddi::Ddi;
+use crate::intel_gpu_gt::Gen11Platform;
+use crate::intel_gpu_pll::{
+    encode_cfgcr0, DpllCoeffs, CFGCR1_CFREQ_8_4_GHZ, CFGCR1_KDIV_1, CFGCR1_PDIV_5,
+};
 
 /// ICL combo-PLL identifiers on this generation. DPLL0/1 serve
 /// the combo ports; DPLL4 exists only on Elkhart/Jasper Lake.
@@ -95,6 +100,40 @@ impl IclDpllId {
             IclDpllId::Dpll1 => 1,
             IclDpllId::Dpll4 => 4,
         }
+    }
+}
+
+/// The fixed combo-PLL assignment for a Gen11 port.
+///
+/// Grounded in Linux `display/intel_dpll_mgr.c`
+/// (`icl_compute_combo_phy_dpll`): on ICL the two combo PHYs are
+/// hard-wired to DPLL0 (PORT_A) and DPLL1 (PORT_B); on EHL/JSL
+/// the three combo PHYs take DPLL0/DPLL1/DPLL4 for PORT_A/B/C
+/// (the only conflict-free fixed assignment — Linux picks any
+/// free DPLL from the {DPLL4, DPLL1, DPLL0} pool at commit time,
+/// and DPLL4 is the only one no other combo port uses).
+/// Returns `None` where no fixed assignment exists:
+///
+/// - ICL PORT_C and above are Type-C ports driven by MG PLLs,
+///   not combo DPLLs (see `intel_gpu_gen11_mg_phy`).
+/// - EHL/JSL PORT_D shares combo PHY A with PORT_A and has no
+///   dedicated PLL — Linux arbitrates the shared {0, 1, 4} pool
+///   per atomic commit, a sharing model this driver does not
+///   have; callers refuse it with a documented remainder.
+pub fn combo_dpll_id(platform: Gen11Platform, ddi: Ddi) -> Option<IclDpllId> {
+    match (platform, ddi) {
+        (Gen11Platform::IceLake, Ddi::A) => Some(IclDpllId::Dpll0),
+        (Gen11Platform::IceLake, Ddi::B) => Some(IclDpllId::Dpll1),
+        (Gen11Platform::ElkhartLake, Ddi::A) | (Gen11Platform::JasperLake, Ddi::A) => {
+            Some(IclDpllId::Dpll0)
+        }
+        (Gen11Platform::ElkhartLake, Ddi::B) | (Gen11Platform::JasperLake, Ddi::B) => {
+            Some(IclDpllId::Dpll1)
+        }
+        (Gen11Platform::ElkhartLake, Ddi::C) | (Gen11Platform::JasperLake, Ddi::C) => {
+            Some(IclDpllId::Dpll4)
+        }
+        _ => None,
     }
 }
 
@@ -180,6 +219,68 @@ fn wait(io: &(impl MmioWindow + ?Sized), r: u64, mask: u32, want: u32) -> Result
     }
 }
 
+/// Shared power/enable sequence for an ICL PLL whose state lives
+/// in a CFGCR0/CFGCR1 register pair (`icl_pll_power_enable` +
+/// state write + `icl_pll_enable`): power-enable the PLL (wait
+/// POWER_STATE), write the state, then set PLL_ENABLE (wait
+/// LOCK). 1 ms per wait (`intel_de_wait_for_*_ms(.., 1)`; the
+/// spec's own lock timeout is 600 µs, the power timeout
+/// "immediate").
+pub fn pll_enable_at(
+    io: &(impl MmioWindow + ?Sized),
+    enable_reg: u64,
+    cfgcr0_reg: u64,
+    cfgcr1_reg: u64,
+    cfgcr0: u32,
+    cfgcr1: u32,
+) -> Result<(), DpllError> {
+    let cur = io.read32(enable_reg);
+    if cur == u32::MAX || !io.display_access_ok() {
+        return Err(DpllError::NoDevice);
+    }
+    // Status bits (LOCK, POWER_STATE) are read-only; never write
+    // them back — the same rule the CDCLK PLL disable follows.
+    let clean = cur & !(PLL_LOCK | PLL_POWER_STATE);
+    io.write32(enable_reg, clean | PLL_POWER_ENABLE);
+    wait(io, enable_reg, PLL_POWER_STATE, PLL_POWER_STATE)?;
+    io.write32(cfgcr0_reg, cfgcr0);
+    io.write32(cfgcr1_reg, cfgcr1);
+    let _ = io.read32(cfgcr1_reg);
+    let cur = io.read32(enable_reg);
+    if cur == u32::MAX || !io.display_access_ok() {
+        return Err(DpllError::NoDevice);
+    }
+    io.write32(
+        enable_reg,
+        (cur & !(PLL_LOCK | PLL_POWER_STATE)) | PLL_ENABLE,
+    );
+    wait(io, enable_reg, PLL_LOCK, PLL_LOCK)
+}
+
+/// Shared disable sequence for an ICL PLL (`icl_pll_disable`):
+/// clear PLL_ENABLE (wait LOCK clear), then clear POWER_ENABLE
+/// (wait POWER_STATE clear). 1 ms per wait.
+pub fn pll_disable_at(io: &(impl MmioWindow + ?Sized), enable_reg: u64) -> Result<(), DpllError> {
+    let cur = io.read32(enable_reg);
+    if cur == u32::MAX || !io.display_access_ok() {
+        return Err(DpllError::NoDevice);
+    }
+    io.write32(
+        enable_reg,
+        (cur & !(PLL_LOCK | PLL_POWER_STATE)) & !PLL_ENABLE,
+    );
+    wait(io, enable_reg, PLL_LOCK, 0)?;
+    let cur = io.read32(enable_reg);
+    if cur == u32::MAX || !io.display_access_ok() {
+        return Err(DpllError::NoDevice);
+    }
+    io.write32(
+        enable_reg,
+        (cur & !(PLL_LOCK | PLL_POWER_STATE)) & !PLL_POWER_ENABLE,
+    );
+    wait(io, enable_reg, PLL_POWER_STATE, 0)
+}
+
 /// `combo_pll_enable` (`icl_pll_power_enable` + `icl_dpll_write` +
 /// `icl_pll_enable`): power-enable the PLL (wait POWER_STATE),
 /// write the state, then set PLL_ENABLE (wait LOCK). 1 ms per wait
@@ -191,17 +292,330 @@ pub fn combo_pll_enable(
     cfgcr0: u32,
     cfgcr1: u32,
 ) -> Result<(), DpllError> {
-    let enable = icl_dpll_enable_reg(id);
+    pll_enable_at(
+        io,
+        icl_dpll_enable_reg(id),
+        icl_dpll_cfgcr0(id),
+        icl_dpll_cfgcr1(id),
+        cfgcr0,
+        cfgcr1,
+    )
+}
+
+/// `combo_pll_disable` (`icl_pll_disable`): clear PLL_ENABLE
+/// (wait LOCK clear), then clear POWER_ENABLE (wait POWER_STATE
+/// clear). 1 ms per wait.
+pub fn combo_pll_disable(io: &(impl MmioWindow + ?Sized), id: IclDpllId) -> Result<(), DpllError> {
+    pll_disable_at(io, icl_dpll_enable_reg(id))
+}
+
+// ── MG PLL (Type-C ports, IceLake) ────────────────────────────
+//
+// The MG (multi-gate) PLLs drive the Type-C ports' DDI clock.
+// Grounded in Linux `display/intel_dpll_mgr.c`
+// (`icl_mg_pll_find_divisors`, `icl_calc_mg_pll_state`,
+// `icl_mg_pll_write`, `mg_pll_enable`, `icl_pll_disable`) and
+// `display/intel_mg_phy_regs.h`.
+//
+// Unlike the combo PLLs the MG state is *computed*, not a table
+// row: the divisor search picks (div1, div2) for the requested
+// port clock, and `icl_calc_mg_pll_state` packs the DCO
+// parameters into the MG register layout (which differs from
+// the DKL layout in `intel_gpu_gen12_tc.rs` — the divisor math
+// is shared, the packing is not).
+//
+// `tc` is the 0-based Type-C index (TC1 = 0 … TC4 = 3); Linux
+// names the same ports 1-based. Every MG register strides
+// 0x1000 per port from its PORT1 (TC1) base.
+
+/// `MG_PLL_ENABLE(tc_port)` (`display/intel_display_regs.h`):
+/// `_MG_PLL1_ENABLE` 0x46030, stride 4. The same register bank
+/// carries the combo DPLL4 enable (EHL/JSL) at TC1's slot.
+pub const fn mg_pll_enable_reg(tc: u8) -> u64 {
+    0x46030 + tc as u64 * 4
+}
+
+/// MG PLL register block base for a TC port:
+/// `MG_PLL_DIV0(tc_port)` 0x168A00, stride 0x1000.
+pub const fn mg_pll_block_base(tc: u8) -> u64 {
+    0x168A00 + tc as u64 * 0x1000
+}
+
+/// `MG_PLL_DIV0(tc_port)` — fraction-enable + FBDIV frac/int.
+pub const fn mg_pll_div0(tc: u8) -> u64 {
+    mg_pll_block_base(tc)
+}
+
+/// `MG_PLL_DIV1(tc_port)` — IREF_NDIVRATIO + DITHER_DIV_2 +
+/// NDIVRATIO + FBPREDIV.
+pub const fn mg_pll_div1(tc: u8) -> u64 {
+    mg_pll_block_base(tc) + 4
+}
+
+/// `MG_PLL_LF(tc_port)` — TDC target + loop-filter coeffs.
+pub const fn mg_pll_lf(tc: u8) -> u64 {
+    mg_pll_block_base(tc) + 8
+}
+
+/// `MG_PLL_FRAC_LOCK(tc_port)` — lock criteria + feed-forward gain.
+pub const fn mg_pll_frac_lock(tc: u8) -> u64 {
+    mg_pll_block_base(tc) + 0xC
+}
+
+/// `MG_PLL_SSC(tc_port)` — spread-spectrum fields (zero on ICL:
+/// `use_ssc` is hardcoded false).
+pub const fn mg_pll_ssc(tc: u8) -> u64 {
+    mg_pll_block_base(tc) + 0x10
+}
+
+/// `MG_PLL_BIAS(tc_port)`.
+pub const fn mg_pll_bias(tc: u8) -> u64 {
+    mg_pll_block_base(tc) + 0x14
+}
+
+/// `MG_PLL_TDC_COLDST_BIAS(tc_port)`.
+pub const fn mg_pll_tdc_coldst_bias(tc: u8) -> u64 {
+    mg_pll_block_base(tc) + 0x18
+}
+
+/// `MG_REFCLKIN_CTL(tc_port)` (`display/intel_mg_phy_regs.h`):
+/// PORT1 0x16892C, stride 0x1000.
+pub const fn mg_pll_refclkin_ctl(tc: u8) -> u64 {
+    0x16892C + tc as u64 * 0x1000
+}
+
+/// `MG_CLKTOP2_CORECLKCTL1(tc_port)`: PORT1 0x1688D8, stride 0x1000.
+pub const fn mg_pll_clktop2_coreclkctl1(tc: u8) -> u64 {
+    0x1688D8 + tc as u64 * 0x1000
+}
+
+/// `MG_CLKTOP2_HSCLKCTL(tc_port)`: PORT1 0x1688D4, stride 0x1000.
+pub const fn mg_pll_clktop2_hsclkctl(tc: u8) -> u64 {
+    0x1688D4 + tc as u64 * 0x1000
+}
+
+/// `MG_REFCLKIN_CTL_OD_2_MUX` mask (bits [10:8]).
+const MG_REFCLKIN_CTL_OD_2_MUX_MASK: u32 = 0x7 << 8;
+
+/// `MG_CLKTOP2_CORECLKCTL1_A_DIVRATIO` mask (bits [15:8]).
+const MG_CORECLKCTL1_A_DIVRATIO_MASK: u32 = 0xFF << 8;
+
+/// `MG_CLKTOP2_HSCLKCTL` masks: TLINEDRV_CLKSEL [15:14],
+/// CORE_INPUTSEL [16], HSDIV [13:12], DSDIV [11:8].
+const MG_HSCLKCTL_TLINEDRV_MASK: u32 = 0x3 << 14;
+const MG_HSCLKCTL_CORE_INPUTSEL_MASK: u32 = 0x1 << 16;
+const MG_HSCLKCTL_HSDIV_MASK: u32 = 0x3 << 12;
+const MG_HSCLKCTL_DSDIV_MASK: u32 = 0xF << 8;
+
+/// Computed MG PLL state: the packed register values for one
+/// port clock, mirroring Linux's `intel_dpll_hw_state` MG
+/// fields (`mg_pll_*` + the two write masks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MgPllState {
+    pub refclkin_ctl: u32,
+    pub clktop2_coreclkctl1: u32,
+    pub clktop2_hsclkctl: u32,
+    pub div0: u32,
+    pub div1: u32,
+    pub lf: u32,
+    pub frac_lock: u32,
+    pub ssc: u32,
+    pub bias: u32,
+    pub tdc_coldst_bias: u32,
+    /// Write mask for `MG_PLL_BIAS` (0 at 38.4 MHz refclk — the
+    /// register is left untouched there).
+    pub bias_mask: u32,
+    /// Write mask for `MG_PLL_TDC_COLDST_BIAS` (COLDSTART only
+    /// at 38.4 MHz refclk).
+    pub tdc_coldst_bias_mask: u32,
+}
+
+/// `icl_mg_pll_find_divisors` + `icl_calc_mg_pll_state`
+/// (non-DKL branch, `use_ssc` hardcoded false — ICL never uses
+/// spread spectrum on the MG PLL).
+///
+/// - DP: the DCO is forced to exactly 8,100,000 kHz
+///   (`min_dco_freq = max_dco_freq = 8100000`).
+/// - HDMI/non-DP: the DCO must land in [7,992,000, 10,000,000].
+/// - `div1` scans {7, 5, 3, 2} and `div2` scans 10 down to 1;
+///   the first pair whose `dco = div1 * div2 * clock * 5` is in
+///   range wins. `div2 >= 2` selects `a_divratio` 10 (DP) / 5
+///   (HDMI) with `tlinedrv` 2; otherwise both are 5 / 0.
+///   `inputsel` is 0 for DP, 1 for HDMI.
+/// - `m1div` starts at 2 and doubles to 4 when `m2div_int`
+///   would exceed 255; still over 255 is `-EINVAL` → `None`.
+/// - Refclk is 19200, 24000 or 38400 kHz; anything else is
+///   `-EINVAL` → `None`.
+///
+/// `None` also when no (div1, div2) pair reaches the DCO range
+/// for the requested clock.
+pub fn mg_pll_state(port_clock_khz: u32, is_dp: bool, refclk_khz: u32) -> Option<MgPllState> {
+    // ── icl_mg_pll_find_divisors ──
+    let (mut div1, mut div2) = (0u32, 0u32);
+    let mut dco: u64 = 0;
+    'search: for cand1 in [7u32, 5, 3, 2] {
+        for cand2 in (1..=10u32).rev() {
+            let cand_dco = cand1 as u64 * cand2 as u64 * port_clock_khz as u64 * 5;
+            let in_range = if is_dp {
+                cand_dco == 8_100_000
+            } else {
+                (7_992_000..=10_000_000).contains(&cand_dco)
+            };
+            if in_range {
+                div1 = cand1;
+                div2 = cand2;
+                dco = cand_dco;
+                break 'search;
+            }
+        }
+    }
+    if div1 == 0 {
+        return None;
+    }
+    let (a_divratio, tlinedrv) = if div2 >= 2 {
+        (if is_dp { 10u32 } else { 5u32 }, 2u32)
+    } else {
+        (5, 0)
+    };
+    let inputsel = if is_dp { 0u32 } else { 1u32 };
+    let hsdiv = match div1 {
+        2 => 0u32,
+        3 => 1,
+        5 => 2,
+        7 => 3,
+        _ => return None,
+    };
+
+    // ── icl_calc_mg_pll_state (non-DKL) ──
+    let mut m1div = 2u32;
+    let mut m2div_int = (dco / (refclk_khz as u64 * m1div as u64)) as u32;
+    if m2div_int > 255 {
+        m1div = 4;
+        m2div_int = (dco / (refclk_khz as u64 * m1div as u64)) as u32;
+        if m2div_int > 255 {
+            return None;
+        }
+    }
+    let m2div_rem = (dco % (refclk_khz as u64 * m1div as u64)) as u32;
+    let m2div_frac = (m2div_rem as u64 * (1u64 << 22) / (refclk_khz as u64 * m1div as u64)) as u32;
+    let (iref_ndiv, iref_trim, iref_pulse_w) = match refclk_khz {
+        19_200 => (1u32, 28u32, 1u32),
+        24_000 => (1, 25, 2),
+        38_400 => (2, 28, 1),
+        _ => return None,
+    };
+    let tdc_targetcnt = (2_000_000_000u32 / (132 * refclk_khz) + 5) / 10;
+    // use_ssc is false, so the gain applies only when the
+    // fractional remainder is non-zero.
+    let feedfwgain = if m2div_rem > 0 {
+        m1div * 100_000_000 / (dco as u32 * 3 / 10)
+    } else {
+        0
+    };
+    let (prop_coeff, int_coeff) = if dco >= 9_000_000 {
+        (5u32, 10u32)
+    } else {
+        (4, 8)
+    };
+
+    let div0 = (if m2div_rem > 0 { 1u32 << 30 } else { 0 }) | (m2div_frac << 8) | m2div_int;
+    let div1_reg = (iref_ndiv << 16) | (1 << 12) | (1 << 4) | m1div;
+    let lf = (tdc_targetcnt << 24) | (1 << 20) | (1 << 16) | (int_coeff << 8) | prop_coeff;
+    let frac_lock = (1 << 18)
+        | (1 << 16)
+        | (10 << 11)
+        | (1 << 10)
+        | feedfwgain
+        | (if m2div_rem > 0 { 1 << 8 } else { 0 });
+    // SSC: SSC_EN off (use_ssc false), SSC_TYPE 2, STEPLENGTH 0,
+    // STEPNUM 4 (steplog), FLLEN set, STEPSIZE 0.
+    let ssc = (2 << 26) | (4 << 10) | (1 << 9);
+    let bias = (3 << 30) | (0x3F << 24) | (10 << 16) | (1 << 15) | (12 << 8) | (4 << 5) | iref_trim;
+    let tdc_coldst_bias = (1 << 27) | (iref_pulse_w << 17) | (1 << 16) | (1 << 2) | 3;
+    // 38.4 MHz refclk: only the COLDSTART bit of TDC_COLDST_BIAS
+    // is written and BIAS is left untouched.
+    let (bias_mask, tdc_coldst_bias_mask) = if refclk_khz == 38_400 {
+        (0, 1 << 16)
+    } else {
+        (u32::MAX, u32::MAX)
+    };
+    Some(MgPllState {
+        refclkin_ctl: 1 << 8,
+        clktop2_coreclkctl1: a_divratio << 8,
+        clktop2_hsclkctl: (tlinedrv << 14) | (inputsel << 16) | (hsdiv << 12) | (div2 << 8),
+        div0,
+        div1: div1_reg,
+        lf,
+        frac_lock,
+        ssc,
+        bias: bias & bias_mask,
+        tdc_coldst_bias: tdc_coldst_bias & tdc_coldst_bias_mask,
+        bias_mask,
+        tdc_coldst_bias_mask,
+    })
+}
+
+/// `icl_mg_pll_write`: RMW the three clock-top registers under
+/// their field masks, plain-write DIV0/DIV1/LF/FRAC_LOCK/SSC,
+/// RMW BIAS and TDC_COLDST_BIAS under their masks, then a
+/// posting read of TDC_COLDST_BIAS.
+pub fn mg_pll_write(io: &(impl MmioWindow + ?Sized), tc: u8, state: &MgPllState) {
+    fn rmw(io: &(impl MmioWindow + ?Sized), reg: u64, mask: u32, val: u32) {
+        let cur = io.read32(reg);
+        io.write32(reg, (cur & !mask) | (val & mask));
+    }
+    rmw(
+        io,
+        mg_pll_refclkin_ctl(tc),
+        MG_REFCLKIN_CTL_OD_2_MUX_MASK,
+        state.refclkin_ctl,
+    );
+    rmw(
+        io,
+        mg_pll_clktop2_coreclkctl1(tc),
+        MG_CORECLKCTL1_A_DIVRATIO_MASK,
+        state.clktop2_coreclkctl1,
+    );
+    rmw(
+        io,
+        mg_pll_clktop2_hsclkctl(tc),
+        MG_HSCLKCTL_TLINEDRV_MASK
+            | MG_HSCLKCTL_CORE_INPUTSEL_MASK
+            | MG_HSCLKCTL_HSDIV_MASK
+            | MG_HSCLKCTL_DSDIV_MASK,
+        state.clktop2_hsclkctl,
+    );
+    io.write32(mg_pll_div0(tc), state.div0);
+    io.write32(mg_pll_div1(tc), state.div1);
+    io.write32(mg_pll_lf(tc), state.lf);
+    io.write32(mg_pll_frac_lock(tc), state.frac_lock);
+    io.write32(mg_pll_ssc(tc), state.ssc);
+    rmw(io, mg_pll_bias(tc), state.bias_mask, state.bias);
+    rmw(
+        io,
+        mg_pll_tdc_coldst_bias(tc),
+        state.tdc_coldst_bias_mask,
+        state.tdc_coldst_bias,
+    );
+    let _ = io.read32(mg_pll_tdc_coldst_bias(tc));
+}
+
+/// `mg_pll_enable`: `icl_pll_power_enable` + `icl_mg_pll_write`
+/// + `icl_pll_enable` on the MG enable register. 1 ms per wait.
+pub fn mg_pll_enable(
+    io: &(impl MmioWindow + ?Sized),
+    tc: u8,
+    state: &MgPllState,
+) -> Result<(), DpllError> {
+    let enable = mg_pll_enable_reg(tc);
     let cur = io.read32(enable);
     if cur == u32::MAX || !io.display_access_ok() {
         return Err(DpllError::NoDevice);
     }
-    // Status bits (LOCK, POWER_STATE) are read-only; never write
-    // them back — the same rule the CDCLK PLL disable follows.
     let clean = cur & !(PLL_LOCK | PLL_POWER_STATE);
     io.write32(enable, clean | PLL_POWER_ENABLE);
     wait(io, enable, PLL_POWER_STATE, PLL_POWER_STATE)?;
-    dpll_write(io, id, cfgcr0, cfgcr1);
+    mg_pll_write(io, tc, state);
     let cur = io.read32(enable);
     if cur == u32::MAX || !io.display_access_ok() {
         return Err(DpllError::NoDevice);
@@ -210,26 +624,88 @@ pub fn combo_pll_enable(
     wait(io, enable, PLL_LOCK, PLL_LOCK)
 }
 
-/// `combo_pll_disable` (`icl_pll_disable`): clear PLL_ENABLE
-/// (wait LOCK clear), then clear POWER_ENABLE (wait POWER_STATE
-/// clear). 1 ms per wait.
-pub fn combo_pll_disable(io: &(impl MmioWindow + ?Sized), id: IclDpllId) -> Result<(), DpllError> {
-    let enable = icl_dpll_enable_reg(id);
-    let cur = io.read32(enable);
-    if cur == u32::MAX || !io.display_access_ok() {
-        return Err(DpllError::NoDevice);
+/// `mg_pll_disable` (`icl_pll_disable` on the MG enable
+/// register): clear PLL_ENABLE (wait LOCK clear), then clear
+/// POWER_ENABLE (wait POWER_STATE clear). 1 ms per wait.
+pub fn mg_pll_disable(io: &(impl MmioWindow + ?Sized), tc: u8) -> Result<(), DpllError> {
+    pll_disable_at(io, mg_pll_enable_reg(tc))
+}
+
+// ── TBT PLL (Type-C ports, IceLake) ───────────────────────────
+//
+// The Thunderbolt PLL is the alternate clock source for TC
+// ports in TBT alt mode. Grounded in Linux
+// `display/intel_dpll_mgr.c` (`icl_tbt_pll_24MHz_values`,
+// `icl_tbt_pll_19_2MHz_values`, `icl_calc_tbt_pll`,
+// `icl_tbt_pll_enable`) and `display/intel_dpll_mgr.h`
+// (`DPLL_ID_ICL_TBTPLL` = 2).
+//
+// The rows are fixed `skl_wrpll_params` — the same 8.1 GHz DCO
+// as the DP combo rows, P/5 K/1 — and the state packs through
+// the shared CFGCR0/CFGCR1 pair at `ICL_DPLL_CFGCR0(2)`.
+// `icl_ddi_tbt_pll_get_freq` warns and returns 0 (the PLL
+// outputs several frequencies; selection happens at the DDI
+// clock mux), so there is no frequency accessor here.
+//
+// Alt-mode entry/exit (the TC subsystem side) is NOT in this
+// lane — only the PLL rows and the enable sequence. The MG
+// signal-levels path returns early in TBT alt mode, matching
+// Linux.
+
+/// `TBT_PLL_ENABLE` (`display/intel_display_regs.h:2954`).
+pub const TBT_PLL_ENABLE: u64 = 0x46020;
+
+/// `ICL_DPLL_CFGCR0(2)` — TBT PLL config register 0
+/// (0x164000 + 2 * 0x80).
+pub const TBT_PLL_CFGCR0: u64 = 0x164100;
+
+/// `ICL_DPLL_CFGCR1(2)` — TBT PLL config register 1.
+pub const TBT_PLL_CFGCR1: u64 = 0x164104;
+
+/// `icl_calc_tbt_pll` (DISPLAY_VER < 12): the 24 MHz refclk
+/// takes the 24 MHz row; 19.2 and 38.4 MHz both take the
+/// 19.2 MHz row. Anything else is `-EINVAL` → `None`.
+/// The returned coefficients pack with `calc_dpll_state`
+/// (no EHL div-frac WA — the TBT rows are not combo rows).
+pub fn tbt_pll_coeffs(refclk_khz: u32) -> Option<DpllCoeffs> {
+    match refclk_khz {
+        24_000 => Some(DpllCoeffs {
+            dco_integer: 0x151,
+            dco_fraction: 0x4000,
+            cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_5 | CFGCR1_CFREQ_8_4_GHZ,
+        }),
+        19_200 | 38_400 => Some(DpllCoeffs {
+            dco_integer: 0x1A5,
+            dco_fraction: 0x7000,
+            cfgcr1: CFGCR1_KDIV_1 | CFGCR1_PDIV_5 | CFGCR1_CFREQ_8_4_GHZ,
+        }),
+        _ => None,
     }
-    io.write32(enable, (cur & !(PLL_LOCK | PLL_POWER_STATE)) & !PLL_ENABLE);
-    wait(io, enable, PLL_LOCK, 0)?;
-    let cur = io.read32(enable);
-    if cur == u32::MAX || !io.display_access_ok() {
-        return Err(DpllError::NoDevice);
-    }
-    io.write32(
-        enable,
-        (cur & !(PLL_LOCK | PLL_POWER_STATE)) & !PLL_POWER_ENABLE,
-    );
-    wait(io, enable, PLL_POWER_STATE, 0)
+}
+
+/// `icl_tbt_pll_enable`: `icl_pll_power_enable` +
+/// `icl_dpll_write` + `icl_pll_enable` on `TBT_PLL_ENABLE`.
+/// 1 ms per wait.
+pub fn tbt_pll_enable(
+    io: &(impl MmioWindow + ?Sized),
+    cfgcr0: u32,
+    cfgcr1: u32,
+) -> Result<(), DpllError> {
+    pll_enable_at(
+        io,
+        TBT_PLL_ENABLE,
+        TBT_PLL_CFGCR0,
+        TBT_PLL_CFGCR1,
+        cfgcr0,
+        cfgcr1,
+    )
+}
+
+/// `icl_pll_disable` on `TBT_PLL_ENABLE`: clear PLL_ENABLE
+/// (wait LOCK clear), then clear POWER_ENABLE (wait
+/// POWER_STATE clear). 1 ms per wait.
+pub fn tbt_pll_disable(io: &(impl MmioWindow + ?Sized)) -> Result<(), DpllError> {
+    pll_disable_at(io, TBT_PLL_ENABLE)
 }
 
 // ── SKL `DPLL_CTRL1` (DISPLAY_VER 9 only) ───────────────────────
@@ -351,6 +827,16 @@ pub mod tests {
     use core::cell::RefCell;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    /// Any PLL enable register the model synthesizes LOCK /
+    /// POWER_STATE for: the three combo enables, the TBT enable,
+    /// and all four MG enables (TC1's is the EHL DPLL4 enable).
+    fn is_pll_enable_reg(off: u64) -> bool {
+        matches!(
+            off,
+            0x46010 | 0x46014 | 0x46020 | 0x46030 | 0x46034 | 0x46038 | 0x4603C
+        )
+    }
+
     /// Scripted combo-PLL endpoint: CFGCR0/1 stores per PLL,
     /// enable registers whose LOCK follows ENABLE and whose
     /// POWER_STATE follows POWER_ENABLE (unless the grant flags
@@ -399,10 +885,7 @@ pub mod tests {
     impl MmioWindow for DpllMmio {
         fn read32(&self, off: u64) -> u32 {
             let mut v = self.reg(&self.enable, off);
-            if off == icl_dpll_enable_reg(IclDpllId::Dpll0)
-                || off == icl_dpll_enable_reg(IclDpllId::Dpll1)
-                || off == icl_dpll_enable_reg(IclDpllId::Dpll4)
-            {
+            if is_pll_enable_reg(off) {
                 if self.grant_power && v & PLL_POWER_ENABLE != 0 {
                     v |= PLL_POWER_STATE;
                 } else {
@@ -429,10 +912,7 @@ pub mod tests {
                 *self.ctrl1.borrow_mut() = val;
                 return;
             }
-            if off == icl_dpll_enable_reg(IclDpllId::Dpll0)
-                || off == icl_dpll_enable_reg(IclDpllId::Dpll1)
-                || off == icl_dpll_enable_reg(IclDpllId::Dpll4)
-            {
+            if is_pll_enable_reg(off) {
                 let mut store = self.enable.borrow_mut();
                 if let Some(slot) = store.iter_mut().find(|(o, _)| *o == off) {
                     slot.1 = val & !(PLL_LOCK | PLL_POWER_STATE);
@@ -686,4 +1166,292 @@ pub mod tests {
         "drivers/gpu/intel_gpu_gen11_dpll",
         smoke_skl_dpll_ctrl1_write_read
     );
+
+    fn smoke_mg_pll_register_map() -> TestResult {
+        // MG_PLL_ENABLE: TC1 0x46030, stride 4.
+        if mg_pll_enable_reg(0) != 0x46030
+            || mg_pll_enable_reg(1) != 0x46034
+            || mg_pll_enable_reg(2) != 0x46038
+            || mg_pll_enable_reg(3) != 0x4603C
+        {
+            return TestResult::Fail("MG PLL enable registers wrong");
+        }
+        // MG PLL block: TC1 DIV0 0x168A00, stride 0x1000.
+        if mg_pll_div0(0) != 0x168A00
+            || mg_pll_div0(1) != 0x169A00
+            || mg_pll_div1(0) != 0x168A04
+            || mg_pll_lf(0) != 0x168A08
+            || mg_pll_frac_lock(0) != 0x168A0C
+            || mg_pll_ssc(0) != 0x168A10
+            || mg_pll_bias(0) != 0x168A14
+            || mg_pll_tdc_coldst_bias(0) != 0x168A18
+            || mg_pll_div0(3) != 0x16BA00
+        {
+            return TestResult::Fail("MG PLL block registers wrong");
+        }
+        // Clock-top registers: PORT1 bases, stride 0x1000.
+        if mg_pll_refclkin_ctl(0) != 0x16892C
+            || mg_pll_refclkin_ctl(1) != 0x16992C
+            || mg_pll_clktop2_coreclkctl1(0) != 0x1688D8
+            || mg_pll_clktop2_hsclkctl(0) != 0x1688D4
+            || mg_pll_clktop2_hsclkctl(3) != 0x16B8D4
+        {
+            return TestResult::Fail("MG clock-top registers wrong");
+        }
+        // TBT PLL: CFGCR0 0x164100, CFGCR1 0x164104, enable 0x46020.
+        if TBT_PLL_CFGCR0 != 0x164100 || TBT_PLL_CFGCR1 != 0x164104 || TBT_PLL_ENABLE != 0x46020 {
+            return TestResult::Fail("TBT PLL registers wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_dpll",
+        smoke_mg_pll_register_map
+    );
+
+    fn smoke_mg_pll_dp_state() -> TestResult {
+        // DP HBR2 (540 MHz) at 19.2 MHz refclk: divisor search
+        // lands on div1=3, div2=1 (DCO 8.1 GHz), m1div=2,
+        // m2div_int=210, rem 36000, frac 0x3C0000.
+        let state = match mg_pll_state(540_000, true, 19_200) {
+            Some(s) => s,
+            None => return TestResult::Fail("HBR2 MG state must exist"),
+        };
+        if state.refclkin_ctl != 0x100
+            || state.clktop2_coreclkctl1 != 0x500
+            || state.clktop2_hsclkctl != 0x1100
+            || state.div0 != 0x7C00_00D2
+            || state.div1 != 0x11012
+            || state.lf != 0x4F11_0804
+            || state.frac_lock != 0x55552
+            || state.ssc != 0x0800_1200
+            || state.bias != 0xFF0A_8C9C
+            || state.tdc_coldst_bias != 0x0803_0007
+            || state.bias_mask != u32::MAX
+            || state.tdc_coldst_bias_mask != u32::MAX
+        {
+            return TestResult::Fail("HBR2 MG state vector wrong");
+        }
+        // DP RBR (162 MHz) at 19.2 MHz: div1=5, div2=2 — same
+        // DCO/refclk, so the packed DCO fields match HBR2; only
+        // the clock-top dividers differ (A_DIVRATIO 10, DSDIV 2,
+        // HSDIV ratio 5).
+        let state = match mg_pll_state(162_000, true, 19_200) {
+            Some(s) => s,
+            None => return TestResult::Fail("RBR MG state must exist"),
+        };
+        if state.clktop2_coreclkctl1 != 0xA00
+            || state.clktop2_hsclkctl != 0xA200
+            || state.div0 != 0x7C00_00D2
+            || state.div1 != 0x11012
+            || state.bias != 0xFF0A_8C9C
+        {
+            return TestResult::Fail("RBR MG state vector wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gen11_dpll", smoke_mg_pll_dp_state);
+
+    fn smoke_mg_pll_hdmi_state() -> TestResult {
+        // HDMI 148.5 MHz TMDS at 24 MHz refclk: divisor search
+        // lands on div1=3, div2=4 (DCO 8.91 GHz), m1div=2,
+        // m2div_int=185, rem 30000, frac 0x280000.
+        let state = match mg_pll_state(148_500, false, 24_000) {
+            Some(s) => s,
+            None => return TestResult::Fail("HDMI MG state must exist"),
+        };
+        if state.refclkin_ctl != 0x100
+            || state.clktop2_coreclkctl1 != 0x500
+            || state.clktop2_hsclkctl != 0x19400
+            || state.div0 != 0x6800_00B9
+            || state.div1 != 0x11012
+            || state.lf != 0x3F11_0804
+            || state.frac_lock != 0x5554A
+            || state.ssc != 0x0800_1200
+            || state.bias != 0xFF0A_8C99
+            || state.tdc_coldst_bias != 0x0805_0007
+        {
+            return TestResult::Fail("HDMI MG state vector wrong");
+        }
+        // A clock no (div1, div2) pair can reach is None.
+        if mg_pll_state(100_000, true, 19_200).is_some() {
+            return TestResult::Fail("unreachable DP clock must have no MG state");
+        }
+        // An unknown refclk is None.
+        if mg_pll_state(540_000, true, 12_345).is_some() {
+            return TestResult::Fail("unknown refclk must have no MG state");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gen11_dpll", smoke_mg_pll_hdmi_state);
+
+    fn smoke_mg_pll_refclk_38_4_masks() -> TestResult {
+        // 38.4 MHz refclk: BIAS is left untouched (mask 0) and
+        // only the COLDSTART bit of TDC_COLDST_BIAS is written.
+        let state = match mg_pll_state(540_000, true, 38_400) {
+            Some(s) => s,
+            None => return TestResult::Fail("HBR2 MG state must exist at 38.4 MHz"),
+        };
+        if state.bias_mask != 0
+            || state.tdc_coldst_bias_mask != 0x1_0000
+            || state.bias != 0
+            || state.tdc_coldst_bias != 0x1_0000
+        {
+            return TestResult::Fail("38.4 MHz MG masks wrong");
+        }
+        if state.div0 != 0x5E00_0069 || state.div1 != 0x21012 || state.lf != 0x2711_0804 {
+            return TestResult::Fail("38.4 MHz MG state vector wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_dpll",
+        smoke_mg_pll_refclk_38_4_masks
+    );
+
+    fn smoke_tbt_pll_rows() -> TestResult {
+        // 24 MHz row: DCO 0x151/0x4000, P/5 K/1, CFREQ 8.4 GHz.
+        let coeffs = match tbt_pll_coeffs(24_000) {
+            Some(c) => c,
+            None => return TestResult::Fail("TBT 24 MHz row must exist"),
+        };
+        let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
+        if cfgcr0 != 0x1000_0151 || cfgcr1 != 0x53 {
+            return TestResult::Fail("TBT 24 MHz row wrong");
+        }
+        // 19.2 MHz row: DCO 0x1A5/0x7000, same dividers.
+        let coeffs = match tbt_pll_coeffs(19_200) {
+            Some(c) => c,
+            None => return TestResult::Fail("TBT 19.2 MHz row must exist"),
+        };
+        let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
+        if cfgcr0 != 0x1C00_01A5 || cfgcr1 != 0x53 {
+            return TestResult::Fail("TBT 19.2 MHz row wrong");
+        }
+        // 38.4 MHz falls through to the 19.2 MHz row.
+        let coeffs = match tbt_pll_coeffs(38_400) {
+            Some(c) => c,
+            None => return TestResult::Fail("TBT 38.4 MHz row must exist"),
+        };
+        let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
+        if cfgcr0 != 0x1C00_01A5 || cfgcr1 != 0x53 {
+            return TestResult::Fail("TBT 38.4 MHz row must fall through to 19.2 MHz");
+        }
+        if tbt_pll_coeffs(12_345).is_some() {
+            return TestResult::Fail("unknown refclk must have no TBT row");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gen11_dpll", smoke_tbt_pll_rows);
+
+    fn smoke_mg_pll_enable_disable() -> TestResult {
+        let mmio = DpllMmio::new();
+        let state = mg_pll_state(540_000, true, 19_200).expect("HBR2 MG state must exist");
+        if mg_pll_enable(&mmio, 0, &state).is_err() {
+            return TestResult::Fail("MG PLL enable must succeed");
+        }
+        // Power-enable, then the state writes, then PLL enable.
+        let enable_writes = mmio.writes_to(mg_pll_enable_reg(0));
+        if enable_writes != alloc::vec![PLL_POWER_ENABLE, PLL_POWER_ENABLE | PLL_ENABLE] {
+            return TestResult::Fail("MG enable sequence must be power then PLL enable");
+        }
+        if mmio.writes_to(mg_pll_div0(0)) != alloc::vec![0x7C00_00D2] {
+            return TestResult::Fail("MG DIV0 must carry the HBR2 state");
+        }
+        if mmio.writes_to(mg_pll_tdc_coldst_bias(0)) != alloc::vec![0x0803_0007] {
+            return TestResult::Fail("MG TDC_COLDST_BIAS must carry the HBR2 state");
+        }
+        // Disable reverses it: clear ENABLE, then clear POWER_ENABLE.
+        let mmio = DpllMmio::new();
+        if mg_pll_enable(&mmio, 2, &state).is_err() || mg_pll_disable(&mmio, 2).is_err() {
+            return TestResult::Fail("MG PLL disable must succeed");
+        }
+        let enable_writes = mmio.writes_to(mg_pll_enable_reg(2));
+        if enable_writes
+            != alloc::vec![
+                PLL_POWER_ENABLE,
+                PLL_POWER_ENABLE | PLL_ENABLE,
+                PLL_POWER_ENABLE,
+                0,
+            ]
+        {
+            return TestResult::Fail("MG disable must clear ENABLE then POWER_ENABLE");
+        }
+        // A PLL that never locks must time out on enable.
+        let mut mmio = DpllMmio::new();
+        mmio.grant_lock = false;
+        if mg_pll_enable(&mmio, 0, &state) != Err(DpllError::Timeout) {
+            return TestResult::Fail("MG enable without LOCK must time out");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_dpll",
+        smoke_mg_pll_enable_disable
+    );
+
+    fn smoke_tbt_pll_enable_disable() -> TestResult {
+        let mmio = DpllMmio::new();
+        let coeffs = tbt_pll_coeffs(19_200).expect("TBT 19.2 MHz row must exist");
+        let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
+        if tbt_pll_enable(&mmio, cfgcr0, cfgcr1).is_err() {
+            return TestResult::Fail("TBT PLL enable must succeed");
+        }
+        let enable_writes = mmio.writes_to(TBT_PLL_ENABLE);
+        if enable_writes != alloc::vec![PLL_POWER_ENABLE, PLL_POWER_ENABLE | PLL_ENABLE] {
+            return TestResult::Fail("TBT enable sequence must be power then PLL enable");
+        }
+        if mmio.writes_to(TBT_PLL_CFGCR0) != alloc::vec![0x1C00_01A5] {
+            return TestResult::Fail("TBT CFGCR0 must carry the 19.2 MHz row");
+        }
+        if mmio.writes_to(TBT_PLL_CFGCR1) != alloc::vec![0x53] {
+            return TestResult::Fail("TBT CFGCR1 must be KDIV_1 | PDIV_5 | CFREQ_8400");
+        }
+        // Disable reverses it.
+        let mmio = DpllMmio::new();
+        if tbt_pll_enable(&mmio, cfgcr0, cfgcr1).is_err() || tbt_pll_disable(&mmio).is_err() {
+            return TestResult::Fail("TBT PLL disable must succeed");
+        }
+        let enable_writes = mmio.writes_to(TBT_PLL_ENABLE);
+        if enable_writes
+            != alloc::vec![
+                PLL_POWER_ENABLE,
+                PLL_POWER_ENABLE | PLL_ENABLE,
+                PLL_POWER_ENABLE,
+                0,
+            ]
+        {
+            return TestResult::Fail("TBT disable must clear ENABLE then POWER_ENABLE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_dpll",
+        smoke_tbt_pll_enable_disable
+    );
+
+    fn smoke_combo_dpll_id_map() -> TestResult {
+        use crate::intel_gpu_gt::Gen11Platform as P;
+        // ICL: A→DPLL0, B→DPLL1, C+ are MG ports (no combo PLL).
+        if combo_dpll_id(P::IceLake, Ddi::A) != Some(IclDpllId::Dpll0)
+            || combo_dpll_id(P::IceLake, Ddi::B) != Some(IclDpllId::Dpll1)
+            || combo_dpll_id(P::IceLake, Ddi::C).is_some()
+            || combo_dpll_id(P::IceLake, Ddi::F).is_some()
+        {
+            return TestResult::Fail("ICL combo-PLL map wrong");
+        }
+        // EHL/JSL: A→DPLL0, B→DPLL1, C→DPLL4, D shares PHY A
+        // (no fixed assignment).
+        for p in [P::ElkhartLake, P::JasperLake] {
+            if combo_dpll_id(p, Ddi::A) != Some(IclDpllId::Dpll0)
+                || combo_dpll_id(p, Ddi::B) != Some(IclDpllId::Dpll1)
+                || combo_dpll_id(p, Ddi::C) != Some(IclDpllId::Dpll4)
+                || combo_dpll_id(p, Ddi::D).is_some()
+            {
+                return TestResult::Fail("EHL/JSL combo-PLL map wrong");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gen11_dpll", smoke_combo_dpll_id_map);
 }

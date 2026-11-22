@@ -63,10 +63,11 @@
 //!   keeper, PORT_TX_DW4 loadgen select, PORT_CL_DW5 SUS clock,
 //!   PORT_TX_DW5 training enable, `icl_ddi_combo_vswing_program`)
 //!   is Lane 5 modeset wiring: the Gen12 programmer is keyed to
-//!   `Gen12Platform` and the ICL port→PHY map (combo PHY A/B,
-//!   TC1–TC4 MG) is not modeled yet. This module only selects
-//!   the table; it programs no register.
+//!   `Gen12Platform`. The ICL port→PHY map (combo PHY A/B,
+//!   TC1–TC4 MG) is modeled by `phy_for_port` above (Lane 8).
+//!   This module only selects the table; it programs no register.
 
+use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_gen12_combo_phy::IclEntry;
 use crate::intel_gpu_gt::Gen11Platform;
 
@@ -265,6 +266,57 @@ pub fn select_table(
     }
 }
 
+/// Which physical layer a Gen11 DDI port is wired to.
+///
+/// Grounded in Linux `display/intel_display.c`
+/// (`intel_port_to_phy`, `intel_phy_is_combo`,
+/// `intel_phy_is_tc`, `intel_port_to_tc`) and
+/// `display/intel_display_device.c` (`icl_desc` port masks):
+///
+/// - IceLake: A and B are combo PHYs; C–F are Type-C ports
+///   (TC1–TC4), each with its own MG PLL. PORT_F exists only
+///   on `port_f` subplatform SKUs (`icl_port_f_ids`) — the map
+///   describes the port when present; this driver does not model
+///   ICL subplatforms.
+/// - Elkhart/Jasper Lake: A, B and C are combo PHYs; D is a
+///   combo port that shares PHY A with PORT_A
+///   (`intel_port_to_phy` special case). EHL/JSL have NO TC
+///   ports and NO MG PLLs — their `ehl_plls[]` is DPLL0, DPLL1,
+///   DPLL4 only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gen11Phy {
+    /// Combo PHY (DDI A/B on ICL; A/B/C on EHL/JSL; D on
+    /// EHL/JSL shares PHY A with PORT_A).
+    Combo,
+    /// Type-C port with its MG PLL; `tc` is the 0-based TC
+    /// index (TC1 = 0 … TC4 = 3).
+    Mg { tc: u8 },
+}
+
+/// The PHY kind for a Gen11 DDI port. `None` for ports the
+/// platform does not have (DDI G and above on all Gen11
+/// platforms; EHL/JSL have no DDI E/F).
+pub const fn phy_for_port(platform: Gen11Platform, ddi: Ddi) -> Option<Gen11Phy> {
+    match (platform, ddi) {
+        (Gen11Platform::IceLake, Ddi::A) | (Gen11Platform::IceLake, Ddi::B) => {
+            Some(Gen11Phy::Combo)
+        }
+        (Gen11Platform::IceLake, Ddi::C) => Some(Gen11Phy::Mg { tc: 0 }),
+        (Gen11Platform::IceLake, Ddi::D) => Some(Gen11Phy::Mg { tc: 1 }),
+        (Gen11Platform::IceLake, Ddi::E) => Some(Gen11Phy::Mg { tc: 2 }),
+        (Gen11Platform::IceLake, Ddi::F) => Some(Gen11Phy::Mg { tc: 3 }),
+        (Gen11Platform::ElkhartLake, Ddi::A)
+        | (Gen11Platform::ElkhartLake, Ddi::B)
+        | (Gen11Platform::ElkhartLake, Ddi::C)
+        | (Gen11Platform::ElkhartLake, Ddi::D)
+        | (Gen11Platform::JasperLake, Ddi::A)
+        | (Gen11Platform::JasperLake, Ddi::B)
+        | (Gen11Platform::JasperLake, Ddi::C)
+        | (Gen11Platform::JasperLake, Ddi::D) => Some(Gen11Phy::Combo),
+        _ => None,
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
@@ -387,4 +439,53 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_gen11_ddi", smoke_icl_ddi_selection);
+
+    fn smoke_gen11_port_map() -> TestResult {
+        let icl = Gen11Platform::IceLake;
+        let ehl = Gen11Platform::ElkhartLake;
+        let jsl = Gen11Platform::JasperLake;
+        // ICL: A/B combo, C–F TC1–TC4.
+        if phy_for_port(icl, Ddi::A) != Some(Gen11Phy::Combo)
+            || phy_for_port(icl, Ddi::B) != Some(Gen11Phy::Combo)
+            || phy_for_port(icl, Ddi::C) != Some(Gen11Phy::Mg { tc: 0 })
+            || phy_for_port(icl, Ddi::D) != Some(Gen11Phy::Mg { tc: 1 })
+            || phy_for_port(icl, Ddi::E) != Some(Gen11Phy::Mg { tc: 2 })
+            || phy_for_port(icl, Ddi::F) != Some(Gen11Phy::Mg { tc: 3 })
+            || phy_for_port(icl, Ddi::G).is_some()
+        {
+            return TestResult::Fail("ICL port map wrong");
+        }
+        // EHL/JSL: A–D all combo (D shares PHY A); no TC ports.
+        for p in [ehl, jsl] {
+            for ddi in [Ddi::A, Ddi::B, Ddi::C, Ddi::D] {
+                if phy_for_port(p, ddi) != Some(Gen11Phy::Combo) {
+                    return TestResult::Fail("EHL/JSL port map wrong");
+                }
+            }
+            if phy_for_port(p, Ddi::E).is_some() || phy_for_port(p, Ddi::F).is_some() {
+                return TestResult::Fail("EHL/JSL must have no DDI E/F");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gen11_ddi", smoke_gen11_port_map);
+
+    fn smoke_gen11_ddi_buf_ctl_bases() -> TestResult {
+        // DDI_BUF_CTL addressing is shared with Gen12: 0x64000
+        // + port * 0x100 — pin the Gen11 TC-port addresses.
+        if Ddi::A.base() != 0x64000
+            || Ddi::B.base() != 0x64100
+            || Ddi::C.base() != 0x64200
+            || Ddi::D.base() != 0x64300
+            || Ddi::E.base() != 0x64400
+            || Ddi::F.base() != 0x64500
+        {
+            return TestResult::Fail("Gen11 DDI_BUF_CTL bases wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_ddi",
+        smoke_gen11_ddi_buf_ctl_bases
+    );
 }
