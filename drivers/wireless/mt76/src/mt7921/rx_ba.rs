@@ -109,10 +109,14 @@ impl Request {
         body
     }
     pub fn delba(self, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
+        self.delba_reason(own, peer, 39) // WLAN_REASON_QSTA_TIMEOUT.
+    }
+    /// The recipient DELBA for this agreement with `reason`.
+    pub fn delba_reason(self, own: [u8; 6], peer: [u8; 6], reason: u16) -> Vec<u8> {
         let mut frame = action(own, peer, 30);
         frame[24..26].copy_from_slice(&[3, 2]);
         frame[26..28].copy_from_slice(&(u16::from(self.tid) << 12).to_le_bytes()); // Recipient, initiator=0.
-        frame[28..30].copy_from_slice(&39u16.to_le_bytes()); // WLAN_REASON_QSTA_TIMEOUT.
+        frame[28..30].copy_from_slice(&reason.to_le_bytes());
         frame
     }
 }

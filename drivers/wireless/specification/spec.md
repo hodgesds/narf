@@ -1219,7 +1219,10 @@ delivered unreordered and meets the same PN check, as `mt76_rx_aggr_reorder`
 leaves it queued; a Block Ack policy subframe on a TID with no agreement
 queues one recipient DELBA (WLAN_REASON_QSTA_REQUIRE_SETUP) per TID until an
 agreement activates again (mac80211 `ieee80211_rx_reorder_ampdu`,
-`unexpected_agg`).
+`unexpected_agg`). Only a pairwise (PTK) EAPOL exchange retires the
+transmit and recipient agreements, as `ieee80211_pairwise_rekey` does;
+each recipient agreement then ends with a DELBA to the AP
+(WLAN_REASON_QSTA_LEAVE_QBSS). A Group Key Handshake leaves them running.
 
 Matching AP deauthentication/disassociation closes packet admission and queues
 firmware teardown. Disconnect waits for pending TX retirement, removes keys

@@ -184,6 +184,31 @@ impl<B: Backend> Session<B> {
 
     /// Close delivery before the first wait and retain each native BA record
     /// until both terminal disable receipts. Key/WCID reuse follows this fence.
+    /// [`Self::retire_receive_ba`] for a PTK rekey: after the firmware stops
+    /// each agreement, its originator gets a recipient DELBA with
+    /// WLAN_REASON_QSTA_LEAVE_QBSS (`ieee80211_sta_tear_down_BA_sessions` →
+    /// `__ieee80211_stop_rx_ba_session(.., tx = true)`).
+    pub(super) async fn retire_receive_ba_notify(
+        &mut self,
+        own: [u8; 6],
+        peer: [u8; 6],
+    ) -> Result<(), Error> {
+        const WLAN_REASON_QSTA_LEAVE_QBSS: u16 = 36;
+        let link = self.station.link;
+        self.station.rx_ba.fence();
+        self.clear_aggregate_receive();
+        for (tid, epoch, request) in self.station.rx_ba.records() {
+            self.exchange(Command::Unified { id: 3 }, &request.wtbl(link, peer, false))
+                .await?;
+            self.exchange(Command::Unified { id: 3 }, &request.station(link, false))
+                .await?;
+            self.station.rx_ba.finish_stop(tid, epoch);
+            let delba = request.delba_reason(own, peer, WLAN_REASON_QSTA_LEAVE_QBSS);
+            self.send_management(&delba, u16::from(link.peer())).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn retire_receive_ba(&mut self, peer: [u8; 6]) -> Result<(), Error> {
         let link = self.station.link;
         self.station.rx_ba.fence();
