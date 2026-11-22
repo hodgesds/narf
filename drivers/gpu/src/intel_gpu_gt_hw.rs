@@ -699,6 +699,14 @@ impl HardwareInit {
                 media: None,
             }));
         }
+        if matches!(self.platform, GtPlatform::Gen11(_)) {
+            // Gen11 cache policy is the legacy PPAT model, not the
+            // Gen12+ PAT registers programmed below; it lands with
+            // the Gen11 GT lanes. Refuse rather than program the
+            // wrong PAT table. (Placed before the steering-semaphore
+            // acquisition, so no semaphore is held on this return.)
+            return Poll::Ready(Err(HardwareError::Unsupported));
+        }
         let modern = !matches!(
             self.platform,
             GtPlatform::ArcticSoundM | GtPlatform::Alchemist
@@ -724,6 +732,9 @@ impl HardwareInit {
         mmio.write32(selector, old | 0x80000000);
         let pat = match self.platform {
             GtPlatform::Gen12(_) => unreachable!("separate pre-GMD cache policy"),
+            // Unreachable: Gen11 is refused before the steering
+            // semaphore is acquired, above.
+            GtPlatform::Gen11(_) => unreachable!("Gen11 cache policy refused above"),
             GtPlatform::Integrated(_) if !self.platform.is_headless_integrated() => {
                 // Xe-LPG PAT3: WB L4, one-way coherent. PAT0, used by the
                 // inherited display, is deliberately not redefined.

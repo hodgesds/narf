@@ -994,6 +994,10 @@ impl RegisterInit {
                     add(0x2050, 0x1080, 0x1080, true, Direct);
                 }
             }
+            // Gen11: no workaround entries modeled yet. The table is
+            // per-platform; Gen11's set lands with the GT lanes.
+            // Adding nothing is safer than reusing Gen12 entries.
+            GtPlatform::Gen11(_) => {}
             GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                 add(0x9424, 2, 0, false, Direct); // 14015795083
                 if crate::intel_gpu_gt::is_dg2_g10(self.device) {

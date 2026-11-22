@@ -217,16 +217,22 @@ impl IntelDpBridge {
         let publication_serial =
             intel_gpu::next_external_scanout_serial().ok_or(DpBridgeError::NotReady)?;
         use core::fmt::Write as _;
+        // Pre-GMD generations (Gen11) have no GMD_ID; the bridge
+        // itself is Gen12-only, so this is a display-only path.
+        let gmd = match gpu.gmd_id {
+            Some(v) => alloc::format!("{v:#010x}"),
+            None => alloc::string::String::from("none"),
+        };
         let _ = writeln!(
             narf_console::Writer,
             "  intel-gpu/dp: DP-Alt active on {} (DDI {:?}, {} lanes, signaling=0x{:x}); \
-             chip={} GMD_ID={:#010x}",
+             chip={} GMD_ID={}",
             cfg.connector,
             ddi,
             cfg.lanes,
             cfg.signaling,
             gpu.chip.asic,
-            gpu.gmd_id,
+            gmd,
         );
 
         let mmio = MmioRegionWindow::new(&gpu.gtt_mmadr, family);

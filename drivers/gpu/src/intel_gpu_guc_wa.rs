@@ -23,6 +23,12 @@ impl GuCWorkarounds {
         let (flags, klvs): (_, &'static [u32]) = match platform {
             // POLLCS + PRE_PARSER. No CCS, TSC or XeHP register-state WA.
             GtPlatform::Gen12(_) => (0x44000, &[0x900b0000]),
+            // Gen11: same flags — i915 `guc_ctl_wa_flags` sets POLLCS
+            // for gen11/gen12 < XeHP (Wa_22012773006) and PRE_PARSER
+            // for graphics 11 (Wa_22011802037, true for VER 11). No
+            // KLVs: the 0x900b entry's 70.44 firmware gate is not met
+            // by the 70.1.1 blob.
+            GtPlatform::Gen11(_) => (0x44000, &[]),
             GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                 let isolation = crate::intel_gpu_gt::is_dg2_g11(device);
                 // HOLD_CCS_SWITCHOUT, DUAL_QUEUE, PRE_PARSER, TSC check;

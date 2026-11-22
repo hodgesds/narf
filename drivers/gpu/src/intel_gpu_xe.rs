@@ -376,7 +376,8 @@ impl XeFile {
                         8 | if info.vram.is_some() { 4 } else { 0 }
                     }
                     crate::intel_gpu_gt::GtPlatform::Integrated(_)
-                    | crate::intel_gpu_gt::GtPlatform::Gen12(_) => 2,
+                    | crate::intel_gpu_gt::GtPlatform::Gen12(_)
+                    | crate::intel_gpu_gt::GtPlatform::Gen11(_) => 2,
                     crate::intel_gpu_gt::GtPlatform::ArcticSoundM
                     | crate::intel_gpu_gt::GtPlatform::Alchemist => {
                         if info.vram.is_some() {

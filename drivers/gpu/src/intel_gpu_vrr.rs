@@ -131,7 +131,10 @@ pub enum DisplayVrrIp {
 impl DisplayVrrIp {
     pub const fn from_generation(gen: Generation) -> Self {
         match gen {
-            Generation::TigerLake | Generation::RocketLake => Self::Gen12,
+            // ICL shares the TGL VRR behaviour: `compute_config_late`
+            // documents the pipeline_full conversion as the ICL/TGL
+            // one. Display itself stays gated until Lane 4.
+            Generation::IceLake | Generation::TigerLake | Generation::RocketLake => Self::Gen12,
             Generation::AlderLake => Self::Display13,
             Generation::MeteorLake => Self::Display14,
             Generation::LunarLake => Self::Display20,
