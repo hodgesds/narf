@@ -2602,6 +2602,27 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// the tree, fetching index-child blocks via `read_block` as
     /// the walker descends.
     async fn map_block_extents(&self, inode: &Inode, logical: u64) -> Result<u64, FsError> {
+        self.map_block_extents_as(inode, logical, false).await
+    }
+
+    /// [`Self::map_block`], but an uninitialized (preallocated, unwritten)
+    /// extent answers with its physical block rather than as a hole: where
+    /// the block *is*, not what a read returns. `bmap` answers through this,
+    /// as Linux's swap-file setup (`iomap_swapfile_activate`) accepts
+    /// unwritten extents.
+    pub async fn map_block_allocated(&self, inode: &Inode, logical: u64) -> Result<u64, FsError> {
+        if self.superblock.uses_extents() && inode.uses_extents() {
+            return self.map_block_extents_as(inode, logical, true).await;
+        }
+        self.map_block(inode, logical).await
+    }
+
+    async fn map_block_extents_as(
+        &self,
+        inode: &Inode,
+        logical: u64,
+        unwritten_is_mapped: bool,
+    ) -> Result<u64, FsError> {
         use super::extent::{lookup_in_node, LookupOutcome};
         // Serialise inode.block[15] as 60 bytes (15 × u32 LE).
         let mut node_buf = alloc::vec![0u8; 60];
@@ -2626,7 +2647,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     // Uninitialized extents read as zeros — surface
                     // them as a hole to the caller, who already
                     // zero-fills on physical == 0.
-                    if is_uninitialized {
+                    if is_uninitialized && !unwritten_is_mapped {
                         return Ok(0);
                     }
                     return Ok(physical);
