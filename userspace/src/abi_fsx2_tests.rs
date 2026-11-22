@@ -2522,6 +2522,74 @@ kernel_test_in!(
     smoke_abi_fsx2_mount_setattr_recursive_reaches_submounts
 );
 
+// ── mount(MS_MOVE) carries the moved mount's subtree ──────────────────
+//
+// `do_move_mount` detaches the source mount together with every mount below
+// it and attaches the whole tree at the target (`attach_recursive_mnt`), on
+// top of whatever the target resolves to. systemd's PrivateDevices= relies
+// on it: the private /dev tmpfs gets its pts/shm/mqueue binds in a
+// temporary directory and is then MS_MOVEd into the service's root.
+
+fn smoke_abi_fsx2_ms_move_carries_submounts() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_MOVE: u64 = 0x2000;
+        const O_WRONLY: u64 = 0o1;
+        const O_CREAT: u64 = 0o100;
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-mvt-src".as_ptr() as u64, 0o755);
+        let _ = call_mkdir(c"/abi-mvt-dst".as_ptr() as u64, 0o755);
+        if mount_fstype(b"/abi-mvt-src\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-mvt-src/sub".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-mvt-src/sub\0", b"tmpfs\0") != Some(0)
+        {
+            return Err("the tmpfs tree under /abi-mvt-src was not mounted");
+        }
+        let marker = c"/abi-mvt-src/sub/marker";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, marker.as_ptr() as u64, O_WRONLY | O_CREAT, 0o644),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("could not create a file in the submount"),
+        }
+        let moved = call(
+            Syscall::Mount.raw(),
+            SyscallArgs {
+                arg0: c"/abi-mvt-src".as_ptr() as u64,
+                arg1: c"/abi-mvt-dst".as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_MOVE,
+                arg4: 0,
+                arg5: 0,
+            },
+        );
+        if moved != Some(0) {
+            return Err("mount(/abi-mvt-src, /abi-mvt-dst, MS_MOVE) failed");
+        }
+        let mut sb = [0u8; STAT_SIZE];
+        let stat = |path: &core::ffi::CStr, sb: &mut [u8; STAT_SIZE]| {
+            call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64)
+        };
+        if stat(c"/abi-mvt-dst/sub/marker", &mut sb) != Some(0) {
+            return Err("the moved mount's submount did not move with it");
+        }
+        if stat(c"/abi-mvt-src/sub", &mut sb) != Some(ENOENT) {
+            return Err("the submount stayed behind at the old path");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mount-move-tree",
+    smoke_abi_fsx2_ms_move_carries_submounts
+);
+
 // ── mount: fstype breadth for systemd's early-boot pseudo-filesystems ──
 //
 // systemd mounts many pseudo-filesystems (proc, sysfs, tmpfs, securityfs,
