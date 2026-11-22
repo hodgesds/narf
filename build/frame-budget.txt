@@ -12,14 +12,13 @@
 23224 <narf_drivers_gpu::out_of_line::OutOfLine<F> as core::future::future::Future>::poll
 23208 narf_drivers_wireless_iwlwifi::iwlwifi::bootstrap::Owner::start::{{closure}}
 21944 narf_drivers_wireless_ath11k::ath11k::pci::probe
-20552 narf_drivers_gpu::amdgpu::claim_navi48
 19880 narf_drivers_wireless_rtw::rtw89::bootstrap::Bootstrap::generation::{{closure}}
 19864 narf_drivers_wireless_ath10k::ath10k::pci::probe
 19560 narf_drivers_wireless_ath10k::ath10k::pci::queue_recovery::{{closure}}
 19384 narf_drivers_wireless_ath10k::ath10k::pci::restart_parked
 19240 narf_fb::amdgpu_boot::bring_up_navi48
-18728 narf_drivers_gpu::amdgpu_navi48_platform::restart::{{closure}}
 18392 narf_drivers_gpu::amdgpu_navi48_platform::status
+17336 narf_drivers_gpu::amdgpu::claim_navi48
 16632 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::after_reset
 16472 narf_userspace::abi_test_support::with_setup
 14112 narf_drivers_wireless_rtw::rtw89::bootstrap::attach_cold
