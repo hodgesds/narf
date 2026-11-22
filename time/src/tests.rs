@@ -175,6 +175,136 @@ kernel_test_in!(
     smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters
 );
 
+/// Where a simulated SMI lands in [`RefSim`].
+#[derive(Copy, Clone)]
+enum SmiAt {
+    /// Nowhere.
+    Never,
+    /// The first `n` HPET reads.
+    Start(u32),
+    /// The first `n` HPET reads that return a value a full window past the
+    /// first one: the reads that can end a measurement.
+    End(u32),
+}
+
+/// A machine for TSC calibration samplers: an HPET at `hpet_hz` and a TSC
+/// at `tsc_hz` counting one simulated time, each counter read taking
+/// [`RefSim::READ_NS`]. An SMI costs [`RefSim::SMI_NS`] AFTER the HPET has
+/// latched the value it returns, so the TSC read that follows is late —
+/// what firmware does to a calibration on Phoenix laptops.
+struct RefSim {
+    now_ns: core::cell::Cell<u64>,
+    first_hpet: core::cell::Cell<Option<u64>>,
+    hpet_reads: core::cell::Cell<u32>,
+    smis_left: core::cell::Cell<u32>,
+    hpet_hz: u64,
+    tsc_hz: u64,
+    window: u64,
+    smi: SmiAt,
+}
+
+impl RefSim {
+    const READ_NS: u64 = 1_000;
+    const SMI_NS: u64 = 500_000;
+    /// The 7600X's TSC as Linux refined it on this board: 4691.189 MHz
+    /// against a 4700 MHz P0 definition.
+    const TSC_HZ: u64 = 4_691_189_000;
+    /// A 69.841279 ns HPET period, as most chipsets report it.
+    const HPET_HZ: u64 = 14_318_180;
+
+    fn new(smi: SmiAt) -> Self {
+        let smis = match smi {
+            SmiAt::Never => 0,
+            SmiAt::Start(n) | SmiAt::End(n) => n,
+        };
+        Self {
+            now_ns: core::cell::Cell::new(0),
+            first_hpet: core::cell::Cell::new(None),
+            hpet_reads: core::cell::Cell::new(0),
+            smis_left: core::cell::Cell::new(smis),
+            hpet_hz: Self::HPET_HZ,
+            tsc_hz: Self::TSC_HZ,
+            // The 100 ms window the calibration paths use.
+            window: Self::HPET_HZ / 10,
+            smi,
+        }
+    }
+
+    fn hpet(&self) -> u64 {
+        let t = self.now_ns.get();
+        self.now_ns.set(t + Self::READ_NS);
+        let value = t * self.hpet_hz / 1_000_000_000;
+        let first = self.first_hpet.get().unwrap_or(value);
+        self.first_hpet.set(Some(first));
+        let reads = self.hpet_reads.get();
+        self.hpet_reads.set(reads + 1);
+        let hit = match self.smi {
+            SmiAt::Never => false,
+            SmiAt::Start(_) => true,
+            SmiAt::End(_) => value - first >= self.window,
+        };
+        if hit && self.smis_left.get() > 0 {
+            self.smis_left.set(self.smis_left.get() - 1);
+            self.now_ns.set(self.now_ns.get() + Self::SMI_NS);
+        }
+        value
+    }
+
+    fn tsc(&self) -> u64 {
+        let t = self.now_ns.get();
+        self.now_ns.set(t + Self::READ_NS);
+        t * self.tsc_hz / 1_000_000_000
+    }
+
+    /// `|measured - tsc_hz|` in ppm of `tsc_hz`.
+    fn error_ppm(&self, measured: u64) -> u64 {
+        measured.abs_diff(self.tsc_hz) * 1_000_000 / self.tsc_hz
+    }
+}
+
+/// Linux `tsc_read_refs`: a reference read is taken between two TSC reads
+/// and used only when the pair is close (`(t2 - t1) < thresh`, retried up
+/// to `MAX_RETRIES` times), so an SMI or NMI between the HPET latching its
+/// count and the TSC being read never becomes part of the measurement. An
+/// SMI there moves one end of the window by its whole length: 500 µs in a
+/// 100 ms window is a 5000 ppm error in every clock derived from the TSC.
+fn smoke_hpet_calibration_rejects_a_reference_read_an_smi_split() -> TestResult {
+    let clean = RefSim::new(SmiAt::Never);
+    let measured =
+        crate::hpet::measure_tsc(clean.hpet_hz, clean.window, || clean.hpet(), || clean.tsc());
+    let Some(hz) = measured else {
+        return TestResult::Fail("an undisturbed HPET calibration failed");
+    };
+    if clean.error_ppm(hz) > 5 {
+        return TestResult::Fail("an undisturbed HPET calibration is off by more than 5 ppm");
+    }
+    for (smi, what) in [
+        (
+            SmiAt::Start(1),
+            "an SMI in the opening reference read skewed the TSC rate",
+        ),
+        (
+            SmiAt::End(1),
+            "an SMI in the closing reference read skewed the TSC rate",
+        ),
+        (
+            SmiAt::End(2),
+            "an SMI in a retried closing reference read skewed the TSC rate",
+        ),
+    ] {
+        let sim = RefSim::new(smi);
+        match crate::hpet::measure_tsc(sim.hpet_hz, sim.window, || sim.hpet(), || sim.tsc()) {
+            Some(hz) if sim.error_ppm(hz) <= 5 => {}
+            _ => return TestResult::Fail(what),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/tsc-refs",
+    smoke_hpet_calibration_rejects_a_reference_read_an_smi_split
+);
+
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
 
 fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {
