@@ -327,44 +327,10 @@ fn read_trims(io: &mut impl EfuseIo, chip: Geometry) -> Result<[u8; 19], EfuseEr
 /// Decode one-/two-byte headers, sparse word enables, and later word
 /// overrides. Protected physical bytes must be excluded by the caller.
 pub fn decode_map(physical: &[u8], logical: &mut [u8]) -> Result<(), EfuseError> {
-    logical.fill(0xff);
-    let mut cursor = 0;
-    while cursor < physical.len() {
-        let first = physical[cursor];
-        cursor += 1;
-        if first == 0xff {
-            break;
-        }
-        let (block, word_enable) = if first & 0x1f == 0x0f {
-            let second = *physical.get(cursor).ok_or(EfuseError::MalformedMap)?;
-            cursor += 1;
-            if second == 0xff {
-                break;
-            }
-            (
-                (((second & 0xf0) >> 1) | (first >> 5)) as usize,
-                second & 0x0f,
-            )
-        } else {
-            ((first >> 4) as usize, first & 0x0f)
-        };
-
-        for word in 0..4 {
-            if word_enable & (1 << word) != 0 {
-                continue;
-            }
-            let target = block * 8 + word * 2;
-            let source = physical
-                .get(cursor..cursor + 2)
-                .ok_or(EfuseError::MalformedMap)?;
-            logical
-                .get_mut(target..target + 2)
-                .ok_or(EfuseError::MalformedMap)?
-                .copy_from_slice(source);
-            cursor += 2;
-        }
-    }
-    Ok(())
+    // The sparse decode lives in the shared chip core so the loadable `.ko`
+    // decodes the same stream; a malformed record maps to the native error.
+    narf_drivers_wireless_rtl_chip::efuse::decode_map(physical, logical)
+        .map_err(|()| EfuseError::MalformedMap)
 }
 
 pub(super) fn read_mac_with(
