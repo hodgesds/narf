@@ -780,6 +780,43 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
         Err(FsError::NoSpace)
     }
 
+    /// `exfat_count_used_clusters`: the set bits of the §7.1 Allocation
+    /// Bitmap, one per heap cluster from cluster 2, streamed a cluster at a
+    /// time along the bitmap's chain as `alloc_clusters` reads it.
+    pub async fn count_used_clusters(&self) -> Result<u32, FsError> {
+        let (bm_first, bm_len) = self
+            .locate_bitmap()
+            .await?
+            .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+        let cluster_count = self.boot.cluster_count;
+        let mut buf = vec![0u8; self.bytes_per_cluster as usize];
+        let mut bm_cluster = bm_first;
+        let mut bm_off: u64 = 0;
+        let mut counted = 0u32;
+        let mut used = 0u32;
+        while bm_off < bm_len && counted < cluster_count {
+            self.read_cluster(bm_cluster, &mut buf).await?;
+            let to_consume = ((bm_len - bm_off) as usize).min(buf.len());
+            for &byte in &buf[..to_consume] {
+                let bits = (cluster_count - counted).min(8);
+                let mask = if bits == 8 { 0xff } else { (1u8 << bits) - 1 };
+                used += (byte & mask).count_ones();
+                counted += bits;
+                if counted >= cluster_count {
+                    break;
+                }
+            }
+            bm_off += to_consume as u64;
+            if bm_off < bm_len && counted < cluster_count {
+                match self.next_cluster(bm_cluster).await? {
+                    FatEntry::Next(c) => bm_cluster = c,
+                    _ => return Err(FsError::Io(narf_block::BlockError::IOError)),
+                }
+            }
+        }
+        Ok(used)
+    }
+
     /// Mark a contiguous run of clusters used/free in the
     /// allocation bitmap. The bitmap stream is treated as a flat
     /// byte sequence indexed by `(cluster - 2)`-th bit.
@@ -919,5 +956,28 @@ impl<B: BlockDevice + 'static> FsInstance for ExfatVolume<B> {
 
     fn name(&self) -> &str {
         "exfat"
+    }
+
+    /// `exfat_statfs`: cluster-sized blocks, the heap's clusters, the free
+    /// ones by the Allocation Bitmap, no inode table, and
+    /// `EXFAT_MAX_FILE_LEN * NLS_MAX_CHARSET_SIZE`-byte names.
+    fn statfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsStat> {
+        alloc::boxed::Box::pin(async move {
+            const EXFAT_MAX_FILE_LEN: u32 = 255;
+            const NLS_MAX_CHARSET_SIZE: u32 = 6;
+            let blocks = u64::from(self.boot.cluster_count);
+            let used = u64::from(self.count_used_clusters().await?);
+            let free = blocks.saturating_sub(used);
+            Ok(narf_filesystem::FsStat {
+                blocks,
+                blocks_free: free,
+                blocks_available: free,
+                files: 0,
+                files_free: 0,
+                block_size: self.bytes_per_cluster,
+                name_len: EXFAT_MAX_FILE_LEN * NLS_MAX_CHARSET_SIZE,
+                fragment_size: self.bytes_per_cluster,
+            })
+        })
     }
 }
