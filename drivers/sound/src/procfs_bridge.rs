@@ -142,8 +142,9 @@ pub fn render_pcm_info(card_index: u32, device: u32, is_capture: bool) -> String
             out.push_str(&format!("device: {}\n", device));
             out.push_str("subdevice: 0\n");
             out.push_str(&format!("stream: {}\n", direction));
-            out.push_str(&format!("id: {}\n", card.id));
-            out.push_str(&format!("name: {}\n", card.name));
+            let (id, name) = crate::pcm_names(card, device, is_capture);
+            out.push_str(&format!("id: {}\n", id));
+            out.push_str(&format!("name: {}\n", name));
             out.push_str("subname: \n");
             out.push_str("class: 0\n");
             out.push_str("subclass: 0\n");

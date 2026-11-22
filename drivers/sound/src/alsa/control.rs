@@ -218,9 +218,11 @@ impl Control {
                     let hardware = crate::card_hardware(self.card);
                     let long_name = hardware.as_ref().and_then(|h| h.long_name());
                     let mixer_name = hardware.as_ref().and_then(|h| h.mixer_name());
+                    let components = hardware.as_ref().and_then(|h| h.components());
                     string(&mut b, 40, 32, card.name);
                     string(&mut b, 72, 80, long_name.as_deref().unwrap_or(card.name));
                     string(&mut b, 168, 80, mixer_name.as_deref().unwrap_or(card.name));
+                    string(&mut b, 248, 128, components.as_deref().unwrap_or(""));
                     ctx.write(arg, &b)?;
                 }
                 2 => {

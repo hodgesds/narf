@@ -102,7 +102,10 @@ sink. `PcmDevice` gains three defaulted
 hooks: `long_name` (`card->longname`: the second `cards` line and control
 CARD_INFO `longname`), `mixer_name` (CARD_INFO `mixername`) and `codec_proc`
 (one `codec#A` body per codec address, rendered by the codec driver; a card
-whose backend reports none keeps the summary `codec#0`).
+whose backend reports none keeps the summary `codec#0`). `components` fills
+CARD_INFO `components` (Linux `card->components`; empty without it) and
+`pcm_name` gives a PCM device its own PCM_INFO id and name and the `id:` /
+`name:` lines of `pcmMp/info` (`pcm_names`; the card's id and name otherwise).
 
 Each successful PCM open acquires its own exclusive lease after access checks;
 lookup/stat do not acquire a hardware lease. Files retain that lease across

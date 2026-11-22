@@ -311,6 +311,20 @@ pub fn pcm_devices(card: &CardInfo, capture: bool) -> Vec<u32> {
     })
 }
 
+/// A PCM device's `snd_pcm` id and name: the backend's own
+/// (`PcmDevice::pcm_name`, Linux HDA "HDMI 0", ...), else the card's id and
+/// name.
+pub(crate) fn pcm_names(
+    card: &CardInfo,
+    device: u32,
+    capture: bool,
+) -> (alloc::string::String, alloc::string::String) {
+    match card_hardware(card.index).and_then(|h| h.pcm_name(capture, device)) {
+        Some(name) => (name.clone(), name),
+        None => (card.id.into(), card.name.into()),
+    }
+}
+
 /// Linux `snd_card_set_id_no_lock` (sound/core/init.c): "Default" for an
 /// empty id or one starting with "card" (it would shadow the proc
 /// directories), then `_1`, `_2`, ... (hex, as Linux prints it) until no

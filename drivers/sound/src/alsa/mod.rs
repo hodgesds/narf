@@ -53,8 +53,9 @@ pub(crate) fn info(card: u32, device: u32, capture: bool) -> Result<Vec<u8>, FsE
     put32(&mut b, 0, device);
     put32(&mut b, 8, u32::from(capture));
     put32(&mut b, 12, card.index);
-    string(&mut b, 16, 64, card.id);
-    string(&mut b, 80, 80, card.name);
+    let (id, name) = crate::pcm_names(&card, device, capture);
+    string(&mut b, 16, 64, &id);
+    string(&mut b, 80, 80, &name);
     string(&mut b, 160, 32, "subdevice #0");
     put32(&mut b, 200, 1);
     put32(&mut b, 204, 1);
