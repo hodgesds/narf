@@ -376,6 +376,16 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // its chroot before exec, so `apply_chroot` keyed on the current
     // task rewrites the interpreter path into the rootfs. Outside any
     // chroot, `apply_chroot` returns the path unchanged.
+    //
+    // `load_elf_binary` opens it with `open_exec`, the LOOKUP_FOLLOW walk
+    // every open takes from `current->fs->root`, so the symlinks on the way
+    // are expanded through the task's mounts: an absolute link restarts at
+    // the task root and may land in another mount. bubblewrap's
+    // `--symlink /usr/lib /lib64` over a separately bound /usr is exactly
+    // that, and the filesystem-local walk `read_path_and_file_from_vfs`
+    // does would restart the link at the root of the filesystem holding it.
+    // The image itself and `#!` interpreters already resolve this way
+    // (`do_execve_resolved`'s `read_exec`).
     let interp_fs_owned: Option<(
         alloc::vec::Vec<u8>,
         alloc::sync::Arc<dyn narf_filesystem::FileOps>,
@@ -387,7 +397,10 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             let resolved = match root {
                 Some(prefix) if prefix != "/" => alloc::format!("{}{}", prefix, name),
                 Some(_) => alloc::string::String::from(name),
-                None => crate::handlers::apply_chroot(name),
+                None => crate::handlers::resolve_vfs_symlink_path(
+                    &crate::handlers::apply_chroot(name),
+                    true,
+                )?,
             };
             read_path_and_file_from_vfs(&resolved)
         });
