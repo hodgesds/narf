@@ -563,6 +563,26 @@ kernel_test_in!(
     smoke_power_s5_preserves_zero_firmware_encoding
 );
 
+/// Linux's default `hibernation_mode`: `platform` only where ACPI offers
+/// `\_S4` (x86_64), `shutdown` otherwise. A zero SLP_TYP is a valid S4
+/// encoding.
+fn smoke_power_hibernation_mode_follows_s4() -> TestResult {
+    use crate::system::{hibernation_mode, HibernationMode};
+    let platform = if cfg!(target_arch = "x86_64") {
+        HibernationMode::Platform
+    } else {
+        HibernationMode::Shutdown
+    };
+    if hibernation_mode(Some((6, 6))) != platform
+        || hibernation_mode(Some((0, 0))) != platform
+        || hibernation_mode(None) != HibernationMode::Shutdown
+    {
+        return TestResult::Fail("hibernation_mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/system", smoke_power_hibernation_mode_follows_s4);
+
 fn smoke_s3_enter_refuses_without_arm() -> TestResult {
     use crate::{suspend, Power};
     use narf_capabilities::{Cap, Invoke};

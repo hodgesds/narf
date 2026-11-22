@@ -30,10 +30,13 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
 
 ## Lanes, in order
 
-1. **Entry and exit.** Parse `\_S4_`, then run `\_PTS(4)` and the PM1
-   write, falling back to S5 as Linux's `hibernation_platform_enter`
-   does. On aarch64, PSCI `SYSTEM_OFF`. A coordinator in `power/` claims
-   the transition beside S3 and s2idle.
+1. ~~**Entry and exit.**~~ Done (`hibernation_power_down`,
+   `narf_aml::evaluate_s4`). `\_PTS(4)` and the PM1 S4 write, falling
+   back to S5 as Linux's `power_down` does; `Shutdown` mode, and so PSCI
+   `SYSTEM_OFF` on aarch64, without `\_S4`. QEMU's DSDT carries no `\_S4_`
+   unless the machine sets ICH9's `disable_s4=0`. The end-to-end test
+   (lane 9) needs it to exercise the platform mode. The coordinator that
+   claims the transition beside S3 and s2idle comes with lane 3.
 2. **Freezer.** `freeze_processes` and `freeze_kernel_threads`: user tasks
    park at their next kernel exit, and freezable kernel work drains. This
    touches the scheduler's executor core, which is TCB, so the PR carries

@@ -197,6 +197,67 @@ pub fn power_off() -> ! {
     narf_arch::halt_forever();
 }
 
+/// `hibernation_mode` (`/sys/power/disk`): how a written image powers the
+/// machine down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HibernationMode {
+    /// `HIBERNATION_PLATFORM`: ACPI S4 (`hibernation_platform_enter`). The
+    /// devices have run their poweroff callbacks.
+    Platform,
+    /// `HIBERNATION_SHUTDOWN`: an ordinary power-off (`kernel_power_off`)
+    /// with the devices thawed.
+    Shutdown,
+}
+/// Linux's default mode. `platform` when ACPI offers S4
+/// (`acpi_sleep_hibernate_setup` registers the hibernation ops only with
+/// `\_S4`), otherwise `shutdown`, which is always the case on aarch64.
+pub fn hibernation_mode(s4: Option<(u8, u8)>) -> HibernationMode {
+    if s4.is_some() && cfg!(target_arch = "x86_64") {
+        HibernationMode::Platform
+    } else {
+        HibernationMode::Shutdown
+    }
+}
+/// The machine's [`hibernation_mode`].
+pub fn default_hibernation_mode() -> HibernationMode {
+    hibernation_mode(narf_aml::evaluate_s4())
+}
+
+/// `power_down()` once the image is on disk. Never returns.
+///
+/// - **Platform:** `hibernation_platform_enter`'s ACPI half: `\_PTS(4)`, then
+///   S4's SLP_TYP and SLP_EN in PM1 (`acpi_enter_sleep_state(ACPI_STATE_S4)`).
+///   The console is flushed, but no shutdown hook runs: the devices are
+///   already powered off. If the platform does not power down, this falls
+///   through to S5, as `power_down` does.
+/// - **Shutdown:** [`power_off`], with its device shutdown.
+pub fn hibernation_power_down(mode: HibernationMode) -> ! {
+    match mode {
+        #[cfg(target_arch = "x86_64")]
+        HibernationMode::Platform => {
+            if let Some((slp_typ_a, slp_typ_b)) = narf_aml::evaluate_s4() {
+                begin_transition("hibernate");
+                narf_console::run_persist_hook(None);
+                let _ = narf_aml::eval::evaluate_method("\\_PTS", &[narf_aml::Value::Integer(4)]);
+                // SAFETY: `\_PTS(4)` ran, the image is on disk and the
+                // devices are powered off; S4 does not return.
+                unsafe { narf_acpi::pm1_enter_sleep(slp_typ_a, slp_typ_b) };
+                for _ in 0..10_000_000 {
+                    core::hint::spin_loop();
+                }
+                // power_down's fallthrough to HIBERNATION_SHUTDOWN. The
+                // transition is already claimed, so S5 is written directly.
+                let (s5_a, s5_b) = select_s5_sleep_types(narf_aml::evaluate_s5());
+                // SAFETY: as above; S5 does not return either.
+                unsafe { narf_acpi::shutdown_via_pm1(s5_a, s5_b) };
+                narf_arch::halt_forever();
+            }
+            power_off()
+        }
+        _ => power_off(),
+    }
+}
+
 /// aarch64 reboot via PSCI SYSTEM_RESET. Returns `!`.
 #[cfg(target_arch = "aarch64")]
 pub fn reboot() -> ! {

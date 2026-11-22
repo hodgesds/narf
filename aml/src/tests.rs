@@ -2345,6 +2345,45 @@ fn smoke_aml_evaluate_s5_against_qemu_dsdt() -> TestResult {
 }
 kernel_test_in!("aml", smoke_aml_evaluate_s5_against_qemu_dsdt);
 
+/// `\_S4_` decodes as `\_S5_` does. QEMU's DSDT carries it unless S4 is
+/// disabled on the machine; without it the test skips.
+fn smoke_aml_evaluate_s4_against_qemu_dsdt() -> TestResult {
+    let Some((typa, typb)) = crate::evaluate_s4() else {
+        return TestResult::Skip("\\_S4_ not in namespace");
+    };
+    if typa > 7 || typb > 7 {
+        return TestResult::Fail("SLP_TYP out of 3-bit range");
+    }
+    if crate::evaluate_s4() != Some((typa, typb)) {
+        return TestResult::Fail("\\_S4_ decoded differently twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_evaluate_s4_against_qemu_dsdt);
+
+/// The `\_Sx` decoder on a synthetic package, since QEMU's DSDT carries no
+/// `\_S4_`: `Name(\TS4_, Package() { 6, 6, 0, 0 })`, a test-only name so the
+/// shared namespace gains no real `\_S4_`. SLP_TYP keeps its low three bits.
+fn smoke_aml_sleep_type_package_decodes() -> TestResult {
+    // NameOp '\' "TS4_" PackageOp PkgLength(8) NumElements(4)
+    // BytePrefix 6, BytePrefix 0x0e (masked to 6), Zero, Zero. The namespace
+    // strips the trailing underscore (`\TS4`), as `evaluate_s5` expects.
+    let blob: &[u8] = &[
+        0x08, b'\\', b'T', b'S', b'4', b'_', 0x12, 0x08, 0x04, 0x0a, 0x06, 0x0a, 0x0e, 0x00, 0x00,
+    ];
+    if crate::__parse_body_for_test(blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    if crate::evaluate_sleep_types("\\TS4_", "\\TS4") != Some((6, 6)) {
+        return TestResult::Fail("SLP_TYPa/b not decoded and masked");
+    }
+    if crate::evaluate_sleep_types("\\TS9_", "\\TS9").is_some() {
+        return TestResult::Fail("a missing package decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_sleep_type_package_decodes);
+
 fn smoke_aml_namespace_walks_into_if_body() -> TestResult {
     // Synthetic DSDT body containing a top-level If whose body
     // declares a Device. Pre-#43 the namespace builder skipped

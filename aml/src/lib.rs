@@ -887,7 +887,20 @@ pub fn device_cids(device_path: &str) -> alloc::vec::Vec<alloc::string::String> 
 /// integer elements are present. The returned integers are opaque
 /// platform encodings; zero is valid (QEMU q35 uses `(0, 0)` for S5).
 pub fn evaluate_s5() -> Option<(u8, u8)> {
-    let node = find_node("\\_S5_").or_else(|| find_node("\\_S5"))?;
+    evaluate_sleep_types("\\_S5_", "\\_S5")
+}
+
+/// `\_S4` (S4, non-volatile sleep) as [`evaluate_s5`] reads `\_S5`: the
+/// `(SLP_TYPa, SLP_TYPb)` pair, or `None` when the platform offers no S4
+/// (`acpi_sleep_state_supported(ACPI_STATE_S4)` false). Linux registers its
+/// platform hibernation ops only when this exists.
+pub fn evaluate_s4() -> Option<(u8, u8)> {
+    evaluate_sleep_types("\\_S4_", "\\_S4")
+}
+
+/// A `\_Sx` Name's first two integers, masked to SLP_TYP's three bits.
+fn evaluate_sleep_types(name: &str, alternate: &str) -> Option<(u8, u8)> {
+    let node = find_node(name).or_else(|| find_node(alternate))?;
     let (offset, length) = match node.value? {
         NameValue::Unparsed { offset, length } if length > 0 => (offset, length),
         _ => return None,

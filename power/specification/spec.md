@@ -1344,6 +1344,33 @@ reports `KEY_POWER` press + release on its own evdev device; with no reader
 open on it (no logind) it requests an **unforced** orderly power-off. No
 power-off ever runs in the notifying (IRQ / SCI subscriber) context.
 
+#### 3.6.0a Hibernation power-down (S4 entry)
+
+```rust
+pub enum HibernationMode { Platform, Shutdown }             // hibernation_mode, /sys/power/disk
+pub fn hibernation_mode(s4: Option<(u8, u8)>) -> HibernationMode;
+pub fn default_hibernation_mode() -> HibernationMode;       // narf_aml::evaluate_s4()
+pub fn hibernation_power_down(mode: HibernationMode) -> !;  // power_down()
+// narf_aml
+pub fn evaluate_s4() -> Option<(u8, u8)>;                    // \_S4_ SLP_TYPa/b, as evaluate_s5
+```
+
+The default is Linux's. `Platform` applies where ACPI offers `\_S4`
+(`acpi_sleep_hibernate_setup` registers the platform hibernation ops only
+then), which is x86_64 only. Otherwise it is `Shutdown`.
+
+`hibernation_power_down` runs once the image is on disk:
+- **`Platform`:** `hibernation_platform_enter`'s ACPI half: `\_PTS(4)`,
+  then S4's SLP_TYP and SLP_EN through `pm1_enter_sleep`. The caller has
+  run the devices' poweroff callbacks, so no shutdown hook runs; only the
+  console is flushed. A platform that does not power down falls through to
+  S5, as `power_down` does.
+- **`Shutdown`:** `power_off()` with its device shutdown, the devices
+  thawed. aarch64 always takes this, so PSCI `SYSTEM_OFF`.
+
+The wake from S4 is a cold boot. The image's restore belongs to the
+resume environment (`power/research/s4-hibernation-plan.md`, lane 8).
+
 #### 3.6.1 Power-off paths vs Linux
 
 Linux line numbers are against the reference tree at `~/git/linux`
