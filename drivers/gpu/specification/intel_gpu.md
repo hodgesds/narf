@@ -689,7 +689,18 @@ DDI A / eDP, single pipe):
   before training and updated per-iteration from the sink's
   level requests via the `TrainingAux` callback. The old
   4-entry `DDI_BUF_TRANS` tables in `intel_gpu_ddi` are
-  deleted.
+  deleted. The same callback retunes the DPLL mid-training
+  when the fallback ladder opens a retry attempt at a lower
+  rate (pattern 1 after a dirty Configure): the DDI buffer
+  and `DP_TP_CTL` stop, the DPLL is disabled and brought back
+  up from the `combo_coeffs` row for the new rate, and the PHY
+  is re-prepared — the combo equivalent of the Type-C
+  `start_training(retune)` restart, minus the clock re-route
+  (DPCLKA routing selects the DPLL index, which a rate change
+  does not alter). M/N needs no mid-training step: the
+  transcoder is not enabled until after training, and the
+  modeset already reprograms M/N to the trained configuration
+  on every path before the DDI buffer enables.
 - **PLL table corrected** — DPLL_CFGCR0/1 field layouts and the
   four DP coefficient rows now match TGL PRM Vol. 12's
   "DisplayPort Mode PLL Values" for the 19.2/38.4 MHz reference
@@ -1611,8 +1622,14 @@ and if the fallback ladder settles elsewhere the DPLL, M/N and
 port width are reprogrammed to the trained configuration before
 the DDI buffer enables (the combo-PHY levels need no such
 reprogramming — the training callback already re-selected the
-table for the settled rate). The legacy eDP
-path (`Modeset::modeset`) is byte-for-byte unchanged.
+table for the settled rate). On the combo path the DPLL part
+of that reprogramming already happened mid-training: the
+callback retunes the DPLL when the fallback retry opens (see
+§7), so the post-training re-program rewrites the same rate.
+The legacy eDP path uses the same combo callback, so it gets
+the mid-training retune too — previously a legacy fallback
+settled at the wrong clock, since the post-training DPLL
+re-program above only runs when a plan was given.
 
 Invariants:
 
