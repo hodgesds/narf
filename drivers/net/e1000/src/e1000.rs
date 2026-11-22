@@ -4318,11 +4318,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
+/// The task specs of the receive pump and of its deferral task. The
+/// device's one vector is delivered to the boot CPU (MSI-X entry 0 targets
+/// APIC 0; INTx reaches the BSP).
+pub(crate) fn rx_task_specs() -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
+    (narf_scheduler::TaskSpec::unthrottled(), None)
+}
+
 fn spawn_pumps(device: Arc<E1000>, tx_cons: Consumer<Frame, TX_RING_N>) {
+    let (spec, _deferral) = rx_task_specs();
     let d1 = device.clone();
-    narf_scheduler::spawn(async move {
-        e1000_rx_pump(d1).await;
-    });
+    narf_scheduler::spawn_with_spec(
+        async move {
+            e1000_rx_pump(d1).await;
+        },
+        spec,
+    );
 
     let d2 = device.clone();
     narf_scheduler::spawn(async move {
@@ -6628,5 +6639,28 @@ mod tests {
     kernel_test_in!(
         "drivers/net/e1000",
         smoke_e1000_rx_desc_sample_never_mixes_occupants
+    );
+
+    /// The receive pump is the softirq model's (`narf_net::napi`): an
+    /// Interactive-class pump with a Default-class deferral task, both on
+    /// the boot CPU the device's vector is delivered to.
+    fn smoke_e1000_softirq_pump_runs_like_napi() -> TestResult {
+        use narf_scheduler::affinity::{Affinity, CpuId};
+        use narf_scheduler::SchedClass;
+        let (pump, deferral) = super::rx_task_specs();
+        if pump.class != SchedClass::Interactive || pump.affinity != Affinity::pinned(CpuId::BOOT) {
+            return TestResult::Fail("the receive pump does not run ahead of the boot CPU's tasks");
+        }
+        let Some(deferral) = deferral else {
+            return TestResult::Fail("the receive pump has no deferral task");
+        };
+        if deferral.class != SchedClass::Default || deferral.affinity != pump.affinity {
+            return TestResult::Fail("the deferral task is not Default class on the boot CPU");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000-softirq",
+        smoke_e1000_softirq_pump_runs_like_napi
     );
 }
