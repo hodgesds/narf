@@ -3490,9 +3490,9 @@ pub(crate) static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Option<Arc<Virtio
 ///
 /// Parses Ethernet (14-byte header) → IPv4 → TCP/UDP ports. The hash folds
 /// (src⊕dst, sport⊕dport) so it's identical for both directions of a flow
-/// (matching the host tun's `__skb_get_hash_symmetric`), then runs an
-/// xorshift-multiply finaliser so the low bits (which `% npairs` selects)
-/// depend on the whole tuple rather than just the port LSBs.
+/// (matching the host tun's `__skb_get_hash_symmetric`), then runs a full
+/// avalanche finaliser and scales the high bits to `npairs`
+/// (`reciprocal_scale`), so the queue depends on the whole tuple.
 fn flow_tx_pair(frame: &[u8], npairs: usize) -> Option<usize> {
     if npairs <= 1 {
         return Some(0);
@@ -3511,10 +3511,11 @@ fn flow_tx_pair(frame: &[u8], npairs: usize) -> Option<usize> {
         return None;
     }
     // Endianness is irrelevant for a hash — only per-flow consistency matters.
-    // `ports.rotate_left(16) ^ ports` and `src ^ dst` are symmetric in
-    // (src,dst)/(sport,dport), so the hash is identical for either flow
-    // direction (matches the host tun's symmetric steering). One
-    // xorshift-multiply finaliser scatters the low bits `% npairs` selects.
+    // `src ^ dst` and `sport ^ dport` are symmetric in (src,dst)/(sport,dport),
+    // so the hash is identical for either flow direction (matches the host
+    // tun's symmetric steering). `ipv4_flow_queue` mixes every tuple bit and
+    // scales its high bits to `npairs`; the stack builds this flow's unbound
+    // segments in the same queue's pool.
     let src = [frame[26], frame[27], frame[28], frame[29]];
     let dst = [frame[30], frame[31], frame[32], frame[33]];
     let src_port = u16::from_be_bytes([frame[34], frame[35]]);
