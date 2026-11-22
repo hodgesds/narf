@@ -124,10 +124,7 @@ impl Igc {
         let mut fenced = false;
         if let Ok(_control) = self.control() {
             self.state.store(CHANGING, Ordering::SeqCst);
-            if self
-                .hw
-                .wait(100_000, || self.active.load(Ordering::SeqCst) == 0)
-            {
+            if self.hw.wait(100_000, || self.quiescent()) {
                 fenced = hardware::quiesce(&self.hw, self.num_queues()).is_ok();
                 if fenced {
                     if let Some(table) = self.msix.lock().as_mut() {

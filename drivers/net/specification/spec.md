@@ -222,6 +222,16 @@ CPU) receive pumps follow the same model. The frame-ring transmit consumer and t
 maintenance worker have no queue locality and are spawned with
 `TaskSpec::kernel_any()`, never on the boot CPU by default.
 
+IGC queue state is per queue, as each Linux `igc_q_vector` owns its `igc_ring`
+pair: the poll and transmit paths reach queue `q` through its own slot in the
+driver's `QueueSet` (the queue handle, re-read by a poll only after a
+reconfiguration, its operation count, and its drop and refusal counters,
+which `stats` sums), and select a frame's transmit queue from the RSS
+function published as a seqlock of atomic words. No device-wide lock is taken
+per packet; the whole queue set and its lock are for configuration paths,
+which replace it only after `stop` has waited for every queue's operations
+to end (`igc_down` disabling each queue's NAPI and transmit).
+
 IGC buffers are per queue and sized from that queue's rings, never from a
 link speed or a fixed count. Each `Queue` owns a TX pool of `MAX_TSO`-byte
 buffers whose bound is the frames its ring can hold in flight

@@ -867,6 +867,31 @@ impl Igc {
         Ok(guard)
     }
 
+    /// [`Igc::operation`] for queue `q`'s poll and transmit paths. The entry
+    /// is counted on the queue's own slot, so no device-wide word is written
+    /// per packet; `stop` waits for these as for `operation`s, as `igc_down`
+    /// disables each queue's NAPI and transmit.
+    fn queue_operation(&self, q: usize) -> Result<crate::queue_set::QueueEntry<'_>, IgcError> {
+        // SeqCst: the stop/entry handshake of `operation`, per queue.
+        let entry = self.queues.enter(q);
+        if self.removed.load(Ordering::Acquire)
+            || self.state.load(Ordering::SeqCst) != RUNNING
+            || self.hw.cap.invoke(Check).is_err()
+        {
+            return Err(IgcError::Other("controller unavailable"));
+        }
+        if self.hw.read(8) == u32::MAX {
+            self.state.store(FAILED, Ordering::Release);
+            return Err(IgcError::Other("PCI function unavailable"));
+        }
+        Ok(entry)
+    }
+
+    /// No packet operation, device-wide or on any queue, is in flight.
+    fn quiescent(&self) -> bool {
+        self.active.load(Ordering::SeqCst) == 0 && self.queues.idle()
+    }
+
     fn control(&self) -> Result<ControlLease<'_>, IgcError> {
         if self.control_busy.swap(true, Ordering::Acquire) {
             return Err(IgcError::Other("hardware control busy"));
@@ -879,10 +904,7 @@ impl Igc {
         self.state
             .compare_exchange(RUNNING, CHANGING, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| IgcError::Other("controller busy"))?;
-        if !self
-            .hw
-            .wait(100_000, || self.active.load(Ordering::SeqCst) == 0)
-        {
+        if !self.hw.wait(100_000, || self.quiescent()) {
             self.state.store(RUNNING, Ordering::Release);
             return Err(IgcError::Other("active packet operation"));
         }
@@ -1200,14 +1222,13 @@ impl Igc {
     /// `queue` is the stack's choice for a backpressure-aware sender (Linux
     /// `skb->queue_mapping`); such a frame is refused with
     /// [`IgcError::TxBusy`] instead of using the stopped queue's reserve.
-    /// The ring `frame` goes to and its launch-time / timestamp options:
-    /// everything `submit_frame_on` decides before the frame is posted.
-    fn tx_setup(
+    /// The ring `frame` goes to.
+    fn tx_queue_for(
         &self,
         frame: &Frame,
         queue: Option<usize>,
         timing: narf_net::TxTiming,
-    ) -> Result<(usize, crate::queue::TxOptions), IgcError> {
+    ) -> Result<usize, IgcError> {
         let q = queue.unwrap_or_else(|| {
             timing
                 .queue
@@ -1216,8 +1237,18 @@ impl Igc {
         if q >= self.num_queues() {
             return Err(IgcError::QueueTooSmall);
         }
+        Ok(q)
+    }
+    /// The launch-time / timestamp options of a frame for ring `q`:
+    /// everything else `submit_frame_on` decides before the frame is posted.
+    fn tx_options(
+        &self,
+        q: usize,
+        backpressure: bool,
+        timing: narf_net::TxTiming,
+    ) -> Result<crate::queue::TxOptions, IgcError> {
         let mut options = crate::queue::TxOptions {
-            backpressure: queue.is_some(),
+            backpressure,
             ..Default::default()
         };
         if let Some(time) = timing.launch_time_ns {
@@ -1236,7 +1267,7 @@ impl Igc {
             // its fast clock until it is delivered.
             self.kick_maintenance();
         }
-        Ok((q, options))
+        Ok(options)
     }
     fn submit_frame_on(
         &self,
@@ -1248,16 +1279,25 @@ impl Igc {
         // the queue it was built for (`Frame::queue`), as `post_options`
         // does for the errors it returns; dropping it shrank that queue's
         // zero-copy pool.
-        let _operation = match self.operation() {
+        let timing = frame.tx_timing();
+        let q = match self.tx_queue_for(&frame, queue, timing) {
+            Ok(q) => q,
+            Err(error) => {
+                self.give_back(frame);
+                return Err(error);
+            }
+        };
+        // An operation on ring `q` alone (`igc_xmit_frame` takes only that
+        // ring's transmit lock).
+        let _operation = match self.queue_operation(q) {
             Ok(operation) => operation,
             Err(error) => {
                 self.give_back(frame);
                 return Err(error);
             }
         };
-        let timing = frame.tx_timing();
-        let (q, options) = match self.tx_setup(&frame, queue, timing) {
-            Ok(setup) => setup,
+        let options = match self.tx_options(q, queue.is_some(), timing) {
+            Ok(options) => options,
             Err(error) => {
                 self.give_back(frame);
                 return Err(error);
@@ -1324,10 +1364,7 @@ impl Igc {
         {
             self.stop()?;
         }
-        if !self
-            .hw
-            .wait(100_000, || self.active.load(Ordering::SeqCst) == 0)
-        {
+        if !self.hw.wait(100_000, || self.quiescent()) {
             self.state.store(FAILED, Ordering::Release);
             return Err(IgcError::Other("packet operation did not stop"));
         }
@@ -2284,10 +2321,14 @@ fn rx_napi_poll(
     producer: &IrqSafeSpinLock<Producer<Frame, RX_RING_N>>,
     handle: &mut crate::queue_set::QueueHandle,
 ) -> (u32, bool) {
-    // Only a reset replaces the queue set; one handle serves the whole poll.
+    // The clean is one operation on this queue alone; a reconfiguration
+    // waits for it (as `napi_disable` waits for a running poll), so the
+    // queue the handle holds cannot change under it.
+    let op = rx.queue_operation(q);
+    // Only a reset replaces the queue; the handle re-reads it only then.
     let queue = handle.current(&rx.queues).cloned();
-    let (frames, drops) = match (rx.operation(), queue.as_ref()) {
-        (Ok(_op), Some(queue)) => {
+    let (frames, drops) = match (op.as_ref(), queue.as_ref()) {
+        (Ok(_), Some(queue)) => {
             let (f, drops) = napi_clean(queue, &rx.hw, q, rx.mtu());
             rx.queues.note_rx_drops(q, drops);
             if drops != 0 {
@@ -2297,6 +2338,7 @@ fn rx_napi_poll(
         }
         _ => (Vec::new(), 0),
     };
+    drop(op);
     // Bounded by the poll's budget.
     let processed = (frames.len() as u64 + drops) as u32;
     if !frames.is_empty() {
@@ -2343,7 +2385,7 @@ fn rx_napi_poll(
         // never inside `receive`.
         queue.replenish_rx();
     }
-    let pending = match rx.operation() {
+    let pending = match rx.queue_operation(q) {
         Ok(_op) => queue.as_ref().is_some_and(|queue| queue.pending_rx()),
         Err(_) => false,
     };
@@ -2360,7 +2402,7 @@ fn rx_napi_done(
     route: Option<IrqRoute>,
     itr: &mut (u32, u32, crate::itr::Work),
 ) -> bool {
-    let Ok(_op) = rx.operation() else {
+    let Ok(_op) = rx.queue_operation(q) else {
         return false;
     };
     let queue = rx.queues.get(q);
