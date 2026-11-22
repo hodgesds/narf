@@ -47,8 +47,11 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
    `amdgpu_pmops_*`: freeze is the suspend, thaw resumes only while
    recovering, poweroff skips a device the thaw left suspended, and restore
    is the resume.
-4. **Non-boot CPUs.** Take them offline for the snapshot and restore
-   (`pm_sleep_disable_secondary_cpus`), through `cpu_take_offline`.
+4. ~~**Non-boot CPUs.**~~ Done on x86_64 (`cpu_lifecycle::cpu_park`,
+   `stop_parked` and `restart_parked`). This is not a hot-unplug: a
+   parked CPU keeps its queue, pinned work included, so nothing needs an
+   offline callback. It is INIT'd and later restarted with INIT-SIPI-SIPI.
+   `cargo xtask hibernate-e2e --smp 2` covers it.
 5. ~~**Snapshot.**~~ Done (`hibernate::snapshot`, spec §3.6.0c). The
    walk uses the allocator's free-state index, so free blocks and cached
    frames are skipped and everything else in known RAM is saved (NVS

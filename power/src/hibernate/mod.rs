@@ -21,8 +21,9 @@
 //! pages in frames the image does not use, quiesces the devices and jumps.
 //! A refused or failed image boots on normally.
 //!
-//! Until secondary CPUs can be taken down and brought back (lane 4), both
-//! refuse to run while more than one CPU is online.
+//! Both run on the boot CPU and stop the others first. Each is parked
+//! between polls with its queue intact and stopped (INIT), and restarted
+//! afterwards, in the restored image or after a failure.
 
 pub mod arch;
 pub mod e2e;
@@ -103,8 +104,12 @@ pub enum HibernateError {
     AuthorityRevoked,
     /// Another sleep transition is in progress.
     Busy,
-    /// More than one CPU is online (lane 4).
+    /// Not running on the boot CPU, which the restore resumes on.
+    NotBootCpu,
+    /// This secondary CPU would not park between polls.
     SecondaryCpus(u32),
+    /// Secondary CPUs are online and nothing can stop them.
+    NoCpuHotplug,
     /// No TPM for the image's key slot.
     NoTpm,
     ImageFile(ImageFileError),
@@ -133,9 +138,10 @@ pub async fn hibernate(cap: &Cap<Power, Invoke>) -> Result<(), HibernateError> {
     if !arch::SUPPORTED {
         return Err(HibernateError::Arch(ArchError::NotImplemented));
     }
-    let online = narf_lib::smp::online_count();
-    if online > 1 {
-        return Err(HibernateError::SecondaryCpus(online));
+    // The restore resumes the saved context on the boot CPU, so the
+    // snapshot must be taken there (Linux migrates to it).
+    if narf_lib::percpu::current_cpu() != 0 {
+        return Err(HibernateError::NotBootCpu);
     }
     let level = policy();
     let tpm = match level {
@@ -197,6 +203,14 @@ fn snapshot_and_write(
         device_pm::set_hibernate_recovering(false);
         return Err(HibernateError::Devices);
     }
+    // `pm_sleep_disable_secondary_cpus`.
+    let secondary = match Secondary::stop() {
+        Ok(s) => s,
+        Err(e) => {
+            recover();
+            return Err(e);
+        }
+    };
     // `ioapic_suspend`: the restored image must route as it did, not as the
     // boot kernel programmed. Reserved now; filled with interrupts off.
     #[cfg(target_arch = "x86_64")]
@@ -245,16 +259,19 @@ fn snapshot_and_write(
             // The image, back. `prealloc` still names the copy frames this
             // kernel allocated before the snapshot; dropping it frees them.
             drop(prealloc);
+            secondary.restart();
             let _ = device_pm::restore_all_devices();
             return Ok(());
         }
         Ok(Captured::Snapshot(snapshot)) => snapshot,
         Err(e) => {
+            secondary.restart();
             recover();
             return Err(HibernateError::Arch(e));
         }
     };
     if let Err(e) = taken {
+        secondary.restart();
         recover();
         return Err(HibernateError::Snapshot(e));
     }
@@ -262,17 +279,78 @@ fn snapshot_and_write(
     // Thaw for the write. amdgpu and the like stay frozen while not
     // recovering, as Linux's thaw leaves them.
     let _ = device_pm::thaw_all_devices();
+    // The image is written on the boot CPU alone; the others stay stopped
+    // until the power-down.
     if let Err(e) = write_image(file, tpm, &prealloc, &record) {
         drop(prealloc);
+        secondary.restart();
         recover_after_thaw();
         return Err(e);
     }
     drop(prealloc);
     if !device_pm::poweroff_all_devices().ok() {
+        secondary.restart();
         recover_after_thaw();
         return Err(HibernateError::Devices);
     }
     crate::system::hibernation_power_down(crate::system::default_hibernation_mode())
+}
+
+/// The secondary CPUs a hibernation or a resume stopped
+/// (`freeze_secondary_cpus`). Each is parked between polls with its run
+/// queue intact, then stopped (INIT on x86_64). [`Self::restart`] starts
+/// them again; their executors pick their queues back up.
+#[derive(Debug)]
+struct Secondary {
+    cpus: alloc::vec::Vec<u32>,
+}
+
+impl Secondary {
+    fn stop() -> Result<Self, HibernateError> {
+        use narf_scheduler::cpu_lifecycle::{self, CpuLifecycle};
+        let me = narf_lib::percpu::current_cpu() as u32;
+        let cap: Cap<CpuLifecycle, Invoke> = Cap::bootstrap();
+        let mut cpus = alloc::vec::Vec::new();
+        for cpu in 0..narf_lib::percpu::MAX_CPUS as u32 {
+            if cpu == me || !narf_lib::smp::is_online(cpu) {
+                continue;
+            }
+            if cpu_lifecycle::cpu_park(narf_scheduler::CpuId(cpu), &cap).is_err() {
+                for &p in &cpus {
+                    let _ = cpu_lifecycle::cpu_unpark(narf_scheduler::CpuId(p), &cap);
+                }
+                return Err(HibernateError::SecondaryCpus(cpu));
+            }
+            cpus.push(cpu);
+        }
+        for (k, &cpu) in cpus.iter().enumerate() {
+            // SAFETY: parked above, between polls.
+            if !unsafe { cpu_lifecycle::stop_parked(narf_scheduler::CpuId(cpu)) } {
+                // No way to stop them on this machine: only the first can
+                // fail this way, so every CPU is merely parked.
+                debug_assert_eq!(k, 0);
+                for &p in &cpus {
+                    let _ = cpu_lifecycle::cpu_unpark(narf_scheduler::CpuId(p), &cap);
+                }
+                return Err(HibernateError::NoCpuHotplug);
+            }
+        }
+        Ok(Self { cpus })
+    }
+
+    fn restart(self) {
+        for &cpu in &self.cpus {
+            let _ = narf_console::write_str(&alloc::format!("  hibernate: restarting CPU {cpu}\n"));
+            // SAFETY: stopped by `stop`, here or in the kernel this image
+            // was taken from.
+            if !unsafe { narf_scheduler::cpu_lifecycle::restart_parked(narf_scheduler::CpuId(cpu)) }
+            {
+                let _ = narf_console::write_str(&alloc::format!(
+                    "  hibernate: CPU {cpu} did not come back online\n"
+                ));
+            }
+        }
+    }
 }
 
 /// The RTC as seconds since the epoch, Linux's persistent clock.
@@ -354,6 +432,9 @@ fn write_image(
 pub enum ResumeSkip {
     /// No `narf.resume=`.
     NotConfigured,
+    NotBootCpu,
+    /// A secondary CPU would not stop (its number, or `u32::MAX` when none
+    /// can be stopped on this machine).
     SecondaryCpus(u32),
     NoDevice(String),
     /// The locator block holds no image file.
@@ -386,9 +467,8 @@ fn resume_from(device: &str, offset: u64) -> ResumeSkip {
     if !arch::SUPPORTED {
         return ResumeSkip::Arch(ArchError::NotImplemented);
     }
-    let online = narf_lib::smp::online_count();
-    if online > 1 {
-        return ResumeSkip::SecondaryCpus(online);
+    if narf_lib::percpu::current_cpu() != 0 {
+        return ResumeSkip::NotBootCpu;
     }
     let name = device.strip_prefix("/dev/").unwrap_or(device);
     let Some(dev) = narf_block::registry::find_block_device(name) else {
@@ -442,6 +522,19 @@ fn resume_from(device: &str, offset: u64) -> ResumeSkip {
         loader.abandon();
         return ResumeSkip::Devices;
     }
+    // The boot kernel's own secondary CPUs must not run while the image
+    // overwrites the memory their code is in.
+    let secondary = match Secondary::stop() {
+        Ok(s) => s,
+        Err(e) => {
+            recover();
+            loader.abandon();
+            return ResumeSkip::SecondaryCpus(match e {
+                HibernateError::SecondaryCpus(cpu) => cpu,
+                _ => u32::MAX,
+            });
+        }
+    };
     let irqs = narf_arch::interrupts_enabled();
     let first_pb = loader.first_pb();
     // SAFETY: the only CPU, devices quiesced, interrupts going off; the
@@ -456,6 +549,7 @@ fn resume_from(device: &str, offset: u64) -> ResumeSkip {
         // SAFETY: restores the state masked above.
         unsafe { narf_arch::enable_interrupts() };
     }
+    secondary.restart();
     recover();
     loader.abandon();
     ResumeSkip::Arch(e)

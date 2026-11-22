@@ -300,10 +300,53 @@ pub unsafe fn drop_ap_trampoline_window() {
     if !pml4.entries[0].is_present() {
         return;
     }
+    // Kept, so a later CPU restart can put the window back
+    // ([`map_ap_trampoline_window`]); the tables it names stay allocated.
+    AP_WINDOW_ENTRY.store(pml4.entries[0].raw(), core::sync::atomic::Ordering::Release);
     pml4.entries[0] = PageTableEntry::from_raw(0);
     // Every online CPU shares this PML4, so the stale top-level translation
     // has to be dropped everywhere, not just here.
     // SAFETY: invalidating a mapping we just removed.
+    unsafe {
+        crate::paging::invlpg_global(crate::VirtAddr::new(AP_TRAMPOLINE_EXEC_BASE));
+    }
+}
+
+/// The PML4[0] entry [`drop_ap_trampoline_window`] removed.
+static AP_WINDOW_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Put the AP trampoline window back into `pml4` around a CPU restart, as
+/// [`drop_ap_trampoline_window`] foresaw for hotplug: hibernation restarts
+/// the secondary CPUs it stopped. `false` if the window was never dropped
+/// (nothing to restore) or `pml4` already maps PML4[0].
+///
+/// # Safety
+/// `pml4` is the PML4 the trampoline hands the APs. The caller drops the
+/// window again ([`unmap_ap_trampoline_window`]) once every AP it starts is
+/// past the trampoline.
+pub unsafe fn map_ap_trampoline_window(pml4: crate::PhysAddr) -> bool {
+    use crate::paging::{PageTable, PageTableEntry};
+    let entry = AP_WINDOW_ENTRY.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: a live PML4, reachable through the direct map.
+    let table = unsafe { &mut *pml4.kernel_mut_ptr::<PageTable>() };
+    if entry == 0 || table.entries[0].is_present() {
+        return false;
+    }
+    table.entries[0] = PageTableEntry::from_raw(entry);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    true
+}
+
+/// Remove the window [`map_ap_trampoline_window`] put back.
+///
+/// # Safety
+/// No CPU is executing in the trampoline.
+pub unsafe fn unmap_ap_trampoline_window(pml4: crate::PhysAddr) {
+    use crate::paging::{PageTable, PageTableEntry};
+    // SAFETY: a live PML4, reachable through the direct map.
+    let table = unsafe { &mut *pml4.kernel_mut_ptr::<PageTable>() };
+    table.entries[0] = PageTableEntry::from_raw(0);
+    // SAFETY: invalidating a mapping just removed, on every CPU.
     unsafe {
         crate::paging::invlpg_global(crate::VirtAddr::new(AP_TRAMPOLINE_EXEC_BASE));
     }

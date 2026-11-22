@@ -1638,9 +1638,20 @@ default Linux image, and the boot prints `OFF_POLICY_WARNING`. A resume
 refuses an OFF image (`OffPolicyRefused`) unless its own command line
 opts in too, so an unsealed image someone planted is never restored.
 
+Both entry points run on the boot CPU (`NotBootCpu` otherwise), because
+the restore resumes the saved context there. The power service pins its
+hibernation task to CPU 0.
+
+After the devices freeze, each secondary CPU is parked between polls with
+its queue intact and stopped (`cpu_lifecycle::cpu_park`, `stop_parked`,
+scheduler §3.5.1). The image is written on the boot CPU alone. The
+restored image restarts the CPUs before its devices' restore callbacks;
+a failure restarts them before thawing. The resume stops the boot kernel's
+own secondary CPUs before the jump, so none of them runs code the image
+overwrites.
+
 aarch64 has no restore yet: `SUPPORTED` is false there, and both entry
-points refuse up front. Both also refuse while more than one CPU is
-online, until secondary CPUs can be taken down and restarted (lane 4).
+points refuse up front.
 
 #### 3.6.1 Power-off paths vs Linux
 

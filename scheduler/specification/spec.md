@@ -1268,6 +1268,31 @@ reports runnable work-kind counts, RT reservation, next deadline, state, and
 cumulative hard-IRQ/NMI cycles. It is a governor input, never a frequency
 control callback.
 
+#### 3.5.1 Parking secondary CPUs for hibernation
+
+```rust
+pub fn cpu_park(id: CpuId, cap: &Cap<CpuLifecycle, Invoke>) -> Result<(), HotPlugError>;
+pub fn cpu_unpark(id: CpuId, cap: &Cap<CpuLifecycle, Invoke>) -> Result<(), HotPlugError>;
+pub struct PhysicalHooks { pub stop: unsafe fn(u32), pub restart: unsafe fn(u32) -> bool }
+pub fn set_physical_hooks(hooks: PhysicalHooks);       // installed by frame/ after start_aps
+pub unsafe fn stop_parked(id: CpuId) -> bool;          // x86_64: INIT, then smp::mark_offline
+pub unsafe fn restart_parked(id: CpuId) -> bool;       // x86_64: trampoline again, INIT-SIPI-SIPI
+```
+
+This is hibernation's `freeze_secondary_cpus`, without a hot-unplug.
+`cpu_park` moves an online CPU to `Draining` and waits, up to 100 ms, for
+the same between-polls acknowledgement `cpu_take_offline` waits for. It
+does not drain the queue. The CPU's tasks, pinned per-CPU work included,
+stay where they are, so no subsystem needs an offline callback. The online
+mask is untouched.
+
+A parked CPU holds no lock and runs no task. `stop_parked` INITs it there,
+and `restart_parked` starts it from the top. `run_forever` clears the
+park's idle marks (`CPU_HALTED`, the TLB-shootdown idle bit) on entry, and
+the restarted executor picks up its queue. A restart works in a restored
+hibernation image too: the trampoline is reinstalled first, because low
+memory may hold the boot kernel's copy.
+
 ### 3.6 Workqueues (`narf_scheduler::workqueue`, Linux `kernel/workqueue.c`)
 
 | Linux | NARF |

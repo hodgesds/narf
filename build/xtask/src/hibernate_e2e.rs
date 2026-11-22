@@ -41,6 +41,11 @@ pub struct Args {
     #[command(flatten)]
     pub build: super::BuildArgs,
 
+    /// Guest CPUs. Above 1, hibernation and resume stop the secondary CPUs
+    /// and the restored image starts them again.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=8))]
+    pub smp: u32,
+
     /// Seconds each boot may take.
     #[arg(long, default_value_t = 600)]
     pub timeout_secs: u64,
@@ -72,7 +77,7 @@ fn qemu_args(
         "-cpu".into(),
         "max,phys-bits=40".into(),
         "-smp".into(),
-        "1".into(),
+        args.smp.to_string(),
         "-m".into(),
         format!("{GUEST_MIB}M"),
     ];

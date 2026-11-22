@@ -9629,6 +9629,12 @@ pub fn run_forever() -> ! {
     } else {
         0
     };
+    // An AP restarted after `cpu_lifecycle::stop_parked` arrives here with
+    // its park's idle marks still set: clear them, or TLB shootdowns would
+    // keep skipping a CPU that runs tasks again. (RCU needs nothing: the
+    // executor leaves RCU idle before every poll.)
+    CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+    narf_memory::tlb_shootdown::mark_busy(cpu as u32);
     // APs enter the scheduler here after architecture bring-up. Publish
     // execution availability even if the first queue is empty; the first
     // run_until_empty pass then emits the matching Idle edge before halt.

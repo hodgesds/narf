@@ -120,7 +120,10 @@ async fn run_hibernate() {
 pub fn initcall() -> narf_init::InitResult {
     match narf_boot::args().value("narf.hibernate_e2e") {
         Some("hibernate") => {
-            narf_scheduler::spawn(run_hibernate());
+            // On the boot CPU, as `hibernate` requires.
+            let mut spec = narf_scheduler::TaskSpec::unthrottled();
+            spec.affinity = narf_scheduler::Affinity::pinned(narf_scheduler::CpuId(0));
+            narf_scheduler::spawn_with_spec(run_hibernate(), spec);
             narf_init::InitResult::Ok
         }
         Some("resume") => {
