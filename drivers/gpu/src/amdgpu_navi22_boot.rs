@@ -556,6 +556,7 @@ pub(crate) fn route_fences(
                     Ok(iv) => {
                         if let Some(engine) = fence_engine(&iv) {
                             crate::amdgpu_fence_navi22::notify(engine);
+                            crate::amdgpu_navi22_cs::fence_interrupt();
                         } else if fault {
                             // An old IH task may have waited across a reset.
                             // Never charge its fault to the replacement owner.

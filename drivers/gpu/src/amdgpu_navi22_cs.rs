@@ -108,6 +108,15 @@ pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine, generation: u64) 
     crate::amdgpu_fence_navi22::notify_all();
 }
 
+/// A fence interrupt (GFX EOP, SDMA/VCN/JPEG trap), as
+/// `amdgpu_fence_process` runs from the IRQ handler: sample every ring now,
+/// so jobs that just completed signal (and are stamped with their signal
+/// time) at the interrupt, not when a client next asks.
+pub(crate) fn fence_interrupt() {
+    if let Some(current) = current(crate::amdgpu_fence_navi22::generation()) {
+        let _ = current.progress();
+    }
+}
 /// The current submitter of `generation`, if one is registered.
 fn current(generation: u64) -> Option<Arc<Submitter>> {
     let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
@@ -410,6 +419,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     fn error(&self, ticket: u64) -> Option<FsError> {
         let _ = self.progress();
         self.jobs.lock().error(ticket)
+    }
+    fn signal_time(&self, ticket: u64) -> Option<u64> {
+        self.jobs.lock().signal_time(ticket)
     }
     fn submit<'a>(
         &'a self,

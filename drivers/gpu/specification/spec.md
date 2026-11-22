@@ -12328,6 +12328,16 @@ sequence. While the heap is withdrawn a VRAM space takes no new tables
 (`Busy`). Cards that register no table heap (Navi48, Phoenix) keep
 system-RAM tables with per-entry cache flushes.
 
+Job fences carry Linux's `dma_fence.timestamp`: the jobs tracker stamps
+every job the sample that completes it with `CLOCK_MONOTONIC` now (as
+`amdgpu_fence_process` signals with `dma_fence_signal_timestamp`), keeping
+the latest 256 (`SIGNAL_TIMES`); `Submitter::signal_time(ticket)` reports it
+and a job fence's `DrmFence::timestamp_ns` is that time, which
+`SYNC_IOC_FILE_INFO` returns for the signalled leaf. Every GFX EOP and
+SDMA/VCN/JPEG trap samples the rings (`amdgpu_navi22_cs::fence_interrupt`),
+so the stamp is the interrupt's time rather than a client's later query.
+Older jobs fall back to the time a sync_file first saw them signalled.
+
 The native submitter retains pending jobs and their context health. A TDR
 marks the oldest pending context on that ring guilty (`TimedOut`), with
 other unfinished work `Canceled`; explicit unregister/reset also cancels

@@ -2757,6 +2757,7 @@ pub fn route_interrupts(
                     Ok(iv) => {
                         if let Some(engine) = fence_engine(&iv) {
                             fence::notify(engine);
+                            crate::amdgpu_navi22_cs::fence_interrupt();
                         }
                     }
                     Err(_) => {

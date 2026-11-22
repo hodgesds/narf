@@ -785,6 +785,10 @@ impl narf_filesystem::DrmFence for JobFence {
     fn owner(&self) -> Option<u64> {
         Some(self.owner)
     }
+    /// `dma_fence.timestamp`: when the engine saw the job complete.
+    fn timestamp_ns(&self) -> Option<u64> {
+        self.engine.signal_time(self.seq)
+    }
 }
 
 /// A job's user fence: written with the job's handle when the job retires.

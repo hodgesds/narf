@@ -3,8 +3,12 @@
 //! wake clients while every unconfirmed resource remains quarantined.
 use super::{ring_index, RING_IDS};
 use crate::amdgpu_ctx::Health;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
+
+/// Signal times kept: the latest jobs' (ticket, ns). Older jobs' fences
+/// fall back to the time a reader first saw them signalled.
+const SIGNAL_TIMES: usize = 256; // linux: n/a (NARF bound on recorded fence timestamps)
 
 #[derive(Debug)]
 pub(super) struct Jobs {
@@ -21,6 +25,10 @@ pub(super) struct Jobs {
     cancelled: Vec<(usize, u32, u32)>,
     /// Jobs whose timeout was suspended (`time_out`): `-ETIME` once done.
     timed_out: Vec<u64>,
+    /// When each recently completed job was first seen complete
+    /// (`dma_fence_signal_timestamp` from `amdgpu_fence_process`), oldest
+    /// first, at most `SIGNAL_TIMES`.
+    signalled_at: VecDeque<(u64, u64)>,
 }
 /// How many recovered jobs keep their error after they retire.
 const FAILED_KEPT: usize = 64; // linux: n/a (NARF bound)
@@ -312,6 +320,7 @@ impl Jobs {
             failed: Vec::new(),
             cancelled: Vec::new(),
             timed_out: Vec::new(),
+            signalled_at: VecDeque::new(),
         }
     }
     pub fn retired(&self, ticket: u64) -> bool {
@@ -328,8 +337,19 @@ impl Jobs {
         }
         self.completed = completed;
         let epoch = self.epoch;
-        self.pending
-            .retain(|(ticket, _, _)| !super::job_done(epoch, completed, *ticket));
+        // amdgpu_fence_process: every job this sample completes signals now.
+        let now = narf_time::wall::monotonic_ns().max(1);
+        let signalled_at = &mut self.signalled_at;
+        self.pending.retain(|(ticket, _, _)| {
+            let done = super::job_done(epoch, completed, *ticket);
+            if done {
+                if signalled_at.len() == SIGNAL_TIMES {
+                    signalled_at.pop_front();
+                }
+                signalled_at.push_back((*ticket, now));
+            }
+            !done
+        });
     }
     pub fn emitted(&mut self, ticket: u64, health: &Arc<Health>) {
         self.emitted_on(ticket, health, 0);
@@ -429,8 +449,11 @@ impl Jobs {
     }
     /// When job `ticket` was seen complete (`Submitter::signal_time`).
     pub fn signal_time(&self, ticket: u64) -> Option<u64> {
-        let _ = ticket;
-        None
+        self.signalled_at
+            .iter()
+            .rev()
+            .find(|(done, _)| *done == ticket)
+            .map(|&(_, at)| at)
     }
     pub fn error(&self, ticket: u64) -> Option<FsError> {
         if let Some(&(_, error)) = self.failed.iter().find(|(t, _)| *t == ticket) {
