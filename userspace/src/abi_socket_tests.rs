@@ -13087,6 +13087,124 @@ kernel_test_in!(
     smoke_abi_socket_ping_honours_device_source_and_recvttl
 );
 
+/// `tcp_v4_connect`: `ip_route_connect(fl4, daddr, inet->inet_saddr,
+/// sk->sk_bound_dev_if, ...)` routes through the bound device and keeps a
+/// bound source address, and `inet_hash_connect` keeps a bound port
+/// (`inet_num` set). On the desktop a socket bound to 192.168.1.211:54105
+/// connected as 192.168.3.165:34215, and SO_BINDTODEVICE wlan0 left eth0
+/// (NetworkManager's per-device connectivity checks all went out eth0).
+fn smoke_abi_socket_tcp_connect_keeps_bound_address_port_and_device() -> TestResult {
+    use alloc::vec::Vec;
+    const EINPROGRESS: i64 = -115;
+    const A: &str = "abi-tcpb-a";
+    const B: &str = "abi-tcpb-b";
+    const A_IP: [u8; 4] = [10, 47, 3, 165];
+    const B_IP: [u8; 4] = [10, 47, 1, 211];
+    const PEER: [u8; 4] = [10, 47, 1, 80];
+    const PEER_MAC: [u8; 6] = [0x52, 0x54, 0, 0, 0x2f, 0x50];
+    static A_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    static B_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    fn capture_a(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        A_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn capture_b(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    /// `(source address, source port)` of each SYN in `frames`.
+    fn syns(frames: &[Vec<u8>]) -> Vec<([u8; 4], u16)> {
+        frames
+            .iter()
+            .filter(|f| f.len() >= 54 && f[12..14] == [0x08, 0x00] && f[23] == 6)
+            .filter(|f| f[47] & 0x12 == 0x02)
+            .map(|f| {
+                (
+                    [f[26], f[27], f[28], f[29]],
+                    u16::from_be_bytes([f[34], f[35]]),
+                )
+            })
+            .collect()
+    }
+    fn local(fd: u64) -> Result<([u8; 4], u16), &'static str> {
+        let mut out = [0u8; 16];
+        let mut outlen = (out.len() as u32).to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("getsockname failed");
+        }
+        Ok((
+            [out[4], out[5], out[6], out[7]],
+            u16::from_be_bytes([out[2], out[3]]),
+        ))
+    }
+    fn connect_peer(fd: u64) -> Result<(), &'static str> {
+        let sa = sockaddr_in(u32::from_be_bytes(PEER), 80);
+        match call(
+            Syscall::SocketConnect.raw(),
+            a2(fd, sa.as_ptr() as u64, sa.len() as u64),
+        ) {
+            Some(EINPROGRESS) => Ok(()),
+            _ => Err("non-blocking connect did not return EINPROGRESS"),
+        }
+    }
+    with_setup(|| {
+        for (name, mac, ip, capture) in [
+            (A, 0xa1, A_IP, capture_a as narf_net::iface::SendFn),
+            (B, 0xb1, B_IP, capture_b as narf_net::iface::SendFn),
+        ] {
+            narf_net::iface::register(name, [0x02, 0, 0, 0, 0x2f, mac], capture);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_iface_ipv4_fields(name, ip, [0; 4]);
+            narf_net::iface::add_addr(name, ip, 22);
+            narf_net::arp_cache::insert(name, PEER, PEER_MAC);
+        }
+        narf_net::tcp_stack::__arp_insert_legacy(PEER, PEER_MAC);
+        A_TX.lock().clear();
+        B_TX.lock().clear();
+        let result = (|| -> Result<(), &'static str> {
+            // Bound address and port.
+            let fd = sockopt_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK)?;
+            sockopt_bind(fd, &sockaddr_in(u32::from_be_bytes(B_IP), 0))?;
+            let (_, port) = local(fd)?;
+            connect_peer(fd)?;
+            let mut sent = syns(&core::mem::take(&mut *A_TX.lock()));
+            sent.extend(syns(&core::mem::take(&mut *B_TX.lock())));
+            if sent != [(B_IP, port)] {
+                return Err("connect dropped the bound source address or port");
+            }
+            if local(fd)? != (B_IP, port) {
+                return Err("getsockname after connect is not the bound address and port");
+            }
+            // Bound device.
+            let dev = sockopt_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK)?;
+            if sockopt_set(dev, SOL_SOCKET, SO_BINDTODEVICE, b"abi-tcpb-b\0")? != 0 {
+                return Err("SO_BINDTODEVICE(abi-tcpb-b) failed");
+            }
+            connect_peer(dev)?;
+            let on_a = syns(&core::mem::take(&mut *A_TX.lock()));
+            let on_b = syns(&core::mem::take(&mut *B_TX.lock()));
+            if !on_a.is_empty() || on_b.len() != 1 || on_b[0].0 != B_IP {
+                return Err("a SYN bound to B did not leave B from B's address");
+            }
+            sockopt_close(&[fd, dev]);
+            Ok(())
+        })();
+        narf_net::iface::del_addr(A, A_IP, 22);
+        narf_net::iface::del_addr(B, B_IP, 22);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/tcp-bind-connect",
+    smoke_abi_socket_tcp_connect_keeps_bound_address_port_and_device
+);
+
 /// systemd-resolved's `link_address_update_rtnl` reads IFA_FLAGS from every
 /// RTM_NEWADDR and fails the whole manager with ENODATA when it is absent
 /// ("Could not create manager: No data available"). Linux always emits it
