@@ -234,7 +234,8 @@ the canonical bit definition without re-deriving it.
   Source: TGL PRM Vol. 12 "Display DDI".
 - **`intel_gpu_gtt`** — 64-bit GTT page-table entry layout: phys
   separate GGTT / PPGTT address, permission and PAT fields;
-  Gen12 / Xe-LPG system-memory formats. Source: TGL PRM Vol. 5 "Memory Views".
+  Gen11 legacy Gen8 PPAT, Gen12 / Xe-LPG system-memory formats.
+  Source: TGL PRM Vol. 5 "Memory Views".
 
 Codec layer is transport-agnostic — it produces the wire
 register values without performing the MMIO write. The
@@ -344,7 +345,16 @@ display-12 port/AUX mapping and has its own DG1 GMBUS/default-pin metadata,
 but no KMS route is admitted yet.
 
 Gen11 (Ice Lake / Elkhart Lake / Jasper Lake) is the first
-pre-Gen12 family admitted, identity + probe only (Gen11 Lane 1).
+pre-Gen12 family admitted, identity + probe (Gen11 Lane 1) plus the
+legacy Gen8 PTE format and exec wiring (Gen11 Lane 2): `PteFormat::Gen8`
+encodes PPGTT leaves with the legacy PPAT levels
+(`gt/gen8_ppgtt.c::gen8_pte_encode`, `gt/intel_gtt.h:135-138`) and the
+exec layer selects it for `GtPlatform::Gen11` with leaf cache level
+`I915_CACHE_LLC` and table policy `PPAT_CACHED_PDE` = 0, so GEM objects
+are mappable on Gen11. The Gen11 GGTT has no PAT bits — same as Gen12:
+Linux `gt/intel_ggtt.c` selects `mtl_ggtt_pte_encode` (PAT bits 53:52)
+only at `GRAPHICS_VER_FULL >= IP_VER(12, 70)`; every earlier generation
+uses `gen8_ggtt_pte_encode`, which ignores the PAT index.
 Linux `include/drm/intel/pciids.h` supplies the exact 26-ID census
 (`INTEL_ICL_IDS` 15, `INTEL_EHL_IDS` 6, `INTEL_JSL_IDS` 5); one
 `Generation::IceLake` carries all three products (the
@@ -361,8 +371,19 @@ forcewake ACK at 0x130044, and no HWCONFIG table (i915 requires
 graphics 12.55+). Gen11 predates GMD_ID, so Stage 1 presence
 re-reads PCI config space (all-ones refuses) instead of reading
 0xD8C/0xFF8, and `gmd_id` is `None` on Gen11. Display, external
-display, backlight, PTE format, execlists submission and GuC load
-stay gated: those are the Gen11 Lanes 2–8. Gen9 stays excluded (§6).
+display, backlight, execlists submission and GuC load stay gated:
+those are the Gen11 Lanes 3–8. Gen9 stays excluded (§6).
+
+Remainder (EHL/JSL 36-bit PPGTT): Linux `i915_pci.c` sets
+`.__runtime.ppgtt_size = 36` for Elkhart Lake and Jasper Lake only;
+Ice Lake inherits the Gen8 default 48. The walk stays four-level on
+all three (`gen8_ppgtt.c`: `ppgtt->vm.top = i915_vm_is_4lvl(...) ? 3 : 2`,
+and `(2^36 - 1) >> 32` is nonzero, so `i915_vm_is_4lvl` is true), so
+NARF's root level 3 is correct as-is — only the VA ceiling differs
+(2^36 vs 2^48). NARF's `Ppgtt` and exec layer hardcode a 48-bit VA
+ceiling (`PPGTT_VA_BITS`, `VA_SIZE`), so they over-admit EHL/JSL VAs
+at or above 2^36. Threading a per-platform VA ceiling through `Ppgtt`
+and the exec VA checks is a follow-up lane, not this one.
 
 Wildcat Lake IDs FD80/FD81 are exact `INTEL_WCL_IDS`. Linux deliberately binds
 them to the same `ptl_desc` as Panther Lake and selects the PTL GuC profile.
@@ -674,9 +695,10 @@ generation gates below.
   (combo-PHY DPLL, universal planes), so that generation would
   need a separate display model, not more table rows. Gen11
   (Ice Lake / Jasper Lake / Elkhart Lake) was excluded under this
-  bullet until Gen11 Lane 1 lifted it for identity + probe only
-  (26 IDs in §5); its display model is still a separate lane
-  programme, and display/GT execution stay gated after Lane 1.
+  bullet until Gen11 Lane 1 lifted it for identity + probe
+  (26 IDs in §5) and Lane 2 extended the lift to GEM mapping via
+  the legacy Gen8 PTE format; its display model is still a separate
+  lane programme, and display/GT execution stay gated after Lane 2.
 - Arrow Lake display — identification landed (#1023, §5);
   display support rides #1016's Xe-LPG family via the shared
   Meteor Lake classification, not a separate Arrow Lake path.

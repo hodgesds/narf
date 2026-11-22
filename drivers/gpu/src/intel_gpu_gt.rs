@@ -353,6 +353,8 @@ impl GtPlatform {
             crate::intel_gpu_gtt::PteFormat::Xe2
         } else if self.is_gen12() || self.is_dg2() {
             crate::intel_gpu_gtt::PteFormat::Gen12
+        } else if matches!(self, Self::Gen11(_)) {
+            crate::intel_gpu_gtt::PteFormat::Gen8
         } else {
             crate::intel_gpu_gtt::PteFormat::XeLpg
         }
@@ -622,6 +624,24 @@ mod tests {
             || GtPlatform::Alchemist.pte_format() != crate::intel_gpu_gtt::PteFormat::Gen12
         {
             return TestResult::Fail("BMG source five-level Xe2 PPGTT profile");
+        }
+        // Gen11 (all three sub-platforms) takes the legacy Gen8 PPAT
+        // format on a four-level walk; Gen12 keeps its own format.
+        for platform in [
+            GtPlatform::Gen11(Gen11Platform::IceLake),
+            GtPlatform::Gen11(Gen11Platform::ElkhartLake),
+            GtPlatform::Gen11(Gen11Platform::JasperLake),
+        ] {
+            if platform.ppgtt_root_level() != 3
+                || platform.pte_format() != crate::intel_gpu_gtt::PteFormat::Gen8
+            {
+                return TestResult::Fail("Gen11 must select the Gen8 PTE format");
+            }
+        }
+        if GtPlatform::Gen12(Gen12Platform::TigerLake).pte_format()
+            != crate::intel_gpu_gtt::PteFormat::Gen12
+        {
+            return TestResult::Fail("Gen12 must keep its PTE format");
         }
         for (platform, sriov) in [
             (GtPlatform::Gen12(Gen12Platform::TigerLake), true),
