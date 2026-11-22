@@ -185,7 +185,9 @@ impl Stream {
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
         let position = unsafe { dev.bar0.read32(sd_base(self.index) + SD_LPIB) };
         let now = narf_time::now_cycles();
-        let wrap_ns = ring.bytes as u64 * 1_000_000_000 / (48_000 * ring.frame_bytes as u64);
+        // One trip around the ring at the stream's own rate.
+        let wrap_ns = ring.bytes as u64 * 1_000_000_000
+            / (u64::from(ring.params.rate.hz()) * ring.frame_bytes as u64);
         if position >= ring.bytes as u32
             || (!ring.free_running
                 && now.wrapping_sub(self.last_sample) >= narf_time::wall::ns_to_cycles(wrap_ns))
