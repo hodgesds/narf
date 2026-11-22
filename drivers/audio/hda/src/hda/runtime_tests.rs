@@ -3830,3 +3830,47 @@ kernel_test_in!(
     "audio/hda/card-names",
     native_hda_codec_proc_header_matches_linux
 );
+
+/// Linux `azx_runtime_idle` refuses (-EBUSY) for a controller without
+/// `AZX_DCAPS_PM_RUNTIME` (1002:1640 among them): the autosuspend still
+/// suspends its codecs (`hda_codec_runtime_suspend`: D3), but the controller
+/// stays up, link out of reset and command rings running. The next command
+/// resumes the codecs first (`codec_exec_verb` -> `snd_hda_power_up_pm` ->
+/// `hda_call_codec_resume`: D0 and the codec init). Before, NARF parked
+/// every controller the same way.
+fn native_hda_pm_codec_only_suspend_without_runtime_pm() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    dev.runtime_pm.store(false, Ordering::Release);
+    dev.autosuspend_ms.store(10, Ordering::Release);
+    super::wait(|| false, 20);
+    let base = fixture.model.verbs.len();
+    let _ = dev.autosuspend();
+    let d3 = make_verb(0, 1, crate::hda_codec::verb::SET_POWER_STATE | 3);
+    if !fixture.model.verbs[base..].contains(&d3) {
+        return TestResult::Fail("the autosuspend puts the codecs in D3");
+    }
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    let (gctl, corbctl) = unsafe { (dev.bar0.read32(REG_GCTL), dev.bar0.read8(REG_CORBCTL)) };
+    if gctl & GCTL_CRST == 0 || corbctl & CORBCTL_RUN == 0 || dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("a controller without runtime PM stays up");
+    }
+    let base = fixture.model.verbs.len();
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x1002aa01) {
+        return TestResult::Fail("a command after the codec suspend");
+    }
+    let d0 = make_verb(0, 1, crate::hda_codec::verb::SET_POWER_STATE);
+    if !fixture.model.verbs[base..].contains(&d0) {
+        return TestResult::Fail("a command resumes the codecs (D0) before it runs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-codec-only",
+    native_hda_pm_codec_only_suspend_without_runtime_pm
+);
