@@ -296,21 +296,58 @@ impl SoftirqHandoff {
     ///
     /// [`returned`]: SoftirqHandoff::returned
     pub fn defer(&self) {
-        let _ = (&self.deferral, &self.pump);
+        // Release: the deferral task's first poll sees the ring state this
+        // pump's last poll left.
+        self.deferred.store(true, Ordering::Release);
+        wake(&self.deferral);
     }
 
     /// Deferral task: resolves once the pump has handed the queue over.
     pub fn taken(&self) -> impl Future<Output = ()> + '_ {
-        core::future::pending()
+        core::future::poll_fn(move |cx| park(&self.deferral, cx, || self.is_deferred()))
     }
 
     /// Deferral task: the queue is drained; give it back to the pump, which
     /// completes it (`napi_complete_done`) and re-enables its interrupt.
-    pub fn hand_back(&self) {}
+    pub fn hand_back(&self) {
+        self.deferred.store(false, Ordering::Release);
+        wake(&self.pump);
+    }
 
     /// Pump: resolves once the deferral task has handed the queue back.
     pub fn returned(&self) -> impl Future<Output = ()> + '_ {
-        core::future::ready(())
+        core::future::poll_fn(move |cx| park(&self.pump, cx, || !self.is_deferred()))
+    }
+}
+
+fn wake(slot: &IrqSafeSpinLock<Option<Waker>>) {
+    // Taken under the lock, woken after it is released.
+    let waker = slot.lock().take();
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+/// Register `cx`'s waker in `slot`, then check `ready`: a hand-over that
+/// lands between the check and the registration is seen by the re-check.
+fn park(
+    slot: &IrqSafeSpinLock<Option<Waker>>,
+    cx: &mut core::task::Context<'_>,
+    ready: impl Fn() -> bool,
+) -> core::task::Poll<()> {
+    if ready() {
+        return core::task::Poll::Ready(());
+    }
+    {
+        let mut slot = slot.lock();
+        if !slot.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+            *slot = Some(cx.waker().clone());
+        }
+    }
+    if ready() {
+        core::task::Poll::Ready(())
+    } else {
+        core::task::Poll::Pending
     }
 }
 
