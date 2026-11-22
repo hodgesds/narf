@@ -2787,6 +2787,21 @@ for every other command until its `compat_ioctl` conversion exists. i386
 mmap keeps every result below `TASK_SIZE_32` (ENOMEM for a fixed range past
 it; a mapping a 64-bit address space hands back above it is undone).
 
+`dispatch_native` runs the read/write family under the same
+`/proc/<pid>/io` accounting as `kernel_syscall_entry` (Linux counts in
+`vfs_read`/`vfs_write`, below every entry point): `syscr`/`syscw` once per
+call and the bytes it moved, where a call re-issued after it parked
+(`syscall_parked_restarting` still set at entry) adds its bytes but not a
+second call. Every context that wraps another to re-present its arguments or
+watch its return — `Ia32ArgsCtx`, the accounting context, the reshape
+proxies of chmod/chown/openat/xattr, `open_tree_attr`'s capture — forwards
+the rest of the trait through `syscall::forward_trap_context!` (RIP, user
+state, `returning_to_user`, signal delivery and sigreturn, `in_ia32_syscall`,
+`in_compat_mode`, `ia32_abi`), so a call under it parks, restarts and is
+interrupted exactly as one made directly. The sendmmsg/recvmmsg capture is
+the one exception: it reports RIP 0 so its nested call cannot park, and
+forwards only the ABI queries.
+
 ```rust
 pub trait TrapContext { /* ... */ fn ia32_abi(&self) -> Ia32Abi { Ia32Abi::default() } }
 pub struct Ia32Abi { pub time32: bool, pub flock: Ia32Flock }

@@ -10155,6 +10155,23 @@ pub(crate) fn io_account_write(task: u64, ret: i64) {
     e.syscw = e.syscw.saturating_add(1);
 }
 
+/// The bytes half of [`io_account_read`] / [`io_account_write`] alone, for
+/// a call re-issued after it parked: Linux sleeps inside its one
+/// `vfs_read`/`vfs_write` (`pipe_read`'s wait), so the re-issue is not
+/// another syscall, but the bytes it moves are the call's.
+pub(crate) fn io_account_reissued(task: u64, read: bool, ret: i64) {
+    if ret <= 0 {
+        return;
+    }
+    let mut g = IO_ACCOUNTING.lock();
+    let e = g.get_or_insert_with(BTreeMap::new).entry(task).or_default();
+    if read {
+        e.rchar = e.rchar.saturating_add(ret as u64);
+    } else {
+        e.wchar = e.wchar.saturating_add(ret as u64);
+    }
+}
+
 /// Read a task's I/O accounting, for `/proc/<pid>/io`.
 pub fn io_accounting_of(task: u64) -> TaskIoAccounting {
     IO_ACCOUNTING
@@ -10597,7 +10614,9 @@ fn adjtimex_core(timex_ptr: u64, writeback_on_error: bool, clock_gate: Result<()
 
 /// Minimal `TrapContext` proxy that overrides the argument tuple and
 /// forwards everything else to the inner context (reshape-and-delegate
-/// handlers like openat2).
+/// handlers like openat2): the RIP and user state a park needs, signal
+/// delivery, and which ABI the call came through
+/// (`syscall::forward_trap_context`).
 struct ReshapeArgs<'a> {
     inner: &'a mut dyn TrapContext,
     args: SyscallArgs,
@@ -10609,21 +10628,21 @@ impl TrapContext for ReshapeArgs<'_> {
     fn set_return(&mut self, ret: SyscallReturn) {
         self.inner.set_return(ret);
     }
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
+    fn pending_return(&self) -> Option<SyscallReturn> {
+        self.inner.pending_return()
     }
-    fn rip(&self) -> u64 {
-        0
-    }
-    fn set_rip(&mut self, _rip: u64) {}
-    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-        self.inner.redirect_to_kernel(rip, rsp)
-    }
+    crate::syscall::forward_trap_context!(inner);
 }
 
 /// `TrapContext` proxy that captures the sub-handler's return value
 /// instead of forwarding it (sendmmsg/recvmmsg loop a single
 /// sendmsg/recvmsg per message and read each result).
+///
+/// Unlike the other proxies it deliberately reports RIP 0 and has no user
+/// state to save, so the nested call cannot park: re-executing the whole
+/// batch is only safe before any message moved, and the outer handler
+/// decides that (`park_reexecute_on_fd_until`). It still presents the ABI
+/// the call came through.
 struct CaptureCtx<'a> {
     inner: &'a mut dyn TrapContext,
     args: SyscallArgs,
@@ -10645,6 +10664,15 @@ impl TrapContext for CaptureCtx<'_> {
     fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
         self.inner.redirect_to_kernel(rip, rsp)
+    }
+    fn in_ia32_syscall(&self) -> bool {
+        self.inner.in_ia32_syscall()
+    }
+    fn in_compat_mode(&self) -> bool {
+        self.inner.in_compat_mode()
+    }
+    fn ia32_abi(&self) -> crate::syscall::Ia32Abi {
+        self.inner.ia32_abi()
     }
 }
 

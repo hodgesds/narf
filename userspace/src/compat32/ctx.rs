@@ -8,11 +8,12 @@
 //! sign-extend; `mmap2` carries pages, not bytes; a 64-bit offset comes as
 //! two registers. [`Ia32ArgsCtx`] presents the native handler with the
 //! converted [`SyscallArgs`] and an [`Ia32Abi`], and forwards everything
-//! else — return, RIP, user state, signal delivery, `in_ia32_syscall` — to
-//! the gate's context, so parking, restart and delivery behave exactly as
-//! for a forwarded call.
+//! else — return, RIP, user state, signal delivery, `in_ia32_syscall`,
+//! `in_compat_mode` (`syscall::forward_trap_context`) — to the gate's
+//! context, so parking, restart and delivery behave exactly as for a
+//! forwarded call.
 
-use crate::syscall::{Ia32Abi, SigDeliveryParams, SyscallArgs, SyscallReturn, TrapContext};
+use crate::syscall::{Ia32Abi, SyscallArgs, SyscallReturn, TrapContext};
 
 /// A native view of an i386 call; see the module documentation.
 pub(crate) struct Ia32ArgsCtx<'a> {
@@ -92,45 +93,8 @@ impl TrapContext for Ia32ArgsCtx<'_> {
             self.inner.pending_return()
         }
     }
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
-    }
-    fn rip(&self) -> u64 {
-        self.inner.rip()
-    }
-    fn set_rip(&mut self, rip: u64) {
-        self.inner.set_rip(rip)
-    }
-    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-        self.inner.redirect_to_kernel(rip, rsp)
-    }
-    fn redirect_to_user(&mut self, entry_rip: u64, entry_rsp: u64) -> bool {
-        self.inner.redirect_to_user(entry_rip, entry_rsp)
-    }
-    unsafe fn save_user_state(&self, out: *mut u8) -> bool {
-        // SAFETY: forwarded unchanged; the caller upholds the trait's
-        // contract for `out`.
-        unsafe { self.inner.save_user_state(out) }
-    }
-    fn returning_to_user(&self) -> bool {
-        self.inner.returning_to_user()
-    }
-    fn deliver_signal(&mut self, params: &SigDeliveryParams) -> bool {
-        self.inner.deliver_signal(params)
-    }
-    fn perform_sigreturn(&mut self, sc_vaddr: u64, is_rt: bool) -> bool {
-        self.inner.perform_sigreturn(sc_vaddr, is_rt)
-    }
-    fn dump_gprs(&self) {
-        self.inner.dump_gprs()
-    }
-    fn in_ia32_syscall(&self) -> bool {
-        self.inner.in_ia32_syscall()
-    }
-    fn in_compat_mode(&self) -> bool {
-        self.inner.in_compat_mode()
-    }
     fn ia32_abi(&self) -> Ia32Abi {
         self.abi
     }
+    crate::syscall::forward_trap_context!(inner, except_ia32_abi);
 }

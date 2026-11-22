@@ -703,21 +703,11 @@ impl TrapContext for ReturnCapture<'_> {
         self.ret = Some(ret);
     }
 
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
+    fn pending_return(&self) -> Option<SyscallReturn> {
+        self.ret
     }
 
-    fn rip(&self) -> u64 {
-        self.inner.rip()
-    }
-
-    fn set_rip(&mut self, rip: u64) {
-        self.inner.set_rip(rip);
-    }
-
-    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-        self.inner.redirect_to_kernel(rip, rsp)
-    }
+    crate::syscall::forward_trap_context!(inner);
 }
 
 fn discard_open_tree_fd(task: u64, fd_no: u32) {

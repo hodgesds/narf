@@ -73,9 +73,9 @@ pub(crate) fn xattr_remove_at(dfd: i64, path_ptr: u64, at_flags: u32, ctx: &mut 
 /// The four cores read `name`/`value`/`size`/`flags` from arg1..arg4,
 /// because that is where the twelve legacy calls put them. The `*at` forms
 /// put them elsewhere, and pack two of them inside a `struct xattr_args`.
-/// This forwards the return and control-flow hooks unchanged and rewrites
-/// only `args`, which is the same shape `chown_legacy` uses to reach the
-/// `fchownat` body.
+/// This forwards the return and the rest of the context unchanged
+/// (`syscall::forward_trap_context`) and rewrites only `args`, which is the
+/// same shape `chown_legacy` uses to reach the `fchownat` body.
 struct Reshaped<'a> {
     inner: &'a mut dyn TrapContext,
     args: SyscallArgs,
@@ -88,18 +88,10 @@ impl TrapContext for Reshaped<'_> {
     fn set_return(&mut self, r: SyscallReturn) {
         self.inner.set_return(r);
     }
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
+    fn pending_return(&self) -> Option<SyscallReturn> {
+        self.inner.pending_return()
     }
-    fn rip(&self) -> u64 {
-        self.inner.rip()
-    }
-    fn set_rip(&mut self, rip: u64) {
-        self.inner.set_rip(rip);
-    }
-    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-        self.inner.redirect_to_kernel(rip, rsp)
-    }
+    crate::syscall::forward_trap_context!(inner);
 }
 
 // ── The four new syscalls ────────────────────────────────────────────
