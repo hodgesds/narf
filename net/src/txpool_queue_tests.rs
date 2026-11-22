@@ -192,3 +192,48 @@ kernel_test_in!(
     "net/txpool-queue",
     smoke_txpool_unbound_tcp_builds_in_posting_queue_pool
 );
+
+/// `ipv4_flow_queue` is the queue a driver without a transmit-queue contract
+/// posts a flow on (virtio-net `flow_tx_pair`) and the pool the stack builds
+/// that flow's unbound segments in. It must stay symmetric (both directions
+/// of a flow on one queue) and spread the flows between one pair of hosts
+/// over every queue: the ports, folded into both halves of one word, used to
+/// cancel in the finaliser's `h ^ h >> 16`, leaving one port bit to choose,
+/// so two hosts' flows reached at most two queues whatever the queue count.
+fn smoke_txpool_flow_hash_spreads_ports_over_every_queue() -> TestResult {
+    let pairs: [([u8; 4], [u8; 4]); 3] = [
+        ([192, 168, 3, 165], [95, 216, 195, 133]),
+        ([10, 0, 0, 1], [10, 0, 0, 2]),
+        ([192, 0, 2, 11], [198, 51, 100, 7]),
+    ];
+    const FLOWS: u16 = 1024;
+    for queues in [2usize, 4, 8, 16] {
+        for (a, b) in pairs {
+            let mut hits = [0u32; 16];
+            for i in 0..FLOWS {
+                let sport = 32_768 + i;
+                let q = crate::ipv4_flow_queue(a, b, sport, 443, queues);
+                if q >= queues {
+                    return TestResult::Fail("flow hash chose a queue out of range");
+                }
+                if crate::ipv4_flow_queue(b, a, 443, sport, queues) != q {
+                    return TestResult::Fail("the two directions of a flow hashed apart");
+                }
+                hits[q] += 1;
+            }
+            // Every queue takes at least half of its fair share.
+            let fair = u32::from(FLOWS) / queues as u32;
+            if hits[..queues].iter().any(|&h| h < fair / 2) {
+                return TestResult::Fail("one host pair's ports did not reach every queue");
+            }
+        }
+    }
+    if crate::ipv4_flow_queue([1, 2, 3, 4], [5, 6, 7, 8], 1, 2, 1) != 0 {
+        return TestResult::Fail("a single queue was not queue 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/txpool-hash",
+    smoke_txpool_flow_hash_spreads_ports_over_every_queue
+);
