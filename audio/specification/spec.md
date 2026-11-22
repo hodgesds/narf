@@ -157,23 +157,25 @@ An HDMI-only codec has no Master controls. HDMI PCM i is named "HDMI i"
 (`PcmDevice::pcm_name`), and the card's components list
 "HDA:vendor,subsystem,revision" for each codec (`snd_component_add`).
 
-GPU codecs expose Linux's digital-output controls per HDMI PCM, over one
-shared IEC958 state (only one stream plays at a time):
+GPU codecs expose Linux's digital-output controls per HDMI PCM, each with
+its own state (Linux's per-PCM `hda_spdif_out`):
 `IEC958 Playback Con Mask`/`Pro Mask` (read-only), `IEC958 Playback Default`
-(`convert_from_spdif_status` into DIG1/DIG2 on every port's converter;
-setting AES0 non-audio selects IEC 61937 passthrough at the next prepare) and
-`IEC958 Playback Switch` (DIGEN). The state starts from the first converter's
-GET_DIGI_CONVERT_1 with DIGEN set, since no userspace hook is required to
-play. `Playback Channel Map` follows `hdmi_chmap_ctl_put`: ignored with no
-open stream, accepted while open, set up or prepared (applied at once to
-every routed port when prepared), EBUSY once running, EINVAL for positions
-past `SNDRV_CHMAP_LAST`, for maps no CA carries and (before revision 3) for
+(`convert_from_spdif_status` into DIG1/DIG2; setting AES0 non-audio selects
+IEC 61937 passthrough at the next prepare) and `IEC958 Playback Switch`
+(DIGEN). A PCM's state reaches its pin's converter only while the PCM is
+open (`snd_hda_spdif_ctls_assign` at open, unassign at close); a closed
+PCM's writes are stored for its next prepare. Every PCM's state starts from
+the first converter's GET_DIGI_CONVERT_1 with DIGEN set, since no userspace
+hook is required to play. `Playback Channel Map` is the pin's and follows
+`hdmi_chmap_ctl_put`: ignored without that PCM's stream open, accepted while
+open, set up or prepared (applied at once to its port when prepared), EBUSY once running,
+EINVAL for positions past `SNDRV_CHMAP_LAST`, for maps no CA carries and (before revision 3) for
 maps that split a slot pair. Closing the stream clears it; after a prepare it
 reports the standard layout's map (`hdmi_setup_fake_chmap`). Its TLV lists the
-CAs the primary port's speakers cover (CHMAP_VAR, or CHMAP_PAIRED with N/A
-fillers before revision 3, where an odd layout is ENODEV as in Linux). The
-primary port is the first one with a valid ELD, the same port the ELD control
-reports; mirrored ports may differ in speaker allocation and CA. The ATI codec has no ELD buffer: narf rebuilds one as `get_eld_ati`
+CAs the PCM's pin's speakers cover (CHMAP_VAR, or CHMAP_PAIRED with N/A
+fillers before revision 3, where an odd layout is ENODEV as in Linux). The primary
+port (the one the display overlay reports through) is the first one with a
+valid ELD. The ATI codec has no ELD buffer: narf rebuilds one as `get_eld_ati`
 does from the speaker allocation, sink info (revision 3+), audio descriptor
 and A/V delay verbs, and parses it as `snd_parse_eld`. Pin sense (presence
 and ELD-valid) is polled every 100 ms with the other jacks; the ELD is

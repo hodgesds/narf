@@ -117,7 +117,7 @@ impl Stream {
         let mut format = pack_sdfmt(ring.params.format, ring.params.rate, ring.params.channels);
         // IEC 61937 to a GPU port: SDnFMT TYPE, as azx_pcm_prepare's
         // snd_hdac_spdif_stream_format sets it.
-        if !self.capture && !dev.hdmi.lock().is_empty() && dev.hdmi_playback.lock().non_pcm {
+        if !self.capture && !dev.hdmi.lock().is_empty() && dev.stream_non_pcm() {
             format |= 0x8000;
         }
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
@@ -327,7 +327,9 @@ impl PcmDevice for Card {
             return Err(SoundError::NoSuchControl);
         }
         // Linux returns -ENODEV for a layout pairwise remapping cannot carry.
-        self.0.chmap_tlv().ok_or(SoundError::NoSuchDevice)
+        self.0
+            .chmap_tlv(super::hdmi::hdmi_pcm_of(id.index))
+            .ok_or(SoundError::NoSuchDevice)
     }
     fn set_control(
         &self,
@@ -627,13 +629,15 @@ impl Drop for Pcm {
         if state.stop(&self.dev).is_ok() {
             state.ring.take();
         }
-        if !self.capture {
-            *self.dev.active_pcm.lock() = None;
-        }
+        let slot = if self.capture {
+            None
+        } else {
+            self.dev.active_pcm.lock().take()
+        };
         state.claimed = false;
         drop(state);
-        if !self.capture {
-            self.dev.reset_chmap();
+        if let Some(super::hdmi::PcmSlot::Hdmi(pcm)) = slot {
+            self.dev.reset_chmap(pcm);
         }
         // azx_pcm_close: snd_hda_power_down_pm. The autosuspend parks the
         // controller once the delay passes with no reference held.

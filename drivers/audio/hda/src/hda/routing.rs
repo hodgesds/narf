@@ -283,7 +283,10 @@ impl IntelHda {
             let spk_alloc = self.hdmi_sink(output).map_or(0, |sink| sink.spk_alloc);
             let channels = params.channels.count();
             self.ati_hdmi_prepare(graph, &path.nodes, output, channels, spk_alloc)?;
-            if self.hdmi_playback.lock().non_pcm {
+            if self
+                .hdmi_pcm_of_output(output)
+                .is_some_and(|pcm| self.hdmi_state(pcm).non_pcm)
+            {
                 format |= 0x8000;
             }
         }
@@ -323,19 +326,21 @@ impl IntelHda {
         }
         let (cad, pin, cvt) = (graph.addr, nodes.pin_nid, nodes.converter_nid);
         let rev3 = hda_codec::ati_hdmi_rev3(graph);
-        let pcm = *self.hdmi_playback.lock();
+        let index = self
+            .hdmi_pcm_of_output(output)
+            .ok_or(HdaError::NoOutputStream)?;
+        let pcm = self.hdmi_state(index);
         self.verb(cad, pin, SET_DOWNMIX_INFO << 8)?;
         if rev3 {
             self.verb(cad, pin, (SET_MULTICHANNEL_MODE << 8) | 1)?;
         }
         let ca = self.ati_hdmi_infoframe(graph, nodes, channels, spk_alloc, &pcm)?;
-        // hdmi_setup_fake_chmap: the controls describe the primary port.
-        if self.hdmi_primary() == Some(output) {
-            let mut state = self.hdmi_playback.lock();
+        // hdmi_setup_fake_chmap: the pin's PCM reports the layout it got.
+        self.update_hdmi_state(index, |state| {
             if pcm.non_pcm || !state.chmap_set {
                 state.chmap = super::hdmi::default_chmap(ca);
             }
-        }
+        });
         if rev3 {
             let ramp = if pcm.non_pcm { 0 } else { 180 };
             self.verb(cad, cvt, (SET_RAMP_RATE << 8) | ramp)?;
@@ -844,14 +849,18 @@ impl IntelHda {
             )),
             ControlKind::Iec958ConMask => Ok(ControlValue::iec958(&super::hdmi::CON_MASK)),
             ControlKind::Iec958ProMask => Ok(ControlValue::iec958(&super::hdmi::PRO_MASK)),
-            ControlKind::Iec958Default => Ok(ControlValue::iec958(
-                &self.hdmi_playback.lock().status.to_le_bytes(),
-            )),
-            ControlKind::Iec958Switch => Ok(ControlValue::boolean(
-                self.hdmi_playback.lock().ctls & super::hdmi::DIG1_ENABLE != 0,
-            )),
+            ControlKind::Iec958Default => {
+                let state = self.hdmi_state(super::hdmi::hdmi_pcm_of(id.index));
+                Ok(ControlValue::iec958(&state.status.to_le_bytes()))
+            }
+            ControlKind::Iec958Switch => {
+                let state = self.hdmi_state(super::hdmi::hdmi_pcm_of(id.index));
+                Ok(ControlValue::boolean(
+                    state.ctls & super::hdmi::DIG1_ENABLE != 0,
+                ))
+            }
             ControlKind::ChannelMap => {
-                let map = self.hdmi_playback.lock().chmap;
+                let map = self.hdmi_state(super::hdmi::hdmi_pcm_of(id.index)).chmap;
                 Ok(ControlValue::integers(&map.map(i32::from)))
             }
         }
@@ -868,19 +877,20 @@ impl IntelHda {
         if !self.mixer_controls().contains(&id) {
             return Err(SoundError::NoSuchControl);
         }
+        let pcm = super::hdmi::hdmi_pcm_of(id.index);
         match (id.kind, value) {
             (ControlKind::Iec958Default, ControlValue::Iec958(status)) => {
                 return self
-                    .set_spdif_status(status)
+                    .set_spdif_status(pcm, status)
                     .map_err(|_| SoundError::BadState);
             }
             (ControlKind::Iec958Switch, ControlValue::Boolean(enable)) => {
                 return self
-                    .set_spdif_enable(enable)
+                    .set_spdif_enable(pcm, enable)
                     .map_err(|_| SoundError::BadState);
             }
             (ControlKind::ChannelMap, ControlValue::Integers { len, values }) => {
-                return self.set_chmap(&values[..usize::from(len)]);
+                return self.set_chmap(pcm, &values[..usize::from(len)]);
             }
             _ => {}
         }
