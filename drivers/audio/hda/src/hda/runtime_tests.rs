@@ -19,6 +19,9 @@ struct Model {
     commands: usize,
     verbs: Vec<u32>,
     stall: bool,
+    /// Commands the codec takes off the CORB without ever answering (a
+    /// lost response): each one decrements it.
+    drop_next: usize,
     supports_32: bool,
     /// Answer as an AMD GPU HDMI codec instead of the Realtek analog one.
     ati: bool,
@@ -116,6 +119,11 @@ impl Model {
                     .read_volatile();
                 self.commands += 1;
                 self.verbs.push(command);
+                if self.drop_next > 0 {
+                    self.drop_next -= 1;
+                    self.mmio.write16(REG_CORBRP, self.corb);
+                    continue;
+                }
                 // Interleave an unsolicited jack event with every reply. The
                 // completion ring must not be indexed with the CORB pointer.
                 let mut reply = if self.navi22 {
@@ -687,6 +695,7 @@ impl Fixture {
                 commands: 0,
                 verbs: Vec::new(),
                 stall: false,
+                drop_next: 0,
                 supports_32: true,
                 ati,
                 sink: false,
@@ -850,22 +859,32 @@ fn native_hda_command_cancellation() -> TestResult {
     let dev = fixture.controller.as_ref().unwrap().clone();
     fixture.model.stall = true;
     {
+        // A node-count read, cancelled while the codec is silent.
         // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
-        let mut future = pin!(unsafe { dev.send_verb_async(make_verb(0, 0, VERB_GET_PARAMETER)) });
+        let verb = unsafe { dev.send_verb_async(make_verb(0, 0, VERB_GET_PARAMETER | 4)) };
+        let mut future = pin!(verb);
         let mut cx = Context::from_waker(Waker::noop());
         if !matches!(future.as_mut().poll(&mut cx), Poll::Pending) {
             return TestResult::Fail("command should wait");
         }
     }
-    if !dev.irq.failed.load(Ordering::Acquire)
-        // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
-        || unsafe { dev.send_verb(0) } != Err(HdaError::DeviceFailed)
-    {
+    if !dev.irq.failed.load(Ordering::Acquire) {
         return TestResult::Fail("cancelled command must poison transport");
+    }
+    // The codec answers again. Its late answer to the cancelled read must not
+    // become the next command's reply: the poisoned transport restarts its
+    // rings before the next command (the azx_rirb_get_response fallback),
+    // which then gets its own answer, and the transport is usable again.
+    fixture.model.stall = false;
+    // SAFETY: as above.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x10ec0287)
+        || dev.irq.failed.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("the command after a cancelled one takes its own reply");
     }
     TestResult::Pass
 }
-kernel_test_in!("audio/hda", native_hda_command_cancellation);
+kernel_test_in!("audio/hda/cmd-recover", native_hda_command_cancellation);
 
 fn native_hda_ati_hdmi_controllers_run_without_snoop() -> TestResult {
     use super::super::ati_hdmi_noncoherent;
@@ -3432,4 +3451,52 @@ fn native_hda_pm_parked_rings_take_no_command() -> TestResult {
 kernel_test_in!(
     "audio/hda/pm-parked",
     native_hda_pm_parked_rings_take_no_command
+);
+
+/// A codec that loses one response must not leave the controller dead. Linux
+/// `azx_rirb_get_response` falls back on a timeout (polling mode, then MSI
+/// off, then a bus reset or single_cmd mode) and the command is tried again;
+/// every later command works. Before, the timed-out lease latched
+/// `irq.failed`, which only a resume of a parked controller cleared, so on a
+/// running controller every later command failed with DeviceFailed and the
+/// PCM paths (open, prepare, start) with EPIPE.
+fn native_hda_cmd_recover_after_lost_response() -> TestResult {
+    let mut fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let vendor = make_verb(0, 0, VERB_GET_PARAMETER);
+    fixture.model.drop_next = 1;
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    let first = unsafe { dev.send_verb(vendor) };
+    // SAFETY: as above.
+    let second = unsafe { dev.send_verb(vendor) };
+    if second != Ok(0x10ec0287) {
+        return TestResult::Fail("a lost response must not leave the command transport dead");
+    }
+    if first != Ok(0x10ec0287) {
+        return TestResult::Fail("the command whose response was lost is retried on restarted rings");
+    }
+    if dev.irq.failed.load(Ordering::Acquire) {
+        return TestResult::Fail("a recovered transport stays poisoned");
+    }
+    // The PCM paths that refused a poisoned transport work again.
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open after a lost response");
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+        || playback.start().is_err()
+    {
+        return TestResult::Fail("playback after a lost response");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/cmd-recover",
+    native_hda_cmd_recover_after_lost_response
 );
