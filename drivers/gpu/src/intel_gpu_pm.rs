@@ -602,9 +602,10 @@ impl PmCore {
     /// The blob is parsed eagerly: a malformed blob is
     /// refused here ([`PmError::DmcParse`]) and the previous
     /// registration stands. Returns the program bitmask.
-    /// Nothing in production calls this yet — Q8 landed the
-    /// loader without a probe-time firmware fetch; this is
-    /// the named seam that wiring uses when it lands.
+    /// Probe wires this through
+    /// [`crate::intel_gpu_gen12_dmc::load_for_display`], which
+    /// fetches the platform blob from the firmware registry
+    /// and registers the resident copy after loading it.
     /// Stepping selection is wildcard: the core owns no
     /// silicon-stepping readout (probe's `ChipInfo` does not
     /// carry one in this tree), and the registrant fetched
