@@ -127,6 +127,13 @@ const LEASE_WAIT_MS: u64 = 3 * COMMAND_TIMEOUT_MS;
 /// How long a park or wake waits for another one: a wake runs the codec
 /// init again, up to the ALC28x headphone tails' 200 ms of settle time.
 const PM_WAIT_MS: u64 = 1000;
+/// `STATESTS_INT_MASK` (include/sound/hda_register.h): the codec wake bits
+/// for `HDA_MAX_CODECS` (8) codecs.
+const STATESTS_INT_MASK: u16 = 0xff;
+/// `AZX_DEFAULT_CODECS`: the codec slots `azx_probe_codecs` probes on every
+/// controller NARF binds (only NVIDIA and Teradici differ in Linux).
+const AZX_DEFAULT_CODECS: u8 = 4;
+const AZX_DEFAULT_CODEC_MASK: u16 = (1 << AZX_DEFAULT_CODECS) - 1;
 
 pub(super) fn wait(mut predicate: impl FnMut() -> bool, ms: u64) -> bool {
     narf_scheduler::responsive_spin_until(&mut predicate, Deadline::after_ms(ms))
@@ -134,6 +141,52 @@ pub(super) fn wait(mut predicate: impl FnMut() -> bool, ms: u64) -> bool {
 pub(super) fn delay_us(us: u64) {
     let deadline = Deadline::after_us(us);
     narf_scheduler::responsive_spin_until(|| deadline.expired(), Deadline::after_us(us + 1000));
+}
+
+/// `snd_hdac_bus_reset_link(bus, true)` (sound/hda/core/controller.c):
+/// clear STATESTS if the link is up, so the mask read afterwards holds only
+/// this reset's codec wake events; enter link reset and hold it; leave it
+/// and give the codecs time to request an address; then the codec mask.
+/// The hold and the settle time are Linux's (500-1000 us and 1000-1200 us);
+/// the spec minimums are 100 us and 521 us (25 frames), and NARF held the
+/// link in reset for only 100 us before.
+fn reset_link(bar: bar::MmioRegion) -> Result<u16, HdaError> {
+    // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+    unsafe {
+        if bar.read8(REG_GCTL) & GCTL_CRST as u8 != 0 {
+            bar.write16(REG_STATESTS, STATESTS_INT_MASK);
+        }
+        // snd_hdac_bus_enter_link_reset: clear CRST only.
+        bar.write32(REG_GCTL, bar.read32(REG_GCTL) & !GCTL_CRST);
+    }
+    if !wait(
+        // SAFETY: as above.
+        || unsafe { bar.read8(REG_GCTL) } & GCTL_CRST as u8 == 0,
+        100,
+    ) {
+        return Err(HdaError::ResetTimeout);
+    }
+    // Codec PLL settle (HDA spec 5.5.1): usleep_range(500, 1000).
+    delay_us(1000);
+    // snd_hdac_bus_exit_link_reset: set CRST, wait for GCTL to read non-zero.
+    // SAFETY: as above.
+    unsafe {
+        bar.write8(REG_GCTL, bar.read8(REG_GCTL) | GCTL_CRST as u8);
+    }
+    // SAFETY: as above.
+    if !wait(|| unsafe { bar.read8(REG_GCTL) } != 0, 100) {
+        return Err(HdaError::ResetTimeout);
+    }
+    // "Brent Chartrand said to wait >= 540us for codecs to initialize":
+    // usleep_range(1000, 1200).
+    delay_us(1200);
+    // SAFETY: as above.
+    if unsafe { bar.read8(REG_GCTL) } == 0 {
+        // "controller not ready!"
+        return Err(HdaError::ResetTimeout);
+    }
+    // SAFETY: as above.
+    Ok(unsafe { bar.read16(REG_STATESTS) } & STATESTS_INT_MASK)
 }
 
 /// SET_AMP_GAIN_MUTE payload muting both output channels (HDA
@@ -201,22 +254,8 @@ impl IntelHda {
             bar.write32(REG_INTCTL, 0);
             bar.write8(REG_CORBCTL, 0);
             bar.write8(REG_RIRBCTL, 0);
-            bar.write32(REG_GCTL, 0);
         }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { bar.read32(REG_GCTL) } & 1 == 0, 100) {
-            return Err(HdaError::ResetTimeout);
-        }
-        delay_us(100);
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        unsafe {
-            bar.write32(REG_GCTL, GCTL_CRST);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { bar.read32(REG_GCTL) } & 1 != 0, 100) {
-            return Err(HdaError::ResetTimeout);
-        }
-        delay_us(1000);
+        let codec_mask = reset_link(bar)?;
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         let gcap = unsafe { bar.read16(REG_GCAP) };
         let counts = (
@@ -304,10 +343,23 @@ impl IntelHda {
             return Err(HdaError::DeviceFailed);
         }
         dev.init_cmd_io()?;
+        // Linux takes the codec mask once, right after the link reset
+        // (`snd_hdac_bus_reset_link`); a codec whose wake event lands while
+        // the rings were set up is taken too; a slot that does not answer is
+        // dropped below either way.
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        let mask =unsafe { bar.read16(REG_STATESTS) } & 0x7fff;
-        for cad in 0..15 {
-            if mask & (1 << cad) == 0 {
+        let mask = codec_mask | (unsafe { bar.read16(REG_STATESTS) } & STATESTS_INT_MASK);
+        let probed = dev.probe_codec_slots(mask)?;
+        if probed != mask & AZX_DEFAULT_CODEC_MASK {
+            narf_console::write_str(&alloc::format!(
+                "hda: codec mask {:#x} (GCAP {:#06x}), slots answering {:#x}\n",
+                mask,
+                gcap,
+                probed
+            ));
+        }
+        for cad in 0..AZX_DEFAULT_CODECS {
+            if probed & (1 << cad) == 0 {
                 continue;
             }
             // SAFETY: The live controller owns the command rings; its command lease serializes access.
@@ -413,6 +465,16 @@ impl IntelHda {
             }
         }
         if dev.codecs.is_empty() {
+            // What the next boot needs to tell a link without codecs from
+            // codecs that do not answer.
+            narf_console::write_str(&alloc::format!(
+                "hda: no codec: STATESTS mask {:#x}, answering {:#x}, GCAP {:#06x}, GCTL {:#x}\n",
+                mask,
+                probed,
+                gcap,
+                // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+                unsafe { bar.read32(REG_GCTL) },
+            ));
             return Err(HdaError::NoCodecs);
         }
         dev.discover_paths();
@@ -504,6 +566,53 @@ impl IntelHda {
         let mut state = self.commands.lock();
         state.wp = 0;
         state.rp = 0;
+        Ok(())
+    }
+
+    /// The first pass of Linux `azx_probe_codecs`: one vendor-id read per
+    /// slot in `mask` (`probe_codec`, without the timeout fallback, as Linux
+    /// does while `chip->probing`). A slot that does not answer is dropped
+    /// ("Some BIOSen give you wrong codec addresses that don't exist") and,
+    /// because "accessing to a non-existing codec often screws up the
+    /// controller chip", the controller is reset before the next slot
+    /// (`azx_stop_chip` + `azx_init_chip`). Returns the answering slots.
+    /// Probe only: no other user of the rings exists yet.
+    fn probe_codec_slots(&self, mask: u16) -> Result<u16, HdaError> {
+        let mut answering = mask & AZX_DEFAULT_CODEC_MASK;
+        for cad in 0..AZX_DEFAULT_CODECS {
+            if answering & (1 << cad) == 0 {
+                continue;
+            }
+            let vendor = self.exec_verb(make_verb(cad, 0, VERB_GET_PARAMETER), false);
+            if matches!(vendor, Ok(id) if id != u32::MAX) {
+                continue;
+            }
+            narf_console::write_str(&alloc::format!(
+                "hda: codec #{} probe error ({:?}); disabling it\n",
+                cad,
+                vendor
+            ));
+            answering &= !(1 << cad);
+            if answering == 0 {
+                break;
+            }
+            self.reset_chip()?;
+        }
+        Ok(answering)
+    }
+
+    /// `azx_stop_chip` + `azx_init_chip(chip, true)` during probe: command
+    /// I/O stopped, link reset, command I/O restarted, which also drops a
+    /// failed probe's poisoned transport.
+    fn reset_chip(&self) -> Result<(), HdaError> {
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        unsafe {
+            self.bar0.write8(REG_RIRBCTL, 0);
+            self.bar0.write8(REG_CORBCTL, 0);
+        }
+        reset_link(self.bar0)?;
+        self.init_cmd_io()?;
+        self.irq.failed.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1552,26 +1661,8 @@ impl IntelHda {
     /// restarted, so an earlier timeout no longer describes them.
     fn restart_controller(&self) -> Result<(), HdaError> {
         let _lease = self.acquire_command_blocking()?;
-        // SAFETY: Controller owns this live BAR; fixed register
-        // offsets are inside the validated window.
-        unsafe {
-            self.bar0.write32(REG_GCTL, 0);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 == 0, 100) {
-            return Err(HdaError::ResetTimeout);
-        }
-        delay_us(100);
-        // SAFETY: Controller owns this live BAR; fixed register
-        // offsets are inside the validated window.
-        unsafe {
-            self.bar0.write32(REG_GCTL, GCTL_CRST);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { self.bar0.read32(REG_GCTL) } & 1 != 0, 100) {
-            return Err(HdaError::ResetTimeout);
-        }
-        delay_us(1000);
+        // The codecs are already known; the wake does not re-probe them.
+        reset_link(self.bar0)?;
         // The shadow cursors restart with the ring pointers inside.
         self.init_cmd_io()?;
         // SAFETY: Controller owns this live BAR; fixed register
