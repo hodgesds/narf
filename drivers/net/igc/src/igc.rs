@@ -2233,11 +2233,8 @@ fn remove(device: BusDevice, _: Cap<BusDeviceCap, Write>) {
 pub(crate) fn rx_task_specs(
     cpu: u32,
 ) -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
-    let mut spec = narf_scheduler::TaskSpec::unthrottled()
-        .with_work_kind(narf_scheduler::WorkKind::SoftIrq);
-    spec.affinity =
-        narf_scheduler::affinity::Affinity::pinned(narf_scheduler::affinity::CpuId(cpu));
-    (spec, None)
+    let pump = narf_net::napi::rx_pump_spec(cpu);
+    (pump, narf_net::napi::rx_deferral_spec(cpu))
 }
 
 /// `igc_poll`'s cleaning of queue `q`: reclaim its transmit completions,
@@ -2265,19 +2262,136 @@ pub(crate) fn napi_complete(queue: Option<&Queue>, hw: &impl Registers, index: O
     queue.is_some_and(|queue| queue.pending_rx())
 }
 
+/// One NAPI poll of queue `q` (`igc_poll` up to its budget check): clean
+/// the queue, hand its frames to the stack, and resume the connections its
+/// transmit completions freed. Returns the packets cleaned and whether the
+/// ring still holds work.
+fn rx_napi_poll(
+    rx: &Igc,
+    q: usize,
+    producer: &IrqSafeSpinLock<Producer<Frame, RX_RING_N>>,
+) -> (u32, bool) {
+    // Only a reset replaces the queue set; one handle serves the whole poll.
+    let queue = rx.queues().get(q).cloned();
+    let (frames, drops) = match (rx.operation(), queue.as_ref()) {
+        (Ok(_op), Some(queue)) => {
+            let (f, drops) = napi_clean(queue, &rx.hw, q, rx.mtu());
+            // Device-wide counters only when there is something to count:
+            // no shared lock per poll.
+            if drops != 0 {
+                rx.stats.lock().rx_drops += drops;
+                narf_net::iface::note_rx_drop(rx.name(), drops);
+            }
+            (f, drops)
+        }
+        _ => (Vec::new(), 0),
+    };
+    // Bounded by the poll's budget.
+    let processed = (frames.len() as u64 + drops) as u32;
+    if !frames.is_empty() {
+        // One interface lookup and one mirror check for the whole poll;
+        // frame and byte counts are folded in when the batch ends.
+        let name = rx.name();
+        let mut batch = narf_net::iface::rx_batch(name);
+        let mirrored = crate::publish::rx_mirror_attached(name);
+        for mut frame in frames {
+            use narf_net::bypass::classifier::XdpAction;
+            crate::publish::mirror_rx(&frame, mirrored, |f| {
+                let _ = producer.lock().try_send(f);
+            });
+            let (action, len) = narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
+            frame.truncate(len as u32);
+            if action == XdpAction::Tx {
+                // The transmit completion recycles it.
+                if rx.submit_frame(frame, TxMeta::plain()).is_err() {
+                    narf_net::bypass::classifier::count_xdp_tx_drop();
+                }
+                continue;
+            }
+            let timestamp = frame.rx_meta().timestamp_ns;
+            match action {
+                XdpAction::Pass | XdpAction::RedirectCpu { .. } => {
+                    batch.receive(frame.payload_mut(), timestamp)
+                }
+                _ => native_redirect(name, frame.payload_mut(), action, timestamp),
+            }
+            // Dispatch copied what it keeps, so the buffer re-arms a slot on
+            // a later poll instead of going back to the page allocator
+            // (Linux `igc_reuse_rx_page`).
+            if let Some(queue) = queue.as_ref() {
+                queue.recycle(frame.into_parts().0);
+            }
+        }
+    }
+    if let Some(queue) = queue.as_ref() {
+        // The wake pass, once per poll: this poll reclaimed the queue's
+        // transmit completions (`poll_xsk`), so resume the connections that
+        // were waiting for them. No queue lock is held here.
+        queue.txq().run_wakeups();
+        // Replace RX buffers a consumer kept, here in task context and
+        // never inside `receive`.
+        queue.replenish_rx();
+    }
+    let pending = match rx.operation() {
+        Ok(_op) => queue.as_ref().is_some_and(|queue| queue.pending_rx()),
+        Err(_) => false,
+    };
+    (processed, pending)
+}
+
+/// `igc_poll` once a poll left queue `q`'s ring empty: `napi_complete_done`
+/// and `igc_ring_irq_enable`, which sets the vector's interval from the work
+/// since it was last set and then re-enables the vector. Returns whether
+/// the ring holds work again.
+fn rx_napi_done(
+    rx: &Igc,
+    q: usize,
+    route: Option<IrqRoute>,
+    itr: &mut (u32, u32, crate::itr::Work),
+) -> bool {
+    let Ok(_op) = rx.operation() else {
+        return false;
+    };
+    let queue = rx.queues().get(q).cloned();
+    if let (Some(r), Some(queue)) = (route, queue.as_ref()) {
+        rx.moderate(r, queue, itr);
+    }
+    napi_complete(queue.as_deref(), &rx.hw, route.map(|r| r.index))
+}
+
 fn spawn_pumps(
     device: Arc<Igc>,
     rx_prod: Producer<Frame, RX_RING_N>,
     mut tx_cons: Consumer<Frame, TX_RING_N>,
 ) {
+    use narf_net::napi::{deferral_run, softirq_run, SoftirqEnd, SoftirqHandoff};
     let producer = Arc::new(IrqSafeSpinLock::new(rx_prod));
     for q in 0..4 {
-        let rx = device.clone();
-        let producer = producer.clone();
         // Linux NAPI: a queue is polled in softirq context on the CPU its
         // vector interrupts, so its ring, its transmit completions and the
-        // flows RSS steers to it stay on one core.
-        let (spec, _deferral) = rx_task_specs(device.queue_cpu_of(q));
+        // flows RSS steers to it stay on one core. Each interrupt gives the
+        // pump one bounded run ahead of the tasks there; work left after it
+        // goes to the queue's deferral task (ksoftirqd), which shares the
+        // CPU with them.
+        let (spec, deferral) = rx_task_specs(device.queue_cpu_of(q));
+        let handoff = Arc::new(SoftirqHandoff::new());
+        let deferral_task = deferral.is_some();
+        if let Some(deferral) = deferral {
+            let rx = device.clone();
+            let producer = producer.clone();
+            let handoff = handoff.clone();
+            narf_scheduler::spawn_with_spec(
+                async move {
+                    while rx.until_removed(handoff.taken()).await.is_some() {
+                        let poll = || rx_napi_poll(&rx, q, &producer);
+                        deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
+                    }
+                },
+                deferral,
+            );
+        }
+        let rx = device.clone();
+        let producer = producer.clone();
         narf_scheduler::spawn_with_spec(
             async move {
                 // This vector's interval and the queue's work counters when
@@ -2286,82 +2400,26 @@ fn spawn_pumps(
                 while !rx.removed.load(Ordering::Acquire) {
                     let route = rx.route(q);
                     // NAPI: the queue's interrupt alone schedules the next
-                    // poll (`igc_msix_ring` → `napi_schedule`); no timer.
+                    // run (`igc_msix_ring` → `napi_schedule`); no timer.
+                    // Taken before the run re-enables the vector, so an
+                    // interrupt after that wakes this task.
                     let waiter = route.map(|r| narf_interrupts::wait_for_irq(r.vector));
-                    // Only a reset replaces the queue set; one handle serves
-                    // the whole poll.
-                    let queue = rx.queues().get(q).cloned();
-                    let frames = match (rx.operation(), queue.as_ref()) {
-                        (Ok(_op), Some(queue)) => {
-                            let (f, drops) = napi_clean(queue, &rx.hw, q, rx.mtu());
-                            // Device-wide counters only when there is
-                            // something to count: no shared lock per poll.
-                            if drops != 0 {
-                                rx.stats.lock().rx_drops += drops;
-                                narf_net::iface::note_rx_drop(rx.name(), drops);
-                            }
-                            f
+                    let end = softirq_run(
+                        || rx_napi_poll(&rx, q, &producer),
+                        || rx_napi_done(&rx, q, route, &mut itr),
+                        &handoff,
+                        narf_time::monotonic_ns,
+                    )
+                    .await;
+                    if end == SoftirqEnd::Deferred {
+                        if deferral_task {
+                            // The vector stays masked while the deferral
+                            // task polls; the next run completes the queue.
+                            let _ = rx.until_removed(handoff.returned()).await;
+                        } else {
+                            let poll = || rx_napi_poll(&rx, q, &producer);
+                            deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
                         }
-                        _ => Vec::new(),
-                    };
-                    if !frames.is_empty() {
-                        // One interface lookup and one mirror check for the
-                        // whole poll; frame and byte counts are folded in
-                        // when the batch ends.
-                        let name = rx.name();
-                        let mut batch = narf_net::iface::rx_batch(name);
-                        let mirrored = crate::publish::rx_mirror_attached(name);
-                        for mut frame in frames {
-                            use narf_net::bypass::classifier::XdpAction;
-                            crate::publish::mirror_rx(&frame, mirrored, |f| {
-                                let _ = producer.lock().try_send(f);
-                            });
-                            let (action, len) =
-                                narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
-                            frame.truncate(len as u32);
-                            if action == XdpAction::Tx {
-                                // The transmit completion recycles it.
-                                if rx.submit_frame(frame, TxMeta::plain()).is_err() {
-                                    narf_net::bypass::classifier::count_xdp_tx_drop();
-                                }
-                                continue;
-                            }
-                            let timestamp = frame.rx_meta().timestamp_ns;
-                            match action {
-                                XdpAction::Pass | XdpAction::RedirectCpu { .. } => {
-                                    batch.receive(frame.payload_mut(), timestamp)
-                                }
-                                _ => native_redirect(name, frame.payload_mut(), action, timestamp),
-                            }
-                            // Dispatch copied what it keeps, so the buffer
-                            // re-arms a slot on a later poll instead of
-                            // going back to the page allocator (Linux
-                            // `igc_reuse_rx_page`).
-                            if let Some(queue) = queue.as_ref() {
-                                queue.recycle(frame.into_parts().0);
-                            }
-                        }
-                    }
-                    if let Some(queue) = queue.as_ref() {
-                        // The wake pass, once per poll: this poll reclaimed
-                        // the queue's transmit completions (`poll_xsk`), so
-                        // resume the connections that were waiting for them.
-                        // No queue lock is held here.
-                        queue.txq().run_wakeups();
-                        // Replace RX buffers a consumer kept, here in task
-                        // context and never inside `receive`.
-                        queue.replenish_rx();
-                    }
-                    let pending = if let Ok(_op) = rx.operation() {
-                        if let (Some(r), Some(queue)) = (route, queue.as_ref()) {
-                            rx.moderate(r, queue, &mut itr);
-                        }
-                        napi_complete(queue.as_deref(), &rx.hw, route.map(|r| r.index))
-                    } else {
-                        false
-                    };
-                    if pending {
-                        narf_scheduler::yield_now().await;
                         continue;
                     }
                     // The ring is empty and the vector re-armed: Linux
