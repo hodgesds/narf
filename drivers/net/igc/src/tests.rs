@@ -3153,6 +3153,75 @@ kernel_test_in!(
     smoke_igc_refused_frame_returns_its_buffer_to_the_pool
 );
 
+fn smoke_igc_txpool_rejected_frames_return_their_buffers() -> TestResult {
+    // A refused frame's buffer goes back to its pool; a rejected one (a
+    // closed traffic gate, a full ring for a sender that does not honour
+    // backpressure) was dropped instead, freeing the 64 KiB buffer and
+    // shrinking the queue's pool, so the copy path later allocated a
+    // replacement on the data path. Linux frees the skb
+    // (`dev_kfree_skb_any`); it has no pool to shrink.
+    fn plain(_: &[u8], _: TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    fn owned(_: u64, _: Frame, _: TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const NAME: &str = "igc-txpool-rej";
+    let name = narf_net::iface::register(NAME, [2, 0, 0, 0, 0, 11], plain);
+    check!(name == NAME, "the test interface was renamed");
+    let q = Queue::new_sized(64, 64).unwrap();
+    q.set_owner(NAME);
+    let pool = q.tx_pool().clone();
+    let prefilled = pool.available();
+    narf_net::iface::enable_zero_copy_tx_context(NAME, 0, owned, vec![pool.clone()], 0, true);
+    let m = Model::new();
+    let pool_frame = || {
+        narf_net::iface::tx_acquire(NAME, 54).map(|mut frame| {
+            frame.payload_mut().copy_from_slice(&tcp4(0));
+            frame
+        })
+    };
+    // A closed traffic gate rejects every frame.
+    q.set_gate_closed(true);
+    for _ in 0..2 * prefilled {
+        let Some(frame) = pool_frame() else {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a closed gate took a buffer out of the zero-copy pool");
+        };
+        if q.post(&m, 0, frame, TxMeta::plain(), 1500).is_ok() {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a closed gate took a frame");
+        }
+    }
+    q.set_gate_closed(false);
+    // A full ring rejects a frame offered without backpressure.
+    while q
+        .post(&m, 0, dma_frame(&tcp4(0)), TxMeta::plain(), 1500)
+        .is_ok()
+    {}
+    for _ in 0..2 * prefilled {
+        let Some(frame) = pool_frame() else {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a full ring took a buffer out of the zero-copy pool");
+        };
+        if q.post(&m, 0, frame, TxMeta::plain(), 1500) != Err(IgcError::QueueTooSmall) {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a full ring took a frame");
+        }
+    }
+    let available = pool.available();
+    let _ = narf_net::iface::unregister(NAME);
+    check!(
+        available == prefilled,
+        "rejected frames were not returned to their pool"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-txpool",
+    smoke_igc_txpool_rejected_frames_return_their_buffers
+);
+
 fn smoke_igc_tx_pool_sized_from_ring() -> TestResult {
     // The pool is bounded by what its ring can hold in flight (one frame per
     // descriptor, one slot reserved) and starts with the ring's worth of

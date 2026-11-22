@@ -2498,3 +2498,57 @@ kernel_test_in!(
     "net/tcp/robust",
     smoke_rx_batch_resolves_device_once_per_poll
 );
+
+/// Zero-copy hook of the `txpool-neigh` interface: a synchronous driver
+/// whose transmit completes at once and recycles into the frame's pool.
+fn txpool_neigh_send(frame: crate::Frame, _meta: crate::TxMeta) -> Result<(), ()> {
+    CAPTURE.lock().push(frame.payload().to_vec());
+    let queue = frame.queue();
+    let (buf, _len) = frame.into_parts();
+    iface::tx_release_on("txpool-neigh", queue, buf);
+    Ok(())
+}
+
+/// A segment built in a zero-copy pool buffer whose next hop is not yet
+/// resolved is copied onto the neighbour's queue (`neigh_output`); the pool
+/// buffer must go back to its pool. It was dropped, freeing the buffer and
+/// shrinking the queue's pool by one per queued segment for good.
+fn smoke_txpool_unresolved_neighbour_returns_pool_buffer() -> TestResult {
+    let local = [10, 77, 0, 1];
+    let peer = reset("txpool-neigh", local);
+    let pool = Arc::new(narf_io::pool::DmaPool::new(
+        2048,
+        narf_lib::id::DomainId::DRIVER_0,
+        4,
+    ));
+    if pool.prefill(4) != 4 {
+        return TestResult::Fail("could not prefill the zero-copy pool");
+    }
+    iface::enable_zero_copy_tx_pools("txpool-neigh", txpool_neigh_send, vec![pool.clone()], 0);
+    let id = established(local, 40_100, peer, 80);
+    // The connection does not know its next hop's MAC yet.
+    let _ = __with_tcb_mut(id, |t| {
+        t.remote_mac = [0; 6];
+        t.nagle_enabled = false;
+    });
+    for _ in 0..8 {
+        if send(id, &[0x42; 100]).is_err() {
+            return TestResult::Fail("send failed");
+        }
+    }
+    let sent = drain()
+        .iter()
+        .filter(|f| ethertype(f) == 0x0800 && frame_payload_len(f) == 100)
+        .count();
+    if sent == 0 {
+        return TestResult::Fail("no segment reached the wire through the neighbour");
+    }
+    if pool.available() != 4 {
+        return TestResult::Fail("a segment queued on its neighbour kept its pool buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/txpool-neigh",
+    smoke_txpool_unresolved_neighbour_returns_pool_buffer
+);
