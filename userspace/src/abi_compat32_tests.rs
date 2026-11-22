@@ -568,7 +568,7 @@ fn smoke_compat32_static_image_loads_in_a_32bit_layout() -> TestResult {
             return Err("i386 text is not mapped at 0x08048000");
         }
         let esp = proc.stack_top.as_u64();
-        if esp >= TASK_SIZE_32 || esp < TASK_SIZE_32 - COMPAT_STACK_RESERVED {
+        if !(TASK_SIZE_32 - COMPAT_STACK_RESERVED..TASK_SIZE_32).contains(&esp) {
             return Err("startup esp is not in the stack window under TASK_SIZE_32");
         }
         if esp & 0xF != 0 {
