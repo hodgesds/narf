@@ -2431,6 +2431,10 @@ pub const POLL_ERR: u32 = 0x0008;
 pub const POLL_HUP: u32 = 0x0010;
 /// `POLLNVAL` — fd not open / invalid.
 pub const POLL_NVAL: u32 = 0x0020;
+/// `POLLRDNORM` — normal data readable. Linux reports it alongside
+/// `POLLIN` wherever ordinary data is waiting (`devkmsg_poll`, sockets,
+/// pipes); the value is the uapi one, so it passes straight to `revents`.
+pub const POLL_RDNORM: u32 = 0x0040;
 
 /// Per-directory async op surface. `lookup` is synchronous because
 /// the only Stage-3 directory implementation (initramfs) is a flat

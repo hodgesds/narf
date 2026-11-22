@@ -637,7 +637,10 @@ only `/dev/kmsg` (`devkmsg_llseek`: SEEK_SET/END/DATA with offset 0, `ESPIPE`
 for a non-zero offset, `EINVAL` otherwise). `/dev/kmsg` is record-based: one
 record per `read`, a per-open sequence cursor (readiness keys off it, never off
 the file offset), `EINVAL` for a too-small buffer, `EPIPE` after overrun, and
-`<N>`-prefixed injection on `write`.
+`<N>`-prefixed injection on `write`. Its poll answer is `devkmsg_poll`'s:
+`POLL_IN | POLL_RDNORM` for a waiting record, plus `POLL_ERR | POLL_PRI`
+once the reader's next record was overwritten. `POLL_RDNORM` (0x40) is the
+uapi `POLLRDNORM` bit, passed through to `revents` like the others.
 `llseek_pos(offset, whence, pos)` defaults to `None` and is consulted before
 `llseek`: a file whose `file_operations.llseek` owns `f_pos` receives the
 description's position and its `Some(Ok(v))` both becomes the new position

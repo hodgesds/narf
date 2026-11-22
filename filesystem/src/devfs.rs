@@ -467,14 +467,15 @@ impl DevKmsg {
         }
     }
 
-    /// `devkmsg_poll`.
+    /// `devkmsg_poll`: `EPOLLIN | EPOLLRDNORM` for a waiting record.
     fn readable(&self) -> u32 {
         let seq = *self.seq.lock();
+        let ready = crate::POLL_IN | crate::POLL_RDNORM;
         match narf_console::klog::kmsg_poll(seq) {
             None => 0,
-            Some(false) => crate::POLL_IN,
+            Some(false) => ready,
             // "return error when data has vanished underneath us"
-            Some(true) => crate::POLL_IN | crate::POLL_ERR | crate::POLL_PRI,
+            Some(true) => ready | crate::POLL_ERR | crate::POLL_PRI,
         }
     }
 }
