@@ -25,6 +25,7 @@
 //! refuse to run while more than one CPU is online.
 
 pub mod arch;
+pub mod e2e;
 pub mod image_file;
 pub mod payload;
 pub mod restore;

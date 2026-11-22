@@ -81,9 +81,12 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
      the image kernel's saved context at its own slide);
    - in the image kernel: device restore, then thaw.
    A refused or failed image boots normally and invalidates the image.
-9. **End-to-end test.** An xtask mode that boots QEMU twice on one disk:
-   the first boot hibernates, the second resumes and checks state a
-   kernel test left behind. Run it on both arches.
+9. **End-to-end test.** `cargo xtask hibernate-e2e` (x86_64, one CPU)
+   boots QEMU twice on one ext4 disk. The first boot fills 16 MiB with a
+   token-seeded pattern and hibernates (guest half:
+   `power/src/hibernate/e2e.rs`). The second resumes through `narf.resume=`
+   and must report the same token and digest. OFF policy unless
+   `--tpm-socket` names a swtpm. aarch64 follows its restore.
 
 ## Linux references
 

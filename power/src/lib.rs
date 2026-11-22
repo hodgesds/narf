@@ -237,6 +237,10 @@ pub fn register_initcalls() {
         let _ = hibernate::software_resume();
         InitResult::Ok
     });
+    // `cargo xtask hibernate-e2e`'s guest half; inert without
+    // `narf.hibernate_e2e=`. After the resume, so a restored image never
+    // reaches it.
+    narf_init::register(Stage::Late, "hibernate-e2e", hibernate::e2e::initcall);
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "s3-resume-hook", || {
         narf_arch::x86_64::s3_resume::set_resume_hook(s3_resume_hook_entry);
