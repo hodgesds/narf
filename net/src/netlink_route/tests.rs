@@ -1389,8 +1389,8 @@ fn delegated_admin_can_add_and_delete_ipv4_neighbor() -> narf_kernel_test::TestR
         i32::from_ne_bytes(add[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()),
         0
     );
-    narf_kernel_test::kt_assert!(crate::arp::snapshot().iter().any(|(iface, entry)| {
-        iface == name && entry.ip == [203, 0, 113, 9] && entry.mac == [0x02, 0, 0, 0, 3, 9]
+    narf_kernel_test::kt_assert!(crate::arp_cache::snapshot().iter().any(|entry| {
+        entry.iface == name && entry.ip == [203, 0, 113, 9] && entry.mac == [0x02, 0, 0, 0, 3, 9]
     }));
 
     let delete = build_replies_authorized(&neighbor_request(RTM_DELNEIGH), Some(&admin)).unwrap();
@@ -1402,9 +1402,9 @@ fn delegated_admin_can_add_and_delete_ipv4_neighbor() -> narf_kernel_test::TestR
         ),
         0
     );
-    narf_kernel_test::kt_assert!(!crate::arp::snapshot()
+    narf_kernel_test::kt_assert!(!crate::arp_cache::snapshot()
         .iter()
-        .any(|(iface, entry)| iface == name && entry.ip == [203, 0, 113, 9]));
+        .any(|entry| entry.iface == name && entry.ip == [203, 0, 113, 9]));
     narf_kernel_test::TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!(

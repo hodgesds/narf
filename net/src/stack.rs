@@ -425,13 +425,20 @@ impl AdminHandle {
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err(AdminError::InvalidMac);
         }
-        crate::arp::insert(&self.iface_name, ip, mac);
+        // `neigh_add` updates the device's entry in `arp_tbl`, the table the
+        // stack resolves with, and releases what was queued on it.
+        let net_ns_id = self.net_ns_id()?;
+        crate::arp_cache::insert(&self.iface_name, ip, mac);
+        crate::tcp_stack::arp_insert_in(net_ns_id, ip, mac);
+        crate::tcp_stack::neigh_resolved(net_ns_id, &self.iface_name, ip, mac);
         Ok(())
     }
 
     pub fn del_ipv4_neighbor(&self, ip: [u8; 4]) -> Result<(), AdminError> {
         self.check_live()?;
-        crate::arp::remove(&self.iface_name, ip);
+        let net_ns_id = self.net_ns_id()?;
+        crate::arp_cache::remove(&self.iface_name, ip);
+        crate::tcp_stack::arp_remove_in(net_ns_id, ip);
         Ok(())
     }
 

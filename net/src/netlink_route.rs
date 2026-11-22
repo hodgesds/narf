@@ -207,6 +207,7 @@ pub const NUD_REACHABLE: u16 = 0x02;
 pub const NUD_STALE: u16 = 0x04;
 pub const NUD_DELAY: u16 = 0x08;
 pub const NUD_PROBE: u16 = 0x10;
+pub const NUD_FAILED: u16 = 0x20;
 pub const NTF_ROUTER: u8 = 0x80;
 pub const FR_ACT_TO_TBL: u8 = 1;
 
@@ -2345,9 +2346,8 @@ fn apply_mutation(
                 None => None,
             };
             let exists = match family {
-                AF_INET if dst.len() == 4 => crate::arp::snapshot()
-                    .iter()
-                    .any(|(iface, entry)| iface == admin.iface_name() && entry.ip == dst),
+                AF_INET if dst.len() == 4 => <[u8; 4]>::try_from(dst)
+                    .is_ok_and(|ip| crate::arp_cache::get_entry(admin.iface_name(), ip).is_some()),
                 AF_INET6 if dst.len() == 16 => {
                     crate::ipv6::ndp::neigh_list_in(admin.net_ns_id().map_err(admin_errno)?)
                         .iter()

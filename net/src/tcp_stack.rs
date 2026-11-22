@@ -66,6 +66,19 @@ fn arp_insert_local(net_ns_id: u64, ip: [u8; 4], mac: [u8; 6]) {
     m.insert((net_ns_id, ip), mac);
 }
 
+/// Record `ip → mac` in the namespace's next-hop cache (an administrator's
+/// RTM_NEWNEIGH).
+pub(crate) fn arp_insert_in(net_ns_id: u64, ip: [u8; 4], mac: [u8; 6]) {
+    arp_insert_local(net_ns_id, ip, mac);
+}
+
+/// Forget `ip` in the namespace's next-hop cache (RTM_DELNEIGH).
+pub(crate) fn arp_remove_in(net_ns_id: u64, ip: [u8; 4]) {
+    if let Some(cache) = ARP_CACHE.lock().as_mut() {
+        cache.remove(&(net_ns_id, ip));
+    }
+}
+
 pub(crate) fn remove_namespace(net_ns_id: u64) {
     if let Some(cache) = ARP_CACHE.lock().as_mut() {
         cache.retain(|(namespace, _), _| *namespace != net_ns_id);

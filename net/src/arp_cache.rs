@@ -476,6 +476,15 @@ pub fn entry_state(iface_name: &str, ip: [u8; 4]) -> Option<ArpState> {
     None
 }
 
+/// Remove `ip` from `iface_name`'s table (`neigh_delete` → `neigh_remove_one`).
+/// Returns whether an entry was there.
+pub fn remove(iface_name: &str, ip: [u8; 4]) -> bool {
+    let mut g = CACHES.lock();
+    g.iter_mut()
+        .find(|c| c.name == iface_name)
+        .is_some_and(|c| c.entries.remove(&ip).is_some())
+}
+
 /// Directly read an entry (for tests that inspect state without side-effects).
 pub fn get_entry(iface_name: &str, ip: [u8; 4]) -> Option<ArpEntry> {
     let g = CACHES.lock();
@@ -657,6 +666,8 @@ pub struct ArpSnapshot {
     /// Linux flag bits from `arp_seq_show`. 0=Incomplete, 2=Complete,
     /// 4=Permanent, 6=Pub.
     pub flags: u8,
+    /// The entry's neighbour state, for rtnetlink's `ndm_state`.
+    pub state: ArpState,
 }
 
 /// Snapshot every entry across all per-iface caches.
@@ -689,6 +700,7 @@ pub fn snapshot_in(net_ns_id: u64) -> Vec<ArpSnapshot> {
                 mac: e.mac,
                 iface: cache.name.clone(),
                 flags,
+                state: e.state,
             });
         }
     }

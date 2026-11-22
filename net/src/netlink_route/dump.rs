@@ -1470,20 +1470,31 @@ fn dump_neigh(d: &mut Dump<'_>) -> Result<(), i32> {
     let family = d.family;
     let links = core::mem::take(&mut d.links);
     if family == 0 || family == AF_INET {
-        for (iface, entry) in crate::arp::snapshot() {
-            let Some(link) = links.iter().find(|link| link.name == iface) else {
+        // `neigh_dump_table` over `arp_tbl`: the table resolution uses, the
+        // one `/proc/net/arp` lists. `neigh_fill_info` carries NDA_LLADDR
+        // only for a NUD_VALID entry.
+        for entry in crate::arp_cache::snapshot_in(d.net_ns_id) {
+            let Some(link) = links.iter().find(|link| link.name == entry.iface) else {
                 continue;
             };
             if !keep(link.ifindex) {
                 continue;
             }
+            use crate::arp_cache::ArpState;
+            let (state, valid) = match entry.state {
+                ArpState::Incomplete => (NUD_INCOMPLETE, false),
+                ArpState::Reachable => (NUD_REACHABLE, true),
+                ArpState::Stale => (NUD_STALE, true),
+                ArpState::Probe => (NUD_PROBE, true),
+                ArpState::Failed => (super::NUD_FAILED, false),
+            };
             let message = build_newneigh(
                 &NeighInfo {
                     family: AF_INET,
                     dst: &entry.ip,
-                    mac: Some(entry.mac),
+                    mac: valid.then_some(entry.mac),
                     ifindex: link.ifindex,
-                    state: NUD_REACHABLE,
+                    state,
                     flags: 0,
                 },
                 d.seq,

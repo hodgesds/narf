@@ -658,7 +658,12 @@ the kernel's metric-0 prefix route (`fib_add_ifaddr`, via
 address removes only the kernel's own prefix route (metric 0,
 RTPROT_KERNEL), never another owner's route to the prefix
 (`fib_del_ifaddr`). `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
-IPv6 NDP state through the same interface-bound authority.
+IPv6 NDP state through the same interface-bound authority. IPv4 neighbours
+live in `arp_cache`, the table resolution uses: the RTM_GETNEIGH dump lists
+it with each entry's NUD state (NDA_LLADDR only for a valid entry,
+`neigh_fill_info`), as `/proc/net/arp` does, and RTM_NEWNEIGH /
+RTM_DELNEIGH write it (`arp_cache::insert` / `arp_cache::remove`), with the
+namespace's next-hop cache, releasing frames queued on the neighbour.
 The stack-daemon launcher performs delegation as a kernel-held transfer from a
 successful `StackAttachReply` to a route socket in the attaching task's fd
 table. The Linux syscall surface never accepts raw admin-handle bytes.
