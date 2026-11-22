@@ -982,6 +982,25 @@ struct Shared<I: Io> {
     engine: Mutex<Engine<I>>,
 }
 impl<I: Io> Shared<I> {
+    /// `navi10_ih_hw_fini` for an s0ix suspend (`Ih::suspend`): the ring
+    /// disabled as `Engine::disable` does, the hub left open with every
+    /// subscription.
+    async fn suspend_ring(&self) -> Result<(), Error> {
+        self.engine.lock().await.disable()
+    }
+    /// `navi10_ih_hw_init` after `suspend_ring` (`Ih::resume`): the engine
+    /// back to Prepared with its read pointer at 0, so programming it again
+    /// restarts the same ring. The hub and its subscriptions are kept.
+    async fn resume_ring(&self) -> Result<(), Error> {
+        let mut engine = self.engine.lock().await;
+        if engine.state != State::Disabled {
+            return Err(Error::Busy);
+        }
+        engine.state = State::Prepared;
+        engine.rptr = 0;
+        engine.inherited = false;
+        Ok(())
+    }
     /// The engine back to Prepared with its read pointer at 0, and the hub
     /// reopened with no subscriber (`Ih::rearm`).
     async fn rearm(&self) {
@@ -1376,6 +1395,8 @@ pub struct Ih {
     _dummy: core::mem::ManuallyDrop<narf_io::DmaBuffer>,
     route: Route,
     state: State,
+    /// Disabled by `suspend`, hub open: `resume` restarts the ring.
+    suspended: bool,
     proof: Option<Result<Proof, Error>>,
 }
 impl core::fmt::Debug for Ih {
@@ -1466,6 +1487,7 @@ impl Ih {
             _dummy: core::mem::ManuallyDrop::new(dummy),
             route: Route::None,
             state: State::Prepared,
+            suspended: false,
             proof: None,
         })
     }
@@ -1645,6 +1667,36 @@ impl Ih {
         self.state = State::Prepared;
         self.proof = None;
         Ok(())
+    }
+    /// `navi10_ih_hw_fini` for an s0ix suspend: the ring disabled (and the
+    /// 1 ms wait) as `disable` does, but the hub stays open with every
+    /// subscription and the vector stays routed, so `resume` restarts the
+    /// same ring for the same waiters. Nothing is delivered in between.
+    ///
+    /// # Safety
+    /// Same ownership as `new`; nothing depends on IH delivery until
+    /// `resume`.
+    pub async unsafe fn suspend(&mut self) -> Result<(), Error> {
+        self.shared.suspend_ring().await?;
+        delay(1000).await;
+        self.state = State::Disabled;
+        self.suspended = true;
+        Ok(())
+    }
+    /// `navi10_ih_hw_init` after `suspend`: the same ring programmed from
+    /// its start on the same route, the subscriptions intact.
+    ///
+    /// # Safety
+    /// Same ownership as `new`.
+    pub async unsafe fn resume(&mut self) -> Result<Delivery, Error> {
+        if !self.suspended {
+            return Err(Error::Busy);
+        }
+        self.shared.resume_ring().await?;
+        self.suspended = false;
+        self.state = State::Prepared;
+        // SAFETY: forwarded; `initialize` reprograms the route it took before.
+        unsafe { self.initialize() }.await
     }
     /// Bounded navi10_ih_irq_disable; every waiter receives `Disabled`.
     /// The ring stays quarantined and the vector stays reserved.

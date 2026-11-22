@@ -1066,3 +1066,43 @@ kernel_test_in!(
     "drivers/gpu/ih-navi22",
     ih_navi22_rearm_reprograms_the_same_ring
 );
+
+/// An s0ix suspend and resume (`navi10_ih_hw_fini`, `navi10_ih_hw_init`)
+/// keep the hub open: a subscription made before the suspend sees nothing
+/// while the ring is down, and receives the first event after the same
+/// ring is programmed again from rptr 0. A resume without a suspend, or a
+/// second suspend, is refused.
+fn ih_navi22_s0ix_cycle_keeps_its_subscribers() -> TestResult {
+    let (pool, shared, handle) = fixture();
+    let mut eop = handle.subscribe(source::GFX_EOP).unwrap();
+    enable(&shared, true).unwrap();
+    let (ring, free) = (with(&shared, |e| e.memory.address()), pool.available());
+    if run(shared.resume_ring()) != Err(Error::Busy) || run(shared.suspend_ring()).is_err() {
+        return TestResult::Fail("resume before suspend, or the suspend");
+    }
+    if run(shared.suspend_ring()) != Err(Error::Busy)
+        || with(&shared, |e| e.state != State::Disabled)
+        || eop.try_next() != Ok(None)
+    {
+        return TestResult::Fail("a second suspend, or the subscription ended");
+    }
+    if run(shared.resume_ring()).is_err()
+        || with(&shared, |e| e.state != State::Prepared || e.rptr != 0)
+        || enable(&shared, true).is_err()
+        || with(&shared, |e| {
+            e.state != State::Enabled || e.memory.address() != ring
+        })
+        || pool.available() != free
+    {
+        return TestResult::Fail("the resumed ring not programmed in place");
+    }
+    with(&shared, |e| e.io.push(iv(source::GFX_EOP, 0, 7)));
+    if handle.drain() != Ok(1) || eop.try_next().unwrap().map(|i| i.src_data[0]) != Some(7) {
+        return TestResult::Fail("the old subscription missed the first event after resume");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/ih-navi22",
+    ih_navi22_s0ix_cycle_keeps_its_subscribers
+);
