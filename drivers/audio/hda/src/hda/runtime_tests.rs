@@ -3340,9 +3340,7 @@ fn native_hda_pm_open_wakes_a_parked_controller() -> TestResult {
                 "reopen of a parked controller must succeed"
             });
         };
-        if dev.suspended.load(Ordering::Acquire)
-            || !fixture.model.verbs[base..].contains(&sense)
-        {
+        if dev.suspended.load(Ordering::Acquire) || !fixture.model.verbs[base..].contains(&sense) {
             return TestResult::Fail("open wakes the controller before it senses the HDMI pin");
         }
         if playback
@@ -3480,7 +3478,7 @@ fn native_hda_cmd_recover_after_lost_response() -> TestResult {
         return TestResult::Fail("a lost response must not leave the command transport dead");
     }
     if first != Ok(0x10ec0287) {
-        return TestResult::Fail("the command whose response was lost is retried on restarted rings");
+        return TestResult::Fail("the command whose response was lost is retried on fresh rings");
     }
     if dev.irq.failed.load(Ordering::Acquire) {
         return TestResult::Fail("a recovered transport stays poisoned");
