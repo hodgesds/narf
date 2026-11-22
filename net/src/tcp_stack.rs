@@ -872,6 +872,12 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str, csum_verified: bool)
     {
         let decided = ctx.packet();
         if let Some((ip, _)) = parse_ipv4(decided) {
+            // `ip_route_input_slow` → `fib_validate_source`, for local
+            // delivery and forwarding alike.
+            if !reverse_path_ok(net_ns_id, iface_in, ip.src_ip) {
+                RP_FILTER_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             if !crate::ip_local::deliver_locally_in(net_ns_id, ip.dst_ip)
                 && !is_dhcp_client_datagram(decided)
             {
@@ -916,6 +922,31 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str, csum_verified: bool)
         return;
     }
     local_deliver_finish(net_ns_id, iface_in, ctx.packet(), csum_verified);
+}
+
+/// Packets dropped by reverse-path filtering (Linux `LINUX_MIB_IPRPFILTER`,
+/// `IPReversePathFilter`).
+pub static RP_FILTER_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `fib_validate_source` for a packet from `src` that arrived on
+/// `iface_in`. With the device's `rp_filter` mode at 0 every source passes.
+/// Strict (1): the best route back to `src` must leave through `iface_in`.
+/// Loose (2 and above, `rpf == 1` being the only strict test): a route
+/// back must exist. Loopback and the unspecified source (DHCP, which
+/// `ip_route_input_slow` sends to `brd_input` unvalidated) are not checked.
+fn reverse_path_ok(net_ns_id: u64, iface_in: &str, src: [u8; 4]) -> bool {
+    if iface_in.is_empty() || iface_in == "lo" || src == [0; 4] {
+        return true;
+    }
+    let mode = narf_lib::sysctl::ipv4::rp_filter_mode(iface_in);
+    if mode == 0 {
+        return true;
+    }
+    match crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(src)) {
+        // `last_resort`: no route back fails both modes.
+        None => false,
+        Some(route) => mode != 1 || route.iface == iface_in,
+    }
 }
 
 /// `ip_local_deliver_finish`: hand a whole, LOCAL_IN-accepted datagram to

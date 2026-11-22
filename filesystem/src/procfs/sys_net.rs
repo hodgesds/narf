@@ -23,6 +23,7 @@
 //! | `ip_forward`                   | `net::ip_forward::try_forward`         |
 //! | `conf/<dev>/forwarding`        | ditto, per ingress interface           |
 //! | `conf/<dev>/send_redirects`    | `net::ip_forward` redirect generation  |
+//! | `conf/{all,<dev>}/rp_filter`   | `net::tcp_stack` `reverse_path_ok`     |
 //! | `ip_default_ttl`               | `net::pkt::write_ipv4_header`          |
 //! | `icmp_echo_ignore_all`         | `net::icmp_sock::handle_echo_request`  |
 //! | `icmp_echo_ignore_broadcasts`  | ditto                                  |
@@ -386,6 +387,20 @@ pub fn register_all() {
         path: "net/ipv4/conf/default/send_redirects",
         read: || read_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT),
         write: Some(|s| write_uint_atomic(&narf_lib::sysctl::ipv4::SEND_REDIRECTS_DEFAULT, s)),
+        perms: 0o644,
+    });
+    // `devinet_conf_proc` is `proc_dointvec`: any int is stored, and every
+    // value but 0 and 1 filters loosely (`rpf == 1` is the strict test).
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/conf/all/rp_filter",
+        read: || read_atomic(&narf_lib::sysctl::ipv4::RP_FILTER_ALL),
+        write: Some(|s| write_uint_atomic(&narf_lib::sysctl::ipv4::RP_FILTER_ALL, s)),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/conf/default/rp_filter",
+        read: || read_atomic(&narf_lib::sysctl::ipv4::RP_FILTER_DEFAULT),
+        write: Some(|s| write_uint_atomic(&narf_lib::sysctl::ipv4::RP_FILTER_DEFAULT, s)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
@@ -1038,6 +1053,7 @@ kernel_test_in!("filesystem/procfs/sys_net", smoke_unix_max_dgram_qlen_rw);
 enum DevKey {
     Forwarding,
     SendRedirects,
+    RpFilter,
 }
 
 impl DevKey {
@@ -1045,6 +1061,7 @@ impl DevKey {
         match self {
             DevKey::Forwarding => "forwarding",
             DevKey::SendRedirects => "send_redirects",
+            DevKey::RpFilter => "rp_filter",
         }
     }
 
@@ -1052,13 +1069,17 @@ impl DevKey {
         match self {
             DevKey::Forwarding => narf_lib::sysctl::ipv4::device_forwarding_value(iface),
             DevKey::SendRedirects => narf_lib::sysctl::ipv4::device_send_redirects_value(iface),
+            DevKey::RpFilter => narf_lib::sysctl::ipv4::device_rp_filter_value(iface),
         }
     }
 
-    fn set(self, iface: &str, on: bool) {
+    fn set(self, iface: &str, v: u32) {
         match self {
-            DevKey::Forwarding => narf_lib::sysctl::ipv4::set_device_forwarding(iface, on),
-            DevKey::SendRedirects => narf_lib::sysctl::ipv4::set_device_send_redirects(iface, on),
+            DevKey::Forwarding => narf_lib::sysctl::ipv4::set_device_forwarding(iface, v != 0),
+            DevKey::SendRedirects => {
+                narf_lib::sysctl::ipv4::set_device_send_redirects(iface, v != 0)
+            }
+            DevKey::RpFilter => narf_lib::sysctl::ipv4::set_device_rp_filter(iface, v),
         }
     }
 }
@@ -1086,7 +1107,7 @@ impl super::ProcFile for DevConfFile {
         if v > i32::MAX as u32 {
             return Err(FsError::InvalidData);
         }
-        self.key.set(&self.iface, v != 0);
+        self.key.set(&self.iface, v);
         Ok(buf.len())
     }
 }
@@ -1100,7 +1121,7 @@ fn dev_conf_path(iface: &str, key: DevKey) -> alloc::string::String {
 /// settings from the matching `conf.default` keys.
 pub fn register_dev_conf(iface: &str) {
     narf_lib::sysctl::ipv4::init_device_conf(iface);
-    for key in [DevKey::Forwarding, DevKey::SendRedirects] {
+    for key in [DevKey::Forwarding, DevKey::SendRedirects, DevKey::RpFilter] {
         super::register_proc(
             &dev_conf_path(iface, key),
             alloc::sync::Arc::new(DevConfFile {

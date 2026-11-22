@@ -58,6 +58,29 @@ pub mod ipv4 {
     /// `net.ipv4.conf.default.rp_filter`, seeding new devices.
     pub static RP_FILTER_DEFAULT: AtomicU32 = AtomicU32::new(0);
 
+    /// Devices whose own `rp_filter` is not 0, kept under `DEV_CONF`'s lock
+    /// so the receive path skips the per-device lookup while every value is
+    /// 0 (the Linux default).
+    static RP_FILTER_DEVICES: AtomicU32 = AtomicU32::new(0);
+
+    fn count_rp_filter_devices(g: &[DevConf]) {
+        let n = g.iter().filter(|d| d.rp_filter != 0).count() as u32;
+        RP_FILTER_DEVICES.store(n, Ordering::Release);
+    }
+
+    /// `IN_DEV_RPFILTER(in_dev)` for `iface`: the larger of `conf.all` and
+    /// the device's own `rp_filter` (`IN_DEV_MAXCONF`). 0 means no
+    /// reverse-path check.
+    pub fn rp_filter_mode(iface: &str) -> u32 {
+        let all = RP_FILTER_ALL.load(Ordering::Relaxed);
+        if RP_FILTER_DEVICES.load(Ordering::Acquire) == 0
+            && RP_FILTER_DEFAULT.load(Ordering::Relaxed) == 0
+        {
+            return all;
+        }
+        all.max(device_rp_filter_value(iface))
+    }
+
     /// One interface's `net.ipv4.conf.<dev>.*` values.
     #[derive(Clone, Debug)]
     struct DevConf {
@@ -280,6 +303,7 @@ pub mod ipv4 {
             send_redirects: SEND_REDIRECTS_DEFAULT.load(Ordering::Relaxed),
             rp_filter: RP_FILTER_DEFAULT.load(Ordering::Relaxed),
         });
+        count_rp_filter_devices(&g);
     }
 
     /// The raw per-interface `rp_filter` value — what procfs prints.
@@ -303,11 +327,14 @@ pub mod ipv4 {
                 rp_filter: v,
             }),
         }
+        count_rp_filter_devices(&g);
     }
 
     /// Drop an interface's settings when it goes away.
     pub fn forget_device_conf(iface: &str) {
-        DEV_CONF.lock().retain(|d| d.name != iface);
+        let mut g = DEV_CONF.lock();
+        g.retain(|d| d.name != iface);
+        count_rp_filter_devices(&g);
     }
 
     /// True iff echo requests must be ignored outright.
@@ -340,6 +367,7 @@ pub mod ipv4 {
         RP_FILTER_ALL.store(0, Ordering::Relaxed);
         RP_FILTER_DEFAULT.store(0, Ordering::Relaxed);
         DEV_CONF.lock().clear();
+        RP_FILTER_DEVICES.store(0, Ordering::Release);
         ICMP_ECHO_IGNORE_ALL.store(0, Ordering::Relaxed);
         ICMP_ECHO_IGNORE_BROADCASTS.store(1, Ordering::Relaxed);
     }
