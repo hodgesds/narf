@@ -933,15 +933,20 @@ fn smoke_ntp_apply_sample_small_offset_slews_via_tick() -> TestResult {
     }
 
     // One second's drain: chunk = time_offset >> (SHIFT_PLL + constant) =
-    // 50 ms >> 4 (boot constant 2) = 3_125_000 ns, folded into the wall.
-    // The range admits a second chunk if a live tick boundary crossed
-    // mid-test and the `on_tick` hook ran `tick_second` concurrently (the
-    // hook fires once per wall second from IRQ context); the readback
-    // range admits the same one-or-two-chunks outcomes (46_875, 43_945).
+    // 50 ms >> 4 (boot constant 2) = 3_125_000 ns, which `second_overflow()`
+    // adds to the coming second's tick length: the steered clock runs
+    // 3.125 ms/s fast and the wall offset (a step) stays put. A live tick
+    // crossing a second boundary mid-test (the `on_tick` hook runs
+    // `tick_second` from IRQ context) may already have applied the next
+    // chunk, 2.93 ms/s; the readback range admits the same one-or-two-chunks
+    // outcomes (46_875, 43_945).
     tick_second();
-    let moved = wall::wall_offset_ns();
-    if !(3_125_000..=6_200_000).contains(&moved) {
-        return TestResult::Fail("tick_second did not slew one exponential chunk");
+    if wall::wall_offset_ns() != 0 {
+        return TestResult::Fail("tick_second stepped the wall clock for a slew");
+    }
+    let rate_ns_per_s = crate::steer::rate() >> 32;
+    if !(2_900_000..=3_125_000).contains(&rate_ns_per_s) {
+        return TestResult::Fail("tick_second did not slew one exponential chunk per second");
     }
     let mut tx = Timex::default();
     let _ = adjtimex(&mut tx, NOW_SEC, 0);
@@ -1029,16 +1034,15 @@ fn smoke_ntp_tick_second_drains_small_phase_to_zero() -> TestResult {
     wall::__test_reset();
     const NOW_SEC: i64 = 1_700_000_000;
 
-    // +1 µs: the exponential chunk rounds to zero within a few seconds,
-    // and then the whole remainder is delivered (Linux `second_overflow()`
-    // convergence rule) — the phase must reach exactly zero, not stall.
+    // +1 µs: the exponential drain (Linux `second_overflow()`) takes the
+    // phase below a nanosecond, and the rate it adds back to zero.
     match apply_sample(1_000, 1_000_000, 1_000_000, 2, NOW_SEC) {
         crate::ntp::DisciplineOutcome::Slewed(1_000) => {}
         _ => return TestResult::Fail("a 1 µs sample should slew"),
     }
     // The drain is exponential (1/16 of the remainder per second at the
     // boot constant), so a 1 µs phase needs ~340 seconds to reach the
-    // sub-16-unit remainder the convergence rule delivers whole.
+    // sub-16-unit remainder whose chunk is zero.
     for _ in 0..500 {
         tick_second();
     }
@@ -1047,10 +1051,9 @@ fn smoke_ntp_tick_second_drains_small_phase_to_zero() -> TestResult {
     if tx.offset != 0 {
         return TestResult::Fail("a 1 µs phase did not converge to zero");
     }
-    // The wall moved by the whole microsecond, up to per-tick ns truncation.
-    let moved = wall::wall_offset_ns();
-    if !(900..=1_000).contains(&moved) {
-        return TestResult::Fail("a 1 µs phase did not slew into the wall clock");
+    // The slew went through the rate, not the wall offset, and is over.
+    if wall::wall_offset_ns() != 0 || crate::steer::rate() != 0 {
+        return TestResult::Fail("a converged 1 µs slew must leave no step and no rate");
     }
 
     ntp::__test_reset();

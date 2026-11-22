@@ -307,8 +307,8 @@ pub fn primary() -> Option<&'static dyn ClockEvent> {
 ///
 /// Once per wall second it also runs the NTP discipline tick
 /// ([`crate::ntp::tick_second`]): the per-second half of Linux's
-/// `second_overflow()`, which drains the adjtimex phase into the wall
-/// clock. The second boundary is detected off the monotonic clock, not a
+/// `second_overflow()`, which sets the steered clocks' rate for the coming
+/// second (one call per second that passed). The second boundary is detected off the monotonic clock, not a
 /// tick count, so the hook stays correct whatever rate the backend was
 /// armed at (boot arms 1000 Hz, but that is boot config, not a contract
 /// this module may assume). The `swap` claims each new second exactly
@@ -329,8 +329,19 @@ pub fn on_tick() {
     // plus atomics. Before any sample was applied the boot state has
     // `time_offset == 0`, so this is a maxerror bump and nothing else.
     let secs = crate::monotonic_ns() / NSEC_PER_SEC;
-    if LAST_NTP_SECOND.swap(secs, Ordering::AcqRel) != secs {
-        crate::ntp::tick_second();
+    let last = LAST_NTP_SECOND.swap(secs, Ordering::AcqRel);
+    if last != secs {
+        // One `second_overflow()` per second that passed, as Linux's
+        // `accumulate_nsecs_to_secs` runs it after a tickless stretch;
+        // bounded so a long idle cannot hold the interrupt.
+        let passed = if last == 0 || secs < last {
+            1
+        } else {
+            (secs - last).min(64)
+        };
+        for _ in 0..passed {
+            crate::ntp::tick_second();
+        }
     }
     // Broadcast to CPUs in BROADCAST_MASK if a sender's installed.
     // No-op until SMP wires `set_broadcast_sender` + per-CPU

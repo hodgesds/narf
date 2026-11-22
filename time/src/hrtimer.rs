@@ -512,13 +512,20 @@ pub fn set_tai_offset_ns(off: u64) {
     clock_was_set();
 }
 
-/// `base->offset`: base clock minus monotonic, in ns.
+/// `base->offset`: base clock minus monotonic, in ns. MONOTONIC is the
+/// kernel's counter clock; REALTIME, BOOTTIME and TAI are the NTP-steered
+/// clock (`crate::steer`) plus their offsets, so their offset carries the
+/// steered clock's lead over the counter clock — which moves with the rate,
+/// and is why expiry re-checks each base against its own clock.
 #[inline]
 fn base_offset(index: usize) -> i64 {
+    let steered = crate::steer::offset_ns;
     match index % HRTIMER_BASE_SOFT {
-        1 => crate::wall_offset_ns(),
-        2 => crate::boot_offset_ns() as i64,
-        3 => crate::wall_offset_ns().saturating_add(TAI_OFFSET_NS.load(Ordering::Relaxed) as i64),
+        1 => steered().saturating_add(crate::wall_offset_ns()),
+        2 => steered().saturating_add(crate::boot_offset_ns() as i64),
+        3 => steered()
+            .saturating_add(crate::wall_offset_ns())
+            .saturating_add(TAI_OFFSET_NS.load(Ordering::Relaxed) as i64),
         _ => 0,
     }
 }

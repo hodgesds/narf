@@ -379,23 +379,47 @@ daemon clears the bit. `userspace/`'s `adjtimex` / `clock_adjtime` handlers
 own the user-struct copy, the `CAP_SYS_TIME` gate and the `ADJ_SETOFFSET`
 step into the wall offset; everything else is state kept here.
 
-The discipline loop exists now (issue #1764): `ADJ_OFFSET` runs the full
-Linux `ntp_update_offset()` (PLL + FLL frequency learning against
-`time_reftime`), and `tick_second()` — driven once per wall second from
-the clockevent tick — drains `time_offset` exponentially into the wall
-offset, which is where phase lands on NARF (there is no timekeeper
-multiplier to steer). The slew is therefore applied at 1 Hz granularity:
-each second's jump is at most `MAXPHASE >> (SHIFT_PLL + time_constant)`.
-What is still missing, see the `narf_time::ntp` module docs: the leap
-state machine on this path (that is §3.5's smear), the `ADJ_ADJTIME`
-single-shot drain, and PPS. Nor does `time_freq` reach any clock: Linux
-steers CLOCK_REALTIME, CLOCK_MONOTONIC and CLOCK_BOOTTIME by it
-(`ntp_tick_length` → `timekeeping_adjust` scales the timekeeper's `mult`;
-CLOCK_MONOTONIC_RAW and the printk clock stay unsteered), while NARF only
-stores and reports it, so a daemon's frequency correction changes nothing
-and CLOCK_REALTIME is held by phase slews and steps alone (on the
-2026-11-21 native boot timesyncd sat at its +500 ppm limit, polling every
-32 s, while REALTIME and MONOTONIC advanced at the same rate).
+The discipline loop steers the clocks programs read, as Linux's
+`ntp_tick_length()` → `timekeeping_adjust()` does (`narf_time::steer`):
+
+```rust
+pub mod steer {
+    pub struct Params { pub cycle_last: u64, pub base_ns: u64, pub mult: u32, pub shift: u32 }
+    impl Params { pub fn ns_at(&self, cyc: u64) -> u64; } // base_ns + ((cyc - cycle_last) * mult) >> shift
+    pub fn params() -> Params;          // seqlock snapshot (the vDSO publishes it)
+    pub fn monotonic_ns() -> u64;       // CLOCK_MONOTONIC as userspace reads it
+    pub fn offset_ns() -> i64;          // steered minus counter clock, now
+    pub fn rate() -> i64;               // ns/s << 32 the steered clock runs fast (+) of the counter
+    pub fn set_rate(rate: i64);         // re-anchor at now, clamp ±11% (clocksource maxadj)
+    pub fn set_vsyscall_notifier(f: fn()); // update_vsyscall
+}
+```
+
+The steered clock is the counter (`now_cycles`) scaled by a multiplier the
+NTP state sets; the rate is the tick length minus one second:
+`tick_usec · USER_HZ` µs − 1 s, plus `time_freq` (clamped to ±500 ppm,
+`MAXFREQ_SCALED`), plus the share `second_overflow()` added for this
+second — one `ntp_offset_chunk()` of `time_offset` and up to `MAX_TICKADJ`
+(500 µs) of an `adjtime(3)` offset. `adjtimex` changing the tick, the
+frequency or the phase applies the new rate at once (`ntp_update_frequency`),
+`apply_sample` does when the PLL learned a frequency, and `tick_second()`
+recomputes it once per second; the clockevent tick runs `tick_second()` once
+for every second that passed (at most 64 per tick). Every re-anchor keeps
+the clock continuous and runs the vsyscall notifier. `now_wall()`
+(CLOCK_REALTIME) is the steered clock plus the wall offset, which only steps
+(`ADJ_SETOFFSET`, `clock_settime`, an SNTP sample over the step threshold)
+move. Before the first rate the steered clock is the counter clock, and a
+change of the counter's scale (`set_clock_hz`) or `ntp::__test_reset`
+returns it there.
+
+The kernel's own timeline is not steered: `monotonic_ns()`, `now_cycles()`,
+every `Instant` / `Deadline`, the hrtimer MONOTONIC base and the kernel log's
+timestamps keep the counter's rate, as Linux's `sched_clock` / `local_clock`
+and its printk timestamps do. A slew is therefore never seen by a hardware
+delay or a kernel timeout.
+
+Still missing, see the `narf_time::ntp` module docs: the leap state machine
+on this path (that is §3.5's smear), and PPS.
 
 ## 4. Invariants & safety properties
 

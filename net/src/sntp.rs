@@ -1201,19 +1201,24 @@ mod tests {
             e2e_teardown();
             return TestResult::Fail("no NTP request frame reached UDP/123");
         }
-        // One discipline second: 1/16 of ~50 ms ≈ 3.1 ms into the wall.
-        // The floor is 2.4 ms, not 2.9 ms: the slew folds 1/16 of the
-        // measured offset, which reads low by RTT/2 under TCG, so one
-        // chunk of a ~40-50 ms offset is 2.5-3.1 ms. The range admits
-        // a second chunk if a live tick boundary crossed mid-test and
-        // the `on_tick` hook ran `tick_second` concurrently (the hook
-        // fires once per wall second from IRQ context).
+        // One discipline second: 1/16 of ~50 ms ≈ 3.1 ms joins the coming
+        // second's tick length, so the steered clocks run ~3.1 ms/s fast and
+        // the wall offset (a step) does not move. The floor is 2.3 ms/s, not
+        // 2.9: the slew takes 1/16 of the measured offset, which reads low
+        // by RTT/2 under TCG, so one chunk of a ~40-50 ms offset is
+        // 2.5-3.1 ms, and a live tick crossing a second boundary mid-test
+        // (the `on_tick` hook runs `tick_second` from IRQ context) may
+        // already have applied the next, 15/16 of that.
         let before = narf_time::wall_offset_ns();
         narf_time::ntp::tick_second();
-        let moved = narf_time::wall_offset_ns() - before;
+        let stepped = narf_time::wall_offset_ns() - before;
+        let rate_ns_per_s = narf_time::steer::rate() >> 32;
         e2e_teardown();
-        if !(2_400_000..=6_400_000).contains(&moved) {
-            return TestResult::Fail("one discipline second should slew ~3.1 ms");
+        if stepped != 0 {
+            return TestResult::Fail("a discipline second must slew, not step the wall");
+        }
+        if !(2_300_000..=3_200_000).contains(&rate_ns_per_s) {
+            return TestResult::Fail("one discipline second should slew ~3.1 ms/s");
         }
         TestResult::Pass
     }

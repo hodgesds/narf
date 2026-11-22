@@ -20,6 +20,7 @@ pub mod hrtimer;
 pub mod ntp;
 pub mod phc;
 pub mod rtc;
+pub mod steer;
 pub mod timer;
 pub mod timer_migration;
 pub mod timerqueue;
