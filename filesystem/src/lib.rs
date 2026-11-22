@@ -107,6 +107,7 @@ pub mod procfs;
 pub mod root_bootlog;
 pub mod root_mount;
 pub mod root_selector;
+pub mod super_magic;
 pub mod sync_all;
 pub mod sysfs;
 pub mod uevent;
@@ -3023,6 +3024,16 @@ pub trait FsInstance: Send + Sync + 'static {
         String::from("/")
     }
 
+    /// The superblock magic `statfs(2)` reports as `f_type`: Linux's
+    /// `sb->s_magic`, which every filesystem's `->statfs` copies into
+    /// `buf->f_type`. The default derives it from [`Self::name`], the type
+    /// name `/proc/mounts` prints ([`super_magic::for_fs_type`]). A
+    /// filesystem whose magic depends on the volume (minix), or that is
+    /// another filesystem's superblock seen through a bind, answers itself.
+    fn magic(&self) -> u64 {
+        super_magic::for_fs_type(self.name())
+    }
+
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
     /// conservative default used before this interface existed.
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
@@ -5577,6 +5588,14 @@ impl FsInstance for BindMount {
     fn backing_identity(&self) -> usize {
         self.backing_identity
     }
+    /// A bind is the source's superblock: `statfs_by_dentry` reaches the
+    /// same `->statfs` through either path.
+    fn magic(&self) -> u64 {
+        self.source.magic()
+    }
+    fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
+        self.source.statfs()
+    }
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
         self.source.reconfigure(options)
     }
@@ -5620,6 +5639,9 @@ impl DirOps for EmptyDir {
 struct FileMount {
     file: Arc<dyn FileOps>,
     fs_name: String,
+    /// The filesystem the bound file lives on, whose superblock `statfs`
+    /// through this mount reports.
+    source: Arc<dyn FsInstance>,
     // A file bind is another mount attachment to the *source* inode, not a
     // new filesystem.  Preserve that identity for inode-aware VFS users such
     // as pathname AF_UNIX, which must recognise the source and target as the
@@ -5651,6 +5673,12 @@ impl FsInstance for FileMount {
     }
     fn root_file(&self) -> Option<Arc<dyn FileOps>> {
         Some(self.file.clone())
+    }
+    fn magic(&self) -> u64 {
+        self.source.magic()
+    }
+    fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
+        self.source.statfs()
     }
     fn show_devname(&self) -> Option<String> {
         self.devname.clone()
@@ -5730,6 +5758,7 @@ fn build_bind_fs(
             return Ok(Arc::new(FileMount {
                 file: node,
                 fs_name,
+                source: source_fs.clone(),
                 backing_identity: source_fs.backing_identity(),
                 devname: source_fs.show_devname(),
                 root_path,

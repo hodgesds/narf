@@ -4374,21 +4374,57 @@ struct StatfsBuf {
     f_fsid: u64,    // fs id (two int32; unused → 0)
     f_namelen: u64, // max filename length
     f_frsize: u64,  // fragment size
-    f_flags: u64,   // mount flags (unused)
+    f_flags: u64,   // ST_* mount flags
     f_spare0: u64,
     f_spare1: u64,
     f_spare2: u64,
     f_spare3: u64,
 }
 
-// Linux super-magics (include/uapi/linux/magic.h) userspace probes for.
-const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
-const SYSFS_MAGIC: u64 = 0x6265_6572;
-const PROC_SUPER_MAGIC: u64 = 0x9fa0;
-const MQUEUE_MAGIC: u64 = 0x1980_0202;
-const TMPFS_MAGIC: u64 = 0x0102_1994;
-const RAMFS_MAGIC: u64 = 0x8584_58f6;
-const EXT2_SUPER_MAGIC: u64 = 0xEF53;
+/// `fs/statfs.c::calculate_f_flags`: `ST_VALID`, the `ST_*` twin of each
+/// `MNT_*` restriction and atime mode the mount carries (`flags_by_mnt`), and
+/// the superblock's synchronous, mandatory-lock and read-only state
+/// (`flags_by_sb`). `mnt` is the mount's effective `MNT_*` set, `sb` its
+/// superblock's `SB_*` set.
+fn statfs_f_flags(mnt: u64, sb: u64) -> u64 {
+    use narf_filesystem::{mnt_flags, sb_flags};
+    const ST_RDONLY: u64 = 0x0001;
+    const ST_NOSUID: u64 = 0x0002;
+    const ST_NODEV: u64 = 0x0004;
+    const ST_NOEXEC: u64 = 0x0008;
+    const ST_SYNCHRONOUS: u64 = 0x0010;
+    const ST_VALID: u64 = 0x0020;
+    const ST_MANDLOCK: u64 = 0x0040;
+    const ST_NOATIME: u64 = 0x0400;
+    const ST_NODIRATIME: u64 = 0x0800;
+    const ST_RELATIME: u64 = 0x1000;
+    const ST_NOSYMFOLLOW: u64 = 0x2000;
+    let mut flags = ST_VALID;
+    for (mnt_bit, st) in [
+        (mnt_flags::READONLY, ST_RDONLY),
+        (mnt_flags::NOSUID, ST_NOSUID),
+        (mnt_flags::NODEV, ST_NODEV),
+        (mnt_flags::NOEXEC, ST_NOEXEC),
+        (mnt_flags::NOATIME, ST_NOATIME),
+        (mnt_flags::NODIRATIME, ST_NODIRATIME),
+        (mnt_flags::RELATIME, ST_RELATIME),
+        (mnt_flags::NOSYMFOLLOW, ST_NOSYMFOLLOW),
+    ] {
+        if mnt & mnt_bit != 0 {
+            flags |= st;
+        }
+    }
+    for (sb_bit, st) in [
+        (sb_flags::SYNCHRONOUS, ST_SYNCHRONOUS),
+        (sb_flags::MANDLOCK, ST_MANDLOCK),
+        (sb_flags::RDONLY, ST_RDONLY),
+    ] {
+        if sb & sb_bit != 0 {
+            flags |= st;
+        }
+    }
+    flags
+}
 
 /// Errors are POSITIVE errnos. The destination is only touched after the
 /// filesystem answered — `user_statfs`/`fd_statfs` run `vfs_statfs` first and
@@ -4400,36 +4436,41 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> Result<(), i64> {
     // the backing mount, otherwise a chrooted PID 1's /run resolves against
     // NARF's host root rather than /mnt/run.
     let path = resolve_cwd_path(current_task_id(), path);
-    // Map the filesystem covering `path` to its Linux super-magic so callers
-    // detect the fs type (elogind → CGROUP2_SUPER_MAGIC at /sys/fs/cgroup).
+    // `statfs_by_dentry`: the superblock behind `path` answers. Its
+    // `->statfs` reports `sb->s_magic` as `f_type` — `FsInstance::magic`,
+    // which callers detect the filesystem by (elogind's CGROUP2_SUPER_MAGIC
+    // at /sys/fs/cgroup, sd-device's SYSFS_MAGIC) — and the capacity numbers.
     let fs = match current_fs_arc_at(&path) {
         Some(fs) => fs,
         None => return Err(ENOENT),
-    };
-    let f_type = match fs.name() {
-        "cgroup2" | "cgroup" => CGROUP2_SUPER_MAGIC,
-        "sysfs" => SYSFS_MAGIC,
-        "procfs" | "proc" => PROC_SUPER_MAGIC,
-        "mqueue" => MQUEUE_MAGIC,
-        "ramfs" => RAMFS_MAGIC,
-        n if n.starts_with("ext") => EXT2_SUPER_MAGIC,
-        _ => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
     };
     let fs_stat = match poll_blocking(fs.statfs()) {
         Some(Ok(stat)) => stat,
         Some(Err(error)) => return Err(copy_fs_errno(error)),
         None => return Err(EIO),
     };
+    let f_bsize = u64::from(fs_stat.block_size);
+    // `if (retval == 0 && buf->f_frsize == 0) buf->f_frsize = buf->f_bsize;`
+    let f_frsize = match fs_stat.fragment_size {
+        0 => f_bsize,
+        fragment_size => u64::from(fragment_size),
+    };
+    // `vfs_statfs`: `buf->f_flags = calculate_f_flags(path->mnt)`.
+    let f_flags = statfs_f_flags(
+        current_mount_flags_at(&path),
+        narf_filesystem::sb_flags::of(&fs),
+    );
     let stat = StatfsBuf {
-        f_type,
-        f_bsize: u64::from(fs_stat.block_size),
+        f_type: fs.magic(),
+        f_bsize,
         f_blocks: fs_stat.blocks,
         f_bfree: fs_stat.blocks_free,
         f_bavail: fs_stat.blocks_available,
         f_files: fs_stat.files,
         f_ffree: fs_stat.files_free,
         f_namelen: u64::from(fs_stat.name_len),
-        f_frsize: u64::from(fs_stat.fragment_size),
+        f_frsize,
+        f_flags,
         ..Default::default()
     };
     // Copy the statfs struct to user space under the SMAP bracket.

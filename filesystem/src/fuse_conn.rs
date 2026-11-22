@@ -2671,6 +2671,12 @@ impl FsInstance for FuseFs {
         &self.name
     }
 
+    /// `fuse_fill_super`: `sb->s_magic = FUSE_SUPER_MAGIC` whatever the
+    /// subtype this instance is named by.
+    fn magic(&self) -> u64 {
+        crate::super_magic::FUSE_SUPER_MAGIC
+    }
+
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
         Box::pin(async move {
             let reply = self

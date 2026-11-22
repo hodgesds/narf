@@ -274,6 +274,17 @@ impl FsInstance for OverlayFs {
         self.name
     }
 
+    /// `ovl_statfs` reports `OVERLAYFS_SUPER_MAGIC`. The overlay that owns
+    /// its lower instance stands in for that filesystem instead — the
+    /// session-writable root over an installed btrfs root is that btrfs to
+    /// everything above it (see `reconfigure`) — so it reports the lower's.
+    fn magic(&self) -> u64 {
+        match self.pinned.first() {
+            Some(lower) => lower.magic(),
+            None => crate::super_magic::OVERLAYFS_SUPER_MAGIC,
+        }
+    }
+
     /// An overlay that owns its lower instance stands in for that filesystem:
     /// the session-writable root over an installed btrfs root. A remount with
     /// the installed fstab's options (`systemd-remount-fs` runs `mount -o

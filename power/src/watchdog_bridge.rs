@@ -676,6 +676,11 @@ impl FsInstance for WatchdogSysFs {
     fn name(&self) -> &str {
         "watchdog-sysfs"
     }
+    /// A piece of /sys: sd-device checks `SYSFS_MAGIC` on what it opens
+    /// there.
+    fn magic(&self) -> u64 {
+        narf_filesystem::super_magic::SYSFS_MAGIC
+    }
 }
 
 // ── Bridge initcall ───────────────────────────────────────────────────

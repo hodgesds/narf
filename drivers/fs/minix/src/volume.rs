@@ -1557,4 +1557,18 @@ impl<B: BlockDevice + 'static> FsInstance for MinixVolume<B> {
             super::MinixVersion::V3 => "minix3",
         }
     }
+
+    /// `minix_statfs`: `buf->f_type = sb->s_magic`, the on-disk magic, which
+    /// also tells the name length apart.
+    fn magic(&self) -> u64 {
+        use super::{MinixVersion, NameLen};
+        use narf_filesystem::super_magic as m;
+        match (self.sb.version, self.sb.name_len) {
+            (MinixVersion::V1, NameLen::N30) => m::MINIX_SUPER_MAGIC2,
+            (MinixVersion::V1, _) => m::MINIX_SUPER_MAGIC,
+            (MinixVersion::V2, NameLen::N30) => m::MINIX2_SUPER_MAGIC2,
+            (MinixVersion::V2, _) => m::MINIX2_SUPER_MAGIC,
+            (MinixVersion::V3, _) => m::MINIX3_SUPER_MAGIC,
+        }
+    }
 }
