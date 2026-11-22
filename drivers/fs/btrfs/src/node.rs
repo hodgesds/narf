@@ -1891,6 +1891,31 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     fn dir_mtime_ns(&self) -> u64 {
         self.inode().mtime_ns()
     }
+
+    /// `btrfs_get_acl(dir, ACL_TYPE_DEFAULT)` for the create path's
+    /// `posix_acl_create` (`btrfs_new_inode_prepare`). btrfs stores the ACL
+    /// as its `system.posix_acl_default` xattr item in the uapi format, so
+    /// the item's value is the blob the VFS decodes.
+    ///
+    /// Without it nothing created in a btrfs directory inherited its
+    /// default ACL: every system journal journald rotated into
+    /// `/var/log/journal/<id>` came out without the `group:wheel` /
+    /// `group:adm` read entries tmpfiles' default ACL hands down.
+    fn default_acl(&self) -> Option<Vec<u8>> {
+        narf_filesystem::wait_sync(<Self as FileOps>::get_xattr(
+            self,
+            narf_filesystem::XATTR_NAME_POSIX_ACL_DEFAULT,
+        ))
+        .ok()
+    }
+
+    /// The directory's own xattr store, which is the inode's — the same
+    /// items [`FileOps::set_xattr`] writes. `mkdir` stores a new
+    /// directory's inherited access and default ACLs here
+    /// (`btrfs_init_inode_security`); answering `Unsupported` dropped them.
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        <Self as FileOps>::set_xattr(self, name, value, flags)
+    }
 }
 
 impl<B: BlockDevice + 'static> BtrfsVolume<B> {

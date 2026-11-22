@@ -216,6 +216,17 @@ prints `read error corrected: ino I off O (dev devid D sector S)` (metadata:
 (100 per 5 s). `BtrfsVolume::repair_stats()` counts repairs and each kind of
 skip. The read never fails because of its repair.
 
+Default-ACL inheritance (Linux `btrfs_new_inode_prepare` → `posix_acl_create`,
+`btrfs_init_inode_security`). A directory node answers
+`DirOps::default_acl()` with its `system.posix_acl_default` xattr item, the
+uapi blob `setxattr` stored, so the syscall layer's `open(O_CREAT)`,
+`mkdir`, `mknod` and socket-`bind` paths inherit it in place of the umask; and
+`DirOps::set_xattr` writes the directory inode's xattr items exactly as
+`FileOps::set_xattr` does, so `mkdir` keeps the inherited access ACL and the
+copied default on the new directory. Test:
+`smoke_btrfs_directory_default_acl_reaches_new_inodes`
+(`drivers/fs/btrfs/default-acl`).
+
 ## 4. Invariants
 
 Without a free-space tree (never under `root-rw`, which requires one) the
@@ -869,9 +880,15 @@ holds the old data; the held extent is not reused),
 The named mount path retains the implementation's existing format and option
 limits; registration does not add support for further on-disk features.
 
-Directories cannot carry xattrs through the VFS yet: `DirOps::set_xattr` is
-the trait's default (`Unsupported`), so a directory's `user.*`, ACL or
-security xattrs cannot be set or removed through it.
+A directory's xattrs are only partly reachable through `DirOps`:
+`set_xattr` and `default_acl` work (§3), but `get_xattr`, `list_xattr` and
+`remove_xattr` are still the trait's `Unsupported`. The syscall layer's
+xattr calls reach a btrfs directory as a `FileOps`, so they are unaffected,
+but `acl_of_dir` reads nothing, and `may_create` / `may_delete` therefore
+check a btrfs directory's mode bits without its access ACL (Linux's
+`check_acl`). Closing it wants a per-inode ACL cache like Linux's
+`i_acl`, or `DirOps::access_acl_present`, so every create and delete does
+not pay an xattr-tree lookup.
 
 A transaction's commit cannot allocate a chunk. Admission keeps it from
 needing one: every operation is refused with `NoSpace` unless the free
