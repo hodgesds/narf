@@ -763,6 +763,47 @@ fn smoke_fat_statfs_counts_clusters() -> TestResult {
 }
 kernel_test_in!("drivers/fs/fat/statfs", smoke_fat_statfs_counts_clusters);
 
+/// Linux mounts every FAT width through the `vfat` filesystem type, so
+/// `/proc/self/mountinfo`, `/proc/mounts` and statmount print `vfat` for a
+/// FAT12, FAT16 or FAT32 volume (`show_type`: `sb->s_type->name`). The FAT
+/// width stays the instance's own name.
+fn smoke_fat_mounts_list_the_vfat_type() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{bootstrap_mount_authority, registry, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    const PATH: &str = "/fat-fstype";
+    let img = build_fat12_image(128, b"narf\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("FatVolume::mount failed"),
+    };
+    if volume.name() != "fat12" {
+        return TestResult::Fail("expected FAT12 detection");
+    }
+    let auth = bootstrap_mount_authority();
+    let handle = match registry().mount_arc(&auth, PATH, volume) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("mounting the FAT volume failed"),
+    };
+    let listed = registry()
+        .list_mountinfo()
+        .into_iter()
+        .rev()
+        .find(|row| row.2 == PATH)
+        .map(|row| row.3);
+    let _ = registry().unmount(&handle, PATH);
+    match listed.as_deref() {
+        Some("vfat") => TestResult::Pass,
+        Some(_) => TestResult::Fail("a FAT mount is not listed with the vfat type"),
+        None => TestResult::Fail("the FAT mount is not in the mount listing"),
+    }
+}
+kernel_test_in!("drivers/fs/fat/fstype", smoke_fat_mounts_list_the_vfat_type);
+
 fn smoke_fat_truncate_grow_extends_chain_and_reads_zero() -> TestResult {
     // #692 regression: the grow branch of truncate used to publish
     // the new i_size without extending the cluster chain, so a read

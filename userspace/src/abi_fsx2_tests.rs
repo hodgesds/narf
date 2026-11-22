@@ -2665,6 +2665,153 @@ kernel_test_in!(
     smoke_abi_fsx2_new_mount_covers_earlier_submounts
 );
 
+// ── filesystem type names in the mount listings ───────────────────────
+//
+// `show_mountinfo` and `show_vfsmnt` print the superblock's type with
+// `show_type`: `sb->s_type->name`, followed by `.<subtype>` when the
+// superblock has one (FUSE: `fuse.portal`, `fuse.sshfs`). The type is the
+// registered filesystem type — `vfat`, `tmpfs`, `overlay` — never a label of
+// the instance. A bind mount is its source's superblock and prints its type.
+// `/proc/filesystems` lists each registered type once, under its Linux name.
+
+/// The type field (after `-`) of the `/proc/self/mountinfo` row whose mount
+/// point is `path`, and the third field of its `/proc/self/mounts` row.
+fn listed_fs_types(
+    path: &str,
+) -> Result<(alloc::string::String, alloc::string::String), &'static str> {
+    let info = read_mount_listing(c"/proc/self/mountinfo")?;
+    let mounts = read_mount_listing(c"/proc/self/mounts")?;
+    let from_info = info
+        .lines()
+        .rfind(|line| line.split(' ').nth(4) == Some(path))
+        .and_then(|line| line.split(" - ").nth(1))
+        .and_then(|tail| tail.split(' ').next())
+        .ok_or("the mount is not in /proc/self/mountinfo")?;
+    let from_mounts = mounts
+        .lines()
+        .rfind(|line| line.split(' ').nth(1) == Some(path))
+        .and_then(|line| line.split(' ').nth(2))
+        .ok_or("the mount is not in /proc/self/mounts")?;
+    Ok((from_info.into(), from_mounts.into()))
+}
+
+fn smoke_abi_fsx2_mount_listings_print_linux_fs_types() -> TestResult {
+    with_setup(|| {
+        use core::fmt::Write as _;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_BIND: u64 = 0x1000;
+        let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let auth = bootstrap_mount_authority();
+        let fuse = |subtype: &'static str| {
+            let conn = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseConnection::new());
+            alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn))
+                as alloc::sync::Arc<dyn narf_filesystem::FsInstance>
+        };
+        let upper = narf_filesystem::FsInstance::root(&MemFs::new("abi-fstn-upper"));
+        let lower = narf_filesystem::FsInstance::root(&MemFs::new("abi-fstn-lower"));
+        let overlay =
+            narf_filesystem::OverlayFs::new("abi-fstn-overlay", upper, alloc::vec![lower]);
+        let installed = alloc::sync::Arc::new(MemFs::new("btrfs"));
+        let root_overlay = narf_filesystem::root_mount::tmpfs_overlay_root(installed)
+            .map_err(|_| "could not build the root overlay")?;
+        let fixtures: [(
+            &str,
+            alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+            &str,
+        ); 6] = [
+            // An in-memory tree under a label is tmpfs to Linux.
+            (
+                "/abi-fstn-mem",
+                alloc::sync::Arc::new(MemFs::new("abi-fstn-label")),
+                "tmpfs",
+            ),
+            // One standing in for a Linux pseudo-filesystem keeps its type.
+            (
+                "/abi-fstn-sec",
+                alloc::sync::Arc::new(MemFs::new("securityfs")),
+                "securityfs",
+            ),
+            ("/abi-fstn-fuse", fuse("portal"), "fuse.portal"),
+            ("/abi-fstn-fuse-plain", fuse("fuse"), "fuse"),
+            ("/abi-fstn-ovl", alloc::sync::Arc::new(overlay), "overlay"),
+            // The session overlay over an installed root stands in for it.
+            ("/abi-fstn-rootov", root_overlay, "btrfs"),
+        ];
+        for (path, fs, want) in fixtures {
+            if crate::handlers::current_mount_arc(&auth, path, fs).is_err() {
+                return Err("could not mount a type-name fixture");
+            }
+            let (info, mounts) = listed_fs_types(path)?;
+            if info != want || mounts != want {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "{path}: {info} / {mounts}, want {want}"
+                );
+                return Err("a mount listing printed a type Linux does not have");
+            }
+        }
+        // A bind prints its source's type.
+        let _ = call_mkdir(c"/abi-fstn-bind".as_ptr() as u64, 0o755);
+        let bound = call(
+            Syscall::Mount.raw(),
+            a4(
+                c"/abi-fstn-mem".as_ptr() as u64,
+                c"/abi-fstn-bind".as_ptr() as u64,
+                0,
+                MS_BIND,
+                0,
+            ),
+        );
+        if bound != Some(0) {
+            return Err("mount(MS_BIND) of the labelled tree failed");
+        }
+        let (info, mounts) = listed_fs_types("/abi-fstn-bind")?;
+        if info != "tmpfs" || mounts != "tmpfs" {
+            return Err("a bind mount did not print its source's type");
+        }
+        // /proc/filesystems: Linux names only, NARF's aliases left out.
+        let filesystems = read_mount_listing(c"/proc/filesystems")?;
+        let listed = |ty: &str| {
+            filesystems
+                .lines()
+                .any(|line| line.split_whitespace().last() == Some(ty))
+        };
+        for alias in [
+            "shmfs",
+            "shm",
+            "procfs",
+            "devfs",
+            "bpffs",
+            "memfs",
+            "overlayfs",
+            "fat",
+            "fat16",
+            "fat32",
+        ] {
+            if listed(alias) {
+                let _ = writeln!(narf_console::Writer, "/proc/filesystems lists {alias}");
+                return Err("/proc/filesystems lists a type name Linux does not register");
+            }
+        }
+        for linux in ["tmpfs", "proc", "sysfs", "devtmpfs", "bpf"] {
+            if !listed(linux) {
+                return Err("/proc/filesystems lost a Linux type");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/fstype-names",
+    smoke_abi_fsx2_mount_listings_print_linux_fs_types
+);
+
 // ── mount: fstype breadth for systemd's early-boot pseudo-filesystems ──
 //
 // systemd mounts many pseudo-filesystems (proc, sysfs, tmpfs, securityfs,
