@@ -4249,3 +4249,69 @@ kernel_test_in!(
     "audio/hda/no-codecs",
     native_hda_no_codec_link_still_comes_up
 );
+
+/// Linux system suspend parks the controller whatever its streams do. The
+/// PCM core suspends every prepared or running stream first
+/// (`snd_pcm_suspend_all`: the trigger stops DMA, the state becomes
+/// SUSPENDED; HDA has no SNDRV_PCM_INFO_RESUME, so the stream is prepared
+/// again after resume), the codecs are force-suspended
+/// (`hda_codec_pm_suspend`), and `azx_suspend` shuts the chip down. NARF's
+/// system suspend refused with Busy while any stream was prepared: a legacy
+/// `load_period` left on the bound controller failed the whole fan-out.
+fn native_hda_pm_system_suspend_stops_prepared_streams() -> TestResult {
+    use narf_power::device_pm::DevicePmOps as _;
+    let fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    // Only this controller in the table for the fan-out; the bound ones
+    // come back on every exit.
+    struct ControllersGuard(Vec<(narf_bus::BusAddr, Arc<IntelHda>, u32)>);
+    impl Drop for ControllersGuard {
+        fn drop(&mut self) {
+            *CONTROLLERS.lock() = core::mem::take(&mut self.0);
+        }
+    }
+    let _cguard = ControllersGuard(core::mem::take(&mut *CONTROLLERS.lock()));
+    CONTROLLERS.lock().push((
+        narf_bus::BusAddr::Mmio(narf_memory::PhysAddr::new(0xFEDC_0000)),
+        dev.clone(),
+        0,
+    ));
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open");
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("prepare");
+    }
+    if HdaSystemPm.suspend().is_err() || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("system suspend parks a controller with a prepared stream");
+    }
+    if dev.streams[0]
+        .lock()
+        .ring
+        .as_ref()
+        .is_some_and(|r| r.prepared || r.running)
+    {
+        return TestResult::Fail("a suspended stream must be prepared again");
+    }
+    if HdaSystemPm.resume().is_err()
+        || dev.suspended.load(Ordering::Acquire)
+        || playback.prepare().is_err()
+        || playback.start().is_err()
+    {
+        return TestResult::Fail("after resume the stream prepares and starts again");
+    }
+    drop(playback);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-system",
+    native_hda_pm_system_suspend_stops_prepared_streams
+);
