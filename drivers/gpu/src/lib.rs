@@ -802,8 +802,6 @@ pub mod intel_gpu_gen11_dpll;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen11_sagv;
 #[cfg(feature = "intel")]
-pub mod intel_gpu_gen11_dpll;
-#[cfg(feature = "intel")]
 pub mod intel_gpu_gen11_wm;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_gen12_cdclk;
