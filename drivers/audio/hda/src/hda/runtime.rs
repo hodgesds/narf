@@ -119,6 +119,10 @@ pub struct IntelHda {
     /// Linux `card->longname` ("<short name> at 0x<BAR> irq <n>"), set when
     /// the card is registered.
     pub(super) long_name: IrqSafeSpinLock<alloc::string::String>,
+    /// Linux `azx_has_pm_runtime` (`AZX_DCAPS_PM_RUNTIME`): the autosuspend
+    /// may power the controller down after its codecs. Without it only the
+    /// codecs suspend.
+    pub(super) runtime_pm: AtomicBool,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -292,6 +296,10 @@ impl IntelHda {
         let noncoherent = super::ati_hdmi_noncoherent(device.id.vendor, device.id.device);
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         let mut dev = unsafe { Self::initialize(bar, noncoherent) }?;
+        dev.runtime_pm.store(
+            super::runtime_pm(device.id.vendor, device.id.device),
+            Ordering::Release,
+        );
         dev.route = Route::new(device, cap, dev.irq.clone());
         dev.irq_vector = dev.route.as_ref().map(|r| r.vector);
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
@@ -397,6 +405,7 @@ impl IntelHda {
             autosuspend_ms: AtomicU64::new(AUTOSUSPEND_MS),
             pm_waker: IrqSafeSpinLock::new(None),
             long_name: IrqSafeSpinLock::new(alloc::string::String::new()),
+            runtime_pm: AtomicBool::new(true),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the

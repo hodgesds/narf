@@ -33,6 +33,32 @@ pub const fn amd_sb_preset(vendor: u16, device: u16) -> bool {
         )
 }
 
+/// The ATI HDMI no-snoop functions whose Linux `azx_ids[]` entry adds
+/// `AZX_DCAPS_PM_RUNTIME` to `AZX_DCAPS_PRESET_ATI_HDMI_NS`.
+const ATI_HDMI_NS_RUNTIME_PM: &[u16] = &[
+    0x0002, 0xaac0, 0xaac8, 0xaad8, 0xaae0, 0xaae8, 0xaaf0, 0xaaf8, 0xab00, 0xab08, 0xab10, 0xab18,
+    0xab20, 0xab28, 0xab30, 0xab38, 0xab40,
+];
+
+/// Whether Linux runtime-suspends the controller (`azx_has_pm_runtime`:
+/// `AZX_DCAPS_PM_RUNTIME` in its `azx_ids[]` entry), so that
+/// `azx_runtime_idle` lets it power down once its codecs have. The AMD SB
+/// preset has it, as do the ATI HDMI functions listed above and every Intel
+/// PCH from Skylake on; the ICH parts, the other ATI HDMI functions and the
+/// ATI/AMD class match (1002:1640, 1002:1637) do not, and there only the
+/// codecs suspend.
+pub fn runtime_pm(vendor: u16, device: u16) -> bool {
+    match vendor {
+        HDA_AMD_VENDOR => amd_sb_preset(vendor, device),
+        HDA_AMD_RADEON_VENDOR => ATI_HDMI_NS_RUNTIME_PM.contains(&device),
+        HDA_INTEL_ICH9_VENDOR => !matches!(
+            device,
+            HDA_INTEL_ICH6_DEVICE | HDA_INTEL_ICH7_DEVICE | HDA_INTEL_ICH9_DEVICE
+        ),
+        _ => false,
+    }
+}
+
 /// The card's short name (Linux `card->shortname`): `driver_short_names[]`
 /// for the driver type `azx_ids[]` gives the controller. The ATI HDMI NS
 /// functions are `AZX_DRIVER_ATIHDMI_NS`; the AMD platform controllers and
