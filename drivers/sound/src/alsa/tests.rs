@@ -1040,7 +1040,8 @@ test!(alsa_hdmi_jack_and_eld_controls, {
         ctl(f.as_ref(), &m, 0x13, 1224, 2048),
         Err(FsError::OperationNotPermitted)
     );
-    // The jack is a boolean on CARD; MIXER does not find it.
+    // The jack is a boolean on CARD (SNDRV_CTL_ELEM_IFACE_CARD, 0: Linux
+    // jack_detect_kctl); MIXER and HWDEP do not find it.
     let mut id = [0u8; 64];
     put32(&mut id, 4, 2);
     let name = b"HDMI/DP,pcm=0 Jack";
@@ -1050,6 +1051,9 @@ test!(alsa_hdmi_jack_and_eld_controls, {
     m.put(128, &info);
     assert_eq!(ctl(f.as_ref(), &m, 0x11, 272, 128), Err(FsError::NotFound));
     put32(&mut info, 4, 1);
+    m.put(128, &info);
+    assert_eq!(ctl(f.as_ref(), &m, 0x11, 272, 128), Err(FsError::NotFound));
+    put32(&mut info, 4, 0);
     m.put(128, &info);
     ctl(f.as_ref(), &m, 0x11, 272, 128).unwrap();
     assert_eq!(get32(&m.bytes.lock(), 128 + 64), 1);
@@ -1346,10 +1350,12 @@ test!(alsa_hdmi_pcms_at_linux_device_numbers, {
             .ok()
             .map(|_| get32(&m.bytes.lock(), 1024))
     };
-    assert_eq!(numid(1, 0, 0, "HDMI/DP,pcm=7 Jack"), Some(2));
+    // The jack on CARD (0), not HWDEP (1).
+    assert_eq!(numid(0, 0, 0, "HDMI/DP,pcm=7 Jack"), Some(2));
+    assert_eq!(numid(1, 0, 0, "HDMI/DP,pcm=7 Jack"), None);
     assert_eq!(numid(3, 7, 0, "ELD"), Some(4));
     assert_eq!(numid(2, 0, 1, "IEC958 Playback Default"), Some(6));
-    assert_eq!(numid(1, 0, 0, "HDMI/DP,pcm=0 Jack"), None);
+    assert_eq!(numid(0, 0, 0, "HDMI/DP,pcm=0 Jack"), None);
     assert_eq!(numid(3, 0, 0, "ELD"), None);
     drop(f);
     crate::unregister_hardware_card(card);
