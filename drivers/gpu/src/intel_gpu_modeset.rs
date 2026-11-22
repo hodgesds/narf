@@ -398,9 +398,11 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
     /// Tiger Lake UY (GT2) part — selects the UY HBR2
     /// combo-PHY table (`intel_gpu_gen12_combo_phy::is_tgl_uy`).
-    /// Set from the PCI device ID by `modeset_display_for_chip`
-    /// (the one site that knows it); default false (the
-    /// standard TGL table) everywhere else.
+    /// Derived from the window's PCI device ID
+    /// (`MmioWindow::tgl_uy`) at construction, so every path
+    /// that builds a `Modeset` — panel, external DP, HDMI, MST
+    /// — carries the real flag; `modeset_display_for_chip`
+    /// re-asserts it from `ChipInfo` for the panel path.
     tgl_uy: bool,
     tc_width: u8,
 }
@@ -431,7 +433,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             pipe,
             dbuf_share: None,
             gen12_family: mmio.gen12_display_family(),
-            tgl_uy: false,
+            tgl_uy: mmio.tgl_uy(),
             tc_width: 4,
         }
     }
@@ -3233,6 +3235,11 @@ pub mod tests {
         regs: RefCell<Vec<(u64, u32)>>,
         /// Raw DSSM value served on reads (reference strap).
         pub dssm: u32,
+        /// Tiger Lake UY (GT2) part: when true the window
+        /// reports `tgl_uy`, so a `Modeset` built over it
+        /// selects the UY HBR2 table. Default false (the
+        /// standard TGL table).
+        pub tgl_uy: bool,
         /// Latency table the pcode endpoint serves.
         pub latencies: [u16; 8],
         /// SAGV block time the pcode endpoint serves.
@@ -3254,6 +3261,7 @@ pub mod tests {
                 writes: RefCell::new(Vec::new()),
                 regs: RefCell::new(Vec::new()),
                 dssm,
+                tgl_uy: false,
                 latencies: [6, 9, 13, 18, 24, 31, 40, 52],
                 sagv_block_time: 20,
                 pcode_status: 0,
@@ -3382,6 +3390,9 @@ pub mod tests {
     }
 
     impl MmioWindow for ScriptedSinkMmio {
+        fn tgl_uy(&self) -> bool {
+            self.tgl_uy
+        }
         fn read32(&self, off: u64) -> u32 {
             use crate::intel_gpu_aux::{DDI_AUX_CTL_OFFSET, DDI_AUX_DATA_OFFSET};
             use crate::intel_gpu_ddi::DDI_BUF_CTL_OFFSET;
@@ -3784,6 +3795,42 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_modeset_fallback_retunes_combo_dpll
+    );
+
+    fn smoke_modeset_uy_window_selects_uy_hbr2_table() -> TestResult {
+        // Same scripted-sink run as
+        // `smoke_modeset_full_run_scripted_sink`, but over a
+        // Tiger Lake UY window: the sink trains at HBR2 and
+        // asks for swing 1, so the final program is preset 4 —
+        // and preset 4 is where the UY HBR2 table differs from
+        // the standard one (swing select 0xC vs 0xA; the
+        // N-scalar 0x47 and cursor 0x3F agree). The UY window
+        // is the whole wiring under test: `Modeset::for_pipe`
+        // derives `tgl_uy` from it, and the shared
+        // `train_dp_link` combo branch programs the PHY from
+        // that flag — the same branch external DP and the MST
+        // primary stream run through.
+        let mut mmio = ScriptedSinkMmio::new(1 << 29);
+        mmio.tgl_uy = true;
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        if ms.modeset(&fb_1080p(), None).is_err() {
+            return TestResult::Fail("full modeset over a UY window must succeed");
+        }
+        let phy = 0x162000u64;
+        if mmio.writes_to(phy + 0x888).last() != Some(&0xA098) {
+            return TestResult::Fail("DW2 LN0 must carry the UY preset-4 swing (0xC)");
+        }
+        if mmio.writes_to(phy + 0x89C).last() != Some(&0x4700_0000) {
+            return TestResult::Fail("DW7 LN0 must carry the preset-4 N-scalar");
+        }
+        if mmio.writes_to(phy + 0x890).last() != Some(&0x3F) {
+            return TestResult::Fail("DW4 must carry the preset-4 cursor");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_modeset_uy_window_selects_uy_hbr2_table
     );
 
     fn smoke_modeset_full_run_ref24_pll_row() -> TestResult {

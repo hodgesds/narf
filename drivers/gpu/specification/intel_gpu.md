@@ -733,6 +733,15 @@ DDI A / eDP, single pipe):
   transcoder is not enabled until after training, and the
   modeset already reprograms M/N to the trained configuration
   on every path before the DDI buffer enables.
+  The Tiger Lake UY (GT2) flag rides the same path on
+  every port: `Modeset` derives it from the window's PCI
+  device ID (`MmioWindow::tgl_uy`, the panel path re-asserts
+  it from `ChipInfo`), so external DP, HDMI, and the MST
+  primary stream select the UY HBR2 table above 270 MHz on UY
+  parts — Linux `tgl_get_combo_buf_trans_dp`
+  (`display->platform.tigerlake_uy`). HDMI is the exception
+  Linux itself makes: it always takes the shared ICL HDMI
+  table, UY or not.
 - **PLL table corrected** — DPLL_CFGCR0/1 field layouts and the
   four DP coefficient rows now match TGL PRM Vol. 12's
   "DisplayPort Mode PLL Values" for the 19.2/38.4 MHz reference

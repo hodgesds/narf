@@ -1639,6 +1639,9 @@ impl crate::intel_gpu_aux::MmioWindow for ModeWindow {
             _ => None,
         }
     }
+    fn tgl_uy(&self) -> bool {
+        crate::intel_gpu_gen12_combo_phy::is_tgl_uy(self.device.id.device)
+    }
     fn gen12_hpd_profile(&self) -> Option<crate::intel_gpu_dp::HpdProfile> {
         use narf_bus::BusAddr;
         let BusAddr::Pcie(gpu) = self.device.addr else {

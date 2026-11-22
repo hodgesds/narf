@@ -992,6 +992,14 @@ pub mod tests {
     #[derive(Debug)]
     pub struct HdmiSinkMmio {
         family: RefCell<Option<crate::intel_gpu_gt::Gen12Platform>>,
+        /// Tiger Lake UY (GT2) part: when true the window
+        /// reports `tgl_uy`. Default false. HDMI always uses
+        /// the shared ICL HDMI table (Linux
+        /// `tgl_get_combo_buf_trans` returns
+        /// `icl_combo_phy_trans_hdmi` for HDMI before any UY
+        /// branch), so the flag must not change HDMI levels —
+        /// the test below pins that.
+        tgl_uy: RefCell<bool>,
         regs: RefCell<BTreeMap<u64, u32>>,
         pub writes: RefCell<Vec<(u64, u32)>>,
         sink: RefCell<GmbusSink>,
@@ -1007,6 +1015,7 @@ pub mod tests {
             regs.insert(crate::intel_gpu_pll::DSSM, 1u32 << 29);
             Self {
                 family: RefCell::new(Some(crate::intel_gpu_gt::Gen12Platform::TigerLake)),
+                tgl_uy: RefCell::new(false),
                 regs: RefCell::new(regs),
                 writes: RefCell::new(Vec::new()),
                 sink: RefCell::new(sink),
@@ -1035,6 +1044,9 @@ pub mod tests {
     impl MmioWindow for HdmiSinkMmio {
         fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
             *self.family.borrow()
+        }
+        fn tgl_uy(&self) -> bool {
+            *self.tgl_uy.borrow()
         }
         fn read32(&self, off: u64) -> u32 {
             if off == GMBUS2 {
@@ -1447,6 +1459,57 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hdmi",
         smoke_hdmi_1080p_connect_no_scdc_traffic
+    );
+
+    fn smoke_hdmi_uy_part_keeps_icl_hdmi_table() -> TestResult {
+        // Linux `tgl_get_combo_buf_trans` returns the shared
+        // ICL HDMI table for HDMI before any UY branch, so a
+        // Tiger Lake UY part must program exactly the same HDMI
+        // levels as a standard part: the ICL HDMI default entry
+        // (index 6: swing 0x6, N-scalar 0x7F, cursor 0x35,
+        // post-cursor-1 0x0A) on PHY_B. The flag still flows
+        // through — `activate` builds its `Modeset` over the
+        // window and `Modeset::for_pipe` derives `tgl_uy` from
+        // it — it just must not change the HDMI table.
+        // PHY_B (DDI B, 0x6C000) TX DW2/DW4/DW7 lane-0 offsets.
+        const DW2_LN0: u64 = 0x6C888;
+        const DW4_LN0: u64 = 0x6C890;
+        const DW7_LN0: u64 = 0x6C89C;
+        fn run(uy: bool) -> Option<(u32, u32, u32)> {
+            let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Scdc);
+            let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
+            *mmio.tgl_uy.borrow_mut() = uy;
+            let conn = connect(&mmio, Ddi::B, &Gen12DdcOverrides::NONE, &test_fb(8192)).ok()?;
+            if conn.scrambling {
+                return None;
+            }
+            let out = (
+                mmio.writes_to(DW2_LN0).last().copied()?,
+                mmio.writes_to(DW4_LN0).last().copied()?,
+                mmio.writes_to(DW7_LN0).last().copied()?,
+            );
+            clear_display_audio(sink_id_for(Ddi::B));
+            Some(out)
+        }
+        for uy in [true, false] {
+            match run(uy) {
+                Some((dw2, dw4, dw7)) => {
+                    if dw2 != 0x3098 || dw4 != 0xA035 || dw7 != 0x7F00_0000 {
+                        return TestResult::Fail(
+                            "HDMI must program the ICL HDMI default entry either way",
+                        );
+                    }
+                }
+                None => {
+                    return TestResult::Fail("HDMI 1080p connect must succeed");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_uy_part_keeps_icl_hdmi_table
     );
 
     fn smoke_hdmi_4k60_scdc_scrambling() -> TestResult {
