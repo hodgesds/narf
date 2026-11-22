@@ -256,6 +256,7 @@ fn snapshot_and_write(
     }
     let (taken, record) = match captured {
         Ok(Captured::Restored) => {
+            let _ = narf_console::write_str("  hibernate: restored, back in the image\n");
             // The image, back. `prealloc` still names the copy frames this
             // kernel allocated before the snapshot; dropping it frees them.
             drop(prealloc);
@@ -498,6 +499,10 @@ fn resume_from(device: &str, offset: u64) -> ResumeSkip {
         Ok(loaded) => loaded,
         Err(e) => return ResumeSkip::Payload(e),
     };
+    let _ = narf_console::write_str(&alloc::format!(
+        "  hibernate: staged {} image pages\n",
+        loader.loaded()
+    ));
     let ranges = narf_memory::frame::saveable_ram_ranges();
     if header.ram_hash != payload::ram_layout_hash(&ranges) {
         loader.abandon();
@@ -535,6 +540,11 @@ fn resume_from(device: &str, offset: u64) -> ResumeSkip {
             });
         }
     };
+    let _ = narf_console::write_str(&alloc::format!(
+        "  hibernate: devices quiesced, {} secondary CPU(s) stopped; entering the image at {:#x}\n",
+        secondary.cpus.len(),
+        record.entry
+    ));
     let irqs = narf_arch::interrupts_enabled();
     let first_pb = loader.first_pb();
     // SAFETY: the only CPU, devices quiesced, interrupts going off; the

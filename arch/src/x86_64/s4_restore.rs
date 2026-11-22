@@ -10,15 +10,19 @@
 //! relocated loop at its identity address. The loop:
 //! - copies every page to its original frame, using no stack, since the
 //!   boot kernel's own stack may be one of the destinations;
-//! - flushes the TLB including global entries (a CR4.PGE toggle), so no
-//!   boot-kernel translation survives;
+//! - copies the image's kernel half (PML4 slots 256..512, now restored)
+//!   over the temporary table's, reloads it, and flushes the TLB including
+//!   global entries (a CR4.PGE toggle), so no boot-kernel translation
+//!   survives;
 //! - jumps to the image kernel's [`super::s3_resume::s3_wake_entry`] at
-//!   its physical address.
+//!   its *virtual* address, as Linux enters `restore_registers`.
 //!
-//! The wake entry is S3's: it reads the image's own saved context
-//! (EFER, CR3, RSP, GDT, IDT, CR0, CR4, RFLAGS), loads the image's page
-//! table, which identity-maps the kernel text as the S3 wake needs, and
-//! long-jumps back to where the image kernel took its snapshot.
+//! The wake entry is S3's. It reads the image's own saved context (EFER,
+//! CR3, the bases, RSP, GDT, IDT, CR0, CR4, RFLAGS) through its virtual
+//! address (`set_resume_context_virt`), loads the image's page table,
+//! which maps that address too, and long-jumps back to where the image
+//! kernel took its snapshot. The image's table need not identity-map
+//! anything.
 
 /// Pairs one restore-list page holds: 16 bytes of header and 255 pairs.
 pub const PB_PAIRS: usize = 255;
@@ -45,8 +49,9 @@ impl core::fmt::Debug for PbPage {
 }
 
 // The copy loop. Position-independent: relative jumps only, no data. It is
-// entered with rdi = the first PbPage, rdx = the image's wake entry, both
-// physical, under the identity map.
+// entered under the identity map with rdi = the first PbPage (physical),
+// rdx = the image's wake entry (virtual), r12 = the temporary PML4 and
+// r13 = the image's PML4 (physical).
 core::arch::global_asm!(
     ".pushsection .text.narf_s4_restore,\"ax\"",
     ".global narf_s4_copy_loop",
@@ -76,6 +81,15 @@ core::arch::global_asm!(
     "mov rdi, [rdi]",
     "jmp 2b",
     "6:",
+    // The image's kernel half replaces the boot kernel's.
+    "mov ecx, 256",
+    "7:",
+    "mov rax, [r13 + rcx * 8]",
+    "mov [r12 + rcx * 8], rax",
+    "inc ecx",
+    "cmp ecx, 512",
+    "jne 7b",
+    "mov cr3, r12",
     // Flush every TLB entry, globals included: toggle CR4.PGE (bit 7).
     "mov rax, cr4",
     "mov rcx, rax",
@@ -106,7 +120,8 @@ pub fn copy_loop() -> &'static [u8] {
 
 /// Switch to `temp_cr3` and run the relocated copy loop at `loop_phys`
 /// over the restore list at `first_page_phys`, ending in the image's wake
-/// entry at `entry_phys`.
+/// entry at `entry_virt`, after installing the kernel half of the image's
+/// PML4 at `image_pml4_phys`.
 ///
 /// # Safety
 /// Interrupts are off and this is the only CPU running. `temp_cr3`
@@ -115,7 +130,13 @@ pub fn copy_loop() -> &'static [u8] {
 /// holds [`copy_loop`]. The restore list, the loop and the table are in
 /// frames no pair writes. Every original frame belongs to an image whose
 /// saved context the wake entry resumes. Nothing returns.
-pub unsafe fn jump(temp_cr3: u64, loop_phys: u64, first_page_phys: u64, entry_phys: u64) -> ! {
+pub unsafe fn jump(
+    temp_cr3: u64,
+    loop_phys: u64,
+    first_page_phys: u64,
+    entry_virt: u64,
+    image_pml4_phys: u64,
+) -> ! {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     // SAFETY: the caller's contract.
     unsafe {
@@ -125,7 +146,9 @@ pub unsafe fn jump(temp_cr3: u64, loop_phys: u64, first_page_phys: u64, entry_ph
             cr3 = in(reg) temp_cr3,
             entry = in(reg) loop_phys,
             in("rdi") first_page_phys,
-            in("rdx") entry_phys,
+            in("rdx") entry_virt,
+            in("r12") temp_cr3,
+            in("r13") image_pml4_phys,
             options(noreturn),
         )
     }

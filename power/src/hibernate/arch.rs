@@ -46,21 +46,25 @@ pub enum ArchError {
 /// The resume point: where the boot kernel jumps once the pages are back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArchRecord {
-    /// x86_64: the physical address of the image's S3 wake entry.
-    pub entry_phys: u64,
+    /// x86_64: the virtual address of the image's S3 wake entry.
+    pub entry: u64,
+    /// x86_64: the physical address of the image's PML4, whose kernel half
+    /// the copy loop installs before the jump.
+    pub page_table: u64,
 }
 
 const RECORD_TAG: u32 = if cfg!(target_arch = "x86_64") {
-    0x8664_0001
+    0x8664_0002
 } else {
-    0xaa64_0001
+    0xaa64_0002
 };
 
 impl ArchRecord {
     pub fn encode(&self) -> [u8; ARCH_RECORD_LEN] {
         let mut out = [0u8; ARCH_RECORD_LEN];
         out[..4].copy_from_slice(&RECORD_TAG.to_le_bytes());
-        out[8..16].copy_from_slice(&self.entry_phys.to_le_bytes());
+        out[8..16].copy_from_slice(&self.entry.to_le_bytes());
+        out[16..24].copy_from_slice(&self.page_table.to_le_bytes());
         out
     }
 
@@ -69,7 +73,8 @@ impl ArchRecord {
             return Err(ArchError::ForeignRecord);
         }
         Ok(Self {
-            entry_phys: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            entry: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            page_table: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
         })
     }
 }
@@ -97,6 +102,7 @@ pub unsafe fn capture<R>(snapshot: impl FnOnce(ArchRecord) -> R) -> Result<Captu
     // SAFETY: `jmp` lives in this frame, which stays live until the
     // snapshot is taken; the restore long-jumps back into it.
     if unsafe { setjmp::setjmp(&mut jmp) } == s3_resume::S3_RESUMED_SENTINEL {
+        s3_resume::set_resume_context_virt(0);
         return Ok(Captured::Restored);
     }
     *s3_resume::S3_CALLER_JMP.lock() = jmp;
@@ -109,10 +115,19 @@ pub unsafe fn capture<R>(snapshot: impl FnOnce(ArchRecord) -> R) -> Result<Captu
             .map(|p| p.raw() | (virt & 0xFFF))
             .ok_or(ArchError::Untranslatable)
     };
-    let entry_phys = phys(s3_resume::s3_wake_entry as usize as u64)?;
-    let ctx_phys = phys(s3_resume::resume_context_static_addr() as u64)?;
-    s3_resume::set_resume_context_phys(ctx_phys);
-    Ok(Captured::Snapshot(snapshot(ArchRecord { entry_phys })))
+    // The restore enters the wake entry at its virtual address, through a
+    // table holding this kernel half, and reads the context at its virtual
+    // address. Disarmed again after the snapshot, so a later S3 reads it
+    // physically.
+    let _ = phys(s3_resume::s3_wake_entry as usize as u64)?;
+    s3_resume::set_resume_context_virt(s3_resume::resume_context_static_addr() as u64);
+    let record = ArchRecord {
+        entry: s3_resume::s3_wake_entry as usize as u64,
+        page_table: pml4.raw(),
+    };
+    let taken = snapshot(record);
+    s3_resume::set_resume_context_virt(0);
+    Ok(Captured::Snapshot(taken))
 }
 
 /// The CPU state the S3 context does not carry and a restore must put
@@ -244,7 +259,13 @@ pub unsafe fn restore(
             PhysAddr::new(loop_phys).kernel_mut_ptr::<u8>(),
             code.len(),
         );
-        narf_arch::x86_64::s4_restore::jump(pml4, loop_phys, first_pb_phys, record.entry_phys)
+        narf_arch::x86_64::s4_restore::jump(
+            pml4,
+            loop_phys,
+            first_pb_phys,
+            record.entry,
+            record.page_table,
+        )
     }
 }
 

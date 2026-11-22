@@ -1583,7 +1583,7 @@ pub enum ResumeSkip { NotConfigured, SecondaryCpus(u32), NoDevice(String), NoIma
 pub fn software_resume() -> ResumeSkip;                      // a Stage::Late initcall
 // narf_power::hibernate::arch
 pub const SUPPORTED: bool;                                   // x86_64 today
-pub struct ArchRecord { pub entry_phys: u64 }                // in PayloadHeader::arch
+pub struct ArchRecord { pub entry: u64, pub page_table: u64 }  // in PayloadHeader::arch
 pub unsafe fn capture<R>(snapshot: impl FnOnce(ArchRecord) -> R) -> Result<Captured<R>, ArchError>;
 pub unsafe fn restore(record, ram, first_pb_phys, safe: &mut dyn SafeFrames) -> Result<Infallible, ArchError>;
 // narf_power::hibernate::restore
@@ -1591,7 +1591,7 @@ pub struct Loader;                                           // stages pages in 
 pub fn load_payload(verified: &VerifiedResume, store: &dyn ImageStore) -> Result<(PayloadHeader, Loader), RestoreError>;
 // narf_arch::x86_64::s4_restore
 pub fn copy_loop() -> &'static [u8];                         // core_restore_code, position-independent
-pub unsafe fn jump(temp_cr3, loop_phys, first_pb_phys, entry_phys) -> !;
+pub unsafe fn jump(temp_cr3, loop_phys, first_pb_phys, entry_virt, image_pml4_phys) -> !;
 ```
 
 `hibernate`, run by the power service for a `disk` write to
@@ -1627,9 +1627,14 @@ x86_64's restore reuses S3's saved context and wake trampoline. It builds a
 temporary page table that identity-maps every 2 MiB block holding RAM,
 executable, and keeps the live kernel half. It copies `copy_loop` into a
 safe frame and jumps there. The loop copies the pages with no stack,
-flushes the TLB including globals, and enters the image's `s3_wake_entry`
-at its physical address. The wake entry reloads the image's EFER, CR3,
-RSP, GDT, IDT, CR0 and CR4 and long-jumps back into `capture`. The S3
+installs the image's kernel half (PML4 slots 256..512, now restored) in the
+temporary table, flushes the TLB including globals, and enters the image's
+`s3_wake_entry` at its *virtual* address, as Linux enters
+`restore_registers`. The wake entry reads the saved context through its
+virtual address (`set_resume_context_virt`), reloads the image's EFER, CR3,
+FS/GS bases, RSP, GDT, IDT, CR0 and CR4, and long-jumps back into
+`capture`. Nothing depends on the image's page table identity-mapping its
+text. The S3
 wake hook skips its device resume while `restoring_image()`.
 
 `narf.hibernate_policy=off` seals under the OFF policy instead of a TPM

@@ -301,6 +301,19 @@ pub fn captured_context() -> Option<ResumeContext> {
 #[cfg(target_arch = "x86_64")]
 static RESUME_CONTEXT_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The context's *virtual* address, for a hibernation restore. That path
+/// enters [`s3_wake_entry`] at its kernel virtual address, through a page
+/// table holding the image's kernel half, not at a physical address. The
+/// image's own page table need not identity-map the context, so it is read
+/// at an address both tables map. 0 outside a hibernation: S3 reads the
+/// physical one.
+static RESUME_CONTEXT_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Arm (non-zero) or disarm (0) the hibernation restore's context address.
+pub fn set_resume_context_virt(virt: u64) {
+    RESUME_CONTEXT_VIRT.store(virt, core::sync::atomic::Ordering::Release);
+}
+
 /// Post-wake hook to fan out device resume. Registered by
 /// `narf_power` at boot via [`set_resume_hook`] so this module
 /// stays dependency-free (power → arch, not the other way).
@@ -417,6 +430,12 @@ pub unsafe extern "C" fn s3_wake_entry() -> ! {
     naked_asm!(
         // Disable interrupts (firmware should have them off; belt+braces).
         "cli",
+        // A hibernation restore enters here at the kernel virtual address
+        // and reads the context through RESUME_CONTEXT_VIRT.
+        "lea r8, [rip + {ctx_virt}]",
+        "mov r8, [r8]",
+        "test r8, r8",
+        "jnz 3f",
         // Read RESUME_CONTEXT_PHYS into r8 via RIP-relative. r8 (not
         // rax) holds the context base for the whole trampoline
         // because the EFER restore below needs rax/rcx/rdx for wrmsr.
@@ -426,6 +445,7 @@ pub unsafe extern "C" fn s3_wake_entry() -> ! {
         // If RESUME_CONTEXT_PHYS == 0, the trampoline wasn't armed.
         // Halt — firmware will eventually reset the box.
         "jz 9f",
+        "3:",
         // r8 = phys of the guarded ResumeContext (see
         // resume_context_static_addr). Every displacement below is a
         // `ctx_offset::*` const operand derived from the Rust struct
@@ -521,6 +541,7 @@ pub unsafe extern "C" fn s3_wake_entry() -> ! {
         "hlt",
         "jmp 9b",
         ctx_phys = sym RESUME_CONTEXT_PHYS,
+        ctx_virt = sym RESUME_CONTEXT_VIRT,
         cont = sym s3_wake_continuation,
         efer_msr = const IA32_EFER,
         ofs_cr0 = const ctx_offset::CR0,
