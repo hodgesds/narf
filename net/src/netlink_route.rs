@@ -131,6 +131,7 @@ const INFINITY_LIFE_TIME: u32 = 0xFFFF_FFFF;
 // ── RTA_* route attribute types (rtnetlink.h) ──────────────────────────
 
 pub const RTA_DST: u16 = 1;
+pub const RTA_SRC: u16 = 2;
 pub const RTA_OIF: u16 = 4;
 pub const RTA_GATEWAY: u16 = 5;
 pub const RTA_PRIORITY: u16 = 6;
@@ -1083,16 +1084,37 @@ fn build_get_in(net_ns_id: u64, req: &[u8], strict: bool, ext_ack: bool) -> Vec<
                 .and_then(|(off, _)| req[off..off + 4].try_into().ok())
                 .unwrap_or([0; 4]);
             let dst = crate::ipv4::Ipv4Addr(dst);
-            if let Some(route) = crate::route::route_lookup_raw_in(net_ns_id, dst) {
-                if let Some(link) = links.iter().find(|link| link.name == route.iface) {
-                    let mut message = build_newroute(&route, link.ifindex, seq, pid);
-                    clear_multipart(&mut message);
-                    out.push(message);
+            const RTM_F_FIB_MATCH: u32 = 0x2000;
+            let rtm_flags = req
+                .get(NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 12)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map_or(0, u32::from_ne_bytes);
+            let attr4 = |kind: u16| {
+                tb[kind as usize]
+                    .and_then(|(off, _)| req.get(off..off + 4))
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            };
+            // `flowi4_oif = nla_get_u32(tb[RTA_OIF])`; `flowi4_saddr` from RTA_SRC.
+            let oif = attr4(RTA_OIF).map_or(0, u32::from_ne_bytes);
+            let src = attr4(RTA_SRC);
+            if rtm_flags & RTM_F_FIB_MATCH != 0 {
+                // `fib_dump_info` of the FIB entry the lookup matched.
+                if let Some(route) = crate::route::route_lookup_raw_in(net_ns_id, dst) {
+                    if let Some(link) = links.iter().find(|link| link.name == route.iface) {
+                        let mut message = build_newroute(&route, link.ifindex, seq, pid);
+                        clear_multipart(&mut message);
+                        out.push(message);
+                    } else {
+                        out.push(build_error(ENODEV, seq, pid, req));
+                    }
                 } else {
-                    out.push(build_error(ENODEV, seq, pid, req));
+                    out.push(build_error(ENETUNREACH, seq, pid, req));
                 }
-            } else {
-                out.push(build_error(ENETUNREACH, seq, pid, req));
+                return out;
+            }
+            match getroute_output(net_ns_id, &links, dst, oif, src) {
+                Ok(route) => out.push(build_cloned_route(&route, seq, pid)),
+                Err(errno) => out.push(build_error(errno, seq, pid, req)),
             }
         }
         // LINUX-GAP: the other RTM_GET* doits (inet6_rtm_getaddr, neigh_get,
@@ -1106,6 +1128,111 @@ fn build_get_in(net_ns_id: u64, req: &[u8], strict: bool, ext_ack: bool) -> Vec<
         }
     }
     out
+}
+
+/// The route `ip_route_output_key_hash_rcu` produces for an RTM_GETROUTE
+/// query, as `rt_fill_info` reports it.
+struct ClonedRoute {
+    dst: [u8; 4],
+    /// RTA_SRC when the query named one; then no RTA_PREFSRC is reported.
+    src: Option<[u8; 4]>,
+    prefsrc: [u8; 4],
+    gateway: Option<[u8; 4]>,
+    oif: u32,
+    table: u8,
+    rtn_type: u8,
+}
+
+/// The output lookup behind `inet_rtm_getroute` (no RTA_IIF): a local
+/// destination is an RTN_LOCAL route through lo in the local table; with
+/// RTA_OIF only that device's routes count, and without one the destination
+/// is on-link there (`route_lookup_oif_in`); an unknown oif is -ENODEV and no
+/// route -ENETUNREACH.
+fn getroute_output(
+    net_ns_id: u64,
+    links: &[LinkInfo],
+    dst: crate::ipv4::Ipv4Addr,
+    oif: u32,
+    src: Option<[u8; 4]>,
+) -> Result<ClonedRoute, i32> {
+    // `ip_route_output_key_hash_rcu`: no destination is the loopback address
+    // (`fl4->daddr = fl4->saddr = htonl(INADDR_LOOPBACK)`), a local route.
+    if dst.0 == [0; 4] || crate::iface::is_local_addr_in(net_ns_id, dst.0) {
+        let local = if dst.0 == [0; 4] {
+            [127, 0, 0, 1]
+        } else {
+            dst.0
+        };
+        return Ok(ClonedRoute {
+            dst: dst.0,
+            src,
+            prefsrc: src.unwrap_or(local),
+            gateway: None,
+            oif: 1,
+            table: crate::route::TABLE_LOCAL,
+            rtn_type: RTN_LOCAL,
+        });
+    }
+    let result = if oif != 0 {
+        let name = links
+            .iter()
+            .find(|link| link.ifindex == oif)
+            .map(|link| link.name.clone())
+            .ok_or(ENODEV)?;
+        crate::route::route_lookup_oif_in(net_ns_id, dst, &name)
+    } else {
+        crate::route::route_lookup_in(net_ns_id, dst).ok_or(ENETUNREACH)?
+    };
+    let oif = links
+        .iter()
+        .find(|link| link.name == result.iface)
+        .map(|link| link.ifindex)
+        .ok_or(ENODEV)?;
+    Ok(ClonedRoute {
+        dst: dst.0,
+        src,
+        prefsrc: src.unwrap_or(result.src.0),
+        gateway: result.gateway.map(|g| g.0),
+        oif,
+        table: crate::route::TABLE_MAIN,
+        rtn_type: RTN_UNICAST,
+    })
+}
+
+/// `rt_fill_info` for an output route: rtm_dst_len 32, RTPROT_UNSPEC,
+/// RT_SCOPE_UNIVERSE, RTM_F_CLONED; RTA_TABLE, RTA_DST, [RTA_SRC], RTA_OIF,
+/// RTA_PREFSRC (unless the query fixed the source), [RTA_GATEWAY] and
+/// RTA_CACHEINFO, in that order.
+// LINUX-GAP: RTA_UID (the requester's uid) is not reported; the netlink
+// request path does not carry the sender's credentials here.
+fn build_cloned_route(route: &ClonedRoute, seq: u32, pid: u32) -> Vec<u8> {
+    const RTA_CACHEINFO: u16 = 12;
+    const RTM_F_CLONED: u32 = 0x200;
+    let mut body = Vec::new();
+    body.push(AF_INET);
+    body.push(32); // rtm_dst_len
+    body.push(if route.src.is_some() { 32 } else { 0 }); // rtm_src_len
+    body.push(0); // rtm_tos
+    body.push(route.table);
+    body.push(0); // rtm_protocol RTPROT_UNSPEC
+    body.push(0); // rtm_scope RT_SCOPE_UNIVERSE
+    body.push(route.rtn_type);
+    body.extend_from_slice(&RTM_F_CLONED.to_ne_bytes());
+    push_rtattr(&mut body, RTA_TABLE, &u32::from(route.table).to_ne_bytes());
+    push_rtattr(&mut body, RTA_DST, &route.dst);
+    if let Some(src) = route.src {
+        push_rtattr(&mut body, RTA_SRC, &src);
+    }
+    push_rtattr(&mut body, RTA_OIF, &route.oif.to_ne_bytes());
+    if route.src.is_none() {
+        push_rtattr(&mut body, RTA_PREFSRC, &route.prefsrc);
+    }
+    if let Some(gateway) = route.gateway {
+        push_rtattr(&mut body, RTA_GATEWAY, &gateway);
+    }
+    // `rtnl_put_cacheinfo`: struct rta_cacheinfo, nothing expiring.
+    push_rtattr(&mut body, RTA_CACHEINFO, &[0u8; 32]);
+    frame_message(RTM_NEWROUTE, 0, seq, pid, &body)
 }
 
 /// `rtnl_valid_getlink_req` (net/core/rtnetlink.c).

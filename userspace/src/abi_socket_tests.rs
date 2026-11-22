@@ -8083,8 +8083,13 @@ fn smoke_abi_netlink_route_point_lookup() -> TestResult {
             return Err("RTM_GETROUTE point lookup did not return RTM_NEWROUTE");
         }
         let flags = u16::from_ne_bytes([reply[6], reply[7]]);
-        if flags & 2 != 0 || reply[NLMSG_HDRLEN + 1] != 24 {
-            return Err("route point reply was multipart or selected the wrong prefix");
+        // `rt_fill_info`: the cloned output route, rtm_dst_len 32, RTA_DST
+        // the queried address, through the longest-prefix route's gateway.
+        if flags & 2 != 0 || reply[NLMSG_HDRLEN + 1] != 32 {
+            return Err("route point reply was multipart or not the cloned /32 route");
+        }
+        if !window_contains(&reply[..n as usize], &[198, 19, 7, 42]) {
+            return Err("route point reply omitted the queried destination");
         }
         if !window_contains(&reply[..n as usize], &[192, 0, 2, 1]) {
             return Err("route point reply omitted the selected gateway");

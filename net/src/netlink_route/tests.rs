@@ -366,8 +366,9 @@ fn getroute_point_query_uses_longest_prefix_match() -> narf_kernel_test::TestRes
         });
     }
 
+    // `ip route get fibmatch`: RTM_F_FIB_MATCH asks for the FIB entry itself.
     let mut body = vec![AF_INET, 32, 0, 0, crate::route::TABLE_MAIN, 0, 0, 0];
-    body.extend_from_slice(&0u32.to_ne_bytes());
+    body.extend_from_slice(&0x2000u32.to_ne_bytes());
     push_rtattr(&mut body, RTA_DST, &[198, 18, 7, 99]);
     let request = frame_message(RTM_GETROUTE, NLM_F_REQUEST, 62, 8, &body);
     let replies = build_dump(&request);

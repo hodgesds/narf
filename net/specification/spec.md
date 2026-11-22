@@ -754,10 +754,17 @@ with `NLMSG_ERROR`; a successful doit's reply precedes its `NLM_F_ACK`.
 Non-dump `RTM_GETLINK` resolves one interface by positive ifindex or else
 `IFLA_IFNAME`, returning a non-multipart reply, `ENODEV` when the named
 interface is absent, or `EINVAL` when neither selector is present.
-Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
-lookup for `RTA_DST` (absent: 0.0.0.0, as `inet_rtm_getroute`), returning
-the selected route as one non-multipart reply or `ENETUNREACH`; a family
-other than `AF_INET` returns `EOPNOTSUPP`.
+Non-dump `RTM_GETROUTE` runs the output lookup for `RTA_DST` (absent:
+0.0.0.0, the loopback route, as `inet_rtm_getroute`), with `RTA_OIF` as the
+output device (only its routes count, else on-link there; an unknown index
+is `ENODEV`) and `RTA_SRC` as the source, and answers the cloned route as
+`rt_fill_info` does: rtm_dst_len 32, `RTM_F_CLONED`, `RTPROT_UNSPEC`,
+`RTA_TABLE`, `RTA_DST`, `RTA_OIF`, `RTA_PREFSRC` (unless `RTA_SRC` fixed
+the source), `RTA_GATEWAY` and `RTA_CACHEINFO`; a local destination is an
+`RTN_LOCAL` route through lo in the local table. With `RTM_F_FIB_MATCH` it
+answers the matched FIB entry instead. No route is `ENETUNREACH`; a family
+other than `AF_INET` returns `EOPNOTSUPP`. LINUX-GAP: `RTA_UID` is not
+reported.
 Address dumps honor `ifa_family`, and `ifa_index` only under strict checking;
 route dumps honor `rtm_family`, and under strict checking `rtm_table` /
 `RTA_TABLE`, `RTA_OIF`, `rtm_protocol`, and `rtm_type`; neighbor dumps filter
