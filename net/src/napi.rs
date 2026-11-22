@@ -198,25 +198,58 @@ impl SoftirqBudget {
 
     /// Account a NAPI poll that processed `processed` frames and left work
     /// queued, at `now_ns`.
+    ///
+    /// `net_rx_action` ends a round once it has processed `netdev_budget`
+    /// packets or run `netdev_budget_usecs`; `__do_softirq` restarts it while
+    /// it has run fewer than `MAX_SOFTIRQ_RESTART` rounds and for less than
+    /// `MAX_SOFTIRQ_TIME`, then wakes ksoftirqd.
     pub fn account(&mut self, processed: u32, now_ns: u64) -> SoftirqNext {
-        let _ = (processed, now_ns);
-        SoftirqNext::Repoll
+        self.round_packets = self.round_packets.saturating_add(processed);
+        if self.round_packets >= NETDEV_BUDGET
+            || now_ns.saturating_sub(self.round_start_ns) >= NETDEV_BUDGET_NS
+        {
+            self.rounds += 1;
+            self.round_packets = 0;
+            self.round_start_ns = now_ns;
+        }
+        if self.rounds >= MAX_SOFTIRQ_RESTART
+            || now_ns.saturating_sub(self.start_ns) >= MAX_SOFTIRQ_TIME_NS
+        {
+            SoftirqNext::Defer
+        } else {
+            SoftirqNext::Repoll
+        }
     }
 }
 
-/// The task spec of a NIC queue's receive pump on `cpu`.
-pub fn rx_pump_spec(cpu: u32) -> narf_scheduler::TaskSpec {
-    let mut spec = narf_scheduler::TaskSpec::unthrottled()
-        .with_work_kind(narf_scheduler::WorkKind::SoftIrq);
+fn pinned_softirq_spec(cpu: u32) -> narf_scheduler::TaskSpec {
+    let mut spec =
+        narf_scheduler::TaskSpec::unthrottled().with_work_kind(narf_scheduler::WorkKind::SoftIrq);
     spec.affinity =
         narf_scheduler::affinity::Affinity::pinned(narf_scheduler::affinity::CpuId(cpu));
     spec
 }
 
-/// The task spec of a queue's deferral task on `cpu`, if the pump has one.
+/// The task spec of a NIC queue's receive pump on `cpu`.
+///
+/// Linux polls a queue in softirq context on IRQ exit, before any task on
+/// that CPU runs again. The pump is Interactive class so NARF's strict-class
+/// dispatcher runs it ahead of the CPU's Default-class tasks; its
+/// [`SoftirqBudget`] bounds how long it does so.
+pub fn rx_pump_spec(cpu: u32) -> narf_scheduler::TaskSpec {
+    let mut spec = pinned_softirq_spec(cpu);
+    spec.class = narf_scheduler::SchedClass::Interactive;
+    spec
+}
+
+/// The task spec of a queue's deferral task on `cpu`: ksoftirqd, a
+/// normal-priority thread on the queue's CPU that takes the queue over when
+/// a softirq run ends with work left, and shares the CPU with the tasks
+/// there.
 pub fn rx_deferral_spec(cpu: u32) -> Option<narf_scheduler::TaskSpec> {
-    let _ = cpu;
-    None
+    let mut spec = pinned_softirq_spec(cpu);
+    spec.class = narf_scheduler::SchedClass::Default;
+    Some(spec)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
