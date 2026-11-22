@@ -698,7 +698,9 @@ generation gates below.
   bullet until Gen11 Lane 1 lifted it for identity + probe
   (26 IDs in §5) and Lane 2 extended the lift to GEM mapping via
   the legacy Gen8 PTE format; its display model is still a separate
-  lane programme, and display/GT execution stay gated after Lane 2.
+  lane programme, and display stays gated. GT execution
+  (execlists submission on RCS) was admitted by the Gen11
+  execlists lane (§8).
 - Arrow Lake display — identification landed (#1023, §5);
   display support rides #1016's Xe-LPG family via the shared
   Meteor Lake classification, not a separate Arrow Lake path.
@@ -856,11 +858,25 @@ remain enabled. Intel media and MST modules likewise require `intel`.
 
 ## 8. Command submission (Stage 5 — `intel_gpu_rcs`)
 
-The RCS0 execlists engine model and kernel submission helper for Gen12.
+The RCS0 execlists engine model and kernel submission helper for Gen12,
+verified for Gen11 (Ice Lake) in the Gen11 execlists lane.
 Compiled only under the GPU crate's `intel` feature. This is not a complete
 userspace render backend (see §19). The corrected Gen12 restore template has
 13 initial register pairs, engine-relative LRI selectors and extended render
-state groups, ending at dword 0xb9; XCS ends at 0x34. RING_CTL uses byte size
+state groups, ending at dword 0xb9; XCS ends at 0x34. The Gen11 template
+follows `intel_lrc.c` `gen11_rcs_offsets` / `gen9_xcs_offsets` instead: a
+15-pair (RCS) / 14-pair (XCS) first group carrying the second-level batch
+registers Gen12 drops and no `0x2b4`, a single-pair `0x1b0` third group on
+RCS, no 51-register extended group (RCS ends at dword 0x44), and an XCS
+44-register group ending at dword 0xaa. The render image is 14 pages on
+both generations (`intel_engine_context_size` returns
+`GEN11_LR_CONTEXT_RENDER_SIZE` for graphics 11 and 12 alike), so the
+48-page allocation bounds Gen11 with no per-generation bound; the CSB
+depth is 12 from graphics 11 on (`GEN11_CSB_ENTRIES`). The indirect-context
+offset default is Gen11 `0x1a` / Gen12 `0xd` (`intel_lrc_reg.h`), programmed
+`<< 6` into the Gen11 RCS template; Gen12 keeps its existing zero template
+value, and the pointer slot stays zero on both (Gen11 has no indirect-context
+batch — Linux `lrc_init_wa_ctx` returns early for graphics 11). RING_CTL uses byte size
 minus one page (128 KiB encodes 0x1f001) and the CSB has 12 entries. Fixed
 source-cited vectors pin these values separately from the hardware model.
 Public interface:
@@ -869,7 +885,10 @@ Public interface:
   page, program `RING_HWS_PGA`, adopt the hardware CSB write
   pointer. Generic over `MmioWindow` + `GpuAllocator` so the
   protocol is fixture-drivable without a BAR; production uses
-  `BarWindow` + `GgttArena`.
+  `BarWindow` + `GgttArena`. `new_for_generation` /
+  `with_spec_for_generation` select the Gen11 context-image
+  template for `Generation::IceLake`; the plain constructors
+  keep the Gen12 template.
 - `create_context() -> ContextId` / `destroy_context(id)` —
   a context owns a 48-page LRC image (register-state template
   on page 1), a 128 KiB ring, and a 1-page HWSP. Handles pack
@@ -898,7 +917,13 @@ Public interface:
   `wait_seqno` is its spin-safe sync bridge outside executor polls.
   Production glue: `submit_dwords` /
   `poll_default_completions` attach lazily to the probed
-  controller on a default context.
+  controller on a default context. The legacy submission lease
+  admits Tiger Lake, Alder Lake and Ice Lake; `attach_default`
+  builds the engine for the probed generation, so a Gen11 part
+  gets the Gen11 template. `GraphicsIp::read` has a pre-GMD
+  arm for Gen11 (version 1100, no MMIO touch) — the Lane 1
+  remainder — so the context-seed and GuC paths that sample
+  the graphics IP work on Gen11 without reading `GMD_ID`.
 - `attach_ppgtt(ctx, root_phys)` / `detach_ppgtt(ctx)` /
   `ppgtt_root(ctx)` — program a PPGTT root (§9) into the
   context image's PDP0 pair. Idle-context discipline, like
@@ -934,7 +959,17 @@ Flagged for first-silicon verification (single named
 constants in `intel_gpu_rcs`): `CSB_ENTRIES` = 12 (Gen11+
 CSB depth), `RCS_IMAGE_PAGES` = 48 (allocation bound above
 the hardware image size), and the descriptor Legacy-64B
-mode choice.
+mode choice. The Gen11 template, indirect-offset default,
+image bound and pre-GMD identity read are fixture-verified
+against the Linux Gen11 tables in this lane; first silicon
+execution on Gen11 hardware is still outstanding (Daniel's
+bringup lane). One pre-existing NARF-wide deviation is
+recorded, not changed: the descriptor sets bit 5
+(`DESC_L3LLC_COHERENT`) on every generation, while Linux
+`lrc_descriptor` sets it only for graphics 8. The Gen12
+submission path ships with the bit set, so the lane keeps
+Gen11 identical to the verified Gen12 descriptor rather than
+diverging on an untested hunch.
 
 ## 9. PPGTT + GGTT discipline (Stage 4/5 — `intel_gpu_ppgtt`, #1012)
 
