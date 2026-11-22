@@ -6800,6 +6800,67 @@ fn smoke_route_multi_iface_egress() -> TestResult {
 }
 kernel_test_in!("net/route", smoke_route_multi_iface_egress);
 
+/// `fib_table_lookup` with `flowi4_oif` set: among the routes through the
+/// output device the longest prefix wins, and at equal prefixes the lowest
+/// metric (`fa_info->fib_priority` order). A default route installed before
+/// the device's connected /22 must not capture a destination on that LAN,
+/// and another device's lower-metric default must not be taken at all.
+fn smoke_route_oif_lookup_takes_the_longest_prefix_on_the_device() -> TestResult {
+    use crate::ifaddr::{__reset_for_test as ifaddr_reset, iface_add_addr};
+    use crate::ipv4::Ipv4Addr;
+    use crate::route::{
+        Ipv4Net, Route, Scope, __reset_for_test, route_add, route_lookup_oif_in, TABLE_MAIN,
+    };
+    use alloc::string::String;
+    const A: &str = "rt-oif-a";
+    const B: &str = "rt-oif-b";
+    const B_IP: [u8; 4] = [10, 48, 1, 211];
+    let default_via = |iface: &str, gateway: [u8; 4], metric: u32| {
+        route_add(Route {
+            net_ns_id: 0,
+            dst: Ipv4Net {
+                addr: Ipv4Addr([0; 4]),
+                prefix_len: 0,
+            },
+            gateway: Some(Ipv4Addr(gateway)),
+            iface: String::from(iface),
+            src_hint: None,
+            metric,
+            scope: Scope::Universe,
+            table: TABLE_MAIN,
+            protocol: crate::route::RTPROT_KERNEL,
+        });
+    };
+
+    __reset_for_test();
+    ifaddr_reset();
+    // B's default route first, then its address and connected 10.48.0.0/22;
+    // a second default through B at a lower metric; A's default lower still.
+    default_via(B, [10, 48, 1, 254], 600);
+    iface_add_addr(B, Ipv4Addr(B_IP), 22);
+    default_via(B, [10, 48, 1, 253], 20);
+    default_via(A, [10, 48, 8, 1], 10);
+
+    let lan = route_lookup_oif_in(0, Ipv4Addr([10, 48, 2, 9]), B);
+    let off_link = route_lookup_oif_in(0, Ipv4Addr([1, 1, 1, 1]), B);
+    __reset_for_test();
+    ifaddr_reset();
+    if lan.gateway.is_some() || lan.nexthop != Ipv4Addr([10, 48, 2, 9]) || lan.iface != B {
+        return TestResult::Fail("a LAN destination bound to B went via B's default gateway");
+    }
+    if lan.src != Ipv4Addr(B_IP) {
+        return TestResult::Fail("the on-link route through B did not source from B's address");
+    }
+    if off_link.gateway != Some(Ipv4Addr([10, 48, 1, 253])) || off_link.iface != B {
+        return TestResult::Fail("B's lowest-metric default route was not chosen through B");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/route-oif-lpm",
+    smoke_route_oif_lookup_takes_the_longest_prefix_on_the_device
+);
+
 fn smoke_arp_gratuitous_does_not_panic() -> TestResult {
     use crate::arp_cache::send_gratuitous_arp;
     send_gratuitous_arp("garp_eth0", [192, 168, 1, 5]);
