@@ -858,8 +858,9 @@ impl FuseConnection {
         nodeid: u64,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, FsError> {
+        // `fuse_get_req`: `if (!fc->connected) goto out;` with -ENOTCONN.
         if !self.is_connected() {
-            return Err(FsError::Unsupported);
+            return Err(FsError::NotConnected);
         }
         let unique = self.submit(opcode, nodeid, &body);
         let reply = self.await_reply(unique).await?;
@@ -876,7 +877,7 @@ impl FuseConnection {
             return Ok(());
         }
         if !self.is_connected() {
-            return Err(FsError::Unsupported);
+            return Err(FsError::NotConnected);
         }
         let body = pod_as_bytes(&FuseSyncfsIn::default());
         let unique = self.submit(FuseOpcode::Syncfs, FUSE_ROOT_ID, &body);
@@ -996,10 +997,26 @@ impl core::future::Future for ReplyFuture {
 const ENOTCONN: u32 = 107;
 
 /// Translate a FUSE `-errno` reply into an [`FsError`].
+/// A daemon's error reply as the caller sees it: Linux hands the errno back
+/// unchanged, so each one maps to the `FsError` that turns back into it.
+/// ENOSYS stays `Unsupported`: Linux turns it into a per-operation answer
+/// (no FUSE_OPEN needed, EOPNOTSUPP for xattrs, success for flush), and the
+/// callers here that need one key on `Unsupported`.
 fn errno_to_fs_error(neg_errno: i32) -> FsError {
     match -neg_errno {
         1 => FsError::OperationNotPermitted,  // EPERM
         2 => FsError::NotFound,               // ENOENT
+        3 => FsError::NoSuchProcess,          // ESRCH
+        4 => FsError::Interrupted,            // EINTR
+        9 => FsError::BadFd,                  // EBADF
+        12 => FsError::OutOfMemory,           // ENOMEM
+        14 => FsError::BadAddress,            // EFAULT
+        18 => FsError::CrossDevice,           // EXDEV
+        19 => FsError::NoDevice,              // ENODEV
+        27 => FsError::FileTooLarge,          // EFBIG
+        32 => FsError::BrokenPipe,            // EPIPE
+        40 => FsError::SymlinkLoop,           // ELOOP
+        107 => FsError::NotConnected,         // ENOTCONN
         7 => FsError::ArgumentListTooLong,    // E2BIG
         13 => FsError::PermissionDenied,      // EACCES
         11 | 16 | 17 | 39 => FsError::Busy,   // EAGAIN / EBUSY / EEXIST / ENOTEMPTY
