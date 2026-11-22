@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! AR9285 legacy20 target-power interpolation and factory CTL limiting.
 //! The inactive probe supplies a zero-dBm ceiling; this grants no TX rights.
-use crate::{
-    ath9k::{
-        identity::{BringUpError, RegisterIo},
-        EEPROM_4K_BYTES,
-    },
-    qualcomm_regulatory::Factory,
+use crate::ath9k::{
+    identity::{BringUpError, RegisterIo},
+    EEPROM_4K_BYTES,
 };
+use narf_drivers_wireless_ath_core::qualcomm_regulatory::Factory;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::ath9k) struct Plan {
     pub(in crate::ath9k) registers: [(u64, u32); 7],

@@ -29,17 +29,15 @@
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::MODAL;
-use crate::{
-    ath9k::{
-        chips::MAP_9287,
-        identity::{eeprom_word, BringUpError, RegisterIo},
-        phy::{
-            rates::{edge_power, initial_ctl, limit_with, target},
-            rmw,
-        },
+use crate::ath9k::{
+    chips::MAP_9287,
+    identity::{eeprom_word, BringUpError, RegisterIo},
+    phy::{
+        rates::{edge_power, initial_ctl, limit_with, target},
+        rmw,
     },
-    qualcomm_regulatory::Factory,
 };
+use narf_drivers_wireless_ath_core::qualcomm_regulatory::Factory;
 
 /// `baseEepHeader.txMask`.
 const TX_MASK: usize = 19;
