@@ -73,10 +73,22 @@ pub fn image_path() -> String {
 /// restored [`hibernate`] runs the restore callbacks itself.
 static RESTORING: AtomicBool = AtomicBool::new(false);
 
+/// The image's protection: `narf.hibernate_policy=off` opts out of the TPM
+/// seal (the image is still authenticated, but anyone with the disk can
+/// read it, as a default Linux image). The default is TPM sealing. The
+/// resuming boot must opt in too, or an unsealed image is refused.
+pub fn policy() -> PolicyLevel {
+    match narf_boot::args().value("narf.hibernate_policy") {
+        Some("off") => PolicyLevel::Off,
+        _ => PolicyLevel::Tpm,
+    }
+}
+
 /// `hibernation_available`: whether `disk` is offered. This arch can
-/// restore an image and a TPM can wrap its key slot.
+/// restore an image, and a TPM can wrap its key slot unless the policy
+/// opted out.
 pub fn available() -> bool {
-    arch::SUPPORTED && TpmAnchor::production().is_some()
+    arch::SUPPORTED && (policy() == PolicyLevel::Off || TpmAnchor::production().is_some())
 }
 
 /// Whether the S3 wake path is resuming a hibernation image.
@@ -124,7 +136,11 @@ pub async fn hibernate(cap: &Cap<Power, Invoke>) -> Result<(), HibernateError> {
     if online > 1 {
         return Err(HibernateError::SecondaryCpus(online));
     }
-    let tpm = TpmAnchor::production().ok_or(HibernateError::NoTpm)?;
+    let level = policy();
+    let tpm = match level {
+        PolicyLevel::Off => None,
+        _ => Some(TpmAnchor::production().ok_or(HibernateError::NoTpm)?),
+    };
     suspend::claim_suspend_transition().map_err(|_| HibernateError::Busy)?;
     let _claim = Claim;
 
@@ -146,7 +162,7 @@ pub async fn hibernate(cap: &Cap<Power, Invoke>) -> Result<(), HibernateError> {
     let result = if transition.succeeded() {
         match freezer::freeze_kernel_threads().await {
             Ok(()) => {
-                let result = snapshot_and_write(&file, &tpm);
+                let result = snapshot_and_write(&file, tpm.as_ref());
                 freezer::thaw_kernel_threads();
                 result
             }
@@ -169,7 +185,10 @@ pub async fn hibernate(cap: &Cap<Power, Invoke>) -> Result<(), HibernateError> {
 /// `hibernation_snapshot` + `swsusp_write` + `power_down`. Returns only in
 /// the restored image (`Ok`) or when the hibernation failed (`Err`), with
 /// the devices running again either way.
-fn snapshot_and_write(file: &image_file::ImageFile, tpm: &TpmAnchor) -> Result<(), HibernateError> {
+fn snapshot_and_write(
+    file: &image_file::ImageFile,
+    tpm: Option<&TpmAnchor>,
+) -> Result<(), HibernateError> {
     let mut prealloc = snapshot::preallocate().map_err(HibernateError::Snapshot)?;
     if !device_pm::freeze_all_devices().ok() {
         device_pm::set_hibernate_recovering(true);
@@ -279,11 +298,11 @@ fn recover_after_thaw() {
     recover();
 }
 
-/// `swsusp_write`: seal the payload into the image file under a fresh slot
-/// the TPM wraps.
+/// `swsusp_write`: seal the payload into the image file, under a fresh
+/// slot the TPM wraps, or under the OFF policy without one.
 fn write_image(
     file: &image_file::ImageFile,
-    tpm: &TpmAnchor,
+    tpm: Option<&TpmAnchor>,
     prealloc: &snapshot::Prealloc,
     record: &ArchRecord,
 ) -> Result<(), HibernateError> {
@@ -292,10 +311,22 @@ fn write_image(
     header.arch = record.encode();
     let source = PayloadSource::new(&header, snapshot);
     let mut service = SuspendService::new(HwKeyEntropy);
-    service.create_epoch().map_err(HibernateError::Seal)?;
-    service.enroll(tpm).map_err(HibernateError::Seal)?;
+    let level = match tpm {
+        Some(tpm) => {
+            service.create_epoch().map_err(HibernateError::Seal)?;
+            service.enroll(tpm).map_err(HibernateError::Seal)?;
+            PolicyLevel::Tpm
+        }
+        None => {
+            let _ = narf_console::write_str(&alloc::format!(
+                "  hibernate: narf.hibernate_policy=off: {}\n",
+                crate::suspend_service::OFF_POLICY_WARNING
+            ));
+            PolicyLevel::Off
+        }
+    };
     let policy = RecordedPolicy {
-        level: PolicyLevel::Tpm,
+        level,
         policy_epoch: 0,
     };
     let mut store = file.store();
@@ -325,6 +356,8 @@ pub enum ResumeSkip {
     Payload(RestoreError),
     /// The RAM layout differs from the image's.
     MemoryMapChanged,
+    /// An unsealed (OFF-policy) image, and this boot did not opt in.
+    OffPolicyRefused,
     Arch(ArchError),
     Devices,
     Store,
@@ -372,6 +405,9 @@ fn resume_from(device: &str, offset: u64) -> ResumeSkip {
         Err(ResumeRefusal::NoImage) => return ResumeSkip::NoImage,
         Err(e) => return ResumeSkip::Refused(e),
     };
+    if verified.policy().level == PolicyLevel::Off && policy() != PolicyLevel::Off {
+        return ResumeSkip::OffPolicyRefused;
+    }
     let (header, mut loader) = match restore::load_payload(&verified, &store) {
         Ok(loaded) => loaded,
         Err(e) => return ResumeSkip::Payload(e),

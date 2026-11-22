@@ -1573,7 +1573,8 @@ narf.resume_offset=<block>` (4 KiB units), Linux's `resume=` and
 ```rust
 // narf_power::hibernate
 pub const DEFAULT_IMAGE_PATH: &str = "/hibernate.img";      // narf.hibernate_file= overrides
-pub fn available() -> bool;                                  // hibernation_available: arch restore + TPM
+pub fn policy() -> PolicyLevel;                              // narf.hibernate_policy=off, else Tpm
+pub fn available() -> bool;                                  // hibernation_available: arch restore + (TPM or off)
 pub enum HibernateError { AuthorityRevoked, Busy, SecondaryCpus(u32), NoTpm, ImageFile(..), Freeze(..),
                           Devices, Snapshot(..), Arch(..), Seal(..) }
 pub async fn hibernate(cap: &Cap<Power, Invoke>) -> Result<(), HibernateError>;  // hibernate()
@@ -1630,6 +1631,12 @@ flushes the TLB including globals, and enters the image's `s3_wake_entry`
 at its physical address. The wake entry reloads the image's EFER, CR3,
 RSP, GDT, IDT, CR0 and CR4 and long-jumps back into `capture`. The S3
 wake hook skips its device resume while `restoring_image()`.
+
+`narf.hibernate_policy=off` seals under the OFF policy instead of a TPM
+slot. That image is authenticated but readable from the disk, like a
+default Linux image, and the boot prints `OFF_POLICY_WARNING`. A resume
+refuses an OFF image (`OffPolicyRefused`) unless its own command line
+opts in too, so an unsealed image someone planted is never restored.
 
 aarch64 has no restore yet: `SUPPORTED` is false there, and both entry
 points refuse up front. Both also refuse while more than one CPU is

@@ -226,7 +226,13 @@ pub fn register_initcalls() {
     });
     // `software_resume`: once the block and TPM drivers are up, before
     // userspace, restore a hibernation image if `narf.resume=` names one.
-    // It returns only when the boot goes on without one.
+    // It returns only when the boot goes on without one. It must also run
+    // before any filesystem is mounted read-write (Linux resumes before
+    // `prepare_namespace`): a boot kernel that replays a journal or
+    // updates a superblock, then restores an image holding its own view of
+    // that filesystem, corrupts it. power's initcalls are registered ahead
+    // of `root-mount-auto` (frame/src/bare_main.rs), and registration order
+    // is execution order within a stage.
     narf_init::register(Stage::Late, "hibernate-resume", || {
         let _ = hibernate::software_resume();
         InitResult::Ok
