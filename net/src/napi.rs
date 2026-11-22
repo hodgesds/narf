@@ -154,6 +154,321 @@ impl AdaptiveItr {
     }
 }
 
+// ── NAPI in softirq context: the bounded pump and its deferral ─────────────
+
+/// `MAX_SOFTIRQ_RESTART` (`kernel/softirq.c`): `__do_softirq` runs the
+/// pending handlers at most this many times per IRQ exit.
+pub const MAX_SOFTIRQ_RESTART: u32 = 10;
+/// `MAX_SOFTIRQ_TIME` (2 ms): `__do_softirq` stops restarting after this.
+pub const MAX_SOFTIRQ_TIME_NS: u64 = 2_000_000;
+/// `netdev_budget`: packets one `net_rx_action` round processes.
+pub const NETDEV_BUDGET: u32 = 300;
+/// `netdev_budget_usecs` (2000 µs): one `net_rx_action` round's time limit.
+pub const NETDEV_BUDGET_NS: u64 = 2_000_000;
+
+/// What a receive pump does after a NAPI poll that left work queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoftirqNext {
+    /// Poll again in this context.
+    Repoll,
+    /// The softirq bound is spent: hand the queue to its deferral task
+    /// (`wakeup_softirqd`).
+    Defer,
+}
+
+/// The work one softirq-context run (one IRQ wake) may do.
+#[derive(Clone, Copy, Debug)]
+pub struct SoftirqBudget {
+    start_ns: u64,
+    round_start_ns: u64,
+    round_packets: u32,
+    rounds: u32,
+}
+
+impl SoftirqBudget {
+    /// A run starting at `now_ns`.
+    pub fn start(now_ns: u64) -> Self {
+        Self {
+            start_ns: now_ns,
+            round_start_ns: now_ns,
+            round_packets: 0,
+            rounds: 0,
+        }
+    }
+
+    /// Account a NAPI poll that processed `processed` frames and left work
+    /// queued, at `now_ns`.
+    pub fn account(&mut self, processed: u32, now_ns: u64) -> SoftirqNext {
+        let _ = (processed, now_ns);
+        SoftirqNext::Repoll
+    }
+}
+
+/// The task spec of a NIC queue's receive pump on `cpu`.
+pub fn rx_pump_spec(cpu: u32) -> narf_scheduler::TaskSpec {
+    let mut spec = narf_scheduler::TaskSpec::unthrottled()
+        .with_work_kind(narf_scheduler::WorkKind::SoftIrq);
+    spec.affinity =
+        narf_scheduler::affinity::Affinity::pinned(narf_scheduler::affinity::CpuId(cpu));
+    spec
+}
+
+/// The task spec of a queue's deferral task on `cpu`, if the pump has one.
+pub fn rx_deferral_spec(cpu: u32) -> Option<narf_scheduler::TaskSpec> {
+    let _ = cpu;
+    None
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod softirq_tests {
+    //! The receive pump's policy on one CPU, simulated against NARF's
+    //! strict-class dispatcher: a higher class always runs first; tasks of
+    //! one class share the CPU in slices. A Default-class hog is always
+    //! runnable on the queue's CPU, as in the desktop reproduction (a busy
+    //! loop pinned to each queue CPU dropped RQDPC on igc queue 2).
+    use super::*;
+    use alloc::vec::Vec;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_scheduler::SchedClass;
+
+    /// Cost of one received frame in a NAPI poll.
+    const POLL_NS_PER_FRAME: u64 = 50;
+    /// Time slice two Default-class tasks share the CPU by.
+    const SLICE_NS: u64 = 1_000_000;
+    /// The hog runs in quanta this long; an IRQ-woken higher-class task
+    /// preempts at a quantum boundary.
+    const HOG_QUANTUM_NS: u64 = 1_000;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Who {
+        Pump,
+        Deferral,
+        Hog,
+    }
+
+    #[derive(Default, Debug)]
+    struct Outcome {
+        /// Frames that found the ring full (igc RQDPC).
+        overruns: u64,
+        hog_ran_ns: u64,
+        /// The longest stretch the softirq-context pump kept a runnable hog
+        /// off the CPU.
+        max_softirq_stretch_ns: u64,
+        deferral_polls: u64,
+        first_deferral_ns: Option<u64>,
+        /// Frames the softirq-context pump processed before its first
+        /// deferral.
+        softirq_frames_before_defer: u64,
+    }
+
+    fn rank(class: SchedClass) -> u8 {
+        match class {
+            SchedClass::Idle => 0,
+            SchedClass::Batch => 1,
+            SchedClass::Default => 2,
+            SchedClass::Interactive => 3,
+            SchedClass::Realtime => 4,
+        }
+    }
+
+    /// `arrivals_per_us` frames reach a `ring_cap`-slot ring every µs for
+    /// `duration_us`.
+    fn simulate(arrivals_per_us: u64, ring_cap: u64, duration_us: u64) -> Outcome {
+        let pump_class = rx_pump_spec(0).class;
+        let deferral_class = rx_deferral_spec(0).map(|spec| spec.class);
+        let mut out = Outcome::default();
+        let (mut now, end) = (0u64, duration_us * 1000);
+        let (mut ring, mut arrival_acc) = (0u64, 0u64);
+        let (mut armed, mut irq, mut softirq, mut deferred) = (true, false, false, false);
+        let mut budget = SoftirqBudget::start(0);
+        let mut stretch_start: Option<u64> = None;
+        let (mut holder, mut holder_since) = (Who::Hog, 0u64);
+        while now < end {
+            let pump_ready = !deferred && (irq || softirq);
+            let deferral_ready = deferred && deferral_class.is_some();
+            let mut ready: Vec<(Who, SchedClass)> = Vec::new();
+            if pump_ready {
+                ready.push((Who::Pump, pump_class));
+            }
+            if deferral_ready {
+                ready.push((Who::Deferral, deferral_class.unwrap_or(SchedClass::Default)));
+            }
+            ready.push((Who::Hog, SchedClass::Default));
+            let top = ready.iter().map(|(_, c)| rank(*c)).max().unwrap_or(0);
+            let peers: Vec<Who> = ready
+                .iter()
+                .filter(|(_, c)| rank(*c) == top)
+                .map(|(w, _)| *w)
+                .collect();
+            let who = if peers.len() == 1 {
+                peers[0]
+            } else if peers.contains(&holder) && now - holder_since < SLICE_NS {
+                holder
+            } else {
+                let next = peers
+                    .iter()
+                    .copied()
+                    .find(|w| *w != holder)
+                    .unwrap_or(peers[0]);
+                holder = next;
+                holder_since = now;
+                next
+            };
+            if who == Who::Pump && stretch_start.is_none() {
+                stretch_start = Some(now);
+            }
+            let (cost, polled) = match who {
+                Who::Hog => {
+                    if let Some(start) = stretch_start.take() {
+                        out.max_softirq_stretch_ns = out.max_softirq_stretch_ns.max(now - start);
+                    }
+                    out.hog_ran_ns += HOG_QUANTUM_NS;
+                    (HOG_QUANTUM_NS, 0)
+                }
+                Who::Pump | Who::Deferral => {
+                    if who == Who::Pump && irq {
+                        irq = false;
+                        softirq = true;
+                        budget = SoftirqBudget::start(now);
+                    }
+                    let n = ring.min(u64::from(DEFAULT_BUDGET));
+                    ring -= n;
+                    ((n * POLL_NS_PER_FRAME).max(100), n as u32)
+                }
+            };
+            // Frames keep arriving while the CPU works.
+            arrival_acc += arrivals_per_us * cost;
+            let arrived = arrival_acc / 1000;
+            arrival_acc %= 1000;
+            ring += arrived;
+            if ring > ring_cap {
+                out.overruns += ring - ring_cap;
+                ring = ring_cap;
+            }
+            now += cost;
+            match who {
+                Who::Pump => {
+                    if out.first_deferral_ns.is_none() {
+                        out.softirq_frames_before_defer += u64::from(polled);
+                    }
+                    if ring == 0 {
+                        softirq = false;
+                        armed = true;
+                    } else if budget.account(polled, now) == SoftirqNext::Defer
+                        && deferral_class.is_some()
+                    {
+                        softirq = false;
+                        deferred = true;
+                        out.first_deferral_ns.get_or_insert(now);
+                    }
+                }
+                Who::Deferral => {
+                    out.deferral_polls += 1;
+                    if ring == 0 {
+                        deferred = false;
+                        armed = true;
+                    }
+                }
+                Who::Hog => {}
+            }
+            if armed && ring > 0 {
+                armed = false;
+                irq = true;
+            }
+        }
+        if let Some(start) = stretch_start {
+            out.max_softirq_stretch_ns = out.max_softirq_stretch_ns.max(now - start);
+        }
+        out
+    }
+
+    /// `__do_softirq` + `net_rx_action`: a softirq run ends after
+    /// MAX_SOFTIRQ_RESTART rounds of NETDEV_BUDGET packets, or after
+    /// MAX_SOFTIRQ_TIME, whichever comes first, and never before.
+    fn smoke_softirq_budget_bounds_one_irq_wake() -> TestResult {
+        // Fast polls: the round count ends the run.
+        let mut budget = SoftirqBudget::start(0);
+        let mut polls = 0u32;
+        let mut now = 0u64;
+        loop {
+            polls += 1;
+            now += 3_200;
+            if budget.account(DEFAULT_BUDGET, now) == SoftirqNext::Defer {
+                break;
+            }
+            if polls > 1_000 {
+                return TestResult::Fail("fast polls never ended the softirq run");
+            }
+        }
+        // 300 packets end a round after five 64-frame polls; ten rounds.
+        if polls != 50 {
+            return TestResult::Fail("the run did not end after ten 300-packet rounds");
+        }
+        // Slow polls: MAX_SOFTIRQ_TIME ends the run.
+        let mut budget = SoftirqBudget::start(0);
+        let mut deferred_at = None;
+        for i in 1..=8u64 {
+            if budget.account(8, i * 600_000) == SoftirqNext::Defer {
+                deferred_at = Some(i * 600_000);
+                break;
+            }
+        }
+        if deferred_at != Some(2_400_000) {
+            return TestResult::Fail("the run did not end at the first poll past 2 ms");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/napi-softirq", smoke_softirq_budget_bounds_one_irq_wake);
+
+    /// A Default-class hog pinned to the queue's CPU: a softirq-priority
+    /// pump drains the ring as frames arrive, so nothing overruns. A pump
+    /// sharing the CPU with the hog waits out the hog's slice while the
+    /// ring fills (the RQDPC drops seen on the desktop).
+    fn smoke_softirq_pump_drains_under_a_cpu_hog() -> TestResult {
+        let out = simulate(1, 256, 20_000);
+        if out.overruns != 0 {
+            return TestResult::Fail("the ring overran while a hog shared the queue CPU");
+        }
+        if out.hog_ran_ns < 10_000_000 {
+            return TestResult::Fail("the hog was starved at a load the pump keeps up with");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/napi-softirq",
+        smoke_softirq_pump_drains_under_a_cpu_hog
+    );
+
+    /// A flood the queue cannot keep up with: the softirq-context pump
+    /// stops at the softirq bound and its Default-class deferral task (the
+    /// ksoftirqd role) takes the queue over, so the hog keeps running and is
+    /// never kept off the CPU by softirq work for longer than the bound.
+    fn smoke_softirq_flood_defers_and_never_starves() -> TestResult {
+        let out = simulate(40, 256, 20_000);
+        let Some(first) = out.first_deferral_ns else {
+            return TestResult::Fail("no deferral task took the flooded queue over");
+        };
+        if out.deferral_polls == 0 {
+            return TestResult::Fail("the deferral task never polled the queue");
+        }
+        // Not before the bound: ten full rounds, or 2 ms.
+        if out.softirq_frames_before_defer
+            < u64::from(MAX_SOFTIRQ_RESTART) * u64::from(NETDEV_BUDGET)
+            && first < MAX_SOFTIRQ_TIME_NS
+        {
+            return TestResult::Fail("the queue was deferred before the softirq bound");
+        }
+        if out.max_softirq_stretch_ns > MAX_SOFTIRQ_TIME_NS + 64 * POLL_NS_PER_FRAME {
+            return TestResult::Fail("softirq work kept the hog off the CPU past 2 ms");
+        }
+        if out.hog_ran_ns < 8_000_000 {
+            return TestResult::Fail("the hog did not get its share under a flood");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/napi-softirq", smoke_softirq_flood_defers_and_never_starves);
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod napi_tests {
     use super::*;
