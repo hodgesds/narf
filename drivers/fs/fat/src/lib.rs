@@ -84,6 +84,9 @@ impl<B: BlockDevice + 'static> FsInstance for FatMount<B> {
     fn always_read_only(&self) -> bool {
         self.0.always_read_only()
     }
+    fn statfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsStat> {
+        self.0.statfs()
+    }
 }
 
 /// FAT Version
