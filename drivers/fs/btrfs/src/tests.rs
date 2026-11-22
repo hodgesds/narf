@@ -27,6 +27,7 @@ mod commit_scale;
 mod concurrent_ops;
 mod data_cache;
 mod default_acl;
+mod dir_xattr;
 mod extent_window;
 mod group_commit;
 mod grow_tall;
