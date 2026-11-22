@@ -138,3 +138,141 @@ kernel_test_in!(
     "syscall_abi",
     smoke_sync_file_error_pending_leaf_order_matches_linux_info_queries
 );
+
+/// A fence whose driver records its signal time, as `dma_fence_signal`
+/// stamps `fence->timestamp`: pending until `signal(status, at)`.
+struct Timed {
+    status: AtomicI32,
+    at: core::sync::atomic::AtomicU64,
+    context: u64,
+}
+impl Timed {
+    fn new(context: u64) -> Arc<Self> {
+        Arc::new(Self {
+            status: AtomicI32::new(0),
+            at: core::sync::atomic::AtomicU64::new(0),
+            context,
+        })
+    }
+    fn signal(&self, status: i32, at: u64) {
+        self.at.store(at, Ordering::Release);
+        self.status.store(status, Ordering::Release);
+    }
+}
+impl DrmFence for Timed {
+    fn is_signalled(&self) -> bool {
+        self.status() != 0
+    }
+    fn status(&self) -> i32 {
+        self.status.load(Ordering::Acquire)
+    }
+    fn wait(&self, _: u64) -> bool {
+        self.is_signalled()
+    }
+    fn context(&self) -> Option<u64> {
+        Some(self.context)
+    }
+    fn seqno(&self) -> u64 {
+        1
+    }
+    fn timestamp_ns(&self) -> Option<u64> {
+        self.is_signalled().then(|| self.at.load(Ordering::Acquire))
+    }
+}
+/// A fence that completes while FILE_INFO looks at it: pending at its first
+/// observation, signalled (status 1, no driver timestamp) from then on.
+struct Completing(core::sync::atomic::AtomicU32);
+impl DrmFence for Completing {
+    fn is_signalled(&self) -> bool {
+        self.0.fetch_add(1, Ordering::AcqRel) > 0
+    }
+    fn wait(&self, _: u64) -> bool {
+        self.is_signalled()
+    }
+}
+/// Entry `i`'s `(status, timestamp_ns)` after `Memory::query(.., true, ..)`.
+fn entry(memory: &Memory, i: u64) -> (i32, u64) {
+    let mut bytes = [0u8; SYNC_FENCE_INFO_SIZE];
+    memory
+        .read(128 + i * SYNC_FENCE_INFO_SIZE as u64, &mut bytes)
+        .unwrap();
+    (
+        i32::from_ne_bytes(bytes[64..68].try_into().unwrap()),
+        u64::from_ne_bytes(bytes[72..80].try_into().unwrap()),
+    )
+}
+
+/// Chromium's `GpuFence::GetStatusChangeTime` reads FILE_INFO twice (count,
+/// then the array) and logs "No timestamp provided from
+/// sync_(pt|fence)_info" when the file's status is 1 but every
+/// `sync_fence_info.timestamp_ns` is 0. Linux's `sync_fill_fence_info` takes
+/// `dma_fence_get_status(fence)` first and only then the timestamp of a
+/// fence `dma_fence_is_signaled` reports signalled, the time
+/// `dma_fence_signal_timestamp` recorded: a status of 1 or an error always
+/// comes with that time. A pending fence reports 0; a fence the driver
+/// stamped reports its stamp, not the query's time; a merged file reports
+/// each leaf's; an errored fence its error and signal time.
+fn smoke_sync_file_info_reports_signal_times_like_sync_fill_fence_info() -> TestResult {
+    let memory = Memory::new();
+    // Pending, then signalled at a recorded time, queried much later.
+    let fence = Timed::new(0x51);
+    let file = DrmSyncFile::device(fence.clone());
+    if memory.query(&file, true, 1) != (0, alloc::vec![0]) || entry(&memory, 0).1 != 0 {
+        return TestResult::Fail("a pending fence reported a status or a timestamp");
+    }
+    fence.signal(1, 4_000_000);
+    if memory.query(&file, false, 1).0 != 1
+        || memory.query(&file, true, 1) != (1, alloc::vec![1])
+        || entry(&memory, 0).1 != 4_000_000
+    {
+        return TestResult::Fail("a signalled fence did not report its signal time");
+    }
+    // A fence completing between the two samples FILE_INFO takes of it.
+    let file = DrmSyncFile::device(Arc::new(Completing(core::sync::atomic::AtomicU32::new(0))));
+    let (status, _) = memory.query(&file, true, 1);
+    let (leaf, timestamp) = entry(&memory, 0);
+    if (status != 0 || leaf != 0) && timestamp == 0 {
+        return TestResult::Fail("a signalled status came without a timestamp");
+    }
+    let (status, _) = memory.query(&file, true, 1);
+    let (_, again) = entry(&memory, 0);
+    if status != 1 || again == 0 || (timestamp != 0 && again != timestamp) {
+        return TestResult::Fail("a signalled fence's timestamp is missing or moved");
+    }
+    // A merge of two pending fences: each leaf keeps its own signal time.
+    let (a, b) = (Timed::new(0x60), Timed::new(0x70));
+    let merged = DrmSyncFile::merge(
+        &DrmSyncFile::device(a.clone()),
+        &DrmSyncFile::device(b.clone()),
+        &[0; 32],
+    );
+    a.signal(1, 5_000_000);
+    if memory.query(&merged, true, 2) != (0, alloc::vec![1, 0])
+        || entry(&memory, 0).1 != 5_000_000
+        || entry(&memory, 1).1 != 0
+    {
+        return TestResult::Fail("a half-signalled merge");
+    }
+    b.signal(1, 6_000_000);
+    if memory.query(&merged, true, 2) != (1, alloc::vec![1, 1])
+        || entry(&memory, 0).1 != 5_000_000
+        || entry(&memory, 1).1 != 6_000_000
+    {
+        return TestResult::Fail("a signalled merge lost a leaf's signal time");
+    }
+    // An errored fence: its error, and the time it signalled.
+    let failed = Timed::new(0x80);
+    let file = DrmSyncFile::device(failed.clone());
+    failed.signal(-5, 7_000_000);
+    if memory.query(&file, false, 1).0 != -5
+        || memory.query(&file, true, 1) != (-5, alloc::vec![-5])
+        || entry(&memory, 0).1 != 7_000_000
+    {
+        return TestResult::Fail("an errored fence's status or signal time");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "syscall_abi/sync-file-info",
+    smoke_sync_file_info_reports_signal_times_like_sync_fill_fence_info
+);
