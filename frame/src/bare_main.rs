@@ -6055,6 +6055,11 @@ fn boot_userspace_init() {
                 // execve and the binary issues raw Linux x86_64
                 // syscalls (write=1, exit_group=231).
                 ("hello", narf_verification::NARF_HELLO_STATIC_ELF),
+                // IA-32 compat: an i386 static ELF32 (`hello_i386.S`,
+                // assembled at build time) making `write`/`exit_group`
+                // through the i386 `int 0x80` gate after a
+                // compatibility-mode entry.
+                ("hello_i386", narf_verification::NARF_HELLO_I386_ELF),
                 // Wave-78 follow-up 2: real musl-static binary built
                 // with musl-gcc. Exercises the actual musl init path
                 // (set_tid_address / rt_sigaction / brk / ...). Caveat:

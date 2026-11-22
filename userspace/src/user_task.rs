@@ -1114,6 +1114,9 @@ pub struct ExecRequest {
     pub entry: u64,
     pub stack_top: u64,
     pub fs_base: Option<u64>,
+    /// The new image is ELF32 (`UserProcess::ia32`): enter it in
+    /// compatibility mode.
+    pub ia32: bool,
     /// Exec page-in plan (#740) for `new_as`, carried from the loader
     /// through the handler. The polling routine moves it into the
     /// future's `pending_page_in` when it applies this request; the
@@ -3855,6 +3858,10 @@ impl core::future::Future for UserTaskFuture {
                 this.process.entry = crate::EntryPoint(narf_memory::VirtAddr::new(req.entry));
                 this.process.stack_top = narf_memory::VirtAddr::new(req.stack_top);
                 this.process.fs_base = req.fs_base;
+                // The new image's mode, and no TLS slots or selectors from the
+                // old one (Linux `flush_thread` / `start_thread_common`).
+                this.process.ia32 = req.ia32;
+                this.process.segs = crate::UserSegments::default();
                 // Stash the exec page-in plan (#740): the next poll
                 // activates the new AS (state Initial below) and drives
                 // the plan there, where the batch's live-root contract

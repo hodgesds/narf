@@ -3251,6 +3251,9 @@ fn do_execve_resolved(
         let rsp = new_proc.stack_top.as_u64();
         #[cfg(target_arch = "x86_64")]
         let fs_base = new_proc.fs_base;
+        // An ELF32 image enters in compatibility mode (`start_thread_ia32`).
+        #[cfg(target_arch = "x86_64")]
+        let ia32 = new_proc.ia32;
         // The scheduler slot (PENDING_SLOT_AS entry from Step 5) holds the
         // persistent reference that keeps the new AS alive while the task
         // runs; this local clone only bridges the activate() below.
@@ -3376,6 +3379,15 @@ fn do_execve_resolved(
         let top = narf_scheduler::stackful::current_stackful_stack_top();
         // This jump skips the syscall return path and its CPU-time hook.
         narf_scheduler::cputime::user_enter();
+        #[cfg(target_arch = "x86_64")]
+        if ia32 {
+            // SAFETY: as below; the loader mapped entry/rsp below 4 GiB. CS =
+            // __USER32_CS with the fresh-image data segments and zero FS/GS
+            // bases (Linux `start_thread_ia32`).
+            unsafe {
+                narf_arch::x86_64::user_mode::enter_user_mode_compat_at_top(entry, rsp, top)
+            };
+        }
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
         // exception stack to this task's top and enters the new image.
         unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) };
@@ -3389,6 +3401,7 @@ fn do_execve_resolved(
         entry: new_proc.entry.0.as_u64(),
         stack_top: new_proc.stack_top.as_u64(),
         fs_base: new_proc.fs_base,
+        ia32: new_proc.ia32,
         // The loader's page-in plan (#740) rides along: the polling
         // routine drives it when it applies this request and first
         // enters the new image. Cloned — `new_proc` is still live here
