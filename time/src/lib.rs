@@ -923,9 +923,10 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
     //    clock, which the invariant TSC matches.
     let hz_amd = narf_arch::x86_64::tsc::calibrate_via_amd_pstate0();
     if hz_amd != 0 {
-        narf_arch::x86_64::tsc::set_hz_via_hpet(hz_amd);
-        apply_cycles_per_ns(hz_amd);
-        return (hz_amd, CalibrationSource::AmdPstate0);
+        let (hz, source) = amd_tsc_hz(hz_amd, |_| None);
+        narf_arch::x86_64::tsc::set_hz_via_hpet(hz);
+        apply_cycles_per_ns(hz);
+        return (hz, source);
     }
     // 5. HPET cross-check. A 100 ms window at the ~14.318 MHz
     //    HPET found on every x86_64 chipset since ICH = ~1.43M
@@ -948,6 +949,17 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
         }
     }
     (0, CalibrationSource::None)
+}
+
+/// The TSC rate the AMD path settles on, from the P-state-0 estimate
+/// `pstate0_hz` and `measure`, which is handed that estimate and returns
+/// the rate a reference counter measured, if one could.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn amd_tsc_hz(
+    pstate0_hz: u64,
+    _measure: impl FnOnce(u64) -> Option<u64>,
+) -> (u64, CalibrationSource) {
+    (pstate0_hz, CalibrationSource::AmdPstate0)
 }
 
 /// Push the measured TSC frequency `hz` into the wall module. Feeds

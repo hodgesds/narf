@@ -308,6 +308,61 @@ kernel_test_in!(
     smoke_hpet_calibration_rejects_a_reference_read_an_smi_split
 );
 
+/// An AMD P-state-0 definition is an estimate of the TSC rate, not the
+/// rate: the TSC counts the P0 multiple of the board's reference clock, and
+/// that clock is not exactly 100 MHz. The 7600X here defines P0 as
+/// 4700 MHz while its TSC runs at 4691.189 MHz (Linux: "Refined TSC
+/// clocksource calibration: 4691.189 MHz"), so a kernel that takes the
+/// definition as the rate runs every TSC clock 1875 ppm slow: 83 s of
+/// dmesg and CLOCK_MONOTONIC time lost against the wall clock in 12.2 h of
+/// that native boot, 120 s in its first 17.6 h.
+///
+/// Linux never takes an AMD TSC rate from a P-state definition: AMD gets no
+/// `native_calibrate_tsc` answer, the early rate comes from the PIT, and
+/// `tsc_refine_calibration_work` replaces it with the rate measured against
+/// the HPET (or the ACPI PM timer) unless that is more than 1% away from
+/// the early one. The AMD path must likewise measure its estimate against
+/// the HPET, keep the estimate when the measurement is unavailable or more
+/// than 1% away, and use the measurement otherwise.
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_pstate0_tsc_rate_is_measured_against_the_hpet() -> TestResult {
+    const P0_HZ: u64 = 4_700_000_000;
+    let asked = core::cell::Cell::new(0);
+    let (hz, _) = crate::amd_tsc_hz(P0_HZ, |early| {
+        asked.set(early);
+        Some(RefSim::TSC_HZ)
+    });
+    if asked.get() != P0_HZ {
+        return TestResult::Fail("the AMD path did not measure its P0 estimate against the HPET");
+    }
+    if hz != RefSim::TSC_HZ {
+        return TestResult::Fail("the AMD path kept its P0 estimate over the measured TSC rate");
+    }
+    // End to end through the HPET sampler, an SMI in its closing reads.
+    let sim = RefSim::new(SmiAt::End(2));
+    let (hz, _) = crate::amd_tsc_hz(P0_HZ, |_| {
+        crate::hpet::measure_tsc(sim.hpet_hz, sim.window, || sim.hpet(), || sim.tsc())
+    });
+    if sim.error_ppm(hz) > 5 {
+        return TestResult::Fail("the AMD path's HPET-measured TSC rate is off by more than 5 ppm");
+    }
+    // `tsc_refine_calibration_work`: "Make sure we're within 1%".
+    if crate::amd_tsc_hz(P0_HZ, |_| Some(4_600_000_000))
+        != (P0_HZ, crate::CalibrationSource::AmdPstate0)
+    {
+        return TestResult::Fail("a measurement over 1% from the P0 estimate was not discarded");
+    }
+    if crate::amd_tsc_hz(P0_HZ, |_| None) != (P0_HZ, crate::CalibrationSource::AmdPstate0) {
+        return TestResult::Fail("without a measurement the AMD path must keep its P0 estimate");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "time/tsc-amd-refine",
+    smoke_amd_pstate0_tsc_rate_is_measured_against_the_hpet
+);
+
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
 
 fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {
