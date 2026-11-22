@@ -349,6 +349,42 @@ pub fn route_lookup_in(net_ns_id: u64, dst: Ipv4Addr) -> Option<RouteResult> {
     })
 }
 
+/// `ip_route_output_key_hash_rcu` with `flowi4_oif` set (SO_BINDTODEVICE,
+/// IP_UNICAST_IF, an IP_PKTINFO ifindex): `fib_lookup` takes only a route
+/// whose nexthop device is `oif` (`fib_lookup_good_nhc`: `flp->flowi4_oif !=
+/// nhc->nhc_oif` → skip). With no such route the destination is taken as
+/// on-link through `oif` ("Apparently, routing tables are wrong. Assume,
+/// that the destination is on link."), sourced from the device's first
+/// address (`inet_select_addr(dev_out, 0, RT_SCOPE_LINK)`).
+pub fn route_lookup_oif_in(net_ns_id: u64, dst: Ipv4Addr, oif: &str) -> RouteResult {
+    let route = ROUTE_TABLE
+        .lock()
+        .iter()
+        .find(|r| r.net_ns_id == net_ns_id && r.iface == oif && r.dst.contains(dst))
+        .cloned();
+    match route {
+        Some(route) => {
+            let nexthop = route.gateway.unwrap_or(dst);
+            let src = choose_src(&route, nexthop, dst);
+            RouteResult {
+                iface: route.iface,
+                nexthop,
+                src,
+                gateway: route.gateway,
+            }
+        }
+        None => RouteResult {
+            iface: String::from(oif),
+            nexthop: dst,
+            src: iface_addrs(oif)
+                .first()
+                .map(|ia| ia.addr)
+                .unwrap_or(Ipv4Addr::UNSPECIFIED),
+            gateway: None,
+        },
+    }
+}
+
 /// Source-address selection function — exported so `tcp_stack` and
 /// `udp_sock` can call it directly without repeating the lookup.
 ///

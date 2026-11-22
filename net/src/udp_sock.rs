@@ -700,15 +700,30 @@ fn udp_send_inner(
     // Resolve the route's NEXT HOP, not the destination. Linux's
     // `ip_neigh_for_gw()` (include/net/route.h) uses the route's gateway when
     // it has one and the destination only when it does not (`rt_nexthop()`).
-    let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(dst_ip))
-        .map(|r| r.nexthop.0)
-        .unwrap_or(dst_ip);
+    // A bound socket routes with `flowi4_oif`: only the bound device's routes
+    // count, and its neighbour table answers (`ip_neigh_for_gw` on
+    // `rt->dst.dev`).
+    let bound = options.bind_to_device != 0;
+    let nexthop = if bound {
+        crate::route::route_lookup_oif_in(net_ns_id, crate::ipv4::Ipv4Addr(dst_ip), &iface.name)
+            .nexthop
+            .0
+    } else {
+        crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(dst_ip))
+            .map(|r| r.nexthop.0)
+            .unwrap_or(dst_ip)
+    };
+    let cached = if bound {
+        crate::arp_cache::lookup(&iface.name, nexthop)
+    } else {
+        crate::tcp_stack::arp_cached_in(net_ns_id, nexthop)
+    };
     // `udp_sendmsg` never waits on neighbour discovery: build the complete
     // frame with a placeholder MAC, queue it below, and let the ARP RX path
     // patch + transmit it (`neigh_output`).
     let pending_neighbor = if is_broadcast {
         None
-    } else if let Some(mac) = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop) {
+    } else if let Some(mac) = cached {
         Some(Ok(mac))
     } else {
         if crate::arp_cache::resolution_failed(&iface.name, nexthop) {
@@ -834,7 +849,14 @@ fn udp_send_inner(
         // Queue before starting ARP so an immediate reply cannot race past
         // the pending frame. If another sender resolved it between our cache
         // lookup and this call, flush synchronously with the returned MAC.
-        if let Some(mac) = crate::tcp_stack::neigh_start_in(net_ns_id, neighbor) {
+        // Resolution runs on the device the frames wait on, so the reply that
+        // releases them is the one that can arrive there.
+        let resolved = if bound {
+            crate::tcp_stack::neigh_start_on(net_ns_id, &iface.name, neighbor)
+        } else {
+            crate::tcp_stack::neigh_start_in(net_ns_id, neighbor)
+        };
+        if let Some(mac) = resolved {
             neighbor_resolved(net_ns_id, &iface.name, neighbor, mac);
         }
         return Ok(payload.len());

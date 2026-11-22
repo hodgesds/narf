@@ -94,6 +94,16 @@ pub fn send_arp_request_in(net_ns_id: u64, target_ip: [u8; 4]) -> Result<(), ()>
     iface.xmit(&frame[..n])
 }
 
+/// `arp_solicit` on a given device: the neighbour table is per device, so
+/// a request for a next hop goes out the device the route chose, from that
+/// device's address.
+pub fn send_arp_request_on(net_ns_id: u64, iface_name: &str, target_ip: [u8; 4]) -> Result<(), ()> {
+    let iface = iface::lookup_in(net_ns_id, iface_name).ok_or(())?;
+    let mut frame = [0u8; 60];
+    let n = pkt::build_arp_request(&mut frame, iface.mac, iface.ipv4, target_ip).ok_or(())?;
+    iface.xmit(&frame[..n])
+}
+
 /// Non-blocking neighbour lookup: the cached MAC for `ip`, or `None`.
 /// For RX-path callers (e.g. a TCP reset) that must never spin on ARP.
 pub(crate) fn arp_cached_in(net_ns_id: u64, ip: [u8; 4]) -> Option<[u8; 6]> {
@@ -156,8 +166,31 @@ pub fn neigh_start_in(net_ns_id: u64, nexthop: [u8; 4]) -> Option<[u8; 6]> {
     }
     arp_cache::mark_incomplete(&name, nexthop);
     neigh_add_timer(net_ns_id, &name, nexthop);
-    let _ = send_arp_request_in(net_ns_id, nexthop);
+    let _ = send_arp_request_on(net_ns_id, &name, nexthop);
     arp_lookup_local(net_ns_id, nexthop)
+}
+
+/// [`neigh_start_in`] for a next hop on a known output device (a route with
+/// `flowi4_oif`, e.g. SO_BINDTODEVICE): the neighbour is `iface_name`'s
+/// (`__ipv4_neigh_lookup_noref(dev, nexthop)`), so only that device's cache
+/// answers and the request goes out that device. `None` once the request is
+/// out, the MAC if the device already knows it.
+pub fn neigh_start_on(net_ns_id: u64, iface_name: &str, nexthop: [u8; 4]) -> Option<[u8; 6]> {
+    if let Some(mac) = arp_cache::lookup(iface_name, nexthop) {
+        return Some(mac);
+    }
+    if arp_cache::resolution_failed(iface_name, nexthop)
+        || matches!(
+            arp_cache::entry_state(iface_name, nexthop),
+            Some(arp_cache::ArpState::Incomplete)
+        )
+    {
+        return None;
+    }
+    arp_cache::mark_incomplete(iface_name, nexthop);
+    neigh_add_timer(net_ns_id, iface_name, nexthop);
+    let _ = send_arp_request_on(net_ns_id, iface_name, nexthop);
+    arp_cache::lookup(iface_name, nexthop)
 }
 
 /// An ARP packet taught us `ip`'s MAC on `iface_name`: send everything that
@@ -286,7 +319,8 @@ fn neigh_timer_handler(nt: &alloc::sync::Arc<NeighTimer>) {
     let (net_ns_id, name, ip) = (nt.net_ns_id, nt.name.as_str(), nt.ip);
     match arp_cache::poll_resolution(name, ip) {
         arp_cache::ResolutionStep::Retransmit => {
-            let _ = send_arp_request_in(net_ns_id, ip);
+            // The retransmission goes out the device this neighbour belongs to.
+            let _ = send_arp_request_on(net_ns_id, name, ip);
         }
         arp_cache::ResolutionStep::GaveUp => {
             for cont in arp_cache::take_pending(net_ns_id, name, ip) {

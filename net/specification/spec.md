@@ -971,6 +971,12 @@ an ICMP host unreachable — EHOSTUNREACH in SYN-SENT), forwarding, ICMP
 errors, ICMP echo requests and replies, and `ipv4::ipv4_send` all go through
 it; the former blocking `arp_resolve_in` / `arp::resolve_blocking` are gone,
 and `udp_sock::udp_send_from` no longer takes an ARP timeout.
+A send bound to a device (SO_BINDTODEVICE) routes with that output device,
+as `flowi4_oif` does: `route::route_lookup_oif_in(ns, dst, oif)` considers
+only routes through `oif` and otherwise treats the destination as on-link
+there, and the next hop is looked up and resolved in that device's neighbour
+table (`tcp_stack::neigh_start_on`, `send_arp_request_on`); resolution
+timers retransmit on the neighbour's own device.
 An IPv4 UDP send to an unresolved next hop retains the complete post-netfilter
 frame in a namespace/interface/neighbor-scoped bounded queue, starts ARP, and
 reports success without blocking. Learning the neighbor MAC patches and
