@@ -5519,6 +5519,127 @@ fn smoke_fs_fuse_destroy_after_init() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_destroy_after_init);
 
+/// xdg-document-portal's `/run/user/1000/doc` answered `statfs` with EINVAL
+/// on the hardware. The portal's FUSE session had already ended: libfuse
+/// (3.16+) refuses a filesystem `want` the kernel did not offer — the
+/// portal wants FUSE_CAP_ATOMIC_O_TRUNC ("fuse: unknown connection 'want'
+/// flags: 0x00000008" in its journal) — replies EPROTO to FUSE_INIT and
+/// exits the session, closing /dev/fuse. Linux's `fuse_new_init` offers
+/// FUSE_ATOMIC_O_TRUNC, and a request on a connection with no daemon left
+/// fails `fuse_get_req`'s `!fc->connected` test with -ENOTCONN; a daemon's
+/// own error reaches the caller as it sent it.
+fn smoke_fs_fuse_init_offers_atomic_o_trunc() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseInitIn, FuseOpcode};
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+
+    const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
+    static FLAGS: AtomicU32 = AtomicU32::new(0);
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    FLAGS.store(0, Ordering::Relaxed);
+    OUTCOME.store(0, Ordering::Relaxed);
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-init-flags", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+
+    let daemon_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        for _ in 0..100_000usize {
+            if let Some(request) = daemon_conn.dequeue_request() {
+                let header: Option<FuseInHeader> = pod_from_bytes(&request);
+                if header.map(|h| h.opcode) == Some(FuseOpcode::Init as u32) {
+                    let body = &request[core::mem::size_of::<FuseInHeader>()..];
+                    if let Some(init) = pod_from_bytes::<FuseInitIn>(body) {
+                        FLAGS.store(init.flags, Ordering::Relaxed);
+                    }
+                    if let Some(reply) = fuse_daemon_answer(&request) {
+                        let _ = daemon_conn.complete_reply(&reply);
+                    }
+                    return;
+                }
+            }
+            narf_scheduler::yield_now().await;
+        }
+    });
+    narf_scheduler::spawn(async move {
+        OUTCOME.store(
+            if fs.init().await.is_ok() { 1 } else { 2 },
+            Ordering::Relaxed,
+        );
+    });
+    narf_scheduler::run_until_empty();
+
+    if OUTCOME.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("FUSE_INIT did not complete");
+    }
+    if FLAGS.load(Ordering::Relaxed) & FUSE_ATOMIC_O_TRUNC == 0 {
+        return TestResult::Fail("FUSE_INIT does not offer FUSE_ATOMIC_O_TRUNC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/fuse-portal",
+    smoke_fs_fuse_init_offers_atomic_o_trunc
+);
+
+fn smoke_fs_fuse_statfs_errors_are_the_daemons_or_enotconn() -> TestResult {
+    use crate::fuse::{pod_from_bytes, FuseInHeader, FuseOpcode};
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use crate::{FsError, FsInstance};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    // A daemon that fails STATFS with ENOTCONN, then with ENOMEM.
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-statfs-errors", Arc::clone(&conn)));
+    narf_scheduler::__reset_queues_for_test();
+
+    let daemon_conn = Arc::clone(&conn);
+    narf_scheduler::spawn(async move {
+        let mut errors = [-107i32, -12].into_iter();
+        for _ in 0..100_000usize {
+            if let Some(request) = daemon_conn.dequeue_request() {
+                let Some(header) = pod_from_bytes::<FuseInHeader>(&request) else {
+                    return;
+                };
+                if header.opcode == FuseOpcode::Statfs as u32 {
+                    let Some(error) = errors.next() else {
+                        return;
+                    };
+                    let _ = daemon_conn.complete_reply(&fuse_reply(header.unique, error, &[]));
+                }
+            }
+            narf_scheduler::yield_now().await;
+        }
+    });
+    let client = Arc::clone(&fs);
+    narf_scheduler::spawn(async move {
+        let first = client.statfs().await;
+        let second = client.statfs().await;
+        let ok = matches!(first, Err(FsError::NotConnected))
+            && matches!(second, Err(FsError::OutOfMemory));
+        OUTCOME.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+    });
+    narf_scheduler::run_until_empty();
+    if OUTCOME.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("a daemon's STATFS error did not reach the caller as sent");
+    }
+
+    // With the daemon gone, the connection answers ENOTCONN by itself.
+    conn.disconnect();
+    match crate::procfs::poll_once(fs.statfs()) {
+        Some(Err(FsError::NotConnected)) => TestResult::Pass,
+        _ => TestResult::Fail("statfs on a disconnected FUSE connection is not ENOTCONN"),
+    }
+}
+kernel_test_in!(
+    "filesystem/fuse-portal",
+    smoke_fs_fuse_statfs_errors_are_the_daemons_or_enotconn
+);
+
 fn smoke_fs_fuse_sysfs_connection_controls() -> TestResult {
     use crate::fuse_conn::DevFuse;
 
