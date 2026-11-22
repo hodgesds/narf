@@ -86,6 +86,18 @@ pub trait PcmDevice: Send + Sync + core::fmt::Debug {
     fn mixer_name(&self) -> Option<alloc::string::String> {
         None
     }
+    /// Linux `card->components` (control CARD_INFO `components`): one
+    /// "HDA:vendor,subsystem,revision" word per codec on HDA, which UCM and
+    /// PipeWire's `alsa.components` read. Empty otherwise.
+    fn components(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// A PCM device's `snd_pcm` id and name (PCM_INFO, `/proc/asound`),
+    /// when it has its own: Linux HDA names HDMI PCMs "HDMI 0", "HDMI 1",
+    /// ... The card's id and name stand in otherwise.
+    fn pcm_name(&self, _capture: bool, _device: u32) -> Option<alloc::string::String> {
+        None
+    }
     /// The card's PCM device numbers in one direction, when they are not
     /// `0..count` (Linux HDA numbers its PCMs through `get_empty_pcm_device`:
     /// analog 0, 2, 4, 5, HDMI 3, 7, 8, 9, 10, ...). The list must hold
