@@ -648,6 +648,20 @@ pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
         Some(a) => a,
         None => return,
     };
+    // `arp_process`: a request for a multicast or loopback target is
+    // dropped before anything is learned or answered.
+    if arp.tpa[0] & 0xf0 == 0xe0 || arp.tpa[0] == 127 {
+        return;
+    }
+    // RFC 2131 duplicate address detection (sender 0.0.0.0): a probe for
+    // one of our addresses is answered so the prober sees the conflict, and
+    // nothing is learned from it (`if (sip == 0) { ... goto out_consume_skb; }`).
+    if arp.spa == [0; 4] {
+        if arp.op == ARP_OP_REQUEST {
+            arp_reply_from_ingress(net_ns_id, iface_name, &arp);
+        }
+        return;
+    }
     arp_insert_local(net_ns_id, arp.spa, arp.sha);
     // Per-iface cache: record on the ingress interface if known.
     if let Some(name) = iface_name {
@@ -655,38 +669,34 @@ pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
         neigh_resolved(net_ns_id, name, arp.spa, arp.sha);
     }
     if arp.op == ARP_OP_REQUEST {
-        // Answer from whichever iface actually owns the requested
-        // address. ARP targets a specific IP, so the responder MUST be
-        // that IP's iface — falling back to `primary()` (first-
-        // registered) wrongly answers (or fails to answer) when the
-        // owning NIC isn't first, e.g. e1000 registers before virtio-net
-        // but only virtio-net carries 10.0.2.15. Without this, QEMU's
-        // user-mode (SLIRP) hostfwd can't ARP-resolve the guest and the
-        // forwarded SYN is never delivered.
-        // Prefer the INGRESS iface when it owns the requested address —
-        // the reply must go back out the NIC the request came in on, so a
-        // multi-NIC / overlapping-subnet setup (e.g. two QEMU user-mode
-        // NICs) answers on the correct link. Fall back to any iface that
-        // owns the address, then `primary`.
-        let snap = iface_name
-            .and_then(iface::lookup)
-            .filter(|s| s.net_ns_id == net_ns_id && s.ipv4 == arp.tpa)
-            .or_else(|| iface::for_local_addr_in(net_ns_id, arp.tpa))
-            .or_else(|| iface_name.and_then(iface::lookup))
-            .filter(|s| s.net_ns_id == net_ns_id)
-            .or_else(|| iface::primary_in(net_ns_id));
-        let iface = match snap {
-            Some(i) => i,
-            None => return,
-        };
-        if arp.tpa == iface.ipv4 {
-            let mut frame = [0u8; 60];
-            if let Some(n) = pkt::build_arp_reply(&mut frame, iface.mac, iface.ipv4, &arp) {
-                let _ = iface.xmit(&frame[..n]);
-            }
-        }
+        arp_reply_from_ingress(net_ns_id, iface_name, &arp);
     }
     let _ = ARP_OP_REPLY;
+}
+
+/// `arp_process` with the defaults arp_ignore=0 and arp_filter=0: a request
+/// for any address local to the namespace (`ip_route_input_noref` →
+/// RTN_LOCAL) is answered from the device it arrived on, with that device's
+/// own address — `arp_send_dst(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip, sha,
+/// dev->dev_addr, sha)` — never from the device that owns the address. Two
+/// NICs on one subnet therefore both answer for each other's addresses (ARP
+/// flux), as Linux does. A legacy caller with no ingress device answers from
+/// the owner of the address.
+fn arp_reply_from_ingress(net_ns_id: u64, iface_name: Option<&str>, arp: &pkt::ArpPacket) {
+    if !iface::is_local_addr_in(net_ns_id, arp.tpa) {
+        return;
+    }
+    let dev = match iface_name {
+        Some(name) => iface::lookup_in(net_ns_id, name),
+        None => iface::for_local_addr_in(net_ns_id, arp.tpa),
+    };
+    let Some(dev) = dev else {
+        return;
+    };
+    let mut frame = [0u8; 60];
+    if let Some(n) = pkt::build_arp_reply(&mut frame, dev.mac, arp.tpa, arp) {
+        let _ = dev.xmit(&frame[..n]);
+    }
 }
 
 /// True iff this is a UDP datagram to the DHCP client port.

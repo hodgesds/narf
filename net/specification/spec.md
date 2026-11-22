@@ -947,6 +947,13 @@ payload over `UDP_MAX_PAYLOAD` (65507) regardless of `SO_SNDBUF`, require
 `SO_BROADCAST` for exactly those broadcast destinations, drop an arriving
 datagram when the receive queue is full, and drop received datagrams whose
 length field is shorter than the header or longer than the segment.
+ARP input (`tcp_stack::handle_arp_on_in`) follows `arp_process` with the
+defaults arp_ignore=0 and arp_filter=0: a request for a multicast or
+loopback target is dropped; a request for any address local to the
+namespace is answered from the device it arrived on, with that device's MAC
+(so two NICs on one subnet each answer for both addresses, as Linux does);
+an RFC 2131 DAD probe (sender 0.0.0.0) for a local address is answered the
+same way and teaches no neighbour.
 No IPv4 output path waits for ARP (Linux `neigh_output` /
 `__neigh_event_send`). `tcp_stack::neigh_output_in(ns, nexthop, len, cont)`
 runs the send continuation `cont` with the MAC at once on a cache hit; on a
