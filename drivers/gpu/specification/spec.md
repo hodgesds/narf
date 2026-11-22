@@ -2130,9 +2130,8 @@ the function to D0 and restores BARs lost across D3hot; only the selected
 generation path then enables memory and DMA. `guc()` selects the exact TGL,
 RKL, DG1, ADL-P, MTL/Arrow, Alchemist, Battlemage, Lunar Lake or Panther Lake
 firmware profile. RKL is a distinct pre-GMD `Gen12Platform` while selecting
-the source-mandated TGL GuC image; its display gate stays closed, so live
-firmware scanout is preserved and only the all-pipes-stopped display-less GT
-route is admitted.
+the TGL GuC image. Its native modeset gate stays closed. An external-only
+VBT may qualify for the retained-firmware render path described below.
 `GtPlatform::physical_bits()` is the source xe descriptor's PCI DMA mask, not
 the wider address capacity of a PTE: qualified Gen12/DG1 profiles are DMA39;
 MTL/Arrow, DG2/ATS-M, BMG, LNL, PTL/WCL and NVL-S are DMA46. Every GGTT/PPGTT
@@ -3193,6 +3192,16 @@ accommodates the optional sparse-DSS sampler alongside firmware and contexts.
 Physical sampler pages are allocated only with its boot opt-in. The
 Late service validates exact live PCI identity, D0, readable PF registers and
 a bounded acyclic extended-capability chain; enabled SR-IOV VFs are refused.
+An integrated Gen12 board with an external-only VBT can start its existing
+GuC render backend beside the firmware framebuffer. The firmware primary must
+match the boot aperture, stride, size and latched linear surface below 16 MiB.
+Before each cold start, two observations across a hardware frame boundary must
+find the same sole primary, idle display state buffers, disabled cursors and
+disabled sprite planes across all pipes. The GT uses its separate GGTT arena.
+Fixed-mode presentation continues to copy into the firmware framebuffer.
+This route keeps the function in D0 and refuses system suspend because the
+driver cannot relight the firmware route. Mesa receives the Xe identity once
+the ordinary GT probes publish a userspace submission epoch.
 Each restart creates a fresh arena/cache-policy proof. MTL/Arrow starts only
 after owned scanout takeover. DG2/BMG register GT-only devices and start only
 when all inherited display planes are disabled; they do not gain display

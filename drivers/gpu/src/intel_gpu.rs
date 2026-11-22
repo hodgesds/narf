@@ -670,6 +670,7 @@ const fn display_fetchers_stopped_values(pipeconf: [u32; 4]) -> bool {
 
 #[path = "intel_gpu_firmware_display.rs"]
 mod firmware_display;
+pub(crate) use firmware_display::FirmwareRenderHandoff;
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if device.id.vendor != INTEL_VENDOR {
@@ -1164,6 +1165,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // display fetcher proves stopped: the GT arena begins at 256 MiB and no
     // live firmware plane can refer to an unowned GGTT entry. Keep this
     // separate from LNL/PTL, whose headless profile requires a driver FLR.
+    let firmware_handoff = firmware_scanout.and_then(|fb| {
+        let family = crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip)?;
+        FirmwareRenderHandoff::discover(
+            family,
+            &dev.mode_window(),
+            dev.gmadr.phys.raw(),
+            dev.gmadr.len,
+            fb,
+        )
+    });
     let stopped_display_gt = scanout_mode.is_none()
         && platform.is_some_and(|platform| {
             (platform.is_gen12()
@@ -1283,14 +1294,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             crate::intel_gpu_xelpg_external::external_route_blocks_dc,
         ));
     }
-    // A retained firmware scanout has not granted us its GGTT reservation.
-    // Start automatically after this driver owns the integrated scanout, or
-    // when all display fetchers proved stopped above. The latter is D0-only:
-    // without a display owner the runtime-PM profile deliberately refuses
-    // autosuspend.
-    // The Lunar Lake display-20 route is the exception: its GT owner takes
-    // the display-preserving profile (no driver FLR) beside the lit panel and
-    // maps only its own >=256 MiB GGTT arena, never the firmware surface.
+    // The external fixed-mode path retains the firmware surface. Its GT
+    // owner independently verifies every display fetcher before using the
+    // separate GGTT arena, and keeps the function powered for that surface.
     let guc_owned = if lnl_display && panel_mode.is_some() {
         crate::intel_gpu_gt_runtime::install_lnl_display(
             card_index, gt_card, device, cap, gt_bar, panel_mode,
@@ -1299,11 +1305,30 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::intel_gpu_gt_runtime::install_ptl_display(
             card_index, gt_card, device, cap, gt_bar, panel_mode,
         )
-    } else if owns_scanout || stopped_display_gt {
-        crate::intel_gpu_gt_runtime::install(card_index, gt_card, device, cap, gt_bar, panel_mode)
+    } else if owns_scanout || stopped_display_gt || firmware_handoff.is_some() {
+        crate::intel_gpu_gt_runtime::install(
+            card_index,
+            gt_card,
+            device,
+            cap,
+            gt_bar,
+            panel_mode,
+            firmware_handoff,
+        )
     } else {
         false
     };
+
+    if firmware_scanout.is_some() {
+        log_probe(
+            if guc_owned {
+                "retained firmware scanout; scheduled Intel render engine startup"
+            } else {
+                "retained firmware scanout; render engine unavailable (display ownership or GT admission)"
+            },
+            &device,
+        );
+    }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("intel-gpu"),

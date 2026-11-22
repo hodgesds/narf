@@ -74,6 +74,110 @@ pub(super) fn scanout(
     Some(fb)
 }
 
+/// An external GOP scanout with a checked GGTT interval below the first native
+/// scanout slot. The fixed-mode KMS path copies pixels and never flips this
+/// plane. Keep the aperture offset, so every GT start can verify the same plane.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FirmwareRenderHandoff {
+    fb: GenericFb,
+    offset: u64,
+    sprites: u64,
+}
+
+impl FirmwareRenderHandoff {
+    pub(super) fn discover(
+        family: crate::intel_gpu_gt::Gen12Platform,
+        io: &impl MmioWindow,
+        aperture: u64,
+        len: u64,
+        fb: GenericFb,
+    ) -> Option<Self> {
+        use crate::intel_gpu_gt::Gen12Platform::*;
+        // intel_display_device.c: display 13 and D12 plane minimization have
+        // four sprites. Tiger Lake has six. DG1 has a separate discrete owner.
+        let sprites = match family {
+            AlderLakeP | AlderLakeN | AlderLakeS | RocketLake => 4,
+            TigerLake => 6,
+            Dg1 => return None,
+        };
+        const {
+            assert!(
+                crate::intel_gpu_gtt::SCANOUT_GTT_OFFSET_PIPE_A
+                    <= crate::intel_gpu_rcs::GGTT_ARENA_BASE as u64
+            );
+        }
+        let fb = scanout(io, aperture, len, fb)?;
+        let handoff = Self {
+            fb,
+            offset: fb.addr.checked_sub(aperture)?,
+            sprites,
+        };
+        handoff.frame(io)?;
+        Some(handoff)
+    }
+
+    /// All live display fetches must reference the matched linear primary.
+    /// DSB_CTRL (intel_dsb_regs.h) can queue future plane programming even
+    /// when the current surfaces look idle. DSB, sprite and cursor state on
+    /// every pipe therefore participates in the proof.
+    fn frame(&self, io: &impl MmioWindow) -> Option<(Pipe, u32)> {
+        let mut live = None;
+        for pipe in [Pipe::A, Pipe::B, Pipe::C, Pipe::D] {
+            let base = pipe.base();
+            let primary = base + pipes::PLANE_PRIMARY_OFFSET;
+            if (0..3).any(|id| io.read32(base + 0xb08 + id * 0x100) & ((1 << 31) | 1) != 0)
+                || io.read32(base + 0x80) & 0x27 != 0 // CURCNTR, MCURSOR_MODE_MASK
+                || (1..=self.sprites).any(|id|
+                    io.read32(primary + id * 0x100 + pipes::PLANE_CTL_OFFSET)
+                    & pipes::PLANE_CTL_ENABLE != 0)
+            {
+                return None;
+            }
+            let busy = io.read32(base + pipes::PIPECONF_OFFSET)
+                & (pipes::PIPECONF_ENABLE | pipes::PIPECONF_STATE);
+            if busy == 0 {
+                if io.read32(primary + pipes::PLANE_CTL_OFFSET) & pipes::PLANE_CTL_ENABLE != 0 {
+                    return None;
+                }
+                continue;
+            }
+            if live.is_some() || !matches_pipe(io, pipe, self.fb, self.offset) {
+                return None;
+            }
+            let frame = io.read32(base + 0x40); // PIPE_FRMCOUNT_G4X
+            if frame == u32::MAX {
+                return None;
+            }
+            live = Some((pipe, frame));
+        }
+        live.filter(|_| io.display_access_ok())
+    }
+
+    /// Plane enables and flips are double buffered. Observe the same sole
+    /// primary on both sides of a frame boundary before allocating GT pages.
+    pub(crate) fn poll(
+        &self,
+        io: &impl MmioWindow,
+        previous: &mut Option<(Pipe, u32, u64)>,
+        now_ns: u64,
+    ) -> Option<core::task::Poll<()>> {
+        let last = previous.take();
+        let (pipe, frame) = self.frame(io)?;
+        match last {
+            None => {
+                *previous = Some((pipe, frame, now_ns.checked_add(250_000_000)?));
+                Some(core::task::Poll::Pending)
+            }
+            Some((old_pipe, _, deadline)) if old_pipe != pipe || now_ns >= deadline => None,
+            Some((_, old_frame, _)) if old_frame == frame => {
+                *previous = last;
+                Some(core::task::Poll::Pending)
+            }
+            Some(_) => Some(core::task::Poll::Ready(())),
+        }
+    }
+}
+
 pub(super) fn fixed_mode_card(fb: GenericFb) -> Card {
     let mode = crate::Mode {
         width: fb.width,
@@ -159,7 +263,7 @@ mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    struct Registers([(u64, u32); 6]);
+    struct Registers(alloc::vec::Vec<(u64, u32)>);
     impl MmioWindow for Registers {
         fn read32(&self, off: u64) -> u32 {
             self.0
@@ -172,10 +276,10 @@ mod tests {
         }
     }
 
-    fn smoke_gen12_external_firmware_kms() -> TestResult {
+    fn external_gop() -> (Registers, u64, u64, GenericFb) {
         let pipe = Pipe::B;
         let plane = pipe.base() + pipes::PLANE_PRIMARY_OFFSET;
-        let mut io = Registers([
+        let io = Registers(alloc::vec![
             (
                 pipe.base() + pipes::PIPECONF_OFFSET,
                 pipes::PIPECONF_ENABLE | pipes::PIPECONF_STATE,
@@ -192,6 +296,71 @@ mod tests {
         let aperture = 0x40_0000_0000;
         let fb = GenericFb::new(aperture + 0x2000, 800, 600, 3200, 32);
         let size = 0x2000 + u64::from(fb.pitch) * u64::from(fb.height);
+        (io, aperture, size, fb)
+    }
+
+    fn smoke_gen12_firmware_render_handoff() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform::*;
+        use core::task::Poll;
+        let (mut io, aperture, size, fb) = external_gop();
+        for family in [TigerLake, RocketLake, AlderLakeP, AlderLakeN, AlderLakeS] {
+            assert!(FirmwareRenderHandoff::discover(family, &io, aperture, size, fb).is_some());
+        }
+        assert!(FirmwareRenderHandoff::discover(Dg1, &io, aperture, size, fb).is_none());
+        let handoff = FirmwareRenderHandoff::discover(AlderLakeP, &io, aperture, size, fb).unwrap();
+        let pipe = Pipe::B.base();
+        let mut frame = None;
+        assert_eq!(handoff.poll(&io, &mut frame, 0), Some(Poll::Pending));
+        assert_eq!(handoff.poll(&io, &mut frame, 1), Some(Poll::Pending));
+        assert_eq!(handoff.poll(&io, &mut frame, 250_000_000), None);
+        frame = None;
+        assert_eq!(handoff.poll(&io, &mut frame, 0), Some(Poll::Pending));
+        io.0.push((pipe + 0x40, 1));
+        assert_eq!(handoff.poll(&io, &mut frame, 1), Some(Poll::Ready(())));
+        assert!(frame.is_none());
+
+        for (reg, value) in [
+            (
+                Pipe::A.base() + pipes::PIPECONF_OFFSET,
+                pipes::PIPECONF_STATE,
+            ),
+            (
+                Pipe::D.base() + pipes::PLANE_PRIMARY_OFFSET,
+                pipes::PLANE_CTL_ENABLE,
+            ),
+            (
+                pipe + pipes::PLANE_PRIMARY_OFFSET + 4 * 0x100,
+                pipes::PLANE_CTL_ENABLE,
+            ),
+            (pipe + 0x80, 0x27),
+            (pipe + 0x80, u32::MAX),
+            (pipe + 0xb08, 1),
+            (Pipe::C.base() + 0xd08, 1 << 31),
+        ] {
+            let mut pending = None;
+            assert_eq!(handoff.poll(&io, &mut pending, 0), Some(Poll::Pending));
+            io.0.push((reg, value));
+            assert_eq!(handoff.poll(&io, &mut pending, 1), None);
+            assert!(pending.is_none());
+            io.0.pop();
+        }
+        // Display 12 on Tiger Lake has a sixth sprite. Display 13 has four.
+        io.0.push((
+            pipe + pipes::PLANE_PRIMARY_OFFSET + 6 * 0x100,
+            pipes::PLANE_CTL_ENABLE,
+        ));
+        assert!(FirmwareRenderHandoff::discover(TigerLake, &io, aperture, size, fb).is_none());
+        assert!(FirmwareRenderHandoff::discover(AlderLakeP, &io, aperture, size, fb).is_some());
+        io.0.pop();
+        // A pending primary flip is outside the original GOP ownership.
+        io.0[4].1 += 0x1000;
+        assert!(handoff.poll(&io, &mut None, 0).is_none());
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/drm_ioctl", smoke_gen12_firmware_render_handoff);
+
+    fn smoke_gen12_external_firmware_kms() -> TestResult {
+        let (mut io, aperture, size, fb) = external_gop();
         let state = fixed_mode_card(scanout(&io, aperture, size, fb).unwrap());
         assert_eq!(state.connectors[0].connector_type, ConnectorType::Unknown);
         assert_eq!(state.encoders[0].encoder_type, EncoderType::None);
