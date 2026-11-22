@@ -699,6 +699,49 @@ since the submitter is replaced. Raphael's port:
     `smu_set_default_dpm_table`'s power-up around the DPM table, does not
     apply: this port never reads the 13.0.5 DPM clock table.
 
+## S0ix
+
+20. s0ix (in progress). `power::lps0` and the AMD PMC driver now send the
+    LPS0 `_DSM` calls and the S0i3 OS hint, so `amdgpu_acpi_is_s0ix_active`'s
+    PMC condition can hold (`lps0::has_handler("amd_pmc")`). Linux's s0ix
+    cycle for Raphael (`amdgpu_device_suspend` with `in_s0ix`):
+    - **Suspend, phase 1.** Ungate PG/CG, except GFX and SDMA, which
+      `amdgpu_device_set_{pg,cg}_state` skip. Then the display (DM)
+      suspends.
+    - **Suspend, phase 2**, in reverse IP order:
+      - JPEG and VCN suspend, with their sessions saved.
+      - SDMA 5.x, GFX and PSP are skipped: GFX stays in GFXOFF, the TMR stays
+        loaded, the rings stay. GFX's delayed idle work is cancelled, and
+        `amdgpu_gfx_off_ctrl` allows GFXOFF without the delay.
+      - The SMU suspends (`smu_disable_dpms`): `smu_v13_0_5_system_features_control`
+        skips `PrepareMp1ForUnload` in s0ix, and `rlc.funcs->stop` halts the
+        RLC (GC >= 9.4.2, an APU without IMU).
+      - IH: `navi10_ih_hw_fini`.
+      - GMC: `gmc_v10_0_gart_disable` on MMHUB only. The GFX hub is in GFX's
+        power domain.
+      - COMMON: `nv_common_hw_fini` disables the doorbell and selfring
+        apertures.
+    - **Resume.** Each block resumes only if its suspend ran, so GFX, SDMA
+      and the PSP are never re-initialized:
+      - COMMON, GMC (MMHUB `gart_enable`, fault defaults, the MMHUB TLB
+        flush) and IH first;
+      - then the SMU (`smu_set_gfx_imu_enable` skipped) and VCN/JPEG;
+      - the fences;
+      - then the display;
+      - then the late-init gating, again skipping GFX and SDMA.
+      The RLC restarts with the GFXOFF exit, not from amdgpu.
+
+    NARF's S3 path tears graphics down and rebuilds it. s0ix suspends and
+    resumes these owners in place instead:
+    - IH: done (`Ih::suspend`/`resume`, subscriptions kept).
+    - GMC: MMHUB-only disable and full re-enable, to its current GART and
+      VMID configuration.
+    - Doorbells: aperture disable and re-enable.
+    - RLC stop.
+    - SMU: the s0ix suspend.
+    - Coordinator: a `GraphicsPm` s0ix state that drives these in order,
+      with the display and media cycles, when the S0Idle checks pass.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table

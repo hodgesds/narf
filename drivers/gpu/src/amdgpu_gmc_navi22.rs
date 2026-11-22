@@ -568,6 +568,8 @@ struct Engine<I: Io> {
     vms: vm::Vms,
     runtime: Runtime,
     fault_irqs: bool,
+    /// MMHUB's GART disabled by an s0ix suspend (`suspend_mmhub`).
+    mmhub_suspended: bool,
 }
 impl<I: Io> Engine<I> {
     fn new(
@@ -592,6 +594,7 @@ impl<I: Io> Engine<I> {
             vms: vm::Vms::new(),
             runtime: Runtime::Idle,
             fault_irqs: false,
+            mmhub_suspended: false,
         })
     }
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -627,8 +630,18 @@ impl<I: Io> Engine<I> {
     /// on after a timeout; here a timeout fails closed (no release/replay)
     /// because the invalidation may still be outstanding.
     async fn flush_tlb(&mut self, vmid: u8, boot: bool) -> Result<(), Error> {
+        self.flush_tlb_on(vmid, boot, &[(0, Hub::Gfx), (1, Hub::Mm)])
+            .await
+    }
+    /// `gmc_v10_0_flush_gpu_tlb` on each listed hub, in order.
+    async fn flush_tlb_on(
+        &mut self,
+        vmid: u8,
+        boot: bool,
+        hubs: &[(usize, Hub)],
+    ) -> Result<(), Error> {
         let layout = self.layout;
-        for (index, hub) in [(0, Hub::Gfx), (1, Hub::Mm)] {
+        for &(index, hub) in hubs {
             // Each hub's own table: MMHUB 2.3 (Raphael) moved engine 17.
             let r = layout.hubs[index];
             if boot {
@@ -992,6 +1005,26 @@ impl Gmc {
     /// gmc_v10_0_vm_fault_interrupt_state. Enable only once an IH owner drains.
     pub fn set_fault_interrupts(&mut self, enable: bool) -> Result<(), Error> {
         self.engine.set_fault_interrupts(enable)
+    }
+    /// `gmc_v10_0_gart_disable` for an s0ix suspend: MMHUB alone
+    /// (`mmhub_v2_3_gart_disable`). The GFX hub is in GFX's power domain,
+    /// which GFXOFF keeps, so it is not touched.
+    ///
+    /// # Safety
+    /// No MMHUB client (VCN, JPEG, SDMA's page-table updates) is running,
+    /// and none starts until `resume_mmhub`.
+    pub unsafe fn suspend_mmhub(&mut self) -> Result<(), Error> {
+        self.engine.suspend_mmhub()
+    }
+    /// The MMHUB half of `gmc_v10_0_gart_enable` after `suspend_mmhub`: the
+    /// hub programmed again to the state `initialize`, `enable_gart` and the
+    /// fault-interrupt switch left, then its TLB flushed. The GFX hub is not
+    /// touched.
+    ///
+    /// # Safety
+    /// As `suspend_mmhub`.
+    pub async unsafe fn resume_mmhub(&mut self) -> Result<(), Error> {
+        self.engine.resume_mmhub().await
     }
     pub(crate) fn test_mapping(&mut self) -> Option<MmioRegion> {
         if self.state() != State::Ready {

@@ -816,30 +816,41 @@ impl<I: Io> Engine<I> {
         let layout = self.layout;
         self.access(|io| {
             for index in [1, 0] {
-                let (base, r) = (layout.bases[index], layout.hubs[index]);
-                update(
-                    io,
-                    base,
-                    r.fault_cntl,
-                    // linux-lit: 0x3fffe000=GCVM_L2_PROTECTION_FAULT_CNTL__CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__OTHER_CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK
-                    0x3fff_e000,
-                    // linux-lit: 0x3fffe000=GCVM_L2_PROTECTION_FAULT_CNTL__CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__OTHER_CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK
-                    if enable { 0x3fff_e000 } else { 0 },
-                )?;
-                // linux: n/a (16 VMID contexts, amdgpu_gmc_set_vm_fault_masks)
-                for context in 0..16 {
-                    update(
-                        io,
-                        base,
-                        r.ctx + context * r.ctx_distance,
-                        CTX_FAULT_IRQS,
-                        if enable { CTX_FAULT_IRQS } else { 0 },
-                    )?;
-                }
+                fault_irqs_hub(io, layout.bases[index], layout.hubs[index], enable)?;
             }
             Ok(())
         })?;
         self.fault_irqs = enable;
         Ok(())
     }
+}
+
+/// One hub's `amdgpu_gmc_set_vm_fault_masks`: its no-retry fault
+/// interrupts and every context's fault interrupt enables.
+pub(super) fn fault_irqs_hub<I: Io>(
+    io: &mut I,
+    base: u64,
+    r: HubRegs,
+    enable: bool,
+) -> Result<(), Error> {
+    update(
+        io,
+        base,
+        r.fault_cntl,
+        // linux-lit: 0x3fffe000=GCVM_L2_PROTECTION_FAULT_CNTL__CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__OTHER_CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK
+        0x3fff_e000,
+        // linux-lit: 0x3fffe000=GCVM_L2_PROTECTION_FAULT_CNTL__CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK | GCVM_L2_PROTECTION_FAULT_CNTL__OTHER_CLIENT_ID_NO_RETRY_FAULT_INTERRUPT_MASK
+        if enable { 0x3fff_e000 } else { 0 },
+    )?;
+    // linux: n/a (16 VMID contexts, amdgpu_gmc_set_vm_fault_masks)
+    for context in 0..16 {
+        update(
+            io,
+            base,
+            r.ctx + context * r.ctx_distance,
+            CTX_FAULT_IRQS,
+            if enable { CTX_FAULT_IRQS } else { 0 },
+        )?;
+    }
+    Ok(())
 }

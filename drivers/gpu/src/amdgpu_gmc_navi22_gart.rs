@@ -237,26 +237,7 @@ impl<I: Io> Engine<I> {
         let root = geometry.physical(gart.empty_root()) | PTE_VALID;
         invoke(authority, io, |io| {
             for (base, r) in layout.bases.into_iter().zip(layout.hubs) {
-                // init_gart_aperture_regs: PDE-form table base, page numbers.
-                pair(io, base, r.pt_base, table);
-                pair(io, base, r.pt_start, info.start >> 12);
-                pair(io, base, r.pt_end, (info.start + info.size - 1) >> 12);
-                // setup_vmid_config for VMIDs 1..15. Linux leaves the table
-                // base unprogrammed until a ring flush; NARF points unbound
-                // contexts at an all-invalid root so stray use only faults.
-                for step in 1..16u32 {
-                    // linux: n/a (VMIDs 1..15, setup_vmid_config i <= 14)
-                    pair(io, base, r.pt_base + step * r.ctx_addr_distance, root);
-                    update(
-                        io,
-                        base,
-                        r.ctx + step * r.ctx_distance,
-                        CTX_MASK,
-                        CTX_VALUE | irqs,
-                    )?;
-                    pair(io, base, r.pt_start + step * r.ctx_addr_distance, 0);
-                    pair(io, base, r.pt_end + step * r.ctx_addr_distance, MAX_PFN - 1);
-                }
+                program_gart_hub(io, base, r, (table, root), info, irqs)?;
             }
             Ok(())
         })?;
@@ -340,4 +321,100 @@ impl<I: Io> Engine<I> {
         }
         gtt.buffer.take().ok_or(Error::Invalid)
     }
+}
+
+// mmhub_v2_3_gart_disable's fields.
+const L1_ENABLE_L1_TLB: u32 = 1 << 0; // linux: MMMC_VM_MX_L1_TLB_CNTL__ENABLE_L1_TLB_MASK
+const L1_ENABLE_ADM: u32 = 1 << 6; // linux: MMMC_VM_MX_L1_TLB_CNTL__ENABLE_ADVANCED_DRIVER_MODEL_MASK
+const L2_ENABLE_L2_CACHE: u32 = 1 << 0; // linux: MMVM_L2_CNTL__ENABLE_L2_CACHE_MASK
+/// The MMHUB in `layout.bases`/`layout.hubs` (the GFX hub is index 0).
+const MMHUB: usize = 1;
+impl<I: Io> Engine<I> {
+    /// `mmhub_v2_3_gart_disable`: every MMHUB context off, its L1 TLB and
+    /// advanced driver model off, its L2 cache off and `L2_CNTL3` cleared.
+    pub(super) fn suspend_mmhub(&mut self) -> Result<(), Error> {
+        self.idle()?;
+        if self.mmhub_suspended {
+            return Err(Error::Busy);
+        }
+        let (base, r) = (self.layout.bases[MMHUB], self.layout.hubs[MMHUB]);
+        self.access(|io| {
+            // linux: n/a (AMDGPU_NUM_VMID 16 contexts)
+            for context in 0..16 {
+                io.write(base + u64::from(r.ctx + context * r.ctx_distance) * 4, 0);
+            }
+            update(io, base, r.l1, L1_ENABLE_L1_TLB | L1_ENABLE_ADM, 0)?;
+            update(io, base, r.l2, L2_ENABLE_L2_CACHE, 0)?;
+            io.write(base + u64::from(r.l2_3) * 4, 0);
+            Ok(())
+        })?;
+        self.mmhub_suspended = true;
+        Ok(())
+    }
+    /// The MMHUB half of `gmc_v10_0_gart_enable` after `suspend_mmhub`:
+    /// `program` as `initialize` ran it, then (with the GART enabled) the
+    /// GART step `enable_gart` ran, then the fault-interrupt switch as last
+    /// set, then the MMHUB TLB flush.
+    pub(super) async fn resume_mmhub(&mut self) -> Result<(), Error> {
+        self.idle()?;
+        if !self.mmhub_suspended {
+            return Err(Error::Busy);
+        }
+        let geometry = self.geometry.ok_or(Error::Invalid)?;
+        let (base, r) = (self.layout.bases[MMHUB], self.layout.hubs[MMHUB]);
+        let address = self.memory.address();
+        let gart = self.gart.as_ref().filter(|g| g.enabled).map(|g| {
+            (
+                (
+                    geometry.physical(g.info.table) | PTE_VALID,
+                    geometry.physical(g.empty_root()) | PTE_VALID,
+                ),
+                g.info,
+            )
+        });
+        let fault_irqs = self.fault_irqs;
+        let irqs = if fault_irqs { CTX_FAULT_IRQS } else { 0 };
+        self.access(|io| {
+            program(io, base, r, geometry, address)?;
+            if let Some((bases, info)) = gart {
+                program_gart_hub(io, base, r, bases, info, irqs)?;
+            }
+            super::vm::fault_irqs_hub(io, base, r, fault_irqs)
+        })?;
+        self.flush_tlb_on(0, false, &[(MMHUB, Hub::Mm)]).await?;
+        self.mmhub_suspended = false;
+        Ok(())
+    }
+}
+
+/// One hub's half of `gart_enable` once the GART exists:
+/// `init_gart_aperture_regs` for VMID0 (`table`, PDE form), then
+/// `setup_vmid_config` for VMIDs 1..15. Linux leaves the table base
+/// unprogrammed until a ring flush, but NARF points unbound contexts at an
+/// all-invalid `root` so that stray use only faults.
+pub(super) fn program_gart_hub<I: Io>(
+    io: &mut I,
+    base: u64,
+    r: HubRegs,
+    (table, root): (u64, u64),
+    info: GartInfo,
+    irqs: u32,
+) -> Result<(), Error> {
+    pair(io, base, r.pt_base, table);
+    pair(io, base, r.pt_start, info.start >> 12);
+    pair(io, base, r.pt_end, (info.start + info.size - 1) >> 12);
+    for step in 1..16u32 {
+        // linux: n/a (VMIDs 1..15, setup_vmid_config i <= 14)
+        pair(io, base, r.pt_base + step * r.ctx_addr_distance, root);
+        update(
+            io,
+            base,
+            r.ctx + step * r.ctx_distance,
+            CTX_MASK,
+            CTX_VALUE | irqs,
+        )?;
+        pair(io, base, r.pt_start + step * r.ctx_addr_distance, 0);
+        pair(io, base, r.pt_end + step * r.ctx_addr_distance, MAX_PFN - 1);
+    }
+    Ok(())
 }
