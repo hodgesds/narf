@@ -33,9 +33,8 @@ pub unsafe fn init_traps() {
         // Enable the fast SYSCALL/SYSRET path now that GDT,
         // per-CPU GS, and IDT are all live. After this, user
         // tasks running `syscall` land in
-        // `syscall::syscall_entry_x86_64`. The legacy `int 0x80`
-        // path stays wired for callers that prefer it (and to
-        // exercise the trap-frame-driven dispatch).
+        // `syscall::syscall_entry_x86_64`; `int 0x80` (IDT vector
+        // 128) is the i386 system-call gate.
         syscall::enable();
     }
 }

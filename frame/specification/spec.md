@@ -221,7 +221,13 @@ runs seccomp for `AUDIT_ARCH_I386`, the TLS calls, then
 `compat32::table::dispatch` (the i386 table, owned by the IA-32 userspace
 work), and delivers signals with restart semantics. If the call parked to
 be re-executed (RIP rewound onto `int 0x80`), the gate restores eax to the
-number (Linux `orig_ax`).
+number (Linux `orig_ax`). A kernel-mode `int 0x80` panics, as Linux's
+`do_int80_emulation` does. 64-bit code enters through `syscall` only; the
+in-tree runtime (`narf-user-runtime`) and fixtures use it.
+`compat32::user_rax` is the value sign-extended; a non-Ok NARF status
+reads as its errno when the value carries one, else -EINVAL. A task parked
+in an `int 0x80` call reports eax and ebx..ebp as its number and arguments
+(`/proc/<pid>/syscall`).
 
 ```rust
 // narf_userspace::compat32

@@ -1,9 +1,9 @@
 //! Fast SYSCALL/SYSRET entry path.
 //!
-//! Companion to the existing `int 0x80` software-interrupt syscall
-//! gate in `trap.rs`. Both paths funnel into
-//! `narf_userspace::kernel_syscall_entry_plain(num, &args)` so the
-//! Rust-side dispatch logic stays in one place.
+//! The 64-bit system-call gate (Linux `entry_SYSCALL_64`), dispatching
+//! through `narf_userspace::kernel_syscall_entry_plain_with_state`. The
+//! `int 0x80` gate in `trap.rs` is the i386 ABI (`compat32::dispatch`);
+//! `syscall` from compatibility mode lands on the CSTAR stub below.
 //!
 //! Unlike `int 0x80`, the `syscall` instruction:
 //!   * Takes the entry RIP from `IA32_LSTAR` (no IDT lookup).

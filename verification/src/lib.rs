@@ -2687,62 +2687,10 @@ fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_frame_x86_64_tss_rsp0_and_gs_base);
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
-    // End-to-end: install a global SyscallTable with a handler for
-    // Syscall::Yield, fire `int 0x80` from kernel mode with
-    // rax = Yield.raw() and rdi = 0xC0FFEE. The IDT vector-128
-    // handler routes the trap into `kernel_syscall_entry`; the
-    // return value lands in rax, status in rdx.
-    use core::arch::asm;
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use narf_userspace::{
-        install_global, syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
-        SyscallTable,
-    };
-
-    static SEEN: AtomicU64 = AtomicU64::new(0);
-    SEEN.store(0, Ordering::Relaxed);
-
-    __test_clear_global();
-    let mut t = SyscallTable::new();
-    t.install_fn(Syscall::Yield, "yield", |args: &SyscallArgs| {
-        SEEN.store(args.arg0, Ordering::Relaxed);
-        SyscallReturn::ok(args.arg0.wrapping_mul(2))
-    });
-    install_global(t);
-
-    let mut value: u64;
-    let mut status: u64;
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        asm!(
-            "int 0x80",
-            inout("rax") Syscall::Yield.raw() as u64 => value,
-            inout("rdi") 0xC0FFEEu64 => _,
-            out("rdx") status,
-            // rcx, r11 are clobbered by the trap; mark so LLVM
-            // doesn't rely on values surviving.
-            out("rcx") _,
-            out("r11") _,
-        );
-    }
-
-    __test_clear_global();
-
-    if SEEN.load(Ordering::Relaxed) != 0xC0FFEE {
-        return TestResult::Fail("handler did not observe arg0 via int 0x80");
-    }
-    if status != SyscallReturn::OK as u64 {
-        return TestResult::Fail("status via rdx wasn't Ok");
-    }
-    if value != 0xC0FFEE * 2 {
-        return TestResult::Fail("value via rax didn't round-trip");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_frame_x86_64_int80_dispatches_through_global);
+// `int 0x80` is the i386 system-call gate for user tasks (Linux
+// `do_int80_emulation`), and a kernel-mode `int 0x80` is a fatal bug there as
+// in Linux, so the old kernel-mode round trip through the 64-bit table is
+// gone. User-mode coverage: `verification/ia32-int80` (ia32_user.rs).
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {

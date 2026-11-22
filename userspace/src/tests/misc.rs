@@ -4300,12 +4300,13 @@ fn smoke_blocked_syscall_decodes_saved_registers() -> TestResult {
         }
 
         // `int 0x80`: a TrapFrame ending at `top`, its last word the user SS.
+        // It is an i386 call: eax, then ebx, ecx, edx, esi, edi, ebp.
         let tf = (top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
         // SAFETY: inside `stack`, suitably aligned.
         unsafe {
             (*tf).rax = 202;
-            ((*tf).rdi, (*tf).rsi, (*tf).rdx) = (0x11, 0x22, 0x33);
-            ((*tf).r10, (*tf).r8, (*tf).r9) = (0x44, 0x55, 0x66);
+            ((*tf).rbx, (*tf).rcx, (*tf).rdx) = (0x11, 0x22, 0x33);
+            ((*tf).rsi, (*tf).rdi, (*tf).rbp) = (0x44, 0x55, 0x66);
             (*tf).ss = 0x1b;
             (*tf).vector = 0x80;
         }
@@ -4483,8 +4484,8 @@ fn smoke_blocked_syscall_frame_reports_user_sp_and_pc() -> TestResult {
         // SAFETY: inside `stack`, suitably aligned.
         unsafe {
             (*tf).rax = 61;
-            ((*tf).rdi, (*tf).rsi, (*tf).rdx) = (0x11, 0x22, 0x33);
-            ((*tf).r10, (*tf).r8, (*tf).r9) = (0x44, 0x55, 0x66);
+            ((*tf).rbx, (*tf).rcx, (*tf).rdx) = (0x11, 0x22, 0x33);
+            ((*tf).rsi, (*tf).rdi, (*tf).rbp) = (0x44, 0x55, 0x66);
             ((*tf).rsp, (*tf).rip, (*tf).ss) = (SP, PC, 0x1b);
             (*tf).vector = 0x80;
         }

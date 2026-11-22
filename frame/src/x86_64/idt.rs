@@ -512,9 +512,9 @@ pub unsafe fn init() {
     install(125, int_125);
     install(126, int_126);
     install(127, int_127);
-    // Software-interrupt syscall gate — `int 0x80` routes here.
-    // DPL=3 so user mode (CPL=3) can trigger it; kernel mode also
-    // works at any CPL.
+    // i386 system-call gate — `int 0x80` routes here (Linux
+    // `IA32_SYSCALL_VECTOR`, an interrupt gate at DPL=3 so user mode
+    // can trigger it). A kernel-mode `int 0x80` is a fatal bug.
     install_full(128, int_128, 0, GATE_INT_USER);
     install(129, int_129);
     install(130, int_130);

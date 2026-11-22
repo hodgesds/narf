@@ -778,7 +778,21 @@ pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u
                 // user's rax is not a syscall number.
                 return Some([NOT_IN_SYSCALL, 0, 0, 0, 0, 0, 0, t.rsp, t.rip]);
             }
-            return Some([t.rax, t.rdi, t.rsi, t.rdx, t.r10, t.r8, t.r9, t.rsp, t.rip]);
+            // `int 0x80` is always an i386 call (Linux `syscall_get_nr` /
+            // `syscall_get_arguments` under TS_COMPAT): eax, then ebx, ecx,
+            // edx, esi, edi, ebp, each its low 32 bits.
+            let low = |r: u64| u64::from(r as u32);
+            return Some([
+                low(t.rax),
+                low(t.rbx),
+                low(t.rcx),
+                low(t.rdx),
+                low(t.rsi),
+                low(t.rdi),
+                low(t.rbp),
+                t.rsp,
+                t.rip,
+            ]);
         }
         // `syscall`: UserState below the 16-byte domain snapshot.
         let f = top - 16 - core::mem::size_of::<X86State>() as u64;
@@ -3598,6 +3612,19 @@ impl core::future::Future for UserTaskFuture {
                     this.state = TaskState::Running;
                     let entry = this.process.entry.0.as_u64();
                     let rsp = this.process.stack_top.as_u64();
+                    if this.process.ia32 {
+                        // An IA-32 image (Linux `start_thread_ia32`): CS =
+                        // __USER32_CS with the fresh-image data segments. The
+                        // i386 ABI has no register argument at entry.
+                        // SAFETY: AS activated + entry/rsp mapped (below 4 GiB)
+                        // by construction; never returns (iretq into CPL=3 in
+                        // compatibility mode on this task's stack top).
+                        unsafe {
+                            narf_arch::x86_64::user_mode::enter_user_mode_compat_at_top(
+                                entry, rsp, top,
+                            )
+                        }
+                    }
                     if let Some(arg) = this.process.entry_arg {
                         // SAFETY: AS activated + entry/rsp mapped by construction;
                         // never returns (iretq into CPL=3 on this task's stack top).
@@ -3612,6 +3639,16 @@ impl core::future::Future for UserTaskFuture {
                 }
                 TaskState::Running => {
                     narf_lib::perf::ctx_switch();
+                    if this.process.ia32 {
+                        // SAFETY: as below; the child resumes in compatibility
+                        // mode, as its parent trapped (`in_compat_mode`).
+                        unsafe {
+                            narf_arch::x86_64::user_mode::enter_user_mode_compat_resume_at_top(
+                                this.task.uctx.state.get(),
+                                top,
+                            )
+                        }
+                    }
                     // SAFETY: `ctx.state` holds a prior trap-from-user snapshot
                     // (fork child / re-image); resume it on the empty stack top.
                     unsafe {
@@ -3662,7 +3699,12 @@ impl core::future::Future for UserTaskFuture {
                     // returns — control reaches CPL=3. When the
                     // process carries an entry_arg (clone(2) for
                     // pthread start), deliver it as the first
-                    // SysV integer arg (RDI).
+                    // SysV integer arg (RDI). An IA-32 image enters
+                    // in compatibility mode instead, with no argument.
+                    if this.process.ia32 {
+                        // SAFETY: as below; entry/rsp are below 4 GiB.
+                        unsafe { narf_arch::x86_64::user_mode::enter_user_mode_compat(entry, rsp) }
+                    }
                     if let Some(arg) = this.process.entry_arg {
                         // SAFETY: the AS is activated and the user
                         // mappings cover `entry` + `rsp` by construction
@@ -3686,6 +3728,14 @@ impl core::future::Future for UserTaskFuture {
                     // GS) is still correct from first entry. Never
                     // returns — iretq resumes the saved user frame.
                     narf_lib::perf::ctx_switch();
+                    if this.process.ia32 {
+                        // SAFETY: as below, resuming in compatibility mode.
+                        unsafe {
+                            narf_arch::x86_64::user_mode::enter_user_mode_compat_resume(
+                                this.task.uctx.state.get(),
+                            )
+                        }
+                    }
                     // SAFETY: Valid memory or trusted environment
                     unsafe { narf_scheduler::enter_user_mode_resume(this.task.uctx.state.get()) }
                 }

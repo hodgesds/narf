@@ -38,6 +38,9 @@ pub const KCODE_SEL: u16 = segments::KERNEL_CS;
 pub const KDATA_SEL: u16 = segments::KERNEL_DS;
 /// TSS selector (`GDT_ENTRY_TSS`, index 8).
 const TSS_SEL: u16 = segments::TSS_SELECTOR;
+/// 32-bit user-code selector (`__USER32_CS`, index 4, RPL 3 → 0x23):
+/// compatibility mode.
+pub const UCODE32_SEL: u16 = segments::USER32_CS;
 /// User-data selector (`__USER_DS`, index 5, RPL 3 → 0x2B).
 pub const UDATA_SEL: u16 = segments::USER_DS;
 /// User-code selector (`__USER_CS`, index 6, RPL 3 → 0x33) — long-mode code
