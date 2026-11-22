@@ -1151,10 +1151,16 @@ impl Backend for Model {
                 }
                 if frame.len() == 30 {
                     let parameters = u16::from_le_bytes([frame[26], frame[27]]);
+                    // A DELBA carries one of the QoS reason codes mac80211
+                    // sends: QSTA_LEAVE_QBSS (36, teardown), QSTA_NOT_USE
+                    // (37), QSTA_REQUIRE_SETUP (38, aggregation without an
+                    // agreement) or QSTA_TIMEOUT (39). The AP takes any of
+                    // them (`ieee80211_process_delba` ignores the reason).
+                    let reason = u16::from_le_bytes([frame[28], frame[29]]);
                     if frame[24..26] != [3, 2]
                         || parameters & 0x7ff != 0
                         || parameters >> 12 >= 8
-                        || frame[28..30] != [39, 0]
+                        || !(36..=39).contains(&reason)
                     {
                         return Err(Error::Bounds);
                     }
