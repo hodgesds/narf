@@ -2665,6 +2665,103 @@ kernel_test_in!(
     smoke_abi_fsx2_new_mount_covers_earlier_submounts
 );
 
+// ── umount2 of a covered mount's path ─────────────────────────────────
+//
+// `path_umount` resolves the target like any path, into the topmost mount
+// at each component, and `path_mounted` then requires the result to be the
+// root of the mount it reached. A mount covered by a later one over a
+// directory above it is not reachable that way: its path names whatever the
+// cover holds there — nothing (-ENOENT) or a plain directory (-EINVAL).
+
+fn smoke_abi_fsx2_umount2_of_a_covered_mount_misses_it() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-ucov".as_ptr() as u64, 0o755);
+        if mount_fstype(b"/abi-ucov\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-ucov/dev".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-ucov/dev\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-ucov/dev/shm".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-ucov/dev/shm\0", b"tmpfs\0") != Some(0)
+            || mount_fstype(b"/abi-ucov/dev\0", b"tmpfs\0") != Some(0)
+        {
+            return Err("the covered tree under /abi-ucov/dev was not mounted");
+        }
+        let umount =
+            |path: &core::ffi::CStr| call(Syscall::Umount2.raw(), a1(path.as_ptr() as u64, 0));
+        if umount(c"/abi-ucov/dev/shm") != Some(ENOENT) {
+            return Err("umount2 reached a covered mount through a path the cover lacks");
+        }
+        if call_mkdir(c"/abi-ucov/dev/shm".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of shm in the cover failed");
+        }
+        if umount(c"/abi-ucov/dev/shm") != Some(EINVAL) {
+            return Err("umount2 of the cover's own directory is not EINVAL");
+        }
+        // With the cover gone the old mount is reachable, and unmountable.
+        if umount(c"/abi-ucov/dev") != Some(0) || umount(c"/abi-ucov/dev/shm") != Some(0) {
+            return Err("the uncovered mount could not be unmounted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/umount-covered",
+    smoke_abi_fsx2_umount2_of_a_covered_mount_misses_it
+);
+
+// ── MS_MOVE into the moved mount's own subtree ────────────────────────
+//
+// `do_move_mount` walks up from the target's mount and refuses with -ELOOP
+// when it meets the mount being moved: a tree cannot be attached inside
+// itself, and that includes onto itself.
+
+fn smoke_abi_fsx2_ms_move_into_its_own_tree_is_eloop() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_MOVE: u64 = 0x2000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-mvl".as_ptr() as u64, 0o755);
+        if mount_fstype(b"/abi-mvl\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-mvl/sub".as_ptr() as u64, 0o755) != Some(0)
+        {
+            return Err("the tmpfs at /abi-mvl was not mounted");
+        }
+        let mv = |target: &core::ffi::CStr| {
+            call(
+                Syscall::Mount.raw(),
+                a4(
+                    c"/abi-mvl".as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    0,
+                    MS_MOVE,
+                    0,
+                ),
+            )
+        };
+        if mv(c"/abi-mvl/sub") != Some(ELOOP) {
+            return Err("MS_MOVE into the moved mount's own tree is not ELOOP");
+        }
+        if mv(c"/abi-mvl") != Some(ELOOP) {
+            return Err("MS_MOVE of a mount onto itself is not ELOOP");
+        }
+        // The refused moves left the mount where it was.
+        let mut sb = [0u8; STAT_SIZE];
+        if call_stat(c"/abi-mvl/sub".as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("a refused MS_MOVE changed the mount table");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mount-move-loop",
+    smoke_abi_fsx2_ms_move_into_its_own_tree_is_eloop
+);
+
 // ── filesystem type names in the mount listings ───────────────────────
 //
 // `show_mountinfo` and `show_vfsmnt` print the superblock's type with
