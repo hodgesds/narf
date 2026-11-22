@@ -244,10 +244,13 @@ pub fn register_hardware_card_at(
     info.index = index;
     // The backend's own PCM numbering, when it has one for exactly the
     // card's PCM count (Linux HDA: analog 0, 2, ..., HDMI 3, 7, 8, ...).
+    // Devices above 7 take the card block's spare minors (see
+    // `sysfs_bridge::pcm_playback_minor`): 8 for playback, 6 for capture.
     let numbering = |capture: bool, count: u32| {
+        let limit = if capture { 14 } else { 16 };
         hardware
             .pcm_devices(capture)
-            .filter(|devices| devices.len() == count as usize && devices.iter().all(|d| *d < 16))
+            .filter(|devices| devices.len() == count as usize && devices.iter().all(|d| *d < limit))
     };
     let playback = numbering(false, info.playback_count);
     let capture = numbering(true, info.capture_count);

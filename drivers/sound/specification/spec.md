@@ -92,8 +92,8 @@ exist. `register_hardware_card_at` keeps ids unique the way
 at registration; Linux HDA analog 0, HDMI 3, 7, 8, ...): `pcm_devices(card,
 capture)` is then the device list that devfs nodes, sysfs endpoints,
 procfs directories, PCM_NEXT_DEVICE, PCM_INFO and the PCM open use, with
-devices 8..15 on minors 2..9 (playback) and 10..17 (capture) of the card
-block. `PcmDevice::control_wire` gives a control its own ALSA device,
+playback devices 8..15 on minors 2..9 and capture devices 8..13 on
+minors 10..15 of the card block. `PcmDevice::control_wire` gives a control its own ALSA device,
 index and name (Linux's per-PCM jack, ELD, IEC958 set and channel map);
 ELEM_LIST reports and name lookups resolve those ids. `PcmDevice` gains three defaulted
 hooks: `long_name` (`card->longname`: the second `cards` line and control
