@@ -3732,3 +3732,62 @@ kernel_test_in!(
     "audio/hda/pm-autosuspend",
     native_hda_pm_autosuspend_parks_after_the_delay
 );
+
+/// A command-transport failure is transparent to a running stream, as
+/// Linux's `azx_rirb_get_response` recovery is (polling mode, single_cmd,
+/// a bus reset only through `response_reset`): a jack re-read that was
+/// lost must not xrun the playback stream, and the next command restarts
+/// the rings under it. Before, the stream's position update saw
+/// `irq.failed` and stopped the stream with an xrun, so one glitch on the
+/// command transport cut the audio PipeWire was playing.
+fn native_hda_running_stream_survives_a_lost_command() -> TestResult {
+    let mut fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open");
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.free_running(true).is_err()
+        || playback.prepare().is_err()
+        || playback.write(&[0x5a; 512]) != Ok(512)
+        || playback.start().is_err()
+    {
+        return TestResult::Fail("playback");
+    }
+    // A jack re-read the codec never answers, given up on.
+    fixture.model.stall = true;
+    {
+        // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+        let mut sense = pin!(unsafe { dev.send_verb_async(make_verb(0, 3, 0xf09 << 8)) });
+        let mut cx = Context::from_waker(Waker::noop());
+        if !matches!(sense.as_mut().poll(&mut cx), Poll::Pending) {
+            return TestResult::Fail("the jack command waits for the codec");
+        }
+    }
+    fixture.model.stall = false;
+    if !dev.irq.failed.load(Ordering::Acquire) {
+        return TestResult::Fail("the lost command poisons the transport");
+    }
+    // The stream service's position update.
+    let _ = playback.pointer();
+    if !dev.streams[0].lock().is_running() {
+        return TestResult::Fail("a command-transport failure must not stop a running stream");
+    }
+    // SAFETY: as above.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x1002aa01)
+        || !dev.streams[0].lock().is_running()
+    {
+        return TestResult::Fail("the ring restart leaves the running stream alone");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/cmd-stream",
+    native_hda_running_stream_survives_a_lost_command
+);
