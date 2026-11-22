@@ -4,13 +4,13 @@
 //! shared by the builtin driver and the loadable `.ko`; this shim bridges the
 //! native `Io` to `RegIo` and re-exports the result. No cached vector
 //! restore/recovery is claimed: failed sampling/writes/convergence are terminal.
-use super::chip_bridge::{from_chip, IoReg};
+use super::chip_bridge::bridge;
 use super::firmware_transport::{Error, Io};
 
 pub(super) use narf_drivers_wireless_rtl_chip::radio::dack::Dack as Info;
 
 pub(super) async fn calibrate(io: &mut impl Io) -> Result<Info, Error> {
-    narf_drivers_wireless_rtl_chip::radio::dack::calibrate(&mut IoReg(io))
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = narf_drivers_wireless_rtl_chip::radio::dack::calibrate(&mut b).await;
+    r.map_err(|e| b.err(e))
 }

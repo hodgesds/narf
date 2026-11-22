@@ -10,6 +10,7 @@
 use crate::{ChipError as Error, RegIo as Io};
 
 pub mod b22;
+pub mod c22;
 pub mod dack;
 
 /// A 32-bit read that maps the all-ones "device gone" pattern to an error.

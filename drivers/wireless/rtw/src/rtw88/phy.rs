@@ -5,7 +5,7 @@
 //! [`Info`], bridges the native `Io` to `RegIo`, and keeps the
 //! calibration-identity table hash. Calibration/channel/power and MAC packet
 //! activation remain separately owned continuations.
-use super::chip_bridge::{from_chip, IoReg};
+use super::chip_bridge::bridge;
 use super::{
     efuse::Factory,
     firmware_transport::{Error, Io},
@@ -70,13 +70,13 @@ pub(super) fn bind_tables(hash: &mut narf_crypto::sha256::Sha256, info: Info) ->
     Ok(())
 }
 pub(super) async fn apply_table(io: &mut impl Io, info: Info, kind: usize) -> Result<(), Error> {
-    chip_phy::apply_table(&mut IoReg(io), info.params(), kind)
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = chip_phy::apply_table(&mut b, info.params(), kind).await;
+    r.map_err(|e| b.err(e))
 }
 pub(super) async fn prepare(io: &mut impl Io, info: Info) -> Result<Info, Error> {
-    chip_phy::prepare(&mut IoReg(io), info.params())
-        .await
-        .map_err(from_chip)?;
+    let mut b = bridge(io);
+    let r = chip_phy::prepare(&mut b, info.params()).await;
+    r.map_err(|e| b.err(e))?;
     Ok(info)
 }

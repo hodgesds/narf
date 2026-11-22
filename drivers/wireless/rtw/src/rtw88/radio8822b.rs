@@ -9,7 +9,7 @@
 //! external callers and the command/mailbox/envelope-coupled calibration and
 //! station steps, which `RegIo` cannot express. No step here opens MAC TX/RX,
 //! releases TXPAUSE or submits H2C.
-use super::chip_bridge::{from_chip, IoReg};
+use super::chip_bridge::bridge;
 use super::radio::read;
 use super::{
     band5::Width,
@@ -71,13 +71,15 @@ pub(super) async fn rf(
 
 /// The `rtw8822b_phy_set_param` tail (`radio::b22::finish_set_param`).
 pub(super) async fn finish_set_param(io: &mut impl Io, info: Info) -> Result<Init, Error> {
-    b22::finish_set_param(&mut IoReg(io), params(info))
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = b22::finish_set_param(&mut b, params(info)).await;
+    r.map_err(|e| b.err(e))
 }
 /// `rtw8822b_pwrtrack_init` default OFDM swing index.
 pub(super) async fn pwrtrack_init(io: &mut impl Io) -> Result<u8, Error> {
-    b22::pwrtrack_init(&mut IoReg(io)).await.map_err(from_chip)
+    let mut b = bridge(io);
+    let r = b22::pwrtrack_init(&mut b).await;
+    r.map_err(|e| b.err(e))
 }
 /// `rtw8822b_set_channel(center, bw, primary_chan_idx)` for 2T2R.
 pub(super) async fn set_channel(
@@ -86,9 +88,9 @@ pub(super) async fn set_channel(
     center: u8,
     width: Width,
 ) -> Result<(), Error> {
-    b22::set_channel(&mut IoReg(io), params(info), center, width)
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = b22::set_channel(&mut b, params(info), center, width).await;
+    r.map_err(|e| b.err(e))
 }
 /// `rtw8822b_set_tx_power_index_by_rate` words for one path.
 pub(super) async fn write_txagc(
@@ -96,27 +98,27 @@ pub(super) async fn write_txagc(
     path: u8,
     indices: &[u8; 64],
 ) -> Result<(), Error> {
-    b22::write_txagc(&mut IoReg(io), path, indices)
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = b22::write_txagc(&mut b, path, indices).await;
+    r.map_err(|e| b.err(e))
 }
 /// 20MHz `rtw8822b_set_channel` readback.
 pub(super) async fn verify_channel20(io: &mut impl Io, ch: u8) -> Result<(), Error> {
-    b22::verify_channel20(&mut IoReg(io), ch)
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = b22::verify_channel20(&mut b, ch).await;
+    r.map_err(|e| b.err(e))
 }
 /// `rtw8822b_set_channel(center, BW, sc)` readback.
 pub(super) async fn verify_channel(io: &mut impl Io, ch: u8, width: Width) -> Result<(), Error> {
-    b22::verify_channel(&mut IoReg(io), ch, width)
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = b22::verify_channel(&mut b, ch, width).await;
+    r.map_err(|e| b.err(e))
 }
 /// Both paths' measured `N2BP` TXAGC words.
 pub(super) async fn verify_txagc(io: &mut impl Io, tables: [[u8; 64]; 2]) -> Result<(), Error> {
-    b22::verify_txagc(&mut IoReg(io), tables)
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = b22::verify_txagc(&mut b, tables).await;
+    r.map_err(|e| b.err(e))
 }
 
 // ── native IQK + station bring-up (H2C commands, envelope and policy) ──

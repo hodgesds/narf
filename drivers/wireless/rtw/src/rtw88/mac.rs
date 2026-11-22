@@ -5,7 +5,7 @@
 //! stream. This shim resolves the PCIe/USB `Hci` into the chip core's
 //! [`MacParams`], bridges the native firmware-owner `Io` to `RegIo`, and
 //! re-exports [`Info`]; DMA, MAC TX/RX and host queues stay closed pending RF.
-use super::chip_bridge::{from_chip, IoReg};
+use super::chip_bridge::bridge;
 use super::firmware_transport::{Error, Io};
 use narf_drivers_wireless_rtl_chip::mac::{self as chip_mac, MacParams};
 
@@ -63,7 +63,7 @@ pub(super) async fn prepare_on(io: &mut impl Io, did: u16, hci: Hci) -> Result<I
                 .ok_or(Error::Unsupported)?
         }
     };
-    chip_mac::prepare(&mut IoReg(io), did, params)
-        .await
-        .map_err(from_chip)
+    let mut b = bridge(io);
+    let r = chip_mac::prepare(&mut b, did, params).await;
+    r.map_err(|e| b.err(e))
 }
