@@ -324,7 +324,10 @@ holds a power reference (`power_up` at open, `power_down` at close, Linux
 `snd_hda_power_up_pm` / `_down_pm`), every command and reference drop marks
 the controller busy, and the autosuspend service (`autosuspend`) parks it
 (codecs D3, then link reset) once it has been idle for `autosuspend_ms`
-(10 s, Linux `power_save`) with no reference and no running stream. A stop
+(10 s, Linux `power_save`) with no reference and no running stream; a controller
+without Linux `AZX_DCAPS_PM_RUNTIME` (`ids::runtime_pm`; 1002:1640, the ICH
+parts, the older ATI HDMI functions) suspends only its codecs (D3) and stays
+up, and the next command or jack event resumes the codecs first. A stop
 with the PCM still open does not park it. Polled jack detection marks it
 busy every 1.5 s and so keeps it up, as Linux jackpoll does. Park and wake
 serialise on a PM lock, the park runs

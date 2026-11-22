@@ -123,6 +123,9 @@ pub struct IntelHda {
     /// may power the controller down after its codecs. Without it only the
     /// codecs suspend.
     pub(super) runtime_pm: AtomicBool,
+    /// The codecs are in D3 while the controller stays up (the autosuspend
+    /// of a controller without `runtime_pm`); a command resumes them first.
+    codecs_suspended: AtomicBool,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -406,6 +409,7 @@ impl IntelHda {
             pm_waker: IrqSafeSpinLock::new(None),
             long_name: IrqSafeSpinLock::new(alloc::string::String::new()),
             runtime_pm: AtomicBool::new(true),
+            codecs_suspended: AtomicBool::new(false),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -1106,7 +1110,9 @@ impl IntelHda {
     /// only the PM transitions themselves issue ungated commands.
     fn exec_verb(&self, verb: u32, gated: bool) -> Result<u32, HdaError> {
         let mut lease = self.acquire_command_blocking()?;
-        if gated && self.suspended.load(Ordering::Acquire) {
+        let parked =
+            self.suspended.load(Ordering::Acquire) || self.codecs_suspended.load(Ordering::Acquire);
+        if gated && parked {
             return Err(HdaError::Suspended);
         }
         self.ready_transport()?;
@@ -1542,6 +1548,11 @@ pub(super) async fn jack_service(weak: alloc::sync::Weak<IntelHda>) {
             return;
         };
         if !dev.suspended.load(Ordering::Acquire) && dev.jack_dirty.swap(false, Ordering::AcqRel) {
+            // A jack event on suspended codecs resumes them first, as
+            // `hda_jackpoll_work` wraps the re-read in snd_hda_power_up_pm.
+            if dev.codecs_suspended.load(Ordering::Acquire) {
+                let _ = dev.ensure_active();
+            }
             let _ = dev.refresh_jacks_async().await;
         }
     }
@@ -1751,6 +1762,21 @@ impl IntelHda {
         // command in between is refused rather than sent to a codec the
         // restart has not re-initialised yet.
         self.restart_controller()?;
+        self.resume_codecs()?;
+        self.suspended.store(false, Ordering::Release);
+        // A wake with no reference held (a control read) parks again after
+        // the delay.
+        self.mark_last_busy();
+        self.kick_pm();
+        Ok(())
+    }
+
+    /// Linux `hda_call_codec_resume` for every codec: D0, the codec init
+    /// (the Realtek coef tables, a quirk's coef sequence, the HP-pin tail),
+    /// unsolicited responses re-armed and every jack marked dirty. Runs
+    /// with the PM lock held, after a controller restart or on its own for
+    /// a controller that only suspended its codecs.
+    fn resume_codecs(&self) -> Result<(), HdaError> {
         self.set_codec_power(false)?;
         // #776 / #1496: the controller reset dropped the codecs'
         // coef state (Linux re-runs the init hook on resume for the
@@ -1784,10 +1810,43 @@ impl IntelHda {
             }
         }
         let _ = self.enable_jack_events();
-        self.suspended.store(false, Ordering::Release);
+        self.codecs_suspended.store(false, Ordering::Release);
         self.note_jack_event();
-        // A wake with no reference held (a control read) parks again after
-        // the delay.
+        Ok(())
+    }
+
+    /// The codec half of a park on its own (Linux `hda_codec_runtime_suspend`
+    /// for a controller `azx_runtime_idle` keeps up): the codecs go to D3,
+    /// the link and the command rings stay up. `idle` is checked again under
+    /// the command lease, as for a full park.
+    fn suspend_codecs_if(&self, idle: impl Fn() -> bool) -> Result<(), HdaError> {
+        let _pm = self.lock_pm()?;
+        if self.suspended.load(Ordering::Acquire) || self.codecs_suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.streams_idle() || !idle() {
+            return Err(HdaError::Busy);
+        }
+        self.set_codec_power(true)?;
+        let lease = self.acquire_command_blocking();
+        if lease.is_err() || !self.streams_idle() || !idle() {
+            drop(lease);
+            let _ = self.set_codec_power(false);
+            return Err(HdaError::Busy);
+        }
+        // Under the lease: a gated command from here on resumes the codecs.
+        self.codecs_suspended.store(true, Ordering::Release);
+        drop(lease);
+        Ok(())
+    }
+
+    /// The wake of a controller that only suspended its codecs.
+    fn resume_codecs_only(&self) -> Result<(), HdaError> {
+        let _pm = self.lock_pm()?;
+        if !self.codecs_suspended.load(Ordering::Acquire) || self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.resume_codecs()?;
         self.mark_last_busy();
         self.kick_pm();
         Ok(())
@@ -1825,6 +1884,9 @@ impl IntelHda {
     pub(super) fn ensure_active(&self) -> Result<(), HdaError> {
         if self.suspended.load(Ordering::Acquire) {
             self.reinit()?;
+        }
+        if self.codecs_suspended.load(Ordering::Acquire) {
+            self.resume_codecs_only()?;
         }
         // A failed transport (a lost response, a latched controller error)
         // is restarted here too: the stream paths refuse one, and nothing
@@ -1887,7 +1949,7 @@ impl IntelHda {
     /// `hda_codec_runtime_suspend` before `azx_runtime_suspend`. A park that
     /// cannot run now is retried a whole delay later.
     pub(super) fn autosuspend(&self) -> Autosuspend {
-        if self.suspended.load(Ordering::Acquire) {
+        if self.suspended.load(Ordering::Acquire) || self.codecs_suspended.load(Ordering::Acquire) {
             return Autosuspend::Parked;
         }
         if self.power_refs.load(Ordering::Acquire) != 0 || !self.streams_idle() {
@@ -1900,7 +1962,15 @@ impl IntelHda {
         if idle_ms < delay {
             return Autosuspend::Wait(delay - idle_ms);
         }
-        match self.quiesce_if(|| self.power_refs.load(Ordering::Acquire) == 0) {
+        let unheld = || self.power_refs.load(Ordering::Acquire) == 0;
+        // `azx_runtime_idle`: without AZX_DCAPS_PM_RUNTIME the controller
+        // stays up and only the codecs suspend.
+        let parked = if self.runtime_pm.load(Ordering::Acquire) {
+            self.quiesce_if(unheld)
+        } else {
+            self.suspend_codecs_if(unheld)
+        };
+        match parked {
             Ok(()) => Autosuspend::Parked,
             Err(_) => {
                 self.mark_last_busy();
@@ -1961,6 +2031,7 @@ impl core::future::Future for PmIdle<'_> {
         };
         let idle = |dev: &IntelHda| {
             !dev.suspended.load(Ordering::Acquire)
+                && !dev.codecs_suspended.load(Ordering::Acquire)
                 && dev.power_refs.load(Ordering::Acquire) == 0
                 && dev.streams_idle()
         };
