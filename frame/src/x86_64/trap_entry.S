@@ -7,6 +7,10 @@
  *   - Jump to `common_trap`.
  *
  * `common_trap`:
+ *   - Sanitise the live RFLAGS for the kernel context (`cld` so
+ *     string ops run forward, `clac` so SMAP stays enforced —
+ *     the interrupted RFLAGS is saved in the CPU-pushed frame and
+ *     `iretq` restores it).
  *   - Push all general-purpose registers in TrapFrame order.
  *   - Load RDI with the trap-frame pointer (RSP).
  *   - Call `rust_trap_handler` (does not return in Stage 1).
@@ -136,6 +140,21 @@ common_trap:
      * sanitizes only the kernel execution context.
      */
     cld
+
+    /* Clear EFLAGS.AC (SMAP): an IRQ or trap landing inside a STAC/CLAC
+     * user-access window — or from user code that set AC via POPF —
+     * must not run the handler with supervisor access to user pages
+     * enabled; any stray user deref in handler code would succeed
+     * silently instead of faulting. Same reasoning as DF above: the
+     * interrupted RFLAGS lives in the CPU-pushed frame and IRETQ
+     * restores it, so the interrupted window resumes intact —
+     * copy_user_guarded re-arms its own window, and its recovery
+     * label sits before its clac, so the heal path itself then runs
+     * with AC clear, which is strictly safer. The SYSCALL path
+     * already masks AC via IA32_FMASK; the IDT path has no
+     * equivalent, hence this clac. (#1303)
+     */
+    clac
 
     /* Push general-purpose registers in the order the Rust TrapFrame
      * struct expects them — last-pushed first in the struct, because
