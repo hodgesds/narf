@@ -11,10 +11,9 @@
 //! Once this is reached on amd64, a Win32 caller's
 //! `mov rax, gs:[0x30]` resolves to the TEB self-pointer,
 //! `mov rax, gs:[0x60]` to the PEB pointer, and so on. The
-//! per-process trampoline page sits at `WinProcess.trampoline_va`
-//! so any `call qword ptr [iat]` from the PE lands on a Ring-3
-//! `int 0x80` that the kernel-side `SYS_WIN_THUNK` handler
-//! dispatches.
+//! PE's `call qword ptr [iat]` instructions land in the mapped
+//! `compat-win-rt` DLL, which enters the kernel through
+//! `narf-user-runtime` (`syscall`).
 
 use crate::process::WinProcess;
 

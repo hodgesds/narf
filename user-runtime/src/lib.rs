@@ -1,7 +1,7 @@
 //! narf-user-runtime — typed user-side SDK for NARF syscalls.
 //!
 //! Phase-4 user binaries (and the eventual relibc shim) build
-//! against this crate instead of hand-rolling `int 0x80` / `svc #0`
+//! against this crate instead of hand-rolling `syscall` / `svc #0`
 //! sequences. The crate is `no_std` + no-alloc + has zero kernel
 //! dependencies so it can be reused by any user binary built for
 //! `x86_64-unknown-none` or `aarch64-unknown-none`.
@@ -13,21 +13,16 @@
 //!   `userspace/src/handlers.rs`. Layout is `#[repr(C)]` and is
 //!   considered wire-stable; updates must land on both sides.
 //!
-//! The x86_64 syscall ABI is `int 0x80` with rax = number, rdi /
-//! rsi / rdx / r10 / r8 / r9 = args, rax = return value, and RDX
-//! is also written by the kernel as the status word. Every wrapper
-//! that takes ≥3 args declares RDX as `inout` so rustc doesn't
-//! assume RDX is preserved across the trap (this is a real
-//! correctness issue — without the clobber rustc may keep a value
-//! it expected in RDX live across the syscall and read garbage).
+//! The x86_64 syscall ABI is Linux's: the `syscall` instruction with
+//! rax = number, rdi / rsi / rdx / r10 / r8 / r9 = args and the result
+//! in rax; the CPU clobbers rcx and r11. `int 0x80` is NOT a 64-bit
+//! gate: as on Linux it is the i386 ABI (eax = number from
+//! `syscall_32.tbl`, ebx..ebp = args) for every task.
 //!
-//! Note: a fast `syscall`/`sysret` MSR-driven path exists in
-//! `frame::x86_64::syscall::syscall_entry_x86_64` and EFER.SCE
-//! is enabled at boot, but the libc shim still uses `int 0x80`
-//! today. The fast-path entry has a stack-marshalling bug we
-//! haven't fully diagnosed; once fixed, the wrappers below
-//! flip back to `syscall` for the perf win. Both paths share
-//! `narf_userspace::kernel_syscall_entry_plain` for dispatch.
+//! A NARF-native call that fails with a non-Ok status reads as a
+//! negative errno in rax (the `syscall` exit folds the status word into
+//! -EINVAL), never as a handle or address; the pointer- and
+//! handle-returning wrappers check [`native_failed`].
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -402,24 +397,36 @@ pub const BOOTSTRAP_ABI_VERSION: u32 = 3;
 /// Mirrors `BOOTSTRAP_SHARED_RING_DEPTH` in `userspace/src/handlers.rs`.
 pub const BOOTSTRAP_SHARED_RING_DEPTH: u32 = 16;
 
+/// Did a NARF-native call that returns a handle or a user address fail?
+/// The kernel reports such a failure with a non-Ok status word: over
+/// `syscall` that reads as `-EINVAL` (any negative errno, really) in rax,
+/// on aarch64 (and the old `int 0x80` convention) as 0 in the value
+/// register, and some handlers answer all-ones. No valid handle or user
+/// address takes any of those values.
+#[inline]
+pub const fn native_failed(r: u64) -> bool {
+    // Negative errnos -4095..=-1 are the top 4095 values as u64; all-ones
+    // is -1 among them.
+    r == 0 || r >= (-4095i64) as u64
+}
+
 // ── Per-arch syscall asm primitives ────────────────────────────────
 //
-// Every wrapper that takes ≥3 register args MUST declare RDX as
-// `inout` (or `out`) on x86_64: the kernel writes the status word
-// into RDX even when only the rax payload is observed, so rustc
-// must treat RDX as clobbered. Missing this clobber is silent UB.
+// x86_64: `syscall` clobbers rcx (return RIP) and r11 (RFLAGS); the
+// kernel preserves every other register, rax aside. The wrappers keep
+// declaring RDX as an output as well, which costs nothing and keeps
+// them correct whatever the kernel does with it.
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn syscall0(num: u64) -> u64 {
     let mut rax = num;
-    // SAFETY: int-0x80 is the registered NARF user gate; rcx + r11
-    // are trap-clobbered, rdx is also kernel-written even on a
-    // 0-arg call.
+    // SAFETY: `syscall` is the x86_64 Linux system-call gate; rcx and
+    // r11 are clobbered by the instruction itself.
     // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
-            "int 0x80",
+            "syscall",
             inout("rax") rax,
             out("rcx") _, out("r11") _, out("rdx") _,
             options(nostack, preserves_flags),
@@ -435,7 +442,7 @@ unsafe fn syscall1(num: u64, a0: u64) -> u64 {
     // SAFETY: see `syscall0`.
     unsafe {
         core::arch::asm!(
-            "int 0x80",
+            "syscall",
             inout("rax") rax,
             in("rdi") a0,
             out("rcx") _, out("r11") _, out("rdx") _,
@@ -452,7 +459,7 @@ unsafe fn syscall2(num: u64, a0: u64, a1: u64) -> u64 {
     // SAFETY: see `syscall0`.
     unsafe {
         core::arch::asm!(
-            "int 0x80",
+            "syscall",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1,
             out("rcx") _, out("r11") _, out("rdx") _,
@@ -466,13 +473,12 @@ unsafe fn syscall2(num: u64, a0: u64, a1: u64) -> u64 {
 #[inline(always)]
 unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let mut rax = num;
-    // SAFETY: int-0x80 with three args; RDX carries `a2` in and the
-    // kernel status word out — declare as inout so rustc doesn't
-    // expect any prior RDX value to survive.
+    // SAFETY: `syscall` with three args; RDX carries `a2` in and is
+    // declared clobbered (see the note above the primitives).
     // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
-            "int 0x80",
+            "syscall",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
             out("rcx") _, out("r11") _,
@@ -491,7 +497,7 @@ unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
-            "int 0x80",
+            "syscall",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _, in("r10") a3,
             out("rcx") _, out("r11") _,
@@ -510,7 +516,7 @@ unsafe fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64
     // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
-            "int 0x80",
+            "syscall",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
             in("r10") a3, in("r8") a4,
@@ -528,7 +534,7 @@ unsafe fn syscall6(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u6
     // SAFETY: r9 is the 6th-arg register per the kernel convention.
     unsafe {
         core::arch::asm!(
-            "int 0x80",
+            "syscall",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
             in("r10") a3, in("r8") a4, in("r9") a5,
@@ -1370,7 +1376,12 @@ pub const FB_FORMAT_XRGB8888: u32 = 1;
 #[inline]
 pub unsafe fn fb_connect(scanout_id: u32) -> u64 {
     // SAFETY: SYS_FB_CONNECT takes (scanout_id) in arg0.
-    unsafe { syscall1(SYS_FB_CONNECT, scanout_id as u64) }
+    let r = unsafe { syscall1(SYS_FB_CONNECT, scanout_id as u64) };
+    if native_failed(r) {
+        0
+    } else {
+        r
+    }
 }
 
 /// Query the connected scanout's geometry. Returns `Ok` on success,
@@ -1403,7 +1414,7 @@ pub unsafe fn fb_info(handle: u64) -> Result<FbInfo, ()> {
 pub unsafe fn fb_ring_map(handle: u64) -> *mut u8 {
     // SAFETY: SYS_FB_RING_MAP signature: arg0 handle.
     let r = unsafe { syscall1(SYS_FB_RING_MAP, handle) };
-    if r == 0 || r == !0u64 {
+    if native_failed(r) {
         core::ptr::null_mut()
     } else {
         r as *mut u8
@@ -1419,7 +1430,13 @@ pub unsafe fn fb_ring_map(handle: u64) -> *mut u8 {
 #[inline]
 pub unsafe fn fb_flush_wait(handle: u64) -> u64 {
     // SAFETY: SYS_FB_FLUSH_WAIT signature: arg0 handle.
-    unsafe { syscall1(SYS_FB_FLUSH_WAIT, handle) }
+    let r = unsafe { syscall1(SYS_FB_FLUSH_WAIT, handle) };
+    // A failed call (no framebuffer service) has drained nothing.
+    if native_failed(r) {
+        0
+    } else {
+        r
+    }
 }
 
 /// Tear down a connection. Auto-called on process exit; explicit
@@ -3282,7 +3299,7 @@ pub struct BootstrapHeader {
 pub unsafe fn bootstrap() -> Option<*const BootstrapHeader> {
     // SAFETY: SYS_BOOTSTRAP takes no args.
     let r = unsafe { syscall0(SYS_BOOTSTRAP) };
-    if r == 0 || r == !0u64 {
+    if native_failed(r) {
         None
     } else {
         Some(r as *const BootstrapHeader)
@@ -3295,7 +3312,13 @@ pub unsafe fn bootstrap() -> Option<*const BootstrapHeader> {
 #[inline]
 pub fn ring_kick() -> u64 {
     // SAFETY: SYS_RING_KICK takes no args.
-    unsafe { syscall0(SYS_RING_KICK) }
+    let r = unsafe { syscall0(SYS_RING_KICK) };
+    // A failed kick (no shared rings bootstrapped) processed nothing.
+    if native_failed(r) {
+        0
+    } else {
+        r
+    }
 }
 
 // ── Thread-local-storage ───────────────────────────────────────────

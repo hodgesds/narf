@@ -404,9 +404,9 @@ cargo xtask musl-demo --arch=x86_64   # x86_64 only
 ```
 
 Runs two `run-interactive` boots verifying `/bin/hello` (hand-rolled
-`int 0x80` asm) and `/bin/hello_musl` (stock musl-static ELF) print
-through the shell + execve + ELF loader + `int 0x80`/`syscall` dual
-dispatch + `CR4.OSFXSR`.
+`syscall` asm) and `/bin/hello_musl` (stock musl-static ELF) print
+through the shell + execve + ELF loader + `syscall` dispatch +
+`CR4.OSFXSR`.
 
 ### 4.4 Off-box network smokes
 

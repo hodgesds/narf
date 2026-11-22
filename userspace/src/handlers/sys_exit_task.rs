@@ -114,7 +114,25 @@ fn exit_current_thread_status(
         return;
     }
     if !ctx.redirect_to_kernel(rip, rsp) {
+        // The `syscall` gate cannot rewrite its return into kernel mode (it
+        // always leaves through SYSRET). The landing pads installed with
+        // `set_exit_landing` are test trampolines that longjmp back into
+        // their runner and use no stack, so jump there directly, leaving
+        // this syscall's kernel frame behind as the redirect would have.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: `rip` is a landing pad registered through
+            // `set_exit_landing` (a `-> !` trampoline in kernel text); the
+            // kernel GS is live and IRQs are masked, as at the redirect's
+            // kernel-mode `iretq`.
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack));
+                let landing: extern "C" fn() -> ! = core::mem::transmute(rip as usize);
+                landing();
+            }
+        }
         // Arch doesn't support redirect; best we can do is mark Ok.
+        #[cfg(not(target_arch = "x86_64"))]
         ctx.set_return(SyscallReturn::ok(0));
     }
     // Redirect succeeded → frame rewritten, `iretq` lands in kernel.

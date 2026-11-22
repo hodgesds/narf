@@ -2808,7 +2808,7 @@ kernel_test!(smoke_frame_aarch64_svc_dispatches_through_global);
 // `smoke_userspace_syscall_dispatch_via_global` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
 // The end-to-end user-mode round-trip test below boots a real user
-// process, issues `int 0x80`, and longjmps back into the harness.
+// process, issues `syscall`, and longjmps back into the harness.
 // It *works* — on a standalone run it prints [OK] and the magic
 // round-trips — but leaves subsystem state (leaked user AS, TSS
 // kernel stack consumed through a trap) that hangs a specific
@@ -3343,13 +3343,15 @@ mod aarch64_el0_preemption_e2e {
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     // Full end-to-end: build a user AS with a code + stack page,
-    // hand-assemble a tiny user program that issues `int 0x80`,
+    // hand-assemble a tiny user program that issues `syscall`,
     // enter user mode, and resume back into this function via a
-    // raw syscall handler that `redirect_to_kernel`s onto a naked
-    // longjmp trampoline. The setjmp-of-self at the top of this
-    // function captures the return state; the longjmp from the
-    // trampoline hands control back with `result == 1`, where we
-    // verify the magic.
+    // raw syscall handler that jumps onto a naked longjmp
+    // trampoline. The setjmp-of-self at the top of this function
+    // captures the return state; the longjmp from the trampoline
+    // hands control back with `result == 1`, where we verify the
+    // magic. (`int 0x80` is the i386 ABI, so the program uses the
+    // 64-bit gate; that gate cannot redirect its return into kernel
+    // mode, so the handler leaves its frame behind and jumps.)
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
@@ -3371,8 +3373,8 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
         rip: 0,
     };
 
-    // Naked trampoline — `redirect_to_kernel`'s rip lands here.
-    // First thing we do is longjmp to the saved kernel state.
+    // Naked trampoline the handler jumps to. First thing we do is
+    // longjmp to the saved kernel state.
     #[unsafe(naked)]
     unsafe extern "C" fn resume_trampoline() -> ! {
         naked_asm!(
@@ -3388,10 +3390,13 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     impl SyscallHandler for UnwindHandler {
         fn handle(&self, ctx: &mut dyn TrapContext) {
             SEEN_MAGIC.store(ctx.args().arg0, Ordering::Release);
-            // Any RSP is OK — the trampoline overwrites RSP before
-            // any stack use.
-            let _ =
-                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
+            // SAFETY: kernel mode with the kernel GS live (the SYSCALL
+            // entry swapped it); the trampoline longjmps to the setjmp
+            // below and never returns, abandoning this syscall frame.
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack));
+                resume_trampoline();
+            }
         }
     }
 
@@ -3485,12 +3490,12 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     // Hand-assembled user program:
     //   mov rax, <Sleep.raw()>      ; 7 bytes (REX.W + C7 C0 + imm32)
     //   movabs rdi, 0xBADC0FFEE0DDF00D ; 10 bytes (REX.W + BF + imm64)
-    //   int 0x80                    ; 2 bytes
+    //   syscall                     ; 2 bytes
     //   jmp $                       ; 2 bytes
     let sleep_n = Syscall::Sleep.raw().to_le_bytes();
     let code_bytes: [u8; 21] = [
         0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3], 0x48, 0xBF, 0x0D, 0xF0,
-        0xDD, 0xE0, 0xFE, 0x0F, 0xDC, 0xBA, 0xCD, 0x80, 0xEB, 0xFE,
+        0xDD, 0xE0, 0xFE, 0x0F, 0xDC, 0xBA, 0x0F, 0x05, 0xEB, 0xFE,
     ];
     // SAFETY: Valid memory or trusted environment
     unsafe {
@@ -3574,17 +3579,12 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
         rsp: 0,
         rip: 0,
     };
-    // Tiny kernel stack for the resume trampoline — `user_mode_resume`
-    // pushes a 5-qword iretq frame, which a 256-byte stack absorbs
-    // comfortably.
-    #[repr(C, align(16))]
-    struct ResumeStack([u64; 32]);
-    static mut RESUME_STACK: ResumeStack = ResumeStack([0; 32]);
-
-    // Yield handler: save user state, redirect_to_kernel into the
-    // resume trampoline. The trampoline calls enter_user_mode_resume
-    // with a pointer to SAVED_USER, which iretq's back to user at
-    // the saved RIP.
+    // Yield handler: save user state, then jump into the resume
+    // trampoline, which calls user_mode_resume with a pointer to
+    // SAVED_USER and iretq's back to user at the saved RIP. (The
+    // `syscall` gate cannot redirect its return into kernel mode, so
+    // the handler leaves this syscall frame behind; the trampoline's
+    // 5-qword iretq frame lands on the syscall's kernel stack.)
     struct YieldHandler;
     impl SyscallHandler for YieldHandler {
         fn handle(&self, ctx: &mut dyn TrapContext) {
@@ -3592,15 +3592,13 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
             unsafe {
                 ctx.save_user_state(core::ptr::addr_of_mut!(SAVED_USER) as *mut u8);
             }
-            // The resume trampoline tail-calls user_mode_resume which
-            // pushes a 5-qword iretq frame — supply a real kernel
-            // stack so that doesn't fault.
-            // SAFETY: Valid memory or trusted environment
-            let stack_top = unsafe {
-                let p = core::ptr::addr_of_mut!(RESUME_STACK) as *mut u64;
-                p.add(32) as u64
-            };
-            let _ = ctx.redirect_to_kernel(resume_landing as usize as u64, stack_top);
+            // SAFETY: kernel mode with the kernel GS live (the SYSCALL
+            // entry swapped it) and IRQs masked for the swapgs/iretq;
+            // SAVED_USER holds the state saved above.
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack));
+                resume_landing();
+            }
         }
     }
 
@@ -3610,8 +3608,12 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     impl SyscallHandler for UnwindHandler {
         fn handle(&self, ctx: &mut dyn TrapContext) {
             SEEN_MAGIC.store(ctx.args().arg0, Ordering::Release);
-            let _ =
-                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
+            // SAFETY: kernel mode, kernel GS live; the trampoline
+            // longjmps to the setjmp below and never returns.
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack));
+                resume_trampoline();
+            }
         }
     }
 
@@ -3721,20 +3723,20 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
 
     // Hand-assembled user program:
     //   mov rax, <Yield.raw()> ; Syscall::Yield
-    //   int 0x80               ; (yield — kernel saves state, resumes)
+    //   syscall                ; (yield — kernel saves state, resumes)
     //   mov rax, <Sleep.raw()> ; Syscall::Sleep
     //   movabs rdi, 0xCAFEBABEDEADBEEF
-    //   int 0x80               ; (handler captures magic + longjmps)
+    //   syscall                ; (handler captures magic + longjmps)
     //   jmp $
     let yield_n = Syscall::Yield.raw().to_le_bytes();
     let sleep_n = Syscall::Sleep.raw().to_le_bytes();
     let code_bytes: [u8; 30] = [
         0x48, 0xC7, 0xC0, yield_n[0], yield_n[1], yield_n[2], yield_n[3], // mov rax, Yield
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3], // mov rax, Sleep
         0x48, 0xBF, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE,
         0xCA, // movabs rdi, 0xCAFEBABEDEADBEEF
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0xEB, 0xFE, // jmp $
     ];
     // SAFETY: Valid memory or trusted environment
@@ -3839,10 +3841,10 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     SAVED_CR3.store(original_cr3, Ordering::Release);
 
     // Per-task ctx + AS + code/stack pages. The user code:
-    //   mov rax, 104     ; Yield
-    //   int 0x80
-    //   mov rax, 103     ; ExitTask
-    //   int 0x80
+    //   mov rax, Yield
+    //   syscall
+    //   mov rax, ExitTask
+    //   syscall
     //   jmp $
     // SAFETY: Valid memory or trusted environment
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
@@ -3879,9 +3881,9 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     let exit_n = Syscall::ExitTask.raw().to_le_bytes();
     let code_bytes: [u8; 20] = [
         0x48, 0xC7, 0xC0, yield_n[0], yield_n[1], yield_n[2], yield_n[3], // mov rax, Yield
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0x48, 0xC7, 0xC0, exit_n[0], exit_n[1], exit_n[2], exit_n[3], // mov rax, ExitTask
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0xEB, 0xFE, // jmp $
     ];
     // SAFETY: Valid memory or trusted environment
@@ -3920,7 +3922,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         unsafe { user_mode_enter(CODE_VADDR, stack_top) }
     } else if saved as u32 == EXIT_REASON_YIELDED {
         // First yield observed. Re-enter via resume so user picks
-        // up at the instruction after `int 0x80`.
+        // up at the instruction after `syscall`.
         OBSERVED_REASONS.fetch_or(1, Ordering::Relaxed);
         // SAFETY: Valid memory or trusted environment
         unsafe {
@@ -4036,15 +4038,15 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
             phys: alloc::vec![stack_frame].into(),
         })
         .ok();
-    // mov rax, 104 ; int 0x80 ; mov rax, 103 ; int 0x80 ; jmp $
-    // First int 0x80 goes Yielded → re-poll → second int 0x80 Exited.
+    // mov rax, Yield ; syscall ; mov rax, ExitTask ; syscall ; jmp $
+    // First syscall goes Yielded → re-poll → second syscall Exited.
     let yield_n = Syscall::Yield.raw().to_le_bytes();
     let exit_n = Syscall::ExitTask.raw().to_le_bytes();
     let code_bytes: [u8; 20] = [
         0x48, 0xC7, 0xC0, yield_n[0], yield_n[1], yield_n[2], yield_n[3], // mov rax, Yield
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0x48, 0xC7, 0xC0, exit_n[0], exit_n[1], exit_n[2], exit_n[3], // mov rax, ExitTask
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0xEB, 0xFE, // jmp $
     ];
     // SAFETY: Valid memory or trusted environment
@@ -4166,10 +4168,10 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     };
 
     // The user code emits two syscalls:
-    //   1. mov rdi, fs:[0]  ; mov rax, 104 (Yield) ; int 0x80
+    //   1. mov rdi, fs:[0]  ; mov rax, Yield ; syscall
     //      → captures the thread-pointer self-pointer; the kernel
     //        saves user state + resumes at the next instruction.
-    //   2. mov rdi, fs:[-32] ; mov rax, 105 (Sleep) ; int 0x80
+    //   2. mov rdi, fs:[-32] ; mov rax, Sleep ; syscall
     //      → captures the first qword of the file image (= 0xABABAB…),
     //        kernel longjmps back to the test.
     static SEEN_TP: AtomicU64 = AtomicU64::new(0);
@@ -4206,15 +4208,13 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
         rsp: 0,
         rip: 0,
     };
-    #[repr(C, align(16))]
-    struct ResumeStack([u64; 32]);
-    static mut RESUME_STACK: ResumeStack = ResumeStack([0; 32]);
-
     // Yield handler: capture rdi as the thread-pointer read, then
     // resume user mode at the saved RIP so the binary can issue its
     // second syscall. The trap path enters/exits CPL=0 with FS_BASE
     // intact (no `swapgs`-like demote on the FS hidden base), so we
-    // don't need to re-program it on the resume.
+    // don't need to re-program it on the resume. The `syscall` gate
+    // cannot redirect its return into kernel mode, so the handler
+    // jumps into the landing and leaves this syscall frame behind.
     struct CaptureTpHandler;
     impl SyscallHandler for CaptureTpHandler {
         fn handle(&self, ctx: &mut dyn TrapContext) {
@@ -4223,12 +4223,13 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
             unsafe {
                 ctx.save_user_state(core::ptr::addr_of_mut!(SAVED_USER) as *mut u8);
             }
-            // SAFETY: Valid memory or trusted environment
-            let stack_top = unsafe {
-                let p = core::ptr::addr_of_mut!(RESUME_STACK) as *mut u64;
-                p.add(32) as u64
-            };
-            let _ = ctx.redirect_to_kernel(resume_landing as usize as u64, stack_top);
+            // SAFETY: kernel mode with the kernel GS live (the SYSCALL
+            // entry swapped it) and IRQs masked for the swapgs/iretq;
+            // SAVED_USER holds the state saved above.
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack));
+                resume_landing();
+            }
         }
     }
 
@@ -4238,8 +4239,12 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     impl SyscallHandler for CaptureFileHandler {
         fn handle(&self, ctx: &mut dyn TrapContext) {
             SEEN_FILEIMAGE.store(ctx.args().arg0, Ordering::Release);
-            let _ =
-                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
+            // SAFETY: kernel mode, kernel GS live; the trampoline
+            // longjmps to the setjmp below and never returns.
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack));
+                resume_trampoline();
+            }
         }
     }
 
@@ -4364,20 +4369,20 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     // — `0x65` is GS, easy to mis-paste). Hand-assembled:
     //   64 48 8B 3C 25 00 00 00 00   mov rdi, qword ptr fs:[0]
     //   48 C7 C0 <Yield>            mov rax, Syscall::Yield.raw()
-    //   CD 80                         int 0x80
+    //   0F 05                         syscall
     //   64 48 8B 3C 25 E0 FF FF FF    mov rdi, qword ptr fs:[-32]
     //   48 C7 C0 <Sleep>            mov rax, Syscall::Sleep.raw()
-    //   CD 80                         int 0x80
+    //   0F 05                         syscall
     //   EB FE                         jmp $
     let yield_n = Syscall::Yield.raw().to_le_bytes();
     let sleep_n = Syscall::Sleep.raw().to_le_bytes();
     let code: [u8; 38] = [
         0x64, 0x48, 0x8B, 0x3C, 0x25, 0x00, 0x00, 0x00, 0x00, // mov rdi, fs:[0]
         0x48, 0xC7, 0xC0, yield_n[0], yield_n[1], yield_n[2], yield_n[3], // mov rax, Yield
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0x64, 0x48, 0x8B, 0x3C, 0x25, 0xE0, 0xFF, 0xFF, 0xFF, // mov rdi, fs:[-32]
         0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3], // mov rax, Sleep
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0xEB, 0xFE, // jmp $ (unreached)
     ];
     elf[CODE_OFF..CODE_OFF + code.len()].copy_from_slice(&code);
