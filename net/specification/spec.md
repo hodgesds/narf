@@ -1441,6 +1441,42 @@ frame admission. Ordinary Ethernet link, carrier, routing and send behavior is
 unchanged. Native asynchronous wireless controls use this fence so a namespace
 away/back or DOWN/UP cycle cannot revive a prior socket/mode operation.
 
+### Receive pumps in softirq context (`napi`)
+
+A NIC queue's receive pump runs the way Linux runs NAPI from
+`__do_softirq` on IRQ exit. `napi::rx_pump_spec(cpu)` is the pump's task
+spec: pinned to the CPU the queue's vector is delivered to,
+`WorkKind::SoftIrq`, and `SchedClass::Interactive`, so the strict-class
+dispatcher runs it ahead of that CPU's Default-class tasks.
+`napi::rx_deferral_spec(cpu)` is its deferral task, the ksoftirqd role:
+the same CPU and work kind, `SchedClass::Default`.
+
+`napi::softirq_run(poll, complete, handoff, now_ns)` is one run from one
+IRQ wake. `poll` is one NAPI poll of at most `DEFAULT_BUDGET` frames,
+returning the frames processed and whether the ring still holds work;
+`complete` is `napi_complete_done` plus the driver's interrupt re-enable,
+called only when a poll left the ring empty, and returns whether work
+landed meanwhile (the run polls again). While work is left the run yields
+to its own class between polls and accounts each poll in a
+`SoftirqBudget`: a round ends after `NETDEV_BUDGET` (300) packets or
+`NETDEV_BUDGET_NS` (2 ms), and the run ends after `MAX_SOFTIRQ_RESTART`
+(10) rounds or `MAX_SOFTIRQ_TIME_NS` (2 ms). It then returns
+`SoftirqEnd::Deferred` with the queue handed over through `handoff`
+uncompleted, so the driver does not re-enable its interrupt; otherwise
+`SoftirqEnd::Completed`.
+
+`SoftirqHandoff` is the queue's ownership between the two tasks
+(`NAPI_STATE_SCHED` held across `wakeup_softirqd`): `defer` and
+`hand_back` publish the owner with Release and wake the other side;
+`taken` and `returned` resolve once the deferral task or the pump holds
+the queue. Exactly one of the two polls the queue at a time.
+`napi::deferral_run(poll, handoff, now_ns)` is the deferral task's turn:
+polls in runs under the same `SoftirqBudget`, yields the CPU between
+runs (`cond_resched`), and hands the queue back when a poll leaves the
+ring empty; the pump's next run completes it.
+
+The igc, igb and e1000 receive pumps use this model.
+
 ## 4. Invariants & safety properties
 
 - A frame buffer is owned by exactly one holder at a time — either

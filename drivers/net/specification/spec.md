@@ -212,7 +212,13 @@ Built-in IGC registration opts the interface into the stack's software GRO
 to the CPU its MSI-X vector is steered to (Linux NAPI polls where the
 interrupt landed), is classified `WorkKind::SoftIrq`, and flushes that CPU's
 held flows when its ring is empty and its vector re-armed, the
-`napi_complete_done` point. The frame-ring transmit consumer and the 10 ms
+`napi_complete_done` point. The receive task is `narf_net::napi`'s
+softirq-context pump (net spec §3, "Receive pumps in softirq context"):
+Interactive class, one bounded `softirq_run` per interrupt, the vector
+re-enabled (ITR update, then EIMS) only when a poll leaves the ring empty,
+and a Default-class deferral task on the same CPU for work left after the
+softirq bound. igb (vector on the probe CPU) and e1000 (vector on the boot
+CPU) receive pumps follow the same model. The frame-ring transmit consumer and the 10 ms
 maintenance worker have no queue locality and are spawned with
 `TaskSpec::kernel_any()`, never on the boot CPU by default.
 
