@@ -1925,3 +1925,115 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_io_counts_in_proc_pid_io
 );
+
+// ── Steam's event and FIFO calls ─────────────────────────────────────
+
+/// The i386 epoll, eventfd and node-creation calls Steam's
+/// `CCompletionPortManager` and named-pipe setup make, all native entries
+/// in `syscall_32.tbl` (`struct epoll_event` is packed on x86, so i386 and
+/// x86_64 share its 12-byte layout):
+///
+///   * `epoll_create` (254) and `epoll_create1` (329); `epoll_create(-1)`
+///     is EINVAL because `size` is an `int`;
+///   * `eventfd` (323) and `eventfd2` (328);
+///   * `epoll_ctl` (255) registering the eventfd, then `epoll_wait` (256),
+///     `epoll_pwait` (319) and `epoll_pwait2` (441, a `__kernel_timespec`)
+///     reporting it readable with the 64-bit `data` intact;
+///     `epoll_wait(maxevents = -1)` is EINVAL;
+///   * `mknodat` (297, `AT_FDCWD` sign-extended) and `mknod` (14) creating
+///     an S_IFIFO node that `open` (5) then opens.
+fn smoke_compat32_table_epoll_eventfd_and_fifo_nodes() -> TestResult {
+    const EPOLL_CTL_ADD: u64 = 1;
+    const EPOLLIN: u32 = 0x1;
+    const S_IFIFO_0600: u64 = 0o010_600;
+    const O_RDWR: u64 = 2;
+    const DATA: u64 = 0x1122_3344_5566_7788;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["ev"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-ev", "compat32-ev", &[], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let mut fds = Vec::new();
+            let epfd = call32(329, [0, 0, 0, 0, 0, 0]);
+            let legacy = call32(254, [1, 0, 0, 0, 0, 0]);
+            if epfd < 0 || legacy < 0 {
+                return Err("i386 epoll_create1 / epoll_create failed");
+            }
+            fds.extend([epfd, legacy]);
+            if call32(254, [0xFFFF_FFFF, 0, 0, 0, 0, 0]) != EINVAL {
+                return Err("i386 epoll_create(-1) must be EINVAL: size is an int");
+            }
+            let efd = call32(328, [0, 0, 0, 0, 0, 0]);
+            let efd_legacy = call32(323, [0, 0, 0, 0, 0, 0]);
+            if efd < 0 || efd_legacy < 0 {
+                return Err("i386 eventfd2 / eventfd failed");
+            }
+            fds.extend([efd, efd_legacy]);
+            let mut event = Vec::new();
+            event.extend_from_slice(&EPOLLIN.to_le_bytes());
+            event.extend_from_slice(&DATA.to_le_bytes());
+            put_user(base + 0x100, &event)?;
+            if call32(
+                255,
+                [epfd as u64, EPOLL_CTL_ADD, efd as u64, base + 0x100, 0, 0],
+            ) != 0
+            {
+                return Err("i386 epoll_ctl(ADD) of an eventfd failed");
+            }
+            put_user(base + 0x200, &1u64.to_le_bytes())?;
+            if call32(4, [efd as u64, base + 0x200, 8, 0, 0, 0]) != 8 {
+                return Err("i386 write to the eventfd failed");
+            }
+            put_user(base + 0x400, &[0u8; 16])?;
+            for (nr, regs) in [
+                (256u32, [epfd as u64, base + 0x300, 4, 0, 0, 0]),
+                (319, [epfd as u64, base + 0x300, 4, 0, 0, 8]),
+                (441, [epfd as u64, base + 0x300, 4, base + 0x400, 0, 8]),
+            ] {
+                put_user(base + 0x300, &[0u8; 12])?;
+                if call32(nr, regs) != 1 {
+                    return Err("an i386 epoll wait did not report the readable eventfd");
+                }
+                let got = get_user(base + 0x300, 12)?;
+                let events = u32::from_le_bytes([got[0], got[1], got[2], got[3]]);
+                let data = u64::from_le_bytes(got[4..12].try_into().unwrap_or([0; 8]));
+                if events & EPOLLIN == 0 || data != DATA {
+                    return Err("an i386 epoll wait did not write the packed 12-byte epoll_event");
+                }
+            }
+            if call32(256, [epfd as u64, base + 0x300, 0xFFFF_FFFF, 0, 0, 0]) != EINVAL {
+                return Err("i386 epoll_wait(maxevents = -1) must be EINVAL");
+            }
+            put_user(base + 0x600, b"/compat32-ev/fifo\0")?;
+            put_user(base + 0x640, b"/compat32-ev/fifo2\0")?;
+            if call32(297, [AT_FDCWD32, base + 0x600, S_IFIFO_0600, 0, 0, 0]) != 0 {
+                return Err("i386 mknodat(AT_FDCWD, S_IFIFO) failed");
+            }
+            if call32(14, [base + 0x640, S_IFIFO_0600, 0, 0, 0, 0]) != 0 {
+                return Err("i386 mknod(S_IFIFO) failed");
+            }
+            for path in [base + 0x600, base + 0x640] {
+                let fd = call32(5, [path, O_RDWR, 0, 0, 0, 0]);
+                if fd < 0 {
+                    return Err("opening the i386-created node failed");
+                }
+                fds.push(fd);
+            }
+            for fd in fds {
+                let _ = call32(6, [fd as u64, 0, 0, 0, 0, 0]);
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_epoll_eventfd_and_fifo_nodes
+);
