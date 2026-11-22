@@ -546,6 +546,8 @@ struct FixtureConfig {
     /// STATESTS at probe (0 = codec 0 only). Only codec 0 answers: the
     /// model tags every response with address 0.
     codec_mask: u16,
+    /// Coef registers (nid, index, value) the codec holds before probe.
+    seed_coef: &'static [(u8, u16, u16)],
 }
 
 struct Fixture {
@@ -671,6 +673,7 @@ impl Fixture {
             codec_id,
             hp_plugged,
             codec_mask,
+            seed_coef,
         } = config;
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -718,10 +721,14 @@ impl Fixture {
                 codec_id,
                 hp_plugged,
                 coef_index: [(0x20, 0), (0x53, 0)],
-                coef: if seed_alc256_coef {
-                    alloc::vec![(crate::hda::quirks::COEF_NODE, 0x46, 0xF5A5)]
-                } else {
-                    Vec::new()
+                coef: {
+                    let mut coef = if seed_alc256_coef {
+                        alloc::vec![(crate::hda::quirks::COEF_NODE, 0x46, 0xF5A5)]
+                    } else {
+                        Vec::new()
+                    };
+                    coef.extend_from_slice(seed_coef);
+                    coef
                 },
             }),
         };
@@ -3583,3 +3590,50 @@ kernel_test_in!(
     "audio/hda/position-rate",
     native_hda_position_wraps_follow_the_stream_rate
 );
+
+/// The value of coef `index` on the coef node, if the codec holds one.
+fn coef_value(model: &Model, index: u16) -> Option<u16> {
+    model
+        .coef
+        .iter()
+        .find(|(nid, i, _)| *nid == crate::hda::quirks::COEF_NODE && *i == index)
+        .map(|(_, _, value)| *value)
+}
+
+/// Linux `alc662_probe` for an ALC897, the analog codec of AM5 desktop
+/// boards: `alc_fix_pll_init(codec, 0x20, 0x04, 15)` clears coef 0x04 bit
+/// 15, and `alc_pre_init` -> `alc_fill_eapd_coef` clears coef 0x07 bit 5
+/// (EAPD control), at probe and again on every init (`alc_init` after a
+/// resume). NARF knew no ALC662-family chip, so the codec kept both bits as
+/// the firmware left them.
+fn native_hda_alc897_pll_and_eapd_coefs() -> TestResult {
+    let mut fixture = match Fixture::build_model(FixtureConfig {
+        codec_id: 0x10ec0897,
+        seed_coef: &[(0x20, 0x04, 0x9234), (0x20, 0x07, 0x0121)],
+        ..Default::default()
+    }) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if coef_value(&fixture.model, 0x04) != Some(0x1234)
+        || coef_value(&fixture.model, 0x07) != Some(0x0101)
+    {
+        return TestResult::Fail("probe clears the ALC897 PLL bit and EAPD coef bit");
+    }
+    // The bits come back (a resume powers the codec up from scratch); the
+    // wake runs the init again.
+    for slot in fixture.model.coef.iter_mut() {
+        slot.2 |= if slot.1 == 0x04 { 0x8000 } else { 0x0020 };
+    }
+    if dev.quiesce().is_err() || dev.reinit().is_err() {
+        return TestResult::Fail("park and wake");
+    }
+    if coef_value(&fixture.model, 0x04) != Some(0x1234)
+        || coef_value(&fixture.model, 0x07) != Some(0x0101)
+    {
+        return TestResult::Fail("the wake re-applies the ALC897 init coefs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda/alc897", native_hda_alc897_pll_and_eapd_coefs);
