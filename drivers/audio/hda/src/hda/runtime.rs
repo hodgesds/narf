@@ -76,6 +76,8 @@ pub struct IntelHda {
     /// `AC_PAR_PCM` word — the same word `configure_paths` enforces — so
     /// `capabilities()` stays a pure read on a path alsa-lib walks repeatedly.
     pub(super) supported_formats: [Vec<narf_drivers_sound::format::SampleFormat>; 2],
+    /// Brought up and ready for its card, codecs or not (Linux registers a
+    /// card for a link with no codec too).
     pub ready: bool,
     /// AMD GPU HD-Audio does not snoop (Linux AZX_DCAPS_SNOOP_OFF): CORB,
     /// RIRB, BDL and sample buffers need explicit cache maintenance.
@@ -561,17 +563,19 @@ impl IntelHda {
             }
         }
         if dev.codecs.is_empty() {
-            // What the next boot needs to tell a link without codecs from
-            // codecs that do not answer.
+            // Linux azx_probe_continue: "no codecs found!", then "keep
+            // running the rest for the runtime PM" and register a card
+            // without PCMs. The register values tell a link without codecs
+            // from codecs that do not answer.
             narf_console::write_str(&alloc::format!(
-                "hda: no codec: STATESTS mask {:#x}, answering {:#x}, GCAP {:#06x}, GCTL {:#x}\n",
+                "hda: no codecs found! STATESTS mask {:#x}, answering {:#x}, GCAP {:#06x}, \
+                 GCTL {:#x}\n",
                 mask,
                 probed,
                 gcap,
                 // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
                 unsafe { bar.read32(REG_GCTL) },
             ));
-            return Err(HdaError::NoCodecs);
         }
         dev.discover_paths();
         dev.hdmi = IrqSafeSpinLock::new(dev.hdmi_ports());
@@ -580,7 +584,9 @@ impl IntelHda {
             dev.query_supported_formats(false),
             dev.query_supported_formats(true),
         ];
-        dev.ready = !dev.outputs.is_empty() || dev.input.lock().is_some();
+        // Linux registers the card whatever the codecs give it; one with no
+        // path simply has no PCMs.
+        dev.ready = true;
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         unsafe {
             bar.write16(REG_STATESTS, mask);
@@ -2369,11 +2375,12 @@ fn probe_error(error: HdaError) -> narf_bus::ProbeError {
     })
 }
 
-/// Linux `AZX_DCAPS_RETRY_PROBE` (the AMD SB preset): a codec probe that
-/// fails on an AMD platform controller is retried rather than final.
+/// Linux `AZX_DCAPS_RETRY_PROBE` (the AMD SB preset): a codec that fails to
+/// configure on an AMD platform controller is retried rather than final.
+/// A link with no codec is not retried; it comes up with an empty card.
 fn retries_probe(device: &BusDevice, error: HdaError) -> bool {
     super::amd_sb_preset(device.id.vendor, device.id.device)
-        && matches!(error, HdaError::NoCodecs | HdaError::CommandTimeout)
+        && matches!(error, HdaError::CommandTimeout)
 }
 
 /// Linux `azx_probe_continue`: `++hda->probe_retry < 60`, one second apart.

@@ -375,8 +375,10 @@ does not answer is dropped and the controller reset, then the answering
 codecs are enumerated. The AMD platform controllers 1022:1457, 1022:1487
 and 1022:15e3 (`HDA_AMD_*_DEVICE`, `amd_sb_preset`; Linux
 `AZX_DCAPS_PRESET_AMD_SB`) get ATI snooping and `AZX_DCAPS_RETRY_PROBE`: a
-probe that finds no usable codec keeps the device and retries the bring-up
-once a second, up to 59 more times. A registered HDA card is named as Linux `azx_create` and
+codec whose enumeration times out keeps the device and retries the bring-up
+once a second, up to 59 more times. A link with no codec is not retried: as
+Linux (`no codecs found!`) it comes up and registers a card without PCMs or
+controls. A registered HDA card is named as Linux `azx_create` and
 `snd_card_register` name it: driver `HDA-Intel`, the driver type's short name
 (`card_short_name`: "HDA ATI HDMI", "HD-Audio Generic", "HDA Intel", "HDA
 Intel PCH"), the id its last word (`card_id`, made unique by the registry,
