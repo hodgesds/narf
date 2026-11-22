@@ -44,6 +44,13 @@
 
 extern crate alloc;
 
+/// `setup_net` for a new, non-initial network namespace: run the per-netns
+/// device init. `loopback_net_init` registers the namespace's own `lo`
+/// (ifindex 1, down, no address); every other device is moved in explicitly.
+pub fn create_network_namespace(net_ns_id: u64) {
+    iface::create_namespace_loopback(net_ns_id);
+}
+
 /// Reclaim kernel networking state after the final reference to a non-initial
 /// network namespace disappears.
 pub fn release_network_namespace(net_ns_id: u64) {

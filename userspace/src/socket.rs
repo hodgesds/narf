@@ -4408,15 +4408,17 @@ impl FileOps for SocketFile {
                     const IFF_PROMISC: i16 = 0x100;
                     const IFF_ALLMULTI: i16 = 0x200;
                     const IFF_MULTICAST: i16 = 0x1000;
-                    let mut flags = IFF_MULTICAST;
+                    // `gen_lo_setup`: `dev->flags = IFF_LOOPBACK`, no
+                    // IFF_MULTICAST; `ether_setup` gives every Ethernet
+                    // device IFF_BROADCAST | IFF_MULTICAST.
+                    let mut flags = if name == "lo" {
+                        IFF_LOOPBACK
+                    } else {
+                        IFF_BROADCAST | IFF_MULTICAST
+                    };
                     if iface.link_up {
                         flags |= IFF_UP | IFF_RUNNING;
                     }
-                    flags |= if name == "lo" {
-                        IFF_LOOPBACK
-                    } else {
-                        IFF_BROADCAST
-                    };
                     if iface.promisc {
                         flags |= IFF_PROMISC;
                     }
@@ -4453,8 +4455,10 @@ impl FileOps for SocketFile {
                     ifreq[18..24].copy_from_slice(&iface.mac);
                 }
                 SIOCGIFINDEX => {
-                    let index = narf_net::iface::ifindex_of(&name).ok_or(FsError::NotFound)?;
-                    ifreq[16..20].copy_from_slice(&(index as i32).to_ne_bytes());
+                    // The device of the socket's own namespace
+                    // (`dev_get_by_name_rcu(net, ...)`): a namespace's `lo`
+                    // is its ifindex 1.
+                    ifreq[16..20].copy_from_slice(&(iface.ifindex as i32).to_ne_bytes());
                 }
                 SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR => {
                     let admin = match delegated {

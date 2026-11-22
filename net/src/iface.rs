@@ -815,7 +815,17 @@ static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::ne
 /// it actually set, or that CPU is left permanently guarded and silently
 /// drops every later loopback frame.
 fn lo_send_fn(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    loopback_guarded(|| {
+        let mut buf = frame.to_vec();
+        record_rx_frame("lo", &buf);
+        crate::tcp_stack::rx_handler("lo", &mut buf);
+    })
+}
+
+/// Run one loopback delivery under the per-CPU reentrancy guard described on
+/// [`lo_send_fn`]; a nested delivery on the same CPU is dropped (`Err`).
+fn loopback_guarded(deliver: impl FnOnce()) -> Result<(), ()> {
+    use core::sync::atomic::AtomicBool;
     const MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
     static IN_LOOPBACK: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
@@ -823,9 +833,7 @@ fn lo_send_fn(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     if IN_LOOPBACK[cpu].swap(true, Ordering::AcqRel) {
         return Err(());
     }
-    let mut buf = frame.to_vec();
-    record_rx_frame("lo", &buf);
-    crate::tcp_stack::rx_handler("lo", &mut buf);
+    deliver();
     IN_LOOPBACK[cpu].store(false, Ordering::Release);
     Ok(())
 }
@@ -1333,15 +1341,29 @@ fn with_stats_mut(name: &str, update: impl FnOnce(&mut IfaceCounterSnapshot)) {
 }
 
 fn record_tx_result(name: &str, bytes: usize, success: bool) {
-    with_stats_mut(name, |stats| {
-        if success {
-            stats.tx_packets = stats.tx_packets.saturating_add(1);
-            stats.tx_bytes = stats.tx_bytes.saturating_add(bytes as u64);
-        } else {
-            stats.tx_errs = stats.tx_errs.saturating_add(1);
-            stats.tx_drop = stats.tx_drop.saturating_add(1);
+    with_stats_mut(name, |stats| apply_tx_result(stats, bytes, success));
+}
+
+fn apply_tx_result(stats: &mut IfaceCounterSnapshot, bytes: usize, success: bool) {
+    if success {
+        stats.tx_packets = stats.tx_packets.saturating_add(1);
+        stats.tx_bytes = stats.tx_bytes.saturating_add(bytes as u64);
+    } else {
+        stats.tx_errs = stats.tx_errs.saturating_add(1);
+        stats.tx_drop = stats.tx_drop.saturating_add(1);
+    }
+}
+
+/// [`record_tx_result`] for the device `dev` is a snapshot of: a non-initial
+/// namespace's `lo` keeps its own counters rather than the initial `lo`'s.
+fn record_tx_result_dev(dev: &NetIfaceSnapshot, bytes: usize, success: bool) {
+    if dev.net_ns_id != 0 && dev.ifindex == LOOPBACK_IFINDEX {
+        if let Some(lo) = NAMESPACE_LOOPBACKS.lock().get_mut(&dev.net_ns_id) {
+            apply_tx_result(&mut lo.entry.stats, bytes, success);
+            return;
         }
-    });
+    }
+    record_tx_result(&dev.name, bytes, success);
 }
 
 fn record_rx_frame(name: &str, frame: &[u8]) {
@@ -1491,8 +1513,14 @@ pub fn primary_in(net_ns_id: u64) -> Option<NetIfaceSnapshot> {
     Some(snapshot(entry))
 }
 
-/// Look up an interface only when it belongs to `net_ns_id`.
+/// Look up an interface only when it belongs to `net_ns_id`
+/// (`__dev_get_by_name(net, name)`).
 pub fn lookup_in(net_ns_id: u64, name: &str) -> Option<NetIfaceSnapshot> {
+    if net_ns_id != 0 && name == "lo" {
+        if let Some(lo) = namespace_loopback_snapshot(net_ns_id) {
+            return Some(lo);
+        }
+    }
     let g = IFACES.lock();
     let entry = g
         .as_ref()?
@@ -1548,6 +1576,12 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
 }
 
 pub(crate) fn release_namespace(net_ns_id: u64) {
+    // `default_device_exit_batch` unregisters the namespace's own `lo` last;
+    // nothing in the namespace can reach it once its final reference is gone.
+    let loopback = NAMESPACE_LOOPBACKS.lock().remove(&net_ns_id);
+    if let Some(mut lo) = loopback {
+        lo.entry.retire_native().notify();
+    }
     let _capture = monitor::PUBLISH.lock();
     let moved: Vec<(NetIfaceSnapshot, crate::native_emission::Retirement)> = {
         let mut interfaces = IFACES.lock();
@@ -1580,6 +1614,170 @@ pub(crate) fn release_namespace(net_ns_id: u64) {
     for (_, retirement) in moved {
         retirement.notify();
     }
+}
+
+// ── Per-namespace loopback (`loopback_net_init`) ────────────────────────
+//
+// `setup_net` runs every pernet init for a new namespace, and
+// `loopback_net_init` (drivers/net/loopback.c) registers that namespace's own
+// `lo` at LOOPBACK_IFINDEX. `gen_lo_setup` gives it `IFF_LOOPBACK` and the
+// 64 KiB MTU; `register_netdevice` leaves it down and without an address.
+//
+// The initial namespace's `lo` is the IFACES entry `register_loopback_iface`
+// installs. IFACES is keyed by name across every namespace, so each other
+// namespace's `lo` lives here, keyed by its namespace, and the
+// namespace-scoped lookups ([`lookup_in`], [`by_index_in`]) answer from it.
+
+/// `LOOPBACK_IFINDEX`: every namespace's `lo` is ifindex 1.
+pub const LOOPBACK_IFINDEX: u32 = 1;
+
+/// One non-initial namespace's `lo`.
+#[derive(Debug)]
+struct NamespaceLoopbackEntry {
+    entry: NetIfaceEntry,
+    /// `in_dev->ifa_list` in insertion order; `entry.ipv4` is its head.
+    ipv4: Vec<([u8; 4], u8)>,
+}
+
+static NAMESPACE_LOOPBACKS: IrqSafeSpinLock<
+    alloc::collections::BTreeMap<u64, NamespaceLoopbackEntry>,
+> = IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// A non-initial namespace's `lo` as its control plane reports it.
+#[derive(Clone, Debug)]
+pub struct NamespaceLoopback {
+    /// `IFF_UP`.
+    pub up: bool,
+    /// The IPv4 addresses, `(address, prefix length)`, in list order.
+    pub ipv4: Vec<([u8; 4], u8)>,
+    pub mtu: u32,
+    pub stats: IfaceCounterSnapshot,
+}
+
+/// `loopback_net_init` for `net_ns_id`: register its own `lo`, down and
+/// without an address. Idempotent; the initial namespace's `lo` is
+/// [`register_loopback_iface`]'s.
+pub(crate) fn create_namespace_loopback(net_ns_id: u64) {
+    if net_ns_id == 0 {
+        return;
+    }
+    NAMESPACE_LOOPBACKS
+        .lock()
+        .entry(net_ns_id)
+        .or_insert_with(|| NamespaceLoopbackEntry {
+            entry: namespace_loopback_entry(net_ns_id),
+            ipv4: Vec::new(),
+        });
+}
+
+/// `net_ns_id`'s own `lo`, or `None` for the initial namespace (whose `lo`
+/// is an ordinary registered device) and for an id no namespace was created
+/// with.
+pub fn namespace_loopback(net_ns_id: u64) -> Option<NamespaceLoopback> {
+    let g = NAMESPACE_LOOPBACKS.lock();
+    let lo = g.get(&net_ns_id)?;
+    Some(NamespaceLoopback {
+        up: lo.entry.link_up,
+        ipv4: lo.ipv4.clone(),
+        mtu: lo.entry.mtu,
+        stats: lo.entry.stats.clone(),
+    })
+}
+
+fn namespace_loopback_snapshot(net_ns_id: u64) -> Option<NetIfaceSnapshot> {
+    NAMESPACE_LOOPBACKS
+        .lock()
+        .get(&net_ns_id)
+        .map(|lo| snapshot(&lo.entry))
+}
+
+/// The registry entry of `net_ns_id`'s `lo` as `register_netdevice` leaves
+/// a freshly set-up loopback device.
+fn namespace_loopback_entry(net_ns_id: u64) -> NetIfaceEntry {
+    NetIfaceEntry {
+        name: String::from("lo"),
+        mac: [0; 6],
+        link_layer: LinkLayer::Ethernet,
+        packet_generation: 0,
+        ownership_epoch: next_ownership_epoch(),
+        registration_epoch: next_ownership_epoch(),
+        native_lifetime: crate::native_emission::ProviderLifetime::new(),
+        monitor_epoch: 0,
+        send: context_send_placeholder,
+        send_context: Some((net_ns_id, namespace_loopback_send)),
+        ipv4: [0; 4],
+        gateway: [0; 4],
+        // `gen_lo_setup(dev, (64 * 1024), ...)`.
+        mtu: 64 * 1024,
+        link_up: false,
+        open_stop: None,
+        control: None,
+        open_stop_target: None,
+        net_ns_id,
+        ifindex: LOOPBACK_IFINDEX,
+        driver: "",
+        driver_version: None,
+        fw_version: None,
+        bus_info: String::new(),
+        promiscuity: 0,
+        allmulti: 0,
+        hw_addrs: Vec::new(),
+        name_assign_type: 2, // NET_NAME_PREDICTABLE
+        addr_assign_type: 0,
+        dev_id: 0,
+        dev_port: 0,
+        link_mode: 0,
+        netdev_group: 0,
+        dormant: false,
+        testing: false,
+        ifalias: String::new(),
+        tx_queue_len: 1000,
+        gro_flush_timeout_ns: 0,
+        napi_defer_hard_irqs: 0,
+        proto_down: false,
+        threaded: false,
+        carrier: true,
+        carrier_changes: 0,
+        carrier_up_count: 0,
+        carrier_down_count: 0,
+        speed_mbps: None,
+        duplex: None,
+        media_available: None,
+        phy_type: None,
+        phy_type_name: None,
+        stats: IfaceCounterSnapshot::empty("lo"),
+        offloads: Default::default(),
+        offload_hardware: Default::default(),
+        feature_wanted: None,
+        gro_supported: false,
+        software_gro: false,
+        send_frame: None,
+        tx_backpressure: None,
+        send_frame_context: None,
+        tx_pools: None,
+        tx_headroom: 0,
+    }
+}
+
+/// `loopback_xmit` for a non-initial namespace's `lo`: the frame is received
+/// on that same device, so it is dispatched in that namespace only.
+fn namespace_loopback_send(net_ns_id: u64, frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+    let dev = namespace_loopback_snapshot(net_ns_id).ok_or(())?;
+    // The IPv6 receive path (`ipv6_stack::rx_frame`) still resolves its
+    // namespace from the device name, which would hand this frame to the
+    // initial namespace's `lo`. Drop it rather than cross the namespace
+    // boundary; the socket layer delivers `::1` traffic in-process.
+    if frame.get(12..14) == Some(&[0x86, 0xDD][..]) {
+        return Err(());
+    }
+    loopback_guarded(|| {
+        let mut buf = frame.to_vec();
+        if let Some(lo) = NAMESPACE_LOOPBACKS.lock().get_mut(&net_ns_id) {
+            lo.entry.stats.rx_packets = lo.entry.stats.rx_packets.saturating_add(1);
+            lo.entry.stats.rx_bytes = lo.entry.stats.rx_bytes.saturating_add(buf.len() as u64);
+        }
+        crate::tcp_stack::rx_handler_native_resolved(&dev, &mut buf, None);
+    })
 }
 
 /// Pick the egress iface for a destination IPv4 address by consulting
@@ -1712,7 +1910,7 @@ impl NetIfaceSnapshot {
         );
         let result = driver.try_xmit(q, frame, meta);
         if result != Err(crate::txq::TxRefusal::Busy) {
-            record_tx_result(&self.name, len, result.is_ok());
+            record_tx_result_dev(self, len, result.is_ok());
         }
         result
     }
@@ -1732,7 +1930,7 @@ impl NetIfaceSnapshot {
         crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
         let result = driver.try_xmit_copy(q, frame, meta, charge);
         if result != Err(crate::txq::TxRefusal::Busy) {
-            record_tx_result(&self.name, frame.len(), result.is_ok());
+            record_tx_result_dev(self, frame.len(), result.is_ok());
         }
         result
     }
@@ -1895,7 +2093,7 @@ impl NetIfaceSnapshot {
                 None => self.driver_send.call(frame.payload(), meta),
             }
         };
-        record_tx_result(&self.name, len, result.is_ok());
+        record_tx_result_dev(self, len, result.is_ok());
         result
     }
     /// `dev->type`: `ARPHRD_LOOPBACK` for `lo`, `ARPHRD_ETHER` otherwise.
@@ -1927,7 +2125,7 @@ impl NetIfaceSnapshot {
         }
         crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
         let result = self.driver_send.call(frame, meta);
-        record_tx_result(&self.name, frame.len(), result.is_ok());
+        record_tx_result_dev(self, frame.len(), result.is_ok());
         result
     }
 
@@ -1946,7 +2144,7 @@ impl NetIfaceSnapshot {
         }
         crate::raw_sock::dev_queue_xmit_nit(self, frame, protocol, origin);
         let result = self.driver_send.call(frame, crate::TxMeta::plain());
-        record_tx_result(&self.name, frame.len(), result.is_ok());
+        record_tx_result_dev(self, frame.len(), result.is_ok());
         result
     }
 
@@ -1957,7 +2155,7 @@ impl NetIfaceSnapshot {
             return Err(());
         }
         let result = self.driver_send.call(frame, crate::TxMeta::plain());
-        record_tx_result(&self.name, frame.len(), result.is_ok());
+        record_tx_result_dev(self, frame.len(), result.is_ok());
         result
     }
 }
@@ -2016,6 +2214,11 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
 /// The interface with `ifindex` in `net_ns_id` (`dev_get_by_index`).
 #[must_use]
 pub fn by_index_in(net_ns_id: u64, ifindex: u32) -> Option<NetIfaceSnapshot> {
+    if net_ns_id != 0 && ifindex == LOOPBACK_IFINDEX {
+        if let Some(lo) = namespace_loopback_snapshot(net_ns_id) {
+            return Some(lo);
+        }
+    }
     let g = IFACES.lock();
     let entry = g
         .as_ref()?

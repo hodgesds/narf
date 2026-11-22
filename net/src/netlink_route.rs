@@ -821,8 +821,45 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     let mut links = Vec::new();
     let mut addrs = Vec::new();
 
-    // Synthetic loopback: ifindex 1, IFF_UP|IFF_LOOPBACK|IFF_RUNNING,
-    // ARPHRD_LOOPBACK, MTU 65536, address 127.0.0.1/8.
+    // A namespace made by `copy_net_ns` has its own `lo`
+    // (`loopback_net_init`): down and without an address until configured.
+    let own_loopback = if net_ns_id == 0 {
+        None
+    } else {
+        crate::iface::namespace_loopback(net_ns_id)
+    };
+    if let Some(lo) = own_loopback {
+        links.push(LinkInfo {
+            ifindex: crate::iface::LOOPBACK_IFINDEX,
+            flags: IFF_LOOPBACK | if lo.up { IFF_UP | IFF_RUNNING } else { 0 },
+            arphrd: ARPHRD_LOOPBACK,
+            name: alloc::string::String::from("lo"),
+            mac: Vec::new(),
+            mtu: lo.mtu,
+            carrier: true,
+            tx_queue_len: 1000,
+            link_mode: 0,
+            netdev_group: 0,
+            stats: Some(lo.stats),
+        });
+        for (addr, prefix_len) in lo.ipv4 {
+            addrs.push(AddrInfo {
+                ifindex: crate::iface::LOOPBACK_IFINDEX,
+                prefix_len,
+                addr,
+                label: alloc::string::String::from("lo"),
+            });
+        }
+    } else {
+        push_initial_loopback(net_ns_id, &mut links, &mut addrs);
+    }
+    enumerate_devices_in(net_ns_id, &mut links, &mut addrs);
+    (links, addrs)
+}
+
+/// The initial namespace's `lo`: ifindex 1, IFF_UP|IFF_LOOPBACK|IFF_RUNNING,
+/// ARPHRD_LOOPBACK, MTU 65536, address 127.0.0.1/8.
+fn push_initial_loopback(net_ns_id: u64, links: &mut Vec<LinkInfo>, addrs: &mut Vec<AddrInfo>) {
     links.push(LinkInfo {
         ifindex: 1,
         flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
@@ -844,14 +881,19 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
         addr: [127, 0, 0, 1],
         label: alloc::string::String::from("lo"),
     });
+}
 
+/// Every device of `net_ns_id` except its `lo`, in registration order.
+fn enumerate_devices_in(net_ns_id: u64, links: &mut Vec<LinkInfo>, addrs: &mut Vec<AddrInfo>) {
     // Legacy L3 interfaces first, each under the ifindex it registered with —
-    // the same number the IPv4 stack, SIOCGIFINDEX and sysfs report.
-    for nic in crate::iface::snapshot_all()
+    // the same number the IPv4 stack, SIOCGIFINDEX and sysfs report. A
+    // device moved into a namespace (`dev_change_net_namespace`) is listed
+    // there and nowhere else.
+    for nic in crate::iface::snapshot_all_in(net_ns_id)
         .into_iter()
-        // `lo` is the synthetic ifindex-1 entry above; its legacy L3
-        // registration must not appear a second time as an Ethernet device.
-        .filter(|nic| nic.net_ns_id == net_ns_id && nic.name != "lo")
+        // `lo` is the ifindex-1 entry above; its legacy L3 registration must
+        // not appear a second time as an Ethernet device.
+        .filter(|nic| nic.name != "lo")
     {
         let ifindex = nic.ifindex;
         links.push(LinkInfo {
@@ -931,8 +973,6 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
             stats: None,
         });
     }
-
-    (links, addrs)
 }
 
 /// Build the reply message stream for a dump request `req`. Returns one

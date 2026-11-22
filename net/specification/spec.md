@@ -570,6 +570,20 @@ A built-in `Loopback` implementation of the contract. Always
 available, backed by a kernel-internal Narf-Ring that loops TX →
 RX. Used by `verification/` to test the contract without hardware.
 
+Every network namespace has its own `lo` (Linux `loopback_net_init`). The
+initial namespace's is the `iface::register_loopback_iface` registration.
+`create_network_namespace(net_ns_id)` is the `setup_net` hook the namespace
+constructor calls, before the namespace is published; it gives the new
+namespace a `lo` at `iface::LOOPBACK_IFINDEX` (1) that is down, has
+`IFF_LOOPBACK` only and no address, with a 64 KiB MTU.
+`release_network_namespace` removes it. `iface::lookup_in(ns, "lo")` and
+`iface::by_index_in(ns, 1)` resolve to it, and so do the device ioctls and
+rtnetlink in that namespace. `iface::namespace_loopback(ns) ->
+Option<NamespaceLoopback>` reports its `up` state, IPv4 addresses, MTU and
+counters; it returns `None` for the initial namespace. A frame sent on it is
+received on it, in that namespace only. Kernel IPv6 frames are dropped there
+until the IPv6 receive path takes its device rather than a name.
+
 ### 3.5 Stack-daemon attach (Stage 4)
 
 - A userspace daemon presents a `Cap<Stack, Install>` token (minted
