@@ -88,8 +88,11 @@ fn validate(profile: GuCProfile, bytes: &[u8]) -> Result<CssImage<'_>, FirmwareE
     let image = CssImage::parse(bytes, 70).map_err(FirmwareError::Image)?;
     // Pin each platform's baseline (MIT xe_uc_fw.c). A matching
     // major alone must not accept older firmware with missing actions/ABIs.
-    if image.version < profile.minimum_version || image.signature.len() != 384 {
+    if image.version < profile.minimum_version {
         return Err(FirmwareError::Image(GuCError::FirmwareVersion));
+    }
+    if profile.rsa_transfer(image.signature.len()).is_none() {
+        return Err(FirmwareError::Image(GuCError::FirmwareLayout));
     }
     Ok(image)
 }

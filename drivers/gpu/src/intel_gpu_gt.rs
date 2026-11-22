@@ -211,6 +211,24 @@ pub struct GuCProfile {
     pub minimum_version: (u8, u8, u8),
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GuCRsaTransfer {
+    ScratchRegisters,
+    GgttPointer,
+}
+
+impl GuCProfile {
+    pub(crate) fn rsa_transfer(self, bytes: usize) -> Option<GuCRsaTransfer> {
+        match (bytes, self.platform) {
+            (256, GtPlatform::Gen11(_) | GtPlatform::Gen12(_)) => {
+                Some(GuCRsaTransfer::ScratchRegisters)
+            }
+            (384, _) => Some(GuCRsaTransfer::GgttPointer),
+            _ => None,
+        }
+    }
+}
+
 impl GtPlatform {
     pub fn from_pci(vendor: u16, device: u16) -> Option<Self> {
         if vendor != 0x8086 {
