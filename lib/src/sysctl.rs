@@ -49,12 +49,22 @@ pub mod ipv4 {
     /// `net.ipv4.conf.default.send_redirects`.
     pub static SEND_REDIRECTS_DEFAULT: AtomicU32 = AtomicU32::new(1);
 
+    /// `net.ipv4.conf.all.rp_filter`: reverse-path filtering, 0 off, 1
+    /// strict, 2 loose (RFC 3704). The device's mode is the larger of this
+    /// and its own value (`IN_DEV_RPFILTER` is `IN_DEV_MAXCONF`). Linux
+    /// default 0; systemd's `50-default.conf` writes 2.
+    pub static RP_FILTER_ALL: AtomicU32 = AtomicU32::new(0);
+
+    /// `net.ipv4.conf.default.rp_filter`, seeding new devices.
+    pub static RP_FILTER_DEFAULT: AtomicU32 = AtomicU32::new(0);
+
     /// One interface's `net.ipv4.conf.<dev>.*` values.
     #[derive(Clone, Debug)]
     struct DevConf {
         name: String,
         forwarding: u32,
         send_redirects: u32,
+        rp_filter: u32,
     }
 
     /// Per-interface conf, for interfaces that have been seeded. Absent means
@@ -187,6 +197,7 @@ pub mod ipv4 {
                     name: String::from(iface),
                     forwarding: v,
                     send_redirects: dflt,
+                    rp_filter: RP_FILTER_DEFAULT.load(Ordering::Relaxed),
                 });
             }
         }
@@ -226,6 +237,7 @@ pub mod ipv4 {
                     name: String::from(iface),
                     forwarding: dflt,
                     send_redirects: v,
+                    rp_filter: RP_FILTER_DEFAULT.load(Ordering::Relaxed),
                 });
             }
         }
@@ -266,7 +278,31 @@ pub mod ipv4 {
             name: String::from(iface),
             forwarding: IP_FORWARD_DEFAULT.load(Ordering::Relaxed),
             send_redirects: SEND_REDIRECTS_DEFAULT.load(Ordering::Relaxed),
+            rp_filter: RP_FILTER_DEFAULT.load(Ordering::Relaxed),
         });
+    }
+
+    /// The raw per-interface `rp_filter` value — what procfs prints.
+    pub fn device_rp_filter_value(iface: &str) -> u32 {
+        let g = DEV_CONF.lock();
+        match g.iter().find(|d| d.name == iface) {
+            Some(d) => d.rp_filter,
+            None => RP_FILTER_DEFAULT.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Set one interface's `conf.<dev>.rp_filter`.
+    pub fn set_device_rp_filter(iface: &str, v: u32) {
+        let mut g = DEV_CONF.lock();
+        match g.iter_mut().find(|d| d.name == iface) {
+            Some(d) => d.rp_filter = v,
+            None => g.push(DevConf {
+                name: String::from(iface),
+                forwarding: IP_FORWARD_DEFAULT.load(Ordering::Relaxed),
+                send_redirects: SEND_REDIRECTS_DEFAULT.load(Ordering::Relaxed),
+                rp_filter: v,
+            }),
+        }
     }
 
     /// Drop an interface's settings when it goes away.
@@ -301,6 +337,8 @@ pub mod ipv4 {
         TCP_LIMIT_OUTPUT_BYTES.store(4 << 20, Ordering::Relaxed);
         SEND_REDIRECTS_ALL.store(1, Ordering::Relaxed);
         SEND_REDIRECTS_DEFAULT.store(1, Ordering::Relaxed);
+        RP_FILTER_ALL.store(0, Ordering::Relaxed);
+        RP_FILTER_DEFAULT.store(0, Ordering::Relaxed);
         DEV_CONF.lock().clear();
         ICMP_ECHO_IGNORE_ALL.store(0, Ordering::Relaxed);
         ICMP_ECHO_IGNORE_BROADCASTS.store(1, Ordering::Relaxed);

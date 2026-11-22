@@ -3478,3 +3478,95 @@ fn smoke_somaxconn_clamps_listen_backlog() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/e2e", smoke_somaxconn_clamps_listen_backlog);
+
+/// Reverse-path filtering as `fib_validate_source` applies it: the device's
+/// mode is the larger of `conf.all.rp_filter` and its own; strict (1) drops
+/// a packet whose best route back to its source leaves through another
+/// device, loose (2) accepts it while any route back exists, 0 accepts.
+/// This host runs all=1 with every device at 2, which is loose.
+fn smoke_rp_filter_strict_and_loose_follow_linux() -> TestResult {
+    use narf_lib::sysctl::ipv4::{set_device_rp_filter, RP_FILTER_ALL};
+    const A: &str = "e2e-rpf-a";
+    const B: &str = "e2e-rpf-b";
+    const A_IP: [u8; 4] = [10, 34, 3, 165];
+    const A_GW: [u8; 4] = [10, 34, 3, 1];
+    const B_IP: [u8; 4] = [10, 34, 1, 211];
+    const B_GW: [u8; 4] = [10, 34, 1, 254];
+    const B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x34, 0x0b];
+    // Routed back through A's default route (metric 100).
+    const REMOTE: [u8; 4] = [1, 1, 1, 1];
+    // On B's connected /22.
+    const NEIGHBOUR: [u8; 4] = [10, 34, 1, 50];
+    fn sink(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    fn default_via(iface: &str, gateway: [u8; 4], metric: u32) {
+        route::route_add(route::Route {
+            net_ns_id: 0,
+            dst: route::Ipv4Net {
+                addr: Ipv4Addr([0; 4]),
+                prefix_len: 0,
+            },
+            gateway: Some(Ipv4Addr(gateway)),
+            iface: alloc::string::String::from(iface),
+            src_hint: None,
+            metric,
+            scope: route::Scope::Universe,
+            table: route::TABLE_MAIN,
+            protocol: route::RTPROT_KERNEL,
+        });
+    }
+    // One datagram from `src` to B's address, arriving on B.
+    fn delivered(src: [u8; 4], port: u16) -> bool {
+        let Ok(sock) = udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default())
+        else {
+            return false;
+        };
+        let mut frame = build_udp_frame(src, B_IP, 40000, port, b"rp-filter");
+        frame[..6].copy_from_slice(&B_MAC);
+        crate::tcp_stack::rx_handler(B, &mut frame);
+        let mut buf = [0u8; 64];
+        let got = udp_recv(&sock, &mut buf).is_ok();
+        udp_close(&sock);
+        got
+    }
+
+    full_reset(A, A_IP, A_GW);
+    iface::register(B, B_MAC, sink);
+    iface::set_link_state(B, true);
+    iface::set_iface_ipv4_fields(B, B_IP, B_GW);
+    iface::add_addr(B, B_IP, 22);
+    default_via(A, A_GW, 100);
+    default_via(B, B_GW, 600);
+    let mut port = 17801;
+    let mut case = |all: u32, dev: u32, src: [u8; 4]| {
+        RP_FILTER_ALL.store(all, Ordering::Relaxed);
+        set_device_rp_filter(B, dev);
+        port += 1;
+        delivered(src, port)
+    };
+    let off = case(0, 0, REMOTE);
+    let strict_all = case(1, 0, REMOTE);
+    let this_host = case(1, 2, REMOTE);
+    let strict_dev = case(0, 1, REMOTE);
+    let strict_on_link = case(1, 0, NEIGHBOUR);
+    RP_FILTER_ALL.store(0, Ordering::Relaxed);
+    set_device_rp_filter(B, 0);
+    if !off {
+        return TestResult::Fail("rp_filter=0 dropped a datagram");
+    }
+    if strict_all || strict_dev {
+        return TestResult::Fail("strict rp_filter accepted a source routed via another device");
+    }
+    if !this_host {
+        return TestResult::Fail("all=1 with the device at 2 did not filter loosely");
+    }
+    if !strict_on_link {
+        return TestResult::Fail("strict rp_filter dropped a source routed via the device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/rp-filter",
+    smoke_rp_filter_strict_and_loose_follow_linux
+);
