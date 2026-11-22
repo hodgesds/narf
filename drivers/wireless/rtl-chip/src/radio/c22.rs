@@ -376,3 +376,287 @@ pub async fn verify_width40(
     }
     Ok(())
 }
+
+// ── gain / trim / calibration programming ──────────────────────────────────
+
+/// `rtw8822c_rf_x2_check` + `rtw8822c_rf_dack`-adjacent X2 PLL confirm.
+pub async fn x2(io: &mut impl Io) -> Result<(), Error> {
+    io.delay_us(1000).await;
+    if rf_read(io, 0, 0xb8).await? & (1 << 15) != 0 {
+        for (reg, value) in [(0xb8, 0xc4440), (0xba, 0x6840d), (0xb8, 0x80440)] {
+            rf(io, 0, reg, 0xfffff, value).await?;
+        }
+        io.delay_us(1000).await;
+        if rf_read(io, 0, 0xb8).await? & (1 << 15) != 0 {
+            return Err(Error::Prerequisite);
+        }
+    }
+    Ok(())
+}
+/// RF trim programming from the 19-byte factory `trims()` record (power-detect
+/// swing, LNA gain, 2G/5G PA bias). Erased cells (0xff) are preserved, never
+/// substituted.
+pub async fn trims(io: &mut impl Io, t: &[u8; 19]) -> Result<(), Error> {
+    // Preserve Linux's erased-cell semantics without substituting calibration
+    // values. The signed board identity includes all original erased bytes.
+    for (path, raw) in t[..2].iter().copied().enumerate() {
+        if raw == 255 {
+            break;
+        }
+        rf(
+            io,
+            path as u8,
+            0x43,
+            0xf0000,
+            u32::from((raw >> 1) & 7 | (raw & 1) << 3),
+        )
+        .await?;
+    }
+    let mut gain = [[0u32; 8]; 2];
+    let mut any = false;
+    for (index, raw) in t[2..5].iter().copied().enumerate() {
+        if raw != 255 {
+            any = true;
+            gain[0][index] = u32::from(raw & 15);
+            gain[1][index] = u32::from(raw >> 4);
+        }
+    }
+    for path in 0..2 {
+        for index in 0..5 {
+            let raw = t[5 + path * 5 + index];
+            if raw != 255 {
+                any = true;
+                gain[path][index + 3] = u32::from(raw & 31);
+            }
+        }
+    }
+    if any {
+        let indices = [0, 1, 2, 2, 3, 4, 5, 6, 7, 3, 4, 5, 6, 7, 7];
+        for path in 0..2 {
+            rf(io, path, 0xee, 1 << 19, 1).await?;
+            for (sequence, index) in indices.iter().copied().enumerate() {
+                rf(io, path, 0x33, 0xfffff, sequence as u32).await?;
+                rf(io, path, 0x3f, 0xfffff, gain[usize::from(path)][index]).await?;
+            }
+            rf(io, path, 0xee, 1 << 19, 0).await?;
+        }
+    }
+    mask(io, 0xa70, 0x3ff, 0x3ff).await?;
+    for (path, raw) in t[15..17].iter().copied().enumerate() {
+        if raw == 255 {
+            return Ok(());
+        }
+        rf(io, path as u8, 0x60, 0xf000, u32::from(raw & 15)).await?;
+    }
+    for (path, raw) in t[17..19].iter().copied().enumerate() {
+        // Linux does not skip erased5G PA bytes in this final loop.
+        rf(io, path as u8, 0x60, 0xf0000, u32::from(raw & 15)).await?;
+    }
+    Ok(())
+}
+/// `rtw8822c_set_write_tx_power_ref` for the retained CCK1 2.4GHz profile.
+pub async fn gains(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
+    for (path, gain) in gains.into_iter().enumerate() {
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        mask(
+            io,
+            if path == 0 { 0x18a0 } else { 0x41a0 },
+            0x7f0000,
+            u32::from(gain),
+        )
+        .await?;
+    }
+    for path in 0..2 {
+        // No OFDM/HT/VHT descriptor is admitted by this profile. Zero their
+        // reference, and use zero relative difference for the four CCK slots.
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        mask(io, if path == 0 { 0x18e8 } else { 0x41e8 }, 0x1fc00, 0).await?;
+    }
+    for reg in [0x3a00, 0x3a04, 0x3a08] {
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        io.write32(reg, 0).await?;
+    }
+    // Original phy_get_rrsr_mask(DESC_RATE1M) &RRSR_INIT_2G. This admits
+    // mandatory CCK/OFDM control responses; their full RF envelope is measured
+    // separately in N22Cv2. Host RX rejection cannot suppress hardware ACKs.
+    io.write32(0x440, 0x1f).await
+}
+/// `RRSR_INIT_5G` (0x150) masked to the OFDM6 response order.
+pub const RRSR_OFDM6_5G: u32 = 0x150 & 0x1f;
+/// 5GHz counterpart of [`gains`] for one N2xO record
+/// (`rtw8822c_set_write_tx_power_ref` + `rtw8822c_set_tx_power_diff`).
+pub async fn ofdm5(io: &mut impl Io, ofdm: [u8; 2], diffs: [u32; 2]) -> Result<(), Error> {
+    for path in 0..2 {
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        mask(io, if path == 0 { 0x18a0 } else { 0x41a0 }, 0x7f0000, 0).await?;
+    }
+    for (path, reference) in ofdm.into_iter().enumerate() {
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        mask(
+            io,
+            if path == 0 { 0x18e8 } else { 0x41e8 },
+            0x1fc00,
+            u32::from(reference),
+        )
+        .await?;
+    }
+    for (reg, value) in [(0x3a00, 0), (0x3a04, diffs[0]), (0x3a08, diffs[1])] {
+        mask(io, 0x1c90, 1 << 15, 0).await?;
+        io.write32(reg, value).await?;
+    }
+    io.write32(0x440, RRSR_OFDM6_5G).await
+}
+/// Readback of [`ofdm5`].
+pub async fn verify_ofdm5(io: &mut impl Io, ofdm: [u8; 2], diffs: [u32; 2]) -> Result<(), Error> {
+    for (path, reference) in ofdm.into_iter().enumerate() {
+        let (cck, ofdm) = if path == 0 {
+            (0x18a0, 0x18e8)
+        } else {
+            (0x41a0, 0x41e8)
+        };
+        if read(io, cck).await? & 0x7f0000 != 0
+            || read(io, ofdm).await? & 0x1fc00 != u32::from(reference) << 10
+        {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(io, 0x3a00).await? != 0
+        || read(io, 0x3a04).await? != diffs[0]
+        || read(io, 0x3a08).await? != diffs[1]
+        || read(io, 0x440).await? != RRSR_OFDM6_5G
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// `rtw8822c_rfk_power_save`: gate the RF path RFK power.
+pub async fn rfk_power(io: &mut impl Io, active: bool) -> Result<(), Error> {
+    for path in 0..2 {
+        mask(io, 0x1b00, 6, path).await?;
+        mask(io, 0x1b08, 1 << 7, u32::from(active)).await?;
+    }
+    Ok(())
+}
+/// Invalidate all 32 CAM slots and demand host-only crypto / native MPDU RX.
+pub async fn software_crypto(io: &mut impl Io) -> Result<(), Error> {
+    // Invalidate each original32-entry CAM slot, then demand the actual
+    // command engine finish. No cached valid/default key can decrypt RX.
+    for index in 0..32 {
+        let mut done = false;
+        for _ in 0..1000 {
+            if read(io, 0x670).await? & (1 << 31) == 0 {
+                done = true;
+                break;
+            }
+            io.delay_us(10).await;
+        }
+        if !done {
+            return Err(Error::Timeout);
+        }
+        io.write32(0x674, 0).await?;
+        io.write32(0x670, 1 << 31 | 1 << 16 | index << 3).await?;
+    }
+    let mut done = false;
+    for _ in 0..1000 {
+        if read(io, 0x670).await? & (1 << 31) == 0 {
+            done = true;
+            break;
+        }
+        io.delay_us(10).await;
+    }
+    if !done {
+        return Err(Error::Timeout);
+    }
+    let cr = io.read16(0x100).await?;
+    if cr == u16::MAX {
+        return Err(Error::Gone);
+    }
+    io.write16(0x100, cr & !(1 << 9)).await?;
+    let security = io.read16(0x680).await?;
+    if security == u16::MAX {
+        return Err(Error::Gone);
+    }
+    io.write16(0x680, security & !0xcf).await?;
+    // Native MPDU with PHY status+FCS; no TCP offload/header conversion,
+    // ICV/MIC stripping or BSSID filtering before host association admission.
+    let rcr = read(io, 0x608).await?;
+    let clear = (1 << 30)
+        | (1 << 29)
+        | (1 << 25)
+        | (1 << 24)
+        | (1 << 18)
+        | (1 << 15)
+        | (1 << 12)
+        | (1 << 9)
+        | (1 << 8)
+        | (1 << 7)
+        | (1 << 6);
+    io.write32(0x608, (rcr & !clear) | 1 << 31 | 1 << 28 | 1 << 10 | 15)
+        .await?;
+    if io.read16(0x680).await? & 0xcf != 0 || io.read16(0x100).await? & (1 << 9) != 0 {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
+/// `ps.c::rtw_power_mode_change` active: wake firmware through RPWM/CPWM.
+pub async fn awake(io: &mut impl Io) -> Result<(), Error> {
+    let request = io.read8(0x3d9).await?;
+    let confirm = io.read8(0x3da).await?;
+    if request == 255 || confirm == 255 {
+        return Err(Error::Gone);
+    }
+    io.write8(0x3d9, (!request & 0x80) | 0x40).await?;
+    for _ in 0..150 {
+        io.delay_us(100).await;
+        let value = io.read8(0x3da).await?;
+        if value == 255 {
+            return Err(Error::Gone);
+        }
+        if (value ^ confirm) & 0x80 != 0 {
+            return Ok(());
+        }
+    }
+    Err(Error::Timeout)
+}
+/// `rtw_phy_init` EDCCA/IGI receive policy at maximum coverage.
+pub async fn receive_policy(io: &mut impl Io) -> Result<(), Error> {
+    // Source phy_init starts EDCCA at a disabled sentinel and its watchdog
+    // later programs a real threshold. Keep the source maximum-coverage IGI
+    // and the stricter adaptive40/33 threshold at that IGI; no disabled
+    // sentinel or missing watchdog may leave unbounded energy detection.
+    mask(io, 0x1d70, 0x7f, 0x1c).await?;
+    mask(io, 0x1d70, 0x7f00, 0x1c).await?;
+    mask(io, 0x84c, 0x00ff0000, 40 + 0x80).await?;
+    mask(io, 0x84c, 0xff000000, 33 + 0x80).await?;
+    mask(io, 0x520, 1 << 15, 0).await?;
+    mask(io, 0x524, 1 << 11, 1).await?;
+    mask(io, 0x844, 3 << 29, 0).await?;
+    Ok(())
+}
+/// Readback of the retained CCK1 gains/RRSR/IGI and the closed security gates.
+pub async fn verify(io: &mut impl Io, gains: [u8; 2]) -> Result<(), Error> {
+    for (path, gain) in gains.into_iter().enumerate() {
+        if (read(io, if path == 0 { 0x18a0 } else { 0x41a0 }).await? >> 16) & 127 != u32::from(gain)
+            || read(io, if path == 0 { 0x18e8 } else { 0x41e8 }).await? & 0x1fc00 != 0
+            || rf_read(io, path as u8, 0x18).await? & 0x733ff != 0x3001
+        {
+            return Err(Error::Prerequisite);
+        }
+    }
+    for reg in [0x3a00, 0x3a04, 0x3a08] {
+        if read(io, reg).await? & 0x7f7f7f7f != 0 {
+            return Err(Error::Prerequisite);
+        }
+    }
+    if read(io, 0x440).await? != 0x1f
+        || read(io, 0x1a04).await? & 0xff000000 != 0x81000000
+        || read(io, 0x820).await? & 255 != 0x11
+        || read(io, 0x1d70).await? & 0x7f7f != 0x1c1c
+        || read(io, 0x84c).await? & 0xffff0000 != (168 << 16 | 161 << 24)
+        || io.read16(0x680).await? & 0xcf != 0
+        || io.read16(0x100).await? & (1 << 9) != 0
+    {
+        return Err(Error::Prerequisite);
+    }
+    Ok(())
+}
