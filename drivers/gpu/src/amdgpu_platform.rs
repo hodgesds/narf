@@ -1201,6 +1201,19 @@ async fn prepare_graphics_idle() {
 /// does the rest (`GraphicsPm::S0ix`).
 async fn prepare_graphics_s0ix() {
     use core::fmt::Write as _;
+    {
+        // amdgpu_device_prepare: a scheduled GFXOFF allow is delivered now,
+        // so GFX is off before the park instead of 100 ms into it.
+        let mut owner = graphics_owner().await;
+        if let Some(boot) = owner.get() {
+            if let Err(error) = boot.flush_gfx_off().await {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael GFXOFF flush {error:?}"
+                );
+            }
+        }
+    }
     drain_rings().await;
     let mut guard = DISPLAY.lock().await;
     let Some(display) = guard.as_mut() else {
@@ -1380,6 +1393,13 @@ async fn resume_graphics() {
             unsafe { graphics.media_after_s0ix() };
             alloc::boxed::Box::pin(media_boot(graphics, loader)).await;
             crate::amdgpu_navi22_cs::register_raphael(graphics);
+            if let Err(error) = graphics.gate_after_s0ix().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael s0ix gating {error:?}"
+                );
+            }
         }
         return;
     }
@@ -1979,7 +1999,7 @@ pub(crate) fn resume() -> bool {
     let s0ix = *graphics_pm == GraphicsPm::S0ix;
     if s0ix {
         // amdgpu_device_ip_resume_phase1 with in_s0ix: COMMON, GMC, IH in
-        // place. The loader kept the PSP and DMCUB, so it is not booted.
+        // place. The PSP kept its TMR, so the loader is not booted.
         if let Some(graphics) = graphics.as_mut() {
             // SAFETY: `suspend_s0ix` ran and nothing touched the GPU since.
             let result = narf_scheduler::block_on_spin(alloc::boxed::Box::pin(unsafe {
@@ -1991,6 +2011,16 @@ pub(crate) fn resume() -> bool {
                     "amdgpu: raphael s0ix resume {error:?}"
                 );
             }
+        }
+        // dm_resume's dm_dmub_hw_resume: DMCUB checked, and booted again from
+        // the TMR only if S0i3 lost it; then its notifications.
+        if narf_scheduler::block_on_spin(async {
+            loader.resume_dmub(Default::default()).await?;
+            loader.enable_notifications().await
+        })
+        .is_err()
+        {
+            return false;
         }
     } else if narf_scheduler::block_on_spin(async {
         loader.boot(Default::default()).await?;

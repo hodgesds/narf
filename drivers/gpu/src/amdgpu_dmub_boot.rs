@@ -300,6 +300,12 @@ impl<I: Io> Engine<I> {
         let fb_offset = self.fb_offset;
         let secure = self.secure;
         self.access(|io| configure(io, layout, placement, fb_base, fb_offset, options, secure))??;
+        self.wait_for_auto_load().await
+    }
+    /// `dmub_srv_wait_for_auto_load`: the DAL firmware and its mailbox ready
+    /// (SCRATCH0's `dal_fw` and `mailbox_rdy`) on a running, unreset DMCUB,
+    /// within 100 ms (`dm_dmub_hw_resume`'s 100000 us).
+    async fn wait_for_auto_load(&mut self) -> Result<(), Error> {
         let deadline = narf_time::Deadline::after_ms(100);
         loop {
             if self.access(|io| {
@@ -316,6 +322,14 @@ impl<I: Io> Engine<I> {
             }
             tick().await;
         }
+    }
+    /// `dmub_dcn31_is_hw_init`: DMCUB enabled with the DAL firmware's boot
+    /// bit (`dal_fw`, SCRATCH0 bit 0) set.
+    fn is_hw_init(&mut self) -> Result<bool, Error> {
+        self.access(|io| {
+            let status = io.read(STATUS);
+            status != u32::MAX && status & 1 != 0 && io.read(CNTL) & ENABLE != 0
+        })
     }
     async fn stop(&mut self) -> Result<(), Error> {
         if matches!(self.state, State::Prepared | State::Stopped) {
@@ -754,6 +768,27 @@ impl Loader {
             self.engine.state = State::Stopped;
         }
         self.engine.boot(options).await?;
+        self.attach_transport()
+    }
+    /// `dm_dmub_hw_resume` for an s0ix resume. The PSP kept the TMR, so DMCUB
+    /// alone is checked. Still initialized, it is given its auto-load wait.
+    /// Otherwise it is booted again from the TMR, as `dm_dmub_hw_init`
+    /// boots it: the data windows re-staged from system memory, no PSP load.
+    /// Its transport is then attached again.
+    pub async fn resume_dmub(&mut self, options: BootOptions) -> Result<(), Error> {
+        if self.engine.state != State::Running {
+            return Err(Error::Busy);
+        }
+        if self.engine.is_hw_init()? {
+            return self.engine.wait_for_auto_load().await;
+        }
+        self.transport = None;
+        // The hardware lost DMCUB; its owner state follows.
+        self.engine.state = State::Stopped;
+        self.engine.boot(options).await?;
+        self.attach_transport()
+    }
+    fn attach_transport(&mut self) -> Result<(), Error> {
         let io = &self.engine.io;
         let transport = self
             .engine

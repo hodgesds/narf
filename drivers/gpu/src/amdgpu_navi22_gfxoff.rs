@@ -173,6 +173,16 @@ impl Controller {
         self.status.allows += 1;
         Ok(true)
     }
+    /// `flush_delayed_work(&gfx_off_delay_work)` (`amdgpu_device_prepare`):
+    /// a scheduled allow delivered now rather than after its delay. The
+    /// scheduled one then finds nothing pending. `Ok(false)`: none pending.
+    pub(crate) async fn flush_delayed(&mut self, pmfw: &mut impl Control) -> Result<bool, Error> {
+        if !self.status.pending {
+            return Ok(false);
+        }
+        let generation = self.generation;
+        self.delayed_allow(generation, pmfw).await
+    }
     /// `set_powergating_state(UNGATE)` and turn the controller off: GFX is
     /// left powered (disallowed) and every reference becomes inert.
     pub(crate) async fn stop(&mut self, pmfw: &mut impl Control) -> Result<(), Error> {

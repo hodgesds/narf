@@ -126,3 +126,28 @@ fn raphael_gfxoff_without_gfx_pg() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/raphael-gfxoff", raphael_gfxoff_without_gfx_pg);
+
+/// `amdgpu_device_prepare`'s `flush_delayed_work`: a GATE's scheduled allow
+/// is delivered at once, the scheduled one then lands on nothing, and with
+/// nothing pending the flush sends nothing.
+fn raphael_gfxoff_flush_delivers_the_pending_allow() -> TestResult {
+    let (mut hw, mut g) = (Fake::default(), GfxOff::new(true, true));
+    let Ok(Some(scheduled)) = run(g.gate(&mut hw)) else {
+        return TestResult::Fail("GATE scheduled no allow");
+    };
+    hw.events.clear();
+    if run(g.flush(&mut hw)) != Ok(true) || hw.events != ["allow"] || !g.status().off {
+        return TestResult::Fail("the flush did not allow GFXOFF now");
+    }
+    if run(g.delayed(scheduled, &mut hw)) != Ok(false)
+        || run(g.flush(&mut hw)) != Ok(false)
+        || hw.events.len() != 1
+    {
+        return TestResult::Fail("a second allow reached PMFW");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/raphael-gfxoff",
+    raphael_gfxoff_flush_delivers_the_pending_allow
+);

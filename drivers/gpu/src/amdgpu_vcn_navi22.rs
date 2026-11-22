@@ -2751,7 +2751,13 @@ pub fn route_interrupts(
 ) -> Result<(), crate::amdgpu_ih_navi22::Error> {
     let mut subscriptions = alloc::vec::Vec::new();
     for from in interrupt_sources(status) {
-        subscriptions.push(ih.subscribe(from)?);
+        match ih.subscribe(from) {
+            Ok(subscription) => subscriptions.push(subscription),
+            // Routed by an earlier start on this same IH: an s0ix resume keeps
+            // the hub and its subscriptions, and that forwarder still delivers.
+            Err(crate::amdgpu_ih_navi22::Error::Busy) => {}
+            Err(error) => return Err(error),
+        }
     }
     for mut subscription in subscriptions {
         narf_scheduler::spawn(async move {

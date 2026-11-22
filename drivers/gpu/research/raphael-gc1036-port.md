@@ -749,15 +749,23 @@ since the submitter is replaced. Raphael's port:
     - **Async resume.** Media restarts with its saved sessions, and
       `register_raphael` serves the clients again on the kept VMIDs.
 
-    Not done (Linux steps without a NARF counterpart yet):
-    - DC's and DMUB's power states (`dc_set_power_state` D3/D0,
-      `dc_dmub_srv_set_power_state`), and `dm_resume`'s `dm_dmub_hw_resume`.
-    - The PG/CG ungate before the suspend and the late-init gate after it,
-      for the blocks that are not GFX or SDMA (IH CG; MMHUB CG, which
-      Linux keeps on DF newer than 3.0.2).
-    - `amdgpu_gfx_off_ctrl`'s immediate allow, and cancelling GFX's
-      delayed idle work.
-    - `amdgpu_fence_driver_hw_fini`'s fence-interrupt handling.
+    The rest of Linux's cycle, mapped:
+    - `amdgpu_device_prepare`'s `flush_delayed_work`: a scheduled GFXOFF
+      allow is delivered at the prepare (`ColdBoot::flush_gfx_off`). GFX's
+      `idle_work` is the power-profile switch, which NARF does not have.
+    - The non-GFX clock gating: `suspend_s0ix` ungates Common and IH, and
+      GMC on DF 3.0.2 or older; the async resume gates them again
+      (`gate_after_s0ix`). Their power gating is a no-op on Raphael.
+    - `dm_suspend`/`dm_resume`: `dc_set_power_state(D3)` acts only with
+      IPS (DCN 3.5+), and `z10_restore` does not apply (DCN 3.1.5 sets
+      `disable_z10`). `dm_dmub_hw_resume` is `Loader::resume_dmub`: wait
+      for DMCUB's auto-load, or boot it again from the TMR if S0i3 lost
+      it. D0's `init_hw` is the stream replay's pipeline start.
+    - `amdgpu_fence_driver_hw_fini`: the GFX power domain's interrupts are
+      kept. VCN's and JPEG's are put and got again, but their
+      `set_interrupt_state` is a no-op. The resumed media start finds its
+      IH routes still subscribed and keeps them (`route_interrupts` skips
+      a source already routed on the same IH).
 
     None of this has run on hardware. Raphael desktop boards rarely set
     `LOW_POWER_S0`; the laptops on the same die do.
