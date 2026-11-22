@@ -36,11 +36,11 @@ pub type PmFn = fn() -> Result<(), DeviceSuspendError>;
 /// PCI config, MMIO snapshot, controller-specific shadow regs)
 /// implement this and register via [`register_device_pm_ops`].
 ///
-/// The trait mirrors Linux's `struct dev_pm_ops` (`.suspend` and
-/// `.resume` callbacks; see `drivers/base/power/main.c::dpm_suspend_start`),
-/// minus the freeze/poweroff/restore quartet — NARF only supports
-/// the S3 "suspend → resume" pair today. When hibernate (S4) lands
-/// we extend this with `freeze` / `thaw` / `poweroff` / `restore`.
+/// The trait mirrors Linux's `struct dev_pm_ops`: `.suspend` and `.resume`
+/// for S3 and s2idle (`drivers/base/power/main.c::dpm_suspend_start`), and
+/// hibernation's `.freeze`, `.thaw`, `.poweroff` and `.restore`. Those four
+/// default as `SET_SYSTEM_SLEEP_PM_OPS` sets them: freeze and poweroff are
+/// the suspend, thaw and restore the resume.
 ///
 /// Object-safe: `Arc<dyn DevicePmOps>` is what the registry holds.
 /// Handlers run on the boot CPU with interrupts gated — they MUST
@@ -53,6 +53,50 @@ pub trait DevicePmOps: Send + Sync {
     /// Re-arm the device. Called in forward-registration order
     /// from the wake continuation.
     fn resume(&self) -> Result<(), DevicePmError>;
+    /// `PMSG_FREEZE`: quiesce before the hibernation snapshot. Reverse order.
+    fn freeze(&self) -> Result<(), DevicePmError> {
+        self.suspend()
+    }
+    /// `PMSG_THAW`: after the snapshot, so the image can be written, or
+    /// after a failed one ([`hibernate_is_recovering`]). Forward order.
+    fn thaw(&self) -> Result<(), DevicePmError> {
+        self.resume()
+    }
+    /// `PMSG_HIBERNATE`: before the platform's S4 entry. Reverse order.
+    fn poweroff(&self) -> Result<(), DevicePmError> {
+        self.suspend()
+    }
+    /// `PMSG_RESTORE`: in the restored image. Forward order.
+    fn restore(&self) -> Result<(), DevicePmError> {
+        self.resume()
+    }
+}
+/// The hibernation callbacks of a function-pointer registration
+/// ([`register_device_pm_hibernation`]); without them, a
+/// [`register_device_pm`] entry's freeze and poweroff run its suspend and
+/// its thaw and restore run its resume.
+#[derive(Clone, Copy, Debug)]
+pub struct HibernationFns {
+    pub freeze: PmFn,
+    pub thaw: PmFn,
+    pub poweroff: PmFn,
+    pub restore: PmFn,
+}
+/// Which `dev_pm_ops` callback a fan-out runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Suspend,
+    Resume,
+    Freeze,
+    Thaw,
+    Poweroff,
+    Restore,
+}
+impl Phase {
+    /// Quiescing phases run children before parents.
+    fn reverse(self) -> bool {
+        matches!(self, Phase::Suspend | Phase::Freeze | Phase::Poweroff)
+    }
 }
 
 /// Error variants returned from a `DevicePmOps` callback. Alias
@@ -74,6 +118,31 @@ pub struct DevicePmEntry {
     /// Trait-object form. When present, takes precedence over
     /// the fn-pointer fields above.
     pub ops: Option<Arc<dyn DevicePmOps>>,
+    /// The fn-pointer form's hibernation callbacks, if it has its own.
+    pub hibernation: Option<HibernationFns>,
+}
+impl DevicePmEntry {
+    fn run(&self, phase: Phase) -> Result<(), DeviceSuspendError> {
+        if let Some(ops) = self.ops.as_ref() {
+            return match phase {
+                Phase::Suspend => ops.suspend(),
+                Phase::Resume => ops.resume(),
+                Phase::Freeze => ops.freeze(),
+                Phase::Thaw => ops.thaw(),
+                Phase::Poweroff => ops.poweroff(),
+                Phase::Restore => ops.restore(),
+            };
+        }
+        let h = self.hibernation;
+        match phase {
+            Phase::Suspend => (self.suspend)(),
+            Phase::Resume => (self.resume)(),
+            Phase::Freeze => h.map_or(self.suspend, |h| h.freeze)(),
+            Phase::Thaw => h.map_or(self.resume, |h| h.thaw)(),
+            Phase::Poweroff => h.map_or(self.suspend, |h| h.poweroff)(),
+            Phase::Restore => h.map_or(self.resume, |h| h.restore)(),
+        }
+    }
 }
 
 impl fmt::Debug for DevicePmEntry {
@@ -112,13 +181,33 @@ static REGISTRY: IrqSafeSpinLock<Vec<DevicePmEntry>> = IrqSafeSpinLock::new(Vec:
 /// Registration order matters: earlier = closer-to-bus-root.
 /// Suspend runs in reverse; resume in forward order.
 pub fn register_device_pm(name: &str, suspend: PmFn, resume: PmFn) {
-    let mut g = REGISTRY.lock();
-    let entry = DevicePmEntry {
+    register_entry(DevicePmEntry {
         name: String::from(name),
         suspend,
         resume,
         ops: None,
-    };
+        hibernation: None,
+    });
+}
+/// [`register_device_pm`] with the driver's own hibernation callbacks
+/// (a driver whose thaw must not resume, as amdgpu's does not).
+pub fn register_device_pm_hibernation(
+    name: &str,
+    suspend: PmFn,
+    resume: PmFn,
+    hibernation: HibernationFns,
+) {
+    register_entry(DevicePmEntry {
+        name: String::from(name),
+        suspend,
+        resume,
+        ops: None,
+        hibernation: Some(hibernation),
+    });
+}
+fn register_entry(entry: DevicePmEntry) {
+    let mut g = REGISTRY.lock();
+    let name = entry.name.clone();
     if let Some(slot) = g.iter_mut().find(|e| e.name == name) {
         *slot = entry;
     } else {
@@ -149,6 +238,7 @@ pub fn register_device_pm_ops(name: &str, ops: Arc<dyn DevicePmOps>) {
         suspend: unreachable_suspend,
         resume: unreachable_resume,
         ops: Some(ops),
+        hibernation: None,
     };
     if let Some(slot) = g.iter_mut().find(|e| e.name == name) {
         *slot = entry;
@@ -208,15 +298,34 @@ impl FanoutReport {
 /// chain — we want partial progress so resume can roll back as
 /// much as possible.
 pub fn suspend_all_devices() -> FanoutReport {
+    fan_out(Phase::Suspend)
+}
+/// `dpm_suspend(PMSG_FREEZE)` before the hibernation snapshot, in reverse
+/// registration order.
+pub fn freeze_all_devices() -> FanoutReport {
+    fan_out(Phase::Freeze)
+}
+/// `dpm_resume(PMSG_THAW)` after the snapshot, or after a failed image
+/// with [`set_hibernate_recovering`] set, in forward order.
+pub fn thaw_all_devices() -> FanoutReport {
+    fan_out(Phase::Thaw)
+}
+/// `dpm_suspend_start(PMSG_HIBERNATE)` before the platform's S4 entry, in
+/// reverse order.
+pub fn poweroff_all_devices() -> FanoutReport {
+    fan_out(Phase::Poweroff)
+}
+/// `dpm_resume(PMSG_RESTORE)` in the restored image, in forward order.
+pub fn restore_all_devices() -> FanoutReport {
+    fan_out(Phase::Restore)
+}
+/// One pass over a registry snapshot; no failure stops it.
+fn fan_out(phase: Phase) -> FanoutReport {
     let snap = REGISTRY.lock().clone();
     let mut outcomes = Vec::with_capacity(snap.len());
     let mut failure_count = 0;
-    for entry in snap.iter().rev() {
-        let result = if let Some(ops) = entry.ops.as_ref() {
-            ops.suspend()
-        } else {
-            (entry.suspend)()
-        };
+    let mut run = |entry: &DevicePmEntry| {
+        let result = entry.run(phase);
         if result.is_err() {
             failure_count += 1;
         }
@@ -224,6 +333,11 @@ pub fn suspend_all_devices() -> FanoutReport {
             name: entry.name.clone(),
             result,
         });
+    };
+    if phase.reverse() {
+        snap.iter().rev().for_each(&mut run);
+    } else {
+        snap.iter().for_each(&mut run);
     }
     FanoutReport {
         outcomes,
@@ -231,30 +345,20 @@ pub fn suspend_all_devices() -> FanoutReport {
     }
 }
 
+/// `pm_hibernate_is_recovering`: a thaw after the snapshot or the image
+/// write failed, so the devices must come back for the running system.
+static RECOVERING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn set_hibernate_recovering(recovering: bool) {
+    RECOVERING.store(recovering, core::sync::atomic::Ordering::Release);
+}
+pub fn hibernate_is_recovering() -> bool {
+    RECOVERING.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Call every registered resume handler in **forward**
 /// registration order.
 pub fn resume_all_devices() -> FanoutReport {
-    let snap = REGISTRY.lock().clone();
-    let mut outcomes = Vec::with_capacity(snap.len());
-    let mut failure_count = 0;
-    for entry in snap.iter() {
-        let result = if let Some(ops) = entry.ops.as_ref() {
-            ops.resume()
-        } else {
-            (entry.resume)()
-        };
-        if result.is_err() {
-            failure_count += 1;
-        }
-        outcomes.push(DeviceFanoutOutcome {
-            name: entry.name.clone(),
-            result,
-        });
-    }
-    FanoutReport {
-        outcomes,
-        failure_count,
-    }
+    fan_out(Phase::Resume)
 }
 
 #[doc(hidden)]

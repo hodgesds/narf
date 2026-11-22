@@ -41,9 +41,11 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
    park at their next kernel exit, and freezable kernel work drains. This
    touches the scheduler's executor core, which is TCB, so the PR carries
    a safety argument (AGENTS.md rule 13).
-3. **Device callbacks.** Add freeze, thaw, poweroff and restore to
-   `DevicePmOps`, with Linux's order, beside the async
-   `prepare_suspend_target(S4)` that exists.
+3. ~~**Device callbacks.**~~ Done (`freeze_all_devices` and the rest,
+   `HibernationFns`, `hibernate_is_recovering`). amdgpu follows
+   `amdgpu_pmops_*`: freeze is the suspend, thaw resumes only while
+   recovering, poweroff skips a device the thaw left suspended, and restore
+   is the resume.
 4. **Non-boot CPUs.** Take them offline for the snapshot and restore
    (`pm_sleep_disable_secondary_cpus`), through `cpu_take_offline`.
 5. **Snapshot.** Enumerate the frame allocator's allocated frames, minus

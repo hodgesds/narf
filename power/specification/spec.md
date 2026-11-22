@@ -254,7 +254,39 @@ Flow:
    hand `time/` the suspend duration so it can jump forward the
    wall clock without violating monotonic.
 
-`system_pm::AsyncSystemPm` is the interrupt-live bracket around the existing
+`device_pm` is the synchronous fan-out, Linux's `dev_pm_ops`:
+
+```rust
+pub trait DevicePmOps: Send + Sync {
+    fn suspend(&self) -> Result<(), DevicePmError>;
+    fn resume(&self) -> Result<(), DevicePmError>;
+    fn freeze(&self) -> Result<(), DevicePmError> { self.suspend() }    // PMSG_FREEZE
+    fn thaw(&self) -> Result<(), DevicePmError> { self.resume() }       // PMSG_THAW
+    fn poweroff(&self) -> Result<(), DevicePmError> { self.suspend() }  // PMSG_HIBERNATE
+    fn restore(&self) -> Result<(), DevicePmError> { self.resume() }    // PMSG_RESTORE
+}
+pub struct HibernationFns { pub freeze: PmFn, pub thaw: PmFn, pub poweroff: PmFn, pub restore: PmFn }
+pub fn register_device_pm(name: &str, suspend: PmFn, resume: PmFn);
+pub fn register_device_pm_hibernation(name: &str, suspend: PmFn, resume: PmFn, h: HibernationFns);
+pub fn register_device_pm_ops(name: &str, ops: Arc<dyn DevicePmOps>);
+pub fn suspend_all_devices() -> FanoutReport;   // reverse registration order
+pub fn resume_all_devices() -> FanoutReport;    // forward
+pub fn freeze_all_devices() -> FanoutReport;    // reverse
+pub fn thaw_all_devices() -> FanoutReport;      // forward
+pub fn poweroff_all_devices() -> FanoutReport;  // reverse
+pub fn restore_all_devices() -> FanoutReport;   // forward
+pub fn set_hibernate_recovering(recovering: bool);
+pub fn hibernate_is_recovering() -> bool;       // pm_hibernate_is_recovering
+```
+
+The hibernation callbacks default as `SET_SYSTEM_SLEEP_PM_OPS` sets them,
+for trait implementations and plain registrations alike: freeze and
+poweroff run the suspend, thaw and restore the resume. A
+`register_device_pm_hibernation` set replaces them; amdgpu's thaw, for
+one, resumes only while recovering. No failure stops a fan-out; the
+report counts them.
+
+`system_pm::AsyncSystemPm` is the interrupt-live bracket around the
 synchronous `device_pm::DevicePmOps` fan-out. Registration is parent → child;
 `prepare_suspend` runs child → parent, and the matching resume runs parent →
 child after the synchronous fan-out has restored PCI/platform delivery. The
