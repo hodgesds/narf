@@ -928,6 +928,28 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         self.write_block(blk, &buf).await
     }
 
+    /// `count_free`: the clear bits of every bitmap block holding the first
+    /// `numbits` bits, at most `n_blocks` from `start_block`.
+    async fn count_free_bits(
+        &self,
+        start_block: u32,
+        n_blocks: u32,
+        numbits: u32,
+    ) -> Result<u64, FsError> {
+        let bs = self.sb.block_size as usize;
+        let blocks = numbits.div_ceil(bs as u32 * 8).min(n_blocks);
+        let mut buf = vec![0u8; bs];
+        let mut free = 0u64;
+        for blk in 0..blocks {
+            self.read_block(start_block + blk, &mut buf).await?;
+            free += buf
+                .iter()
+                .map(|byte| u64::from(byte.count_zeros()))
+                .sum::<u64>();
+        }
+        Ok(free)
+    }
+
     /// Allocate a fresh inode. Returns the (1-based) inode number.
     pub async fn alloc_inode(&self) -> Result<u32, FsError> {
         let imap_start = self.sb.imap_first_block();
@@ -1561,6 +1583,33 @@ impl<B: BlockDevice + 'static> FsInstance for MinixVolume<B> {
     /// Linux's one `minix` type serves every version.
     fn fs_type(&self) -> &str {
         "minix"
+    }
+
+    /// `minix_statfs`: the data zones in blocks, the free ones and the free
+    /// inodes by their bitmaps (`minix_count_free_blocks`,
+    /// `minix_count_free_inodes`), and the version's name length.
+    fn statfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsStat> {
+        alloc::boxed::Box::pin(async move {
+            let sb = &self.sb;
+            let zone_bits = sb.nzones.saturating_sub(sb.first_data_zone) + 1;
+            let free_zones = self
+                .count_free_bits(sb.zmap_first_block(), sb.zmap_blocks, zone_bits)
+                .await?;
+            let free_inodes = self
+                .count_free_bits(sb.imap_first_block(), sb.imap_blocks, sb.ninodes + 1)
+                .await?;
+            let zones = u64::from(sb.nzones.saturating_sub(sb.first_data_zone));
+            Ok(narf_filesystem::FsStat {
+                blocks: zones << sb.log_zone_size,
+                blocks_free: free_zones << sb.log_zone_size,
+                blocks_available: free_zones << sb.log_zone_size,
+                files: u64::from(sb.ninodes),
+                files_free: free_inodes,
+                block_size: sb.block_size,
+                name_len: sb.name_len.bytes() as u32,
+                fragment_size: sb.block_size,
+            })
+        })
     }
 
     /// `minix_statfs`: `buf->f_type = sb->s_magic`, the on-disk magic, which
