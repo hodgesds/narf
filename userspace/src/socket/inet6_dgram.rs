@@ -517,7 +517,17 @@ impl SocketFile {
         {
             if *local_addr == UNSPEC {
                 *local_addr = src_addr;
-                *local_scope_id = src_scope;
+                // `inet6_getname` reports `ipv6_iface_scope_id(addr,
+                // sk->sk_bound_dev_if)`: a link-local source carries the
+                // socket's bound device — the one this connect bound for a
+                // scoped link-local peer, else SO_BINDTODEVICE's, which a
+                // connect to a global address through a link-local source
+                // leaves 0. The egress device is not the socket's scope.
+                *local_scope_id = if src_scope != 0 {
+                    new_bound_dev.unwrap_or(bound_dev)
+                } else {
+                    0
+                };
             }
             *slot = Some(peer);
         }
