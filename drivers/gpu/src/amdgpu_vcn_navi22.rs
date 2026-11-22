@@ -577,6 +577,18 @@ impl Layout {
             _ => None,
         }
     }
+    /// Whether the VCN has a JPEG engine to drive.
+    /// `amdgpu_discovery_set_mm_ip_blocks` adds `jpeg_v3_0` beside
+    /// `vcn_v3_0` for UVD 3.0.0, 3.0.2, 3.0.16, 3.1.1 and 3.1.2, but not for
+    /// Beige Goby's (Navi24) 3.0.33. Discovery compares the revision without
+    /// its encode/decode capability bits [7:6], as here.
+    pub(crate) fn has_jpeg(&self) -> bool {
+        let (major, minor, revision) = self.vcn_version;
+        matches!(
+            (major, minor, revision & 0x3f),
+            (3, 0, 0) | (3, 0, 2) | (3, 0, 16) | (3, 1, 1) | (3, 1, 2)
+        )
+    }
     /// `jpeg_v3_0_early_init` reads `CC_UVD_HARVESTING` except on VCN
     /// 3.1.1/3.1.2.
     pub(crate) fn jpeg_reads_harvesting(&self) -> bool {
@@ -832,10 +844,11 @@ pub(crate) struct StaticPg {
     pub jpeg_off: bool,
 }
 impl StaticPg {
-    /// Navi22's fixed policy: the static path with `AMD_PG_SUPPORT_VCN`
-    /// clear, and UVDJ powered on for JPEG and left on. (Navy Flounder's
-    /// Linux flags carry `AMD_PG_SUPPORT_JPEG`, whose stop also powers UVDJ
-    /// off.)
+    /// Navi22's fixed policy, which every discrete owner takes: the static
+    /// path with `AMD_PG_SUPPORT_VCN` clear, and UVDJ powered on for JPEG
+    /// and left on. (The Navi21-23 Linux flags carry `AMD_PG_SUPPORT_JPEG`,
+    /// whose stop also powers UVDJ off. Navi24's lack it, and it has no JPEG
+    /// owner.)
     pub(crate) const NAVI22: Self = Self {
         vcn: false,
         jpeg_on: true,
@@ -865,8 +878,9 @@ pub(crate) struct Mgcg {
     pub jpeg: bool,
 }
 impl Mgcg {
-    /// The discrete owners' fixed policy: both set, as Navy Flounder's
-    /// flags carry them.
+    /// The discrete owners' fixed policy: both set, as the Navi21, Navi22
+    /// and Navi23 flags carry them. Navi24's lack JPEG_MGCG, and it has no
+    /// JPEG owner ([`Layout::has_jpeg`]).
     pub(crate) const NAVI22: Self = Self {
         vcn: true,
         jpeg: true,
@@ -2643,7 +2657,8 @@ impl Media {
     }
     /// Reserve per-instance VCPU/ring/IB storage without device I/O.
     /// `instances` is the unharvested VCN mask whose firmware PSP loads;
-    /// JPEG exists when instance 0 does (`num_jpeg_inst = 1`).
+    /// JPEG exists when instance 0 does (`num_jpeg_inst = 1`) and the VCN
+    /// has one ([`Layout::has_jpeg`]: not on Navi24).
     ///
     /// # Safety
     /// Caller exclusively owns this physical Navi22 GPU's VCN/JPEG blocks,
@@ -2735,7 +2750,8 @@ impl Media {
                 *slot = Some(Instance::new(pool, i as u32)?);
             }
         }
-        let jpeg = if instances & 1 != 0 {
+        // JPEG exists with instance 0, where the VCN has one.
+        let jpeg = if instances & 1 != 0 && layout.has_jpeg() {
             Some(Jpeg::new(pool)?)
         } else {
             None

@@ -583,9 +583,15 @@ impl SramLoader for NoSram {
     }
 }
 fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
+    engine_on(model, layout(instances))
+}
+/// The owner `with_layout` builds on `layout`: JPEG with instance 0, where
+/// the VCN has one.
+fn engine_on(model: Model, layout: Layout) -> (Pool, Engine<Model>) {
+    let instances = u8::from(layout.vcn[0].is_some()) | u8::from(layout.vcn[1].is_some()) << 1;
     let pool = pool(4 << 20);
     let vcn = [0, 1].map(|i| (instances & (1 << i) != 0).then(|| Instance::new(&pool, i).unwrap()));
-    let jpeg = (instances & 1 != 0).then(|| Jpeg::new(&pool).unwrap());
+    let jpeg = (instances & 1 != 0 && layout.has_jpeg()).then(|| Jpeg::new(&pool).unwrap());
     (
         pool,
         Engine {
@@ -594,7 +600,7 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
             hw: Hw {
                 io: model,
                 authority: Cap::bootstrap(),
-                layout: layout(instances),
+                layout,
             },
             vcn,
             jpeg_state: if jpeg.is_some() {
@@ -623,19 +629,80 @@ fn owned(instances: u8) -> u64 {
     u64::from(instances.count_ones()) * ((INSTANCE_BYTES + 4095) & !4095) + jpeg
 }
 
+/// Navi24 (Beige Goby, VCN 3.0.33) decodes only, and has no JPEG owner:
+/// Linux's discovery adds `vcn_v3_0` alone for it. Nothing reaches UVDJ's
+/// PGFSM field, the JPEG registers or the JPEG doorbell, and no JPEG ring or
+/// interrupt source is offered.
 fn vcn_navi24_decode_only() -> TestResult {
-    let (_pool, mut e) = engine(Model::new(), 1);
+    let navi24 = Layout {
+        vcn_version: (3, 0, 33),
+        ..layout(1)
+    };
+    let (_pool, mut e) = engine_on(Model::new(), navi24);
     e.enc_count = 0;
+    if e.jpeg.is_some() || e.jpeg_state != JpegState::Absent {
+        return TestResult::Fail("Navi24 reserved a JPEG owner");
+    }
     if run(e.start(firmware(1), None, &mut NoSram)).is_err()
-        || run(e.start_jpeg()).is_err()
+        || run(e.start_jpeg()) != Err(Error::Busy)
         || run(e.test_ib()).is_err()
         || e.proof.dec_ring != [true, false]
         || e.proof.dec_ib != [2, 0]
         || e.proof.enc_ring != [[false; 2]; 2]
         || e.proof.enc_ib != [[0; 2]; 2]
-        || !e.proof.jpeg_ring
+        || e.proof.jpeg_ring
     {
-        return TestResult::Fail("decode-only VCN/JPEG proofs");
+        return TestResult::Fail("decode-only VCN proofs, or a JPEG start");
+    }
+    let jpeg_regs = [
+        JPEG_CGC_CTRL,
+        JPEG_CGC_GATE,
+        JPEG_POWER_STATUS,
+        JRBC_RB_CNTL,
+        JMI_CNTL,
+    ];
+    let m = &e.hw.io;
+    if m.writes.iter().any(|&(a, x)| {
+        jpeg_regs.iter().any(|&r| a == v(0, r))
+            || (a == v(0, PGFSM_CONFIG) && x & PGFSM_UVDJ_STATUS != 0)
+    }) || m
+        .doorbells
+        .iter()
+        .any(|&(index, _)| index == doorbell::JPEG)
+    {
+        return TestResult::Fail("Navi24 touched the JPEG engine");
+    }
+    let sources = interrupt_sources(Status {
+        state: e.state,
+        jpeg: e.jpeg_state,
+        proof: e.proof,
+    });
+    if sources.contains(&crate::amdgpu_ih_navi22::source::JPEG_DEC)
+        || !sources.contains(&crate::amdgpu_ih_navi22::source::VCN0_DEC)
+    {
+        return TestResult::Fail("Navi24's interrupt routes");
+    }
+    // Every VCN 3.x that Linux pairs with jpeg_v3_0, with and without the
+    // capability bits in the revision.
+    for (version, jpeg) in [
+        ((3, 0, 0), true),
+        ((3, 0, 64), true),
+        ((3, 0, 192), true),
+        ((3, 0, 2), true),
+        ((3, 0, 16), true),
+        ((3, 1, 1), true),
+        ((3, 1, 2), true),
+        ((3, 0, 33), false),
+    ] {
+        if (Layout {
+            vcn_version: version,
+            ..layout(1)
+        })
+        .has_jpeg()
+            != jpeg
+        {
+            return TestResult::Fail("the VCN versions that carry a JPEG engine");
+        }
     }
     for regs in [RB_BASE_LO, RB_BASE_HI, RB_SIZE, RB_RPTR, RB_WPTR] {
         if regs

@@ -11983,7 +11983,10 @@ resolves each instance's VCN BASE_IDX 0/1 banks from discovery (3.0.0 at
 0x7800/0x7E00, 3.0.1 at 0x7B00/0x12000), GC/NBIO/HDP, and reserves per instance
 the VCPU BO (128 KiB stack, 512 KiB context, 4 KiB fw_shared), 4 KiB decode and
 two encode rings, writeback and IB-test buffers (below 2^40), plus an 8 KiB JPEG
-ring when instance 0 exists. No I/O. Doorbells are 32-bit: decode
+ring when instance 0 exists and its VCN has a JPEG engine (`Layout::has_jpeg`).
+Linux's discovery pairs `jpeg_v3_0` with UVD 3.0.0, 3.0.2, 3.0.16, 3.1.1 and
+3.1.2, ignoring the revision's capability bits, but not with Navi24's 3.0.33.
+That owner has no JPEG ring, interrupt source or client ring. No I/O. Doorbells are 32-bit: decode
 `0x310 + 8i`, encode j `0x312 + j + 8i`, JPEG `0x311`, with NBIO MMSCH0/1
 ranges (size 8). `unsafe start(MediaFirmware, Option<PowerStatus>, &mut Psp)`
 refuses a missing per-instance TMR address or a running SMU MM_DPM_PG feature
