@@ -384,6 +384,22 @@ construction errors (including ENOENT for a missing registered block source).
 Bind, move, remount and propagation operate on existing mount objects.
 `mount_setattr` with `AT_RECURSIVE` applies the attributes to the named mount
 and every mount below it; without it, to the named mount only.
+A mount a task makes — `mount(2)`, a bind or recursive bind, an `fsmount` or
+`open_tree` graft, a propagated copy — goes on top of whatever is mounted at
+or below its mountpoint and covers it until it is unmounted, as Linux's
+`graft_tree` does: after a tmpfs is mounted on a directory, the mounts made
+below that directory earlier are unreachable (`mkdir` of their mountpoint
+names creates in the tmpfs) and appear again once the tmpfs goes.
+`mount(MS_MOVE)` and `move_mount(2)` of an attached mount take it with every
+mount below it (`do_move_mount`) and put the tree on top at the target.
+`statfs(2)` and `fstatfs(2)` report the filesystem's Linux superblock magic as
+`f_type` (`FsInstance::magic`: `BTRFS_SUPER_MAGIC`, `MSDOS_SUPER_MAGIC` for
+every FAT width, `0xEF53` for ext2/3/4, `DEVPTS_SUPER_MAGIC`, ...; a bind
+answers for its source filesystem, numbers included), `f_flags` as
+`calculate_f_flags` computes it (`ST_VALID`, the `ST_*` twin of each `MNT_*`
+restriction and atime mode, and the superblock's synchronous, mandatory-lock
+and read-only state), and `f_frsize` as `f_bsize` when the filesystem leaves
+it 0.
 `open_tree(OPEN_TREE_CLONE)` clones the selected mount. Adding `AT_RECURSIVE`
 includes its child mounts. A plain bind of the installed root therefore exposes
 the on-disk directory beneath a mounted `/run`.
@@ -1045,6 +1061,15 @@ byte prefix and advances the directory cursor only through that prefix. The
 unsigned `count` argument is truncated to its native 32-bit ABI width.
 `d_ino` is `DirOps::entry_ino` of the entry where the directory answers it
 (devpts), otherwise a cursor placeholder.
+Every directory lists `.` at position 0 and `..` at position 1 (`DT_DIR`), as
+Linux's `dir_emit_dots` and the on-disk entries of ext2 and FAT
+subdirectories do, whatever the filesystem enumerates; the filesystem's own
+entries follow from position 2, and a `.` or `..` it lists itself is not
+reported again. `.` carries the inode `fstat` reports for the descriptor,
+`..` the inode of the directory above it, or the directory's own at a mount
+root, whose dentry is its own parent. Positions are what `d_off` reports, so
+`lseek(fd, 0, SEEK_SET)` lists from `.` again and `seekdir` to a `d_off`
+resumes after the entry that reported it.
 `ioctl(master, TIOCGPTPEER, flags)` returns a slave descriptor that has a
 path like one from `open(2)`, as `ptm_open_peer` opens the devpts dentry:
 `<mnt>/<N>` when the master was opened on that devpts mount's own `ptmx`,
@@ -1277,6 +1302,11 @@ the owning filesystem's mount root. `NOEXEC` and set-id `NOSUID` policy use the
 resolved executable mount, including a script's selected interpreter; a symlink
 on another mount does not supply that policy. `AT_EXECFN` retains the caller's
 spelling. `execveat(2)` retains its explicit `AT_EMPTY_PATH` descriptor semantics.
+An image's `PT_INTERP` is opened the way `open_exec` opens it: under the
+caller's root, with its symlinks expanded through the caller's mounts, so an
+absolute link such as bubblewrap's `/lib64 -> /usr/lib` restarts at the process
+root and reaches a separately mounted `/usr`. An interpreter that cannot be
+resolved fails the `execve` with `ENOENT`.
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.

@@ -1153,10 +1153,44 @@ pub fn mount(on: &DirCap, fs: Cap<FsInstance, Attach>, opts: MountOpts) -> Cap<M
 pub fn unmount(mp: Cap<MountPoint, Own>) -> impl Future<Output = ()>;
 
 pub trait FsInstance {
+    fn magic(&self) -> u64; // default: super_magic::for_fs_type(self.name())
     fn statfs(&self) -> impl Future<Output = Result<FsStat, FsError>>;
     fn reconfigure(&self, options: &str) -> Result<(), FsError>;
 }
+
+impl VfsRegistry /* and MountNamespace */ {
+    pub fn mount_arc_on_top(&self, a: &Cap<MountPoint, Grant>, path: &str,
+        fs: Arc<dyn FsInstance>, flags: u64, devname: Option<&str>)
+        -> Result<Cap<MountPoint, Write>, FsError>;
+    pub fn bind_mount_on_top(&self, a: &Cap<MountPoint, Grant>, source: &str,
+        target: &str) -> Result<Cap<MountPoint, Write>, FsError>;
+}
 ```
+
+`FsInstance::magic` is Linux's `sb->s_magic`, which `statfs` reports as
+`f_type`. The `super_magic` module holds Linux's values and `for_fs_type`,
+the default, which maps a type name `name()` reports to its magic (NARF's
+`fat12`/`fat16`/`fat32` are `MSDOS_SUPER_MAGIC`; an unknown name is one of
+NARF's in-memory trees, `TMPFS_MAGIC`). A bind and a file bind answer
+`magic` and `statfs` for their source filesystem; FUSE is
+`FUSE_SUPER_MAGIC` whatever subtype names it; minix reports its on-disk
+magic; an overlay that owns its lower stands in for it. FAT implements
+`statfs` as `fat_statfs` does: cluster-sized blocks, the data clusters, the
+free ones counted in the FAT (cached until an entry changes), and
+`FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE` names.
+
+The registry table is in attachment order, and a path walk reaches the
+LATEST attachment at the path or at one of its ancestors: a later mount
+over a directory covers every mount made below that directory before it,
+as a Linux walk entering the topmost mount at each component does. An
+attach a task asks for (`mount(2)`, binds, propagated copies, pivot_root's
+old root) goes on top (`mount_arc_on_top`, `bind_mount_on_top`, appended).
+The kernel's own assembly of the initial tree (`mount`, `mount_arc*`,
+`bind_mount`) goes beneath the mounts already made below its mountpoint —
+the initramfs at `/` after `/dev`, `/proc` and `/sys`, the installed root at
+`/mnt` after its ESP at `/mnt/boot` — the result a Linux initramfs reaches by
+moving those mounts onto the new root. A mountinfo parent is the mount
+attached at or above the mountpoint just before it.
 
 Persistent-format drivers may expose a typed assembly entry point in addition
 to the generic mount registry. Btrfs provides
@@ -1350,8 +1384,10 @@ descriptor; an attribute failure leaves no visible or retained detached tree.
 An `OPEN_TREE_CLONE` detached object retains the visible descendant
 mounts beneath that root; attaching it rebases those mount paths beneath
 the new target.
-Classic `MS_MOVE` relocates the topmost source mount to the target without
-changing its filesystem object.
+Classic `MS_MOVE` moves the topmost source mount, with every mount attached
+below it, to the target without changing their filesystem objects
+(`do_move_mount`); the moved tree is the newest attachment there, on top of
+what the target had.
 
 ### 3.6 Filesystem driver interface
 
