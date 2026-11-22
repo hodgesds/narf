@@ -146,10 +146,14 @@ impl Agreement {
         frame[24..26].copy_from_slice(&[3, action]);
         frame
     }
+    /// The originator DELBA for a locally stopped session. mac80211 sends it
+    /// from `ieee80211_stop_tx_ba_cb` with WLAN_REASON_QSTA_NOT_USE (37) for
+    /// every local stop: inactivity, an ADDBA response timeout or teardown.
     pub fn delba(&self) -> Vec<u8> {
+        const WLAN_REASON_QSTA_NOT_USE: u16 = 37;
         let mut frame = self.action(30, 2);
         frame[26..28].copy_from_slice(&(u16::from(self.tid) << 12 | 0x0800).to_le_bytes());
-        frame[28..30].copy_from_slice(&39u16.to_le_bytes()); // QSTA_TIMEOUT.
+        frame[28..30].copy_from_slice(&WLAN_REASON_QSTA_NOT_USE.to_le_bytes());
         frame
     }
     /// `peer_wcid` is the owning link's AP WCID (Linux `wcid->idx`).
