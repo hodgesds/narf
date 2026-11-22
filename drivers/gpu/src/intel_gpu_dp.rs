@@ -855,6 +855,13 @@ pub mod tests {
         /// control byte, served verbatim so the VRR MSA-ignore
         /// write/read-modify-write is observable.
         downspread_ctrl: u8,
+        /// ADJUST_REQUEST byte served at 0x206/0x207 on a healthy
+        /// rate (default 0x00: level 0 on every lane). A test
+        /// that needs the source to program a discriminating
+        /// level sets this — e.g. 0x11 asks swing 1, pre-emphasis
+        /// 0 on lanes 0/1 (preset 4, where the UY and standard
+        /// HBR2 tables differ).
+        adjust_request: u8,
         /// Every request frame, verbatim, in order.
         wire_log: Vec<Vec<u8>>,
         /// I²C transaction shape: (command nibble, data length)
@@ -878,6 +885,7 @@ pub mod tests {
                 fail_bw: [0, 0],
                 nack_all: false,
                 downspread_ctrl: 0,
+                adjust_request: 0,
                 wire_log: Vec::new(),
                 i2c_log: Vec::new(),
             }
@@ -940,12 +948,12 @@ pub mod tests {
                     // ADJUST_REQUEST: a failing rate demands MAX
                     // swing on every lane (drives the source's
                     // same-MAX-twice rule); a healthy sink asks
-                    // for level 0.
+                    // for `adjust_request` (level 0 by default).
                     0x206 | 0x207 => {
                         if self.rate_fails() {
                             0x33
                         } else {
-                            0x00
+                            self.adjust_request
                         }
                     }
                     0x107 => self.downspread_ctrl,
@@ -1062,6 +1070,10 @@ pub mod tests {
     #[derive(Debug)]
     pub struct SinkMmio {
         family: RefCell<Option<crate::intel_gpu_gt::Gen12Platform>>,
+        /// Tiger Lake UY (GT2) part: when true the window
+        /// reports `tgl_uy`, so a `Modeset` built over it
+        /// selects the UY HBR2 table. Default false.
+        tgl_uy: RefCell<bool>,
         regs: RefCell<BTreeMap<u64, u32>>,
         pub writes: RefCell<Vec<(u64, u32)>>,
         sink: RefCell<DpSink>,
@@ -1081,6 +1093,7 @@ pub mod tests {
         fn new(ddi: Ddi, sink: DpSink) -> Self {
             Self {
                 family: RefCell::new(Some(crate::intel_gpu_gt::Gen12Platform::TigerLake)),
+                tgl_uy: RefCell::new(false),
                 regs: RefCell::new(BTreeMap::new()),
                 writes: RefCell::new(Vec::new()),
                 sink: RefCell::new(sink),
@@ -1123,6 +1136,9 @@ pub mod tests {
     impl MmioWindow for SinkMmio {
         fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
             *self.family.borrow()
+        }
+        fn tgl_uy(&self) -> bool {
+            *self.tgl_uy.borrow()
         }
         fn gen12_hpd_profile(&self) -> Option<HpdProfile> {
             self.gen12_display_family().and_then(|family| {
@@ -1432,6 +1448,65 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_dp",
         smoke_dp_full_conversation_hbr2_sink
+    );
+
+    fn smoke_dp_external_uy_selects_uy_hbr2_table() -> TestResult {
+        // External DP on DDI B, HBR2 x4, sink asking swing 1 /
+        // pre-emphasis 0 (preset 4): the UY HBR2 table's preset
+        // 4 carries swing select 0xC where the standard TGL
+        // HBR2 table carries 0xA, so the programmed DW2 lane-0
+        // word differs (0xA098 vs 0x9098) while DW7 (N-scalar
+        // 0x47) and DW4 (cursor 0x3F) agree. The `tgl_uy` flag
+        // reaches the training through the window alone —
+        // `activate_on_pipe` builds its `Modeset` over the
+        // `ModeWindow`, and `Modeset::for_pipe` derives the flag
+        // from it; no call site passes it explicitly.
+        // PHY_B (DDI B, 0x6C000) TX DW2/DW4/DW7 lane-0 offsets.
+        const DW2_LN0: u64 = 0x6C888;
+        const DW4_LN0: u64 = 0x6C890;
+        const DW7_LN0: u64 = 0x6C89C;
+        fn run(uy: bool) -> Option<(u32, u32, u32)> {
+            let caps = fixture_caps(BW_HBR2, 4);
+            let edid = fixture_edid(594_000, 3840, 2160, b"TEST DP MON");
+            let mut sink = DpSink::new(caps, edid);
+            sink.adjust_request = 0x11;
+            let mmio = SinkMmio::new(Ddi::B, sink);
+            *mmio.tgl_uy.borrow_mut() = uy;
+            let conn = connect(&mmio, Ddi::B, &test_fb()).ok()?;
+            if conn.trained.rate != LinkRate::Hbr2 || conn.trained.lanes != 4 {
+                return None;
+            }
+            let out = (
+                mmio.writes_to(DW2_LN0).last().copied()?,
+                mmio.writes_to(DW4_LN0).last().copied()?,
+                mmio.writes_to(DW7_LN0).last().copied()?,
+            );
+            clear_display_audio(sink_id_for(Ddi::B));
+            Some(out)
+        }
+        match run(true) {
+            Some((dw2, dw4, dw7)) => {
+                if dw2 != 0xA098 || dw4 != 0x3F || dw7 != 0x4700_0000 {
+                    return TestResult::Fail("UY window must program the UY preset-4 levels");
+                }
+            }
+            None => return TestResult::Fail("UY HBR2 connect must succeed"),
+        }
+        match run(false) {
+            Some((dw2, dw4, dw7)) => {
+                if dw2 != 0x9098 || dw4 != 0x3F || dw7 != 0x4700_0000 {
+                    return TestResult::Fail(
+                        "non-UY window must program the standard preset-4 levels",
+                    );
+                }
+            }
+            None => return TestResult::Fail("non-UY HBR2 connect must succeed"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_dp_external_uy_selects_uy_hbr2_table
     );
 
     fn smoke_dp_hbr3_sink_trains_hbr3() -> TestResult {

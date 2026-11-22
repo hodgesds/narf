@@ -1145,6 +1145,13 @@ pub mod tests {
         /// Every AUX wire frame, verbatim.
         wire_log: Vec<Vec<u8>>,
         training_pattern_writes: u32,
+        /// ADJUST_REQUEST byte served at 0x206/0x207 during link
+        /// training (default 0x00: level 0 on every lane). A
+        /// test that needs the source to program a
+        /// discriminating level sets this — e.g. 0x11 asks swing
+        /// 1, pre-emphasis 0 on lanes 0/1 (preset 4, where the
+        /// UY and standard HBR2 tables differ).
+        adjust_request: u8,
     }
 
     impl Hub {
@@ -1176,6 +1183,7 @@ pub mod tests {
                 request_log: Vec::new(),
                 wire_log: Vec::new(),
                 training_pattern_writes: 0,
+                adjust_request: 0,
             }
         }
 
@@ -1235,6 +1243,7 @@ pub mod tests {
                             0x00
                         }
                     }
+                    0x206 | 0x207 => self.adjust_request,
                     0x2C0 => {
                         if self.payload_updated {
                             1
@@ -1657,6 +1666,10 @@ pub mod tests {
     #[derive(Debug)]
     struct HubMmio {
         family: RefCell<Option<crate::intel_gpu_gt::Gen12Platform>>,
+        /// Tiger Lake UY (GT2) part: when true the window
+        /// reports `tgl_uy`, so a `Modeset` built over it
+        /// selects the UY HBR2 table. Default false.
+        tgl_uy: RefCell<bool>,
         regs: RefCell<BTreeMap<u64, u32>>,
         pub writes: RefCell<Vec<(u64, u32)>>,
         hub: RefCell<Hub>,
@@ -1670,6 +1683,7 @@ pub mod tests {
         fn new(hub: Hub) -> Self {
             Self {
                 family: RefCell::new(Some(crate::intel_gpu_gt::Gen12Platform::TigerLake)),
+                tgl_uy: RefCell::new(false),
                 regs: RefCell::new(BTreeMap::new()),
                 writes: RefCell::new(Vec::new()),
                 hub: RefCell::new(hub),
@@ -1717,6 +1731,9 @@ pub mod tests {
     impl MmioWindow for HubMmio {
         fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
             *self.family.borrow()
+        }
+        fn tgl_uy(&self) -> bool {
+            *self.tgl_uy.borrow()
         }
         fn read32(&self, off: u64) -> u32 {
             if off == self.aux_ctl_off() {
@@ -2092,6 +2109,72 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_mst",
         smoke_mst_two_streams_one_trained_link
+    );
+
+    fn smoke_mst_primary_uy_selects_uy_hbr2_table() -> TestResult {
+        // The MST primary stream trains the shared link (HBR2
+        // x4 — the hub caps' maximum, per `add_stream`'s
+        // mutual-maximum negotiation) through
+        // `modeset_mst_primary`, i.e. the same `train_dp_link`
+        // combo branch external DP uses. With the hub asking
+        // swing 1 / pre-emphasis 0 (preset 4), a UY window
+        // must program the UY preset-4 levels (DW2 0xA098) and
+        // a non-UY window the standard ones (DW2 0x9098); DW7
+        // (N-scalar 0x47) and DW4 (cursor 0x3F) agree either
+        // way. The flag reaches the primary stream's `Modeset`
+        // through the window alone — `add_stream` builds it
+        // over the `ModeWindow` in production.
+        // PHY_B (DDI B, 0x6C000) TX DW2/DW4/DW7 lane-0 offsets.
+        const DW2_LN0: u64 = 0x6C888;
+        const DW4_LN0: u64 = 0x6C890;
+        const DW7_LN0: u64 = 0x6C89C;
+        fn run(uy: bool) -> Option<(u32, u32, u32)> {
+            let mut fx = Fixture::new(two_level_hub());
+            fx.mmio.hub.borrow_mut().adjust_request = 0x11;
+            *fx.mmio.tgl_uy.borrow_mut() = uy;
+            if fx.connect_and_probe().is_err() {
+                return None;
+            }
+            let sink = Sink { branch: 0, port: 1 };
+            let (phys, stride) = fb_1080p(0x300_0000);
+            if fx.add(sink, Pipe::B, phys, stride).is_err() {
+                return None;
+            }
+            let trained = fx.link.trained()?;
+            if trained.rate != crate::dp_link_training::LinkRate::Hbr2 {
+                return None;
+            }
+            Some((
+                fx.mmio.writes_to(DW2_LN0).last().copied()?,
+                fx.mmio.writes_to(DW4_LN0).last().copied()?,
+                fx.mmio.writes_to(DW7_LN0).last().copied()?,
+            ))
+        }
+        match run(true) {
+            Some((dw2, dw4, dw7)) => {
+                if dw2 != 0xA098 || dw4 != 0x3F || dw7 != 0x4700_0000 {
+                    return TestResult::Fail(
+                        "UY window must program the UY preset-4 levels on the MST primary",
+                    );
+                }
+            }
+            None => return TestResult::Fail("UY MST primary stream must train HBR2"),
+        }
+        match run(false) {
+            Some((dw2, dw4, dw7)) => {
+                if dw2 != 0x9098 || dw4 != 0x3F || dw7 != 0x4700_0000 {
+                    return TestResult::Fail(
+                        "non-UY window must program the standard preset-4 levels on the MST primary",
+                    );
+                }
+            }
+            None => return TestResult::Fail("non-UY MST primary stream must train HBR2"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_mst",
+        smoke_mst_primary_uy_selects_uy_hbr2_table
     );
 
     fn smoke_mst_over_capacity_stream_refused_cleanly() -> TestResult {

@@ -104,17 +104,35 @@ pub fn connector_to_ddi(connector: ConnectorId) -> Option<Ddi> {
 struct MmioRegionWindow<'a> {
     region: &'a MmioRegion,
     family: crate::intel_gpu_gt::Gen12Platform,
+    /// Tiger Lake UY (GT2) part, from the owning chip's PCI
+    /// device ID — carried so a `Modeset` built over this
+    /// window selects the UY HBR2 table on combo DDIs (the
+    /// Type-C DDIs this bridge drives use the DKL PHY, where
+    /// the flag is inert, but the window still reports the
+    /// real value).
+    tgl_uy: bool,
 }
 
 impl<'a> MmioRegionWindow<'a> {
-    fn new(region: &'a MmioRegion, family: crate::intel_gpu_gt::Gen12Platform) -> Self {
-        Self { region, family }
+    fn new(
+        region: &'a MmioRegion,
+        family: crate::intel_gpu_gt::Gen12Platform,
+        tgl_uy: bool,
+    ) -> Self {
+        Self {
+            region,
+            family,
+            tgl_uy,
+        }
     }
 }
 
 impl<'a> MmioWindow for MmioRegionWindow<'a> {
     fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         Some(self.family)
+    }
+    fn tgl_uy(&self) -> bool {
+        self.tgl_uy
     }
     fn read32(&self, off: u64) -> u32 {
         // SAFETY: BAR0 is mapped for the lifetime of `IntelGpu`.
@@ -235,7 +253,11 @@ impl IntelDpBridge {
             gmd,
         );
 
-        let mmio = MmioRegionWindow::new(&gpu.gtt_mmadr, family);
+        let mmio = MmioRegionWindow::new(
+            &gpu.gtt_mmadr,
+            family,
+            crate::intel_gpu_gen12_combo_phy::is_tgl_uy(gpu.chip.did),
+        );
         if !matches!(cfg.lanes, 2 | 4) {
             return Err(DpBridgeError::ModesetFailed);
         }
@@ -461,7 +483,11 @@ fn stop_session(gpu: &intel_gpu::DisplayInfo, ddi: Ddi) -> Result<(), DpBridgeEr
     }
     let family =
         crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).ok_or(DpBridgeError::NotReady)?;
-    let io = MmioRegionWindow::new(&gpu.gtt_mmadr, family);
+    let io = MmioRegionWindow::new(
+        &gpu.gtt_mmadr,
+        family,
+        crate::intel_gpu_gen12_combo_phy::is_tgl_uy(gpu.chip.did),
+    );
     if let Some(pipe) = session.pipe {
         Modeset::for_pipe(&io, ddi, pipe)
             .try_teardown()

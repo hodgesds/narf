@@ -121,6 +121,9 @@ impl<M: MmioWindow + ?Sized> MmioWindow for CheckedWindow<'_, M> {
     fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         self.raw.gen12_display_family()
     }
+    fn tgl_uy(&self) -> bool {
+        self.raw.tgl_uy()
+    }
     fn gen12_hpd_profile(&self) -> Option<crate::intel_gpu_dp::HpdProfile> {
         self.raw.gen12_hpd_profile()
     }

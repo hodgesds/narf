@@ -201,6 +201,17 @@ pub trait MmioWindow {
     fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         None
     }
+    /// Whether this exact owned PCI mapping is a Tiger Lake UY
+    /// (GT2) part (`intel_gpu_gen12_combo_phy::is_tgl_uy`): on
+    /// such parts the combo-PHY table selection uses the UY HBR2
+    /// table above 270 MHz (Linux `tgl_get_combo_buf_trans_dp`,
+    /// `display->platform.tigerlake_uy`). Physical adapters derive
+    /// it from the PCI device ID, like `gen12_display_family`;
+    /// the default is false (the standard TGL table). Wrappers
+    /// between a physical adapter and the modeset forward it.
+    fn tgl_uy(&self) -> bool {
+        false
+    }
     /// Observed native ISA-bridge identity selects this source HPD bank.
     /// Family metadata alone never synthesizes a south-display controller.
     fn gen12_hpd_profile(&self) -> Option<crate::intel_gpu_dp::HpdProfile> {
