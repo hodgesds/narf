@@ -1153,7 +1153,10 @@ pub fn mount(on: &DirCap, fs: Cap<FsInstance, Attach>, opts: MountOpts) -> Cap<M
 pub fn unmount(mp: Cap<MountPoint, Own>) -> impl Future<Output = ()>;
 
 pub trait FsInstance {
-    fn magic(&self) -> u64; // default: super_magic::for_fs_type(self.name())
+    fn fs_type(&self) -> &str; // default: self.name()
+    fn magic(&self) -> u64; // default: super_magic::for_fs_type(self.fs_type())
+    fn statfs_fsid(&self) -> Option<u64>; // default None: the encoded st_dev
+    fn root_parent_ino(&self) -> FsFuture<'_, u64>; // default NotFound: own parent
     fn statfs(&self) -> impl Future<Output = Result<FsStat, FsError>>;
     fn reconfigure(&self, options: &str) -> Result<(), FsError>;
 }
@@ -1177,7 +1180,18 @@ NARF's in-memory trees, `TMPFS_MAGIC`). A bind and a file bind answer
 magic; an overlay that owns its lower stands in for it. FAT implements
 `statfs` as `fat_statfs` does: cluster-sized blocks, the data clusters, the
 free ones counted in the FAT (cached until an entry changes), and
-`FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE` names.
+`FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE` names. exFAT, iso9660 and minix
+implement `statfs` as `exfat_statfs`, `isofs_statfs` and `minix_statfs` do;
+ext2, UDF and 9p still answer with the trait default.
+`FsInstance::fs_type` is the Linux type the mount listings print, where
+`name` is the instance's own label (FAT is `vfat`, FUSE `fuse.<subtype>`, a
+labelled MemFs `tmpfs`). `FileSystemType::listed` is false for the aliases
+mount(2) accepts beside a Linux type; `/proc/filesystems` leaves them out.
+`root_parent_ino` is `parent_ino(mnt_root)`: a bind of a subdirectory
+reports the directory above it in the source filesystem.
+FUSE offers FUSE_ATOMIC_O_TRUNC (NARF still truncates an `O_TRUNC` open with
+SETATTR); a request on a disconnected connection is `NotConnected`
+(ENOTCONN), and a daemon's error reply maps to the FsError of that errno.
 
 The registry table is in attachment order, and a path walk reaches the
 LATEST attachment at the path or at one of its ancestors: a later mount

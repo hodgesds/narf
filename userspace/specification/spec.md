@@ -391,7 +391,16 @@ or below its mountpoint and covers it until it is unmounted, as Linux's
 below that directory earlier are unreachable (`mkdir` of their mountpoint
 names creates in the tmpfs) and appear again once the tmpfs goes.
 `mount(MS_MOVE)` and `move_mount(2)` of an attached mount take it with every
-mount below it (`do_move_mount`) and put the tree on top at the target.
+mount below it (`do_move_mount`) and put the tree on top at the target; a
+target inside the moved tree, the mount itself included, is `ELOOP`.
+`umount2(2)` reaches only the mount a walk reaches at its target: the path
+of a covered mount is `ENOENT`, or `EINVAL` where the cover has a directory
+there.
+Mount listings print each mount's Linux filesystem type
+(`FsInstance::fs_type`: `vfat`, `fuse.<subtype>`, `tmpfs` for an in-memory
+tree, the source's type for a bind), and `/proc/filesystems` lists only
+registered Linux types, not the aliases mount(2) also accepts (`shm`,
+`procfs`, `fat32`, ...).
 `statfs(2)` and `fstatfs(2)` report the filesystem's Linux superblock magic as
 `f_type` (`FsInstance::magic`: `BTRFS_SUPER_MAGIC`, `MSDOS_SUPER_MAGIC` for
 every FAT width, `0xEF53` for ext2/3/4, `DEVPTS_SUPER_MAGIC`, ...; a bind
@@ -399,7 +408,10 @@ answers for its source filesystem, numbers included), `f_flags` as
 `calculate_f_flags` computes it (`ST_VALID`, the `ST_*` twin of each `MNT_*`
 restriction and atime mode, and the superblock's synchronous, mandatory-lock
 and read-only state), and `f_frsize` as `f_bsize` when the filesystem leaves
-it 0.
+it 0. `statfs` follows a final symlink (LOOKUP_FOLLOW); `fstatfs` names the
+descriptor's file. `f_fsid` is the filesystem's own where it derives one
+(ext2 and btrfs from their UUIDs, FUSE none), otherwise the encoded device
+`st_dev` reports (`simple_statfs`, the block filesystems).
 `open_tree(OPEN_TREE_CLONE)` clones the selected mount. Adding `AT_RECURSIVE`
 includes its child mounts. A plain bind of the installed root therefore exposes
 the on-disk directory beneath a mounted `/run`.
@@ -1066,8 +1078,9 @@ Linux's `dir_emit_dots` and the on-disk entries of ext2 and FAT
 subdirectories do, whatever the filesystem enumerates; the filesystem's own
 entries follow from position 2, and a `.` or `..` it lists itself is not
 reported again. `.` carries the inode `fstat` reports for the descriptor,
-`..` the inode of the directory above it, or the directory's own at a mount
-root, whose dentry is its own parent. Positions are what `d_off` reports, so
+`..` the inode of the directory above it, or the directory's own at the root
+of a mount of a filesystem's root, whose dentry is its own parent; at a bind
+of a subdirectory it is the directory above that one in the filesystem. Positions are what `d_off` reports, so
 `lseek(fd, 0, SEEK_SET)` lists from `.` again and `seekdir` to a `d_off`
 resumes after the entry that reported it.
 `ioctl(master, TIOCGPTPEER, flags)` returns a slave descriptor that has a
@@ -1306,7 +1319,8 @@ An image's `PT_INTERP` is opened the way `open_exec` opens it: under the
 caller's root, with its symlinks expanded through the caller's mounts, so an
 absolute link such as bubblewrap's `/lib64 -> /usr/lib` restarts at the process
 root and reaches a separately mounted `/usr`. An interpreter that cannot be
-resolved fails the `execve` with `ENOENT`.
+resolved fails the `execve` with `ENOENT`; one on a `noexec` mount fails it
+with `EACCES` (`do_open_execat`'s `path_noexec`).
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
