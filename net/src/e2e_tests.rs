@@ -3194,7 +3194,10 @@ fn syn_options_emitted(peer_port: u16) -> Option<crate::tcp::options::ParsedOpti
         0,
         TCPO_PEER,
         peer_port,
-        core::ConnectOptions { syn_retries: 1 },
+        core::ConnectOptions {
+            syn_retries: 1,
+            ..Default::default()
+        },
     );
     let frames = drain_captured();
     let off = ETH_HDR_LEN + IPV4_HDR_LEN;

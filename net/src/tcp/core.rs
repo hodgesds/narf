@@ -219,6 +219,10 @@ pub struct Tcb {
     /// IPv4 next hop `remote_mac` belongs to (the route's gateway, or the
     /// peer itself on-link — `rt_nexthop`).
     pub nexthop: [u8; 4],
+    /// `sk_bound_dev_if` of an IPv4 connection: its segments leave through
+    /// this device and its next hop is that device's neighbour; 0 routes
+    /// each segment by destination.
+    pub oif: u32,
     pub state: TcpState,
 
     // ── Sequence space (RFC 9293 §3.3.1) ──
@@ -552,26 +556,29 @@ fn emit_tcb_frame_on(
             }
         };
         let tcb = arc.clone();
+        let bound = tcb.lock().oif != 0;
         let dev = dev.clone();
         let len = v.len();
-        crate::tcp_stack::neigh_output_in(
-            net_ns_id,
-            nexthop,
-            len,
-            alloc::boxed::Box::new(move |mac| match mac {
-                Some(mac) => {
-                    {
-                        let mut t = tcb.lock();
-                        if t.remote_mac == [0u8; 6] {
-                            t.remote_mac = mac;
-                        }
+        let device = dev.name.clone();
+        let cont: crate::arp_cache::NeighCont = alloc::boxed::Box::new(move |mac| match mac {
+            Some(mac) => {
+                {
+                    let mut t = tcb.lock();
+                    if t.remote_mac == [0u8; 6] {
+                        t.remote_mac = mac;
                     }
-                    v[..6].copy_from_slice(&mac);
-                    let _ = dev.xmit_meta(&v, meta);
                 }
-                None => neigh_failed(&tcb, &v),
-            }),
-        );
+                v[..6].copy_from_slice(&mac);
+                let _ = dev.xmit_meta(&v, meta);
+            }
+            None => neigh_failed(&tcb, &v),
+        });
+        // A bound connection's neighbour is its device's.
+        if bound {
+            crate::tcp_stack::neigh_output_on(net_ns_id, &device, nexthop, len, cont);
+        } else {
+            crate::tcp_stack::neigh_output_in(net_ns_id, nexthop, len, cont);
+        }
         return Ok(());
     }
     match (frame, queued) {
@@ -881,6 +888,7 @@ impl Tcb {
             remote_port,
             remote_mac,
             nexthop: remote_addr,
+            oif: 0,
             state: TcpState::Closed,
             snd_una: iss,
             snd_nxt: iss,
@@ -2038,11 +2046,24 @@ pub fn connect_in(net_ns_id: u64, remote_addr: [u8; 4], remote_port: u16) -> Res
 #[derive(Copy, Clone, Debug)]
 pub struct ConnectOptions {
     pub syn_retries: u8,
+    /// `inet->inet_saddr` of a bound socket; `None` takes the route's.
+    pub local_addr: Option<[u8; 4]>,
+    /// `inet->inet_num` of a bound socket, kept by `inet_hash_connect`; 0
+    /// picks an ephemeral port.
+    pub local_port: u16,
+    /// `sk->sk_bound_dev_if`: only this device's routes count and the
+    /// connection leaves through it; 0 routes freely.
+    pub oif: u32,
 }
 
 impl Default for ConnectOptions {
     fn default() -> Self {
-        Self { syn_retries: 6 }
+        Self {
+            syn_retries: 6,
+            local_addr: None,
+            local_port: 0,
+            oif: 0,
+        }
     }
 }
 
@@ -2092,7 +2113,16 @@ pub fn connect_start_in(
     remote_port: u16,
     options: ConnectOptions,
 ) -> Result<u32, i32> {
-    let iface = iface::for_dst_in(net_ns_id, remote_addr).ok_or(errno::ENETUNREACH as i32)?;
+    // `ip_route_connect(.., sk->sk_bound_dev_if, ..)`: a bound socket's
+    // device is its output device.
+    let iface = if options.oif != 0 {
+        iface::snapshot_all_in(net_ns_id)
+            .into_iter()
+            .find(|i| iface::ifindex_of(&i.name) == Some(options.oif))
+            .ok_or(errno::ENODEV as i32)?
+    } else {
+        iface::for_dst_in(net_ns_id, remote_addr).ok_or(errno::ENETUNREACH as i32)?
+    };
     // Resolve the ROUTE's next hop, not the interface's `gateway` field.
     //
     // Linux picks it in `ip_neigh_for_gw` (include/net/route.h): the route's
@@ -2114,24 +2144,61 @@ pub fn connect_start_in(
     // so a connect made while NetworkManager was between default routes
     // failed only after six ARP retries (curl: "Failed to connect ... after
     // 6060 ms") instead of at once.
-    let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(remote_addr))
-        .map(|r| r.nexthop.0)
-        .ok_or(errno::ENETUNREACH as i32)?;
+    let nexthop = if options.oif != 0 {
+        // `flowi4_oif`: only that device's routes, else on-link there.
+        crate::route::route_lookup_oif_in(
+            net_ns_id,
+            crate::ipv4::Ipv4Addr(remote_addr),
+            &iface.name,
+        )
+        .nexthop
+        .0
+    } else {
+        crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(remote_addr))
+            .map(|r| r.nexthop.0)
+            .ok_or(errno::ENETUNREACH as i32)?
+    };
     // `tcp_v4_connect` does not wait for the neighbour: an unresolved next
     // hop leaves the MAC zero, and the SYN queues on it in `emit_tcb_frame`.
     // Resolution failing reaches the socket as EHOSTUNREACH (`tcp_v4_err`).
-    let mac = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop).unwrap_or([0u8; 6]);
+    let mac = if options.oif != 0 {
+        crate::arp_cache::lookup(&iface.name, nexthop)
+    } else {
+        crate::tcp_stack::arp_cached_in(net_ns_id, nexthop)
+    }
+    .unwrap_or([0u8; 6]);
+    // A bound source address is kept (`inet->inet_saddr`).
+    let local_addr = options
+        .local_addr
+        .filter(|a| *a != [0; 4])
+        .unwrap_or(iface.ipv4);
     let id = fresh_tcb_id();
     // Port choice and index insertion are one step, so two racing connects
     // to the same destination cannot both take a free port.
     let (id, arc) = {
         let _bind = CONNECT_BIND_LOCK.lock();
-        let local_port = pick_local_port4(net_ns_id, iface.ipv4, remote_addr, remote_port)
-            .ok_or(errno::EADDRNOTAVAIL as i32)?;
-        let iss = secure_tcp_seq(net_ns_id, iface.ipv4, remote_addr, local_port, remote_port);
+        // `inet_hash_connect`: a bound port is kept unless its 4-tuple is
+        // taken (`__inet_check_established` → -EADDRNOTAVAIL).
+        let local_port = if options.local_port != 0 {
+            let key = conn_key(
+                net_ns_id,
+                remote_addr,
+                remote_port,
+                local_addr,
+                options.local_port,
+            );
+            if conn_index_lookup(key).is_some() {
+                return Err(errno::EADDRNOTAVAIL as i32);
+            }
+            options.local_port
+        } else {
+            pick_local_port4(net_ns_id, local_addr, remote_addr, remote_port)
+                .ok_or(errno::EADDRNOTAVAIL as i32)?
+        };
+        let iss = secure_tcp_seq(net_ns_id, local_addr, remote_addr, local_port, remote_port);
         let mut tcb = Tcb::new_active(
             id,
-            iface.ipv4,
+            local_addr,
             local_port,
             remote_addr,
             remote_port,
@@ -2140,6 +2207,7 @@ pub fn connect_start_in(
         )
         .with_net_ns(net_ns_id);
         tcb.nexthop = nexthop;
+        tcb.oif = options.oif;
         tcb.state = TcpState::SynSent;
         tcb.syn_retries = options.syn_retries.clamp(1, 127);
         install_tcb(tcb)
@@ -3113,6 +3181,11 @@ fn build_frame6(
 }
 
 fn iface_for_tcb(t: &Tcb) -> Option<crate::iface::NetIfaceSnapshot> {
+    if !t.is_ipv6 && t.oif != 0 {
+        return iface::snapshot_all_in(t.net_ns_id)
+            .into_iter()
+            .find(|i| iface::ifindex_of(&i.name) == Some(t.oif));
+    }
     if !t.is_ipv6 {
         return iface::for_dst_in(t.net_ns_id, t.remote_addr);
     }

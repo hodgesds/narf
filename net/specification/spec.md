@@ -1052,6 +1052,14 @@ an ICMP host unreachable — EHOSTUNREACH in SYN-SENT), forwarding, ICMP
 errors, ICMP echo requests and replies, and `ipv4::ipv4_send` all go through
 it; the former blocking `arp_resolve_in` / `arp::resolve_blocking` are gone,
 and `udp_sock::udp_send_from` no longer takes an ARP timeout.
+An IPv4 active open (`tcp::core::connect_start_in`) takes the socket's
+binding in `ConnectOptions { local_addr, local_port, oif }`, as
+`tcp_v4_connect` does: a bound address is the source, a bound port is kept
+(`inet_hash_connect`; a taken 4-tuple is `EADDRNOTAVAIL`), and with `oif`
+(SO_BINDTODEVICE) the route and next hop are that device's and every
+segment of the connection (`Tcb::oif`) leaves through it, resolving on its
+neighbour table (`tcp_stack::neigh_output_on`). An unknown device is
+`ENODEV`.
 A send bound to a device (SO_BINDTODEVICE) routes with that output device,
 as `flowi4_oif` does: `route::route_lookup_oif_in(ns, dst, oif)` considers
 only routes through `oif` and otherwise treats the destination as on-link

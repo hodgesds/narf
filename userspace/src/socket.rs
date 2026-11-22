@@ -10323,14 +10323,36 @@ impl SocketFile {
                         let is_loopback = (ip >> 24) == 127;
                         if !is_loopback {
                             let ip_bytes = ip.to_be_bytes();
-                            let syn_retries = self.options.lock().tcp_syncnt as u8;
+                            let (syn_retries, oif) = {
+                                let o = self.options.lock();
+                                (o.tcp_syncnt as u8, o.bindtodevice_index)
+                            };
+                            // `tcp_v4_connect`: a bound socket keeps its
+                            // address and port (`inet_saddr`, `inet_num`).
+                            let bound = match &*self.state.lock() {
+                                SocketState::InetListener {
+                                    addr,
+                                    port,
+                                    listening: false,
+                                    ..
+                                } => Some((*addr, *port)),
+                                _ => None,
+                            };
+                            let options = narf_net::tcp_stack::ConnectOptions {
+                                syn_retries,
+                                local_addr: bound
+                                    .map(|(a, _)| a.to_be_bytes())
+                                    .filter(|a| *a != [0; 4]),
+                                local_port: bound.map_or(0, |(_, p)| p),
+                                oif,
+                            };
                             // `tcp_v4_connect` sends the SYN and returns; the
                             // handshake is waited for (or not) by the caller.
                             match narf_net::tcp_stack::connect_start_in(
                                 self.net_ns_id(),
                                 ip_bytes,
                                 port,
-                                narf_net::tcp_stack::ConnectOptions { syn_retries },
+                                options,
                             ) {
                                 Ok(tcb_id) => {
                                     let r = self.inet_connect_begun(
@@ -10341,7 +10363,13 @@ impl SocketFile {
                                             peer_port: port,
                                         },
                                     );
-                                    if matches!(r, SocketOpResult::Err(SockError::InProgress)) {
+                                    // A bound port stays the socket's (its
+                                    // bind bucket); an autobind reservation
+                                    // the stack's own port choice replaced
+                                    // is given back.
+                                    if matches!(r, SocketOpResult::Err(SockError::InProgress))
+                                        && options.local_port == 0
+                                    {
                                         self.inet_tcp_release_port();
                                     }
                                     return r;
@@ -11565,7 +11593,10 @@ impl SocketFile {
                             self.net_ns_id(),
                             ip,
                             port,
-                            narf_net::tcp_stack::ConnectOptions { syn_retries },
+                            narf_net::tcp_stack::ConnectOptions {
+                                syn_retries,
+                                ..Default::default()
+                            },
                         ) {
                             Ok(tcb_id) => {
                                 let r = self.inet_connect_begun(
