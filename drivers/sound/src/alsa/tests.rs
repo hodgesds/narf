@@ -1360,3 +1360,61 @@ test!(alsa_hdmi_pcms_at_linux_device_numbers, {
     drop(f);
     crate::unregister_hardware_card(card);
 });
+
+/// Linux card->components and per-PCM names: snd_hda_codec_configure adds
+/// "HDA:vendor,subsystem,revision" per codec to the card's components, and
+/// patch_hdmi names its PCMs "HDMI 0", "HDMI 1", ... (the snd_pcm id and
+/// name). NARF reported no components and gave every PCM the card's id and
+/// name.
+#[derive(Debug)]
+struct NamedPcms;
+impl PcmDevice for NamedPcms {
+    fn open(&self, _: bool, _: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
+        Err(SoundError::NoSuchDevice)
+    }
+    fn pcm_devices(&self, capture: bool) -> Option<Vec<u32>> {
+        (!capture).then(|| alloc::vec![3, 7])
+    }
+    fn components(&self) -> Option<alloc::string::String> {
+        Some("HDA:1002aa01,00aa0100,00100800".into())
+    }
+    fn pcm_name(&self, capture: bool, device: u32) -> Option<alloc::string::String> {
+        let pcm = [3, 7].iter().position(|d| *d == device)?;
+        (!capture).then(|| alloc::format!("HDMI {}", pcm))
+    }
+}
+test!(alsa_card_components_and_pcm_names, {
+    let card = crate::register_hardware_card(
+        crate::CardInfo {
+            index: 0,
+            driver: "alsa-test",
+            id: "HDMI",
+            name: "HDA ATI HDMI",
+            playback_count: 2,
+            capture_count: 0,
+        },
+        Arc::new(NamedPcms),
+    );
+    let f = crate::devfs_bridge::SoundControlFile::new(card)
+        .open_instance_checked(true)
+        .unwrap()
+        .unwrap();
+    let m = Memory::new();
+    // SNDRV_CTL_IOCTL_CARD_INFO: components[128] at 248.
+    run(f.ioctl_user(command(b'U', 1, 2, 376), 0, &m)).unwrap();
+    let components = b"HDA:1002aa01,00aa0100,00100800\0";
+    assert_eq!(m.bytes.lock()[248..248 + components.len()], *components);
+    // SNDRV_CTL_IOCTL_PCM_INFO for device 7: id[64] at 16, name[80] at 80.
+    let mut info = alloc::vec![0; 288];
+    put32(&mut info, 0, 7);
+    m.put(512, &info);
+    ctl(f.as_ref(), &m, 0x31, 288, 512).unwrap();
+    let bytes = m.bytes.lock()[512..800].to_vec();
+    assert_eq!(bytes[16..23], *b"HDMI 1\0");
+    assert_eq!(bytes[80..87], *b"HDMI 1\0");
+    // /proc/asound/cardN/pcm7p/info.
+    let text = crate::procfs_bridge::render_pcm_info(card, 7, false);
+    assert!(text.contains("id: HDMI 1\nname: HDMI 1\n"));
+    drop(f);
+    crate::unregister_hardware_card(card);
+});

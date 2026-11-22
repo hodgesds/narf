@@ -4054,3 +4054,33 @@ kernel_test_in!(
     "audio/hda/hdmi-pcm",
     native_hda_hdmi_pcm_per_pin_at_linux_devices
 );
+
+/// Linux snd_hda_codec_configure adds "HDA:<vendor>,<subsystem>,<revision>"
+/// per codec to card->components (PipeWire's alsa.components:
+/// "HDA:1002aa01,00aa0100,00100800" for the RX 6750 XT's HDMI codec on
+/// this host), and patch_hdmi names PCM i "HDMI i" (`/proc/asound/pcm`:
+/// "00-07: HDMI 1 : HDMI 1 : playback 1"). NARF reported no components and
+/// named every PCM after the card.
+fn native_hda_components_and_hdmi_pcm_names() -> TestResult {
+    let fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    if card.components().as_deref() != Some("HDA:1002aa01,00000000,00100700") {
+        return TestResult::Fail("card components name each codec as Linux does");
+    }
+    if card.pcm_name(false, 3).as_deref() != Some("HDMI 0")
+        || card.pcm_name(false, 7).as_deref() != Some("HDMI 1")
+        || card.pcm_name(false, 0).is_some()
+        || card.pcm_name(true, 3).is_some()
+    {
+        return TestResult::Fail("HDMI PCMs are named HDMI 0, HDMI 1, ...");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pcm-names",
+    native_hda_components_and_hdmi_pcm_names
+);
