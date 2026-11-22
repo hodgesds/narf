@@ -63,6 +63,8 @@ fn expected_saves(
             (0xe48c, 1),
             (0xe4f4, 1),
         ],
+        // Mirrors the production table: no Gen11 reset tuning modeled.
+        GtPlatform::Gen11(_) => &[],
         GtPlatform::ArcticSoundM | GtPlatform::Alchemist => &[
             (0x20ec, 1),
             (0x83b4, 1),

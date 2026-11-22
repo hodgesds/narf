@@ -172,11 +172,21 @@ pub const GEN12_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS1_SPEC, VECS0_SP
 /// no other generation can be asked about — when a second
 /// generation lands, its (possibly different) set goes here,
 /// not in a second table somewhere else.
+///
+/// Gen11 maps to no engines yet, deliberately: ICL's engine
+/// mask is VCS0/VCS2/VECS0 (Linux `i915_pci.c::icl_info`) while
+/// the Gen12 table is VCS0/VCS1/VECS0 and there is no VCS2
+/// selector to express the Gen11 set. The Gen11 media table
+/// lands with the execlists lane, which models the engine set;
+/// until then the probe announce stays silent and `attach_media`
+/// is a no-op on Gen11 rather than claiming a VCS1 that does
+/// not exist on the part.
 pub fn media_engines_for(gen: RegionGeneration) -> &'static [EngineSpec] {
     match gen {
         RegionGeneration::Gen12 => &GEN12_MEDIA_ENGINES,
         // MTL's media engines sit on a separate media GT, not modelled.
         RegionGeneration::XeLpg => &[],
+        RegionGeneration::Gen11 => &[],
     }
 }
 
@@ -1051,6 +1061,15 @@ pub mod tests {
         }
         if media_engines_for(RegionGeneration::Gen12).len() != 3 {
             return TestResult::Fail("inventory for Gen12");
+        }
+        // Gen11 serves no media engines yet: its set is
+        // VCS0/VCS2/VECS0, which the Gen12 table cannot express
+        // (no VCS2 selector). Claiming the Gen12 set here would
+        // announce a VCS1 the part does not have.
+        if !media_engines_for(RegionGeneration::Gen11).is_empty() {
+            return TestResult::Fail(
+                "Gen11 media set must stay unmodelled until the execlists lane",
+            );
         }
         // Derived register addresses land in each engine's own
         // 0x4000 slot.

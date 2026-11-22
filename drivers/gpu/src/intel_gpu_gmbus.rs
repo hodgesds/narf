@@ -297,9 +297,14 @@ impl GmbusPinTable {
     pub const fn for_generation(generation: crate::intel_gpu::Generation) -> Self {
         use crate::intel_gpu::Generation;
         match generation {
-            Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
-                GmbusPinTable::Icp
-            }
+            // Ice Lake uses the ICP PCH pin table, as do TGL/RKL/
+            // ADL (all `>= PCH_ICP`). Gen11 GMBUS programming itself
+            // is a later lane's work; this arm only keeps the table
+            // selection honest now that the generation exists.
+            Generation::IceLake
+            | Generation::TigerLake
+            | Generation::RocketLake
+            | Generation::AlderLake => GmbusPinTable::Icp,
             Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
                 GmbusPinTable::Mtp
             }
@@ -2308,6 +2313,7 @@ pub mod tests {
         use crate::intel_gpu::Generation;
         if GmbusPinTable::for_generation(Generation::TigerLake) != GmbusPinTable::Icp
             || GmbusPinTable::for_generation(Generation::AlderLake) != GmbusPinTable::Icp
+            || GmbusPinTable::for_generation(Generation::IceLake) != GmbusPinTable::Icp
             || GmbusPinTable::for_generation(Generation::MeteorLake) != GmbusPinTable::Mtp
             || GmbusPinTable::for_generation(Generation::LunarLake) != GmbusPinTable::Mtp
         {

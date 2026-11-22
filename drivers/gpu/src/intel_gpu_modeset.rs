@@ -2141,9 +2141,11 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
                 None => ms.modeset(fb, None),
             }
         }
-        Generation::RocketLake | Generation::LunarLake | Generation::PantherLake => {
-            Err(ModesetError::UnsupportedGeneration)
-        }
+        // Gen11 display lands in Lane 4; no modeset is modeled yet.
+        Generation::IceLake
+        | Generation::RocketLake
+        | Generation::LunarLake
+        | Generation::PantherLake => Err(ModesetError::UnsupportedGeneration),
     };
     if let Ok(committed) = &result {
         // Per-modeset VRR/CMRR compute for the panel (#1771): a

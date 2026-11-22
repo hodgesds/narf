@@ -3,6 +3,40 @@
 /// Intel Corporation (PCI Special Interest Group ID).
 pub const INTEL_VENDOR: u16 = 0x8086;
 
+// Ice Lake (Gen11). Linux `include/drm/intel/pciids.h`
+// INTEL_ICL_IDS (15): PORT_F 8A50/8A52–8A54/8A56–8A5C/8A70/8A71
+// plus 8A51 and 8A5D.
+pub const ICL_8A50: u16 = 0x8A50;
+pub const ICL_8A51: u16 = 0x8A51;
+pub const ICL_8A52: u16 = 0x8A52;
+pub const ICL_8A53: u16 = 0x8A53;
+pub const ICL_8A54: u16 = 0x8A54;
+pub const ICL_8A56: u16 = 0x8A56;
+pub const ICL_8A57: u16 = 0x8A57;
+pub const ICL_8A58: u16 = 0x8A58;
+pub const ICL_8A59: u16 = 0x8A59;
+pub const ICL_8A5A: u16 = 0x8A5A;
+pub const ICL_8A5B: u16 = 0x8A5B;
+pub const ICL_8A5C: u16 = 0x8A5C;
+pub const ICL_8A5D: u16 = 0x8A5D;
+pub const ICL_8A70: u16 = 0x8A70;
+pub const ICL_8A71: u16 = 0x8A71;
+
+// Elkhart Lake (Gen11). Linux INTEL_EHL_IDS (6).
+pub const EHL_4541: u16 = 0x4541;
+pub const EHL_4551: u16 = 0x4551;
+pub const EHL_4555: u16 = 0x4555;
+pub const EHL_4557: u16 = 0x4557;
+pub const EHL_4570: u16 = 0x4570;
+pub const EHL_4571: u16 = 0x4571;
+
+// Jasper Lake (Gen11). Linux INTEL_JSL_IDS (5).
+pub const JSL_4E51: u16 = 0x4E51;
+pub const JSL_4E55: u16 = 0x4E55;
+pub const JSL_4E57: u16 = 0x4E57;
+pub const JSL_4E61: u16 = 0x4E61;
+pub const JSL_4E71: u16 = 0x4E71;
+
 // Tiger Lake (Gen12 Xe-LP) — public `pci.ids` Intel rows.
 pub const TGL_9A40: u16 = 0x9A40;
 pub const TGL_U_GT2_9A49: u16 = 0x9A49;
@@ -176,6 +210,16 @@ pub(crate) const ATSM_IDS: &[u16] = &[ATSM_56C0, ATSM_56C1, ATSM_56C2];
 /// uses Xe-LPG (different DDI / DPLL programming).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Generation {
+    /// Ice Lake / Elkhart Lake / Jasper Lake — Gen11. One
+    /// variant for the whole Gen11 family, following the
+    /// Raptor-Lake-under-AlderLake pattern: the GT/register
+    /// surface is shared and `asic` carries the product name
+    /// ("icelake" / "elkhartlake" / "jasperlake"). The GuC
+    /// firmware family is NOT shared (ICL takes `icl_guc`,
+    /// EHL/JSL take `ehl_guc`), so `GtPlatform` keeps a
+    /// distinct `Gen11` sub-platform per product (see
+    /// `intel_gpu_gt::Gen11Platform`).
+    IceLake,
     /// Tiger Lake — Gen12 Xe-LP. Conservative reference target.
     TigerLake,
     /// Rocket Lake — Gen12 Xe-LP GT with a distinct display-12 clock/port
@@ -238,6 +282,165 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
         did: 0x64b0,
         generation: Generation::LunarLake,
         asic: "lunarlake",
+    },
+    // Ice Lake (Gen11). Linux INTEL_ICL_IDS, in macro order.
+    DeviceEntry {
+        name: "intel-gpu-icl-8A50",
+        did: ICL_8A50,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A51",
+        did: ICL_8A51,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A52",
+        did: ICL_8A52,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A53",
+        did: ICL_8A53,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A54",
+        did: ICL_8A54,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A56",
+        did: ICL_8A56,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A57",
+        did: ICL_8A57,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A58",
+        did: ICL_8A58,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A59",
+        did: ICL_8A59,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A5A",
+        did: ICL_8A5A,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A5B",
+        did: ICL_8A5B,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A5C",
+        did: ICL_8A5C,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A5D",
+        did: ICL_8A5D,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A70",
+        did: ICL_8A70,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-icl-8A71",
+        did: ICL_8A71,
+        generation: Generation::IceLake,
+        asic: "icelake",
+    },
+    // Elkhart Lake (Gen11). Linux INTEL_EHL_IDS.
+    DeviceEntry {
+        name: "intel-gpu-ehl-4541",
+        did: EHL_4541,
+        generation: Generation::IceLake,
+        asic: "elkhartlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-ehl-4551",
+        did: EHL_4551,
+        generation: Generation::IceLake,
+        asic: "elkhartlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-ehl-4555",
+        did: EHL_4555,
+        generation: Generation::IceLake,
+        asic: "elkhartlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-ehl-4557",
+        did: EHL_4557,
+        generation: Generation::IceLake,
+        asic: "elkhartlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-ehl-4570",
+        did: EHL_4570,
+        generation: Generation::IceLake,
+        asic: "elkhartlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-ehl-4571",
+        did: EHL_4571,
+        generation: Generation::IceLake,
+        asic: "elkhartlake",
+    },
+    // Jasper Lake (Gen11). Linux INTEL_JSL_IDS.
+    DeviceEntry {
+        name: "intel-gpu-jsl-4E51",
+        did: JSL_4E51,
+        generation: Generation::IceLake,
+        asic: "jasperlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-jsl-4E55",
+        did: JSL_4E55,
+        generation: Generation::IceLake,
+        asic: "jasperlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-jsl-4E57",
+        did: JSL_4E57,
+        generation: Generation::IceLake,
+        asic: "jasperlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-jsl-4E61",
+        did: JSL_4E61,
+        generation: Generation::IceLake,
+        asic: "jasperlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-jsl-4E71",
+        did: JSL_4E71,
+        generation: Generation::IceLake,
+        asic: "jasperlake",
     },
     // Tiger Lake (Gen12 Xe-LP).
     DeviceEntry {

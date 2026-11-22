@@ -186,12 +186,17 @@ the canonical bit definition without re-deriving it.
 ### Stage 1 (landed) — PCI claim + presence test
 - `intel_gpu.rs`: vendor `0x8086`, class `0x03`, exact match table
   for documented Gen12 device IDs (TGL-U/H, ADL-S/P, RPL-S/P, MTL-P)
+  and Gen11 device IDs (ICL, EHL, JSL — identity + probe only),
   plus a class-match backstop that filters on vendor.
 - BAR0 (GTTMMADR) maps the unified MMIO + GTT window. BAR2 maps
   the stolen-memory frame-buffer aperture on iGPUs.
-- Presence test by reading `GMD_ID` (Graphics Media Device
-  Identifier, MMIO 0xD8C). All-ones / all-zeros means the BAR is
-  mapped but no silicon backs it.
+- Presence test is generation-aware. Gen12+ reads `GMD_ID`
+  (Graphics Media Device Identifier, MMIO 0xD8C) plus the
+  `MTCFG_TRBLK` cookie (0xFF8); all-ones means the BAR is mapped
+  but no silicon backs it. Pre-GMD Gen11 (Ice Lake / Elkhart
+  Lake / Jasper Lake) has no such registers, so its presence test
+  re-reads PCI config space (vendor/device dword, offset 0);
+  all-ones refuses, and `gmd_id` is `None`.
 - Records `BoundDriver { name: "intel-gpu", kind: Graphics }` on
   successful probe.
 
@@ -289,6 +294,9 @@ rules apply.
 
 | ASIC (`ChipInfo::asic`) | Device IDs |
 | ----------------------- | ---------- |
+| icelake (Gen11) | 8A50, 8A51, 8A52, 8A53, 8A54, 8A56, 8A57, 8A58, 8A59, 8A5A, 8A5B, 8A5C, 8A5D, 8A70, 8A71 |
+| elkhartlake (Gen11) | 4541, 4551, 4555, 4557, 4570, 4571 |
+| jasperlake (Gen11) | 4E51, 4E55, 4E57, 4E61, 4E71 |
 | lunarlake (Xe2-LPG; display 20 opt-in) | 6420, 64A0, 64B0 |
 | tigerlake (Gen12) | 9A40, 9A49, 9A59, 9A60, 9A68, 9A70, 9A78, 9AC0, 9AC9, 9AD9, 9AF8 |
 | rocketlake (Gen12 GT; display gated) | 4C80, 4C8A, 4C8B, 4C8C, 4C90, 4C9A |
@@ -334,6 +342,27 @@ execution may then start. DG1 local-memory geometry is not the DG2 flat-CCS
 layout, so BAR2 is retained but no VRAM pool is published. DG1 shares RKL's
 display-12 port/AUX mapping and has its own DG1 GMBUS/default-pin metadata,
 but no KMS route is admitted yet.
+
+Gen11 (Ice Lake / Elkhart Lake / Jasper Lake) is the first
+pre-Gen12 family admitted, identity + probe only (Gen11 Lane 1).
+Linux `include/drm/intel/pciids.h` supplies the exact 26-ID census
+(`INTEL_ICL_IDS` 15, `INTEL_EHL_IDS` 6, `INTEL_JSL_IDS` 5); one
+`Generation::IceLake` carries all three products (the
+Raptor-Lake-under-AlderLake pattern) with `asic` per product, while
+`GtPlatform::Gen11` keeps a sub-platform per product because the
+GuC firmware family differs: Ice Lake takes
+`i915/icl_guc_70.1.1.bin`, Elkhart/Jasper Lake take
+`i915/ehl_guc_70.1.1.bin`, both at minimum 70.1.1
+(`gt/uc/intel_uc_fw.c` `INTEL_GUC_FIRMWARE_DEFS`). Gen11 shares
+the Gen12 BAR0/GTT partitioning (`intel_uncore.c::__gen11_fw_ranges`),
+so its region table carries the verified Gen12 contents; it has a
+39-bit DMA mask (`i915_pci.c` GEN11_FEATURES) and the Gen9 GT
+forcewake ACK at 0x130044, and no HWCONFIG table (i915 requires
+graphics 12.55+). Gen11 predates GMD_ID, so Stage 1 presence
+re-reads PCI config space (all-ones refuses) instead of reading
+0xD8C/0xFF8, and `gmd_id` is `None` on Gen11. Display, external
+display, backlight, PTE format, execlists submission and GuC load
+stay gated: those are the Gen11 Lanes 2–8. Gen9 stays excluded (§6).
 
 Wildcat Lake IDs FD80/FD81 are exact `INTEL_WCL_IDS`. Linux deliberately binds
 them to the same `ptl_desc` as Panther Lake and selects the PTL GuC profile.
@@ -639,12 +668,15 @@ generation gates below.
 
 ## 6. Out of scope
 
-- **Gen9 (Skylake / Kaby Lake / Coffee Lake) and Gen11 (Ice
-  Lake / Jasper Lake / Elkhart Lake)** — explicitly out of scope.
-  No device IDs are listed for them and none will be added to
-  this driver: the codec layer is Gen12-shaped (combo-PHY DPLL,
-  universal planes), so those generations would need a separate
-  display model, not more table rows.
+- **Gen9 (Skylake / Kaby Lake / Coffee Lake)** — explicitly out
+  of scope. No device IDs are listed for it and none will be
+  added to this driver: the codec layer is Gen12-shaped
+  (combo-PHY DPLL, universal planes), so that generation would
+  need a separate display model, not more table rows. Gen11
+  (Ice Lake / Jasper Lake / Elkhart Lake) was excluded under this
+  bullet until Gen11 Lane 1 lifted it for identity + probe only
+  (26 IDs in §5); its display model is still a separate lane
+  programme, and display/GT execution stay gated after Lane 1.
 - Arrow Lake display — identification landed (#1023, §5);
   display support rides #1016's Xe-LPG family via the shared
   Meteor Lake classification, not a separate Arrow Lake path.

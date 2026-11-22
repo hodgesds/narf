@@ -109,6 +109,11 @@ impl GuCFirmware {
             // ADL spans different firmware families; an ambiguous generation
             // cannot choose ADL-P versus ADL-S/N's asset. Use PCI identity.
             Generation::AlderLake => return Err(FirmwareError::Unsupported),
+            // Gen11 spans different firmware families the same way
+            // (ICL takes `icl_guc`, EHL/JSL take `ehl_guc`); an
+            // ambiguous generation cannot choose. Use PCI identity
+            // (`open_for_platform` with the `Gen11` sub-platform).
+            Generation::IceLake => return Err(FirmwareError::Unsupported),
             _ => GtPlatform::Integrated(generation),
         };
         Self::open_for_platform(platform, authority)

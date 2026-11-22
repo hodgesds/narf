@@ -28,8 +28,10 @@
 //!
 //! ## Stage progression
 //!
-//! - **Stage 1** — PCI claim, BAR0 (GTTMMADR) mapping, presence
-//!   test against `GMD_ID`, bound-driver record.
+//! - **Stage 1** — PCI claim, BAR0 (GTTMMADR) mapping,
+//!   generation-aware presence test (`GMD_ID` on Gen12+,
+//!   PCI config-space re-read on pre-GMD Gen11), bound-driver
+//!   record.
 //! - **Stage 2** — Codec layer: GMBUS, DPLL, pipes, DDI, GTT
 //!   register-codecs in sibling `crate::intel_gpu_*` modules.
 //! - **Stage 3** — Modeset orchestrator takes over the firmware
@@ -40,7 +42,12 @@
 //!   and owns its scanout allocation; display programming is
 //!   gated to Gen12 — Meteor Lake / Panther Lake identify and
 //!   announce, but skip modeset (their display engines are
-//!   #1016's lane).
+//!   #1016's lane). Gen11 (Ice Lake / Elkhart Lake / Jasper
+//!   Lake) identifies and announces the same way — its BAR0
+//!   partitioning and GuC firmware family are modelled, its
+//!   presence test is the pre-GMD config-space re-read — but
+//!   display and GT execution stay gated until the Gen11 lanes
+//!   land (PTE format, execlists, display clocks, modeset).
 
 #[path = "intel_gpu_external_stop.rs"]
 pub(crate) mod external_stop;
@@ -67,17 +74,32 @@ const PCI_CLASS_DISPLAY: u8 = 0x03;
 impl Generation {
     /// Map the sub-architecture to the BAR0 region-enumeration
     /// generation. TGL / ADL / RPL share the Xe-LP MMIO map
-    /// (`RegionGeneration::Gen12`); Meteor Lake maps to the
-    /// Xe-LPG region table (#1016); Panther Lake's Xe3-LPD map
-    /// is not modelled yet.
+    /// (`RegionGeneration::Gen12`); Gen11 (ICL / EHL / JSL)
+    /// shares that partitioning (`__gen11_fw_ranges`) and maps
+    /// to its own `RegionGeneration::Gen11` table, whose contents
+    /// are the verified Gen12 table carried over; Meteor Lake maps
+    /// to the Xe-LPG region table (#1016); Panther Lake's Xe3-LPD
+    /// map is not modelled yet.
     pub const fn region_generation(self) -> Option<RegionGeneration> {
         match self {
+            Generation::IceLake => Some(RegionGeneration::Gen11),
             Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
                 Some(RegionGeneration::Gen12)
             }
             Generation::MeteorLake => Some(RegionGeneration::XeLpg),
             Generation::LunarLake | Generation::PantherLake => None,
         }
+    }
+
+    /// Whether the generation publishes the Xe-era `GMD_ID` /
+    /// `MTCFG_TRBLK` identification registers. Gen12+ does;
+    /// Gen11 predates GMD_ID, so what 0xD8C/0xFF8 read on
+    /// Gen11 silicon is ungrounded and must never be used as a
+    /// presence signal (a 0 read would pass the all-ones check
+    /// spuriously). Stage-1 presence for Gen11 re-reads PCI
+    /// config space instead.
+    pub const fn has_gmd_id(self) -> bool {
+        !matches!(self, Generation::IceLake)
     }
 
     /// Whether this lane programs the display engine for the
@@ -196,6 +218,40 @@ pub enum IntelGpuError {
     DeviceGone,
 }
 
+/// Pure Stage-1 presence decision, factored out of `bring_up` so
+/// the generation-aware rule is fixture-testable without MMIO
+/// hardware. `gmd` carries the (`GMD_ID`, `MTCFG_TRBLK`) pair and
+/// is `Some` only on generations that publish those registers;
+/// `config_id` carries the PCI config-space vendor/device dword
+/// and is only consulted on pre-GMD generations.
+///
+/// - Gen12+: the device is present iff neither identity read is
+///   all-ones (a mapped BAR over a gone device reads all-ones).
+///   Returns the `GMD_ID` value.
+/// - Gen11: the device is present iff the config-space re-read
+///   is not all-ones. The MMIO pair is ignored entirely — even
+///   all-ones `GMD_ID`/`MTCFG_TRBLK` values cannot refuse a
+///   Gen11 part, because those offsets predate GMD_ID and their
+///   Gen11 values are ungrounded. Returns `None`.
+fn stage1_presence(
+    generation: Generation,
+    gmd: Option<(u32, u32)>,
+    config_id: u32,
+) -> Result<Option<u32>, IntelGpuError> {
+    if generation.has_gmd_id() {
+        let (gmd_id, trblk) = gmd.ok_or(IntelGpuError::DeviceGone)?;
+        if gmd_id == 0xFFFF_FFFF || trblk == 0xFFFF_FFFF {
+            return Err(IntelGpuError::DeviceGone);
+        }
+        Ok(Some(gmd_id))
+    } else {
+        if config_id == 0xFFFF_FFFF {
+            return Err(IntelGpuError::DeviceGone);
+        }
+        Ok(None)
+    }
+}
+
 // ── Driver state ─────────────────────────────────────────────────
 
 /// The scanout allocation owned by the probed device. Before
@@ -218,8 +274,10 @@ pub struct IntelGpu {
     pub gtt_mmadr: MmioRegion,
     pub gmadr: MmioRegion,
     pub chip: ChipInfo,
-    /// `GMD_ID` value captured at probe time.
-    pub gmd_id: u32,
+    /// `GMD_ID` value captured at probe time. `None` on pre-GMD
+    /// generations (Gen11), which have no such register — see
+    /// `has_gmd_id` / `stage1_presence`.
+    pub gmd_id: Option<u32>,
     display_device: BusDevice,
     display_cap: Cap<BusDeviceCap, Write>,
     pub active_scanout: narf_lib::sync::IrqSafeSpinLock<Option<ActiveScanout>>,
@@ -257,7 +315,7 @@ impl core::fmt::Debug for IntelGpu {
 
 impl IntelGpu {
     /// Map BAR0 (GTTMMADR) and BAR2 (GMADR), identify the chip,
-    /// run a presence test against `GMD_ID`.
+    /// run a generation-aware presence test.
     ///
     /// # Safety
     /// Caller owns BAR0 + BAR2 exclusively for the duration of probe.
@@ -279,19 +337,27 @@ impl IntelGpu {
             // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { map_bar(device, BAR_GMADR) }.map_err(|_| IntelGpuError::BarMapFailed)?;
 
-        // Presence smoke test: read `GMD_ID`. All-ones means the
-        // BAR is mapped but the device isn't responding.
-        // SAFETY: identity-mapped MMIO.
-        let gmd_id = unsafe { gtt_mmadr.read32(GMD_ID) };
-        if gmd_id == 0xFFFF_FFFF {
-            return Err(IntelGpuError::DeviceGone);
-        }
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: same.
-        let trblk = unsafe { gtt_mmadr.read32(MTCFG_TRBLK) };
-        if trblk == 0xFFFF_FFFF {
-            return Err(IntelGpuError::DeviceGone);
-        }
+        // Presence smoke test, generation-aware (see
+        // `stage1_presence`). Gen12+ reads the Xe-era identity
+        // registers; pre-GMD Gen11 re-reads PCI config space —
+        // the GMD_ID / MTCFG_TRBLK offsets are never read on
+        // Gen11, where their values are ungrounded.
+        let gmd_id = if chip.generation.has_gmd_id() {
+            // SAFETY: identity-mapped MMIO.
+            let gmd = unsafe { gtt_mmadr.read32(GMD_ID) };
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: same.
+            let trblk = unsafe { gtt_mmadr.read32(MTCFG_TRBLK) };
+            stage1_presence(chip.generation, Some((gmd, trblk)), 0)?
+        } else {
+            // PCI config-space dword 0 (vendor ID + device ID). A
+            // device that has gone away answers config reads with
+            // all-ones; BAR0 mapping success is already established
+            // above. No MMIO semantics are invented for Gen11.
+            let config_id = narf_bus::pci::read_config32(cap, device, 0)
+                .map_err(|_| IntelGpuError::DeviceGone)?;
+            stage1_presence(chip.generation, None, config_id)?
+        };
 
         Ok(Self {
             gtt_mmadr,
@@ -322,7 +388,7 @@ impl IntelGpu {
         self.display_device.addr
     }
 
-    pub fn gmd_id(&self) -> u32 {
+    pub fn gmd_id(&self) -> Option<u32> {
         self.gmd_id
     }
 
@@ -690,14 +756,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         use core::fmt::Write as _;
         let bar0_phys = dev.gtt_mmadr.phys.raw();
         let region_count = dev.regions().len();
+        // Pre-GMD generations (Gen11) have no GMD_ID to print.
+        let gmd = match dev.gmd_id {
+            Some(v) => alloc::format!("{v:#010x}"),
+            None => alloc::string::String::from("none"),
+        };
         let _ = writeln!(
             narf_console::Writer,
-            "intel-gpu: detected {} (PCI {:04x}:{:04x}, gen={:?}, GMD_ID={:#010x}) BAR0={:#018x} regions={}",
+            "intel-gpu: detected {} (PCI {:04x}:{:04x}, gen={:?}, GMD_ID={}) BAR0={:#018x} regions={}",
             dev.chip.asic,
             dev.chip.vid,
             dev.chip.did,
             dev.chip.generation,
-            dev.gmd_id,
+            gmd,
             bar0_phys,
             region_count,
         );
@@ -1482,7 +1553,8 @@ pub fn with_controller<R>(f: impl FnOnce(&IntelGpu) -> R) -> Option<R> {
 pub(crate) struct DisplayInfo {
     pub gtt_mmadr: MmioRegion,
     pub chip: ChipInfo,
-    pub gmd_id: u32,
+    /// `GMD_ID`, or `None` on pre-GMD generations (Gen11).
+    pub gmd_id: Option<u32>,
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
 }
@@ -2861,6 +2933,32 @@ pub mod tests {
             (0x6420, "lunarlake"),
             (0x64a0, "lunarlake"),
             (0x64b0, "lunarlake"),
+            (0x8A50, "icelake"),
+            (0x8A51, "icelake"),
+            (0x8A52, "icelake"),
+            (0x8A53, "icelake"),
+            (0x8A54, "icelake"),
+            (0x8A56, "icelake"),
+            (0x8A57, "icelake"),
+            (0x8A58, "icelake"),
+            (0x8A59, "icelake"),
+            (0x8A5A, "icelake"),
+            (0x8A5B, "icelake"),
+            (0x8A5C, "icelake"),
+            (0x8A5D, "icelake"),
+            (0x8A70, "icelake"),
+            (0x8A71, "icelake"),
+            (0x4541, "elkhartlake"),
+            (0x4551, "elkhartlake"),
+            (0x4555, "elkhartlake"),
+            (0x4557, "elkhartlake"),
+            (0x4570, "elkhartlake"),
+            (0x4571, "elkhartlake"),
+            (0x4E51, "jasperlake"),
+            (0x4E55, "jasperlake"),
+            (0x4E57, "jasperlake"),
+            (0x4E61, "jasperlake"),
+            (0x4E71, "jasperlake"),
             (0x9A40, "tigerlake"),
             (0x9A49, "tigerlake"),
             (0x9A59, "tigerlake"),
@@ -3019,7 +3117,8 @@ pub mod tests {
         // Exact IDs only: nearby values outside Linux's family macros must
         // not bleed into a platform profile through an approximate range.
         for did in [
-            0x9A5Au16, 0x9ACA, 0x4C81, 0x46A4, 0x46B4, 0x46C4, 0xFD82, 0xD746,
+            0x9A5Au16, 0x9ACA, 0x4C81, 0x46A4, 0x46B4, 0x46C4, 0xFD82, 0xD746, 0x8A5E, 0x8A5F,
+            0x4572, 0x4E52,
         ] {
             if chip_info_for_pci_id(INTEL_VENDOR, did).is_some() {
                 return TestResult::Fail("unlisted DID present in table");
@@ -3218,6 +3317,20 @@ pub mod tests {
         {
             return TestResult::Fail("RKL must admit Gen12 GT regions while display stays gated");
         }
+        // Gen11 (Lane 1): identity + probe only. The BAR0 region
+        // map is admitted (Gen11 shares Gen12's partitioning) and
+        // the part is explicitly pre-GMD, but display, external
+        // display and backlight all stay gated until the display
+        // lanes land.
+        if Generation::IceLake.display_supported()
+            || Generation::IceLake.external_display_supported()
+            || Generation::IceLake.backlight_supported()
+            || Generation::IceLake.region_generation() != Some(RegionGeneration::Gen11)
+            || Generation::IceLake.has_gmd_id()
+            || !Generation::TigerLake.has_gmd_id()
+        {
+            return TestResult::Fail("Gen11 must admit regions while display and GMD stay gated");
+        }
         if !Generation::TigerLake.external_display_supported()
             || !Generation::AlderLake.external_display_supported()
             || Generation::MeteorLake.external_display_supported()
@@ -3314,6 +3427,130 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_arrowlake_classification);
+
+    /// Gen11 classification (Lane 1): all 26 IDs from Linux
+    /// `INTEL_ICL_IDS` / `INTEL_EHL_IDS` / `INTEL_JSL_IDS`
+    /// classify as `Generation::IceLake` under their product
+    /// ASIC, resolve to the Gen11 GT sub-platform with its GuC
+    /// firmware family, and stay display-gated. This pins the
+    /// whole set so a future reclassification — or arming the
+    /// Gen12 modeset against Gen11 silicon — fails here first.
+    fn smoke_icelake_classification() -> TestResult {
+        use crate::intel_gpu_gt::{Gen11Platform, GtPlatform};
+        const ICL_DIDS: &[u16] = &[
+            ICL_8A50, ICL_8A51, ICL_8A52, ICL_8A53, ICL_8A54, ICL_8A56, ICL_8A57, ICL_8A58,
+            ICL_8A59, ICL_8A5A, ICL_8A5B, ICL_8A5C, ICL_8A5D, ICL_8A70, ICL_8A71,
+        ];
+        const EHL_DIDS: &[u16] = &[EHL_4541, EHL_4551, EHL_4555, EHL_4557, EHL_4570, EHL_4571];
+        const JSL_DIDS: &[u16] = &[JSL_4E51, JSL_4E55, JSL_4E57, JSL_4E61, JSL_4E71];
+        for (dids, asic, platform, firmware) in [
+            (
+                ICL_DIDS,
+                "icelake",
+                GtPlatform::Gen11(Gen11Platform::IceLake),
+                "i915/icl_guc_70.1.1.bin",
+            ),
+            (
+                EHL_DIDS,
+                "elkhartlake",
+                GtPlatform::Gen11(Gen11Platform::ElkhartLake),
+                "i915/ehl_guc_70.1.1.bin",
+            ),
+            (
+                JSL_DIDS,
+                "jasperlake",
+                GtPlatform::Gen11(Gen11Platform::JasperLake),
+                "i915/ehl_guc_70.1.1.bin",
+            ),
+        ] {
+            for did in dids {
+                let info = match chip_info_for_pci_id(INTEL_VENDOR, *did) {
+                    Some(i) => i,
+                    None => return TestResult::Fail("Gen11 DID does not classify"),
+                };
+                if info.asic != asic {
+                    return TestResult::Fail("Gen11 DID classifies to the wrong ASIC");
+                }
+                if info.generation != Generation::IceLake {
+                    return TestResult::Fail("Gen11 DID must classify as IceLake");
+                }
+                if GtPlatform::from_pci(INTEL_VENDOR, *did) != Some(platform) {
+                    return TestResult::Fail("Gen11 DID resolves to the wrong GT platform");
+                }
+                match platform.guc() {
+                    Some(profile)
+                        if profile.firmware == firmware
+                            && profile.minimum_version == (70, 1, 1) => {}
+                    _ => return TestResult::Fail("Gen11 DID has the wrong GuC profile"),
+                }
+                // Lane 1 disposition: region map admitted, display
+                // and GT execution gated, pre-GMD presence.
+                if info.generation.display_supported()
+                    || info.generation.external_display_supported()
+                    || info.generation.backlight_supported()
+                    || info.generation.region_generation() != Some(RegionGeneration::Gen11)
+                    || info.generation.has_gmd_id()
+                {
+                    return TestResult::Fail("Gen11 disposition wrong after Lane 1");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu", smoke_icelake_classification);
+
+    /// Generation-aware Stage-1 presence (`stage1_presence`):
+    /// the Gen12 GMD path is unchanged, and the Gen11 path
+    /// refuses only on an all-ones config-space re-read — the
+    /// ungrounded MMIO pair cannot refuse a Gen11 part.
+    fn smoke_stage1_presence_generation_aware() -> TestResult {
+        // Gen12: a live GMD_ID + TRBLK pair passes; either
+        // all-ones refuses; a missing pair refuses.
+        if stage1_presence(
+            Generation::TigerLake,
+            Some((0x0001_2000, 0x0000_0001)),
+            0x9A49_8086,
+        ) != Ok(Some(0x0001_2000))
+        {
+            return TestResult::Fail("Gen12 live GMD pair must pass presence");
+        }
+        for gmd in [
+            Some((0xFFFF_FFFF, 0x0000_0001)),
+            Some((0x0001_2000, 0xFFFF_FFFF)),
+            Some((0xFFFF_FFFF, 0xFFFF_FFFF)),
+            None,
+        ] {
+            if stage1_presence(Generation::TigerLake, gmd, 0x9A49_8086)
+                != Err(IntelGpuError::DeviceGone)
+            {
+                return TestResult::Fail("Gen12 gone device must fail presence");
+            }
+        }
+        // Gen11: a live config-space dword passes with no GMD_ID;
+        // all-ones config refuses.
+        if stage1_presence(Generation::IceLake, None, 0x8A50_8086) != Ok(None) {
+            return TestResult::Fail("Gen11 live config re-read must pass presence");
+        }
+        if stage1_presence(Generation::IceLake, None, 0xFFFF_FFFF) != Err(IntelGpuError::DeviceGone)
+        {
+            return TestResult::Fail("Gen11 gone device must fail presence");
+        }
+        // The MMIO pair is ignored on Gen11 even when it reads
+        // all-ones — those offsets predate GMD_ID.
+        if stage1_presence(
+            Generation::IceLake,
+            Some((0xFFFF_FFFF, 0xFFFF_FFFF)),
+            0x8A50_8086,
+        ) != Ok(None)
+        {
+            return TestResult::Fail("Gen11 MMIO pair must not refuse presence");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_stage1_presence_generation_aware
+    );
 
     fn smoke_mtl_external_hook_pass_allocates_publishes_and_withdraws() -> TestResult {
         // Drives the production hook core (`mtl_external_pass`) over the

@@ -224,6 +224,67 @@ pub static GEN12_REGIONS: &[Region] = &[
     },
 ];
 
+/// Gen11 region map — Ice Lake / Elkhart Lake / Jasper Lake.
+///
+/// Contents are the verified Gen12 table carried over, not
+/// re-derived: Linux `intel_uncore.c::__gen11_fw_ranges` gives
+/// Gen11 and Gen12 the same partitioning (see the module header
+/// note), and the BAR0/GTT layout is the shared Gen8+ 16 MiB
+/// split (MMIO low half, GTT array at 0x80_0000). A distinct
+/// table — rather than aliasing `GEN12_REGIONS` — keeps a home
+/// for any Gen11 delta a later lane grounds, and keeps Gen11
+/// distinct in consumers that must not inherit Gen12 claims
+/// (notably the media-engine set, which differs: ICL is
+/// VCS0/VCS2/VECS0, not the Gen12 VCS0/VCS1/VECS0 set).
+pub static GEN11_REGIONS: &[Region] = &[
+    Region {
+        kind: RegionKind::Gunit,
+        offset: 0x0000_0000,
+        size: 0x0001_0000,
+    },
+    Region {
+        kind: RegionKind::Fuse,
+        offset: 0x0000_9000,
+        size: 0x0000_1000,
+    },
+    Region {
+        kind: RegionKind::Punit,
+        offset: 0x0013_8000,
+        size: 0x0000_8000,
+    },
+    Region {
+        kind: RegionKind::Gt,
+        offset: 0x0000_2000,
+        size: 0x0000_4000,
+    },
+    Region {
+        kind: RegionKind::Display,
+        offset: 0x0006_0000,
+        size: 0x0001_0000,
+    },
+    // GMBUS sits inside the display block on i915's map, but the
+    // Stage-2 codec carries it as its own register file (matching
+    // the i915 `gmbus.c` block) so the enumeration mirrors that.
+    Region {
+        kind: RegionKind::Gmbus,
+        offset: 0x000C_5100,
+        size: 0x0000_0040,
+    },
+    Region {
+        kind: RegionKind::Dpll,
+        offset: 0x0016_4280,
+        size: 0x0000_0040,
+    },
+    // GTT entry array — second half of BAR0. 8 MiB on Gen11 maps
+    // 1M PTEs × 8 bytes; the codec layer in `intel_gpu_gtt` writes
+    // into this region via `intel_gpu.bar0_offset(GTTADR_BASE)`.
+    Region {
+        kind: RegionKind::GttAdr,
+        offset: 0x0080_0000,
+        size: 0x0080_0000,
+    },
+];
+
 /// Xe-LPG region map — Meteor Lake (#1016).
 ///
 /// Deltas vs Gen12, each grounded in the MTL display register
@@ -292,13 +353,19 @@ pub static XE_LPG_REGIONS: &[Region] = &[
 
 /// Sub-architectures the Stage-0 enumeration covers. Tiger Lake /
 /// Alder Lake / Raptor Lake all share the Xe-LP register surface
-/// and are folded onto `GEN12_REGIONS`. Meteor Lake (Xe-LPG) has
-/// a different MMIO map — display block shifted down, Type-C
-/// port block where Gen12's DPLL block sits — and maps to
-/// `XE_LPG_REGIONS` (#1016). Panther Lake (Xe3-LPD) is not
-/// modelled.
+/// and are folded onto `GEN12_REGIONS`. Ice Lake / Elkhart Lake /
+/// Jasper Lake (Gen11) share Gen11/Gen12's partitioning
+/// (`__gen11_fw_ranges`) and map to `GEN11_REGIONS`, whose
+/// contents are the verified Gen12 table carried over — kept
+/// distinct so Gen11 never inherits a Gen12-only claim.
+/// Meteor Lake (Xe-LPG) has a different MMIO map — display block
+/// shifted down, Type-C port block where Gen12's DPLL block sits —
+/// and maps to `XE_LPG_REGIONS` (#1016). Panther Lake (Xe3-LPD)
+/// is not modelled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegionGeneration {
+    /// Gen11 — ICL / EHL / JSL. Same BAR0 partitioning as Gen12.
+    Gen11,
     /// Gen12 Xe-LP — TGL / ADL / RPL.
     Gen12,
     /// Xe-LPG — Meteor Lake.
@@ -308,6 +375,7 @@ pub enum RegionGeneration {
 /// Resolve the region table for a generation.
 pub const fn regions_for(gen: RegionGeneration) -> &'static [Region] {
     match gen {
+        RegionGeneration::Gen11 => GEN11_REGIONS,
         RegionGeneration::Gen12 => GEN12_REGIONS,
         RegionGeneration::XeLpg => XE_LPG_REGIONS,
     }
@@ -459,4 +527,58 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_region_kind_roundtrip);
+
+    fn smoke_gen11_regions_carry_gen12_partitioning() -> TestResult {
+        // Gen11's table is the verified Gen12 partitioning carried
+        // over (`__gen11_fw_ranges`): same regions, same bounds.
+        // A future Gen11 delta must change this table deliberately,
+        // not drift silently.
+        if GEN11_REGIONS.len() != GEN12_REGIONS.len() {
+            return TestResult::Fail("Gen11 region table drifted from Gen12");
+        }
+        for (a, b) in GEN11_REGIONS.iter().zip(GEN12_REGIONS.iter()) {
+            if a != b {
+                return TestResult::Fail("Gen11 region differs from the Gen12 table it carries");
+            }
+        }
+        for kind in [
+            RegionKind::Gt,
+            RegionKind::Display,
+            RegionKind::Gmbus,
+            RegionKind::Dpll,
+            RegionKind::Gunit,
+            RegionKind::Punit,
+            RegionKind::Fuse,
+            RegionKind::GttAdr,
+        ] {
+            if region_of(RegionGeneration::Gen11, kind).is_none() {
+                return TestResult::Fail("Gen11 region table missing a kind");
+            }
+        }
+        // Pipe A base (0x60000) lands in DISPLAY; GMBUS0 (0xC5100)
+        // in GMBUS; GTTADR is the second 8 MiB of a 16 MiB BAR0.
+        match region_at(RegionGeneration::Gen11, 0x6_0000) {
+            Some(r) if r.kind == RegionKind::Display => {}
+            _ => return TestResult::Fail("Gen11 DISPLAY region should contain pipe A base"),
+        }
+        match region_at(RegionGeneration::Gen11, 0xC_5100) {
+            Some(r) if r.kind == RegionKind::Gmbus => {}
+            _ => return TestResult::Fail("Gen11 GMBUS region should contain GMBUS0 offset"),
+        }
+        let r = region_of(RegionGeneration::Gen11, RegionKind::GttAdr).expect("GTTADR present");
+        if r.offset != 0x0080_0000 || r.size != 0x0080_0000 {
+            return TestResult::Fail("Gen11 GTTADR should be the second 8 MiB of BAR0");
+        }
+        const BAR0_LEN: u64 = 16 * 1024 * 1024;
+        for r in GEN11_REGIONS {
+            if r.end() > BAR0_LEN {
+                return TestResult::Fail("Gen11 region overflows BAR0 size");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_regions",
+        smoke_gen11_regions_carry_gen12_partitioning
+    );
 }

@@ -120,6 +120,11 @@ pub(crate) const GUC_GGTT_MIN: u32 = 8 * 1024 * 1024;
 pub enum GtPlatform {
     Integrated(Generation),
     Gen12(Gen12Platform),
+    /// Gen11 — Ice Lake / Elkhart Lake / Jasper Lake, pre-GMD.
+    /// Distinct from `Integrated(Generation::IceLake)`: the GuC
+    /// firmware family differs by product (see `Gen11Platform`),
+    /// and only the sub-platform selects the right blob.
+    Gen11(Gen11Platform),
     /// Wildcat Lake: PTL device descriptor/firmware, distinct 30.02 media
     /// and 30.03-30.05 graphics GMD contract.
     WildcatLake,
@@ -144,6 +149,20 @@ pub enum Gen12Platform {
     AlderLakeP,
     AlderLakeS,
     AlderLakeN,
+}
+
+/// Gen11 sub-platforms. The GT/register surface is shared across
+/// Ice Lake, Elkhart Lake and Jasper Lake (one `Generation::IceLake`),
+/// but the GuC firmware family is not: Ice Lake takes the `icl_guc`
+/// blob, Elkhart/Jasper Lake the `ehl_guc` blob
+/// (`gt/uc/intel_uc_fw.c`, Linux 7.4-rc2 `INTEL_GUC_FIRMWARE_DEFS`).
+/// The sub-platform is what selects the file, so it lives here —
+/// the same reason `Gen12Platform` exists for the Gen12 family.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Gen11Platform {
+    IceLake,
+    ElkhartLake,
+    JasperLake,
 }
 
 pub(crate) use crate::intel_gpu::{BMG_IDS, DG1_IDS, DG2_IDS};
@@ -211,7 +230,16 @@ impl GtPlatform {
                 "alderlake-n" => Some(Gen12Platform::AlderLakeN),
                 _ => None,
             };
-            return Some(family.map_or(Self::Integrated(entry.generation), Self::Gen12));
+            if let Some(family) = family {
+                return Some(Self::Gen12(family));
+            }
+            let gen11 = match entry.asic {
+                "icelake" => Some(Gen11Platform::IceLake),
+                "elkhartlake" => Some(Gen11Platform::ElkhartLake),
+                "jasperlake" => Some(Gen11Platform::JasperLake),
+                _ => None,
+            };
+            return Some(gen11.map_or(Self::Integrated(entry.generation), Self::Gen11));
         }
         if DG1_IDS.contains(&device) {
             Some(Self::Gen12(Gen12Platform::Dg1))
@@ -333,6 +361,9 @@ impl GtPlatform {
     pub(crate) const fn physical_bits(self) -> u32 {
         match self {
             Self::Gen12(_) => 39,
+            // Gen11: 39-bit DMA mask (`i915_pci.c` GEN11_FEATURES
+            // inherits GEN9/GEN8's `.dma_mask_size = 39`).
+            Self::Gen11(_) => 39,
             // Current Linux xe descriptors give every admitted post-Gen12
             // platform a 46-bit DMA mask. PTE address capacity is a separate
             // contract and must not widen DMA admission (notably DG2/BMG).
@@ -345,19 +376,29 @@ impl GtPlatform {
             | Self::Alchemist
             | Self::Battlemage => 46,
             Self::Integrated(
-                Generation::TigerLake | Generation::RocketLake | Generation::AlderLake,
+                Generation::TigerLake
+                | Generation::RocketLake
+                | Generation::AlderLake
+                | Generation::IceLake,
             ) => 39,
         }
     }
 
     /// xe_guc_hwconfig.c: only ADL-P among pre-XeHP families supplies a
     /// HWCONFIG table. Absence is a platform property, never a guessed table.
+    /// Gen11 has none either: i915's `intel_guc_hwconfig.c::has_table`
+    /// requires graphics 12.55+, and Gen11 is graphics 11.
     pub const fn has_hwconfig(self) -> bool {
+        if matches!(self, Self::Gen11(_)) {
+            return false;
+        }
         !matches!(self, Self::Gen12(family) if !matches!(family, Gen12Platform::AlderLakeP))
     }
 
     /// Graphics-GT forcewake ACK (xe_force_wake_init_gt / xe_gt_regs.h).
     /// Gfx 12.70+ moved the GT ACK; DG2 retains the earlier address.
+    /// Gen11 keeps the earlier address too: i915's
+    /// `FORCEWAKE_ACK_GT_GEN9` is 0x130044 (`intel_gt_regs.h`).
     pub const fn guc_forcewake_ack(self) -> Option<u64> {
         match self {
             Self::Integrated(
@@ -366,7 +407,9 @@ impl GtPlatform {
             | Self::WildcatLake
             | Self::NovaLakeS
             | Self::Battlemage => Some(0xdfc),
-            Self::ArcticSoundM | Self::Alchemist | Self::Gen12(_) => Some(0x130044),
+            Self::ArcticSoundM | Self::Alchemist | Self::Gen12(_) | Self::Gen11(_) => {
+                Some(0x130044)
+            }
             _ => None,
         }
     }
@@ -377,6 +420,19 @@ impl GtPlatform {
             Self::Gen12(Gen12Platform::Dg1) => ("i915/dg1_guc_70.bin", (70, 44, 1)),
             Self::Gen12(Gen12Platform::AlderLakeP) => ("i915/adlp_guc_70.bin", (70, 44, 1)),
             Self::Gen12(_) => ("i915/tgl_guc_70.bin", (70, 44, 1)),
+            // Gen11 GuC is old-format: the blob filename carries its
+            // full version and the embedded CSS version is that same
+            // 70.1.1 (`gt/uc/intel_uc_fw.c` INTEL_GUC_FIRMWARE_DEFS:
+            // ICL `guc_mmp(icl, 70, 1, 1)`, EHL/JSL
+            // `guc_mmp(ehl, 70, 1, 1)`). The minimum is the blob's
+            // own version — the same rule the TGL (70, 44, 1) pin
+            // follows for its major-only blob. GuC submission stays
+            // optional on Gen11 (execlists works without it); this
+            // profile only admits the firmware family for Lane 7.
+            Self::Gen11(Gen11Platform::IceLake) => ("i915/icl_guc_70.1.1.bin", (70, 1, 1)),
+            Self::Gen11(Gen11Platform::ElkhartLake | Gen11Platform::JasperLake) => {
+                ("i915/ehl_guc_70.1.1.bin", (70, 1, 1))
+            }
             Self::Integrated(Generation::MeteorLake) => ("i915/mtl_guc_70.bin", (70, 53, 0)),
             Self::ArcticSoundM | Self::Alchemist => ("i915/dg2_guc_70.bin", (70, 53, 0)),
             Self::Battlemage => ("xe/bmg_guc_70.bin", (70, 54, 0)),
@@ -447,6 +503,30 @@ mod tests {
                 GtPlatform::Integrated(Generation::MeteorLake),
                 "i915/mtl_guc_70.bin",
                 (70, 53, 0),
+            ),
+            (
+                0x8a50,
+                GtPlatform::Gen11(Gen11Platform::IceLake),
+                "i915/icl_guc_70.1.1.bin",
+                (70, 1, 1),
+            ),
+            (
+                0x8a71,
+                GtPlatform::Gen11(Gen11Platform::IceLake),
+                "i915/icl_guc_70.1.1.bin",
+                (70, 1, 1),
+            ),
+            (
+                0x4571,
+                GtPlatform::Gen11(Gen11Platform::ElkhartLake),
+                "i915/ehl_guc_70.1.1.bin",
+                (70, 1, 1),
+            ),
+            (
+                0x4e51,
+                GtPlatform::Gen11(Gen11Platform::JasperLake),
+                "i915/ehl_guc_70.1.1.bin",
+                (70, 1, 1),
             ),
             (
                 0x56a0,
@@ -550,6 +630,9 @@ mod tests {
             (GtPlatform::Gen12(Gen12Platform::AlderLakeP), true),
             (GtPlatform::Gen12(Gen12Platform::AlderLakeS), true),
             (GtPlatform::Gen12(Gen12Platform::AlderLakeN), true),
+            (GtPlatform::Gen11(Gen11Platform::IceLake), false),
+            (GtPlatform::Gen11(Gen11Platform::ElkhartLake), false),
+            (GtPlatform::Gen11(Gen11Platform::JasperLake), false),
             (GtPlatform::Integrated(Generation::MeteorLake), false),
             (GtPlatform::Integrated(Generation::LunarLake), false),
             (GtPlatform::Integrated(Generation::PantherLake), true),
@@ -566,6 +649,9 @@ mod tests {
         for (platform, bits) in [
             (GtPlatform::Gen12(Gen12Platform::TigerLake), 39),
             (GtPlatform::Gen12(Gen12Platform::Dg1), 39),
+            (GtPlatform::Gen11(Gen11Platform::IceLake), 39),
+            (GtPlatform::Gen11(Gen11Platform::ElkhartLake), 39),
+            (GtPlatform::Gen11(Gen11Platform::JasperLake), 39),
             (GtPlatform::Integrated(Generation::MeteorLake), 46),
             (GtPlatform::ArcticSoundM, 46),
             (GtPlatform::Alchemist, 46),
@@ -633,6 +719,24 @@ mod tests {
             || !GtPlatform::WildcatLake.is_ptl()
         {
             return TestResult::Fail("NVL-S Xe3 mechanics leaked PTL-only policy");
+        }
+        // Gen11: no HWCONFIG table (i915 requires graphics 12.55+)
+        // and the GT forcewake ACK is the Gen9 address 0x130044 —
+        // never the MTL 0xdfc. The pre-GMD identity read must not
+        // touch MMIO: Gen11 has no GMD_ID to sample.
+        for platform in [
+            GtPlatform::Gen11(Gen11Platform::IceLake),
+            GtPlatform::Gen11(Gen11Platform::ElkhartLake),
+            GtPlatform::Gen11(Gen11Platform::JasperLake),
+        ] {
+            if platform.has_hwconfig()
+                || platform.guc_forcewake_ack() != Some(0x130044)
+                || platform.is_gen12()
+                || platform.is_headless_integrated()
+                || platform.ppgtt_root_level() != 3
+            {
+                return TestResult::Fail("Gen11 GT profile");
+            }
         }
         TestResult::Pass
     }

@@ -177,6 +177,10 @@ impl ResetPolicy {
                         add(0xb020 + index * 4, 0); // Wa1607983814.
                     }
                 }
+                // Gen11: no platform reset tuning modeled yet; the
+                // common RCS0 entries above still apply. The Gen11
+                // set lands with the GT lanes.
+                GtPlatform::Gen11(_) => {}
                 GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                     add(0x20ec, 1);
                     add(0xe7cc, mcr);
