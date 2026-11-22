@@ -153,6 +153,26 @@ pub(crate) fn personality_exec(task: u64) {
     }
 }
 
+/// [`personality_exec`] for the image just loaded into `new_as`. An IA-32
+/// image (`AddressSpace::is_compat32_layout`) goes through
+/// `set_personality_ia32` instead, which leaves READ_IMPLIES_EXEC as it was,
+/// and then `elf_read_implies_exec` — `mmap_is_ia32() && executable_stack ==
+/// EXSTACK_DEFAULT` — sets it for an image without PT_GNU_STACK (recorded by
+/// the loader in `compat32::mm`).
+pub(crate) fn personality_exec_image(task: u64, new_as: &AddressSpace) {
+    #[cfg(target_arch = "x86_64")]
+    if new_as.is_compat32_layout() {
+        let wants = crate::compat32::mm::lookup(new_as.identity())
+            .is_some_and(|mm| mm.read_implies_exec);
+        if wants {
+            write_personality(task, read_personality(task) | READ_IMPLIES_EXEC);
+        }
+        return;
+    }
+    let _ = new_as;
+    personality_exec(task);
+}
+
 /// `fork(2)` inheritance: the child gets the parent's personality, as it
 /// gets the whole `task_struct` it was copied from.
 pub fn personality_fork(parent: u64, child: u64) {
@@ -2817,7 +2837,10 @@ fn do_execve_resolved(
 
     // Step 2: copy argv + envp — each a NUL-terminated array of
     // user-mode `char *`, walked until the first null pointer.
-    let argv_strs = match copy_user_strarr(argv_uptr, 1024) {
+    // An i386 execve/execveat (`compat_sys_execve`) passes arrays of 32-bit
+    // pointers.
+    let compat_arrays = ctx.in_ia32_syscall();
+    let argv_strs = match copy_user_strarr(argv_uptr, 1024, compat_arrays) {
         Some(v) => v,
         None => {
             // Faulting argv array pointer → EFAULT.
@@ -2825,7 +2848,7 @@ fn do_execve_resolved(
             return;
         }
     };
-    let envp_strs = match copy_user_strarr(envp_uptr, 4096) {
+    let envp_strs = match copy_user_strarr(envp_uptr, 4096, compat_arrays) {
         Some(v) => v,
         None => {
             // Faulting envp array pointer → EFAULT.
@@ -3168,8 +3191,9 @@ fn do_execve_resolved(
     sigaction_exec_reset(task);
     // `SET_PERSONALITY` on the new image: x86_64's clears READ_IMPLIES_EXEC
     // and keeps everything else, so ADDR_NO_RANDOMIZE survives the exec it
-    // was set for (`setarch -R prog`).
-    personality_exec(task);
+    // was set for (`setarch -R prog`). An IA-32 image takes
+    // `set_personality_ia32` and `elf_read_implies_exec` instead.
+    personality_exec_image(task, &new_proc.address_space);
     // The alternate signal stack, robust-list head, and clear_child_tid
     // uaddr all point into the OLD image's address space — Linux clears
     // all three on exec. A surviving sigaltstack sp would have the next
@@ -3858,21 +3882,26 @@ pub(crate) fn copy_user_cstr_checked(
 /// envp). Each element points to a C string copied via
 /// [`copy_user_cstr`]. Returns `None` on any copy fault or if
 /// the array doesn't terminate within `max_entries`.
+///
+/// `compat`: the array belongs to an i386 call, whose elements are 32-bit
+/// `compat_uptr_t` (`get_user_arg_ptr` under `in_compat_syscall()`).
 fn copy_user_strarr(
     arr_ptr: u64,
     max_entries: usize,
+    compat: bool,
 ) -> Option<alloc::vec::Vec<alloc::string::String>> {
     if arr_ptr == 0 {
         // POSIX permits argv=NULL to mean "no args"; envp=NULL
         // similarly. Treat as empty rather than rejecting.
         return Some(alloc::vec::Vec::new());
     }
+    let slot_len: usize = if compat { 4 } else { 8 };
     let mut out = alloc::vec::Vec::new();
     for i in 0..max_entries {
-        let slot_ptr = arr_ptr.checked_add((i as u64) * 8)?;
+        let slot_ptr = arr_ptr.checked_add((i as u64) * slot_len as u64)?;
         let mut slot_bytes = [0u8; 8];
         // SAFETY: SMAP bracket inside copy_from_user.
-        unsafe { copy_from_user(&mut slot_bytes, slot_ptr) }.ok()?;
+        unsafe { copy_from_user(&mut slot_bytes[..slot_len], slot_ptr) }.ok()?;
         let element_ptr = u64::from_le_bytes(slot_bytes);
         if element_ptr == 0 {
             // NULL terminator → end of array.

@@ -32,6 +32,7 @@ pub mod nr {
     pub const OPEN: u32 = 5;
     pub const CLOSE: u32 = 6;
     pub const UNLINK: u32 = 10;
+    pub const EXECVE: u32 = 11;
     pub const CHDIR: u32 = 12;
     pub const LSEEK: u32 = 19;
     pub const GETPID: u32 = 20;
@@ -100,6 +101,7 @@ pub mod nr {
     pub const PIPE2: u32 = 331;
     pub const PRLIMIT64: u32 = 340;
     pub const GETRANDOM: u32 = 355;
+    pub const EXECVEAT: u32 = 358;
     pub const STATX: u32 = 383;
     pub const ARCH_PRCTL: u32 = 384;
     pub const RSEQ: u32 = 386;
@@ -131,6 +133,11 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
     match nr {
         // kernel/exit.c
         EXIT => forward(ctx, Syscall::ExitTask),
+        // fs/exec.c: `compat_sys_execve` / `compat_sys_execveat` read argv and
+        // envp as 32-bit pointers (the native handler checks
+        // `in_ia32_syscall`); the image may be either class.
+        EXECVE => forward(ctx, Syscall::Execve),
+        EXECVEAT => forward_sx(ctx, Syscall::Execveat, 0b10001),
         EXIT_GROUP => forward(ctx, Syscall::ExitGroup),
         // fs/read_write.c, fs/open.c, fs/pipe.c, fs/file.c
         READ => forward(ctx, Syscall::Read),

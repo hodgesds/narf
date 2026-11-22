@@ -2825,6 +2825,16 @@ getuid/getgid/geteuid/getegid go through `high2lowuid` (65534 for an id
 past 16 bits); arch_prctl serves the CPUID and XSTATE-permission options
 and answers EINVAL for the rest; rseq is -ENOSYS.
 
+**Exec.** An i386 `execve` (11) / `execveat` (358) reads argv and envp as
+arrays of 32-bit pointers (`copy_user_strarr` with `compat` from
+`in_ia32_syscall()`); the image it loads may be of either class, and a
+64-bit task's `execve` of an i386 image loads it too (mixed exec). After a
+successful load, `personality_exec_image` applies `SET_PERSONALITY` for the
+image's class: a 64-bit image clears READ_IMPLIES_EXEC
+(`set_personality_64bit`); an IA-32 one keeps the word and sets
+READ_IMPLIES_EXEC when the image has no PT_GNU_STACK
+(`elf_read_implies_exec`, from `compat32::mm`).
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.
