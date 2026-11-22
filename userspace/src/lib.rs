@@ -163,6 +163,9 @@ mod abi_lookup_error_tests;
 mod abi_mem2_tests;
 mod abi_mem_tests;
 mod abi_misc_tests;
+// Network namespaces exist only in `--features container` builds.
+#[cfg(feature = "container")]
+mod abi_netns_lo_tests;
 mod abi_packet_tests;
 mod abi_pacman_tests;
 mod abi_path_tests;
