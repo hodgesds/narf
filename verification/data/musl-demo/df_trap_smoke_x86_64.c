@@ -8,7 +8,8 @@
 // Make the failure deterministic with an `int $0x80` uname: the kernel copies
 // the utsname out through REP MOVSB. Without the entry CLD that copy runs
 // backward into the arena prefix and leaves sysname incomplete. With the fix
-// it writes "NARF", returns success, and restores DF=1 to this user context;
+// it writes "Linux" (sys_uname reports the Linux ABI identity), returns
+// success, and restores DF=1 to this user context;
 // the inline asm then clears DF before returning to C.
 //
 // `int $0x80` is the i386 system-call ABI for every task (as on Linux): the
@@ -70,7 +71,7 @@ int main(void) {
         w("df-trap-fail: user DF not restored\n");
         return 1;
     }
-    if (memcmp(u->sysname, "NARF", 5) != 0) {
+    if (memcmp(u->sysname, "Linux", 6) != 0) {
         w("df-trap-fail: backward kernel copy\n");
         return 1;
     }
