@@ -2947,6 +2947,133 @@ fn smoke_arp_reply_leaves_the_ingress_device() -> TestResult {
 }
 kernel_test_in!("net/arp-ingress", smoke_arp_reply_leaves_the_ingress_device);
 
+// ── SO_BINDTODEVICE: route, source and neighbour on the bound device ────────
+//
+// Linux `udp_sendmsg` → `ip_route_output_flow` with `flowi4_oif =
+// sk->sk_bound_dev_if`. `fib_lookup` takes only a route through that device
+// (`fib_lookup_good_nhc`: `flp->flowi4_oif != nhc->nhc_oif` → skip), so a
+// datagram bound to the second NIC goes to THAT NIC's gateway even when the
+// first NIC's default route has the better metric, and the next hop is
+// resolved on the bound device (`ip_neigh_for_gw(rt, ...)` looks up the
+// neighbour on `rt->dst.dev`; `arp_solicit` sends the request from it). NARF
+// sent on the bound NIC but took the next hop from the unbound lookup and
+// resolved it on whichever NIC `for_dst` picked, so the queued frame waited
+// for a reply that could only arrive on the other NIC.
+fn smoke_udp_bound_device_routes_and_resolves_on_that_device() -> TestResult {
+    use crate::pkt::{write_arp, ArpPacket, ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP};
+    const A: &str = "e2e-bdev-a";
+    const B: &str = "e2e-bdev-b";
+    const A_IP: [u8; 4] = [10, 32, 3, 165];
+    const A_GW: [u8; 4] = [10, 32, 3, 1];
+    const B_IP: [u8; 4] = [10, 32, 1, 211];
+    const B_GW: [u8; 4] = [10, 32, 1, 254];
+    const B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x32, 0x0b];
+    const B_GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x32, 0xfe];
+    const DST: [u8; 4] = [9, 9, 9, 9];
+    static B_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+    fn capture_b(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn default_via(iface: &str, gateway: [u8; 4], metric: u32) {
+        route::route_add(route::Route {
+            net_ns_id: 0,
+            dst: route::Ipv4Net {
+                addr: Ipv4Addr([0; 4]),
+                prefix_len: 0,
+            },
+            gateway: Some(Ipv4Addr(gateway)),
+            iface: alloc::string::String::from(iface),
+            src_hint: None,
+            metric,
+            scope: route::Scope::Universe,
+            table: route::TABLE_MAIN,
+            protocol: route::RTPROT_KERNEL,
+        });
+    }
+    let is_arp = |f: &Vec<u8>| f.len() >= ETH_HDR_LEN + 28 && f[12..14] == ETHERTYPE_ARP.to_be_bytes();
+    let is_udp = |f: &Vec<u8>| {
+        f.len() >= ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
+            && f[12..14] == ETHERTYPE_IPV4.to_be_bytes()
+            && f[ETH_HDR_LEN + 9] == IP_PROTO_UDP
+    };
+
+    full_reset(A, A_IP, A_GW);
+    iface::register(B, B_MAC, capture_b);
+    iface::set_link_state(B, true);
+    iface::set_iface_ipv4_fields(B, B_IP, B_GW);
+    iface::add_addr(B, B_IP, 22);
+    default_via(A, A_GW, 100);
+    default_via(B, B_GW, 600);
+    let Some(b_index) = iface::ifindex_of(B) else {
+        return TestResult::Fail("second test device has no ifindex");
+    };
+    drain_captured();
+    B_TX.lock().clear();
+
+    let payload = b"bound-to-b";
+    let opts = UdpOptions {
+        bind_to_device: b_index,
+        ..UdpOptions::default()
+    };
+    let sent =
+        crate::udp_sock::udp_send_from(0, 49170, SocketAddrV4::new(DST, 53), payload, &opts, None);
+    if sent != Ok(payload.len()) {
+        return TestResult::Fail("bound UDP send to an unresolved next hop was not accepted");
+    }
+    let on_a = drain_captured();
+    let on_b = ::core::mem::take(&mut *B_TX.lock());
+    if on_a.iter().any(|f| is_arp(f) || is_udp(f)) {
+        return TestResult::Fail("a send bound to B put frames on A");
+    }
+    let Some(request) = on_b.iter().find(|&f| is_arp(f)) else {
+        return TestResult::Fail("the bound device's next hop was not resolved on that device");
+    };
+    let arp = &request[ETH_HDR_LEN..];
+    if u16::from_be_bytes([arp[6], arp[7]]) != ARP_OP_REQUEST
+        || arp[8..14] != B_MAC
+        || arp[14..18] != B_IP
+        || arp[24..28] != B_GW
+    {
+        return TestResult::Fail("ARP request is not for B's gateway from B's address");
+    }
+
+    // B's gateway answers on B: the queued datagram leaves B, to it.
+    let mut reply = [0u8; 28];
+    let _ = write_arp(
+        &mut reply,
+        &ArpPacket {
+            op: ARP_OP_REPLY,
+            sha: B_GW_MAC,
+            spa: B_GW,
+            tha: B_MAC,
+            tpa: B_IP,
+        },
+    );
+    crate::tcp_stack::handle_arp_on_in(&reply, 0, Some(B));
+    let on_b = ::core::mem::take(&mut *B_TX.lock());
+    let Some(frame) = on_b.iter().find(|&f| is_udp(f)) else {
+        return TestResult::Fail("ARP reply on B did not release the bound datagram");
+    };
+    let ip = &frame[ETH_HDR_LEN..];
+    if frame[..6] != B_GW_MAC
+        || frame[6..12] != B_MAC
+        || ip[12..16] != B_IP
+        || ip[16..20] != DST
+        || frame[ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN..] != *payload
+    {
+        return TestResult::Fail("bound datagram is not B's, to B's gateway");
+    }
+    if drain_captured().iter().any(is_udp) {
+        return TestResult::Fail("bound datagram also left A");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/udp-bound-dev",
+    smoke_udp_bound_device_routes_and_resolves_on_that_device
+);
+
 fn smoke_udp_pending_datagram_dropped_on_iface_namespace_move() -> TestResult {
     const IFACE: &str = "e2e-udp-netns-move";
     const LOCAL_IP: [u8; 4] = [10, 24, 0, 15];
