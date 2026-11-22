@@ -269,9 +269,16 @@ pub fn snapshot() -> Vec<Ipv6IfAddrSnapshot> {
 /// every configured address, with the device's ifindex, its
 /// [`ipv6_addr_scope`] and the low byte of its [`ifa_flags`].
 pub fn snapshot_in(net_ns_id: u64) -> Vec<Ipv6IfAddrSnapshot> {
+    // A namespace's own `lo` holds `::1` only while it is up
+    // (`init_loopback` on NETDEV_UP, `addrconf_ifdown` on NETDEV_DOWN), as
+    // the RTM_GETADDR dump reports; the initial namespace's `lo` is up.
+    let loopback_up =
+        net_ns_id == 0 || crate::iface::namespace_loopback(net_ns_id).is_none_or(|lo| lo.up);
     // Copy the table out before resolving ifindexes: the interface registry
     // has its own lock, which is never taken under ADDRS.
-    let entries: Vec<Ipv6IfAddr> = core::iter::once(loopback_ifaddr())
+    let entries: Vec<Ipv6IfAddr> = loopback_up
+        .then(loopback_ifaddr)
+        .into_iter()
         .chain(
             ADDRS
                 .lock()
