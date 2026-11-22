@@ -4499,8 +4499,8 @@ pub fn with_controller<R>(index: usize, f: impl FnOnce(&Igb) -> R) -> Option<R> 
 pub(crate) fn rx_task_specs(
     cpu: u32,
 ) -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
-    let _ = cpu;
-    (narf_scheduler::TaskSpec::unthrottled(), None)
+    let pump = narf_net::napi::rx_pump_spec(cpu);
+    (pump, narf_net::napi::rx_deferral_spec(cpu))
 }
 
 fn spawn_tx_pump(device: Arc<Igb>, tx_cons: Consumer<Frame, TX_RING_N>) {
@@ -4509,11 +4509,23 @@ fn spawn_tx_pump(device: Arc<Igb>, tx_cons: Consumer<Frame, TX_RING_N>) {
     // shares the `rx_head` lock with the synchronous `igb_rx_pump_step`
     // busy-wait drain, so the two never double-consume a descriptor.
     // Probe programmed the vector to the CPU it runs on (`try_enable_msix`).
-    let (spec, _deferral) = rx_task_specs(narf_lib::percpu::current_cpu() as u32);
+    let (spec, deferral) = rx_task_specs(narf_lib::percpu::current_cpu() as u32);
+    let handoff = Arc::new(narf_net::napi::SoftirqHandoff::new());
+    let deferral_task = deferral.is_some();
+    if let Some(deferral) = deferral {
+        let d = device.clone();
+        let handoff = handoff.clone();
+        narf_scheduler::spawn_with_spec(
+            async move {
+                igb_rx_deferral(d, handoff).await;
+            },
+            deferral,
+        );
+    }
     let d_rx = device.clone();
     narf_scheduler::spawn_with_spec(
         async move {
-            igb_rx_pump(d_rx).await;
+            igb_rx_pump(d_rx, deferral_task, handoff).await;
         },
         spec,
     );
@@ -4530,8 +4542,47 @@ fn spawn_tx_pump(device: Arc<Igb>, tx_cons: Consumer<Frame, TX_RING_N>) {
     narf_net::watchdog::DevWatchdog::start_for_device(weak, TX_TIMEOUT_NS);
 }
 
-async fn igb_rx_pump(device: Arc<Igb>) {
-    const RX_DRAIN_BUDGET: usize = 64;
+/// Frames one NAPI poll hands to the stack (the NAPI weight).
+const RX_DRAIN_BUDGET: usize = narf_net::napi::DEFAULT_BUDGET as usize;
+
+/// One NAPI poll (`igb_poll` -> `igb_clean_rx_irq`): dispatch each
+/// completed frame straight out of its RX DMA page into the kernel stack
+/// through the same unified in-place drain the synchronous
+/// `igb_rx_pump_step` uses, so the async pump and the busy-wait drain never
+/// race for a descriptor. Returns the frames and whether the poll used its
+/// whole budget (work may be left).
+fn igb_napi_poll(device: &Igb) -> (u32, bool) {
+    let drained = device.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| {
+        narf_net::iface::on_rx_frame_from(device.ifname(), frame);
+    });
+    (drained as u32, drained == RX_DRAIN_BUDGET)
+}
+
+/// `igb_poll` once a poll did not use its budget: `napi_complete_done` and
+/// `igb_ring_irq_enable` re-enable the vector (EIAM masked it when it
+/// fired). Returns whether a frame completed meanwhile.
+fn igb_napi_done(device: &Igb) -> bool {
+    device.rearm_msix();
+    device.rx_has_pending()
+}
+
+/// The receive deferral task (ksoftirqd): takes the ring over when the
+/// pump's softirq run ends with work left, polls it in bounded runs while
+/// sharing the CPU, and hands it back once a poll leaves budget unused.
+async fn igb_rx_deferral(device: Arc<Igb>, handoff: Arc<narf_net::napi::SoftirqHandoff>) {
+    loop {
+        handoff.taken().await;
+        let poll = || igb_napi_poll(&device);
+        narf_net::napi::deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
+    }
+}
+
+async fn igb_rx_pump(
+    device: Arc<Igb>,
+    deferral_task: bool,
+    handoff: Arc<narf_net::napi::SoftirqHandoff>,
+) {
+    use narf_net::napi::{deferral_run, softirq_run, SoftirqEnd};
     const IRQ_FALLBACK_MS: u64 = 10;
     let poll_fallback_cycles = narf_time::ns_to_cycles(1_000_000);
 
@@ -4556,21 +4607,24 @@ async fn igb_rx_pump(device: Arc<Igb>) {
                 narf_time::Deadline::after_ms(IRQ_FALLBACK_MS),
             )
         });
-        // Dispatch each completed frame straight out of its RX DMA page
-        // into the kernel stack through the same unified in-place drain the
-        // synchronous `igb_rx_pump_step` uses, so the async pump and the
-        // busy-wait drain never race for a descriptor.
-        let drained = device.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| {
-            narf_net::iface::on_rx_frame_from(device.ifname(), frame);
-        });
-        if drained == RX_DRAIN_BUDGET {
-            narf_scheduler::yield_now().await;
-            continue;
-        }
-
-        device.rearm_msix();
-        if device.rx_has_pending() {
-            narf_scheduler::yield_now().await;
+        // One softirq run: polls ahead of the CPU's tasks until one leaves
+        // budget unused and the vector is re-enabled, or until the softirq
+        // bound, when the deferral task takes the ring with the vector
+        // still masked.
+        let end = softirq_run(
+            || igb_napi_poll(&device),
+            || igb_napi_done(&device),
+            &handoff,
+            narf_time::monotonic_ns,
+        )
+        .await;
+        if end == SoftirqEnd::Deferred {
+            if deferral_task {
+                handoff.returned().await;
+            } else {
+                let poll = || igb_napi_poll(&device);
+                deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
+            }
             continue;
         }
         match irq_waiter {
