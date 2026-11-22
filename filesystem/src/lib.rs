@@ -3046,6 +3046,15 @@ pub trait FsInstance: Send + Sync + 'static {
         super_magic::for_fs_type(self.fs_type())
     }
 
+    /// The inode number of the directory above this mount's root inside its
+    /// filesystem — `parent_ino(mnt_root)`, what `..` at the mount's root
+    /// lists. A filesystem mounted at its own root has none (its root dentry
+    /// is its own parent), which is the default `NotFound`; a bind of a
+    /// subdirectory answers with the directory above it.
+    fn root_parent_ino<'a>(&'a self) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::NotFound) })
+    }
+
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
     /// conservative default used before this interface existed.
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
@@ -5608,6 +5617,29 @@ impl FsInstance for BindMount {
     }
     fn fs_type(&self) -> &str {
         self.source.fs_type()
+    }
+    /// The bound directory's parent in the source filesystem: walk to it from
+    /// the source's root, or ask the source when this binds its root.
+    fn root_parent_ino<'a>(&'a self) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            let base = self.source.show_root();
+            let rel = self
+                .root_path
+                .strip_prefix(base.trim_end_matches('/'))
+                .unwrap_or("");
+            let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+            if components.pop().is_none() {
+                return self.source.root_parent_ino().await;
+            }
+            let mut dir = self.source.root();
+            for component in components {
+                dir = dir.lookup_dir_async(component).await?;
+            }
+            match dir.ino() {
+                0 => Err(FsError::NotFound),
+                ino => Ok(ino),
+            }
+        })
     }
     /// A bind is the source's superblock: `statfs_by_dentry` reaches the
     /// same `->statfs` through either path.

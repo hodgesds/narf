@@ -58,9 +58,10 @@ const DOT_ENTRIES: usize = 2;
 ///
 /// `dir_emit_dots` reports `file_inode(file)->i_ino` for `.` and
 /// `parent_ino(dentry)` — the inode of `d_parent` — for `..`. A filesystem
-/// root's dentry is its own parent, so at the root of a mount `..` is the
-/// directory itself; anywhere else it is the directory above it, which is in
-/// the same filesystem. Filesystems whose on-disk format holds the two
+/// root's dentry is its own parent, so at a mount of a filesystem's root `..`
+/// is the directory itself; at a bind of a subdirectory it is the directory
+/// above that in the filesystem (`FsInstance::root_parent_ino`); anywhere
+/// else it is the directory above it, which is in the same filesystem. Filesystems whose on-disk format holds the two
 /// entries (ext2, a FAT subdirectory) report the same numbers. A directory
 /// with no inode number of its own keeps the position placeholder the other
 /// records use, so `d_ino` is never the 0 glibc's readdir skips.
@@ -72,18 +73,22 @@ fn dot_inos(
         0 => 1,
         ino => ino,
     };
-    let parent = path
-        .filter(|path| *path != "/" && !current_path_is_mount_root(path))
-        .and_then(|path| {
-            let parent = match path.trim_end_matches('/').rsplit_once('/') {
-                Some(("", _)) => "/",
-                Some((parent, _)) => parent,
-                None => return None,
-            };
-            stat_ino_path_dir_aware(parent).ok().map(|stat| stat.1)
-        })
-        .filter(|ino| *ino != 0);
-    (own, parent.unwrap_or(own))
+    let parent = path.and_then(|path| {
+        let mount_root = current_covering_mount_info(path).is_some_and(|(mount, _)| mount == path);
+        if path == "/" || mount_root {
+            // A mount root's parent is inside its filesystem: none for the
+            // filesystem's own root, the bound directory's parent for a bind.
+            let fs = current_fs_arc_at(path)?;
+            return poll_blocking(fs.root_parent_ino()).and_then(Result::ok);
+        }
+        let parent = match path.trim_end_matches('/').rsplit_once('/') {
+            Some(("", _)) => "/",
+            Some((parent, _)) => parent,
+            None => return None,
+        };
+        stat_ino_path_dir_aware(parent).ok().map(|stat| stat.1)
+    });
+    (own, parent.filter(|ino| *ino != 0).unwrap_or(own))
 }
 
 /// Shared native implementation for x86_64 getdents and both architectures'
