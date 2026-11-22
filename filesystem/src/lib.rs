@@ -5520,8 +5520,25 @@ impl MountNamespace {
 /// vanishes and later targets cannot be created — but rebuilding it on each
 /// reset yields a fresh, empty MemFs that has lost every directory made so
 /// far. Re-mounting the SAME instance keeps the tree across resets.
+///
+/// The directory is made in the initial namespace's view of `path`. A
+/// caller in a private mount namespace makes it in its own view instead,
+/// with [`__test_ensure_writable_root`] and [`__test_make_dirs`].
 #[doc(hidden)]
 pub fn __test_ensure_mount_target(path: &str) {
+    __test_ensure_writable_root();
+    // Create the directory inside the mount that COVERS the path, not in the
+    // root filesystem. A target under an existing mount (mounting at
+    // "/cjail/x" when a tmpfs is mounted at "/cjail") would otherwise be
+    // created in the root and immediately shadowed, so the handler's own
+    // lookup would still not find it.
+    registry().resolve_absolute(path, __test_make_dirs);
+}
+
+/// Test support: the writable root [`__test_ensure_mount_target`] mounts at
+/// "/" in the initial namespace, if it is not mounted there already.
+#[doc(hidden)]
+pub fn __test_ensure_writable_root() {
     static ROOT_FS: IrqSafeSpinLock<Option<Arc<dyn FsInstance>>> = IrqSafeSpinLock::new(None);
 
     // The kernel-test image DOES have a root: `boot-initramfs`, and it is
@@ -5562,25 +5579,24 @@ pub fn __test_ensure_mount_target(path: &str) {
         let auth = bootstrap_mount_authority();
         let _ = registry().mount_arc(&auth, "/", fs);
     }
+}
 
-    // Create the directory inside the mount that COVERS the path, not in the
-    // root filesystem. A target under an existing mount (mounting at
-    // "/cjail/x" when a tmpfs is mounted at "/cjail") would otherwise be
-    // created in the root and immediately shadowed, so the handler's own
-    // lookup — longest-prefix-first — would still not find it.
-    registry().resolve_absolute(path, |fs, rel| {
-        let mut dir = fs.root();
-        for comp in rel.split('/').filter(|c| !c.is_empty()) {
-            if let Some(d) = dir.lookup_dir(comp) {
-                dir = d;
-                continue;
-            }
-            match crate::procfs::poll_once(dir.mkdir(comp)) {
-                Some(Ok(d)) => dir = d,
-                _ => return,
-            }
+/// Test support: make each missing directory of `rel` below the root of
+/// `fs`, the mount a walk of the target reaches. An existing directory is
+/// left as it is.
+#[doc(hidden)]
+pub fn __test_make_dirs(fs: &dyn FsInstance, rel: &str) {
+    let mut dir = fs.root();
+    for comp in rel.split('/').filter(|c| !c.is_empty()) {
+        if let Some(d) = dir.lookup_dir(comp) {
+            dir = d;
+            continue;
         }
-    });
+        match crate::procfs::poll_once(dir.mkdir(comp)) {
+            Some(Ok(d)) => dir = d,
+            _ => return,
+        }
+    }
 }
 
 pub fn bootstrap_mount_authority() -> Cap<MountPoint, Grant> {

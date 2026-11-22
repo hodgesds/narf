@@ -1220,9 +1220,10 @@ leaves it queued; a Block Ack policy subframe on a TID with no agreement
 queues one recipient DELBA (WLAN_REASON_QSTA_REQUIRE_SETUP) per TID until an
 agreement activates again (mac80211 `ieee80211_rx_reorder_ampdu`,
 `unexpected_agg`). Only a pairwise (PTK) EAPOL exchange retires the
-transmit and recipient agreements, as `ieee80211_pairwise_rekey` does;
-each recipient agreement then ends with a DELBA to the AP
-(WLAN_REASON_QSTA_LEAVE_QBSS). A Group Key Handshake leaves them running.
+agreements, as `ieee80211_pairwise_rekey` does: the recipient agreements
+first, each ending with a DELBA to the AP (WLAN_REASON_QSTA_LEAVE_QBSS), then
+the transmit agreements (`ieee80211_sta_tear_down_BA_sessions`). A Group Key
+Handshake leaves them running.
 
 Matching AP deauthentication/disassociation closes packet admission and queues
 firmware teardown. Disconnect waits for pending TX retirement, removes keys

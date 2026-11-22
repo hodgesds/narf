@@ -279,11 +279,29 @@ mod tests {
     /// 56/60. While `adjtimex` holds +500 ppm, the published multiplier must be
     /// the steered one, and the vDSO's arithmetic on the page must agree with
     /// the kernel's CLOCK_MONOTONIC and CLOCK_MONOTONIC_RAW.
+    ///
+    /// The kernel-test boot runs before `bare_main`'s boot-init registers the
+    /// vDSO image, so there the page under test is a scratch frame published
+    /// by the same writer (`write_vvar`); a boot with a registered image
+    /// checks the live page, which the re-anchor itself republished.
     fn smoke_vdso_vvar_publishes_the_steered_clock() -> TestResult {
         use narf_scheduler::narf_time;
-        let Some(frame) = VDSO.lock().as_ref().map(|img| img.vvar_frame) else {
-            return TestResult::Skip("no vDSO image registered");
+        let live = VDSO.lock().as_ref().map(|img| img.vvar_frame);
+        let scratch = match live {
+            Some(_) => None,
+            None => match alloc_frame() {
+                Ok(f) => Some(f),
+                Err(_) => return TestResult::Fail("no frame for a scratch vvar page"),
+            },
         };
+        let frame = match (live, scratch) {
+            (Some(frame), _) => frame,
+            (None, Some(f)) => f.start_address(),
+            (None, None) => return TestResult::Fail("no vvar page to check"),
+        };
+        if scratch.is_some() {
+            zero_frame(frame);
+        }
         let read_u64 = |off: usize| {
             // SAFETY: identity-mapped vvar frame; off+8 <= 4096.
             unsafe { core::ptr::read_volatile(frame.kernel_ptr::<u8>().add(off) as *const u64) }
@@ -295,6 +313,13 @@ mod tests {
             ..Default::default()
         };
         let _ = narf_time::ntp::adjtimex(&mut tx, 0, 0);
+        if scratch.is_some() {
+            write_vvar(
+                frame,
+                narf_time::cycles_per_ns(),
+                narf_time::wall_offset_ns(),
+            );
+        }
         let verdict = (|| {
             let (raw_mult, raw_shift) = narf_time::cyc_to_ns_mult_shift();
             // One consistent copy of the page, under its seqlock.
@@ -344,6 +369,9 @@ mod tests {
             Ok(())
         })();
         narf_time::ntp::__test_reset();
+        if let Some(f) = scratch {
+            narf_memory::free_frame(f);
+        }
         match verdict {
             Ok(()) => TestResult::Pass,
             Err(why) => TestResult::Fail(why),

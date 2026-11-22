@@ -287,6 +287,33 @@ fn framebuffer_range(
     Ok(Some(fb.addr..end))
 }
 
+/// What AMDGPU_INFO_FW_VERSION reports for the CP firmware (ME, PFP, MEC),
+/// after every IP image validates.
+///
+/// Out of line: the eleven validated images (3.8 KiB, and a second copy
+/// when `boot::Firmware::images` inlines) would otherwise sit in
+/// `amdgpu::claim_navi48`'s frame beside the cold-boot owner it boxes.
+#[inline(never)]
+fn publish_cp_firmware(firmware: &boot::Firmware) -> Result<(), Error> {
+    use crate::amdgpu_navi48_firmware::Source;
+    use crate::amdgpu_uapi as u;
+    let images = firmware.images().map_err(Error::Firmware)?;
+    let cp = |source, fw_type| {
+        images
+            .iter()
+            .find(|i| i.source() == source)
+            .map(|i| (fw_type, i.version(), i.feature()))
+    };
+    if let (Some(me), Some(pfp), Some(mec)) = (
+        cp(Source::Me, u::AMDGPU_INFO_FW_GFX_ME),
+        cp(Source::Pfp, u::AMDGPU_INFO_FW_GFX_PFP),
+        cp(Source::Mec, u::AMDGPU_INFO_FW_GFX_MEC),
+    ) {
+        crate::amdgpu_info::publish_navi48_firmware([me, pfp, mec]);
+    }
+    Ok(())
+}
+
 fn training_clients(protected: &[vram::Protected]) -> Result<(), Error> {
     // Long training temporarily overwrites this entire prefix, regardless of
     // allocator exclusions. Display/cursor readers can show transient pixels,
@@ -345,25 +372,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             crate::amdgpu_navi48_firmware::MesMode::Unified,
         )
         .map_err(Error::Firmware)?;
-        // What AMDGPU_INFO_FW_VERSION reports for the CP firmware.
-        {
-            use crate::amdgpu_navi48_firmware::Source;
-            use crate::amdgpu_uapi as u;
-            let images = firmware.images().map_err(Error::Firmware)?;
-            let cp = |source, fw_type| {
-                images
-                    .iter()
-                    .find(|i| i.source() == source)
-                    .map(|i| (fw_type, i.version(), i.feature()))
-            };
-            if let (Some(me), Some(pfp), Some(mec)) = (
-                cp(Source::Me, u::AMDGPU_INFO_FW_GFX_ME),
-                cp(Source::Pfp, u::AMDGPU_INFO_FW_GFX_PFP),
-                cp(Source::Mec, u::AMDGPU_INFO_FW_GFX_MEC),
-            ) {
-                crate::amdgpu_info::publish_navi48_firmware([me, pfp, mec]);
-            }
-        }
+        publish_cp_firmware(&firmware)?;
         let end = gpu
             .vram
             .base
@@ -1244,7 +1253,7 @@ async unsafe fn restart(
     // boot failure cannot make those old DMA requests execute again.
     unsafe { old_clearer.stopped() };
     // SAFETY: full reset and ASIC_Init proved old hardware no longer executes.
-    let new = alloc::boxed::Box::new(unsafe { old.after_reset() }?);
+    let new = unsafe { after_reset_boxed(old) }?;
     let old = retained.boot.replace(new).unwrap();
     if clean {
         // The cleanly quiesced owner went through a resume post: drop it
@@ -1334,6 +1343,28 @@ async unsafe fn restart(
     }
     placement.restarted = true;
     Ok(report)
+}
+
+/// [`boot::ColdBoot::after_reset`]'s new owner, written straight into its
+/// allocation from this frame, as [`crate::out_of_line::OutOfLine::build`]
+/// builds a future.
+///
+/// Out of line: `Box::new(old.after_reset()?)` in [`restart`]'s poll kept
+/// the 7.5 KiB owner twice there, the call's result and the copy moved
+/// into the box, and that copy was the top of the poll's frame.
+///
+/// # Safety
+/// As [`boot::ColdBoot::after_reset`]: a full reset and ASIC_Init proved the
+/// old hardware no longer executes.
+#[inline(never)]
+unsafe fn after_reset_boxed(
+    old: &mut boot::ColdBoot,
+) -> Result<alloc::boxed::Box<boot::ColdBoot>, boot::Error> {
+    let mut slot = alloc::boxed::Box::<boot::ColdBoot>::new_uninit();
+    // SAFETY: the caller's.
+    slot.write(unsafe { old.after_reset() }?);
+    // SAFETY: `slot` was initialised by the `write` just above.
+    Ok(unsafe { slot.assume_init() })
 }
 
 /// Linux `amdgpu.gpu_recovery` on a dGPU: a ring whose reset failed or a

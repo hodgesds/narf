@@ -823,7 +823,7 @@ pub mod tests {
         mmio.grant = false;
         match request_dbuf_slice(&mmio, 0) {
             Err(DbufError::PowerTimeout) => TestResult::Pass,
-            _ => return TestResult::Fail("ungranted slice must surface PowerTimeout"),
+            _ => TestResult::Fail("ungranted slice must surface PowerTimeout"),
         }
     }
     kernel_test_in!(
