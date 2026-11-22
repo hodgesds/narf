@@ -290,40 +290,9 @@ impl IntelHda {
         {
             return Err(HdaError::DeviceFailed);
         }
+        dev.init_cmd_io()?;
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        unsafe {
-            bar.write8(REG_CORBSIZE, CORBSIZE_256);
-            bar.write8(REG_RIRBSIZE, RIRBSIZE_256);
-            bar.write32(REG_CORBLBASE, dev.corb.dma_addr().raw() as u32);
-            bar.write32(REG_CORBUBASE, (dev.corb.dma_addr().raw() >> 32) as u32);
-            bar.write32(REG_RIRBLBASE, dev.rirb.dma_addr().raw() as u32);
-            bar.write32(REG_RIRBUBASE, (dev.rirb.dma_addr().raw() >> 32) as u32);
-            bar.write16(REG_CORBWP, 0);
-            bar.write16(REG_CORBRP, 1 << 15);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { bar.read16(REG_CORBRP) } & (1 << 15) != 0, 100) {
-            return Err(HdaError::CorbResetTimeout);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        unsafe {
-            bar.write16(REG_CORBRP, 0);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        if !wait(|| unsafe { bar.read16(REG_CORBRP) } & (1 << 15) == 0, 100) {
-            return Err(HdaError::CorbResetTimeout);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        unsafe {
-            bar.write16(REG_RIRBWP, 1 << 15);
-            bar.write16(REG_RINTCNT, 1);
-            bar.write8(REG_RIRBSTS, bar.read8(REG_RIRBSTS) & 5);
-            bar.write8(REG_CORBSTS, bar.read8(REG_CORBSTS) & 1);
-            bar.write8(REG_RIRBCTL, RIRBCTL_RUN | RIRBCTL_RINTCTL | RIRBCTL_OIC);
-            bar.write8(REG_CORBCTL, CORBCTL_RUN | CORBCTL_CMEIE);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-        let mask = unsafe { bar.read16(REG_STATESTS) } & 0x7fff;
+        let mask =unsafe { bar.read16(REG_STATESTS) } & 0x7fff;
         for cad in 0..15 {
             if mask & (1 << cad) == 0 {
                 continue;
@@ -456,6 +425,59 @@ impl IntelHda {
         }
         let _ = dev.enable_jack_events();
         Ok(dev)
+    }
+
+    /// `snd_hdac_bus_init_cmd_io` (sound/hda/core/controller.c): program
+    /// both command rings from the retained CORB/RIRB buffers, restart both
+    /// ring pointers, enable the ring DMA engines and accept unsolicited
+    /// responses (GCTL.UNSOL). Shared by probe and resume, so a resumed
+    /// controller is set up exactly as a probed one.
+    ///
+    /// The driver's shadow cursors restart with the hardware pointers.
+    /// Without that, the first response after the restart reads RIRBWP's
+    /// reset value (low byte 0) against a stale `rp` and walks pre-reset
+    /// RIRB slots, taking the first stale reply whose codec address matches
+    /// as the new command's response.
+    fn init_cmd_io(&self) -> Result<(), HdaError> {
+        let bar = self.bar0;
+        // SAFETY: Controller owns this live BAR and its retained CORB/RIRB
+        // buffers; fixed register offsets are inside the validated window.
+        unsafe {
+            bar.write8(REG_CORBSIZE, CORBSIZE_256);
+            bar.write8(REG_RIRBSIZE, RIRBSIZE_256);
+            bar.write32(REG_CORBLBASE, self.corb.dma_addr().raw() as u32);
+            bar.write32(REG_CORBUBASE, (self.corb.dma_addr().raw() >> 32) as u32);
+            bar.write32(REG_RIRBLBASE, self.rirb.dma_addr().raw() as u32);
+            bar.write32(REG_RIRBUBASE, (self.rirb.dma_addr().raw() >> 32) as u32);
+            bar.write16(REG_CORBWP, 0);
+            bar.write16(REG_CORBRP, 1 << 15);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        if !wait(|| unsafe { bar.read16(REG_CORBRP) } & (1 << 15) != 0, 100) {
+            return Err(HdaError::CorbResetTimeout);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        unsafe {
+            bar.write16(REG_CORBRP, 0);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        if !wait(|| unsafe { bar.read16(REG_CORBRP) } & (1 << 15) == 0, 100) {
+            return Err(HdaError::CorbResetTimeout);
+        }
+        // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
+        unsafe {
+            bar.write16(REG_RIRBWP, 1 << 15);
+            bar.write16(REG_RINTCNT, 1);
+            bar.write8(REG_RIRBSTS, bar.read8(REG_RIRBSTS) & 5);
+            bar.write8(REG_CORBSTS, bar.read8(REG_CORBSTS) & 1);
+            bar.write8(REG_RIRBCTL, RIRBCTL_RUN | RIRBCTL_RINTCTL | RIRBCTL_OIC);
+            bar.write8(REG_CORBCTL, CORBCTL_RUN | CORBCTL_CMEIE);
+            bar.write32(REG_GCTL, bar.read32(REG_GCTL) | GCTL_UNSOL);
+        }
+        let mut state = self.commands.lock();
+        state.wp = 0;
+        state.rp = 0;
+        Ok(())
     }
 
     /// #776 / #1496: issue a chip's init coef table as
@@ -1343,55 +1365,11 @@ impl IntelHda {
             return Err(HdaError::ResetTimeout);
         }
         delay_us(1000);
-        // SAFETY: Controller owns this live BAR and its retained
-        // CORB/RIRB buffers; same writes as `initialize`.
-        unsafe {
-            self.bar0.write8(REG_CORBSIZE, CORBSIZE_256);
-            self.bar0.write8(REG_RIRBSIZE, RIRBSIZE_256);
-            self.bar0
-                .write32(REG_CORBLBASE, self.corb.dma_addr().raw() as u32);
-            self.bar0
-                .write32(REG_CORBUBASE, (self.corb.dma_addr().raw() >> 32) as u32);
-            self.bar0
-                .write32(REG_RIRBLBASE, self.rirb.dma_addr().raw() as u32);
-            self.bar0
-                .write32(REG_RIRBUBASE, (self.rirb.dma_addr().raw() >> 32) as u32);
-            self.bar0.write16(REG_CORBWP, 0);
-            self.bar0.write16(REG_CORBRP, 1 << 15);
-        }
-        let corb_reset = wait(
-            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-            || unsafe { self.bar0.read16(REG_CORBRP) } & (1 << 15) != 0,
-            100,
-        );
-        if !corb_reset {
-            return Err(HdaError::CorbResetTimeout);
-        }
+        // The shadow cursors restart with the ring pointers inside.
+        self.init_cmd_io()?;
         // SAFETY: Controller owns this live BAR; fixed register
         // offsets are inside the validated window.
         unsafe {
-            self.bar0.write16(REG_CORBRP, 0);
-        }
-        let corb_cleared = wait(
-            // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
-            || unsafe { self.bar0.read16(REG_CORBRP) } & (1 << 15) == 0,
-            100,
-        );
-        if !corb_cleared {
-            return Err(HdaError::CorbResetTimeout);
-        }
-        // SAFETY: Controller owns this live BAR; fixed register
-        // offsets are inside the validated window.
-        unsafe {
-            self.bar0.write16(REG_RIRBWP, 1 << 15);
-            self.bar0.write16(REG_RINTCNT, 1);
-            self.bar0
-                .write8(REG_RIRBSTS, self.bar0.read8(REG_RIRBSTS) & 5);
-            self.bar0
-                .write8(REG_CORBSTS, self.bar0.read8(REG_CORBSTS) & 1);
-            self.bar0
-                .write8(REG_RIRBCTL, RIRBCTL_RUN | RIRBCTL_RINTCTL | RIRBCTL_OIC);
-            self.bar0.write8(REG_CORBCTL, CORBCTL_RUN | CORBCTL_CMEIE);
             self.bar0.write32(
                 REG_INTCTL,
                 if self.route.is_some() {
@@ -1400,20 +1378,6 @@ impl IntelHda {
                     0
                 },
             );
-        }
-        // The ring pointers above restarted at 0 (CORBWP=0, RIRBWP
-        // reset): the driver's shadow cursors must restart with
-        // them, exactly as `initialize` starts them at 0. Without
-        // this, the first post-reset response() reads RIRBWP's reset
-        // value (low byte 0) with a stale rp and walks pre-reset
-        // RIRB slots, accepting the first stale reply whose cad
-        // nibble matches as the new verb's response — the D0 verb
-        // then "succeeds" without ever reaching the codec, and every
-        // following verb validates against a stale value.
-        {
-            let mut state = self.commands.lock();
-            state.wp = 0;
-            state.rp = 0;
         }
         // The rings are reset; a pre-suspend verb timeout no longer
         // describes the transport.
