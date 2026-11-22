@@ -259,6 +259,15 @@ pub unsafe fn frame::register_boot_ram(regions: &[UsableRegion]);
 /// hotplug range, online or not. Takes registry leaf locks separately and is
 /// callable under a page-table root lock.
 pub fn frame::is_system_ram(phys: PhysAddr) -> bool;
+/// Hibernation: the RAM a snapshot covers (known boot RAM, the usable
+/// ranges, online hotplug blocks), as sorted, merged `[start_pfn, end_pfn)`.
+pub fn frame::saveable_ram_ranges() -> Vec<(u64, u64)>;
+/// Hibernation (`saveable_page`): `save(pfn)` for each frame of the range the
+/// allocator does not hold free. Free blocks are skipped from their heads and
+/// cached frames are free; a frame without a word, or with an empty word no
+/// free block covers, is saved. Lock- and allocation-free; exact only while
+/// nothing else allocates (interrupts off, one CPU).
+pub fn frame::for_each_saveable_frame(start_pfn: u64, end_pfn: u64, save: impl FnMut(u64));
 
 /// Publish local HMAT coordinates and derive Linux-style memory tiers.
 pub fn set_node_performance(

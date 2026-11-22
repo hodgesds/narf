@@ -49,12 +49,12 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
    is the resume.
 4. **Non-boot CPUs.** Take them offline for the snapshot and restore
    (`pm_sleep_disable_secondary_cpus`), through `cpu_take_offline`.
-5. **Snapshot.** Enumerate the frame allocator's allocated frames, minus
-   the nosave regions (the image buffers themselves, firmware-reserved
-   memory). Copy them atomically into free frames, with interrupts off
-   on the boot CPU, as `swsusp_save` does. The copy needs free memory at
-   least equal to what is in use. A fuller system fails the hibernation
-   cleanly.
+5. ~~**Snapshot.**~~ Done (`hibernate::snapshot`, spec §3.6.0c). The
+   walk uses the allocator's free-state index, so free blocks and cached
+   frames are skipped and everything else in known RAM is saved (NVS
+   included, in place of `suspend_nvs_save`). The copy frames are
+   preallocated and marked so the copy skips them, and the copy allocates
+   nothing. A system with less free memory than it uses fails cleanly.
 6. **Sealed streaming write.** The sealer takes a page source rather than
    one buffer. The SMS is TPM-sealed. Then preallocate the image file,
    map its extents, and write the header with the extent list, the

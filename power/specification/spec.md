@@ -1457,6 +1457,42 @@ completion, and `freeze_kernel_threads` waits for it on the same timeout
 loop. `thaw_workqueues` restores `max_active` and starts the work that
 waited.
 
+#### 3.6.0c Hibernation snapshot
+
+```rust
+// narf_power::hibernate::snapshot
+pub enum SnapshotError { NoMemory { needed: u64, got: u64 }, Grew { copies: u64 } }
+pub fn preallocate() -> Result<Prealloc, SnapshotError>;   // hibernate_preallocate_memory
+impl Prealloc {
+    pub fn capacity(&self) -> usize;
+    pub unsafe fn copy(self) -> Result<Snapshot, SnapshotError>;  // swsusp_save
+}
+impl Snapshot {                                              // frees its copy frames on drop
+    pub fn len(&self) -> usize;
+    pub fn pfns(&self) -> &[u64];                            // ascending
+    pub fn page(&self, i: usize) -> (u64, &[u8; 4096]);
+    pub fn release_spare(&mut self);
+}
+```
+
+`preallocate` runs live:
+- it counts the saveable frames (`frame::for_each_saveable_frame` over
+  `frame::saveable_ram_ranges`);
+- it takes that many free frames plus a margin (1/32 plus 1024) for the
+  copies, and marks them in a bitmap so the copy skips them;
+- it reserves the frame-number list.
+
+A system with less free memory than it uses fails here with `NoMemory`.
+Linux shrinks the page cache first.
+
+`copy` runs once the devices are frozen, with interrupts off on the only
+CPU running. It copies every saveable frame except the copy frames, and
+allocates nothing. Frames in use beyond the margin fail it with `Grew`.
+
+The snapshot covers all known RAM, ACPI NVS included. Linux saves only
+`E820_TYPE_RAM` and saves NVS separately (`suspend_nvs_save`), with the
+same effect. The resume refuses a changed memory map.
+
 #### 3.6.1 Power-off paths vs Linux
 
 Linux line numbers are against the reference tree at `~/git/linux`

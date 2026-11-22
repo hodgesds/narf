@@ -31,6 +31,7 @@ pub mod cpu_idle;
 mod cpu_idle_tests;
 pub mod device_pm;
 pub mod freezer;
+pub mod hibernate;
 pub mod laptop_state;
 pub mod lps0;
 pub mod monitor;
