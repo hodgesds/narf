@@ -314,10 +314,22 @@ impl PcmDevice for Card {
         {
             return Err(SoundError::NoSuchDevice);
         }
-        // Linux azx_pcm_open powers the codec up (snd_hda_power_up_pm)
-        // before the codec's own open: the last stop may have parked the
-        // controller, and the pin sense below needs live command rings.
-        self.0.ensure_active().map_err(|_| SoundError::BadState)?;
+        // Linux azx_pcm_open takes a power reference (snd_hda_power_up_pm)
+        // before the codec's own open and holds it until close: the
+        // autosuspend may have parked the controller, and the pin sense
+        // below needs live command rings.
+        self.0.power_up().map_err(|_| SoundError::BadState)?;
+        let opened = self.claim(capture);
+        if opened.is_err() {
+            self.0.power_down();
+        }
+        opened
+    }
+}
+impl Card {
+    /// The rest of `open` once the power reference is held: the HDMI sense
+    /// and the stream claim.
+    fn claim(&self, capture: bool) -> Result<Box<dyn PcmHardware>, SoundError> {
         // Constraints come from the sinks attached now (Linux hdmi_pcm_open
         // reads the pin's ELD at open).
         if !capture {
@@ -398,12 +410,11 @@ impl PcmHardware for Pcm {
             .start(&self.dev)
     }
     fn stop(&mut self) -> Result<(), SoundError> {
+        // A stop (PipeWire's DROP on an idle sink) leaves the controller up:
+        // the open PCM holds its power reference until close.
         self.dev.streams[usize::from(self.capture)]
             .lock()
-            .stop(&self.dev)?;
-        // Last stop parks the controller (best-effort idle, #779).
-        self.dev.maybe_idle_quiesce();
-        Ok(())
+            .stop(&self.dev)
     }
     fn pause(&mut self, paused: bool) -> Result<(), SoundError> {
         let mut state = self.dev.streams[usize::from(self.capture)].lock();
@@ -534,6 +545,9 @@ impl Drop for Pcm {
         if !self.capture {
             self.dev.reset_chmap();
         }
+        // azx_pcm_close: snd_hda_power_down_pm. The autosuspend parks the
+        // controller once the delay passes with no reference held.
+        self.dev.power_down();
     }
 }
 

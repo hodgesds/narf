@@ -6,7 +6,7 @@ use crate::{
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     mem::ManuallyDrop,
-    sync::atomic::{fence, AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use narf_bus::{bar, BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -107,6 +107,15 @@ pub struct IntelHda {
     jack_tags: core::sync::atomic::AtomicU64,
     /// Held by a park or a wake (`lock_pm`).
     pm: AtomicBool,
+    /// Power references (Linux `snd_hda_power_up` / `_down`): one per open
+    /// PCM. The controller parks only with none held.
+    power_refs: AtomicU32,
+    /// `pm_runtime_mark_last_busy`: the last command or reference drop.
+    last_busy_ns: AtomicU64,
+    /// The autosuspend delay (Linux `power_save`, in ms).
+    pub(super) autosuspend_ms: AtomicU64,
+    /// The autosuspend service while nothing can be parked.
+    pm_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -127,6 +136,10 @@ const LEASE_WAIT_MS: u64 = 3 * COMMAND_TIMEOUT_MS;
 /// How long a park or wake waits for another one: a wake runs the codec
 /// init again, up to the ALC28x headphone tails' 200 ms of settle time.
 const PM_WAIT_MS: u64 = 1000;
+/// The autosuspend delay: Linux `snd_hda_intel.power_save`, whose default is
+/// `CONFIG_SND_HDA_POWER_SAVE_DEFAULT` (10 s in the host's Linux config), set
+/// on each codec with `pm_runtime_set_autosuspend_delay`.
+const AUTOSUSPEND_MS: u64 = 10_000;
 /// `STATESTS_INT_MASK` (include/sound/hda_register.h): the codec wake bits
 /// for `HDA_MAX_CODECS` (8) codecs.
 const STATESTS_INT_MASK: u16 = 0xff;
@@ -327,6 +340,10 @@ impl IntelHda {
             jack_waker: IrqSafeSpinLock::new(None),
             jack_tags: core::sync::atomic::AtomicU64::new(0),
             pm: AtomicBool::new(false),
+            power_refs: AtomicU32::new(0),
+            last_busy_ns: AtomicU64::new(narf_time::monotonic_ns()),
+            autosuspend_ms: AtomicU64::new(AUTOSUSPEND_MS),
+            pm_waker: IrqSafeSpinLock::new(None),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -1489,8 +1506,11 @@ impl core::future::Future for JackWait<'_> {
 //   PCI node is a follow-up: moving the function to D3hot needs a
 //   PCM start path that can await resume (the ALSA start hook is
 //   sync), and wiring it without one would let a start touch a
-//   D3hot BAR. The live idle path is the PCM stop hook below
-//   (codecs D3 + engines off, PCI stays D0).
+//   D3hot BAR. The live idle path is the autosuspend service below
+//   (`autosuspend`): an open PCM holds a power reference, and the
+//   controller parks (codecs D3, then engines off and link reset; PCI
+//   stays D0) `power_save` after the last one went, as Linux runtime PM
+//   suspends the codecs and then the controller.
 //
 // The verb path is synchronous in both layers: `send_verb` polls
 // RIRB via MMIO and never waits on an IRQ, so it is safe with
@@ -1550,11 +1570,18 @@ impl IntelHda {
     /// park). Idempotent: already-suspended is Ok. Refuses with
     /// Busy when any stream is running or prepared.
     fn quiesce(&self) -> Result<(), HdaError> {
+        self.quiesce_if(|| true)
+    }
+
+    /// [`Self::quiesce`] that also refuses while `idle` is false, checked
+    /// again under the command lease right before the park (the autosuspend
+    /// passes "no power reference held").
+    fn quiesce_if(&self, idle: impl Fn() -> bool) -> Result<(), HdaError> {
         let _pm = self.lock_pm()?;
         if self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
-        if !self.streams_idle() {
+        if !self.streams_idle() || !idle() {
             return Err(HdaError::Busy);
         }
         self.set_codec_power(true)?;
@@ -1568,7 +1595,7 @@ impl IntelHda {
                 return Err(error);
             }
         };
-        if !self.streams_idle() {
+        if !self.streams_idle() || !idle() {
             drop(lease);
             let _ = self.set_codec_power(false);
             return Err(HdaError::Busy);
@@ -1652,6 +1679,10 @@ impl IntelHda {
         let _ = self.enable_jack_events();
         self.suspended.store(false, Ordering::Release);
         self.note_jack_event();
+        // A wake with no reference held (a control read) parks again after
+        // the delay.
+        self.mark_last_busy();
+        self.kick_pm();
         Ok(())
     }
 
@@ -1703,14 +1734,140 @@ impl IntelHda {
         Ok(())
     }
 
-    /// Best-effort idle transition for the PCM stop path: quiesce
-    /// when every stream is stopped, ignore failures (the next stop
-    /// retries; the controller simply stays powered).
-    pub(super) fn maybe_idle_quiesce(&self) {
-        if self.suspended.load(Ordering::Acquire) || !self.streams_idle() {
-            return;
+    /// `pm_runtime_mark_last_busy`: every command marks it when its lease
+    /// goes (Linux `codec_exec_verb` ends in `snd_hda_power_down_pm`, whose
+    /// `pm_runtime_put_autosuspend` marks it), and so does a reference drop.
+    fn mark_last_busy(&self) {
+        self.last_busy_ns
+            .store(narf_time::monotonic_ns(), Ordering::Release);
+    }
+
+    /// Linux `snd_hda_power_up` (`pm_runtime_get_sync`): take a power
+    /// reference, then wake the controller. A PCM open holds one until close
+    /// (`azx_pcm_open` / `azx_pcm_close`).
+    pub(super) fn power_up(&self) -> Result<(), HdaError> {
+        self.power_refs.fetch_add(1, Ordering::AcqRel);
+        if let Err(error) = self.ensure_active() {
+            self.power_down();
+            return Err(error);
         }
-        let _ = self.quiesce();
+        Ok(())
+    }
+
+    /// Linux `snd_hda_power_down` (`pm_runtime_put_autosuspend`): drop a
+    /// power reference and mark the controller busy; the autosuspend service
+    /// parks it `autosuspend_ms` later if nothing took a reference since.
+    pub(super) fn power_down(&self) {
+        self.mark_last_busy();
+        let refs = &self.power_refs;
+        let _ = refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        self.kick_pm();
+    }
+
+    /// Wake the autosuspend service: a reference went, or a wake left the
+    /// controller up with none held.
+    fn kick_pm(&self) {
+        let waker = self.pm_waker.lock().take();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// One autosuspend decision (Linux `rpm_suspend` under the autosuspend
+    /// timer): held while a reference or a running stream is; otherwise
+    /// park once the controller has been idle `autosuspend_ms`. The park
+    /// suspends the codecs first and then the controller, as Linux runs
+    /// `hda_codec_runtime_suspend` before `azx_runtime_suspend`. A park that
+    /// cannot run now is retried a whole delay later.
+    pub(super) fn autosuspend(&self) -> Autosuspend {
+        if self.suspended.load(Ordering::Acquire) {
+            return Autosuspend::Parked;
+        }
+        if self.power_refs.load(Ordering::Acquire) != 0 || !self.streams_idle() {
+            return Autosuspend::Held;
+        }
+        let delay = self.autosuspend_ms.load(Ordering::Acquire);
+        let idle_ms = narf_time::monotonic_ns()
+            .saturating_sub(self.last_busy_ns.load(Ordering::Acquire))
+            / 1_000_000;
+        if idle_ms < delay {
+            return Autosuspend::Wait(delay - idle_ms);
+        }
+        match self.quiesce_if(|| self.power_refs.load(Ordering::Acquire) == 0) {
+            Ok(()) => Autosuspend::Parked,
+            Err(_) => {
+                self.mark_last_busy();
+                Autosuspend::Wait(delay)
+            }
+        }
+    }
+}
+
+/// What the autosuspend service does next.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Autosuspend {
+    /// A power reference or a running stream holds the controller up.
+    Held,
+    /// Idle, but not for the whole delay yet: look again in this many ms.
+    Wait(u64),
+    /// Parked.
+    Parked,
+}
+
+/// The controller's autosuspend timer (Linux runtime PM's autosuspend for
+/// the codecs, then the controller). Sleeps out the delay while the
+/// controller is idle and parks with no strong reference held while it is
+/// held up or parked; a reference drop or a wake wakes it.
+pub(super) async fn autosuspend_service(weak: alloc::sync::Weak<IntelHda>) {
+    loop {
+        let step = {
+            let Some(dev) = weak.upgrade() else {
+                return;
+            };
+            dev.autosuspend()
+        };
+        match step {
+            Autosuspend::Wait(ms) => {
+                narf_time::SleepUntil::new(Deadline::after_ms(ms.max(1)).as_instant()).await;
+            }
+            Autosuspend::Held | Autosuspend::Parked => {
+                if PmIdle(&weak).await.is_none() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Parks the autosuspend service until the controller could be parked (up,
+/// no reference, no running stream), or `None` once it is gone.
+struct PmIdle<'a>(&'a alloc::sync::Weak<IntelHda>);
+
+impl core::future::Future for PmIdle<'_> {
+    type Output = Option<()>;
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<()>> {
+        let Some(dev) = self.0.upgrade() else {
+            return core::task::Poll::Ready(None);
+        };
+        let idle = |dev: &IntelHda| {
+            !dev.suspended.load(Ordering::Acquire)
+                && dev.power_refs.load(Ordering::Acquire) == 0
+                && dev.streams_idle()
+        };
+        if idle(&dev) {
+            return core::task::Poll::Ready(Some(()));
+        }
+        // Register, then re-check, so a reference drop racing this poll
+        // wakes us.
+        *dev.pm_waker.lock() = Some(cx.waker().clone());
+        if idle(&dev) {
+            dev.pm_waker.lock().take();
+            return core::task::Poll::Ready(Some(()));
+        }
+        core::task::Poll::Pending
     }
 }
 
@@ -1797,6 +1954,7 @@ impl Drop for CommandLease<'_> {
         if self.pending {
             self.dev.irq.failed.store(true, Ordering::Release);
         }
+        self.dev.mark_last_busy();
         self.dev.busy.store(false, Ordering::Release);
     }
 }
@@ -1804,6 +1962,7 @@ impl Drop for IntelHda {
     fn drop(&mut self) {
         // The parked service tasks see the controller gone and exit.
         self.kick_service();
+        self.kick_pm();
         let waker = self.jack_waker.lock().take();
         if let Some(w) = waker {
             w.wake();
@@ -2021,6 +2180,8 @@ fn register_controller(device: &BusDevice, dev: IntelHda) -> Result<(), narf_bus
         }
     });
     narf_scheduler::spawn(jack_service(Arc::downgrade(&dev)));
+    // Runtime PM: park the controller `power_save` after the last PCM closed.
+    narf_scheduler::spawn(autosuspend_service(Arc::downgrade(&dev)));
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: "hda".into(),
         kind: narf_drivers::BoundKind::Audio,

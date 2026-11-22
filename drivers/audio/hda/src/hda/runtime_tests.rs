@@ -3694,3 +3694,41 @@ kernel_test_in!(
     "audio/hda/pm-autosuspend",
     native_hda_pm_stop_and_close_keep_the_controller_up
 );
+
+/// The autosuspend timer: held while a PCM is open, waiting while the
+/// delay since the close runs, parked once it has passed, and woken by the
+/// next open (Linux `pm_runtime_put_autosuspend` at close, the autosuspend
+/// timer, `pm_runtime_get_sync` at open).
+fn native_hda_pm_autosuspend_parks_after_the_delay() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    dev.autosuspend_ms.store(30, Ordering::Release);
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(playback) = card.open(false, 0) else {
+        return TestResult::Fail("open");
+    };
+    if dev.autosuspend() != Autosuspend::Held {
+        return TestResult::Fail("an open PCM holds the controller up");
+    }
+    drop(playback);
+    if !matches!(dev.autosuspend(), Autosuspend::Wait(_))
+        || dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("the delay starts at the close");
+    }
+    super::wait(|| false, 40);
+    if dev.autosuspend() != Autosuspend::Parked || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the controller parks once the delay has passed");
+    }
+    if card.open(false, 0).is_err() || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the next open wakes the controller");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-autosuspend",
+    native_hda_pm_autosuspend_parks_after_the_delay
+);

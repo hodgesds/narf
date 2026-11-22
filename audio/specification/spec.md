@@ -319,8 +319,15 @@ command under the command lease, which a synchronous caller waits for
 parked under the lease is refused with `HdaError::Suspended` and wakes it
 again; `send_verb_async` (the jack service) never wakes one and returns
 `Suspended`. `Card::open`, `refresh_hdmi` and `refresh_jacks` wake the
-controller before sensing pins. The last PCM stop parks the controller
-(codecs D3, link reset); park and wake serialise on a PM lock, the park runs
+controller before sensing pins. Power follows Linux runtime PM: an open PCM
+holds a power reference (`power_up` at open, `power_down` at close, Linux
+`snd_hda_power_up_pm` / `_down_pm`), every command and reference drop marks
+the controller busy, and the autosuspend service (`autosuspend`) parks it
+(codecs D3, then link reset) once it has been idle for `autosuspend_ms`
+(10 s, Linux `power_save`) with no reference and no running stream. A stop
+with the PCM still open does not park it. Polled jack detection marks it
+busy every 1.5 s and so keeps it up, as Linux jackpoll does. Park and wake
+serialise on a PM lock, the park runs
 under the command lease and sets `suspended` before the reset, and the
 wake restarts the link and command I/O under the lease before the codecs
 are re-initialised with ungated commands. A command that times out or is
