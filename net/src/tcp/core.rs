@@ -6071,6 +6071,39 @@ pub fn __with_tcb_mut<R>(id: u32, f: impl FnOnce(&mut Tcb) -> R) -> Option<R> {
     Some(f(&mut t))
 }
 
+/// Test-only: build `t`'s next segment for `dev` as every sender does
+/// (`build_tcb_frame`) and report the transmit queue whose zero-copy pool
+/// the frame was built in, with the frame's bytes. `None` when no pool
+/// buffer was available and the frame was built in a `Vec`. The pool
+/// buffer goes straight back to the pool it came from.
+#[doc(hidden)]
+pub fn __tcb_frame_pool_queue_for_test(
+    dev: &iface::NetIfaceSnapshot,
+    t: &Tcb,
+) -> Option<(u16, Vec<u8>)> {
+    let frame = build_tcb_frame(
+        dev,
+        t,
+        dev.mac,
+        t.snd_nxt,
+        t.rcv_nxt,
+        FLAG_ACK,
+        0,
+        Vec::new(),
+        &[],
+        false,
+    );
+    match frame {
+        TxFrame::Dma(f) => {
+            let bytes = f.payload().to_vec();
+            let (buf, _offset, _len, queue) = f.into_parts_with_offset_and_queue();
+            iface::tx_release_on(&dev.name, queue, buf);
+            Some((queue, bytes))
+        }
+        TxFrame::Owned(_) => None,
+    }
+}
+
 // ── Public timer-sweep + ICMP-error glue ────────────────────────────
 
 /// Interval-stamp (monotonic cycles) of the last `tick_all` scan, CAS-gated so

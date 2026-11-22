@@ -173,6 +173,8 @@ mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tls_client_tests;
 #[cfg(any(test, feature = "kernel-test"))]
+mod txpool_queue_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod udp_gso_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod watchdog_tests;
