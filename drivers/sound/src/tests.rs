@@ -701,3 +701,80 @@ kernel_test_in!(
     "drivers/sound/procfs-pcm",
     smoke_procfs_asound_card_id_and_substreams
 );
+
+// ── #38: card id dedupe and the Linux /proc/asound/cards layout ──────
+
+/// A hardware card with no PCM: enough for the registry.
+#[derive(Debug)]
+struct NamedCard;
+impl crate::hardware::PcmDevice for NamedCard {
+    fn open(
+        &self,
+        _capture: bool,
+        _device: u32,
+    ) -> Result<alloc::boxed::Box<dyn crate::hardware::PcmHardware>, SoundError> {
+        Err(SoundError::NoSuchDevice)
+    }
+}
+
+/// Linux `snd_card_set_id_no_lock` keeps card ids unique: a clash gets an
+/// `_1`, `_2`, ... suffix ("Generic", "Generic_1" for two generic HDA
+/// controllers). `/proc/asound/cards` prints `"%2i [%-15s]: %s - %s\n"` and
+/// the long name on a second line indented by 22 spaces
+/// (`snd_card_info_read`), and a card's PCM directories are only
+/// `pcmMp` / `pcmMc`. NARF gave both HDA cards the id "HDA", printed one line
+/// per card, and published uppercase `pcmMP` / `pcmMC` duplicates.
+fn smoke_card_ids_dedupe_and_cards_layout() -> TestResult {
+    use narf_filesystem::FsInstance;
+    crate::__reset_for_test();
+    mixer::__reset_for_test();
+    let info = |name: &'static str| crate::CardInfo {
+        index: 0,
+        driver: "HDA-Intel",
+        id: "Generic",
+        name,
+        playback_count: 1,
+        capture_count: 0,
+    };
+    let first = crate::register_hardware_card_at(
+        info("HD-Audio Generic"),
+        alloc::sync::Arc::new(NamedCard),
+        None,
+    );
+    let second = crate::register_hardware_card_at(
+        info("HD-Audio Generic"),
+        alloc::sync::Arc::new(NamedCard),
+        None,
+    );
+    let ids: alloc::vec::Vec<(u32, &'static str)> =
+        list_cards().iter().map(|c| (c.index, c.id)).collect();
+    if ids != [(first, "Generic"), (second, "Generic_1")] {
+        return TestResult::Fail("a clashing card id gets the _1 suffix");
+    }
+    let expected = alloc::format!(
+        "{:2} [Generic        ]: HDA-Intel - HD-Audio Generic\n{:22}HD-Audio Generic\n",
+        first,
+        ""
+    );
+    if !crate::procfs_bridge::render_cards_list().starts_with(&expected) {
+        return TestResult::Fail("/proc/asound/cards follows snd_card_info_read");
+    }
+    crate::procfs_bridge::register_procfs_asound();
+    let root = narf_filesystem::procfs::ProcFs.root();
+    let Some(card) = root
+        .lookup_dir("asound")
+        .and_then(|asound| asound.lookup_dir("card0"))
+    else {
+        return TestResult::Fail("/proc/asound/card0 directory lookup failed");
+    };
+    if card.lookup_dir("pcm0p").is_none() || card.lookup_dir("pcm0P").is_some() {
+        return TestResult::Fail("only the lowercase pcm0p directory exists");
+    }
+    crate::unregister_hardware_card(second);
+    crate::unregister_hardware_card(first);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sound/card-names",
+    smoke_card_ids_dedupe_and_cards_layout
+);

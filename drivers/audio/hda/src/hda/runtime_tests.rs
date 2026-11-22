@@ -3791,3 +3791,44 @@ kernel_test_in!(
     "audio/hda/cmd-stream",
     native_hda_running_stream_survives_a_lost_command
 );
+
+/// `/proc/asound/cardN/codec#A` opens with Linux `print_codec_core_info`:
+/// "Codec: <vendor> <chip>" (the `hda_vendor_ids` name and the codec
+/// driver's chip name), the address, the AFG function id and its unsol bit
+/// (`AC_PAR_FUNCTION_TYPE`), the vendor, subsystem and revision ids, and
+/// the modem function group line. Before, the file printed the card name
+/// as the codec and a made-up node count, so alsa-info and the UCM codec
+/// matching saw no codec at all.
+fn native_hda_codec_proc_header_matches_linux() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let info = narf_drivers_sound::CardInfo {
+        index: 0,
+        driver: "HDA-Intel",
+        id: "HDMI",
+        name: "HDA ATI HDMI",
+        playback_count: 1,
+        capture_count: 0,
+    };
+    let card = narf_drivers_sound::register_hardware_card_at(
+        info,
+        Arc::new(super::super::stream::Card(dev.clone())),
+        None,
+    );
+    let text = narf_drivers_sound::procfs_bridge::render_codec_dump(card, 0);
+    narf_drivers_sound::unregister_hardware_card(card);
+    let header = "Codec: ATI R6xx HDMI\nAddress: 0\nAFG Function Id: 0x1 (unsol 0)\n\
+                  Vendor Id: 0x1002aa01\nSubsystem Id: 0x00000000\nRevision Id: 0x100700\n\
+                  No Modem Function Group found\n";
+    if !text.starts_with(header) {
+        return TestResult::Fail("codec#0 opens with print_codec_core_info's header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/card-names",
+    native_hda_codec_proc_header_matches_linux
+);
