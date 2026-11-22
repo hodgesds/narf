@@ -1823,6 +1823,10 @@ pub fn install_for_probe(
     let applicable = match generation {
         Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => true,
         Generation::TigerLake | Generation::AlderLake => gen12.is_some(),
+        // Gen11 (Lane 5): the VRR flag and the eDP
+        // low-vswing bit install for the internal panel; the
+        // Gen12 DDC overrides below are skipped for IceLake.
+        Generation::IceLake => true,
         _ => false,
     };
     if !applicable {
@@ -1841,10 +1845,11 @@ pub fn install_for_probe(
                 crate::intel_gpu_vrr::VbtVrr::from_vbt(vbt)
             }),
     );
-    // The same panel's eDP HOBL / low-vswing bits for the Gen12
+    // The same panel's eDP HOBL / low-vswing bits for the
     // combo-PHY table selection (`tgl_get_combo_buf_trans_edp`'s
-    // `use_edp_hobl` / `use_edp_low_vswing`); without a VBT both
-    // stay clear and the DP tables are selected, as in Linux.
+    // `use_edp_hobl` / `use_edp_low_vswing` on Gen12,
+    // `select_table`'s `edp_low_vswing` on Gen11); without a VBT
+    // both stay clear and the DP tables are selected, as in Linux.
     crate::intel_gpu_gen12_combo_phy::install_vbt(found.as_ref().map_or(
         crate::intel_gpu_gen12_combo_phy::VbtEdpSignal::Missing,
         |(vbt, _)| crate::intel_gpu_gen12_combo_phy::VbtEdpSignal::from_vbt(vbt),
@@ -1877,6 +1882,11 @@ pub fn install_for_probe(
         (Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake, None) => {
             install_mtl_port_policy(MtlPortPolicy::NO_VBT)
         }
+        // Gen11: no Gen12 DDC overrides exist (the external
+        // DDC overrides are a Gen12 construct, Lane 8); the
+        // VRR + eDP-signal installs above already ran, so the
+        // install counts with or without a VBT.
+        (Generation::IceLake, _) => true,
         (_, Some((vbt, _))) => match gen12 {
             Some(family) => {
                 install_gen12_ddc(Gen12DdcOverrides::from_vbt(vbt, family));

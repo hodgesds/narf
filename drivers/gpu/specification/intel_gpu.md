@@ -370,9 +370,20 @@ so its region table carries the verified Gen12 contents; it has a
 forcewake ACK at 0x130044, and no HWCONFIG table (i915 requires
 graphics 12.55+). Gen11 predates GMD_ID, so Stage 1 presence
 re-reads PCI config space (all-ones refuses) instead of reading
-0xD8C/0xFF8, and `gmd_id` is `None` on Gen11. Display, external
-display, backlight, execlists submission and GuC load stay gated:
-those are the Gen11 Lanes 3–8. Gen9 stays excluded (§6).
+0xD8C/0xFF8, and `gmd_id` is `None` on Gen11. Display clocks
+(Lane 4) and the internal-panel modeset (Lane 5) are admitted:
+CDCLK (pcode command 0x7, per-product voltage levels), the ICL
+combo DPLL (CFGCR0 0x164000 + pll·0x80), the 8-level watermark
+algorithm (no SAGV watermark), the ICL DDI tables, the DMC load
+(`i915/icl_dmc_ver1_09.bin`, best-effort), and the first modeset
+on the internal display — in Linux's ICL order (CDCLK → DPLL →
+DDI pre-enable → transcoder/pipe/M-N/FUNC_CTL → DBUF +
+watermarks → plane → link training → DDI buffer → enables),
+fixture-validated, silicon untested. The plane admission is the
+SKL rule: 256 KiB surface alignment, 32 KiB stride cap.
+External display, backlight, execlists submission and GuC load
+stay gated: those are the Gen11 Lanes 3 and 6–8. Gen9 stays
+excluded (§6).
 
 Remainder (EHL/JSL 36-bit PPGTT): Linux `i915_pci.c` sets
 `.__runtime.ppgtt_size = 36` for Elkhart Lake and Jasper Lake only;
@@ -698,7 +709,7 @@ generation gates below.
   bullet until Gen11 Lane 1 lifted it for identity + probe
   (26 IDs in §5) and Lane 2 extended the lift to GEM mapping via
   the legacy Gen8 PTE format; its display model is still a separate
-  lane programme, and display stays gated. GT execution
+  lane programme, and external display stays gated (Lane 8). GT execution
   (execlists submission on RCS) was admitted by the Gen11
   execlists lane (§8).
 - Arrow Lake display — identification landed (#1023, §5);

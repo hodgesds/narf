@@ -396,6 +396,13 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// pre-boot single-pipe programming.
     dbuf_share: Option<(u16, u16)>,
     gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
+    /// Gen11 platform when this run modesets an Ice Lake /
+    /// Elkhart Lake / Jasper Lake part (Lane 5). Set by
+    /// `modeset_display_family` from the chip; `None` on the
+    /// Gen12 path. Drives the per-step Gen11 branches (ICL
+    /// CDCLK / DPLL / watermarks / DDI tables, the Linux ICL
+    /// step order, and the Gen11 plane admission).
+    gen11_platform: Option<crate::intel_gpu_gt::Gen11Platform>,
     /// Tiger Lake UY (GT2) part — selects the UY HBR2
     /// combo-PHY table (`intel_gpu_gen12_combo_phy::is_tgl_uy`).
     /// Derived from the window's PCI device ID
@@ -441,6 +448,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             pipe,
             dbuf_share: None,
             gen12_family: mmio.gen12_display_family(),
+            gen11_platform: None,
             tgl_uy: mmio.tgl_uy(),
             edp_hobl: false,
             edp_low_vswing: false,
@@ -450,6 +458,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     pub(crate) fn set_gen12_family(&mut self, family: crate::intel_gpu_gt::Gen12Platform) {
         self.gen12_family = Some(family);
+    }
+
+    pub(crate) fn set_gen11_platform(&mut self, platform: crate::intel_gpu_gt::Gen11Platform) {
+        self.gen11_platform = Some(platform);
     }
 
     pub(crate) fn set_tgl_uy(&mut self, uy: bool) {
@@ -639,11 +651,38 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.try_disable_pipe_pipeline()
     }
     fn check_stop_source(&self) -> Result<(), ModesetError> {
+        if self.gen11_platform.is_some() {
+            if !self.mmio.display_access_ok() {
+                return Err(ModesetError::PipelineStopUnavailable);
+            }
+            return Ok(());
+        }
         if self.gen12_family.is_none() || self.gen12_family != self.mmio.gen12_display_family() {
             return Err(ModesetError::UnsupportedGeneration);
         }
         if !self.mmio.display_access_ok() {
             return Err(ModesetError::PipelineStopUnavailable);
+        }
+        Ok(())
+    }
+
+    /// Gen11 plane admission (Lane 5): the SKL rules
+    /// (`skl_universal_plane.c`) — a linear surface's stride
+    /// is capped at 32 KiB (`skl_plane_max_stride`) and its
+    /// GGTT offset must be 256 KiB aligned
+    /// (`skl_plane_min_alignment`, the VT-d floor). The shared
+    /// validation already checked 64-byte stride units and 4K
+    /// surface alignment; this is the Gen11 pinning rule on
+    /// top. A firmware surface that fails it refuses the
+    /// takeover (the panel keeps scanning the firmware
+    /// surface); the probe's owned allocation is 256 KiB
+    /// aligned by construction.
+    fn validate_framebuffer_gen11(&self, fb: &Framebuffer) -> Result<(), ModesetError> {
+        if fb.stride_bytes > crate::intel_gpu_scanout::gen11_max_stride() {
+            return Err(ModesetError::InvalidFramebuffer);
+        }
+        if fb.phys_addr % u64::from(crate::intel_gpu_scanout::gen11_alignment()) != 0 {
+            return Err(ModesetError::InvalidFramebuffer);
         }
         Ok(())
     }
@@ -675,6 +714,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         scrambling: bool,
         high_tmds_char_rate: bool,
     ) -> Result<Mode, ModesetError> {
+        // Gen11 has no HDMI modeset in this lane (Lane 8 owns
+        // external outputs): refuse before any validation.
+        if self.gen11_platform.is_some() {
+            return Err(ModesetError::UnsupportedGeneration);
+        }
         if self.ddi as u8 >= Ddi::D as u8 {
             return Err(ModesetError::UnsupportedGeneration);
         }
@@ -794,6 +838,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         };
 
         validate_framebuffer_mode(primary_fb, &mode)?;
+        // Gen11 plane admission (Lane 5): the SKL stride cap
+        // and the 256 KiB surface alignment, on top of the
+        // shared validation above.
+        if self.gen11_platform.is_some() {
+            self.validate_framebuffer_gen11(primary_fb)?;
+        }
         let dekel_sst = dekel && ddi_mode == crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST;
         if dekel_sst {
             if let Some(plan) = plan {
@@ -830,6 +880,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // stream skips this entirely — the primary stream's run
         // already clocked the shared link, and re-running the
         // PLL power/enable sequence would glitch it.
+        //
+        // Gen11 follows Linux's order instead: CDCLK
+        // (`intel_set_cdclk_pre_plane_update`) runs before DPLL
+        // enable, so the floor is raised here and step 4b below
+        // is skipped for Gen11 (see the branch there).
+        if self.gen11_platform.is_some() {
+            self.program_cdclk_floor(&mode)?;
+        }
         match (plan, already_trained) {
             (Some(p), _) => self.program_dpll_with_rate(&mode, to_pll_rate(p.rate))?,
             (None, Some(_)) => {}
@@ -844,7 +902,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // `icl_cdclk_table` rung at or above the floor, with
         // pcode frequency-request notifies. Only raises; a
         // faster firmware CDCLK is left alone.
-        self.program_cdclk_floor(&mode)?;
+        //
+        // Gen11 already raised the floor before step 4 (Linux
+        // order); this step is Gen12-only.
+        if self.gen11_platform.is_none() {
+            self.program_cdclk_floor(&mode)?;
+        }
 
         // Step 4c (lane 1): route this DDI's DPLL to the DDI in
         // DPCLKA_CFGCR0 — select the PLL and turn the DDI clock
@@ -1233,6 +1296,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 crate::intel_gpu_pll::refclk_khz(self.mmio.read32(DSSM)),
             );
         }
+        // Gen11: the ICL combo PLL (CFGCR0 0x164000 + pll*0x80),
+        // never the TGL CFGCR0 (0x164284) `program_dpll_coeffs`
+        // writes below.
+        if self.gen11_platform.is_some() {
+            return self.program_dpll_gen11(rate);
+        }
         // Reference-clock family from the DSSM strap (Q6,
         // #1024): a 24 MHz-strapped part programmed with the
         // 19.2 MHz rows gets a DCO 26% off target.
@@ -1243,6 +1312,31 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             None => return Err(ModesetError::PllLockTimeout),
         };
         self.program_dpll_coeffs(&coeffs)
+    }
+
+    /// Bring the Gen11 combo PLL up for `rate`:
+    /// `combo_coeffs` under the DSSM reference family, then the
+    /// ICL `combo_pll_enable` sequence (power, CFGCR0/1, enable,
+    /// wait LOCK). The EHL/JSL div-fraction workaround is off:
+    /// it applies only at a 38.4 MHz reference on EHL B0+
+    /// steppings, which this driver does not model — a
+    /// remainder, not a guess. DDI C fails closed: ICL has no
+    /// DPLL2 (Gen12's DDI C PLL), and DPLL4 is EHL/JSL-only
+    /// with an ungrounded port mapping.
+    fn program_dpll_gen11(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen11_dpll::{calc_dpll_state, combo_pll_enable, IclDpllId};
+        let id = match self.ddi {
+            Ddi::A => IclDpllId::Dpll0,
+            Ddi::B => IclDpllId::Dpll1,
+            _ => return Err(ModesetError::UnsupportedGeneration),
+        };
+        let family = decode_refclk_family(self.mmio.read32(DSSM));
+        let coeffs = match combo_coeffs(rate, family) {
+            Some(c) => c,
+            None => return Err(ModesetError::PllLockTimeout),
+        };
+        let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
+        combo_pll_enable(self.mmio, id, cfgcr0, cfgcr1).map_err(|_| ModesetError::PllLockTimeout)
     }
 
     /// Bring DPLL0 up with explicit coefficients: power, write
@@ -1480,15 +1574,26 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             // laptops, and the panel's VBT HOBL/low-vswing bits
             // ride on the modeset (set by
             // `modeset_display_family` from the probe-installed
-            // facts) into the table selection.
-            let phy = crate::intel_gpu_gen12_combo_phy::ComboPhy::new(
-                self.ddi,
-                self.gen12_family,
-                self.tgl_uy,
-                self.ddi == Ddi::A,
-                self.edp_hobl,
-                self.edp_low_vswing,
-            )?;
+            // facts) into the table selection. On Gen11 the same
+            // programmer runs with the ICL tables and the
+            // port-based DP_TP_CTL (`ComboPhy::new_gen11`); the
+            // HOBL bit never reaches it (no HOBL table on ICL).
+            let phy = match self.gen11_platform {
+                Some(platform) => crate::intel_gpu_gen12_combo_phy::ComboPhy::new_gen11(
+                    self.ddi,
+                    platform,
+                    self.ddi == Ddi::A,
+                    self.edp_low_vswing,
+                )?,
+                None => crate::intel_gpu_gen12_combo_phy::ComboPhy::new(
+                    self.ddi,
+                    self.gen12_family,
+                    self.tgl_uy,
+                    self.ddi == Ddi::A,
+                    self.edp_hobl,
+                    self.edp_low_vswing,
+                )?,
+            };
             phy.prepare(
                 self.mmio,
                 self.transcoder(),
@@ -1574,6 +1679,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// fail the modeset). A PLL lock timeout, lost access or
     /// readback mismatch fails the modeset.
     fn program_cdclk_floor(&mut self, mode: &Mode) -> Result<(), ModesetError> {
+        // Gen11: the ICL CDCLK model (pcode command 0x7,
+        // per-platform voltage levels), not the TGL
+        // frequency-request model below.
+        if let Some(platform) = self.gen11_platform {
+            return self.program_cdclk_floor_gen11(mode, platform);
+        }
         use crate::intel_gpu_gen12_cdclk as cdclk;
         let current =
             cdclk::Current::read(self.mmio).map_err(|_| ModesetError::CdclkUnavailable)?;
@@ -1590,6 +1701,40 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         match cdclk::program(self.mmio, &current, target) {
             Ok(()) => Ok(()),
             Err(cdclk::CdclkError::Pcode(_)) => Ok(()),
+            Err(_) => Err(ModesetError::CdclkUnavailable),
+        }
+    }
+
+    /// Gen11 CDCLK floor: the same shape as the Gen12 floor
+    /// above, through the ICL model (`intel_gpu_gen11_cdclk`:
+    /// the 18-rung table, DE PLL ratio + CD2X divider, pcode
+    /// CDCLK-control notifies with the ready-bit check, and the
+    /// platform voltage level). A refused pcode pre-notify —
+    /// or a reply without the ready bit — degrades the same
+    /// way as on Gen12 (leave the firmware clock; the modeset
+    /// proceeds). A PLL lock timeout, lost access or readback
+    /// mismatch fails the modeset.
+    fn program_cdclk_floor_gen11(
+        &mut self,
+        mode: &Mode,
+        platform: crate::intel_gpu_gt::Gen11Platform,
+    ) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen11_cdclk as cdclk;
+        let current =
+            cdclk::Current::read(self.mmio).map_err(|_| ModesetError::CdclkUnavailable)?;
+        let floor_khz = mode.pixel_clock_khz.div_ceil(2);
+        if let Some(known) = current.known {
+            if known.cdclk_khz >= floor_khz {
+                return Ok(());
+            }
+        }
+        let target = match cdclk::calc_cdclk(current.refclk_khz, floor_khz) {
+            Some(r) => r,
+            None => return Ok(()), // beyond the table; leave firmware CDCLK
+        };
+        match cdclk::program(self.mmio, &current, target, platform) {
+            Ok(()) => Ok(()),
+            Err(cdclk::CdclkError::Pcode(_) | cdclk::CdclkError::PcodeNotReady) => Ok(()),
             Err(_) => Err(ModesetError::CdclkUnavailable),
         }
     }
@@ -1642,6 +1787,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// watermark programming: the DDB blocks the watermarks
     /// reference live in the slices' SRAM.
     fn enable_dbuf_slices(&mut self) -> Result<(), ModesetError> {
+        // Gen11 DBUF slices live at the same offsets with the
+        // same power sequencing; the Gen11-scoped module owns
+        // the call so the register facts stay per-generation.
+        if self.gen11_platform.is_some() {
+            return crate::intel_gpu_gen11_wm::request_dbuf_slices(self.mmio)
+                .map_err(|_| ModesetError::DbufPowerTimeout);
+        }
         crate::intel_gpu_wm::request_dbuf_slices(self.mmio)
             .map_err(|_| ModesetError::DbufPowerTimeout)
     }
@@ -1669,6 +1821,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// shape — rather than leaving firmware watermarks of
     /// unknown provenance in place.
     fn program_watermarks(&mut self, mode: &Mode, fb: &Framebuffer) {
+        // Gen11: the 8-level ICL algorithm (no SAGV watermark),
+        // through the Gen11-scoped module.
+        if self.gen11_platform.is_some() {
+            self.program_watermarks_gen11(mode, fb);
+            return;
+        }
         use crate::intel_gpu_wm::{
             adjust_latencies, compute_plane_watermarks, encode_plane_buf_cfg, encode_wm_level,
             validate_watermarks, WmParams, PRIMARY_DDB_END, PRIMARY_DDB_START,
@@ -1733,6 +1891,93 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
+    /// Latency-based watermarks + DBUF allocation on Gen11
+    /// (Lane 5): the 8-level ICL algorithm in
+    /// `intel_gpu_gen11_wm` — read the memory latencies from
+    /// the pcode mailbox, compute the 8 levels + transition
+    /// watermark, validate against the whole-DBUF allocation,
+    /// and program PLANE_WM levels 0..7, the transition
+    /// watermark, and PLANE_BUF_CFG. Gen11 has no SAGV
+    /// watermark (`HAS_SAGV_WM` is DISPLAY_VER >= 12), so the
+    /// SAGV offsets are never written. The multi-pipe share
+    /// shape mirrors the Gen12 path (level-0 = the share size
+    /// at 2 lines, PLANE_BUF_CFG = the share's range).
+    ///
+    /// Fallback: if the pcode latency read fails, or the
+    /// computed set has no usable level 0, program the
+    /// pre-boot basics instead — the same 160-block level-0
+    /// shape as the Gen12 fallback (same DBUF geometry and
+    /// encoding; the ICL PRM pre-boot table itself was not
+    /// independently verified, so this is the shared shape).
+    fn program_watermarks_gen11(&mut self, mode: &Mode, fb: &Framebuffer) {
+        use crate::intel_gpu_gen11_wm::{
+            adjust_latencies, compute_plane_watermarks, encode_plane_buf_cfg, encode_wm_level,
+            validate_watermarks, WmParams, PRIMARY_DDB_END, PRIMARY_DDB_START,
+        };
+        if let Some((start, end)) = self.dbuf_share {
+            write_wm_block_gen11(
+                self.mmio,
+                self.pipe,
+                plane_wm0_for_blocks(end - start + 1),
+                dbuf_buf_cfg(start, end),
+            );
+            return;
+        }
+        let mmio = self.mmio;
+        let computed = (|| {
+            let raw = crate::intel_gpu_pcode::read_mem_latencies(mmio).ok()?;
+            // No 16 Gb-DIMM latency adjustment input: the driver
+            // does not model DIMMs, so the adjustment is off.
+            let latencies = adjust_latencies(&raw, false);
+            let params = WmParams {
+                pixel_rate_khz: mode.pixel_clock_khz,
+                htotal: mode.h_total as u32,
+                width_px: mode.h_active as u32,
+                cpp: fb.format.bits_per_pixel() / 8,
+            };
+            let mut wm = compute_plane_watermarks(&params, &latencies);
+            if !wm.levels[0].enable {
+                return None;
+            }
+            validate_watermarks(&mut wm, PRIMARY_DDB_END - PRIMARY_DDB_START);
+            if !wm.levels[0].enable {
+                return None;
+            }
+            Some(wm)
+        })();
+        let wm = match computed {
+            Some(wm) => wm,
+            None => {
+                self.program_watermarks_preboot_gen11();
+                return;
+            }
+        };
+        let wm_base = self.pipe.base() + PLANE_WM_BASE_OFFSET;
+        for (level, wm_level) in wm.levels.iter().enumerate() {
+            self.mmio
+                .write32(wm_base + level as u64 * 4, encode_wm_level(wm_level));
+        }
+        self.mmio
+            .write32(wm_base + PLANE_WM_TRANS_OFFSET, encode_wm_level(&wm.trans));
+        self.mmio.write32(
+            self.pipe.base() + PLANE_BUF_CFG_OFFSET,
+            encode_plane_buf_cfg(PRIMARY_DDB_START, PRIMARY_DDB_END),
+        );
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Gen11 pre-boot watermark basics: the same 160-block
+    /// level-0 shape as the Gen12 fallback (same DBUF geometry
+    /// and encoding — see `program_watermarks_gen11`).
+    fn program_watermarks_preboot_gen11(&mut self) {
+        write_wm_block_gen11(
+            self.mmio,
+            self.pipe,
+            PLANE_WM0_PREBOOT,
+            PLANE_BUF_CFG_PREBOOT_A,
+        );
+    }
+
     /// Lane 1's basic programming, kept as the fallback when
     /// the latency-based algorithm cannot run: the PRM's
     /// "Display Buffer Allocation and Watermark Programming
@@ -1744,6 +1989,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// programming to any resolution, linear surfaces,
     /// <=32 bpp, one universal plane per pipe.
     fn program_watermarks_preboot(&mut self) {
+        if self.gen11_platform.is_some() {
+            self.program_watermarks_preboot_gen11();
+            return;
+        }
         write_wm_block(
             self.mmio,
             self.pipe,
@@ -1981,6 +2230,23 @@ fn write_wm_block<M: MmioWindow + ?Sized>(mmio: &M, pipe: Pipe, wm0: u32, buf_cf
     compiler_fence(Ordering::SeqCst);
 }
 
+/// The Gen11 form of `write_wm_block`: level-0 watermark
+/// `wm0`, levels 1–7 and the transition watermark disabled,
+/// PLANE_BUF_CFG `buf_cfg`. Gen11 has 8 latency levels and no
+/// SAGV watermark — the offsets 0x18/0x1C are WM levels 6/7
+/// here, so the Gen12 writer (which writes SAGV zeros there)
+/// must never run on a Gen11 pipe.
+fn write_wm_block_gen11<M: MmioWindow + ?Sized>(mmio: &M, pipe: Pipe, wm0: u32, buf_cfg: u32) {
+    let wm_base = pipe.base() + PLANE_WM_BASE_OFFSET;
+    mmio.write32(wm_base, wm0);
+    for level in 1..8u64 {
+        mmio.write32(wm_base + level * 4, 0);
+    }
+    mmio.write32(wm_base + PLANE_WM_TRANS_OFFSET, 0);
+    mmio.write32(pipe.base() + PLANE_BUF_CFG_OFFSET, buf_cfg);
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Reprogram an already-live pipe's DBUF share (#1017): when
 /// the set of active pipes changes, the multi-pipe coordinator
 /// rewrites every surviving pipe's watermark block and
@@ -2084,7 +2350,9 @@ pub(crate) fn modeset_display<M: MmioWindow + ?Sized>(
     fb: &Framebuffer,
     mode: Option<&Mode>,
 ) -> Result<Mode, ModesetError> {
-    modeset_display_family(mmio, generation, None, false, fb, mode)
+    // No chip: the Gen11 platform is unknown, so the IceLake
+    // arm fails closed (see `modeset_display_family`).
+    modeset_display_family(mmio, generation, None, false, None, fb, mode)
 }
 
 /// Exact known PCI family; no P/S/N inference from the broad generation.
@@ -2112,6 +2380,23 @@ pub(crate) fn gen12_family_for_chip(
     }
 }
 
+/// The Gen11 mirror of `gen12_family_for_chip`: the exact
+/// Ice Lake / Elkhart Lake / Jasper Lake product for a chip
+/// whose generation is IceLake, from the PCI device ID.
+pub(crate) fn gen11_family_for_chip(
+    chip: crate::intel_gpu::ChipInfo,
+) -> Option<crate::intel_gpu_gt::Gen11Platform> {
+    use crate::intel_gpu::Generation;
+    match crate::intel_gpu_gt::GtPlatform::from_pci(chip.vid, chip.did) {
+        Some(crate::intel_gpu_gt::GtPlatform::Gen11(platform))
+            if chip.generation == Generation::IceLake =>
+        {
+            Some(platform)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn modeset_display_for_chip<M: MmioWindow + ?Sized>(
     mmio: &M,
     chip: crate::intel_gpu::ChipInfo,
@@ -2128,11 +2413,24 @@ pub(crate) fn modeset_display_for_chip<M: MmioWindow + ?Sized>(
     {
         return Err(ModesetError::UnsupportedGeneration);
     }
+    // Gen11: the platform is required — without the exact
+    // product the CDCLK voltage levels and DDI table selection
+    // cannot be resolved, so an unmapped IceLake chip fails
+    // closed here rather than modesetting as a wrong product.
+    let gen11 = if chip.generation == crate::intel_gpu::Generation::IceLake {
+        Some(match gen11_family_for_chip(chip) {
+            Some(platform) => platform,
+            None => return Err(ModesetError::UnsupportedGeneration),
+        })
+    } else {
+        None
+    };
     modeset_display_family(
         mmio,
         chip.generation,
         family,
         crate::intel_gpu_gen12_combo_phy::is_tgl_uy(chip.did),
+        gen11,
         fb,
         mode,
     )
@@ -2143,6 +2441,7 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
     generation: crate::intel_gpu::Generation,
     family: Option<crate::intel_gpu_gt::Gen12Platform>,
     tgl_uy: bool,
+    gen11: Option<crate::intel_gpu_gt::Gen11Platform>,
     fb: &Framebuffer,
     mode: Option<&Mode>,
 ) -> Result<Mode, ModesetError> {
@@ -2171,6 +2470,27 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
                 None => ms.modeset(fb, None),
             }
         }
+        Generation::IceLake => {
+            // Gen11 internal-panel modeset (Lane 5): the ICL
+            // CDCLK / DPLL / watermark / DDI-table path in the
+            // Linux ICL order, fixture-validated, silicon
+            // untested. The platform must be known (the
+            // no-chip `modeset_display` passes None and fails
+            // closed below). Only the low-vswing VBT bit rides
+            // into the table selection — there is no HOBL table
+            // on ICL, so `edp_hobl` stays clear.
+            let Some(platform) = gen11 else {
+                return Err(ModesetError::UnsupportedGeneration);
+            };
+            let mut ms = Modeset::new(mmio, Ddi::A);
+            ms.set_gen11_platform(platform);
+            let edp_signal = crate::intel_gpu_gen12_combo_phy::installed_edp_signal();
+            ms.set_edp_low_vswing(edp_signal.low_vswing());
+            match mode {
+                Some(mode) => ms.modeset_fixed(fb, mode),
+                None => ms.modeset(fb, None),
+            }
+        }
         Generation::MeteorLake => {
             let mut ms = crate::intel_gpu_modeset_xelpg::XeLpgModeset::new(
                 mmio,
@@ -2181,11 +2501,12 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
                 None => ms.modeset(fb, None),
             }
         }
-        // Gen11 display lands in Lane 4; no modeset is modeled yet.
-        Generation::IceLake
-        | Generation::RocketLake
-        | Generation::LunarLake
-        | Generation::PantherLake => Err(ModesetError::UnsupportedGeneration),
+        // Rocket Lake / Lunar Lake / Panther Lake have no
+        // panel modeset in this module (owned routes elsewhere
+        // or not modeled).
+        Generation::RocketLake | Generation::LunarLake | Generation::PantherLake => {
+            Err(ModesetError::UnsupportedGeneration)
+        }
     };
     if let Ok(committed) = &result {
         // Per-modeset VRR/CMRR compute for the panel (#1771): a
@@ -3351,6 +3672,21 @@ pub mod tests {
                     // answers with no data dwords.
                     *self.pcode_mailbox.borrow_mut() = 0;
                 }
+                crate::intel_gpu_pcode::PCODE_CMD_CDCLK_CONTROL => {
+                    // The ICL CDCLK-control notifies: pre-notify
+                    // (DATA0 = PREPARE_FOR_CHANGE) replies with
+                    // the ready bit; post-notify (DATA0 = voltage
+                    // level) just completes.
+                    use crate::intel_gpu_pcode::{
+                        SKL_CDCLK_PREPARE_FOR_CHANGE, SKL_CDCLK_READY_FOR_CHANGE,
+                    };
+                    if self.pcode_data.borrow()[0] == SKL_CDCLK_PREPARE_FOR_CHANGE {
+                        self.pcode_data.borrow_mut()[0] = SKL_CDCLK_READY_FOR_CHANGE;
+                    } else {
+                        self.pcode_data.borrow_mut()[0] = 0;
+                    }
+                    *self.pcode_mailbox.borrow_mut() = 0;
+                }
                 _ => *self.pcode_mailbox.borrow_mut() = 0x1, // ILLEGAL_CMD
             }
         }
@@ -3759,6 +4095,309 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_modeset_full_run_scripted_sink
+    );
+
+    // ── Gen11 modeset (Lane 5) ───────────────────────────────────
+
+    fn smoke_gen11_family_for_chip_uses_exact_pci_ids() -> TestResult {
+        use crate::intel_gpu::{ChipInfo, Generation};
+        use crate::intel_gpu_gt::Gen11Platform;
+        for (did, platform) in [
+            (0x8A51, Gen11Platform::IceLake),
+            (0x4571, Gen11Platform::ElkhartLake),
+            (0x4E51, Gen11Platform::JasperLake),
+        ] {
+            let chip = ChipInfo {
+                vid: 0x8086,
+                did,
+                generation: Generation::IceLake,
+                asic: "literal native fixture",
+            };
+            if gen11_family_for_chip(chip) != Some(platform) {
+                return TestResult::Fail("Gen11 PCI ID must map to its exact product");
+            }
+            // A generation alias must not promote a chip into a
+            // Gen11 platform it is not.
+            if gen11_family_for_chip(ChipInfo {
+                generation: Generation::TigerLake,
+                ..chip
+            })
+            .is_some()
+            {
+                return TestResult::Fail("Gen11 mapping must require the IceLake generation");
+            }
+        }
+        // An unmapped IceLake chip fails closed at the dispatch,
+        // without touching MMIO.
+        struct NoIo;
+        impl MmioWindow for NoIo {
+            fn read32(&self, _: u64) -> u32 {
+                panic!("unknown Gen11 chip read MMIO")
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("unknown Gen11 chip wrote MMIO")
+            }
+        }
+        if modeset_display_for_chip(
+            &NoIo,
+            ChipInfo {
+                vid: 0x8086,
+                did: 0x8AFF,
+                generation: Generation::IceLake,
+                asic: "unknown",
+            },
+            &fb_1080p(),
+            Some(&Mode::VESA_1024X768_60),
+        ) != Err(ModesetError::UnsupportedGeneration)
+        {
+            return TestResult::Fail("unmapped IceLake chip must fail closed");
+        }
+        // The no-chip entry point has no platform to select
+        // with, so IceLake fails closed there too.
+        if modeset_display(
+            &NoIo,
+            Generation::IceLake,
+            &fb_1080p(),
+            Some(&Mode::VESA_1024X768_60),
+        ) != Err(ModesetError::UnsupportedGeneration)
+        {
+            return TestResult::Fail("no-chip IceLake modeset must fail closed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen11_family_for_chip_uses_exact_pci_ids
+    );
+
+    fn smoke_gen11_scanout_admission() -> TestResult {
+        use crate::intel_gpu_gt::Gen11Platform;
+        if crate::intel_gpu_scanout::gen11_alignment() != 256 * 1024
+            || crate::intel_gpu_scanout::gen11_max_stride() != 32 * 1024
+        {
+            return TestResult::Fail("Gen11 alignment/stride must be the SKL rules");
+        }
+        let io = FakeMmio::new();
+        let mut ms = Modeset::new(&io, Ddi::A);
+        ms.set_gen11_platform(Gen11Platform::IceLake);
+        // Stride past the 32 KiB SKL cap.
+        let over_stride = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 32 * 1024 + 64,
+            format: PixelFormat::Xrgb8888,
+        };
+        if ms.validate_framebuffer_gen11(&over_stride).is_ok() {
+            return TestResult::Fail("Gen11 must refuse a stride past 32 KiB");
+        }
+        // 4K-aligned but not 256 KiB aligned surface.
+        let misaligned = Framebuffer {
+            phys_addr: 0x100_1000,
+            stride_bytes: 1920 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+        if ms.validate_framebuffer_gen11(&misaligned).is_ok() {
+            return TestResult::Fail("Gen11 must refuse a surface past 256 KiB alignment");
+        }
+        // The probe's owned allocation (16 MiB, 256 KiB aligned)
+        // and the 1080p stride pass.
+        if ms.validate_framebuffer_gen11(&fb_1080p()).is_err() {
+            return TestResult::Fail("Gen11 must admit the owned 1080p surface");
+        }
+        // The cap is exact: 32 KiB strides pass.
+        let at_cap = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 32 * 1024,
+            format: PixelFormat::Xrgb8888,
+        };
+        if ms.validate_framebuffer_gen11(&at_cap).is_err() {
+            return TestResult::Fail("Gen11 must admit a 32 KiB stride");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen11_scanout_admission
+    );
+
+    fn smoke_gen11_modeset_full_run_scripted_sink() -> TestResult {
+        use crate::intel_gpu::{ChipInfo, Generation};
+        // DSSM strap: 19.2 MHz (field 1).
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        let chip = ChipInfo {
+            vid: 0x8086,
+            did: 0x8A51,
+            generation: Generation::IceLake,
+            asic: "icelake",
+        };
+        let mode = match modeset_display_for_chip(&mmio, chip, &fb_1080p(), None) {
+            Ok(m) => m,
+            Err(_) => {
+                return TestResult::Fail("Gen11 full modeset over scripted sink must succeed")
+            }
+        };
+        // The mode came from the sink's EDID, not a fallback.
+        if mode.pixel_clock_khz != 148_500
+            || mode.h_active != 1920
+            || mode.h_total != 2200
+            || mode.v_active != 1080
+            || mode.v_total != 1125
+        {
+            return TestResult::Fail("Gen11 modeset must return the EDID preferred mode");
+        }
+        // DPLL: the RBR row of the 19.2 MHz family, written to
+        // the ICL CFGCR0 (0x164000) — never the TGL CFGCR0
+        // (0x164284).
+        if mmio.writes_to(0x164000) != alloc::vec![0x01C0_01A5] {
+            return TestResult::Fail("Gen11 CFGCR0 must be the 19.2-family RBR row at 0x164000");
+        }
+        if !mmio.writes_to(0x164284).is_empty() {
+            return TestResult::Fail("Gen11 must never write the TGL CFGCR0");
+        }
+        // CDCLK: 148.5 MHz pixel clock, floor 74.25 MHz, 19.2 MHz
+        // strap -> the 172.8 MHz ICL rung (ratio 18, DIV_SEL 2,
+        // decimal 344), with pcode CDCLK-control pre + post
+        // notifies (0x07).
+        use crate::intel_gpu_gen11_cdclk::{CDCLK_CTL, DE_PLL_ENABLE};
+        if mmio.writes_to(DE_PLL_ENABLE) != alloc::vec![0, 18, 0x8000_0012] {
+            return TestResult::Fail("Gen11 CDCLK PLL must disable, then enable at ratio 18");
+        }
+        if mmio.writes_to(CDCLK_CTL) != alloc::vec![(7 << 19) | 344] {
+            return TestResult::Fail("Gen11 CDCLK_CTL must be pipe-none + decimal 344");
+        }
+        let cdclk_notify = mmio
+            .writes_to(crate::intel_gpu_pcode::PCODE_MAILBOX)
+            .into_iter()
+            .filter(|w| *w == 0x8000_0007)
+            .count();
+        if cdclk_notify != 2 {
+            return TestResult::Fail("Gen11 CDCLK change must send pre + post control notifies");
+        }
+        // Linux order: the CDCLK program precedes the DPLL
+        // program in the write log.
+        let writes = mmio.writes.borrow();
+        let cdclk_at = writes
+            .iter()
+            .position(|(o, _)| *o == CDCLK_CTL)
+            .unwrap_or(usize::MAX);
+        let dpll_at = writes
+            .iter()
+            .position(|(o, _)| *o == 0x164000)
+            .unwrap_or(usize::MAX);
+        if !(cdclk_at < dpll_at) {
+            return TestResult::Fail("Gen11 CDCLK must precede DPLL in the write log");
+        }
+        // DPCLKA: DDI A selects DPLL 0, clock on, in the PRM's
+        // two writes.
+        if mmio.writes_to(0x164280) != alloc::vec![0x400, 0x0] {
+            return TestResult::Fail("Gen11 DPCLKA must select DPLL0 for DDI A, clock on");
+        }
+        // Watermarks: the 8 ICL levels hand-computed from the
+        // algorithm for this mode + the sink's latency table
+        // ([6, 9, 13, 18, 24, 31, 40, 52] µs), the transition
+        // watermark (level-0 blocks + 14), and the full-DBUF
+        // allocation. No SAGV watermark exists on Gen11: the
+        // 0x18/0x1C offsets are WM levels 6/7 and must carry
+        // their levels, never SAGV zeros.
+        let wm_base = Pipe::A.base() + super::PLANE_WM_BASE_OFFSET;
+        let want = [
+            0x8000_4010u32,
+            0x8000_4010,
+            0x8000_8012,
+            0x8000_8021,
+            0x8000_8021,
+            0x8000_C031,
+            0x8000_C031,
+            0x8001_0041,
+        ];
+        for (level, w) in want.iter().enumerate() {
+            if mmio.writes_to(wm_base + level as u64 * 4) != alloc::vec![*w] {
+                return TestResult::Fail("Gen11 PLANE_WM level value mismatch in full run");
+            }
+        }
+        if mmio.writes_to(wm_base + super::PLANE_WM_TRANS_OFFSET) != alloc::vec![0x8000_001E] {
+            return TestResult::Fail("Gen11 transition watermark mismatch in full run");
+        }
+        if mmio.writes_to(Pipe::A.base() + super::PLANE_BUF_CFG_OFFSET) != alloc::vec![0x07FF_0000]
+        {
+            return TestResult::Fail("Gen11 BUF_CFG must be the full-DBUF allocation");
+        }
+        // DBUF slices were power-requested.
+        use crate::intel_gpu_gen11_wm::{DBUF_CTL_S1, DBUF_CTL_S2, DBUF_POWER_REQUEST};
+        for off in [DBUF_CTL_S1, DBUF_CTL_S2] {
+            if !mmio
+                .writes_to(off)
+                .iter()
+                .any(|v| v & DBUF_POWER_REQUEST != 0)
+            {
+                return TestResult::Fail("Gen11 DBUF slice never power-requested");
+            }
+        }
+        // Training really happened: SET_POWER D0, TPS1 → TPS3
+        // → off, and the sink's requested swing was applied.
+        let sink = mmio.sink.borrow();
+        if sink.power != 1 {
+            return TestResult::Fail("sink never powered to D0");
+        }
+        if sink.pattern_history != alloc::vec![1u8, 3, 0] {
+            return TestResult::Fail("training pattern sequence must be TPS1, TPS3, off");
+        }
+        if sink.pattern != 0 {
+            return TestResult::Fail("training must end with pattern off");
+        }
+        if sink.tunes.iter().any(|t| t & 0x3 != 1) {
+            return TestResult::Fail("sink-requested swing 1 must be applied on all lanes");
+        }
+        // Combo-PHY signal levels (PHY_A, 0x162000): the sink
+        // trained at HBR2 and asked for swing 1, so the final
+        // program is preset 4 of the ICL DP HBR2 / eDP HBR3
+        // table {0xA, 0x4C, 0x3F, 0x00, 0x00} — the N-scalar
+        // 0x4C distinguishes it from the TGL table's 0x47.
+        let phy = 0x162000u64;
+        if mmio.writes_to(phy + 0x604).last() != Some(&0x0400_0000) {
+            return TestResult::Fail("PCS_DW1 must end with COMMON_KEEPER_EN set");
+        }
+        if mmio.writes_to(phy + 0x14).last() != Some(&0x3) {
+            return TestResult::Fail("CL_DW5 must carry SUS_CLOCK_CONFIG");
+        }
+        let cl_dw10 = mmio.writes_to(phy + 0x28);
+        if cl_dw10.is_empty() || cl_dw10.iter().any(|w| *w != 0) {
+            return TestResult::Fail("Gen11 eDP must clear the CL_DW10 HOBL override");
+        }
+        if mmio.writes_to(phy + 0x694).last() != Some(&0xA008_0030) {
+            return TestResult::Fail("DW5 must end with scaling programmed + training enable");
+        }
+        if mmio.writes_to(phy + 0x888).last() != Some(&0x9098) {
+            return TestResult::Fail("DW2 LN0 must carry the preset-4 swing");
+        }
+        if mmio.writes_to(phy + 0x89C).last() != Some(&0x4C00_0000) {
+            return TestResult::Fail("DW7 LN0 must carry the ICL preset-4 N-scalar");
+        }
+        // DP_TP_CTL is port-based on Gen11: DDI A base + 0x40
+        // (0x64040) returns to NORMAL once training ends with
+        // pattern off (ENABLE + ENHANCED_FRAME stay set), and
+        // the TGL transcoder-based register (0x60540) is never
+        // written.
+        if mmio.writes_to(0x64040).last() != Some(&0x8004_0300) {
+            return TestResult::Fail("Gen11 DP_TP_CTL must end at NORMAL");
+        }
+        if !mmio.writes_to(0x60540).is_empty() {
+            return TestResult::Fail("Gen11 must never write the TGL transcoder DP_TP_CTL");
+        }
+        // Gen11 never writes DDI_BUF_TRANS either: Linux selects
+        // it only for DISPLAY_VER < 10.
+        if mmio
+            .writes
+            .borrow()
+            .iter()
+            .any(|(o, _)| (0x64E00..0x64E50).contains(o))
+        {
+            return TestResult::Fail("DDI_BUF_TRANS must not be written on Gen11");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen11_modeset_full_run_scripted_sink
     );
 
     fn smoke_modeset_fallback_retunes_combo_dpll() -> TestResult {
