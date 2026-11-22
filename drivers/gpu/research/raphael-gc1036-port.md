@@ -703,7 +703,13 @@ since the submitter is replaced. Raphael's port:
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table
   nothing here has read; NBIO is inferred to be `nbio_v7_2`'s from Linux's
-  history (step 4).
+  history (step 4). No public Raphael discovery dump was found: the one
+  Raphael bring-up report found, FreeBSD drm-kmod #478, carries no logs, and
+  the amd-gfx archives refuse automated reads. The cold boot now prints one
+  line with the discovered NBIF, MMHUB, ATHUB, OSSSYS, HDP and SMUIO
+  versions (`amdgpu: raphael discovery: ...`), so the first boot on the
+  hardware confirms them. So does a Linux dump of
+  `/sys/class/drm/card*/device/ip_discovery/die/0/*/0/{major,minor,revision}`.
 - PMFW's initial GFXOFF state on 13.0.5: Linux starts with a GFXOFF request
   count of 1 (disallowed) and never sends `DisallowGfxOff` at init. This
   port sends it at the SMU stage, before any GC access, and allows GFXOFF

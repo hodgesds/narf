@@ -205,6 +205,10 @@ impl ColdBoot {
         {
             return Err(Error::Invalid);
         }
+        {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "{}", discovery_line(&gpu.ip_blocks));
+        }
         let gpu = snapshot(gpu)?;
         // SAFETY: forwarded exclusive ownership; every constructor below only
         // validates layouts, reserves memory or maps BAR2.
@@ -958,6 +962,32 @@ async fn trap_round_trip(ih: &mut ih::Ih, sdma: &mut sdma::Sdma) -> Result<(), E
         .await
         .map_err(Error::Interrupts)?;
     Ok(())
+}
+
+/// The blocks whose Raphael versions this port infers rather than knows:
+/// no Raphael discovery table has been read. Each is accepted at every
+/// version Linux drives with the same functions.
+const INFERRED: [(&str, u16); 6] = [
+    ("NBIF", crate::amdgpu_discovery::HW_ID_NBIF),
+    ("MMHUB", crate::amdgpu_discovery::HW_ID_MMHUB),
+    ("ATHUB", crate::amdgpu_discovery::HW_ID_ATHUB),
+    ("OSSSYS", crate::amdgpu_discovery::HW_ID_OSSSYS),
+    ("HDP", crate::amdgpu_discovery::HW_ID_HDP),
+    ("SMUIO", crate::amdgpu_discovery::HW_ID_SMUIO),
+];
+/// One boot line with the discovered versions of [`INFERRED`]'s blocks
+/// (instance 0; `-` where discovery lists none), so the first boot on the
+/// hardware confirms or refutes them.
+pub(crate) fn discovery_line(blocks: &[crate::amdgpu_discovery::IpBlock]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut line = alloc::string::String::from("amdgpu: raphael discovery:");
+    for (name, id) in INFERRED {
+        let _ = match crate::amdgpu_discovery::find_ip(blocks, id, 0) {
+            Some(b) => write!(line, " {name} {}.{}.{}", b.major, b.minor, b.revision),
+            None => write!(line, " {name} -"),
+        };
+    }
+    line
 }
 
 /// Boot-only checkpoints, never a poll-loop trace.

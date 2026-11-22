@@ -68,3 +68,39 @@ kernel_test_in!(
     "drivers/gpu/raphael-boot",
     raphael_boot_refuses_other_gpus_before_allocation
 );
+
+/// The boot's discovery line names each inferred block's instance-0
+/// version in a fixed order, and `-` for a block discovery did not list,
+/// so a first boot on Raphael reads as a confirmation or a refutation.
+fn raphael_discovery_line_names_the_inferred_versions() -> TestResult {
+    use crate::amdgpu_discovery::{self as d, IpBlock};
+    let ip = |hw_id, (major, minor, revision), instance| IpBlock {
+        hw_id,
+        instance,
+        major,
+        minor,
+        revision,
+        sub_revision: 0,
+        variant: 0,
+        base_addrs: [0; d::MAX_BASE_ADDRS],
+        num_bases: 0,
+    };
+    let blocks = [
+        ip(d::HW_ID_SMUIO, (13, 0, 3), 0),
+        ip(d::HW_ID_NBIF, (7, 2, 1), 0),
+        ip(d::HW_ID_MMHUB, (2, 9, 9), 1),
+        ip(d::HW_ID_MMHUB, (2, 3, 0), 0),
+        ip(d::HW_ID_OSSSYS, (5, 2, 1), 0),
+        ip(d::HW_ID_HDP, (5, 2, 1), 0),
+    ];
+    if discovery_line(&blocks)
+        != "amdgpu: raphael discovery: NBIF 7.2.1 MMHUB 2.3.0 ATHUB - OSSSYS 5.2.1 HDP 5.2.1 SMUIO 13.0.3"
+    {
+        return TestResult::Fail("the discovery line's order, instance or absent marker");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/raphael-boot",
+    raphael_discovery_line_names_the_inferred_versions
+);
