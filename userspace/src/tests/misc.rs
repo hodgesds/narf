@@ -4367,6 +4367,61 @@ fn smoke_blocked_syscall_decodes_saved_registers() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_blocked_syscall_decodes_saved_registers);
 
+// A task parked in an `int 0x80` system call is in an i386 call, whatever
+// mode it runs in (Linux `syscall_get_nr` / `syscall_get_arguments` for an
+// ia32 syscall): the number is eax and the arguments are ebx, ecx, edx,
+// esi, edi, ebp, each its low 32 bits.
+#[cfg(target_arch = "x86_64")]
+fn smoke_blocked_syscall_decodes_int80_as_i386() -> TestResult {
+    use crate::user_task::UserTaskCtx;
+    use core::sync::atomic::Ordering;
+    use narf_arch::x86_64::trap_frame::TrapFrame;
+
+    #[repr(C, align(16))]
+    struct Stack([u8; 4096]);
+    let mut stack = alloc::boxed::Box::new(Stack([0; 4096]));
+    let top = stack.0.as_mut_ptr() as u64 + 4096;
+    let uc = UserTaskCtx::new();
+    uc.parked_in_syscall.store(true, Ordering::Release);
+    uc.kernel_stack_top.store(top, Ordering::Release);
+    let tf = (top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
+    // SAFETY: inside `stack`, suitably aligned.
+    unsafe {
+        // i386 nanosleep (162), with garbage above eax.
+        (*tf).rax = 0xDEAD_0000_0000_00A2;
+        ((*tf).rbx, (*tf).rcx, (*tf).rdx) = (0xFFFF_FFFF_0000_0011, 0x1_0000_0022, 0x33);
+        ((*tf).rsi, (*tf).rdi, (*tf).rbp) = (0x44, 0xAAAA_0000_0000_0055, 0x66);
+        // The 64-bit argument registers are not i386 arguments.
+        ((*tf).r10, (*tf).r8, (*tf).r9) = (0x777, 0x888, 0x999);
+        ((*tf).rsp, (*tf).rip) = (0xFFD0_0000, 0x0804_8123);
+        ((*tf).cs, (*tf).ss) = (0x23, 0x2B);
+        (*tf).vector = 0x80;
+    }
+    let got = uc.blocked_syscall_frame();
+    uc.parked_in_syscall.store(false, Ordering::Release);
+    drop(stack);
+    let want = [
+        162,
+        0x11,
+        0x22,
+        0x33,
+        0x44,
+        0x55,
+        0x66,
+        0xFFD0_0000,
+        0x0804_8123,
+    ];
+    if got != Some(want) {
+        return TestResult::Fail("an int 0x80 frame was not decoded as an i386 system call");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/ia32-int80",
+    smoke_blocked_syscall_decodes_int80_as_i386
+);
+
 // `/proc/<pid>/syscall` prints `task_current_syscall()`'s whole result:
 // number, six arguments, then the user SP and PC. Both come from the same
 // saved frame as the arguments, for every frame layout the decoder handles.
