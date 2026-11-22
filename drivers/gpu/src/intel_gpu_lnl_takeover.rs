@@ -811,9 +811,10 @@ mod tests {
         assert!(!crate::intel_gpu::Generation::LunarLake.display_supported());
         assert!(!crate::intel_gpu::Generation::LunarLake.external_display_supported());
         assert!(!crate::intel_gpu::Generation::LunarLake.backlight_supported());
-        assert!(crate::intel_gpu::Generation::LunarLake
-            .region_generation()
-            .is_none());
+        assert_eq!(
+            crate::intel_gpu::Generation::LunarLake.region_generation(),
+            Some(crate::intel_gpu_regions::RegionGeneration::Xe2Lpd)
+        );
         assert_eq!(
             crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80),
             Some(crate::intel_gpu_gt::GtPlatform::WildcatLake)
@@ -1059,9 +1060,10 @@ mod tests {
         assert!(!crate::intel_gpu::Generation::PantherLake.display_supported());
         assert!(!crate::intel_gpu::Generation::PantherLake.external_display_supported());
         assert!(!crate::intel_gpu::Generation::PantherLake.backlight_supported());
-        assert!(crate::intel_gpu::Generation::PantherLake
-            .region_generation()
-            .is_none());
+        assert_eq!(
+            crate::intel_gpu::Generation::PantherLake.region_generation(),
+            Some(crate::intel_gpu_regions::RegionGeneration::Xe3Lpd)
+        );
         assert_eq!(
             crate::intel_gpu_gt::GtPlatform::from_pci(0x8086, 0xfd80),
             Some(crate::intel_gpu_gt::GtPlatform::WildcatLake)

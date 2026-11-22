@@ -349,6 +349,150 @@ pub static XE_LPG_REGIONS: &[Region] = &[
     },
 ];
 
+/// Xe2-LPD region map — Lunar Lake (display 20).
+///
+/// Entry-identical to [`XE_LPG_REGIONS`] today, and deliberately a
+/// separate table rather than an alias: LNL is a different display
+/// IP from MTL (display 20 vs 14), so a future BAR0 delta needs a
+/// home that does not conflate the two. The shared layout is
+/// grounded, not assumed:
+///
+/// - Linux 7.4-rc2 assigns the single `__mtl_fw_ranges` table for
+///   every `GRAPHICS_VER_FULL >= IP_VER(12, 70)`
+///   (`drivers/gpu/drm/i915/intel_uncore.c`,
+///   `uncore_forcewake_init`); LNL's graphics IP is Xe2_LPG 20.04
+///   (`drivers/gpu/drm/xe/xe_pci.c`, `graphics_ips[]`), above the
+///   threshold. That table's display domain is one no-forcewake
+///   range `[0x40000, 0x1901F0)`, which covers both NARF Display
+///   ranges below.
+/// - Every display register the in-tree display-20 code touches
+///   falls inside these ranges (offset census of
+///   `intel_gpu_xe2lpd.rs` / `intel_gpu_xe3lpd.rs` /
+///   `intel_gpu_xe3plpd.rs` / `intel_gpu_lnl_takeover.rs`): e.g.
+///   `XE2LPD_DE_CAP` 0x41100, `LNL_PKG_C_LATENCY` 0x46460,
+///   `SKL_DFSM` 0x51000, `GMD_ID_DISPLAY` 0x510a0,
+///   `DP_MIN_HBLANK_CTL` 0x600ac (all in the display block), and
+///   `XE2LPD_PICA_PW_CTL` 0x16fe04 / `PICA_PHY_CONFIG_CONTROL`
+///   0x16fe68 (in the PICA block). The only outsiders are GT-side
+///   registers (GuC 0x101000, `VF_CAP` 0x1901f8, media-GSI
+///   0x38xxxx), the DMC scratch `DMC_FQ_W2_PTS_CFG_SEL` 0x8f240 and
+///   the Wa_15015404425 flush dummy 0x130030 — all outside MTL's
+///   table too, so no new `RegionKind` is introduced here.
+/// - The display-14/20 chain shares one register map: LNL display
+///   runs through `XeLpgModeset` with a `DisplayIp::Xe2Lpd`
+///   dispatch, relocating only DDI A/B PHY/AUX into the PICA
+///   block (`__xe2lpd_port_idx`, `__xe2lpd_aux_ch_idx`).
+pub static XE2_LPD_REGIONS: &[Region] = &[
+    Region {
+        kind: RegionKind::Gunit,
+        offset: 0x0000_0000,
+        size: 0x0001_0000,
+    },
+    Region {
+        kind: RegionKind::Fuse,
+        offset: 0x0000_9000,
+        size: 0x0000_1000,
+    },
+    Region {
+        kind: RegionKind::Punit,
+        offset: 0x0013_8000,
+        size: 0x0000_8000,
+    },
+    Region {
+        kind: RegionKind::Gt,
+        offset: 0x0000_2000,
+        size: 0x0000_4000,
+    },
+    Region {
+        kind: RegionKind::Display,
+        offset: 0x0004_0000,
+        size: 0x0004_0000,
+    },
+    // PICA block (Type-C PHY/AUX) — the display-20 DDI A/B
+    // PHY and AUX registers live here, not at their Gen12
+    // offsets (`intel_gpu_xe2lpd::PICA_PW_CTL` 0x16fe04,
+    // `intel_gpu_xe3lpd::PICA_PHY_CONFIG_CONTROL` 0x16fe68).
+    Region {
+        kind: RegionKind::Display,
+        offset: 0x0016_F000,
+        size: 0x0000_1000,
+    },
+    Region {
+        kind: RegionKind::Gmbus,
+        offset: 0x000C_5100,
+        size: 0x0000_0040,
+    },
+    // No Dpll entry — as on Xe-LPG, the port PLLs live inside
+    // the C10/C20 PHYs and are programmed over the message bus.
+    Region {
+        kind: RegionKind::GttAdr,
+        offset: 0x0080_0000,
+        size: 0x0080_0000,
+    },
+];
+
+/// Xe3-LPD region map — Panther Lake (display 30.00) and Wildcat
+/// Lake (display 30.02).
+///
+/// Entry-identical to [`XE2_LPD_REGIONS`] today, kept separate so
+/// the two display IPs are never conflated: display 30 is its own
+/// IP (VRR timing generator on every transcoder, widened
+/// `XELPDP_DDI_CLOCK_SELECT_MASK` 16:12, PICA-relocated PHY/AUX,
+/// Wa_15015404425) even though it shares the BAR0 layout. The
+/// grounding is the same as Xe2-LPD's: Linux assigns the single
+/// `__mtl_fw_ranges` table for `GRAPHICS_VER_FULL >= IP_VER(12,
+/// 70)`, and PTL's graphics IP is Xe3_LPG 30.00
+/// (`drivers/gpu/drm/xe/xe_pci.c`, `graphics_ips[]`). Wildcat
+/// Lake shares the map: it is a Panther Lake subplatform on
+/// C10/C20 (three pipes A–C vs four is a pipe-count difference,
+/// not a BAR0 difference — `intel_gpu_xe3lpd`).
+pub static XE3_LPD_REGIONS: &[Region] = &[
+    Region {
+        kind: RegionKind::Gunit,
+        offset: 0x0000_0000,
+        size: 0x0001_0000,
+    },
+    Region {
+        kind: RegionKind::Fuse,
+        offset: 0x0000_9000,
+        size: 0x0000_1000,
+    },
+    Region {
+        kind: RegionKind::Punit,
+        offset: 0x0013_8000,
+        size: 0x0000_8000,
+    },
+    Region {
+        kind: RegionKind::Gt,
+        offset: 0x0000_2000,
+        size: 0x0000_4000,
+    },
+    Region {
+        kind: RegionKind::Display,
+        offset: 0x0004_0000,
+        size: 0x0004_0000,
+    },
+    // PICA block — the display-30 view (`intel_gpu_xe3lpd::View`)
+    // relocates DDI A PHY/AUX here; `PICA_PHY_CONFIG_CONTROL`
+    // 0x16fe68 carries `EDP_ON_TYPEC`.
+    Region {
+        kind: RegionKind::Display,
+        offset: 0x0016_F000,
+        size: 0x0000_1000,
+    },
+    Region {
+        kind: RegionKind::Gmbus,
+        offset: 0x000C_5100,
+        size: 0x0000_0040,
+    },
+    // No Dpll entry — as on Xe-LPG / Xe2-LPD.
+    Region {
+        kind: RegionKind::GttAdr,
+        offset: 0x0080_0000,
+        size: 0x0080_0000,
+    },
+];
+
 // ── Generation routing ───────────────────────────────────────────
 
 /// Sub-architectures the Stage-0 enumeration covers. Tiger Lake /
@@ -360,8 +504,12 @@ pub static XE_LPG_REGIONS: &[Region] = &[
 /// distinct so Gen11 never inherits a Gen12-only claim.
 /// Meteor Lake (Xe-LPG) has a different MMIO map — display block
 /// shifted down, Type-C port block where Gen12's DPLL block sits —
-/// and maps to `XE_LPG_REGIONS` (#1016). Panther Lake (Xe3-LPD)
-/// is not modelled.
+/// and maps to `XE_LPG_REGIONS` (#1016). Lunar Lake (Xe2-LPD,
+/// display 20) and Panther/Wildcat Lake (Xe3-LPD, display 30)
+/// share that BAR0 layout — one Linux forcewake table
+/// (`__mtl_fw_ranges`) covers all three — but keep their own
+/// tables (`XE2_LPD_REGIONS`, `XE3_LPD_REGIONS`) so the display
+/// IPs are never conflated.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegionGeneration {
     /// Gen11 — ICL / EHL / JSL. Same BAR0 partitioning as Gen12.
@@ -370,6 +518,10 @@ pub enum RegionGeneration {
     Gen12,
     /// Xe-LPG — Meteor Lake.
     XeLpg,
+    /// Xe2-LPD — Lunar Lake (display 20).
+    Xe2Lpd,
+    /// Xe3-LPD — Panther Lake (display 30.00) / Wildcat Lake (30.02).
+    Xe3Lpd,
 }
 
 /// Resolve the region table for a generation.
@@ -378,6 +530,8 @@ pub const fn regions_for(gen: RegionGeneration) -> &'static [Region] {
         RegionGeneration::Gen11 => GEN11_REGIONS,
         RegionGeneration::Gen12 => GEN12_REGIONS,
         RegionGeneration::XeLpg => XE_LPG_REGIONS,
+        RegionGeneration::Xe2Lpd => XE2_LPD_REGIONS,
+        RegionGeneration::Xe3Lpd => XE3_LPD_REGIONS,
     }
 }
 
@@ -506,6 +660,89 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_xelpg_regions);
+
+    fn smoke_xe2lpd_regions() -> TestResult {
+        // Lunar Lake (display 20) carries the Xe-LPG BAR0 layout
+        // under its own table: every kind the map defines must
+        // resolve, DPLL must NOT (the port PLLs live in the C10/
+        // C20 PHYs), and the display-20 registers must land in
+        // DISPLAY — `XE2LPD_DE_CAP` 0x41100, the power-well
+        // register 0x45404, Pipe A 0x60000 — and the PICA
+        // registers in the second DISPLAY range:
+        // `XE2LPD_PICA_PW_CTL` 0x16fe04 and
+        // `PICA_PHY_CONFIG_CONTROL` 0x16fe68.
+        for kind in [
+            RegionKind::Gt,
+            RegionKind::Display,
+            RegionKind::Gmbus,
+            RegionKind::Gunit,
+            RegionKind::Punit,
+            RegionKind::Fuse,
+            RegionKind::GttAdr,
+        ] {
+            if region_of(RegionGeneration::Xe2Lpd, kind).is_none() {
+                return TestResult::Fail("Xe2-LPD region table missing a kind");
+            }
+        }
+        if region_of(RegionGeneration::Xe2Lpd, RegionKind::Dpll).is_some() {
+            return TestResult::Fail("Xe2-LPD must not enumerate a DPLL region");
+        }
+        for off in [0x4_1100u64, 0x4_5404, 0x6_0000, 0x16_FE04, 0x16_FE68] {
+            match region_at(RegionGeneration::Xe2Lpd, off) {
+                Some(r) if r.kind == RegionKind::Display => {}
+                _ => return TestResult::Fail("Xe2-LPD DISPLAY region missing a display register"),
+            }
+        }
+        const BAR0_LEN: u64 = 16 * 1024 * 1024;
+        for r in XE2_LPD_REGIONS {
+            if r.end() > BAR0_LEN {
+                return TestResult::Fail("Xe2-LPD region overflows BAR0 size");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_xe2lpd_regions);
+
+    fn smoke_xe3lpd_regions() -> TestResult {
+        // Panther Lake (display 30.00) / Wildcat Lake (30.02)
+        // share the Xe2-LPD BAR0 layout under their own table:
+        // same kinds, no DPLL, the display-30 registers in
+        // DISPLAY (`XE2LPD_DE_CAP` 0x41100 is read for display
+        // >= 20; `DP_MIN_HBLANK_CTL` 0x600ac is the VRR timing
+        // generator's hblank control) and the PICA block in the
+        // second DISPLAY range (`PICA_PHY_CONFIG_CONTROL`
+        // 0x16fe68, `EDP_ON_TYPEC`).
+        for kind in [
+            RegionKind::Gt,
+            RegionKind::Display,
+            RegionKind::Gmbus,
+            RegionKind::Gunit,
+            RegionKind::Punit,
+            RegionKind::Fuse,
+            RegionKind::GttAdr,
+        ] {
+            if region_of(RegionGeneration::Xe3Lpd, kind).is_none() {
+                return TestResult::Fail("Xe3-LPD region table missing a kind");
+            }
+        }
+        if region_of(RegionGeneration::Xe3Lpd, RegionKind::Dpll).is_some() {
+            return TestResult::Fail("Xe3-LPD must not enumerate a DPLL region");
+        }
+        for off in [0x4_1100u64, 0x4_5404, 0x6_0000, 0x6_00ac, 0x16_FE68] {
+            match region_at(RegionGeneration::Xe3Lpd, off) {
+                Some(r) if r.kind == RegionKind::Display => {}
+                _ => return TestResult::Fail("Xe3-LPD DISPLAY region missing a display register"),
+            }
+        }
+        const BAR0_LEN: u64 = 16 * 1024 * 1024;
+        for r in XE3_LPD_REGIONS {
+            if r.end() > BAR0_LEN {
+                return TestResult::Fail("Xe3-LPD region overflows BAR0 size");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_xe3lpd_regions);
 
     fn smoke_region_kind_roundtrip() -> TestResult {
         for kind in [

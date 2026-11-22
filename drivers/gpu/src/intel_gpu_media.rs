@@ -105,9 +105,11 @@
 //!   engines: the shared machinery takes them via one more
 //!   `EngineSpec` each, but this lane's scope is the media
 //!   engines; BCS is a follow-on.
-//! - MTL / PTL media: the Xe-LPG GT is a different engine
+//! - MTL / LNL / PTL media: the Xe-LPG GT is a different engine
 //!   generation (GuC-era submission); `media_engines_for`
 //!   returns engines only for the Gen12 region generation.
+//!   (Their region tables are modelled; only the media engines
+//!   are not.)
 //! - Codec programming itself (VDBox bitstream control,
 //!   SFC) sits above submission, with the future media
 //!   userspace; this lane delivers the engines, contexts and
@@ -167,11 +169,11 @@ pub const VECS0_SPEC: EngineSpec = EngineSpec {
 pub const GEN12_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS1_SPEC, VECS0_SPEC];
 
 /// The media engines a region generation carries. Only Gen12
-/// is served: MTL/PTL GT support does not exist in the tree
-/// (their [`RegionGeneration`] is not modelled yet either), so
-/// no other generation can be asked about — when a second
-/// generation lands, its (possibly different) set goes here,
-/// not in a second table somewhere else.
+/// is served: MTL/LNL/PTL GT support does not exist in the tree
+/// (their media engines sit on a separate media GT, not
+/// modelled), so no other generation can be asked about — when a
+/// second generation lands, its (possibly different) set goes
+/// here, not in a second table somewhere else.
 ///
 /// Gen11 maps to no engines yet, deliberately: ICL's engine
 /// mask is VCS0/VCS2/VECS0 (Linux `i915_pci.c::icl_info`) while
@@ -187,6 +189,10 @@ pub fn media_engines_for(gen: RegionGeneration) -> &'static [EngineSpec] {
         // MTL's media engines sit on a separate media GT, not modelled.
         RegionGeneration::XeLpg => &[],
         RegionGeneration::Gen11 => &[],
+        // Lunar Lake (Xe2-LPD) and Panther Lake (Xe3-LPD): their
+        // region tables are modelled, but their media engines
+        // sit on the same separate media GT as MTL's.
+        RegionGeneration::Xe2Lpd | RegionGeneration::Xe3Lpd => &[],
     }
 }
 

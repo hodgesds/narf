@@ -236,7 +236,9 @@ pub enum Generation {
     /// table follows the silicon, as it already does for Raptor
     /// Lake under `AlderLake`; `asic` carries the product name.
     MeteorLake,
-    /// Lunar Lake — Xe2-LPG graphics only; display remains unadmitted.
+    /// Lunar Lake — Xe2-LPG graphics; display 20 (Xe2_LPD) is
+    /// driven only through the opted-in per-device route
+    /// (`intel_gpu_xe2lpd`), never the shared probe path.
     LunarLake,
     /// Panther Lake / Wildcat Lake — Xe3-LPG. Display is Xe3_LPD: the DDI block
     /// moved again relative to Xe-LPG and the C10/C20 PHYs replace
