@@ -3570,4 +3570,142 @@ fn smoke_igc_softirq_pump_runs_like_napi() -> TestResult {
     );
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/igc-softirq", smoke_igc_softirq_pump_runs_like_napi);
+kernel_test_in!(
+    "drivers/net/igc-softirq",
+    smoke_igc_softirq_pump_runs_like_napi
+);
+
+/// One queue's share of `smoke_igc_queue_fast_paths_are_per_queue`: four
+/// NAPI polls of queue `q` through its own handle, each frame's transmit
+/// queue selected and reached as the stack's transmit does, and one refused
+/// frame. Returns the frames received, the descriptors dropped and the
+/// frames whose transmit queue differed from the RSS function's.
+fn igc_queue_fast_path_job(
+    q: usize,
+    set: &crate::queue_set::QueueSet,
+    rss: &narf_net::rss::RssConfig,
+) -> (u64, u64, u64) {
+    let m = Model::new();
+    let mut handle = set.handle(q);
+    let (mut frames_seen, mut drops, mut mismatched) = (0u64, 0u64, 0u64);
+    for _ in 0..4 {
+        let _entry = set.enter(q);
+        let Some(queue) = handle.current(set).cloned() else {
+            return (frames_seen, drops, mismatched + 1);
+        };
+        if q >= set.count() {
+            mismatched += 1;
+        }
+        let (frames, dropped) = queue.receive(&m, q, 1500, 16);
+        set.note_rx_drops(q, dropped);
+        drops += dropped;
+        for frame in frames {
+            frames_seen += 1;
+            let tx = set.select(frame.payload());
+            if tx != rss.rx_queue(frame.payload()) || set.get(tx).is_none() {
+                mismatched += 1;
+            }
+            queue.recycle(frame.into_parts().0);
+        }
+    }
+    set.note_tx_rejected(q);
+    (frames_seen, drops, mismatched)
+}
+
+/// Each queue's poll and transmit paths touch only that queue's state, as
+/// each Linux `igc_q_vector` polls its own `igc_ring`, `igc_xmit_frame`
+/// indexes its ring, and every ring keeps its own counters for
+/// `igc_update_stats` to sum. Four queues polled and transmitted on at once,
+/// one per CPU when there are enough, take no device-wide lock, and the
+/// queues' counters still sum to the device totals.
+fn smoke_igc_queue_fast_paths_are_per_queue() -> TestResult {
+    use crate::queue_set::QueueSet;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    let rss = narf_net::rss::RssConfig::standard(4, 128);
+    let b = tcp4(0);
+    let mut queues = Vec::new();
+    for _ in 0..4 {
+        let queue = Queue::new().unwrap();
+        // An errored descriptor chain (one dropped packet), then 40 frames.
+        inject(&queue, 0, &b, 0x80000001, 0, 0);
+        inject(&queue, 1, &b, 3, 0, 0);
+        for slot in 2..42 {
+            inject(&queue, slot, &b, 3, 0, 0);
+        }
+        queues.push(Arc::new(queue));
+    }
+    let set = Arc::new(QueueSet::new(queues, &rss));
+    {
+        let _entry = set.enter(1);
+        check!(
+            set.busy(1) && !set.busy(2),
+            "an operation on queue 1 marked queue 2 busy"
+        );
+    }
+    check!(set.idle(), "an ended operation left a queue busy");
+
+    let before = set.device_locks();
+    let frames = Arc::new(AtomicU64::new(0));
+    let drops = Arc::new(AtomicU64::new(0));
+    let mismatched = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicU64::new(0));
+    let run = {
+        let (set, rss) = (set.clone(), rss.clone());
+        let (frames, drops, mismatched, done) = (
+            frames.clone(),
+            drops.clone(),
+            mismatched.clone(),
+            done.clone(),
+        );
+        move |q: usize| {
+            let (f, d, m) = igc_queue_fast_path_job(q, &set, &rss);
+            frames.fetch_add(f, Ordering::AcqRel);
+            drops.fetch_add(d, Ordering::AcqRel);
+            mismatched.fetch_add(m, Ordering::AcqRel);
+            done.fetch_add(1, Ordering::AcqRel);
+        }
+    };
+    if narf_lib::smp::cpu_count() >= 5 {
+        for q in 0..4 {
+            let run = run.clone();
+            narf_scheduler::spawn_stackful_pinned(async move { run(q) }, q as u32 + 1);
+        }
+        let mut spins = 0u64;
+        while done.load(Ordering::Acquire) < 4 && spins < 4_000_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        check!(
+            done.load(Ordering::Acquire) == 4,
+            "the per-CPU queue polls did not finish"
+        );
+    } else {
+        for q in 0..4 {
+            run(q);
+        }
+    }
+    check!(
+        set.device_locks() == before,
+        "a queue's poll or transmit path took a device-wide lock"
+    );
+    check!(
+        mismatched.load(Ordering::Acquire) == 0,
+        "a frame's transmit queue was not its flow's RSS queue"
+    );
+    check!(
+        frames.load(Ordering::Acquire) == 160 && drops.load(Ordering::Acquire) == 4,
+        "the queues did not receive their 40 frames and drop their errored packet"
+    );
+    let (rx_drops, tx_rejected) = set.totals();
+    check!(
+        rx_drops == drops.load(Ordering::Acquire) && tx_rejected == 4,
+        "the queues' counters do not sum to the device totals"
+    );
+    check!(set.idle(), "a finished poll left its queue busy");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-queues",
+    smoke_igc_queue_fast_paths_are_per_queue
+);

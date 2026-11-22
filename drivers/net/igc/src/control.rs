@@ -62,13 +62,15 @@ impl Igc {
         }
         self.quarantine.lock().push(old_queues.clone());
         if let Some(q) = replacement {
-            *self.queues.lock() = q;
+            self.queues.replace(q);
         }
+        self.queues.set_rss(&settings.rss);
         *self.settings.lock() = settings;
         let result = self.reset_and_start();
         if result.is_err() {
             self.quarantine.lock().push(self.queues());
-            *self.queues.lock() = old_queues;
+            self.queues.replace(old_queues);
+            self.queues.set_rss(&old.rss);
             *self.settings.lock() = old;
             return Err(5);
         }

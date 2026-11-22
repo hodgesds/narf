@@ -38,6 +38,8 @@ mod ptp;
 #[cfg(feature = "builtin")]
 mod queue;
 #[cfg(feature = "builtin")]
+mod queue_set;
+#[cfg(feature = "builtin")]
 mod tests;
 #[cfg(feature = "builtin")]
 mod traffic;

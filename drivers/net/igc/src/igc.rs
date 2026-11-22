@@ -411,7 +411,7 @@ pub struct Igc {
     device: BusDevice,
     config: IrqSafeSpinLock<Config>,
     mtu: AtomicU32,
-    queues: IrqSafeSpinLock<Arc<Vec<Arc<Queue>>>>,
+    queues: crate::queue_set::QueueSet,
     ptp: IrqSafeSpinLock<crate::ptp::ClockState>,
     phc_index: core::sync::atomic::AtomicI32,
     counters: IrqSafeSpinLock<crate::counters::Counters>,
@@ -679,6 +679,7 @@ impl Igc {
         for _ in 0..count {
             queues.push(Arc::new(Queue::new()?));
         }
+        let rss = narf_net::rss::RssConfig::standard(count, 128);
         let (msix, irq_routes) = Self::try_enable_msix(cap, device).unwrap_or((None, Vec::new()));
         let irq_vector = irq_routes.first().map(|r| r.vector);
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
@@ -696,7 +697,7 @@ impl Igc {
                 unicast: Vec::new(),
             }),
             mtu: AtomicU32::new(1500),
-            queues: IrqSafeSpinLock::new(Arc::new(queues)),
+            queues: crate::queue_set::QueueSet::new(queues, &rss),
             ptp: IrqSafeSpinLock::new(crate::ptp::ClockState::new()),
             phc_index: core::sync::atomic::AtomicI32::new(-1),
             counters: IrqSafeSpinLock::new(crate::counters::Counters::new()),
@@ -717,7 +718,7 @@ impl Igc {
                 channels: count as u16,
                 // Linux `IGC_DEFAULT_ITR`: dynamic, conservative.
                 coalesce_us: 3,
-                rss: narf_net::rss::RssConfig::standard(count, 128),
+                rss,
                 link: narf_net::nic::LinkSettings {
                     advertised: if matches!(device.id.device, IGC_I220_V | IGC_I221_V) {
                         0x1f
@@ -809,14 +810,15 @@ impl Igc {
     fn name(&self) -> &'static str {
         self.ifname.get()
     }
+    /// Every queue, for a configuration path; a queue's poll and transmit
+    /// paths reach it through `self.queues` alone.
     fn queues(&self) -> Arc<Vec<Arc<Queue>>> {
-        self.queues.lock().clone()
+        self.queues.all()
     }
     /// Return a frame no ring took to the pool of the queue it was built
     /// for, exactly as that queue's completion would (`Queue::recycle`).
     fn give_back(&self, frame: Frame) {
-        let queues = self.queues();
-        if let Some(queue) = queues.get(usize::from(frame.queue())) {
+        if let Some(queue) = self.queues.get(usize::from(frame.queue())) {
             queue.recycle(frame.into_parts().0);
         }
     }
@@ -1151,10 +1153,16 @@ impl Igc {
         self.link_sample().carrier
     }
     pub fn stats(&self) -> IgcStats {
-        *self.stats.lock()
+        let mut stats = *self.stats.lock();
+        // Each queue counts its own drops and refusals (Linux per-ring
+        // stats, summed by `igc_update_stats`).
+        let (rx_drops, tx_rejected) = self.queues.totals();
+        stats.rx_drops += rx_drops;
+        stats.tx_rejected += tx_rejected;
+        stats
     }
     pub fn num_queues(&self) -> usize {
-        self.queues().len()
+        self.queues.count()
     }
 
     /// Copy a borrowed frame into a buffer of the queue it will be posted
@@ -1163,16 +1171,15 @@ impl Igc {
     fn copy_for_queue(&self, bytes: &[u8], timing: narf_net::TxTiming) -> Result<Frame, IgcError> {
         let q = timing
             .queue
-            .map_or_else(|| self.settings.lock().rss.rx_queue(bytes), usize::from);
-        let queues = self.queues();
-        let queue = queues.get(q).ok_or(IgcError::QueueTooSmall)?;
+            .map_or_else(|| self.queues.select(bytes), usize::from);
+        let queue = self.queues.get(q).ok_or(IgcError::QueueTooSmall)?;
         match queue.tx_copy(bytes) {
             Ok(mut frame) => {
                 frame.set_tx_timing(timing);
                 Ok(frame)
             }
             Err(crate::queue::TxCopyRefusal::Exhausted) => {
-                self.stats.lock().tx_rejected += 1;
+                self.queues.note_tx_rejected(q);
                 Err(IgcError::QueueTooSmall)
             }
             Err(crate::queue::TxCopyRefusal::Invalid) => Err(IgcError::QueueTooSmall),
@@ -1202,10 +1209,9 @@ impl Igc {
         timing: narf_net::TxTiming,
     ) -> Result<(usize, crate::queue::TxOptions), IgcError> {
         let q = queue.unwrap_or_else(|| {
-            timing.queue.map_or_else(
-                || self.settings.lock().rss.rx_queue(frame.payload()),
-                usize::from,
-            )
+            timing
+                .queue
+                .map_or_else(|| self.queues.select(frame.payload()), usize::from)
         });
         if q >= self.num_queues() {
             return Err(IgcError::QueueTooSmall);
@@ -1257,12 +1263,18 @@ impl Igc {
                 return Err(error);
             }
         };
-        let result = self.queues()[q].post_options(&self.hw, q, frame, meta, self.mtu(), options);
+        let result = match self.queues.get(q) {
+            Some(queue) => queue.post_options(&self.hw, q, frame, meta, self.mtu(), options),
+            None => {
+                self.give_back(frame);
+                Err(IgcError::QueueTooSmall)
+            }
+        };
         if result.is_err() && timing.timestamp_cookie.is_some() {
             self.ptp.lock().pending[q] = None;
         }
         if result.is_err() && result != Err(IgcError::TxBusy) {
-            self.stats.lock().tx_rejected += 1;
+            self.queues.note_tx_rejected(q);
         }
         result
     }
@@ -1273,7 +1285,7 @@ impl Igc {
         let mut frames = Vec::new();
         for (q, queue) in self.queues().iter().enumerate() {
             let (mut batch, drops) = queue.receive(&self.hw, q, self.mtu(), budget);
-            self.stats.lock().rx_drops += drops;
+            self.queues.note_rx_drops(q, drops);
             narf_net::iface::note_rx_drop(self.name(), drops);
             frames.append(&mut batch);
         }
@@ -1283,7 +1295,7 @@ impl Igc {
         let _operation = self.operation().ok()?;
         for (q, queue) in self.queues().iter().enumerate() {
             let (frames, drops) = queue.receive(&self.hw, q, self.mtu(), 1);
-            self.stats.lock().rx_drops += drops;
+            self.queues.note_rx_drops(q, drops);
             if let Some(frame) = frames.into_iter().next() {
                 return Some(frame);
             }
@@ -1796,12 +1808,12 @@ impl narf_net::txq::TxBackpressure for Igc {
         self.num_queues() as u16
     }
     fn tx_queue(&self, q: u16) -> Option<Arc<narf_net::txq::TxQueue>> {
-        self.queues()
+        self.queues
             .get(usize::from(q))
             .map(|queue| queue.txq().clone())
     }
     fn tx_select_queue(&self, frame: &[u8]) -> u16 {
-        self.settings.lock().rss.rx_queue(frame) as u16
+        self.queues.select(frame) as u16
     }
     fn tx_link_speed_mbps(&self) -> u32 {
         self.link_sample().speed_mbps.unwrap_or(0)
@@ -1820,8 +1832,8 @@ impl narf_net::txq::TxBackpressure for Igc {
         meta: TxMeta,
         charge: Option<narf_net::txq::TxCharge>,
     ) -> Result<(), narf_net::txq::TxRefusal> {
-        let queues = self.queues();
-        let queue = queues
+        let queue = self
+            .queues
             .get(usize::from(q))
             .ok_or(narf_net::txq::TxRefusal::Dropped)?;
         // The stack copies only when its zero-copy acquire found this
@@ -2270,16 +2282,15 @@ fn rx_napi_poll(
     rx: &Igc,
     q: usize,
     producer: &IrqSafeSpinLock<Producer<Frame, RX_RING_N>>,
+    handle: &mut crate::queue_set::QueueHandle,
 ) -> (u32, bool) {
     // Only a reset replaces the queue set; one handle serves the whole poll.
-    let queue = rx.queues().get(q).cloned();
+    let queue = handle.current(&rx.queues).cloned();
     let (frames, drops) = match (rx.operation(), queue.as_ref()) {
         (Ok(_op), Some(queue)) => {
             let (f, drops) = napi_clean(queue, &rx.hw, q, rx.mtu());
-            // Device-wide counters only when there is something to count:
-            // no shared lock per poll.
+            rx.queues.note_rx_drops(q, drops);
             if drops != 0 {
-                rx.stats.lock().rx_drops += drops;
                 narf_net::iface::note_rx_drop(rx.name(), drops);
             }
             (f, drops)
@@ -2352,7 +2363,7 @@ fn rx_napi_done(
     let Ok(_op) = rx.operation() else {
         return false;
     };
-    let queue = rx.queues().get(q).cloned();
+    let queue = rx.queues.get(q);
     if let (Some(r), Some(queue)) = (route, queue.as_ref()) {
         rx.moderate(r, queue, itr);
     }
@@ -2382,8 +2393,9 @@ fn spawn_pumps(
             let handoff = handoff.clone();
             narf_scheduler::spawn_with_spec(
                 async move {
+                    let mut handle = rx.queues.handle(q);
                     while rx.until_removed(handoff.taken()).await.is_some() {
-                        let poll = || rx_napi_poll(&rx, q, &producer);
+                        let poll = || rx_napi_poll(&rx, q, &producer, &mut handle);
                         deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
                     }
                 },
@@ -2397,6 +2409,7 @@ fn spawn_pumps(
                 // This vector's interval and the queue's work counters when
                 // it was last set (`igc_update_ring_itr` state).
                 let mut itr = (u32::MAX, crate::itr::START_ITR, crate::itr::Work::default());
+                let mut handle = rx.queues.handle(q);
                 while !rx.removed.load(Ordering::Acquire) {
                     let route = rx.route(q);
                     // NAPI: the queue's interrupt alone schedules the next
@@ -2405,7 +2418,7 @@ fn spawn_pumps(
                     // interrupt after that wakes this task.
                     let waiter = route.map(|r| narf_interrupts::wait_for_irq(r.vector));
                     let end = softirq_run(
-                        || rx_napi_poll(&rx, q, &producer),
+                        || rx_napi_poll(&rx, q, &producer, &mut handle),
                         || rx_napi_done(&rx, q, route, &mut itr),
                         &handoff,
                         narf_time::monotonic_ns,
@@ -2417,7 +2430,7 @@ fn spawn_pumps(
                             // task polls; the next run completes the queue.
                             let _ = rx.until_removed(handoff.returned()).await;
                         } else {
-                            let poll = || rx_napi_poll(&rx, q, &producer);
+                            let poll = || rx_napi_poll(&rx, q, &producer, &mut handle);
                             deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
                         }
                         continue;
