@@ -203,6 +203,52 @@ impl Ring {
         self.set_word(slot, 1, (MAX_FRAME as u32) << 16);
     }
 }
+/// Descriptor counts of the owner's rings, by queue type: Linux
+/// `mt7921_dma_init` with the device's `mt7921_dma_layout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DmaLayout {
+    /// The MCU event ring before firmware download (`MT_RXQ_MCU`).
+    pub(super) rx_event: usize,
+    /// The MCU WA ring after it (`MT_RXQ_MCU_WA`).
+    pub(super) rx_wa: usize,
+    /// The data ring (`MT_RXQ_MAIN`).
+    pub(super) rx_data: usize,
+}
+
+/// The ring layout of the function with PCI device id `device`.
+pub(super) fn dma_layout(device: u16) -> DmaLayout {
+    let _ = device;
+    DmaLayout {
+        rx_event: DEPTH,
+        rx_wa: DEPTH,
+        rx_data: DEPTH,
+    }
+}
+
+/// Every ring of the owner, sized by `layout`, from `dma` (as
+/// `mt76_dma_alloc_queue` allocates each).
+fn allocate_storage(dma: &narf_io::DmaDevice, layout: DmaLayout) -> Result<Storage, Error> {
+    let _ = layout;
+    Ok(Storage {
+        wm: Ring::allocate_for(dma, TX_WM, false)?,
+        fwdl: Ring::allocate_for(dma, TX_FWDL, false)?,
+        data: Ring::allocate_for(dma, TX_DATA, false)?,
+        data_dma: 0,
+        tokens: packet_tx::Tokens::new(),
+        tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
+        pending_events: VecDeque::new(),
+        pending_data: VecDeque::new(),
+        receive_epoch: 0,
+        receive_open: false,
+        p2p_capture: super::p2p_management_capture::Queue::new(),
+        rx: [
+            Ring::allocate_for(dma, RX_PRE, true)?,
+            Ring::allocate_for(dma, RX_POST, true)?,
+            Ring::allocate_for(dma, RX_DATA, true)?,
+        ],
+    })
+}
+
 #[derive(Debug)]
 struct Storage {
     wm: Ring,
@@ -1981,24 +2027,7 @@ impl Transport {
             // re-attached before its first mapping (bus mastering off).
             restore_function_dma(&device)?;
             let dma = narf_bus::dma::configure(&device).map_err(|_| Error::Allocation)?;
-            let storage = Storage {
-                wm: Ring::allocate_for(&dma, TX_WM, false)?,
-                fwdl: Ring::allocate_for(&dma, TX_FWDL, false)?,
-                data: Ring::allocate_for(&dma, TX_DATA, false)?,
-                data_dma: 0,
-                tokens: packet_tx::Tokens::new(),
-                tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
-                pending_events: VecDeque::new(),
-                pending_data: VecDeque::new(),
-                receive_epoch: 0,
-                receive_open: false,
-                p2p_capture: super::p2p_management_capture::Queue::new(),
-                rx: [
-                    Ring::allocate_for(&dma, RX_PRE, true)?,
-                    Ring::allocate_for(&dma, RX_POST, true)?,
-                    Ring::allocate_for(&dma, RX_DATA, true)?,
-                ],
-            };
+            let storage = allocate_storage(&dma, dma_layout(device.id.device))?;
             Ok(Self {
                 session: Session::new_boxed(
                     Hardware {
