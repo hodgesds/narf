@@ -599,6 +599,12 @@ pub fn udp_send_from(
     udp_send_inner(net_ns_id, src_port, dst, payload, options, inet_id)
 }
 
+/// `ip_eth_mc_map` (`include/net/ip.h`): 01:00:5e followed by the low 23
+/// bits of the IPv4 group address.
+pub fn ip_eth_mc_map(group: [u8; 4]) -> [u8; 6] {
+    [0x01, 0x00, 0x5e, group[1] & 0x7f, group[2], group[3]]
+}
+
 fn udp_send_inner(
     net_ns_id: u64,
     src_port: u16,
@@ -713,7 +719,12 @@ fn udp_send_inner(
             .map(|r| r.nexthop.0)
             .unwrap_or(dst_ip)
     };
-    let cached = if bound {
+    // A multicast group's neighbour is NUD_NOARP with the `ip_eth_mc_map`
+    // address (`arp_mc_map`): it is never looked up, resolved or waited on.
+    let is_multicast = dst_ip[0] & 0xf0 == 0xe0;
+    let cached = if is_multicast {
+        None
+    } else if bound {
         crate::arp_cache::lookup(&iface.name, nexthop)
     } else {
         crate::tcp_stack::arp_cached_in(net_ns_id, nexthop)
@@ -721,7 +732,7 @@ fn udp_send_inner(
     // `udp_sendmsg` never waits on neighbour discovery: build the complete
     // frame with a placeholder MAC, queue it below, and let the ARP RX path
     // patch + transmit it (`neigh_output`).
-    let pending_neighbor = if is_broadcast {
+    let pending_neighbor = if is_broadcast || is_multicast {
         None
     } else if let Some(mac) = cached {
         Some(Ok(mac))
@@ -732,6 +743,7 @@ fn udp_send_inner(
         Some(Err(nexthop))
     };
     let dst_mac = match pending_neighbor {
+        None if is_multicast => ip_eth_mc_map(dst_ip),
         None => [0xFF; 6],
         Some(Ok(mac)) => mac,
         Some(Err(_)) => [0; 6],

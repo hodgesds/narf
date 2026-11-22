@@ -976,7 +976,10 @@ as `flowi4_oif` does: `route::route_lookup_oif_in(ns, dst, oif)` considers
 only routes through `oif` and otherwise treats the destination as on-link
 there, and the next hop is looked up and resolved in that device's neighbour
 table (`tcp_stack::neigh_start_on`, `send_arp_request_on`); resolution
-timers retransmit on the neighbour's own device.
+timers retransmit on the neighbour's own device. A multicast destination is
+never resolved: it leaves at once for `udp_sock::ip_eth_mc_map(group)`
+(01:00:5e + the group's low 23 bits), as `arp_mc_map` gives a NUD_NOARP
+neighbour.
 An IPv4 UDP send to an unresolved next hop retains the complete post-netfilter
 frame in a namespace/interface/neighbor-scoped bounded queue, starts ARP, and
 reports success without blocking. Learning the neighbor MAC patches and
