@@ -4223,6 +4223,48 @@ fn mount_covers_path(mount_path: &str, abs: &str) -> bool {
         || (abs.starts_with(mount_path) && abs.as_bytes().get(mount_path.len()) == Some(&b'/'))
 }
 
+/// `do_move_mount`: detach the topmost mount at `source` together with every
+/// mount below it, and attach that tree on top at `target`
+/// (`attach_recursive_mnt`).
+///
+/// The table is in attachment order, so the moved mount's tree is the mount
+/// itself and each LATER entry below `source` — `umount_tree`'s set, the one
+/// `umount2` detaches. The tree keeps its internal order and goes to the end
+/// of the table: it is now the newest attachment at `target`, above whatever
+/// was mounted there or below it before.
+fn move_mount_tree(mounts: &mut Vec<Mount>, source: &str, target: &str) -> Result<(), FsError> {
+    let top = mounts
+        .iter()
+        .rposition(|m| m.path == source)
+        .ok_or(FsError::NotFound)?;
+    let relocate = |path: &str| -> String {
+        if path == source {
+            return String::from(target);
+        }
+        let rest = if source == "/" {
+            &path[1..]
+        } else {
+            &path[source.len() + 1..]
+        };
+        if target == "/" {
+            alloc::format!("/{rest}")
+        } else {
+            alloc::format!("{}/{rest}", target.trim_end_matches('/'))
+        }
+    };
+    let mut tree = Vec::new();
+    for (index, mut mount) in core::mem::take(mounts).into_iter().enumerate() {
+        if index == top || (index > top && path_is_proper_descendant(&mount.path, source)) {
+            mount.path = relocate(&mount.path);
+            tree.push(mount);
+        } else {
+            mounts.push(mount);
+        }
+    }
+    mounts.extend(tree);
+    Ok(())
+}
+
 #[inline]
 fn path_is_proper_descendant(path: &str, ancestor: &str) -> bool {
     path.len() > ancestor.len()
@@ -5393,15 +5435,12 @@ impl MountNamespace {
         self.store().pivoted_location(path)
     }
 
-    /// Move the topmost mount at `source` to `target`.
+    /// Move the topmost mount at `source`, with the mounts below it, to
+    /// `target` (see [`move_mount_tree`]).
     pub fn move_mount(&self, source: &str, target: &str) -> Result<(), FsError> {
         let store = self.store();
         let mut q = store.inner.lock();
-        let index = q
-            .iter()
-            .rposition(|m| m.path == source)
-            .ok_or(FsError::NotFound)?;
-        q[index].path = String::from(target);
+        move_mount_tree(&mut q, source, target)?;
         store.publish_lookup_locked(&q);
         store
             .mountinfo_generation
@@ -6359,7 +6398,8 @@ impl VfsRegistry {
         Ok(())
     }
 
-    /// Move a mounted filesystem from `source` to `target`.
+    /// Move a mounted filesystem from `source`, with the mounts below it, to
+    /// `target` (see [`move_mount_tree`]).
     pub fn move_mount(
         &self,
         authority: &Cap<MountPoint, Grant>,
@@ -6368,12 +6408,8 @@ impl VfsRegistry {
     ) -> Result<(), FsError> {
         authority.check_live()?;
         let mut q = self.inner.lock();
-        let index = q
-            .iter()
-            .rposition(|m| m.path == source)
-            .ok_or(FsError::NotFound)?;
         // Overmount is allowed: moving onto an occupied path stacks (see `mount`).
-        q[index].path = String::from(target);
+        move_mount_tree(&mut q, source, target)?;
         self.publish_lookup_locked(&q);
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
