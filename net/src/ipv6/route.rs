@@ -56,7 +56,27 @@ pub struct Route {
     /// Deadline (monotonic-ns) past which the route is dropped. 0 =
     /// never expires (e.g. statically configured connected routes).
     pub valid_deadline_ns: u64,
+    /// `fib6_protocol`, reported as `rtm_protocol`: RTPROT_KERNEL for the
+    /// kernel's own routes, RTPROT_RA for an RA's default router, and what
+    /// an RTM_NEWROUTE asked for (RTPROT_BOOT when it named none).
+    pub protocol: u8,
+    /// RFC 4191 router preference (`RTF_PREF`, reported as RTA_PREF):
+    /// [`PREF_MEDIUM`], [`PREF_HIGH`] or [`PREF_LOW`].
+    pub pref: u8,
 }
+
+/// `RTPROT_KERNEL`.
+pub const RTPROT_KERNEL: u8 = 2;
+/// `RTPROT_BOOT`: an RTM_NEWROUTE that named no protocol.
+pub const RTPROT_BOOT: u8 = 3;
+/// `RTPROT_RA`: installed from a Router Advertisement.
+pub const RTPROT_RA: u8 = 9;
+/// `ICMPV6_ROUTER_PREF_MEDIUM`.
+pub const PREF_MEDIUM: u8 = 0;
+/// `ICMPV6_ROUTER_PREF_HIGH`.
+pub const PREF_HIGH: u8 = 1;
+/// `ICMPV6_ROUTER_PREF_LOW`.
+pub const PREF_LOW: u8 = 3;
 
 #[derive(Clone, Debug)]
 struct NamespacedRoute {

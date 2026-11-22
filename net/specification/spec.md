@@ -765,6 +765,14 @@ the source), `RTA_GATEWAY` and `RTA_CACHEINFO`; a local destination is an
 answers the matched FIB entry instead. No route is `ENETUNREACH`; a family
 other than `AF_INET` returns `EOPNOTSUPP`. LINUX-GAP: `RTA_UID` is not
 reported.
+IPv6 routes carry `ipv6::route::Route::{protocol, pref}`: an RA's default
+route is `RTPROT_RA` at metric 1024 with the RA's router preference
+(`rt6_add_dflt_router`), a PIO prefix route `RTPROT_KERNEL` at 256, and an
+RTM_NEWROUTE keeps its `rtm_protocol` (`RTPROT_BOOT` when unspecified), its
+RTA_PREF (low/high, else medium) and, without RTA_PRIORITY, metric 1024
+(`ip6_route_info_create`). Dumps report the protocol, RTA_PREF on every
+route and an expiring route's remaining lifetime in RTA_CACHEINFO
+(`rt6_fill_node`).
 Address dumps honor `ifa_family`, and `ifa_index` only under strict checking;
 route dumps honor `rtm_family`, and under strict checking `rtm_table` /
 `RTA_TABLE`, `RTA_OIF`, `rtm_protocol`, and `rtm_type`; neighbor dumps filter

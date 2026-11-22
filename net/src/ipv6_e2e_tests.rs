@@ -2905,6 +2905,8 @@ fn smoke_v6_icmp6_dest_unreach_aborts_syn_sent() -> TestResult {
         iface: alloc::string::String::from(IFACE),
         metric: 100,
         valid_deadline_ns: 0,
+        protocol: crate::ipv6::route::RTPROT_KERNEL,
+        pref: crate::ipv6::route::PREF_MEDIUM,
     });
     ndp::neigh_upsert(ndp::Neigh {
         iface: alloc::string::String::from(IFACE),

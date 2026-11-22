@@ -1352,7 +1352,7 @@ fn dump_fib6(d: &mut Dump<'_>) -> Result<(), i32> {
         let Some(link) = links.iter().find(|link| link.name == route.iface) else {
             continue;
         };
-        if !filter.matches(RTPROT_KERNEL, RTN_UNICAST, link.ifindex) {
+        if !filter.matches(route.protocol, RTN_UNICAST, link.ifindex) {
             continue;
         }
         d.push(build_newroute_v6(&route, link.ifindex, d.seq, 0), flags);

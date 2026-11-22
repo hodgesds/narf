@@ -762,6 +762,8 @@ fn smoke_proc_net_ipv6_namespaces() -> narf_kernel_test::TestResult {
                 gateway: None,
                 metric,
                 valid_deadline_ns: 0,
+                protocol: narf_net::ipv6::route::RTPROT_KERNEL,
+                pref: narf_net::ipv6::route::PREF_MEDIUM,
             },
         );
     }

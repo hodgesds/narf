@@ -161,6 +161,10 @@ pub struct AdminIpv6Route {
     pub prefix_len: u8,
     pub gateway: Option<[u8; 16]>,
     pub metric: u32,
+    /// `rtm_protocol` as requested.
+    pub protocol: u8,
+    /// RTA_PREF, already reduced to a valid preference.
+    pub pref: u8,
 }
 
 impl AdminHandle {
@@ -400,13 +404,25 @@ impl AdminHandle {
         if crate::iface::lookup(&self.iface_name).is_none() {
             return Err(AdminError::NoIface);
         }
+        // `ip6_route_info_create`: no RTA_PRIORITY is IP6_RT_PRIO_USER and
+        // RTPROT_UNSPEC is RTPROT_BOOT.
         crate::ipv6::route::add(crate::ipv6::route::Route {
             prefix: route.dst,
             prefix_len: route.prefix_len,
             gateway: route.gateway,
             iface: self.iface_name.clone(),
-            metric: route.metric,
+            metric: if route.metric == 0 {
+                1024
+            } else {
+                route.metric
+            },
             valid_deadline_ns: 0,
+            protocol: if route.protocol == 0 {
+                crate::ipv6::route::RTPROT_BOOT
+            } else {
+                route.protocol
+            },
+            pref: route.pref,
         });
         Ok(())
     }

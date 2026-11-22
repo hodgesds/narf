@@ -774,6 +774,8 @@ fn ipv6_route_message_reports_gateway_and_oif() -> narf_kernel_test::TestResult 
         iface: "eth0".into(),
         metric: 100,
         valid_deadline_ns: 0,
+        protocol: crate::ipv6::route::RTPROT_KERNEL,
+        pref: crate::ipv6::route::PREF_MEDIUM,
     };
     let msg = build_newroute_v6(&route, 7, 47, 0);
     narf_kernel_test::kt_assert_eq!(hdr_of(&msg).1, RTM_NEWROUTE);

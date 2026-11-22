@@ -12706,6 +12706,8 @@ fn smoke_abi_socket_inet6_udp_link_local_source_scope_is_bound_dev() -> TestResu
             iface: alloc::string::String::from(IFACE),
             metric: 1024,
             valid_deadline_ns: 0,
+            protocol: narf_net::ipv6::route::RTPROT_KERNEL,
+            pref: narf_net::ipv6::route::PREF_MEDIUM,
         });
         let result = (|| {
             let u = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;

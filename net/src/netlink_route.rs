@@ -555,7 +555,7 @@ fn build_newroute_v6(
     body.push(route.prefix_len);
     body.extend_from_slice(&[0, 0]);
     body.push(crate::route::TABLE_MAIN);
-    body.push(RTPROT_KERNEL);
+    body.push(route.protocol); // `rtm_protocol = rt->fib6_protocol`
     body.push(0);
     body.push(RTN_UNICAST);
     body.extend_from_slice(&0u32.to_ne_bytes());
@@ -574,6 +574,20 @@ fn build_newroute_v6(
         RTA_TABLE,
         &(crate::route::TABLE_MAIN as u32).to_ne_bytes(),
     );
+    // `rtnl_put_cacheinfo`: an RTF_EXPIRES route's remaining lifetime in
+    // clock_t (USER_HZ = 100); then RTA_PREF on every route.
+    const RTA_CACHEINFO: u16 = 12;
+    const RTA_PREF: u16 = 20;
+    let expires = if route.valid_deadline_ns == 0 || route.valid_deadline_ns == u64::MAX {
+        0
+    } else {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        (route.valid_deadline_ns.saturating_sub(now) / 10_000_000).min(i32::MAX as u64) as u32
+    };
+    let mut cacheinfo = [0u8; 32];
+    cacheinfo[8..12].copy_from_slice(&expires.to_ne_bytes());
+    push_rtattr(&mut body, RTA_CACHEINFO, &cacheinfo);
+    push_rtattr(&mut body, RTA_PREF, &[route.pref]);
     frame_message(RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &body)
 }
 
@@ -2359,12 +2373,20 @@ fn apply_mutation(
                     Some(_) => return Err(EINVAL),
                     None => 0,
                 };
+                // `rtm_to_fib6_config`: an RTA_PREF other than low/high is
+                // medium.
+                let pref = match find_attr(request, 12, 20).and_then(|v| v.first().copied()) {
+                    Some(p @ (crate::ipv6::route::PREF_LOW | crate::ipv6::route::PREF_HIGH)) => p,
+                    _ => crate::ipv6::route::PREF_MEDIUM,
+                };
                 return admin
                     .add_ipv6_route(crate::AdminIpv6Route {
                         dst,
                         prefix_len,
                         gateway,
                         metric,
+                        protocol: request[NLMSG_HDRLEN + 5],
+                        pref,
                     })
                     .map_err(admin_errno);
             }
