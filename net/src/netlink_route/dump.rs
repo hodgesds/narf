@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use super::{
     build_error, build_newaddr, build_newaddr_v6, build_newlink, build_newneigh, build_newroute,
     build_newroute_v6, build_newrule, build_qdisc_messages, builtin_loopback_ipv6, enumerate_in,
-    frame_message, ifindex_for_name, nlmsg_align, parse_hdr, push_rtattr, rta_align, LinkInfo,
+    frame_message, ifindex_for_name_in, nlmsg_align, parse_hdr, push_rtattr, rta_align, LinkInfo,
     NeighInfo, AF_INET, AF_INET6, EAFNOSUPPORT, EINVAL, ENODEV, ENOENT, EOPNOTSUPP,
     NLMSGERR_ATTR_MSG, NLMSG_DONE, NLMSG_HDRLEN, NLM_F_ACK_TLVS, NLM_F_MULTI, NTF_ROUTER,
     NUD_DELAY, NUD_INCOMPLETE, NUD_PROBE, NUD_REACHABLE, NUD_STALE, RTM_GETACTION, RTM_GETADDR,
@@ -1070,17 +1070,23 @@ fn dump_addr6(d: &mut Dump<'_>) -> Result<(), i32> {
             }
         }
     }
-    if ifindex == 0 || ifindex == 1 {
+    // A namespace's own `lo` holds `::1` only while it is up
+    // (`addrconf_notify` → `init_loopback` on NETDEV_UP, `addrconf_ifdown`
+    // on NETDEV_DOWN); the initial namespace's `lo` is always up.
+    let loopback_up =
+        d.net_ns_id == 0 || crate::iface::namespace_loopback(d.net_ns_id).is_none_or(|lo| lo.up);
+    if loopback_up && (ifindex == 0 || ifindex == 1) {
         d.push(
             build_newaddr_v6(&builtin_loopback_ipv6(), 1, d.seq, 0),
             flags,
         );
     }
-    for addr in crate::ipv6::addrs::list_all() {
+    // `inet6_dump_addr` walks the devices of the socket's namespace only.
+    for addr in crate::ipv6::addrs::list_all_in(d.net_ns_id) {
         if addr.state == crate::ipv6::addrs::AddrState::Invalid {
             continue;
         }
-        if let Some(addr_ifindex) = ifindex_for_name(&addr.iface) {
+        if let Some(addr_ifindex) = ifindex_for_name_in(d.net_ns_id, &addr.iface) {
             if ifindex == 0 || ifindex == addr_ifindex {
                 d.push(build_newaddr_v6(&addr, addr_ifindex, d.seq, 0), flags);
             }
@@ -1220,6 +1226,14 @@ fn legacy_rtm_flags(req: &[u8]) -> u32 {
 /// The IPv4 routes NARF exposes, including the synthetic loopback route.
 fn ipv4_routes(net_ns_id: u64) -> Vec<crate::route::Route> {
     let mut routes = crate::route::route_list_in(net_ns_id);
+    // A namespace's own `lo` gets its local routes from `fib_add_ifaddr`:
+    // `local 127.0.0.0/8` only once 127.0.0.1/8 is configured and the
+    // device is up.
+    if let Some(lo) = crate::iface::namespace_loopback(net_ns_id) {
+        if !lo.up || !lo.ipv4.contains(&([127, 0, 0, 1], 8)) {
+            return routes;
+        }
+    }
     // Link/address dumps always expose loopback. Mirror that invariant in
     // route dumps even during early boot before net init installs the
     // canonical loopback FIB entry.
