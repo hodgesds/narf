@@ -28,6 +28,7 @@ pub mod probe;
 pub mod psci;
 pub mod rme;
 pub mod rndr;
+pub mod s4;
 pub mod sctlr2;
 pub mod smccc;
 pub mod sme;

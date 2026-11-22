@@ -12,13 +12,13 @@
 //!
 //! x86_64 reuses the S3 resume context and wake trampoline
 //! (`narf_arch::x86_64::s3_resume`), with the copy loop of
-//! `narf_arch::x86_64::s4_restore`. aarch64 has no restore yet and
-//! answers [`ArchError::NotImplemented`].
+//! `narf_arch::x86_64::s4_restore`. aarch64 has its own save, copy loop
+//! and wake entry (`narf_arch::aarch64::s4`).
 
 use super::payload::ARCH_RECORD_LEN;
 
 /// Whether this architecture can hibernate and restore yet.
-pub const SUPPORTED: bool = cfg!(target_arch = "x86_64");
+pub const SUPPORTED: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
 
 /// What [`capture`] came back from.
 #[derive(Debug)]
@@ -46,10 +46,11 @@ pub enum ArchError {
 /// The resume point: where the boot kernel jumps once the pages are back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArchRecord {
-    /// x86_64: the virtual address of the image's S3 wake entry.
+    /// The virtual address of the image's wake entry (x86_64: S3's
+    /// `s3_wake_entry`; aarch64: `s4_wake_entry`).
     pub entry: u64,
     /// x86_64: the physical address of the image's PML4, whose kernel half
-    /// the copy loop installs before the jump.
+    /// the copy loop installs before the jump. aarch64: the image's TTBR1.
     pub page_table: u64,
 }
 
@@ -176,11 +177,34 @@ pub unsafe fn fix_cpu_after_restore() {
     unsafe { narf_arch::x86_64::s4_restore::reload_task_register(tss) };
 }
 
-/// No hibernation restore on this architecture yet.
+/// `swsusp_arch_suspend` on aarch64: [`narf_arch::aarch64::s4::s4_save`],
+/// then the snapshot.
 ///
 /// # Safety
 /// As the x86_64 version.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+pub unsafe fn capture<R>(snapshot: impl FnOnce(ArchRecord) -> R) -> Result<Captured<R>, ArchError> {
+    use narf_arch::aarch64::s4;
+    // SAFETY: the caller's contract; returns 1 in the restored image.
+    if unsafe { s4::s4_save() } == 1 {
+        return Ok(Captured::Restored);
+    }
+    let ttbr1: u64;
+    // SAFETY: a side-effect-free system register read at EL1.
+    unsafe { core::arch::asm!("mrs {}, ttbr1_el1", out(reg) ttbr1, options(nomem, nostack)) };
+    let record = ArchRecord {
+        entry: s4::s4_wake_entry as usize as u64,
+        page_table: ttbr1,
+    };
+    Ok(Captured::Snapshot(snapshot(record)))
+}
+
+/// No hibernation restore on this architecture.
+///
+/// # Safety
+/// As the x86_64 version.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn capture<R>(
     _snapshot: impl FnOnce(ArchRecord) -> R,
 ) -> Result<Captured<R>, ArchError> {
@@ -269,11 +293,79 @@ pub unsafe fn restore(
     }
 }
 
-/// No hibernation restore on this architecture yet.
+/// `swsusp_arch_resume` on aarch64: a TTBR0 table identity-mapping every
+/// 2 MiB block of RAM as Normal write-back memory, EL1 read-write and
+/// executable (4 KiB granule, T0SZ 16 as `boot.S` sets). The copy loop is
+/// copied into a safe frame and cleaned for instruction fetch before the
+/// jump.
 ///
 /// # Safety
 /// As the x86_64 version.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn restore(
+    record: &ArchRecord,
+    ram: &[(u64, u64)],
+    first_pb_phys: u64,
+    safe: &mut dyn SafeFrames,
+) -> Result<core::convert::Infallible, ArchError> {
+    use narf_arch::aarch64::s4;
+    use narf_memory::PhysAddr;
+    const GIB: u64 = 1 << 30;
+    const MIB2: u64 = 1 << 21;
+    const TABLE: u64 = 0b11;
+    // Block, AttrIndx 0 (Normal WB, `mair`), AP EL1 RW, inner shareable,
+    // access flag set, UXN; PXN clear.
+    const BLOCK: u64 = 0b01 | (0b11 << 8) | (1 << 10) | (1 << 54);
+    let top = ram.last().map_or(0, |&(_, end)| end << 12);
+    if top > 512 * GIB {
+        return Err(ArchError::TooMuchRam);
+    }
+    let table = |phys: u64| PhysAddr::new(phys).kernel_mut_ptr::<u64>();
+    let l0 = safe.safe_frame().ok_or(ArchError::NoMemory)?;
+    let l1 = safe.safe_frame().ok_or(ArchError::NoMemory)?;
+    // SAFETY: fresh, zeroed safe frames through the linear map.
+    unsafe { *table(l0) = l1 | TABLE };
+    let mut l2s = [0u64; 512];
+    for &(start, end) in ram {
+        let mut block = (start << 12) & !(MIB2 - 1);
+        while block < end << 12 {
+            let gib = (block / GIB) as usize;
+            if l2s[gib] == 0 {
+                l2s[gib] = safe.safe_frame().ok_or(ArchError::NoMemory)?;
+                // SAFETY: as above.
+                unsafe { *table(l1).add(gib) = l2s[gib] | TABLE };
+            }
+            let slot = ((block % GIB) / MIB2) as usize;
+            // SAFETY: as above.
+            unsafe { *table(l2s[gib]).add(slot) = block | BLOCK };
+            block += MIB2;
+        }
+    }
+    let code = s4::copy_loop();
+    let loop_phys = safe.safe_frame().ok_or(ArchError::NoMemory)?;
+    let loop_va = PhysAddr::new(loop_phys).kernel_mut_ptr::<u8>();
+    // SAFETY: a safe frame; the loop is smaller than a page. It is cleaned
+    // to PoU and the instruction cache invalidated, and the table writes
+    // made visible to the walker, before the jump.
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), loop_va, code.len());
+        narf_arch::aarch64::asm::flush_icache_range(loop_va as u64, code.len() as u64);
+        core::arch::asm!("dsb ish", "isb", options(nostack));
+        s4::jump(
+            l0,
+            loop_phys,
+            first_pb_phys,
+            record.entry,
+            record.page_table,
+        )
+    }
+}
+
+/// No hibernation restore on this architecture.
+///
+/// # Safety
+/// As the x86_64 version.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn restore(
     _record: &ArchRecord,
     _ram: &[(u64, u64)],

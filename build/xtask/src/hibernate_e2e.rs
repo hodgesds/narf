@@ -15,9 +15,11 @@
 //!    report the same token and digest.
 //!
 //! The image is sealed under `narf.hibernate_policy=off` unless
-//! `--tpm-state` points at a running swtpm socket (the host has to
-//! provide one; NARF does not start it). x86_64 only, one CPU: lane 4 brings
-//! secondary CPUs.
+//! `--tpm-socket` points at a running swtpm socket (the host has to
+//! provide one; NARF does not start it). x86_64 takes `--smp` CPUs, which
+//! hibernation stops and the restored image restarts. aarch64 runs on the
+//! `virt` machine with one CPU (it cannot stop secondary CPUs yet) and
+//! 1 GiB.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -32,8 +34,17 @@ const IMAGE_MIB: u64 = 4096;
 /// The root partition starts at 1 MiB.
 const PART_START_LBA: u64 = 2048;
 const GUEST_MIB: u64 = 2048;
-/// Must match `power::hibernate::e2e::EXIT_*`, as QEMU reports them.
-const EXIT_RESUMED: i32 = (0x10 << 1) | 1;
+/// `power::hibernate::e2e::EXIT_RESUMED`.
+const EXIT_RESUMED_CODE: i32 = 0x10;
+
+/// QEMU's status for a guest exit code: isa-debug-exit reports
+/// `code << 1 | 1`; aarch64 semihosting reports the code itself.
+fn exit_status(arch: super::Arch, code: i32) -> i32 {
+    match arch {
+        super::Arch::X86_64 => (code << 1) | 1,
+        super::Arch::Aarch64 => code,
+    }
+}
 
 /// Options for `cargo xtask hibernate-e2e`.
 #[derive(clap::Args, Clone)]
@@ -135,6 +146,38 @@ struct Boot {
     status: Option<i32>,
 }
 
+/// aarch64: the regular `virt` command line (`Arch::qemu_args`, its DTB
+/// carrying `append`) with the test disk on NVMe, `--smp` CPUs and the reset
+/// log.
+fn aarch64_qemu_args(
+    args: &Args,
+    kernel: &Path,
+    append: &str,
+    qemu_log: &Path,
+    no_reboot: bool,
+) -> Result<Vec<String>> {
+    let mut q = args.build.arch.qemu_args(
+        kernel,
+        "none",
+        super::HwProfile::LegacyOnly,
+        super::GpuBackend::Virtio2d,
+        append,
+    )?;
+    if let Some(at) = q.iter().position(|a| a == "-smp") {
+        q[at + 1] = args.smp.to_string();
+    }
+    if !no_reboot {
+        q.retain(|a| a != "-no-reboot");
+    }
+    q.extend([
+        "-d".into(),
+        "cpu_reset,guest_errors".into(),
+        "-D".into(),
+        qemu_log.display().to_string(),
+    ]);
+    Ok(q)
+}
+
 fn boot(
     args: &Args,
     kernel: &Path,
@@ -148,16 +191,13 @@ fn boot(
         .write(true)
         .open("/dev/kvm")
         .is_ok();
+    let qemu_log = log.with_extension("qemu.log");
+    let qemu = match args.build.arch {
+        super::Arch::X86_64 => qemu_args(args, kernel, image, append, kvm, &qemu_log, no_reboot),
+        super::Arch::Aarch64 => aarch64_qemu_args(args, kernel, append, &qemu_log, no_reboot)?,
+    };
     let mut child = Command::new(args.build.arch.qemu_bin())
-        .args(qemu_args(
-            args,
-            kernel,
-            image,
-            append,
-            kvm,
-            &log.with_extension("qemu.log"),
-            no_reboot,
-        ))
+        .args(qemu)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -208,8 +248,8 @@ fn field(lines: &[String], prefix: &str, key: &str) -> Option<String> {
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    if !matches!(args.build.arch, super::Arch::X86_64) {
-        bail!("hibernate-e2e: x86_64 only (no aarch64 restore yet)");
+    if matches!(args.build.arch, super::Arch::Aarch64) && args.smp > 1 {
+        bail!("hibernate-e2e: aarch64 cannot stop secondary CPUs yet; use --smp 1");
     }
     for tool in ["mkfs.ext4", "sfdisk", args.build.arch.qemu_bin()] {
         if super::which(tool).is_none() {
@@ -271,6 +311,12 @@ pub fn run(args: &Args) -> Result<()> {
             .arg(format!("{IMAGE_MIB}M")),
         "mkfs.ext4",
     )?;
+    // aarch64 attaches its NVMe disk through `Arch::qemu_args`, which takes
+    // the image from NARF_NVME_IMG. The guest RAM caps at 1 GiB there.
+    if matches!(args.build.arch, super::Arch::Aarch64) {
+        std::env::set_var("NARF_NVME_IMG", &image);
+        std::env::set_var("NARF_QEMU_MEM_MB", "1024");
+    }
     let policy = if args.tpm_socket.is_some() {
         ""
     } else {
@@ -340,7 +386,10 @@ pub fn run(args: &Args) -> Result<()> {
             .unwrap_or_else(|| format!("no resumed line (status {:?})", second.status));
         bail!("hibernate-e2e: boot 2 did not resume: {why}");
     };
-    if token2 != token || digest2 != digest || second.status != Some(EXIT_RESUMED) {
+    if token2 != token
+        || digest2 != digest
+        || second.status != Some(exit_status(args.build.arch, EXIT_RESUMED_CODE))
+    {
         bail!(
             "hibernate-e2e: resumed state differs: token {token} -> {token2}, \
              digest {digest} -> {digest2}, status {:?}",

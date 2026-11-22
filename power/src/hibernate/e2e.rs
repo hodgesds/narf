@@ -37,7 +37,12 @@ fn exit(code: u32) -> ! {
     unsafe {
         narf_arch::x86_64::exit_qemu(code)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: semihosting SYS_EXIT_EXTENDED; elsewhere it halts.
+    unsafe {
+        narf_arch::aarch64::exit_qemu(code)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = code;
         narf_arch::halt_forever()
