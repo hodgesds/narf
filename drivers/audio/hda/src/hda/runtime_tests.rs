@@ -4712,3 +4712,22 @@ kernel_test_in!(
     "audio/hda/pointer-wrap",
     native_hda_pointer_advances_across_lpib_wraps
 );
+
+/// Linux `azx_pcm_hw`: HDA PCMs are interleaved only (no
+/// SNDRV_PCM_INFO_NONINTERLEAVED), analog and HDMI alike.
+fn native_hda_pcms_are_interleaved_only() -> TestResult {
+    let builds: [fn() -> Result<Fixture, &'static str>; 2] =
+        [Fixture::new, || Fixture::with(false, true)];
+    for build in builds {
+        let fixture = match build() {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let card = super::super::stream::Card(fixture.controller.as_ref().unwrap().clone());
+        if card.noninterleaved() {
+            return TestResult::Fail("HDA PCMs offer interleaved access only");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda/access", native_hda_pcms_are_interleaved_only);
