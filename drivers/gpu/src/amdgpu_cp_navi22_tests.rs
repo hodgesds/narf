@@ -949,6 +949,15 @@ fn cp_navi22_layout_uses_discovery_banks_and_rejects_aliases() -> TestResult {
     {
         return TestResult::Fail("NBIF doorbell apertures");
     }
+    // nv_common_hw_fini: both apertures off, the base left as it was.
+    model.regs.insert(NBIO + 0xc0 * 4, 0x3);
+    disable_doorbells(&mut model, layout()).unwrap();
+    if model.reg(NBIO + 0xc0 * 4) != 0x2
+        || model.reg(NBIO + 0xf5 * 4) != 0
+        || model.reg(NBIO + 0xf4 * 4) != 0x2345_6000
+    {
+        return TestResult::Fail("NBIF doorbell apertures not disabled");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -1937,4 +1946,31 @@ fn raphael_gfx_power_gating_follows_gfx_v10_cntl_pg() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/cp-raphael",
     raphael_gfx_power_gating_follows_gfx_v10_cntl_pg
+);
+
+/// gfx_v10_0_rlc_stop, the s0ix suspend's RLC halt: only RLC_ENABLE_F32
+/// cleared, and refused before the rings were verified.
+fn raphael_rlc_stop_follows_gfx_v10_0_rlc_stop() -> TestResult {
+    let resolved = Layout::resolve_raphael(&raphael_cp_gpu()).unwrap();
+    let (_pool, mut engine) = gfx(enabled());
+    engine.hw.layout = resolved;
+    engine.hw.io.no_read_cache = true;
+    if engine.stop_rlc() != Err(Error::Busy) {
+        return TestResult::Fail("an RLC stop before the rings were verified");
+    }
+    engine.golden().unwrap();
+    run(engine.configure()).unwrap();
+    run(engine.start()).unwrap();
+    run(engine.test_ib()).unwrap();
+    let cntl = resolved.reg(RLC_CNTL);
+    engine.hw.io.regs.insert(cntl, 0x0000_0f01);
+    let from = engine.hw.io.writes.len();
+    if engine.stop_rlc().is_err() || engine.hw.io.writes[from..] != [(cntl, 0x0000_0f00)] {
+        return TestResult::Fail("RLC_CNTL not written with RLC_ENABLE_F32 alone cleared");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/cp-raphael",
+    raphael_rlc_stop_follows_gfx_v10_0_rlc_stop
 );

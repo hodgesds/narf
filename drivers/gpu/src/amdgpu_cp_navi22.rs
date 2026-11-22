@@ -1155,6 +1155,15 @@ pub(crate) fn enable_doorbells<I: Io>(io: &mut I, l: Layout, bus: u64) -> Result
     io.write(l.nbio(NBIO_SELFRING_CNTL), 0b11);
     Ok(())
 }
+/// `nv_common_hw_fini`: the doorbell aperture
+/// (`nbio_v7_2_enable_doorbell_aperture(false)`) and the self-ring aperture
+/// (`_selfring_aperture(false)` writes its control 0) off.
+pub(crate) fn disable_doorbells<I: Io>(io: &mut I, l: Layout) -> Result<(), Error> {
+    // linux-lit: 1=RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN_MASK
+    update(io, l.nbio(NBIO_DOORBELL_APER_EN), 1, 0)?;
+    io.write(l.nbio(NBIO_SELFRING_CNTL), 0);
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GfxState {
@@ -1345,6 +1354,17 @@ impl<I: Io> GfxEngine<I> {
             exit_safe_mode(&mut self.hw)?;
         }
         written
+    }
+    /// `gfx_v10_0_rlc_stop`, which `smu_disable_dpms` runs for an s0ix
+    /// suspend on GC 10.3 APUs without an IMU: `RLC_CNTL.RLC_ENABLE_F32`
+    /// cleared. GFX itself is left in GFXOFF, and leaving GFXOFF restarts the
+    /// RLC; no NARF step restarts it.
+    pub(crate) fn stop_rlc(&mut self) -> Result<(), Error> {
+        if self.state != GfxState::Verified {
+            return Err(Error::Busy);
+        }
+        self.hw
+            .access(|io, l| update(io, l.reg(RLC_CNTL), RLC_ENABLE_F32, 0))
     }
     /// The state is stored outside the future: cancellation leaves `busy`
     /// and blocks every later step, so no sequence is ever replayed.
@@ -1881,6 +1901,10 @@ impl Gfx {
     pub(crate) async fn set_power_gating(&mut self, enable: bool) -> Result<(), Error> {
         self.engine.set_power_gating(enable).await
     }
+    /// See `GfxEngine::stop_rlc`.
+    pub fn stop_rlc(&mut self) -> Result<(), Error> {
+        self.engine.stop_rlc()
+    }
     /// See `GfxEngine::begin_reset`.
     pub(crate) fn begin_reset(&mut self) -> Result<GfxQueueMap, Error> {
         self.engine.begin_reset()
@@ -1956,6 +1980,26 @@ pub unsafe fn enable_doorbell_apertures_raphael(
         authority,
     };
     hw.access(|io, l| enable_doorbells(io, l, doorbells.bus))
+}
+/// Raphael's `nv_common_hw_fini` for an s0ix suspend: both apertures off
+/// ([`disable_doorbells`]). `enable_doorbell_apertures_raphael` is the
+/// resume's half (`nv_common_hw_init`, then `nv_common_late_init`'s
+/// self-ring enable).
+///
+/// # Safety
+/// As `enable_doorbell_apertures_raphael`; nothing rings a doorbell until
+/// the apertures are enabled again.
+pub unsafe fn disable_doorbell_apertures_raphael(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let mut hw = Hw {
+        layout: Layout::resolve_raphael(gpu)?,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(disable_doorbells)
 }
 
 /// `TIME_STAMP_INT_ENABLE` in CP_INT_CNTL_RING0 / CP_ME1_PIPE0_INT_CNTL.

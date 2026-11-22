@@ -1006,6 +1006,14 @@ impl Gmc {
     pub fn set_fault_interrupts(&mut self, enable: bool) -> Result<(), Error> {
         self.engine.set_fault_interrupts(enable)
     }
+    /// `nv_common_hw_init`'s NBIO half after an s0ix suspend:
+    /// `init_registers` and the HDP remap, as `initialize` ran them.
+    ///
+    /// # Safety
+    /// Same ownership as `initialize`.
+    pub unsafe fn resume_nbio(&mut self) -> Result<(), Error> {
+        self.engine.resume_nbio()
+    }
     /// `gmc_v10_0_gart_disable` for an s0ix suspend: MMHUB alone
     /// (`mmhub_v2_3_gart_disable`). The GFX hub is in GFX's power domain,
     /// which GFXOFF keeps, so it is not touched.

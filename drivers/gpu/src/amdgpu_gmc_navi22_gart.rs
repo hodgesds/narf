@@ -330,6 +330,12 @@ const L2_ENABLE_L2_CACHE: u32 = 1 << 0; // linux: MMVM_L2_CNTL__ENABLE_L2_CACHE_
 /// The MMHUB in `layout.bases`/`layout.hubs` (the GFX hub is index 0).
 const MMHUB: usize = 1;
 impl<I: Io> Engine<I> {
+    /// `init_nbio` again (`Gmc::resume_nbio`), on a booted engine.
+    pub(super) fn resume_nbio(&mut self) -> Result<(), Error> {
+        self.idle()?;
+        let init = self.layout.init;
+        self.access(|io| init_nbio(io, init))
+    }
     /// `mmhub_v2_3_gart_disable`: every MMHUB context off, its L1 TLB and
     /// advanced driver model off, its L2 cache off and `L2_CNTL3` cleared.
     pub(super) fn suspend_mmhub(&mut self) -> Result<(), Error> {
