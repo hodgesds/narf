@@ -7403,6 +7403,12 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     // heavy GUI cases each need their own fresh boot (see GUI_FRESH_BOOT).
     let lightweight: &[(&str, &str)] = &[
         ("hello", "hello"),
+        // IA-32 compat: an i386 static ELF32 (`hello_i386.S`, assembled at
+        // build time) loaded into a TASK_SIZE_32 address space, entered in
+        // compatibility mode and making `write`/`exit_group` through the
+        // i386 `int 0x80` gate. Seeded at /bin/hello_i386 from
+        // `narf_verification::NARF_HELLO_I386_ELF`.
+        ("hello_i386", "hello i386"),
         ("hello_musl", "hello from musl"),
         ("hello_musl_dyn", "hello from musl dyn"),
         // BusyBox demo cases. Each applet exercises a different

@@ -4980,6 +4980,14 @@ define_smoke_elf!(
     "NARF_FORK_PIPE_SMOKE_ELF_X86_64",
     "NARF_FORK_PIPE_SMOKE_ELF_AARCH64"
 );
+// The IA-32 compat smoke: an i386 static `write` + `exit_group` through
+// `int 0x80`, assembled from `data/musl-demo/hello_i386.S` at build time.
+// Prints `hello i386` once the compat-mode entry and the i386 gate run it.
+define_smoke_elf!(
+    NARF_HELLO_I386_ELF,
+    "NARF_HELLO_I386_ELF_X86_64",
+    "NARF_HELLO_I386_ELF_AARCH64"
+);
 define_smoke_elf!(
     NARF_WLSERVE_SMOKE_ELF,
     "NARF_WLSERVE_SMOKE_ELF_X86_64",
