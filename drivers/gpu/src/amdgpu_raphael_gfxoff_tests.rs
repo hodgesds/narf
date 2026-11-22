@@ -28,7 +28,7 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 /// disallows first, a disable before the delay cancels it, and UNGATE
 /// disallows before power gating goes off.
 fn raphael_gfxoff_follows_gfx_v10_powergating() -> TestResult {
-    let (mut hw, mut g) = (Fake::default(), GfxOff::new(true));
+    let (mut hw, mut g) = (Fake::default(), GfxOff::new(true, true));
     if run(g.hold(&mut hw)).is_err() || g.release() != Ok(None) || !hw.events.is_empty() {
         return TestResult::Fail("an access before GATE reached PMFW");
     }
@@ -75,17 +75,17 @@ kernel_test_in!(
 /// before it; without PP_GFXOFF_MASK only power gating follows GATE and
 /// UNGATE, and nothing reaches PMFW.
 fn raphael_gfxoff_epochs_and_the_feature_mask() -> TestResult {
-    let (mut hw, mut old) = (Fake::default(), GfxOff::new(true));
+    let (mut hw, mut old) = (Fake::default(), GfxOff::new(true, true));
     let Ok(Some(stale)) = run(old.gate(&mut hw)) else {
         return TestResult::Fail("GATE scheduled no allow");
     };
-    let mut new = GfxOff::new(true);
+    let mut new = GfxOff::new(true, true);
     let _ = run(new.gate(&mut hw));
     hw.events.clear();
     if run(new.delayed(stale, &mut hw)) != Ok(false) || !hw.events.is_empty() {
         return TestResult::Fail("an allow from an older lifetime landed");
     }
-    let (mut hw, mut off) = (Fake::default(), GfxOff::new(false));
+    let (mut hw, mut off) = (Fake::default(), GfxOff::new(false, true));
     if run(off.gate(&mut hw)) != Ok(None)
         || run(off.hold(&mut hw)).is_err()
         || off.release() != Ok(None)
@@ -100,3 +100,29 @@ kernel_test_in!(
     "drivers/gpu/raphael-gfxoff",
     raphael_gfxoff_epochs_and_the_feature_mask
 );
+
+/// Without `AMD_PG_SUPPORT_GFX_PG` (`amdgpu.pg_mask`) GATE still runs
+/// `gfx_v10_cntl_pg(true)`, which clears RLC's enable instead of setting it,
+/// and GFXOFF follows the count all the same. A renewed lifetime keeps both
+/// flags.
+fn raphael_gfxoff_without_gfx_pg() -> TestResult {
+    let (mut hw, mut g) = (Fake::default(), GfxOff::new(true, false));
+    let Ok(Some(allow)) = run(g.gate(&mut hw)) else {
+        return TestResult::Fail("GATE scheduled no allow");
+    };
+    if hw.events != ["pg off"] || run(g.delayed(allow, &mut hw)) != Ok(true) || !g.status().off {
+        return TestResult::Fail("GATE without GFX_PG");
+    }
+    hw.events.clear();
+    if run(g.ungate(&mut hw)).is_err() || hw.events != ["disallow", "pg off"] {
+        return TestResult::Fail("UNGATE without GFX_PG");
+    }
+    let mut next = g.renewed();
+    hw.events.clear();
+    if !next.enabled() || !matches!(run(next.gate(&mut hw)), Ok(Some(_))) || hw.events != ["pg off"]
+    {
+        return TestResult::Fail("a renewed lifetime lost the flags");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/raphael-gfxoff", raphael_gfxoff_without_gfx_pg);

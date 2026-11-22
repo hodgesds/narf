@@ -5,7 +5,9 @@
 //! - GATE (`gfx_v10_cntl_pg(true)`, then `amdgpu_gfx_off_ctrl(true)`) once
 //!   graphics serves clients, as Linux's late init gates every IP. The
 //!   request count drops from 1 to 0, and `AllowGfxOff` follows
-//!   `GFX_OFF_DELAY_ENABLE` (100 ms) later.
+//!   `GFX_OFF_DELAY_ENABLE` (100 ms) later. Without `AMD_PG_SUPPORT_GFX_PG`
+//!   (`amdgpu.pg_mask`) `gfx_v10_cntl_pg(true)` still runs, clearing the
+//!   enable instead, and GFXOFF is allowed all the same.
 //! - UNGATE (`amdgpu_gfx_off_ctrl(false)`, then `gfx_v10_cntl_pg(false)`)
 //!   before S3 and before a mode 2 reset, as `amdgpu_device_ip_suspend` does.
 //! - A driver read of GC registers holds a disable request for the access:
@@ -48,20 +50,28 @@ pub(crate) struct GfxOff {
     epoch: u64,
     /// `PP_GFXOFF_MASK`: requests reach PMFW.
     enabled: bool,
+    /// `AMD_PG_SUPPORT_GFX_PG`: GATE turns RLC's power gating on.
+    power_gating: bool,
     /// GATE applied and not yet undone.
     gated: bool,
 }
 impl GfxOff {
     /// A coordinator lifetime's state: count 1 (GFXOFF disallowed, which
     /// the SMU stage told PMFW), not gated.
-    pub(crate) fn new(enabled: bool) -> Self {
+    pub(crate) fn new(enabled: bool, power_gating: bool) -> Self {
         Self {
             controller: Controller::new(),
             epoch: EPOCHS.fetch_add(1, Ordering::Relaxed),
             enabled,
+            power_gating,
             gated: false,
         }
     }
+    /// The next lifetime's state, with the same feature flags.
+    pub(crate) fn renewed(&self) -> Self {
+        Self::new(self.enabled, self.power_gating)
+    }
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
@@ -80,9 +90,10 @@ impl GfxOff {
             generation,
         })
     }
-    /// GATE: power gating on, then the count's GATE request. The returned
-    /// allow is to be delivered through [`Self::delayed`] after
-    /// [`DELAY_MS`]. A second GATE does nothing.
+    /// GATE: power gating on (`gfx_v10_cntl_power_gating` sets the enable
+    /// only with `AMD_PG_SUPPORT_GFX_PG`), then the count's GATE request.
+    /// The returned allow is to be delivered through [`Self::delayed`]
+    /// after [`DELAY_MS`]. A second GATE does nothing.
     pub(crate) async fn gate(
         &mut self,
         hw: &mut (impl Control + PowerGating),
@@ -90,7 +101,7 @@ impl GfxOff {
         if self.gated {
             return Ok(None);
         }
-        hw.set_power_gating(true)
+        hw.set_power_gating(self.power_gating)
             .await
             .map_err(|()| Error::Control)?;
         self.gated = true;

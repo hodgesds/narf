@@ -4511,7 +4511,8 @@ compatibility.
 
 `amdgpu_rdna2::options::BootOptions::parse(cmdline)` yields
 `{native_display, accel, multi, hw_cursor, gpu_recovery, power_saving,
-dmub_tables, atom_pixclk, connector}`. Switches
+dmub_tables, atom_pixclk, vcn_smu_pg, vcn_dpg, connector, gfxoff, cg_mask,
+pg_mask}`. Switches
 `amdgpu.native_display`, `amdgpu.rdna2_accel`, `amdgpu.rdna2_multi` and
 `amdgpu.rdna2_hw_cursor` accept a bare flag or `=1|on|y|yes|true` (on) and
 `=0|off|n|no|false` (off); any other value keeps the default. The
@@ -4530,7 +4531,17 @@ the ATOM interpreter instead of DMCUB. `amdgpu.rdna2_connector=dp|hdmi`
 (`options::Connector`; anything else is `Any`) makes the single-display
 Navi22 boot modeset light that kind of sink first when one is connected
 (`amdgpu_navi22_modeset::set_connector_preference`, `choose_preferring`);
-`Any` keeps Linux's order, HDMI first.
+`Any` keeps Linux's order, HDMI first. Raphael takes Linux's own knobs:
+`gfxoff` is `amdgpu.ppfeaturemask`'s `PP_GFXOFF_MASK`, and `cg_mask` and
+`pg_mask` are `amdgpu.cg_mask` and `amdgpu.pg_mask`. Each is a `uint`
+(`0x` hex, a leading `0` octal, otherwise decimal), and a malformed value
+keeps Linux's default (`0xfff7bfff`, all ones, all ones). Raphael keeps
+`RAPHAEL_CG & cg_mask` and `RAPHAEL_PG & pg_mask` of `nv_common_early_init`'s
+GC 10.3.6 flags. Its `pg_flags` decide three things:
+- whether GATE sets RLC's CGPG enable (`AMD_PG_SUPPORT_GFX_PG`);
+- whether VCN starts in DPG or on the static path (`AMD_PG_SUPPORT_VCN_DPG`);
+- the VCN and JPEG PGFSM steps of the static power gating
+  (`amdgpu_vcn_navi22::StaticPg`; Navi22 keeps its fixed policy).
 
 Clock/power capability flags come from each profile's Linux
 `nv_common_early_init` selection. Navi21/22/23 share the existing capability

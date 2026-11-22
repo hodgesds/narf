@@ -68,6 +68,10 @@ pub struct BootOptions<'a> {
     /// Linux `amdgpu.cg_mask`: the clock-gating flags Raphael keeps
     /// (`cg_flags &= amdgpu_cg_mask`). Every bit by default.
     pub cg_mask: u32,
+    /// Linux `amdgpu.pg_mask`: the power-gating flags Raphael keeps
+    /// (`pg_flags &= amdgpu_pg_mask`; `0` disables power gating). Every bit
+    /// by default.
+    pub pg_mask: u32,
 }
 /// `amdgpu_pp_feature_mask`'s default (amdgpu_drv.c).
 // linux-lit: 0xfff7bfff=amdgpu_pp_feature_mask default
@@ -154,6 +158,10 @@ impl<'a> BootOptions<'a> {
                 Some(Some(v)) => parse_uint(v).unwrap_or(u32::MAX),
                 _ => u32::MAX,
             },
+            pg_mask: match value("amdgpu.pg_mask") {
+                Some(Some(v)) => parse_uint(v).unwrap_or(u32::MAX),
+                _ => u32::MAX,
+            },
         }
     }
 }
@@ -223,6 +231,13 @@ mod tests {
         assert_eq!(default.cg_mask, u32::MAX);
         assert_eq!(BootOptions::parse("amdgpu.cg_mask=0xfffffffb").cg_mask, !4);
         assert_eq!(BootOptions::parse("amdgpu.cg_mask=nope").cg_mask, u32::MAX);
+        assert_eq!(default.pg_mask, u32::MAX);
+        assert_eq!(BootOptions::parse("amdgpu.pg_mask=0").pg_mask, 0);
+        assert_eq!(
+            BootOptions::parse("amdgpu.pg_mask=0xffff7fff").pg_mask,
+            !0x8000
+        );
+        assert_eq!(BootOptions::parse("amdgpu.pg_mask=-1").pg_mask, u32::MAX);
         for (raw, want) in [
             ("amdgpu.rdna2_connector=dp", Connector::DisplayPort),
             ("amdgpu.rdna2_connector=hdmi", Connector::Hdmi),

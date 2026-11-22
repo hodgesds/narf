@@ -162,6 +162,9 @@ pub struct ColdBoot {
     /// Clock gating (`amdgpu_device_set_cg_state`); `None` if its banks did
     /// not resolve, and the clocks then stay ungated.
     gating: Option<gating::Gating>,
+    /// `adev->pg_flags`: [`gating::RAPHAEL_PG`] under `amdgpu.pg_mask`
+    /// (`amdgpu_device_ip_early_init`).
+    pg_flags: u32,
 }
 /// PMFW's GFXOFF messages and RLC's power gating, for `gfxoff`.
 struct GcPower<'a> {
@@ -219,6 +222,7 @@ impl ColdBoot {
             let queues = sdma_queues::Sdma::new_raphael(&gpu, authority, pool, doorbells)
                 .map_err(Error::Queues)?;
             let options = crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw());
+            let pg_flags = gating::RAPHAEL_PG & options.pg_mask;
             // This coordinator alone writes the gating registers; no access.
             let gating = match gating::Gating::new_raphael(&gpu, authority, options.cg_mask) {
                 Ok(gating) => Some(gating),
@@ -249,8 +253,9 @@ impl ColdBoot {
                 proof: None,
                 topology: None,
                 state: State::Prepared,
-                gfxoff: gfxoff::GfxOff::new(options.gfxoff),
+                gfxoff: gfxoff::GfxOff::new(options.gfxoff, pg_flags & gating::pg::GFX_PG != 0),
                 gating,
+                pg_flags,
             })
         }
     }
@@ -574,7 +579,7 @@ impl ColdBoot {
         self.state = State::Prepared;
         // A new lifetime: the count back at 1 (the SMU stage disallows), and
         // a delayed allow from before lands nowhere.
-        self.gfxoff = gfxoff::GfxOff::new(self.gfxoff.enabled());
+        self.gfxoff = self.gfxoff.renewed();
         if let Some(gating) = self.gating.as_mut() {
             // SAFETY: forwarded; the reset left every gating register at its
             // default and no transition is in flight.
@@ -742,9 +747,11 @@ impl ColdBoot {
         Ok(report)
     }
     /// Bring VCN and JPEG up after a completed `run`: `smu_hw_init`'s APU
-    /// power-up (`PowerUpVcn`, `PowerUpJpeg`; VCN is power gated by default),
-    /// then `vcn_v3_0_hw_init` in DPG mode with `psp`, the session that loaded
-    /// the VCN image, writing its register lists, then JPEG, then the
+    /// power-up (`PowerUpVcn`, `PowerUpJpeg`; VCN is power gated by default,
+    /// and Linux sends both whatever `pg_flags` hold), then `vcn_v3_0_hw_init`
+    /// in DPG mode with `psp`, the session that loaded the VCN image, writing
+    /// its register lists (the static path without `AMD_PG_SUPPORT_VCN_DPG`),
+    /// then JPEG, then the
     /// interrupt routes and the decode/encode/JPEG IB tests. Failing here
     /// leaves the graphics engines and the display as they are.
     ///
@@ -777,6 +784,7 @@ impl ColdBoot {
                         &self.pool,
                         self.doorbells,
                         vcn_bytes,
+                        self.pg_flags,
                     )
                 }
                 .map_err(Error::Media)?;

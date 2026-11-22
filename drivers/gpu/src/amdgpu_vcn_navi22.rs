@@ -22,6 +22,10 @@
 //! runs unannounced is refused before any write. Firmware images come from
 //! the PSP-loaded TMR (`AMDGPU_FW_LOAD_PSP`). Client submissions use lent
 //! MMHUB VMIDs; startup proofs use VMID0.
+//!
+//! Raphael's owner follows Linux's `pg_flags` under `amdgpu.pg_mask`
+//! instead: DPG with `AMD_PG_SUPPORT_VCN_DPG`, otherwise the static path,
+//! and the PGFSM steps of both blocks' static power gating ([`StaticPg`]).
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_fence_navi22 as fence, amdgpu_vram::Pool,
     amdgpu_vram::Reservation,
@@ -192,6 +196,16 @@ pub(crate) mod bits {
     pub const PGFSM_ALL_ON: u32 = 0x1515_5555;
     // linux: n/a (literal 0x3F3FFFFF in vcn_v3_0_disable_static_power_gating)
     pub const PGFSM_STATUS_MASK: u32 = 0x3f3f_ffff;
+    /// UVDM, UVDU and UVDLM set to 1 (on), every other tile except UVDJ to
+    /// 2 (off): the `AMD_PG_SUPPORT_VCN` branch of
+    /// `vcn_v3_0_disable_static_power_gating`.
+    // linux: (1 << UVD_PGFSM_CONFIG__UVDM_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDU_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDF_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDC_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDB_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDIRL_PWR_CONFIG__SHIFT) | (1 << UVD_PGFSM_CONFIG__UVDLM_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDTD_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDTE_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDE_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDAB_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDATD_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDNA_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDNB_PWR_CONFIG__SHIFT)
+    pub const PGFSM_VCN_PG_ON: u32 = 0x2a2a_9aa5;
+    pub const PGFSM_VCN_PG_ON_STATUS: u32 = 0x2a2a_8aa0; // linux: UVD_PGFSM_STATUS__UVDM_UVDU_UVDLM_PWR_ON_3_0
+    /// Every tile except UVDJ set to 2 (off), and the status that reports
+    /// it: `vcn_v3_0_enable_static_power_gating`.
+    // linux: (2 << UVD_PGFSM_CONFIG__UVDM_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDU_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDF_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDC_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDB_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDIRL_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDLM_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDTD_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDTE_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDE_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDAB_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDATD_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDNA_PWR_CONFIG__SHIFT) | (2 << UVD_PGFSM_CONFIG__UVDNB_PWR_CONFIG__SHIFT)
+    pub const PGFSM_ALL_OFF: u32 = 0x2a2a_aaaa;
     /// UVD_POWER_STATUS bits cleared with PG disabled (POWER_STATUS, PG_EN).
     // linux: UVD_POWER_STATUS__UVD_PG_EN_MASK | UVD_POWER_STATUS__UVD_POWER_STATUS_MASK
     pub const POWER_STATUS_CLEAR: u32 = 0x103;
@@ -222,6 +236,8 @@ pub(crate) mod bits {
     pub const CC_UVD_DISABLE: u32 = 1 << 1; // linux: CC_UVD_HARVESTING__UVD_DISABLE_MASK
     pub const PGFSM_UVDJ_ON: u32 = 1 << 22; // linux: 1 << UVD_PGFSM_CONFIG__UVDJ_PWR_CONFIG__SHIFT
     pub const PGFSM_UVDJ_STATUS: u32 = 0x00c0_0000; // linux: UVD_PGFSM_STATUS__UVDJ_PWR_STATUS_MASK
+    /// UVDJ set to 2 (off), and its status once off.
+    pub const PGFSM_UVDJ_OFF: u32 = 2 << 22; // linux: 2 << UVD_PGFSM_CONFIG__UVDJ_PWR_CONFIG__SHIFT
     /// linux: UVD_JPEG_POWER_STATUS__JPEG_POWER_STATUS_MASK
     pub const JPEG_POWER_STATUS_MASK: u32 = 1;
     pub const JPEG_PG_MODE: u32 = 1 << 4; // linux: UVD_JPEG_POWER_STATUS__JPEG_PG_MODE_MASK
@@ -244,6 +260,8 @@ pub(crate) mod bits {
     pub const POWER_STALL_DPG: u32 = 1 << 31;
     /// UVD_POWER_STATUS once a paused instance is powered back up.
     pub const POWER_UVDM_UVDU_ON: u32 = 2; // linux: UVD_PGFSM_CONFIG__UVDM_UVDU_PWR_ON
+    /// The indicator set before the static path powers the tiles off.
+    pub const POWER_TILES_OFF: u32 = 1; // linux: UVD_POWER_STATUS__UVD_POWER_STATUS_TILES_OFF
     pub const DPG_PAUSE_REQ: u32 = 1 << 2; // linux: UVD_DPG_PAUSE__NJ_PAUSE_DPG_REQ_MASK
     pub const DPG_PAUSE_ACK: u32 = 1 << 3; // linux: UVD_DPG_PAUSE__NJ_PAUSE_DPG_ACK_MASK
     /// PRB_TIMEOUT_VAL 0xff | CLK_EN, the DPG VCPU control word.
@@ -783,6 +801,54 @@ static DPG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new
 pub fn set_dpg(enabled: bool) {
     DPG.store(enabled, Ordering::Relaxed);
 }
+impl StartMode {
+    /// `vcn_v3_0_start`'s choice under Linux's `pg_flags`.
+    pub(crate) fn linux(pg_flags: u32) -> Self {
+        if pg_flags & crate::amdgpu_navi22_gating::pg::VCN_DPG != 0 {
+            Self::Dpg
+        } else {
+            Self::Static
+        }
+    }
+}
+
+/// The PGFSM power gating an owner applies around its engines' static
+/// starts and stops (`vcn_v3_0_{disable,enable}_static_power_gating`,
+/// `jpeg_v3_0_{disable,enable}_static_power_gating`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StaticPg {
+    /// `AMD_PG_SUPPORT_VCN`: the static start powers UVDM, UVDU and UVDLM on
+    /// with UVD_PG_EN set, the other tiles off, and the static stop powers
+    /// every tile off. Without it the start powers every tile on and the
+    /// stop leaves them on.
+    pub vcn: bool,
+    /// The JPEG start powers UVDJ on.
+    pub jpeg_on: bool,
+    /// The JPEG stop powers UVDJ off.
+    pub jpeg_off: bool,
+}
+impl StaticPg {
+    /// Navi22's fixed policy: the static path with `AMD_PG_SUPPORT_VCN`
+    /// clear, and UVDJ powered on for JPEG and left on. (Navy Flounder's
+    /// Linux flags carry `AMD_PG_SUPPORT_JPEG`, whose stop also powers UVDJ
+    /// off.)
+    pub(crate) const NAVI22: Self = Self {
+        vcn: false,
+        jpeg_on: true,
+        jpeg_off: false,
+    };
+    /// Linux's `pg_flags`: `AMD_PG_SUPPORT_VCN`, and `AMD_PG_SUPPORT_JPEG`
+    /// for both UVDJ steps.
+    pub(crate) fn linux(pg_flags: u32) -> Self {
+        use crate::amdgpu_navi22_gating::pg;
+        let jpeg = pg_flags & pg::JPEG != 0;
+        Self {
+            vcn: pg_flags & pg::VCN != 0,
+            jpeg_on: jpeg,
+            jpeg_off: jpeg,
+        }
+    }
+}
 
 /// `amdgpu_vcn_psp_update_sram`: PSP writes one instance's DPG register
 /// list (offset/value pairs) into that instance's DPG SRAM.
@@ -1155,6 +1221,8 @@ pub(crate) struct Engine<I: Io> {
     pub firmware_bytes: u32,
     pub timing: Timing,
     pub mode: StartMode,
+    /// The static power gating ([`StaticPg`]).
+    pub pg: StaticPg,
     /// DPG instances paused for encode (`pause_state.fw_based`).
     pub paused: [bool; 2],
     pub state: State,
@@ -1526,20 +1594,30 @@ impl<I: Io> Engine<I> {
         // linux: n/a (AMDGPU_GPU_PAGE_ALIGN(fw->size + 4), vcn_v3_0_mc_resume)
         let cache0 = (self.firmware_bytes + 4 + 4095) & !4095;
         let r = move |l: Layout, reg: Reg| l.reg(i, reg);
-        // vcn_v3_0_disable_static_power_gating, !AMD_PG_SUPPORT_VCN branch.
+        // vcn_v3_0_disable_static_power_gating: with AMD_PG_SUPPORT_VCN the
+        // core tiles alone, UVD_PG_EN set; without it every tile.
+        let (config, powered, power) = if self.pg.vcn {
+            (
+                PGFSM_VCN_PG_ON,
+                PGFSM_VCN_PG_ON_STATUS,
+                POWER_UVDM_UVDU_ON | POWER_PG_EN,
+            )
+        } else {
+            (PGFSM_ALL_ON, 0, 0)
+        };
         self.hw.access(|io, l| {
             // UVD_STATUS belongs to the gated domain. Like vcn_v3_0_start,
             // power the tiles first; GC and NBIO liveness were checked before
             // reaching here. A gated status read is not proof of device loss.
-            io.write(r(l, PGFSM_CONFIG), PGFSM_ALL_ON);
+            io.write(r(l, PGFSM_CONFIG), config);
             Ok(())
         })?;
         let status = self.hw.layout.reg(i, PGFSM_STATUS);
         self.hw
-            .wait_reg(engine, status, 0, PGFSM_STATUS_MASK)
+            .wait_reg(engine, status, powered, PGFSM_STATUS_MASK)
             .await?;
         self.hw.access(|io, l| {
-            update(io, r(l, POWER_STATUS), POWER_STATUS_CLEAR, 0)?;
+            update(io, r(l, POWER_STATUS), POWER_STATUS_CLEAR, power)?;
             // set VCN status busy
             update(io, r(l, STATUS), STATUS_UVD_BUSY, STATUS_UVD_BUSY)?;
             // vcn_v3_0_disable_clock_gating with AMD_CG_SUPPORT_VCN_MGCG
@@ -2208,13 +2286,31 @@ impl<I: Io> Engine<I> {
     }
     async fn stop_inner(&mut self) -> Result<(), Error> {
         if self.jpeg_state == JpegState::Verified {
+            let off = self.pg.jpeg_off;
             self.hw.access(|io, l| {
                 let r = |reg: Reg| l.reg(0, reg);
                 update(io, r(JMI_CNTL), JMI_SOFT_RESET, JMI_SOFT_RESET)?;
-                // jpeg_v3_0_enable_clock_gating; anti-hang on, no PGFSM.
+                // jpeg_v3_0_enable_clock_gating, then
+                // jpeg_v3_0_enable_static_power_gating: anti-hang on, and
+                // UVDJ off where the owner powers it off.
                 update(io, r(JPEG_CGC_GATE), JPEG_CGC_GATE_ALL, JPEG_CGC_GATE_ALL)?;
-                update(io, r(JPEG_POWER_STATUS), JPEG_POWER_STATUS_MASK, 1)
+                update(io, r(JPEG_POWER_STATUS), JPEG_POWER_STATUS_MASK, 1)?;
+                if off {
+                    io.write(r(PGFSM_CONFIG), PGFSM_UVDJ_OFF);
+                }
+                Ok(())
             })?;
+            if off {
+                let status = self.hw.layout.reg(0, PGFSM_STATUS);
+                self.hw
+                    .wait_reg(
+                        fence::Engine::Jpeg,
+                        status,
+                        PGFSM_UVDJ_OFF,
+                        PGFSM_UVDJ_STATUS,
+                    )
+                    .await?;
+            }
             self.jpeg_state = JpegState::Stopped;
         }
         self.stop_instances().await
@@ -2224,6 +2320,7 @@ impl<I: Io> Engine<I> {
             return Ok(());
         }
         let instances: alloc::vec::Vec<usize> = self.active().collect();
+        let vcn_pg = self.pg.vcn;
         for i in instances {
             if self.mode == StartMode::Dpg {
                 self.stop_dpg(i).await?;
@@ -2266,9 +2363,28 @@ impl<I: Io> Engine<I> {
                     SUVD_CGC_CTRL_MODES,
                     SUVD_CGC_CTRL_MODES,
                 )?;
-                checked(io.read(r(STATUS)))?;
+                if !vcn_pg {
+                    checked(io.read(r(STATUS)))?;
+                    return Ok(());
+                }
+                // vcn_v3_0_enable_static_power_gating, AMD_PG_SUPPORT_VCN:
+                // the tiles-off indicator, then every tile off.
+                update(io, r(POWER_STATUS), POWER_STATUS_MASK, POWER_TILES_OFF)?;
+                io.write(r(PGFSM_CONFIG), PGFSM_ALL_OFF);
                 Ok(())
             })?;
+            if vcn_pg {
+                let pgfsm = reg(self.hw.layout, PGFSM_STATUS);
+                self.hw
+                    .wait_reg(engine, pgfsm, PGFSM_ALL_OFF, PGFSM_STATUS_MASK)
+                    .await?;
+                // The read-back that orders the writes. UVD_STATUS is in the
+                // gated domain now, so its value proves nothing.
+                self.hw.access(|io, l| {
+                    io.read(reg(l, STATUS));
+                    Ok(())
+                })?;
+            }
         }
         Ok(())
     }
@@ -2292,7 +2408,7 @@ impl<I: Io> Engine<I> {
         let jpeg = self.jpeg.as_mut().ok_or(Error::Invalid)?;
         let (map, address) = (jpeg.memory.mapping(), jpeg.memory.address());
         let r = |l: Layout, reg: Reg| l.reg(0, reg);
-        let nbio_v7_2 = self.nbio_v7_2;
+        let (nbio_v7_2, power_on) = (self.nbio_v7_2, self.pg.jpeg_on);
         let present = self.hw.access(|io, l| {
             if l.jpeg_reads_harvesting() {
                 let harvest = checked(io.read(r(l, CC_UVD_HARVESTING)))?;
@@ -2308,18 +2424,23 @@ impl<I: Io> Engine<I> {
             flush(io, l);
             // jpeg_v3_0_hw_init: the VCN0 range starts at the VCN0 ring base.
             vcn_doorbell_range(io, l, nbio_v7_2, 0, doorbell::VCN_BASE)?;
-            // jpeg_v3_0_disable_static_power_gating: power UVDJ on
-            io.write(r(l, PGFSM_CONFIG), PGFSM_UVDJ_ON);
+            // jpeg_v3_0_disable_static_power_gating: power UVDJ on, where
+            // the owner powers it (AMD_PG_SUPPORT_JPEG).
+            if power_on {
+                io.write(r(l, PGFSM_CONFIG), PGFSM_UVDJ_ON);
+            }
             Ok(true)
         })?;
         if !present {
             return Ok(false);
         }
         jpeg.memory.publish();
-        let status = self.hw.layout.reg(0, PGFSM_STATUS);
-        self.hw
-            .wait_reg(fence::Engine::Jpeg, status, 0, PGFSM_UVDJ_STATUS)
-            .await?;
+        if power_on {
+            let status = self.hw.layout.reg(0, PGFSM_STATUS);
+            self.hw
+                .wait_reg(fence::Engine::Jpeg, status, 0, PGFSM_UVDJ_STATUS)
+                .await?;
+        }
         let jpeg = self.jpeg.as_mut().ok_or(Error::Invalid)?;
         let ring = &mut jpeg.ring;
         ring.reset();
@@ -2479,6 +2600,11 @@ impl Media {
         firmware_bytes: usize,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu, instances)?;
+        let mode = if DPG.load(Ordering::Relaxed) {
+            StartMode::Dpg
+        } else {
+            StartMode::Static
+        };
         Self::with_layout(
             gpu,
             authority,
@@ -2488,13 +2614,16 @@ impl Media {
             firmware_bytes,
             layout,
             None,
+            (mode, StaticPg::NAVI22),
         )
     }
     /// Reserve Raphael's one VCN 3.1.2 instance and its JPEG: the same
     /// `vcn_v3_0`/`jpeg_v3_0` start, with NBIO 7.2's doorbell range, no HDP
     /// read cache, `smu_interface_type` 2 and no JPEG harvest read. PMFW must
     /// have powered VCN and JPEG up (`PowerUpVcn`/`PowerUpJpeg`) before
-    /// `start`.
+    /// `start`. `pg_flags` (Linux's, under `amdgpu.pg_mask`) choose the
+    /// start ([`StartMode::linux`]) and the static power gating
+    /// ([`StaticPg::linux`]).
     ///
     /// # Safety
     /// As `new`, for Raphael.
@@ -2504,6 +2633,7 @@ impl Media {
         pool: &Pool,
         doorbells: crate::amdgpu_cp_navi22::Doorbells,
         firmware_bytes: usize,
+        pg_flags: u32,
     ) -> Result<Self, Error> {
         let (layout, nbio) = Layout::resolve_raphael(gpu, 1)?;
         Self::with_layout(
@@ -2515,6 +2645,7 @@ impl Media {
             firmware_bytes,
             layout,
             Some(nbio),
+            (StartMode::linux(pg_flags), StaticPg::linux(pg_flags)),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -2527,6 +2658,7 @@ impl Media {
         firmware_bytes: usize,
         layout: Layout,
         nbio_v7_2: Option<crate::amdgpu_nbio_v7_2::Banks>,
+        (mode, pg): (StartMode, StaticPg),
     ) -> Result<Self, Error> {
         let firmware_bytes = u32::try_from(firmware_bytes).map_err(|_| Error::Invalid)?;
         if firmware_bytes == 0 || firmware_bytes > 4 << 20 {
@@ -2572,11 +2704,8 @@ impl Media {
                 jpeg,
                 firmware_bytes,
                 timing: LINUX_TIMING,
-                mode: if DPG.load(Ordering::Relaxed) {
-                    StartMode::Dpg
-                } else {
-                    StartMode::Static
-                },
+                mode,
+                pg,
                 paused: [false; 2],
                 state: State::Prepared,
                 proof: Proof {

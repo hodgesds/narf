@@ -267,7 +267,9 @@ impl Model {
         }
         let window = self.pair(v(i, LMI_VCPU_CACHE_BAR_LOW), v(i, LMI_VCPU_CACHE_BAR_HIGH));
         let size = self.reg(v(i, VCPU_CACHE_SIZE0));
-        let powered = self.reg(v(i, PGFSM_STATUS)) & PGFSM_STATUS_MASK == 0;
+        // Every tile on, or (AMD_PG_SUPPORT_VCN) the core tiles alone.
+        let tiles = self.reg(v(i, PGFSM_STATUS)) & PGFSM_STATUS_MASK;
+        let powered = tiles == 0 || tiles == PGFSM_VCN_PG_ON_STATUS;
         if window != TMR[i] || size != (FW_BYTES + 4 + 4095) & !4095 || !powered {
             return;
         }
@@ -604,6 +606,7 @@ fn engine(model: Model, instances: u8) -> (Pool, Engine<Model>) {
             firmware_bytes: FW_BYTES,
             timing: FAST,
             mode: StartMode::Static,
+            pg: StaticPg::NAVI22,
             paused: [false; 2],
             state: State::Prepared,
             proof: Proof {
@@ -2179,6 +2182,93 @@ kernel_test_in!(
     "drivers/gpu/vcn-raphael",
     raphael_vcn_layout_and_3_1_x_rules
 );
+
+/// Raphael's media under `amdgpu.pg_mask`. nv.c's GC 10.3.6 `pg_flags` start
+/// VCN in DPG. Without `AMD_PG_SUPPORT_VCN_DPG` the static path runs, and
+/// with `AMD_PG_SUPPORT_VCN` it powers only UVDM, UVDU and UVDLM on (UVD_PG_EN
+/// set) and, at stop, raises the tiles-off indicator before powering every
+/// tile off. `AMD_PG_SUPPORT_JPEG` powers UVDJ on at the JPEG start and off
+/// at its stop. With `pg_mask=0` every tile is powered on and stays on, and
+/// UVDJ is never commanded.
+fn raphael_media_follows_pg_mask() -> TestResult {
+    use crate::amdgpu_navi22_gating::{pg, RAPHAEL_PG};
+    let all = StaticPg {
+        vcn: true,
+        jpeg_on: true,
+        jpeg_off: true,
+    };
+    let no_jpeg = StaticPg {
+        jpeg_on: false,
+        jpeg_off: false,
+        ..all
+    };
+    if RAPHAEL_PG != pg::GFX_PG | pg::VCN | pg::VCN_DPG | pg::JPEG
+        || (StartMode::linux(RAPHAEL_PG), StaticPg::linux(RAPHAEL_PG)) != (StartMode::Dpg, all)
+        || StartMode::linux(RAPHAEL_PG & !pg::VCN_DPG) != StartMode::Static
+        || StaticPg::linux(RAPHAEL_PG & !pg::JPEG) != no_jpeg
+        || StaticPg::linux(0)
+            != (StaticPg {
+                vcn: false,
+                ..no_jpeg
+            })
+    {
+        return TestResult::Fail("pg_flags to the media owner's policy");
+    }
+    let configs = |m: &Model| -> Vec<u32> {
+        m.writes
+            .iter()
+            .filter(|&&(a, _)| a == v(0, PGFSM_CONFIG))
+            .map(|&(_, value)| value)
+            .collect()
+    };
+    let cycle = |e: &mut Engine<Model>| {
+        run(e.start(firmware(1), None, &mut NoSram)).is_ok()
+            && run(e.start_jpeg()).is_ok()
+            && run(e.test_ib()).is_ok()
+    };
+    let (_pool, mut e) = engine(Model::new(), 1);
+    e.pg = StaticPg::linux(RAPHAEL_PG & !pg::VCN_DPG);
+    if !cycle(&mut e)
+        || configs(&e.hw.io) != [PGFSM_VCN_PG_ON, PGFSM_UVDJ_ON]
+        || e.hw.io.reg(v(0, POWER_STATUS)) != POWER_PG_EN | POWER_UVDM_UVDU_ON
+    {
+        return TestResult::Fail("static power-up with AMD_PG_SUPPORT_VCN");
+    }
+    let from = e.hw.io.writes.len();
+    if run(e.stop()).is_err() {
+        return TestResult::Fail("static stop with AMD_PG_SUPPORT_VCN");
+    }
+    let m = &e.hw.io;
+    let at = |want: (u64, u32)| m.writes[from..].iter().position(|&w| w == want);
+    let (indicator, off) = (
+        at((v(0, POWER_STATUS), POWER_PG_EN | POWER_TILES_OFF)),
+        at((v(0, PGFSM_CONFIG), PGFSM_ALL_OFF)),
+    );
+    if configs(m)[2..] != [PGFSM_UVDJ_OFF, PGFSM_ALL_OFF]
+        || !matches!((indicator, off), (Some(a), Some(b)) if a < b)
+        || m.reg(v(0, PGFSM_STATUS)) & PGFSM_STATUS_MASK != PGFSM_ALL_OFF
+        || m.reg(v(0, PGFSM_STATUS)) & PGFSM_UVDJ_STATUS != PGFSM_UVDJ_OFF
+    {
+        return TestResult::Fail("static power-down with AMD_PG_SUPPORT_VCN and JPEG");
+    }
+    // pg_mask=0: UVDJ is never commanded, so it must already be on.
+    let mut model = Model::new();
+    model
+        .regs
+        .insert(v(0, PGFSM_STATUS), 0xaaaa_aaaa & !PGFSM_UVDJ_STATUS);
+    let (_pool, mut e) = engine(model, 1);
+    e.pg = StaticPg::linux(0);
+    if !cycle(&mut e)
+        || run(e.stop()).is_err()
+        || configs(&e.hw.io) != [PGFSM_ALL_ON]
+        || e.hw.io.reg(v(0, POWER_STATUS)) != 0
+        || e.hw.io.reg(v(0, PGFSM_STATUS)) & PGFSM_STATUS_MASK != 0
+    {
+        return TestResult::Fail("pg_mask=0 power gated a media tile");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/vcn-raphael", raphael_media_follows_pg_mask);
 
 /// A media ring's VM flush names its hub's registers: on MMHUB 2.0/2.1
 /// (Navi22) CONTEXT0 PTB 0x72b and ENG0 SEM/REQ/ACK 0x6d1/0x6e3/0x6f5 with

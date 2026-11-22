@@ -660,6 +660,37 @@ since the submitter is replaced. Raphael's port:
     firmware may also have lit a GOP stream; the display's replay assumes
     the DCN state S3 leaves, and this is unproven.
 
+## Power-gating mask
+
+19. ~~`amdgpu.pg_mask`~~ (done). `amdgpu_device_ip_early_init` masks
+    `nv_common_early_init`'s 10.3.6 `pg_flags` (GFX_PG, VCN, VCN_DPG, JPEG)
+    with `amdgpu_pg_mask`; `0` turns power gating off. The boot keeps
+    `RAPHAEL_PG & pg_mask`, and each flag reaches what Linux keys on it:
+    - **GFX_PG.** GATE still runs `gfx_v10_cntl_pg(true)` in RLC safe mode,
+      which without the flag clears `RLC_PG_CNTL`'s enable and leaves
+      `RLC_PG_DELAY_3` alone. GFXOFF follows `PP_GFXOFF_MASK` either way
+      (step 15). SMU 13.0.5 has no `set_gfx_cgpg`, so nothing else reads it.
+    - **VCN_DPG.** Without it `vcn_v3_0_start` takes the static path: the
+      registers written directly, the VCPU boot polled, no DPG pause, and the
+      idle gate and its wake stop and restart the same way. That path has
+      not run on Raphael; Navi22's boards refuse its direct VCPU writes.
+    - **VCN.** It matters only on the static path. With it,
+      `vcn_v3_0_disable_static_power_gating` powers UVDM, UVDU and UVDLM on
+      (PGFSM status `UVDM_UVDU_UVDLM_PWR_ON_3_0`) and sets UVD_PG_EN, and
+      `_enable_` raises the tiles-off indicator and powers every tile off
+      at stop. Without it every tile is powered on and stays on.
+    - **JPEG.** `jpeg_v3_0_{disable,enable}_static_power_gating` power UVDJ
+      on at the JPEG start and off at its stop. The stop's power-off is new
+      on Raphael's default path too: S3 and hibernation stop media
+      (`suspend_media`); recovery does not.
+      Navi22's owner keeps its fixed policy, which powers UVDJ on and never
+      off, although Navy Flounder's Linux flags carry JPEG.
+
+    Linux sends `PowerUpVcn` and `PowerUpJpeg` at `smu_hw_init` whatever the
+    flags hold, and so does `run_media`. The flags' other consumer,
+    `smu_set_default_dpm_table`'s power-up around the DPM table, does not
+    apply: this port never reads the 13.0.5 DPM clock table.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table

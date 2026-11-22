@@ -92,6 +92,11 @@ pub const RAPHAEL_CG: u64 = cg::GFX_MGCG
     | cg::VCN_MGCG
     | cg::JPEG_MGCG;
 
+/// The same case's `pg_flags`: RLC's CGPG (`gfx_v10_cntl_pg`), VCN's DPG
+/// start and both media blocks' static PGFSM power gating. GFXOFF itself
+/// follows `PP_GFXOFF_MASK`, not these.
+pub const RAPHAEL_PG: u32 = pg::GFX_PG | pg::VCN | pg::VCN_DPG | pg::JPEG;
+
 /// `nv_common_early_init` flags for bare-metal discrete RDNA2.
 pub fn profile_flags(profile: &crate::amdgpu_rdna2::Profile) -> (u64, u32) {
     (profile.clock_gating_flags(), profile.power_gating_flags())
