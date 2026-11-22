@@ -1753,7 +1753,10 @@ impl IntelHda {
     /// Power-management quiesce: codecs to D3, command + stream
     /// engines off, DMA rings retained (host memory survives the
     /// park). Idempotent: already-suspended is Ok. Refuses with
-    /// Busy when any stream is running or prepared.
+    /// Busy when any stream is running or prepared. The runtime-PM callback
+    /// (`HdaRuntimePm`, constructed by kernel tests only so far, like the
+    /// struct itself); system suspend uses `system_suspend`.
+    #[allow(dead_code)]
     fn quiesce(&self) -> Result<(), HdaError> {
         self.quiesce_with(|| true, false)
     }
@@ -1769,20 +1772,55 @@ impl IntelHda {
         if !self.streams_idle() || !idle() {
             return Err(HdaError::Busy);
         }
-        self.set_codec_power(true)?;
+        self.park(&idle, arm_wake)
+    }
+
+    /// Linux system suspend: the PCM core suspends every prepared or running
+    /// stream first (`snd_pcm_suspend_all`: DMA stops; HDA has no
+    /// SNDRV_PCM_INFO_RESUME, so the stream is prepared again after resume),
+    /// the codecs are force-suspended (`hda_codec_pm_suspend`) and
+    /// `azx_suspend` shuts the chip down, whatever runtime PM holds. Only a
+    /// stream whose DMA does not stop fails it.
+    fn system_suspend(&self) -> Result<(), HdaError> {
+        let _pm = self.lock_pm()?;
+        if self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        for stream in &self.streams {
+            stream
+                .lock()
+                .stop(self)
+                .map_err(|_| HdaError::DeviceFailed)?;
+        }
+        self.park(&|| true, false)
+    }
+
+    /// The park itself, under the PM lock: codecs to D3 (unless their own
+    /// suspend already put them there: `pm_runtime_force_suspend` skips a
+    /// runtime-suspended codec), then the controller reset. `idle` is
+    /// checked again under the command lease.
+    fn park(&self, idle: &dyn Fn() -> bool, arm_wake: bool) -> Result<(), HdaError> {
+        let codecs_to_d3 = !self.codecs_suspended.load(Ordering::Acquire);
+        if codecs_to_d3 {
+            self.set_codec_power(true)?;
+        }
         // Park under the command lease: a command either finished before
         // this point or, once it holds the lease, sees `suspended` and never
         // posts into the rings the reset below stops.
         let lease = match self.acquire_command_blocking() {
             Ok(lease) => lease,
             Err(error) => {
-                let _ = self.set_codec_power(false);
+                if codecs_to_d3 {
+                    let _ = self.set_codec_power(false);
+                }
                 return Err(error);
             }
         };
         if !self.streams_idle() || !idle() {
             drop(lease);
-            let _ = self.set_codec_power(false);
+            if codecs_to_d3 {
+                let _ = self.set_codec_power(false);
+            }
             return Err(HdaError::Busy);
         }
         // Set before the reset: the engines stop below whether or not the
@@ -2203,7 +2241,7 @@ impl narf_power::device_pm::DevicePmOps for HdaSystemPm {
             .map(|(_, dev, _)| dev.clone())
             .collect();
         for dev in devs {
-            if let Err(error) = dev.quiesce() {
+            if let Err(error) = dev.system_suspend() {
                 // What a refused system suspend needs on the console.
                 narf_console::write_str(&alloc::format!(
                     "hda: system suspend of {:#x} failed: {:?}; {}\n",

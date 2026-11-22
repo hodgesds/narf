@@ -37,7 +37,7 @@ impl Stream {
             last_sample: 0,
         }
     }
-    fn stop(&mut self, dev: &IntelHda) -> Result<(), SoundError> {
+    pub(super) fn stop(&mut self, dev: &IntelHda) -> Result<(), SoundError> {
         let sd = sd_base(self.index);
         // SAFETY: stream descriptor is within the validated GCAP register range.
         unsafe {

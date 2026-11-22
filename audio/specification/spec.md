@@ -355,7 +355,12 @@ state change wakes the controller, which disarms WAKEEN and re-reads every jack.
 Before D3 every converter still assigned a stream is cleared
 (`hda_cleanup_all_streams`: stream id and format 0). A stop
 with the PCM still open does not park it. Polled jack detection marks it
-busy every 1.5 s and so keeps it up, as Linux jackpoll does. Park and wake
+busy every 1.5 s and so keeps it up, as Linux jackpoll does. System suspend
+(`HdaSystemPm`, Linux `azx_suspend` after `snd_pcm_suspend_all` and the codec
+PM) parks the controller whatever runtime PM holds: every stream's DMA stops
+and the stream must be prepared again (HDA has no PCM resume), codecs not
+already suspended go to D3, WAKEEN stays unarmed; only a stream that will not
+stop fails it. Park and wake
 serialise on a PM lock, the park runs
 under the command lease and sets `suspended` before the reset, and the
 wake restarts the link and command I/O under the lease before the codecs
