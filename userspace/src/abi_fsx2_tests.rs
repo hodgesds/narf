@@ -3808,8 +3808,10 @@ fn smoke_abi_fsx2_listmount_then_statmount() -> TestResult {
             }
             if sm_str(&buf, rd_u32(&buf, sm::OFF_MNT_POINT)) == "/lsm" {
                 found = true;
-                if sm_str(&buf, rd_u32(&buf, sm::OFF_FS_TYPE)) != "lsm" {
-                    return Err("fs_type is not the filesystem's name");
+                // `statmount_fs_type`: `sb->s_type->name`. The case's tree is
+                // in-memory, which Linux calls tmpfs; its label is no type.
+                if sm_str(&buf, rd_u32(&buf, sm::OFF_FS_TYPE)) != "tmpfs" {
+                    return Err("fs_type is not the filesystem type's name");
                 }
                 // `mnt_opts` is the FILESYSTEM's own option string
                 // (`show_options`), which is the column a caller would
@@ -3851,7 +3853,10 @@ fn smoke_abi_fsx2_listmount_then_statmount() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_listmount_then_statmount);
+kernel_test_in!(
+    "syscall_abi/statmount",
+    smoke_abi_fsx2_listmount_then_statmount
+);
 
 /// The returned `mask` says what was written, so an unsupported bit comes
 /// back CLEAR rather than failing the call.
