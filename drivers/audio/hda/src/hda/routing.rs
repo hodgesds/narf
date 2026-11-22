@@ -563,21 +563,20 @@ impl IntelHda {
         // An HDMI-only codec has no Master controls (Linux patch_hdmi
         // creates none); the analog outputs carry them.
         let analog = self.analog_outputs();
-        if !analog.is_empty()
-            && analog.iter().all(|&output| {
-                let path = &self.outputs[output];
-                self.graphs[path.codec]
-                    .widget(path.nodes.converter_nid)
-                    .and_then(|w| w.out_amp)
-                    .is_some()
-            })
-        {
-            controls.push(ControlId {
-                index: 0,
-                kind: ControlKind::MasterVolume,
-            });
-        }
+        let analog_amps = analog.iter().all(|&output| {
+            let path = &self.outputs[output];
+            self.graphs[path.codec]
+                .widget(path.nodes.converter_nid)
+                .and_then(|w| w.out_amp)
+                .is_some()
+        });
         if !analog.is_empty() {
+            if analog_amps {
+                controls.push(ControlId {
+                    index: 0,
+                    kind: ControlKind::MasterVolume,
+                });
+            }
             controls.push(ControlId {
                 index: 1,
                 kind: ControlKind::MasterMute,

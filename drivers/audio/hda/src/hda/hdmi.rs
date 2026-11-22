@@ -797,7 +797,9 @@ impl IntelHda {
         if !self.analog_outputs().is_empty() {
             layout.push((0, PcmSlot::Analog));
         }
-        layout.extend((0..ports).map(|pcm| (hdmi_pcm_device(pcm), PcmSlot::Hdmi(pcm))));
+        for pcm in 0..ports {
+            layout.push((hdmi_pcm_device(pcm), PcmSlot::Hdmi(pcm)));
+        }
         layout
     }
 

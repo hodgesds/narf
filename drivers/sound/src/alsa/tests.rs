@@ -1311,8 +1311,8 @@ test!(alsa_hdmi_pcms_at_linux_device_numbers, {
     );
     let dir = crate::devfs_bridge::DevSndDir;
     let node = |device: u32| {
-        dir.lookup(&alloc::format!("pcmC{}D{}p", card, device))
-            .is_some()
+        let name = alloc::format!("pcmC{}D{}p", card, device);
+        dir.lookup(&name).is_some()
     };
     assert_eq!(
         [node(3), node(7), node(0), node(1)],
