@@ -2956,3 +2956,77 @@ fn smoke_v6_icmp6_dest_unreach_aborts_syn_sent() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_dest_unreach_aborts_syn_sent);
+
+/// NetworkManager sets a managed device's `accept_ra` to 0 and handles RAs
+/// itself: `ndisc_router_discovery` then takes no default router, route,
+/// prefix or address from them (`ipv6_accept_ra`), so only NetworkManager's
+/// routes remain. With `accept_ra` on and `autoconf` off the router and
+/// prefix routes are taken but no SLAAC address (`addrconf_prefix_rcv`
+/// needs `cnf.autoconf`); with both on the prefix is autoconfigured.
+fn smoke_v6_accept_ra_and_autoconf_gate_ra_processing() -> TestResult {
+    use narf_lib::sysctl::ipv6::{set_device, Key};
+    const IFACE: &str = "v6e2e-ara";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x46];
+    const ROUTER_MAC: [u8; 6] = [0x86, 0x43, 0x42, 0xa5, 0x25, 0x61];
+    const ROUTER: [u8; 16] = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x84, 0x43, 0x42, 0xff, 0xfe, 0xa5, 0x25, 0x61,
+    ];
+    const ALL_NODES: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const PREFIX: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0x46, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const FAR: [u8; 16] = [
+        0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+    ];
+
+    reset_v6(IFACE, MAC);
+    narf_lib::sysctl::ipv6::__reset_for_test();
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    let ra = build_ra_with_pio(0, 1800, PREFIX, 64, 2_592_000, 604_800);
+    let deliver = || {
+        let dst_mac = multicast_mac(&ALL_NODES);
+        let mut frame = build_icmpv6_frame(ROUTER_MAC, dst_mac, ROUTER, ALL_NODES, &ra);
+        crate::tcp_stack::rx_handler(IFACE, &mut frame);
+    };
+    let routed = || {
+        matches!(
+            crate::ipv6::route::lookup(&FAR, Some(IFACE)),
+            crate::ipv6::route::NextHop::Gateway { gateway, .. } if gateway == ROUTER
+        )
+    };
+    let addressed = || {
+        addrs::list_iface(IFACE)
+            .iter()
+            .any(|a| a.addr[..8] == PREFIX[..8])
+    };
+
+    set_device(IFACE, Key::AcceptRa, 0);
+    deliver();
+    let ignored = !routed() && !addressed() && ndp::routers().iter().all(|r| r.iface != IFACE);
+    set_device(IFACE, Key::AcceptRa, 1);
+    set_device(IFACE, Key::Autoconf, 0);
+    deliver();
+    let routed_only = routed() && !addressed();
+    set_device(IFACE, Key::Autoconf, 1);
+    deliver();
+    let autoconfigured = addressed();
+    narf_lib::sysctl::ipv6::__reset_for_test();
+    if !ignored {
+        return TestResult::Fail(
+            "an RA on a device with accept_ra=0 installed a router or address",
+        );
+    }
+    if !routed_only {
+        return TestResult::Fail("accept_ra=1 autoconf=0 did not take only the router and routes");
+    }
+    if !autoconfigured {
+        return TestResult::Fail("accept_ra=1 autoconf=1 did not autoconfigure the prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/ipv6-accept-ra",
+    smoke_v6_accept_ra_and_autoconf_gate_ra_processing
+);

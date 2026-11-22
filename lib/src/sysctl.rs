@@ -372,3 +372,211 @@ pub mod ipv4 {
         ICMP_ECHO_IGNORE_BROADCASTS.store(1, Ordering::Relaxed);
     }
 }
+
+/// `net.ipv6.conf.{all,default,<dev>}.*` (Linux `ipv6_devconf`): the keys
+/// NetworkManager writes for a device it manages. NetworkManager runs its own
+/// router discovery and sets the device's `accept_ra` to 0 and
+/// `addr_gen_mode` to 1 (none), so the kernel takes no router, route,
+/// prefix or address from an RA. The values live here because the IPv6
+/// stack in `narf-net` reads them and `narf-filesystem` publishes them.
+pub mod ipv6 {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicI32, Ordering};
+
+    use crate::sync::IrqSafeSpinLock;
+
+    /// A per-device IPv6 key.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Key {
+        AcceptRa,
+        Autoconf,
+        UseTempaddr,
+        DisableIpv6,
+        AddrGenMode,
+        HopLimit,
+        Mtu,
+    }
+
+    const KEYS: usize = 7;
+
+    impl Key {
+        /// Every key, in procfs order.
+        pub const ALL: [Key; KEYS] = [
+            Key::AcceptRa,
+            Key::Autoconf,
+            Key::UseTempaddr,
+            Key::DisableIpv6,
+            Key::AddrGenMode,
+            Key::HopLimit,
+            Key::Mtu,
+        ];
+
+        /// The file name under `conf/<dev>/`.
+        pub fn name(self) -> &'static str {
+            match self {
+                Key::AcceptRa => "accept_ra",
+                Key::Autoconf => "autoconf",
+                Key::UseTempaddr => "use_tempaddr",
+                Key::DisableIpv6 => "disable_ipv6",
+                Key::AddrGenMode => "addr_gen_mode",
+                Key::HopLimit => "hop_limit",
+                Key::Mtu => "mtu",
+            }
+        }
+
+        /// The values a write may set (the key's `proc_handler` bounds):
+        /// `addrconf_sysctl_addr_gen_mode` takes 0..=3, `hop_limit` is
+        /// `proc_dointvec_minmax` 1..=255, `addrconf_sysctl_mtu` starts at
+        /// IPV6_MIN_MTU, and the rest are `proc_dointvec`.
+        pub fn bounds(self) -> (i32, i32) {
+            match self {
+                Key::AddrGenMode => (0, 3),
+                Key::HopLimit => (1, 255),
+                Key::Mtu => (1280, 65535),
+                _ => (i32::MIN, i32::MAX),
+            }
+        }
+
+        fn index(self) -> usize {
+            self as usize
+        }
+
+        /// Linux `ipv6_devconf` / `ipv6_devconf_dflt` defaults.
+        const fn linux_default(self) -> i32 {
+            match self {
+                Key::AcceptRa | Key::Autoconf => 1,
+                Key::UseTempaddr | Key::DisableIpv6 | Key::AddrGenMode => 0,
+                Key::HopLimit => 64,
+                Key::Mtu => 1280,
+            }
+        }
+    }
+
+    const fn defaults() -> [AtomicI32; KEYS] {
+        [
+            AtomicI32::new(Key::AcceptRa.linux_default()),
+            AtomicI32::new(Key::Autoconf.linux_default()),
+            AtomicI32::new(Key::UseTempaddr.linux_default()),
+            AtomicI32::new(Key::DisableIpv6.linux_default()),
+            AtomicI32::new(Key::AddrGenMode.linux_default()),
+            AtomicI32::new(Key::HopLimit.linux_default()),
+            AtomicI32::new(Key::Mtu.linux_default()),
+        ]
+    }
+
+    static ALL: [AtomicI32; KEYS] = defaults();
+    static DEFAULT: [AtomicI32; KEYS] = defaults();
+
+    #[derive(Clone, Debug)]
+    struct DevConf {
+        name: String,
+        values: [i32; KEYS],
+    }
+
+    static DEV_CONF: IrqSafeSpinLock<Vec<DevConf>> = IrqSafeSpinLock::new(Vec::new());
+
+    /// `conf.all.<key>`.
+    pub fn all(key: Key) -> i32 {
+        ALL[key.index()].load(Ordering::Relaxed)
+    }
+
+    /// Write `conf.all.<key>`. `disable_ipv6` reaches every device, as
+    /// `addrconf_disable_ipv6` writes it into each `inet6_dev`.
+    pub fn set_all(key: Key, v: i32) {
+        ALL[key.index()].store(v, Ordering::Relaxed);
+        if key == Key::DisableIpv6 {
+            DEFAULT[key.index()].store(v, Ordering::Relaxed);
+            for d in DEV_CONF.lock().iter_mut() {
+                d.values[key.index()] = v;
+            }
+        }
+    }
+
+    /// `conf.default.<key>`, which seeds new devices.
+    pub fn default_value(key: Key) -> i32 {
+        DEFAULT[key.index()].load(Ordering::Relaxed)
+    }
+
+    /// Write `conf.default.<key>`.
+    pub fn set_default(key: Key, v: i32) {
+        DEFAULT[key.index()].store(v, Ordering::Relaxed);
+    }
+
+    fn seeded(name: &str) -> DevConf {
+        let mut values = [0; KEYS];
+        for key in Key::ALL {
+            values[key.index()] = default_value(key);
+        }
+        DevConf {
+            name: String::from(name),
+            values,
+        }
+    }
+
+    /// `<dev>`'s value of `key`, `conf.default`'s for an unseeded device.
+    pub fn device(iface: &str, key: Key) -> i32 {
+        let g = DEV_CONF.lock();
+        match g.iter().find(|d| d.name == iface) {
+            Some(d) => d.values[key.index()],
+            None => default_value(key),
+        }
+    }
+
+    /// Write `<dev>`'s `key`.
+    pub fn set_device(iface: &str, key: Key, v: i32) {
+        let mut g = DEV_CONF.lock();
+        match g.iter_mut().find(|d| d.name == iface) {
+            Some(d) => d.values[key.index()] = v,
+            None => {
+                let mut d = seeded(iface);
+                d.values[key.index()] = v;
+                g.push(d);
+            }
+        }
+    }
+
+    /// Seed `iface` from `conf.default`, its `mtu` from the device's
+    /// (`ipv6_add_dev`: `ndev->cnf.mtu6 = dev->mtu`).
+    pub fn init_device_conf(iface: &str, mtu: u32) {
+        let mut g = DEV_CONF.lock();
+        if g.iter().any(|d| d.name == iface) {
+            return;
+        }
+        let mut d = seeded(iface);
+        d.values[Key::Mtu.index()] = mtu.min(i32::MAX as u32) as i32;
+        g.push(d);
+    }
+
+    /// Drop `iface`'s values when it goes away.
+    pub fn forget_device_conf(iface: &str) {
+        DEV_CONF.lock().retain(|d| d.name != iface);
+    }
+
+    /// `ipv6_accept_ra(idev)`: whether `iface` processes router
+    /// advertisements. NARF does not forward IPv6, so forwarding's
+    /// `accept_ra == 2` hybrid mode does not arise.
+    pub fn accept_ra(iface: &str) -> bool {
+        device(iface, Key::AcceptRa) != 0
+    }
+
+    /// `in6_dev->cnf.autoconf`: whether a prefix makes SLAAC addresses.
+    pub fn autoconf(iface: &str) -> bool {
+        device(iface, Key::Autoconf) != 0
+    }
+
+    /// `in6_dev->cnf.use_tempaddr`: above 0, SLAAC adds RFC 8981 temporary
+    /// addresses.
+    pub fn use_tempaddr(iface: &str) -> i32 {
+        device(iface, Key::UseTempaddr)
+    }
+
+    /// Every value back at its Linux default. Test-only.
+    pub fn __reset_for_test() {
+        for key in Key::ALL {
+            ALL[key.index()].store(key.linux_default(), Ordering::Relaxed);
+            DEFAULT[key.index()].store(key.linux_default(), Ordering::Relaxed);
+        }
+        DEV_CONF.lock().clear();
+    }
+}

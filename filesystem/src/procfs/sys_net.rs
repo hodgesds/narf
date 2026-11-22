@@ -1302,3 +1302,64 @@ kernel_test_in!(
     "filesystem/procfs/sys_net",
     smoke_default_and_core_sysctls_registered
 );
+
+/// `net.ipv6.conf.{all,default,<dev>}` carries the keys NetworkManager
+/// writes for a managed device, each reaching the value the IPv6 stack
+/// reads, with the key's write bounds.
+fn smoke_ipv6_conf_device_keys_reach_the_stack() -> TestResult {
+    use narf_lib::sysctl::ipv6::{self, Key};
+    const DEV: &str = "smoke-conf6";
+    register_all();
+    ipv6::__reset_for_test();
+    register_dev_conf(DEV);
+    let file = |dev: &str, key: Key| match lookup_registry(&[
+        "sys",
+        "net",
+        "ipv6",
+        "conf",
+        dev,
+        key.name(),
+    ]) {
+        Some(ProcNodeSnapshot::File(f)) => Some(f),
+        _ => None,
+    };
+    for dev in ["all", "default", DEV] {
+        for key in Key::ALL {
+            if file(dev, key).is_none() {
+                ipv6::__reset_for_test();
+                return TestResult::Fail("an ipv6 conf key is not registered");
+            }
+        }
+    }
+    let Some(accept_ra) = file(DEV, Key::AcceptRa) else {
+        return TestResult::Fail("conf/<dev>/accept_ra is not registered");
+    };
+    let starts_on = core::str::from_utf8(&accept_ra.read()).unwrap_or("").trim() == "1";
+    let _ = accept_ra.write(b"0\n");
+    let reached = !ipv6::accept_ra(DEV);
+    let gen_mode = file(DEV, Key::AddrGenMode).map(|f| (f.write(b"1\n"), f.write(b"4\n")));
+    let hop = file(DEV, Key::HopLimit).map(|f| f.write(b"0\n").is_err());
+    let all_off = file("all", Key::DisableIpv6).map(|f| f.write(b"1\n").is_ok());
+    let propagated = ipv6::device(DEV, Key::DisableIpv6) == 1;
+    ipv6::__reset_for_test();
+    if !starts_on {
+        return TestResult::Fail("conf/<dev>/accept_ra did not start at conf.default (1)");
+    }
+    if !reached {
+        return TestResult::Fail("writing conf/<dev>/accept_ra did not reach the IPv6 stack");
+    }
+    if !matches!(gen_mode, Some((Ok(_), Err(_)))) {
+        return TestResult::Fail("addr_gen_mode does not take 0..=3 only");
+    }
+    if hop != Some(true) {
+        return TestResult::Fail("hop_limit accepted 0");
+    }
+    if all_off != Some(true) || !propagated {
+        return TestResult::Fail("conf/all/disable_ipv6 did not reach the device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/sys-net-ipv6-conf",
+    smoke_ipv6_conf_device_keys_reach_the_stack
+);
