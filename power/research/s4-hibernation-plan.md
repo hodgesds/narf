@@ -55,12 +55,16 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
    included, in place of `suspend_nvs_save`). The copy frames are
    preallocated and marked so the copy skips them, and the copy allocates
    nothing. A system with less free memory than it uses fails cleanly.
-6. **Sealed streaming write.** The sealer takes a page source rather than
-   one buffer. The SMS is TPM-sealed. Then preallocate the image file,
-   map its extents, and write the header with the extent list, the
-   kernel's KASLR slide and entry, and a hash of the firmware memory map.
-   The resume locator follows Linux's `resume=` and `resume_offset=`:
-   `narf.resume=<device>` and `narf.resume_offset=<block>`.
+6. ~~**Sealed streaming write.**~~ Done, except the coordinator glue:
+   - the sealer reads an `ImageSource`;
+   - `hibernate::payload` streams the snapshot with its header (kernel
+     base and bounds, RAM-layout hash, arch record);
+   - `hibernate::image_file` preallocates, maps (ext2 `bmap`) and proves
+     the image file, and writes through its extents;
+   - the resume locator is `narf.resume=<device>
+     narf.resume_offset=<block>`.
+
+   The SMS is TPM-sealed through the existing `TpmAnchor` slot.
 7. **Early readers.** Add polled PCI front ends for virtio-blk (QEMU on
    x86_64) and NVMe (hardware) beside the virtio-mmio one, plus early TPM
    access (CRB/TIS) for the unseal.

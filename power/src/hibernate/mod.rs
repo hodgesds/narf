@@ -4,5 +4,6 @@
 //! image format and the resume pipeline live in
 //! [`crate::suspend_service`].
 
+pub mod image_file;
 pub mod payload;
 pub mod snapshot;

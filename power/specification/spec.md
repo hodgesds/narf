@@ -1525,6 +1525,43 @@ The hibernation payload is that plaintext:
 
 `PayloadSource` streams it from a `Snapshot`.
 
+#### 3.6.0e Hibernation image file
+
+```rust
+// narf_power::hibernate::image_file
+pub const BLOCK: u64 = 4096;                       // the map unit and the resume_offset unit
+pub const MAX_EXTENTS: usize;                      // 169: what one locator block holds
+pub struct Extent { pub file_block: u64, pub device_block: u64, pub blocks: u64 }
+pub struct Locator { pub file_blocks: u64, pub extents: Vec<Extent> }
+impl Locator { pub fn from_map(map: &[u64]) -> Self; pub fn device_block(&self, b: u64) -> Option<u64>;
+               pub fn encode(&self) -> Option<[u8; 4096]>; pub fn decode(page: &[u8]) -> Result<Self, LocatorError>; }
+pub struct ExtentStore<D: ImageStore>;             // impl ImageStore: the file after its locator block
+pub enum ImageFileError { NoMount, NoDevice(String), Fs(FsError), Unmapped(u64), Fragmented(usize), Mismatch, Store }
+pub async fn prepare(path: &str, image_len: u64) -> Result<ImageFile, ImageFileError>;
+impl ImageFile { pub device: String; pub locator: Locator; pub fn resume_offset(&self) -> u64;
+                 pub fn store(&self) -> ExtentStore<BlockStore>; }
+```
+
+This is Linux's swap-file hibernation, using a file of its own.
+
+`prepare` runs before the freeze:
+- it creates or grows the file: `fallocate`, or zeros on a block-mapped
+  ext2;
+- it maps every 4 KiB block with `bmap` (FIBMAP);
+- it finds the device: the mount's source when it names one, or else the
+  one registered device holding what the filesystem wrote.
+
+It writes the locator, the file's first block, through the filesystem,
+then reads it back raw at the mapped block. It checks a marker in the last
+block the same way. A disagreement refuses the file (`Mismatch`) before
+any raw write.
+
+The sealed image then goes raw through `ExtentStore` to the blocks after
+the locator. More than 169 extents refuses the file; Linux chains swap-map
+pages instead. The resume finds the locator through `narf.resume=<device>
+narf.resume_offset=<block>` (4 KiB units), Linux's `resume=` and
+`resume_offset=`.
+
 #### 3.6.1 Power-off paths vs Linux
 
 Linux line numbers are against the reference tree at `~/git/linux`
