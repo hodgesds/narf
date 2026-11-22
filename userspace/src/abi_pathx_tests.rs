@@ -4201,6 +4201,85 @@ kernel_test_in!(
     smoke_abi_pathx_getdents64_does_not_repeat_on_disk_dots
 );
 
+/// A bind mount's root is a dentry of the bound filesystem, and
+/// `dir_emit_dots` reports `parent_ino(dentry)` for its `..`: the directory
+/// above it in that filesystem, or the directory itself when the bind is of
+/// the filesystem's root. A bind of a bind resolves through to the same
+/// filesystem.
+fn smoke_abi_pathx_getdents64_dotdot_of_a_bound_subdirectory() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_BIND: u64 = 0x1000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let tmpfs = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: c"/abi-gdb".as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        let _ = call_mkdir(c"/abi-gdb".as_ptr() as u64, 0o755);
+        if call(Syscall::Mount.raw(), tmpfs) != Some(0) {
+            return Err("mounting the tmpfs at /abi-gdb failed");
+        }
+        for dir in [
+            c"/abi-gdb/a",
+            c"/abi-gdb/a/b",
+            c"/abi-gdb/a/b/c",
+            c"/abi-gdb-root",
+            c"/abi-gdb-sub",
+            c"/abi-gdb-subsub",
+        ] {
+            let _ = call_mkdir(dir.as_ptr() as u64, 0o755);
+        }
+        let bind = |source: &core::ffi::CStr, target: &core::ffi::CStr| {
+            call(
+                Syscall::Mount.raw(),
+                a4(
+                    source.as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    0,
+                    MS_BIND,
+                    0,
+                ),
+            )
+        };
+        if bind(c"/abi-gdb", c"/abi-gdb-root") != Some(0)
+            || bind(c"/abi-gdb/a/b", c"/abi-gdb-sub") != Some(0)
+            || bind(c"/abi-gdb-sub/c", c"/abi-gdb-subsub") != Some(0)
+        {
+            return Err("the bind mounts were not made");
+        }
+        let mut sb = [0u8; STAT_SIZE];
+        let mut ino_at = |path: &core::ffi::CStr| -> Result<u64, &'static str> {
+            match call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+                Some(0) => Ok(stat_ino_of(&sb)),
+                _ => Err("stat of a bound directory failed"),
+            }
+        };
+        let root = ino_at(c"/abi-gdb")?;
+        let a = ino_at(c"/abi-gdb/a")?;
+        let b = ino_at(c"/abi-gdb/a/b")?;
+        let cc = ino_at(c"/abi-gdb/a/b/c")?;
+        for (path, own, parent) in [
+            (c"/abi-gdb-root", root, root),
+            (c"/abi-gdb-sub", b, a),
+            (c"/abi-gdb-subsub", cc, b),
+        ] {
+            let fd = open_dir(path)?;
+            let listing = read_dirents64(fd, 4096);
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            check_dots(&listing?, own, parent)?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents-dots-bind",
+    smoke_abi_pathx_getdents64_dotdot_of_a_bound_subdirectory
+);
+
 // ── listdir (NARF-native path_ptr, path_len, cursor, out, out_len) ──
 //
 // Path-based readdir: serialises the cursor-th entry as
