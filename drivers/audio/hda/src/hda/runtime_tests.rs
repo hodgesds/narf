@@ -3346,3 +3346,33 @@ kernel_test_in!(
     "audio/hda/pm-open",
     native_hda_pm_open_wakes_a_parked_controller
 );
+
+/// A resume re-initialises the command I/O the way probe does, including the
+/// controller's acceptance of unsolicited responses: Linux
+/// `snd_hdac_bus_init_cmd_io` sets GCTL.UNSOL on every chip init. Before,
+/// `reinit` left GCTL at CRST alone, so after the first park the controller
+/// dropped every unsolicited response and HDMI/jack hotplug went unseen.
+fn native_hda_pm_reinit_accepts_unsolicited_responses() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    if unsafe { dev.bar0.read32(REG_GCTL) } & GCTL_UNSOL == 0 {
+        return TestResult::Fail("probe accepts unsolicited responses");
+    }
+    if dev.quiesce().is_err() || dev.reinit().is_err() {
+        return TestResult::Fail("park and resume");
+    }
+    // SAFETY: as above.
+    let gctl = unsafe { dev.bar0.read32(REG_GCTL) };
+    if gctl & GCTL_CRST == 0 || gctl & GCTL_UNSOL == 0 {
+        return TestResult::Fail("resume must accept unsolicited responses again (GCTL.UNSOL)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-unsol",
+    native_hda_pm_reinit_accepts_unsolicited_responses
+);
