@@ -31,7 +31,6 @@ use super::{
     NUD_DELAY, NUD_INCOMPLETE, NUD_PROBE, NUD_REACHABLE, NUD_STALE, RTM_GETACTION, RTM_GETADDR,
     RTM_GETADDRLABEL, RTM_GETLINK, RTM_GETMDB, RTM_GETNEIGH, RTM_GETNEXTHOP, RTM_GETQDISC,
     RTM_GETROUTE, RTM_GETRULE, RTM_GETTCLASS, RTM_GETTFILTER, RTN_LOCAL, RTN_UNICAST,
-    RTPROT_KERNEL,
 };
 
 pub const ERANGE: i32 = 34;
@@ -1310,7 +1309,7 @@ fn dump_fib4(d: &mut Dump<'_>) -> Result<(), i32> {
         } else {
             RTN_UNICAST
         };
-        if !filter.matches(RTPROT_KERNEL, rt_type, link.ifindex) {
+        if !filter.matches(route.protocol, rt_type, link.ifindex) {
             continue;
         }
         d.push(build_newroute(route, link.ifindex, d.seq, 0), flags);
