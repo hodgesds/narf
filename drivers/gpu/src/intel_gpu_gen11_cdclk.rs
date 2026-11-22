@@ -496,6 +496,7 @@ pub fn program(
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
+    use crate::intel_gpu_pcode::{PCODE_DATA0, PCODE_MAILBOX};
     use alloc::vec::Vec;
     use core::cell::RefCell;
     use narf_kernel_test::{kernel_test_in, TestResult};
