@@ -194,9 +194,13 @@ impl Control {
                     put32(&mut b, 0, self.card);
                     string(&mut b, 8, 16, card.id);
                     string(&mut b, 24, 16, card.driver);
+                    // Linux snd_ctl_card_info: name, longname, mixername.
+                    let hardware = crate::card_hardware(self.card);
+                    let long_name = hardware.as_ref().and_then(|h| h.long_name());
+                    let mixer_name = hardware.as_ref().and_then(|h| h.mixer_name());
                     string(&mut b, 40, 32, card.name);
-                    string(&mut b, 72, 80, card.name);
-                    string(&mut b, 168, 80, card.name);
+                    string(&mut b, 72, 80, long_name.as_deref().unwrap_or(card.name));
+                    string(&mut b, 168, 80, mixer_name.as_deref().unwrap_or(card.name));
                     ctx.write(arg, &b)?;
                 }
                 2 => {

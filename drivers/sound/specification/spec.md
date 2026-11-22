@@ -77,13 +77,24 @@ to the LED trigger engine (`Trigger::AudioMute`), so the Elan `elan:red:mute`
 LED follows mixer mute (Linux `sound/core/control_led.c`).
 
 `sound_fs_initcall` publishes `/dev/snd`, sysfs and procfs card information.
-Per card, `/proc/asound` carries `cards`, `version`, `cardN/id`, `cardN/codec#0`,
+Per card, `/proc/asound` carries `cards`, `version`, `cardN/id`, `cardN/codec#A`,
 `cardN/pcmMx/info` and `cardN/pcmMx/sub0/{info,hw_params,sw_params,status}`
 (x = `p` or `c`). The `sub0` runtime files follow Linux's
 `snd_pcm_substream_proc_*_read` layout from the open ALSA runtime: `closed`
 without one, `no setup` before HW_PARAMS, `busy` while an ioctl holds it;
 lines for state the runtime does not keep (`owner_pid`, `avail_max`,
-`tstamp_mode`, `period_step`) are omitted. Each successful PCM open acquires its own exclusive lease after access checks;
+`tstamp_mode`, `period_step`) are omitted. `cards` follows `snd_card_info_read`
+(`"%2i [%-15s]: %s - %s"` plus the long name indented 22 columns, `--- no
+soundcards ---` when empty); only lowercase `pcmMp` / `pcmMc` directories
+exist. `register_hardware_card_at` keeps ids unique the way
+`snd_card_set_id_no_lock` does (`Default` for an empty or `card*` id, then
+`_1`, `_2`, ... in hex within 15 characters). `PcmDevice` gains three defaulted
+hooks: `long_name` (`card->longname`: the second `cards` line and control
+CARD_INFO `longname`), `mixer_name` (CARD_INFO `mixername`) and `codec_proc`
+(one `codec#A` body per codec address, rendered by the codec driver; a card
+whose backend reports none keeps the summary `codec#0`).
+
+Each successful PCM open acquires its own exclusive lease after access checks;
 lookup/stat do not acquire a hardware lease. Files retain that lease across
 calls and release it with the open file object. Per-file async mutexes serialize
 operations without disabling interrupts during device waits. Close flush and

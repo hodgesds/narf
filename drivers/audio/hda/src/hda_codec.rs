@@ -315,6 +315,9 @@ pub struct Codec {
     pub device_id: u16,
     pub revision: u32,
     pub afg_nid: u8,
+    /// The AFG's `AC_PAR_FUNCTION_TYPE` word (Linux `afg_function_id` is
+    /// its low byte, `afg_unsol` bit 8); 0 without an AFG.
+    pub afg_function: u32,
     pub widgets: Vec<Widget>,
     /// Preferred (pin, DAC) pairs, Linux `spec->gen.preferred_dacs`
     /// (`sound/hda/codecs/generic.c::get_preferred_dac`): when the
@@ -430,6 +433,7 @@ where
 
     // Find the first Audio Function Group (Function Group Type = 1).
     let mut afg_nid = 0u8;
+    let mut afg_function = 0u32;
     for i in 0..n_fg {
         let Some(nid) = first_fg.checked_add(i) else {
             break;
@@ -441,6 +445,7 @@ where
         ));
         if (fgt & 0x7F) == 0x01 {
             afg_nid = nid;
+            afg_function = fgt;
             break;
         }
     }
@@ -579,6 +584,7 @@ where
         device_id,
         revision,
         afg_nid,
+        afg_function,
         widgets,
         preferred_dacs: Vec::new(),
     }

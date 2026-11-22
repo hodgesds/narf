@@ -297,7 +297,7 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
     narf_drivers_sound::sound_fs_initcall();
     let Some(card) = narf_drivers_sound::list_cards()
         .into_iter()
-        .find(|card| card.driver == "hda")
+        .find(|card| card.driver == "HDA-Intel")
     else {
         return TestResult::Fail("HDA missing from sound registry");
     };

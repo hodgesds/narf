@@ -271,6 +271,16 @@ impl PcmDevice for Card {
     fn controls(&self) -> alloc::vec::Vec<narf_drivers_sound::mixer::ControlId> {
         self.0.mixer_controls()
     }
+    fn long_name(&self) -> Option<alloc::string::String> {
+        let name = self.0.long_name.lock().clone();
+        (!name.is_empty()).then_some(name)
+    }
+    fn mixer_name(&self) -> Option<alloc::string::String> {
+        self.0.mixer_name()
+    }
+    fn codec_proc(&self) -> alloc::vec::Vec<(u8, alloc::string::String)> {
+        self.0.codec_proc()
+    }
     fn get_control(
         &self,
         id: narf_drivers_sound::mixer::ControlId,

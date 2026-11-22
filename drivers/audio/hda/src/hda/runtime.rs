@@ -116,6 +116,9 @@ pub struct IntelHda {
     pub(super) autosuspend_ms: AtomicU64,
     /// The autosuspend service while nothing can be parked.
     pm_waker: IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Linux `card->longname` ("<short name> at 0x<BAR> irq <n>"), set when
+    /// the card is registered.
+    pub(super) long_name: IrqSafeSpinLock<alloc::string::String>,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -200,6 +203,55 @@ fn reset_link(bar: bar::MmioRegion) -> Result<u16, HdaError> {
     }
     // SAFETY: as above.
     Ok(unsafe { bar.read16(REG_STATESTS) } & STATESTS_INT_MASK)
+}
+
+/// Linux `hda_vendor_ids` (sound/hda/core/device.c).
+fn codec_vendor_name(vendor: u16) -> Option<&'static str> {
+    Some(match vendor {
+        0x0014 => "Loongson",
+        0x1002 => "ATI",
+        0x1013 => "Cirrus Logic",
+        0x1057 => "Motorola",
+        0x1095 => "Silicon Image",
+        0x10de => "Nvidia",
+        0x10ec => "Realtek",
+        0x1102 => "Creative",
+        0x1106 => "VIA",
+        0x111d => "IDT",
+        0x11c1 => "LSI",
+        0x11d4 => "Analog Devices",
+        0x13f6 => "C-Media",
+        0x14f1 => "Conexant",
+        0x17e8 => "Chrontel",
+        0x1854 => "LG",
+        0x19e5 => "Huawei",
+        0x1aec => "Wolfson Microelectronics",
+        0x1af4 => "QEMU",
+        0x1fa8 => "Senarytech",
+        0x434d => "C-Media",
+        0x8086 => "Intel",
+        0x8384 => "SigmaTel",
+        _ => return None,
+    })
+}
+
+/// "<vendor> <chip>" as Linux names a codec: the vendor from
+/// `hda_vendor_ids` ("Generic %04x" otherwise), the chip from the codec
+/// driver that binds it (atihdmi's "R6xx HDMI", the Realtek tables), or the
+/// core's "ID %x" for a codec no driver names.
+fn codec_name(vendor_id: u32) -> alloc::string::String {
+    let vendor = (vendor_id >> 16) as u16;
+    let chip = if vendor_id == 0x1002_aa01 {
+        alloc::string::String::from("R6xx HDMI")
+    } else if let Some(chip) = super::quirks::RealtekChip::from_vendor_id(vendor_id) {
+        alloc::string::String::from(chip.name())
+    } else {
+        alloc::format!("ID {:x}", vendor_id & 0xffff)
+    };
+    match codec_vendor_name(vendor) {
+        Some(name) => alloc::format!("{} {}", name, chip),
+        None => alloc::format!("Generic {:04x} {}", vendor, chip),
+    }
 }
 
 /// SET_AMP_GAIN_MUTE payload muting both output channels (HDA
@@ -344,6 +396,7 @@ impl IntelHda {
             last_busy_ns: AtomicU64::new(narf_time::monotonic_ns()),
             autosuspend_ms: AtomicU64::new(AUTOSUSPEND_MS),
             pm_waker: IrqSafeSpinLock::new(None),
+            long_name: IrqSafeSpinLock::new(alloc::string::String::new()),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -1290,6 +1343,48 @@ impl IntelHda {
     pub fn codecs(&self) -> &[CodecInfo] {
         &self.codecs
     }
+    /// Linux `card->mixername`: "<vendor> <chip>" of the first codec with
+    /// an audio function group (`snd_hda_codec_configure`).
+    pub(super) fn mixer_name(&self) -> Option<alloc::string::String> {
+        self.codecs
+            .iter()
+            .find(|codec| codec.afg_node_id.is_some())
+            .map(|codec| codec_name(codec.vendor_id))
+    }
+    /// `/proc/asound/cardN/codec#A` for every codec: Linux
+    /// `print_codec_core_info`'s header, from the values probe read.
+    pub(super) fn codec_proc(&self) -> Vec<(u8, alloc::string::String)> {
+        self.codecs
+            .iter()
+            .map(|codec| {
+                let mut text = alloc::format!(
+                    "Codec: {}\nAddress: {}\n",
+                    codec_name(codec.vendor_id),
+                    codec.addr
+                );
+                if codec.afg_node_id.is_some() {
+                    let function = self
+                        .graphs
+                        .iter()
+                        .find(|graph| graph.addr == codec.addr)
+                        .map_or(0, |graph| graph.afg_function);
+                    text.push_str(&alloc::format!(
+                        "AFG Function Id: 0x{:x} (unsol {})\n",
+                        function & 0xff,
+                        (function >> 8) & 1
+                    ));
+                }
+                text.push_str(&alloc::format!(
+                    "Vendor Id: 0x{:08x}\nSubsystem Id: 0x{:08x}\nRevision Id: 0x{:x}\n\
+                     No Modem Function Group found\n",
+                    codec.vendor_id,
+                    codec.subsystem_id.unwrap_or(0),
+                    codec.revision_id
+                ));
+                (codec.addr, text)
+            })
+            .collect()
+    }
     pub fn output_stream_idx(&self) -> u8 {
         self.counts.0
     }
@@ -2144,11 +2239,21 @@ fn register_controller(device: &BusDevice, dev: IntelHda) -> Result<(), narf_bus
     if !dev.ready {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
+    // Linux azx_create: card->driver "HDA-Intel", the driver type's short
+    // name, and "<short name> at 0x<BAR> irq <n>" as the long name; the id
+    // is the short name's last word, made unique by the sound registry.
+    let short_name = super::card_short_name(device.id.vendor, device.id.device);
+    *dev.long_name.lock() = alloc::format!(
+        "{} at 0x{:x} irq {}",
+        short_name,
+        dev.bar0.phys.raw(),
+        dev.irq_vector.map_or(-1, i32::from)
+    );
     let info = narf_drivers_sound::CardInfo {
         index: 0,
-        driver: "hda",
-        id: "HDA",
-        name: "HD Audio",
+        driver: "HDA-Intel",
+        id: super::card_id(short_name),
+        name: short_name,
         playback_count: u32::from(!dev.outputs.is_empty()),
         capture_count: u32::from(dev.input.lock().is_some()),
     };

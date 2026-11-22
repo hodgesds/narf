@@ -295,4 +295,28 @@ mod renoir_bind_tests {
         "audio/hda/amd-sb",
         native_hda_amd_sb_preset_retries_platform_probes
     );
+
+    /// Linux `driver_short_names[]` by driver type and the card id
+    /// `snd_card_register` takes from the short name's last word: "HDMI" for
+    /// the Navi21/23 HDMI/DP function, "Generic" for the Raphael iGPU audio
+    /// and the AMD platform controller, "Intel" / "PCH" on Intel.
+    fn native_hda_card_names_follow_linux_driver_types() -> TestResult {
+        for (vendor, device, short, id) in [
+            (0x1002, 0xab28, "HDA ATI HDMI", "HDMI"),
+            (0x1002, 0x1640, "HD-Audio Generic", "Generic"),
+            (0x1022, 0x15e3, "HD-Audio Generic", "Generic"),
+            (0x8086, 0x293e, "HDA Intel", "Intel"),
+            (0x8086, 0x7ad0, "HDA Intel PCH", "PCH"),
+        ] {
+            let name = card_short_name(vendor, device);
+            if name != short || card_id(name) != id {
+                return TestResult::Fail("card short name or id differs from Linux");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/hda/card-names",
+        native_hda_card_names_follow_linux_driver_types
+    );
 }

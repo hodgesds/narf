@@ -58,6 +58,23 @@ pub trait PcmDevice: Send + Sync + core::fmt::Debug {
     fn controls(&self) -> alloc::vec::Vec<crate::mixer::ControlId> {
         alloc::vec::Vec::new()
     }
+    /// Linux `card->longname` (the second `/proc/asound/cards` line, the
+    /// control CARD_INFO `longname`), when the backend knows one. The card
+    /// name stands in otherwise.
+    fn long_name(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// Linux `card->mixername` (control CARD_INFO `mixername`): the codec's
+    /// vendor and chip name on HDA. The card name stands in otherwise.
+    fn mixer_name(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// One `/proc/asound/cardN/codec#A` body per codec address, rendered by
+    /// the codec driver (Linux `print_codec_info`). Empty for a backend
+    /// without HDA codecs.
+    fn codec_proc(&self) -> alloc::vec::Vec<(u8, alloc::string::String)> {
+        alloc::vec::Vec::new()
+    }
     fn get_control(
         &self,
         _: crate::mixer::ControlId,

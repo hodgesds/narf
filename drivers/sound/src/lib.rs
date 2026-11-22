@@ -242,14 +242,57 @@ pub fn register_hardware_card_at(
     );
     let index = NEXT_CARD_INDEX.fetch_add(1, Ordering::AcqRel) as u32;
     info.index = index;
-    CARD_REGISTRY.lock().push(SoundCard {
-        info: info.clone(),
-        controller_index: index as usize,
-        hardware: Some(hardware),
-        parent,
-    });
+    {
+        let mut cards = CARD_REGISTRY.lock();
+        info.id = unique_card_id(info.id, &cards);
+        cards.push(SoundCard {
+            info: info.clone(),
+            controller_index: index as usize,
+            hardware: Some(hardware),
+            parent,
+        });
+    }
     publish_card(&info, parent);
     index
+}
+
+/// Linux `snd_card_set_id_no_lock` (sound/core/init.c): "Default" for an
+/// empty id or one starting with "card" (it would shadow the proc
+/// directories), then `_1`, `_2`, ... (hex, as Linux prints it) until no
+/// registered card has the id, kept within ALSA's 15 characters. Two
+/// generic HDA controllers become "Generic" and "Generic_1".
+fn unique_card_id(id: &'static str, cards: &[SoundCard]) -> &'static str {
+    let base = if id.is_empty() || id.starts_with("card") {
+        "Default"
+    } else {
+        id
+    };
+    let taken = |candidate: &str| cards.iter().any(|c| c.info.id == candidate);
+    if !taken(base) {
+        return base;
+    }
+    // SNDRV_CARDS suffixes at most.
+    for n in 1..=32u32 {
+        let suffix = alloc::format!("_{:X}", n);
+        let mut keep = base.len().min(15 - suffix.len());
+        while !base.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let candidate = alloc::format!("{}{}", &base[..keep], suffix);
+        if !taken(&candidate) {
+            return alloc::boxed::Box::leak(candidate.into_boxed_str());
+        }
+    }
+    base
+}
+
+/// The backend of a hardware card (`None` for a registry-only card).
+pub(crate) fn card_hardware(index: u32) -> Option<alloc::sync::Arc<dyn hardware::PcmDevice>> {
+    CARD_REGISTRY
+        .lock()
+        .iter()
+        .find(|c| c.info.index == index)
+        .and_then(|c| c.hardware.clone())
 }
 
 fn publish_card(info: &CardInfo, parent: Option<narf_bus::BusAddr>) {

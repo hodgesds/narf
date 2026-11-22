@@ -347,7 +347,13 @@ codecs are enumerated. The AMD platform controllers 1022:1457, 1022:1487
 and 1022:15e3 (`HDA_AMD_*_DEVICE`, `amd_sb_preset`; Linux
 `AZX_DCAPS_PRESET_AMD_SB`) get ATI snooping and `AZX_DCAPS_RETRY_PROBE`: a
 probe that finds no usable codec keeps the device and retries the bring-up
-once a second, up to 59 more times. The free-running playback position adds
+once a second, up to 59 more times. A registered HDA card is named as Linux `azx_create` and
+`snd_card_register` name it: driver `HDA-Intel`, the driver type's short name
+(`card_short_name`: "HDA ATI HDMI", "HD-Audio Generic", "HDA Intel", "HDA
+Intel PCH"), the id its last word (`card_id`, made unique by the registry,
+so "HDMI", "Generic", "Generic_1"), the long name "<short name> at 0x<BAR> irq
+<n>", the mixer name "<vendor> <chip>" of the first AFG codec, and
+`codec#A` opening with `print_codec_core_info`'s header. The free-running playback position adds
 the ring wraps the elapsed time implies at the stream's own rate.
 
 ALSA stream hooks preserve DMA position and storage across pause/resume. HDA

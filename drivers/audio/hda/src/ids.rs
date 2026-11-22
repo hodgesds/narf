@@ -33,6 +33,32 @@ pub const fn amd_sb_preset(vendor: u16, device: u16) -> bool {
         )
 }
 
+/// The card's short name (Linux `card->shortname`): `driver_short_names[]`
+/// for the driver type `azx_ids[]` gives the controller. The ATI HDMI NS
+/// functions are `AZX_DRIVER_ATIHDMI_NS`; the AMD platform controllers and
+/// the ATI/AMD class match (1002:1640 among them) are `AZX_DRIVER_GENERIC`;
+/// the ICH parts are `AZX_DRIVER_ICH` and every later Intel PCH is
+/// `AZX_DRIVER_PCH` / `AZX_DRIVER_SKL` ("HDA Intel PCH" for both).
+pub fn card_short_name(vendor: u16, device: u16) -> &'static str {
+    if vendor == HDA_AMD_RADEON_VENDOR && HDA_ATI_HDMI_NS_DEVICES.contains(&device) {
+        "HDA ATI HDMI"
+    } else if vendor == HDA_INTEL_ICH9_VENDOR {
+        match device {
+            HDA_INTEL_ICH6_DEVICE | HDA_INTEL_ICH7_DEVICE | HDA_INTEL_ICH9_DEVICE => "HDA Intel",
+            _ => "HDA Intel PCH",
+        }
+    } else {
+        "HD-Audio Generic"
+    }
+}
+
+/// The card id Linux `snd_card_register` derives when the driver sets none:
+/// the short name's last word (`retrieve_id_from_card_name`), so "HDMI",
+/// "Generic", "Intel" or "PCH". The sound registry makes it unique.
+pub fn card_id(short_name: &'static str) -> &'static str {
+    short_name.rsplit(' ').next().unwrap_or(short_name)
+}
+
 /// AMD Radeon HD Audio Controller — found on integrated Radeon GPUs.
 pub const HDA_AMD_RADEON_VENDOR: u16 = 0x1002;
 pub const HDA_AMD_RADEON_DEVICE: u16 = 0x1640;
