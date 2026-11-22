@@ -805,9 +805,10 @@ pub async fn poll_bit_async<F: FnMut() -> bool>(
 /// by [`calibrate_clocks`] / [`calibrate_clocks_with_source`] so
 /// the early-boot console line can show *how* the platform's clock
 /// got its number, not just that it did. Real-HW bring-up wants
-/// this — a Zen4 laptop should land on `AmdPstate0`, not
-/// `HpetXcheck` (the HPET reading is unreliable on Phoenix
-/// HawkPoint1 under SMM activity).
+/// this — a Zen machine should land on `AmdPstate0Hpet`: the
+/// P-state-0 estimate refined by an HPET measurement whose reference
+/// reads are SMI-checked (`hpet::measure_tsc`). `AmdPstate0` alone means
+/// the refinement failed and the clock runs at the nominal P0 rate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CalibrationSource {
     /// Cached value from a prior call.
@@ -825,9 +826,13 @@ pub enum CalibrationSource {
     /// Encodes the max non-turbo ratio; TSC = ratio * 100 MHz BCLK.
     IntelPlatformInfo,
     /// AMD `MSR_AMD_PSTATE_DEF_0` (`Core::X86::Msr::PStateDef`)
-    /// decode. Used on Zen2 / Zen3 / Zen4 / Zen5 where Intel
-    /// CPUID leaves are not populated.
+    /// decode, unrefined: no HPET measurement was available, or it was
+    /// more than 1% from the decoded rate. Used on Zen2 / Zen3 / Zen4 /
+    /// Zen5 where Intel CPUID leaves are not populated.
     AmdPstate0,
+    /// The `AmdPstate0` estimate refined by an HPET measurement (Linux
+    /// `tsc_refine_calibration_work`) — the expected AMD outcome.
+    AmdPstate0Hpet,
     /// HPET cross-check (`Δtsc / Δhpet * hpet_hz`). Works on any
     /// chipset with a functioning HPET; unreliable on some
     /// laptops (Phoenix HawkPoint1).
@@ -845,6 +850,7 @@ impl CalibrationSource {
             CalibrationSource::CpuId16h => "cpuid-16h",
             CalibrationSource::IntelPlatformInfo => "intel-platform-info",
             CalibrationSource::AmdPstate0 => "amd-pstate0",
+            CalibrationSource::AmdPstate0Hpet => "amd-pstate0+hpet",
             CalibrationSource::HpetXcheck => "hpet-xcheck",
             CalibrationSource::None => "none",
         }
@@ -873,8 +879,8 @@ pub fn calibrate_clocks() -> u64 {
 }
 
 /// Variant of [`calibrate_clocks`] that also reports which path
-/// produced the Hz value. On a Zen4 laptop the expected outcome
-/// is `(non-zero, CalibrationSource::AmdPstate0)`; on a Skylake
+/// produced the Hz value. On a Zen machine the expected outcome
+/// is `(non-zero, CalibrationSource::AmdPstate0Hpet)`; on a Skylake
 /// desktop `(non-zero, CalibrationSource::CpuId15h)`; on a
 /// virtualised host that masks AMD MSRs, `(non-zero,
 /// CalibrationSource::HpetXcheck)`. `(0, CalibrationSource::None)`
@@ -919,11 +925,12 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
         return (hz, CalibrationSource::IntelPlatformInfo);
     }
     // 4. AMD MSR_PSTATE0. Family 0x17+ doesn't populate the
-    //    Intel CPUID leaves; the P-state-0 MSR has the boost
-    //    clock, which the invariant TSC matches.
+    //    Intel CPUID leaves; the P-state-0 MSR gives the P0 clock the
+    //    invariant TSC is a multiple of, nominally. It is the early
+    //    estimate the HPET measurement refines (`amd_tsc_hz`).
     let hz_amd = narf_arch::x86_64::tsc::calibrate_via_amd_pstate0();
     if hz_amd != 0 {
-        let (hz, source) = amd_tsc_hz(hz_amd, |_| None);
+        let (hz, source) = amd_tsc_hz(hz_amd, hpet::refine_tsc_hz);
         narf_arch::x86_64::tsc::set_hz_via_hpet(hz);
         apply_cycles_per_ns(hz);
         return (hz, source);
@@ -954,12 +961,26 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
 /// The TSC rate the AMD path settles on, from the P-state-0 estimate
 /// `pstate0_hz` and `measure`, which is handed that estimate and returns
 /// the rate a reference counter measured, if one could.
+///
+/// The P-state-0 definition is the P0 multiple of a nominal 100 MHz
+/// reference; the TSC counts the board's actual one, which on the 7600X
+/// this was found on makes a 4700 MHz P0 a 4691.189 MHz TSC — a clock
+/// 1875 ppm slow if the definition is taken as the rate. Linux never does:
+/// on AMD its early rate comes from the PIT and `tsc_refine_calibration_work`
+/// replaces it with the rate measured against the HPET, "within 1%" of the
+/// early one. Here the estimate is the early rate and the HPET measurement
+/// the refinement, under the same 1% rule.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn amd_tsc_hz(
     pstate0_hz: u64,
-    _measure: impl FnOnce(u64) -> Option<u64>,
+    measure: impl FnOnce(u64) -> Option<u64>,
 ) -> (u64, CalibrationSource) {
-    (pstate0_hz, CalibrationSource::AmdPstate0)
+    match measure(pstate0_hz) {
+        Some(hz) if hz.abs_diff(pstate0_hz) <= pstate0_hz / 100 => {
+            (hz, CalibrationSource::AmdPstate0Hpet)
+        }
+        _ => (pstate0_hz, CalibrationSource::AmdPstate0),
+    }
 }
 
 /// Push the measured TSC frequency `hz` into the wall module. Feeds

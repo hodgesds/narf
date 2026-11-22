@@ -83,6 +83,19 @@ TSC frequency. Before calibration, `cycles_to_ns` and `ns_to_cycles` use an
 identity fallback; hardware minimum delays and timeouts must not treat it as
 wall time (a >1 GHz TSC makes such waits too short).
 
+On AMD Family 17h+ the `MSR_AMD_PSTATE_DEF_0` decode is only the early
+estimate (the P0 multiple of a nominal 100 MHz reference; a 4700 MHz P0 is
+a 4691.189 MHz TSC on the 7600X it was found on).
+`amd_tsc_hz(pstate0_hz, hpet::refine_tsc_hz)` refines it as Linux's
+`tsc_refine_calibration_work` does: `hpet::refine_tsc_hz(early_hz)` measures
+the TSC against the HPET singleton over 100 ms with a `tsc_khz >> 5`
+reference-read bracket, and a result within 1% of the estimate is the rate
+(`CalibrationSource::AmdPstate0Hpet`, "amd-pstate0+hpet"); otherwise, or
+without an HPET, the estimate stays (`AmdPstate0`). The rate is final once
+chosen: `monotonic_ns` is the TSC scaled by one rate, so it is never
+replaced after boot, and a caller that calibrates before `hpet::init` (the
+amdgpu firmware handoff) caches the unrefined estimate.
+
 `hpet::calibrate_tsc_at(mapped_base)` is an unsafe x86_64 boot-only
 measurement for callers running before timer installation. The caller owns
 an uncached HPET mapping exclusively. It enables and samples a 64-bit main
@@ -375,7 +388,14 @@ multiplier to steer). The slew is therefore applied at 1 Hz granularity:
 each second's jump is at most `MAXPHASE >> (SHIFT_PLL + time_constant)`.
 What is still missing, see the `narf_time::ntp` module docs: the leap
 state machine on this path (that is §3.5's smear), the `ADJ_ADJTIME`
-single-shot drain, and PPS.
+single-shot drain, and PPS. Nor does `time_freq` reach any clock: Linux
+steers CLOCK_REALTIME, CLOCK_MONOTONIC and CLOCK_BOOTTIME by it
+(`ntp_tick_length` → `timekeeping_adjust` scales the timekeeper's `mult`;
+CLOCK_MONOTONIC_RAW and the printk clock stay unsteered), while NARF only
+stores and reports it, so a daemon's frequency correction changes nothing
+and CLOCK_REALTIME is held by phase slews and steps alone (on the
+2026-11-21 native boot timesyncd sat at its +500 ppm limit, polling every
+32 s, while REALTIME and MONOTONIC advanced at the same rate).
 
 ## 4. Invariants & safety properties
 
@@ -445,7 +465,9 @@ single-shot drain, and PPS.
   uncalibrated InitialCount mode is available, or the LAPIC timer stops in
   deep C-states (no ARAT).
 - **Boot calibration:** TSC ↔ PM timer or HPET cross-check to get
-  frequency; CPUID leaf `0x15` on supported silicon.
+  frequency; CPUID leaf `0x15` on supported silicon. AMD's P-state-0
+  definition is an estimate the HPET measurement refines (§3.1); Linux
+  likewise takes no AMD TSC rate from a P-state.
 - **SMP sync:** TSC is architecturally synchronised across cores on
   invariant-TSC silicon; still verify at boot to catch BIOS bugs.
 

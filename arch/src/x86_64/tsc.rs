@@ -22,9 +22,13 @@
 //!      100 MHz BCLK. Matches Linux `cpu_khz_from_msr()`.
 //!   4. **AMD MSR_PSTATE0** (0xC001_0064) — Family 0x17+ chips
 //!      don't populate Intel CPUID leaves 0x15 / 0x16. The
-//!      P-state-0 definition MSR encodes the P0 (boost) clock
-//!      from `CpuFid` / `CpuDfsId`; on Zen2+ the TSC is
-//!      invariant and tied to that boost clock. See
+//!      P-state-0 definition MSR encodes the P0 clock from
+//!      `CpuFid` / `CpuDfsId` as a multiple of a nominal 100 MHz
+//!      reference. The invariant TSC counts that multiple of the
+//!      board's actual reference, so the decode is an estimate
+//!      (4700 MHz for a 4691.189 MHz TSC on a 7600X); `narf_time`
+//!      refines it against the HPET as Linux's
+//!      `tsc_refine_calibration_work` does. See
 //!      [`calibrate_via_amd_pstate0`].
 //!   5. **HPET cross-check** — measure `Δtsc / Δhpet` over a
 //!      short window. Works on every CPU with a working HPET,
@@ -166,8 +170,11 @@ const MSR_AMD_PSTATE_DEF_0: u32 = 0xC001_0064;
 
 /// AMD P-state 0 frequency readout via MSR 0xC001_0064
 /// (`Core::X86::Msr::PStateDef`). On AMD Family 0x17+ the TSC is
-/// invariant and runs at the P0 (boost) frequency, so decoding
-/// P-state 0 yields the TSC clock without needing a cross-check.
+/// invariant and counts at the P0 frequency — of the board's reference
+/// clock, which the decode assumes is exactly 100 MHz. The result is
+/// therefore an estimate of the TSC rate, off by the reference's error
+/// (1875 ppm on the 7600X where this was measured), and is refined
+/// against the HPET by `narf_time::calibrate_clocks_with_source`.
 ///
 /// Bit layout (AMD64 PPR, Family 0x17 / 0x19):
 /// ```text
@@ -187,9 +194,9 @@ const MSR_AMD_PSTATE_DEF_0: u32 = 0xC001_0064;
 ///   - the MSR `#GP`'d (BIOS lock or unsupported)
 ///   - decoded fields would produce a divide-by-zero
 ///
-/// Used as TSC-calibration fallback when CPUID 0x15 / 0x16 don't
-/// populate (the Intel-only leaves) and HPET cross-check is
-/// unreliable (Phoenix HawkPoint1 SMM drift). See `narf_time`'s
+/// Used as the early TSC-rate estimate when CPUID 0x15 / 0x16 don't
+/// populate (the Intel-only leaves), and kept when the HPET
+/// measurement is unavailable or more than 1% away. See `narf_time`'s
 /// `calibrate_clocks` for the call order.
 pub fn calibrate_via_amd_pstate0() -> u64 {
     // 1. Vendor must be "AuthenticAMD".

@@ -1112,6 +1112,33 @@ pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64>
     )
 }
 
+/// `tsc_refine_calibration_work` against the HPET singleton: the TSC rate
+/// measured over a 100 ms window, given the early estimate `early_hz` the
+/// measurement refines. As in Linux, a known early rate narrows the
+/// reference-read bracket from `TSC_DEFAULT_THRESHOLD` to `tsc_khz >> 5`
+/// cycles (1/32 ms). `None` without an HPET or when every reference read of
+/// an end was disturbed; the caller then keeps its estimate.
+///
+/// Linux measures over about a second from a delayed work item, which NARF
+/// cannot do: its monotonic clock is the TSC scaled by one fixed rate, so a
+/// rate replaced after the clock is in use would move every timestamp
+/// taken since boot. 100 ms of 70 ns HPET ticks resolves the rate to about
+/// 1 ppm, far inside the 500 ppm NTP can then correct.
+#[cfg(target_arch = "x86_64")]
+pub fn refine_tsc_hz(early_hz: u64) -> Option<u64> {
+    let g = HPET.lock();
+    let dev = g.as_ref()?;
+    let hpet_hz = dev.caps.frequency_hz();
+    measure_tsc_within(
+        (early_hz / 1_000) >> 5,
+        hpet_hz,
+        (hpet_hz / 10).max(1),
+        // SAFETY: the singleton mapping remains alive under the guard.
+        || unsafe { dev.read_counter() },
+        narf_arch::x86_64::tsc::rdtsc,
+    )
+}
+
 /// Measure TSC Hz before the HPET singleton and IRQ timers are installed.
 /// Enables the main counter without changing comparators or publishing a
 /// singleton/base override. The later timer owner can initialize normally.
@@ -1179,10 +1206,20 @@ fn read_refs(
 pub(crate) fn measure_tsc(
     hpet_hz: u64,
     window: u64,
+    hpet: impl FnMut() -> u64,
+    tsc: impl FnMut() -> u64,
+) -> Option<u64> {
+    measure_tsc_within(REF_READ_THRESHOLD_CYCLES, hpet_hz, window, hpet, tsc)
+}
+
+/// [`measure_tsc`] with the [`read_refs`] bracket bound `thresh` (cycles).
+fn measure_tsc_within(
+    thresh: u64,
+    hpet_hz: u64,
+    window: u64,
     mut hpet: impl FnMut() -> u64,
     mut tsc: impl FnMut() -> u64,
 ) -> Option<u64> {
-    let thresh = REF_READ_THRESHOLD_CYCLES;
     if hpet_hz == 0 || window == 0 {
         return None;
     }
