@@ -284,3 +284,110 @@ pub unsafe fn load_user_selectors(_next: UserSelectors, _tls: &[u64; GDT_ENTRY_T
 /// # Safety
 /// As [`load_user_selectors`].
 pub unsafe fn reload_selector_users(_modified: u16, _tls: &[u64; GDT_ENTRY_TLS_ENTRIES]) {}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// glibc's TLS request (`TLS_INIT_TP`): slot "any", 4 GiB, 32-bit, pages,
+/// useable.
+const GLIBC_TLS: UserDesc = UserDesc {
+    entry_number: u32::MAX,
+    base_addr: 0x1234_5678,
+    limit: 0xF_FFFF,
+    flags: 0x51,
+};
+/// `fill_ldt(GLIBC_TLS)`: base 0x12345678, limit 0xfffff, type 3
+/// (read/write, accessed), S, DPL 3, P, AVL, D, G.
+const GLIBC_TLS_DESC: u64 = 0x12DF_F334_5678_FFFF;
+
+/// `struct user_desc` validation and encoding follow `arch/x86/kernel/tls.c`
+/// and `asm/desc.h` (`tls_desc_okay`, `LDT_empty`, `LDT_zero`, `fill_ldt`,
+/// `fill_user_desc`, `get_free_idx`), including the rules that keep 16-bit,
+/// code and non-present segments out of the TLS slots.
+fn smoke_ia32_user_desc_encoding_matches_linux() -> TestResult {
+    let desc = |entry_number, base_addr, limit, flags| UserDesc {
+        entry_number,
+        base_addr,
+        limit,
+        flags,
+    };
+    if !tls_desc_okay(&GLIBC_TLS) || fill_ldt(&GLIBC_TLS) != GLIBC_TLS_DESC {
+        return TestResult::Fail("glibc's TLS user_desc did not encode as fill_ldt does");
+    }
+    // `lm` is not part of a 32-bit caller's struct: ignored, never L=1.
+    let with_lm = desc(u32::MAX, 0x1234_5678, 0xF_FFFF, 0x51 | 0x80);
+    if !tls_desc_okay(&with_lm) || fill_ldt(&with_lm) != GLIBC_TLS_DESC {
+        return TestResult::Fail("the lm bit reached the descriptor");
+    }
+    // Read-only expand-down data: type 5.
+    let ro_down = desc(12, 0x1000, 0x10, 0x1 | (1 << 1) | (1 << 3));
+    if !tls_desc_okay(&ro_down) || (fill_ldt(&ro_down) >> 40) & 0xFF != 0xF5 {
+        return TestResult::Fail("a read-only expand-down data request was mis-encoded");
+    }
+    // The two "no segment" spellings.
+    let empty = desc(13, 0, 0, (1 << 3) | (1 << 5));
+    if !ldt_empty(&empty) || ldt_zero(&empty) || !tls_desc_okay(&empty) {
+        return TestResult::Fail("LDT_empty was not recognised");
+    }
+    let zero = desc(13, 0, 0, 0);
+    if !ldt_zero(&zero) || ldt_empty(&zero) || !tls_desc_okay(&zero) {
+        return TestResult::Fail("an all-zero request was not taken as LDT_zero");
+    }
+    // tls_desc_okay's refusals: 16-bit data (espfix only covers the LDT),
+    // code segments, non-present segments.
+    if tls_desc_okay(&desc(12, 0x1000, 0x10, 0)) {
+        return TestResult::Fail("a 16-bit TLS segment was accepted");
+    }
+    if tls_desc_okay(&desc(12, 0x1000, 0x10, 0x1 | (2 << 1))) {
+        return TestResult::Fail("a code segment was accepted as TLS");
+    }
+    if tls_desc_okay(&desc(12, 0x1000, 0x10, 0x1 | (1 << 5))) {
+        return TestResult::Fail("a non-present TLS segment was accepted");
+    }
+    // get_thread_area's view of a slot.
+    let back = fill_user_desc(12, GLIBC_TLS_DESC);
+    if back != desc(12, 0x1234_5678, 0xF_FFFF, 0x51) {
+        return TestResult::Fail("fill_user_desc did not invert fill_ldt");
+    }
+    // An empty slot reads back as LDT_empty (type 0: read_exec_only, !P).
+    if fill_user_desc(14, 0) != desc(14, 0, 0, (1 << 3) | (1 << 5)) {
+        return TestResult::Fail("an empty slot did not read back as LDT_empty");
+    }
+    // get_free_idx: the first empty slot, as its GDT index.
+    if get_free_idx(&[0, GLIBC_TLS_DESC, 0]) != Some(12)
+        || get_free_idx(&[GLIBC_TLS_DESC, 0, 0]) != Some(13)
+        || get_free_idx(&[GLIBC_TLS_DESC; 3]).is_some()
+    {
+        return TestResult::Fail("get_free_idx did not return the first empty slot");
+    }
+    if UserDesc::from_bytes(GLIBC_TLS.to_bytes()) != GLIBC_TLS {
+        return TestResult::Fail("user_desc bytes did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("arch/ia32-tls", smoke_ia32_user_desc_encoding_matches_linux);
+
+/// Which selectors a switch-in may load into DS/ES/FS/GS without faulting:
+/// null (any RPL), the three static user segments, and a TLS slot only
+/// while it holds a present DPL-3 descriptor. Kernel, system and LDT
+/// selectors never load (Linux's fault fixup turns them into null).
+fn smoke_ia32_selector_loadable_matches_gdt() -> TestResult {
+    let tls = [GLIBC_TLS_DESC, 0, 0];
+    for sel in [0u16, 1, 2, 3, USER32_CS, USER_DS, USER_CS, 0x63, 0x60] {
+        if !selector_loadable(sel, &tls) {
+            return TestResult::Fail("a loadable user selector was refused");
+        }
+    }
+    // 0x6b/0x73 name empty slots; 0x08/0x10 are kernel, 0x40 the TSS, 0x18
+    // and 0x7b empty, 0x67 an LDT selector (no LDT), 0x83 past the table.
+    for sel in [
+        0x6Bu16, 0x73, 0x08, 0x0B, 0x10, 0x13, 0x40, 0x43, 0x1B, 0x7B, 0x67, 0x83,
+    ] {
+        if selector_loadable(sel, &tls) {
+            return TestResult::Fail("a selector that would fault was reported loadable");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("arch/ia32-tls", smoke_ia32_selector_loadable_matches_gdt);

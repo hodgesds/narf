@@ -140,9 +140,57 @@ impl Program {
     }
 }
 
+/// A fast periodic timer for the duration of a run, so user loops are
+/// interrupted (and preempted) many times.
+struct FastTimer {
+    irqs_were_enabled: bool,
+}
+
+impl FastTimer {
+    fn start() -> Self {
+        let irqs_were_enabled = narf_arch::interrupts_enabled();
+        // SAFETY: the interrupt controller and timer are initialized before
+        // kernel tests run, and no IRQ-unsafe lock is held here.
+        unsafe {
+            narf_interrupts::x86_64::apic::start_timer(narf_interrupts::VECTOR_TIMER, 10_000);
+            narf_arch::enable_interrupts();
+        }
+        Self { irqs_were_enabled }
+    }
+}
+
+impl Drop for FastTimer {
+    fn drop(&mut self) {
+        // SAFETY: this guard armed the timer; restore the harness's IRQ state.
+        unsafe {
+            narf_arch::disable_interrupts();
+            narf_interrupts::x86_64::apic::stop_timer();
+            if self.irqs_were_enabled {
+                narf_arch::enable_interrupts();
+            }
+        }
+    }
+}
+
+/// Leave the running CPU with no user segment state: empty TLS slots, null
+/// DS/ES/FS/GS and a zero user GS base, whatever the last task left.
+fn reset_cpu_segments() {
+    use narf_arch::x86_64::segments;
+    narf_lib::sync::without_interrupts(|| {
+        // SAFETY: CPL0 with the kernel GS live and IRQs masked; null
+        // selectors always load.
+        unsafe {
+            segments::load_tls(&[0; 3]);
+            segments::load_user_selectors(segments::UserSelectors::default(), &[0; 3]);
+            narf_arch::x86_64::user_mode::set_user_gs_base(0);
+        }
+    });
+}
+
 /// Spawn every program as its own process on the boot CPU, run the
-/// executor until all of them exit, and tear the harness state down again.
-fn run(programs: &mut [Program]) -> Result<(), &'static str> {
+/// executor until all of them exit (under a fast timer when `fast_timer`),
+/// and tear the harness state down again.
+fn run(programs: &mut [Program], fast_timer: bool) -> Result<(), &'static str> {
     // SAFETY: privileged harness context; the root stays live throughout.
     let original_root = unsafe { narf_arch::x86_64::cr::read_cr3() };
     narf_userspace::syscall::__test_clear_global();
@@ -181,10 +229,14 @@ fn run(programs: &mut [Program]) -> Result<(), &'static str> {
         ids.push(id);
         pending.push(task);
     }
-    for task in pending {
-        task.spawn();
+    {
+        let _timer = fast_timer.then(FastTimer::start);
+        for task in pending {
+            task.spawn();
+        }
+        narf_scheduler::run_until_empty();
     }
-    narf_scheduler::run_until_empty();
+    reset_cpu_segments();
 
     // SAFETY: restore the live harness root before user mappings go.
     unsafe { narf_arch::x86_64::cr::write_cr3(original_root) };
@@ -256,7 +308,7 @@ fn smoke_ia32_compat_task_int80_getpid() -> TestResult {
         Ok(p) => [p],
         Err(why) => return TestResult::Fail(why),
     };
-    if let Err(why) = run(&mut programs) {
+    if let Err(why) = run(&mut programs, false) {
         return TestResult::Fail(why);
     }
     let p = &programs[0];
@@ -316,7 +368,7 @@ fn smoke_ia32_int80_from_64bit_task_is_i386() -> TestResult {
         Ok(p) => [p],
         Err(why) => return TestResult::Fail(why),
     };
-    if let Err(why) = run(&mut programs) {
+    if let Err(why) = run(&mut programs, false) {
         return TestResult::Fail(why);
     }
     let p = &programs[0];
@@ -341,4 +393,315 @@ fn smoke_ia32_int80_from_64bit_task_is_i386() -> TestResult {
 kernel_test_in!(
     "verification/ia32-int80",
     smoke_ia32_int80_from_64bit_task_is_i386
+);
+
+// ── TLS: set_thread_area / get_thread_area and the switch ───────────
+
+/// Little assembler for the TLS programs: bytes plus 8-bit branches.
+struct Asm(Vec<u8>);
+
+impl Asm {
+    fn op(&mut self, bytes: &[u8]) -> &mut Self {
+        self.0.extend_from_slice(bytes);
+        self
+    }
+
+    /// `op imm32` (B8+r forms and friends).
+    fn op_imm(&mut self, bytes: &[u8], imm: u32) -> &mut Self {
+        self.0.extend_from_slice(bytes);
+        self.0.extend_from_slice(&imm.to_le_bytes());
+        self
+    }
+
+    fn here(&self) -> usize {
+        self.0.len()
+    }
+
+    /// A short branch `op rel8` back to `target`.
+    fn branch_back(&mut self, op: u8, target: usize) -> &mut Self {
+        let rel = target as isize - (self.0.len() as isize + 2);
+        self.0.extend_from_slice(&[op, rel as i8 as u8]);
+        self
+    }
+
+    /// A short forward branch `op rel8`; returns the site to [`Self::land`].
+    fn branch_fwd(&mut self, op: u8) -> usize {
+        self.0.extend_from_slice(&[op, 0]);
+        self.0.len()
+    }
+
+    /// Point the forward branch ending at `site` here.
+    fn land(&mut self, site: usize) {
+        self.0[site - 1] = (self.0.len() - site) as u8;
+    }
+}
+
+const JNE: u8 = 0x75;
+const JMP: u8 = 0xEB;
+
+/// i386 `set_thread_area(ebx)`: `mov eax, 243; int 0x80`.
+fn i386_set_thread_area(a: &mut Asm) {
+    a.op_imm(&[0xB8], 243).op(&[0xCD, 0x80]);
+}
+
+/// i386 `exit(0)`, then a trap if it returned.
+fn i386_exit(a: &mut Asm) {
+    a.op_imm(&[0xB8], 1)
+        .op(&[0x31, 0xDB, 0xCD, 0x80, 0x0F, 0x0B]);
+}
+
+/// A `struct user_desc` as the user passes it.
+fn user_desc(entry: u32, base: u32, limit: u32, flags: u32) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&entry.to_le_bytes());
+    b[4..8].copy_from_slice(&base.to_le_bytes());
+    b[8..12].copy_from_slice(&limit.to_le_bytes());
+    b[12..16].copy_from_slice(&flags.to_le_bytes());
+    b
+}
+
+/// glibc's TLS flags: seg_32bit, limit_in_pages, useable.
+const TLS_FLAGS: u32 = 0x51;
+/// The flags of an `LDT_empty` request: read_exec_only, seg_not_present.
+const EMPTY_FLAGS: u32 = 0x28;
+const TLS_MAGIC: u32 = 0xC0DE_F00D;
+
+/// `set_thread_area(-1)` hands out GDT entry 12 and writes it back, %gs =
+/// 0x63 then reads the descriptor's base, `get_thread_area` reports the
+/// slot, the Linux refusals answer -EINVAL, a full table answers -ESRCH,
+/// and an `LDT_empty` request frees a slot for the next allocation.
+fn smoke_ia32_set_thread_area_entry_12_and_gs_base() -> TestResult {
+    let data = DATA_VADDR as u32;
+    let desc_addr = data + INPUT as u32;
+    let base = data + 0x200;
+    let mut a = Asm(Vec::new());
+    a.op_imm(&[0xBF], data) //                        mov edi, DATA
+        .op_imm(&[0xBB], desc_addr); //               mov ebx, &desc_a
+    i386_set_thread_area(&mut a);
+    a.op(&[0x89, 0x07]) //                             mov [edi], eax
+        .op(&[0x8B, 0x03, 0x89, 0x47, 0x04]) //       [edi+4] = entry_number
+        .op_imm(&[0xB8], 0x63) //                     mov eax, 0x63
+        .op(&[0x8E, 0xE8]) //                         mov gs, ax
+        .op_imm(&[0x65, 0x8B, 0x05], 0) //            mov eax, gs:[0]
+        .op(&[0x89, 0x47, 0x08]) //                   [edi+8]
+        .op(&[0x31, 0xC0, 0x66, 0x8C, 0xE8]) //       mov ax, gs
+        .op(&[0x89, 0x47, 0x0C]) //                   [edi+12]
+        // get_thread_area(12) over a scribbled copy.
+        .op_imm(&[0xC7, 0x43, 0x04], 0) //            [ebx+4] = 0 (base)
+        .op_imm(&[0xC7, 0x03], 12) //                 [ebx] = 12
+        .op_imm(&[0xB8], 244)
+        .op(&[0xCD, 0x80])
+        .op(&[0x89, 0x47, 0x10]) //                   [edi+16] = ret
+        .op(&[0x8B, 0x43, 0x04, 0x89, 0x47, 0x14]) // [edi+20] = base
+        .op(&[0x8B, 0x43, 0x0C, 0x89, 0x47, 0x18]) // [edi+24] = flags
+        // A 16-bit request and entry 11: -EINVAL.
+        .op_imm(&[0xBB], desc_addr + 0x10);
+    i386_set_thread_area(&mut a);
+    a.op(&[0x89, 0x47, 0x1C]).op_imm(&[0xBB], desc_addr + 0x20);
+    i386_set_thread_area(&mut a);
+    a.op(&[0x89, 0x47, 0x20]).op_imm(&[0xBB], desc_addr);
+    // Allocate 13 and 14, then the full table answers -ESRCH.
+    for (ret, entry) in [(0x24u8, Some(0x28u8)), (0x2C, Some(0x30)), (0x34, None)] {
+        a.op_imm(&[0xC7, 0x03], u32::MAX); //         [ebx] = -1
+        i386_set_thread_area(&mut a);
+        a.op(&[0x89, 0x47, ret]);
+        if let Some(entry) = entry {
+            a.op(&[0x8B, 0x03, 0x89, 0x47, entry]);
+        }
+    }
+    // Free 13 with LDT_empty; the next allocation takes it again.
+    a.op_imm(&[0xBB], desc_addr + 0x30);
+    i386_set_thread_area(&mut a);
+    a.op(&[0x89, 0x47, 0x38])
+        .op_imm(&[0xBB], desc_addr)
+        .op_imm(&[0xC7, 0x03], u32::MAX);
+    i386_set_thread_area(&mut a);
+    a.op(&[0x8B, 0x03, 0x89, 0x47, 0x3C]);
+    i386_exit(&mut a);
+
+    let desc_a = user_desc(u32::MAX, base, 0xF_FFFF, TLS_FLAGS);
+    let desc_16bit = user_desc(13, 0x1000, 1, 0);
+    let desc_entry_11 = user_desc(11, base, 0xF_FFFF, TLS_FLAGS);
+    let desc_empty = user_desc(13, 0, 0, EMPTY_FLAGS);
+    let magic = TLS_MAGIC.to_le_bytes();
+    let inputs = [
+        (INPUT, desc_a.as_slice()),
+        (INPUT + 0x10, desc_16bit.as_slice()),
+        (INPUT + 0x20, desc_entry_11.as_slice()),
+        (INPUT + 0x30, desc_empty.as_slice()),
+        (0x200, magic.as_slice()),
+    ];
+    let mut programs = match build(&a.0, true, &inputs) {
+        Ok(p) => [p],
+        Err(why) => return TestResult::Fail(why),
+    };
+    if let Err(why) = run(&mut programs, false) {
+        return TestResult::Fail(why);
+    }
+    let p = &programs[0];
+    const EINVAL: u32 = (-22i32) as u32;
+    const ESRCH: u32 = (-3i32) as u32;
+    if p.u32_at(0) != 0 || p.u32_at(4) != 12 {
+        return TestResult::Fail("set_thread_area(-1) did not hand out entry 12");
+    }
+    if p.u32_at(8) != TLS_MAGIC || p.u32_at(12) != 0x63 {
+        return TestResult::Fail("%gs = 0x63 did not read the TLS descriptor's base");
+    }
+    if p.u32_at(16) != 0 || p.u32_at(20) != base || p.u32_at(24) != TLS_FLAGS {
+        return TestResult::Fail("get_thread_area(12) did not report the slot");
+    }
+    if p.u32_at(28) != EINVAL || p.u32_at(32) != EINVAL {
+        return TestResult::Fail("a 16-bit request or entry 11 was not -EINVAL");
+    }
+    if p.u32_at(36) != 0 || p.u32_at(40) != 13 || p.u32_at(44) != 0 || p.u32_at(48) != 14 {
+        return TestResult::Fail("the next allocations did not hand out 13 and 14");
+    }
+    if p.u32_at(52) != ESRCH {
+        return TestResult::Fail("a full TLS table did not answer -ESRCH");
+    }
+    if p.u32_at(56) != 0 || p.u32_at(60) != 13 {
+        return TestResult::Fail("an LDT_empty request did not free its slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "verification/ia32-tls",
+    smoke_ia32_set_thread_area_entry_12_and_gs_base
+);
+
+const OUTER_YIELDS: u32 = 200;
+const INNER_READS: u32 = 20_000;
+
+/// An i386 task that takes a TLS slot for a block at `DATA + tls_off`,
+/// loads %gs with it, then reads `%gs:0` and %gs over and over, yielding
+/// between bursts. [edi+8] = 1 when every read matched, 2 on the first
+/// mismatch.
+fn compat_tls_loop(tls_off: u32) -> Vec<u8> {
+    let data = DATA_VADDR as u32;
+    let mut a = Asm(Vec::new());
+    a.op_imm(&[0xBF], data).op_imm(&[0xBB], data + INPUT as u32);
+    i386_set_thread_area(&mut a);
+    a.op(&[0x89, 0x07]) //                                 [edi] = ret
+        .op(&[0x8B, 0x03, 0xC1, 0xE0, 0x03, 0x83, 0xC8, 0x03]) // eax = entry*8+3
+        .op(&[0x8E, 0xE8]) //                              mov gs, ax
+        .op(&[0x89, 0x47, 0x04]) //                        [edi+4] = selector
+        .op_imm(&[0xBE], OUTER_YIELDS); //                 mov esi, N
+    let outer = a.here();
+    a.op_imm(&[0xB9], INNER_READS); //                     mov ecx, M
+    let inner = a.here();
+    a.op_imm(&[0x65, 0x8B, 0x05], 0) //                    mov eax, gs:[0]
+        .op_imm(&[0x3B, 0x05], data + tls_off); //         cmp eax, [block]
+    let bad1 = a.branch_fwd(JNE);
+    a.op(&[0x31, 0xD2, 0x66, 0x8C, 0xEA]) //               mov dx, gs
+        .op(&[0x3B, 0x57, 0x04]); //                       cmp edx, [edi+4]
+    let bad2 = a.branch_fwd(JNE);
+    a.op(&[0x49]).branch_back(JNE, inner); //              dec ecx; jnz
+    a.op_imm(&[0xB8], 158).op(&[0xCD, 0x80]); //           sched_yield
+    a.op(&[0x4E]).branch_back(JNE, outer); //              dec esi; jnz
+    a.op_imm(&[0xC7, 0x47, 0x08], 1);
+    let done = a.branch_fwd(JMP);
+    a.land(bad1);
+    a.land(bad2);
+    a.op_imm(&[0xC7, 0x47, 0x08], 2).op(&[0x89, 0x4F, 0x0C]);
+    a.land(done);
+    i386_exit(&mut a);
+    a.0
+}
+
+/// A 64-bit task with a GS base from `arch_prctl(ARCH_SET_GS)` that reads
+/// `%gs:0`, GS and DS over and over, yielding between bursts. [rdi+8] = 1
+/// when GS and DS stayed null and every read matched, 2 otherwise.
+fn native_gs_loop() -> Vec<u8> {
+    let data = DATA_VADDR as u32;
+    let block = data + 0x200;
+    let mut a = Asm(Vec::new());
+    a.op_imm(&[0xB8], 158) //                              arch_prctl
+        .op_imm(&[0xBF], 0x1001) //                        ARCH_SET_GS
+        .op_imm(&[0xBE], block)
+        .op(&[0x0F, 0x05])
+        .op_imm(&[0xBF], data)
+        .op(&[0x89, 0x07]) //                              [rdi] = ret
+        .op_imm(&[0xBE], OUTER_YIELDS);
+    let outer = a.here();
+    a.op_imm(&[0xB9], INNER_READS);
+    let inner = a.here();
+    a.op_imm(&[0x65, 0x8B, 0x04, 0x25], 0) //              mov eax, gs:[0]
+        .op_imm(&[0x3B, 0x04, 0x25], block); //            cmp eax, [block]
+    let bad1 = a.branch_fwd(JNE);
+    a.op(&[0x8C, 0xEA, 0x85, 0xD2]); //                    mov edx, gs; test
+    let bad2 = a.branch_fwd(JNE);
+    a.op(&[0x8C, 0xDA, 0x85, 0xD2]); //                    mov edx, ds; test
+    let bad3 = a.branch_fwd(JNE);
+    a.op(&[0xFF, 0xC9]).branch_back(JNE, inner); //        dec ecx; jnz
+    a.op_imm(&[0xB8], 24).op(&[0x0F, 0x05]); //            sched_yield
+    a.op(&[0xFF, 0xCE]).branch_back(JNE, outer); //        dec esi; jnz
+    a.op_imm(&[0xC7, 0x47, 0x08], 1);
+    let done = a.branch_fwd(JMP);
+    a.land(bad1);
+    a.land(bad2);
+    a.land(bad3);
+    a.op_imm(&[0xC7, 0x47, 0x08], 2)
+        .op(&[0x89, 0x4F, 0x0C, 0x89, 0x57, 0x10]); //     [rdi+12] = ecx, [rdi+16] = edx
+    a.land(done);
+    a.op_imm(&[0xB8], 60)
+        .op(&[0x31, 0xFF, 0x0F, 0x05, 0x0F, 0x0B]);
+    a.0
+}
+
+/// Two i386 tasks hold slot 12 (both %gs = 0x63) with descriptors for
+/// different blocks, and a 64-bit task keeps GS null with its own base,
+/// all on one CPU under a fast timer: every switch, cooperative or
+/// preemptive, must load the incoming task's descriptor, selectors and
+/// base (Linux `load_TLS` + `load_seg_legacy`). A leaked descriptor reads
+/// the other block (zero in this task's page); a leaked selector shows up
+/// in the 64-bit task's GS or DS.
+fn smoke_ia32_tls_kept_per_task_across_switches() -> TestResult {
+    let data = DATA_VADDR as u32;
+    let desc_at = |off: u32| user_desc(u32::MAX, data + off, 0xF_FFFF, TLS_FLAGS);
+    let (desc_a, desc_b) = (desc_at(0x200), desc_at(0x300));
+    let magic_a = 0xA1A1_0001u32.to_le_bytes();
+    let magic_b = 0xB2B2_0002u32.to_le_bytes();
+    let magic_c = 0xC3C3_0003u32.to_le_bytes();
+    let built = (|| {
+        Ok::<_, &'static str>([
+            build(
+                &compat_tls_loop(0x200),
+                true,
+                &[(INPUT, desc_a.as_slice()), (0x200, magic_a.as_slice())],
+            )?,
+            build(
+                &compat_tls_loop(0x300),
+                true,
+                &[(INPUT, desc_b.as_slice()), (0x300, magic_b.as_slice())],
+            )?,
+            build(&native_gs_loop(), false, &[(0x200, magic_c.as_slice())])?,
+        ])
+    })();
+    let mut programs = match built {
+        Ok(p) => p,
+        Err(why) => return TestResult::Fail(why),
+    };
+    if let Err(why) = run(&mut programs, true) {
+        return TestResult::Fail(why);
+    }
+    for p in &programs[..2] {
+        if p.u32_at(0) != 0 || p.u32_at(4) != 0x63 {
+            return TestResult::Fail("an i386 task did not get slot 12 (%gs 0x63)");
+        }
+        if p.u32_at(8) != 1 {
+            return TestResult::Fail("an i386 task saw another task's TLS across a switch");
+        }
+    }
+    let native = &programs[2];
+    if native.u32_at(0) != 0 {
+        return TestResult::Fail("arch_prctl(ARCH_SET_GS) failed");
+    }
+    if native.u32_at(8) != 1 {
+        return TestResult::Fail("a 64-bit task saw an i386 task's GS/DS or lost its GS base");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "verification/ia32-tls",
+    smoke_ia32_tls_kept_per_task_across_switches
 );

@@ -4423,6 +4423,81 @@ kernel_test_in!(
     smoke_blocked_syscall_decodes_int80_as_i386
 );
 
+// `clone(CLONE_SETTLS)` from an i386 task (Linux `set_new_tls` →
+// `do_set_thread_area(p, -1, tls, 0)` for a child that has not run): the
+// named slot gets the descriptor, and a child FS or GS selector naming that
+// slot gets the descriptor's base. No allocation: entry -1 is refused, as
+// is anything `tls_desc_okay` refuses.
+#[cfg(target_arch = "x86_64")]
+fn smoke_ia32_clone_settls_sets_child_slot_and_base() -> TestResult {
+    use crate::compat32::tls::set_child_tls;
+    use narf_arch::x86_64::segments::UserDesc;
+    const EINVAL: i64 = -22;
+    let desc = |entry_number, base_addr, flags| UserDesc {
+        entry_number,
+        base_addr,
+        limit: 0xF_FFFF,
+        flags,
+    };
+    // glibc's pthread_create TLS for slot 12, the parent's GS selector.
+    let mut segs = crate::UserSegments {
+        ds: 0x2B,
+        es: 0x2B,
+        gs: 0x63,
+        ..Default::default()
+    };
+    let (mut gs_base, mut fs_base) = (0xDEAD_0000u64, None);
+    if set_child_tls(
+        &mut segs,
+        &mut gs_base,
+        &mut fs_base,
+        &desc(12, 0x0804_C000, 0x51),
+    ) != 0
+    {
+        return TestResult::Fail("a valid CLONE_SETTLS descriptor was refused");
+    }
+    if segs.tls != [0x08DF_F304_C000_FFFF, 0, 0] {
+        return TestResult::Fail("the child's slot 12 does not hold the descriptor");
+    }
+    if gs_base != 0x0804_C000 || fs_base.is_some() {
+        return TestResult::Fail("the child's GS base is not the new descriptor's");
+    }
+    // A slot no child selector names leaves the bases alone; FS naming slot
+    // 13 takes its base.
+    segs.fs = 0x6B;
+    if set_child_tls(
+        &mut segs,
+        &mut gs_base,
+        &mut fs_base,
+        &desc(13, 0x0805_0000, 0x51),
+    ) != 0
+        || fs_base != Some(0x0805_0000)
+        || gs_base != 0x0804_C000
+    {
+        return TestResult::Fail("an FS selector naming the slot did not take its base");
+    }
+    let before = segs;
+    for bad in [
+        desc(u32::MAX, 0x1000, 0x51), // allocation is not allowed for a child
+        desc(11, 0x1000, 0x51),       // below GDT_ENTRY_TLS_MIN
+        desc(15, 0x1000, 0x51),       // above GDT_ENTRY_TLS_MAX
+        desc(14, 0x1000, 0x00),       // 16-bit
+    ] {
+        if set_child_tls(&mut segs, &mut gs_base, &mut fs_base, &bad) != EINVAL {
+            return TestResult::Fail("an invalid CLONE_SETTLS descriptor was not -EINVAL");
+        }
+    }
+    if segs != before {
+        return TestResult::Fail("a refused CLONE_SETTLS descriptor changed the child");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/ia32-tls",
+    smoke_ia32_clone_settls_sets_child_slot_and_base
+);
+
 // `/proc/<pid>/syscall` prints `task_current_syscall()`'s whole result:
 // number, six arguments, then the user SP and PC. Both come from the same
 // saved frame as the arguments, for every frame layout the decoder handles.
