@@ -110,6 +110,9 @@ whose backend reports none keeps the summary `codec#0`). `components` fills
 CARD_INFO `components` (Linux `card->components`; empty without it) and
 `pcm_name` gives a PCM device its own PCM_INFO id and name and the `id:` /
 `name:` lines of `pcmMp/info` (`pcm_names`; the card's id and name otherwise).
+`noninterleaved` (default true) lets HW_REFINE offer RW_NONINTERLEAVED and
+report SNDRV_PCM_INFO_NONINTERLEAVED; an interleaved-only device (HDA, as
+Linux `azx_pcm_hw`) gets MMAP_INTERLEAVED and RW_INTERLEAVED only.
 
 Each successful PCM open acquires its own exclusive lease after access checks;
 lookup/stat do not acquire a hardware lease. Files retain that lease across

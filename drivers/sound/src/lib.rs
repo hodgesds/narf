@@ -311,6 +311,15 @@ pub fn pcm_devices(card: &CardInfo, capture: bool) -> Vec<u32> {
     })
 }
 
+/// Whether HW_REFINE offers the card's PCMs non-interleaved access
+/// (`PcmDevice::noninterleaved`; every card without a backend does).
+pub(crate) fn pcm_noninterleaved(card: u32) -> bool {
+    match card_hardware(card) {
+        Some(hardware) => hardware.noninterleaved(),
+        None => true,
+    }
+}
+
 /// A PCM device's `snd_pcm` id and name: the backend's own
 /// (`PcmDevice::pcm_name`, Linux HDA "HDMI 0", ...), else the card's id and
 /// name.

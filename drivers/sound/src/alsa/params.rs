@@ -9,6 +9,10 @@ pub(super) const HW_BYTES: usize = 608;
 // Interleaved mmap/read/write, planar read/write, pause/resume. No hardware linked-start,
 // or noninterleaved mmap capability is advertised.
 pub(super) const INFO: u32 = 1 | 2 | 0x20 | 0x100 | 0x200 | 0xc0000 | 0x2000_0000;
+/// `SNDRV_PCM_INFO_NONINTERLEAVED`, dropped for interleaved-only devices.
+const INFO_NONINTERLEAVED: u32 = 0x200;
+/// `SNDRV_PCM_ACCESS_RW_NONINTERLEAVED`.
+const ACCESS_RW_NONINTERLEAVED: u32 = 4;
 /// `SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_BLOCK_TRANSFER`, set per device
 /// for block-granular pointers (Linux `sound/virtio/virtio_pcm.c`).
 pub(super) const INFO_BATCH: u32 = 0x10 | 0x1_0000;
@@ -85,6 +89,7 @@ pub(super) fn refine(
     b: &mut [u8],
     caps: &PcmCapabilities,
     choose: bool,
+    noninterleaved: bool,
 ) -> Result<Option<(HwParams, u32)>, FsError> {
     if b.len() != HW_BYTES {
         return Err(FsError::InvalidData);
@@ -93,8 +98,11 @@ pub(super) fn refine(
     for (i, r) in ranges.iter_mut().enumerate() {
         *r = Range::read(b, i)?;
     }
+    // Linux snd_pcm_hw_constraints_complete: the non-interleaved access
+    // types only for a device with SNDRV_PCM_INFO_NONINTERLEAVED.
     let access = [0, 3, 4]
         .into_iter()
+        .filter(|v| noninterleaved || *v != ACCESS_RW_NONINTERLEAVED)
         .filter(|v| mask_has(b, 0, *v))
         .collect::<Vec<_>>();
     if access.is_empty() || !mask_has(b, 2, 0) || !ranges[11].contains(0) {
@@ -212,7 +220,12 @@ pub(super) fn refine(
     }
     put32(b, 512, 0);
     put32(b, 516, get32(&old, 516) | changed);
-    put32(b, 520, INFO | if caps.batch { INFO_BATCH } else { 0 });
+    let info = if noninterleaved {
+        INFO
+    } else {
+        INFO & !INFO_NONINTERLEAVED
+    };
+    put32(b, 520, info | if caps.batch { INFO_BATCH } else { 0 });
     put32(
         b,
         524,

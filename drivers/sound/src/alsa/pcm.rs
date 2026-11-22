@@ -1044,7 +1044,8 @@ impl Pcm {
                     }
                     let caps = crate::pcm_device_capabilities(self.card, self.device, self.capture)
                         .map_err(sound_error)?;
-                    let refined = params::refine(&mut b, &caps, nr == 0x11);
+                    let noninterleaved = crate::pcm_noninterleaved(self.card);
+                    let refined = params::refine(&mut b, &caps, nr == 0x11, noninterleaved);
                     if nr == 0x11 {
                         r.stop()?;
                         r.state = OPEN;
