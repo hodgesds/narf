@@ -310,6 +310,10 @@ impl PcmDevice for Card {
     fn components(&self) -> Option<alloc::string::String> {
         self.0.components()
     }
+    fn noninterleaved(&self) -> bool {
+        // azx_pcm_hw: SNDRV_PCM_INFO_INTERLEAVED, never NONINTERLEAVED.
+        false
+    }
     fn pcm_name(&self, capture: bool, device: u32) -> Option<alloc::string::String> {
         // patch_hdmi: "HDMI %d" by PCM index.
         match self.0.pcm_slot(device).filter(|_| !capture)? {
