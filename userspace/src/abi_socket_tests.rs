@@ -12655,6 +12655,91 @@ kernel_test_in!(
     smoke_abi_socket_sockopt_mcast6_delivery_pos
 );
 
+/// The desktop's IPv6 state: a link-local address only, and a route to the
+/// world via the router's link-local address. Linux `ip6_datagram_connect`
+/// → `ip6_dst_lookup_flow` takes the route and `ipv6_dev_get_saddr` picks
+/// the link-local address (RFC 6724 rule 2 ranks scopes, it filters none),
+/// so connect succeeds; `inet6_getname` then reports
+/// `ipv6_iface_scope_id(addr, sk->sk_bound_dev_if)` — the socket's bound
+/// device, which a connect to a global address leaves 0. Chromium's
+/// `IsGloballyReachable` reads this source and treats link-local as "no
+/// IPv6". NARF reported the egress ifindex as sin6_scope_id.
+fn smoke_abi_socket_inet6_udp_link_local_source_scope_is_bound_dev() -> TestResult {
+    with_setup(|| {
+        fn discard(_: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+            Ok(())
+        }
+        const IFACE: &str = "abi-v6ll0";
+        const LL: [u8; 16] = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x55, 0x65, 0x7b, 0x7b, 0x9a, 0xbe, 0xb7, 0xb1,
+        ];
+        const ROUTER: [u8; 16] = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x84, 0x43, 0x42, 0xff, 0xfe, 0xa5, 0x25, 0x61,
+        ];
+        const PREFIX: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0x77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        const DST: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0x77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+        ];
+        narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0x6c, 1], discard);
+        narf_net::iface::set_link_state(IFACE, true);
+        narf_net::ipv6::addrs::add(narf_net::ipv6::addrs::Ipv6IfAddr {
+            iface: alloc::string::String::from(IFACE),
+            addr: LL,
+            prefix_len: 64,
+            state: narf_net::ipv6::addrs::AddrState::Preferred,
+            scope: narf_net::ipv6::addrs::AddrScope::LinkLocal,
+            preferred_deadline_ns: u64::MAX,
+            valid_deadline_ns: u64::MAX,
+            temporary: false,
+        });
+        narf_net::ipv6::route::add(narf_net::ipv6::route::Route {
+            prefix: PREFIX,
+            prefix_len: 48,
+            gateway: Some(ROUTER),
+            iface: alloc::string::String::from(IFACE),
+            metric: 1024,
+            valid_deadline_ns: 0,
+        });
+        let result = (|| {
+            let u = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+            let peer = sockaddr_in6(DST, 443, 0);
+            if call(
+                Syscall::SocketConnect.raw(),
+                a2(u, peer.as_ptr() as u64, peer.len() as u64),
+            ) != Some(0)
+            {
+                return Err("connect to a global address via a link-local router failed");
+            }
+            let mut out = [0u8; 28];
+            let mut outlen = (out.len() as u32).to_ne_bytes();
+            if call(
+                Syscall::SocketGetSockName.raw(),
+                a2(u, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("getsockname failed");
+            }
+            if out[8..24] != LL {
+                return Err("the connected source is not the link-local address");
+            }
+            if u32::from_ne_bytes([out[24], out[25], out[26], out[27]]) != 0 {
+                return Err("sin6_scope_id is not sk_bound_dev_if (0) for an unbound socket");
+            }
+            sockopt_close(&[u]);
+            Ok(())
+        })();
+        narf_net::ipv6::route::remove(&PREFIX, 48, IFACE);
+        narf_net::ipv6::addrs::remove(IFACE, &LL);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/inet6-llsrc",
+    smoke_abi_socket_inet6_udp_link_local_source_scope_is_bound_dev
+);
+
 /// systemd-resolved's `link_address_update_rtnl` reads IFA_FLAGS from every
 /// RTM_NEWADDR and fails the whole manager with ENODATA when it is absent
 /// ("Could not create manager: No data available"). Linux always emits it

@@ -2991,7 +2991,8 @@ fn smoke_udp_bound_device_routes_and_resolves_on_that_device() -> TestResult {
             protocol: route::RTPROT_KERNEL,
         });
     }
-    let is_arp = |f: &Vec<u8>| f.len() >= ETH_HDR_LEN + 28 && f[12..14] == ETHERTYPE_ARP.to_be_bytes();
+    let is_arp =
+        |f: &Vec<u8>| f.len() >= ETH_HDR_LEN + 28 && f[12..14] == ETHERTYPE_ARP.to_be_bytes();
     let is_udp = |f: &Vec<u8>| {
         f.len() >= ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
             && f[12..14] == ETHERTYPE_IPV4.to_be_bytes()
