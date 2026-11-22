@@ -1852,3 +1852,76 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_exec_without_gnu_stack_reads_implies_exec
 );
+
+// ── /proc/<pid>/io for i386 calls ────────────────────────────────────
+
+/// An i386 read or write is a `vfs_read`/`vfs_write` like a native one, so
+/// it moves `/proc/<pid>/io` the same way (`fs/read_write.c`: `add_rchar` /
+/// `add_wchar` for the bytes, `inc_syscr` / `inc_syscw` per call): `write`
+/// (4), `writev` (146), `read` (3) and `readv` (145) on a pipe here. The
+/// accounting wraps the native handler in a context of its own, and that
+/// context has to keep presenting the i386 call — the `compat_iovec`s
+/// `readv`/`writev` read are the proof.
+fn smoke_compat32_table_io_counts_in_proc_pid_io() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["ioacct"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            crate::handlers::__test_io_accounting_reset();
+            let task = crate::handlers::current_task_id();
+            let base = u64::from(STATIC_DATA_VA);
+            put_user(base, b"hello")?;
+            if call32(42, [base + 0x100, 0, 0, 0, 0, 0]) != 0 {
+                return Err("i386 pipe(int[2]) failed");
+            }
+            let rfd = u64::from(get_u32(base + 0x100)?);
+            let wfd = u64::from(get_u32(base + 0x104)?);
+            if call32(4, [wfd, base, 5, 0, 0, 0]) != 5 {
+                return Err("i386 write to the pipe failed");
+            }
+            let mut iov = Vec::new();
+            for word in [base as u32, 2, base as u32 + 2, 3] {
+                iov.extend_from_slice(&word.to_le_bytes());
+            }
+            put_user(base + 0x300, &iov)?;
+            if call32(146, [wfd, base + 0x300, 2, 0, 0, 0]) != 5 {
+                return Err("i386 writev under the accounting did not read compat_iovecs");
+            }
+            if call32(3, [rfd, base + 0x200, 5, 0, 0, 0]) != 5 {
+                return Err("i386 read from the pipe failed");
+            }
+            let mut iov = Vec::new();
+            for word in [base as u32 + 0x500, 4, base as u32 + 0x504, 1] {
+                iov.extend_from_slice(&word.to_le_bytes());
+            }
+            put_user(base + 0x320, &iov)?;
+            if call32(145, [rfd, base + 0x320, 2, 0, 0, 0]) != 5
+                || get_user(base + 0x500, 5)? != b"hello"
+            {
+                return Err("i386 readv under the accounting did not fill compat_iovecs");
+            }
+            let io = crate::handlers::io_accounting_of(task);
+            crate::handlers::__test_io_accounting_reset();
+            let _ = call32(6, [rfd, 0, 0, 0, 0, 0]);
+            let _ = call32(6, [wfd, 0, 0, 0, 0, 0]);
+            if io.syscw != 2 || io.wchar != 10 {
+                return Err("i386 write/writev did not count in syscw/wchar");
+            }
+            if io.syscr != 2 || io.rchar != 10 {
+                return Err("i386 read/readv did not count in syscr/rchar");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_io_counts_in_proc_pid_io
+);

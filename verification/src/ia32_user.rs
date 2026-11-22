@@ -964,3 +964,207 @@ kernel_test_in!(
     "verification/ia32-fork",
     smoke_ia32_clone_settls_gives_the_child_its_own_gs_base
 );
+
+// ── i386 calls that park, and the signals that end a park ───────────
+
+/// An i386 `read` (3) on an empty pipe parks the task (RIP rewound onto
+/// `int 0x80` for re-execution) until a forked i386 child, after yielding a
+/// few times, writes four bytes; the re-issued read returns them. The read
+/// runs under the `/proc/<pid>/io` accounting context, which must hand the
+/// park the real register file and RIP.
+fn smoke_ia32_read_parks_on_an_empty_pipe_until_the_child_writes() -> TestResult {
+    let data = DATA_VADDR as u32;
+    let mut a = Asm(Vec::new());
+    a.op_imm(&[0xBF], data).op(&[0x8D, 0x5F, 0x04]); // edi = DATA; ebx = &fds
+    i386_call(&mut a, 42); //                           pipe
+    a.op(&[0x89, 0x07]);
+    i386_call(&mut a, 2); //                            fork
+    a.op(&[0x85, 0xC0]);
+    let parent = a.branch_fwd(JNE);
+    // Child: yield a few times so the parent is parked, then write.
+    a.op_imm(&[0xB9], 8); //                            ecx = 8
+    let again = a.here();
+    i386_call(&mut a, 158); //                          sched_yield
+    a.op(&[0x83, 0xE9, 0x01]).branch_back(JNE, again); // sub ecx, 1; jnz
+    a.op(&[0x8B, 0x5F, 0x08]) //                        ebx = fds[1]
+        .op_imm(&[0x8D, 0x8F], 0x180) //                ecx = DATA+0x180
+        .op_imm(&[0xBA], 4);
+    i386_call(&mut a, 4); //                            write
+    a.op_imm(&[0xB8], 252)
+        .op(&[0x31, 0xDB, 0xCD, 0x80, 0x0F, 0x0B]);
+    a.land(parent);
+    a.op(&[0x89, 0x47, 0x10]) //                        [edi+0x10] = pid
+        .op(&[0x8B, 0x5F, 0x04]) //                     ebx = fds[0]
+        .op(&[0x8D, 0x4F, 0x40]) //                     ecx = DATA+0x40
+        .op_imm(&[0xBA], 4);
+    i386_call(&mut a, 3); //                            read: parks
+    a.op(&[0x89, 0x47, 0x18])
+        .op(&[0x8B, 0x5F, 0x10]) //                     ebx = pid
+        .op(&[0x8D, 0x4F, 0x20]) //                     ecx = &status
+        .op(&[0x31, 0xD2]);
+    i386_call(&mut a, 7); //                            waitpid
+    a.op(&[0x89, 0x47, 0x1C]);
+    i386_exit(&mut a);
+    let payload = *b"ia32";
+    let mut programs = match build(&a.0, true, &[(0x180, payload.as_slice())]) {
+        Ok(p) => [p],
+        Err(why) => return TestResult::Fail(why),
+    };
+    if let Err(why) = run(&mut programs, false) {
+        return TestResult::Fail(why);
+    }
+    let p = &mut programs[0];
+    if let Err(why) = p.follow_data_page() {
+        return TestResult::Fail(why);
+    }
+    if p.u32_at(0) != 0 || p.u32_at(0x10) as i32 <= 0 {
+        return TestResult::Fail("i386 pipe or fork failed");
+    }
+    if p.u32_at(0x18) != 4 || p.bytes_at::<4>(0x40) != payload {
+        return TestResult::Fail("the parked i386 read did not return the child's bytes");
+    }
+    if p.u32_at(0x1C) != p.u32_at(0x10) || p.u32_at(0x20) != 0 {
+        return TestResult::Fail("i386 waitpid did not reap the writer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "verification/ia32-park",
+    smoke_ia32_read_parks_on_an_empty_pipe_until_the_child_writes
+);
+
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_RESTART: u64 = 0x1000_0000;
+const SIGUSR1: u32 = 10;
+
+/// A 64-bit task that installs a SIGUSR1 handler (native `rt_sigaction`,
+/// `sa_flags` = `flags`), opens a pipe and parks in an `int 0x80` read on
+/// it. The handler writes "sig!" into the pipe and counts itself at
+/// DATA+0x20; the read's rax lands at DATA+0x18. rbp holds DATA throughout
+/// (the i386 call uses ebx, ecx, edx). Returns the code and the
+/// `struct kernel_sigaction` to plant at INPUT.
+fn signalled_int80_reader(flags: u64) -> (Vec<u8>, [u8; 32]) {
+    let data = DATA_VADDR as u32;
+    let mut a = Asm(Vec::new());
+    a.op_imm(&[0xBD], data) //                          mov ebp, DATA
+        .op_imm(&[0xB8], 13) //                         rt_sigaction
+        .op_imm(&[0xBF], SIGUSR1)
+        .op_imm(&[0x48, 0x8D, 0xB5], INPUT as u32) //   lea rsi, [rbp+INPUT]
+        .op(&[0x31, 0xD2]) //                           oact = NULL
+        .op_imm(&[0x41, 0xBA], 8) //                    mov r10d, 8
+        .op(&[0x0F, 0x05, 0x89, 0x45, 0x00]) //         syscall; [rbp] = eax
+        .op_imm(&[0xB8], 293) //                        pipe2
+        .op(&[0x48, 0x8D, 0x7D, 0x10]) //               lea rdi, [rbp+0x10]
+        .op(&[0x31, 0xF6, 0x0F, 0x05, 0x89, 0x45, 0x08]) // flags 0; [rbp+8]
+        .op_imm(&[0xB8], 3) //                          i386 read
+        .op(&[0x8B, 0x5D, 0x10]) //                     ebx = fds[0]
+        .op(&[0x8D, 0x4D, 0x40]) //                     ecx = DATA+0x40
+        .op_imm(&[0xBA], 4)
+        .op(&[0xCD, 0x80]) //                           int 0x80: parks
+        .op(&[0x48, 0x89, 0x45, 0x18]) //               [rbp+0x18] = rax
+        .op_imm(&[0xB8], 60)
+        .op(&[0x31, 0xFF, 0x0F, 0x05, 0x0F, 0x0B]); //  exit(0)
+    let handler = a.here() as u64;
+    a.op_imm(&[0xBD], data)
+        .op_imm(&[0xB8], 1) //                          write
+        .op(&[0x8B, 0x7D, 0x14]) //                     edi = fds[1]
+        .op_imm(&[0x48, 0x8D, 0xB5], 0x180) //          lea rsi, [rbp+0x180]
+        .op_imm(&[0xBA], 4)
+        .op(&[0x0F, 0x05])
+        .op(&[0x83, 0x45, 0x20, 0x01, 0xC3]); //        add [rbp+0x20], 1; ret
+    let restorer = a.here() as u64;
+    a.op_imm(&[0xB8], 15).op(&[0x0F, 0x05, 0x0F, 0x0B]); // rt_sigreturn
+    let mut act = [0u8; 32];
+    act[0..8].copy_from_slice(&(CODE_VADDR + handler).to_le_bytes());
+    act[8..16].copy_from_slice(&(SA_RESTORER | flags).to_le_bytes());
+    act[16..24].copy_from_slice(&(CODE_VADDR + restorer).to_le_bytes());
+    (a.0, act)
+}
+
+/// A 64-bit task that yields long enough for the readers to park, then
+/// sends SIGUSR1 to the two pids planted at INPUT and INPUT+4.
+fn signaller() -> Vec<u8> {
+    let data = DATA_VADDR as u32;
+    let mut a = Asm(Vec::new());
+    a.op_imm(&[0xBD], data).op_imm(&[0x41, 0xBC], 64); // ebp = DATA; r12d = 64
+    let again = a.here();
+    a.op_imm(&[0xB8], 24).op(&[0x0F, 0x05]); //         sched_yield
+    a.op(&[0x41, 0x83, 0xEC, 0x01]).branch_back(JNE, again); // sub r12d, 1
+    for (pid_at, ret_at) in [(INPUT as u32, 0u8), (INPUT as u32 + 4, 4)] {
+        a.op_imm(&[0xB8], 62) //                        kill
+            .op_imm(&[0x8B, 0xBD], pid_at) //           edi = pid
+            .op_imm(&[0xBE], SIGUSR1)
+            .op(&[0x0F, 0x05, 0x89, 0x45, ret_at]);
+    }
+    a.op_imm(&[0xB8], 60)
+        .op(&[0x31, 0xFF, 0x0F, 0x05, 0x0F, 0x0B]);
+    a.0
+}
+
+/// A caught signal ends an `int 0x80` read parked on an empty pipe the way
+/// Linux's `handle_signal` ends `-ERESTARTSYS`: with SA_RESTART the read is
+/// re-issued after the handler (eax back to the i386 number, RIP on
+/// `int 0x80`) and returns the bytes the handler wrote; without it the read
+/// completes as -EINTR. 64-bit tasks make the i386 call, so the handler
+/// runs on the 64-bit frame its native `rt_sigaction` asked for, as on
+/// Linux (the frame follows the sigaction's ABI, not the interrupted call's).
+fn smoke_ia32_int80_read_interrupted_by_a_signal_restarts_or_is_eintr() -> TestResult {
+    let (restart_code, restart_act) = signalled_int80_reader(SA_RESTART);
+    let (eintr_code, eintr_act) = signalled_int80_reader(0);
+    let message = *b"sig!";
+    let built = (|| {
+        let restart = build(
+            &restart_code,
+            false,
+            &[(INPUT, restart_act.as_slice()), (0x180, message.as_slice())],
+        )?;
+        let eintr = build(
+            &eintr_code,
+            false,
+            &[(INPUT, eintr_act.as_slice()), (0x180, message.as_slice())],
+        )?;
+        let pid_of = |p: &Program| {
+            p.process
+                .as_ref()
+                .map(|process| process.pid.raw() as u32)
+                .ok_or("program already run")
+        };
+        let mut pids = [0u8; 8];
+        pids[0..4].copy_from_slice(&pid_of(&restart)?.to_le_bytes());
+        pids[4..8].copy_from_slice(&pid_of(&eintr)?.to_le_bytes());
+        let signaller = build(&signaller(), false, &[(INPUT, pids.as_slice())])?;
+        Ok::<_, &'static str>([restart, eintr, signaller])
+    })();
+    let mut programs = match built {
+        Ok(p) => p,
+        Err(why) => return TestResult::Fail(why),
+    };
+    if let Err(why) = run(&mut programs, false) {
+        return TestResult::Fail(why);
+    }
+    let [restart, eintr, sender] = &programs;
+    if sender.u32_at(0) != 0 || sender.u32_at(4) != 0 {
+        return TestResult::Fail("kill(SIGUSR1) to a reader failed");
+    }
+    for p in [restart, eintr] {
+        if p.u32_at(0) != 0 || p.u32_at(8) != 0 {
+            return TestResult::Fail("a reader's rt_sigaction or pipe2 failed");
+        }
+        if p.u32_at(0x20) != 1 {
+            return TestResult::Fail("the SIGUSR1 handler did not run exactly once");
+        }
+    }
+    if restart.u64_at(0x18) != 4 || restart.bytes_at::<4>(0x40) != message {
+        return TestResult::Fail("an SA_RESTART handler did not restart the i386 read");
+    }
+    if eintr.u64_at(0x18) != (-4i64) as u64 {
+        return TestResult::Fail(
+            "a handler without SA_RESTART did not end the i386 read with -EINTR",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "verification/ia32-park",
+    smoke_ia32_int80_read_interrupted_by_a_signal_restarts_or_is_eintr
+);
