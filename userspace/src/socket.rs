@@ -4460,6 +4460,31 @@ impl FileOps for SocketFile {
                     // is its ifindex 1.
                     ifreq[16..20].copy_from_slice(&(iface.ifindex as i32).to_ne_bytes());
                 }
+                SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR
+                    if self.net_ns_id() != 0
+                        && iface.ifindex == narf_net::iface::LOOPBACK_IFINDEX =>
+                {
+                    // The namespace's own `lo` (`loopback_net_init`): its
+                    // flags and MTU change in place. A loopback device has
+                    // no `ndo_set_mac_address` (-EOPNOTSUPP), and
+                    // `dev_validate_mtu` refuses only a negative MTU.
+                    let change = match cmd {
+                        SIOCSIFFLAGS => {
+                            const IFF_UP: i16 = 0x1;
+                            let flags = i16::from_ne_bytes(ifreq[16..18].try_into().unwrap());
+                            narf_net::iface::LoopbackChange::Link(flags & IFF_UP != 0)
+                        }
+                        SIOCSIFMTU => {
+                            let mtu = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
+                            let mtu = u32::try_from(mtu).map_err(|_| FsError::InvalidPath)?;
+                            narf_net::iface::LoopbackChange::Mtu(mtu)
+                        }
+                        _ => return Err(FsError::Unsupported),
+                    };
+                    narf_net::iface::change_namespace_loopback(self.net_ns_id(), change)
+                        .ok_or(FsError::NoDevice)?;
+                    return Ok(0);
+                }
                 SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR => {
                     let admin = match delegated {
                         Some(admin) => admin,

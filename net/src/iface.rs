@@ -1684,6 +1684,79 @@ pub fn namespace_loopback(net_ns_id: u64) -> Option<NamespaceLoopback> {
     })
 }
 
+/// One change to a non-initial namespace's `lo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopbackChange {
+    /// `dev_change_flags`: set or clear IFF_UP.
+    Link(bool),
+    /// `__inet_insert_ifa` of `(address, prefix length)`.
+    AddIpv4([u8; 4], u8),
+    /// `inet_del_ifa` of `(address, prefix length)`.
+    DelIpv4([u8; 4], u8),
+    /// `dev_set_mtu`.
+    Mtu(u32),
+}
+
+/// Apply `change` to `net_ns_id`'s own `lo`. `None` when the namespace has
+/// none (the initial namespace's `lo` changes through its `AdminHandle`);
+/// `Some(false)` when nothing changed, e.g. an address already present.
+pub fn change_namespace_loopback(net_ns_id: u64, change: LoopbackChange) -> Option<bool> {
+    let changed = {
+        let mut g = NAMESPACE_LOOPBACKS.lock();
+        let lo = g.get_mut(&net_ns_id)?;
+        match change {
+            LoopbackChange::Link(up) => {
+                let changed = lo.entry.link_up != up;
+                lo.entry.link_up = up;
+                if up {
+                    // `inetdev_event(NETDEV_UP)`: a loopback device gets
+                    // 127.0.0.1/8; `inet_insert_ifa` drops it when the same
+                    // address is already configured.
+                    lo.insert_ipv4([127, 0, 0, 1], 8);
+                }
+                changed
+            }
+            LoopbackChange::AddIpv4(addr, prefix_len) => lo.insert_ipv4(addr, prefix_len),
+            LoopbackChange::DelIpv4(addr, prefix_len) => {
+                let at = lo.ipv4.iter().position(|a| *a == (addr, prefix_len));
+                if let Some(at) = at {
+                    lo.ipv4.remove(at);
+                    lo.entry.ipv4 = lo.ipv4.first().map_or([0; 4], |(a, _)| *a);
+                }
+                at.is_some()
+            }
+            LoopbackChange::Mtu(mtu) => {
+                let changed = lo.entry.mtu != mtu;
+                lo.entry.mtu = mtu;
+                changed
+            }
+        }
+    };
+    if change == LoopbackChange::Link(false) {
+        // `addrconf_ifdown` without keep_addr_on_down drops every IPv6
+        // address of a device that goes down (IPv4 addresses stay).
+        for addr in crate::ipv6::addrs::list_iface_in(net_ns_id, "lo") {
+            crate::ipv6::addrs::remove_in(net_ns_id, "lo", &addr.addr);
+        }
+    }
+    Some(changed)
+}
+
+impl NamespaceLoopbackEntry {
+    /// `__inet_insert_ifa`: append unless the same address and prefix is
+    /// already there; the first address is the primary.
+    fn insert_ipv4(&mut self, addr: [u8; 4], prefix_len: u8) -> bool {
+        if self.ipv4.contains(&(addr, prefix_len)) {
+            return false;
+        }
+        self.ipv4.push((addr, prefix_len));
+        if self.entry.ipv4 == [0; 4] {
+            self.entry.ipv4 = addr;
+        }
+        true
+    }
+}
+
 fn namespace_loopback_snapshot(net_ns_id: u64) -> Option<NetIfaceSnapshot> {
     NAMESPACE_LOOPBACKS
         .lock()
@@ -2874,6 +2947,11 @@ pub fn get_addrs(iface_name: &str) -> alloc::vec::Vec<(crate::ipv4::Ipv4Addr, u8
 /// (`net/ipv4/af_inet.c:494`) and the loopback-delivery decision need.
 pub fn is_local_addr_in(net_ns_id: u64, ip: [u8; 4]) -> bool {
     if ip[0] == 127 {
+        return true;
+    }
+    if namespace_loopback(net_ns_id)
+        .is_some_and(|lo| lo.ipv4.iter().any(|(a, _)| *a == ip))
+    {
         return true;
     }
     snapshot_all_in(net_ns_id).iter().any(|i| {

@@ -584,6 +584,22 @@ counters; it returns `None` for the initial namespace. A frame sent on it is
 received on it, in that namespace only. Kernel IPv6 frames are dropped there
 until the IPv6 receive path takes its device rather than a name.
 
+`iface::change_namespace_loopback(ns, LoopbackChange) -> Option<bool>` is the
+only way to change a namespace's `lo`. `LoopbackChange` is one of `Link(up)`,
+`AddIpv4(addr, prefix)`, `DelIpv4(addr, prefix)` or `Mtu(mtu)`. It returns
+`None` when the namespace has no `lo` of its own and `Some(false)` when
+nothing changed. It applies the Linux side effects: bringing `lo` up adds
+127.0.0.1/8 unless that address is already there (`inetdev_event`
+NETDEV_UP), and it holds `::1/128` while it is up. Taking it down keeps its
+IPv4 addresses and drops its IPv6 ones (`addrconf_ifdown`).
+`RTM_NEWLINK`/`RTM_SETLINK`, `RTM_NEWADDR`/`RTM_DELADDR` and
+SIOCSIFFLAGS/SIOCSIFMTU on that namespace's `lo` call it, and require
+CAP_NET_ADMIN over the namespace. No delegated `AdminHandle` names it.
+Setting its hardware address is `-EOPNOTSUPP`.
+`netlink_route::iface_name_for_index_in(ns, ifindex)` and
+`ifindex_for_name_in(ns, name)` resolve rtnetlink device references within
+the sender's namespace (`__dev_get_by_index(net, ...)`).
+
 ### 3.5 Stack-daemon attach (Stage 4)
 
 - A userspace daemon presents a `Cap<Stack, Install>` token (minted
