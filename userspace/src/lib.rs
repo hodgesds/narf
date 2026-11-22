@@ -236,6 +236,9 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     // SysV attachments belong to the mm as well: Linux `exit_mmap` closes
     // whatever shm mappings are left when it is torn down.
     handlers::drop_address_space_shm(address_space_id);
+    // An IA-32 image's `start_brk` and exec personality are mm state too.
+    #[cfg(target_arch = "x86_64")]
+    compat32::mm::drop_mm(address_space_id);
 }
 
 /// Clone file/device VMA ownership while memory still holds the parent's fork
@@ -243,6 +246,10 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
 /// or its partially-built address space is dropped.
 pub fn fork_mapped_file_address_space(parent_id: u64, child_id: u64) {
     mapped_file::fork_address_space(parent_id, child_id);
+    // `dup_mm` copies `start_brk` with the rest of the mm; the child's heap
+    // must keep growing from where the parent's does.
+    #[cfg(target_arch = "x86_64")]
+    compat32::mm::fork(parent_id, child_id);
 }
 
 /// Filesystem truncation bridge installed during common boot init.

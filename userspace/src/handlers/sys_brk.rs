@@ -28,6 +28,20 @@ fn brk_core(as_ref: &AddressSpace, new_break: u64) -> u64 {
     )
 }
 
+/// `[start_brk, ceiling)` of `as_ref`'s heap. A 64-bit address space uses
+/// NARF's fixed brk arena; an IA-32 one (`AddressSpace::is_compat32_layout`)
+/// grows from the `mm->start_brk` the ELF32 loader recorded, just past the
+/// image's `.bss`, up to its compat mmap floor — every break below
+/// `TASK_SIZE_32`, as Linux's `load_elf_binary` places it.
+fn brk_arena(as_ref: &AddressSpace) -> (u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    if as_ref.is_compat32_layout() {
+        return crate::compat32::mm::brk_arena(as_ref);
+    }
+    let _ = as_ref;
+    (BRK_DEFAULT_BASE, BRK_ARENA_TOP)
+}
+
 fn brk_core_limited(
     as_ref: &AddressSpace,
     new_break: u64,
@@ -36,11 +50,12 @@ fn brk_core_limited(
     memlock_limit_bytes: u64,
     bypass_memlock_limit: bool,
 ) -> u64 {
+    let (arena_base, arena_top) = brk_arena(as_ref);
     let mut lazy_pages = alloc::vec::Vec::new();
     loop {
         match as_ref.update_brk_limited(
-            VirtAddr::new(BRK_DEFAULT_BASE),
-            BRK_ARENA_TOP,
+            VirtAddr::new(arena_base),
+            arena_top,
             new_break,
             lazy_pages,
             data_limit_bytes,
@@ -55,7 +70,7 @@ fn brk_core_limited(
                 // the exact delta; the next serialized attempt revalidates it.
                 let mut prepared = alloc::vec::Vec::new();
                 if prepared.try_reserve_exact(page_count).is_err() {
-                    return as_ref.brk_top().max(BRK_DEFAULT_BASE);
+                    return as_ref.brk_top().max(arena_base);
                 }
                 prepared.resize(page_count, narf_memory::PhysAddr::new(0));
                 lazy_pages = prepared;

@@ -14,8 +14,12 @@
 //! every other number to [`table::dispatch`], the i386 table proper.
 //!
 //! Ownership: the hook, [`user_rax`] and [`tls`] belong to the frame /
-//! TCB work; [`table`]'s contents belong to the IA-32 userspace work.
+//! TCB work; [`table`]'s contents belong to the IA-32 userspace work, as
+//! does [`mm`], the per-address-space state the ELF32 loader leaves for
+//! later syscalls (`fs/compat_binfmt_elf.c`: `start_brk`, the exec-time
+//! `READ_IMPLIES_EXEC`).
 
+pub mod mm;
 pub mod table;
 pub mod tls;
 

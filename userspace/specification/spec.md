@@ -2713,13 +2713,59 @@ the same `ExecImage`. Its kind is `ExecKind::Elf32Exec` / `Elf32Dyn`;
 it. x32 (ELFCLASS32 EM_X86_64) and every other 32-bit image is
 `ElfError::Not64Bit`; an ELF64 header naming EM_386 is `WrongMachine`. An
 ELF32 image's `PT_GNU_PROPERTY` is not decoded (Linux x86 parses no GNU
-properties). The loader refuses an ELF32 image (`Not64Bit`, ENOEXEC from
-execve) until the 32-bit address-space layout is installed.
+properties).
 
 ```rust
 pub enum ExecKind { Elf64Exec, Elf64Dyn, Elf32Exec, Elf32Dyn }
 impl ExecKind { pub const fn is_dyn(self) -> bool; pub const fn is_elf32(self) -> bool; }
 impl ExecImage { pub const fn is_compat32(&self) -> bool; }
+```
+
+**The 32-bit layout.** `load_elf_bytes_file` gives an ELF32 image an
+address space from `AddressSpace::new_for_user_compat32` (memory §3): every
+kernel-chosen address lies below `TASK_SIZE_32` = 0xFFFF_E000, laid out
+bottom-up from the compat mmap base `PAGE_ALIGN(TASK_SIZE_32 / 3)` plus a
+random floor (Linux `mmap_compat_legacy_base`). An image is loaded only into
+an address space of its own class (`load_elf_into_at_file` answers
+`WrongMachine` otherwise — Linux's `-ELIBBAD` for a mismatched interpreter).
+
+- ET_EXEC loads at its own vaddrs; a PIE at `ELF_ET_DYN_BASE` = 0x400000 plus
+  the user-image slot, rounded down to its `max_align`; an ET_DYN with no
+  PT_INTERP (`ld-linux.so.2` run as the program) at the mmap floor. A
+  segment outside the compat window is `ImageWindowOverflow`.
+- The interpreter must be ELF32 and takes the next span of the mmap cursor
+  (`load_elf_interp` through `get_unmapped_area`). The kernel applies no
+  relocation to an ELF32 interpreter (`Elf32_Rel` addends are in place).
+- The stack is the 8 MiB reservation ending at `COMPAT32_USER_STACK_TOP` =
+  `TASK_SIZE_32` (`COMPAT32_USER_STACK_BASE` below it), jittered like the
+  64-bit one. The startup block is `create_elf_tables` with `Elf32_Addr`
+  words: 4-byte argc/argv/envp, 8-byte `Elf32_auxv_t`, AT_PHENT 32, AT_PLATFORM
+  "i686", AT_EXECFN, `esp` 16-byte aligned. No vDSO is mapped and neither
+  AT_SYSINFO nor AT_SYSINFO_EHDR is emitted (Linux with `vdso32=0`); no TLS is
+  staged (`fs_base` None, FS/GS bases zero). `UserProcess::ia32` is set, so the
+  first entry is in compatibility mode (frame §3.1).
+- `compat32::mm` records, keyed by `AddressSpace::identity()`, the image's
+  `start_brk` (end of its highest PT_LOAD, page-aligned, or 0x400000 for a
+  loader run directly; randomized by the user-image slot) and whether it
+  wants `READ_IMPLIES_EXEC` (no PT_GNU_STACK). Fork copies the entry and the
+  address-space drop hook removes it. `brk(2)` on an IA-32 address space grows
+  from `start_brk` up to the mmap floor.
+- `MAP_FIXED`/`MREMAP_FIXED` in an IA-32 address space may name any address
+  from `COMPAT32_MMAP_MIN_ADDR` (64 KiB, Linux's default `mmap_min_addr`).
+
+```rust
+pub const process::COMPAT32_USER_STACK_TOP: u64;  // 0xFFFF_E000
+pub const process::COMPAT32_USER_STACK_BASE: u64;
+pub mod compat32::mm {
+    pub const ET_DYN_BASE: u64;                   // 0x400000
+    pub struct CompatMm { pub start_brk: u64, pub read_implies_exec: bool }
+    pub fn register(as_id: u64, mm: CompatMm);
+    pub fn lookup(as_id: u64) -> Option<CompatMm>;
+    pub fn fork(parent_id: u64, child_id: u64);
+    pub fn drop_mm(as_id: u64);
+    pub fn start_brk(image: &ExecImage, program_bias: u64) -> u64;
+    pub fn brk_arena(as_ref: &AddressSpace) -> (u64, u64);
+}
 ```
 
 ## 4. Invariants & safety properties

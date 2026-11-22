@@ -284,10 +284,13 @@ pub unsafe fn load_elf_into_at_file<S: crate::elf::ExecBytes + ?Sized>(
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
 ) -> Result<(u64, PageInPlan), LoadBytesError> {
     let image = crate::elf::parse_from(src)?;
-    // See `load_elf_bytes_file`: no address space is laid out for an i386
-    // image yet, so neither a program nor an interpreter may be ELF32.
-    if image.is_compat32() {
-        return Err(LoadBytesError::Elf(crate::ElfError::Not64Bit));
+    // An image goes only into an address space laid out for its class: an
+    // i386 object into a `TASK_SIZE_32` one, a 64-bit object into a native
+    // one. This is the interpreter's `elf_check_arch` in `load_elf_binary`
+    // (`-ELIBBAD` there): a 32-bit program naming a 64-bit `ld.so`, or the
+    // reverse, cannot run.
+    if image.is_compat32() != addr_space.is_compat32_layout() {
+        return Err(LoadBytesError::Elf(crate::ElfError::WrongMachine));
     }
     // SAFETY: forwarding this function's own contract.
     unsafe { load_image_into_at(&image, src, addr_space, vaddr_bias, file) }
@@ -720,21 +723,40 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
     src: &S,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
 ) -> Result<LoadedElf, LoadBytesError> {
+    // Parse first: the image's class decides which address-space layout it
+    // gets (`SET_PERSONALITY` runs before `setup_new_exec` lays the mm out).
+    // ET_EXEC names absolute load addresses in its PT_LOAD vaddrs (NARF's
+    // own statics link in PML4[1] — see `init.ld` / `hello_static_x86_64.S`;
+    // an i386 one at 0x08048000), so its bias is 0.
+    let image = crate::elf::parse_from(src)?;
     // SAFETY: `new_for_user` contract — caller is in kernel mode
     // with paging up.
     // SAFETY: Valid memory or trusted environment
-    let addr_space = unsafe { AddressSpace::new_for_user() }
+    let addr_space = unsafe { new_address_space_for(&image) }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
-    // Bias selection — see `program_load_bias`. ET_EXEC names absolute
-    // load addresses in its PT_LOAD vaddrs (NARF expects those in
-    // PML4[1] — see `init.ld` / `hello_static_x86_64.S`), so bias 0.
-    let image = crate::elf::parse_from(src)?;
-    // The parser accepts an i386 ELF32 image for the IA-32 compat ABI, but
-    // such an image can only be loaded into an address space laid out for a
-    // 32-bit task. Until that layout exists it stays ENOEXEC, as before.
+    // An IA-32 image is placed in its 32-bit window rather than a PML4 slot.
+    #[cfg(target_arch = "x86_64")]
     if image.is_compat32() {
-        return Err(LoadBytesError::Elf(crate::ElfError::Not64Bit));
+        let bias = compat32_program_load_bias(&image, &addr_space);
+        compat32_check_image_window(&image, &addr_space, bias)?;
+        // SAFETY: forwarding the caller's identity-map + allocator contract;
+        // the bias was chosen and checked against the compat window above.
+        let (entry, page_in_plan) =
+            unsafe { load_image_into_at(&image, src, &addr_space, bias, file) }?;
+        // SAFETY: AS constructed by `new_for_user_compat32`; regions just
+        // pushed by `load_image_into_at`.
+        unsafe { addr_space.materialize() }
+            .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+        let address_space = Arc::new(addr_space);
+        narf_memory::as_origin::note_arc(&address_space);
+        return Ok(LoadedElf {
+            address_space,
+            program_entry: EntryPoint(VirtAddr::new(entry)),
+            program_bias: bias,
+            image,
+            page_in_plan,
+        });
     }
     // An image is placed inside one PML4 slot. Check it fits before mapping
     // anything: VA that falls outside the slot is either another mapping's or,
@@ -893,6 +915,85 @@ pub fn program_load_bias(kind: crate::ExecKind, max_align: u64) -> u64 {
         }
         _ => 0,
     }
+}
+
+/// A fresh address space laid out for `image`'s class: the native layout, or
+/// on x86_64 the IA-32 one (`TASK_SIZE_32`) for an i386 ELF32 image.
+///
+/// # Safety
+/// Same contract as [`AddressSpace::new_for_user`].
+unsafe fn new_address_space_for(image: &ExecImage) -> Result<AddressSpace, AddressSpaceError> {
+    #[cfg(target_arch = "x86_64")]
+    if image.is_compat32() {
+        // SAFETY: forwarded caller contract.
+        return unsafe { AddressSpace::new_for_user_compat32() };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = image;
+    // SAFETY: forwarded caller contract.
+    unsafe { AddressSpace::new_for_user() }
+}
+
+/// The load bias of an IA-32 program image (`load_elf_binary` for Elf32):
+///
+///   * ET_EXEC: 0 — it names its own addresses (0x08048000 classically);
+///   * ET_DYN with PT_INTERP (a PIE): `ELF_ET_DYN_BASE`, 0x400000 for
+///     `mmap_is_ia32()`, plus `arch_mmap_rnd()`, rounded down to the image's
+///     largest PT_LOAD alignment;
+///   * ET_DYN without PT_INTERP (a loader such as `ld-linux.so.2` run as the
+///     program): "loaders are loaded into the independently randomized mmap
+///     region" — here the bottom of the compat mmap window, this address
+///     space's randomized floor, rounded up to the alignment.
+#[cfg(target_arch = "x86_64")]
+fn compat32_program_load_bias(image: &ExecImage, addr_space: &AddressSpace) -> u64 {
+    if !image.kind.is_dyn() {
+        return 0;
+    }
+    let align = image.max_align.max(4096);
+    if image.interp.is_some() {
+        let base = crate::compat32::mm::ET_DYN_BASE;
+        let slot = if crate::handlers::randomize_user_layout() {
+            narf_memory::kaslr::user_elf_slot(base)
+        } else {
+            base
+        };
+        slot & !(align - 1)
+    } else {
+        addr_space.mmap_floor().saturating_add(align - 1) & !(align - 1)
+    }
+}
+
+/// Every PT_LOAD of an IA-32 image, at `bias`, must lie in its 32-bit
+/// window: an ET_EXEC or a loader below `COMPAT32_MMAP_WINDOW_TOP` (under the
+/// stack reservation), a PIE below the compat mmap floor that the
+/// interpreter and every later mmap start from. An image that does not fit
+/// is refused before anything is mapped, as an ET_DYN that outgrows its PML4
+/// slot is.
+#[cfg(target_arch = "x86_64")]
+fn compat32_check_image_window(
+    image: &ExecImage,
+    addr_space: &AddressSpace,
+    bias: u64,
+) -> Result<(), LoadBytesError> {
+    let end = image
+        .segments
+        .iter()
+        .try_fold(0u64, |acc, seg| {
+            seg.vaddr
+                .checked_add(bias)
+                .and_then(|start| start.checked_add(seg.mem_size))
+                .map(|end| acc.max(end))
+        })
+        .ok_or(LoadBytesError::ImageWindowOverflow)?;
+    let limit = if image.kind.is_dyn() && image.interp.is_some() {
+        addr_space.mmap_floor()
+    } else {
+        AddressSpace::COMPAT32_MMAP_WINDOW_TOP
+    };
+    if end > limit {
+        return Err(LoadBytesError::ImageWindowOverflow);
+    }
+    Ok(())
 }
 
 // ── PT_DYNAMIC relocation processing ────────────────────────────────

@@ -375,7 +375,7 @@ fn mremap_core_limited(
             if source_perms.contains(RegionPerms::STACK_SEGMENT) {
                 return Err(EFAULT);
             }
-            if new_addr < AddressSpace::USER_FIXED_FLOOR {
+            if new_addr < super::handler_sys_mmap::user_fixed_floor(as_ref) {
                 return Err(EPERM);
             }
             if source_shared {
@@ -655,7 +655,7 @@ fn mremap_core_limited(
             };
             let alias_len = if old_len == 0 { new_len } else { old_len };
             let preferred = if mode == narf_memory::SharedMremapMode::DontUnmap
-                && new_addr >= AddressSpace::USER_FIXED_FLOOR
+                && new_addr >= super::handler_sys_mmap::user_fixed_floor(as_ref)
             {
                 Some(new_addr)
             } else {

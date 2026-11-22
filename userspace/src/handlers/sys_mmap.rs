@@ -21,6 +21,18 @@ fn try_raw_region_backing(
     Ok(backing)
 }
 
+/// The lowest address a user `MAP_FIXED` (or `MREMAP_FIXED`) may name in
+/// `as_ref`: `USER_FIXED_FLOOR` in a 64-bit layout, Linux's default
+/// `vm.mmap_min_addr` in an IA-32 one, whose program, heap, mmap window and
+/// stack all lie below 4 GiB.
+pub(crate) fn user_fixed_floor(as_ref: &AddressSpace) -> u64 {
+    if as_ref.is_compat32_layout() {
+        AddressSpace::COMPAT32_MMAP_MIN_ADDR
+    } else {
+        AddressSpace::USER_FIXED_FLOOR
+    }
+}
+
 fn finish_nonfixed_private_file_mapping(
     as_ref: &AddressSpace,
     receipt: narf_memory::MappingReceipt,
@@ -390,8 +402,9 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
         // security_mmap_addr -> cap_mmap_addr: below mmap_min_addr this needs
         // CAP_SYS_RAWIO, and the denial is EPERM. NARF's USER_FIXED_FLOOR is
-        // that policy boundary.
-        if hint < AddressSpace::USER_FIXED_FLOOR {
+        // that policy boundary for a 64-bit layout; an IA-32 address space
+        // lies wholly below it and uses Linux's default mmap_min_addr.
+        if hint < user_fixed_floor(&as_ref) {
             ctx.set_return(errno_ret(EPERM));
             return;
         }

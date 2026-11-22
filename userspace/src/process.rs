@@ -56,6 +56,16 @@ pub const DEFAULT_USER_STACK_TOP: u64 = 0x0000_7FFF_FFFE_0000;
 /// Stage-4 refinement will let the loader pick per-process.
 pub const DEFAULT_USER_STACK_BASE: u64 = DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_RESERVED;
 
+/// Exclusive top of an IA-32 task's stack region: `STACK_TOP` is
+/// `TASK_SIZE_LOW` = `IA32_PAGE_OFFSET` for a `TIF_ADDR32` task
+/// (`arch/x86/include/asm/page_64_types.h`), the end of its 32-bit
+/// address space.
+pub const COMPAT32_USER_STACK_TOP: u64 = narf_memory::AddressSpace::COMPAT32_TASK_SIZE;
+
+/// Base of an IA-32 task's stack region: the same RLIMIT_STACK reservation
+/// as the 64-bit one, under [`COMPAT32_USER_STACK_TOP`].
+pub const COMPAT32_USER_STACK_BASE: u64 = COMPAT32_USER_STACK_TOP - DEFAULT_USER_STACK_RESERVED;
+
 #[derive(Clone, Debug)]
 pub struct LoadedMapping {
     pub addr: u64,
@@ -294,6 +304,12 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         page_in_plan,
     } = unsafe { crate::loader::load_elf_bytes_file(src, file) }?;
 
+    // An i386 ELF32 image runs under the IA-32 compat ABI in a `TASK_SIZE_32`
+    // address space (`load_elf_binary` built for Elf32). Its layout choices
+    // differ below: interpreter, stack window, startup-stack word size, no
+    // 64-bit vDSO and no staged TLS.
+    let compat32 = image.is_compat32();
+
     // PT_INTERP follow-through: if the program names an interpreter
     // and we have its bytes registered, load it at a fixed bias and
     // hand the scheduler the interpreter's entry. The interpreter
@@ -306,7 +322,11 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // full of gadgets. The nominal base is a user-range address well
     // clear of the program window and the mmap arena.
     const INTERP_NOMINAL_BASE: u64 = 0x0000_4000_0000_0000;
-    let interp_bias: u64 = if crate::handlers::randomize_user_layout() {
+    // An IA-32 interpreter's base is chosen once its size is known (see
+    // `compat32_interp_bias`); 0 stands in until then.
+    let mut interp_bias: u64 = if compat32 {
+        0
+    } else if crate::handlers::randomize_user_layout() {
         narf_memory::kaslr::user_elf_slot(INTERP_NOMINAL_BASE)
     } else {
         INTERP_NOMINAL_BASE
@@ -469,10 +489,14 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             }
         };
         {
+            if compat32 {
+                interp_bias = compat32_interp_bias(interp_bytes, &address_space)?;
+            }
             let interp_entry =
                 // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
                 // interp_bias is a randomised user-range base well-separated from the
-                // program's load range, so appending the interp's segments here
+                // program's load range (for an IA-32 image, a span reserved from the
+                // compat mmap cursor), so appending the interp's segments here
                 // cannot collide with pages already mapped.
                 // SAFETY: Valid memory or trusted environment
                 unsafe { load_elf_into_at(interp_bytes, &address_space, interp_bias) }?;
@@ -499,7 +523,11 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
                     interp_file_identity,
                 )
             }));
-            if !interp_image.dynamic.is_empty() {
+            // No kernel relocation pass for an IA-32 interpreter: Linux never
+            // relocates any interpreter (`ld.so` relocates itself), and i386
+            // uses `Elf32_Rel` whose addends live in the slots, so a second
+            // pass would add the load bias twice.
+            if !compat32 && !interp_image.dynamic.is_empty() {
                 // SAFETY: the interp's segments were just mapped + materialized
                 // at interp_bias above, so its PT_DYNAMIC relocation sites are
                 // walkable; interp_bias is the matching load offset to apply.
@@ -547,10 +575,18 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // frames — which means the eagerly-committed window has to end at the
     // jittered top, not at the region end. Jittering after the fact put the
     // top in the lazy `phys 0` range and the writes silently found nothing.
-    let stack_top_v = if crate::handlers::randomize_user_layout() {
-        narf_memory::kaslr::user_stack_top(DEFAULT_USER_STACK_TOP)
+    //
+    // An IA-32 task's region is the same reservation ending at
+    // `TASK_SIZE_32` (`STACK_TOP` = `IA32_PAGE_OFFSET` under `TIF_ADDR32`).
+    let (stack_region_top, stack_region_base) = if compat32 {
+        (COMPAT32_USER_STACK_TOP, COMPAT32_USER_STACK_BASE)
     } else {
-        DEFAULT_USER_STACK_TOP
+        (DEFAULT_USER_STACK_TOP, DEFAULT_USER_STACK_BASE)
+    };
+    let stack_top_v = if crate::handlers::randomize_user_layout() {
+        narf_memory::kaslr::user_stack_top(stack_region_top)
+    } else {
+        stack_region_top
     };
     // Publish it for `/proc/<pid>/stat`'s startstack, which used to report
     // the fixed nominal top.
@@ -562,7 +598,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // uses. Clamped so a future widening of the jitter window can't eat into
     // the committed window.
     let lazy_high = core::cmp::min(
-        ((DEFAULT_USER_STACK_TOP - stack_top_v) >> 12) as usize,
+        ((stack_region_top - stack_top_v) >> 12) as usize,
         total_pages.saturating_sub(commit_pages),
     );
     let lazy_low = total_pages - commit_pages - lazy_high;
@@ -600,14 +636,14 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
 
     address_space
         .map_region(Region {
-            base: VirtAddr::new(DEFAULT_USER_STACK_BASE),
+            base: VirtAddr::new(stack_region_base),
             len: DEFAULT_USER_STACK_RESERVED,
             perms: stack_perms,
             phys: stack_phys_list.into(),
         })
         .map_err(|_| ProcessLoadError::StackMapFailed)?;
     loaded_mappings.push(LoadedMapping {
-        addr: DEFAULT_USER_STACK_BASE,
+        addr: stack_region_base,
         file_len: 0,
         len: DEFAULT_USER_STACK_RESERVED,
         pgoff: 0,
@@ -632,7 +668,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // with an existing region the grow fails and the user gets
     // a real SEGV — the explicit interval keeps the stack arena
     // distinct from heap / mmap.
-    let guard_base = DEFAULT_USER_STACK_BASE - 0x1000;
+    let guard_base = stack_region_base - 0x1000;
     address_space
         .map_region(Region {
             base: VirtAddr::new(guard_base),
@@ -647,7 +683,17 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // header address) is published below as AT_SYSINFO_EHDR. `None` when no
     // vDSO image is registered (build host lacked clang) — programs then
     // fall back to plain syscalls.
-    let vdso_base = crate::vdso::map_into(&address_space);
+    //
+    // Never for an IA-32 task: the vDSO is a 64-bit object at a 64-bit
+    // address, which an i386 libc would parse as an `Elf32_Ehdr`. Until a
+    // vDSO32 exists this is Linux with `vdso32=0`: `ARCH_DLINFO_IA32` emits
+    // neither AT_SYSINFO nor AT_SYSINFO_EHDR, and libc makes plain
+    // `int 0x80` syscalls.
+    let vdso_base = if compat32 {
+        None
+    } else {
+        crate::vdso::map_into(&address_space)
+    };
 
     // SAFETY: AS is from `load_elf_bytes` (hence `new_for_user`)
     // and stack region was just pushed.
@@ -657,7 +703,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // Extent of the stack below the (jittered) top — what
     // `init_sysv_stack` treats as the writable window
     // `[stack_top_v - stack_bytes, stack_top_v)`.
-    let stack_bytes = stack_top_v - DEFAULT_USER_STACK_BASE;
+    let stack_bytes = stack_top_v - stack_region_base;
 
     // AT_RANDOM: 16 bytes of CSPRNG-grade entropy living at the top
     // of the user stack. musl's __init_libc reads these for ASLR
@@ -690,35 +736,37 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // Only emitted when an interpreter was actually loaded — the
     // NARF-native (no-interpreter) path keeps the all-zero top-of-
     // stack contract that the smoke tests assert against. We determine
-    // this by checking if args/envp/auxv are completely empty.
-    let (stack_top_v, at_random_vaddr) =
-        if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
-            let entropy_va = stack_top_v - 16;
-            let mut key = [0u8; 16];
-            match narf_filesystem::csprng::try_fill(&mut key) {
-                Ok(()) => {
-                    let root = address_space.root;
-                    for (i, &byte) in key.iter().enumerate() {
-                        if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
-                            // SAFETY: stack region is mapped+materialised R+W
-                            // above; reached through the kernel direct map (this
-                            // runs with a user CR3 live, which no longer carries
-                            // the low identity map).
-                            unsafe {
-                                *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = byte;
-                            }
+    // this by checking if args/envp/auxv are completely empty. An IA-32
+    // image is never NARF-native: it always gets Linux's startup block.
+    let linux_startup =
+        compat32 || interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty();
+    let (stack_top_v, at_random_vaddr) = if linux_startup {
+        let entropy_va = stack_top_v - 16;
+        let mut key = [0u8; 16];
+        match narf_filesystem::csprng::try_fill(&mut key) {
+            Ok(()) => {
+                let root = address_space.root;
+                for (i, &byte) in key.iter().enumerate() {
+                    if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
+                        // SAFETY: stack region is mapped+materialised R+W
+                        // above; reached through the kernel direct map (this
+                        // runs with a user CR3 live, which no longer carries
+                        // the low identity map).
+                        unsafe {
+                            *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = byte;
                         }
                     }
-                    (entropy_va, Some(entropy_va))
                 }
-                // Pool unseeded (no hardware entropy source): omit
-                // AT_RANDOM rather than publish the zero buffer as
-                // canary material (#1026).
-                Err(_) => (stack_top_v, None),
+                (entropy_va, Some(entropy_va))
             }
-        } else {
-            (stack_top_v, None)
-        };
+            // Pool unseeded (no hardware entropy source): omit
+            // AT_RANDOM rather than publish the zero buffer as
+            // canary material (#1026).
+            Err(_) => (stack_top_v, None),
+        }
+    } else {
+        (stack_top_v, None)
+    };
 
     // Build the final aux vector: caller-supplied entries take
     // precedence; we append interp-related defaults (AT_ENTRY,
@@ -758,9 +806,23 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // `unwrap_or` gave when the buffer was too short.
     let mut ehdr = [0u8; 64];
     let _ = src.read_exact_at(0, &mut ehdr);
-    let e_phoff = u64::from_le_bytes(ehdr[0x20..0x28].try_into().unwrap_or([0; 8]));
-    let e_phentsize = u16::from_le_bytes(ehdr[0x36..0x38].try_into().unwrap_or([0; 2]));
-    let e_phnum = u16::from_le_bytes(ehdr[0x38..0x3a].try_into().unwrap_or([0; 2]));
+    // `Elf32_Ehdr` keeps `e_phoff` at 0x1C (4 bytes) and `e_phentsize` /
+    // `e_phnum` at 0x2A / 0x2C; AT_PHENT is then sizeof(Elf32_Phdr).
+    let (e_phoff, e_phentsize, e_phnum) = if compat32 {
+        (
+            u64::from(u32::from_le_bytes(
+                ehdr[0x1C..0x20].try_into().unwrap_or([0; 4]),
+            )),
+            u16::from_le_bytes(ehdr[0x2A..0x2C].try_into().unwrap_or([0; 2])),
+            u16::from_le_bytes(ehdr[0x2C..0x2E].try_into().unwrap_or([0; 2])),
+        )
+    } else {
+        (
+            u64::from_le_bytes(ehdr[0x20..0x28].try_into().unwrap_or([0; 8])),
+            u16::from_le_bytes(ehdr[0x36..0x38].try_into().unwrap_or([0; 2])),
+            u16::from_le_bytes(ehdr[0x38..0x3a].try_into().unwrap_or([0; 2])),
+        )
+    };
     let first_load = image.segments.first();
     // ET_DYN binaries' PT_PHDR / PT_LOAD vaddrs are 0-relative; bias
     // them by `program_bias` so AT_PHDR points at the actual runtime
@@ -783,7 +845,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // the only way a program learns Memory Tagging is available at all.
     let (hwcap, hwcap2) = crate::hwcap::hwcaps();
     let mut final_aux = aux.to_vec();
-    if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
+    if linux_startup {
         for default in [
             AuxEntry::Pagesz(4096),
             AuxEntry::Entry(program_entry.0.as_u64()),
@@ -846,8 +908,25 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     }
 
     // Lay out argc/argv/envp/auxv if anything was supplied; an
-    // entirely empty (no-args) process keeps the all-zero stack.
-    let rsp = if argv.is_empty() && envp.is_empty() && final_aux.is_empty() {
+    // entirely empty (no-args) process keeps the all-zero stack. An IA-32
+    // image gets the 32-bit block (`elf_addr_t` = `Elf32_Addr`) with its
+    // `AT_PLATFORM` string.
+    let rsp = if compat32 {
+        // SAFETY: same mapped + materialized stack window as below.
+        unsafe {
+            init_compat32_stack(
+                &address_space,
+                stack_top_v,
+                stack_bytes,
+                argv,
+                envp,
+                &final_aux,
+                execfn,
+                COMPAT32_PLATFORM,
+            )
+        }
+        .map_err(|_| ProcessLoadError::StackOverflow)?
+    } else if argv.is_empty() && envp.is_empty() && final_aux.is_empty() {
         stack_top_v
     } else {
         // SAFETY: the stack region [stack_top_v - stack_bytes .. stack_top_v]
@@ -880,7 +959,14 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // Synthesising an empty `TlsTemplate { mem_size = 0 }` makes
     // `stage_tls` allocate a 4-KiB region whose first qword holds
     // `*fs:[0] = fs_base`, satisfying the read.
-    let fs_base = {
+    //
+    // Not for an IA-32 task. `compat_start_thread` enters it with zero FS/GS
+    // bases and selectors; an i386 libc builds its own TLS and installs it
+    // with `set_thread_area` (GDT TLS slots, `%gs`). A kernel-staged 64-bit
+    // block would sit above 4 GiB, where a 32-bit task cannot address it.
+    let fs_base = if compat32 {
+        None
+    } else {
         // The synthetic-TLS path needs room for thread-local accesses on
         // whichever side of the thread pointer this arch's TLS variant puts
         // the block — `tls::stage_tls` places it and
@@ -917,6 +1003,20 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         Some(unsafe { crate::tls::stage_tls(&synthetic_image, src, &address_space) }?)
     };
 
+    // The IA-32 mm state later syscalls need: where `brk(2)` starts
+    // (`mm->start_brk`) and whether the image wants `READ_IMPLIES_EXEC`
+    // (`elf_read_implies_exec`: an IA-32 binary without PT_GNU_STACK).
+    #[cfg(target_arch = "x86_64")]
+    if compat32 {
+        crate::compat32::mm::register(
+            address_space.identity(),
+            crate::compat32::mm::CompatMm {
+                start_brk: crate::compat32::mm::start_brk(&image, program_bias),
+                read_implies_exec: image.stack_flags.is_none(),
+            },
+        );
+    }
+
     // `/proc/<pid>/auxv` and `/proc/<pid>/environ` describe the image that
     // has just been committed, not merely an execve request.  Publish only
     // after every fallible loader stage has completed, so a failed PT_TLS
@@ -948,8 +1048,10 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         loaded_mappings,
         program_bias,
         page_in_plan,
-        // A native ELF64 image; the ELF32 loader sets `ia32`.
-        ia32: false,
+        // An i386 ELF32 image is entered in compatibility mode, CS =
+        // `__USER32_CS` (Linux `start_thread_ia32`); a fresh image starts
+        // with no TLS descriptors and null FS/GS.
+        ia32: compat32,
         segs: UserSegments::default(),
     })
 }
@@ -1220,6 +1322,188 @@ pub unsafe fn init_sysv_stack(
     write_u64(wv + 8, 0)?; // AT_NULL val
 
     Ok(rsp_vaddr)
+}
+
+/// `COMPAT_ELF_PLATFORM` (`arch/x86/include/asm/elf.h`): the `AT_PLATFORM`
+/// string of an IA-32 task.
+const COMPAT32_PLATFORM: &str = "i686";
+
+/// `AT_PLATFORM` — address of the platform string on the startup stack.
+const AT_PLATFORM: u32 = 15;
+
+/// Where an IA-32 interpreter loads. `load_elf_interp` maps an ET_DYN
+/// interpreter with no address hint, so `get_unmapped_area` places it in the
+/// compat mmap region; bottom-up, that is the next free span at this address
+/// space's mmap cursor, which starts at its randomized floor and has already
+/// been moved past anything the program mapped there. Reserving the span
+/// from the cursor keeps later mmaps clear of it, as the mapping does on
+/// Linux. An ET_EXEC interpreter names its own addresses (bias 0).
+///
+/// The interpreter must be an IA-32 image (`elf_check_arch` on
+/// `interp_elf_ex`); a 64-bit one is refused here, before anything maps.
+fn compat32_interp_bias(
+    interp_bytes: &[u8],
+    address_space: &AddressSpace,
+) -> Result<u64, ProcessLoadError> {
+    let interp = crate::parse_elf(interp_bytes).map_err(LoadBytesError::Elf)?;
+    if !interp.is_compat32() {
+        return Err(ProcessLoadError::Load(LoadBytesError::Elf(
+            crate::ElfError::WrongMachine,
+        )));
+    }
+    if !interp.kind.is_dyn() {
+        return Ok(0);
+    }
+    let span = interp
+        .segments
+        .iter()
+        .map(|seg| seg.vaddr.saturating_add(seg.mem_size))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(0xFFF)
+        & !0xFFF;
+    let base = address_space.reserve_mmap_va_aligned(span, interp.max_align.max(4096));
+    if base == 0 {
+        return Err(ProcessLoadError::Load(LoadBytesError::ImageWindowOverflow));
+    }
+    Ok(base)
+}
+
+/// Initialise an IA-32 task's startup stack below `stack_top_vaddr`:
+/// `create_elf_tables` built for Elf32 (`compat_binfmt_elf.c`, where
+/// `elf_addr_t` is `Elf32_Addr`). From `esp` up: a 4-byte `argc`, 4-byte
+/// `argv[]` and `envp[]` pointers each NULL-terminated, then `Elf32_auxv_t`
+/// pairs (`aux`, `AT_EXECFN`, `AT_PLATFORM`, `AT_NULL`); the strings —
+/// argv, envp, the exec name, the platform — sit above at increasing
+/// addresses, as [`init_sysv_stack`] lays them. `esp` is 16-byte aligned
+/// (`STACK_ROUND`), which the i386 psABI requires at `_start`. Every
+/// auxv value must fit 32 bits; the loader only produces ones that do.
+///
+/// # Safety
+/// Same contract as [`init_sysv_stack`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn init_compat32_stack(
+    address_space: &AddressSpace,
+    stack_top_vaddr: u64,
+    stack_bytes: u64,
+    argv: &[&str],
+    envp: &[&str],
+    aux: &[AuxEntry],
+    execfn: Option<&str>,
+    platform: &str,
+) -> Result<u64, SysVStackError> {
+    let mut strings_bytes: u64 = 0;
+    for s in argv.iter().chain(envp.iter()) {
+        strings_bytes = strings_bytes.saturating_add(s.len() as u64 + 1);
+    }
+    if let Some(name) = execfn {
+        strings_bytes = strings_bytes.saturating_add(name.len() as u64 + 1);
+    }
+    strings_bytes = strings_bytes.saturating_add(platform.len() as u64 + 1);
+
+    // Elf32_auxv_t is 8 bytes: the caller's entries, AT_EXECFN when there is
+    // an exec name, AT_PLATFORM, and the AT_NULL terminator.
+    let aux_bytes = ((aux.len() as u64) + u64::from(execfn.is_some()) + 2) * 8;
+    let envp_bytes = ((envp.len() as u64) + 1) * 4;
+    let argv_bytes = ((argv.len() as u64) + 1) * 4;
+    let block = aux_bytes + envp_bytes + argv_bytes + 4;
+
+    // The strings end at the top; the pointer block ends below them, and its
+    // bottom (argc) is rounded down to 16 bytes.
+    let strings_start = stack_top_vaddr
+        .checked_sub(strings_bytes)
+        .ok_or(SysVStackError::Overflow)?;
+    let esp = (strings_start & !3)
+        .checked_sub(block)
+        .ok_or(SysVStackError::Overflow)?
+        & !0xF;
+    if stack_top_vaddr - esp > stack_bytes {
+        return Err(SysVStackError::Overflow);
+    }
+
+    let root = address_space.root;
+    let write_u8 = |vaddr: u64, byte: u8| -> Result<(), SysVStackError> {
+        let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
+        // SAFETY: `phys` is a materialized stack-page byte returned by
+        // `resolve_user_phys_byte`, reached through the kernel direct map.
+        unsafe {
+            *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = byte;
+        }
+        Ok(())
+    };
+    // Every 32-bit slot is 4-aligned (esp is 16-aligned and each slot is a
+    // multiple of 4 above it), so a slot never straddles a page.
+    let write_u32 = |vaddr: u64, val: u32| -> Result<(), SysVStackError> {
+        let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
+        // SAFETY: `phys` is a materialized stack-page address for a 4-aligned
+        // user vaddr, so the u32 store stays inside the resolved page.
+        unsafe {
+            *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u32>() = val;
+        }
+        Ok(())
+    };
+    let write_str = |at: u64, s: &str| -> Result<u64, SysVStackError> {
+        for (i, &b) in s.as_bytes().iter().enumerate() {
+            write_u8(at + i as u64, b)?;
+        }
+        write_u8(at + s.len() as u64, 0)?;
+        Ok(at + s.len() as u64 + 1)
+    };
+
+    let mut cursor = strings_start;
+    let mut argv_ptrs = alloc::vec::Vec::with_capacity(argv.len());
+    for &s in argv {
+        argv_ptrs.push(cursor);
+        cursor = write_str(cursor, s)?;
+    }
+    let mut envp_ptrs = alloc::vec::Vec::with_capacity(envp.len());
+    for &s in envp {
+        envp_ptrs.push(cursor);
+        cursor = write_str(cursor, s)?;
+    }
+    let execfn_ptr = match execfn {
+        Some(name) => {
+            let at = cursor;
+            cursor = write_str(cursor, name)?;
+            Some(at)
+        }
+        None => None,
+    };
+    let platform_ptr = cursor;
+    let _ = write_str(cursor, platform)?;
+
+    let mut wv = esp;
+    write_u32(wv, argv.len() as u32)?;
+    wv += 4;
+    for &p in &argv_ptrs {
+        write_u32(wv, p as u32)?;
+        wv += 4;
+    }
+    write_u32(wv, 0)?;
+    wv += 4;
+    for &p in &envp_ptrs {
+        write_u32(wv, p as u32)?;
+        wv += 4;
+    }
+    write_u32(wv, 0)?;
+    wv += 4;
+    for e in aux {
+        let (key, val) = aux_pair(e);
+        write_u32(wv, key)?;
+        write_u32(wv + 4, val as u32)?;
+        wv += 8;
+    }
+    if let Some(at) = execfn_ptr {
+        write_u32(wv, AuxEntry::ExecFn(0).tag())?;
+        write_u32(wv + 4, at as u32)?;
+        wv += 8;
+    }
+    write_u32(wv, AT_PLATFORM)?;
+    write_u32(wv + 4, platform_ptr as u32)?;
+    wv += 8;
+    write_u32(wv, 0)?; // AT_NULL key
+    write_u32(wv + 4, 0)?; // AT_NULL val
+    Ok(esp)
 }
 
 fn aux_pair(e: &AuxEntry) -> (u32, u64) {
