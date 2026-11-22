@@ -2804,6 +2804,11 @@ enum BwrapBuild {
     /// bubblewrap 0.11.2 (Steam's srt-bwrap): binds by path, then reads
     /// `/oldroot/proc/self/fd/N` and `/proc/self/mountinfo` to remount.
     V0_11,
+    /// bubblewrap 0.13.1 with `--ro-bind / / --dev /dev`, the shape of
+    /// glycin's image-loader sandbox: the bound root made read-only, then a
+    /// fresh tmpfs on its /dev with device binds, links, its own `shm` and a
+    /// new devpts instance ([`bwrap_mount_dev`]).
+    V0_13Dev,
 }
 
 /// Fail a replay step: name it, and log what the syscall returned.
@@ -2986,7 +2991,9 @@ fn bwrap_replay(build: BwrapBuild, child: u64, proc_fd: u64) -> Result<(), &'sta
     const AT_EMPTY_PATH: u64 = 0x1000;
     const AT_RECURSIVE: u64 = 0x8000;
     const AT_EACCESS: u64 = 0x200;
+    const MOUNT_ATTR_RDONLY: u64 = 0x1;
     const MOUNT_ATTR_NOSUID: u64 = 0x2;
+    const MOUNT_ATTR_NODEV: u64 = 0x4;
     const EEXIST: i64 = -17;
     const EINVAL: i64 = -22;
     const ENOENT: i64 = -2;
@@ -3064,7 +3071,7 @@ fn bwrap_replay(build: BwrapBuild, child: u64, proc_fd: u64) -> Result<(), &'sta
     bwrap_zero("chdir(/)", Syscall::Chdir.raw(), a0(c"/".as_ptr() as u64))?;
 
     match build {
-        BwrapBuild::V0_13 => {
+        BwrapBuild::V0_13 | BwrapBuild::V0_13Dev => {
             // Its own /proc, bound from the old root's.
             bwrap_zero(
                 "mkdir(proc)",
@@ -3154,7 +3161,14 @@ fn bwrap_replay(build: BwrapBuild, child: u64, proc_fd: u64) -> Result<(), &'sta
                     0,
                 ),
             )?;
-            let attr = [MOUNT_ATTR_NOSUID, 0u64, 0, 0];
+            // `--dev-bind` only adds nosuid; `--ro-bind` makes the tree
+            // read-only and nodev as well.
+            let attr_set = if build == BwrapBuild::V0_13Dev {
+                MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV
+            } else {
+                MOUNT_ATTR_NOSUID
+            };
+            let attr = [attr_set, 0u64, 0, 0];
             bwrap_zero(
                 "mount_setattr(/newroot, AT_RECURSIVE, NOSUID)",
                 Syscall::MountSetattr.raw(),
@@ -3225,6 +3239,10 @@ fn bwrap_replay(build: BwrapBuild, child: u64, proc_fd: u64) -> Result<(), &'sta
         }
     }
 
+    if build == BwrapBuild::V0_13Dev {
+        bwrap_mount_dev()?;
+    }
+
     mount(
         "mount(oldroot, oldroot, MS_REC|MS_PRIVATE)",
         c"oldroot".as_ptr() as u64,
@@ -3288,7 +3306,278 @@ fn bwrap_replay(build: BwrapBuild, child: u64, proc_fd: u64) -> Result<(), &'sta
         got,
         got == Some(0),
     )?;
+    if build == BwrapBuild::V0_13Dev {
+        bwrap_check_dev()?;
+    }
     Ok(())
+}
+
+/// bubblewrap 0.13.1's `SETUP_MOUNT_DEV` for `--dev /dev`, as traced on the
+/// hardware: a tmpfs on the bound root's /dev, the six device nodes bound
+/// from the old root over files created in it, the stdio, `fd` and `core`
+/// links, then its own `shm` and `pts` directories, a new devpts instance
+/// on `pts`, and `ptmx -> pts/ptmx`.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_mount_dev() -> Result<(), &'static str> {
+    const O_RDONLY: u64 = 0;
+    const O_WRONLY: u64 = 0o1;
+    const O_CREAT: u64 = 0o100;
+    const O_EXCL: u64 = 0o200;
+    const O_NOCTTY: u64 = 0o400;
+    const O_DIRECTORY: u64 = 0o200_000;
+    const O_NOFOLLOW: u64 = 0o400_000;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const O_PATH: u64 = 0o10_000_000;
+    const MS_NOSUID: u64 = 0x2;
+    const MS_NODEV: u64 = 0x4;
+    const MS_NOEXEC: u64 = 0x8;
+    const MS_BIND: u64 = 0x1000;
+    const MS_REC: u64 = 0x4000;
+    const MS_SILENT: u64 = 0x8000;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_RECURSIVE: u64 = 0x8000;
+    const MOUNT_ATTR_NOSUID: u64 = 0x2;
+    const EEXIST: i64 = -17;
+    let close = |fd: u64| {
+        let _ = call(Syscall::Close.raw(), a0(fd));
+    };
+    let open_newroot = |step: &'static str| {
+        bwrap_fd(
+            step,
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                c"/newroot".as_ptr() as u64,
+                O_RDONLY | O_NOCTTY | O_CLOEXEC | O_PATH,
+                0,
+            ),
+        )
+    };
+
+    // `ensure_dir`: the bound root already has a /dev.
+    let newroot = open_newroot("openat(/newroot, O_PATH) for --dev")?;
+    let root_dir = bwrap_openat2(
+        "openat2(/newroot, /, RESOLVE_IN_ROOT) for --dev",
+        newroot,
+        c"/",
+        O_RDONLY | O_CLOEXEC | O_PATH | O_DIRECTORY,
+        RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+    )?;
+    close(newroot);
+    let got = call(
+        Syscall::Mkdirat.raw(),
+        a2(root_dir, c"dev".as_ptr() as u64, 0o755),
+    );
+    bwrap_step("mkdirat(newroot, dev)", got, got == Some(EEXIST))?;
+    let mountpoint = bwrap_fd(
+        "openat(newroot, dev, O_PATH|O_NOFOLLOW)",
+        Syscall::Openat.raw(),
+        a3(
+            root_dir,
+            c"dev".as_ptr() as u64,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_PATH,
+            0,
+        ),
+    )?;
+    close(root_dir);
+    let mountpoint_link = alloc::format!("/proc/self/fd/{mountpoint}\0");
+    bwrap_zero(
+        "mount(tmpfs, /proc/self/fd/<newroot/dev>, mode=0755)",
+        Syscall::Mount.raw(),
+        a4(
+            c"tmpfs".as_ptr() as u64,
+            mountpoint_link.as_ptr() as u64,
+            c"tmpfs".as_ptr() as u64,
+            MS_NOSUID | MS_NODEV,
+            c"mode=0755".as_ptr() as u64,
+        ),
+    )?;
+    close(mountpoint);
+
+    let newroot = open_newroot("openat(/newroot, O_PATH) for the new /dev")?;
+    let dev = bwrap_openat2(
+        "openat2(/newroot, /dev, RESOLVE_IN_ROOT)",
+        newroot,
+        c"/dev",
+        O_RDONLY | O_NOFOLLOW | O_PATH,
+        RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+    )?;
+    close(newroot);
+    for (node, source, bound) in [
+        (c"null", c"/dev/null", c"/newroot/dev/null"),
+        (c"zero", c"/dev/zero", c"/newroot/dev/zero"),
+        (c"full", c"/dev/full", c"/newroot/dev/full"),
+        (c"random", c"/dev/random", c"/newroot/dev/random"),
+        (c"urandom", c"/dev/urandom", c"/newroot/dev/urandom"),
+        (c"tty", c"/dev/tty", c"/newroot/dev/tty"),
+    ] {
+        let created = bwrap_fd(
+            "create_file(newroot/dev/<node>)",
+            Syscall::Openat.raw(),
+            a3(
+                dev,
+                node.as_ptr() as u64,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOCTTY | O_NOFOLLOW | O_CLOEXEC,
+                0o444,
+            ),
+        )?;
+        close(created);
+        let dest = bwrap_fd(
+            "openat(newroot/dev, <node>, O_PATH|O_NOFOLLOW)",
+            Syscall::Openat.raw(),
+            a3(
+                dev,
+                node.as_ptr() as u64,
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_PATH,
+                0,
+            ),
+        )?;
+        let old = bwrap_fd(
+            "openat(/oldroot, O_PATH) for a device",
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                c"/oldroot".as_ptr() as u64,
+                O_RDONLY | O_NOCTTY | O_CLOEXEC | O_PATH,
+                0,
+            ),
+        )?;
+        let src = bwrap_openat2(
+            "openat2(/oldroot, /dev/<node>, RESOLVE_IN_ROOT)",
+            old,
+            source,
+            O_RDONLY | O_PATH,
+            RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+        )?;
+        close(old);
+        let src_link = alloc::format!("/proc/self/fd/{src}\0");
+        let dest_link = alloc::format!("/proc/self/fd/{dest}\0");
+        bwrap_zero(
+            "mount(/proc/self/fd/<device>, /proc/self/fd/<dev node>, MS_BIND|MS_REC)",
+            Syscall::Mount.raw(),
+            a4(
+                src_link.as_ptr() as u64,
+                dest_link.as_ptr() as u64,
+                0,
+                MS_BIND | MS_REC | MS_SILENT,
+                0,
+            ),
+        )?;
+        close(src);
+        close(dest);
+        let attr_fd = bwrap_fd(
+            "openat(/newroot/dev/<node>, O_PATH) for mount_setattr",
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                bound.as_ptr() as u64,
+                O_RDONLY | O_CLOEXEC | O_PATH,
+                0,
+            ),
+        )?;
+        let attr = [MOUNT_ATTR_NOSUID, 0u64, 0, 0];
+        bwrap_zero(
+            "mount_setattr(/newroot/dev/<node>, AT_RECURSIVE, NOSUID)",
+            Syscall::MountSetattr.raw(),
+            SyscallArgs {
+                arg0: attr_fd,
+                arg1: c"".as_ptr() as u64,
+                arg2: AT_EMPTY_PATH | AT_RECURSIVE,
+                arg3: attr.as_ptr() as u64,
+                arg4: 32,
+                arg5: 0,
+            },
+        )?;
+        close(attr_fd);
+    }
+    for (target, name) in [
+        (c"/proc/self/fd/0", c"stdin"),
+        (c"/proc/self/fd/1", c"stdout"),
+        (c"/proc/self/fd/2", c"stderr"),
+        (c"/proc/self/fd", c"fd"),
+        (c"/proc/kcore", c"core"),
+    ] {
+        bwrap_zero(
+            "symlinkat(<target>, newroot/dev, <name>)",
+            Syscall::Symlinkat.raw(),
+            a2(target.as_ptr() as u64, dev, name.as_ptr() as u64),
+        )?;
+    }
+    // Its own shm and pts. The new tmpfs is empty whatever the bound root
+    // had mounted below its /dev: those mounts are covered.
+    bwrap_zero(
+        "mkdirat(newroot/dev, shm)",
+        Syscall::Mkdirat.raw(),
+        a2(dev, c"shm".as_ptr() as u64, 0o755),
+    )?;
+    bwrap_zero(
+        "mkdirat(newroot/dev, pts)",
+        Syscall::Mkdirat.raw(),
+        a2(dev, c"pts".as_ptr() as u64, 0o755),
+    )?;
+    let pts = bwrap_fd(
+        "openat(newroot/dev, pts, O_PATH|O_NOFOLLOW)",
+        Syscall::Openat.raw(),
+        a3(
+            dev,
+            c"pts".as_ptr() as u64,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_PATH,
+            0,
+        ),
+    )?;
+    let pts_link = alloc::format!("/proc/self/fd/{pts}\0");
+    bwrap_zero(
+        "mount(devpts, /proc/self/fd/<newroot/dev/pts>, newinstance)",
+        Syscall::Mount.raw(),
+        a4(
+            c"devpts".as_ptr() as u64,
+            pts_link.as_ptr() as u64,
+            c"devpts".as_ptr() as u64,
+            MS_NOSUID | MS_NOEXEC,
+            c"newinstance,ptmxmode=0666,mode=620".as_ptr() as u64,
+        ),
+    )?;
+    close(pts);
+    bwrap_zero(
+        "symlinkat(pts/ptmx, newroot/dev, ptmx)",
+        Syscall::Symlinkat.raw(),
+        a2(c"pts/ptmx".as_ptr() as u64, dev, c"ptmx".as_ptr() as u64),
+    )?;
+    close(dev);
+    Ok(())
+}
+
+/// What the sandbox sees of its `--dev /dev`: bubblewrap's own `shm` (not
+/// the host's, which the tmpfs covers), the bound device nodes, and the
+/// `ptmx` link into its devpts.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_check_dev() -> Result<(), &'static str> {
+    let mut sb = [0u8; STAT_SIZE];
+    let got = call_stat(c"/dev/shm".as_ptr() as u64, sb.as_mut_ptr() as u64);
+    bwrap_step(
+        "stat(/dev/shm) in the sandbox",
+        got,
+        got == Some(0) && stat_mode(&sb) & 0o170000 == 0o040000,
+    )?;
+    let got = bwrap_stat(c"/dev/shm/host-marker");
+    bwrap_step(
+        "stat(/dev/shm/host-marker) in the sandbox",
+        got,
+        got == Some(ENOENT),
+    )?;
+    let got = call_stat(c"/dev/null".as_ptr() as u64, sb.as_mut_ptr() as u64);
+    bwrap_step(
+        "stat(/dev/null) in the sandbox",
+        got,
+        got == Some(0) && stat_mode(&sb) & 0o170000 == 0o020000,
+    )?;
+    bwrap_readlink(
+        "readlink(/dev/ptmx) in the sandbox",
+        "/dev/ptmx",
+        "pts/ptmx",
+    )
 }
 
 /// Run [`bwrap_replay`] the way bubblewrap starts it: an unprivileged
@@ -3314,8 +3603,21 @@ fn with_bwrap_sandbox(build: BwrapBuild) -> TestResult {
         );
         let saved_fd_path = narf_filesystem::procfs::__test_fd_path_hook_snapshot();
         narf_filesystem::procfs::__test_fd_path_hook_restore(crate::handlers::fd_path_of as usize);
+        let mut host_shm = None;
         let result = (|| {
             install_test_address_space()?;
+            // The host's /dev/shm is a tmpfs of its own below /dev, so the
+            // bound copy of / brings a copy of it to /newroot/dev/shm.
+            if build == BwrapBuild::V0_13Dev {
+                let auth = narf_filesystem::bootstrap_mount_authority();
+                let shm =
+                    narf_filesystem::MemFs::with_seeds("bwrap-host-shm", &[("host-marker", b"x")]);
+                host_shm = Some(
+                    narf_filesystem::registry()
+                        .mount(&auth, "/dev/shm", shm)
+                        .map_err(|_| "could not mount the host's /dev/shm")?,
+                );
+            }
             narf_scheduler::__reset_queues_for_test();
             // The host root's /tmp and the caller's working directory.
             narf_filesystem::__test_ensure_mount_target("/tmp");
@@ -3340,6 +3642,9 @@ fn with_bwrap_sandbox(build: BwrapBuild) -> TestResult {
             release_clone_child(child);
             replay
         })();
+        if let Some(handle) = host_shm.take() {
+            let _ = narf_filesystem::registry().unmount(&handle, "/dev/shm");
+        }
         narf_filesystem::procfs::__test_fd_path_hook_restore(saved_fd_path);
         narf_filesystem::procfs::__test_pidns_hooks_restore(saved_pidns);
         result
@@ -3367,6 +3672,19 @@ fn smoke_abi_userns_bwrap_0_11_bind_root() -> TestResult {
 kernel_test_in!(
     "syscall_abi/userns-bwrap",
     smoke_abi_userns_bwrap_0_11_bind_root
+);
+
+/// `bwrap --unshare-user --ro-bind / / --dev /dev true` (bubblewrap 0.13.1),
+/// the /dev glycin's image loaders get. It failed "Can't create /dev/shm:
+/// File exists": the bound root's /dev/shm mount showed through the tmpfs.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_bwrap_0_13_dev_over_bound_root() -> TestResult {
+    with_bwrap_sandbox(BwrapBuild::V0_13Dev)
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-bwrap-dev",
+    smoke_abi_userns_bwrap_0_13_dev_over_bound_root
 );
 
 fn smoke_abi_caps_unshare_needs_sys_admin_except_newuser() -> TestResult {

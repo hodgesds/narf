@@ -2590,6 +2590,81 @@ kernel_test_in!(
     smoke_abi_fsx2_ms_move_carries_submounts
 );
 
+// ── a new mount covers what was mounted below its mountpoint ──────────
+//
+// A path walk crosses into the topmost mount at every component
+// (`__lookup_mnt` / `follow_mount`), so a filesystem mounted on a directory
+// hides every mount made below that directory before it: those hang off the
+// covered mount, which the walk no longer enters. bubblewrap's `--dev /dev`
+// over `--ro-bind / /` is this shape: its fresh tmpfs on /newroot/dev covers
+// the bound copies of /dev/shm and /dev/pts, and it then creates its own
+// `shm` and `pts` in the tmpfs. Unmounting the cover reveals the tree again.
+
+fn smoke_abi_fsx2_new_mount_covers_earlier_submounts() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_WRONLY: u64 = 0o1;
+        const O_CREAT: u64 = 0o100;
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-cover".as_ptr() as u64, 0o755);
+        if mount_fstype(b"/abi-cover\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-cover/dev".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-cover/dev\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-cover/dev/shm".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-cover/dev/shm\0", b"tmpfs\0") != Some(0)
+        {
+            return Err("the tmpfs tree under /abi-cover/dev was not mounted");
+        }
+        let marker = c"/abi-cover/dev/shm/marker";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, marker.as_ptr() as u64, O_WRONLY | O_CREAT, 0o644),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("could not create a file in /abi-cover/dev/shm"),
+        }
+        // The cover: a fresh tmpfs on /abi-cover/dev.
+        if mount_fstype(b"/abi-cover/dev\0", b"tmpfs\0") != Some(0) {
+            return Err("mounting a tmpfs over /abi-cover/dev failed");
+        }
+        let mut sb = [0u8; STAT_SIZE];
+        let stat = |path: &core::ffi::CStr, sb: &mut [u8; STAT_SIZE]| {
+            call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64)
+        };
+        if stat(c"/abi-cover/dev/shm", &mut sb) != Some(ENOENT) {
+            return Err("a mount made below the mountpoint earlier shows through the new mount");
+        }
+        if call_mkdir(c"/abi-cover/dev/shm".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir in the new mount found the covered mount (EEXIST)");
+        }
+        if stat(marker, &mut sb) != Some(ENOENT) {
+            return Err("the covered mount's files show through the new directory");
+        }
+        // A plain umount of the cover: its own `shm` is a directory, not a
+        // mount, so nothing pins it.
+        if call(
+            Syscall::Umount2.raw(),
+            a1(c"/abi-cover/dev".as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("umount2 of the covering tmpfs failed");
+        }
+        if stat(marker, &mut sb) != Some(0) {
+            return Err("unmounting the cover did not reveal the mounts below it");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mount-cover",
+    smoke_abi_fsx2_new_mount_covers_earlier_submounts
+);
+
 // ── mount: fstype breadth for systemd's early-boot pseudo-filesystems ──
 //
 // systemd mounts many pseudo-filesystems (proc, sysfs, tmpfs, securityfs,
