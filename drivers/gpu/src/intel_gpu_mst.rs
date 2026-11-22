@@ -1660,8 +1660,10 @@ pub mod tests {
     // ── The MMIO register model ─────────────────────────────
 
     const PWR_WELL_CTL2: u64 = 0x4_5404;
+    const PLL_ENABLE: u32 = 1 << 31;
     const PLL_POWER_STATE: u32 = 1 << 26;
     const PLL_LOCK: u32 = 1 << 30;
+    const PLL_POWER_ENABLE: u32 = 1 << 27;
 
     #[derive(Debug)]
     struct HubMmio {
@@ -1753,7 +1755,19 @@ pub mod tests {
                 return v | ((v & 0xAAAA_AAAA) >> 1);
             }
             if (0x4_6010..=0x4_6018).contains(&off) && (off - 0x4_6010) % 4 == 0 {
-                return v | PLL_POWER_STATE | PLL_LOCK;
+                // Same derived-bits shape as `SinkMmio`: LOCK
+                // follows ENABLE, POWER_STATE follows
+                // POWER_ENABLE. An unconditional OR can never
+                // clear, so a mid-training DPLL retune's
+                // wait-for-clear (#2358) would time out if
+                // this link ever falls back.
+                let lock = if v & PLL_ENABLE != 0 { PLL_LOCK } else { 0 };
+                let power = if v & PLL_POWER_ENABLE != 0 {
+                    PLL_POWER_STATE
+                } else {
+                    0
+                };
+                return (v & !(PLL_LOCK | PLL_POWER_STATE)) | lock | power;
             }
             // DBUF slices grant power when requested.
             {
