@@ -909,3 +909,398 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_execve_of_an_i386_image_is_not_enoexec
 );
+
+// ── The i386 syscall table ───────────────────────────────────────────
+
+/// The `int 0x80` gate's view of an i386 call, as `frame` builds it: six
+/// 32-bit registers zero-extended into `args()`, `in_ia32_syscall()` true.
+struct Ia32Ctx {
+    args: SyscallArgs,
+    ret: Option<SyscallReturn>,
+}
+
+impl TrapContext for Ia32Ctx {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, r: SyscallReturn) {
+        self.ret = Some(r);
+    }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
+    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        false
+    }
+    fn in_ia32_syscall(&self) -> bool {
+        true
+    }
+    fn in_compat_mode(&self) -> bool {
+        true
+    }
+}
+
+/// Issue i386 syscall `nr` through the i386 table with ebx..ebp = `regs`
+/// (each truncated to 32 bits, as the registers are) and return eax,
+/// sign-extended the way an i386 libc reads a negative errno.
+fn call32(nr: u32, regs: [u64; 6]) -> i64 {
+    let reg = |i: usize| u64::from(regs[i] as u32);
+    let mut ctx = Ia32Ctx {
+        args: SyscallArgs {
+            arg0: reg(0),
+            arg1: reg(1),
+            arg2: reg(2),
+            arg3: reg(3),
+            arg4: reg(4),
+            arg5: reg(5),
+        },
+        ret: None,
+    };
+    let _ = crate::compat32::table::dispatch(nr, &mut ctx);
+    match ctx.ret {
+        Some(r) => i64::from(r.value as u32 as i32),
+        None => i64::MIN,
+    }
+}
+
+/// Run `body` with `proc`'s address space live on this CPU, as it is for a
+/// syscall that task makes; the previous root comes back afterwards.
+fn with_live_as(
+    proc: &crate::UserProcess,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    // SAFETY: CPL0 read of CR3; the value is restored below.
+    let saved = unsafe { narf_arch::x86_64::cr::read_cr3() };
+    if proc.address_space.activate().is_err() {
+        return Err("activating the i386 address space failed");
+    }
+    let outcome = body();
+    // SAFETY: `saved` is the root this CPU ran on before `activate`.
+    unsafe { narf_arch::x86_64::cr::write_cr3(saved) };
+    outcome
+}
+
+/// Store `bytes` at user `va` of the live address space.
+fn put_user(va: u64, bytes: &[u8]) -> Result<(), &'static str> {
+    // SAFETY: the caller's address space is live (`with_live_as`) and `va`
+    // lies in its eagerly-backed data segment; the copy validates the range.
+    unsafe { crate::handlers::copy_to_user(va, bytes) }.map_err(|_| "user store failed")
+}
+
+/// Load `len` bytes from user `va` of the live address space.
+fn get_user(va: u64, len: usize) -> Result<Vec<u8>, &'static str> {
+    let mut out = alloc::vec![0u8; len];
+    // SAFETY: as `put_user`.
+    unsafe { crate::handlers::copy_from_user(&mut out, va) }.map_err(|_| "user load failed")?;
+    Ok(out)
+}
+
+fn get_u32(va: u64) -> Result<u32, &'static str> {
+    let b = get_user(va, 4)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// i386 calls with no structure to convert reach the native handler with
+/// the same answer: the identity family (`getpid` 20, `gettid` 224,
+/// `getppid` 64 and the `*32` uid/gid calls 199-202), `set_tid_address`
+/// (258), and `sys_ni_syscall`'s -ENOSYS for a number the table lacks.
+fn smoke_compat32_table_identity_calls_match_native() -> TestResult {
+    with_setup_strict(|| {
+        for (nr, native) in [
+            (20u32, Syscall::GetPid),
+            (224, Syscall::Gettid),
+            (64, Syscall::GetPpid),
+            (199, Syscall::GetUid),
+            (200, Syscall::GetGid),
+            (201, Syscall::Geteuid),
+            (202, Syscall::Getegid),
+        ] {
+            let want = call(native.raw(), a0(0)).ok_or("native identity call failed")?;
+            if call32(nr, [0; 6]) != want {
+                return Err("an i386 identity call does not match its native handler");
+            }
+        }
+        let tid = call(Syscall::Gettid.raw(), a0(0)).ok_or("native gettid failed")?;
+        if call32(258, [0; 6]) != tid {
+            return Err("i386 set_tid_address(NULL) must return the caller's tid");
+        }
+        // 17 is i386 `break`, `sys_ni_syscall` on every kernel.
+        for nr in [17u32, 0x7FFF] {
+            if call32(nr, [0; 6]) != ENOSYS {
+                return Err("an i386 number without an entry must be -ENOSYS");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_identity_calls_match_native
+);
+
+/// The i386 I/O calls through 32-bit pointers in an IA-32 address space:
+///
+///   * `pipe` (42), `write` (4), `read` (3), `close` (6) pass through;
+///   * `writev` (146) / `readv` (145) read 8-byte `struct compat_iovec`
+///     (`import_iovec` under `in_compat_syscall()`), not 16-byte iovecs;
+///   * `open` (5) and `openat` (295) with `AT_FDCWD`, which arrives as the
+///     32-bit register 0xFFFFFF9C and is an `int` (sign-extended by the
+///     `__ia32_sys_openat` wrapper);
+///   * `ioctl` (54): `compat_sys_ioctl` serves the commands whose argument
+///     is layout-compatible (FIONREAD, the termios family) through the
+///     native path, answers EBADF for a dead descriptor first, and ENOTTY
+///     for a command with no compat translation (DRM_IOCTL_VERSION here).
+fn smoke_compat32_table_io_takes_32bit_pointers_and_iovecs() -> TestResult {
+    const O_RDONLY: u64 = 0;
+    const FIONREAD: u64 = 0x541B;
+    const TCGETS: u64 = 0x5401;
+    const DRM_IOCTL_VERSION: u64 = 0xC040_6400;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["io"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-io", "compat32-io", &[("f", b"abc")], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            put_user(base, b"hello")?;
+            if call32(42, [base + 0x100, 0, 0, 0, 0, 0]) != 0 {
+                return Err("i386 pipe(int[2]) failed");
+            }
+            let rfd = u64::from(get_u32(base + 0x100)?);
+            let wfd = u64::from(get_u32(base + 0x104)?);
+            if call32(4, [wfd, base, 5, 0, 0, 0]) != 5 {
+                return Err("i386 write through a 32-bit pointer failed");
+            }
+            if call32(54, [rfd, FIONREAD, base + 0x180, 0, 0, 0]) != 0
+                || get_u32(base + 0x180)? != 5
+            {
+                return Err("i386 ioctl(FIONREAD) did not reach the pipe");
+            }
+            if call32(54, [rfd, TCGETS, base + 0x400, 0, 0, 0]) != ENOTTY {
+                return Err("i386 ioctl(TCGETS) on a pipe must be the tty layer's ENOTTY");
+            }
+            if call32(54, [rfd, DRM_IOCTL_VERSION, base + 0x400, 0, 0, 0]) != ENOTTY {
+                return Err("an ioctl with no compat translation must be ENOTTY");
+            }
+            if call32(54, [999, TCGETS, base + 0x400, 0, 0, 0]) != EBADF {
+                return Err("i386 ioctl on a dead fd must be EBADF");
+            }
+            if call32(3, [rfd, base + 0x200, 16, 0, 0, 0]) != 5
+                || get_user(base + 0x200, 5)? != b"hello"
+            {
+                return Err("i386 read through a 32-bit pointer failed");
+            }
+            // struct compat_iovec { compat_uptr_t iov_base; compat_size_t iov_len; }
+            let mut iov = Vec::new();
+            for word in [base as u32, 2, base as u32 + 2, 3] {
+                iov.extend_from_slice(&word.to_le_bytes());
+            }
+            put_user(base + 0x300, &iov)?;
+            if call32(146, [wfd, base + 0x300, 2, 0, 0, 0]) != 5 {
+                return Err("i386 writev did not read 8-byte compat_iovecs");
+            }
+            let mut iov = Vec::new();
+            for word in [base as u32 + 0x500, 5] {
+                iov.extend_from_slice(&word.to_le_bytes());
+            }
+            put_user(base + 0x320, &iov)?;
+            if call32(145, [rfd, base + 0x320, 1, 0, 0, 0]) != 5
+                || get_user(base + 0x500, 5)? != b"hello"
+            {
+                return Err("i386 readv did not fill a compat_iovec");
+            }
+            if call32(6, [rfd, 0, 0, 0, 0, 0]) != 0 || call32(6, [wfd, 0, 0, 0, 0, 0]) != 0 {
+                return Err("i386 close failed");
+            }
+            put_user(base + 0x600, b"/compat32-io/f\0")?;
+            for fd in [
+                call32(5, [base + 0x600, O_RDONLY, 0, 0, 0, 0]),
+                call32(295, [0xFFFF_FF9C, base + 0x600, O_RDONLY, 0, 0, 0]),
+            ] {
+                if fd < 0 {
+                    return Err("i386 open/openat(AT_FDCWD) of an existing file failed");
+                }
+                if call32(3, [fd as u64, base + 0x700, 8, 0, 0, 0]) != 3
+                    || get_user(base + 0x700, 3)? != b"abc"
+                {
+                    return Err("reading the opened file through the i386 table failed");
+                }
+                let _ = call32(6, [fd as u64, 0, 0, 0, 0, 0]);
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_io_takes_32bit_pointers_and_iovecs
+);
+
+/// The i386 memory calls keep an IA-32 task inside `TASK_SIZE_32`:
+///
+///   * `mmap2` (192) takes its offset in 4096-byte pages (`sys_mmap_pgoff`)
+///     and returns an address below 0xFFFFe000;
+///   * the old `mmap` (90) reads `struct mmap_arg_struct32` (six 32-bit
+///     words) and refuses an offset that is not page-aligned with EINVAL
+///     and an unreadable struct with EFAULT (`compat_sys_ia32_mmap`);
+///   * a `MAP_FIXED` range ending above `TASK_SIZE_32` is ENOMEM
+///     (`__get_unmapped_area`: `addr > TASK_SIZE - len`);
+///   * `munmap` (91), `mprotect` (125) and `brk` (45) pass through.
+fn smoke_compat32_table_memory_calls_stay_below_task_size_32() -> TestResult {
+    const PROT_R: u64 = 0x1;
+    const PROT_RW: u64 = 0x3;
+    const MAP_PRIVATE_ANON: u64 = 0x02 | 0x20;
+    const MAP_FIXED: u64 = 0x10;
+    const FD_NONE: u64 = 0xFFFF_FFFF;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["mem"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup_strict(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let in_window = |addr: i64, len: u64| {
+                addr >= 0 && (addr as u64) >= COMPAT_MMAP_BASE && addr as u64 + len <= TASK_SIZE_32
+            };
+            let anon = call32(192, [0, 0x2000, PROT_RW, MAP_PRIVATE_ANON, FD_NONE, 0]);
+            if !in_window(anon, 0x2000) {
+                return Err("i386 mmap2 must return an address inside the 32-bit window");
+            }
+            let base = u64::from(STATIC_DATA_VA);
+            // struct mmap_arg_struct32 { addr, len, prot, flags, fd, offset }
+            let mut arg = Vec::new();
+            for word in [
+                0u32,
+                0x1000,
+                PROT_RW as u32,
+                MAP_PRIVATE_ANON as u32,
+                u32::MAX,
+                0,
+            ] {
+                arg.extend_from_slice(&word.to_le_bytes());
+            }
+            put_user(base, &arg)?;
+            let old = call32(90, [base, 0, 0, 0, 0, 0]);
+            if !in_window(old, 0x1000) {
+                return Err("i386 old mmap(mmap_arg_struct32 *) failed or left the window");
+            }
+            put_user(base + 20, &0x800u32.to_le_bytes())?;
+            if call32(90, [base, 0, 0, 0, 0, 0]) != EINVAL {
+                return Err("old mmap with an unaligned offset must be EINVAL");
+            }
+            if call32(90, [0xFFFF_F000, 0, 0, 0, 0, 0]) != EFAULT {
+                return Err("old mmap with an unreadable struct must be EFAULT");
+            }
+            if call32(
+                192,
+                [
+                    TASK_SIZE_32 - 0x1000,
+                    0x2000,
+                    PROT_RW,
+                    MAP_PRIVATE_ANON | MAP_FIXED,
+                    FD_NONE,
+                    0,
+                ],
+            ) != ENOMEM
+            {
+                return Err("a MAP_FIXED range past TASK_SIZE_32 must be ENOMEM");
+            }
+            if call32(125, [anon as u64, 0x1000, PROT_R, 0, 0, 0]) != 0 {
+                return Err("i386 mprotect failed");
+            }
+            if call32(91, [anon as u64, 0x2000, 0, 0, 0, 0]) != 0
+                || call32(91, [old as u64, 0x1000, 0, 0, 0, 0]) != 0
+            {
+                return Err("i386 munmap failed");
+            }
+            let brk = call32(45, [0; 6]);
+            if brk <= 0 || brk as u64 >= COMPAT_MMAP_BASE {
+                return Err("i386 brk(0) must report the 32-bit program break");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_memory_calls_stay_below_task_size_32
+);
+
+/// Time and identity structures through the i386 table:
+///
+///   * `clock_gettime` (265) is `clock_gettime32`, writing an 8-byte
+///     `struct old_timespec32` and nothing past it;
+///     `clock_gettime64` (403) writes the 16-byte `__kernel_timespec`;
+///   * `uname` (122, `newuname`) reports `machine` "x86_64" to a compat task,
+///     and "i686" only once its personality is PER_LINUX32
+///     (`override_architecture`, `COMPAT_UTS_MACHINE`).
+fn smoke_compat32_table_time_and_uname_layouts() -> TestResult {
+    const CLOCK_MONOTONIC: u64 = 1;
+    const PER_LINUX32: u64 = 0x0008;
+    const UTS_FIELD: u64 = 65;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["time"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup_strict(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            put_user(base, &[0xAA; 32])?;
+            if call32(265, [CLOCK_MONOTONIC, base, 0, 0, 0, 0]) != 0 {
+                return Err("i386 clock_gettime (time32) failed");
+            }
+            let ts = get_user(base, 16)?;
+            let nsec = u32::from_le_bytes([ts[4], ts[5], ts[6], ts[7]]);
+            if nsec >= 1_000_000_000 || ts[8..16].iter().any(|&b| b != 0xAA) {
+                return Err("clock_gettime32 must write exactly an 8-byte old_timespec32");
+            }
+            put_user(base, &[0xAA; 32])?;
+            if call32(403, [CLOCK_MONOTONIC, base, 0, 0, 0, 0]) != 0 {
+                return Err("i386 clock_gettime64 failed");
+            }
+            let ts = get_user(base, 24)?;
+            let nsec = u64::from_le_bytes(ts[8..16].try_into().unwrap_or([0xFF; 8]));
+            if ts[4..8] != [0, 0, 0, 0] || nsec >= 1_000_000_000 || ts[16..24] != [0xAA; 8] {
+                return Err("clock_gettime64 must write a 16-byte __kernel_timespec");
+            }
+            let machine = |p: u64| get_user(p + 4 * UTS_FIELD, 7);
+            if call32(122, [base + 0x100, 0, 0, 0, 0, 0]) != 0 {
+                return Err("i386 uname failed");
+            }
+            if machine(base + 0x100)? != b"x86_64\0" {
+                return Err("a compat task without PER_LINUX32 must see machine x86_64");
+            }
+            if call32(136, [PER_LINUX32, 0, 0, 0, 0, 0]) < 0 {
+                return Err("i386 personality(PER_LINUX32) failed");
+            }
+            let uname = call32(122, [base + 0x100, 0, 0, 0, 0, 0]);
+            let _ = call32(136, [0, 0, 0, 0, 0, 0]);
+            if uname != 0 || machine(base + 0x100)?[..5] != *b"i686\0" {
+                return Err("PER_LINUX32 must report COMPAT_UTS_MACHINE \"i686\"");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_time_and_uname_layouts
+);
