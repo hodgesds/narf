@@ -69,11 +69,10 @@
 //! the bounded test entry; no production park is offered there.
 //!
 //! Task freezing: like the S3 core today, the phase progression
-//! marks `FreezingUserspace` / `ThawingUserspace` but no scheduler
-//! freezer exists yet to reuse; the executor's worker task is the
-//! only task that parks, and device quiesce is what makes the park
-//! safe. A real freezer is a scheduler-side follow-up for both
-//! sleep states, not something to fake here.
+//! marks `FreezingUserspace` / `ThawingUserspace` without calling
+//! [`crate::freezer::freeze_processes`]; the executor's worker task is
+//! the only task that parks, and device quiesce is what makes the park
+//! safe. Hibernation is the freezer's first caller.
 
 extern crate alloc;
 

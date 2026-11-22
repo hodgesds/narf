@@ -96,7 +96,7 @@ fn delta(after: CpuTimes, before: CpuTimes) -> CpuTimes {
     }
 }
 
-fn alloc_page() -> Result<narf_memory::PhysAddr, &'static str> {
+pub(crate) fn alloc_page() -> Result<narf_memory::PhysAddr, &'static str> {
     narf_memory::alloc_frame()
         .map(|frame| frame.start_address())
         .map_err(|_| "alloc frame")
@@ -154,12 +154,12 @@ fn build_process(code: &[u8]) -> Result<UserProcess, &'static str> {
 
 /// A fast periodic timer for the duration of a run, so the user loop is
 /// interrupted (and preempted) many times.
-struct FastTimer {
+pub(crate) struct FastTimer {
     irqs_were_enabled: bool,
 }
 
 impl FastTimer {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let irqs_were_enabled = narf_arch::interrupts_enabled();
         // SAFETY: the interrupt controller and timer are initialized before
         // kernel tests run, and no IRQ-unsafe lock is held here.
@@ -321,7 +321,7 @@ fn syscall_loop(iterations: u32) -> Vec<u8> {
 }
 
 #[cfg(target_arch = "aarch64")]
-mod a64 {
+pub(crate) mod a64 {
     use alloc::vec::Vec;
 
     pub fn movz(rd: u32, imm: u16, shift: u32) -> u32 {
@@ -358,7 +358,7 @@ mod a64 {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn emit_exit(code: &mut Vec<u32>) {
+pub(crate) fn emit_exit(code: &mut Vec<u32>) {
     a64::load_u64(code, 8, u64::from(Syscall::ExitTask.raw()));
     code.push(a64::movz(0, 0, 0));
     code.push(a64::SVC0);

@@ -2003,6 +2003,10 @@ pub(crate) fn own_stack_park_until(completed: impl Fn() -> bool) {
             Some(u) => u,
             None => break,
         };
+        // A `TASK_FREEZABLE` sleep: every park, a timer-tick yield included,
+        // is a freeze point. The wait's own state is untouched, so after
+        // the thaw the condition below is re-checked as after any wake.
+        refrigerator(uctx);
         // SAFETY: the in-flight task's poller-pinned UserTaskCtx; single-CPU
         // cooperative execution means no concurrent &mut to these fields.
         let uc = unsafe { &*uctx };
@@ -2071,6 +2075,61 @@ pub(crate) fn own_stack_park_until(completed: impl Fn() -> bool) {
         }
         // Resumed by the executor — loop and re-check the condition.
     }
+}
+
+/// `__refrigerator`: park the current own-stack task in place while the
+/// freezer runs. Only [`narf_power::freezer::thaw_processes`] ends it; any
+/// other wake finds the task still frozen. A no-op outside a freeze or
+/// outside a stackful task.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
+pub(crate) fn refrigerator(uctx: *mut UserTaskCtx) {
+    // Every park passes here: outside a freeze, one atomic load.
+    if !narf_power::freezer::freezing() {
+        return;
+    }
+    let task = crate::handlers::current_task_id();
+    loop {
+        let Some(waker) = narf_scheduler::stackful::current_stackful_waker() else {
+            return;
+        };
+        if !narf_power::freezer::try_to_freeze(task, &waker) {
+            return;
+        }
+        // SAFETY: CPL0 on this task's own kernel stack; `uctx` is its
+        // poller-pinned context, valid while the task lives.
+        unsafe {
+            (*uctx).park_site.store(
+                core::panic::Location::caller() as *const _ as usize,
+                Ordering::Relaxed,
+            );
+            (*uctx).parked_in_syscall.store(true, Ordering::Release);
+            narf_scheduler::stackful::yield_current_stackful();
+            (*uctx).parked_in_syscall.store(false, Ordering::Release);
+            (*uctx).park_site.store(0, Ordering::Relaxed);
+        }
+        // Resumed by kernel_switch: re-publish this task's ctx, as every
+        // own-stack resume must.
+        install_current(uctx);
+    }
+}
+
+/// The live user tasks, for the freezer: every registered task that has
+/// not exited.
+fn freezer_live_tasks() -> alloc::vec::Vec<u64> {
+    let mut live = crate::task::task_ids();
+    live.retain(|&tid| !crate::task::task_has_exited(tid));
+    live
+}
+
+/// Install the freezer's hooks (the live tasks, and `fake_signal_wake_up`,
+/// a non-delivering signal wake that sends a parked task round its park
+/// loop to the freeze point).
+fn install_freezer_hooks() {
+    narf_power::freezer::install(narf_power::freezer::Hooks {
+        live: freezer_live_tasks,
+        kick: crate::handlers::wake_signal,
+    });
 }
 
 /// Run `f` against a task's `UserTaskCtx`, resolved through the
@@ -2579,6 +2638,7 @@ pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
     install_execve_hook(user_task_execve_hook);
+    install_freezer_hooks();
     // CPU time needs no hook: the scheduler's `cputime` accounting follows
     // the trap boundary and every switch of the own-stack continuation.
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
@@ -2982,6 +3042,12 @@ impl core::future::Future for UserTaskFuture {
         // un-killable. We register the signal waker (consumed +
         // fired by `wake_signal`) and return Pending without a
         // wake_by_ref, so the task truly idles until woken.
+        // Freezer: no user code runs during a freeze. The thaw fires
+        // `cx.waker()`; under own-stack this is the first entry only, and
+        // the park loops' `refrigerator` holds the task after that.
+        if narf_power::freezer::try_to_freeze(crate::handlers::current_task_id(), cx.waker()) {
+            return core::task::Poll::Pending;
+        }
         if park_while_stopped(cx.waker()) {
             return core::task::Poll::Pending;
         }
@@ -4014,6 +4080,12 @@ impl core::future::Future for UserTaskFuture {
 
         // Job-control stop: keep a stopped task parked until SIGCONT
         // (or SIGKILL) — see the x86_64 sibling body for rationale.
+        // Freezer: no user code runs during a freeze. The thaw fires
+        // `cx.waker()`; under own-stack this is the first entry only, and
+        // the park loops' `refrigerator` holds the task after that.
+        if narf_power::freezer::try_to_freeze(crate::handlers::current_task_id(), cx.waker()) {
+            return core::task::Poll::Pending;
+        }
         if park_while_stopped(cx.waker()) {
             return core::task::Poll::Pending;
         }
@@ -4353,6 +4425,7 @@ pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
     install_execve_hook(user_task_execve_hook);
+    install_freezer_hooks();
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
     narf_scheduler::stackful::set_park_syscall_hook(crate::handlers::park_syscall_frame);
     narf_scheduler::stackful::enable_user_own_stack();

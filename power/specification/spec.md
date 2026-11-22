@@ -1403,6 +1403,44 @@ then), which is x86_64 only. Otherwise it is `Shutdown`.
 The wake from S4 is a cold boot. The image's restore belongs to the
 resume environment (`power/research/s4-hibernation-plan.md`, lane 8).
 
+#### 3.6.0b Task freezer
+
+```rust
+pub const FREEZE_TIMEOUT_MS: u64 = 20_000;                  // freeze_timeout_msecs
+pub struct Hooks { pub live: fn() -> Vec<u64>, pub kick: fn(u64) }
+pub enum FreezeError { InProgress, Timeout { refusing: Vec<u64> } }
+pub fn install(hooks: Hooks) -> Option<Hooks>;          // returns the replaced hooks
+pub fn freezing() -> bool;                                  // pm_freezing
+pub fn try_to_freeze(task: u64, waker: &Waker) -> bool;     // a freeze point
+pub fn frozen(task: u64) -> bool;
+pub async fn freeze_processes() -> Result<(), FreezeError>;
+pub async fn freeze_processes_within(timeout_ns: u64) -> Result<(), FreezeError>;
+pub fn thaw_processes();
+```
+
+`narf_power::freezer` holds the state; `narf-userspace` supplies the tasks.
+`install_user_task_hooks` installs the hooks:
+- `live`: the registered tasks that have not exited;
+- `kick`: a non-delivering signal wake (`fake_signal_wake_up`).
+
+The freeze points are a user task's first poll, before user mode, and the
+top of the own-stack park loop and `wait4`'s loop. Linux's freezable
+sleeps are the model. The timer tick yields a user-mode task while
+`freezing()` holds, even with nothing else runnable, so a busy task
+reaches the park within a tick.
+
+`freeze_processes` passes over the live tasks like `try_to_freeze_tasks`:
+it kicks each one that is not frozen, then sleeps 1 ms, doubling to 8 ms,
+until none remain. After the timeout it thaws everything and names the
+tasks that refused.
+
+Only `thaw_processes` ends a freeze. Any other wake, `SIGKILL` included,
+finds the task still frozen. An uninterruptible kernel wait (a
+synchronous filesystem read, a lock) is not a freeze point. The freezer
+waits for the task to leave it, so no frozen task holds a lock that device
+freezing or the image writer needs. S3 and s2idle do not freeze yet; the
+S4 coordinator is the first caller.
+
 #### 3.6.1 Power-off paths vs Linux
 
 Linux line numbers are against the reference tree at `~/git/linux`

@@ -30,6 +30,7 @@ pub mod cpu_idle;
 #[cfg(target_arch = "x86_64")]
 mod cpu_idle_tests;
 pub mod device_pm;
+pub mod freezer;
 pub mod laptop_state;
 pub mod lps0;
 pub mod monitor;
