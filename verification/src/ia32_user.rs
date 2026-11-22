@@ -705,3 +705,52 @@ kernel_test_in!(
     "verification/ia32-tls",
     smoke_ia32_tls_kept_per_task_across_switches
 );
+
+/// A TLS selector in SS must not take the kernel down when the task then
+/// empties that slot: the `int 0x80` return `iretq` reloads SS from the GDT,
+/// and a fault there would be at CPL 0. (Linux turns it into a SIGSEGV for
+/// the task through `fixup_bad_iret`; NARF hands the task `__USER_DS`.)
+/// The task loads SS = 0x63 over a flat slot-12 segment, empties slot 12
+/// with `set_thread_area`, and must come back to user mode and exit.
+fn smoke_ia32_emptied_ss_slot_does_not_fault_iret() -> TestResult {
+    let data = DATA_VADDR as u32;
+    let mut a = Asm(Vec::new());
+    a.op_imm(&[0xBF], data).op_imm(&[0xBB], data + INPUT as u32);
+    i386_set_thread_area(&mut a);
+    a.op(&[0x89, 0x07]) //                                 [edi] = ret
+        .op_imm(&[0xB8], 0x63)
+        .op(&[0x8E, 0xD0]) //                              mov ss, ax
+        .op_imm(&[0xBB], data + INPUT as u32 + 0x10);
+    i386_set_thread_area(&mut a); //                       empty slot 12
+    a.op(&[0x89, 0x47, 0x04]) //                           [edi+4] = ret
+        .op(&[0x31, 0xC0, 0x66, 0x8C, 0xD0]) //            mov ax, ss
+        .op(&[0x89, 0x47, 0x08]) //                        [edi+8]
+        .op_imm(&[0xC7, 0x47, 0x0C], 1); //                [edi+12] = 1: back in user
+    i386_exit(&mut a);
+    // Slot 12 first: flat (base 0, 4 GiB) writable data, usable as a stack.
+    let flat = user_desc(u32::MAX, 0, 0xF_FFFF, TLS_FLAGS);
+    let empty = user_desc(12, 0, 0, EMPTY_FLAGS);
+    let inputs = [(INPUT, flat.as_slice()), (INPUT + 0x10, empty.as_slice())];
+    let mut programs = match build(&a.0, true, &inputs) {
+        Ok(p) => [p],
+        Err(why) => return TestResult::Fail(why),
+    };
+    if let Err(why) = run(&mut programs, false) {
+        return TestResult::Fail(why);
+    }
+    let p = &programs[0];
+    if p.u32_at(0) != 0 || p.u32_at(4) != 0 {
+        return TestResult::Fail("set_thread_area failed");
+    }
+    if p.u32_at(12) != 1 {
+        return TestResult::Fail("the task did not return to user mode after emptying its SS slot");
+    }
+    if p.u32_at(8) != 0x2B {
+        return TestResult::Fail("the emptied SS selector was not replaced by __USER_DS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "verification/ia32-tls-ss",
+    smoke_ia32_emptied_ss_slot_does_not_fault_iret
+);
