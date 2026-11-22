@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! C21 ch1/20 IQK and separately qualified awake radio continuations.
 //! Linux rtw8821c.c/fw.c/mac.c/ps.c; the IQK envelope alone grants no packets.
+use super::chip_bridge::bridge;
 use super::{
     band5::Width,
     calibration8821c::Envelope,
@@ -9,6 +10,9 @@ use super::{
     mac, phy8821c,
 };
 use alloc::boxed::Box;
+use narf_drivers_wireless_rtl_chip::radio::c21;
+
+pub(super) use c21::rf18_for;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Info {
@@ -31,22 +35,7 @@ const TXAGC: [u16; 8] = [
 /// programs: band (2.4GHz 0, 5GHz bits 16|8), channel byte, RFSI (bit17 on
 /// 100..=140, bit18 above 140) and BW (20MHz bits 11:10 = 3, 40MHz bit11,
 /// 80MHz bit10). `channel` is the RF center; `bw_mhz` other than 40/80 is 20.
-pub(super) const fn rf18_for(channel: u8, bw_mhz: u8) -> u32 {
-    let band = if channel <= 14 { 0 } else { 1 << 16 | 1 << 8 };
-    let rfsi = if channel >= 100 && channel <= 140 {
-        1 << 17
-    } else if channel > 140 {
-        1 << 18
-    } else {
-        0
-    };
-    let bw = match bw_mhz {
-        40 => 1 << 11,
-        80 => 1 << 10,
-        _ => 3 << 10,
-    };
-    band | rfsi | bw | channel as u32
-}
+// `rf18_for` is re-exported from `radio::c21` at the top of the module.
 /// `channel` is the committed 20MHz primary whose RF18 the retune (or the
 /// channel-1 base program) left in place.
 pub(super) async fn operating_readback(
@@ -275,15 +264,9 @@ async fn channel(
 /// filters, swing and DFIR stay as programmed), so only `_rf` changes: RF
 /// LUTDBG/0x64, the RF18 channel byte and the XTALX2 bit19 toggle.
 pub(super) async fn retune_channel(io: &mut impl Io, ch: u8) -> Result<(), Error> {
-    if !(1..=13).contains(&ch) {
-        return Err(Error::Unsupported);
-    }
-    let rf18 = (rf_read(io, 0x18).await? & !0x70fff) | rf18_for(ch, 20);
-    rf(io, 0xdf, 1 << 6, 1).await?;
-    rf(io, 0x64, 15, 15).await?;
-    rf(io, 0x18, 0xfffff, rf18).await?;
-    rf(io, 0xb8, 1 << 19, 0).await?;
-    rf(io, 0xb8, 1 << 19, 1).await
+    let mut b = bridge(io);
+    let r = c21::retune_channel(&mut b, ch).await;
+    r.map_err(|e| b.err(e))
 }
 /// Retained C21 board facts a cross-band `rtw8821c_set_channel` needs:
 /// the 2.4GHz CCK TX filter words Linux reads into `hal->ch_param` at
@@ -602,29 +585,18 @@ pub(super) async fn verify_width40(io: &mut impl Io, center: u8, sc: u8) -> Resu
 /// `rtw8821c_set_tx_power_index_by_rate` for the retained CCK/OFDM words;
 /// HT/VHT words stay zero (no HT program on a noninitial channel).
 pub(super) async fn write_txagc(io: &mut impl Io, indices: [u8; 12]) -> Result<(), Error> {
-    for (slot, reg) in TXAGC.into_iter().enumerate() {
-        let value = if slot < 3 {
-            u32::from_le_bytes(
-                indices[slot * 4..slot * 4 + 4]
-                    .try_into()
-                    .map_err(|_| Error::State)?,
-            )
-        } else {
-            0
-        };
-        io.write32(reg, value).await?;
-    }
-    Ok(())
+    let mut b = bridge(io);
+    let r = c21::write_txagc(&mut b, indices).await;
+    r.map_err(|e| b.err(e))
 }
 pub(super) async fn verify_retune(
     io: &mut impl Io,
     ch: u8,
     indices: [u8; 12],
 ) -> Result<(), Error> {
-    if rf_read(io, 0x18).await? & 0x70fff != rf18_for(ch, 20) {
-        return Err(Error::Prerequisite);
-    }
-    verify_txagc(io, indices, 0x1f).await
+    let mut b = bridge(io);
+    let r = c21::verify_retune(&mut b, ch, indices).await;
+    r.map_err(|e| b.err(e))
 }
 /// TXAGC words of [`write_txagc`], REG_RRSR `rrsr` and the clean IQK
 /// report (0x1bf0).
@@ -633,24 +605,9 @@ pub(super) async fn verify_txagc(
     indices: [u8; 12],
     rrsr: u32,
 ) -> Result<(), Error> {
-    for (slot, reg) in TXAGC.into_iter().enumerate() {
-        let expected = if slot < 3 {
-            u32::from_le_bytes(
-                indices[slot * 4..slot * 4 + 4]
-                    .try_into()
-                    .map_err(|_| Error::State)?,
-            )
-        } else {
-            0
-        };
-        if read(io, reg).await? != expected {
-            return Err(Error::Prerequisite);
-        }
-    }
-    if read(io, 0x440).await? != rrsr || read(io, 0x1bf0).await? & 0x100ff != 0 {
-        return Err(Error::Prerequisite);
-    }
-    Ok(())
+    let mut b = bridge(io);
+    let r = c21::verify_txagc(&mut b, indices, rrsr).await;
+    r.map_err(|e| b.err(e))
 }
 async fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
     verify_geometry(io, swing, btg).await?;
