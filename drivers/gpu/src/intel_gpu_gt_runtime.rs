@@ -84,6 +84,7 @@ struct State {
     probe: Option<Arc<CompletionFence>>,
     recovery: recovery::Coordinator,
     phase: Phase,
+    firmware_frame: Option<(crate::intel_gpu_pipes::Pipe, u32, u64)>,
     saved: Option<narf_bus::pci::SavedPciConfig>,
     power_ready: u64,
     /// User epoch to continue after a runtime resume (clean idle stop only).
@@ -190,6 +191,14 @@ impl crate::intel_gpu_gt::media::gsc::owner::DsmPort for GscDsm<'_> {
 
 use crate::intel_gpu_gt::media::Retire as MediaRetire;
 
+#[derive(Clone, Copy)]
+enum DisplayOwner {
+    Standard,
+    LunarLake,
+    PantherLake,
+    Firmware(crate::intel_gpu::FirmwareRenderHandoff),
+}
+
 struct Pending {
     index: u32,
     card: Arc<IntelGpuCard>,
@@ -198,14 +207,21 @@ struct Pending {
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
     smallbar: bool,
-    /// Installed by the opted-in Lunar Lake display-20 route after its owned
-    /// modeset (`narf.intel.lnl_display=1`): the display-preserving profile.
-    lnl_display: bool,
-    /// Installed by the opted-in Panther Lake display-30 route after its
-    /// owned modeset (`narf.intel.ptl_display=1`): the display-preserving
-    /// profile.
-    ptl_display: bool,
+    display: DisplayOwner,
     window: AuthorizedWindow,
+}
+
+impl Pending {
+    fn allows_system_suspend(&self) -> bool {
+        !matches!(self.display, DisplayOwner::Firmware(_))
+            && system_suspend_admitted(
+                self.smallbar,
+                matches!(
+                    self.display,
+                    DisplayOwner::LunarLake | DisplayOwner::PantherLake
+                ),
+            )
+    }
 }
 
 /// The integrated Xe2/Xe3 GT profile of one function (§17 10.5).
@@ -1008,16 +1024,22 @@ impl crate::intel_gpu_user::UserBackend for Backend {
         Some(self.power_controls.clone())
     }
     fn native_xe(&self) -> bool {
-        true
+        // Fixed-mode KMS becomes usable at probe, before this GT has even
+        // observed its two firmware frames. Advertise Mesa submission on
+        // that route only after the live engine has passed the normal probes.
+        self.owner.upgrade().is_some_and(|owner| {
+            !matches!(owner.pending.display, DisplayOwner::Firmware(_))
+                || self.epoch.load(Ordering::Acquire) != 0
+        })
     }
     fn display_preserving(&self) -> bool {
         self.owner.upgrade().is_some_and(|owner| {
             lnl_profile(
                 self.platform,
-                owner.pending.lnl_display,
+                matches!(owner.pending.display, DisplayOwner::LunarLake),
                 owner.pending.mode.is_some(),
             ) == Some(LnlProfile::DisplayPreserving)
-                || (owner.pending.ptl_display
+                || (matches!(owner.pending.display, DisplayOwner::PantherLake)
                     && ptl_profile(self.platform, true, owner.pending.mode.is_some())
                         == Some(LnlProfile::DisplayPreserving))
         })
@@ -1445,8 +1467,17 @@ pub(crate) fn install(
     cap: Cap<BusDeviceCap, Write>,
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
+    firmware: Option<crate::intel_gpu::FirmwareRenderHandoff>,
 ) -> bool {
-    install_profile(index, card, device, cap, bar, mode, false, false)
+    install_profile(
+        index,
+        card,
+        device,
+        cap,
+        bar,
+        mode,
+        firmware.map_or(DisplayOwner::Standard, DisplayOwner::Firmware),
+    )
 }
 
 /// The Lunar Lake display-20 route's GT owner: the display-preserving
@@ -1465,7 +1496,7 @@ pub(crate) fn install_lnl_display(
     if profile != Some(LnlProfile::DisplayPreserving) {
         return false;
     }
-    install_profile(index, card, device, cap, bar, mode, true, false)
+    install_profile(index, card, device, cap, bar, mode, DisplayOwner::LunarLake)
 }
 
 /// The Panther Lake display-30 route's GT owner: the display-preserving
@@ -1484,7 +1515,15 @@ pub(crate) fn install_ptl_display(
     if profile != Some(LnlProfile::DisplayPreserving) {
         return false;
     }
-    install_profile(index, card, device, cap, bar, mode, false, true)
+    install_profile(
+        index,
+        card,
+        device,
+        cap,
+        bar,
+        mode,
+        DisplayOwner::PantherLake,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1495,8 +1534,7 @@ fn install_profile(
     cap: Cap<BusDeviceCap, Write>,
     bar: narf_bus::bar::MmioRegion,
     mode: Option<crate::intel_gpu_modeset::Mode>,
-    lnl_display: bool,
-    ptl_display: bool,
+    display: DisplayOwner,
 ) -> bool {
     if GtPlatform::from_pci(device.id.vendor, device.id.device)
         .and_then(GtPlatform::guc)
@@ -1527,8 +1565,7 @@ fn install_profile(
         bar,
         mode,
         smallbar,
-        lnl_display,
-        ptl_display,
+        display,
         window,
     });
     true
@@ -1608,6 +1645,7 @@ pub(crate) fn start_pending() {
                 probe: None,
                 recovery: recovery::Coordinator::new(reset_publication.clone()),
                 phase: Phase::Cold,
+                firmware_frame: None,
                 saved: None,
                 power_ready: 0,
                 parked_epoch: None,
@@ -1885,6 +1923,22 @@ impl Owner {
         let mut revision = validate_pci(p, &mmio)?;
         let platform = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
             .ok_or(RuntimeError::Device)?;
+        if let DisplayOwner::Firmware(handoff) = p.display {
+            match handoff.poll(&mmio, &mut state.firmware_frame, narf_time::monotonic_ns()) {
+                Some(core::task::Poll::Ready(())) => {}
+                Some(core::task::Poll::Pending) => {
+                    state.phase = Phase::Takeover;
+                    return Ok(());
+                }
+                None => {
+                    log(
+                        p.index,
+                        "firmware display ownership check failed; render engine withheld",
+                    );
+                    return Err(RuntimeError::Configuration);
+                }
+            }
+        }
         // Each verified restart needs a fresh policy proof. Reusing an arena
         // after S3 would publish new PTEs using the pre-suspend PAT/MOCS state
         // before hardware initialization has re-established that state.
@@ -1950,8 +2004,11 @@ impl Owner {
                 GgttArena::for_smallbar_gt(p.bar, mmio.clone(), authority)
                     .map_err(|_| RuntimeError::State)?,
             )
-        } else if lnl_profile(platform, p.lnl_display, p.mode.is_some())
-            == Some(LnlProfile::DisplayPreserving)
+        } else if lnl_profile(
+            platform,
+            matches!(p.display, DisplayOwner::LunarLake),
+            p.mode.is_some(),
+        ) == Some(LnlProfile::DisplayPreserving)
         {
             // §17 10.5: never the headless driver FLR, which would reset the
             // route's lit panel. Each cold start re-admits from current
@@ -1970,7 +2027,7 @@ impl Owner {
                 GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
                     .map_err(|_| RuntimeError::State)?,
             )
-        } else if p.ptl_display
+        } else if matches!(p.display, DisplayOwner::PantherLake)
             && ptl_profile(platform, true, p.mode.is_some()) == Some(LnlProfile::DisplayPreserving)
         {
             // The Panther Lake display-30 route: the same display-preserving
@@ -1989,7 +2046,10 @@ impl Owner {
                 GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
                     .map_err(|_| RuntimeError::State)?,
             )
-        } else if p.lnl_display || p.ptl_display {
+        } else if matches!(
+            p.display,
+            DisplayOwner::LunarLake | DisplayOwner::PantherLake
+        ) {
             return Err(RuntimeError::Configuration);
         } else if platform.is_headless_integrated() {
             if self.user_epoch.load(Ordering::Acquire) != 0
@@ -3505,10 +3565,7 @@ impl Owner {
 impl narf_power::device_pm::DevicePmOps for Owner {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
         use narf_power::device_pm::DeviceSuspendError as E;
-        if !system_suspend_admitted(
-            self.pending.smallbar,
-            self.pending.lnl_display || self.pending.ptl_display,
-        ) {
+        if !self.pending.allows_system_suspend() {
             return Err(E::Busy);
         }
         let state = self.state.try_lock().ok_or(E::Busy)?;
@@ -3533,14 +3590,9 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
     fn prepare_suspend(&self) -> narf_power::system_pm::SystemPmFuture<'_> {
         Box::pin(async move {
             use narf_power::device_pm::DeviceSuspendError as E;
-            // Initial opted-in whole-device incarnation is deliberately D0-only.
-            // No repeated driver-FLR may wipe retained BO/fd/VM state. The
-            // Lunar Lake display-20 profile is D0-only as well: display-20
-            // relight after S3 is not owned; neither is display-30 relight.
-            if !system_suspend_admitted(
-                self.pending.smallbar,
-                self.pending.lnl_display || self.pending.ptl_display,
-            ) {
+            // A retained Gen12 GOP has no S3 relight owner. Refuse before
+            // touching its display or powering down the function.
+            if !self.pending.allows_system_suspend() {
                 return Err(E::Busy);
             }
             // pci_pm_suspend runtime-resumes a suspended function before the
@@ -3894,7 +3946,7 @@ pub(crate) fn probe_discrete(
     } else {
         crate::drm_registry::register_drm_card(card.clone())
     };
-    install(assigned, card, device, cap, bar, None);
+    install(assigned, card, device, cap, bar, None, None);
     if let (Some(ip), Some(console)) = (discrete_display, discrete_console) {
         crate::intel_gpu_kms::install_discrete(assigned, ip, bar, device, cap, console);
     }
