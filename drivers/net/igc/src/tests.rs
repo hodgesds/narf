@@ -3222,6 +3222,56 @@ kernel_test_in!(
     smoke_igc_txpool_rejected_frames_return_their_buffers
 );
 
+fn smoke_igc_rxerr_rqdpc_is_fifo_and_mpc_is_missed() -> TestResult {
+    // Linux `igc_update_stats`: each queue's RQDPC (a frame dropped because
+    // its ring had no free descriptor) and MPC add to `rx_fifo_errors`; MPC
+    // alone is `rx_missed_errors`; `rx_over_errors` is never assigned; and
+    // `rx_errors` sums the hardware error counters (CRCERRS here), not the
+    // drops. The hardware host showed every RQDPC drop as rx_over_errors and
+    // rx_errors too, and MPC never as missed.
+    fn plain(_: &[u8], _: TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const NAME: &str = "igc-rxerr-selftest";
+    let name = narf_net::iface::register(NAME, [2, 0, 0, 0, 0, 12], plain);
+    check!(name == NAME, "the test interface was renamed");
+    let m = Model::new();
+    m.regs.borrow_mut().extend([
+        (0xc030, 7), // RQDPC(0)
+        (0xc070, 5), // RQDPC(1)
+        (0x4010, 3), // MPC
+        (0x4000, 2), // CRCERRS
+    ]);
+    let mut counters = crate::counters::Counters::new();
+    let (crc, missed, fifo) = counters.sample(&m, 4, false);
+    check!(
+        (crc, missed, fifo) == (2, 3, 12),
+        "the sample did not read CRCERRS, MPC and the queues' RQDPC"
+    );
+    let device_missed = crate::counters::publish_rx_errors(NAME, crc, missed, fifo);
+    let stats = narf_net::iface::lookup(NAME).map(|iface| iface.stats);
+    let _ = narf_net::iface::unregister(NAME);
+    let Some(stats) = stats else {
+        return TestResult::Fail("the test interface disappeared");
+    };
+    check!(stats.rx_fifo == 15, "RQDPC + MPC is not rx_fifo_errors");
+    check!(stats.rx_missed_errors == 3, "MPC is not rx_missed_errors");
+    check!(stats.rx_over_errors == 0, "igc reported rx_over_errors");
+    check!(
+        stats.rx_errs == 2 && stats.rx_crc_errors == 2,
+        "rx_errors counted the drops, not the hardware errors"
+    );
+    check!(
+        device_missed == 3,
+        "the device's missed-packet count took the RQDPC drops"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-rxerr",
+    smoke_igc_rxerr_rqdpc_is_fifo_and_mpc_is_missed
+);
+
 fn smoke_igc_tx_pool_sized_from_ring() -> TestResult {
     // The pool is bounded by what its ring can hold in flight (one frame per
     // descriptor, one slot reserved) and starts with the ring's worth of

@@ -1543,11 +1543,10 @@ impl Igc {
         }
         let mut counters = self.counters.lock();
         let (crc, missed, fifo) = counters.sample(&self.hw, self.num_queues(), false);
-        narf_net::iface::note_rx_crc_error(self.name(), crc);
-        narf_net::iface::note_rx_overrun(self.name(), missed + fifo);
+        let missed = crate::counters::publish_rx_errors(self.name(), crc, missed, fifo);
         let mut stats = self.stats.lock();
         stats.crc_errors += crc;
-        stats.missed_packets += missed + fifo;
+        stats.missed_packets += missed;
         stats.rx_packets = counters.value(0x4074);
         stats.tx_packets = counters.value(0x4080);
         stats.rx_bytes = counters.value(0x4088);

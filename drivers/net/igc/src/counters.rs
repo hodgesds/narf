@@ -73,6 +73,15 @@ const COUNTERS: &[(&str, u64, bool)] = &[
     ("macmerge_tx_fragments", 0x4298, false),
     ("macmerge_rx_fragments", 0x429c, false),
 ];
+/// Fold one sample's receive errors into `name`'s netdev counters: `crc`
+/// (CRCERRS), `missed` (MPC) and `fifo` (the queues' RQDPC). Returns what
+/// the sample adds to the device's missed-packet count.
+pub(crate) fn publish_rx_errors(name: &str, crc: u64, missed: u64, fifo: u64) -> u64 {
+    narf_net::iface::note_rx_crc_error(name, crc);
+    narf_net::iface::note_rx_overrun(name, missed + fifo);
+    missed + fifo
+}
+
 impl Counters {
     pub const fn new() -> Self {
         Self {
