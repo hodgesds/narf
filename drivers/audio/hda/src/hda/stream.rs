@@ -312,6 +312,10 @@ impl PcmDevice for Card {
         {
             return Err(SoundError::NoSuchDevice);
         }
+        // Linux azx_pcm_open powers the codec up (snd_hda_power_up_pm)
+        // before the codec's own open: the last stop may have parked the
+        // controller, and the pin sense below needs live command rings.
+        self.0.ensure_active().map_err(|_| SoundError::BadState)?;
         // Constraints come from the sinks attached now (Linux hdmi_pcm_open
         // reads the pin's ELD at open).
         if !capture {
