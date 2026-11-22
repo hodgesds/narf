@@ -89,6 +89,9 @@ pub enum RealtekChip {
     Alc701 = 0x0701,
     Alc703 = 0x0703,
     Alc711 = 0x0711,
+    /// ALC662 family (Linux `alc662.c`): the analog codec of AM5 desktop
+    /// boards.
+    Alc897 = 0x0897,
     /// "ALC3204" / "ALC3225" / ... are vendor-rebrands of ALC families
     /// for OEM SKUs. They share the underlying core register map but
     /// carry a distinct PCI subsystem ID.
@@ -147,6 +150,7 @@ impl RealtekChip {
             0x0701 => Some(RealtekChip::Alc701),
             0x0703 => Some(RealtekChip::Alc703),
             0x0711 => Some(RealtekChip::Alc711),
+            0x0897 => Some(RealtekChip::Alc897),
             0x3204 => Some(RealtekChip::Alc3204),
             0x3225 => Some(RealtekChip::Alc3225),
             0x3236 => Some(RealtekChip::Alc3236),
@@ -197,6 +201,7 @@ impl RealtekChip {
             RealtekChip::Alc701 => "ALC701",
             RealtekChip::Alc703 => "ALC703",
             RealtekChip::Alc711 => "ALC711",
+            RealtekChip::Alc897 => "ALC897",
             RealtekChip::Alc3204 => "ALC3204",
             RealtekChip::Alc3225 => "ALC3225",
             RealtekChip::Alc3236 => "ALC3236",
@@ -240,7 +245,11 @@ impl RealtekChip {
     /// 300/623/700) or rescued-but-unverified staged data (#776),
     /// so the live path must not apply it.
     pub const fn has_verified_coef_init(self) -> bool {
-        self.uses_alc256_init() || matches!(self, RealtekChip::Alc282 | RealtekChip::Alc283)
+        self.uses_alc256_init()
+            || matches!(
+                self,
+                RealtekChip::Alc282 | RealtekChip::Alc283 | RealtekChip::Alc897
+            )
     }
 }
 
@@ -402,6 +411,15 @@ pub const ALC270_INIT: &[CoefOp] = &[CoefOp::write(0x14, 0x0080)];
 /// 20 × 50 ms) and `alc_default_init`'s sense-gated PIN_OUT +
 /// amp-unmute tail.
 pub const ALC294_INIT: &[CoefOp] = &[];
+
+/// ALC897 init (Linux `alc662_probe` and `alc_init`, alc662.c /
+/// realtek.c): `alc_fix_pll_init(codec, 0x20, 0x04, 15)` clears coef 0x04
+/// bit 15, then `alc_pre_init` -> `alc_fill_eapd_coef` clears coef 0x07
+/// bit 5 (EAPD control). Both run at probe and again on every init.
+pub const ALC897_INIT: &[CoefOp] = &[
+    CoefOp::update(0x04, 1 << 15, 0x0000),
+    CoefOp::update(0x07, 1 << 5, 0x0000),
+];
 
 /// ALC280 init.
 pub const ALC280_INIT: &[CoefOp] = &[CoefOp::write(0x35, 0x1080)];
@@ -612,6 +630,7 @@ pub fn init_table_for(chip: RealtekChip) -> &'static [CoefOp] {
         RealtekChip::Alc701 => ALC294_INIT,
         RealtekChip::Alc703 => ALC294_INIT,
         RealtekChip::Alc711 => ALC294_INIT,
+        RealtekChip::Alc897 => ALC897_INIT,
         RealtekChip::Alc3204 => ALC3204_INIT,
         RealtekChip::Alc3225 => ALC3225_INIT,
         RealtekChip::Alc3236 => ALC3236_INIT,
@@ -693,6 +712,7 @@ pub fn parse_table_for(chip: RealtekChip) -> &'static [CoefOp] {
         RealtekChip::Alc701 => ALC700_PARSE,
         RealtekChip::Alc703 => ALC700_PARSE,
         RealtekChip::Alc711 => ALC700_PARSE,
+        RealtekChip::Alc897 => &[],
         RealtekChip::Alc3204 => &[],
         RealtekChip::Alc3225 => &[],
         RealtekChip::Alc3236 => &[],
