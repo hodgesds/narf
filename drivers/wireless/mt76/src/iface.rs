@@ -331,7 +331,8 @@ impl Mt76Iface {
                 };
                 self.finish_teardown(false).await?;
             }
-            self.drain_network()?;
+            // The station data queue is the data pump's (`data_pump`), as
+            // Linux polls `napi[MT_RXQ_MAIN]` apart from the MCU queue.
             if !self.link_up() {
                 self.poll_sched_scan().await;
             }
@@ -425,8 +426,46 @@ impl Mt76Iface {
         if self.ap_owned.load(Ordering::Acquire) || self.ap_role() {
             return self.drain_ap_network();
         }
+        let moved = self.station_step()?.unwrap_or(0);
+        if moved != 0 {
+            self.serviced.store(true, Ordering::Release);
+        }
+        Ok(moved != 0)
+    }
+
+    /// Whether the station data queue is the data pump's: an associated
+    /// station link that is not asleep, being torn down, or in an AP or
+    /// monitor role (the service worker polls those).
+    fn station_data_ready(&self) -> bool {
+        self.link_up()
+            && !self.sleeping.load(Ordering::Acquire)
+            && !self.ap_owned.load(Ordering::Acquire)
+            && !self.ap_role()
+            && self.current_iftype() != 6
+            && !self.teardown_needed.load(Ordering::Acquire)
+            && !radio_needs_recovery()
+    }
+
+    /// One data-queue poll: a station step. Returns the frames it moved and
+    /// whether more may be waiting; `busy` records that the owner was held by
+    /// control work.
+    fn data_poll(&self, busy: &mut bool) -> (u32, bool) {
+        match self.station_step() {
+            Ok(Some(moved)) => (moved, moved != 0),
+            Ok(None) => {
+                *busy = true;
+                (0, false)
+            }
+            Err(_) => (0, false),
+        }
+    }
+
+    /// One station packet step: a queued TX frame and up to a batch of
+    /// received frames. Returns the frames moved, or `None` when the owner
+    /// was busy.
+    fn station_step(&self) -> Result<Option<u32>, WirelessError> {
         if !self.link_up() {
-            return Ok(false);
+            return Ok(Some(0));
         }
         let result = {
             let mut pending = self.pending_tx.lock();
@@ -443,7 +482,7 @@ impl Mt76Iface {
         };
         let step = match result {
             Ok(step) => step,
-            Err(crate::mt7921::firmware_transport::Error::Busy) => return Ok(false),
+            Err(crate::mt7921::firmware_transport::Error::Busy) => return Ok(None),
             Err(error) => {
                 if error != crate::mt7921::firmware_transport::Error::DeviceGone {
                     note_failure("packet service", &error);
@@ -460,10 +499,7 @@ impl Mt76Iface {
                 narf_wireless::nl80211::notify_cqm_rssi(&self.name, high, level_dbm);
             }
         }
-        let progress = step.transmitted || !step.received.is_empty();
-        if progress {
-            self.serviced.store(true, Ordering::Release);
-        }
+        let moved = u32::from(step.transmitted) + step.received.len() as u32;
         deliver_received_batch(
             step,
             |epoch| self.receive_current(epoch),
@@ -492,7 +528,7 @@ impl Mt76Iface {
                 Ok(())
             },
         )?;
-        Ok(progress)
+        Ok(Some(moved))
     }
 
     fn receive_current(&self, epoch: u64) -> Result<bool, WirelessError> {
@@ -2068,7 +2104,87 @@ pub(crate) fn register_scan_iface_profile(
             worker.service_pass().await;
         }
     });
+    let (spec, deferral) = data_task_specs();
+    let handoff = Arc::new(narf_net::napi::SoftirqHandoff::new());
+    let deferral_task = deferral.is_some();
+    if let Some(deferral) = deferral {
+        let (iface, handoff) = (iface.clone(), handoff.clone());
+        narf_scheduler::spawn_with_spec(
+            async move {
+                data_deferral(iface, handoff).await;
+            },
+            deferral,
+        );
+    }
+    let pump = iface.clone();
+    narf_scheduler::spawn_with_spec(
+        async move {
+            data_pump(pump, deferral_task, handoff).await;
+        },
+        spec,
+    );
     Ok(iface)
+}
+
+/// The station data queue's poll (Linux `napi[MT_RXQ_MAIN]`, with the TX it
+/// frees room for): one bounded `softirq_run` per line raise ahead of the
+/// boot CPU's tasks, and work left after the softirq bound to the deferral
+/// task. The service worker keeps the tasklet's acknowledge and the MCU,
+/// key and control work, so control never waits behind data receive in one
+/// pass; the owner is held only for one packet step at a time.
+async fn data_pump(
+    iface: Arc<Mt76Iface>,
+    deferral_task: bool,
+    handoff: Arc<narf_net::napi::SoftirqHandoff>,
+) {
+    use crate::mt7921::irq::LINE;
+    use narf_net::napi::{deferral_run, softirq_run, SoftirqEnd};
+    while is_active(&iface) {
+        let seen = LINE.raised();
+        let mut busy = false;
+        if iface.station_data_ready() {
+            let end = softirq_run(
+                || iface.data_poll(&mut busy),
+                || false,
+                &handoff,
+                narf_time::wall::monotonic_ns,
+            )
+            .await;
+            if end == SoftirqEnd::Deferred {
+                if deferral_task {
+                    handoff.returned().await;
+                } else {
+                    let poll = || iface.data_poll(&mut busy);
+                    deferral_run(poll, &handoff, narf_time::wall::monotonic_ns).await;
+                }
+                continue;
+            }
+        }
+        // A busy owner (control work) is retried at the poll period; an idle
+        // queue waits for the next raise.
+        let period = if LINE.bound() && !busy {
+            WATCHDOG_NS
+        } else {
+            POLL_NS
+        };
+        let deadline = narf_time::Deadline::after_ns(period);
+        let _ = narf_time::timeout(deadline, LINE.wait_data(seen)).await;
+    }
+    // Release a deferral task parked for the queue: it finds the link gone
+    // and ends.
+    handoff.defer();
+}
+
+/// The data queue's deferral task (ksoftirqd): takes the queue over when the
+/// pump's softirq run ends with work left, polls it in bounded runs while
+/// sharing the CPU, and hands it back.
+async fn data_deferral(iface: Arc<Mt76Iface>, handoff: Arc<narf_net::napi::SoftirqHandoff>) {
+    while is_active(&iface) {
+        handoff.taken().await;
+        let mut busy = false;
+        let poll = || iface.data_poll(&mut busy);
+        narf_net::napi::deferral_run(poll, &handoff, narf_time::wall::monotonic_ns).await;
+    }
 }
 
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Mt76Iface>>> = IrqSafeSpinLock::new(None);
@@ -2077,7 +2193,9 @@ static ACTIVE: IrqSafeSpinLock<Option<Arc<Mt76Iface>>> = IrqSafeSpinLock::new(No
 /// and of its deferral task. The function's one MSI vector is delivered to
 /// the boot CPU.
 pub(crate) fn data_task_specs() -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
-    (narf_scheduler::TaskSpec::unthrottled(), None)
+    let cpu = narf_scheduler::affinity::CpuId::BOOT.0;
+    let pump = narf_net::napi::rx_pump_spec(cpu);
+    (pump, narf_net::napi::rx_deferral_spec(cpu))
 }
 
 /// The permanent module host retains this exact publication, never a name
