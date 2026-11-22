@@ -826,10 +826,10 @@ impl<'a, T: Transport> TlsClient<'a, T> {
     fn handshake(&mut self) -> Result<(), TlsError> {
         // Client random + ephemeral key: injected by fixtures, else
         // entropy. The per-task RNG is the keygen source; the suspend
-        // design's P0 (per_task_rng lacks secure keygen entropy) is a
-        // known caveat — `try_fill_random_bytes` is the health-checked
-        // hardware-seeded path, and its failure fails the handshake
-        // rather than falling back to weak randomness.
+        // design's P0 (the removed `per_task_rng` lacked secure keygen
+        // entropy) is a known caveat — `try_fill_random_bytes` is the
+        // health-checked hardware-seeded path, and its failure fails
+        // the handshake rather than falling back to weak randomness.
         self.client_random = match self.config.client_random {
             Some(r) => r,
             None => {

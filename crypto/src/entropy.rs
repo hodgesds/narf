@@ -24,7 +24,8 @@ use crate::CryptoError;
 
 /// Construct a ChaCha20 stream using a fresh 256-bit architectural RNG seed.
 /// No cycle-counter fallback is permitted. The temporary seed is zeroized.
-/// This stream is independent of the legacy Stage-3 `per_task_rng` helper.
+/// The predictable Stage-3 cycle-counter helper was removed (issue #1296);
+/// there is no weaker stream to fall back to.
 pub fn try_per_task_rng() -> Result<ChaCha20Rng, CryptoError> {
     rng_with(hardware_seed)
 }
@@ -151,8 +152,8 @@ fn hardware_seed(seed: &mut [u8; 32]) -> Result<(), CryptoError> {
 //   release, then continuous tests for the life of the boot. A failure
 //   latches the source off permanently; absence, starvation, and health
 //   failure all return `CryptoError::EntropyUnavailable` — the spec §5
-//   starvation rule. There is no path from here to the cycle-counter
-//   placeholder behind `per_task_rng`.
+//   starvation rule. There is no path from here to a cycle-counter
+//   placeholder: the predictable helper was removed (issue #1296).
 
 /// Repetition Count Test cutoff: 33 consecutive identical bytes
 /// (SP 800-90B §4.4.1, `1 + ⌈−log2(α)/H⌉` at α = 2^-32, H = 1 bit/byte).
@@ -434,7 +435,7 @@ pub fn has_hw_entropy() -> bool {
 /// `CryptoError::EntropyUnavailable` — when the seed-grade source is
 /// absent, starved, or health-latched off. An empty request succeeds
 /// without consulting the source. Key material must never come from
-/// `per_task_rng` or be mixed with its output.
+/// a cycle-counter-seeded stream or be mixed with its output.
 pub fn try_fill_key_material(out: &mut [u8]) -> Result<(), CryptoError> {
     fill_key_material_with(out, &KEY_MATERIAL_HEALTH, hw_key_word)
 }

@@ -1158,7 +1158,6 @@ dependencies = [
  "narf-ipc",
  "narf-kernel-test",
  "narf-lib",
- "narf-time",
  "polyval",
  "rand_chacha",
  "rand_core 0.6.4",

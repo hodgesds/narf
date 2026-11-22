@@ -21437,8 +21437,9 @@ pub(crate) fn shm_ipc_namespace_drop(ipc_ns: u64) {
 //
 // Fill the caller's user-mode buffer with random bytes. Stage-4
 // backing is a Park-Miller LCG seeded from monotonic_ns() — NOT
-// cryptographically secure (matches `crypto::per_task_rng`'s seed
-// quality, which carries the same caveat). When `arch/` exposes a
+// cryptographically secure (matching the removed `crypto::per_task_rng`'s
+// seed quality — predictable cycle-counter output, removed by issue
+// #1296 — which carries the same caveat). When `arch/` exposes a
 // HW entropy probe (RDSEED on x86_64, RNDR on aarch64), the seed
 // path here gets replaced.
 //
