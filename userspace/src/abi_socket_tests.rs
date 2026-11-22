@@ -12946,6 +12946,147 @@ kernel_test_in!(
     smoke_abi_socket_ip_unicast_if_picks_the_output_device
 );
 
+/// `ping_v4_sendmsg` routes with `ipc.oif = sk_bound_dev_if` (else
+/// IP_UNICAST_IF) and sources from the bound address (`inet->inet_saddr`),
+/// and `ping_recvmsg` → `ip_cmsg_recv` reports the reply's TTL as an IP_TTL
+/// control message to an IP_RECVTTL socket. On the desktop `ping -I wlan0`
+/// left through eth0 and every reply printed `ttl=0`.
+fn smoke_abi_socket_ping_honours_device_source_and_recvttl() -> TestResult {
+    use alloc::vec::Vec;
+    const IPPROTO_ICMP: u64 = 1;
+    const MSG_DONTWAIT: u64 = 0x40;
+    const A: &str = "abi-ping-a";
+    const B: &str = "abi-ping-b";
+    const A_IP: [u8; 4] = [10, 46, 3, 165];
+    const B_IP: [u8; 4] = [10, 46, 1, 211];
+    const PEER: [u8; 4] = [10, 46, 1, 1];
+    const A_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x2e, 0xa1];
+    const B_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x2e, 0xb1];
+    const PEER_MAC: [u8; 6] = [0x86, 0x43, 0x42, 0xa5, 0x25, 0x61];
+    static A_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    static B_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    fn capture_a(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        A_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn capture_b(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn echo_requests(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .filter(|f| f.len() >= 42 && f[12..14] == [0x08, 0x00] && f[23] == 1 && f[34] == 8)
+            .cloned()
+            .collect()
+    }
+    fn ping(fd: u64, seq: u16) -> Result<(), &'static str> {
+        let mut req = [0u8; 16];
+        req[0] = 8;
+        req[6..8].copy_from_slice(&seq.to_be_bytes());
+        let sa = sockaddr_in(u32::from_be_bytes(PEER), 0);
+        if sockopt_sendto(fd, &req, &sa) != Some(16) {
+            return Err("ping sendto failed");
+        }
+        Ok(())
+    }
+    with_setup(|| {
+        for (name, mac, ip, capture) in [
+            (A, A_MAC, A_IP, capture_a as narf_net::iface::SendFn),
+            (B, B_MAC, B_IP, capture_b as narf_net::iface::SendFn),
+        ] {
+            narf_net::iface::register(name, mac, capture);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_iface_ipv4_fields(name, ip, [0; 4]);
+            narf_net::iface::add_addr(name, ip, 22);
+            narf_net::arp_cache::insert(name, PEER, PEER_MAC);
+        }
+        narf_net::tcp_stack::__arp_insert_legacy(PEER, PEER_MAC);
+        A_TX.lock().clear();
+        B_TX.lock().clear();
+        let result = (|| -> Result<(), &'static str> {
+            // Bound to B: the request leaves B from B's address.
+            let bound = match socket_errno(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)? {
+                fd if fd >= 0 => fd as u64,
+                _ => return Err("socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) failed"),
+            };
+            if sockopt_set(bound, SOL_SOCKET, SO_BINDTODEVICE, b"abi-ping-b\0")? != 0 {
+                return Err("SO_BINDTODEVICE(abi-ping-b) failed");
+            }
+            ping(bound, 1)?;
+            let on_a = echo_requests(&core::mem::take(&mut *A_TX.lock()));
+            let on_b = echo_requests(&core::mem::take(&mut *B_TX.lock()));
+            let [request] = on_b.as_slice() else {
+                return Err("a ping bound to B did not leave B");
+            };
+            if !on_a.is_empty() || request[26..30] != B_IP {
+                return Err("a ping bound to B left A or not from B's address");
+            }
+            // Bound to B's address, no device: sourced from it.
+            let sourced = match socket_errno(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)? {
+                fd if fd >= 0 => fd as u64,
+                _ => return Err("second ping socket failed"),
+            };
+            sockopt_bind(sourced, &sockaddr_in(u32::from_be_bytes(B_IP), 0))?;
+            ping(sourced, 2)?;
+            let mut sent = echo_requests(&core::mem::take(&mut *A_TX.lock()));
+            sent.extend(echo_requests(&core::mem::take(&mut *B_TX.lock())));
+            if sent.len() != 1 || sent[0][26..30] != B_IP {
+                return Err("a ping bound to B's address was not sourced from it");
+            }
+            // The reply's TTL reaches an IP_RECVTTL socket.
+            if sockopt_set_int(bound, so::IPPROTO_IP, so::IP_RECVTTL, 1)? != 0 {
+                return Err("IP_RECVTTL failed");
+            }
+            let mut reply = alloc::vec![0u8; 14 + 20 + 16];
+            let _ = narf_net::pkt::write_eth_header(&mut reply, B_MAC, PEER_MAC, 0x0800);
+            let _ = narf_net::pkt::write_ipv4_header(&mut reply[14..], 36, 1, PEER, B_IP);
+            reply[14 + 8] = 57;
+            narf_net::pkt::set_ipv4_checksum(&mut reply[14..34]);
+            reply[34] = 0;
+            reply[38..42].copy_from_slice(&request[38..42]); // identifier, sequence
+            let sum = narf_net::pkt::ip_checksum(&reply[34..]);
+            reply[36..38].copy_from_slice(&sum.to_be_bytes());
+            narf_net::iface::on_rx_frame_from(B, &mut reply);
+            let mut data = [0u8; 64];
+            let mut ctrl = [0u8; 64];
+            let mut iov = [0u8; 16];
+            iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+            iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+            let mut msg = [0u8; 56];
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+            msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+            match call(
+                Syscall::SocketRecvMsg.raw(),
+                a2(bound, msg.as_mut_ptr() as u64, MSG_DONTWAIT),
+            ) {
+                Some(16) => {}
+                _ => return Err("the bound ping socket did not receive its echo reply"),
+            }
+            let len = u64::from_ne_bytes(ctrl[0..8].try_into().unwrap());
+            let level = i32::from_ne_bytes(ctrl[8..12].try_into().unwrap());
+            let kind = i32::from_ne_bytes(ctrl[12..16].try_into().unwrap());
+            let ttl = i32::from_ne_bytes(ctrl[16..20].try_into().unwrap());
+            if (len, level, kind, ttl) != (20, 0, 2, 57) {
+                return Err("IP_RECVTTL did not report the echo reply's TTL");
+            }
+            sockopt_close(&[bound, sourced]);
+            Ok(())
+        })();
+        narf_net::iface::del_addr(A, A_IP, 22);
+        narf_net::iface::del_addr(B, B_IP, 22);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/ping-bind",
+    smoke_abi_socket_ping_honours_device_source_and_recvttl
+);
+
 /// systemd-resolved's `link_address_update_rtnl` reads IFA_FLAGS from every
 /// RTM_NEWADDR and fails the whole manager with ENODATA when it is absent
 /// ("Could not create manager: No data available"). Linux always emits it
