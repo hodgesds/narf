@@ -434,6 +434,57 @@ fn getroute_dump_honors_table_filter() -> narf_kernel_test::TestResult {
 }
 narf_kernel_test::kernel_test_in!("net/netlink_route", getroute_dump_honors_table_filter);
 
+/// `ip route show proto dhcp`: a strict IPv4 dump with `rtm_protocol` set
+/// keeps the routes installed with that protocol (`fib_dump_info_fnhe` /
+/// `fn_trie_dump_leaf` compare `fa->fa_info->fib_protocol`). NARF compared
+/// RTPROT_KERNEL for every route, so the filter matched only kernel routes.
+fn getroute_dump_filters_by_the_routes_protocol() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const RTPROT_DHCP: u8 = 16;
+    let name = "rtnl-proto0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 0x16, 1], discard);
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+    let net = crate::route::Ipv4Net {
+        addr: crate::ipv4::Ipv4Addr([198, 18, 16, 0]),
+        prefix_len: 24,
+    };
+    crate::route::route_add(crate::route::Route {
+        net_ns_id: 0,
+        dst: net,
+        gateway: Some(crate::ipv4::Ipv4Addr([192, 0, 2, 16])),
+        iface: alloc::string::String::from(name),
+        src_hint: None,
+        metric: 100,
+        scope: crate::route::Scope::Universe,
+        table: crate::route::TABLE_MAIN,
+        protocol: RTPROT_DHCP,
+    });
+    let dump = |protocol: u8| {
+        let mut body = [0u8; 12];
+        body[0] = AF_INET;
+        body[5] = protocol;
+        let request = frame_message(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 64, 0, &body);
+        build_get_in(0, &request, true, false)
+            .into_iter()
+            .filter(|m| {
+                parse_hdr(m).is_some_and(|h| h.msg_type == RTM_NEWROUTE)
+                    && find_rtattr(m, 12, RTA_OIF).as_deref() == Some(&ifindex.to_ne_bytes()[..])
+            })
+            .count()
+    };
+    let (dhcp, kernel) = (dump(RTPROT_DHCP), dump(RTPROT_KERNEL));
+    crate::route::route_delete(net, name, crate::route::TABLE_MAIN);
+    narf_kernel_test::kt_assert_eq!(dhcp, 1);
+    narf_kernel_test::kt_assert_eq!(kernel, 0);
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/route-proto-filter",
+    getroute_dump_filters_by_the_routes_protocol
+);
+
 fn newneigh_wire_layout_carries_ipv4_destination_and_mac() -> narf_kernel_test::TestResult {
     let msg = build_newneigh(
         &NeighInfo {
