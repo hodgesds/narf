@@ -59,9 +59,9 @@ fn rig_with(
         },
     };
     let storage = Storage {
-        wm: Ring::allocate_for(dma, TX_WM, false)?,
-        fwdl: Ring::allocate_for(dma, TX_FWDL, false)?,
-        data: Ring::allocate_for(dma, TX_DATA, false)?,
+        wm: Ring::allocate_for(dma, TX_WM, false, DEPTH)?,
+        fwdl: Ring::allocate_for(dma, TX_FWDL, false, DEPTH)?,
+        data: Ring::allocate_for(dma, TX_DATA, false, DEPTH)?,
         data_dma: 0,
         tokens: packet_tx::Tokens::new(),
         // The descriptor fixtures pin exact TXD words and PIDs; the
@@ -73,9 +73,9 @@ fn rig_with(
         receive_open: false,
         p2p_capture: super::super::p2p_management_capture::Queue::new(),
         rx: [
-            Ring::allocate_for(dma, RX_PRE, true)?,
-            Ring::allocate_for(dma, RX_POST, true)?,
-            Ring::allocate_for(dma, RX_DATA, true)?,
+            Ring::allocate_for(dma, RX_PRE, true, DEPTH)?,
+            Ring::allocate_for(dma, RX_POST, true, DEPTH)?,
+            Ring::allocate_for(dma, RX_DATA, true, DEPTH)?,
         ],
     };
     Ok((

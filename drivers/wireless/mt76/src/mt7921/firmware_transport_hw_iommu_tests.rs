@@ -43,7 +43,7 @@ fn mt7921_rings_program_perdomain_iovas() -> TestResult {
             (RX_POST, true),
             (RX_DATA, true),
         ] {
-            let ring = Ring::allocate_for(&dev, base, rx).map_err(|_| "ring allocation")?;
+            let ring = Ring::allocate_for(&dev, base, rx, DEPTH).map_err(|_| "ring allocation")?;
             if !mapped(&domain, &ring.descriptors)
                 || !ring.buffers.iter().all(|b| mapped(&domain, b))
             {
@@ -282,7 +282,7 @@ fn mt7921_iommu_recovery_restores_before_reallocation() -> TestResult {
         {
             return Err("new generation not re-attached before allocation");
         }
-        let ring = Ring::allocate_for(&dev, TX_FWDL, false).map_err(|_| "reallocation")?;
+        let ring = Ring::allocate_for(&dev, TX_FWDL, false, DEPTH).map_err(|_| "reallocation")?;
         if !mapped(&domain, &ring.descriptors) || !ring.buffers.iter().all(|b| mapped(&domain, b)) {
             return Err("re-allocated ring is not a domain IOVA of its frames");
         }

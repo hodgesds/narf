@@ -50,7 +50,7 @@ fn mt7921_rings_use_noncoherent_device_pool() -> TestResult {
             (RX_POST, true),
             (RX_DATA, true),
         ] {
-            let ring = Ring::allocate_for(&dev, base, rx).map_err(|_| "ring allocation")?;
+            let ring = Ring::allocate_for(&dev, base, rx, DEPTH).map_err(|_| "ring allocation")?;
             if !within(&ring.descriptors, &pool) || !ring.buffers.iter().all(|b| within(b, &pool)) {
                 return Err("ring memory outside the device pool");
             }
@@ -74,12 +74,12 @@ fn mt7921_rings_use_noncoherent_device_pool() -> TestResult {
         // Linux would remap RAM here; NARF has no RAM alias, so refuse.
         let bare = DmaDevice::new(DmaCoherence::NonCoherent, None, None);
         if !matches!(
-            Ring::allocate_for(&bare, TX_WM, false),
+            Ring::allocate_for(&bare, TX_WM, false, DEPTH),
             Err(Error::Allocation)
         ) {
             return Err("non-coherent device without a pool got rings");
         }
-        let coherent = Ring::allocate(TX_WM, false).map_err(|_| "coherent ring")?;
+        let coherent = Ring::allocate(TX_WM, false, DEPTH).map_err(|_| "coherent ring")?;
         if coherent.descriptors.is_pool_backed()
             || coherent.buffers.iter().any(|b| b.is_pool_backed())
         {
@@ -107,7 +107,7 @@ fn mt7921_ring_pool_exhaustion_is_clean() -> TestResult {
     };
     let dev = DmaDevice::new(DmaCoherence::NonCoherent, Some(pool.clone()), None);
     let failed = matches!(
-        Ring::allocate_for(&dev, RX_DATA, true),
+        Ring::allocate_for(&dev, RX_DATA, true, DEPTH),
         Err(Error::Allocation)
     );
     let clean = pool.free_pages() == pool.pages();
