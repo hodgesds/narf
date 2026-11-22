@@ -587,6 +587,63 @@ narf_kernel_test::kernel_test_in!(
     ipv6_route_message_reports_gateway_and_oif
 );
 
+/// `neigh_dump_table` walks the one IPv4 neighbour table the stack resolves
+/// with (`arp_tbl`): `ip neigh` lists what `/proc/net/arp` lists, each entry
+/// with its NUD state, and NDA_LLADDR only for a valid (`NUD_VALID`) entry
+/// (`neigh_fill_info`). NARF dumped a separate table only RTM_NEWNEIGH
+/// wrote, so `ip neigh` on the desktop showed no IPv4 neighbour at all.
+fn ipv4_neighbor_dump_reports_the_resolver_table() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    let name = "rtnl-neigh-dump0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 8, 1], discard);
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+    let resolved = [10, 43, 0, 1];
+    let mac = [0x86, 0x43, 0x42, 0xa5, 0x25, 0x61];
+    let resolving = [10, 43, 0, 125];
+    crate::arp_cache::insert(name, resolved, mac);
+    crate::arp_cache::mark_incomplete(name, resolving);
+
+    let mut body = vec![AF_INET, 0, 0, 0];
+    body.extend_from_slice(&[0u8; 8]);
+    let request = frame_message(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 46, 12, &body);
+    let msgs = build_dump(&request);
+    let ours: Vec<&Vec<u8>> = msgs
+        .iter()
+        .filter(|m| {
+            hdr_of(m).1 == RTM_NEWNEIGH
+                && i32::from_ne_bytes(m[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].try_into().unwrap())
+                    == ifindex as i32
+        })
+        .collect();
+    let find = |ip: [u8; 4]| {
+        ours.iter()
+            .find(|m| find_rtattr(m, 12, NDA_DST).as_deref() == Some(&ip[..]))
+            .copied()
+    };
+    let state = |m: &Vec<u8>| u16::from_ne_bytes([m[NLMSG_HDRLEN + 8], m[NLMSG_HDRLEN + 9]]);
+    let Some(complete) = find(resolved) else {
+        return narf_kernel_test::TestResult::Fail("resolved ARP entry missing from ip neigh");
+    };
+    narf_kernel_test::kt_assert_eq!(complete[NLMSG_HDRLEN], AF_INET);
+    narf_kernel_test::kt_assert_eq!(state(complete), NUD_REACHABLE);
+    narf_kernel_test::kt_assert_eq!(
+        find_rtattr(complete, 12, NDA_LLADDR).as_deref(),
+        Some(&mac[..])
+    );
+    let Some(incomplete) = find(resolving) else {
+        return narf_kernel_test::TestResult::Fail("resolving ARP entry missing from ip neigh");
+    };
+    narf_kernel_test::kt_assert_eq!(state(incomplete), NUD_INCOMPLETE);
+    narf_kernel_test::kt_assert!(find_rtattr(incomplete, 12, NDA_LLADDR).is_none());
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/neigh-dump",
+    ipv4_neighbor_dump_reports_the_resolver_table
+);
+
 fn getneigh_dump_honors_ifindex_filter() -> narf_kernel_test::TestResult {
     // `neigh_valid_dump_req`: the device filter is NDA_IFINDEX (8), not
     // ndm_ifindex.
