@@ -563,6 +563,26 @@ kernel_test_in!(
     smoke_power_s5_preserves_zero_firmware_encoding
 );
 
+/// Linux's default `hibernation_mode`: `platform` only where ACPI offers
+/// `\_S4` (x86_64), `shutdown` otherwise. A zero SLP_TYP is a valid S4
+/// encoding.
+fn smoke_power_hibernation_mode_follows_s4() -> TestResult {
+    use crate::system::{hibernation_mode, HibernationMode};
+    let platform = if cfg!(target_arch = "x86_64") {
+        HibernationMode::Platform
+    } else {
+        HibernationMode::Shutdown
+    };
+    if hibernation_mode(Some((6, 6))) != platform
+        || hibernation_mode(Some((0, 0))) != platform
+        || hibernation_mode(None) != HibernationMode::Shutdown
+    {
+        return TestResult::Fail("hibernation_mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/system", smoke_power_hibernation_mode_follows_s4);
+
 fn smoke_s3_enter_refuses_without_arm() -> TestResult {
     use crate::{suspend, Power};
     use narf_capabilities::{Cap, Invoke};
@@ -2569,6 +2589,94 @@ fn smoke_device_pm_register_and_fanout_order() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power/device_pm", smoke_device_pm_register_and_fanout_order);
+
+static HIB_LOG: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<&'static str>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+fn hib_note(what: &'static str) -> Result<(), crate::device_pm::DeviceSuspendError> {
+    HIB_LOG.lock().push(what);
+    Ok(())
+}
+fn hib_a_suspend() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    hib_note("a.suspend")
+}
+fn hib_a_resume() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    hib_note("a.resume")
+}
+fn hib_b_suspend() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    hib_note("b.suspend")
+}
+fn hib_b_resume() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    hib_note("b.resume")
+}
+fn hib_b_freeze() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    hib_note("b.freeze")
+}
+fn hib_b_thaw() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    hib_note("b.thaw")
+}
+fn hib_b_poweroff() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    hib_note("b.poweroff")
+}
+fn hib_b_restore() -> Result<(), crate::device_pm::DeviceSuspendError> {
+    hib_note("b.restore")
+}
+
+/// The hibernation fan-outs. Freeze and poweroff run in reverse
+/// registration order, thaw and restore forward. A plain registration and a
+/// trait without its own hibernation callbacks take
+/// `SET_SYSTEM_SLEEP_PM_OPS`'s defaults: freeze and poweroff are the
+/// suspend, thaw and restore the resume. A hibernation set's own callbacks
+/// replace them. The recovering flag reads back as set.
+fn smoke_device_pm_hibernation_fanouts() -> TestResult {
+    use crate::device_pm::{self as pm, DevicePmOps, DeviceSuspendError, HibernationFns};
+    use alloc::sync::Arc;
+    struct C;
+    impl DevicePmOps for C {
+        fn suspend(&self) -> Result<(), DeviceSuspendError> {
+            hib_note("c.suspend")
+        }
+        fn resume(&self) -> Result<(), DeviceSuspendError> {
+            hib_note("c.resume")
+        }
+    }
+    let _pm_registry = pm::__test_isolate_registry();
+    pm::register_device_pm("a", hib_a_suspend, hib_a_resume);
+    pm::register_device_pm_hibernation(
+        "b",
+        hib_b_suspend,
+        hib_b_resume,
+        HibernationFns {
+            freeze: hib_b_freeze,
+            thaw: hib_b_thaw,
+            poweroff: hib_b_poweroff,
+            restore: hib_b_restore,
+        },
+    );
+    pm::register_device_pm_ops("c", Arc::new(C));
+    let run = |fan: fn() -> pm::FanoutReport| {
+        HIB_LOG.lock().clear();
+        let ok = fan().ok();
+        (ok, HIB_LOG.lock().clone())
+    };
+    if run(pm::freeze_all_devices) != (true, alloc::vec!["c.suspend", "b.freeze", "a.suspend"])
+        || run(pm::thaw_all_devices) != (true, alloc::vec!["a.resume", "b.thaw", "c.resume"])
+        || run(pm::poweroff_all_devices)
+            != (true, alloc::vec!["c.suspend", "b.poweroff", "a.suspend"])
+        || run(pm::restore_all_devices) != (true, alloc::vec!["a.resume", "b.restore", "c.resume"])
+        || run(pm::suspend_all_devices)
+            != (true, alloc::vec!["c.suspend", "b.suspend", "a.suspend"])
+    {
+        return TestResult::Fail("hibernation fan-out order or callbacks");
+    }
+    pm::set_hibernate_recovering(true);
+    let recovering = pm::hibernate_is_recovering();
+    pm::set_hibernate_recovering(false);
+    if !recovering || pm::hibernate_is_recovering() {
+        return TestResult::Fail("pm_hibernate_is_recovering");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/device_pm", smoke_device_pm_hibernation_fanouts);
 
 /// Isolating a failing fixture must not erase probe-owned callbacks needed
 /// by later hardware tests, including trait-backed registrations.

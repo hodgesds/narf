@@ -31,16 +31,17 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// A system sleep state a user can request by name — the subset of
-/// Linux's `pm_state` table this kernel implements. (`standby` and
-/// `disk` are absent: no S1 platform path, no hibernation image
-/// writer — writing either name is an error, as on a Linux built
-/// without those configurations.)
+/// Linux's `pm_state` table this kernel implements, plus `disk`
+/// (hibernation, `hibernate()`). `standby` is absent: no S1 platform
+/// path, so writing it is an error, as on a Linux built without it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SleepState {
     /// Suspend-to-idle: [`crate::s2idle::suspend_to_idle`].
     Freeze,
     /// Suspend-to-RAM (S3): [`crate::suspend::s3_enter`].
     Mem,
+    /// Hibernation (S4): [`crate::hibernate::hibernate`].
+    Disk,
 }
 
 impl SleepState {
@@ -49,6 +50,7 @@ impl SleepState {
         match self {
             SleepState::Freeze => "freeze",
             SleepState::Mem => "mem",
+            SleepState::Disk => "disk",
         }
     }
 
@@ -58,6 +60,7 @@ impl SleepState {
         match token {
             "freeze" => Some(SleepState::Freeze),
             "mem" => Some(SleepState::Mem),
+            "disk" => Some(SleepState::Disk),
             _ => None,
         }
     }
@@ -70,6 +73,7 @@ impl SleepState {
         match self {
             SleepState::Freeze => crate::s2idle::s2idle_supported(),
             SleepState::Mem => crate::suspend::s3_supported(),
+            SleepState::Disk => crate::hibernate::available(),
         }
     }
 }

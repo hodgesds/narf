@@ -137,6 +137,12 @@ impl GfxOff {
         let generation = self.controller.allow()?;
         Ok(self.allow(generation))
     }
+    /// `amdgpu_device_prepare`'s `flush_delayed_work`: a scheduled allow
+    /// delivered now, so GFX is in GFXOFF before the suspend goes on. Any
+    /// allow already scheduled then lands on nothing.
+    pub(crate) async fn flush(&mut self, hw: &mut impl Control) -> Result<bool, Error> {
+        self.controller.flush_delayed(hw).await
+    }
     /// `amdgpu_device_delay_enable_gfx_off` for `allow`: `Ok(false)` when a
     /// disable request cancelled it or it belongs to another lifetime.
     pub(crate) async fn delayed(

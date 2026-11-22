@@ -1210,7 +1210,7 @@ fn hooked_image() -> (MemImageStore, TestAnchor, Vec<u8>) {
         smk: &smk,
         image_id: [0x42; 16],
         smk_wrap_nonce: [0x05; 12],
-        image: &image,
+        image: &image.as_slice(),
         hook_region: &region,
     };
     write_image(&mut store, &req).expect("write_image");

@@ -252,6 +252,72 @@ unsafe fn write_reg_locked(base_phys: u64, index: u32, value: u32) {
 ///
 /// # Safety
 /// Caller-asserted live IOAPIC.
+/// One saved redirection-table entry ([`save_all`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SavedEntry {
+    pub base_phys: u64,
+    pub index: u32,
+    pub low: u32,
+    pub high: u32,
+}
+
+/// Every known IOAPIC's redirection table, appended to `out`: Linux's
+/// `save_ioapic_entries` for `ioapic_suspend`. A restored hibernation image
+/// runs on the routing the boot kernel programmed, whose vectors are its
+/// own. `out` must have the capacity reserved: this may run with
+/// interrupts off.
+///
+/// # Safety
+/// Every IOAPIC this module mapped is live.
+pub unsafe fn save_all(out: &mut alloc::vec::Vec<SavedEntry>) {
+    let _g = IOAPIC_LOCK.lock();
+    for slot in 0..MAX_IOAPICS {
+        let base_phys = MMIO_PHYS[slot].load(Ordering::Relaxed);
+        if base_phys == 0 {
+            continue;
+        }
+        // SAFETY: a mapped IOAPIC; locked.
+        let entries = (unsafe { read_reg_locked(base_phys, IDX_IOAPICVER) } >> 16) & 0xFF;
+        for index in 0..=entries {
+            let low_idx = IDX_IOREDTBL_BASE + 2 * index;
+            if out.len() == out.capacity() {
+                return;
+            }
+            // SAFETY: as above.
+            let (low, high) = unsafe {
+                (
+                    read_reg_locked(base_phys, low_idx),
+                    read_reg_locked(base_phys, low_idx + 1),
+                )
+            };
+            out.push(SavedEntry {
+                base_phys,
+                index,
+                low,
+                high,
+            });
+        }
+    }
+}
+
+/// Write back what [`save_all`] saved, each entry masked first so nothing
+/// is delivered through half of it (`restore_ioapic_entries`).
+///
+/// # Safety
+/// The IOAPICs are the ones saved, interrupts are off.
+pub unsafe fn restore_all(saved: &[SavedEntry]) {
+    let _g = IOAPIC_LOCK.lock();
+    for e in saved {
+        let low_idx = IDX_IOREDTBL_BASE + 2 * e.index;
+        // SAFETY: the caller's contract; locked.
+        unsafe {
+            write_reg_locked(e.base_phys, low_idx, e.low | MASKED);
+            write_reg_locked(e.base_phys, low_idx + 1, e.high);
+            write_reg_locked(e.base_phys, low_idx, e.low);
+        }
+    }
+}
+
 pub unsafe fn read_id(h: &IoApicHandle) -> u8 {
     let _g = IOAPIC_LOCK.lock();
     // SAFETY: locked.

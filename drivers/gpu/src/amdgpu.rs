@@ -3532,10 +3532,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // resume; full S3 also needs PSP TMR teardown + SMU
     // PowerDownGfx, which the current scaffold doesn't do —
     // registered as best-effort.
-    narf_power::device_pm::register_device_pm(
+    narf_power::device_pm::register_device_pm_hibernation(
         "amdgpu",
         amdgpu_suspend_handler,
         amdgpu_resume_handler,
+        narf_power::device_pm::HibernationFns {
+            // amdgpu_pmops_freeze: the suspend, which on Raphael also runs the
+            // mode 2 reset an S4 prepare asked for (`after_psp_stop`).
+            freeze: amdgpu_suspend_handler,
+            thaw: amdgpu_thaw_handler,
+            poweroff: amdgpu_poweroff_handler,
+            restore: amdgpu_resume_handler,
+        },
     );
     // Panel backlight: an APU drives the internal panel, so register
     // the production backlight owner through the backlight
@@ -3677,6 +3685,24 @@ fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendEr
         );
     });
     Ok(())
+}
+
+/// `amdgpu_pmops_thaw`: a normal hibernation leaves the device frozen while
+/// its image is written. Only a thaw after a failed snapshot or write
+/// (`pm_hibernate_is_recovering`) resumes it.
+fn amdgpu_thaw_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if !narf_power::device_pm::hibernate_is_recovering() {
+        return Ok(());
+    }
+    amdgpu_resume_handler()
+}
+/// `amdgpu_pmops_poweroff`: a device the thaw left suspended stays as it
+/// is (`in_s4 && in_suspend`); one that was resumed suspends again.
+fn amdgpu_poweroff_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if PM_SUSPENDED.load(core::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    amdgpu_suspend_handler()
 }
 
 fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {

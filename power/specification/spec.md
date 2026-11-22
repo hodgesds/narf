@@ -254,7 +254,39 @@ Flow:
    hand `time/` the suspend duration so it can jump forward the
    wall clock without violating monotonic.
 
-`system_pm::AsyncSystemPm` is the interrupt-live bracket around the existing
+`device_pm` is the synchronous fan-out, Linux's `dev_pm_ops`:
+
+```rust
+pub trait DevicePmOps: Send + Sync {
+    fn suspend(&self) -> Result<(), DevicePmError>;
+    fn resume(&self) -> Result<(), DevicePmError>;
+    fn freeze(&self) -> Result<(), DevicePmError> { self.suspend() }    // PMSG_FREEZE
+    fn thaw(&self) -> Result<(), DevicePmError> { self.resume() }       // PMSG_THAW
+    fn poweroff(&self) -> Result<(), DevicePmError> { self.suspend() }  // PMSG_HIBERNATE
+    fn restore(&self) -> Result<(), DevicePmError> { self.resume() }    // PMSG_RESTORE
+}
+pub struct HibernationFns { pub freeze: PmFn, pub thaw: PmFn, pub poweroff: PmFn, pub restore: PmFn }
+pub fn register_device_pm(name: &str, suspend: PmFn, resume: PmFn);
+pub fn register_device_pm_hibernation(name: &str, suspend: PmFn, resume: PmFn, h: HibernationFns);
+pub fn register_device_pm_ops(name: &str, ops: Arc<dyn DevicePmOps>);
+pub fn suspend_all_devices() -> FanoutReport;   // reverse registration order
+pub fn resume_all_devices() -> FanoutReport;    // forward
+pub fn freeze_all_devices() -> FanoutReport;    // reverse
+pub fn thaw_all_devices() -> FanoutReport;      // forward
+pub fn poweroff_all_devices() -> FanoutReport;  // reverse
+pub fn restore_all_devices() -> FanoutReport;   // forward
+pub fn set_hibernate_recovering(recovering: bool);
+pub fn hibernate_is_recovering() -> bool;       // pm_hibernate_is_recovering
+```
+
+The hibernation callbacks default as `SET_SYSTEM_SLEEP_PM_OPS` sets them,
+for trait implementations and plain registrations alike: freeze and
+poweroff run the suspend, thaw and restore the resume. A
+`register_device_pm_hibernation` set replaces them; amdgpu's thaw, for
+one, resumes only while recovering. No failure stops a fan-out; the
+report counts them.
+
+`system_pm::AsyncSystemPm` is the interrupt-live bracket around the
 synchronous `device_pm::DevicePmOps` fan-out. Registration is parent → child;
 `prepare_suspend` runs child → parent, and the matching resume runs parent →
 child after the synchronous fan-out has restored PCI/platform delivery. The
@@ -284,6 +316,53 @@ are not reset by this fixture.
 This profile forwards only the required bus/ACPI/AML wake fixtures; it does
 not activate token/TPM fixture providers. The existing `kernel-test` profile
 retains those independent providers and includes the wake tests as well.
+
+#### LPS0 notifications around suspend-to-idle
+
+`lps0` is Linux's `drivers/acpi/x86/s2idle.c` LPS0 half:
+
+```rust
+pub trait Dsm { fn call(&mut self, uuid: [u8; 16], revision: u64, function: u32) -> Option<narf_aml::Value>; }
+pub struct Lps0 { pub amd: bool, pub vendor: Option<u32>, pub microsoft: Option<u32> }
+impl Lps0 {
+    pub fn attach(dsm: &mut impl Dsm, amd: bool, hid: Option<&str>) -> Option<Self>;
+    pub fn prepare_late(&self, dsm: &mut impl Dsm);
+    pub fn restore_early(&self, dsm: &mut impl Dsm);
+}
+pub trait Handler: Sync { fn name(&self) -> &'static str; fn prepare(&self) {} fn check(&self) {} fn restore(&self) {} }
+pub fn setup() -> bool;              // lps0_device_attach, x86_64 Subsys initcall
+pub fn attached() -> bool;
+pub fn register(handler: &'static dyn Handler);   // acpi_register_lps0_dev
+pub fn has_handler(name: &str) -> bool;
+pub fn prepare_late(); pub fn check(); pub fn restore_early();
+```
+
+`setup` attaches the first device whose `_HID` or `_CID` is `PNP0D80`. The
+masks are each UUID's function-0 buffer of one to four bytes:
+- the Microsoft UUID;
+- AMD's UUID on AMD CPUs, otherwise Intel's.
+
+`None` is a failed evaluation. With both failed, nothing attaches. On AMD
+the Picasso HIDs (`AMD0004`, `AMD0005`, `AMDI0005`) shift a vendor mask
+above 0x3 left by one and set bit 0. Calls after function 0 use revision 0
+on AMD and 1 on Intel, and a function runs only if its mask lists it.
+
+Suspend-to-idle calls `prepare_late` after the device fan-out and the
+framebuffer blank, before the IRQ mask:
+- screen off;
+- LPS0 entry (on AMD the vendor entry comes before the Microsoft Modern
+  Standby pair, on Intel after it);
+- each handler's `prepare`.
+
+`check` runs each handler's `check` before every park iteration.
+`restore_early` runs before any device resumes:
+- each handler's `restore`;
+- LPS0 exit;
+- the Microsoft exit, display-on intent and Modern Standby exit;
+- screen on.
+
+Without an attached device all three do nothing. The constraint checks
+(`lpi_check_constraints`, which only log) are not done.
 
 ### 3.3a Typed PCI firmware policy metadata
 
@@ -1296,6 +1375,288 @@ and arms a statically spawned watchdog that forces `power_off()` (no sync)
 reports `KEY_POWER` press + release on its own evdev device; with no reader
 open on it (no logind) it requests an **unforced** orderly power-off. No
 power-off ever runs in the notifying (IRQ / SCI subscriber) context.
+
+#### 3.6.0a Hibernation power-down (S4 entry)
+
+```rust
+pub enum HibernationMode { Platform, Shutdown }             // hibernation_mode, /sys/power/disk
+pub fn hibernation_mode(s4: Option<(u8, u8)>) -> HibernationMode;
+pub fn default_hibernation_mode() -> HibernationMode;       // narf_aml::evaluate_s4()
+pub fn hibernation_power_down(mode: HibernationMode) -> !;  // power_down()
+// narf_aml
+pub fn evaluate_s4() -> Option<(u8, u8)>;                    // \_S4_ SLP_TYPa/b, as evaluate_s5
+```
+
+The default is Linux's. `Platform` applies where ACPI offers `\_S4`
+(`acpi_sleep_hibernate_setup` registers the platform hibernation ops only
+then), which is x86_64 only. Otherwise it is `Shutdown`.
+
+`hibernation_power_down` runs once the image is on disk:
+- **`Platform`:** `hibernation_platform_enter`'s ACPI half: `\_PTS(4)`,
+  then S4's SLP_TYP and SLP_EN through `pm1_enter_sleep`. The caller has
+  run the devices' poweroff callbacks, so no shutdown hook runs; only the
+  console is flushed. A platform that does not power down falls through to
+  S5, as `power_down` does.
+- **`Shutdown`:** `power_off()` with its device shutdown, the devices
+  thawed. aarch64 always takes this, so PSCI `SYSTEM_OFF`.
+
+The wake from S4 is a cold boot. The image's restore belongs to the
+resume environment (`power/research/s4-hibernation-plan.md`, lane 8).
+
+#### 3.6.0b Task freezer
+
+```rust
+pub const FREEZE_TIMEOUT_MS: u64 = 20_000;                  // freeze_timeout_msecs
+pub struct Hooks { pub live: fn() -> Vec<u64>, pub kick: fn(u64) }
+pub enum FreezeError { InProgress, Timeout { refusing: Vec<u64> }, WorkqueuesBusy }
+pub fn install(hooks: Hooks) -> Option<Hooks>;          // returns the replaced hooks
+pub fn freezing() -> bool;                                  // pm_freezing
+pub fn try_to_freeze(task: u64, waker: &Waker) -> bool;     // a freeze point
+pub fn frozen(task: u64) -> bool;
+pub async fn freeze_processes() -> Result<(), FreezeError>;
+pub async fn freeze_processes_within(timeout_ns: u64) -> Result<(), FreezeError>;
+pub fn thaw_processes();
+pub async fn freeze_kernel_threads() -> Result<(), FreezeError>;
+pub async fn freeze_kernel_threads_within(timeout_ns: u64) -> Result<(), FreezeError>;
+pub fn thaw_kernel_threads();
+// narf_scheduler::workqueue
+pub fn freeze_workqueues_begin();                           // WQ_FREEZABLE: limit 0
+pub fn freeze_workqueues_busy() -> bool;
+pub fn thaw_workqueues();
+```
+
+`narf_power::freezer` holds the state; `narf-userspace` supplies the tasks.
+`install_user_task_hooks` installs the hooks:
+- `live`: the registered tasks that have not exited;
+- `kick`: a non-delivering signal wake (`fake_signal_wake_up`).
+
+The freeze points are a user task's first poll, before user mode, and the
+top of the own-stack park loop and `wait4`'s loop. Linux's freezable
+sleeps are the model. The timer tick yields a user-mode task while
+`freezing()` holds, even with nothing else runnable, so a busy task
+reaches the park within a tick.
+
+`freeze_processes` passes over the live tasks like `try_to_freeze_tasks`:
+it kicks each one that is not frozen, then sleeps 1 ms, doubling to 8 ms,
+until none remain. After the timeout it thaws everything and names the
+tasks that refused.
+
+Only `thaw_processes` ends a freeze. Any other wake, `SIGKILL` included,
+finds the task still frozen. An uninterruptible kernel wait (a
+synchronous filesystem read, a lock) is not a freeze point. The freezer
+waits for the task to leave it, so no frozen task holds a lock that device
+freezing or the image writer needs. S3 and s2idle do not freeze yet; the
+S4 coordinator is the first caller.
+
+`freeze_kernel_threads` covers kernel work. NARF's kernel tasks are
+executor futures, not threads, so freezable work means the `WQ_FREEZABLE`
+workqueues (writeback). `freeze_workqueues_begin` sets each one's active
+limit to 0, so new work waits on the inactive list; a freezable workqueue
+created during a freeze starts frozen. Work already active runs to
+completion, and `freeze_kernel_threads` waits for it on the same timeout
+loop. `thaw_workqueues` restores `max_active` and starts the work that
+waited.
+
+#### 3.6.0c Hibernation snapshot
+
+```rust
+// narf_power::hibernate::snapshot
+pub enum SnapshotError { NoMemory { needed: u64, got: u64 }, Grew { copies: u64 } }
+pub fn preallocate() -> Result<Prealloc, SnapshotError>;   // hibernate_preallocate_memory
+impl Prealloc {                                              // frees its copy frames on drop (swsusp_free)
+    pub fn capacity(&self) -> usize;
+    pub unsafe fn take(&mut self) -> Result<(), SnapshotError>;  // swsusp_save, in place
+    pub fn snapshot(&self) -> &Snapshot;
+    pub fn release_spare(&mut self);
+}
+impl Snapshot {
+    pub fn len(&self) -> usize;
+    pub fn pfns(&self) -> &[u64];                            // ascending
+    pub fn page(&self, i: usize) -> (u64, &[u8; 4096]);
+    pub fn release_spare(&mut self);
+}
+```
+
+`preallocate` runs live:
+- it counts the saveable frames (`frame::for_each_saveable_frame` over
+  `frame::saveable_ram_ranges`);
+- it takes that many free frames plus a margin (1/32 plus 1024) for the
+  copies, and marks them in a bitmap so the copy skips them;
+- it reserves the frame-number list.
+
+A system with less free memory than it uses fails here with `NoMemory`.
+Linux shrinks the page cache first.
+
+`take` runs once the devices are frozen, with interrupts off on the only
+CPU running. It copies every saveable frame except the copy frames, in
+place in the `Prealloc`, and allocates nothing. Frames in use beyond the
+margin fail it with `Grew`.
+
+The restored image resumes above the copy, so the `Prealloc` owned there
+still names its copy frames. Dropping it frees them (`swsusp_free`).
+
+The snapshot covers all known RAM, ACPI NVS included. Linux saves only
+`E820_TYPE_RAM` and saves NVS separately (`suspend_nvs_save`), with the
+same effect. The resume refuses a changed memory map.
+
+#### 3.6.0d Hibernation payload
+
+```rust
+// narf_power::suspend_service
+pub trait ImageSource { fn len(&self) -> u64; fn is_empty(&self) -> bool; fn read_at(&self, offset: u64, out: &mut [u8]); }
+impl ImageSource for &[u8];
+SuspendService::seal_source_registered(&mut self, store, policy, image: &dyn ImageSource)
+    -> Result<([u8; 16], SealFanoutReport), ServiceError>;
+// narf_power::hibernate::payload
+pub struct PayloadHeader { pub page_count: u64, pub kernel_virt_base: u64, pub kernel_phys: (u64, u64),
+                           pub ram_hash: [u8; 32], pub arch: [u8; ARCH_RECORD_LEN] }   // swsusp_info
+impl PayloadHeader { pub fn for_running_kernel(page_count: u64) -> Self; pub fn encode(&self) -> [u8; 4096];
+                     pub fn decode(page: &[u8]) -> Result<Self, PayloadError>; }
+pub fn ram_layout_hash(ranges: &[(u64, u64)]) -> [u8; 32];
+pub trait Pages { fn count(&self) -> usize; fn pfn(&self, i: usize) -> u64; fn page(&self, i: usize) -> &[u8; 4096]; }
+pub struct PayloadSource<'a, P: Pages + ?Sized>;   // impl ImageSource
+pub const fn frame_table_offset() -> u64; pub const fn pages_offset(n: u64) -> u64; pub const fn payload_len(n: u64) -> u64;
+pub fn decode_frame_table(bytes: &[u8], page_count: u64) -> Vec<u64>;
+```
+
+The sealed writer reads its plaintext a chunk at a time through
+`ImageSource`, reusing one 1 MiB buffer. Slices keep working unchanged.
+
+The hibernation payload is that plaintext:
+- a header page: magic `NARFSNAP`, version, page count, the kernel's
+  virtual base and physical bounds, the RAM-layout hash, and lane 8's arch
+  restore record;
+- the frame table, page-padded;
+- the pages in table order.
+
+`PayloadSource` streams it from a `Snapshot`.
+
+#### 3.6.0e Hibernation image file
+
+```rust
+// narf_power::hibernate::image_file
+pub const BLOCK: u64 = 4096;                       // the map unit and the resume_offset unit
+pub const MAX_EXTENTS: usize;                      // 169: what one locator block holds
+pub struct Extent { pub file_block: u64, pub device_block: u64, pub blocks: u64 }
+pub struct Locator { pub file_blocks: u64, pub extents: Vec<Extent> }
+impl Locator { pub fn from_map(map: &[u64]) -> Self; pub fn device_block(&self, b: u64) -> Option<u64>;
+               pub fn encode(&self) -> Option<[u8; 4096]>; pub fn decode(page: &[u8]) -> Result<Self, LocatorError>; }
+pub struct ExtentStore<D: ImageStore>;             // impl ImageStore: the file after its locator block
+pub enum ImageFileError { NoMount, NoDevice(String), Fs(FsError), Unmapped(u64), Fragmented(usize), Mismatch, Store }
+pub async fn prepare(path: &str, image_len: u64) -> Result<ImageFile, ImageFileError>;
+impl ImageFile { pub device: String; pub locator: Locator; pub fn resume_offset(&self) -> u64;
+                 pub fn store(&self) -> ExtentStore<BlockStore>; }
+```
+
+This is Linux's swap-file hibernation, using a file of its own.
+
+`prepare` runs before the freeze:
+- it creates or grows the file: `fallocate`, or zeros on a block-mapped
+  ext2;
+- it maps every 4 KiB block with `bmap` (FIBMAP);
+- it finds the device: the mount's source when it names one, or else the
+  one registered device holding what the filesystem wrote.
+
+It writes the locator, the file's first block, through the filesystem,
+then reads it back raw at the mapped block. It checks a marker in the last
+block the same way. A disagreement refuses the file (`Mismatch`) before
+any raw write.
+
+The sealed image then goes raw through `ExtentStore` to the blocks after
+the locator. More than 169 extents refuses the file; Linux chains swap-map
+pages instead. The resume finds the locator through `narf.resume=<device>
+narf.resume_offset=<block>` (4 KiB units), Linux's `resume=` and
+`resume_offset=`.
+
+#### 3.6.0f Hibernation and resume
+
+```rust
+// narf_power::hibernate
+pub const DEFAULT_IMAGE_PATH: &str = "/hibernate.img";      // narf.hibernate_file= overrides
+pub fn policy() -> PolicyLevel;                              // narf.hibernate_policy=off, else Tpm
+pub fn available() -> bool;                                  // hibernation_available: arch restore + (TPM or off)
+pub enum HibernateError { AuthorityRevoked, Busy, SecondaryCpus(u32), NoTpm, ImageFile(..), Freeze(..),
+                          Devices, Snapshot(..), Arch(..), Seal(..) }
+pub async fn hibernate(cap: &Cap<Power, Invoke>) -> Result<(), HibernateError>;  // hibernate()
+pub enum ResumeSkip { NotConfigured, SecondaryCpus(u32), NoDevice(String), NoImage, Refused(..),
+                      Payload(..), MemoryMapChanged, Arch(..), Devices, Store }
+pub fn software_resume() -> ResumeSkip;                      // a Stage::Late initcall
+// narf_power::hibernate::arch
+pub const SUPPORTED: bool;                                   // x86_64 today
+pub struct ArchRecord { pub entry: u64, pub page_table: u64 }  // in PayloadHeader::arch
+pub unsafe fn capture<R>(snapshot: impl FnOnce(ArchRecord) -> R) -> Result<Captured<R>, ArchError>;
+pub unsafe fn restore(record, ram, first_pb_phys, safe: &mut dyn SafeFrames) -> Result<Infallible, ArchError>;
+// narf_power::hibernate::restore
+pub struct Loader;                                           // stages pages in frames the image does not use
+pub fn load_payload(verified: &VerifiedResume, store: &dyn ImageStore) -> Result<(PayloadHeader, Loader), RestoreError>;
+// narf_arch::x86_64::s4_restore
+pub fn copy_loop() -> &'static [u8];                         // core_restore_code, position-independent
+pub unsafe fn jump(temp_cr3, loop_phys, first_pb_phys, entry_virt, image_pml4_phys) -> !;
+```
+
+`hibernate`, run by the power service for a `disk` write to
+`/sys/power/state`, follows Linux's `hibernate()`:
+1. Prepare the image file (§3.6.0e), sized from the frames in use.
+2. `freeze_processes`; the async system-PM prepare for S4;
+   `freeze_kernel_threads`.
+3. `snapshot::preallocate`; `freeze_all_devices`.
+4. With interrupts off, `arch::capture` takes the snapshot.
+5. `thaw_all_devices` (amdgpu stays frozen); seal the payload under a
+   fresh epoch whose only slot the TPM wraps.
+6. `poweroff_all_devices`; `hibernation_power_down`.
+
+A failure on the way thaws everything, recovering (every device resumes),
+and returns the error. The restored image returns from step 4 with
+`Captured::Restored`. It frees its copy frames, runs `restore_all_devices`,
+thaws, zeroes the image header and returns `Ok(())`.
+
+`software_resume` is Linux's `software_resume`: a late initcall, reading
+through the normal block and TPM drivers. It follows `narf.resume=<device>
+narf.resume_offset=<block>` to the locator and runs `attempt_resume`, the
+whole-image verification under the recorded TPM policy. Then:
+1. `load_payload` streams the pages into frames no image page uses,
+   listing (copy, original) pairs (`restore_pblist`).
+2. A RAM-layout hash other than this boot's refuses the image.
+3. The image header is zeroed, so a restore that dies cold-boots next time.
+4. Devices are quiesced (`freeze_all_devices`).
+5. With interrupts off, `arch::restore`.
+
+Any refusal boots on normally.
+
+x86_64's restore reuses S3's saved context and wake trampoline. It builds a
+temporary page table that identity-maps every 2 MiB block holding RAM,
+executable, and keeps the live kernel half. It copies `copy_loop` into a
+safe frame and jumps there. The loop copies the pages with no stack,
+installs the image's kernel half (PML4 slots 256..512, now restored) in the
+temporary table, flushes the TLB including globals, and enters the image's
+`s3_wake_entry` at its *virtual* address, as Linux enters
+`restore_registers`. The wake entry reads the saved context through its
+virtual address (`set_resume_context_virt`), reloads the image's EFER, CR3,
+FS/GS bases, RSP, GDT, IDT, CR0 and CR4, and long-jumps back into
+`capture`. Nothing depends on the image's page table identity-mapping its
+text. The S3
+wake hook skips its device resume while `restoring_image()`.
+
+`narf.hibernate_policy=off` seals under the OFF policy instead of a TPM
+slot. That image is authenticated but readable from the disk, like a
+default Linux image, and the boot prints `OFF_POLICY_WARNING`. A resume
+refuses an OFF image (`OffPolicyRefused`) unless its own command line
+opts in too, so an unsealed image someone planted is never restored.
+
+Both entry points run on the boot CPU (`NotBootCpu` otherwise), because
+the restore resumes the saved context there. The power service pins its
+hibernation task to CPU 0.
+
+After the devices freeze, each secondary CPU is parked between polls with
+its queue intact and stopped (`cpu_lifecycle::cpu_park`, `stop_parked`,
+scheduler §3.5.1). The image is written on the boot CPU alone. The
+restored image restarts the CPUs before its devices' restore callbacks;
+a failure restarts them before thawing. The resume stops the boot kernel's
+own secondary CPUs before the jump, so none of them runs code the image
+overwrites.
+
+aarch64 has no restore yet: `SUPPORTED` is false there, and both entry
+points refuse up front.
 
 #### 3.6.1 Power-off paths vs Linux
 

@@ -5847,6 +5847,54 @@ kernel_test_in!(
     smoke_ext4_extent_truncate_down_frees_blocks_past_eof
 );
 
+/// `bmap` (FIBMAP) on a preallocated extent file: every block maps, to
+/// distinct device blocks; a smaller unit maps inside the block; a larger
+/// unit agrees with the blocks it spans when it maps at all; a block past
+/// the allocation is a hole (0); a unit that does not tile the block size
+/// is refused.
+fn smoke_ext4_bmap_maps_preallocated_blocks() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    const BS: u64 = 1024;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if !matches!(poll_once(file.fallocate(0, 0, 8 * BS)), Some(Ok(()))) {
+        return TestResult::Fail("fallocate failed");
+    }
+    let mut phys = alloc::vec::Vec::new();
+    for block in 0..8 {
+        match poll_once(file.bmap(block, BS as u32)) {
+            Some(Ok(p)) if p != 0 => phys.push(p),
+            _ => return TestResult::Fail("a preallocated block did not map"),
+        }
+    }
+    let mut sorted = phys.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != phys.len() {
+        return TestResult::Fail("two file blocks mapped to one device block");
+    }
+    if poll_once(file.bmap(3, 512)) != Some(Ok(phys[1] * 2 + 1)) {
+        return TestResult::Fail("a sub-block unit did not map inside its block");
+    }
+    match poll_once(file.bmap(1, 4096)) {
+        Some(Ok(0)) => {}
+        Some(Ok(p)) if p * 4 == phys[4] && (1..4).all(|k| phys[4 + k] == phys[4] + k as u64) => {}
+        _ => return TestResult::Fail("a multi-block unit disagreed with its blocks"),
+    }
+    if poll_once(file.bmap(64, BS as u32)) != Some(Ok(0)) {
+        return TestResult::Fail("a block past the allocation was not a hole");
+    }
+    if poll_once(file.bmap(0, 1536)) != Some(Err(FsError::InvalidData)) {
+        return TestResult::Fail("a unit that does not tile the block size was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_bmap_maps_preallocated_blocks);
+
 /// `fallocate` mode 0 and `FALLOC_FL_KEEP_SIZE` on an extent-mapped file
 /// (`ext4_do_fallocate`): holes become unwritten extents — real blocks, so a
 /// later write cannot hit ENOSPC, but reading back as zeros. Mode 0 moves

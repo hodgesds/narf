@@ -30,7 +30,10 @@ pub mod cpu_idle;
 #[cfg(target_arch = "x86_64")]
 mod cpu_idle_tests;
 pub mod device_pm;
+pub mod freezer;
+pub mod hibernate;
 pub mod laptop_state;
+pub mod lps0;
 pub mod monitor;
 pub mod orderly;
 pub mod pci_firmware;
@@ -152,6 +155,17 @@ extern "C" fn s3_resume_hook_entry() {
     unsafe {
         narf_arch::x86_64::s3_resume::restore_lapic_state();
     }
+    // A hibernation image restored through the same wake path runs its
+    // devices' restore callbacks itself, after it returns from the capture.
+    // Its CPU still holds the boot kernel's syscall MSRs and task register.
+    if hibernate::restoring_image() {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the wake continuation, interrupts off, in the image.
+        unsafe {
+            hibernate::arch::fix_cpu_after_restore();
+        }
+        return;
+    }
     let _ = device_pm::resume_all_devices();
     suspend::restore_irq_masks();
     suspend::invoke_fb_resume();
@@ -203,6 +217,30 @@ pub fn register_initcalls() {
     // device-PM fan-out runs from the asm continuation. Must run
     // before any suspend() can be issued; Stage::Subsys gives us
     // that ordering relative to driver bring-up.
+    // `lps0_device_attach`: the LPS0 device's `_DSM` masks, before any
+    // suspend-to-idle and before platform drivers register their handlers.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Subsys, "lps0", || {
+        lps0::setup();
+        InitResult::Ok
+    });
+    // `software_resume`: once the block and TPM drivers are up, before
+    // userspace, restore a hibernation image if `narf.resume=` names one.
+    // It returns only when the boot goes on without one. It must also run
+    // before any filesystem is mounted read-write (Linux resumes before
+    // `prepare_namespace`): a boot kernel that replays a journal or
+    // updates a superblock, then restores an image holding its own view of
+    // that filesystem, corrupts it. power's initcalls are registered ahead
+    // of `root-mount-auto` (frame/src/bare_main.rs), and registration order
+    // is execution order within a stage.
+    narf_init::register(Stage::Late, "hibernate-resume", || {
+        let _ = hibernate::software_resume();
+        InitResult::Ok
+    });
+    // `cargo xtask hibernate-e2e`'s guest half; inert without
+    // `narf.hibernate_e2e=`. After the resume, so a restored image never
+    // reaches it.
+    narf_init::register(Stage::Late, "hibernate-e2e", hibernate::e2e::initcall);
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "s3-resume-hook", || {
         narf_arch::x86_64::s3_resume::set_resume_hook(s3_resume_hook_entry);

@@ -31,6 +31,8 @@ extern crate alloc;
 
 #[cfg(feature = "user-mode-e2e")]
 mod cputime_user;
+#[cfg(feature = "user-mode-e2e")]
+mod freezer_user;
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 mod ia32_user;
 #[cfg(feature = "user-mode-e2e")]

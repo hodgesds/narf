@@ -32,6 +32,7 @@ narf-input        = { path = "../input" }
 narf-crypto       = { path = "../crypto" }
 narf-ctap2        = { path = "../ctap2" }
 narf-block        = { path = "../block" }
+narf-boot         = { path = "../boot" }
 narf-drivers-tpm  = { path = "../drivers/tpm" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 zeroize           = { version = "1", default-features = false, features = ["alloc"] }

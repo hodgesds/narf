@@ -338,3 +338,38 @@ kernel_test_in!(
     "drivers/gpu/amdgpu-dmub",
     dmub_mailbox_authority_checked_at_every_poll
 );
+
+/// `dm_dmub_hw_resume`'s two branches on the engine. A DMCUB still running
+/// its DAL firmware is `is_hw_init` and passes the auto-load wait. One that
+/// S0i3 powered off (DMCUB_CNTL disabled, SCRATCH0 cleared) is not
+/// initialized, and boots again from Stopped on the same allocation.
+fn dmub_s0ix_resume_checks_hw_init_and_reboots_a_lost_dmcub() -> TestResult {
+    let (_pool, mut engine) = fixture();
+    if narf_scheduler::block_on_spin(engine.boot(BootOptions::default())).is_err() {
+        return TestResult::Fail("boot");
+    }
+    if engine.is_hw_init() != Ok(true)
+        || narf_scheduler::block_on_spin(engine.wait_for_auto_load()).is_err()
+    {
+        return TestResult::Fail("a running DMCUB not seen as initialized");
+    }
+    engine.io.regs[CNTL as usize] &= !ENABLE;
+    engine.io.regs[STATUS as usize] = 0;
+    if engine.is_hw_init() != Ok(false) {
+        return TestResult::Fail("a powered-off DMCUB seen as initialized");
+    }
+    engine.state = State::Stopped;
+    // The model tracks one staging pass; a new boot stages from offset 0.
+    engine.io.uploaded = 0;
+    if narf_scheduler::block_on_spin(engine.boot(BootOptions::default())).is_err()
+        || engine.state != State::Running
+        || engine.is_hw_init() != Ok(true)
+    {
+        return TestResult::Fail("the lost DMCUB did not boot again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu-dmub",
+    dmub_s0ix_resume_checks_hw_init_and_reboots_a_lost_dmcub
+);

@@ -1047,6 +1047,11 @@ pub(crate) enum GraphicsPm {
     /// Frozen for hibernation: the TMR released and the GPU reset (mode 2),
     /// as `amdgpu_pmops_freeze` leaves an APU while the image is written.
     Frozen,
+    /// Suspend-to-idle on Linux's s0ix path: clients paused, the rings
+    /// drained, media suspended. The sync suspend then blanks the stream and
+    /// halts the RLC, IH, MMHUB and the doorbells. GFX, SDMA and the PSP are
+    /// never suspended, and all of it resumes in place.
+    S0ix,
 }
 /// Why Raphael would not take Linux's s0ix path for a suspend-to-idle
 /// (`amdgpu_acpi_is_s0ix_active` for an APU, in its order).
@@ -1062,9 +1067,12 @@ pub(crate) enum S0ix {
     /// `CONFIG_AMD_PMC`).
     NoPmc,
 }
-/// Whether an AMD PMC driver exists to send the SoC its S0i3 OS hint and
-/// run the LPS0 `_DSM` calls. None does yet.
-const AMD_PMC: bool = false;
+/// Whether the AMD PMC driver bound (Linux's `CONFIG_AMD_PMC`): it sends the
+/// SoC its S0i3 OS hint through the LPS0 handler list (`drivers/platform`'s
+/// `amd_pmc`).
+fn amd_pmc() -> bool {
+    narf_power::lps0::has_handler("amd_pmc")
+}
 pub(crate) fn s0ix(gfxoff: bool, low_power_s0: bool, pmc: bool) -> S0ix {
     if !gfxoff {
         S0ix::NoGfxoff
@@ -1084,6 +1092,9 @@ pub(crate) enum ResumeWork {
     Rebuild,
     /// The GPU never lost power: reset it (mode 2), then rebuild.
     ResetThenRebuild,
+    /// An s0ix cycle: the sync resume brought the engines back in place.
+    /// Media restarts with its sessions and the clients are served again.
+    InPlace,
 }
 pub(crate) fn resume_work(state: GraphicsPm) -> ResumeWork {
     match state {
@@ -1092,6 +1103,7 @@ pub(crate) fn resume_work(state: GraphicsPm) -> ResumeWork {
         // finds it reset: the sync resume booted the PSP either way.
         GraphicsPm::Stopped | GraphicsPm::Frozen => ResumeWork::Rebuild,
         GraphicsPm::Quiesced | GraphicsPm::Freezing => ResumeWork::ResetThenRebuild,
+        GraphicsPm::S0ix => ResumeWork::InPlace,
     }
 }
 /// Where the sync suspend leaves graphics once the PSP stop has run, and
@@ -1157,7 +1169,11 @@ async fn prepare_graphics_idle() {
     }
     let gfxoff = crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw()).gfxoff;
     let low_power_s0 = narf_acpi::fadt_pm().is_some_and(|fadt| fadt.low_power_s0);
-    let why = s0ix(gfxoff, low_power_s0, AMD_PMC);
+    let why = s0ix(gfxoff, low_power_s0, amd_pmc());
+    if why == S0ix::Active {
+        prepare_graphics_s0ix().await;
+        return;
+    }
     let mut guard = DISPLAY.lock().await;
     let Some(display) = guard.as_mut() else {
         return;
@@ -1173,6 +1189,51 @@ async fn prepare_graphics_idle() {
     let _ = writeln!(
         narf_console::Writer,
         "amdgpu: raphael s2idle without s0ix ({why:?}): graphics and display stay up"
+    );
+}
+/// The async half of Linux's s0ix suspend (`amdgpu_device_suspend` with
+/// `in_s0ix`):
+/// - `amdgpu_fence_driver_hw_fini`'s wait for the rings;
+/// - the client path paused with its VMIDs and media sessions kept;
+/// - `vcn_v3_0_suspend`, with each VCPU saved.
+///
+/// No PG/CG is ungated: Linux skips GFX and SDMA there. The sync suspend
+/// does the rest (`GraphicsPm::S0ix`).
+async fn prepare_graphics_s0ix() {
+    use core::fmt::Write as _;
+    {
+        // amdgpu_device_prepare: a scheduled GFXOFF allow is delivered now,
+        // so GFX is off before the park instead of 100 ms into it.
+        let mut owner = graphics_owner().await;
+        if let Some(boot) = owner.get() {
+            if let Err(error) = boot.flush_gfx_off().await {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael GFXOFF flush {error:?}"
+                );
+            }
+        }
+    }
+    drain_rings().await;
+    let mut guard = DISPLAY.lock().await;
+    let Some(display) = guard.as_mut() else {
+        return;
+    };
+    let Some(graphics) = display.graphics.as_mut().filter(|g| g.queues_verified()) else {
+        return;
+    };
+    crate::amdgpu_navi22_cs::pause();
+    crate::amdgpu_navi22_tdr::stop();
+    if let Err(error) = graphics.suspend_media().await {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: raphael media sessions not saved: {error:?}"
+        );
+    }
+    display.graphics_pm = GraphicsPm::S0ix;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: raphael s2idle on the s0ix path"
     );
 }
 async fn prepare_graphics_suspend() {
@@ -1317,6 +1378,29 @@ async fn resume_graphics() {
     if work == ResumeWork::Nothing {
         // A suspend-to-idle left everything running.
         display.graphics_pm = GraphicsPm::Running;
+        return;
+    }
+    if work == ResumeWork::InPlace {
+        // amdgpu_device_ip_resume_phase2 with in_s0ix: media restarts with
+        // its saved sessions (GFX, SDMA and the PSP were never suspended),
+        // then the clients are served again on their kept VMIDs.
+        display.graphics_pm = GraphicsPm::Running;
+        let Display {
+            loader, graphics, ..
+        } = display;
+        if let Some(graphics) = graphics.as_mut() {
+            // SAFETY: the s0ix prepare stopped media; nothing has run on it.
+            unsafe { graphics.media_after_s0ix() };
+            alloc::boxed::Box::pin(media_boot(graphics, loader)).await;
+            crate::amdgpu_navi22_cs::register_raphael(graphics);
+            if let Err(error) = graphics.gate_after_s0ix().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael s0ix gating {error:?}"
+                );
+            }
+        }
         return;
     }
     let Display {
@@ -1842,6 +1926,25 @@ pub(crate) fn suspend() -> bool {
             return false;
         }
     }
+    if *graphics_pm == GraphicsPm::S0ix {
+        // amdgpu_device_ip_suspend_phase2 with in_s0ix: the PSP keeps its TMR,
+        // so the loader is not stopped.
+        if let Some(graphics) = graphics.as_mut() {
+            // SAFETY: the async prepare paused clients, drained the rings and
+            // suspended media; the sync resume brings these back first.
+            let result = narf_scheduler::block_on_spin(alloc::boxed::Box::pin(unsafe {
+                graphics.suspend_s0ix()
+            }));
+            if let Err(error) = result {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael s0ix suspend {error:?}"
+                );
+            }
+        }
+        return true;
+    }
     if matches!(*graphics_pm, GraphicsPm::Quiesced | GraphicsPm::Freezing) {
         // The async prepare quiesced graphics. S3 powers the engines off,
         // which is the reset releasing the TMR under them needs; a
@@ -1885,6 +1988,7 @@ pub(crate) fn resume() -> bool {
     let Display {
         loader,
         stream,
+        graphics,
         graphics_pm,
         ..
     } = display;
@@ -1892,7 +1996,33 @@ pub(crate) fn resume() -> bool {
         // Nothing was suspended (see `prepare_graphics_idle`).
         return true;
     }
-    if narf_scheduler::block_on_spin(async {
+    let s0ix = *graphics_pm == GraphicsPm::S0ix;
+    if s0ix {
+        // amdgpu_device_ip_resume_phase1 with in_s0ix: COMMON, GMC, IH in
+        // place. The PSP kept its TMR, so the loader is not booted.
+        if let Some(graphics) = graphics.as_mut() {
+            // SAFETY: `suspend_s0ix` ran and nothing touched the GPU since.
+            let result = narf_scheduler::block_on_spin(alloc::boxed::Box::pin(unsafe {
+                graphics.resume_s0ix()
+            }));
+            if let Err(error) = result {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: raphael s0ix resume {error:?}"
+                );
+            }
+        }
+        // dm_resume's dm_dmub_hw_resume: DMCUB checked, and booted again from
+        // the TMR only if S0i3 lost it; then its notifications.
+        if narf_scheduler::block_on_spin(async {
+            loader.resume_dmub(Default::default()).await?;
+            loader.enable_notifications().await
+        })
+        .is_err()
+        {
+            return false;
+        }
+    } else if narf_scheduler::block_on_spin(async {
         loader.boot(Default::default()).await?;
         loader.enable_notifications().await
     })
@@ -1905,7 +2035,10 @@ pub(crate) fn resume() -> bool {
     // re-cleared because VRAM contents do not survive a suspend.
     if let Some(running) = stream.as_mut() {
         let replayed = narf_scheduler::block_on_spin(async {
-            running.scanout.clear().await;
+            // VRAM, system memory on an APU, survives an s0ix cycle.
+            if !s0ix {
+                running.scanout.clear().await;
+            }
             running.pipeline.start().await?;
             running
                 .pipeline
@@ -1969,6 +2102,10 @@ mod tests {
             || resume_work(GraphicsPm::Freezing) != ResumeWork::ResetThenRebuild
         {
             return TestResult::Fail("S4 resume work");
+        }
+        // An s0ix cycle resumed the engines in place: no reset, no rebuild.
+        if resume_work(GraphicsPm::S0ix) != ResumeWork::InPlace {
+            return TestResult::Fail("s0ix resume work");
         }
         TestResult::Pass
     }
@@ -2085,8 +2222,8 @@ mod tests {
         TestResult::Pass
     }
     /// amdgpu_acpi_is_s0ix_active for an APU suspending to idle, in Linux's
-    /// order: GFXOFF allowed, the FADT's LOW_POWER_S0, then AMD PMC. NARF has
-    /// no PMC driver, so s0ix is never active yet.
+    /// order: GFXOFF allowed, the FADT's LOW_POWER_S0, then AMD PMC, which
+    /// counts once `amd_pmc` registered its LPS0 handler.
     fn raphael_s0ix_follows_amdgpu_acpi_is_s0ix_active() -> TestResult {
         for (gfxoff, lps0, pmc, want) in [
             (false, true, true, S0ix::NoGfxoff),
@@ -2099,7 +2236,8 @@ mod tests {
                 return TestResult::Fail("s0ix decision order");
             }
         }
-        if s0ix(true, true, AMD_PMC) == S0ix::Active {
+        // The kernel-test boot binds no AMD PMC (no ACPI PMC device).
+        if s0ix(true, true, amd_pmc()) == S0ix::Active {
             return TestResult::Fail("s0ix active without an AMD PMC driver");
         }
         TestResult::Pass

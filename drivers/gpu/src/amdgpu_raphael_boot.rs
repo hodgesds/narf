@@ -205,6 +205,10 @@ impl ColdBoot {
         {
             return Err(Error::Invalid);
         }
+        {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "{}", discovery_line(&gpu.ip_blocks));
+        }
         let gpu = snapshot(gpu)?;
         // SAFETY: forwarded exclusive ownership; every constructor below only
         // validates layouts, reserves memory or maps BAR2.
@@ -529,6 +533,14 @@ impl ColdBoot {
             .await
             .map_err(Error::GfxOff)
     }
+    /// `amdgpu_device_prepare`'s flush of the delayed GFXOFF allow.
+    pub(crate) async fn flush_gfx_off(&mut self) -> Result<bool, Error> {
+        let mut hw = GcPower {
+            smu: &mut self.smu,
+            gfx: &mut self.gfx,
+        };
+        self.gfxoff.flush(&mut hw).await.map_err(Error::GfxOff)
+    }
     /// `amdgpu_gfx_off_ctrl(false)` around a driver read of GC registers.
     async fn hold_gc(&mut self) -> Result<(), Error> {
         let mut hw = GcPower {
@@ -701,6 +713,128 @@ impl ColdBoot {
         self.media
             .as_ref()
             .is_some_and(|media| media.sessions_restored())
+    }
+    /// The engine half of Linux's s0ix suspend, after the display, in its
+    /// reverse IP order:
+    /// - `smu_disable_dpms`'s RLC halt (`gfx_v10_0_rlc_stop`);
+    /// - `navi10_ih_hw_fini`;
+    /// - MMHUB's `gart_disable`;
+    /// - `nv_common_hw_fini`'s doorbell apertures.
+    ///
+    /// GFX, SDMA and the PSP are left alone: GFX stays in GFXOFF and the
+    /// TMR stays loaded. Every step runs even if one before it failed, as
+    /// Linux logs and goes on; the first error is returned.
+    ///
+    /// # Safety
+    /// Clients are paused, every ring has drained, media is suspended, and
+    /// nothing touches the GPU until `resume_s0ix`.
+    pub(crate) async unsafe fn suspend_s0ix(&mut self) -> Result<(), Error> {
+        // amdgpu_device_ip_suspend_phase1: set_cg_state(UNGATE), which skips
+        // GFX and SDMA in s0ix.
+        let cg = self.s0ix_clock_gating(false).await;
+        let rlc = self.gfx.stop_rlc().map_err(Error::Queues);
+        // SAFETY: forwarded; nothing waits on IH delivery until the resume.
+        let ih = unsafe { self.ih.suspend() }
+            .await
+            .map_err(Error::Interrupts);
+        // SAFETY: forwarded; no MMHUB client runs until the resume.
+        let mmhub = unsafe { self.gmc.suspend_mmhub() }.map_err(Error::MemoryHubs);
+        // SAFETY: forwarded; nothing rings a doorbell until the resume.
+        let doorbells = unsafe {
+            cp::disable_doorbell_apertures_raphael(&self.gpu, self.authority, self.doorbells)
+        }
+        .map_err(Error::Queues);
+        cg.and(rlc).and(ih).and(mmhub).and(doorbells)
+    }
+    /// The blocks Linux's s0ix cycle ungates and gates again: every gated
+    /// block but GFX and SDMA (`amdgpu_device_set_cg_state` skips them in
+    /// s0ix). GMC counts only on DF 3.0.2 or older, because
+    /// `gmc_v10_0_set_clockgating_state` keeps MMHUB and ATHUB gating on newer
+    /// DF ("mmhub can't disconnect from DF"). A DF that discovery does not
+    /// list reads as version 0, as `amdgpu_ip_version` gives it.
+    fn s0ix_clock_blocks(&self) -> gating::Blocks {
+        use crate::amdgpu_discovery::{find_ip, HW_ID_DF};
+        let df = find_ip(&self.gpu.ip_blocks, HW_ID_DF, 0)
+            .map_or((0, 0, 0), |b| (b.major, b.minor, b.revision));
+        let blocks =
+            gating::Blocks::of(gating::Ip::Common).union(gating::Blocks::of(gating::Ip::Ih));
+        if df > (3, 0, 2) {
+            blocks
+        } else {
+            blocks.union(gating::Blocks::of(gating::Ip::Gmc))
+        }
+    }
+    /// `amdgpu_device_set_cg_state` over [`Self::s0ix_clock_blocks`].
+    async fn s0ix_clock_gating(&mut self, gate: bool) -> Result<(), Error> {
+        let blocks = self.s0ix_clock_blocks();
+        let Some(gating) = self.gating.as_mut() else {
+            return Ok(());
+        };
+        // SAFETY: the coordinator owns every gated block. GFX is not among
+        // them, so GC need not be powered, and `amdgpu.cg_mask` admitted the
+        // flags.
+        unsafe { gating.set_clockgating(gate, blocks) }
+            .await
+            .map_err(Error::ClockGating)
+    }
+    /// `amdgpu_device_ip_late_init`'s `set_cg_state(GATE)` after an s0ix
+    /// resume, again without GFX and SDMA.
+    pub(crate) async fn gate_after_s0ix(&mut self) -> Result<(), Error> {
+        self.s0ix_clock_gating(true).await
+    }
+    /// The engine half of Linux's s0ix resume, before the display:
+    /// - COMMON: `nv_common_hw_init`'s NBIO init, then the doorbell
+    ///   apertures with `nv_common_late_init`'s self-ring;
+    /// - GMC: MMHUB's `gart_enable`;
+    /// - IH, on its ring with its subscriptions.
+    ///
+    /// An owner whose suspend did not run refuses its resume (`Busy`),
+    /// and that refusal is not an error here.
+    ///
+    /// # Safety
+    /// `suspend_s0ix` ran and nothing has touched the GPU since.
+    pub(crate) async unsafe fn resume_s0ix(&mut self) -> Result<(), Error> {
+        // SAFETY: forwarded.
+        let nbio = unsafe { self.gmc.resume_nbio() }.map_err(Error::MemoryHubs);
+        // SAFETY: forwarded; the apertures come back on the same BAR.
+        let doorbells = unsafe {
+            cp::enable_doorbell_apertures_raphael(&self.gpu, self.authority, self.doorbells)
+        }
+        .map_err(Error::Queues);
+        let not_suspended = |r: &Result<(), Error>| {
+            matches!(
+                r,
+                Err(Error::MemoryHubs(gmc::Error::Busy) | Error::Interrupts(ih::Error::Busy))
+            )
+        };
+        // SAFETY: forwarded.
+        let mut mmhub = unsafe { self.gmc.resume_mmhub() }
+            .await
+            .map_err(Error::MemoryHubs);
+        if not_suspended(&mmhub) {
+            mmhub = Ok(());
+        }
+        // SAFETY: forwarded; the same ring and route.
+        let mut ih = unsafe { self.ih.resume() }
+            .await
+            .map(drop)
+            .map_err(Error::Interrupts);
+        if not_suspended(&ih) {
+            ih = Ok(());
+        }
+        nbio.and(doorbells).and(mmhub).and(ih)
+    }
+    /// The media owner back to Prepared after the s0ix suspend stopped it
+    /// with its VCPU saved, so `run_media` starts it again and the firmware
+    /// finds its sessions.
+    ///
+    /// # Safety
+    /// `suspend_media` stopped every instance; no media work is in flight.
+    pub(crate) unsafe fn media_after_s0ix(&mut self) {
+        if let Some(media) = self.media.as_mut() {
+            // SAFETY: forwarded; the stopped VCPUs reach no memory.
+            unsafe { media.rearm() };
+        }
     }
     /// Drop a saved VCPU BO, so the next media start begins with no
     /// sessions (a recovery's).
@@ -958,6 +1092,32 @@ async fn trap_round_trip(ih: &mut ih::Ih, sdma: &mut sdma::Sdma) -> Result<(), E
         .await
         .map_err(Error::Interrupts)?;
     Ok(())
+}
+
+/// The blocks whose Raphael versions this port infers rather than knows:
+/// no Raphael discovery table has been read. Each is accepted at every
+/// version Linux drives with the same functions.
+const INFERRED: [(&str, u16); 6] = [
+    ("NBIF", crate::amdgpu_discovery::HW_ID_NBIF),
+    ("MMHUB", crate::amdgpu_discovery::HW_ID_MMHUB),
+    ("ATHUB", crate::amdgpu_discovery::HW_ID_ATHUB),
+    ("OSSSYS", crate::amdgpu_discovery::HW_ID_OSSSYS),
+    ("HDP", crate::amdgpu_discovery::HW_ID_HDP),
+    ("SMUIO", crate::amdgpu_discovery::HW_ID_SMUIO),
+];
+/// One boot line with the discovered versions of [`INFERRED`]'s blocks
+/// (instance 0; `-` where discovery lists none), so the first boot on the
+/// hardware confirms or refutes them.
+pub(crate) fn discovery_line(blocks: &[crate::amdgpu_discovery::IpBlock]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut line = alloc::string::String::from("amdgpu: raphael discovery:");
+    for (name, id) in INFERRED {
+        let _ = match crate::amdgpu_discovery::find_ip(blocks, id, 0) {
+            Some(b) => write!(line, " {name} {}.{}.{}", b.major, b.minor, b.revision),
+            None => write!(line, " {name} -"),
+        };
+    }
+    line
 }
 
 /// Boot-only checkpoints, never a poll-loop trace.

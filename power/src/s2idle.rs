@@ -69,11 +69,10 @@
 //! the bounded test entry; no production park is offered there.
 //!
 //! Task freezing: like the S3 core today, the phase progression
-//! marks `FreezingUserspace` / `ThawingUserspace` but no scheduler
-//! freezer exists yet to reuse; the executor's worker task is the
-//! only task that parks, and device quiesce is what makes the park
-//! safe. A real freezer is a scheduler-side follow-up for both
-//! sleep states, not something to fake here.
+//! marks `FreezingUserspace` / `ThawingUserspace` without calling
+//! [`crate::freezer::freeze_processes`]; the executor's worker task is
+//! the only task that parks, and device quiesce is what makes the park
+//! safe. Hibernation is the freezer's first caller.
 
 extern crate alloc;
 
@@ -500,6 +499,9 @@ fn s2idle_after_claim(
     // no FACS vector, no PM1 write. What remains is the IRQ mask
     // snapshot — non-wake vectors must not fire into quiesced
     // drivers — and the park itself.
+    // `acpi_s2idle_prepare_late_lps0`: screen off, LPS0 entry and the
+    // registered handlers' prepare (the AMD PMC's S0i3 OS hint).
+    crate::lps0::prepare_late();
     let allowlist = wake_irq_allowlist();
     let _ = suspend::snapshot_and_mask_irqs(&allowlist);
     // Consume any latch set before the park, immediately before
@@ -528,6 +530,9 @@ fn s2idle_after_claim(
         STAT_WAKES.fetch_add(1, Ordering::Relaxed);
     }
     WAKE_LATCH.store(false, Ordering::Release);
+    // `acpi_s2idle_restore_early_lps0`: the handlers' restore, LPS0 exit
+    // and screen on, before any device resumes.
+    crate::lps0::restore_early();
 
     suspend::set_phase(SuspendPhase::RestoringCpuState);
     suspend::set_phase(SuspendPhase::ResumingDrivers);
@@ -567,6 +572,8 @@ fn park(max_halts: Option<u64>) -> ParkExit {
                 break ParkExit::BoundExhausted;
             }
         }
+        // `s2idle_loop`: the platform's check before each idle entry.
+        crate::lps0::check();
         invoke_park_step_hook();
         // The step hook models a wake source firing while parked;
         // give its latch the same immediate re-check a delivered

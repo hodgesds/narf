@@ -34,7 +34,7 @@ use zeroize::Zeroizing;
 
 use super::custody::Secret32;
 use super::format::{
-    self, ImageClaims, ImageStore, PolicyLevel, RecordedPolicy, SealedBody, CHUNK_LEN,
+    self, ImageClaims, ImageSource, ImageStore, PolicyLevel, RecordedPolicy, SealedBody, CHUNK_LEN,
     FORMAT_VERSION, IMAGE_MAGIC, PAGE_LEN, SEALED_BODY_LEN, SEALED_BODY_STORED, TAG_LEN,
     WRAPPED_SMK_LEN,
 };
@@ -124,7 +124,7 @@ pub(crate) struct WriteRequest<'a> {
     pub smk: &'a Secret32,
     pub image_id: [u8; 16],
     pub smk_wrap_nonce: [u8; 12],
-    pub image: &'a [u8],
+    pub image: &'a dyn ImageSource,
     /// Encoded hook region (P2, design §5): already AEAD-sealed
     /// blobs from the seal fan-out, written between the manifest
     /// and the chunks; its length is recorded in the sealed body,
@@ -141,7 +141,7 @@ pub(crate) fn write_image(
     store: &mut dyn ImageStore,
     req: &WriteRequest<'_>,
 ) -> Result<(), ServiceError> {
-    let image_len = req.image.len() as u64;
+    let image_len = req.image.len();
     if image_len == 0 {
         return Err(ServiceError::EmptyImage);
     }
@@ -153,21 +153,25 @@ pub(crate) fn write_image(
     let img_key = image_key(req.smk);
     let man_key = manifest_key(req.smk);
 
-    // Chunks first: AEAD each under the image key, collecting tags.
+    // Chunks first: AEAD each under the image key, collecting tags. One
+    // chunk buffer is reused, so a streamed image never needs more.
     let mut tags: Vec<[u8; TAG_LEN]> = Vec::with_capacity(chunk_count as usize);
+    let mut chunk = Vec::new();
     for index in 0..chunk_count {
-        let start = (index * CHUNK_LEN) as usize;
-        let end = core::cmp::min(start + CHUNK_LEN as usize, req.image.len());
-        let mut buf = req.image[start..end].to_vec();
+        let start = index * CHUNK_LEN;
+        let end = core::cmp::min(start + CHUNK_LEN, image_len);
+        chunk.resize((end - start) as usize, 0);
+        req.image.read_at(start, &mut chunk);
+        let buf = &mut chunk[..];
         let tag = chacha20_poly1305_seal(
             &img_key,
             &format::chunk_nonce(index),
             &format::chunk_aad(&req.image_id, index),
-            &mut buf,
+            buf,
         );
         store.write_all(
             format::chunk_offset(chunk_count, hook_region_len, index),
-            &buf,
+            buf,
         )?;
         tags.push(tag);
     }

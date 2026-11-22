@@ -317,6 +317,10 @@ impl Blocks {
     /// Everything else (policy feature `ClockGating`): hubs, HDP, IH, SDMA.
     pub const SOC: Self =
         Self(1 << Ip::Common as u8 | 1 << Ip::Gmc as u8 | 1 << Ip::Ih as u8 | 1 << Ip::Sdma as u8);
+    /// `ip` alone.
+    pub const fn of(ip: Ip) -> Self {
+        Self(1 << ip as u8)
+    }
     pub const fn contains(self, ip: Ip) -> bool {
         self.0 & 1 << ip as u8 != 0
     }

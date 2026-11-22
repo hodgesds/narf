@@ -782,3 +782,73 @@ kernel_test_in!(
     "drivers/gpu/gmc-navi22",
     gmc_navi22_rearm_reuses_the_aperture_and_gart
 );
+
+/// An s0ix MMHUB cycle (`mmhub_v2_3_gart_disable`, then the MMHUB half of
+/// `gmc_v10_0_gart_enable`). The suspend turns off MMHUB's contexts, L1 TLB,
+/// advanced driver model and L2 cache, and clears L2_CNTL3. The resume puts
+/// every MMHUB register back as the boot, the GART enable and the fault
+/// switch left it. Neither touches the GFX hub, which GFXOFF keeps, and the
+/// flush invalidates MMHUB alone. Pairs are enforced.
+fn gmc_navi22_s0ix_cycle_restores_mmhub_alone() -> TestResult {
+    let (_pool, mut engine) = fixture_sized(BYTES + (1 << 20) + 2 * 4096);
+    engine.vram_size = 12272 << 20;
+    if run(engine.initialize()).is_err()
+        || engine.prepare_gart().is_err()
+        || run(engine.enable_gart()).is_err()
+        || engine.set_fault_interrupts(true).is_err()
+    {
+        return TestResult::Fail("bring-up");
+    }
+    let (layout, before, from) = (
+        engine.layout,
+        engine.io.registers.clone(),
+        engine.io.writes.len(),
+    );
+    let at = |hub: usize, reg: u32| layout.bases[hub] + u64::from(reg) * 4;
+    let (gfx, mm) = (layout.hubs[0], layout.hubs[1]);
+    if run(engine.resume_mmhub()) != Err(Error::Busy) || engine.suspend_mmhub().is_err() {
+        return TestResult::Fail("resume before suspend, or the suspend");
+    }
+    let reg =
+        |engine: &Engine<Fake>, hub, r| engine.io.registers.get(&at(hub, r)).copied().unwrap_or(0);
+    if engine.suspend_mmhub() != Err(Error::Busy)
+        || (0..16).any(|c| reg(&engine, 1, mm.ctx + c * mm.ctx_distance) != 0)
+        || reg(&engine, 1, mm.l1) & 0x41 != 0
+        || reg(&engine, 1, mm.l2) & 1 != 0
+        || reg(&engine, 1, mm.l2_3) != 0
+    {
+        return TestResult::Fail("mmhub_v2_3_gart_disable");
+    }
+    if run(engine.resume_mmhub()).is_err() {
+        return TestResult::Fail("the resume");
+    }
+    let flush = [mm.inv_req, mm.inv_ack, mm.inv_sem].map(|r| at(1, r));
+    let restored = before
+        .iter()
+        .filter(|(a, _)| !flush.contains(a))
+        .all(|(a, v)| engine.io.registers.get(a) == Some(v));
+    let gfx_regs: alloc::vec::Vec<u64> = (0..16)
+        .map(|c| gfx.ctx + c * gfx.ctx_distance)
+        .chain([
+            gfx.l1,
+            gfx.l2,
+            gfx.l2_3,
+            gfx.pt_base,
+            gfx.fault_cntl,
+            gfx.inv_req,
+        ])
+        .map(|r| at(0, r))
+        .collect();
+    let cycle = &engine.io.writes[from..];
+    if !restored
+        || cycle.iter().any(|(a, _)| gfx_regs.contains(a))
+        || !cycle.iter().any(|&(a, _)| a == at(1, mm.inv_req))
+    {
+        return TestResult::Fail("MMHUB not restored, the GFX hub touched, or no MMHUB flush");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi22",
+    gmc_navi22_s0ix_cycle_restores_mmhub_alone
+);

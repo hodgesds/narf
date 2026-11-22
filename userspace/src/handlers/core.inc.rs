@@ -14979,6 +14979,8 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
         .wait_child_is_waitid
         .load(core::sync::atomic::Ordering::Acquire);
     loop {
+        // wait4 sleeps TASK_FREEZABLE: a freeze point before each check.
+        crate::user_task::refrigerator(uctx);
         let mut status = 0i32;
         let reaped =
             crate::user_task::call_wait_child_check(parent, want_pid, options, &mut status);

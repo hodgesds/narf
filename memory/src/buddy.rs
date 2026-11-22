@@ -411,6 +411,20 @@ impl FrameStateIndex {
         }
     }
 
+    /// The free run a frame's word starts, for a hibernation snapshot's walk:
+    /// `None` when the frame has no word, `Some(0)` when the word starts no
+    /// free run (an allocated frame, the interior of a free block, or a frame
+    /// never handed out), and `Some(n)` for the `n` free frames from it (a
+    /// free-block head, or one cached frame).
+    pub(crate) fn free_run(&self, frame: u64) -> Option<u64> {
+        let state = self.slot(frame)?.load(Ordering::Acquire);
+        Some(match state & STATE_KIND_MASK {
+            0 => 0,
+            STATE_KIND_CACHED => 1,
+            kind => order_frames((kind - 1) as u8),
+        })
+    }
+
     /// Validate and claim the free of the order-`order` block at `frame`:
     /// on success its head and tail words are 0 (the caller now holds the
     /// block as free). A frame without a word is accepted unchecked. The head

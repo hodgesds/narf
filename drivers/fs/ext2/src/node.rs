@@ -921,6 +921,50 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         })
     }
 
+    /// `ext4_bmap` / `generic_block_bmap` (FIBMAP): the device block that
+    /// holds the file's `block`, both counted in `block_size` units. A hole
+    /// is 0, as Linux answers. A `block_size` larger than the filesystem's
+    /// maps only when its filesystem blocks are contiguous and aligned (else
+    /// 0); one that neither divides nor is a multiple of it is refused.
+    /// Preallocated (unwritten) extents map to their blocks. Hibernation
+    /// maps its image file through this, as Linux's swap-file setup does.
+    fn bmap<'a>(&'a self, block: u64, block_size: u32) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            let fs_bs = self.volume.block_size() as u64;
+            let bs = u64::from(block_size);
+            if bs == 0 || (fs_bs % bs != 0 && bs % fs_bs != 0) {
+                return Err(FsError::InvalidData);
+            }
+            let byte = block.checked_mul(bs).ok_or(FsError::InvalidData)?;
+            let inode_no = self.state.lock().inode_no;
+            let inode = self.volume.read_inode(inode_no).await?;
+            let first = self
+                .volume
+                .map_block_allocated(&inode, byte / fs_bs)
+                .await?;
+            if first == 0 {
+                return Ok(0);
+            }
+            if bs <= fs_bs {
+                return Ok((first * fs_bs + byte % fs_bs) / bs);
+            }
+            if (first * fs_bs) % bs != 0 {
+                return Ok(0);
+            }
+            for k in 1..bs / fs_bs {
+                if self
+                    .volume
+                    .map_block_allocated(&inode, byte / fs_bs + k)
+                    .await?
+                    != first + k
+                {
+                    return Ok(0);
+                }
+            }
+            Ok(first * fs_bs / bs)
+        })
+    }
+
     /// `ext4_fallocate`. The VFS checks (`vfs_fallocate`: argument ranges,
     /// mode combinations, fd mode, file type, immutable/append-only) are the
     /// syscall layer's; what reaches here is a valid request.

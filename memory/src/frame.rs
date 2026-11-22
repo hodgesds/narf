@@ -353,6 +353,79 @@ static FRAME_INDEX: buddy::FrameStateIndex = buddy::FrameStateIndex::new();
 /// owners, or loop a cache's list back on itself. Stays 0 in a correct kernel.
 static DOUBLE_FREES_REFUSED: AtomicU64 = AtomicU64::new(0);
 
+/// The RAM a hibernation snapshot covers, as sorted, merged, page-aligned
+/// `[start_pfn, end_pfn)` ranges: every boot range known to be RAM (usable,
+/// the kernel image and modules, ACPI reclaimable and NVS) and every online
+/// hot-plugged block. Linux saves only `E820_TYPE_RAM` and restores NVS
+/// separately (`suspend_nvs_save`). Here NVS travels in the image instead,
+/// with the same effect, and the resume's memory-map check makes the
+/// layout the same.
+pub fn saveable_ram_ranges() -> Vec<(u64, u64)> {
+    let mut bytes: Vec<(u64, u64)> = BOOT_KNOWN_RAM.lock().clone();
+    bytes.extend(BOOT_MEMORY_RANGES.lock().iter().copied());
+    bytes.extend(
+        HOTPLUG_RANGES
+            .lock()
+            .iter()
+            .filter(|range| range.online)
+            .map(|range| (range.start, range.len)),
+    );
+    let mut pfns: Vec<(u64, u64)> = bytes
+        .into_iter()
+        .filter_map(|(start, len)| {
+            let end = start.checked_add(len)? >> PAGE_SHIFT;
+            let start = start.div_ceil(PAGE_SIZE);
+            (start < end).then_some((start, end))
+        })
+        .collect();
+    pfns.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(pfns.len());
+    for (start, end) in pfns {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// A hibernation snapshot's walk (`saveable_page` over a range): call
+/// `save(pfn)` for each frame of `[start_pfn, end_pfn)` the allocator does
+/// not hold free. A free block is skipped from its head, so its interior
+/// frames are never saved. A frame in a per-CPU cache is free. A frame with
+/// no state word (outside every managed section) or with an empty word that
+/// no free block covers (never handed out, such as an excluded range) is
+/// saved.
+///
+/// Lock-free and allocation-free, so it can run with interrupts off. The
+/// answer is exact only while nothing else allocates or frees: the caller
+/// is the only CPU running, with interrupts masked.
+pub fn for_each_saveable_frame(start_pfn: u64, end_pfn: u64, mut save: impl FnMut(u64)) {
+    let mut pfn = start_pfn;
+    // A range may begin inside a free block whose head lies before it.
+    for order in 1..=buddy::MAX_ORDER {
+        let head = pfn & !((1u64 << order) - 1);
+        if head == pfn {
+            continue;
+        }
+        if let Some(run) = FRAME_INDEX.free_run(head) {
+            if run > pfn - head {
+                pfn = head + run;
+                break;
+            }
+        }
+    }
+    while pfn < end_pfn {
+        match FRAME_INDEX.free_run(pfn) {
+            Some(run) if run > 0 => pfn += run,
+            _ => {
+                save(pfn);
+                pfn += 1;
+            }
+        }
+    }
+}
+
 /// Number of frees the allocator has refused as double frees since boot.
 pub fn double_frees_refused() -> u64 {
     DOUBLE_FREES_REFUSED.load(Ordering::Relaxed)

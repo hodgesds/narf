@@ -270,7 +270,8 @@ unsafe impl Send for WorkList {}
 
 /// `WQ_UNBOUND`: run on the unbound pool, any CPU.
 pub const WQ_UNBOUND: u32 = 1 << 1;
-/// `WQ_FREEZABLE` (accepted; NARF has no freezer yet).
+/// `WQ_FREEZABLE`: new work waits while the system freezes
+/// ([`freeze_workqueues_begin`]).
 pub const WQ_FREEZABLE: u32 = 1 << 2;
 /// `WQ_MEM_RECLAIM`: has a rescuer; may be used on the reclaim path.
 pub const WQ_MEM_RECLAIM: u32 = 1 << 3;
@@ -283,6 +284,8 @@ pub const WQ_DFL_ACTIVE: usize = 256;
 
 struct WqInner {
     nr_active: usize,
+    /// `max_active`, or 0 while a freezable workqueue is frozen.
+    limit: usize,
     inactive: WorkList,
 }
 
@@ -320,16 +323,18 @@ pub fn alloc_workqueue(name: &'static str, flags: u32, max_active: usize) -> &'s
     } else {
         flags
     };
+    let max_active = if max_active == 0 {
+        WQ_DFL_ACTIVE
+    } else {
+        max_active
+    };
     let wq: &'static Workqueue = Box::leak(Box::new(Workqueue {
         name,
         flags,
-        max_active: if max_active == 0 {
-            WQ_DFL_ACTIVE
-        } else {
-            max_active
-        },
+        max_active,
         inner: IrqSafeSpinLock::new(WqInner {
             nr_active: 0,
+            limit: max_active,
             inactive: WorkList::new(),
         }),
         rescuer: (flags & WQ_MEM_RECLAIM != 0).then(|| Rescuer {
@@ -337,7 +342,61 @@ pub fn alloc_workqueue(name: &'static str, flags: u32, max_active: usize) -> &'s
             running: AtomicBool::new(false),
         }),
     }));
+    if flags & WQ_FREEZABLE != 0 {
+        // One made during a freeze starts frozen. The registry's lock
+        // orders this against the freeze and the thaw.
+        let mut list = FREEZABLE.lock();
+        if WQ_FREEZING.load(Ordering::Acquire) {
+            wq.inner.lock().limit = 0;
+        }
+        list.push(wq);
+    }
     wq
+}
+
+/// `workqueue_freezing`.
+static WQ_FREEZING: AtomicBool = AtomicBool::new(false);
+/// Every `WQ_FREEZABLE` workqueue (they are never freed).
+static FREEZABLE: IrqSafeSpinLock<Vec<&'static Workqueue>> = IrqSafeSpinLock::new(Vec::new());
+
+/// `freeze_workqueues_begin`: work queued on a `WQ_FREEZABLE` workqueue
+/// from now on waits on its inactive list. Work already active runs to
+/// completion; [`freeze_workqueues_busy`] reports when it has.
+pub fn freeze_workqueues_begin() {
+    let list = FREEZABLE.lock();
+    WQ_FREEZING.store(true, Ordering::Release);
+    for wq in list.iter() {
+        wq.inner.lock().limit = 0;
+    }
+}
+
+impl Workqueue {
+    /// Works active (pending on a pool, or running) on this workqueue.
+    pub(crate) fn nr_active(&self) -> usize {
+        self.inner.lock().nr_active
+    }
+}
+
+/// `freeze_workqueues_busy`: a freezable workqueue still has active work.
+pub fn freeze_workqueues_busy() -> bool {
+    FREEZABLE
+        .lock()
+        .iter()
+        .any(|wq| wq.inner.lock().nr_active > 0)
+}
+
+/// `thaw_workqueues`: restore each freezable workqueue's `max_active` and
+/// start the work that waited.
+pub fn thaw_workqueues() {
+    let list = FREEZABLE.lock();
+    WQ_FREEZING.store(false, Ordering::Release);
+    for wq in list.iter() {
+        let mut wg = wq.inner.lock();
+        wg.limit = wq.max_active;
+        while wg.nr_active < wg.limit && wg.inactive.len > 0 {
+            activate_inactive(&mut wg);
+        }
+    }
 }
 
 /// `alloc_ordered_workqueue`: one work at a time, in queue order.
@@ -690,7 +749,7 @@ fn insert_work(wq: &'static Workqueue, pool: &'static Pool, w: &WorkStruct) {
         .store(pool as *const Pool as *mut Pool, Ordering::Release);
     w.wq.store(wq as *const Workqueue as *mut Workqueue, Ordering::Release);
     let mut wg = wq.inner.lock();
-    if wg.nr_active >= wq.max_active {
+    if wg.nr_active >= wg.limit {
         // SAFETY: pending and unlinked, owned by this queueing; kept in place
         // by the queue contract.
         unsafe { wg.inactive.push_back(w) };
@@ -1007,8 +1066,11 @@ fn try_to_grab_pending(w: &WorkStruct, timer: Option<&TimerList>) -> Grab {
 /// One inactive work becomes active, if `max_active` allows
 /// (`pwq_activate_first_inactive`). Workqueue lock held.
 fn activate_inactive(wg: &mut WqInner) {
-    // `max_active` is checked by the caller's accounting: called right
-    // after an active slot was released.
+    // Called right after an active slot was released, or by the thaw. A
+    // frozen workqueue (`limit` 0) keeps its work inactive.
+    if wg.nr_active >= wg.limit {
+        return;
+    }
     let Some(w) = wg.inactive.pop_front() else {
         return;
     };

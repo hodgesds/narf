@@ -173,6 +173,108 @@ pub fn cpu_take_offline(
     Ok(())
 }
 
+/// Hibernation's `freeze_secondary_cpus`, without a hot-unplug: stop
+/// `cpu`'s executor between polls and keep it there. Its run queue stays
+/// as it is, pinned work (per-CPU workers, NAPI) included. Nothing is
+/// migrated, so nothing needs a CPU-offline callback.
+///
+/// A parked CPU is either let go again ([`cpu_unpark`]), or stopped
+/// ([`stop_parked`]) and later restarted ([`restart_parked`]). A restarted
+/// CPU's executor starts from the top and picks its queue back up. Any
+/// online CPU but the caller's may be parked. Cap-gated.
+pub fn cpu_park(
+    cpu: CpuId,
+    cap: &Cap<CpuLifecycle, narf_capabilities::Invoke>,
+) -> Result<(), HotPlugError> {
+    cap.invoke(NoopOp)?;
+    let id = cpu.0;
+    if id as usize >= narf_lib::percpu::MAX_CPUS {
+        return Err(HotPlugError::OutOfRange);
+    }
+    if id as usize == narf_lib::percpu::current_cpu() {
+        return Err(HotPlugError::Busy);
+    }
+    if !narf_lib::smp::is_online(id) {
+        return Err(HotPlugError::NoChange);
+    }
+    DRAIN_QUIESCED[id as usize].store(false, Ordering::Release);
+    policy::notify_cpu_state(cpu, CpuState::Draining, None);
+    crate::resched_remote(id);
+    // The same between-polls barrier `cpu_take_offline` waits for, bounded
+    // so a wedged CPU fails as Busy rather than hanging the caller.
+    let deadline = narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(100_000_000));
+    while !DRAIN_QUIESCED[id as usize].load(Ordering::Acquire) {
+        if narf_time::now_cycles() >= deadline {
+            policy::notify_cpu_state(cpu, CpuState::Active, None);
+            crate::resched_remote(id);
+            return Err(HotPlugError::Busy);
+        }
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
+/// Let a [`cpu_park`]ed CPU that was never stopped run again.
+pub fn cpu_unpark(
+    cpu: CpuId,
+    cap: &Cap<CpuLifecycle, narf_capabilities::Invoke>,
+) -> Result<(), HotPlugError> {
+    cap.invoke(NoopOp)?;
+    if cpu.0 as usize >= narf_lib::percpu::MAX_CPUS {
+        return Err(HotPlugError::OutOfRange);
+    }
+    policy::notify_cpu_state(cpu, CpuState::Active, None);
+    crate::resched_remote(cpu.0);
+    Ok(())
+}
+
+/// How the architecture stops and restarts a CPU: INIT and
+/// INIT-SIPI-SIPI on x86_64. The boot code installs them once it has
+/// started the secondary CPUs.
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicalHooks {
+    /// Stop a parked CPU wherever it is, and mark it offline.
+    pub stop: unsafe fn(u32),
+    /// Start a stopped CPU again; `true` once it is online.
+    pub restart: unsafe fn(u32) -> bool,
+}
+
+static PHYSICAL: narf_lib::sync::IrqSafeSpinLock<Option<PhysicalHooks>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Install the architecture's stop and restart.
+pub fn set_physical_hooks(hooks: PhysicalHooks) {
+    *PHYSICAL.lock() = Some(hooks);
+}
+
+/// Stop a parked CPU. `false` without physical hooks: it stays parked.
+///
+/// # Safety
+/// `cpu` is [`cpu_park`]ed: between polls, holding no lock and running no
+/// task, so stopping it loses nothing.
+pub unsafe fn stop_parked(cpu: CpuId) -> bool {
+    let Some(hooks) = *PHYSICAL.lock() else {
+        return false;
+    };
+    // SAFETY: the caller's contract.
+    unsafe { (hooks.stop)(cpu.0) };
+    true
+}
+
+/// Restart a stopped CPU; `true` once it is online again, its executor
+/// running its queue.
+///
+/// # Safety
+/// `cpu` was [`stop_parked`], in this kernel or in the one an image was
+/// taken from.
+pub unsafe fn restart_parked(cpu: CpuId) -> bool {
+    let Some(hooks) = *PHYSICAL.lock() else {
+        return false;
+    };
+    // SAFETY: the caller's contract.
+    unsafe { (hooks.restart)(cpu.0) }
+}
+
 /// Test helper: reset online-mask to boot state (CPU 0 only).
 #[doc(hidden)]
 pub fn __test_reset_online_mask() {

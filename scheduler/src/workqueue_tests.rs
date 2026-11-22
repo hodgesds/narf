@@ -18,7 +18,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::workqueue::{
     self, alloc_ordered_workqueue, alloc_workqueue, cancel_delayed_work_sync,
     cancel_work_sync_blocking, flush_work_blocking, mod_delayed_work_on, queue_delayed_work_on,
-    queue_work_on, DelayedWork, WorkFn, WorkFuture, WorkRef, WorkStruct, WQ_MEM_RECLAIM,
+    queue_work_on, DelayedWork, WorkFn, WorkFuture, WorkRef, WorkStruct, WQ_FREEZABLE,
+    WQ_MEM_RECLAIM,
 };
 
 fn me() -> usize {
@@ -456,4 +457,78 @@ fn smoke_workqueue_unbound_concurrent_across_cpus() -> TestResult {
 kernel_test_in!(
     "scheduler/workqueue",
     smoke_workqueue_unbound_concurrent_across_cpus
+);
+
+static FREEZE_GATE: AtomicBool = AtomicBool::new(false);
+static FREEZE_SLEPT: AtomicUsize = AtomicUsize::new(0);
+
+/// Resolves when `FREEZE_GATE` opens.
+struct FreezeGate;
+impl Future for FreezeGate {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if FREEZE_GATE.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+fn freeze_sleeper_fn(_: WorkRef) -> WorkFuture {
+    Box::pin(async {
+        FreezeGate.await;
+        FREEZE_SLEPT.fetch_add(1, Ordering::AcqRel);
+    })
+}
+
+/// `freeze_workqueues_begin` lets a freezable workqueue's running work
+/// finish, and the workqueue stays busy until it has. Work queued during
+/// the freeze waits on the inactive list until `thaw_workqueues`.
+fn smoke_workqueue_freezable_waits_for_thaw() -> TestResult {
+    let wq = alloc_workqueue("freeze-smoke", WQ_FREEZABLE, 0);
+    FREEZE_GATE.store(false, Ordering::Release);
+    FREEZE_SLEPT.store(0, Ordering::Release);
+    let sleeper = Box::new(WorkStruct::new(WorkFn::Async(freeze_sleeper_fn)));
+    let c = counted();
+    // SAFETY: the Boxes outlive the works; both finish below.
+    unsafe { queue_work_on(me(), wq, &sleeper) };
+    let started = rounds_until(1000, || wq.nr_active() == 1);
+    workqueue::freeze_workqueues_begin();
+    let busy = workqueue::freeze_workqueues_busy() && wq.nr_active() == 1;
+    // SAFETY: as above.
+    let queued = unsafe { queue_work_on(me(), wq, &c.work) };
+    FREEZE_GATE.store(true, Ordering::Release);
+    let drained = rounds_until(1000, || wq.nr_active() == 0);
+    let held = !rounds_until(50, || c.runs.load(Ordering::Acquire) != 0);
+    let late = alloc_workqueue("freeze-smoke-late", WQ_FREEZABLE, 0);
+    let late_work = counted();
+    // SAFETY: as above.
+    unsafe { queue_work_on(me(), late, &late_work.work) };
+    let late_held = !rounds_until(50, || late_work.runs.load(Ordering::Acquire) != 0);
+    workqueue::thaw_workqueues();
+    let ran = rounds_until(1000, || {
+        c.runs.load(Ordering::Acquire) == 1 && late_work.runs.load(Ordering::Acquire) == 1
+    });
+    flush_work_blocking(&sleeper);
+    flush_work_blocking(&c.work);
+    flush_work_blocking(&late_work.work);
+    if !started || !busy {
+        return TestResult::Fail("running freezable work did not keep the freeze busy");
+    }
+    if !queued || !drained || FREEZE_SLEPT.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("running work did not finish during the freeze");
+    }
+    if !held || !late_held {
+        return TestResult::Fail("work queued during a freeze ran before the thaw");
+    }
+    if !ran {
+        return TestResult::Fail("the thaw did not start the waiting work");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/workqueue",
+    smoke_workqueue_freezable_waits_for_thaw
 );

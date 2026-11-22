@@ -55,6 +55,7 @@ pub mod rdt;
 pub mod rtc;
 pub mod rtm_abort;
 pub mod s3_resume;
+pub mod s4_restore;
 pub mod segments;
 pub mod setjmp;
 pub mod sgx;

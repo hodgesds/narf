@@ -699,11 +699,88 @@ since the submitter is replaced. Raphael's port:
     `smu_set_default_dpm_table`'s power-up around the DPM table, does not
     apply: this port never reads the 13.0.5 DPM clock table.
 
+## S0ix
+
+20. ~~s0ix~~ (done, with the gaps listed below). `power::lps0` and the AMD PMC driver now send the
+    LPS0 `_DSM` calls and the S0i3 OS hint, so `amdgpu_acpi_is_s0ix_active`'s
+    PMC condition can hold (`lps0::has_handler("amd_pmc")`). Linux's s0ix
+    cycle for Raphael (`amdgpu_device_suspend` with `in_s0ix`):
+    - **Suspend, phase 1.** Ungate PG/CG, except GFX and SDMA, which
+      `amdgpu_device_set_{pg,cg}_state` skip. Then the display (DM)
+      suspends.
+    - **Suspend, phase 2**, in reverse IP order:
+      - JPEG and VCN suspend, with their sessions saved.
+      - SDMA 5.x, GFX and PSP are skipped: GFX stays in GFXOFF, the TMR stays
+        loaded, the rings stay. GFX's delayed idle work is cancelled, and
+        `amdgpu_gfx_off_ctrl` allows GFXOFF without the delay.
+      - The SMU suspends (`smu_disable_dpms`): `smu_v13_0_5_system_features_control`
+        skips `PrepareMp1ForUnload` in s0ix, and `rlc.funcs->stop` halts the
+        RLC (GC >= 9.4.2, an APU without IMU).
+      - IH: `navi10_ih_hw_fini`.
+      - GMC: `gmc_v10_0_gart_disable` on MMHUB only. The GFX hub is in GFX's
+        power domain.
+      - COMMON: `nv_common_hw_fini` disables the doorbell and selfring
+        apertures.
+    - **Resume.** Each block resumes only if its suspend ran, so GFX, SDMA
+      and the PSP are never re-initialized:
+      - COMMON, GMC (MMHUB `gart_enable`, fault defaults, the MMHUB TLB
+        flush) and IH first;
+      - then the SMU (`smu_set_gfx_imu_enable` skipped) and VCN/JPEG;
+      - the fences;
+      - then the display;
+      - then the late-init gating, again skipping GFX and SDMA.
+      The RLC restarts with the GFXOFF exit, not from amdgpu.
+
+    NARF's S3 path tears graphics down and rebuilds it. s0ix suspends and
+    resumes these owners in place instead (`GraphicsPm::S0ix`), when an
+    S0Idle prepare finds GFXOFF allowed, `LOW_POWER_S0` set and `amd_pmc`
+    bound:
+    - **Async prepare.** Drain the rings. Pause the client path
+      (`navi22_cs::pause`), which keeps the lent VMIDs and the media
+      session table. Stop TDR. Suspend media.
+    - **Sync suspend.** Blank the stream. Then `ColdBoot::suspend_s0ix`:
+      the RLC stop (`Gfx::stop_rlc`; SMU 13.0.5 sends nothing),
+      `Ih::suspend` with the subscriptions kept, `Gmc::suspend_mmhub`, and
+      the doorbell apertures off. The loader is not stopped.
+    - **Sync resume.** `ColdBoot::resume_s0ix`: `Gmc::resume_nbio` and the
+      apertures, `Gmc::resume_mmhub`, `Ih::resume`. Then the stream replays
+      without a loader boot and without clearing the scanout (APU VRAM
+      survives).
+    - **Async resume.** Media restarts with its saved sessions, and
+      `register_raphael` serves the clients again on the kept VMIDs.
+
+    The rest of Linux's cycle, mapped:
+    - `amdgpu_device_prepare`'s `flush_delayed_work`: a scheduled GFXOFF
+      allow is delivered at the prepare (`ColdBoot::flush_gfx_off`). GFX's
+      `idle_work` is the power-profile switch, which NARF does not have.
+    - The non-GFX clock gating: `suspend_s0ix` ungates Common and IH, and
+      GMC on DF 3.0.2 or older; the async resume gates them again
+      (`gate_after_s0ix`). Their power gating is a no-op on Raphael.
+    - `dm_suspend`/`dm_resume`: `dc_set_power_state(D3)` acts only with
+      IPS (DCN 3.5+), and `z10_restore` does not apply (DCN 3.1.5 sets
+      `disable_z10`). `dm_dmub_hw_resume` is `Loader::resume_dmub`: wait
+      for DMCUB's auto-load, or boot it again from the TMR if S0i3 lost
+      it. D0's `init_hw` is the stream replay's pipeline start.
+    - `amdgpu_fence_driver_hw_fini`: the GFX power domain's interrupts are
+      kept. VCN's and JPEG's are put and got again, but their
+      `set_interrupt_state` is a no-op. The resumed media start finds its
+      IH routes still subscribed and keeps them (`route_interrupts` skips
+      a source already routed on the same IH).
+
+    None of this has run on hardware. Raphael desktop boards rarely set
+    `LOW_POWER_S0`; the laptops on the same die do.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table
   nothing here has read; NBIO is inferred to be `nbio_v7_2`'s from Linux's
-  history (step 4).
+  history (step 4). No public Raphael discovery dump was found: the one
+  Raphael bring-up report found, FreeBSD drm-kmod #478, carries no logs, and
+  the amd-gfx archives refuse automated reads. The cold boot now prints one
+  line with the discovered NBIF, MMHUB, ATHUB, OSSSYS, HDP and SMUIO
+  versions (`amdgpu: raphael discovery: ...`), so the first boot on the
+  hardware confirms them. So does a Linux dump of
+  `/sys/class/drm/card*/device/ip_discovery/die/0/*/0/{major,minor,revision}`.
 - PMFW's initial GFXOFF state on 13.0.5: Linux starts with a GFXOFF request
   count of 1 (disallowed) and never sends `DisallowGfxOff` at init. This
   port sends it at the SMU stage, before any GC access, and allows GFXOFF

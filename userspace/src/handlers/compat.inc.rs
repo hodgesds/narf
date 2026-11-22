@@ -10457,7 +10457,11 @@ pub fn timer_preempt_user_task(ctx: &mut dyn TrapContext) {
     // timer IRQ each tick (signal delivery, the alarm SIGALRM that stops it,
     // wheel arming), so fairness/liveness are preserved the moment any peer
     // wakes. Voluntary yields (syscall/park) don't come through here.
-    if !narf_scheduler::has_other_runnable_work(current_task_id()) {
+    // A freeze needs this task at its next freeze point (the park the
+    // yield below enters) even when nothing else wants the CPU.
+    if !narf_scheduler::has_other_runnable_work(current_task_id())
+        && !narf_power::freezer::freezing()
+    {
         return;
     }
     if let (Some(uctx), Some(hook)) = (

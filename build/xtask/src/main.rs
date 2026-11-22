@@ -43,6 +43,7 @@ mod composition;
 mod crate_release;
 mod efi_image;
 mod frame_budget;
+mod hibernate_e2e;
 mod http3_smoke;
 mod kallsyms;
 mod kaslr_knob;
@@ -194,6 +195,12 @@ enum Cmd {
     /// --check-data-csum` and `btrfs restore` against the guest's final
     /// manifest afterwards.
     BtrfsCycles(btrfs_cycles::Args),
+    /// Hibernate on one boot and resume on the next (S4): boot 1 fills
+    /// 16 MiB with a token-seeded pattern and hibernates to an image file
+    /// on an ext4 root; boot 2 resumes it through `narf.resume=` and must
+    /// report the same token and digest. x86_64, one CPU; OFF policy
+    /// unless `--tpm-socket` names a swtpm.
+    HibernateE2e(hibernate_e2e::Args),
     /// Host-side (no QEMU) root-rw btrfs harness: CachyOS-shaped fixtures
     /// and the Linux snapshot fixture mounted through NARF's btrfs driver in
     /// a host process, a seeded random workload checked against a model,
@@ -16105,6 +16112,7 @@ fn main() -> Result<()> {
         Cmd::BtrfsRootrwInterop(args) => btrfs_interop::run_cmd(&args),
         Cmd::BtrfsCrashSmoke(args) => btrfs_crash::run(&args),
         Cmd::BtrfsCycles(args) => btrfs_cycles::run(&args),
+        Cmd::HibernateE2e(args) => hibernate_e2e::run(&args),
         Cmd::BtrfsHostRw(args) => btrfs_host::run(&args),
         Cmd::CachyosGate(args) => cachyos_gate::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),

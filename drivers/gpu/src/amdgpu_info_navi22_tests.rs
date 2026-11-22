@@ -688,6 +688,32 @@ kernel_test_in!(
     navi22_media_hw_ip_and_video_caps_follow_linux
 );
 
+/// Navi24 (VCN 3.0.33) has no JPEG block. Linux's `amdgpu_ip_get_block_type`
+/// then answers a JPEG query from the VCN block: HW_IP_INFO offers no rings
+/// (it counts JPEG rings, of which there are none), and HW_IP_COUNT is
+/// `num_vcn_inst`. Without the switch both are closed, as for VCN.
+fn navi24_jpeg_queries_answer_from_the_vcn_block() -> TestResult {
+    let mut published = booted(true);
+    published.media_rings = 0b0001; // decode only
+    let mut s = snap(published);
+    for b in s.ip_blocks.iter_mut().filter(|b| b.hw_id == HW_ID_VCN) {
+        b.revision = 33;
+    }
+    let jpeg = |sub, query| ask(&s, sub, query, [uapi::AMDGPU_HW_IP_VCN_JPEG, 0, 0, 0]);
+    let (w, n) = (Submission::Wired, Submission::NotWired);
+    let info: uapi::DrmAmdgpuInfoHwIp = decode(&jpeg(w, uapi::AMDGPU_INFO_HW_IP_INFO).unwrap());
+    let count = |sub| u32_at(&jpeg(sub, uapi::AMDGPU_INFO_HW_IP_COUNT).unwrap(), 0);
+    if info.available_rings != 0 || info.hw_ip_version_major != 3 || count(w) != 1 || count(n) != 0
+    {
+        return TestResult::Fail("Navi24's JPEG queries differ from the VCN block's answers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi24_jpeg_queries_answer_from_the_vcn_block
+);
+
 /// amdgpu_kms.c reports xclk * 10, even before queues are advertised.
 fn rdna2_dev_info_reports_vbios_counter_frequency() -> TestResult {
     for profile in crate::amdgpu_rdna2::PROFILES {

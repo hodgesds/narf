@@ -76,6 +76,9 @@ extern "C" {
 /// # Safety
 /// - BSP, post-paging.
 /// - The first 1 GiB is identity-mapped (BSP's boot.S sets this up).
+/// The CR3 the trampoline hands the APs, recorded at the first install.
+static AP_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 unsafe fn install_trampoline() {
     // Source: kernel high-half virt of the trampoline.
     let src = core::ptr::addr_of!(_ap_trampoline_start);
@@ -97,8 +100,11 @@ unsafe fn install_trampoline() {
         "AP trampoline blob outgrew the executable identity window"
     );
 
-    // Dest: identity-mapped phys 0x8000.
-    let dst = TRAMPOLINE_PHYS as *mut u8;
+    // Dest: phys 0x8000, through the direct map. The low identity map
+    // holds only the trampoline's executable window, and a hibernation
+    // image's page table (a domain clone) need not map it writable, so
+    // writes go through the direct map, which every kernel table maps.
+    let dst = narf_memory::PhysAddr::new(TRAMPOLINE_PHYS).kernel_mut_ptr::<u8>();
 
     // SAFETY: src/dst are well-formed and non-overlapping (src is
     // in the kernel high half, dst is at low phys 0x8000).
@@ -112,16 +118,24 @@ unsafe fn install_trampoline() {
     // .text.ap_trampoline) once per param and apply the same offset
     // to the runtime copy.
     let trampoline_kernel_base = src as u64;
-    let phys_addr =
-        |kern_sym: u64| -> u64 { TRAMPOLINE_PHYS + (kern_sym - trampoline_kernel_base) };
+    let phys_addr = |kern_sym: u64| -> u64 {
+        narf_memory::PhysAddr::new(TRAMPOLINE_PHYS + (kern_sym - trampoline_kernel_base))
+            .kernel_mut_ptr::<u8>() as u64
+    };
 
     // SAFETY: writes target identity-mapped phys 0x8000+; the BSP's
     // 1 GiB identity mapping covers the trampoline page as RW.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        // CR3: read current PML4 base.
-        let cr3: u64;
-        asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        // CR3: the PML4 the APs first booted with, read on the first
+        // install. It maps the trampoline window executable. A later
+        // restart (after hibernation) may run under a domain clone that
+        // does not, so it reuses that one.
+        let mut cr3 = AP_CR3.load(Ordering::Acquire);
+        if cr3 == 0 {
+            asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+            AP_CR3.store(cr3, Ordering::Release);
+        }
         let p_cr3 = phys_addr(core::ptr::addr_of!(ap_param_cr3) as u64);
         (p_cr3 as *mut u64).write_unaligned(cr3);
         // The trampoline carries its own GDT (including a 64-bit code
@@ -577,7 +591,73 @@ pub unsafe fn start_aps() -> u32 {
             }
         }
     }
+    // Hibernation stops parked APs and starts them again through these.
+    narf_scheduler::cpu_lifecycle::set_physical_hooks(
+        narf_scheduler::cpu_lifecycle::PhysicalHooks {
+            stop: stop_ap,
+            restart: restart_ap,
+        },
+    );
     started
+}
+
+/// INIT a parked AP: it stops wherever its park left it and waits for a
+/// SIPI, the state firmware left it in. Linux takes the same route for the
+/// non-boot CPUs around a hibernation restore. The AP is marked offline,
+/// so TLB shootdowns and IPIs stop waiting on it.
+///
+/// # Safety
+/// `logical` is an AP parked between polls (`cpu_lifecycle::cpu_park`),
+/// holding no lock and running no task.
+unsafe fn stop_ap(logical: u32) {
+    let apic = narf_acpi::apic_id_of_cpu(logical as usize).unwrap_or(logical);
+    narf_lib::smp::mark_offline(logical);
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: a valid APIC id; INIT resets only that core.
+    unsafe { narf_interrupts::x86_64::apic::send_init_ipi(apic) };
+    delay_us(10_000);
+}
+
+/// Start a stopped AP again with INIT-SIPI-SIPI and wait up to 1 s for it to
+/// report online. The trampoline is installed again first: after a
+/// hibernation restore, low memory may hold the boot kernel's copy, which
+/// names that kernel's page table and entry.
+///
+/// # Safety
+/// `logical` was stopped by [`stop_ap`], in this kernel or in the one an
+/// image was taken from; its `AP_STACKS` slot still holds its stack.
+unsafe fn restart_ap(logical: u32) -> bool {
+    let apic = narf_acpi::apic_id_of_cpu(logical as usize).unwrap_or(logical);
+    // SAFETY: the caller's contract; the trampoline page is reserved for it.
+    unsafe { install_trampoline() };
+    // The window was dropped after boot (`drop_ap_trampoline_window`): put
+    // it back in the PML4 the trampoline hands the AP, for this bring-up.
+    let pml4 = narf_memory::PhysAddr::new(AP_CR3.load(Ordering::Acquire) & !0xFFF);
+    // SAFETY: the APs' PML4, recorded by the boot install; dropped again
+    // below once the AP is past the trampoline.
+    let remapped = unsafe { narf_memory::mmu::map_ap_trampoline_window(pml4) };
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: a valid APIC id; the Intel SDM INIT-SIPI-SIPI sequence.
+    unsafe {
+        narf_interrupts::x86_64::apic::send_init_ipi(apic);
+        delay_us(10_000);
+        narf_interrupts::x86_64::apic::send_startup_ipi(apic, SIPI_VECTOR_PAGE);
+        delay_us(200);
+        narf_interrupts::x86_64::apic::send_startup_ipi(apic, SIPI_VECTOR_PAGE);
+    }
+    let _ = narf_scheduler::responsive_spin_until(
+        || narf_lib::smp::is_online(logical),
+        narf_time::Deadline::after_ms(1000),
+    );
+    let online = narf_lib::smp::is_online(logical);
+    // An AP marks itself online from high-half code, past the trampoline.
+    // One that never came up is left with the window mapped rather than
+    // risk unmapping it under a CPU still in real mode.
+    if remapped && online {
+        // SAFETY: no CPU is in the trampoline.
+        unsafe { narf_memory::mmu::unmap_ap_trampoline_window(pml4) };
+    }
+    online
 }
 
 /// Crude TSC-based microsecond delay. Enough for the SIPI timing

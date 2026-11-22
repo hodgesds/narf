@@ -258,6 +258,25 @@ pub fn timekeeping_resume() -> u64 {
     ns
 }
 
+/// [`timekeeping_resume`] after a sleep that reset the counter: a restored
+/// hibernation image runs on a TSC that started again at power-on, so the
+/// cycles since [`timekeeping_suspend`] mean nothing. CLOCK_MONOTONIC still
+/// resumes from where it stopped: the offset is rebased with wrapping
+/// arithmetic, as Linux rebases `cycle_last`. `slept_ns` comes from a
+/// persistent clock (the RTC), or is 0 when there is none. CLOCK_BOOTTIME
+/// and CLOCK_REALTIME gain it.
+pub fn timekeeping_resume_after_reset(slept_ns: u64) {
+    if !TK_FROZEN.load(Ordering::Acquire) {
+        return;
+    }
+    let rebase = raw_cycles().wrapping_sub(SUSPEND_START_RAW.load(Ordering::Relaxed));
+    SUSPENDED_CYCLES.fetch_add(rebase, Ordering::AcqRel);
+    TK_FROZEN.store(false, Ordering::Release);
+    OFFS_BOOT_NS.fetch_add(slept_ns, Ordering::AcqRel);
+    adjust_wall_offset_ns(slept_ns as i64);
+    hrtimer::clock_was_set();
+}
+
 /// Read the raw hardware counter (TSC / `CNTPCT_EL0`). Counts through
 /// suspend; see [`now_cycles`] for monotonic time.
 #[inline]
