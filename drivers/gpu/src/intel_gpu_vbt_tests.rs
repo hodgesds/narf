@@ -858,6 +858,9 @@ fn vbt_edp_block_per_panel_and_versions() -> TestResult {
         preemphasis: Some(2),
         vswing: Some(2),
         low_vswing: Some(true),
+        // No LFP power block in this image, and BDB 223 predates
+        // the `hobl` field (232+).
+        hobl: None,
         drrs_msa_timing_delay: 3,
         max_link_rate_khz: None,
         dsc_disable: None,
@@ -901,7 +904,8 @@ fn vbt_edp_block_per_panel_and_versions() -> TestResult {
                 && p.lanes.is_none()
                 && p.preemphasis.is_none()
                 && p.vswing.is_none()
-                && p.low_vswing.is_none() => {}
+                && p.low_vswing.is_none()
+                && p.hobl.is_none() => {}
         _ => return TestResult::Fail("unknown eDP encodings must stay unset"),
     }
     if Vbt::parse(&VbtImage::new(250).build())
@@ -917,6 +921,60 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_vbt",
     vbt_edp_block_per_panel_and_versions
 );
+
+/// `BDB_LFP_POWER` with the `hobl` bit set for `panel`: the u16
+/// at block offset 54 (`struct bdb_lfp_power`: `features` (1 B)
+/// + `als[5]` (20 B) + `lace_aggressiveness_profile` (1 B) +
+/// seven u16 fields + `lace_enabled_status` (2 B) +
+/// `aggressiveness[16]` (16 B)).
+fn lfp_power_block(panel: usize) -> Vec<u8> {
+    let mut w = alloc::vec![0u8; 136];
+    w[54..56].copy_from_slice(&(1u16 << panel).to_le_bytes());
+    w
+}
+
+fn vbt_edp_hobl_from_lfp_power() -> TestResult {
+    let panel = 5usize;
+    // BDB 232: the HOBL bit reads per panel.
+    let v232 = Vbt::parse(
+        &VbtImage::new(232)
+            .block(block::EDP, edp_block(panel))
+            .block(block::LFP_POWER, lfp_power_block(panel))
+            .build(),
+    )
+    .unwrap();
+    match v232.edp_panel(panel as u8) {
+        Some(p) if p.hobl == Some(true) => {}
+        _ => return TestResult::Fail("BDB 232 HOBL bit must decode for its panel"),
+    }
+    match v232.edp_panel(0) {
+        Some(p) if p.hobl == Some(false) => {}
+        _ => return TestResult::Fail("HOBL must not alias across panels"),
+    }
+    // BDB 231 predates the field; no LFP power block reads clear.
+    let v231 = Vbt::parse(
+        &VbtImage::new(231)
+            .block(block::EDP, edp_block(panel))
+            .block(block::LFP_POWER, lfp_power_block(panel))
+            .build(),
+    )
+    .unwrap();
+    if v231.edp_panel(panel as u8).is_none_or(|p| p.hobl.is_some()) {
+        return TestResult::Fail("BDB 231 has no HOBL field");
+    }
+    let v_no_power = Vbt::parse(
+        &VbtImage::new(232)
+            .block(block::EDP, edp_block(panel))
+            .build(),
+    )
+    .unwrap();
+    match v_no_power.edp_panel(panel as u8) {
+        Some(p) if p.hobl == Some(false) => {}
+        _ => return TestResult::Fail("no LFP power block must read HOBL clear"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_vbt", vbt_edp_hobl_from_lfp_power);
 
 fn vbt_psr_block_and_enable_sources() -> TestResult {
     let panel = 2usize;

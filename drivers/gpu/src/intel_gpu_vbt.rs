@@ -914,6 +914,14 @@ pub struct EdpPanel {
     pub vswing: Option<u8>,
     /// `edp.low_vswing` (173+).
     pub low_vswing: Option<bool>,
+    /// `edp.hobl` (232+): the per-panel bit of the BDB_LFP_POWER
+    /// `hobl` u16 (block offset 54), read by `parse_lfp_power`
+    /// (`intel_bios.c`), not by `parse_edp` — the bit lives in the
+    /// LFP power block while the field belongs to the eDP panel
+    /// facts, as in Linux's `panel->vbt.edp.hobl`. `None` below
+    /// BDB 232; `Some(false)` when the block is absent (Linux's
+    /// `init_vbt_defaults` leaves it clear).
+    pub hobl: Option<bool>,
     /// `edp.drrs_msa_timing_delay`.
     pub drrs_msa_timing_delay: u8,
     /// `edp.max_link_rate` in kHz (244+; 0 means none).
@@ -1154,6 +1162,18 @@ impl Vbt {
             preemphasis: level(e[fast + 1] & 0xF),
             vswing: level(e[fast + 1] >> 4),
             low_vswing: (self.version >= 173).then(|| (le64(e, 204) >> (p * 4)) & 0xF == 0),
+            // `parse_lfp_power`: the LFP power block's `hobl` u16
+            // (offset 54 — after `features` (1 B) + `als[5]` (20 B)
+            // + `lace_aggressiveness_profile` (1 B) + seven u16
+            // fields + `lace_enabled_status` (2 B) +
+            // `aggressiveness[16]` (16 B); the `vrr` u16 at
+            // offset 56 in `vrr_feature_enabled` pins the
+            // arithmetic), per-panel bit, BDB 232+.
+            hobl: (self.version >= 232).then(|| {
+                self.lfp_power
+                    .as_deref()
+                    .is_some_and(|w| panel_bits(u32::from(le16(w, 54)), p, 1) != 0)
+            }),
             drrs_msa_timing_delay: panel_bits(le32(e, 196), p, 2) as u8,
             max_link_rate_khz: (self.version >= 244).then(|| u32::from(le16(e, 780 + 2 * p)) * 20),
             dsc_disable: (self.version >= 251)
@@ -1821,6 +1841,14 @@ pub fn install_for_probe(
                 crate::intel_gpu_vrr::VbtVrr::from_vbt(vbt)
             }),
     );
+    // The same panel's eDP HOBL / low-vswing bits for the Gen12
+    // combo-PHY table selection (`tgl_get_combo_buf_trans_edp`'s
+    // `use_edp_hobl` / `use_edp_low_vswing`); without a VBT both
+    // stay clear and the DP tables are selected, as in Linux.
+    crate::intel_gpu_gen12_combo_phy::install_vbt(found.as_ref().map_or(
+        crate::intel_gpu_gen12_combo_phy::VbtEdpSignal::Missing,
+        |(vbt, _)| crate::intel_gpu_gen12_combo_phy::VbtEdpSignal::from_vbt(vbt),
+    ));
     // The Pipe-A eDP PSR facts (intel_bios_init_panel's parse_psr and PSR
     // enable); without a VBT, psr.enable stays false as in Linux.
     if generation == Generation::MeteorLake {

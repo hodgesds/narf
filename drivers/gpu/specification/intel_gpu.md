@@ -743,16 +743,25 @@ DDI A / eDP, single pipe):
   before training and updated per-iteration from the sink's
   level requests via the `TrainingAux` callback. The old
   4-entry `DDI_BUF_TRANS` tables in `intel_gpu_ddi` are
-  deleted. The same callback retunes the DPLL mid-training
-  when the fallback ladder opens a retry attempt at a lower
-  rate (pattern 1 after a dirty Configure): the DDI buffer
-  and `DP_TP_CTL` stop, the DPLL is disabled and brought back
-  up from the `combo_coeffs` row for the new rate, and the PHY
-  is re-prepared — the combo equivalent of the Type-C
-  `start_training(retune)` restart, minus the clock re-route
-  (DPCLKA routing selects the DPLL index, which a rate change
-  does not alter). M/N needs no mid-training step: the
-  transcoder is not enabled until after training, and the
+  deleted. The eDP HOBL / low-vswing VBT bits are plumbed:
+  probe installs the built-in panel's bits
+  (`VbtEdpSignal::from_vbt`, BDB_LFP_POWER `hobl` at block
+  offset 54, BDB 232+, and the EDP block's `low_vswing` nibble,
+  BDB 173+), `modeset_display_family` hands them to the
+  modeset, and the combo PHY selects the HOBL / low-vswing
+  eDP tables (`tgl_get_combo_buf_trans_edp`) with the CL_DW10
+  override on HOBL. Remainder: Linux retries without HOBL
+  after a training failure with HOBL active (`hobl_failed`);
+  NARF has no such retry yet. The same callback retunes the
+  DPLL mid-training when the fallback ladder opens a retry
+  attempt at a lower rate (pattern 1 after a dirty Configure):
+  the DDI buffer and `DP_TP_CTL` stop, the DPLL is disabled
+  and brought back up from the `combo_coeffs` row for the new
+  rate, and the PHY is re-prepared — the combo equivalent of
+  the Type-C `start_training(retune)` restart, minus the clock
+  re-route (DPCLKA routing selects the DPLL index, which a
+  rate change does not alter). M/N needs no mid-training step:
+  the transcoder is not enabled until after training, and the
   modeset already reprograms M/N to the trained configuration
   on every path before the DDI buffer enables.
   The Tiger Lake UY (GT2) flag rides the same path on
@@ -5072,7 +5081,8 @@ Type-C, TBT and dedicated-external bits by BDB version, DP dual mode, HDMI
 level shifter and max TMDS clock, lane reversal, DP max rate and lanes) and the
 driver features. It also decodes the LFP options panel type, the eDP block
 (bpp, PPS delays, link rate, lanes, pre-emphasis, voltage swing, low vswing,
-max rate, DSC disable), PSR and PSR2 wake times and enable, and the LFP
+max rate, DSC disable) and the LFP power block's per-panel `hobl` bit (BDB
+232+, block offset 54), PSR and PSR2 wake times and enable, and the LFP
 backlight. The per-platform tables cover TGL, ADL-S, ADL-P (display 13) and MTL
 (display 14): `dvo_port_to_port`, `map_aux_ch`, `map_ddc_pin`, the default DDC
 pin, `intel_phy_is_tc` and the port masks. `Vbt::encoders` reproduces the
@@ -5106,7 +5116,9 @@ HDMI takes its DDC pin from the VBT when the VBT declares an HDMI connector on
 the DDI. With no VBT, Meteor Lake keeps `NO_VBT` (`init_vbt_missing_defaults`)
 and Gen12 keeps `gen12_ddc_pin`. The eDP, PSR and backlight panel facts are
 exposed (`edp_panel`, `psr_panel`, `backlight_panel`, `panel_type`) for the
-panel and PSR owners and are not yet consumed.
+panel and PSR owners; the eDP HOBL / low-vswing bits are consumed by the
+Gen12 combo-PHY table selection (`VbtEdpSignal`, installed at probe), while
+the remaining panel facts are not yet consumed.
 
 Gen12 DDC corrections. The Gen12 HDMI session now runs on `GmbusBus`, whose
 new `xfer` is `do_gmbus_xfer`. Each message ends in the wait phase so the next

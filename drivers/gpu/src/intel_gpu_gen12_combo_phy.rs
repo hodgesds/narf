@@ -22,15 +22,15 @@
 //! (mirroring the Type-C `DklPort::training_update` shape).
 //! The old tables, loader and test are deleted with this change.
 //!
-//! Two inputs the modeset does not carry yet are pinned false
-//! with their selection branches present and unit-tested:
-//! eDP HOBL and eDP low-vswing are VBT bits
+//! The eDP HOBL and low-vswing inputs are VBT bits
 //! (`connector->panel.vbt.edp.hobl` / `.low_vswing`); NARF
-//! parses `low_vswing` (`intel_gpu_vbt`) but does not plumb
-//! either into the modeset, and `is_edp` is the documented
-//! `ddi == Ddi::A` assumption (DDI A is the eDP panel port on
-//! Gen12 laptops; connector-typed selection is a follow-up).
-//! Likewise the TGL-UY table is selected only on the
+//! parses both (`intel_gpu_vbt::EdpPanel::{hobl, low_vswing}`)
+//! and the probe installs the built-in panel's values as
+//! [`VbtEdpSignal`], which the modeset hands to [`ComboPhy::new`]
+//! (see `modeset_display_family`, the `tgl_uy` precedent). `is_edp`
+//! is the documented `ddi == Ddi::A` assumption (DDI A is the eDP
+//! panel port on Gen12 laptops; connector-typed selection is a
+//! follow-up). Likewise the TGL-UY table is selected only on the
 //! `modeset_display_for_chip` path, the one site that knows the
 //! PCI device ID — external-DP/HDMI/MST paths keep the standard
 //! TGL table until the DID reaches them.
@@ -50,6 +50,14 @@
 //! after training, and the modeset already reprograms M/N to
 //! the trained configuration on every path before the DDI
 //! buffer enables.
+//!
+//! Remainder (Linux `intel_dp_link_training.c`): when link training
+//! fails with HOBL active, Linux sets `hobl_failed` and retries
+//! without the HOBL table (`use_edp_hobl` checks it). NARF's
+//! training loop has no such retry — a HOBL panel that fails
+//! training retries with the same table, and a fallback to the
+//! non-HOBL table needs a `hobl_failed` bit on the training
+//! state, which does not exist yet.
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_gt::Gen12Platform;
@@ -493,6 +501,81 @@ pub(crate) fn select_combo_buf_trans(
     }
 }
 
+// ── VBT eDP signal facts (probe-installed) ───────────────────
+
+/// The VBT facts the eDP table selection consumes for the
+/// built-in panel: the `hobl` and `low_vswing` bits Linux's
+/// `tgl_get_combo_buf_trans_edp` reads as `use_edp_hobl` /
+/// `use_edp_low_vswing`. Mirrors the `VbtVrr` install pattern
+/// (`intel_gpu_vrr::install_vbt`): the probe installs the
+/// projection once, the modeset reads it via
+/// [`installed_edp_signal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VbtEdpSignal {
+    /// No VBT: both bits clear and the DP tables are selected
+    /// (as in Linux, where `intel_bios_init` leaves both false
+    /// without a VBT).
+    Missing,
+    /// The built-in panel's VBT bits.
+    Present {
+        /// `panel.vbt.edp.hobl`.
+        hobl: bool,
+        /// `panel.vbt.edp.low_vswing`.
+        low_vswing: bool,
+    },
+}
+
+impl VbtEdpSignal {
+    /// `intel_bios_init` for the built-in panel (LFP1 — the
+    /// Gen12 modeset only drives the DDI-A panel, whose panel
+    /// type is `panel_type(false)`; an LFP2 panel is not
+    /// selected by this projection). Without an eDP block the
+    /// panel carries no VBT facts and both bits are clear, as
+    /// `EdpVbt::from_vbt` defaults them.
+    pub fn from_vbt(vbt: &crate::intel_gpu_vbt::Vbt) -> Self {
+        match vbt.edp_panel(vbt.panel_type(false).index_or_fallback()) {
+            Some(edp) => Self::Present {
+                hobl: edp.hobl.unwrap_or(false),
+                low_vswing: edp.low_vswing.unwrap_or(false),
+            },
+            None => Self::Present {
+                hobl: false,
+                low_vswing: false,
+            },
+        }
+    }
+
+    /// The installed HOBL bit (false without a VBT).
+    pub fn hobl(self) -> bool {
+        matches!(self, Self::Present { hobl: true, .. })
+    }
+
+    /// The installed low-vswing bit (false without a VBT).
+    pub fn low_vswing(self) -> bool {
+        matches!(
+            self,
+            Self::Present {
+                low_vswing: true,
+                ..
+            }
+        )
+    }
+}
+
+static VBT_EDP_SIGNAL: narf_lib::sync::IrqSafeSpinLock<VbtEdpSignal> =
+    narf_lib::sync::IrqSafeSpinLock::new(VbtEdpSignal::Missing);
+
+/// Install the probe's VBT facts ([`VbtEdpSignal::Missing`]
+/// without a VBT).
+pub fn install_vbt(vbt: VbtEdpSignal) {
+    *VBT_EDP_SIGNAL.lock() = vbt;
+}
+
+/// The installed VBT facts.
+pub fn installed_edp_signal() -> VbtEdpSignal {
+    *VBT_EDP_SIGNAL.lock()
+}
+
 // ── Register map (`display/intel_combo_phy_regs.h`) ──────────
 //
 // `_ICL_COMBOPHY(phy)`: A 0x162000, B 0x6C000, C (EHL label)
@@ -620,13 +703,14 @@ pub struct ComboPhy {
     family: Gen12Platform,
     tgl_uy: bool,
     is_edp: bool,
-    /// eDP HOBL (VBT `panel.edp.hobl`) — not plumbed into the
-    /// modeset yet, so always false; the selection branch and
-    /// the CL_DW10 write exist and are unit-tested.
+    /// eDP HOBL (VBT `panel.edp.hobl`, parsed in
+    /// `intel_gpu_vbt`; `tgl_get_combo_buf_trans_edp`'s
+    /// `use_edp_hobl` — the VBT bit, without Linux's
+    /// `hobl_failed` retry; see the module note).
     hobl: bool,
     /// eDP low-vswing (VBT `panel.edp.low_vswing`, parsed in
-    /// `intel_gpu_vbt` but not plumbed into the modeset) —
-    /// always false for now; same status as `hobl`.
+    /// `intel_gpu_vbt`; `tgl_get_combo_buf_trans_edp`'s
+    /// `use_edp_low_vswing`).
     low_vswing: bool,
 }
 
@@ -635,12 +719,18 @@ impl ComboPhy {
     /// are owned by `DklPort`, not this module. `family`
     /// defaults to TigerLake when the window carries none (the
     /// modeset's default generation; same convention as the
-    /// `vrr_ip` unknown-family fallback).
+    /// `vrr_ip` unknown-family fallback). `hobl` / `low_vswing`
+    /// are the built-in eDP panel's VBT bits (the modeset reads
+    /// them from [`installed_edp_signal`]); they select the
+    /// HOBL / low-vswing eDP tables and are ignored on a
+    /// non-eDP link.
     pub(crate) fn new(
         ddi: Ddi,
         family: Option<Gen12Platform>,
         tgl_uy: bool,
         is_edp: bool,
+        hobl: bool,
+        low_vswing: bool,
     ) -> Result<Self, ModesetError> {
         if ddi as u8 >= Ddi::D as u8 {
             return Err(ModesetError::UnsupportedGeneration);
@@ -650,8 +740,8 @@ impl ComboPhy {
             family: family.unwrap_or(Gen12Platform::TigerLake),
             tgl_uy,
             is_edp,
-            hobl: false,
-            low_vswing: false,
+            hobl,
+            low_vswing,
         })
     }
 
@@ -1471,12 +1561,12 @@ mod tests {
     fn smoke_combo_phy_set_signal_levels_programs_phy() -> TestResult {
         use Gen12Platform::TigerLake;
         let io = Model::new();
-        let phy = match ComboPhy::new(Ddi::B, Some(TigerLake), false, false) {
+        let phy = match ComboPhy::new(Ddi::B, Some(TigerLake), false, false, false, false) {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("DDI B must build a combo PHY"),
         };
-        if ComboPhy::new(Ddi::D, Some(TigerLake), false, false).is_ok()
-            || ComboPhy::new(Ddi::A, None, false, true).is_err()
+        if ComboPhy::new(Ddi::D, Some(TigerLake), false, false, false, false).is_ok()
+            || ComboPhy::new(Ddi::A, None, false, true, false, false).is_err()
         {
             return TestResult::Fail("combo PHY must refuse TC DDIs and accept DDI A");
         }
@@ -1537,16 +1627,16 @@ mod tests {
     fn smoke_combo_phy_edp_clears_hobl_override() -> TestResult {
         use Gen12Platform::TigerLake;
         let io = Model::new();
-        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true).unwrap();
+        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true, false, false).unwrap();
         if phy
             .set_signal_levels(&io, LinkRate::DpHbr2, &[(0, 0); 4], 4)
             .is_err()
         {
             return TestResult::Fail("eDP set_signal_levels must succeed");
         }
-        // HOBL is false (not plumbed), so CL_DW10 is written
-        // with the override bits cleared — the same write Linux
-        // makes when `hobl_active` is false.
+        // HOBL is false (constructed without the VBT bit), so
+        // CL_DW10 is written with the override bits cleared —
+        // the same write Linux makes when `hobl_active` is false.
         if io.writes_to(0x162000 + 0x28) != alloc::vec![0u32] {
             return TestResult::Fail("eDP must clear the CL_DW10 HOBL override");
         }
@@ -1557,10 +1647,119 @@ mod tests {
         smoke_combo_phy_edp_clears_hobl_override
     );
 
+    fn smoke_combo_phy_edp_hobl_table_and_override() -> TestResult {
+        use Gen12Platform::TigerLake;
+        let io = Model::new();
+        // A VBT carrying the HOBL bit: the HOBL table (9 entries,
+        // all {0x6, 0x7F, 0x3F, 0x00, 0x00}) and the CL_DW10
+        // override set — `tgl_get_combo_buf_trans_edp`'s HOBL
+        // branch at HBR2.
+        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true, true, false).unwrap();
+        if phy
+            .set_signal_levels(&io, LinkRate::DpHbr2, &[(0, 0); 4], 4)
+            .is_err()
+        {
+            return TestResult::Fail("eDP HOBL set_signal_levels must succeed");
+        }
+        let base = 0x162000u64; // PHY_A
+        if io.writes_to(base + 0x28) != alloc::vec![0xCu32] {
+            return TestResult::Fail("HOBL must set the CL_DW10 override bits");
+        }
+        // HOBL entry: DW2 swing 0x6 → upper 0, lower 6, RCOMP
+        // 0x98; DW7 N-scalar 0x7F.
+        if io.last_write_to(base + 0x888) != Some(0x3098)
+            || io.last_write_to(base + 0x89C) != Some(0x7F00_0000)
+        {
+            return TestResult::Fail("HOBL must program the HOBL entry on every lane");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_combo_phy",
+        smoke_combo_phy_edp_hobl_table_and_override
+    );
+
+    fn smoke_combo_phy_edp_low_vswing_table() -> TestResult {
+        use Gen12Platform::TigerLake;
+        let io = Model::new();
+        // A VBT carrying the low-vswing bit: the shared ICL eDP
+        // HBR2 table — entry 0 {0x0, 0x7F, 0x3F, 0x00, 0x00} —
+        // and the CL_DW10 override cleared (only the HOBL table
+        // drives it).
+        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true, false, true).unwrap();
+        if phy
+            .set_signal_levels(&io, LinkRate::DpHbr2, &[(0, 0); 4], 4)
+            .is_err()
+        {
+            return TestResult::Fail("eDP low-vswing set_signal_levels must succeed");
+        }
+        let base = 0x162000u64; // PHY_A
+        if io.writes_to(base + 0x28) != alloc::vec![0u32] {
+            return TestResult::Fail("low-vswing must not set the CL_DW10 override");
+        }
+        // Low-vswing entry 0: DW2 swing 0x0 → 0x0098; DW4
+        // cursor 0x3F; DW7 N-scalar 0x7F.
+        if io.last_write_to(base + 0x888) != Some(0x0098)
+            || io.last_write_to(base + 0x890) != Some(0x003F)
+            || io.last_write_to(base + 0x89C) != Some(0x7F00_0000)
+        {
+            return TestResult::Fail("low-vswing must program the ICL eDP HBR2 entry");
+        }
+        // HOBL wins over low-vswing when both bits are set, as
+        // in `tgl_get_combo_buf_trans_edp`.
+        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true, true, true).unwrap();
+        if phy
+            .set_signal_levels(&io, LinkRate::DpHbr2, &[(0, 0); 4], 4)
+            .is_err()
+        {
+            return TestResult::Fail("eDP HOBL+low-vswing set_signal_levels must succeed");
+        }
+        if io.writes_to(base + 0x28).last() != Some(&0xCu32)
+            || io.last_write_to(base + 0x888) != Some(0x3098)
+        {
+            return TestResult::Fail("HOBL must win over low-vswing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_combo_phy",
+        smoke_combo_phy_edp_low_vswing_table
+    );
+
+    fn smoke_combo_phy_vbt_edp_signal_install() -> TestResult {
+        // The installed projection round-trips through the
+        // global, and defaults to Missing (both bits clear).
+        let previous = installed_edp_signal();
+        install_vbt(VbtEdpSignal::Present {
+            hobl: true,
+            low_vswing: false,
+        });
+        let got = installed_edp_signal();
+        install_vbt(previous);
+        let want = VbtEdpSignal::Present {
+            hobl: true,
+            low_vswing: false,
+        };
+        if installed_edp_signal() != previous
+            || got != want
+            || !got.hobl()
+            || got.low_vswing()
+            || VbtEdpSignal::Missing.hobl()
+            || VbtEdpSignal::Missing.low_vswing()
+        {
+            return TestResult::Fail("installed eDP signal facts must round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_combo_phy",
+        smoke_combo_phy_vbt_edp_signal_install
+    );
+
     fn smoke_combo_phy_loadgen_rules() -> TestResult {
         use Gen12Platform::TigerLake;
         let io = Model::new();
-        let phy = ComboPhy::new(Ddi::B, Some(TigerLake), false, false).unwrap();
+        let phy = ComboPhy::new(Ddi::B, Some(TigerLake), false, false, false, false).unwrap();
         let base = 0x6C000u64;
         // Above 6 GHz (HBR3): no loadgen on any lane. Levels
         // (0, 0) → preset 0, cursor 0x3F.
@@ -1591,7 +1790,7 @@ mod tests {
     fn smoke_combo_phy_hdmi_default_levels() -> TestResult {
         use Gen12Platform::TigerLake;
         let io = Model::new();
-        let phy = ComboPhy::new(Ddi::B, Some(TigerLake), false, false).unwrap();
+        let phy = ComboPhy::new(Ddi::B, Some(TigerLake), false, false, false, false).unwrap();
         if phy.set_hdmi_default_levels(&io, 148_500).is_err() {
             return TestResult::Fail("HDMI default levels must succeed");
         }
@@ -1629,7 +1828,7 @@ mod tests {
         use crate::intel_gpu_pipes::Transcoder;
         use Gen12Platform::TigerLake;
         let io = Model::new();
-        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true).unwrap();
+        let phy = ComboPhy::new(Ddi::A, Some(TigerLake), false, true, false, false).unwrap();
         let trans = Transcoder::A;
         let tp = trans.base() + 0x540;
         // Prepare: (0, 0) levels + DP_TP_CTL enable with PAT1.
@@ -1859,7 +2058,7 @@ mod tests {
     fn smoke_combo_phy_dw7_n_scalar_full_range() -> TestResult {
         use Gen12Platform::TigerLake;
         let io = Model::new();
-        let phy = ComboPhy::new(Ddi::B, Some(TigerLake), false, false).unwrap();
+        let phy = ComboPhy::new(Ddi::B, Some(TigerLake), false, false, false, false).unwrap();
         let base = 0x6C000u64; // PHY_B
 
         // (swing, pre-emphasis) for presets 0..9 — the same
