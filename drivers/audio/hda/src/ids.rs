@@ -6,9 +6,84 @@
 
 // ── PCI device ids ─────────────────────────────────────────────────
 
-/// AMD Ryzen / Phoenix Family-19h HD Audio Controller.
-pub const HDA_AMD_PHOENIX_VENDOR: u16 = 0x1022;
-pub const HDA_AMD_PHOENIX_DEVICE: u16 = 0x15e3;
+/// AMD platform (FCH / SoC) HD-Audio controllers: the board's analog codec.
+pub const HDA_AMD_VENDOR: u16 = 0x1022;
+/// The Family 17h/19h HD-Audio controller. Linux lists it as "AMD Raven",
+/// the first part it shipped on, but the same function carries the analog
+/// codec on Renoir, Cezanne, Rembrandt and Phoenix APUs and on the Ryzen 7000
+/// (Raphael / Granite Ridge, AM5) desktop, such as a Ryzen 5 7600X board.
+pub const HDA_AMD_ZEN_DEVICE: u16 = 0x15e3;
+/// Linux "AMD, X370 & co": the Zen 1/Zen+ desktop chipset's HD-Audio.
+pub const HDA_AMD_X370_DEVICE: u16 = 0x1457;
+/// Linux "AMD, X570 & co": the Zen 2/Zen 3 desktop HD-Audio.
+pub const HDA_AMD_X570_DEVICE: u16 = 0x1487;
+
+/// Whether `vendor:device` is one Linux binds with `AZX_DCAPS_PRESET_AMD_SB`
+/// (sound/hda/controllers/intel.c): ATI snoop (PCI 0x42), no TCSEL, the
+/// FIFO position fix (LPIB, 32-frame delay) and, in particular
+/// `AZX_DCAPS_RETRY_PROBE`: Linux retries the codec probe every second, up
+/// to 60 times, because "a few recent AMD systems show the codec
+/// configuration errors at the early boot, while loading the driver at a
+/// later stage works magically" (commit c0f1886de7e1).
+pub const fn amd_sb_preset(vendor: u16, device: u16) -> bool {
+    vendor == HDA_AMD_VENDOR
+        && matches!(
+            device,
+            HDA_AMD_X370_DEVICE | HDA_AMD_X570_DEVICE | HDA_AMD_ZEN_DEVICE
+        )
+}
+
+/// The ATI HDMI no-snoop functions whose Linux `azx_ids[]` entry adds
+/// `AZX_DCAPS_PM_RUNTIME` to `AZX_DCAPS_PRESET_ATI_HDMI_NS`.
+const ATI_HDMI_NS_RUNTIME_PM: &[u16] = &[
+    0x0002, 0xaac0, 0xaac8, 0xaad8, 0xaae0, 0xaae8, 0xaaf0, 0xaaf8, 0xab00, 0xab08, 0xab10, 0xab18,
+    0xab20, 0xab28, 0xab30, 0xab38, 0xab40,
+];
+
+/// Whether Linux runtime-suspends the controller (`azx_has_pm_runtime`:
+/// `AZX_DCAPS_PM_RUNTIME` in its `azx_ids[]` entry), so that
+/// `azx_runtime_idle` lets it power down once its codecs have. The AMD SB
+/// preset has it, as do the ATI HDMI functions listed above and every Intel
+/// PCH from Skylake on; the ICH parts, the other ATI HDMI functions and the
+/// ATI/AMD class match (1002:1640, 1002:1637) do not, and there only the
+/// codecs suspend.
+pub fn runtime_pm(vendor: u16, device: u16) -> bool {
+    match vendor {
+        HDA_AMD_VENDOR => amd_sb_preset(vendor, device),
+        HDA_AMD_RADEON_VENDOR => ATI_HDMI_NS_RUNTIME_PM.contains(&device),
+        HDA_INTEL_ICH9_VENDOR => !matches!(
+            device,
+            HDA_INTEL_ICH6_DEVICE | HDA_INTEL_ICH7_DEVICE | HDA_INTEL_ICH9_DEVICE
+        ),
+        _ => false,
+    }
+}
+
+/// The card's short name (Linux `card->shortname`): `driver_short_names[]`
+/// for the driver type `azx_ids[]` gives the controller. The ATI HDMI NS
+/// functions are `AZX_DRIVER_ATIHDMI_NS`; the AMD platform controllers and
+/// the ATI/AMD class match (1002:1640 among them) are `AZX_DRIVER_GENERIC`;
+/// the ICH parts are `AZX_DRIVER_ICH` and every later Intel PCH is
+/// `AZX_DRIVER_PCH` / `AZX_DRIVER_SKL` ("HDA Intel PCH" for both).
+pub fn card_short_name(vendor: u16, device: u16) -> &'static str {
+    if vendor == HDA_AMD_RADEON_VENDOR && HDA_ATI_HDMI_NS_DEVICES.contains(&device) {
+        "HDA ATI HDMI"
+    } else if vendor == HDA_INTEL_ICH9_VENDOR {
+        match device {
+            HDA_INTEL_ICH6_DEVICE | HDA_INTEL_ICH7_DEVICE | HDA_INTEL_ICH9_DEVICE => "HDA Intel",
+            _ => "HDA Intel PCH",
+        }
+    } else {
+        "HD-Audio Generic"
+    }
+}
+
+/// The card id Linux `snd_card_register` derives when the driver sets none:
+/// the short name's last word (`retrieve_id_from_card_name`), so "HDMI",
+/// "Generic", "Intel" or "PCH". The sound registry makes it unique.
+pub fn card_id(short_name: &'static str) -> &'static str {
+    short_name.rsplit(' ').next().unwrap_or(short_name)
+}
 
 /// AMD Radeon HD Audio Controller — found on integrated Radeon GPUs.
 pub const HDA_AMD_RADEON_VENDOR: u16 = 0x1002;
@@ -101,12 +176,10 @@ pub const HDA_INTEL_TIGER_LAKE_GFX_DEVICE_D: u16 = 0x9A0C;
 /// Every named HDA controller `(match name, vendor, device)`; each binds
 /// the same vendor-agnostic probe.
 pub const HDA_PCI_IDS: &[(&str, u16, u16)] = &[
-    // AMD — Family-19h Phoenix HD Audio + Radeon HD Audio iGPU.
-    (
-        "hda-amd-phoenix",
-        HDA_AMD_PHOENIX_VENDOR,
-        HDA_AMD_PHOENIX_DEVICE,
-    ),
+    // AMD platform HD-Audio (the board codec) + Radeon HD Audio iGPU.
+    ("hda-amd-zen", HDA_AMD_VENDOR, HDA_AMD_ZEN_DEVICE),
+    ("hda-amd-x370", HDA_AMD_VENDOR, HDA_AMD_X370_DEVICE),
+    ("hda-amd-x570", HDA_AMD_VENDOR, HDA_AMD_X570_DEVICE),
     (
         "hda-amd-radeon",
         HDA_AMD_RADEON_VENDOR,

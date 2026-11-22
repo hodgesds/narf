@@ -45,12 +45,12 @@ impl Shmem {
     pub fn create(len: usize) -> Result<Self, ShmemError> {
         // SAFETY: pure syscalls.
         let handle = unsafe { syscall1(SYS_SHMEM_CREATE, len as u64) };
-        if handle == 0 || handle == !0u64 {
+        if crate::native_failed(handle) {
             return Err(ShmemError::Create);
         }
         // SAFETY: handle is live (we just got it).
         let va = unsafe { syscall1(SYS_SHMEM_MAP, handle) };
-        if va == 0 || va == !0u64 {
+        if crate::native_failed(va) {
             // SAFETY: handle is live; clean up.
             let _ = unsafe { syscall1(SYS_SHMEM_DESTROY, handle) };
             return Err(ShmemError::Map);

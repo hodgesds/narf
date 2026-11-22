@@ -545,8 +545,7 @@ fn smoke_pivot_root_basic() -> TestResult {
 
     // Mount new_root, and create old_root_target as a sub-mount of
     // new_root by mounting another tmpfs there.
-    let _ = unmount_for_test("/new_root");
-    let _ = unmount_for_test("/new_root/old");
+    detach_for_test(b"/new_root\0");
     let mut m1 = StubCtx {
         args: mount_args(b"tmpfs\0", b"/new_root\0", b"tmpfs\0", 0),
         ret: None,
@@ -561,7 +560,7 @@ fn smoke_pivot_root_basic() -> TestResult {
     };
     crate::handlers::sys_mount_for_test(&mut m2);
     if !matches!(m2.ret, Some(r) if r.value == 0) {
-        let _ = unmount_for_test("/new_root");
+        detach_for_test(b"/new_root\0");
         return TestResult::Fail("mount /new_root/old failed");
     }
 
@@ -574,8 +573,7 @@ fn smoke_pivot_root_basic() -> TestResult {
         Some(r) if r.value == 0 => {}
         _ => {
             crate::handlers::__test_root_dir_reset();
-            let _ = unmount_for_test("/new_root/old");
-            let _ = unmount_for_test("/new_root");
+            detach_for_test(b"/new_root\0");
             return TestResult::Fail("sys_pivot_root failed");
         }
     }
@@ -584,8 +582,7 @@ fn smoke_pivot_root_basic() -> TestResult {
     let rd = crate::handlers::root_dir_of(task);
     if rd.as_deref() != Some("/new_root") {
         crate::handlers::__test_root_dir_reset();
-        let _ = unmount_for_test("/new_root/old");
-        let _ = unmount_for_test("/new_root");
+        detach_for_test(b"/new_root\0");
         return TestResult::Fail("root_dir not /new_root after pivot");
     }
 
@@ -596,14 +593,12 @@ fn smoke_pivot_root_basic() -> TestResult {
     let rewritten = crate::handlers::apply_chroot_for_test("/old");
     if rewritten != "/new_root/old" {
         crate::handlers::__test_root_dir_reset();
-        let _ = unmount_for_test("/new_root/old");
-        let _ = unmount_for_test("/new_root");
+        detach_for_test(b"/new_root\0");
         return TestResult::Fail("apply_chroot did not rewrite /old");
     }
 
     crate::handlers::__test_root_dir_reset();
-    let _ = unmount_for_test("/new_root/old");
-    let _ = unmount_for_test("/new_root");
+    detach_for_test(b"/new_root\0");
     TestResult::Pass
 }
 #[cfg(feature = "container")]
@@ -628,7 +623,7 @@ fn smoke_pivot_root_relative_dot() -> TestResult {
     crate::handlers::__test_root_dir_reset();
     crate::handlers::__test_cwd_reset();
 
-    let _ = unmount_for_test("/new_root2");
+    detach_for_test(b"/new_root2\0");
     let mut m1 = StubCtx {
         args: mount_args(b"tmpfs\0", b"/new_root2\0", b"tmpfs\0", 0),
         ret: None,
@@ -649,7 +644,7 @@ fn smoke_pivot_root_relative_dot() -> TestResult {
     };
     crate::handlers::sys_chdir(&mut cd);
     if !matches!(cd.ret, Some(r) if r.value == 0) {
-        let _ = unmount_for_test("/new_root2");
+        detach_for_test(b"/new_root2\0");
         return TestResult::Fail("chdir /new_root2 failed");
     }
 
@@ -664,7 +659,9 @@ fn smoke_pivot_root_relative_dot() -> TestResult {
 
     crate::handlers::__test_root_dir_reset();
     crate::handlers::__test_cwd_reset();
-    let _ = unmount_for_test("/new_root2");
+    // The old root sits stacked on /new_root2 until it is detached; then
+    // /new_root2 itself.
+    detach_for_test(b"/new_root2\0");
     if ok {
         TestResult::Pass
     } else {
@@ -694,7 +691,7 @@ fn smoke_pivot_root_switch_root_umount_dot() -> TestResult {
     crate::handlers::__test_cwd_reset();
     crate::handlers::clear_current_mount_namespace_for_test();
 
-    let _ = unmount_for_test("/swr");
+    detach_for_test(b"/swr\0");
     let mut m1 = StubCtx {
         args: mount_args(b"tmpfs\0", b"/swr\0", b"tmpfs\0", 0),
         ret: None,
@@ -715,7 +712,7 @@ fn smoke_pivot_root_switch_root_umount_dot() -> TestResult {
     };
     crate::handlers::sys_chdir(&mut cd);
     if !matches!(cd.ret, Some(r) if r.value == 0) {
-        let _ = unmount_for_test("/swr");
+        detach_for_test(b"/swr\0");
         return TestResult::Fail("chdir /swr failed");
     }
 
@@ -728,7 +725,7 @@ fn smoke_pivot_root_switch_root_umount_dot() -> TestResult {
     if !matches!(pctx.ret, Some(r) if r.value == 0) {
         crate::handlers::__test_root_dir_reset();
         crate::handlers::__test_cwd_reset();
-        let _ = unmount_for_test("/swr");
+        detach_for_test(b"/swr\0");
         return TestResult::Fail("pivot_root(\".\",\".\") failed");
     }
 
@@ -748,8 +745,7 @@ fn smoke_pivot_root_switch_root_umount_dot() -> TestResult {
 
     crate::handlers::__test_root_dir_reset();
     crate::handlers::__test_cwd_reset();
-    let _ = unmount_for_test("/swr");
-    let _ = unmount_for_test("/swr");
+    detach_for_test(b"/swr\0");
 
     if umount_ok {
         TestResult::Pass
@@ -1090,8 +1086,7 @@ fn smoke_pivot_root_putold_bind_private() -> TestResult {
     crate::handlers::clear_current_mount_namespace_for_test();
 
     // The new root must exist as a directory before the pivot.
-    let _ = unmount_for_test("/pvr_new");
-    let _ = unmount_for_test("/pvr_new/old");
+    detach_for_test(b"/pvr_new\0");
     let mut mnr = StubCtx {
         args: mount_args(b"tmpfs\0", b"/pvr_new\0", b"tmpfs\0", 0),
         ret: None,
@@ -1122,7 +1117,7 @@ fn smoke_pivot_root_putold_bind_private() -> TestResult {
     };
     crate::handlers::sys_unshare(&mut uctx);
     if !matches!(uctx.ret, Some(r) if r.value == 0) {
-        let _ = unmount_for_test("/pvr_new");
+        detach_for_test(b"/pvr_new\0");
         return TestResult::Fail("unshare(CLONE_NEWNS) failed");
     }
 
@@ -1144,11 +1139,12 @@ fn smoke_pivot_root_putold_bind_private() -> TestResult {
         .iter()
         .any(|p| p == "/pvr_new/old");
 
+    // The pivot happened in the private namespace, which goes with the task's
+    // namespace; the global /pvr_new it was made from is detached here.
     crate::handlers::clear_current_mount_namespace_for_test();
     crate::handlers::__test_root_dir_reset();
     crate::handlers::__test_cwd_reset();
-    let _ = unmount_for_test("/pvr_new/old");
-    let _ = unmount_for_test("/pvr_new");
+    detach_for_test(b"/pvr_new\0");
 
     if !pivot_ok {
         return TestResult::Fail("pivot_root in a private namespace failed");
@@ -1553,7 +1549,7 @@ fn smoke_pivot_root_missing_target() -> TestResult {
     crate::handlers::__test_cwd_reset();
 
     // Ensure the target really doesn't exist.
-    let _ = unmount_for_test("/does_not_exist");
+    detach_for_test(b"/does_not_exist\0");
 
     let mut pctx = StubCtx {
         args: pivot_args(b"/does_not_exist\0", b"/does_not_exist/old\0"),
@@ -1599,9 +1595,7 @@ fn smoke_pivot_root_relative_paths() -> TestResult {
     crate::handlers::__test_root_dir_reset();
     crate::handlers::__test_cwd_reset();
 
-    let _ = unmount_for_test("/stage/root8");
-    let _ = unmount_for_test("/stage/root8/old");
-    let _ = unmount_for_test("/stage");
+    detach_for_test(b"/stage\0");
 
     // new_root at /stage/root8, put_old target as a sub-mount below it.
     let mut m0 = StubCtx {
@@ -1620,9 +1614,7 @@ fn smoke_pivot_root_relative_paths() -> TestResult {
     };
     crate::handlers::sys_mount_for_test(&mut m2);
     if !matches!(m1.ret, Some(r) if r.value == 0) || !matches!(m2.ret, Some(r) if r.value == 0) {
-        let _ = unmount_for_test("/stage/root8/old");
-        let _ = unmount_for_test("/stage/root8");
-        let _ = unmount_for_test("/stage");
+        detach_for_test(b"/stage\0");
         return TestResult::Fail("staging mounts for relative pivot_root failed");
     }
 
@@ -1651,9 +1643,7 @@ fn smoke_pivot_root_relative_paths() -> TestResult {
 
     crate::handlers::__test_root_dir_reset();
     crate::handlers::__test_cwd_reset();
-    let _ = unmount_for_test("/stage/root8/old");
-    let _ = unmount_for_test("/stage/root8");
-    let _ = unmount_for_test("/stage");
+    detach_for_test(b"/stage\0");
 
     if swapped && old_reachable {
         TestResult::Pass
@@ -2985,6 +2975,31 @@ kernel_test_in!(
     "userspace/mount",
     smoke_execve_image_read_survives_slow_backing_store
 );
+
+/// `umount2(path, MNT_DETACH)` through the syscall, repeated while it
+/// succeeds, as a task tidies up after a `pivot_root`. Each call detaches the
+/// topmost mount at `path` together with every mount attached below it
+/// (`umount_tree`): a new root goes with its put_old and the old root's tree
+/// at it, and a stack at one path (the old root `pivot_root(".", ".")` puts
+/// on its new root) comes off a layer at a time. A raw registry pop takes the
+/// one entry and leaves the mounts below it behind.
+#[cfg(feature = "container")]
+fn detach_for_test(path: &[u8]) {
+    for _ in 0..8 {
+        let mut um = StubCtx {
+            args: SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: 2,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        crate::handlers::sys_umount2_for_test(&mut um);
+        if !matches!(um.ret, Some(r) if r.value == 0) {
+            return;
+        }
+    }
+}
 
 // Helper: unmount a path under a fresh bootstrap handle. The
 // registry's unmount is keyed by path; the handle check is the

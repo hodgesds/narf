@@ -112,6 +112,8 @@ kernel_test_in!(
 
 fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResult {
     use core::cell::Cell;
+    // Each end of the window is a TSC read, an HPET read and a TSC read
+    // (`tsc_read_refs`): the first two TSC reads bracket the opening sample.
     let sample = |start: u64, end: u64, cycles: u64| {
         let hpet_reads = Cell::new(0);
         let tsc_reads = Cell::new(0);
@@ -130,7 +132,7 @@ fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResu
             || {
                 let n = tsc_reads.get();
                 tsc_reads.set(n + 1);
-                if n == 0 {
+                if n < 2 {
                     100
                 } else {
                     100 + cycles
@@ -153,14 +155,15 @@ fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResu
         || {
             let n = tsc_reads.get();
             tsc_reads.set(n + 1);
-            if n == 0 {
+            if n < 2 {
                 0
             } else {
                 6_500_000_001
             }
         },
     );
-    if stalled.is_some() || tsc_reads.get() != 2 {
+    // The opening sample's two reads, then the bound check that ends it.
+    if stalled.is_some() || tsc_reads.get() != 3 {
         return TestResult::Fail("stalled HPET calibration ignored its TSC safety bound");
     }
     for (frequency, window) in [(0, 200), (100_000_000, 0)] {
@@ -173,6 +176,191 @@ fn smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters() -> TestResu
 kernel_test_in!(
     "time/calibration",
     smoke_hpet_calibration_samples_wrap_and_reject_stalled_counters
+);
+
+/// Where a simulated SMI lands in [`RefSim`].
+#[derive(Copy, Clone)]
+enum SmiAt {
+    /// Nowhere.
+    Never,
+    /// The first `n` HPET reads.
+    Start(u32),
+    /// The first `n` HPET reads that return a value a full window past the
+    /// first one: the reads that can end a measurement.
+    End(u32),
+}
+
+/// A machine for TSC calibration samplers: an HPET at `hpet_hz` and a TSC
+/// at `tsc_hz` counting one simulated time, each counter read taking
+/// [`RefSim::READ_NS`]. An SMI costs [`RefSim::SMI_NS`] AFTER the HPET has
+/// latched the value it returns, so the TSC read that follows is late —
+/// what firmware does to a calibration on Phoenix laptops.
+struct RefSim {
+    now_ns: core::cell::Cell<u64>,
+    first_hpet: core::cell::Cell<Option<u64>>,
+    hpet_reads: core::cell::Cell<u32>,
+    smis_left: core::cell::Cell<u32>,
+    hpet_hz: u64,
+    tsc_hz: u64,
+    window: u64,
+    smi: SmiAt,
+}
+
+impl RefSim {
+    const READ_NS: u64 = 1_000;
+    const SMI_NS: u64 = 500_000;
+    /// The 7600X's TSC as Linux refined it on this board: 4691.189 MHz
+    /// against a 4700 MHz P0 definition.
+    const TSC_HZ: u64 = 4_691_189_000;
+    /// A 69.841279 ns HPET period, as most chipsets report it.
+    const HPET_HZ: u64 = 14_318_180;
+
+    fn new(smi: SmiAt) -> Self {
+        let smis = match smi {
+            SmiAt::Never => 0,
+            SmiAt::Start(n) | SmiAt::End(n) => n,
+        };
+        Self {
+            now_ns: core::cell::Cell::new(0),
+            first_hpet: core::cell::Cell::new(None),
+            hpet_reads: core::cell::Cell::new(0),
+            smis_left: core::cell::Cell::new(smis),
+            hpet_hz: Self::HPET_HZ,
+            tsc_hz: Self::TSC_HZ,
+            // The 100 ms window the calibration paths use.
+            window: Self::HPET_HZ / 10,
+            smi,
+        }
+    }
+
+    fn hpet(&self) -> u64 {
+        let t = self.now_ns.get();
+        self.now_ns.set(t + Self::READ_NS);
+        let value = t * self.hpet_hz / 1_000_000_000;
+        let first = self.first_hpet.get().unwrap_or(value);
+        self.first_hpet.set(Some(first));
+        let reads = self.hpet_reads.get();
+        self.hpet_reads.set(reads + 1);
+        let hit = match self.smi {
+            SmiAt::Never => false,
+            SmiAt::Start(_) => true,
+            SmiAt::End(_) => value - first >= self.window,
+        };
+        if hit && self.smis_left.get() > 0 {
+            self.smis_left.set(self.smis_left.get() - 1);
+            self.now_ns.set(self.now_ns.get() + Self::SMI_NS);
+        }
+        value
+    }
+
+    fn tsc(&self) -> u64 {
+        let t = self.now_ns.get();
+        self.now_ns.set(t + Self::READ_NS);
+        t * self.tsc_hz / 1_000_000_000
+    }
+
+    /// `|measured - tsc_hz|` in ppm of `tsc_hz`.
+    fn error_ppm(&self, measured: u64) -> u64 {
+        measured.abs_diff(self.tsc_hz) * 1_000_000 / self.tsc_hz
+    }
+}
+
+/// Linux `tsc_read_refs`: a reference read is taken between two TSC reads
+/// and used only when the pair is close (`(t2 - t1) < thresh`, retried up
+/// to `MAX_RETRIES` times), so an SMI or NMI between the HPET latching its
+/// count and the TSC being read never becomes part of the measurement. An
+/// SMI there moves one end of the window by its whole length: 500 µs in a
+/// 100 ms window is a 5000 ppm error in every clock derived from the TSC.
+fn smoke_hpet_calibration_rejects_a_reference_read_an_smi_split() -> TestResult {
+    let clean = RefSim::new(SmiAt::Never);
+    let measured =
+        crate::hpet::measure_tsc(clean.hpet_hz, clean.window, || clean.hpet(), || clean.tsc());
+    let Some(hz) = measured else {
+        return TestResult::Fail("an undisturbed HPET calibration failed");
+    };
+    if clean.error_ppm(hz) > 5 {
+        return TestResult::Fail("an undisturbed HPET calibration is off by more than 5 ppm");
+    }
+    for (smi, what) in [
+        (
+            SmiAt::Start(1),
+            "an SMI in the opening reference read skewed the TSC rate",
+        ),
+        (
+            SmiAt::End(1),
+            "an SMI in the closing reference read skewed the TSC rate",
+        ),
+        (
+            SmiAt::End(2),
+            "an SMI in a retried closing reference read skewed the TSC rate",
+        ),
+    ] {
+        let sim = RefSim::new(smi);
+        match crate::hpet::measure_tsc(sim.hpet_hz, sim.window, || sim.hpet(), || sim.tsc()) {
+            Some(hz) if sim.error_ppm(hz) <= 5 => {}
+            _ => return TestResult::Fail(what),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/tsc-refs",
+    smoke_hpet_calibration_rejects_a_reference_read_an_smi_split
+);
+
+/// An AMD P-state-0 definition is an estimate of the TSC rate, not the
+/// rate: the TSC counts the P0 multiple of the board's reference clock, and
+/// that clock is not exactly 100 MHz. The 7600X here defines P0 as
+/// 4700 MHz while its TSC runs at 4691.189 MHz (Linux: "Refined TSC
+/// clocksource calibration: 4691.189 MHz"), so a kernel that takes the
+/// definition as the rate runs every TSC clock 1875 ppm slow: 83 s of
+/// dmesg and CLOCK_MONOTONIC time lost against the wall clock in 12.2 h of
+/// that native boot, 120 s in its first 17.6 h.
+///
+/// Linux never takes an AMD TSC rate from a P-state definition: AMD gets no
+/// `native_calibrate_tsc` answer, the early rate comes from the PIT, and
+/// `tsc_refine_calibration_work` replaces it with the rate measured against
+/// the HPET (or the ACPI PM timer) unless that is more than 1% away from
+/// the early one. The AMD path must likewise measure its estimate against
+/// the HPET, keep the estimate when the measurement is unavailable or more
+/// than 1% away, and use the measurement otherwise.
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_pstate0_tsc_rate_is_measured_against_the_hpet() -> TestResult {
+    const P0_HZ: u64 = 4_700_000_000;
+    let asked = core::cell::Cell::new(0);
+    let (hz, _) = crate::amd_tsc_hz(P0_HZ, |early| {
+        asked.set(early);
+        Some(RefSim::TSC_HZ)
+    });
+    if asked.get() != P0_HZ {
+        return TestResult::Fail("the AMD path did not measure its P0 estimate against the HPET");
+    }
+    if hz != RefSim::TSC_HZ {
+        return TestResult::Fail("the AMD path kept its P0 estimate over the measured TSC rate");
+    }
+    // End to end through the HPET sampler, an SMI in its closing reads.
+    let sim = RefSim::new(SmiAt::End(2));
+    let (hz, _) = crate::amd_tsc_hz(P0_HZ, |_| {
+        crate::hpet::measure_tsc(sim.hpet_hz, sim.window, || sim.hpet(), || sim.tsc())
+    });
+    if sim.error_ppm(hz) > 5 {
+        return TestResult::Fail("the AMD path's HPET-measured TSC rate is off by more than 5 ppm");
+    }
+    // `tsc_refine_calibration_work`: "Make sure we're within 1%".
+    if crate::amd_tsc_hz(P0_HZ, |_| Some(4_600_000_000))
+        != (P0_HZ, crate::CalibrationSource::AmdPstate0)
+    {
+        return TestResult::Fail("a measurement over 1% from the P0 estimate was not discarded");
+    }
+    if crate::amd_tsc_hz(P0_HZ, |_| None) != (P0_HZ, crate::CalibrationSource::AmdPstate0) {
+        return TestResult::Fail("without a measurement the AMD path must keep its P0 estimate");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "time/tsc-amd-refine",
+    smoke_amd_pstate0_tsc_rate_is_measured_against_the_hpet
 );
 
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
@@ -745,15 +933,20 @@ fn smoke_ntp_apply_sample_small_offset_slews_via_tick() -> TestResult {
     }
 
     // One second's drain: chunk = time_offset >> (SHIFT_PLL + constant) =
-    // 50 ms >> 4 (boot constant 2) = 3_125_000 ns, folded into the wall.
-    // The range admits a second chunk if a live tick boundary crossed
-    // mid-test and the `on_tick` hook ran `tick_second` concurrently (the
-    // hook fires once per wall second from IRQ context); the readback
-    // range admits the same one-or-two-chunks outcomes (46_875, 43_945).
+    // 50 ms >> 4 (boot constant 2) = 3_125_000 ns, which `second_overflow()`
+    // adds to the coming second's tick length: the steered clock runs
+    // 3.125 ms/s fast and the wall offset (a step) stays put. A live tick
+    // crossing a second boundary mid-test (the `on_tick` hook runs
+    // `tick_second` from IRQ context) may already have applied the next
+    // chunk, 2.93 ms/s; the readback range admits the same one-or-two-chunks
+    // outcomes (46_875, 43_945).
     tick_second();
-    let moved = wall::wall_offset_ns();
-    if !(3_125_000..=6_200_000).contains(&moved) {
-        return TestResult::Fail("tick_second did not slew one exponential chunk");
+    if wall::wall_offset_ns() != 0 {
+        return TestResult::Fail("tick_second stepped the wall clock for a slew");
+    }
+    let rate_ns_per_s = crate::steer::rate() >> 32;
+    if !(2_900_000..=3_125_000).contains(&rate_ns_per_s) {
+        return TestResult::Fail("tick_second did not slew one exponential chunk per second");
     }
     let mut tx = Timex::default();
     let _ = adjtimex(&mut tx, NOW_SEC, 0);
@@ -841,16 +1034,15 @@ fn smoke_ntp_tick_second_drains_small_phase_to_zero() -> TestResult {
     wall::__test_reset();
     const NOW_SEC: i64 = 1_700_000_000;
 
-    // +1 µs: the exponential chunk rounds to zero within a few seconds,
-    // and then the whole remainder is delivered (Linux `second_overflow()`
-    // convergence rule) — the phase must reach exactly zero, not stall.
+    // +1 µs: the exponential drain (Linux `second_overflow()`) takes the
+    // phase below a nanosecond, and the rate it adds back to zero.
     match apply_sample(1_000, 1_000_000, 1_000_000, 2, NOW_SEC) {
         crate::ntp::DisciplineOutcome::Slewed(1_000) => {}
         _ => return TestResult::Fail("a 1 µs sample should slew"),
     }
     // The drain is exponential (1/16 of the remainder per second at the
     // boot constant), so a 1 µs phase needs ~340 seconds to reach the
-    // sub-16-unit remainder the convergence rule delivers whole.
+    // sub-16-unit remainder whose chunk is zero.
     for _ in 0..500 {
         tick_second();
     }
@@ -859,10 +1051,9 @@ fn smoke_ntp_tick_second_drains_small_phase_to_zero() -> TestResult {
     if tx.offset != 0 {
         return TestResult::Fail("a 1 µs phase did not converge to zero");
     }
-    // The wall moved by the whole microsecond, up to per-tick ns truncation.
-    let moved = wall::wall_offset_ns();
-    if !(900..=1_000).contains(&moved) {
-        return TestResult::Fail("a 1 µs phase did not slew into the wall clock");
+    // The slew went through the rate, not the wall offset, and is over.
+    if wall::wall_offset_ns() != 0 || crate::steer::rate() != 0 {
+        return TestResult::Fail("a converged 1 µs slew must leave no step and no rate");
     }
 
     ntp::__test_reset();
@@ -969,3 +1160,97 @@ fn smoke_ntp_update_offset_learns_frequency() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time", smoke_ntp_update_offset_learns_frequency);
+
+/// How much faster than the counter clock `now_wall()` advances over a
+/// `window_ns` busy wait, in ppm: `(Δwall − Δraw) / Δraw · 1e6`. Each end
+/// reads the two clocks back to back with interrupts masked, so the pair's
+/// own spread is the same at both ends and cancels.
+fn wall_rate_ppm(window_ns: u64) -> i64 {
+    let pair = || {
+        narf_lib::sync::without_interrupts(|| {
+            let raw = crate::cycles_to_ns(crate::now_cycles());
+            (raw, crate::now_wall().as_nanos())
+        })
+    };
+    let (raw0, wall0) = pair();
+    while crate::monotonic_ns() < raw0 + window_ns {
+        core::hint::spin_loop();
+    }
+    let (raw1, wall1) = pair();
+    let d_raw = (raw1 - raw0) as i128;
+    let d_wall = wall1 - wall0;
+    ((d_wall - d_raw) * 1_000_000 / d_raw) as i64
+}
+
+/// The frequency `adjtimex` holds steers the clock, as Linux's
+/// `ntp_tick_length()` → `timekeeping_adjust()` scales the timekeeper's
+/// `mult`: `ADJ_FREQUENCY` +250 ppm runs CLOCK_REALTIME 250 ppm fast of the
+/// counter, a +600 ppm request is clamped to `MAXFREQ_SCALED` (500 ppm) and
+/// steers 500 ppm, and an `ADJ_OFFSET` phase is a slew: `second_overflow()`
+/// adds one chunk of it (`time_offset >> (SHIFT_PLL + time_constant)`, here
+/// 50 ms >> 4 = 3.125 ms) to the next second's tick length, so the clock
+/// runs ~3125 ppm fast for that second and the wall offset — a step — does
+/// not move. Before this, `time_freq` was stored and reported but steered
+/// nothing, and the phase was stepped into the wall offset once a second:
+/// timesyncd sat at its +500 ppm limit, polling every 32 s, while REALTIME
+/// and MONOTONIC kept the counter's rate.
+fn smoke_ntp_frequency_and_slew_steer_the_clock_rate() -> TestResult {
+    use crate::ntp::{
+        adjtimex, tick_second, Timex, ADJ_FREQUENCY, ADJ_OFFSET, ADJ_STATUS, STA_PLL,
+    };
+    use crate::{ntp, wall};
+    const NOW_SEC: i64 = 1_700_000_000;
+    const WINDOW_NS: u64 = 20_000_000;
+    let set = |modes: u32, freq: i64, offset: i64, status: i32| {
+        let mut tx = Timex {
+            modes,
+            freq,
+            offset,
+            status,
+            ..Timex::default()
+        };
+        let _ = adjtimex(&mut tx, NOW_SEC, 0);
+        tx
+    };
+
+    ntp::__test_reset();
+    wall::__test_reset();
+    let result = (|| {
+        let _ = set(ADJ_FREQUENCY, 250 << 16, 0, 0);
+        if !(230..=270).contains(&wall_rate_ppm(WINDOW_NS)) {
+            return TestResult::Fail("ADJ_FREQUENCY +250 ppm did not run the clock 250 ppm fast");
+        }
+        let tx = set(ADJ_FREQUENCY, 600 << 16, 0, 0);
+        if tx.freq != 500 << 16 {
+            return TestResult::Fail("ADJ_FREQUENCY +600 ppm must read back as the 500 ppm limit");
+        }
+        if !(480..=520).contains(&wall_rate_ppm(WINDOW_NS)) {
+            return TestResult::Fail("a frequency clamped to 500 ppm must steer 500 ppm");
+        }
+        let _ = set(ADJ_FREQUENCY, 0, 0, 0);
+        if wall_rate_ppm(WINDOW_NS).abs() > 20 {
+            return TestResult::Fail("frequency 0 must return the clock to the counter's rate");
+        }
+        // Slew only: PLL on, then a +50 ms phase (µs units).
+        let _ = set(ADJ_STATUS, 0, 0, STA_PLL);
+        let _ = set(ADJ_OFFSET, 0, 50_000, 0);
+        let stepped = wall::wall_offset_ns();
+        tick_second();
+        if wall::wall_offset_ns() != stepped {
+            return TestResult::Fail("an ADJ_OFFSET slew stepped the wall offset");
+        }
+        // One chunk is 3125 ppm; a live tick crossing a second boundary
+        // mid-measurement may already apply the next, 2930 ppm.
+        if !(2_700..=3_300).contains(&wall_rate_ppm(WINDOW_NS)) {
+            return TestResult::Fail("a 50 ms slew did not run the clock ~3125 ppm fast");
+        }
+        TestResult::Pass
+    })();
+    ntp::__test_reset();
+    wall::__test_reset();
+    result
+}
+kernel_test_in!(
+    "time/ntp-steer",
+    smoke_ntp_frequency_and_slew_steer_the_clock_rate
+);

@@ -212,9 +212,25 @@ Built-in IGC registration opts the interface into the stack's software GRO
 to the CPU its MSI-X vector is steered to (Linux NAPI polls where the
 interrupt landed), is classified `WorkKind::SoftIrq`, and flushes that CPU's
 held flows when its ring is empty and its vector re-armed, the
-`napi_complete_done` point. The frame-ring transmit consumer and the 10 ms
+`napi_complete_done` point. The receive task is `narf_net::napi`'s
+softirq-context pump (net spec §3, "Receive pumps in softirq context"):
+Interactive class, one bounded `softirq_run` per interrupt, the vector
+re-enabled (ITR update, then EIMS) only when a poll leaves the ring empty,
+and a Default-class deferral task on the same CPU for work left after the
+softirq bound. igb (vector on the probe CPU) and e1000 (vector on the boot
+CPU) receive pumps follow the same model. The frame-ring transmit consumer and the 10 ms
 maintenance worker have no queue locality and are spawned with
 `TaskSpec::kernel_any()`, never on the boot CPU by default.
+
+IGC queue state is per queue, as each Linux `igc_q_vector` owns its `igc_ring`
+pair: the poll and transmit paths reach queue `q` through its own slot in the
+driver's `QueueSet` (the queue handle, re-read by a poll only after a
+reconfiguration, its operation count, and its drop and refusal counters,
+which `stats` sums), and select a frame's transmit queue from the RSS
+function published as a seqlock of atomic words. No device-wide lock is taken
+per packet; the whole queue set and its lock are for configuration paths,
+which replace it only after `stop` has waited for every queue's operations
+to end (`igc_down` disabling each queue's NAPI and transmit).
 
 IGC buffers are per queue and sized from that queue's rings, never from a
 link speed or a fixed count. Each `Queue` owns a TX pool of `MAX_TSO`-byte
@@ -378,6 +394,10 @@ Hardware waits never retain a queue or global spinlock.
 ring/channel/RSS/coalescing configuration, link advertising/forced 10/100,
 pause negotiation, EEE, wake policy, cumulative hardware/per-queue counters,
 register snapshots, read-only bounded NVM access, diagnostics and link restart.
+The netdev counters follow Linux `igc_update_stats`: each queue's RQDPC and
+MPC add to `rx_fifo_errors` (`iface::note_rx_fifo_errors`), MPC alone is
+`rx_missed_errors` (`iface::note_rx_missed`), CRCERRS counts toward
+`rx_errors` (`iface::note_rx_crc_error`), and `rx_over_errors` stays 0.
 The Linux ethtool ioctl bridge supplies these controls, names/stats, channel
 and ring queries, timestamp capabilities and Ethernet/VLAN-priority receive
 flow rules. EtherType (eight), destination-MAC (available RARs) and VLAN

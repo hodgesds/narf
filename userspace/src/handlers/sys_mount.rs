@@ -526,6 +526,8 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             }
             Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
             Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),
+            // `do_move_mount`: the target is inside the tree being moved.
+            Err(narf_filesystem::FsError::SymlinkLoop) => ctx.set_return(errno_ret(ELOOP)),
             Err(_) => ctx.set_return(einval),
         };
     }

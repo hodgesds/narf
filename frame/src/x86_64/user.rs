@@ -17,9 +17,9 @@
 //!   structurally fine.
 //!
 //! `enter_user_mode` does not return. The only way back into the
-//! kernel is a trap — `int 0x80` for syscalls (vector 128, now DPL=3
-//! so user mode can trigger it), CPU exceptions (page fault etc.),
-//! or an external IRQ.
+//! kernel is `syscall`, a trap — `int 0x80` for i386 system calls
+//! (vector 128, DPL=3 so user mode can trigger it), CPU exceptions
+//! (page fault etc.) — or an external IRQ.
 //!
 //! All of the actual primitives — `UserState`, `JmpBuf`, `setjmp`,
 //! `longjmp`, `enter_user_mode`, `enter_user_mode_resume`,

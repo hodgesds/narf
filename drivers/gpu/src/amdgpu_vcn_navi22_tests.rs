@@ -3,7 +3,9 @@
 //! and its reset released, decodes the public VCN decode (PACKET0 to the
 //! internal command registers), encode and JRBC ring ABIs independently of
 //! the encoders, and executes work only after an HDP flush, inside an open
-//! NBIF aperture and the MMSCH doorbell range of the right instance.
+//! NBIF aperture and the MMSCH doorbell range of the right instance. Its
+//! encoder walks each IB's packages over the length VCN_ENC_CMD_IB names;
+//! a package that does not parse wedges the instance's VCPU.
 use super::*;
 use alloc::{collections::BTreeMap, rc::Rc, sync::Arc, vec::Vec};
 use core::{
@@ -111,6 +113,9 @@ struct Model {
     /// unpause, as the RX 6750 XT's VCN0 does (POWER_STATUS 0x906) while its
     /// encode rings hold IB-test commands they never ran.
     power_held: [bool; 2],
+    /// The VCPU never returned from an encode IB whose packages did not
+    /// parse: no ring of the instance runs again and it stays powered up.
+    wedged: [bool; 2],
 }
 fn mc(map: MmioRegion, offset: u64) -> u64 {
     map.phys.raw() - PHYS + MC + offset
@@ -161,6 +166,7 @@ impl Model {
             sram: Rc::new(RefCell::new(BTreeMap::new())),
             pause_stuck: false,
             power_held: [false; 2],
+            wedged: [false; 2],
         }
     }
     fn reg(&self, address: u64) -> u32 {
@@ -255,9 +261,14 @@ impl Model {
             }
         }
         self.regs.insert(v(i, PGFSM_STATUS), status);
+        // UVDM off: the VCPU loses its state, a wedged one included.
+        if status & 3 == 2 {
+            self.wedged[i] = false;
+        }
     }
     fn vcpu(&mut self, i: usize, old: u32, new: u32) {
         if new & VCPU_BLK_RST != 0 {
+            self.wedged[i] = false;
             let status = self.reg(v(i, STATUS)) & !VCPU_REPORT_BOOTED;
             self.regs.insert(v(i, STATUS), status);
             return;
@@ -344,22 +355,54 @@ impl Model {
             }
         }
     }
-    fn enc(&mut self, i: usize, j: usize, words: &[u32]) {
+    /// The encoder firmware's IB walk: packages of `[size in bytes, type,
+    /// payload]` until the `dwords` the VCN_ENC_CMD_IB names are consumed.
+    /// A package that claims no size, is not whole dwords or runs past the
+    /// IB never advances the walk: the VCPU does not return from the IB.
+    /// Returns the session op, or None for such a wedge.
+    fn enc_ib(&self, address: u64, dwords: u32) -> Option<u32> {
+        let mut at = 0;
+        let mut op = None;
+        while at < dwords {
+            let size = self.word(address + u64::from(at) * 4);
+            if size == 0 || size % 4 != 0 || at + size / 4 > dwords {
+                return None;
+            }
+            let package: Vec<u32> = (0..size / 4)
+                .map(|n| self.word(address + u64::from(at + n) * 4))
+                .collect();
+            match package.get(1).copied() {
+                Some(1) => {
+                    assert_eq!(package.len(), 6, "session info size");
+                    assert_eq!(package[2], 1, "session handle 1");
+                    let session = (u64::from(package[3]) << 32) | u64::from(package[4]);
+                    assert_eq!(session % 4096, 0, "session buffer not page aligned");
+                }
+                Some(2) => assert_eq!(package, [0x14, 2, 0x1c, 0, 0], "task info"),
+                Some(code @ (0x0800_0001 | 0x0800_0002)) => {
+                    assert_eq!(package.len(), 2, "op size");
+                    op = Some(code);
+                }
+                other => panic!("unexpected encode package {other:?}"),
+            }
+            at += size / 4;
+        }
+        Some(op.expect("encode IB without an op"))
+    }
+    /// Run encode ring commands; `Err(k)`: the VCPU wedged in the IB at
+    /// command word `k` and consumed nothing from there on.
+    fn enc(&mut self, i: usize, j: usize, words: &[u32]) -> Result<(), usize> {
         let mut k = 0;
         while k < words.len() {
             k += match words[k] {
                 cmd::ENC_NOP | cmd::ENC_END => 1,
                 cmd::ENC_IB => {
                     assert_eq!(words[k + 1], 0, "kernel IB outside VMID0");
-                    assert_eq!(words[k + 4], 16);
                     let address = u64::from(words[k + 2]) | (u64::from(words[k + 3]) << 32);
-                    let ib: Vec<u32> = (0..16).map(|n| self.word(address + n * 4)).collect();
-                    assert_eq!(ib[..3], [0x18, 1, 1], "session info / handle 1");
-                    assert_eq!(ib[6..11], [0x14, 2, 0x1c, 0, 0], "task info");
-                    let session = (u64::from(ib[3]) << 32) | u64::from(ib[4]);
-                    assert_eq!(session % 4096, 0);
-                    assert_eq!(ib[11], 8);
-                    self.work.push(Work::Session(i, j, ib[12]));
+                    let Some(op) = self.enc_ib(address, words[k + 4]) else {
+                        return Err(k);
+                    };
+                    self.work.push(Work::Session(i, j, op));
                     5
                 }
                 cmd::ENC_FENCE => {
@@ -376,6 +419,7 @@ impl Model {
                 other => panic!("unexpected encode command {other:#x}"),
             };
         }
+        Ok(())
     }
     fn jpeg(&mut self, words: &[u32]) {
         for pair in words.chunks_exact(2) {
@@ -398,7 +442,7 @@ impl Model {
             if index == doorbell::dec(i as u32) {
                 let slot = 3 * i;
                 self.regs.insert(v(i, RBC_RB_WPTR), value);
-                if !self.booted(i) || self.stalled[slot] {
+                if !self.booted(i) || self.stalled[slot] || self.wedged[i] {
                     return;
                 }
                 if self.dpg(i) {
@@ -420,6 +464,12 @@ impl Model {
                 self.dec(i, &words, false);
                 self.rptr[slot] = value;
                 self.regs.insert(v(i, RBC_RB_RPTR), value);
+                if self.dpg(i) {
+                    // The firmware keeps fw_shared rb.rptr, which the DPG
+                    // pause restores into UVD_RBC_RB_RPTR.
+                    let shared = self.dpg_shared(i);
+                    self.put(shared + shared::RB_RPTR, value);
+                }
                 return;
             }
             for j in [0, 1] {
@@ -429,15 +479,26 @@ impl Model {
                 let slot = 3 * i + 1 + j;
                 self.regs.insert(v(i, RB_WPTR[j]), value);
                 // DPG keeps no encode ring state outside a pause.
-                if !self.booted(i) || self.stalled[slot] || (self.dpg(i) && !self.paused(i)) {
+                if !self.booted(i)
+                    || self.stalled[slot]
+                    || self.wedged[i]
+                    || (self.dpg(i) && !self.paused(i))
+                {
                     return;
                 }
                 assert_eq!(self.reg(v(i, RB_SIZE[j])), RING_DW);
                 let base = self.pair(v(i, RB_BASE_LO[j]), v(i, RB_BASE_HI[j]));
                 let words = self.ring(base, self.rptr[slot], value);
-                self.enc(i, j, &words);
-                self.rptr[slot] = value;
-                self.regs.insert(v(i, RB_RPTR[j]), value);
+                let rptr = match self.enc(i, j, &words) {
+                    Ok(()) => value,
+                    // The read pointer stays on the IB the VCPU never left.
+                    Err(k) => {
+                        self.wedged[i] = true;
+                        (self.rptr[slot] + k as u32) % RING_DW
+                    }
+                };
+                self.rptr[slot] = rptr;
+                self.regs.insert(v(i, RB_RPTR[j]), rptr);
                 return;
             }
             if i == 0 && index == doorbell::JPEG {
@@ -480,8 +541,11 @@ impl Io for Model {
         for i in [0, 1] {
             let power = self.reg(v(i, POWER_STATUS));
             if address == v(i, POWER_STATUS) && power & POWER_PG_MODE != 0 {
-                // Powered up (2) while paused and not stalled, else 1.
-                let up = self.power_held[i] || (self.paused(i) && power & POWER_STALL_DPG == 0);
+                // Powered up (2) while paused and not stalled, or while the
+                // VCPU is wedged; else 1.
+                let up = self.power_held[i]
+                    || self.wedged[i]
+                    || (self.paused(i) && power & POWER_STALL_DPG == 0);
                 return (power & !POWER_STATUS_MASK) | if up { 2 } else { 1 };
             }
         }
@@ -505,6 +569,18 @@ impl Io for Model {
         let old = self.reg(address);
         self.regs.insert(address, value);
         for i in [0, 1] {
+            // A written read pointer is where the engine fetches next.
+            if address == v(i, RBC_RB_RPTR) {
+                self.rptr[3 * i] = value % RING_DW;
+            }
+            for j in [0, 1] {
+                if address == v(i, RB_RPTR[j]) {
+                    self.rptr[3 * i + 1 + j] = value % RING_DW;
+                }
+            }
+            if i == 0 && address == v(0, JRBC_RB_RPTR) {
+                self.rptr[6] = value % RING_DW;
+            }
             if address == v(i, PGFSM_CONFIG) {
                 self.pgfsm(i, value);
             }
@@ -1506,6 +1582,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
         let want = encode_media(&MediaFrame {
             ring: MediaRing::Dec,
             hub: submit::MediaHub::mmhub_v2_0(0x1a000),
+            hdp: Some((HDP / 4) as u32),
             engine: 0,
             flush: (k == 0).then_some(vm(true)),
             pasid_map: (k == 0).then_some((0x10a0 + 0x10 + 3, 0x42)),
@@ -1525,6 +1602,25 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
         {
             return TestResult::Fail("decode client frame/sequence");
         }
+    }
+    // amdgpu_ib_schedule's HDP flush and invalidate ride in every frame as
+    // WRITE_REGs: the remapped HDP_MEM_FLUSH_CNTL and this layout's
+    // HDP_READ_CACHE_INVALIDATE.
+    let wreg = |byte: u32, value: u32| {
+        [
+            cmd::packet0(cmd::INTERNAL_DATA0),
+            byte,
+            cmd::packet0(cmd::INTERNAL_DATA1),
+            value,
+            cmd::packet0(cmd::INTERNAL_CMD),
+            cmd::DEC_KMD | (4 << 1),
+        ]
+    };
+    let (hdp_flush, hdp_invalidate) = (wreg(0x7f000, 0), wreg((HDP + 0xd1 * 4) as u32, 1));
+    if frames.iter().any(|(_, words, _)| {
+        !words.windows(6).any(|w| w == hdp_flush) || !words.windows(6).any(|w| w == hdp_invalidate)
+    }) {
+        return TestResult::Fail("decode client frame without the HDP flush/invalidate");
     }
     let m = &e.hw.io;
     let last = frames[1].2;
@@ -1676,6 +1772,175 @@ kernel_test_in!(
     vcn_navi22_client_jobs_frame_flush_and_throttle
 );
 
+/// Linux arms drm_sched's `video_timeout` when a media job starts on its
+/// ring, and `amdgpu_job_timedout` compares the ring's emitted and signalled
+/// sequences. A client media job wakes the hang detector, and each client
+/// ring is sampled on its own: its last sequence and its fence writeback.
+/// A ring that failed its IB test takes no job and is not sampled.
+fn vcn_navi22_client_jobs_are_sampled_for_the_job_timeout() -> TestResult {
+    use crate::amdgpu_navi22_submit::{Ib, MediaRing, VmRef};
+    use crate::amdgpu_navi22_tdr::Progress;
+    let mut model = Model::new();
+    model.drop_enc_fence[0][1] = true;
+    let (pool, mut e) = engine(model, 1);
+    if run(e.start(firmware(1), None, &mut NoSram)).is_err() || run(e.start_jpeg()).is_err() {
+        return TestResult::Fail("media bring-up");
+    }
+    if run(e.test_ib()) != Err(Error::Timeout)
+        || e.state != State::Verified
+        || e.client_ready(MediaRing::Enc(1))
+    {
+        return TestResult::Fail("encode ring 1 should fail its IB test alone");
+    }
+    // Client frames are recorded, not executed: the job never completes.
+    e.hw.io.stalled = [true; 7];
+    let mut jpeg_ibs = pool.reserve(JPEG_IB_SLOT * 2).unwrap();
+    jpeg_ibs.publish();
+    let client = Client {
+        hub: submit::MediaHub::mmhub_v2_0(0x1a000),
+        oss: 0x10a0,
+        instances: 1,
+        jpeg_ibs: Some(jpeg_ibs),
+    };
+    let vm = VmRef {
+        vmid: 3,
+        page_table_base: 0x1_2345_6001,
+        pasid: 0x42,
+        flush: true,
+        map_pasid: true,
+    };
+    let ibs = [Ib {
+        va: 0x7000_0010_0000,
+        dwords: 16,
+        flags: 0,
+    }];
+    let _ = crate::amdgpu_navi22_tdr::__take_job_emitted();
+    let Ok(seq) = e.submit_client(&client, MediaRing::Dec, vm, &ibs, &[]) else {
+        return TestResult::Fail("decode client job refused");
+    };
+    if !crate::amdgpu_navi22_tdr::__take_job_emitted() {
+        return TestResult::Fail("a media job did not arm the job timeout");
+    }
+    let progress = |ring: MediaRing, emitted, signaled| Progress {
+        engine: if ring == MediaRing::Jpeg {
+            fence::Engine::Jpeg
+        } else {
+            fence::Engine::Vcn0
+        },
+        media: Some(ring),
+        emitted,
+        signaled,
+    };
+    let Ok(samples) = e.client_progress(0xf) else {
+        return TestResult::Fail("client ring sample refused");
+    };
+    if samples
+        != [
+            progress(MediaRing::Dec, seq, seq - 1),
+            progress(MediaRing::Enc(0), 2, 2),
+            progress(MediaRing::Jpeg, 0, 0),
+        ]
+    {
+        return TestResult::Fail("client media rings are not sampled for the job timeout");
+    }
+    if e.client_progress(1 << MediaRing::Dec.index()) != Ok(alloc::vec![samples[0]]) {
+        return TestResult::Fail("a ring outside the client set was sampled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/job-timeout",
+    vcn_navi22_client_jobs_are_sampled_for_the_job_timeout
+);
+
+/// A ring that never finishes is reported with what Linux's VCN 3.0 dump
+/// reads (`vcn_reg_list_3_0`, `amdgpu_vcn_dump_ip_state`: power and PGFSM
+/// state, the DPG LMA window and pause, the VCPU context id and its last
+/// GPCOM command and data, every ring's base, size and pointers), the LMI
+/// and VCPU control state, the fw_shared queue modes and decode pointers
+/// the firmware works from, and the command at the stuck read pointer.
+/// That separates a firmware wedged inside a command from one that never
+/// fetched the ring.
+fn vcn_navi22_ring_timeout_snapshot_reads_linux_vcn3_dump() -> TestResult {
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    if run(e.start(firmware(1), None, &mut psp)).is_err() {
+        return TestResult::Fail("DPG start");
+    }
+    // Encode ring 0 passed its ring test, then stops fetching.
+    e.hw.io.stalled[1] = true;
+    if run(e.test_ib()) != Err(Error::Timeout) {
+        return TestResult::Fail("the stalled encode IB test passed");
+    }
+    let Ok(s) = e.ring_snapshot(0, 1) else {
+        return TestResult::Fail("snapshot refused");
+    };
+    let inst = e.vcn[0].as_ref().unwrap();
+    let ring0 = inst.address(ENC_RING[0]);
+    let ib = inst.address(IBS[2]);
+    let value = |name: &str| {
+        TIMEOUT_REGS
+            .iter()
+            .position(|(n, _)| *n == name)
+            .map(|k| s.regs[k])
+    };
+    for name in [
+        "POWER_STATUS",
+        "STATUS",
+        "CONTEXT_ID",
+        "CONTEXT_ID2",
+        "GPCOM_VCPU_DATA0",
+        "GPCOM_VCPU_DATA1",
+        "GPCOM_VCPU_CMD",
+        "RB_BASE_HI",
+        "RB_BASE_LO",
+        "RB_BASE_HI2",
+        "RB_BASE_LO2",
+        "RB_RPTR",
+        "RB_WPTR",
+        "RB_RPTR2",
+        "RB_WPTR2",
+        "RB_SIZE",
+        "RB_SIZE2",
+        "PGFSM_CONFIG",
+        "PGFSM_STATUS",
+        "DPG_LMA_CTL",
+        "DPG_LMA_DATA",
+        "DPG_LMA_MASK",
+        "DPG_PAUSE",
+        "RBC_RB_RPTR",
+        "RBC_RB_WPTR",
+        "VCPU_CNTL",
+        "SOFT_RESET",
+        "LMI_CTRL2",
+        "LMI_STATUS",
+    ] {
+        if value(name).is_none() {
+            return TestResult::Fail("the timeout report lacks a VCN 3.0 dump register");
+        }
+    }
+    if (s.rptr, s.wptr, s.observed, s.shadow) != (0x40, 0xc0, 0, 0xc0)
+        || value("RB_BASE_LO") != Some(ring0 as u32)
+        || value("RB_SIZE") != Some(RING_DW)
+        || value("RB_RPTR2") != Some(0xc0)
+        || value("RBC_RB_RPTR") != Some(0x50)
+    {
+        return TestResult::Fail("timeout snapshot registers");
+    }
+    // fw_shared: no ring reset pending, the decode pointers the firmware
+    // restores from; then the VCN_ENC_CMD_IB the encoder sits on.
+    if s.shared != [0, 0x50, 0x50] {
+        return TestResult::Fail("timeout snapshot fw_shared modes and decode pointers");
+    }
+    if s.at_rptr != [cmd::ENC_IB, 0, ib as u32, (ib >> 32) as u32, 13] {
+        return TestResult::Fail("timeout snapshot of the command at the read pointer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/timeout-report",
+    vcn_navi22_ring_timeout_snapshot_reads_linux_vcn3_dump
+);
+
 fn dpg_engine(instances: u8) -> (Pool, Engine<Model>, FakePsp) {
     let model = Model::new();
     let psp = FakePsp::new(&model);
@@ -1725,6 +1990,152 @@ fn runtime_engine(mode: StartMode, gated: bool) -> (Pool, Engine<Model>, Runtime
     run(e.test_ib()).unwrap();
     (pool, e, pm)
 }
+/// A media client over the model's MMHUB, and one 16-dword client IB under
+/// a flushing MMHUB grant.
+fn media_client(pool: &Pool) -> Client {
+    let mut jpeg_ibs = pool.reserve(JPEG_IB_SLOT * 2).unwrap();
+    jpeg_ibs.publish();
+    Client {
+        hub: submit::MediaHub::mmhub_v2_0(0x1a000),
+        oss: 0x10a0,
+        instances: 1,
+        jpeg_ibs: Some(jpeg_ibs),
+    }
+}
+fn client_job() -> (
+    crate::amdgpu_navi22_submit::VmRef,
+    [crate::amdgpu_navi22_submit::Ib; 1],
+) {
+    (
+        crate::amdgpu_navi22_submit::VmRef {
+            vmid: 3,
+            page_table_base: 0x1_2345_6001,
+            pasid: 0x42,
+            flush: true,
+            map_pasid: true,
+        },
+        [crate::amdgpu_navi22_submit::Ib {
+            va: 0x7000_0010_0000,
+            dwords: 16,
+            flags: 0,
+        }],
+    )
+}
+
+/// `amdgpu_job_timedout` on a VCN 3.0 ring resets the instance alone
+/// (`amdgpu_vcn_ring_reset` -> `amdgpu_vcn_reset_engine`): `vcn_v3_0_reset`
+/// stops it (`vcn_v3_0_stop`, PowerDownVcn), enables clock gating and, with
+/// `AMD_PG_SUPPORT_VCN` (the DPG configuration), static power gating (every
+/// tile off), then starts it (PowerUpVcn, `vcn_v3_0_start`); the decode and
+/// encode rings are ring-tested and every outstanding fence of the instance
+/// is force-completed with `-ECANCELED`. The instance's rings keep serving
+/// clients. The static start restores each encode ring's pointers to the
+/// ring's write pointer, as `vcn_v3_0_start` does, so nothing already run
+/// runs again.
+fn vcn3_timed_out_job_resets_the_instance_like_amdgpu_vcn_reset_engine() -> TestResult {
+    use crate::amdgpu_navi22_submit::MediaRing;
+    for mode in [StartMode::Dpg, StartMode::Static] {
+        let (pool, mut e, mut pm) = runtime_engine(mode, true);
+        let client = media_client(&pool);
+        let (vm, ibs) = client_job();
+        let sessions = |m: &Model| {
+            m.work
+                .iter()
+                .filter(|w| matches!(w, Work::Session(0, ..)))
+                .count()
+        };
+        let ran = sessions(&e.hw.io);
+        // VCN0's VCPU stops: no ring of the instance runs any more.
+        e.hw.io.wedged[0] = true;
+        let dec = e.submit_client(&client, MediaRing::Dec, vm, &ibs, &[]);
+        let enc = e.submit_client(&client, MediaRing::Enc(0), vm, &ibs, &[]);
+        if dec != Ok(3) || enc != Ok(3) {
+            return TestResult::Fail("client jobs refused before the hang");
+        }
+        pm.commands.clear();
+        let writes = e.hw.io.writes.len();
+        let mut cancelled = Vec::new();
+        if run(e.reset_instance(&mut pm, 0, |c| cancelled.extend_from_slice(c))).is_err() {
+            return TestResult::Fail("the VCN engine reset failed");
+        }
+        let m = &e.hw.io;
+        if m.wedged[0] || pm.commands != [([true, false], false), ([true, false], true)] {
+            return TestResult::Fail("the reset did not power VCN0 down and up again");
+        }
+        // vcn_v3_0_enable_static_power_gating powers every tile off (DPG).
+        let off = m.writes[writes..]
+            .iter()
+            .any(|&w| w == (v(0, PGFSM_CONFIG), 0x2a2a_aaaa));
+        if (mode == StartMode::Dpg) != off {
+            return TestResult::Fail("static power gating in the reset");
+        }
+        if cancelled != [(MediaRing::Dec, 2, 3), (MediaRing::Enc(0), 2, 3)] {
+            return TestResult::Fail("the reset did not report the outstanding client work");
+        }
+        let inst = e.vcn[0].as_ref().unwrap();
+        let map = inst.memory.mapping();
+        let fences = FENCE.map(|at| m.word(mc(map, at)));
+        if fences != [3, 3, 2] {
+            return TestResult::Fail("the reset did not force-complete the instance's fences");
+        }
+        // Ring tests ran on the restarted rings, and nothing ran twice.
+        let rptr = [
+            m.reg(v(0, RBC_RB_RPTR)),
+            m.reg(v(0, RB_RPTR[0])),
+            m.reg(v(0, RB_RPTR[1])),
+        ];
+        if rptr != [inst.dec.wptr, inst.enc[0].wptr, inst.enc[1].wptr]
+            || m.reg(v(0, SCRATCH9)) != 0xdead_beef
+            || sessions(m) != ran
+        {
+            return TestResult::Fail("ring tests after the reset, or stale commands re-ran");
+        }
+        if e.state != State::Verified
+            || e.runtime.phase != idle::Phase::Awake
+            || MediaRing::ALL.iter().any(|&r| !e.client_ready(r))
+            || (mode == StartMode::Dpg && !e.paused[0])
+        {
+            return TestResult::Fail("the media rings are not offered after the reset");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/engine-reset",
+    vcn3_timed_out_job_resets_the_instance_like_amdgpu_vcn_reset_engine
+);
+
+/// An instance that does not come back from `vcn_v3_0_reset` fails its
+/// ring test: the reset fails (Linux then sets `-ETIME` and recovers the
+/// GPU), nothing is force-completed and the engine is no longer usable.
+fn vcn3_engine_reset_that_does_not_restart_fails() -> TestResult {
+    use crate::amdgpu_navi22_submit::MediaRing;
+    let (pool, mut e, mut pm) = runtime_engine(StartMode::Dpg, true);
+    let client = media_client(&pool);
+    let (vm, ibs) = client_job();
+    e.hw.io.wedged[0] = true;
+    if e.submit_client(&client, MediaRing::Dec, vm, &ibs, &[]) != Ok(3) {
+        return TestResult::Fail("client job refused before the hang");
+    }
+    e.hw.io.never_boot[0] = true;
+    let mut called = false;
+    if run(e.reset_instance(&mut pm, 0, |_| called = true)) != Err(Error::Timeout)
+        || called
+        || e.state != State::Failed
+    {
+        return TestResult::Fail("a reset whose ring test failed did not fail");
+    }
+    let inst = e.vcn[0].as_ref().unwrap();
+    if e.hw.io.word(mc(inst.memory.mapping(), FENCE[0])) != 2 {
+        return TestResult::Fail("a failed reset force-completed fences");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/engine-reset",
+    vcn3_engine_reset_that_does_not_restart_fails
+);
+
 fn vcn3_idle_resume_preserves_context_fences_and_jpeg() -> TestResult {
     for mode in [StartMode::Dpg, StartMode::Static] {
         for gated in [false, true] {
@@ -1998,6 +2409,59 @@ fn vcn_navi22_dpg_failures_are_terminal() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vcn-navi22",
     vcn_navi22_dpg_failures_are_terminal
+);
+
+/// `amdgpu_vcn_enc_get_create_msg` / `_destroy_msg` write 13 dwords of
+/// packages (session info, task info, op) into a 16-dword IB and submit
+/// `ib->length_dw`, 13: `vcn_v2_0_enc_ring_emit_ib` names exactly the
+/// packages. An IB that names 16 makes the firmware walk a zero-sized
+/// package after the op. That is the RX 6750 XT's VCN0 at boot: both encode
+/// rings passed their ring tests, then never left their first IB-test IB
+/// (RPTR 0x40, WPTR 0xc0, fence 0, POWER_STATUS 2) and the VCPU stopped
+/// serving its decode ring as well.
+fn vcn_navi22_encode_ib_names_only_its_packages() -> TestResult {
+    let (_pool, mut e, mut psp) = dpg_engine(1);
+    if run(e.start(firmware(1), None, &mut psp)).is_err() || e.state != State::Running {
+        return TestResult::Fail("DPG start");
+    }
+    let result = run(e.test_ib());
+    let m = &e.hw.io;
+    let rptr = [m.reg(v(0, RB_RPTR[0])), m.reg(v(0, RB_RPTR[1]))];
+    if m.wedged[0] || rptr != [0xc0, 0xc0] {
+        return TestResult::Fail(
+            "the encode IB test wedged VCN0 in its first IB (RPTR 0x40, WPTR 0xc0, fence 0)",
+        );
+    }
+    if result.is_err() || e.state != State::Verified || e.proof.enc_ib[0] != [2, 2] {
+        return TestResult::Fail("encode IB tests");
+    }
+    let inst = e.vcn[0].as_ref().unwrap();
+    let map = inst.memory.mapping();
+    for (j, &ring) in ENC_RING.iter().enumerate() {
+        // Two submissions after the ring test, each VCN_ENC_CMD_IB first.
+        for (at, ib) in [(0x40, IBS[2]), (0x80, IBS[3])] {
+            let start = mc(map, ring) + at * 4;
+            let packet: Vec<u32> = (0..5).map(|k| m.word(start + k * 4)).collect();
+            let address = inst.address(ib);
+            if packet != [cmd::ENC_IB, 0, address as u32, (address >> 32) as u32, 13] {
+                return TestResult::Fail("VCN_ENC_CMD_IB does not name the 13 package dwords");
+            }
+        }
+        for op in [0x0800_0001, 0x0800_0002] {
+            if !m.work.contains(&Work::Session(0, j, op)) {
+                return TestResult::Fail("encode session initialize/close");
+            }
+        }
+    }
+    // The VCPU still serves decode after the encode IB tests.
+    if run(e.test_dec_ring(0)).is_err() {
+        return TestResult::Fail("VCN0 decode stopped after the encode IB tests");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi22/enc-ib",
+    vcn_navi22_encode_ib_names_only_its_packages
 );
 
 /// Every idle gate attempt that reaches the engine stop and the PMFW
@@ -2428,6 +2892,7 @@ fn media_flush_follows_the_hub_registers() -> TestResult {
         encode_media(&MediaFrame {
             ring: MediaRing::Dec,
             hub,
+            hdp: None,
             engine,
             flush: Some(VmRef {
                 vmid: vmid as u8,

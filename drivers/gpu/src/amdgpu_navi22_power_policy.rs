@@ -412,12 +412,17 @@ mod tests {
             return TestResult::Fail("a power-saving feature is enabled by default");
         }
         // The cold-boot SMU policy (even with every board feature present)
-        // and the display transition exclude GFXOFF, gating and deep sleep;
-        // only the DCN-owned display transition may add UCLK/FCLK DPM.
+        // and the display transition exclude GFXOFF, hub gating and deep
+        // sleep; only the DCN-owned display transition may add UCLK/FCLK
+        // DPM. Multimedia DPM/power gating is Linux's Navi22 boot default
+        // (`AMD_PG_SUPPORT_VCN`), owned by the VCN start and idle gate.
         let boot = crate::amdgpu_power_navi22::BootPolicy::from_features(u64::MAX).unwrap();
-        let gated = SMU_GFXOFF | SMU_DEEP_SLEEP | SMU_HUB_PG | SMU_BACO | SMU_MM_DPM_PG;
+        let gated = SMU_GFXOFF | SMU_DEEP_SLEEP | SMU_HUB_PG | SMU_BACO;
         if boot.allowed() & (gated | SMU_DPM_UCLK | SMU_DPM_FCLK) != 0 {
             return TestResult::Fail("boot policy allows a gated feature");
+        }
+        if boot.allowed() & SMU_MM_DPM_PG == 0 {
+            return TestResult::Fail("boot policy leaves out Linux's MM_DPM_PG");
         }
         if boot.display_allowed().unwrap() & gated != 0 {
             return TestResult::Fail("display transition allows GFXOFF/gating/deep sleep");

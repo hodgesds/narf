@@ -2374,6 +2374,1319 @@ kernel_test_in!(
     smoke_abi_caps_mount_follows_the_mount_namespace_owner
 );
 
+/// Fork-shaped `clone(flags | SIGCHLD)` issued by the harness task. On
+/// success returns the child's TaskId: the child is published but never
+/// polled, so a case can inspect its namespaces and issue syscalls AS it via
+/// [`set_task`]. Release it with [`release_clone_child`]. On failure returns
+/// the clone's Linux return value.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn clone_child(flags: u64) -> Result<u64, i64> {
+    const SIGCHLD: u64 = 17;
+    match call(Syscall::Clone.raw(), a1(flags | SIGCHLD, 0)) {
+        Some(pid) if pid > 0 => {
+            Ok(crate::handlers::pid_to_task_raw(pid as u64).unwrap_or(pid as u64))
+        }
+        Some(ret) => Err(ret),
+        None => Err(i64::MIN),
+    }
+}
+
+/// Drop the synthetic child [`clone_child`] made and switch back to the
+/// harness task. Namespace, credential and mount tables are reset by the
+/// harness teardown.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn release_clone_child(child: u64) {
+    set_task(FAKE_TASK);
+    let _ = crate::task::release_task(child);
+    narf_scheduler::__reset_queues_for_test();
+}
+
+/// `kernel/fork.c::copy_process` runs `copy_creds` — which, for
+/// CLONE_NEWUSER, creates the user namespace and binds the child's new
+/// credential to it (`create_user_ns` → `set_cred_user_ns`) — BEFORE
+/// `copy_namespaces`, and `copy_namespaces` hands that credential's namespace
+/// to every constructor:
+///
+///     struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+///     ...
+///     new_ns = create_new_namespaces(flags, tsk, user_ns, tsk->fs);
+///
+/// so `copy_mnt_ns` records `new_ns->user_ns = get_user_ns(user_ns)`: the
+/// mount namespace a `clone(CLONE_NEWUSER | CLONE_NEWNS)` child gets belongs
+/// to the child's own user namespace, and `may_mount`
+/// (`ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN)`) passes
+/// for it.
+///
+/// This is bubblewrap's container setup verbatim: one raw clone creating
+/// both, then `mount(NULL, "/", NULL, MS_SILENT | MS_SLAVE | MS_REC, NULL)`
+/// in the child. Steam's runtime check runs exactly that and reported
+/// "Failed to make / slave: Operation not permitted" when the child's mount
+/// namespace was stamped with the PARENT's user namespace instead.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_clone_newuser_newns_child_may_mount() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const MS_REC: u64 = 0x4000;
+        const MS_SILENT: u64 = 0x8000;
+        const MS_SLAVE: u64 = 1 << 19;
+        const TARGET: &str = "/abi-userns-clone-mnt";
+
+        install_test_address_space()?;
+        narf_scheduler::__reset_queues_for_test();
+        // The mount point must exist in the table the child's namespace is
+        // copied from, so create it before the clone takes that copy.
+        narf_filesystem::__test_ensure_mount_target(TARGET);
+        // An ordinary desktop user: no host privilege at all.
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        drop_all_caps();
+
+        let child = match clone_child(CLONE_NEWUSER | CLONE_NEWNS) {
+            Ok(child) => child,
+            Err(_) => return Err("unprivileged clone(CLONE_NEWUSER|CLONE_NEWNS) failed"),
+        };
+        let result = (|| {
+            let user_ns = crate::namespaces::user_ns_of(child)
+                .ok_or("clone(CLONE_NEWUSER) child has no user namespace")?;
+            let mnt_ns = crate::handlers::mount_namespace_of(child)
+                .ok_or("clone(CLONE_NEWNS) child has no private mount namespace")?;
+            if mnt_ns.owner().map(|owner| owner.ns_id()) != Some(user_ns.id()) {
+                return Err("child's mount namespace is not owned by its new user namespace");
+            }
+
+            set_task(child);
+            let root = b"/\0";
+            match call(
+                Syscall::Mount.raw(),
+                a4(0, root.as_ptr() as u64, 0, MS_SILENT | MS_SLAVE | MS_REC, 0),
+            ) {
+                Some(0) => {}
+                Some(-1) => return Err("bwrap's make-rslave of / was EPERM in the child"),
+                _ => return Err("make-rslave of / in the child failed"),
+            }
+            let target = b"/abi-userns-clone-mnt\0";
+            let fstype = b"tmpfs\0";
+            let source = b"tmpfs\0";
+            match call(
+                Syscall::Mount.raw(),
+                a4(
+                    source.as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    fstype.as_ptr() as u64,
+                    0,
+                    0,
+                ),
+            ) {
+                Some(0) => {}
+                Some(-1) => return Err("tmpfs mount in the child's own mount namespace was EPERM"),
+                _ => return Err("tmpfs mount in the child's own mount namespace failed"),
+            }
+            // The mount landed in the child's namespace, not the host's.
+            if mnt_ns.mount_id_at(TARGET).is_none() {
+                return Err("the child's tmpfs is missing from its own mount namespace");
+            }
+            if narf_filesystem::registry()
+                .list()
+                .iter()
+                .any(|mount| mount == TARGET)
+            {
+                return Err("the child's tmpfs leaked into the host mount namespace");
+            }
+            Ok(())
+        })();
+        release_clone_child(child);
+        result
+    })
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-clone",
+    smoke_abi_userns_clone_newuser_newns_child_may_mount
+);
+
+/// Every namespace a single `clone()` creates alongside CLONE_NEWUSER is
+/// owned by the NEW user namespace: `create_new_namespaces` passes one
+/// `user_ns` — the child credential's — to `copy_mnt_ns`, `copy_utsname`,
+/// `copy_ipcs`, `copy_pid_ns`, `copy_cgroup_ns` and `copy_net_ns` alike.
+/// The owner is what every later `ns_capable(ns->user_ns, …)` test and
+/// `setns` measures against, and what `NS_GET_USERNS`/`listns` report.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_clone_newuser_owns_every_new_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        const CLONE_NEWIPC: u64 = 0x0800_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+        let flags = CLONE_NEWUSER
+            | CLONE_NEWNS
+            | CLONE_NEWUTS
+            | CLONE_NEWIPC
+            | CLONE_NEWPID
+            | CLONE_NEWNET
+            | CLONE_NEWCGROUP;
+
+        install_test_address_space()?;
+        narf_scheduler::__reset_queues_for_test();
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        drop_all_caps();
+
+        let child = match clone_child(flags) {
+            Ok(child) => child,
+            Err(_) => return Err("unprivileged clone(CLONE_NEWUSER|every namespace) failed"),
+        };
+        let result = (|| {
+            let owner = crate::namespaces::user_ns_of(child)
+                .ok_or("clone(CLONE_NEWUSER) child has no user namespace")?
+                .id();
+            let mnt = crate::handlers::mount_namespace_of(child)
+                .ok_or("child has no private mount namespace")?;
+            if mnt.owner().map(|o| o.ns_id()) != Some(owner) {
+                return Err("CLONE_NEWNS namespace is not owned by the new user namespace");
+            }
+            let uts = crate::namespaces::uts_ns_of(child).ok_or("child has no UTS namespace")?;
+            if uts.owner_user_ns().id() != owner {
+                return Err("CLONE_NEWUTS namespace is not owned by the new user namespace");
+            }
+            let ipc = crate::namespaces::ipc_ns_of(child).ok_or("child has no IPC namespace")?;
+            if ipc.owner_user_ns().id() != owner {
+                return Err("CLONE_NEWIPC namespace is not owned by the new user namespace");
+            }
+            let net = crate::namespaces::net_ns_of(child).ok_or("child has no net namespace")?;
+            if net.owner_user_ns().id() != owner {
+                return Err("CLONE_NEWNET namespace is not owned by the new user namespace");
+            }
+            let pid = crate::pid_ns::ns_of(child).ok_or("child has no PID namespace")?;
+            if pid.owner_user_ns().id() != owner {
+                return Err("CLONE_NEWPID namespace is not owned by the new user namespace");
+            }
+            #[cfg(feature = "cgroup")]
+            {
+                let outer = crate::handlers::task_to_pid_raw(child).unwrap_or(child);
+                let cgroup = narf_filesystem::cgroupfs::cgroup_namespace_of(outer);
+                if cgroup.owner().map(|o| o.ns_id()) != Some(owner) {
+                    return Err("CLONE_NEWCGROUP namespace is not owned by the new user namespace");
+                }
+            }
+            Ok(())
+        })();
+        release_clone_child(child);
+        result
+    })
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-clone",
+    smoke_abi_userns_clone_newuser_owns_every_new_namespace
+);
+
+/// The `unshare(2)` twin of the clone case above: `ksys_unshare` runs
+/// `unshare_userns` first and hands the new credential to
+/// `unshare_nsproxy_namespaces`, whose `user_ns = new_cred ?
+/// new_cred->user_ns : current_user_ns()` owns everything it creates.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_unshare_newuser_owns_every_new_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        const CLONE_NEWIPC: u64 = 0x0800_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+        let flags = CLONE_NEWUSER
+            | CLONE_NEWNS
+            | CLONE_NEWUTS
+            | CLONE_NEWIPC
+            | CLONE_NEWNET
+            | CLONE_NEWCGROUP;
+
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        drop_all_caps();
+        if call(Syscall::Unshare.raw(), a0(flags)) != Some(0) {
+            return Err("unprivileged unshare(CLONE_NEWUSER|every namespace) failed");
+        }
+        let owner = crate::namespaces::user_ns_of(FAKE_TASK)
+            .ok_or("unshare(CLONE_NEWUSER) left no user namespace")?
+            .id();
+        let mnt = crate::handlers::mount_namespace_of(FAKE_TASK)
+            .ok_or("unshare(CLONE_NEWNS) left no private mount namespace")?;
+        if mnt.owner().map(|o| o.ns_id()) != Some(owner) {
+            return Err("CLONE_NEWNS namespace is not owned by the new user namespace");
+        }
+        let uts = crate::namespaces::uts_ns_of(FAKE_TASK).ok_or("no UTS namespace")?;
+        if uts.owner_user_ns().id() != owner {
+            return Err("CLONE_NEWUTS namespace is not owned by the new user namespace");
+        }
+        let ipc = crate::namespaces::ipc_ns_of(FAKE_TASK).ok_or("no IPC namespace")?;
+        if ipc.owner_user_ns().id() != owner {
+            return Err("CLONE_NEWIPC namespace is not owned by the new user namespace");
+        }
+        let net = crate::namespaces::net_ns_of(FAKE_TASK).ok_or("no net namespace")?;
+        if net.owner_user_ns().id() != owner {
+            return Err("CLONE_NEWNET namespace is not owned by the new user namespace");
+        }
+        #[cfg(feature = "cgroup")]
+        {
+            let cgroup = narf_filesystem::cgroupfs::cgroup_namespace_of(FAKE_TASK);
+            if cgroup.owner().map(|o| o.ns_id()) != Some(owner) {
+                return Err("CLONE_NEWCGROUP namespace is not owned by the new user namespace");
+            }
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns-clone",
+    smoke_abi_userns_unshare_newuser_owns_every_new_namespace
+);
+
+/// `fs/namespace.c::path_pivot_root` attaches the old root mount at put_old
+/// WITH every mount below it — `attach_mnt(root_mnt, old_mnt, old_mp)`
+/// moves the whole `root_mnt` tree — after `umount_mnt(new_mnt)` took the
+/// new root's own subtree out of it. So right after
+/// `pivot_root("/tmp", "oldroot")` the old root's `/proc` is procfs at
+/// `/oldroot/proc`, and the new root's tmpfs is no longer under the old
+/// root's `/tmp`.
+///
+/// This replays the probe of bubblewrap's first steps (make / rslave, a
+/// tmpfs on /tmp, newroot + oldroot, pivot_root, chdir /). NARF attached the
+/// root filesystem alone, so `/oldroot/proc` was an empty directory:
+/// Steam's srt-bwrap died on `readlink(/oldroot/proc/self/fd/N)` ENOENT
+/// ("Can't bind mount /oldroot/ on /newroot/"), and bwrap 0.13 on its bind
+/// of `oldroot/proc`.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_pivot_root_keeps_the_old_roots_mounts() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const MS_NOSUID: u64 = 0x2;
+        const MS_NODEV: u64 = 0x4;
+        const MS_BIND: u64 = 0x1000;
+        const MS_REC: u64 = 0x4000;
+        const MS_SLAVE: u64 = 1 << 19;
+        const O_PATH: u64 = 0o10_000_000;
+        const ENOENT: i64 = -2;
+        let saved_fd_path = narf_filesystem::procfs::__test_fd_path_hook_snapshot();
+        narf_filesystem::procfs::__test_fd_path_hook_restore(crate::handlers::fd_path_of as usize);
+        let result = (|| {
+            if !registry().list().iter().any(|mount| mount == "/proc") {
+                return Err("/proc is not mounted in the test image");
+            }
+            narf_filesystem::__test_ensure_mount_target("/tmp");
+            if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+                || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            {
+                return Err("could not drop the test task to host uid/gid 1000");
+            }
+            drop_all_caps();
+            let zero = |num: u32, args: SyscallArgs| call(num, args) == Some(0);
+            if !zero(Syscall::Unshare.raw(), a0(CLONE_NEWUSER | CLONE_NEWNS))
+                || !zero(
+                    Syscall::Mount.raw(),
+                    a4(0, c"/".as_ptr() as u64, 0, MS_SLAVE | MS_REC, 0),
+                )
+                || !zero(
+                    Syscall::Mount.raw(),
+                    a4(
+                        c"tmpfs".as_ptr() as u64,
+                        c"/tmp".as_ptr() as u64,
+                        c"tmpfs".as_ptr() as u64,
+                        MS_NOSUID | MS_NODEV,
+                        0,
+                    ),
+                )
+                || !zero(Syscall::Chdir.raw(), a0(c"/tmp".as_ptr() as u64))
+                || !zero(Syscall::Mkdir.raw(), a1(c"newroot".as_ptr() as u64, 0o755))
+                || !zero(Syscall::Mkdir.raw(), a1(c"oldroot".as_ptr() as u64, 0o755))
+            {
+                return Err("the user + mount namespace with a tmpfs on /tmp was not set up");
+            }
+            if !zero(
+                Syscall::PivotRoot.raw(),
+                a1(c"/tmp".as_ptr() as u64, c"oldroot".as_ptr() as u64),
+            ) || !zero(Syscall::Chdir.raw(), a0(c"/".as_ptr() as u64))
+            {
+                return Err("pivot_root(/tmp, oldroot) failed");
+            }
+            let mut sb = [0u8; STAT_SIZE];
+            if call_stat(
+                c"/oldroot/proc/self/status".as_ptr() as u64,
+                sb.as_mut_ptr() as u64,
+            ) != Some(0)
+            {
+                return Err("the old root's /proc is not procfs at /oldroot/proc");
+            }
+            if call_stat(
+                c"/oldroot/tmp/oldroot".as_ptr() as u64,
+                sb.as_mut_ptr() as u64,
+            ) != Some(ENOENT)
+            {
+                return Err("the new root's tmpfs is still mounted under the old root's /tmp");
+            }
+            let newroot = match call_open(c"/newroot".as_ptr() as u64, O_PATH) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open(/newroot, O_PATH) failed"),
+            };
+            let link = alloc::format!("/oldroot/proc/self/fd/{newroot}\0");
+            let mut buf = [0u8; 64];
+            let n = call_readlink(
+                link.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            );
+            if n != Some(8) || &buf[..8] != b"/newroot" {
+                return Err("readlink(/oldroot/proc/self/fd/N) did not name /newroot");
+            }
+            if !zero(
+                Syscall::Mount.raw(),
+                a4(
+                    c"/oldroot/".as_ptr() as u64,
+                    c"/newroot/".as_ptr() as u64,
+                    0,
+                    MS_BIND | MS_REC,
+                    0,
+                ),
+            ) {
+                return Err("mount(/oldroot/, /newroot/, MS_BIND|MS_REC) failed");
+            }
+            if call_stat(
+                c"/newroot/proc/self/status".as_ptr() as u64,
+                sb.as_mut_ptr() as u64,
+            ) != Some(0)
+            {
+                return Err("the recursive bind of the old root lost its /proc");
+            }
+            Ok(())
+        })();
+        narf_filesystem::procfs::__test_fd_path_hook_restore(saved_fd_path);
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns-pivot",
+    smoke_abi_userns_pivot_root_keeps_the_old_roots_mounts
+);
+
+// ── bubblewrap's sandbox setup, replayed syscall for syscall ─────────────
+//
+// Both sequences below were recorded with `strace -f` on Linux 7.3 (CachyOS):
+// `bwrap --unshare-user --dev-bind / / true` (bubblewrap 0.13.1, what a user
+// or Flatpak runs) and Steam's `srt-bwrap --bind / / true` (bubblewrap
+// 0.11.2, run by `steam-runtime-check-requirements` to decide whether Steam
+// can start at all). The setup is the same up to the first pivot_root; the
+// two builds then bind the old root onto the new one differently, and finish
+// with the same rprivate + lazy unmount of the old root and the second
+// pivot_root(".", ".") into newroot.
+
+/// Which recorded bubblewrap sequence to replay.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BwrapBuild {
+    /// bubblewrap 0.13.1: binds via openat2(RESOLVE_IN_ROOT) and
+    /// `/proc/self/fd/N` magic links through its own bind of oldroot/proc.
+    V0_13,
+    /// bubblewrap 0.11.2 (Steam's srt-bwrap): binds by path, then reads
+    /// `/oldroot/proc/self/fd/N` and `/proc/self/mountinfo` to remount.
+    V0_11,
+    /// bubblewrap 0.13.1 with `--ro-bind / / --dev /dev`, the shape of
+    /// glycin's image-loader sandbox: the bound root made read-only, then a
+    /// fresh tmpfs on its /dev with device binds, links, its own `shm` and a
+    /// new devpts instance ([`bwrap_mount_dev`]).
+    V0_13Dev,
+}
+
+/// Fail a replay step: name it, and log what the syscall returned.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_step(step: &'static str, got: Option<i64>, ok: bool) -> Result<i64, &'static str> {
+    use core::fmt::Write as _;
+    if ok {
+        return Ok(got.unwrap_or(0));
+    }
+    let _ = writeln!(narf_console::Writer, "userns-bwrap: {step} = {got:?}");
+    Err(step)
+}
+
+/// A syscall that must return 0.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_zero(step: &'static str, num: u32, args: SyscallArgs) -> Result<(), &'static str> {
+    let got = call(num, args);
+    bwrap_step(step, got, got == Some(0)).map(|_| ())
+}
+
+/// A syscall that must return a descriptor.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_fd(step: &'static str, num: u32, args: SyscallArgs) -> Result<u64, &'static str> {
+    let got = call(num, args);
+    bwrap_step(step, got, got.is_some_and(|fd| fd >= 0)).map(|fd| fd as u64)
+}
+
+/// `readlink(path)` must name `want`.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_readlink(step: &'static str, path: &str, want: &str) -> Result<(), &'static str> {
+    use core::fmt::Write as _;
+    let path = alloc::format!("{path}\0");
+    let mut buf = [0u8; 256];
+    let got = call_readlink(
+        path.as_ptr() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    if let Some(n) = got.filter(|n| *n >= 0) {
+        if &buf[..n as usize] == want.as_bytes() {
+            return Ok(());
+        }
+        let text = core::str::from_utf8(&buf[..n as usize]).unwrap_or("<non-utf8>");
+        let _ = writeln!(narf_console::Writer, "userns-bwrap: {step} = {text:?}");
+        return Err(step);
+    }
+    bwrap_step(step, got, false).map(|_| ())
+}
+
+/// `fstat(fd)` must report a directory.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_fstat_dir(step: &'static str, fd: u64) -> Result<(), &'static str> {
+    let mut sb = [0u8; STAT_SIZE];
+    let got = call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64));
+    bwrap_step(
+        step,
+        got,
+        got == Some(0) && stat_mode(&sb) & 0o170000 == 0o040000,
+    )
+    .map(|_| ())
+}
+
+/// `stat(path)`'s raw result, for the existence checks.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_stat(path: &core::ffi::CStr) -> Option<i64> {
+    let mut sb = [0u8; STAT_SIZE];
+    call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64)
+}
+
+/// `openat2(dirfd, path, how)`: `struct open_how { flags, mode, resolve }`.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_openat2(
+    step: &'static str,
+    dirfd: u64,
+    path: &core::ffi::CStr,
+    flags: u64,
+    resolve: u64,
+) -> Result<u64, &'static str> {
+    let how = [flags, 0u64, resolve];
+    bwrap_fd(
+        step,
+        Syscall::Openat2.raw(),
+        a3(dirfd, path.as_ptr() as u64, how.as_ptr() as u64, 24),
+    )
+}
+
+/// Read `/proc/self/mountinfo` through bubblewrap's `/proc` descriptor and
+/// list the mount points `bind_mount()` would remount for `root`: the topmost
+/// mount AT `root`, then every mount below it by parent id, skipping one a
+/// later sibling covers (bubblewrap's `parse_mountinfo` / `collect_mounts`).
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_mount_tab(
+    proc_fd: u64,
+    root: &str,
+) -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+    use alloc::vec::Vec;
+    use core::fmt::Write as _;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    let fd = bwrap_fd(
+        "openat(proc_fd, self/mountinfo)",
+        Syscall::Openat.raw(),
+        a3(proc_fd, c"self/mountinfo".as_ptr() as u64, O_CLOEXEC, 0),
+    )?;
+    let mut text = Vec::new();
+    loop {
+        let mut chunk = [0u8; 1024];
+        match call(
+            Syscall::Read.raw(),
+            a2(fd, chunk.as_mut_ptr() as u64, chunk.len() as u64),
+        ) {
+            Some(0) => break,
+            Some(n) if n > 0 => text.extend_from_slice(&chunk[..n as usize]),
+            other => {
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                return bwrap_step("read(self/mountinfo)", other, false).map(|_| Vec::new());
+            }
+        }
+    }
+    let _ = call(Syscall::Close.raw(), a0(fd));
+    let text = core::str::from_utf8(&text).map_err(|_| "mountinfo is not UTF-8")?;
+    // (id, parent id, mount point) per line, in file order.
+    let lines: Vec<(u64, u64, &str)> = text
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split(' ');
+            let id = f.next()?.parse().ok()?;
+            let parent = f.next()?.parse().ok()?;
+            let _devno = f.next()?;
+            let _mnt_root = f.next()?;
+            Some((id, parent, f.next()?))
+        })
+        .collect();
+    let Some(top) = lines.iter().rposition(|(_, _, path)| *path == root) else {
+        let _ = writeln!(narf_console::Writer, "userns-bwrap: mountinfo:\n{text}");
+        return Err("bind_mount: the destination is not in /proc/self/mountinfo");
+    };
+    let mut out = alloc::vec![alloc::string::String::from(root)];
+    let mut stack = alloc::vec![lines[top].0];
+    while let Some(parent) = stack.pop() {
+        let children: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].1 == parent).collect();
+        for (k, &i) in children.iter().enumerate() {
+            let path = lines[i].2;
+            let covered = children[k + 1..].iter().any(|&j| {
+                let later = lines[j].2;
+                later == path
+                    || (path.starts_with(later) && path.as_bytes().get(later.len()) == Some(&b'/'))
+            });
+            if !covered {
+                out.push(alloc::string::String::from(path));
+            }
+            stack.push(lines[i].0);
+        }
+    }
+    Ok(out)
+}
+
+/// Replay one recorded bubblewrap sandbox setup as the clone child `child`,
+/// with `proc_fd` the `/proc` descriptor its parent opened before cloning.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_replay(build: BwrapBuild, child: u64, proc_fd: u64) -> Result<(), &'static str> {
+    const O_RDONLY: u64 = 0;
+    const O_RDWR: u64 = 0o2;
+    const O_NOCTTY: u64 = 0o400;
+    const O_DIRECTORY: u64 = 0o200_000;
+    const O_NOFOLLOW: u64 = 0o400_000;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const O_PATH: u64 = 0o10_000_000;
+    const MS_NOSUID: u64 = 0x2;
+    const MS_NODEV: u64 = 0x4;
+    const MS_REMOUNT: u64 = 0x20;
+    const MS_BIND: u64 = 0x1000;
+    const MS_REC: u64 = 0x4000;
+    const MS_SILENT: u64 = 0x8000;
+    const MS_PRIVATE: u64 = 1 << 18;
+    const MS_SLAVE: u64 = 1 << 19;
+    const MS_MGC_VAL: u64 = 0xC0ED_0000;
+    const MNT_DETACH: u64 = 2;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_RECURSIVE: u64 = 0x8000;
+    const AT_EACCESS: u64 = 0x200;
+    const MOUNT_ATTR_RDONLY: u64 = 0x1;
+    const MOUNT_ATTR_NOSUID: u64 = 0x2;
+    const MOUNT_ATTR_NODEV: u64 = 0x4;
+    const EEXIST: i64 = -17;
+    const EINVAL: i64 = -22;
+    const ENOENT: i64 = -2;
+    let mount = |step: &'static str, src: u64, dst: u64, fstype: u64, flags: u64| {
+        bwrap_zero(step, Syscall::Mount.raw(), a4(src, dst, fstype, flags, 0))
+    };
+
+    set_task(child);
+    // `write_uid_gid_map`: through the /proc fd the parent opened.
+    let self_fd = bwrap_fd(
+        "openat(proc_fd, self, O_PATH)",
+        Syscall::Openat.raw(),
+        a3(proc_fd, c"self".as_ptr() as u64, O_RDONLY | O_PATH, 0),
+    )?;
+    for (step, file, data) in [
+        ("write uid_map", c"uid_map", &b"1000 1000 1\n"[..]),
+        ("write setgroups", c"setgroups", &b"deny\n"[..]),
+        ("write gid_map", c"gid_map", &b"1000 1000 1\n"[..]),
+    ] {
+        let fd = bwrap_fd(
+            step,
+            Syscall::Openat.raw(),
+            a3(self_fd, file.as_ptr() as u64, O_RDWR | O_CLOEXEC, 0),
+        )?;
+        let wrote = call(
+            Syscall::Write.raw(),
+            a2(fd, data.as_ptr() as u64, data.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        bwrap_step(step, wrote, wrote == Some(data.len() as i64))?;
+    }
+    let _ = call(Syscall::Close.raw(), a0(self_fd));
+
+    mount(
+        "mount(NULL, /, MS_SLAVE|MS_REC)",
+        0,
+        c"/".as_ptr() as u64,
+        0,
+        MS_REC | MS_SILENT | MS_SLAVE,
+    )?;
+    mount(
+        "mount(tmpfs, /tmp)",
+        c"tmpfs".as_ptr() as u64,
+        c"/tmp".as_ptr() as u64,
+        c"tmpfs".as_ptr() as u64,
+        MS_NOSUID | MS_NODEV,
+    )?;
+    bwrap_zero(
+        "chdir(/tmp)",
+        Syscall::Chdir.raw(),
+        a0(c"/tmp".as_ptr() as u64),
+    )?;
+    bwrap_zero(
+        "mkdir(newroot)",
+        Syscall::Mkdir.raw(),
+        a1(c"newroot".as_ptr() as u64, 0o755),
+    )?;
+    mount(
+        "mount(newroot, newroot, MS_BIND|MS_REC)",
+        c"newroot".as_ptr() as u64,
+        c"newroot".as_ptr() as u64,
+        0,
+        MS_MGC_VAL | MS_BIND | MS_REC | MS_SILENT,
+    )?;
+    bwrap_zero(
+        "mkdir(oldroot)",
+        Syscall::Mkdir.raw(),
+        a1(c"oldroot".as_ptr() as u64, 0o755),
+    )?;
+    bwrap_zero(
+        "pivot_root(/tmp, oldroot)",
+        Syscall::PivotRoot.raw(),
+        a1(c"/tmp".as_ptr() as u64, c"oldroot".as_ptr() as u64),
+    )?;
+    bwrap_zero("chdir(/)", Syscall::Chdir.raw(), a0(c"/".as_ptr() as u64))?;
+
+    match build {
+        BwrapBuild::V0_13 | BwrapBuild::V0_13Dev => {
+            // Its own /proc, bound from the old root's.
+            bwrap_zero(
+                "mkdir(proc)",
+                Syscall::Mkdir.raw(),
+                a1(c"proc".as_ptr() as u64, 0o755),
+            )?;
+            mount(
+                "mount(oldroot/proc, proc, MS_BIND|MS_REC)",
+                c"oldroot/proc".as_ptr() as u64,
+                c"proc".as_ptr() as u64,
+                0,
+                MS_BIND | MS_REC | MS_SILENT,
+            )?;
+            // setup_newroot: the --dev-bind source and destination.
+            let old = bwrap_fd(
+                "openat(/oldroot, O_PATH)",
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    c"/oldroot".as_ptr() as u64,
+                    O_RDONLY | O_NOCTTY | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            let source = bwrap_openat2(
+                "openat2(/oldroot, /, RESOLVE_IN_ROOT)",
+                old,
+                c"/",
+                O_RDONLY | O_PATH,
+                RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+            )?;
+            bwrap_fstat_dir("fstat(source)", source)?;
+            let new = bwrap_fd(
+                "openat(/newroot, O_PATH)",
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    c"/newroot".as_ptr() as u64,
+                    O_RDONLY | O_NOCTTY | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            let dest_dir = bwrap_openat2(
+                "openat2(/newroot, /, RESOLVE_IN_ROOT)",
+                new,
+                c"/",
+                O_RDONLY | O_CLOEXEC | O_PATH | O_DIRECTORY,
+                RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+            )?;
+            let got = call(
+                Syscall::Mkdirat.raw(),
+                a2(dest_dir, c".".as_ptr() as u64, 0o755),
+            );
+            bwrap_step("mkdirat(dest, .)", got, got == Some(EEXIST))?;
+            let dest = bwrap_fd(
+                "openat(dest, ., O_PATH|O_NOFOLLOW)",
+                Syscall::Openat.raw(),
+                a3(
+                    dest_dir,
+                    c".".as_ptr() as u64,
+                    O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            bwrap_fstat_dir("fstat(dest)", dest)?;
+            bwrap_readlink(
+                "readlink(/proc/self/fd/<dest>)",
+                &alloc::format!("/proc/self/fd/{dest}"),
+                "/newroot",
+            )?;
+            let src_link = alloc::format!("/proc/self/fd/{source}\0");
+            let dst_link = alloc::format!("/proc/self/fd/{dest}\0");
+            mount(
+                "mount(/proc/self/fd/<source>, /proc/self/fd/<dest>, MS_BIND|MS_REC)",
+                src_link.as_ptr() as u64,
+                dst_link.as_ptr() as u64,
+                0,
+                MS_BIND | MS_REC | MS_SILENT,
+            )?;
+            let attr_fd = bwrap_fd(
+                "openat(/newroot, O_PATH) for mount_setattr",
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    c"/newroot".as_ptr() as u64,
+                    O_RDONLY | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            // `--dev-bind` only adds nosuid; `--ro-bind` makes the tree
+            // read-only and nodev as well.
+            let attr_set = if build == BwrapBuild::V0_13Dev {
+                MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV
+            } else {
+                MOUNT_ATTR_NOSUID
+            };
+            let attr = [attr_set, 0u64, 0, 0];
+            bwrap_zero(
+                "mount_setattr(/newroot, AT_RECURSIVE, NOSUID)",
+                Syscall::MountSetattr.raw(),
+                SyscallArgs {
+                    arg0: attr_fd,
+                    arg1: c"".as_ptr() as u64,
+                    arg2: AT_EMPTY_PATH | AT_RECURSIVE,
+                    arg3: attr.as_ptr() as u64,
+                    arg4: 32,
+                    arg5: 0,
+                },
+            )?;
+        }
+        BwrapBuild::V0_11 => {
+            for (step, path) in [
+                ("stat(/oldroot/)", c"/oldroot/"),
+                ("stat(/newroot)", c"/newroot"),
+                ("stat(/newroot/)", c"/newroot/"),
+            ] {
+                let got = bwrap_stat(path);
+                bwrap_step(step, got, got == Some(0))?;
+            }
+            mount(
+                "mount(/oldroot/, /newroot/, MS_BIND|MS_REC)",
+                c"/oldroot/".as_ptr() as u64,
+                c"/newroot/".as_ptr() as u64,
+                0,
+                MS_BIND | MS_REC | MS_SILENT,
+            )?;
+            // realpath("/newroot/").
+            let mut buf = [0u8; 64];
+            let got = call_readlink(
+                c"/newroot".as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            );
+            bwrap_step("readlink(/newroot)", got, got == Some(EINVAL))?;
+            bwrap_zero(
+                "faccessat2(/newroot/, F_OK, AT_EACCESS)",
+                Syscall::Faccessat2.raw(),
+                a3(AT_FDCWD, c"/newroot/".as_ptr() as u64, 0, AT_EACCESS),
+            )?;
+            let dest = bwrap_fd(
+                "openat(/newroot, O_PATH)",
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    c"/newroot".as_ptr() as u64,
+                    O_RDONLY | O_CLOEXEC | O_PATH,
+                    0,
+                ),
+            )?;
+            bwrap_readlink(
+                "readlink(/oldroot/proc/self/fd/<dest>)",
+                &alloc::format!("/oldroot/proc/self/fd/{dest}"),
+                "/newroot",
+            )?;
+            for path in bwrap_mount_tab(proc_fd, "/newroot")? {
+                let target = alloc::format!("{path}\0");
+                mount(
+                    "mount(none, <bound mount>, MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NODEV)",
+                    c"none".as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    0,
+                    MS_NOSUID | MS_NODEV | MS_REMOUNT | MS_BIND | MS_SILENT,
+                )?;
+            }
+        }
+    }
+
+    if build == BwrapBuild::V0_13Dev {
+        bwrap_mount_dev()?;
+    }
+
+    mount(
+        "mount(oldroot, oldroot, MS_REC|MS_PRIVATE)",
+        c"oldroot".as_ptr() as u64,
+        c"oldroot".as_ptr() as u64,
+        0,
+        MS_REC | MS_SILENT | MS_PRIVATE,
+    )?;
+    bwrap_zero(
+        "umount2(oldroot, MNT_DETACH)",
+        Syscall::Umount2.raw(),
+        a1(c"oldroot".as_ptr() as u64, MNT_DETACH),
+    )?;
+    // The second pivot.
+    let oldrootfd = bwrap_fd(
+        "open(/, O_DIRECTORY)",
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, c"/".as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
+    )?;
+    bwrap_zero(
+        "chdir(/newroot)",
+        Syscall::Chdir.raw(),
+        a0(c"/newroot".as_ptr() as u64),
+    )?;
+    bwrap_zero(
+        "pivot_root(., .)",
+        Syscall::PivotRoot.raw(),
+        a1(c".".as_ptr() as u64, c".".as_ptr() as u64),
+    )?;
+    bwrap_zero("fchdir(oldrootfd)", Syscall::Fchdir.raw(), a0(oldrootfd))?;
+    bwrap_zero(
+        "umount2(., MNT_DETACH)",
+        Syscall::Umount2.raw(),
+        a1(c".".as_ptr() as u64, MNT_DETACH),
+    )?;
+    bwrap_zero(
+        "chdir(/) after the second pivot",
+        Syscall::Chdir.raw(),
+        a0(c"/".as_ptr() as u64),
+    )?;
+    // bubblewrap returns to the caller's working directory, then execs.
+    bwrap_zero(
+        "chdir(old cwd)",
+        Syscall::Chdir.raw(),
+        a0(c"/abi-bwrap-cwd".as_ptr() as u64),
+    )?;
+
+    // The sandbox root IS the host root (`--bind / /`): its directories are
+    // there, bubblewrap's staging directories are not, and /proc is procfs.
+    let got = bwrap_stat(c"/abi-bwrap-cwd");
+    bwrap_step("stat(/abi-bwrap-cwd) in the sandbox", got, got == Some(0))?;
+    for (step, path) in [
+        ("stat(/newroot) in the sandbox", c"/newroot"),
+        ("stat(/oldroot) in the sandbox", c"/oldroot"),
+    ] {
+        let got = bwrap_stat(path);
+        bwrap_step(step, got, got == Some(ENOENT))?;
+    }
+    let got = bwrap_stat(c"/proc/self/status");
+    bwrap_step(
+        "stat(/proc/self/status) in the sandbox",
+        got,
+        got == Some(0),
+    )?;
+    if build == BwrapBuild::V0_13Dev {
+        bwrap_check_dev()?;
+    }
+    Ok(())
+}
+
+/// bubblewrap 0.13.1's `SETUP_MOUNT_DEV` for `--dev /dev`, as traced on the
+/// hardware: a tmpfs on the bound root's /dev, the six device nodes bound
+/// from the old root over files created in it, the stdio, `fd` and `core`
+/// links, then its own `shm` and `pts` directories, a new devpts instance
+/// on `pts`, and `ptmx -> pts/ptmx`.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_mount_dev() -> Result<(), &'static str> {
+    const O_RDONLY: u64 = 0;
+    const O_WRONLY: u64 = 0o1;
+    const O_CREAT: u64 = 0o100;
+    const O_EXCL: u64 = 0o200;
+    const O_NOCTTY: u64 = 0o400;
+    const O_DIRECTORY: u64 = 0o200_000;
+    const O_NOFOLLOW: u64 = 0o400_000;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const O_PATH: u64 = 0o10_000_000;
+    const MS_NOSUID: u64 = 0x2;
+    const MS_NODEV: u64 = 0x4;
+    const MS_NOEXEC: u64 = 0x8;
+    const MS_BIND: u64 = 0x1000;
+    const MS_REC: u64 = 0x4000;
+    const MS_SILENT: u64 = 0x8000;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_RECURSIVE: u64 = 0x8000;
+    const MOUNT_ATTR_NOSUID: u64 = 0x2;
+    const EEXIST: i64 = -17;
+    let close = |fd: u64| {
+        let _ = call(Syscall::Close.raw(), a0(fd));
+    };
+    let open_newroot = |step: &'static str| {
+        bwrap_fd(
+            step,
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                c"/newroot".as_ptr() as u64,
+                O_RDONLY | O_NOCTTY | O_CLOEXEC | O_PATH,
+                0,
+            ),
+        )
+    };
+
+    // `ensure_dir`: the bound root already has a /dev.
+    let newroot = open_newroot("openat(/newroot, O_PATH) for --dev")?;
+    let root_dir = bwrap_openat2(
+        "openat2(/newroot, /, RESOLVE_IN_ROOT) for --dev",
+        newroot,
+        c"/",
+        O_RDONLY | O_CLOEXEC | O_PATH | O_DIRECTORY,
+        RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+    )?;
+    close(newroot);
+    let got = call(
+        Syscall::Mkdirat.raw(),
+        a2(root_dir, c"dev".as_ptr() as u64, 0o755),
+    );
+    bwrap_step("mkdirat(newroot, dev)", got, got == Some(EEXIST))?;
+    let mountpoint = bwrap_fd(
+        "openat(newroot, dev, O_PATH|O_NOFOLLOW)",
+        Syscall::Openat.raw(),
+        a3(
+            root_dir,
+            c"dev".as_ptr() as u64,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_PATH,
+            0,
+        ),
+    )?;
+    close(root_dir);
+    let mountpoint_link = alloc::format!("/proc/self/fd/{mountpoint}\0");
+    bwrap_zero(
+        "mount(tmpfs, /proc/self/fd/<newroot/dev>, mode=0755)",
+        Syscall::Mount.raw(),
+        a4(
+            c"tmpfs".as_ptr() as u64,
+            mountpoint_link.as_ptr() as u64,
+            c"tmpfs".as_ptr() as u64,
+            MS_NOSUID | MS_NODEV,
+            c"mode=0755".as_ptr() as u64,
+        ),
+    )?;
+    close(mountpoint);
+
+    let newroot = open_newroot("openat(/newroot, O_PATH) for the new /dev")?;
+    let dev = bwrap_openat2(
+        "openat2(/newroot, /dev, RESOLVE_IN_ROOT)",
+        newroot,
+        c"/dev",
+        O_RDONLY | O_NOFOLLOW | O_PATH,
+        RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+    )?;
+    close(newroot);
+    for (node, source, bound) in [
+        (c"null", c"/dev/null", c"/newroot/dev/null"),
+        (c"zero", c"/dev/zero", c"/newroot/dev/zero"),
+        (c"full", c"/dev/full", c"/newroot/dev/full"),
+        (c"random", c"/dev/random", c"/newroot/dev/random"),
+        (c"urandom", c"/dev/urandom", c"/newroot/dev/urandom"),
+        (c"tty", c"/dev/tty", c"/newroot/dev/tty"),
+    ] {
+        let created = bwrap_fd(
+            "create_file(newroot/dev/<node>)",
+            Syscall::Openat.raw(),
+            a3(
+                dev,
+                node.as_ptr() as u64,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOCTTY | O_NOFOLLOW | O_CLOEXEC,
+                0o444,
+            ),
+        )?;
+        close(created);
+        let dest = bwrap_fd(
+            "openat(newroot/dev, <node>, O_PATH|O_NOFOLLOW)",
+            Syscall::Openat.raw(),
+            a3(
+                dev,
+                node.as_ptr() as u64,
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_PATH,
+                0,
+            ),
+        )?;
+        let old = bwrap_fd(
+            "openat(/oldroot, O_PATH) for a device",
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                c"/oldroot".as_ptr() as u64,
+                O_RDONLY | O_NOCTTY | O_CLOEXEC | O_PATH,
+                0,
+            ),
+        )?;
+        let src = bwrap_openat2(
+            "openat2(/oldroot, /dev/<node>, RESOLVE_IN_ROOT)",
+            old,
+            source,
+            O_RDONLY | O_PATH,
+            RESOLVE_NO_MAGICLINKS | RESOLVE_IN_ROOT,
+        )?;
+        close(old);
+        let src_link = alloc::format!("/proc/self/fd/{src}\0");
+        let dest_link = alloc::format!("/proc/self/fd/{dest}\0");
+        bwrap_zero(
+            "mount(/proc/self/fd/<device>, /proc/self/fd/<dev node>, MS_BIND|MS_REC)",
+            Syscall::Mount.raw(),
+            a4(
+                src_link.as_ptr() as u64,
+                dest_link.as_ptr() as u64,
+                0,
+                MS_BIND | MS_REC | MS_SILENT,
+                0,
+            ),
+        )?;
+        close(src);
+        close(dest);
+        let attr_fd = bwrap_fd(
+            "openat(/newroot/dev/<node>, O_PATH) for mount_setattr",
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                bound.as_ptr() as u64,
+                O_RDONLY | O_CLOEXEC | O_PATH,
+                0,
+            ),
+        )?;
+        let attr = [MOUNT_ATTR_NOSUID, 0u64, 0, 0];
+        bwrap_zero(
+            "mount_setattr(/newroot/dev/<node>, AT_RECURSIVE, NOSUID)",
+            Syscall::MountSetattr.raw(),
+            SyscallArgs {
+                arg0: attr_fd,
+                arg1: c"".as_ptr() as u64,
+                arg2: AT_EMPTY_PATH | AT_RECURSIVE,
+                arg3: attr.as_ptr() as u64,
+                arg4: 32,
+                arg5: 0,
+            },
+        )?;
+        close(attr_fd);
+    }
+    for (target, name) in [
+        (c"/proc/self/fd/0", c"stdin"),
+        (c"/proc/self/fd/1", c"stdout"),
+        (c"/proc/self/fd/2", c"stderr"),
+        (c"/proc/self/fd", c"fd"),
+        (c"/proc/kcore", c"core"),
+    ] {
+        bwrap_zero(
+            "symlinkat(<target>, newroot/dev, <name>)",
+            Syscall::Symlinkat.raw(),
+            a2(target.as_ptr() as u64, dev, name.as_ptr() as u64),
+        )?;
+    }
+    // Its own shm and pts. The new tmpfs is empty whatever the bound root
+    // had mounted below its /dev: those mounts are covered.
+    bwrap_zero(
+        "mkdirat(newroot/dev, shm)",
+        Syscall::Mkdirat.raw(),
+        a2(dev, c"shm".as_ptr() as u64, 0o755),
+    )?;
+    bwrap_zero(
+        "mkdirat(newroot/dev, pts)",
+        Syscall::Mkdirat.raw(),
+        a2(dev, c"pts".as_ptr() as u64, 0o755),
+    )?;
+    let pts = bwrap_fd(
+        "openat(newroot/dev, pts, O_PATH|O_NOFOLLOW)",
+        Syscall::Openat.raw(),
+        a3(
+            dev,
+            c"pts".as_ptr() as u64,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_PATH,
+            0,
+        ),
+    )?;
+    let pts_link = alloc::format!("/proc/self/fd/{pts}\0");
+    bwrap_zero(
+        "mount(devpts, /proc/self/fd/<newroot/dev/pts>, newinstance)",
+        Syscall::Mount.raw(),
+        a4(
+            c"devpts".as_ptr() as u64,
+            pts_link.as_ptr() as u64,
+            c"devpts".as_ptr() as u64,
+            MS_NOSUID | MS_NOEXEC,
+            c"newinstance,ptmxmode=0666,mode=620".as_ptr() as u64,
+        ),
+    )?;
+    close(pts);
+    bwrap_zero(
+        "symlinkat(pts/ptmx, newroot/dev, ptmx)",
+        Syscall::Symlinkat.raw(),
+        a2(c"pts/ptmx".as_ptr() as u64, dev, c"ptmx".as_ptr() as u64),
+    )?;
+    close(dev);
+    Ok(())
+}
+
+/// What the sandbox sees of its `--dev /dev`: bubblewrap's own `shm` (not
+/// the host's, which the tmpfs covers), the bound device nodes, and the
+/// `ptmx` link into its devpts.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn bwrap_check_dev() -> Result<(), &'static str> {
+    let mut sb = [0u8; STAT_SIZE];
+    let got = call_stat(c"/dev/shm".as_ptr() as u64, sb.as_mut_ptr() as u64);
+    bwrap_step(
+        "stat(/dev/shm) in the sandbox",
+        got,
+        got == Some(0) && stat_mode(&sb) & 0o170000 == 0o040000,
+    )?;
+    let got = bwrap_stat(c"/dev/shm/host-marker");
+    bwrap_step(
+        "stat(/dev/shm/host-marker) in the sandbox",
+        got,
+        got == Some(ENOENT),
+    )?;
+    let got = call_stat(c"/dev/null".as_ptr() as u64, sb.as_mut_ptr() as u64);
+    bwrap_step(
+        "stat(/dev/null) in the sandbox",
+        got,
+        got == Some(0) && stat_mode(&sb) & 0o170000 == 0o020000,
+    )?;
+    bwrap_readlink(
+        "readlink(/dev/ptmx) in the sandbox",
+        "/dev/ptmx",
+        "pts/ptmx",
+    )
+}
+
+/// Run [`bwrap_replay`] the way bubblewrap starts it: an unprivileged
+/// uid-1000 parent opens `/proc` (O_PATH) and makes the sandbox child with
+/// `clone(CLONE_NEWNS | CLONE_NEWUSER | SIGCHLD)`.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn with_bwrap_sandbox(build: BwrapBuild) -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const O_PATH: u64 = 0o10_000_000;
+        // The procfs wiring a booted kernel installs at init.
+        install_idmap_proc_hooks()?;
+        let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        let saved_pidns = narf_filesystem::procfs::__test_pidns_hooks_snapshot();
+        narf_filesystem::procfs::install_proc_pidns_hooks(
+            crate::handlers::proc_current_outer_pid,
+            crate::handlers::proc_pid_resolve,
+            crate::handlers::proc_pid_report,
+            crate::handlers::proc_current_tid,
+        );
+        let saved_fd_path = narf_filesystem::procfs::__test_fd_path_hook_snapshot();
+        narf_filesystem::procfs::__test_fd_path_hook_restore(crate::handlers::fd_path_of as usize);
+        let mut host_shm = None;
+        let result = (|| {
+            install_test_address_space()?;
+            // The host's /dev/shm is a tmpfs of its own below /dev, so the
+            // bound copy of / brings a copy of it to /newroot/dev/shm.
+            if build == BwrapBuild::V0_13Dev {
+                let auth = narf_filesystem::bootstrap_mount_authority();
+                let shm =
+                    narf_filesystem::MemFs::with_seeds("bwrap-host-shm", &[("host-marker", b"x")]);
+                host_shm = Some(
+                    narf_filesystem::registry()
+                        .mount(&auth, "/dev/shm", shm)
+                        .map_err(|_| "could not mount the host's /dev/shm")?,
+                );
+            }
+            narf_scheduler::__reset_queues_for_test();
+            // The host root's /tmp and the caller's working directory.
+            narf_filesystem::__test_ensure_mount_target("/tmp");
+            narf_filesystem::__test_ensure_mount_target("/abi-bwrap-cwd");
+            if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+                || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            {
+                return Err("could not drop the test task to host uid/gid 1000");
+            }
+            drop_all_caps();
+            if call(Syscall::Chdir.raw(), a0(c"/abi-bwrap-cwd".as_ptr() as u64)) != Some(0) {
+                return Err("chdir to the caller's working directory failed");
+            }
+            let proc_fd = bwrap_fd(
+                "openat(/proc, O_PATH)",
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, c"/proc".as_ptr() as u64, O_PATH, 0),
+            )?;
+            let child = clone_child(CLONE_NEWNS | CLONE_NEWUSER)
+                .map_err(|_| "clone(CLONE_NEWNS|CLONE_NEWUSER) failed")?;
+            let replay = bwrap_replay(build, child, proc_fd);
+            release_clone_child(child);
+            replay
+        })();
+        if let Some(handle) = host_shm.take() {
+            let _ = narf_filesystem::registry().unmount(&handle, "/dev/shm");
+        }
+        narf_filesystem::procfs::__test_fd_path_hook_restore(saved_fd_path);
+        narf_filesystem::procfs::__test_pidns_hooks_restore(saved_pidns);
+        result
+    })
+}
+
+/// `bwrap --unshare-user --dev-bind / / true` (bubblewrap 0.13.1).
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_bwrap_0_13_dev_bind_root() -> TestResult {
+    with_bwrap_sandbox(BwrapBuild::V0_13)
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-bwrap",
+    smoke_abi_userns_bwrap_0_13_dev_bind_root
+);
+
+/// Steam's `srt-bwrap --bind / / true` (bubblewrap 0.11.2), the probe
+/// `steam-runtime-check-requirements` runs before Steam starts.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_bwrap_0_11_bind_root() -> TestResult {
+    with_bwrap_sandbox(BwrapBuild::V0_11)
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-bwrap",
+    smoke_abi_userns_bwrap_0_11_bind_root
+);
+
+/// `bwrap --unshare-user --ro-bind / / --dev /dev true` (bubblewrap 0.13.1),
+/// the /dev glycin's image loaders get. It failed "Can't create /dev/shm:
+/// File exists": the bound root's /dev/shm mount showed through the tmpfs.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_bwrap_0_13_dev_over_bound_root() -> TestResult {
+    with_bwrap_sandbox(BwrapBuild::V0_13Dev)
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-bwrap-dev",
+    smoke_abi_userns_bwrap_0_13_dev_over_bound_root
+);
+
 fn smoke_abi_caps_unshare_needs_sys_admin_except_newuser() -> TestResult {
     with_setup(|| {
         // `unshare_nsproxy_namespaces` gates CLONE_NEWNS|NEWUTS|NEWIPC|
@@ -2399,6 +3712,71 @@ fn smoke_abi_caps_unshare_needs_sys_admin_except_newuser() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_caps_unshare_needs_sys_admin_except_newuser
+);
+
+/// `kernel/nsproxy.c::copy_namespaces` — the clone(2)/clone3(2) twin of the
+/// unshare gate above:
+///
+///     struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+///     if (likely(!(flags & (CLONE_NS_ALL & ~CLONE_NEWUSER)))) { ... }
+///     else if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+///             return -EPERM;
+///
+/// asked of the CHILD's credential. Without CLONE_NEWUSER that is a copy of
+/// the caller's, so an unprivileged clone creating any other namespace is
+/// -EPERM and no child exists. With CLONE_NEWUSER `copy_creds` has already
+/// bound the credential to the new user namespace with a full capability
+/// set, so the same clone succeeds — which is how bubblewrap, Chromium's
+/// zygote and Steam's pressure-vessel create their sandboxes unprivileged.
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_caps_clone_new_namespaces_need_sys_admin() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        const CLONE_NEWIPC: u64 = 0x0800_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+
+        install_test_address_space()?;
+        narf_scheduler::__reset_queues_for_test();
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        drop_all_caps();
+        for flag in [
+            CLONE_NEWNS,
+            CLONE_NEWUTS,
+            CLONE_NEWIPC,
+            CLONE_NEWPID,
+            CLONE_NEWNET,
+            CLONE_NEWCGROUP,
+        ] {
+            match clone_child(flag) {
+                Err(-1) => {}
+                Ok(child) => {
+                    release_clone_child(child);
+                    return Err("an unprivileged clone created a namespace without CAP_SYS_ADMIN");
+                }
+                Err(_) => return Err("unprivileged clone(CLONE_NEW*): want -EPERM"),
+            }
+        }
+        match clone_child(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS) {
+            Ok(child) => {
+                release_clone_child(child);
+                Ok(())
+            }
+            Err(_) => Err("clone(CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWUTS) was refused"),
+        }
+    })
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-clone-caps",
+    smoke_abi_caps_clone_new_namespaces_need_sys_admin
 );
 
 fn smoke_abi_caps_unshare_einval_precedes_eperm() -> TestResult {
@@ -2918,4 +4296,234 @@ fn smoke_abi_userns_map_fd_captures_opener_caps() -> TestResult {
 kernel_test_in!(
     "syscall_abi/userns",
     smoke_abi_userns_map_fd_captures_opener_caps
+);
+
+/// Write `bytes` to `/proc/self/<file>` the way CPython's
+/// `open(path, "w").write(s)` does when `flags` carries O_CREAT|O_TRUNC:
+/// openat(flags, 0666), fstat, lseek(0, SEEK_CUR), write, close. With plain
+/// `O_WRONLY` it is util-linux `unshare`'s `map_id` / `setgroups_control`.
+#[cfg(feature = "container")]
+fn proc_self_idmap_write(file: &str, bytes: &[u8], flags: u64) -> Result<(), &'static str> {
+    use core::fmt::Write as _;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const SEEK_CUR: u64 = 1;
+    let path = alloc::format!("/proc/self/{}\0", file);
+    let open = call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, path.as_ptr() as u64, flags | O_CLOEXEC, 0o666),
+    );
+    let fd = match open {
+        Some(fd) if fd >= 0 => fd as u64,
+        other => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "userns-idmap: open(/proc/self/{file}, {flags:#o}) = {other:?}"
+            );
+            return Err("open of a /proc/self id-map file failed");
+        }
+    };
+    let mut sb = [0u8; STAT_SIZE];
+    let _ = call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64));
+    let _ = call(Syscall::Lseek.raw(), a2(fd, 0, SEEK_CUR));
+    let wrote = call(
+        Syscall::Write.raw(),
+        a2(fd, bytes.as_ptr() as u64, bytes.len() as u64),
+    );
+    let _ = call(Syscall::Close.raw(), a0(fd));
+    if wrote == Some(bytes.len() as i64) {
+        return Ok(());
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "userns-idmap: write(/proc/self/{file}) through a {flags:#o} open = {wrote:?}"
+    );
+    Err("write to a /proc/self id-map file failed")
+}
+
+/// Wire the procfs hooks an id-map case needs and check the real `/proc` is
+/// there to write through.
+#[cfg(feature = "container")]
+fn install_idmap_proc_hooks() -> Result<(), &'static str> {
+    narf_filesystem::procfs::install_ns_proc_hooks(
+        crate::handlers::proc_ns_readlink,
+        crate::handlers::proc_ns_mountinfo,
+        crate::handlers::proc_ns_idmap_open,
+        crate::handlers::proc_ns_idmap_owners,
+    );
+    if !registry().list().iter().any(|mount| mount == "/proc") {
+        return Err("/proc is not mounted in the test image");
+    }
+    Ok(())
+}
+
+/// Python's `open(path, "w")` and a shell `>` redirect open with
+/// `O_WRONLY | O_CREAT | O_TRUNC`, and that is how most tools write
+/// `/proc/<pid>/{setgroups,gid_map,uid_map}`. Linux accepts it: the files
+/// exist, so O_CREAT creates nothing, and O_TRUNC goes `do_open` →
+/// `handle_truncate` → `do_truncate` → `notify_change` → `proc_setattr`,
+/// which refuses only a mode change (`if (attr->ia_valid & ATTR_MODE)
+/// return -EPERM;`) and otherwise just copies the attributes. The write
+/// that follows is an ordinary `map_write` / `proc_setgroups_write`.
+///
+/// Runs the CPython sequence through the real `/proc` for a rootless
+/// identity mapping, and again one user namespace deeper: a nested
+/// namespace's owner maps the same id it holds in its parent
+/// (`new_idmap_permitted`'s one-id arm, with `make_kuid(ns->parent, id)`
+/// resolving through the parent's map).
+#[cfg(feature = "container")]
+fn smoke_abi_userns_idmap_writes_through_truncating_open() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const TRUNCATING: u64 = 0o1 | 0o100 | 0o1000; // O_WRONLY|O_CREAT|O_TRUNC
+        install_idmap_proc_hooks()?;
+        if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+        {
+            return Err("could not drop the test task to host uid/gid 1000");
+        }
+        for level in 1..=2u32 {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+                return Err("unprivileged unshare(CLONE_NEWUSER) failed");
+            }
+            proc_self_idmap_write("setgroups", b"deny", TRUNCATING)?;
+            proc_self_idmap_write("gid_map", b"1000 1000 1\n", TRUNCATING)?;
+            proc_self_idmap_write("uid_map", b"1000 1000 1\n", TRUNCATING)?;
+            let ns = crate::namespaces::current_user_ns(FAKE_TASK);
+            if ns.level() != level {
+                return Err("unshare(CLONE_NEWUSER) did not nest under the previous namespace");
+            }
+            if ns.translate_uid_to_host(1000) != 1000 || ns.translate_gid_to_host(1000) != 1000 {
+                return Err("the identity maps were not installed");
+            }
+            if ns.may_setgroups() {
+                return Err("setgroups was not denied");
+            }
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns-idmap",
+    smoke_abi_userns_idmap_writes_through_truncating_open
+);
+
+/// The same nested identity mapping, in the shape Chromium's sandbox probe
+/// ran under: `unshare -U --map-user=1000 --map-group=1000 -p -n -f` (an
+/// outer user + PID + net namespace, mapped by util-linux with plain
+/// O_WRONLY writes, uid_map first), then the command — pid 1 of the new PID
+/// namespace — unshares a nested user namespace and writes its maps through
+/// `open(path, "w")`. `/proc/self` there names the writer by its
+/// in-namespace pid, which procfs must translate back to the writer itself
+/// (`proc_self_get_link` → `task_tgid_nr_ns(current, ns)` → `proc_pid_lookup`).
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+fn smoke_abi_userns_idmap_nested_under_a_pid_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+        const PLAIN: u64 = 0o1; // O_WRONLY
+        const TRUNCATING: u64 = 0o1 | 0o100 | 0o1000; // O_WRONLY|O_CREAT|O_TRUNC
+        install_idmap_proc_hooks()?;
+        // The boot wiring installs procfs's PID-namespace translation; the
+        // kernel-test image does not, so install the production hooks here.
+        let saved = narf_filesystem::procfs::__test_pidns_hooks_snapshot();
+        narf_filesystem::procfs::install_proc_pidns_hooks(
+            crate::handlers::proc_current_outer_pid,
+            crate::handlers::proc_pid_resolve,
+            crate::handlers::proc_pid_report,
+            crate::handlers::proc_current_tid,
+        );
+        let result = (|| {
+            install_test_address_space()?;
+            narf_scheduler::__reset_queues_for_test();
+            if call(Syscall::Setresgid.raw(), a2(1000, 1000, 1000)) != Some(0)
+                || call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0)
+            {
+                return Err("could not drop the test task to host uid/gid 1000");
+            }
+            if call(
+                Syscall::Unshare.raw(),
+                a0(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET),
+            ) != Some(0)
+            {
+                return Err("unshare(CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET) failed");
+            }
+            proc_self_idmap_write("uid_map", b"1000 1000 1", PLAIN)?;
+            proc_self_idmap_write("setgroups", b"deny", PLAIN)?;
+            proc_self_idmap_write("gid_map", b"1000 1000 1", PLAIN)?;
+            let child = clone_child(0).map_err(|_| "fork into the new PID namespace failed")?;
+            let nested = (|| {
+                set_task(child);
+                if call(Syscall::GetPid.raw(), a0(0)) != Some(1) {
+                    return Err("the forked command is not pid 1 of its PID namespace");
+                }
+                if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+                    return Err("nested unshare(CLONE_NEWUSER) failed");
+                }
+                proc_self_idmap_write("setgroups", b"deny", TRUNCATING)?;
+                proc_self_idmap_write("gid_map", b"1000 1000 1\n", TRUNCATING)?;
+                proc_self_idmap_write("uid_map", b"1000 1000 1\n", TRUNCATING)?;
+                let ns = crate::namespaces::current_user_ns(child);
+                if ns.level() != 2 {
+                    return Err("the nested user namespace is not two levels deep");
+                }
+                if ns.translate_uid_to_host(1000) != 1000 || ns.translate_gid_to_host(1000) != 1000
+                {
+                    return Err("the nested identity maps were not installed");
+                }
+                Ok(())
+            })();
+            release_clone_child(child);
+            nested
+        })();
+        narf_filesystem::procfs::__test_pidns_hooks_restore(saved);
+        result
+    })
+}
+#[cfg(all(feature = "container", target_arch = "x86_64"))]
+kernel_test_in!(
+    "syscall_abi/userns-idmap",
+    smoke_abi_userns_idmap_nested_under_a_pid_namespace
+);
+
+/// `kernel/user_namespace.c::proc_setgroups_write` checks only the request
+/// against the namespace's state, never where the namespace sits:
+///
+///     if (setgroups_allowed) {
+///             if (!(ns->flags & USERNS_SETGROUPS_ALLOWED))
+///                     goto out_unlock;            /* -EPERM */
+///     } else {
+///             if (ns->gid_map.nr_extents != 0)
+///                     goto out_unlock;            /* -EPERM */
+///             ns->flags &= ~USERNS_SETGROUPS_ALLOWED;
+///     }
+///
+/// so in the initial user namespace — identity gid_map, setgroups allowed —
+/// writing `allow` succeeds (it changes nothing) and writing `deny` is
+/// -EPERM. Who may write at all was decided at open: `proc_setgroups_open`
+/// wants CAP_SYS_ADMIN over the namespace, which the harness task holds.
+#[cfg(feature = "container")]
+fn smoke_abi_userns_setgroups_write_in_the_initial_namespace() -> TestResult {
+    with_setup(|| {
+        const O_WRONLY: u64 = 0o1;
+        install_idmap_proc_hooks()?;
+        if !crate::namespaces::current_user_ns(FAKE_TASK).is_initial() {
+            return Err("the harness task is not in the initial user namespace");
+        }
+        proc_self_idmap_write("setgroups", b"allow\n", O_WRONLY)
+            .map_err(|_| "writing allow to the initial namespace's setgroups failed")?;
+        if proc_self_idmap_write("setgroups", b"deny\n", O_WRONLY).is_ok() {
+            return Err("the initial namespace's setgroups was denied after its gid_map");
+        }
+        if !crate::namespaces::current_user_ns(FAKE_TASK).setgroups_allowed() {
+            return Err("setgroups is no longer allowed in the initial namespace");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/userns-idmap",
+    smoke_abi_userns_setgroups_write_in_the_initial_namespace
 );

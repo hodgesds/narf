@@ -147,6 +147,8 @@ fn build_process(code: &[u8]) -> Result<UserProcess, &'static str> {
         loaded_mappings: Vec::new(),
         program_bias: 0,
         page_in_plan: Vec::new(),
+        ia32: false,
+        segs: narf_userspace::UserSegments::default(),
     })
 }
 
@@ -296,7 +298,7 @@ fn user_loop(iterations: u32) -> Vec<u8> {
         0xFF, 0xC9, // 1: dec ecx
         0x75, 0xFC, // jnz 1b
         0x48, 0xC7, 0xC0, exit[0], exit[1], exit[2], exit[3], // mov rax, exit
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0xEB, 0xFE, // jmp $
     ]
 }
@@ -313,7 +315,7 @@ fn syscall_loop(iterations: u32) -> Vec<u8> {
         0xFF, 0xCB, // dec ebx
         0x75, 0xF5, // jnz 1b
         0x48, 0xC7, 0xC0, exit[0], exit[1], exit[2], exit[3], // mov rax, exit
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall
         0xEB, 0xFE, // jmp $
     ]
 }

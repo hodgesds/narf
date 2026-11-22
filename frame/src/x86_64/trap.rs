@@ -1753,6 +1753,38 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     }
 }
 
+/// Keep the `int 0x80` return `iretq` from faulting at CPL 0 on the user's
+/// SS. A task may have loaded SS with a TLS selector and then emptied or
+/// narrowed that slot with `set_thread_area` (the only call that changes a
+/// slot under a running task); `iretq` reloads SS from the GDT, and its #GP
+/// would land after common_trap's exit `swapgs`, on the kernel stack with
+/// the user GS base. Linux turns that fault into a SIGSEGV for the task
+/// (`fixup_bad_iret`); NARF has no bad-IRET fixup, so an SS that is no
+/// longer a valid user stack segment becomes `__USER_DS` (the only other
+/// stack segment a user can hold).
+fn sanitize_user_ss(frame: &mut TrapFrame) {
+    use narf_arch::x86_64::segments::{cpu_tls, GDT_ENTRY_TLS_MAX, GDT_ENTRY_TLS_MIN};
+    let ss = frame.ss as u16;
+    if ss == super::gdt::UDATA_SEL || frame.cs & 3 != 3 {
+        return;
+    }
+    let index = usize::from(ss >> 3);
+    // A stack segment at CPL 3: GDT (TI 0), RPL 3, and a present DPL-3
+    // writable data descriptor.
+    let valid = ss & 7 == 3 && (GDT_ENTRY_TLS_MIN..=GDT_ENTRY_TLS_MAX).contains(&index) && {
+        let desc = cpu_tls()[index - GDT_ENTRY_TLS_MIN];
+        let present = desc & (1 << 47) != 0;
+        let code_or_data = desc & (1 << 44) != 0;
+        let dpl3 = (desc >> 45) & 3 == 3;
+        let data = desc & (1 << 43) == 0;
+        let writable = desc & (1 << 41) != 0;
+        present && code_or_data && dpl3 && data && writable
+    };
+    if !valid {
+        frame.ss = u64::from(super::gdt::UDATA_SEL);
+    }
+}
+
 /// IST continuations must return on their exception stack without scheduling.
 /// In particular, NMI handling is not an ordinary interrupt-exit boundary.
 const fn scheduler_user_return_allowed(cs: u64, vector: u64) -> bool {
@@ -1767,50 +1799,41 @@ fn dispatch_trap(frame: &mut TrapFrame) {
     if frame.vector == 8 && stack_overflow_on_double_fault(frame) {
         return;
     }
-    // Software-interrupt syscall gate. `int 0x80` arrives here; the
-    // caller's registers have been saved into `frame` already.
-    // Convention: rax = syscall number, rdi/rsi/rdx/r10/r8/r9 =
-    // args 0..5. Return value in rax, status in rdx.
+    // Software-interrupt syscall gate: `int 0x80` is the i386 system-call
+    // ABI for every task, 32-bit or 64-bit (Linux `entry_INT80_compat` /
+    // `do_int80_emulation`). eax is the `syscall_32.tbl` number; ebx, ecx,
+    // edx, esi, edi, ebp are the arguments, zero-extended; the result goes
+    // to rax and every other register is preserved.
     //
-    // Raw handlers can `redirect_to_kernel` to rewrite the frame
-    // instead of returning to the caller's context — the iretq at
-    // the tail of common_trap then lands at the kernel RIP we set
-    // here, with kernel CS/SS and the supplied RSP. swapgs on exit
-    // is gated on the (possibly rewritten) frame.cs, so a redirect
-    // to KCODE correctly skips the user-side swapgs.
+    // `compat32::dispatch` runs seccomp (AUDIT_ARCH_I386), the call and the
+    // signal delivery for this return. Raw handlers can still
+    // `redirect_to_kernel` (legacy exit landing): common_trap's exit swapgs
+    // is gated on the (possibly rewritten) frame.cs.
     if frame.vector == 128 {
-        let num = frame.rax as u32;
-        let mut ctx = X86TrapContext::from_int80(frame);
-        narf_userspace::kernel_syscall_entry(num, &mut ctx);
-        // Signal-delivery hook: if a `narf_userspace`-side hook
-        // is installed and we're heading back to user (CS RPL=3,
-        // i.e. the syscall handler didn't redirect to kernel),
-        // give it a chance to rewrite the frame to land at a
-        // pending signal handler. The hook self-checks
-        // `returning_to_user` so a redirect-to-kernel handler
-        // (exit, longjmp) bypasses delivery cleanly.
-        //
-        // SYSCALL_NUM_NONE, NOT `num`: `kernel_syscall_entry` has
-        // already run this syscall to COMPLETION (a real value is
-        // in rax). A syscall that genuinely blocked and was
-        // interrupted delivers its signal — and takes any
-        // SA_RESTART RIP-rewind — at its own park/yield point,
-        // with the real syscall number, INSIDE the handler (see
-        // `maybe_deliver_signal_before_yield` / poll.rs); it never
-        // reaches this completion hook with the signal still
-        // pending. Forwarding the real `num` here would let an
-        // SA_RESTART signal delivered on the way out rewind RIP-2
-        // and RE-EXECUTE a syscall that already returned (with rax
-        // clobbered by its return value) — a completed
-        // connect/accept/read replayed. Passing the sentinel makes
-        // `is_restartable_syscall` short-circuit to false, so a
-        // completed syscall is never restarted. This is exactly
-        // what the `syscall`-instruction completion path does
-        // (`userspace/src/syscall.rs`, `SYSCALL_NUM_NONE`); the two
-        // gates must stay in parity.
-        if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
-            hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+        // "Kernel does not use INT $0x80!" — Linux panics on a kernel-mode
+        // one; nothing in NARF issues it either.
+        if frame.cs & 3 != 3 {
+            panic!(
+                "int 0x80 from kernel mode at rip {:#x}: the i386 gate serves user tasks only",
+                frame.rip
+            );
         }
+        // Linux `orig_ax = ax & GENMASK(31, 0)`: the i386 number, and what
+        // eax is set back to if the call parks to be re-executed.
+        let orig_eax = frame.rax & 0xFFFF_FFFF;
+        let entry_rip = frame.rip;
+        {
+            let mut ctx = X86TrapContext::from_int80_ia32(frame);
+            narf_userspace::compat32::dispatch(orig_eax as u32, &mut ctx);
+        }
+        // RESTART semantics (as `dispatch_syscall` for the 64-bit gate): a
+        // handler that parked rewound RIP onto `int 0x80` (2 bytes, like
+        // `syscall`) so the task re-issues it on resume; the re-issue must
+        // see the number in eax, not whatever the park left there.
+        if frame.rip == entry_rip.wrapping_sub(2) {
+            frame.rax = orig_eax;
+        }
+        sanitize_user_ss(frame);
         return;
     }
 
@@ -2638,14 +2661,21 @@ use narf_userspace::{
 };
 
 /// Arch-specific `TrapContext` wrapper around a live trap frame.
-/// Constructed at int-0x80 dispatch time so raw handlers get
+/// Constructed by the trap paths (signal delivery on an interrupt return,
+/// timer preemption) and by the `int 0x80` gate, so handlers get
 /// `set_return` + `redirect_to_kernel` bound to the real frame.
 struct X86TrapContext<'a> {
     frame: &'a mut TrapFrame,
     args: SyscallArgs,
+    /// Servicing an i386 system call (`int 0x80`): `args` are the i386
+    /// registers and `set_return` writes only rax (Linux `TS_COMPAT`).
+    ia32: bool,
 }
 
 impl<'a> X86TrapContext<'a> {
+    /// The 64-bit register view of a user trap frame: rdi, rsi, rdx, r10,
+    /// r8, r9 as the six arguments. (The name is historical: `int 0x80` is
+    /// the i386 gate, [`Self::from_int80_ia32`].)
     fn from_int80(frame: &'a mut TrapFrame) -> Self {
         let args = SyscallArgs {
             arg0: frame.rdi,
@@ -2655,7 +2685,31 @@ impl<'a> X86TrapContext<'a> {
             arg4: frame.r8,
             arg5: frame.r9,
         };
-        Self { frame, args }
+        Self {
+            frame,
+            args,
+            ia32: false,
+        }
+    }
+
+    /// The i386 system-call view of an `int 0x80` frame (Linux
+    /// `do_int80_emulation` → `SC_IA32_REGS_TO_ARGS`): ebx, ecx, edx, esi,
+    /// edi, ebp as the six arguments, each zero-extended from 32 bits
+    /// whatever the upper halves hold (a 64-bit caller's garbage included).
+    fn from_int80_ia32(frame: &'a mut TrapFrame) -> Self {
+        let args = SyscallArgs {
+            arg0: u64::from(frame.rbx as u32),
+            arg1: u64::from(frame.rcx as u32),
+            arg2: u64::from(frame.rdx as u32),
+            arg3: u64::from(frame.rsi as u32),
+            arg4: u64::from(frame.rdi as u32),
+            arg5: u64::from(frame.rbp as u32),
+        };
+        Self {
+            frame,
+            args,
+            ia32: true,
+        }
     }
 }
 
@@ -2665,8 +2719,21 @@ impl<'a> TrapContext for X86TrapContext<'a> {
     }
 
     fn set_return(&mut self, ret: SyscallReturn) {
+        if self.ia32 {
+            // Linux leaves every register but rax as the caller had it.
+            self.frame.rax = narf_userspace::compat32::user_rax(ret);
+            return;
+        }
         self.frame.rax = ret.value;
         self.frame.rdx = ret.status as u64;
+    }
+
+    fn in_ia32_syscall(&self) -> bool {
+        self.ia32
+    }
+
+    fn in_compat_mode(&self) -> bool {
+        self.frame.cs == u64::from(super::gdt::UCODE32_SEL)
     }
 
     fn user_rsp(&self) -> u64 {

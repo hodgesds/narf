@@ -109,10 +109,10 @@ fn control_rdev(card_index: u32) -> u64 {
 pub(crate) fn remove_card_node_metadata(info: &crate::CardInfo) {
     let mut nodes = SOUND_NODE_METADATA.lock();
     nodes.remove(&control_rdev(info.index));
-    for device in 0..info.playback_count {
+    for device in crate::pcm_devices(info, false) {
         nodes.remove(&pcm_rdev(info.index, device, false));
     }
-    for device in 0..info.capture_count {
+    for device in crate::pcm_devices(info, true) {
         nodes.remove(&pcm_rdev(info.index, device, true));
     }
 }
@@ -327,9 +327,15 @@ impl FileOps for SoundControlFile {
         let card_index = self.card_index;
         Box::pin(async move {
             if offset == HW_PARAMS_MAGIC_OFFSET {
-                // hw_params setsockopt path — applies to playback device 0.
+                // hw_params setsockopt path — applies to the first playback
+                // device (0 unless the backend numbers its PCMs).
                 let params = decode_hw_params(buf).ok_or(FsError::InvalidPath)?;
-                let mut stream = open_playback(card_index, 0).map_err(|_| FsError::Busy)?;
+                let device = crate::list_cards()
+                    .iter()
+                    .find(|c| c.index == card_index)
+                    .and_then(|c| crate::pcm_devices(c, false).first().copied())
+                    .unwrap_or(0);
+                let mut stream = open_playback(card_index, device).map_err(|_| FsError::Busy)?;
                 stream.hw_params(params).map_err(|_| FsError::InvalidPath)?;
                 return Ok(buf.len());
             }
@@ -607,13 +613,13 @@ impl DirOps for DevSndDir {
             let card = cards.iter().find(|c| c.index == n)?;
             match capture {
                 false => {
-                    if m >= card.playback_count {
+                    if !crate::pcm_devices(card, false).contains(&m) {
                         return None;
                     }
                     return Some(Arc::new(SoundPcmPlaybackFile::new(n, m)) as Arc<dyn FileOps>);
                 }
                 true => {
-                    if m >= card.capture_count {
+                    if !crate::pcm_devices(card, true).contains(&m) {
                         return None;
                     }
                     return Some(Arc::new(SoundPcmCaptureFile::new(n, m)) as Arc<dyn FileOps>);
@@ -655,10 +661,10 @@ impl DirOps for DevSndDir {
         for card in list_cards() {
             let n = card.index;
             entries.push((format!("controlC{}", n), FileType::Special));
-            for m in 0..card.playback_count {
+            for m in crate::pcm_devices(&card, false) {
                 entries.push((format!("pcmC{}D{}p", n, m), FileType::Special));
             }
-            for m in 0..card.capture_count {
+            for m in crate::pcm_devices(&card, true) {
                 entries.push((format!("pcmC{}D{}c", n, m), FileType::Special));
             }
         }

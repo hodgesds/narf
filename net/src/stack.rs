@@ -161,6 +161,10 @@ pub struct AdminIpv6Route {
     pub prefix_len: u8,
     pub gateway: Option<[u8; 16]>,
     pub metric: u32,
+    /// `rtm_protocol` as requested.
+    pub protocol: u8,
+    /// RTA_PREF, already reduced to a valid preference.
+    pub pref: u8,
 }
 
 impl AdminHandle {
@@ -261,11 +265,29 @@ impl AdminHandle {
     }
 
     pub fn add_ipv4(&self, addr: [u8; 4], prefix_len: u8) -> Result<(), AdminError> {
+        self.add_ipv4_flags(addr, prefix_len, 0)
+    }
+
+    /// [`Self::add_ipv4`] with the request's IFA_F_* flags. IFA_F_NOPREFIXROUTE
+    /// (0x200) adds the address without the kernel's prefix route
+    /// (`fib_add_ifaddr`).
+    pub fn add_ipv4_flags(
+        &self,
+        addr: [u8; 4],
+        prefix_len: u8,
+        ifa_flags: u32,
+    ) -> Result<(), AdminError> {
+        const IFA_F_NOPREFIXROUTE: u32 = 0x200;
         self.check_live()?;
         if prefix_len > 32 {
             return Err(AdminError::InvalidPrefix);
         }
-        crate::iface::add_addr(&self.iface_name, addr, prefix_len);
+        crate::iface::add_addr_with(
+            &self.iface_name,
+            addr,
+            prefix_len,
+            ifa_flags & IFA_F_NOPREFIXROUTE == 0,
+        );
         Ok(())
     }
 
@@ -382,13 +404,25 @@ impl AdminHandle {
         if crate::iface::lookup(&self.iface_name).is_none() {
             return Err(AdminError::NoIface);
         }
+        // `ip6_route_info_create`: no RTA_PRIORITY is IP6_RT_PRIO_USER and
+        // RTPROT_UNSPEC is RTPROT_BOOT.
         crate::ipv6::route::add(crate::ipv6::route::Route {
             prefix: route.dst,
             prefix_len: route.prefix_len,
             gateway: route.gateway,
             iface: self.iface_name.clone(),
-            metric: route.metric,
+            metric: if route.metric == 0 {
+                1024
+            } else {
+                route.metric
+            },
             valid_deadline_ns: 0,
+            protocol: if route.protocol == 0 {
+                crate::ipv6::route::RTPROT_BOOT
+            } else {
+                route.protocol
+            },
+            pref: route.pref,
         });
         Ok(())
     }
@@ -407,13 +441,20 @@ impl AdminHandle {
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err(AdminError::InvalidMac);
         }
-        crate::arp::insert(&self.iface_name, ip, mac);
+        // `neigh_add` updates the device's entry in `arp_tbl`, the table the
+        // stack resolves with, and releases what was queued on it.
+        let net_ns_id = self.net_ns_id()?;
+        crate::arp_cache::insert(&self.iface_name, ip, mac);
+        crate::tcp_stack::arp_insert_in(net_ns_id, ip, mac);
+        crate::tcp_stack::neigh_resolved(net_ns_id, &self.iface_name, ip, mac);
         Ok(())
     }
 
     pub fn del_ipv4_neighbor(&self, ip: [u8; 4]) -> Result<(), AdminError> {
         self.check_live()?;
-        crate::arp::remove(&self.iface_name, ip);
+        let net_ns_id = self.net_ns_id()?;
+        crate::arp_cache::remove(&self.iface_name, ip);
+        crate::tcp_stack::arp_remove_in(net_ns_id, ip);
         Ok(())
     }
 

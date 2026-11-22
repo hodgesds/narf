@@ -246,6 +246,63 @@ fn main() {
     // resolves under cross-arch builds.
     println!("cargo:rustc-env=NARF_HELLO_STATIC_ELF_AARCH64=/dev/null");
 
+    // IA-32 compat smoke: an i386 static hello assembled from
+    // `data/musl-demo/hello_i386.S` with the host binutils (`as --32`, `ld -m
+    // elf_i386`) into OUT_DIR — built from source, never a committed binary.
+    // A host whose binutils lacks the i386 emulation gets an empty
+    // placeholder, like the musl smokes without musl-gcc; binutils that has
+    // it and still fails is a real error.
+    {
+        let src = manifest_dir.join("data/musl-demo/hello_i386.S");
+        println!("cargo:rerun-if-changed={}", src.display());
+        let have_i386_binutils = which("as").is_some()
+            && Command::new("ld")
+                .arg("-V")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("elf_i386"))
+                .unwrap_or(false);
+        let path = if have_i386_binutils {
+            let obj = out_dir.join("hello_i386.o");
+            let out = out_dir.join("hello_i386");
+            match Command::new("as")
+                .arg("--32")
+                .arg("-o")
+                .arg(&obj)
+                .arg(&src)
+                .output()
+            {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => panic!(
+                    "hello_i386: as --32 failed ({}):\n{}",
+                    src.display(),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => panic!("hello_i386: could not invoke as: {e}"),
+            }
+            match Command::new("ld")
+                .args(["-m", "elf_i386", "-static", "-nostdlib", "-o"])
+                .arg(&out)
+                .arg(&obj)
+                .output()
+            {
+                Ok(o) if o.status.success() => out.display().to_string(),
+                Ok(o) => panic!(
+                    "hello_i386: ld -m elf_i386 failed:\n{}",
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => panic!("hello_i386: could not invoke ld: {e}"),
+            }
+        } else {
+            println!(
+                "cargo:warning=hello_i386: no i386 binutils (as --32 / ld -m elf_i386); \
+                 the IA-32 smoke uses an empty placeholder"
+            );
+            "/dev/null".to_string()
+        };
+        println!("cargo:rustc-env=NARF_HELLO_I386_ELF_X86_64={path}");
+        println!("cargo:rustc-env=NARF_HELLO_I386_ELF_AARCH64=/dev/null");
+    }
+
     // Wave-78 follow-up 2: real musl-static demo binary. Built via
     // `data/musl-demo/REGEN_musl.sh` (requires musl-gcc); the
     // prebuilt artefact is checked in so the kernel build doesn't

@@ -2,8 +2,8 @@
 //!
 //! Links at user virt `0x0000_0080_0000_1000` via the sibling
 //! `testbin.ld`. The `_start` entry point invokes the kernel via
-//! `narf-user-runtime`, which in turn issues `int 0x80` (x86_64) /
-//! `svc #0` (aarch64) using NARF's syscall ABI.
+//! `narf-user-runtime`, which in turn issues `syscall` (x86_64) /
+//! `svc #0` (aarch64) using the Linux system-call ABI.
 //!
 //! Behaviour: drives the 12 probes the e2e harness greps for
 //! (argv / aux / mmap / boot / ring / fs / wr / pid / brk / clk /

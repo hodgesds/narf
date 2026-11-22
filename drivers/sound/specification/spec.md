@@ -77,6 +77,36 @@ to the LED trigger engine (`Trigger::AudioMute`), so the Elan `elan:red:mute`
 LED follows mixer mute (Linux `sound/core/control_led.c`).
 
 `sound_fs_initcall` publishes `/dev/snd`, sysfs and procfs card information.
+Per card, `/proc/asound` carries `cards`, `version`, `cardN/id`, `cardN/codec#A`,
+`cardN/pcmMx/info` and `cardN/pcmMx/sub0/{info,hw_params,sw_params,status}`
+(x = `p` or `c`). The `sub0` runtime files follow Linux's
+`snd_pcm_substream_proc_*_read` layout from the open ALSA runtime: `closed`
+without one, `no setup` before HW_PARAMS, `busy` while an ioctl holds it;
+lines for state the runtime does not keep (`owner_pid`, `avail_max`,
+`tstamp_mode`, `period_step`) are omitted. `cards` follows `snd_card_info_read`
+(`"%2i [%-15s]: %s - %s"` plus the long name indented 22 columns, `--- no
+soundcards ---` when empty); only lowercase `pcmMp` / `pcmMc` directories
+exist. `register_hardware_card_at` keeps ids unique the way
+`snd_card_set_id_no_lock` does (`Default` for an empty or `card*` id, then
+`_1`, `_2`, ... in hex within 15 characters). A backend may number its PCMs itself (`PcmDevice::pcm_devices`, recorded
+at registration; Linux HDA analog 0, HDMI 3, 7, 8, ...): `pcm_devices(card,
+capture)` is then the device list that devfs nodes, sysfs endpoints,
+procfs directories, PCM_NEXT_DEVICE, PCM_INFO and the PCM open use, with
+playback devices 8..15 on minors 2..9 and capture devices 8..13 on
+minors 10..15 of the card block. `PcmDevice::control_wire` gives a control its own ALSA device,
+index and name (Linux's per-PCM jack, ELD, IEC958 set and channel map);
+ELEM_LIST reports and name lookups resolve those ids. `PcmDevice::device_capabilities`
+(default: `capabilities`) answers HW_REFINE and HW_PARAMS for the PCM device
+the file opened (`pcm_device_capabilities`), so each HDMI PCM follows its own
+sink. `PcmDevice` gains three defaulted
+hooks: `long_name` (`card->longname`: the second `cards` line and control
+CARD_INFO `longname`), `mixer_name` (CARD_INFO `mixername`) and `codec_proc`
+(one `codec#A` body per codec address, rendered by the codec driver; a card
+whose backend reports none keeps the summary `codec#0`). `components` fills
+CARD_INFO `components` (Linux `card->components`; empty without it) and
+`pcm_name` gives a PCM device its own PCM_INFO id and name and the `id:` /
+`name:` lines of `pcmMp/info` (`pcm_names`; the card's id and name otherwise).
+
 Each successful PCM open acquires its own exclusive lease after access checks;
 lookup/stat do not acquire a hardware lease. Files retain that lease across
 calls and release it with the open file object. Per-file async mutexes serialize

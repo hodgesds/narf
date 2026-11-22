@@ -3153,6 +3153,125 @@ kernel_test_in!(
     smoke_igc_refused_frame_returns_its_buffer_to_the_pool
 );
 
+fn smoke_igc_txpool_rejected_frames_return_their_buffers() -> TestResult {
+    // A refused frame's buffer goes back to its pool; a rejected one (a
+    // closed traffic gate, a full ring for a sender that does not honour
+    // backpressure) was dropped instead, freeing the 64 KiB buffer and
+    // shrinking the queue's pool, so the copy path later allocated a
+    // replacement on the data path. Linux frees the skb
+    // (`dev_kfree_skb_any`); it has no pool to shrink.
+    fn plain(_: &[u8], _: TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    fn owned(_: u64, _: Frame, _: TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const NAME: &str = "igc-txpool-rej";
+    let name = narf_net::iface::register(NAME, [2, 0, 0, 0, 0, 11], plain);
+    check!(name == NAME, "the test interface was renamed");
+    let q = Queue::new_sized(64, 64).unwrap();
+    q.set_owner(NAME);
+    let pool = q.tx_pool().clone();
+    let prefilled = pool.available();
+    narf_net::iface::enable_zero_copy_tx_context(NAME, 0, owned, vec![pool.clone()], 0, true);
+    let m = Model::new();
+    let pool_frame = || {
+        narf_net::iface::tx_acquire(NAME, 54).map(|mut frame| {
+            frame.payload_mut().copy_from_slice(&tcp4(0));
+            frame
+        })
+    };
+    // A closed traffic gate rejects every frame.
+    q.set_gate_closed(true);
+    for _ in 0..2 * prefilled {
+        let Some(frame) = pool_frame() else {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a closed gate took a buffer out of the zero-copy pool");
+        };
+        if q.post(&m, 0, frame, TxMeta::plain(), 1500).is_ok() {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a closed gate took a frame");
+        }
+    }
+    q.set_gate_closed(false);
+    // A full ring rejects a frame offered without backpressure.
+    while q
+        .post(&m, 0, dma_frame(&tcp4(0)), TxMeta::plain(), 1500)
+        .is_ok()
+    {}
+    for _ in 0..2 * prefilled {
+        let Some(frame) = pool_frame() else {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a full ring took a buffer out of the zero-copy pool");
+        };
+        if q.post(&m, 0, frame, TxMeta::plain(), 1500) != Err(IgcError::QueueTooSmall) {
+            let _ = narf_net::iface::unregister(NAME);
+            return TestResult::Fail("a full ring took a frame");
+        }
+    }
+    let available = pool.available();
+    let _ = narf_net::iface::unregister(NAME);
+    check!(
+        available == prefilled,
+        "rejected frames were not returned to their pool"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-txpool",
+    smoke_igc_txpool_rejected_frames_return_their_buffers
+);
+
+fn smoke_igc_rxerr_rqdpc_is_fifo_and_mpc_is_missed() -> TestResult {
+    // Linux `igc_update_stats`: each queue's RQDPC (a frame dropped because
+    // its ring had no free descriptor) and MPC add to `rx_fifo_errors`; MPC
+    // alone is `rx_missed_errors`; `rx_over_errors` is never assigned; and
+    // `rx_errors` sums the hardware error counters (CRCERRS here), not the
+    // drops. The hardware host showed every RQDPC drop as rx_over_errors and
+    // rx_errors too, and MPC never as missed.
+    fn plain(_: &[u8], _: TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const NAME: &str = "igc-rxerr-selftest";
+    let name = narf_net::iface::register(NAME, [2, 0, 0, 0, 0, 12], plain);
+    check!(name == NAME, "the test interface was renamed");
+    let m = Model::new();
+    m.regs.borrow_mut().extend([
+        (0xc030, 7), // RQDPC(0)
+        (0xc070, 5), // RQDPC(1)
+        (0x4010, 3), // MPC
+        (0x4000, 2), // CRCERRS
+    ]);
+    let mut counters = crate::counters::Counters::new();
+    let (crc, missed, fifo) = counters.sample(&m, 4, false);
+    check!(
+        (crc, missed, fifo) == (2, 3, 12),
+        "the sample did not read CRCERRS, MPC and the queues' RQDPC"
+    );
+    let device_missed = crate::counters::publish_rx_errors(NAME, crc, missed, fifo);
+    let stats = narf_net::iface::lookup(NAME).map(|iface| iface.stats);
+    let _ = narf_net::iface::unregister(NAME);
+    let Some(stats) = stats else {
+        return TestResult::Fail("the test interface disappeared");
+    };
+    check!(stats.rx_fifo == 15, "RQDPC + MPC is not rx_fifo_errors");
+    check!(stats.rx_missed_errors == 3, "MPC is not rx_missed_errors");
+    check!(stats.rx_over_errors == 0, "igc reported rx_over_errors");
+    check!(
+        stats.rx_errs == 2 && stats.rx_crc_errors == 2,
+        "rx_errors counted the drops, not the hardware errors"
+    );
+    check!(
+        device_missed == 3,
+        "the device's missed-packet count took the RQDPC drops"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-rxerr",
+    smoke_igc_rxerr_rqdpc_is_fifo_and_mpc_is_missed
+);
+
 fn smoke_igc_tx_pool_sized_from_ring() -> TestResult {
     // The pool is bounded by what its ring can hold in flight (one frame per
     // descriptor, one slot reserved) and starts with the ring's worth of
@@ -3371,4 +3490,258 @@ fn smoke_igc_dynamic_itr_follows_linux_ring_itr() -> TestResult {
 kernel_test_in!(
     "drivers/net/igc",
     smoke_igc_dynamic_itr_follows_linux_ring_itr
+);
+
+/// The igc receive pump is the softirq model's: an Interactive-class pump
+/// with a Default-class deferral task on the queue's CPU. Its queue is
+/// completed, the vector re-enabled, only once a poll leaves the ring
+/// empty, as `igc_poll` returns the budget and keeps polling until then.
+fn smoke_igc_softirq_pump_runs_like_napi() -> TestResult {
+    use core::future::Future as _;
+    use narf_scheduler::affinity::{Affinity, CpuId};
+    use narf_scheduler::SchedClass;
+    let (pump, deferral) = crate::igc::rx_task_specs(3);
+    check!(
+        pump.class == SchedClass::Interactive && pump.affinity == Affinity::pinned(CpuId(3)),
+        "the receive pump does not run ahead of its queue CPU's tasks"
+    );
+    let Some(deferral) = deferral else {
+        return TestResult::Fail("the queue has no deferral task");
+    };
+    check!(
+        deferral.class == SchedClass::Default && deferral.affinity == pump.affinity,
+        "the deferral task is not a Default-class task on the queue's CPU"
+    );
+
+    // A 100-frame burst on queue 1, vector 2.
+    let q = Queue::new().unwrap();
+    let m = Model::new();
+    let b = tcp4(0);
+    for slot in 0..100 {
+        inject(&q, slot, &b, 3, 0, 0);
+    }
+    let polls = Cell::new(0u32);
+    let completed_after = RefCell::new(Vec::new());
+    let handoff = narf_net::napi::SoftirqHandoff::new();
+    let run = narf_net::napi::softirq_run(
+        || {
+            let (frames, _) = crate::igc::napi_clean(&q, &m, 1, 1500);
+            let n = frames.len() as u32;
+            for frame in frames {
+                q.recycle(frame.into_parts().0);
+            }
+            polls.set(polls.get() + 1);
+            (n, q.pending_rx())
+        },
+        || {
+            completed_after.borrow_mut().push(polls.get());
+            crate::igc::napi_complete(Some(&q), &m, Some(2))
+        },
+        &handoff,
+        || 0,
+    );
+    let mut run = core::pin::pin!(run);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    let mut end = None;
+    for _ in 0..100 {
+        if let core::task::Poll::Ready(e) = run.as_mut().poll(&mut cx) {
+            end = Some(e);
+            break;
+        }
+    }
+    check!(
+        end == Some(narf_net::napi::SoftirqEnd::Completed),
+        "a 100-frame burst did not complete"
+    );
+    check!(
+        polls.get() == 2 && completed_after.borrow().as_slice() == [2],
+        "the queue was completed before its ring drained"
+    );
+    let eims: Vec<u32> = m
+        .writes
+        .borrow()
+        .iter()
+        .filter(|(reg, _)| *reg == 0x1524)
+        .map(|(_, value)| *value)
+        .collect();
+    check!(
+        eims == [1 << 2],
+        "the vector was not re-enabled exactly once, by its own bit"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-softirq",
+    smoke_igc_softirq_pump_runs_like_napi
+);
+
+/// One queue's share of `smoke_igc_queue_fast_paths_are_per_queue`: four
+/// NAPI polls of queue `q` through its own handle, each frame's transmit
+/// queue selected and reached as the stack's transmit does, and one refused
+/// frame. Returns the frames received, the descriptors dropped and the
+/// frames whose transmit queue differed from the RSS function's.
+fn igc_queue_fast_path_job(
+    q: usize,
+    set: &crate::queue_set::QueueSet,
+    rss: &narf_net::rss::RssConfig,
+) -> (u64, u64, u64) {
+    let m = Model::new();
+    let mut handle = set.handle(q);
+    let (mut frames_seen, mut drops, mut mismatched) = (0u64, 0u64, 0u64);
+    for _ in 0..4 {
+        let _entry = set.enter(q);
+        let Some(queue) = handle.current(set).cloned() else {
+            return (frames_seen, drops, mismatched + 1);
+        };
+        if q >= set.count() {
+            mismatched += 1;
+        }
+        let (frames, dropped) = queue.receive(&m, q, 1500, 16);
+        set.note_rx_drops(q, dropped);
+        drops += dropped;
+        for frame in frames {
+            frames_seen += 1;
+            let tx = set.select(frame.payload());
+            if tx != rss.rx_queue(frame.payload()) || set.get(tx).is_none() {
+                mismatched += 1;
+            }
+            queue.recycle(frame.into_parts().0);
+        }
+    }
+    set.note_tx_rejected(q);
+    (frames_seen, drops, mismatched)
+}
+
+/// Each queue's poll and transmit paths touch only that queue's state, as
+/// each Linux `igc_q_vector` polls its own `igc_ring`, `igc_xmit_frame`
+/// indexes its ring, and every ring keeps its own counters for
+/// `igc_update_stats` to sum. Four queues polled and transmitted on at once,
+/// one per CPU when there are enough, take no device-wide lock, and the
+/// queues' counters still sum to the device totals.
+fn smoke_igc_queue_fast_paths_are_per_queue() -> TestResult {
+    use crate::queue_set::QueueSet;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    let rss = narf_net::rss::RssConfig::standard(4, 128);
+    let b = tcp4(0);
+    let mut queues = Vec::new();
+    for _ in 0..4 {
+        let queue = Queue::new().unwrap();
+        // An errored descriptor chain (one dropped packet), then 40 frames.
+        inject(&queue, 0, &b, 0x80000001, 0, 0);
+        inject(&queue, 1, &b, 3, 0, 0);
+        for slot in 2..42 {
+            inject(&queue, slot, &b, 3, 0, 0);
+        }
+        queues.push(Arc::new(queue));
+    }
+    let set = Arc::new(QueueSet::new(queues, &rss));
+    {
+        let _entry = set.enter(1);
+        check!(
+            set.busy(1) && !set.busy(2),
+            "an operation on queue 1 marked queue 2 busy"
+        );
+    }
+    check!(set.idle(), "an ended operation left a queue busy");
+
+    let before = set.device_locks();
+    let frames = Arc::new(AtomicU64::new(0));
+    let drops = Arc::new(AtomicU64::new(0));
+    let mismatched = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicU64::new(0));
+    let run = {
+        let (set, rss) = (set.clone(), rss.clone());
+        let (frames, drops, mismatched, done) = (
+            frames.clone(),
+            drops.clone(),
+            mismatched.clone(),
+            done.clone(),
+        );
+        move |q: usize| {
+            let (f, d, m) = igc_queue_fast_path_job(q, &set, &rss);
+            frames.fetch_add(f, Ordering::AcqRel);
+            drops.fetch_add(d, Ordering::AcqRel);
+            mismatched.fetch_add(m, Ordering::AcqRel);
+            done.fetch_add(1, Ordering::AcqRel);
+        }
+    };
+    if narf_lib::smp::cpu_count() >= 5 {
+        for q in 0..4 {
+            let run = run.clone();
+            narf_scheduler::spawn_stackful_pinned(async move { run(q) }, q as u32 + 1);
+        }
+        let mut spins = 0u64;
+        while done.load(Ordering::Acquire) < 4 && spins < 4_000_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        check!(
+            done.load(Ordering::Acquire) == 4,
+            "the per-CPU queue polls did not finish"
+        );
+    } else {
+        for q in 0..4 {
+            run(q);
+        }
+    }
+    check!(
+        set.device_locks() == before,
+        "a queue's poll or transmit path took a device-wide lock"
+    );
+    check!(
+        mismatched.load(Ordering::Acquire) == 0,
+        "a frame's transmit queue was not its flow's RSS queue"
+    );
+    check!(
+        frames.load(Ordering::Acquire) == 160 && drops.load(Ordering::Acquire) == 4,
+        "the queues did not receive their 40 frames and drop their errored packet"
+    );
+    let (rx_drops, tx_rejected) = set.totals();
+    check!(
+        rx_drops == drops.load(Ordering::Acquire) && tx_rejected == 4,
+        "the queues' counters do not sum to the device totals"
+    );
+    check!(set.idle(), "a finished poll left its queue busy");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-queues",
+    smoke_igc_queue_fast_paths_are_per_queue
+);
+
+/// The receive pump's mirror check takes no global lock per poll once it
+/// has read the mirror registry, and sees an attach after it happens.
+fn smoke_igc_rx_mirror_check_takes_no_global_lock() -> TestResult {
+    const NAME: &str = "igc-mirror-locks";
+    let mut state = crate::publish::RxMirrorState::new();
+    check!(
+        !state.attached(NAME),
+        "a mirror was attached before any consumer"
+    );
+    let locks = crate::publish::rx_mirror_locks();
+    for _ in 0..64 {
+        check!(
+            !state.attached(NAME),
+            "a mirror was attached before any consumer"
+        );
+    }
+    let taken = crate::publish::rx_mirror_locks() - locks;
+    crate::publish::note_rx_mirror_attached(NAME);
+    let attached = state.attached(NAME);
+    crate::publish::clear_rx_mirror_attached(NAME);
+    let cleared = !state.attached(NAME);
+    check!(
+        taken == 0,
+        "the mirror check took the mirror registry lock per poll"
+    );
+    check!(
+        attached && cleared,
+        "the mirror check did not see an attach or a clear"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc-rx-locks",
+    smoke_igc_rx_mirror_check_takes_no_global_lock
 );

@@ -3416,6 +3416,177 @@ kernel_test_in!(
     smoke_userspace_execve_absolute_links_cross_mounts
 );
 
+/// `load_elf_binary` opens `PT_INTERP` with `open_exec`, the same
+/// LOOKUP_FOLLOW walk as any open from the task's root: an absolute symlink
+/// on the way restarts at that root and crosses into whatever is mounted
+/// below it. bubblewrap builds exactly that root for glycin's image loaders
+/// (`--ro-bind /usr /usr --symlink /usr/lib /lib64`): `/lib64` is an
+/// absolute link on the sandbox's own filesystem and `/usr` is another
+/// mount, so `/lib64/ld-linux-x86-64.so.2` names a file in a different
+/// filesystem from the link. The interpreter has to load from there.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_interp_through_absolute_link_in_root() -> TestResult {
+    // ENOSYS is the fixture's bail after a complete load (no user context to
+    // return into); ENOENT is the interpreter lookup failing.
+    match execve_in_lib64_link_root(0) {
+        Ok(ret) if ret == Some(errno_ret(ENOSYS)) => TestResult::Pass,
+        Ok(ret) if ret == Some(errno_ret(ENOENT)) => {
+            TestResult::Fail("PT_INTERP via /lib64 -> /usr/lib missed the task root")
+        }
+        Ok(_) => TestResult::Fail("execve of the sandboxed dynamic program did not load"),
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/exec-interp",
+    smoke_userspace_execve_interp_through_absolute_link_in_root
+);
+
+/// `open_exec` refuses an interpreter on a noexec mount as it refuses the
+/// image: `do_open_execat`'s `path_noexec` is -EACCES, and
+/// `load_elf_binary` returns it from the execve.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_interp_on_a_noexec_mount_is_eacces() -> TestResult {
+    match execve_in_lib64_link_root(narf_filesystem::mnt_flags::NOEXEC) {
+        Ok(ret) if ret == Some(errno_ret(EACCES)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("an interpreter on a noexec mount was not refused with EACCES"),
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/exec-interp-noexec",
+    smoke_userspace_execve_interp_on_a_noexec_mount_is_eacces
+);
+
+/// Build the glycin-shaped sandbox root — `prog` (PT_INTERP
+/// `/lib64/ld-narf-interp.so`) and `lib64 -> /usr/lib` on one filesystem, the
+/// interpreter on a second mounted at its `usr` with `usr_flags` — root the
+/// task there and `execve("/prog")`. Returns what the execve returned.
+#[cfg(target_arch = "x86_64")]
+fn execve_in_lib64_link_root(usr_flags: u64) -> Result<Option<SyscallReturn>, &'static str> {
+    use narf_filesystem::{bootstrap_mount_authority, registry, FsInstance, MemFs};
+    const ROOT: &str = "/execve-interp-root";
+    const USR: &str = "/execve-interp-root/usr";
+    // A one-page interpreter: ET_EXEC with a low entry, loaded at the
+    // interpreter bias like the registered `ld-narf` of the loader smoke.
+    fn interp_elf() -> alloc::vec::Vec<u8> {
+        const CODE_VA: u64 = 0x1000;
+        const ENTRY: u64 = 0x1234;
+        let mut b = alloc::vec![0u8; 0x2000];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&ENTRY.to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        let ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&CODE_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&CODE_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        b
+    }
+
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    crate::syscall::__test_clear_global();
+    crate::interp::__test_clear_interpreters();
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+    let auth = bootstrap_mount_authority();
+
+    // The sandbox root: the dynamic program, `lib64 -> /usr/lib`, and the
+    // `usr` directory the /usr mount covers. /usr holds the interpreter.
+    let prog = build_pt_interp_elf("/lib64/ld-narf-interp.so");
+    let sandbox = MemFs::with_seeds("execve-interp-root", &[("prog", &prog)]);
+    let usr = MemFs::new("execve-interp-usr");
+    let staged = (|| {
+        let root = sandbox.root();
+        if !matches!(
+            crate::handlers::poll_blocking(root.symlink("lib64", "/usr/lib")),
+            Some(Ok(_))
+        ) || !matches!(
+            crate::handlers::poll_blocking(root.mkdir("usr")),
+            Some(Ok(_))
+        ) {
+            return Err("cannot stage the sandbox root");
+        }
+        let usr_root = usr.root();
+        let lib = match crate::handlers::poll_blocking(usr_root.mkdir("lib")) {
+            Some(Ok(dir)) => dir,
+            _ => return Err("cannot stage /usr/lib"),
+        };
+        let file = match crate::handlers::poll_blocking(lib.create("ld-narf-interp.so")) {
+            Some(Ok(file)) => file,
+            _ => return Err("cannot create the interpreter"),
+        };
+        let bytes = interp_elf();
+        match crate::handlers::poll_blocking(file.write(0, &bytes)) {
+            Some(Ok(n)) if n == bytes.len() => Ok(()),
+            _ => Err("cannot write the interpreter"),
+        }
+    })();
+    if let Err(why) = staged {
+        crate::syscall::__test_clear_global();
+        return Err(why);
+    }
+    let root_mount = match registry().mount(&auth, ROOT, sandbox) {
+        Ok(handle) => handle,
+        Err(_) => {
+            crate::syscall::__test_clear_global();
+            return Err("cannot mount the sandbox root");
+        }
+    };
+    let usr_mount = match registry().mount(&auth, USR, usr) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&root_mount, ROOT);
+            crate::syscall::__test_clear_global();
+            return Err("cannot mount the sandbox /usr");
+        }
+    };
+    if usr_flags != 0 && !registry().set_flags_at(USR, usr_flags) {
+        let _ = registry().unmount(&usr_mount, USR);
+        let _ = registry().unmount(&root_mount, ROOT);
+        crate::syscall::__test_clear_global();
+        return Err("cannot set the sandbox /usr mount flags");
+    }
+
+    let task = crate::handlers::current_task_id();
+    let result = if crate::handlers::install_root_dir(task, ROOT) {
+        let path = b"/prog\0";
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: 0,
+                arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+        Ok(ctx.ret)
+    } else {
+        Err("cannot install the sandbox root")
+    };
+    crate::handlers::__test_root_dir_reset();
+    let _ = registry().unmount(&usr_mount, USR);
+    let _ = registry().unmount(&root_mount, ROOT);
+    crate::syscall::__test_clear_global();
+    result
+}
+
 /// Byte-built ET_EXEC for the execve page-in smokes (#740): one PT_LOAD
 /// R|X, file offset 0x1000 → vaddr 0x80_0000_1000, entry +0x111. The
 /// header DECLARES `declared_pages` of filesz/memsz; the byte vector

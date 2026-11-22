@@ -1,8 +1,11 @@
 //! High-resolution timers — Linux `kernel/time/hrtimer.c`.
 //!
 //! Every CPU owns an [`HrTimerCpuBase`] (`struct hrtimer_cpu_base`) with
-//! eight clock bases (`HRTIMER_MAX_CLOCK_BASES`): MONOTONIC, REALTIME,
-//! BOOTTIME and TAI, each in a hard-IRQ and a `_SOFT` variant. Each clock
+//! ten clock bases (`HRTIMER_MAX_CLOCK_BASES`): MONOTONIC, REALTIME,
+//! BOOTTIME, TAI and MONOTONIC_STEERED, each in a hard-IRQ and a `_SOFT`
+//! variant. MONOTONIC is the kernel's counter clock; MONOTONIC_STEERED is
+//! CLOCK_MONOTONIC as programs read it (`crate::steer`), which Linux needs
+//! no base of its own for because its kernel runs on the steered clock too. Each clock
 //! base is a [`TimerQueueHead`] — a red-black tree ordered by expiry with the
 //! earliest node cached — of intrusive [`HrTimer`] nodes. Nothing on these
 //! paths allocates, frees, or has a capacity limit: a timer is linked through
@@ -72,17 +75,23 @@ pub const KTIME_MAX: Ktime = u64::MAX;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ClockId {
+    /// The kernel's counter clock ([`crate::monotonic_ns`]): kernel timers
+    /// and every deadline derived from `Instant`.
     Monotonic = 0,
     Realtime = 1,
     Boottime = 2,
     Tai = 3,
+    /// CLOCK_MONOTONIC as userspace reads it: the NTP-steered clock
+    /// ([`crate::steer::monotonic_ns`]). Timers whose expiry a program
+    /// gave in CLOCK_MONOTONIC (timerfd, POSIX timers) run here.
+    MonotonicSteered = 4,
 }
 
-/// `HRTIMER_MAX_CLOCK_BASES`: four clocks, hard and soft.
-pub const HRTIMER_MAX_CLOCK_BASES: usize = 8;
-const HRTIMER_BASE_SOFT: usize = 4;
-const HRTIMER_ACTIVE_HARD: u8 = 0x0f;
-const HRTIMER_ACTIVE_SOFT: u8 = 0xf0;
+/// `HRTIMER_MAX_CLOCK_BASES`: five clocks, hard and soft.
+pub const HRTIMER_MAX_CLOCK_BASES: usize = 10;
+const HRTIMER_BASE_SOFT: usize = 5;
+const HRTIMER_ACTIVE_HARD: u16 = 0x01f;
+const HRTIMER_ACTIVE_SOFT: u16 = 0x3e0;
 
 /// `enum hrtimer_mode`, as bit flags.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -209,7 +218,8 @@ impl HrTimer {
             0 => ClockId::Monotonic,
             1 => ClockId::Realtime,
             2 => ClockId::Boottime,
-            _ => ClockId::Tai,
+            3 => ClockId::Tai,
+            _ => ClockId::MonotonicSteered,
         }
     }
 
@@ -284,7 +294,7 @@ impl HrTimer {
 
 struct CpuBaseInner {
     clock_base: [TimerQueueHead; HRTIMER_MAX_CLOCK_BASES],
-    active_bases: u8,
+    active_bases: u16,
     /// Programmed next event, monotonic ns (`cpu_base->expires_next`).
     expires_next: Ktime,
     /// Earliest soft expiry, monotonic ns (`softirq_expires_next`).
@@ -512,13 +522,22 @@ pub fn set_tai_offset_ns(off: u64) {
     clock_was_set();
 }
 
-/// `base->offset`: base clock minus monotonic, in ns.
+/// `base->offset`: base clock minus monotonic, in ns. MONOTONIC is the
+/// kernel's counter clock; MONOTONIC_STEERED is the NTP-steered clock
+/// (`crate::steer`), and REALTIME, BOOTTIME and TAI are it plus their
+/// offsets, so their offset carries the steered clock's lead over the
+/// counter clock — which moves with the rate, and is why expiry re-checks
+/// each base against its own clock.
 #[inline]
 fn base_offset(index: usize) -> i64 {
+    let steered = crate::steer::offset_ns;
     match index % HRTIMER_BASE_SOFT {
-        1 => crate::wall_offset_ns(),
-        2 => crate::boot_offset_ns() as i64,
-        3 => crate::wall_offset_ns().saturating_add(TAI_OFFSET_NS.load(Ordering::Relaxed) as i64),
+        1 => steered().saturating_add(crate::wall_offset_ns()),
+        2 => steered().saturating_add(crate::boot_offset_ns() as i64),
+        3 => steered()
+            .saturating_add(crate::wall_offset_ns())
+            .saturating_add(TAI_OFFSET_NS.load(Ordering::Relaxed) as i64),
+        4 => steered(),
         _ => 0,
     }
 }
@@ -587,7 +606,7 @@ fn lock_hrtimer_base(timer: &HrTimer) -> Locked {
 
 /// Monotonic-ns expiry of the earliest timer among `mask` bases
 /// (`__hrtimer_next_event_base`).
-fn next_event_bases(inner: &CpuBaseInner, mask: u8) -> Ktime {
+fn next_event_bases(inner: &CpuBaseInner, mask: u16) -> Ktime {
     let mut next = KTIME_MAX;
     let mut bits = inner.active_bases & mask;
     while bits != 0 {
@@ -841,7 +860,7 @@ pub fn hrtimer_get_remaining(timer: &HrTimer) -> u64 {
 // ── expiry ──────────────────────────────────────────────────────────────
 
 /// `__hrtimer_run_queues`: run every expired timer of `mask` bases.
-fn run_queues(base: &'static HrTimerCpuBase, mut g: Guard, now: Ktime, mask: u8) -> Guard {
+fn run_queues(base: &'static HrTimerCpuBase, mut g: Guard, now: Ktime, mask: u16) -> Guard {
     let mut bits = g.active_bases & mask;
     while bits != 0 {
         let idx = bits.trailing_zeros() as usize;

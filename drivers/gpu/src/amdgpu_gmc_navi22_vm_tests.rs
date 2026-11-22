@@ -783,3 +783,275 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_gart_and_client_gpuvm_use_resolved_hubs_and_isolate_clients
 );
+
+/// The RX 6750 XT's first VCN decode logged MMHUB VMID 7 faults with
+/// `MMVM_L2_PROTECTION_FAULT_STATUS` 0x70133c, which the report named
+/// "SQC (inst)" from the GFXHUB table. As
+/// `mmhub_v2_0_print_l2_protection_fault_status` does, an MMHUB status names
+/// its client from the MMHUB IP's read/write table
+/// (`mmhub_client_ids_sienna_cichlid` for 2.1.0/2.1.1,
+/// `mmhub_client_ids_beige_goby` for 2.1.2) and prints the raw CID beside it;
+/// a GFXHUB status keeps `gfxhub_client_ids`.
+fn gmc_navi22_fault_report_names_mmhub_clients_like_mmhub_v2_0() -> TestResult {
+    let status = FaultStatus(0x0070_133c);
+    if status.cid() != 9
+        || status.walker_error() != 6
+        || status.permission_faults() != 3
+        || status.mapping_error() != 1
+        || status.rw() != 0
+        || status.vmid() != 7
+        || status.more_faults() != 0
+    {
+        return TestResult::Fail("MMVM_L2_PROTECTION_FAULT_STATUS fields");
+    }
+    /// (hub, MMHUB IP version, CID, write, expected name)
+    type Case = (Hub, (u8, u8, u8), u32, bool, Option<&'static str>);
+    let sienna = (2, 1, 0);
+    let cases: [Case; 13] = [
+        (Hub::Mm, sienna, 9, false, Some("VCNU0")),
+        (Hub::Mm, sienna, 9, true, Some("VCNU0")),
+        (Hub::Mm, sienna, 10, false, Some("JPEG")),
+        (Hub::Mm, sienna, 11, true, Some("VCN0")),
+        (Hub::Mm, sienna, 32 + 11, false, Some("VCN0")),
+        (Hub::Mm, sienna, 0, true, Some("DBGU0")),
+        (Hub::Mm, (2, 1, 1), 13, false, Some("VCN1")),
+        // Holes and the end of the table are unknown, as Linux prints them.
+        (Hub::Mm, sienna, 2, false, None),
+        (Hub::Mm, sienna, 8, true, None),
+        (Hub::Mm, sienna, 44, false, None),
+        (Hub::Mm, (2, 1, 2), 11, false, Some("VCN0")),
+        (Hub::Mm, (2, 1, 2), 10, false, None),
+        (Hub::Gfx, sienna, 9, false, Some("SQC (inst)")),
+    ];
+    for (hub, mmhub, cid, write, name) in cases {
+        if fault_client(hub, mmhub, cid, write) != name {
+            return TestResult::Fail("fault client table does not follow the hub's IP");
+        }
+    }
+    let line = StatusLine {
+        hub: Hub::Mm,
+        mmhub: sienna,
+        status,
+    };
+    if alloc::format!("{line}")
+        != "status=0x70133c hub=MM client=VCNU0 (0x9) more=0 walker=6 permission=0x3 mapping=1 rw=0 vmid=7"
+    {
+        return TestResult::Fail("MMHUB status line");
+    }
+    let unknown = StatusLine {
+        hub: Hub::Mm,
+        mmhub: sienna,
+        status: FaultStatus(0x0004_1001),
+    };
+    if alloc::format!("{unknown}")
+        != "status=0x41001 hub=MM client=unknown (0x8) more=1 walker=0 permission=0x0 mapping=0 rw=1 vmid=0"
+    {
+        return TestResult::Fail("unknown client line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi22/fault-report",
+    gmc_navi22_fault_report_names_mmhub_clients_like_mmhub_v2_0
+);
+
+/// A client space on its own DRM card with one GTT buffer of `size` bytes
+/// mapped R/W/X at `va` (sign-extended, as radeonsi passes it), and the
+/// buffer's handle.
+fn client_space(
+    card: u32,
+    va: u64,
+    size: u64,
+) -> (crate::amdgpu_gem::GemState, crate::amdgpu_vm::VmState, u32) {
+    let amd = |nr: u32| 0xc000_0000 | (0x64 << 8) | (0x40 + nr);
+    let gem = crate::amdgpu_gem::GemState::new();
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&size.to_le_bytes());
+    create[16..24].copy_from_slice(&u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT).to_le_bytes());
+    crate::amdgpu_gem::dispatch(
+        amd(uapi::DRM_AMDGPU_GEM_CREATE),
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .unwrap();
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let vm = crate::amdgpu_vm::VmState::for_card(card);
+    let mut map = [0u8; 40];
+    map[0..4].copy_from_slice(&handle.to_le_bytes());
+    map[8..12].copy_from_slice(&uapi::AMDGPU_VA_OP_MAP.to_le_bytes());
+    map[12..16].copy_from_slice(&0x0eu32.to_le_bytes());
+    map[16..24].copy_from_slice(&va.to_le_bytes());
+    map[32..40].copy_from_slice(&size.to_le_bytes());
+    crate::amdgpu_vm::dispatch(
+        amd(uapi::DRM_AMDGPU_GEM_VA),
+        map.as_mut_ptr() as usize,
+        &vm,
+        &gem,
+        None,
+    )
+    .unwrap();
+    (gem, vm, handle)
+}
+
+/// The RX 6750 XT's VCN faults on MMHUB VMID 7 (PASID 5) at
+/// 0xffff_8001_0007_0000 left two questions open: does the client's VM map
+/// that address, and does MMHUB context 7 point at the client's root when
+/// the hub walks it. The report for a fault on a lent client VMID answers
+/// both: the IV PASID's address space at the address (the mapping, its
+/// placement, the root `amdgpu_gmc_pd_addr` gives the VM flush and every
+/// table entry down to the PTE) and both hubs' context 7 registers as
+/// mmhub_v2_0/gfxhub_v2_1 `setup_vmid_config` and the ring's
+/// `gmc_v10_0_emit_flush_gpu_tlb` program them, then names the cause.
+fn gmc_navi22_client_fault_report_reads_the_vm_and_both_contexts() -> TestResult {
+    const VA: u64 = 0xffff_8001_0007_0000;
+    let (_pool, mut engine) = ready(0);
+    if engine.reserve_client_vmids().is_err() {
+        return TestResult::Fail("client VMIDs not lent");
+    }
+    let (_gem, vm, handle) = client_space(0xfa17_0007, VA, 0x2000);
+    let (Some(pasid), Some(root)) = (vm.pasid(), vm.root_pde()) else {
+        return TestResult::Fail("setup: PASID or root");
+    };
+    let stripped = crate::amdgpu_vm::strip_hole(VA);
+    // The flush the decode job's ring frame emits: MMHUB context 7 points at
+    // the client's root; GFXHUB context 7 stays on the empty root.
+    let ptb = MM_BASE + u64::from(MM.pt_base + 2 * 7) * 4;
+    engine.io.registers.insert(ptb, root as u32);
+    engine.io.registers.insert(ptb + 4, (root >> 32) as u32);
+    let empty = reg64(&engine, GFX_BASE, GFX.pt_base + 2 * 7);
+    let Some(space) = crate::amdgpu_vm::describe_fault(pasid, stripped) else {
+        return TestResult::Fail("the IV PASID's address space was not found");
+    };
+    let want = crate::amdgpu_vm::Mapping {
+        va: stripped,
+        size: 0x2000,
+        gem_handle: handle,
+        offset: 0,
+        vm_flags: 0x0e,
+    };
+    let leaf = vm.leaf_entry(stripped).unwrap_or(0);
+    if space.root != Some(root)
+        || space.mapping != Some(want)
+        || space.system != Some(true)
+        || space.levels != 4
+        || space.walk.len() != 4
+        || space.walk[0] != vm.directory_entry(stripped, Level::Pdb2).unwrap_or(0)
+        || space.walk[3] != leaf
+        || !space.translates()
+    {
+        return TestResult::Fail("address space evidence at the faulting VA");
+    }
+    let outside = crate::amdgpu_vm::describe_fault(pasid, stripped + (1 << 30));
+    if outside
+        .as_ref()
+        .is_none_or(|s| s.mapping.is_some() || s.translates() || s.root != Some(root))
+        || crate::amdgpu_vm::describe_fault(0, stripped).is_some()
+    {
+        return TestResult::Fail("unmapped VA or unknown PASID");
+    }
+    let fault = Fault {
+        hub: Hub::Mm,
+        vmid: 7,
+        pasid,
+        address: stripped,
+        retry: false,
+        write: false,
+    };
+    let report = engine.client_fault_report(fault, Some(space.clone()));
+    let cntl = |base, r: regs::HubRegs| reg(&engine, base, r.ctx + 7);
+    let context = |base, r: regs::HubRegs, ptb| ContextRegs {
+        cntl: cntl(base, r),
+        base: ptb,
+        start: 0,
+        end: (1 << 36) - 1,
+    };
+    let mm = context(MM_BASE, MM, root);
+    let gfx = context(GFX_BASE, GFX, empty);
+    if report.contexts != Some([(Hub::Mm, mm), (Hub::Gfx, gfx)])
+        || report.space.as_ref() != Some(&space)
+        || report.cause() != Some(FaultCause::HubWalk)
+    {
+        return TestResult::Fail("hub context read-back or cause");
+    }
+    let walk = alloc::format!(
+        "{:#x},{:#x},{:#x},{:#x}",
+        space.walk[0],
+        space.walk[1],
+        space.walk[2],
+        space.walk[3]
+    );
+    let lines = alloc::format!(
+        "amdgpu: navi22 GPU page fault va={VA:#x} pasid={pasid}: mapped va={VA:#x}+0x2000 handle={handle} offset=0x0 flags=0xe system root={root:#x} walk={walk}\n\
+         amdgpu: navi22 GPU page fault vmid=7 MM cntl={:#x} base={root:#x} start=0x0 end=0xfffffffff, GFX cntl={:#x} base={empty:#x} start=0x0 end=0xfffffffff\n\
+         amdgpu: navi22 GPU page fault cause: mapped, the client's tables translate it and the MM context points at their root: the hub cannot walk them",
+        mm.cntl,
+        gfx.cntl,
+    );
+    if alloc::format!("{report}") != lines {
+        return TestResult::Fail("report lines");
+    }
+    // The flush never landed: MMHUB context 7 still on the empty root.
+    engine.io.registers.insert(ptb, empty as u32);
+    engine.io.registers.insert(ptb + 4, (empty >> 32) as u32);
+    if engine
+        .client_fault_report(fault, Some(space.clone()))
+        .cause()
+        != Some(FaultCause::ContextElsewhere)
+    {
+        return TestResult::Fail("a context off the client's root");
+    }
+    // Every other cause, in the order the report decides them.
+    let with = |space: Option<crate::amdgpu_vm::FaultVa>, mm: ContextRegs| ClientFaultReport {
+        fault,
+        contexts: Some([(Hub::Mm, mm), (Hub::Gfx, gfx)]),
+        space,
+    };
+    let unmapped = crate::amdgpu_vm::FaultVa {
+        mapping: None,
+        walk: alloc::vec![],
+        ..space.clone()
+    };
+    let untranslated = crate::amdgpu_vm::FaultVa {
+        walk: space.walk[..3].to_vec(),
+        ..space.clone()
+    };
+    let disabled = ContextRegs {
+        cntl: mm.cntl & !1,
+        ..mm
+    };
+    let short = ContextRegs {
+        end: (stripped >> 12) - 1,
+        ..mm
+    };
+    let causes = [
+        (with(None, mm).cause(), FaultCause::NoSpace),
+        (with(Some(unmapped), mm).cause(), FaultCause::Unmapped),
+        (
+            with(Some(untranslated), mm).cause(),
+            FaultCause::NotTranslated,
+        ),
+        (
+            with(Some(space.clone()), disabled).cause(),
+            FaultCause::ContextDisabled,
+        ),
+        (
+            with(Some(space.clone()), short).cause(),
+            FaultCause::ContextRange,
+        ),
+    ];
+    if causes.iter().any(|&(got, want)| got != Some(want)) {
+        return TestResult::Fail("fault causes");
+    }
+    if alloc::format!("{}", with(None, mm)).lines().next()
+        != Some(&*alloc::format!(
+            "amdgpu: navi22 GPU page fault va={VA:#x} pasid={pasid}: no address space holds this PASID"
+        ))
+    {
+        return TestResult::Fail("report without an address space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi22/fault-report",
+    gmc_navi22_client_fault_report_reads_the_vm_and_both_contexts
+);

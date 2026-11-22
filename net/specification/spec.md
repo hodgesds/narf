@@ -270,8 +270,20 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
   (`Tcb::tx_bind`) acquires only from that queue's pool
   (`NetIfaceSnapshot::tx_acquire_on_queue`); an empty bound pool falls back to
   the copy path, never to another queue's pool, so each pool covers exactly
-  the frames its own ring holds in flight. Only a connection's first frame,
-  before the binding exists, uses the flow hash or round-robin choice.
+  the frames its own ring holds in flight. Before the binding exists (the
+  handshake and the first data segment) the pool is the queue the driver posts
+  the flow on: on an egress with a transmit-queue contract,
+  `TxBackpressure::tx_select_queue` of the flow, placed through
+  `rss::flow_probe_ipv4` / `rss::flow_probe_ipv6` (the shortest frame whose
+  `flow_tuple` is the flow), so the binding then made from the first frame
+  names the same queue (`NetIfaceSnapshot::tx_acquire_ipv4_flow` /
+  `tx_acquire_ipv6_flow`). Only an egress without the contract uses the flow
+  hash (`ipv4_flow_queue`, the one its driver posts by) or round-robin. A
+  frame built in one queue's pool and posted on another moves a buffer between
+  pools at every completion, draining the first. A pool frame that is not
+  transmitted — dropped by netfilter, copied onto an unresolved neighbour's
+  queue (`NetIfaceSnapshot::tx_return`), or rejected or refused by the driver —
+  returns its buffer to the pool it came from; it is never freed.
 - Resolved interface snapshots retain references to their TX recyclers. The
   routing/TCP fast path acquires from that snapshot, not by taking the global
   interface-registry lock once per packet.
@@ -558,6 +570,40 @@ A built-in `Loopback` implementation of the contract. Always
 available, backed by a kernel-internal Narf-Ring that loops TX →
 RX. Used by `verification/` to test the contract without hardware.
 
+Every network namespace has its own `lo` (Linux `loopback_net_init`). The
+initial namespace's is the `iface::register_loopback_iface` registration.
+`create_network_namespace(net_ns_id)` is the `setup_net` hook the namespace
+constructor calls, before the namespace is published; it gives the new
+namespace a `lo` at `iface::LOOPBACK_IFINDEX` (1) that is down, has
+`IFF_LOOPBACK` only and no address, with a 64 KiB MTU.
+`release_network_namespace` removes it. `iface::lookup_in(ns, "lo")` and
+`iface::by_index_in(ns, 1)` resolve to it, and so do the device ioctls and
+rtnetlink in that namespace. `iface::namespace_loopback(ns) ->
+Option<NamespaceLoopback>` reports its `up` state, IPv4 addresses, MTU and
+counters; it returns `None` for the initial namespace. A frame sent on it is
+received on it, in that namespace only. Kernel IPv6 frames are dropped there
+until the IPv6 receive path takes its device rather than a name.
+
+`iface::change_namespace_loopback(ns, LoopbackChange) -> Option<bool>` is the
+only way to change a namespace's `lo`. `LoopbackChange` is one of `Link(up)`,
+`AddIpv4(addr, prefix)`, `DelIpv4(addr, prefix)` or `Mtu(mtu)`. It returns
+`None` when the namespace has no `lo` of its own and `Some(false)` when
+nothing changed. It applies the Linux side effects: bringing `lo` up adds
+127.0.0.1/8 unless that address is already there (`inetdev_event`
+NETDEV_UP), and it holds `::1/128` while it is up. Taking it down keeps its
+IPv4 addresses and drops its IPv6 ones (`addrconf_ifdown`).
+`RTM_NEWLINK`/`RTM_SETLINK`, `RTM_NEWADDR`/`RTM_DELADDR` and
+SIOCSIFFLAGS/SIOCSIFMTU on that namespace's `lo` call it, and require
+CAP_NET_ADMIN over the namespace. No delegated `AdminHandle` names it.
+Setting its hardware address is `-EOPNOTSUPP`.
+`netlink_route::iface_name_for_index_in(ns, ifindex)` and
+`ifindex_for_name_in(ns, name)` resolve every rtnetlink device reference
+(link, address, route, neighbour and qdisc requests) within the sender's
+namespace (`__dev_get_by_index(net, ...)`). The kernel handle for the name
+`lo` is the initial namespace's device. Route, neighbour and qdisc requests
+on a namespace's own `lo` therefore answer `-EOPNOTSUPP` (a LINUX-GAP)
+rather than changing the initial namespace.
+
 ### 3.5 Stack-daemon attach (Stage 4)
 
 - A userspace daemon presents a `Cap<Stack, Install>` token (minted
@@ -584,7 +630,15 @@ caches, the canonical local/main/default IPv4 policy rules, and each
 interface's direct-ring `noqueue` discipline respectively,
 echo the request sequence, identify the kernel sender with port ID zero, carry
 `NLM_F_MULTI`, and terminate with `NLMSG_DONE`. Unsupported request types return
-`NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests follow
+`NLMSG_ERROR(-EOPNOTSUPP)`. An IPv6 address's scope and flags have one
+source, `ipv6::addrs`: `ipv6_addr_scope(addr)` is Linux's IPV6_ADDR_* scope
+bits (0x10 `::1`, 0x20 fe80::/10, 0x40 fec0::/10, 0 otherwise, ULAs
+included), `rt_scope()` maps them to the `RT_SCOPE_*` value RTM_NEWADDR
+carries in `ifa_scope` (254 / 253 / 200 / 0, `inet6_fill_ifaddr`), and
+`ifa_flags()` is the IFA_F_* word (PERMANENT only for an address with no
+lifetime). `/proc/net/if_inet6` (`addrs::snapshot_in`) prints the device's
+ifindex, `ipv6_addr_scope` and `(u8)ifa_flags`, starting with `::1` on lo
+(`addrs::loopback_ifaddr`). Rtnetlink mutation requests follow
 `rtnetlink_rcv_msg`: a non-GET request needs
 `netlink_net_capable(skb, CAP_NET_ADMIN)` — CAP_NET_ADMIN over the socket's
 network namespace (its owning user namespace), held both by the socket's
@@ -596,8 +650,20 @@ kernel-held interface handles minted once per interface
 interface-bound `AdminHandle`, which authorizes exactly that interface.
 `RTM_NEWLINK`/`RTM_SETLINK` and IPv4 or IPv6
 `RTM_NEWADDR`/`RTM_DELADDR` plus `RTM_NEWROUTE`/`RTM_DELROUTE` invoke the
-typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
-IPv6 NDP state through the same interface-bound authority.
+typed operations in §3.3. An IPv4 `RTM_NEWADDR` passes its IFA_F_* flags
+(`ifa_flags`, replaced by the IFA_FLAGS attribute when present) to
+`AdminHandle::add_ipv4_flags`; IFA_F_NOPREFIXROUTE adds the address without
+the kernel's metric-0 prefix route (`fib_add_ifaddr`, via
+`iface::add_addr_with` / `ifaddr::iface_add_addr_with`), and removing an
+address removes only the kernel's own prefix route (metric 0,
+RTPROT_KERNEL), never another owner's route to the prefix
+(`fib_del_ifaddr`). `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
+IPv6 NDP state through the same interface-bound authority. IPv4 neighbours
+live in `arp_cache`, the table resolution uses: the RTM_GETNEIGH dump lists
+it with each entry's NUD state (NDA_LLADDR only for a valid entry,
+`neigh_fill_info`), as `/proc/net/arp` does, and RTM_NEWNEIGH /
+RTM_DELNEIGH write it (`arp_cache::insert` / `arp_cache::remove`), with the
+namespace's next-hop cache, releasing frames queued on the neighbour.
 The stack-daemon launcher performs delegation as a kernel-held transfer from a
 successful `StackAttachReply` to a route socket in the attaching task's fd
 table. The Linux syscall surface never accepts raw admin-handle bytes.
@@ -688,10 +754,25 @@ with `NLMSG_ERROR`; a successful doit's reply precedes its `NLM_F_ACK`.
 Non-dump `RTM_GETLINK` resolves one interface by positive ifindex or else
 `IFLA_IFNAME`, returning a non-multipart reply, `ENODEV` when the named
 interface is absent, or `EINVAL` when neither selector is present.
-Non-dump `RTM_GETROUTE` performs the forwarding table's longest-prefix
-lookup for `RTA_DST` (absent: 0.0.0.0, as `inet_rtm_getroute`), returning
-the selected route as one non-multipart reply or `ENETUNREACH`; a family
-other than `AF_INET` returns `EOPNOTSUPP`.
+Non-dump `RTM_GETROUTE` runs the output lookup for `RTA_DST` (absent:
+0.0.0.0, the loopback route, as `inet_rtm_getroute`), with `RTA_OIF` as the
+output device (only its routes count, else on-link there; an unknown index
+is `ENODEV`) and `RTA_SRC` as the source, and answers the cloned route as
+`rt_fill_info` does: rtm_dst_len 32, `RTM_F_CLONED`, `RTPROT_UNSPEC`,
+`RTA_TABLE`, `RTA_DST`, `RTA_OIF`, `RTA_PREFSRC` (unless `RTA_SRC` fixed
+the source), `RTA_GATEWAY` and `RTA_CACHEINFO`; a local destination is an
+`RTN_LOCAL` route through lo in the local table. With `RTM_F_FIB_MATCH` it
+answers the matched FIB entry instead. No route is `ENETUNREACH`; a family
+other than `AF_INET` returns `EOPNOTSUPP`. LINUX-GAP: `RTA_UID` is not
+reported.
+IPv6 routes carry `ipv6::route::Route::{protocol, pref}`: an RA's default
+route is `RTPROT_RA` at metric 1024 with the RA's router preference
+(`rt6_add_dflt_router`), a PIO prefix route `RTPROT_KERNEL` at 256, and an
+RTM_NEWROUTE keeps its `rtm_protocol` (`RTPROT_BOOT` when unspecified), its
+RTA_PREF (low/high, else medium) and, without RTA_PRIORITY, metric 1024
+(`ip6_route_info_create`). Dumps report the protocol, RTA_PREF on every
+route and an expiring route's remaining lifetime in RTA_CACHEINFO
+(`rt6_fill_node`).
 Address dumps honor `ifa_family`, and `ifa_index` only under strict checking;
 route dumps honor `rtm_family`, and under strict checking `rtm_table` /
 `RTA_TABLE`, `RTA_OIF`, `rtm_protocol`, and `rtm_type`; neighbor dumps filter
@@ -931,6 +1012,14 @@ socket's pending-reply queue and readiness state under its own lock; it never
 holds a registry lock while waking a waiter. This permits unrelated echo flows
 to complete concurrently on distinct RX CPUs while retaining namespace-safe
 lookup when a flow moves between NIC queues.
+`icmp_sock::icmp_echo_send_with(.., EchoSendOpts { src, oif })` is
+`ping_v4_sendmsg`'s routing: with an `oif` (SO_BINDTODEVICE, else
+IP_UNICAST_IF) only that device's routes count and its neighbour table
+resolves the next hop (`tcp_stack::neigh_output_on`), and a bound address
+is the source. `on_icmp_rx_meta` records each Echo Reply's TTL, TOS,
+arrival device and destination (`EchoRxMeta`), which
+`icmp_echo_recv_reply_meta` returns for `ip_cmsg_recv` (IP_TTL, IP_TOS,
+IP_PKTINFO).
 `iface::is_local_addr_in(ns, ip)` reports whether `ip` is one of the
 namespace's addresses (or in 127.0.0.0/8); `iface::is_broadcast_in(ns, ip)`
 reports the limited broadcast or a local subnet's `prefix | ~mask` for
@@ -939,6 +1028,13 @@ payload over `UDP_MAX_PAYLOAD` (65507) regardless of `SO_SNDBUF`, require
 `SO_BROADCAST` for exactly those broadcast destinations, drop an arriving
 datagram when the receive queue is full, and drop received datagrams whose
 length field is shorter than the header or longer than the segment.
+ARP input (`tcp_stack::handle_arp_on_in`) follows `arp_process` with the
+defaults arp_ignore=0 and arp_filter=0: a request for a multicast or
+loopback target is dropped; a request for any address local to the
+namespace is answered from the device it arrived on, with that device's MAC
+(so two NICs on one subnet each answer for both addresses, as Linux does);
+an RFC 2131 DAD probe (sender 0.0.0.0) for a local address is answered the
+same way and teaches no neighbour.
 No IPv4 output path waits for ARP (Linux `neigh_output` /
 `__neigh_event_send`). `tcp_stack::neigh_output_in(ns, nexthop, len, cont)`
 runs the send continuation `cont` with the MAC at once on a cache hit; on a
@@ -956,6 +1052,23 @@ an ICMP host unreachable — EHOSTUNREACH in SYN-SENT), forwarding, ICMP
 errors, ICMP echo requests and replies, and `ipv4::ipv4_send` all go through
 it; the former blocking `arp_resolve_in` / `arp::resolve_blocking` are gone,
 and `udp_sock::udp_send_from` no longer takes an ARP timeout.
+An IPv4 active open (`tcp::core::connect_start_in`) takes the socket's
+binding in `ConnectOptions { local_addr, local_port, oif }`, as
+`tcp_v4_connect` does: a bound address is the source, a bound port is kept
+(`inet_hash_connect`; a taken 4-tuple is `EADDRNOTAVAIL`), and with `oif`
+(SO_BINDTODEVICE) the route and next hop are that device's and every
+segment of the connection (`Tcb::oif`) leaves through it, resolving on its
+neighbour table (`tcp_stack::neigh_output_on`). An unknown device is
+`ENODEV`.
+A send bound to a device (SO_BINDTODEVICE) routes with that output device,
+as `flowi4_oif` does: `route::route_lookup_oif_in(ns, dst, oif)` considers
+only routes through `oif` and otherwise treats the destination as on-link
+there, and the next hop is looked up and resolved in that device's neighbour
+table (`tcp_stack::neigh_start_on`, `send_arp_request_on`); resolution
+timers retransmit on the neighbour's own device. A multicast destination is
+never resolved: it leaves at once for `udp_sock::ip_eth_mc_map(group)`
+(01:00:5e + the group's low 23 bits), as `arp_mc_map` gives a NUD_NOARP
+neighbour.
 An IPv4 UDP send to an unresolved next hop retains the complete post-netfilter
 frame in a namespace/interface/neighbor-scoped bounded queue, starts ARP, and
 reports success without blocking. Learning the neighbor MAC patches and
@@ -1269,8 +1382,13 @@ table holds `gc_thresh1` entries, drop FAILED entries and unused ones past
 `iface::rx_batch(name)` resolves the ingress device once per receive poll and
 returns an `RxBatch`; `RxBatch::receive(frame, timestamp)` delivers a frame
 whose native XDP action was PASS without touching the interface registry,
-and the batch's packet, byte and multicast counts are added to the interface
-when it is dropped. `iface::on_native_rx_timestamped` remains for callers
+and the batch's packet, byte and multicast counts are added to the
+interface's per-CPU receive counters (Linux `dev->tstats`) when it is
+dropped; every counter reader folds them into the interface totals. A
+receive path that keeps an `iface::RxHandle` (as a driver holds its
+`net_device`) gets its batches from `RxHandle::batch()`, which reads the
+registry only after a writer changed it (the registry's generation, bumped
+by every mutable borrow): a steady-state poll takes no global lock. `iface::on_native_rx_timestamped` remains for callers
 that deliver single frames by name.
 
 IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,
@@ -1327,6 +1445,42 @@ wrap or revive an earlier identity. Observing an epoch grants no capability or
 frame admission. Ordinary Ethernet link, carrier, routing and send behavior is
 unchanged. Native asynchronous wireless controls use this fence so a namespace
 away/back or DOWN/UP cycle cannot revive a prior socket/mode operation.
+
+### Receive pumps in softirq context (`napi`)
+
+A NIC queue's receive pump runs the way Linux runs NAPI from
+`__do_softirq` on IRQ exit. `napi::rx_pump_spec(cpu)` is the pump's task
+spec: pinned to the CPU the queue's vector is delivered to,
+`WorkKind::SoftIrq`, and `SchedClass::Interactive`, so the strict-class
+dispatcher runs it ahead of that CPU's Default-class tasks.
+`napi::rx_deferral_spec(cpu)` is its deferral task, the ksoftirqd role:
+the same CPU and work kind, `SchedClass::Default`.
+
+`napi::softirq_run(poll, complete, handoff, now_ns)` is one run from one
+IRQ wake. `poll` is one NAPI poll of at most `DEFAULT_BUDGET` frames,
+returning the frames processed and whether the ring still holds work;
+`complete` is `napi_complete_done` plus the driver's interrupt re-enable,
+called only when a poll left the ring empty, and returns whether work
+landed meanwhile (the run polls again). While work is left the run yields
+to its own class between polls and accounts each poll in a
+`SoftirqBudget`: a round ends after `NETDEV_BUDGET` (300) packets or
+`NETDEV_BUDGET_NS` (2 ms), and the run ends after `MAX_SOFTIRQ_RESTART`
+(10) rounds or `MAX_SOFTIRQ_TIME_NS` (2 ms). It then returns
+`SoftirqEnd::Deferred` with the queue handed over through `handoff`
+uncompleted, so the driver does not re-enable its interrupt; otherwise
+`SoftirqEnd::Completed`.
+
+`SoftirqHandoff` is the queue's ownership between the two tasks
+(`NAPI_STATE_SCHED` held across `wakeup_softirqd`): `defer` and
+`hand_back` publish the owner with Release and wake the other side;
+`taken` and `returned` resolve once the deferral task or the pump holds
+the queue. Exactly one of the two polls the queue at a time.
+`napi::deferral_run(poll, handoff, now_ns)` is the deferral task's turn:
+polls in runs under the same `SoftirqBudget`, yields the CPU between
+runs (`cond_resched`), and hands the queue back when a poll leaves the
+ring empty; the pump's next run completes it.
+
+The igc, igb and e1000 receive pumps use this model.
 
 ## 4. Invariants & safety properties
 

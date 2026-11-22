@@ -15,25 +15,22 @@
 //! clears the bit with `ADJ_STATUS` and the answer becomes `TIME_OK`, exactly
 //! as on Linux.
 //!
-//! LINUX-GAP (closed by #1764): the discipline loop. Linux feeds
-//! `time_offset` / `time_freq` into `second_overflow()` on every tick and into
-//! the timekeeper's multiplier, so a PLL correction physically slews
-//! CLOCK_REALTIME. NARF has no timekeeper multiplier — the wall clock is
-//! `monotonic_ns + WALL_OFFSET_NS` — so the loop lives here instead:
-//! [`tick_second`], called once per wall second from the clockevent tick
-//! handler, drains `time_offset` exponentially (`ntp_offset_chunk()`:
-//! `time_offset >> (SHIFT_PLL + time_constant)`, whole remainder when the
-//! chunk rounds to zero, exactly as Linux's `second_overflow()`) and folds
-//! the chunk into the wall offset via [`crate::wall::adjust_wall_offset_ns`].
-//! The slew is therefore applied at 1 Hz granularity, not spread over the
-//! second's ticks: each second's jump is at most `MAXPHASE >> (SHIFT_PLL +
-//! time_constant)` (≤ 8 ms while converging from the 128 ms step threshold,
-//! ≤ 0.5 ms at the µs-mode default constant). [`apply_sample`] is the SNTP
-//! client's entry point: offsets over the RFC 5905 step threshold (128 ms)
-//! step the wall clock at once, smaller ones go through `ADJ_OFFSET`'s
-//! PLL/FLL frequency learning ([`update_offset`], the full Linux
-//! `ntp_update_offset()`), and the tick drains the phase. `ADJ_SETOFFSET`
-//! (a step, not a slew) still reaches the timekeeper directly, as before.
+//! The discipline loop steers the timekeeper ([`crate::steer`]), as Linux
+//! feeds `ntp_tick_length()` to `timekeeping_adjust()`: the rate the steered
+//! clocks (CLOCK_MONOTONIC, BOOTTIME, REALTIME, TAI) run at against the
+//! counter is the tick length minus one second — `tick_usec · USER_HZ` µs −
+//! 1 s, plus `time_freq`, plus this second's phase and adjtime share — set at once
+//! when `adjtimex` changes the frequency or tick (`ntp_update_frequency`)
+//! and once a second by [`tick_second`] (`second_overflow()`), which moves
+//! one `ntp_offset_chunk()` (`time_offset >> (SHIFT_PLL + time_constant)`)
+//! of the phase into the coming second's rate. A slew therefore moves
+//! CLOCK_MONOTONIC as well as CLOCK_REALTIME, smoothly; only a step
+//! (`ADJ_SETOFFSET`, `clock_settime`, an SNTP sample over the 128 ms step
+//! threshold) moves the wall offset, and only CLOCK_REALTIME / TAI.
+//! [`apply_sample`] is the in-kernel SNTP client's entry point: offsets over
+//! the RFC 5905 step threshold step the wall clock at once, smaller ones go
+//! through `ADJ_OFFSET`'s PLL/FLL frequency learning ([`update_offset`], the
+//! full Linux `ntp_update_offset()`).
 //!
 //! LINUX-GAP: no leap-second machinery here. `STA_INS` / `STA_DEL` are stored
 //! and reported, but `time_state` never advances to `TIME_INS` / `TIME_DEL` /
@@ -41,12 +38,8 @@
 //! `second_overflow()`. NARF's leap handling is [`crate::wall::begin_leap_smear`]
 //! — a different mechanism with no adjtimex surface.
 //!
-//! LINUX-GAP: the `ADJ_ADJTIME` single-shot offset (`time_adjust`) is not
-//! drained by [`tick_second`]. Linux drains it at `MAX_TICKADJ` (500 µs/s)
-//! through the same per-tick skew machinery that carries `time_offset`;
-//! NARF has no per-tick multiplier to carry it, so a single-shot offset
-//! stays pending until something steps the clock. The SNTP path never sets
-//! it.
+//! The `ADJ_ADJTIME` single-shot offset (`time_adjust`) drains as in Linux:
+//! at most `MAX_TICKADJ` (500 µs) of it joins each second's rate.
 //!
 //! LINUX-GAP: no PPS, as if `CONFIG_NTP_PPS` were off. `ppsfreq`, `jitter`,
 //! `shift`, `stabil`, `jitcnt`, `calcnt`, `errcnt` and `stbcnt` read back as
@@ -281,6 +274,10 @@ struct NtpState {
     /// `adjtime(3)`'s single-shot offset, µs.
     time_adjust: i64,
     tai_offset: i32,
+    /// What `second_overflow()` added to this second's tick length — the
+    /// phase chunk and the `adjtime` share — as a rate, ns/s << 32
+    /// (`tick_length - tick_length_base`, times `NTP_INTERVAL_FREQ`).
+    tick_phase: i64,
 }
 
 /// `kernel/time/ntp.c`'s `tk_ntp_data[]` initialiser.
@@ -296,6 +293,7 @@ static NTP: IrqSafeSpinLock<NtpState> = IrqSafeSpinLock::new(NtpState {
     time_reftime: 0,
     time_adjust: 0,
     tai_offset: 0,
+    tick_phase: 0,
 });
 
 /// `kernel/time/ntp.c::is_error_status()` in its `!CONFIG_NTP_PPS` form —
@@ -403,6 +401,22 @@ fn process_adj_status(ntp: &mut NtpState, txc: &Timex, now_sec: i64) {
     ntp.time_status |= txc.status & !STA_RONLY;
 }
 
+/// `MAX_TICKADJ` (`include/linux/timex.h`): the most of an `adjtime(3)`
+/// offset one second absorbs, µs.
+const MAX_TICKADJ: i64 = 500;
+
+/// The steered clocks' rate against the counter, ns/s << 32: Linux's
+/// `ntp_tick_length()` over one second (`tick_length_base` from
+/// `ntp_update_frequency` — `tick_usec · NSEC_PER_USEC · USER_HZ << 32 +
+/// time_freq` — plus `second_overflow()`'s share) minus one second.
+fn steer_rate(ntp: &NtpState) -> i64 {
+    // `tick_usec` is held to ±10% of 10000 (`validate`), so `tick` is within
+    // ±(1e8 << 32) ≈ 4.3e17; `time_freq` is within ±`MAXFREQ_SCALED`
+    // (2.1e15) and `tick_phase` within ±2.2e18: the sum fits.
+    let tick = (ntp.tick_usec * NSEC_PER_USEC * USER_HZ - NSEC_PER_SEC) << NTP_SCALE_SHIFT;
+    tick + ntp.time_freq + ntp.tick_phase
+}
+
 /// `kernel/time/ntp.c::process_adjtimex_modes()`. `now_sec` is the realtime
 /// sample the caller took, threaded to the status handler (PLL turn-on
 /// resets `time_reftime`) and to the offset handler (the frequency loop
@@ -444,10 +458,8 @@ fn process_modes(ntp: &mut NtpState, txc: &Timex, now_sec: i64) {
     if txc.modes & ADJ_TICK != 0 {
         ntp.tick_usec = txc.tick;
     }
-    // Linux follows with ntp_update_frequency() — the tick-length recompute.
-    // NARF has no timekeeper multiplier whose length to recompute: the
-    // frequency lives in `time_freq`, reported back and consumed by the
-    // discipline loop's error accounting, not by a tick-length register.
+    // Linux follows with ntp_update_frequency() for ADJ_TICK, ADJ_FREQUENCY
+    // and ADJ_OFFSET; the caller applies the new rate (see `adjtimex`).
 }
 
 /// `kernel/time/ntp.c::ntp_update_offset_fll()`.
@@ -548,6 +560,9 @@ fn update_offset(ntp: &mut NtpState, offset: i64, now_sec: i64) {
 /// does it. Every other mode is pure NTP state and lives here.
 pub fn adjtimex(txc: &mut Timex, now_sec: i64, now_nsec: i64) -> i64 {
     let mut ntp = NTP.lock();
+    // `ntp_update_frequency`: "Don't wait for the next second_overflow,
+    // apply the change to the tick length immediately".
+    let mut new_rate = None;
 
     if txc.modes & ADJ_ADJTIME != 0 {
         // `adjtime(3)` is independent of `ntp_adjtime(3)`: the request
@@ -561,6 +576,9 @@ pub fn adjtimex(txc: &mut Timex, now_sec: i64, now_nsec: i64) -> i64 {
     } else {
         if txc.modes != 0 {
             process_modes(&mut ntp, txc, now_sec);
+            if txc.modes & (ADJ_TICK | ADJ_FREQUENCY | ADJ_OFFSET) != 0 {
+                new_rate = Some(steer_rate(&ntp));
+            }
         }
         txc.offset = shift_right(ntp.time_offset * NTP_INTERVAL_FREQ, NTP_SCALE_SHIFT);
         if ntp.time_status & STA_NANO == 0 {
@@ -593,6 +611,10 @@ pub fn adjtimex(txc: &mut Timex, now_sec: i64, now_nsec: i64) -> i64 {
     } else {
         now_nsec / NSEC_PER_USEC
     };
+    drop(ntp);
+    if let Some(rate) = new_rate {
+        crate::steer::set_rate(rate);
+    }
 
     result
 }
@@ -704,6 +726,10 @@ pub fn apply_sample(
     // frequency from the interval since the last update and stores the
     // phase in `time_offset`; `tick_second` drains it.
     update_offset(&mut ntp, offset_ns / NSEC_PER_USEC, now_sec);
+    // `ntp_update_frequency`: the learned frequency applies at once.
+    let rate = steer_rate(&ntp);
+    drop(ntp);
+    crate::steer::set_rate(rate);
     DisciplineOutcome::Slewed(offset_ns)
 }
 
@@ -716,22 +742,22 @@ pub fn apply_sample(
 ///   marked `STA_UNSYNC`, exactly as Linux does — a clock nobody has fed
 ///   for ~4.4 hours is no longer trusted. A fresh SNTP sample resets the
 ///   estimates (see [`apply_sample`]), so a polling client never trips it.
-/// * Drains `time_offset` exponentially: the chunk is
-///   `ntp_offset_chunk()` — `time_offset >> (SHIFT_PLL + time_constant)` —
-///   and when the chunk rounds to zero the whole remainder is delivered so
-///   the phase converges instead of stalling just above zero (both are
-///   Linux's `second_overflow()` verbatim). The chunk, converted back to
-///   nanoseconds, is folded into the wall offset — that is the slew, since
-///   NARF has no timekeeper multiplier to steer.
+/// * Moves one `ntp_offset_chunk()` — `time_offset >> (SHIFT_PLL +
+///   time_constant)` — of the phase, and up to `MAX_TICKADJ` of an
+///   `adjtime(3)` offset, into the coming second's rate, and hands the
+///   resulting tick length to the steered timekeeper
+///   ([`crate::steer::set_rate`]): the slew is spread over the second, on
+///   CLOCK_MONOTONIC as on CLOCK_REALTIME. One call is one second; the
+///   clockevent tick calls it once for every second that passed.
 ///
-/// IRQ-safe: one spinlock plus atomics, no blocking, no allocation. Safe
+/// IRQ-safe: the NTP lock, then the timekeeper's writer lock and the
+/// vsyscall notifier; no blocking, no allocation. Safe
 /// to call before any sample was ever applied (the boot state has
 /// `time_offset == 0`, so it is a maxerror bump and nothing else).
 ///
 /// The leap half of `second_overflow()` is deliberately not here: leap
 /// handling stays with the smear (`crate::wall::begin_leap_smear`), per the
-/// module LINUX-GAP. `time_adjust` (the `ADJ_ADJTIME` single-shot offset)
-/// is not drained either — same gap, same reason.
+/// module LINUX-GAP.
 pub fn tick_second() {
     let mut ntp = NTP.lock();
 
@@ -742,24 +768,27 @@ pub fn tick_second() {
         ntp.time_status |= STA_UNSYNC;
     }
 
-    // Compute the phase adjustment for the next second.
-    if ntp.time_offset != 0 {
-        // `ntp_offset_chunk()` (no-PPS form): exponential drain.
-        let mut chunk = shift_right(ntp.time_offset, SHIFT_PLL + ntp.time_constant as u32);
-        // Once the exponential chunk rounds to zero, deliver the last
-        // remaining offset this second so it converges to zero instead
-        // of stalling just above it.
-        if chunk == 0 {
-            chunk = ntp.time_offset;
-        }
-        // `chunk` is in `time_offset` units ((ns << 32) / 100); convert
-        // back to ns. `chunk * NTP_INTERVAL_FREQ` cannot overflow:
-        // `|time_offset|` ≤ `MAXPHASE << 32 / 100` ≈ 2.1e16, times 100
-        // is ≈ 2.1e18 < `i64::MAX`.
-        let chunk_ns = shift_right(chunk * NTP_INTERVAL_FREQ, NTP_SCALE_SHIFT);
-        ntp.time_offset -= chunk;
-        crate::wall::adjust_wall_offset_ns(chunk_ns);
+    // Compute the phase adjustment for the next second: one
+    // `ntp_offset_chunk()` leaves `time_offset` and joins the tick length.
+    // `chunk` is in `time_offset` units ((ns << 32) / NTP_INTERVAL_FREQ),
+    // so the second's share is `chunk * NTP_INTERVAL_FREQ` (ns << 32);
+    // `|time_offset|` ≤ `(MAXPHASE << 32) / 100` ≈ 2.1e16, so the product
+    // is ≤ 2.1e18 < `i64::MAX`.
+    let chunk = shift_right(ntp.time_offset, SHIFT_PLL + ntp.time_constant as u32);
+    ntp.time_offset -= chunk;
+    let mut phase = chunk * NTP_INTERVAL_FREQ;
+
+    // `adjtime(3)`: at most MAX_TICKADJ µs of the single-shot offset per
+    // second.
+    if ntp.time_adjust != 0 {
+        let take = ntp.time_adjust.clamp(-MAX_TICKADJ, MAX_TICKADJ);
+        ntp.time_adjust -= take;
+        phase += (take * NSEC_PER_USEC) << NTP_SCALE_SHIFT;
     }
+    ntp.tick_phase = phase;
+    let rate = steer_rate(&ntp);
+    drop(ntp);
+    crate::steer::set_rate(rate);
 }
 
 /// Test helper: restore the NTP state to Linux's boot defaults (see the
@@ -780,5 +809,8 @@ pub fn __test_reset() {
         time_reftime: 0,
         time_adjust: 0,
         tai_offset: 0,
+        tick_phase: 0,
     };
+    // The steered clocks go back to the counter's rate and value.
+    crate::steer::reset_to_counter();
 }

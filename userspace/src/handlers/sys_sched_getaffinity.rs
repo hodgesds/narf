@@ -28,7 +28,12 @@ pub(crate) fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
     // `unsigned long`, so every CPU fits in 64 bits.
     let online = narf_scheduler::online_cpu_set().bits();
     let nr_cpu_ids = (64 - online.leading_zeros()).max(1);
-    if len.wrapping_mul(8) < nr_cpu_ids || len & 7 != 0 {
+    // The mask is an array of `unsigned long`, or of `compat_ulong_t` for an
+    // i386 call (`compat_sys_sched_getaffinity`): `len` must be a multiple
+    // of that word, and the copy is `min(len, cpumask_size())` bytes either
+    // way — the bitmap bytes are the same in both ABIs on little-endian x86.
+    let word: u32 = if ctx.in_ia32_syscall() { 4 } else { 8 };
+    if len.wrapping_mul(8) < nr_cpu_ids || len & (word - 1) != 0 {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
@@ -44,12 +49,14 @@ pub(crate) fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
     };
     let effective = mask.intersection(narf_scheduler::online_cpu_set());
     let bytes = effective.bits().to_ne_bytes();
-    // `retlen = min(len, cpumask_size())`; `len` is a non-zero multiple of 8.
+    // `retlen = min(len, cpumask_size())`: `len` is a non-zero multiple of
+    // the word, so a compat caller may ask for 4 bytes of the 8-byte mask.
+    let retlen = (len as usize).min(bytes.len());
     // SAFETY: copy_to_user range-validates (including NULL) and
     // SMAP-brackets the write.
-    if unsafe { copy_to_user(out, &bytes) }.is_err() {
+    if unsafe { copy_to_user(out, &bytes[..retlen]) }.is_err() {
         ctx.set_return(errno_ret(EFAULT));
         return;
     }
-    ctx.set_return(SyscallReturn::ok(bytes.len() as u64));
+    ctx.set_return(SyscallReturn::ok(retlen as u64));
 }

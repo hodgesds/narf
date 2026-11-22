@@ -68,9 +68,9 @@ impl WallInstant {
 
 // ── Monotonic → wall offset ─────────────────────────────────────────
 //
-// `now_wall()` is computed as `monotonic_ns + offset_ns`. The offset
-// is atomic so a concurrent `set_wall_offset` never produces a torn
-// read.
+// `now_wall()` is computed as the NTP-steered monotonic clock
+// (`crate::steer`) plus `offset_ns`. The offset is atomic so a concurrent
+// `set_wall_offset` never produces a torn read.
 
 /// Calibration: how many cycles per nanosecond the platform ticks,
 /// as a truncated integer. Kept only for coarse callers (driver
@@ -151,6 +151,8 @@ pub fn set_clock_hz(hz: u64) {
     // Legacy truncated integer, preserved for coarse busy-wait callers.
     let cpns = (hz / 1_000_000_000).clamp(1, 6) as u32;
     CYCLES_PER_NS.store(cpns, Ordering::Release);
+    // The steered multiplier was derived from the old scale.
+    crate::steer::reset_to_counter();
 }
 
 /// Test-only: compute `cycles_to_ns(cyc)` for an explicit TSC `hz`
@@ -342,13 +344,15 @@ pub fn monotonic_ns() -> u64 {
 pub fn now_wall() -> WallInstant {
     let end = SMEAR_END_CYCLES.load(Ordering::Acquire);
     let delta = SMEAR_DELTA_NS_REMAINING.load(Ordering::Acquire);
-    let now = now_cycles();
+    // CLOCK_REALTIME is the NTP-steered clock plus the wall offset (Linux
+    // `tk->tkr_mono` + `offs_real`), not the counter clock.
+    let (steered, now) = crate::steer::snapshot_with_now();
 
     // Reuse the cycle sample that also decides the smear branch. Calling
     // monotonic_ns() here would read the clock a second time, making one
     // wall-clock observation internally span two instants and adding another
     // RDTSCP to hot timestamp-maintenance paths such as semop.
-    let base_ns = cycles_to_ns(now) as i128 + WALL_OFFSET_NS.load(Ordering::Acquire) as i128;
+    let base_ns = steered.ns_at(now) as i128 + WALL_OFFSET_NS.load(Ordering::Acquire) as i128;
 
     if end > now && delta != 0 {
         // Fold a fraction of the remaining delta proportional to how

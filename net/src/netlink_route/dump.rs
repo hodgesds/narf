@@ -25,13 +25,12 @@ use alloc::vec::Vec;
 use super::{
     build_error, build_newaddr, build_newaddr_v6, build_newlink, build_newneigh, build_newroute,
     build_newroute_v6, build_newrule, build_qdisc_messages, builtin_loopback_ipv6, enumerate_in,
-    frame_message, ifindex_for_name, nlmsg_align, parse_hdr, push_rtattr, rta_align, LinkInfo,
+    frame_message, ifindex_for_name_in, nlmsg_align, parse_hdr, push_rtattr, rta_align, LinkInfo,
     NeighInfo, AF_INET, AF_INET6, EAFNOSUPPORT, EINVAL, ENODEV, ENOENT, EOPNOTSUPP,
     NLMSGERR_ATTR_MSG, NLMSG_DONE, NLMSG_HDRLEN, NLM_F_ACK_TLVS, NLM_F_MULTI, NTF_ROUTER,
     NUD_DELAY, NUD_INCOMPLETE, NUD_PROBE, NUD_REACHABLE, NUD_STALE, RTM_GETACTION, RTM_GETADDR,
     RTM_GETADDRLABEL, RTM_GETLINK, RTM_GETMDB, RTM_GETNEIGH, RTM_GETNEXTHOP, RTM_GETQDISC,
     RTM_GETROUTE, RTM_GETRULE, RTM_GETTCLASS, RTM_GETTFILTER, RTN_LOCAL, RTN_UNICAST,
-    RTPROT_KERNEL,
 };
 
 pub const ERANGE: i32 = 34;
@@ -1070,17 +1069,23 @@ fn dump_addr6(d: &mut Dump<'_>) -> Result<(), i32> {
             }
         }
     }
-    if ifindex == 0 || ifindex == 1 {
+    // A namespace's own `lo` holds `::1` only while it is up
+    // (`addrconf_notify` → `init_loopback` on NETDEV_UP, `addrconf_ifdown`
+    // on NETDEV_DOWN); the initial namespace's `lo` is always up.
+    let loopback_up =
+        d.net_ns_id == 0 || crate::iface::namespace_loopback(d.net_ns_id).is_none_or(|lo| lo.up);
+    if loopback_up && (ifindex == 0 || ifindex == 1) {
         d.push(
             build_newaddr_v6(&builtin_loopback_ipv6(), 1, d.seq, 0),
             flags,
         );
     }
-    for addr in crate::ipv6::addrs::list_all() {
+    // `inet6_dump_addr` walks the devices of the socket's namespace only.
+    for addr in crate::ipv6::addrs::list_all_in(d.net_ns_id) {
         if addr.state == crate::ipv6::addrs::AddrState::Invalid {
             continue;
         }
-        if let Some(addr_ifindex) = ifindex_for_name(&addr.iface) {
+        if let Some(addr_ifindex) = ifindex_for_name_in(d.net_ns_id, &addr.iface) {
             if ifindex == 0 || ifindex == addr_ifindex {
                 d.push(build_newaddr_v6(&addr, addr_ifindex, d.seq, 0), flags);
             }
@@ -1220,6 +1225,14 @@ fn legacy_rtm_flags(req: &[u8]) -> u32 {
 /// The IPv4 routes NARF exposes, including the synthetic loopback route.
 fn ipv4_routes(net_ns_id: u64) -> Vec<crate::route::Route> {
     let mut routes = crate::route::route_list_in(net_ns_id);
+    // A namespace's own `lo` gets its local routes from `fib_add_ifaddr`:
+    // `local 127.0.0.0/8` only once 127.0.0.1/8 is configured and the
+    // device is up.
+    if let Some(lo) = crate::iface::namespace_loopback(net_ns_id) {
+        if !lo.up || !lo.ipv4.contains(&([127, 0, 0, 1], 8)) {
+            return routes;
+        }
+    }
     // Link/address dumps always expose loopback. Mirror that invariant in
     // route dumps even during early boot before net init installs the
     // canonical loopback FIB entry.
@@ -1296,7 +1309,7 @@ fn dump_fib4(d: &mut Dump<'_>) -> Result<(), i32> {
         } else {
             RTN_UNICAST
         };
-        if !filter.matches(RTPROT_KERNEL, rt_type, link.ifindex) {
+        if !filter.matches(route.protocol, rt_type, link.ifindex) {
             continue;
         }
         d.push(build_newroute(route, link.ifindex, d.seq, 0), flags);
@@ -1338,7 +1351,7 @@ fn dump_fib6(d: &mut Dump<'_>) -> Result<(), i32> {
         let Some(link) = links.iter().find(|link| link.name == route.iface) else {
             continue;
         };
-        if !filter.matches(RTPROT_KERNEL, RTN_UNICAST, link.ifindex) {
+        if !filter.matches(route.protocol, RTN_UNICAST, link.ifindex) {
             continue;
         }
         d.push(build_newroute_v6(&route, link.ifindex, d.seq, 0), flags);
@@ -1456,20 +1469,31 @@ fn dump_neigh(d: &mut Dump<'_>) -> Result<(), i32> {
     let family = d.family;
     let links = core::mem::take(&mut d.links);
     if family == 0 || family == AF_INET {
-        for (iface, entry) in crate::arp::snapshot() {
-            let Some(link) = links.iter().find(|link| link.name == iface) else {
+        // `neigh_dump_table` over `arp_tbl`: the table resolution uses, the
+        // one `/proc/net/arp` lists. `neigh_fill_info` carries NDA_LLADDR
+        // only for a NUD_VALID entry.
+        for entry in crate::arp_cache::snapshot_in(d.net_ns_id) {
+            let Some(link) = links.iter().find(|link| link.name == entry.iface) else {
                 continue;
             };
             if !keep(link.ifindex) {
                 continue;
             }
+            use crate::arp_cache::ArpState;
+            let (state, valid) = match entry.state {
+                ArpState::Incomplete => (NUD_INCOMPLETE, false),
+                ArpState::Reachable => (NUD_REACHABLE, true),
+                ArpState::Stale => (NUD_STALE, true),
+                ArpState::Probe => (NUD_PROBE, true),
+                ArpState::Failed => (super::NUD_FAILED, false),
+            };
             let message = build_newneigh(
                 &NeighInfo {
                     family: AF_INET,
                     dst: &entry.ip,
-                    mac: Some(entry.mac),
+                    mac: valid.then_some(entry.mac),
                     ifindex: link.ifindex,
-                    state: NUD_REACHABLE,
+                    state,
                     flags: 0,
                 },
                 d.seq,

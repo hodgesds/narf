@@ -134,39 +134,59 @@ exactly for eight-channel non-PCM (refused on a port without HBR
 capability), the converter's DIG1/DIG2 from the IEC958 state, then the
 stream format and tag. Non-PCM sets the TYPE bit in both the converter and
 the controller's SDnFMT (`snd_hdac_spdif_stream_format`). Playback offers
-stereo, 4, 6 and 8 channels up to the smallest channel ceiling among attached
-sinks, S32_LE only while every attached sink advertises 20/24-bit LPCM, and
-the 44.1–192 kHz rates every attached sink's SADs share
-(`snd_hdmi_eld_update_pcm_info`; 48 kHz if they share none, no 32 kHz); with
-no sink the converter's own limits apply. Analog codecs stay at 48 kHz.
+stereo, 4, 6 and 8 channels up to the PCM's sink's channel ceiling, S32_LE
+only while that sink advertises 20/24-bit LPCM, and the 44.1–192 kHz rates
+its SADs carry (`snd_hdmi_eld_update_pcm_info`; 48 kHz if none, no 32 kHz);
+with no sink the converter's own limits apply. Queried with no PCM named
+(`PcmDevice::capabilities` with nothing open) the limits intersect every
+attached sink. Analog codecs stay at 48 kHz.
 
-GPU codecs expose Linux's digital-output controls for the one playback PCM:
+The PCM layout is Linux patch_hdmi's with atihdmi's `static_pcm_mapping`:
+one playback PCM per HDMI pin (`min(num_cvts, num_pins)`, pin i on PCM i) at
+the device numbers `get_empty_pcm_device` gives HDMI PCMs (3, 7, 8, 9, then
+10, 11, ...), after an analog PCM at device 0 when the controller also has
+analog outputs (`PcmDevice::pcm_devices`); a controller without HDMI pins
+keeps its one PCM at device 0. An HDMI PCM streams to its own pin's
+converter and detaches the others; one playback stream runs at a time. Each
+HDMI PCM has its own "HDMI/DP,pcm=N Jack" (CARD interface,
+`generic_hdmi_build_jack`), "ELD" (PCM interface at device N,
+`hdmi_create_eld_ctl`), IEC958 set (MIXER interface at the PCM's index,
+`snd_hda_create_dig_out_ctls`) and "Playback Channel Map" (PCM interface at
+device N), placed in the ALSA id space through `PcmDevice::control_wire`.
+An HDMI-only codec has no Master controls. HDMI PCM i is named "HDMI i"
+(`PcmDevice::pcm_name`), and the card's components list
+"HDA:vendor,subsystem,revision" for each codec (`snd_component_add`).
+
+GPU codecs expose Linux's digital-output controls per HDMI PCM, each with
+its own state (Linux's per-PCM `hda_spdif_out`):
 `IEC958 Playback Con Mask`/`Pro Mask` (read-only), `IEC958 Playback Default`
-(`convert_from_spdif_status` into DIG1/DIG2 on every port's converter;
-setting AES0 non-audio selects IEC 61937 passthrough at the next prepare) and
-`IEC958 Playback Switch` (DIGEN). The state starts from the first converter's
-GET_DIGI_CONVERT_1 with DIGEN set, since no userspace hook is required to
-play. `Playback Channel Map` follows `hdmi_chmap_ctl_put`: ignored with no
-open stream, accepted while open, set up or prepared (applied at once to
-every routed port when prepared), EBUSY once running, EINVAL for positions
-past `SNDRV_CHMAP_LAST`, for maps no CA carries and (before revision 3) for
+(`convert_from_spdif_status` into DIG1/DIG2; setting AES0 non-audio selects
+IEC 61937 passthrough at the next prepare) and `IEC958 Playback Switch`
+(DIGEN). A PCM's state reaches its pin's converter only while the PCM is
+open (`snd_hda_spdif_ctls_assign` at open, unassign at close); a closed
+PCM's writes are stored for its next prepare. Every PCM's state starts from
+the first converter's GET_DIGI_CONVERT_1 with DIGEN set, since no userspace
+hook is required to play. `Playback Channel Map` is the pin's and follows
+`hdmi_chmap_ctl_put`: ignored without that PCM's stream open, accepted while
+open, set up or prepared (applied at once to its port when prepared), EBUSY once running,
+EINVAL for positions past `SNDRV_CHMAP_LAST`, for maps no CA carries and (before revision 3) for
 maps that split a slot pair. Closing the stream clears it; after a prepare it
 reports the standard layout's map (`hdmi_setup_fake_chmap`). Its TLV lists the
-CAs the primary port's speakers cover (CHMAP_VAR, or CHMAP_PAIRED with N/A
-fillers before revision 3, where an odd layout is ENODEV as in Linux). The
-primary port is the first one with a valid ELD, the same port the ELD control
-reports; mirrored ports may differ in speaker allocation and CA. The ATI codec has no ELD buffer: narf rebuilds one as `get_eld_ati`
+CAs the PCM's pin's speakers cover (CHMAP_VAR, or CHMAP_PAIRED with N/A
+fillers before revision 3, where an odd layout is ENODEV as in Linux). The primary
+port (the one the display overlay reports through) is the first one with a
+valid ELD. The ATI codec has no ELD buffer: narf rebuilds one as `get_eld_ati`
 does from the speaker allocation, sink info (revision 3+), audio descriptor
 and A/V delay verbs, and parses it as `snd_parse_eld`. Pin sense (presence
 and ELD-valid) is polled every 100 ms with the other jacks; the ELD is
-re-read only when the sense changes or the last read was unusable. A playback
-PCM routes to every port whose monitor has a valid ELD (mirroring, since a
-native card has one playback PCM), detaching the converters of the others; with
-none it routes to every port as Linux's static PCM mapping keeps pins
-attached. A port that gains a valid ELD while a stream is configured is set
-up again, as Linux update_eld does. The card exposes "HDMI/DP,pcm=0 Jack"
-(CARD interface) and "ELD" (PCM interface, volatile read-only bytes) and
-notifies subscribers when either changes. The display side (DCN Azalia
+re-read only when the sense changes or the last read was unusable. A stream
+opened outside a PCM (no device named) routes to every port whose monitor
+has a valid ELD, detaching the converters of the others, or to every port
+with none. The open PCM's port that gains a valid ELD while a stream is
+configured is set up again, as Linux update_eld does. Each PCM's jack and
+ELD (volatile read-only bytes) notify subscribers when they change; the
+display overlay (`display_sink`) reports through the primary port's PCM.
+The display side (DCN Azalia
 endpoint, ACR, AFMT) is programmed by the amdgpu modeset.
 
 `hda::probe`, `register_pci_driver`, `controller`, `capture_card`,
@@ -311,6 +331,62 @@ INTx. A direct _PRT GSI can join an existing compatible shared vector;
 named interrupt-link routes fall back to polling. A 2 ms service timer
 handles DMA accounting even without IRQ routing; jack refresh runs at 100 ms.
 
+HDA command and power model (Linux `codec_exec_verb`, `azx_rirb_get_response`,
+`azx_runtime_suspend`/`resume`). `IntelHda::send_verb` wakes a parked
+controller (`ensure_active`, Linux `snd_hda_power_up_pm`), then runs the
+command under the command lease, which a synchronous caller waits for
+(bounded) instead of failing `Busy`. A command that finds the controller
+parked under the lease is refused with `HdaError::Suspended` and wakes it
+again; `send_verb_async` (the jack service) never wakes one and returns
+`Suspended`. `Card::open`, `refresh_hdmi` and `refresh_jacks` wake the
+controller before sensing pins. Power follows Linux runtime PM: an open PCM
+holds a power reference (`power_up` at open, `power_down` at close, Linux
+`snd_hda_power_up_pm` / `_down_pm`), every command and reference drop marks
+the controller busy, and the autosuspend service (`autosuspend`) parks it
+(codecs D3, then link reset) once it has been idle for `autosuspend_ms`
+(10 s, Linux `power_save`) with no reference and no running stream; a controller
+without Linux `AZX_DCAPS_PM_RUNTIME` (`ids::runtime_pm`; 1002:1640, the ICH
+parts, the older ATI HDMI functions) suspends only its codecs (D3) and stays
+up, and the next command or jack event resumes the codecs first. The autosuspend park arms
+WAKEEN for every codec slot (`azx_runtime_suspend`); while parked, the
+autosuspend service checks STATESTS under WAKEEN every 100 ms (the link is in
+reset with the function in D0, so no PME or interrupt can arrive) and a codec
+state change wakes the controller, which disarms WAKEEN and re-reads every jack.
+Before D3 every converter still assigned a stream is cleared
+(`hda_cleanup_all_streams`: stream id and format 0). A stop
+with the PCM still open does not park it. Polled jack detection marks it
+busy every 1.5 s and so keeps it up, as Linux jackpoll does. Park and wake
+serialise on a PM lock, the park runs
+under the command lease and sets `suspended` before the reset, and the
+wake restarts the link and command I/O under the lease before the codecs
+are re-initialised with ungated commands. A command that times out or is
+cancelled poisons the transport; the next command, or `ensure_active`,
+restarts both rings (`init_cmd_io`, after `snd_hdac_bus_stop_cmd_io` /
+`snd_hdac_bus_init_cmd_io`, GCTL.UNSOL included) and a synchronous command
+is retried once, so one lost response never disables the controller. A
+command engine found stopped with the link in reset outside a park (a
+function reset or power loss) marks the controller parked for a full
+re-initialisation.
+
+Probe follows `snd_hdac_bus_reset_link` (STATESTS cleared while the link is
+up, 1 ms in reset, 1.2 ms for codec wake) and `azx_probe_codecs`: the vendor
+id of every slot in the codec mask (four slots) is read first, a slot that
+does not answer is dropped and the controller reset, then the answering
+codecs are enumerated. The AMD platform controllers 1022:1457, 1022:1487
+and 1022:15e3 (`HDA_AMD_*_DEVICE`, `amd_sb_preset`; Linux
+`AZX_DCAPS_PRESET_AMD_SB`) get ATI snooping and `AZX_DCAPS_RETRY_PROBE`: a
+codec whose enumeration times out keeps the device and retries the bring-up
+once a second, up to 59 more times. A link with no codec is not retried: as
+Linux (`no codecs found!`) it comes up and registers a card without PCMs or
+controls. A registered HDA card is named as Linux `azx_create` and
+`snd_card_register` name it: driver `HDA-Intel`, the driver type's short name
+(`card_short_name`: "HDA ATI HDMI", "HD-Audio Generic", "HDA Intel", "HDA
+Intel PCH"), the id its last word (`card_id`, made unique by the registry,
+so "HDMI", "Generic", "Generic_1"), the long name "<short name> at 0x<BAR> irq
+<n>", the mixer name "<vendor> <chip>" of the first AFG codec, and
+`codec#A` opening with `print_codec_core_info`'s header. The free-running playback position adds
+the ring wraps the elapsed time implies at the stream's own rate.
+
 ALSA stream hooks preserve DMA position and storage across pause/resume. HDA
 supports rewriting queued cyclic slots and delegates stop-threshold/silence
 policy to ALSA in free-running mode; raw native clients retain underrun checks.
@@ -330,6 +406,11 @@ must restore controller programming before ALSA RESUME.
   after copying to detect overwrite races.
 - Underrun/overrun stops the stream and requires stop/prepare recovery.
   HDA rejects a position sample gap long enough to hide a whole ring wrap.
+- No HDA command is posted into a parked controller's rings, and nothing
+  walks a parked controller's RIRB: the `suspended` check runs under the
+  command lease, and the park sets it under the same lease.
+- A command-transport failure is recoverable: the rings restart before the
+  next command; only a function that reads all-ones fails it.
 - No IRQ-safe lock crosses an await. Synchronous register waits use the
   scheduler's bounded responsive polling; timer waits release all guards.
 - IRQ handlers acknowledge their device sources and report unhandled shared

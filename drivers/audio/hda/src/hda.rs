@@ -250,4 +250,73 @@ mod renoir_bind_tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/hda", native_hda_renoir_function_binds_ns);
+
+    /// Linux binds the AMD platform HD-Audio controllers with
+    /// `AZX_DCAPS_PRESET_AMD_SB` (sound/hda/controllers/intel.c): 1022:1457
+    /// ("AMD, X370 & co"), 1022:1487 ("AMD, X570 & co") and 1022:15e3 ("AMD
+    /// Raven", which is also the Ryzen 7000 desktop's board-codec
+    /// controller). NARF bound only 15e3, and named it after Phoenix, an APU
+    /// it is not specific to: the Ryzen 5 7600X desktop's analog codec sits
+    /// behind it.
+    fn native_hda_amd_platform_controllers_bind() -> TestResult {
+        for device in [0x1457u16, 0x1487, 0x15e3] {
+            let Some(&(name, _, _)) = HDA_PCI_IDS
+                .iter()
+                .find(|&&(_, v, d)| v == 0x1022 && d == device)
+            else {
+                return TestResult::Fail("an AMD platform HD-Audio controller is not bound");
+            };
+            if name.contains("phoenix") {
+                return TestResult::Fail("1022:15e3 is no Phoenix-specific controller");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/hda/amd-sb", native_hda_amd_platform_controllers_bind);
+
+    /// The AMD SB preset (and with it `AZX_DCAPS_RETRY_PROBE`) covers the
+    /// platform controllers only: the GPU HD-Audio functions take the ATI
+    /// HDMI presets, and the vendor gate keeps another vendor's 0x15e3 out.
+    fn native_hda_amd_sb_preset_retries_platform_probes() -> TestResult {
+        for device in [0x1457u16, 0x1487, 0x15e3] {
+            if !amd_sb_preset(HDA_AMD_VENDOR, device) {
+                return TestResult::Fail("AMD platform controller without the AMD SB preset");
+            }
+        }
+        if amd_sb_preset(HDA_AMD_RADEON_VENDOR, HDA_AMD_RADEON_DEVICE)
+            || amd_sb_preset(HDA_AMD_RADEON_VENDOR, 0xab28)
+            || amd_sb_preset(0x8086, HDA_AMD_ZEN_DEVICE)
+        {
+            return TestResult::Fail("the AMD SB preset is for 1022 platform controllers only");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/hda/amd-sb",
+        native_hda_amd_sb_preset_retries_platform_probes
+    );
+
+    /// Linux `driver_short_names[]` by driver type and the card id
+    /// `snd_card_register` takes from the short name's last word: "HDMI" for
+    /// the Navi21/23 HDMI/DP function, "Generic" for the Raphael iGPU audio
+    /// and the AMD platform controller, "Intel" / "PCH" on Intel.
+    fn native_hda_card_names_follow_linux_driver_types() -> TestResult {
+        for (vendor, device, short, id) in [
+            (0x1002, 0xab28, "HDA ATI HDMI", "HDMI"),
+            (0x1002, 0x1640, "HD-Audio Generic", "Generic"),
+            (0x1022, 0x15e3, "HD-Audio Generic", "Generic"),
+            (0x8086, 0x293e, "HDA Intel", "Intel"),
+            (0x8086, 0x7ad0, "HDA Intel PCH", "PCH"),
+        ] {
+            let name = card_short_name(vendor, device);
+            if name != short || card_id(name) != id {
+                return TestResult::Fail("card short name or id differs from Linux");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/hda/card-names",
+        native_hda_card_names_follow_linux_driver_types
+    );
 }

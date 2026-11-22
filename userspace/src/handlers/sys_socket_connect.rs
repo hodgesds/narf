@@ -85,7 +85,10 @@ fn inet_wait_for_connect(
         let syn_retries = sock.tcp_syncnt();
         let ret = match sock.kernel_tcb_id() {
             Some(id) => {
-                let options = narf_net::tcp_stack::ConnectOptions { syn_retries };
+                let options = narf_net::tcp_stack::ConnectOptions {
+                    syn_retries,
+                    ..Default::default()
+                };
                 let _ = narf_net::tcp_stack::connect_wait(id, options);
                 match sock.inet_connect_progress() {
                     Some(crate::socket::SocketOpResult::Ok(_)) | None => SyscallReturn::ok(0),

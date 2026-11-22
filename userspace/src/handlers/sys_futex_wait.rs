@@ -85,7 +85,7 @@ pub(crate) fn futex2_deadline(timeout_ptr: u64, clockid: i32) -> Result<Option<u
     }
     // "Since there's no opcode for futex_waitv, use FUTEX_WAIT_BITSET that
     // uses absolute timeout as well" — futex2 deadlines are always absolute.
-    futex_timeout_deadline(timeout_ptr, true, clockid == FUTEX2_CLOCK_REALTIME)
+    futex_timeout_deadline(timeout_ptr, true, clockid == FUTEX2_CLOCK_REALTIME, false)
 }
 
 /// `kernel/futex/syscalls.c::SYSCALL_DEFINE6(futex_wait)` — futex2's split

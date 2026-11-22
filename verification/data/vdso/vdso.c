@@ -4,10 +4,12 @@
 // every process and points AT_SYSINFO_EHDR at the ELF header here. libc
 // (and the NARF vdso smoke) resolve the versioned symbols below and call
 // them to read the clock WITHOUT a syscall: each reads the CPU counter
-// (rdtsc / cntvct) and converts using the cycles_per_ns + wall_offset the
-// kernel publishes in the vvar page — the exact same arithmetic the
-// clock_gettime syscall does, so results match bit-for-bit. Unsupported
-// clocks fall back to the real syscall.
+// (rdtsc / cntvct) and converts it with the timekeeper the kernel publishes
+// in the vvar page (Linux `update_vsyscall`) — the NTP-steered
+// cycle_last/base_ns/mult/shift for CLOCK_MONOTONIC, BOOTTIME and REALTIME,
+// the counter's own raw_mult/raw_shift for CLOCK_MONOTONIC_RAW — the exact
+// same arithmetic the clock_gettime syscall does, so results match
+// bit-for-bit. Unsupported clocks fall back to the real syscall.
 //
 // The vvar page is mapped immediately before this object, so it lives at
 // `__ehdr_start - 4096` (a hidden, PC-relative reference — no GOT, no
@@ -22,10 +24,14 @@ struct vvar {
     uint32_t seq; // seqlock: odd while the kernel is updating
     uint32_t cycles_per_ns; // legacy truncated cyc/ns (coarse fallback only)
     int64_t wall_offset_ns; // realtime_ns = monotonic_ns + wall_offset_ns
-    uint32_t mult; // cycles→ns fixed-point: ns = (cyc * mult) >> shift
-    uint32_t shift; // == time crate C2N_MULT / C2N_SHIFT
+    uint32_t mult; // steered: ns = base_ns + ((cyc - cycle_last) * mult) >> shift
+    uint32_t shift; // == narf_time::steer::params()
     uint64_t suspended_cycles; // counter cycles spent suspended (MONOTONIC excludes them)
     uint64_t boot_offset_ns; // offs_boot: BOOTTIME = MONOTONIC + this
+    uint64_t cycle_last; // steered timekeeper anchor (monotonic counter cycles)
+    uint64_t base_ns; // steered CLOCK_MONOTONIC at cycle_last
+    uint32_t raw_mult; // CLOCK_MONOTONIC_RAW: ns = (cyc * raw_mult) >> raw_shift
+    uint32_t raw_shift; // == time crate C2N_MULT / C2N_SHIFT
 };
 
 struct vdso_timespec {
@@ -50,8 +56,10 @@ extern const char __ehdr_start[] __attribute__((visibility("hidden")));
 
 static inline uint64_t read_cycles(void) {
 #if defined(__x86_64__)
+    // `rdtsc_ordered`: the LFENCE keeps the read after the seqlock load
+    // that precedes it, as the kernel's `raw_cycles` does.
     uint32_t lo, hi;
-    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)::"memory");
+    __asm__ __volatile__("lfence\n\trdtsc" : "=a"(lo), "=d"(hi)::"memory");
     return ((uint64_t)hi << 32) | lo;
 #elif defined(__aarch64__)
     uint64_t v;
@@ -69,8 +77,8 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
     const volatile struct vvar *vv = VVAR;
     uint32_t cpns;
     int64_t off;
-    uint32_t mult, shift;
-    uint64_t suspended, boot_off;
+    uint32_t mult, shift, raw_mult, raw_shift;
+    uint64_t suspended, boot_off, cycle_last, base_ns, cyc;
     for (;;) {
         uint32_t seq = __atomic_load_n(&vv->seq, __ATOMIC_ACQUIRE);
         if (seq & 1u) {
@@ -82,30 +90,48 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
         shift = vv->shift;
         suspended = vv->suspended_cycles;
         boot_off = vv->boot_offset_ns;
+        cycle_last = vv->cycle_last;
+        base_ns = vv->base_ns;
+        raw_mult = vv->raw_mult;
+        raw_shift = vv->raw_shift;
+        // Read the counter inside the section, as the kernel does, so a
+        // re-anchor between the snapshot and the read is retried and the
+        // clock never steps back.
+        // Monotonic counter time excludes time spent suspended, as the
+        // kernel's `now_cycles()` does.
+        cyc = read_cycles() - suspended;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (seq == __atomic_load_n(&vv->seq, __ATOMIC_ACQUIRE)) {
             break;
         }
     }
-    // Match the kernel's monotonic_ns() bit-for-bit: ns = (cyc * mult) >> shift
-    // (exact to <1 ppm). The truncated cyc/cpns is only a pre-calibration
-    // fallback — using it for an absolute deadline (TFD_TIMER_ABSTIME) skews
-    // the wakeup by ~0.1·uptime against the kernel timerfd timebase.
-    // Monotonic counter time excludes time spent suspended, as the kernel's
-    // `now_cycles()` does.
-    uint64_t cyc = read_cycles() - suspended;
+    // Match the kernel bit-for-bit (exact to <1 ppm): the steered
+    // `narf_time::steer` clock for MONOTONIC/BOOTTIME/REALTIME, the counter
+    // clock `monotonic_ns()` for MONOTONIC_RAW. The truncated cyc/cpns is
+    // only a pre-calibration fallback — using it for an absolute deadline
+    // (TFD_TIMER_ABSTIME) skews the wakeup by ~0.1·uptime against the kernel
+    // timerfd timebase.
+    if (cpns == 0) {
+        cpns = 1;
+    }
     uint64_t ns;
     if (mult != 0) {
-        ns = (uint64_t)(((unsigned __int128)cyc * mult) >> shift);
+        uint64_t delta = cyc > cycle_last ? cyc - cycle_last : 0;
+        ns = base_ns + (uint64_t)(((unsigned __int128)delta * mult) >> shift);
     } else {
-        if (cpns == 0) {
-            cpns = 1;
-        }
         ns = cyc / (uint64_t)cpns;
+    }
+    uint64_t raw_ns;
+    if (raw_mult != 0) {
+        raw_ns = (uint64_t)(((unsigned __int128)cyc * raw_mult) >> raw_shift);
+    } else {
+        raw_ns = cyc / (uint64_t)cpns;
     }
     switch (clk) {
     case CLOCK_MONOTONIC:
+        break;
     case CLOCK_MONOTONIC_RAW:
+        ns = raw_ns;
         break;
     case CLOCK_BOOTTIME:
         ns += boot_off;

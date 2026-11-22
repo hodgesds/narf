@@ -244,12 +244,13 @@ pub struct UserState {
     pub valid: u64,
 }
 
-/// User-code segment selector (DPL=3). Matches the GDT layout in
-/// `narf-frame`. Hard-coded here because we can't pull `narf-frame`
-/// (the kernel binary) into a library dep.
-const UCODE_SEL: u64 = 0x33;
-/// User-data segment selector (DPL=3).
-const UDATA_SEL: u64 = 0x2B;
+/// User-code segment selector (DPL=3, `__USER_CS`). The GDT layout lives in
+/// `crate::x86_64::segments`; `narf-frame` builds the tables from it.
+const UCODE_SEL: u64 = crate::x86_64::segments::USER_CS as u64;
+/// User-data segment selector (DPL=3, `__USER_DS`).
+const UDATA_SEL: u64 = crate::x86_64::segments::USER_DS as u64;
+/// 32-bit user-code selector (DPL=3, `__USER32_CS`): compatibility mode.
+const UCODE32_SEL: u64 = crate::x86_64::segments::USER32_CS as u64;
 
 /// RFLAGS value to hand user mode: IF=1 (interrupts enabled), the
 /// always-set reserved bit at position 1. Everything else zero —
@@ -631,5 +632,204 @@ pub unsafe extern "C" fn enter_user_mode_resume_at_top(
         "iretq",
         udata = const UDATA_SEL,
         ucode = const UCODE_SEL,
+    );
+}
+
+// ── Compatibility-mode (IA-32) entry ────────────────────────────────
+//
+// The same transfers with CS = `__USER32_CS` (0x23), so the task runs its
+// code as i386 (Linux `start_thread_ia32` / a compat task's `iret`). The
+// first-entry forms also load the data segments `start_thread_common` gives
+// a fresh image — DS = ES = `__USER_DS`, FS = GS = 0 — with zero hidden
+// bases on every vendor: FS and GS are loaded with `__USER_DS` (base 0)
+// before the null selector, since AMD keeps the old base on a null load
+// (Linux `X86_BUG_NULL_SEG`). GS is loaded after the exit `swapgs`, while
+// the user's GS base is the live one; a null or `__USER_DS` load cannot
+// fault. SS = `__USER_DS` comes from the iretq frame. The resume forms load
+// no data segment: a resumed task's selectors are its own, restored by the
+// scheduler's switch-in (`stackful::set_current_user_segments` for a
+// fork/clone child's first run).
+
+/// [`enter_user_mode_at_top`] for an IA-32 image: reset RSP to the task's
+/// own kernel-stack top, load the fresh-image data segments and `iretq` to
+/// `eip`/`esp` in compatibility mode with every GPR zeroed.
+///
+/// SysV: `eip`=rdi, `esp`=rsi, `stack_top`=rdx.
+///
+/// # Safety
+/// As [`enter_user_mode_at_top`]; in addition `eip` and `esp` are below
+/// 4 GiB (inside the flat 32-bit segments). The image starts with FS and
+/// GS bases of 0 whatever the caller wrote.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_compat_at_top(eip: u64, esp: u64, stack_top: u64) -> ! {
+    naked_asm!(
+        "cli",
+        "mov rsp, rdx",
+        "mov ax, {udata}",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "xor ecx, ecx",
+        "mov fs, cx",
+        "swapgs",
+        "mov gs, ax",
+        "mov gs, cx",
+        "push {udata}",                   // ss
+        "push rsi",                       // user esp
+        "push {rflags}",                  // rflags (IF=1)
+        "push {ucode32}",                 // cs = __USER32_CS
+        "push rdi",                       // eip
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
+        "iretq",
+        udata   = const UDATA_SEL,
+        ucode32 = const UCODE32_SEL,
+        rflags  = const USER_RFLAGS,
+    );
+}
+
+/// [`enter_user_mode`] for an IA-32 image (the longjmp model's first
+/// entry): load the fresh-image data segments and `iretq` to `eip`/`esp`
+/// in compatibility mode with every GPR zeroed.
+///
+/// SysV: `eip`=rdi, `esp`=rsi.
+///
+/// # Safety
+/// As [`enter_user_mode_compat_at_top`], without the stack reset.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_compat(eip: u64, esp: u64) -> ! {
+    naked_asm!(
+        "mov ax, {udata}",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "xor ecx, ecx",
+        "mov fs, cx",
+        "swapgs",
+        "mov gs, ax",
+        "mov gs, cx",
+        "push {udata}",                   // ss
+        "push rsi",                       // user esp
+        "push {rflags}",                  // rflags (IF=1)
+        "push {ucode32}",                 // cs = __USER32_CS
+        "push rdi",                       // eip
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
+        "iretq",
+        udata   = const UDATA_SEL,
+        ucode32 = const UCODE32_SEL,
+        rflags  = const USER_RFLAGS,
+    );
+}
+
+/// [`enter_user_mode_resume_at_top`] for a task that runs in compatibility
+/// mode (a fork/clone child of an IA-32 task): resume `*state` with CS =
+/// `__USER32_CS` on the empty top of the task's kernel stack.
+///
+/// SysV: `state`=rdi, `stack_top`=rsi.
+///
+/// # Safety
+/// As [`enter_user_mode_resume_at_top`]; the task's data segments are
+/// already loaded.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_compat_resume_at_top(
+    state: *const UserState,
+    stack_top: u64,
+) -> ! {
+    naked_asm!(
+        "cli",
+        "mov rsp, rsi",
+        "mov rax, {udata}",
+        "push rax",                       // ss
+        "push qword ptr [rdi + 8*17]",    // user rsp
+        "push qword ptr [rdi + 8*16]",    // rflags
+        "mov rax, {ucode32}",
+        "push rax",                       // cs = __USER32_CS
+        "push qword ptr [rdi + 8*15]",    // rip
+        "mov r15, [rdi + 8*0]",
+        "mov r14, [rdi + 8*1]",
+        "mov r13, [rdi + 8*2]",
+        "mov r12, [rdi + 8*3]",
+        "mov r11, [rdi + 8*4]",
+        "mov r10, [rdi + 8*5]",
+        "mov r9,  [rdi + 8*6]",
+        "mov r8,  [rdi + 8*7]",
+        "mov rbp, [rdi + 8*8]",
+        "mov rsi, [rdi + 8*10]",
+        "mov rdx, [rdi + 8*11]",
+        "mov rcx, [rdi + 8*12]",
+        "mov rbx, [rdi + 8*13]",
+        "mov rax, [rdi + 8*14]",
+        "mov rdi, [rdi + 8*9]",
+        "swapgs",
+        "iretq",
+        udata   = const UDATA_SEL,
+        ucode32 = const UCODE32_SEL,
+    );
+}
+
+/// [`enter_user_mode_resume`] for a task that runs in compatibility mode
+/// (the longjmp model): resume `*state` with CS = `__USER32_CS`.
+///
+/// SysV: `state`=rdi.
+///
+/// # Safety
+/// As [`enter_user_mode_resume`]; the task's data segments are already
+/// loaded.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_compat_resume(state: *const UserState) -> ! {
+    naked_asm!(
+        "mov rax, {udata}",
+        "push rax",                       // ss
+        "push qword ptr [rdi + 8*17]",    // user rsp
+        "push qword ptr [rdi + 8*16]",    // rflags
+        "mov rax, {ucode32}",
+        "push rax",                       // cs = __USER32_CS
+        "push qword ptr [rdi + 8*15]",    // rip
+        "mov r15, [rdi + 8*0]",
+        "mov r14, [rdi + 8*1]",
+        "mov r13, [rdi + 8*2]",
+        "mov r12, [rdi + 8*3]",
+        "mov r11, [rdi + 8*4]",
+        "mov r10, [rdi + 8*5]",
+        "mov r9,  [rdi + 8*6]",
+        "mov r8,  [rdi + 8*7]",
+        "mov rbp, [rdi + 8*8]",
+        "mov rsi, [rdi + 8*10]",
+        "mov rdx, [rdi + 8*11]",
+        "mov rcx, [rdi + 8*12]",
+        "mov rbx, [rdi + 8*13]",
+        "mov rax, [rdi + 8*14]",
+        "mov rdi, [rdi + 8*9]",
+        "swapgs",
+        "iretq",
+        udata   = const UDATA_SEL,
+        ucode32 = const UCODE32_SEL,
     );
 }

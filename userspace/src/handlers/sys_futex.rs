@@ -97,7 +97,12 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     } else if has_timeout && args.arg3 != 0 {
         // FUTEX_LOCK_PI's deadline is always CLOCK_REALTIME (`do_futex`
         // sets FLAGS_CLOCKRT for it); FUTEX_LOCK_PI2 follows the flag.
-        match futex_timeout_deadline(args.arg3, cmd != FUTEX_WAIT, realtime || cmd == FUTEX_LOCK_PI) {
+        match futex_timeout_deadline(
+            args.arg3,
+            cmd != FUTEX_WAIT,
+            realtime || cmd == FUTEX_LOCK_PI,
+            ctx.ia32_abi().time32,
+        ) {
             Ok(d) => d,
             Err(errno) => {
                 ctx.set_return(SyscallReturn::ok((-errno) as u64));

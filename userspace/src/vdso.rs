@@ -59,10 +59,14 @@ pub(crate) const VDSO_CODE_PERMS: RegionPerms = RegionPerms(
 const VVAR_SEQ: usize = 0; // u32
 const VVAR_CPNS: usize = 4; // u32
 const VVAR_OFF: usize = 8; // i64
-const VVAR_MULT: usize = 16; // u32 — cycles→ns fixed-point multiplier
-const VVAR_SHIFT: usize = 20; // u32 — cycles→ns fixed-point shift
+const VVAR_MULT: usize = 16; // u32 — steered cycles→ns multiplier (`tkr_mono.mult`)
+const VVAR_SHIFT: usize = 20; // u32 — cycles→ns shift
 const VVAR_SUSPENDED: usize = 24; // u64 — counter cycles spent suspended
 const VVAR_BOOT_OFF: usize = 32; // u64 — offs_boot: BOOTTIME − MONOTONIC (ns)
+const VVAR_CYCLE_LAST: usize = 40; // u64 — steered timekeeper anchor (`cycle_last`)
+const VVAR_BASE_NS: usize = 48; // u64 — steered ns at the anchor (`basetime`)
+const VVAR_RAW_MULT: usize = 56; // u32 — the counter's own multiplier (`tkr_raw`)
+const VVAR_RAW_SHIFT: usize = 60; // u32 — the counter's own shift
 
 struct VdsoImage {
     vvar_frame: PhysAddr,
@@ -137,8 +141,10 @@ pub fn register_vdso_image(bytes: &[u8], cycles_per_ns: u32) {
         vdso_frames: frames,
     });
     // Every clock step or resume (`clock_was_set`) republishes the clock
-    // data: the wall offset, the suspend offset and `offs_boot`.
+    // data: the wall offset, the suspend offset and `offs_boot`; every NTP
+    // re-anchor of the steered timekeeper does too (`update_vsyscall`).
     narf_scheduler::narf_time::hrtimer::set_clock_was_set_notifier(republish);
+    narf_scheduler::narf_time::steer::set_vsyscall_notifier(republish);
 }
 
 /// `clock_was_set` notifier: republish the current clock data.
@@ -222,12 +228,16 @@ fn read_u32(frame: PhysAddr, off: usize) -> u32 {
 /// Write the vvar fields under a seqlock: bump seq to odd, store the
 /// payload, bump to even. Readers retry while seq is odd or changes.
 ///
-/// `mult`/`shift` are the calibrated cycles→ns fixed-point pair (the vDSO
-/// computes `ns = (cyc * mult) >> shift`, matching `monotonic_ns`); they are
-/// pulled from the live clock calibration so a re-publish always reflects the
-/// current scale.
+/// `update_vsyscall`: the steered timekeeper (`narf_time::steer::params`)
+/// the vDSO's CLOCK_MONOTONIC, BOOTTIME and REALTIME are computed from —
+/// `ns = base_ns + ((cyc - cycle_last) * mult) >> shift`, exactly the
+/// kernel's arithmetic — and the counter's own scale for
+/// CLOCK_MONOTONIC_RAW (`ns = (cyc * raw_mult) >> raw_shift`, the kernel's
+/// `monotonic_ns`). Both come from live state, so a re-publish always
+/// reflects the current scale and rate.
 fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
-    let (mult, shift) = narf_scheduler::narf_time::cyc_to_ns_mult_shift();
+    let steered = narf_scheduler::narf_time::steer::params();
+    let (raw_mult, raw_shift) = narf_scheduler::narf_time::cyc_to_ns_mult_shift();
     let base = frame.kernel_mut_ptr::<u8>();
     // SAFETY: identity-mapped vvar frame; all offsets within the page.
     unsafe {
@@ -237,8 +247,12 @@ fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
         fence(Ordering::Release);
         core::ptr::write_volatile(base.add(VVAR_CPNS) as *mut u32, cycles_per_ns);
         core::ptr::write_volatile(base.add(VVAR_OFF) as *mut i64, offset_ns);
-        core::ptr::write_volatile(base.add(VVAR_MULT) as *mut u32, mult);
-        core::ptr::write_volatile(base.add(VVAR_SHIFT) as *mut u32, shift);
+        core::ptr::write_volatile(base.add(VVAR_MULT) as *mut u32, steered.mult);
+        core::ptr::write_volatile(base.add(VVAR_SHIFT) as *mut u32, steered.shift);
+        core::ptr::write_volatile(base.add(VVAR_CYCLE_LAST) as *mut u64, steered.cycle_last);
+        core::ptr::write_volatile(base.add(VVAR_BASE_NS) as *mut u64, steered.base_ns);
+        core::ptr::write_volatile(base.add(VVAR_RAW_MULT) as *mut u32, raw_mult);
+        core::ptr::write_volatile(base.add(VVAR_RAW_SHIFT) as *mut u32, raw_shift);
         core::ptr::write_volatile(
             base.add(VVAR_SUSPENDED) as *mut u64,
             narf_scheduler::narf_time::suspended_cycles(),
@@ -250,4 +264,90 @@ fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
         fence(Ordering::Release);
         core::ptr::write_volatile(seq_ptr, (seq | 1).wrapping_add(1)); // even
     }
+}
+
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// `update_vsyscall` publishes the steered timekeeper, the clock data the
+    /// vDSO's CLOCK_MONOTONIC, BOOTTIME and REALTIME are computed from
+    /// (`vdso_clock`'s `cycle_last`, `basetime`, `mult`, `shift`), and the
+    /// counter's own scale for CLOCK_MONOTONIC_RAW. `struct vvar` in
+    /// `verification/data/vdso/vdso.c`: `mult`/`shift` at 16/20 are the steered
+    /// pair, `cycle_last` at 40, `base_ns` at 48, `raw_mult`/`raw_shift` at
+    /// 56/60. While `adjtimex` holds +500 ppm, the published multiplier must be
+    /// the steered one, and the vDSO's arithmetic on the page must agree with
+    /// the kernel's CLOCK_MONOTONIC and CLOCK_MONOTONIC_RAW.
+    fn smoke_vdso_vvar_publishes_the_steered_clock() -> TestResult {
+        use narf_scheduler::narf_time;
+        let Some(frame) = VDSO.lock().as_ref().map(|img| img.vvar_frame) else {
+            return TestResult::Skip("no vDSO image registered");
+        };
+        let read_u64 = |off: usize| {
+            // SAFETY: identity-mapped vvar frame; off+8 <= 4096.
+            unsafe { core::ptr::read_volatile(frame.kernel_ptr::<u8>().add(off) as *const u64) }
+        };
+        narf_time::ntp::__test_reset();
+        let mut tx = narf_time::ntp::Timex {
+            modes: narf_time::ntp::ADJ_FREQUENCY,
+            freq: 500 << 16,
+            ..Default::default()
+        };
+        let _ = narf_time::ntp::adjtimex(&mut tx, 0, 0);
+        let verdict = (|| {
+            let (raw_mult, raw_shift) = narf_time::cyc_to_ns_mult_shift();
+            // One consistent copy of the page, under its seqlock.
+            let (mult, shift, cycle_last, base_ns, vraw_mult, vraw_shift) = loop {
+                let seq = read_u32(frame, VVAR_SEQ);
+                if seq & 1 != 0 {
+                    continue;
+                }
+                fence(Ordering::Acquire);
+                let page = (
+                    read_u32(frame, VVAR_MULT),
+                    read_u32(frame, VVAR_SHIFT),
+                    read_u64(VVAR_CYCLE_LAST),
+                    read_u64(VVAR_BASE_NS),
+                    read_u32(frame, VVAR_RAW_MULT),
+                    read_u32(frame, VVAR_RAW_SHIFT),
+                );
+                fence(Ordering::Acquire);
+                if read_u32(frame, VVAR_SEQ) == seq {
+                    break page;
+                }
+            };
+            let want = u64::from(raw_mult) + u64::from(raw_mult) / 2000;
+            if u64::from(mult).abs_diff(want) > 2 {
+                return Err("the vvar multiplier is not the +500 ppm steered one");
+            }
+            if vraw_mult != raw_mult || vraw_shift != raw_shift {
+                return Err("the vvar raw scale is not the counter's");
+            }
+            let (mono, raw, cyc) = narf_lib::sync::without_interrupts(|| {
+                let cyc = narf_time::now_cycles();
+                (
+                    narf_time::steer::monotonic_ns(),
+                    narf_time::monotonic_ns(),
+                    cyc,
+                )
+            });
+            let since = u128::from(cyc.saturating_sub(cycle_last));
+            let vdso_mono = base_ns + ((since * u128::from(mult)) >> shift) as u64;
+            let vdso_raw = ((u128::from(cyc) * u128::from(vraw_mult)) >> vraw_shift) as u64;
+            if vdso_mono.abs_diff(mono) > 2_000 {
+                return Err("the vDSO's CLOCK_MONOTONIC disagrees with the kernel's");
+            }
+            if vdso_raw.abs_diff(raw) > 2_000 {
+                return Err("the vDSO's CLOCK_MONOTONIC_RAW disagrees with the kernel's");
+            }
+            Ok(())
+        })();
+        narf_time::ntp::__test_reset();
+        match verdict {
+            Ok(()) => TestResult::Pass,
+            Err(why) => TestResult::Fail(why),
+        }
+    }
+    kernel_test_in!("vdso/steer", smoke_vdso_vvar_publishes_the_steered_clock);
 }

@@ -88,6 +88,10 @@ pub struct FileSystemType {
     pub requires_device: bool,
     /// Permit `name.subtype` lookups, e.g. `fuse.sshfs`.
     pub subtypes: bool,
+    /// Whether `/proc/filesystems` lists the name. A NARF alias that
+    /// `mount(2)` accepts for a Linux type (`shm`, `procfs`, `fat32`, ...) is
+    /// not a registered Linux type, so it is left out (see [`Self::alias`]).
+    pub listed: bool,
     constructor: Constructor,
 }
 
@@ -97,8 +101,16 @@ impl FileSystemType {
             name,
             requires_device: false,
             subtypes: false,
+            listed: true,
             constructor: Constructor::Context(init),
         }
+    }
+
+    /// This descriptor as an alias: mountable by name, not listed in
+    /// `/proc/filesystems`, which lists only registered Linux types.
+    pub const fn alias(mut self) -> Self {
+        self.listed = false;
+        self
     }
 
     pub fn init(&self, request: &MountRequest<'_>) -> Result<Arc<dyn FsInstance>, FsError> {
@@ -157,6 +169,7 @@ pub fn register_fstype(name: &'static str, builder: FsBuilder) {
         name,
         requires_device: false,
         subtypes: false,
+        listed: true,
         constructor: Constructor::Simple(builder),
     });
 }
@@ -175,8 +188,24 @@ pub fn register_block_fstype_ctx(name: &'static str, init: FsInit) {
         name,
         requires_device: true,
         subtypes: false,
+        listed: true,
         constructor: Constructor::Context(init),
     });
+}
+
+/// [`register_block_fstype_ctx`] for a NARF alias of a Linux type
+/// ([`FileSystemType::alias`]).
+pub fn register_block_fstype_alias_ctx(name: &'static str, init: FsInit) {
+    register_fs_type(
+        FileSystemType {
+            name,
+            requires_device: true,
+            subtypes: false,
+            listed: true,
+            constructor: Constructor::Context(init),
+        }
+        .alias(),
+    );
 }
 
 pub fn register_block_fstype(name: &'static str, builder: FsBuilder) {
@@ -184,6 +213,7 @@ pub fn register_block_fstype(name: &'static str, builder: FsBuilder) {
         name,
         requires_device: true,
         subtypes: false,
+        listed: true,
         constructor: Constructor::Simple(builder),
     });
 }

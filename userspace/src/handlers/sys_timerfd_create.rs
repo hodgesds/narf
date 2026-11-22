@@ -54,12 +54,13 @@ pub(crate) fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
     let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
 
     // The fd's hrtimer runs on its clock's base. The ALARM clocks run on
-    // their base clock (NARF has no RTC wake alarm).
+    // their base clock (NARF has no RTC wake alarm). CLOCK_MONOTONIC is the
+    // NTP-steered clock programs read, not the kernel's counter clock.
     use narf_scheduler::narf_time::hrtimer::ClockId;
     let clock = match clockid {
         CLOCK_REALTIME | CLOCK_REALTIME_ALARM => ClockId::Realtime,
         CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => ClockId::Boottime,
-        _ => ClockId::Monotonic,
+        _ => ClockId::MonotonicSteered,
     };
     let tfd = crate::io_mux::TimerFd::new(clock);
     timerfd_arc_register(&tfd);

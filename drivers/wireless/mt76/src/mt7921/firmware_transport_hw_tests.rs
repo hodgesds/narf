@@ -59,9 +59,9 @@ fn rig_with(
         },
     };
     let storage = Storage {
-        wm: Ring::allocate_for(dma, TX_WM, false)?,
-        fwdl: Ring::allocate_for(dma, TX_FWDL, false)?,
-        data: Ring::allocate_for(dma, TX_DATA, false)?,
+        wm: Ring::allocate_for(dma, TX_WM, false, DEPTH)?,
+        fwdl: Ring::allocate_for(dma, TX_FWDL, false, DEPTH)?,
+        data: Ring::allocate_for(dma, TX_DATA, false, DEPTH)?,
         data_dma: 0,
         tokens: packet_tx::Tokens::new(),
         // The descriptor fixtures pin exact TXD words and PIDs; the
@@ -73,9 +73,9 @@ fn rig_with(
         receive_open: false,
         p2p_capture: super::super::p2p_management_capture::Queue::new(),
         rx: [
-            Ring::allocate_for(dma, RX_PRE, true)?,
-            Ring::allocate_for(dma, RX_POST, true)?,
-            Ring::allocate_for(dma, RX_DATA, true)?,
+            Ring::allocate_for(dma, RX_PRE, true, DEPTH)?,
+            Ring::allocate_for(dma, RX_POST, true, DEPTH)?,
+            Ring::allocate_for(dma, RX_DATA, true, DEPTH)?,
         ],
     };
     Ok((
@@ -1411,4 +1411,54 @@ fn mcu_interrupt_pass_masks_acknowledges_and_unmasks_like_the_tasklet() -> TestR
 kernel_test_in!(
     "drivers/wireless/mt7921/tx",
     mcu_interrupt_pass_masks_acknowledges_and_unmasks_like_the_tasklet
+);
+
+/// The RX rings are sized as Linux `mt7921_dma_init` sizes them for the
+/// function: the MCU event ring `MT7921_RX_MCU_RING_SIZE` (8), the MCU WA
+/// ring `MT7921_RX_MCU_WA_RING_SIZE` (512) and the data ring
+/// `MT7921_RX_RING_SIZE` (1536). Every function this driver binds has
+/// `has_mcu_wa` and the 8-entry event ring (only MT7902 differs). Each ring
+/// is armed in every slot and programmed with its own descriptor count.
+fn mcu_rx_rings_are_sized_as_linux_mt7921_dma_init() -> TestResult {
+    for device in [0x0608u16, 0x0616, 0x7920, 0x7922, 0x7961] {
+        let layout = dma_layout(device);
+        if (layout.rx_event, layout.rx_wa, layout.rx_data) != (8, 512, 1536) {
+            return TestResult::Fail("the RX rings are not sized as mt7921_dma_init sizes them");
+        }
+    }
+    let (words, hw) = match rig() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("allocation"),
+    };
+    let storage = match allocate_storage(&narf_io::DmaDevice::coherent(), dma_layout(0x0616)) {
+        Ok(storage) => storage,
+        Err(_) => return TestResult::Fail("the Linux-sized rings could not be allocated"),
+    };
+    let slots = [
+        storage.rx[0].buffers.len(),
+        storage.rx[1].buffers.len(),
+        storage.rx[2].buffers.len(),
+    ];
+    if slots != [8, 512, 1536] {
+        return TestResult::Fail("the allocated RX rings do not have the layout's slots");
+    }
+    for ring in &storage.rx {
+        let depth = ring.buffers.len();
+        if (0..depth).any(|slot| ring.word(slot, 0) != ring.buffers[slot].dma_addr().raw() as u32) {
+            return TestResult::Fail("an RX slot is not armed with its buffer");
+        }
+        if hw.program(ring, true).is_err() {
+            return TestResult::Fail("an RX ring could not be programmed");
+        }
+        let count = words[(ring.base + 4) as usize / 4] as usize;
+        let cpu = words[(ring.base + 8) as usize / 4] as usize;
+        if count != depth || cpu != depth - 1 {
+            return TestResult::Fail("an RX ring was programmed with another descriptor count");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/rx-ring-sizes",
+    mcu_rx_rings_are_sized_as_linux_mt7921_dma_init
 );

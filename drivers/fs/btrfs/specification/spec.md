@@ -216,6 +216,41 @@ prints `read error corrected: ino I off O (dev devid D sector S)` (metadata:
 (100 per 5 s). `BtrfsVolume::repair_stats()` counts repairs and each kind of
 skip. The read never fails because of its repair.
 
+Default-ACL inheritance (Linux `btrfs_new_inode_prepare` → `posix_acl_create`,
+`btrfs_init_inode_security`). A directory node answers
+`DirOps::default_acl()` with its `system.posix_acl_default` xattr item, the
+uapi blob `setxattr` stored, so the syscall layer's `open(O_CREAT)`,
+`mkdir`, `mknod` and socket-`bind` paths inherit it in place of the umask; and
+`DirOps::set_xattr` writes the directory inode's xattr items exactly as
+`FileOps::set_xattr` does, so `mkdir` keeps the inherited access ACL and the
+copied default on the new directory. Test:
+`smoke_btrfs_directory_default_acl_reaches_new_inodes`
+(`drivers/fs/btrfs/default-acl`).
+
+Xattrs and POSIX ACLs (Linux `btrfs_xattr_handlers`, `fs/btrfs/acl.c`).
+A directory's `DirOps::{get,set,list,remove}_xattr` are its inode's
+`FileOps` ones, so `acl_of_dir` — `may_create` / `may_delete` — sees a
+directory's access ACL. `system.posix_acl_access` and
+`system.posix_acl_default` are not raw xattr writes on either handle
+(`BtrfsNode::set_acl`, `btrfs_set_acl`): the value decodes first (`EINVAL`,
+`EOPNOTSUPP` for an unknown version), a default ACL on a non-directory is
+`EACCES` (removing one a no-op), the ACL must be valid (`EINVAL`), and an
+access ACL sets the mode through `posix_acl_update_mode` — the mode takes
+the ACL's permission bits, setgid goes unless the caller is in the group or
+capable, and an ACL the mode expresses exactly is removed instead of stored.
+`write::set_acl_xattr_item` writes the xattr item and the inode item (mode,
+ctime, transid, sequence) in one commit (`btrfs_setxattr_trans`). An empty
+value or `removexattr` removes the ACL, and removing an absent one succeeds;
+`XATTR_CREATE` / `XATTR_REPLACE` do not apply to ACL names. Test:
+`smoke_btrfs_directory_xattrs_and_acls_follow_btrfs_set_acl`
+(`drivers/fs/btrfs/dir-xattr`). A chmod (`FileOps::set_perms`,
+`DirOps::set_dir_mode_async`) ends with `posix_acl_chmod` under the same
+hold of the inode lock (`btrfs_setattr` with `ATTR_MODE`): the stored access
+ACL takes the new owner and other bits, its mask (or `group::` without one)
+the group bits, named entries stay, and it is stored as `btrfs_set_acl`
+stores one; an inode without an access ACL gets none. Test:
+`smoke_btrfs_chmod_remasks_the_access_acl` (`drivers/fs/btrfs/acl-chmod`).
+
 ## 4. Invariants
 
 Without a free-space tree (never under `root-rw`, which requires one) the
@@ -869,9 +904,16 @@ holds the old data; the held extent is not reused),
 The named mount path retains the implementation's existing format and option
 limits; registration does not add support for further on-disk features.
 
-Directories cannot carry xattrs through the VFS yet: `DirOps::set_xattr` is
-the trait's default (`Unsupported`), so a directory's `user.*`, ACL or
-security xattrs cannot be set or removed through it.
+A btrfs directory's access ACL is read from the xattr tree on every
+create and delete in it (`acl_of_dir`): there is no per-inode ACL cache like
+Linux's `i_acl`, and `DirOps::access_acl_present` stays "unknown", so the
+mode-only fast path of `dir_write_permitted` is never taken on btrfs.
+
+The create paths install an inherited access ACL through `set_xattr`, so it
+passes `posix_acl_update_mode`; Linux's `btrfs_init_inode_security` stores it
+directly. The mode is the same (it already came from `posix_acl_create`),
+except that a setgid bit a new directory inherited is dropped when its
+creator is neither in the directory's group nor capable — Linux keeps it.
 
 A transaction's commit cannot allocate a chunk. Admission keeps it from
 needing one: every operation is refused with `NoSpace` unless the free

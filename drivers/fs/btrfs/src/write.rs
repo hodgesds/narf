@@ -9569,6 +9569,70 @@ pub async fn set_xattr_item<B: BlockDevice + 'static>(
     commit_fs_edits(vol, &[Edit::Upsert(key, body)], Vec::new(), Vec::new()).await
 }
 
+/// `__btrfs_set_acl` → `btrfs_setxattr_trans` for a POSIX ACL xattr: write
+/// (`Some`) or delete (`None`) attribute `name` of inode `ino` and, in the
+/// same commit, the inode item — its permission bits set to `perms` when the
+/// ACL changed the mode (`posix_acl_update_mode`), ctime moved to now,
+/// `transid` and `sequence` advanced. Deleting an absent attribute is not an
+/// error (`btrfs_setxattr` without `XATTR_REPLACE`). Returns the new inode.
+pub async fn set_acl_xattr_item<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    name: &str,
+    value: Option<&[u8]>,
+    perms: Option<u16>,
+) -> Result<InodeItem, FsError> {
+    const S_IFMT: u32 = 0o170000;
+    let name_bytes = name.as_bytes();
+    if name.is_empty() || name_bytes.len() > 255 {
+        return Err(FsError::InvalidData);
+    }
+    ensure_private_subvol(vol).await?;
+    let xattr_key = BtrfsKey::new(
+        ino,
+        format::XATTR_ITEM_KEY,
+        u64::from(name_hash(name_bytes)),
+    );
+    let inode_key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
+    let (fs_root, _) = vol.fs_tree_root();
+    let gen = batch_gen(vol).await?;
+    let existing = btree::find_item(vol, fs_root, &xattr_key).await?;
+    // Names sharing the hash stay; this one is dropped and, for a set,
+    // re-added with its new value.
+    let mut body = Vec::new();
+    if let Some(b) = &existing {
+        for e in decode_dir_items(b)? {
+            if e.name != name {
+                body.extend_from_slice(&xattr_entry(gen, e.name.as_bytes(), &e.value));
+            }
+        }
+    }
+    if let Some(v) = value {
+        body.extend_from_slice(&xattr_entry(gen, name_bytes, v));
+    }
+    let mut item = btree::find_item(vol, fs_root, &inode_key)
+        .await?
+        .ok_or(FsError::NotFound)?;
+    if let Some(perms) = perms {
+        let mode = format::le32(&item, 52)?;
+        let mode = (mode & S_IFMT) | (u32::from(perms) & 0o7777);
+        item[52..56].copy_from_slice(&mode.to_le_bytes());
+    }
+    touch_times(&mut item, false);
+    item[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
+    let seq = le64(&item, 72)?;
+    item[72..80].copy_from_slice(&(seq + 1).to_le_bytes()); // sequence
+    let mut edits = Vec::with_capacity(2);
+    if !body.is_empty() {
+        edits.push(Edit::Upsert(xattr_key, body));
+    } else if existing.is_some() {
+        edits.push(Edit::Delete(xattr_key));
+    }
+    edits.push(Edit::Upsert(inode_key, item.clone()));
+    commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
+    InodeItem::decode(&item)
+}
+
 /// Remove extended attribute `name` from inode `ino` (mounted subvolume). Deletes
 /// the `XATTR_ITEM`, or rebuilds it without this name when others share its hash.
 pub async fn remove_xattr_item<B: BlockDevice + 'static>(

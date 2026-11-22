@@ -577,7 +577,7 @@ impl FileOps for TimerFd {
         use narf_scheduler::narf_time::hrtimer::ClockId;
         let clockid = match self.clock {
             ClockId::Realtime => 0,
-            ClockId::Monotonic => 1,
+            ClockId::Monotonic | ClockId::MonotonicSteered => 1,
             ClockId::Boottime => 7,
             ClockId::Tai => 11,
         };

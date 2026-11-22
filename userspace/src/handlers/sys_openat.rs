@@ -31,6 +31,19 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(ENOENT));
         return;
     }
+    openat_path(ctx, dirfd, path_str, flags, mode);
+}
+
+/// `openat(dirfd, path, flags, mode)` once `path` has been copied in and the
+/// flags validated — shared with `openat2`, which may first rewrite the path
+/// (an absolute name under `RESOLVE_IN_ROOT` is relative to `dirfd`).
+pub(crate) fn openat_path(
+    ctx: &mut dyn TrapContext,
+    dirfd: i64,
+    path_str: alloc::string::String,
+    flags: u64,
+    mode: u32,
+) {
     let task = current_task_id();
     // A detached mount returned by fsmount(2) is a directory fd even
     // though it intentionally has no pathname.  systemd's credential

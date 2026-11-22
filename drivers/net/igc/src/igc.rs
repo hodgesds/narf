@@ -411,7 +411,7 @@ pub struct Igc {
     device: BusDevice,
     config: IrqSafeSpinLock<Config>,
     mtu: AtomicU32,
-    queues: IrqSafeSpinLock<Arc<Vec<Arc<Queue>>>>,
+    queues: crate::queue_set::QueueSet,
     ptp: IrqSafeSpinLock<crate::ptp::ClockState>,
     phc_index: core::sync::atomic::AtomicI32,
     counters: IrqSafeSpinLock<crate::counters::Counters>,
@@ -679,6 +679,7 @@ impl Igc {
         for _ in 0..count {
             queues.push(Arc::new(Queue::new()?));
         }
+        let rss = narf_net::rss::RssConfig::standard(count, 128);
         let (msix, irq_routes) = Self::try_enable_msix(cap, device).unwrap_or((None, Vec::new()));
         let irq_vector = irq_routes.first().map(|r| r.vector);
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
@@ -696,7 +697,7 @@ impl Igc {
                 unicast: Vec::new(),
             }),
             mtu: AtomicU32::new(1500),
-            queues: IrqSafeSpinLock::new(Arc::new(queues)),
+            queues: crate::queue_set::QueueSet::new(queues, &rss),
             ptp: IrqSafeSpinLock::new(crate::ptp::ClockState::new()),
             phc_index: core::sync::atomic::AtomicI32::new(-1),
             counters: IrqSafeSpinLock::new(crate::counters::Counters::new()),
@@ -717,7 +718,7 @@ impl Igc {
                 channels: count as u16,
                 // Linux `IGC_DEFAULT_ITR`: dynamic, conservative.
                 coalesce_us: 3,
-                rss: narf_net::rss::RssConfig::standard(count, 128),
+                rss,
                 link: narf_net::nic::LinkSettings {
                     advertised: if matches!(device.id.device, IGC_I220_V | IGC_I221_V) {
                         0x1f
@@ -809,8 +810,17 @@ impl Igc {
     fn name(&self) -> &'static str {
         self.ifname.get()
     }
+    /// Every queue, for a configuration path; a queue's poll and transmit
+    /// paths reach it through `self.queues` alone.
     fn queues(&self) -> Arc<Vec<Arc<Queue>>> {
-        self.queues.lock().clone()
+        self.queues.all()
+    }
+    /// Return a frame no ring took to the pool of the queue it was built
+    /// for, exactly as that queue's completion would (`Queue::recycle`).
+    fn give_back(&self, frame: Frame) {
+        if let Some(queue) = self.queues.get(usize::from(frame.queue())) {
+            queue.recycle(frame.into_parts().0);
+        }
     }
     /// Each queue's own TX pool, in queue order, for the stack's zero-copy
     /// acquire: a frame is built in the pool of the queue it is sent on.
@@ -857,6 +867,31 @@ impl Igc {
         Ok(guard)
     }
 
+    /// [`Igc::operation`] for queue `q`'s poll and transmit paths. The entry
+    /// is counted on the queue's own slot, so no device-wide word is written
+    /// per packet; `stop` waits for these as for `operation`s, as `igc_down`
+    /// disables each queue's NAPI and transmit.
+    fn queue_operation(&self, q: usize) -> Result<crate::queue_set::QueueEntry<'_>, IgcError> {
+        // SeqCst: the stop/entry handshake of `operation`, per queue.
+        let entry = self.queues.enter(q);
+        if self.removed.load(Ordering::Acquire)
+            || self.state.load(Ordering::SeqCst) != RUNNING
+            || self.hw.cap.invoke(Check).is_err()
+        {
+            return Err(IgcError::Other("controller unavailable"));
+        }
+        if self.hw.read(8) == u32::MAX {
+            self.state.store(FAILED, Ordering::Release);
+            return Err(IgcError::Other("PCI function unavailable"));
+        }
+        Ok(entry)
+    }
+
+    /// No packet operation, device-wide or on any queue, is in flight.
+    fn quiescent(&self) -> bool {
+        self.active.load(Ordering::SeqCst) == 0 && self.queues.idle()
+    }
+
     fn control(&self) -> Result<ControlLease<'_>, IgcError> {
         if self.control_busy.swap(true, Ordering::Acquire) {
             return Err(IgcError::Other("hardware control busy"));
@@ -869,10 +904,7 @@ impl Igc {
         self.state
             .compare_exchange(RUNNING, CHANGING, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| IgcError::Other("controller busy"))?;
-        if !self
-            .hw
-            .wait(100_000, || self.active.load(Ordering::SeqCst) == 0)
-        {
+        if !self.hw.wait(100_000, || self.quiescent()) {
             self.state.store(RUNNING, Ordering::Release);
             return Err(IgcError::Other("active packet operation"));
         }
@@ -1143,10 +1175,16 @@ impl Igc {
         self.link_sample().carrier
     }
     pub fn stats(&self) -> IgcStats {
-        *self.stats.lock()
+        let mut stats = *self.stats.lock();
+        // Each queue counts its own drops and refusals (Linux per-ring
+        // stats, summed by `igc_update_stats`).
+        let (rx_drops, tx_rejected) = self.queues.totals();
+        stats.rx_drops += rx_drops;
+        stats.tx_rejected += tx_rejected;
+        stats
     }
     pub fn num_queues(&self) -> usize {
-        self.queues().len()
+        self.queues.count()
     }
 
     /// Copy a borrowed frame into a buffer of the queue it will be posted
@@ -1155,16 +1193,15 @@ impl Igc {
     fn copy_for_queue(&self, bytes: &[u8], timing: narf_net::TxTiming) -> Result<Frame, IgcError> {
         let q = timing
             .queue
-            .map_or_else(|| self.settings.lock().rss.rx_queue(bytes), usize::from);
-        let queues = self.queues();
-        let queue = queues.get(q).ok_or(IgcError::QueueTooSmall)?;
+            .map_or_else(|| self.queues.select(bytes), usize::from);
+        let queue = self.queues.get(q).ok_or(IgcError::QueueTooSmall)?;
         match queue.tx_copy(bytes) {
             Ok(mut frame) => {
                 frame.set_tx_timing(timing);
                 Ok(frame)
             }
             Err(crate::queue::TxCopyRefusal::Exhausted) => {
-                self.stats.lock().tx_rejected += 1;
+                self.queues.note_tx_rejected(q);
                 Err(IgcError::QueueTooSmall)
             }
             Err(crate::queue::TxCopyRefusal::Invalid) => Err(IgcError::QueueTooSmall),
@@ -1185,25 +1222,33 @@ impl Igc {
     /// `queue` is the stack's choice for a backpressure-aware sender (Linux
     /// `skb->queue_mapping`); such a frame is refused with
     /// [`IgcError::TxBusy`] instead of using the stopped queue's reserve.
-    fn submit_frame_on(
+    /// The ring `frame` goes to.
+    fn tx_queue_for(
         &self,
-        frame: Frame,
-        meta: TxMeta,
+        frame: &Frame,
         queue: Option<usize>,
-    ) -> Result<(), IgcError> {
-        let _operation = self.operation()?;
-        let timing = frame.tx_timing();
+        timing: narf_net::TxTiming,
+    ) -> Result<usize, IgcError> {
         let q = queue.unwrap_or_else(|| {
-            timing.queue.map_or_else(
-                || self.settings.lock().rss.rx_queue(frame.payload()),
-                usize::from,
-            )
+            timing
+                .queue
+                .map_or_else(|| self.queues.select(frame.payload()), usize::from)
         });
         if q >= self.num_queues() {
             return Err(IgcError::QueueTooSmall);
         }
+        Ok(q)
+    }
+    /// The launch-time / timestamp options of a frame for ring `q`:
+    /// everything else `submit_frame_on` decides before the frame is posted.
+    fn tx_options(
+        &self,
+        q: usize,
+        backpressure: bool,
+        timing: narf_net::TxTiming,
+    ) -> Result<crate::queue::TxOptions, IgcError> {
         let mut options = crate::queue::TxOptions {
-            backpressure: queue.is_some(),
+            backpressure,
             ..Default::default()
         };
         if let Some(time) = timing.launch_time_ns {
@@ -1222,12 +1267,54 @@ impl Igc {
             // its fast clock until it is delivered.
             self.kick_maintenance();
         }
-        let result = self.queues()[q].post_options(&self.hw, q, frame, meta, self.mtu(), options);
+        Ok(options)
+    }
+    fn submit_frame_on(
+        &self,
+        frame: Frame,
+        meta: TxMeta,
+        queue: Option<usize>,
+    ) -> Result<(), IgcError> {
+        // An error before the frame reaches a ring gives its buffer back to
+        // the queue it was built for (`Frame::queue`), as `post_options`
+        // does for the errors it returns; dropping it shrank that queue's
+        // zero-copy pool.
+        let timing = frame.tx_timing();
+        let q = match self.tx_queue_for(&frame, queue, timing) {
+            Ok(q) => q,
+            Err(error) => {
+                self.give_back(frame);
+                return Err(error);
+            }
+        };
+        // An operation on ring `q` alone (`igc_xmit_frame` takes only that
+        // ring's transmit lock).
+        let _operation = match self.queue_operation(q) {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.give_back(frame);
+                return Err(error);
+            }
+        };
+        let options = match self.tx_options(q, queue.is_some(), timing) {
+            Ok(options) => options,
+            Err(error) => {
+                self.give_back(frame);
+                return Err(error);
+            }
+        };
+        let result = match self.queues.get(q) {
+            Some(queue) => queue.post_options(&self.hw, q, frame, meta, self.mtu(), options),
+            None => {
+                self.give_back(frame);
+                Err(IgcError::QueueTooSmall)
+            }
+        };
         if result.is_err() && timing.timestamp_cookie.is_some() {
             self.ptp.lock().pending[q] = None;
         }
         if result.is_err() && result != Err(IgcError::TxBusy) {
-            self.stats.lock().tx_rejected += 1;
+            self.queues.note_tx_rejected(q);
         }
         result
     }
@@ -1238,7 +1325,7 @@ impl Igc {
         let mut frames = Vec::new();
         for (q, queue) in self.queues().iter().enumerate() {
             let (mut batch, drops) = queue.receive(&self.hw, q, self.mtu(), budget);
-            self.stats.lock().rx_drops += drops;
+            self.queues.note_rx_drops(q, drops);
             narf_net::iface::note_rx_drop(self.name(), drops);
             frames.append(&mut batch);
         }
@@ -1248,7 +1335,7 @@ impl Igc {
         let _operation = self.operation().ok()?;
         for (q, queue) in self.queues().iter().enumerate() {
             let (frames, drops) = queue.receive(&self.hw, q, self.mtu(), 1);
-            self.stats.lock().rx_drops += drops;
+            self.queues.note_rx_drops(q, drops);
             if let Some(frame) = frames.into_iter().next() {
                 return Some(frame);
             }
@@ -1277,10 +1364,7 @@ impl Igc {
         {
             self.stop()?;
         }
-        if !self
-            .hw
-            .wait(100_000, || self.active.load(Ordering::SeqCst) == 0)
-        {
+        if !self.hw.wait(100_000, || self.quiescent()) {
             self.state.store(FAILED, Ordering::Release);
             return Err(IgcError::Other("packet operation did not stop"));
         }
@@ -1508,11 +1592,10 @@ impl Igc {
         }
         let mut counters = self.counters.lock();
         let (crc, missed, fifo) = counters.sample(&self.hw, self.num_queues(), false);
-        narf_net::iface::note_rx_crc_error(self.name(), crc);
-        narf_net::iface::note_rx_overrun(self.name(), missed + fifo);
+        let missed = crate::counters::publish_rx_errors(self.name(), crc, missed, fifo);
         let mut stats = self.stats.lock();
         stats.crc_errors += crc;
-        stats.missed_packets += missed + fifo;
+        stats.missed_packets += missed;
         stats.rx_packets = counters.value(0x4074);
         stats.tx_packets = counters.value(0x4080);
         stats.rx_bytes = counters.value(0x4088);
@@ -1762,12 +1845,12 @@ impl narf_net::txq::TxBackpressure for Igc {
         self.num_queues() as u16
     }
     fn tx_queue(&self, q: u16) -> Option<Arc<narf_net::txq::TxQueue>> {
-        self.queues()
+        self.queues
             .get(usize::from(q))
             .map(|queue| queue.txq().clone())
     }
     fn tx_select_queue(&self, frame: &[u8]) -> u16 {
-        self.settings.lock().rss.rx_queue(frame) as u16
+        self.queues.select(frame) as u16
     }
     fn tx_link_speed_mbps(&self) -> u32 {
         self.link_sample().speed_mbps.unwrap_or(0)
@@ -1786,8 +1869,8 @@ impl narf_net::txq::TxBackpressure for Igc {
         meta: TxMeta,
         charge: Option<narf_net::txq::TxCharge>,
     ) -> Result<(), narf_net::txq::TxRefusal> {
-        let queues = self.queues();
-        let queue = queues
+        let queue = self
+            .queues
             .get(usize::from(q))
             .ok_or(narf_net::txq::TxRefusal::Dropped)?;
         // The stack copies only when its zero-copy acquire found this
@@ -2194,112 +2277,224 @@ fn remove(device: BusDevice, _: Cap<BusDeviceCap, Write>) {
         c.remove();
     }
 }
+/// The task specs of a queue's receive pump and of its deferral task, on
+/// the queue's CPU `cpu`.
+pub(crate) fn rx_task_specs(
+    cpu: u32,
+) -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
+    let pump = narf_net::napi::rx_pump_spec(cpu);
+    (pump, narf_net::napi::rx_deferral_spec(cpu))
+}
+
+/// `igc_poll`'s cleaning of queue `q`: reclaim its transmit completions,
+/// then clean at most [`narf_net::napi::DEFAULT_BUDGET`] receive
+/// descriptors. Returns the frames for the stack and the descriptors
+/// dropped.
+pub(crate) fn napi_clean(
+    queue: &Queue,
+    hw: &impl Registers,
+    q: usize,
+    mtu: u32,
+) -> (Vec<Frame>, u64) {
+    queue.poll_xsk(hw, q, mtu);
+    queue.receive(hw, q, mtu, narf_net::napi::DEFAULT_BUDGET as usize)
+}
+
+/// `igc_ring_irq_enable`: re-enable the queue's MSI-X vector `index` (its
+/// EIMS bit; EIAM masked it when it fired). Returns whether the ring holds
+/// work, so a descriptor that completed before the vector was enabled
+/// again is polled rather than left until the next interrupt.
+pub(crate) fn napi_complete(queue: Option<&Queue>, hw: &impl Registers, index: Option<u8>) -> bool {
+    if let Some(index) = index {
+        hw.write(0x1524, 1u32 << index);
+    }
+    queue.is_some_and(|queue| queue.pending_rx())
+}
+
+/// One NAPI poll of queue `q` (`igc_poll` up to its budget check): clean
+/// the queue, hand its frames to the stack, and resume the connections its
+/// transmit completions freed. Returns the packets cleaned and whether the
+/// ring still holds work.
+/// What one receive task keeps across its polls: its queue, its interface
+/// and whether the interface's mirror is attached, each re-read only after
+/// it changed.
+#[derive(Debug)]
+struct RxPollState {
+    queue: crate::queue_set::QueueHandle,
+    iface: narf_net::iface::RxHandle,
+    mirror: crate::publish::RxMirrorState,
+}
+
+impl RxPollState {
+    fn new(rx: &Igc, q: usize) -> Self {
+        Self {
+            queue: rx.queues.handle(q),
+            iface: narf_net::iface::RxHandle::new(rx.name()),
+            mirror: crate::publish::RxMirrorState::new(),
+        }
+    }
+}
+
+fn rx_napi_poll(
+    rx: &Igc,
+    q: usize,
+    producer: &IrqSafeSpinLock<Producer<Frame, RX_RING_N>>,
+    state: &mut RxPollState,
+) -> (u32, bool) {
+    // The clean is one operation on this queue alone; a reconfiguration
+    // waits for it (as `napi_disable` waits for a running poll), so the
+    // queue the handle holds cannot change under it.
+    let op = rx.queue_operation(q);
+    // Only a reset replaces the queue; the handle re-reads it only then.
+    let queue = state.queue.current(&rx.queues).cloned();
+    let (frames, drops) = match (op.as_ref(), queue.as_ref()) {
+        (Ok(_), Some(queue)) => {
+            let (f, drops) = napi_clean(queue, &rx.hw, q, rx.mtu());
+            rx.queues.note_rx_drops(q, drops);
+            if drops != 0 {
+                narf_net::iface::note_rx_drop(rx.name(), drops);
+            }
+            (f, drops)
+        }
+        _ => (Vec::new(), 0),
+    };
+    drop(op);
+    // Bounded by the poll's budget.
+    let processed = (frames.len() as u64 + drops) as u32;
+    if !frames.is_empty() {
+        // One interface lookup and one mirror check for the whole poll;
+        // frame and byte counts are folded in when the batch ends.
+        let name = rx.name();
+        let mirrored = state.mirror.attached(name);
+        let mut batch = state.iface.batch();
+        for mut frame in frames {
+            use narf_net::bypass::classifier::XdpAction;
+            crate::publish::mirror_rx(&frame, mirrored, |f| {
+                let _ = producer.lock().try_send(f);
+            });
+            let (action, len) = narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
+            frame.truncate(len as u32);
+            if action == XdpAction::Tx {
+                // The transmit completion recycles it.
+                if rx.submit_frame(frame, TxMeta::plain()).is_err() {
+                    narf_net::bypass::classifier::count_xdp_tx_drop();
+                }
+                continue;
+            }
+            let timestamp = frame.rx_meta().timestamp_ns;
+            match action {
+                XdpAction::Pass | XdpAction::RedirectCpu { .. } => {
+                    batch.receive(frame.payload_mut(), timestamp)
+                }
+                _ => native_redirect(name, frame.payload_mut(), action, timestamp),
+            }
+            // Dispatch copied what it keeps, so the buffer re-arms a slot on
+            // a later poll instead of going back to the page allocator
+            // (Linux `igc_reuse_rx_page`).
+            if let Some(queue) = queue.as_ref() {
+                queue.recycle(frame.into_parts().0);
+            }
+        }
+    }
+    if let Some(queue) = queue.as_ref() {
+        // The wake pass, once per poll: this poll reclaimed the queue's
+        // transmit completions (`poll_xsk`), so resume the connections that
+        // were waiting for them. No queue lock is held here.
+        queue.txq().run_wakeups();
+        // Replace RX buffers a consumer kept, here in task context and
+        // never inside `receive`.
+        queue.replenish_rx();
+    }
+    let pending = match rx.queue_operation(q) {
+        Ok(_op) => queue.as_ref().is_some_and(|queue| queue.pending_rx()),
+        Err(_) => false,
+    };
+    (processed, pending)
+}
+
+/// `igc_poll` once a poll left queue `q`'s ring empty: `napi_complete_done`
+/// and `igc_ring_irq_enable`, which sets the vector's interval from the work
+/// since it was last set and then re-enables the vector. Returns whether
+/// the ring holds work again.
+fn rx_napi_done(
+    rx: &Igc,
+    q: usize,
+    route: Option<IrqRoute>,
+    itr: &mut (u32, u32, crate::itr::Work),
+) -> bool {
+    let Ok(_op) = rx.queue_operation(q) else {
+        return false;
+    };
+    let queue = rx.queues.get(q);
+    if let (Some(r), Some(queue)) = (route, queue.as_ref()) {
+        rx.moderate(r, queue, itr);
+    }
+    napi_complete(queue.as_deref(), &rx.hw, route.map(|r| r.index))
+}
+
 fn spawn_pumps(
     device: Arc<Igc>,
     rx_prod: Producer<Frame, RX_RING_N>,
     mut tx_cons: Consumer<Frame, TX_RING_N>,
 ) {
+    use narf_net::napi::{deferral_run, softirq_run, SoftirqEnd, SoftirqHandoff};
     let producer = Arc::new(IrqSafeSpinLock::new(rx_prod));
     for q in 0..4 {
-        let rx = device.clone();
-        let producer = producer.clone();
         // Linux NAPI: a queue is polled in softirq context on the CPU its
         // vector interrupts, so its ring, its transmit completions and the
-        // flows RSS steers to it stay on one core.
-        let mut spec = narf_scheduler::TaskSpec::unthrottled()
-            .with_work_kind(narf_scheduler::WorkKind::SoftIrq);
-        spec.affinity = narf_scheduler::affinity::Affinity::pinned(
-            narf_scheduler::affinity::CpuId(device.queue_cpu_of(q)),
-        );
+        // flows RSS steers to it stay on one core. Each interrupt gives the
+        // pump one bounded run ahead of the tasks there; work left after it
+        // goes to the queue's deferral task (ksoftirqd), which shares the
+        // CPU with them.
+        let (spec, deferral) = rx_task_specs(device.queue_cpu_of(q));
+        let handoff = Arc::new(SoftirqHandoff::new());
+        let deferral_task = deferral.is_some();
+        if let Some(deferral) = deferral {
+            let rx = device.clone();
+            let producer = producer.clone();
+            let handoff = handoff.clone();
+            narf_scheduler::spawn_with_spec(
+                async move {
+                    let mut state = RxPollState::new(&rx, q);
+                    while rx.until_removed(handoff.taken()).await.is_some() {
+                        let poll = || rx_napi_poll(&rx, q, &producer, &mut state);
+                        deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
+                    }
+                },
+                deferral,
+            );
+        }
+        let rx = device.clone();
+        let producer = producer.clone();
         narf_scheduler::spawn_with_spec(
             async move {
                 // This vector's interval and the queue's work counters when
                 // it was last set (`igc_update_ring_itr` state).
                 let mut itr = (u32::MAX, crate::itr::START_ITR, crate::itr::Work::default());
+                let mut state = RxPollState::new(&rx, q);
                 while !rx.removed.load(Ordering::Acquire) {
                     let route = rx.route(q);
                     // NAPI: the queue's interrupt alone schedules the next
-                    // poll (`igc_msix_ring` → `napi_schedule`); no timer.
+                    // run (`igc_msix_ring` → `napi_schedule`); no timer.
+                    // Taken before the run re-enables the vector, so an
+                    // interrupt after that wakes this task.
                     let waiter = route.map(|r| narf_interrupts::wait_for_irq(r.vector));
-                    // Only a reset replaces the queue set; one handle serves
-                    // the whole poll.
-                    let queue = rx.queues().get(q).cloned();
-                    let frames = match (rx.operation(), queue.as_ref()) {
-                        (Ok(_op), Some(queue)) => {
-                            queue.poll_xsk(&rx.hw, q, rx.mtu());
-                            let budget = narf_net::napi::DEFAULT_BUDGET as usize;
-                            let (f, drops) = queue.receive(&rx.hw, q, rx.mtu(), budget);
-                            // Device-wide counters only when there is
-                            // something to count: no shared lock per poll.
-                            if drops != 0 {
-                                rx.stats.lock().rx_drops += drops;
-                                narf_net::iface::note_rx_drop(rx.name(), drops);
-                            }
-                            f
+                    let end = softirq_run(
+                        || rx_napi_poll(&rx, q, &producer, &mut state),
+                        || rx_napi_done(&rx, q, route, &mut itr),
+                        &handoff,
+                        narf_time::monotonic_ns,
+                    )
+                    .await;
+                    if end == SoftirqEnd::Deferred {
+                        if deferral_task {
+                            // The vector stays masked while the deferral
+                            // task polls; the next run completes the queue.
+                            let _ = rx.until_removed(handoff.returned()).await;
+                        } else {
+                            let poll = || rx_napi_poll(&rx, q, &producer, &mut state);
+                            deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
                         }
-                        _ => Vec::new(),
-                    };
-                    if !frames.is_empty() {
-                        // One interface lookup and one mirror check for the
-                        // whole poll; frame and byte counts are folded in
-                        // when the batch ends.
-                        let name = rx.name();
-                        let mut batch = narf_net::iface::rx_batch(name);
-                        let mirrored = crate::publish::rx_mirror_attached(name);
-                        for mut frame in frames {
-                            use narf_net::bypass::classifier::XdpAction;
-                            crate::publish::mirror_rx(&frame, mirrored, |f| {
-                                let _ = producer.lock().try_send(f);
-                            });
-                            let (action, len) =
-                                narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
-                            frame.truncate(len as u32);
-                            if action == XdpAction::Tx {
-                                // The transmit completion recycles it.
-                                if rx.submit_frame(frame, TxMeta::plain()).is_err() {
-                                    narf_net::bypass::classifier::count_xdp_tx_drop();
-                                }
-                                continue;
-                            }
-                            let timestamp = frame.rx_meta().timestamp_ns;
-                            match action {
-                                XdpAction::Pass | XdpAction::RedirectCpu { .. } => {
-                                    batch.receive(frame.payload_mut(), timestamp)
-                                }
-                                _ => native_redirect(name, frame.payload_mut(), action, timestamp),
-                            }
-                            // Dispatch copied what it keeps, so the buffer
-                            // re-arms a slot on a later poll instead of
-                            // going back to the page allocator (Linux
-                            // `igc_reuse_rx_page`).
-                            if let Some(queue) = queue.as_ref() {
-                                queue.recycle(frame.into_parts().0);
-                            }
-                        }
-                    }
-                    if let Some(queue) = queue.as_ref() {
-                        // The wake pass, once per poll: this poll reclaimed
-                        // the queue's transmit completions (`poll_xsk`), so
-                        // resume the connections that were waiting for them.
-                        // No queue lock is held here.
-                        queue.txq().run_wakeups();
-                        // Replace RX buffers a consumer kept, here in task
-                        // context and never inside `receive`.
-                        queue.replenish_rx();
-                    }
-                    let pending = if let Ok(_op) = rx.operation() {
-                        if let (Some(r), Some(queue)) = (route, queue.as_ref()) {
-                            rx.moderate(r, queue, &mut itr);
-                        }
-                        if let Some(r) = route {
-                            rx.hw.write(0x1524, 1u32 << r.index);
-                        }
-                        queue.as_ref().is_some_and(|queue| queue.pending_rx())
-                    } else {
-                        false
-                    };
-                    if pending {
-                        narf_scheduler::yield_now().await;
                         continue;
                     }
                     // The ring is empty and the vector re-armed: Linux

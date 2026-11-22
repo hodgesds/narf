@@ -86,6 +86,28 @@ pub(crate) struct PendingEcho {
     pub(crate) sent_ns: u64,
     /// Receive timestamp in nanoseconds.
     pub(crate) recv_ns: u64,
+    /// The reply's IP header and arrival device, for `ip_cmsg_recv`.
+    pub(crate) rx: Option<EchoRxMeta>,
+}
+
+/// What `ping_recvmsg` → `ip_cmsg_recv` reports about an Echo Reply: its IP
+/// header's TTL and TOS (IP_TTL / IP_TOS), the device it arrived on and the
+/// address it was sent to (IP_PKTINFO).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EchoRxMeta {
+    pub ttl: u8,
+    pub tos: u8,
+    pub ifindex: u32,
+    pub dst: [u8; 4],
+}
+
+/// The per-send routing inputs `ping_v4_sendmsg` takes from the socket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EchoSendOpts {
+    /// `inet->inet_saddr` (a bound address); `None` lets the route choose.
+    pub src: Option<[u8; 4]>,
+    /// `ipc.oif`: `sk_bound_dev_if`, else IP_UNICAST_IF; 0 routes freely.
+    pub oif: u32,
 }
 
 /// An ICMP echo socket.  Represents a single `ping` session.
@@ -300,14 +322,47 @@ pub fn icmp_echo_send(
     pmtudisc: i32,
     inet_id: Option<&core::sync::atomic::AtomicU16>,
 ) -> Result<(), IcmpError2> {
+    icmp_echo_send_with(
+        sock,
+        target,
+        seq,
+        payload,
+        pmtudisc,
+        inet_id,
+        EchoSendOpts::default(),
+    )
+}
+
+/// [`icmp_echo_send`] with the socket's bound address and output device
+/// (`ping_v4_sendmsg`: `ipc.oif`, `inet->inet_saddr`). With an `oif` only
+/// that device's routes count and its neighbour table resolves the next
+/// hop, as for a bound UDP socket.
+pub fn icmp_echo_send_with(
+    sock: &Arc<IcmpEchoSocket>,
+    target: [u8; 4],
+    seq: u16,
+    payload: &[u8],
+    pmtudisc: i32,
+    inet_id: Option<&core::sync::atomic::AtomicU16>,
+    opts: EchoSendOpts,
+) -> Result<(), IcmpError2> {
     // `ping_v4_sendmsg`: `len > 0xFFFF` → -EMSGSIZE before any routing work;
     // `len` is the whole ICMP message, echo header included.
     let icmp_len = 8 + payload.len(); // 8-byte ICMP echo header
     if icmp_len > 0xFFFF {
         return Err(IcmpError2::MsgTooLong);
     }
-    // Wave-47: route by destination, not boot-time primary.
-    let iface = iface::for_dst_in(sock.net_ns_id, target).ok_or(IcmpError2::NoInterface)?;
+    // Wave-47: route by destination, not boot-time primary; a bound socket
+    // leaves through its device.
+    let iface = if opts.oif != 0 {
+        iface::snapshot_all_in(sock.net_ns_id)
+            .into_iter()
+            .find(|i| iface::ifindex_of(&i.name) == Some(opts.oif))
+            .ok_or(IcmpError2::NoInterface)?
+    } else {
+        iface::for_dst_in(sock.net_ns_id, target).ok_or(IcmpError2::NoInterface)?
+    };
+    let src_ip = opts.src.filter(|s| *s != [0; 4]).unwrap_or(iface.ipv4);
     // `ip_append_data` (`ip_setup_cork` + `__ip_append_data`), before the
     // neighbour is resolved.
     let mtu = crate::ip_output::fragsize(pmtudisc, iface.mtu);
@@ -327,10 +382,26 @@ pub fn icmp_echo_send(
     let (dst_mac, unresolved) = if target == [255, 255, 255, 255] {
         ([0xFF; 6], None)
     } else {
-        let nexthop = crate::route::route_lookup_in(sock.net_ns_id, crate::ipv4::Ipv4Addr(target))
-            .map(|r| r.nexthop.0)
-            .unwrap_or(target);
-        match crate::tcp_stack::arp_cached_in(sock.net_ns_id, nexthop) {
+        let (nexthop, cached) = if opts.oif != 0 {
+            let nexthop = crate::route::route_lookup_oif_in(
+                sock.net_ns_id,
+                crate::ipv4::Ipv4Addr(target),
+                &iface.name,
+            )
+            .nexthop
+            .0;
+            (nexthop, crate::arp_cache::lookup(&iface.name, nexthop))
+        } else {
+            let nexthop =
+                crate::route::route_lookup_in(sock.net_ns_id, crate::ipv4::Ipv4Addr(target))
+                    .map(|r| r.nexthop.0)
+                    .unwrap_or(target);
+            (
+                nexthop,
+                crate::tcp_stack::arp_cached_in(sock.net_ns_id, nexthop),
+            )
+        };
+        match cached {
             Some(mac) => (mac, None),
             None => ([0u8; 6], Some(nexthop)),
         }
@@ -346,7 +417,7 @@ pub fn icmp_echo_send(
         &mut frame[ETH_HDR_LEN..],
         ip_total as u16,
         IP_PROTO_ICMP,
-        iface.ipv4,
+        src_ip,
         target,
     );
     // `__ip_make_skb`: DF from IP_MTU_DISCOVER, then `ip_select_ident`.
@@ -391,6 +462,7 @@ pub fn icmp_echo_send(
             reply: None,
             sent_ns,
             recv_ns: 0,
+            rx: None,
         });
         sock.sync_readiness(&pending);
     }
@@ -399,24 +471,24 @@ pub fn icmp_echo_send(
         let net_ns_id = sock.net_ns_id;
         let ignore_df = crate::ip_output::ip_sk_ignore_df(pmtudisc);
         let len = frame.len();
-        crate::tcp_stack::neigh_output_in(
-            net_ns_id,
-            nexthop,
-            len,
-            alloc::boxed::Box::new(move |mac| {
-                if let Some(mac) = mac {
-                    frame[..6].copy_from_slice(&mac);
-                    let _ = crate::ip_output::ip_finish_output(
-                        net_ns_id,
-                        &frame,
-                        ETH_HDR_LEN,
-                        mtu,
-                        ignore_df,
-                        |f| iface.xmit(f),
-                    );
-                }
-            }),
-        );
+        let on_device = (opts.oif != 0).then(|| iface.name.clone());
+        let send: crate::arp_cache::NeighCont = alloc::boxed::Box::new(move |mac| {
+            if let Some(mac) = mac {
+                frame[..6].copy_from_slice(&mac);
+                let _ = crate::ip_output::ip_finish_output(
+                    net_ns_id,
+                    &frame,
+                    ETH_HDR_LEN,
+                    mtu,
+                    ignore_df,
+                    |f| iface.xmit(f),
+                );
+            }
+        });
+        match on_device {
+            Some(name) => crate::tcp_stack::neigh_output_on(net_ns_id, &name, nexthop, len, send),
+            None => crate::tcp_stack::neigh_output_in(net_ns_id, nexthop, len, send),
+        }
         return Ok(());
     }
     // `ip_finish_output`: fragments a request larger than the MTU.
@@ -470,6 +542,17 @@ pub fn icmp_echo_recv_reply(
     sock: &Arc<IcmpEchoSocket>,
     peek: bool,
 ) -> Option<(u16, [u8; 4], Vec<u8>, u64)> {
+    icmp_echo_recv_reply_meta(sock, peek)
+        .map(|(seq, peer, payload, rtt, _meta)| (seq, peer, payload, rtt))
+}
+
+/// An Echo Reply as `icmp_echo_recv_reply_meta` returns it: sequence,
+/// peer, payload, round-trip time and what its IP header and arrival said.
+pub type EchoReplyMeta = (u16, [u8; 4], Vec<u8>, u64, EchoRxMeta);
+
+/// [`icmp_echo_recv_reply`] plus what the reply's IP header and arrival
+/// said ([`EchoRxMeta`]), for the receive control messages.
+pub fn icmp_echo_recv_reply_meta(sock: &Arc<IcmpEchoSocket>, peek: bool) -> Option<EchoReplyMeta> {
     let mut q = sock.pending.lock();
     let index = q.iter().position(|entry| entry.reply.is_some())?;
     let entry = q.get_mut(index)?;
@@ -483,6 +566,7 @@ pub fn icmp_echo_recv_reply(
         entry.target,
         payload,
         entry.recv_ns.saturating_sub(entry.sent_ns),
+        entry.rx.unwrap_or_default(),
     );
     if !peek {
         sock.sync_readiness(&q);
@@ -581,6 +665,22 @@ pub fn on_icmp_rx(src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body: &[u8]) {
 }
 
 pub fn on_icmp_rx_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body: &[u8]) {
+    let meta = EchoRxMeta {
+        dst: dst_ip,
+        ..EchoRxMeta::default()
+    };
+    on_icmp_rx_meta(net_ns_id, src_ip, dst_ip, icmp_body, meta);
+}
+
+/// [`on_icmp_rx_in`] with the datagram's IP header TTL/TOS and arrival
+/// device, which an Echo Reply carries up to its socket (`ip_cmsg_recv`).
+pub fn on_icmp_rx_meta(
+    net_ns_id: u64,
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    icmp_body: &[u8],
+    meta: EchoRxMeta,
+) {
     if icmp_body.len() < 4 {
         return;
     }
@@ -599,7 +699,7 @@ pub fn on_icmp_rx_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_body
         }
         ICMP_ECHO_REPLY => {
             // Deliver to waiting echo sockets.
-            handle_echo_reply(net_ns_id, src_ip, icmp_body);
+            handle_echo_reply(net_ns_id, src_ip, icmp_body, meta);
         }
         // `icmp_rcv` hands Parameter Problem to `icmp_unreach` as well, so
         // the originating socket sees EPROTO (`udp_err` / `tcp_v4_err`).
@@ -728,7 +828,7 @@ fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_bo
     );
 }
 
-fn handle_echo_reply(net_ns_id: u64, _src_ip: [u8; 4], icmp_body: &[u8]) {
+fn handle_echo_reply(net_ns_id: u64, _src_ip: [u8; 4], icmp_body: &[u8], meta: EchoRxMeta) {
     if icmp_body.len() < 8 {
         return;
     }
@@ -757,6 +857,7 @@ fn handle_echo_reply(net_ns_id: u64, _src_ip: [u8; 4], icmp_body: &[u8]) {
             if entry.seq == seq && entry.reply.is_none() {
                 entry.reply = payload.take();
                 entry.recv_ns = recv_ns;
+                entry.rx = Some(meta);
                 delivered = true;
                 break;
             }
@@ -927,6 +1028,7 @@ fn smoke_icmp_echo_send_recv_reply() -> TestResult {
             reply: None,
             sent_ns: 1_000_000,
             recv_ns: 0,
+            rx: None,
         });
 
     // Simulate receiving a reply: build a minimal ICMP Echo Reply body.
@@ -943,7 +1045,7 @@ fn smoke_icmp_echo_send_recv_reply() -> TestResult {
     icmp_body[2] = (cs >> 8) as u8;
     icmp_body[3] = (cs & 0xFF) as u8;
 
-    handle_echo_reply(0, [10, 0, 0, 1], &icmp_body);
+    handle_echo_reply(0, [10, 0, 0, 1], &icmp_body, EchoRxMeta::default());
 
     let result = icmp_echo_poll_reply(&sock, seq);
     icmp_echo_close(&sock);

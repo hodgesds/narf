@@ -175,6 +175,137 @@ Boot installs the procfs network snapshot adapters. Each adapter queries the
 network stack using the namespace ID supplied by the open procfs file,
 including for IPv6 addresses and routes.
 
+### 3.1 x86_64 IA-32 emulation (Linux `CONFIG_IA32_EMULATION`)
+
+Every CPU's GDT has Linux's 64-bit layout (`arch/x86/include/asm/segment.h`)
+for each user-visible selector; the constants live in
+`narf_arch::x86_64::segments`:
+
+| index | selector | descriptor |
+|-------|----------|------------|
+| 1 | 0x08 | kernel code (NARF's; Linux uses 0x10) |
+| 2 | 0x10 | kernel data |
+| 4 | 0x23 | `__USER32_CS`: flat 32-bit user code, DPL 3 |
+| 5 | 0x2b | `__USER_DS`: flat user data, DPL 3 |
+| 6 | 0x33 | `__USER_CS`: long-mode user code, DPL 3 |
+| 8–9 | 0x40 | TSS, loaded by `LTR` |
+| 12–14 | 0x63, 0x6b, 0x73 | TLS slots, the running task's |
+
+Slots 0, 3, 7, 10–11 (LDT, never installed) and 15 are empty. `gdt::init`
+(BSP) and `gdt::init_ap` (each AP) build the table and publish it with
+`segments::register_cpu_gdt(cpu, gdt)`; `segments::cpu_gdt(cpu)` returns it.
+
+`IA32_STAR[63:48]` is `__USER32_CS`: `sysretq` returns to 0x33/0x2b and
+`sysretl` to 0x23/0x2b. `IA32_CSTAR`, where AMD CPUs enter on a `syscall`
+from compatibility mode, is `syscall32_ignore_x86_64`: Linux's
+`ignore_sysret`, which returns -ENOSYS in eax with `sysretl` without touching
+the stack or GS. (Intel raises #UD for that `syscall`.)
+
+```rust
+// narf_arch::x86_64::segments
+pub const GDT_ENTRIES: usize = 16;
+pub const GDT_ENTRY_TLS_MIN: usize = 12; // ..=GDT_ENTRY_TLS_MAX (14)
+pub const USER32_CS: u16 = 0x23; pub const USER_DS: u16 = 0x2b;
+pub const USER_CS: u16 = 0x33;   pub const TSS_SELECTOR: u16 = 0x40;
+pub unsafe fn register_cpu_gdt(cpu: usize, gdt: *mut u64);
+pub fn cpu_gdt(cpu: usize) -> *mut u64;
+```
+
+**The i386 system-call hook.** `int 0x80` from user mode is the i386 ABI
+for every task (Linux `do_int80_emulation`). The gate builds a
+`TrapContext` over the trap frame whose `args()` are ebx, ecx, edx, esi,
+edi, ebp zero-extended, whose `set_return` writes rax with
+`compat32::user_rax` and nothing else, and whose `in_ia32_syscall()` is
+true, and calls `compat32::dispatch` with eax. `compat32` (userspace)
+runs seccomp for `AUDIT_ARCH_I386`, the TLS calls, then
+`compat32::table::dispatch` (the i386 table, owned by the IA-32 userspace
+work), and delivers signals with restart semantics. If the call parked to
+be re-executed (RIP rewound onto `int 0x80`), the gate restores eax to the
+number (Linux `orig_ax`). A kernel-mode `int 0x80` panics, as Linux's
+`do_int80_emulation` does. 64-bit code enters through `syscall` only; the
+in-tree runtime (`narf-user-runtime`) and fixtures use it.
+`compat32::user_rax` is the value sign-extended; a non-Ok NARF status
+reads as its errno when the value carries one, else -EINVAL. A task parked
+in an `int 0x80` call reports eax and ebx..ebp as its number and arguments
+(`/proc/<pid>/syscall`). Seccomp sees these calls with `AUDIT_ARCH_I386`
+and the i386 number (`seccomp_data`, `si_arch`, user notifications); they
+never take the native constant-action cache, and strict mode admits the
+i386 set (read 3, write 4, exit 1, sigreturn 119).
+
+```rust
+// narf_userspace::compat32
+pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext);
+pub fn user_rax(ret: SyscallReturn) -> u64;
+pub mod table {
+    pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall>;
+    pub fn forward(ctx: &mut dyn TrapContext, variant: Syscall) -> Option<Syscall>;
+}
+pub mod tls {
+    pub fn sys_set_thread_area(ctx: &mut dyn TrapContext); // i386 243
+    pub fn sys_get_thread_area(ctx: &mut dyn TrapContext); // i386 244
+    pub fn current_segments() -> UserSegments;             // fork/clone copy
+    pub fn set_child_tls(segs: &mut UserSegments, gs_base: &mut u64,
+                         fs_base: &mut Option<u64>, info: &UserDesc) -> i64;
+    pub fn clone_settls(segs: &mut UserSegments, gs_base: &mut u64,
+                        fs_base: &mut Option<u64>, u_info: u64) -> i64;
+}
+// narf_userspace::syscall
+pub fn dispatch_native(variant: Syscall, ctx: &mut dyn TrapContext);
+trait TrapContext {
+    fn in_ia32_syscall(&self) -> bool { false } // TS_COMPAT
+    fn in_compat_mode(&self) -> bool { false }  // trapping CS == __USER32_CS
+}
+```
+
+**Entering a 32-bit task.** `UserProcess::ia32` asks the first entry (and a
+fork/clone child's first resume) for CS = `__USER32_CS`; a fresh image gets
+DS = ES = SS = `__USER_DS`, FS = GS = 0 with zero bases (Linux
+`start_thread_ia32`). `UserProcess::segs: UserSegments` is the task's
+initial TLS descriptors and DS/ES/FS/GS selectors (empty for an image, the
+parent's for fork/clone), applied before the FS/GS bases.
+
+**Per-task segment state.** The scheduler keeps each task's TLS
+descriptors and selectors (Linux `thread.tls_array`, `ds`, `es`,
+`fsindex`, `gsindex`). Switch-out saves the live selectors; switch-in loads
+the task's descriptors into the running CPU's slots 12..=14, then its
+selectors (GS through `load_gs_index`'s `swapgs` bracket with interrupts
+masked; a selector whose descriptor is no longer loadable becomes null),
+then the FS/GS bases. A register is reloaded only when it or its
+replacement is non-null, so 64-bit-only switches reload nothing. A nested
+poll restores the outer task's whole segment state after the inner task
+yields. The first own-stack poll applies `UserProcess::segs`; execve
+empties the slots and nulls the selectors.
+
+`set_thread_area` (i386 243) and `get_thread_area` (244) follow
+`arch/x86/kernel/tls.c`: `tls_desc_okay` (no 16-bit, code or non-present
+segments; `LDT_empty`/`LDT_zero` clear a slot), entry -1 allocates the
+first empty slot and writes its index back (-ESRCH when none), indexes
+outside 12..=14 are -EINVAL, `fill_ldt` never sets L, and a data segment
+register naming the rewritten slot is reloaded. `clone_settls` /
+`set_child_tls` apply a `CLONE_SETTLS` descriptor to a child's
+`UserSegments` (no allocation) and set the child's FS or GS base when its
+selector names the slot.
+
+```rust
+// narf_scheduler::stackful (x86_64)
+pub fn set_current_user_tls_desc(slot: usize, desc: u64);
+pub fn current_user_tls() -> [u64; 3];
+pub fn current_user_segments() -> ([u64; 3], UserSelectors);
+pub fn set_current_user_segments(tls: [u64; 3], sel: UserSelectors);
+// narf_arch::x86_64::segments
+pub struct UserDesc { entry_number, base_addr, limit, flags }
+pub fn tls_desc_okay(&UserDesc) -> bool;   pub fn fill_ldt(&UserDesc) -> u64;
+pub fn fill_user_desc(idx: u32, desc: u64) -> UserDesc;
+pub fn ldt_empty(&UserDesc) -> bool;       pub fn ldt_zero(&UserDesc) -> bool;
+pub fn get_free_idx(&[u64; 3]) -> Option<u32>;
+pub struct UserSelectors { ds, es, fs, gs }
+pub fn read_user_selectors() -> UserSelectors;  pub fn cpu_tls() -> [u64; 3];
+pub fn selector_loadable(sel: u16, tls: &[u64; 3]) -> bool;
+pub unsafe fn load_tls(&[u64; 3]);         pub unsafe fn load_gs_index(u16);
+pub unsafe fn load_user_selectors(UserSelectors, &[u64; 3]);
+pub unsafe fn reload_selector_users(modified: u16, &[u64; 3]);
+```
+
 ## 4. Invariants & safety properties
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.
@@ -202,6 +333,22 @@ including for IPv6 addresses and routes.
   COW are attempted by the synchronous fault handler, while an invalid or
   concurrently unmapped target reaches the probe fixup and terminates only the
   receiving task.
+- **x86_64 IA-32 segments (§3.1).** Every CPU's `IA32_CSTAR` names the
+  -ENOSYS `sysretl` stub before user code can run there, so a compat-mode
+  `syscall` never jumps to an unprogrammed CSTAR at CPL 0. The kernel loads
+  a user DS/ES/FS/GS selector only after `selector_loadable` accepts it
+  against the slots this CPU now holds (otherwise null), so no switch, exec
+  or `set_thread_area` path takes a #GP/#NP at CPL 0. GS is loaded only
+  inside `swapgs` … `swapgs` with interrupts masked, and the user GS base is
+  rewritten from the task's saved value afterwards. TLS descriptors are
+  built only by `fill_ldt` from requests `tls_desc_okay` accepts: DPL 3,
+  32-bit, data, present, never L — no 16-bit stack segment (no espfix
+  leak), no call-gate or system descriptor.
+- `int 0x80` serves user tasks only; a kernel-mode `int 0x80` panics. Its
+  return replaces a user SS that no longer names a present DPL-3 writable
+  data segment (a TLS slot emptied or narrowed under it) with `__USER_DS`,
+  so the `iretq` cannot fault at CPL 0 (Linux delivers SIGSEGV through
+  `fixup_bad_iret`; NARF has no bad-IRET fixup).
 - **x86_64 trap entry clears the live direction flag before executing any
   compiler-generated code.** CPL3 may be interrupted between `std` and `cld`;
   the CPU-pushed RFLAGS retains that user state for `iretq`, while the kernel
@@ -279,7 +426,8 @@ including for IPv6 addresses and routes.
 ## 5. Architecture notes
 
 ### x86_64
-- GDT: kernel code, kernel data, user code, user data, TSS per CPU.
+- GDT per CPU in Linux's 64-bit layout (§3.1): kernel code and data, 32-bit
+  user code, user data, 64-bit user code, the TSS and three TLS slots.
 - IDT: 256 entries, trap gates for exceptions, interrupt gates for IRQs.
 - Uses `swapgs` + per-CPU `KERNEL_GS_BASE` for `CpuLocal` pointer.
 - **TSS IST slot assignments** (fixed, not negotiable):

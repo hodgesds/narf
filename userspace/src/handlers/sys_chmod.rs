@@ -24,16 +24,10 @@ pub(crate) fn sys_chmod(ctx: &mut dyn TrapContext) {
         fn set_return(&mut self, ret: SyscallReturn) {
             self.inner.set_return(ret);
         }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
+        fn pending_return(&self) -> Option<SyscallReturn> {
+            self.inner.pending_return()
         }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
+        crate::syscall::forward_trap_context!(inner);
     }
     let proxy_args = SyscallArgs {
         arg0: (-100i64) as u64, // dirfd = AT_FDCWD (legacy chmod).

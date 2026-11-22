@@ -707,6 +707,103 @@ kernel_test_in!(
     smoke_fat_create_write_read_unlink_round_trip
 );
 
+/// `fat_statfs`: the cluster is the block (`f_bsize = sbi->cluster_size`),
+/// `f_blocks` the data clusters (`max_cluster - FAT_START_ENT`), `f_bfree`
+/// and `f_bavail` the free ones `fat_count_free_clusters` counts in the FAT,
+/// and `f_namelen` the long-name limit (`FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE`).
+/// The count follows the FAT as clusters are allocated and freed.
+fn smoke_fat_statfs_counts_clusters() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    // 128 sectors of 512 bytes, one sector per cluster: 1 reserved, two
+    // one-sector FATs and a one-sector root directory leave 124 data
+    // clusters, of which NARF.TXT holds cluster 2.
+    let img = build_fat12_image(128, b"narf\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("FatVolume::mount failed"),
+    };
+    let stat = match poll_once(volume.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("statfs failed"),
+    };
+    if stat.block_size != 512 || stat.fragment_size != 512 {
+        return TestResult::Fail("statfs f_bsize/f_frsize is not the cluster size");
+    }
+    if stat.blocks != 124 || stat.blocks_free != 123 || stat.blocks_available != 123 {
+        return TestResult::Fail("statfs did not count the data and free clusters");
+    }
+    if stat.name_len != 255 * 6 {
+        return TestResult::Fail("statfs f_namelen is not FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE");
+    }
+    let root = volume.root();
+    let file = match poll_once(root.create("HI.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create HI.TXT failed"),
+    };
+    if !matches!(poll_once(file.write(0, b"hello fat\n")), Some(Ok(10))) {
+        return TestResult::Fail("write failed");
+    }
+    match poll_once(volume.statfs()) {
+        Some(Ok(stat)) if stat.blocks_free == 122 => {}
+        _ => return TestResult::Fail("statfs did not see the cluster the write allocated"),
+    }
+    if !matches!(poll_once(root.unlink("HI.TXT")), Some(Ok(()))) {
+        return TestResult::Fail("unlink failed");
+    }
+    match poll_once(volume.statfs()) {
+        Some(Ok(stat)) if stat.blocks_free == 123 => TestResult::Pass,
+        _ => TestResult::Fail("statfs did not see the cluster the unlink freed"),
+    }
+}
+kernel_test_in!("drivers/fs/fat/statfs", smoke_fat_statfs_counts_clusters);
+
+/// Linux mounts every FAT width through the `vfat` filesystem type, so
+/// `/proc/self/mountinfo`, `/proc/mounts` and statmount print `vfat` for a
+/// FAT12, FAT16 or FAT32 volume (`show_type`: `sb->s_type->name`). The FAT
+/// width stays the instance's own name.
+fn smoke_fat_mounts_list_the_vfat_type() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{bootstrap_mount_authority, registry, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    const PATH: &str = "/fat-fstype";
+    let img = build_fat12_image(128, b"narf\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("FatVolume::mount failed"),
+    };
+    if volume.name() != "fat12" {
+        return TestResult::Fail("expected FAT12 detection");
+    }
+    let auth = bootstrap_mount_authority();
+    let handle = match registry().mount_arc(&auth, PATH, volume) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("mounting the FAT volume failed"),
+    };
+    let listed = registry()
+        .list_mountinfo()
+        .into_iter()
+        .rev()
+        .find(|row| row.2 == PATH)
+        .map(|row| row.3);
+    let _ = registry().unmount(&handle, PATH);
+    match listed.as_deref() {
+        Some("vfat") => TestResult::Pass,
+        Some(_) => TestResult::Fail("a FAT mount is not listed with the vfat type"),
+        None => TestResult::Fail("the FAT mount is not in the mount listing"),
+    }
+}
+kernel_test_in!("drivers/fs/fat/fstype", smoke_fat_mounts_list_the_vfat_type);
+
 fn smoke_fat_truncate_grow_extends_chain_and_reads_zero() -> TestResult {
     // #692 regression: the grow branch of truncate used to publish
     // the new i_size without extending the cluster chain, so a read

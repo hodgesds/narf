@@ -153,6 +153,26 @@ pub(crate) fn personality_exec(task: u64) {
     }
 }
 
+/// [`personality_exec`] for the image just loaded into `new_as`. An IA-32
+/// image (`AddressSpace::is_compat32_layout`) goes through
+/// `set_personality_ia32` instead, which leaves READ_IMPLIES_EXEC as it was,
+/// and then `elf_read_implies_exec` — `mmap_is_ia32() && executable_stack ==
+/// EXSTACK_DEFAULT` — sets it for an image without PT_GNU_STACK (recorded by
+/// the loader in `compat32::mm`).
+pub(crate) fn personality_exec_image(task: u64, new_as: &AddressSpace) {
+    #[cfg(target_arch = "x86_64")]
+    if new_as.is_compat32_layout() {
+        let wants = crate::compat32::mm::lookup(new_as.identity())
+            .is_some_and(|mm| mm.read_implies_exec);
+        if wants {
+            write_personality(task, read_personality(task) | READ_IMPLIES_EXEC);
+        }
+        return;
+    }
+    let _ = new_as;
+    personality_exec(task);
+}
+
 /// `fork(2)` inheritance: the child gets the parent's personality, as it
 /// gets the whole `task_struct` it was copied from.
 pub fn personality_fork(parent: u64, child: u64) {
@@ -1577,7 +1597,11 @@ fn proc_fd_magic_target(task: u64, user_path: &str) -> Option<alloc::string::Str
 /// The descriptor a `/proc/self/fd/N`, `/proc/thread-self/fd/N` or
 /// `/proc/<pid>/fd/N` link (caller view) refers to: `(owning task, N)`.
 /// `self` and `thread-self` are the caller, whose thread shares the
-/// process's table; a pid is resolved in the caller's pid namespace.
+/// process's table; a pid is resolved in the caller's pid namespace
+/// (`find_task_by_vpid`), the namespace NARF's procfs lists pids in. That is
+/// how `self` reads once resolved: a dirfd opened through `self/fd/` is
+/// `/proc/<caller's own-namespace pid>/fd`. A pid that names no task there
+/// is not a link to anything; the ordinary walk then reports it.
 fn proc_fd_link_owner(task: u64, user_path: &str) -> Option<(u64, u32)> {
     let n = parse_proc_self_fd(user_path)?;
     if user_path.starts_with("/proc/self/fd/")
@@ -1589,9 +1613,9 @@ fn proc_fd_link_owner(task: u64, user_path: &str) -> Option<(u64, u32)> {
         .strip_prefix("/proc/")?
         .split_once('/')?
         .0
-        .parse::<u64>()
+        .parse::<i32>()
         .ok()?;
-    Some((proc_pid_to_tid(pid), n))
+    Some((find_task_by_vpid(task, pid)?, n))
 }
 
 /// Where FOLLOWING a proc-fd magic link lands. `proc_fd_link` hands
@@ -2813,7 +2837,10 @@ fn do_execve_resolved(
 
     // Step 2: copy argv + envp — each a NUL-terminated array of
     // user-mode `char *`, walked until the first null pointer.
-    let argv_strs = match copy_user_strarr(argv_uptr, 1024) {
+    // An i386 execve/execveat (`compat_sys_execve`) passes arrays of 32-bit
+    // pointers.
+    let compat_arrays = ctx.in_ia32_syscall();
+    let argv_strs = match copy_user_strarr(argv_uptr, 1024, compat_arrays) {
         Some(v) => v,
         None => {
             // Faulting argv array pointer → EFAULT.
@@ -2821,7 +2848,7 @@ fn do_execve_resolved(
             return;
         }
     };
-    let envp_strs = match copy_user_strarr(envp_uptr, 4096) {
+    let envp_strs = match copy_user_strarr(envp_uptr, 4096, compat_arrays) {
         Some(v) => v,
         None => {
             // Faulting envp array pointer → EFAULT.
@@ -3139,6 +3166,11 @@ fn do_execve_resolved(
             ctx.set_return(errno_ret(ENOENT)); // -ENOENT
             return;
         }
+        // `open_exec` of the interpreter failed `path_noexec`.
+        Err(crate::process::ProcessLoadError::InterpNoExec) => {
+            ctx.set_return(errno_ret(EACCES));
+            return;
+        }
         Err(_) => {
             // Malformed ELF (bad magic, unsupported class, etc.) → ENOEXEC.
             ctx.set_return(errno_ret(ENOEXEC));
@@ -3159,8 +3191,9 @@ fn do_execve_resolved(
     sigaction_exec_reset(task);
     // `SET_PERSONALITY` on the new image: x86_64's clears READ_IMPLIES_EXEC
     // and keeps everything else, so ADDR_NO_RANDOMIZE survives the exec it
-    // was set for (`setarch -R prog`).
-    personality_exec(task);
+    // was set for (`setarch -R prog`). An IA-32 image takes
+    // `set_personality_ia32` and `elf_read_implies_exec` instead.
+    personality_exec_image(task, &new_proc.address_space);
     // The alternate signal stack, robust-list head, and clear_child_tid
     // uaddr all point into the OLD image's address space — Linux clears
     // all three on exec. A surviving sigaltstack sp would have the next
@@ -3242,6 +3275,9 @@ fn do_execve_resolved(
         let rsp = new_proc.stack_top.as_u64();
         #[cfg(target_arch = "x86_64")]
         let fs_base = new_proc.fs_base;
+        // An ELF32 image enters in compatibility mode (`start_thread_ia32`).
+        #[cfg(target_arch = "x86_64")]
+        let ia32 = new_proc.ia32;
         // The scheduler slot (PENDING_SLOT_AS entry from Step 5) holds the
         // persistent reference that keeps the new AS alive while the task
         // runs; this local clone only bridges the activate() below.
@@ -3298,6 +3334,15 @@ fn do_execve_resolved(
         // the plan came from loading the image mapped in it.
         unsafe { crate::loader::page_in_plan(&new_as, &page_in_plan) };
         drop(page_in_plan);
+        // execve empties the TLS slots and nulls DS/ES/FS/GS (Linux
+        // `flush_thread` clears `tls_array`, `start_thread_common` loads null
+        // selectors) before the new image's FS/GS bases below: an i386
+        // image's %gs descriptor must not survive into its successor.
+        #[cfg(target_arch = "x86_64")]
+        narf_scheduler::stackful::set_current_user_segments(
+            [0; narf_arch::x86_64::segments::GDT_ENTRY_TLS_ENTRIES],
+            narf_arch::x86_64::segments::UserSelectors::default(),
+        );
         #[cfg(target_arch = "x86_64")]
         if let Some(fb) = fs_base {
             // SAFETY: canonical user vaddr from the new image's TLS staging.
@@ -3358,6 +3403,15 @@ fn do_execve_resolved(
         let top = narf_scheduler::stackful::current_stackful_stack_top();
         // This jump skips the syscall return path and its CPU-time hook.
         narf_scheduler::cputime::user_enter();
+        #[cfg(target_arch = "x86_64")]
+        if ia32 {
+            // SAFETY: as below; the loader mapped entry/rsp below 4 GiB. CS =
+            // __USER32_CS with the fresh-image data segments and zero FS/GS
+            // bases (Linux `start_thread_ia32`).
+            unsafe {
+                narf_arch::x86_64::user_mode::enter_user_mode_compat_at_top(entry, rsp, top)
+            };
+        }
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
         // exception stack to this task's top and enters the new image.
         unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) };
@@ -3371,6 +3425,7 @@ fn do_execve_resolved(
         entry: new_proc.entry.0.as_u64(),
         stack_top: new_proc.stack_top.as_u64(),
         fs_base: new_proc.fs_base,
+        ia32: new_proc.ia32,
         // The loader's page-in plan (#740) rides along: the polling
         // routine drives it when it applies this request and first
         // enters the new image. Cloned — `new_proc` is still live here
@@ -3827,21 +3882,26 @@ pub(crate) fn copy_user_cstr_checked(
 /// envp). Each element points to a C string copied via
 /// [`copy_user_cstr`]. Returns `None` on any copy fault or if
 /// the array doesn't terminate within `max_entries`.
+///
+/// `compat`: the array belongs to an i386 call, whose elements are 32-bit
+/// `compat_uptr_t` (`get_user_arg_ptr` under `in_compat_syscall()`).
 fn copy_user_strarr(
     arr_ptr: u64,
     max_entries: usize,
+    compat: bool,
 ) -> Option<alloc::vec::Vec<alloc::string::String>> {
     if arr_ptr == 0 {
         // POSIX permits argv=NULL to mean "no args"; envp=NULL
         // similarly. Treat as empty rather than rejecting.
         return Some(alloc::vec::Vec::new());
     }
+    let slot_len: usize = if compat { 4 } else { 8 };
     let mut out = alloc::vec::Vec::new();
     for i in 0..max_entries {
-        let slot_ptr = arr_ptr.checked_add((i as u64) * 8)?;
+        let slot_ptr = arr_ptr.checked_add((i as u64) * slot_len as u64)?;
         let mut slot_bytes = [0u8; 8];
         // SAFETY: SMAP bracket inside copy_from_user.
-        unsafe { copy_from_user(&mut slot_bytes, slot_ptr) }.ok()?;
+        unsafe { copy_from_user(&mut slot_bytes[..slot_len], slot_ptr) }.ok()?;
         let element_ptr = u64::from_le_bytes(slot_bytes);
         if element_ptr == 0 {
             // NULL terminator → end of array.
@@ -4370,62 +4430,118 @@ struct StatfsBuf {
     f_fsid: u64,    // fs id (two int32; unused → 0)
     f_namelen: u64, // max filename length
     f_frsize: u64,  // fragment size
-    f_flags: u64,   // mount flags (unused)
+    f_flags: u64,   // ST_* mount flags
     f_spare0: u64,
     f_spare1: u64,
     f_spare2: u64,
     f_spare3: u64,
 }
 
-// Linux super-magics (include/uapi/linux/magic.h) userspace probes for.
-const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
-const SYSFS_MAGIC: u64 = 0x6265_6572;
-const PROC_SUPER_MAGIC: u64 = 0x9fa0;
-const MQUEUE_MAGIC: u64 = 0x1980_0202;
-const TMPFS_MAGIC: u64 = 0x0102_1994;
-const RAMFS_MAGIC: u64 = 0x8584_58f6;
-const EXT2_SUPER_MAGIC: u64 = 0xEF53;
+/// `fs/statfs.c::calculate_f_flags`: `ST_VALID`, the `ST_*` twin of each
+/// `MNT_*` restriction and atime mode the mount carries (`flags_by_mnt`), and
+/// the superblock's synchronous, mandatory-lock and read-only state
+/// (`flags_by_sb`). `mnt` is the mount's effective `MNT_*` set, `sb` its
+/// superblock's `SB_*` set.
+fn statfs_f_flags(mnt: u64, sb: u64) -> u64 {
+    use narf_filesystem::{mnt_flags, sb_flags};
+    const ST_RDONLY: u64 = 0x0001;
+    const ST_NOSUID: u64 = 0x0002;
+    const ST_NODEV: u64 = 0x0004;
+    const ST_NOEXEC: u64 = 0x0008;
+    const ST_SYNCHRONOUS: u64 = 0x0010;
+    const ST_VALID: u64 = 0x0020;
+    const ST_MANDLOCK: u64 = 0x0040;
+    const ST_NOATIME: u64 = 0x0400;
+    const ST_NODIRATIME: u64 = 0x0800;
+    const ST_RELATIME: u64 = 0x1000;
+    const ST_NOSYMFOLLOW: u64 = 0x2000;
+    let mut flags = ST_VALID;
+    for (mnt_bit, st) in [
+        (mnt_flags::READONLY, ST_RDONLY),
+        (mnt_flags::NOSUID, ST_NOSUID),
+        (mnt_flags::NODEV, ST_NODEV),
+        (mnt_flags::NOEXEC, ST_NOEXEC),
+        (mnt_flags::NOATIME, ST_NOATIME),
+        (mnt_flags::NODIRATIME, ST_NODIRATIME),
+        (mnt_flags::RELATIME, ST_RELATIME),
+        (mnt_flags::NOSYMFOLLOW, ST_NOSYMFOLLOW),
+    ] {
+        if mnt & mnt_bit != 0 {
+            flags |= st;
+        }
+    }
+    for (sb_bit, st) in [
+        (sb_flags::SYNCHRONOUS, ST_SYNCHRONOUS),
+        (sb_flags::MANDLOCK, ST_MANDLOCK),
+        (sb_flags::RDONLY, ST_RDONLY),
+    ] {
+        if sb & sb_bit != 0 {
+            flags |= st;
+        }
+    }
+    flags
+}
 
 /// Errors are POSITIVE errnos. The destination is only touched after the
 /// filesystem answered — `user_statfs`/`fd_statfs` run `vfs_statfs` first and
 /// `copy_to_user` last — so a bad `buf` never hides a lookup error.
-fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> Result<(), i64> {
+fn fill_statfs_for_path(path: &str, buf_ptr: u64, follow: bool) -> Result<(), i64> {
     // Both statfs(path) and fstatfs(fd) hand us a path in the caller's
     // namespace: fds deliberately retain a chroot-relative path so
     // /proc/self/fd can expose a reopenable link. Re-root it before finding
     // the backing mount, otherwise a chrooted PID 1's /run resolves against
     // NARF's host root rather than /mnt/run.
     let path = resolve_cwd_path(current_task_id(), path);
-    // Map the filesystem covering `path` to its Linux super-magic so callers
-    // detect the fs type (elogind → CGROUP2_SUPER_MAGIC at /sys/fs/cgroup).
+    // `user_statfs` looks the name up with LOOKUP_FOLLOW, so a final symlink
+    // answers for its target's filesystem. A descriptor names its file.
+    let path = if follow {
+        resolve_vfs_symlink_path(&path, true).unwrap_or(path)
+    } else {
+        path
+    };
+    // `statfs_by_dentry`: the superblock behind `path` answers. Its
+    // `->statfs` reports `sb->s_magic` as `f_type` — `FsInstance::magic`,
+    // which callers detect the filesystem by (elogind's CGROUP2_SUPER_MAGIC
+    // at /sys/fs/cgroup, sd-device's SYSFS_MAGIC) — and the capacity numbers.
     let fs = match current_fs_arc_at(&path) {
         Some(fs) => fs,
         None => return Err(ENOENT),
-    };
-    let f_type = match fs.name() {
-        "cgroup2" | "cgroup" => CGROUP2_SUPER_MAGIC,
-        "sysfs" => SYSFS_MAGIC,
-        "procfs" | "proc" => PROC_SUPER_MAGIC,
-        "mqueue" => MQUEUE_MAGIC,
-        "ramfs" => RAMFS_MAGIC,
-        n if n.starts_with("ext") => EXT2_SUPER_MAGIC,
-        _ => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
     };
     let fs_stat = match poll_blocking(fs.statfs()) {
         Some(Ok(stat)) => stat,
         Some(Err(error)) => return Err(copy_fs_errno(error)),
         None => return Err(EIO),
     };
+    let f_bsize = u64::from(fs_stat.block_size);
+    // `if (retval == 0 && buf->f_frsize == 0) buf->f_frsize = buf->f_bsize;`
+    let f_frsize = match fs_stat.fragment_size {
+        0 => f_bsize,
+        fragment_size => u64::from(fragment_size),
+    };
+    // `vfs_statfs`: `buf->f_flags = calculate_f_flags(path->mnt)`.
+    let f_flags = statfs_f_flags(
+        current_mount_flags_at(&path),
+        narf_filesystem::sb_flags::of(&fs),
+    );
+    // `u64_to_fsid(huge_encode_dev(sb->s_dev))` unless the filesystem
+    // derives its own; `huge_encode_dev` is the encoding `st_dev` reports.
+    let f_fsid = fs.statfs_fsid().unwrap_or_else(|| {
+        stat_ino_path_dir_aware(&path)
+            .map(|stat| stat.5.dev)
+            .unwrap_or(0)
+    });
     let stat = StatfsBuf {
-        f_type,
-        f_bsize: u64::from(fs_stat.block_size),
+        f_type: fs.magic(),
+        f_fsid,
+        f_bsize,
         f_blocks: fs_stat.blocks,
         f_bfree: fs_stat.blocks_free,
         f_bavail: fs_stat.blocks_available,
         f_files: fs_stat.files,
         f_ffree: fs_stat.files_free,
         f_namelen: u64::from(fs_stat.name_len),
-        f_frsize: u64::from(fs_stat.fragment_size),
+        f_frsize,
+        f_flags,
         ..Default::default()
     };
     // Copy the statfs struct to user space under the SMAP bracket.
@@ -4471,14 +4587,21 @@ pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::Mou
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
-pub(crate) fn snapshot_current_mount_namespace() -> alloc::sync::Arc<narf_filesystem::MountNamespace>
-{
-    // `copy_mnt_ns` stamps the UNSHARING task's user namespace onto the new
-    // mount namespace, which is what `mount(2)`'s CAP_SYS_ADMIN check is
-    // later measured against. Without it a task that unshared a user
-    // namespace and then a mount namespace would own neither as far as the
-    // capability check could tell, and could not mount inside its own.
-    let owner = ns_owner_for(current_task_id());
+/// Copy the calling task's mount namespace for `unshare(CLONE_NEWNS)` or
+/// `clone(CLONE_NEWNS)`, owned by `owner`.
+///
+/// `copy_mnt_ns(flags, ns, user_ns, new_fs)` records `new_ns->user_ns =
+/// get_user_ns(user_ns)`, and `user_ns` is the NEW credential's namespace:
+/// `unshare_nsproxy_namespaces` passes `new_cred->user_ns` and
+/// `copy_namespaces` passes `task_cred_xxx(tsk, user_ns)` — the child's
+/// credential, which `copy_creds` has already bound to a CLONE_NEWUSER
+/// namespace. That owner is what `may_mount`'s CAP_SYS_ADMIN test is
+/// measured against, so the caller names it rather than this helper reading
+/// the copying task's: for a clone the copier is the parent, whose
+/// credential is the wrong one.
+pub(crate) fn snapshot_current_mount_namespace(
+    owner: Option<alloc::sync::Arc<dyn narf_filesystem::NsOwner>>,
+) -> alloc::sync::Arc<narf_filesystem::MountNamespace> {
     current_mount_namespace()
         .map(|ns| ns.snapshot_owned_by(owner.clone()))
         .unwrap_or_else(|| narf_filesystem::MountNamespace::snapshot_global_owned_by(owner))
@@ -4646,6 +4769,13 @@ pub(crate) fn current_clone_mount_subtree(
         if !seen.insert(relative.clone()) {
             continue;
         }
+        // A mount covered by a later one over a directory above it is out of
+        // reach from the source, and `current_fs_arc_at` would answer for
+        // its path with the covering filesystem instead.
+        let covering = current_covering_mount_info(&mount_path);
+        if covering.is_none_or(|(path, _)| path != mount_path) {
+            continue;
+        }
         if let Some(fs) = current_fs_arc_at(&mount_path) {
             descendants.push((relative, fs));
         }
@@ -4724,10 +4854,12 @@ pub(crate) fn current_mount_arc_with_source(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
+    // `graft_tree`: a mount a task makes goes on top of whatever is mounted
+    // at or below `path`, and covers it.
     let r = if let Some(ns) = current_mount_namespace() {
-        ns.mount_arc_with_source(authority, path, fs, flags, devname)
+        ns.mount_arc_on_top(authority, path, fs, flags, devname)
     } else {
-        narf_filesystem::registry().mount_arc_with_source(authority, path, fs, flags, devname)
+        narf_filesystem::registry().mount_arc_on_top(authority, path, fs, flags, devname)
     };
     // Mount propagation: a filesystem mount attached under a shared mount is
     // mirrored into every peer namespace (Linux `propagate_mnt`). No-op unless
@@ -4956,7 +5088,13 @@ fn propagate_new_mount(new_path: &str) {
             continue;
         }
         let child = join(&peer_path);
-        let _ = narf_filesystem::registry().mount_arc_with_flags(&auth, &child, fs.clone(), flags);
+        let _ = narf_filesystem::registry().mount_arc_on_top(
+            &auth,
+            &child,
+            fs.clone(),
+            flags,
+            None,
+        );
     }
     // Peers in every distinct private namespace.
     for ns in unique_private_mount_namespaces() {
@@ -4968,7 +5106,7 @@ fn propagate_new_mount(new_path: &str) {
                 continue;
             }
             let child = join(&peer_path);
-            let _ = ns.mount_arc_with_flags(&auth, &child, fs.clone(), flags);
+            let _ = ns.mount_arc_on_top(&auth, &child, fs.clone(), flags, None);
         }
     }
 }
@@ -4981,10 +5119,11 @@ fn current_bind_mount(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
+    // On top, as `do_loopback` grafts it (see `current_mount_arc_with_source`).
     let r = if let Some(ns) = current_mount_namespace() {
-        ns.bind_mount(authority, source, target)
+        ns.bind_mount_on_top(authority, source, target)
     } else {
-        narf_filesystem::registry().bind_mount(authority, source, target)
+        narf_filesystem::registry().bind_mount_on_top(authority, source, target)
     };
     // Mount propagation: a bind attached under a shared mount is mirrored into
     // every peer namespace (Linux `propagate_mnt`). Only fires when the parent
@@ -4993,6 +5132,32 @@ fn current_bind_mount(
         propagate_new_mount(target);
     }
     r
+}
+
+/// `pivot_root`'s reattachment of the old root — with every mount below it
+/// except the new root's subtree — at `put_old`, in the caller's mount
+/// namespace. See [`narf_filesystem::VfsRegistry::attach_old_root`].
+pub(crate) fn current_attach_old_root(
+    old_root: &str,
+    new_root: &str,
+    put_old: &str,
+) -> Result<u64, narf_filesystem::FsError> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.attach_old_root(old_root, new_root, put_old)
+    } else {
+        narf_filesystem::registry().attach_old_root(old_root, new_root, put_old)
+    }
+}
+
+/// Where `host` — a path in an old root `pivot_root` moved — is attached now
+/// in the caller's mount namespace. See
+/// [`narf_filesystem::VfsRegistry::pivoted_location`].
+pub(crate) fn current_pivoted_location(host: &str) -> Option<alloc::string::String> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.pivoted_location(host)
+    } else {
+        narf_filesystem::registry().pivoted_location(host)
+    }
 }
 
 pub(crate) fn current_move_mount(
@@ -5206,24 +5371,11 @@ pub fn caller_in_group_or_capable(uid: u32, gid: u32) -> bool {
 
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
-    let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
     let mut s = alloc::string::String::new();
     use core::fmt::Write as _;
-    let rows = mount_namespace_of(task)
-        .map(|ns| ns.list_mountinfo())
-        .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name, mnt_opts, sb_opts, super_flags, source, root) in rows {
-        let visible = if process_root == "/" {
-            path
-        } else if path == process_root {
-            alloc::string::String::from("/")
-        } else if path.starts_with(process_root.as_str())
-            && path.as_bytes().get(process_root.len()) == Some(&b'/')
-        {
-            alloc::string::String::from(&path[process_root.len()..])
-        } else {
-            continue;
-        };
+    for (id, parent, visible, name, mnt_opts, sb_opts, super_flags, source, root) in
+        mountinfo_rows_seen_by(task)
+    {
         // Then the option halves: this attachment's MNT_* flags, the
         // filesystem's `show_options` text, and the superblock's `rw`/`ro` +
         // `show_sb_opts` (procfs renders the first before mountinfo's `-`
@@ -5236,6 +5388,36 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         );
     }
     Some(s)
+}
+
+/// The mount rows `task` sees: its namespace's mounts reachable from its root,
+/// each once, with mount points relative to that root —
+/// `fs/proc_namespace.c::show_mountinfo` printing `seq_path_root` and
+/// skipping a mount the root does not reach, and `do_listmount` /
+/// `do_statmount` asking the same of the caller's root. A `pivot_root`'s
+/// moved mounts are listed once, where this root reaches them
+/// (`VfsRegistry::list_mountinfo_from`).
+pub(crate) fn mountinfo_rows_seen_by(task: u64) -> alloc::vec::Vec<narf_filesystem::MountInfoRow> {
+    let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
+    let rows = mount_namespace_of(task)
+        .map(|ns| ns.list_mountinfo_from(&process_root))
+        .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo_from(&process_root));
+    rows.into_iter()
+        .filter_map(|(id, parent, path, name, mnt_opts, sb_opts, super_flags, source, root)| {
+            let visible = if process_root == "/" {
+                path
+            } else if path == process_root {
+                alloc::string::String::from("/")
+            } else if path.starts_with(process_root.as_str())
+                && path.as_bytes().get(process_root.len()) == Some(&b'/')
+            {
+                alloc::string::String::from(&path[process_root.len()..])
+            } else {
+                return None;
+            };
+            Some((id, parent, visible, name, mnt_opts, sb_opts, super_flags, source, root))
+        })
+        .collect()
 }
 
 /// Current mount-table generation in the named task's mount namespace. Procfs
@@ -5376,7 +5558,14 @@ fn proc_ns_idmap_write(
             "deny" => false,
             _ => return Err(narf_filesystem::FsError::InvalidData),
         };
-        if target_ns.parent().is_none() || !opened.opener_capable(target_ns, CAP_SYS_ADMIN) {
+        // `proc_setgroups_write` judges the request only against the
+        // namespace's state (`write_setgroups`): "allow" after a deny, or
+        // "deny" after a gid_map, is -EPERM — which is what the initial
+        // namespace's identity gid_map makes of "deny". It does not ask
+        // whether the namespace has a parent. The authority to write is the
+        // opener's CAP_SYS_ADMIN over the namespace, which
+        // `proc_setgroups_open` tested and the open captured.
+        if !opened.opener_capable(target_ns, CAP_SYS_ADMIN) {
             return Err(narf_filesystem::FsError::OperationNotPermitted);
         }
         return target_ns
@@ -5661,9 +5850,9 @@ const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
 const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
 const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
-// Wave-73: CLOCK_MONOTONIC_RAW skips NTP slew (we have no NTP, so
-// RAW == MONOTONIC for now). CLOCK_BOOTTIME counts wall time across
-// suspend (no suspend support → same as MONOTONIC).
+// CLOCK_MONOTONIC_RAW is the counter at its own rate; CLOCK_MONOTONIC and
+// CLOCK_BOOTTIME are the NTP-steered clock (`narf_time::steer`), BOOTTIME
+// plus the time spent suspended.
 const CLOCK_MONOTONIC_RAW: u64 = 4;
 const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
@@ -10586,16 +10775,34 @@ fn futex_timeout_deadline(
     timeout_ptr: u64,
     absolute: bool,
     realtime: bool,
+    time32: bool,
 ) -> Result<Option<u64>, i64> {
     if timeout_ptr == 0 {
         return Ok(None);
     }
-    let mut bytes = [0u8; 16];
-    // SAFETY: the syscall supplied a `const struct timespec *`; uaccess
-    // validates the range and SMAP-brackets the fixed-size read.
-    unsafe { copy_from_user(&mut bytes, timeout_ptr) }.map_err(|_| EFAULT)?;
-    let seconds = i64::from_ne_bytes(bytes[0..8].try_into().unwrap());
-    let nanoseconds = i64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+    // `get_timespec64` reads a `struct __kernel_timespec`; the i386
+    // `futex` (240, `sys_futex_time32`) has `get_old_timespec32` read an
+    // 8-byte `struct old_timespec32` instead. Both then pass the same
+    // `timespec64_valid` check.
+    let (seconds, nanoseconds) = if time32 {
+        let mut bytes = [0u8; 8];
+        // SAFETY: the syscall supplied a `const struct old_timespec32 *`;
+        // uaccess validates the range and SMAP-brackets the read.
+        unsafe { copy_from_user(&mut bytes, timeout_ptr) }.map_err(|_| EFAULT)?;
+        (
+            i64::from(i32::from_ne_bytes(bytes[0..4].try_into().unwrap())),
+            i64::from(i32::from_ne_bytes(bytes[4..8].try_into().unwrap())),
+        )
+    } else {
+        let mut bytes = [0u8; 16];
+        // SAFETY: the syscall supplied a `const struct timespec *`; uaccess
+        // validates the range and SMAP-brackets the fixed-size read.
+        unsafe { copy_from_user(&mut bytes, timeout_ptr) }.map_err(|_| EFAULT)?;
+        (
+            i64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            i64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+        )
+    };
     if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
         return Err(EINVAL);
     }
@@ -10607,7 +10814,11 @@ fn futex_timeout_deadline(
         return Ok(Some(monotonic_now.saturating_add(requested)));
     }
     if !realtime {
-        return Ok(Some(requested));
+        // An absolute CLOCK_MONOTONIC timeout is in the steered clock the
+        // program reads; the wait runs on the kernel's counter clock.
+        let lead = i128::from(narf_scheduler::narf_time::steer::offset_ns());
+        let deadline = (i128::from(requested) - lead).clamp(0, i128::from(u64::MAX)) as u64;
+        return Ok(Some(deadline));
     }
     let wall_now = narf_scheduler::narf_time::now_wall().as_nanos();
     let remaining = i128::from(requested).saturating_sub(wall_now);
@@ -18471,7 +18682,7 @@ pub(crate) use {
     handler_sys_munmap::sys_munmap,
     handler_sys_noop_ok::sys_noop_ok,
     handler_sys_open_linux::sys_open_linux,
-    handler_sys_openat::sys_openat,
+    handler_sys_openat::{openat_path, sys_openat},
     handler_sys_openat2::sys_openat2,
     handler_sys_pause::sys_pause,
     handler_sys_personality::sys_personality,

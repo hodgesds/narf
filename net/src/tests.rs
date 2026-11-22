@@ -895,6 +895,8 @@ fn smoke_ipv6_namespace_address_and_route_isolation() -> TestResult {
             iface: alloc::string::String::from("ns6-test"),
             metric: 1,
             valid_deadline_ns: 0,
+            protocol: crate::ipv6::route::RTPROT_KERNEL,
+            pref: crate::ipv6::route::PREF_MEDIUM,
         },
     );
     crate::ipv6::ndp::neigh_upsert_in(
@@ -4949,6 +4951,8 @@ fn smoke_ipv6_routing_connected_direct() -> TestResult {
         iface: alloc::string::String::from("eth0"),
         metric: 100,
         valid_deadline_ns: 0,
+        protocol: crate::ipv6::route::RTPROT_KERNEL,
+        pref: crate::ipv6::route::PREF_MEDIUM,
     });
     let mut dst = [0u8; 16];
     dst[0] = 0x20;
@@ -4981,6 +4985,8 @@ fn smoke_ipv6_routing_default_via_gateway() -> TestResult {
         iface: alloc::string::String::from("eth0"),
         metric: 100,
         valid_deadline_ns: 0,
+        protocol: crate::ipv6::route::RTPROT_KERNEL,
+        pref: crate::ipv6::route::PREF_MEDIUM,
     });
     let mut gw = [0u8; 16];
     gw[0] = 0xFE;
@@ -4993,6 +4999,8 @@ fn smoke_ipv6_routing_default_via_gateway() -> TestResult {
         iface: alloc::string::String::from("eth0"),
         metric: 1024,
         valid_deadline_ns: 0,
+        protocol: crate::ipv6::route::RTPROT_KERNEL,
+        pref: crate::ipv6::route::PREF_MEDIUM,
     });
     // Off-link dst: 2606:4700::1.
     let mut dst = [0u8; 16];

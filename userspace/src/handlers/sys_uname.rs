@@ -44,8 +44,21 @@ pub(crate) fn sys_uname(ctx: &mut dyn TrapContext) {
     off += UTSNAME_FIELD_LEN;
     pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "#1 SMP NARF");
     off += UTSNAME_FIELD_LEN;
+    // `override_architecture` (kernel/sys.c): a task whose execution domain
+    // is PER_LINUX32 sees `COMPAT_UTS_MACHINE` ("i686" on x86) — what
+    // `setarch i686` / `linux32` ask for. Nothing else changes `machine`: an
+    // IA-32 task that has not set the domain sees x86_64, as on Linux.
     #[cfg(target_arch = "x86_64")]
-    let machine = "x86_64";
+    let machine = {
+        // `personality(p)` is the execution-domain byte; PER_LINUX32 = 8.
+        const PER_MASK: u32 = 0x00FF;
+        const PER_LINUX32: u32 = 0x0008;
+        if current_personality() & PER_MASK == PER_LINUX32 {
+            "i686"
+        } else {
+            "x86_64"
+        }
+    };
     #[cfg(target_arch = "aarch64")]
     let machine = "aarch64";
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

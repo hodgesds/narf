@@ -81,7 +81,8 @@ pub(crate) fn sys_clock_settime(ctx: &mut dyn TrapContext) {
         return;
     }
     let target_ns = (sec as i128) * 1_000_000_000 + (nsec as i128);
-    let mono_ns = narf_scheduler::narf_time::monotonic_ns() as i128;
+    // Wall time is the NTP-steered clock plus the offset.
+    let mono_ns = narf_scheduler::narf_time::steer::monotonic_ns() as i128;
     let offset_ns = (target_ns - mono_ns) as i64;
     narf_scheduler::narf_time::set_wall_offset_uncapped(offset_ns);
     // Republish the offset to the vDSO vvar so __vdso_clock_gettime

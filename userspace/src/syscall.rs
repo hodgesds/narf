@@ -124,6 +124,123 @@ pub trait TrapContext {
     /// no-op; real trap frames override it. Used to symbolize a faulting
     /// instruction's operands (e.g. a corrupted heap pointer held in r13/r15).
     fn dump_gprs(&self) {}
+
+    /// Linux `in_ia32_syscall()` (`TS_COMPAT`): this context is servicing an
+    /// i386 system call — x86_64 `int 0x80`, from a 32-bit or a 64-bit task
+    /// alike. `args()` are then ebx, ecx, edx, esi, edi, ebp zero-extended
+    /// and `set_return` writes only eax. Handlers shared with the native
+    /// table check it to pick the compat ABI (`compat32`).
+    fn in_ia32_syscall(&self) -> bool {
+        false
+    }
+
+    /// The trapping user code ran in compatibility mode (CS = `__USER32_CS`,
+    /// Linux `!user_64bit_mode(regs)`). fork/clone copy it into the child's
+    /// `UserProcess::ia32` so the child resumes in the same mode.
+    fn in_compat_mode(&self) -> bool {
+        false
+    }
+
+    /// Which i386 entry point an `in_ia32_syscall()` call came through, where
+    /// one native handler serves several with different user layouts —
+    /// Linux's `clock_gettime32` vs `clock_gettime`, or `fcntl64`'s
+    /// `F_GETLK64` vs `F_GETLK`. The i386 table (`compat32::table`) sets it
+    /// on the context it hands the native handler; every other context,
+    /// the gate's own included, reports [`Ia32Abi::default`].
+    fn ia32_abi(&self) -> Ia32Abi {
+        Ia32Abi::default()
+    }
+}
+
+/// Implement the [`TrapContext`] methods a wrapping context leaves alone by
+/// forwarding them to `self.$inner`: every method but `args`, `set_return`
+/// and `pending_return` (a wrapper exists to re-present or watch those), and
+/// `ia32_abi` as well unless the wrapper names `except_ia32_abi` (the i386
+/// table's own context sets it).
+///
+/// A wrapper that left one of these at the trait default would change what
+/// the handler under it can do: without the real `rip`/`set_rip`,
+/// `save_user_state` or `returning_to_user` a call cannot park and be
+/// re-issued; without `deliver_signal` a signal cannot end the park; without
+/// `in_ia32_syscall`/`in_compat_mode`/`ia32_abi` an i386 call reads native
+/// structure layouts and its children start in the wrong mode. Every wrapper
+/// that hands a native handler the caller's call uses this list.
+macro_rules! forward_trap_context {
+    ($inner:ident) => {
+        $crate::syscall::forward_trap_context!($inner, except_ia32_abi);
+        fn ia32_abi(&self) -> $crate::syscall::Ia32Abi {
+            self.$inner.ia32_abi()
+        }
+    };
+    ($inner:ident, except_ia32_abi) => {
+        fn user_rsp(&self) -> u64 {
+            self.$inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            self.$inner.rip()
+        }
+        fn set_rip(&mut self, rip: u64) {
+            self.$inner.set_rip(rip)
+        }
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.$inner.redirect_to_kernel(rip, rsp)
+        }
+        fn redirect_to_user(&mut self, entry_rip: u64, entry_rsp: u64) -> bool {
+            self.$inner.redirect_to_user(entry_rip, entry_rsp)
+        }
+        unsafe fn save_user_state(&self, out: *mut u8) -> bool {
+            // SAFETY: forwarded unchanged; the caller upholds the trait's
+            // contract for `out`.
+            unsafe { self.$inner.save_user_state(out) }
+        }
+        fn returning_to_user(&self) -> bool {
+            self.$inner.returning_to_user()
+        }
+        fn deliver_signal(&mut self, params: &$crate::syscall::SigDeliveryParams) -> bool {
+            self.$inner.deliver_signal(params)
+        }
+        fn perform_sigreturn(&mut self, sc_vaddr: u64, is_rt: bool) -> bool {
+            self.$inner.perform_sigreturn(sc_vaddr, is_rt)
+        }
+        fn dump_gprs(&self) {
+            self.$inner.dump_gprs()
+        }
+        fn in_ia32_syscall(&self) -> bool {
+            self.$inner.in_ia32_syscall()
+        }
+        fn in_compat_mode(&self) -> bool {
+            self.$inner.in_compat_mode()
+        }
+    };
+}
+pub(crate) use forward_trap_context;
+
+/// The layout choices an i386 call makes beyond `in_ia32_syscall()`. All
+/// `false`/native by default.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ia32Abi {
+    /// User timespecs are `struct old_timespec32` (two `s32`), not
+    /// `struct __kernel_timespec`: the y2038-limited i386 entry points
+    /// (`clock_gettime` 265, `futex` 240, ...), as opposed to their `*_time64`
+    /// twins.
+    pub time32: bool,
+    /// The `struct flock` an `fcntl` record-lock command reads and writes.
+    pub flock: Ia32Flock,
+}
+
+/// `fcntl` lock-structure layout of an i386 call (`fs/fcntl.c`
+/// `do_compat_fcntl64`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Ia32Flock {
+    /// The native `struct flock` (any 64-bit call).
+    #[default]
+    Native,
+    /// `struct compat_flock`: 32-bit `l_start`/`l_len` (F_GETLK/F_SETLK/
+    /// F_SETLKW), with `fixup_compat_flock`'s EOVERFLOW on the way out.
+    Compat,
+    /// `struct compat_flock64`, packed, 24 bytes (F_GETLK64/F_SETLK64/
+    /// F_SETLKW64 and the F_OFD_* commands).
+    Compat64,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3545,7 +3662,9 @@ fn io_accounting_class(variant: Syscall) -> Option<IoClass> {
 
 /// Forwards every `TrapContext` call and records the return, so the
 /// accounting above can see what the handler answered without changing the
-/// value the caller receives.
+/// value the caller receives. The whole context is forwarded
+/// ([`forward_trap_context`]): the read family parks, and the i386 table's
+/// calls come through here too.
 struct IoAccountCtx<'a> {
     inner: &'a mut dyn TrapContext,
     ret: Option<SyscallReturn>,
@@ -3559,17 +3678,59 @@ impl TrapContext for IoAccountCtx<'_> {
         self.ret = Some(ret);
         self.inner.set_return(ret);
     }
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
+    fn pending_return(&self) -> Option<SyscallReturn> {
+        self.inner.pending_return()
     }
-    fn redirect_to_kernel(&mut self, r: u64, s: u64) -> bool {
-        self.inner.redirect_to_kernel(r, s)
-    }
-    fn rip(&self) -> u64 {
-        self.inner.rip()
-    }
-    fn set_rip(&mut self, rip: u64) {
-        self.inner.set_rip(rip)
+    forward_trap_context!(inner);
+}
+
+/// Run `variant`'s handler on `ctx` with the `/proc/<pid>/io` accounting of
+/// the read/write family around it.
+///
+/// Linux does this at ONE funnel — `vfs_read`/`vfs_write` — so every syscall
+/// that reaches the file op is counted and none is counted twice, whichever
+/// entry point (native or compat) led there. NARF's equivalent single point
+/// is here, after dispatch, where the return value of whichever handler ran
+/// is visible. Doing it per handler would mean touching every early-return
+/// path, and `syscr`/`syscw` count FAILED calls too, so the error exits are
+/// exactly the ones that would get missed. Only the read/write family pays
+/// for the wrapper.
+///
+/// A call re-issued after it parked (`syscall_parked_restarting` still set:
+/// the park rewound RIP onto the gate and nothing completed or redirected
+/// the frame since) is the one call Linux makes once and sleeps inside
+/// (`pipe_read`'s wait): its bytes count, a second syscall does not. A
+/// signal that ends the park clears the marker, so a restart after the
+/// handler counts again, as Linux's `-ERESTARTSYS` attempt and its restart
+/// both pass through `vfs_read`.
+fn dispatch_io_accounted(
+    table: &SyscallTable,
+    variant: Syscall,
+    version: u8,
+    ctx: &mut dyn TrapContext,
+) {
+    let Some(class) = io_accounting_class(variant) else {
+        table.dispatch_ctx_versioned(variant, version, ctx);
+        return;
+    };
+    let reissued = crate::user_task::current_user_task().is_some_and(|u| {
+        // SAFETY: the in-flight task's poller-pinned context; atomic load.
+        unsafe { (*u).syscall_parked_restarting.load(Ordering::Acquire) }
+    });
+    let mut cap = IoAccountCtx {
+        inner: ctx,
+        ret: None,
+    };
+    table.dispatch_ctx_versioned(variant, version, &mut cap);
+    let ret = cap.ret.map(|r| r.value as i64).unwrap_or(0);
+    let task = crate::handlers::current_task_id();
+    let read = class == IoClass::Read;
+    if reissued {
+        crate::handlers::io_account_reissued(task, read, ret);
+    } else if read {
+        crate::handlers::io_account_read(task, ret);
+    } else {
+        crate::handlers::io_account_write(task, ret);
     }
 }
 
@@ -3651,24 +3812,8 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                     .store(raw_n.wrapping_add(1), core::sync::atomic::Ordering::Relaxed);
             }
         }
-        // Only read/write-family handlers need their result captured here.
-        // The x86 SYSCALL entry already has the result in its saved context.
-        match io_accounting_class(variant) {
-            Some(class) => {
-                let entry_rip = ctx.rip();
-                let mut cap = IoAccountCtx {
-                    inner: ctx,
-                    ret: None,
-                };
-                table.dispatch_ctx_versioned(variant, version, &mut cap);
-                if cap.rip() == entry_rip {
-                    if let Some(ret) = cap.ret {
-                        class.account(ret.value as i64);
-                    }
-                }
-            }
-            None => table.dispatch_ctx_versioned(variant, version, ctx),
-        }
+        // `/proc/<pid>/io` accounting around the read/write family.
+        dispatch_io_accounted(table, variant, version, ctx);
         #[cfg(feature = "syscall-trace")]
         if syscall_trace_relevant(variant) {
             use core::fmt::Write as _;
@@ -3705,6 +3850,25 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         // is available and that 0 is its ring fd.
         ctx.set_return(SyscallReturn::not_implemented());
     }
+}
+
+/// Run the installed native handler for `variant` on `ctx`, with no number
+/// lookup or seccomp around it: the i386 table (`compat32::table`) serves a
+/// compat syscall whose arguments already match a native handler this way,
+/// after `compat32::dispatch` has done the entry work for the i386 number.
+/// The read/write family's `/proc/<pid>/io` accounting does run
+/// (`dispatch_io_accounted`): Linux counts in `vfs_read`/`vfs_write`, below
+/// every entry point.
+pub fn dispatch_native(variant: Syscall, ctx: &mut dyn TrapContext) {
+    let p = GLOBAL_TABLE.load(Ordering::Acquire);
+    if p.is_null() {
+        ctx.set_return(SyscallReturn::not_implemented());
+        return;
+    }
+    // SAFETY: as in `kernel_syscall_entry`: `p` was published by
+    // `install_global` from a leaked Box that is never freed while installed.
+    let table = unsafe { &*p };
+    dispatch_io_accounted(table, variant, 0, ctx);
 }
 
 /// Comm selector for the `syscall-trace` feature. Set from the kernel cmdline

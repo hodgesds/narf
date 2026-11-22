@@ -44,6 +44,13 @@
 
 extern crate alloc;
 
+/// `setup_net` for a new, non-initial network namespace: run the per-netns
+/// device init. `loopback_net_init` registers the namespace's own `lo`
+/// (ifindex 1, down, no address); every other device is moved in explicitly.
+pub fn create_network_namespace(net_ns_id: u64) {
+    iface::create_namespace_loopback(net_ns_id);
+}
+
 /// Reclaim kernel networking state after the final reference to a non-initial
 /// network namespace disappears.
 pub fn release_network_namespace(net_ns_id: u64) {
@@ -172,6 +179,8 @@ mod tcp_timer_e2e_tests;
 mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tls_client_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod txpool_queue_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod udp_gso_tests;
 #[cfg(any(test, feature = "kernel-test"))]
@@ -433,19 +442,24 @@ pub fn ipv4_flow_queue(
     if queues <= 1 {
         return 0;
     }
-    // Keep this byte-for-byte compatible with the virtio-net fast parser:
-    // addresses and ports are folded in wire order, then a short finalizer
-    // spreads entropy into the low bits selected by `% queues`.
-    let src = u32::from_ne_bytes(src);
-    let dst = u32::from_ne_bytes(dst);
-    let src_port = src_port.to_be_bytes();
-    let dst_port = dst_port.to_be_bytes();
-    let ports = u32::from_ne_bytes([src_port[0], src_port[1], dst_port[0], dst_port[1]]);
-    let mut hash = src ^ dst ^ ports.rotate_left(16) ^ ports;
+    // virtio-net's fast parser (`flow_tx_pair`) calls this, so its posting
+    // queue and the stack's build pool agree. `src ^ dst` and
+    // `src_port ^ dst_port` are the same for both directions of the flow.
+    // The ports are multiplied across the whole word before they meet the
+    // addresses: folded into both halves (`rotate_left(16) ^ ports`) they
+    // cancelled in the finaliser's `h ^ h >> 16`, and one port bit chose
+    // between two queues for every flow of a host pair.
+    let addrs = u32::from_ne_bytes(src) ^ u32::from_ne_bytes(dst);
+    let ports = u32::from(src_port ^ dst_port);
+    let mut hash = addrs ^ ports.wrapping_mul(0x9e37_79b1);
+    // murmur3 `fmix32`: every input bit reaches every output bit.
     hash ^= hash >> 16;
-    hash = hash.wrapping_mul(0x7feb_352d);
-    hash ^= hash >> 15;
-    (hash as usize) % queues
+    hash = hash.wrapping_mul(0x85eb_ca6b);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2_ae35);
+    hash ^= hash >> 16;
+    // Linux `reciprocal_scale` (`skb_tx_hash`): the high bits choose.
+    ((u64::from(hash) * queues as u64) >> 32) as usize
 }
 
 // ── Direction ───────────────────────────────────────────────────────

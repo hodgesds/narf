@@ -190,3 +190,50 @@ kernel_test_in!(
     "drivers/gpu/navi48-transfer",
     cs_kernel_dependency_wait_refuses_terminal_card
 );
+
+/// A job fence exported to a sync_file reports the engine's signal time as
+/// its `dma_fence.timestamp` (`DrmFence::timestamp_ns`), which
+/// `SYNC_IOC_FILE_INFO` hands to clients, not the instant a client happened
+/// to ask.
+fn cs_job_fence_reports_its_engines_signal_time() -> TestResult {
+    struct Stamped;
+    impl Submitter for Stamped {
+        fn submit<'a>(
+            &'a self,
+            _: &'a VmState,
+            _: &'a Submission,
+            _: &'a Arc<crate::amdgpu_ctx::Health>,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + Send + 'a>> {
+            Box::pin(async { Err(FsError::Unsupported) })
+        }
+        fn signalled(&self, ticket: u64) -> bool {
+            ticket == 7
+        }
+        fn signal_time(&self, ticket: u64) -> Option<u64> {
+            (ticket == 7).then_some(1_234_567)
+        }
+        fn ring_for(&self, _: u32, _: u32, _: u32) -> Option<u32> {
+            None
+        }
+        fn wait(
+            &self,
+            ticket: u64,
+            _: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, FsError>> + Send + '_>> {
+            Box::pin(async move { Ok(ticket == 7) })
+        }
+    }
+    let engine: Arc<dyn Submitter> = Arc::new(Stamped);
+    let done = JobFence::new(&engine, 0xfee7, 7, 1);
+    let pending = JobFence::new(&engine, 0xfee7, 8, 1);
+    if narf_filesystem::DrmFence::timestamp_ns(&*done) != Some(1_234_567)
+        || narf_filesystem::DrmFence::timestamp_ns(&*pending).is_some()
+    {
+        return TestResult::Fail("a job fence does not report its engine's signal time");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/fence-time",
+    cs_job_fence_reports_its_engines_signal_time
+);

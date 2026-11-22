@@ -6,7 +6,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_hda_match_amd_phoenix_ids() -> TestResult {
     // Register the HDA driver and verify both supported PCI ids
-    // (AMD Ryzen Phoenix HDA + Radeon HD Audio) appear in the bus
+    // (AMD platform HD-Audio 1022:15e3 + Radeon HD Audio) appear in the bus
     // match table. No live silicon required.
     use crate::hda;
     use narf_bus::driver_match::__reset_for_test as bus_reset;
@@ -23,7 +23,7 @@ fn smoke_hda_match_amd_phoenix_ids() -> TestResult {
     let mut saw_radeon = false;
     for m in regs.iter() {
         if let MatchKind::VendorDevice { vendor, device } = m.kind {
-            if vendor == hda::HDA_AMD_PHOENIX_VENDOR && device == hda::HDA_AMD_PHOENIX_DEVICE {
+            if vendor == hda::HDA_AMD_VENDOR && device == hda::HDA_AMD_ZEN_DEVICE {
                 saw_phoenix = true;
             }
             if vendor == hda::HDA_AMD_RADEON_VENDOR && device == hda::HDA_AMD_RADEON_DEVICE {
@@ -32,7 +32,7 @@ fn smoke_hda_match_amd_phoenix_ids() -> TestResult {
         }
     }
     if !saw_phoenix {
-        return TestResult::Fail("AMD Phoenix 1022:15e3 not in match table");
+        return TestResult::Fail("AMD 1022:15e3 not in match table");
     }
     if !saw_radeon {
         return TestResult::Fail("AMD Radeon 1002:1640 not in match table");
@@ -297,7 +297,7 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
     narf_drivers_sound::sound_fs_initcall();
     let Some(card) = narf_drivers_sound::list_cards()
         .into_iter()
-        .find(|card| card.driver == "hda")
+        .find(|card| card.driver == "HDA-Intel")
     else {
         return TestResult::Fail("HDA missing from sound registry");
     };

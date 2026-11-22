@@ -54,11 +54,14 @@ impl State {
                     }
                     for index in 0..30 {
                         if cause & (1 << index) != 0 && 0x84 + index * 32 <= self.mmio.len {
+                            // Acknowledge completion, FIFO and descriptor
+                            // errors alike. Like Linux
+                            // snd_hdac_bus_handle_stream_irq, a stream error
+                            // does not mark the controller failed: `failed`
+                            // is the command transport's, and the stream's
+                            // own position check sees a dead DMA engine.
                             let status = self.mmio.read8(0x83 + index * 32);
                             self.mmio.write8(0x83 + index * 32, status & 0x1c);
-                            if status & 0x18 != 0 {
-                                self.failed.store(true, Ordering::Release);
-                            }
                         }
                     }
                     self.pending.fetch_or(cause, Ordering::Release);
@@ -316,10 +319,25 @@ mod tests {
             mmio.write32(0x24, 1);
             mmio.write8(0x83, 0x18);
         }
+        // A stream FIFO/descriptor error is acknowledged and nothing more:
+        // Linux snd_hdac_bus_handle_stream_irq clears SD_STS and acts only on
+        // buffer completion. `failed` means the command transport, which a
+        // stream error does not touch, and latching it cut running streams.
+        if handler(Arc::as_ptr(&hda) as u64) != dispatch::IrqStatus::Handled
+            || hda.failed.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("a stream DMA error is acknowledged, not latched");
+        }
+        // A RIRB overrun is a command-transport event and still latches.
+        // SAFETY: owned fake MMIO allocation includes these registers.
+        unsafe {
+            mmio.write32(0x24, 1 << 30);
+            mmio.write8(0x5d, 4);
+        }
         if handler(Arc::as_ptr(&hda) as u64) != dispatch::IrqStatus::Handled
             || !hda.failed.load(Ordering::Acquire)
         {
-            return TestResult::Fail("stream DMA error must latch failure");
+            return TestResult::Fail("a RIRB overrun latches the transport failure");
         }
         let acp = State::new(mmio, Kind::Acp);
         if acp.service() {

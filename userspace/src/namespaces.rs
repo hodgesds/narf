@@ -915,6 +915,10 @@ impl NetNamespace {
                 ifaces: alloc::vec![lo],
             }),
         });
+        // `copy_net_ns` → `setup_net`: the pernet inits, `loopback_net_init`
+        // among them, run before the namespace is published. `Drop` runs
+        // the matching `release_network_namespace`.
+        narf_net::create_network_namespace(ns.id);
         register_ns(&ns, ns_type::NET, owner_id);
         ns
     }

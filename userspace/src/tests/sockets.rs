@@ -1217,6 +1217,8 @@ fn smoke_socket_inet6_udp_connect_source_selection() -> TestResult {
             iface: alloc::string::String::from(IFACE),
             metric: 100,
             valid_deadline_ns: 0,
+            protocol: narf_net::ipv6::route::RTPROT_KERNEL,
+            pref: narf_net::ipv6::route::PREF_MEDIUM,
         });
         if !matches!(
             sock.dispatch_op(crate::socket::SocketOp::Connect {

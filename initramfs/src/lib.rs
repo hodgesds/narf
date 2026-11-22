@@ -198,6 +198,9 @@ impl narf_filesystem::FsInstance for MountProxy {
     fn name(&self) -> &str {
         self.fs.name()
     }
+    fn fs_type(&self) -> &str {
+        self.fs.fs_type()
+    }
 }
 
 /// Stage::Early `initramfs-stage` initcall reports whether

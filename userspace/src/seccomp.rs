@@ -94,6 +94,10 @@ pub const SYS_SECCOMP: i32 = 1;
 pub const AUDIT_ARCH_NATIVE: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 #[cfg(not(target_arch = "aarch64"))]
 pub const AUDIT_ARCH_NATIVE: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+/// `AUDIT_ARCH_I386`: what an i386 system call (x86_64 `int 0x80`,
+/// `TrapContext::in_ia32_syscall`) reports, with its `syscall_32.tbl`
+/// number, exactly as Linux's compat entry does.
+pub const AUDIT_ARCH_I386: u32 = 0x4000_0003;
 
 /// `BPF_MAXINSNS`.
 const BPF_MAXINSNS: usize = 4096;
@@ -109,6 +113,17 @@ const SECCOMP_DATA_SIZE: u32 = 64;
 const STRICT_ALLOWED: [u32; 4] = [63, 64, 93, 139];
 #[cfg(not(target_arch = "aarch64"))]
 const STRICT_ALLOWED: [u32; 4] = [0, 1, 60, 15];
+/// The i386 mode-1 set (`mode1_syscalls_32[]`): read, write, exit, sigreturn.
+const STRICT_ALLOWED_I386: [u32; 4] = [3, 4, 1, 119];
+
+/// The `seccomp_data.arch` a call through `ctx` reports.
+fn syscall_arch(ctx: &dyn TrapContext) -> u32 {
+    if cfg!(target_arch = "x86_64") && ctx.in_ia32_syscall() {
+        AUDIT_ARCH_I386
+    } else {
+        AUDIT_ARCH_NATIVE
+    }
+}
 
 // ── classic BPF (`include/uapi/linux/filter.h`, `bpf_common.h`) ──
 
@@ -1158,8 +1173,18 @@ pub enum Verdict {
     UserNotif(Arc<UserNotifListener>),
 }
 
-/// The decision for syscall `nr` of `task`, without acting on it.
+/// The decision for native syscall `nr` of `task`, without acting on it.
 pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
+    evaluate_arch(task, nr, AUDIT_ARCH_NATIVE, ip, args)
+}
+
+/// [`evaluate`] for a call of `arch` (`AUDIT_ARCH_NATIVE`, or
+/// `AUDIT_ARCH_I386` for an x86_64 `int 0x80` call, whose `nr` is an
+/// i386 number). The constant-action cache describes native numbers only,
+/// so an i386 call always runs the filters (Linux keeps a separate compat
+/// bitmap; NARF has none yet), and strict mode admits the i386 set.
+pub fn evaluate_arch(task: u64, nr: u32, arch: u32, ip: u64, args: [u64; 6]) -> Verdict {
+    let native = arch == AUDIT_ARCH_NATIVE;
     let st = {
         let map = shard(task).lock();
         let Some(st) = map.get(&task) else {
@@ -1167,7 +1192,9 @@ pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
         };
         // `seccomp_cache_check_allow`: decided without running BPF, and
         // without bouncing the shared filter's reference count.
-        if st.mode == SECCOMP_MODE_FILTER && st.filter.as_ref().is_some_and(|f| f.cache_allows(nr))
+        if native
+            && st.mode == SECCOMP_MODE_FILTER
+            && st.filter.as_ref().is_some_and(|f| f.cache_allows(nr))
         {
             return Verdict::Allow;
         }
@@ -1176,7 +1203,12 @@ pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
     match st.mode {
         SECCOMP_MODE_DISABLED => Verdict::Allow,
         SECCOMP_MODE_STRICT => {
-            if STRICT_ALLOWED.contains(&nr) {
+            let allowed: &[u32] = if native {
+                &STRICT_ALLOWED
+            } else {
+                &STRICT_ALLOWED_I386
+            };
+            if allowed.contains(&nr) {
                 Verdict::Allow
             } else {
                 Verdict::StrictKill
@@ -1189,7 +1221,7 @@ pub fn evaluate(task: u64, nr: u32, ip: u64, args: [u64; 6]) -> Verdict {
             };
             let sd = SeccompData {
                 nr: nr as i32,
-                arch: AUDIT_ARCH_NATIVE,
+                arch,
                 instruction_pointer: ip,
                 args,
             };
@@ -1321,7 +1353,8 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
     }
     let a = *ctx.args();
     let args = [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5];
-    match evaluate(task, nr, ctx.rip(), args) {
+    let arch = syscall_arch(ctx);
+    match evaluate_arch(task, nr, arch, ctx.rip(), args) {
         Verdict::Allow => Some(nr),
         Verdict::Return(v) => {
             ctx.set_return(SyscallReturn::ok(v as u64));
@@ -1331,13 +1364,13 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
             // `syscall_rollback`: the handler sees the original registers,
             // the syscall number in the return register included.
             ctx.set_return(SyscallReturn::ok(u64::from(nr)));
-            crate::handlers::force_sigsys_seccomp(ctx, task, nr, AUDIT_ARCH_NATIVE, data, false);
+            crate::handlers::force_sigsys_seccomp(ctx, task, nr, arch, data, false);
             None
         }
         Verdict::KillProcess(data) => {
             mark_dead(task);
             ctx.set_return(SyscallReturn::ok(u64::from(nr)));
-            crate::handlers::force_sigsys_seccomp(ctx, task, nr, AUDIT_ARCH_NATIVE, data, true);
+            crate::handlers::force_sigsys_seccomp(ctx, task, nr, arch, data, true);
             None
         }
         Verdict::KillThread => {
@@ -1360,7 +1393,7 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
                     let new_nr = new_nr as u32;
                     let a = *ctx.args();
                     let args = [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5];
-                    match evaluate(task, new_nr, ctx.rip(), args) {
+                    match evaluate_arch(task, new_nr, arch, ctx.rip(), args) {
                         Verdict::Allow | Verdict::TraceEvent(_) => Some(new_nr),
                         _ => {
                             // A recheck that is not ALLOW skips without a
@@ -1378,7 +1411,7 @@ fn secure_computing_slow(ctx: &mut dyn TrapContext, nr: u32) -> Option<u32> {
             task,
             SeccompData {
                 nr: nr as i32,
-                arch: AUDIT_ARCH_NATIVE,
+                arch,
                 instruction_pointer: ctx.rip(),
                 args,
             },
@@ -2108,4 +2141,85 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace/seccomp", smoke_seccomp_user_notification_queue);
+
+    /// An i386 call (x86_64 `int 0x80`, `TrapContext::in_ia32_syscall`)
+    /// reaches the filter as Linux's compat entry presents it: with
+    /// `AUDIT_ARCH_I386` and its i386 number, never through the native
+    /// constant-action cache. The usual sandbox prologue — refuse any arch
+    /// but x86_64 — must therefore refuse it. Without that, a filtered
+    /// 64-bit task escapes its filter through `int 0x80`: i386 11 is
+    /// `execve`, native 11 is a cached `munmap`.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_seccomp_ia32_call_reports_i386_arch() -> TestResult {
+        struct Ia32Ctx {
+            args: crate::syscall::SyscallArgs,
+            ret: Option<SyscallReturn>,
+        }
+        impl TrapContext for Ia32Ctx {
+            fn args(&self) -> &crate::syscall::SyscallArgs {
+                &self.args
+            }
+            fn set_return(&mut self, ret: SyscallReturn) {
+                self.ret = Some(ret);
+            }
+            fn user_rsp(&self) -> u64 {
+                0
+            }
+            fn rip(&self) -> u64 {
+                0x0804_8000
+            }
+            fn set_rip(&mut self, _rip: u64) {}
+            fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+                false
+            }
+            fn in_ia32_syscall(&self) -> bool {
+                true
+            }
+        }
+        // `if (arch != AUDIT_ARCH_X86_64) return ERRNO(EPERM); return ALLOW;`
+        let prog = validate(alloc::vec![
+            stmt(BPF_LD | BPF_W | BPF_ABS, 4),
+            jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_NATIVE, 1, 0),
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1),
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        ])
+        .expect("arch-check fixture validates");
+        let filter = Arc::new(SeccompFilter::new(prog, None, false, None));
+        // For a native call the arch is a constant, so every number caches.
+        if !filter.cache_allows(11) {
+            return TestResult::Fail("the arch-check filter did not cache native 11");
+        }
+        let task = current_task_id();
+        {
+            let _m = MUTATION.lock();
+            set(
+                task,
+                TaskSeccomp {
+                    mode: SECCOMP_MODE_FILTER,
+                    filter: Some(filter),
+                },
+            );
+        }
+        let mut ctx = Ia32Ctx {
+            args: crate::syscall::SyscallArgs::default(),
+            ret: None,
+        };
+        let dispatched = secure_computing(&mut ctx, 11);
+        {
+            let _m = MUTATION.lock();
+            set(task, TaskSeccomp::default());
+        }
+        if dispatched.is_some() {
+            return TestResult::Fail("an i386 call passed a filter refusing all but x86_64");
+        }
+        if ctx.ret != Some(SyscallReturn::ok((-1i64) as u64)) {
+            return TestResult::Fail("the refused i386 call did not answer the filter's EPERM");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "userspace/seccomp-ia32",
+        smoke_seccomp_ia32_call_reports_i386_arch
+    );
 }

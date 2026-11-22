@@ -4408,15 +4408,17 @@ impl FileOps for SocketFile {
                     const IFF_PROMISC: i16 = 0x100;
                     const IFF_ALLMULTI: i16 = 0x200;
                     const IFF_MULTICAST: i16 = 0x1000;
-                    let mut flags = IFF_MULTICAST;
+                    // `gen_lo_setup`: `dev->flags = IFF_LOOPBACK`, no
+                    // IFF_MULTICAST; `ether_setup` gives every Ethernet
+                    // device IFF_BROADCAST | IFF_MULTICAST.
+                    let mut flags = if name == "lo" {
+                        IFF_LOOPBACK
+                    } else {
+                        IFF_BROADCAST | IFF_MULTICAST
+                    };
                     if iface.link_up {
                         flags |= IFF_UP | IFF_RUNNING;
                     }
-                    flags |= if name == "lo" {
-                        IFF_LOOPBACK
-                    } else {
-                        IFF_BROADCAST
-                    };
                     if iface.promisc {
                         flags |= IFF_PROMISC;
                     }
@@ -4453,8 +4455,35 @@ impl FileOps for SocketFile {
                     ifreq[18..24].copy_from_slice(&iface.mac);
                 }
                 SIOCGIFINDEX => {
-                    let index = narf_net::iface::ifindex_of(&name).ok_or(FsError::NotFound)?;
-                    ifreq[16..20].copy_from_slice(&(index as i32).to_ne_bytes());
+                    // The device of the socket's own namespace
+                    // (`dev_get_by_name_rcu(net, ...)`): a namespace's `lo`
+                    // is its ifindex 1.
+                    ifreq[16..20].copy_from_slice(&(iface.ifindex as i32).to_ne_bytes());
+                }
+                SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR
+                    if self.net_ns_id() != 0
+                        && iface.ifindex == narf_net::iface::LOOPBACK_IFINDEX =>
+                {
+                    // The namespace's own `lo` (`loopback_net_init`): its
+                    // flags and MTU change in place. A loopback device has
+                    // no `ndo_set_mac_address` (-EOPNOTSUPP), and
+                    // `dev_validate_mtu` refuses only a negative MTU.
+                    let change = match cmd {
+                        SIOCSIFFLAGS => {
+                            const IFF_UP: i16 = 0x1;
+                            let flags = i16::from_ne_bytes(ifreq[16..18].try_into().unwrap());
+                            narf_net::iface::LoopbackChange::Link(flags & IFF_UP != 0)
+                        }
+                        SIOCSIFMTU => {
+                            let mtu = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
+                            let mtu = u32::try_from(mtu).map_err(|_| FsError::InvalidPath)?;
+                            narf_net::iface::LoopbackChange::Mtu(mtu)
+                        }
+                        _ => return Err(FsError::Unsupported),
+                    };
+                    narf_net::iface::change_namespace_loopback(self.net_ns_id(), change)
+                        .ok_or(FsError::NoDevice)?;
+                    return Ok(0);
                 }
                 SIOCSIFFLAGS | SIOCSIFMTU | SIOCSIFHWADDR => {
                     let admin = match delegated {
@@ -8944,13 +8973,29 @@ impl SocketFile {
                 // A connected ping socket numbers its datagrams from
                 // `inet_id` (`ip_select_ident_segs` keys on `inet_daddr`).
                 let connected = self.icmp_echo.lock().peer.is_some();
-                match narf_net::icmp_sock::icmp_echo_send(
+                // `ping_v4_sendmsg`: `ipc.oif = sk_bound_dev_if`, else
+                // IP_UNICAST_IF; the source is the bound address.
+                let opts = {
+                    let o = self.options.lock();
+                    let state = self.icmp_echo.lock();
+                    narf_net::icmp_sock::EchoSendOpts {
+                        src: (state.bound && state.local_addr != 0)
+                            .then(|| state.local_addr.to_be_bytes()),
+                        oif: if o.bindtodevice_index != 0 {
+                            o.bindtodevice_index
+                        } else {
+                            o.ext.ip_uc_index
+                        },
+                    }
+                };
+                match narf_net::icmp_sock::icmp_echo_send_with(
                     &echo,
                     target.to_be_bytes(),
                     sequence,
                     &buf[8..],
                     pmtudisc,
                     connected.then_some(&self.inet_id),
+                    opts,
                 ) {
                     Ok(()) => SocketOpResult::Ok(buf.len() as u64),
                     Err(narf_net::icmp_sock::IcmpError2::MsgTooLong)
@@ -8987,9 +9032,22 @@ impl SocketFile {
                 }
                 let peek = flags & MSG_PEEK != 0;
                 if let Some(echo) = self.icmp_echo_socket() {
-                    if let Some((sequence, peer_ip, payload, _rtt_ns)) =
-                        narf_net::icmp_sock::icmp_echo_recv_reply(&echo, peek)
+                    if let Some((sequence, peer_ip, payload, _rtt_ns, rx)) =
+                        narf_net::icmp_sock::icmp_echo_recv_reply_meta(&echo, peek)
                     {
+                        // `ping_recvmsg` → `ip_cmsg_recv`: IP_TTL / IP_TOS /
+                        // IP_PKTINFO from the reply's header and arrival.
+                        let dst = u32::from_be_bytes(rx.dst);
+                        self.stash_inet4_recv_ancillary(Some(Inet4RxInfo {
+                            dst,
+                            dport: 0,
+                            ifindex: rx.ifindex,
+                            spec_dst: dst,
+                            ttl: rx.ttl,
+                            tos: rx.tos,
+                            gso_size: 0,
+                            tstamp_ns: rx_tstamp_now_ns(),
+                        }));
                         let full_len = 8 + payload.len();
                         let mut reply = Vec::with_capacity(full_len);
                         reply.extend_from_slice(&[
@@ -9403,7 +9461,21 @@ impl SocketFile {
                         if let Some(msg) = narf_net::ipv6::icmp6_sock::next_msg(id) {
                             let n = core::cmp::min(buf.len(), msg.body.len());
                             buf[..n].copy_from_slice(&msg.body[..n]);
-                            let peer = make_sockaddr_in6(msg.src_ip, 0);
+                            // `rawv6_recvmsg`: `sin6_scope_id =
+                            // ipv6_iface_scope_id(saddr, inet6_iif(skb))`,
+                            // and `ip6_datagram_recv_ctl` reports the
+                            // destination, ingress device and hop limit.
+                            let link_local = msg.src_ip[0] == 0xfe && msg.src_ip[1] & 0xc0 == 0x80;
+                            let scope = if link_local { msg.ifindex } else { 0 };
+                            let peer = make_sockaddr_in6_scoped(msg.src_ip, 0, scope);
+                            self.stash_inet6_recv_ancillary(Inet6RecvAncillary {
+                                destination: msg.dst_ip,
+                                ifindex: msg.ifindex,
+                                hop_limit: i32::from(msg.hop_limit),
+                                traffic_class: 0,
+                                gso_size: 0,
+                                tstamp_ns: rx_tstamp_now_ns(),
+                            });
                             return SocketOpResult::Received {
                                 n,
                                 peer: Some(peer),
@@ -10251,14 +10323,36 @@ impl SocketFile {
                         let is_loopback = (ip >> 24) == 127;
                         if !is_loopback {
                             let ip_bytes = ip.to_be_bytes();
-                            let syn_retries = self.options.lock().tcp_syncnt as u8;
+                            let (syn_retries, oif) = {
+                                let o = self.options.lock();
+                                (o.tcp_syncnt as u8, o.bindtodevice_index)
+                            };
+                            // `tcp_v4_connect`: a bound socket keeps its
+                            // address and port (`inet_saddr`, `inet_num`).
+                            let bound = match &*self.state.lock() {
+                                SocketState::InetListener {
+                                    addr,
+                                    port,
+                                    listening: false,
+                                    ..
+                                } => Some((*addr, *port)),
+                                _ => None,
+                            };
+                            let options = narf_net::tcp_stack::ConnectOptions {
+                                syn_retries,
+                                local_addr: bound
+                                    .map(|(a, _)| a.to_be_bytes())
+                                    .filter(|a| *a != [0; 4]),
+                                local_port: bound.map_or(0, |(_, p)| p),
+                                oif,
+                            };
                             // `tcp_v4_connect` sends the SYN and returns; the
                             // handshake is waited for (or not) by the caller.
                             match narf_net::tcp_stack::connect_start_in(
                                 self.net_ns_id(),
                                 ip_bytes,
                                 port,
-                                narf_net::tcp_stack::ConnectOptions { syn_retries },
+                                options,
                             ) {
                                 Ok(tcb_id) => {
                                     let r = self.inet_connect_begun(
@@ -10269,7 +10363,13 @@ impl SocketFile {
                                             peer_port: port,
                                         },
                                     );
-                                    if matches!(r, SocketOpResult::Err(SockError::InProgress)) {
+                                    // A bound port stays the socket's (its
+                                    // bind bucket); an autobind reservation
+                                    // the stack's own port choice replaced
+                                    // is given back.
+                                    if matches!(r, SocketOpResult::Err(SockError::InProgress))
+                                        && options.local_port == 0
+                                    {
                                         self.inet_tcp_release_port();
                                     }
                                     return r;
@@ -11493,7 +11593,10 @@ impl SocketFile {
                             self.net_ns_id(),
                             ip,
                             port,
-                            narf_net::tcp_stack::ConnectOptions { syn_retries },
+                            narf_net::tcp_stack::ConnectOptions {
+                                syn_retries,
+                                ..Default::default()
+                            },
                         ) {
                             Ok(tcb_id) => {
                                 let r = self.inet_connect_begun(

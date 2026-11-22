@@ -62,7 +62,12 @@ Sync-file FILE_INFO preserves native `DrmFence::status` errors for each leaf.
 Poll and count-only FILE_INFO remain pending until all leaves terminate;
 terminal errors then make the aggregate readable. Detailed FILE_INFO follows
 Linux's ordered first-nonpositive leaf rule, which can expose an earlier error
-while a later sibling is pending. Intel NONBLOCK presentation exports its native
+while a later sibling is pending. Each leaf is filled as
+`sync_fill_fence_info` does: its status first, then the names and the
+timestamp of a leaf that is signalled, so a nonzero leaf status always comes
+with a nonzero `timestamp_ns` (the driver's recorded signal time, else the
+first instant the file saw the leaf signalled), even for a fence that
+completes during the query. Intel NONBLOCK presentation exports its native
 completion fence in the calling ioctl before the owned background job is
 published; no user address or ioctl context escapes into that worker.
 
@@ -266,6 +271,28 @@ therefore leaves the root unchanged, as on Linux — pacman runs every hook
 with `chroot("/")` inside PID 1's root, and `ldconfig -r .` adds its own
 `chroot(".")`.
 
+`pivot_root(new_root, put_old)` attaches the old root at `put_old` with every
+mount below it except the new root's own subtree, as Linux `path_pivot_root`
+moves the whole old root tree: right after `pivot_root("/tmp", "oldroot")` the
+old root's procfs is at `/oldroot/proc`, and `/proc/self/fd/N` read through it
+names files relative to the caller's new root. The mount table is path-keyed,
+so the attachment copies each entry (filesystem, root, flags, peer group,
+source); the originals stay at their old paths outside the new root, where
+only a descriptor opened before the pivot still reaches them.
+Mount listings — `/proc/<pid>/mountinfo`, `/proc/<pid>/mounts`, `listmount`
+and `statmount` — show the mounts the reader's root reaches, each once, with
+mount points relative to that root and unique ids in attachment order. After
+a pivot a reader in the new root sees the old root's mounts at `put_old`, not
+at their former paths; a task still rooted in the old root (Linux's
+`chroot_fs_refs` would have moved it, NARF does not) sees the old root's tree
+as it was, without the new root's subtree or the `put_old` attachment.
+Mounts left below a `put_old` attachment that is no longer mounted belong to
+no tree and are not listed.
+A directory descriptor opened inside that old root follows it to `put_old`:
+`fchdir` to it lands at its `put_old` location while the attachment is
+mounted, as bubblewrap's `fchdir` back to the old root after its second
+`pivot_root(".", ".")`, before `umount2(".", MNT_DETACH)`, requires.
+
 `narf_user_runtime::execve` does not return on success and returns the kernel's
 positive Linux errno on failure. `narf-libc::execve` publishes that exact value
 through thread-local `errno`; it must not collapse path-resolution failures,
@@ -355,6 +382,36 @@ configuration calls see EBUSY while construction is in progress. Both mount
 APIs attach instances through the caller's mount namespace and report shared
 construction errors (including ENOENT for a missing registered block source).
 Bind, move, remount and propagation operate on existing mount objects.
+`mount_setattr` with `AT_RECURSIVE` applies the attributes to the named mount
+and every mount below it; without it, to the named mount only.
+A mount a task makes — `mount(2)`, a bind or recursive bind, an `fsmount` or
+`open_tree` graft, a propagated copy — goes on top of whatever is mounted at
+or below its mountpoint and covers it until it is unmounted, as Linux's
+`graft_tree` does: after a tmpfs is mounted on a directory, the mounts made
+below that directory earlier are unreachable (`mkdir` of their mountpoint
+names creates in the tmpfs) and appear again once the tmpfs goes.
+`mount(MS_MOVE)` and `move_mount(2)` of an attached mount take it with every
+mount below it (`do_move_mount`) and put the tree on top at the target; a
+target inside the moved tree, the mount itself included, is `ELOOP`.
+`umount2(2)` reaches only the mount a walk reaches at its target: the path
+of a covered mount is `ENOENT`, or `EINVAL` where the cover has a directory
+there.
+Mount listings print each mount's Linux filesystem type
+(`FsInstance::fs_type`: `vfat`, `fuse.<subtype>`, `tmpfs` for an in-memory
+tree, the source's type for a bind), and `/proc/filesystems` lists only
+registered Linux types, not the aliases mount(2) also accepts (`shm`,
+`procfs`, `fat32`, ...).
+`statfs(2)` and `fstatfs(2)` report the filesystem's Linux superblock magic as
+`f_type` (`FsInstance::magic`: `BTRFS_SUPER_MAGIC`, `MSDOS_SUPER_MAGIC` for
+every FAT width, `0xEF53` for ext2/3/4, `DEVPTS_SUPER_MAGIC`, ...; a bind
+answers for its source filesystem, numbers included), `f_flags` as
+`calculate_f_flags` computes it (`ST_VALID`, the `ST_*` twin of each `MNT_*`
+restriction and atime mode, and the superblock's synchronous, mandatory-lock
+and read-only state), and `f_frsize` as `f_bsize` when the filesystem leaves
+it 0. `statfs` follows a final symlink (LOOKUP_FOLLOW); `fstatfs` names the
+descriptor's file. `f_fsid` is the filesystem's own where it derives one
+(ext2 and btrfs from their UUIDs, FUSE none), otherwise the encoded device
+`st_dev` reports (`simple_statfs`, the block filesystems).
 `open_tree(OPEN_TREE_CLONE)` clones the selected mount. Adding `AT_RECURSIVE`
 includes its child mounts. A plain bind of the installed root therefore exposes
 the on-disk directory beneath a mounted `/run`.
@@ -901,7 +958,12 @@ reads its class: `pipe:[ino]`, `socket:[ino]`, `<nstype>:[ino]`,
 `/dmabuf:`. The helpers that re-resolve a descriptor (`fd_path_for_task`: a
 `*at` directory, a reopen or `stat` through the magic link, `fexecve`) return
 a path only while it leads to the file; one whose name was removed is reached
-as an object, like one that never had a name.
+as an object, like one that never had a name. Following `/proc/<pid>/fd/<n>`
+names the descriptor of the task that `<pid>` is in the caller's PID namespace
+(`find_task_by_vpid`, the namespace procfs lists pids in), checked with
+`ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` unless it is the caller's own
+thread group. A `self/fd/` directory opened through a `/proc` fd records that
+own-namespace pid, which is how Chromium's sandbox walks it after chrooting.
 Stdin is `O_RDONLY`, stdout/stderr are
 `O_WRONLY`, and sockets/socketpairs are `O_RDWR`; constructors do not rely on
 type-based access-mode exceptions. Sequential transfer syscalls pin these
@@ -1011,6 +1073,16 @@ byte prefix and advances the directory cursor only through that prefix. The
 unsigned `count` argument is truncated to its native 32-bit ABI width.
 `d_ino` is `DirOps::entry_ino` of the entry where the directory answers it
 (devpts), otherwise a cursor placeholder.
+Every directory lists `.` at position 0 and `..` at position 1 (`DT_DIR`), as
+Linux's `dir_emit_dots` and the on-disk entries of ext2 and FAT
+subdirectories do, whatever the filesystem enumerates; the filesystem's own
+entries follow from position 2, and a `.` or `..` it lists itself is not
+reported again. `.` carries the inode `fstat` reports for the descriptor,
+`..` the inode of the directory above it, or the directory's own at the root
+of a mount of a filesystem's root, whose dentry is its own parent; at a bind
+of a subdirectory it is the directory above that one in the filesystem. Positions are what `d_off` reports, so
+`lseek(fd, 0, SEEK_SET)` lists from `.` again and `seekdir` to a `d_off`
+resumes after the entry that reported it.
 `ioctl(master, TIOCGPTPEER, flags)` returns a slave descriptor that has a
 path like one from `open(2)`, as `ptm_open_peer` opens the devpts dentry:
 `<mnt>/<N>` when the master was opened on that devpts mount's own `ptmx`,
@@ -1243,11 +1315,25 @@ the owning filesystem's mount root. `NOEXEC` and set-id `NOSUID` policy use the
 resolved executable mount, including a script's selected interpreter; a symlink
 on another mount does not supply that policy. `AT_EXECFN` retains the caller's
 spelling. `execveat(2)` retains its explicit `AT_EMPTY_PATH` descriptor semantics.
+An image's `PT_INTERP` is opened the way `open_exec` opens it: under the
+caller's root, with its symlinks expanded through the caller's mounts, so an
+absolute link such as bubblewrap's `/lib64 -> /usr/lib` restarts at the process
+root and reaches a separately mounted `/usr`. An interpreter that cannot be
+resolved fails the `execve` with `ENOENT`; one on a `noexec` mount fails it
+with `EACCES` (`do_open_execat`'s `path_noexec`).
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
 Intermediate symlinks can cross mounts in the caller's mount namespace.
 The resolved inode's mount supplies the read-only check.
+`openat2` with `RESOLVE_IN_ROOT` walks from the dirfd as its root — a leading
+`/` and a `..` at the top both stay at the dirfd — whatever the caller's own
+(chroot or pivoted) root.
+Every new inode, symlinks included, belongs to the creator as Linux's
+`inode_init_owner` assigns it: the filesystem UID, and the filesystem GID or
+the parent directory's group when that directory is setgid. A filesystem that
+keeps no per-inode owners (devtmpfs links, sysfs) leaves its own; a failure
+to record the owner removes the new link and reports the error.
 Legacy `fchmodat` always uses zero flags; `fchmodat2` supports
 `AT_EMPTY_PATH`, including `AT_FDCWD` naming cwd. Chmod preserves all `07777`
 mode bits. Chown preserves a field requested as `(uid_t)-1` and clears setuid
@@ -1258,7 +1344,23 @@ Linux-compatibility shim; capability-based filesystem authority remains the
 security boundary.
 `clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
 CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
-calling task's accumulated user and kernel accounting.
+calling task's accumulated user and kernel accounting. CLOCK_MONOTONIC,
+CLOCK_BOOTTIME and CLOCK_REALTIME are the NTP-steered clock
+(`narf_time::steer::monotonic_ns`, plus `offs_boot` or the wall offset) and
+follow `adjtimex`'s frequency and slews; CLOCK_MONOTONIC_RAW is the counter
+clock (`narf_time::monotonic_ns`) and never does, as Linux's `tkr_raw`.
+`clock_settime` and `settimeofday` set the wall offset against the steered
+clock. timerfds and POSIX timers on CLOCK_MONOTONIC run on the
+MONOTONIC_STEERED hrtimer base; an absolute CLOCK_MONOTONIC `clock_nanosleep`
+or futex timeout is converted to the kernel's counter clock
+(`steer::offset_ns`), and `clock_nanosleep` re-derives it after every wake,
+as it does a CLOCK_REALTIME expiry, so it never ends before the clock the
+program reads gets there (a futex timeout is converted once, so it may end
+up to the NTP rate times its length early or late). The vDSO's vvar page
+publishes the steered timekeeper — `mult`/`shift` (16/20), `cycle_last`
+(40), `base_ns` (48) — and the counter's `raw_mult`/`raw_shift` (56/60),
+republished on every NTP re-anchor (`steer::set_vsyscall_notifier`), and the
+vDSO reads the counter inside its seqlock section.
 The scheduling-policy syscalls (`sched_setscheduler`, `sched_setparam`,
 `sched_setattr`, getters and `sched_rr_get_interval`) publish accepted policy,
 nice, RT priority and custom fair slice to the live scheduler before committing
@@ -1617,7 +1719,18 @@ that retains the named namespace and is accepted by `setns(2)`. An
 `O_PATH|O_NOFOLLOW` open retains symlink-node semantics. Initial UTS, network,
 IPC, PID, mount, user, and enabled cgroup namespaces have stable nonzero
 identities even before a task unshares them.
-User namespace creation grants capabilities only in the new namespace. Real,
+User namespace creation grants capabilities only in the new namespace. Every
+other namespace created by the same `clone(2)`, `clone3(2)`, or `unshare(2)`
+call — mount, UTS, IPC, PID, network, and cgroup — is owned by that new user
+namespace, as Linux `copy_namespaces` and `unshare_nsproxy_namespaces` pass
+the new credential's namespace to every constructor. A
+`clone(CLONE_NEWUSER | CLONE_NEWNS)` child therefore holds `CAP_SYS_ADMIN`
+over its own mount namespace and may change propagation and mount there.
+Creating any non-user namespace through `clone(2)` or `clone3(2)` requires
+`CAP_SYS_ADMIN` over the child credential's user namespace — the caller's own
+unless the same call creates a user namespace, in which the child holds every
+capability — and otherwise fails with `EPERM` before a PID is allocated, as
+`unshare(2)` already does. Real,
 effective, saved, filesystem IDs and supplementary groups retain their
 kernel-global identity across `clone(CLONE_NEWUSER)`, `unshare`, and `setns`.
 Credential getters and inode stat results translate to the caller's namespace;
@@ -1643,6 +1756,11 @@ unprivileged one-ID exception uses the opener's effective UID/GID. Offset must
 be zero and the write shorter than a page. The map's second column is rendered
 in the opener's namespace, or the target's parent when opened from the target.
 Writable `setgroups` opens require target CAP_SYS_ADMIN and capture that grant.
+A `setgroups` write is then refused only by the namespace's state — `allow`
+after `deny`, or `deny` once a gid_map exists — so in the initial namespace
+`allow` succeeds and `deny` is `EPERM`. Opening an id-map file with
+`O_CREAT|O_TRUNC` (Python `open(path, "w")`, a shell `>` redirect) is accepted
+and behaves as a plain write-only open.
 Sysfs exposes Linux memory blocks under `/sys/devices/system/memory/memoryN`
 and each block's `nodeN/memoryN` membership from allocator RAM ranges
 classified by SRAT; CPU topology is never used to infer memory membership.
@@ -2355,7 +2473,12 @@ Native IPv6 raw sockets retain 128-bit local and peer addresses, link-local /
 scope-id routing, and Linux RFC 3542 input filtering via `setsockopt`/`getsockopt`
 with `IPPROTO_ICMPV6` level and `ICMP6_FILTER` (256-bit type mask where bit 0
 passes and 1 blocks). Inbound ICMPv6 messages deliver via `narf_net::ipv6::icmp6_sock`
-with per-socket durable readiness cells for poll and epoll.
+with per-socket durable readiness cells for poll and epoll. Each message carries
+its ingress ifindex and IPv6 hop limit (`icmp6_sock::on_rx_on`); `recvfrom` gives
+a link-local source that ifindex as `sin6_scope_id` (`rawv6_recvmsg`), and
+`recvmsg` reports IPV6_PKTINFO (destination, ifindex) and IPV6_HOPLIMIT when
+requested, as `ip6_datagram_recv_ctl` does — what NetworkManager's ndisc
+(libndp) needs to attribute a Router Advertisement to its device.
 
 Internet sockets implement the legacy network-device ioctl ABI for
 `SIOCGIFNAME`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFMTU`,
@@ -2575,6 +2698,170 @@ idle are never charged.
 task and provides `procfs::ProcessIo`. Both syscall dispatch paths contribute
 completed read/write-family calls. Block submission retains the issuing thread
 group's storage counters across asynchronous completion and process exit.
+
+### 3.7 IA-32 compat ABI (x86_64)
+
+NARF runs i386 Linux programs the way Linux does with `CONFIG_IA32_EMULATION`
+(`fs/compat_binfmt_elf.c`, `arch/x86/entry/syscalls/syscall_32.tbl`).
+
+**ELF32 images.** `elf::parse_from` accepts, on x86_64, an ELFCLASS32
+little-endian image whose `e_machine` is EM_386 or EM_486
+(`compat_elf_check_arch`), decoding the 52-byte `Elf32_Ehdr`, 32-byte
+`Elf32_Phdr` (2048-entry cap) and 8-byte `Elf32_Dyn` (tag sign-extended) into
+the same `ExecImage`. Its kind is `ExecKind::Elf32Exec` / `Elf32Dyn`;
+`ExecKind::is_elf32`, `ExecKind::is_dyn` and `ExecImage::is_compat32` classify
+it. x32 (ELFCLASS32 EM_X86_64) and every other 32-bit image is
+`ElfError::Not64Bit`; an ELF64 header naming EM_386 is `WrongMachine`. An
+ELF32 image's `PT_GNU_PROPERTY` is not decoded (Linux x86 parses no GNU
+properties).
+
+```rust
+pub enum ExecKind { Elf64Exec, Elf64Dyn, Elf32Exec, Elf32Dyn }
+impl ExecKind { pub const fn is_dyn(self) -> bool; pub const fn is_elf32(self) -> bool; }
+impl ExecImage { pub const fn is_compat32(&self) -> bool; }
+```
+
+**The 32-bit layout.** `load_elf_bytes_file` gives an ELF32 image an
+address space from `AddressSpace::new_for_user_compat32` (memory §3): every
+kernel-chosen address lies below `TASK_SIZE_32` = 0xFFFF_E000, laid out
+bottom-up from the compat mmap base `PAGE_ALIGN(TASK_SIZE_32 / 3)` plus a
+random floor (Linux `mmap_compat_legacy_base`). An image is loaded only into
+an address space of its own class (`load_elf_into_at_file` answers
+`WrongMachine` otherwise — Linux's `-ELIBBAD` for a mismatched interpreter).
+
+- ET_EXEC loads at its own vaddrs; a PIE at `ELF_ET_DYN_BASE` = 0x400000 plus
+  the user-image slot, rounded down to its `max_align`; an ET_DYN with no
+  PT_INTERP (`ld-linux.so.2` run as the program) at the mmap floor. A
+  segment outside the compat window is `ImageWindowOverflow`.
+- The interpreter must be ELF32 and takes the next span of the mmap cursor
+  (`load_elf_interp` through `get_unmapped_area`). The kernel applies no
+  relocation to an ELF32 interpreter (`Elf32_Rel` addends are in place).
+- The stack is the 8 MiB reservation ending at `COMPAT32_USER_STACK_TOP` =
+  `TASK_SIZE_32` (`COMPAT32_USER_STACK_BASE` below it), jittered like the
+  64-bit one. The startup block is `create_elf_tables` with `Elf32_Addr`
+  words: 4-byte argc/argv/envp, 8-byte `Elf32_auxv_t`, AT_PHENT 32, AT_PLATFORM
+  "i686", AT_EXECFN, `esp` 16-byte aligned. No vDSO is mapped and neither
+  AT_SYSINFO nor AT_SYSINFO_EHDR is emitted (Linux with `vdso32=0`); no TLS is
+  staged (`fs_base` None, FS/GS bases zero). `UserProcess::ia32` is set, so the
+  first entry is in compatibility mode (frame §3.1).
+- `compat32::mm` records, keyed by `AddressSpace::identity()`, the image's
+  `start_brk` (end of its highest PT_LOAD, page-aligned, or 0x400000 for a
+  loader run directly; randomized by the user-image slot) and whether it
+  wants `READ_IMPLIES_EXEC` (no PT_GNU_STACK). Fork copies the entry and the
+  address-space drop hook removes it. `brk(2)` on an IA-32 address space grows
+  from `start_brk` up to the mmap floor.
+- `MAP_FIXED`/`MREMAP_FIXED` in an IA-32 address space may name any address
+  from `COMPAT32_MMAP_MIN_ADDR` (64 KiB, Linux's default `mmap_min_addr`).
+
+```rust
+pub const process::COMPAT32_USER_STACK_TOP: u64;  // 0xFFFF_E000
+pub const process::COMPAT32_USER_STACK_BASE: u64;
+pub mod compat32::mm {
+    pub const ET_DYN_BASE: u64;                   // 0x400000
+    pub struct CompatMm { pub start_brk: u64, pub read_implies_exec: bool }
+    pub fn register(as_id: u64, mm: CompatMm);
+    pub fn lookup(as_id: u64) -> Option<CompatMm>;
+    pub fn fork(parent_id: u64, child_id: u64);
+    pub fn drop_mm(as_id: u64);
+    pub fn start_brk(image: &ExecImage, program_bias: u64) -> u64;
+    pub fn brk_arena(as_ref: &AddressSpace) -> (u64, u64);
+}
+```
+
+**The i386 table.** `compat32::dispatch` (frame §3.1) hands every call it
+does not serve itself to `compat32::table::dispatch(nr, ctx)`, which maps
+`syscall_32.tbl` numbers onto the native handlers: `forward` for a call
+whose zero-extended registers are the native arguments, `compat32::ctx::
+Ia32ArgsCtx` for one that needs signed arguments sign-extended
+(`__SC_COMPAT_CAST`: `int dfd`, `pid_t`, `clockid_t`), other values, or a
+captured return, and its own function where Linux has a compat entry point
+(`sys_mmap_pgoff`, `compat_sys_ia32_mmap`, `compat_sys_ioctl`). A number
+without an entry is -ENOSYS. Shared handlers choose the i386 layout from
+`TrapContext::in_ia32_syscall()` (iovecs: `import_rw_iovecs_abi`) or, where
+one handler serves several i386 entry points, from `TrapContext::ia32_abi()`
+(`time32`: `clock_gettime32`'s `struct old_timespec32`). `uname` reports
+machine "i686" to a task whose personality domain is PER_LINUX32, on either
+ABI. `compat_sys_ioctl` passes the inode-flags pair (renumbered) and the
+layout-compatible generic and tty commands, and answers ENOTTY (after EBADF)
+for every other command until its `compat_ioctl` conversion exists. i386
+mmap keeps every result below `TASK_SIZE_32` (ENOMEM for a fixed range past
+it; a mapping a 64-bit address space hands back above it is undone).
+
+`dispatch_native` runs the read/write family under the same
+`/proc/<pid>/io` accounting as `kernel_syscall_entry` (Linux counts in
+`vfs_read`/`vfs_write`, below every entry point): `syscr`/`syscw` once per
+call and the bytes it moved, where a call re-issued after it parked
+(`syscall_parked_restarting` still set at entry) adds its bytes but not a
+second call. Every context that wraps another to re-present its arguments or
+watch its return — `Ia32ArgsCtx`, the accounting context, the reshape
+proxies of chmod/chown/openat/xattr, `open_tree_attr`'s capture — forwards
+the rest of the trait through `syscall::forward_trap_context!` (RIP, user
+state, `returning_to_user`, signal delivery and sigreturn, `in_ia32_syscall`,
+`in_compat_mode`, `ia32_abi`), so a call under it parks, restarts and is
+interrupted exactly as one made directly. The sendmmsg/recvmmsg capture is
+the one exception: it reports RIP 0 so its nested call cannot park, and
+forwards only the ABI queries.
+
+```rust
+pub trait TrapContext { /* ... */ fn ia32_abi(&self) -> Ia32Abi { Ia32Abi::default() } }
+pub struct Ia32Abi { pub time32: bool, pub flock: Ia32Flock }
+pub enum Ia32Flock { Native, Compat, Compat64 }
+pub mod compat32::table {
+    pub mod nr;                                  // syscall_32.tbl numbers
+    pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall>;
+    pub fn forward(ctx: &mut dyn TrapContext, variant: Syscall) -> Option<Syscall>;
+}
+```
+
+Phase-1 coverage: exit, exit_group, read, write, readv, writev, open, openat,
+close, pipe, pipe2, dup, dup2, dup3, ioctl, chdir, getcwd, umask, brk, mmap2,
+mmap, munmap, mprotect, uname, personality, getpid, getppid, gettid,
+getuid32, getgid32, geteuid32, getegid32, set_tid_address, sched_yield,
+kill, tkill, tgkill, clock_gettime (time32), clock_gettime64.
+
+Phase-2 coverage (dynamic glibc): stat64, lstat64, fstat64 and fstatat64
+write the packed 96-byte `struct stat64` (`put_linux_stat` under
+`in_ia32_syscall()`, `cp_stat64`); statx, getdents64, access, faccessat,
+faccessat2, readlink, readlinkat, unlink, unlinkat, mkdir, mkdirat, rmdir,
+rename, madvise, mremap, getrandom, getresuid32, getresgid32 pass through;
+lseek sign-extends its `compat_off_t`; `_llseek` and `pread64`/`pwrite64`
+assemble their 64-bit offsets from two registers; `fcntl64`/`fcntl` select
+`Ia32Flock::Compat` (F_GETLK/F_SETLK/F_SETLKW, 16-byte `compat_flock`,
+EOVERFLOW past `COMPAT_OFF_T_MAX`) or `Compat64` (F_*LK64 renamed to
+F_*LK, F_OFD_*, packed 24-byte `compat_flock64`; EINVAL from plain
+`fcntl`); futex reads an `old_timespec32` timeout (`Ia32Abi::time32`) and
+futex_time64 the native one; set_robust_list accepts only the 12-byte
+`compat_robust_list_head`, and the exit walk reads a list registered that
+way with 32-bit pointers and offset; rt_sigaction reads and writes the
+20-byte `compat_sigaction`; rt_sigprocmask passes through (8-byte sets);
+prlimit64 passes through; sched_getaffinity accepts a length in 4-byte
+`compat_ulong_t` units and copies `min(len, cpumask_size())`; the 16-bit
+getuid/getgid/geteuid/getegid go through `high2lowuid` (65534 for an id
+past 16 bits); arch_prctl serves the CPUID and XSTATE-permission options
+and answers EINVAL for the rest; rseq is -ENOSYS.
+
+**Exec.** An i386 `execve` (11) / `execveat` (358) reads argv and envp as
+arrays of 32-bit pointers (`copy_user_strarr` with `compat` from
+`in_ia32_syscall()`); the image it loads may be of either class, and a
+64-bit task's `execve` of an i386 image loads it too (mixed exec). After a
+successful load, `personality_exec_image` applies `SET_PERSONALITY` for the
+image's class: a 64-bit image clears READ_IMPLIES_EXEC
+(`set_personality_64bit`); an IA-32 one keeps the word and sets
+READ_IMPLIES_EXEC when the image has no PT_GNU_STACK
+(`elf_read_implies_exec`, from `compat32::mm`).
+
+**Fork and clone.** i386 `fork` (2), `vfork` (190) and `clone3` (435) pass
+through; `clone` (120, `compat_sys_ia32_clone`) is CONFIG_CLONE_BACKWARDS —
+flags, newsp, parent_tid, tls, child_tid — and swaps tls and child_tid into
+the x86_64 order; `waitpid` (7) is `wait4` with no rusage. Every fork/clone
+child, of either ABI, starts as Linux `copy_thread` leaves it: in the
+caller's mode (`UserProcess::ia32 = TrapContext::in_compat_mode()`) with the
+caller's TLS descriptors and DS/ES/FS/GS (`UserProcess::segs =
+compat32::tls::current_segments()`) and FS/GS bases. CLONE_SETTLS from an
+i386 call (`in_ia32_syscall()`, `set_new_tls`) installs the `struct
+user_desc` at `tls` through `compat32::tls::clone_settls` — an explicit
+slot, no allocation — and fails the clone with its EINVAL/EFAULT before any
+child state is built; from a 64-bit call `tls` stays the FS base.
 
 ## 4. Invariants & safety properties
 

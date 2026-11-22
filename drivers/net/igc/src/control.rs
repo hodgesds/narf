@@ -62,13 +62,15 @@ impl Igc {
         }
         self.quarantine.lock().push(old_queues.clone());
         if let Some(q) = replacement {
-            *self.queues.lock() = q;
+            self.queues.replace(q);
         }
+        self.queues.set_rss(&settings.rss);
         *self.settings.lock() = settings;
         let result = self.reset_and_start();
         if result.is_err() {
             self.quarantine.lock().push(self.queues());
-            *self.queues.lock() = old_queues;
+            self.queues.replace(old_queues);
+            self.queues.set_rss(&old.rss);
             *self.settings.lock() = old;
             return Err(5);
         }
@@ -122,10 +124,7 @@ impl Igc {
         let mut fenced = false;
         if let Ok(_control) = self.control() {
             self.state.store(CHANGING, Ordering::SeqCst);
-            if self
-                .hw
-                .wait(100_000, || self.active.load(Ordering::SeqCst) == 0)
-            {
+            if self.hw.wait(100_000, || self.quiescent()) {
                 fenced = hardware::quiesce(&self.hw, self.num_queues()).is_ok();
                 if fenced {
                     if let Some(table) = self.msix.lock().as_mut() {

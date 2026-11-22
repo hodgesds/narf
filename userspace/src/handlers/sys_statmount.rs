@@ -237,11 +237,12 @@ type VisibleMount = (
     alloc::string::String,
 );
 
+/// The caller's mounts as `do_listmount` / `do_statmount` see them: those its
+/// root reaches, each once, mount points relative to that root
+/// (`mountinfo_rows_seen_by`, which `/proc/<pid>/mountinfo` renders too).
 fn visible_mounts() -> alloc::vec::Vec<VisibleMount> {
-    let rows = mount_namespace_of(current_task_id())
-        .map(|ns| ns.list_mountinfo())
-        .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    rows.into_iter()
+    mountinfo_rows_seen_by(current_task_id())
+        .into_iter()
         .map(|(id, parent, path, fstype, mnt_opts, sb_opts, super_flags, source, root)| {
             // `struct statmount`: "mnt_parent_id — Unique ID of parent (for
             // root == mnt_id)". Linux's root mount has `mnt_parent` pointing

@@ -37,7 +37,7 @@ use crate::handlers::{
     current_clone_mount_subtree, current_clone_tree_at, current_fs_arc_at, current_mount_arc,
     current_mount_arc_with_source, current_mount_devname_at, current_mount_flags_exact,
     current_mount_list, current_set_mount_flags, current_task_id, fd_path_for_task, mount_admin,
-    parse_proc_self_fd, resolve_at_path, resolve_cwd_path, stat_path_dir_aware,
+    parse_proc_self_fd, path_at_or_under, resolve_at_path, resolve_cwd_path, stat_path_dir_aware,
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 
@@ -703,21 +703,11 @@ impl TrapContext for ReturnCapture<'_> {
         self.ret = Some(ret);
     }
 
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
+    fn pending_return(&self) -> Option<SyscallReturn> {
+        self.ret
     }
 
-    fn rip(&self) -> u64 {
-        self.inner.rip()
-    }
-
-    fn set_rip(&mut self, rip: u64) {
-        self.inner.set_rip(rip);
-    }
-
-    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-        self.inner.redirect_to_kernel(rip, rsp)
-    }
+    crate::syscall::forward_trap_context!(inner);
 }
 
 fn discard_open_tree_fd(task: u64, fd_no: u32) {
@@ -1305,6 +1295,7 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
                 match crate::handlers::current_move_mount(&auth, &source, &target) {
                     Ok(()) => ok(0),
                     Err(FsError::Busy) => err(EBUSY),
+                    Err(FsError::SymlinkLoop) => err(ELOOP),
                     Err(_) => err(EINVAL),
                 },
             );
@@ -1767,10 +1758,30 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
         };
         let _ = current_change_propagation(&path, prop, a.arg2 & AT_RECURSIVE != 0);
     }
-    match apply_mount_attr(&path, &attr) {
-        Ok(()) => ctx.set_return(ok(0)),
-        Err(errno) => ctx.set_return(err(errno)),
+    // `mount_setattr_prepare` / `mount_setattr_commit` walk
+    // `for (m = mnt; m; m = next_mnt(m, mnt))` under AT_RECURSIVE: the
+    // attributes land on the mount AND every mount below it. bubblewrap
+    // 0.13 makes a whole `--bind` tree nosuid with one
+    // `mount_setattr(fd, "", AT_EMPTY_PATH | AT_RECURSIVE, NOSUID)`;
+    // applying it to the top mount alone left every submount set-id.
+    let targets: alloc::vec::Vec<alloc::string::String> = if a.arg2 & AT_RECURSIVE != 0 {
+        let mut below: alloc::vec::Vec<alloc::string::String> = current_mount_list()
+            .into_iter()
+            .filter(|mount| mount != &path && path_at_or_under(mount, &path))
+            .collect();
+        below.sort();
+        below.dedup();
+        core::iter::once(path.clone()).chain(below).collect()
+    } else {
+        alloc::vec![path.clone()]
+    };
+    for target in &targets {
+        if let Err(errno) = apply_mount_attr(target, &attr) {
+            ctx.set_return(err(errno));
+            return;
+        }
     }
+    ctx.set_return(ok(0));
 }
 
 /// `build_mount_kattr` + `mount_setattr_commit`: translate `MOUNT_ATTR_*` to

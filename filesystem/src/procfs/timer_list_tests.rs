@@ -115,7 +115,10 @@ fn smoke_timer_list_prints_linux_print_timer_lines() -> TestResult {
     let site = alloc::format!("{}:{}:{}", SITE.file(), SITE.line(), SITE.column());
     let want = [
         String::from("Timer List Version: v0.10"),
-        String::from("HRTIMER_MAX_CLOCK_BASES: 8"),
+        alloc::format!(
+            "HRTIMER_MAX_CLOCK_BASES: {}",
+            narf_time::hrtimer::HRTIMER_MAX_CLOCK_BASES
+        ),
         String::from("now at 100000 nsecs"),
         String::from("cpu: 0"),
         String::from(" clock 0:"),

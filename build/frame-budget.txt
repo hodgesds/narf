@@ -2,64 +2,58 @@
 # (build/xtask/src/frame_budget.rs). <bytes> <function>. This list
 # may only shrink: remove an entry when its function fits. Regenerate
 # (or lower entries): NARF_FRAME_BUDGET_WRITE=1.
-30840 narf_drivers_wireless_iwlwifi::iwlwifi::bootstrap::schedule::{{closure}}
-30728 narf_drivers_wireless_iwlwifi::iwlwifi::bootstrap::Owner::start::{{closure}}
-29832 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::Guard::build_native_wide
-29096 narf_drivers_wireless_rtl::rtl8xxxu::receive_runtime::receive_retune::<impl narf_drivers_wireless_rtl::rtl8xxxu::receive_runtime::Receiver<C,B>>::restore_channel::{{closure}}
-28904 narf_drivers_gpu::amdgpu::claim_navi48
+29816 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::Guard::build_native_wide
+29400 narf_drivers_wireless_rtl::rtl8xxxu::receive_runtime::receive_retune::<impl narf_drivers_wireless_rtl::rtl8xxxu::receive_runtime::Receiver<C,B>>::restore_channel::{{closure}}
+28824 narf_drivers_wireless_ath11k::ath11k::core::pci_start::{{closure}}
 28248 narf_drivers_wireless_iwlwifi::iwlwifi::mvm_device::p2p::<impl narf_drivers_wireless_iwlwifi::iwlwifi::mvm_device::Device>::p2p_begin_locked::{{closure}}
 26728 <narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::Guard as core::ops::drop::Drop>::drop
-26376 <narf_drivers_wireless_ath11k::ath11k::future_heap::HeapFuture<F> as core::future::future::Future>::poll
-25688 narf_drivers_wireless_rtw::rtw89::bootstrap::Bootstrap::generation::{{closure}}
 23976 narf_drivers_wireless_rtw::rtw89::efuse_be::read_factory
 23960 narf_drivers_wireless_rtw::rtw89::efuse_be::BeFactory::read
-23176 <narf_drivers_gpu::out_of_line::OutOfLine<F> as core::future::future::Future>::poll
-21960 narf_drivers_wireless_ath11k::ath11k::pci::probe
-21720 narf_drivers_wireless_ath10k::ath10k::pci::probe
-21464 narf_drivers_wireless_brcm::cyw43439::interface::attach_runtime::{{closure}}
-21368 narf_drivers_wireless_ath10k::ath10k::pci::queue_recovery::{{closure}}
-21240 narf_drivers_wireless_ath10k::ath10k::pci::restart_parked
-21192 narf_drivers_wireless_iwlwifi::iwlwifi::mvm_boot::station::<impl narf_drivers_wireless_iwlwifi::iwlwifi::mvm_boot::Owner>::station_join::{{closure}}
-20728 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::check
-20064 narf_drivers_wireless_rtw::rtw89::bootstrap::attach_cold
-19848 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::composition
+23224 <narf_drivers_gpu::out_of_line::OutOfLine<F> as core::future::future::Future>::poll
+23208 narf_drivers_wireless_iwlwifi::iwlwifi::bootstrap::Owner::start::{{closure}}
+21944 narf_drivers_wireless_ath11k::ath11k::pci::probe
+20552 narf_drivers_gpu::amdgpu::claim_navi48
+19880 narf_drivers_wireless_rtw::rtw89::bootstrap::Bootstrap::generation::{{closure}}
+19864 narf_drivers_wireless_ath10k::ath10k::pci::probe
+19560 narf_drivers_wireless_ath10k::ath10k::pci::queue_recovery::{{closure}}
+19384 narf_drivers_wireless_ath10k::ath10k::pci::restart_parked
 19240 narf_fb::amdgpu_boot::bring_up_navi48
-19168 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::run
-19112 narf_drivers_gpu::amdgpu_navi48_platform::restart::{{closure}}
-18760 <narf_drivers_gpu::amdgpu_navi48_boot::Hardware as narf_drivers_gpu::amdgpu_navi48_boot::Backend>::step::{{closure}}
+18728 narf_drivers_gpu::amdgpu_navi48_platform::restart::{{closure}}
 18392 narf_drivers_gpu::amdgpu_navi48_platform::status
-18008 <narf_drivers_wireless_iwlwifi::iwlwifi::device::Device as narf_wireless::WirelessNetIface>::roam::{{closure}}
 16632 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::after_reset
 16472 narf_userspace::abi_test_support::with_setup
-16064 narf_drivers_wireless_rtl::rtlwifi::prepare::station::<impl narf_drivers_wireless_rtl::rtlwifi::prepare::Prepared<I,M>>::connect_station::{{closure}}::{{closure}}
-15320 narf_drivers_wireless_rtl::rtlwifi::prepare_native::initialize_registered_on_channel::{{closure}}
-14408 narf_drivers_wireless_rtl::rtl8xxxu::rtl8xxxu_probe::{{closure}}
+14112 narf_drivers_wireless_rtw::rtw89::bootstrap::attach_cold
+13896 <narf_drivers_wireless_ath11k::ath11k::future_heap::HeapFuture<F> as core::future::future::Future>::poll
 13848 narf_time::timer::timers_prepare_cpu
-13624 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
-13560 narf_drivers_wireless_ath10k::ath10k::interface::publish_with_mac
+13688 narf_drivers_wireless_ath10k::ath10k::interface::publish_with_mac
+13656 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
 12424 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::draw_inputs
-11984 narf_drivers_wireless_mt76::mt7921::firmware_transport::KeyWork<T>::prepare
 11896 narf_drivers_wireless_ath10k::ath10k::interface::ap::<impl narf_drivers_wireless_ath10k::ath10k::interface::Device<T>>::ap_control::{{closure}}
-11640 narf_drivers_wireless_iwlwifi::iwlwifi::connection::Connection::associate_links_in_domain::{{closure}}
+11144 narf_drivers_wireless_brcm::cyw43439::interface::attach_runtime::{{closure}}
+11016 narf_drivers_gpu::amdgpu_dcn401_otg::dp_phy::training::frontend::video::<impl narf_drivers_gpu::amdgpu_dcn401_otg::Engine<I>>::dp_audio_verify_transport
 10984 <narf_drivers_wireless_rtl::rtl8xxxu::interface::Device<C,B,E> as narf_wireless::WirelessNetIface>::associate::{{closure}}
-10920 narf_drivers_gpu::amdgpu_dcn401_otg::dp_phy::training::frontend::video::<impl narf_drivers_gpu::amdgpu_dcn401_otg::Engine<I>>::dp_audio_verify_transport
+10888 <narf_drivers_wireless_iwlwifi::iwlwifi::device::Device as narf_wireless::WirelessNetIface>::roam::{{closure}}
 10808 narf_drivers_wireless_rtl::rtl8xxxu::service_runtime::Service<C,B,E>::connect::{{closure}}
-10264 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::new
-9896 narf_drivers_wireless_iwlwifi::iwlwifi::mvm_device::Device::execute::{{closure}}
+10408 narf_drivers_wireless_rtl::rtlwifi::prepare_native::initialize_registered_on_channel::{{closure}}
+10328 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::new
+10248 narf_drivers_wireless_iwlwifi::iwlwifi::connection::Connection::associate_links_in_domain::{{closure}}
+9976 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::check
+9688 narf_drivers_wireless_iwlwifi::iwlwifi::mvm_device::Device::execute::{{closure}}
 9512 narf_drivers_net_igb::igb::vmdq::VtState::set_vf_vlan_admin
 9160 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::search_config
+9096 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::composition
 9048 narf_drivers_wireless_mt76::mt7921::association::JoinPlan::prepare_native
 8984 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prepare_media_transport
 8904 narf_drivers_wireless_brcm::brcmfmac::native_runtime::provision_using::{{closure}}
-8808 narf_drivers_wireless_ath11k::ath11k::ahb_live::LiveAhb<E>::core_ready::{{closure}}
-8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table
-8664 narf_drivers_wireless_iwlwifi::iwlwifi::device::ap::<impl narf_drivers_wireless_iwlwifi::iwlwifi::device::Device>::ap_control::{{closure}}
-8648 <narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot as narf_drivers_gpu::amdgpu_navi48_boot::teardown::Backend>::step::{{closure}}
-8576 narf_userspace::sysvipc::sys_msgget
-8360 narf_userspace::abi_test_support::with_memfs
-8296 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prove_media_transport::{{closure}}::{{closure}}
-8296 narf_memory::compress::lz4_encode
-28808 narf_drivers_wireless_ath11k::ath11k::core::pci_start::{{closure}}
-13296 narf_drivers_wireless_ath11k::ath11k::iface::register_ahb
-13144 narf_drivers_wireless_ath11k::ath11k::iface::register_pci_netdev
 8856 narf_drivers_wireless_ath11k::ath11k::pci::mhi_task::{{closure}}
+8752 narf_drivers_wireless_ath11k::ath11k::iface::register_ahb
+8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table
+8680 narf_drivers_wireless_iwlwifi::iwlwifi::device::ap::<impl narf_drivers_wireless_iwlwifi::iwlwifi::device::Device>::ap_control::{{closure}}
+8648 <narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot as narf_drivers_gpu::amdgpu_navi48_boot::teardown::Backend>::step::{{closure}}
+8584 narf_drivers_wireless_ath11k::ath11k::iface::register_pci_netdev
+8576 narf_userspace::sysvipc::sys_msgget
+8504 <narf_drivers_gpu::amdgpu_navi48_boot::Hardware as narf_drivers_gpu::amdgpu_navi48_boot::Backend>::step::{{closure}}
+8416 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::run
+8360 narf_userspace::abi_test_support::with_memfs
+8296 narf_memory::compress::lz4_encode
+8280 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prove_media_transport::{{closure}}::{{closure}}

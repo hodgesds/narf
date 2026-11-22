@@ -53,12 +53,18 @@ use crate::list_cards;
 pub fn render_cards_list() -> String {
     let mut out = String::new();
     for card in list_cards() {
-        // Pad the id field to 15 characters, left-aligned (Linux format).
-        let padded_id = format!("{:<15}", card.id);
+        // `"%2i [%-15s]: %s - %s\n"` then the long name indented 22
+        // columns; the card name stands in for a backend without one.
+        let long_name = crate::card_hardware(card.index)
+            .and_then(|hardware| hardware.long_name())
+            .unwrap_or_else(|| String::from(card.name));
         out.push_str(&format!(
-            " {} [{}]: {} - {}\n",
-            card.index, padded_id, card.driver, card.name
+            "{:2} [{:<15}]: {} - {}\n{:22}{}\n",
+            card.index, card.id, card.driver, card.name, "", long_name
         ));
+    }
+    if out.is_empty() {
+        out.push_str("--- no soundcards ---\n");
     }
     out
 }
@@ -84,6 +90,16 @@ pub fn render_version() -> String {
 ///
 /// Linux ref: `sound/hda/hda_codec.c::hda_codec_info_read`.
 pub fn render_codec_dump(card_index: u32, codec_index: u32) -> String {
+    // A codec driver renders its own codecs (Linux `print_codec_info`).
+    if let Some(text) = crate::card_hardware(card_index).and_then(|hardware| {
+        hardware
+            .codec_proc()
+            .into_iter()
+            .find(|(addr, _)| u32::from(*addr) == codec_index)
+            .map(|(_, text)| text)
+    }) {
+        return text;
+    }
     let cards = list_cards();
     match cards.iter().find(|c| c.index == card_index) {
         None => format!("card {} not found\n", card_index),
@@ -126,8 +142,9 @@ pub fn render_pcm_info(card_index: u32, device: u32, is_capture: bool) -> String
             out.push_str(&format!("device: {}\n", device));
             out.push_str("subdevice: 0\n");
             out.push_str(&format!("stream: {}\n", direction));
-            out.push_str(&format!("id: {}\n", card.id));
-            out.push_str(&format!("name: {}\n", card.name));
+            let (id, name) = crate::pcm_names(card, device, is_capture);
+            out.push_str(&format!("id: {}\n", id));
+            out.push_str(&format!("name: {}\n", name));
             out.push_str("subname: \n");
             out.push_str("class: 0\n");
             out.push_str("subclass: 0\n");
@@ -183,11 +200,103 @@ impl ProcFile for AsoundPcmInfoFile {
     }
 }
 
+/// `/proc/asound/card<N>/id` (Linux `snd_card_id_read`).
+#[derive(Debug)]
+struct AsoundCardIdFile {
+    card_index: u32,
+}
+
+impl ProcFile for AsoundCardIdFile {
+    fn read(&self) -> Vec<u8> {
+        list_cards()
+            .iter()
+            .find(|c| c.index == self.card_index)
+            .map_or_else(Vec::new, |c| format!("{}\n", c.id).into_bytes())
+    }
+}
+
+/// `/proc/asound/card<N>/pcm<M><p|c>/sub0/{hw_params,sw_params,status}`
+/// (Linux `snd_pcm_substream_proc_init`), rendered from the open runtime.
+#[derive(Debug)]
+struct AsoundSubstreamFile {
+    card_index: u32,
+    device: u32,
+    is_capture: bool,
+    file: crate::alsa::SubstreamFile,
+}
+
+impl ProcFile for AsoundSubstreamFile {
+    fn read(&self) -> Vec<u8> {
+        crate::alsa::proc_substream(self.card_index, self.device, self.is_capture, self.file)
+            .into_bytes()
+    }
+}
+
+/// The `sub0` directory of one substream: `info` as the stream's, plus the
+/// three runtime files.
+fn register_substream_procfs(card_index: u32, device: u32, is_capture: bool) {
+    let dir = format!(
+        "asound/card{}/pcm{}{}/sub0",
+        card_index,
+        device,
+        if is_capture { 'c' } else { 'p' }
+    );
+    register_proc(
+        &format!("{}/info", dir),
+        Arc::new(AsoundPcmInfoFile {
+            card_index,
+            device,
+            is_capture,
+        }),
+    );
+    for (name, file) in [
+        ("hw_params", crate::alsa::SubstreamFile::HwParams),
+        ("sw_params", crate::alsa::SubstreamFile::SwParams),
+        ("status", crate::alsa::SubstreamFile::Status),
+    ] {
+        register_proc(
+            &format!("{}/{}", dir, name),
+            Arc::new(AsoundSubstreamFile {
+                card_index,
+                device,
+                is_capture,
+                file,
+            }),
+        );
+    }
+}
+
 // ── Registration entry points ─────────────────────────────────────────
 
 /// Register `/proc/asound/card<N>/*` entries for a single card.
 pub fn register_card_procfs(card: &crate::CardInfo) {
-    for codec in 0..1u32 {
+    register_proc(
+        &format!("asound/card{}/id", card.index),
+        Arc::new(AsoundCardIdFile {
+            card_index: card.index,
+        }),
+    );
+    for m in crate::pcm_devices(card, false) {
+        register_substream_procfs(card.index, m, false);
+    }
+    for m in crate::pcm_devices(card, true) {
+        register_substream_procfs(card.index, m, true);
+    }
+    // One codec#A per codec the backend reports, codec#0 for a card whose
+    // backend reports none.
+    let mut codecs: Vec<u32> = crate::card_hardware(card.index)
+        .map(|hardware| {
+            hardware
+                .codec_proc()
+                .iter()
+                .map(|(addr, _)| u32::from(*addr))
+                .collect()
+        })
+        .unwrap_or_default();
+    if codecs.is_empty() {
+        codecs.push(0);
+    }
+    for codec in codecs {
         register_proc(
             &format!("asound/card{}/codec#{}", card.index, codec),
             Arc::new(AsoundCodecFile {
@@ -196,7 +305,7 @@ pub fn register_card_procfs(card: &crate::CardInfo) {
             }),
         );
     }
-    for m in 0..card.playback_count {
+    for m in crate::pcm_devices(card, false) {
         register_proc(
             &format!("asound/card{}/pcm{}p/info", card.index, m),
             Arc::new(AsoundPcmInfoFile {
@@ -205,26 +314,10 @@ pub fn register_card_procfs(card: &crate::CardInfo) {
                 is_capture: false,
             }),
         );
-        register_proc(
-            &format!("asound/card{}/pcm{}P/info", card.index, m),
-            Arc::new(AsoundPcmInfoFile {
-                card_index: card.index,
-                device: m,
-                is_capture: false,
-            }),
-        );
     }
-    for m in 0..card.capture_count {
+    for m in crate::pcm_devices(card, true) {
         register_proc(
             &format!("asound/card{}/pcm{}c/info", card.index, m),
-            Arc::new(AsoundPcmInfoFile {
-                card_index: card.index,
-                device: m,
-                is_capture: true,
-            }),
-        );
-        register_proc(
-            &format!("asound/card{}/pcm{}C/info", card.index, m),
             Arc::new(AsoundPcmInfoFile {
                 card_index: card.index,
                 device: m,

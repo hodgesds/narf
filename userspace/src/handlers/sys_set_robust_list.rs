@@ -22,9 +22,20 @@ pub(crate) const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 /// marks the wrong words FUTEX_OWNER_DIED — silent corruption instead of
 /// an EINVAL the libc can fall back from. (glibc and musl both pass
 /// exactly 24 here, so this rejects only genuinely mismatched callers.)
+/// `sizeof(struct compat_robust_list_head)`: three 32-bit words. The i386
+/// `set_robust_list` (311, `compat_sys_set_robust_list`) accepts only this,
+/// and the length recorded with the head is how the exit-time walk knows to
+/// read the list with 32-bit pointers (`compat_exit_robust_list`).
+pub(crate) const COMPAT_ROBUST_LIST_HEAD_SIZE: u64 = 12;
+
 pub(crate) fn sys_set_robust_list(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    if a.arg1 != ROBUST_LIST_HEAD_SIZE {
+    let head_size = if ctx.in_ia32_syscall() {
+        COMPAT_ROBUST_LIST_HEAD_SIZE
+    } else {
+        ROBUST_LIST_HEAD_SIZE
+    };
+    if a.arg1 != head_size {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }

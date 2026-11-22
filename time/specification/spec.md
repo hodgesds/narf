@@ -83,12 +83,30 @@ TSC frequency. Before calibration, `cycles_to_ns` and `ns_to_cycles` use an
 identity fallback; hardware minimum delays and timeouts must not treat it as
 wall time (a >1 GHz TSC makes such waits too short).
 
+On AMD Family 17h+ the `MSR_AMD_PSTATE_DEF_0` decode is only the early
+estimate (the P0 multiple of a nominal 100 MHz reference; a 4700 MHz P0 is
+a 4691.189 MHz TSC on the 7600X it was found on).
+`amd_tsc_hz(pstate0_hz, hpet::refine_tsc_hz)` refines it as Linux's
+`tsc_refine_calibration_work` does: `hpet::refine_tsc_hz(early_hz)` measures
+the TSC against the HPET singleton over 100 ms with a `tsc_khz >> 5`
+reference-read bracket, and a result within 1% of the estimate is the rate
+(`CalibrationSource::AmdPstate0Hpet`, "amd-pstate0+hpet"); otherwise, or
+without an HPET, the estimate stays (`AmdPstate0`). The rate is final once
+chosen: `monotonic_ns` is the TSC scaled by one rate, so it is never
+replaced after boot, and a caller that calibrates before `hpet::init` (the
+amdgpu firmware handoff) caches the unrefined estimate.
+
 `hpet::calibrate_tsc_at(mapped_base)` is an unsafe x86_64 boot-only
 measurement for callers running before timer installation. The caller owns
 an uncached HPET mapping exclusively. It enables and samples a 64-bit main
 counter without publishing the singleton, changing the physical-base override
 or programming comparators. Both this path and singleton calibration bound
 counter reads and return unavailable for a stopped counter or invalid ratio.
+Each end of an HPET calibration window is a Linux `tsc_read_refs` sample:
+the HPET read sits between two TSC reads, the later one is the TSC end of
+the window, and a pair `TSC_DEFAULT_THRESHOLD` (0x20000) cycles or more
+apart — an SMI or NMI between the HPET latch and the TSC read — is retried,
+at most `MAX_RETRIES` (5) times before the measurement is unavailable.
 
 `hpet::init` takes exclusive boot ownership: it disables inherited comparator
 interrupts and legacy replacement routing, acknowledges all channel latches,
@@ -173,7 +191,7 @@ pub fn next_deadline() -> Option<Instant>;
 | Linux | NARF |
 | --- | --- |
 | `struct hrtimer_cpu_base` (per CPU) | `HrTimerCpuBase`, allocated per CPU at bring-up (`hrtimers_prepare_cpu`); a static array holds only pointers |
-| `HRTIMER_MAX_CLOCK_BASES` = MONOTONIC, REALTIME, BOOTTIME, TAI + `_SOFT` | same eight clock bases; REALTIME/TAI expiries convert through the wall (+TAI) offset, BOOTTIME through `offs_boot` (time spent suspended; MONOTONIC excludes it, `timekeeping_suspend`/`timekeeping_resume` around s2idle). Clockevents are programmed on raw counter time (`mono_to_raw_cycles`) |
+| `HRTIMER_MAX_CLOCK_BASES` = MONOTONIC, REALTIME, BOOTTIME, TAI + `_SOFT` | ten bases: those four plus MONOTONIC_STEERED (`ClockId::MonotonicSteered`), each with `_SOFT`. MONOTONIC is the kernel's counter clock (`monotonic_ns`); MONOTONIC_STEERED is CLOCK_MONOTONIC as programs read it (`steer::monotonic_ns`), the base timerfd and POSIX timers on CLOCK_MONOTONIC run on — Linux needs no such base because its kernel timers run on the steered clock too. Every other base's offset is the steered clock's lead over the counter clock (`steer::offset_ns`), plus the wall (+TAI) offset for REALTIME/TAI and `offs_boot` for BOOTTIME (time spent suspended; MONOTONIC excludes it, `timekeeping_suspend`/`timekeeping_resume` around s2idle); expiry checks each base against its own clock, so a timer never fires before its clock reaches it as the NTP rate moves. Clockevents are programmed on raw counter time (`mono_to_raw_cycles`) |
 | `struct timerqueue_head` (rbtree, leftmost cached) | `timerqueue::TimerQueueHead`: intrusive red-black tree, earliest cached; FIFO on equal expiry |
 | `struct hrtimer`, `hrtimer_setup` | `HrTimer::new(fn, clock, mode)` — caller-owned storage, intrusive node |
 | `hrtimer_start_range_ns`, `_softexpires` / `expires` | `hrtimer_start_range_ns(timer, tim, delta, mode)`; expiry runs at `softexpires`, the clockevent is programmed for `expires` |
@@ -361,16 +379,47 @@ daemon clears the bit. `userspace/`'s `adjtimex` / `clock_adjtime` handlers
 own the user-struct copy, the `CAP_SYS_TIME` gate and the `ADJ_SETOFFSET`
 step into the wall offset; everything else is state kept here.
 
-The discipline loop exists now (issue #1764): `ADJ_OFFSET` runs the full
-Linux `ntp_update_offset()` (PLL + FLL frequency learning against
-`time_reftime`), and `tick_second()` — driven once per wall second from
-the clockevent tick — drains `time_offset` exponentially into the wall
-offset, which is where phase lands on NARF (there is no timekeeper
-multiplier to steer). The slew is therefore applied at 1 Hz granularity:
-each second's jump is at most `MAXPHASE >> (SHIFT_PLL + time_constant)`.
-What is still missing, see the `narf_time::ntp` module docs: the leap
-state machine on this path (that is §3.5's smear), the `ADJ_ADJTIME`
-single-shot drain, and PPS.
+The discipline loop steers the clocks programs read, as Linux's
+`ntp_tick_length()` → `timekeeping_adjust()` does (`narf_time::steer`):
+
+```rust
+pub mod steer {
+    pub struct Params { pub cycle_last: u64, pub base_ns: u64, pub mult: u32, pub shift: u32 }
+    impl Params { pub fn ns_at(&self, cyc: u64) -> u64; } // base_ns + ((cyc - cycle_last) * mult) >> shift
+    pub fn params() -> Params;          // seqlock snapshot (the vDSO publishes it)
+    pub fn monotonic_ns() -> u64;       // CLOCK_MONOTONIC as userspace reads it
+    pub fn offset_ns() -> i64;          // steered minus counter clock, now
+    pub fn rate() -> i64;               // ns/s << 32 the steered clock runs fast (+) of the counter
+    pub fn set_rate(rate: i64);         // re-anchor at now, clamp ±11% (clocksource maxadj)
+    pub fn set_vsyscall_notifier(f: fn()); // update_vsyscall
+}
+```
+
+The steered clock is the counter (`now_cycles`) scaled by a multiplier the
+NTP state sets; the rate is the tick length minus one second:
+`tick_usec · USER_HZ` µs − 1 s, plus `time_freq` (clamped to ±500 ppm,
+`MAXFREQ_SCALED`), plus the share `second_overflow()` added for this
+second — one `ntp_offset_chunk()` of `time_offset` and up to `MAX_TICKADJ`
+(500 µs) of an `adjtime(3)` offset. `adjtimex` changing the tick, the
+frequency or the phase applies the new rate at once (`ntp_update_frequency`),
+`apply_sample` does when the PLL learned a frequency, and `tick_second()`
+recomputes it once per second; the clockevent tick runs `tick_second()` once
+for every second that passed (at most 64 per tick). Every re-anchor keeps
+the clock continuous and runs the vsyscall notifier. `now_wall()`
+(CLOCK_REALTIME) is the steered clock plus the wall offset, which only steps
+(`ADJ_SETOFFSET`, `clock_settime`, an SNTP sample over the step threshold)
+move. Before the first rate the steered clock is the counter clock, and a
+change of the counter's scale (`set_clock_hz`) or `ntp::__test_reset`
+returns it there.
+
+The kernel's own timeline is not steered: `monotonic_ns()`, `now_cycles()`,
+every `Instant` / `Deadline`, the hrtimer MONOTONIC base and the kernel log's
+timestamps keep the counter's rate, as Linux's `sched_clock` / `local_clock`
+and its printk timestamps do. A slew is therefore never seen by a hardware
+delay or a kernel timeout.
+
+Still missing, see the `narf_time::ntp` module docs: the leap state machine
+on this path (that is §3.5's smear), and PPS.
 
 ## 4. Invariants & safety properties
 
@@ -440,7 +489,9 @@ single-shot drain, and PPS.
   uncalibrated InitialCount mode is available, or the LAPIC timer stops in
   deep C-states (no ARAT).
 - **Boot calibration:** TSC ↔ PM timer or HPET cross-check to get
-  frequency; CPUID leaf `0x15` on supported silicon.
+  frequency; CPUID leaf `0x15` on supported silicon. AMD's P-state-0
+  definition is an estimate the HPET measurement refines (§3.1); Linux
+  likewise takes no AMD TSC rate from a P-state.
 - **SMP sync:** TSC is architecturally synchronised across cores on
   invariant-TSC silicon; still verify at boot to catch BIOS bugs.
 

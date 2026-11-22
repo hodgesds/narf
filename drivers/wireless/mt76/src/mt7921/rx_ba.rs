@@ -109,10 +109,14 @@ impl Request {
         body
     }
     pub fn delba(self, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
+        self.delba_reason(own, peer, 39) // WLAN_REASON_QSTA_TIMEOUT.
+    }
+    /// The recipient DELBA for this agreement with `reason`.
+    pub fn delba_reason(self, own: [u8; 6], peer: [u8; 6], reason: u16) -> Vec<u8> {
         let mut frame = action(own, peer, 30);
         frame[24..26].copy_from_slice(&[3, 2]);
         frame[26..28].copy_from_slice(&(u16::from(self.tid) << 12).to_le_bytes()); // Recipient, initiator=0.
-        frame[28..30].copy_from_slice(&39u16.to_le_bytes()); // WLAN_REASON_QSTA_TIMEOUT.
+        frame[28..30].copy_from_slice(&reason.to_le_bytes());
         frame
     }
 }
@@ -182,6 +186,9 @@ pub(super) struct Owner {
     agreements: [Option<Agreement>; TIDS],
     work: VecDeque<Work>,
     ready: VecDeque<Ready>,
+    /// mac80211 `sta->ampdu_mlme.unexpected_agg`: TIDs that already got a
+    /// DELBA for aggregation without an agreement, until one activates.
+    unexpected: u8,
 }
 impl Default for Owner {
     fn default() -> Self {
@@ -190,6 +197,7 @@ impl Default for Owner {
             agreements: core::array::from_fn(|_| None),
             work: VecDeque::new(),
             ready: VecDeque::new(),
+            unexpected: 0,
         }
     }
 }
@@ -296,7 +304,32 @@ impl Owner {
         }
         a.phase = Phase::Active;
         a.activity = now;
+        // agg-rx.c `__ieee80211_start_rx_ba_session`: a valid session
+        // re-arms the one-shot DELBA for unexpected aggregation.
+        self.unexpected &= !(1u8 << tid);
         true
+    }
+    /// mac80211 `ieee80211_rx_reorder_ampdu` (`rx.c`): a Block Ack policy
+    /// subframe on `tid` with no agreement (`!agg_session_valid`) asks the
+    /// originator to stop or set one up with one DELBA per TID
+    /// (`test_and_set_bit(tid, unexpected_agg)`). True when the caller sends it.
+    pub fn unexpected(&mut self, tid: u8) -> bool {
+        if usize::from(tid) >= TIDS || self.owns(tid) {
+            return false;
+        }
+        let bit = 1u8 << tid;
+        let first = self.unexpected & bit == 0;
+        self.unexpected |= bit;
+        first
+    }
+    /// The recipient DELBA for aggregation on `tid` without an agreement:
+    /// initiator 0 (recipient), WLAN_REASON_QSTA_REQUIRE_SETUP (38).
+    pub fn unexpected_delba(tid: u8, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
+        let mut frame = action(own, peer, 30);
+        frame[24..26].copy_from_slice(&[3, 2]);
+        frame[26..28].copy_from_slice(&(u16::from(tid) << 12).to_le_bytes());
+        frame[28..30].copy_from_slice(&38u16.to_le_bytes());
+        frame
     }
     pub fn response_complete(&mut self, tid: u8, epoch: u64, now: u64) {
         if let Some(a) = self
@@ -368,12 +401,15 @@ impl Owner {
     pub fn reset_after_quiescence(&mut self) {
         self.fence();
         self.agreements = core::array::from_fn(|_| None);
+        self.unexpected = 0;
     }
     pub fn begin_connection(&mut self) -> bool {
         if self.agreements.iter().any(Option::is_some) || self.epoch == u64::MAX {
             return false;
         }
         self.fence();
+        // A new association starts with a fresh `sta->ampdu_mlme`.
+        self.unexpected = 0;
         true
     }
     fn distance(sequence: u16, head: u16) -> u16 {

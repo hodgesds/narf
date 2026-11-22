@@ -168,6 +168,11 @@ pub struct FatVolume<B: BlockDevice> {
     /// [`EntryLocator`]). Weak for the same reason as `mmap_anchors`:
     /// a file no open node references gives its locator up.
     entry_locators: IrqSafeSpinLock<BTreeMap<u64, Weak<EntryLocator>>>,
+    /// `sbi->free_clusters` once `free_clus_valid`: the free clusters
+    /// [`FatVolume::count_free_clusters`] found, `None` until a statfs counts
+    /// them and again after any FAT entry changes. The first word is bumped
+    /// on every change, so a count that raced one is not kept.
+    free_clusters: IrqSafeSpinLock<(u64, Option<u32>)>,
 }
 
 /// Boot-global source of generation epochs (#732). A generation is
@@ -386,6 +391,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
             mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
             entry_locators: IrqSafeSpinLock::new(BTreeMap::new()),
+            free_clusters: IrqSafeSpinLock::new((0, None)),
         }))
     }
 
@@ -711,14 +717,67 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             super::fat::write_entry(self.version, cluster, ent_offset, &mut buf, value);
         }
         let fat_sz = self.bpb.fat_size(self.fat32_ext.as_ref());
-        for i in 0..self.bpb.num_fats {
-            let fat_sec = sec_num + (i as u32 * fat_sz);
-            self.write_sector(fat_sec as u64, &buf).await?;
-            if let Some(second) = &next {
-                self.write_sector(fat_sec as u64 + 1, second).await?;
+        let written: Result<(), FsError> = async {
+            for i in 0..self.bpb.num_fats {
+                let fat_sec = sec_num + (i as u32 * fat_sz);
+                self.write_sector(fat_sec as u64, &buf).await?;
+                if let Some(second) = &next {
+                    self.write_sector(fat_sec as u64 + 1, second).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        // The FAT changed (or may have, partway): the next statfs counts the
+        // free clusters again.
+        {
+            let mut free = self.free_clusters.lock();
+            free.0 = free.0.wrapping_add(1);
+            free.1 = None;
+        }
+        written
+    }
+
+    /// `fat_count_free_clusters`: every FAT entry from cluster 2 up to the
+    /// last data cluster, read a FAT sector at a time. An entry a FAT12
+    /// sector boundary splits is read across both sectors.
+    pub async fn count_free_clusters(&self) -> Result<u32, FsError> {
+        let end = self.total_data_clusters() + 2;
+        let lbs = self.io.lock().await.lbs;
+        let mut buf = vec![0u8; lbs];
+        let mut loaded = None;
+        let mut free = 0u32;
+        for cluster in 2..end {
+            let (sec_num, ent_offset) = self.sector_of_fat_entry(cluster);
+            let entry = if self.fat_entry_straddles(ent_offset, lbs) {
+                self.next_cluster(cluster).await?
+            } else {
+                if loaded != Some(sec_num) {
+                    self.read_sector(sec_num as u64, &mut buf).await?;
+                    loaded = Some(sec_num);
+                }
+                super::fat::parse_entry(self.version, cluster, ent_offset, &buf)
+            };
+            if matches!(entry, super::fat::FatEntry::Free) {
+                free += 1;
             }
         }
-        Ok(())
+        Ok(free)
+    }
+
+    /// The free-cluster count, counted when it is not known
+    /// (`fat_statfs`: `if (sbi->free_clusters == -1 || !sbi->free_clus_valid)`).
+    async fn free_cluster_count(&self) -> Result<u32, FsError> {
+        let (generation, known) = *self.free_clusters.lock();
+        if let Some(free) = known {
+            return Ok(free);
+        }
+        let free = self.count_free_clusters().await?;
+        let mut slot = self.free_clusters.lock();
+        if slot.0 == generation {
+            slot.1 = Some(free);
+        }
+        Ok(free)
     }
 
     pub async fn allocate_cluster(&self) -> Result<u32, FsError> {
@@ -827,6 +886,29 @@ impl<B: BlockDevice + 'static> FsInstance for FatVolume<B> {
         narf_block::disk_policy::policy().is_root_policy() && self.device.is_read_only()
     }
 
+    /// `fat_statfs`: the cluster is the block, the data clusters are
+    /// `f_blocks`, the free ones (`fat_count_free_clusters`) both `f_bfree`
+    /// and `f_bavail`; FAT has no inode table to count; names are long
+    /// names, `FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE` bytes.
+    fn statfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsStat> {
+        alloc::boxed::Box::pin(async move {
+            const FAT_LFN_LEN: u32 = 255;
+            const NLS_MAX_CHARSET_SIZE: u32 = 6;
+            let free = u64::from(self.free_cluster_count().await?);
+            let cluster_size = u32::from(self.bpb.bytes_per_sec) * u32::from(self.bpb.sec_per_clus);
+            Ok(narf_filesystem::FsStat {
+                blocks: u64::from(self.total_data_clusters()),
+                blocks_free: free,
+                blocks_available: free,
+                files: 0,
+                files_free: 0,
+                block_size: cluster_size,
+                name_len: FAT_LFN_LEN * NLS_MAX_CHARSET_SIZE,
+                fragment_size: cluster_size,
+            })
+        })
+    }
+
     fn root(&self) -> Arc<dyn DirOps> {
         let first_cluster = if self.version == super::FatVersion::Fat32 {
             self.fat32_ext.as_ref().unwrap().root_clus
@@ -863,5 +945,11 @@ impl<B: BlockDevice + 'static> FsInstance for FatVolume<B> {
             FatVersion::Fat16 => "fat16",
             FatVersion::Fat32 => "fat32",
         }
+    }
+
+    /// Linux mounts every FAT width through `vfat` (long names), the type
+    /// the mount listings print.
+    fn fs_type(&self) -> &str {
+        "vfat"
     }
 }

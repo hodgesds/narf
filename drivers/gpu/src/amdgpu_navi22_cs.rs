@@ -108,6 +108,57 @@ pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine, generation: u64) 
     crate::amdgpu_fence_navi22::notify_all();
 }
 
+/// A fence interrupt (GFX EOP, SDMA/VCN/JPEG trap), as
+/// `amdgpu_fence_process` runs from the IRQ handler: sample every ring now,
+/// so jobs that just completed signal (and are stamped with their signal
+/// time) at the interrupt, not when a client next asks.
+pub(crate) fn fence_interrupt() {
+    if let Some(current) = current(crate::amdgpu_fence_navi22::generation()) {
+        let _ = current.progress();
+    }
+}
+/// The current submitter of `generation`, if one is registered.
+fn current(generation: u64) -> Option<Arc<Submitter>> {
+    let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
+    current.filter(|current| current.epoch == generation)
+}
+/// A VCN engine reset force-completed `cancelled` (client ring, last
+/// completed, last emitted): those jobs end with `-ECANCELED`
+/// (`amdgpu_fence_driver_force_completion`). Called before the forced
+/// fences are written, so no job retires without its error.
+pub(crate) fn media_reset(
+    cancelled: &[crate::amdgpu_vcn_navi22::idle::Cancelled],
+    generation: u64,
+) {
+    if let Some(current) = current(generation) {
+        let mut jobs = current.jobs.lock();
+        for &(ring, after, upto) in cancelled {
+            let id = crate::amdgpu_vcn_navi22_cs::FIRST_ID + ring.index();
+            jobs.cancel(id, after, upto);
+        }
+    }
+}
+/// A media job timed out and nothing resets its ring (recovery disabled or
+/// spent): `-ETIME` on the job, `drm_sched_suspend_timeout`.
+pub(crate) fn media_timed_out(ring: crate::amdgpu_navi22_submit::MediaRing, generation: u64) {
+    if let Some(current) = current(generation) {
+        let _ = current.progress();
+        let id = crate::amdgpu_vcn_navi22_cs::FIRST_ID + ring.index();
+        current.jobs.lock().time_out(id);
+    }
+}
+/// A media job timed out and the GPU recovers (`amdgpu_job_timedout`'s
+/// `-ETIME` and `amdgpu_device_gpu_recover`): as for a kernel queue, the
+/// job is guilty and every other job is abandoned.
+pub(crate) fn media_hung(ring: crate::amdgpu_navi22_submit::MediaRing, generation: u64) {
+    if let Some(current) = current(generation) {
+        let _ = current.progress();
+        let id = crate::amdgpu_vcn_navi22_cs::FIRST_ID + ring.index();
+        current.jobs.lock().hang(id);
+    }
+    crate::amdgpu_fence_navi22::notify_all();
+}
+
 const RINGS: [Option<Ring>; 10] = [
     Some(Ring::Gfx),
     Some(Ring::Compute),
@@ -161,6 +212,21 @@ fn submission_ring(ibs: &[crate::amdgpu_cs::Ib]) -> Result<usize, FsError> {
 }
 /// Ticket ring ids: four original kernel queues, four media rings, SDMA2/3.
 pub const RING_IDS: usize = 10; // linux: n/a (NARF ticket ring ids)
+/// IBs one job may carry on ring `id`, as `AMDGPU_INFO_MAX_IBS` reports it
+/// (Linux's `amdgpu_ring_max_ibs`): what the native queue accepts,
+/// `amdgpu_navi22_submit::validate` for the kernel queues and
+/// `validate_media` for VCN/JPEG. Mesa's RADV packs a submission's IBs up to
+/// this count and always spends one on its preamble, so a count of one fits no
+/// command buffer at all. 0 for an id the card does not run.
+pub(crate) fn ring_max_ibs(id: usize) -> u32 {
+    if (crate::amdgpu_vcn_navi22_cs::FIRST_ID..8).contains(&id) {
+        crate::amdgpu_navi22_submit::MEDIA_MAX_IBS as u32
+    } else if id < RING_IDS {
+        crate::amdgpu_navi22_submit::MAX_IBS as u32
+    } else {
+        0
+    }
+}
 /// The ticket ring index of ring `id` in recovery epoch `epoch`.
 pub const fn ring_index(epoch: u64, id: usize) -> u32 {
     ((epoch as u32 & 0x07ff_ffff) << 4) | id as u32
@@ -335,6 +401,11 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             .filter(|id| fence_slot(*id).is_none_or(|slot| self.reader.present(slot)))
             .map(|id| ring_index(self.epoch, id))
     }
+    /// `ring` is a ticket ring index (`ring_for`); its low four bits are the
+    /// ring id.
+    fn max_ibs(&self, ring: u32) -> u32 {
+        ring_max_ibs((ring & 15) as usize)
+    }
     fn signalled(&self, ticket: u64) -> bool {
         // A vanished device makes no more progress; report done so waiters
         // cannot wedge.
@@ -348,6 +419,9 @@ impl crate::amdgpu_cs::Submitter for Submitter {
     fn error(&self, ticket: u64) -> Option<FsError> {
         let _ = self.progress();
         self.jobs.lock().error(ticket)
+    }
+    fn signal_time(&self, ticket: u64) -> Option<u64> {
+        self.jobs.lock().signal_time(ticket)
     }
     fn submit<'a>(
         &'a self,
@@ -563,6 +637,21 @@ pub async fn register(boot: &mut crate::amdgpu_navi22_boot::ColdBoot) {
                     });
             }
             crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+            // amdgpu_vm_pt_create on a dGPU: client page tables live in this
+            // CPU-visible VRAM, committed by the HDP flush (both hubs walk
+            // them; MMHUB cannot walk system-RAM tables). Before any job:
+            // existing spaces move in, or are rewritten after a VRAM loss.
+            if let Ok(gmc) = boot.memory() {
+                crate::amdgpu_vm::register_table_heap(
+                    card,
+                    crate::amdgpu_vm::TableHeap {
+                        pool: heap.pool.clone(),
+                        fb_base: heap.fb_base,
+                        fb_offset: heap.fb_offset,
+                        hdp: Arc::new(gmc.hdp_flusher()),
+                    },
+                );
+            }
             let _ = writeln!(
                 narf_console::Writer,
                 "amdgpu: navi22 client VRAM heap {} MiB, VMIDs {first}-{last}",
@@ -782,6 +871,7 @@ fn withdraw(keep_media_sessions: bool) {
     if let Some(card) = drm_card() {
         crate::amdgpu_cs::unregister_submitter(card);
         crate::amdgpu_gem::unregister_vram_heap(card);
+        crate::amdgpu_vm::unregister_table_heap(card);
     }
     if keep_media_sessions {
         crate::amdgpu_vcn_navi22_cs::suspend();
@@ -896,5 +986,39 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_cs_tickets_name_ring_and_recovery_epoch
+    );
+
+    /// Mesa's RADV packs a submission's IBs up to `AMDGPU_INFO_MAX_IBS` per
+    /// ring, and its preamble IB always takes one of them. With one per ring,
+    /// as this card reported, no command buffer ever fits: RADV resubmitted
+    /// the preamble alone forever, so vkcube and GTK4's Vulkan renderer
+    /// (Steam's setup dialog) hung in their first vkQueueSubmit. Every ring
+    /// reports what its native queue takes: `validate` / `validate_media`.
+    fn navi22_cs_max_ibs_is_what_the_native_queues_take() -> TestResult {
+        for id in 0..RING_IDS {
+            let media = (crate::amdgpu_vcn_navi22_cs::FIRST_ID..8).contains(&id);
+            let native = if media {
+                crate::amdgpu_navi22_submit::MEDIA_MAX_IBS
+            } else {
+                crate::amdgpu_navi22_submit::MAX_IBS
+            };
+            let reported = ring_max_ibs(id);
+            if reported < 2 {
+                return TestResult::Fail(
+                    "a ring has no room for RADV's preamble IB and a command buffer",
+                );
+            }
+            if reported as usize != native {
+                return TestResult::Fail("a ring reports other than its native queue's IB bound");
+            }
+        }
+        if ring_max_ibs(RING_IDS) != 0 {
+            return TestResult::Fail("a ring id the card does not run reports IBs");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22-max-ibs",
+        navi22_cs_max_ibs_is_what_the_native_queues_take
     );
 }

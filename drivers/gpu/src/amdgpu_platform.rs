@@ -618,6 +618,11 @@ fn stage_failed<T>(stage: &str, result: Result<T, Error>) -> Result<T, Error> {
     result
 }
 
+/// The boot handoff: the VRAM plan, the pool and the PSP/DMUB loader.
+/// Out of line: inlined, its firmware, plan, pool and loader temporaries
+/// join [`start`]'s frame beside the display task's future and pass the
+/// 8 KiB kernel frame budget (`build/frame-budget.txt`).
+#[inline(never)]
 pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
     let boot = stage_failed(
         "boot-framebuffer-record",

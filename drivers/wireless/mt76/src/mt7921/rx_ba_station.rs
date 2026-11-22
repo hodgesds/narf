@@ -5,6 +5,26 @@ use super::{ba, scan::NativeRx, station::Command, Backend, Error, Session};
 use alloc::vec;
 
 impl<B: Backend> Session<B> {
+    /// A unicast A-MPDU subframe from the AP on `tid` with no active
+    /// recipient agreement; `qos` is its first QoS control octet. mt76
+    /// delivers it unreordered (`mt76_rx_aggr_reorder`), and mac80211
+    /// `ieee80211_rx_reorder_ampdu` answers a Block Ack policy subframe on a
+    /// TID with no session with one recipient DELBA
+    /// (WLAN_REASON_QSTA_REQUIRE_SETUP) per TID until a session starts, so
+    /// the originator stops aggregating or negotiates again.
+    pub(super) fn unexpected_aggregate(&mut self, tid: u8, qos: u8, own: [u8; 6], peer: [u8; 6]) {
+        const IEEE80211_QOS_CTL_ACK_POLICY_MASK: u8 = 0x60;
+        const IEEE80211_QOS_CTL_ACK_POLICY_BLOCKACK: u8 = 0x60;
+        if qos & IEEE80211_QOS_CTL_ACK_POLICY_MASK != IEEE80211_QOS_CTL_ACK_POLICY_BLOCKACK {
+            return;
+        }
+        if self.station.control_pending.len() < 4 && self.station.rx_ba.unexpected(tid) {
+            self.station
+                .control_pending
+                .push_back(ba::Owner::unexpected_delba(tid, own, peer));
+        }
+    }
+
     /// Process only this AP's exact, unfragmented native action/BAR profile.
     pub(super) fn receive_ba_control(
         &mut self,
@@ -164,6 +184,31 @@ impl<B: Backend> Session<B> {
 
     /// Close delivery before the first wait and retain each native BA record
     /// until both terminal disable receipts. Key/WCID reuse follows this fence.
+    /// [`Self::retire_receive_ba`] for a PTK rekey: after the firmware stops
+    /// each agreement, its originator gets a recipient DELBA with
+    /// WLAN_REASON_QSTA_LEAVE_QBSS (`ieee80211_sta_tear_down_BA_sessions` →
+    /// `__ieee80211_stop_rx_ba_session(.., tx = true)`).
+    pub(super) async fn retire_receive_ba_notify(
+        &mut self,
+        own: [u8; 6],
+        peer: [u8; 6],
+    ) -> Result<(), Error> {
+        const WLAN_REASON_QSTA_LEAVE_QBSS: u16 = 36;
+        let link = self.station.link;
+        self.station.rx_ba.fence();
+        self.clear_aggregate_receive();
+        for (tid, epoch, request) in self.station.rx_ba.records() {
+            self.exchange(Command::Unified { id: 3 }, &request.wtbl(link, peer, false))
+                .await?;
+            self.exchange(Command::Unified { id: 3 }, &request.station(link, false))
+                .await?;
+            self.station.rx_ba.finish_stop(tid, epoch);
+            let delba = request.delba_reason(own, peer, WLAN_REASON_QSTA_LEAVE_QBSS);
+            self.send_management(&delba, u16::from(link.peer())).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn retire_receive_ba(&mut self, peer: [u8; 6]) -> Result<(), Error> {
         let link = self.station.link;
         self.station.rx_ba.fence();

@@ -88,9 +88,11 @@ unsafe fn list_dir(path: *const i8) -> i32 {
         };
         // SAFETY: Valid memory or trusted environment
         let nlen = unsafe { cstr_len(name_ptr) };
-        if nlen > 0 {
-            // SAFETY: name_ptr points at nlen valid bytes.
-            let name = unsafe { core::slice::from_raw_parts(name_ptr, nlen) };
+        // SAFETY: name_ptr points at nlen valid bytes.
+        let name = unsafe { core::slice::from_raw_parts(name_ptr, nlen) };
+        // `ls` without `-a` leaves out the `.` and `..` every directory
+        // lists first.
+        if nlen > 0 && name != b"." && name != b".." {
             // SAFETY: Valid memory or trusted environment
             unsafe { write_stdout(name); }
             // SAFETY: Valid memory or trusted environment

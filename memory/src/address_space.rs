@@ -2858,6 +2858,69 @@ impl AddressSpace {
     /// multithreaded process that spawned a second thread.
     pub const MMAP_WINDOW_TOP: u64 = 0x0000_7F00_0000_0000;
 
+    /// End of an IA-32 (compat) task's address space — Linux's
+    /// `IA32_PAGE_OFFSET`, which `TASK_SIZE`/`STACK_TOP` are for a task with
+    /// `TIF_ADDR32` (`arch/x86/include/asm/page_64_types.h`). The last page
+    /// below 4 GiB stays unmapped, as it does under a 64-bit kernel. Every
+    /// address a 32-bit pointer can name and the kernel may hand out lies
+    /// below this.
+    pub const COMPAT32_TASK_SIZE: u64 = 0xFFFF_E000;
+
+    /// Floor of an IA-32 address space's mmap window:
+    /// `__TASK_UNMAPPED_BASE(TASK_SIZE_32)` = `PAGE_ALIGN(TASK_SIZE_32 / 3)`,
+    /// Linux's `mmap_compat_legacy_base` before randomization. NARF lays a
+    /// compat address space out bottom-up from here — the layout Linux uses
+    /// under `vm.legacy_va_layout` or `ADDR_COMPAT_LAYOUT` — as it lays the
+    /// 64-bit one out bottom-up from [`Self::MMAP_CURSOR_BASE`].
+    pub const COMPAT32_MMAP_BASE: u64 = 0x5555_5000;
+
+    /// Ceiling of an IA-32 address space's no-hint mmap window. The 8 MiB
+    /// RLIMIT_STACK reservation ends at [`Self::COMPAT32_TASK_SIZE`] and its
+    /// guard page sits below that; this leaves the gap between the two
+    /// (`stack_guard_gap`'s role) free of kernel-chosen mappings.
+    pub const COMPAT32_MMAP_WINDOW_TOP: u64 = 0xFF00_0000;
+
+    /// Linux's default `vm.mmap_min_addr` (`CONFIG_DEFAULT_MMAP_MIN_ADDR`):
+    /// the lowest address a user `MAP_FIXED` may name in an IA-32 address
+    /// space, whose whole layout lies below [`Self::USER_FIXED_FLOOR`].
+    pub const COMPAT32_MMAP_MIN_ADDR: u64 = 0x1_0000;
+
+    /// The `[base, top)` mmap window for an address space whose floor is
+    /// `floor`. A compat floor lies below 4 GiB, which no 64-bit floor can
+    /// (those start at [`Self::MMAP_CURSOR_BASE`]), so the floor alone says
+    /// which layout an address space has — and fork, which copies it,
+    /// inherits that layout with it.
+    #[inline]
+    const fn mmap_window_for_floor(floor: u64) -> (u64, u64) {
+        if floor < Self::COMPAT32_TASK_SIZE {
+            (Self::COMPAT32_MMAP_BASE, Self::COMPAT32_MMAP_WINDOW_TOP)
+        } else {
+            (Self::MMAP_CURSOR_BASE, Self::MMAP_WINDOW_TOP)
+        }
+    }
+
+    /// This address space's `[base, top)` no-hint mmap window.
+    #[inline]
+    fn mmap_window(&self) -> (u64, u64) {
+        Self::mmap_window_for_floor(self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Was this address space laid out for an IA-32 task
+    /// ([`Self::new_for_user_compat32`])? Linux keeps the same fact as
+    /// `TIF_ADDR32` / `mmap_is_ia32()`; here it is the address space's
+    /// mmap floor lying under [`Self::COMPAT32_TASK_SIZE`].
+    #[inline]
+    pub fn is_compat32_layout(&self) -> bool {
+        self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed) < Self::COMPAT32_TASK_SIZE
+    }
+
+    /// This address space's randomized mmap floor — Linux's `mm->mmap_base`
+    /// (bottom-up). Fixed for the address space's life and inherited by fork.
+    #[inline]
+    pub fn mmap_floor(&self) -> u64 {
+        self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     /// End of the mappable user half: 1 << 47 is the first
     /// non-canonical low address on x86_64, and NARF's user layout
     /// (binary / interp / mmap arena / stack) tops out below it on
@@ -3412,10 +3475,11 @@ impl AddressSpace {
         // then across the non-canonical boundary — which would silently
         // re-create the #GP-kill the window was introduced to prevent.
         let bytes = bytes.max(0x1000);
+        let (_, window_top) = self.mmap_window();
         let mut cur = self.mmap_cursor.load(Ordering::Relaxed);
         loop {
             let end = cur.saturating_add(bytes);
-            if end > Self::MMAP_WINDOW_TOP {
+            if end > window_top {
                 return 0; // arena exhausted → caller returns -ENOMEM
             }
             match self.mmap_cursor.compare_exchange_weak(
@@ -3446,9 +3510,10 @@ impl AddressSpace {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
         let candidate = self.mmap_cursor.load(core::sync::atomic::Ordering::Relaxed);
+        let (_, window_top) = self.mmap_window();
         candidate
             .checked_add(len)
-            .filter(|end| *end <= Self::MMAP_WINDOW_TOP)
+            .filter(|end| *end <= window_top)
             .ok_or(AddressSpaceError::MappingLimit)?;
         Ok(VirtAddr::new(candidate))
     }
@@ -3473,7 +3538,9 @@ impl AddressSpace {
         let huge = self.huge_regions.lock();
         let regions = self.regions.lock();
         let floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
-        Self::find_unmapped_area_locked(&regions, &huge, floor, 0, len, align).map(VirtAddr::new)
+        let window = self.mmap_window();
+        Self::find_unmapped_area_locked(&regions, &huge, window, floor, 0, len, align)
+            .map(VirtAddr::new)
     }
 
     /// Reserve an mmap window with an aligned base. Any alignment padding is
@@ -3484,6 +3551,7 @@ impl AddressSpace {
         if align < 4096 || !align.is_power_of_two() {
             return 0;
         }
+        let (_, window_top) = self.mmap_window();
         let mut cur = self.mmap_cursor.load(Ordering::Relaxed);
         loop {
             let Some(aligned) = cur.checked_add(align - 1).map(|v| v & !(align - 1)) else {
@@ -3492,7 +3560,7 @@ impl AddressSpace {
             let Some(next) = aligned.checked_add(bytes.max(4096)) else {
                 return 0;
             };
-            if next > Self::MMAP_WINDOW_TOP {
+            if next > window_top {
                 return 0;
             }
             match self
@@ -3516,7 +3584,8 @@ impl AddressSpace {
     /// into the stack and across the canonical boundary.
     fn bump_mmap_cursor_past(&self, region_base: u64, region_len: u64) {
         use core::sync::atomic::Ordering;
-        if !(Self::MMAP_CURSOR_BASE..Self::MMAP_WINDOW_TOP).contains(&region_base) {
+        let (window_base, window_top) = self.mmap_window();
+        if !(window_base..window_top).contains(&region_base) {
             return;
         }
         let region_end = region_base.saturating_add(region_len);
@@ -3867,6 +3936,28 @@ impl AddressSpace {
         unsafe { Self::new_for_user_with_mmap_floor(floor) }
     }
 
+    /// [`Self::new_for_user`] laid out for an IA-32 (compat) task — the
+    /// address space `load_elf_binary` gives an ELFCLASS32 image once
+    /// `SET_PERSONALITY` has set `TIF_ADDR32`.
+    ///
+    /// Its mmap window is `[COMPAT32_MMAP_BASE, COMPAT32_MMAP_WINDOW_TOP)`
+    /// with the floor randomized above the base (Linux `arch_rnd` added to
+    /// `mmap_compat_legacy_base`), so every address the kernel picks for it —
+    /// no-hint mmap, mremap moves, the interpreter — is below
+    /// `COMPAT32_TASK_SIZE`. Fork inherits the layout with the floor.
+    ///
+    /// # Safety
+    /// Same as [`Self::new_for_user`].
+    #[cfg(target_arch = "x86_64")]
+    #[track_caller]
+    pub unsafe fn new_for_user_compat32() -> Result<Self, AddressSpaceError> {
+        let floor = crate::kaslr::user_mmap_slot(Self::COMPAT32_MMAP_BASE);
+        // SAFETY: forwarded from this function's caller; `floor` is a
+        // page-aligned address inside the compat mmap window (the slot adds
+        // at most 16 MiB to a base far below the window's top).
+        unsafe { Self::new_for_user_with_mmap_floor(floor) }
+    }
+
     /// Construct a fresh x86_64 user root with a caller-selected mmap floor.
     /// Fork uses the parent's immutable floor, matching Linux `dup_mm`; exec
     /// and other fresh-address-space callers go through [`Self::new_for_user`]
@@ -3879,7 +3970,10 @@ impl AddressSpace {
     #[track_caller]
     unsafe fn new_for_user_with_mmap_floor(floor: u64) -> Result<Self, AddressSpaceError> {
         debug_assert_eq!(floor & 0xFFF, 0);
-        debug_assert!((Self::MMAP_CURSOR_BASE..Self::MMAP_WINDOW_TOP).contains(&floor));
+        debug_assert!({
+            let (base, top) = Self::mmap_window_for_floor(floor);
+            (base..top).contains(&floor)
+        });
         // Allocate fallible metadata before the paging root so ENOMEM cannot
         // strand an otherwise-unpublished page-table frame.
         let regions = RegionTable::try_new()?;
@@ -3927,7 +4021,10 @@ impl AddressSpace {
     #[cfg(target_arch = "aarch64")]
     unsafe fn new_for_user_with_mmap_floor(floor: u64) -> Result<Self, AddressSpaceError> {
         debug_assert_eq!(floor & 0xFFF, 0);
-        debug_assert!((Self::MMAP_CURSOR_BASE..Self::MMAP_WINDOW_TOP).contains(&floor));
+        debug_assert!({
+            let (base, top) = Self::mmap_window_for_floor(floor);
+            (base..top).contains(&floor)
+        });
         // Allocate fallible metadata before the paging root so ENOMEM cannot
         // strand an otherwise-unpublished page-table frame.
         let regions = RegionTable::try_new()?;
@@ -4137,7 +4234,8 @@ impl AddressSpace {
             let huge = self.huge_regions.lock();
             let regions = self.regions.lock();
             let caller_hint = hint.as_u64();
-            let placement_hint = if caller_hint >= Self::MMAP_CURSOR_BASE {
+            let window = self.mmap_window();
+            let placement_hint = if caller_hint >= window.0 {
                 caller_hint
             } else if regions.len() == 0 {
                 // Preserve the first-fit/reuse shape for an otherwise empty
@@ -4151,6 +4249,7 @@ impl AddressSpace {
             Self::find_unmapped_area_locked(
                 &regions,
                 &huge,
+                window,
                 floor,
                 placement_hint,
                 region.len,
@@ -4177,14 +4276,22 @@ impl AddressSpace {
     /// Linux-style bottom-up unmapped-area search over the authoritative base
     /// and huge VMA sets. The caller holds the VMA transaction and both table
     /// locks, so the returned gap cannot disappear before publication.
+    ///
+    /// `window` is the address space's `[base, top)` mmap window
+    /// ([`Self::mmap_window`]): a hint is honoured only inside it and the
+    /// search never returns an interval ending above `top` — for an IA-32
+    /// address space that is what keeps every kernel-chosen address
+    /// representable in a 32-bit pointer.
     fn find_unmapped_area_locked(
         regions: &RegionTable,
         huge: &[HugeRegion],
+        window: (u64, u64),
         floor: u64,
         hint: u64,
         len: u64,
         align: u64,
     ) -> Result<u64, AddressSpaceError> {
+        let (window_base, window_top) = window;
         let align_up = |value: u64| {
             value
                 .checked_add(align - 1)
@@ -4229,14 +4336,14 @@ impl AddressSpace {
         let interval_is_free = |candidate: u64| {
             candidate
                 .checked_add(len)
-                .filter(|end| *end <= Self::MMAP_WINDOW_TOP)
+                .filter(|end| *end <= window_top)
                 .is_some_and(|end| next_obstacle(candidate, end).is_none())
         };
 
         // Linux treats a non-fixed address as a hint: align and accept it only
         // when the entire interval is legal and currently free, then fall back
         // to the normal search rather than reporting overlap.
-        if hint >= Self::MMAP_CURSOR_BASE {
+        if hint >= window_base {
             if let Some(candidate) = align_up(hint) {
                 if interval_is_free(candidate) {
                     return Ok(candidate);
@@ -4254,7 +4361,7 @@ impl AddressSpace {
             candidate = align_up(candidate).ok_or(AddressSpaceError::MappingLimit)?;
             let end = candidate
                 .checked_add(len)
-                .filter(|end| *end <= Self::MMAP_WINDOW_TOP)
+                .filter(|end| *end <= window_top)
                 .ok_or(AddressSpaceError::MappingLimit)?;
             let Some(obstacle_end) = next_obstacle(candidate, end) else {
                 return Ok(candidate);
@@ -7136,9 +7243,10 @@ impl AddressSpace {
         }
 
         let candidate = self.mmap_cursor.load(core::sync::atomic::Ordering::Relaxed);
+        let (_, window_top) = self.mmap_window();
         let end = candidate
             .checked_add(len)
-            .filter(|end| *end <= Self::MMAP_WINDOW_TOP)
+            .filter(|end| *end <= window_top)
             .ok_or(AddressSpaceError::MappingLimit)?;
         debug_assert!(end > candidate);
         let destination = VirtAddr::new(candidate);

@@ -18,7 +18,9 @@ pub(crate) fn clock(id: i32, write: bool) -> Result<Arc<dyn narf_time::phc::Hard
     }
     ops.hardware_clock().ok_or(EINVAL)
 }
-pub(super) fn gettime(id: i32, ptr: u64) -> Option<i64> {
+/// `time32`: the caller is the i386 `clock_gettime32`, whose output is an
+/// 8-byte `struct old_timespec32` (`put_old_timespec32`).
+pub(super) fn gettime(id: i32, ptr: u64, time32: bool) -> Option<i64> {
     if !dynamic(id) {
         return None;
     }
@@ -26,11 +28,19 @@ pub(super) fn gettime(id: i32, ptr: u64) -> Option<i64> {
         (|| {
             let clock = clock(id, false)?;
             let ns = clock.read_ns().map_err(|e| -i64::from(e))?;
+            let (sec, nsec) = ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64);
             let mut bytes = [0u8; 16];
-            bytes[..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_ne_bytes());
-            bytes[8..].copy_from_slice(&((ns % 1_000_000_000) as i64).to_ne_bytes());
+            let len = if time32 {
+                bytes[..4].copy_from_slice(&(sec as i32).to_ne_bytes());
+                bytes[4..8].copy_from_slice(&(nsec as i32).to_ne_bytes());
+                8
+            } else {
+                bytes[..8].copy_from_slice(&sec.to_ne_bytes());
+                bytes[8..].copy_from_slice(&nsec.to_ne_bytes());
+                16
+            };
             // SAFETY: guarded user copy validates the output timespec.
-            unsafe { copy_to_user(ptr, &bytes) }.map_err(|_| EFAULT)?;
+            unsafe { copy_to_user(ptr, &bytes[..len]) }.map_err(|_| EFAULT)?;
             Ok::<i64, i64>(0)
         })()
         .unwrap_or_else(|e| e),

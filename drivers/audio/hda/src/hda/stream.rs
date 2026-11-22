@@ -2,7 +2,6 @@
 use super::*;
 use crate::native_pcm::Ring;
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::Ordering;
 use narf_drivers_sound::{
     format::{pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate},
     hardware::{PcmDevice, PcmHardware},
@@ -46,7 +45,8 @@ impl Stream {
         }
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
         if !super::runtime::wait(|| unsafe { dev.bar0.read8(sd) } & 2 == 0, 100) {
-            dev.irq.failed.store(true, Ordering::Release);
+            // A stream that will not stop fails its own operation only: the
+            // command transport is unaffected (Linux snd_hdac_stream_stop).
             return Err(SoundError::BadState);
         }
         if let Some(ring) = self.ring.as_mut() {
@@ -93,9 +93,6 @@ impl Stream {
     }
     fn prepare(&mut self, dev: &IntelHda) -> Result<(), SoundError> {
         self.stop(dev)?;
-        if dev.irq.failed.load(Ordering::Acquire) {
-            return Err(SoundError::BadState);
-        }
         let ring = self.ring.as_mut().ok_or(SoundError::BadState)?;
         let sd = sd_base(self.index);
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
@@ -120,7 +117,7 @@ impl Stream {
         let mut format = pack_sdfmt(ring.params.format, ring.params.rate, ring.params.channels);
         // IEC 61937 to a GPU port: SDnFMT TYPE, as azx_pcm_prepare's
         // snd_hdac_spdif_stream_format sets it.
-        if !self.capture && !dev.hdmi.lock().is_empty() && dev.hdmi_playback.lock().non_pcm {
+        if !self.capture && !dev.hdmi.lock().is_empty() && dev.stream_non_pcm() {
             format |= 0x8000;
         }
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
@@ -146,7 +143,7 @@ impl Stream {
         // written yet starts DMA on the reset-zeroed buffer (silence),
         // and the restart sequence (fresh prepare, then start) must
         // not need a preceding write. The other guards still apply.
-        if !ring.prepared || ring.running || ring.xrun || dev.irq.failed.load(Ordering::Acquire) {
+        if !ring.prepared || ring.running || ring.xrun {
             return Err(SoundError::BadState);
         }
         let sd = sd_base(self.index);
@@ -185,11 +182,12 @@ impl Stream {
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
         let position = unsafe { dev.bar0.read32(sd_base(self.index) + SD_LPIB) };
         let now = narf_time::now_cycles();
-        let wrap_ns = ring.bytes as u64 * 1_000_000_000 / (48_000 * ring.frame_bytes as u64);
+        // One trip around the ring at the stream's own rate.
+        let wrap_ns = ring.bytes as u64 * 1_000_000_000
+            / (u64::from(ring.params.rate.hz()) * ring.frame_bytes as u64);
         if position >= ring.bytes as u32
             || (!ring.free_running
                 && now.wrapping_sub(self.last_sample) >= narf_time::wall::ns_to_cycles(wrap_ns))
-            || dev.irq.failed.load(Ordering::Acquire)
         {
             ring.xrun = true;
             let _ = self.stop(dev);
@@ -238,40 +236,77 @@ impl Stream {
 pub(super) struct Card(pub Arc<IntelHda>);
 impl PcmDevice for Card {
     fn capabilities(&self, capture: bool) -> narf_drivers_sound::hardware::PcmCapabilities {
-        use narf_drivers_sound::hardware::PcmCapabilities;
-        // Only what this codec's converters can configure. A fixed list made
-        // HW_REFINE advertise a format HW_PARAMS rejected; see
-        // `query_supported_formats`. An empty query result falls back to the
-        // driver's own default format rather than offering nothing at all.
-        let mut formats = self.0.supported_formats[usize::from(capture)].clone();
-        // An HDMI sink without 20/24-bit LPCM takes S16_LE only.
-        if !capture && self.0.hdmi_limits().is_some_and(|(_, s32, _)| !s32) {
-            formats.retain(|f| *f != SampleFormat::S32LE);
+        self.capabilities_for(capture, *self.0.active_pcm.lock())
+    }
+    fn device_capabilities(
+        &self,
+        capture: bool,
+        device: u32,
+    ) -> narf_drivers_sound::hardware::PcmCapabilities {
+        let slot = if capture {
+            None
+        } else {
+            self.0.pcm_slot(device)
+        };
+        self.capabilities_for(capture, slot)
+    }
+    fn pcm_devices(&self, capture: bool) -> Option<alloc::vec::Vec<u32>> {
+        if capture || self.0.hdmi.lock().is_empty() {
+            return None;
         }
-        if formats.is_empty() {
-            formats.push(default_params().format);
-        }
-        PcmCapabilities {
-            formats,
-            rates: if capture {
-                alloc::vec![SampleRate::R48000]
-            } else {
-                self.0.playback_rates()
-            },
-            channels: if capture {
-                alloc::vec![ChannelCount::Stereo]
-            } else {
-                self.0.playback_channels()
-            },
-            period_frames: (16, 32768),
-            periods: (2, 256),
-            buffer_bytes: (4096, 256 * 1024),
-            period_byte_alignment: 128,
-            batch: false,
+        Some(self.0.pcm_layout().into_iter().map(|(d, _)| d).collect())
+    }
+    fn control_wire(
+        &self,
+        id: narf_drivers_sound::mixer::ControlId,
+    ) -> Option<narf_drivers_sound::hardware::ControlWire> {
+        use narf_drivers_sound::{hardware::ControlWire, mixer::ControlKind};
+        // Linux's per-PCM HDMI controls: the jack named after the PCM
+        // device (generic_hdmi_build_jack), the ELD and the channel map on
+        // the PCM's device (hdmi_create_eld_ctl, snd_pcm_add_chmap_ctls),
+        // the IEC958 set at the PCM's index (snd_hda_create_dig_out_ctls).
+        let pcm = super::hdmi::hdmi_pcm_of(id.index);
+        let device = super::hdmi::hdmi_pcm_device(pcm);
+        let wire = |device: u32, index: u32, name: Option<alloc::string::String>| ControlWire {
+            device,
+            index,
+            name,
+        };
+        match id.kind {
+            ControlKind::HdmiJack => {
+                let name = alloc::format!("HDMI/DP,pcm={} Jack", device);
+                Some(wire(0, 0, Some(name)))
+            }
+            ControlKind::Eld | ControlKind::ChannelMap => Some(wire(device, 0, None)),
+            ControlKind::Iec958ConMask
+            | ControlKind::Iec958ProMask
+            | ControlKind::Iec958Default
+            | ControlKind::Iec958Switch => Some(wire(0, pcm as u32, None)),
+            _ => None,
         }
     }
     fn controls(&self) -> alloc::vec::Vec<narf_drivers_sound::mixer::ControlId> {
         self.0.mixer_controls()
+    }
+    fn long_name(&self) -> Option<alloc::string::String> {
+        let name = self.0.long_name.lock().clone();
+        (!name.is_empty()).then_some(name)
+    }
+    fn mixer_name(&self) -> Option<alloc::string::String> {
+        self.0.mixer_name()
+    }
+    fn codec_proc(&self) -> alloc::vec::Vec<(u8, alloc::string::String)> {
+        self.0.codec_proc()
+    }
+    fn components(&self) -> Option<alloc::string::String> {
+        self.0.components()
+    }
+    fn pcm_name(&self, capture: bool, device: u32) -> Option<alloc::string::String> {
+        // patch_hdmi: "HDMI %d" by PCM index.
+        match self.0.pcm_slot(device).filter(|_| !capture)? {
+            super::hdmi::PcmSlot::Hdmi(pcm) => Some(alloc::format!("HDMI {}", pcm)),
+            _ => None,
+        }
     }
     fn get_control(
         &self,
@@ -292,7 +327,9 @@ impl PcmDevice for Card {
             return Err(SoundError::NoSuchControl);
         }
         // Linux returns -ENODEV for a layout pairwise remapping cannot carry.
-        self.0.chmap_tlv().ok_or(SoundError::NoSuchDevice)
+        self.0
+            .chmap_tlv(super::hdmi::hdmi_pcm_of(id.index))
+            .ok_or(SoundError::NoSuchDevice)
     }
     fn set_control(
         &self,
@@ -306,12 +343,79 @@ impl PcmDevice for Card {
         self.0.set_mixer(id, value)
     }
     fn open(&self, capture: bool, device: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
-        if device != 0
-            || (capture && self.0.input.lock().is_none())
-            || (!capture && self.0.outputs.is_empty())
+        // Playback opens one PCM of `pcm_layout` (an HDMI PCM drives its
+        // own pin only); capture has the one PCM at device 0.
+        let slot = if capture {
+            None
+        } else {
+            self.0.pcm_slot(device)
+        };
+        if (capture && (device != 0 || self.0.input.lock().is_none()))
+            || (!capture && (self.0.outputs.is_empty() || slot.is_none()))
         {
             return Err(SoundError::NoSuchDevice);
         }
+        // Linux azx_pcm_open takes a power reference (snd_hda_power_up_pm)
+        // before the codec's own open and holds it until close: the
+        // autosuspend may have parked the controller, and the pin sense
+        // below needs live command rings.
+        self.0.power_up().map_err(|_| SoundError::BadState)?;
+        let opened = self.claim(capture, slot);
+        if opened.is_err() {
+            self.0.power_down();
+        }
+        opened
+    }
+}
+impl Card {
+    /// The playback or capture constraints of one PCM (`slot`, or every
+    /// HDMI port when `None`).
+    fn capabilities_for(
+        &self,
+        capture: bool,
+        slot: Option<super::hdmi::PcmSlot>,
+    ) -> narf_drivers_sound::hardware::PcmCapabilities {
+        use narf_drivers_sound::hardware::PcmCapabilities;
+        // Only what this codec's converters can configure. A fixed list made
+        // HW_REFINE advertise a format HW_PARAMS rejected; see
+        // `query_supported_formats`. An empty query result falls back to the
+        // driver's own default format rather than offering nothing at all.
+        let mut formats = self.0.supported_formats[usize::from(capture)].clone();
+        // An HDMI sink without 20/24-bit LPCM takes S16_LE only.
+        let limits = self.0.hdmi_limits_for(slot);
+        if !capture && limits.is_some_and(|(_, s32, _)| !s32) {
+            formats.retain(|f| *f != SampleFormat::S32LE);
+        }
+        if formats.is_empty() {
+            formats.push(default_params().format);
+        }
+        PcmCapabilities {
+            formats,
+            rates: if capture {
+                alloc::vec![SampleRate::R48000]
+            } else {
+                self.0.playback_rates_for(slot)
+            },
+            channels: if capture {
+                alloc::vec![ChannelCount::Stereo]
+            } else {
+                self.0.playback_channels_for(slot)
+            },
+            period_frames: (16, 32768),
+            periods: (2, 256),
+            buffer_bytes: (4096, 256 * 1024),
+            period_byte_alignment: 128,
+            batch: false,
+        }
+    }
+
+    /// The rest of `open` once the power reference is held: the HDMI sense
+    /// and the stream claim.
+    fn claim(
+        &self,
+        capture: bool,
+        slot: Option<super::hdmi::PcmSlot>,
+    ) -> Result<Box<dyn PcmHardware>, SoundError> {
         // Constraints come from the sinks attached now (Linux hdmi_pcm_open
         // reads the pin's ELD at open).
         if !capture {
@@ -326,6 +430,9 @@ impl PcmDevice for Card {
         state.stop(&self.0)?;
         state.ring.take();
         state.claimed = true;
+        if !capture {
+            *self.0.active_pcm.lock() = slot;
+        }
         Ok(Box::new(Pcm {
             dev: self.0.clone(),
             capture,
@@ -392,12 +499,11 @@ impl PcmHardware for Pcm {
             .start(&self.dev)
     }
     fn stop(&mut self) -> Result<(), SoundError> {
+        // A stop (PipeWire's DROP on an idle sink) leaves the controller up:
+        // the open PCM holds its power reference until close.
         self.dev.streams[usize::from(self.capture)]
             .lock()
-            .stop(&self.dev)?;
-        // Last stop parks the controller (best-effort idle, #779).
-        self.dev.maybe_idle_quiesce();
-        Ok(())
+            .stop(&self.dev)
     }
     fn pause(&mut self, paused: bool) -> Result<(), SoundError> {
         let mut state = self.dev.streams[usize::from(self.capture)].lock();
@@ -523,11 +629,19 @@ impl Drop for Pcm {
         if state.stop(&self.dev).is_ok() {
             state.ring.take();
         }
+        let slot = if self.capture {
+            None
+        } else {
+            self.dev.active_pcm.lock().take()
+        };
         state.claimed = false;
         drop(state);
-        if !self.capture {
-            self.dev.reset_chmap();
+        if let Some(super::hdmi::PcmSlot::Hdmi(pcm)) = slot {
+            self.dev.reset_chmap(pcm);
         }
+        // azx_pcm_close: snd_hda_power_down_pm. The autosuspend parks the
+        // controller once the delay passes with no reference held.
+        self.dev.power_down();
     }
 }
 
@@ -537,7 +651,9 @@ pub fn play_buffer(data: &[u8]) -> Result<usize, SoundError> {
         return Ok(0);
     }
     let dev = super::runtime::controller().ok_or(SoundError::NoSuchCard)?;
-    let mut stream = Card(dev).open(false, 0)?;
+    // The card's first playback PCM (an HDMI-only card has no device 0).
+    let device = dev.pcm_layout().first().map_or(0, |(device, _)| *device);
+    let mut stream = Card(dev).open(false, device)?;
     stream.configure(default_params())?;
     stream.prepare()?;
     let mut written = stream.write(data)?;

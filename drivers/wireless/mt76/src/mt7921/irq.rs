@@ -35,7 +35,8 @@ pub(super) const MT_INT_MCU_CMD: u32 = 1 << 29;
 pub(super) const HOST_INT_MASK: u32 = MT_INT_TX_DONE_ALL | MT_INT_RX_DONE_ALL | MT_INT_MCU_CMD;
 
 /// One wakeable interrupt line shared by the hard handler, software kicks
-/// (TX enqueue, configuration changes) and the single service worker.
+/// (TX enqueue, configuration changes), the service worker and the
+/// data-queue poll.
 #[derive(Debug)]
 pub(crate) struct Line {
     raised: AtomicU64,
@@ -47,6 +48,8 @@ pub(crate) struct Line {
     /// An owner operation's MCU or scan wait (Linux `mcu.wait`): its own
     /// slot, so it never displaces the worker's waker.
     owner_waker: IrqSafeSpinLock<Option<Waker>>,
+    /// The data-queue poll's wait (`napi[MT_RXQ_MAIN]`): its own slot too.
+    data_waker: IrqSafeSpinLock<Option<Waker>>,
 }
 
 impl Line {
@@ -57,18 +60,18 @@ impl Line {
             bound: AtomicBool::new(false),
             waker: IrqSafeSpinLock::new(None),
             owner_waker: IrqSafeSpinLock::new(None),
+            data_waker: IrqSafeSpinLock::new(None),
         }
     }
-    /// Record a source and wake the worker and any parked owner wait.
+    /// Record a source and wake the worker, the data-queue poll and any
+    /// parked owner wait (the tasklet's `napi_schedule` of each queue).
     pub(crate) fn raise(&self) {
         self.raised.fetch_add(1, Ordering::AcqRel);
-        let waker = self.waker.lock().take();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        let waker = self.owner_waker.lock().take();
-        if let Some(waker) = waker {
-            waker.wake();
+        for slot in [&self.waker, &self.data_waker, &self.owner_waker] {
+            let waker = slot.lock().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
     /// Park an owner wait (`wait_event_timeout(dev->mcu.wait, ...)`) until
@@ -95,7 +98,20 @@ impl Line {
     }
     /// Wait for any raise after `seen`.
     pub(crate) fn wait(&self, seen: u64) -> Wait<'_> {
-        Wait { line: self, seen }
+        Wait {
+            line: self,
+            slot: &self.waker,
+            seen,
+        }
+    }
+    /// The data-queue poll's wait for any raise after `seen`
+    /// (`napi_schedule(&dev->mt76.napi[MT_RXQ_MAIN])` from the tasklet).
+    pub(crate) fn wait_data(&self, seen: u64) -> Wait<'_> {
+        Wait {
+            line: self,
+            slot: &self.data_waker,
+            seen,
+        }
     }
 }
 
@@ -103,6 +119,8 @@ impl Line {
 #[derive(Debug)]
 pub(crate) struct Wait<'a> {
     line: &'a Line,
+    /// The waiter's own waker slot on the line.
+    slot: &'a IrqSafeSpinLock<Option<Waker>>,
     seen: u64,
 }
 
@@ -113,11 +131,11 @@ impl Future for Wait<'_> {
         if now != self.seen {
             return Poll::Ready(now);
         }
-        *self.line.waker.lock() = Some(cx.waker().clone());
+        *self.slot.lock() = Some(cx.waker().clone());
         // A raise between the first load and the waker store is caught here.
         let now = self.line.raised();
         if now != self.seen {
-            self.line.waker.lock().take();
+            self.slot.lock().take();
             return Poll::Ready(now);
         }
         Poll::Pending
@@ -256,5 +274,57 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/irq",
         mt76_interrupt_line_never_loses_a_raise
+    );
+
+    struct Wakes(core::sync::atomic::AtomicU32);
+    impl alloc::task::Wake for Wakes {
+        fn wake(self: alloc::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+        fn wake_by_ref(self: &alloc::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The data-queue poll parks beside the service worker and an owner
+    /// wait (Linux: its own NAPI, scheduled by the tasklet), and one raise
+    /// wakes all three: none displaces another's waker.
+    fn mt76_interrupt_line_wakes_the_data_poll_beside_the_worker() -> TestResult {
+        use alloc::sync::Arc;
+        use core::sync::atomic::AtomicU32;
+        let line = Line::new();
+        let worker = Arc::new(Wakes(AtomicU32::new(0)));
+        let data = Arc::new(Wakes(AtomicU32::new(0)));
+        let owner = Arc::new(Wakes(AtomicU32::new(0)));
+        let worker_waker = Waker::from(worker.clone());
+        let data_waker = Waker::from(data.clone());
+        let owner_waker = Waker::from(owner.clone());
+        let mut worker_cx = Context::from_waker(&worker_waker);
+        let mut data_cx = Context::from_waker(&data_waker);
+        let seen = line.raised();
+        let mut worker_wait = core::pin::pin!(line.wait(seen));
+        let mut data_wait = core::pin::pin!(line.wait_data(seen));
+        let worker_parked = worker_wait.as_mut().poll(&mut worker_cx).is_pending();
+        let data_parked = data_wait.as_mut().poll(&mut data_cx).is_pending();
+        if !worker_parked || !data_parked || !line.park(&owner_waker, seen) {
+            return TestResult::Fail("an idle wait did not park");
+        }
+        line.raise();
+        let woken = (
+            worker.0.load(Ordering::Acquire),
+            data.0.load(Ordering::Acquire),
+            owner.0.load(Ordering::Acquire),
+        );
+        if woken != (1, 1, 1) {
+            return TestResult::Fail("a raise did not wake the worker, data poll and owner");
+        }
+        if data_wait.as_mut().poll(&mut data_cx) != Poll::Ready(seen + 1) {
+            return TestResult::Fail("the woken data poll did not see the raise");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/irq-data",
+        mt76_interrupt_line_wakes_the_data_poll_beside_the_worker
     );
 }

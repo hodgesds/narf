@@ -161,8 +161,15 @@ pub enum FuseInitFlag {
 pub const FUSE_PASSTHROUGH: u64 = 1 << 37;
 pub const FUSE_REQUEST_TIMEOUT: u64 = 1 << 42;
 pub const FOPEN_PASSTHROUGH: u32 = 1 << 7;
+/// LINUX-GAP: with FUSE_ATOMIC_O_TRUNC negotiated Linux sends `O_TRUNC` in
+/// FUSE_OPEN and skips the size SETATTR (`fuse_send_open`, `fuse_do_setattr`'s
+/// `ATTR_OPEN` case). NARF opens FUSE files lazily and truncates an `O_TRUNC`
+/// open with SETATTR(size = 0) in every case, which every daemon serves; the
+/// flag is offered because libfuse refuses a filesystem `want` the kernel did
+/// not offer, and xdg-document-portal wants it.
 pub const FUSE_SUPPORTED_INIT_FLAGS: u64 = FuseInitFlag::AsyncRead as u64
     | FuseInitFlag::PosixLocks as u64
+    | FuseInitFlag::AtomicOTrunc as u64
     | FuseInitFlag::BigWrites as u64
     | FuseInitFlag::FlockLocks as u64
     | FuseInitFlag::DoReaddirplus as u64

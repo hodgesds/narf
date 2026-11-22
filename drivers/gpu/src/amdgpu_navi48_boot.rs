@@ -676,6 +676,35 @@ fn driver_reserve(aperture: u64, available: u64) -> u64 {
         .min(available)
 }
 
+/// Publish card `card`'s client VRAM heap for GEM placements and, as
+/// `amdgpu_vm_pt_create` places a dGPU's tables in VRAM, for its clients'
+/// page tables, committed with `hdp` (the GMC's HDP flush). Registering the
+/// table heap rewrites tables a VRAM loss (S3) took, before jobs run again.
+/// Without a GMC owner the tables stay where they are.
+pub(crate) fn publish_heap(
+    card: u32,
+    heap: &crate::amdgpu_gem::VramHeap,
+    hdp: Option<alloc::sync::Arc<dyn crate::amdgpu_vm::HdpFlush>>,
+) {
+    crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+    if let Some(hdp) = hdp {
+        crate::amdgpu_vm::register_table_heap(
+            card,
+            crate::amdgpu_vm::TableHeap {
+                pool: heap.pool.clone(),
+                fb_base: heap.fb_base,
+                fb_offset: heap.fb_offset,
+                hdp,
+            },
+        );
+    }
+}
+/// Withdraw what [`publish_heap`] published (suspend, recovery).
+pub(crate) fn withdraw_heap(card: u32) {
+    crate::amdgpu_gem::unregister_vram_heap(card);
+    crate::amdgpu_vm::unregister_table_heap(card);
+}
+
 pub(crate) fn reserve_client_chunk(pool: &Pool) -> Result<crate::amdgpu_vram::Reservation, Error> {
     const ALIGN: u64 = 2 << 20;
     let available = pool.available();
@@ -1095,8 +1124,15 @@ impl ColdBoot {
     }
     pub(crate) fn republish_client_vram(&self) {
         if let (Some(card), Some(heap)) = (Self::drm_card(), &self.client_heap) {
-            crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+            publish_heap(card, heap, self.hdp_flusher());
         }
+    }
+    /// The GMC owner's HDP flush, for client page-table updates.
+    fn hdp_flusher(&self) -> Option<alloc::sync::Arc<dyn crate::amdgpu_vm::HdpFlush>> {
+        self.sequence.backend.gmc.as_ref().map(|gmc| {
+            alloc::sync::Arc::new(gmc.hdp_flusher())
+                as alloc::sync::Arc<dyn crate::amdgpu_vm::HdpFlush>
+        })
     }
     pub fn state(&self) -> State {
         self.sequence.state
@@ -1575,7 +1611,7 @@ impl ColdBoot {
         // Evictions see every buffer of the card, framebuffer-only ones
         // included, as TTM's LRU does.
         crate::amdgpu_gem::set_lru_eviction(card, true);
-        crate::amdgpu_gem::register_vram_heap(card, heap.clone());
+        publish_heap(card, &heap, self.hdp_flusher());
         self.client_heap = Some(heap);
         self.client_vram = Some(chunk);
         Ok(size)

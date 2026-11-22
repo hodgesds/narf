@@ -4,6 +4,18 @@
 use crate::{format::HwParams, SoundError};
 use alloc::boxed::Box;
 
+/// A control's place in the ALSA id space (`snd_ctl_elem_id`) beside its
+/// numid and its kind's interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlWire {
+    /// `id.device`: the PCM device of a PCM-interface control.
+    pub device: u32,
+    /// `id.index`: tells apart same-named controls (one IEC958 set per PCM).
+    pub index: u32,
+    /// A name other than the kind's own ("HDMI/DP,pcm=7 Jack").
+    pub name: Option<alloc::string::String>,
+}
+
 /// One independently claimable PCM endpoint on a physical card.
 pub trait PcmDevice: Send + Sync + core::fmt::Debug {
     fn control_info(
@@ -55,7 +67,55 @@ pub trait PcmDevice: Send + Sync + core::fmt::Debug {
     fn capabilities(&self, capture: bool) -> PcmCapabilities {
         PcmCapabilities::fixed(self.default_params(capture))
     }
+    /// [`Self::capabilities`] of one PCM device, for a backend whose PCMs
+    /// differ (Linux HDA: each HDMI PCM follows its own pin's ELD).
+    fn device_capabilities(&self, capture: bool, _device: u32) -> PcmCapabilities {
+        self.capabilities(capture)
+    }
     fn controls(&self) -> alloc::vec::Vec<crate::mixer::ControlId> {
+        alloc::vec::Vec::new()
+    }
+    /// Linux `card->longname` (the second `/proc/asound/cards` line, the
+    /// control CARD_INFO `longname`), when the backend knows one. The card
+    /// name stands in otherwise.
+    fn long_name(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// Linux `card->mixername` (control CARD_INFO `mixername`): the codec's
+    /// vendor and chip name on HDA. The card name stands in otherwise.
+    fn mixer_name(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// Linux `card->components` (control CARD_INFO `components`): one
+    /// "HDA:vendor,subsystem,revision" word per codec on HDA, which UCM and
+    /// PipeWire's `alsa.components` read. Empty otherwise.
+    fn components(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// A PCM device's `snd_pcm` id and name (PCM_INFO, `/proc/asound`),
+    /// when it has its own: Linux HDA names HDMI PCMs "HDMI 0", "HDMI 1",
+    /// ... The card's id and name stand in otherwise.
+    fn pcm_name(&self, _capture: bool, _device: u32) -> Option<alloc::string::String> {
+        None
+    }
+    /// The card's PCM device numbers in one direction, when they are not
+    /// `0..count` (Linux HDA numbers its PCMs through `get_empty_pcm_device`:
+    /// analog 0, 2, 4, 5, HDMI 3, 7, 8, 9, 10, ...). The list must hold
+    /// exactly the card's PCM count for that direction.
+    fn pcm_devices(&self, _capture: bool) -> Option<alloc::vec::Vec<u32>> {
+        None
+    }
+    /// Where a control sits in the ALSA id space (`snd_ctl_elem_id`), when
+    /// that is not device 0, index 0 under the kind's own name: Linux
+    /// creates one HDMI jack, ELD, IEC958 set and channel map per PCM, told
+    /// apart by the PCM device, the element index or the jack's name.
+    fn control_wire(&self, _id: crate::mixer::ControlId) -> Option<ControlWire> {
+        None
+    }
+    /// One `/proc/asound/cardN/codec#A` body per codec address, rendered by
+    /// the codec driver (Linux `print_codec_info`). Empty for a backend
+    /// without HDA codecs.
+    fn codec_proc(&self) -> alloc::vec::Vec<(u8, alloc::string::String)> {
         alloc::vec::Vec::new()
     }
     fn get_control(

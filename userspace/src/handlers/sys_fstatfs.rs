@@ -32,7 +32,7 @@ pub(crate) fn sys_fstatfs(ctx: &mut dyn TrapContext) {
     let path = fd_path_for_task(task, fd)
         .filter(|p| p.starts_with('/'))
         .unwrap_or_else(|| alloc::string::String::from("/"));
-    match fill_statfs_for_path(&path, buf_ptr) {
+    match fill_statfs_for_path(&path, buf_ptr, false) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(errno) => ctx.set_return(errno_ret(errno)),
     }

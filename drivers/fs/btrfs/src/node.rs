@@ -450,6 +450,137 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         )
     }
 
+    /// `chmod`/`fchmod` (`btrfs_setattr` with `ATTR_MODE`): the permission
+    /// and special bits, ctime, then `posix_acl_chmod` — all under one hold
+    /// of the inode lock, as Linux holds `inode_lock` across `notify_change`.
+    async fn chmod(&self, perms: u16) -> Result<(), FsError> {
+        if self.tree_root.is_some() {
+            return Err(FsError::ReadOnly);
+        }
+        let vol = self.volume()?;
+        let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
+        let change = crate::write::AttrChange {
+            perms: Some(perms),
+            ..Default::default()
+        };
+        autogrow!(
+            vol,
+            async {
+                let _update = self.begin_inode_update();
+                let updated = crate::write::set_inode_attrs(&vol, self.ino, change).await?;
+                self.cache_inode(updated);
+                Ok(())
+            }
+            .await
+        )?;
+        self.acl_chmod_locked(&vol, perms).await
+    }
+
+    /// `posix_acl_chmod`, with the inode lock held: after a mode change to
+    /// `perms`, rewrite the stored access ACL with `__posix_acl_chmod_masq`
+    /// — owner and other entries from the outer triplets, the group triplet
+    /// on the mask (on `group::` without one), named entries untouched — and
+    /// store it as `btrfs_set_acl` does. No ACL, nothing to do.
+    async fn acl_chmod_locked(&self, vol: &Arc<BtrfsVolume<B>>, perms: u16) -> Result<(), FsError> {
+        use narf_filesystem::{AclType, PosixAcl};
+        let raw = match <Self as FileOps>::get_xattr(self, AclType::Access.xattr_name()).await {
+            Ok(raw) => raw,
+            Err(FsError::NotFound) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let Some(mut acl) = PosixAcl::from_xattr(&raw)? else {
+            return Ok(());
+        };
+        acl.chmod_masq(perms)?;
+        self.set_acl_locked(vol, AclType::Access, Some(acl)).await
+    }
+
+    /// `set_posix_acl` → `btrfs_set_acl` for the ACL named by `ty`: `Some`
+    /// sets it from its uapi `value`, `None` (removexattr, or an empty or
+    /// zero-entry value) removes it.
+    ///
+    /// * The value decodes first (`do_set_acl`): a bad header or entry is
+    ///   `EINVAL`, an unknown version `EOPNOTSUPP`.
+    /// * A default ACL on a non-directory is `EACCES` (`set_posix_acl`,
+    ///   before any other check), its removal a no-op.
+    /// * The ACL must be valid (`posix_acl_valid`): `EINVAL`.
+    /// * An access ACL sets the mode (`posix_acl_update_mode`): the mode's
+    ///   permission bits become the ACL's, setgid goes unless the caller is
+    ///   in the group or holds `CAP_FSETID`, and an ACL the mode expresses
+    ///   exactly is removed rather than stored.
+    /// * The xattr and the inode item (mode, ctime) are written in one
+    ///   commit, as `btrfs_setxattr_trans` does; removing an absent ACL
+    ///   succeeds (`btrfs_setxattr` without `XATTR_REPLACE`).
+    async fn set_acl(
+        &self,
+        ty: narf_filesystem::AclType,
+        value: Option<&[u8]>,
+    ) -> Result<(), FsError> {
+        if self.tree_root.is_some() {
+            return Err(FsError::ReadOnly);
+        }
+        let acl = match value {
+            Some(v) if !v.is_empty() => narf_filesystem::PosixAcl::from_xattr(v)?,
+            _ => None,
+        };
+        let vol = self.volume()?;
+        // Linux `inode_lock` around `set_posix_acl`.
+        let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
+        self.set_acl_locked(&vol, ty, acl).await
+    }
+
+    /// [`Self::set_acl`] with the decoded ACL and the inode lock held.
+    async fn set_acl_locked(
+        &self,
+        vol: &Arc<BtrfsVolume<B>>,
+        ty: narf_filesystem::AclType,
+        acl: Option<narf_filesystem::PosixAcl>,
+    ) -> Result<(), FsError> {
+        use narf_filesystem::AclType;
+        let inode = self.inode();
+        if ty == AclType::Default && !inode.is_dir() {
+            return match acl {
+                Some(_) => Err(FsError::PermissionDenied),
+                None => Ok(()),
+            };
+        }
+        let (stored, perms) = match acl {
+            Some(acl) => {
+                acl.valid()?;
+                if ty == AclType::Access {
+                    let (mode, stored) = narf_filesystem::posix_acl_update_mode(
+                        inode.perms(),
+                        acl,
+                        narf_filesystem::caller_in_group_or_capable(inode.uid, inode.gid),
+                    )?;
+                    (stored, Some(mode))
+                } else {
+                    (Some(acl), None)
+                }
+            }
+            None => (None, None),
+        };
+        let blob = stored.map(|acl| acl.to_xattr());
+        let vol = Arc::clone(vol);
+        autogrow!(
+            vol,
+            async {
+                let _update = self.begin_inode_update();
+                let updated = crate::write::set_acl_xattr_item(
+                    &vol,
+                    self.ino,
+                    ty.xattr_name(),
+                    blob.as_deref(),
+                    perms,
+                )
+                .await?;
+                self.cache_inode(updated);
+                Ok(())
+            }
+            .await
+        )
+    }
+
     fn volume(&self) -> Result<Arc<BtrfsVolume<B>>, FsError> {
         self.vol.upgrade().ok_or(FsError::NotFound)
     }
@@ -1260,12 +1391,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     }
 
     /// `chmod`/`fchmod`: the permission and special bits; the file type in
-    /// `S_IFMT` never changes. ctime moves.
+    /// `S_IFMT` never changes. ctime moves. Then, as `btrfs_setattr` ends
+    /// with `posix_acl_chmod`, the access ACL follows the new mode.
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
-        Box::pin(self.change_attrs(crate::write::AttrChange {
-            perms: Some(perms),
-            ..Default::default()
-        }))
+        Box::pin(self.chmod(perms))
     }
 
     /// `utimensat`/`futimens` (`None` = `UTIME_OMIT`). ctime moves.
@@ -1336,8 +1465,15 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         })
     }
 
+    /// `btrfs_xattr_handlers`: the two POSIX ACL names go through
+    /// [`Self::set_acl`] (`btrfs_set_acl`, which ignores `XATTR_CREATE` /
+    /// `XATTR_REPLACE` as `do_set_acl` does); every other name is stored as
+    /// given.
     fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(ty) = narf_filesystem::AclType::from_xattr_name(name) {
+                return self.set_acl(ty, Some(value)).await;
+            }
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
@@ -1350,8 +1486,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         })
     }
 
+    /// `vfs_remove_acl` → `btrfs_set_acl(NULL)` for an ACL name (absent is
+    /// not an error); `ENODATA` for any other absent name.
     fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(ty) = narf_filesystem::AclType::from_xattr_name(name) {
+                return self.set_acl(ty, None).await;
+            }
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
@@ -1891,6 +2032,47 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     fn dir_mtime_ns(&self) -> u64 {
         self.inode().mtime_ns()
     }
+
+    /// `btrfs_get_acl(dir, ACL_TYPE_DEFAULT)` for the create path's
+    /// `posix_acl_create` (`btrfs_new_inode_prepare`). btrfs stores the ACL
+    /// as its `system.posix_acl_default` xattr item in the uapi format, so
+    /// the item's value is the blob the VFS decodes.
+    ///
+    /// Without it nothing created in a btrfs directory inherited its
+    /// default ACL: every system journal journald rotated into
+    /// `/var/log/journal/<id>` came out without the `group:wheel` /
+    /// `group:adm` read entries tmpfiles' default ACL hands down.
+    fn default_acl(&self) -> Option<Vec<u8>> {
+        narf_filesystem::wait_sync(<Self as FileOps>::get_xattr(
+            self,
+            narf_filesystem::XATTR_NAME_POSIX_ACL_DEFAULT,
+        ))
+        .ok()
+    }
+
+    /// The directory's own xattr store, which is the inode's — the same
+    /// items [`FileOps::set_xattr`] writes, ACL names included. `mkdir`
+    /// stores a new directory's inherited access and default ACLs here
+    /// (`btrfs_init_inode_security`); answering `Unsupported` dropped them.
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        <Self as FileOps>::set_xattr(self, name, value, flags)
+    }
+
+    /// Linux's btrfs serves a directory's xattrs with the same handlers as
+    /// a file's. This is what `acl_of_dir` reads for `may_create` /
+    /// `may_delete`: answering `Unsupported` made every btrfs directory's
+    /// access ACL invisible to them.
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        <Self as FileOps>::get_xattr(self, name)
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        <Self as FileOps>::list_xattr(self)
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        <Self as FileOps>::remove_xattr(self, name)
+    }
 }
 
 impl<B: BlockDevice + 'static> BtrfsVolume<B> {
@@ -1948,6 +2130,19 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
 
     fn name(&self) -> &str {
         "btrfs"
+    }
+
+    /// `btrfs_statfs`: the big-endian words of the filesystem UUID folded
+    /// in pairs, with the subvolume's root id mixed in so subvolumes differ
+    /// (the mounted subvolume's; a nested subvolume below it reports the
+    /// same here).
+    fn statfs_fsid(&self) -> Option<u64> {
+        let fsid = self.fsid();
+        let word = |i: usize| u32::from_be_bytes(fsid[i..i + 4].try_into().unwrap_or([0; 4]));
+        let root = self.mounted_subvol_id();
+        let val0 = word(0) ^ word(8) ^ (root >> 32) as u32;
+        let val1 = word(4) ^ word(12) ^ root as u32;
+        Some(u64::from(val0) | (u64::from(val1) << 32))
     }
 
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {

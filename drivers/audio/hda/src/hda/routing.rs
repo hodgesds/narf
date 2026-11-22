@@ -158,7 +158,7 @@ impl IntelHda {
         // Route to the HDMI/DP ports a monitor is on; detach the others'
         // converters so a port that lost its sink stops taking the stream.
         self.refresh_hdmi(false)?;
-        let routed = self.routed_outputs();
+        let routed = self.pcm_outputs();
         for (index, path) in self.outputs.iter().enumerate() {
             if routed.contains(&index) {
                 self.configure_path(path, index, false, params)?;
@@ -283,7 +283,10 @@ impl IntelHda {
             let spk_alloc = self.hdmi_sink(output).map_or(0, |sink| sink.spk_alloc);
             let channels = params.channels.count();
             self.ati_hdmi_prepare(graph, &path.nodes, output, channels, spk_alloc)?;
-            if self.hdmi_playback.lock().non_pcm {
+            if self
+                .hdmi_pcm_of_output(output)
+                .is_some_and(|pcm| self.hdmi_state(pcm).non_pcm)
+            {
                 format |= 0x8000;
             }
         }
@@ -293,6 +296,8 @@ impl IntelHda {
             converter.nid,
             VERB_SET_CONVERTER_STREAM | if capture { 0x20 } else { 0x10 },
         )?;
+        // Linux `hda_cvt_setup`: remembered for the cleanup at codec suspend.
+        self.note_cvt_setup(cad, converter.nid);
         Ok(())
     }
     /// Linux atihdmi_init plus snd_hda_hdmi_generic_pcm_prepare and
@@ -321,19 +326,21 @@ impl IntelHda {
         }
         let (cad, pin, cvt) = (graph.addr, nodes.pin_nid, nodes.converter_nid);
         let rev3 = hda_codec::ati_hdmi_rev3(graph);
-        let pcm = *self.hdmi_playback.lock();
+        let index = self
+            .hdmi_pcm_of_output(output)
+            .ok_or(HdaError::NoOutputStream)?;
+        let pcm = self.hdmi_state(index);
         self.verb(cad, pin, SET_DOWNMIX_INFO << 8)?;
         if rev3 {
             self.verb(cad, pin, (SET_MULTICHANNEL_MODE << 8) | 1)?;
         }
         let ca = self.ati_hdmi_infoframe(graph, nodes, channels, spk_alloc, &pcm)?;
-        // hdmi_setup_fake_chmap: the controls describe the primary port.
-        if self.hdmi_primary() == Some(output) {
-            let mut state = self.hdmi_playback.lock();
+        // hdmi_setup_fake_chmap: the pin's PCM reports the layout it got.
+        self.update_hdmi_state(index, |state| {
             if pcm.non_pcm || !state.chmap_set {
                 state.chmap = super::hdmi::default_chmap(ca);
             }
-        }
+        });
         if rev3 {
             let ramp = if pcm.non_pcm { 0 } else { 180 };
             self.verb(cad, cvt, (SET_RAMP_RATE << 8) | ramp)?;
@@ -386,6 +393,9 @@ impl IntelHda {
         Ok(ca)
     }
     pub(super) fn refresh_jacks(&self) -> Result<(), HdaError> {
+        // As `refresh_hdmi`: wake a parked controller before the async
+        // commands, which refuse one.
+        self.ensure_active()?;
         narf_scheduler::block_on_spin(self.refresh_jacks_async())
     }
     /// `snd_hda_jack_report_sync`: re-read every jack and apply it (HDMI
@@ -555,21 +565,28 @@ impl IntelHda {
             return Vec::new();
         }
         let mut controls = Vec::new();
-        if self.outputs.iter().all(|path| {
+        // An HDMI-only codec has no Master controls (Linux patch_hdmi
+        // creates none); the analog outputs carry them.
+        let analog = self.analog_outputs();
+        let analog_amps = analog.iter().all(|&output| {
+            let path = &self.outputs[output];
             self.graphs[path.codec]
                 .widget(path.nodes.converter_nid)
                 .and_then(|w| w.out_amp)
                 .is_some()
-        }) {
+        });
+        if !analog.is_empty() {
+            if analog_amps {
+                controls.push(ControlId {
+                    index: 0,
+                    kind: ControlKind::MasterVolume,
+                });
+            }
             controls.push(ControlId {
-                index: 0,
-                kind: ControlKind::MasterVolume,
+                index: 1,
+                kind: ControlKind::MasterMute,
             });
         }
-        controls.push(ControlId {
-            index: 1,
-            kind: ControlKind::MasterMute,
-        });
         if self.outputs.iter().any(|path| {
             self.graphs[path.codec]
                 .widget(path.nodes.pin_nid)
@@ -642,23 +659,20 @@ impl IntelHda {
                 });
             }
         }
-        if !self.hdmi.lock().is_empty() {
-            controls.push(ControlId {
-                index: 3,
-                kind: ControlKind::HdmiJack,
-            });
-            controls.push(ControlId {
-                index: 4,
-                kind: ControlKind::Eld,
-            });
-            for (index, kind) in [
-                (5, ControlKind::Iec958ConMask),
-                (6, ControlKind::Iec958ProMask),
-                (7, ControlKind::Iec958Default),
-                (8, ControlKind::Iec958Switch),
-                (9, ControlKind::ChannelMap),
+        // Per HDMI PCM (Linux snd_hda_hdmi_generic_build_controls): jack,
+        // ELD, the IEC958 set and the channel map.
+        let ports = self.hdmi.lock().len();
+        for pcm in 0..ports {
+            for kind in [
+                ControlKind::HdmiJack,
+                ControlKind::Eld,
+                ControlKind::Iec958ConMask,
+                ControlKind::Iec958ProMask,
+                ControlKind::Iec958Default,
+                ControlKind::Iec958Switch,
+                ControlKind::ChannelMap,
             ] {
-                controls.push(ControlId { index, kind });
+                controls.push(super::hdmi::hdmi_pcm_control(pcm, kind));
             }
         }
         controls
@@ -827,18 +841,26 @@ impl IntelHda {
                 }
                 Ok(ControlValue::boolean(present))
             }
-            ControlKind::HdmiJack => Ok(ControlValue::boolean(self.hdmi_jack().0)),
-            ControlKind::Eld => Ok(ControlValue::bytes(&self.hdmi_jack().1)),
+            ControlKind::HdmiJack => Ok(ControlValue::boolean(
+                self.hdmi_port_jack(super::hdmi::hdmi_pcm_of(id.index)).0,
+            )),
+            ControlKind::Eld => Ok(ControlValue::bytes(
+                &self.hdmi_port_jack(super::hdmi::hdmi_pcm_of(id.index)).1,
+            )),
             ControlKind::Iec958ConMask => Ok(ControlValue::iec958(&super::hdmi::CON_MASK)),
             ControlKind::Iec958ProMask => Ok(ControlValue::iec958(&super::hdmi::PRO_MASK)),
-            ControlKind::Iec958Default => Ok(ControlValue::iec958(
-                &self.hdmi_playback.lock().status.to_le_bytes(),
-            )),
-            ControlKind::Iec958Switch => Ok(ControlValue::boolean(
-                self.hdmi_playback.lock().ctls & super::hdmi::DIG1_ENABLE != 0,
-            )),
+            ControlKind::Iec958Default => {
+                let state = self.hdmi_state(super::hdmi::hdmi_pcm_of(id.index));
+                Ok(ControlValue::iec958(&state.status.to_le_bytes()))
+            }
+            ControlKind::Iec958Switch => {
+                let state = self.hdmi_state(super::hdmi::hdmi_pcm_of(id.index));
+                Ok(ControlValue::boolean(
+                    state.ctls & super::hdmi::DIG1_ENABLE != 0,
+                ))
+            }
             ControlKind::ChannelMap => {
-                let map = self.hdmi_playback.lock().chmap;
+                let map = self.hdmi_state(super::hdmi::hdmi_pcm_of(id.index)).chmap;
                 Ok(ControlValue::integers(&map.map(i32::from)))
             }
         }
@@ -855,19 +877,20 @@ impl IntelHda {
         if !self.mixer_controls().contains(&id) {
             return Err(SoundError::NoSuchControl);
         }
+        let pcm = super::hdmi::hdmi_pcm_of(id.index);
         match (id.kind, value) {
             (ControlKind::Iec958Default, ControlValue::Iec958(status)) => {
                 return self
-                    .set_spdif_status(status)
+                    .set_spdif_status(pcm, status)
                     .map_err(|_| SoundError::BadState);
             }
             (ControlKind::Iec958Switch, ControlValue::Boolean(enable)) => {
                 return self
-                    .set_spdif_enable(enable)
+                    .set_spdif_enable(pcm, enable)
                     .map_err(|_| SoundError::BadState);
             }
             (ControlKind::ChannelMap, ControlValue::Integers { len, values }) => {
-                return self.set_chmap(&values[..usize::from(len)]);
+                return self.set_chmap(pcm, &values[..usize::from(len)]);
             }
             _ => {}
         }

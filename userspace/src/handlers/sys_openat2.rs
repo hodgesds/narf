@@ -198,28 +198,63 @@ pub(crate) fn sys_openat2(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // `RESOLVE_IN_ROOT`: `path_init` with LOOKUP_IN_ROOT sets `nd->root` to
+    // the dirfd and an absolute name jumps to THAT root, so "/x" names the
+    // same file as "x" below dirfd. Joined as written, an absolute name was
+    // resolved from the caller's own root instead — harmless only while
+    // that root is "/". After a chroot or pivot_root the caller's root is a
+    // directory inside the mount table, and `openat2(fd_of("/oldroot"), "/",
+    // RESOLVE_IN_ROOT)` (bubblewrap's open of a `--bind / /` source after
+    // its pivot_root) named `/oldroot/<caller's root>` instead of the
+    // dirfd's directory itself — ENOENT, "Can't open source /".
+    let raw = if scope.in_root {
+        in_root_relative(&raw)
+    } else {
+        raw
+    };
+
     // `openat2` is an extensible version of `openat`, not of NARF's legacy
     // length-delimited `open` ABI. In particular, retain `dirfd`: systemd's
     // mount-unit path walker opens each child relative to an O_PATH parent
     // and later uses that parent in mkdirat(). Routing through `sys_open`
     // discarded the directory fd, so the returned descriptor had no usable
     // backing path for the subsequent mkdirat.
-    let proxy_args = SyscallArgs {
-        arg0: args.arg0,
-        arg1: args.arg1,
-        arg2: flags,
-        arg3: mode,
-        arg4: 0,
-        arg5: 0,
-    };
-    let mut proxy = ReshapeArgs {
-        inner: ctx,
-        args: proxy_args,
-    };
+    //
     // The scope lives for exactly this resolution — Linux's
     // `current->nameidata`, which is why the resolver can consult it
     // without every frame in between threading it down.
-    with_resolve_scope(task, scope, || sys_openat(&mut proxy));
+    let dirfd = i64::from(args.arg0 as u32 as i32);
+    with_resolve_scope(task, scope, || openat_path(ctx, dirfd, raw, flags, mode as u32));
+}
+
+/// A `RESOLVE_IN_ROOT` name as the path below the dirfd it walks to.
+///
+/// The dirfd is the walk's root: a leading `/` jumps to it (`nd_jump_root`)
+/// and `..` at it stays there (`follow_dotdot` stops at `nd->root`), so
+/// `"/"`, `"/x"`, `"../x"` and `"/a/../../x"` name `.`, `x`, `x` and `x`
+/// below the dirfd. The components are folded here, before the join onto
+/// the dirfd's path, because the join is textual and a `..` left in it
+/// would climb out of the dirfd before the scope ever saw it. A trailing
+/// `/` is kept: it still asks for a directory.
+fn in_root_relative(path: &str) -> alloc::string::String {
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name => parts.push(name),
+        }
+    }
+    if parts.is_empty() {
+        return alloc::string::String::from(".");
+    }
+    let mut relative = parts.join("/");
+    if path.ends_with('/') {
+        relative.push('/');
+    }
+    relative
 }
 
 /// Translate the `resolve` mask into a [`ResolveScope`].

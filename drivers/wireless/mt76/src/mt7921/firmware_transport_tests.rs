@@ -297,6 +297,10 @@ struct Model {
     anonce: [u8; 32],
     ap_mac: [u8; 6],
     own_mac: [u8; 6],
+    /// KCK and KEK of the last PTK this model's authenticator derived, so a
+    /// test can build the Group Key Handshake that follows.
+    kck: Vec<u8>,
+    kek: Vec<u8>,
     access_point: Option<narf_wifi_fixtures::FakeAp>,
     recovery_trace: Vec<(&'static str, u64)>,
     reset_asserted_at: Option<u64>,
@@ -457,6 +461,8 @@ impl Model {
             anonce: [0; 32],
             ap_mac: [0; 6],
             own_mac: [0; 6],
+            kck: Vec::new(),
+            kek: Vec::new(),
             access_point: None,
             recovery_trace: Vec::new(),
             reset_asserted_at: None,
@@ -1355,6 +1361,8 @@ impl Backend for Model {
                         .unwrap();
                         let mut m3_bytes = m3.into_eapol();
                         let mic_full = narf_crypto::pbkdf2_sha1::hmac_sha1(&ptk.kck, &m3_bytes);
+                        self.kck = ptk.kck.clone();
+                        self.kek = ptk.kek.clone();
                         m3_bytes[81..97].copy_from_slice(&mic_full[..16]);
                         let m3_frame = ap_eapol_frame(self.own_mac, self.ap_mac, &m3_bytes);
                         let mut m3_packet = vec![0u8; 32 + m3_frame.len()];

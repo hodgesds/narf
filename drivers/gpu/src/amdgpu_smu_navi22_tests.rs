@@ -293,7 +293,7 @@ impl Io for Fake {
                             0
                         }
                         ALLOW_GFXOFF | DISALLOW_GFXOFF => 0,
-                        POWER_UP_VCN | POWER_DOWN_VCN => 0,
+                        POWER_UP_VCN | POWER_DOWN_VCN | POWER_UP_JPEG => 0,
                         SET_SOFT_MIN_BY_FREQ | SET_SOFT_MAX_BY_FREQ => 0,
                         GET_PPT_LIMIT => self.ppt_limit,
                         _ => panic!("unexpected SMU command"),
@@ -1787,4 +1787,64 @@ fn rdna2_uclk_limits_follow_dpm_state() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_uclk_limits_follow_dpm_state
+);
+
+/// Linux's Navi22 media power path is the boot default: `pg_flags` carry
+/// `AMD_PG_SUPPORT_VCN`/`_JPEG`, so `sienna_cichlid_get_allowed_feature_mask`
+/// allows MM_DPM_PG and PMFW runs it; `vcn_v3_0_start` then powers VCN up
+/// through `amdgpu_dpm_enable_vcn` (PowerUpVcn per unharvested instance,
+/// PowerUpJpeg) and `vcn_v3_0_stop` at the idle gate powers it down
+/// (PowerDownVcn). `amdgpu.rdna2_vcn_smu_pg=0` turns that path off.
+fn rdna2_vcn_media_power_is_linuxs_by_default() -> TestResult {
+    use crate::amdgpu_rdna2::options::BootOptions;
+    const MM_DPM_PG: u64 = 1 << 22;
+    const BOARD: u64 = 0x3767_a37f_fdff; // RX 6750 XT PMFW feature mask
+    let default = BootOptions::default();
+    // As the fb boot applies the options before the SMU policy is built.
+    crate::amdgpu_power_navi22::set_vcn_smu_pg(default.vcn_smu_pg);
+    let policy = crate::amdgpu_power_navi22::BootPolicy::from_features(BOARD).unwrap();
+    let (mut e, _pool) = powered_engine(0x413f00);
+    e.io.writes.clear();
+    let up = run(e.power_up_media([true, false]));
+    let up_commands = commands(&e.io.writes);
+    e.io.writes.clear();
+    let down = run(e.set_vcn_power([true, false], false));
+    let down_commands = commands(&e.io.writes);
+    let off = BootOptions::parse("amdgpu.rdna2_vcn_smu_pg=0");
+    crate::amdgpu_power_navi22::set_vcn_smu_pg(off.vcn_smu_pg);
+    let off_policy = crate::amdgpu_power_navi22::BootPolicy::from_features(BOARD).unwrap();
+    let (mut e, _pool) = powered_engine(0x413f00);
+    e.io.writes.clear();
+    let off_up = run(e.power_up_media([true, false]));
+    crate::amdgpu_power_navi22::set_vcn_smu_pg(default.vcn_smu_pg);
+    if !default.vcn_smu_pg
+        || policy.allowed() & MM_DPM_PG == 0
+        || !policy.validate_enabled(policy.allowed())
+    {
+        return TestResult::Fail("the default boot policy does not allow MM_DPM_PG");
+    }
+    if up != Ok(true)
+        || up_commands
+            != [
+                (RUNNING_LOW, 0),
+                (RUNNING_HIGH, 0),
+                (POWER_UP_VCN, 0),
+                (POWER_UP_JPEG, 0),
+            ]
+    {
+        return TestResult::Fail("the default media start does not power VCN and JPEG up");
+    }
+    if down != Ok(true)
+        || down_commands != [(RUNNING_LOW, 0), (RUNNING_HIGH, 0), (POWER_DOWN_VCN, 0)]
+    {
+        return TestResult::Fail("the default idle gate does not power VCN down");
+    }
+    if off.vcn_smu_pg || off_policy.allowed() & MM_DPM_PG != 0 || off_up != Ok(false) {
+        return TestResult::Fail("amdgpu.rdna2_vcn_smu_pg=0 does not turn PMFW media power off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22/media-power",
+    rdna2_vcn_media_power_is_linuxs_by_default
 );

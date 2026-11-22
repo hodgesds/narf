@@ -1,9 +1,9 @@
 //! Fast SYSCALL/SYSRET entry path.
 //!
-//! Companion to the existing `int 0x80` software-interrupt syscall
-//! gate in `trap.rs`. Both paths funnel into
-//! `narf_userspace::kernel_syscall_entry_plain(num, &args)` so the
-//! Rust-side dispatch logic stays in one place.
+//! The 64-bit system-call gate (Linux `entry_SYSCALL_64`), dispatching
+//! through `narf_userspace::kernel_syscall_entry_plain_with_state`. The
+//! `int 0x80` gate in `trap.rs` is the i386 ABI (`compat32::dispatch`);
+//! `syscall` from compatibility mode lands on the CSTAR stub below.
 //!
 //! Unlike `int 0x80`, the `syscall` instruction:
 //!   * Takes the entry RIP from `IA32_LSTAR` (no IDT lookup).
@@ -35,6 +35,7 @@ use narf_arch::x86_64::msr;
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_STAR: u32 = 0xC000_0081;
 const IA32_LSTAR: u32 = 0xC000_0082;
+const IA32_CSTAR: u32 = 0xC000_0083;
 const IA32_FMASK: u32 = 0xC000_0084;
 
 /// EFER.SCE — System Call Enable. Required to enable the
@@ -547,6 +548,31 @@ unsafe extern "C" fn sigreturn_iret_exit_x86_64(
     )
 }
 
+/// `IA32_CSTAR` landing pad: `syscall` executed in compatibility mode (CS =
+/// `__USER32_CS`). Only AMD CPUs enter here; Intel raises #UD for SYSCALL
+/// outside 64-bit mode. NARF has no compat SYSCALL entry yet (i386 code
+/// uses `int 0x80`), so this is Linux's `ignore_sysret`: return -ENOSYS in
+/// eax straight to the caller with `sysretl`. It touches neither the stack
+/// (RSP is still the user's) nor GS (no `swapgs`), runs with IF, TF, DF and
+/// AC cleared by `IA32_FMASK`, and `sysretl` reloads CS from `IA32_STAR`
+/// (0x23) and EIP/EFLAGS from ECX/R11.
+///
+/// Encoded as raw bytes: `mov eax, -38` (B8 DA FF FF FF) then SYSRET with a
+/// 32-bit operand size (0F 07, no REX.W), the return-to-compatibility-mode
+/// form.
+///
+/// # Safety
+/// Never call this from Rust; it is entered only by the CPU through
+/// `IA32_CSTAR`.
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall32_ignore_x86_64() {
+    naked_asm!(
+        ".byte 0xb8, 0xda, 0xff, 0xff, 0xff", // mov eax, -38 (-ENOSYS)
+        ".byte 0x0f, 0x07",                   // sysretl
+    )
+}
+
 /// Canonical-address guard for a SYSRET target RIP. Returns `rip` unchanged
 /// when it is canonical (bits [63:47] are a sign-extension of bit 47, the only
 /// form `sysretq` can return to without #GP), and `0` otherwise. `0` is
@@ -572,8 +598,8 @@ pub fn sysret_safe_rip(rip: u64) -> u64 {
 /// # Safety
 /// Caller asserts:
 ///   - GDT is configured with KCODE at 0x08, KDATA at 0x10,
-///     UCODE at 0x33 (UCODE-16 == 0x20 = STAR[63:48]),
-///     UDATA at 0x2B.
+///     UCODE32 at 0x23 (= STAR[63:48]), UDATA at 0x2B and UCODE at
+///     0x33 (`gdt::init` / `gdt::init_ap`).
 ///   - `init_bsp` (percpu) has set `IA32_GS_BASE` and
 ///     `IA32_KERNEL_GS_BASE` so swapgs lands at a valid PerCpu.
 ///   - This is called exactly once per CPU, after IDT and TSS
@@ -605,13 +631,16 @@ pub unsafe fn enable() {
     // CS = 0x23+16 = 0x33 and SS = 0x23+8 = 0x2B with the RPL bits
     // present in the base value — correct whether or not the CPU
     // re-ORs RPL=3. The +8/+16 only shift the GDT index (SS→idx5,
-    // CS→idx6); SYSRET synthesises the descriptors, so no GDT entry
-    // at index 4 (the 0x23 base) is required.
-    let kernel_cs: u64 = 0x08;
-    let user_cs_base: u64 = 0x23;
+    // CS→idx6). The 32-bit form (`sysretl`, used only by the CSTAR stub)
+    // returns to CS = STAR[63:48] itself: __USER32_CS, GDT index 4.
+    let kernel_cs: u64 = super::gdt::KCODE_SEL as u64;
+    let user_cs_base: u64 = narf_arch::x86_64::segments::USER32_CS as u64;
     let star = (user_cs_base << 48) | (kernel_cs << 32);
 
     let lstar = syscall_entry_x86_64 as usize as u64;
+    // A compat-mode `syscall` (AMD) must never reach CSTAR = 0 now that the
+    // GDT carries a 32-bit user code segment: point it at the -ENOSYS stub.
+    let cstar = syscall32_ignore_x86_64 as usize as u64;
 
     // SAFETY: WRMSR at CPL=0 against architecturally-defined
     // SYSCALL MSRs. Reads + writes EFER preserving other bits
@@ -620,6 +649,7 @@ pub unsafe fn enable() {
     unsafe {
         msr::wrmsr(IA32_STAR, star);
         msr::wrmsr(IA32_LSTAR, lstar);
+        msr::wrmsr(IA32_CSTAR, cstar);
         msr::wrmsr(IA32_FMASK, SFMASK_BITS);
 
         let efer = msr::rdmsr(IA32_EFER);
@@ -687,4 +717,36 @@ fn smoke_x86_64_sysret_noncanonical_rips_rewritten_to_zero() -> TestResult {
 kernel_test_in!(
     "frame/x86_64",
     smoke_x86_64_sysret_noncanonical_rips_rewritten_to_zero
+);
+
+/// `IA32_CSTAR` is where an AMD CPU sends `syscall` executed in
+/// compatibility mode (Intel raises #UD there). With a 32-bit user code
+/// segment in the GDT any task can reach compatibility mode, so CSTAR must
+/// name a landing pad, never 0 (a CPL-0 jump to RIP 0 on the user stack).
+/// Linux without a compat SYSCALL entry uses `ignore_sysret`: return
+/// -ENOSYS in eax with `sysretl`, touching neither the stack nor GS.
+fn smoke_ia32_cstar_returns_enosys_to_compat_caller() -> TestResult {
+    const IA32_CSTAR: u32 = 0xC000_0083;
+    // `mov eax, -38` (ENOSYS); `sysretl` (0F 07 without REX.W).
+    const IGNORE_SYSRET: [u8; 7] = [0xB8, 0xDA, 0xFF, 0xFF, 0xFF, 0x0F, 0x07];
+    // SAFETY: RDMSR of an architectural MSR at CPL0.
+    let cstar = unsafe { msr::rdmsr(IA32_CSTAR) };
+    if cstar == 0 {
+        return TestResult::Fail("IA32_CSTAR is 0: a compat-mode SYSCALL jumps to RIP 0 at CPL0");
+    }
+    let code = cstar as *const u8;
+    let mut bytes = [0u8; 7];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: CSTAR names kernel text, mapped readable; the landing pad
+        // is at least these seven bytes long.
+        *byte = unsafe { core::ptr::read_volatile(code.add(i)) };
+    }
+    if bytes != IGNORE_SYSRET {
+        return TestResult::Fail("IA32_CSTAR does not land on the -ENOSYS sysretl stub");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/ia32-gdt",
+    smoke_ia32_cstar_returns_enosys_to_compat_caller
 );

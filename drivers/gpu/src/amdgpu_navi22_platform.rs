@@ -443,6 +443,26 @@ pub(crate) async fn queue_progress(
     owner.as_mut().ok_or(boot::Error::Invalid)?.queue_progress()
 }
 
+/// `amdgpu_vcn_reset_engine` for VCN instance `instance` after a client job
+/// timed out. The owner is held throughout, so no media job is submitted
+/// meanwhile; the cancelled jobs are recorded before their fences are
+/// forced, and their waiters are woken afterwards.
+pub(crate) async fn reset_media_engine(
+    instance: usize,
+    generation: u64,
+) -> Result<(), boot::Error> {
+    let result = {
+        let mut owner = OWNER.lock().await;
+        let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+        boot.reset_media(instance, |cancelled| {
+            crate::amdgpu_navi22_cs::media_reset(cancelled, generation)
+        })
+        .await
+    };
+    crate::amdgpu_fence_navi22::notify_all();
+    result
+}
+
 /// Sample only after a graphics timeout. Unlike queue progress this reads GC
 /// registers, so it holds a GFXOFF reference with the owner. The caller
 /// prints after both guards drop.
@@ -1107,53 +1127,45 @@ pub async fn start_fault_service() -> Result<(), boot::Error> {
                 let Some(fault) = crate::amdgpu_gmc_navi22::Fault::from_iv(&iv) else {
                     continue;
                 };
-                let result = {
+                let seen = FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let logged = seen < FAULT_LOG_LIMIT;
+                let (result, line, report) = {
                     let mut owner = OWNER.lock().await;
-                    owner
+                    let gmc = owner
                         .as_mut()
                         .ok_or(boot::Error::Invalid)
-                        .and_then(|boot| boot.memory())
-                        .and_then(|gmc| gmc.handle_fault(fault).map_err(boot::Error::MemoryHubs))
+                        .and_then(|boot| boot.memory());
+                    match gmc {
+                        Ok(gmc) => {
+                            let result = gmc.handle_fault(fault).map_err(boot::Error::MemoryHubs);
+                            // gfxhub_v2_1/mmhub_v2_0_print_l2_protection_fault_status.
+                            let status = crate::amdgpu_vmid::fault(fault.pasid).status;
+                            let line = gmc.status_line(fault.hub, status);
+                            // Read back while the registers still hold what the
+                            // faulting job ran with.
+                            let client = matches!(
+                                result,
+                                Ok(crate::amdgpu_gmc_navi22::FaultOwner::Client { .. })
+                            );
+                            let report = (logged && client).then(|| gmc.client_fault_report(fault));
+                            (result, Some(line), report)
+                        }
+                        Err(error) => (Err(error), None, None),
+                    }
                 };
-                let seen = FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if seen < FAULT_LOG_LIMIT {
+                if logged {
                     use core::fmt::Write;
                     let _ = writeln!(
                         narf_console::Writer,
                         "amdgpu: navi22 GPU page fault {fault:?} -> {result:?}"
                     );
-                    // gfxhub_v2_1_print_l2_protection_fault_status.
-                    let status = crate::amdgpu_vmid::fault(fault.pasid).status;
-                    const CLIENTS: [&str; 18] = [
-                        "CB/DB",
-                        "Reserved",
-                        "GE1",
-                        "GE2",
-                        "CPF",
-                        "CPC",
-                        "CPG",
-                        "RLC",
-                        "TCP",
-                        "SQC (inst)",
-                        "SQC (data)",
-                        "SQG",
-                        "Reserved",
-                        "SDMA0",
-                        "SDMA1",
-                        "GCR",
-                        "SDMA2",
-                        "SDMA3",
-                    ];
-                    let cid = (status >> 9) & 0x1ff;
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "amdgpu: navi22 GPU page fault status={status:#x} client={} walker={} permission={:#x} mapping={} rw={}",
-                        CLIENTS.get(cid as usize).copied().unwrap_or("?"),
-                        (status >> 1) & 7,
-                        (status >> 4) & 0xf,
-                        (status >> 8) & 1,
-                        (status >> 18) & 1,
-                    );
+                    if let Some(line) = line {
+                        let _ =
+                            writeln!(narf_console::Writer, "amdgpu: navi22 GPU page fault {line}");
+                    }
+                    if let Some(report) = report {
+                        let _ = writeln!(narf_console::Writer, "{report}");
+                    }
                 }
             }
         });
@@ -3956,7 +3968,14 @@ mod tests {
         if amdgpu::pci_device().is_some() {
             return TestResult::Skip("physical GPU: its monitor consumes requests");
         }
+        // Start with no event owed: no DRM/HPD request pending, and no relight
+        // owed for a recovery an earlier test ran (no monitor runs here to
+        // relight after it, so `monitor_wait` would rightly end at once).
         let _ = crate::amdgpu_navi22_kms::take_pending();
+        RELIT.store(
+            crate::amdgpu_navi22_recovery::recoveries(),
+            Ordering::Release,
+        );
         for poll in [None, Some(10_000)] {
             let count = alloc::sync::Arc::new(Count(core::sync::atomic::AtomicUsize::new(0)));
             let waker = core::task::Waker::from(count.clone());

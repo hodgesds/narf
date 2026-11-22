@@ -66,6 +66,19 @@ fn arp_insert_local(net_ns_id: u64, ip: [u8; 4], mac: [u8; 6]) {
     m.insert((net_ns_id, ip), mac);
 }
 
+/// Record `ip → mac` in the namespace's next-hop cache (an administrator's
+/// RTM_NEWNEIGH).
+pub(crate) fn arp_insert_in(net_ns_id: u64, ip: [u8; 4], mac: [u8; 6]) {
+    arp_insert_local(net_ns_id, ip, mac);
+}
+
+/// Forget `ip` in the namespace's next-hop cache (RTM_DELNEIGH).
+pub(crate) fn arp_remove_in(net_ns_id: u64, ip: [u8; 4]) {
+    if let Some(cache) = ARP_CACHE.lock().as_mut() {
+        cache.remove(&(net_ns_id, ip));
+    }
+}
+
 pub(crate) fn remove_namespace(net_ns_id: u64) {
     if let Some(cache) = ARP_CACHE.lock().as_mut() {
         cache.retain(|(namespace, _), _| *namespace != net_ns_id);
@@ -89,6 +102,16 @@ pub fn send_arp_request(target_ip: [u8; 4]) -> Result<(), ()> {
 
 pub fn send_arp_request_in(net_ns_id: u64, target_ip: [u8; 4]) -> Result<(), ()> {
     let iface = iface::for_dst_in(net_ns_id, target_ip).ok_or(())?;
+    let mut frame = [0u8; 60];
+    let n = pkt::build_arp_request(&mut frame, iface.mac, iface.ipv4, target_ip).ok_or(())?;
+    iface.xmit(&frame[..n])
+}
+
+/// `arp_solicit` on a given device: the neighbour table is per device, so
+/// a request for a next hop goes out the device the route chose, from that
+/// device's address.
+pub fn send_arp_request_on(net_ns_id: u64, iface_name: &str, target_ip: [u8; 4]) -> Result<(), ()> {
+    let iface = iface::lookup_in(net_ns_id, iface_name).ok_or(())?;
     let mut frame = [0u8; 60];
     let n = pkt::build_arp_request(&mut frame, iface.mac, iface.ipv4, target_ip).ok_or(())?;
     iface.xmit(&frame[..n])
@@ -138,6 +161,39 @@ pub fn neigh_output_in(net_ns_id: u64, nexthop: [u8; 4], len: usize, cont: arp_c
     }
 }
 
+/// [`neigh_output_in`] for a next hop in `iface_name`'s neighbour table (a
+/// route with `flowi4_oif`): only that device's entry answers, and the
+/// request goes out that device.
+pub fn neigh_output_on(
+    net_ns_id: u64,
+    iface_name: &str,
+    nexthop: [u8; 4],
+    len: usize,
+    cont: arp_cache::NeighCont,
+) {
+    if let Some(mac) = arp_cache::lookup(iface_name, nexthop) {
+        cont(Some(mac));
+        return;
+    }
+    if arp_cache::resolution_failed(iface_name, nexthop) {
+        cont(None);
+        return;
+    }
+    let resolving = matches!(
+        arp_cache::entry_state(iface_name, nexthop),
+        Some(arp_cache::ArpState::Incomplete)
+    );
+    arp_cache::queue_pending(net_ns_id, iface_name, nexthop, len, cont);
+    if !resolving {
+        arp_cache::mark_incomplete(iface_name, nexthop);
+        neigh_add_timer(net_ns_id, iface_name, nexthop);
+        let _ = send_arp_request_on(net_ns_id, iface_name, nexthop);
+    }
+    if let Some(mac) = arp_cache::lookup(iface_name, nexthop) {
+        neigh_resolved(net_ns_id, iface_name, nexthop, mac);
+    }
+}
+
 /// Start resolving `nexthop` unless that is already under way, without
 /// waiting: the cached MAC if it is known, else `None` after the request is
 /// out. For callers with their own queue of frames for the neighbour.
@@ -156,8 +212,31 @@ pub fn neigh_start_in(net_ns_id: u64, nexthop: [u8; 4]) -> Option<[u8; 6]> {
     }
     arp_cache::mark_incomplete(&name, nexthop);
     neigh_add_timer(net_ns_id, &name, nexthop);
-    let _ = send_arp_request_in(net_ns_id, nexthop);
+    let _ = send_arp_request_on(net_ns_id, &name, nexthop);
     arp_lookup_local(net_ns_id, nexthop)
+}
+
+/// [`neigh_start_in`] for a next hop on a known output device (a route with
+/// `flowi4_oif`, e.g. SO_BINDTODEVICE): the neighbour is `iface_name`'s
+/// (`__ipv4_neigh_lookup_noref(dev, nexthop)`), so only that device's cache
+/// answers and the request goes out that device. `None` once the request is
+/// out, the MAC if the device already knows it.
+pub fn neigh_start_on(net_ns_id: u64, iface_name: &str, nexthop: [u8; 4]) -> Option<[u8; 6]> {
+    if let Some(mac) = arp_cache::lookup(iface_name, nexthop) {
+        return Some(mac);
+    }
+    if arp_cache::resolution_failed(iface_name, nexthop)
+        || matches!(
+            arp_cache::entry_state(iface_name, nexthop),
+            Some(arp_cache::ArpState::Incomplete)
+        )
+    {
+        return None;
+    }
+    arp_cache::mark_incomplete(iface_name, nexthop);
+    neigh_add_timer(net_ns_id, iface_name, nexthop);
+    let _ = send_arp_request_on(net_ns_id, iface_name, nexthop);
+    arp_cache::lookup(iface_name, nexthop)
 }
 
 /// An ARP packet taught us `ip`'s MAC on `iface_name`: send everything that
@@ -286,7 +365,8 @@ fn neigh_timer_handler(nt: &alloc::sync::Arc<NeighTimer>) {
     let (net_ns_id, name, ip) = (nt.net_ns_id, nt.name.as_str(), nt.ip);
     match arp_cache::poll_resolution(name, ip) {
         arp_cache::ResolutionStep::Retransmit => {
-            let _ = send_arp_request_in(net_ns_id, ip);
+            // The retransmission goes out the device this neighbour belongs to.
+            let _ = send_arp_request_on(net_ns_id, name, ip);
         }
         arp_cache::ResolutionStep::GaveUp => {
             for cont in arp_cache::take_pending(net_ns_id, name, ip) {
@@ -648,6 +728,20 @@ pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
         Some(a) => a,
         None => return,
     };
+    // `arp_process`: a request for a multicast or loopback target is
+    // dropped before anything is learned or answered.
+    if arp.tpa[0] & 0xf0 == 0xe0 || arp.tpa[0] == 127 {
+        return;
+    }
+    // RFC 2131 duplicate address detection (sender 0.0.0.0): a probe for
+    // one of our addresses is answered so the prober sees the conflict, and
+    // nothing is learned from it (`if (sip == 0) { ... goto out_consume_skb; }`).
+    if arp.spa == [0; 4] {
+        if arp.op == ARP_OP_REQUEST {
+            arp_reply_from_ingress(net_ns_id, iface_name, &arp);
+        }
+        return;
+    }
     arp_insert_local(net_ns_id, arp.spa, arp.sha);
     // Per-iface cache: record on the ingress interface if known.
     if let Some(name) = iface_name {
@@ -655,38 +749,34 @@ pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
         neigh_resolved(net_ns_id, name, arp.spa, arp.sha);
     }
     if arp.op == ARP_OP_REQUEST {
-        // Answer from whichever iface actually owns the requested
-        // address. ARP targets a specific IP, so the responder MUST be
-        // that IP's iface — falling back to `primary()` (first-
-        // registered) wrongly answers (or fails to answer) when the
-        // owning NIC isn't first, e.g. e1000 registers before virtio-net
-        // but only virtio-net carries 10.0.2.15. Without this, QEMU's
-        // user-mode (SLIRP) hostfwd can't ARP-resolve the guest and the
-        // forwarded SYN is never delivered.
-        // Prefer the INGRESS iface when it owns the requested address —
-        // the reply must go back out the NIC the request came in on, so a
-        // multi-NIC / overlapping-subnet setup (e.g. two QEMU user-mode
-        // NICs) answers on the correct link. Fall back to any iface that
-        // owns the address, then `primary`.
-        let snap = iface_name
-            .and_then(iface::lookup)
-            .filter(|s| s.net_ns_id == net_ns_id && s.ipv4 == arp.tpa)
-            .or_else(|| iface::for_local_addr_in(net_ns_id, arp.tpa))
-            .or_else(|| iface_name.and_then(iface::lookup))
-            .filter(|s| s.net_ns_id == net_ns_id)
-            .or_else(|| iface::primary_in(net_ns_id));
-        let iface = match snap {
-            Some(i) => i,
-            None => return,
-        };
-        if arp.tpa == iface.ipv4 {
-            let mut frame = [0u8; 60];
-            if let Some(n) = pkt::build_arp_reply(&mut frame, iface.mac, iface.ipv4, &arp) {
-                let _ = iface.xmit(&frame[..n]);
-            }
-        }
+        arp_reply_from_ingress(net_ns_id, iface_name, &arp);
     }
     let _ = ARP_OP_REPLY;
+}
+
+/// `arp_process` with the defaults arp_ignore=0 and arp_filter=0: a request
+/// for any address local to the namespace (`ip_route_input_noref` →
+/// RTN_LOCAL) is answered from the device it arrived on, with that device's
+/// own address — `arp_send_dst(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip, sha,
+/// dev->dev_addr, sha)` — never from the device that owns the address. Two
+/// NICs on one subnet therefore both answer for each other's addresses (ARP
+/// flux), as Linux does. A legacy caller with no ingress device answers from
+/// the owner of the address.
+fn arp_reply_from_ingress(net_ns_id: u64, iface_name: Option<&str>, arp: &pkt::ArpPacket) {
+    if !iface::is_local_addr_in(net_ns_id, arp.tpa) {
+        return;
+    }
+    let dev = match iface_name {
+        Some(name) => iface::lookup_in(net_ns_id, name),
+        None => iface::for_local_addr_in(net_ns_id, arp.tpa),
+    };
+    let Some(dev) = dev else {
+        return;
+    };
+    let mut frame = [0u8; 60];
+    if let Some(n) = pkt::build_arp_reply(&mut frame, dev.mac, arp.tpa, arp) {
+        let _ = dev.xmit(&frame[..n]);
+    }
 }
 
 /// True iff this is a UDP datagram to the DHCP client port.
@@ -782,6 +872,12 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str, csum_verified: bool)
     {
         let decided = ctx.packet();
         if let Some((ip, _)) = parse_ipv4(decided) {
+            // `ip_route_input_slow` → `fib_validate_source`, for local
+            // delivery and forwarding alike.
+            if !reverse_path_ok(net_ns_id, iface_in, ip.src_ip) {
+                RP_FILTER_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             if !crate::ip_local::deliver_locally_in(net_ns_id, ip.dst_ip)
                 && !is_dhcp_client_datagram(decided)
             {
@@ -828,6 +924,31 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str, csum_verified: bool)
     local_deliver_finish(net_ns_id, iface_in, ctx.packet(), csum_verified);
 }
 
+/// Packets dropped by reverse-path filtering (Linux `LINUX_MIB_IPRPFILTER`,
+/// `IPReversePathFilter`).
+pub static RP_FILTER_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `fib_validate_source` for a packet from `src` that arrived on
+/// `iface_in`. With the device's `rp_filter` mode at 0 every source passes.
+/// Strict (1): the best route back to `src` must leave through `iface_in`.
+/// Loose (2 and above, `rpf == 1` being the only strict test): a route
+/// back must exist. Loopback and the unspecified source (DHCP, which
+/// `ip_route_input_slow` sends to `brd_input` unvalidated) are not checked.
+fn reverse_path_ok(net_ns_id: u64, iface_in: &str, src: [u8; 4]) -> bool {
+    if iface_in.is_empty() || iface_in == "lo" || src == [0; 4] {
+        return true;
+    }
+    let mode = narf_lib::sysctl::ipv4::rp_filter_mode(iface_in);
+    if mode == 0 {
+        return true;
+    }
+    match crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(src)) {
+        // `last_resort`: no route back fails both modes.
+        None => false,
+        Some(route) => mode != 1 || route.iface == iface_in,
+    }
+}
+
 /// `ip_local_deliver_finish`: hand a whole, LOCAL_IN-accepted datagram to
 /// its transport protocol. `csum_verified` is the driver/GRO
 /// `CHECKSUM_UNNECESSARY` verdict; it never covers a reassembled datagram.
@@ -849,7 +970,14 @@ fn local_deliver_finish(net_ns_id: u64, iface_in: &str, body: &[u8], csum_verifi
                 rx_csum::TCP_CSUM_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return;
             }
-            crate::tcp::core::handle_segment_in(net_ns_id, ip.src_ip, ip.dst_ip, payload)
+            // The arrival device (`inet_iif`) for SO_BINDTODEVICE matching.
+            crate::tcp::core::handle_segment_on(
+                net_ns_id,
+                ip.src_ip,
+                ip.dst_ip,
+                payload,
+                iface::ifindex_of(iface_in).unwrap_or(0),
+            )
         }
         IP_PROTO_UDP => handle_udp(
             net_ns_id,
@@ -862,7 +990,18 @@ fn local_deliver_finish(net_ns_id: u64, iface_in: &str, body: &[u8], csum_verifi
             // is why SO_BINDTODEVICE could not be checked on receive.
             iface::ifindex_of(iface_in).unwrap_or(0),
         ),
-        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx_in(net_ns_id, ip.src_ip, ip.dst_ip, payload),
+        IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx_meta(
+            net_ns_id,
+            ip.src_ip,
+            ip.dst_ip,
+            payload,
+            crate::icmp_sock::EchoRxMeta {
+                ttl,
+                tos,
+                ifindex: iface::ifindex_of(iface_in).unwrap_or(0),
+                dst: ip.dst_ip,
+            },
+        ),
         _ => {}
     }
 }

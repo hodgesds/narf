@@ -131,6 +131,7 @@ const INFINITY_LIFE_TIME: u32 = 0xFFFF_FFFF;
 // ── RTA_* route attribute types (rtnetlink.h) ──────────────────────────
 
 pub const RTA_DST: u16 = 1;
+pub const RTA_SRC: u16 = 2;
 pub const RTA_OIF: u16 = 4;
 pub const RTA_GATEWAY: u16 = 5;
 pub const RTA_PRIORITY: u16 = 6;
@@ -207,6 +208,7 @@ pub const NUD_REACHABLE: u16 = 0x02;
 pub const NUD_STALE: u16 = 0x04;
 pub const NUD_DELAY: u16 = 0x08;
 pub const NUD_PROBE: u16 = 0x10;
+pub const NUD_FAILED: u16 = 0x20;
 pub const NTF_ROUTER: u8 = 0x80;
 pub const FR_ACT_TO_TBL: u8 = 1;
 
@@ -465,23 +467,7 @@ fn remaining_lifetime(deadline_ns: u64, now_ns: u64) -> u32 {
 
 /// The 32-bit `inet6_ifaddr.flags` for an address.
 fn ipv6_ifa_flags(addr: &crate::ipv6::addrs::Ipv6IfAddr) -> u32 {
-    use crate::ipv6::addrs::AddrState;
-    let mut flags = match addr.state {
-        AddrState::Tentative => IFA_F_TENTATIVE,
-        AddrState::Deprecated => IFA_F_DEPRECATED,
-        AddrState::Preferred | AddrState::Invalid => 0,
-    };
-    if addr.temporary {
-        flags |= IFA_F_TEMPORARY;
-    }
-    // A statically configured address — one with no lifetime at all — is
-    // IFA_F_PERMANENT (`inet6_addr_add` → `ifa_flags |= IFA_F_PERMANENT`
-    // when `valid_lft == INFINITY_LIFE_TIME`); SLAAC addresses carry their
-    // router-advertised lifetimes instead.
-    if addr.valid_deadline_ns == u64::MAX && addr.preferred_deadline_ns == u64::MAX {
-        flags |= IFA_F_PERMANENT;
-    }
-    flags
+    crate::ipv6::addrs::ifa_flags(addr)
 }
 
 fn build_newaddr_v6(
@@ -490,19 +476,17 @@ fn build_newaddr_v6(
     seq: u32,
     pid: u32,
 ) -> Vec<u8> {
-    use crate::ipv6::addrs::AddrScope;
-
     let mut body = Vec::new();
     body.push(AF_INET6);
     body.push(addr.prefix_len);
     let flags = ipv6_ifa_flags(addr);
     // `put_ifaddrmsg`: the legacy u8 field carries the low byte.
     body.push(flags as u8);
-    body.push(match addr.scope {
-        AddrScope::Host => 254, // RT_SCOPE_HOST
-        AddrScope::Global | AddrScope::UniqueLocal => 0,
-        AddrScope::LinkLocal => 0x20,
-    });
+    // `put_ifaddrmsg(..., rt_scope(ifa->scope), ...)`: an RT_SCOPE_* value
+    // (RT_SCOPE_LINK for fe80::/10), not the IPV6_ADDR_* scope bits.
+    body.push(crate::ipv6::addrs::rt_scope(
+        crate::ipv6::addrs::ipv6_addr_scope(&addr.addr),
+    ));
     body.extend_from_slice(&ifindex.to_ne_bytes());
     push_rtattr(&mut body, IFA_ADDRESS, &addr.addr);
     // `inet6_fill_ifaddr` order: IFA_ADDRESS, IFA_CACHEINFO, IFA_FLAGS.
@@ -571,7 +555,7 @@ fn build_newroute_v6(
     body.push(route.prefix_len);
     body.extend_from_slice(&[0, 0]);
     body.push(crate::route::TABLE_MAIN);
-    body.push(RTPROT_KERNEL);
+    body.push(route.protocol); // `rtm_protocol = rt->fib6_protocol`
     body.push(0);
     body.push(RTN_UNICAST);
     body.extend_from_slice(&0u32.to_ne_bytes());
@@ -590,6 +574,20 @@ fn build_newroute_v6(
         RTA_TABLE,
         &(crate::route::TABLE_MAIN as u32).to_ne_bytes(),
     );
+    // `rtnl_put_cacheinfo`: an RTF_EXPIRES route's remaining lifetime in
+    // clock_t (USER_HZ = 100); then RTA_PREF on every route.
+    const RTA_CACHEINFO: u16 = 12;
+    const RTA_PREF: u16 = 20;
+    let expires = if route.valid_deadline_ns == 0 || route.valid_deadline_ns == u64::MAX {
+        0
+    } else {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        (route.valid_deadline_ns.saturating_sub(now) / 10_000_000).min(i32::MAX as u64) as u32
+    };
+    let mut cacheinfo = [0u8; 32];
+    cacheinfo[8..12].copy_from_slice(&expires.to_ne_bytes());
+    push_rtattr(&mut body, RTA_CACHEINFO, &cacheinfo);
+    push_rtattr(&mut body, RTA_PREF, &[route.pref]);
     frame_message(RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &body)
 }
 
@@ -812,6 +810,7 @@ fn build_ack(seq: u32, req: &[u8]) -> Vec<u8> {
 /// (ifindex 1); every other device reports the ifindex it was given when it
 /// registered (`dev_new_index`). Returned as `(link, addrs)` so both dumps
 /// share one enumeration.
+#[cfg(any(test, feature = "kernel-test"))]
 fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     enumerate_in(0)
 }
@@ -832,24 +831,52 @@ fn ipv4_addrs_of(iface: &str) -> Vec<([u8; 4], u8)> {
 }
 
 fn builtin_loopback_ipv6() -> crate::ipv6::addrs::Ipv6IfAddr {
-    crate::ipv6::addrs::Ipv6IfAddr {
-        iface: alloc::string::String::from("lo"),
-        addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-        prefix_len: 128,
-        state: crate::ipv6::addrs::AddrState::Preferred,
-        scope: crate::ipv6::addrs::AddrScope::Host,
-        preferred_deadline_ns: u64::MAX,
-        valid_deadline_ns: u64::MAX,
-        temporary: false,
-    }
+    crate::ipv6::addrs::loopback_ifaddr()
 }
 
 fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     let mut links = Vec::new();
     let mut addrs = Vec::new();
 
-    // Synthetic loopback: ifindex 1, IFF_UP|IFF_LOOPBACK|IFF_RUNNING,
-    // ARPHRD_LOOPBACK, MTU 65536, address 127.0.0.1/8.
+    // A namespace made by `copy_net_ns` has its own `lo`
+    // (`loopback_net_init`): down and without an address until configured.
+    let own_loopback = if net_ns_id == 0 {
+        None
+    } else {
+        crate::iface::namespace_loopback(net_ns_id)
+    };
+    if let Some(lo) = own_loopback {
+        links.push(LinkInfo {
+            ifindex: crate::iface::LOOPBACK_IFINDEX,
+            flags: IFF_LOOPBACK | if lo.up { IFF_UP | IFF_RUNNING } else { 0 },
+            arphrd: ARPHRD_LOOPBACK,
+            name: alloc::string::String::from("lo"),
+            mac: Vec::new(),
+            mtu: lo.mtu,
+            carrier: true,
+            tx_queue_len: 1000,
+            link_mode: 0,
+            netdev_group: 0,
+            stats: Some(lo.stats),
+        });
+        for (addr, prefix_len) in lo.ipv4 {
+            addrs.push(AddrInfo {
+                ifindex: crate::iface::LOOPBACK_IFINDEX,
+                prefix_len,
+                addr,
+                label: alloc::string::String::from("lo"),
+            });
+        }
+    } else {
+        push_initial_loopback(net_ns_id, &mut links, &mut addrs);
+    }
+    enumerate_devices_in(net_ns_id, &mut links, &mut addrs);
+    (links, addrs)
+}
+
+/// The initial namespace's `lo`: ifindex 1, IFF_UP|IFF_LOOPBACK|IFF_RUNNING,
+/// ARPHRD_LOOPBACK, MTU 65536, address 127.0.0.1/8.
+fn push_initial_loopback(net_ns_id: u64, links: &mut Vec<LinkInfo>, addrs: &mut Vec<AddrInfo>) {
     links.push(LinkInfo {
         ifindex: 1,
         flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
@@ -871,14 +898,19 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
         addr: [127, 0, 0, 1],
         label: alloc::string::String::from("lo"),
     });
+}
 
+/// Every device of `net_ns_id` except its `lo`, in registration order.
+fn enumerate_devices_in(net_ns_id: u64, links: &mut Vec<LinkInfo>, addrs: &mut Vec<AddrInfo>) {
     // Legacy L3 interfaces first, each under the ifindex it registered with —
-    // the same number the IPv4 stack, SIOCGIFINDEX and sysfs report.
-    for nic in crate::iface::snapshot_all()
+    // the same number the IPv4 stack, SIOCGIFINDEX and sysfs report. A
+    // device moved into a namespace (`dev_change_net_namespace`) is listed
+    // there and nowhere else.
+    for nic in crate::iface::snapshot_all_in(net_ns_id)
         .into_iter()
-        // `lo` is the synthetic ifindex-1 entry above; its legacy L3
-        // registration must not appear a second time as an Ethernet device.
-        .filter(|nic| nic.net_ns_id == net_ns_id && nic.name != "lo")
+        // `lo` is the ifindex-1 entry above; its legacy L3 registration must
+        // not appear a second time as an Ethernet device.
+        .filter(|nic| nic.name != "lo")
     {
         let ifindex = nic.ifindex;
         links.push(LinkInfo {
@@ -958,8 +990,6 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
             stats: None,
         });
     }
-
-    (links, addrs)
 }
 
 /// Build the reply message stream for a dump request `req`. Returns one
@@ -1068,16 +1098,37 @@ fn build_get_in(net_ns_id: u64, req: &[u8], strict: bool, ext_ack: bool) -> Vec<
                 .and_then(|(off, _)| req[off..off + 4].try_into().ok())
                 .unwrap_or([0; 4]);
             let dst = crate::ipv4::Ipv4Addr(dst);
-            if let Some(route) = crate::route::route_lookup_raw_in(net_ns_id, dst) {
-                if let Some(link) = links.iter().find(|link| link.name == route.iface) {
-                    let mut message = build_newroute(&route, link.ifindex, seq, pid);
-                    clear_multipart(&mut message);
-                    out.push(message);
+            const RTM_F_FIB_MATCH: u32 = 0x2000;
+            let rtm_flags = req
+                .get(NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 12)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map_or(0, u32::from_ne_bytes);
+            let attr4 = |kind: u16| {
+                tb[kind as usize]
+                    .and_then(|(off, _)| req.get(off..off + 4))
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            };
+            // `flowi4_oif = nla_get_u32(tb[RTA_OIF])`; `flowi4_saddr` from RTA_SRC.
+            let oif = attr4(RTA_OIF).map_or(0, u32::from_ne_bytes);
+            let src = attr4(RTA_SRC);
+            if rtm_flags & RTM_F_FIB_MATCH != 0 {
+                // `fib_dump_info` of the FIB entry the lookup matched.
+                if let Some(route) = crate::route::route_lookup_raw_in(net_ns_id, dst) {
+                    if let Some(link) = links.iter().find(|link| link.name == route.iface) {
+                        let mut message = build_newroute(&route, link.ifindex, seq, pid);
+                        clear_multipart(&mut message);
+                        out.push(message);
+                    } else {
+                        out.push(build_error(ENODEV, seq, pid, req));
+                    }
                 } else {
-                    out.push(build_error(ENODEV, seq, pid, req));
+                    out.push(build_error(ENETUNREACH, seq, pid, req));
                 }
-            } else {
-                out.push(build_error(ENETUNREACH, seq, pid, req));
+                return out;
+            }
+            match getroute_output(net_ns_id, &links, dst, oif, src) {
+                Ok(route) => out.push(build_cloned_route(&route, seq, pid)),
+                Err(errno) => out.push(build_error(errno, seq, pid, req)),
             }
         }
         // LINUX-GAP: the other RTM_GET* doits (inet6_rtm_getaddr, neigh_get,
@@ -1091,6 +1142,111 @@ fn build_get_in(net_ns_id: u64, req: &[u8], strict: bool, ext_ack: bool) -> Vec<
         }
     }
     out
+}
+
+/// The route `ip_route_output_key_hash_rcu` produces for an RTM_GETROUTE
+/// query, as `rt_fill_info` reports it.
+struct ClonedRoute {
+    dst: [u8; 4],
+    /// RTA_SRC when the query named one; then no RTA_PREFSRC is reported.
+    src: Option<[u8; 4]>,
+    prefsrc: [u8; 4],
+    gateway: Option<[u8; 4]>,
+    oif: u32,
+    table: u8,
+    rtn_type: u8,
+}
+
+/// The output lookup behind `inet_rtm_getroute` (no RTA_IIF): a local
+/// destination is an RTN_LOCAL route through lo in the local table; with
+/// RTA_OIF only that device's routes count, and without one the destination
+/// is on-link there (`route_lookup_oif_in`); an unknown oif is -ENODEV and no
+/// route -ENETUNREACH.
+fn getroute_output(
+    net_ns_id: u64,
+    links: &[LinkInfo],
+    dst: crate::ipv4::Ipv4Addr,
+    oif: u32,
+    src: Option<[u8; 4]>,
+) -> Result<ClonedRoute, i32> {
+    // `ip_route_output_key_hash_rcu`: no destination is the loopback address
+    // (`fl4->daddr = fl4->saddr = htonl(INADDR_LOOPBACK)`), a local route.
+    if dst.0 == [0; 4] || crate::iface::is_local_addr_in(net_ns_id, dst.0) {
+        let local = if dst.0 == [0; 4] {
+            [127, 0, 0, 1]
+        } else {
+            dst.0
+        };
+        return Ok(ClonedRoute {
+            dst: dst.0,
+            src,
+            prefsrc: src.unwrap_or(local),
+            gateway: None,
+            oif: 1,
+            table: crate::route::TABLE_LOCAL,
+            rtn_type: RTN_LOCAL,
+        });
+    }
+    let result = if oif != 0 {
+        let name = links
+            .iter()
+            .find(|link| link.ifindex == oif)
+            .map(|link| link.name.clone())
+            .ok_or(ENODEV)?;
+        crate::route::route_lookup_oif_in(net_ns_id, dst, &name)
+    } else {
+        crate::route::route_lookup_in(net_ns_id, dst).ok_or(ENETUNREACH)?
+    };
+    let oif = links
+        .iter()
+        .find(|link| link.name == result.iface)
+        .map(|link| link.ifindex)
+        .ok_or(ENODEV)?;
+    Ok(ClonedRoute {
+        dst: dst.0,
+        src,
+        prefsrc: src.unwrap_or(result.src.0),
+        gateway: result.gateway.map(|g| g.0),
+        oif,
+        table: crate::route::TABLE_MAIN,
+        rtn_type: RTN_UNICAST,
+    })
+}
+
+/// `rt_fill_info` for an output route: rtm_dst_len 32, RTPROT_UNSPEC,
+/// RT_SCOPE_UNIVERSE, RTM_F_CLONED; RTA_TABLE, RTA_DST, [RTA_SRC], RTA_OIF,
+/// RTA_PREFSRC (unless the query fixed the source), [RTA_GATEWAY] and
+/// RTA_CACHEINFO, in that order.
+// LINUX-GAP: RTA_UID (the requester's uid) is not reported; the netlink
+// request path does not carry the sender's credentials here.
+fn build_cloned_route(route: &ClonedRoute, seq: u32, pid: u32) -> Vec<u8> {
+    const RTA_CACHEINFO: u16 = 12;
+    const RTM_F_CLONED: u32 = 0x200;
+    let mut body = Vec::new();
+    body.push(AF_INET);
+    body.push(32); // rtm_dst_len
+    body.push(if route.src.is_some() { 32 } else { 0 }); // rtm_src_len
+    body.push(0); // rtm_tos
+    body.push(route.table);
+    body.push(0); // rtm_protocol RTPROT_UNSPEC
+    body.push(0); // rtm_scope RT_SCOPE_UNIVERSE
+    body.push(route.rtn_type);
+    body.extend_from_slice(&RTM_F_CLONED.to_ne_bytes());
+    push_rtattr(&mut body, RTA_TABLE, &u32::from(route.table).to_ne_bytes());
+    push_rtattr(&mut body, RTA_DST, &route.dst);
+    if let Some(src) = route.src {
+        push_rtattr(&mut body, RTA_SRC, &src);
+    }
+    push_rtattr(&mut body, RTA_OIF, &route.oif.to_ne_bytes());
+    if route.src.is_none() {
+        push_rtattr(&mut body, RTA_PREFSRC, &route.prefsrc);
+    }
+    if let Some(gateway) = route.gateway {
+        push_rtattr(&mut body, RTA_GATEWAY, &gateway);
+    }
+    // `rtnl_put_cacheinfo`: struct rta_cacheinfo, nothing expiring.
+    push_rtattr(&mut body, RTA_CACHEINFO, &[0u8; 32]);
+    frame_message(RTM_NEWROUTE, 0, seq, pid, &body)
 }
 
 /// `rtnl_valid_getlink_req` (net/core/rtnetlink.c).
@@ -1503,7 +1659,7 @@ fn apply_qdisc_mutation(
     }
     let handle = u32::from_ne_bytes(request[24..28].try_into().map_err(|_| EINVAL)?);
     let parent = u32::from_ne_bytes(request[28..32].try_into().map_err(|_| EINVAL)?);
-    let iface_name = iface_name_for_index(ifindex as u32).ok_or(ENODEV)?;
+    let iface_name = iface_name_for_index_in(authority.net_ns_id, ifindex as u32).ok_or(ENODEV)?;
     let admin = authority.for_iface(&iface_name)?;
     let target = admin.iface_name();
     let kind = find_attr(request, 20, TCA_KIND).map(|raw| raw.strip_suffix(&[0]).unwrap_or(raw));
@@ -1598,7 +1754,12 @@ fn apply_qdisc_mutation(
 }
 
 pub fn iface_name_for_index(ifindex: u32) -> Option<alloc::string::String> {
-    enumerate()
+    iface_name_for_index_in(0, ifindex)
+}
+
+/// The device of `net_ns_id` with `ifindex` (`__dev_get_by_index(net, ...)`).
+pub fn iface_name_for_index_in(net_ns_id: u64, ifindex: u32) -> Option<alloc::string::String> {
+    enumerate_in(net_ns_id)
         .0
         .into_iter()
         .find(|iface| iface.ifindex == ifindex)
@@ -1607,7 +1768,12 @@ pub fn iface_name_for_index(ifindex: u32) -> Option<alloc::string::String> {
 
 /// Resolve a name to the same ifindex exposed by RTM_GETLINK.
 pub fn ifindex_for_name(name: &str) -> Option<u32> {
-    enumerate()
+    ifindex_for_name_in(0, name)
+}
+
+/// The ifindex of `net_ns_id`'s device `name` (`__dev_get_by_name(net, ...)`).
+pub fn ifindex_for_name_in(net_ns_id: u64, name: &str) -> Option<u32> {
+    enumerate_in(net_ns_id)
         .0
         .into_iter()
         .find(|iface| iface.name == name)
@@ -1650,6 +1816,88 @@ fn validate_new_flags(exists: bool, flags: u16) -> Result<(), i32> {
     } else {
         Err(ENOENT)
     }
+}
+
+/// `do_setlink` on a namespace's own `lo`, in Linux's order: IFLA_ADDRESS
+/// first (a loopback device has no `ndo_set_mac_address`, so
+/// `dev_set_mac_address` is -EOPNOTSUPP), then IFLA_MTU (`dev_validate_mtu`:
+/// `gen_lo_setup` sets no min/max MTU, so only a negative one is -EINVAL),
+/// then the IFF_UP flag (`dev_change_flags`).
+fn change_own_loopback_link(request: &[u8], net_ns_id: u64) -> Result<(), i32> {
+    let flags = u32::from_ne_bytes(request[24..28].try_into().map_err(|_| EINVAL)?);
+    let change = u32::from_ne_bytes(request[28..32].try_into().map_err(|_| EINVAL)?);
+    if let Some(mac) = find_attr(request, 16, IFLA_ADDRESS) {
+        return Err(if mac.len() != 6 { EINVAL } else { EOPNOTSUPP });
+    }
+    if let Some(mtu) = find_attr(request, 16, IFLA_MTU) {
+        let mtu = u32::from_ne_bytes(mtu.try_into().map_err(|_| EINVAL)?);
+        if mtu > i32::MAX as u32 {
+            return Err(EINVAL);
+        }
+        crate::iface::change_namespace_loopback(net_ns_id, crate::iface::LoopbackChange::Mtu(mtu))
+            .ok_or(ENODEV)?;
+    }
+    if change & IFF_UP != 0 {
+        let up = crate::iface::LoopbackChange::Link(flags & IFF_UP != 0);
+        crate::iface::change_namespace_loopback(net_ns_id, up).ok_or(ENODEV)?;
+    }
+    Ok(())
+}
+
+/// `inet6_rtm_newaddr` / `inet6_rtm_deladdr` on a namespace's own `lo`.
+/// While it is up it holds `::1/128` (`addrconf_notify` → `init_loopback`)
+/// besides any address configured on it. An error carries its
+/// extended-ACK text.
+fn change_own_loopback_ipv6(
+    msg_type: u16,
+    flags: u16,
+    net_ns_id: u64,
+    addr: [u8; 16],
+    prefix_len: u8,
+) -> Result<(), (i32, Option<&'static str>)> {
+    let up = crate::iface::namespace_loopback(net_ns_id).is_some_and(|lo| lo.up);
+    let builtin = builtin_loopback_ipv6();
+    let mut configured: Vec<([u8; 16], u8)> = crate::ipv6::addrs::list_iface_in(net_ns_id, "lo")
+        .iter()
+        .map(|existing| (existing.addr, existing.prefix_len))
+        .collect();
+    if up {
+        configured.push((builtin.addr, builtin.prefix_len));
+    }
+    if msg_type == RTM_NEWADDR {
+        // `ipv6_get_ifaddr` matches the address alone.
+        if configured.iter().any(|(existing, _)| *existing == addr) {
+            return validate_new_addr_flags(true, flags)
+                .map_err(|errno| (errno, Some("ipv6: address already assigned")));
+        }
+        if prefix_len > 128 {
+            return Err((EINVAL, Some("ipv6: Invalid prefix length")));
+        }
+        crate::ipv6::addrs::add_in(
+            net_ns_id,
+            crate::ipv6::addrs::Ipv6IfAddr {
+                iface: alloc::string::String::from("lo"),
+                addr,
+                prefix_len,
+                state: crate::ipv6::addrs::AddrState::Preferred,
+                scope: crate::ipv6::addrs::scope_of(&addr),
+                preferred_deadline_ns: u64::MAX,
+                valid_deadline_ns: u64::MAX,
+                temporary: false,
+            },
+        );
+        return Ok(());
+    }
+    // `inet6_addr_del` matches prefix length and address. The built-in
+    // `::1` belongs to the device's up state and is not deleted here.
+    if !crate::ipv6::addrs::list_iface_in(net_ns_id, "lo")
+        .iter()
+        .any(|existing| existing.addr == addr && existing.prefix_len == prefix_len)
+    {
+        return Err((EADDRNOTAVAIL, Some("ipv6: address not found")));
+    }
+    crate::ipv6::addrs::remove_in(net_ns_id, "lo", &addr);
+    Ok(())
 }
 
 /// `inet_rtm_newaddr` (net/ipv4/devinet.c) and `inet6_rtm_newaddr`
@@ -1699,7 +1947,12 @@ fn validate_new_neigh_flags(exists: bool, flags: u16) -> Result<(), i32> {
 
 /// Resolve the device an `RTM_NEWLINK` / `RTM_SETLINK` names, with the
 /// errno ladder of `__rtnl_newlink` / `rtnl_setlink` (net/core/rtnetlink.c).
-fn resolve_link(request: &[u8], msg_type: u16, flags: u16) -> Result<alloc::string::String, i32> {
+fn resolve_link(
+    request: &[u8],
+    msg_type: u16,
+    flags: u16,
+    net_ns_id: u64,
+) -> Result<alloc::string::String, i32> {
     let ifindex = i32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
     let requested_name = find_attr(request, 16, IFLA_IFNAME)
         .and_then(|raw| core::str::from_utf8(raw.strip_suffix(&[0]).unwrap_or(raw)).ok());
@@ -1712,10 +1965,11 @@ fn resolve_link(request: &[u8], msg_type: u16, flags: u16) -> Result<alloc::stri
         return Err(EINVAL);
     }
     let found = if ifindex > 0 {
-        iface_name_for_index(ifindex as u32)
+        iface_name_for_index_in(net_ns_id, ifindex as u32)
     } else {
-        requested_name
-            .and_then(|name| ifindex_for_name(name).map(|_| alloc::string::String::from(name)))
+        requested_name.and_then(|name| {
+            ifindex_for_name_in(net_ns_id, name).map(|_| alloc::string::String::from(name))
+        })
     };
     match found {
         Some(name) => {
@@ -1755,6 +2009,23 @@ impl MutationAuthority<'_> {
         self.delegated.is_some() || self.net_admin
     }
 
+    /// `Some(namespace)` when `iface` is the sender's namespace's own `lo`
+    /// rather than the initial namespace's. Only CAP_NET_ADMIN over that
+    /// namespace changes it; no delegated interface handle names it.
+    fn own_loopback(&self, iface: &str) -> Result<Option<u64>, i32> {
+        if self.net_ns_id == 0
+            || iface != "lo"
+            || crate::iface::namespace_loopback(self.net_ns_id).is_none()
+        {
+            return Ok(None);
+        }
+        if self.net_admin {
+            Ok(Some(self.net_ns_id))
+        } else {
+            Err(EPERM)
+        }
+    }
+
     /// The handle that changes `iface`, or the errno refusing it.
     fn for_iface(&self, iface: &str) -> Result<crate::AdminHandle, i32> {
         if let Some(admin) = self.delegated {
@@ -1767,6 +2038,18 @@ impl MutationAuthority<'_> {
             // (`__dev_get_by_index(sock_net(skb->sk), ...)` -> -ENODEV).
             if iface != "lo" && crate::iface::lookup_in(self.net_ns_id, iface).is_none() {
                 return Err(ENODEV);
+            }
+            // The kernel handle for "lo" is the initial namespace's device. A
+            // namespace with its own `lo` must never reach it through the
+            // shared name; its address and link changes go through
+            // `own_loopback` instead.
+            // LINUX-GAP: routes, neighbours and qdiscs on a namespace's own
+            // `lo` are refused rather than kept in that namespace.
+            if iface == "lo"
+                && self.net_ns_id != 0
+                && crate::iface::namespace_loopback(self.net_ns_id).is_some()
+            {
+                return Err(EOPNOTSUPP);
             }
             return crate::stack::kernel_admin(iface).ok_or(ENODEV);
         }
@@ -1791,7 +2074,10 @@ fn apply_mutation(
             if request.len() < NLMSG_HDRLEN + 16 {
                 return Err(EINVAL);
             }
-            let iface_name = resolve_link(request, hdr.msg_type, hdr.flags)?;
+            let iface_name = resolve_link(request, hdr.msg_type, hdr.flags, authority.net_ns_id)?;
+            if let Some(net_ns_id) = authority.own_loopback(&iface_name)? {
+                return change_own_loopback_link(request, net_ns_id);
+            }
             let admin = authority.for_iface(&iface_name)?;
             let flags = u32::from_ne_bytes(request[24..28].try_into().map_err(|_| EINVAL)?);
             let change = u32::from_ne_bytes(request[28..32].try_into().map_err(|_| EINVAL)?);
@@ -1853,10 +2139,25 @@ fn apply_mutation(
                         return Ok(());
                     }
                     // `inet_rtm_to_ifa`.
-                    let Some(iface_name) = iface_name_for_index(ifindex) else {
+                    let Some(iface_name) = iface_name_for_index_in(authority.net_ns_id, ifindex)
+                    else {
                         *msg = Some("ipv4: Device not found");
                         return Err(ENODEV);
                     };
+                    if let Some(net_ns_id) = authority.own_loopback(&iface_name)? {
+                        let exists = crate::iface::namespace_loopback(net_ns_id)
+                            .is_some_and(|lo| lo.ipv4.contains(&(addr, prefix_len)));
+                        if let Err(errno) = validate_new_addr_flags(exists, hdr.flags) {
+                            *msg = Some("ipv4: Address already assigned");
+                            return Err(errno);
+                        }
+                        return crate::iface::change_namespace_loopback(
+                            net_ns_id,
+                            crate::iface::LoopbackChange::AddIpv4(addr, prefix_len),
+                        )
+                        .map(|_| ())
+                        .ok_or(ENODEV);
+                    }
                     let admin = authority.for_iface(&iface_name)?;
                     let exists = ipv4_addrs_of(admin.iface_name())
                         .iter()
@@ -1865,15 +2166,31 @@ fn apply_mutation(
                         *msg = Some("ipv4: Address already assigned");
                         return Err(errno);
                     }
-                    return admin.add_ipv4(addr, prefix_len).map_err(admin_errno);
+                    // `inet_rtm_to_ifa`: `ifa_flags` from the header, replaced
+                    // by the full 32-bit IFA_FLAGS attribute when present.
+                    let ifa_flags = find_attr(request, 8, IFA_FLAGS)
+                        .and_then(|v| <[u8; 4]>::try_from(v.get(..4)?).ok())
+                        .map_or(u32::from(request[NLMSG_HDRLEN + 2]), u32::from_ne_bytes);
+                    return admin
+                        .add_ipv4_flags(addr, prefix_len, ifa_flags)
+                        .map_err(admin_errno);
                 }
                 // `inet_rtm_deladdr`: find the device, then delete the first
                 // address every supplied selector matches.
-                let Some(iface_name) = iface_name_for_index(ifindex) else {
+                let Some(iface_name) = iface_name_for_index_in(authority.net_ns_id, ifindex) else {
                     *msg = Some("ipv4: Device not found");
                     return Err(ENODEV);
                 };
-                let admin = authority.for_iface(&iface_name)?;
+                let own_loopback = authority.own_loopback(&iface_name)?;
+                let admin = match own_loopback {
+                    Some(_) => None,
+                    None => Some(authority.for_iface(&iface_name)?),
+                };
+                let configured = match own_loopback {
+                    Some(net_ns_id) => crate::iface::namespace_loopback(net_ns_id)
+                        .map_or_else(Vec::new, |lo| lo.ipv4),
+                    None => ipv4_addrs_of(&iface_name),
+                };
                 let local = match local {
                     Some(raw) => {
                         Some(<[u8; 4]>::try_from(raw.get(..4).ok_or(EINVAL)?).map_err(|_| EINVAL)?)
@@ -1890,30 +2207,35 @@ fn apply_mutation(
                     let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
                     &raw[..end]
                 });
-                let victim =
-                    ipv4_addrs_of(admin.iface_name())
-                        .into_iter()
-                        .find(|(addr, prefix)| {
-                            local.is_none_or(|local| local == *addr)
-                                && label.is_none_or(|label| label == admin.iface_name().as_bytes())
-                                && address.is_none_or(|address| {
-                                    // `inet_ifa_match`: same subnet under the address's mask.
-                                    let mask = if *prefix == 0 {
-                                        0
-                                    } else {
-                                        u32::MAX << (32 - u32::from(*prefix))
-                                    };
-                                    prefix_len == *prefix
-                                        && (u32::from_be_bytes(address) ^ u32::from_be_bytes(*addr))
-                                            & mask
-                                            == 0
-                                })
-                        });
+                let victim = configured.into_iter().find(|(addr, prefix)| {
+                    local.is_none_or(|local| local == *addr)
+                        && label.is_none_or(|label| label == iface_name.as_bytes())
+                        && address.is_none_or(|address| {
+                            // `inet_ifa_match`: same subnet under the address's mask.
+                            let mask = if *prefix == 0 {
+                                0
+                            } else {
+                                u32::MAX << (32 - u32::from(*prefix))
+                            };
+                            prefix_len == *prefix
+                                && (u32::from_be_bytes(address) ^ u32::from_be_bytes(*addr)) & mask
+                                    == 0
+                        })
+                });
                 let Some((addr, prefix)) = victim else {
                     *msg = Some("ipv4: Address not found");
                     return Err(EADDRNOTAVAIL);
                 };
-                return admin.del_ipv4(addr, prefix).map_err(admin_errno);
+                return match (own_loopback, admin) {
+                    (Some(net_ns_id), _) => crate::iface::change_namespace_loopback(
+                        net_ns_id,
+                        crate::iface::LoopbackChange::DelIpv4(addr, prefix),
+                    )
+                    .map(|_| ())
+                    .ok_or(ENODEV),
+                    (None, Some(admin)) => admin.del_ipv4(addr, prefix).map_err(admin_errno),
+                    (None, None) => Err(ENODEV),
+                };
             }
             // IPv6 (`inet6_rtm_newaddr` / `inet6_rtm_deladdr`): `extract_addr`
             // prefers IFA_LOCAL; with neither attribute the request is a bare
@@ -1930,10 +2252,18 @@ fn apply_mutation(
                 *msg = Some("ipv6: Invalid prefix length");
                 return Err(EINVAL);
             }
-            let Some(iface_name) = iface_name_for_index(ifindex) else {
+            let Some(iface_name) = iface_name_for_index_in(authority.net_ns_id, ifindex) else {
                 *msg = Some("ipv6: Unable to find the interface");
                 return Err(ENODEV);
             };
+            if let Some(net_ns_id) = authority.own_loopback(&iface_name)? {
+                let result =
+                    change_own_loopback_ipv6(hdr.msg_type, hdr.flags, net_ns_id, addr, prefix_len);
+                return result.map_err(|(errno, text)| {
+                    *msg = text;
+                    errno
+                });
+            }
             let admin = authority.for_iface(&iface_name)?;
             let configured = |iface: &str| {
                 let mut addrs: Vec<([u8; 16], u8)> = crate::ipv6::addrs::list_iface(iface)
@@ -2006,7 +2336,7 @@ fn apply_mutation(
                 return Err(EINVAL);
             }
             let ifindex = u32::from_ne_bytes(oif.try_into().map_err(|_| EINVAL)?);
-            let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
+            let iface_name = iface_name_for_index_in(authority.net_ns_id, ifindex).ok_or(ENODEV)?;
             let admin = authority.for_iface(&iface_name)?;
             if family == AF_INET6 {
                 if table != crate::route::TABLE_MAIN {
@@ -2043,12 +2373,20 @@ fn apply_mutation(
                     Some(_) => return Err(EINVAL),
                     None => 0,
                 };
+                // `rtm_to_fib6_config`: an RTA_PREF other than low/high is
+                // medium.
+                let pref = match find_attr(request, 12, 20).and_then(|v| v.first().copied()) {
+                    Some(p @ (crate::ipv6::route::PREF_LOW | crate::ipv6::route::PREF_HIGH)) => p,
+                    _ => crate::ipv6::route::PREF_MEDIUM,
+                };
                 return admin
                     .add_ipv6_route(crate::AdminIpv6Route {
                         dst,
                         prefix_len,
                         gateway,
                         metric,
+                        protocol: request[NLMSG_HDRLEN + 5],
+                        pref,
                     })
                     .map_err(admin_errno);
             }
@@ -2142,7 +2480,7 @@ fn apply_mutation(
             }
             let family = request[NLMSG_HDRLEN];
             let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
-            let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
+            let iface_name = iface_name_for_index_in(authority.net_ns_id, ifindex).ok_or(ENODEV)?;
             let admin = authority.for_iface(&iface_name)?;
             let state = u16::from_ne_bytes(request[24..26].try_into().map_err(|_| EINVAL)?);
             let flags = request[26];
@@ -2157,9 +2495,8 @@ fn apply_mutation(
                 None => None,
             };
             let exists = match family {
-                AF_INET if dst.len() == 4 => crate::arp::snapshot()
-                    .iter()
-                    .any(|(iface, entry)| iface == admin.iface_name() && entry.ip == dst),
+                AF_INET if dst.len() == 4 => <[u8; 4]>::try_from(dst)
+                    .is_ok_and(|ip| crate::arp_cache::get_entry(admin.iface_name(), ip).is_some()),
                 AF_INET6 if dst.len() == 16 => {
                     crate::ipv6::ndp::neigh_list_in(admin.net_ns_id().map_err(admin_errno)?)
                         .iter()

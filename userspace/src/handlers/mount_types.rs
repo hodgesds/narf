@@ -17,7 +17,7 @@ pub(crate) fn register_mount_types() {
         narf_drivers_fs_iso9660::register_fstypes();
         narf_drivers_fs_udf::register_fstypes();
         narf_filesystem::register_fs_type(FileSystemType::new("overlay", build_overlay));
-        narf_filesystem::register_fs_type(FileSystemType::new("overlayfs", build_overlay));
+        narf_filesystem::register_fs_type(FileSystemType::new("overlayfs", build_overlay).alias());
         let mut fuse = FileSystemType::new("fuse", build_fuse);
         fuse.subtypes = true;
         narf_filesystem::register_fs_type(fuse);
@@ -186,7 +186,18 @@ fn build_fuse(r: &MountRequest<'_>) -> Result<Arc<dyn FsInstance>, FsError> {
             return Err(FsError::InvalidData);
         }
     };
-    let subtype = r.fs_type.strip_prefix("fuse.").unwrap_or("fuse");
+    // The superblock's subtype: the `fuse.<subtype>` type name, or a
+    // `subtype=` option on a plain `fuse` mount (`fuse_parse_param`).
+    let subtype = r
+        .fs_type
+        .strip_prefix("fuse.")
+        .or_else(|| {
+            r.options
+                .split(',')
+                .find_map(|kv| kv.trim().strip_prefix("subtype="))
+        })
+        .filter(|subtype| !subtype.is_empty())
+        .unwrap_or("fuse");
     let fs = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn));
     // FUSE_INIT is driven in the BACKGROUND, and the mount is published
     // without waiting for it — this is what Linux does.

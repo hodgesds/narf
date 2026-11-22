@@ -5043,7 +5043,11 @@ allow-list only for `GB_ADDR_CONFIG` (GC segment 0 + 0x13de, from the
 topology sample's `gb_addr_config`), with Linux's SE (< 4) / SH (< 2) /
 count (<= 128) checks and EFAULT for any other offset. `MAX_IBS` on an open
 of a card with a submitter reports `Submitter::max_ibs` for each IP type it
-runs (8 on Navi48, `MAX_JOB_IBS`) and 0 for the rest.
+runs (8 on Navi48, `MAX_JOB_IBS`; 16 on Navi22, `amdgpu_navi22_cs::ring_max_ibs`:
+`amdgpu_navi22_submit::MAX_IBS` for the kernel queues, `MEDIA_MAX_IBS` for
+VCN/JPEG) and 0 for the rest. A card backend must report at least two for a
+ring it runs: Mesa's RADV spends one IB of each submission on its preamble, and
+with a bound of one it never fits a command buffer and resubmits forever.
 `DEV_INFO.gpu_counter_freq` is `Snapshot::reference_clock_10khz` times
 ten (kHz), from `amdgpu_info::reference_clock_10khz(vbios, navi)`:
 smu_info v3/v4 `core_refclk_10khz` (byte 16), replaced on Navi and later by
@@ -11301,8 +11305,12 @@ hardware or releases its transfer buffer.
 The boot allowlist includes GFX DPM/prefetch, PPT/TDC, VR0HOT, firmware critical
 temperature, fan/thermal control, GFX spread spectrum, out-of-band monitoring
 and APCC DFLL when present in the board table. UCLK/FCLK/SOC/display/PCIe DPM,
-memory-voltage scaling, deep sleep, GFXOFF, BACO and hub/media gating remain
-disabled until their owners supply constraints. This does not install OS
+memory-voltage scaling, deep sleep, GFXOFF, BACO and hub gating remain
+disabled until their owners supply constraints. Multimedia DPM/power gating
+(MM_DPM_PG) is allowed when the board has it, as Linux's Navi22 `pg_flags`
+(`AMD_PG_SUPPORT_VCN`/`_JPEG`) make `sienna_cichlid_get_allowed_feature_mask`
+do; the VCN owner sends PowerUpVcn/PowerUpJpeg at start and PowerDownVcn at
+its idle gate. `amdgpu.rdna2_vcn_smu_pg=0` leaves it off. This does not install OS
 thermal interrupts or override board frequencies, voltages or fan curves.
 
 ### Shared discrete RDNA2 PSP ring, TMR and firmware upload
@@ -11553,6 +11561,36 @@ Unowned}`, recording `FaultInfo` (latest address/status, count) for
 stay masked until the IH owner calls `set_fault_interrupts(true)`;
 `Fault::from_iv(&ih::Iv)` adapts IVs from `ColdBoot::interrupts()` subscriptions
 to `ih::source::{VMC_FAULT, UTCL2_FAULT}`.
+`FaultStatus(status)` decodes `*VM_L2_PROTECTION_FAULT_STATUS` (MORE_FAULTS,
+WALKER_ERROR, PERMISSION_FAULTS, MAPPING_ERROR, CID, RW, VMID; the same
+fields on both hubs). `fault_client(hub, mmhub_version, cid, write)` names
+the client as Linux prints it: `gfxhub_client_ids[cid]` on GFXHUB, and on
+MMHUB `amdgpu_mmhub_client_name(cid, rw)` over the table
+`mmhub_v2_0_init_client_info` picks for the discovered MMHUB IP
+(`mmhub_client_ids_sienna_cichlid` for 2.1.0/2.1.1, `_beige_goby` for
+2.1.2); `None` is "unknown". `Gmc::mmhub_version()` reports that IP and
+`Gmc::status_line(hub, status) -> StatusLine` formats
+`status=… hub=GFX|MM client=NAME (CID) more=… walker=… permission=…
+mapping=… rw=… vmid=…`, which the fault service prints after each of the
+first 16 faults it logs. For each of those charged to a lent client VMID
+(`FaultOwner::Client`) it also prints `Gmc::client_fault_report(Fault) ->
+ClientFaultReport`, gathered under the same owner lock right after
+`handle_fault`: `amdgpu_vm::describe_fault(pasid, va) -> Option<FaultVa>`
+finds the card-registered address space holding the IV's PASID (spaces
+without a PASID match nothing) and reports, at the hole-stripped address,
+the covering mapping (VA, size, handle, offset, flags), whether its buffer
+is system memory, the root `root_pde` gives the VM flush and the table
+entries read root first down to the PTE (`FaultVa::translates`: all levels
+VALID); `ContextRegs { cntl, base, start, end }` are both hubs' context
+registers for the VMID, faulting hub first. `ClientFaultReport::cause()`
+names the first explanation in walk order — `NoSpace`, `Unmapped`,
+`NotTranslated`, `ContextDisabled`, `ContextRange`, `ContextElsewhere`
+(the hub's base is not the client's root: the flush did not land) or
+`HubWalk` (mapped, translated, and the context points at the root) — and
+the report prints three `amdgpu: navi22 GPU page fault` lines: `va=… pasid=…:
+mapped va=…+… handle=… offset=… flags=… system|vram root=… walk=…` (or
+`unmapped …`, or `no address space holds this PASID`), `vmid=… MM cntl=…
+base=… start=… end=…, GFX …`, and `cause: …`.
 `ColdBoot::memory()` exposes this owner after `FirmwareReady`/`Released`.
 
 ### Shared discrete RDNA2 SDMA0 execution proof
@@ -11841,9 +11879,46 @@ SDMA kernel-frame path (`submit_kernel`) call `tdr::job_emitted`, which wakes
 the parked task; it samples at once, then
 at the earliest pending job's timeout (`tdr::next_sample`), and with nothing
 pending (or only hangs already reported) arms no timer. Each sample reads
-`Progress { engine, emitted, signaled }` of GFX, KIQ, compute and SDMA0/1
-(`ColdBoot::queue_progress`: the queue's last sequence and its fence writeback
-after an HDP invalidate; an all-ones read-back is device loss). The sample
+`Progress { engine, media, emitted, signaled }` of GFX, KIQ, compute and SDMA
+(`media: None`) and of every client media ring (`media: Some(MediaRing)`,
+`Media::client_progress`: the VCN0 decode and encode rings and JPEG that
+passed their ring and IB tests; a client media job emitted by
+`Engine::submit_client` also calls `tdr::job_emitted`), each the ring's last
+sequence and its fence writeback after an HDP invalidate
+(`ColdBoot::queue_progress`; an all-ones read-back is device loss). Media
+rings are timed with Linux's `video_timeout` (also 2 s), one timer per ring
+although VCN0's rings share fence engine `Vcn0`. A media timeout is
+`amdgpu_job_timedout` on a VCN or JPEG ring, bare metal: it logs `ring
+<linux name> timeout, signaled seq=…, emitted seq=…` (`vcn_dec_0`,
+`vcn_enc_0.0`, `vcn_enc_0.1`, `jpeg_dec`) and the VCN register line (or JRBC
+pointers and JPEG power state) of `Media::report_client_timeout`, then takes
+`tdr::media_action`. With `amdgpu.gpu_recovery=0` nothing is reset: the job
+reports `-ETIME` once its fence lands and waits meanwhile, its context's next
+submission fails (`Jobs::time_out`, `drm_sched_suspend_timeout`). Otherwise a
+VCN ring resets its instance (VCN 3.0's `AMDGPU_RESET_TYPE_PER_QUEUE`,
+`amdgpu_vcn_ring_reset` → `amdgpu_vcn_reset_engine`,
+`amdgpu_navi22_platform::reset_media_engine` → `ColdBoot::reset_media` →
+`Engine::reset_instance`), holding the media owner so no job reaches the
+instance: `vcn_v3_0_reset` (`vcn_v3_0_stop`, PowerDownVcn while MM_DPM_PG runs,
+`vcn_v3_0_enable_clock_gating`, in DPG mode `vcn_v3_0_enable_static_power_gating`
+with every tile but UVDJ off, PowerUpVcn, the DPG or static start), the decode
+ring test, the DPG pause and both encode ring tests, then
+`amdgpu_fence_driver_force_completion` on each of the instance's rings: every
+outstanding client job (`idle::Cancelled`, recorded in the submitter by
+`amdgpu_navi22_cs::media_reset` before the fences are written) ends with
+`Canceled` (`-ECANCELED`), the timed-out job's included, and keeps that error
+after its forced fence retires its memory; their contexts' next submissions
+fail and no context is guilty. The rings stay offered to clients and the log
+reads `Starting <ring> ring reset` and `Ring <ring> reset succeeded`. A reset
+that fails (`Ring <ring> reset failed (…)`; the engine is left failed) or a
+JPEG timeout (NARF has no JPEG ring reset, which in Linux backs up and
+re-emits other contexts' work) takes Linux's `-ETIME` and
+`amdgpu_device_gpu_recover` branch exactly as a kernel-queue hang does: the
+job is guilty, every other job abandoned and `recover()` runs within the same
+`tdr::MAX_AUTOMATIC_RECOVERIES`; past that budget the job waits as with
+recovery disabled. The static start restores each encode ring's pointers to
+the ring's write pointer, as `vcn_v3_0_start` does, so a restart re-runs
+nothing. The sample
 reads no GC register, so like Linux's fence timeout it takes no GFXOFF
 reference and never wakes an idle GPU. The per-engine
 timer starts when unsignalled work is first seen and restarts on every fence
@@ -12043,15 +12118,26 @@ all-ones reads still fail rather than proving readiness.
 `unsafe start_jpeg()` honours CC_UVD_HARVESTING, powers UVDJ on and runs
 `jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
 create/destroy message pair and the encoder session initialize/close pair on
-every started ring and waits (1 s) for the fences; register waits are bounded
+every started ring and waits (1 s) for the fences. Each encoder IB names only
+its 13 package dwords (session info, task info, op), Linux's `ib->length_dw`
+after `amdgpu_vcn_enc_get_create_msg`/`_destroy_msg`: the firmware walks every
+dword the IB names as packages, and a zero-sized one past the op never
+returns (on the RX 6750 XT both encode rings stopped there, RPTR 0x40, and the
+VCPU no longer served decode). Register waits are bounded
 by 100 ms. As `amdgpu_ib_ring_tests`, each ring is tested on its own: a ring
 that fails is not ready (its `Proof::{dec_ib, enc_ib}` stays 0, so it takes no
 client job and is left out of idle accounting) while the rings that passed
 serve; the engine is Verified when any ring passed and `test_ib` returns the
 first failure. Device loss or revoked authority ends the tests. An IB-test fence timeout emits one bounded, capability-checked
-snapshot identifying the instance/ring, expected and observed fence, submitted
-and shadow write pointers, hardware read/write pointers, status, power and DPG
-state. The polling path does no logging. A timeout does not release the IB,
+snapshot (`Engine::ring_snapshot`) identifying the instance/ring, expected and
+observed fence, submitted and shadow write pointers, hardware read/write
+pointers, and `TIMEOUT_REGS`: Linux's VCN 3.0 dump list (`vcn_reg_list_3_0`:
+status, power and PGFSM state, the DPG LMA window and pause, CONTEXT_ID/2,
+GPCOM_VCPU_CMD/DATA0/DATA1, both encode rings' base, size and pointers), the
+decode RBC pointers, DPG scratch, master interrupt, VCPU control, soft reset
+and LMI state; then the fw_shared queue-mode dword and `rb` pointers and the
+five ring dwords at the hardware read pointer. The polling path does no
+logging. A timeout does not release the IB,
 session or fence storage: they share the instance's published reservation,
 which remains excluded from reuse even if the failed owner is dropped.
 `unsafe stop()` runs `vcn_v3_0_stop` (DPG or static) and
@@ -12090,8 +12176,9 @@ sampling.
 Recovery stops the worker before replacing the owner. Owned full shutdown
 uses `unsafe ColdBoot::stop_media().await`: callers block new publication,
 drain JPEG and retain all mappings/TMR; hardware stop precedes conditional
-SMU power-down. The existing media-gating opt-in still controls MM_DPM_PG;
-idle work does not enable that feature. Model coverage is not physical
+SMU power-down. MM_DPM_PG runs by default (Linux's Navi22 path;
+`amdgpu.rdna2_vcn_smu_pg=0` turns it off); idle work does not enable that
+feature itself. Model coverage is not physical
 power-transition acceptance.
 
 `amdgpu_video_caps_navi22::{codecs, caps}(kind, harvested)` return Linux's
@@ -12116,16 +12203,29 @@ validate_media, media_grant, MEDIA_MAX_IBS}` frame them as Linux's
 flushes, (decode/JPEG `insert_start`,) the MMHUB
 `gmc_v10_0_emit_flush_gpu_tlb` (invalidation semaphore acquire, PTB LO/HI,
 request/ACK, release), the ring's PTB-write wait and, when the grant remaps
-the PASID, the `IH_VMID_<vmid>_LUT_MM` write; then `insert_start`, the IBs under the VMID
-(`vcn_v2_0_dec/enc_ring_emit_ib`, `jpeg_v2_0_dec_ring_emit_ib`), the fence on
-the kernel ring's sequence and `insert_end`/`VCN_ENC_CMD_END`. MMHUB
+the PASID, the `IH_VMID_<vmid>_LUT_MM` write; then `insert_start`, the HDP flush
+(`amdgpu_device_flush_hdp` → `amdgpu_hdp_generic_flush` through the ring's
+`emit_wreg`: 0 to the remapped `HDP_MEM_FLUSH_CNTL` at byte 0x7f000), the
+IBs under the VMID (`vcn_v2_0_dec/enc_ring_emit_ib`,
+`jpeg_v2_0_dec_ring_emit_ib`), the HDP read-cache invalidate
+(`hdp_v5_0_invalidate_hdp`: 1 to `HDP_READ_CACHE_INVALIDATE` at
+`MediaFrame::hdp`, the HDP segment-0 base), the fence on the kernel ring's
+sequence and `insert_end`/`VCN_ENC_CMD_END`; JPEG reaches both HDP
+registers through `JRBC_DEC_EXTERNAL_REG_WRITE_ADDR`. These are in
+addition to the CPU HDP flush before the doorbell. An APU's frame (Raphael:
+`MediaFrame::hdp` is `None`, HDP 5.2.1 has no read cache) carries neither,
+as `amdgpu_device_{flush,invalidate}_hdp` return early on x86_64. MMHUB
 invalidation engines follow `amdgpu_gmc_allocate_vm_inv_eng` over ring order
 (dec 0, enc 1/4, JPEG 5 with VCN1 harvested, 8 otherwise). JPEG IBs run from
 a kernel copy (`JPEG_IB_SLOT`, 64 KiB per outstanding job) at VMID 0 with
 data at the client's VMID; the JPEG fence is `JPEG_FENCE` in the JPEG
 reservation. Two jobs outstanding per ring; frames are bounded to half the
 ring. Not emitted: the post-flush VM fence (Linux bookkeeping; the job's own
-fence stands in, as on the kernel queues).
+fence stands in, as on the kernel queues). A client media job that never
+completes times out after 2 s on its own ring (hang detection,
+`amdgpu_navi22_tdr`): a VCN timeout resets the VCN instance and its
+outstanding jobs end with `-ECANCELED`; a failed reset or a JPEG timeout
+recovers the GPU.
 
 `amdgpu_vcn_navi22_cs::{media_ring, ring_id, completed, rings, register,
 unregister, forget_owner, submit, dec_ib_messages, check_dec_msg,
@@ -12214,6 +12314,52 @@ last)`), whose PASID remap is honoured only together with a flush
 including SDMA2/3). `amdgpu_vm::VmState` tracks sixteen ring slots. Fences are read
 by `amdgpu_cp_navi22::FenceReader` (`ColdBoot::client_fence_reader`) without
 the owner. `unregister` runs at the start of recovery.
+
+Client page tables live in the card's VRAM, as `amdgpu_vm_pt_create` places
+them on a dGPU (`AMDGPU_GEM_DOMAIN_VRAM` unless `is_app_apu`); MMHUB cannot
+walk the system-RAM tables NARF used before (the RX 6750 XT's VCN faulted
+with the context pointing at a valid system-RAM root). Right after the client
+VRAM heap, `register` gives `amdgpu_vm::register_table_heap(card,
+TableHeap { pool, fb_base, fb_offset, hdp })` the same CPU-visible heap and
+`Gmc::hdp_flusher() -> HdpFlusher` (`amdgpu_vm::HdpFlush`: the remapped
+`HDP_MEM_FLUSH_CNTL` write and NBIO read-back under live PCI authority);
+`unregister` withdraws it (`unregister_table_heap`). Updates follow Linux's
+CPU update mode (`AMDGPU_VM_USE_CPU_FOR_GFX`: `amdgpu_vm_cpu_update`, then
+`amdgpu_vm_cpu_commit`'s `mb()` and HDP flush), which matches NARF's
+synchronous VA path; tables are CPU-visible VRAM as Linux requires for
+CPU-updated tables (`AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED`). Every table of
+a space on such a card is a 64-bit-stored VRAM page plus a system-RAM copy
+the CPU reads (`describe_va`, unmaps) and restores from; a new table is
+committed before its PDE is written, every map/unmap/relocation rewrite
+commits once. `root_pde()` — the base both hubs' ring flushes program — and
+every PDE are `amdgpu_gmc_vram_mc2pa(mc) | VALID` with no SYSTEM/SNOOPED bit
+(`amdgpu_gmc_get_pde_for_bo`, `gmc_v10_0_get_vm_pde`); PTEs of GTT pages
+keep SYSTEM/SNOOPED. `register_table_heap` brings every registered space of
+the card in line before the card takes jobs: system-RAM tables (mapped
+before the heap existed) move into VRAM bottom-up, VRAM tables lost to S3
+or a recovery are rewritten from the copy; either bumps the space's TLB
+sequence. While the heap is withdrawn a VRAM space takes no new tables
+(`Busy`). Navi48 (GC 12.0.x, `gmc_v12_0`) does the same through
+`amdgpu_navi48_boot::{publish_heap, withdraw_heap}`: its client heap and
+`amdgpu_gmc_navi48::Gmc::hdp_flusher()` become the card's table heap on
+first publication and on every republication after S3, and the suspend and
+recovery teardowns withdraw it. GFX12 VRAM directories are
+`vram_base_offset + mc - vram_start | VALID` (`gmc_v12_0_get_vm_pde`; GMC12
+never sets `translate_further`, so no BFS/TF bits) and never carry
+`AMDGPU_PDE_PTE_GFX12`, which marks only a leaf directory. Phoenix registers
+no table heap and keeps system-RAM tables with per-entry cache flushes
+(LINUX-GAP: Linux uses GTT tables only for `is_app_apu` parts; Phoenix's go
+to its carve-out VRAM).
+
+Job fences carry Linux's `dma_fence.timestamp`: the jobs tracker stamps
+every job the sample that completes it with `CLOCK_MONOTONIC` now (as
+`amdgpu_fence_process` signals with `dma_fence_signal_timestamp`), keeping
+the latest 256 (`SIGNAL_TIMES`); `Submitter::signal_time(ticket)` reports it
+and a job fence's `DrmFence::timestamp_ns` is that time, which
+`SYNC_IOC_FILE_INFO` returns for the signalled leaf. Every GFX EOP and
+SDMA/VCN/JPEG trap samples the rings (`amdgpu_navi22_cs::fence_interrupt`),
+so the stamp is the interrupt's time rather than a client's later query.
+Older jobs fall back to the time a sync_file first saw them signalled.
 
 The native submitter retains pending jobs and their context health. A TDR
 marks the oldest pending context on that ring guilty (`TimedOut`), with

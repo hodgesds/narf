@@ -152,7 +152,8 @@ impl ControlKind {
     /// them up there. The older headphone sense control stays on MIXER.
     pub const fn iface(self) -> u32 {
         match self {
-            ControlKind::HdmiJack => 1,
+            // SNDRV_CTL_ELEM_IFACE_CARD (Linux jack_detect_kctl).
+            ControlKind::HdmiJack => 0,
             ControlKind::Eld | ControlKind::ChannelMap => 3,
             _ => 2,
         }

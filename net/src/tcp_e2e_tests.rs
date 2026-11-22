@@ -890,9 +890,16 @@ fn tcp_e2e_defer_accept_waits_for_data() -> Result<(), &'static str> {
     reset();
     let listener = listen(SERVER_IP, SERVER_PORT, 16).map_err(|_| "listen failed")?;
     setsockopt_int(listener, TCP_DEFER_ACCEPT, 3).map_err(|_| "set defer accept failed")?;
-    let client =
-        connect_errno_with_options_in(0, SERVER_IP, SERVER_PORT, ConnectOptions { syn_retries: 2 })
-            .map_err(|_| "connect failed")?;
+    let client = connect_errno_with_options_in(
+        0,
+        SERVER_IP,
+        SERVER_PORT,
+        ConnectOptions {
+            syn_retries: 2,
+            ..Default::default()
+        },
+    )
+    .map_err(|_| "connect failed")?;
     if __with_tcb(client, |t| t.syn_retries) != Some(2) {
         return Err("TCP_SYNCNT was not installed before active open");
     }

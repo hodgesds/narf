@@ -84,6 +84,12 @@ impl<B: BlockDevice + 'static> FsInstance for FatMount<B> {
     fn always_read_only(&self) -> bool {
         self.0.always_read_only()
     }
+    fn fs_type(&self) -> &str {
+        self.0.fs_type()
+    }
+    fn statfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsStat> {
+        self.0.statfs()
+    }
 }
 
 /// FAT Version
@@ -147,10 +153,12 @@ fn fat_factory(dev: Arc<dyn narf_block::BlockDeviceSync>) -> Result<Arc<dyn FsIn
 /// permission model is the mount options plus the mounting task's uid, gid
 /// and umask, and the source+data constructor shape cannot see the latter.
 pub fn register_fstypes() {
-    narf_filesystem::register_block_fstype_ctx("fat", build_named);
+    // Linux registers `vfat` (and `msdos`); the other names are NARF
+    // aliases mount(2) accepts but /proc/filesystems does not list.
     narf_filesystem::register_block_fstype_ctx("vfat", build_named);
-    narf_filesystem::register_block_fstype_ctx("fat16", build_named);
-    narf_filesystem::register_block_fstype_ctx("fat32", build_named);
+    narf_filesystem::register_block_fstype_alias_ctx("fat", build_named);
+    narf_filesystem::register_block_fstype_alias_ctx("fat16", build_named);
+    narf_filesystem::register_block_fstype_alias_ctx("fat32", build_named);
 }
 
 fn build_named(

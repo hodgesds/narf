@@ -2448,6 +2448,467 @@ fn smoke_abi_fsx2_mount_setattr_oversize_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_setattr_oversize_neg);
 
+/// `mount_setattr(fd, "", AT_EMPTY_PATH | AT_RECURSIVE, attr)` changes the
+/// mount the fd names AND every mount below it: `mount_setattr_prepare` and
+/// `mount_setattr_commit` walk `for (m = mnt; m; m = next_mnt(m, mnt))`
+/// when AT_RECURSIVE is set, and only the named mount without it.
+///
+/// bubblewrap 0.13 makes a whole `--bind` tree nosuid exactly this way; the
+/// flag reached the top mount alone, so every submount of the sandbox root
+/// still honoured set-user-ID binaries.
+fn smoke_abi_fsx2_mount_setattr_recursive_reaches_submounts() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_PATH: u64 = 0o10000000;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        const AT_RECURSIVE: u64 = 0x8000;
+        const MOUNT_ATTR_NOSUID: u64 = 0x2;
+        const MOUNT_ATTR_NODEV: u64 = 0x4;
+        let nosuid = narf_filesystem::mnt_flags::NOSUID;
+        let nodev = narf_filesystem::mnt_flags::NODEV;
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        if mount_fstype(b"/abi-msa-rec\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-msa-rec/sub".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-msa-rec/sub\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-msa-rec/sub/deep".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-msa-rec/sub/deep\0", b"tmpfs\0") != Some(0)
+        {
+            return Err("the tmpfs tree under /abi-msa-rec was not mounted");
+        }
+        let setattr = |path: &core::ffi::CStr, flags: u64, set: u64| -> Option<i64> {
+            let fd = call_open(path.as_ptr() as u64, O_PATH).filter(|fd| *fd >= 0)? as u64;
+            let attr = [set, 0u64, 0, 0];
+            let r = call(
+                Syscall::MountSetattr.raw(),
+                SyscallArgs {
+                    arg0: fd,
+                    arg1: c"".as_ptr() as u64,
+                    arg2: AT_EMPTY_PATH | flags,
+                    arg3: attr.as_ptr() as u64,
+                    arg4: 32,
+                    arg5: 0,
+                },
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            r
+        };
+        let flags = |path: &str| crate::handlers::current_mount_flags_exact(path).unwrap_or(0);
+        if setattr(c"/abi-msa-rec", AT_RECURSIVE, MOUNT_ATTR_NOSUID) != Some(0) {
+            return Err("mount_setattr(AT_EMPTY_PATH|AT_RECURSIVE) failed");
+        }
+        for path in ["/abi-msa-rec", "/abi-msa-rec/sub", "/abi-msa-rec/sub/deep"] {
+            if flags(path) & nosuid == 0 {
+                return Err("AT_RECURSIVE did not make every mount of the tree nosuid");
+            }
+        }
+        // Without AT_RECURSIVE only the named mount changes.
+        if setattr(c"/abi-msa-rec/sub", 0, MOUNT_ATTR_NODEV) != Some(0) {
+            return Err("mount_setattr(AT_EMPTY_PATH) failed");
+        }
+        if flags("/abi-msa-rec/sub") & nodev == 0 {
+            return Err("mount_setattr did not make the named mount nodev");
+        }
+        if flags("/abi-msa-rec/sub/deep") & nodev != 0 || flags("/abi-msa-rec") & nodev != 0 {
+            return Err("mount_setattr without AT_RECURSIVE changed another mount");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mount-setattr-rec",
+    smoke_abi_fsx2_mount_setattr_recursive_reaches_submounts
+);
+
+// ── mount(MS_MOVE) carries the moved mount's subtree ──────────────────
+//
+// `do_move_mount` detaches the source mount together with every mount below
+// it and attaches the whole tree at the target (`attach_recursive_mnt`), on
+// top of whatever the target resolves to. systemd's PrivateDevices= relies
+// on it: the private /dev tmpfs gets its pts/shm/mqueue binds in a
+// temporary directory and is then MS_MOVEd into the service's root.
+
+fn smoke_abi_fsx2_ms_move_carries_submounts() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_MOVE: u64 = 0x2000;
+        const O_WRONLY: u64 = 0o1;
+        const O_CREAT: u64 = 0o100;
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-mvt-src".as_ptr() as u64, 0o755);
+        let _ = call_mkdir(c"/abi-mvt-dst".as_ptr() as u64, 0o755);
+        if mount_fstype(b"/abi-mvt-src\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-mvt-src/sub".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-mvt-src/sub\0", b"tmpfs\0") != Some(0)
+        {
+            return Err("the tmpfs tree under /abi-mvt-src was not mounted");
+        }
+        let marker = c"/abi-mvt-src/sub/marker";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, marker.as_ptr() as u64, O_WRONLY | O_CREAT, 0o644),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("could not create a file in the submount"),
+        }
+        let moved = call(
+            Syscall::Mount.raw(),
+            SyscallArgs {
+                arg0: c"/abi-mvt-src".as_ptr() as u64,
+                arg1: c"/abi-mvt-dst".as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_MOVE,
+                arg4: 0,
+                arg5: 0,
+            },
+        );
+        if moved != Some(0) {
+            return Err("mount(/abi-mvt-src, /abi-mvt-dst, MS_MOVE) failed");
+        }
+        let mut sb = [0u8; STAT_SIZE];
+        let stat = |path: &core::ffi::CStr, sb: &mut [u8; STAT_SIZE]| {
+            call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64)
+        };
+        if stat(c"/abi-mvt-dst/sub/marker", &mut sb) != Some(0) {
+            return Err("the moved mount's submount did not move with it");
+        }
+        if stat(c"/abi-mvt-src/sub", &mut sb) != Some(ENOENT) {
+            return Err("the submount stayed behind at the old path");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mount-move-tree",
+    smoke_abi_fsx2_ms_move_carries_submounts
+);
+
+// ── a new mount covers what was mounted below its mountpoint ──────────
+//
+// A path walk crosses into the topmost mount at every component
+// (`__lookup_mnt` / `follow_mount`), so a filesystem mounted on a directory
+// hides every mount made below that directory before it: those hang off the
+// covered mount, which the walk no longer enters. bubblewrap's `--dev /dev`
+// over `--ro-bind / /` is this shape: its fresh tmpfs on /newroot/dev covers
+// the bound copies of /dev/shm and /dev/pts, and it then creates its own
+// `shm` and `pts` in the tmpfs. Unmounting the cover reveals the tree again.
+
+fn smoke_abi_fsx2_new_mount_covers_earlier_submounts() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_WRONLY: u64 = 0o1;
+        const O_CREAT: u64 = 0o100;
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-cover".as_ptr() as u64, 0o755);
+        if mount_fstype(b"/abi-cover\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-cover/dev".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-cover/dev\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-cover/dev/shm".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-cover/dev/shm\0", b"tmpfs\0") != Some(0)
+        {
+            return Err("the tmpfs tree under /abi-cover/dev was not mounted");
+        }
+        let marker = c"/abi-cover/dev/shm/marker";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, marker.as_ptr() as u64, O_WRONLY | O_CREAT, 0o644),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("could not create a file in /abi-cover/dev/shm"),
+        }
+        // The cover: a fresh tmpfs on /abi-cover/dev.
+        if mount_fstype(b"/abi-cover/dev\0", b"tmpfs\0") != Some(0) {
+            return Err("mounting a tmpfs over /abi-cover/dev failed");
+        }
+        let mut sb = [0u8; STAT_SIZE];
+        let stat = |path: &core::ffi::CStr, sb: &mut [u8; STAT_SIZE]| {
+            call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64)
+        };
+        if stat(c"/abi-cover/dev/shm", &mut sb) != Some(ENOENT) {
+            return Err("a mount made below the mountpoint earlier shows through the new mount");
+        }
+        if call_mkdir(c"/abi-cover/dev/shm".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir in the new mount found the covered mount (EEXIST)");
+        }
+        if stat(marker, &mut sb) != Some(ENOENT) {
+            return Err("the covered mount's files show through the new directory");
+        }
+        // A plain umount of the cover: its own `shm` is a directory, not a
+        // mount, so nothing pins it.
+        if call(
+            Syscall::Umount2.raw(),
+            a1(c"/abi-cover/dev".as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("umount2 of the covering tmpfs failed");
+        }
+        if stat(marker, &mut sb) != Some(0) {
+            return Err("unmounting the cover did not reveal the mounts below it");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mount-cover",
+    smoke_abi_fsx2_new_mount_covers_earlier_submounts
+);
+
+// ── umount2 of a covered mount's path ─────────────────────────────────
+//
+// `path_umount` resolves the target like any path, into the topmost mount
+// at each component, and `path_mounted` then requires the result to be the
+// root of the mount it reached. A mount covered by a later one over a
+// directory above it is not reachable that way: its path names whatever the
+// cover holds there — nothing (-ENOENT) or a plain directory (-EINVAL).
+
+fn smoke_abi_fsx2_umount2_of_a_covered_mount_misses_it() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-ucov".as_ptr() as u64, 0o755);
+        if mount_fstype(b"/abi-ucov\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-ucov/dev".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-ucov/dev\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-ucov/dev/shm".as_ptr() as u64, 0o755) != Some(0)
+            || mount_fstype(b"/abi-ucov/dev/shm\0", b"tmpfs\0") != Some(0)
+            || mount_fstype(b"/abi-ucov/dev\0", b"tmpfs\0") != Some(0)
+        {
+            return Err("the covered tree under /abi-ucov/dev was not mounted");
+        }
+        let umount =
+            |path: &core::ffi::CStr| call(Syscall::Umount2.raw(), a1(path.as_ptr() as u64, 0));
+        if umount(c"/abi-ucov/dev/shm") != Some(ENOENT) {
+            return Err("umount2 reached a covered mount through a path the cover lacks");
+        }
+        if call_mkdir(c"/abi-ucov/dev/shm".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of shm in the cover failed");
+        }
+        if umount(c"/abi-ucov/dev/shm") != Some(EINVAL) {
+            return Err("umount2 of the cover's own directory is not EINVAL");
+        }
+        // With the cover gone the old mount is reachable, and unmountable.
+        if umount(c"/abi-ucov/dev") != Some(0) || umount(c"/abi-ucov/dev/shm") != Some(0) {
+            return Err("the uncovered mount could not be unmounted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/umount-covered",
+    smoke_abi_fsx2_umount2_of_a_covered_mount_misses_it
+);
+
+// ── MS_MOVE into the moved mount's own subtree ────────────────────────
+//
+// `do_move_mount` walks up from the target's mount and refuses with -ELOOP
+// when it meets the mount being moved: a tree cannot be attached inside
+// itself, and that includes onto itself.
+
+fn smoke_abi_fsx2_ms_move_into_its_own_tree_is_eloop() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_MOVE: u64 = 0x2000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-mvl".as_ptr() as u64, 0o755);
+        if mount_fstype(b"/abi-mvl\0", b"tmpfs\0") != Some(0)
+            || call_mkdir(c"/abi-mvl/sub".as_ptr() as u64, 0o755) != Some(0)
+        {
+            return Err("the tmpfs at /abi-mvl was not mounted");
+        }
+        let mv = |target: &core::ffi::CStr| {
+            call(
+                Syscall::Mount.raw(),
+                a4(
+                    c"/abi-mvl".as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    0,
+                    MS_MOVE,
+                    0,
+                ),
+            )
+        };
+        if mv(c"/abi-mvl/sub") != Some(ELOOP) {
+            return Err("MS_MOVE into the moved mount's own tree is not ELOOP");
+        }
+        if mv(c"/abi-mvl") != Some(ELOOP) {
+            return Err("MS_MOVE of a mount onto itself is not ELOOP");
+        }
+        // The refused moves left the mount where it was.
+        let mut sb = [0u8; STAT_SIZE];
+        if call_stat(c"/abi-mvl/sub".as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("a refused MS_MOVE changed the mount table");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mount-move-loop",
+    smoke_abi_fsx2_ms_move_into_its_own_tree_is_eloop
+);
+
+// ── filesystem type names in the mount listings ───────────────────────
+//
+// `show_mountinfo` and `show_vfsmnt` print the superblock's type with
+// `show_type`: `sb->s_type->name`, followed by `.<subtype>` when the
+// superblock has one (FUSE: `fuse.portal`, `fuse.sshfs`). The type is the
+// registered filesystem type — `vfat`, `tmpfs`, `overlay` — never a label of
+// the instance. A bind mount is its source's superblock and prints its type.
+// `/proc/filesystems` lists each registered type once, under its Linux name.
+
+/// The type field (after `-`) of the `/proc/self/mountinfo` row whose mount
+/// point is `path`, and the third field of its `/proc/self/mounts` row.
+fn listed_fs_types(
+    path: &str,
+) -> Result<(alloc::string::String, alloc::string::String), &'static str> {
+    let info = read_mount_listing(c"/proc/self/mountinfo")?;
+    let mounts = read_mount_listing(c"/proc/self/mounts")?;
+    let from_info = info
+        .lines()
+        .rfind(|line| line.split(' ').nth(4) == Some(path))
+        .and_then(|line| line.split(" - ").nth(1))
+        .and_then(|tail| tail.split(' ').next())
+        .ok_or("the mount is not in /proc/self/mountinfo")?;
+    let from_mounts = mounts
+        .lines()
+        .rfind(|line| line.split(' ').nth(1) == Some(path))
+        .and_then(|line| line.split(' ').nth(2))
+        .ok_or("the mount is not in /proc/self/mounts")?;
+    Ok((from_info.into(), from_mounts.into()))
+}
+
+fn smoke_abi_fsx2_mount_listings_print_linux_fs_types() -> TestResult {
+    with_setup(|| {
+        use core::fmt::Write as _;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_BIND: u64 = 0x1000;
+        let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let auth = bootstrap_mount_authority();
+        let fuse = |subtype: &'static str| {
+            let conn = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseConnection::new());
+            alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn))
+                as alloc::sync::Arc<dyn narf_filesystem::FsInstance>
+        };
+        let upper = narf_filesystem::FsInstance::root(&MemFs::new("abi-fstn-upper"));
+        let lower = narf_filesystem::FsInstance::root(&MemFs::new("abi-fstn-lower"));
+        let overlay =
+            narf_filesystem::OverlayFs::new("abi-fstn-overlay", upper, alloc::vec![lower]);
+        let installed = alloc::sync::Arc::new(MemFs::new("btrfs"));
+        let root_overlay = narf_filesystem::root_mount::tmpfs_overlay_root(installed)
+            .map_err(|_| "could not build the root overlay")?;
+        let fixtures: [(
+            &str,
+            alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+            &str,
+        ); 6] = [
+            // An in-memory tree under a label is tmpfs to Linux.
+            (
+                "/abi-fstn-mem",
+                alloc::sync::Arc::new(MemFs::new("abi-fstn-label")),
+                "tmpfs",
+            ),
+            // One standing in for a Linux pseudo-filesystem keeps its type.
+            (
+                "/abi-fstn-sec",
+                alloc::sync::Arc::new(MemFs::new("securityfs")),
+                "securityfs",
+            ),
+            ("/abi-fstn-fuse", fuse("portal"), "fuse.portal"),
+            ("/abi-fstn-fuse-plain", fuse("fuse"), "fuse"),
+            ("/abi-fstn-ovl", alloc::sync::Arc::new(overlay), "overlay"),
+            // The session overlay over an installed root stands in for it.
+            ("/abi-fstn-rootov", root_overlay, "btrfs"),
+        ];
+        for (path, fs, want) in fixtures {
+            if crate::handlers::current_mount_arc(&auth, path, fs).is_err() {
+                return Err("could not mount a type-name fixture");
+            }
+            let (info, mounts) = listed_fs_types(path)?;
+            if info != want || mounts != want {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "{path}: {info} / {mounts}, want {want}"
+                );
+                return Err("a mount listing printed a type Linux does not have");
+            }
+        }
+        // A bind prints its source's type.
+        let _ = call_mkdir(c"/abi-fstn-bind".as_ptr() as u64, 0o755);
+        let bound = call(
+            Syscall::Mount.raw(),
+            a4(
+                c"/abi-fstn-mem".as_ptr() as u64,
+                c"/abi-fstn-bind".as_ptr() as u64,
+                0,
+                MS_BIND,
+                0,
+            ),
+        );
+        if bound != Some(0) {
+            return Err("mount(MS_BIND) of the labelled tree failed");
+        }
+        let (info, mounts) = listed_fs_types("/abi-fstn-bind")?;
+        if info != "tmpfs" || mounts != "tmpfs" {
+            return Err("a bind mount did not print its source's type");
+        }
+        // /proc/filesystems: Linux names only, NARF's aliases left out.
+        let filesystems = read_mount_listing(c"/proc/filesystems")?;
+        let listed = |ty: &str| {
+            filesystems
+                .lines()
+                .any(|line| line.split_whitespace().last() == Some(ty))
+        };
+        for alias in [
+            "shmfs",
+            "shm",
+            "procfs",
+            "devfs",
+            "bpffs",
+            "memfs",
+            "overlayfs",
+            "fat",
+            "fat16",
+            "fat32",
+        ] {
+            if listed(alias) {
+                let _ = writeln!(narf_console::Writer, "/proc/filesystems lists {alias}");
+                return Err("/proc/filesystems lists a type name Linux does not register");
+            }
+        }
+        for linux in ["tmpfs", "proc", "sysfs", "devtmpfs", "bpf"] {
+            if !listed(linux) {
+                return Err("/proc/filesystems lost a Linux type");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/fstype-names",
+    smoke_abi_fsx2_mount_listings_print_linux_fs_types
+);
+
 // ── mount: fstype breadth for systemd's early-boot pseudo-filesystems ──
 //
 // systemd mounts many pseudo-filesystems (proc, sysfs, tmpfs, securityfs,
@@ -3564,6 +4025,351 @@ fn smoke_abi_fsx2_listmount_flags_limits_and_cursor() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx2_listmount_flags_limits_and_cursor
+);
+
+/// Each mount is listed once after a `pivot_root` the caller steps back out
+/// of: a task pivots the initial mount namespace into a tmpfs and then resets
+/// its root to "/" (what `smoke_abi_fsx_pivot_root_pos` left behind before it
+/// moved into a mount namespace of its own).
+///
+/// `pivot_root` moves the old root's mounts to put_old (`attach_mnt`); NARF's
+/// path-keyed table holds them twice, as the copies at put_old and the
+/// entries they were made from. A reader rooted at "/" is where Linux's
+/// `chroot_fs_refs` would never have left it: still in the old root, which
+/// reaches neither the new root mount above it nor a second copy of its own
+/// tree. `show_mountinfo` (`seq_path_root`) and `do_listmount`
+/// (`is_path_reachable`) list the tree its root reaches, so the listings
+/// must be what they were plus the mount made since, with unique ids and a
+/// cursor that pages them to the end.
+///
+/// The copies were listed too, doubling the global table: every later case
+/// that reads /proc/mounts or mountinfo in one 4 KiB read, or lists 64 ids,
+/// stopped finding the mount it had just made.
+fn smoke_abi_fsx2_mount_listings_after_a_global_pivot_root() -> TestResult {
+    const LSMT_ROOT: u64 = u64::MAX;
+    const MNT_DETACH: u64 = 2;
+    with_setup(|| {
+        let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        crate::handlers::__test_root_dir_reset();
+        let read_all = |path: &core::ffi::CStr| -> Result<alloc::string::String, &'static str> {
+            let fd = match call_open(path.as_ptr() as u64, 0) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open of a mount listing failed"),
+            };
+            let mut text = alloc::vec::Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                match call(
+                    Syscall::Read.raw(),
+                    a2(fd, chunk.as_mut_ptr() as u64, chunk.len() as u64),
+                ) {
+                    Some(0) => break,
+                    Some(n) if n > 0 => text.extend_from_slice(&chunk[..n as usize]),
+                    _ => {
+                        let _ = call(Syscall::Close.raw(), a0(fd));
+                        return Err("read of a mount listing failed");
+                    }
+                }
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            alloc::string::String::from_utf8(text).map_err(|_| "a mount listing is not UTF-8")
+        };
+        // Every id listmount(LSMT_ROOT) pages out one at a time.
+        let list_paged = || -> Result<alloc::vec::Vec<u64>, &'static str> {
+            let mut ids = alloc::vec::Vec::new();
+            let mut cursor = 0u64;
+            loop {
+                let req = mnt_id_req(32, LSMT_ROOT, cursor);
+                let mut one = [0u64; 1];
+                match call(
+                    Syscall::Listmount.raw(),
+                    a3(req.as_ptr() as u64, one.as_mut_ptr() as u64, 1, 0),
+                ) {
+                    Some(1) if one[0] > cursor => {
+                        ids.push(one[0]);
+                        cursor = one[0];
+                    }
+                    Some(0) => return Ok(ids),
+                    _ => return Err("listmount paging returned an id that did not advance"),
+                }
+                if ids.len() > 100_000 {
+                    return Err("listmount paging did not terminate");
+                }
+            }
+        };
+        let mount_points = |info: &str| -> alloc::vec::Vec<alloc::string::String> {
+            info.lines()
+                .filter_map(|line| line.split(' ').nth(4).map(alloc::string::String::from))
+                .collect()
+        };
+        let mount_tmpfs = |target: &core::ffi::CStr| {
+            call(
+                Syscall::Mount.raw(),
+                a4(
+                    c"none".as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    c"tmpfs".as_ptr() as u64,
+                    0,
+                    0,
+                ),
+            ) == Some(0)
+        };
+        let umount = |target: &core::ffi::CStr| {
+            let _ = call(
+                Syscall::Umount2.raw(),
+                a1(target.as_ptr() as u64, MNT_DETACH),
+            );
+        };
+
+        let before = mount_points(&read_all(c"/proc/self/mountinfo")?);
+        let before_ids = list_paged()?;
+        // The pivot, as smoke_abi_fsx_pivot_root_pos makes it.
+        if !mount_tmpfs(c"/abi-pvl-new")
+            || call(
+                Syscall::Mkdirat.raw(),
+                a3(AT_FDCWD, c"/abi-pvl-new/old".as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+        {
+            return Err("the new root tmpfs and its put_old were not set up");
+        }
+        let pivoted = call(
+            Syscall::PivotRoot.raw(),
+            a2(
+                c"/abi-pvl-new".as_ptr() as u64,
+                c"/abi-pvl-new/old".as_ptr() as u64,
+                0,
+            ),
+        );
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        let result = (|| {
+            if pivoted != Some(0) {
+                return Err("pivot_root into the tmpfs failed");
+            }
+            if !mount_tmpfs(c"/abi-pvl-after") {
+                return Err("the mount after the pivot failed");
+            }
+            let after = mount_points(&read_all(c"/proc/self/mountinfo")?);
+            if after.iter().any(|path| path.starts_with("/abi-pvl-new")) {
+                return Err("mountinfo lists the new root or the copy of the old root at put_old");
+            }
+            if after
+                .iter()
+                .filter(|path| *path == "/abi-pvl-after")
+                .count()
+                != 1
+            {
+                return Err("mountinfo does not list the mount made after the pivot exactly once");
+            }
+            if after.len() != before.len() + 1 {
+                return Err("mountinfo gained more than the one mount made after the pivot");
+            }
+            let mounts = read_all(c"/proc/mounts")?;
+            let mounts: alloc::vec::Vec<&str> = mounts
+                .lines()
+                .filter_map(|line| line.split(' ').nth(1))
+                .collect();
+            if mounts.iter().any(|path| path.starts_with("/abi-pvl-new"))
+                || mounts
+                    .iter()
+                    .filter(|path| **path == "/abi-pvl-after")
+                    .count()
+                    != 1
+            {
+                return Err("/proc/mounts does not list each mount once from the caller's root");
+            }
+            let ids = list_paged()?;
+            if ids.len() != before_ids.len() + 1 {
+                return Err("listmount gained more than the one mount made after the pivot");
+            }
+            let mut all = alloc::vec![0u64; ids.len() + 8];
+            let req = mnt_id_req(32, LSMT_ROOT, 0);
+            let n = call(
+                Syscall::Listmount.raw(),
+                a3(
+                    req.as_ptr() as u64,
+                    all.as_mut_ptr() as u64,
+                    all.len() as u64,
+                    0,
+                ),
+            );
+            if n != Some(ids.len() as i64) || all[..ids.len()] != ids[..] {
+                return Err(
+                    "paging listmount with its cursor reached a different set than one call",
+                );
+            }
+            Ok(())
+        })();
+        // Undo the case: the later mount, the old root's attachment at put_old,
+        // and the new root tmpfs.
+        umount(c"/abi-pvl-after");
+        umount(c"/abi-pvl-new/old");
+        umount(c"/abi-pvl-new");
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/pivot-listing",
+    smoke_abi_fsx2_mount_listings_after_a_global_pivot_root
+);
+
+/// The whole of a procfs mount listing, read until EOF.
+fn read_mount_listing(path: &core::ffi::CStr) -> Result<alloc::string::String, &'static str> {
+    let fd = match call_open(path.as_ptr() as u64, 0) {
+        Some(fd) if fd >= 0 => fd as u64,
+        _ => return Err("open of a mount listing failed"),
+    };
+    let mut text = alloc::vec::Vec::new();
+    loop {
+        let mut chunk = [0u8; 1024];
+        match call(
+            Syscall::Read.raw(),
+            a2(fd, chunk.as_mut_ptr() as u64, chunk.len() as u64),
+        ) {
+            Some(0) => break,
+            Some(n) if n > 0 => text.extend_from_slice(&chunk[..n as usize]),
+            _ => {
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                return Err("read of a mount listing failed");
+            }
+        }
+    }
+    let _ = call(Syscall::Close.raw(), a0(fd));
+    alloc::string::String::from_utf8(text).map_err(|_| "a mount listing is not UTF-8")
+}
+
+/// Every id `listmount(LSMT_ROOT)` pages out, one per call.
+fn listmount_paged_ids() -> Result<alloc::vec::Vec<u64>, &'static str> {
+    const LSMT_ROOT: u64 = u64::MAX;
+    let mut ids = alloc::vec::Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let req = mnt_id_req(32, LSMT_ROOT, cursor);
+        let mut one = [0u64; 1];
+        match call(
+            Syscall::Listmount.raw(),
+            a3(req.as_ptr() as u64, one.as_mut_ptr() as u64, 1, 0),
+        ) {
+            Some(1) if one[0] > cursor => {
+                ids.push(one[0]);
+                cursor = one[0];
+            }
+            Some(0) => return Ok(ids),
+            _ => return Err("listmount paging returned an id that did not advance"),
+        }
+        if ids.len() > 100_000 {
+            return Err("listmount paging did not terminate");
+        }
+    }
+}
+
+/// The same state after a raw registry pop of the topmost mount at put_old
+/// and of the new root — the kernel-internal `VfsRegistry::unmount`, which
+/// the `userspace/mount` pivot smokes cleaned up with before they used
+/// `umount2(MNT_DETACH)` — which takes the old root's attachment but not the
+/// mounts that were attached below it.
+///
+/// Linux cannot get there — `umount_tree` takes an attachment's children
+/// with it, and a plain umount of a mount with children is -EBUSY — so the
+/// children left behind belong to no tree any root reaches, and no listing
+/// shows them. They were listed, one copy of the whole global tree per such
+/// smoke (`/new_root/old/proc`, `/new_root2/...`), which is what kept
+/// `smoke_abi_fsx_noexec_nodev_are_enforced_and_reported`'s one 4 KiB read
+/// of /proc/mounts from reaching the mount it had made.
+fn smoke_abi_fsx2_mount_listings_drop_an_orphaned_old_root() -> TestResult {
+    with_setup(|| {
+        let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
+        crate::handlers::__test_root_dir_reset();
+        let mount_points = |info: &str| -> alloc::vec::Vec<alloc::string::String> {
+            info.lines()
+                .filter_map(|line| line.split(' ').nth(4).map(alloc::string::String::from))
+                .collect()
+        };
+        let pop = |path: &str| {
+            let handle = narf_capabilities::Cap::<
+                narf_filesystem::MountPoint,
+                narf_capabilities::Write,
+            >::bootstrap();
+            let _ = registry().unmount(&handle, path);
+        };
+        let before = mount_points(&read_mount_listing(c"/proc/self/mountinfo")?);
+        let before_ids = listmount_paged_ids()?;
+        let mounted = call(
+            Syscall::Mount.raw(),
+            a4(
+                c"none".as_ptr() as u64,
+                c"/abi-pvo-new".as_ptr() as u64,
+                c"tmpfs".as_ptr() as u64,
+                0,
+                0,
+            ),
+        ) == Some(0);
+        if !mounted
+            || call(
+                Syscall::Mkdirat.raw(),
+                a3(AT_FDCWD, c"/abi-pvo-new/old".as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+        {
+            return Err("the new root tmpfs and its put_old were not set up");
+        }
+        let pivoted = call(
+            Syscall::PivotRoot.raw(),
+            a2(
+                c"/abi-pvo-new".as_ptr() as u64,
+                c"/abi-pvo-new/old".as_ptr() as u64,
+                0,
+            ),
+        );
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        // The smokes' cleanup: the topmost mount at put_old, then the root.
+        pop("/abi-pvo-new/old");
+        pop("/abi-pvo-new");
+        let result = (|| {
+            if pivoted != Some(0) {
+                return Err("pivot_root into the tmpfs failed");
+            }
+            let after = mount_points(&read_mount_listing(c"/proc/self/mountinfo")?);
+            if after.iter().any(|path| path.starts_with("/abi-pvo-new")) {
+                return Err("mountinfo lists mounts left behind by a popped put_old attachment");
+            }
+            if after != before {
+                return Err("mountinfo changed across a pivot whose mounts are all gone");
+            }
+            let mounts = read_mount_listing(c"/proc/mounts")?;
+            if mounts
+                .lines()
+                .filter_map(|line| line.split(' ').nth(1))
+                .any(|path| path.starts_with("/abi-pvo-new"))
+            {
+                return Err("/proc/mounts lists mounts left behind by a popped put_old attachment");
+            }
+            if listmount_paged_ids()?.len() != before_ids.len() {
+                return Err("listmount lists mounts left behind by a popped put_old attachment");
+            }
+            Ok(())
+        })();
+        // Pop what the registry still holds below the old new root, deepest
+        // first.
+        let mut left: alloc::vec::Vec<alloc::string::String> = registry()
+            .list()
+            .into_iter()
+            .filter(|path| path.starts_with("/abi-pvo-new/"))
+            .collect();
+        left.sort_by_key(|path| core::cmp::Reverse(path.len()));
+        for path in &left {
+            pop(path);
+        }
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/pivot-listing",
+    smoke_abi_fsx2_mount_listings_drop_an_orphaned_old_root
 );
 
 /// `statmount`'s flag validation and the string-area sizing.

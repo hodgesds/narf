@@ -2839,6 +2839,299 @@ fn smoke_udp_first_datagram_flushes_after_arp_reply() -> TestResult {
 }
 kernel_test_in!("net/e2e", smoke_udp_first_datagram_flushes_after_arp_reply);
 
+// ── ARP replies leave the device the request arrived on ─────────────────────
+//
+// Two NICs on one subnet (the desktop's eth0 192.168.3.165/22 and wlan0
+// 192.168.1.211/22). Linux `arp_process` with the defaults arp_ignore=0 and
+// arp_filter=0 answers a request for ANY local address from the receiving
+// device, with that device's own MAC:
+//   arp_send_dst(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip, sha, dev->dev_addr, sha)
+// A DAD probe (sender 0.0.0.0, RFC 2131) for a local address is answered the
+// same way and teaches the cache nothing. NARF answered from the device that
+// owns the address — its MAC, transmitted on the other NIC — and cached the
+// probe's 0.0.0.0 sender.
+fn smoke_arp_reply_leaves_the_ingress_device() -> TestResult {
+    use crate::pkt::{write_arp, ArpPacket, ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP};
+    const A: &str = "e2e-arp-in-a";
+    const B: &str = "e2e-arp-in-b";
+    const A_IP: [u8; 4] = [10, 31, 3, 165];
+    const B_IP: [u8; 4] = [10, 31, 1, 211];
+    const GW: [u8; 4] = [10, 31, 1, 1];
+    const A_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x05];
+    const B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x31, 0x0b];
+    const ROUTER_MAC: [u8; 6] = [0x86, 0x43, 0x42, 0xa5, 0x25, 0x61];
+    const PROBER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x31, 0x99];
+    static B_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+    fn capture_b(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn arp_body(op: u16, sha: [u8; 6], spa: [u8; 4], tpa: [u8; 4]) -> [u8; 28] {
+        let mut body = [0u8; 28];
+        let _ = write_arp(
+            &mut body,
+            &ArpPacket {
+                op,
+                sha,
+                spa,
+                tha: [0; 6],
+                tpa,
+            },
+        );
+        body
+    }
+    fn arp_frames(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .filter(|f| f.len() >= ETH_HDR_LEN + 28 && f[12..14] == ETHERTYPE_ARP.to_be_bytes())
+            .cloned()
+            .collect()
+    }
+
+    full_reset(A, A_IP, GW);
+    iface::set_iface_ipv4_fields(A, A_IP, GW);
+    iface::register(B, B_MAC, capture_b);
+    iface::set_link_state(B, true);
+    iface::set_iface_ipv4_fields(B, B_IP, GW);
+    iface::add_addr(B, B_IP, 22);
+    drain_captured();
+    B_TX.lock().clear();
+
+    // The router asks for B's address; the broadcast reaches A first.
+    let request = arp_body(ARP_OP_REQUEST, ROUTER_MAC, GW, B_IP);
+    crate::tcp_stack::handle_arp_on_in(&request, 0, Some(A));
+    let on_a = arp_frames(&drain_captured());
+    let on_b = arp_frames(&::core::mem::take(&mut *B_TX.lock()));
+    if !on_b.is_empty() {
+        return TestResult::Fail("ARP request on A was answered on B");
+    }
+    let [reply] = on_a.as_slice() else {
+        return TestResult::Fail("ARP request on A for a local address got no single reply on A");
+    };
+    let arp = &reply[ETH_HDR_LEN..];
+    if reply[..6] != ROUTER_MAC
+        || reply[6..12] != A_MAC
+        || u16::from_be_bytes([arp[6], arp[7]]) != ARP_OP_REPLY
+        || arp[8..14] != A_MAC
+        || arp[14..18] != B_IP
+        || arp[18..24] != ROUTER_MAC
+        || arp[24..28] != GW
+    {
+        return TestResult::Fail("ARP reply on A is not from A's MAC for the requested address");
+    }
+
+    // A DAD probe for A's address arrives on B.
+    let probe = arp_body(ARP_OP_REQUEST, PROBER_MAC, [0; 4], A_IP);
+    crate::tcp_stack::handle_arp_on_in(&probe, 0, Some(B));
+    let on_a = arp_frames(&drain_captured());
+    let on_b = arp_frames(&::core::mem::take(&mut *B_TX.lock()));
+    if !on_a.is_empty() {
+        return TestResult::Fail("DAD probe on B was answered on A");
+    }
+    let [reply] = on_b.as_slice() else {
+        return TestResult::Fail("DAD probe for a local address got no single reply on B");
+    };
+    let arp = &reply[ETH_HDR_LEN..];
+    if reply[..6] != PROBER_MAC
+        || arp[8..14] != B_MAC
+        || arp[14..18] != A_IP
+        || arp[18..24] != PROBER_MAC
+        || arp[24..28] != [0; 4]
+    {
+        return TestResult::Fail("DAD probe reply is not from B's MAC to the prober");
+    }
+    if arp_cache::lookup(B, [0; 4]).is_some() {
+        return TestResult::Fail("a DAD probe taught the ARP cache a 0.0.0.0 neighbour");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/arp-ingress", smoke_arp_reply_leaves_the_ingress_device);
+
+// ── SO_BINDTODEVICE: route, source and neighbour on the bound device ────────
+//
+// Linux `udp_sendmsg` → `ip_route_output_flow` with `flowi4_oif =
+// sk->sk_bound_dev_if`. `fib_lookup` takes only a route through that device
+// (`fib_lookup_good_nhc`: `flp->flowi4_oif != nhc->nhc_oif` → skip), so a
+// datagram bound to the second NIC goes to THAT NIC's gateway even when the
+// first NIC's default route has the better metric, and the next hop is
+// resolved on the bound device (`ip_neigh_for_gw(rt, ...)` looks up the
+// neighbour on `rt->dst.dev`; `arp_solicit` sends the request from it). NARF
+// sent on the bound NIC but took the next hop from the unbound lookup and
+// resolved it on whichever NIC `for_dst` picked, so the queued frame waited
+// for a reply that could only arrive on the other NIC.
+fn smoke_udp_bound_device_routes_and_resolves_on_that_device() -> TestResult {
+    use crate::pkt::{write_arp, ArpPacket, ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP};
+    const A: &str = "e2e-bdev-a";
+    const B: &str = "e2e-bdev-b";
+    const A_IP: [u8; 4] = [10, 32, 3, 165];
+    const A_GW: [u8; 4] = [10, 32, 3, 1];
+    const B_IP: [u8; 4] = [10, 32, 1, 211];
+    const B_GW: [u8; 4] = [10, 32, 1, 254];
+    const B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x32, 0x0b];
+    const B_GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x32, 0xfe];
+    const DST: [u8; 4] = [9, 9, 9, 9];
+    static B_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+    fn capture_b(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn default_via(iface: &str, gateway: [u8; 4], metric: u32) {
+        route::route_add(route::Route {
+            net_ns_id: 0,
+            dst: route::Ipv4Net {
+                addr: Ipv4Addr([0; 4]),
+                prefix_len: 0,
+            },
+            gateway: Some(Ipv4Addr(gateway)),
+            iface: alloc::string::String::from(iface),
+            src_hint: None,
+            metric,
+            scope: route::Scope::Universe,
+            table: route::TABLE_MAIN,
+            protocol: route::RTPROT_KERNEL,
+        });
+    }
+    let is_arp =
+        |f: &Vec<u8>| f.len() >= ETH_HDR_LEN + 28 && f[12..14] == ETHERTYPE_ARP.to_be_bytes();
+    let is_udp = |f: &Vec<u8>| {
+        f.len() >= ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN
+            && f[12..14] == ETHERTYPE_IPV4.to_be_bytes()
+            && f[ETH_HDR_LEN + 9] == IP_PROTO_UDP
+    };
+
+    full_reset(A, A_IP, A_GW);
+    iface::register(B, B_MAC, capture_b);
+    iface::set_link_state(B, true);
+    iface::set_iface_ipv4_fields(B, B_IP, B_GW);
+    iface::add_addr(B, B_IP, 22);
+    default_via(A, A_GW, 100);
+    default_via(B, B_GW, 600);
+    let Some(b_index) = iface::ifindex_of(B) else {
+        return TestResult::Fail("second test device has no ifindex");
+    };
+    drain_captured();
+    B_TX.lock().clear();
+
+    let payload = b"bound-to-b";
+    let opts = UdpOptions {
+        bind_to_device: b_index,
+        ..UdpOptions::default()
+    };
+    let sent =
+        crate::udp_sock::udp_send_from(0, 49170, SocketAddrV4::new(DST, 53), payload, &opts, None);
+    if sent != Ok(payload.len()) {
+        return TestResult::Fail("bound UDP send to an unresolved next hop was not accepted");
+    }
+    let on_a = drain_captured();
+    let on_b = ::core::mem::take(&mut *B_TX.lock());
+    if on_a.iter().any(|f| is_arp(f) || is_udp(f)) {
+        return TestResult::Fail("a send bound to B put frames on A");
+    }
+    let Some(request) = on_b.iter().find(|&f| is_arp(f)) else {
+        return TestResult::Fail("the bound device's next hop was not resolved on that device");
+    };
+    let arp = &request[ETH_HDR_LEN..];
+    if u16::from_be_bytes([arp[6], arp[7]]) != ARP_OP_REQUEST
+        || arp[8..14] != B_MAC
+        || arp[14..18] != B_IP
+        || arp[24..28] != B_GW
+    {
+        return TestResult::Fail("ARP request is not for B's gateway from B's address");
+    }
+
+    // B's gateway answers on B: the queued datagram leaves B, to it.
+    let mut reply = [0u8; 28];
+    let _ = write_arp(
+        &mut reply,
+        &ArpPacket {
+            op: ARP_OP_REPLY,
+            sha: B_GW_MAC,
+            spa: B_GW,
+            tha: B_MAC,
+            tpa: B_IP,
+        },
+    );
+    crate::tcp_stack::handle_arp_on_in(&reply, 0, Some(B));
+    let on_b = ::core::mem::take(&mut *B_TX.lock());
+    let Some(frame) = on_b.iter().find(|&f| is_udp(f)) else {
+        return TestResult::Fail("ARP reply on B did not release the bound datagram");
+    };
+    let ip = &frame[ETH_HDR_LEN..];
+    if frame[..6] != B_GW_MAC
+        || frame[6..12] != B_MAC
+        || ip[12..16] != B_IP
+        || ip[16..20] != DST
+        || frame[ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN..] != *payload
+    {
+        return TestResult::Fail("bound datagram is not B's, to B's gateway");
+    }
+    if drain_captured().iter().any(is_udp) {
+        return TestResult::Fail("bound datagram also left A");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/udp-bound-dev",
+    smoke_udp_bound_device_routes_and_resolves_on_that_device
+);
+
+// ── IPv4 multicast goes to the group MAC, never through ARP ─────────────────
+//
+// Linux: a multicast destination's neighbour is NUD_NOARP with the address
+// `arp_mc_map` → `ip_eth_mc_map` derives (01:00:5e + the low 23 bits of the
+// group), so `ip_finish_output2` transmits at once and no ARP request is ever
+// sent for a group. NARF ARPed for 224.0.0.251 (the desktop's /proc/net/arp
+// shows it INCOMPLETE on eth0) and, with a default route, sent mDNS to the
+// gateway's unicast MAC.
+fn smoke_udp_multicast_uses_the_group_mac() -> TestResult {
+    const IFACE: &str = "e2e-mc-mac";
+    const LOCAL_IP: [u8; 4] = [10, 33, 0, 7];
+    const GATEWAY: [u8; 4] = [10, 33, 0, 1];
+    const GROUP: [u8; 4] = [224, 0, 0, 251];
+    full_reset(IFACE, LOCAL_IP, GATEWAY);
+    let Some(index) = iface::ifindex_of(IFACE) else {
+        return TestResult::Fail("test device has no ifindex");
+    };
+    drain_captured();
+    let payload = b"mdns-query";
+    // The socket layer hands a multicast send its egress device.
+    let opts = UdpOptions {
+        bind_to_device: index,
+        ip_ttl: 255,
+        ..UdpOptions::default()
+    };
+    let sent = crate::udp_sock::udp_send_from(
+        0,
+        5353,
+        SocketAddrV4::new(GROUP, 5353),
+        payload,
+        &opts,
+        None,
+    );
+    if sent != Ok(payload.len()) {
+        return TestResult::Fail("multicast UDP send failed");
+    }
+    let frames = drain_captured();
+    if frames
+        .iter()
+        .any(|f| f.len() >= 14 && f[12..14] == crate::pkt::ETHERTYPE_ARP.to_be_bytes())
+    {
+        return TestResult::Fail("a multicast send ARPed for its group");
+    }
+    let Some(frame) = frames.iter().find(|f| {
+        f.len() >= ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN && f[ETH_HDR_LEN + 9] == IP_PROTO_UDP
+    }) else {
+        return TestResult::Fail("multicast datagram was not transmitted at once");
+    };
+    if frame[..6] != [0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb]
+        || frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20] != GROUP
+    {
+        return TestResult::Fail("multicast datagram is not addressed to the group MAC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp-mcast-mac", smoke_udp_multicast_uses_the_group_mac);
+
 fn smoke_udp_pending_datagram_dropped_on_iface_namespace_move() -> TestResult {
     const IFACE: &str = "e2e-udp-netns-move";
     const LOCAL_IP: [u8; 4] = [10, 24, 0, 15];
@@ -2901,7 +3194,10 @@ fn syn_options_emitted(peer_port: u16) -> Option<crate::tcp::options::ParsedOpti
         0,
         TCPO_PEER,
         peer_port,
-        core::ConnectOptions { syn_retries: 1 },
+        core::ConnectOptions {
+            syn_retries: 1,
+            ..Default::default()
+        },
     );
     let frames = drain_captured();
     let off = ETH_HDR_LEN + IPV4_HDR_LEN;
@@ -3182,3 +3478,201 @@ fn smoke_somaxconn_clamps_listen_backlog() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/e2e", smoke_somaxconn_clamps_listen_backlog);
+
+/// Reverse-path filtering as `fib_validate_source` applies it: the device's
+/// mode is the larger of `conf.all.rp_filter` and its own; strict (1) drops
+/// a packet whose best route back to its source leaves through another
+/// device, loose (2) accepts it while any route back exists, 0 accepts.
+/// This host runs all=1 with every device at 2, which is loose.
+fn smoke_rp_filter_strict_and_loose_follow_linux() -> TestResult {
+    use narf_lib::sysctl::ipv4::{set_device_rp_filter, RP_FILTER_ALL};
+    const A: &str = "e2e-rpf-a";
+    const B: &str = "e2e-rpf-b";
+    const A_IP: [u8; 4] = [10, 34, 3, 165];
+    const A_GW: [u8; 4] = [10, 34, 3, 1];
+    const B_IP: [u8; 4] = [10, 34, 1, 211];
+    const B_GW: [u8; 4] = [10, 34, 1, 254];
+    const B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x34, 0x0b];
+    // Routed back through A's default route (metric 100).
+    const REMOTE: [u8; 4] = [1, 1, 1, 1];
+    // On B's connected /22.
+    const NEIGHBOUR: [u8; 4] = [10, 34, 1, 50];
+    fn sink(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    fn default_via(iface: &str, gateway: [u8; 4], metric: u32) {
+        route::route_add(route::Route {
+            net_ns_id: 0,
+            dst: route::Ipv4Net {
+                addr: Ipv4Addr([0; 4]),
+                prefix_len: 0,
+            },
+            gateway: Some(Ipv4Addr(gateway)),
+            iface: alloc::string::String::from(iface),
+            src_hint: None,
+            metric,
+            scope: route::Scope::Universe,
+            table: route::TABLE_MAIN,
+            protocol: route::RTPROT_KERNEL,
+        });
+    }
+    // One datagram from `src` to B's address, arriving on B.
+    fn delivered(src: [u8; 4], port: u16) -> bool {
+        let Ok(sock) = udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default())
+        else {
+            return false;
+        };
+        let mut frame = build_udp_frame(src, B_IP, 40000, port, b"rp-filter");
+        frame[..6].copy_from_slice(&B_MAC);
+        crate::tcp_stack::rx_handler(B, &mut frame);
+        let mut buf = [0u8; 64];
+        let got = udp_recv(&sock, &mut buf).is_ok();
+        udp_close(&sock);
+        got
+    }
+
+    full_reset(A, A_IP, A_GW);
+    iface::register(B, B_MAC, sink);
+    iface::set_link_state(B, true);
+    iface::set_iface_ipv4_fields(B, B_IP, B_GW);
+    iface::add_addr(B, B_IP, 22);
+    default_via(A, A_GW, 100);
+    default_via(B, B_GW, 600);
+    let mut port = 17801;
+    let mut case = |all: u32, dev: u32, src: [u8; 4]| {
+        RP_FILTER_ALL.store(all, Ordering::Relaxed);
+        set_device_rp_filter(B, dev);
+        port += 1;
+        delivered(src, port)
+    };
+    let off = case(0, 0, REMOTE);
+    let strict_all = case(1, 0, REMOTE);
+    let this_host = case(1, 2, REMOTE);
+    let strict_dev = case(0, 1, REMOTE);
+    let strict_on_link = case(1, 0, NEIGHBOUR);
+    RP_FILTER_ALL.store(0, Ordering::Relaxed);
+    set_device_rp_filter(B, 0);
+    if !off {
+        return TestResult::Fail("rp_filter=0 dropped a datagram");
+    }
+    if strict_all || strict_dev {
+        return TestResult::Fail("strict rp_filter accepted a source routed via another device");
+    }
+    if !this_host {
+        return TestResult::Fail("all=1 with the device at 2 did not filter loosely");
+    }
+    if !strict_on_link {
+        return TestResult::Fail("strict rp_filter dropped a source routed via the device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/rp-filter",
+    smoke_rp_filter_strict_and_loose_follow_linux
+);
+
+/// A TCP socket bound to a device (`SO_BINDTODEVICE`) matches only segments
+/// that arrive on that device: `__inet_lookup_established` and the
+/// listener lookup test `inet_sk_bound_dev_eq(net, sk_bound_dev_if, dif,
+/// sdif)`. On this host a connect from enp14s0's address bound to wlan0
+/// times out: the SYN leaves wlan0, the SYN-ACK to enp14s0's address comes
+/// back on enp14s0, finds no socket, and is answered with a RST.
+fn smoke_tcp_bound_device_matches_only_its_own_arrivals() -> TestResult {
+    const A: &str = "e2e-tbdev-a";
+    const B: &str = "e2e-tbdev-b";
+    const A_IP: [u8; 4] = [10, 35, 3, 165];
+    const A_GW: [u8; 4] = [10, 35, 3, 1];
+    const A_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x05];
+    const B_IP: [u8; 4] = [10, 35, 1, 211];
+    const B_GW: [u8; 4] = [10, 35, 1, 254];
+    const B_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x35, 0x0b];
+    const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x35, 0xfe];
+    const REMOTE: [u8; 4] = [1, 1, 1, 1];
+    static B_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+    fn capture_b(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    let tcp_flags = |f: &Vec<u8>| -> Option<(u16, u32, u8)> {
+        if f.len() < ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN
+            || f[12..14] != ETHERTYPE_IPV4.to_be_bytes()
+            || f[ETH_HDR_LEN + 9] != IP_PROTO_TCP
+        {
+            return None;
+        }
+        let tcp = &f[ETH_HDR_LEN + IPV4_HDR_LEN..];
+        let port = u16::from_be_bytes([tcp[0], tcp[1]]);
+        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+        Some((port, seq, tcp[13]))
+    };
+
+    full_reset(A, A_IP, A_GW);
+    iface::register(B, B_MAC, capture_b);
+    iface::set_link_state(B, true);
+    iface::set_iface_ipv4_fields(B, B_IP, B_GW);
+    iface::add_addr(B, B_IP, 22);
+    arp_cache::insert(B, B_GW, GW_MAC);
+    let Some(b_index) = iface::ifindex_of(B) else {
+        return TestResult::Fail("second test device has no ifindex");
+    };
+    drain_captured();
+    B_TX.lock().clear();
+
+    let opts = core::ConnectOptions {
+        oif: b_index,
+        local_addr: Some(A_IP),
+        ..core::ConnectOptions::default()
+    };
+    let Ok(id) = core::connect_start_in(0, REMOTE, 443, opts) else {
+        return TestResult::Fail("a connect bound to B with A's address was refused");
+    };
+    let on_b = ::core::mem::take(&mut *B_TX.lock());
+    let Some((port, iss, _)) = on_b
+        .iter()
+        .filter_map(tcp_flags)
+        .find(|&(_, _, flags)| flags & FLAG_SYN != 0)
+    else {
+        return TestResult::Fail("the bound connect's SYN did not leave B");
+    };
+    let syn_ack = |dst_mac: [u8; 6]| {
+        build_tcp_frame(TcpFrameSpec {
+            src_mac: GW_MAC,
+            dst_mac,
+            src_ip: REMOTE,
+            dst_ip: A_IP,
+            src_port: 443,
+            dst_port: port,
+            seq: 9000,
+            ack: iss.wrapping_add(1),
+            flags: FLAG_SYN | FLAG_ACK,
+            window: 65535,
+            payload: &[],
+        })
+    };
+    // The answer to A's address comes back on A.
+    crate::tcp_stack::rx_handler(A, &mut syn_ack(A_MAC));
+    let after_a = lookup_tcb(id).map(|t| t.lock().state);
+    let rst = drain_captured()
+        .iter()
+        .chain(B_TX.lock().iter())
+        .filter_map(tcp_flags)
+        .any(|(_, _, flags)| flags & 0x04 != 0);
+    // The same segment arriving on B completes it.
+    crate::tcp_stack::rx_handler(B, &mut syn_ack(B_MAC));
+    let after_b = lookup_tcb(id).map(|t| t.lock().state);
+    let _ = close(id);
+    if after_a != Some(TcpState::SynSent) {
+        return TestResult::Fail("a SYN-ACK arriving on A completed a connection bound to B");
+    }
+    if !rst {
+        return TestResult::Fail("the SYN-ACK that found no socket on A was not reset");
+    }
+    if after_b != Some(TcpState::Established) {
+        return TestResult::Fail("the SYN-ACK arriving on B did not complete the connection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp-bound-dev-rx",
+    smoke_tcp_bound_device_matches_only_its_own_arrivals
+);

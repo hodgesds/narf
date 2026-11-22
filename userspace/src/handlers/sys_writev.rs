@@ -17,7 +17,8 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EBADF));
         return;
     }
-    let iovecs = match import_rw_iovecs(args.arg1, args.arg2 as usize) {
+    // An i386 writev (146) carries `struct compat_iovec`s.
+    let iovecs = match import_rw_iovecs_abi(args.arg1, args.arg2 as usize, ctx.in_ia32_syscall()) {
         Ok(iovecs) => iovecs,
         Err(errno) => {
             ctx.set_return(errno_ret(errno as i64));

@@ -1471,6 +1471,84 @@ kernel_test_in!(
     smoke_abi_pathx_openat2_beneath_escape_is_exdev
 );
 
+/// `RESOLVE_IN_ROOT` treats the dirfd as the root of the walk: `path_init`
+/// with LOOKUP_IN_ROOT sets `nd->root` to the dirfd, and an absolute name
+/// jumps to that root, so `openat2(dfd, "/", RESOLVE_IN_ROOT)` is `dfd`'s
+/// own directory and `"/x"` is `dfd/x` — whatever the caller's own root is.
+///
+/// Under a chroot (or after pivot_root) the caller's root is a directory
+/// inside the mount table. The absolute name used to be resolved from that
+/// root and then joined under the dirfd, naming `<dirfd>/<caller's root>`:
+/// bubblewrap 0.13's `openat2(fd_of("/oldroot"), "/", RESOLVE_IN_ROOT)` for a
+/// `--dev-bind / /` source was ENOENT ("Can't open source /").
+fn smoke_abi_pathx_openat2_in_root_absolute_name_under_a_chroot() -> TestResult {
+    with_memfs("/p3jail", "p3jail", &[("top", b"t")], || {
+        const O_PATH: u64 = 0o10000000;
+        const O_DIRECTORY: u64 = 0o200000;
+        const RESOLVE_IN_ROOT: u64 = 0x10;
+        if call_mkdir(c"/p3jail/sub".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir /p3jail/sub failed");
+        }
+        if call_mkdir(c"/p3jail/sub/leaf".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir /p3jail/sub/leaf failed");
+        }
+        if call(Syscall::Chroot.raw(), a0(c"/p3jail".as_ptr() as u64)) != Some(0)
+            || call(Syscall::Chdir.raw(), a0(c"/".as_ptr() as u64)) != Some(0)
+        {
+            return Err("chroot into /p3jail failed");
+        }
+        // (st_dev, st_ino) of an fd, from struct stat's first two words.
+        let identity = |fd: u64| -> Option<[u8; 16]> {
+            let mut sb = [0u8; STAT_SIZE];
+            (call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64)) == Some(0))
+                .then(|| sb[..16].try_into().expect("16-byte prefix"))
+        };
+        let open_dir = |path: &core::ffi::CStr| -> Option<u64> {
+            call_open(path.as_ptr() as u64, O_PATH | O_DIRECTORY)
+                .filter(|fd| *fd >= 0)
+                .map(|fd| fd as u64)
+        };
+        let dfd = open_dir(c"/sub").ok_or("open(/sub, O_PATH) inside the chroot failed")?;
+        let leaf = open_dir(c"/sub/leaf").ok_or("open(/sub/leaf, O_PATH) failed")?;
+        let how = [O_PATH | O_DIRECTORY, 0u64, RESOLVE_IN_ROOT];
+        for (path, want, msg) in [
+            (
+                c"/",
+                dfd,
+                "openat2(dfd, \"/\", RESOLVE_IN_ROOT) is not dfd's own directory",
+            ),
+            (
+                c"/leaf",
+                leaf,
+                "openat2(dfd, \"/leaf\", RESOLVE_IN_ROOT) is not dfd/leaf",
+            ),
+            (
+                c"/../leaf",
+                leaf,
+                "openat2(dfd, \"/../leaf\", RESOLVE_IN_ROOT) did not clamp .. at dfd",
+            ),
+        ] {
+            let fd = match call(
+                Syscall::Openat2.raw(),
+                a3(dfd, path.as_ptr() as u64, how.as_ptr() as u64, 24),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err(msg),
+            };
+            let same = identity(fd).is_some() && identity(fd) == identity(want);
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            if !same {
+                return Err(msg);
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/openat2-in-root",
+    smoke_abi_pathx_openat2_in_root_absolute_name_under_a_chroot
+);
+
 // ── readlinkat (dirfd, NUL-term path, buf, buflen) → len / -1 ──────
 //
 // Resolves a symlink and copies its target into buf, returning the byte
@@ -2981,6 +3059,319 @@ fn smoke_abi_pathx_statfs_ftype() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_ftype);
 
+// ── statfs: f_type is the superblock's magic, f_flags the mount's ─────
+//
+// `statfs_by_dentry` hands the call to the superblock's `->statfs`, which
+// reports `sb->s_magic` as `f_type`: BTRFS_SUPER_MAGIC for btrfs,
+// MSDOS_SUPER_MAGIC for vfat and msdos, 0xEF53 for ext2/3/4,
+// DEVPTS_SUPER_MAGIC for devpts and so on (include/uapi/linux/magic.h).
+// `vfs_statfs` then sets `f_flags` from the mount (`calculate_f_flags`):
+// ST_VALID, the ST_* twin of each MNT_* restriction and atime mode, and
+// ST_RDONLY for a read-only superblock. A bind mount is the same superblock,
+// so statfs through it answers for the source filesystem.
+
+/// A filesystem that reports `name` as its type and fixed capacity numbers.
+struct StatfsNamedFs {
+    name: &'static str,
+    root: alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+}
+
+impl narf_filesystem::FsInstance for StatfsNamedFs {
+    fn root(&self) -> alloc::sync::Arc<dyn narf_filesystem::DirOps> {
+        self.root.clone()
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn statfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsStat> {
+        alloc::boxed::Box::pin(async {
+            Ok(narf_filesystem::FsStat {
+                blocks: 1000,
+                blocks_free: 600,
+                blocks_available: 500,
+                files: 64,
+                files_free: 32,
+                block_size: 4096,
+                name_len: 255,
+                fragment_size: 4096,
+            })
+        })
+    }
+}
+
+/// `struct statfs` as fifteen words: f_type, f_bsize, f_blocks, f_bfree,
+/// f_bavail, f_files, f_ffree, f_fsid, f_namelen, f_frsize, f_flags, spare.
+fn statfs_words(num: u32, arg: u64) -> Option<[u64; 15]> {
+    let mut words = [0u64; 15];
+    let got = call(num, a1(arg, words.as_mut_ptr() as u64));
+    (got == Some(0)).then_some(words)
+}
+
+fn smoke_abi_pathx_statfs_reports_the_superblock_magic() -> TestResult {
+    with_setup(|| {
+        use narf_filesystem::FsInstance as _;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const ST_VALID: u64 = 0x0020;
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let auth = bootstrap_mount_authority();
+        for (path, name, magic) in [
+            ("/abi-sfm-btrfs", "btrfs", 0x9123_683e_u64),
+            ("/abi-sfm-fat32", "fat32", 0x4d44),
+            ("/abi-sfm-fat16", "fat16", 0x4d44),
+            ("/abi-sfm-ext", "ext2", 0xef53),
+            ("/abi-sfm-exfat", "exfat", 0x2011_bab0),
+            ("/abi-sfm-iso", "iso9660", 0x9660),
+            ("/abi-sfm-udf", "udf", 0x1501_3346),
+            ("/abi-sfm-squashfs", "squashfs", 0x7371_7368),
+            ("/abi-sfm-9p", "9p", 0x0102_1997),
+            ("/abi-sfm-overlay", "overlay", 0x794c_7630),
+            ("/abi-sfm-fuse", "fuse", 0x6573_5546),
+            ("/abi-sfm-fusectl", "fusectl", 0x6573_5543),
+            ("/abi-sfm-devpts", "devpts", 0x1cd1),
+            ("/abi-sfm-cgroup2", "cgroup2", 0x6367_7270),
+            ("/abi-sfm-debugfs", "debugfs", 0x6462_6720),
+            ("/abi-sfm-tracefs", "tracefs", 0x7472_6163),
+            ("/abi-sfm-securityfs", "securityfs", 0x7363_6673),
+            ("/abi-sfm-pstore", "pstore", 0x6165_676c),
+            ("/abi-sfm-configfs", "configfs", 0x6265_6570),
+            ("/abi-sfm-efivarfs", "efivarfs", 0xde5e_81e4),
+            ("/abi-sfm-bpf", "bpf", 0xcafe_4a11),
+            ("/abi-sfm-binfmt", "binfmt_misc", 0x4249_4e4d),
+            ("/abi-sfm-hugetlbfs", "hugetlbfs", 0x9584_58f6),
+            ("/abi-sfm-autofs", "autofs", 0x0187),
+            ("/abi-sfm-ramfs", "ramfs", 0x8584_58f6),
+            ("/abi-sfm-devtmpfs", "devtmpfs", 0x0102_1994),
+            ("/abi-sfm-tmpfs", "tmpfs", 0x0102_1994),
+        ] {
+            let fs = alloc::sync::Arc::new(StatfsNamedFs {
+                name,
+                root: MemFs::new("abi-sfm").root(),
+            });
+            if crate::handlers::current_mount_arc(&auth, path, fs).is_err() {
+                return Err("could not mount a statfs fixture");
+            }
+            let cpath = alloc::format!("{path}\0");
+            let Some(st) = statfs_words(Syscall::Statfs.raw(), cpath.as_ptr() as u64) else {
+                return Err("statfs of a mounted fixture failed");
+            };
+            if st[0] != magic {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "statfs {name}: f_type {:#x}", st[0]);
+                return Err("statfs f_type is not the filesystem type's Linux magic");
+            }
+            if st[1] != 4096 || st[2] != 1000 || st[8] != 255 || st[9] != 4096 {
+                return Err("statfs did not report the filesystem's own capacity numbers");
+            }
+            if st[10] & ST_VALID == 0 {
+                return Err("statfs f_flags lacks ST_VALID");
+            }
+        }
+
+        // A bind of the btrfs mount, of a directory in it and of a file in
+        // it: the same superblock each time.
+        let fs_root = crate::handlers::current_fs_arc_at("/abi-sfm-btrfs")
+            .ok_or("the btrfs fixture is not mounted")?
+            .root();
+        let sub = crate::handlers::poll_blocking(fs_root.mkdir("sub"));
+        let file = crate::handlers::poll_blocking(fs_root.create("file"));
+        if !matches!(sub, Some(Ok(_))) || !matches!(file, Some(Ok(_))) {
+            return Err("could not populate the btrfs fixture");
+        }
+        const MS_BIND: u64 = 0x1000;
+        const O_WRONLY: u64 = 0o1;
+        const O_CREAT: u64 = 0o100;
+        let _ = call_mkdir(c"/abi-sfm-bind".as_ptr() as u64, 0o755);
+        let _ = call_mkdir(c"/abi-sfm-bind-sub".as_ptr() as u64, 0o755);
+        if let Some(fd) = call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                c"/abi-sfm-bind-file".as_ptr() as u64,
+                O_WRONLY | O_CREAT,
+                0o644,
+            ),
+        )
+        .filter(|fd| *fd >= 0)
+        {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        for (source, target) in [
+            (c"/abi-sfm-btrfs", c"/abi-sfm-bind"),
+            (c"/abi-sfm-btrfs/sub", c"/abi-sfm-bind-sub"),
+            (c"/abi-sfm-btrfs/file", c"/abi-sfm-bind-file"),
+        ] {
+            let bound = call(
+                Syscall::Mount.raw(),
+                a4(
+                    source.as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    0,
+                    MS_BIND,
+                    0,
+                ),
+            );
+            if bound != Some(0) {
+                return Err("mount(MS_BIND) of the btrfs fixture failed");
+            }
+            let Some(st) = statfs_words(Syscall::Statfs.raw(), target.as_ptr() as u64) else {
+                return Err("statfs of a bind mount failed");
+            };
+            if st[0] != 0x9123_683e || st[2] != 1000 {
+                return Err("statfs through a bind did not answer for the bound superblock");
+            }
+        }
+
+        // The session-writable overlay NARF puts over a read-only installed
+        // root stands in for that filesystem.
+        let lower = alloc::sync::Arc::new(StatfsNamedFs {
+            name: "btrfs",
+            root: MemFs::new("abi-sfm-lower").root(),
+        });
+        let overlay = narf_filesystem::root_mount::tmpfs_overlay_root(lower)
+            .map_err(|_| "could not build the root overlay")?;
+        if crate::handlers::current_mount_arc(&auth, "/abi-sfm-rootov", overlay).is_err() {
+            return Err("could not mount the root overlay");
+        }
+        match statfs_words(Syscall::Statfs.raw(), c"/abi-sfm-rootov".as_ptr() as u64) {
+            Some(st) if st[0] == 0x9123_683e => Ok(()),
+            _ => Err("the root overlay did not report its installed root's magic"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/statfs-magic",
+    smoke_abi_pathx_statfs_reports_the_superblock_magic
+);
+
+fn smoke_abi_pathx_statfs_flags_follow_the_mount() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_RDONLY: u64 = 0x1;
+        const MS_NOSUID: u64 = 0x2;
+        const MS_NODEV: u64 = 0x4;
+        const MS_NOEXEC: u64 = 0x8;
+        const MS_NOATIME: u64 = 0x400;
+        const ST_RDONLY: u64 = 0x0001;
+        const ST_NOSUID: u64 = 0x0002;
+        const ST_NODEV: u64 = 0x0004;
+        const ST_NOEXEC: u64 = 0x0008;
+        const ST_VALID: u64 = 0x0020;
+        const ST_NOATIME: u64 = 0x0400;
+        const ST_RELATIME: u64 = 0x1000;
+        const O_PATH: u64 = 0o10000000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-sff-plain".as_ptr() as u64, 0o755);
+        let _ = call_mkdir(c"/abi-sff-locked".as_ptr() as u64, 0o755);
+        let mount = |target: &core::ffi::CStr, flags: u64| {
+            call(
+                Syscall::Mount.raw(),
+                a4(
+                    c"tmpfs".as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    c"tmpfs".as_ptr() as u64,
+                    flags,
+                    0,
+                ),
+            )
+        };
+        let locked = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME;
+        if mount(c"/abi-sff-plain", 0) != Some(0) || mount(c"/abi-sff-locked", locked) != Some(0) {
+            return Err("mounting the tmpfs fixtures failed");
+        }
+        // mount(2) defaults to relatime.
+        match statfs_words(Syscall::Statfs.raw(), c"/abi-sff-plain".as_ptr() as u64) {
+            Some(st) if st[10] == ST_VALID | ST_RELATIME => {}
+            _ => return Err("statfs f_flags of a default mount is not ST_VALID|ST_RELATIME"),
+        }
+        let want = ST_VALID | ST_RDONLY | ST_NOSUID | ST_NODEV | ST_NOEXEC | ST_NOATIME;
+        match statfs_words(Syscall::Statfs.raw(), c"/abi-sff-locked".as_ptr() as u64) {
+            Some(st) if st[10] == want => {}
+            _ => return Err("statfs f_flags do not carry the mount's restrictions"),
+        }
+        // fstatfs answers from the descriptor's mount the same way.
+        let fd = call_open(c"/abi-sff-locked".as_ptr() as u64, O_PATH)
+            .filter(|fd| *fd >= 0)
+            .ok_or("open(O_PATH) of the read-only tmpfs failed")? as u64;
+        let st = statfs_words(Syscall::Fstatfs.raw(), fd);
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        match st {
+            Some(st) if st[0] == 0x0102_1994 && st[10] == want => Ok(()),
+            _ => Err("fstatfs f_type or f_flags differ from statfs of the same mount"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/statfs-magic",
+    smoke_abi_pathx_statfs_flags_follow_the_mount
+);
+
+/// `user_statfs` looks the path up with LOOKUP_FOLLOW, so a final symlink
+/// answers for the filesystem its target is on. `f_fsid` is the
+/// superblock's: `simple_statfs` and the block filesystems encode its device
+/// (`u64_to_fsid(huge_encode_dev(sb->s_dev))`), the `st_dev` every file on
+/// it reports; a bind is the same superblock.
+fn smoke_abi_pathx_statfs_follows_links_and_reports_the_fsid() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"x")], || {
+        const MS_BIND: u64 = 0x1000;
+        let link = c"/p2/to-proc";
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(c"/proc".as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("symlink /p2/to-proc -> /proc failed");
+        }
+        let Some(st) = statfs_words(Syscall::Statfs.raw(), link.as_ptr() as u64) else {
+            return Err("statfs through the symlink failed");
+        };
+        if st[0] != 0x9fa0 {
+            return Err("statfs did not follow a final symlink into procfs");
+        }
+        // f_fsid is the st_dev of the filesystem, through the link too.
+        let mut sb = [0u8; STAT_SIZE];
+        if call_stat(c"/proc".as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("stat /proc failed");
+        }
+        let proc_dev = u64::from_ne_bytes(sb[..8].try_into().unwrap());
+        if proc_dev == 0 || st[7] != proc_dev {
+            return Err("statfs f_fsid is not the encoded device of the superblock");
+        }
+        let _ = call_mkdir(c"/abi-sff-bind".as_ptr() as u64, 0o755);
+        let bound = call(
+            Syscall::Mount.raw(),
+            a4(
+                c"/p2".as_ptr() as u64,
+                c"/abi-sff-bind".as_ptr() as u64,
+                0,
+                MS_BIND,
+                0,
+            ),
+        );
+        let through_bind = statfs_words(Syscall::Statfs.raw(), c"/abi-sff-bind".as_ptr() as u64);
+        let direct = statfs_words(Syscall::Statfs.raw(), c"/p2".as_ptr() as u64);
+        if bound == Some(0) {
+            let _ = call(
+                Syscall::Umount2.raw(),
+                a1(c"/abi-sff-bind".as_ptr() as u64, 0),
+            );
+        }
+        match (bound, through_bind, direct) {
+            (Some(0), Some(b), Some(d)) if b[7] == d[7] => Ok(()),
+            (Some(0), ..) => Err("a bind does not report its source's f_fsid"),
+            _ => Err("bind of /p2 failed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/statfs-fsid",
+    smoke_abi_pathx_statfs_follows_links_and_reports_the_fsid
+);
+
 // ── quotactl(cmd, special, id, addr) — Linux disk-quota control ─────
 //
 // cmd = (subcmd << 8) | type. `if_dqblk` limits are in 1 KiB quota blocks;
@@ -3462,14 +3853,31 @@ fn smoke_abi_pathx_getdents_pos() -> TestResult {
         if reclen == 0 || reclen > n || reclen % 8 != 0 {
             return Err("getdents d_reclen must be a non-zero 8-aligned length");
         }
+        // `.` and `..` lead the listing (`dir_emit_dots`); the first seed
+        // follows them. Records are walked by d_reclen.
+        let mut pos = 0usize;
+        for _ in 0..2 {
+            let len = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            if len == 0 || pos + len > n {
+                return Err("getdents returned fewer records than `.`, `..` and a seed");
+            }
+            pos += len;
+        }
+        if pos + 20 > n {
+            return Err("getdents returned fewer records than `.`, `..` and a seed");
+        }
+        let reclen = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+        if reclen == 0 || pos + reclen > n {
+            return Err("getdents d_reclen of the first seed is out of range");
+        }
         // Name starts at offset 18 and is NUL-terminated; the first seed
         // enumerated is "a" (single byte name).
-        if buf[18] != b'a' || buf[19] != 0 {
-            return Err("getdents first entry name should be \"a\\0\"");
+        if buf[pos + 18] != b'a' || buf[pos + 19] != 0 {
+            return Err("getdents first seed name should be \"a\\0\"");
         }
         // Legacy d_type is the LAST byte of the record — DT_REG (8) for a
         // regular file seed.
-        if buf[reclen - 1] != 8 {
+        if buf[pos + reclen - 1] != 8 {
             return Err("getdents d_type (at reclen-1) should be DT_REG (8)");
         }
         Ok(())
@@ -3541,6 +3949,397 @@ fn smoke_abi_pathx_getdents_errno_order_and_small_buffer() -> TestResult {
 kernel_test_in!(
     "syscall_abi/getdents",
     smoke_abi_pathx_getdents_errno_order_and_small_buffer
+);
+
+// ── getdents: `.` and `..` come first, in every directory ─────────────
+//
+// `dir_emit_dots` puts `.` at position 0 and `..` at position 1 — for
+// dcache_readdir (tmpfs, ramfs, devtmpfs), btrfs_real_readdir,
+// proc_readdir_de, proc_pid_readdir, kernfs_fop_readdir and the FAT root —
+// with `d_ino` the directory's own inode and its parent's (`parent_ino`).
+// ext2 and FAT subdirectories hold the two entries on disk and report them
+// in the same place. A filesystem's root dentry is its own parent, so at the
+// root of a mount `..` names the directory itself. The positions are what
+// `d_off` reports, so lseek(0) rewinds onto `.` and seekdir to a d_off
+// resumes after the entry that reported it.
+
+/// One `struct linux_dirent64`: `(d_ino, d_off, d_type, d_name)`.
+type Dirent64 = (u64, u64, u8, alloc::string::String);
+
+fn parse_dirents64(buf: &[u8]) -> Option<alloc::vec::Vec<Dirent64>> {
+    let mut out = alloc::vec::Vec::new();
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let rec = buf.get(pos..)?;
+        let reclen = u16::from_ne_bytes(rec.get(16..18)?.try_into().ok()?) as usize;
+        if reclen < 20 || reclen > rec.len() {
+            return None;
+        }
+        let ino = u64::from_ne_bytes(rec.get(..8)?.try_into().ok()?);
+        let off = u64::from_ne_bytes(rec.get(8..16)?.try_into().ok()?);
+        let name = &rec[19..reclen];
+        let name = &name[..name.iter().position(|b| *b == 0)?];
+        let name = alloc::string::String::from(core::str::from_utf8(name).ok()?);
+        out.push((ino, off, rec[18], name));
+        pos += reclen;
+    }
+    Some(out)
+}
+
+/// Every record of directory `fd` from its current position on, read with
+/// `count`-byte getdents64 calls.
+fn read_dirents64(fd: u64, count: usize) -> Result<alloc::vec::Vec<Dirent64>, &'static str> {
+    let mut all = alloc::vec::Vec::new();
+    let mut buf = alloc::vec![0u8; count];
+    for _ in 0..4096 {
+        match call(
+            Syscall::Getdents64.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, count as u64),
+        ) {
+            Some(0) => return Ok(all),
+            Some(n) if n > 0 => {
+                all.extend(parse_dirents64(&buf[..n as usize]).ok_or("malformed linux_dirent64")?)
+            }
+            _ => return Err("getdents64 failed"),
+        }
+    }
+    Err("getdents64 never reached the end of the directory")
+}
+
+/// `st_ino` of a raw `struct stat` (offset 8 on x86_64 and arm64).
+fn stat_ino_of(sb: &[u8]) -> u64 {
+    u64::from_ne_bytes([sb[8], sb[9], sb[10], sb[11], sb[12], sb[13], sb[14], sb[15]])
+}
+
+/// `.` then `..` at positions 0 and 1 with their inode numbers, and neither
+/// name anywhere else in the listing.
+fn check_dots(listing: &[Dirent64], own: u64, parent: u64) -> Result<(), &'static str> {
+    const DT_DIR: u8 = 4;
+    let (Some(dot), Some(dotdot)) = (listing.first(), listing.get(1)) else {
+        return Err("getdents64 listed fewer than two entries");
+    };
+    if dot.3 != "." || dot.1 != 1 || dot.2 != DT_DIR {
+        return Err("the first entry is not `.` (d_off 1, DT_DIR)");
+    }
+    if dotdot.3 != ".." || dotdot.1 != 2 || dotdot.2 != DT_DIR {
+        return Err("the second entry is not `..` (d_off 2, DT_DIR)");
+    }
+    if dot.0 != own {
+        return Err("`.` does not carry the directory's own inode number");
+    }
+    if dotdot.0 != parent {
+        return Err("`..` does not carry the parent directory's inode number");
+    }
+    if listing[2..].iter().any(|e| e.3 == "." || e.3 == "..") {
+        return Err("`.` or `..` is listed a second time");
+    }
+    Ok(())
+}
+
+fn open_dir(path: &core::ffi::CStr) -> Result<u64, &'static str> {
+    const O_DIRECTORY: u64 = 0o200_000;
+    match call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, path.as_ptr() as u64, O_DIRECTORY, 0),
+    ) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("open(O_DIRECTORY) failed"),
+    }
+}
+
+fn smoke_abi_pathx_getdents64_lists_dot_and_dotdot_first() -> TestResult {
+    with_memfs("/p2", "p2", &[("a", b"x"), ("b", b"y")], || {
+        use core::fmt::Write as _;
+        if call_mkdir(c"/p2/sub".as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir /p2/sub failed");
+        }
+        let mut sb = [0u8; STAT_SIZE];
+        let mut ino_at = |path: &core::ffi::CStr| -> Result<u64, &'static str> {
+            match call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+                Some(0) => Ok(stat_ino_of(&sb)),
+                _ => Err("stat of a listed directory failed"),
+            }
+        };
+        let p2 = ino_at(c"/p2")?;
+        let sub = ino_at(c"/p2/sub")?;
+        let proc_root = ino_at(c"/proc")?;
+        let sys = ino_at(c"/sys")?;
+        let dev = ino_at(c"/dev")?;
+        let tmp = ino_at(c"/tmp")?;
+        let proc_self = ino_at(c"/proc/self")?;
+        // (directory, its inode, its parent's): a mount root is its own
+        // parent; a directory below one has the directory above it.
+        for (path, own, parent) in [
+            (c"/p2", p2, p2),
+            (c"/p2/sub", sub, p2),
+            (c"/proc", proc_root, proc_root),
+            (c"/proc/self", proc_self, proc_root),
+            (c"/sys", sys, sys),
+            (c"/dev", dev, dev),
+            (c"/tmp", tmp, tmp),
+        ] {
+            let fd = open_dir(path)?;
+            let listing = read_dirents64(fd, 4096);
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            let checked = listing.and_then(|listing| check_dots(&listing, own, parent));
+            if let Err(why) = checked {
+                let _ = writeln!(narf_console::Writer, "getdents64 {path:?}: {why}");
+                return Err(why);
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents-dots",
+    smoke_abi_pathx_getdents64_lists_dot_and_dotdot_first
+);
+
+fn smoke_abi_pathx_getdents64_dot_positions_rewind_and_seek() -> TestResult {
+    with_memfs(
+        "/p2",
+        "p2",
+        &[("a", b"x"), ("bb", b"y"), ("ccc", b"z")],
+        || {
+            const SEEK_SET: u64 = 0;
+            let fd = open_dir(c"/p2")?;
+            let result = (|| {
+                let whole = read_dirents64(fd, 4096)?;
+                let names: alloc::vec::Vec<&str> = whole.iter().map(|e| e.3.as_str()).collect();
+                if names.len() != 5 || names[0] != "." || names[1] != ".." {
+                    return Err("/p2 did not list `.`, `..` and its three files");
+                }
+                // rewinddir.
+                if call(Syscall::Lseek.raw(), a2(fd, 0, SEEK_SET)) != Some(0) {
+                    return Err("lseek(dir, 0, SEEK_SET) failed");
+                }
+                if read_dirents64(fd, 4096)? != whole {
+                    return Err("rewinding the directory did not list it again from `.`");
+                }
+                // Buffers that hold one record, one and a half, two: the dots
+                // split across calls the same way any other entries would.
+                for count in [24usize, 32, 48] {
+                    if call(Syscall::Lseek.raw(), a2(fd, 0, SEEK_SET)) != Some(0) {
+                        return Err("lseek(dir, 0, SEEK_SET) failed");
+                    }
+                    if read_dirents64(fd, count)? != whole {
+                        return Err("small getdents64 buffers listed the directory differently");
+                    }
+                }
+                // telldir/seekdir: each d_off resumes at the entry after it, and
+                // position 0 is `.` again.
+                let mut resume = 0u64;
+                for entry in &whole {
+                    if call(Syscall::Lseek.raw(), a2(fd, resume, SEEK_SET)) != Some(resume as i64) {
+                        return Err("lseek(dir, d_off, SEEK_SET) failed");
+                    }
+                    let next = read_dirents64(fd, 24)?;
+                    if next.first() != Some(entry) {
+                        return Err("seekdir to a d_off did not resume at the following entry");
+                    }
+                    resume = entry.1;
+                }
+                Ok(())
+            })();
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            result
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi/getdents-dots",
+    smoke_abi_pathx_getdents64_dot_positions_rewind_and_seek
+);
+
+/// The legacy x86_64 getdents reports the same two entries first, with
+/// d_type in the record's last byte.
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_pathx_getdents_legacy_lists_dot_and_dotdot_first() -> TestResult {
+    with_memfs("/p2", "p2", &[("a", b"x")], || {
+        const DT_DIR: u8 = 4;
+        let fd = open_dir(c"/p2")?;
+        let mut buf = [0u8; 256];
+        let got = call(
+            Syscall::Getdents.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let n = match got {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("getdents(dir fd) returned nothing"),
+        };
+        let mut pos = 0usize;
+        for (want, d_off) in [(&b"."[..], 1u64), (&b".."[..], 2)] {
+            if pos + 20 > n {
+                return Err("getdents returned fewer than two records");
+            }
+            let off = u64::from_ne_bytes(buf[pos + 8..pos + 16].try_into().unwrap());
+            let reclen = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            let name = &buf[pos + 18..pos + 18 + want.len() + 1];
+            if off != d_off || &name[..want.len()] != want || name[want.len()] != 0 {
+                return Err("legacy getdents did not start with `.` and `..`");
+            }
+            if buf[pos + reclen - 1] != DT_DIR {
+                return Err("legacy getdents `.`/`..` d_type (last byte) is not DT_DIR");
+            }
+            pos += reclen;
+        }
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "syscall_abi/getdents-dots",
+    smoke_abi_pathx_getdents_legacy_lists_dot_and_dotdot_first
+);
+
+/// A directory whose filesystem lists `.` and `..` itself, as ext2 and FAT
+/// subdirectories read them off the disk.
+struct OnDiskDotsDir;
+
+impl narf_filesystem::DirOps for OnDiskDotsDir {
+    fn ino(&self) -> u64 {
+        77
+    }
+    fn lookup(&self, _name: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+        None
+    }
+    fn iter<'a>(
+        &'a self,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = narf_filesystem::DirEntry> + 'a> {
+        let entry = |name: &'static str, file_type| narf_filesystem::DirEntry {
+            name: alloc::borrow::Cow::Borrowed(name),
+            file_type,
+        };
+        alloc::boxed::Box::new(
+            [
+                entry(".", narf_filesystem::FileType::Dir),
+                entry("..", narf_filesystem::FileType::Dir),
+                entry("x", narf_filesystem::FileType::File),
+            ]
+            .into_iter(),
+        )
+    }
+}
+
+struct OnDiskDotsFs;
+
+impl narf_filesystem::FsInstance for OnDiskDotsFs {
+    fn root(&self) -> alloc::sync::Arc<dyn narf_filesystem::DirOps> {
+        alloc::sync::Arc::new(OnDiskDotsDir)
+    }
+    fn name(&self) -> &str {
+        "ext2"
+    }
+}
+
+fn smoke_abi_pathx_getdents64_does_not_repeat_on_disk_dots() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        // A private namespace, so the mount does not outlive the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let auth = bootstrap_mount_authority();
+        let fs = alloc::sync::Arc::new(OnDiskDotsFs);
+        if crate::handlers::current_mount_arc(&auth, "/abi-gdd-ondisk", fs).is_err() {
+            return Err("could not mount the on-disk-dots fixture");
+        }
+        let fd = open_dir(c"/abi-gdd-ondisk")?;
+        let listing = read_dirents64(fd, 4096);
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let listing = listing?;
+        // The mount root: `..` is the directory itself.
+        check_dots(&listing, 77, 77)?;
+        let rest: alloc::vec::Vec<&str> = listing[2..].iter().map(|e| e.3.as_str()).collect();
+        if rest != ["x"] {
+            return Err("the filesystem's own entries were not listed once, after the dots");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents-dots",
+    smoke_abi_pathx_getdents64_does_not_repeat_on_disk_dots
+);
+
+/// A bind mount's root is a dentry of the bound filesystem, and
+/// `dir_emit_dots` reports `parent_ino(dentry)` for its `..`: the directory
+/// above it in that filesystem, or the directory itself when the bind is of
+/// the filesystem's root. A bind of a bind resolves through to the same
+/// filesystem.
+fn smoke_abi_pathx_getdents64_dotdot_of_a_bound_subdirectory() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_BIND: u64 = 0x1000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let tmpfs = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: c"/abi-gdb".as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        let _ = call_mkdir(c"/abi-gdb".as_ptr() as u64, 0o755);
+        if call(Syscall::Mount.raw(), tmpfs) != Some(0) {
+            return Err("mounting the tmpfs at /abi-gdb failed");
+        }
+        for dir in [
+            c"/abi-gdb/a",
+            c"/abi-gdb/a/b",
+            c"/abi-gdb/a/b/c",
+            c"/abi-gdb-root",
+            c"/abi-gdb-sub",
+            c"/abi-gdb-subsub",
+        ] {
+            let _ = call_mkdir(dir.as_ptr() as u64, 0o755);
+        }
+        let bind = |source: &core::ffi::CStr, target: &core::ffi::CStr| {
+            call(
+                Syscall::Mount.raw(),
+                a4(
+                    source.as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    0,
+                    MS_BIND,
+                    0,
+                ),
+            )
+        };
+        if bind(c"/abi-gdb", c"/abi-gdb-root") != Some(0)
+            || bind(c"/abi-gdb/a/b", c"/abi-gdb-sub") != Some(0)
+            || bind(c"/abi-gdb-sub/c", c"/abi-gdb-subsub") != Some(0)
+        {
+            return Err("the bind mounts were not made");
+        }
+        let mut sb = [0u8; STAT_SIZE];
+        let mut ino_at = |path: &core::ffi::CStr| -> Result<u64, &'static str> {
+            match call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+                Some(0) => Ok(stat_ino_of(&sb)),
+                _ => Err("stat of a bound directory failed"),
+            }
+        };
+        let root = ino_at(c"/abi-gdb")?;
+        let a = ino_at(c"/abi-gdb/a")?;
+        let b = ino_at(c"/abi-gdb/a/b")?;
+        let cc = ino_at(c"/abi-gdb/a/b/c")?;
+        for (path, own, parent) in [
+            (c"/abi-gdb-root", root, root),
+            (c"/abi-gdb-sub", b, a),
+            (c"/abi-gdb-subsub", cc, b),
+        ] {
+            let fd = open_dir(path)?;
+            let listing = read_dirents64(fd, 4096);
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            check_dots(&listing?, own, parent)?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents-dots-bind",
+    smoke_abi_pathx_getdents64_dotdot_of_a_bound_subdirectory
 );
 
 // ── listdir (NARF-native path_ptr, path_len, cursor, out, out_len) ──
@@ -3991,6 +4790,189 @@ fn smoke_abi_pathx_statx_slow_lookup_preserves_metadata() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_pathx_statx_slow_lookup_preserves_metadata
+);
+
+/// `btrfs_symlink` -> `btrfs_new_inode` -> `inode_init_owner`: a new symlink
+/// belongs to its creator's fsuid, with its fsgid or a setgid parent's group,
+/// as every new inode does. NARF stamped owners after mkdir and create but
+/// not after symlink, so on btrfs, whose new inodes start at 0:0, a link made
+/// by uid 1000 was root's. GNU tar then could not set the link's times
+/// (utimensat AT_SYMLINK_NOFOLLOW with explicit times needs the owner) and
+/// Steam's bootstrap extraction aborted. The filesystem here behaves the
+/// same way: its symlinks report 0:0 until their owners are set.
+fn smoke_abi_pathx_symlink_belongs_to_its_creator() -> TestResult {
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use narf_filesystem::{
+        DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
+    };
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    struct Link {
+        owners: IrqSafeSpinLock<(u32, u32)>,
+    }
+    impl FileOps for Link {
+        fn ino(&self) -> u64 {
+            0x4c49_4e4b_0001
+        }
+        fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+        fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Err(FsError::ReadOnly) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 6,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::Symlink,
+                    perms: 0o777,
+                },
+                mtime_cycles: 0,
+            }
+        }
+        fn owners(&self) -> (u32, u32) {
+            *self.owners.lock()
+        }
+        fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+            *self.owners.lock() = (uid, gid);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct Dir {
+        mode: u16,
+        owners: (u32, u32),
+        link: IrqSafeSpinLock<Option<Arc<Link>>>,
+    }
+    impl DirOps for Dir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name != "link" {
+                return None;
+            }
+            self.link
+                .lock()
+                .clone()
+                .map(|link| link as Arc<dyn FileOps>)
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+        fn dir_mode(&self) -> u16 {
+            self.mode
+        }
+        fn dir_owners(&self) -> (u32, u32) {
+            self.owners
+        }
+        fn symlink<'a>(
+            &'a self,
+            name: &'a str,
+            _target: &'a str,
+        ) -> FsFuture<'a, Arc<dyn FileOps>> {
+            let link = Arc::new(Link {
+                owners: IrqSafeSpinLock::new((0, 0)),
+            });
+            let created = (name == "link").then(|| {
+                *self.link.lock() = Some(Arc::clone(&link));
+                link as Arc<dyn FileOps>
+            });
+            Box::pin(async move { created.ok_or(FsError::Unsupported) })
+        }
+    }
+
+    struct Fs {
+        root: Arc<Dir>,
+    }
+    impl FsInstance for Fs {
+        fn root(&self) -> Arc<dyn DirOps> {
+            self.root.clone()
+        }
+        fn name(&self) -> &str {
+            "symlink-owner"
+        }
+    }
+
+    with_setup(|| {
+        const UID: u64 = 1000;
+        const GID: u64 = 1000;
+        const SHARED_GID: u32 = 77;
+        // The gid first: dropping the uid clears the set-id capabilities.
+        if call(Syscall::Setresgid.raw(), a2(GID, GID, GID)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(UID, UID, UID)) != Some(0)
+        {
+            return Err("fixture: could not become uid/gid 1000");
+        }
+        struct Case {
+            mount: &'static str,
+            link: &'static [u8],
+            /// The parent directory's mode and owners.
+            mode: u16,
+            owners: (u32, u32),
+            /// The link's owners lstat must report.
+            want: (u32, u32),
+        }
+        let cases = [
+            Case {
+                mount: "/symown-plain",
+                link: b"/symown-plain/link\0",
+                mode: 0o777,
+                owners: (0, 0),
+                want: (1000, 1000),
+            },
+            Case {
+                mount: "/symown-sgid",
+                link: b"/symown-sgid/link\0",
+                mode: 0o2777,
+                owners: (0, SHARED_GID),
+                want: (1000, SHARED_GID),
+            },
+        ];
+        for Case {
+            mount,
+            link,
+            mode,
+            owners,
+            want,
+        } in cases
+        {
+            let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+            let handle = registry()
+                .mount(
+                    &auth,
+                    mount,
+                    Fs {
+                        root: Arc::new(Dir {
+                            mode,
+                            owners,
+                            link: IrqSafeSpinLock::new(None),
+                        }),
+                    },
+                )
+                .map_err(|_| "fixture: mounting the test filesystem failed")?;
+            let created = call(
+                Syscall::Symlinkat.raw(),
+                a2(c"target".as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
+            );
+            let got = lstat_owners(link);
+            let _ = registry().unmount(&handle, mount);
+            if created != Some(0) {
+                return Err("symlinkat on the test filesystem failed");
+            }
+            if got != Some(want) {
+                return Err(if mode & 0o2000 == 0 {
+                    "a new symlink does not belong to its creator's fsuid and fsgid"
+                } else {
+                    "a new symlink in a setgid directory did not take the directory's group"
+                });
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/symlink-owner",
+    smoke_abi_pathx_symlink_belongs_to_its_creator
 );
 
 // `fs/stat.c::SYSCALL_DEFINE2(newstat)` → vfs_stat → cp_new_stat.

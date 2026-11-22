@@ -556,6 +556,44 @@ fn smoke_exfat_mount_ramblock_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/exfat", smoke_exfat_mount_ramblock_round_trip);
 
+/// `exfat_statfs`: the cluster is the block, the heap's clusters are
+/// `f_blocks` (`num_clusters - 2`), the clear bits of the Allocation Bitmap
+/// are `f_bfree` and `f_bavail` (`exfat_count_used_clusters`), and names are
+/// `EXFAT_MAX_FILE_LEN * NLS_MAX_CHARSET_SIZE` bytes.
+fn smoke_exfat_statfs_counts_clusters() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::ExfatVolume;
+
+    // 64 one-sector clusters, of which the image's bitmap marks 2..=5 used.
+    let img = build_exfat_image("HELLO.TXT", b"hello exfat\n");
+    let device = RamBlockDevice::from_image(LBS as u32, img);
+    let volume = match poll_once(ExfatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("ExfatVolume::mount failed"),
+    };
+    let stat = match poll_once(volume.statfs()) {
+        Some(Ok(stat)) => stat,
+        _ => return TestResult::Fail("statfs failed"),
+    };
+    if stat.block_size != 512 || stat.fragment_size != 512 || stat.blocks != 64 {
+        return TestResult::Fail("statfs did not report 64 512-byte cluster blocks");
+    }
+    if stat.blocks_free != 60 || stat.blocks_available != 60 {
+        return TestResult::Fail("statfs did not count the free clusters in the bitmap");
+    }
+    if stat.name_len != 255 * 6 {
+        return TestResult::Fail("statfs f_namelen is not 255 * NLS_MAX_CHARSET_SIZE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/exfat/statfs",
+    smoke_exfat_statfs_counts_clusters
+);
+
 // ── Write-path scaffolding smokes ────────────────────────────────
 
 /// §6.3.3 SetChecksum is deterministic and skips bytes 2..4

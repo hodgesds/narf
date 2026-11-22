@@ -607,10 +607,11 @@ fn smoke_e2e_efi_mount_visible_inside_installed_root() -> TestResult {
             fs.name() == "test-fat"
         }) == Some(true);
     let rows = registry().list_mountinfo();
+    // The installed-root stand-in is an in-memory tree, listed as tmpfs.
     let root_id = rows
         .iter()
         .rev()
-        .find(|(_, _, path, name, ..)| path == "/mnt" && name == "test-root")
+        .find(|(_, _, path, name, ..)| path == "/mnt" && name == "tmpfs")
         .map(|(id, ..)| *id);
     let rooted_boot_parent = rows
         .iter()

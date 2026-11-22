@@ -15,11 +15,12 @@
 //! drained VCN instances after one second. `amdgpu.rdna2_vcn_dpg=0` selects Linux's static path with
 //! `AMD_PG_SUPPORT_VCN` clear instead: every tile powered on through PGFSM
 //! and the registers written directly, clock gating as
-//! `vcn_v3_0_disable_clock_gating` programs it. MM_DPM_PG is outside the
-//! default SMU boot policy, so `PowerUpVcn` is skipped exactly as
-//! `sienna_cichlid_dpm_set_vcn_enable` does; with
-//! `amdgpu.rdna2_vcn_smu_pg=1` the boot sends it first, and a board where it
-//! runs unannounced is refused before any write. Firmware images come from
+//! `vcn_v3_0_disable_clock_gating` programs it. As in Linux the SMU boot
+//! policy allows MM_DPM_PG (`AMD_PG_SUPPORT_VCN`/`_JPEG`), so the boot sends
+//! PowerUpVcn and PowerUpJpeg before any write and the idle gate
+//! PowerDownVcn (`sienna_cichlid_dpm_set_vcn_enable`); with
+//! `amdgpu.rdna2_vcn_smu_pg=0` it stays off and nothing is sent, and a board
+//! where it runs unannounced is refused before any write. Firmware images come from
 //! the PSP-loaded TMR (`AMDGPU_FW_LOAD_PSP`). Client submissions use lent
 //! MMHUB VMIDs; startup proofs use VMID0.
 //!
@@ -69,6 +70,9 @@ pub(crate) mod regs {
     pub const POWER_STATUS: Reg = Reg(1, 0x004); // linux: mmUVD_POWER_STATUS
     pub const CC_UVD_HARVESTING: Reg = Reg(1, 0x007); // linux: mmCC_UVD_HARVESTING
     pub const JPEG_POWER_STATUS: Reg = Reg(1, 0x00a); // linux: mmUVD_JPEG_POWER_STATUS
+    pub const DPG_LMA_CTL: Reg = Reg(1, 0x011); // linux: mmUVD_DPG_LMA_CTL
+    pub const DPG_LMA_DATA: Reg = Reg(1, 0x012); // linux: mmUVD_DPG_LMA_DATA
+    pub const DPG_LMA_MASK: Reg = Reg(1, 0x013); // linux: mmUVD_DPG_LMA_MASK
     pub const DPG_PAUSE: Reg = Reg(1, 0x014); // linux: mmUVD_DPG_PAUSE
     pub const SCRATCH2: Reg = Reg(1, 0x016); // linux: mmUVD_SCRATCH2
     pub const SCRATCH9: Reg = Reg(1, 0x01d); // linux: mmUVD_SCRATCH9
@@ -76,11 +80,16 @@ pub(crate) mod regs {
     pub const STATUS: Reg = Reg(1, 0x080); // linux: mmUVD_STATUS
     pub const SOFT_RESET: Reg = Reg(1, 0x084); // linux: mmUVD_SOFT_RESET
     pub const CGC_GATE: Reg = Reg(1, 0x088); // linux: mmUVD_CGC_GATE
+    pub const GPCOM_VCPU_CMD: Reg = Reg(1, 0x08f); // linux: mmUVD_GPCOM_VCPU_CMD
+    pub const GPCOM_VCPU_DATA0: Reg = Reg(1, 0x090); // linux: mmUVD_GPCOM_VCPU_DATA0
+    pub const GPCOM_VCPU_DATA1: Reg = Reg(1, 0x091); // linux: mmUVD_GPCOM_VCPU_DATA1
     pub const CGC_CTRL: Reg = Reg(1, 0x08a); // linux: mmUVD_CGC_CTRL
     pub const SUVD_CGC_GATE: Reg = Reg(1, 0x08c); // linux: mmUVD_SUVD_CGC_GATE
     pub const SUVD_CGC_CTRL: Reg = Reg(1, 0x08e); // linux: mmUVD_SUVD_CGC_CTRL
     pub const SUVD_CGC_GATE2: Reg = Reg(1, 0x0ff); // linux: mmUVD_SUVD_CGC_GATE2
     pub const MASTINT_EN: Reg = Reg(1, 0x0a1); // linux: mmUVD_MASTINT_EN
+    pub const CONTEXT_ID: Reg = Reg(1, 0x0a7); // linux: mmUVD_CONTEXT_ID
+    pub const CONTEXT_ID2: Reg = Reg(1, 0x0a8); // linux: mmUVD_CONTEXT_ID2
     /// Encode ring 0 (general purpose) and ring 1 (low latency).
     // linux: mmUVD_RB_BASE_LO; mmUVD_RB_BASE_LO2
     pub const RB_BASE_LO: [Reg; 2] = [Reg(1, 0x0aa), Reg(1, 0x0af)];
@@ -711,6 +720,20 @@ fn update_vcpu<I: Io>(
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
+/// `vcn_v3_0_enable_clock_gating`: DYN_CLOCK_MODE only with
+/// `AMD_CG_SUPPORT_VCN_MGCG` ([`cgc_ctrl`]).
+fn enable_clock_gating<I: Io>(io: &mut I, l: Layout, i: usize, mgcg: bool) -> Result<(), Error> {
+    let r = |x: Reg| l.reg(i, x);
+    let ctrl = checked(io.read(r(CGC_CTRL)))?;
+    io.write(r(CGC_CTRL), ctrl | cgc_ctrl(mgcg));
+    update(io, r(CGC_CTRL), CGC_CTRL_MODES, CGC_CTRL_MODES)?;
+    update(
+        io,
+        r(SUVD_CGC_CTRL),
+        SUVD_CGC_CTRL_MODES,
+        SUVD_CGC_CTRL_MODES,
+    )
+}
 /// CPU VRAM writes leave the HDP write cache before an engine fetches them.
 fn flush<I: Io>(io: &mut I, l: Layout) {
     barrier(Ordering::SeqCst);
@@ -1266,6 +1289,75 @@ impl Jpeg {
     }
 }
 
+/// Instance registers of a ring-timeout snapshot, after the ring's own
+/// read and write pointers: Linux's VCN 3.0 dump (`vcn_reg_list_3_0` for
+/// `amdgpu_vcn_dump_ip_state`; encode rings 3 and 4 do not exist on VCN
+/// 3.0), then the decode RBC pointers, DPG scratch, interrupt, VCPU, reset
+/// and LMI state.
+pub(crate) const TIMEOUT_REGS: [(&str, Reg); 33] = [
+    ("STATUS", STATUS),
+    ("POWER_STATUS", POWER_STATUS),
+    ("CONTEXT_ID", CONTEXT_ID),
+    ("CONTEXT_ID2", CONTEXT_ID2),
+    ("GPCOM_VCPU_DATA0", GPCOM_VCPU_DATA0),
+    ("GPCOM_VCPU_DATA1", GPCOM_VCPU_DATA1),
+    ("GPCOM_VCPU_CMD", GPCOM_VCPU_CMD),
+    ("RB_BASE_HI", RB_BASE_HI[0]),
+    ("RB_BASE_LO", RB_BASE_LO[0]),
+    ("RB_BASE_HI2", RB_BASE_HI[1]),
+    ("RB_BASE_LO2", RB_BASE_LO[1]),
+    ("RB_RPTR", RB_RPTR[0]),
+    ("RB_WPTR", RB_WPTR[0]),
+    ("RB_RPTR2", RB_RPTR[1]),
+    ("RB_WPTR2", RB_WPTR[1]),
+    ("RB_SIZE", RB_SIZE[0]),
+    ("RB_SIZE2", RB_SIZE[1]),
+    ("PGFSM_CONFIG", PGFSM_CONFIG),
+    ("PGFSM_STATUS", PGFSM_STATUS),
+    ("DPG_LMA_CTL", DPG_LMA_CTL),
+    ("DPG_LMA_DATA", DPG_LMA_DATA),
+    ("DPG_LMA_MASK", DPG_LMA_MASK),
+    ("DPG_PAUSE", DPG_PAUSE),
+    ("RBC_RB_RPTR", RBC_RB_RPTR),
+    ("RBC_RB_WPTR", RBC_RB_WPTR),
+    ("RB_ARB_CTRL", RB_ARB_CTRL),
+    ("SCRATCH2", SCRATCH2),
+    ("SCRATCH9", SCRATCH9),
+    ("MASTINT_EN", MASTINT_EN),
+    ("VCPU_CNTL", VCPU_CNTL),
+    ("SOFT_RESET", SOFT_RESET),
+    ("LMI_CTRL2", LMI_CTRL2),
+    ("LMI_STATUS", LMI_STATUS),
+];
+/// One ring's timeout evidence (`Engine::ring_snapshot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RingSnapshot {
+    pub rptr: u32,
+    pub wptr: u32,
+    /// The ring's fence writeback and shadow wptr.
+    pub observed: u32,
+    pub shadow: u32,
+    /// `TIMEOUT_REGS`, in order.
+    pub regs: [u32; TIMEOUT_REGS.len()],
+    /// fw_shared dword 56 (`pad1`, `multi_queue` modes), `rb.rptr`, `rb.wptr`.
+    pub shared: [u32; 3],
+    /// The ring dwords at the hardware read pointer.
+    pub at_rptr: [u32; 5],
+}
+impl Default for RingSnapshot {
+    fn default() -> Self {
+        Self {
+            rptr: 0,
+            wptr: 0,
+            observed: 0,
+            shadow: 0,
+            regs: [0; TIMEOUT_REGS.len()],
+            shared: [0; 3],
+            at_rptr: [0; 5],
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Engine<I: Io> {
     pub runtime: idle::Runtime,
@@ -1370,12 +1462,13 @@ pub(crate) fn dec_msg(create: bool) -> [u32; 14] {
         [0x28, 0x18, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     }
 }
-/// `amdgpu_vcn_enc_get_create_msg` / `_destroy_msg` IB (16 dwords, no
-/// unified-queue header on VCN 3.0): session info, task info, op.
-pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 16] {
-    let mut ib = [0; 16];
+/// `amdgpu_vcn_enc_get_create_msg` / `_destroy_msg` packages (no
+/// unified-queue header on VCN 3.0): session info, task info, op. Linux
+/// zeroes the rest of its 16-dword allocation but submits `ib->length_dw`,
+/// these 13 dwords: the firmware walks every dword the IB names as packages.
+pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 13] {
     // linux: n/a (IB literals in amdgpu_vcn.c:amdgpu_vcn_enc_get_create_msg/_destroy_msg)
-    ib[..13].copy_from_slice(&[
+    [
         0x18,
         1,
         1,
@@ -1389,8 +1482,7 @@ pub(crate) fn enc_msg_ib(session: u64, create: bool) -> [u32; 16] {
         0,
         8,
         if create { 0x0800_0001 } else { 0x0800_0002 },
-    ]);
-    ib
+    ]
 }
 
 impl<I: Io> Engine<I> {
@@ -2031,6 +2123,7 @@ impl<I: Io> Engine<I> {
         let map = instance.memory.mapping();
         let dec = instance.address(DEC_RING);
         let enc = [instance.address(ENC_RING[0]), instance.address(ENC_RING[1])];
+        let enc_wptr = [instance.enc[0].wptr, instance.enc[1].wptr];
         let wptr = self.hw.access(|io, l| {
             let r = |reg: Reg| l.reg(i, reg);
             update(io, r(MASTINT_EN), MASTINT_VCPU_EN, MASTINT_VCPU_EN)?;
@@ -2053,8 +2146,10 @@ impl<I: Io> Engine<I> {
             modes(io, 0);
             for j in 0..enc_count {
                 modes(io, shared::RING_RESET << shared::ENCODE_SHIFT[j]);
-                io.write(r(RB_RPTR[j]), 0);
-                io.write(r(RB_WPTR[j]), 0);
+                // Both pointers at the ring's write pointer, as
+                // vcn_v3_0_start does: a restart runs nothing twice.
+                io.write(r(RB_RPTR[j]), enc_wptr[j]);
+                io.write(r(RB_WPTR[j]), enc_wptr[j]);
                 io.write(r(RB_BASE_LO[j]), enc[j] as u32);
                 io.write(r(RB_BASE_HI[j]), (enc[j] >> 32) as u32);
                 io.write(r(RB_SIZE[j]), RING_DW);
@@ -2191,45 +2286,66 @@ impl<I: Io> Engine<I> {
     /// path. A consumed ring with an unchanged fence needs a different
     /// investigation from a ring whose commands were never fetched.
     fn report_ib_timeout(&mut self, i: usize, slot: usize, seq: u32) {
-        use core::fmt::Write;
-        let Some(instance) = self.vcn[i].as_ref() else {
-            return;
-        };
+        self.report_ring_timeout(i, slot, seq, "IB fence timeout");
+    }
+    /// Timeout evidence of ring `slot` (0 decode, 1 + j encode) of instance
+    /// `i`: its pointers, fence and shadow wptr, `TIMEOUT_REGS`, the
+    /// fw_shared queue modes and decode pointers, and the ring dwords at the
+    /// hardware read pointer (the command the engine sits on).
+    pub(crate) fn ring_snapshot(&mut self, i: usize, slot: usize) -> Result<RingSnapshot, Error> {
+        let instance = self.vcn[i].as_ref().ok_or(Error::Invalid)?;
         let (ring, rptr, wptr) = if slot == 0 {
             (&instance.dec, RBC_RB_RPTR, RBC_RB_WPTR)
         } else {
-            let j = slot - 1;
+            let j = (slot - 1) & 1;
             (&instance.enc[j], RB_RPTR[j], RB_WPTR[j])
         };
-        let map = instance.memory.mapping();
-        let regs = [
-            ("RPTR", rptr),
-            ("WPTR", wptr),
-            ("STATUS", STATUS),
-            ("POWER_STATUS", POWER_STATUS),
-            ("PGFSM_STATUS", PGFSM_STATUS),
-            ("DPG_PAUSE", DPG_PAUSE),
-            ("RB_ARB_CTRL", RB_ARB_CTRL),
-            ("SCRATCH2", SCRATCH2),
-            ("SCRATCH9", SCRATCH9),
-            ("MASTINT_EN", MASTINT_EN),
-        ];
-        let mut values = [0u32; 10];
-        let mut observed = 0;
-        let mut shadow = 0;
-        let read = self.hw.access(|io, l| {
-            for (value, (_, reg)) in values.iter_mut().zip(regs) {
+        let (map, shadow, base) = (instance.memory.mapping(), ring.shadow, ring.base);
+        let mut s = RingSnapshot::default();
+        self.hw.access(|io, l| {
+            s.rptr = io.read(l.reg(i, rptr));
+            s.wptr = io.read(l.reg(i, wptr));
+            for (value, (_, reg)) in s.regs.iter_mut().zip(TIMEOUT_REGS) {
                 *value = io.read(l.reg(i, reg));
             }
             invalidate(io, l);
-            observed = io.read_memory(map, FENCE[slot]);
-            shadow = io.read_memory(map, ring.shadow);
+            s.observed = io.read_memory(map, FENCE[slot]);
+            s.shadow = io.read_memory(map, shadow);
+            for (word, at) in
+                s.shared
+                    .iter_mut()
+                    .zip([shared::QUEUE_MODES, shared::RB_RPTR, shared::RB_WPTR])
+            {
+                *word = io.read_memory(map, SHARED + at);
+            }
+            // The decode RBC pointer may carry flag bits (the DPG stop masks
+            // 0x7fffffff); the ring index wraps at its size either way.
+            let mut at = s.rptr % RING_DW;
+            for word in &mut s.at_rptr {
+                *word = io.read_memory(map, base + u64::from(at) * 4);
+                at = (at + 1) % RING_DW;
+            }
             Ok(())
-        });
+        })?;
+        Ok(s)
+    }
+    /// The snapshot of ring `slot` (0 decode, 1 + j encode) of instance `i`
+    /// whose fence `seq` did not land, labelled `what`.
+    fn report_ring_timeout(&mut self, i: usize, slot: usize, seq: u32, what: &str) {
+        use core::fmt::Write;
+        let snapshot = self.ring_snapshot(i, slot);
+        let Some(instance) = self.vcn[i].as_ref() else {
+            return;
+        };
+        let ring = if slot == 0 {
+            &instance.dec
+        } else {
+            &instance.enc[(slot - 1) & 1]
+        };
         let mut w = narf_console::Writer;
         let _ = write!(
             w,
-            "amdgpu: VCN{i} IB fence timeout ({:?}): slot={slot} ring={:?} base={:#x} doorbell={:#x} submitted_wptr={:#x} fence={:#x} expected={seq:#x}",
+            "amdgpu: VCN{i} {what} ({:?}): slot={slot} ring={:?} base={:#x} doorbell={:#x} submitted_wptr={:#x} fence={:#x} expected={seq:#x}",
             self.mode,
             ring.kind,
             instance.address(ring.base),
@@ -2237,12 +2353,22 @@ impl<I: Io> Engine<I> {
             ring.wptr,
             instance.address(FENCE[slot]),
         );
-        match read {
-            Ok(()) => {
-                let _ = write!(w, " observed={observed:#x} shadow_wptr={shadow:#x}");
-                for ((name, _), value) in regs.iter().zip(values) {
+        match snapshot {
+            Ok(s) => {
+                let _ = write!(
+                    w,
+                    " observed={:#x} shadow_wptr={:#x} RPTR={:#x} WPTR={:#x}",
+                    s.observed, s.shadow, s.rptr, s.wptr
+                );
+                for ((name, _), value) in TIMEOUT_REGS.iter().zip(s.regs) {
                     let _ = write!(w, " {name}={value:#x}");
                 }
+                let [modes, rptr, wptr] = s.shared;
+                let _ = write!(
+                    w,
+                    " fw_shared_modes={modes:#x} fw_shared_rb={rptr:#x}/{wptr:#x} at_rptr={:x?}",
+                    s.at_rptr
+                );
             }
             Err(error) => {
                 let _ = write!(w, " snapshot_refused={error:?}");
@@ -2287,7 +2413,8 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     /// `amdgpu_vcn_enc_ring_test_ib`: initialize then close session 1 on
-    /// ring j (`vcn_v2_0_enc_ring_emit_ib/_fence`, insert_end).
+    /// ring j (`vcn_v2_0_enc_ring_emit_ib/_fence`, insert_end). Each
+    /// VCN_ENC_CMD_IB names the IB's package dwords (`ib->length_dw`).
     async fn test_enc_ib(&mut self, i: usize, j: usize) -> Result<(), Error> {
         let instance = self.vcn[i].as_mut().ok_or(Error::Invalid)?;
         let map = instance.memory.mapping();
@@ -2301,10 +2428,16 @@ impl<I: Io> Engine<I> {
             last = seq;
             self.hw.access(|io, l| {
                 checked(io.read(l.reg(i, STATUS)))?;
-                for (at, &word) in enc_msg_ib(session, create).iter().enumerate() {
+                let words = enc_msg_ib(session, create);
+                for (at, &word) in words.iter().enumerate() {
                     io.write_memory(map, IBS[k] + at as u64 * 4, word);
                 }
-                ring.emit(io, map, &[cmd::ENC_IB, 0, ib as u32, (ib >> 32) as u32, 16])?;
+                let dwords = words.len() as u32;
+                ring.emit(
+                    io,
+                    map,
+                    &[cmd::ENC_IB, 0, ib as u32, (ib >> 32) as u32, dwords],
+                )?;
                 ring.emit(
                     io,
                     map,
@@ -2383,73 +2516,70 @@ impl<I: Io> Engine<I> {
             return Ok(());
         }
         let instances: alloc::vec::Vec<usize> = self.active().collect();
-        let (vcn_pg, mgcg) = (self.pg.vcn, self.cg.vcn);
         for i in instances {
             if self.mode == StartMode::Dpg {
                 self.stop_dpg(i).await?;
                 continue;
             }
-            let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
-            let reg = |l: Layout, r: Reg| l.reg(i, r);
-            let (status, lmi) = (reg(self.hw.layout, STATUS), reg(self.hw.layout, LMI_STATUS));
-            // linux: n/a (literal 0x7, vcn_v3_0_stop)
-            self.hw.wait_reg(engine, status, STATUS_IDLE, 0x7).await?;
+            self.stop_static(i).await?;
+        }
+        Ok(())
+    }
+    /// `vcn_v3_0_stop` without DPG for instance `i`: wait for idle and a
+    /// clean LMI, stall UMC, block the VCPU and hold it in reset, soft-reset
+    /// the LMI, clear the status, enable clock gating and, with
+    /// `AMD_PG_SUPPORT_VCN`, power every tile off.
+    pub(crate) async fn stop_static(&mut self, i: usize) -> Result<(), Error> {
+        let (vcn_pg, mgcg) = (self.pg.vcn, self.cg.vcn);
+        let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
+        let reg = |l: Layout, r: Reg| l.reg(i, r);
+        let (status, lmi) = (reg(self.hw.layout, STATUS), reg(self.hw.layout, LMI_STATUS));
+        // linux: n/a (literal 0x7, vcn_v3_0_stop)
+        self.hw.wait_reg(engine, status, STATUS_IDLE, 0x7).await?;
+        self.hw
+            .wait_reg(engine, lmi, LMI_STATUS_CLEAN, LMI_STATUS_CLEAN)
+            .await?;
+        self.hw.access(|io, l| {
+            update(
+                io,
+                reg(l, LMI_CTRL2),
+                LMI_CTRL2_STALL_ARB_UMC,
+                LMI_CTRL2_STALL_ARB_UMC,
+            )
+        })?;
+        self.hw
+            .wait_reg(engine, lmi, LMI_STATUS_UMC_CLEAN, LMI_STATUS_UMC_CLEAN)
+            .await?;
+        self.hw.access(|io, l| {
+            let r = |x: Reg| reg(l, x);
+            update(io, r(RB_ARB_CTRL), RB_ARB_VCPU_DIS, RB_ARB_VCPU_DIS)?;
+            update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST)?;
+            update_vcpu(io, l, i, VCPU_CLK_EN, 0)?;
+            update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
+            update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
+            io.write(r(STATUS), 0);
+            enable_clock_gating(io, l, i, mgcg)?;
+            if !vcn_pg {
+                checked(io.read(r(STATUS)))?;
+                return Ok(());
+            }
+            // vcn_v3_0_enable_static_power_gating, AMD_PG_SUPPORT_VCN:
+            // the tiles-off indicator, then every tile off.
+            update(io, r(POWER_STATUS), POWER_STATUS_MASK, POWER_TILES_OFF)?;
+            io.write(r(PGFSM_CONFIG), PGFSM_ALL_OFF);
+            Ok(())
+        })?;
+        if vcn_pg {
+            let pgfsm = reg(self.hw.layout, PGFSM_STATUS);
             self.hw
-                .wait_reg(engine, lmi, LMI_STATUS_CLEAN, LMI_STATUS_CLEAN)
+                .wait_reg(engine, pgfsm, PGFSM_ALL_OFF, PGFSM_STATUS_MASK)
                 .await?;
+            // The read-back that orders the writes. UVD_STATUS is in the
+            // gated domain now, so its value proves nothing.
             self.hw.access(|io, l| {
-                update(
-                    io,
-                    reg(l, LMI_CTRL2),
-                    LMI_CTRL2_STALL_ARB_UMC,
-                    LMI_CTRL2_STALL_ARB_UMC,
-                )
-            })?;
-            self.hw
-                .wait_reg(engine, lmi, LMI_STATUS_UMC_CLEAN, LMI_STATUS_UMC_CLEAN)
-                .await?;
-            self.hw.access(|io, l| {
-                let r = |x: Reg| reg(l, x);
-                update(io, r(RB_ARB_CTRL), RB_ARB_VCPU_DIS, RB_ARB_VCPU_DIS)?;
-                update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST)?;
-                update_vcpu(io, l, i, VCPU_CLK_EN, 0)?;
-                update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
-                update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
-                io.write(r(STATUS), 0);
-                // vcn_v3_0_enable_clock_gating. Without
-                // AMD_CG_SUPPORT_VCN_MGCG it ORs in 0: DYN_CLOCK_MODE stays
-                // as read.
-                let ctrl = checked(io.read(r(CGC_CTRL)))?;
-                io.write(r(CGC_CTRL), ctrl | cgc_ctrl(mgcg));
-                update(io, r(CGC_CTRL), CGC_CTRL_MODES, CGC_CTRL_MODES)?;
-                update(
-                    io,
-                    r(SUVD_CGC_CTRL),
-                    SUVD_CGC_CTRL_MODES,
-                    SUVD_CGC_CTRL_MODES,
-                )?;
-                if !vcn_pg {
-                    checked(io.read(r(STATUS)))?;
-                    return Ok(());
-                }
-                // vcn_v3_0_enable_static_power_gating, AMD_PG_SUPPORT_VCN:
-                // the tiles-off indicator, then every tile off.
-                update(io, r(POWER_STATUS), POWER_STATUS_MASK, POWER_TILES_OFF)?;
-                io.write(r(PGFSM_CONFIG), PGFSM_ALL_OFF);
+                io.read(reg(l, STATUS));
                 Ok(())
             })?;
-            if vcn_pg {
-                let pgfsm = reg(self.hw.layout, PGFSM_STATUS);
-                self.hw
-                    .wait_reg(engine, pgfsm, PGFSM_ALL_OFF, PGFSM_STATUS_MASK)
-                    .await?;
-                // The read-back that orders the writes. UVD_STATUS is in the
-                // gated domain now, so its value proves nothing.
-                self.hw.access(|io, l| {
-                    io.read(reg(l, STATUS));
-                    Ok(())
-                })?;
-            }
         }
         Ok(())
     }
@@ -2627,6 +2757,7 @@ pub fn route_interrupts(
                     Ok(iv) => {
                         if let Some(engine) = fence_engine(&iv) {
                             fence::notify(engine);
+                            crate::amdgpu_navi22_cs::fence_interrupt();
                         }
                     }
                     Err(_) => {
@@ -3035,6 +3166,99 @@ impl<I: Io> Engine<I> {
         })?;
         Ok((completed, throttle))
     }
+    /// Job-timeout samples (`amdgpu_navi22_tdr`, Linux's per-ring
+    /// drm_sched `video_timeout`) of the client rings in `rings` (bit
+    /// `MediaRing::index()`) that passed their ring and IB tests: each ring's
+    /// last sequence and its fence writeback, read after one HDP invalidate.
+    /// An all-ones invalidate read-back is device loss.
+    pub(crate) fn client_progress(
+        &mut self,
+        rings: u8,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
+        let mut slots = alloc::vec::Vec::new();
+        for ring in MediaRing::ALL {
+            if rings & 1 << ring.index() == 0 || !self.client_ready(ring) {
+                continue;
+            }
+            let (r, map, _, fence_at) = client_ring(&mut self.vcn[0], &mut self.jpeg, ring)?;
+            let engine = if ring == MediaRing::Jpeg {
+                fence::Engine::Jpeg
+            } else {
+                fence::Engine::Vcn0
+            };
+            slots.push((ring, engine, r.seq, map, fence_at));
+        }
+        let mut samples = alloc::vec::Vec::new();
+        samples
+            .try_reserve_exact(slots.len())
+            .map_err(|_| Error::Allocation)?;
+        self.hw.access(|io, l| {
+            invalidate(io, l);
+            checked(io.read(l.liveness()))?;
+            for &(ring, engine, emitted, map, fence_at) in &slots {
+                samples.push(crate::amdgpu_navi22_tdr::Progress {
+                    engine,
+                    media: Some(ring),
+                    emitted,
+                    signaled: io.read_memory(map, fence_at),
+                });
+            }
+            Ok(())
+        })?;
+        Ok(samples)
+    }
+    /// Timeout-only evidence for a client job on `ring` whose fence `seq`
+    /// never landed (`amdgpu_navi22_tdr`): the IB-timeout register line for
+    /// a VCN0 ring, the JRBC pointers and JPEG power state for JPEG.
+    pub(crate) fn report_client_timeout(&mut self, ring: MediaRing, seq: u32) {
+        use core::fmt::Write;
+        match ring {
+            MediaRing::Dec => self.report_ring_timeout(0, 0, seq, "client job timeout"),
+            MediaRing::Enc(j) => {
+                self.report_ring_timeout(0, 1 + usize::from(j & 1), seq, "client job timeout")
+            }
+            MediaRing::Jpeg => {
+                let Some(jpeg) = self.jpeg.as_ref() else {
+                    return;
+                };
+                let (map, wptr) = (jpeg.memory.mapping(), jpeg.ring.wptr);
+                let regs = [
+                    ("RPTR", JRBC_RB_RPTR),
+                    ("WPTR", JRBC_RB_WPTR),
+                    ("RB_CNTL", JRBC_RB_CNTL),
+                    ("JPEG_POWER_STATUS", JPEG_POWER_STATUS),
+                    ("PGFSM_STATUS", PGFSM_STATUS),
+                ];
+                let mut values = [0u32; 5];
+                let mut observed = 0;
+                let read = self.hw.access(|io, l| {
+                    for (value, (_, reg)) in values.iter_mut().zip(regs) {
+                        *value = io.read(l.reg(0, reg));
+                    }
+                    invalidate(io, l);
+                    observed = io.read_memory(map, JPEG_FENCE);
+                    Ok(())
+                });
+                let mut w = narf_console::Writer;
+                let _ = write!(
+                    w,
+                    "amdgpu: JPEG client job timeout: submitted_wptr={wptr:#x} expected={seq:#x}"
+                );
+                match read {
+                    Ok(()) => {
+                        let _ = write!(w, " observed={observed:#x}");
+                        for ((name, _), value) in regs.iter().zip(values) {
+                            let _ = write!(w, " {name}={value:#x}");
+                        }
+                    }
+                    Err(error) => {
+                        let _ = write!(w, " snapshot_refused={error:?}");
+                    }
+                }
+                let _ = writeln!(w);
+            }
+        }
+    }
     /// Queue one client job on `ring` (see `amdgpu_navi22_submit`'s media
     /// section). JPEG IBs arrive as validated copies (`copies`, one per IB),
     /// written to a kernel slot and fetched at VMID 0; VCN IBs run from the
@@ -3099,6 +3323,10 @@ impl<I: Io> Engine<I> {
         let frame = submit::MediaFrame {
             ring,
             hub: client.hub,
+            // HDP 5.0's bank, which Layout bounds inside the sub-4 GiB
+            // register BAR. Raphael's HDP 5.2.1 has none: an APU skips
+            // amdgpu_device_{flush,invalidate}_hdp.
+            hdp: self.hw.layout.hdp.map(|hdp| (hdp.get() / 4) as u32),
             engine,
             flush: vm.flush.then_some(vm),
             pasid_map: (vm.flush && vm.map_pasid).then_some((
@@ -3138,6 +3366,8 @@ impl<I: Io> Engine<I> {
             r.seq = seq.wrapping_sub(1);
         }
         result?;
+        // drm_sched arms the ring's job timeout at job start.
+        crate::amdgpu_navi22_tdr::job_emitted();
         Ok(seq)
     }
 }
@@ -3240,6 +3470,27 @@ impl Media {
     /// (last completed, throttle) sequences of client ring `ring`.
     pub fn client_fences(&mut self, ring: MediaRing) -> Result<(u32, u32), Error> {
         self.engine.client_fences(ring)
+    }
+    /// Job-timeout samples of the rings clients submit to
+    /// (`Engine::client_progress`).
+    pub(crate) fn client_progress(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
+        let rings = self.client_rings();
+        self.engine.client_progress(rings)
+    }
+    /// See `Engine::report_client_timeout`.
+    pub(crate) fn report_client_timeout(&mut self, ring: MediaRing, seq: u32) {
+        self.engine.report_client_timeout(ring, seq);
+    }
+    /// The per-queue reset of VCN instance `i` (`Engine::reset_instance`).
+    pub(crate) async fn reset_engine(
+        &mut self,
+        control: &mut impl idle::Control,
+        i: usize,
+        cancel: impl FnOnce(&[idle::Cancelled]),
+    ) -> Result<(), Error> {
+        self.engine.reset_instance(control, i, cancel).await
     }
 }
 

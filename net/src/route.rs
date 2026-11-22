@@ -349,6 +349,42 @@ pub fn route_lookup_in(net_ns_id: u64, dst: Ipv4Addr) -> Option<RouteResult> {
     })
 }
 
+/// `ip_route_output_key_hash_rcu` with `flowi4_oif` set (SO_BINDTODEVICE,
+/// IP_UNICAST_IF, an IP_PKTINFO ifindex): `fib_lookup` takes only a route
+/// whose nexthop device is `oif` (`fib_lookup_good_nhc`: `flp->flowi4_oif !=
+/// nhc->nhc_oif` → skip). With no such route the destination is taken as
+/// on-link through `oif` ("Apparently, routing tables are wrong. Assume,
+/// that the destination is on link."), sourced from the device's first
+/// address (`inet_select_addr(dev_out, 0, RT_SCOPE_LINK)`).
+pub fn route_lookup_oif_in(net_ns_id: u64, dst: Ipv4Addr, oif: &str) -> RouteResult {
+    let route = ROUTE_TABLE
+        .lock()
+        .iter()
+        .find(|r| r.net_ns_id == net_ns_id && r.iface == oif && r.dst.contains(dst))
+        .cloned();
+    match route {
+        Some(route) => {
+            let nexthop = route.gateway.unwrap_or(dst);
+            let src = choose_src(&route, nexthop, dst);
+            RouteResult {
+                iface: route.iface,
+                nexthop,
+                src,
+                gateway: route.gateway,
+            }
+        }
+        None => RouteResult {
+            iface: String::from(oif),
+            nexthop: dst,
+            src: iface_addrs(oif)
+                .first()
+                .map(|ia| ia.addr)
+                .unwrap_or(Ipv4Addr::UNSPECIFIED),
+            gateway: None,
+        },
+    }
+}
+
 /// Source-address selection function — exported so `tcp_stack` and
 /// `udp_sock` can call it directly without repeating the lookup.
 ///
@@ -400,6 +436,11 @@ fn connected_route_placement(iface_name: &str) -> (u8, Scope) {
 
 /// Remove the connected route that was auto-installed for `addr/prefix_len`.
 /// Called by `ifaddr::iface_del_addr`.
+///
+/// `fib_del_ifaddr` removes the kernel's own prefix route only — metric 0,
+/// RTPROT_KERNEL — so a route to the same prefix that another owner
+/// installed (NetworkManager's, at the device metric) survives, and an
+/// address added with IFA_F_NOPREFIXROUTE removes nothing.
 pub fn remove_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) {
     let mask = prefix_to_mask(prefix_len);
     let net_addr = Ipv4Addr::from_u32(addr.to_u32() & mask);
@@ -407,7 +448,18 @@ pub fn remove_connected_route(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) 
         addr: net_addr,
         prefix_len,
     };
-    route_delete(dst, iface_name, connected_route_placement(iface_name).0);
+    let net_ns_id = crate::iface::lookup(iface_name).map_or(0, |iface| iface.net_ns_id);
+    let _ = route_delete_matching_in(
+        net_ns_id,
+        dst,
+        connected_route_placement(iface_name).0,
+        RouteMatch {
+            iface: Some(iface_name),
+            metric: Some(0),
+            gateway: None,
+            protocol: RTPROT_KERNEL,
+        },
+    );
 }
 
 /// Install the loopback route (127.0.0.0/8 → "lo"). Must be called at

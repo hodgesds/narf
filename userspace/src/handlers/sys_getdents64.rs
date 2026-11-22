@@ -49,11 +49,60 @@ fn enumerate_batch(
     }
 }
 
+/// Directory positions `dir_emit_dots` gives `.` and `..`; the filesystem's
+/// own entries start after them.
+const DOT_ENTRIES: usize = 2;
+
+/// `d_ino` of `.` and `..` for the directory open as `ops`, opened on the
+/// host path `path` (`None` for a directory reached without one).
+///
+/// `dir_emit_dots` reports `file_inode(file)->i_ino` for `.` and
+/// `parent_ino(dentry)` — the inode of `d_parent` — for `..`. A filesystem
+/// root's dentry is its own parent, so at a mount of a filesystem's root `..`
+/// is the directory itself; at a bind of a subdirectory it is the directory
+/// above that in the filesystem (`FsInstance::root_parent_ino`); anywhere
+/// else it is the directory above it, which is in the same filesystem. Filesystems whose on-disk format holds the two
+/// entries (ext2, a FAT subdirectory) report the same numbers. A directory
+/// with no inode number of its own keeps the position placeholder the other
+/// records use, so `d_ino` is never the 0 glibc's readdir skips.
+fn dot_inos(
+    ops: &alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+    path: Option<&str>,
+) -> (u64, u64) {
+    let own = match ops.ino() {
+        0 => 1,
+        ino => ino,
+    };
+    let parent = path.and_then(|path| {
+        let mount_root = current_covering_mount_info(path).is_some_and(|(mount, _)| mount == path);
+        if path == "/" || mount_root {
+            // A mount root's parent is inside its filesystem: none for the
+            // filesystem's own root, the bound directory's parent for a bind.
+            let fs = current_fs_arc_at(path)?;
+            return poll_blocking(fs.root_parent_ino()).and_then(Result::ok);
+        }
+        let parent = match path.trim_end_matches('/').rsplit_once('/') {
+            Some(("", _)) => "/",
+            Some((parent, _)) => parent,
+            None => return None,
+        };
+        stat_ino_path_dir_aware(parent).ok().map(|stat| stat.1)
+    });
+    (own, parent.filter(|ino| *ino != 0).unwrap_or(own))
+}
+
 /// Shared native implementation for x86_64 getdents and both architectures'
 /// getdents64. Linux resolves the fd before touching the output buffer, faults
 /// only when an entry is actually emitted, returns EINVAL when the first
 /// pending record cannot fit, and preserves partial progress after a later
 /// copy fault.
+///
+/// Every directory starts with `.` and `..` at positions 0 and 1, as
+/// `dir_emit_dots` emits them for dcache_readdir, btrfs, procfs, kernfs and
+/// the FAT root, and as ext2 and FAT subdirectories hold them on disk. They
+/// are produced here, once for every filesystem; the filesystem's entries
+/// follow at position 2 onwards, and any `.` or `..` a filesystem lists
+/// itself is passed over so it is never reported twice.
 pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -75,10 +124,14 @@ pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
         {
             return None;
         }
-        Some((entry.ops.clone(), table.offset(fd)?))
+        let name = table
+            .description(fd)
+            .and_then(|description| description.name())
+            .filter(|name| !name.deleted);
+        Some((entry.ops.clone(), table.offset(fd)?, name))
     })
     .flatten();
-    let Some((ops, offset)) = entry else {
+    let Some((ops, offset, name)) = entry else {
         ctx.set_return(fail(EBADF));
         return;
     };
@@ -96,18 +149,51 @@ pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
     let batch_max = (out_len / MINIMUM_RECORD)
         .saturating_add(1)
         .clamp(1, SNAPSHOT_ENTRY_CAP);
-    let snapshot = match enumerate_batch(&dir, cursor, batch_max) {
+    // Room for a `.` and `..` the filesystem lists itself, which are passed
+    // over below, so they never stand in for an entry that would fit.
+    let fs_batch = batch_max.saturating_add(DOT_ENTRIES);
+    let snapshot = match enumerate_batch(&dir, cursor.saturating_sub(DOT_ENTRIES), fs_batch) {
         Ok(snapshot) => snapshot,
         Err(errno) => {
             ctx.set_return(fail(errno));
             return;
         }
     };
+    let dots: &[&str] = match cursor {
+        0 => &[".", ".."],
+        1 => &[".."],
+        _ => &[],
+    };
+    let (dot_ino, dotdot_ino) = if dots.is_empty() {
+        (0, 0)
+    } else {
+        dot_inos(&ops, name.as_ref().map(|name| &*name.path))
+    };
+    let mut pending = alloc::vec::Vec::new();
+    if pending.try_reserve_exact(dots.len() + snapshot.len()).is_err() {
+        ctx.set_return(fail(ENOMEM));
+        return;
+    }
+    for dot in dots {
+        pending.push((
+            alloc::string::String::from(*dot),
+            narf_filesystem::FileType::Dir,
+            true,
+        ));
+    }
+    for (name, ftype) in snapshot {
+        pending.push((name, ftype, false));
+    }
 
     let mut written = 0usize;
     let mut terminal_error = None;
     let mut record = alloc::vec::Vec::new();
-    for (name, ftype) in snapshot {
+    for (name, ftype, is_dot) in pending {
+        if !is_dot && (name == "." || name == "..") {
+            // Emitted above, at positions 0 and 1.
+            cursor = cursor.saturating_add(1);
+            continue;
+        }
         let name = name.as_bytes();
         // Linux verify_dirent_name(): an empty, slash-containing, or
         // PATH_MAX-sized component indicates a corrupt filesystem record.
@@ -146,10 +232,14 @@ pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
         record.resize(reclen, 0);
         // `filldir64`: `d_ino` is the entry's inode number. A directory that
         // cannot name it without a lookup keeps the cursor placeholder.
-        let d_ino = core::str::from_utf8(name)
-            .ok()
-            .and_then(|name| dir.entry_ino(name))
-            .unwrap_or(next_cursor as u64);
+        let d_ino = match (is_dot, name) {
+            (true, b".") => dot_ino,
+            (true, _) => dotdot_ino,
+            (false, _) => core::str::from_utf8(name)
+                .ok()
+                .and_then(|name| dir.entry_ino(name))
+                .unwrap_or(next_cursor as u64),
+        };
         record[..8].copy_from_slice(&d_ino.to_ne_bytes());
         record[8..16].copy_from_slice(&(next_cursor as u64).to_ne_bytes());
         record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());

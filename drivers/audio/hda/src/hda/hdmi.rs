@@ -586,14 +586,13 @@ pub(crate) fn spdif_status(val: u16) -> u32 {
     sbits
 }
 
-/// The HDMI playback PCM's digital-output and channel-map state (Linux
-/// keeps it in hda_spdif_out and hdmi_spec_per_pin). One native PCM
-/// mirrors to every routed port, so this is shared by all of them.
+/// One HDMI PCM's digital-output and channel-map state (Linux keeps it in
+/// the PCM's hda_spdif_out and its pin's hdmi_spec_per_pin).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Playback {
     /// IEC958 channel status, AES0..AES3 ("IEC958 Playback Default").
     pub status: u32,
-    /// DIG1 (low byte, with DIGEN) and DIG2 every port's converter carries.
+    /// DIG1 (low byte, with DIGEN) and DIG2 for the PCM's converter.
     pub ctls: u16,
     /// The non-audio bit as of the last hw_params/prepare (per_pin->non_pcm):
     /// IEC 61937 data in place of LPCM.
@@ -651,11 +650,17 @@ impl IntelHda {
             .collect()
     }
 
-    /// The PCM's digital state from the first port's converter
-    /// (snd_hda_create_dig_out_ctls reads GET_DIGI_CONVERT_1).
-    pub(super) fn initial_hdmi_playback(&self) -> Result<Playback, HdaError> {
-        let Some(port) = self.hdmi.lock().first().map(|p| p.output) else {
-            return Ok(Playback::from_converter(0));
+    /// Every HDMI PCM's digital state, from the first port's converter
+    /// (generic_hdmi_build_controls passes cvt_nids[0] to
+    /// snd_hda_create_dig_out_ctls for each PCM, which reads
+    /// GET_DIGI_CONVERT_1).
+    pub(super) fn initial_hdmi_playback(&self) -> Result<Vec<Playback>, HdaError> {
+        let (first, ports) = {
+            let ports = self.hdmi.lock();
+            (ports.first().map(|p| p.output), ports.len())
+        };
+        let Some(port) = first else {
+            return Ok(Vec::new());
         };
         let path = &self.outputs[port];
         let dig = self.verb(
@@ -663,7 +668,44 @@ impl IntelHda {
             path.nodes.converter_nid,
             0xf0d << 8,
         )?;
-        Ok(Playback::from_converter(dig as u16))
+        Ok(alloc::vec![Playback::from_converter(dig as u16); ports])
+    }
+
+    /// The HDMI PCM an output path's pin is bound to (static PCM mapping).
+    pub(super) fn hdmi_pcm_of_output(&self, output: usize) -> Option<usize> {
+        self.hdmi.lock().iter().position(|p| p.output == output)
+    }
+
+    /// The open playback PCM, when it is an HDMI one.
+    fn open_hdmi_pcm(&self) -> Option<usize> {
+        match *self.active_pcm.lock() {
+            Some(PcmSlot::Hdmi(pcm)) => Some(pcm),
+            _ => None,
+        }
+    }
+
+    /// One HDMI PCM's digital-output and channel-map state.
+    pub(super) fn hdmi_state(&self, pcm: usize) -> Playback {
+        self.hdmi_playback
+            .lock()
+            .get(pcm)
+            .copied()
+            .unwrap_or(Playback::from_converter(0))
+    }
+
+    pub(super) fn update_hdmi_state(&self, pcm: usize, update: impl FnOnce(&mut Playback)) {
+        if let Some(state) = self.hdmi_playback.lock().get_mut(pcm) {
+            update(state);
+        }
+    }
+
+    /// The stream's IEC 61937 flag: the open HDMI PCM's, or any PCM's for a
+    /// stream opened outside one.
+    pub(super) fn stream_non_pcm(&self) -> bool {
+        match self.open_hdmi_pcm() {
+            Some(pcm) => self.hdmi_state(pcm).non_pcm,
+            None => self.hdmi_playback.lock().iter().any(|s| s.non_pcm),
+        }
     }
 
     /// `get_eld_ati`: build an ELD from the codec's copy of what the display
@@ -783,6 +825,80 @@ impl IntelHda {
         Ok(changed)
     }
 
+    /// The card's playback PCMs (Linux `snd_hda_hdmi_generic_build_pcms`
+    /// with atihdmi's `static_pcm_mapping`): an analog PCM at device 0 when
+    /// the controller has analog outputs, then one PCM per HDMI pin, pin i on
+    /// PCM i, at `hdmi_pcm_device(i)`. A controller without HDMI pins keeps
+    /// its single PCM at device 0 over every output.
+    pub(super) fn pcm_layout(&self) -> Vec<(u32, PcmSlot)> {
+        let ports = self.hdmi.lock().len();
+        if ports == 0 {
+            return alloc::vec![(0, PcmSlot::All)];
+        }
+        let mut layout = Vec::new();
+        if !self.analog_outputs().is_empty() {
+            layout.push((0, PcmSlot::Analog));
+        }
+        for pcm in 0..ports {
+            layout.push((hdmi_pcm_device(pcm), PcmSlot::Hdmi(pcm)));
+        }
+        layout
+    }
+
+    /// The playback PCM at ALSA device `device`.
+    pub(super) fn pcm_slot(&self, device: u32) -> Option<PcmSlot> {
+        self.pcm_layout()
+            .into_iter()
+            .find(|(d, _)| *d == device)
+            .map(|(_, slot)| slot)
+    }
+
+    /// Output paths no HDMI pin owns.
+    pub(super) fn analog_outputs(&self) -> Vec<usize> {
+        let ports = self.hdmi.lock();
+        (0..self.outputs.len())
+            .filter(|o| !ports.iter().any(|p| p.output == *o))
+            .collect()
+    }
+
+    /// The outputs the open playback PCM drives: its pin for an HDMI PCM,
+    /// the analog outputs for the analog one, and the routed outputs for a
+    /// controller without HDMI pins or a stream opened outside a PCM.
+    pub(super) fn pcm_outputs(&self) -> Vec<usize> {
+        let slot = *self.active_pcm.lock();
+        match slot {
+            Some(PcmSlot::Hdmi(port)) => self
+                .hdmi
+                .lock()
+                .get(port)
+                .map(|p| alloc::vec![p.output])
+                .unwrap_or_default(),
+            Some(PcmSlot::Analog) => self.analog_outputs(),
+            Some(PcmSlot::All) | None => self.routed_outputs(),
+        }
+    }
+
+    /// One HDMI PCM's jack and ELD: its pin's codec sink, or the display
+    /// overlay for the pin that carries it (`hdmi_jack`).
+    pub(super) fn hdmi_port_jack(&self, port: usize) -> (bool, Vec<u8>) {
+        let (primary, own) = {
+            let ports = self.hdmi.lock();
+            let primary = ports
+                .iter()
+                .position(|p| p.present && p.sink.is_some())
+                .unwrap_or(0);
+            let own = ports
+                .get(port)
+                .and_then(|p| p.sink.as_ref().filter(|_| p.present))
+                .map(|sink| sink.eld.clone());
+            (primary, own)
+        };
+        if port == primary {
+            return self.hdmi_jack();
+        }
+        own.map_or((false, Vec::new()), |eld| (true, eld))
+    }
+
     /// Output paths a PCM routes to: every port with a monitor whose ELD
     /// reads valid. With none, every path, as Linux's static PCM mapping
     /// keeps a pin attached before the display side publishes an ELD.
@@ -812,28 +928,47 @@ impl IntelHda {
             .and_then(|p| p.sink.clone())
     }
 
-    /// Playback limits across the sinks playback currently reaches
-    /// (`snd_hdmi_eld_update_pcm_info` per pin, intersected because one
-    /// native PCM mirrors to every routed port): channel ceiling, whether
-    /// S32_LE is allowed and the CEA rate bits. Without any ELD: the ATI
+    /// Playback limits of one PCM (`snd_hdmi_eld_update_pcm_info` per
+    /// pin): channel ceiling, whether S32_LE is allowed and the CEA rate
+    /// bits. An HDMI PCM is bound to one pin (static PCM mapping): only that
+    /// pin's sink limits it; the analog PCM has no HDMI limits; `None` (no
+    /// PCM named) intersects every port. Without any ELD: the ATI
     /// converter's own 8 / S32 / every rate (atihdmi_probe's
-    /// SUPPORTED_RATES). The display overlay (`display_sink`) joins
-    /// the intersection when selected, so a display publication gates
-    /// formats even where the codec verbs report no ELD; per-port
-    /// routing stays codec-driven (see `display_sink`).
-    pub(super) fn hdmi_limits(&self) -> Option<(u8, bool, u8)> {
-        let codec_sinks: Vec<Sink> = {
+    /// SUPPORTED_RATES). The display overlay (`display_sink`) joins for the
+    /// primary port, so a display publication gates formats even where the
+    /// codec verbs report no ELD; per-port routing stays codec-driven (see
+    /// `display_sink`).
+    pub(super) fn hdmi_limits_for(&self, slot: Option<PcmSlot>) -> Option<(u8, bool, u8)> {
+        if slot == Some(PcmSlot::Analog) {
+            return None;
+        }
+        let primary_only = match slot {
+            Some(PcmSlot::Hdmi(port)) => Some(port),
+            _ => None,
+        };
+        let (codec_sinks, primary): (Vec<Sink>, usize) = {
             let ports = self.hdmi.lock();
             if ports.is_empty() {
                 return None;
             }
-            ports
+            let primary = ports
                 .iter()
-                .filter_map(|p| p.sink.as_ref().filter(|_| p.present))
+                .position(|p| p.present && p.sink.is_some())
+                .unwrap_or(0);
+            let sinks = ports
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| primary_only.is_none_or(|port| port == *index))
+                .filter_map(|(_, p)| p.sink.as_ref().filter(|_| p.present))
                 .cloned()
-                .collect()
+                .collect();
+            (sinks, primary)
         };
-        let display = self.display_sink();
+        let display = if primary_only.is_none_or(|port| port == primary) {
+            self.display_sink()
+        } else {
+            None
+        };
         Some(codec_sinks.iter().chain(display.iter()).fold(
             (8, true, 0x7f),
             |(channels, s32, rates), sink| {
@@ -849,7 +984,12 @@ impl IntelHda {
     /// Playback rates on a GPU codec: the sinks' common SAD rates the
     /// sound core can name (no 32 kHz), 48 kHz when they share none.
     pub(super) fn playback_rates(&self) -> Vec<SampleRate> {
-        let Some((_, _, rates)) = self.hdmi_limits() else {
+        self.playback_rates_for(*self.active_pcm.lock())
+    }
+
+    /// [`Self::playback_rates`] of one PCM.
+    pub(super) fn playback_rates_for(&self, slot: Option<PcmSlot>) -> Vec<SampleRate> {
+        let Some((_, _, rates)) = self.hdmi_limits_for(slot) else {
             return alloc::vec![SampleRate::R48000];
         };
         let rates: Vec<SampleRate> = [
@@ -945,17 +1085,23 @@ impl IntelHda {
             .any(|p| !hda_codec::ati_hdmi_rev3(&self.graphs[self.outputs[p.output].codec]))
     }
 
-    /// `set_dig_out_convert` on every HDMI converter: DIG1 and, with
-    /// `dig2`, DIG2.
-    fn write_spdif_ctls(&self, ctls: u16, dig2: bool) -> Result<(), HdaError> {
-        let outputs: Vec<usize> = self.hdmi.lock().iter().map(|p| p.output).collect();
-        for output in outputs {
-            let path = &self.outputs[output];
-            let (cad, cvt) = (self.graphs[path.codec].addr, path.nodes.converter_nid);
-            self.verb(cad, cvt, (SET_DIGI_CONVERT_1 << 8) | u32::from(ctls & 0xff))?;
-            if dig2 {
-                self.verb(cad, cvt, (SET_DIGI_CONVERT_2 << 8) | u32::from(ctls >> 8))?;
-            }
+    /// `set_dig_out_convert` on the converter HDMI PCM `pcm` is assigned
+    /// to: DIG1 and, with `dig2`, DIG2. A PCM is assigned to its pin's
+    /// converter while it is open (snd_hda_spdif_ctls_assign at
+    /// hdmi_pcm_open, unassign at close); a closed PCM's state waits for
+    /// its next prepare.
+    fn write_spdif_ctls(&self, pcm: usize, ctls: u16, dig2: bool) -> Result<(), HdaError> {
+        if self.open_hdmi_pcm() != Some(pcm) {
+            return Ok(());
+        }
+        let Some(output) = self.hdmi.lock().get(pcm).map(|p| p.output) else {
+            return Ok(());
+        };
+        let path = &self.outputs[output];
+        let (cad, cvt) = (self.graphs[path.codec].addr, path.nodes.converter_nid);
+        self.verb(cad, cvt, (SET_DIGI_CONVERT_1 << 8) | u32::from(ctls & 0xff))?;
+        if dig2 {
+            self.verb(cad, cvt, (SET_DIGI_CONVERT_2 << 8) | u32::from(ctls >> 8))?;
         }
         Ok(())
     }
@@ -963,42 +1109,43 @@ impl IntelHda {
     /// `snd_hda_spdif_default_put`: new channel status; the converters
     /// take its DIG1/DIG2 when they change. The non-audio bit applies to
     /// the stream at its next hw_params or prepare.
-    pub(super) fn set_spdif_status(&self, status: [u8; 24]) -> Result<(), HdaError> {
+    pub(super) fn set_spdif_status(&self, pcm: usize, status: [u8; 24]) -> Result<(), HdaError> {
         let sbits = u32::from_le_bytes([status[0], status[1], status[2], status[3]]);
-        let old = self.hdmi_playback.lock().ctls;
+        let old = self.hdmi_state(pcm).ctls;
         let ctls = spdif_ctls(sbits) | (old & DIG1_ENABLE);
         // No codec command runs under the IRQ-safe state lock.
         if ctls != old {
-            self.write_spdif_ctls(ctls, true)?;
+            self.write_spdif_ctls(pcm, ctls, true)?;
         }
-        let mut pcm = self.hdmi_playback.lock();
-        pcm.status = sbits;
-        pcm.ctls = ctls;
+        self.update_hdmi_state(pcm, |state| {
+            state.status = sbits;
+            state.ctls = ctls;
+        });
         Ok(())
     }
 
-    /// `snd_hda_spdif_out_switch_put`: DIGEN on every HDMI converter.
-    pub(super) fn set_spdif_enable(&self, enable: bool) -> Result<(), HdaError> {
-        let old = self.hdmi_playback.lock().ctls;
+    /// `snd_hda_spdif_out_switch_put`: DIGEN in HDMI PCM `pcm`'s DIG1.
+    pub(super) fn set_spdif_enable(&self, pcm: usize, enable: bool) -> Result<(), HdaError> {
+        let old = self.hdmi_state(pcm).ctls;
         let ctls = (old & !DIG1_ENABLE) | if enable { DIG1_ENABLE } else { 0 };
         if ctls != old {
-            self.write_spdif_ctls(ctls, false)?;
+            self.write_spdif_ctls(pcm, ctls, false)?;
         }
-        self.hdmi_playback.lock().ctls = ctls;
+        self.update_hdmi_state(pcm, |state| state.ctls = ctls);
         Ok(())
     }
 
-    /// `hdmi_chmap_ctl_tlv` for the primary port's speakers, falling
-    /// back to the display overlay's speaker allocation when the
-    /// primary port has no codec sink (same rule as the jack/ELD
-    /// controls: the TLV must describe the sink the ELD control
-    /// exposes, not a stale stereo default).
-    pub(super) fn chmap_tlv(&self) -> Option<Vec<u32>> {
-        let spk_alloc = self
-            .hdmi_primary()
+    /// `hdmi_chmap_ctl_tlv` for HDMI PCM `pcm`'s pin's speakers; the
+    /// primary port without a codec sink falls back to the display
+    /// overlay's speaker allocation (same rule as the jack/ELD controls:
+    /// the TLV must describe the sink the ELD control exposes, not a stale
+    /// stereo default).
+    pub(super) fn chmap_tlv(&self, pcm: usize) -> Option<Vec<u32>> {
+        let output = self.hdmi.lock().get(pcm).map(|p| p.output);
+        let spk_alloc = output
             .and_then(|o| self.hdmi_sink(o))
             .map_or(0, |s| s.spk_alloc);
-        let spk_alloc = if spk_alloc == 0 {
+        let spk_alloc = if spk_alloc == 0 && output.is_some() && output == self.hdmi_primary() {
             self.display_sink().map_or(0, |s| s.spk_alloc)
         } else {
             spk_alloc
@@ -1006,11 +1153,12 @@ impl IntelHda {
         chmap_tlv(spk_alloc, self.hdmi_paired())
     }
 
-    /// `hdmi_chmap_ctl_put`. Ignored without an open stream (so a saved
-    /// state restores harmlessly), refused once the stream runs. A map no
-    /// CA carries, or (pre-rev3) one that splits a slot pair, is invalid.
-    /// With the stream prepared, every routed port takes it immediately.
-    pub(super) fn set_chmap(&self, values: &[i32]) -> Result<(), SoundError> {
+    /// `hdmi_chmap_ctl_put` for HDMI PCM `pcm`. Ignored without that PCM's
+    /// stream open (so a saved state restores harmlessly), refused once the
+    /// stream runs. A map no CA carries, or (pre-rev3) one that splits a
+    /// slot pair, is invalid. With the stream prepared, the PCM's port takes
+    /// it immediately.
+    pub(super) fn set_chmap(&self, pcm: usize, values: &[i32]) -> Result<(), SoundError> {
         if values.len() != 8
             || values
                 .iter()
@@ -1019,6 +1167,9 @@ impl IntelHda {
             return Err(SoundError::OutOfRange);
         }
         let map: [u8; 8] = core::array::from_fn(|i| values[i] as u8);
+        if self.open_hdmi_pcm() != Some(pcm) {
+            return Ok(());
+        }
         let (prepared, channels) = {
             let stream = self.streams[0].lock();
             let Some(prepared) = stream.chmap_state()? else {
@@ -1027,21 +1178,20 @@ impl IntelHda {
             let channels = stream.ring.as_ref().map(|r| r.params.channels.count());
             (prepared, channels)
         };
-        if self.hdmi_playback.lock().chmap == map {
+        if self.hdmi_state(pcm).chmap == map {
             return Ok(());
         }
         let ca = manual_allocation(8, &map).ok_or(SoundError::OutOfRange)?;
         if self.hdmi_paired() && !paired_chmap_valid(ca, &map) {
             return Err(SoundError::OutOfRange);
         }
-        let pcm = {
-            let mut pcm = self.hdmi_playback.lock();
-            pcm.chmap = map;
-            pcm.chmap_set = true;
-            *pcm
-        };
+        self.update_hdmi_state(pcm, |state| {
+            state.chmap = map;
+            state.chmap_set = true;
+        });
+        let pcm = self.hdmi_state(pcm);
         if let (true, Some(channels)) = (prepared, channels) {
-            for output in self.routed_outputs() {
+            for output in self.pcm_outputs() {
                 let path = &self.outputs[output];
                 let graph = &self.graphs[path.codec];
                 if !hda_codec::is_ati_hdmi(graph) {
@@ -1055,24 +1205,38 @@ impl IntelHda {
         Ok(())
     }
 
-    /// hdmi_pcm_close: the user map lasts as long as the stream is open.
-    pub(super) fn reset_chmap(&self) {
-        let mut pcm = self.hdmi_playback.lock();
-        pcm.chmap = [0; 8];
-        pcm.chmap_set = false;
+    /// hdmi_pcm_close (hdmi_pcm_reset_pin): the pin's map lasts as long
+    /// as its PCM is open.
+    pub(super) fn reset_chmap(&self, pcm: usize) {
+        self.update_hdmi_state(pcm, |state| {
+            state.chmap = [0; 8];
+            state.chmap_set = false;
+        });
     }
 
-    /// Latch the non-audio bit for the stream being set up.
+    /// Latch the non-audio bit for the stream being set up: the open HDMI
+    /// PCM's, or every PCM's for a stream opened outside one.
     pub(super) fn latch_non_pcm(&self) {
-        let mut pcm = self.hdmi_playback.lock();
-        pcm.non_pcm = pcm.nonaudio();
+        let open = self.open_hdmi_pcm();
+        for (index, state) in self.hdmi_playback.lock().iter_mut().enumerate() {
+            if open.is_none_or(|pcm| pcm == index) {
+                state.non_pcm = state.nonaudio();
+            }
+        }
     }
 
     /// Channel counts playback offers: stereo, plus the even surround
     /// layouts up to the HDMI ceiling on a GPU codec (ATI converters take
     /// eight channels whatever they advertise; Linux atihdmi_probe).
     pub(super) fn playback_channels(&self) -> Vec<ChannelCount> {
-        let max = self.hdmi_limits().map_or(2, |(channels, _, _)| channels);
+        self.playback_channels_for(*self.active_pcm.lock())
+    }
+
+    /// [`Self::playback_channels`] of one PCM.
+    pub(super) fn playback_channels_for(&self, slot: Option<PcmSlot>) -> Vec<ChannelCount> {
+        let max = self
+            .hdmi_limits_for(slot)
+            .map_or(2, |(channels, _, _)| channels);
         [
             ChannelCount::Stereo,
             ChannelCount::Quad,
@@ -1104,6 +1268,9 @@ impl IntelHda {
     /// re-set-up each port that just gained a valid ELD (Linux update_eld's
     /// `eld_valid && !old_eld_valid && per_pin->setup`).
     pub(super) fn refresh_hdmi(&self, reconfigure: bool) -> Result<(), HdaError> {
+        // The async commands below never wake a parked controller; a
+        // synchronous caller does, as `snd_hda_power_up_pm` would.
+        self.ensure_active()?;
         narf_scheduler::block_on_spin(self.refresh_hdmi_async(reconfigure))
     }
     /// [`Self::refresh_hdmi`] whose commands sleep on the response.
@@ -1118,13 +1285,11 @@ impl IntelHda {
         }
         let card = self.card.load(Ordering::Acquire);
         if card != u32::MAX {
-            for kind in [ControlKind::HdmiJack, ControlKind::Eld] {
-                if let Some(id) = self
-                    .mixer_controls()
-                    .into_iter()
-                    .find(|id: &ControlId| id.kind == kind)
-                {
-                    narf_drivers_sound::control_changed(card, id);
+            // The jack and ELD of each changed pin's PCM (Linux
+            // update_eld notifies the PCM's own controls).
+            for &index in &changed {
+                for kind in [ControlKind::HdmiJack, ControlKind::Eld] {
+                    narf_drivers_sound::control_changed(card, hdmi_pcm_control(index, kind));
                 }
             }
         }
@@ -1132,6 +1297,7 @@ impl IntelHda {
             return Ok(());
         }
         let params = self.streams[0].lock().ring.as_ref().map(|ring| ring.params);
+        let active = self.pcm_outputs();
         if let Some(params) = params {
             for index in changed {
                 let (output, gained) = {
@@ -1139,11 +1305,71 @@ impl IntelHda {
                     let port = &ports[index];
                     (port.output, port.sink.is_some() && !before[index])
                 };
-                if gained {
+                if gained && active.contains(&output) {
                     self.configure_path(&self.outputs[output], output, false, params)?;
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Linux `get_empty_pcm_device` for `HDA_PCM_TYPE_HDMI` with
+/// CONFIG_SND_DYNAMIC_MINORS: 3, 7, 8, 9, then 10, 11, ...
+pub(super) fn hdmi_pcm_device(pcm: usize) -> u32 {
+    match pcm {
+        0 => 3,
+        1 => 7,
+        2 => 8,
+        3 => 9,
+        pcm => 10 + (pcm as u32 - 4),
+    }
+}
+
+/// The NARF control index of an HDMI PCM's control: PCM 0 keeps the
+/// card's original indices (jack 3, ELD 4, IEC958 5..8, channel map 9);
+/// PCM i > 0 takes the block at 32 + 8 (i - 1), in the same order.
+pub(super) fn hdmi_pcm_control_index(pcm: usize, kind: ControlKind) -> u32 {
+    let offset = match kind {
+        ControlKind::HdmiJack => 0,
+        ControlKind::Eld => 1,
+        ControlKind::Iec958ConMask => 2,
+        ControlKind::Iec958ProMask => 3,
+        ControlKind::Iec958Default => 4,
+        ControlKind::Iec958Switch => 5,
+        _ => 6,
+    };
+    if pcm == 0 {
+        3 + offset
+    } else {
+        32 + 8 * (pcm as u32 - 1) + offset
+    }
+}
+
+/// [`hdmi_pcm_control_index`] as a control id.
+pub(super) fn hdmi_pcm_control(pcm: usize, kind: ControlKind) -> ControlId {
+    ControlId {
+        index: hdmi_pcm_control_index(pcm, kind),
+        kind,
+    }
+}
+
+/// The HDMI PCM a control index belongs to.
+pub(super) fn hdmi_pcm_of(index: u32) -> usize {
+    if index < 32 {
+        0
+    } else {
+        ((index - 32) / 8 + 1) as usize
+    }
+}
+
+/// What a playback PCM drives.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum PcmSlot {
+    /// Every output (a controller without HDMI pins).
+    All,
+    /// The analog outputs of a controller that also has HDMI pins.
+    Analog,
+    /// One HDMI pin (the index into the controller's HDMI ports).
+    Hdmi(usize),
 }

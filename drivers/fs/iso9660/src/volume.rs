@@ -408,6 +408,25 @@ impl<B: BlockDevice + 'static> FsInstance for Iso9660Volume<B> {
     fn name(&self) -> &str {
         "iso9660"
     }
+
+    /// `isofs_statfs`: `f_bsize` is the logical block (the zone size the
+    /// superblock is set to), `f_blocks` the volume space size in those
+    /// blocks, no free space or inode count, `f_namelen = NAME_MAX`.
+    fn statfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsStat> {
+        alloc::boxed::Box::pin(async move {
+            let block_size = u32::from(self.pvd.logical_block_size_le());
+            Ok(narf_filesystem::FsStat {
+                blocks: u64::from(self.pvd.volume_space_size_le()),
+                blocks_free: 0,
+                blocks_available: 0,
+                files: 0,
+                files_free: 0,
+                block_size,
+                name_len: 255,
+                fragment_size: block_size,
+            })
+        })
+    }
 }
 
 // ── Helpers reachable to siblings (`node.rs`, tests) ───────────────

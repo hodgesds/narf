@@ -45,6 +45,10 @@ pub mod linux_compat;
 
 pub mod anon_reclaim;
 pub(crate) mod bpf_iter;
+/// IA-32 (i386) system calls: the `int 0x80` dispatch hook, TLS and the
+/// i386 table.
+#[cfg(target_arch = "x86_64")]
+pub mod compat32;
 pub mod coredump;
 pub mod elf;
 pub mod ephemeral_port;
@@ -142,6 +146,7 @@ mod abi_coherence_9p_tests;
 mod abi_coherence_btrfs_tests;
 mod abi_coherence_exfat_tests;
 mod abi_coherence_minix_tests;
+mod abi_compat32_tests;
 mod abi_creds_tests;
 mod abi_device_mmap_tests;
 mod abi_drm_prime_tests;
@@ -163,6 +168,9 @@ mod abi_lookup_error_tests;
 mod abi_mem2_tests;
 mod abi_mem_tests;
 mod abi_misc_tests;
+// Network namespaces exist only in `--features container` builds.
+#[cfg(feature = "container")]
+mod abi_netns_lo_tests;
 mod abi_packet_tests;
 mod abi_pacman_tests;
 mod abi_path_tests;
@@ -228,6 +236,9 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     // SysV attachments belong to the mm as well: Linux `exit_mmap` closes
     // whatever shm mappings are left when it is torn down.
     handlers::drop_address_space_shm(address_space_id);
+    // An IA-32 image's `start_brk` and exec personality are mm state too.
+    #[cfg(target_arch = "x86_64")]
+    compat32::mm::drop_mm(address_space_id);
 }
 
 /// Clone file/device VMA ownership while memory still holds the parent's fork
@@ -235,6 +246,10 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
 /// or its partially-built address space is dropped.
 pub fn fork_mapped_file_address_space(parent_id: u64, child_id: u64) {
     mapped_file::fork_address_space(parent_id, child_id);
+    // `dup_mm` copies `start_brk` with the rest of the mm; the child's heap
+    // must keep growing from where the parent's does.
+    #[cfg(target_arch = "x86_64")]
+    compat32::mm::fork(parent_id, child_id);
 }
 
 /// Filesystem truncation bridge installed during common boot init.
@@ -267,16 +282,17 @@ pub use loader::{
 };
 pub use process::{
     init_sysv_stack, load_user_process, load_user_process_with, load_user_process_with_root,
-    load_user_process_with_root_file, ProcessLoadError, SysVStackError, UserProcess,
+    load_user_process_with_root_file, ProcessLoadError, SysVStackError, UserProcess, UserSegments,
     DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES, DEFAULT_USER_STACK_RESERVED,
     DEFAULT_USER_STACK_TOP,
 };
 pub use syscall::{
     install_global, kernel_syscall_entry, kernel_syscall_entry_plain,
     kernel_syscall_entry_plain_with_state, syscall_number, syscall_pack, syscall_version,
-    FnHandler, RawFnHandler, RawSyscallHandler, SigDeliveryParams, Syscall, SyscallArgs,
-    SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable, TrapContext, SA_NODEFER, SA_ONSTACK,
-    SA_RESETHAND, SA_RESTART, SA_SIGINFO, SYS_NUMBER_MASK, SYS_VERSION_MASK, SYS_VERSION_SHIFT,
+    FnHandler, Ia32Abi, Ia32Flock, RawFnHandler, RawSyscallHandler, SigDeliveryParams, Syscall,
+    SyscallArgs, SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable, TrapContext,
+    SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SA_RESTART, SA_SIGINFO, SYS_NUMBER_MASK,
+    SYS_VERSION_MASK, SYS_VERSION_SHIFT,
 };
 pub use tls::{stage_tls, TlsError, TLS_REGION_BASE};
 pub use user_task::{
@@ -493,6 +509,26 @@ impl CapType for Process {
 pub enum ExecKind {
     Elf64Exec,
     Elf64Dyn,
+    /// ELFCLASS32 i386 `ET_EXEC`, run under the IA-32 compat ABI (x86_64).
+    Elf32Exec,
+    /// ELFCLASS32 i386 `ET_DYN`: a PIE program, or a loader such as
+    /// `ld-linux.so.2` run directly.
+    Elf32Dyn,
+}
+
+impl ExecKind {
+    /// `ET_DYN` of either class: the loader picks its base.
+    #[inline]
+    pub const fn is_dyn(self) -> bool {
+        matches!(self, ExecKind::Elf64Dyn | ExecKind::Elf32Dyn)
+    }
+
+    /// An i386 ELF32 image — one that runs under the IA-32 compat ABI with
+    /// a 32-bit address space (`TASK_SIZE_32`), not the native one.
+    #[inline]
+    pub const fn is_elf32(self) -> bool {
+        matches!(self, ExecKind::Elf32Exec | ExecKind::Elf32Dyn)
+    }
 }
 
 /// A single loadable segment in the final address space.
@@ -660,6 +696,12 @@ impl ExecImage {
             envp: Vec::new(),
             aux: Vec::new(),
         }
+    }
+
+    /// Does this image run under the IA-32 compat ABI (an i386 ELF32)?
+    #[inline]
+    pub const fn is_compat32(&self) -> bool {
+        self.kind.is_elf32()
     }
 }
 

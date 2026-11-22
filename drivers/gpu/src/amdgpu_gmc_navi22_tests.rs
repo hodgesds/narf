@@ -108,6 +108,7 @@ pub(super) fn fixture_hub(
         nbio: 0x30000,
         init: NbioInit::Smn { pcie: 0x40000 },
         hdp: Some(0x50000),
+        mmhub: (2, 1, 0),
     };
     let mut registers = BTreeMap::new();
     for (base, r) in layout.bases.into_iter().zip(layout.hubs) {

@@ -1219,9 +1219,11 @@ fn smoke_v6_proc_if_inet6_reflects_slaac() -> TestResult {
         return TestResult::Fail("/proc/net/if_inet6: scope byte != 0x00 (Global)");
     }
 
-    // Flags: 0x80 (Preferred / permanent) — as Linux sets IFA_F_PERMANENT.
-    if entry.flags & 0x80 == 0 {
-        return TestResult::Fail("/proc/net/if_inet6: Preferred flag not set");
+    // Flags: `(u8)ifp->flags`. A SLAAC address carries the RA's lifetimes,
+    // so it is not IFA_F_PERMANENT (0x80), and it is no longer
+    // IFA_F_TENTATIVE (0x40) once DAD passed.
+    if entry.flags & 0xc0 != 0 {
+        return TestResult::Fail("/proc/net/if_inet6: SLAAC addr flagged permanent/tentative");
     }
 
     // Verify the 32-hex-addr format would round-trip correctly.
@@ -1236,6 +1238,71 @@ fn smoke_v6_proc_if_inet6_reflects_slaac() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/ipv6_e2e", smoke_v6_proc_if_inet6_reflects_slaac);
+
+// ── /proc/net/if_inet6 columns are Linux's ──────────────────────────
+//
+// Linux ref: `if6_seq_show` (`net/ipv6/addrconf.c`) prints
+//   `ifp->idev->dev->ifindex` (the device's real ifindex),
+//   `ifp->scope` = `ipv6_addr_scope(addr)` = `__ipv6_addr_type(addr) &
+//   IPV6_ADDR_SCOPE_MASK` (LOOPBACK 0x10, LINKLOCAL 0x20, SITELOCAL 0x40;
+//   a ULA fc00::/7 is global, 0x00), and `(u8)ifp->flags`, the same
+//   IFA_F_* word RTM_NEWADDR carries: a SLAAC address with finite lifetimes
+//   is not IFA_F_PERMANENT. The loopback ::1 is listed on lo (ifindex 1).
+fn smoke_v6_if_inet6_reports_linux_scope_ifindex_and_flags() -> TestResult {
+    const IFACE: &str = "v6ifinet6-0";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x77];
+    reset_v6(IFACE, MAC);
+    let Some(ifindex) = iface::ifindex_of(IFACE) else {
+        return TestResult::Fail("test iface has no ifindex");
+    };
+    let mk = |addr: [u8; 16], scope, deadline: u64| addrs::Ipv6IfAddr {
+        iface: String::from(IFACE),
+        addr,
+        prefix_len: 64,
+        state: addrs::AddrState::Preferred,
+        scope,
+        preferred_deadline_ns: deadline,
+        valid_deadline_ns: deadline,
+        temporary: false,
+    };
+    let ll = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77];
+    let ula = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77];
+    let slaac = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77,
+    ];
+    addrs::add(mk(ll, addrs::AddrScope::LinkLocal, u64::MAX));
+    addrs::add(mk(ula, addrs::AddrScope::UniqueLocal, u64::MAX));
+    addrs::add(mk(slaac, addrs::AddrScope::Global, u64::MAX - 1));
+    let snap = addrs::snapshot();
+    let find = |a: [u8; 16]| snap.iter().find(|s| s.addr == a).cloned();
+    let (Some(l), Some(u), Some(s)) = (find(ll), find(ula), find(slaac)) else {
+        return TestResult::Fail("if_inet6 snapshot is missing an address");
+    };
+    if (l.ifindex, u.ifindex, s.ifindex) != (ifindex, ifindex, ifindex) {
+        return TestResult::Fail("if_inet6 ifindex is not the device's ifindex");
+    }
+    if l.scope != 0x20 || u.scope != 0x00 || s.scope != 0x00 {
+        return TestResult::Fail("if_inet6 scope is not ipv6_addr_scope()");
+    }
+    // IFA_F_PERMANENT (0x80) only for the addresses with no lifetime.
+    if l.flags != 0x80 || u.flags != 0x80 || s.flags != 0x00 {
+        return TestResult::Fail("if_inet6 flags are not (u8)ifa_flags");
+    }
+    let lo_line = snap
+        .iter()
+        .find(|e| e.iface == "lo" && e.addr == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    match lo_line {
+        Some(e) if e.ifindex == 1 && e.prefix_len == 128 && e.scope == 0x10 && e.flags == 0x80 => {
+            TestResult::Pass
+        }
+        Some(_) => TestResult::Fail("if_inet6 ::1 line has the wrong columns"),
+        None => TestResult::Fail("if_inet6 does not list ::1 on lo"),
+    }
+}
+kernel_test_in!(
+    "net/ipv6-ifinet6",
+    smoke_v6_if_inet6_reports_linux_scope_ifindex_and_flags
+);
 
 // ── Smoke 18: /proc/net/ipv6_route reflects default route ───────────
 //
@@ -2838,6 +2905,8 @@ fn smoke_v6_icmp6_dest_unreach_aborts_syn_sent() -> TestResult {
         iface: alloc::string::String::from(IFACE),
         metric: 100,
         valid_deadline_ns: 0,
+        protocol: crate::ipv6::route::RTPROT_KERNEL,
+        pref: crate::ipv6::route::PREF_MEDIUM,
     });
     ndp::neigh_upsert(ndp::Neigh {
         iface: alloc::string::String::from(IFACE),
@@ -2887,3 +2956,77 @@ fn smoke_v6_icmp6_dest_unreach_aborts_syn_sent() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_dest_unreach_aborts_syn_sent);
+
+/// NetworkManager sets a managed device's `accept_ra` to 0 and handles RAs
+/// itself: `ndisc_router_discovery` then takes no default router, route,
+/// prefix or address from them (`ipv6_accept_ra`), so only NetworkManager's
+/// routes remain. With `accept_ra` on and `autoconf` off the router and
+/// prefix routes are taken but no SLAAC address (`addrconf_prefix_rcv`
+/// needs `cnf.autoconf`); with both on the prefix is autoconfigured.
+fn smoke_v6_accept_ra_and_autoconf_gate_ra_processing() -> TestResult {
+    use narf_lib::sysctl::ipv6::{set_device, Key};
+    const IFACE: &str = "v6e2e-ara";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x46];
+    const ROUTER_MAC: [u8; 6] = [0x86, 0x43, 0x42, 0xa5, 0x25, 0x61];
+    const ROUTER: [u8; 16] = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x84, 0x43, 0x42, 0xff, 0xfe, 0xa5, 0x25, 0x61,
+    ];
+    const ALL_NODES: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const PREFIX: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0x46, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const FAR: [u8; 16] = [
+        0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+    ];
+
+    reset_v6(IFACE, MAC);
+    narf_lib::sysctl::ipv6::__reset_for_test();
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    let ra = build_ra_with_pio(0, 1800, PREFIX, 64, 2_592_000, 604_800);
+    let deliver = || {
+        let dst_mac = multicast_mac(&ALL_NODES);
+        let mut frame = build_icmpv6_frame(ROUTER_MAC, dst_mac, ROUTER, ALL_NODES, &ra);
+        crate::tcp_stack::rx_handler(IFACE, &mut frame);
+    };
+    let routed = || {
+        matches!(
+            crate::ipv6::route::lookup(&FAR, Some(IFACE)),
+            crate::ipv6::route::NextHop::Gateway { gateway, .. } if gateway == ROUTER
+        )
+    };
+    let addressed = || {
+        addrs::list_iface(IFACE)
+            .iter()
+            .any(|a| a.addr[..8] == PREFIX[..8])
+    };
+
+    set_device(IFACE, Key::AcceptRa, 0);
+    deliver();
+    let ignored = !routed() && !addressed() && ndp::routers().iter().all(|r| r.iface != IFACE);
+    set_device(IFACE, Key::AcceptRa, 1);
+    set_device(IFACE, Key::Autoconf, 0);
+    deliver();
+    let routed_only = routed() && !addressed();
+    set_device(IFACE, Key::Autoconf, 1);
+    deliver();
+    let autoconfigured = addressed();
+    narf_lib::sysctl::ipv6::__reset_for_test();
+    if !ignored {
+        return TestResult::Fail(
+            "an RA on a device with accept_ra=0 installed a router or address",
+        );
+    }
+    if !routed_only {
+        return TestResult::Fail("accept_ra=1 autoconf=0 did not take only the router and routes");
+    }
+    if !autoconfigured {
+        return TestResult::Fail("accept_ra=1 autoconf=1 did not autoconfigure the prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/ipv6-accept-ra",
+    smoke_v6_accept_ra_and_autoconf_gate_ra_processing
+);

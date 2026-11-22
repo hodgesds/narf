@@ -114,20 +114,27 @@ struct Ring {
     index: usize,
     pending: bool,
     base: u32,
+    /// Descriptors in the ring (`q->ndesc`).
+    depth: usize,
 }
 impl Ring {
     /// [`Self::allocate_for`] on a coherent device.
-    fn allocate(base: u32, rx: bool) -> Result<Self, Error> {
-        Self::allocate_for(&narf_io::DmaDevice::coherent(), base, rx)
+    fn allocate(base: u32, rx: bool, depth: usize) -> Result<Self, Error> {
+        Self::allocate_for(&narf_io::DmaDevice::coherent(), base, rx, depth)
     }
     /// Linux `mt76_dma_alloc_queue`: descriptors and per-slot frame buffers
     /// from `dma_alloc_coherent(dev, …)`. The device writes DONE bits into
     /// 16-byte descriptors that share cache lines, so a non-coherent device
     /// must get its reserved non-cacheable pool; without one this fails.
-    fn allocate_for(dma: &narf_io::DmaDevice, base: u32, rx: bool) -> Result<Self, Error> {
+    fn allocate_for(
+        dma: &narf_io::DmaDevice,
+        base: u32,
+        rx: bool,
+        depth: usize,
+    ) -> Result<Self, Error> {
         let descriptors = narf_io::alloc_coherent_for(
             dma,
-            DEPTH * 16,
+            depth * 16,
             narf_lib::id::DomainId::DRIVER_0,
             u64::from(u32::MAX),
         )
@@ -136,13 +143,13 @@ impl Ring {
         if descriptors
             .dma_addr()
             .raw()
-            .checked_add((DEPTH * 16 - 1) as u64)
+            .checked_add((depth * 16 - 1) as u64)
             .is_none_or(|end| end > u64::from(u32::MAX))
         {
             return Err(Error::DmaAddress);
         }
-        let mut buffers = Vec::with_capacity(DEPTH);
-        for _ in 0..DEPTH {
+        let mut buffers = Vec::with_capacity(depth);
+        for _ in 0..depth {
             // MT7921/MT7922 use DMA_BIT_MASK(32) in Linux mt7921_pci_probe.
             // The generic mt76 descriptor's high-address field does not
             // establish a wider device mask. Apply the same ceiling to
@@ -167,8 +174,9 @@ impl Ring {
             index: 0,
             pending: false,
             base,
+            depth,
         };
-        for index in 0..DEPTH {
+        for index in 0..depth {
             if rx {
                 ring.arm_rx(index);
             } else {
@@ -203,6 +211,68 @@ impl Ring {
         self.set_word(slot, 1, (MAX_FRAME as u32) << 16);
     }
 }
+/// Descriptor counts of the owner's rings, by queue type: Linux
+/// `mt7921_dma_init` with the device's `mt7921_dma_layout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DmaLayout {
+    /// The MCU event ring before firmware download (`MT_RXQ_MCU`).
+    pub(super) rx_event: usize,
+    /// The MCU WA ring after it (`MT_RXQ_MCU_WA`).
+    pub(super) rx_wa: usize,
+    /// The data ring (`MT_RXQ_MAIN`).
+    pub(super) rx_data: usize,
+}
+
+/// `MT7921_RX_RING_SIZE`: the data ring.
+const RX_DATA_RING: usize = 1536;
+/// `MT7921_RX_MCU_RING_SIZE`: the MCU event ring of a function with the WA
+/// ring (`mt7921_dma_layout.mcu_rxdone_ring_size`).
+const RX_EVENT_RING: usize = 8;
+/// `MT7921_RX_MCU_WA_RING_SIZE`.
+const RX_WA_RING: usize = 512;
+
+/// The ring layout of the function with PCI device id `device`: Linux
+/// `mt7921_pci_probe`'s default `mt7921_dma_layout`, which every function
+/// this driver binds uses (only MT7902 sets a 512-entry event ring and no
+/// WA ring). The memory this commits per function: (1536 + 512 + 8) RX
+/// buffers of MAX_FRAME (4 KiB) = 8.0 MiB of DMA32 coherent memory, plus
+/// 2056 16-byte descriptors (32 KiB). The TX rings keep [`DEPTH`] slots: each
+/// slot owns a payload buffer the firmware reads until it releases the
+/// token (cut-through), and at most `packet_tx::PIPELINE` are in flight;
+/// Linux's 2048-, 256- and 128-entry TX rings carry skbs and the txwi cache,
+/// not per-slot buffers.
+pub(super) fn dma_layout(device: u16) -> DmaLayout {
+    let _ = device;
+    DmaLayout {
+        rx_event: RX_EVENT_RING,
+        rx_wa: RX_WA_RING,
+        rx_data: RX_DATA_RING,
+    }
+}
+
+/// Every ring of the owner, sized by `layout`, from `dma` (as
+/// `mt76_dma_alloc_queue` allocates each).
+fn allocate_storage(dma: &narf_io::DmaDevice, layout: DmaLayout) -> Result<Storage, Error> {
+    Ok(Storage {
+        wm: Ring::allocate_for(dma, TX_WM, false, DEPTH)?,
+        fwdl: Ring::allocate_for(dma, TX_FWDL, false, DEPTH)?,
+        data: Ring::allocate_for(dma, TX_DATA, false, DEPTH)?,
+        data_dma: 0,
+        tokens: packet_tx::Tokens::new(),
+        tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
+        pending_events: VecDeque::new(),
+        pending_data: VecDeque::new(),
+        receive_epoch: 0,
+        receive_open: false,
+        p2p_capture: super::p2p_management_capture::Queue::new(),
+        rx: [
+            Ring::allocate_for(dma, RX_PRE, true, layout.rx_event)?,
+            Ring::allocate_for(dma, RX_POST, true, layout.rx_wa)?,
+            Ring::allocate_for(dma, RX_DATA, true, layout.rx_data)?,
+        ],
+    })
+}
+
 #[derive(Debug)]
 struct Storage {
     wm: Ring,
@@ -237,7 +307,7 @@ impl Storage {
         for ring in &mut self.rx {
             ring.index = 0;
             ring.pending = false;
-            for slot in 0..DEPTH {
+            for slot in 0..ring.depth {
                 ring.arm_rx(slot);
             }
         }
@@ -361,8 +431,9 @@ impl Hardware {
         self.check()?;
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
         let ring = &storage.rx[which];
+        let depth = ring.depth;
         let didx = self.read(ring.base + 12)? as usize;
-        if didx >= DEPTH {
+        if didx >= depth {
             return Err(Error::Ring);
         }
         if didx == ring.index {
@@ -395,7 +466,7 @@ impl Hardware {
         dma_barrier();
         let base = ring.base;
         self.write(base + 8, slot as u32)?;
-        self.owner.storage.as_mut().ok_or(Error::Busy)?.rx[which].index = (slot + 1) % DEPTH;
+        self.owner.storage.as_mut().ok_or(Error::Busy)?.rx[which].index = (slot + 1) % depth;
         Ok(Some(frame))
     }
     fn route_rx(&mut self, event: Option<bool>) -> Result<Option<CapturedData>, Error> {
@@ -518,12 +589,13 @@ impl Hardware {
         let mut cuts = [0; 3];
         for (which, ring) in storage.rx.iter().enumerate() {
             cuts[which] = self.read(ring.base + 12)? as usize;
-            if cuts[which] >= DEPTH {
+            if cuts[which] >= ring.depth {
                 return Err(Error::Ring);
             }
         }
         for (which, cut) in cuts.into_iter().enumerate() {
-            for _ in 0..DEPTH {
+            let depth = self.owner.storage.as_ref().ok_or(Error::Busy)?.rx[which].depth;
+            for _ in 0..depth {
                 if self.owner.storage.as_ref().ok_or(Error::Busy)?.rx[which].index == cut {
                     break;
                 }
@@ -964,7 +1036,7 @@ impl Hardware {
             let slot = if rx || ring.pending {
                 ring.index
             } else {
-                (ring.index + DEPTH - 1) % DEPTH
+                (ring.index + ring.depth - 1) % ring.depth
             };
             dma_barrier();
             let _ = writeln!(
@@ -1061,8 +1133,8 @@ impl Hardware {
 
     fn program(&self, ring: &Ring, rx: bool) -> Result<(), Error> {
         self.write(ring.base, ring.descriptors.dma_addr().raw() as u32)?;
-        self.write(ring.base + 4, DEPTH as u32)?;
-        self.write(ring.base + 8, if rx { (DEPTH - 1) as u32 } else { 0 })?;
+        self.write(ring.base + 4, ring.depth as u32)?;
+        self.write(ring.base + 8, if rx { (ring.depth - 1) as u32 } else { 0 })?;
         self.write(ring.base + 12, 0)
     }
     fn clear_rings(&self) -> Result<(), Error> {
@@ -1981,24 +2053,7 @@ impl Transport {
             // re-attached before its first mapping (bus mastering off).
             restore_function_dma(&device)?;
             let dma = narf_bus::dma::configure(&device).map_err(|_| Error::Allocation)?;
-            let storage = Storage {
-                wm: Ring::allocate_for(&dma, TX_WM, false)?,
-                fwdl: Ring::allocate_for(&dma, TX_FWDL, false)?,
-                data: Ring::allocate_for(&dma, TX_DATA, false)?,
-                data_dma: 0,
-                tokens: packet_tx::Tokens::new(),
-                tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
-                pending_events: VecDeque::new(),
-                pending_data: VecDeque::new(),
-                receive_epoch: 0,
-                receive_open: false,
-                p2p_capture: super::p2p_management_capture::Queue::new(),
-                rx: [
-                    Ring::allocate_for(&dma, RX_PRE, true)?,
-                    Ring::allocate_for(&dma, RX_POST, true)?,
-                    Ring::allocate_for(&dma, RX_DATA, true)?,
-                ],
-            };
+            let storage = allocate_storage(&dma, dma_layout(device.id.device))?;
             Ok(Self {
                 session: Session::new_boxed(
                     Hardware {

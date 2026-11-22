@@ -429,6 +429,18 @@ fn lookup(
 /// the owning interface address — 127.0.0.1 for the whole loopback /8
 /// (`ip_route_output_key_hash_rcu`, `net/ipv4/route.c:2768`). Anything else
 /// takes its egress interface's address; no interface at all is ENETUNREACH.
+/// The output device of a unicast datagram: `sk_bound_dev_if`, else
+/// IP_UNICAST_IF (`ip4_datagram_connect` / `udp_sendmsg`: `if (!oif) oif =
+/// inet->uc_index`). It routes and sources the datagram; it does not bind
+/// the socket's receive side.
+fn unicast_oif(o: &SockOptions) -> u32 {
+    if o.bindtodevice_index != 0 {
+        o.bindtodevice_index
+    } else {
+        o.ext.ip_uc_index
+    }
+}
+
 pub(super) fn select_source(ns: u64, daddr: u32, dev: u32) -> Result<u32, SockError> {
     let d = daddr.to_be_bytes();
     if d[0] == 127 {
@@ -813,7 +825,7 @@ impl SocketFile {
         // runs with the binding table released.
         let (dev, broadcast) = {
             let o = self.options.lock();
-            (o.bindtodevice_index, o.broadcast)
+            (unicast_oif(&o), o.broadcast)
         };
         let src = match select_source(ns, ip, dev) {
             Ok(s) => s,
@@ -966,7 +978,7 @@ impl SocketFile {
         let (dev, broadcast, ip_ttl, ip_tos, ip_pmtudisc, no_check) = {
             let o = self.options.lock();
             (
-                o.bindtodevice_index,
+                unicast_oif(&o),
                 o.broadcast,
                 o.ip_ttl,
                 o.ip_tos,

@@ -139,8 +139,10 @@ fn park_timer_target(
     {
         return (ClockId::Monotonic, deadline, deadline);
     }
-    let offset = narf_scheduler::narf_time::wall_offset_ns();
-    let mono = (realtime as i128 - offset as i128).clamp(1, (u64::MAX - 1) as i128) as u64;
+    // Wall time is the NTP-steered clock plus the wall offset.
+    let offset = i128::from(narf_scheduler::narf_time::wall_offset_ns())
+        + i128::from(narf_scheduler::narf_time::steer::offset_ns());
+    let mono = (realtime as i128 - offset).clamp(1, (u64::MAX - 1) as i128) as u64;
     if mono != deadline
         && uc
             .sleep_deadline_ns
@@ -776,7 +778,21 @@ pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u
                 // user's rax is not a syscall number.
                 return Some([NOT_IN_SYSCALL, 0, 0, 0, 0, 0, 0, t.rsp, t.rip]);
             }
-            return Some([t.rax, t.rdi, t.rsi, t.rdx, t.r10, t.r8, t.r9, t.rsp, t.rip]);
+            // `int 0x80` is always an i386 call (Linux `syscall_get_nr` /
+            // `syscall_get_arguments` under TS_COMPAT): eax, then ebx, ecx,
+            // edx, esi, edi, ebp, each its low 32 bits.
+            let low = |r: u64| u64::from(r as u32);
+            return Some([
+                low(t.rax),
+                low(t.rbx),
+                low(t.rcx),
+                low(t.rdx),
+                low(t.rsi),
+                low(t.rdi),
+                low(t.rbp),
+                t.rsp,
+                t.rip,
+            ]);
         }
         // `syscall`: UserState below the 16-byte domain snapshot.
         let f = top - 16 - core::mem::size_of::<X86State>() as u64;
@@ -1098,6 +1114,9 @@ pub struct ExecRequest {
     pub entry: u64,
     pub stack_top: u64,
     pub fs_base: Option<u64>,
+    /// The new image is ELF32 (`UserProcess::ia32`): enter it in
+    /// compatibility mode.
+    pub ia32: bool,
     /// Exec page-in plan (#740) for `new_as`, carried from the loader
     /// through the handler. The polling routine moves it into the
     /// future's `pending_page_in` when it applies this request; the
@@ -1412,8 +1431,10 @@ mod realtime_park_tests {
         let uc = UserTaskCtx::new();
         let saved = narf_scheduler::narf_time::wall_offset_ns();
         let now = narf_scheduler::narf_time::monotonic_ns();
-        let realtime = (now as i64 + saved + 60_000_000_000) as u64;
-        let mono = (realtime as i64 - saved) as u64;
+        // Wall time is the steered clock plus the wall offset.
+        let lead = saved + narf_scheduler::narf_time::steer::offset_ns();
+        let realtime = (now as i64 + lead + 60_000_000_000) as u64;
+        let mono = (realtime as i64 - lead) as u64;
         note_realtime_park(&uc, mono, realtime);
         uc.sleep_deadline_ns.store(mono, Ordering::Release);
         let before = park_timer_target(&uc, mono);
@@ -3511,6 +3532,24 @@ impl core::future::Future for UserTaskFuture {
         // task's mm. Taking the slot makes a fault one-shot as well: put_user
         // failure does not make clone fail and is not retried.
         complete_set_child_tid(&mut this.set_child_tid, &this.task);
+        // The segment state the task starts with (`UserProcess::segs`: empty
+        // for a fresh image, the parent's for fork/clone): TLS descriptors
+        // and DS/ES/FS/GS, before the FS/GS bases below since a selector load
+        // replaces the base. Own-stack runs this poll once per task; from then
+        // on the scheduler's per-task copy is saved and restored on every
+        // switch.
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            let segs = this.process.segs;
+            narf_scheduler::stackful::set_current_user_segments(
+                segs.tls,
+                narf_arch::x86_64::segments::UserSelectors {
+                    ds: segs.ds,
+                    es: segs.es,
+                    fs: segs.fs,
+                    gs: segs.gs,
+                },
+            );
+        }
         // Program the per-task TLS thread pointer. Done after CR3
         // is in place — `IA32_FS_BASE` doesn't depend on the
         // page-table root, but pairing the writes here keeps the
@@ -3594,6 +3633,19 @@ impl core::future::Future for UserTaskFuture {
                     this.state = TaskState::Running;
                     let entry = this.process.entry.0.as_u64();
                     let rsp = this.process.stack_top.as_u64();
+                    if this.process.ia32 {
+                        // An IA-32 image (Linux `start_thread_ia32`): CS =
+                        // __USER32_CS with the fresh-image data segments. The
+                        // i386 ABI has no register argument at entry.
+                        // SAFETY: AS activated + entry/rsp mapped (below 4 GiB)
+                        // by construction; never returns (iretq into CPL=3 in
+                        // compatibility mode on this task's stack top).
+                        unsafe {
+                            narf_arch::x86_64::user_mode::enter_user_mode_compat_at_top(
+                                entry, rsp, top,
+                            )
+                        }
+                    }
                     if let Some(arg) = this.process.entry_arg {
                         // SAFETY: AS activated + entry/rsp mapped by construction;
                         // never returns (iretq into CPL=3 on this task's stack top).
@@ -3608,6 +3660,16 @@ impl core::future::Future for UserTaskFuture {
                 }
                 TaskState::Running => {
                     narf_lib::perf::ctx_switch();
+                    if this.process.ia32 {
+                        // SAFETY: as below; the child resumes in compatibility
+                        // mode, as its parent trapped (`in_compat_mode`).
+                        unsafe {
+                            narf_arch::x86_64::user_mode::enter_user_mode_compat_resume_at_top(
+                                this.task.uctx.state.get(),
+                                top,
+                            )
+                        }
+                    }
                     // SAFETY: `ctx.state` holds a prior trap-from-user snapshot
                     // (fork child / re-image); resume it on the empty stack top.
                     unsafe {
@@ -3658,7 +3720,12 @@ impl core::future::Future for UserTaskFuture {
                     // returns — control reaches CPL=3. When the
                     // process carries an entry_arg (clone(2) for
                     // pthread start), deliver it as the first
-                    // SysV integer arg (RDI).
+                    // SysV integer arg (RDI). An IA-32 image enters
+                    // in compatibility mode instead, with no argument.
+                    if this.process.ia32 {
+                        // SAFETY: as below; entry/rsp are below 4 GiB.
+                        unsafe { narf_arch::x86_64::user_mode::enter_user_mode_compat(entry, rsp) }
+                    }
                     if let Some(arg) = this.process.entry_arg {
                         // SAFETY: the AS is activated and the user
                         // mappings cover `entry` + `rsp` by construction
@@ -3682,6 +3749,14 @@ impl core::future::Future for UserTaskFuture {
                     // GS) is still correct from first entry. Never
                     // returns — iretq resumes the saved user frame.
                     narf_lib::perf::ctx_switch();
+                    if this.process.ia32 {
+                        // SAFETY: as below, resuming in compatibility mode.
+                        unsafe {
+                            narf_arch::x86_64::user_mode::enter_user_mode_compat_resume(
+                                this.task.uctx.state.get(),
+                            )
+                        }
+                    }
                     // SAFETY: Valid memory or trusted environment
                     unsafe { narf_scheduler::enter_user_mode_resume(this.task.uctx.state.get()) }
                 }
@@ -3783,6 +3858,10 @@ impl core::future::Future for UserTaskFuture {
                 this.process.entry = crate::EntryPoint(narf_memory::VirtAddr::new(req.entry));
                 this.process.stack_top = narf_memory::VirtAddr::new(req.stack_top);
                 this.process.fs_base = req.fs_base;
+                // The new image's mode, and no TLS slots or selectors from the
+                // old one (Linux `flush_thread` / `start_thread_common`).
+                this.process.ia32 = req.ia32;
+                this.process.segs = crate::UserSegments::default();
                 // Stash the exec page-in plan (#740): the next poll
                 // activates the new AS (state Initial below) and drives
                 // the plan there, where the batch's live-root contract

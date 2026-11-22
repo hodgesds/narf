@@ -742,11 +742,22 @@ impl Queue {
         mtu: u32,
         options: TxOptions,
     ) -> Result<(), IgcError> {
+        // A frame this returns an error for was not posted: its buffer goes
+        // back to the pool a completion would return it to (`recycle`), as
+        // a refusal's does. Dropped, it freed the buffer and shrank the
+        // queue's zero-copy pool for good.
         if self.gate_closed.load(Ordering::Acquire) {
             self.tx.lock().rejects += 1;
+            self.recycle(frame.into_parts().0);
             return Err(IgcError::Other("traffic gate closed"));
         }
-        let mut plan = TxPlan::prepare(frame.payload_mut(), meta, q, mtu)?;
+        let mut plan = match TxPlan::prepare(frame.payload_mut(), meta, q, mtu) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.recycle(frame.into_parts().0);
+                return Err(error);
+            }
+        };
         plan.command |= options.command;
         plan.info |= options.info;
         if let Some(launch) = options.launch {
@@ -761,7 +772,13 @@ impl Queue {
         // Split at 4 KiB boundaries; every descriptor length fits the device field.
         let data_count = ((address as usize & 4095) + length).div_ceil(4096);
         let empty_candidate = if options.launch.is_some_and(|l| l.next) {
-            let mut b = allocate(60)?;
+            let mut b = match allocate(60) {
+                Ok(b) => b,
+                Err(error) => {
+                    self.recycle(frame.into_parts().0);
+                    return Err(error);
+                }
+            };
             b.as_mut_slice()[..60].fill(0);
             Some(Frame::new(b, 60))
         } else {
@@ -800,6 +817,7 @@ impl Queue {
             tx.rejects += 1;
             fence(Ordering::Release);
             r.write(0xe018 + q as u64 * 0x40, tx.next as u32);
+            self.recycle(frame.into_parts().0);
             return Err(IgcError::QueueTooSmall);
         }
         let mut slot = tx.next;

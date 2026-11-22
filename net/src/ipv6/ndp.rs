@@ -474,6 +474,12 @@ pub fn on_ra_in(
     let managed_flag = (mo_flags & pkt_ipv6::RA_FLAG_MANAGED) != 0;
     let other_flag = (mo_flags & pkt_ipv6::RA_FLAG_OTHER_CONFIG) != 0;
     let router_lifetime_s = u16::from_be_bytes([body[6], body[7]]);
+    // `ndisc_router_discovery`: the RA's 2-bit preference; the reserved
+    // value 10 is medium (`ICMPV6_ROUTER_PREF_INVALID` → MEDIUM).
+    let router_pref = match (mo_flags >> 3) & 3 {
+        2 => route::PREF_MEDIUM,
+        p => p,
+    };
     // Default router update.
     if router_lifetime_s > 0 {
         router_upsert_in(
@@ -495,6 +501,9 @@ pub fn on_ra_in(
                 metric: 1024,
                 valid_deadline_ns: now_ns
                     .saturating_add((router_lifetime_s as u64) * 1_000_000_000),
+                // `rt6_add_dflt_router`: RTPROT_RA, RTF_PREF(pref).
+                protocol: route::RTPROT_RA,
+                pref: router_pref,
             },
         );
     }
@@ -536,6 +545,9 @@ pub fn on_ra_in(
                                 metric: 256,
                                 valid_deadline_ns: now_ns
                                     .saturating_add((valid_lifetime_s as u64) * 1_000_000_000),
+                                // `addrconf_prefix_route`: RTPROT_KERNEL.
+                                protocol: route::RTPROT_KERNEL,
+                                pref: route::PREF_MEDIUM,
                             },
                         );
                     }
@@ -601,6 +613,8 @@ pub fn on_redirect_in(net_ns_id: u64, iface: &str, body: &[u8]) -> NdRxResult {
             iface: String::from(iface),
             metric: 200,
             valid_deadline_ns: 0,
+            protocol: route::RTPROT_KERNEL,
+            pref: route::PREF_MEDIUM,
         },
     );
     NdRxResult::Updated

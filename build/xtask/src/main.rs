@@ -7231,7 +7231,7 @@ fn spawn_net_check_listener() -> Result<u16> {
 /// Success criteria: `narf> ` prompt observed within `prompt_secs`,
 /// then `hello world\n` observed within `echo_secs` after typing.
 /// Failure: any panic marker, OR either deadline missed.
-/// Wave-78 — boot both `/bin/hello` (hand-rolled int 0x80 asm)
+/// Wave-78 — boot both `/bin/hello` (hand-rolled `syscall` asm)
 /// and `/bin/hello_musl` (real musl-static) through the live
 /// shell + execve + ELF loader + syscall-instruction path. Each
 /// binary is a separate QEMU run since `run-interactive` types one
@@ -7241,7 +7241,7 @@ fn spawn_net_check_listener() -> Result<u16> {
 ///
 /// Failure on either binary is failure for the whole smoke.
 /// x86_64 only: `hello_musl` is a stock musl-built ELF and the
-/// CR4.OSFXSR / arch_prctl / int 0x80-vs-syscall plumbing is all
+/// CR4.OSFXSR / arch_prctl / syscall-instruction plumbing is all
 /// x86-specific; the aarch64 mirror is a separate sub-wave.
 /// Bucket a musl-demo case into a coarse subsystem group, so CI can fan
 /// the ~80 cases out across a handful of parallel jobs by subsystem
@@ -7403,6 +7403,12 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     // heavy GUI cases each need their own fresh boot (see GUI_FRESH_BOOT).
     let lightweight: &[(&str, &str)] = &[
         ("hello", "hello"),
+        // IA-32 compat: an i386 static ELF32 (`hello_i386.S`, assembled at
+        // build time) loaded into a TASK_SIZE_32 address space, entered in
+        // compatibility mode and making `write`/`exit_group` through the
+        // i386 `int 0x80` gate. Seeded at /bin/hello_i386 from
+        // `narf_verification::NARF_HELLO_I386_ELF`.
+        ("hello_i386", "hello i386"),
         ("hello_musl", "hello from musl"),
         ("hello_musl_dyn", "hello from musl dyn"),
         // BusyBox demo cases. Each applet exercises a different

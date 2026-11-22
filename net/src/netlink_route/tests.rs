@@ -249,6 +249,95 @@ narf_kernel_test::kernel_test_in!(
     getroute_dump_has_loopback_and_terminates
 );
 
+/// `inet_rtm_getroute` without RTM_F_FIB_MATCH answers with the route the
+/// lookup produced (`rt_fill_info`): rtm_dst_len 32, RTM_F_CLONED, protocol
+/// RTPROT_UNSPEC, RTA_TABLE, RTA_DST = the queried address, RTA_OIF, the
+/// selected source as RTA_PREFSRC and the gateway, which iproute2 prints as
+/// `198.18.44.9 via 10.44.3.1 dev A src 10.44.3.165 ... cache`. RTA_OIF in
+/// the request is `fl4.flowi4_oif`, so only routes through that device
+/// count. NARF ignored RTA_OIF and returned the FIB entry (`ip route get
+/// 192.168.1.1 oif wlan0` printed eth0's `192.168.0.0/22` route).
+fn getroute_answers_the_cloned_route_and_honours_oif() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const RTM_F_CLONED: u32 = 0x200;
+    const RTM_F_FIB_MATCH: u32 = 0x2000;
+    let net = crate::route::Ipv4Net {
+        addr: crate::ipv4::Ipv4Addr([198, 18, 44, 0]),
+        prefix_len: 24,
+    };
+    let devices = [
+        ("rtnl-get-a0", [10, 44, 3, 165], [10, 44, 3, 1], 100u32),
+        ("rtnl-get-b0", [10, 44, 1, 211], [10, 44, 1, 254], 600),
+    ];
+    for (i, (name, ip, gateway, metric)) in devices.iter().enumerate() {
+        crate::iface::register(name, [0x02, 0, 0, 0, 0x44, i as u8], discard);
+        crate::iface::set_link_state(name, true);
+        crate::iface::set_iface_ipv4_fields(name, *ip, [0; 4]);
+        crate::iface::add_addr(name, *ip, 24);
+        crate::route::route_add(crate::route::Route {
+            net_ns_id: 0,
+            dst: net,
+            gateway: Some(crate::ipv4::Ipv4Addr(*gateway)),
+            iface: alloc::string::String::from(*name),
+            src_hint: None,
+            metric: *metric,
+            scope: crate::route::Scope::Universe,
+            table: crate::route::TABLE_MAIN,
+            protocol: crate::route::RTPROT_KERNEL,
+        });
+    }
+    let index = |name: &str| crate::iface::ifindex_of(name).unwrap();
+    let request = |oif: Option<u32>, flags: u32| {
+        let mut body = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&flags.to_ne_bytes());
+        push_rtattr(&mut body, RTA_DST, &[198, 18, 44, 9]);
+        if let Some(oif) = oif {
+            push_rtattr(&mut body, RTA_OIF, &oif.to_ne_bytes());
+        }
+        frame_message(RTM_GETROUTE, NLM_F_REQUEST, 64, 8, &body)
+    };
+    let check = |reply: &[Vec<u8>], (name, ip, gateway, _): (&str, [u8; 4], [u8; 4], u32)| {
+        let [msg] = reply else {
+            return false;
+        };
+        let flags = &msg[NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 12];
+        let flags = u32::from_ne_bytes(flags.try_into().unwrap());
+        hdr_of(msg).1 == RTM_NEWROUTE
+            && msg[NLMSG_HDRLEN + 1] == 32
+            && msg[NLMSG_HDRLEN + 5] == 0
+            && msg[NLMSG_HDRLEN + 7] == RTN_UNICAST
+            && flags & RTM_F_CLONED != 0
+            && find_rtattr(msg, 12, RTA_DST).as_deref() == Some(&[198, 18, 44, 9][..])
+            && find_rtattr(msg, 12, RTA_OIF).as_deref() == Some(&index(name).to_ne_bytes()[..])
+            && find_rtattr(msg, 12, RTA_GATEWAY).as_deref() == Some(&gateway[..])
+            && find_rtattr(msg, 12, RTA_PREFSRC).as_deref() == Some(&ip[..])
+    };
+    let plain = build_dump(&request(None, 0));
+    let bound = build_dump(&request(Some(index(devices[1].0)), 0));
+    let fib = build_dump(&request(None, RTM_F_FIB_MATCH));
+    for (name, _, _, _) in devices {
+        crate::route::route_delete(net, name, crate::route::TABLE_MAIN);
+    }
+    if !check(&plain[..], devices[0]) {
+        return narf_kernel_test::TestResult::Fail(
+            "RTM_GETROUTE did not answer a cloned /32 route",
+        );
+    }
+    if !check(&bound[..], devices[1]) {
+        return narf_kernel_test::TestResult::Fail("RTM_GETROUTE ignored RTA_OIF");
+    }
+    // RTM_F_FIB_MATCH still answers the FIB entry itself.
+    narf_kernel_test::kt_assert_eq!(fib.len(), 1);
+    narf_kernel_test::kt_assert_eq!(fib[0][NLMSG_HDRLEN + 1], 24);
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/getroute-cloned",
+    getroute_answers_the_cloned_route_and_honours_oif
+);
+
 fn getroute_point_query_uses_longest_prefix_match() -> narf_kernel_test::TestResult {
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
@@ -277,8 +366,9 @@ fn getroute_point_query_uses_longest_prefix_match() -> narf_kernel_test::TestRes
         });
     }
 
+    // `ip route get fibmatch`: RTM_F_FIB_MATCH asks for the FIB entry itself.
     let mut body = vec![AF_INET, 32, 0, 0, crate::route::TABLE_MAIN, 0, 0, 0];
-    body.extend_from_slice(&0u32.to_ne_bytes());
+    body.extend_from_slice(&0x2000u32.to_ne_bytes());
     push_rtattr(&mut body, RTA_DST, &[198, 18, 7, 99]);
     let request = frame_message(RTM_GETROUTE, NLM_F_REQUEST, 62, 8, &body);
     let replies = build_dump(&request);
@@ -343,6 +433,57 @@ fn getroute_dump_honors_table_filter() -> narf_kernel_test::TestResult {
     narf_kernel_test::TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!("net/netlink_route", getroute_dump_honors_table_filter);
+
+/// `ip route show proto dhcp`: a strict IPv4 dump with `rtm_protocol` set
+/// keeps the routes installed with that protocol (`fib_dump_info_fnhe` /
+/// `fn_trie_dump_leaf` compare `fa->fa_info->fib_protocol`). NARF compared
+/// RTPROT_KERNEL for every route, so the filter matched only kernel routes.
+fn getroute_dump_filters_by_the_routes_protocol() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const RTPROT_DHCP: u8 = 16;
+    let name = "rtnl-proto0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 0x16, 1], discard);
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+    let net = crate::route::Ipv4Net {
+        addr: crate::ipv4::Ipv4Addr([198, 18, 16, 0]),
+        prefix_len: 24,
+    };
+    crate::route::route_add(crate::route::Route {
+        net_ns_id: 0,
+        dst: net,
+        gateway: Some(crate::ipv4::Ipv4Addr([192, 0, 2, 16])),
+        iface: alloc::string::String::from(name),
+        src_hint: None,
+        metric: 100,
+        scope: crate::route::Scope::Universe,
+        table: crate::route::TABLE_MAIN,
+        protocol: RTPROT_DHCP,
+    });
+    let dump = |protocol: u8| {
+        let mut body = [0u8; 12];
+        body[0] = AF_INET;
+        body[5] = protocol;
+        let request = frame_message(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 64, 0, &body);
+        build_get_in(0, &request, true, false)
+            .into_iter()
+            .filter(|m| {
+                parse_hdr(m).is_some_and(|h| h.msg_type == RTM_NEWROUTE)
+                    && find_rtattr(m, 12, RTA_OIF).as_deref() == Some(&ifindex.to_ne_bytes()[..])
+            })
+            .count()
+    };
+    let (dhcp, kernel) = (dump(RTPROT_DHCP), dump(RTPROT_KERNEL));
+    crate::route::route_delete(net, name, crate::route::TABLE_MAIN);
+    narf_kernel_test::kt_assert_eq!(dhcp, 1);
+    narf_kernel_test::kt_assert_eq!(kernel, 0);
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/route-proto-filter",
+    getroute_dump_filters_by_the_routes_protocol
+);
 
 fn newneigh_wire_layout_carries_ipv4_destination_and_mac() -> narf_kernel_test::TestResult {
     let msg = build_newneigh(
@@ -502,6 +643,180 @@ narf_kernel_test::kernel_test_in!(
     ipv6_address_message_uses_linux_ifaddr_layout
 );
 
+/// `inet6_fill_ifaddr` → `put_ifaddrmsg(skb, plen, flags, rt_scope(ifa->scope),
+/// ifindex)` (`net/ipv6/addrconf.c`): `ifa_scope` is an `RT_SCOPE_*` value,
+/// not the `IPV6_ADDR_*` scope bits `/proc/net/if_inet6` prints. `rt_scope()`
+/// (`include/net/addrconf.h`) maps IFA_HOST → RT_SCOPE_HOST (254), IFA_LINK →
+/// RT_SCOPE_LINK (253), IFA_SITE → RT_SCOPE_SITE (200), anything else →
+/// RT_SCOPE_UNIVERSE (0). A ULA (fc00::/7) is global scope
+/// (`__ipv6_addr_type`). iproute2 prints 0x20 as "scope 32".
+fn ipv6_address_scope_is_an_rt_scope() -> narf_kernel_test::TestResult {
+    use crate::ipv6::addrs::{AddrScope, AddrState, Ipv6IfAddr};
+    let mk = |addr: [u8; 16], scope: AddrScope| Ipv6IfAddr {
+        iface: "eth0".into(),
+        addr,
+        prefix_len: 64,
+        state: AddrState::Preferred,
+        scope,
+        preferred_deadline_ns: u64::MAX,
+        valid_deadline_ns: u64::MAX,
+        temporary: false,
+    };
+    let cases: [([u8; 16], AddrScope, u8); 5] = [
+        (
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x55, 0x65, 0x7b, 0x7b, 0x9a, 0xbe, 0xb7, 0xb1,
+            ],
+            AddrScope::LinkLocal,
+            253,
+        ),
+        (
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            AddrScope::Host,
+            254,
+        ),
+        (
+            [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            AddrScope::Global,
+            0,
+        ),
+        (
+            [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            AddrScope::UniqueLocal,
+            0,
+        ),
+        // fec0::/10 is IPV6_ADDR_SITELOCAL → RT_SCOPE_SITE.
+        (
+            [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            AddrScope::Global,
+            200,
+        ),
+    ];
+    for (addr, scope, want) in cases {
+        let msg = build_newaddr_v6(&mk(addr, scope), 2, 1, 0);
+        narf_kernel_test::kt_assert_eq!(msg[NLMSG_HDRLEN + 3], want);
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("net/ipv6-ifa-scope", ipv6_address_scope_is_an_rt_scope);
+
+/// `rt6_add_dflt_router` installs an RA's default route with RTPROT_RA,
+/// metric `accept_ra_defrtr_metric` (IP6_RT_PRIO_USER, 1024), RTF_EXPIRES
+/// and the RA's router preference; `rt6_fill_node` reports `rtm_protocol`
+/// as installed, RTA_PREF on every route and the remaining lifetime in
+/// RTA_CACHEINFO, so iproute2 prints `proto ra metric 1024 expires ...
+/// pref high`. An RTM_NEWROUTE keeps its `rtm_protocol` (NetworkManager
+/// installs its RA routes as `proto ra`), and without RTA_PRIORITY gets
+/// metric 1024 (`ip6_route_info_create`). NARF reported every IPv6 route as
+/// `proto kernel` without a preference or lifetime, and stored metric 0.
+fn ipv6_ra_and_requested_routes_keep_protocol_metric_and_pref() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const RTPROT_RA: u8 = 9;
+    const RTA_PREF: u16 = 20;
+    const RTA_CACHEINFO: u16 = 12;
+    let name = "rtnl-v6-ra0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 9, 1], discard);
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+    let router = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x84, 0x43, 0x42, 0xff, 0xfe, 0xa5, 0x25, 0x61,
+    ];
+    // RA: hop limit 64, router preference high (prf 01), lifetime 1800 s.
+    let mut ra = [0u8; 16];
+    ra[0] = 134;
+    ra[4] = 64;
+    ra[5] = 0x08;
+    ra[6..8].copy_from_slice(&1800u16.to_be_bytes());
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let _ = crate::ipv6::ndp::on_ra_in(0, name, router, &ra, now);
+
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    let prefix = [0x20, 1, 0x0d, 0xb8, 0, 0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut body = vec![
+        AF_INET6,
+        64,
+        0,
+        0,
+        crate::route::TABLE_MAIN,
+        RTPROT_RA,
+        0,
+        RTN_UNICAST,
+    ];
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    push_rtattr(&mut body, RTA_DST, &prefix);
+    push_rtattr(&mut body, RTA_OIF, &ifindex.to_ne_bytes());
+    let request = frame_message(
+        RTM_NEWROUTE,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        211,
+        1,
+        &body,
+    );
+    let added = build_replies_authorized(&request, Some(&admin)).unwrap();
+    narf_kernel_test::kt_assert_eq!(
+        i32::from_ne_bytes(added[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()),
+        0
+    );
+
+    let mut dump = vec![AF_INET6, 0, 0, 0, 0, 0, 0, 0];
+    dump.extend_from_slice(&0u32.to_ne_bytes());
+    let msgs = build_dump(&frame_message(
+        RTM_GETROUTE,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        212,
+        1,
+        &dump,
+    ));
+    let ours = |m: &&Vec<u8>| {
+        hdr_of(m).1 == RTM_NEWROUTE
+            && find_rtattr(m, 12, RTA_OIF).as_deref() == Some(&ifindex.to_ne_bytes()[..])
+    };
+    let default = msgs
+        .iter()
+        .filter(ours)
+        .find(|m| find_rtattr(m, 12, RTA_GATEWAY).as_deref() == Some(&router[..]))
+        .cloned();
+    let requested = msgs
+        .iter()
+        .filter(ours)
+        .find(|m| find_rtattr(m, 12, RTA_DST).as_deref() == Some(&prefix[..]))
+        .cloned();
+    crate::ipv6::route::remove(&[0; 16], 0, name);
+    crate::ipv6::route::remove(&prefix, 64, name);
+    let (Some(default), Some(requested)) = (default, requested) else {
+        return narf_kernel_test::TestResult::Fail("RA default or requested route missing");
+    };
+    let priority = |m: &Vec<u8>| {
+        find_rtattr(m, 12, RTA_PRIORITY).map(|v| u32::from_ne_bytes(v[..4].try_into().unwrap()))
+    };
+    if default[NLMSG_HDRLEN + 5] != RTPROT_RA || priority(&default) != Some(1024) {
+        return narf_kernel_test::TestResult::Fail("RA default route is not proto ra metric 1024");
+    }
+    if find_rtattr(&default, 12, RTA_PREF).as_deref() != Some(&[1][..]) {
+        return narf_kernel_test::TestResult::Fail("RA default route lost the router preference");
+    }
+    let expires = find_rtattr(&default, 12, RTA_CACHEINFO)
+        .map(|ci| u32::from_ne_bytes(ci[8..12].try_into().unwrap()));
+    if expires.is_none_or(|e| e == 0) {
+        return narf_kernel_test::TestResult::Fail("RA default route reports no lifetime");
+    }
+    if requested[NLMSG_HDRLEN + 5] != RTPROT_RA || priority(&requested) != Some(1024) {
+        return narf_kernel_test::TestResult::Fail(
+            "RTM_NEWROUTE lost rtm_protocol or the IP6_RT_PRIO_USER default metric",
+        );
+    }
+    if find_rtattr(&requested, 12, RTA_PREF).as_deref() != Some(&[0][..]) {
+        return narf_kernel_test::TestResult::Fail("IPv6 route has no RTA_PREF (medium)");
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/ipv6-ra-route",
+    ipv6_ra_and_requested_routes_keep_protocol_metric_and_pref
+);
+
 fn ipv6_route_message_reports_gateway_and_oif() -> narf_kernel_test::TestResult {
     let route = crate::ipv6::route::Route {
         prefix: [0; 16],
@@ -510,6 +825,8 @@ fn ipv6_route_message_reports_gateway_and_oif() -> narf_kernel_test::TestResult 
         iface: "eth0".into(),
         metric: 100,
         valid_deadline_ns: 0,
+        protocol: crate::ipv6::route::RTPROT_KERNEL,
+        pref: crate::ipv6::route::PREF_MEDIUM,
     };
     let msg = build_newroute_v6(&route, 7, 47, 0);
     narf_kernel_test::kt_assert_eq!(hdr_of(&msg).1, RTM_NEWROUTE);
@@ -528,6 +845,63 @@ fn ipv6_route_message_reports_gateway_and_oif() -> narf_kernel_test::TestResult 
 narf_kernel_test::kernel_test_in!(
     "net/netlink_route",
     ipv6_route_message_reports_gateway_and_oif
+);
+
+/// `neigh_dump_table` walks the one IPv4 neighbour table the stack resolves
+/// with (`arp_tbl`): `ip neigh` lists what `/proc/net/arp` lists, each entry
+/// with its NUD state, and NDA_LLADDR only for a valid (`NUD_VALID`) entry
+/// (`neigh_fill_info`). NARF dumped a separate table only RTM_NEWNEIGH
+/// wrote, so `ip neigh` on the desktop showed no IPv4 neighbour at all.
+fn ipv4_neighbor_dump_reports_the_resolver_table() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    let name = "rtnl-neigh-dump0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 8, 1], discard);
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+    let resolved = [10, 43, 0, 1];
+    let mac = [0x86, 0x43, 0x42, 0xa5, 0x25, 0x61];
+    let resolving = [10, 43, 0, 125];
+    crate::arp_cache::insert(name, resolved, mac);
+    crate::arp_cache::mark_incomplete(name, resolving);
+
+    let mut body = vec![AF_INET, 0, 0, 0];
+    body.extend_from_slice(&[0u8; 8]);
+    let request = frame_message(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 46, 12, &body);
+    let msgs = build_dump(&request);
+    let ours: Vec<&Vec<u8>> = msgs
+        .iter()
+        .filter(|m| {
+            hdr_of(m).1 == RTM_NEWNEIGH
+                && i32::from_ne_bytes(m[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].try_into().unwrap())
+                    == ifindex as i32
+        })
+        .collect();
+    let find = |ip: [u8; 4]| {
+        ours.iter()
+            .find(|m| find_rtattr(m, 12, NDA_DST).as_deref() == Some(&ip[..]))
+            .copied()
+    };
+    let state = |m: &Vec<u8>| u16::from_ne_bytes([m[NLMSG_HDRLEN + 8], m[NLMSG_HDRLEN + 9]]);
+    let Some(complete) = find(resolved) else {
+        return narf_kernel_test::TestResult::Fail("resolved ARP entry missing from ip neigh");
+    };
+    narf_kernel_test::kt_assert_eq!(complete[NLMSG_HDRLEN], AF_INET);
+    narf_kernel_test::kt_assert_eq!(state(complete), NUD_REACHABLE);
+    narf_kernel_test::kt_assert_eq!(
+        find_rtattr(complete, 12, NDA_LLADDR).as_deref(),
+        Some(&mac[..])
+    );
+    let Some(incomplete) = find(resolving) else {
+        return narf_kernel_test::TestResult::Fail("resolving ARP entry missing from ip neigh");
+    };
+    narf_kernel_test::kt_assert_eq!(state(incomplete), NUD_INCOMPLETE);
+    narf_kernel_test::kt_assert!(find_rtattr(incomplete, 12, NDA_LLADDR).is_none());
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/neigh-dump",
+    ipv4_neighbor_dump_reports_the_resolver_table
 );
 
 fn getneigh_dump_honors_ifindex_filter() -> narf_kernel_test::TestResult {
@@ -1031,6 +1405,112 @@ narf_kernel_test::kernel_test_in!(
     delegated_admin_can_add_and_delete_ipv4_route
 );
 
+/// NetworkManager adds every IPv4 address with IFA_F_NOPREFIXROUTE (0x200)
+/// in IFA_FLAGS and installs the prefix route itself, at the device's route
+/// metric (eth0 100, wlan0 600). Linux `fib_add_ifaddr` adds the kernel's
+/// metric-0 prefix route only without that flag, and `fib_del_ifaddr`
+/// removes only the kernel's own prefix route. NARF ignored the flag: with
+/// eth0 and wlan0 in one /22 the desktop had two metric-0 prefix routes, so
+/// which device carried LAN traffic was decided by insertion order instead
+/// of NM's metrics.
+fn ipv4_noprefixroute_address_installs_no_prefix_route() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+    let name = "rtnl-v4-nopfx0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 7, 1], discard);
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    let addr = [10, 41, 3, 165];
+    let net = crate::route::Ipv4Net {
+        addr: crate::ipv4::Ipv4Addr([10, 41, 0, 0]),
+        prefix_len: 22,
+    };
+    let addr_request = |kind, flags: Option<u32>| {
+        let mut body = vec![AF_INET, 22, 0, 0];
+        body.extend_from_slice(&ifindex.to_ne_bytes());
+        push_rtattr(&mut body, IFA_LOCAL, &addr);
+        push_rtattr(&mut body, IFA_ADDRESS, &addr);
+        if let Some(flags) = flags {
+            push_rtattr(&mut body, IFA_FLAGS, &flags.to_ne_bytes());
+        }
+        let nl_flags = NLM_F_REQUEST
+            | NLM_F_ACK
+            | if kind == RTM_NEWADDR {
+                NLM_F_CREATE | NLM_F_REPLACE
+            } else {
+                0
+            };
+        frame_message(kind, nl_flags, 207, 1, &body)
+    };
+    let errno_of = |replies: &Vec<Vec<u8>>| {
+        i32::from_ne_bytes(
+            replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    let kernel_prefix_route = || {
+        crate::route::route_list().iter().any(|route| {
+            route.iface == name
+                && route.dst == net
+                && route.metric == 0
+                && route.protocol == crate::route::RTPROT_KERNEL
+        })
+    };
+
+    let add = build_replies_authorized(
+        &addr_request(RTM_NEWADDR, Some(IFA_F_NOPREFIXROUTE)),
+        Some(&admin),
+    )
+    .unwrap();
+    narf_kernel_test::kt_assert_eq!(errno_of(&add), 0);
+    narf_kernel_test::kt_assert!(crate::iface::is_local_addr_in(0, addr));
+    if kernel_prefix_route() {
+        return narf_kernel_test::TestResult::Fail(
+            "IFA_F_NOPREFIXROUTE address installed a kernel prefix route",
+        );
+    }
+    // NM's own prefix route at the device metric survives the address's
+    // removal: `fib_del_ifaddr` only removes the kernel's.
+    crate::route::route_add(crate::route::Route {
+        net_ns_id: 0,
+        dst: net,
+        gateway: None,
+        iface: alloc::string::String::from(name),
+        src_hint: None,
+        metric: 100,
+        scope: crate::route::Scope::Link,
+        table: crate::route::TABLE_MAIN,
+        protocol: 4, // RTPROT_STATIC, as NetworkManager installs it
+    });
+    let del = build_replies_authorized(&addr_request(RTM_DELADDR, None), Some(&admin)).unwrap();
+    narf_kernel_test::kt_assert_eq!(errno_of(&del), 0);
+    let nm_route_kept = crate::route::route_list()
+        .iter()
+        .any(|route| route.iface == name && route.dst == net && route.metric == 100);
+    crate::route::route_delete(net, name, crate::route::TABLE_MAIN);
+    if !nm_route_kept {
+        return narf_kernel_test::TestResult::Fail(
+            "deleting the address removed NM's metric-100 prefix route",
+        );
+    }
+    // Without the flag the kernel's prefix route is installed as before.
+    let add = build_replies_authorized(&addr_request(RTM_NEWADDR, None), Some(&admin)).unwrap();
+    narf_kernel_test::kt_assert_eq!(errno_of(&add), 0);
+    narf_kernel_test::kt_assert!(kernel_prefix_route());
+    let del = build_replies_authorized(&addr_request(RTM_DELADDR, None), Some(&admin)).unwrap();
+    narf_kernel_test::kt_assert_eq!(errno_of(&del), 0);
+    narf_kernel_test::kt_assert!(!kernel_prefix_route());
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/ifa-noprefixroute",
+    ipv4_noprefixroute_address_installs_no_prefix_route
+);
+
 fn delegated_admin_can_add_and_delete_ipv6_address_and_route() -> narf_kernel_test::TestResult {
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
@@ -1169,8 +1649,8 @@ fn delegated_admin_can_add_and_delete_ipv4_neighbor() -> narf_kernel_test::TestR
         i32::from_ne_bytes(add[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap()),
         0
     );
-    narf_kernel_test::kt_assert!(crate::arp::snapshot().iter().any(|(iface, entry)| {
-        iface == name && entry.ip == [203, 0, 113, 9] && entry.mac == [0x02, 0, 0, 0, 3, 9]
+    narf_kernel_test::kt_assert!(crate::arp_cache::snapshot().iter().any(|entry| {
+        entry.iface == name && entry.ip == [203, 0, 113, 9] && entry.mac == [0x02, 0, 0, 0, 3, 9]
     }));
 
     let delete = build_replies_authorized(&neighbor_request(RTM_DELNEIGH), Some(&admin)).unwrap();
@@ -1182,9 +1662,9 @@ fn delegated_admin_can_add_and_delete_ipv4_neighbor() -> narf_kernel_test::TestR
         ),
         0
     );
-    narf_kernel_test::kt_assert!(!crate::arp::snapshot()
+    narf_kernel_test::kt_assert!(!crate::arp_cache::snapshot()
         .iter()
-        .any(|(iface, entry)| iface == name && entry.ip == [203, 0, 113, 9]));
+        .any(|entry| entry.iface == name && entry.ip == [203, 0, 113, 9]));
     narf_kernel_test::TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!(

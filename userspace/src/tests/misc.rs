@@ -4300,12 +4300,13 @@ fn smoke_blocked_syscall_decodes_saved_registers() -> TestResult {
         }
 
         // `int 0x80`: a TrapFrame ending at `top`, its last word the user SS.
+        // It is an i386 call: eax, then ebx, ecx, edx, esi, edi, ebp.
         let tf = (top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
         // SAFETY: inside `stack`, suitably aligned.
         unsafe {
             (*tf).rax = 202;
-            ((*tf).rdi, (*tf).rsi, (*tf).rdx) = (0x11, 0x22, 0x33);
-            ((*tf).r10, (*tf).r8, (*tf).r9) = (0x44, 0x55, 0x66);
+            ((*tf).rbx, (*tf).rcx, (*tf).rdx) = (0x11, 0x22, 0x33);
+            ((*tf).rsi, (*tf).rdi, (*tf).rbp) = (0x44, 0x55, 0x66);
             (*tf).ss = 0x1b;
             (*tf).vector = 0x80;
         }
@@ -4366,6 +4367,136 @@ fn smoke_blocked_syscall_decodes_saved_registers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_blocked_syscall_decodes_saved_registers);
+
+// A task parked in an `int 0x80` system call is in an i386 call, whatever
+// mode it runs in (Linux `syscall_get_nr` / `syscall_get_arguments` for an
+// ia32 syscall): the number is eax and the arguments are ebx, ecx, edx,
+// esi, edi, ebp, each its low 32 bits.
+#[cfg(target_arch = "x86_64")]
+fn smoke_blocked_syscall_decodes_int80_as_i386() -> TestResult {
+    use crate::user_task::UserTaskCtx;
+    use core::sync::atomic::Ordering;
+    use narf_arch::x86_64::trap_frame::TrapFrame;
+
+    #[repr(C, align(16))]
+    struct Stack([u8; 4096]);
+    let mut stack = alloc::boxed::Box::new(Stack([0; 4096]));
+    let top = stack.0.as_mut_ptr() as u64 + 4096;
+    let uc = UserTaskCtx::new();
+    uc.parked_in_syscall.store(true, Ordering::Release);
+    uc.kernel_stack_top.store(top, Ordering::Release);
+    let tf = (top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
+    // SAFETY: inside `stack`, suitably aligned.
+    unsafe {
+        // i386 nanosleep (162), with garbage above eax.
+        (*tf).rax = 0xDEAD_0000_0000_00A2;
+        ((*tf).rbx, (*tf).rcx, (*tf).rdx) = (0xFFFF_FFFF_0000_0011, 0x1_0000_0022, 0x33);
+        ((*tf).rsi, (*tf).rdi, (*tf).rbp) = (0x44, 0xAAAA_0000_0000_0055, 0x66);
+        // The 64-bit argument registers are not i386 arguments.
+        ((*tf).r10, (*tf).r8, (*tf).r9) = (0x777, 0x888, 0x999);
+        ((*tf).rsp, (*tf).rip) = (0xFFD0_0000, 0x0804_8123);
+        ((*tf).cs, (*tf).ss) = (0x23, 0x2B);
+        (*tf).vector = 0x80;
+    }
+    let got = uc.blocked_syscall_frame();
+    uc.parked_in_syscall.store(false, Ordering::Release);
+    drop(stack);
+    let want = [
+        162,
+        0x11,
+        0x22,
+        0x33,
+        0x44,
+        0x55,
+        0x66,
+        0xFFD0_0000,
+        0x0804_8123,
+    ];
+    if got != Some(want) {
+        return TestResult::Fail("an int 0x80 frame was not decoded as an i386 system call");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/ia32-int80",
+    smoke_blocked_syscall_decodes_int80_as_i386
+);
+
+// `clone(CLONE_SETTLS)` from an i386 task (Linux `set_new_tls` →
+// `do_set_thread_area(p, -1, tls, 0)` for a child that has not run): the
+// named slot gets the descriptor, and a child FS or GS selector naming that
+// slot gets the descriptor's base. No allocation: entry -1 is refused, as
+// is anything `tls_desc_okay` refuses.
+#[cfg(target_arch = "x86_64")]
+fn smoke_ia32_clone_settls_sets_child_slot_and_base() -> TestResult {
+    use crate::compat32::tls::set_child_tls;
+    use narf_arch::x86_64::segments::UserDesc;
+    const EINVAL: i64 = -22;
+    let desc = |entry_number, base_addr, flags| UserDesc {
+        entry_number,
+        base_addr,
+        limit: 0xF_FFFF,
+        flags,
+    };
+    // glibc's pthread_create TLS for slot 12, the parent's GS selector.
+    let mut segs = crate::UserSegments {
+        ds: 0x2B,
+        es: 0x2B,
+        gs: 0x63,
+        ..Default::default()
+    };
+    let (mut gs_base, mut fs_base) = (0xDEAD_0000u64, None);
+    if set_child_tls(
+        &mut segs,
+        &mut gs_base,
+        &mut fs_base,
+        &desc(12, 0x0804_C000, 0x51),
+    ) != 0
+    {
+        return TestResult::Fail("a valid CLONE_SETTLS descriptor was refused");
+    }
+    if segs.tls != [0x08DF_F304_C000_FFFF, 0, 0] {
+        return TestResult::Fail("the child's slot 12 does not hold the descriptor");
+    }
+    if gs_base != 0x0804_C000 || fs_base.is_some() {
+        return TestResult::Fail("the child's GS base is not the new descriptor's");
+    }
+    // A slot no child selector names leaves the bases alone; FS naming slot
+    // 13 takes its base.
+    segs.fs = 0x6B;
+    if set_child_tls(
+        &mut segs,
+        &mut gs_base,
+        &mut fs_base,
+        &desc(13, 0x0805_0000, 0x51),
+    ) != 0
+        || fs_base != Some(0x0805_0000)
+        || gs_base != 0x0804_C000
+    {
+        return TestResult::Fail("an FS selector naming the slot did not take its base");
+    }
+    let before = segs;
+    for bad in [
+        desc(u32::MAX, 0x1000, 0x51), // allocation is not allowed for a child
+        desc(11, 0x1000, 0x51),       // below GDT_ENTRY_TLS_MIN
+        desc(15, 0x1000, 0x51),       // above GDT_ENTRY_TLS_MAX
+        desc(14, 0x1000, 0x00),       // 16-bit
+    ] {
+        if set_child_tls(&mut segs, &mut gs_base, &mut fs_base, &bad) != EINVAL {
+            return TestResult::Fail("an invalid CLONE_SETTLS descriptor was not -EINVAL");
+        }
+    }
+    if segs != before {
+        return TestResult::Fail("a refused CLONE_SETTLS descriptor changed the child");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/ia32-tls",
+    smoke_ia32_clone_settls_sets_child_slot_and_base
+);
 
 // `/proc/<pid>/syscall` prints `task_current_syscall()`'s whole result:
 // number, six arguments, then the user SP and PC. Both come from the same
@@ -4428,8 +4559,8 @@ fn smoke_blocked_syscall_frame_reports_user_sp_and_pc() -> TestResult {
         // SAFETY: inside `stack`, suitably aligned.
         unsafe {
             (*tf).rax = 61;
-            ((*tf).rdi, (*tf).rsi, (*tf).rdx) = (0x11, 0x22, 0x33);
-            ((*tf).r10, (*tf).r8, (*tf).r9) = (0x44, 0x55, 0x66);
+            ((*tf).rbx, (*tf).rcx, (*tf).rdx) = (0x11, 0x22, 0x33);
+            ((*tf).rsi, (*tf).rdi, (*tf).rbp) = (0x44, 0x55, 0x66);
             ((*tf).rsp, (*tf).rip, (*tf).ss) = (SP, PC, 0x1b);
             (*tf).vector = 0x80;
         }

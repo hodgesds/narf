@@ -107,6 +107,7 @@ pub mod procfs;
 pub mod root_bootlog;
 pub mod root_mount;
 pub mod root_selector;
+pub mod super_magic;
 pub mod sync_all;
 pub mod sysfs;
 pub mod uevent;
@@ -138,8 +139,9 @@ pub use devfs::{
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile, UinputControlFile};
 pub use efivarfs::EfivarFs;
 pub use fs_registry::{
-    lookup_fstype, register_block_fstype, register_block_fstype_ctx, register_fs_type,
-    register_fstype, registered_fstypes, FileSystemType, FsBuilder, FsInit, MountRequest,
+    lookup_fstype, register_block_fstype, register_block_fstype_alias_ctx,
+    register_block_fstype_ctx, register_fs_type, register_fstype, registered_fstypes,
+    FileSystemType, FsBuilder, FsInit, MountRequest,
 };
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
@@ -2431,6 +2433,10 @@ pub const POLL_ERR: u32 = 0x0008;
 pub const POLL_HUP: u32 = 0x0010;
 /// `POLLNVAL` — fd not open / invalid.
 pub const POLL_NVAL: u32 = 0x0020;
+/// `POLLRDNORM` — normal data readable. Linux reports it alongside
+/// `POLLIN` wherever ordinary data is waiting (`devkmsg_poll`, sockets,
+/// pipes); the value is the uapi one, so it passes straight to `revents`.
+pub const POLL_RDNORM: u32 = 0x0040;
 
 /// Per-directory async op surface. `lookup` is synchronous because
 /// the only Stage-3 directory implementation (initramfs) is a flat
@@ -3017,6 +3023,44 @@ pub trait FsInstance: Send + Sync + 'static {
     /// btrfs subvolume mount, the bound directory for a bind mount.
     fn show_root(&self) -> String {
         String::from("/")
+    }
+
+    /// The filesystem type the mount listings print: Linux's `show_type`,
+    /// `sb->s_type->name` plus `.<subtype>` for a superblock that has one
+    /// (`fuse.portal`). It is the registered Linux type, where [`Self::name`]
+    /// is this instance's own label — a FAT volume is named by its FAT width
+    /// and lists as `vfat`, an in-memory tree under a label lists as `tmpfs`.
+    /// The default is the name, for the filesystems whose name already is
+    /// their Linux type.
+    fn fs_type(&self) -> &str {
+        self.name()
+    }
+
+    /// The superblock magic `statfs(2)` reports as `f_type`: Linux's
+    /// `sb->s_magic`, which every filesystem's `->statfs` copies into
+    /// `buf->f_type`. The default derives it from [`Self::fs_type`]
+    /// ([`super_magic::for_fs_type`]). A filesystem whose magic depends on
+    /// the volume (minix), or that is another filesystem's superblock seen
+    /// through a bind, answers itself.
+    fn magic(&self) -> u64 {
+        super_magic::for_fs_type(self.fs_type())
+    }
+
+    /// `statfs`'s `f_fsid` when the filesystem derives its own: ext2 and
+    /// btrfs from their UUIDs, FUSE none at all. `None` — the default, and
+    /// `simple_statfs` / every block filesystem's rule — is
+    /// `huge_encode_dev(sb->s_dev)`, the `st_dev` of the files on it.
+    fn statfs_fsid(&self) -> Option<u64> {
+        None
+    }
+
+    /// The inode number of the directory above this mount's root inside its
+    /// filesystem — `parent_ino(mnt_root)`, what `..` at the mount's root
+    /// lists. A filesystem mounted at its own root has none (its root dentry
+    /// is its own parent), which is the default `NotFound`; a bind of a
+    /// subdirectory answers with the directory above it.
+    fn root_parent_ino<'a>(&'a self) -> FsFuture<'a, u64> {
+        Box::pin(async { Err(FsError::NotFound) })
     }
 
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
@@ -4024,6 +4068,22 @@ impl Mount {
 }
 
 impl Mount {
+    /// This mount attached again at `path`, as `pivot_root` reattaches the
+    /// old root's tree: same filesystem, root dentry, `MNT_*` flags, peer
+    /// group and source, under a new mount id.
+    fn attached_copy(&self, path: String) -> Mount {
+        Mount {
+            path,
+            fs: self.fs.clone(),
+            root: self.root.clone(),
+            handle: Cap::<MountPoint, Write>::bootstrap(),
+            id: alloc_mount_id(),
+            flags: core::sync::atomic::AtomicU64::new(self.flags()),
+            group_id: core::sync::atomic::AtomicU64::new(self.group_id()),
+            devname: self.devname.clone(),
+        }
+    }
+
     /// This mount's `MNT_*` flags.
     pub fn flags(&self) -> u64 {
         self.flags.load(core::sync::atomic::Ordering::Acquire)
@@ -4113,39 +4173,35 @@ pub type MountInfoRow = (
 );
 
 fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
+    mountinfo_rows_of(&mounts.iter().collect::<Vec<_>>())
+}
+
+/// [`mountinfo_rows`] over a chosen subset of a table, still in attachment
+/// order; parents are found among the same subset.
+fn mountinfo_rows_of(mounts: &[&Mount]) -> Vec<MountInfoRow> {
     mounts
         .iter()
+        .copied()
         .enumerate()
         .map(|(index, mount)| {
-            // Mounts normally arrive parent-first, but boot-time discovery can
-            // attach a known nested filesystem before its backing root is
-            // available (the ESP at /mnt/boot before the distro root at
-            // /mnt).  Parentage is a property of the finished mount tree, not
-            // attachment order, so consider later ancestors too.  Equal-path
-            // overmounts are the exception: their parent is the preceding
-            // layer in that stack, never a layer attached above them later.
-            let parent = mounts
+            // The parent is the mount this one was attached on: the mount a
+            // walk reached at its mountpoint just before it ([`covering_mount`]
+            // over the earlier entries). The kernel's boot-time attaches go
+            // beneath the mounts already below them ([`Placement::Beneath`]),
+            // so the ESP at /mnt/boot, found before the distro root at /mnt,
+            // still sits after it here. A later mount over an ancestor covers
+            // this one; it is never its parent.
+            let parent = mounts[..index]
                 .iter()
-                .enumerate()
-                .filter(|(candidate_index, candidate)| {
-                    if *candidate_index == index {
-                        return false;
-                    }
-                    if mount.path == candidate.path {
-                        return *candidate_index < index;
-                    }
-                    candidate.path == "/"
-                        || (mount.path.starts_with(candidate.path.as_str())
-                            && mount.path.as_bytes().get(candidate.path.len()) == Some(&b'/'))
-                })
-                .max_by_key(|(candidate_index, candidate)| (candidate.path.len(), *candidate_index))
-                .map(|(_, candidate)| candidate.id)
+                .rev()
+                .find(|candidate| mount_covers_path(&candidate.path, &mount.path))
+                .map(|candidate| candidate.id)
                 .unwrap_or(0);
             (
                 mount.id,
                 parent,
                 mount.path.clone(),
-                String::from(mount.fs.name()),
+                String::from(mount.fs.fs_type()),
                 mnt_flags::render(mount.flags()),
                 mount.fs.show_options(),
                 sb_flags::render(sb_flags::of(&mount.fs)),
@@ -4156,32 +4212,29 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
         .collect()
 }
 
-/// The flags of the mount that covers `abs`, by the same longest-prefix,
-/// last-wins rule `single_mount_lookup_resolution` uses — so the answer always
-/// describes the mount a path operation on `abs` would actually reach.
+/// The flags of the mount that covers `abs`, by the same rule
+/// `single_mount_lookup_resolution` uses — so the answer always describes the
+/// mount a path operation on `abs` would actually reach.
 fn mount_flags_for(mounts: &[Mount], abs: &str) -> Option<u64> {
     covering_mount(mounts, abs).map(Mount::effective_flags)
 }
 
-/// The mount covering `abs` by the longest-prefix + newest-wins rule that all
-/// resolution uses. Shared by `mount_flags_for` / `mount_group_id_for`.
+/// The mount a path walk on `abs` reaches: the LATEST attachment at `abs` or
+/// at one of its ancestors.
+///
+/// Linux walks into the topmost mount at every component (`__lookup_mnt` /
+/// `follow_mount`). Every mount whose path is `abs` or an ancestor of it is a
+/// candidate, and the table is in attachment order, so a later candidate is
+/// on top of an earlier one: deeper, it was mounted inside it; at the same
+/// path, it is stacked on it; shallower, it was mounted over a directory
+/// above it and covers it, together with everything else attached below
+/// that directory before it. Shared by `mount_flags_for` /
+/// `mount_group_id_for`.
 fn covering_mount<'a>(mounts: &'a [Mount], abs: &str) -> Option<&'a Mount> {
-    let mut best: Option<&Mount> = None;
-    for mount in mounts {
-        if !mount_covers_path(&mount.path, abs) {
-            continue;
-        }
-        let better = match best {
-            None => true,
-            // Equal-length paths: the LAST mount wins, as an overmount
-            // shadows what it was stacked on.
-            Some(current) => mount.path.len() >= current.path.len(),
-        };
-        if better {
-            best = Some(mount);
-        }
-    }
-    best
+    mounts
+        .iter()
+        .rev()
+        .find(|mount| mount_covers_path(&mount.path, abs))
 }
 
 fn mount_group_id_for(mounts: &[Mount], abs: &str) -> Option<u64> {
@@ -4193,6 +4246,88 @@ fn mount_covers_path(mount_path: &str, abs: &str) -> bool {
     abs == mount_path
         || mount_path == "/"
         || (abs.starts_with(mount_path) && abs.as_bytes().get(mount_path.len()) == Some(&b'/'))
+}
+
+/// `do_move_mount`: detach the topmost mount at `source` together with every
+/// mount below it, and attach that tree on top at `target`
+/// (`attach_recursive_mnt`).
+///
+/// The table is in attachment order, so the moved mount's tree is the mount
+/// itself and each LATER entry below `source` — `umount_tree`'s set, the one
+/// `umount2` detaches. The tree keeps its internal order and goes to the end
+/// of the table: it is now the newest attachment at `target`, above whatever
+/// was mounted there or below it before.
+fn move_mount_tree(mounts: &mut Vec<Mount>, source: &str, target: &str) -> Result<(), FsError> {
+    // `for (; mnt_has_parent(p); p = p->mnt_parent) if (p == old) goto out;`
+    // with -ELOOP: the target may not lie in the tree being moved, which
+    // starts at the mount itself.
+    if target == source || path_is_proper_descendant(target, source) {
+        return Err(FsError::SymlinkLoop);
+    }
+    let top = mounts
+        .iter()
+        .rposition(|m| m.path == source)
+        .ok_or(FsError::NotFound)?;
+    let relocate = |path: &str| -> String {
+        if path == source {
+            return String::from(target);
+        }
+        let rest = if source == "/" {
+            &path[1..]
+        } else {
+            &path[source.len() + 1..]
+        };
+        if target == "/" {
+            alloc::format!("/{rest}")
+        } else {
+            alloc::format!("{}/{rest}", target.trim_end_matches('/'))
+        }
+    };
+    let mut tree = Vec::new();
+    for (index, mut mount) in core::mem::take(mounts).into_iter().enumerate() {
+        if index == top || (index > top && path_is_proper_descendant(&mount.path, source)) {
+            mount.path = relocate(&mount.path);
+            tree.push(mount);
+        } else {
+            mounts.push(mount);
+        }
+    }
+    mounts.extend(tree);
+    Ok(())
+}
+
+/// Where a new attachment goes in a mount table kept in attachment order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// `graft_tree`: an attach a task asks for — `mount(2)`, a bind, a
+    /// propagated copy — goes on top. It is appended, and covers whatever was
+    /// mounted at or below its mountpoint before it (see [`covering_mount`]).
+    OnTop,
+    /// The kernel's own assembly of the initial tree slots a filesystem in
+    /// BENEATH the mounts it already made below the mountpoint: the root at
+    /// `/` after /dev, /proc and /sys, the installed root at /mnt after its
+    /// ESP at /mnt/boot. Those stay on top, as a Linux initramfs keeps them
+    /// by moving them onto the new root before it switches to it.
+    Beneath,
+}
+
+/// Put `mount` into `mounts` per `placement`. [`Placement::Beneath`] goes
+/// after the mounts already at its path (it is still stacked on them) and
+/// before the first later one below its path.
+fn attach_mount(mounts: &mut Vec<Mount>, mount: Mount, placement: Placement) {
+    if placement == Placement::OnTop {
+        mounts.push(mount);
+        return;
+    }
+    let stacked = mounts
+        .iter()
+        .rposition(|m| m.path == mount.path)
+        .map_or(0, |index| index + 1);
+    let below = mounts[stacked..]
+        .iter()
+        .position(|m| path_is_proper_descendant(&m.path, &mount.path))
+        .map_or(mounts.len(), |offset| stacked + offset);
+    mounts.insert(below, mount);
 }
 
 #[inline]
@@ -4250,32 +4385,33 @@ impl MountLookupTable {
     }
 }
 
+/// [`covering_mount`] over the published routing table.
 fn covering_mount_lookup<'a>(mounts: &'a [MountLookup], abs: &str) -> Option<&'a MountLookup> {
-    let mut best: Option<&MountLookup> = None;
-    for mount in mounts {
-        if mount_covers_path(&mount.path, abs)
-            && best.map(|old| old.path.len()).unwrap_or(0) <= mount.path.len()
-        {
-            best = Some(mount);
-        }
-    }
-    best
+    mounts
+        .iter()
+        .rev()
+        .find(|mount| mount_covers_path(&mount.path, abs))
 }
 
-/// Select the mount covering `abs` only when no deeper mount has `abs` as a
-/// proper ancestor. The returned filesystem and relative path can therefore
-/// be walked without consulting the mount table between components.
+/// Select the mount covering `abs` only when no visible deeper mount has
+/// `abs` as a proper ancestor. The returned filesystem and relative path can
+/// therefore be walked without consulting the mount table between
+/// components. A deeper mount attached before the selected one is covered by
+/// it and cannot be reached from `abs`.
 fn single_mount_lookup_resolution(mounts: &[MountLookup], abs: &str) -> Option<MountResolution> {
     if abs.is_empty() || abs.as_bytes()[0] != b'/' {
         return None;
     }
-    let mount = covering_mount_lookup(mounts, abs)?;
+    let index = mounts
+        .iter()
+        .rposition(|mount| mount_covers_path(&mount.path, abs))?;
+    let mount = &mounts[index];
     let path = if abs == "/" {
         abs
     } else {
         abs.trim_end_matches('/')
     };
-    if mounts
+    if mounts[index + 1..]
         .iter()
         .any(|candidate| path_is_proper_descendant(&candidate.path, path))
     {
@@ -4300,12 +4436,37 @@ pub struct VfsRegistry {
     inner: IrqSafeSpinLock<Vec<Mount>>,
     lookup: RcuAtomic<MountLookupTable>,
     mountinfo_generation: core::sync::atomic::AtomicU64,
+    /// Old roots [`VfsRegistry::attach_old_root`] reattached, while their
+    /// attachment is still mounted. Always taken after `inner`.
+    pivots: IrqSafeSpinLock<Vec<PivotedRoot>>,
+}
+
+/// One `pivot_root`: the old root's tree at `old_root`, minus the new root's
+/// subtree at `new_root`, is attached at `put_old` as mount `attachment`.
+///
+/// Each copy in `copies` and the entry it was made from in `originals` are
+/// one Linux mount: `attach_mnt` moved it. A listing shows it once, at the
+/// place the reader's root reaches (see [`VfsRegistry::list_mountinfo_from`]).
+#[derive(Debug)]
+struct PivotedRoot {
+    old_root: String,
+    new_root: String,
+    put_old: String,
+    attachment: u64,
+    /// The topmost mount at `new_root` when the pivot ran — the new root
+    /// mount — if `new_root` was a mount point.
+    new_root_mount: Option<u64>,
+    /// Ids of the attachment at `put_old` and every copy made with it.
+    copies: Vec<u64>,
+    /// Ids of the entries those copies were made from.
+    originals: Vec<u64>,
 }
 
 static REGISTRY: VfsRegistry = VfsRegistry {
     inner: IrqSafeSpinLock::new(Vec::new()),
     lookup: RcuAtomic::null(),
     mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
+    pivots: IrqSafeSpinLock::new(Vec::new()),
 };
 
 static NEXT_MOUNT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -4871,6 +5032,9 @@ impl MountNamespace {
                 inner: IrqSafeSpinLock::new(copied),
                 lookup,
                 mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
+                // The copies have new mount ids, so no earlier pivot's
+                // attachment exists in this table.
+                pivots: IrqSafeSpinLock::new(Vec::new()),
             }),
         });
         ns_tree_add(
@@ -5119,8 +5283,8 @@ impl MountNamespace {
             .collect()
     }
 
-    /// The `MNT_*` flags of the mount covering `abs`, by the same
-    /// longest-prefix rule resolution uses, or `None` when no mount covers
+    /// The `MNT_*` flags of the mount covering `abs`, by the same rule
+    /// resolution uses (`covering_mount`), or `None` when no mount covers
     /// it.
     pub fn flags_at(&self, abs: &str) -> Option<u64> {
         let q = self.store().inner.lock();
@@ -5150,7 +5314,7 @@ impl MountNamespace {
     }
 
     /// `(path, group_id)` of the mount covering `abs` in this namespace, by the
-    /// longest-prefix + newest-wins rule. Used to find a just-attached mount's
+    /// rule resolution uses (`covering_mount`). Used to find a just-attached mount's
     /// PARENT mount (call with the new mount's parent directory) to decide
     /// whether propagation applies.
     pub fn covering_mount_info(&self, abs: &str) -> Option<(String, u64)> {
@@ -5201,6 +5365,11 @@ impl MountNamespace {
         mountinfo_rows(&self.store().inner.lock())
     }
 
+    /// [`VfsRegistry::list_mountinfo_from`] in this namespace's table.
+    pub fn list_mountinfo_from(&self, root: &str) -> Vec<MountInfoRow> {
+        self.store().list_mountinfo_from(root)
+    }
+
     /// ID of the newest visible mount covering `abs`.
     pub fn mount_id_at(&self, abs: &str) -> Option<u64> {
         self.store()
@@ -5242,38 +5411,21 @@ impl MountNamespace {
         flags: u64,
         devname: Option<&str>,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
-        authority.check_live()?;
-        let flags = if fs.always_read_only() {
-            flags | mnt_flags::READONLY
-        } else {
-            flags
-        };
-        let root = pathwalk::Dentry::root(fs.root());
-        let handle = Cap::<MountPoint, Write>::bootstrap();
-        let store = self.store();
-        let mut mounts = store.inner.lock();
-        mounts.push(Mount {
-            path: String::from(path),
-            fs,
-            root,
-            handle,
-            id: alloc_mount_id(),
-            flags: core::sync::atomic::AtomicU64::new(flags),
-            // A freshly created mount is PRIVATE (no peer group) until
-            // `mount --make-shared` marks it, exactly as Linux mounts start
-            // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
-            // already-shared parent is handled by the attach path, not here.
-            group_id: core::sync::atomic::AtomicU64::new(0),
-            devname: devname.map(Arc::from),
-        });
-        store.publish_lookup_locked(&mounts);
-        note_mnt_flags(flags);
-        store
-            .mountinfo_generation
-            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        drop(mounts);
-        notify_mount_change();
-        Ok(handle)
+        self.store()
+            .attach_arc(authority, path, fs, flags, devname, Placement::Beneath)
+    }
+
+    /// [`VfsRegistry::mount_arc_on_top`] in this namespace's table.
+    pub fn mount_arc_on_top(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+        flags: u64,
+        devname: Option<&str>,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.store()
+            .attach_arc(authority, path, fs, flags, devname, Placement::OnTop)
     }
 
     /// Bind an arbitrary directory into this private namespace.
@@ -5283,16 +5435,19 @@ impl MountNamespace {
         source: &str,
         target: &str,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
-        authority.check_live()?;
-        let source_mount = self
-            .store()
-            .lookup_covering_mount(source)
-            .ok_or(FsError::NotFound)?;
-        let rel = String::from(&source[source_mount.rel_start..]);
-        // A directory source binds as a subtree; a FILE source binds as a
-        // single file (mount --bind of a file).
-        let bind = build_bind_fs(&source_mount.fs, source_mount.root, &rel)?;
-        self.mount_arc_with_source(authority, target, bind, 0, source_mount.devname.as_deref())
+        self.store()
+            .attach_bind(authority, source, target, Placement::Beneath)
+    }
+
+    /// [`VfsRegistry::bind_mount_on_top`] in this namespace's table.
+    pub fn bind_mount_on_top(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        source: &str,
+        target: &str,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.store()
+            .attach_bind(authority, source, target, Placement::OnTop)
     }
 
     /// Detach the topmost mount at `path` from this private namespace.
@@ -5317,15 +5472,27 @@ impl MountNamespace {
         Ok(())
     }
 
-    /// Move the topmost mount at `source` to `target`.
+    /// [`VfsRegistry::attach_old_root`] in this namespace's table.
+    pub fn attach_old_root(
+        &self,
+        old_root: &str,
+        new_root: &str,
+        put_old: &str,
+    ) -> Result<u64, FsError> {
+        self.store().attach_old_root(old_root, new_root, put_old)
+    }
+
+    /// [`VfsRegistry::pivoted_location`] in this namespace's table.
+    pub fn pivoted_location(&self, path: &str) -> Option<String> {
+        self.store().pivoted_location(path)
+    }
+
+    /// Move the topmost mount at `source`, with the mounts below it, to
+    /// `target` (see `move_mount_tree`).
     pub fn move_mount(&self, source: &str, target: &str) -> Result<(), FsError> {
         let store = self.store();
         let mut q = store.inner.lock();
-        let index = q
-            .iter()
-            .rposition(|m| m.path == source)
-            .ok_or(FsError::NotFound)?;
-        q[index].path = String::from(target);
+        move_mount_tree(&mut q, source, target)?;
         store.publish_lookup_locked(&q);
         store
             .mountinfo_generation
@@ -5456,6 +5623,43 @@ impl FsInstance for BindMount {
     fn backing_identity(&self) -> usize {
         self.backing_identity
     }
+    fn fs_type(&self) -> &str {
+        self.source.fs_type()
+    }
+    fn statfs_fsid(&self) -> Option<u64> {
+        self.source.statfs_fsid()
+    }
+    /// The bound directory's parent in the source filesystem: walk to it from
+    /// the source's root, or ask the source when this binds its root.
+    fn root_parent_ino<'a>(&'a self) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            let base = self.source.show_root();
+            let rel = self
+                .root_path
+                .strip_prefix(base.trim_end_matches('/'))
+                .unwrap_or("");
+            let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+            if components.pop().is_none() {
+                return self.source.root_parent_ino().await;
+            }
+            let mut dir = self.source.root();
+            for component in components {
+                dir = dir.lookup_dir_async(component).await?;
+            }
+            match dir.ino() {
+                0 => Err(FsError::NotFound),
+                ino => Ok(ino),
+            }
+        })
+    }
+    /// A bind is the source's superblock: `statfs_by_dentry` reaches the
+    /// same `->statfs` through either path.
+    fn magic(&self) -> u64 {
+        self.source.magic()
+    }
+    fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
+        self.source.statfs()
+    }
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
         self.source.reconfigure(options)
     }
@@ -5499,6 +5703,9 @@ impl DirOps for EmptyDir {
 struct FileMount {
     file: Arc<dyn FileOps>,
     fs_name: String,
+    /// The filesystem the bound file lives on, whose superblock `statfs`
+    /// through this mount reports.
+    source: Arc<dyn FsInstance>,
     // A file bind is another mount attachment to the *source* inode, not a
     // new filesystem.  Preserve that identity for inode-aware VFS users such
     // as pathname AF_UNIX, which must recognise the source and target as the
@@ -5530,6 +5737,18 @@ impl FsInstance for FileMount {
     }
     fn root_file(&self) -> Option<Arc<dyn FileOps>> {
         Some(self.file.clone())
+    }
+    fn fs_type(&self) -> &str {
+        self.source.fs_type()
+    }
+    fn statfs_fsid(&self) -> Option<u64> {
+        self.source.statfs_fsid()
+    }
+    fn magic(&self) -> u64 {
+        self.source.magic()
+    }
+    fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
+        self.source.statfs()
     }
     fn show_devname(&self) -> Option<String> {
         self.devname.clone()
@@ -5609,6 +5828,7 @@ fn build_bind_fs(
             return Ok(Arc::new(FileMount {
                 file: node,
                 fs_name,
+                source: source_fs.clone(),
                 backing_identity: source_fs.backing_identity(),
                 devname: source_fs.show_devname(),
                 root_path,
@@ -5750,20 +5970,24 @@ impl VfsRegistry {
         };
         let root = pathwalk::Dentry::root(arc.root());
         let mut q = self.inner.lock();
-        q.push(Mount {
-            path: alloc::string::String::from(path),
-            fs: arc,
-            root,
-            handle,
-            id: alloc_mount_id(),
-            flags: core::sync::atomic::AtomicU64::new(flags),
-            // A freshly created mount is PRIVATE (no peer group) until
-            // `mount --make-shared` marks it, exactly as Linux mounts start
-            // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
-            // already-shared parent is handled by the attach path, not here.
-            group_id: core::sync::atomic::AtomicU64::new(0),
-            devname: None,
-        });
+        attach_mount(
+            &mut q,
+            Mount {
+                path: alloc::string::String::from(path),
+                fs: arc,
+                root,
+                handle,
+                id: alloc_mount_id(),
+                flags: core::sync::atomic::AtomicU64::new(flags),
+                // A freshly created mount is PRIVATE (no peer group) until
+                // `mount --make-shared` marks it, exactly as Linux mounts start
+                // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
+                // already-shared parent is handled by the attach path, not here.
+                group_id: core::sync::atomic::AtomicU64::new(0),
+                devname: None,
+            },
+            Placement::Beneath,
+        );
         self.publish_lookup_locked(&q);
         note_mnt_flags(flags);
         self.mountinfo_generation
@@ -5803,6 +6027,11 @@ impl VfsRegistry {
     /// `/proc/<pid>/mountinfo` print for a filesystem without
     /// `show_devname`. `None` is a mount the kernel made with no source
     /// string, which reports the filesystem's name.
+    ///
+    /// This is the kernel's own attach, used while it assembles the initial
+    /// tree: it goes beneath the mounts already made below `path`
+    /// (`Placement::Beneath`). An attach a task asks for is
+    /// [`Self::mount_arc_on_top`].
     pub fn mount_arc_with_source(
         &self,
         authority: &Cap<MountPoint, Grant>,
@@ -5810,6 +6039,32 @@ impl VfsRegistry {
         fs: Arc<dyn FsInstance>,
         flags: u64,
         devname: Option<&str>,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.attach_arc(authority, path, fs, flags, devname, Placement::Beneath)
+    }
+
+    /// Attach `fs` at `path` on top of whatever is mounted there or below
+    /// it, as `mount(2)` does (`do_add_mount` -> `graft_tree`): the mounts
+    /// made below `path` before it are covered until it goes.
+    pub fn mount_arc_on_top(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+        flags: u64,
+        devname: Option<&str>,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.attach_arc(authority, path, fs, flags, devname, Placement::OnTop)
+    }
+
+    fn attach_arc(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+        flags: u64,
+        devname: Option<&str>,
+        placement: Placement,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
         let flags = if fs.always_read_only() {
@@ -5820,20 +6075,24 @@ impl VfsRegistry {
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let root = pathwalk::Dentry::root(fs.root());
         let mut q = self.inner.lock();
-        q.push(Mount {
-            path: alloc::string::String::from(path),
-            fs,
-            root,
-            handle,
-            id: alloc_mount_id(),
-            flags: core::sync::atomic::AtomicU64::new(flags),
-            // A freshly created mount is PRIVATE (no peer group) until
-            // `mount --make-shared` marks it, exactly as Linux mounts start
-            // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
-            // already-shared parent is handled by the attach path, not here.
-            group_id: core::sync::atomic::AtomicU64::new(0),
-            devname: devname.map(Arc::from),
-        });
+        attach_mount(
+            &mut q,
+            Mount {
+                path: alloc::string::String::from(path),
+                fs,
+                root,
+                handle,
+                id: alloc_mount_id(),
+                flags: core::sync::atomic::AtomicU64::new(flags),
+                // A freshly created mount is PRIVATE (no peer group) until
+                // `mount --make-shared` marks it, exactly as Linux mounts start
+                // with `mnt_group_id == 0`. Propagation of a new mount UNDER an
+                // already-shared parent is handled by the attach path, not here.
+                group_id: core::sync::atomic::AtomicU64::new(0),
+                devname: devname.map(Arc::from),
+            },
+            placement,
+        );
         self.publish_lookup_locked(&q);
         note_mnt_flags(flags);
         self.mountinfo_generation
@@ -5850,14 +6109,40 @@ impl VfsRegistry {
     /// Useful for exposing a subtree of one filesystem at another
     /// path without remounting the whole volume (Linux's
     /// `mount --bind <source> <target>`).
+    ///
+    /// Like [`Self::mount_arc_with_source`], this attach goes beneath the
+    /// mounts already below `target`; [`Self::bind_mount_on_top`] is the one
+    /// `mount(MS_BIND)` makes.
     pub fn bind_mount(
         &self,
         authority: &Cap<MountPoint, Grant>,
         source: &str,
         target: &str,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.attach_bind(authority, source, target, Placement::Beneath)
+    }
+
+    /// [`Self::bind_mount`] attached on top of whatever is mounted at or
+    /// below `target`, as `mount(MS_BIND)` does (`do_loopback` ->
+    /// `graft_tree`).
+    pub fn bind_mount_on_top(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        source: &str,
+        target: &str,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.attach_bind(authority, source, target, Placement::OnTop)
+    }
+
+    fn attach_bind(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        source: &str,
+        target: &str,
+        placement: Placement,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
-        // Resolve the longest mount prefix first, then walk the remaining
+        // Resolve the covering mount first, then walk the remaining
         // directory components. Linux permits binding any directory, not only
         // a filesystem root; systemd relies on that while constructing a
         // service's private mount namespace.
@@ -5868,7 +6153,8 @@ impl VfsRegistry {
         // A directory source binds as a subtree; a FILE source binds as a
         // single file (mount --bind of a file).
         let bind = build_bind_fs(&source_mount.fs, source_mount.root, &rel)?;
-        self.mount_arc_with_source(authority, target, bind, 0, source_mount.devname.as_deref())
+        let devname = source_mount.devname.as_deref();
+        self.attach_arc(authority, target, bind, 0, devname, placement)
     }
 
     /// Mount a writable overlay at `path`: the directory currently visible at
@@ -6025,6 +6311,228 @@ impl VfsRegistry {
         mountinfo_rows(&self.inner.lock())
     }
 
+    /// [`Self::list_mountinfo`] as a reader whose root is `root` sees it:
+    /// each mount once.
+    ///
+    /// `pivot_root` moves mounts (`attach_mnt`), and this table represents a
+    /// moved mount twice — the copy at put_old and the entry it came from
+    /// (see [`Self::attach_old_root`]). `show_mountinfo` and `listmount` walk
+    /// the one tree the reader's root reaches (`seq_path_root`,
+    /// `is_path_reachable`), so which entry is the mount depends on where
+    /// that root is:
+    ///
+    /// * at or below the pivot's new root — every task the pivot was made
+    ///   for: the copies are the mounts while the attachment at put_old is
+    ///   mounted, and the entries at their former paths are stale;
+    /// * anywhere else — a task still rooted in the old root, which Linux's
+    ///   `chroot_fs_refs` would have moved but NARF leaves alone: it sees the
+    ///   old root's tree as it was, so never the copies (a second view of
+    ///   that tree) and, while the attachment is mounted, not the new root's
+    ///   subtree either (above the old root, unreachable from it).
+    ///
+    /// Copies outliving their attachment — only a direct registry pop of
+    /// put_old's top mount leaves them — are listed for no one: Linux's
+    /// `umount_tree` takes an attachment's children with it, and a plain
+    /// umount of a mount with children is -EBUSY.
+    ///
+    /// Mount ids stay unique and the order stays attachment order, which is
+    /// what `listmount`'s cursor relies on.
+    pub fn list_mountinfo_from(&self, root: &str) -> alloc::vec::Vec<MountInfoRow> {
+        let q = self.inner.lock();
+        let pivots = self.pivots.lock();
+        let under = |path: &str, base: &str| path == base || path_is_proper_descendant(path, base);
+        let mut hidden = alloc::collections::BTreeSet::new();
+        for pivot in pivots.iter() {
+            let attached = q.iter().any(|m| m.id == pivot.attachment);
+            if under(root, &pivot.new_root) {
+                hidden.extend(pivot.originals.iter().copied());
+                if !attached {
+                    // `umount_tree` takes an attachment's children with it;
+                    // copies left behind belong to no tree.
+                    hidden.extend(pivot.copies.iter().copied());
+                }
+            } else {
+                hidden.extend(pivot.copies.iter().copied());
+                if !attached {
+                    continue;
+                }
+                if let Some(new_root_mount) = pivot.new_root_mount {
+                    hidden.extend(
+                        q.iter()
+                            .filter(|m| m.id >= new_root_mount && under(&m.path, &pivot.new_root))
+                            .map(|m| m.id),
+                    );
+                }
+            }
+        }
+        drop(pivots);
+        let visible: Vec<&Mount> = q.iter().filter(|m| !hidden.contains(&m.id)).collect();
+        mountinfo_rows_of(&visible)
+    }
+
+    /// `pivot_root`'s `attach_mnt(root_mnt, old_mnt, old_mp)`: attach the old
+    /// root at `put_old` WITH every mount below it, as `fs/namespace.c`'s
+    /// `path_pivot_root` moves the whole `root_mnt` tree there. Only the new
+    /// root's own subtree stays behind — the topmost mount at `new_root` and
+    /// whatever was attached at or below `new_root` after it — because
+    /// `umount_mnt(new_mnt)` detached that subtree from the old root first.
+    ///
+    /// The table is path-keyed, so the attachment is a copy of each entry
+    /// sharing its filesystem, root dentry, `MNT_*` flags, peer group and
+    /// source; the originals stay at their old paths, outside the caller's
+    /// new root, where only a descriptor opened before the pivot still
+    /// reaches them — the part of a lazily detached tree Linux keeps alive
+    /// for its holders. A root that is not itself a mount point (NARF lets a
+    /// chroot directory be one) is attached as a bind of that directory.
+    /// The copies are appended in attachment order, the old root first, so
+    /// a later lazy unmount of `put_old` takes all of them.
+    ///
+    /// Returns the mount id of the old root's attachment at `put_old`.
+    pub fn attach_old_root(
+        &self,
+        old_root: &str,
+        new_root: &str,
+        put_old: &str,
+    ) -> Result<u64, FsError> {
+        // A root inside a mount is bound from its covering mount, resolved
+        // before the writer lock (the lookup takes the RCU read side).
+        let bind_root = match self.mount_flags_exact(old_root) {
+            Some(_) => None,
+            None => {
+                let covering = self
+                    .lookup_covering_mount(old_root)
+                    .ok_or(FsError::NotFound)?;
+                let rel = String::from(&old_root[covering.rel_start..]);
+                let fs = build_bind_fs(&covering.fs, covering.root, &rel)?;
+                Some((fs, covering.devname))
+            }
+        };
+        let relocate = |path: &str| -> String {
+            let rel = if old_root == "/" {
+                path
+            } else {
+                &path[old_root.len()..]
+            };
+            if put_old == "/" {
+                String::from(rel)
+            } else {
+                alloc::format!("{}{}", put_old.trim_end_matches('/'), rel)
+            }
+        };
+        let mut q = self.inner.lock();
+        let new_top = q.iter().rposition(|m| m.path == new_root);
+        let in_new_root = |index: usize, mount: &Mount| {
+            new_top.is_some_and(|top| {
+                index == top
+                    || (index > top
+                        && (mount.path == new_root
+                            || path_is_proper_descendant(&mount.path, new_root)))
+            })
+        };
+        let mut originals = Vec::new();
+        let root_copy = match bind_root {
+            Some((fs, devname)) => Mount {
+                path: String::from(put_old),
+                root: pathwalk::Dentry::root(fs.root()),
+                fs,
+                handle: Cap::<MountPoint, Write>::bootstrap(),
+                id: alloc_mount_id(),
+                flags: core::sync::atomic::AtomicU64::new(
+                    covering_mount(&q[..], old_root).map_or(0, Mount::flags),
+                ),
+                group_id: core::sync::atomic::AtomicU64::new(0),
+                devname,
+            },
+            None => {
+                let top = q
+                    .iter()
+                    .rposition(|m| m.path == old_root)
+                    .ok_or(FsError::NotFound)?;
+                originals.push(q[top].id);
+                q[top].attached_copy(String::from(put_old))
+            }
+        };
+        let root_id = root_copy.id;
+        let below: Vec<Mount> = q
+            .iter()
+            .enumerate()
+            .filter(|(index, mount)| {
+                path_is_proper_descendant(&mount.path, old_root) && !in_new_root(*index, mount)
+            })
+            .map(|(_, mount)| {
+                originals.push(mount.id);
+                mount.attached_copy(relocate(&mount.path))
+            })
+            .collect();
+        let mut copies = alloc::vec![root_id];
+        copies.extend(below.iter().map(|mount| mount.id));
+        let new_root_mount = new_top.map(|top| q[top].id);
+        q.push(root_copy);
+        q.extend(below);
+        {
+            let mut pivots = self.pivots.lock();
+            // A record matters while either view of its mounts exists.
+            pivots.retain(|pivot| {
+                q.iter()
+                    .any(|m| pivot.copies.contains(&m.id) || pivot.originals.contains(&m.id))
+            });
+            pivots.push(PivotedRoot {
+                old_root: String::from(old_root),
+                new_root: String::from(new_root),
+                put_old: String::from(put_old),
+                attachment: root_id,
+                new_root_mount,
+                copies,
+                originals,
+            });
+        }
+        self.publish_lookup_locked(&q);
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        drop(q);
+        notify_mount_change();
+        Ok(root_id)
+    }
+
+    /// Where `path` — a host path inside an old root that `pivot_root`
+    /// reattached — is attached now: under the old root's `put_old`
+    /// attachment, while that attachment is still mounted. `None` for a path
+    /// no live pivot moved (including one inside the new root's subtree,
+    /// which stayed where it was).
+    ///
+    /// A descriptor opened on such a path still names the mount Linux moved;
+    /// this is its current location. Once the attachment is unmounted the
+    /// original entry, outside the caller's root, stands for the detached
+    /// tree, as [`Self::attach_old_root`] describes.
+    pub fn pivoted_location(&self, path: &str) -> Option<String> {
+        let q = self.inner.lock();
+        let pivots = self.pivots.lock();
+        let under = |path: &str, base: &str| path == base || path_is_proper_descendant(path, base);
+        pivots
+            .iter()
+            .rev()
+            .find(|pivot| {
+                under(path, &pivot.old_root)
+                    && !under(path, &pivot.new_root)
+                    && q.iter()
+                        .any(|m| m.id == pivot.attachment && m.path == pivot.put_old)
+            })
+            .map(|pivot| {
+                let rel = if pivot.old_root != "/" {
+                    &path[pivot.old_root.len()..]
+                } else if path == "/" {
+                    ""
+                } else {
+                    path
+                };
+                if pivot.put_old == "/" {
+                    String::from(if rel.is_empty() { "/" } else { rel })
+                } else {
+                    alloc::format!("{}{}", pivot.put_old, rel)
+                }
+            })
+    }
+
     /// ID of the visible mount covering `abs`.
     pub fn mount_id_at(&self, abs: &str) -> Option<u64> {
         self.lookup_covering_mount(abs).map(|mount| mount.id)
@@ -6061,7 +6569,8 @@ impl VfsRegistry {
         Ok(())
     }
 
-    /// Move a mounted filesystem from `source` to `target`.
+    /// Move a mounted filesystem from `source`, with the mounts below it, to
+    /// `target` (see `move_mount_tree`).
     pub fn move_mount(
         &self,
         authority: &Cap<MountPoint, Grant>,
@@ -6070,12 +6579,8 @@ impl VfsRegistry {
     ) -> Result<(), FsError> {
         authority.check_live()?;
         let mut q = self.inner.lock();
-        let index = q
-            .iter()
-            .rposition(|m| m.path == source)
-            .ok_or(FsError::NotFound)?;
         // Overmount is allowed: moving onto an occupied path stacks (see `mount`).
-        q[index].path = String::from(target);
+        move_mount_tree(&mut q, source, target)?;
         self.publish_lookup_locked(&q);
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -6109,10 +6614,11 @@ impl VfsRegistry {
         Some(f(&*fs, root))
     }
 
-    /// Resolve a POSIX-shaped absolute path by finding the
-    /// longest mount-prefix match and running `f` against the
-    /// matching FS with the remaining suffix (leading `/`
-    /// stripped). Returns `None` when no mount covers the path.
+    /// Resolve a POSIX-shaped absolute path by finding the mount a
+    /// walk reaches (the latest attachment at the path or an ancestor
+    /// of it) and running `f` against the matching FS with the
+    /// remaining suffix (leading `/` stripped). Returns `None` when no
+    /// mount covers the path.
     ///
     /// Examples (with `/test` and `/test/sub` both mounted):
     ///   `/test/foo`     → `/test`     + `foo`
@@ -6158,7 +6664,7 @@ impl VfsRegistry {
     }
 
     /// Clone the `Arc<dyn FsInstance>` of the mount covering `abs` (the
-    /// longest-prefix match). Used by the new mount API's `open_tree` /
+    /// one a walk reaches). Used by the new mount API's `open_tree` /
     /// `fspick` to grab an existing mount's filesystem object.
     pub fn fs_arc_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
         self.lookup_covering_mount(abs).map(|mount| mount.fs)
@@ -6485,6 +6991,10 @@ impl FsInstance for Initramfs {
     }
     fn name(&self) -> &str {
         self.name
+    }
+    /// The unpacked initramfs is Linux's `rootfs` (`init_rootfs`).
+    fn fs_type(&self) -> &str {
+        "rootfs"
     }
 }
 
@@ -7032,6 +7542,9 @@ impl FsInstance for VirtiofsMount {
     }
     fn name(&self) -> &str {
         self.name
+    }
+    fn fs_type(&self) -> &str {
+        "virtiofs"
     }
 }
 

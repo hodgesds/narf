@@ -556,6 +556,7 @@ pub(crate) fn route_fences(
                     Ok(iv) => {
                         if let Some(engine) = fence_engine(&iv) {
                             crate::amdgpu_fence_navi22::notify(engine);
+                            crate::amdgpu_navi22_cs::fence_interrupt();
                         } else if fault {
                             // An old IH task may have waited across a reset.
                             // Never charge its fault to the replacement owner.
@@ -1875,7 +1876,8 @@ impl ColdBoot {
                 .and_then(Queues::proof)
                 .is_some()
     }
-    /// TDR sample of every verified kernel queue; empty without queues.
+    /// TDR sample of every verified kernel queue and client media ring;
+    /// empty without queues.
     pub(crate) fn queue_progress(
         &mut self,
     ) -> Result<alloc::vec::Vec<crate::amdgpu_navi22_tdr::Progress>, Error> {
@@ -1895,7 +1897,42 @@ impl ColdBoot {
         samples.push(queues.gfx.progress().map_err(Error::Queues)?);
         samples.extend(queues.compute.progress().map_err(Error::Queues)?);
         samples.extend(queues.sdma.progress().map_err(Error::Queues)?);
+        // The client media rings: Linux's drm_sched `video_timeout`.
+        if let Some(media) = self.sequence.backend.media.as_mut() {
+            samples.extend(media.client_progress().map_err(Error::Media)?);
+        }
         Ok(samples)
+    }
+    /// The per-queue reset of VCN instance `i` after a client job timed out
+    /// (`amdgpu_vcn_reset_engine`), with PMFW power and the PSP DPG register
+    /// list as in begin-use; `cancel` receives the outstanding client work
+    /// the reset force-completes.
+    pub(crate) async fn reset_media(
+        &mut self,
+        i: usize,
+        cancel: impl FnOnce(&[crate::amdgpu_vcn_navi22::idle::Cancelled]),
+    ) -> Result<(), Error> {
+        let h = &mut self.sequence.backend;
+        let media = h.media.as_mut().ok_or(Error::Invalid)?;
+        let mut control = crate::amdgpu_vcn_navi22::idle::Owned {
+            smu: h.smu.as_mut(),
+            psp: h.psp.as_mut().ok_or(Error::Invalid)?,
+        };
+        media
+            .reset_engine(&mut control, i, cancel)
+            .await
+            .map_err(Error::Media)
+    }
+    /// Timeout-only evidence of a client media job that never completed
+    /// (`Media::report_client_timeout`); nothing without a media owner.
+    pub(crate) fn media_timeout_report(
+        &mut self,
+        ring: crate::amdgpu_navi22_submit::MediaRing,
+        seq: u32,
+    ) {
+        if let Some(media) = self.sequence.backend.media.as_mut() {
+            media.report_client_timeout(ring, seq);
+        }
     }
     /// Timeout-only graphics evidence from the retained verified queue.
     pub(crate) fn gfx_hang_snapshot(

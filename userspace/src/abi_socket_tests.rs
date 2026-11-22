@@ -8083,8 +8083,13 @@ fn smoke_abi_netlink_route_point_lookup() -> TestResult {
             return Err("RTM_GETROUTE point lookup did not return RTM_NEWROUTE");
         }
         let flags = u16::from_ne_bytes([reply[6], reply[7]]);
-        if flags & 2 != 0 || reply[NLMSG_HDRLEN + 1] != 24 {
-            return Err("route point reply was multipart or selected the wrong prefix");
+        // `rt_fill_info`: the cloned output route, rtm_dst_len 32, RTA_DST
+        // the queried address, through the longest-prefix route's gateway.
+        if flags & 2 != 0 || reply[NLMSG_HDRLEN + 1] != 32 {
+            return Err("route point reply was multipart or not the cloned /32 route");
+        }
+        if !window_contains(&reply[..n as usize], &[198, 19, 7, 42]) {
+            return Err("route point reply omitted the queried destination");
         }
         if !window_contains(&reply[..n as usize], &[192, 0, 2, 1]) {
             return Err("route point reply omitted the selected gateway");
@@ -12653,6 +12658,551 @@ fn smoke_abi_socket_sockopt_mcast6_delivery_pos() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_sockopt_mcast6_delivery_pos
+);
+
+/// The desktop's IPv6 state: a link-local address only, and a route to the
+/// world via the router's link-local address. Linux `ip6_datagram_connect`
+/// → `ip6_dst_lookup_flow` takes the route and `ipv6_dev_get_saddr` picks
+/// the link-local address (RFC 6724 rule 2 ranks scopes, it filters none),
+/// so connect succeeds; `inet6_getname` then reports
+/// `ipv6_iface_scope_id(addr, sk->sk_bound_dev_if)` — the socket's bound
+/// device, which a connect to a global address leaves 0. Chromium's
+/// `IsGloballyReachable` reads this source and treats link-local as "no
+/// IPv6". NARF reported the egress ifindex as sin6_scope_id.
+fn smoke_abi_socket_inet6_udp_link_local_source_scope_is_bound_dev() -> TestResult {
+    with_setup(|| {
+        fn discard(_: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+            Ok(())
+        }
+        const IFACE: &str = "abi-v6ll0";
+        const LL: [u8; 16] = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x55, 0x65, 0x7b, 0x7b, 0x9a, 0xbe, 0xb7, 0xb1,
+        ];
+        const ROUTER: [u8; 16] = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x84, 0x43, 0x42, 0xff, 0xfe, 0xa5, 0x25, 0x61,
+        ];
+        const PREFIX: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0x77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        const DST: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0x77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+        ];
+        narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0x6c, 1], discard);
+        narf_net::iface::set_link_state(IFACE, true);
+        narf_net::ipv6::addrs::add(narf_net::ipv6::addrs::Ipv6IfAddr {
+            iface: alloc::string::String::from(IFACE),
+            addr: LL,
+            prefix_len: 64,
+            state: narf_net::ipv6::addrs::AddrState::Preferred,
+            scope: narf_net::ipv6::addrs::AddrScope::LinkLocal,
+            preferred_deadline_ns: u64::MAX,
+            valid_deadline_ns: u64::MAX,
+            temporary: false,
+        });
+        narf_net::ipv6::route::add(narf_net::ipv6::route::Route {
+            prefix: PREFIX,
+            prefix_len: 48,
+            gateway: Some(ROUTER),
+            iface: alloc::string::String::from(IFACE),
+            metric: 1024,
+            valid_deadline_ns: 0,
+            protocol: narf_net::ipv6::route::RTPROT_KERNEL,
+            pref: narf_net::ipv6::route::PREF_MEDIUM,
+        });
+        let result = (|| {
+            let u = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+            let peer = sockaddr_in6(DST, 443, 0);
+            if call(
+                Syscall::SocketConnect.raw(),
+                a2(u, peer.as_ptr() as u64, peer.len() as u64),
+            ) != Some(0)
+            {
+                return Err("connect to a global address via a link-local router failed");
+            }
+            let mut out = [0u8; 28];
+            let mut outlen = (out.len() as u32).to_ne_bytes();
+            if call(
+                Syscall::SocketGetSockName.raw(),
+                a2(u, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("getsockname failed");
+            }
+            if out[8..24] != LL {
+                return Err("the connected source is not the link-local address");
+            }
+            if u32::from_ne_bytes([out[24], out[25], out[26], out[27]]) != 0 {
+                return Err("sin6_scope_id is not sk_bound_dev_if (0) for an unbound socket");
+            }
+            sockopt_close(&[u]);
+            Ok(())
+        })();
+        narf_net::ipv6::route::remove(&PREFIX, 48, IFACE);
+        narf_net::ipv6::addrs::remove(IFACE, &LL);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/inet6-llsrc",
+    smoke_abi_socket_inet6_udp_link_local_source_scope_is_bound_dev
+);
+
+/// NetworkManager's ndisc (libndp `myrecvfrom6`) learns which device a
+/// Router Advertisement arrived on from the raw ICMPv6 socket: the
+/// link-local source's `sin6_scope_id` and the IPV6_PKTINFO ifindex, and
+/// RFC 4861 §6.1.2 validity from the IPV6_HOPLIMIT (255). Linux
+/// `rawv6_recvmsg` sets `sin6_scope_id = ipv6_iface_scope_id(saddr,
+/// inet6_iif(skb))` and `ip6_datagram_recv_ctl` emits both cmsgs. NARF gave
+/// scope 0 and no control messages, so a handler registered for one ifindex
+/// never saw an RA and NM never configured IPv6 (SLAAC, DHCPv6, RDNSS).
+fn smoke_abi_socket_icmp6_raw_ra_reports_ingress_device_and_hoplimit() -> TestResult {
+    const SOL_IPV6: i32 = 41;
+    const IPV6_PKTINFO: i32 = 50;
+    const IPV6_HOPLIMIT: i32 = 52;
+    const IPPROTO_ICMPV6: u64 = 58;
+    const MSG_DONTWAIT: u64 = 0x40;
+    const IFACE: &str = "abi-v6ra0";
+    const ROUTER: [u8; 16] = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x84, 0x43, 0x42, 0xff, 0xfe, 0xa5, 0x25, 0x61,
+    ];
+    const ALL_NODES: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    fn discard(_: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    with_setup(|| {
+        narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0x6d, 1], discard);
+        narf_net::iface::set_link_state(IFACE, true);
+        let ifindex = narf_net::iface::ifindex_of(IFACE).ok_or("test device has no ifindex")?;
+        let fd = match socket_errno(so::AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)? {
+            fd if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6) failed"),
+        };
+        let result = (|| -> Result<(), &'static str> {
+            if sockopt_set_int(fd, so::IPPROTO_IPV6, so::IPV6_RECVPKTINFO, 1)? != 0
+                || sockopt_set_int(fd, so::IPPROTO_IPV6, so::IPV6_RECVHOPLIMIT, 1)? != 0
+            {
+                return Err("enabling IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT failed");
+            }
+            // A Router Advertisement with router lifetime 0 (no default
+            // route is installed), from the router's link-local address.
+            let mut ra = [0u8; 16];
+            ra[0] = 134;
+            ra[4] = 64;
+            let sum = narf_net::ipv6_stack::icmp6_checksum(ROUTER, ALL_NODES, &ra);
+            ra[2..4].copy_from_slice(&sum.to_be_bytes());
+            let mut packet = alloc::vec![0x60, 0, 0, 0, 0, 16, 58, 255];
+            packet.extend_from_slice(&ROUTER);
+            packet.extend_from_slice(&ALL_NODES);
+            packet.extend_from_slice(&ra);
+            narf_net::ipv6_stack::rx_frame(IFACE, &packet);
+
+            let mut data = [0u8; 64];
+            let mut name = [0u8; 28];
+            let mut ctrl = [0u8; 128];
+            let mut iov = [0u8; 16];
+            iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+            iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+            let mut msg = [0u8; 56];
+            msg[0..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes());
+            msg[8..12].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+            msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+            match call(
+                Syscall::SocketRecvMsg.raw(),
+                a2(fd, msg.as_mut_ptr() as u64, MSG_DONTWAIT),
+            ) {
+                Some(16) => {}
+                _ => return Err("the raw ICMPv6 socket did not receive the 16-byte RA"),
+            }
+            if data[0] != 134 || name[8..24] != ROUTER {
+                return Err("the received message is not the router's RA");
+            }
+            if u32::from_ne_bytes([name[24], name[25], name[26], name[27]]) != ifindex {
+                return Err("the RA's link-local source has no ingress sin6_scope_id");
+            }
+            let used = u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize;
+            let len0 = u64::from_ne_bytes(ctrl[0..8].try_into().unwrap()) as usize;
+            let level0 = i32::from_ne_bytes(ctrl[8..12].try_into().unwrap());
+            let kind0 = i32::from_ne_bytes(ctrl[12..16].try_into().unwrap());
+            let pktinfo_dst = &ctrl[16..32];
+            let pktinfo_ifindex = u32::from_ne_bytes(ctrl[32..36].try_into().unwrap());
+            let len1 = u64::from_ne_bytes(ctrl[40..48].try_into().unwrap()) as usize;
+            let level1 = i32::from_ne_bytes(ctrl[48..52].try_into().unwrap());
+            let kind1 = i32::from_ne_bytes(ctrl[52..56].try_into().unwrap());
+            let hoplimit = i32::from_ne_bytes(ctrl[56..60].try_into().unwrap());
+            if used != 64
+                || (len0, level0, kind0) != (36, SOL_IPV6, IPV6_PKTINFO)
+                || pktinfo_dst != ALL_NODES
+                || pktinfo_ifindex != ifindex
+                || (len1, level1, kind1) != (20, SOL_IPV6, IPV6_HOPLIMIT)
+                || hoplimit != 255
+            {
+                return Err("the RA carried no IPV6_PKTINFO(ifindex) / IPV6_HOPLIMIT(255)");
+            }
+            Ok(())
+        })();
+        sockopt_close(&[fd]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/icmp6-raw-ra",
+    smoke_abi_socket_icmp6_raw_ra_reports_ingress_device_and_hoplimit
+);
+
+/// IP_UNICAST_IF is the output device of an unbound socket's unicast
+/// traffic: `ip4_datagram_connect` and `udp_sendmsg` take `inet->uc_index`
+/// as `oif` when `sk_bound_dev_if` is 0, so the route, and with it the
+/// source address, are that device's. systemd-resolved scopes its per-link
+/// DNS sockets this way. NARF stored the option and never read it.
+fn smoke_abi_socket_ip_unicast_if_picks_the_output_device() -> TestResult {
+    const A: &str = "abi-ucif-a";
+    const B: &str = "abi-ucif-b";
+    const A_IP: [u8; 4] = [10, 42, 3, 165];
+    const A_GW: [u8; 4] = [10, 42, 3, 1];
+    const B_IP: [u8; 4] = [10, 42, 1, 211];
+    const DST: [u8; 4] = [198, 18, 42, 9];
+    fn discard(_: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    fn local_addr(fd: u64) -> Result<[u8; 4], &'static str> {
+        let mut out = [0u8; 16];
+        let mut outlen = (out.len() as u32).to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("getsockname failed");
+        }
+        Ok([out[4], out[5], out[6], out[7]])
+    }
+    fn connect_dst(fd: u64) -> Result<(), &'static str> {
+        let sa = sockaddr_in(u32::from_be_bytes(DST), 53);
+        match call(
+            Syscall::SocketConnect.raw(),
+            a2(fd, sa.as_ptr() as u64, sa.len() as u64),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("UDP connect failed"),
+        }
+    }
+    let net = narf_net::route::Ipv4Net {
+        addr: narf_net::ipv4::Ipv4Addr([198, 18, 42, 0]),
+        prefix_len: 24,
+    };
+    with_setup(|| {
+        for (name, mac, ip) in [(A, 0xa1, A_IP), (B, 0xb1, B_IP)] {
+            narf_net::iface::register(name, [0x02, 0, 0, 0, 0x2a, mac], discard);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_iface_ipv4_fields(name, ip, [0; 4]);
+            narf_net::iface::add_addr(name, ip, 24);
+        }
+        narf_net::route::route_add(narf_net::route::Route {
+            net_ns_id: 0,
+            dst: net,
+            gateway: Some(narf_net::ipv4::Ipv4Addr(A_GW)),
+            iface: alloc::string::String::from(A),
+            src_hint: None,
+            metric: 0,
+            scope: narf_net::route::Scope::Universe,
+            table: narf_net::route::TABLE_MAIN,
+            protocol: narf_net::route::RTPROT_KERNEL,
+        });
+        let result = (|| -> Result<(), &'static str> {
+            let b_index = narf_net::iface::ifindex_of(B).ok_or("B has no ifindex")?;
+            let plain = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+            connect_dst(plain)?;
+            if local_addr(plain)? != A_IP {
+                return Err("baseline: the route's device A did not source the socket");
+            }
+            let scoped = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+            if sockopt_set_int(
+                scoped,
+                so::IPPROTO_IP,
+                so::IP_UNICAST_IF,
+                b_index.to_be() as i32,
+            )? != 0
+            {
+                return Err("IP_UNICAST_IF(B) failed");
+            }
+            connect_dst(scoped)?;
+            if local_addr(scoped)? != B_IP {
+                return Err("IP_UNICAST_IF did not make B the output device and source");
+            }
+            sockopt_close(&[plain, scoped]);
+            Ok(())
+        })();
+        narf_net::route::route_delete(net, A, narf_net::route::TABLE_MAIN);
+        narf_net::iface::del_addr(A, A_IP, 24);
+        narf_net::iface::del_addr(B, B_IP, 24);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/ip-unicast-if",
+    smoke_abi_socket_ip_unicast_if_picks_the_output_device
+);
+
+/// `ping_v4_sendmsg` routes with `ipc.oif = sk_bound_dev_if` (else
+/// IP_UNICAST_IF) and sources from the bound address (`inet->inet_saddr`),
+/// and `ping_recvmsg` → `ip_cmsg_recv` reports the reply's TTL as an IP_TTL
+/// control message to an IP_RECVTTL socket. On the desktop `ping -I wlan0`
+/// left through eth0 and every reply printed `ttl=0`.
+fn smoke_abi_socket_ping_honours_device_source_and_recvttl() -> TestResult {
+    use alloc::vec::Vec;
+    const IPPROTO_ICMP: u64 = 1;
+    const MSG_DONTWAIT: u64 = 0x40;
+    const A: &str = "abi-ping-a";
+    const B: &str = "abi-ping-b";
+    const A_IP: [u8; 4] = [10, 46, 3, 165];
+    const B_IP: [u8; 4] = [10, 46, 1, 211];
+    const PEER: [u8; 4] = [10, 46, 1, 1];
+    const A_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x2e, 0xa1];
+    const B_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x2e, 0xb1];
+    const PEER_MAC: [u8; 6] = [0x86, 0x43, 0x42, 0xa5, 0x25, 0x61];
+    static A_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    static B_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    fn capture_a(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        A_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn capture_b(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn echo_requests(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .filter(|f| f.len() >= 42 && f[12..14] == [0x08, 0x00] && f[23] == 1 && f[34] == 8)
+            .cloned()
+            .collect()
+    }
+    fn ping(fd: u64, seq: u16) -> Result<(), &'static str> {
+        let mut req = [0u8; 16];
+        req[0] = 8;
+        req[6..8].copy_from_slice(&seq.to_be_bytes());
+        let sa = sockaddr_in(u32::from_be_bytes(PEER), 0);
+        if sockopt_sendto(fd, &req, &sa) != Some(16) {
+            return Err("ping sendto failed");
+        }
+        Ok(())
+    }
+    with_setup(|| {
+        for (name, mac, ip, capture) in [
+            (A, A_MAC, A_IP, capture_a as narf_net::iface::SendFn),
+            (B, B_MAC, B_IP, capture_b as narf_net::iface::SendFn),
+        ] {
+            narf_net::iface::register(name, mac, capture);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_iface_ipv4_fields(name, ip, [0; 4]);
+            narf_net::iface::add_addr(name, ip, 22);
+            narf_net::arp_cache::insert(name, PEER, PEER_MAC);
+        }
+        narf_net::tcp_stack::__arp_insert_legacy(PEER, PEER_MAC);
+        A_TX.lock().clear();
+        B_TX.lock().clear();
+        let result = (|| -> Result<(), &'static str> {
+            // Bound to B: the request leaves B from B's address.
+            let bound = match socket_errno(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)? {
+                fd if fd >= 0 => fd as u64,
+                _ => return Err("socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) failed"),
+            };
+            if sockopt_set(bound, SOL_SOCKET, SO_BINDTODEVICE, b"abi-ping-b\0")? != 0 {
+                return Err("SO_BINDTODEVICE(abi-ping-b) failed");
+            }
+            ping(bound, 1)?;
+            let on_a = echo_requests(&core::mem::take(&mut *A_TX.lock()));
+            let on_b = echo_requests(&core::mem::take(&mut *B_TX.lock()));
+            let [request] = on_b.as_slice() else {
+                return Err("a ping bound to B did not leave B");
+            };
+            if !on_a.is_empty() || request[26..30] != B_IP {
+                return Err("a ping bound to B left A or not from B's address");
+            }
+            // Bound to B's address, no device: sourced from it.
+            let sourced = match socket_errno(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)? {
+                fd if fd >= 0 => fd as u64,
+                _ => return Err("second ping socket failed"),
+            };
+            sockopt_bind(sourced, &sockaddr_in(u32::from_be_bytes(B_IP), 0))?;
+            ping(sourced, 2)?;
+            let mut sent = echo_requests(&core::mem::take(&mut *A_TX.lock()));
+            sent.extend(echo_requests(&core::mem::take(&mut *B_TX.lock())));
+            if sent.len() != 1 || sent[0][26..30] != B_IP {
+                return Err("a ping bound to B's address was not sourced from it");
+            }
+            // The reply's TTL reaches an IP_RECVTTL socket.
+            if sockopt_set_int(bound, so::IPPROTO_IP, so::IP_RECVTTL, 1)? != 0 {
+                return Err("IP_RECVTTL failed");
+            }
+            let mut reply = alloc::vec![0u8; 14 + 20 + 16];
+            let _ = narf_net::pkt::write_eth_header(&mut reply, B_MAC, PEER_MAC, 0x0800);
+            let _ = narf_net::pkt::write_ipv4_header(&mut reply[14..], 36, 1, PEER, B_IP);
+            reply[14 + 8] = 57;
+            narf_net::pkt::set_ipv4_checksum(&mut reply[14..34]);
+            reply[34] = 0;
+            reply[38..42].copy_from_slice(&request[38..42]); // identifier, sequence
+            let sum = narf_net::pkt::ip_checksum(&reply[34..]);
+            reply[36..38].copy_from_slice(&sum.to_be_bytes());
+            narf_net::iface::on_rx_frame_from(B, &mut reply);
+            let mut data = [0u8; 64];
+            let mut ctrl = [0u8; 64];
+            let mut iov = [0u8; 16];
+            iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+            iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+            let mut msg = [0u8; 56];
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+            msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+            match call(
+                Syscall::SocketRecvMsg.raw(),
+                a2(bound, msg.as_mut_ptr() as u64, MSG_DONTWAIT),
+            ) {
+                Some(16) => {}
+                _ => return Err("the bound ping socket did not receive its echo reply"),
+            }
+            let len = u64::from_ne_bytes(ctrl[0..8].try_into().unwrap());
+            let level = i32::from_ne_bytes(ctrl[8..12].try_into().unwrap());
+            let kind = i32::from_ne_bytes(ctrl[12..16].try_into().unwrap());
+            let ttl = i32::from_ne_bytes(ctrl[16..20].try_into().unwrap());
+            if (len, level, kind, ttl) != (20, 0, 2, 57) {
+                return Err("IP_RECVTTL did not report the echo reply's TTL");
+            }
+            sockopt_close(&[bound, sourced]);
+            Ok(())
+        })();
+        narf_net::iface::del_addr(A, A_IP, 22);
+        narf_net::iface::del_addr(B, B_IP, 22);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/ping-bind",
+    smoke_abi_socket_ping_honours_device_source_and_recvttl
+);
+
+/// `tcp_v4_connect`: `ip_route_connect(fl4, daddr, inet->inet_saddr,
+/// sk->sk_bound_dev_if, ...)` routes through the bound device and keeps a
+/// bound source address, and `inet_hash_connect` keeps a bound port
+/// (`inet_num` set). On the desktop a socket bound to 192.168.1.211:54105
+/// connected as 192.168.3.165:34215, and SO_BINDTODEVICE wlan0 left eth0
+/// (NetworkManager's per-device connectivity checks all went out eth0).
+fn smoke_abi_socket_tcp_connect_keeps_bound_address_port_and_device() -> TestResult {
+    use alloc::vec::Vec;
+    const EINPROGRESS: i64 = -115;
+    const A: &str = "abi-tcpb-a";
+    const B: &str = "abi-tcpb-b";
+    const A_IP: [u8; 4] = [10, 47, 3, 165];
+    const B_IP: [u8; 4] = [10, 47, 1, 211];
+    const PEER: [u8; 4] = [10, 47, 1, 80];
+    const PEER_MAC: [u8; 6] = [0x52, 0x54, 0, 0, 0x2f, 0x50];
+    static A_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    static B_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    fn capture_a(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        A_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    fn capture_b(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        B_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    /// `(source address, source port)` of each SYN in `frames`.
+    fn syns(frames: &[Vec<u8>]) -> Vec<([u8; 4], u16)> {
+        frames
+            .iter()
+            .filter(|f| f.len() >= 54 && f[12..14] == [0x08, 0x00] && f[23] == 6)
+            .filter(|f| f[47] & 0x12 == 0x02)
+            .map(|f| {
+                (
+                    [f[26], f[27], f[28], f[29]],
+                    u16::from_be_bytes([f[34], f[35]]),
+                )
+            })
+            .collect()
+    }
+    fn local(fd: u64) -> Result<([u8; 4], u16), &'static str> {
+        let mut out = [0u8; 16];
+        let mut outlen = (out.len() as u32).to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("getsockname failed");
+        }
+        Ok((
+            [out[4], out[5], out[6], out[7]],
+            u16::from_be_bytes([out[2], out[3]]),
+        ))
+    }
+    fn connect_peer(fd: u64) -> Result<(), &'static str> {
+        let sa = sockaddr_in(u32::from_be_bytes(PEER), 80);
+        match call(
+            Syscall::SocketConnect.raw(),
+            a2(fd, sa.as_ptr() as u64, sa.len() as u64),
+        ) {
+            Some(EINPROGRESS) => Ok(()),
+            _ => Err("non-blocking connect did not return EINPROGRESS"),
+        }
+    }
+    with_setup(|| {
+        for (name, mac, ip, capture) in [
+            (A, 0xa1, A_IP, capture_a as narf_net::iface::SendFn),
+            (B, 0xb1, B_IP, capture_b as narf_net::iface::SendFn),
+        ] {
+            narf_net::iface::register(name, [0x02, 0, 0, 0, 0x2f, mac], capture);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_iface_ipv4_fields(name, ip, [0; 4]);
+            narf_net::iface::add_addr(name, ip, 22);
+            narf_net::arp_cache::insert(name, PEER, PEER_MAC);
+        }
+        narf_net::tcp_stack::__arp_insert_legacy(PEER, PEER_MAC);
+        A_TX.lock().clear();
+        B_TX.lock().clear();
+        let result = (|| -> Result<(), &'static str> {
+            // Bound address and port.
+            let fd = sockopt_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK)?;
+            sockopt_bind(fd, &sockaddr_in(u32::from_be_bytes(B_IP), 0))?;
+            let (_, port) = local(fd)?;
+            connect_peer(fd)?;
+            let mut sent = syns(&core::mem::take(&mut *A_TX.lock()));
+            sent.extend(syns(&core::mem::take(&mut *B_TX.lock())));
+            if sent != [(B_IP, port)] {
+                return Err("connect dropped the bound source address or port");
+            }
+            if local(fd)? != (B_IP, port) {
+                return Err("getsockname after connect is not the bound address and port");
+            }
+            // Bound device.
+            let dev = sockopt_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK)?;
+            if sockopt_set(dev, SOL_SOCKET, SO_BINDTODEVICE, b"abi-tcpb-b\0")? != 0 {
+                return Err("SO_BINDTODEVICE(abi-tcpb-b) failed");
+            }
+            connect_peer(dev)?;
+            let on_a = syns(&core::mem::take(&mut *A_TX.lock()));
+            let on_b = syns(&core::mem::take(&mut *B_TX.lock()));
+            if !on_a.is_empty() || on_b.len() != 1 || on_b[0].0 != B_IP {
+                return Err("a SYN bound to B did not leave B from B's address");
+            }
+            sockopt_close(&[fd, dev]);
+            Ok(())
+        })();
+        narf_net::iface::del_addr(A, A_IP, 22);
+        narf_net::iface::del_addr(B, B_IP, 22);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/tcp-bind-connect",
+    smoke_abi_socket_tcp_connect_keeps_bound_address_port_and_device
 );
 
 /// systemd-resolved's `link_address_update_rtnl` reads IFA_FLAGS from every

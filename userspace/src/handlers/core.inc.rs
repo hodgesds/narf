@@ -4140,6 +4140,67 @@ fn linux_stat_from_fs(
     }
 }
 
+/// `cp_new_stat` / `cp_stat64`: copy `st` to the user `out_ptr` in the
+/// layout of the ABI the call arrived through. A native call gets the
+/// arch's `struct stat`; an i386 one (`in_ia32_syscall()`) gets the packed
+/// 96-byte `struct stat64` (`arch/x86/include/asm/ia32.h`), which is what
+/// every stat entry the i386 table serves writes (`stat64`, `lstat64`,
+/// `fstat64`, `fstatat64` — the old `newstat` family is not served). The
+/// values are the same `kstat`; only the encoding differs.
+fn put_linux_stat(
+    ctx: &dyn TrapContext,
+    out_ptr: u64,
+    st: &linux_compat::Stat,
+) -> Result<(), u64> {
+    #[cfg(target_arch = "x86_64")]
+    if ctx.in_ia32_syscall() {
+        let bytes = stat64_bytes(st);
+        // SAFETY: copy_to_user range-validates and fault-brackets the
+        // caller's statbuf.
+        return unsafe { copy_to_user(out_ptr, &bytes) };
+    }
+    let _ = ctx;
+    // SAFETY: `st` is a live repr(C) Stat; the slice spans exactly its size.
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            st as *const linux_compat::Stat as *const u8,
+            core::mem::size_of::<linux_compat::Stat>(),
+        )
+    };
+    // SAFETY: copy_to_user range-validates and fault-brackets the caller's
+    // statbuf.
+    unsafe { copy_to_user(out_ptr, bytes) }
+}
+
+/// `cp_stat64` (`arch/x86/kernel/sys_ia32.c`): the i386 `struct stat64`
+/// image of `st`. `__st_ino` carries the inode truncated to 32 bits and
+/// `st_ino` the whole of it (`STAT64_HAS_BROKEN_ST_INO`); the times are
+/// 32-bit; `st_dev`/`st_rdev` are the `huge_encode_dev` words native
+/// `struct stat` also carries.
+#[cfg(target_arch = "x86_64")]
+fn stat64_bytes(st: &linux_compat::Stat) -> [u8; 96] {
+    let mut b = [0u8; 96];
+    let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, &st.st_dev.to_le_bytes());
+    put(12, &(st.st_ino as u32).to_le_bytes());
+    put(16, &st.st_mode.to_le_bytes());
+    put(20, &(st.st_nlink as u32).to_le_bytes());
+    put(24, &st.st_uid.to_le_bytes());
+    put(28, &st.st_gid.to_le_bytes());
+    put(32, &st.st_rdev.to_le_bytes());
+    put(44, &st.st_size.to_le_bytes());
+    put(52, &(st.st_blksize as u32).to_le_bytes());
+    put(56, &st.st_blocks.to_le_bytes());
+    put(64, &(st.st_atim.tv_sec as u32).to_le_bytes());
+    put(68, &(st.st_atim.tv_nsec as u32).to_le_bytes());
+    put(72, &(st.st_mtim.tv_sec as u32).to_le_bytes());
+    put(76, &(st.st_mtim.tv_nsec as u32).to_le_bytes());
+    put(80, &(st.st_ctim.tv_sec as u32).to_le_bytes());
+    put(84, &(st.st_ctim.tv_nsec as u32).to_le_bytes());
+    put(88, &st.st_ino.to_le_bytes());
+    b
+}
+
 // Linux-ABI sys_stat: writes the arch's uapi `struct stat`. Same path-
 // resolution as the NARF-shape sys_stat, only the wire layout
 // changes.
@@ -4222,15 +4283,8 @@ fn stat_linux_ops(
         return;
     }
     let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
-    // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size.
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            &out as *const linux_compat::Stat as *const u8,
-            core::mem::size_of::<linux_compat::Stat>(),
-        )
-    };
-    // SAFETY: `out_ptr` null-checked above; copy_to_user range-validates it.
-    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+    // `cp_new_stat`, or `cp_stat64` for an i386 call: see `put_linux_stat`.
+    if put_linux_stat(&*ctx, out_ptr as u64, &out).is_err() {
         ctx.set_return(errno_ret(EFAULT));
         return;
     }
@@ -4376,19 +4430,8 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // libudev validate a device's type from a path stat before opening it, so
     // a 0 rdev makes them reject evdev nodes (weston input never opens).
     let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
-    // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
-    // and borrows it for the duration of the copy below.
-    // SAFETY: Valid memory or trusted environment
-    let bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            &out as *const linux_compat::Stat as *const u8,
-            core::mem::size_of::<linux_compat::Stat>(),
-        )
-    };
-    // SAFETY: `out_ptr` is the user Stat pointer (null-checked above);
-    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
+    // `cp_new_stat`, or `cp_stat64` for an i386 call: see `put_linux_stat`.
+    if put_linux_stat(&*ctx, out_ptr as u64, &out).is_err() {
         ctx.set_return(errno_ret(EFAULT)); // -EFAULT
         return;
     }
@@ -5851,29 +5894,54 @@ struct ImportedRwIovec {
 }
 
 fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<ImportedRwIovec>, u64> {
+    import_rw_iovecs_abi(iov_ptr, iovcnt, false)
+}
+
+/// [`import_rw_iovecs`] for the ABI the call arrived through: `compat` reads
+/// 8-byte `struct compat_iovec { compat_uptr_t iov_base; compat_size_t
+/// iov_len; }` (`lib/iov_iter.c::copy_compat_iovec_from_user`, chosen by
+/// `in_compat_syscall()`), whose `iov_len` is refused when negative as a
+/// `compat_ssize_t`.
+fn import_rw_iovecs_abi(
+    iov_ptr: u64,
+    iovcnt: usize,
+    compat: bool,
+) -> Result<alloc::vec::Vec<ImportedRwIovec>, u64> {
     if iovcnt == 0 {
         return Ok(alloc::vec::Vec::new());
     }
     if iovcnt > LINUX_IOV_MAX {
         return Err(EINVAL as u64);
     }
+    let stride = if compat { 8 } else { 16 };
+    // (base, signed length) of one array element.
+    let decode = |slot: &[u8]| -> (u64, i64) {
+        if compat {
+            (
+                u64::from(u32::from_ne_bytes(slot[..4].try_into().unwrap())),
+                i64::from(i32::from_ne_bytes(slot[4..8].try_into().unwrap())),
+            )
+        } else {
+            (
+                u64::from_ne_bytes(slot[..8].try_into().unwrap()),
+                u64::from_ne_bytes(slot[8..16].try_into().unwrap()) as i64,
+            )
+        }
+    };
     // SAFETY: 1024 native iovecs occupy 16 KiB, below MAX_USER_COPY.
-    let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * 16) }?;
+    let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * stride) }?;
     // `lib/iov_iter.c::copy_iovec_from_user` rejects an iov_len with the
     // ssize_t sign bit set (-EINVAL) while copying the array — before
     // `__import_iovec` runs a single access_ok, so a negative length outranks
     // a bad base in an earlier element.
-    if raw
-        .chunks_exact(16)
-        .any(|slot| (u64::from_ne_bytes(slot[8..].try_into().unwrap()) as i64) < 0)
-    {
+    if raw.chunks_exact(stride).any(|slot| decode(slot).1 < 0) {
         return Err(EINVAL as u64);
     }
     let mut out = alloc::vec::Vec::with_capacity(iovcnt);
     let mut remaining = LINUX_MAX_RW_COUNT;
-    for slot in raw.chunks_exact(16) {
-        let base = u64::from_ne_bytes(slot[..8].try_into().unwrap());
-        let requested = u64::from_ne_bytes(slot[8..].try_into().unwrap()) as usize;
+    for slot in raw.chunks_exact(stride) {
+        let (base, requested) = decode(slot);
+        let requested = requested as usize;
         // A one-element vector takes `__import_iovec_ubuf` -> `import_ubuf`,
         // which clamps to MAX_RW_COUNT BEFORE access_ok; the multi-element
         // loop checks the full length first.
@@ -6197,13 +6265,19 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
     /// Linux ROBUST_LIST_LIMIT — bounds a malicious/corrupt circular list.
     const ROBUST_LIST_LIMIT: usize = 2048;
 
-    let head = {
+    let (head, head_len) = {
         let g = ROBUST_LIST_TABLE.lock();
         match g.as_ref().and_then(|m| m.get(&tid)) {
-            Some(&(head, _len)) if head != 0 => head,
+            Some(&(head, len)) if head != 0 => (head, len),
             _ => return,
         }
     };
+    // A head registered through the i386 `set_robust_list` is a
+    // `struct compat_robust_list_head`: 32-bit pointers and a 32-bit
+    // `futex_offset` (`compat_exit_robust_list`, `compat_uptr_t` /
+    // `compat_long_t`). Its recorded length says so.
+    let compat = head_len == handler_sys_set_robust_list::COMPAT_ROBUST_LIST_HEAD_SIZE;
+    let word = if compat { 4u64 } else { 8u64 };
 
     // The robust-list head and every node/lock pointer are fully
     // user-controlled and may be bogus (robust_smoke deliberately registers
@@ -6226,25 +6300,31 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
             .unwrap_or(false)
     };
 
-    let read_u64 = |uaddr: u64| -> Option<u64> {
+    // One list word: a pointer, or the signed `futex_offset`, as stored.
+    let read_word = |uaddr: u64| -> Option<u64> {
         if !user_mapped(uaddr) {
             return None;
         }
         let mut b = [0u8; 8];
         // SAFETY: mapping-probed above; copy_from_user range-validates +
         // SMAP-brackets the read.
-        unsafe { copy_from_user(&mut b, uaddr).ok()? };
+        unsafe { copy_from_user(&mut b[..word as usize], uaddr).ok()? };
         Some(u64::from_le_bytes(b))
     };
 
-    let futex_offset = match read_u64(head.wrapping_add(8)) {
+    let futex_offset = match read_word(head.wrapping_add(word)) {
+        Some(v) if compat => i64::from(v as u32 as i32),
         Some(v) => v as i64,
         None => return,
     };
-    let pending = read_u64(head.wrapping_add(16)).unwrap_or(0);
+    let pending = read_word(head.wrapping_add(2 * word)).unwrap_or(0);
 
     let handle_lock = |entry: u64| {
-        let uaddr = entry.wrapping_add(futex_offset as u64);
+        let mut uaddr = entry.wrapping_add(futex_offset as u64);
+        if compat {
+            // `compat_ptr(entry) + futex_offset`, a 32-bit user address.
+            uaddr &= 0xFFFF_FFFF;
+        }
         if uaddr == 0 || uaddr & 3 != 0 {
             return;
         }
@@ -6277,7 +6357,7 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
 
     // Walk the list. Termination: `next == head` (the head's own list
     // node is the sentinel); 0/unreadable ends the walk defensively.
-    let mut entry = match read_u64(head) {
+    let mut entry = match read_word(head) {
         Some(e) => e,
         None => return,
     };
@@ -6288,7 +6368,7 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
         if entry != pending {
             handle_lock(entry);
         }
-        entry = match read_u64(entry) {
+        entry = match read_word(entry) {
             Some(e) => e,
             None => break,
         };
@@ -10075,6 +10155,23 @@ pub(crate) fn io_account_write(task: u64, ret: i64) {
     e.syscw = e.syscw.saturating_add(1);
 }
 
+/// The bytes half of [`io_account_read`] / [`io_account_write`] alone, for
+/// a call re-issued after it parked: Linux sleeps inside its one
+/// `vfs_read`/`vfs_write` (`pipe_read`'s wait), so the re-issue is not
+/// another syscall, but the bytes it moves are the call's.
+pub(crate) fn io_account_reissued(task: u64, read: bool, ret: i64) {
+    if ret <= 0 {
+        return;
+    }
+    let mut g = IO_ACCOUNTING.lock();
+    let e = g.get_or_insert_with(BTreeMap::new).entry(task).or_default();
+    if read {
+        e.rchar = e.rchar.saturating_add(ret as u64);
+    } else {
+        e.wchar = e.wchar.saturating_add(ret as u64);
+    }
+}
+
 /// Read a task's I/O accounting, for `/proc/<pid>/io`.
 pub fn io_accounting_of(task: u64) -> TaskIoAccounting {
     IO_ACCOUNTING
@@ -10517,7 +10614,9 @@ fn adjtimex_core(timex_ptr: u64, writeback_on_error: bool, clock_gate: Result<()
 
 /// Minimal `TrapContext` proxy that overrides the argument tuple and
 /// forwards everything else to the inner context (reshape-and-delegate
-/// handlers like openat2).
+/// handlers like openat2): the RIP and user state a park needs, signal
+/// delivery, and which ABI the call came through
+/// (`syscall::forward_trap_context`).
 struct ReshapeArgs<'a> {
     inner: &'a mut dyn TrapContext,
     args: SyscallArgs,
@@ -10529,21 +10628,21 @@ impl TrapContext for ReshapeArgs<'_> {
     fn set_return(&mut self, ret: SyscallReturn) {
         self.inner.set_return(ret);
     }
-    fn user_rsp(&self) -> u64 {
-        self.inner.user_rsp()
+    fn pending_return(&self) -> Option<SyscallReturn> {
+        self.inner.pending_return()
     }
-    fn rip(&self) -> u64 {
-        0
-    }
-    fn set_rip(&mut self, _rip: u64) {}
-    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-        self.inner.redirect_to_kernel(rip, rsp)
-    }
+    crate::syscall::forward_trap_context!(inner);
 }
 
 /// `TrapContext` proxy that captures the sub-handler's return value
 /// instead of forwarding it (sendmmsg/recvmmsg loop a single
 /// sendmsg/recvmsg per message and read each result).
+///
+/// Unlike the other proxies it deliberately reports RIP 0 and has no user
+/// state to save, so the nested call cannot park: re-executing the whole
+/// batch is only safe before any message moved, and the outer handler
+/// decides that (`park_reexecute_on_fd_until`). It still presents the ABI
+/// the call came through.
 struct CaptureCtx<'a> {
     inner: &'a mut dyn TrapContext,
     args: SyscallArgs,
@@ -10565,6 +10664,15 @@ impl TrapContext for CaptureCtx<'_> {
     fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
         self.inner.redirect_to_kernel(rip, rsp)
+    }
+    fn in_ia32_syscall(&self) -> bool {
+        self.inner.in_ia32_syscall()
+    }
+    fn in_compat_mode(&self) -> bool {
+        self.inner.in_compat_mode()
+    }
+    fn ia32_abi(&self) -> crate::syscall::Ia32Abi {
+        self.inner.ia32_abi()
     }
 }
 
@@ -12351,6 +12459,22 @@ fn child_tls_base(flags: u64, tls: u64) -> Option<u64> {
     }
 }
 
+/// The segment state a fork/clone child starts with: the parent's TLS
+/// descriptors and DS/ES/FS/GS selectors (Linux `copy_thread` after
+/// `save_fsgs`; `dup_task_struct` already copied `thread.tls_array`). A
+/// 64-bit task has them too — `set_thread_area` through `int 0x80` is open
+/// to it. Empty on aarch64, which has no segments.
+fn child_user_segments() -> crate::UserSegments {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::compat32::tls::current_segments()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        crate::UserSegments::default()
+    }
+}
+
 /// Test hook for [`child_tls_base`]: `CLONE_SETTLS` is implemented but was
 /// covered by nothing, so a regression in it would have stayed silent until a
 /// threaded program ran.
@@ -12423,6 +12547,39 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
+
+    // The child's thread state (Linux `copy_thread`): the parent's segment
+    // state and FS/GS bases, with CLONE_SETTLS applied — through `set_new_tls`,
+    // which for an i386 call (`in_ia32_syscall()`) installs the `struct
+    // user_desc` at `tls` in the child's TLS slots (`do_set_thread_area(p, -1,
+    // utls, 0)`) rather than taking it as an FS base. A bad descriptor fails
+    // the clone; it is checked here, before any child state exists, so that
+    // failure has nothing to undo.
+    #[cfg(target_arch = "x86_64")]
+    let (child_segs, child_fs_base, child_gs_base) = {
+        let mut segs = child_user_segments();
+        // SAFETY: CPL0 syscall context, kernel GS live.
+        let mut gs_base = unsafe { narf_arch::x86_64::user_mode::user_gs_base() };
+        if ctx.in_ia32_syscall() && flags & CLONE_SETTLS != 0 {
+            let mut fs_base = current_user_tls_base();
+            let ret = crate::compat32::tls::clone_settls(
+                &mut segs,
+                &mut gs_base,
+                &mut fs_base,
+                ca.tls,
+            );
+            if ret != 0 {
+                ctx.set_return(SyscallReturn::ok(ret as u64));
+                return;
+            }
+            (segs, fs_base, gs_base)
+        } else {
+            (segs, child_tls_base(flags, ca.tls), gs_base)
+        }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let (child_segs, child_fs_base, child_gs_base) =
+        (child_user_segments(), child_tls_base(flags, ca.tls), 0u64);
 
     // CLONE_VM: share AS via Arc::clone. Without it, this would be a
     // full fork — but pthread always passes CLONE_VM so the no-VM
@@ -12588,6 +12745,66 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     } else {
         None
     };
+    // `copy_namespaces` owns every namespace this clone creates by ONE user
+    // namespace, the child credential's:
+    //
+    //     struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+    //     ...
+    //     new_ns = create_new_namespaces(flags, tsk, user_ns, tsk->fs);
+    //
+    // `copy_creds` ran first and, under CLONE_NEWUSER, bound that credential
+    // to the namespace prepared above. Taking the CREATING task's instead —
+    // the parent's — left a `clone(CLONE_NEWUSER | CLONE_NEWNS)` child
+    // without CAP_SYS_ADMIN over its own mount namespace, so bubblewrap's
+    // first mount in it was -EPERM. The PID namespace takes the same owner
+    // through `pid_owner` below; UTS/IPC/net read the child's installed
+    // credential, which is this namespace too.
+    #[cfg(feature = "container")]
+    let child_ns_owner: Option<alloc::sync::Arc<dyn narf_filesystem::NsOwner>> =
+        match prepared_user_ns.as_ref() {
+            Some(user_ns) => Some(user_ns.clone()),
+            None => ns_owner_for(parent_pid),
+        };
+    #[cfg(not(feature = "container"))]
+    let child_ns_owner = ns_owner_for(parent_pid);
+    // `copy_namespaces` gates every namespace other than a user namespace on
+    // CAP_SYS_ADMIN over that same credential's user namespace:
+    //
+    //     if (likely(!(flags & (CLONE_NS_ALL & ~CLONE_NEWUSER)))) { ... }
+    //     else if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+    //             return -EPERM;
+    //
+    // Under CLONE_NEWUSER the credential holds the full set
+    // `set_cred_user_ns` grants inside the namespace it now belongs to, so
+    // the test passes by construction — that is how an unprivileged
+    // bubblewrap gets its mount namespace. Otherwise it is the parent's
+    // credential in the parent's own namespace. Linux decides this after
+    // `copy_mm` and before `alloc_pid`, so a refused clone consumes no PID.
+    {
+        const CLONE_NS_ALL_EXCEPT_USER: u64 = 0x0000_0080 // CLONE_NEWTIME
+            | 0x0002_0000 // CLONE_NEWNS
+            | 0x0200_0000 // CLONE_NEWCGROUP
+            | 0x0400_0000 // CLONE_NEWUTS
+            | 0x0800_0000 // CLONE_NEWIPC
+            | 0x2000_0000 // CLONE_NEWPID
+            | 0x4000_0000; // CLONE_NEWNET
+        #[cfg(feature = "container")]
+        let in_new_user_ns = prepared_user_ns.is_some();
+        #[cfg(not(feature = "container"))]
+        let in_new_user_ns = false;
+        if flags & CLONE_NS_ALL_EXCEPT_USER != 0
+            && !in_new_user_ns
+            && !task_capable_in_own_ns(parent_pid, CAP_SYS_ADMIN)
+        {
+            if let Some(fd) = reserved_pidfd {
+                let _ = crate::fd::with_table(parent_pid, |table| {
+                    table.release_reserved(&[fd]);
+                });
+            }
+            ctx.set_return(errno_ret(EPERM));
+            return;
+        }
+    }
     #[cfg(feature = "container")]
     let pid_plan = {
         let new_pid = flags & crate::namespaces::CLONE_NEWPID != 0;
@@ -12772,14 +12989,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         address_space: child_as.clone(),
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(rsp),
-        fs_base: child_tls_base(flags, ca.tls),
-        // Linux `copy_thread` copies the parent's GS base into the child (fork
-        // and threads alike); CLONE_SETTLS only replaces FS.
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: CPL0 syscall context, kernel GS live.
-        gs_base: unsafe { narf_arch::x86_64::user_mode::user_gs_base() },
-        #[cfg(not(target_arch = "x86_64"))]
-        gs_base: 0,
+        // Computed above with the segment state: the parent's bases, which a
+        // 64-bit CLONE_SETTLS replaces FS of and an i386 one may replace
+        // either of (whichever selector names the slot it rewrites).
+        fs_base: child_fs_base,
+        gs_base: child_gs_base,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
         // Zero sentinel, like `entry` above: a cloned task resumes from
@@ -12790,6 +13004,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         // No page-in plan (#740): nothing was loaded for this task —
         // its pages are the parent's, already resident or shared.
         page_in_plan: alloc::vec::Vec::new(),
+        // The caller's mode (`copy_thread` copies its saved CS) and the
+        // segment state computed above.
+        ia32: ctx.in_compat_mode(),
+        segs: child_segs,
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 
@@ -12920,12 +13138,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
             const CLONE_NEWCGROUP: u64 = 0x0200_0000;
             narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_visible_pid);
             if flags & CLONE_NEWCGROUP != 0 {
-                // The owner is the CREATING task's user namespace — the
-                // parent's, since `copy_cgroup_ns` runs with the parent's
-                // credentials before the child is running.
+                // `copy_cgroup_ns(flags, user_ns, ...)` gets the same
+                // `user_ns` as every other constructor in
+                // `create_new_namespaces`: the child credential's, i.e. the
+                // new user namespace under CLONE_NEWUSER.
                 narf_filesystem::cgroupfs::unshare_cgroup_ns_owned_by(
                     child_visible_pid,
-                    ns_owner_for(current_task_id()),
+                    child_ns_owner.clone(),
                 );
             }
         }
@@ -13026,7 +13245,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // the inherited Arc above.
     const CLONE_NEWNS: u64 = 0x0002_0000;
     if !share_thread && flags & CLONE_NEWNS != 0 {
-        install_mount_namespace(child_tid.raw(), snapshot_current_mount_namespace());
+        install_mount_namespace(
+            child_tid.raw(),
+            snapshot_current_mount_namespace(child_ns_owner),
+        );
     }
 
     #[cfg(feature = "container")]
@@ -13034,7 +13256,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         let child = child_tid.raw();
         let parent_task = current_task_id();
         // UTS / NET / IPC / User: shared by ref, then CLONE_NEW* mints
-        // a fresh one for the child.
+        // a fresh one for the child. The user namespace goes first: the
+        // `unshare_*` constructors below stamp the CHILD's credential
+        // namespace as owner, which must already be `child_ns_owner`.
         crate::namespaces::inherit_into_child(parent_task, child);
         if flags & crate::namespaces::CLONE_NEWUSER != 0 {
             crate::namespaces::setns_user(

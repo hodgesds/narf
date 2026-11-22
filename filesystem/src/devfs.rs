@@ -467,14 +467,15 @@ impl DevKmsg {
         }
     }
 
-    /// `devkmsg_poll`.
+    /// `devkmsg_poll`: `EPOLLIN | EPOLLRDNORM` for a waiting record.
     fn readable(&self) -> u32 {
         let seq = *self.seq.lock();
+        let ready = crate::POLL_IN | crate::POLL_RDNORM;
         match narf_console::klog::kmsg_poll(seq) {
             None => 0,
-            Some(false) => crate::POLL_IN,
+            Some(false) => ready,
             // "return error when data has vanished underneath us"
-            Some(true) => crate::POLL_IN | crate::POLL_ERR | crate::POLL_PRI,
+            Some(true) => ready | crate::POLL_ERR | crate::POLL_PRI,
         }
     }
 }
@@ -2737,6 +2738,37 @@ fn smoke_dev_kmsg_llseek() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_llseek);
+
+/// `devkmsg_poll` answers a readable record with `EPOLLIN | EPOLLRDNORM`,
+/// and an overrun with `EPOLLIN | EPOLLRDNORM | EPOLLERR | EPOLLPRI`. A
+/// `poll(2)` or epoll interest of `POLLRDNORM` alone otherwise never sees
+/// /dev/kmsg readable.
+fn smoke_dev_kmsg_poll_reports_rdnorm() -> TestResult {
+    /// `POLLRDNORM` (`include/uapi/asm-generic/poll.h`).
+    const RDNORM: u32 = 0x0040;
+    let readable = crate::POLL_IN | RDNORM;
+    let k = kmsg_at_end();
+    narf_console::klog::record("kmsg-rdnorm-probe\n");
+    if k.poll_readiness() & readable != readable {
+        return TestResult::Fail("a readable /dev/kmsg must poll EPOLLIN|EPOLLRDNORM");
+    }
+    if k.poll_readiness_at(0) & readable != readable {
+        return TestResult::Fail("epoll's /dev/kmsg readiness must carry EPOLLRDNORM");
+    }
+    let flood = (narf_console::klog::log_buf_len() >> 5) + 8;
+    for _ in 0..flood {
+        narf_console::klog::emit(narf_console::klog::LOG_USER, 7, b"kmsg-rdnorm-flood");
+    }
+    let overrun = readable | crate::POLL_ERR | crate::POLL_PRI;
+    if k.poll_readiness() & overrun != overrun {
+        return TestResult::Fail("an overrun /dev/kmsg must poll EPOLLIN|EPOLLRDNORM|ERR|PRI");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs-kmsg-poll",
+    smoke_dev_kmsg_poll_reports_rdnorm
+);
 
 /// devtmpfs is writable for runtime aliases such as journald's `/dev/log`.
 fn smoke_dev_runtime_symlink_create_lookup_unlink() -> TestResult {

@@ -79,7 +79,29 @@ pub(crate) fn symlink_absolute(
             refused = Some(errno);
             return None;
         }
-        poll_blocking(parent.symlink(leaf, target_str))
+        // `btrfs_symlink` -> `btrfs_new_inode` -> `inode_init_owner`, as for
+        // every new inode: the creator's fsuid, and its fsgid or a setgid
+        // parent's group. A symlink's mode is always 0777 and never setgid.
+        let mut mode = 0o777;
+        let (uid, gid) = inode_init_owner(&*parent, false, &mut mode);
+        let link = match poll_blocking(parent.symlink(leaf, target_str))? {
+            Ok(link) => link,
+            Err(error) => return Some(Err(error)),
+        };
+        match poll_blocking(link.set_owners(uid, gid)) {
+            Some(Ok(())) => Some(Ok(link)),
+            // A filesystem with no per-inode owners (devfs, sysfs) keeps the
+            // link as it made it.
+            Some(Err(narf_filesystem::FsError::Unsupported)) => Some(Ok(link)),
+            // Never leave behind a link that belongs to someone else: undo it
+            // and report why, as mkdir does.
+            failed => {
+                let _ = poll_blocking(parent.unlink(leaf));
+                Some(Err(failed.and_then(Result::err).unwrap_or(
+                    narf_filesystem::FsError::Io(narf_block::BlockError::IOError),
+                )))
+            }
+        }
     });
     if let Some(errno) = refused {
         ctx.set_return(SyscallReturn::ok(errno as u64));

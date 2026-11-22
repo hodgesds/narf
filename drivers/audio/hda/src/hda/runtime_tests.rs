@@ -19,6 +19,9 @@ struct Model {
     commands: usize,
     verbs: Vec<u32>,
     stall: bool,
+    /// Commands the codec takes off the CORB without ever answering (a
+    /// lost response): each one decrements it.
+    drop_next: usize,
     supports_32: bool,
     /// Answer as an AMD GPU HDMI codec instead of the Realtek analog one.
     ati: bool,
@@ -116,6 +119,11 @@ impl Model {
                     .read_volatile();
                 self.commands += 1;
                 self.verbs.push(command);
+                if self.drop_next > 0 {
+                    self.drop_next -= 1;
+                    self.mmio.write16(REG_CORBRP, self.corb);
+                    continue;
+                }
                 // Interleave an unsolicited jack event with every reply. The
                 // completion ring must not be indexed with the CORB pointer.
                 let mut reply = if self.navi22 {
@@ -535,6 +543,13 @@ struct FixtureConfig {
     seed_alc256_coef: bool,
     codec_id: u32,
     hp_plugged: bool,
+    /// STATESTS at probe (0 = codec 0 only). Only codec 0 answers: the
+    /// model tags every response with address 0.
+    codec_mask: u16,
+    /// Coef registers (nid, index, value) the codec holds before probe.
+    seed_coef: &'static [(u8, u16, u16)],
+    /// STATESTS reads 0: the link has no codec at all.
+    no_codecs: bool,
 }
 
 struct Fixture {
@@ -659,6 +674,9 @@ impl Fixture {
             seed_alc256_coef,
             codec_id,
             hp_plugged,
+            codec_mask,
+            seed_coef,
+            no_codecs,
         } = config;
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -672,7 +690,12 @@ impl Fixture {
         // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
         unsafe {
             mmio.write16(REG_GCAP, 0x1101);
-            mmio.write16(REG_STATESTS, 1);
+            let statests = match (no_codecs, codec_mask) {
+                (true, _) => 0,
+                (false, 0) => 1,
+                (false, mask) => mask,
+            };
+            mmio.write16(REG_STATESTS, statests);
             mmio.write8(REG_CORBSIZE, 0x40);
             mmio.write8(REG_RIRBSIZE, 0x40);
         }
@@ -687,6 +710,7 @@ impl Fixture {
                 commands: 0,
                 verbs: Vec::new(),
                 stall: false,
+                drop_next: 0,
                 supports_32: true,
                 ati,
                 sink: false,
@@ -705,10 +729,14 @@ impl Fixture {
                 codec_id,
                 hp_plugged,
                 coef_index: [(0x20, 0), (0x53, 0)],
-                coef: if seed_alc256_coef {
-                    alloc::vec![(crate::hda::quirks::COEF_NODE, 0x46, 0xF5A5)]
-                } else {
-                    Vec::new()
+                coef: {
+                    let mut coef = if seed_alc256_coef {
+                        alloc::vec![(crate::hda::quirks::COEF_NODE, 0x46, 0xF5A5)]
+                    } else {
+                        Vec::new()
+                    };
+                    coef.extend_from_slice(seed_coef);
+                    coef
                 },
             }),
         };
@@ -850,22 +878,32 @@ fn native_hda_command_cancellation() -> TestResult {
     let dev = fixture.controller.as_ref().unwrap().clone();
     fixture.model.stall = true;
     {
+        // A node-count read, cancelled while the codec is silent.
         // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
-        let mut future = pin!(unsafe { dev.send_verb_async(make_verb(0, 0, VERB_GET_PARAMETER)) });
+        let verb = unsafe { dev.send_verb_async(make_verb(0, 0, VERB_GET_PARAMETER | 4)) };
+        let mut future = pin!(verb);
         let mut cx = Context::from_waker(Waker::noop());
         if !matches!(future.as_mut().poll(&mut cx), Poll::Pending) {
             return TestResult::Fail("command should wait");
         }
     }
-    if !dev.irq.failed.load(Ordering::Acquire)
-        // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
-        || unsafe { dev.send_verb(0) } != Err(HdaError::DeviceFailed)
-    {
+    if !dev.irq.failed.load(Ordering::Acquire) {
         return TestResult::Fail("cancelled command must poison transport");
+    }
+    // The codec answers again. Its late answer to the cancelled read must not
+    // become the next command's reply: the poisoned transport restarts its
+    // rings before the next command (the azx_rirb_get_response fallback),
+    // which then gets its own answer, and the transport is usable again.
+    fixture.model.stall = false;
+    // SAFETY: as above.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x10ec0287)
+        || dev.irq.failed.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("the command after a cancelled one takes its own reply");
     }
     TestResult::Pass
 }
-kernel_test_in!("audio/hda", native_hda_command_cancellation);
+kernel_test_in!("audio/hda/cmd-recover", native_hda_command_cancellation);
 
 fn native_hda_ati_hdmi_controllers_run_without_snoop() -> TestResult {
     use super::super::ati_hdmi_noncoherent;
@@ -901,7 +939,7 @@ fn native_hda_ati_hdmi_port_streams_stereo_like_atihdmi() -> TestResult {
         return TestResult::Fail("HDMI port discovery");
     }
     let card = super::super::stream::Card(dev.clone());
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     let first = fixture.model.verbs.len();
@@ -1050,7 +1088,7 @@ fn native_hda_hdmi_sink_drives_eld_routing_and_surround() -> TestResult {
         return TestResult::Fail("HDMI jack and ELD controls");
     }
     // No monitor yet: the converter's own limits.
-    let Ok(playback) = card.open(false, 0) else {
+    let Ok(playback) = card.open(false, 3) else {
         return TestResult::Fail("open without a sink");
     };
     if card.get_control(jack) != Ok(ControlValue::boolean(false))
@@ -1061,7 +1099,7 @@ fn native_hda_hdmi_sink_drives_eld_routing_and_surround() -> TestResult {
     }
     drop(playback);
     fixture.model.sink = true;
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open with a sink");
     };
     if card.get_control(jack) != Ok(ControlValue::boolean(true))
@@ -1492,27 +1530,33 @@ fn native_hda_hdmi_passthrough_and_channel_map() -> TestResult {
     {
         return TestResult::Fail("initial IEC958 state");
     }
-    // The switch is DIGEN on every port's converter.
+    // With the PCM closed its IEC958 state is unassigned
+    // (snd_hda_spdif_ctls_unassign): the switch and the status are kept for
+    // the next open and reach no converter.
+    let digital = |verbs: &[u32]| {
+        verbs
+            .iter()
+            .any(|v| matches!((v >> 8) & 0xfff, 0x70d | 0x70e))
+    };
     let first = fixture.model.verbs.len();
     if card
         .set_control(switch, ControlValue::boolean(false))
         .is_err()
-        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70d00))
-        || !fixture.model.verbs[first..].contains(&make_verb(0, 4, 0x70d00))
         || card.get_control(switch) != Ok(ControlValue::boolean(false))
         || card
             .set_control(switch, ControlValue::boolean(true))
             .is_err()
+        || digital(&fixture.model.verbs[first..])
     {
         return TestResult::Fail("IEC958 switch");
     }
-    // Non-audio status: DIG1 NONAUDIO | DIGEN and DIG2 category.
+    // Non-audio status: DIG1 NONAUDIO | DIGEN and DIG2 category at the next
+    // prepare.
     let first = fixture.model.verbs.len();
     if card
         .set_control(status, ControlValue::iec958(&[0x06, 0x02]))
         .is_err()
-        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70d21))
-        || !fixture.model.verbs[first..].contains(&make_verb(0, 2, 0x70e02))
+        || digital(&fixture.model.verbs[first..])
         || card.get_control(status) != Ok(ControlValue::iec958(&[0x06, 0x02]))
     {
         return TestResult::Fail("IEC958 non-audio status");
@@ -1525,7 +1569,7 @@ fn native_hda_hdmi_passthrough_and_channel_map() -> TestResult {
     {
         return TestResult::Fail("channel map without a stream");
     }
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     if card.capabilities(false).rates
@@ -1736,9 +1780,10 @@ fn native_hda_navi22_binds_ab28_and_routes_the_dcn30_endpoint() -> TestResult {
     if dev.routed_outputs() != [2] {
         return TestResult::Fail("routing to the live port");
     }
-    // Playback goes to converter 6 only.
+    // Endpoint 2 is PCM 2 at device 8 (static PCM mapping); its playback
+    // goes to converter 6 only.
     let card = super::super::stream::Card(dev.clone());
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 8) else {
         return TestResult::Fail("open");
     };
     let first = fixture.model.verbs.len();
@@ -1862,9 +1907,11 @@ fn native_hda_pm_busy_while_stream_runs_or_prepared() -> TestResult {
     if dev.quiesce().is_ok() {
         return TestResult::Fail("quiesce must refuse a running stream");
     }
-    // Layer 1: the PCM stop path parks the controller itself.
-    if playback.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
-        return TestResult::Fail("stop parks the controller");
+    // Once the stream is stopped the park is allowed (the autosuspend runs
+    // it after the delay; here it is called directly).
+    if playback.stop().is_err() || dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("a stopped stream lets the controller park");
     }
     // And the next start transparently re-inits it.
     if playback
@@ -1876,8 +1923,9 @@ fn native_hda_pm_busy_while_stream_runs_or_prepared() -> TestResult {
     {
         return TestResult::Fail("start re-inits a parked controller");
     }
-    if playback.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
-        return TestResult::Fail("second stop re-parks the controller");
+    if playback.stop().is_err() || dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("second stop lets the controller park again");
     }
     TestResult::Pass
 }
@@ -3286,4 +3334,913 @@ fn native_hda_jack_service_never_stalls_its_cpu() -> TestResult {
 kernel_test_in!(
     "audio/hda/jack",
     native_hda_jack_service_never_stalls_its_cpu
+);
+
+/// PipeWire suspends an idle HDMI sink (DROP, then close) and reopens it on
+/// the next use. The DROP parks the controller (#779: codecs D3, command and
+/// stream engines off, link in reset), so the reopen has to wake it before
+/// the HDMI pin sense, as Linux `azx_pcm_open` calls `snd_hda_power_up_pm`
+/// before the codec's open (`hdmi_pcm_open` reads the pin's ELD). Before,
+/// `Card::open` sensed the pins through the parked rings: GET_PIN_SENSE timed
+/// out (the field log's `verb 0x3f0900 timeout: CORB wp/rp=0x0/0x0 RIRB
+/// wp=0x0 ctl=0x0/0x0`), the timeout latched the transport failure, and every
+/// later open failed with EPIPE.
+fn native_hda_pm_open_wakes_a_parked_controller() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if dev.hdmi.lock().is_empty() {
+        return TestResult::Fail("fixture has no HDMI port");
+    }
+    let card = super::super::stream::Card(dev.clone());
+    let sense = make_verb(0, 3, 0xf09 << 8);
+    for cycle in 0..2 {
+        let base = fixture.model.verbs.len();
+        let Ok(mut playback) = card.open(false, 3) else {
+            return TestResult::Fail(if cycle == 0 {
+                "first open"
+            } else {
+                "reopen of a parked controller must succeed"
+            });
+        };
+        if dev.suspended.load(Ordering::Acquire) || !fixture.model.verbs[base..].contains(&sense) {
+            return TestResult::Fail("open wakes the controller before it senses the HDMI pin");
+        }
+        if playback
+            .configure(super::super::stream::default_params())
+            .is_err()
+            || playback.prepare().is_err()
+            || playback.write(&[0x5a; 512]) != Ok(512)
+            || playback.start().is_err()
+        {
+            return TestResult::Fail("playback after open");
+        }
+        // DROP and close, then the park the autosuspend would run.
+        if playback.stop().is_err() {
+            return TestResult::Fail("DROP");
+        }
+        drop(playback);
+        if dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire) {
+            return TestResult::Fail("the closed controller parks");
+        }
+    }
+    if dev.irq.failed.load(Ordering::Acquire) {
+        return TestResult::Fail("no command may time out across a suspend cycle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-open",
+    native_hda_pm_open_wakes_a_parked_controller
+);
+
+/// A resume re-initialises the command I/O the way probe does, including the
+/// controller's acceptance of unsolicited responses: Linux
+/// `snd_hdac_bus_init_cmd_io` sets GCTL.UNSOL on every chip init. Before,
+/// `reinit` left GCTL at CRST alone, so after the first park the controller
+/// dropped every unsolicited response and HDMI/jack hotplug went unseen.
+fn native_hda_pm_reinit_accepts_unsolicited_responses() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    if unsafe { dev.bar0.read32(REG_GCTL) } & GCTL_UNSOL == 0 {
+        return TestResult::Fail("probe accepts unsolicited responses");
+    }
+    if dev.quiesce().is_err() || dev.reinit().is_err() {
+        return TestResult::Fail("park and resume");
+    }
+    // SAFETY: as above.
+    let gctl = unsafe { dev.bar0.read32(REG_GCTL) };
+    if gctl & GCTL_CRST == 0 || gctl & GCTL_UNSOL == 0 {
+        return TestResult::Fail("resume must accept unsolicited responses again (GCTL.UNSOL)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-unsol",
+    native_hda_pm_reinit_accepts_unsolicited_responses
+);
+
+/// Nothing posts into a parked controller's command rings. The jack service
+/// runs beside the PCM stop that parks the controller; an unsolicited-response
+/// drain or a jack re-read that lands after the park must leave the rings
+/// alone: a controller held in reset reads RIRBWP 0, so a drain walked the
+/// driver's read cursor through every stale RIRB slot down to 0, and a jack
+/// command waited out the 100 ms timeout and poisoned the transport. Linux
+/// never reaches a suspended controller's rings: `codec_exec_verb` powers the
+/// codec up first and runtime PM serialises suspend against the command path.
+fn native_hda_pm_parked_rings_take_no_command() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("park the idle controller");
+    }
+    // What the parked hardware reads: pointers at their reset values.
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    unsafe {
+        dev.bar0.write16(REG_RIRBWP, 0);
+        dev.bar0.write16(REG_CORBWP, 0);
+        dev.bar0.write16(REG_CORBRP, 0);
+    }
+    dev.commands.lock().rp = 0x40;
+    dev.drain_unsolicited();
+    if dev.commands.lock().rp != 0x40 {
+        return TestResult::Fail("the jack drain walked a parked controller's stale RIRB");
+    }
+    let start = narf_time::monotonic_ns();
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    let sensed =
+        narf_scheduler::block_on_spin(unsafe { dev.send_verb_async(make_verb(0, 3, 0xf09 << 8)) });
+    let elapsed = narf_time::monotonic_ns().saturating_sub(start);
+    // SAFETY: as above.
+    let posted = unsafe { dev.bar0.read16(REG_CORBWP) };
+    if sensed.is_ok() || posted != 0 || dev.irq.failed.load(Ordering::Acquire) {
+        return TestResult::Fail("a jack command must not be posted into parked rings");
+    }
+    if elapsed > 50_000_000 {
+        return TestResult::Fail("a jack command on a parked controller waited for the timeout");
+    }
+    // A synchronous command wakes the controller first (codec_exec_verb's
+    // snd_hda_power_up_pm) and gets the codec's own answer.
+    // SAFETY: as above.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x1002aa01)
+        || dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("a command wakes the parked controller before it is posted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-parked",
+    native_hda_pm_parked_rings_take_no_command
+);
+
+/// A codec that loses one response must not leave the controller dead. Linux
+/// `azx_rirb_get_response` falls back on a timeout (polling mode, then MSI
+/// off, then a bus reset or single_cmd mode) and the command is tried again;
+/// every later command works. Before, the timed-out lease latched
+/// `irq.failed`, which only a resume of a parked controller cleared, so on a
+/// running controller every later command failed with DeviceFailed and the
+/// PCM paths (open, prepare, start) with EPIPE.
+fn native_hda_cmd_recover_after_lost_response() -> TestResult {
+    let mut fixture = match Fixture::new() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let vendor = make_verb(0, 0, VERB_GET_PARAMETER);
+    fixture.model.drop_next = 1;
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    let first = unsafe { dev.send_verb(vendor) };
+    // SAFETY: as above.
+    let second = unsafe { dev.send_verb(vendor) };
+    if second != Ok(0x10ec0287) {
+        return TestResult::Fail("a lost response must not leave the command transport dead");
+    }
+    if first != Ok(0x10ec0287) {
+        return TestResult::Fail("the command whose response was lost is retried on fresh rings");
+    }
+    if dev.irq.failed.load(Ordering::Acquire) {
+        return TestResult::Fail("a recovered transport stays poisoned");
+    }
+    // The PCM paths that refused a poisoned transport work again.
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open after a lost response");
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+        || playback.start().is_err()
+    {
+        return TestResult::Fail("playback after a lost response");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/cmd-recover",
+    native_hda_cmd_recover_after_lost_response
+);
+
+/// Linux `azx_probe_codecs`: a STATESTS bit whose codec never answers ("Some
+/// BIOSen give you wrong codec addresses that don't exist") is dropped from
+/// the codec mask, the controller is reset back to a sane state, and the
+/// codecs that do answer are probed. Before, the silent slot's vendor read
+/// timed out and failed the whole controller, so one spurious bit cost the
+/// board all of its audio.
+fn native_hda_codec_probe_skips_a_silent_slot() -> TestResult {
+    let fixture = match Fixture::build_model(FixtureConfig {
+        codec_mask: 0b11,
+        ..Default::default()
+    }) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if !fixture
+        .model
+        .verbs
+        .contains(&make_verb(1, 0, VERB_GET_PARAMETER))
+    {
+        return TestResult::Fail("codec #1 is in the mask and must be probed");
+    }
+    if dev.codecs().len() != 1
+        || dev.codecs()[0].addr != 0
+        || dev.codecs()[0].vendor_id != 0x10ec0287
+        || dev.outputs.is_empty()
+    {
+        return TestResult::Fail("the answering codec #0 comes up beside the silent slot");
+    }
+    // The reset after the failed probe left a working transport.
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x10ec0287) {
+        return TestResult::Fail("commands after a failed slot probe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/codec-probe",
+    native_hda_codec_probe_skips_a_silent_slot
+);
+
+/// A free-running playback position (ALSA owns the stop threshold) is LPIB
+/// plus the whole ring wraps the elapsed time implies when a position sample
+/// comes late, as Linux checks a late period against `hw_ptr_jiffies` in
+/// `snd_pcm_update_hw_ptr0`. The wrap period is the stream's own: with
+/// 48 kHz hard-coded, a 96 kHz HDMI stream counted half its wraps, so its
+/// clock lost a whole ring on every late sample.
+fn native_hda_position_wraps_follow_the_stream_rate() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 3) else {
+        return TestResult::Fail("open");
+    };
+    let mut params = super::super::stream::default_params();
+    params.rate = narf_drivers_sound::format::SampleRate::R96000;
+    if playback.configure(params).is_err()
+        || playback.free_running(true).is_err()
+        || playback.prepare().is_err()
+        || playback.start().is_err()
+    {
+        return TestResult::Fail("96 kHz HDMI playback");
+    }
+    // LPIB stays 0, so only the elapsed time can account for the wraps:
+    // about 2.1 of them at 96 kHz, 1.03 had the ring run at 48 kHz.
+    let frames = u64::from(params.period_size) * u64::from(params.periods);
+    let wrap_ms = frames * 1000 / 96_000;
+    super::wait(|| false, 2 * wrap_ms + wrap_ms / 10);
+    if playback.pointer() != 2 * frames {
+        return TestResult::Fail("a 96 kHz ring wraps every 42.7 ms, not every 85.3 ms");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/position-rate",
+    native_hda_position_wraps_follow_the_stream_rate
+);
+
+/// The value of coef `index` on the coef node, if the codec holds one.
+fn coef_value(model: &Model, index: u16) -> Option<u16> {
+    model
+        .coef
+        .iter()
+        .find(|(nid, i, _)| *nid == crate::hda::quirks::COEF_NODE && *i == index)
+        .map(|(_, _, value)| *value)
+}
+
+/// Linux `alc662_probe` for an ALC897, the analog codec of AM5 desktop
+/// boards: `alc_fix_pll_init(codec, 0x20, 0x04, 15)` clears coef 0x04 bit
+/// 15, and `alc_pre_init` -> `alc_fill_eapd_coef` clears coef 0x07 bit 5
+/// (EAPD control), at probe and again on every init (`alc_init` after a
+/// resume). NARF knew no ALC662-family chip, so the codec kept both bits as
+/// the firmware left them.
+fn native_hda_alc897_pll_and_eapd_coefs() -> TestResult {
+    let mut fixture = match Fixture::build_model(FixtureConfig {
+        codec_id: 0x10ec0897,
+        seed_coef: &[(0x20, 0x04, 0x9234), (0x20, 0x07, 0x0121)],
+        ..Default::default()
+    }) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if coef_value(&fixture.model, 0x04) != Some(0x1234)
+        || coef_value(&fixture.model, 0x07) != Some(0x0101)
+    {
+        return TestResult::Fail("probe clears the ALC897 PLL bit and EAPD coef bit");
+    }
+    // The bits come back (a resume powers the codec up from scratch); the
+    // wake runs the init again.
+    for slot in fixture.model.coef.iter_mut() {
+        slot.2 |= if slot.1 == 0x04 { 0x8000 } else { 0x0020 };
+    }
+    if dev.quiesce().is_err() || dev.reinit().is_err() {
+        return TestResult::Fail("park and wake");
+    }
+    if coef_value(&fixture.model, 0x04) != Some(0x1234)
+        || coef_value(&fixture.model, 0x07) != Some(0x0101)
+    {
+        return TestResult::Fail("the wake re-applies the ALC897 init coefs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda/alc897", native_hda_alc897_pll_and_eapd_coefs);
+
+/// Linux keeps the controller powered while a PCM is open (`azx_pcm_open`
+/// takes `snd_hda_power_up_pm`, `azx_pcm_close` drops it) and powers it down
+/// only `power_save` seconds after the last reference went
+/// (`pm_runtime_put_autosuspend`): codec suspend first
+/// (`hda_call_codec_suspend`), then the controller (`azx_runtime_suspend`).
+/// A DROP with the PCM still open, what PipeWire sends when a sink goes
+/// idle, must not park the controller, and neither may the close at once.
+/// Before, every stop parked it, so each pause/resume of an open sink cost
+/// a full link reset and codec re-init.
+fn native_hda_pm_stop_and_close_keep_the_controller_up() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 3) else {
+        return TestResult::Fail("open");
+    };
+    let start = |playback: &mut Box<dyn narf_drivers_sound::hardware::PcmHardware>| {
+        playback.prepare().is_ok()
+            && playback.write(&[0x5a; 512]) == Ok(512)
+            && playback.start().is_ok()
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || !start(&mut playback)
+    {
+        return TestResult::Fail("playback");
+    }
+    if playback.stop().is_err() || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("a stop with the PCM open must not park the controller");
+    }
+    if !start(&mut playback) || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("restart after a stop");
+    }
+    if playback.stop().is_err() {
+        return TestResult::Fail("second stop");
+    }
+    drop(playback);
+    if dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the close parks only after the autosuspend delay");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-autosuspend",
+    native_hda_pm_stop_and_close_keep_the_controller_up
+);
+
+/// The autosuspend timer: held while a PCM is open, waiting while the
+/// delay since the close runs, parked once it has passed, and woken by the
+/// next open (Linux `pm_runtime_put_autosuspend` at close, the autosuspend
+/// timer, `pm_runtime_get_sync` at open).
+fn native_hda_pm_autosuspend_parks_after_the_delay() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    dev.autosuspend_ms.store(30, Ordering::Release);
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(playback) = card.open(false, 3) else {
+        return TestResult::Fail("open");
+    };
+    if dev.autosuspend() != Autosuspend::Held {
+        return TestResult::Fail("an open PCM holds the controller up");
+    }
+    drop(playback);
+    if !matches!(dev.autosuspend(), Autosuspend::Wait(_)) || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the delay starts at the close");
+    }
+    super::wait(|| false, 40);
+    if dev.autosuspend() != Autosuspend::Parked || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the controller parks once the delay has passed");
+    }
+    if card.open(false, 3).is_err() || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the next open wakes the controller");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-autosuspend",
+    native_hda_pm_autosuspend_parks_after_the_delay
+);
+
+/// A command-transport failure is transparent to a running stream, as
+/// Linux's `azx_rirb_get_response` recovery is (polling mode, single_cmd,
+/// a bus reset only through `response_reset`): a jack re-read that was
+/// lost must not xrun the playback stream, and the next command restarts
+/// the rings under it. Before, the stream's position update saw
+/// `irq.failed` and stopped the stream with an xrun, so one glitch on the
+/// command transport cut the audio PipeWire was playing.
+fn native_hda_running_stream_survives_a_lost_command() -> TestResult {
+    let mut fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 3) else {
+        return TestResult::Fail("open");
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.free_running(true).is_err()
+        || playback.prepare().is_err()
+        || playback.write(&[0x5a; 512]) != Ok(512)
+        || playback.start().is_err()
+    {
+        return TestResult::Fail("playback");
+    }
+    // A jack re-read the codec never answers, given up on.
+    fixture.model.stall = true;
+    {
+        // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+        let mut sense = pin!(unsafe { dev.send_verb_async(make_verb(0, 3, 0xf09 << 8)) });
+        let mut cx = Context::from_waker(Waker::noop());
+        if !matches!(sense.as_mut().poll(&mut cx), Poll::Pending) {
+            return TestResult::Fail("the jack command waits for the codec");
+        }
+    }
+    fixture.model.stall = false;
+    if !dev.irq.failed.load(Ordering::Acquire) {
+        return TestResult::Fail("the lost command poisons the transport");
+    }
+    // The stream service's position update.
+    let _ = playback.pointer();
+    if !dev.streams[0].lock().is_running() {
+        return TestResult::Fail("a command-transport failure must not stop a running stream");
+    }
+    // SAFETY: as above.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x1002aa01)
+        || !dev.streams[0].lock().is_running()
+    {
+        return TestResult::Fail("the ring restart leaves the running stream alone");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/cmd-stream",
+    native_hda_running_stream_survives_a_lost_command
+);
+
+/// `/proc/asound/cardN/codec#A` opens with Linux `print_codec_core_info`:
+/// "Codec: <vendor> <chip>" (the `hda_vendor_ids` name and the codec
+/// driver's chip name), the address, the AFG function id and its unsol bit
+/// (`AC_PAR_FUNCTION_TYPE`), the vendor, subsystem and revision ids, and
+/// the modem function group line. Before, the file printed the card name
+/// as the codec and a made-up node count, so alsa-info and the UCM codec
+/// matching saw no codec at all.
+fn native_hda_codec_proc_header_matches_linux() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let info = narf_drivers_sound::CardInfo {
+        index: 0,
+        driver: "HDA-Intel",
+        id: "HDMI",
+        name: "HDA ATI HDMI",
+        playback_count: 1,
+        capture_count: 0,
+    };
+    let card = narf_drivers_sound::register_hardware_card_at(
+        info,
+        Arc::new(super::super::stream::Card(dev.clone())),
+        None,
+    );
+    let text = narf_drivers_sound::procfs_bridge::render_codec_dump(card, 0);
+    narf_drivers_sound::unregister_hardware_card(card);
+    let header = "Codec: ATI R6xx HDMI\nAddress: 0\nAFG Function Id: 0x1 (unsol 0)\n\
+                  Vendor Id: 0x1002aa01\nSubsystem Id: 0x00000000\nRevision Id: 0x100700\n\
+                  No Modem Function Group found\n";
+    if !text.starts_with(header) {
+        return TestResult::Fail("codec#0 opens with print_codec_core_info's header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/card-names",
+    native_hda_codec_proc_header_matches_linux
+);
+
+/// Linux `azx_runtime_idle` refuses (-EBUSY) for a controller without
+/// `AZX_DCAPS_PM_RUNTIME` (1002:1640 among them): the autosuspend still
+/// suspends its codecs (`hda_codec_runtime_suspend`: D3), but the controller
+/// stays up, link out of reset and command rings running. The next command
+/// resumes the codecs first (`codec_exec_verb` -> `snd_hda_power_up_pm` ->
+/// `hda_call_codec_resume`: D0 and the codec init). Before, NARF parked
+/// every controller the same way.
+fn native_hda_pm_codec_only_suspend_without_runtime_pm() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    dev.runtime_pm.store(false, Ordering::Release);
+    dev.autosuspend_ms.store(10, Ordering::Release);
+    super::wait(|| false, 20);
+    let base = fixture.model.verbs.len();
+    let _ = dev.autosuspend();
+    let d3 = make_verb(0, 1, crate::hda_codec::verb::SET_POWER_STATE | 3);
+    if !fixture.model.verbs[base..].contains(&d3) {
+        return TestResult::Fail("the autosuspend puts the codecs in D3");
+    }
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    let (gctl, corbctl) = unsafe { (dev.bar0.read32(REG_GCTL), dev.bar0.read8(REG_CORBCTL)) };
+    if gctl & GCTL_CRST == 0 || corbctl & CORBCTL_RUN == 0 || dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("a controller without runtime PM stays up");
+    }
+    let base = fixture.model.verbs.len();
+    // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+    if unsafe { dev.send_verb(make_verb(0, 0, VERB_GET_PARAMETER)) } != Ok(0x1002aa01) {
+        return TestResult::Fail("a command after the codec suspend");
+    }
+    let d0 = make_verb(0, 1, crate::hda_codec::verb::SET_POWER_STATE);
+    if !fixture.model.verbs[base..].contains(&d0) {
+        return TestResult::Fail("a command resumes the codecs (D0) before it runs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-codec-only",
+    native_hda_pm_codec_only_suspend_without_runtime_pm
+);
+
+/// Linux `azx_runtime_suspend` arms WAKEEN for every codec slot before it
+/// shuts the link down, so a codec state change while parked (a monitor or
+/// headphone plugged) sets STATESTS and wakes the controller;
+/// `azx_runtime_resume` resumes it, the codecs re-read their jacks, and
+/// WAKEEN is disarmed again. Before, nothing armed the wake, and a hotplug
+/// while parked went unseen until the next PCM open.
+fn native_hda_pm_codec_state_change_wakes_a_parked_controller() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    dev.autosuspend_ms.store(10, Ordering::Release);
+    super::wait(|| false, 20);
+    if dev.autosuspend() != Autosuspend::Parked || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the idle controller parks");
+    }
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    if unsafe { dev.bar0.read16(REG_WAKEEN) } & 0xff != 0xff {
+        return TestResult::Fail("the park arms WAKEEN for every codec slot");
+    }
+    // No state change yet: the controller stays parked. STATESTS is a
+    // resume-well register the reset does not clear.
+    // SAFETY: as above.
+    unsafe { dev.bar0.write16(REG_STATESTS, 0) };
+    if dev.autosuspend() != Autosuspend::Parked {
+        return TestResult::Fail("a parked controller with no codec wake stays parked");
+    }
+    dev.jack_dirty.store(false, Ordering::Release);
+    // Codec 0 signals a state change.
+    // SAFETY: as above.
+    unsafe { dev.bar0.write16(REG_STATESTS, 1) };
+    let _ = dev.autosuspend();
+    if dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("a codec state change wakes the parked controller");
+    }
+    // SAFETY: as above.
+    if unsafe { dev.bar0.read16(REG_WAKEEN) } & 0xff != 0 || !dev.jack_dirty.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("the wake disarms WAKEEN and re-reads the jacks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-wake",
+    native_hda_pm_codec_state_change_wakes_a_parked_controller
+);
+
+/// Linux `hda_call_codec_suspend` runs `hda_cleanup_all_streams` before
+/// D3: every converter still assigned a stream gets SET_CHANNEL_STREAMID 0
+/// and SET_STREAM_FORMAT 0 (`really_cleanup_stream`), so no converter keeps
+/// decoding a stream tag across the power-down. Before, NARF sent D3 with
+/// the last stream's tag and format still programmed.
+fn native_hda_pm_codec_suspend_cleans_up_converters() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 3) else {
+        return TestResult::Fail("open");
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure HDMI playback");
+    }
+    drop(playback);
+    let base = fixture.model.verbs.len();
+    if dev.quiesce().is_err() {
+        return TestResult::Fail("park");
+    }
+    let verbs = &fixture.model.verbs[base..];
+    let at = |v: u32| verbs.iter().position(|x| *x == v);
+    let d3 = at(make_verb(0, 1, crate::hda_codec::verb::SET_POWER_STATE | 3));
+    let stream = at(make_verb(0, 2, VERB_SET_CONVERTER_STREAM));
+    let format = at(make_verb(0, 2, VERB_SET_CONVERTER_FORMAT));
+    match (stream, format, d3) {
+        (Some(s), Some(f), Some(d)) if s < d && f < d => TestResult::Pass,
+        _ => TestResult::Fail("the codec suspend clears the converter's stream and format first"),
+    }
+}
+kernel_test_in!(
+    "audio/hda/pm-wake",
+    native_hda_pm_codec_suspend_cleans_up_converters
+);
+
+/// Linux patch_hdmi with atihdmi's `static_pcm_mapping`: one PCM per pin
+/// (`min(num_cvts, num_pins)`), device numbers from `get_empty_pcm_device`
+/// (3, 7, 8, 9, 10, ...), pin i bound to PCM i. Per PCM, the
+/// "HDMI/DP,pcm=N Jack" on CARD (`generic_hdmi_build_jack`), the "ELD" on
+/// PCM at device N (`hdmi_create_eld_ctl`), the IEC958 Con Mask, Pro Mask,
+/// Default and Switch on MIXER at the PCM's index
+/// (`snd_hda_create_dig_out_ctls`) and the "Playback Channel Map" on PCM at
+/// device N (`snd_hdac_add_chmap_ctls`). An HDMI-only codec has no "Master
+/// Playback Switch". NARF had one PCM at device 0 that mirrored every port,
+/// one control set at device 0, index 0, and a Master switch.
+fn native_hda_hdmi_pcm_per_pin_at_linux_devices() -> TestResult {
+    use narf_drivers_sound::mixer::ControlKind;
+    let fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    if card.pcm_devices(false) != Some(alloc::vec![3, 7]) || card.pcm_devices(true).is_some() {
+        return TestResult::Fail("one playback PCM per HDMI pin at devices 3 and 7");
+    }
+    let wires: Vec<(ControlKind, u32, u32, Option<alloc::string::String>)> = card
+        .controls()
+        .into_iter()
+        .map(|id| match card.control_wire(id) {
+            Some(wire) => (id.kind, wire.device, wire.index, wire.name),
+            None => (id.kind, 0, 0, None),
+        })
+        .collect();
+    let has = |kind: ControlKind, device: u32, index: u32, name: Option<&str>| {
+        wires
+            .iter()
+            .any(|w| w.0 == kind && w.1 == device && w.2 == index && w.3.as_deref() == name)
+    };
+    for (pcm, device) in [(0u32, 3u32), (1, 7)] {
+        let jack = alloc::format!("HDMI/DP,pcm={} Jack", device);
+        if !has(ControlKind::HdmiJack, 0, 0, Some(&jack))
+            || !has(ControlKind::Eld, device, 0, None)
+            || !has(ControlKind::ChannelMap, device, 0, None)
+        {
+            return TestResult::Fail("per-PCM jack, ELD and channel map at Linux's ids");
+        }
+        for kind in [
+            ControlKind::Iec958ConMask,
+            ControlKind::Iec958ProMask,
+            ControlKind::Iec958Default,
+            ControlKind::Iec958Switch,
+        ] {
+            if !has(kind, 0, pcm, None) {
+                return TestResult::Fail("per-PCM IEC958 set at the PCM's index");
+            }
+        }
+    }
+    if card
+        .controls()
+        .iter()
+        .any(|id| id.kind == ControlKind::MasterMute)
+    {
+        return TestResult::Fail("an HDMI-only codec has no Master Playback Switch");
+    }
+    if card.open(false, 0).is_ok() {
+        return TestResult::Fail("an HDMI-only card has no PCM device 0");
+    }
+    // Device 7 is pin 5's PCM: its converter takes the stream, pin 3's
+    // converter does not.
+    let Ok(mut playback) = card.open(false, 7) else {
+        return TestResult::Fail("open HDMI PCM device 7");
+    };
+    let first = fixture.model.verbs.len();
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure device 7");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    if !verbs.contains(&make_verb(0, 4, VERB_SET_CONVERTER_STREAM | 0x10))
+        || verbs.contains(&make_verb(0, 2, VERB_SET_CONVERTER_STREAM | 0x10))
+    {
+        return TestResult::Fail("device 7 streams to pin 5's converter only");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/hdmi-pcm",
+    native_hda_hdmi_pcm_per_pin_at_linux_devices
+);
+
+/// Linux snd_hda_codec_configure adds "HDA:<vendor>,<subsystem>,<revision>"
+/// per codec to card->components (PipeWire's alsa.components:
+/// "HDA:1002aa01,00aa0100,00100800" for the RX 6750 XT's HDMI codec on
+/// this host), and patch_hdmi names PCM i "HDMI i" (`/proc/asound/pcm`:
+/// "00-07: HDMI 1 : HDMI 1 : playback 1"). NARF reported no components and
+/// named every PCM after the card.
+fn native_hda_components_and_hdmi_pcm_names() -> TestResult {
+    let fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    if card.components().as_deref() != Some("HDA:1002aa01,00000000,00100700") {
+        return TestResult::Fail("card components name each codec as Linux does");
+    }
+    if card.pcm_name(false, 3).as_deref() != Some("HDMI 0")
+        || card.pcm_name(false, 7).as_deref() != Some("HDMI 1")
+        || card.pcm_name(false, 0).is_some()
+        || card.pcm_name(true, 3).is_some()
+    {
+        return TestResult::Fail("HDMI PCMs are named HDMI 0, HDMI 1, ...");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pcm-names",
+    native_hda_components_and_hdmi_pcm_names
+);
+
+/// Linux keeps one hda_spdif_out per HDMI PCM (snd_hda_create_dig_out_ctls
+/// for each PCM, its DIG1/DIG2 read from cvt_nids[0]) and leaves it
+/// unassigned until the PCM opens (hdmi_pcm_open: snd_hda_spdif_ctls_assign
+/// to the PCM's converter; close: unassign). A closed PCM's IEC958 write is
+/// only stored; an open PCM's reaches its own converter. The channel map is
+/// the pin's: without an open stream a write is ignored and the map reads
+/// zeros. NARF shared one state between all PCMs and wrote it to every
+/// port's converter. On this host's Linux, `amixer -c0` shows "IEC958
+/// Playback Default" index 0 at AES1 0x82 (in use) and indices 1..5 at 0.
+fn native_hda_hdmi_iec958_state_per_pcm() -> TestResult {
+    use narf_drivers_sound::mixer::{ControlId, ControlKind, ControlValue};
+    let fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let id = |index, kind| ControlId { index, kind };
+    // PCM 0 (device 3) keeps indices 5..9; PCM 1 (device 7) has 34..38.
+    let status = [
+        id(7, ControlKind::Iec958Default),
+        id(36, ControlKind::Iec958Default),
+    ];
+    let switch = [
+        id(8, ControlKind::Iec958Switch),
+        id(37, ControlKind::Iec958Switch),
+    ];
+    let chmap = [
+        id(9, ControlKind::ChannelMap),
+        id(38, ControlKind::ChannelMap),
+    ];
+    // SET_DIGI_CONVERT_1/2 to converter `nid`.
+    let digital = |verbs: &[u32], nid: u32| {
+        verbs
+            .iter()
+            .any(|v| (v >> 20) & 0x7f == nid && matches!((v >> 8) & 0xfff, 0x70d | 0x70e))
+    };
+    let first = fixture.model.verbs.len();
+    if card
+        .set_control(status[1], ControlValue::iec958(&[0x04, 0x05]))
+        .is_err()
+        || card
+            .set_control(switch[1], ControlValue::boolean(false))
+            .is_err()
+        || digital(&fixture.model.verbs[first..], 2)
+        || digital(&fixture.model.verbs[first..], 4)
+    {
+        return TestResult::Fail("a closed PCM's IEC958 write reaches no converter");
+    }
+    if card.get_control(status[1]) != Ok(ControlValue::iec958(&[0x04, 0x05]))
+        || card.get_control(switch[1]) != Ok(ControlValue::boolean(false))
+        || card.get_control(status[0]) != Ok(ControlValue::iec958(&[0x04, 0x02]))
+        || card.get_control(switch[0]) != Ok(ControlValue::boolean(true))
+    {
+        return TestResult::Fail("each HDMI PCM keeps its own IEC958 state");
+    }
+    // Opening device 7 assigns PCM 1 to pin 5's converter: the prepare
+    // writes PCM 1's DIG1 (DIGEN off) and DIG2 (category 5) there only.
+    let Ok(mut playback) = card.open(false, 7) else {
+        return TestResult::Fail("open device 7");
+    };
+    let first = fixture.model.verbs.len();
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("prepare device 7");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    if !verbs.contains(&make_verb(0, 4, 0x70d00))
+        || !verbs.contains(&make_verb(0, 4, 0x70e05))
+        || digital(verbs, 2)
+    {
+        return TestResult::Fail("the open PCM's converter takes that PCM's DIG1/DIG2");
+    }
+    // The open PCM's write reaches its converter; the closed PCM's does not.
+    let first = fixture.model.verbs.len();
+    if card
+        .set_control(switch[1], ControlValue::boolean(true))
+        .is_err()
+        || !fixture.model.verbs[first..].contains(&make_verb(0, 4, 0x70d01))
+        || card
+            .set_control(switch[0], ControlValue::boolean(false))
+            .is_err()
+        || digital(&fixture.model.verbs[first..], 2)
+    {
+        return TestResult::Fail("only the open PCM's IEC958 write reaches a converter");
+    }
+    // Each PCM reports its own pin's channel map.
+    if card
+        .set_control(chmap[0], ControlValue::integers(&[4, 3, 0, 0, 0, 0, 0, 0]))
+        .is_err()
+        || card.get_control(chmap[0]) != Ok(ControlValue::integers(&[0; 8]))
+        || card.get_control(chmap[1]) != Ok(ControlValue::integers(&[3, 4, 0, 0, 0, 0, 0, 0]))
+    {
+        return TestResult::Fail("each PCM reports its own pin's channel map");
+    }
+    drop(playback);
+    if card.get_control(chmap[1]) != Ok(ControlValue::integers(&[0; 8]))
+        || card.get_control(status[1]) != Ok(ControlValue::iec958(&[0x04, 0x05]))
+    {
+        return TestResult::Fail("close resets the map and keeps the IEC958 state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/hdmi-iec958",
+    native_hda_hdmi_iec958_state_per_pcm
+);
+
+/// Linux azx_probe_continue on a link with no codec logs "no codecs
+/// found!" and keeps running: interrupts, the card registration and runtime
+/// PM, with a card that has no PCMs. RETRY_PROBE retries only a codec that
+/// fails to configure, not an empty link. This host's Linux shows exactly
+/// that for the 1022:15e3 controller: "snd_hda_intel 0000:12:00.6: no
+/// codecs found!" at boot, with no retries, and card 2 "Generic" holding
+/// only an id file. NARF failed the bring-up with NoCodecs, retried it for
+/// a minute on AMD platform controllers and registered no card.
+fn native_hda_no_codec_link_still_comes_up() -> TestResult {
+    let fixture = match Fixture::build_model(FixtureConfig {
+        no_codecs: true,
+        ..Default::default()
+    }) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if !dev.codecs().is_empty()
+        || !dev.outputs.is_empty()
+        || dev.input.lock().is_some()
+        || !dev.ready
+    {
+        return TestResult::Fail("a codec-less controller comes up ready for an empty card");
+    }
+    let card = super::super::stream::Card(dev.clone());
+    if card.open(false, 0).is_ok() || card.open(true, 0).is_ok() || !card.controls().is_empty() {
+        return TestResult::Fail("the empty card has no PCMs and no controls");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/no-codecs",
+    native_hda_no_codec_link_still_comes_up
 );

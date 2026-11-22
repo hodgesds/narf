@@ -800,6 +800,20 @@ impl AddressSpace {
     /// the root; metadata exhaustion returns `OutOfRange` (Linux `ENOMEM`)
     /// without stranding a page-table frame.
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError>;
+    /// x86_64: the same, laid out for an IA-32 (compat) task. Its mmap
+    /// window is [COMPAT32_MMAP_BASE (0x5555_5000), COMPAT32_MMAP_WINDOW_TOP
+    /// (0xFF00_0000)) with a randomized floor, so every kernel-chosen address
+    /// (no-hint mmap, mremap move, alias placement) is below
+    /// COMPAT32_TASK_SIZE (0xFFFF_E000, Linux IA32_PAGE_OFFSET). The floor
+    /// lying under 4 GiB is what marks the layout; fork inherits it.
+    pub unsafe fn new_for_user_compat32() -> Result<Self, AddressSpaceError>;
+    pub fn is_compat32_layout(&self) -> bool;
+    /// Linux `mm->mmap_base` (bottom-up): fixed for the address space's life.
+    pub fn mmap_floor(&self) -> u64;
+    pub const COMPAT32_TASK_SIZE: u64;       // 0xFFFF_E000
+    pub const COMPAT32_MMAP_BASE: u64;       // PAGE_ALIGN(TASK_SIZE_32 / 3)
+    pub const COMPAT32_MMAP_WINDOW_TOP: u64; // below the 8 MiB stack reservation
+    pub const COMPAT32_MMAP_MIN_ADDR: u64;   // default vm.mmap_min_addr, 64 KiB
     /// Lifetime process PCID/ASID, or zero for the flushing fallback.
     pub fn translation_tag(&self) -> u16;
     /// Stable, never-reused identity of this address-space incarnation.
@@ -1116,7 +1130,9 @@ impl AddressSpace {
     /// Atomically select a reusable aligned mmap gap and publish an ordinary
     /// private anonymous VMA; a free non-zero hint wins, otherwise the current
     /// mmap high-water candidate is tried before falling back to the first
-    /// suitable gap at or above MMAP_CURSOR_BASE.
+    /// suitable gap at or above the address space's mmap window base
+    /// (MMAP_CURSOR_BASE, or COMPAT32_MMAP_BASE for a compat layout) and
+    /// ending at or below the window top.
     pub fn map_private_anonymous_region_anywhere_limited(
         &self, region: Region, hint: VirtAddr, align: u64,
         explicit_lock: bool, limit_bytes: u64, bypass_limit: bool,
