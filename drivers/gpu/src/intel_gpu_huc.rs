@@ -1,8 +1,15 @@
 //! HuC DMA upload and GuC authentication. Linux b90c984d: xe_huc.c,
 //! xe_uc_fw.c, xe_wopcm.c and xe_guc.c. xe_huc.c::xe_huc_init places the HuC
 //! on the primary GT through graphics 12.55 and on the media GT above it, so
-//! NARF's two profiles are owned by different GuCs:
+//! NARF's profiles are owned by different GuCs:
 //! - exact TGL: the main GuC loads `i915/tgl_huc.bin` (whole-file CSS);
+//! - Gen11: the main GuC loads `i915/icl_huc_9.0.0.bin` (Ice Lake) or
+//!   `i915/ehl_huc_9.0.0.bin` (Elkhart/Jasper Lake), both whole-file CSS
+//!   like TGL's (`gt/uc/intel_uc_fw.c` `INTEL_HUC_FIRMWARE_DEFS`:
+//!   `huc_mmp(icl, 9, 0, 0)`, `huc_mmp(ehl, 9, 0, 0)`; the 9.0.0 is the
+//!   filename version, not an enforced minimum — Linux applies no version
+//!   matching to HuC: "there is no KMD interaction, hence no version
+//!   matching requirement");
 //! - MTL/Arrow: the standalone media GuC loads `i915/mtl_huc_gsc.bin`, whose
 //!   GSC CPD headers embed the CSS that is DMA-uploaded (xe_uc_fw.c
 //!   parse_headers), and authenticates it via XE_HUC_AUTH_VIA_GUC.
@@ -12,7 +19,7 @@
 
 use crate::{
     intel_gpu_aux::MmioWindow,
-    intel_gpu_gt::{media::gsc, Gen12Platform, GtPlatform},
+    intel_gpu_gt::{media::gsc, Gen11Platform, Gen12Platform, GtPlatform},
     intel_gpu_guc::{GuCError, GuCMessage},
     intel_gpu_guc_boot::{BootAllocator, GuCRole},
     intel_gpu_guc_firmware::FirmwareError,
@@ -24,6 +31,11 @@ use narf_capabilities::{Cap, CapError, CapOp, Read};
 
 pub(crate) const PLATFORM: GtPlatform = GtPlatform::Gen12(Gen12Platform::TigerLake);
 const NAME: &str = "i915/tgl_huc.bin";
+/// Gen11 (Lane 7): Ice Lake takes the `icl_huc` blob, Elkhart/Jasper Lake
+/// the `ehl_huc` blob (`gt/uc/intel_uc_fw.c` `INTEL_HUC_FIRMWARE_DEFS`,
+/// Linux 7.4-rc2: `huc_mmp(icl, 9, 0, 0)`, `huc_mmp(ehl, 9, 0, 0)`).
+const ICL_NAME: &str = "i915/icl_huc_9.0.0.bin";
+const EHL_NAME: &str = "i915/ehl_huc_9.0.0.bin";
 const FIRST: u16 = 0x4000;
 const LAST: u16 = 0x7eff; // log sideband starts at7f00; SLPC at8000
 /// NARF bound on an acquired HuC file (Linux copies any size into its BO).
@@ -33,12 +45,28 @@ pub(crate) fn opted_in(args: narf_boot::args::KernelCmdline<'_>) -> bool {
     crate::intel_gpu_gt::boot_opt_in(args, "narf.intel.huc")
 }
 
+/// The primary-GT HuC blob name for `platform`, if the platform has a
+/// primary-GT HuC at all: exact TGL plus the Gen11 sub-platforms (Lane 7).
+/// The media GT has no entry here — its name is `gsc::HUC_FIRMWARE`.
+/// The returned name is the registry key `Firmware::open` loads; the
+/// version embedded in a `_mmp` filename is the file's own version, not a
+/// minimum (Linux applies no version matching to HuC).
+pub(crate) fn firmware_name(platform: GtPlatform) -> Option<&'static str> {
+    match platform {
+        p if p == PLATFORM => Some(NAME),
+        GtPlatform::Gen11(Gen11Platform::IceLake) => Some(ICL_NAME),
+        GtPlatform::Gen11(Gen11Platform::ElkhartLake | Gen11Platform::JasperLake) => Some(EHL_NAME),
+        _ => None,
+    }
+}
+
 /// xe_huc.c::xe_huc_init: whether the GuC in `role` owns `platform`'s HuC.
 /// Linux supports HuC on the primary GT only through graphics 12.55 and on
-/// the media GT otherwise; NARF admits exact TGL and the MTL/Arrow media GT.
+/// the media GT otherwise; NARF admits exact TGL and the Gen11 primary GT
+/// (Lane 7), and the MTL/Arrow media GT.
 pub(crate) fn profile(platform: GtPlatform, role: GuCRole) -> bool {
     match role {
-        GuCRole::Primary => platform == PLATFORM,
+        GuCRole::Primary => firmware_name(platform).is_some(),
         GuCRole::Media(_) => crate::intel_gpu_gt::media::profile_eligible(platform),
     }
 }
@@ -164,7 +192,11 @@ impl<'a> Load<'a> {
 }
 
 fn validate(platform: GtPlatform, bytes: &[u8]) -> Result<Load<'_>, FirmwareError> {
-    if platform == PLATFORM {
+    // The primary-GT blobs (TGL's unversioned file and the Gen11 `_mmp`
+    // files) are all whole-file CSS (`gt/uc/intel_uc_fw.c`:
+    // non-GSC blobs take `check_ccs_header`); the media-GT blob is
+    // GSC-headered and parses through `Load::media`.
+    if firmware_name(platform).is_some() {
         Image::parse(bytes)
             .map(Load::from)
             .map_err(FirmwareError::Image)
@@ -193,12 +225,10 @@ impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
         // xe_uc_fw.c XE_HUC_FIRMWARE_DEFS: TIGERLAKE no_ver(i915, huc, tgl)
-        // and METEORLAKE no_ver(i915, huc_gsc, mtl).
-        let name = if self.0 == PLATFORM {
-            NAME
-        } else {
-            gsc::HUC_FIRMWARE
-        };
+        // and METEORLAKE no_ver(i915, huc_gsc, mtl); i915
+        // INTEL_HUC_FIRMWARE_DEFS adds ICELAKE huc_mmp(icl, 9, 0, 0) and
+        // ELKHARTLAKE/JASPERLAKE huc_mmp(ehl, 9, 0, 0) (Lane 7).
+        let name = firmware_name(self.0).unwrap_or(gsc::HUC_FIRMWARE);
         let blob = match narf_firmware::open(name, cap) {
             Ok(b) => b,
             Err(e) => return Ok(Err(FirmwareError::Registry(e))),
@@ -235,7 +265,9 @@ impl Firmware {
         platform: GtPlatform,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
-        if platform != PLATFORM && !crate::intel_gpu_gt::media::profile_eligible(platform) {
+        if firmware_name(platform).is_none()
+            && !crate::intel_gpu_gt::media::profile_eligible(platform)
+        {
             return Err(FirmwareError::Unsupported);
         }
         authority

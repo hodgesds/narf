@@ -2123,8 +2123,12 @@ impl Owner {
                     .map_err(RuntimeError::Firmware)?,
             );
         }
-        let huc_enabled = platform == crate::intel_gpu_huc::PLATFORM
-            && crate::intel_gpu_huc::opted_in(narf_boot::args());
+        // HuC is default-off (`narf.intel.huc=1`) and only on a primary GT
+        // with a HuC profile: exact TGL, or a Gen11 sub-platform (Lane 7).
+        // The media-GT HuC opt-in below is a separate path.
+        let huc_enabled =
+            crate::intel_gpu_huc::profile(platform, crate::intel_gpu_guc_boot::GuCRole::Primary)
+                && crate::intel_gpu_huc::opted_in(narf_boot::args());
         if huc_enabled && state.huc.is_none() {
             let authority = narf_firmware::trusted_loader_authority()
                 .ok_or(RuntimeError::Authority)?

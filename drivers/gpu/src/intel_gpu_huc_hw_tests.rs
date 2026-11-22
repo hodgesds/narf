@@ -1121,3 +1121,54 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_huc",
     smoke_tgl_huc_disabled_unsupported_and_no_video_refuse
 );
+
+fn smoke_gen11_huc_profile_selection() -> TestResult {
+    // Lane 7 item 2: the Gen11 HuC family from Linux
+    // `gt/uc/intel_uc_fw.c` `INTEL_HUC_FIRMWARE_DEFS` —
+    // `huc_mmp(icl, 9, 0, 0)`, `huc_mmp(ehl, 9, 0, 0)`. The 9.0.0 is the
+    // filename version, not an enforced minimum (Linux applies no version
+    // matching to HuC); the parsed CSS version is reported, not gated.
+    use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, GtPlatform};
+    let icl = GtPlatform::Gen11(Gen11Platform::IceLake);
+    let ehl = GtPlatform::Gen11(Gen11Platform::ElkhartLake);
+    let jsl = GtPlatform::Gen11(Gen11Platform::JasperLake);
+    if huc::firmware_name(icl) != Some("i915/icl_huc_9.0.0.bin")
+        || huc::firmware_name(ehl) != Some("i915/ehl_huc_9.0.0.bin")
+        || huc::firmware_name(jsl) != Some("i915/ehl_huc_9.0.0.bin")
+        || huc::firmware_name(huc::PLATFORM) != Some("i915/tgl_huc.bin")
+        || huc::firmware_name(GtPlatform::Gen12(Gen12Platform::RocketLake)).is_some()
+        || huc::firmware_name(GtPlatform::Integrated(
+            crate::intel_gpu::Generation::MeteorLake,
+        ))
+        .is_some()
+    {
+        return TestResult::Fail("Gen11 HuC blob selection");
+    }
+    if !huc::profile(icl, crate::intel_gpu_guc_boot::GuCRole::Primary)
+        || !huc::profile(ehl, crate::intel_gpu_guc_boot::GuCRole::Primary)
+        || !huc::profile(jsl, crate::intel_gpu_guc_boot::GuCRole::Primary)
+    {
+        return TestResult::Fail("Gen11 primary-GT HuC not admitted");
+    }
+    // Whole-file CSS carrying the 9.0.0 file version: accepted on every
+    // Gen11 sub-platform, with the parsed version reported.
+    let mut bytes = css();
+    put32(&mut bytes, 64, 0x0009_0000);
+    for platform in [icl, ehl, jsl] {
+        match huc::Firmware::from_fixture(platform, &bytes) {
+            Ok(firmware) if firmware.load().version == (9, 0, 0) => {}
+            _ => return TestResult::Fail("Gen11 HuC 9.0.0 fixture rejected"),
+        }
+    }
+    // A malformed CSS is refused on Gen11 exactly as on TGL.
+    let mut bad = css();
+    put32(&mut bad, 0, 5);
+    if huc::Firmware::from_fixture(icl, &bad).is_ok() {
+        return TestResult::Fail("Gen11 HuC malformed CSS admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_huc",
+    smoke_gen11_huc_profile_selection
+);
