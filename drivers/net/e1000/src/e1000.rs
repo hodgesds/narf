@@ -4322,15 +4322,29 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// device's one vector is delivered to the boot CPU (MSI-X entry 0 targets
 /// APIC 0; INTx reaches the BSP).
 pub(crate) fn rx_task_specs() -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
-    (narf_scheduler::TaskSpec::unthrottled(), None)
+    let cpu = narf_scheduler::affinity::CpuId::BOOT.0;
+    let pump = narf_net::napi::rx_pump_spec(cpu);
+    (pump, narf_net::napi::rx_deferral_spec(cpu))
 }
 
 fn spawn_pumps(device: Arc<E1000>, tx_cons: Consumer<Frame, TX_RING_N>) {
-    let (spec, _deferral) = rx_task_specs();
+    let (spec, deferral) = rx_task_specs();
+    let handoff = Arc::new(narf_net::napi::SoftirqHandoff::new());
+    let deferral_task = deferral.is_some();
+    if let Some(deferral) = deferral {
+        let d = device.clone();
+        let handoff = handoff.clone();
+        narf_scheduler::spawn_with_spec(
+            async move {
+                e1000_rx_deferral(d, handoff).await;
+            },
+            deferral,
+        );
+    }
     let d1 = device.clone();
     narf_scheduler::spawn_with_spec(
         async move {
-            e1000_rx_pump(d1).await;
+            e1000_rx_pump(d1, deferral_task, handoff).await;
         },
         spec,
     );
@@ -4347,7 +4361,37 @@ fn spawn_pumps(device: Arc<E1000>, tx_cons: Consumer<Frame, TX_RING_N>) {
     narf_net::watchdog::DevWatchdog::start_for_device(weak, TX_TIMEOUT_NS);
 }
 
-async fn e1000_rx_pump(device: Arc<E1000>) {
+/// One NAPI poll (`e1000e_poll` -> `e1000_clean_rx_irq`): at most
+/// `RX_DRAIN_BUDGET` frames handed to the stack. Returns the frames and
+/// whether the ring may hold more.
+fn e1000_napi_poll(device: &E1000) -> (u32, bool) {
+    let n = device.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| dispatch_rx_frame(device, frame));
+    if n != 0 {
+        // Another task may run before the next poll: hand up what this
+        // CPU's coalescer holds first (`__napi_poll` flushes GRO before a
+        // repoll for the same reason).
+        narf_net::tcp_stack::gro_flush();
+    }
+    (n as u32, n != 0)
+}
+
+/// The receive deferral task (ksoftirqd): takes the ring over when the
+/// pump's softirq run ends with work left, polls it in bounded runs while
+/// sharing the CPU, and hands it back once it drains.
+async fn e1000_rx_deferral(device: Arc<E1000>, handoff: Arc<narf_net::napi::SoftirqHandoff>) {
+    loop {
+        handoff.taken().await;
+        let poll = || e1000_napi_poll(&device);
+        narf_net::napi::deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
+    }
+}
+
+async fn e1000_rx_pump(
+    device: Arc<E1000>,
+    deferral_task: bool,
+    handoff: Arc<narf_net::napi::SoftirqHandoff>,
+) {
+    use narf_net::napi::{deferral_run, softirq_run, SoftirqEnd};
     // Build the IRQ waiter BEFORE checking DD. WaitForIrq snapshots the
     // vector's fire count, so an interrupt racing the empty-ring check either
     // makes the waiter immediately ready or invokes its registered waker. The
@@ -4357,13 +4401,12 @@ async fn e1000_rx_pump(device: Arc<E1000>) {
     // Once awake, drain until the ring is empty without waiting for another
     // interrupt. This is the shape of an interrupt-driven NAPI poll: the
     // device interrupt starts a burst, then descriptor DD bits drive the hot
-    // path without one wake per packet. Each pass is bounded by
-    // `RX_DRAIN_BUDGET`, and a pass that found frames gives the CPU to the
-    // other tasks queued on it before the next one, as `net_rx_action` does
-    // when a poll uses its budget: a sender that keeps the ring non-empty
-    // must not hold the CPU for as long as it keeps sending. A short deadline
-    // remains as a lost-interrupt safety net; devices without a wired vector
-    // retain the 1-ms polling fallback.
+    // path without one wake per packet. The pump runs ahead of the boot
+    // CPU's tasks as softirq does, each poll bounded by `RX_DRAIN_BUDGET` and
+    // each interrupt's run by the softirq bound; a sender that keeps the
+    // ring non-empty past that bound is served by the deferral task, which
+    // shares the CPU. A short deadline remains as a lost-interrupt safety
+    // net; devices without a wired vector retain the 1-ms polling fallback.
     const IRQ_FALLBACK_MS: u64 = 10;
     let poll_fallback_cycles = narf_time::ns_to_cycles(1_000_000);
     loop {
@@ -4381,14 +4424,22 @@ async fn e1000_rx_pump(device: Arc<E1000>) {
                 narf_time::Deadline::after_ms(IRQ_FALLBACK_MS),
             )
         });
-        if device.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| dispatch_rx_frame(&device, frame)) != 0
-        {
-            // This pump is not pinned, so it may resume on another CPU: hand
-            // up what this CPU's coalescer holds first (`__napi_poll` flushes
-            // GRO before a repoll for the same reason — nothing may wait on a
-            // poll that is no longer running here).
-            narf_net::tcp_stack::gro_flush();
-            narf_scheduler::yield_now().await;
+        // The device's interrupt is never masked while it is polled (the
+        // ISR only reads ICR), so completion has nothing to re-enable.
+        let end = softirq_run(
+            || e1000_napi_poll(&device),
+            || false,
+            &handoff,
+            narf_time::monotonic_ns,
+        )
+        .await;
+        if end == SoftirqEnd::Deferred {
+            if deferral_task {
+                handoff.returned().await;
+            } else {
+                let poll = || e1000_napi_poll(&device);
+                deferral_run(poll, &handoff, narf_time::monotonic_ns).await;
+            }
             continue;
         }
 
