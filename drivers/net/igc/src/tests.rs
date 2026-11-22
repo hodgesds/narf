@@ -3491,3 +3491,83 @@ kernel_test_in!(
     "drivers/net/igc",
     smoke_igc_dynamic_itr_follows_linux_ring_itr
 );
+
+/// The igc receive pump is the softirq model's: an Interactive-class pump
+/// with a Default-class deferral task on the queue's CPU. Its queue is
+/// completed, the vector re-enabled, only once a poll leaves the ring
+/// empty, as `igc_poll` returns the budget and keeps polling until then.
+fn smoke_igc_softirq_pump_runs_like_napi() -> TestResult {
+    use core::future::Future as _;
+    use narf_scheduler::affinity::{Affinity, CpuId};
+    use narf_scheduler::SchedClass;
+    let (pump, deferral) = crate::igc::rx_task_specs(3);
+    check!(
+        pump.class == SchedClass::Interactive && pump.affinity == Affinity::pinned(CpuId(3)),
+        "the receive pump does not run ahead of its queue CPU's tasks"
+    );
+    let Some(deferral) = deferral else {
+        return TestResult::Fail("the queue has no deferral task");
+    };
+    check!(
+        deferral.class == SchedClass::Default && deferral.affinity == pump.affinity,
+        "the deferral task is not a Default-class task on the queue's CPU"
+    );
+
+    // A 100-frame burst on queue 1, vector 2.
+    let q = Queue::new().unwrap();
+    let m = Model::new();
+    let b = tcp4(0);
+    for slot in 0..100 {
+        inject(&q, slot, &b, 3, 0, 0);
+    }
+    let polls = Cell::new(0u32);
+    let completed_after = RefCell::new(Vec::new());
+    let handoff = narf_net::napi::SoftirqHandoff::new();
+    let run = narf_net::napi::softirq_run(
+        || {
+            let (frames, _) = crate::igc::napi_clean(&q, &m, 1, 1500);
+            let n = frames.len() as u32;
+            for frame in frames {
+                q.recycle(frame.into_parts().0);
+            }
+            polls.set(polls.get() + 1);
+            (n, q.pending_rx())
+        },
+        || {
+            completed_after.borrow_mut().push(polls.get());
+            crate::igc::napi_complete(Some(&q), &m, Some(2))
+        },
+        &handoff,
+        || 0,
+    );
+    let mut run = core::pin::pin!(run);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    let mut end = None;
+    for _ in 0..100 {
+        if let core::task::Poll::Ready(e) = run.as_mut().poll(&mut cx) {
+            end = Some(e);
+            break;
+        }
+    }
+    check!(
+        end == Some(narf_net::napi::SoftirqEnd::Completed),
+        "a 100-frame burst did not complete"
+    );
+    check!(
+        polls.get() == 2 && completed_after.borrow().as_slice() == [2],
+        "the queue was completed before its ring drained"
+    );
+    let eims: Vec<u32> = m
+        .writes
+        .borrow()
+        .iter()
+        .filter(|(reg, _)| *reg == 0x1524)
+        .map(|(_, value)| *value)
+        .collect();
+    check!(
+        eims == [1 << 2],
+        "the vector was not re-enabled exactly once, by its own bit"
+    );
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc-softirq", smoke_igc_softirq_pump_runs_like_napi);

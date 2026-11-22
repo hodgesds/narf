@@ -2228,6 +2228,43 @@ fn remove(device: BusDevice, _: Cap<BusDeviceCap, Write>) {
         c.remove();
     }
 }
+/// The task specs of a queue's receive pump and of its deferral task, on
+/// the queue's CPU `cpu`.
+pub(crate) fn rx_task_specs(
+    cpu: u32,
+) -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
+    let mut spec = narf_scheduler::TaskSpec::unthrottled()
+        .with_work_kind(narf_scheduler::WorkKind::SoftIrq);
+    spec.affinity =
+        narf_scheduler::affinity::Affinity::pinned(narf_scheduler::affinity::CpuId(cpu));
+    (spec, None)
+}
+
+/// `igc_poll`'s cleaning of queue `q`: reclaim its transmit completions,
+/// then clean at most [`narf_net::napi::DEFAULT_BUDGET`] receive
+/// descriptors. Returns the frames for the stack and the descriptors
+/// dropped.
+pub(crate) fn napi_clean(
+    queue: &Queue,
+    hw: &impl Registers,
+    q: usize,
+    mtu: u32,
+) -> (Vec<Frame>, u64) {
+    queue.poll_xsk(hw, q, mtu);
+    queue.receive(hw, q, mtu, narf_net::napi::DEFAULT_BUDGET as usize)
+}
+
+/// `igc_ring_irq_enable`: re-enable the queue's MSI-X vector `index` (its
+/// EIMS bit; EIAM masked it when it fired). Returns whether the ring holds
+/// work, so a descriptor that completed before the vector was enabled
+/// again is polled rather than left until the next interrupt.
+pub(crate) fn napi_complete(queue: Option<&Queue>, hw: &impl Registers, index: Option<u8>) -> bool {
+    if let Some(index) = index {
+        hw.write(0x1524, 1u32 << index);
+    }
+    queue.is_some_and(|queue| queue.pending_rx())
+}
+
 fn spawn_pumps(
     device: Arc<Igc>,
     rx_prod: Producer<Frame, RX_RING_N>,
@@ -2240,11 +2277,7 @@ fn spawn_pumps(
         // Linux NAPI: a queue is polled in softirq context on the CPU its
         // vector interrupts, so its ring, its transmit completions and the
         // flows RSS steers to it stay on one core.
-        let mut spec = narf_scheduler::TaskSpec::unthrottled()
-            .with_work_kind(narf_scheduler::WorkKind::SoftIrq);
-        spec.affinity = narf_scheduler::affinity::Affinity::pinned(
-            narf_scheduler::affinity::CpuId(device.queue_cpu_of(q)),
-        );
+        let (spec, _deferral) = rx_task_specs(device.queue_cpu_of(q));
         narf_scheduler::spawn_with_spec(
             async move {
                 // This vector's interval and the queue's work counters when
@@ -2260,9 +2293,7 @@ fn spawn_pumps(
                     let queue = rx.queues().get(q).cloned();
                     let frames = match (rx.operation(), queue.as_ref()) {
                         (Ok(_op), Some(queue)) => {
-                            queue.poll_xsk(&rx.hw, q, rx.mtu());
-                            let budget = narf_net::napi::DEFAULT_BUDGET as usize;
-                            let (f, drops) = queue.receive(&rx.hw, q, rx.mtu(), budget);
+                            let (f, drops) = napi_clean(queue, &rx.hw, q, rx.mtu());
                             // Device-wide counters only when there is
                             // something to count: no shared lock per poll.
                             if drops != 0 {
@@ -2325,10 +2356,7 @@ fn spawn_pumps(
                         if let (Some(r), Some(queue)) = (route, queue.as_ref()) {
                             rx.moderate(r, queue, &mut itr);
                         }
-                        if let Some(r) = route {
-                            rx.hw.write(0x1524, 1u32 << r.index);
-                        }
-                        queue.as_ref().is_some_and(|queue| queue.pending_rx())
+                        napi_complete(queue.as_deref(), &rx.hw, route.map(|r| r.index))
                     } else {
                         false
                     };
