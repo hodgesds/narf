@@ -2534,7 +2534,18 @@ pub fn set_iface_ipv4(name: &str, ipv4: [u8; 4], gateway: [u8; 4]) {
 /// Add an IPv4 address (with CIDR prefix length) to the named interface.
 /// Automatically installs a connected subnet route. Idempotent.
 pub fn add_addr(iface_name: &str, addr: [u8; 4], prefix_len: u8) {
-    crate::ifaddr::iface_add_addr(iface_name, crate::ipv4::Ipv4Addr(addr), prefix_len);
+    add_addr_with(iface_name, addr, prefix_len, true);
+}
+
+/// [`add_addr`]; `prefix_route` false is an address added with
+/// IFA_F_NOPREFIXROUTE, which gets no kernel prefix route.
+pub fn add_addr_with(iface_name: &str, addr: [u8; 4], prefix_len: u8, prefix_route: bool) {
+    crate::ifaddr::iface_add_addr_with(
+        iface_name,
+        crate::ipv4::Ipv4Addr(addr),
+        prefix_len,
+        prefix_route,
+    );
     // The first address a device gets is its primary: the source address
     // the stack sends from (Linux `inet_select_addr` picks the primary).
     let mut g = IFACES.lock();

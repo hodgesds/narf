@@ -261,11 +261,29 @@ impl AdminHandle {
     }
 
     pub fn add_ipv4(&self, addr: [u8; 4], prefix_len: u8) -> Result<(), AdminError> {
+        self.add_ipv4_flags(addr, prefix_len, 0)
+    }
+
+    /// [`Self::add_ipv4`] with the request's IFA_F_* flags. IFA_F_NOPREFIXROUTE
+    /// (0x200) adds the address without the kernel's prefix route
+    /// (`fib_add_ifaddr`).
+    pub fn add_ipv4_flags(
+        &self,
+        addr: [u8; 4],
+        prefix_len: u8,
+        ifa_flags: u32,
+    ) -> Result<(), AdminError> {
+        const IFA_F_NOPREFIXROUTE: u32 = 0x200;
         self.check_live()?;
         if prefix_len > 32 {
             return Err(AdminError::InvalidPrefix);
         }
-        crate::iface::add_addr(&self.iface_name, addr, prefix_len);
+        crate::iface::add_addr_with(
+            &self.iface_name,
+            addr,
+            prefix_len,
+            ifa_flags & IFA_F_NOPREFIXROUTE == 0,
+        );
         Ok(())
     }
 

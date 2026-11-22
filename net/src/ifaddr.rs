@@ -86,6 +86,14 @@ static IFACE_ADDRS: IrqSafeSpinLock<Vec<IfaceAddrs>> = IrqSafeSpinLock::new(Vec:
 /// After inserting, a connected route (`Scope::Link`) for the subnet is
 /// automatically registered. Ref: Linux `fib_frontend.c:fib_add_ifaddr`.
 pub fn iface_add_addr(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) {
+    iface_add_addr_with(iface_name, addr, prefix_len, true);
+}
+
+/// [`iface_add_addr`], installing the kernel's prefix route only when
+/// `prefix_route` is set: `fib_add_ifaddr` skips it for an address added
+/// with IFA_F_NOPREFIXROUTE, whose owner (NetworkManager) installs its own
+/// at the device's metric.
+pub fn iface_add_addr_with(iface_name: &str, addr: Ipv4Addr, prefix_len: u8, prefix_route: bool) {
     let entry = IfaceAddr { addr, prefix_len };
     {
         let mut g = IFACE_ADDRS.lock();
@@ -101,7 +109,9 @@ pub fn iface_add_addr(iface_name: &str, addr: Ipv4Addr, prefix_len: u8) {
         }
     }
     // Auto-install the connected route for the subnet.
-    crate::route::install_connected_route(iface_name, addr, prefix_len);
+    if prefix_route {
+        crate::route::install_connected_route(iface_name, addr, prefix_len);
+    }
 }
 
 /// Remove an IPv4 address from the named interface. No-op if not found.

@@ -1838,7 +1838,14 @@ fn apply_mutation(
                         *msg = Some("ipv4: Address already assigned");
                         return Err(errno);
                     }
-                    return admin.add_ipv4(addr, prefix_len).map_err(admin_errno);
+                    // `inet_rtm_to_ifa`: `ifa_flags` from the header, replaced
+                    // by the full 32-bit IFA_FLAGS attribute when present.
+                    let ifa_flags = find_attr(request, 8, IFA_FLAGS)
+                        .and_then(|v| <[u8; 4]>::try_from(v.get(..4)?).ok())
+                        .map_or(u32::from(request[NLMSG_HDRLEN + 2]), u32::from_ne_bytes);
+                    return admin
+                        .add_ipv4_flags(addr, prefix_len, ifa_flags)
+                        .map_err(admin_errno);
                 }
                 // `inet_rtm_deladdr`: find the device, then delete the first
                 // address every supplied selector matches.

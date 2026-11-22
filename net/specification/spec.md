@@ -604,7 +604,14 @@ kernel-held interface handles minted once per interface
 interface-bound `AdminHandle`, which authorizes exactly that interface.
 `RTM_NEWLINK`/`RTM_SETLINK` and IPv4 or IPv6
 `RTM_NEWADDR`/`RTM_DELADDR` plus `RTM_NEWROUTE`/`RTM_DELROUTE` invoke the
-typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
+typed operations in §3.3. An IPv4 `RTM_NEWADDR` passes its IFA_F_* flags
+(`ifa_flags`, replaced by the IFA_FLAGS attribute when present) to
+`AdminHandle::add_ipv4_flags`; IFA_F_NOPREFIXROUTE adds the address without
+the kernel's metric-0 prefix route (`fib_add_ifaddr`, via
+`iface::add_addr_with` / `ifaddr::iface_add_addr_with`), and removing an
+address removes only the kernel's own prefix route (metric 0,
+RTPROT_KERNEL), never another owner's route to the prefix
+(`fib_del_ifaddr`). `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
 IPv6 NDP state through the same interface-bound authority.
 The stack-daemon launcher performs delegation as a kernel-held transfer from a
 successful `StackAttachReply` to a route socket in the attaching task's fd
