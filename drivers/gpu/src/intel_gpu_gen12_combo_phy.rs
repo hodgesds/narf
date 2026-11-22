@@ -337,17 +337,26 @@ pub(crate) fn port_clock_khz(rate: LinkRate) -> Option<u32> {
 
 /// Tiger Lake UY (GT2) device IDs — Linux `INTEL_TGL_GT2_IDS`
 /// (`tigerlake_uy`), which selects the UY HBR2 table. Grounded
-/// in NARF's own `intel_gpu_pci_ids` const names (`TGL_*_GT2_*`):
-/// 9A49, 9A59, 9A68, 9A70, 9A78, 9AC0, 9AC9, 9AD9, 9AF8. GT1 is
-/// 9A60 only. 0x9A40 carries no GT suffix in-tree and is NOT
-/// treated as UY here — if the BSpec places it in GT2, add it;
-/// the UY and non-UY tables differ only in swing tuning, so a
-/// wrong call here degrades signal margin, it does not break
+/// in the Linux macro itself (`include/drm/intel/pciids.h:626-634`,
+/// Linux 7.4-rc2): 9A40, 9A49, 9A59, 9A78, 9AC0, 9AC9, 9AD9, 9AF8.
+/// GT1 is 9A60, 9A68, 9A70 (`INTEL_TGL_GT1_IDS`, same file:621-624).
+/// NOTE: an earlier in-tree reading had this backwards — it took
+/// NARF's own `intel_gpu_pci_ids` const names at face value, which
+/// mislabelled 9A68/9A70 as GT2 and left 9A40 unsuffixed. The
+/// macro is authoritative: 0x9A40 IS UY, 0x9A68/0x9A70 are NOT.
+/// Corroborated by `tgl_uy_ids[] = { INTEL_TGL_GT2_IDS(ID), 0 }`
+/// as the `tigerlake_uy` subplatform pciidlist
+/// (`drivers/gpu/drm/i915/display/intel_display_device.c:1004-1027`)
+/// and by `tgl_get_combo_buf_trans_dp` returning the UY table iff
+/// `display->platform.tigerlake_uy` at port_clock > 270000
+/// (`drivers/gpu/drm/i915/display/intel_ddi_buf_trans.c:1477-1478`).
+/// A wrong call here degrades signal margin only — the UY and
+/// non-UY tables differ only in swing tuning, it does not break
 /// the link.
 pub(crate) fn is_tgl_uy(did: u16) -> bool {
     matches!(
         did,
-        0x9A49 | 0x9A59 | 0x9A68 | 0x9A70 | 0x9A78 | 0x9AC0 | 0x9AC9 | 0x9AD9 | 0x9AF8
+        0x9A40 | 0x9A49 | 0x9A59 | 0x9A78 | 0x9AC0 | 0x9AC9 | 0x9AD9 | 0x9AF8
     )
 }
 
@@ -1422,17 +1431,35 @@ mod tests {
     );
 
     fn smoke_combo_phy_is_tgl_uy() -> TestResult {
+        // Linux `INTEL_TGL_GT2_IDS` (`include/drm/intel/pciids.h`,
+        // Linux 7.4-rc2): 9A40 IS GT2/UY; 9A68/9A70 are GT1.
         for did in [
-            0x9A49, 0x9A59, 0x9A68, 0x9A70, 0x9A78, 0x9AC0, 0x9AC9, 0x9AD9, 0x9AF8,
+            0x9A40, 0x9A49, 0x9A59, 0x9A78, 0x9AC0, 0x9AC9, 0x9AD9, 0x9AF8,
         ] {
             if !is_tgl_uy(did) {
                 return TestResult::Fail("GT2 DID must select the UY table");
             }
         }
-        // GT1 is 9A60 only; 0x9A40 carries no GT suffix in-tree
-        // and is deliberately not UY (see `is_tgl_uy`).
-        if is_tgl_uy(0x9A60) || is_tgl_uy(0x9A40) || is_tgl_uy(0x4C80) || is_tgl_uy(0x4626) {
+        // GT1 is 9A60, 9A68, 9A70; RKL 0x4C80 / TGL-H 0x4626 are
+        // not TGL GT2 either.
+        if is_tgl_uy(0x9A60)
+            || is_tgl_uy(0x9A68)
+            || is_tgl_uy(0x9A70)
+            || is_tgl_uy(0x4C80)
+            || is_tgl_uy(0x4626)
+        {
             return TestResult::Fail("non-GT2 DID must not select the UY table");
+        }
+        // 0x9A40 must select the UY HBR2 table end to end at HBR2
+        // rates (entry 1 distinguishes it from the standard table),
+        // and GT1 0x9A68 must select the standard HBR2 table.
+        let (table, _) = tgl_dp(540_000, is_tgl_uy(0x9A40));
+        if table[1] != TGL_UY_DP_HBR2[1] {
+            return TestResult::Fail("0x9A40 must select the UY HBR2 table");
+        }
+        let (table, _) = tgl_dp(540_000, is_tgl_uy(0x9A68));
+        if table[1] != TGL_DP_HBR2[1] {
+            return TestResult::Fail("0x9A68 (GT1) must select the standard HBR2 table");
         }
         TestResult::Pass
     }
