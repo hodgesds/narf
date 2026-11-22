@@ -396,9 +396,15 @@ fn rekey() -> Result<(), &'static str> {
     let before = session.backend.frames.len();
     run(session.service_keys()).map_err(|_| "both BA roles before M2")?;
     let f = &session.backend.frames[before..];
-    if f.len() != 6
-        || f[2].1.get(24..) != Some(&[3, 2, 0, 8, 39, 0][..])
-        || extract_eapol(&f[5].1).is_none()
+    // A PTK rekey (`ieee80211_pairwise_rekey`) runs
+    // `ieee80211_sta_tear_down_BA_sessions(AGG_STOP_LOCAL_REQUEST)`: each
+    // recipient session stops and its originator gets a recipient DELBA
+    // (WLAN_REASON_QSTA_LEAVE_QBSS, 36), then each originator session
+    // stops with its own DELBA. Both precede M2.
+    if f.len() != 7
+        || f[2].1.get(24..) != Some(&[3, 2, 0, 0, 36, 0][..])
+        || f[5].1.get(24..) != Some(&[3, 2, 0, 8, 39, 0][..])
+        || extract_eapol(&f[6].1).is_none()
         || session.station.tx_ba.active()
         || session.station.tx_ba.published()
         || !session.station.rx_ba.records().is_empty()

@@ -1090,7 +1090,8 @@ impl<B: Backend> Session<B> {
         // `ieee80211_pairwise_rekey`: only a pairwise (PTK) handshake tears
         // the block-ack sessions down, and each recipient session's
         // originator is told with a DELBA; a Group Key Handshake leaves them
-        // running.
+        // running. `ieee80211_sta_tear_down_BA_sessions` stops the recipient
+        // sessions first, then the originator sessions.
         let pairwise = security.pending.iter().any(|(pdu, _)| {
             pdu.get(5..7).is_some_and(|ki| {
                 u16::from_be_bytes([ki[0], ki[1]]) & narf_wireless::eapol::KI_KEY_TYPE_PAIRWISE != 0
@@ -1098,9 +1099,9 @@ impl<B: Backend> Session<B> {
         });
         let result = async {
             if pairwise {
-                self.retire_transmit_ba(true).await?;
                 self.retire_receive_ba_notify(info.capabilities.mac, peer)
                     .await?;
+                self.retire_transmit_ba(true).await?;
             }
             for _ in 0..4 {
                 let Some((pdu, protected)) = security.pending.pop_front() else {
