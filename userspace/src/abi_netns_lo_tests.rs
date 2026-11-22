@@ -42,6 +42,12 @@ const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RT_TABLE_MAIN: u8 = 254;
+const RTPROT_BOOT: u8 = 3;
+const RT_SCOPE_LINK: u8 = 253;
+const RTN_UNICAST: u8 = 1;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLMSG_HDRLEN: usize = 16;
@@ -344,8 +350,7 @@ fn dump_routes(fd: u64, seq: u32, family: u8) -> Result<usize, &'static str> {
 }
 
 fn initial_lo_up() -> bool {
-    narf_net::iface::lookup_in(0, "lo")
-        .is_some_and(|lo| lo.link_up)
+    narf_net::iface::lookup_in(0, "lo").is_some_and(|lo| lo.link_up)
 }
 
 /// A fresh network namespace has its own `lo`: ifindex 1, `IFF_LOOPBACK`
@@ -635,4 +640,69 @@ fn smoke_abi_netns_lo_outer_devices_are_invisible() -> TestResult {
 kernel_test_in!(
     "syscall_abi/netns-lo",
     smoke_abi_netns_lo_outer_devices_are_invisible
+);
+
+/// The shared device name `lo` never reaches across namespaces. In Linux,
+/// RTM_NEWROUTE `dev lo` (RTA_OIF 1) from a new namespace resolves to that
+/// namespace's own `lo` (`__dev_get_by_index(net, 1)`), and the route goes
+/// into that namespace's FIB. Whatever the request's outcome, the initial
+/// namespace's routing table must not change.
+fn smoke_abi_netns_lo_route_on_lo_stays_in_namespace() -> TestResult {
+    const DST: [u8; 4] = [198, 51, 100, 0];
+    let leaked = || {
+        narf_net::route::route_list_in(0)
+            .iter()
+            .any(|r| r.dst.addr.0 == DST && r.dst.prefix_len == 24)
+    };
+    with_setup(|| {
+        narf_net::iface::register_loopback_iface();
+        expect(
+            !leaked(),
+            "the test route already exists in the initial namespace",
+        )?;
+        expect(
+            sys(Syscall::Unshare, a0(CLONE_NEWNET)) == Some(0),
+            "unshare(CLONE_NEWNET)",
+        )?;
+        let (route, _) = open_route()?;
+        // struct rtmsg: family, dst_len, src_len, tos, table, protocol,
+        // scope, type, flags.
+        let mut body = alloc::vec![
+            RTNL_AF_INET,
+            24,
+            0,
+            0,
+            RT_TABLE_MAIN,
+            RTPROT_BOOT,
+            RT_SCOPE_LINK,
+            RTN_UNICAST,
+        ];
+        body.extend_from_slice(&0u32.to_ne_bytes());
+        push_attr(&mut body, RTA_DST, &DST);
+        push_attr(&mut body, RTA_OIF, &1u32.to_ne_bytes());
+        let flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK;
+        let _ = exchange(route, &rtnl_request(RTM_NEWROUTE, flags, 30, &body))?;
+        let crossed = leaked();
+        if crossed {
+            narf_net::route::route_delete_in(
+                0,
+                narf_net::route::Ipv4Net {
+                    addr: narf_net::ipv4::Ipv4Addr(DST),
+                    prefix_len: 24,
+                },
+                "lo",
+                RT_TABLE_MAIN,
+            );
+        }
+        expect(
+            !crossed,
+            "RTM_NEWROUTE dev lo in a new namespace changed the initial namespace's routes",
+        )?;
+        close(route);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/netns-lo",
+    smoke_abi_netns_lo_route_on_lo_stays_in_namespace
 );
