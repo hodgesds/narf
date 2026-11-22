@@ -247,11 +247,6 @@ unsafe fn write_reg_locked(base_phys: u64, index: u32, value: u32) {
     }
 }
 
-/// Read IOAPICID — the high 4 bits of register 0 hold the chip's
-/// APIC ID (Intel 82093AA §3.2.1). Mostly diagnostic.
-///
-/// # Safety
-/// Caller-asserted live IOAPIC.
 /// One saved redirection-table entry ([`save_all`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SavedEntry {
@@ -271,8 +266,8 @@ pub struct SavedEntry {
 /// Every IOAPIC this module mapped is live.
 pub unsafe fn save_all(out: &mut alloc::vec::Vec<SavedEntry>) {
     let _g = IOAPIC_LOCK.lock();
-    for slot in 0..MAX_IOAPICS {
-        let base_phys = MMIO_PHYS[slot].load(Ordering::Relaxed);
+    for phys in &MMIO_PHYS {
+        let base_phys = phys.load(Ordering::Relaxed);
         if base_phys == 0 {
             continue;
         }
@@ -318,6 +313,11 @@ pub unsafe fn restore_all(saved: &[SavedEntry]) {
     }
 }
 
+/// Read IOAPICID — the high 4 bits of register 0 hold the chip's
+/// APIC ID (Intel 82093AA §3.2.1). Mostly diagnostic.
+///
+/// # Safety
+/// Caller-asserted live IOAPIC.
 pub unsafe fn read_id(h: &IoApicHandle) -> u8 {
     let _g = IOAPIC_LOCK.lock();
     // SAFETY: locked.
