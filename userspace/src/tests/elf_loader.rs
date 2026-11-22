@@ -3426,6 +3426,46 @@ kernel_test_in!(
 /// filesystem from the link. The interpreter has to load from there.
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_interp_through_absolute_link_in_root() -> TestResult {
+    // ENOSYS is the fixture's bail after a complete load (no user context to
+    // return into); ENOENT is the interpreter lookup failing.
+    match execve_in_lib64_link_root(0) {
+        Ok(ret) if ret == Some(errno_ret(ENOSYS)) => TestResult::Pass,
+        Ok(ret) if ret == Some(errno_ret(ENOENT)) => {
+            TestResult::Fail("PT_INTERP via /lib64 -> /usr/lib missed the task root")
+        }
+        Ok(_) => TestResult::Fail("execve of the sandboxed dynamic program did not load"),
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/exec-interp",
+    smoke_userspace_execve_interp_through_absolute_link_in_root
+);
+
+/// `open_exec` refuses an interpreter on a noexec mount as it refuses the
+/// image: `do_open_execat`'s `path_noexec` is -EACCES, and
+/// `load_elf_binary` returns it from the execve.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_interp_on_a_noexec_mount_is_eacces() -> TestResult {
+    match execve_in_lib64_link_root(narf_filesystem::mnt_flags::NOEXEC) {
+        Ok(ret) if ret == Some(errno_ret(EACCES)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("an interpreter on a noexec mount was not refused with EACCES"),
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/exec-interp-noexec",
+    smoke_userspace_execve_interp_on_a_noexec_mount_is_eacces
+);
+
+/// Build the glycin-shaped sandbox root — `prog` (PT_INTERP
+/// `/lib64/ld-narf-interp.so`) and `lib64 -> /usr/lib` on one filesystem, the
+/// interpreter on a second mounted at its `usr` with `usr_flags` — root the
+/// task there and `execve("/prog")`. Returns what the execve returned.
+#[cfg(target_arch = "x86_64")]
+fn execve_in_lib64_link_root(usr_flags: u64) -> Result<Option<SyscallReturn>, &'static str> {
     use narf_filesystem::{bootstrap_mount_authority, registry, FsInstance, MemFs};
     const ROOT: &str = "/execve-interp-root";
     const USR: &str = "/execve-interp-root/usr";
@@ -3497,13 +3537,13 @@ fn smoke_userspace_execve_interp_through_absolute_link_in_root() -> TestResult {
     })();
     if let Err(why) = staged {
         crate::syscall::__test_clear_global();
-        return TestResult::Fail(why);
+        return Err(why);
     }
     let root_mount = match registry().mount(&auth, ROOT, sandbox) {
         Ok(handle) => handle,
         Err(_) => {
             crate::syscall::__test_clear_global();
-            return TestResult::Fail("cannot mount the sandbox root");
+            return Err("cannot mount the sandbox root");
         }
     };
     let usr_mount = match registry().mount(&auth, USR, usr) {
@@ -3511,9 +3551,15 @@ fn smoke_userspace_execve_interp_through_absolute_link_in_root() -> TestResult {
         Err(_) => {
             let _ = registry().unmount(&root_mount, ROOT);
             crate::syscall::__test_clear_global();
-            return TestResult::Fail("cannot mount the sandbox /usr");
+            return Err("cannot mount the sandbox /usr");
         }
     };
+    if usr_flags != 0 && !registry().set_flags_at(USR, usr_flags) {
+        let _ = registry().unmount(&usr_mount, USR);
+        let _ = registry().unmount(&root_mount, ROOT);
+        crate::syscall::__test_clear_global();
+        return Err("cannot set the sandbox /usr mount flags");
+    }
 
     let task = crate::handlers::current_task_id();
     let result = if crate::handlers::install_root_dir(task, ROOT) {
@@ -3530,17 +3576,9 @@ fn smoke_userspace_execve_interp_through_absolute_link_in_root() -> TestResult {
             ret: None,
         };
         kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
-        // ENOSYS is the fixture's bail after a complete load (no user
-        // context to return into); ENOENT is the interpreter lookup failing.
-        if ctx.ret == Some(errno_ret(ENOSYS)) {
-            TestResult::Pass
-        } else if ctx.ret == Some(errno_ret(ENOENT)) {
-            TestResult::Fail("PT_INTERP via /lib64 -> /usr/lib missed the task root")
-        } else {
-            TestResult::Fail("execve of the sandboxed dynamic program did not load")
-        }
+        Ok(ctx.ret)
     } else {
-        TestResult::Fail("cannot install the sandbox root")
+        Err("cannot install the sandbox root")
     };
     crate::handlers::__test_root_dir_reset();
     let _ = registry().unmount(&usr_mount, USR);
@@ -3548,11 +3586,6 @@ fn smoke_userspace_execve_interp_through_absolute_link_in_root() -> TestResult {
     crate::syscall::__test_clear_global();
     result
 }
-#[cfg(target_arch = "x86_64")]
-kernel_test_in!(
-    "userspace/exec-interp",
-    smoke_userspace_execve_interp_through_absolute_link_in_root
-);
 
 /// Byte-built ET_EXEC for the execve page-in smokes (#740): one PT_LOAD
 /// R|X, file offset 0x1000 → vaddr 0x80_0000_1000, entry +0x111. The
