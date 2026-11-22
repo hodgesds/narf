@@ -109,10 +109,10 @@ fn control_rdev(card_index: u32) -> u64 {
 pub(crate) fn remove_card_node_metadata(info: &crate::CardInfo) {
     let mut nodes = SOUND_NODE_METADATA.lock();
     nodes.remove(&control_rdev(info.index));
-    for device in 0..info.playback_count {
+    for device in crate::pcm_devices(info, false) {
         nodes.remove(&pcm_rdev(info.index, device, false));
     }
-    for device in 0..info.capture_count {
+    for device in crate::pcm_devices(info, true) {
         nodes.remove(&pcm_rdev(info.index, device, true));
     }
 }
@@ -607,13 +607,13 @@ impl DirOps for DevSndDir {
             let card = cards.iter().find(|c| c.index == n)?;
             match capture {
                 false => {
-                    if m >= card.playback_count {
+                    if !crate::pcm_devices(card, false).contains(&m) {
                         return None;
                     }
                     return Some(Arc::new(SoundPcmPlaybackFile::new(n, m)) as Arc<dyn FileOps>);
                 }
                 true => {
-                    if m >= card.capture_count {
+                    if !crate::pcm_devices(card, true).contains(&m) {
                         return None;
                     }
                     return Some(Arc::new(SoundPcmCaptureFile::new(n, m)) as Arc<dyn FileOps>);
@@ -655,10 +655,10 @@ impl DirOps for DevSndDir {
         for card in list_cards() {
             let n = card.index;
             entries.push((format!("controlC{}", n), FileType::Special));
-            for m in 0..card.playback_count {
+            for m in crate::pcm_devices(&card, false) {
                 entries.push((format!("pcmC{}D{}p", n, m), FileType::Special));
             }
-            for m in 0..card.capture_count {
+            for m in crate::pcm_devices(&card, true) {
                 entries.push((format!("pcmC{}D{}c", n, m), FileType::Special));
             }
         }

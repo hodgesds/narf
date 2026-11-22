@@ -242,6 +242,22 @@ pub fn register_hardware_card_at(
     );
     let index = NEXT_CARD_INDEX.fetch_add(1, Ordering::AcqRel) as u32;
     info.index = index;
+    // The backend's own PCM numbering, when it has one for exactly the
+    // card's PCM count (Linux HDA: analog 0, 2, ..., HDMI 3, 7, 8, ...).
+    let numbering = |capture: bool, count: u32| {
+        hardware
+            .pcm_devices(capture)
+            .filter(|devices| devices.len() == count as usize && devices.iter().all(|d| *d < 16))
+    };
+    let playback = numbering(false, info.playback_count);
+    let capture = numbering(true, info.capture_count);
+    if playback.is_some() || capture.is_some() {
+        PCM_DEVICES.lock().push(CardPcmDevices {
+            card: index,
+            playback: playback.unwrap_or_else(|| (0..info.playback_count).collect()),
+            capture: capture.unwrap_or_else(|| (0..info.capture_count).collect()),
+        });
+    }
     {
         let mut cards = CARD_REGISTRY.lock();
         info.id = unique_card_id(info.id, &cards);
@@ -254,6 +270,42 @@ pub fn register_hardware_card_at(
     }
     publish_card(&info, parent);
     index
+}
+
+/// The PCM device numbers a backend reported for one card at registration.
+struct CardPcmDevices {
+    card: u32,
+    playback: Vec<u32>,
+    capture: Vec<u32>,
+}
+
+static PCM_DEVICES: narf_lib::sync::IrqSafeSpinLock<Vec<CardPcmDevices>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+
+/// A card's PCM device numbers in one direction: the backend's own
+/// (`PcmDevice::pcm_devices`, recorded at registration), else `0..count`.
+/// devfs, sysfs, procfs, the control device's PCM_NEXT_DEVICE / PCM_INFO
+/// and the PCM open all go through it.
+pub fn pcm_devices(card: &CardInfo, capture: bool) -> Vec<u32> {
+    let recorded = PCM_DEVICES
+        .lock()
+        .iter()
+        .find(|devices| devices.card == card.index)
+        .map(|devices| {
+            if capture {
+                devices.capture.clone()
+            } else {
+                devices.playback.clone()
+            }
+        });
+    recorded.unwrap_or_else(|| {
+        let count = if capture {
+            card.capture_count
+        } else {
+            card.playback_count
+        };
+        (0..count).collect()
+    })
 }
 
 /// Linux `snd_card_set_id_no_lock` (sound/core/init.c): "Default" for an
@@ -316,6 +368,7 @@ pub fn unregister_hardware_card(index: u32) {
     };
     if let Some(card) = removed {
         unpublish_card(&card.info);
+        PCM_DEVICES.lock().retain(|devices| devices.card != index);
         // A backend's Drop can quiesce hardware. Release the publication lock
         // before letting the last registry-owned reference go.
         drop(_publication);
@@ -351,6 +404,7 @@ pub fn __reset_for_test() {
     for card in &cards {
         unpublish_card(&card.info);
     }
+    PCM_DEVICES.lock().clear();
     NEXT_CARD_INDEX.store(0, Ordering::SeqCst);
     drop(_publication);
     drop(cards);
@@ -457,7 +511,7 @@ pub fn open_playback(card: u32, device: u32) -> Result<PlaybackStream, SoundErro
         .iter()
         .find(|c| c.info.index == card)
         .ok_or(SoundError::NoSuchCard)?;
-    if device >= _card.info.playback_count {
+    if !pcm_devices(&_card.info, false).contains(&device) {
         return Err(SoundError::NoSuchDevice);
     }
     let controller_index = _card.controller_index;
@@ -482,7 +536,7 @@ pub fn open_capture(card: u32, device: u32) -> Result<CaptureStream, SoundError>
         .iter()
         .find(|c| c.info.index == card)
         .ok_or(SoundError::NoSuchCard)?;
-    if device >= _card.info.capture_count {
+    if !pcm_devices(&_card.info, true).contains(&device) {
         return Err(SoundError::NoSuchDevice);
     }
     let controller_index = _card.controller_index;

@@ -89,7 +89,7 @@ fn remove(c: &Control, elements: &mut Vec<Element>, id: &[u8]) -> Result<(), FsE
         .position(|e| e.card == c.card && e.offset(id).is_some());
     let Some(index) = index else {
         let native = crate::mixer(c.card).map_err(sound_error)?.list_controls();
-        return Err(if resolve(&native, id).is_ok() {
+        return Err(if resolve(c.card, &native, id).is_ok() {
             FsError::InvalidData
         } else {
             FsError::NotFound
@@ -190,7 +190,7 @@ pub(super) async fn modify(
     let start = get32(&b, 60);
     let end = start + count - 1;
     if native.iter().any(|id| {
-        let id = wire_id(*id);
+        let id = wire_id(c.card, *id);
         id[4..16] == b[4..16] && name(&id) == name(&b) && (start..=end).contains(&get32(&id, 60))
     }) || elements.iter().any(|e| {
         e.card == c.card

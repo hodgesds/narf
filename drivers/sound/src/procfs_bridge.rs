@@ -275,10 +275,10 @@ pub fn register_card_procfs(card: &crate::CardInfo) {
             card_index: card.index,
         }),
     );
-    for m in 0..card.playback_count {
+    for m in crate::pcm_devices(card, false) {
         register_substream_procfs(card.index, m, false);
     }
-    for m in 0..card.capture_count {
+    for m in crate::pcm_devices(card, true) {
         register_substream_procfs(card.index, m, true);
     }
     // One codec#A per codec the backend reports, codec#0 for a card whose
@@ -304,7 +304,7 @@ pub fn register_card_procfs(card: &crate::CardInfo) {
             }),
         );
     }
-    for m in 0..card.playback_count {
+    for m in crate::pcm_devices(card, false) {
         register_proc(
             &format!("asound/card{}/pcm{}p/info", card.index, m),
             Arc::new(AsoundPcmInfoFile {
@@ -314,7 +314,7 @@ pub fn register_card_procfs(card: &crate::CardInfo) {
             }),
         );
     }
-    for m in 0..card.capture_count {
+    for m in crate::pcm_devices(card, true) {
         register_proc(
             &format!("asound/card{}/pcm{}c/info", card.index, m),
             Arc::new(AsoundPcmInfoFile {

@@ -88,7 +88,14 @@ lines for state the runtime does not keep (`owner_pid`, `avail_max`,
 soundcards ---` when empty); only lowercase `pcmMp` / `pcmMc` directories
 exist. `register_hardware_card_at` keeps ids unique the way
 `snd_card_set_id_no_lock` does (`Default` for an empty or `card*` id, then
-`_1`, `_2`, ... in hex within 15 characters). `PcmDevice` gains three defaulted
+`_1`, `_2`, ... in hex within 15 characters). A backend may number its PCMs itself (`PcmDevice::pcm_devices`, recorded
+at registration; Linux HDA analog 0, HDMI 3, 7, 8, ...): `pcm_devices(card,
+capture)` is then the device list that devfs nodes, sysfs endpoints,
+procfs directories, PCM_NEXT_DEVICE, PCM_INFO and the PCM open use, with
+devices 8..15 on minors 2..9 (playback) and 10..17 (capture) of the card
+block. `PcmDevice::control_wire` gives a control its own ALSA device,
+index and name (Linux's per-PCM jack, ELD, IEC958 set and channel map);
+ELEM_LIST reports and name lookups resolve those ids. `PcmDevice` gains three defaulted
 hooks: `long_name` (`card->longname`: the second `cards` line and control
 CARD_INFO `longname`), `mixer_name` (CARD_INFO `mixername`) and `codec_proc`
 (one `codec#A` body per codec address, rendered by the codec driver; a card

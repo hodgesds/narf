@@ -46,13 +46,7 @@ pub(crate) fn info(card: u32, device: u32, capture: bool) -> Result<Vec<u8>, FsE
         .into_iter()
         .find(|c| c.index == card)
         .ok_or(FsError::NoDevice)?;
-    if device
-        >= if capture {
-            card.capture_count
-        } else {
-            card.playback_count
-        }
-    {
+    if !crate::pcm_devices(&card, capture).contains(&device) {
         return Err(FsError::NotFound);
     }
     let mut b = alloc::vec![0; 288];

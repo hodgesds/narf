@@ -40,7 +40,11 @@ static LOCKS: IrqSafeSpinLock<Vec<(u32, u32, u64, u32)>> = IrqSafeSpinLock::new(
 pub(crate) fn changed(card: u32, id: ControlId) {
     // A byte control's size changes with its value: VALUE | INFO, as Linux
     // update_eld notifies the ELD control.
-    notify(card, wire_id(id), if id.kind.is_bytes() { 3 } else { 1 });
+    notify(
+        card,
+        wire_id(card, id),
+        if id.kind.is_bytes() { 3 } else { 1 },
+    );
 }
 fn notify(card: u32, id: [u8; 64], mask: u32) {
     let clients = {
@@ -68,26 +72,42 @@ fn notify(card: u32, id: [u8; 64], mask: u32) {
         }
     }
 }
-fn wire_id(id: ControlId) -> [u8; 64] {
+fn wire_id(card: u32, id: ControlId) -> [u8; 64] {
+    wire_id_on(crate::card_hardware(card).as_deref(), id)
+}
+/// `snd_ctl_elem_id` of a control: its numid, its kind's interface, and the
+/// device, index and name the backend gives it (Linux's per-PCM HDMI
+/// controls), else device 0, index 0 and the kind's name.
+fn wire_id_on(hardware: Option<&dyn crate::hardware::PcmDevice>, id: ControlId) -> [u8; 64] {
+    let wire = hardware.and_then(|hardware| hardware.control_wire(id));
     let mut b = [0; 64];
     put32(&mut b, 0, id.index + 1);
     put32(&mut b, 4, id.kind.iface());
-    string(&mut b, 16, 44, id.kind.name());
+    if let Some(wire) = &wire {
+        put32(&mut b, 8, wire.device);
+        put32(&mut b, 60, wire.index);
+    }
+    let name = wire
+        .as_ref()
+        .and_then(|wire| wire.name.as_deref())
+        .unwrap_or(id.kind.name());
+    string(&mut b, 16, 44, name);
     b
 }
-fn resolve(ids: &[ControlId], b: &[u8]) -> Result<ControlId, FsError> {
+fn resolve(card: u32, ids: &[ControlId], b: &[u8]) -> Result<ControlId, FsError> {
     let num = get32(b, 0);
+    let hardware = crate::card_hardware(card);
     ids.iter()
         .copied()
         .find(|id| {
             if num != 0 {
                 num == id.index + 1
             } else {
-                get32(b, 4) == id.kind.iface()
-                    && get32(b, 8) == 0
-                    && get32(b, 12) == 0
-                    && get32(b, 60) == 0
-                    && name(b) == name(&wire_id(*id))
+                // Interface, device and subdevice, then index and name.
+                let wire = wire_id_on(hardware.as_deref(), *id);
+                b[4..16] == wire[4..16]
+                    && get32(b, 60) == get32(&wire, 60)
+                    && name(b) == name(&wire)
             }
         })
         .ok_or(FsError::NotFound)
@@ -220,11 +240,12 @@ impl Control {
                     let mut b = input(ctx, arg, 80)?;
                     let offset = get32(&b, 0) as usize;
                     let space = get32(&b, 4) as usize;
+                    let hardware = crate::card_hardware(self.card);
                     let mut ids: Vec<[u8; 64]> = crate::mixer(self.card)
                         .map_err(sound_error)?
                         .list_controls()
                         .into_iter()
-                        .map(wire_id)
+                        .map(|id| wire_id_on(hardware.as_deref(), id))
                         .collect();
                     ids.extend(user::ids(self.card).await);
                     let selected = ids
@@ -251,8 +272,8 @@ impl Control {
                         return result;
                     }
                     let mx = crate::mixer(self.card).map_err(sound_error)?;
-                    let id = resolve(&mx.list_controls(), &b)?;
-                    b[..64].copy_from_slice(&wire_id(id));
+                    let id = resolve(self.card, &mx.list_controls(), &b)?;
+                    b[..64].copy_from_slice(&wire_id(self.card, id));
                     match nr {
                         0x11 => {
                             let metadata = mx.control_info(id).map_err(sound_error)?;
@@ -404,14 +425,17 @@ impl Control {
                     ctx.write(arg, &(-1i32).to_ne_bytes())?;
                 }
                 0x30 => {
+                    // snd_pcm_control_ioctl: the next registered PCM device
+                    // after `previous`, either direction, or -1.
                     let b = input(ctx, arg, 4)?;
                     let previous = get32(&b, 0) as i32;
-                    let next = previous
-                        .checked_add(1)
-                        .filter(|n| {
-                            *n >= 0 && (*n as u32) < card.playback_count.max(card.capture_count)
-                        })
-                        .unwrap_or(-1);
+                    let mut devices = crate::pcm_devices(&card, false);
+                    devices.extend(crate::pcm_devices(&card, true));
+                    let next = devices
+                        .into_iter()
+                        .filter(|d| i64::from(*d) > i64::from(previous))
+                        .min()
+                        .map_or(-1, |d| d as i32);
                     ctx.write(arg, &next.to_ne_bytes())?;
                 }
                 0x31 => {
@@ -419,11 +443,14 @@ impl Control {
                     if get32(&b, 8) > 1 {
                         return Err(FsError::InvalidData);
                     }
-                    if get32(&b, 0) >= card.playback_count.max(card.capture_count) {
+                    let device = get32(&b, 0);
+                    let playback = crate::pcm_devices(&card, false);
+                    let capture = crate::pcm_devices(&card, true);
+                    if !playback.contains(&device) && !capture.contains(&device) {
                         return Err(FsError::NoDeviceAddress);
                     }
-                    if (get32(&b, 8) == 0 && card.playback_count == 0)
-                        || (get32(&b, 8) == 1 && card.capture_count == 0)
+                    if (get32(&b, 8) == 0 && !playback.contains(&device))
+                        || (get32(&b, 8) == 1 && !capture.contains(&device))
                     {
                         return Err(FsError::NotFound);
                     }

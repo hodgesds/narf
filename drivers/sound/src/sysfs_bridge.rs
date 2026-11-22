@@ -16,10 +16,21 @@ pub fn control_minor(card: u32) -> u32 {
     card * 32
 }
 pub fn pcm_playback_minor(card: u32, device: u32) -> u32 {
-    card * 32 + 16 + device
+    if device < 8 {
+        card * 32 + 16 + device
+    } else {
+        // Beyond the static eight: Linux takes these from
+        // CONFIG_SND_DYNAMIC_MINORS; NARF uses the card's free slots
+        // 2..=9 (hwdep and rawmidi, unused here), so nothing collides.
+        card * 32 + 2 + (device - 8)
+    }
 }
 pub fn pcm_capture_minor(card: u32, device: u32) -> u32 {
-    card * 32 + 24 + device
+    if device < 8 {
+        card * 32 + 24 + device
+    } else {
+        card * 32 + 10 + (device - 8)
+    }
 }
 
 fn virtual_sound() -> Arc<Kobject> {
@@ -71,13 +82,13 @@ fn link(class: &Arc<Kobject>, node: &Arc<Kobject>, minor: Option<u32>) {
 
 fn endpoints(info: &CardInfo) -> Vec<(String, u32)> {
     let mut nodes = alloc::vec![(format!("controlC{}", info.index), control_minor(info.index))];
-    for device in 0..info.playback_count {
+    for device in crate::pcm_devices(info, false) {
         nodes.push((
             format!("pcmC{}D{device}p", info.index),
             pcm_playback_minor(info.index, device),
         ));
     }
-    for device in 0..info.capture_count {
+    for device in crate::pcm_devices(info, true) {
         nodes.push((
             format!("pcmC{}D{device}c", info.index),
             pcm_capture_minor(info.index, device),
