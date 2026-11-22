@@ -366,10 +366,12 @@ impl SyncPoint {
         signalled
     }
 
-    /// Linux `dma_fence_timestamp`, for a signalled fence.
+    /// Linux `dma_fence_timestamp`, for a signalled fence: the driver's
+    /// recorded signal time, else the first instant this file saw it.
     fn timestamp_ns(&self) -> u64 {
         self.fence
             .timestamp_ns()
+            .filter(|&at| at != 0)
             .unwrap_or_else(|| self.observed_ns.load(core::sync::atomic::Ordering::Acquire))
     }
 }
@@ -687,7 +689,12 @@ impl DrmSyncFile {
                 .iter()
                 .zip(array.chunks_exact_mut(SYNC_FENCE_INFO_SIZE))
             {
-                // sync_fill_fence_info.
+                // sync_fill_fence_info: dma_fence_get_status first, then
+                // the timestamp of a fence dma_fence_is_signaled reports
+                // signalled. A fence only ever becomes signalled, so a
+                // status of 1 or an error always carries its signal time,
+                // even when the fence completes during this query.
+                let fence_status = point.fence.status();
                 let signalled = point.signalled();
                 let (timeline, driver) = if signalled {
                     ("signaled-timeline", "detached-driver")
@@ -696,7 +703,6 @@ impl DrmSyncFile {
                 };
                 strscpy(&mut entry[0..32], timeline.as_bytes());
                 strscpy(&mut entry[32..64], driver.as_bytes());
-                let fence_status = point.fence.status();
                 entry[64..68].copy_from_slice(&fence_status.to_ne_bytes());
                 let timestamp = if signalled { point.timestamp_ns() } else { 0 };
                 entry[72..80].copy_from_slice(&timestamp.to_ne_bytes());
