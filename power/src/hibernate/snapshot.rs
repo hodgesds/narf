@@ -6,7 +6,7 @@
 //! frames ([`narf_memory::frame::for_each_saveable_frame`] over
 //! [`narf_memory::frame::saveable_ram_ranges`]), takes one free frame per
 //! saveable frame plus a margin to hold the copies, and reserves the list
-//! of saved frame numbers. [`Prealloc::copy`] runs once the devices are
+//! of saved frame numbers. [`Prealloc::take`] runs once the devices are
 //! frozen, with interrupts off on the only CPU running. It copies every
 //! saveable frame, except the copy frames, and allocates nothing while it
 //! does. The [`Snapshot`] is then the system's memory at that instant,
@@ -51,7 +51,7 @@ fn pfn_of(frame: PhysFrame) -> u64 {
 }
 
 /// The copy frames and the saved frame numbers, filled by
-/// [`Prealloc::copy`]. Dropping it frees every copy frame.
+/// [`Prealloc::take`]. Dropping it frees every copy frame.
 #[derive(Debug)]
 pub struct Snapshot {
     /// Frame `i` of the image is the copy of `pfns[i]`, in walk order.
@@ -101,7 +101,10 @@ impl Drop for Snapshot {
 }
 
 /// `hibernate_preallocate_memory`'s result: the copy frames and the marks
-/// that keep them out of the copy.
+/// that keep them out of the copy. The snapshot fills it in place, so the
+/// kernel restored from the image still owns its copy frames and frees
+/// them by dropping it (`swsusp_free`). The restore resumes above the copy,
+/// where nothing else would.
 #[derive(Debug)]
 pub struct Prealloc {
     ranges: Vec<(u64, u64)>,
@@ -116,55 +119,62 @@ impl Prealloc {
         self.snapshot.copies.len()
     }
 
-    fn is_taken(&self, pfn: u64) -> bool {
-        self.taken
-            .get((pfn / 64) as usize)
-            .is_some_and(|word| word & (1 << (pfn % 64)) != 0)
-    }
-
-    /// `swsusp_save`: copy every saveable frame except the copy frames.
+    /// `swsusp_save`: copy every saveable frame except the copy frames into
+    /// [`Self::snapshot`].
     ///
     /// # Safety
     /// Interrupts are off and no other CPU runs, so no frame changes
     /// between the walk and the copy and the allocator's state is still.
     /// Devices are frozen, so no DMA writes memory meanwhile.
-    pub unsafe fn copy(mut self) -> Result<Snapshot, SnapshotError> {
+    pub unsafe fn take(&mut self) -> Result<(), SnapshotError> {
+        let Self {
+            ranges,
+            taken,
+            snapshot,
+        } = self;
+        let is_taken = |pfn: u64| {
+            taken
+                .get((pfn / 64) as usize)
+                .is_some_and(|word| word & (1 << (pfn % 64)) != 0)
+        };
         let mut n = 0;
         let mut grew = false;
-        let ranges = core::mem::take(&mut self.ranges);
-        for &(start, end) in &ranges {
+        for &(start, end) in ranges.iter() {
             frame::for_each_saveable_frame(start, end, |pfn| {
-                if grew || self.is_taken(pfn) {
+                if grew || is_taken(pfn) {
                     return;
                 }
-                if n == self.snapshot.copies.len() {
+                if n == snapshot.copies.len() {
                     grew = true;
                     return;
                 }
                 let src = PhysAddr::new(pfn << PAGE_SHIFT).kernel_ptr::<u8>();
-                let dst = self.snapshot.copies[n]
-                    .start_address()
-                    .kernel_mut_ptr::<u8>();
+                let dst = snapshot.copies[n].start_address().kernel_mut_ptr::<u8>();
                 // SAFETY: `src` is a RAM frame, which the direct map covers;
                 // `dst` is a copy frame this snapshot owns. They differ: a
                 // copy frame is never saved.
                 unsafe { core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize) };
-                self.snapshot.pfns[n] = pfn;
+                snapshot.pfns[n] = pfn;
                 n += 1;
             });
         }
         if grew {
             return Err(SnapshotError::Grew {
-                copies: self.snapshot.copies.len() as u64,
+                copies: snapshot.copies.len() as u64,
             });
         }
-        self.snapshot.len = n;
-        let empty = Snapshot {
-            pfns: Vec::new(),
-            copies: Vec::new(),
-            len: 0,
-        };
-        Ok(core::mem::replace(&mut self.snapshot, empty))
+        snapshot.len = n;
+        Ok(())
+    }
+
+    /// The snapshot [`Self::take`] filled.
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    /// [`Snapshot::release_spare`].
+    pub fn release_spare(&mut self) {
+        self.snapshot.release_spare();
     }
 }
 

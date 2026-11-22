@@ -59,6 +59,7 @@ pub(crate) fn schedule_sleep(action: PowerAction, cap: Cap<Power, Invoke>) -> Ar
     let supported = match action {
         PowerAction::Suspend => narf_power::suspend::s3_supported(),
         PowerAction::Freeze => narf_power::s2idle::s2idle_supported(),
+        PowerAction::Hibernate => narf_power::hibernate::available(),
         PowerAction::PowerOff => false,
     };
     if !supported {
@@ -72,6 +73,19 @@ pub(crate) fn schedule_sleep(action: PowerAction, cap: Cap<Power, Invoke>) -> Ar
         let result = match action {
             PowerAction::Suspend => narf_power::suspend::suspend_async(&cap).await,
             PowerAction::Freeze => narf_power::s2idle::suspend_to_idle_async(&cap).await,
+            PowerAction::Hibernate => narf_power::hibernate::hibernate(&cap).await.map_err(|e| {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  power-service: hibernation failed: {e:?}"
+                );
+                match e {
+                    narf_power::hibernate::HibernateError::AuthorityRevoked => {
+                        SuspendError::AuthorityRevoked
+                    }
+                    narf_power::hibernate::HibernateError::Busy => SuspendError::AlreadySuspending,
+                    _ => SuspendError::Aborted,
+                }
+            }),
             PowerAction::PowerOff => Err(SuspendError::NotImplemented),
         };
         complete(&owned, result);

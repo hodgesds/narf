@@ -75,6 +75,14 @@ pub struct ResumeContext {
     /// trampoline skips the restore rather than writing 0 (which
     /// would clear `LME` while executing in long mode).
     pub efer: u64,
+    /// `IA32_FS_BASE`, `IA32_GS_BASE` and `IA32_KERNEL_GS_BASE`. Lost across
+    /// S3 and, for a hibernation image, still the *boot* kernel's after the
+    /// restore: its per-CPU block, at its own KASLR slide. The trampoline
+    /// restores them right after CR3, before any Rust can reach per-CPU data
+    /// through GS.
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub kernel_gs_base: u64,
 }
 
 /// `IA32_EFER` MSR number.
@@ -86,6 +94,12 @@ const IA32_EFER: u32 = 0xC000_0080;
 /// cannot try to change it.
 #[cfg(target_arch = "x86_64")]
 const EFER_LMA: u64 = 1 << 10;
+#[cfg(target_arch = "x86_64")]
+const IA32_FS_BASE: u32 = 0xC000_0100;
+#[cfg(target_arch = "x86_64")]
+const IA32_GS_BASE: u32 = 0xC000_0101;
+#[cfg(target_arch = "x86_64")]
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 /// Byte offsets of [`ResumeContext`] fields, *derived from the
 /// struct* via `offset_of!` and fed to the wake trampoline as
@@ -114,6 +128,9 @@ pub mod ctx_offset {
     pub const IDT_LIMIT: usize = offset_of!(ResumeContext, idt_limit);
     pub const RSP: usize = offset_of!(ResumeContext, rsp);
     pub const EFER: usize = offset_of!(ResumeContext, efer);
+    pub const FS_BASE: usize = offset_of!(ResumeContext, fs_base);
+    pub const GS_BASE: usize = offset_of!(ResumeContext, gs_base);
+    pub const KERNEL_GS_BASE: usize = offset_of!(ResumeContext, kernel_gs_base);
 }
 
 // The trampoline builds its 10-byte lgdt/lidt operands by pairing
@@ -135,6 +152,9 @@ const _: () = {
     assert!(ctx_offset::IDT_BASE % 8 == 0);
     assert!(ctx_offset::RSP % 8 == 0);
     assert!(ctx_offset::EFER % 8 == 0);
+    assert!(ctx_offset::FS_BASE % 8 == 0);
+    assert!(ctx_offset::GS_BASE % 8 == 0);
+    assert!(ctx_offset::KERNEL_GS_BASE % 8 == 0);
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -150,6 +170,9 @@ static RESUME_CONTEXT: narf_lib::sync::IrqSafeSpinLock<ResumeContext> =
         idt_limit: 0,
         rsp: 0,
         efer: 0,
+        fs_base: 0,
+        gs_base: 0,
+        kernel_gs_base: 0,
     });
 
 /// True once `save_resume_context` has run on this boot.
@@ -209,6 +232,14 @@ pub unsafe fn save_resume_context() {
     // a wrmsr that tries to change it. Same masking Linux does in
     // `arch/x86/realmode/init.c` (`tr_efer = efer & ~EFER_LMA`).
     let efer = crate::x86_64::msr::rdmsr_or_gp(IA32_EFER).unwrap_or(0) & !EFER_LMA;
+    // SAFETY: architectural MSRs on every x86_64 CPU, read at CPL 0.
+    let (fs_base, gs_base, kernel_gs_base) = unsafe {
+        (
+            crate::x86_64::msr::rdmsr(IA32_FS_BASE),
+            crate::x86_64::msr::rdmsr(IA32_GS_BASE),
+            crate::x86_64::msr::rdmsr(IA32_KERNEL_GS_BASE),
+        )
+    };
     *RESUME_CONTEXT.lock() = ResumeContext {
         cr0,
         cr3,
@@ -220,6 +251,9 @@ pub unsafe fn save_resume_context() {
         idt_limit,
         rsp,
         efer,
+        fs_base,
+        gs_base,
+        kernel_gs_base,
     };
     CAPTURED.store(true, Ordering::Release);
 }
@@ -429,6 +463,22 @@ pub unsafe extern "C" fn s3_wake_entry() -> ! {
         // need our CR3 to resolve).
         "mov rbx, [r8 + {ofs_cr3}]",
         "mov cr3, rbx",
+        // ── FS / GS / KERNEL_GS bases ──────────────────────────
+        // Before anything can reach per-CPU data through GS: S3 lost
+        // them, and a restored hibernation image would otherwise run on
+        // the boot kernel's per-CPU block at the boot kernel's slide.
+        "mov ecx, {fs_base_msr}",
+        "mov eax, [r8 + {ofs_fs_base}]",
+        "mov edx, [r8 + {ofs_fs_base} + 4]",
+        "wrmsr",
+        "mov ecx, {gs_base_msr}",
+        "mov eax, [r8 + {ofs_gs_base}]",
+        "mov edx, [r8 + {ofs_gs_base} + 4]",
+        "wrmsr",
+        "mov ecx, {kernel_gs_base_msr}",
+        "mov eax, [r8 + {ofs_kernel_gs_base}]",
+        "mov edx, [r8 + {ofs_kernel_gs_base} + 4]",
+        "wrmsr",
         // Restore RSP so the lgdt/lidt stack pushes land in a
         // known location (an arbitrary stack-relative push pre-
         // CR3-restore can't be trusted).
@@ -483,6 +533,12 @@ pub unsafe extern "C" fn s3_wake_entry() -> ! {
         ofs_idt_limit = const ctx_offset::IDT_LIMIT,
         ofs_rsp = const ctx_offset::RSP,
         ofs_efer = const ctx_offset::EFER,
+        ofs_fs_base = const ctx_offset::FS_BASE,
+        ofs_gs_base = const ctx_offset::GS_BASE,
+        ofs_kernel_gs_base = const ctx_offset::KERNEL_GS_BASE,
+        fs_base_msr = const IA32_FS_BASE,
+        gs_base_msr = const IA32_GS_BASE,
+        kernel_gs_base_msr = const IA32_KERNEL_GS_BASE,
     );
 }
 

@@ -76,6 +76,9 @@ pub enum PowerAction {
     /// command, forced to an emergency sync + kernel power-off if it
     /// cannot be started).
     PowerOff,
+    /// Hibernate: [`crate::hibernate::hibernate`], what a userspace `disk`
+    /// request maps to.
+    Hibernate,
 }
 
 impl PowerAction {
@@ -84,6 +87,7 @@ impl PowerAction {
             PowerAction::Suspend => 1 << 0,
             PowerAction::PowerOff => 1 << 1,
             PowerAction::Freeze => 1 << 2,
+            PowerAction::Hibernate => 1 << 3,
         }
     }
 
@@ -91,9 +95,10 @@ impl PowerAction {
     /// sleeps first (S3, then s2idle), power-off last — a power-off
     /// request that lands during a sleep wins on the next pump,
     /// after resume.
-    const ORDER: [PowerAction; 3] = [
+    const ORDER: [PowerAction; 4] = [
         PowerAction::Suspend,
         PowerAction::Freeze,
+        PowerAction::Hibernate,
         PowerAction::PowerOff,
     ];
 }
@@ -217,6 +222,7 @@ pub struct ServiceStats {
     pub sleep_presses: u64,
     pub suspend_requests: u64,
     pub freeze_requests: u64,
+    pub hibernate_requests: u64,
     pub poweroff_requests: u64,
     pub actions_executed: u64,
     pub warnings_fired: u64,
@@ -271,6 +277,7 @@ static STATE: IrqSafeSpinLock<ServiceState> = IrqSafeSpinLock::new(ServiceState 
         sleep_presses: 0,
         suspend_requests: 0,
         freeze_requests: 0,
+        hibernate_requests: 0,
         poweroff_requests: 0,
         actions_executed: 0,
         warnings_fired: 0,
@@ -435,6 +442,7 @@ pub fn request_action(action: PowerAction) {
         match action {
             PowerAction::Suspend => state.stats.suspend_requests += 1,
             PowerAction::Freeze => state.stats.freeze_requests += 1,
+            PowerAction::Hibernate => state.stats.hibernate_requests += 1,
             PowerAction::PowerOff => state.stats.poweroff_requests += 1,
         }
     }

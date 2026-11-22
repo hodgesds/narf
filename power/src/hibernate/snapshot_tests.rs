@@ -13,7 +13,7 @@ fn snapshot_copies_frames_in_use() -> TestResult {
     for (i, byte) in page.iter_mut().enumerate() {
         *byte = (i as u8) ^ 0xA5;
     }
-    let prealloc = match preallocate() {
+    let mut prealloc = match preallocate() {
         Ok(prealloc) => prealloc,
         Err(why) => {
             frame::free_frame(marked);
@@ -33,22 +33,20 @@ fn snapshot_copies_frames_in_use() -> TestResult {
     let irqs = narf_arch::interrupts_enabled();
     // SAFETY: the copy's preconditions hold for the frames this test checks:
     // nothing else touches them, and the walk only reads.
-    let snapshot = unsafe {
+    let taken = unsafe {
         narf_arch::disable_interrupts();
-        let snapshot = prealloc.copy();
+        let taken = prealloc.take();
         if irqs {
             narf_arch::enable_interrupts();
         }
-        snapshot
+        taken
     };
-    let mut snapshot = match snapshot {
-        Ok(snapshot) => snapshot,
-        Err(_) => {
-            frame::free_frame(marked);
-            return TestResult::Fail("the copy outgrew its preallocation");
-        }
-    };
-    snapshot.release_spare();
+    if taken.is_err() {
+        frame::free_frame(marked);
+        return TestResult::Fail("the copy outgrew its preallocation");
+    }
+    prealloc.release_spare();
+    let snapshot = prealloc.snapshot();
     let pfns = snapshot.pfns();
     let ascending = pfns.windows(2).all(|w| w[0] < w[1]);
     let marked_pfn = pfn_of(marked);
@@ -66,7 +64,7 @@ fn snapshot_copies_frames_in_use() -> TestResult {
         .sum();
     let copies_saved = copy_pfns.iter().any(|pfn| pfns.binary_search(pfn).is_ok());
     let len = snapshot.len();
-    drop(snapshot);
+    drop(prealloc);
     frame::free_frame(marked);
     if len == 0 || len > capacity || !ascending {
         return TestResult::Fail("the snapshot's frame list is empty, too long or unordered");

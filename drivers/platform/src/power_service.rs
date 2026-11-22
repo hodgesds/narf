@@ -54,7 +54,7 @@ struct PlatformExecutor;
 impl service::ActionExecutor for PlatformExecutor {
     fn execute(&self, action: PowerAction) {
         match action {
-            PowerAction::Suspend | PowerAction::Freeze => {
+            PowerAction::Suspend | PowerAction::Freeze | PowerAction::Hibernate => {
                 // This composition site owns minting. The service/sysfs
                 // writer gets a queued acknowledgment; the retained request
                 // exposes actual completion/refusal from the async task.
@@ -88,6 +88,7 @@ fn forward_sleep_request(state: SleepState) -> Result<(), SleepRequestError> {
     service::request_action(match state {
         SleepState::Freeze => PowerAction::Freeze,
         SleepState::Mem => PowerAction::Suspend,
+        SleepState::Disk => PowerAction::Hibernate,
     });
     Ok(())
 }

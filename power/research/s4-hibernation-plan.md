@@ -65,10 +65,15 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
      narf.resume_offset=<block>`.
 
    The SMS is TPM-sealed through the existing `TpmAnchor` slot.
-7. **Early readers.** Add polled PCI front ends for virtio-blk (QEMU on
-   x86_64) and NVMe (hardware) beside the virtio-mmio one, plus early TPM
-   access (CRB/TIS) for the unseal.
-8. **Resume.** Probe after memory init and before device init. Then:
+7. ~~**Early readers.**~~ Not needed. The resume follows Linux's
+   `software_resume`: a late initcall, reading through the normal block
+   and TPM drivers, then quiescing the devices before the jump. The early
+   virtio-mmio reader stays for the existing resume environment.
+8. **Resume.** x86_64 done (`hibernate::software_resume`,
+   `hibernate::arch`, `hibernate::restore`, spec §3.6.0f). It reuses S3's
+   wake trampoline after a relocated copy loop, and the hibernation
+   coordinator (`hibernate::hibernate`) is wired to `/sys/power/state`'s
+   `disk`. aarch64's restore remains. The original outline:
    - TPM unseal, then whole-image verification (`attempt_resume`);
    - refuse a changed memory map (`hibernation_e820_mismatch`);
    - load the pages into frames the boot kernel does not need;

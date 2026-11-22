@@ -1463,11 +1463,13 @@ waited.
 // narf_power::hibernate::snapshot
 pub enum SnapshotError { NoMemory { needed: u64, got: u64 }, Grew { copies: u64 } }
 pub fn preallocate() -> Result<Prealloc, SnapshotError>;   // hibernate_preallocate_memory
-impl Prealloc {
+impl Prealloc {                                              // frees its copy frames on drop (swsusp_free)
     pub fn capacity(&self) -> usize;
-    pub unsafe fn copy(self) -> Result<Snapshot, SnapshotError>;  // swsusp_save
+    pub unsafe fn take(&mut self) -> Result<(), SnapshotError>;  // swsusp_save, in place
+    pub fn snapshot(&self) -> &Snapshot;
+    pub fn release_spare(&mut self);
 }
-impl Snapshot {                                              // frees its copy frames on drop
+impl Snapshot {
     pub fn len(&self) -> usize;
     pub fn pfns(&self) -> &[u64];                            // ascending
     pub fn page(&self, i: usize) -> (u64, &[u8; 4096]);
@@ -1485,9 +1487,13 @@ impl Snapshot {                                              // frees its copy f
 A system with less free memory than it uses fails here with `NoMemory`.
 Linux shrinks the page cache first.
 
-`copy` runs once the devices are frozen, with interrupts off on the only
-CPU running. It copies every saveable frame except the copy frames, and
-allocates nothing. Frames in use beyond the margin fail it with `Grew`.
+`take` runs once the devices are frozen, with interrupts off on the only
+CPU running. It copies every saveable frame except the copy frames, in
+place in the `Prealloc`, and allocates nothing. Frames in use beyond the
+margin fail it with `Grew`.
+
+The restored image resumes above the copy, so the `Prealloc` owned there
+still names its copy frames. Dropping it frees them (`swsusp_free`).
 
 The snapshot covers all known RAM, ACPI NVS included. Linux saves only
 `E820_TYPE_RAM` and saves NVS separately (`suspend_nvs_save`), with the
@@ -1561,6 +1567,73 @@ the locator. More than 169 extents refuses the file; Linux chains swap-map
 pages instead. The resume finds the locator through `narf.resume=<device>
 narf.resume_offset=<block>` (4 KiB units), Linux's `resume=` and
 `resume_offset=`.
+
+#### 3.6.0f Hibernation and resume
+
+```rust
+// narf_power::hibernate
+pub const DEFAULT_IMAGE_PATH: &str = "/hibernate.img";      // narf.hibernate_file= overrides
+pub fn available() -> bool;                                  // hibernation_available: arch restore + TPM
+pub enum HibernateError { AuthorityRevoked, Busy, SecondaryCpus(u32), NoTpm, ImageFile(..), Freeze(..),
+                          Devices, Snapshot(..), Arch(..), Seal(..) }
+pub async fn hibernate(cap: &Cap<Power, Invoke>) -> Result<(), HibernateError>;  // hibernate()
+pub enum ResumeSkip { NotConfigured, SecondaryCpus(u32), NoDevice(String), NoImage, Refused(..),
+                      Payload(..), MemoryMapChanged, Arch(..), Devices, Store }
+pub fn software_resume() -> ResumeSkip;                      // a Stage::Late initcall
+// narf_power::hibernate::arch
+pub const SUPPORTED: bool;                                   // x86_64 today
+pub struct ArchRecord { pub entry_phys: u64 }                // in PayloadHeader::arch
+pub unsafe fn capture<R>(snapshot: impl FnOnce(ArchRecord) -> R) -> Result<Captured<R>, ArchError>;
+pub unsafe fn restore(record, ram, first_pb_phys, safe: &mut dyn SafeFrames) -> Result<Infallible, ArchError>;
+// narf_power::hibernate::restore
+pub struct Loader;                                           // stages pages in frames the image does not use
+pub fn load_payload(verified: &VerifiedResume, store: &dyn ImageStore) -> Result<(PayloadHeader, Loader), RestoreError>;
+// narf_arch::x86_64::s4_restore
+pub fn copy_loop() -> &'static [u8];                         // core_restore_code, position-independent
+pub unsafe fn jump(temp_cr3, loop_phys, first_pb_phys, entry_phys) -> !;
+```
+
+`hibernate`, run by the power service for a `disk` write to
+`/sys/power/state`, follows Linux's `hibernate()`:
+1. Prepare the image file (§3.6.0e), sized from the frames in use.
+2. `freeze_processes`; the async system-PM prepare for S4;
+   `freeze_kernel_threads`.
+3. `snapshot::preallocate`; `freeze_all_devices`.
+4. With interrupts off, `arch::capture` takes the snapshot.
+5. `thaw_all_devices` (amdgpu stays frozen); seal the payload under a
+   fresh epoch whose only slot the TPM wraps.
+6. `poweroff_all_devices`; `hibernation_power_down`.
+
+A failure on the way thaws everything, recovering (every device resumes),
+and returns the error. The restored image returns from step 4 with
+`Captured::Restored`. It frees its copy frames, runs `restore_all_devices`,
+thaws, zeroes the image header and returns `Ok(())`.
+
+`software_resume` is Linux's `software_resume`: a late initcall, reading
+through the normal block and TPM drivers. It follows `narf.resume=<device>
+narf.resume_offset=<block>` to the locator and runs `attempt_resume`, the
+whole-image verification under the recorded TPM policy. Then:
+1. `load_payload` streams the pages into frames no image page uses,
+   listing (copy, original) pairs (`restore_pblist`).
+2. A RAM-layout hash other than this boot's refuses the image.
+3. The image header is zeroed, so a restore that dies cold-boots next time.
+4. Devices are quiesced (`freeze_all_devices`).
+5. With interrupts off, `arch::restore`.
+
+Any refusal boots on normally.
+
+x86_64's restore reuses S3's saved context and wake trampoline. It builds a
+temporary page table that identity-maps every 2 MiB block holding RAM,
+executable, and keeps the live kernel half. It copies `copy_loop` into a
+safe frame and jumps there. The loop copies the pages with no stack,
+flushes the TLB including globals, and enters the image's `s3_wake_entry`
+at its physical address. The wake entry reloads the image's EFER, CR3,
+RSP, GDT, IDT, CR0 and CR4 and long-jumps back into `capture`. The S3
+wake hook skips its device resume while `restoring_image()`.
+
+aarch64 has no restore yet: `SUPPORTED` is false there, and both entry
+points refuse up front. Both also refuse while more than one CPU is
+online, until secondary CPUs can be taken down and restarted (lane 4).
 
 #### 3.6.1 Power-off paths vs Linux
 

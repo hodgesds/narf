@@ -378,6 +378,17 @@ impl<E: KeyEntropy> SuspendService<E> {
         Ok(image_id)
     }
 
+    /// [`Self::seal_image`] over a streamed plaintext, with no hooks.
+    pub fn seal_source(
+        &mut self,
+        store: &mut dyn ImageStore,
+        policy: RecordedPolicy,
+        image: &dyn ImageSource,
+    ) -> Result<[u8; 16], ServiceError> {
+        let (image_id, _report) = self.seal_image_hooked(store, policy, image, &[])?;
+        Ok(image_id)
+    }
+
     /// Seal with the state-hook seal fan-out (design §5, P2): the
     /// hooks in `hooks` run in reverse order after device quiesce
     /// and before the image write; their sealed blobs land in the

@@ -603,6 +603,12 @@ fn power_state_show() -> String {
         }
         out.push_str(crate::sleep_request::SleepState::Mem.name());
     }
+    if crate::hibernate::available() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(crate::sleep_request::SleepState::Disk.name());
+    }
     out.push('\n');
     out
 }
@@ -1161,6 +1167,7 @@ mod tests {
             match state {
                 crate::sleep_request::SleepState::Freeze => 1,
                 crate::sleep_request::SleepState::Mem => 2,
+                crate::sleep_request::SleepState::Disk => 3,
             },
             core::sync::atomic::Ordering::SeqCst,
         );

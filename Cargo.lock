@@ -3549,6 +3549,7 @@ dependencies = [
  "narf-aml",
  "narf-arch",
  "narf-block",
+ "narf-boot",
  "narf-bus",
  "narf-capabilities",
  "narf-console",

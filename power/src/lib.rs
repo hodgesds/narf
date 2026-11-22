@@ -155,6 +155,17 @@ extern "C" fn s3_resume_hook_entry() {
     unsafe {
         narf_arch::x86_64::s3_resume::restore_lapic_state();
     }
+    // A hibernation image restored through the same wake path runs its
+    // devices' restore callbacks itself, after it returns from the capture.
+    // Its CPU still holds the boot kernel's syscall MSRs and task register.
+    if hibernate::restoring_image() {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the wake continuation, interrupts off, in the image.
+        unsafe {
+            hibernate::arch::fix_cpu_after_restore();
+        }
+        return;
+    }
     let _ = device_pm::resume_all_devices();
     suspend::restore_irq_masks();
     suspend::invoke_fb_resume();
@@ -211,6 +222,13 @@ pub fn register_initcalls() {
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "lps0", || {
         lps0::setup();
+        InitResult::Ok
+    });
+    // `software_resume`: once the block and TPM drivers are up, before
+    // userspace, restore a hibernation image if `narf.resume=` names one.
+    // It returns only when the boot goes on without one.
+    narf_init::register(Stage::Late, "hibernate-resume", || {
+        let _ = hibernate::software_resume();
         InitResult::Ok
     });
     #[cfg(target_arch = "x86_64")]
