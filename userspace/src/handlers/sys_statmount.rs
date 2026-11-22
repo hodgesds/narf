@@ -33,6 +33,7 @@ const STATMOUNT_MNT_POINT: u64 = 0x0000_0010;
 const STATMOUNT_FS_TYPE: u64 = 0x0000_0020;
 const STATMOUNT_MNT_NS_ID: u64 = 0x0000_0040;
 const STATMOUNT_MNT_OPTS: u64 = 0x0000_0080;
+const STATMOUNT_FS_SUBTYPE: u64 = 0x0000_0100;
 const STATMOUNT_SB_SOURCE: u64 = 0x0000_0200;
 const STATMOUNT_SUPPORTED_MASK: u64 = 0x0000_1000;
 
@@ -53,6 +54,7 @@ const STATMOUNT_SUPPORTED: u64 = STATMOUNT_SB_BASIC
     | STATMOUNT_FS_TYPE
     | STATMOUNT_MNT_NS_ID
     | STATMOUNT_MNT_OPTS
+    | STATMOUNT_FS_SUBTYPE
     | STATMOUNT_SB_SOURCE
     | STATMOUNT_SUPPORTED_MASK;
 
@@ -60,15 +62,15 @@ const STATMOUNT_SUPPORTED: u64 = STATMOUNT_SB_BASIC
 /// struct, which is what makes `bufsize == sizeof(statmount)` -EOVERFLOW.
 ///
 /// This is Linux's `STATMOUNT_STRING_REQ`, including the string fields NARF
-/// cannot fill (FS_SUBTYPE, OPT_ARRAY, OPT_SEC_ARRAY, MNT_UIDMAP,
-/// MNT_GIDMAP): `prepare_kstatmount` tests the REQUESTED mask, so asking for
-/// only FS_SUBTYPE with a 512-byte buffer is -EOVERFLOW even though nothing
-/// would be written (probed on 6.18).
+/// cannot fill (OPT_ARRAY, OPT_SEC_ARRAY, MNT_UIDMAP, MNT_GIDMAP):
+/// `prepare_kstatmount` tests the REQUESTED mask, so asking for only
+/// FS_SUBTYPE with a 512-byte buffer is -EOVERFLOW even for a superblock
+/// with no subtype, which writes nothing (probed on 6.18).
 const STATMOUNT_STRING_REQ: u64 = STATMOUNT_MNT_ROOT
     | STATMOUNT_MNT_POINT
     | STATMOUNT_FS_TYPE
     | STATMOUNT_MNT_OPTS
-    | 0x0000_0100 // STATMOUNT_FS_SUBTYPE
+    | STATMOUNT_FS_SUBTYPE
     | STATMOUNT_SB_SOURCE
     | 0x0000_0400 // STATMOUNT_OPT_ARRAY
     | 0x0000_0800 // STATMOUNT_OPT_SEC_ARRAY
@@ -512,9 +514,21 @@ pub(crate) fn sys_statmount(ctx: &mut dyn TrapContext) {
         got |= STATMOUNT_MNT_POINT;
         sm.mnt_point = push(path, &mut strs);
     }
+    // mountinfo's type is `show_type`: `s_type->name`, then '.' and
+    // `s_subtype` when the superblock has one ("fuse.portal"). statmount
+    // reports the two apart — `statmount_fs_type` writes `s_type->name`,
+    // `statmount_fs_subtype` the subtype — and a type name never contains a
+    // '.', so the first one splits them back.
+    let (type_name, subtype) = fstype.split_once('.').unwrap_or((fstype.as_str(), ""));
     if mask & STATMOUNT_FS_TYPE != 0 {
         got |= STATMOUNT_FS_TYPE;
-        sm.fs_type = push(fstype, &mut strs);
+        sm.fs_type = push(type_name, &mut strs);
+    }
+    // `statmount_string`: "If nothing was emitted, return to avoid setting
+    // the flag" — a superblock without a subtype leaves the bit clear.
+    if mask & STATMOUNT_FS_SUBTYPE != 0 && !subtype.is_empty() {
+        got |= STATMOUNT_FS_SUBTYPE;
+        sm.fs_subtype = push(subtype, &mut strs);
     }
     if mask & STATMOUNT_MNT_OPTS != 0 {
         got |= STATMOUNT_MNT_OPTS;

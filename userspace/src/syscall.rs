@@ -3631,13 +3631,33 @@ enum IoClass {
 }
 
 impl IoClass {
-    fn account(self, ret: i64) {
+    /// Account one execution of a read/write-family call that returned
+    /// `ret` (0 for an execution that parked and set none). A call
+    /// `reissued` after it parked is the one call Linux makes once and sleeps
+    /// inside (`pipe_read`'s wait): it adds its bytes but not a second
+    /// `syscr`/`syscw`. See [`dispatch_io_accounted`].
+    fn account(self, ret: i64, reissued: bool) {
         let task = crate::handlers::current_task_id();
-        match self {
-            Self::Read => crate::handlers::io_account_read(task, ret),
-            Self::Write => crate::handlers::io_account_write(task, ret),
+        let read = self == Self::Read;
+        if reissued {
+            crate::handlers::io_account_reissued(task, read, ret);
+        } else if read {
+            crate::handlers::io_account_read(task, ret);
+        } else {
+            crate::handlers::io_account_write(task, ret);
         }
     }
+}
+
+/// Whether the current task's call is the re-issue of one that parked:
+/// `syscall_parked_restarting` is still set at entry only when the park
+/// rewound RIP onto the gate and no completion, signal or exec has moved the
+/// frame since (every exit path clears it then).
+fn reissued_after_park() -> bool {
+    crate::user_task::current_user_task().is_some_and(|u| {
+        // SAFETY: the in-flight task's poller-pinned context; atomic load.
+        unsafe { (*u).syscall_parked_restarting.load(Ordering::Acquire) }
+    })
 }
 
 /// The read/write family Linux accounts, i.e. everything that reaches
@@ -3713,25 +3733,13 @@ fn dispatch_io_accounted(
         table.dispatch_ctx_versioned(variant, version, ctx);
         return;
     };
-    let reissued = crate::user_task::current_user_task().is_some_and(|u| {
-        // SAFETY: the in-flight task's poller-pinned context; atomic load.
-        unsafe { (*u).syscall_parked_restarting.load(Ordering::Acquire) }
-    });
+    let reissued = reissued_after_park();
     let mut cap = IoAccountCtx {
         inner: ctx,
         ret: None,
     };
     table.dispatch_ctx_versioned(variant, version, &mut cap);
-    let ret = cap.ret.map(|r| r.value as i64).unwrap_or(0);
-    let task = crate::handlers::current_task_id();
-    let read = class == IoClass::Read;
-    if reissued {
-        crate::handlers::io_account_reissued(task, read, ret);
-    } else if read {
-        crate::handlers::io_account_read(task, ret);
-    } else {
-        crate::handlers::io_account_write(task, ret);
-    }
+    class.account(cap.ret.map_or(0, |r| r.value as i64), reissued);
 }
 
 /// Name of the handler a raw Linux syscall number dispatches to, if this
@@ -4679,13 +4687,24 @@ pub fn kernel_syscall_entry_plain_with_state(
             );
         }
     }
+    // `/proc/<pid>/io` for the read/write family, under the rule every entry
+    // path shares (`dispatch_io_accounted`): the first execution is the
+    // call, a re-issue after a park adds only its bytes. An execution that
+    // parked (RIP rewound for replay) has no result yet.
+    let io_class = if user_state.is_null() {
+        None
+    } else {
+        io_accounting_class(n)
+    };
+    let reissued = io_class.is_some() && reissued_after_park();
     table.dispatch(n, &mut ctx);
-    // A rewound RIP parks the syscall for replay. Account its eventual
-    // userspace result once, including errors and zero-byte reads.
-    if !user_state.is_null() && ctx.rip() == entry_rip {
-        if let Some(class) = io_accounting_class(n) {
-            class.account(ctx.ret.value as i64);
-        }
+    if let Some(class) = io_class {
+        let ret = if ctx.rip() == entry_rip {
+            ctx.ret.value as i64
+        } else {
+            0
+        };
+        class.account(ret, reissued);
     }
     if let Some(u) = in_syscall {
         // SAFETY: as above. The context is the task's own (it lives in its

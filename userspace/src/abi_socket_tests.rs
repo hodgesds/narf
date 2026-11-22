@@ -13049,7 +13049,10 @@ fn smoke_abi_socket_ping_honours_device_source_and_recvttl() -> TestResult {
             reply[38..42].copy_from_slice(&request[38..42]); // identifier, sequence
             let sum = narf_net::pkt::ip_checksum(&reply[34..]);
             reply[36..38].copy_from_slice(&sum.to_be_bytes());
-            narf_net::iface::on_rx_frame_from(B, &mut reply);
+            // Into the stack itself, as B's driver hands it up. A kernel-test
+            // boot never runs `tcp_stack::init`, so `iface::on_rx_frame_from`
+            // has a stack handler only after some earlier test installed one.
+            narf_net::tcp_stack::rx_handler(B, &mut reply);
             let mut data = [0u8; 64];
             let mut ctrl = [0u8; 64];
             let mut iov = [0u8; 16];

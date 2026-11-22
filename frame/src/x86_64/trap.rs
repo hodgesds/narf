@@ -2670,6 +2670,10 @@ struct X86TrapContext<'a> {
     /// Servicing an i386 system call (`int 0x80`): `args` are the i386
     /// registers and `set_return` writes only rax (Linux `TS_COMPAT`).
     ia32: bool,
+    /// The call number as the trap delivered it (Linux `pt_regs.orig_ax`):
+    /// what a restarted call must find in rax again, whatever a handler
+    /// wrote there before it parked.
+    orig_ax: u64,
 }
 
 impl<'a> X86TrapContext<'a> {
@@ -2685,10 +2689,12 @@ impl<'a> X86TrapContext<'a> {
             arg4: frame.r8,
             arg5: frame.r9,
         };
+        let orig_ax = frame.rax;
         Self {
             frame,
             args,
             ia32: false,
+            orig_ax,
         }
     }
 
@@ -2705,10 +2711,13 @@ impl<'a> X86TrapContext<'a> {
             arg4: u64::from(frame.rdi as u32),
             arg5: u64::from(frame.rbp as u32),
         };
+        // `do_int80_emulation`: `regs->orig_ax = regs->ax & GENMASK(31, 0)`.
+        let orig_ax = frame.rax & 0xFFFF_FFFF;
         Self {
             frame,
             args,
             ia32: true,
+            orig_ax,
         }
     }
 }
@@ -2950,10 +2959,29 @@ impl<'a> TrapContext for X86TrapContext<'a> {
             (stack_top.wrapping_sub(frame_size) & !0xFu64) | 0x8
         };
 
-        let saved_rip = if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
-            self.frame.rip.wrapping_sub(2)
+        // The context the handler returns into, Linux `handle_signal`:
+        //  * restart-pending frame (`prerewound_syscall`: a blocking park
+        //    already rewound RIP onto the 2-byte gate): SA_RESTART on a
+        //    restartable call keeps the rewind — it IS the restart — and
+        //    reloads the call number (`regs->ax = regs->orig_ax`); anything
+        //    else completes the call as -EINTR past the instruction.
+        //  * completed frame + SA_RESTART restartable: rewind by 2 so the
+        //    handler's return re-issues the call.
+        //  * completed frame otherwise: resume exactly where it stopped.
+        // The same three shapes as `UserStateCtx`'s writer on the
+        // `syscall` path (`deliver_signal_into_state`).
+        const EINTR_RAX: u64 = (-4i64) as u64;
+        let restart = (params.flags & SA_RESTART) != 0 && params.restartable_syscall;
+        let (saved_rip, saved_rax) = if params.prerewound_syscall {
+            if restart {
+                (self.frame.rip, self.orig_ax)
+            } else {
+                (self.frame.rip.wrapping_add(2), EINTR_RAX)
+            }
+        } else if restart {
+            (self.frame.rip.wrapping_sub(2), self.frame.rax)
         } else {
-            self.frame.rip
+            (self.frame.rip, self.frame.rax)
         };
 
         if want_siginfo || force_rt {
@@ -3003,7 +3031,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                     rbp: self.frame.rbp,
                     rbx: self.frame.rbx,
                     rdx: self.frame.rdx,
-                    rax: self.frame.rax,
+                    rax: saved_rax,
                     rcx: self.frame.rcx,
                     rsp: self.frame.rsp,
                     rip: saved_rip,
@@ -3085,7 +3113,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 rdx: self.frame.rdx,
                 rcx: self.frame.rcx,
                 rbx: self.frame.rbx,
-                rax: self.frame.rax,
+                rax: saved_rax,
                 rip: saved_rip,
                 rflags: self.frame.rflags,
                 rsp: self.frame.rsp,
@@ -3584,6 +3612,75 @@ fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("frame/x86_64", smoke_x86_64_sa_restart_rewinds_saved_rip);
+
+/// An `int 0x80` call that parked for re-execution (RIP already rewound onto
+/// the gate, `prerewound_syscall`) and is then interrupted by a handled
+/// signal gets Linux `handle_signal`'s two outcomes over `-ERESTARTSYS`: with
+/// SA_RESTART the frame resumes ON `int 0x80` with eax reloaded from the
+/// call number (`regs->ax = regs->orig_ax`), whatever the park left in rax;
+/// without it the call completes as -EINTR past the instruction. A rewind of
+/// the already-rewound RIP would land two bytes inside the previous
+/// instruction.
+fn smoke_x86_64_int80_restart_pending_frame_reloads_eax_or_is_eintr() -> TestResult {
+    const GATE_RIP: u64 = 0x0040_1234;
+    // eax = i386 read (3), with a 64-bit caller's garbage above it.
+    const ENTRY_RAX: u64 = 0xDEAD_0000_0000_0003;
+    let mcontext = |field: usize| core::mem::offset_of!(UContext, uc_mcontext) + field;
+    for (flags, want_rip, want_rax) in [
+        (SA_SIGINFO | SA_RESTART, GATE_RIP, 3u64),
+        (SA_SIGINFO, GATE_RIP + 2, (-4i64) as u64),
+    ] {
+        let stack = SmokeStack::new();
+        let mut frame = smoke_signal_trap_frame(GATE_RIP, stack.top());
+        frame.rax = ENTRY_RAX;
+        let params = SigDeliveryParams {
+            handler: 0xCAFE_F00D,
+            restorer: 0,
+            signum: 10,
+            flags,
+            altstack_sp: 0,
+            altstack_size: 0,
+            restartable_syscall: true,
+            prerewound_syscall: true,
+            si_code: 0,
+            si_addr: 0,
+            si_value: 0,
+            si_pid: 0,
+        };
+        let mut ctx = X86TrapContext::from_int80_ia32(&mut frame);
+        // What a handler may leave behind before it parks.
+        ctx.set_return(SyscallReturn::invalid_op());
+        if !ctx.deliver_signal(&params) {
+            return TestResult::Fail("deliver_signal returned false");
+        }
+        let uc = frame.rdx;
+        // SAFETY: the frame writer just laid the ucontext at `uc`, inside
+        // this test's kernel-resident stack buffer.
+        let (rip, rax) = unsafe {
+            (
+                ((uc + mcontext(core::mem::offset_of!(McContext, rip)) as u64) as *const u64)
+                    .read_unaligned(),
+                ((uc + mcontext(core::mem::offset_of!(McContext, rax)) as u64) as *const u64)
+                    .read_unaligned(),
+            )
+        };
+        if rip != want_rip {
+            return TestResult::Fail(
+                "a restart-pending int 0x80 frame saved the wrong RIP (re-rewound or not completed)",
+            );
+        }
+        if rax != want_rax {
+            return TestResult::Fail(
+                "a restart-pending int 0x80 frame saved the wrong rax (not orig eax / -EINTR)",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/x86_64-int80-restart",
+    smoke_x86_64_int80_restart_pending_frame_reloads_eax_or_is_eintr
+);
 
 /// Robustness: when a signal is delivered to a *real* user task (an active
 /// address space is present) but the target stack range can't be backed —

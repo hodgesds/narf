@@ -3112,6 +3112,7 @@ fn smoke_abi_pathx_statfs_reports_the_superblock_magic() -> TestResult {
         use narf_filesystem::FsInstance as _;
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const ST_VALID: u64 = 0x0020;
+        root_mount_points(&["/abi-sfm-bind", "/abi-sfm-bind-sub"]);
         // A private namespace, so nothing here outlives the case.
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
@@ -3183,8 +3184,6 @@ fn smoke_abi_pathx_statfs_reports_the_superblock_magic() -> TestResult {
         const MS_BIND: u64 = 0x1000;
         const O_WRONLY: u64 = 0o1;
         const O_CREAT: u64 = 0o100;
-        let _ = call_mkdir(c"/abi-sfm-bind".as_ptr() as u64, 0o755);
-        let _ = call_mkdir(c"/abi-sfm-bind-sub".as_ptr() as u64, 0o755);
         if let Some(fd) = call(
             Syscall::Openat.raw(),
             a3(
@@ -3262,11 +3261,10 @@ fn smoke_abi_pathx_statfs_flags_follow_the_mount() -> TestResult {
         const ST_NOATIME: u64 = 0x0400;
         const ST_RELATIME: u64 = 0x1000;
         const O_PATH: u64 = 0o10000000;
+        root_mount_points(&["/abi-sff-plain", "/abi-sff-locked"]);
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-sff-plain".as_ptr() as u64, 0o755);
-        let _ = call_mkdir(c"/abi-sff-locked".as_ptr() as u64, 0o755);
         let mount = |target: &core::ffi::CStr, flags: u64| {
             call(
                 Syscall::Mount.raw(),
@@ -4272,6 +4270,7 @@ fn smoke_abi_pathx_getdents64_dotdot_of_a_bound_subdirectory() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const MS_BIND: u64 = 0x1000;
+        root_mount_points(&["/abi-gdb"]);
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
@@ -4281,7 +4280,6 @@ fn smoke_abi_pathx_getdents64_dotdot_of_a_bound_subdirectory() -> TestResult {
             arg2: c"tmpfs".as_ptr() as u64,
             ..Default::default()
         };
-        let _ = call_mkdir(c"/abi-gdb".as_ptr() as u64, 0o755);
         if call(Syscall::Mount.raw(), tmpfs) != Some(0) {
             return Err("mounting the tmpfs at /abi-gdb failed");
         }

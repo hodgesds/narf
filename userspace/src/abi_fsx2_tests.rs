@@ -2536,12 +2536,11 @@ fn smoke_abi_fsx2_ms_move_carries_submounts() -> TestResult {
         const MS_MOVE: u64 = 0x2000;
         const O_WRONLY: u64 = 0o1;
         const O_CREAT: u64 = 0o100;
+        root_mount_points(&["/abi-mvt-src", "/abi-mvt-dst"]);
         // A private namespace, so nothing here outlives the case.
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-mvt-src".as_ptr() as u64, 0o755);
-        let _ = call_mkdir(c"/abi-mvt-dst".as_ptr() as u64, 0o755);
         if mount_fstype(b"/abi-mvt-src\0", b"tmpfs\0") != Some(0)
             || call_mkdir(c"/abi-mvt-src/sub".as_ptr() as u64, 0o755) != Some(0)
             || mount_fstype(b"/abi-mvt-src/sub\0", b"tmpfs\0") != Some(0)
@@ -2605,11 +2604,11 @@ fn smoke_abi_fsx2_new_mount_covers_earlier_submounts() -> TestResult {
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const O_WRONLY: u64 = 0o1;
         const O_CREAT: u64 = 0o100;
+        root_mount_points(&["/abi-cover"]);
         // A private namespace, so nothing here outlives the case.
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-cover".as_ptr() as u64, 0o755);
         if mount_fstype(b"/abi-cover\0", b"tmpfs\0") != Some(0)
             || call_mkdir(c"/abi-cover/dev".as_ptr() as u64, 0o755) != Some(0)
             || mount_fstype(b"/abi-cover/dev\0", b"tmpfs\0") != Some(0)
@@ -2676,10 +2675,10 @@ kernel_test_in!(
 fn smoke_abi_fsx2_umount2_of_a_covered_mount_misses_it() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
+        root_mount_points(&["/abi-ucov"]);
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-ucov".as_ptr() as u64, 0o755);
         if mount_fstype(b"/abi-ucov\0", b"tmpfs\0") != Some(0)
             || call_mkdir(c"/abi-ucov/dev".as_ptr() as u64, 0o755) != Some(0)
             || mount_fstype(b"/abi-ucov/dev\0", b"tmpfs\0") != Some(0)
@@ -2722,10 +2721,10 @@ fn smoke_abi_fsx2_ms_move_into_its_own_tree_is_eloop() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const MS_MOVE: u64 = 0x2000;
+        root_mount_points(&["/abi-mvl"]);
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
         }
-        let _ = call_mkdir(c"/abi-mvl".as_ptr() as u64, 0o755);
         if mount_fstype(b"/abi-mvl\0", b"tmpfs\0") != Some(0)
             || call_mkdir(c"/abi-mvl/sub".as_ptr() as u64, 0o755) != Some(0)
         {
@@ -2800,6 +2799,7 @@ fn smoke_abi_fsx2_mount_listings_print_linux_fs_types() -> TestResult {
         let _mountinfo = narf_filesystem::procfs::MountinfoHookGuard::install(
             crate::handlers::proc_ns_mountinfo,
         );
+        root_mount_points(&["/abi-fstn-bind"]);
         // A private namespace, so nothing here outlives the case.
         if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
             return Err("unshare(CLONE_NEWNS) failed");
@@ -2854,7 +2854,6 @@ fn smoke_abi_fsx2_mount_listings_print_linux_fs_types() -> TestResult {
             }
         }
         // A bind prints its source's type.
-        let _ = call_mkdir(c"/abi-fstn-bind".as_ptr() as u64, 0o755);
         let bound = call(
             Syscall::Mount.raw(),
             a4(
@@ -3808,8 +3807,10 @@ fn smoke_abi_fsx2_listmount_then_statmount() -> TestResult {
             }
             if sm_str(&buf, rd_u32(&buf, sm::OFF_MNT_POINT)) == "/lsm" {
                 found = true;
-                if sm_str(&buf, rd_u32(&buf, sm::OFF_FS_TYPE)) != "lsm" {
-                    return Err("fs_type is not the filesystem's name");
+                // `statmount_fs_type`: `sb->s_type->name`. The case's tree is
+                // in-memory, which Linux calls tmpfs; its label is no type.
+                if sm_str(&buf, rd_u32(&buf, sm::OFF_FS_TYPE)) != "tmpfs" {
+                    return Err("fs_type is not the filesystem type's name");
                 }
                 // `mnt_opts` is the FILESYSTEM's own option string
                 // (`show_options`), which is the column a caller would
@@ -3851,7 +3852,133 @@ fn smoke_abi_fsx2_listmount_then_statmount() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_listmount_then_statmount);
+kernel_test_in!(
+    "syscall_abi/statmount",
+    smoke_abi_fsx2_listmount_then_statmount
+);
+
+/// `statmount` hands out a FUSE mount's type and subtype apart.
+///
+/// mountinfo's type column is `show_type`: `s_type->name`, then `.` and
+/// `s_subtype` when the superblock has one ("fuse.portal"). `statmount`
+/// reports the two separately: `STATMOUNT_FS_TYPE` is `s_type->name` alone
+/// (`statmount_fs_type`) and `STATMOUNT_FS_SUBTYPE` the subtype
+/// (`statmount_fs_subtype`). A superblock without a subtype emits nothing
+/// for FS_SUBTYPE, and `statmount_string` then leaves its bit out of the
+/// returned mask.
+fn smoke_abi_fsx2_statmount_reports_fs_type_and_subtype_apart() -> TestResult {
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    const LSMT_ROOT: u64 = u64::MAX;
+    const STATMOUNT_FS_SUBTYPE: u64 = 0x0100;
+    const OFF_FS_SUBTYPE: usize = 0x78;
+    with_setup(|| {
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let auth = bootstrap_mount_authority();
+        let fuse = |subtype: &'static str| {
+            let conn = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseConnection::new());
+            alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn))
+                as alloc::sync::Arc<dyn narf_filesystem::FsInstance>
+        };
+        let fixtures: [(&str, alloc::sync::Arc<dyn narf_filesystem::FsInstance>); 3] = [
+            ("/abi-smst-portal", fuse("portal")),
+            ("/abi-smst-fuse", fuse("fuse")),
+            (
+                "/abi-smst-mem",
+                alloc::sync::Arc::new(MemFs::new("abi-smst-label")),
+            ),
+        ];
+        for (path, fs) in fixtures {
+            if crate::handlers::current_mount_arc(&auth, path, fs).is_err() {
+                return Err("could not mount a statmount fixture");
+            }
+        }
+        let mask = STATMOUNT_MNT_POINT
+            | STATMOUNT_FS_TYPE
+            | STATMOUNT_FS_SUBTYPE
+            | STATMOUNT_SUPPORTED_MASK;
+        // (returned mask, fs_type, fs_subtype or "", supported_mask) of the
+        // mount at `path`, found by paging listmount from the root.
+        let stat_at = |path: &str| -> Result<
+            (u64, alloc::string::String, alloc::string::String, u64),
+            &'static str,
+        > {
+            let mut cursor = 0u64;
+            loop {
+                let req = mnt_id_req(32, LSMT_ROOT, cursor);
+                let mut ids = [0u64; 64];
+                let n = match call(
+                    Syscall::Listmount.raw(),
+                    a3(
+                        req.as_ptr() as u64,
+                        ids.as_mut_ptr() as u64,
+                        ids.len() as u64,
+                        0,
+                    ),
+                ) {
+                    Some(n) if n >= 0 => n as usize,
+                    _ => return Err("listmount(LSMT_ROOT) failed"),
+                };
+                if n == 0 {
+                    return Err("listmount did not list a fixture mount");
+                }
+                for &id in &ids[..n] {
+                    let sreq = mnt_id_req(32, id, mask);
+                    let mut buf = [0u8; sm::SIZE + 512];
+                    if call(
+                        Syscall::Statmount.raw(),
+                        a3(
+                            sreq.as_ptr() as u64,
+                            buf.as_mut_ptr() as u64,
+                            buf.len() as u64,
+                            0,
+                        ),
+                    ) != Some(0)
+                    {
+                        return Err("statmount on an id listmount reported failed");
+                    }
+                    if sm_str(&buf, rd_u32(&buf, sm::OFF_MNT_POINT)) != path {
+                        continue;
+                    }
+                    let got = rd_u64(&buf, sm::OFF_MASK);
+                    let fs_type = sm_str(&buf, rd_u32(&buf, sm::OFF_FS_TYPE)).into();
+                    let subtype = if got & STATMOUNT_FS_SUBTYPE != 0 {
+                        sm_str(&buf, rd_u32(&buf, OFF_FS_SUBTYPE)).into()
+                    } else {
+                        alloc::string::String::new()
+                    };
+                    return Ok((got, fs_type, subtype, rd_u64(&buf, sm::OFF_SUPPORTED_MASK)));
+                }
+                cursor = ids[n - 1];
+            }
+        };
+        let (got, fs_type, subtype, supported) = stat_at("/abi-smst-portal")?;
+        if fs_type != "fuse" {
+            return Err("statmount's fs_type for fuse.portal is not s_type->name");
+        }
+        if got & STATMOUNT_FS_SUBTYPE == 0 || subtype != "portal" {
+            return Err("statmount did not report the FUSE subtype as fs_subtype");
+        }
+        if supported & STATMOUNT_FS_SUBTYPE == 0 {
+            return Err("supported_mask does not advertise FS_SUBTYPE");
+        }
+        let (got, fs_type, ..) = stat_at("/abi-smst-fuse")?;
+        if fs_type != "fuse" || got & STATMOUNT_FS_SUBTYPE != 0 {
+            return Err("a FUSE mount without a subtype reported one");
+        }
+        let (got, fs_type, ..) = stat_at("/abi-smst-mem")?;
+        if fs_type != "tmpfs" || got & STATMOUNT_FS_SUBTYPE != 0 {
+            return Err("an in-memory mount is not tmpfs without a subtype");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/statmount-fstype",
+    smoke_abi_fsx2_statmount_reports_fs_type_and_subtype_apart
+);
 
 /// The returned `mask` says what was written, so an unsupported bit comes
 /// back CLEAR rather than failing the call.
@@ -4123,6 +4250,7 @@ fn smoke_abi_fsx2_mount_listings_after_a_global_pivot_root() -> TestResult {
             );
         };
 
+        root_mount_points(&["/abi-pvl-new"]);
         let before = mount_points(&read_all(c"/proc/self/mountinfo")?);
         let before_ids = list_paged()?;
         // The pivot, as smoke_abi_fsx_pivot_root_pos makes it.
@@ -4296,6 +4424,7 @@ fn smoke_abi_fsx2_mount_listings_drop_an_orphaned_old_root() -> TestResult {
             >::bootstrap();
             let _ = registry().unmount(&handle, path);
         };
+        root_mount_points(&["/abi-pvo-new"]);
         let before = mount_points(&read_mount_listing(c"/proc/self/mountinfo")?);
         let before_ids = listmount_paged_ids()?;
         let mounted = call(

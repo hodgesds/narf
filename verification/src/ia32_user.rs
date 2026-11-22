@@ -3,9 +3,9 @@
 //!
 //! Each program is a few hand-assembled i386 or x86_64 instructions in a
 //! fresh address space below 4 GiB, run as an ordinary own-stack user task.
-//! It reports through a data page the test reads back after the run:
-//! offsets below `INPUT` are results the program stores, inputs (a
-//! `user_desc`, a TLS block) sit from `INPUT` up.
+//! It reports through a data page that [`run`] copies out before the
+//! address space goes: offsets below `INPUT` are results the program stores,
+//! inputs (a `user_desc`, a TLS block) sit from `INPUT` up.
 //!
 //! No ELF32 loader is involved: the process is built by hand with
 //! `UserProcess::ia32` set, which is what the loader will set for an
@@ -25,12 +25,12 @@ const PAGE_BYTES: u64 = 4096;
 /// Data-page offset where the inputs a test plants begin.
 const INPUT: usize = 0x100;
 
-/// One hand-built program, the data page it reports through, and its
-/// address space (held so the data frame outlives the task).
+/// One hand-built program, its address space, and the data page it
+/// reported through, as [`run`] copied it out.
 struct Program {
     process: Option<UserProcess>,
-    _space: Arc<AddressSpace>,
-    data: PhysAddr,
+    space: Arc<AddressSpace>,
+    results: Vec<u8>,
     pid: u64,
 }
 
@@ -112,47 +112,29 @@ fn build(code: &[u8], ia32: bool, inputs: &[(usize, &[u8])]) -> Result<Program, 
             ia32,
             segs: narf_userspace::UserSegments::default(),
         }),
-        _space: space,
-        data: data_phys,
+        space,
+        results: Vec::new(),
         pid: 0,
     })
 }
 
 impl Program {
-    fn u32_at(&self, off: usize) -> u32 {
-        // SAFETY: `data` is this program's data frame, kept alive by
-        // `_space`; `off + 4` is inside the page at every call site.
-        unsafe { core::ptr::read_volatile(self.data.kernel_ptr::<u8>().add(off).cast::<u32>()) }
-    }
-
-    fn u64_at(&self, off: usize) -> u64 {
-        // SAFETY: as `u32_at`.
-        unsafe { core::ptr::read_volatile(self.data.kernel_ptr::<u8>().add(off).cast::<u64>()) }
-    }
-
+    /// `N` result bytes at `off` of the data page; zeros past what [`run`]
+    /// copied out.
     fn bytes_at<const N: usize>(&self, off: usize) -> [u8; N] {
         let mut out = [0u8; N];
-        for (i, byte) in out.iter_mut().enumerate() {
-            // SAFETY: as `u32_at`; `off + N` is inside the page.
-            *byte = unsafe { core::ptr::read_volatile(self.data.kernel_ptr::<u8>().add(off + i)) };
+        if let Some(src) = self.results.get(off..off + N) {
+            out.copy_from_slice(src);
         }
         out
     }
 
-    /// Read results from the data page's frame as the run left it. A
-    /// program that forked shared the page copy-on-write, so its first store
-    /// afterwards may have moved it to a new frame; `_space` still maps it.
-    fn follow_data_page(&mut self) -> Result<(), &'static str> {
-        let region = self
-            ._space
-            .lookup(VirtAddr::new(DATA_VADDR))
-            .ok_or("the data page is no longer mapped")?;
-        let frame = region.backing_at(0);
-        if frame.as_u64() == 0 {
-            return Err("the data page lost its backing");
-        }
-        self.data = frame;
-        Ok(())
+    fn u32_at(&self, off: usize) -> u32 {
+        u32::from_le_bytes(self.bytes_at(off))
+    }
+
+    fn u64_at(&self, off: usize) -> u64 {
+        u64::from_le_bytes(self.bytes_at(off))
     }
 }
 
@@ -205,7 +187,14 @@ fn reset_cpu_segments() {
 
 /// Spawn every program as its own process on the boot CPU, run the
 /// executor until all of them exit (under a fast timer when `fast_timer`),
-/// and tear the harness state down again.
+/// copy each program's data page out, and tear the harness state down again.
+///
+/// The copy needs a user reference on each address space (Linux `mmget`,
+/// as `access_process_vm` takes one): once a program's last task is gone its
+/// mappings and frames go back (`mmput` → `exit_mmap`), and a program that
+/// forked may have moved its data page off the frame `build` planted, by a
+/// copy-on-write store. So the reference is taken before the run and the
+/// page is read through the mapping, then the reference is dropped.
 fn run(programs: &mut [Program], fast_timer: bool) -> Result<(), &'static str> {
     // SAFETY: privileged harness context; the root stays live throughout.
     let original_root = unsafe { narf_arch::x86_64::cr::read_cr3() };
@@ -245,22 +234,49 @@ fn run(programs: &mut [Program], fast_timer: bool) -> Result<(), &'static str> {
         ids.push(id);
         pending.push(task);
     }
+    let users;
     {
         let _timer = fast_timer.then(FastTimer::start);
         for task in pending {
             task.spawn();
         }
+        // Spawned tasks are users of their address spaces, so this cannot
+        // find one at zero; none has run yet.
+        users = programs
+            .iter()
+            .map(|program| program.space.mmget_not_zero())
+            .collect::<Vec<_>>();
         narf_scheduler::run_until_empty();
     }
     reset_cpu_segments();
 
     // SAFETY: restore the live harness root before user mappings go.
     unsafe { narf_arch::x86_64::cr::write_cr3(original_root) };
+    let held = users.iter().all(Option::is_some);
+    for program in programs.iter_mut() {
+        let frame = program
+            .space
+            .lookup(VirtAddr::new(DATA_VADDR))
+            .map(|region| region.backing_at(0))
+            .filter(|frame| frame.as_u64() != 0);
+        program.results = match frame {
+            // SAFETY: the data page's current backing frame, which the
+            // user reference in `users` keeps mapped and allocated; a whole
+            // page is readable through the kernel direct map.
+            Some(frame) => unsafe {
+                core::slice::from_raw_parts(frame.kernel_ptr::<u8>(), PAGE_BYTES as usize)
+            }
+            .to_vec(),
+            None => Vec::new(),
+        };
+    }
     let mut exited = true;
     for id in &ids {
         exited &= narf_userspace::task::task_has_exited(id.raw());
         narf_scheduler::__test_clear_published_address_space(*id);
     }
+    // The last user of each address space: its mappings go now.
+    drop(users);
     narf_scheduler::__reset_queues_for_test();
     for id in &ids {
         narf_userspace::task::release_task(id.raw());
@@ -274,8 +290,14 @@ fn run(programs: &mut [Program], fast_timer: bool) -> Result<(), &'static str> {
     if missing {
         return Err("a program was run twice");
     }
+    if !held {
+        return Err("a program's address space had no user once spawned");
+    }
     if !exited {
         return Err("a user program did not exit");
+    }
+    if programs.iter().any(|program| program.results.is_empty()) {
+        return Err("a program's data page was not mapped after the run");
     }
     Ok(())
 }
@@ -900,9 +922,6 @@ fn smoke_ia32_fork_child_resumes_compat_with_parent_tls() -> TestResult {
         if let Err(why) = run(&mut programs, false) {
             return TestResult::Fail(why);
         }
-        if let Err(why) = programs[0].follow_data_page() {
-            return TestResult::Fail(why);
-        }
         if let Err(why) = check_child_report(&programs[0], MAGIC_PARENT) {
             return TestResult::Fail(why);
         }
@@ -950,9 +969,6 @@ fn smoke_ia32_clone_settls_gives_the_child_its_own_gs_base() -> TestResult {
         Err(why) => return TestResult::Fail(why),
     };
     if let Err(why) = run(&mut programs, false) {
-        return TestResult::Fail(why);
-    }
-    if let Err(why) = programs[0].follow_data_page() {
         return TestResult::Fail(why);
     }
     match check_child_report(&programs[0], MAGIC_CHILD) {
@@ -1013,10 +1029,7 @@ fn smoke_ia32_read_parks_on_an_empty_pipe_until_the_child_writes() -> TestResult
     if let Err(why) = run(&mut programs, false) {
         return TestResult::Fail(why);
     }
-    let p = &mut programs[0];
-    if let Err(why) = p.follow_data_page() {
-        return TestResult::Fail(why);
-    }
+    let p = &programs[0];
     if p.u32_at(0) != 0 || p.u32_at(0x10) as i32 <= 0 {
         return TestResult::Fail("i386 pipe or fork failed");
     }

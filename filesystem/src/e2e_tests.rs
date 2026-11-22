@@ -613,12 +613,14 @@ fn smoke_e2e_efi_mount_visible_inside_installed_root() -> TestResult {
         .rev()
         .find(|(_, _, path, name, ..)| path == "/mnt" && name == "tmpfs")
         .map(|(id, ..)| *id);
+    // The ESP stand-in is an in-memory tree too, so mountinfo lists it as
+    // tmpfs, as Linux's `show_type` prints `s_type->name` and never a label.
+    // Its mount point is what names its row; `rooted_boot_is_fat` above has
+    // already shown that the mount there is the ESP.
     let rooted_boot_parent = rows
         .iter()
         .rev()
-        .find(|(_, _, path, name, ..)| {
-            path == INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT && name == "test-fat"
-        })
+        .find(|(_, _, path, ..)| path == INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT)
         .map(|(_, parent, ..)| *parent);
 
     if let Ok(handle) = root_handle {
