@@ -1349,15 +1349,12 @@ fn smoke_sysfs_block_class_auto_populate() -> TestResult {
             return TestResult::Fail("smoke-sysblk0 not in /sys/class/block/");
         }
 
-        // Check that the size attr is present.
-        let dev_dir = match block_dir.lookup_dir("smoke-sysblk0") {
-            Some(d) => d,
-            None => return TestResult::Fail("smoke-sysblk0 dir missing"),
-        };
-        let attr_entries = dev_dir.enumerate(0, 64);
-        let attr_names: Vec<String> = attr_entries.iter().map(|(n, _)| n.clone()).collect();
-        if !attr_names.iter().any(|n| n == "size") {
-            return TestResult::Fail("size attr missing on smoke-sysblk0");
+        let link = crate::sysfs::sysfs_root()
+            .get_child("class")
+            .and_then(|class| class.get_child("block"))
+            .and_then(|block| block.get_symlink("smoke-sysblk0"));
+        if link.as_deref() != Some("../../devices/virtual/block/smoke-sysblk0") {
+            return TestResult::Fail("class link does not lead to the canonical disk");
         }
         TestResult::Pass
     })();
@@ -1380,32 +1377,106 @@ fn smoke_sysfs_block_size_sectors_and_stacking_dirs() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
     let snap = narf_block::registry::__snapshot_for_test();
+    narf_block::registry::__reset_for_test();
     // 8 blocks of 4096 bytes = 32768 bytes = 64 sectors.
-    narf_block::registry::register_block_device("smoke-secblk0", FakeBlock::new(4096, 8));
+    narf_block::registry::register_block_device_with_identity(
+        "smoke-secblk0",
+        FakeBlock::new(4096, 8),
+        narf_block::DiskIdentity {
+            model: String::from("NVMe fixture"),
+            ..Default::default()
+        },
+    );
+    narf_block::registry::register_partition_device(
+        "smoke-secblk0p1",
+        "smoke-secblk0",
+        FakeBlock::new(4096, 2),
+        None,
+    );
     crate::sysfs::populate_block_class();
 
     let result = (|| -> TestResult {
         let root = crate::sysfs::sysfs_root();
-        let views = [
-            root.get_child("block"),
-            root.get_child("class").and_then(|c| c.get_child("block")),
-            root.get_child("devices")
-                .and_then(|d| d.get_child("virtual"))
-                .and_then(|v| v.get_child("block")),
-        ];
-        for view in views {
-            let Some(dev) = view.and_then(|v| v.get_child("smoke-secblk0")) else {
-                return TestResult::Fail("block device missing from a sysfs view");
-            };
-            if dev.attr_show("size").as_deref() != Some("64\n") {
-                return TestResult::Fail("block `size` is not in 512-byte sectors");
+        let Some(top) = root.get_child("block") else {
+            return TestResult::Fail("missing /sys/block");
+        };
+        if top.get_symlink("smoke-secblk0").as_deref()
+            != Some("../devices/virtual/block/smoke-secblk0")
+            || top.get_symlink("smoke-secblk0p1").is_some()
+            || top.get_child("smoke-secblk0p1").is_some()
+        {
+            return TestResult::Fail("/sys/block must link to the whole disk");
+        }
+        let Some(disk) = root
+            .get_child("devices")
+            .and_then(|d| d.get_child("virtual"))
+            .and_then(|v| v.get_child("block"))
+            .and_then(|b| b.get_child("smoke-secblk0"))
+        else {
+            return TestResult::Fail("canonical disk missing");
+        };
+        if disk
+            .get_child("device")
+            .and_then(|d| d.attr_show("model"))
+            .as_deref()
+            != Some("NVMe fixture\n")
+        {
+            return TestResult::Fail("NVMe model must be inside the device directory");
+        }
+        let Some(part) = disk.get_child("smoke-secblk0p1") else {
+            return TestResult::Fail("partition missing under disk");
+        };
+        if disk.attr_show("size").as_deref() != Some("64\n")
+            || part.attr_show("size").as_deref() != Some("16\n")
+            || part.attr_show("partition").as_deref() != Some("1\n")
+        {
+            return TestResult::Fail("wrong sector count or partition number");
+        }
+        if disk.get_child("holders").is_none()
+            || disk.get_child("slaves").is_none()
+            || part.get_child("holders").is_none()
+            || part.get_child("slaves").is_some()
+        {
+            return TestResult::Fail("wrong block stacking directories");
+        }
+        let dev_block = root
+            .get_child("dev")
+            .and_then(|d| d.get_child("block"))
+            .unwrap();
+        let class = root
+            .get_child("class")
+            .and_then(|c| c.get_child("block"))
+            .unwrap();
+        for (node, target) in [
+            (&disk, "../../devices/virtual/block/smoke-secblk0"),
+            (
+                &part,
+                "../../devices/virtual/block/smoke-secblk0/smoke-secblk0p1",
+            ),
+        ] {
+            let devno = node.attr_show("dev").unwrap_or_default();
+            if dev_block.get_symlink(devno.trim()).as_deref() != Some(target)
+                || class.get_symlink(node.name()).as_deref() != Some(target)
+            {
+                return TestResult::Fail("by-name and by-number views disagree");
             }
-            if dev.get_child("holders").is_none() {
-                return TestResult::Fail("block device has no holders/ directory");
+            if node.attr_names().iter().any(|name| name.contains('/'))
+                || node
+                    .get_child("queue")
+                    .and_then(|q| q.attr_show("scheduler"))
+                    .as_deref()
+                    != Some("none\n")
+            {
+                return TestResult::Fail("queue attributes must have valid directory entries");
             }
-            if dev.get_child("slaves").is_none() {
-                return TestResult::Fail("whole disk has no slaves/ directory");
-            }
+        }
+        let mut reader = UeventReader::new();
+        crate::sysfs::emit_block_device_add_events();
+        if !reader.drain(256).iter().any(|event| {
+            event.subsystem == "block"
+                && event.devpath == "/devices/virtual/block/smoke-secblk0/smoke-secblk0p1"
+        }) {
+            return TestResult::Fail("coldplug missed the nested partition");
         }
         TestResult::Pass
     })();

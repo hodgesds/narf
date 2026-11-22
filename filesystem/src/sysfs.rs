@@ -966,14 +966,6 @@ pub fn get_or_create_child(parent: &Arc<Kobject>, name: &str) -> Arc<Kobject> {
 
 // ── Auto-population ───────────────────────────────────────────────────
 
-/// Populate block-device sysfs views for every registered block device.
-///
-/// The canonical device kobject lives at `/sys/devices/virtual/block/<name>`.
-/// `/sys/class/block` and `/sys/block` are discovery views, whereas uevents
-/// must name the canonical `/sys/devices` path: systemd-udevd constructs an
-/// `sd_device` from `DEVPATH` and rejects class paths as non-device objects.
-/// Also registers under `/sys/block/<name>/` (flat view).
-/// Linux ref: `blk_register_queue` (block/blk-sysfs.c:852).
 /// Register `/sys/class/tty/tty0/active` — the attribute systemd-logind reads to
 /// learn the active VT on seat0.
 ///
@@ -1039,6 +1031,7 @@ pub fn console_active_sysfs() -> String {
     crate::console_tty::active_sysfs()
 }
 
+/// Publish canonical disk and partition kobjects and their Linux discovery links.
 pub fn populate_block_class() {
     use crate::devfs_block::BLOCK_EXT_MAJOR;
     let root = get_root();
@@ -1092,34 +1085,37 @@ pub fn populate_block_class() {
             })
             .unwrap_or_default();
 
-        // `/sys/class/block/<name>` remains a directory-shaped compatibility
-        // view for consumers which enumerate the class directly.  The actual
-        // device (and the ONLY kobject carrying `uevent`) is the canonical
-        // `/sys/devices/virtual/block/<name>` node below.
-        let class_kobj = class_device_register(class_block.clone(), name);
-        let kobj = get_or_create_child(&virtual_block, name);
-        // `size` is in 512-byte sectors whatever the logical block size:
-        // `part_size_show` prints `bdev_nr_sectors()`. lsblk, udisks and
-        // blkid multiply it by 512.
+        let disk = partition_parent(&dev);
+        let (parent, path) = match disk {
+            Some(disk) => (
+                get_or_create_child(&virtual_block, disk),
+                format!("{disk}/{name}"),
+            ),
+            None => (virtual_block.clone(), name.to_string()),
+        };
+        let kobj = get_or_create_child(&parent, name);
+        let target = format!("../../devices/virtual/block/{path}");
+        if disk.is_none() {
+            sys_block.add_symlink(name, format!("../devices/virtual/block/{name}"));
+        }
+        class_block.add_symlink(name, target.clone());
+        dev_block.add_symlink(format!("{BLOCK_EXT_MAJOR}:{minor}"), target);
+
+        // Linux reports size in 512-byte sectors for every logical block size.
         let sectors = capacity.saturating_mul(u64::from(lba_size)) / 512;
-        let flat = get_or_create_child(&sys_block, name);
-        for node in [&class_kobj, &kobj, &flat] {
-            let stats = dev.stats.clone();
-            kobject_add_attr(node, "stat", move || {
-                crate::procfs::aggregate::disk_stat_line(&stats, is_partition)
-            });
-            if let Some(partno) = dev.partno {
-                kobject_add_attr(node, "partition", move || format!("{partno}\n"));
-            }
+        let stats = dev.stats.clone();
+        kobject_add_attr(&kobj, "stat", move || {
+            crate::procfs::aggregate::disk_stat_line(&stats, is_partition)
+        });
+        if let Some(partno) = dev.partno {
+            kobject_add_attr(&kobj, "partition", move || format!("{partno}\n"));
         }
-        for node in [&class_kobj, &kobj] {
-            kobject_add_attr(node, "size", move || format!("{sectors}\n"));
-            add_block_stacking_dirs(node, is_partition);
-            kobject_add_attr(node, "removable", || "0\n".to_string());
-            kobject_add_attr(node, "queue/scheduler", || "none\n".to_string());
-            let dev_str = format!("{}:{}\n", BLOCK_EXT_MAJOR, minor);
-            kobject_add_attr(node, "dev", move || dev_str.clone());
-        }
+        kobject_add_attr(&kobj, "size", move || format!("{sectors}\n"));
+        add_block_stacking_dirs(&kobj, is_partition);
+        kobject_add_attr(&kobj, "removable", || "0\n".to_string());
+        let queue = get_or_create_child(&kobj, "queue");
+        kobject_add_attr(&queue, "scheduler", || "none\n".to_string());
+        kobject_add_attr(&kobj, "dev", move || format!("{BLOCK_EXT_MAJOR}:{minor}\n"));
         // `dev` (<major>:<minor>) + writable `uevent` (MAJOR/MINOR/DEVNAME)
         // are what `udevadm info` and the coldplug walker read to synthesise
         // an ADD carrying the block dev_t; without them udev can't create
@@ -1133,31 +1129,29 @@ pub fn populate_block_class() {
                 BLOCK_EXT_MAJOR, minor, name, devtype, fs_identity
             ),
         );
-        kobj.add_symlink("subsystem", "../../../../class/block");
-        // `/sys/dev/block/<major>:<minor>` points to the canonical device,
-        // as libudev's by-devnum lookup realpaths this link before opening
-        // `uevent` / `dev`.
-        dev_block.add_symlink(
-            format!("{}:{}", BLOCK_EXT_MAJOR, minor),
-            format!("../../devices/virtual/block/{}", name),
+        kobj.add_symlink(
+            "subsystem",
+            if disk.is_some() {
+                "../../../../../class/block"
+            } else {
+                "../../../../class/block"
+            },
         );
-
-        // /sys/block/<name>/ — flat view
-        kobject_add_attr(&flat, "size", move || format!("{sectors}\n"));
-        add_block_stacking_dirs(&flat, is_partition);
-        kobject_add_attr(&flat, "removable", || "0\n".to_string());
-
         // Hardware identity of a whole disk (NVMe namespace): the
         // attributes Linux `nvme_ns_id_attrs` exposes on the gendisk
         // (`wwid`, `nsid`, `eui`, `nguid`, `uuid`) and the controller's
         // `model` / `serial` / `firmware_rev` under `device/`. These — not
         // the enumeration-order name — identify the disk.
         if let (None, Some(id)) = (dev.parent, dev.identity.as_ref()) {
-            for node in [&kobj, &flat] {
-                add_identity_attrs(node, id);
-            }
+            add_identity_attrs(&kobj, id);
         }
     }
+}
+
+/// Only numbered partitions share their parent's gendisk directory. Stacked
+/// devices can also carry a registry parent while owning a separate gendisk.
+fn partition_parent(dev: &narf_block::registry::RegisteredBlockDevice) -> Option<&'static str> {
+    dev.partno.and(dev.parent)
 }
 
 /// The stacking directories of a block device. `holders/` lists the devices
@@ -1198,13 +1192,14 @@ fn add_identity_attrs(node: &Arc<Kobject>, id: &Arc<narf_block::DiskIdentity>) {
         kobject_add_attr(node, "uuid", move || v.clone());
     }
     for (attr, value) in [
-        ("device/model", &id.model),
-        ("device/serial", &id.serial),
-        ("device/firmware_rev", &id.firmware),
+        ("model", &id.model),
+        ("serial", &id.serial),
+        ("firmware_rev", &id.firmware),
     ] {
         if !value.is_empty() {
             let v = format!("{value}\n");
-            kobject_add_attr(node, attr, move || v.clone());
+            let device = get_or_create_child(node, "device");
+            kobject_add_attr(&device, attr, move || v.clone());
         }
     }
 }
@@ -1351,7 +1346,11 @@ pub fn emit_block_device_add_events() -> usize {
     };
     let mut count = 0;
     for entry in narf_block::block_devices() {
-        if let Some(kobj) = virtual_block.get_child(entry.name) {
+        let parent = match partition_parent(&entry) {
+            Some(disk) => virtual_block.get_child(disk),
+            None => Some(virtual_block.clone()),
+        };
+        if let Some(kobj) = parent.and_then(|p| p.get_child(entry.name)) {
             kobject_emit_uevent(&kobj, UeventAction::Add);
             count += 1;
         }
