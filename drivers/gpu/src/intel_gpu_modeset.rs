@@ -404,6 +404,14 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// — carries the real flag; `modeset_display_for_chip`
     /// re-asserts it from `ChipInfo` for the panel path.
     tgl_uy: bool,
+    /// The built-in eDP panel's VBT bits — HOBL and low-vswing
+    /// (`intel_gpu_gen12_combo_phy::VbtEdpSignal`), installed
+    /// by probe and read by `modeset_display_family` (the
+    /// `tgl_uy` precedent). Default false (the DP tables)
+    /// everywhere else, including the external-DP path, which
+    /// never drives the panel.
+    edp_hobl: bool,
+    edp_low_vswing: bool,
     tc_width: u8,
 }
 
@@ -434,6 +442,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             dbuf_share: None,
             gen12_family: mmio.gen12_display_family(),
             tgl_uy: mmio.tgl_uy(),
+            edp_hobl: false,
+            edp_low_vswing: false,
             tc_width: 4,
         }
     }
@@ -444,6 +454,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     pub(crate) fn set_tgl_uy(&mut self, uy: bool) {
         self.tgl_uy = uy;
+    }
+
+    pub(crate) fn set_edp_hobl(&mut self, hobl: bool) {
+        self.edp_hobl = hobl;
+    }
+
+    pub(crate) fn set_edp_low_vswing(&mut self, low_vswing: bool) {
+        self.edp_low_vswing = low_vswing;
     }
 
     pub(crate) fn set_typec_width(&mut self, width: u8) {
@@ -694,6 +712,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             self.ddi,
             self.gen12_family,
             self.tgl_uy,
+            false,
+            false,
             false,
         )?;
         phy.set_hdmi_default_levels(self.mmio, mode.pixel_clock_khz)?;
@@ -1457,13 +1477,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             // drive per-iteration level updates through the same
             // `TrainingAux` callback shape the Type-C branch
             // uses. DDI A is the eDP panel port on Gen12
-            // laptops; VBT HOBL/low-vswing are not plumbed into
-            // the modeset yet (see `intel_gpu_gen12_combo_phy`).
+            // laptops, and the panel's VBT HOBL/low-vswing bits
+            // ride on the modeset (set by
+            // `modeset_display_family` from the probe-installed
+            // facts) into the table selection.
             let phy = crate::intel_gpu_gen12_combo_phy::ComboPhy::new(
                 self.ddi,
                 self.gen12_family,
                 self.tgl_uy,
                 self.ddi == Ddi::A,
+                self.edp_hobl,
+                self.edp_low_vswing,
             )?;
             phy.prepare(
                 self.mmio,
@@ -2135,6 +2159,13 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
                 ms.set_gen12_family(family);
             }
             ms.set_tgl_uy(tgl_uy);
+            // The built-in panel's VBT HOBL / low-vswing bits,
+            // installed by probe (`intel_gpu_vbt::install_for_probe`);
+            // without a VBT both stay clear and the DP tables are
+            // selected.
+            let edp_signal = crate::intel_gpu_gen12_combo_phy::installed_edp_signal();
+            ms.set_edp_hobl(edp_signal.hobl());
+            ms.set_edp_low_vswing(edp_signal.low_vswing());
             match mode {
                 Some(mode) => ms.modeset_fixed(fb, mode),
                 None => ms.modeset(fb, None),
