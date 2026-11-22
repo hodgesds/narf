@@ -333,6 +333,18 @@ pub unsafe fn reload_selector_users(modified: u16, &[u64; 3]);
   COW are attempted by the synchronous fault handler, while an invalid or
   concurrently unmapped target reaches the probe fixup and terminates only the
   receiving task.
+- **x86_64 IA-32 segments (§3.1).** Every CPU's `IA32_CSTAR` names the
+  -ENOSYS `sysretl` stub before user code can run there, so a compat-mode
+  `syscall` never jumps to an unprogrammed CSTAR at CPL 0. The kernel loads
+  a user DS/ES/FS/GS selector only after `selector_loadable` accepts it
+  against the slots this CPU now holds (otherwise null), so no switch, exec
+  or `set_thread_area` path takes a #GP/#NP at CPL 0. GS is loaded only
+  inside `swapgs` … `swapgs` with interrupts masked, and the user GS base is
+  rewritten from the task's saved value afterwards. TLS descriptors are
+  built only by `fill_ldt` from requests `tls_desc_okay` accepts: DPL 3,
+  32-bit, data, present, never L — no 16-bit stack segment (no espfix
+  leak), no call-gate or system descriptor.
+- `int 0x80` serves user tasks only; a kernel-mode `int 0x80` panics.
 - **x86_64 trap entry clears the live direction flag before executing any
   compiler-generated code.** CPL3 may be interrupted between `std` and `cld`;
   the CPU-pushed RFLAGS retains that user state for `iretq`, while the kernel
