@@ -3487,6 +3487,9 @@ pub fn populate_rtc_class() {
     kobject_emit_uevent(&rtc0, crate::uevent::UeventAction::Add);
 }
 
+/// `/sys/class/dmi/id` and `/sys/firmware/dmi/tables` for `table`.
+pub fn publish_dmi(_table: &narf_firmware_smbios::RawTable) {}
+
 /// A boot-time projection into the shared kobject registry. Providers must
 /// tolerate refresh after devices probe; mounting sysfs only attaches a view
 /// and never invokes these callbacks or recreates device state.

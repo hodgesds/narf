@@ -30,6 +30,7 @@ narf-crypto       = { path = "../crypto" }
 narf-interrupts   = { path = "../interrupts" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-efi          = { path = "../efi" }
+narf-firmware-smbios = { path = "../firmware/smbios" }
 narf-rcu          = { path = "../rcu" }
 narf-observability = { path = "../observability" }
 async-trait       = "0.1"
