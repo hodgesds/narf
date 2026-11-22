@@ -59,7 +59,9 @@
 //!   `CNL_HWS_CSB_WRITE_INDEX`).
 //!
 //! The CSB depth is twelve (MIT intel_lrc_reg.h). The 48-page image
-//! allocation bounds the 14-page Gen12 render image. These model-checked
+//! allocation bounds the 14-page render image shared by Gen11 and
+//! Gen12 (`intel_engine_context_size`). The Gen11 template itself
+//! differs — see [`build_reg_state_for_generation`]. These model-checked
 //! encodings do not establish full GT setup, safe userspace execution,
 //! silicon cache completion or hardware reset; the userspace gate in
 //! intel_gpu_render remains closed until those owners exist.
@@ -434,6 +436,46 @@ pub const CTX_BB_PER_CTX_PTR: usize = 0x12;
 pub const CTX_RCS_INDIRECT_CTX: usize = 0x14;
 /// `CTX_RCS_INDIRECT_CTX_OFFSET` pair index.
 pub const CTX_RCS_INDIRECT_CTX_OFFSET: usize = 0x16;
+/// Gen11 `CTX_BB_PER_CTX_PTR` pair index. The Gen11 first
+/// group carries the second-level batch registers Gen12 drops,
+/// so the workaround-batch pair sits six dwords later than on
+/// Gen12 (MIT `intel_lrc.c` `gen11_rcs_offsets` /
+/// `gen9_xcs_offsets`).
+pub const GEN11_CTX_BB_PER_CTX_PTR: usize = 0x18;
+/// Gen11 `CTX_RCS_INDIRECT_CTX` pair index.
+pub const GEN11_CTX_RCS_INDIRECT_CTX: usize = 0x1A;
+/// Gen11 `CTX_RCS_INDIRECT_CTX_OFFSET` pair index.
+pub const GEN11_CTX_RCS_INDIRECT_CTX_OFFSET: usize = 0x1C;
+/// Gen11 render context restore terminator (the template ends
+/// after the `R_PWR_CLK_STATE` pair — there is no 51-register
+/// extended group on Gen11).
+pub const GEN11_CTX_RCS_END: usize = 0x44;
+/// Gen11 non-render context restore terminator (the template
+/// ends after the 44-register group).
+pub const GEN11_CTX_XCS_END: usize = 0xAA;
+/// `RING_INDIRECT_CTX_OFFSET` default for Gen11 (MIT
+/// `intel_lrc_reg.h` `GEN11_CTX_RCS_INDIRECT_CTX_OFFSET_DEFAULT`).
+pub const GEN11_INDIRECT_CTX_OFFSET_DEFAULT: u32 = 0x1A;
+/// `RING_INDIRECT_CTX_OFFSET` default for Gen12 (MIT
+/// `intel_lrc_reg.h` `GEN12_CTX_RCS_INDIRECT_CTX_OFFSET_DEFAULT`).
+pub const GEN12_INDIRECT_CTX_OFFSET_DEFAULT: u32 = 0x0D;
+
+/// The `RING_INDIRECT_CTX_OFFSET` default for `generation`:
+/// the value Linux programs (`<< 6`, per
+/// `intel_lrc.c::lrc_setup_indirect_ctx`) when an indirect
+/// context exists. Only the Gen11 template programs it today
+/// (the task's per-generation dispatch); Gen12 keeps its
+/// existing zero template value. Either way the value is inert
+/// until an indirect batch exists — Linux programs it only
+/// alongside one (`lrc_init_wa_ctx` returns early for graphics
+/// 11, and the per-context WA page is Gen12+ only) — and the
+/// pointer slot stays zero on both generations.
+pub const fn indirect_ctx_offset_default(generation: crate::intel_gpu::Generation) -> u32 {
+    match generation {
+        crate::intel_gpu::Generation::IceLake => GEN11_INDIRECT_CTX_OFFSET_DEFAULT,
+        _ => GEN12_INDIRECT_CTX_OFFSET_DEFAULT,
+    }
+}
 /// `CTX_LRI_HEADER_1` dword index.
 pub const CTX_LRI_HEADER_1: usize = 0x21;
 /// `CTX_CTX_TIMESTAMP` pair index.
@@ -483,11 +525,36 @@ pub const fn ring_ctl_value(ring_bytes: u32) -> u32 {
 /// structural difference is the extended render groups:
 /// `R_PWR_CLK_STATE` and the extended register state exist only in
 /// render-class templates. XCS terminates after the PDP group.
+/// This is the Gen12 form; [`build_reg_state_for_generation`]
+/// selects the Gen11 layout for `Generation::IceLake`.
 pub fn build_reg_state_for(
     spec: &EngineSpec,
     ring_ggtt: u32,
     ring_bytes: u32,
 ) -> [u32; REG_STATE_DWORDS] {
+    build_reg_state_for_generation(
+        spec,
+        ring_ggtt,
+        ring_bytes,
+        crate::intel_gpu::Generation::TigerLake,
+    )
+}
+
+/// Build the register-state template for a fresh context on
+/// the engine `spec` names for the generation `generation`.
+/// Gen11 (`Generation::IceLake`) takes the Gen11 layout
+/// ([`build_gen11_reg_state`]); every other generation keeps
+/// the existing Gen12-shaped template (the MTL+ tables are
+/// their own Linux tables and out of scope here).
+pub fn build_reg_state_for_generation(
+    spec: &EngineSpec,
+    ring_ggtt: u32,
+    ring_bytes: u32,
+    generation: crate::intel_gpu::Generation,
+) -> [u32; REG_STATE_DWORDS] {
+    if matches!(generation, crate::intel_gpu::Generation::IceLake) {
+        return build_gen11_reg_state(spec, ring_ggtt, ring_bytes);
+    }
     let b = spec.base;
     let mut r = [0u32; REG_STATE_DWORDS];
     // Source-cited Gen12 layout (MIT intel_lrc.c gen12_{r,x}cs_offsets).
@@ -534,6 +601,94 @@ pub fn build_reg_state_for(
         r[0x52 + i * 2] = b as u32 + offset;
     }
     r[CTX_END] = MI_BATCH_BUFFER_END | 1;
+    r
+}
+
+/// Gen11 register-state template (MIT `intel_lrc.c`:
+/// `gen11_rcs_offsets` for render, `gen9_xcs_offsets` for
+/// everything else — Gen11 has no own XCS table; `reg_offsets`
+/// falls back to the Gen9 one for non-RCS engines on Gen9–11).
+///
+/// Deltas from the Gen12 template, transcribed from those
+/// tables rather than re-derived:
+/// - The first group is 15 (RCS) / 14 (XCS) pairs and carries
+///   the second-level batch registers (`RING_SBBADDR_UDW` 0x11c,
+///   `RING_SBBADDR` 0x114, `RING_SBBSTATE` 0x118) Gen12 drops,
+///   with no `0x2b4` tail register; XCS also omits the trailing
+///   `0x180`. The SBB registers shift the workaround-batch and
+///   indirect-context pairs to the `GEN11_CTX_*` indices.
+/// - The third group is a single `0x1b0` pair on RCS. XCS has
+///   no third group and instead carries the `0x200` pair at
+///   0x42, then the 44-register group at 0x51 — the Gen12
+///   extended list without the six `0x588` repeats and the
+///   trailing `0x84`.
+/// - There is no 51-register extended group on RCS: the render
+///   template ends after the `R_PWR_CLK_STATE` pair at
+///   `GEN11_CTX_RCS_END` (0x44).
+/// - The indirect-context offset value is Gen11's 0x1a,
+///   programmed `<< 6` per `lrc_setup_indirect_ctx`.
+fn build_gen11_reg_state(
+    spec: &EngineSpec,
+    ring_ggtt: u32,
+    ring_bytes: u32,
+) -> [u32; REG_STATE_DWORDS] {
+    let b = spec.base;
+    let mut r = [0u32; REG_STATE_DWORDS];
+    const RELATIVE: u32 = 1 << 19;
+    let first: &[u32] = if spec.has_pwr_clk_state() {
+        &[
+            0x244, 0x34, 0x30, 0x38, 0x3c, 0x168, 0x140, 0x110, 0x11c, 0x114, 0x118, 0x1c0, 0x1c4,
+            0x1c8, 0x180,
+        ]
+    } else {
+        &[
+            0x244, 0x34, 0x30, 0x38, 0x3c, 0x168, 0x140, 0x110, 0x11c, 0x114, 0x118, 0x1c0, 0x1c4,
+            0x1c8,
+        ]
+    };
+    r[CTX_LRI_HEADER_0] = mi_load_register_imm(first.len() as u32, true) | RELATIVE;
+    for (i, offset) in first.iter().enumerate() {
+        r[2 + i * 2] = b as u32 + offset;
+    }
+    r[CTX_CONTEXT_CONTROL + 1] = CTX_CONTROL_VALUE;
+    r[CTX_RING_BUFFER_START + 1] = ring_ggtt;
+    r[CTX_RING_BUFFER_CONTROL + 1] = ring_ctl_value(ring_bytes);
+    r[CTX_LRI_HEADER_1] = mi_load_register_imm(9, true) | RELATIVE;
+    r[CTX_CTX_TIMESTAMP] = (b + 0x3a8) as u32;
+    for i in 0..4u32 {
+        let at = CTX_PDP3_UDW + i as usize * 4;
+        r[at] = ring_pdp_udw_at(b, 3 - i) as u32;
+        r[at + 2] = ring_pdp_ldw_at(b, 3 - i) as u32;
+    }
+    if !spec.has_pwr_clk_state() {
+        r[0x41] = mi_load_register_imm(1, true) | RELATIVE;
+        r[0x42] = b as u32 + 0x200;
+        // Transcribed from `gen9_xcs_offsets`: the Gen12
+        // extended list without the six 0x588 repeats and the
+        // trailing 0x84.
+        const XCS44: [u32; 44] = [
+            0x28, 0x9c, 0xc0, 0x178, 0x17c, 0x358, 0x170, 0x150, 0x154, 0x158, 0x41c, 0x600, 0x604,
+            0x608, 0x60c, 0x610, 0x614, 0x618, 0x61c, 0x620, 0x624, 0x628, 0x62c, 0x630, 0x634,
+            0x638, 0x63c, 0x640, 0x644, 0x648, 0x64c, 0x650, 0x654, 0x658, 0x65c, 0x660, 0x664,
+            0x668, 0x66c, 0x670, 0x674, 0x678, 0x67c, 0x68,
+        ];
+        r[0x51] = mi_load_register_imm(44, true) | RELATIVE;
+        for (i, offset) in XCS44.iter().enumerate() {
+            r[0x52 + i * 2] = b as u32 + offset;
+        }
+        r[GEN11_CTX_XCS_END] = MI_BATCH_BUFFER_END | 1;
+        return r;
+    }
+    // RCS only: the indirect-context offset default, programmed
+    // in the value slot of the shifted offset pair (see
+    // `GEN11_CTX_RCS_INDIRECT_CTX_OFFSET`). The pointer slot
+    // stays zero — Gen11 has no indirect-context batch.
+    r[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET + 1] = GEN11_INDIRECT_CTX_OFFSET_DEFAULT << 6;
+    r[0x34] = mi_load_register_imm(1, true) | RELATIVE;
+    r[0x35] = b as u32 + 0x1b0;
+    r[CTX_LRI_HEADER_2] = mi_load_register_imm(1, false) | RELATIVE;
+    r[CTX_R_PWR_CLK_STATE] = R_PWR_CLK_STATE as u32;
+    r[GEN11_CTX_RCS_END] = MI_BATCH_BUFFER_END | 1;
     r
 }
 
@@ -1592,6 +1747,20 @@ pub const RING_BYTES: u32 = RING_PAGES * 4096;
 /// Pages allocated per context image. An allocation *bound*
 /// above the Gen12 RCS hardware image size (see module docs).
 pub const RCS_IMAGE_PAGES: u32 = 48;
+/// Hardware render context image size in pages, shared by
+/// Gen11 and Gen12 (MIT `intel_engine_cs.c`:
+/// `intel_engine_context_size` returns
+/// `GEN11_LR_CONTEXT_RENDER_SIZE` — 14 pages — for graphics
+/// 11 and 12 alike). The 48-page allocation above bounds it
+/// on both generations; no per-generation bound is needed.
+pub const RENDER_IMAGE_PAGES: u32 = 14;
+/// Hardware non-render (video decode / enhancement / copy /
+/// other) context image size in pages, shared by every Gen8+
+/// generation (MIT `intel_engine_cs.c`:
+/// `GEN8_LR_CONTEXT_OTHER_SIZE` — 2 pages). The media
+/// allocation bound (`MEDIA_IMAGE_PAGES` = 4) covers it.
+pub const OTHER_IMAGE_PAGES: u32 = 2;
+const _: () = assert!(RCS_IMAGE_PAGES >= RENDER_IMAGE_PAGES);
 /// Maximum simultaneous contexts on the engine.
 pub const MAX_CONTEXTS: usize = 64;
 /// Maximum requests waiting for a free execlist port.
@@ -1797,6 +1966,10 @@ pub struct ResidentSubmission {
 /// against a modelled GPU.
 pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
     spec: EngineSpec,
+    /// Generation selecting the context-image template
+    /// ([`build_reg_state_for_generation`]): Gen11 takes its
+    /// own layout, everything else the Gen12-shaped one.
+    generation: crate::intel_gpu::Generation,
     mmio: M,
     alloc: A,
     status: A::Backing,
@@ -1832,16 +2005,41 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         Self::with_spec(RCS0_SPEC, mmio, alloc)
     }
 
+    /// Bring up the RCS0 engine for the generation
+    /// `generation` (Gen11 takes its own context-image
+    /// template; see [`build_reg_state_for_generation`]).
+    pub fn new_for_generation(
+        generation: crate::intel_gpu::Generation,
+        mmio: M,
+        alloc: A,
+    ) -> Result<Self, SubmitError> {
+        Self::with_spec_for_generation(RCS0_SPEC, generation, mmio, alloc)
+    }
+
     /// Bring up the engine `spec` names: allocate the engine
     /// status page and program that engine's `RING_HWS_PGA`,
     /// then adopt the hardware's current CSB write pointer so
     /// no stale entry is replayed.
-    pub fn with_spec(spec: EngineSpec, mmio: M, mut alloc: A) -> Result<Self, SubmitError> {
+    pub fn with_spec(spec: EngineSpec, mmio: M, alloc: A) -> Result<Self, SubmitError> {
+        Self::with_spec_for_generation(spec, crate::intel_gpu::Generation::TigerLake, mmio, alloc)
+    }
+
+    /// Bring up the engine `spec` names for the generation
+    /// `generation`: allocate the engine status page and program
+    /// that engine's `RING_HWS_PGA`, then adopt the hardware's
+    /// current CSB write pointer so no stale entry is replayed.
+    pub fn with_spec_for_generation(
+        spec: EngineSpec,
+        generation: crate::intel_gpu::Generation,
+        mmio: M,
+        mut alloc: A,
+    ) -> Result<Self, SubmitError> {
         let status = alloc.alloc(1)?;
         mmio.write32(spec.hws_pga(), status.ggtt_offset());
         let head = ((status.read32(CSB_WRITE_BYTE) & 0xFF) as u8) % CSB_ENTRIES;
         Ok(Self {
             spec,
+            generation,
             mmio,
             alloc,
             status,
@@ -1942,7 +2140,12 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 return Err(e);
             }
         };
-        let template = build_reg_state_for(&self.spec, ring_mem.ggtt_offset(), RING_BYTES);
+        let template = build_reg_state_for_generation(
+            &self.spec,
+            ring_mem.ggtt_offset(),
+            RING_BYTES,
+            self.generation,
+        );
         for (i, dw) in template.iter().enumerate() {
             image.write32(REG_STATE_PAGE_BYTE + (i as u64) * 4, *dw);
         }
@@ -2720,7 +2923,9 @@ pub(crate) fn legacy_submission_lease(
     crate::intel_gpu::with_controller(|gpu| {
         if !matches!(
             gpu.chip_info().generation,
-            crate::intel_gpu::Generation::TigerLake | crate::intel_gpu::Generation::AlderLake
+            crate::intel_gpu::Generation::TigerLake
+                | crate::intel_gpu::Generation::AlderLake
+                | crate::intel_gpu::Generation::IceLake
         ) {
             return Err(SubmitError::NoEngine);
         }
@@ -2738,7 +2943,12 @@ fn attach_default(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result
             return None;
         }
         let arena = production_arena(gpu.gtt_mmadr);
-        let engine = RcsEngine::new(BarWindow::new(gpu.gtt_mmadr), arena).ok()?;
+        let engine = RcsEngine::new_for_generation(
+            gpu.chip_info().generation,
+            BarWindow::new(gpu.gtt_mmadr),
+            arena,
+        )
+        .ok()?;
         Some((engine, BarWindow::new(gpu.gtt_mmadr)))
     })
     .flatten()
@@ -2753,7 +2963,7 @@ fn attach_default(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result
 }
 
 /// Submit raw batch dwords on the default context of the
-/// probed Gen12 controller, attaching the RCS0 engine on first
+/// probed Gen12/Gen11 controller, attaching the RCS0 engine on first
 /// use. Returns the engine-wide request id; completion is
 /// observed through [`poll_default_completions`].
 /// A pending, failed or stopped GuC owner still excludes this legacy path.
@@ -3193,6 +3403,20 @@ pub mod tests {
         Ok((engine, hw))
     }
 
+    fn make_engine_for_generation(
+        generation: crate::intel_gpu::Generation,
+    ) -> Result<(RcsEngine<FakeRegs, FakeArena>, FakeHw), TestResult> {
+        let regs = FakeRegs::new();
+        let registry = Rc::new(RefCell::new(BTreeMap::new()));
+        let arena = FakeArena::new(registry.clone());
+        let engine = match RcsEngine::new_for_generation(generation, regs.clone(), arena) {
+            Ok(e) => e,
+            Err(_) => return Err(TestResult::Fail("engine init")),
+        };
+        let hw = FakeHw::new(regs, registry, engine.status_ggtt());
+        Ok((engine, hw))
+    }
+
     // ── Codec fixtures ──────────────────────────────────────
 
     fn smoke_render_cache_barrier() -> TestResult {
@@ -3584,6 +3808,219 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_reg_state_template);
+
+    fn smoke_gen11_reg_state_template() -> TestResult {
+        // MIT intel_lrc.c `gen11_rcs_offsets`: 15-pair first group
+        // with the second-level batch registers, a single-pair
+        // third group, no 51-register extended group, terminator
+        // at 0x44.
+        let r = build_reg_state_for_generation(
+            &RCS0_SPEC,
+            0x1004_0000,
+            RING_BYTES,
+            crate::intel_gpu::Generation::IceLake,
+        );
+        if r[0] != MI_NOOP || r[CTX_LRI_HEADER_0] != 0x1108_101d {
+            return TestResult::Fail("Gen11 group 0 header");
+        }
+        if r[CTX_CONTEXT_CONTROL] != RING_CONTEXT_CONTROL as u32
+            || r[CTX_CONTEXT_CONTROL + 1] != CTX_CONTROL_VALUE
+        {
+            return TestResult::Fail("Gen11 context control pair");
+        }
+        if r[CTX_RING_TAIL] != RING_TAIL as u32 || r[CTX_RING_TAIL + 1] != 0 {
+            return TestResult::Fail("Gen11 ring tail pair");
+        }
+        if r[CTX_RING_BUFFER_START] != RING_START as u32
+            || r[CTX_RING_BUFFER_START + 1] != 0x1004_0000
+        {
+            return TestResult::Fail("Gen11 ring start pair");
+        }
+        if r[CTX_RING_BUFFER_CONTROL + 1] != 0x1_f001 {
+            return TestResult::Fail("Gen11 ring ctl value");
+        }
+        // Second-level batch registers Gen12 drops, in template order.
+        if r[0x12] != 0x211c || r[0x13] != 0 {
+            return TestResult::Fail("Gen11 SBBADDR_UDW pair");
+        }
+        if r[0x14] != 0x2114 || r[0x15] != 0 {
+            return TestResult::Fail("Gen11 SBBADDR pair");
+        }
+        if r[0x16] != 0x2118 || r[0x17] != 0 {
+            return TestResult::Fail("Gen11 SBBSTATE pair");
+        }
+        // The workaround-batch and indirect-context pairs sit
+        // six dwords later than on Gen12.
+        if r[GEN11_CTX_BB_PER_CTX_PTR] != RING_BB_PER_CTX_PTR as u32
+            || r[GEN11_CTX_BB_PER_CTX_PTR + 1] != 0
+        {
+            return TestResult::Fail("Gen11 BB per-ctx pair");
+        }
+        if r[GEN11_CTX_RCS_INDIRECT_CTX] != RING_INDIRECT_CTX as u32
+            || r[GEN11_CTX_RCS_INDIRECT_CTX + 1] != 0
+        {
+            return TestResult::Fail("Gen11 indirect ctx pair");
+        }
+        if r[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET] != RING_INDIRECT_CTX_OFFSET as u32
+            || r[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET + 1] != 0x1a << 6
+        {
+            return TestResult::Fail("Gen11 indirect ctx offset value");
+        }
+        // No Gen12 0x2b4 tail register: the last first-group
+        // pair is 0x180.
+        if r[0x1e] != 0x2180 || r[0x1f] != 0 {
+            return TestResult::Fail("Gen11 first group tail");
+        }
+        if r[CTX_LRI_HEADER_1] != 0x1108_1011 {
+            return TestResult::Fail("Gen11 group 1 header");
+        }
+        if r[CTX_PDP3_UDW] != ring_pdp_udw(3) as u32 || r[CTX_PDP3_UDW + 1] != 0 {
+            return TestResult::Fail("Gen11 PDP3 pair");
+        }
+        // Third group: a single 0x1b0 pair; the Gen12 0x5a8 /
+        // 0x5ac pairs and the 51-register group are absent.
+        if r[0x34] != 0x1108_1001 || r[0x35] != 0x21b0 || r[0x36] != 0 {
+            return TestResult::Fail("Gen11 third group");
+        }
+        if r[0x37] != 0 || r[0x39] != 0 || r[0x51] != 0 {
+            return TestResult::Fail("Gen11 must not carry Gen12 extended groups");
+        }
+        if r[CTX_LRI_HEADER_2] != 0x1108_0001 || r[CTX_R_PWR_CLK_STATE] != R_PWR_CLK_STATE as u32 {
+            return TestResult::Fail("Gen11 group 2 (RCS power clock state)");
+        }
+        if r[GEN11_CTX_RCS_END] != MI_BATCH_BUFFER_END | 1 {
+            return TestResult::Fail("Gen11 template terminator");
+        }
+        if r[GEN11_CTX_RCS_END + 1] != 0 || r[CTX_END] != 0 {
+            return TestResult::Fail("Gen11 template must end at 0x44");
+        }
+        // The Gen12 template is byte-identical through the
+        // refactor.
+        if build_reg_state(0x1004_0000, RING_BYTES)
+            != build_reg_state_for_generation(
+                &RCS0_SPEC,
+                0x1004_0000,
+                RING_BYTES,
+                crate::intel_gpu::Generation::TigerLake,
+            )
+        {
+            return TestResult::Fail("Gen12 template drifted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen11_reg_state_template);
+
+    fn smoke_gen11_reg_state_xcs() -> TestResult {
+        // MIT intel_lrc.c `gen9_xcs_offsets` (the Gen11 XCS
+        // table): 14-pair first group, the 0x200 pair at 0x42,
+        // the 44-register group at 0x51, terminator at 0xaa.
+        let t = build_reg_state_for_generation(
+            &crate::intel_gpu_media::VECS0_SPEC,
+            0x1000_5000,
+            RING_BYTES,
+            crate::intel_gpu::Generation::IceLake,
+        );
+        if t[CTX_LRI_HEADER_0] != 0x1108_101b {
+            return TestResult::Fail("Gen11 XCS group 0 header");
+        }
+        if t[CTX_CONTEXT_CONTROL] != 0x1C_8244 {
+            return TestResult::Fail("Gen11 XCS context control address");
+        }
+        if t[0x12] != 0x1C_811C || t[0x14] != 0x1C_8114 || t[0x16] != 0x1C_8118 {
+            return TestResult::Fail("Gen11 XCS second-level batch pairs");
+        }
+        if t[GEN11_CTX_BB_PER_CTX_PTR] != 0x1C_81C0
+            || t[GEN11_CTX_RCS_INDIRECT_CTX] != 0x1C_81C4
+            || t[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET] != 0x1C_81C8
+            || t[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET + 1] != 0
+        {
+            return TestResult::Fail("Gen11 XCS indirect ctx pairs");
+        }
+        // No trailing 0x180 in the XCS first group: 0x1e is a NOP.
+        if t[0x1e] != 0 {
+            return TestResult::Fail("Gen11 XCS first group tail");
+        }
+        if t[CTX_LRI_HEADER_1] != 0x1108_1011 || t[CTX_PDP3_UDW] != 0x1C_828C {
+            return TestResult::Fail("Gen11 XCS PDP group");
+        }
+        // No Gen12 XCS terminator at 0x34: that slot is a NOP.
+        if t[CTX_XCS_END] != 0 {
+            return TestResult::Fail("Gen11 XCS must not end at 0x34");
+        }
+        if t[0x41] != 0x1108_1001 || t[0x42] != 0x1C_8200 || t[0x43] != 0 {
+            return TestResult::Fail("Gen11 XCS 0x200 pair");
+        }
+        if t[0x51] != 0x1108_1057 || t[0x52] != 0x1C_8028 || t[0xA8] != 0x1C_8068 {
+            return TestResult::Fail("Gen11 XCS 44-register group");
+        }
+        // No render group: header 2 and the R_PWR_CLK_STATE
+        // pair stay zero, terminator intact.
+        if t[CTX_LRI_HEADER_2] != 0
+            || t[CTX_R_PWR_CLK_STATE] != 0
+            || t[CTX_R_PWR_CLK_STATE + 1] != 0
+        {
+            return TestResult::Fail("Gen11 XCS template carries render group");
+        }
+        if t[GEN11_CTX_XCS_END] != MI_BATCH_BUFFER_END | 1 {
+            return TestResult::Fail("Gen11 XCS template terminator");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen11_reg_state_xcs);
+
+    fn smoke_gen11_context_image_bound() -> TestResult {
+        // MIT intel_engine_cs.c `intel_engine_context_size`:
+        // Gen11 and Gen12 render images are both
+        // GEN11_LR_CONTEXT_RENDER_SIZE (14 pages); non-render
+        // images are GEN8_LR_CONTEXT_OTHER_SIZE (2 pages) on
+        // every Gen8+ generation. The CSB depth is
+        // GEN11_CSB_ENTRIES (12) from graphics 11 on.
+        if RENDER_IMAGE_PAGES != 14 || RCS_IMAGE_PAGES < RENDER_IMAGE_PAGES {
+            return TestResult::Fail("Gen11 render image bound");
+        }
+        if OTHER_IMAGE_PAGES != 2 {
+            return TestResult::Fail("Gen11 non-render image bound");
+        }
+        if CSB_ENTRIES != 12 {
+            return TestResult::Fail("Gen11 CSB depth");
+        }
+        // MIT intel_lrc_reg.h: Gen11 0x1a, Gen12 0xd.
+        if indirect_ctx_offset_default(crate::intel_gpu::Generation::IceLake) != 0x1a
+            || indirect_ctx_offset_default(crate::intel_gpu::Generation::TigerLake) != 0x0d
+            || indirect_ctx_offset_default(crate::intel_gpu::Generation::AlderLake) != 0x0d
+        {
+            return TestResult::Fail("indirect ctx offset defaults");
+        }
+        // Gen12 keeps its existing (zero) template value.
+        let gen12 = build_reg_state(0x1004_0000, RING_BYTES);
+        if gen12[CTX_RCS_INDIRECT_CTX_OFFSET + 1] != 0 {
+            return TestResult::Fail("Gen12 indirect ctx offset value changed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen11_context_image_bound);
+
+    fn smoke_gen11_batch_executes_on_rcs() -> TestResult {
+        let (mut engine, mut hw) =
+            make_engine_for_generation(crate::intel_gpu::Generation::IceLake).unwrap();
+        let ctx = engine.create_context().unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        let request = engine.submit(ctx, batch).unwrap();
+        hw.step();
+        let done = engine.poll_completions();
+        if done.len() != 1 || done[0].request != request || !engine.is_idle() {
+            return TestResult::Fail("Gen11 batch did not execute to completion on RCS");
+        }
+        // SAFETY: the model has completed and no peer runs afterwards.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_gen11_batch_executes_on_rcs
+    );
 
     fn smoke_csb_parse() -> TestResult {
         if csb_step(&csb_promote(3), false) != CsbStep::Promote {

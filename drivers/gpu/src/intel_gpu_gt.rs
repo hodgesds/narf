@@ -85,6 +85,16 @@ impl GraphicsIp {
                 step: 0,
             });
         }
+        if platform.is_gen11() {
+            // Pre-GMD, like Gen12: ICL/EHL/JSL are graphics 11
+            // (`i915_pci.c` GEN11_FEATURES carries GEN(11)), so
+            // there is no GMD_ID to sample and the version is the
+            // generation itself (11.00) with no step.
+            return Ok(Self {
+                version: 1100,
+                step: 0,
+            });
+        }
         let a = mmio.read32(0xd8c);
         let b = mmio.read32(0xd8c);
         if a == u32::MAX || b == u32::MAX {
@@ -294,6 +304,11 @@ impl GtPlatform {
 
     pub const fn is_gen12(self) -> bool {
         matches!(self, Self::Gen12(_))
+    }
+
+    /// Pre-GMD Gen11 (Ice Lake / Elkhart Lake / Jasper Lake).
+    pub const fn is_gen11(self) -> bool {
+        matches!(self, Self::Gen11(_))
     }
 
     /// Shared Xe-HPG 12.55 mechanics. ATS-M remains a distinct policy
@@ -754,6 +769,11 @@ mod tests {
                 || platform.is_gen12()
                 || platform.is_headless_integrated()
                 || platform.ppgtt_root_level() != 3
+                || GraphicsIp::read(&NoMmio, platform)
+                    != Ok(GraphicsIp {
+                        version: 1100,
+                        step: 0,
+                    })
             {
                 return TestResult::Fail("Gen11 GT profile");
             }

@@ -1065,6 +1065,12 @@ pub mod tests {
         if GEN12_MEDIA_ENGINES.iter().any(|s| s.image_pages != 4) {
             return TestResult::Fail("media image bound");
         }
+        // The 4-page media allocation bounds the 2-page
+        // non-render hardware image shared by Gen11 and Gen12
+        // (MIT intel_engine_cs.c GEN8_LR_CONTEXT_OTHER_SIZE).
+        if MEDIA_IMAGE_PAGES < crate::intel_gpu_rcs::OTHER_IMAGE_PAGES {
+            return TestResult::Fail("media image below hardware bound");
+        }
         if media_engines_for(RegionGeneration::Gen12).len() != 3 {
             return TestResult::Fail("inventory for Gen12");
         }
