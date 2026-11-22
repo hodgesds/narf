@@ -2873,6 +2873,14 @@ user_desc` at `tls` through `compat32::tls::clone_settls` — an explicit
 slot, no allocation — and fails the clone with its EINVAL/EFAULT before any
 child state is built; from a 64-bit call `tls` stays the FS base.
 
+**Events and nodes.** epoll_create (254), epoll_create1 (329), epoll_ctl
+(255), epoll_wait (256), epoll_pwait (319), epoll_pwait2 (441), eventfd
+(323), eventfd2 (328), mknod (14) and mknodat (297) pass through with their
+`int` arguments sign-extended: `struct epoll_event` is packed on x86, and
+epoll_pwait2's compat entry takes the 64-bit `__kernel_timespec`. (An
+S_IFIFO node is created as NARF creates every non-directory node, as a
+regular file.)
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

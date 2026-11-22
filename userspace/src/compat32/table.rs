@@ -36,6 +36,7 @@ pub mod nr {
     pub const UNLINK: u32 = 10;
     pub const EXECVE: u32 = 11;
     pub const CHDIR: u32 = 12;
+    pub const MKNOD: u32 = 14;
     pub const LSEEK: u32 = 19;
     pub const GETPID: u32 = 20;
     pub const GETUID: u32 = 24;
@@ -91,16 +92,24 @@ pub mod nr {
     pub const FUTEX: u32 = 240;
     pub const SCHED_GETAFFINITY: u32 = 242;
     pub const EXIT_GROUP: u32 = 252;
+    pub const EPOLL_CREATE: u32 = 254;
+    pub const EPOLL_CTL: u32 = 255;
+    pub const EPOLL_WAIT: u32 = 256;
     pub const SET_TID_ADDRESS: u32 = 258;
     pub const CLOCK_GETTIME: u32 = 265;
     pub const TGKILL: u32 = 270;
     pub const OPENAT: u32 = 295;
     pub const MKDIRAT: u32 = 296;
+    pub const MKNODAT: u32 = 297;
     pub const FSTATAT64: u32 = 300;
     pub const UNLINKAT: u32 = 301;
     pub const READLINKAT: u32 = 305;
     pub const FACCESSAT: u32 = 307;
     pub const SET_ROBUST_LIST: u32 = 311;
+    pub const EPOLL_PWAIT: u32 = 319;
+    pub const EVENTFD: u32 = 323;
+    pub const EVENTFD2: u32 = 328;
+    pub const EPOLL_CREATE1: u32 = 329;
     pub const DUP3: u32 = 330;
     pub const PIPE2: u32 = 331;
     pub const PRLIMIT64: u32 = 340;
@@ -110,9 +119,10 @@ pub mod nr {
     pub const ARCH_PRCTL: u32 = 384;
     pub const RSEQ: u32 = 386;
     pub const CLOCK_GETTIME64: u32 = 403;
-    pub const CLONE3: u32 = 435;
     pub const FUTEX_TIME64: u32 = 422;
+    pub const CLONE3: u32 = 435;
     pub const FACCESSAT2: u32 = 439;
+    pub const EPOLL_PWAIT2: u32 = 441;
 }
 
 /// i386 `exit`.
@@ -269,6 +279,21 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
         // `__kernel_timespec`.
         CLOCK_GETTIME => forward_abi(ctx, Syscall::ClockGetTime, 0b1, TIME32),
         CLOCK_GETTIME64 => forward_sx(ctx, Syscall::ClockGetTime, 0b1),
+        // fs/eventpoll.c, fs/eventfd.c: native entries (`struct epoll_event`
+        // is packed on x86, so both ABIs share its 12-byte layout; the
+        // epoll_pwait sigmask is a `sigset_t` either way; epoll_pwait2's
+        // `compat_sys_epoll_pwait2` takes the 64-bit `__kernel_timespec`).
+        EPOLL_CREATE => forward_sx(ctx, Syscall::EpollCreateLegacy, 0b1),
+        EPOLL_CREATE1 => forward_sx(ctx, Syscall::EpollCreate, 0b1),
+        EPOLL_CTL => forward_sx(ctx, Syscall::EpollCtl, 0b111),
+        EPOLL_WAIT => forward_sx(ctx, Syscall::EpollWait, 0b1101),
+        EPOLL_PWAIT => forward_sx(ctx, Syscall::EpollPwait, 0b1101),
+        EPOLL_PWAIT2 => forward_sx(ctx, Syscall::EpollPwait2, 0b101),
+        EVENTFD => forward(ctx, Syscall::EventfdLegacy),
+        EVENTFD2 => forward_sx(ctx, Syscall::Eventfd, 0b10),
+        // fs/namei.c
+        MKNOD => forward(ctx, Syscall::Mknod),
+        MKNODAT => forward_sx(ctx, Syscall::Mknodat, 0b1),
         _ => {
             ctx.set_return(SyscallReturn::not_implemented());
             None
