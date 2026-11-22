@@ -134,13 +134,29 @@ exactly for eight-channel non-PCM (refused on a port without HBR
 capability), the converter's DIG1/DIG2 from the IEC958 state, then the
 stream format and tag. Non-PCM sets the TYPE bit in both the converter and
 the controller's SDnFMT (`snd_hdac_spdif_stream_format`). Playback offers
-stereo, 4, 6 and 8 channels up to the smallest channel ceiling among attached
-sinks, S32_LE only while every attached sink advertises 20/24-bit LPCM, and
-the 44.1–192 kHz rates every attached sink's SADs share
-(`snd_hdmi_eld_update_pcm_info`; 48 kHz if they share none, no 32 kHz); with
-no sink the converter's own limits apply. Analog codecs stay at 48 kHz.
+stereo, 4, 6 and 8 channels up to the PCM's sink's channel ceiling, S32_LE
+only while that sink advertises 20/24-bit LPCM, and the 44.1–192 kHz rates
+its SADs carry (`snd_hdmi_eld_update_pcm_info`; 48 kHz if none, no 32 kHz);
+with no sink the converter's own limits apply. Queried with no PCM named
+(`PcmDevice::capabilities` with nothing open) the limits intersect every
+attached sink. Analog codecs stay at 48 kHz.
 
-GPU codecs expose Linux's digital-output controls for the one playback PCM:
+The PCM layout is Linux patch_hdmi's with atihdmi's `static_pcm_mapping`:
+one playback PCM per HDMI pin (`min(num_cvts, num_pins)`, pin i on PCM i) at
+the device numbers `get_empty_pcm_device` gives HDMI PCMs (3, 7, 8, 9, then
+10, 11, ...), after an analog PCM at device 0 when the controller also has
+analog outputs (`PcmDevice::pcm_devices`); a controller without HDMI pins
+keeps its one PCM at device 0. An HDMI PCM streams to its own pin's
+converter and detaches the others; one playback stream runs at a time. Each
+HDMI PCM has its own "HDMI/DP,pcm=N Jack" (CARD interface,
+`generic_hdmi_build_jack`), "ELD" (PCM interface at device N,
+`hdmi_create_eld_ctl`), IEC958 set (MIXER interface at the PCM's index,
+`snd_hda_create_dig_out_ctls`) and "Playback Channel Map" (PCM interface at
+device N), placed in the ALSA id space through `PcmDevice::control_wire`.
+An HDMI-only codec has no Master controls.
+
+GPU codecs expose Linux's digital-output controls per HDMI PCM, over one
+shared IEC958 state (only one stream plays at a time):
 `IEC958 Playback Con Mask`/`Pro Mask` (read-only), `IEC958 Playback Default`
 (`convert_from_spdif_status` into DIG1/DIG2 on every port's converter;
 setting AES0 non-audio selects IEC 61937 passthrough at the next prepare) and
@@ -159,14 +175,14 @@ reports; mirrored ports may differ in speaker allocation and CA. The ATI codec h
 does from the speaker allocation, sink info (revision 3+), audio descriptor
 and A/V delay verbs, and parses it as `snd_parse_eld`. Pin sense (presence
 and ELD-valid) is polled every 100 ms with the other jacks; the ELD is
-re-read only when the sense changes or the last read was unusable. A playback
-PCM routes to every port whose monitor has a valid ELD (mirroring, since a
-native card has one playback PCM), detaching the converters of the others; with
-none it routes to every port as Linux's static PCM mapping keeps pins
-attached. A port that gains a valid ELD while a stream is configured is set
-up again, as Linux update_eld does. The card exposes "HDMI/DP,pcm=0 Jack"
-(CARD interface) and "ELD" (PCM interface, volatile read-only bytes) and
-notifies subscribers when either changes. The display side (DCN Azalia
+re-read only when the sense changes or the last read was unusable. A stream
+opened outside a PCM (no device named) routes to every port whose monitor
+has a valid ELD, detaching the converters of the others, or to every port
+with none. The open PCM's port that gains a valid ELD while a stream is
+configured is set up again, as Linux update_eld does. Each PCM's jack and
+ELD (volatile read-only bytes) notify subscribers when they change; the
+display overlay (`display_sink`) reports through the primary port's PCM.
+The display side (DCN Azalia
 endpoint, ACR, AFMT) is programmed by the amdgpu modeset.
 
 `hda::probe`, `register_pci_driver`, `controller`, `capture_card`,

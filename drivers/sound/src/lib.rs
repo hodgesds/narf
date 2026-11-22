@@ -670,6 +670,23 @@ pub use crate::format::{ChannelCount, SampleRate};
 
 /// Query constraints without claiming or reprogramming an endpoint.
 pub fn pcm_capabilities(card: u32, capture: bool) -> Result<hardware::PcmCapabilities, SoundError> {
+    pcm_capabilities_of(card, None, capture)
+}
+
+/// [`pcm_capabilities`] of one PCM device.
+pub fn pcm_device_capabilities(
+    card: u32,
+    device: u32,
+    capture: bool,
+) -> Result<hardware::PcmCapabilities, SoundError> {
+    pcm_capabilities_of(card, Some(device), capture)
+}
+
+fn pcm_capabilities_of(
+    card: u32,
+    device: Option<u32>,
+    capture: bool,
+) -> Result<hardware::PcmCapabilities, SoundError> {
     let hardware = CARD_REGISTRY
         .lock()
         .iter()
@@ -678,7 +695,10 @@ pub fn pcm_capabilities(card: u32, capture: bool) -> Result<hardware::PcmCapabil
         .hardware
         .clone();
     if let Some(hardware) = hardware {
-        return Ok(hardware.capabilities(capture));
+        return Ok(match device {
+            Some(device) => hardware.device_capabilities(capture, device),
+            None => hardware.capabilities(capture),
+        });
     }
     Ok(hardware::PcmCapabilities {
         formats: alloc::vec![

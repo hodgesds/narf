@@ -95,7 +95,10 @@ procfs directories, PCM_NEXT_DEVICE, PCM_INFO and the PCM open use, with
 playback devices 8..15 on minors 2..9 and capture devices 8..13 on
 minors 10..15 of the card block. `PcmDevice::control_wire` gives a control its own ALSA device,
 index and name (Linux's per-PCM jack, ELD, IEC958 set and channel map);
-ELEM_LIST reports and name lookups resolve those ids. `PcmDevice` gains three defaulted
+ELEM_LIST reports and name lookups resolve those ids. `PcmDevice::device_capabilities`
+(default: `capabilities`) answers HW_REFINE and HW_PARAMS for the PCM device
+the file opened (`pcm_device_capabilities`), so each HDMI PCM follows its own
+sink. `PcmDevice` gains three defaulted
 hooks: `long_name` (`card->longname`: the second `cards` line and control
 CARD_INFO `longname`), `mixer_name` (CARD_INFO `mixername`) and `codec_proc`
 (one `codec#A` body per codec address, rendered by the codec driver; a card

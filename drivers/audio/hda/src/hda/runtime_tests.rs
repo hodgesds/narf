@@ -931,7 +931,7 @@ fn native_hda_ati_hdmi_port_streams_stereo_like_atihdmi() -> TestResult {
         return TestResult::Fail("HDMI port discovery");
     }
     let card = super::super::stream::Card(dev.clone());
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     let first = fixture.model.verbs.len();
@@ -1080,7 +1080,7 @@ fn native_hda_hdmi_sink_drives_eld_routing_and_surround() -> TestResult {
         return TestResult::Fail("HDMI jack and ELD controls");
     }
     // No monitor yet: the converter's own limits.
-    let Ok(playback) = card.open(false, 0) else {
+    let Ok(playback) = card.open(false, 3) else {
         return TestResult::Fail("open without a sink");
     };
     if card.get_control(jack) != Ok(ControlValue::boolean(false))
@@ -1091,7 +1091,7 @@ fn native_hda_hdmi_sink_drives_eld_routing_and_surround() -> TestResult {
     }
     drop(playback);
     fixture.model.sink = true;
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open with a sink");
     };
     if card.get_control(jack) != Ok(ControlValue::boolean(true))
@@ -1555,7 +1555,7 @@ fn native_hda_hdmi_passthrough_and_channel_map() -> TestResult {
     {
         return TestResult::Fail("channel map without a stream");
     }
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     if card.capabilities(false).rates
@@ -1766,9 +1766,10 @@ fn native_hda_navi22_binds_ab28_and_routes_the_dcn30_endpoint() -> TestResult {
     if dev.routed_outputs() != [2] {
         return TestResult::Fail("routing to the live port");
     }
-    // Playback goes to converter 6 only.
+    // Endpoint 2 is PCM 2 at device 8 (static PCM mapping); its playback
+    // goes to converter 6 only.
     let card = super::super::stream::Card(dev.clone());
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 8) else {
         return TestResult::Fail("open");
     };
     let first = fixture.model.verbs.len();
@@ -3343,7 +3344,7 @@ fn native_hda_pm_open_wakes_a_parked_controller() -> TestResult {
     let sense = make_verb(0, 3, 0xf09 << 8);
     for cycle in 0..2 {
         let base = fixture.model.verbs.len();
-        let Ok(mut playback) = card.open(false, 0) else {
+        let Ok(mut playback) = card.open(false, 3) else {
             return TestResult::Fail(if cycle == 0 {
                 "first open"
             } else {
@@ -3570,7 +3571,7 @@ fn native_hda_position_wraps_follow_the_stream_rate() -> TestResult {
     };
     let dev = fixture.controller.as_ref().unwrap().clone();
     let card = super::super::stream::Card(dev.clone());
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     let mut params = super::super::stream::default_params();
@@ -3660,7 +3661,7 @@ fn native_hda_pm_stop_and_close_keep_the_controller_up() -> TestResult {
     };
     let dev = fixture.controller.as_ref().unwrap().clone();
     let card = super::super::stream::Card(dev.clone());
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     let start = |playback: &mut Box<dyn narf_drivers_sound::hardware::PcmHardware>| {
@@ -3707,7 +3708,7 @@ fn native_hda_pm_autosuspend_parks_after_the_delay() -> TestResult {
     let dev = fixture.controller.as_ref().unwrap().clone();
     dev.autosuspend_ms.store(30, Ordering::Release);
     let card = super::super::stream::Card(dev.clone());
-    let Ok(playback) = card.open(false, 0) else {
+    let Ok(playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     if dev.autosuspend() != Autosuspend::Held {
@@ -3721,7 +3722,7 @@ fn native_hda_pm_autosuspend_parks_after_the_delay() -> TestResult {
     if dev.autosuspend() != Autosuspend::Parked || !dev.suspended.load(Ordering::Acquire) {
         return TestResult::Fail("the controller parks once the delay has passed");
     }
-    if card.open(false, 0).is_err() || dev.suspended.load(Ordering::Acquire) {
+    if card.open(false, 3).is_err() || dev.suspended.load(Ordering::Acquire) {
         return TestResult::Fail("the next open wakes the controller");
     }
     TestResult::Pass
@@ -3745,7 +3746,7 @@ fn native_hda_running_stream_survives_a_lost_command() -> TestResult {
     };
     let dev = fixture.controller.as_ref().unwrap().clone();
     let card = super::super::stream::Card(dev.clone());
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     if playback
@@ -3935,7 +3936,7 @@ fn native_hda_pm_codec_suspend_cleans_up_converters() -> TestResult {
     };
     let dev = fixture.controller.as_ref().unwrap().clone();
     let card = super::super::stream::Card(dev.clone());
-    let Ok(mut playback) = card.open(false, 0) else {
+    let Ok(mut playback) = card.open(false, 3) else {
         return TestResult::Fail("open");
     };
     if playback

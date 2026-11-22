@@ -158,7 +158,7 @@ impl IntelHda {
         // Route to the HDMI/DP ports a monitor is on; detach the others'
         // converters so a port that lost its sink stops taking the stream.
         self.refresh_hdmi(false)?;
-        let routed = self.routed_outputs();
+        let routed = self.pcm_outputs();
         for (index, path) in self.outputs.iter().enumerate() {
             if routed.contains(&index) {
                 self.configure_path(path, index, false, params)?;
@@ -560,21 +560,29 @@ impl IntelHda {
             return Vec::new();
         }
         let mut controls = Vec::new();
-        if self.outputs.iter().all(|path| {
-            self.graphs[path.codec]
-                .widget(path.nodes.converter_nid)
-                .and_then(|w| w.out_amp)
-                .is_some()
-        }) {
+        // An HDMI-only codec has no Master controls (Linux patch_hdmi
+        // creates none); the analog outputs carry them.
+        let analog = self.analog_outputs();
+        if !analog.is_empty()
+            && analog.iter().all(|&output| {
+                let path = &self.outputs[output];
+                self.graphs[path.codec]
+                    .widget(path.nodes.converter_nid)
+                    .and_then(|w| w.out_amp)
+                    .is_some()
+            })
+        {
             controls.push(ControlId {
                 index: 0,
                 kind: ControlKind::MasterVolume,
             });
         }
-        controls.push(ControlId {
-            index: 1,
-            kind: ControlKind::MasterMute,
-        });
+        if !analog.is_empty() {
+            controls.push(ControlId {
+                index: 1,
+                kind: ControlKind::MasterMute,
+            });
+        }
         if self.outputs.iter().any(|path| {
             self.graphs[path.codec]
                 .widget(path.nodes.pin_nid)
@@ -647,23 +655,20 @@ impl IntelHda {
                 });
             }
         }
-        if !self.hdmi.lock().is_empty() {
-            controls.push(ControlId {
-                index: 3,
-                kind: ControlKind::HdmiJack,
-            });
-            controls.push(ControlId {
-                index: 4,
-                kind: ControlKind::Eld,
-            });
-            for (index, kind) in [
-                (5, ControlKind::Iec958ConMask),
-                (6, ControlKind::Iec958ProMask),
-                (7, ControlKind::Iec958Default),
-                (8, ControlKind::Iec958Switch),
-                (9, ControlKind::ChannelMap),
+        // Per HDMI PCM (Linux snd_hda_hdmi_generic_build_controls): jack,
+        // ELD, the IEC958 set and the channel map.
+        let ports = self.hdmi.lock().len();
+        for pcm in 0..ports {
+            for kind in [
+                ControlKind::HdmiJack,
+                ControlKind::Eld,
+                ControlKind::Iec958ConMask,
+                ControlKind::Iec958ProMask,
+                ControlKind::Iec958Default,
+                ControlKind::Iec958Switch,
+                ControlKind::ChannelMap,
             ] {
-                controls.push(ControlId { index, kind });
+                controls.push(super::hdmi::hdmi_pcm_control(pcm, kind));
             }
         }
         controls
@@ -832,8 +837,12 @@ impl IntelHda {
                 }
                 Ok(ControlValue::boolean(present))
             }
-            ControlKind::HdmiJack => Ok(ControlValue::boolean(self.hdmi_jack().0)),
-            ControlKind::Eld => Ok(ControlValue::bytes(&self.hdmi_jack().1)),
+            ControlKind::HdmiJack => Ok(ControlValue::boolean(
+                self.hdmi_port_jack(super::hdmi::hdmi_pcm_of(id.index)).0,
+            )),
+            ControlKind::Eld => Ok(ControlValue::bytes(
+                &self.hdmi_port_jack(super::hdmi::hdmi_pcm_of(id.index)).1,
+            )),
             ControlKind::Iec958ConMask => Ok(ControlValue::iec958(&super::hdmi::CON_MASK)),
             ControlKind::Iec958ProMask => Ok(ControlValue::iec958(&super::hdmi::PRO_MASK)),
             ControlKind::Iec958Default => Ok(ControlValue::iec958(

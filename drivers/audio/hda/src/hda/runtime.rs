@@ -129,6 +129,9 @@ pub struct IntelHda {
     /// Linux `codec->cvt_setups` with a stream assigned: the converters a
     /// configure gave a stream tag and format, cleared at codec suspend.
     cvt_setups: IrqSafeSpinLock<Vec<(u8, u8)>>,
+    /// What the open playback PCM drives (`pcm_layout`), `None` while no
+    /// playback PCM is open.
+    pub(super) active_pcm: IrqSafeSpinLock<Option<super::hdmi::PcmSlot>>,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -419,6 +422,7 @@ impl IntelHda {
             runtime_pm: AtomicBool::new(true),
             codecs_suspended: AtomicBool::new(false),
             cvt_setups: IrqSafeSpinLock::new(Vec::new()),
+            active_pcm: IrqSafeSpinLock::new(None),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -2420,7 +2424,13 @@ fn register_controller(device: &BusDevice, dev: IntelHda) -> Result<(), narf_bus
         driver: "HDA-Intel",
         id: super::card_id(short_name),
         name: short_name,
-        playback_count: u32::from(!dev.outputs.is_empty()),
+        // One playback PCM per HDMI pin besides the analog one (Linux
+        // patch_hdmi; see `pcm_layout`).
+        playback_count: if dev.outputs.is_empty() {
+            0
+        } else {
+            dev.pcm_layout().len() as u32
+        },
         capture_count: u32::from(dev.input.lock().is_some()),
     };
     let card = narf_drivers_sound::register_hardware_card_at(

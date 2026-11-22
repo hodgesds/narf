@@ -67,6 +67,11 @@ pub trait PcmDevice: Send + Sync + core::fmt::Debug {
     fn capabilities(&self, capture: bool) -> PcmCapabilities {
         PcmCapabilities::fixed(self.default_params(capture))
     }
+    /// [`Self::capabilities`] of one PCM device, for a backend whose PCMs
+    /// differ (Linux HDA: each HDMI PCM follows its own pin's ELD).
+    fn device_capabilities(&self, capture: bool, _device: u32) -> PcmCapabilities {
+        self.capabilities(capture)
+    }
     fn controls(&self) -> alloc::vec::Vec<crate::mixer::ControlId> {
         alloc::vec::Vec::new()
     }

@@ -1042,8 +1042,8 @@ impl Pcm {
                     if nr == 0x11 && r.data.as_ref().is_some_and(|p| Arc::strong_count(p) > 1) {
                         return Err(FsError::BadFileState);
                     }
-                    let caps =
-                        crate::pcm_capabilities(self.card, self.capture).map_err(sound_error)?;
+                    let caps = crate::pcm_device_capabilities(self.card, self.device, self.capture)
+                        .map_err(sound_error)?;
                     let refined = params::refine(&mut b, &caps, nr == 0x11);
                     if nr == 0x11 {
                         r.stop()?;

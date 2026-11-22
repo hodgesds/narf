@@ -327,9 +327,15 @@ impl FileOps for SoundControlFile {
         let card_index = self.card_index;
         Box::pin(async move {
             if offset == HW_PARAMS_MAGIC_OFFSET {
-                // hw_params setsockopt path — applies to playback device 0.
+                // hw_params setsockopt path — applies to the first playback
+                // device (0 unless the backend numbers its PCMs).
                 let params = decode_hw_params(buf).ok_or(FsError::InvalidPath)?;
-                let mut stream = open_playback(card_index, 0).map_err(|_| FsError::Busy)?;
+                let device = crate::list_cards()
+                    .iter()
+                    .find(|c| c.index == card_index)
+                    .and_then(|c| crate::pcm_devices(c, false).first().copied())
+                    .unwrap_or(0);
+                let mut stream = open_playback(card_index, device).map_err(|_| FsError::Busy)?;
                 stream.hw_params(params).map_err(|_| FsError::InvalidPath)?;
                 return Ok(buf.len());
             }
