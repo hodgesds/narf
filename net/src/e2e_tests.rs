@@ -2975,22 +2975,6 @@ fn smoke_udp_bound_device_routes_and_resolves_on_that_device() -> TestResult {
         B_TX.lock().push(frame.to_vec());
         Ok(())
     }
-    fn default_via(iface: &str, gateway: [u8; 4], metric: u32) {
-        route::route_add(route::Route {
-            net_ns_id: 0,
-            dst: route::Ipv4Net {
-                addr: Ipv4Addr([0; 4]),
-                prefix_len: 0,
-            },
-            gateway: Some(Ipv4Addr(gateway)),
-            iface: alloc::string::String::from(iface),
-            src_hint: None,
-            metric,
-            scope: route::Scope::Universe,
-            table: route::TABLE_MAIN,
-            protocol: route::RTPROT_KERNEL,
-        });
-    }
     let is_arp =
         |f: &Vec<u8>| f.len() >= ETH_HDR_LEN + 28 && f[12..14] == ETHERTYPE_ARP.to_be_bytes();
     let is_udp = |f: &Vec<u8>| {
@@ -3479,6 +3463,25 @@ fn smoke_somaxconn_clamps_listen_backlog() -> TestResult {
 }
 kernel_test_in!("net/e2e", smoke_somaxconn_clamps_listen_backlog);
 
+/// `ip route add default via <gateway> dev <iface> metric <metric>`, as
+/// NetworkManager installs one per connected device.
+fn default_via(iface: &str, gateway: [u8; 4], metric: u32) {
+    route::route_add(route::Route {
+        net_ns_id: 0,
+        dst: route::Ipv4Net {
+            addr: Ipv4Addr([0; 4]),
+            prefix_len: 0,
+        },
+        gateway: Some(Ipv4Addr(gateway)),
+        iface: alloc::string::String::from(iface),
+        src_hint: None,
+        metric,
+        scope: route::Scope::Universe,
+        table: route::TABLE_MAIN,
+        protocol: route::RTPROT_KERNEL,
+    });
+}
+
 /// Reverse-path filtering as `fib_validate_source` applies it: the device's
 /// mode is the larger of `conf.all.rp_filter` and its own; strict (1) drops
 /// a packet whose best route back to its source leaves through another
@@ -3499,22 +3502,6 @@ fn smoke_rp_filter_strict_and_loose_follow_linux() -> TestResult {
     const NEIGHBOUR: [u8; 4] = [10, 34, 1, 50];
     fn sink(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
-    }
-    fn default_via(iface: &str, gateway: [u8; 4], metric: u32) {
-        route::route_add(route::Route {
-            net_ns_id: 0,
-            dst: route::Ipv4Net {
-                addr: Ipv4Addr([0; 4]),
-                prefix_len: 0,
-            },
-            gateway: Some(Ipv4Addr(gateway)),
-            iface: alloc::string::String::from(iface),
-            src_hint: None,
-            metric,
-            scope: route::Scope::Universe,
-            table: route::TABLE_MAIN,
-            protocol: route::RTPROT_KERNEL,
-        });
     }
     // One datagram from `src` to B's address, arriving on B.
     fn delivered(src: [u8; 4], port: u16) -> bool {
@@ -3611,6 +3598,13 @@ fn smoke_tcp_bound_device_matches_only_its_own_arrivals() -> TestResult {
     iface::set_link_state(B, true);
     iface::set_iface_ipv4_fields(B, B_IP, B_GW);
     iface::add_addr(B, B_IP, 22);
+    // The host's routes: each device has a default route, the wired one
+    // preferred. With SO_BINDTODEVICE only B's routes count (`flowi4_oif`);
+    // without B's default route `ip_route_output_key_hash_rcu` takes the
+    // destination as on-link and the SYN waits on its ARP. A's default
+    // route carries the RST answering the SYN-ACK that arrives on A.
+    default_via(A, A_GW, 100);
+    default_via(B, B_GW, 600);
     arp_cache::insert(B, B_GW, GW_MAC);
     let Some(b_index) = iface::ifindex_of(B) else {
         return TestResult::Fail("second test device has no ifindex");
