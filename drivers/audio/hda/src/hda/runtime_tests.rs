@@ -3714,9 +3714,7 @@ fn native_hda_pm_autosuspend_parks_after_the_delay() -> TestResult {
         return TestResult::Fail("an open PCM holds the controller up");
     }
     drop(playback);
-    if !matches!(dev.autosuspend(), Autosuspend::Wait(_))
-        || dev.suspended.load(Ordering::Acquire)
-    {
+    if !matches!(dev.autosuspend(), Autosuspend::Wait(_)) || dev.suspended.load(Ordering::Acquire) {
         return TestResult::Fail("the delay starts at the close");
     }
     super::wait(|| false, 40);
