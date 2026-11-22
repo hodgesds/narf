@@ -3059,6 +3059,257 @@ fn smoke_abi_pathx_statfs_ftype() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_ftype);
 
+// ── statfs: f_type is the superblock's magic, f_flags the mount's ─────
+//
+// `statfs_by_dentry` hands the call to the superblock's `->statfs`, which
+// reports `sb->s_magic` as `f_type`: BTRFS_SUPER_MAGIC for btrfs,
+// MSDOS_SUPER_MAGIC for vfat and msdos, 0xEF53 for ext2/3/4,
+// DEVPTS_SUPER_MAGIC for devpts and so on (include/uapi/linux/magic.h).
+// `vfs_statfs` then sets `f_flags` from the mount (`calculate_f_flags`):
+// ST_VALID, the ST_* twin of each MNT_* restriction and atime mode, and
+// ST_RDONLY for a read-only superblock. A bind mount is the same superblock,
+// so statfs through it answers for the source filesystem.
+
+/// A filesystem that reports `name` as its type and fixed capacity numbers.
+struct StatfsNamedFs {
+    name: &'static str,
+    root: alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+}
+
+impl narf_filesystem::FsInstance for StatfsNamedFs {
+    fn root(&self) -> alloc::sync::Arc<dyn narf_filesystem::DirOps> {
+        self.root.clone()
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn statfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsStat> {
+        alloc::boxed::Box::pin(async {
+            Ok(narf_filesystem::FsStat {
+                blocks: 1000,
+                blocks_free: 600,
+                blocks_available: 500,
+                files: 64,
+                files_free: 32,
+                block_size: 4096,
+                name_len: 255,
+                fragment_size: 4096,
+            })
+        })
+    }
+}
+
+/// `struct statfs` as fifteen words: f_type, f_bsize, f_blocks, f_bfree,
+/// f_bavail, f_files, f_ffree, f_fsid, f_namelen, f_frsize, f_flags, spare.
+fn statfs_words(num: u32, arg: u64) -> Option<[u64; 15]> {
+    let mut words = [0u64; 15];
+    let got = call(num, a1(arg, words.as_mut_ptr() as u64));
+    (got == Some(0)).then_some(words)
+}
+
+fn smoke_abi_pathx_statfs_reports_the_superblock_magic() -> TestResult {
+    with_setup(|| {
+        use narf_filesystem::FsInstance as _;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const ST_VALID: u64 = 0x0020;
+        // A private namespace, so nothing here outlives the case.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let auth = bootstrap_mount_authority();
+        for (path, name, magic) in [
+            ("/abi-sfm-btrfs", "btrfs", 0x9123_683e_u64),
+            ("/abi-sfm-fat32", "fat32", 0x4d44),
+            ("/abi-sfm-fat16", "fat16", 0x4d44),
+            ("/abi-sfm-ext", "ext2", 0xef53),
+            ("/abi-sfm-exfat", "exfat", 0x2011_bab0),
+            ("/abi-sfm-iso", "iso9660", 0x9660),
+            ("/abi-sfm-udf", "udf", 0x1501_3346),
+            ("/abi-sfm-squashfs", "squashfs", 0x7371_7368),
+            ("/abi-sfm-9p", "9p", 0x0102_1997),
+            ("/abi-sfm-overlay", "overlay", 0x794c_7630),
+            ("/abi-sfm-fuse", "fuse", 0x6573_5546),
+            ("/abi-sfm-fusectl", "fusectl", 0x6573_5543),
+            ("/abi-sfm-devpts", "devpts", 0x1cd1),
+            ("/abi-sfm-cgroup2", "cgroup2", 0x6367_7270),
+            ("/abi-sfm-debugfs", "debugfs", 0x6462_6720),
+            ("/abi-sfm-tracefs", "tracefs", 0x7472_6163),
+            ("/abi-sfm-securityfs", "securityfs", 0x7363_6673),
+            ("/abi-sfm-pstore", "pstore", 0x6165_676c),
+            ("/abi-sfm-configfs", "configfs", 0x6265_6570),
+            ("/abi-sfm-efivarfs", "efivarfs", 0xde5e_81e4),
+            ("/abi-sfm-bpf", "bpf", 0xcafe_4a11),
+            ("/abi-sfm-binfmt", "binfmt_misc", 0x4249_4e4d),
+            ("/abi-sfm-hugetlbfs", "hugetlbfs", 0x9584_58f6),
+            ("/abi-sfm-autofs", "autofs", 0x0187),
+            ("/abi-sfm-ramfs", "ramfs", 0x8584_58f6),
+            ("/abi-sfm-devtmpfs", "devtmpfs", 0x0102_1994),
+            ("/abi-sfm-tmpfs", "tmpfs", 0x0102_1994),
+        ] {
+            let fs = alloc::sync::Arc::new(StatfsNamedFs {
+                name,
+                root: MemFs::new("abi-sfm").root(),
+            });
+            if crate::handlers::current_mount_arc(&auth, path, fs).is_err() {
+                return Err("could not mount a statfs fixture");
+            }
+            let cpath = alloc::format!("{path}\0");
+            let Some(st) = statfs_words(Syscall::Statfs.raw(), cpath.as_ptr() as u64) else {
+                return Err("statfs of a mounted fixture failed");
+            };
+            if st[0] != magic {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "statfs {name}: f_type {:#x}", st[0]);
+                return Err("statfs f_type is not the filesystem type's Linux magic");
+            }
+            if st[1] != 4096 || st[2] != 1000 || st[8] != 255 || st[9] != 4096 {
+                return Err("statfs did not report the filesystem's own capacity numbers");
+            }
+            if st[10] & ST_VALID == 0 {
+                return Err("statfs f_flags lacks ST_VALID");
+            }
+        }
+
+        // A bind of the btrfs mount, of a directory in it and of a file in
+        // it: the same superblock each time.
+        let fs_root = crate::handlers::current_fs_arc_at("/abi-sfm-btrfs")
+            .ok_or("the btrfs fixture is not mounted")?
+            .root();
+        let sub = crate::handlers::poll_blocking(fs_root.mkdir("sub"));
+        let file = crate::handlers::poll_blocking(fs_root.create("file"));
+        if !matches!(sub, Some(Ok(_))) || !matches!(file, Some(Ok(_))) {
+            return Err("could not populate the btrfs fixture");
+        }
+        const MS_BIND: u64 = 0x1000;
+        const O_WRONLY: u64 = 0o1;
+        const O_CREAT: u64 = 0o100;
+        let _ = call_mkdir(c"/abi-sfm-bind".as_ptr() as u64, 0o755);
+        let _ = call_mkdir(c"/abi-sfm-bind-sub".as_ptr() as u64, 0o755);
+        if let Some(fd) = call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                c"/abi-sfm-bind-file".as_ptr() as u64,
+                O_WRONLY | O_CREAT,
+                0o644,
+            ),
+        )
+        .filter(|fd| *fd >= 0)
+        {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        for (source, target) in [
+            (c"/abi-sfm-btrfs", c"/abi-sfm-bind"),
+            (c"/abi-sfm-btrfs/sub", c"/abi-sfm-bind-sub"),
+            (c"/abi-sfm-btrfs/file", c"/abi-sfm-bind-file"),
+        ] {
+            let bound = call(
+                Syscall::Mount.raw(),
+                a4(
+                    source.as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    0,
+                    MS_BIND,
+                    0,
+                ),
+            );
+            if bound != Some(0) {
+                return Err("mount(MS_BIND) of the btrfs fixture failed");
+            }
+            let Some(st) = statfs_words(Syscall::Statfs.raw(), target.as_ptr() as u64) else {
+                return Err("statfs of a bind mount failed");
+            };
+            if st[0] != 0x9123_683e || st[2] != 1000 {
+                return Err("statfs through a bind did not answer for the bound superblock");
+            }
+        }
+
+        // The session-writable overlay NARF puts over a read-only installed
+        // root stands in for that filesystem.
+        let lower = alloc::sync::Arc::new(StatfsNamedFs {
+            name: "btrfs",
+            root: MemFs::new("abi-sfm-lower").root(),
+        });
+        let overlay = narf_filesystem::root_mount::tmpfs_overlay_root(lower)
+            .map_err(|_| "could not build the root overlay")?;
+        if crate::handlers::current_mount_arc(&auth, "/abi-sfm-rootov", overlay).is_err() {
+            return Err("could not mount the root overlay");
+        }
+        match statfs_words(Syscall::Statfs.raw(), c"/abi-sfm-rootov".as_ptr() as u64) {
+            Some(st) if st[0] == 0x9123_683e => Ok(()),
+            _ => Err("the root overlay did not report its installed root's magic"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/statfs-magic",
+    smoke_abi_pathx_statfs_reports_the_superblock_magic
+);
+
+fn smoke_abi_pathx_statfs_flags_follow_the_mount() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_RDONLY: u64 = 0x1;
+        const MS_NOSUID: u64 = 0x2;
+        const MS_NODEV: u64 = 0x4;
+        const MS_NOEXEC: u64 = 0x8;
+        const MS_NOATIME: u64 = 0x400;
+        const ST_RDONLY: u64 = 0x0001;
+        const ST_NOSUID: u64 = 0x0002;
+        const ST_NODEV: u64 = 0x0004;
+        const ST_NOEXEC: u64 = 0x0008;
+        const ST_VALID: u64 = 0x0020;
+        const ST_NOATIME: u64 = 0x0400;
+        const ST_RELATIME: u64 = 0x1000;
+        const O_PATH: u64 = 0o10000000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) failed");
+        }
+        let _ = call_mkdir(c"/abi-sff-plain".as_ptr() as u64, 0o755);
+        let _ = call_mkdir(c"/abi-sff-locked".as_ptr() as u64, 0o755);
+        let mount = |target: &core::ffi::CStr, flags: u64| {
+            call(
+                Syscall::Mount.raw(),
+                a4(
+                    c"tmpfs".as_ptr() as u64,
+                    target.as_ptr() as u64,
+                    c"tmpfs".as_ptr() as u64,
+                    flags,
+                    0,
+                ),
+            )
+        };
+        let locked = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME;
+        if mount(c"/abi-sff-plain", 0) != Some(0) || mount(c"/abi-sff-locked", locked) != Some(0) {
+            return Err("mounting the tmpfs fixtures failed");
+        }
+        // mount(2) defaults to relatime.
+        match statfs_words(Syscall::Statfs.raw(), c"/abi-sff-plain".as_ptr() as u64) {
+            Some(st) if st[10] == ST_VALID | ST_RELATIME => {}
+            _ => return Err("statfs f_flags of a default mount is not ST_VALID|ST_RELATIME"),
+        }
+        let want = ST_VALID | ST_RDONLY | ST_NOSUID | ST_NODEV | ST_NOEXEC | ST_NOATIME;
+        match statfs_words(Syscall::Statfs.raw(), c"/abi-sff-locked".as_ptr() as u64) {
+            Some(st) if st[10] == want => {}
+            _ => return Err("statfs f_flags do not carry the mount's restrictions"),
+        }
+        // fstatfs answers from the descriptor's mount the same way.
+        let fd = call_open(c"/abi-sff-locked".as_ptr() as u64, O_PATH)
+            .filter(|fd| *fd >= 0)
+            .ok_or("open(O_PATH) of the read-only tmpfs failed")? as u64;
+        let st = statfs_words(Syscall::Fstatfs.raw(), fd);
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        match st {
+            Some(st) if st[0] == 0x0102_1994 && st[10] == want => Ok(()),
+            _ => Err("fstatfs f_type or f_flags differ from statfs of the same mount"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/statfs-magic",
+    smoke_abi_pathx_statfs_flags_follow_the_mount
+);
+
 // ── quotactl(cmd, special, id, addr) — Linux disk-quota control ─────
 //
 // cmd = (subcmd << 8) | type. `if_dqblk` limits are in 1 KiB quota blocks;
