@@ -2473,7 +2473,12 @@ Native IPv6 raw sockets retain 128-bit local and peer addresses, link-local /
 scope-id routing, and Linux RFC 3542 input filtering via `setsockopt`/`getsockopt`
 with `IPPROTO_ICMPV6` level and `ICMP6_FILTER` (256-bit type mask where bit 0
 passes and 1 blocks). Inbound ICMPv6 messages deliver via `narf_net::ipv6::icmp6_sock`
-with per-socket durable readiness cells for poll and epoll.
+with per-socket durable readiness cells for poll and epoll. Each message carries
+its ingress ifindex and IPv6 hop limit (`icmp6_sock::on_rx_on`); `recvfrom` gives
+a link-local source that ifindex as `sin6_scope_id` (`rawv6_recvmsg`), and
+`recvmsg` reports IPV6_PKTINFO (destination, ifindex) and IPV6_HOPLIMIT when
+requested, as `ip6_datagram_recv_ctl` does — what NetworkManager's ndisc
+(libndp) needs to attribute a Router Advertisement to its device.
 
 Internet sockets implement the legacy network-device ioctl ABI for
 `SIOCGIFNAME`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFMTU`,

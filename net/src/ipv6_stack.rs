@@ -1729,7 +1729,7 @@ fn dispatch_l4(
     err_ctx: Icmp6ErrorCtx<'_>,
 ) -> bool {
     match proto {
-        NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, l4),
+        NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, meta.ttl, l4),
         NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, meta, l4, err_ctx),
         NEXT_HEADER_TCP => handle_tcp6(iface, src_ip, dst_ip, l4),
         _ => false,
@@ -1817,7 +1817,16 @@ fn handle_udp6(
     true
 }
 
-fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) -> bool {
+fn handle_icmp6(
+    iface: &str,
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    hop_limit: u8,
+    body: &[u8],
+) -> bool {
+    // Raw ICMPv6 sockets learn the ingress device and hop limit
+    // (`inet6_iif(skb)`, `ipv6_hdr(skb)->hop_limit`).
+    let ifindex = crate::iface::ifindex_of(iface).unwrap_or(0);
     let hdr = match Icmpv6Header::decode(body) {
         Some(h) => h,
         None => return false,
@@ -1860,7 +1869,7 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
                     }
                 }
             }
-            icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+            icmp6_sock::on_rx_on(ifindex, hop_limit, src_ip, dst_ip, hdr.typ, hdr.code, body);
             true
         }
         ICMPV6_PACKET_TOO_BIG => {
@@ -1879,7 +1888,7 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
                     .and_modify(|mtu| *mtu = (*mtu).min(advertised))
                     .or_insert(advertised);
             }
-            icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+            icmp6_sock::on_rx_on(ifindex, hop_limit, src_ip, dst_ip, hdr.typ, hdr.code, body);
             true
         }
         ICMPV6_ECHO_REQUEST => {
@@ -1928,7 +1937,7 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
             true
         }
         ICMPV6_ECHO_REPLY => {
-            icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+            icmp6_sock::on_rx_on(ifindex, hop_limit, src_ip, dst_ip, hdr.typ, hdr.code, body);
             true
         }
         ICMPV6_NEIGHBOR_SOLICITATION => match ndp::on_ns(iface, src_ip, None, body) {
@@ -2002,13 +2011,13 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
                         slaac::process_pio(iface, mac, pio, cfg, now);
                     }
                 }
-                icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+                icmp6_sock::on_rx_on(ifindex, hop_limit, src_ip, dst_ip, hdr.typ, hdr.code, body);
             }
             true
         }
         ICMPV6_ROUTER_SOLICITATION => {
             // Hosts do not respond; routers do. Stage-1 is host-only.
-            icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+            icmp6_sock::on_rx_on(ifindex, hop_limit, src_ip, dst_ip, hdr.typ, hdr.code, body);
             true
         }
         ICMPV6_REDIRECT => {
@@ -2016,7 +2025,7 @@ fn handle_icmp6(iface: &str, src_ip: [u8; 16], dst_ip: [u8; 16], body: &[u8]) ->
             true
         }
         _ => {
-            icmp6_sock::on_rx(src_ip, dst_ip, hdr.typ, hdr.code, body);
+            icmp6_sock::on_rx_on(ifindex, hop_limit, src_ip, dst_ip, hdr.typ, hdr.code, body);
             true
         }
     }

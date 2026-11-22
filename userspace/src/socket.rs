@@ -9403,7 +9403,21 @@ impl SocketFile {
                         if let Some(msg) = narf_net::ipv6::icmp6_sock::next_msg(id) {
                             let n = core::cmp::min(buf.len(), msg.body.len());
                             buf[..n].copy_from_slice(&msg.body[..n]);
-                            let peer = make_sockaddr_in6(msg.src_ip, 0);
+                            // `rawv6_recvmsg`: `sin6_scope_id =
+                            // ipv6_iface_scope_id(saddr, inet6_iif(skb))`,
+                            // and `ip6_datagram_recv_ctl` reports the
+                            // destination, ingress device and hop limit.
+                            let link_local = msg.src_ip[0] == 0xfe && msg.src_ip[1] & 0xc0 == 0x80;
+                            let scope = if link_local { msg.ifindex } else { 0 };
+                            let peer = make_sockaddr_in6_scoped(msg.src_ip, 0, scope);
+                            self.stash_inet6_recv_ancillary(Inet6RecvAncillary {
+                                destination: msg.dst_ip,
+                                ifindex: msg.ifindex,
+                                hop_limit: i32::from(msg.hop_limit),
+                                traffic_class: 0,
+                                gso_size: 0,
+                                tstamp_ns: rx_tstamp_now_ns(),
+                            });
                             return SocketOpResult::Received {
                                 n,
                                 peer: Some(peer),

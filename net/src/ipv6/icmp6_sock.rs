@@ -32,6 +32,12 @@ pub struct Icmp6Msg {
     pub typ: u8,
     pub code: u8,
     pub body: Vec<u8>,
+    /// The ingress device (`inet6_iif(skb)`), 0 when unknown: the scope of
+    /// a link-local source and the IPV6_PKTINFO ifindex.
+    pub ifindex: u32,
+    /// The IPv6 header's hop limit (IPV6_HOPLIMIT); Neighbor Discovery
+    /// requires 255 (RFC 4861 §6.1.2).
+    pub hop_limit: u8,
 }
 
 #[derive(Debug)]
@@ -108,9 +114,25 @@ pub fn set_filter(id: u32, types: &[u8]) -> bool {
     true
 }
 
-/// Deliver an inbound ICMPv6 message to whichever socket matches.
-/// Called from `ipv6_stack::handle_icmp6`.
+/// Deliver an inbound ICMPv6 message whose device and hop limit are not
+/// known (ifindex 0, hop limit 255).
 pub fn on_rx(src_ip: [u8; 16], dst_ip: [u8; 16], typ: u8, code: u8, body: &[u8]) {
+    on_rx_on(0, 255, src_ip, dst_ip, typ, code, body);
+}
+
+/// Deliver an inbound ICMPv6 message that arrived on `ifindex` with IPv6
+/// hop limit `hop_limit` to whichever socket matches (`rawv6_rcv`). The
+/// socket layer reports both as `rawv6_recvmsg` / `ip6_datagram_recv_ctl`
+/// do. Called from `ipv6_stack::handle_icmp6`.
+pub fn on_rx_on(
+    ifindex: u32,
+    hop_limit: u8,
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    typ: u8,
+    code: u8,
+    body: &[u8],
+) {
     let socks: Vec<Arc<IrqSafeSpinLock<Sock>>> = SOCKS.lock().values().cloned().collect();
     let msg = Icmp6Msg {
         src_ip,
@@ -118,6 +140,8 @@ pub fn on_rx(src_ip: [u8; 16], dst_ip: [u8; 16], typ: u8, code: u8, body: &[u8])
         typ,
         code,
         body: body.to_vec(),
+        ifindex,
+        hop_limit,
     };
     for arc in &socks {
         let mut g = arc.lock();
