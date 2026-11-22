@@ -436,3 +436,70 @@ pub async fn verify_width40(io: &mut impl Io, center: u8, sc: u8) -> Result<(), 
     }
     Ok(())
 }
+
+const DFIR: [(u16, u32, u32); 4] = [
+    (0x948, 3 << 28, 2),
+    (0x94c, 3 << 28, 2),
+    (0xc20, 1 << 31, 1),
+    (0x8f0, 1 << 31, 0),
+];
+
+/// `rtw8821c_set_channel` initial ch1/20MHz 2.4GHz program: the `ch_param`
+/// CCK filters, factory swing and RFE BTG the caller resolved into `params`,
+/// the RF-A switch, RF18, `_rxdfir` and cleared TXAGC. Returns the swing.
+pub async fn channel(io: &mut impl Io, params: C21BandParams) -> Result<u16, Error> {
+    for (reg, bits, value) in BB_2G {
+        mask(io, reg, bits, value).await?;
+    }
+    io.write32(0xa24, params.filters[0]).await?;
+    mask(io, 0xa28, 0xffff, params.filters[1] & 0xffff).await?;
+    io.write32(0xaac, params.filters[2]).await?;
+    let adc = read(io, 0x8ac).await?;
+    io.write32(0x8ac, (adc & 0xffcffc00) | 0x10010000).await?;
+    mask(io, 0x8c4, 1 << 30, 1).await?;
+    let swing = params.swing;
+    mask(io, 0xc1c, 0xffe00000, u32::from(swing)).await?;
+    // rtw_set_channel_mac: no sideband for20MHz, source80MHz MAC clock.
+    io.write8(0x483, 0).await?;
+    mask(io, 0x668, 0x180, 0).await?;
+    mask(io, 0x24, 3 << 20, 0).await?;
+    io.write8(0x55c, 80).await?;
+    io.write8(0x638, 80).await?;
+    let cck = io.read8(0x454).await?;
+    if cck == 255 {
+        return Err(Error::Gone);
+    }
+    io.write8(0x454, cck & !0x80).await?;
+    let rf18 = (rf_read(io, 0x18).await? & !0x70fff) | rf18_for(1, 20);
+    mask(io, 0x1080, 1 << 16, 1).await?;
+    mask(io, 0, 1 << 26, 1).await?;
+    let btg = params.btg;
+    mask(io, 0xa84, 0xff0000, if btg { 0x0e } else { 0x12 }).await?;
+    mask(io, 0xa80, 0xffff, if btg { 0xfc84 } else { 0x7532 }).await?;
+    mask(io, 0xcb8, 0xf50000, if btg { 1 } else { 0x70 }).await?;
+    rf(io, 0xdf, 1 << 6, 1).await?;
+    rf(io, 0x64, 15, 15).await?;
+    rf(io, 0x18, 0xfffff, rf18).await?;
+    rf(io, 0xb8, 1 << 19, 0).await?;
+    rf(io, 0xb8, 1 << 19, 1).await?;
+    for (reg, bits, value) in DFIR {
+        mask(io, reg, bits, value).await?;
+    }
+    for reg in TXAGC {
+        io.write32(reg, 0).await?;
+    }
+    verify_channel(io, swing, btg).await?;
+    Ok(swing)
+}
+async fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
+    verify_geometry(io, swing, btg).await?;
+    for reg in TXAGC {
+        if read(io, reg).await? != 0 {
+            return Err(Error::Prerequisite);
+        }
+    }
+    Ok(())
+}
+async fn verify_geometry(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
+    verify_geometry_at(io, 1, swing, btg).await
+}

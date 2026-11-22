@@ -210,53 +210,22 @@ async fn convert_temperature(io: &mut impl Io, envelope: &Envelope) -> Result<u8
     io.delay_us(2_000_000).await;
     temperature(io, envelope).await
 }
+/// The initial ch1/20MHz 2.4GHz program (`radio::c21::channel`), with the
+/// factory swing + `ch_param` CCK filters + RFE BTG resolved from the retained
+/// factory/PHY identities. Returns the programmed swing.
 async fn channel(
     io: &mut impl Io,
     factory: &Factory8821c,
     phy: phy8821c::Info,
 ) -> Result<u16, Error> {
-    for (reg, bits, value) in BB_2G {
-        mask(io, reg, bits, value).await?;
-    }
-    io.write32(0xa24, phy.channel_filters[0]).await?;
-    mask(io, 0xa28, 0xffff, phy.channel_filters[1] & 0xffff).await?;
-    io.write32(0xaac, phy.channel_filters[2]).await?;
-    let adc = read(io, 0x8ac).await?;
-    io.write32(0x8ac, (adc & 0xffcffc00) | 0x10010000).await?;
-    mask(io, 0x8c4, 1 << 30, 1).await?;
-    let swing = [0x200u16, 0x16a, 0x101, 0xb6][usize::from(factory.swing_2g() / 3)];
-    mask(io, 0xc1c, 0xffe00000, u32::from(swing)).await?;
-    // rtw_set_channel_mac: no sideband for20MHz, source80MHz MAC clock.
-    io.write8(0x483, 0).await?;
-    mask(io, 0x668, 0x180, 0).await?;
-    mask(io, 0x24, 3 << 20, 0).await?;
-    io.write8(0x55c, 80).await?;
-    io.write8(0x638, 80).await?;
-    let cck = io.read8(0x454).await?;
-    if cck == 255 {
-        return Err(Error::Gone);
-    }
-    io.write8(0x454, cck & !0x80).await?;
-    let rf18 = (rf_read(io, 0x18).await? & !0x70fff) | rf18_for(1, 20);
-    mask(io, 0x1080, 1 << 16, 1).await?;
-    mask(io, 0, 1 << 26, 1).await?;
-    let btg = matches!(phy.rfe, 2 | 4);
-    mask(io, 0xa84, 0xff0000, if btg { 0x0e } else { 0x12 }).await?;
-    mask(io, 0xa80, 0xffff, if btg { 0xfc84 } else { 0x7532 }).await?;
-    mask(io, 0xcb8, 0xf50000, if btg { 1 } else { 0x70 }).await?;
-    rf(io, 0xdf, 1 << 6, 1).await?;
-    rf(io, 0x64, 15, 15).await?;
-    rf(io, 0x18, 0xfffff, rf18).await?;
-    rf(io, 0xb8, 1 << 19, 0).await?;
-    rf(io, 0xb8, 1 << 19, 1).await?;
-    for (reg, bits, value) in DFIR {
-        mask(io, reg, bits, value).await?;
-    }
-    for reg in TXAGC {
-        io.write32(reg, 0).await?;
-    }
-    verify_channel(io, swing, btg).await?;
-    Ok(swing)
+    let params = c21::C21BandParams {
+        swing: [0x200u16, 0x16a, 0x101, 0xb6][usize::from(factory.swing_2g() / 3)],
+        filters: phy.channel_filters,
+        btg: matches!(phy.rfe, 2 | 4),
+    };
+    let mut b = bridge(io);
+    let r = c21::channel(&mut b, params).await;
+    r.map_err(|e| b.err(e))
 }
 /// Linux `rtw8821c_set_channel` retune between 2.4GHz/20MHz primaries on the
 /// retained non-SRRC C21: `_bb`, `rtw_set_channel_mac`, `_rxdfir` and
@@ -418,6 +387,9 @@ pub(super) async fn verify_txagc(
     let r = c21::verify_txagc(&mut b, indices, rrsr).await;
     r.map_err(|e| b.err(e))
 }
+// `verify_channel`/`verify_geometry`/`verify_geometry_at` also live in
+// `radio::c21` (used by its `channel` program); these native copies serve the
+// envelope/station readbacks below, which run over the policy-checked `Io`.
 async fn verify_channel(io: &mut impl Io, swing: u16, btg: bool) -> Result<(), Error> {
     verify_geometry(io, swing, btg).await?;
     for reg in TXAGC {
