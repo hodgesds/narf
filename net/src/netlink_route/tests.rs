@@ -1088,6 +1088,112 @@ narf_kernel_test::kernel_test_in!(
     delegated_admin_can_add_and_delete_ipv4_route
 );
 
+/// NetworkManager adds every IPv4 address with IFA_F_NOPREFIXROUTE (0x200)
+/// in IFA_FLAGS and installs the prefix route itself, at the device's route
+/// metric (eth0 100, wlan0 600). Linux `fib_add_ifaddr` adds the kernel's
+/// metric-0 prefix route only without that flag, and `fib_del_ifaddr`
+/// removes only the kernel's own prefix route. NARF ignored the flag: with
+/// eth0 and wlan0 in one /22 the desktop had two metric-0 prefix routes, so
+/// which device carried LAN traffic was decided by insertion order instead
+/// of NM's metrics.
+fn ipv4_noprefixroute_address_installs_no_prefix_route() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+    let name = "rtnl-v4-nopfx0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 7, 1], discard);
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    let addr = [10, 41, 3, 165];
+    let net = crate::route::Ipv4Net {
+        addr: crate::ipv4::Ipv4Addr([10, 41, 0, 0]),
+        prefix_len: 22,
+    };
+    let addr_request = |kind, flags: Option<u32>| {
+        let mut body = vec![AF_INET, 22, 0, 0];
+        body.extend_from_slice(&ifindex.to_ne_bytes());
+        push_rtattr(&mut body, IFA_LOCAL, &addr);
+        push_rtattr(&mut body, IFA_ADDRESS, &addr);
+        if let Some(flags) = flags {
+            push_rtattr(&mut body, IFA_FLAGS, &flags.to_ne_bytes());
+        }
+        let nl_flags = NLM_F_REQUEST
+            | NLM_F_ACK
+            | if kind == RTM_NEWADDR {
+                NLM_F_CREATE | NLM_F_REPLACE
+            } else {
+                0
+            };
+        frame_message(kind, nl_flags, 207, 1, &body)
+    };
+    let errno_of = |replies: &Vec<Vec<u8>>| {
+        i32::from_ne_bytes(
+            replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    let kernel_prefix_route = || {
+        crate::route::route_list().iter().any(|route| {
+            route.iface == name
+                && route.dst == net
+                && route.metric == 0
+                && route.protocol == crate::route::RTPROT_KERNEL
+        })
+    };
+
+    let add = build_replies_authorized(
+        &addr_request(RTM_NEWADDR, Some(IFA_F_NOPREFIXROUTE)),
+        Some(&admin),
+    )
+    .unwrap();
+    narf_kernel_test::kt_assert_eq!(errno_of(&add), 0);
+    narf_kernel_test::kt_assert!(crate::iface::is_local_addr_in(0, addr));
+    if kernel_prefix_route() {
+        return narf_kernel_test::TestResult::Fail(
+            "IFA_F_NOPREFIXROUTE address installed a kernel prefix route",
+        );
+    }
+    // NM's own prefix route at the device metric survives the address's
+    // removal: `fib_del_ifaddr` only removes the kernel's.
+    crate::route::route_add(crate::route::Route {
+        net_ns_id: 0,
+        dst: net,
+        gateway: None,
+        iface: alloc::string::String::from(name),
+        src_hint: None,
+        metric: 100,
+        scope: crate::route::Scope::Link,
+        table: crate::route::TABLE_MAIN,
+        protocol: 4, // RTPROT_STATIC, as NetworkManager installs it
+    });
+    let del = build_replies_authorized(&addr_request(RTM_DELADDR, None), Some(&admin)).unwrap();
+    narf_kernel_test::kt_assert_eq!(errno_of(&del), 0);
+    let nm_route_kept = crate::route::route_list()
+        .iter()
+        .any(|route| route.iface == name && route.dst == net && route.metric == 100);
+    crate::route::route_delete(net, name, crate::route::TABLE_MAIN);
+    if !nm_route_kept {
+        return narf_kernel_test::TestResult::Fail(
+            "deleting the address removed NM's metric-100 prefix route",
+        );
+    }
+    // Without the flag the kernel's prefix route is installed as before.
+    let add = build_replies_authorized(&addr_request(RTM_NEWADDR, None), Some(&admin)).unwrap();
+    narf_kernel_test::kt_assert_eq!(errno_of(&add), 0);
+    narf_kernel_test::kt_assert!(kernel_prefix_route());
+    let del = build_replies_authorized(&addr_request(RTM_DELADDR, None), Some(&admin)).unwrap();
+    narf_kernel_test::kt_assert_eq!(errno_of(&del), 0);
+    narf_kernel_test::kt_assert!(!kernel_prefix_route());
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/ifa-noprefixroute",
+    ipv4_noprefixroute_address_installs_no_prefix_route
+);
+
 fn delegated_admin_can_add_and_delete_ipv6_address_and_route() -> narf_kernel_test::TestResult {
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
