@@ -2144,6 +2144,51 @@ readback decodes ratio + divider + squash popcount — under
 squash the CDCLK_CTL decimal field is nominal and is not
 trusted.
 
+On Gen11 (Ice Lake / Elkhart Lake / Jasper Lake, display 11)
+the same inherited path programs the ICL model
+(`intel_gpu_gen11_cdclk`, MIT Linux `display/intel_cdclk.c`,
+`icl_cdclk_funcs`): the `icl_cdclk_table` rung for the DSSM
+reference strap (19.2 / 24.0 / 38.4 MHz) at or above the floor,
+the DE PLL ratio in `BXT_DE_PLL_ENABLE` (0x46070) and the CD2X
+divider in `CDCLK_CTL` (0x46000), with SKL pcode CDCLK-control
+notifies (`SKL_PCODE_CDCLK_CONTROL` 0x7: pre DATA0
+`SKL_CDCLK_PREPARE_FOR_CHANGE` 0x3 expecting
+`SKL_CDCLK_READY_FOR_CHANGE` 0x1, post DATA0 = the
+`icl_calc_voltage_level` level — three levels on ICL,
+maxima 312 / 556.8 / 652.8 MHz; four on EHL/JSL, maxima
+180 / 312 / 326.4 / 652.8 MHz) around the change. ICL has no
+CDCLK crawl or squash, so a VCO change is a full PLL
+disable/enable and a same-VCO change rewrites only the
+divider; the readback decodes ratio + divider and must match
+the rung exactly. A refused pre-notify leaves the firmware
+clock and degrades, matching the standing pcode-degrade
+contract. The port PLLs are the ICL combo PLLs
+(`intel_gpu_gen11_dpll`, MIT Linux `display/intel_dpll_mgr.c`,
+`icl_pll_mgr`): `ICL_DPLL_CFGCR0/1` at 0x164000/0x164004
+(DPLL0), 0x164080/0x164084 (DPLL1), 0x164200/0x164204 (EHL
+DPLL4), enable at 0x46010/0x46014 (DPLL4: `MG_PLL_ENABLE(0)`
+0x46030); enable is power-enable, wait POWER_STATE, write
+state, set ENABLE, wait LOCK (1 ms each). DP rates come from
+the fixed combo tables and HDMI from the WRPLL search already
+in `intel_gpu_pll` (`combo_coeffs`, `hdmi_wrpll_coeffs`).
+`DPLL_CTRL1` (0x6C058) is a SKL/Gen9-only register — it is
+transcribed in `intel_gpu_gen11_dpll` as a DISPLAY_VER 9-only
+section and is never programmed on ICL. Watermarks are the
+SKL method (`intel_gpu_gen11_wm`, MIT Linux
+`display/skl_watermark.c`): 8 levels (no SAGV watermark on
+Gen11), WaWmMemoryReadLatency +2 µs, the 16 Gb-DIMM +1 µs
+workaround, transition wm0 + 14, DBUF 2048 blocks over slices
+S1|S2 (`DBUF_CTL` 0x45008 / 0x44FE8), single-pipe allocation
+of the whole DBUF to Pipe A's primary plane. DDI signal
+levels are the ICL/EHL/JSL translation tables
+(`intel_gpu_gen11_ddi`, MIT Linux
+`display/intel_ddi_buf_trans.c` `.icl` entries) with the
+ICL/EHL/JSL selectors (eDP 540 MHz and 270 MHz thresholds,
+VBT low-vswing); programming the selected entries into the
+PHY is Lane 5 modeset wiring. GMBUS on Gen11 uses the ICP
+pin table (`GmbusPinTable::for_generation(Generation::IceLake)
+→ Icp`, already landed with Lane 1).
+
 ### 10.4 Gates and named remainders
 
 - `display_supported()`: Gen12 + Meteor Lake. **Lunar Lake and Panther Lake
@@ -2217,6 +2262,17 @@ trusted.
   (`intel_gpu_xelpg_scaler`) but not wired into a modeset.
 - §5's device table is unchanged by this lane: the MTL DIDs
   were already in the census; only their display gate moved.
+- Gen11 Lane 4 remainders (clocking/watermark prerequisites
+  for modeset, Lane 5): MG PLL divisor search + TC-port
+  programming (Lane 8); TBT PLL fixed rows; the VBT
+  AFC-startup `div0` (VBT fields not parsed); the SKL WRPLL
+  search + CFGCR1/2 (Gen9 lane — `DPLL_CTRL1` on Gen9 is a
+  different manager); ICL PHY register programming of the
+  selected DDI entries (Lane 5 wiring); `display_supported()`
+  stays unflipped for Gen11 (Lane 5 flips it); the SAGV
+  *control* pcode command and per-level SAGV admission feed
+  the power manager (Lane 6); the cursor DDB allocation
+  special case belongs to the cursor lane.
 
 ### 10.5 Xe2_LPD — Lunar Lake display 20 (`intel_gpu_xe2lpd`)
 
