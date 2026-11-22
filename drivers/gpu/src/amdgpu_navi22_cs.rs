@@ -492,6 +492,11 @@ impl crate::amdgpu_cs::Submitter for Submitter {
 static CLIENT_VRAM: IrqSafeSpinLock<
     Option<(crate::amdgpu_vram::Reservation, crate::amdgpu_gem::VramHeap)>,
 > = IrqSafeSpinLock::new(None);
+/// The client heap, for a hibernation that must put it back after a refused
+/// eviction.
+pub(crate) fn client_heap() -> Option<crate::amdgpu_gem::VramHeap> {
+    CLIENT_VRAM.lock().as_ref().map(|(_, heap)| heap.clone())
+}
 /// The client VMIDs lent by the memory owner, kept for its lifetime.
 static CLIENT_VMIDS: IrqSafeSpinLock<Option<crate::amdgpu_gmc_navi22::ClientVmids>> =
     IrqSafeSpinLock::new(None);

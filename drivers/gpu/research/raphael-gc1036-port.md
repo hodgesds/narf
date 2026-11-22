@@ -607,6 +607,59 @@ since the submitter is replaced. Raphael's port:
     still take their S3-style display cycle on s2idle, unchanged; Linux
     would leave those alone too.
 
+## Hibernation
+
+18. ~~S4~~ (done on the driver side: `prepare_graphics_hibernate`). NARF
+    has no S4 entry yet. Nothing snapshots RAM, enters `SLP_TYP` S4 or
+    hands off to a restored image (the power spec lists S4 for after 1.0).
+    So this follows Linux's driver contract behind the new
+    `SystemSleepState::S4` target, and nothing drives it yet.
+
+    S4 loses the carve-out, which holds everything here. Linux's hibernation
+    for a Raphael APU:
+    - `amdgpu_device_evict_resources` evicts VRAM, which on an APU it does
+      only for S4.
+    - `amdgpu_pmops_freeze` runs the full `amdgpu_device_suspend`, then
+      resets the GPU. `amdgpu_acpi_should_gpu_reset` is true: an APU with
+      no IMU, hibernating rather than in S3, picks mode 2
+      (`nv_asic_reset_method` for MP1 13.0.5).
+    - `thaw` and `poweroff` leave the frozen GPU alone for a normal
+      hibernation. `restore`, or a `thaw` after a failed image, runs
+      `amdgpu_device_resume`.
+
+    SMU 13.0.5 has no S4 case. The `GfxDeviceDriverReset` before
+    `PrepareMp1ForUnload` in `system_features_control` is 13.0.4's
+    (Phoenix), and Phoenix runs no graphics here.
+
+    What is lost and what brings it back:
+    - **Client buffers.** The freeze takes the placement lock (clients'
+      order, before the display owner), drains the rings, withdraws the
+      heap and runs `evict_all`, Navi48's suspend eviction. Every unpinned
+      buffer moves to system memory with its bytes. A pinned one, such as
+      a scanned-out framebuffer, stays and loses its contents, as in Linux.
+      The resume restores the allowed domains the move widened, and
+      validation brings each buffer back into the heap. A failed eviction
+      puts the heap back and refuses the hibernation.
+    - **Kernel state.** Nothing is lost that is not rebuilt anyway:
+      - rings and MQDs are rebuilt by the re-arm (step 13);
+      - the GART table is zeroed, and its boot pages are mapped again;
+      - the PSP and DMUB firmware is staged again from system memory;
+      - the scanout is cleared at resume;
+      - client page tables are in system memory;
+      - VCN's buffer is saved to the heap, as for S3 (step 14).
+    - **The TMR.** The sync suspend releases it as for S3, then runs the
+      mode 2 reset at once (`after_psp_stop`), so the image is written with
+      the GPU reset rather than running from a released TMR. A failed reset
+      fails the freeze. The resume is S3's: the PSP session boots, then the
+      coordinator re-arms.
+
+    The S4 lane must refuse an image when the firmware memory map changed,
+    as Linux's x86 `hibernation_e820_mismatch` does. Otherwise the restore
+    could find the carve-out moved or resized (a UMA size change in setup)
+    under a pool that still names the old range. Before the restore, the
+    firmware may also have lit a GOP stream; the display's replay assumes
+    the DCN state S3 leaves, and this is unproven.
+
 ## Open
 
 - Raphael's exact NBIO, MMHUB and OSSSYS revisions come from a discovery table

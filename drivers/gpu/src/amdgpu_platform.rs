@@ -1022,7 +1022,9 @@ async fn rebuild_graphics(
 ///    that aborted before the PSP stopped never powered the GPU off, so
 ///    that resume runs a mode 2 reset first.
 ///
-/// Suspend-to-idle takes none of this: see [`GraphicsPm::Idle`].
+/// Suspend-to-idle takes none of this: see [`GraphicsPm::Idle`]. Hibernation
+/// takes all of it, with the carve-out emptied first and a reset after the
+/// PSP stops: see [`prepare_graphics_hibernate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GraphicsPm {
     Running,
@@ -1034,6 +1036,12 @@ pub(crate) enum GraphicsPm {
     /// running through the park, and the PSP keeps its TMR, as Linux's
     /// amdgpu does when `amdgpu_acpi_is_s0ix_active` is false.
     Idle,
+    /// Prepared for hibernation: as `Quiesced`, with every unpinned client
+    /// buffer moved out of the carve-out.
+    Freezing,
+    /// Frozen for hibernation: the TMR released and the GPU reset (mode 2),
+    /// as `amdgpu_pmops_freeze` leaves an APU while the image is written.
+    Frozen,
 }
 /// Why Raphael would not take Linux's s0ix path for a suspend-to-idle
 /// (`amdgpu_acpi_is_s0ix_active` for an APU, in its order).
@@ -1075,8 +1083,27 @@ pub(crate) enum ResumeWork {
 pub(crate) fn resume_work(state: GraphicsPm) -> ResumeWork {
     match state {
         GraphicsPm::Running | GraphicsPm::Idle => ResumeWork::Nothing,
-        GraphicsPm::Stopped => ResumeWork::Rebuild,
-        GraphicsPm::Quiesced => ResumeWork::ResetThenRebuild,
+        // A restored image finds the GPU power-cycled, a failed image write
+        // finds it reset: the sync resume booted the PSP either way.
+        GraphicsPm::Stopped | GraphicsPm::Frozen => ResumeWork::Rebuild,
+        GraphicsPm::Quiesced | GraphicsPm::Freezing => ResumeWork::ResetThenRebuild,
+    }
+}
+/// Where the sync suspend leaves graphics once the PSP stop has run, and
+/// whether the suspend may go on. S3's power-off is the reset releasing the
+/// TMR needs; a hibernation writes its image first, so it resets now, as
+/// `amdgpu_pmops_freeze` does (`amdgpu_acpi_should_gpu_reset`). `reset` runs
+/// only then. A failed reset fails the freeze, as Linux's does.
+pub(crate) fn after_psp_stop(
+    state: GraphicsPm,
+    stopped: bool,
+    reset: impl FnOnce() -> bool,
+) -> (GraphicsPm, bool) {
+    match state {
+        _ if !stopped => (state, false),
+        GraphicsPm::Freezing if reset() => (GraphicsPm::Frozen, true),
+        GraphicsPm::Freezing => (GraphicsPm::Stopped, false),
+        _ => (GraphicsPm::Stopped, true),
     }
 }
 /// How long the prepare hook waits for submitted jobs (the GFX job timeout,
@@ -1144,22 +1171,112 @@ async fn prepare_graphics_idle() {
     );
 }
 async fn prepare_graphics_suspend() {
-    use core::fmt::Write as _;
     if crate::amdgpu_rdna2_client::backend() != crate::amdgpu_rdna2_client::Backend::Raphael {
         return;
     }
     // amdgpu_fence_driver_hw_fini waits for the rings to empty first.
+    drain_rings().await;
+    quiesce_graphics(GraphicsPm::Quiesced, Vec::new()).await;
+}
+async fn drain_rings() {
+    use core::fmt::Write as _;
     if !rings_idle(RING_DRAIN_MS).await {
         let _ = writeln!(
             narf_console::Writer,
             "amdgpu: raphael rings still busy at suspend; their jobs fail"
         );
     }
+}
+/// Hibernation with graphics up (`amdgpu_pmops_freeze` on an APU): the S3
+/// preparation, with the carve-out emptied first. S4 loses it, and an APU's
+/// VRAM is evicted only for S4 (`amdgpu_device_evict_resources`), so every
+/// unpinned client buffer moves to system memory, which the image captures.
+/// Pinned ones (a scanned-out framebuffer) stay and lose their contents, as
+/// in Linux. Kernel state needs nothing: the rings, MQDs, GART table and
+/// scanout are rebuilt or cleared at resume, firmware is staged again from
+/// system memory, and VCN's buffer is saved as for S3. The sync suspend then
+/// resets the GPU after the PSP stops ([`after_psp_stop`]).
+///
+/// Placement is excluded first, in clients' order (before the display
+/// owner), and held until the client path is withdrawn, so no submission or
+/// placement lands in the carve-out after its buffers left. A failed
+/// eviction puts the heap back and refuses the hibernation with graphics
+/// still running.
+async fn prepare_graphics_hibernate() -> Result<(), narf_power::device_pm::DevicePmError> {
+    use core::fmt::Write as _;
+    if crate::amdgpu_rdna2_client::backend() != crate::amdgpu_rdna2_client::Backend::Raphael {
+        return Ok(());
+    }
+    let Some(card) = crate::amdgpu_navi22_cs::drm_card() else {
+        drain_rings().await;
+        quiesce_graphics(GraphicsPm::Freezing, Vec::new()).await;
+        return Ok(());
+    };
+    let gate = crate::amdgpu_gem::lock_placement_live(card)
+        .await
+        .map_err(|_| narf_power::device_pm::DevicePmError::Busy)?;
+    drain_rings().await;
+    let heap = crate::amdgpu_navi22_cs::client_heap();
+    let evicted = match evict_for_hibernation(&gate, heap).await {
+        Ok(evicted) => evicted,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: raphael hibernation refused: client VRAM not evicted ({error:?})"
+            );
+            return Err(narf_power::device_pm::DevicePmError::Busy);
+        }
+    };
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: raphael hibernation: {} client buffers out of the carve-out",
+        evicted.len()
+    );
+    quiesce_graphics(GraphicsPm::Freezing, evicted).await;
+    drop(gate);
+    Ok(())
+}
+/// `amdgpu_ttm_evict_resources(TTM_PL_VRAM)` for `gate`'s card: the heap is
+/// withdrawn, so nothing new lands in it, then every unpinned buffer moves to
+/// system memory with its bytes. Returns the buffers whose allowed domains
+/// the move widened, for [`crate::amdgpu_gem::restore_domains`] at resume.
+/// On failure their domains are put back and `heap` registered again.
+pub(crate) async fn evict_for_hibernation(
+    gate: &crate::amdgpu_gem::PlacementGuard,
+    heap: Option<crate::amdgpu_gem::VramHeap>,
+) -> Result<Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>, narf_filesystem::FsError> {
+    let card = gate.card();
+    crate::amdgpu_gem::unregister_vram_heap(card);
+    let (touched, evicted) = crate::amdgpu_gem::evict_all(gate).await;
+    match evicted {
+        Ok(()) => Ok(touched),
+        Err(error) => {
+            crate::amdgpu_gem::restore_domains(touched);
+            if let Some(heap) = heap {
+                crate::amdgpu_gem::register_vram_heap(card, heap);
+            }
+            Err(error)
+        }
+    }
+}
+/// The S3 preparation from the drained rings on, leaving `next`. `evicted`
+/// is kept for the resume; with no running graphics to quiesce it is put
+/// back now.
+async fn quiesce_graphics(
+    next: GraphicsPm,
+    evicted: Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>,
+) {
+    use core::fmt::Write as _;
     let mut guard = DISPLAY.lock().await;
-    let Some(display) = guard.as_mut() else {
+    let display = guard
+        .as_mut()
+        .filter(|d| d.graphics.as_ref().is_some_and(|g| g.queues_verified()));
+    let Some(display) = display else {
+        crate::amdgpu_gem::restore_domains(evicted);
         return;
     };
-    let Some(graphics) = display.graphics.as_mut().filter(|g| g.queues_verified()) else {
+    display.evicted = evicted;
+    let Some(graphics) = display.graphics.as_mut() else {
         return;
     };
     // The media session table stays for the restored firmware context.
@@ -1183,7 +1300,7 @@ async fn prepare_graphics_suspend() {
         let _ = writeln!(narf_console::Writer, "amdgpu: raphael IH quiesce {error:?}");
     }
     crate::amdgpu_fence_navi22::abandon_all();
-    display.graphics_pm = GraphicsPm::Quiesced;
+    display.graphics_pm = next;
 }
 async fn resume_graphics() {
     use core::fmt::Write as _;
@@ -1203,6 +1320,7 @@ async fn resume_graphics() {
         graphics,
         retired,
         graphics_pm,
+        evicted,
         ..
     } = display;
     let result = async {
@@ -1231,6 +1349,9 @@ async fn resume_graphics() {
     }
     .await;
     *graphics_pm = GraphicsPm::Running;
+    // After a hibernation: back to their own domains, in system memory until
+    // validation brings each into the heap the rebuild registered again.
+    crate::amdgpu_gem::restore_domains(core::mem::take(evicted));
     if let Err(error) = result {
         let _ = writeln!(
             narf_console::Writer,
@@ -1257,10 +1378,7 @@ impl narf_power::system_pm::AsyncSystemPm for GraphicsSystemPm {
             match target {
                 SystemSleepState::S3 => prepare_graphics_suspend().await,
                 SystemSleepState::S0Idle => prepare_graphics_idle().await,
-                // Graphics in the carve-out would be lost: not yet.
-                SystemSleepState::S4 => {
-                    return Err(narf_power::device_pm::DevicePmError::NotImplemented)
-                }
+                SystemSleepState::S4 => prepare_graphics_hibernate().await?,
             }
             Ok::<(), narf_power::device_pm::DevicePmError>(())
         })
@@ -1550,8 +1668,11 @@ struct Display {
     /// the memory they published stays quarantined (Navi22's policy: each
     /// recovery leaks its old owners' carve-out).
     retired: Vec<crate::amdgpu_raphael_boot::ColdBoot>,
-    /// Where an S3 transition left the graphics (`GraphicsPm`).
+    /// Where a system transition left the graphics (`GraphicsPm`).
     graphics_pm: GraphicsPm,
+    /// The client buffers a hibernation moved out of the carve-out, with
+    /// the allowed domains to put back at resume.
+    evicted: Vec<(Arc<crate::amdgpu_gem::GemObject>, u64)>,
 }
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
 
@@ -1615,6 +1736,7 @@ pub(crate) fn start() -> bool {
         graphics: None,
         retired: Vec::new(),
         graphics_pm: GraphicsPm::Running,
+        evicted: Vec::new(),
     });
     drop(owner);
     crate::amdgpu_usbc::observe_connectors();
@@ -1698,6 +1820,7 @@ pub(crate) fn suspend() -> bool {
     let Display {
         loader,
         stream,
+        graphics,
         graphics_pm,
         ..
     } = display;
@@ -1714,9 +1837,10 @@ pub(crate) fn suspend() -> bool {
             return false;
         }
     }
-    if *graphics_pm == GraphicsPm::Quiesced {
+    if matches!(*graphics_pm, GraphicsPm::Quiesced | GraphicsPm::Freezing) {
         // The async prepare quiesced graphics. S3 powers the engines off,
-        // which is the reset releasing the TMR under them needs.
+        // which is the reset releasing the TMR under them needs; a
+        // hibernation resets them here (`after_psp_stop`).
         // SAFETY: as above; `resume` boots the loader again before use.
         // Boxed: block_on_spin holds its future by value, and the PSP stop's
         // state has no business in this frame.
@@ -1724,10 +1848,21 @@ pub(crate) fn suspend() -> bool {
             loader.stop_for_reset()
         }))
         .is_ok();
-        if stopped {
-            *graphics_pm = GraphicsPm::Stopped;
-        }
-        return stopped;
+        let reset = || {
+            let (Some(device), Some(graphics)) = (crate::amdgpu::pci_device(), graphics.as_mut())
+            else {
+                return false;
+            };
+            // SAFETY: quiesced at prepare and the TMR released just above;
+            // the resume rebuilds every engine.
+            narf_scheduler::block_on_spin(alloc::boxed::Box::pin(unsafe {
+                graphics.mode2_reset(&device)
+            }))
+            .is_ok()
+        };
+        let (next, proceed) = after_psp_stop(*graphics_pm, stopped, reset);
+        *graphics_pm = next;
+        return proceed;
     }
     narf_scheduler::block_on_spin(loader.stop()).is_ok()
 }
@@ -1822,6 +1957,126 @@ mod tests {
         if resume_work(GraphicsPm::Idle) != ResumeWork::Nothing {
             return TestResult::Fail("s2idle resume work");
         }
+        // A hibernation that froze resumes like S3 (restore or thaw find
+        // the GPU power-cycled or reset); one whose PSP never stopped needs
+        // the reset first.
+        if resume_work(GraphicsPm::Frozen) != ResumeWork::Rebuild
+            || resume_work(GraphicsPm::Freezing) != ResumeWork::ResetThenRebuild
+        {
+            return TestResult::Fail("S4 resume work");
+        }
+        TestResult::Pass
+    }
+    /// amdgpu_pmops_freeze resets an APU after amdgpu_device_suspend: the
+    /// sync suspend resets only a hibernation, only once the PSP stopped,
+    /// and a failed reset fails the freeze.
+    fn raphael_s4_freeze_resets_after_the_psp_stop() -> TestResult {
+        use core::cell::Cell;
+        use GraphicsPm::{Freezing, Frozen, Quiesced, Stopped};
+        let resets = Cell::new(0);
+        let run = |state, stopped, ok| {
+            resets.set(0);
+            let next = after_psp_stop(state, stopped, || {
+                resets.set(resets.get() + 1);
+                ok
+            });
+            (next, resets.get())
+        };
+        // S3: the power-off is the reset.
+        if run(Quiesced, true, true) != ((Stopped, true), 0)
+            || run(Quiesced, false, true) != ((Quiesced, false), 0)
+        {
+            return TestResult::Fail("S3 sync suspend reset");
+        }
+        // S4: reset once the PSP stopped; a failed reset fails the freeze.
+        if run(Freezing, true, true) != ((Frozen, true), 1)
+            || run(Freezing, true, false) != ((Stopped, false), 1)
+            || run(Freezing, false, true) != ((Freezing, false), 0)
+        {
+            return TestResult::Fail("S4 freeze reset");
+        }
+        TestResult::Pass
+    }
+    /// After the freeze's eviction the carve-out may be lost (S4 powers it
+    /// off, and firmware may reuse it before the image is restored): every
+    /// unpinned client buffer's bytes are already in system memory, and
+    /// nothing new can be placed in the withdrawn heap.
+    fn raphael_s4_eviction_empties_the_carve_out() -> TestResult {
+        use crate::amdgpu_gem::{GemState, VramHeap};
+        const CARD: u32 = 0xe1c5; // linux: n/a (test card index)
+        const BASE: u64 = 0x8_0000_0000; // linux: n/a (test carve-out MC address)
+        struct Registered;
+        impl Drop for Registered {
+            fn drop(&mut self) {
+                crate::amdgpu_gem::unregister_vram_heap(CARD);
+            }
+        }
+        let mut memory = vec![0u8; 16 * 4096];
+        let map = narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0xb900_0000),
+            virt: memory.as_mut_ptr() as u64,
+            len: memory.len() as u64,
+            kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+        };
+        // SAFETY: this test exclusively owns memory until the registered heap
+        // and every object have been dropped; no hardware reaches it.
+        let pool = unsafe { crate::amdgpu_vram::Pool::from_owned_range(map, BASE) }.unwrap();
+        let heap = VramHeap {
+            pool: pool.clone(),
+            fb_base: BASE,
+            fb_offset: BASE,
+            unmapped: None,
+        };
+        let _registered = Registered;
+        crate::amdgpu_gem::register_vram_heap(CARD, heap.clone());
+        let state = GemState::for_card(CARD);
+        let full = pool.available();
+        let Some(object) = state
+            .create_dumb(64, 4, 32)
+            .ok()
+            .and_then(|(handle, _, _)| state.object(handle))
+        else {
+            return TestResult::Fail("client buffer in the carve-out");
+        };
+        let Some(at) = object.placement().gpu_at(0x123) else {
+            return TestResult::Fail("client buffer address");
+        };
+        let at = (at - BASE) as usize;
+        memory[at..at + 4].copy_from_slice(&0x00c0_ffeeu32.to_le_bytes());
+        let mut back = [0u8; 4];
+        if object.system()
+            || object.placement().read_bytes(0x123, &mut back).is_none()
+            || back != 0x00c0_ffeeu32.to_le_bytes()
+        {
+            return TestResult::Fail("client buffer not in the carve-out");
+        }
+        let evicted = narf_scheduler::block_on_spin(async {
+            let gate = crate::amdgpu_gem::lock_placement(CARD).await;
+            evict_for_hibernation(&gate, Some(heap.clone())).await
+        });
+        let Ok(evicted) = evicted else {
+            return TestResult::Fail("hibernation eviction");
+        };
+        if !object.system() || evicted.len() != 1 || pool.available() != full {
+            return TestResult::Fail("the eviction left a buffer in the carve-out");
+        }
+        if state
+            .create_dumb(64, 4, 32)
+            .is_ok_and(|(handle, _, _)| state.object(handle).is_some_and(|o| !o.system()))
+        {
+            return TestResult::Fail("a buffer was placed in the withdrawn heap");
+        }
+        // S4: the carve-out's contents are gone.
+        memory.fill(0);
+        back = [0; 4];
+        if object.placement().read_bytes(0x123, &mut back).is_none()
+            || back != 0x00c0_ffeeu32.to_le_bytes()
+        {
+            return TestResult::Fail("client bytes did not survive the carve-out");
+        }
+        crate::amdgpu_gem::restore_domains(evicted);
+        drop(object);
+        drop(state);
         TestResult::Pass
     }
     /// amdgpu_acpi_is_s0ix_active for an APU suspending to idle, in Linux's
@@ -1851,6 +2106,14 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/raphael-reset",
         raphael_s0ix_follows_amdgpu_acpi_is_s0ix_active
+    );
+    kernel_test_in!(
+        "drivers/gpu/raphael-reset",
+        raphael_s4_freeze_resets_after_the_psp_stop
+    );
+    kernel_test_in!(
+        "drivers/gpu/raphael-reset",
+        raphael_s4_eviction_empties_the_carve_out
     );
     /// Every literal here is read off the AMD header, never off the row it
     /// checks. One case per row, so adding a GPU means adding a case: a new
