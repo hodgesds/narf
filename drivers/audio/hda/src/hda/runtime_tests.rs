@@ -1892,9 +1892,11 @@ fn native_hda_pm_busy_while_stream_runs_or_prepared() -> TestResult {
     if dev.quiesce().is_ok() {
         return TestResult::Fail("quiesce must refuse a running stream");
     }
-    // Layer 1: the PCM stop path parks the controller itself.
-    if playback.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
-        return TestResult::Fail("stop parks the controller");
+    // Once the stream is stopped the park is allowed (the autosuspend runs
+    // it after the delay; here it is called directly).
+    if playback.stop().is_err() || dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("a stopped stream lets the controller park");
     }
     // And the next start transparently re-inits it.
     if playback
@@ -1906,8 +1908,9 @@ fn native_hda_pm_busy_while_stream_runs_or_prepared() -> TestResult {
     {
         return TestResult::Fail("start re-inits a parked controller");
     }
-    if playback.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
-        return TestResult::Fail("second stop re-parks the controller");
+    if playback.stop().is_err() || dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("second stop lets the controller park again");
     }
     TestResult::Pass
 }
@@ -3359,11 +3362,14 @@ fn native_hda_pm_open_wakes_a_parked_controller() -> TestResult {
         {
             return TestResult::Fail("playback after open");
         }
-        // DROP parks the idle controller; close follows.
-        if playback.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
-            return TestResult::Fail("DROP parks the controller");
+        // DROP and close, then the park the autosuspend would run.
+        if playback.stop().is_err() {
+            return TestResult::Fail("DROP");
         }
         drop(playback);
+        if dev.quiesce().is_err() || !dev.suspended.load(Ordering::Acquire) {
+            return TestResult::Fail("the closed controller parks");
+        }
     }
     if dev.irq.failed.load(Ordering::Acquire) {
         return TestResult::Fail("no command may time out across a suspend cycle");
@@ -3637,3 +3643,54 @@ fn native_hda_alc897_pll_and_eapd_coefs() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda/alc897", native_hda_alc897_pll_and_eapd_coefs);
+
+/// Linux keeps the controller powered while a PCM is open (`azx_pcm_open`
+/// takes `snd_hda_power_up_pm`, `azx_pcm_close` drops it) and powers it down
+/// only `power_save` seconds after the last reference went
+/// (`pm_runtime_put_autosuspend`): codec suspend first
+/// (`hda_call_codec_suspend`), then the controller (`azx_runtime_suspend`).
+/// A DROP with the PCM still open, what PipeWire sends when a sink goes
+/// idle, must not park the controller, and neither may the close at once.
+/// Before, every stop parked it, so each pause/resume of an open sink cost
+/// a full link reset and codec re-init.
+fn native_hda_pm_stop_and_close_keep_the_controller_up() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open");
+    };
+    let start = |playback: &mut Box<dyn narf_drivers_sound::hardware::PcmHardware>| {
+        playback.prepare().is_ok()
+            && playback.write(&[0x5a; 512]) == Ok(512)
+            && playback.start().is_ok()
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || !start(&mut playback)
+    {
+        return TestResult::Fail("playback");
+    }
+    if playback.stop().is_err() || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("a stop with the PCM open must not park the controller");
+    }
+    if !start(&mut playback) || dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("restart after a stop");
+    }
+    if playback.stop().is_err() {
+        return TestResult::Fail("second stop");
+    }
+    drop(playback);
+    if dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the close parks only after the autosuspend delay");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-autosuspend",
+    native_hda_pm_stop_and_close_keep_the_controller_up
+);
