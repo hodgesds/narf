@@ -270,8 +270,17 @@ pub fn tx_ring(iface: &Cap<NetIface, Tx>, queue: u16) -> Ring<Frame>;
   (`Tcb::tx_bind`) acquires only from that queue's pool
   (`NetIfaceSnapshot::tx_acquire_on_queue`); an empty bound pool falls back to
   the copy path, never to another queue's pool, so each pool covers exactly
-  the frames its own ring holds in flight. Only a connection's first frame,
-  before the binding exists, uses the flow hash or round-robin choice.
+  the frames its own ring holds in flight. Before the binding exists (the
+  handshake and the first data segment) the pool is the queue the driver posts
+  the flow on: on an egress with a transmit-queue contract,
+  `TxBackpressure::tx_select_queue` of the flow, placed through
+  `rss::flow_probe_ipv4` / `rss::flow_probe_ipv6` (the shortest frame whose
+  `flow_tuple` is the flow), so the binding then made from the first frame
+  names the same queue (`NetIfaceSnapshot::tx_acquire_ipv4_flow` /
+  `tx_acquire_ipv6_flow`). Only an egress without the contract uses the flow
+  hash (`ipv4_flow_queue`, the one its driver posts by) or round-robin. A
+  frame built in one queue's pool and posted on another moves a buffer between
+  pools at every completion, draining the first.
 - Resolved interface snapshots retain references to their TX recyclers. The
   routing/TCP fast path acquires from that snapshot, not by taking the global
   interface-registry lock once per packet.

@@ -3137,7 +3137,10 @@ fn build_tcb_frame(
         // A connection bound to a transmit queue builds in that queue's
         // pool: the frame is posted on that queue's ring and its buffer
         // recycled there, so each pool covers only its own ring. Before the
-        // binding exists (the first frame) the flow hash picks the pool.
+        // binding exists (the handshake and the first data segment) the
+        // pool is the one of the queue the driver will post the flow on —
+        // the queue the binding then takes — as Linux picks a socket's
+        // queue once (`netdev_pick_tx`) for every skb it sends.
         let bound = t
             .tx_bind
             .as_ref()
@@ -3146,7 +3149,13 @@ fn build_tcb_frame(
         let frame = if let Some(queue) = bound {
             dev.tx_acquire_on_queue(total, queue)
         } else if t.is_ipv6 {
-            dev.tx_acquire(total)
+            dev.tx_acquire_ipv6_flow(
+                total,
+                t.local_addr6,
+                t.remote_addr6,
+                t.local_port,
+                t.remote_port,
+            )
         } else {
             dev.tx_acquire_ipv4_flow(
                 total,

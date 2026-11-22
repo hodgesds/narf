@@ -99,6 +99,48 @@ pub fn flow_tuple(frame: &[u8], out: &mut [u8; 36]) -> usize {
     n
 }
 
+/// The shortest Ethernet frame whose [`flow_tuple`] is the IPv4 flow
+/// `src:src_port → dst:dst_port` of `protocol`. A queue selection that hashes
+/// frames (`TxBackpressure::tx_select_queue`) can place a flow with it before
+/// any of the flow's frames exists — the stack needs the queue first, to
+/// build the frame in that queue's pool.
+pub fn flow_probe_ipv4(
+    src: [u8; 4],
+    dst: [u8; 4],
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+) -> [u8; 38] {
+    let mut f = [0u8; 38];
+    f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    f[14] = 0x45;
+    f[23] = protocol;
+    f[26..30].copy_from_slice(&src);
+    f[30..34].copy_from_slice(&dst);
+    f[34..36].copy_from_slice(&src_port.to_be_bytes());
+    f[36..38].copy_from_slice(&dst_port.to_be_bytes());
+    f
+}
+
+/// As [`flow_probe_ipv4`] for an IPv6 flow (no extension headers).
+pub fn flow_probe_ipv6(
+    src: [u8; 16],
+    dst: [u8; 16],
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+) -> [u8; 58] {
+    let mut f = [0u8; 58];
+    f[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    f[14] = 0x60;
+    f[20] = protocol;
+    f[22..38].copy_from_slice(&src);
+    f[38..54].copy_from_slice(&dst);
+    f[54..56].copy_from_slice(&src_port.to_be_bytes());
+    f[56..58].copy_from_slice(&dst_port.to_be_bytes());
+    f
+}
+
 /// A balanced indirection table: `len` entries round-robin over `queues`, so
 /// every queue draws an equal share of the hash space. `len` is the hardware
 /// table size (commonly 128 or 512); `queues` the active RX queue count.

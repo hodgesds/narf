@@ -1733,9 +1733,15 @@ impl NetIfaceSnapshot {
         self.tx_acquire_from_pool(len, pools.acquire_pool()?)
     }
 
-    /// Acquire a TCP/IPv4 zero-copy frame. Affinity-enabled drivers use the
-    /// same symmetric 4-tuple mapping as their regular TX path; all other
-    /// drivers retain the normal round-robin pool selection.
+    /// Acquire a TCP/IPv4 zero-copy frame for a flow not yet bound to a
+    /// transmit queue. A driver with a transmit-queue contract posts the
+    /// flow on the queue its [`crate::txq::TxBackpressure::tx_select_queue`]
+    /// picks and recycles the completed buffer into that ring's pool, so the
+    /// frame is built in that queue's pool: built anywhere else, each frame
+    /// moved a buffer from the pool it came from to the posting ring's, and
+    /// the pools the stack's own hash named ran dry. Without a contract,
+    /// affinity-enabled drivers use the same symmetric 4-tuple mapping as
+    /// their regular TX path and all others the round-robin selection.
     pub(crate) fn tx_acquire_ipv4_flow(
         &self,
         len: usize,
@@ -1745,7 +1751,47 @@ impl NetIfaceSnapshot {
         dst_port: u16,
     ) -> Option<crate::Frame> {
         let pools = self.tx_pools.as_ref()?;
-        self.tx_acquire_from_pool(len, pools.acquire_ipv4_flow(src, dst, src_port, dst_port)?)
+        let selected = match self.tx_backpressure.as_ref() {
+            Some(driver) => {
+                let probe = crate::rss::flow_probe_ipv4(
+                    src,
+                    dst,
+                    crate::pkt::IP_PROTO_TCP,
+                    src_port,
+                    dst_port,
+                );
+                pools.acquire_pool_on(usize::from(driver.tx_select_queue(&probe)))?
+            }
+            None => pools.acquire_ipv4_flow(src, dst, src_port, dst_port)?,
+        };
+        self.tx_acquire_from_pool(len, selected)
+    }
+
+    /// As [`Self::tx_acquire_ipv4_flow`] for a TCP/IPv6 flow. Without a
+    /// transmit-queue contract the selection stays round-robin.
+    pub(crate) fn tx_acquire_ipv6_flow(
+        &self,
+        len: usize,
+        src: [u8; 16],
+        dst: [u8; 16],
+        src_port: u16,
+        dst_port: u16,
+    ) -> Option<crate::Frame> {
+        let pools = self.tx_pools.as_ref()?;
+        let selected = match self.tx_backpressure.as_ref() {
+            Some(driver) => {
+                let probe = crate::rss::flow_probe_ipv6(
+                    src,
+                    dst,
+                    crate::pkt::IP_PROTO_TCP,
+                    src_port,
+                    dst_port,
+                );
+                pools.acquire_pool_on(usize::from(driver.tx_select_queue(&probe)))?
+            }
+            None => pools.acquire_pool()?,
+        };
+        self.tx_acquire_from_pool(len, selected)
     }
 
     /// Acquire from transmit queue `queue`'s own pool and no other, for a
