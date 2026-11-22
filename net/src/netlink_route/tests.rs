@@ -249,6 +249,95 @@ narf_kernel_test::kernel_test_in!(
     getroute_dump_has_loopback_and_terminates
 );
 
+/// `inet_rtm_getroute` without RTM_F_FIB_MATCH answers with the route the
+/// lookup produced (`rt_fill_info`): rtm_dst_len 32, RTM_F_CLONED, protocol
+/// RTPROT_UNSPEC, RTA_TABLE, RTA_DST = the queried address, RTA_OIF, the
+/// selected source as RTA_PREFSRC and the gateway, which iproute2 prints as
+/// `198.18.44.9 via 10.44.3.1 dev A src 10.44.3.165 ... cache`. RTA_OIF in
+/// the request is `fl4.flowi4_oif`, so only routes through that device
+/// count. NARF ignored RTA_OIF and returned the FIB entry (`ip route get
+/// 192.168.1.1 oif wlan0` printed eth0's `192.168.0.0/22` route).
+fn getroute_answers_the_cloned_route_and_honours_oif() -> narf_kernel_test::TestResult {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    const RTM_F_CLONED: u32 = 0x200;
+    const RTM_F_FIB_MATCH: u32 = 0x2000;
+    let net = crate::route::Ipv4Net {
+        addr: crate::ipv4::Ipv4Addr([198, 18, 44, 0]),
+        prefix_len: 24,
+    };
+    let devices = [
+        ("rtnl-get-a0", [10, 44, 3, 165], [10, 44, 3, 1], 100u32),
+        ("rtnl-get-b0", [10, 44, 1, 211], [10, 44, 1, 254], 600),
+    ];
+    for (i, (name, ip, gateway, metric)) in devices.iter().enumerate() {
+        crate::iface::register(name, [0x02, 0, 0, 0, 0x44, i as u8], discard);
+        crate::iface::set_link_state(name, true);
+        crate::iface::set_iface_ipv4_fields(name, *ip, [0; 4]);
+        crate::iface::add_addr(name, *ip, 24);
+        crate::route::route_add(crate::route::Route {
+            net_ns_id: 0,
+            dst: net,
+            gateway: Some(crate::ipv4::Ipv4Addr(*gateway)),
+            iface: alloc::string::String::from(*name),
+            src_hint: None,
+            metric: *metric,
+            scope: crate::route::Scope::Universe,
+            table: crate::route::TABLE_MAIN,
+            protocol: crate::route::RTPROT_KERNEL,
+        });
+    }
+    let index = |name: &str| crate::iface::ifindex_of(name).unwrap();
+    let request = |oif: Option<u32>, flags: u32| {
+        let mut body = vec![AF_INET, 32, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&flags.to_ne_bytes());
+        push_rtattr(&mut body, RTA_DST, &[198, 18, 44, 9]);
+        if let Some(oif) = oif {
+            push_rtattr(&mut body, RTA_OIF, &oif.to_ne_bytes());
+        }
+        frame_message(RTM_GETROUTE, NLM_F_REQUEST, 64, 8, &body)
+    };
+    let check = |reply: &[Vec<u8>], (name, ip, gateway, _): (&str, [u8; 4], [u8; 4], u32)| {
+        let [msg] = reply else {
+            return false;
+        };
+        let flags = &msg[NLMSG_HDRLEN + 8..NLMSG_HDRLEN + 12];
+        let flags = u32::from_ne_bytes(flags.try_into().unwrap());
+        hdr_of(msg).1 == RTM_NEWROUTE
+            && msg[NLMSG_HDRLEN + 1] == 32
+            && msg[NLMSG_HDRLEN + 5] == 0
+            && msg[NLMSG_HDRLEN + 7] == RTN_UNICAST
+            && flags & RTM_F_CLONED != 0
+            && find_rtattr(msg, 12, RTA_DST).as_deref() == Some(&[198, 18, 44, 9][..])
+            && find_rtattr(msg, 12, RTA_OIF).as_deref() == Some(&index(name).to_ne_bytes()[..])
+            && find_rtattr(msg, 12, RTA_GATEWAY).as_deref() == Some(&gateway[..])
+            && find_rtattr(msg, 12, RTA_PREFSRC).as_deref() == Some(&ip[..])
+    };
+    let plain = build_dump(&request(None, 0));
+    let bound = build_dump(&request(Some(index(devices[1].0)), 0));
+    let fib = build_dump(&request(None, RTM_F_FIB_MATCH));
+    for (name, _, _, _) in devices {
+        crate::route::route_delete(net, name, crate::route::TABLE_MAIN);
+    }
+    if !check(&plain[..], devices[0]) {
+        return narf_kernel_test::TestResult::Fail(
+            "RTM_GETROUTE did not answer a cloned /32 route",
+        );
+    }
+    if !check(&bound[..], devices[1]) {
+        return narf_kernel_test::TestResult::Fail("RTM_GETROUTE ignored RTA_OIF");
+    }
+    // RTM_F_FIB_MATCH still answers the FIB entry itself.
+    narf_kernel_test::kt_assert_eq!(fib.len(), 1);
+    narf_kernel_test::kt_assert_eq!(fib[0][NLMSG_HDRLEN + 1], 24);
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "net/getroute-cloned",
+    getroute_answers_the_cloned_route_and_honours_oif
+);
+
 fn getroute_point_query_uses_longest_prefix_match() -> narf_kernel_test::TestResult {
     fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
