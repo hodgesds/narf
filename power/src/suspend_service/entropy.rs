@@ -7,7 +7,8 @@
 //! 800-90B health discipline, refusing with a typed error — no
 //! fallback — when no healthy source exists. The design's standing
 //! invariant (power-suspend design §1.4 / §3.1) is that there is no
-//! other path: no `per_task_rng`, no cycle counter, no private probe
+//! other path: no cycle-counter-seeded RNG (the predictable
+//! `per_task_rng` helper was removed, issue #1296), no private probe
 //! of the RNG instructions.
 //!
 //! [`KeyEntropy`] exists so fixtures can script the surface's two

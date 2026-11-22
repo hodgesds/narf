@@ -1761,8 +1761,9 @@ pub enum Syscall {
     /// Returns the byte count actually written; -1 on bad pointer or
     /// length. Stage-4 backing source is a Park-Miller LCG seeded
     /// from `monotonic_ns()` mixed with the cycle counter — NOT
-    /// cryptographically secure. The seed quality matches
-    /// `crypto::per_task_rng()` so callers wanting real entropy
+    /// cryptographically secure. The seed quality matched the removed
+    /// `crypto::per_task_rng()` (predictable cycle-counter output,
+    /// removed by issue #1296), so callers wanting real entropy
     /// must also gate on a future `arch::has_hw_entropy()` probe.
     GetRandom,
 

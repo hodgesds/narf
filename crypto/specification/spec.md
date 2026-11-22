@@ -129,7 +129,9 @@ explicitly trusts the architectural RNG; it does not implement the system
 pool, jitter collection, per-task handle lifecycle, or the SP 800-90B service
 specified below — that discipline lives on the key-material surface, next.
 The legacy Stage-3 `per_task_rng` / `fill_random_bytes`
-helpers remain predictable and must not supply protocol secrets or nonces.
+helpers were removed (issue #1296): they were predictable
+cycle-counter streams, and the `try_` adapters above are now the only
+per-task RNG surface — no predictable helper remains to misuse.
 
 The key-material surface (issue #996) is the only sanctioned source for
 SMS/SMK-class key generation: `has_hw_entropy() -> bool`,
@@ -150,11 +152,11 @@ Absence, starvation, and health failure all return
 `CryptoError::EntropyUnavailable` — the §5 starvation rule: no silent
 fallback to a weaker source, and in particular never to the
 cycle-counter placeholder. Failed fills zeroize the caller's whole
-output buffer, and partial seeds are never published. The legacy
-`per_task_rng` has no live consumers outside this crate (consumer
-audit at the #996 landing) and is prohibited for key material by this
-interface: key generation through it, or mixing its output into key
-material, is a spec violation.
+output buffer, and partial seeds are never published. The predictable
+`per_task_rng` helper had no live consumers outside this crate
+(consumer audit at the #996 landing) and was removed by issue #1296.
+Key generation through a cycle-counter-seeded stream, or mixing such
+output into key material, remains a spec violation.
 
 One consumer of this section lives outside the crate: the userspace
 CSPRNG pool (`filesystem::csprng`, backing `getrandom(2)`, `/dev/random`,

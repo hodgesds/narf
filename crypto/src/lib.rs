@@ -3,7 +3,7 @@
 //! Spec: `crypto/specification/spec.md`. Stage-3 surface lands the
 //! cap-gated wrappers around RustCrypto primitives (Ed25519 verify,
 //! ChaCha20-Poly1305 AEAD, HKDF-SHA-256), the un-gated BLAKE3 content
-//! hash, and a per-task `ChaCha20Rng` helper. The full SecureRing impl
+//! hash, and hardware-seeded `try_` entropy adapters. The full SecureRing impl
 //! is deferred to Stage 4 — see the `secure_ring` module for the
 //! handshake / replay-window deferrals.
 //!
@@ -496,46 +496,19 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
 }
 
 // ── Per-task RNG ─────────────────────────────────────────────────────
-//
-// Legacy Stage-3 compatibility helpers use observable cycle counters. They
-// remain predictable and must not supply protocol secrets or nonces. New
-// protocol callers use try_per_task_rng / try_fill_random_bytes, which require
-// fresh architectural RNG output and propagate failure. Key material —
-// SMS/SMK-class secrets and any long-term key generation — must instead use
-// try_fill_key_material / key_material_rng, which draw only from the
-// seed-grade architectural source behind SP 800-90B health tests and refuse
-// (EntropyUnavailable) when no healthy source exists; this section's output
-// must never seed, reseed, or be mixed into key material. The full system
-// pool and per-task handle lifecycle remain separate work.
-
-use rand_chacha::ChaCha20Rng;
-use rand_core::{RngCore, SeedableRng};
-
-/// Construct the predictable Stage-3 compatibility stream from cycle counts.
-/// This helper is unsuitable for cryptographic secrets.
-/// Protocol secrets and nonces must use [`try_per_task_rng`] instead;
-/// key material must use [`try_fill_key_material`] / [`key_material_rng`].
-pub fn per_task_rng() -> ChaCha20Rng {
-    // Mix cycles into a 32-byte seed by stretching across the buffer.
-    // Two independent reads + a constant tag keep the seed at least
-    // distinct across rapid successive calls within one task; this is
-    // emphatically not the same thing as adversarial unpredictability.
-    let mut seed = [0u8; 32];
-    let c0 = narf_time::now_cycles();
-    let c1 = narf_time::now_cycles().wrapping_add(0x9E37_79B9_7F4A_7C15); // golden-ratio splash
-    seed[..8].copy_from_slice(&c0.to_le_bytes());
-    seed[8..16].copy_from_slice(&c1.to_le_bytes());
-    seed[16..24].copy_from_slice(&c0.wrapping_mul(0x100000001B3).to_le_bytes());
-    seed[24..32].copy_from_slice(&c1.wrapping_mul(0xCBF29CE484222325).to_le_bytes());
-    ChaCha20Rng::from_seed(seed)
-}
-
-/// Fill `out` with the predictable Stage-3 compatibility stream.
-/// This helper is unsuitable for cryptographic secrets.
-/// Protocol secrets and nonces must use [`try_fill_random_bytes`] instead.
-pub fn fill_random_bytes(out: &mut [u8]) {
-    per_task_rng().fill_bytes(out);
-}
+// The predictable Stage-3 helpers (`per_task_rng` / `fill_random_bytes`,
+// cycle-counter-seeded ChaCha20) were removed (issue #1296): no live
+// caller used them and the near-identical names were a footgun next to
+// the `try_` surface. Protocol callers use `try_per_task_rng` /
+// `try_fill_random_bytes` (entropy.rs), which require fresh
+// architectural RNG output and propagate failure. Key material —
+// SMS/SMK-class secrets and any long-term key generation — must instead
+// use `try_fill_key_material` / `key_material_rng`, which draw only from
+// the seed-grade architectural source behind SP 800-90B health tests
+// and refuse (EntropyUnavailable) when no healthy source exists; no
+// cycle-counter-seeded output must ever seed, reseed, or be mixed into
+// key material. The full system pool and per-task handle lifecycle
+// remain separate work.
 
 // ── SecureRing skeleton ──────────────────────────────────────────────
 
