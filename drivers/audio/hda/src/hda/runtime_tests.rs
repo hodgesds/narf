@@ -3287,3 +3287,62 @@ kernel_test_in!(
     "audio/hda/jack",
     native_hda_jack_service_never_stalls_its_cpu
 );
+
+/// PipeWire suspends an idle HDMI sink (DROP, then close) and reopens it on
+/// the next use. The DROP parks the controller (#779: codecs D3, command and
+/// stream engines off, link in reset), so the reopen has to wake it before
+/// the HDMI pin sense, as Linux `azx_pcm_open` calls `snd_hda_power_up_pm`
+/// before the codec's open (`hdmi_pcm_open` reads the pin's ELD). Before,
+/// `Card::open` sensed the pins through the parked rings: GET_PIN_SENSE timed
+/// out (the field log's `verb 0x3f0900 timeout: CORB wp/rp=0x0/0x0 RIRB
+/// wp=0x0 ctl=0x0/0x0`), the timeout latched the transport failure, and every
+/// later open failed with EPIPE.
+fn native_hda_pm_open_wakes_a_parked_controller() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if dev.hdmi.lock().is_empty() {
+        return TestResult::Fail("fixture has no HDMI port");
+    }
+    let card = super::super::stream::Card(dev.clone());
+    let sense = make_verb(0, 3, 0xf09 << 8);
+    for cycle in 0..2 {
+        let base = fixture.model.verbs.len();
+        let Ok(mut playback) = card.open(false, 0) else {
+            return TestResult::Fail(if cycle == 0 {
+                "first open"
+            } else {
+                "reopen of a parked controller must succeed"
+            });
+        };
+        if dev.suspended.load(Ordering::Acquire)
+            || !fixture.model.verbs[base..].contains(&sense)
+        {
+            return TestResult::Fail("open wakes the controller before it senses the HDMI pin");
+        }
+        if playback
+            .configure(super::super::stream::default_params())
+            .is_err()
+            || playback.prepare().is_err()
+            || playback.write(&[0x5a; 512]) != Ok(512)
+            || playback.start().is_err()
+        {
+            return TestResult::Fail("playback after open");
+        }
+        // DROP parks the idle controller; close follows.
+        if playback.stop().is_err() || !dev.suspended.load(Ordering::Acquire) {
+            return TestResult::Fail("DROP parks the controller");
+        }
+        drop(playback);
+    }
+    if dev.irq.failed.load(Ordering::Acquire) {
+        return TestResult::Fail("no command may time out across a suspend cycle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-open",
+    native_hda_pm_open_wakes_a_parked_controller
+);
