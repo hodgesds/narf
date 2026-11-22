@@ -3874,3 +3874,93 @@ kernel_test_in!(
     "audio/hda/pm-codec-only",
     native_hda_pm_codec_only_suspend_without_runtime_pm
 );
+
+/// Linux `azx_runtime_suspend` arms WAKEEN for every codec slot before it
+/// shuts the link down, so a codec state change while parked (a monitor or
+/// headphone plugged) sets STATESTS and wakes the controller;
+/// `azx_runtime_resume` resumes it, the codecs re-read their jacks, and
+/// WAKEEN is disarmed again. Before, nothing armed the wake, and a hotplug
+/// while parked went unseen until the next PCM open.
+fn native_hda_pm_codec_state_change_wakes_a_parked_controller() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    dev.autosuspend_ms.store(10, Ordering::Release);
+    super::wait(|| false, 20);
+    if dev.autosuspend() != Autosuspend::Parked || !dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("the idle controller parks");
+    }
+    // SAFETY: Fixture owns the fake MMIO until all test leases drop.
+    if unsafe { dev.bar0.read16(REG_WAKEEN) } & 0xff != 0xff {
+        return TestResult::Fail("the park arms WAKEEN for every codec slot");
+    }
+    // No state change yet: the controller stays parked. STATESTS is a
+    // resume-well register the reset does not clear.
+    // SAFETY: as above.
+    unsafe { dev.bar0.write16(REG_STATESTS, 0) };
+    if dev.autosuspend() != Autosuspend::Parked {
+        return TestResult::Fail("a parked controller with no codec wake stays parked");
+    }
+    dev.jack_dirty.store(false, Ordering::Release);
+    // Codec 0 signals a state change.
+    // SAFETY: as above.
+    unsafe { dev.bar0.write16(REG_STATESTS, 1) };
+    let _ = dev.autosuspend();
+    if dev.suspended.load(Ordering::Acquire) {
+        return TestResult::Fail("a codec state change wakes the parked controller");
+    }
+    // SAFETY: as above.
+    if unsafe { dev.bar0.read16(REG_WAKEEN) } & 0xff != 0 || !dev.jack_dirty.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("the wake disarms WAKEEN and re-reads the jacks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pm-wake",
+    native_hda_pm_codec_state_change_wakes_a_parked_controller
+);
+
+/// Linux `hda_call_codec_suspend` runs `hda_cleanup_all_streams` before
+/// D3: every converter still assigned a stream gets SET_CHANNEL_STREAMID 0
+/// and SET_STREAM_FORMAT 0 (`really_cleanup_stream`), so no converter keeps
+/// decoding a stream tag across the power-down. Before, NARF sent D3 with
+/// the last stream's tag and format still programmed.
+fn native_hda_pm_codec_suspend_cleans_up_converters() -> TestResult {
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open");
+    };
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure HDMI playback");
+    }
+    drop(playback);
+    let base = fixture.model.verbs.len();
+    if dev.quiesce().is_err() {
+        return TestResult::Fail("park");
+    }
+    let verbs = &fixture.model.verbs[base..];
+    let at = |v: u32| verbs.iter().position(|x| *x == v);
+    let d3 = at(make_verb(0, 1, crate::hda_codec::verb::SET_POWER_STATE | 3));
+    let stream = at(make_verb(0, 2, VERB_SET_CONVERTER_STREAM));
+    let format = at(make_verb(0, 2, VERB_SET_CONVERTER_FORMAT));
+    match (stream, format, d3) {
+        (Some(s), Some(f), Some(d)) if s < d && f < d => TestResult::Pass,
+        _ => TestResult::Fail("the codec suspend clears the converter's stream and format first"),
+    }
+}
+kernel_test_in!(
+    "audio/hda/pm-wake",
+    native_hda_pm_codec_suspend_cleans_up_converters
+);
