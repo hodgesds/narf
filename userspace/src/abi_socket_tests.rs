@@ -12740,6 +12740,111 @@ kernel_test_in!(
     smoke_abi_socket_inet6_udp_link_local_source_scope_is_bound_dev
 );
 
+/// NetworkManager's ndisc (libndp `myrecvfrom6`) learns which device a
+/// Router Advertisement arrived on from the raw ICMPv6 socket: the
+/// link-local source's `sin6_scope_id` and the IPV6_PKTINFO ifindex, and
+/// RFC 4861 §6.1.2 validity from the IPV6_HOPLIMIT (255). Linux
+/// `rawv6_recvmsg` sets `sin6_scope_id = ipv6_iface_scope_id(saddr,
+/// inet6_iif(skb))` and `ip6_datagram_recv_ctl` emits both cmsgs. NARF gave
+/// scope 0 and no control messages, so a handler registered for one ifindex
+/// never saw an RA and NM never configured IPv6 (SLAAC, DHCPv6, RDNSS).
+fn smoke_abi_socket_icmp6_raw_ra_reports_ingress_device_and_hoplimit() -> TestResult {
+    const SOL_IPV6: i32 = 41;
+    const IPV6_PKTINFO: i32 = 50;
+    const IPV6_HOPLIMIT: i32 = 52;
+    const IPPROTO_ICMPV6: u64 = 58;
+    const MSG_DONTWAIT: u64 = 0x40;
+    const IFACE: &str = "abi-v6ra0";
+    const ROUTER: [u8; 16] = [
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x84, 0x43, 0x42, 0xff, 0xfe, 0xa5, 0x25, 0x61,
+    ];
+    const ALL_NODES: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    fn discard(_: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    with_setup(|| {
+        narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0x6d, 1], discard);
+        narf_net::iface::set_link_state(IFACE, true);
+        let ifindex = narf_net::iface::ifindex_of(IFACE).ok_or("test device has no ifindex")?;
+        let fd = match socket_errno(so::AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)? {
+            fd if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6) failed"),
+        };
+        let result = (|| -> Result<(), &'static str> {
+            if sockopt_set_int(fd, so::IPPROTO_IPV6, so::IPV6_RECVPKTINFO, 1)? != 0
+                || sockopt_set_int(fd, so::IPPROTO_IPV6, so::IPV6_RECVHOPLIMIT, 1)? != 0
+            {
+                return Err("enabling IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT failed");
+            }
+            // A Router Advertisement with router lifetime 0 (no default
+            // route is installed), from the router's link-local address.
+            let mut ra = [0u8; 16];
+            ra[0] = 134;
+            ra[4] = 64;
+            let sum = narf_net::ipv6_stack::icmp6_checksum(ROUTER, ALL_NODES, &ra);
+            ra[2..4].copy_from_slice(&sum.to_be_bytes());
+            let mut packet = alloc::vec![0x60, 0, 0, 0, 0, 16, 58, 255];
+            packet.extend_from_slice(&ROUTER);
+            packet.extend_from_slice(&ALL_NODES);
+            packet.extend_from_slice(&ra);
+            narf_net::ipv6_stack::rx_frame(IFACE, &packet);
+
+            let mut data = [0u8; 64];
+            let mut name = [0u8; 28];
+            let mut ctrl = [0u8; 128];
+            let mut iov = [0u8; 16];
+            iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+            iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+            let mut msg = [0u8; 56];
+            msg[0..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes());
+            msg[8..12].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+            msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+            match call(
+                Syscall::SocketRecvMsg.raw(),
+                a2(fd, msg.as_mut_ptr() as u64, MSG_DONTWAIT),
+            ) {
+                Some(16) => {}
+                _ => return Err("the raw ICMPv6 socket did not receive the 16-byte RA"),
+            }
+            if data[0] != 134 || name[8..24] != ROUTER {
+                return Err("the received message is not the router's RA");
+            }
+            if u32::from_ne_bytes([name[24], name[25], name[26], name[27]]) != ifindex {
+                return Err("the RA's link-local source has no ingress sin6_scope_id");
+            }
+            let used = u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize;
+            let len0 = u64::from_ne_bytes(ctrl[0..8].try_into().unwrap()) as usize;
+            let level0 = i32::from_ne_bytes(ctrl[8..12].try_into().unwrap());
+            let kind0 = i32::from_ne_bytes(ctrl[12..16].try_into().unwrap());
+            let pktinfo_dst = &ctrl[16..32];
+            let pktinfo_ifindex = u32::from_ne_bytes(ctrl[32..36].try_into().unwrap());
+            let len1 = u64::from_ne_bytes(ctrl[40..48].try_into().unwrap()) as usize;
+            let level1 = i32::from_ne_bytes(ctrl[48..52].try_into().unwrap());
+            let kind1 = i32::from_ne_bytes(ctrl[52..56].try_into().unwrap());
+            let hoplimit = i32::from_ne_bytes(ctrl[56..60].try_into().unwrap());
+            if used != 64
+                || (len0, level0, kind0) != (36, SOL_IPV6, IPV6_PKTINFO)
+                || pktinfo_dst != ALL_NODES
+                || pktinfo_ifindex != ifindex
+                || (len1, level1, kind1) != (20, SOL_IPV6, IPV6_HOPLIMIT)
+                || hoplimit != 255
+            {
+                return Err("the RA carried no IPV6_PKTINFO(ifindex) / IPV6_HOPLIMIT(255)");
+            }
+            Ok(())
+        })();
+        sockopt_close(&[fd]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/icmp6-raw-ra",
+    smoke_abi_socket_icmp6_raw_ra_reports_ingress_device_and_hoplimit
+);
+
 /// systemd-resolved's `link_address_update_rtnl` reads IFA_FLAGS from every
 /// RTM_NEWADDR and fails the whole manager with ENODATA when it is absent
 /// ("Could not create manager: No data available"). Linux always emits it
