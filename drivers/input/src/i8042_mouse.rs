@@ -141,7 +141,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use narf_arch::x86_64::io_port::{inb, outb};
 use narf_input::{
     abs,
-    btn::{BTN_TOOL_DOUBLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_TRIPLETAP},
+    btn::{BTN_TOOL_DOUBLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_QUINTTAP, BTN_TOOL_TRIPLETAP},
     evdev::{
         dispatch_key_to_node, dispatch_pointer_wheel_to_node, dispatch_synaptics_abs_to_node, key,
         prop, rel, DeviceCaps, DeviceId, DeviceNode, EvdevEvent, EventType, MtContactUpdate,
@@ -304,11 +304,18 @@ static SYNAPTICS_AGM: narf_lib::sync::IrqSafeSpinLock<psmouse::SynapticsAgmState
 /// derivation on the global ring.
 static SYNAPTICS_PREV: narf_lib::sync::IrqSafeSpinLock<[psmouse::SynapticsMtSlot; 2]> =
     narf_lib::sync::IrqSafeSpinLock::new([psmouse::SynapticsMtSlot::new(); 2]);
-/// Evdev protocol-B MT emitter for the Synaptics pad (2 semi-MT
-/// slots). Created in `init()` for AGM pads; `None` in tests that
-/// only force the protocol (global-ring assertions still run there).
+/// Evdev protocol-B MT emitter for the Synaptics pad (2 MT
+/// slots, semi-MT for AGM pads, tracked full-MT for
+/// image-sensor pads). Created in `init()` for AGM / image-sensor
+/// pads; `None` in tests that only force the protocol
+/// (global-ring assertions still run there).
 static SYNAPTICS_MT: narf_lib::sync::IrqSafeSpinLock<Option<MtEvdevState>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Image-sensor MT tracking state (previous slot positions +
+/// tracking ids + next id). Only ever taken on the IRQ/test feed
+/// path, so IRQ context is safe.
+static SYNAPTICS_IMAGE_MT: narf_lib::sync::IrqSafeSpinLock<psmouse::SynapticsImageMtState> =
+    narf_lib::sync::IrqSafeSpinLock::new(psmouse::SynapticsImageMtState::new());
 // ── ALPS absolute-mode state ────────────────────────────────────────────────
 
 /// Default protocol for the inert decoder (v3, first-byte check
@@ -801,13 +808,19 @@ pub unsafe fn init() -> Result<(), InitError> {
         caps.add_key(key::BTN_LEFT);
         caps.add_key(key::BTN_RIGHT);
         caps.add_key(key::BTN_TOUCH);
-        if psmouse::syn_cap_adv_gesture(psmouse::synaptics_ext_cap_0c()) {
-            // AGM pad: two semi-MT slots (Linux
-            // `synaptics_report_semi_mt_data`), same shape as the
-            // Elantech MT caps; `ABS_PRESSURE` rides per frame and
-            // the finger-count keys track the SGM `w` decode.
-            // (No `ABS_MT_PRESSURE`: Linux's semi-MT report
-            // carries none.)
+        if psmouse::syn_cap_image_sensor(psmouse::synaptics_ext_cap_0c())
+            || psmouse::syn_cap_adv_gesture(psmouse::synaptics_ext_cap_0c())
+        {
+            // Two MT slots (Linux `set_input_params`): an
+            // image-sensor pad gets the tracked full-MT report
+            // (`synaptics_report_mt_data`, per-contact
+            // `ABS_MT_PRESSURE`, tool keys up to five fingers),
+            // an ADV_GESTURE pad the two-slot semi-MT report
+            // (`synaptics_report_semi_mt_data`, min/max corners,
+            // `ABS_PRESSURE` per frame, no `ABS_MT_PRESSURE`).
+            // Both share the slot axes; a pad claiming both bits
+            // takes the image-sensor report (Linux checks that bit
+            // first).
             let axis = |max: i32| AxisInfo {
                 min: 0,
                 max,
@@ -840,6 +853,20 @@ pub unsafe fn init() -> Result<(), InitError> {
             caps.add_key(key::BTN_TOOL_FINGER);
             caps.add_key(BTN_TOOL_DOUBLETAP);
             caps.add_key(BTN_TOOL_TRIPLETAP);
+            if psmouse::syn_cap_image_sensor(psmouse::synaptics_ext_cap_0c()) {
+                caps.add_abs_info(
+                    abs::ABS_MT_PRESSURE,
+                    AxisInfo {
+                        min: 0,
+                        max: 255,
+                        fuzz: 0,
+                        flat: 0,
+                        res: 0,
+                    },
+                );
+                caps.add_key(BTN_TOOL_QUADTAP);
+                caps.add_key(BTN_TOOL_QUINTTAP);
+            }
             *SYNAPTICS_MT.lock() = Some(MtEvdevState::new(2));
         }
     } else {
@@ -1265,6 +1292,267 @@ fn dispatch_synaptics_semi_mt(hw: &psmouse::SynapticsHwState, num_fingers: u8) {
     }
 }
 
+/// Route one decoded Synaptics SGM packet on an image-sensor pad:
+/// per-slot `TouchEvent`s (Down/Move/Up from the previous frame)
+/// on the global ring, and one tracked protocol-B MT frame on the
+/// evdev node (Linux `synaptics_image_sensor_process` +
+/// `synaptics_report_mt_data`): the contacts are assigned to MT
+/// slots by best-match tracking (`input_mt_assign_slots`,
+/// `DMAX * x_res`), each slot reports its own `ABS_MT_PRESSURE`,
+/// and the `BTN_TOOL_*` keys follow the finger count (up to
+/// `QUINTTAP`). The MT frame owns `ABS_X`/`ABS_Y`/`BTN_TOUCH`/
+/// buttons (`MtEvdevState` wire rules); `ABS_PRESSURE` and the
+/// tool keys ride in a second SYN-terminated frame, exactly as on
+/// the semi-MT path. A no-change frame emits nothing on evdev.
+///
+/// Tracking ids are stable per contact: a contact that stays on
+/// its slot keeps its id, a new contact gets the next id, a
+/// lifted contact releases its slot. When a contact takes over a
+/// slot whose previous contact is gone (the `input_mt_assign_slots`
+/// `-1` corner: every live slot is far from the new contact), the
+/// old contact is released first and the new one goes down on the
+/// same slot, so the wire never carries a tracking-id change on a
+/// live slot.
+fn dispatch_synaptics_image_mt(hw: &psmouse::SynapticsHwState, num_fingers: u8) {
+    let agm = SYNAPTICS_AGM.lock().agm;
+    let slots = psmouse::synaptics_image_mt_slots(hw, &agm, num_fingers);
+    let pressures = psmouse::synaptics_image_mt_pressures(hw, &agm);
+    let dmax = psmouse::SYN_MT_DMAX_MM * psmouse::synaptics_x_res() as i32;
+    let mut state = SYNAPTICS_IMAGE_MT.lock();
+    let assigned = psmouse::synaptics_mt_assign_slots(&state.slots, &slots, dmax);
+    // Slot per contact. `assigned[i]` is `-1` where Linux leaves
+    // the contact unassigned (every live slot is far from it);
+    // such a contact takes the first slot no other contact took
+    // this frame instead — the evdev emitter cannot express
+    // slot `-1`.
+    let mut used = [false; 2];
+    let mut slot_of = [-1i32; 2];
+    for i in 0..2 {
+        if !slots[i].active {
+            continue;
+        }
+        let mut s = assigned[i];
+        if !(0..=1).contains(&s) || used[s as usize] {
+            s = (0..2).find(|&k| !used[k]).map(|k| k as i32).unwrap_or(-1);
+        }
+        slot_of[i] = s;
+        if s >= 0 {
+            used[s as usize] = true;
+        }
+    }
+    // Per-slot evdev updates (at most two per slot: a release
+    // then a down, on takeover) and ring events, in slot order.
+    // A release reports the last known position with pressure 0
+    // (the contact is gone); a down/move the contact's position
+    // and pressure.
+    let blank = MtContactUpdate {
+        slot: 0,
+        active: false,
+        tracking_id: 0,
+        x: 0,
+        y: 0,
+        pressure: None,
+    };
+    let mut updates = [blank; 4];
+    let mut n_updates = 0;
+    let mut next_slots = [psmouse::SynapticsMtSlot::new(); 2];
+    let mut next_ids = [None; 2];
+    for s in 0..2 {
+        let contact = (0..2).find(|&i| slot_of[i] == s as i32);
+        let was = state.slots[s].active;
+        let was_id = state.tracking_ids[s];
+        let (last_x, last_y) = (state.slots[s].x, state.slots[s].y);
+        if was {
+            if let Some(i) = contact {
+                if assigned[i] == s as i32 {
+                    if let Some(id) = was_id {
+                        // Continuing contact: same slot, same id.
+                        updates[n_updates] = MtContactUpdate {
+                            slot: s,
+                            active: true,
+                            tracking_id: id,
+                            x: slots[i].x,
+                            y: slots[i].y,
+                            pressure: Some(pressures[i] as i32),
+                        };
+                        n_updates += 1;
+                        let _ = push_global(InputEvent::Touch(TouchEvent {
+                            slot: s as u8,
+                            tracking_id: Some(id),
+                            id: id as u16,
+                            x: slots[i].x,
+                            y: slots[i].y,
+                            pressure: pressures[i] as i32,
+                            state: TouchState::Move,
+                        }));
+                        next_slots[s] = slots[i];
+                        next_ids[s] = Some(id);
+                        continue;
+                    }
+                }
+                // Takeover: the previous contact is gone (or its
+                // id was lost); release it, then bring the new
+                // contact down on the same slot.
+                let id = state.new_tracking_id();
+                updates[n_updates] = MtContactUpdate {
+                    slot: s,
+                    active: false,
+                    tracking_id: 0,
+                    x: last_x,
+                    y: last_y,
+                    pressure: None,
+                };
+                n_updates += 1;
+                updates[n_updates] = MtContactUpdate {
+                    slot: s,
+                    active: true,
+                    tracking_id: id,
+                    x: slots[i].x,
+                    y: slots[i].y,
+                    pressure: Some(pressures[i] as i32),
+                };
+                n_updates += 1;
+                let _ = push_global(InputEvent::Touch(TouchEvent {
+                    slot: s as u8,
+                    tracking_id: was_id,
+                    id: was_id.unwrap_or(s as i32) as u16,
+                    x: last_x,
+                    y: last_y,
+                    pressure: 0,
+                    state: TouchState::Up,
+                }));
+                let _ = push_global(InputEvent::Touch(TouchEvent {
+                    slot: s as u8,
+                    tracking_id: Some(id),
+                    id: id as u16,
+                    x: slots[i].x,
+                    y: slots[i].y,
+                    pressure: pressures[i] as i32,
+                    state: TouchState::Down,
+                }));
+                next_slots[s] = slots[i];
+                next_ids[s] = Some(id);
+            } else {
+                // Lifted contact.
+                updates[n_updates] = MtContactUpdate {
+                    slot: s,
+                    active: false,
+                    tracking_id: 0,
+                    x: last_x,
+                    y: last_y,
+                    pressure: None,
+                };
+                n_updates += 1;
+                let _ = push_global(InputEvent::Touch(TouchEvent {
+                    slot: s as u8,
+                    tracking_id: was_id,
+                    id: was_id.unwrap_or(s as i32) as u16,
+                    x: last_x,
+                    y: last_y,
+                    pressure: 0,
+                    state: TouchState::Up,
+                }));
+            }
+        } else if let Some(i) = contact {
+            // New contact on a free slot.
+            let id = state.new_tracking_id();
+            updates[n_updates] = MtContactUpdate {
+                slot: s,
+                active: true,
+                tracking_id: id,
+                x: slots[i].x,
+                y: slots[i].y,
+                pressure: Some(pressures[i] as i32),
+            };
+            n_updates += 1;
+            let _ = push_global(InputEvent::Touch(TouchEvent {
+                slot: s as u8,
+                tracking_id: Some(id),
+                id: id as u16,
+                x: slots[i].x,
+                y: slots[i].y,
+                pressure: pressures[i] as i32,
+                state: TouchState::Down,
+            }));
+            next_slots[s] = slots[i];
+            next_ids[s] = Some(id);
+        }
+        // Else: the slot stays empty.
+    }
+    state.slots = next_slots;
+    state.tracking_ids = next_ids;
+    drop(state);
+    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    let mut mt = SYNAPTICS_MT.lock();
+    let Some(mt) = mt.as_mut() else {
+        return;
+    };
+    // SAFETY: `raw` is the `Arc::as_ptr` of the node stored once in `init()`
+    // before IRQ 12 is armed; the Arc is held alive in `MOUSE_EVDEV_NODE`,
+    // so the pointee outlives this borrow. Non-null checked just above.
+    let node_ref: &DeviceNode = unsafe { &*raw };
+    mt.dispatch_frame(node_ref, &updates[..n_updates], hw.left, hw.right);
+    // Second frame (Linux's pointer-emulation + finger-count
+    // tail): `ABS_PRESSURE` from the SGM pressure and the
+    // `BTN_TOOL_*` keys from the finger count, edge-only like the
+    // semi-MT path. (Linux's pointer emulation takes the pressure
+    // from the oldest slot; the SGM contact is the oldest whenever
+    // both contacts land in the same frame, and the semi-MT path
+    // already reports the SGM pressure here.)
+    let now = narf_time::monotonic_ns();
+    let mut emitted = 0;
+    let mut push = |type_: EventType, code: u16, value: i32| {
+        node_ref.dispatch(EvdevEvent {
+            time: now,
+            type_,
+            code,
+            value,
+        });
+        emitted += 1;
+    };
+    let prev_pressure = STATE.syn_prev_pressure.swap(hw.z as i32, Ordering::AcqRel);
+    if prev_pressure != hw.z as i32 {
+        push(EventType::Abs, abs::ABS_PRESSURE, hw.z as i32);
+    }
+    let prev_fingers = STATE
+        .syn_prev_fingers
+        .swap(num_fingers as i32, Ordering::AcqRel);
+    if prev_fingers != num_fingers as i32 {
+        let keys = psmouse::synaptics_mt_tool_keys(num_fingers);
+        push(
+            EventType::Key,
+            key::BTN_TOOL_FINGER,
+            if keys[0] { 1 } else { 0 },
+        );
+        push(
+            EventType::Key,
+            BTN_TOOL_DOUBLETAP,
+            if keys[1] { 1 } else { 0 },
+        );
+        push(
+            EventType::Key,
+            BTN_TOOL_TRIPLETAP,
+            if keys[2] { 1 } else { 0 },
+        );
+        push(
+            EventType::Key,
+            BTN_TOOL_QUADTAP,
+            if keys[3] { 1 } else { 0 },
+        );
+        push(
+            EventType::Key,
+            BTN_TOOL_QUINTTAP,
+            if keys[4] { 1 } else { 0 },
+        );
+    }
+    if emitted > 0 {
+        node_ref.dispatch(EvdevEvent::syn_report(now));
+    }
+}
+
 /// Map an absolute sample onto the on-screen pixel `span` of its
 /// axis using the advertised range (virtio-tablet `abs_to_px`
 /// shape: clamp into the range, then scale linearly).
@@ -1317,7 +1605,17 @@ fn decode_absolute_packet() {
     let moved = hw.z > 0 && hw.x > 1;
     let y_inv = psmouse::synaptics_invert_y(hw.y);
 
-    if psmouse::syn_cap_adv_gesture(psmouse::synaptics_ext_cap_0c()) {
+    if psmouse::syn_cap_image_sensor(psmouse::synaptics_ext_cap_0c()) {
+        // Image-sensor pad: the SGM packet reports up to two
+        // tracked contacts (Linux `synaptics_image_sensor_process`
+        // + `synaptics_report_mt_data`); the finger count comes
+        // from `w` + the AGM-CONTACT count. The MT frame owns
+        // ABS_X/Y + BTN_TOUCH + buttons; the legacy bridge below
+        // still runs on the SGM position.
+        let num_fingers =
+            psmouse::synaptics_image_sensor_num_fingers(&hw, SYNAPTICS_AGM.lock().agm_count);
+        dispatch_synaptics_image_mt(&hw, num_fingers);
+    } else if psmouse::syn_cap_adv_gesture(psmouse::synaptics_ext_cap_0c()) {
         // AGM pad: the SGM packet reports both contacts as two
         // semi-MT slots (Linux `synaptics_report_semi_mt_data`).
         // The MT frame owns ABS_X/Y + BTN_TOUCH + buttons; the
@@ -1779,6 +2077,7 @@ pub fn __reset_for_test() {
     *SYNAPTICS_AGM.lock() = psmouse::SynapticsAgmState::new();
     *SYNAPTICS_PREV.lock() = [psmouse::SynapticsMtSlot::new(); 2];
     *SYNAPTICS_MT.lock() = None;
+    *SYNAPTICS_IMAGE_MT.lock() = psmouse::SynapticsImageMtState::new();
     ALPS.lock().reset();
     ALPS_ACTIVE.store(false, Ordering::Release);
     psmouse::set_detected(

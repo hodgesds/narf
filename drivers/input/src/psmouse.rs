@@ -50,10 +50,12 @@
 //!   AGM marker), and the two-slot semi-MT report (Linux
 //!   `synaptics_report_semi_mt_data`: min/max corners). Image-sensor
 //!   pads (`SYN_CAP_IMAGE_SENSOR`) share the AGM mode set and the
-//!   `w == 2` decode, but their full-MT path (Linux
-//!   `synaptics_image_sensor_process` + `synaptics_report_mt_data`,
-//!   slot assignment via `input_mt_assign_slots`) is a follow-up:
-//!   they keep the single-finger report for now.
+//!   `w == 2` decode, and take the full-MT path instead of the
+//!   semi-MT one (Linux `synaptics_image_sensor_process` +
+//!   `synaptics_report_mt_data`, slot assignment via
+//!   `input_mt_assign_slots`, `DMAX * x_res`): the finger count
+//!   comes from `w` + the AGM-CONTACT count, and each contact
+//!   reports its own `ABS_MT_PRESSURE`.
 //!
 //! Probe order follows Linux `psmouse_extensions()`: Synaptics, then
 //! ALPS, then Elantech, then a full reset to defaults (the vendor probes
@@ -86,7 +88,14 @@
 //!   `z < 25`, X/Y reported only when `z > 0 && x > 1`,
 //!   `w == 2` AGM packets, `w` 0..=1 → `w + 2` fingers on
 //!   multifinger pads), `synaptics_report_semi_mt_data`,
-//!   `synaptics_invert_y`, `__synaptics_init`.
+//!   `synaptics_image_sensor_process` (finger count from `w` +
+//!   `agm_count`), `synaptics_report_mt_data` (tracked two-slot
+//!   report, per-contact `ABS_MT_PRESSURE`, `BTN_TOOL_*` from the
+//!   count), `synaptics_invert_y`, `__synaptics_init`.
+//! * Linux `drivers/input/input-mt.c` — `input_mt_assign_slots`
+//!   (best-match slot assignment, `DMAX` = 10 mm) +
+//!   `input_mt_report_finger_count` (`BTN_TOOL_*` from the count)
+//!   + `input_mt_new_trkid` (`TRKID_MAX` = 0xffff).
 //! * Linux `Documentation/input/alps.txt` — "E6 report"
 //!   (`E8-E6-E6-E6-E9` → `00-00-0A` or `00-00-64`) and "E7 report"
 //!   (`E8-E7-E7-E7-E9` → model signature, `0x73...` for v3/v4).
@@ -507,11 +516,14 @@ pub fn set_protocol_for_test(proto: PsmouseProtocol) {
 
 /// The two queried words the IRQ path needs after enablement:
 /// `capabilities` (multifinger / extended, for the SGM finger
-/// count) and `ext_cap_0c` (AGM / image sensor, for the `w == 2`
-/// decode and the semi-MT report). Stored like the Elantech info
-/// above — write-once at init, before IRQ 12 is armed.
+/// count), `ext_cap_0c` (AGM / image sensor, for the `w == 2`
+/// decode and the semi-MT report), and `x_res` (units/mm, for the
+/// image-sensor MT tracking distance `DMAX * x_res`). Stored like
+/// the Elantech info above — write-once at init, before IRQ 12 is
+/// armed.
 static SYNAPTICS_CAPABILITIES: AtomicU32 = AtomicU32::new(0);
 static SYNAPTICS_EXT_CAP_0C: AtomicU32 = AtomicU32::new(0);
+static SYNAPTICS_X_RES: AtomicU32 = AtomicU32::new(0);
 
 /// Queried capabilities word of the negotiated Synaptics pad
 /// (0 when no Synaptics pad was negotiated).
@@ -525,6 +537,14 @@ pub fn synaptics_ext_cap_0c() -> u32 {
     SYNAPTICS_EXT_CAP_0C.load(Ordering::Acquire)
 }
 
+/// Queried X resolution in units/mm of the negotiated Synaptics
+/// pad (0 when the pad does not answer the resolution query —
+/// Linux then passes `DMAX * x_res == 0` to
+/// `input_mt_assign_slots`, which means "unbounded" there).
+pub fn synaptics_x_res() -> u32 {
+    SYNAPTICS_X_RES.load(Ordering::Acquire)
+}
+
 /// Record the negotiated Synaptics hardware. Called from
 /// `i8042_mouse` right after a successful
 /// [`synaptics_enable_absolute`]; the IRQ path reads it back via
@@ -532,6 +552,7 @@ pub fn synaptics_ext_cap_0c() -> u32 {
 pub fn set_synaptics_info(hw: &SynapticsHw) {
     SYNAPTICS_CAPABILITIES.store(hw.capabilities, Ordering::Release);
     SYNAPTICS_EXT_CAP_0C.store(hw.ext_cap_0c, Ordering::Release);
+    SYNAPTICS_X_RES.store(hw.x_res, Ordering::Release);
 }
 
 /// Test-only: install Synaptics info directly (lets packet
@@ -544,6 +565,7 @@ pub fn set_synaptics_info_for_test(hw: &SynapticsHw) {
 fn clear_synaptics_info() {
     SYNAPTICS_CAPABILITIES.store(0, Ordering::Release);
     SYNAPTICS_EXT_CAP_0C.store(0, Ordering::Release);
+    SYNAPTICS_X_RES.store(0, Ordering::Release);
 }
 
 // ── Elantech negotiated info ──────────────────────────────────────────────
@@ -2431,6 +2453,297 @@ pub fn synaptics_semi_mt_slots(
     } else {
         [SynapticsMtSlot::new(), SynapticsMtSlot::new()]
     }
+}
+
+// ── Synaptics image-sensor full-MT (pure) ──────────────────────────────────
+//
+// From Linux `synaptics_image_sensor_process` +
+// `synaptics_report_mt_data` (`drivers/input/mouse/synaptics.c`)
+// and `input_mt_assign_slots` (`drivers/input/input-mt.c`).
+// Only image-sensor pads take this path: Linux routes them in
+// `synaptics_process_packet` before the AGM/semi-MT and
+// single-finger tails, and they share the AGM mode set + the
+// `w == 2` decode (an AGM packet updates the second-contact
+// state and produces no report itself).
+
+/// Maximum `ABS_MT_POSITION` displacement in mm for slot
+/// tracking (Linux `DMAX` in `synaptics.c`); the IRQ path passes
+/// `SYN_MT_DMAX_MM * x_res` device units to the assignment.
+pub const SYN_MT_DMAX_MM: i32 = 10;
+
+/// Maximum tracking id (Linux `TRKID_MAX` in
+/// `include/linux/input/mt.h`); ids wrap at this value.
+pub const SYN_MT_TRKID_MAX: i32 = 0xffff;
+
+/// Finger count for one image-sensor SGM packet (Linux
+/// `synaptics_image_sensor_process`, verbatim): 0 when there is no
+/// finger (`z == 0`); 1 for a palm (`w >= 4`); 2 when `w == 0`;
+/// the AGM-CONTACT count when `w == 1` (3 while no AGM-CONTACT
+/// packet has arrived yet); 4 otherwise (`w == 2` or `w == 3` —
+/// a `w == 2` SGM packet never reaches here in practice, the
+/// `w == 2` decode consumes it as an AGM packet first).
+pub fn synaptics_image_sensor_num_fingers(sgm: &SynapticsHwState, agm_count: u8) -> u8 {
+    if sgm.z == 0 {
+        0
+    } else if sgm.w >= 4 {
+        1
+    } else if sgm.w == 0 {
+        2
+    } else if sgm.w == 1 {
+        if agm_count != 0 {
+            agm_count
+        } else {
+            3
+        }
+    } else {
+        4
+    }
+}
+
+/// The ≤2 reported contacts of an image-sensor frame (Linux
+/// `synaptics_report_mt_data`: `hw[2] = {sgm, agm}`,
+/// `nsemi = clamp(num_fingers, 0, 2)`, Y inverted per contact).
+/// Slot 0 is the SGM contact, slot 1 the AGM second contact;
+/// pressures ride by index (`sgm.z` / `agm.z`) — see
+/// [`synaptics_image_mt_pressures`].
+pub fn synaptics_image_mt_slots(
+    sgm: &SynapticsHwState,
+    agm: &SynapticsHwState,
+    num_fingers: u8,
+) -> [SynapticsMtSlot; 2] {
+    let nsemi = num_fingers.clamp(0, 2);
+    let mut slots = [SynapticsMtSlot::new(); 2];
+    if nsemi >= 1 {
+        slots[0] = SynapticsMtSlot {
+            active: true,
+            x: sgm.x,
+            y: synaptics_invert_y(sgm.y),
+        };
+    }
+    if nsemi >= 2 {
+        slots[1] = SynapticsMtSlot {
+            active: true,
+            x: agm.x,
+            y: synaptics_invert_y(agm.y),
+        };
+    }
+    slots
+}
+
+/// Per-contact pressure for an image-sensor frame (Linux
+/// `synaptics_report_mt_data`: `ABS_MT_PRESSURE` is `hw[i]->z`
+/// for the contact in slot `i`): index 0 is the SGM pressure,
+/// index 1 the AGM second-contact pressure.
+pub fn synaptics_image_mt_pressures(sgm: &SynapticsHwState, agm: &SynapticsHwState) -> [u8; 2] {
+    [sgm.z, agm.z]
+}
+
+/// `BTN_TOOL_*` states for a finger count (Linux
+/// `input_mt_report_finger_count`, verbatim): index 0..=4 is
+/// `FINGER`, `DOUBLETAP`, `TRIPLETAP`, `QUADTAP`, `QUINTTAP` —
+/// the key whose count matches is pressed, the rest released
+/// (a count above 5, or 0, releases all five).
+pub fn synaptics_mt_tool_keys(num_fingers: u8) -> [bool; 5] {
+    [
+        num_fingers == 1,
+        num_fingers == 2,
+        num_fingers == 3,
+        num_fingers == 4,
+        num_fingers == 5,
+    ]
+}
+
+/// Tracking state that survives across image-sensor frames:
+/// the previous slot positions (the `input_mt_assign_slots`
+/// match input), the tracking id on each slot, and the next id
+/// to issue. Owned by the IRQ/test feed path in `i8042_mouse`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SynapticsImageMtState {
+    /// Last reported slot positions (Y already inverted).
+    pub slots: [SynapticsMtSlot; 2],
+    /// Tracking id currently on each slot (`None` = inactive).
+    pub tracking_ids: [Option<i32>; 2],
+    /// Next tracking id to issue (masked to
+    /// [`SYN_MT_TRKID_MAX`] on issue, Linux
+    /// `input_mt_new_trkid`).
+    pub next_tracking_id: i32,
+}
+
+impl SynapticsImageMtState {
+    /// Empty state (no contacts, ids from 0); the const form of
+    /// `Default`, for static initializers.
+    pub const fn new() -> Self {
+        Self {
+            slots: [SynapticsMtSlot::new(); 2],
+            tracking_ids: [None; 2],
+            next_tracking_id: 0,
+        }
+    }
+
+    /// Issue the next tracking id (Linux `input_mt_new_trkid`:
+    /// `trkid++ & TRKID_MAX`).
+    pub fn new_tracking_id(&mut self) -> i32 {
+        let id = self.next_tracking_id & SYN_MT_TRKID_MAX;
+        self.next_tracking_id = (self.next_tracking_id + 1) & SYN_MT_TRKID_MAX;
+        id
+    }
+}
+
+/// One dual-adjustment pass of the assignment reduction (Linux
+/// `adjust_dual` in `input-mt.c`, verbatim, over the flat
+/// `red` matrix: `begin` is the first element, `step` the
+/// stride, `end` the exclusive bound). C integer division
+/// truncates toward zero, as does Rust's `/` on `i32`, so the
+/// `(f + s + 1) / 2` midpoint matches exactly.
+fn mt_assign_adjust_dual(
+    red: &mut [i32; 4],
+    begin: usize,
+    step: usize,
+    end: usize,
+    eq: bool,
+    mu: i32,
+) -> i32 {
+    if begin == end {
+        return 0;
+    }
+    let mut f = red[begin];
+    let mut p = begin + step;
+    let mut s = if p == end { f + 1 } else { red[p] };
+    while p != end {
+        if red[p] < f {
+            s = f;
+            f = red[p];
+        } else if red[p] < s {
+            s = red[p];
+        }
+        p += step;
+    }
+    let c = (f + s + 1) / 2;
+    if c == 0 || (c > mu && (!eq || mu > 0)) {
+        return 0;
+    }
+    // Improve convergence for positive matrices by penalizing
+    // overcovers.
+    let mut c = c;
+    if s < 0 && mu <= 0 {
+        c *= 2;
+    }
+    let mut p = begin;
+    while p != end {
+        red[p] -= c;
+        p += step;
+    }
+    i32::from((c < s && s <= 0) || (f >= 0 && f < c))
+}
+
+/// Reduce the cost matrix (Linux `find_reduced_matrix` in
+/// `input-mt.c`, verbatim): column adjustments, then row
+/// adjustments, until a pass changes nothing (`sum == 0`) or
+/// the pass budget (`nrc`) is spent. `nr` is the number of
+/// positions (columns), `nc` the number of active slots (rows).
+fn mt_assign_find_reduced_matrix(red: &mut [i32; 4], nr: usize, nc: usize, nrc: usize, mu: i32) {
+    for _ in 0..nrc {
+        for i in 0..nr {
+            mt_assign_adjust_dual(red, i, nr, i + nrc, nr <= nc, mu);
+        }
+        let mut sum = 0;
+        let mut i = 0;
+        while i < nrc {
+            sum += mt_assign_adjust_dual(red, i, 1, i + nr, nc <= nr, mu);
+            i += nr;
+        }
+        if sum == 0 {
+            break;
+        }
+    }
+}
+
+/// Fill the cost matrix (Linux `input_mt_set_matrix` in
+/// `input-mt.c`, verbatim): one row per active slot, one entry
+/// per position, `dx * dx + dy * dy - mu`. Returns the number of
+/// entries written (`nrc`).
+fn mt_assign_set_matrix(
+    prev: &[SynapticsMtSlot; 2],
+    pos: &[(i32, i32); 2],
+    npos: usize,
+    mu: i32,
+    red: &mut [i32; 4],
+) -> usize {
+    let mut w = 0;
+    for s in prev.iter() {
+        if !s.active {
+            continue;
+        }
+        for p in pos.iter().take(npos) {
+            let dx = s.x - p.0;
+            let dy = s.y - p.1;
+            red[w] = dx * dx + dy * dy - mu;
+            w += 1;
+        }
+    }
+    w
+}
+
+/// Read the slot assignment out of the reduced matrix (Linux
+/// `input_mt_set_slots` in `input-mt.c`, verbatim): each active
+/// slot takes the first position whose reduced cost is negative;
+/// each inactive slot then takes the first position still
+/// unassigned, in slot order.
+fn mt_assign_set_slots(prev: &[SynapticsMtSlot; 2], red: &[i32; 4], npos: usize) -> [i32; 2] {
+    let mut slots = [-1i32; 2];
+    let mut w = 0;
+    for (si, s) in prev.iter().enumerate() {
+        if !s.active {
+            continue;
+        }
+        for j in 0..npos {
+            if red[w + j] < 0 {
+                slots[j] = si as i32;
+                break;
+            }
+        }
+        w += npos;
+    }
+    for (si, s) in prev.iter().enumerate() {
+        if s.active {
+            continue;
+        }
+        for slot in slots.iter_mut() {
+            if *slot < 0 {
+                *slot = si as i32;
+                break;
+            }
+        }
+    }
+    slots
+}
+
+/// Assign MT slots to this frame's contacts (Linux
+/// `input_mt_assign_slots` in `input-mt.c`, verbatim port for
+/// the 2-slot / ≤2-position case). `prev` is the previous
+/// frame's slots (active flags + positions), `slots` this
+/// frame's contacts ([`synaptics_image_mt_slots`]: actives are a
+/// prefix), `dmax` the maximum displacement in device units
+/// (`SYN_MT_DMAX_MM * x_res`; 0 means unbounded, as in Linux).
+/// Returns the slot per contact (`-1` where Linux leaves the
+/// contact unassigned — every live slot is far from every new
+/// contact — which the caller re-homes to a free slot, since
+/// the evdev emitter cannot express slot `-1`).
+pub fn synaptics_mt_assign_slots(
+    prev: &[SynapticsMtSlot; 2],
+    slots: &[SynapticsMtSlot; 2],
+    dmax: i32,
+) -> [i32; 2] {
+    let npos = slots.iter().filter(|s| s.active).count();
+    if npos == 0 {
+        return [-1, -1];
+    }
+    let mu = 2 * dmax * dmax;
+    let pos = [(slots[0].x, slots[0].y), (slots[1].x, slots[1].y)];
+    let mut red = [0i32; 4];
+    let nrc = mt_assign_set_matrix(prev, &pos, npos, mu, &mut red);
+    mt_assign_find_reduced_matrix(&mut red, npos, nrc / npos, nrc, mu);
+    mt_assign_set_slots(prev, &red, npos)
 }
 
 pub fn register_initcalls() {
