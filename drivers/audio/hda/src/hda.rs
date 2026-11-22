@@ -250,4 +250,27 @@ mod renoir_bind_tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/hda", native_hda_renoir_function_binds_ns);
+
+    /// Linux binds the AMD platform HD-Audio controllers with
+    /// `AZX_DCAPS_PRESET_AMD_SB` (sound/hda/controllers/intel.c): 1022:1457
+    /// ("AMD, X370 & co"), 1022:1487 ("AMD, X570 & co") and 1022:15e3 ("AMD
+    /// Raven", which is also the Ryzen 7000 desktop's board-codec
+    /// controller). NARF bound only 15e3, and named it after Phoenix, an APU
+    /// it is not specific to: the Ryzen 5 7600X desktop's analog codec sits
+    /// behind it.
+    fn native_hda_amd_platform_controllers_bind() -> TestResult {
+        for device in [0x1457u16, 0x1487, 0x15e3] {
+            let Some(&(name, _, _)) = HDA_PCI_IDS
+                .iter()
+                .find(|&&(_, v, d)| v == 0x1022 && d == device)
+            else {
+                return TestResult::Fail("an AMD platform HD-Audio controller is not bound");
+            };
+            if name.contains("phoenix") {
+                return TestResult::Fail("1022:15e3 is no Phoenix-specific controller");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/hda/amd-sb", native_hda_amd_platform_controllers_bind);
 }
