@@ -794,9 +794,9 @@ pub mod intel_gpu_gen11_cdclk;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen11_ddi;
 #[cfg(feature = "intel")]
-pub mod intel_gpu_gen11_dpll;
-#[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_gen11_dmc;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_gen11_dpll;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen11_wm;
 #[cfg(feature = "intel")]
