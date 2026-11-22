@@ -4494,15 +4494,29 @@ pub fn with_controller<R>(index: usize, f: impl FnOnce(&Igb) -> R) -> Option<R> 
     live_controller(index).map(|a| f(&a))
 }
 
+/// The task specs of the receive pump and of its deferral task on `cpu`,
+/// the CPU the device's vector is delivered to.
+pub(crate) fn rx_task_specs(
+    cpu: u32,
+) -> (narf_scheduler::TaskSpec, Option<narf_scheduler::TaskSpec>) {
+    let _ = cpu;
+    (narf_scheduler::TaskSpec::unthrottled(), None)
+}
+
 fn spawn_tx_pump(device: Arc<Igb>, tx_cons: Consumer<Frame, TX_RING_N>) {
     // Steady-state RX: an IRQ-driven (polled fallback) task that drains
     // the ring and dispatches each frame into the kernel TCP stack. It
     // shares the `rx_head` lock with the synchronous `igb_rx_pump_step`
     // busy-wait drain, so the two never double-consume a descriptor.
+    // Probe programmed the vector to the CPU it runs on (`try_enable_msix`).
+    let (spec, _deferral) = rx_task_specs(narf_lib::percpu::current_cpu() as u32);
     let d_rx = device.clone();
-    narf_scheduler::spawn(async move {
-        igb_rx_pump(d_rx).await;
-    });
+    narf_scheduler::spawn_with_spec(
+        async move {
+            igb_rx_pump(d_rx).await;
+        },
+        spec,
+    );
 
     let d_tx = device.clone();
     narf_scheduler::spawn(async move {
@@ -6705,5 +6719,28 @@ mod tests {
     kernel_test_in!(
         "drivers/net/igb",
         smoke_igb_rx_wb_sample_never_mixes_occupants
+    );
+
+    /// The receive pump is the softirq model's (`narf_net::napi`): an
+    /// Interactive-class pump with a Default-class deferral task, both on
+    /// the CPU the device's vector is delivered to.
+    fn smoke_igb_softirq_pump_runs_like_napi() -> TestResult {
+        use narf_scheduler::affinity::{Affinity, CpuId};
+        use narf_scheduler::SchedClass;
+        let (pump, deferral) = super::rx_task_specs(2);
+        if pump.class != SchedClass::Interactive || pump.affinity != Affinity::pinned(CpuId(2)) {
+            return TestResult::Fail("the receive pump does not run ahead of its CPU's tasks");
+        }
+        let Some(deferral) = deferral else {
+            return TestResult::Fail("the receive pump has no deferral task");
+        };
+        if deferral.class != SchedClass::Default || deferral.affinity != pump.affinity {
+            return TestResult::Fail("the deferral task is not Default class on the pump's CPU");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/igb-softirq",
+        smoke_igb_softirq_pump_runs_like_napi
     );
 }
