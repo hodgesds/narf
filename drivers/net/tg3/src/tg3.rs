@@ -206,7 +206,8 @@ mod pm {
         GRC_MISC_CFG_CORECLK_RESET, GRC_MODE_HOST_SENDBDS, GRC_MODE_HOST_STACKUP,
         GRC_MODE_INT_ON_MAC_ATTN, MAC_MI_MODE_DEFAULT_CLK, MISC_HOST_CTRL_CLKREG_RW,
         MISC_HOST_CTRL_INDIR_ACCESS, MISC_HOST_CTRL_PCISTATE_RW, MISC_HOST_CTRL_TAGGED_STATUS,
-        REG_GRC_MISC_CFG, REG_GRC_MODE, REG_MAC_MI_MODE, REG_MISC_HOST_CTRL,
+        REG_GRC_MISC_CFG, REG_GRC_MODE, REG_HOSTCC_STATUS_BLK_HOST_ADDR, REG_MAC_MI_MODE,
+        REG_MAILBOX_SNDHOST_PROD_IDX_0, REG_MISC_HOST_CTRL, TG3_64BIT_REG_LOW,
     };
     use narf_bus::MmioRegion;
 
@@ -296,6 +297,41 @@ mod pm {
         cleared
     }
 
+    /// Ring the TX producer doorbell (Linux `tg3_start_xmit`:
+    /// `tw32_tx_mbox(tnapi->prodmbox, tnapi->tx_prod)`, tg3.c:8254).
+    /// `prod` is the post-increment producer index — the next free
+    /// slot, already advanced past the last descriptor written;
+    /// the chip sends every descriptor with index < `prod`
+    /// (modulo the ring size). The write targets the LOW word of
+    /// the 64-bit mailbox (`REG_MAILBOX_SNDHOST_PROD_IDX_0 +
+    /// TG3_64BIT_REG_LOW` = 0x304); writing the base (0x300) would
+    /// land in the HIGH word the chip ignores. The caller must
+    /// have made the descriptor writes visible first (the
+    /// `compiler_fence` in `transmit`, Linux's `wmb()` before the
+    /// mailbox write).
+    pub fn ring_tx_doorbell_plan(bank: &impl RegBank, prod: u32) {
+        bank.write32(REG_MAILBOX_SNDHOST_PROD_IDX_0 + TG3_64BIT_REG_LOW, prod);
+    }
+
+    /// Program the host-coalescing status-block DMA address (Linux
+    /// `tg3_init_hw`, tg3.c:9746-9748): HIGH word at the base, then
+    /// the LOW word at base + `TG3_64BIT_REG_LOW`. The chip DMAs
+    /// the `tg3_hw_status` block to `status_dma_addr`; until this
+    /// is programmed the TX consumer index `poll_tx_completions`
+    /// reads stays at its zeroed value. Called at bring-up and
+    /// after every chip reset (resume), since the reset can clear
+    /// the HOSTCC registers.
+    pub fn program_status_block_plan(bank: &impl RegBank, status_dma_addr: u64) {
+        bank.write32(
+            REG_HOSTCC_STATUS_BLK_HOST_ADDR,
+            (status_dma_addr >> 32) as u32,
+        );
+        bank.write32(
+            REG_HOSTCC_STATUS_BLK_HOST_ADDR + TG3_64BIT_REG_LOW,
+            status_dma_addr as u32,
+        );
+    }
+
     #[cfg(any(test, feature = "builtin"))]
     mod tests {
         use super::*;
@@ -303,11 +339,12 @@ mod pm {
 
         /// In-memory register bank for the PM fixtures: 32 KiB of
         /// BAR0 window, covering MISC_HOST_CTRL (0x0068),
-        /// MAC_MI_MODE (0x0454), GRC_MODE (0x6800) and
-        /// GRC_MISC_CFG (0x6804). Emulates the self-clearing
-        /// core-clock reset bit: the first read after the reset
-        /// write still shows it set, the second shows it clear —
-        /// the wait loop polls, then succeeds.
+        /// MAC_MI_MODE (0x0454), the TX producer mailbox low word
+        /// (0x0304), HOSTCC_STATUS_BLK_HOST_ADDR (0x3c38), GRC_MODE
+        /// (0x6800) and GRC_MISC_CFG (0x6804). Emulates the
+        /// self-clearing core-clock reset bit: the first read after
+        /// the reset write still shows it set, the second shows it
+        /// clear — the wait loop polls, then succeeds.
         struct FakeBank {
             regs: core::cell::RefCell<alloc::vec::Vec<u32>>,
             reset_reads: core::cell::RefCell<u32>,
@@ -406,6 +443,46 @@ mod pm {
             "drivers/net/tg3",
             smoke_tg3_pm_chip_reset_plan_timeout_fails_closed
         );
+
+        fn smoke_tg3_tx_doorbell_plan_targets_low_word() -> TestResult {
+            let bank = FakeBank::new(false);
+            ring_tx_doorbell_plan(&bank, 7);
+            if bank.read32(REG_MAILBOX_SNDHOST_PROD_IDX_0 + TG3_64BIT_REG_LOW) != 7 {
+                return TestResult::Fail("tg3 doorbell did not land in the mailbox low word");
+            }
+            if bank.read32(REG_MAILBOX_SNDHOST_PROD_IDX_0) != 0 {
+                return TestResult::Fail("tg3 doorbell wrote the mailbox high word");
+            }
+            // Ringing with the post-increment index 0 (ring wrapped
+            // back to slot 0) is a real value, not a no-op.
+            ring_tx_doorbell_plan(&bank, 0);
+            if bank.read32(REG_MAILBOX_SNDHOST_PROD_IDX_0 + TG3_64BIT_REG_LOW) != 0 {
+                return TestResult::Fail("tg3 doorbell did not ring prod index 0");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!(
+            "drivers/net/tg3",
+            smoke_tg3_tx_doorbell_plan_targets_low_word
+        );
+
+        fn smoke_tg3_status_block_plan_programs_host_addr() -> TestResult {
+            let bank = FakeBank::new(false);
+            program_status_block_plan(&bank, 0x1_2345_6789);
+            // HIGH word at the base (+0x00).
+            if bank.read32(REG_HOSTCC_STATUS_BLK_HOST_ADDR) != 0x1 {
+                return TestResult::Fail("tg3 status-block plan lost the DMA addr high half");
+            }
+            // LOW word at base + TG3_64BIT_REG_LOW.
+            if bank.read32(REG_HOSTCC_STATUS_BLK_HOST_ADDR + TG3_64BIT_REG_LOW) != 0x2345_6789 {
+                return TestResult::Fail("tg3 status-block plan lost the DMA addr low half");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!(
+            "drivers/net/tg3",
+            smoke_tg3_status_block_plan_programs_host_addr
+        );
     }
 }
 
@@ -430,12 +507,34 @@ pub const RX_BUF_LEN: usize = 2048;
 
 // ── Mailbox / doorbell offsets ─────────────────────────────────────
 //
-// BCM57xx mailboxes are 64-bit, low-half-first. The high-half is
-// unused for the indices we touch in Stage 2. Linux uses
-// `tw32_mailbox` to write only the low word — same idiom here.
+// BCM57xx mailboxes are 64-bit registers: the base offset names
+// the register, the HIGH word sits at base + 0x00 and the LOW word
+// at base + 0x04 (Linux `TG3_64BIT_REG_HIGH` / `TG3_64BIT_REG_LOW`,
+// tg3.h:17-18). The producer index lives in the LOW word — every
+// mailbox write in Linux adds `TG3_64BIT_REG_LOW` to the base
+// (e.g. `tnapi->prodmbox = MAILBOX_SNDHOST_PROD_IDX_0 +
+// TG3_64BIT_REG_LOW`, tg3.c:17997), and `tw32_tx_mbox` is a plain
+// 32-bit write to that address. The high half is never written
+// for the indices we touch.
+
+/// Low half of a 64-bit register (Linux tg3.h:18). Added to a
+/// mailbox base offset to reach the word the index lives in. (The
+/// HIGH half is the base offset itself, +0x00 — tg3.h:17 — so no
+/// constant is needed for it.)
+const TG3_64BIT_REG_LOW: u64 = 0x04;
 
 const REG_MAILBOX_RCV_STD_PROD_IDX: u64 = 0x0268;
 const REG_MAILBOX_SNDHOST_PROD_IDX_0: u64 = 0x0300;
+
+/// Host-coalescing status-block host address (Linux tg3.h:1275,
+/// 64-bit). The chip DMAs the 0x50-byte `tg3_hw_status` block —
+/// including the TX consumer index `poll_tx_completions` reads —
+/// to the address programmed here (HIGH word at the base, LOW
+/// word at base + `TG3_64BIT_REG_LOW`, tg3.c:9746-9748).
+const REG_HOSTCC_STATUS_BLK_HOST_ADDR: u64 = 0x3c38;
+
+/// Size of Linux `struct tg3_hw_status` (tg3.h:2677).
+const TG3_HW_STATUS_SIZE: usize = 0x50;
 
 // ── Tx/Rx descriptor layouts ───────────────────────────────────────
 //
@@ -567,6 +666,93 @@ impl RxBufferDesc {
     }
 }
 
+// ── Host-coalescing status block ───────────────────────────────────
+//
+// Bit-for-bit copy of Linux `struct tg3_hw_status` (tg3.h:2678).
+// The chip DMAs this 0x50-byte block to host memory at the address
+// programmed into HOSTCC_STATUS_BLK_HOST_ADDR; the TX consumer
+// index in `idx[0]` is what `tg3_tx()` reads to reclaim sent
+// descriptors. Only `idx[0]` is consumed in Stage 3 — the rest is
+// mirrored so the watchdog / IRQ slices read the same layout the
+// chip writes, instead of re-deriving offsets.
+//
+// Field order is the little-endian branch of the C struct (NARF
+// runs LE on x86_64 + aarch64, GRC_MODE.BSWAP_DATA = 0): in
+// `idx[i]`, `[0]` is rx_producer and `[1]` is tx_consumer.
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HwStatus {
+    /// Status word (`SD_STATUS_UPDATED` etc.); Stage 3 ignores it.
+    pub status: u32,
+    /// Interrupt-coalescing tag; Stage 3 ignores it.
+    pub status_tag: u32,
+    /// RX jumbo consumer index.
+    pub rx_jumbo_consumer: u16,
+    /// RX standard consumer index.
+    pub rx_consumer: u16,
+    /// RX mini consumer index.
+    pub rx_mini_consumer: u16,
+    /// Reserved.
+    pub reserved: u16,
+    /// Per-vector `[rx_producer, tx_consumer]` pairs. `idx[0][1]`
+    /// is the TX consumer index: the ring slot the chip has
+    /// finished sending, i.e. every descriptor with index <
+    /// `idx[0][1]` (modulo the ring size) is complete.
+    pub idx: [[u16; 2]; 16],
+}
+const _: () = assert!(core::mem::size_of::<HwStatus>() == TG3_HW_STATUS_SIZE);
+
+impl HwStatus {
+    /// TX consumer index for vector 0 — the value Linux's
+    /// `tg3_tx()` reads as `hw_status->idx[0].tx_consumer`.
+    pub fn tx_consumer(&self) -> u16 {
+        self.idx[0][1]
+    }
+}
+
+// ── TX completion arithmetic ───────────────────────────────────────
+//
+// Pure helpers over (producer, consumer) ring indices, so fixtures
+// pin the wrap + bound behaviour without standing up a device.
+// Linux keeps the same discipline: `tg3_tx_avail` masks
+// `(tx_prod - tx_cons)` by the ring size, and `tg3_tx` walks
+// `tx_cons` toward `hw_status->idx[0].tx_consumer` one slot at a
+// time (tg3.c:6539-6544, 6551-6656).
+
+/// Usable TX slots. One slot stays empty so `prod == cons` always
+/// means "empty", never "full" — otherwise a completely full ring
+/// is indistinguishable from an empty one under modulo arithmetic
+/// (same discipline as e1000's `TX_RING_USABLE`).
+pub const TX_RING_USABLE: usize = TX_RING_LEN - 1;
+
+/// Descriptors outstanding: `(prod - cons)` modulo the ring size.
+/// Callers must keep the result `< TX_RING_LEN` (the
+/// `TX_RING_USABLE` gate in `transmit` does) — at `TX_RING_LEN`
+/// the value wraps to 0.
+pub fn tx_ring_outstanding(prod: u32, cons: u32) -> u32 {
+    prod.wrapping_sub(cons) % (TX_RING_LEN as u32)
+}
+
+/// Advance the software TX consumer toward the hardware consumer
+/// index the status block reports (Linux `tg3_tx()`). Returns
+/// `(new_cons, reclaimed)`. The walk stops after `outstanding`
+/// steps, so it never advances past `prod` and always terminates.
+/// A stale or corrupt consumer index can still reclaim in-flight
+/// slots inside the window — the status block is trusted the same
+/// way Linux trusts it — but it can never run the consumer past
+/// the producer or loop forever.
+pub fn advance_tx_cons(sw_cons: u32, hw_cons: u32, prod: u32) -> (u32, u32) {
+    let mut cons = sw_cons;
+    let mut reclaimed = 0;
+    let outstanding = tx_ring_outstanding(prod, sw_cons);
+    while cons != hw_cons && reclaimed < outstanding {
+        cons = (cons + 1) % (TX_RING_LEN as u32);
+        reclaimed += 1;
+    }
+    (cons, reclaimed)
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -633,6 +819,18 @@ pub struct Tg3Nic {
     tx_pool: alloc::vec::Vec<DmaBuffer>,
     /// Producer cursor for the TX ring (next slot to fill).
     tx_head: IrqSafeSpinLock<u32>,
+    /// Host-coalescing status block (`TG3_HW_STATUS_SIZE` bytes of
+    /// DMA-coherent memory). The chip DMAs `tg3_hw_status` here;
+    /// `poll_tx_completions` reads `idx[0].tx_consumer` out of it.
+    /// Its address is programmed into HOSTCC_STATUS_BLK_HOST_ADDR
+    /// at bring-up and after every chip reset (resume).
+    status_block: DmaBuffer,
+    /// Software TX consumer cursor (Linux `tnapi->tx_cons`): the
+    /// oldest slot not yet reclaimed. Advanced only by
+    /// `poll_tx_completions`, never past `tx_head`. Lock order is
+    /// `tx_head` -> `tx_cons` everywhere (see
+    /// `poll_tx_completions`).
+    tx_cons: IrqSafeSpinLock<u32>,
     /// RX BD ring (`RX_STD_RING_LEN * 32` bytes, contiguous DMA).
     rx_ring: DmaBuffer,
     /// Per-slot RX frame buffers. Pre-armed at bring-up; descriptor
@@ -669,12 +867,13 @@ pub struct Tg3Nic {
     pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
-// SAFETY: every shared/mutable field (the `tx_head`/`rx_head` cursors and the
-// `rx_ipc_ring`/`tx_ipc_ring` IPC endpoints) is guarded by an
-// `IrqSafeSpinLock`, so concurrent access from another CPU is serialised. The
-// remaining fields are owned: `mmio` addresses a device-register window and
-// the `DmaBuffer`s address DMA-coherent frames — both reachable identically
-// from any CPU, with no thread-affine raw state. Sending the `Tg3Nic` to or
+// SAFETY: every shared/mutable field (the `tx_head` / `rx_head` /
+// `tx_cons` cursors and the `rx_ipc_ring` / `tx_ipc_ring` IPC
+// endpoints) is guarded by an `IrqSafeSpinLock`, so concurrent access
+// from another CPU is serialised. The remaining fields are owned:
+// `mmio` addresses a device-register window and the `DmaBuffer`s
+// address DMA-coherent frames — both reachable identically from any
+// CPU, with no thread-affine raw state. Sending the `Tg3Nic` to or
 // sharing it across threads therefore introduces no data race.
 unsafe impl Send for Tg3Nic {}
 // SAFETY: see the `Send` impl above — all interior mutability is behind
@@ -864,13 +1063,32 @@ impl Tg3Nic {
         }
         compiler_fence(Ordering::SeqCst);
 
+        // Stage 3: host-coalescing status block. Linux allocates
+        // `TG3_HW_STATUS_SIZE` bytes of coherent memory per NAPI
+        // (`tg3_alloc_status_block`, tg3.c:8863) and programs its
+        // DMA address into HOSTCC_STATUS_BLK_HOST_ADDR
+        // (`tg3_init_hw`, tg3.c:9746-9748); the chip DMAs the TX
+        // consumer index there. Zero it so a pre-first-update read
+        // reports consumer 0, not garbage.
+        let status_block = alloc_coherent(TG3_HW_STATUS_SIZE, DomainId::DRIVER_0)
+            .map_err(|_| NicError::NoMemory)?;
+        // SAFETY: status block is a TG3_HW_STATUS_SIZE coherent
+        // buffer; the byte writes stay in bounds.
+        unsafe {
+            for i in 0..TG3_HW_STATUS_SIZE {
+                core::ptr::write_volatile(status_block.cpu_mut_ptr_at::<u8>(i as u64), 0);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+
         let _ = writeln!(
             narf_console::Writer,
-            "  tg3: rings allocated — RX@{:#018x} ({} slots) TX@{:#018x} ({} slots)",
+            "  tg3: rings allocated — RX@{:#018x} ({} slots) TX@{:#018x} ({} slots) status@{:#018x}",
             rx_ring_phys,
             RX_STD_RING_LEN,
             tx_ring_phys,
             TX_RING_LEN,
+            status_block.dma_addr().raw(),
         );
 
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
@@ -881,6 +1099,8 @@ impl Tg3Nic {
             tx_ring,
             tx_pool,
             tx_head: IrqSafeSpinLock::new(0),
+            status_block,
+            tx_cons: IrqSafeSpinLock::new(0),
             rx_ring,
             rx_pool,
             rx_head: IrqSafeSpinLock::new(0),
@@ -894,6 +1114,14 @@ impl Tg3Nic {
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
+
+        // Stage 3: program the status-block DMA address into
+        // HOSTCC (Linux `tg3_init_hw`). The chip DMAs
+        // `tx_consumer` here once the send block runs; until the
+        // ring-base + SNDBDS_MODE slices land, the block stays
+        // zeroed and `poll_tx_completions` reports nothing
+        // complete.
+        tg3.program_status_block();
 
         // Spawn the device's only pump pair — probe spawns none, so the
         // pair fed here is the pair whose halves occupy the ring slots.
@@ -935,6 +1163,17 @@ impl Tg3Nic {
         // wrapper keeps the original `unsafe` contract (caller
         // owns the device's MMIO window).
         pm::chip_reset_plan(&pm::MmioBank::new(mmio))
+    }
+
+    /// (Re-)program the status-block DMA address into the HOSTCC
+    /// registers (Linux `tg3_init_hw`). Idempotent — safe to call
+    /// after every chip reset, since the reset can clear the
+    /// HOSTCC registers.
+    fn program_status_block(&self) {
+        pm::program_status_block_plan(
+            &pm::MmioBank::new(&self.mmio),
+            self.status_block.dma_addr().raw(),
+        );
     }
 
     /// Read a 16-bit MII-Clause-22 register through MAC_MI_COM. This
@@ -1044,6 +1283,9 @@ impl Tg3Nic {
         if !pm::chip_reset_plan(&pm::MmioBank::new(&self.mmio)) {
             return Err(NicError::ResetTimeout);
         }
+        // The reset can clear the HOSTCC registers: re-program the
+        // status-block address so TX completions keep flowing.
+        self.program_status_block();
         self.suspended.store(false, Ordering::Release);
         crate::publish::publish_link(
             self.ifname(),
@@ -1052,11 +1294,17 @@ impl Tg3Nic {
         Ok(())
     }
 
-    /// Stage 2: copy `frame` into the next TX slot's buffer, write a
-    /// fully-formed TX descriptor, advance the producer index. Does
-    /// not yet ring the SNDHOST_PROD_IDX mailbox — that's Stage 3
-    /// (real silicon will need SNDBDS_MODE enabled + the mailbox
-    /// doorbell + a TX-completion IRQ to drain).
+    /// Stage 3: copy `frame` into the next TX slot's buffer, write a
+    /// fully-formed TX descriptor, advance the producer index, and
+    /// ring the SNDHOST_PROD_IDX mailbox so the chip sends it
+    /// (Linux `tg3_start_xmit`). Before reserving a slot, drain
+    /// whatever the chip has completed since the last TX
+    /// (`poll_tx_completions`); if no usable slot is free, fail
+    /// with `TxRingFull` instead of overwriting a descriptor still
+    /// in flight. Real silicon still needs the ring-base
+    /// programming + SNDBDS_MODE enable slices before the chip can
+    /// fetch the ring — the doorbell alone only tells a programmed
+    /// chip there is work.
     ///
     /// Returns `Ok(slot)` so a caller (or smoke test) can locate the
     /// produced descriptor in the ring without re-deriving it.
@@ -1067,7 +1315,13 @@ impl Tg3Nic {
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
+        // Reclaim whatever the chip has completed first, so the
+        // full check below sees the freshest consumer index.
+        self.poll_tx_completions();
         let mut head_g = self.tx_head.lock();
+        if tx_ring_outstanding(*head_g, *self.tx_cons.lock()) >= TX_RING_USABLE as u32 {
+            return Err(NicError::TxRingFull);
+        }
         let slot = (*head_g) as usize % TX_RING_LEN;
         let phys = self.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked above.
@@ -1100,9 +1354,52 @@ impl Tg3Nic {
 
         let returned = *head_g;
         *head_g = (*head_g + 1) % (TX_RING_LEN as u32);
-        // Stage 3 will write `*head_g + 1` into
-        // MAILBOX_SNDHOST_PROD_IDX_0 here to ring the doorbell.
+        // Stage 3: ring the doorbell with the post-increment
+        // producer index — `*head_g` now names the next free slot,
+        // which is the value Linux writes as `tnapi->tx_prod`
+        // (tg3.c:8254). (The old TODO here read `*head_g + 1`, but
+        // at this point `*head_g` is already advanced; `+ 1` would
+        // tell the chip one more descriptor exists than was
+        // written.)
+        pm::ring_tx_doorbell_plan(&pm::MmioBank::new(&self.mmio), *head_g);
         Ok(returned)
+    }
+
+    /// Reclaim TX slots the chip reports complete (Linux
+    /// `tg3_tx()`, tg3.c:6551-6656): read the hardware consumer
+    /// index the chip DMAs into the status block and advance the
+    /// software consumer cursor toward it, never past the
+    /// producer. Returns the number of descriptors reclaimed.
+    /// Called from `transmit` before every slot reservation, so
+    /// the ring drains on the TX path even before the
+    /// TX-completion IRQ / watchdog slices land; the watchdog
+    /// will call it (or its IRQ-driven successor) to age
+    /// outstanding descriptors.
+    pub fn poll_tx_completions(&self) -> u32 {
+        // Lock order is `tx_head` -> `tx_cons` everywhere:
+        // `transmit` takes `tx_cons` while holding `tx_head`, so
+        // taking them in the same order here keeps the pair
+        // deadlock-free.
+        let head_g = self.tx_head.lock();
+        let mut cons_g = self.tx_cons.lock();
+        let hw_cons = self.read_hw_tx_consumer();
+        let (new_cons, reclaimed) = advance_tx_cons(*cons_g, hw_cons, *head_g);
+        *cons_g = new_cons;
+        reclaimed
+    }
+
+    /// Read the chip's TX consumer index out of the status block
+    /// (`HwStatus::tx_consumer`, Linux
+    /// `hw_status->idx[0].tx_consumer`). A zeroed / never-updated
+    /// status block reads 0, so `poll_tx_completions` reclaims
+    /// nothing until the chip starts DMAing status updates.
+    fn read_hw_tx_consumer(&self) -> u32 {
+        let p = self.status_block.cpu_ptr_at::<HwStatus>(0);
+        // SAFETY: status block is a TG3_HW_STATUS_SIZE coherent
+        // buffer owned by this NIC; a volatile read observes the
+        // chip's latest DMA without tearing the u16 field.
+        let s = unsafe { core::ptr::read_volatile(p) };
+        s.tx_consumer() as u32
     }
 
     /// Stage 2: read the descriptor at the current RX consumer
@@ -1127,7 +1424,7 @@ impl Tg3Nic {
         // carry the actual frame length (≤ RX_BUF_LEN) but the slot's
         // self-idx (high 16) won't necessarily match anymore. The
         // simplest "did the chip touch this?" check is: did `type_flags`
-        // gain any of the err / end / type bits? Stage 3 will swap
+        // gain any of the err / end / type bits? A later slice will swap
         // this for the proper "did the status block advance" check.
         if d.type_flags == 0 && d.err_vlan == 0 {
             return None;
@@ -1151,8 +1448,8 @@ impl Tg3Nic {
 
         // Rearm the slot in place: zero the metadata, restore the
         // self-idx pre-arm shape so the next chip-write produces a
-        // distinguishable result. Stage 3 will also write the new
-        // producer index back to MAILBOX_RCV_STD_PROD_IDX.
+        // distinguishable result. A later slice will also write the
+        // new producer index back to MAILBOX_RCV_STD_PROD_IDX.
         let rearmed = RxBufferDesc {
             addr_hi: (buf_phys >> 32) as u32,
             addr_lo: buf_phys as u32,
@@ -1206,14 +1503,33 @@ impl Tg3Nic {
         REG_MAILBOX_RCV_STD_PROD_IDX
     }
 
-    /// Stage 2 introspection: low-half of the TX producer mailbox.
+    /// Stage 3 introspection: address of the LOW word of the TX
+    /// producer mailbox — the address `transmit` rings. Linux's
+    /// `tnapi->prodmbox` is `MAILBOX_SNDHOST_PROD_IDX_0 +
+    /// TG3_64BIT_REG_LOW` (tg3.c:17997); the base (0x0300) names
+    /// the 64-bit register, the low word lives at base + 0x04.
     pub fn tx_prod_mailbox_addr(&self) -> u64 {
-        REG_MAILBOX_SNDHOST_PROD_IDX_0
+        REG_MAILBOX_SNDHOST_PROD_IDX_0 + TG3_64BIT_REG_LOW
     }
 
     /// Current TX producer cursor (for tests).
     pub fn tx_head(&self) -> u32 {
         *self.tx_head.lock()
+    }
+
+    /// Current TX consumer cursor (for tests / the watchdog slice):
+    /// the oldest slot not yet reclaimed by `poll_tx_completions`.
+    pub fn tx_cons(&self) -> u32 {
+        *self.tx_cons.lock()
+    }
+
+    /// Descriptors currently outstanding (produced, not yet
+    /// reclaimed). The watchdog slice ages the oldest one against
+    /// this count.
+    pub fn tx_outstanding(&self) -> u32 {
+        let prod = *self.tx_head.lock();
+        let cons = *self.tx_cons.lock();
+        tx_ring_outstanding(prod, cons)
     }
 
     /// Current RX consumer cursor (for tests).
@@ -1863,16 +2179,100 @@ mod smoke {
     kernel_test_in!("drivers/net/tg3", smoke_tg3_ring_constants);
 
     fn smoke_tg3_mailbox_offsets_match_linux() -> TestResult {
-        // Mailbox offsets pulled from Linux tg3.h. Stage 3 will
-        // write to these — a one-byte drift would silently push
-        // the producer index into the wrong mailbox slot.
+        // Mailbox offsets pulled from Linux tg3.h. Stage 3 writes
+        // to these — a one-byte drift would silently push the
+        // producer index into the wrong mailbox slot.
         if REG_MAILBOX_RCV_STD_PROD_IDX != 0x0268 {
             return TestResult::Fail("MAILBOX_RCV_STD_PROD_IDX offset drift");
         }
         if REG_MAILBOX_SNDHOST_PROD_IDX_0 != 0x0300 {
             return TestResult::Fail("MAILBOX_SNDHOST_PROD_IDX_0 offset drift");
         }
+        // The low word lives at base + TG3_64BIT_REG_LOW (tg3.h:18),
+        // so the doorbell write address is 0x0304, not 0x0300.
+        if TG3_64BIT_REG_LOW != 0x04 {
+            return TestResult::Fail("TG3_64BIT_REG_LOW drift");
+        }
+        if REG_MAILBOX_SNDHOST_PROD_IDX_0 + TG3_64BIT_REG_LOW != 0x0304 {
+            return TestResult::Fail("TX doorbell write address drift");
+        }
+        if REG_HOSTCC_STATUS_BLK_HOST_ADDR != 0x3c38 {
+            return TestResult::Fail("HOSTCC_STATUS_BLK_HOST_ADDR offset drift");
+        }
+        if TG3_HW_STATUS_SIZE != 0x50 {
+            return TestResult::Fail("TG3_HW_STATUS_SIZE drift");
+        }
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/tg3", smoke_tg3_mailbox_offsets_match_linux);
+
+    fn smoke_tg3_hw_status_layout_matches_linux() -> TestResult {
+        // Pin the status-block layout against Linux tg3.h:2678 — a
+        // drift here would read the TX consumer index out of the
+        // wrong half-word and reclaim the wrong slots.
+        if core::mem::size_of::<HwStatus>() != TG3_HW_STATUS_SIZE {
+            return TestResult::Fail("HwStatus size drift");
+        }
+        let s = HwStatus::default();
+        let base = &s as *const HwStatus as usize;
+        let txc = &s.idx[0][1] as *const u16 as usize;
+        if txc - base != 18 {
+            return TestResult::Fail("idx[0].tx_consumer offset drift");
+        }
+        if s.tx_consumer() != 0 {
+            return TestResult::Fail("zeroed status block reports a consumer");
+        }
+        let mut s2 = HwStatus::default();
+        s2.idx[0][1] = 42;
+        if s2.tx_consumer() != 42 {
+            return TestResult::Fail("tx_consumer() did not read idx[0][1]");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_hw_status_layout_matches_linux);
+
+    fn smoke_tg3_tx_completion_arithmetic() -> TestResult {
+        // Pure ring-index arithmetic `poll_tx_completions` relies
+        // on, pinned without standing up a device.
+        if TX_RING_USABLE != TX_RING_LEN - 1 {
+            return TestResult::Fail("TX_RING_USABLE drift");
+        }
+        if tx_ring_outstanding(5, 5) != 0 {
+            return TestResult::Fail("empty ring reads outstanding");
+        }
+        if tx_ring_outstanding(6, 5) != 1 {
+            return TestResult::Fail("one outstanding miscounted");
+        }
+        if tx_ring_outstanding(0, 255) != 1 {
+            return TestResult::Fail("wrapped producer miscounted");
+        }
+        if tx_ring_outstanding(3, 250) != 9 {
+            return TestResult::Fail("wrapped window miscounted");
+        }
+        // Straight reclaim: hw reports 8, sw sits at 5, prod at 10.
+        if advance_tx_cons(5, 8, 10) != (8, 3) {
+            return TestResult::Fail("tx_cons did not walk to the hw index");
+        }
+        // Nothing to do.
+        if advance_tx_cons(5, 5, 10) != (5, 0) {
+            return TestResult::Fail("idle tx_cons moved");
+        }
+        // Stale hw index (e.g. pre-reset value): the walk stops at
+        // prod, never past it.
+        if advance_tx_cons(5, 0, 10) != (10, 5) {
+            return TestResult::Fail("stale hw consumer over-advanced tx_cons");
+        }
+        // Wrapped reclaim across the ring boundary: 250 -> 3 is 9
+        // steps (251..255, 0..3).
+        if advance_tx_cons(250, 3, 10) != (3, 9) {
+            return TestResult::Fail("wrapped tx_cons walk drifted");
+        }
+        // Hw index beyond prod (corrupt / stale): the walk is
+        // bounded by the outstanding count and stops at prod.
+        if advance_tx_cons(250, 20, 10) != (10, 16) {
+            return TestResult::Fail("unbounded tx_cons walk past prod");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_tx_completion_arithmetic);
 }
