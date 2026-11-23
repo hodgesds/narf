@@ -1180,6 +1180,215 @@ kernel_test_in!(
     smoke_userspace_signal_delivery_lowest_first_multiple_pending
 );
 
+// #2135: the legacy 3-arg `sigaction` form lives on NARF extension wire
+// 0x4060; Linux wire 13 (x86_64) / 134 (aarch64) route to `RtSigaction`
+// (pointer-to-struct). Pin both directions of the mapping so a future
+// renumber breaks loudly here instead of silently breaking every
+// narf-libc handler install (whose user-runtime constant tracked the
+// old Linux numbers and failed `-EINVAL` on every install).
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_sigaction_wire_is_narf_extension() -> TestResult {
+    use crate::Syscall;
+    if Syscall::Sigaction.raw() != 0x4060 {
+        return TestResult::Fail("Sigaction.raw() is not the 0x4060 extension wire");
+    }
+    if Syscall::from_raw(0x4060) != Some(Syscall::Sigaction) {
+        return TestResult::Fail("wire 0x4060 does not dispatch to Sigaction");
+    }
+    #[cfg(target_arch = "x86_64")]
+    if Syscall::from_raw(13) != Some(Syscall::RtSigaction) {
+        return TestResult::Fail("x86_64 wire 13 is not RtSigaction");
+    }
+    #[cfg(target_arch = "aarch64")]
+    if Syscall::from_raw(134) != Some(Syscall::RtSigaction) {
+        return TestResult::Fail("aarch64 wire 134 is not RtSigaction");
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_sigaction_wire_is_narf_extension
+);
+
+// #2135: SIGWINCH defaults to Ignore, so it is the signal most exposed
+// to a registration failure — with no handler installed the generation
+// path drops it before it ever goes pending, and delivery applies the
+// default action. Install a handler for 28 through the legacy 3-arg
+// `Sigaction` wire (0x4060, the wire narf-libc must use), then drive
+// BOTH arrival paths the reproducer exercised and assert the handler
+// is actually invoked each time:
+//   1. the resize path — `deliver_signal_to_pgrp(fg, SIGWINCH)`, exactly
+//      what `console_tty::resize` / `devfs_pty::resize` issue via
+//      `pty_deliver_signal` on TIOCSWINSZ;
+//   2. the self-kill path — `kill(getpid(), SIGWINCH)` via `Syscall::Kill`.
+// Before the user-runtime wire fix the install itself failed `-EINVAL`
+// (wire 13/134 → `RtSigaction`, arg3 = 0 ≠ 8), so both sends were
+// dropped at generation and the handler never ran.
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_sigwinch_handler_fires_on_resize_and_self_kill() -> TestResult {
+    use crate::{
+        default_signal_delivery, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, signal_init, signal_pending_of, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD12C);
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
+    let task = task_lookup();
+    install_task_id_lookup(task_lookup);
+    crate::handlers::register_task_to_pid(task, task);
+    crate::handlers::register_pid_task_mapping(task, task);
+    if crate::task::task_get(task).is_none() {
+        let _ = crate::task::Task::new_registered(task, task);
+    }
+
+    crate::handlers::__test_sigaction_reset();
+    crate::handlers::__test_signal_reset();
+    crate::handlers::__test_pgid_reset();
+    crate::handlers::pgid_init();
+    crate::handlers::__test_set_pgid(task, task);
+    crate::sigaction_init();
+    signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+        delivered: Option<(u64, u32)>,
+        going_to_user: bool,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+        fn returning_to_user(&self) -> bool {
+            self.going_to_user
+        }
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            self.delivered = Some((p.handler, p.signum));
+            true
+        }
+    }
+
+    const SIGWINCH: u64 = 28;
+    const H28: u64 = 0x2A2A_0000;
+    let cleanup = || {
+        __test_clear_global();
+        crate::handlers::__test_sigaction_reset();
+        crate::handlers::__test_signal_reset();
+        crate::handlers::__test_pgid_reset();
+    };
+
+    // Install the SIGWINCH handler through the legacy wire, as narf-libc
+    // `signal()` does.
+    let mut old: u64 = 0;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: SIGWINCH,
+            arg1: H28,
+            arg2: &mut old as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+        delivered: None,
+        going_to_user: false,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        cleanup();
+        return TestResult::Fail("sigaction registration for SIGWINCH did not Ok");
+    }
+
+    // (1) Resize path: foreground-pgrp SIGWINCH.
+    if !crate::handlers::deliver_signal_to_pgrp(task, SIGWINCH as u32) {
+        cleanup();
+        return TestResult::Fail("pgrp SIGWINCH targeted no task");
+    }
+    if signal_pending_of(task) & crate::handlers::sig_bit(SIGWINCH as u32) == 0 {
+        cleanup();
+        return TestResult::Fail("pgrp SIGWINCH was dropped before going pending");
+    }
+    let mut ctx1 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        delivered: None,
+        going_to_user: true,
+    };
+    default_signal_delivery(&mut ctx1, crate::handlers::SYSCALL_NUM_NONE);
+    if !matches!(ctx1.delivered, Some((h, s)) if h == H28 && s == SIGWINCH as u32) {
+        cleanup();
+        return TestResult::Fail("resize-path SIGWINCH did not reach its handler");
+    }
+    if signal_pending_of(task) & crate::handlers::sig_bit(SIGWINCH as u32) != 0 {
+        cleanup();
+        return TestResult::Fail("resize-path SIGWINCH left its pending bit set");
+    }
+
+    // (2) Self-kill path: kill(getpid(), SIGWINCH).
+    let mut ctxk = FakeCtx {
+        args: SyscallArgs {
+            arg0: task,
+            arg1: SIGWINCH,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+        delivered: None,
+        going_to_user: false,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctxk);
+    if !matches!(ctxk.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        cleanup();
+        return TestResult::Fail("self-kill SIGWINCH did not return 0");
+    }
+    if signal_pending_of(task) & crate::handlers::sig_bit(SIGWINCH as u32) == 0 {
+        cleanup();
+        return TestResult::Fail("self-kill SIGWINCH was dropped before going pending");
+    }
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        delivered: None,
+        going_to_user: true,
+    };
+    default_signal_delivery(&mut ctx2, crate::handlers::SYSCALL_NUM_NONE);
+    if !matches!(ctx2.delivered, Some((h, s)) if h == H28 && s == SIGWINCH as u32) {
+        cleanup();
+        return TestResult::Fail("self-kill SIGWINCH did not reach its handler");
+    }
+    if signal_pending_of(task) & crate::handlers::sig_bit(SIGWINCH as u32) != 0 {
+        cleanup();
+        return TestResult::Fail("self-kill SIGWINCH left its pending bit set");
+    }
+
+    cleanup();
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_sigwinch_handler_fires_on_resize_and_self_kill
+);
+
 fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
     // Register a SIGSEGV handler via sys_sigaction, then run the
     // synchronous-signal hook with vector=14 (#PF) and confirm the

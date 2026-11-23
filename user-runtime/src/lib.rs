@@ -65,6 +65,19 @@ pub const SYS_TCSETATTR: u64 = 0x4051;
 pub const SYS_GETHOSTNAME: u64 = 0x4052;
 pub const SYS_LISTDIR: u64 = 0x4053;
 
+/// Legacy 3-arg `sigaction` (handler vaddr in a register — the form
+/// [`sigaction()`] in this crate issues). Linux wire 13 (x86_64) / 134
+/// (aarch64) now route to `RtSigaction` (pointer-to-struct, `sys_rt_sigaction`
+/// requires `sigsetsize == 8` in arg3) — commit 09b3c2c23 — so the legacy
+/// form lives on this arch-independent NARF extension wire
+/// (`userspace/src/syscall.rs`, `NARF_EXTENSION_TABLE`). Do NOT move it
+/// back into the per-arch Linux tables: the old numbers made
+/// `sys_rt_sigaction` reject the install with `-EINVAL` (arg3 = 0), so
+/// every narf-libc `signal()`/`sigaction()` install silently never
+/// registered and a later `kill()` applied the default action instead
+/// (`Ignore` for SIGWINCH — #2135).
+pub const SYS_SIGACTION: u64 = 0x4060;
+
 // ── x86_64 Linux ABI ─────────────────────────────────────────────
 #[cfg(target_arch = "x86_64")]
 mod arch_syscalls {
@@ -81,7 +94,6 @@ mod arch_syscalls {
     pub const SYS_MPROTECT: u64 = 10;
     pub const SYS_MUNMAP: u64 = 11;
     pub const SYS_BRK: u64 = 12;
-    pub const SYS_SIGACTION: u64 = 13;
     pub const SYS_SIGPROCMASK: u64 = 14;
     pub const SYS_SIGRETURN: u64 = 15;
     pub const SYS_PREAD64: u64 = 17;
@@ -280,7 +292,6 @@ mod arch_syscalls {
     pub const SYS_TGKILL: u64 = 131;
     pub const SYS_SIGALTSTACK: u64 = 132;
     pub const SYS_RT_SIGSUSPEND: u64 = 133;
-    pub const SYS_SIGACTION: u64 = 134;
     pub const SYS_SIGPROCMASK: u64 = 135;
     pub const SYS_RT_SIGPENDING: u64 = 136;
     pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
@@ -1347,6 +1358,34 @@ mod mmap_return_tests {
         assert_eq!(mmap_return_ptr(0x8000_0000_0000) as u64, 0x8000_0000_0000);
         // -4096 is past MAX_ERRNO, so it is an address, not an error.
         assert_eq!(mmap_return_ptr((-4096i64) as u64) as u64, (-4096i64) as u64);
+    }
+}
+
+/// Legacy 3-arg `sigaction` (handler vaddr in a register) must go out on
+/// the NARF extension wire, not the Linux `rt_sigaction` numbers.
+///
+/// Commit 09b3c2c23 repointed Linux wire 13 (x86_64) / 134 (aarch64) to
+/// `RtSigaction` (pointer-to-struct, `sigsetsize == 8` in arg3) and moved
+/// the legacy form to 0x4060 (`userspace/src/syscall.rs`,
+/// `NARF_EXTENSION_TABLE`). `SYS_SIGACTION` kept the old Linux numbers,
+/// so every narf-libc `signal()`/`sigaction()` install hit
+/// `sys_rt_sigaction` with arg3 = 0 and failed `-EINVAL` — silently, the
+/// return value is discarded — and the handler never reached the kernel's
+/// `SIGACTION_TABLE`. A later `kill()` still queued the signal, but
+/// delivery found no handler and applied the default action: `Ignore`
+/// for SIGWINCH, so the handler never ran (#2135). Pin the wire here so
+/// a future renumber breaks loudly in a host test instead of silently
+/// on the serial console.
+#[cfg(test)]
+mod sigaction_wire_tests {
+    use super::SYS_SIGACTION;
+
+    #[test]
+    fn sigaction_uses_the_narf_extension_wire() {
+        assert_eq!(
+            SYS_SIGACTION, 0x4060,
+            "SYS_SIGACTION must be the NARF extension wire (0x4060), not the Linux rt_sigaction number: see userspace/src/syscall.rs NARF_EXTENSION_TABLE"
+        );
     }
 }
 
