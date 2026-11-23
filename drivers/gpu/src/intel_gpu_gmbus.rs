@@ -1232,13 +1232,13 @@ pub mod tests {
         // intel_gmbus.h b90c984d: GMBUS_PIN_DISABLED, GMBUS_PIN_1_BXT..
         // GMBUS_PIN_5_MTP, GMBUS_PIN_9_TC1_ICP..GMBUS_PIN_14_TC6_TGP. The
         // former 0..=7 range encoded DDI A..F as 2..7, which is wrong.
-        for v in [0u32, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14] {
+        for v in [0u32, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14] {
             let pp = PinPair::try_from(v).expect("GMBUS_PIN_* value");
             if pp.encode() != v {
                 return TestResult::Fail("pin pair encode round-trip");
             }
         }
-        for v in [6u32, 7, 8, 15, 0x202] {
+        for v in [7u32, 8, 15, 0x202] {
             if PinPair::try_from(v) != Err(GmbusError::InvalidPinPair) {
                 return TestResult::Fail("non-GMBUS_PIN values must not decode");
             }
