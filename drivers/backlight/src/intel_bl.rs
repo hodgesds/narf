@@ -7,7 +7,9 @@
 //! ## References (GPL-2.0-or-later, direct citation allowed)
 //!
 //! - `drivers/gpu/drm/i915/display/intel_backlight.c` —
-//!   `bxt_set_backlight`, `pch_get_max_backlight`.
+//!   `bxt_set_backlight`, `pch_get_max_backlight`,
+//!   `lpt_set_backlight`, `lpt_get_backlight`,
+//!   `spt_pwm_funcs`.
 //! - `drivers/gpu/drm/xe/display/xe_display.c` — Xe backlight ops.
 //! - Intel "Tiger Lake Platform Controller Hub EDS Vol 2" — PWM register
 //!   offsets and bit definitions.
@@ -35,6 +37,30 @@ pub const SOUTH_CHICKEN1: u64 = 0xC2000;
 pub const BXT_BLC_PWM_FREQ1: u64 = 0xC8254;
 /// `BXT_BLC_PWM_DUTY1` — duty-cycle target, modern PCH path.
 pub const BXT_BLC_PWM_DUTY1: u64 = 0xC8258;
+/// `BLC_PWM_PCH_CTL2` — the SPT period/duty register (same
+/// address as `BXT_BLC_PWM_FREQ1`): high 16 bits = period, low
+/// 16 bits = duty (`lpt_set_backlight` / `lpt_get_backlight`,
+/// `display/intel_backlight.c`).
+pub const BLC_PWM_PCH_CTL2: u64 = 0xC8254;
+/// `SPT_PWM_GRANULARITY` — bit 0 of `SOUTH_CHICKEN1` (the
+/// alternate PWM increment on the SPT path). Not modeled: the
+/// device preserves the firmware period and never converts
+/// Hz→PWM, so a future VBT-plumbed backlight can set it at
+/// enable time per Linux `lpt_enable_backlight`.
+pub const SPT_PWM_GRANULARITY: u32 = 1 << 0;
+
+/// Which PWM register layout the device drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PwmLayout {
+    /// BXT/CNP: period in `BXT_BLC_PWM_FREQ1` (0xC8254),
+    /// duty in `BXT_BLC_PWM_DUTY1` (0xC8258).
+    Bxt,
+    /// SPT (Skylake PCH): period in the high 16 bits of
+    /// `BLC_PWM_PCH_CTL2` (0xC8254), duty in its low 16
+    /// bits — the duty write is a read-modify-write that
+    /// preserves the period.
+    Spt,
+}
 
 // ── Intel Backlight Device ─────────────────────────────────────────
 
@@ -44,6 +70,7 @@ pub struct IntelBacklightDevice {
     pub name: String,
     mmio: MmioRegion,
     max: u32,
+    layout: PwmLayout,
 }
 
 impl IntelBacklightDevice {
@@ -52,13 +79,29 @@ impl IntelBacklightDevice {
     /// # Safety
     /// `mmio` must be a valid mapping of the iGPU's BAR0 registers.
     pub unsafe fn new(name: &str, mmio: MmioRegion) -> Self {
-        // Read period from BXT_BLC_PWM_FREQ1.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let max = unsafe { mmio.read32(BXT_BLC_PWM_FREQ1) };
+        unsafe { Self::new_with_layout(name, mmio, PwmLayout::Bxt) }
+    }
+
+    /// Construct a new Intel backlight device with an explicit
+    /// PWM layout (BXT for Gen11/Gen12, SPT for Gen9 Skylake).
+    ///
+    /// # Safety
+    /// `mmio` must be a valid mapping of the iGPU's BAR0 registers.
+    pub unsafe fn new_with_layout(name: &str, mmio: MmioRegion, layout: PwmLayout) -> Self {
+        // BXT: the whole FREQ1 register is the period. SPT:
+        // the period is CTL2's high 16 bits (`lpt_get_backlight`
+        // reads `BLC_PWM_PCH_CTL2 >> 16`).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let max = match layout {
+            PwmLayout::Bxt => unsafe { mmio.read32(BXT_BLC_PWM_FREQ1) },
+            PwmLayout::Spt => (unsafe { mmio.read32(BLC_PWM_PCH_CTL2) }) >> 16,
+        };
         Self {
             name: name.to_string(),
             mmio,
             max,
+            layout,
         }
     }
 
@@ -93,8 +136,13 @@ impl BacklightDevice for IntelBacklightDevice {
         if self.max == 0 {
             return 0;
         }
+        // BXT: duty lives in DUTY1. SPT: duty is CTL2's low 16
+        // bits (`lpt_get_backlight`).
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let duty = unsafe { self.mmio.read32(BXT_BLC_PWM_DUTY1) };
+        let duty = match self.layout {
+            PwmLayout::Bxt => unsafe { self.mmio.read32(BXT_BLC_PWM_DUTY1) },
+            PwmLayout::Spt => (unsafe { self.mmio.read32(BLC_PWM_PCH_CTL2) }) & 0xFFFF,
+        };
         self.duty_to_pct(duty)
     }
 
@@ -103,8 +151,17 @@ impl BacklightDevice for IntelBacklightDevice {
             return;
         }
         let duty = self.pct_to_duty(level);
+        // BXT: plain write to DUTY1. SPT: read-modify-write
+        // CTL2's low 16 bits, preserving the period in the
+        // high 16 bits (`lpt_set_backlight`).
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.mmio.write32(BXT_BLC_PWM_DUTY1, duty) };
+        match self.layout {
+            PwmLayout::Bxt => unsafe { self.mmio.write32(BXT_BLC_PWM_DUTY1, duty) },
+            PwmLayout::Spt => unsafe {
+                let cur = self.mmio.read32(BLC_PWM_PCH_CTL2);
+                self.mmio.write32(BLC_PWM_PCH_CTL2, (cur & !0xFFFF) | duty);
+            },
+        }
     }
 
     fn kind(&self) -> BacklightKind {
@@ -135,6 +192,27 @@ pub fn install(mmio: MmioRegion) {
     let _ = writeln!(
         narf_console::Writer,
         "  intel-backlight: registered, max_duty={}",
+        dev.max
+    );
+    crate::register_backlight(Arc::new(dev));
+}
+
+/// Install an Intel backlight device with the SPT PWM layout
+/// (Skylake PCH). Called from Intel GPU bring-up when the
+/// generation drives SPT (`Generation::Skylake`). The SPT
+/// install does not clear the BXT `PCH_LPC_PWM_SEL` bit —
+/// that ownership step belongs to the BXT path; the SPT
+/// enable sequence (CTL1 enable + `SPT_PWM_GRANULARITY`)
+/// belongs to a future backlight-enable step per Linux
+/// `lpt_enable_backlight`, and this install preserves the
+/// firmware period exactly as `install` does for BXT.
+pub fn install_spt(mmio: MmioRegion) {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let dev =
+        unsafe { IntelBacklightDevice::new_with_layout("intel_backlight", mmio, PwmLayout::Spt) };
+    let _ = writeln!(
+        narf_console::Writer,
+        "  intel-backlight: registered (SPT), max_duty={}",
         dev.max
     );
     crate::register_backlight(Arc::new(dev));

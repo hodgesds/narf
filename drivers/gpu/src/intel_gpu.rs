@@ -51,7 +51,8 @@
 //!   shared probe path (display clocks, DPLL, watermarks, DDI
 //!   tables, first light on the internal display,
 //!   fixture-validated, silicon untested). External display and
-//!   backlight stay gated (Lane 8 owns external outputs), and
+//!   backlight are admitted since Lane 8 (Gen11 §12.3; Gen9
+//!   Lane 8, §12.7), and
 //!   GT execution stays gated until the Gen11 lanes land
 //!   (PTE format, execlists, GuC load).
 
@@ -150,43 +151,56 @@ impl Generation {
     }
 
     /// The modeset-level external outputs are implemented for
-    /// Gen12 and for Gen11 Ice Lake (Lane 8: combo-PHY A/B DP +
+    /// Gen12, for Gen11 Ice Lake (Lane 8: combo-PHY A/B DP +
     /// HDMI, TC1–TC4 MG PLL + DP + HDMI, fixture-validated,
-    /// silicon untested). The HPD / external-session layer
-    /// (`enable_external_hpd`, `dp_connect`, `hdmi_connect`,
-    /// `mst_connect`) still implements Gen12 only and fails
-    /// closed for Gen11 — its Gen12 gates return `None` on a
-    /// Gen11 adapter — so flipping this predicate does not
-    /// arm any session path; threading that layer for Gen11
-    /// is a follow-up lane.
+    /// silicon untested), and for Gen9 Skylake (Gen9 Lane 8:
+    /// DDI B–E DP + HDMI, SKL WRPLL + DDI tables, same
+    /// fixture-validated, silicon-untested status). The HPD /
+    /// external-session layer (`enable_external_hpd`,
+    /// `dp_connect`, `hdmi_connect`, `mst_connect`) still
+    /// implements Gen12 only and fails closed for Gen11 and
+    /// Gen9 — its Gen12 gates return `None` on a Gen11/Gen9
+    /// adapter — so flipping this predicate does not arm any
+    /// session path; threading that layer for Gen11/Gen9 is a
+    /// follow-up lane.
     pub const fn external_display_supported(self) -> bool {
         matches!(
             self,
-            Generation::TigerLake | Generation::AlderLake | Generation::IceLake
+            Generation::TigerLake
+                | Generation::AlderLake
+                | Generation::IceLake
+                | Generation::Skylake
         )
     }
 
     /// Whether the backlight PWM install is valid for the
-    /// generation. The install programs the BXT-style PWM
-    /// block (`BXT_BLC_PWM_CTL1`/`FREQ1`/`DUTY1` 0xC8250/54/58
-    /// + `SOUTH_CHICKEN1` 0xC2000 bit 25), which Ice Lake
-    ///   shares: Linux drives ICL through the same
-    ///   `cnp_pwm_funcs` (`bxt_set_backlight` /
-    ///   `bxt_get_backlight`, `display/intel_backlight.c`) —
-    ///   "CNP has the BXT implementation of backlight, but with
-    ///   only one controller". MTL's backlight path is owned by
-    ///   the backlight composition lane (PR #1037, #947/#949/#951),
-    ///   which flips this predicate when the MTL registers land.
-    ///   Keeping it separate from `display_supported` lets the
-    ///   MTL modeset ship without claiming a backlight it cannot
-    ///   drive. The install's controller-1 hardcoding is
-    ///   pre-existing Gen12 behavior (Linux takes the VBT
-    ///   controller, defaulting to 0); on a VBT-controller-0
-    ///   part FREQ1 may read 0 and the install no-ops harmlessly.
+    /// generation. Two layouts: Skylake drives the SPT PWM
+    /// block (`BLC_PWM_PCH_CTL1`/`CTL2` 0xC8250/54, duty RMW
+    /// into CTL2's low 16 bits, max = CTL2 >> 16, 24 MHz,
+    /// `SPT_PWM_GRANULARITY` bit 0 of `SOUTH_CHICKEN1`
+    /// 0xC2000 — Linux `spt_pwm_funcs`,
+    /// `display/intel_backlight.c`), and Ice Lake shares the
+    /// BXT-style block (`BXT_BLC_PWM_CTL1`/`FREQ1`/`DUTY1`
+    /// 0xC8250/54/58 + `SOUTH_CHICKEN1` 0xC2000 bit 25 —
+    /// Linux drives ICL through the same `cnp_pwm_funcs`
+    /// (`bxt_set_backlight` / `bxt_get_backlight`) — "CNP has
+    /// the BXT implementation of backlight, but with only one
+    /// controller". MTL's backlight path is owned by the
+    /// backlight composition lane (PR #1037, #947/#949/#951),
+    /// which flips this predicate when the MTL registers land.
+    /// Keeping it separate from `display_supported` lets the
+    /// MTL modeset ship without claiming a backlight it cannot
+    /// drive. The install's controller-1 hardcoding is
+    /// pre-existing Gen12 behavior (Linux takes the VBT
+    /// controller, defaulting to 0); on a VBT-controller-0
+    /// part FREQ1 may read 0 and the install no-ops harmlessly.
     pub const fn backlight_supported(self) -> bool {
         matches!(
             self,
-            Generation::TigerLake | Generation::AlderLake | Generation::IceLake
+            Generation::TigerLake
+                | Generation::AlderLake
+                | Generation::IceLake
+                | Generation::Skylake
         )
     }
 }
@@ -986,8 +1000,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // Activate backlight PWM where the generation's PWM
             // block is modelled (Gen12 today; MTL's install is
             // gated on the backlight composition lane, PR #1037).
+            // Gen9 Skylake drives the SPT PWM layout, Gen11/Gen12
+            // the BXT layout (Lane 8).
             if dev.chip.generation.backlight_supported() {
-                narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
+                if dev.chip.generation == Generation::Skylake {
+                    narf_drivers_backlight::intel_bl::install_spt(dev.gtt_mmadr);
+                } else {
+                    narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
+                }
             }
             let mode = crate::intel_gpu_modeset::takeover_display(&dev);
             if mode.is_some() {
@@ -3579,23 +3599,22 @@ pub mod tests {
         {
             return TestResult::Fail("RKL must admit Gen12 GT regions while display stays gated");
         }
-        // Gen9 (Lanes 1 + 5): identity + probe + internal-panel
-        // modeset. The BAR0 region map is admitted (Gen9 shares
-        // Gen12's partitioning) and the part is explicitly
-        // pre-GMD; display is admitted (fixture-validated,
-        // silicon untested) while external display and
-        // backlight stay gated — Lane 8 owns the external
-        // outputs and backlight. The part still binds and
-        // announces.
+        // Gen9 (Lanes 1 + 5 + 8): identity + probe +
+        // internal-panel modeset + external outputs +
+        // backlight. The BAR0 region map is admitted (Gen9
+        // shares Gen12's partitioning) and the part is
+        // explicitly pre-GMD; display, external display and
+        // backlight are admitted (fixture-validated, silicon
+        // untested). The HPD/session layer still fails closed
+        // for Gen9 (its own Gen12 gates), so this flip arms no
+        // session path. The part still binds and announces.
         if !Generation::Skylake.display_supported()
-            || Generation::Skylake.external_display_supported()
-            || Generation::Skylake.backlight_supported()
+            || !Generation::Skylake.external_display_supported()
+            || !Generation::Skylake.backlight_supported()
             || Generation::Skylake.region_generation() != Some(RegionGeneration::Gen9)
             || Generation::Skylake.has_gmd_id()
         {
-            return TestResult::Fail(
-                "Gen9 must admit regions + display while external + backlight stay gated",
-            );
+            return TestResult::Fail("Gen9 must admit regions + display + external + backlight");
         }
         // Gen11 (Lanes 5 + 8): identity + probe + internal-panel
         // modeset + external outputs + backlight. The BAR0 region
@@ -3619,21 +3638,24 @@ pub mod tests {
         if !Generation::TigerLake.external_display_supported()
             || !Generation::AlderLake.external_display_supported()
             || !Generation::IceLake.external_display_supported()
+            || !Generation::Skylake.external_display_supported()
             || Generation::MeteorLake.external_display_supported()
             || Generation::PantherLake.external_display_supported()
         {
-            return TestResult::Fail("external display sequences must remain Gen12 + Gen11");
+            return TestResult::Fail("external display sequences must remain Gen12 + Gen11 + Gen9");
         }
-        // Backlight stays Gen12 + Gen11 (Lane 8: ICL shares
-        // the BXT-style PWM block) until the composition lane
-        // (PR #1037) lands the MTL PWM path.
+        // Backlight stays Gen12 + Gen11 + Gen9 (Lane 8: SKL
+        // drives the SPT PWM block, ICL shares the BXT-style
+        // PWM block) until the composition lane (PR #1037)
+        // lands the MTL PWM path.
         if !Generation::TigerLake.backlight_supported()
             || !Generation::AlderLake.backlight_supported()
             || !Generation::IceLake.backlight_supported()
+            || !Generation::Skylake.backlight_supported()
             || Generation::MeteorLake.backlight_supported()
             || Generation::PantherLake.backlight_supported()
         {
-            return TestResult::Fail("backlight gate must be Gen12 + Gen11 pending #1037");
+            return TestResult::Fail("backlight gate must be Gen12 + Gen11 + Gen9 pending #1037");
         }
         // Region generations follow the same split, with Lunar
         // Lake on the Xe2-LPD table (display 20) and Panther Lake
@@ -3884,16 +3906,17 @@ pub mod tests {
                             && profile.minimum_version == (70, 1, 1) => {}
                     _ => return TestResult::Fail("Gen9 DID has the wrong GuC profile"),
                 }
-                // Lane-1 disposition: regions admitted, pre-GMD
+                // Lane-8 disposition: regions admitted, pre-GMD
                 // presence, display / external display /
-                // backlight gated (Lanes 5 and 8 flip those).
-                if info.generation.display_supported()
-                    || info.generation.external_display_supported()
-                    || info.generation.backlight_supported()
+                // backlight all admitted (Lanes 5 and 8 flipped
+                // those).
+                if !info.generation.display_supported()
+                    || !info.generation.external_display_supported()
+                    || !info.generation.backlight_supported()
                     || info.generation.region_generation() != Some(RegionGeneration::Gen9)
                     || info.generation.has_gmd_id()
                 {
-                    return TestResult::Fail("Gen9 disposition wrong after Lane 1");
+                    return TestResult::Fail("Gen9 disposition wrong after Lane 8");
                 }
             }
         }

@@ -796,13 +796,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         scrambling: bool,
         high_tmds_char_rate: bool,
     ) -> Result<Mode, ModesetError> {
-        // Gen9 has no HDMI modeset here (Lane 8 owns the
-        // external outputs): a Gen9 run reaching this function
-        // would run the Gen12 `program_dpll_coeffs` writes
-        // (TGL CFGCR0) on SKL silicon. Fail closed instead.
-        if self.gen9_platform.is_some() {
-            return Err(ModesetError::UnsupportedGeneration);
+        // Gen9: DMC is REQUIRED (Q5 default, §12.6) — the
+        // same gate `modeset_impl` applies, here because the
+        // HDMI entry bypasses `modeset_impl` entirely.
+        if self.gen9_platform.is_some() && !crate::intel_gpu_gen9_dmc::gen9_dmc_loaded() {
+            return Err(ModesetError::DmcUnavailable);
         }
+        // Gen9: the SKL modeset below (WRPLL row + SKL HDMI
+        // table + Wa #1143 pulse) — never the TGL
+        // `hdmi_wrpll_coeffs` search or the Gen12
+        // `program_dpll_coeffs` writes. Lane 8.
         // Gen12 Type-C ports have no HDMI modeset here (their
         // DDI is a Dekel port); Gen11 TC ports do — the MG PHY
         // drives HDMI through the MG PLL + MG HDMI table below.
@@ -810,25 +813,38 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             return Err(ModesetError::UnsupportedGeneration);
         }
         validate_framebuffer_mode(primary_fb, mode)?;
-        let coeffs = match crate::intel_gpu_pll::hdmi_wrpll_coeffs(
-            mode.pixel_clock_khz,
-            // Same DSSM-strap family selection as the DP path
-            // (Q6, #1024).
-            decode_refclk_family(self.mmio.read32(DSSM)),
-        ) {
-            Some(c) => c,
-            None => return Err(ModesetError::HdmiClockUnsupported),
-        };
+        // Gen9 SKL admission, as the DP path applies it in
+        // `modeset_impl` (`validate_framebuffer_skl`): a bad
+        // stride or alignment fails before any HW write.
+        if self.gen9_platform.is_some() {
+            self.validate_framebuffer_skl(primary_fb)?;
+        }
 
         self.enable_pg1()?;
         self.disable_pipeline();
-        // Gen11: the ICL combo PLL (DP path shares this) or the
-        // MG PLL on a TC port — never the TGL CFGCR0
-        // `program_dpll_coeffs` writes below.
-        if self.gen11_platform.is_some() {
-            self.program_dpll_gen11_hdmi(&coeffs, mode.pixel_clock_khz)?;
+        // Gen9: the SKL WRPLL row (`program_dpll_gen9_hdmi`),
+        // not the TGL coefficients — the search below is
+        // skipped entirely for Gen9.
+        if self.gen9_platform.is_some() {
+            self.program_dpll_gen9_hdmi(mode.pixel_clock_khz)?;
         } else {
-            self.program_dpll_coeffs(&coeffs)?;
+            let coeffs = match crate::intel_gpu_pll::hdmi_wrpll_coeffs(
+                mode.pixel_clock_khz,
+                // Same DSSM-strap family selection as the DP path
+                // (Q6, #1024).
+                decode_refclk_family(self.mmio.read32(DSSM)),
+            ) {
+                Some(c) => c,
+                None => return Err(ModesetError::HdmiClockUnsupported),
+            };
+            // Gen11: the ICL combo PLL (DP path shares this) or the
+            // MG PLL on a TC port — never the TGL CFGCR0
+            // `program_dpll_coeffs` writes below.
+            if self.gen11_platform.is_some() {
+                self.program_dpll_gen11_hdmi(&coeffs, mode.pixel_clock_khz)?;
+            } else {
+                self.program_dpll_coeffs(&coeffs)?;
+            }
         }
         self.program_cdclk_floor(mode)?;
         self.program_dpclka_routing()?;
@@ -841,14 +857,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.program_watermarks(mode, primary_fb);
         self.program_plane(primary_fb, mode);
         // No step 9: no link training on a TMDS link — but the
-        // PHY still gets its signal levels: the ICL HDMI
+        // PHY still gets its signal levels: the SKL HDMI table
+        // entry + I_boost + Wa #1143 pulse (Gen9), the ICL HDMI
         // table's default entry (combo ports) or the MG HDMI
         // table's default entry (TC ports), programmed before
         // the DDI buffer enables (Linux
         // `intel_ddi_pre_enable_hdmi` calls `set_signal_levels`;
         // the old "no BUF_TRANS load" note predates the PHY
         // model).
-        if let Some(platform) = self.gen11_platform {
+        if self.gen9_platform.is_some() {
+            self.program_hdmi_levels_gen9()?;
+        } else if let Some(platform) = self.gen11_platform {
             use crate::intel_gpu_gen11_ddi::{phy_for_port, Gen11Phy};
             match phy_for_port(platform, self.ddi) {
                 Some(Gen11Phy::Mg { .. }) => {
@@ -906,15 +925,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         link: LinkStep,
         ddi_mode: u32,
     ) -> Result<(Mode, Option<crate::dp_link_training::TrainedLink>), ModesetError> {
-        // Gen9 external outputs are Lane 8's: the plan path
-        // (external DP / MST, `modeset_with_plan` /
-        // `modeset_mst_primary`) refuses here, so a Gen9 run
-        // can only modeset the internal panel (legacy /
-        // fixed-mode). The session layers already fail closed
-        // for Gen9 (their Gen12 gates return `None`); this is
-        // the orchestrator-level backstop.
-        if self.gen9_platform.is_some() && matches!(link, LinkStep::Plan(_)) {
-            return Err(ModesetError::UnsupportedGeneration);
+        // Gen9: DMC is REQUIRED (Q5 default, §12.6) — the
+        // gate fires before any register is touched, on every
+        // entry (legacy, plan, trained), not only the panel
+        // entry (`modeset_display_family` gates the panel
+        // path; this covers the plan/trained paths too).
+        // Lane 8 removed the plan-path backstop here: the
+        // external-output plan plumbing is now wired, so a
+        // Gen9 run can modeset an external output.
+        if self.gen9_platform.is_some() && !crate::intel_gpu_gen9_dmc::gen9_dmc_loaded() {
+            return Err(ModesetError::DmcUnavailable);
         }
         // Step 0: validate inputs that don't require touching HW.
         validate_framebuffer(primary_fb)?;
@@ -1550,10 +1570,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// (CTRL1 write, CTL enable, 5 ms `DPLL_STATUS` lock
     /// wait). The DPLL id comes from `skl_get_dpll`: eDP
     /// takes DPLL0 only; every other output takes the first
-    /// of DPLL1/2/3. This lane modesets the internal panel
-    /// only, so the id is always DPLL0 here — but the pool
-    /// call is the arbitration point Lane 8 extends when
-    /// external outputs land, instead of a hardcoded id.
+    /// of DPLL1/2/3. Lane 8: external outputs take the first
+    /// of DPLL1/2/3 through the same pool call —
+    /// `program_dpclka_routing` makes the same pick, so the
+    /// DPLL program and the clock routing agree on the id.
+    /// Multi-external arbitration (two simultaneous external
+    /// outputs would both take DPLL1) is a remainder.
     fn program_dpll_gen9(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
         use crate::intel_gpu_gen9_dpll::{dp_state, dpll_pool, pll_enable, SklDpllId};
         let is_edp = self.ddi == Ddi::A;
@@ -1565,6 +1587,58 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             .ok_or(ModesetError::PllLockTimeout)?;
         let state = dp_state(port_clock).ok_or(ModesetError::PllLockTimeout)?;
         pll_enable(self.mmio, id, &state).map_err(|_| ModesetError::PllLockTimeout)
+    }
+
+    /// Bring the Gen9 SKL DPLL up for an HDMI mode:
+    /// `skl_ddi_hdmi_pll_dividers` — the WRPLL row for the
+    /// pixel clock under the fixed 24 MHz reference
+    /// (`REFCLK_KHZ`; Lane 4's CDCLK hardcodes ref 24000, not
+    /// the DSSM strap) — then `skl_ddi_pll_enable` (CTRL1,
+    /// CFGCR1/2, CTL enable, 5 ms `DPLL_STATUS` lock wait).
+    /// The DPLL id is the same first-of-pool pick
+    /// `program_dpll_gen9` and `program_dpclka_routing`
+    /// make, so the WRPLL program and the clock routing agree.
+    fn program_dpll_gen9_hdmi(&mut self, pixel_clock_khz: u32) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen9_cdclk::REFCLK_KHZ;
+        use crate::intel_gpu_gen9_dpll::{dpll_pool, hdmi_state, pll_enable, SklDpllId};
+        let is_edp = self.ddi == Ddi::A;
+        let id = dpll_pool(is_edp)
+            .first()
+            .copied()
+            .unwrap_or(SklDpllId::Dpll0);
+        let (state, _actual) =
+            hdmi_state(pixel_clock_khz, REFCLK_KHZ).ok_or(ModesetError::HdmiClockUnsupported)?;
+        pll_enable(self.mmio, id, &state).map_err(|_| ModesetError::PllLockTimeout)
+    }
+
+    /// Program the Gen9 HDMI signal levels: the SKL HDMI
+    /// table's default entry at index 9
+    /// (`hsw_prepare_hdmi_ddi_buffers`), the I_boost for that
+    /// entry (`skl_ddi_set_iboost` — Linux
+    /// `hsw_set_signal_levels` runs the I_boost step for HDMI,
+    /// then returns: "HDMI ignores the rest"), and the Wa
+    /// #1143 training-override pulse. VBT inputs are caller
+    /// inputs until the modeset plumbs `intel_gpu_vbt`
+    /// through, so the table's default level and boost rule.
+    fn program_hdmi_levels_gen9(&mut self) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen11_ddi::Output;
+        use crate::intel_gpu_gen9_ddi::{
+            hdmi_level, program_hdmi_buffer, select_table, set_iboost_for_level,
+            wa1143_training_override_pulse,
+        };
+        let (platform, sku, _) = self.gen9_dp_inputs()?;
+        let table = select_table(platform, sku, Output::Hdmi, false);
+        let level = hdmi_level(None);
+        if !program_hdmi_buffer(self.mmio, self.ddi, table, level, false) {
+            return Err(ModesetError::UnsupportedGeneration);
+        }
+        if !set_iboost_for_level(self.mmio, self.ddi, table, level, 0, false) {
+            return Err(ModesetError::UnsupportedGeneration);
+        }
+        if !wa1143_training_override_pulse(self.mmio, self.ddi) {
+            return Err(ModesetError::UnsupportedGeneration);
+        }
+        Ok(())
     }
 
     /// Bring the Gen11 PLL up for an HDMI mode: the combo PLL
@@ -5508,7 +5582,11 @@ pub mod tests {
             0x8001_003F,
         ];
         for (level, want) in want_wm.iter().enumerate() {
-            let got = sink.writes_to(wm_base + (level as u64) * 8);
+            // PLANE_WM levels are 4 bytes apart
+            // (`program_watermarks_gen9` writes `wm_base +
+            // level * 4`); the Gen11 full-run test pins the
+            // same stride.
+            let got = sink.writes_to(wm_base + (level as u64) * 4);
             if got.last() != Some(want) {
                 return TestResult::Fail("a PLANE_WM level is not the hand-computed value");
             }
@@ -5548,10 +5626,13 @@ pub mod tests {
         }
         // DDI_BUF_CTL ends enabled, 4 lanes, TRANS_SELECT 4
         // (swing 1, pre-emphasis 0 on lane 0). DDI A BUF_CTL
-        // is 0x64000.
+        // is 0x64000. The low byte keeps the IDLE bit (0x80)
+        // the fixture serves on readback while ENABLE is
+        // clear — `enable_ddi_buffer` RMWs it in, so the
+        // final value is 0x84000086, not 0x84000006.
         let buf_ctl = sink.writes_to(0x64000);
-        if buf_ctl.last() != Some(&0x8400_0006) {
-            return TestResult::Fail("DDI_BUF_CTL last write is not 0x84000006");
+        if buf_ctl.last() != Some(&0x8400_0086) {
+            return TestResult::Fail("DDI_BUF_CTL last write is not 0x84000086");
         }
         // Training ended with DP_TP_CTL NORMAL (0x80040300)
         // and the Gen12 transcoder DP_TP_CTL was never touched.
@@ -5604,51 +5685,363 @@ pub mod tests {
         smoke_gen9_modeset_full_run_scripted_sink
     );
 
-    /// Gen9: the Plan path refuses — the first-light modeset
-    /// is the legacy path only.
-    fn smoke_gen9_plan_path_refuses() -> TestResult {
-        let io = FakeMmio::new();
-        let mut m = Modeset::new(&io, Ddi::A);
-        m.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::Skylake);
-        m.set_gen9_sku_family(crate::intel_gpu_gen9_ddi::SkuFamily::Desktop);
+    /// Gen9: the external-DP plan path on DDI B (Lane 8) —
+    /// the Lane 5 backstop is gone. DDI B / Pipe A / HBR2
+    /// x4 / 1080p60, asserting the full register image
+    /// against the panel run (same mode, same sink): the
+    /// DPLL1 program, the DDI-IO-B power well, the SKL DP
+    /// table at the port-B BUF_TRANS block, and the training
+    /// sequence on DDI B's AUX channel.
+    fn smoke_gen9_external_dp_ddi_b_full_run() -> TestResult {
+        use crate::intel_gpu_gen11_dpll::DPLL_CTRL1;
+        use crate::intel_gpu_gen9_cdclk::CDCLK_CTL;
+        use crate::intel_gpu_gen9_ddi::{ddi_buf_trans_hi, ddi_buf_trans_lo, DISPIO_CR_TX_BMU_CR0};
+        use crate::intel_gpu_gen9_dpll::DPLL_CTRL2;
+        use crate::intel_gpu_gen9_wm::{DBUF_CTL_S1, DBUF_POWER_REQUEST};
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(true);
+        // DSSM strap: 19.2 MHz (field 1) — irrelevant to the
+        // Gen9 CDCLK (fixed 24 MHz reference), kept for parity
+        // with the panel run.
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::B, Pipe::A);
+        ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::Skylake);
+        ms.set_gen9_sku_family(crate::intel_gpu_gen9_ddi::SkuFamily::Desktop);
         let plan = LinkPlan {
             rate: crate::dp_link_training::LinkRate::Hbr2,
             lanes: 4,
         };
-        let out = m.modeset_with_plan(&fb_1080p(), &mode_1080p60(), plan);
-        if out != Err(ModesetError::UnsupportedGeneration) {
-            return TestResult::Fail("Gen9 plan path did not refuse UnsupportedGeneration");
+        let (mode, trained) = match ms.modeset_with_plan(&fb_1080p(), &mode_1080p60(), plan) {
+            Ok((m, t)) => (m, t),
+            Err(_) => return TestResult::Fail("Gen9 external DP on DDI B must succeed"),
+        };
+        if mode.pixel_clock_khz != 148_500
+            || trained.rate != crate::dp_link_training::LinkRate::Hbr2
+            || trained.lanes != 4
+        {
+            return TestResult::Fail("external DP must train at HBR2 x4 for 1080p60");
         }
-        if !io.writes.borrow().is_empty() {
-            return TestResult::Fail("Gen9 plan-path refusal wrote registers");
+        // CDCLK: the same 337.5 MHz rung as the panel run,
+        // programmed before the DP DPLL.
+        if mmio.writes_to(CDCLK_CTL)
+            != [
+                0x0800_02A1,
+                0x0808_02A1,
+                0x0008_0000,
+                0x0800_02A1,
+                0x0800_02A1,
+            ]
+        {
+            return TestResult::Fail("CDCLK_CTL writes are not the panel run's sequence");
         }
+        let writes = mmio.writes.borrow();
+        let cdclk_at = writes
+            .iter()
+            .position(|(o, v)| *o == CDCLK_CTL && *v == 0x0800_02A1)
+            .unwrap_or(usize::MAX);
+        let dpll_at = writes
+            .iter()
+            .position(|(o, v)| *o == DPLL_CTRL1 && *v == 0x45)
+            .unwrap_or(usize::MAX);
+        drop(writes);
+        if cdclk_at >= dpll_at {
+            return TestResult::Fail("CDCLK was not programmed before the DP DPLL");
+        }
+        // DPLL_CTRL1: the CDCLK VCO program (0x5) then the
+        // DPLL1 HBR2 link state (0x1 << 6 = 0x40, RMW'd over
+        // the VCO field: 0x45).
+        if mmio.writes_to(DPLL_CTRL1) != [0x5, 0x45] {
+            return TestResult::Fail("DPLL_CTRL1 writes are not [0x5, 0x45]");
+        }
+        // DPLL_CTRL2 routes DDI B to DPLL1 with override:
+        // sel 1 << 4 | override 1 << 3 = 0x18.
+        if mmio.writes_to(DPLL_CTRL2) != [0x18] {
+            return TestResult::Fail("DPLL_CTRL2 writes are not [0x18]");
+        }
+        // The DDI IO well for port B (idx 2) was requested —
+        // no PW_1/PW_2 writes for the always-on Pipe A.
+        if mmio.writes_to(PWR_WELL_CTL2) != [0x20] {
+            return TestResult::Fail("PWR_WELL_CTL2 writes are not [0x20] (DDI IO B only)");
+        }
+        // DBUF slice S1 power-requested.
+        if mmio
+            .writes_to(DBUF_CTL_S1)
+            .iter()
+            .all(|w| w & DBUF_POWER_REQUEST == 0)
+        {
+            return TestResult::Fail("DBUF_CTL_S1 was never power-requested");
+        }
+        // Watermarks: the same 8 levels as the panel run
+        // (same mode, pipe, latencies), TRANS 0, and the full
+        // 892-block DBUF in BUF_CFG.
+        let wm_base = Pipe::A.base() + PLANE_WM_BASE_OFFSET;
+        let want_wm: [u32; 8] = [
+            0x8000_0008,
+            0x8000_4011,
+            0x8000_4012,
+            0x8000_8017,
+            0x8000_801E,
+            0x8000_C026,
+            0x8000_C031,
+            0x8001_003F,
+        ];
+        for (level, want) in want_wm.iter().enumerate() {
+            let got = mmio.writes_to(wm_base + (level as u64) * 4);
+            if got.last() != Some(want) {
+                return TestResult::Fail("a PLANE_WM level is not the panel run's value");
+            }
+        }
+        if mmio.writes_to(wm_base + PLANE_WM_TRANS_OFFSET) != [0x0] {
+            return TestResult::Fail("PLANE_WM_TRANS is not 0");
+        }
+        if mmio.writes_to(Pipe::A.base() + PLANE_BUF_CFG_OFFSET) != [0x037B_0000] {
+            return TestResult::Fail("PLANE_BUF_CFG is not the full 892-block DBUF");
+        }
+        // The 9-entry SKL DP buffer table was programmed at
+        // DDI_BUF_TRANS_B (0x64E60); no 10th entry exists.
+        if mmio.writes_to(ddi_buf_trans_lo(Ddi::B, 0)) != [0x0000_2016]
+            || mmio.writes_to(ddi_buf_trans_hi(Ddi::B, 0)) != [0x0000_00A0]
+        {
+            return TestResult::Fail("DDI_BUF_TRANS entry 0 is not the SKL DP table entry 0");
+        }
+        if mmio.writes_to(ddi_buf_trans_lo(Ddi::B, 8)) != [0x8000_5012]
+            || mmio.writes_to(ddi_buf_trans_hi(Ddi::B, 8)) != [0x0000_00C0]
+        {
+            return TestResult::Fail("DDI_BUF_TRANS entry 8 is not the SKL DP table entry 8");
+        }
+        if !mmio.writes_to(ddi_buf_trans_lo(Ddi::B, 9)).is_empty() {
+            return TestResult::Fail("DDI_BUF_TRANS entry 9 was written — port B DP caps at 9");
+        }
+        // I_boost: the level-4 table entry's boost is 0, so
+        // the prepare + set-levels writes both disable port
+        // B's balance leg (1 << 24).
+        let iboost = mmio.writes_to(DISPIO_CR_TX_BMU_CR0);
+        if iboost.len() < 2 || iboost.iter().any(|w| *w != 0x0100_0000) {
+            return TestResult::Fail(
+                "DISPIO_CR_TX_BMU_CR0 must be all 0x01000000 (port B disable)",
+            );
+        }
+        // DDI_BUF_CTL for DDI B (0x64100): the disable-first
+        // write (readback 0x80), at least one level-4
+        // set-levels write (0x04000080), then the enable
+        // (0x84000086 — IDLE bit RMW'd in, as on the panel
+        // run); DDI A is never enabled.
+        let buf_ctl = mmio.writes_to(0x64100);
+        if buf_ctl.len() < 3
+            || buf_ctl.first() != Some(&0x80)
+            || buf_ctl.last() != Some(&0x8400_0086)
+        {
+            return TestResult::Fail("DDI_BUF_CTL B must be [0x80, 0x04000080.., 0x84000086]");
+        }
+        if buf_ctl[1..buf_ctl.len() - 1]
+            .iter()
+            .any(|w| *w != 0x0400_0080)
+        {
+            return TestResult::Fail("DDI_BUF_CTL B middle writes must be the level-4 value");
+        }
+        if !mmio.writes_to(0x64000).is_empty() {
+            return TestResult::Fail("Gen9 DDI B run must not touch DDI A");
+        }
+        // Training ended with DP_TP_CTL NORMAL (0x80040300)
+        // and the Gen12 transcoder DP_TP_CTL was never touched.
+        if mmio.writes_to(0x64140).last() != Some(&0x8004_0300) {
+            return TestResult::Fail("DP_TP_CTL last write is not 0x80040300");
+        }
+        if !mmio.writes_to(0x60540).is_empty() {
+            return TestResult::Fail(
+                "Gen12 transcoder DP_TP_CTL 0x60540 was written on a Gen9 run",
+            );
+        }
+        // TRANS_DDI_FUNC_CTL at the Transcoder A base
+        // (0x60400): DP-SST, 8 bpc, 4 lanes, DDI B selected
+        // (0x92000006); the EDP transcoder is untouched.
+        if mmio.writes_to(0x60400).last() != Some(&0x9200_0006) {
+            return TestResult::Fail(
+                "TRANS_DDI_FUNC_CTL must bind transcoder A to DDI B in DP-SST",
+            );
+        }
+        if !mmio.writes_to(0x6F400).is_empty() {
+            return TestResult::Fail(
+                "EDP transcoder FUNC_CTL 0x6F400 was written on an external run",
+            );
+        }
+        // No Tiger Lake DPLL/CFGCR registers on this run:
+        // TGL CFGCR0 is 0x164284, DPCLKA is 0x164280.
+        for off in [0x164284_u64, 0x164280_u64] {
+            if !mmio.writes_to(off).is_empty() {
+                return TestResult::Fail("a Tiger Lake register was written on a Gen9 run");
+            }
+        }
+        // Training ran clean on DDI B's AUX channel: the sink
+        // is powered, the pattern history is TPS1 → TPS3 →
+        // off, and every tune is swing 1.
+        let sink = mmio.sink.borrow();
+        if sink.power != 1 || sink.pattern != 0 {
+            return TestResult::Fail("sink is not powered in pattern 0 after training");
+        }
+        if sink.pattern_history != alloc::vec![1u8, 3, 0] {
+            return TestResult::Fail("sink pattern history is not [1, 3, 0]");
+        }
+        if sink.tunes.iter().any(|t| t & 0x3 != 1) {
+            return TestResult::Fail("sink tunes are not all swing 1");
+        }
+        drop(sink);
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(false);
         TestResult::Pass
     }
 
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
-        smoke_gen9_plan_path_refuses
+        smoke_gen9_external_dp_ddi_b_full_run
     );
 
-    /// Gen9: the HDMI path refuses — external outputs are
-    /// Lane 8's scope and the Gen12 DPLL machinery must never
-    /// run on SKL.
-    fn smoke_gen9_hdmi_refuses() -> TestResult {
-        let io = FakeMmio::new();
-        let mut m = Modeset::new(&io, Ddi::A);
-        m.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::Skylake);
-        m.set_gen9_sku_family(crate::intel_gpu_gen9_ddi::SkuFamily::Desktop);
-        let out = m.modeset_hdmi(&fb_1080p(), &mode_1080p60(), false, false);
-        if out != Err(ModesetError::UnsupportedGeneration) {
-            return TestResult::Fail("Gen9 HDMI path did not refuse UnsupportedGeneration");
+    /// Gen9: the HDMI path on DDI B (Lane 8) — the SKL WRPLL
+    /// row, the SKL HDMI table entry, and the Wa #1143 pulse.
+    /// The DMC gate is exercised first (refusal, no writes),
+    /// then the full run.
+    fn smoke_gen9_hdmi_ddi_b_full_run() -> TestResult {
+        use crate::intel_gpu_gen11_dpll::DPLL_CTRL1;
+        use crate::intel_gpu_gen9_cdclk::CDCLK_CTL;
+        use crate::intel_gpu_gen9_ddi::{
+            chicken_trans_for_port, ddi_buf_trans_hi, ddi_buf_trans_lo, DISPIO_CR_TX_BMU_CR0,
+        };
+        use crate::intel_gpu_gen9_dpll::DPLL_CTRL2;
+        // DSSM strap: 24 MHz (field 0).
+        let mmio = ScriptedSinkMmio::new(0);
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::B, Pipe::A);
+        ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::Skylake);
+        ms.set_gen9_sku_family(crate::intel_gpu_gen9_ddi::SkuFamily::Desktop);
+        // DMC gate: the HDMI entry refuses without DMC and
+        // writes nothing.
+        let refused = ms.modeset_hdmi(&fb_1080p(), &mode_1080p60(), false, false);
+        if refused != Err(ModesetError::DmcUnavailable) {
+            return TestResult::Fail("Gen9 HDMI must refuse without DMC");
         }
-        if !io.writes.borrow().is_empty() {
-            return TestResult::Fail("Gen9 hdmi refusal wrote registers");
+        if !mmio.writes.borrow().is_empty() {
+            return TestResult::Fail("Gen9 HDMI refusal wrote registers");
         }
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(true);
+        let mode = match ms.modeset_hdmi(&fb_1080p(), &mode_1080p60(), false, false) {
+            Ok(m) => m,
+            Err(_) => return TestResult::Fail("Gen9 HDMI on DDI B must succeed"),
+        };
+        if mode.pixel_clock_khz != 148_500 {
+            return TestResult::Fail("HDMI must commit the 1080p60 mode");
+        }
+        // WRPLL row for 148.5 MHz at the fixed 24 MHz ref
+        // (divider 12, DCO 371 + 0x2000, Q/3 K/2 P/2):
+        // CFGCR1 0x80400173, CFGCR2 0x3A5 at the DPLL1 pair
+        // (0x6C040/0x6C044). DPLL0 has no CFGCRs.
+        if mmio.writes_to(0x6C040) != [0x8040_0173] {
+            return TestResult::Fail("Gen9 HDMI CFGCR1 must be the WRPLL row at 0x6C040");
+        }
+        if mmio.writes_to(0x6C044) != [0x3A5] {
+            return TestResult::Fail("Gen9 HDMI CFGCR2 must be Q/3 K/2 P/2 at 0x6C044");
+        }
+        // DPLL_CTRL1: the HDMI DPLL1 program (OVERRIDE |
+        // HDMI_MODE << 6 = 0x840), then the CDCLK VCO program
+        // RMW'd over the DPLL0 field (0x845).
+        if mmio.writes_to(DPLL_CTRL1) != [0x840, 0x845] {
+            return TestResult::Fail("DPLL_CTRL1 writes are not [0x840, 0x845]");
+        }
+        // DPLL1 CTL enabled (LCPLL2_CTL 0x46014).
+        if mmio.writes_to(0x46014) != [0x8000_0000] {
+            return TestResult::Fail("DPLL1 CTL must enable at 0x46014");
+        }
+        // DPLL_CTRL2 routes DDI B to DPLL1 with override.
+        if mmio.writes_to(DPLL_CTRL2) != [0x18] {
+            return TestResult::Fail("DPLL_CTRL2 writes are not [0x18]");
+        }
+        // The DDI IO well for port B (idx 2).
+        if mmio.writes_to(PWR_WELL_CTL2) != [0x20] {
+            return TestResult::Fail("PWR_WELL_CTL2 writes are not [0x20] (DDI IO B only)");
+        }
+        // CDCLK: the same 337.5 MHz rung as the panel run.
+        if mmio.writes_to(CDCLK_CTL)
+            != [
+                0x0800_02A1,
+                0x0808_02A1,
+                0x0008_0000,
+                0x0800_02A1,
+                0x0800_02A1,
+            ]
+        {
+            return TestResult::Fail("CDCLK_CTL writes are not the panel run's sequence");
+        }
+        // TRANS_DDI_FUNC_CTL (transcoder A + 0x400): HDMI
+        // mode, 8 bpc, 4 lanes, DDI B selected — no scrambling
+        // at 148.5 MHz.
+        if mmio.writes_to(0x60400).last() != Some(&0x9000_0006) {
+            return TestResult::Fail("Gen9 HDMI must bind transcoder A to DDI B in HDMI mode");
+        }
+        // Watermarks: the same 8 levels as the panel run
+        // (same mode, pipe, latencies), TRANS 0, and the full
+        // 892-block DBUF in BUF_CFG.
+        let wm_base = Pipe::A.base() + PLANE_WM_BASE_OFFSET;
+        let want_wm: [u32; 8] = [
+            0x8000_0008,
+            0x8000_4011,
+            0x8000_4012,
+            0x8000_8017,
+            0x8000_801E,
+            0x8000_C026,
+            0x8000_C031,
+            0x8001_003F,
+        ];
+        for (level, want) in want_wm.iter().enumerate() {
+            let got = mmio.writes_to(wm_base + (level as u64) * 4);
+            if got.last() != Some(want) {
+                return TestResult::Fail("a PLANE_WM level is not the panel run's value");
+            }
+        }
+        if mmio.writes_to(wm_base + PLANE_WM_TRANS_OFFSET) != [0x0] {
+            return TestResult::Fail("PLANE_WM_TRANS is not 0");
+        }
+        if mmio.writes_to(Pipe::A.base() + PLANE_BUF_CFG_OFFSET) != [0x037B_0000] {
+            return TestResult::Fail("PLANE_BUF_CFG is not the full 892-block DBUF");
+        }
+        // HDMI signal levels: the SKL HDMI default entry
+        // (index 8) at BUF_TRANS index 9, I_boost 1 on port
+        // B, and the Wa #1143 pulse on CHICKEN_TRANS_A.
+        if mmio.writes_to(ddi_buf_trans_lo(Ddi::B, 9)) != [0x8000_3015]
+            || mmio.writes_to(ddi_buf_trans_hi(Ddi::B, 9)) != [0x0000_00CD]
+        {
+            return TestResult::Fail("DDI_BUF_TRANS index 9 is not the SKL HDMI default entry");
+        }
+        if mmio.writes_to(DISPIO_CR_TX_BMU_CR0) != [0x800] {
+            return TestResult::Fail("DISPIO_CR_TX_BMU_CR0 must be 0x800 (port B I_boost 1)");
+        }
+        if mmio.writes_to(chicken_trans_for_port(Ddi::B).unwrap()) != [0xC0000, 0x0] {
+            return TestResult::Fail("Wa #1143 pulse must set then clear bits 19|18");
+        }
+        // DDI_BUF_CTL for DDI B: disable-first (0x80) then
+        // enable (0x80000086); no training writes on HDMI.
+        if mmio.writes_to(0x64100) != [0x80, 0x8000_0086] {
+            return TestResult::Fail("Gen9 HDMI DDI B buffer must enable at 4 lanes");
+        }
+        // No DP training on a TMDS link: DP_TP_CTL B untouched.
+        if !mmio.writes_to(0x64140).is_empty() {
+            return TestResult::Fail("Gen9 HDMI must not touch DP_TP_CTL");
+        }
+        // No Tiger Lake registers, no DDI A, no EDP transcoder.
+        for off in [0x164284_u64, 0x164280_u64] {
+            if !mmio.writes_to(off).is_empty() {
+                return TestResult::Fail("a Tiger Lake register was written on a Gen9 run");
+            }
+        }
+        if !mmio.writes_to(0x64000).is_empty() {
+            return TestResult::Fail("Gen9 HDMI run must not touch DDI A");
+        }
+        if !mmio.writes_to(0x6F400).is_empty() {
+            return TestResult::Fail("EDP transcoder FUNC_CTL 0x6F400 was written on an HDMI run");
+        }
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(false);
         TestResult::Pass
     }
 
-    kernel_test_in!("drivers/gpu/intel_gpu_modeset", smoke_gen9_hdmi_refuses);
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen9_hdmi_ddi_b_full_run
+    );
 
     fn smoke_gen11_external_dp_ddi_b_full_run() -> TestResult {
         use crate::intel_gpu_gt::Gen11Platform;

@@ -554,6 +554,65 @@ pub fn set_iboost_for_level(
     true
 }
 
+// ── Wa #1143 (HDMI-only) ────────────────────────────────────────
+
+/// `CHICKEN_TRANS` register for a transcoder (`i915_reg.h`):
+/// A 0x420C0, B 0x420C4, C 0x420C8, EDP 0x420CC, D 0x420D8.
+/// Port→transcoder: A→EDP, B→A, C→B, D→C, E→A.
+pub const fn chicken_trans_for_port(port: Ddi) -> Option<u64> {
+    match port {
+        Ddi::A => Some(0x420CC),
+        Ddi::B | Ddi::E => Some(0x420C0),
+        Ddi::C => Some(0x420C4),
+        Ddi::D => Some(0x420C8),
+        _ => None,
+    }
+}
+
+/// `DDI_TRAINING_OVERRIDE_ENABLE` — bit 19 of the
+/// per-transcoder chicken register (bit 17 for port E, which
+/// shares `CHICKEN_TRANS_A` with port B).
+pub const DDI_TRAINING_OVERRIDE_ENABLE: u32 = 1 << 19;
+/// `DDI_TRAINING_OVERRIDE_VALUE` — bit 18 (bit 16 for port E).
+pub const DDI_TRAINING_OVERRIDE_VALUE: u32 = 1 << 18;
+
+/// Microsecond spin (TSC-calibrated when the clocks are
+/// calibrated, spin-loop fallback otherwise) — the same shape
+/// as `amdgpu::delay_us`.
+fn delay_us(us: u32) {
+    let hz = narf_time::calibrate_clocks();
+    if hz > 0 {
+        narf_time::busy_wait_cycles((hz / 1_000_000).max(1) * u64::from(us));
+    } else {
+        for _ in 0..(u64::from(us) * 1000) {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Wa #1143 (`display/intel_ddi.c:3455`, HDMI only): pulse
+/// `DDI_TRAINING_OVERRIDE_ENABLE | DDI_TRAINING_OVERRIDE_VALUE`
+/// in the port's transcoder chicken register — set, posting
+/// read, 1 µs delay, clear — before the DDI buffer enables.
+/// Returns `false` (writing nothing) for a port Gen9 does
+/// not have.
+pub fn wa1143_training_override_pulse(io: &(impl MmioWindow + ?Sized), port: Ddi) -> bool {
+    let Some(reg) = chicken_trans_for_port(port) else {
+        return false;
+    };
+    let (enable, value) = if matches!(port, Ddi::E) {
+        (1 << 17, 1 << 16)
+    } else {
+        (DDI_TRAINING_OVERRIDE_ENABLE, DDI_TRAINING_OVERRIDE_VALUE)
+    };
+    let cur = io.read32(reg);
+    io.write32(reg, cur | enable | value);
+    let _ = io.read32(reg);
+    delay_us(1);
+    io.write32(reg, cur & !(enable | value));
+    true
+}
+
 // ── Port map ─────────────────────────────────────────────────
 
 /// What a Gen9 DDI port is wired to (`skl_display`:
@@ -917,7 +976,7 @@ pub mod tests {
         if !set_iboost(&mmio, Ddi::B, 0) {
             return TestResult::Fail("I_boost 0 must program");
         }
-        let want = 0xFFFF_FFFF & !(0x7 << 11 | 1 << 24) | (1 << 24);
+        let want = !(0x7 << 11 | 1 << 24) | (1 << 24);
         if mmio.read(DISPIO_CR_TX_BMU_CR0) != want {
             return TestResult::Fail("I_boost 0 must set only the disable bit");
         }
@@ -961,4 +1020,44 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_gen9_ddi", smoke_skl_ddi_port_map);
+
+    fn smoke_skl_ddi_wa1143_pulse() -> TestResult {
+        // Port→transcoder chicken registers (`i915_reg.h`).
+        if chicken_trans_for_port(Ddi::A) != Some(0x420CC)
+            || chicken_trans_for_port(Ddi::B) != Some(0x420C0)
+            || chicken_trans_for_port(Ddi::C) != Some(0x420C4)
+            || chicken_trans_for_port(Ddi::D) != Some(0x420D8)
+            || chicken_trans_for_port(Ddi::E) != Some(0x420C0)
+            || chicken_trans_for_port(Ddi::F).is_some()
+        {
+            return TestResult::Fail("Wa #1143 chicken registers wrong");
+        }
+        // Port B pulse: set bits 19|18, then clear — the
+        // register ends as it started.
+        let mmio = DdiMmio::new();
+        if !wa1143_training_override_pulse(&mmio, Ddi::B) {
+            return TestResult::Fail("Wa #1143 pulse must program port B");
+        }
+        if mmio.writes_to(0x420C0) != alloc::vec![0xC0000, 0x0] {
+            return TestResult::Fail("Wa #1143 pulse must set then clear");
+        }
+        // Port E shares CHICKEN_TRANS_A with different bits.
+        let mmio = DdiMmio::new();
+        if !wa1143_training_override_pulse(&mmio, Ddi::E) {
+            return TestResult::Fail("Wa #1143 pulse must program port E");
+        }
+        if mmio.writes_to(0x420C0) != alloc::vec![0x30000, 0x0] {
+            return TestResult::Fail("Wa #1143 port-E pulse must use bits 17/16");
+        }
+        // A port Gen9 does not have programs nothing.
+        let mmio = DdiMmio::new();
+        if wa1143_training_override_pulse(&mmio, Ddi::F) {
+            return TestResult::Fail("Wa #1143 pulse must refuse DDI F");
+        }
+        if !mmio.regs.borrow().is_empty() {
+            return TestResult::Fail("refused Wa #1143 pulse must write nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gen9_ddi", smoke_skl_ddi_wa1143_pulse);
 }
