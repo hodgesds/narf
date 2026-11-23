@@ -5,8 +5,10 @@
 //! one-shot bring-up request at Stage::Subsys, leaving the hardware
 //! to autonomously pick a P-state inside the supplied window. This
 //! module applies policy and thermal bounds on the owning CPU. Intel HWP
-//! selects performance autonomously within that window under Balanced and
-//! Powersave. The software-selected backends also update desired performance.
+//! and AMD CPPC select performance autonomously within that window
+//! under Balanced and Powersave (desired 0, EPP hint); only the
+//! Performance policy and the legacy `_PSS` backend write an
+//! explicit desired performance.
 //!
 //! ## Backend priority
 //!
@@ -32,18 +34,43 @@
 //!
 //! ## Governor algorithm
 //!
-//! On the software-selected backends, the governor reads a per-CPU
-//! scheduler-demand proxy and computes
+//! On the software-selected backends, the governor reads a graded
+//! per-CPU utilisation signal and computes
 //!
 //! ```text
 //!   target_perf = min_perf + (util * (max_perf - min_perf)) / 1000
 //! ```
 //!
-//! NARF does not yet account PELT-style run time, so the proxy is
-//! deliberately conservative: an empty local ready queue maps to
-//! zero demand and any queued runnable task maps to full demand.
-//! This avoids the old timer-IRQ proxy, which could not distinguish
-//! an idle CPU woken by the periodic tick from a busy CPU.
+//! The signal is run-time accounting, Linux `schedutil` style:
+//! `cpu_times` deltas (user + nice + system + IRQ + softirq over
+//! busy + idle + iowait) since the last sample, re-anchored at
+//! every scheduler Idle↔Active edge so a fresh busy span is never
+//! diluted by the idle tail that preceded it. The old signal was a
+//! binary ready-queue-depth proxy (empty queue → 0, anything
+//! queued → 1000): a single-threaded benchmark running alone on a
+//! CPU sampled 0 — its queue was empty while it ran — so the
+//! governor held that CPU at `min_perf` for the whole run.
+//!
+//! The sample is event-driven, not polled: the scheduler calls the
+//! governor's edge hook on Idle↔Active transitions (Linux
+//! `cpufreq_update_util` on wakeup/sleep), rate-limited to 1 ms
+//! per CPU, and wakes the owning CPU's governor worker so the
+//! request is re-evaluated immediately. The 100 ms deferrable tick
+//! remains as the periodic backstop (thermal ceiling, policy
+//! changes).
+//!
+//! Under EPP/autonomous policies (Balanced, Powersave, Userspace)
+//! the CPPC backend writes `desired_perf = 0`, exactly like
+//! Linux amd-pstate in ACTIVE (EPP) mode ("set desired perf as
+//! zero to allow EPP firmware control"): the firmware picks inside
+//! the `[min, max]` window under the EPP hint. Only the
+//! `Performance` policy writes an explicit desired (the capped
+//! max), and only the legacy `_PSS` backend — which has no
+//! autonomous firmware selector — keeps the explicit graded
+//! schedutil target. The HWP path already wrote desired 0 for
+//! these policies. A CPPC request that recomputes to the same
+//! bytes as the last write skips the WRMSR, the amd-pstate request
+//! cache.
 //!
 //! Hysteresis is a simple one-shot guard: a recompute that lands
 //! within `HYSTERESIS_BAND` of the previously-written value is
@@ -86,7 +113,10 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use narf_arch::x86_64::cpuid::cpuid;
 use narf_arch::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp};
@@ -193,6 +223,10 @@ static ENABLED: AtomicU8 = AtomicU8::new(0);
 struct PerCpu {
     /// Last `desired_perf` byte we wrote, for hysteresis.
     last_desired: u8,
+    /// Last CPPC request bytes written (full `MSR_AMD_CPPC_REQ`
+    /// value), for the Linux amd-pstate write cache: a tick that
+    /// recomputes the same request skips the WRMSR.
+    last_cppc_request: Option<u64>,
     /// Last successfully applied Intel request, including its thermal ceiling.
     last_hwp_request: Option<u32>,
     hwp_epp_supported: bool,
@@ -211,6 +245,7 @@ const MAX_CPUS: usize = 64;
 static PERCPU: IrqSafeSpinLock<[PerCpu; MAX_CPUS]> = IrqSafeSpinLock::new(
     [PerCpu {
         last_desired: 0,
+        last_cppc_request: None,
         last_hwp_request: None,
         hwp_epp_supported: false,
         hw_min_perf: 0,
@@ -237,6 +272,39 @@ const HYSTERESIS_BAND: u8 = 4;
 /// slower than the 1 kHz LAPIC tick so the timer-IRQ count delta
 /// is large enough (~100 ticks at 1 kHz) to be a useful signal.
 pub const TICK_INTERVAL_MS: u32 = 100;
+
+/// Scheduler-event rate limit, in nanoseconds: a governor
+/// re-evaluation is triggered at most once per millisecond per
+/// CPU, the Linux schedutil `freq_update_delay_ns` scale. Faster
+/// edges only re-anchor the utilisation window (see
+/// [`note_cpu_state_change`]).
+const FREQ_UPDATE_DELAY_NS: u64 = 1_000_000;
+
+/// Per-CPU scheduler-event pending flag: set by
+/// [`note_cpu_state_change`] on an Idle↔Active edge, consumed by
+/// the governor worker's wait ([`TickWait`]).
+static EVENT_PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Monotonic ns of the last event-driven wake per CPU, for the
+/// [`FREQ_UPDATE_DELAY_NS`] rate limit.
+static EVENT_LAST_NS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// The governor worker's waker per CPU, parked in [`TickWait`]
+/// while the worker sleeps. Same shape as `orderly::WAKER`.
+static EVENT_WAKER: [IrqSafeSpinLock<Option<Waker>>; MAX_CPUS] =
+    [const { IrqSafeSpinLock::new(None) }; MAX_CPUS];
+
+/// Graded-utilisation baseline per CPU: busy / total nanoseconds
+/// from `cpu_times` at the last sample (or at the last scheduler
+/// Idle↔Active edge, which re-anchors the window). Lock-free
+/// atomics so the scheduler edge hook can anchor them from any
+/// context without taking a lock.
+static UTIL_BASELINE_BUSY: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static UTIL_BASELINE_TOTAL: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Graded utilisation from the last sample per CPU, permille.
+/// Returned unchanged when a sample's window is empty.
+static LAST_UTIL: [AtomicU16; MAX_CPUS] = [const { AtomicU16::new(0) }; MAX_CPUS];
 
 // ── Public API ─────────────────────────────────────────────────────
 
@@ -273,6 +341,11 @@ pub fn enable() -> Result<(), CpuFreqError> {
 /// is hard-pinned because HWP and CPPC request/status MSRs are per-CPU.
 /// Calling this more than once is harmless.
 pub fn start_workers() {
+    // Linux `cpufreq_update_util`: the scheduler tells the governor
+    // about Idle↔Active edges instead of the governor polling for
+    // them. Installed once, before the workers spawn, so no edge
+    // after `enable()` is missed.
+    narf_scheduler::set_cpu_state_hook(note_cpu_state_change);
     if WORKERS_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -324,13 +397,25 @@ async fn worker(cpu: usize) {
             (None, Ok(_)) => {}
         }
     }
+    // Anchor the graded-utilisation window before the first tick
+    // so the first sample measures a real window, not the whole
+    // uptime since boot.
+    anchor_util_baseline(cpu);
     loop {
         // A deferrable timer, as the ondemand/conservative governors' `dbs`
         // work (`INIT_DEFERRABLE_WORK`): an idle CPU has no load to sample
         // and is not woken for it; the sample runs when the CPU next wakes.
         let expires = narf_time::timer::jiffies()
             + narf_time::timer::msecs_to_jiffies(TICK_INTERVAL_MS as u64);
-        narf_time::sleep_until_jiffies(expires, narf_time::timer::TIMER_DEFERRABLE).await;
+        // Wait for the sooner of the periodic tick and a scheduler
+        // Idle↔Active edge (see [`note_cpu_state_change`]): a CPU
+        // that just went busy is re-evaluated now, not up to
+        // 100 ms later.
+        let wait = TickWait {
+            sleep: narf_time::sleep_until_jiffies(expires, narf_time::timer::TIMER_DEFERRABLE),
+            cpu,
+        };
+        core::pin::pin!(wait).await;
         let _ = tick_cpu(cpu);
     }
 }
@@ -500,10 +585,21 @@ fn tick_cpu(cpu: usize) -> Result<u32, CpuFreqError> {
     // cap binds `Performance` as well as the utilisation-shaped
     // policies.
     let max = thermal_capped_max(min, max);
+    // Linux amd-pstate ACTIVE (EPP) mode sets desired_perf = 0 and
+    // leaves frequency selection to the firmware under the EPP
+    // hint. The CPPC path used to write an explicit graded target
+    // instead — and with the old binary proxy that target was
+    // min_perf for a lone running thread (its ready queue was empty
+    // while it ran), pinning the CPU low for the whole run. The HWP
+    // path already writes desired 0 for these policies
+    // (`update_hwp_request`); CPPC now matches it. The legacy
+    // `_PSS` backend has no autonomous firmware selector, so it
+    // keeps the explicit graded schedutil target.
     let target = match policy {
         Policy::Performance => max,
-        Policy::Balanced | Policy::Powersave => target_perf(sample_utilization(cpu), min, max),
         Policy::Userspace => 0,
+        Policy::Balanced | Policy::Powersave if b == Backend::AmdCppc => 0,
+        Policy::Balanced | Policy::Powersave => target_perf(sample_utilization(cpu), min, max),
     };
     // Hysteresis suppression — except when the previously written
     // desired now sits *above* the (possibly newly tightened)
@@ -513,12 +609,12 @@ fn tick_cpu(cpu: usize) -> Result<u32, CpuFreqError> {
     if prev != 0 && prev <= max && target.abs_diff(prev) <= HYSTERESIS_BAND {
         return Ok(0);
     }
-    write_desired(b, cpu, target)?;
-    {
+    let changed = write_desired(b, cpu, target)?;
+    if changed != 0 {
         let mut pc = PERCPU.lock();
         pc[cpu].last_desired = target;
     }
-    Ok(1)
+    Ok(changed)
 }
 
 /// Cumulative governor-tick count. Mostly for tests + diagnostics.
@@ -591,7 +687,7 @@ pub fn set_epp_current(epp: u8) -> Result<(), CpuFreqError> {
         s.epp = epp;
         s.last_desired
     };
-    write_desired(backend(), cpu, desired)
+    write_desired(backend(), cpu, desired).map(|_| ())
 }
 
 // ── Backend detection ──────────────────────────────────────────────
@@ -788,6 +884,7 @@ fn seed_slot(slot: &mut PerCpu, lowest: u8, nominal: u8, highest: u8) {
     slot.min_perf = lowest;
     slot.max_perf = highest;
     slot.last_desired = 0;
+    slot.last_cppc_request = None;
     slot.last_hwp_request = None;
     slot.epp = cppc_epp::BALANCED_PERFORMANCE;
     slot.policy = Policy::Balanced;
@@ -802,25 +899,220 @@ fn validate_window(lowest: u8, nominal: u8, highest: u8) -> Result<(), CpuFreqEr
 
 // ── Utilisation sampling ───────────────────────────────────────────
 
-/// Per-CPU scheduler-load proxy on the unitless 0..=1000 scale.
-/// The worker itself has been popped from the ready queue while it
-/// executes, so zero means idle and any queued workload means the
-/// CPU has demand to serve.
-fn sample_utilization(cpu: usize) -> u16 {
-    let runnable = narf_scheduler::cpu_queue_depths()
-        .into_iter()
-        .find(|(id, _)| *id as usize == cpu)
-        .map(|(_, depth)| depth)
-        .unwrap_or(0);
-    util_permille_from_runnable(runnable)
+/// Busy nanoseconds in a [`narf_scheduler::CpuTimes`] snapshot:
+/// user + nice + system + IRQ + softirq. Idle and iowait are not
+/// busy; steal time is time the vCPU never received, so it belongs
+/// to neither side of the ratio.
+fn util_busy_ns(times: &narf_scheduler::CpuTimes) -> u64 {
+    times
+        .user
+        .saturating_add(times.nice)
+        .saturating_add(times.system)
+        .saturating_add(times.irq)
+        .saturating_add(times.softirq)
 }
 
-/// Pure helper mapping ready-queue depth into a bounded load signal.
+/// Denominator for the graded signal: busy + idle + iowait.
+fn util_total_ns(times: &narf_scheduler::CpuTimes) -> u64 {
+    util_busy_ns(times)
+        .saturating_add(times.idle)
+        .saturating_add(times.iowait)
+}
+
+/// Pure helper: graded utilisation permille from a busy/total
+/// window. `u128` keeps `busy * 1000` exact for any `u64` window.
+/// A zero-length window reports 0 (the caller keeps its last
+/// sample); busy above total saturates to 1000.
 #[inline]
-pub const fn util_permille_from_runnable(runnable: usize) -> u16 {
-    match runnable {
-        0 => 0,
-        _ => 1000,
+pub fn util_permille_from_cputime(busy_ns: u64, total_ns: u64) -> u16 {
+    if total_ns == 0 {
+        return 0;
+    }
+    let busy = busy_ns.min(total_ns) as u128;
+    ((busy * 1000) / total_ns as u128).min(1000) as u16
+}
+
+/// Snapshot the graded-utilisation baseline for `cpu` at the
+/// current `cpu_times`: the next sample measures only the span
+/// after this point. Called by the governor worker at start and by
+/// the scheduler edge hook at every Idle↔Active transition.
+fn anchor_util_baseline(cpu: usize) {
+    let Some(busy) = UTIL_BASELINE_BUSY.get(cpu) else {
+        return;
+    };
+    let Some(total) = UTIL_BASELINE_TOTAL.get(cpu) else {
+        return;
+    };
+    let times = narf_scheduler::cpu_times(cpu);
+    busy.store(util_busy_ns(&times), Ordering::Release);
+    total.store(util_total_ns(&times), Ordering::Release);
+}
+
+/// Per-CPU scheduler-load signal on the unitless 0..=1000 scale:
+/// the busy fraction of `cpu_times` since the last sample (or
+/// since the last scheduler Idle↔Active edge, which re-anchors
+/// the window). Linux `schedutil` reads the same shape from PELT;
+/// NARF reads it from the transition-stamped `cpu_times`, which
+/// includes the open span — so a thread running right now already
+/// counts as busy, unlike the old ready-queue-depth proxy, which
+/// reported 0 for it (its queue was empty while it ran).
+fn sample_utilization(cpu: usize) -> u16 {
+    let Some(busy_slot) = UTIL_BASELINE_BUSY.get(cpu) else {
+        return 0;
+    };
+    let Some(total_slot) = UTIL_BASELINE_TOTAL.get(cpu) else {
+        return 0;
+    };
+    let Some(last_slot) = LAST_UTIL.get(cpu) else {
+        return 0;
+    };
+    let times = narf_scheduler::cpu_times(cpu);
+    let busy = util_busy_ns(&times);
+    let total = util_total_ns(&times);
+    let prev_busy = busy_slot.load(Ordering::Acquire);
+    let prev_total = total_slot.load(Ordering::Acquire);
+    // Never anchored (no worker start, no scheduler edge yet):
+    // anchor now and fall back to the instantaneous queue demand
+    // for this one sample — a queued runnable task means the CPU
+    // has work. The since-boot average would dilute a fresh busy
+    // span with the idle tail that preceded it.
+    if prev_busy == 0 && prev_total == 0 {
+        busy_slot.store(busy, Ordering::Release);
+        total_slot.store(total, Ordering::Release);
+        let runnable =
+            narf_scheduler::cpu_demand(narf_scheduler::affinity::CpuId(cpu as u32)).runnable;
+        let util = if runnable > 0 { 1000 } else { 0 };
+        last_slot.store(util, Ordering::Release);
+        return util;
+    }
+    let busy_delta = busy.saturating_sub(prev_busy);
+    let total_delta = total.saturating_sub(prev_total);
+    busy_slot.store(busy, Ordering::Release);
+    total_slot.store(total, Ordering::Release);
+    // An empty window (two samples at the same instant) carries no
+    // new information; keep the last sample instead of reporting
+    // an idle blip.
+    if total_delta == 0 {
+        return last_slot.load(Ordering::Acquire);
+    }
+    let util = util_permille_from_cputime(busy_delta, total_delta);
+    last_slot.store(util, Ordering::Release);
+    util
+}
+
+// ── Scheduler-event hook ───────────────────────────────────────────
+
+/// Scheduler CPU-state edge hook (installed by [`start_workers`]
+/// via `narf_scheduler::set_cpu_state_hook`).
+///
+/// Runs in the scheduler's `notify_cpu_state` path, after the
+/// run-queue/lifecycle locks are released, on every CPU-state
+/// edge. Safe from any context, including IRQ: it touches only
+/// atomics and a deferred waker (the `orderly_poweroff` shape).
+/// It never writes an MSR, never takes a lock, never allocates.
+///
+/// What it does: on an Idle↔Active edge it re-anchors the
+/// utilisation window at the transition — so the next sample never
+/// dilutes a fresh busy span with the idle tail that preceded it —
+/// and, rate-limited to [`FREQ_UPDATE_DELAY_NS`], wakes the owning
+/// CPU's governor worker so the request is re-evaluated now
+/// instead of at the next 100 ms tick.
+pub fn note_cpu_state_change(
+    cpu: narf_scheduler::affinity::CpuId,
+    previous: narf_scheduler::CpuState,
+    current: narf_scheduler::CpuState,
+) {
+    use narf_scheduler::CpuState;
+    if !matches!(
+        (previous, current),
+        (CpuState::Idle, CpuState::Active) | (CpuState::Active, CpuState::Idle)
+    ) {
+        return;
+    }
+    if ENABLED.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let cpu = cpu.0 as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    anchor_util_baseline(cpu);
+    let now = narf_time::monotonic_ns();
+    let Some(last) = EVENT_LAST_NS.get(cpu) else {
+        return;
+    };
+    let prev = last.load(Ordering::Acquire);
+    if now.saturating_sub(prev) < FREQ_UPDATE_DELAY_NS {
+        return;
+    }
+    if last
+        .compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if let Some(flag) = EVENT_PENDING.get(cpu) {
+        flag.store(true, Ordering::Release);
+    }
+    wake_event_waker(cpu);
+}
+
+/// Wake the governor worker parked in [`TickWait`] on `cpu`, if
+/// it is parked. The wake itself never runs inside an IRQ (the
+/// `orderly_poweroff` shape): from IRQ context the waker is
+/// deferred to the per-CPU pending queue.
+fn wake_event_waker(cpu: usize) {
+    let Some(waker) = EVENT_WAKER.get(cpu).and_then(|slot| slot.lock().take()) else {
+        return;
+    };
+    if narf_lib::context::in_irq() {
+        // Never run the wake (and its Arc traffic) inside the IRQ.
+        narf_lib::deferred_wake::push_pending(core::iter::once(Some(waker)));
+    } else {
+        waker.wake();
+    }
+}
+
+/// Take (and clear) the pending scheduler event for `cpu`.
+fn take_sched_event(cpu: usize) -> bool {
+    EVENT_PENDING
+        .get(cpu)
+        .map(|flag| flag.swap(false, Ordering::AcqRel))
+        .unwrap_or(false)
+}
+
+/// Wait for the sooner of the governor's periodic tick and a
+/// scheduler Idle↔Active edge. Polls the deferrable sleep and the
+/// per-CPU event flag with the same task waker, so whichever fires
+/// first re-polls this future (a hand-rolled `select` — the tree
+/// has no `select!` combinator for these two futures).
+struct TickWait<S> {
+    sleep: S,
+    cpu: usize,
+}
+
+impl<S: Future<Output = ()>> Future for TickWait<S> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: `sleep` is never moved after this future is
+        // pinned by the worker (`core::pin::pin!`); projecting a
+        // `Pin<&mut S>` to it is the standard manual projection.
+        let this = unsafe { self.get_unchecked_mut() };
+        if take_sched_event(this.cpu) {
+            return Poll::Ready(());
+        }
+        // Park the worker's waker for the event hook, then re-check:
+        // an edge that landed between the first check and the store
+        // would otherwise sleep until the next tick.
+        if let Some(slot) = EVENT_WAKER.get(this.cpu) {
+            *slot.lock() = Some(cx.waker().clone());
+        }
+        if take_sched_event(this.cpu) {
+            return Poll::Ready(());
+        }
+        let sleep = unsafe { Pin::new_unchecked(&mut this.sleep) };
+        sleep.poll(cx)
     }
 }
 
@@ -844,16 +1136,18 @@ pub fn target_perf(util_permille: u16, min: u8, max: u8) -> u8 {
 
 /// Re-program `desired_perf` for the active backend. `min` and
 /// `max` come from the cached window so the request is consistent
-/// across ticks. Returns `Err(RequestGp)` if the MSR write
-/// `#GP`'d (BIOS lock on the request MSR).
-fn write_desired(b: Backend, cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
+/// across ticks. Returns 1 when the request was written and 0 when
+/// the backend's write cache suppressed an unchanged request.
+/// Returns `Err(RequestGp)` if the MSR write `#GP`'d (BIOS lock on
+/// the request MSR).
+fn write_desired(b: Backend, cpu: usize, desired: u8) -> Result<u32, CpuFreqError> {
     if cpu != narf_lib::percpu::current_cpu() {
         return Err(CpuFreqError::NoSuchCpu);
     }
     match b {
-        Backend::IntelHwp => sync_hwp_policy(cpu).map(|_| ()),
+        Backend::IntelHwp => sync_hwp_policy(cpu),
         Backend::AmdCppc => write_desired_cppc(cpu, desired),
-        Backend::AcpiPss => write_desired_pss(desired),
+        Backend::AcpiPss => write_desired_pss(desired).map(|()| 1),
         Backend::None => Err(CpuFreqError::NoBackend),
     }
 }
@@ -900,15 +1194,38 @@ fn update_hwp_request(
     Ok(1)
 }
 
-fn write_desired_cppc(cpu: usize, desired: u8) -> Result<(), CpuFreqError> {
-    let pc = PERCPU.lock();
-    let (min, max, epp) = (pc[cpu].min_perf, pc[cpu].max_perf, pc[cpu].epp);
-    drop(pc);
+/// Serialize the cached CPPC request and its MSR write on the
+/// owning CPU.
+fn write_desired_cppc(cpu: usize, desired: u8) -> Result<u32, CpuFreqError> {
+    update_cppc_request(cpu, desired, |req| {
+        wrmsr_or_gp(MSR_AMD_CPPC_REQ, req).map_err(|_| CpuFreqError::RequestGp)
+    })
+}
+
+/// Build the CPPC request for `cpu`'s cached window and write it
+/// unless it matches the last one written — the Linux amd-pstate
+/// request cache, so the steady-state tick (desired 0 under EPP)
+/// costs no WRMSR. Returns 1 when the write ran and 0 when the
+/// cache suppressed it. The `write` closure is injected so tests
+/// can observe the request bytes without a CPPC MSR; production
+/// passes the `wrmsr_or_gp` write.
+fn update_cppc_request(
+    cpu: usize,
+    desired: u8,
+    write: impl FnOnce(u64) -> Result<(), CpuFreqError>,
+) -> Result<u32, CpuFreqError> {
+    let mut pc = PERCPU.lock();
+    let slot = pc.get_mut(cpu).ok_or(CpuFreqError::NoSuchCpu)?;
     // As with HWP: the CPPC request's max bounds autonomous
     // selection, so the thermal ceiling applies to it as well.
-    let max = thermal_capped_max(min, max);
-    let req = CppcRequest::build(min, max, desired, epp);
-    wrmsr_or_gp(MSR_AMD_CPPC_REQ, req.0).map_err(|_| CpuFreqError::RequestGp)
+    let max = thermal_capped_max(slot.min_perf, slot.max_perf);
+    let req = CppcRequest::build(slot.min_perf, max, desired, slot.epp).0;
+    if slot.last_cppc_request == Some(req) {
+        return Ok(0);
+    }
+    write(req)?;
+    slot.last_cppc_request = Some(req);
+    Ok(1)
 }
 
 fn write_desired_pss(_desired: u8) -> Result<(), CpuFreqError> {
@@ -1007,6 +1324,21 @@ pub fn __reset_for_test() {
     WORKERS_STARTED.store(false, Ordering::Release);
     TICK_COUNT.store(0, Ordering::Release);
     THERMAL_LIMIT_PERMILLE.store(1000, Ordering::Release);
+    for flag in EVENT_PENDING.iter() {
+        flag.store(false, Ordering::Release);
+    }
+    for last in EVENT_LAST_NS.iter() {
+        last.store(0, Ordering::Release);
+    }
+    for baseline in UTIL_BASELINE_BUSY.iter() {
+        baseline.store(0, Ordering::Release);
+    }
+    for baseline in UTIL_BASELINE_TOTAL.iter() {
+        baseline.store(0, Ordering::Release);
+    }
+    for util in LAST_UTIL.iter() {
+        util.store(0, Ordering::Release);
+    }
     let mut pc = PERCPU.lock();
     for slot in pc.iter_mut() {
         *slot = PerCpu::default();
@@ -1277,22 +1609,160 @@ mod smoke_tests {
         if target_perf(500, 220, 200) != 220 {
             return TestResult::Fail("degenerate inverted");
         }
-        // Scheduler ready-depth mapping sanity.
-        if util_permille_from_runnable(0) != 0 {
-            return TestResult::Fail("runnable=0");
+        // Graded run-time accounting: endpoints exact, midpoint
+        // exact, zero window reports 0, busy above total saturates.
+        if util_permille_from_cputime(0, 1000) != 0 {
+            return TestResult::Fail("cputime idle");
         }
-        if util_permille_from_runnable(1) != 1000 {
-            return TestResult::Fail("runnable=1");
+        if util_permille_from_cputime(1000, 1000) != 1000 {
+            return TestResult::Fail("cputime busy");
         }
-        if util_permille_from_runnable(2) != 1000 {
-            return TestResult::Fail("runnable=2");
+        if util_permille_from_cputime(500, 1000) != 500 {
+            return TestResult::Fail("cputime half");
         }
-        if util_permille_from_runnable(9999) != 1000 {
-            return TestResult::Fail("runnable saturates");
+        if util_permille_from_cputime(1, 3) != 333 {
+            return TestResult::Fail("cputime third");
+        }
+        if util_permille_from_cputime(0, 0) != 0 {
+            return TestResult::Fail("cputime zero window");
+        }
+        if util_permille_from_cputime(2000, 1000) != 1000 {
+            return TestResult::Fail("cputime saturate");
         }
         TestResult::Pass
     }
     kernel_test_in!("power/cpufreq", smoke_cpufreq_target_perf_interp);
+
+    /// Linux amd-pstate ACTIVE (EPP) parity for the CPPC backend:
+    /// under Balanced the request carries desired 0 (firmware
+    /// decides inside [min, max] under the EPP hint), a recomputed
+    /// identical request skips the WRMSR, and the thermal ceiling
+    /// still binds max while desired stays 0. Performance writes
+    /// the explicit capped max.
+    fn smoke_cpufreq_cppc_autonomous_desired() -> TestResult {
+        __reset_for_test();
+        let cpu = narf_lib::percpu::current_cpu();
+        {
+            let mut pc = PERCPU.lock();
+            seed_slot(&mut pc[cpu], 20, 100, 200);
+            apply_policy_to_slot(&mut pc[cpu], Policy::Balanced);
+        }
+        set_thermal_limit_permille(1000);
+        let mut writes = alloc::vec::Vec::new();
+        let mut write = |req: u64| {
+            writes.push(req);
+            Ok(())
+        };
+        // Balanced: desired 0, full window, balanced EPP.
+        if update_cppc_request(cpu, 0, &mut write) != Ok(1) || writes.len() != 1 {
+            __reset_for_test();
+            return TestResult::Fail("balanced CPPC request must write once");
+        }
+        let req = CppcRequest(writes[0]);
+        if (
+            req.min_perf(),
+            req.max_perf(),
+            req.desired_perf(),
+            req.energy_performance_preference(),
+        ) != (20, 200, 0, cppc_epp::BALANCED_PERFORMANCE)
+        {
+            __reset_for_test();
+            return TestResult::Fail(
+                "balanced CPPC request must be (20, 200, desired 0, EPP 0x80)",
+            );
+        }
+        // Identical recompute: the request cache suppresses the write.
+        if update_cppc_request(cpu, 0, &mut write) != Ok(0) || writes.len() != 1 {
+            __reset_for_test();
+            return TestResult::Fail("identical CPPC request must skip the WRMSR");
+        }
+        // Thermal ceiling at 500 permille: max 110, desired still 0.
+        set_thermal_limit_permille(500);
+        if update_cppc_request(cpu, 0, &mut write) != Ok(1) || writes.len() != 2 {
+            __reset_for_test();
+            return TestResult::Fail("thermal cap change must re-program the CPPC request");
+        }
+        let capped = CppcRequest(writes[1]);
+        if (capped.min_perf(), capped.max_perf(), capped.desired_perf()) != (20, 110, 0) {
+            __reset_for_test();
+            return TestResult::Fail("capped CPPC request must be (20, 110, desired 0)");
+        }
+        // Performance: explicit desired at the (uncapped) max.
+        set_thermal_limit_permille(1000);
+        {
+            let mut pc = PERCPU.lock();
+            apply_policy_to_slot(&mut pc[cpu], Policy::Performance);
+        }
+        if update_cppc_request(cpu, 200, &mut write) != Ok(1) || writes.len() != 3 {
+            __reset_for_test();
+            return TestResult::Fail("performance CPPC request must write");
+        }
+        let perf = CppcRequest(writes[2]);
+        if (
+            perf.min_perf(),
+            perf.max_perf(),
+            perf.desired_perf(),
+            perf.energy_performance_preference(),
+        ) != (100, 200, 200, cppc_epp::PERFORMANCE)
+        {
+            __reset_for_test();
+            return TestResult::Fail(
+                "performance CPPC request must be (100, 200, desired 200, EPP 0x00)",
+            );
+        }
+        set_thermal_limit_permille(1000);
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("power/cpufreq", smoke_cpufreq_cppc_autonomous_desired);
+
+    /// Scheduler-edge hook: a disabled governor ignores edges; an
+    /// enabled governor raises one worker event per Idle↔Active
+    /// edge, anchors the utilisation baseline at the transition,
+    /// and rate-limits an immediate second edge.
+    fn smoke_cpufreq_sched_event_hook() -> TestResult {
+        use narf_scheduler::CpuState;
+        __reset_for_test();
+        let cpu = narf_lib::percpu::current_cpu();
+        let cpu_id = narf_scheduler::affinity::CpuId(cpu as u32);
+        let pending = || EVENT_PENDING[cpu].load(Ordering::Acquire);
+        // Disabled governor: edges are ignored.
+        note_cpu_state_change(cpu_id, CpuState::Idle, CpuState::Active);
+        if pending() {
+            __reset_for_test();
+            return TestResult::Fail("disabled governor must ignore scheduler edges");
+        }
+        // Enabled: an Idle→Active edge anchors the baseline and
+        // raises the event for the worker.
+        __force_backend_for_test(Backend::AmdCppc);
+        ENABLED.store(1, Ordering::Release);
+        note_cpu_state_change(cpu_id, CpuState::Idle, CpuState::Active);
+        if !pending() {
+            __reset_for_test();
+            return TestResult::Fail("Idle→Active edge must raise a governor event");
+        }
+        if UTIL_BASELINE_TOTAL[cpu].load(Ordering::Acquire) == 0 {
+            __reset_for_test();
+            return TestResult::Fail("edge must anchor the utilisation baseline");
+        }
+        // Rate limit: an immediate second edge re-anchors but does
+        // not raise a second wake within FREQ_UPDATE_DELAY_NS.
+        EVENT_PENDING[cpu].store(false, Ordering::Release);
+        note_cpu_state_change(cpu_id, CpuState::Active, CpuState::Idle);
+        if pending() {
+            __reset_for_test();
+            return TestResult::Fail("immediate second edge must be rate-limited");
+        }
+        // A non-edge (same state twice) raises nothing.
+        note_cpu_state_change(cpu_id, CpuState::Active, CpuState::Active);
+        if pending() {
+            __reset_for_test();
+            return TestResult::Fail("non-edge must not raise a governor event");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("power/cpufreq", smoke_cpufreq_sched_event_hook);
 
     fn smoke_cpufreq_policy_windows() -> TestResult {
         let mut slot = PerCpu::default();

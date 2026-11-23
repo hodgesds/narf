@@ -822,6 +822,17 @@ state; other transitions carry `idle: None`. The callback may update bounded,
 nonblocking policy telemetry, but does not grant authority over hot-plug,
 stealing, clockevents, architecture halt, or power state.
 
+A second, policy-independent edge hook exists for the built-in cpufreq
+governor: `set_cpu_state_hook(f: fn(CpuId, CpuState, CpuState))` registers one
+`fn` pointer, invoked from the same `notify_cpu_state` path after the policy
+callback, with the same lock-free delivery guarantee. It is the Linux
+`cpufreq_update_util` analogue — the governor learns about Idle↔Active
+transitions from the scheduler instead of polling. The hook must be
+nonblocking, must not allocate, and must not take any scheduler lock; it may
+run in interrupt context, so a hook that needs more than atomics must defer
+the work (e.g. via a stored waker). A hook that loops forever denies service
+on the calling CPU, the same trust the policy callback carries.
+
 A separate crate is an API and build boundary, not a protection boundary. The
 core remains safe against a returned stale/invalid choice, but a policy that
 loops forever can deny service on the calling CPU. Policy implementations are

@@ -5370,6 +5370,39 @@ kernel_test_in!(
     smoke_scheduler_pending_local_wake_precedes_idle
 );
 
+/// The CPU-state edge hook fires once per edge and never on a
+/// non-edge, so the cpufreq governor learns about Idle↔Active
+/// transitions without polling.
+fn smoke_scheduler_cpu_state_hook_fires_on_edge() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
+    fn hook(_cpu: crate::CpuId, _prev: crate::CpuState, _cur: crate::CpuState) {
+        HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn noop_hook(_cpu: crate::CpuId, _prev: crate::CpuState, _cur: crate::CpuState) {}
+    HOOK_CALLS.store(0, Ordering::Release);
+    crate::set_cpu_state_hook(hook);
+    crate::policy::__reset_cpu_states_for_test();
+    let cpu = crate::CpuId(narf_lib::percpu::current_cpu() as u32);
+    // Already Active: no edge, no call.
+    crate::policy::notify_cpu_state(cpu, crate::CpuState::Active, None);
+    // Active→Idle→Active: one call per edge.
+    crate::policy::notify_cpu_state(cpu, crate::CpuState::Idle, None);
+    crate::policy::notify_cpu_state(cpu, crate::CpuState::Idle, None);
+    crate::policy::notify_cpu_state(cpu, crate::CpuState::Active, None);
+    crate::set_cpu_state_hook(noop_hook);
+    crate::policy::__reset_cpu_states_for_test();
+    if HOOK_CALLS.load(Ordering::Acquire) != 2 {
+        return TestResult::Fail("hook must fire exactly once per edge");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_cpu_state_hook_fires_on_edge
+);
+
 // Donation is also an activation source: a sleeping donee leaves PARKED and
 // becomes policy-visible exactly once at the requested queue position.
 fn smoke_scheduler_donation_activates_parked_task() -> TestResult {
