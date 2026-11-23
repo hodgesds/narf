@@ -3495,6 +3495,10 @@ fn gen_cmdline() -> String {
 //
 // Linux ref: `calc_load` (`kernel/sched/loadavg.c`) — the core
 // one-tick decay step is `load = load*EXP + n*(FIXED_1 - EXP)`.
+// The sample `n` is the runnable count scaled by FIXED_1, as Linux
+// does in `calc_global_load` (`active = active * FIXED_1`); without
+// the scale the averages converge to the raw count and render 0.00
+// (issue #2384).
 // [[proc-loadavg-ewma]]
 
 /// Fixed-point scale: 1 << 11, matching Linux `FIXED_1`.
@@ -3513,10 +3517,32 @@ static LOADAVG_AVG5: IrqSafeSpinLock<u64> = IrqSafeSpinLock::new(0);
 static LOADAVG_AVG15: IrqSafeSpinLock<u64> = IrqSafeSpinLock::new(0);
 
 /// Apply one 5-second EWMA tick: `load = load*exp + n*(FIXED_1 - exp)`.
-/// Linux ref: `calc_load` (kernel/sched/loadavg.c).
+/// Linux ref: `calc_load` (kernel/sched/loadavg.c). `n` is in FIXED_1
+/// units, exactly as Linux passes it — see `apply_loadavg_ticks`.
 #[inline]
 fn calc_load_tick(load: u64, exp: u64, n: u64) -> u64 {
     (load.saturating_mul(exp) + n.saturating_mul(FIXED_1 - exp)) / FIXED_1
+}
+
+/// Apply `ticks` 5-second EWMA ticks at raw runnable count `n`.
+///
+/// Linux scales the sample before the decay step (`calc_global_load`:
+/// `active = active * FIXED_1`); `calc_load`'s `active` parameter is in
+/// FIXED_1 units, so the averages converge to `n * FIXED_1`. Passing the
+/// raw count made them converge to `n` instead, which renders as
+/// `n / 2048` — 0.00 for any realistic load (issue #2384: stress-ng at
+/// 10 CPUs for 30 s still read 0.00 from the file itself).
+fn apply_loadavg_ticks(avg1: u64, avg5: u64, avg15: u64, n: u64, ticks: u64) -> (u64, u64, u64) {
+    let n_fixed = n.saturating_mul(FIXED_1);
+    let mut a1 = avg1;
+    let mut a5 = avg5;
+    let mut a15 = avg15;
+    for _ in 0..ticks {
+        a1 = calc_load_tick(a1, EXP_1, n_fixed);
+        a5 = calc_load_tick(a5, EXP_5, n_fixed);
+        a15 = calc_load_tick(a15, EXP_15, n_fixed);
+    }
+    (a1, a5, a15)
 }
 
 /// Sysinfo-shaped loadavg snapshot: (avg1, avg5, avg15) in the Linux
@@ -3554,11 +3580,10 @@ fn loadavg_update() -> (u64, u64, u64) {
     // Cap at 1000 to avoid spending O(uptime_in_ticks) on first read.
     let ticks = (elapsed_ns / 5_000_000_000).min(1000);
 
-    for _ in 0..ticks {
-        *avg1 = calc_load_tick(*avg1, EXP_1, runnable);
-        *avg5 = calc_load_tick(*avg5, EXP_5, runnable);
-        *avg15 = calc_load_tick(*avg15, EXP_15, runnable);
-    }
+    let (a1, a5, a15) = apply_loadavg_ticks(*avg1, *avg5, *avg15, runnable, ticks);
+    *avg1 = a1;
+    *avg5 = a5;
+    *avg15 = a15;
     // If no full tick has elapsed yet but this is the first call,
     // seed the averages with the instantaneous count so the first
     // read isn't misleadingly zero.
@@ -4819,6 +4844,92 @@ fn smoke_loadavg_format_three_values() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/procfs", smoke_loadavg_format_three_values);
+
+/// The EWMA converges to the *scaled* runnable count (issue #2384):
+/// from zero, 6 ticks at n=10 must land avg1 well above 1.00. Before
+/// the fix the tick took the raw count, so avg1 converged to 10 and
+/// rendered as 10/2048 = 0.00 under any realistic load.
+fn smoke_loadavg_ewma_converges_to_scaled_count() -> TestResult {
+    let (a1, a5, a15) = apply_loadavg_ticks(0, 0, 0, 10, 6);
+    // Fixed: a1 ≈ 10*2048*(1 - 0.92^6) ≈ 8065. Buggy: a1 stays 0
+    // (integer truncation: one tick from zero is 10*164/2048 = 0).
+    if a1 <= FIXED_1 {
+        return TestResult::Fail("loadavg: avg1 did not converge past 1.00 after 6 ticks at n=10");
+    }
+    if a1 >= 10 * FIXED_1 {
+        return TestResult::Fail("loadavg: avg1 overshot the 10.00 fixed point");
+    }
+    // The slower averages move less in 6 ticks but must still be
+    // clearly nonzero and below the fixed point.
+    if a5 <= FIXED_1 / 2 || a5 >= 10 * FIXED_1 {
+        return TestResult::Fail("loadavg: avg5 out of band after 6 ticks at n=10");
+    }
+    if a15 == 0 || a15 >= 10 * FIXED_1 {
+        return TestResult::Fail("loadavg: avg15 out of band after 6 ticks at n=10");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_loadavg_ewma_converges_to_scaled_count
+);
+
+/// The live path: real load applied, the average moves (issue #2384).
+/// Eight yield-loop tasks raise the unparked count by 8 for ~11 s
+/// (two 5 s ticks); avg1 must close at least 5% of the gap to the
+/// scaled target (expected ~15% after two ticks). Before the fix the
+/// target was the raw count, so the average barely moved (or fell,
+/// from a seeded start) and the file read 0.00 under real load.
+fn smoke_loadavg_average_moves_with_real_load() -> TestResult {
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use core::time::Duration;
+    static STOP: AtomicBool = AtomicBool::new(false);
+    static A0: AtomicU64 = AtomicU64::new(0);
+    static A1: AtomicU64 = AtomicU64::new(0);
+    static R: AtomicUsize = AtomicUsize::new(0);
+    STOP.store(false, Ordering::Relaxed);
+    // Burn-in read: consumes the first-read seed (if any) at the
+    // pre-load count, so the gap below is exactly the spinner delta.
+    let _ = loadavg_update();
+    // Eight tasks that stay READY (yield loop, never parked) for the
+    // window: they count in unparked_task_count() the whole time.
+    for _ in 0..8 {
+        let _ = narf_scheduler::spawn(async {
+            while !STOP.load(Ordering::Relaxed) {
+                narf_scheduler::yield_now().await;
+            }
+        });
+    }
+    let _ = narf_scheduler::spawn(async {
+        let (a0, _, _) = loadavg_update();
+        A0.store(a0, Ordering::Relaxed);
+        R.store(narf_scheduler::unparked_task_count(), Ordering::Relaxed);
+        narf_time::sleep(Duration::from_secs(11)).await;
+        let (a1, _, _) = loadavg_update();
+        A1.store(a1, Ordering::Relaxed);
+        STOP.store(true, Ordering::Relaxed);
+    });
+    narf_scheduler::run_until_empty();
+    let a0 = A0.load(Ordering::Relaxed);
+    let a1 = A1.load(Ordering::Relaxed);
+    let r = R.load(Ordering::Relaxed) as u64;
+    let target = r.saturating_mul(FIXED_1);
+    let gap = target.saturating_sub(a0);
+    // Two ticks close ~15% of the gap; require at least 5% (covers a
+    // one-tick shortfall from timer slop). A zero gap (no spinners
+    // visible) fails loudly instead of passing vacuously.
+    if gap == 0 {
+        return TestResult::Fail("loadavg: no gap to close — spinners not counted");
+    }
+    if a1.saturating_sub(a0).saturating_mul(20) < gap {
+        return TestResult::Fail("loadavg: avg1 did not move toward the scaled load");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_loadavg_average_moves_with_real_load
+);
 
 /// /proc/stat (mod.rs gen_stat path) has a "btime <positive-int>" line.
 fn smoke_stat_btime_positive() -> TestResult {
