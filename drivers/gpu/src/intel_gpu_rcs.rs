@@ -3965,12 +3965,16 @@ pub mod tests {
         if t[0x51] != 0x1108_1057 || t[0x52] != 0x1C_8028 || t[0xA8] != 0x1C_8068 {
             return TestResult::Fail("Gen11 XCS 44-register group");
         }
-        // No render group: header 2 and the R_PWR_CLK_STATE
-        // pair stay zero, terminator intact.
-        if t[CTX_LRI_HEADER_2] != 0
-            || t[CTX_R_PWR_CLK_STATE] != 0
-            || t[CTX_R_PWR_CLK_STATE + 1] != 0
-        {
+        // No render group: the R_PWR_CLK_STATE register address
+        // (0x20C8, `GEN8_R_PWR_CLK_STATE`) appears nowhere in the
+        // template. The render pair lives only in the RCS tables
+        // (`gen11_rcs_offsets`: non-posted LRI-1 at 0x41, 0x20C8
+        // at 0x42); on XCS those same slots are the 0x200 pair
+        // (`gen9_xcs_offsets`: posted LRI-1 at 0x41, base+0x200
+        // at 0x42), already pinned by the 0x200-pair check above
+        // — so a zero check on `CTX_LRI_HEADER_2` /
+        // `CTX_R_PWR_CLK_STATE` here would contradict it.
+        if t.iter().any(|&v| v == R_PWR_CLK_STATE as u32) {
             return TestResult::Fail("Gen11 XCS template carries render group");
         }
         if t[GEN11_CTX_XCS_END] != MI_BATCH_BUFFER_END | 1 {
