@@ -10,7 +10,10 @@
 //! `timeout_ms * 1_000_000` to obtain a cycle deadline.  The
 //! 0xFFFF "wait forever" sentinel is capped at 5 000 000 spin
 //! iterations rather than a real deadline so we cannot wedge forever
-//! in a single-CPU boot context.
+//! in a single-CPU boot context.  `Sleep`/`Stall` are bounded the
+//! same way (SEC-F6, #1301): `Sleep` clamps to `MAX_SLEEP_MS`,
+//! `Stall` rejects operands over `MAX_STALL_US` — both mirror
+//! ACPICA's `acpi_ex_system_do_sleep` / `acpi_ex_system_do_stall`.
 
 extern crate alloc;
 
@@ -336,20 +339,66 @@ pub fn dispatch_notify(target_path: &str, value: u64) {
 
 // ── Timing primitives ─────────────────────────────────────────────────────────
 
+/// Maximum `Stall` operand in microseconds (SEC-F6, #1301). ACPI 6.2
+/// Errata A §19.6.128: "delays longer than 100 microseconds must use
+/// Sleep instead of Stall". ACPICA (`acpi_ex_system_do_stall`) allows
+/// up to 255 µs for compatibility with existing BIOSes and rejects
+/// anything larger with `AE_AML_OPERAND_VALUE`; we mirror that bound
+/// and the rejection.
+pub const MAX_STALL_US: u64 = 255;
+
+/// Maximum `Sleep` duration in milliseconds (SEC-F6, #1301).
+/// ACPICA `ACPI_MAX_SLEEP` (`acconfig.h`: "Maximum sleep allowed via
+/// Sleep() operator", 2000 ms == two seconds);
+/// `acpi_ex_system_do_sleep` clamps over-long sleeps to it "to
+/// prevent accidental deep sleeps". We mirror the clamp.
+pub const MAX_SLEEP_MS: u64 = 2000;
+
+/// Clamp a `Sleep` operand to [`MAX_SLEEP_MS`]. Pure, so tests can
+/// pin the bound without waiting out a real sleep.
+pub(crate) fn clamped_sleep_ms(milliseconds: u64) -> u64 {
+    milliseconds.min(MAX_SLEEP_MS)
+}
+
 /// Busy-wait for at least `microseconds` microseconds.
 /// Treats 1 cycle ≈ 1 ns, so 1 µs ≈ 1 000 cycles.
-pub fn stall(microseconds: u32) {
-    let cycles = (microseconds as u64).saturating_mul(1_000);
+///
+/// Rejects operands over [`MAX_STALL_US`] with
+/// [`AmlError::OperandValue`] instead of spinning (SEC-F6, #1301):
+/// a `Stall(0xFFFFFFFF)` used to busy-wait ~71 minutes. Mirrors
+/// ACPICA `acpi_ex_system_do_stall`, which errors with
+/// `AE_AML_OPERAND_VALUE` above 255 µs. The operand is `u64` (the
+/// full TermArg) so values over `u32::MAX` are rejected, not
+/// truncated to a small stall.
+pub fn stall(microseconds: u64) -> Result<(), AmlError> {
+    if microseconds > MAX_STALL_US {
+        return Err(AmlError::OperandValue);
+    }
+    let cycles = microseconds.saturating_mul(1_000);
     let deadline = narf_time::now_cycles().saturating_add(cycles);
     while narf_time::now_cycles() < deadline {
         core::hint::spin_loop();
     }
+    Ok(())
 }
 
 /// Busy-wait for at least `milliseconds` milliseconds.
 /// Treats 1 cycle ≈ 1 ns, so 1 ms ≈ 1 000 000 cycles.
-pub fn sleep(milliseconds: u32) {
-    let cycles = (milliseconds as u64).saturating_mul(1_000_000);
+///
+/// Clamps the operand to [`MAX_SLEEP_MS`] (SEC-F6, #1301): a
+/// `Sleep(0xFFFFFFFF)` used to busy-wait ~49.7 days. Mirrors ACPICA
+/// `acpi_ex_system_do_sleep`, which clamps to `ACPI_MAX_SLEEP`.
+///
+/// NOTE: this is still a busy-wait, not a scheduler sleep — Linux
+/// implements `Sleep` via `msleep`, and ACPICA releases the
+/// interpreter around `acpi_os_sleep`. Converting NARF's `Sleep` to
+/// a timer sleep needs an async evaluator (or a `block_on` audit of
+/// every evaluation call site, which today includes sync driver
+/// paths that cannot block on the executor); that is follow-up work,
+/// not part of this cap.
+pub fn sleep(milliseconds: u64) {
+    let ms = clamped_sleep_ms(milliseconds);
+    let cycles = ms.saturating_mul(1_000_000);
     let deadline = narf_time::now_cycles().saturating_add(cycles);
     while narf_time::now_cycles() < deadline {
         core::hint::spin_loop();
@@ -365,3 +414,64 @@ pub fn __reset_for_test() {
     EVENTS.lock().clear();
     HANDLERS.lock().clear();
 }
+
+// ── Tests (SEC-F6, #1301) ───────────────────────────────────────────────────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// `Stall` operands over the ACPICA bound are rejected, never spun:
+/// `Stall(256)` and anything larger must fail without waiting.
+fn sync_stall_rejects_over_cap() -> TestResult {
+    if stall(256).is_ok() {
+        return TestResult::Fail("stall(256) must be rejected");
+    }
+    if stall(0xFFFF_FFFF).is_ok() {
+        return TestResult::Fail("stall(0xFFFFFFFF) must be rejected");
+    }
+    if stall(u64::MAX).is_ok() {
+        return TestResult::Fail("stall(u64::MAX) must be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml/sync", sync_stall_rejects_over_cap);
+
+/// `Stall` operands inside the ACPICA bound still stall: 0, the
+/// 100 µs spec max, and the 255 µs compatibility allowance.
+fn sync_stall_accepts_spec_range() -> TestResult {
+    if stall(0).is_err() {
+        return TestResult::Fail("stall(0) must succeed");
+    }
+    if stall(100).is_err() {
+        return TestResult::Fail("stall(100) must succeed");
+    }
+    if stall(MAX_STALL_US).is_err() {
+        return TestResult::Fail("stall(255) must succeed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml/sync", sync_stall_accepts_spec_range);
+
+/// The `Sleep` clamp pins the ACPICA bound without waiting: small
+/// values pass through, anything over 2000 ms clamps to 2000 ms.
+fn sync_sleep_clamp_bound() -> TestResult {
+    if clamped_sleep_ms(0) != 0 {
+        return TestResult::Fail("clamp(0) must be 0");
+    }
+    if clamped_sleep_ms(1) != 1 {
+        return TestResult::Fail("clamp(1) must be 1");
+    }
+    if clamped_sleep_ms(MAX_SLEEP_MS) != MAX_SLEEP_MS {
+        return TestResult::Fail("clamp(2000) must be 2000");
+    }
+    if clamped_sleep_ms(2001) != MAX_SLEEP_MS {
+        return TestResult::Fail("clamp(2001) must be 2000");
+    }
+    if clamped_sleep_ms(0xFFFF_FFFF) != MAX_SLEEP_MS {
+        return TestResult::Fail("clamp(0xFFFFFFFF) must be 2000");
+    }
+    if clamped_sleep_ms(u64::MAX) != MAX_SLEEP_MS {
+        return TestResult::Fail("clamp(u64::MAX) must be 2000");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml/sync", sync_sleep_clamp_bound);
