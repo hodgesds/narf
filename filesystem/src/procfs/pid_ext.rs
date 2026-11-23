@@ -613,10 +613,12 @@ fn nice_to_weight(nice: i32) -> u64 {
 /// Linux shape: `run_time_ns wait_time_ns timeslices\n`
 /// Linux ref: `kernel/sched/stats.c:proc_schedstat_show`.
 ///
-/// LINUX-GAP: the middle field is run-queue WAIT time, which needs the
-/// enqueue timestamp Linux keeps in `se.statistics.wait_start`. NARF's
-/// executor does not timestamp readiness, so it reports 0 — the other two
-/// fields are real.
+/// All three fields are real: the wait field is the scheduler's run-delay
+/// accounting (`cputime.note_run_delay` at dispatch), and the third field
+/// is the slice-start dispatch count (`stamp_slice_start`). The third field
+/// used to be folded only by the legacy longjmp poll tail, which the
+/// own-stack model never reaches — so it read 0 for every live thread and
+/// schbench divided runqueue_ns by it (#2400).
 fn render_schedstat(pid: u64) -> String {
     let sched = super::hook_sched_snapshot(pid);
     format!("{} {} {}\n", sched.run_ns, sched.wait_ns, sched.timeslices)

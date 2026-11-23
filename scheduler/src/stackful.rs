@@ -2332,6 +2332,16 @@ fn stamp_slice_start(task: &KernelTask, cpu: usize) {
     task.wake_preempt_at.store(0, Ordering::Release);
     let now = narf_time::now_cycles();
     task.tsc_started.store(now, Ordering::Release);
+    // Count the dispatch in the task's own accounting (Linux
+    // `sched_info.pcount`, `/proc/<pid>/schedstat`'s third field). The
+    // aggregate per-CPU counter is healthy, but the per-task count used to
+    // be folded only by the legacy longjmp poll tail, which the own-stack
+    // model never reaches — so it read 0 for every live thread and
+    // schbench divided runqueue_ns by it (#2400).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(cputime) = task_wake_cell(task).and_then(|cell| cell.cputime.as_ref()) {
+        cputime.note_dispatch();
+    }
     #[cfg(feature = "instruction-quantum")]
     {
         // Capture the mode with its baseline. A rolling policy replacement
@@ -9311,6 +9321,45 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// One dispatch through `poll_to_yield` counts once in the task's own
+    /// accounting (Linux `sched_info.pcount`, `/proc/<pid>/schedstat`'s
+    /// third field). Regression test for #2400: the count used to be folded
+    /// only by the legacy longjmp poll tail, which the own-stack model never
+    /// reaches, so a live thread's pcount stayed 0 and schbench divided
+    /// runqueue_ns by it.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_slice_start_counts_a_dispatch() -> TestResult {
+        use alloc::sync::Arc;
+        struct ReadyImmediately;
+        impl Future for ReadyImmediately {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        let cpu = this_cpu();
+        let cputime = Arc::new(crate::cputime::TaskCputime::new());
+        let cell = crate::new_wake_cell_with_cputime(
+            crate::TaskId(24001),
+            cpu as u32,
+            false,
+            cputime.clone(),
+        );
+        let mut task = KernelTask::new(ReadyImmediately);
+        task.bind_wake_cell(cell);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: same as smoke_current_task_cleared_after_poll.
+        let _ = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        task.unbind_wake_cell();
+        if cputime.dispatches() != 1 {
+            return TestResult::Fail(
+                "a dispatched task's schedstat pcount did not count the dispatch",
+            );
+        }
+        TestResult::Pass
+    }
+
     /// Owner context follows `CURRENT_STACKFUL_TASK`, not the CPU that first
     /// polled a task. This is the property syscall task-local lookup relies on
     /// across work stealing and direct `kernel_switch` resume.
@@ -10426,6 +10475,8 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_current_task_cleared_after_poll);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/stackful", smoke_slice_start_counts_a_dispatch);
     kernel_test_in!(
         "scheduler/stackful",
         smoke_current_user_context_is_task_local

@@ -358,3 +358,22 @@ fn smoke_cputime_transition_cost() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler/cputime", smoke_cputime_transition_cost);
+
+/// The dispatch counter starts at 0 and counts each slice start exactly
+/// once (Linux `sched_info.pcount`, `/proc/<pid>/schedstat`'s third field).
+/// Regression test for #2400: the counter is what a live thread's pcount
+/// reports, and it used to stay 0 forever.
+fn smoke_cputime_dispatches_count() -> TestResult {
+    let task = TaskCputime::new();
+    if task.dispatches() != 0 {
+        return TestResult::Fail("a fresh task reports dispatches before running");
+    }
+    task.note_dispatch();
+    task.note_dispatch();
+    task.note_dispatch();
+    if task.dispatches() != 3 {
+        return TestResult::Fail("note_dispatch did not count each dispatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler/cputime", smoke_cputime_dispatches_count);

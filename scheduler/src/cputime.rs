@@ -104,6 +104,12 @@ pub struct TaskCputime {
     /// Time spent runnable but waiting for a CPU, in TSC cycles (Linux
     /// `sched_info.run_delay`, `/proc/<pid>/schedstat`'s second field).
     run_delay_cycles: AtomicU64,
+    /// Dispatches (slice starts) this task has had (Linux
+    /// `sched_info.pcount`, `/proc/<pid>/schedstat`'s third field).
+    /// Counted by `stamp_slice_start`, the single choke point for every
+    /// resume/dispatch path — so a task that has run at all reports >= 1,
+    /// on both arches and both execution models.
+    dispatches: AtomicU64,
 }
 
 const _: () = assert!(core::mem::align_of::<TaskCputime>() > WORD_FLAGS);
@@ -137,6 +143,7 @@ impl TaskCputime {
             cpu: AtomicU32::new(u32::MAX),
             nice: AtomicBool::new(false),
             run_delay_cycles: AtomicU64::new(0),
+            dispatches: AtomicU64::new(0),
         }
     }
 
@@ -151,6 +158,24 @@ impl TaskCputime {
     /// Total time this task has waited runnable for a CPU, in ns.
     pub fn run_delay_ns(&self) -> u64 {
         narf_time::cycles_to_ns(self.run_delay_cycles.load(Ordering::Relaxed))
+    }
+
+    /// Count one dispatch of this task, at slice start.
+    #[inline]
+    pub(crate) fn note_dispatch(&self) {
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Dispatches so far (slice starts), including the slice running now.
+    pub fn dispatches(&self) -> u64 {
+        self.dispatches.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: count one dispatch directly, as `stamp_slice_start`
+    /// would have. Only for a task that is not running.
+    #[doc(hidden)]
+    pub fn __test_note_dispatch(&self) {
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the task's nice value; positive nice moves its user time to

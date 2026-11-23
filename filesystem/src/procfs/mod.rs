@@ -654,7 +654,8 @@ pub struct ProcSchedSnapshot {
     /// `sched_info.run_delay` — time runnable but waiting for a CPU, ns
     /// (`/proc/<pid>/schedstat`'s second field).
     pub wait_ns: u64,
-    /// Completed run slices (`/proc/<pid>/schedstat`'s third field).
+    /// Dispatches (`/proc/<pid>/schedstat`'s third field, Linux
+    /// `sched_info.pcount`): slice starts counted by the scheduler.
     pub timeslices: u64,
     /// `nr_voluntary_switches` — slices that ended in a park.
     pub voluntary_switches: u64,
