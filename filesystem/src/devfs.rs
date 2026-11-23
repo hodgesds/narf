@@ -1549,8 +1549,17 @@ impl FileOps for DevConsole {
         _context: &'a dyn crate::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
+            // VT_WAITACTIVE sleeps on the VT layer's wake. The wait is
+            // available through the console aliases (/dev/console, /dev/tty)
+            // whichever port backs the console, and through VT ttys: the
+            // switch it waits for is a logical VT-layer event, not UART
+            // state. A UART's own tty (/dev/ttyS<n>) keeps the sync
+            // fallback below, which answers -ENOTTY (#2137).
             if cmd == crate::devfs_pty::VT_WAITACTIVE
-                && self.port().kind() != crate::console_tty::PortKind::Serial
+                && (matches!(
+                    self.kind,
+                    ConsoleNodeKind::Console | ConsoleNodeKind::CurrentTty
+                ) || self.port().kind() != crate::console_tty::PortKind::Serial)
             {
                 let target = u32::try_from(arg).map_err(|_| crate::FsError::InvalidData)?;
                 crate::vt::wait_active(target).await?;
@@ -1590,26 +1599,35 @@ impl FileOps for DevConsole {
             ConsoleNodeKind::Virtual(n) if n >= 1 => n,
             _ => crate::vt::active_vt(),
         };
-        // The VT and KD ioctls are `vt_ioctl`'s, installed on VT ttys only; a
-        // UART answers them -ENOTTY (`tty_ioctl` -> `-ENOIOCTLCMD`), also
-        // through `/dev/console` when the console is `ttyS0`, and on a
-        // probed-UART tty exactly as on `ttyS0`.
+        // The KD ioctls are `vt_ioctl`'s, installed on VT ttys only; a UART
+        // answers them -ENOTTY (`tty_ioctl` -> `-ENOIOCTLCMD`), also through
+        // `/dev/console` when the console is `ttyS0`, and on a probed-UART
+        // tty exactly as on `ttyS0`. The VT ioctls are different: they are
+        // logical VT-layer operations (`vt::activate` only flips the
+        // active-VT number and notifies — no UART hardware is involved), so
+        // the console aliases (`/dev/console`, `/dev/tty`) forward them to
+        // the VT layer whichever port backs the console (#2137). Only a
+        // UART's own tty (`/dev/ttyS<n>`) answers the VT ioctls -ENOTTY,
+        // as on Linux.
+        let console_alias = matches!(
+            self.kind,
+            ConsoleNodeKind::Console | ConsoleNodeKind::CurrentTty
+        );
         if self.port().kind().is_serial()
-            && matches!(
+            && (matches!(
                 cmd,
-                KDGETMODE
-                    | KDGKBMODE
-                    | KDSETMODE
-                    | KDSIGACCEPT
-                    | KDSKBMODE
-                    | VT_ACTIVATE
-                    | VT_GETMODE
-                    | VT_GETSTATE
-                    | VT_OPENQRY
-                    | VT_RELDISP
-                    | VT_SETMODE
-                    | VT_WAITACTIVE
-            )
+                KDGETMODE | KDGKBMODE | KDSETMODE | KDSIGACCEPT | KDSKBMODE
+            ) || (!console_alias
+                && matches!(
+                    cmd,
+                    VT_ACTIVATE
+                        | VT_GETMODE
+                        | VT_GETSTATE
+                        | VT_OPENQRY
+                        | VT_RELDISP
+                        | VT_SETMODE
+                        | VT_WAITACTIVE
+                )))
         {
             return Err(crate::FsError::Unsupported);
         }

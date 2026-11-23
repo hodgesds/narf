@@ -6839,6 +6839,107 @@ fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_devfs_console_vt_kd_probes_degrade);
 
+// `VT_ACTIVATE` on /dev/console must reach the VT layer even when the
+// console is the serial line (#2137): /dev/console is an alias of "the
+// current console", not the UART's own tty, and the switch is a logical
+// VT-layer operation. The UART's own tty (/dev/ttyS0) still answers
+// -ENOTTY, out-of-range targets are still -EINVAL, and the KD ioctls stay
+// rejected on a serial-backed console.
+fn smoke_devfs_console_vt_activate_forwards() -> TestResult {
+    use crate::devfs_pty::{KDGETMODE, VT_ACTIVATE, VT_GETSTATE, VT_OPENQRY, VT_WAITACTIVE};
+    use crate::FsError;
+    struct ContextStub;
+    impl crate::IoctlContext for ContextStub {
+        fn read(&self, _: u64, _: &mut [u8]) -> Result<(), FsError> {
+            Err(FsError::BadAddress)
+        }
+        fn write(&self, _: u64, _: &[u8]) -> Result<(), FsError> {
+            Err(FsError::BadAddress)
+        }
+        fn nonblocking(&self) -> bool {
+            false
+        }
+    }
+    crate::console_tty::__test_reset_cooked();
+    crate::vt::__reset_for_test();
+    // Pin /dev/console to the serial port so the test exercises the
+    // guard path even if the boot cmdline ever prefers the VT.
+    let saved =
+        crate::console_tty::__test_swap_config(Some(crate::console_tty::parse_console_config("")));
+    let result = (|| {
+        let console = open_dev_node_for_test("console").ok_or("resolve /dev/console failed")?;
+        // Activation is synchronous and visible to the VT layer at once.
+        if console.ioctl(VT_ACTIVATE, 2) != Ok(0) {
+            return Err("VT_ACTIVATE(2) on /dev/console failed");
+        }
+        if crate::vt::active_vt() != 2 {
+            return Err("active VT did not follow VT_ACTIVATE on /dev/console");
+        }
+        let mut state = [0u8; 6];
+        if console.ioctl(VT_GETSTATE, state.as_mut_ptr() as usize) != Ok(0)
+            || u16::from_le_bytes([state[0], state[1]]) != 2
+        {
+            return Err("VT_GETSTATE on /dev/console did not report VT 2");
+        }
+        // Synchronous VT_WAITACTIVE: Ok when already active, WouldBlock
+        // when not.
+        if console.ioctl(VT_WAITACTIVE, 2) != Ok(0) {
+            return Err("VT_WAITACTIVE(2) on /dev/console failed");
+        }
+        if console.ioctl(VT_WAITACTIVE, 1) != Err(FsError::WouldBlock) {
+            return Err("VT_WAITACTIVE(1) on /dev/console was not WouldBlock");
+        }
+        // The async path must take the VT wait, not the sync fallback: a
+        // wait for the inactive VT pends instead of answering WouldBlock
+        // at once.
+        let mut wait = console.ioctl_user(VT_WAITACTIVE, 1, &ContextStub);
+        if poll_once_devfs_input(wait.as_mut()).is_some() {
+            return Err("async VT_WAITACTIVE on /dev/console did not pend");
+        }
+        drop(wait);
+        // The /dev/tty alias forwards too: switch back through it.
+        let devtty = open_dev_node_for_test("tty").ok_or("resolve /dev/tty failed")?;
+        if devtty.ioctl(VT_ACTIVATE, 1) != Ok(0) || crate::vt::active_vt() != 1 {
+            return Err("VT_ACTIVATE(1) on /dev/tty failed");
+        }
+        // Out-of-range targets are -EINVAL and leave the active VT alone.
+        if console.ioctl(VT_ACTIVATE, 0).is_ok()
+            || console
+                .ioctl(VT_ACTIVATE, crate::vt::MAX_VT as usize + 1)
+                .is_ok()
+        {
+            return Err("VT_ACTIVATE accepted an out-of-range target");
+        }
+        if crate::vt::active_vt() != 1 {
+            return Err("a rejected VT_ACTIVATE moved the active VT");
+        }
+        // The UART's own tty still answers the VT ioctls -ENOTTY, as on
+        // Linux — only the console aliases forward.
+        let tty_s0 = open_dev_node_for_test("ttyS0").ok_or("resolve /dev/ttyS0 failed")?;
+        if tty_s0.ioctl(VT_ACTIVATE, 2) != Err(FsError::Unsupported) {
+            return Err("VT_ACTIVATE on /dev/ttyS0 was not ENOTTY");
+        }
+        // And the KD ioctls stay rejected on a serial-backed console.
+        let mut mode: i32 = -7;
+        if console.ioctl(KDGETMODE, &mut mode as *mut i32 as usize) != Err(FsError::Unsupported) {
+            return Err("KDGETMODE on the serial /dev/console was not ENOTTY");
+        }
+        // VT_OPENQRY through the console alias returns the first free VT.
+        let mut open_vt: i32 = 0;
+        if console.ioctl(VT_OPENQRY, &mut open_vt as *mut i32 as usize) != Ok(0) || open_vt != 1 {
+            return Err("VT_OPENQRY on /dev/console");
+        }
+        Ok(())
+    })();
+    let _ = crate::console_tty::__test_swap_config(saved);
+    crate::vt::__reset_for_test();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!("filesystem", smoke_devfs_console_vt_activate_forwards);
+
 /// An empty `/dev/uinput` read must NOT report end-of-file.
 ///
 /// `read() == 0` on a character device means the device hung up. The control
