@@ -19,6 +19,7 @@
 //! [`ImageSource`](crate::suspend_service::ImageSource), so the sealed
 //! writer never holds more than one chunk.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use narf_crypto::sha256::Sha256;
@@ -68,9 +69,8 @@ impl PayloadHeader {
         }
     }
 
-    /// The header page.
-    pub fn encode(&self) -> [u8; PAGE as usize] {
-        let mut page = [0u8; PAGE as usize];
+    /// The header page, written into `page`.
+    pub fn encode_into(&self, page: &mut [u8; PAGE as usize]) {
         let mut at = 0;
         let mut put = |bytes: &[u8]| {
             page[at..at + bytes.len()].copy_from_slice(bytes);
@@ -85,6 +85,12 @@ impl PayloadHeader {
         put(&self.kernel_phys.1.to_le_bytes());
         put(&self.ram_hash);
         put(&self.arch);
+    }
+
+    /// The header page.
+    pub fn encode(&self) -> [u8; PAGE as usize] {
+        let mut page = [0u8; PAGE as usize];
+        self.encode_into(&mut page);
         page
     }
 
@@ -164,7 +170,9 @@ impl Pages for Snapshot {
 
 /// A payload streamed from its pages.
 pub struct PayloadSource<'a, P: Pages + ?Sized> {
-    header: [u8; PAGE as usize],
+    /// The encoded header page, heap-allocated: a 4 KiB array by value in
+    /// the caller's frame is what put `hibernate`'s callers over budget.
+    header: Box<[u8; PAGE as usize]>,
     pages: &'a P,
 }
 
@@ -179,8 +187,14 @@ impl<P: Pages + ?Sized> core::fmt::Debug for PayloadSource<'_, P> {
 impl<'a, P: Pages + ?Sized> PayloadSource<'a, P> {
     pub fn new(header: &PayloadHeader, pages: &'a P) -> Self {
         debug_assert_eq!(header.page_count, pages.count() as u64);
+        // The encoded header page (4 KiB) lives on the heap, not in the
+        // caller's frame: building it by value in `hibernate`'s poll kept
+        // both the page and `encode`'s own copy there (8552 bytes, main
+        // run 45082275318).
+        let mut encoded = Box::new([0u8; PAGE as usize]);
+        header.encode_into(&mut encoded);
         Self {
-            header: header.encode(),
+            header: encoded,
             pages,
         }
     }
