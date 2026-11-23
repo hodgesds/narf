@@ -1064,8 +1064,10 @@ pub mod tests {
     const PWR_WELL_CTL2: u64 = 0x4_5404;
     /// DPLL0/1/2_ENABLE: combo DDIs A/B/C each lock their own PLL.
     const DPLL_ENABLES: [u64; 3] = [0x4_6010, 0x4_6014, 0x4_6018];
+    const PLL_ENABLE: u32 = 1 << 31;
     const PLL_POWER_STATE: u32 = 1 << 26;
     const PLL_LOCK: u32 = 1 << 30;
+    const PLL_POWER_ENABLE: u32 = 1 << 27;
 
     #[derive(Debug)]
     pub struct SinkMmio {
@@ -1185,7 +1187,21 @@ pub mod tests {
                 return v | ((v & 0xAAAA_AAAA) >> 1);
             }
             if DPLL_ENABLES.contains(&off) {
-                return v | PLL_POWER_STATE | PLL_LOCK;
+                // LOCK / POWER_STATE are read-only status
+                // derived from the enables: LOCK follows
+                // ENABLE, POWER_STATE follows POWER_ENABLE —
+                // the shape `ScriptedSinkMmio` and the
+                // combo-phy `Model` serve. An unconditional OR
+                // can never clear, so the #2358 mid-training
+                // retune's wait-for-clear times out and the
+                // HBR3→HBR2 fallback fails.
+                let lock = if v & PLL_ENABLE != 0 { PLL_LOCK } else { 0 };
+                let power = if v & PLL_POWER_ENABLE != 0 {
+                    PLL_POWER_STATE
+                } else {
+                    0
+                };
+                return (v & !(PLL_LOCK | PLL_POWER_STATE)) | lock | power;
             }
             // DBUF slices grant power when requested.
             {
