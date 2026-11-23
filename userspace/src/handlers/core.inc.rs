@@ -10154,6 +10154,50 @@ pub(crate) fn numa_balance_fork(parent_task: u64, child_task: u64) {
     map.insert(child_task, NUMA_TICKS_DELAYED);
 }
 
+/// Fused fork inheritance for the three NUMA tables: the task mempolicy
+/// ([`mempolicy_fork`]), the interleave cursor ([`interleave_index_fork`]),
+/// and the NUMA-balancing pacing ([`numa_balance_fork`]).
+///
+/// Fork used to call the three separately, paying the
+/// `custom_mempolicy_possible()` gate check three times plus three
+/// table lock/unlock pairs. The gate is one atomic load, so the saving is
+/// the two redundant gate evaluations and the call/lookup repetition, not
+/// the lock itself — each table still takes its own lock, in the same
+/// order as the separate calls, so no lock-ordering hazard is introduced.
+/// The individual functions stay for the abi_mem tests that exercise each
+/// table on its own. Semantics are
+/// identical: when the gate is closed or a table has no parent row, that
+/// row is skipped exactly as the separate call would skip it.
+pub(crate) fn numa_fork(parent_task: u64, child_task: u64) {
+    if parent_task == child_task || !custom_mempolicy_possible() {
+        return;
+    }
+    {
+        let mut table = MEMPOLICY_TABLE.lock();
+        if let Some(map) = table.as_mut() {
+            if let Some(inherited) = map.get(&parent_task).copied() {
+                map.insert(child_task, inherited);
+            }
+        }
+    }
+    {
+        let mut table = INTERLEAVE_INDEX_TABLE.lock();
+        if let Some(map) = table.as_mut() {
+            if let Some(inherited) = map.get(&parent_task).copied() {
+                map.insert(child_task, inherited);
+            }
+        }
+    }
+    {
+        let mut table = NUMA_BALANCE_TICKS.lock();
+        if let Some(map) = table.as_mut() {
+            if map.contains_key(&parent_task) {
+                map.insert(child_task, NUMA_TICKS_DELAYED);
+            }
+        }
+    }
+}
+
 /// Test accessor: the policy stored for `task`, as (mode, nodemask,
 /// home_node). `None` when the task has no policy of its own — which is
 /// what an un-inherited child looks like.
@@ -13258,9 +13302,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // keeps a forked foreground job in the terminal's foreground pgrp so
     // it does NOT trip the SIGTTIN/SIGTTOU background-access check on its
     // first console read; a job-control shell moves it out via setpgid.
-    pgid_fork(parent_pid, child_tid.raw());
-    sid_fork(parent_pid, child_tid.raw());
-    ctty_fork(parent_pid, child_tid.raw());
+    // One fused call: one pass over the three job-control tables (see
+    // `job_control_fork`).
+    job_control_fork(parent_pid, child_tid.raw());
 
     // `copy_fs`: CLONE_FS shares the parent's root + cwd (a chdir or chroot
     // by either is seen by both); otherwise the child gets a copy. Without
@@ -13280,15 +13324,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     uidgid_fork(parent_pid, child_tid.raw());
     // `copy_process` duplicates the task mempolicy for EVERY child
     // (`kernel/fork.c:2156`) — no CLONE_ flag guards it, so a thread
-    // inherits it exactly as a forked process does.
-    mempolicy_fork(parent_pid, child_tid.raw());
-    // Likewise the interleave cursor: `il_prev` is never reset by
-    // `copy_process`, so the struct copy carries it to every child.
-    interleave_index_fork(parent_pid, child_tid.raw());
-    // Only pacing is seeded. The CLONE_VM split is structural now: a
-    // thread shares its parent's scope and so its cursor, while a new mm
-    // has no cursor yet and starts at the floor.
-    numa_balance_fork(parent_pid, child_tid.raw());
+    // inherits it exactly as a forked process does. The interleave cursor
+    // rides along the same way, and only the NUMA-balancing pacing is
+    // seeded. One fused call: a single gate check, then one pass over the
+    // three NUMA tables (see `numa_fork`).
+    numa_fork(parent_pid, child_tid.raw());
 
     // Namespace inheritance + CLONE_NEW* layering. A child — thread OR
     // process — shares the parent's namespaces (Linux copy_*ns), unless
@@ -17557,6 +17597,51 @@ pub fn ctty_fork(parent: u64, child: u64) {
     if let Some(v) = raw {
         if let Some(m) = CTTY_TABLE.lock().as_mut() {
             m.insert(child, v);
+        }
+    }
+}
+
+/// Fused fork inheritance for the three job-control tables: process group
+/// ([`pgid_fork`]), session ([`sid_fork`]), and controlling terminal
+/// ([`ctty_fork`]).
+///
+/// Fork used to call the three separately, and the session and ctty arms
+/// each took their table lock TWICE — once to read the parent row, once to
+/// insert the child row. This does one pass over the three tables, with
+/// the session and ctty rows read and written under a single acquisition
+/// each. The individual functions stay for the abi_proc tests that
+/// exercise each table on its own. Semantics are
+/// identical: a missing parent row defaults exactly as the separate calls
+/// default (pgid/sid fall back to the parent id; an absent ctty row stays
+/// absent and resolves to the console default for both).
+pub(crate) fn job_control_fork(parent: u64, child: u64) {
+    {
+        let mut pgids = PGID_TABLE.lock();
+        let pg = pgids
+            .as_ref()
+            .and_then(|m| m.get(&parent).copied())
+            .unwrap_or(parent);
+        crate::task::inherit_process_group_id(parent, child, pg);
+        pgids.get_or_insert_with(BTreeMap::new).insert(child, pg);
+    }
+    {
+        let mut g = SID_TABLE.lock();
+        let sid = g
+            .as_ref()
+            .and_then(|m| m.get(&parent).copied())
+            .unwrap_or(parent);
+        if let Some(m) = g.as_mut() {
+            m.insert(child, sid);
+        }
+    }
+    {
+        let parent = process_state_key(parent);
+        let child = process_state_key(child);
+        let mut g = CTTY_TABLE.lock();
+        if let Some(v) = g.as_ref().and_then(|m| m.get(&parent).copied()) {
+            if let Some(m) = g.as_mut() {
+                m.insert(child, v);
+            }
         }
     }
 }

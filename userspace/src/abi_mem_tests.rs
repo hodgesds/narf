@@ -916,6 +916,65 @@ kernel_test_in!(
     smoke_abi_mem_numa_scan_cursor_is_per_address_space
 );
 
+/// The fused `numa_fork` inherits all three NUMA rows in one call: the task
+/// mempolicy, the interleave cursor, and the NUMA-balancing pacing. It must
+/// copy exactly what the three separate calls copied — the parent's policy
+/// struct, its advanced cursor (not a restarted one), and a delayed first
+/// scan for the child.
+fn smoke_abi_mem_numa_fork_copies_all_three_rows() -> TestResult {
+    with_setup(|| {
+        const CHILD_TID: u64 = 0x3FED_0005;
+        const FLOOR: u64 = 0x0000_0080_0000_0000;
+        // MPOL_INTERLEAVE (3): seeds the task mempolicy row AND the cursor.
+        let mask = 1u64;
+        if call(
+            Syscall::SetMempolicy.raw(),
+            a2(3, &mask as *const u64 as u64, 64),
+        ) != Some(0)
+        {
+            return Err("set_mempolicy(MPOL_INTERLEAVE) failed");
+        }
+        crate::handlers::__test_advance_interleave_index(FAKE_TASK);
+        crate::handlers::__test_advance_interleave_index(FAKE_TASK);
+        let parent_policy = crate::handlers::__test_task_mempolicy(FAKE_TASK)
+            .ok_or("parent has no stored mempolicy after set_mempolicy")?;
+        let parent_cursor = crate::handlers::__test_interleave_index(FAKE_TASK)
+            .ok_or("parent has no interleave cursor")?;
+        if parent_cursor == 0 {
+            return Err("parent cursor did not advance; test cannot discriminate");
+        }
+        // mbind with MPOL_F_NUMA_BALANCING seeds the parent's pacing row.
+        let mode = 2u64 | (1u64 << 13);
+        let scan_start = FLOOR + 0x2000;
+        if call(
+            Syscall::Mbind.raw(),
+            a3(scan_start, 0x1000, mode, &mask as *const u64 as u64),
+        ) != Some(0)
+        {
+            return Err("mbind(MPOL_F_NUMA_BALANCING) failed");
+        }
+
+        crate::handlers::__test_release_task_tables(CHILD_TID);
+        crate::handlers::numa_fork(FAKE_TASK, CHILD_TID);
+        let child_policy = crate::handlers::__test_task_mempolicy(CHILD_TID);
+        let child_cursor = crate::handlers::__test_interleave_index(CHILD_TID);
+        let child_ticks = crate::handlers::__test_numa_balance_ticks(CHILD_TID);
+        crate::handlers::__test_release_task_tables(CHILD_TID);
+        if child_policy != Some(parent_policy) {
+            return Err("fused numa_fork did not copy the parent's mempolicy");
+        }
+        if child_cursor != Some(parent_cursor) {
+            return Err("fused numa_fork did not copy the parent's interleave cursor");
+        }
+        match child_ticks {
+            Some(0) => Ok(()),
+            Some(_) => Err("fused numa_fork did not delay the child's first scan"),
+            None => Err("fused numa_fork did not seed the child's balancing pacing"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_numa_fork_copies_all_three_rows);
+
 /// A forked child's new address space inherits the parent's `mbind` ranges.
 ///
 /// `dup_mmap` calls `vma_dup_policy` (`mm/mempolicy.c:2802`) for every VMA

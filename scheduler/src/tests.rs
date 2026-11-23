@@ -772,21 +772,37 @@ fn smoke_scheduler_fork_cpu_tie_policy() -> TestResult {
     let cpu2 = CpuId(2);
 
     // A saturated tie stays with the forking task for cache locality.
-    if choose_fork_cpu(cpu0, 1, cpu1, Some(1), cpu2, Some(1)) != cpu1 {
+    if choose_fork_cpu(cpu0, 1, cpu1, Some(1), cpu2, Some(1), false) != cpu1 {
         return TestResult::Fail("saturated fork placement did not retain current CPU");
     }
     // Any idle candidate wins over a busy current CPU; the rotating preference
     // breaks the minimum-load tie so setup bursts still spread.
-    if choose_fork_cpu(cpu0, 0, cpu1, Some(1), cpu2, Some(0)) != cpu2 {
+    if choose_fork_cpu(cpu0, 0, cpu1, Some(1), cpu2, Some(0), false) != cpu2 {
         return TestResult::Fail("idle fork placement did not honor rotating preference");
     }
     // A preferred CPU that is not minimum-loaded cannot override the best CPU.
-    if choose_fork_cpu(cpu0, 1, cpu1, Some(2), cpu2, Some(2)) != cpu0 {
+    if choose_fork_cpu(cpu0, 1, cpu1, Some(2), cpu2, Some(2), false) != cpu0 {
         return TestResult::Fail("fork placement selected a busier CPU");
     }
     // An affinity-excluded current or preferred CPU has no recorded load.
-    if choose_fork_cpu(cpu0, 1, cpu1, None, cpu2, None) != cpu0 {
+    if choose_fork_cpu(cpu0, 1, cpu1, None, cpu2, None, false) != cpu0 {
         return TestResult::Fail("fork placement escaped its sampled candidates");
+    }
+    // Fork+wait locality (`prefer_current`): the load on the parent CPU is
+    // the forking parent itself, so it does not count against that CPU —
+    // with nothing else queued there, the child stays local instead of
+    // paying a cross-CPU spawn plus an exit-wakeup IPI pair for an idle CPU.
+    if choose_fork_cpu(cpu0, 0, cpu1, Some(1), cpu2, Some(0), true) != cpu1 {
+        return TestResult::Fail("parent-local fork placement left an otherwise idle parent CPU");
+    }
+    // ...but a parent CPU with genuinely queued work besides the parent
+    // still spreads to the idle CPU.
+    if choose_fork_cpu(cpu0, 0, cpu1, Some(2), cpu2, Some(0), true) != cpu2 {
+        return TestResult::Fail("parent-local fork placement kept a child on a busy parent CPU");
+    }
+    // An affinity-excluded parent CPU cannot take the child either way.
+    if choose_fork_cpu(cpu0, 0, cpu1, None, cpu2, Some(0), true) != cpu2 {
+        return TestResult::Fail("parent-local fork placement escaped its sampled candidates");
     }
 
     TestResult::Pass
