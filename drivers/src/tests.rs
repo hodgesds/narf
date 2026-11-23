@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_drivers_bound_firmware_round_trip() -> TestResult {
