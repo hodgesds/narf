@@ -1026,7 +1026,7 @@ pub mod tests {
         if chicken_trans_for_port(Ddi::A) != Some(0x420CC)
             || chicken_trans_for_port(Ddi::B) != Some(0x420C0)
             || chicken_trans_for_port(Ddi::C) != Some(0x420C4)
-            || chicken_trans_for_port(Ddi::D) != Some(0x420D8)
+            || chicken_trans_for_port(Ddi::D) != Some(0x420C8)
             || chicken_trans_for_port(Ddi::E) != Some(0x420C0)
             || chicken_trans_for_port(Ddi::F).is_some()
         {
