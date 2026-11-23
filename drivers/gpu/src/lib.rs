@@ -826,6 +826,8 @@ pub(crate) mod intel_gpu_gen9_dmc;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen9_dpll;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_gen9_irq;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gen9_sagv;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen9_wm;

@@ -2034,7 +2034,11 @@ section, it does not re-litigate scope.
   panel fitting is not on the first-modeset path);
   Gen9 interrupt routing register-by-register (Lane 8
   grounds against `display/intel_display_irq.c` and
-  `gt/intel_gt_irq.c`).
+  `gt/intel_gt_irq.c` — CLOSED by Lane 8: §12.7; the
+  register map, reset/post-install sequences and decode
+  are pinned by `intel_gpu_gen9_irq.rs` fixtures, verified
+  against the Linux sources line by line, and the xe-era
+  0x190000 block is asserted untouched).
 - **Stale pointer, not edited here**: §5's Gen11
   paragraph still ends "Gen9 stays excluded (§6)".
   That sentence is stale as of this lane; Lane 1 owns
@@ -2140,9 +2144,9 @@ First light on the internal eDP panel, in Linux's SKL order
 (CDCLK → DPLL → DDI pre-enable → transcoder/pipe/M-N → DBUF +
 watermarks → plane → link training → DDI buffer → enables), on
 the legacy modeset path (post-#2377 shape — the trained link is
-returned on the legacy path). The Plan path refuses with
-`ModesetError::UnsupportedGeneration`: first light is the legacy
-path only.
+returned on the legacy path). Lane 8 unblocked the Plan path
+(`modeset_with_plan` / `modeset_mst_primary`) for external
+outputs; see §12.7.
 
 - DMC is REQUIRED (the §12.4 Q5 default, mirroring Gen12):
   the probe loads `i915/skl_dmc_ver1_27.bin` (Skylake) or
@@ -2169,9 +2173,10 @@ path only.
 - DPLL: DPLL0 for the eDP panel, DPLL1 otherwise
   (`dpll_pool`); `DPLL_CTRL1` carries OVERRIDE + link rate,
   `DPLL_CTRL2` routes the port, and there is no DPCLKA or TGL
-  CFGCR0 on SKL. `modeset_hdmi` refuses Gen9 outright (it
-  would otherwise run the Gen12 `program_dpll_coeffs` writes
-  on SKL); external outputs are Lane 8.
+  CFGCR0 on SKL. `modeset_hdmi` had refused Gen9 outright
+  (it would otherwise have run the Gen12
+  `program_dpll_coeffs` writes on SKL); Lane 8 added the
+  Gen9 HDMI branch (§12.7).
 - Training: the whole `DDI_BUF_TRANS` table is programmed at
   pre-enable, then each training iteration applies the sink's
   requested level via lane 0's level only (`preset_index` +
@@ -2207,6 +2212,117 @@ path only.
 - VBT boost levels are unplumbed caller inputs (Lane 4
   remainder): `dp_boost` is false for first light and the
   VBT boost level is not consumed.
+
+### 12.7 Gen9 external outputs (Lane 8)
+
+External DP (DDI B–E, Plan path) + HDMI + IRQ routing + SPT
+backlight, fixture-validated, silicon untested. The Gen9
+programme's last lane; `external_display_supported()` and
+`backlight_supported()` flip for `Generation::Skylake` here.
+
+- Port map (`intel_gpu_gen9_ddi.rs`, `skl_display`):
+  port A is the eDP panel, ports B–E are DP/HDMI, F+ do not
+  exist. Pipes A/B/C, transcoders A/B/C + EDP, DBUF 896−4
+  blocks, slice S1 only. The port-kind, DPLL-pool and SKU
+  tests pin the map across Skylake/KabyLake/CometLake (the
+  external paths key off `Gen9Platform`, not PCI IDs).
+- DP training reuse: Lane 5's training loop is port-agnostic
+  (`is_edp = ddi == Ddi::A` → `Output::Dp` for external) —
+  no second training loop was written. The only thing that
+  blocked external DP was the Plan-path backstop in
+  `modeset_impl`; removing it unblocked `modeset_with_plan`
+  and `modeset_mst_primary` (same `LinkStep::Plan`).
+  Everything else already dispatched Gen9 (DPLL, DPCLKA
+  routing, watermarks, DBUF, power wells, M/N, FUNC_CTL).
+- DPLL arbitration (named remainder): Linux `skl_get_dpll`
+  gives eDP DPLL0 only and every other output the first
+  free of DPLL1/2/3 (occupancy-based). NARF has no
+  cross-run occupancy tracking, so the modeset takes the
+  first of the pool — DPLL1 for every external output —
+  and `program_dpclka_routing` makes the same pick, so the
+  DPLL program and the clock routing agree. Two
+  simultaneous external outputs would both take DPLL1;
+  occupancy tracking is the follow-up.
+- HDMI (`modeset_hdmi` Gen9 branch): the TGL
+  `hdmi_wrpll_coeffs` search is skipped for Gen9; the SKL
+  WRPLL row comes from `hdmi_state` under the fixed 24 MHz
+  reference (`REFCLK_KHZ` — Lane 4's CDCLK hardcodes ref
+  24000, not the DSSM strap). For 1080p60 (148.5 MHz): the
+  winning divider is 12, DCO 371 + 0x2000, CFGCR1
+  0x80400173, CFGCR2 0x3A5. Levels are the SKL HDMI table's
+  default entry (index 8) at BUF_TRANS index 9 plus the
+  I_boost for that entry — Linux `hsw_set_signal_levels`
+  runs `skl_ddi_set_iboost` for HDMI, then returns ("HDMI
+  ignores the rest"). Wa #1143 (HDMI-only,
+  `display/intel_ddi.c:3455`): pulse
+  `DDI_TRAINING_OVERRIDE_ENABLE | VALUE` in the port's
+  transcoder chicken register (set, posting read, 1 µs,
+  clear; port E uses bits 17/16 of `CHICKEN_TRANS_A`).
+- DMC gate: the Q5 default (DMC REQUIRED) now fires at the
+  top of `modeset_impl` on every entry (legacy, plan,
+  trained), not only the panel entry
+  (`modeset_display_family` gates the panel path), and at
+  the top of `modeset_hdmi` (which bypasses `modeset_impl`
+  entirely) — both before any register is touched.
+- IRQ routing (`intel_gpu_gen9_irq.rs`): the Gen9 display +
+  GT interrupt model, grounded register-by-register against
+  `display/intel_display_irq.c`, `gt/intel_gt_irq.c`,
+  `i915_irq.c` (Linux 7.4-rc2) — this closes the §12.4
+  interrupt-routing item. `GEN8_MASTER_IRQ` 0x44200
+  (CONTROL bit 31; the Gen11 HPD bit 21 in the same address
+  does not exist on Gen9), the DE block (0x44000 summary,
+  0x44400 pipes, 0x44440 port, 0x44460 misc, 0x444e0 PCU),
+  the four GT banks (0x44300 + 0x10 per bank), and the
+  reset (`gen2_irq_reset` shape) / post-install
+  (bank 2 stays IER 0 / IMR all-ones; PM/RPS + GuC enable on
+  demand) / decode / W1C-ack primitives, with fixtures
+  pinning the addresses, the write sequences, the master
+  decode split (GT banks vs display), the port hotplug bits
+  (3 + pin − A) and the Gen9 AUX mask (A + B/C/D), and a
+  negative control that the xe-era 0x190000 block is never
+  touched. Verification method: each constant and sequence
+  was transcribed from the named Linux source and pinned by
+  a fixture that asserts the exact register write sequence
+  — the module is register-level routing only. Live
+  IRQ-handler wiring is a named remainder (no
+  interrupt-domain registration exists in this crate yet).
+- HPD / external-session threading (named remainder, same
+  as Gen11): the session layer (`enable_external_hpd`,
+  `poll_external_hpd`, `dp_connect` / `hdmi_connect` /
+  `mst_connect`) is Gen12-gated — its `ModeWindow` impl
+  returns `None` for Gen9 — so flipping
+  `external_display_supported` arms no session path by
+  construction. The HPD sources are the DE_PORT hotplug bits
+  plus SDE, and `decode_port_iir` is the decode the future
+  threading consumes; threading them into the session layer
+  (and MST session threading) is the follow-up lane.
+- Backlight: Skylake drives the SPT PWM block
+  (`intel_bl.rs` `PwmLayout::Spt`: max = `BLC_PWM_PCH_CTL2`
+  0xC8254 >> 16, duty RMW into CTL2's low 16 bits,
+  `lpt_set_backlight` / `lpt_get_backlight`); the probe
+  branches to `install_spt` for Skylake and keeps the BXT
+  install for Gen11/Gen12. `SPT_PWM_GRANULARITY` (bit 0 of
+  `SOUTH_CHICKEN1`, alternate increment) is not modeled —
+  the device preserves the firmware period and never
+  converts Hz→PWM; a future VBT-plumbed backlight can set
+  it at enable time per `lpt_enable_backlight`. The SPT
+  enable sequence (CTL1 enable) likewise belongs to a
+  future backlight-enable step.
+- Fixtures: `smoke_gen9_external_dp_ddi_b_full_run` and
+  `smoke_gen9_hdmi_ddi_b_full_run` (DDI B / Pipe A / HBR2
+  x4 / 1080p60) assert the full register image — CDCLK
+  337.5 MHz rung, DPLL_CTRL1/2, DDI-IO-B power well,
+  watermarks, BUF_CFG, the SKL DP/HDMI tables at the
+  port-B BUF_TRANS block, I_boost, DDI_BUF_CTL, DP_TP_CTL,
+  FUNC_CTL, the Wa #1143 pulse, and the absence of TGL
+  registers, DDI A, and the EDP transcoder — plus ten
+  `intel_gpu_gen9_irq` fixtures and the SPT round-trip.
+  Two Lane 5 panel-test assertions were corrected in this
+  lane (both never executed: host test execution was
+  deferred): DDI_BUF_CTL's last write is 0x84000086, not
+  0x84000006 — the IDLE bit the fixture serves on readback
+  survives the enable RMW — and the PLANE_WM stride is 4,
+  not 8 (the Gen11 full-run test pins the same stride).
 
 ## 13. Suspend/resume + D-states (Stage 5 — `intel_gpu_pm`, #1015)
 

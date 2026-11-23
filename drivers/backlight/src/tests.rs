@@ -423,6 +423,89 @@ mod smokes {
     }
     kernel_test_in!("drivers/backlight", smoke_intel_backlight_pwm_roundtrip);
 
+    // ── 15b. Intel backlight SPT PWM round-trip (Gen9) ─────────────
+
+    fn smoke_intel_backlight_spt_pwm_roundtrip() -> TestResult {
+        __reset_all_for_test();
+
+        // Fake BAR0 large enough to cover the SPT PWM registers
+        // at 0xC8250/0xC8254 (same shape as the BXT test above).
+        let buf: Box<[u8]> = alloc::vec![0u8; 0xC9000].into_boxed_slice();
+        let raw = Box::leak(buf);
+        let bar_len = raw.len() as u64;
+        let phys = narf_memory::PhysAddr::new(raw.as_ptr() as u64);
+        let mmio = narf_driver_runtime::MmioRegion {
+            phys,
+            virt: phys.raw(),
+            len: bar_len,
+            kind: narf_driver_runtime::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+
+        // Seed BLC_PWM_PCH_CTL2 (0xC8254) with period 0x1000 in
+        // the high 16 bits and an initial duty of 0x400.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe {
+            core::ptr::write_volatile((raw.as_ptr() as *mut u32).add(0xC8254 / 4), 0x1000_0400);
+        }
+
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let dev = unsafe {
+            crate::intel_bl::IntelBacklightDevice::new_with_layout(
+                "intel_bl0",
+                mmio,
+                crate::intel_bl::PwmLayout::Spt,
+            )
+        };
+
+        // Max is the period (CTL2 >> 16), not the whole register;
+        // the seeded duty 0x400 reads back as 25%.
+        if dev.current_brightness() != 25 {
+            return TestResult::Fail("SPT initial read-back != 25");
+        }
+
+        // 50% → duty 0x800, period preserved in the high 16 bits.
+        dev.set_brightness(50);
+        let ctl2 =
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe { core::ptr::read_volatile((raw.as_ptr() as *const u32).add(0xC8254 / 4)) };
+        if ctl2 != 0x1000_0800 {
+            return TestResult::Fail("SPT 50% did not RMW CTL2 to 0x10000800");
+        }
+        if dev.current_brightness() != 50 {
+            return TestResult::Fail("SPT read-back percentage != 50");
+        }
+
+        // The BXT duty register (0xC8258) is never touched on
+        // the SPT path.
+        let duty1 =
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe { core::ptr::read_volatile((raw.as_ptr() as *const u32).add(0xC8258 / 4)) };
+        if duty1 != 0 {
+            return TestResult::Fail("SPT run wrote the BXT DUTY1 register");
+        }
+
+        // 0% → duty 0, period preserved.
+        dev.set_brightness(0);
+        if dev.current_brightness() != 0 {
+            return TestResult::Fail("SPT 0% read-back != 0");
+        }
+
+        // 100% → duty 0x1000, period preserved.
+        dev.set_brightness(100);
+        let ctl2 =
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe { core::ptr::read_volatile((raw.as_ptr() as *const u32).add(0xC8254 / 4)) };
+        if ctl2 != 0x1000_1000 || dev.current_brightness() != 100 {
+            return TestResult::Fail("SPT 100% did not yield CTL2 0x10001000");
+        }
+
+        __reset_all_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/backlight", smoke_intel_backlight_spt_pwm_roundtrip);
+
     // ── 16. Lenovo keyboard backlight ACPI operations ───────────────
 
     fn smoke_lenovo_kbd_backlight_acpi_operations() -> TestResult {
