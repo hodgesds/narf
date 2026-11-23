@@ -440,9 +440,14 @@ and `gmd_id` is `None` on Gen9. The WOPCM plan for Gen9 is the
 1 MiB total (`gt/intel_wopcm.c` `GEN9_WOPCM_SIZE`). The part binds
 and announces; display, external display and backlight stay gated
 (Lanes 5 and 8), submission stays gated (Lane 3), no media-engine
-table is admitted until Lane 3, and the SPT GMBUS pin table is
-untranscribed until Lane 4 (SPT uses the old `GMBUS_PIN_DPC` = 4 /
-`DPB` = 5 / `DPD` = 6 numbering). Gen9 has no VRR (Linux `HAS_VRR`
+table is admitted until Lane 3. Lane 4 admitted the display model:
+SKL CDCLK via LCPLL (`intel_gpu_gen9_cdclk.rs`, VCO-aware ladders,
+Wa Display #1183), the SKL WRPLL + CFGCR1/2
+(`intel_gpu_gen9_dpll.rs`), the Gen9 watermarks
+(`intel_gpu_gen9_wm.rs`: 8 levels, 892-block single-slice DBUF, no
+transition watermarks) and the `DDI_BUF_TRANS` swing tables
+(`intel_gpu_gen9_ddi.rs`, 106 entries) + the SPT GMBUS pin table
+(`intel_gpu_gmbus.rs`: SPT pins 4/5/6 = DPC/DPB/DPD). Gen9 has no VRR (Linux `HAS_VRR`
 needs DISPLAY_VER >= 11). The §6 lift for Gen9 display is Lane 0's.
 
 Remainder (EHL/JSL 36-bit PPGTT): Linux `i915_pci.c` sets
@@ -1833,8 +1838,8 @@ section, it does not re-litigate scope.
   batch, `GEN9_MEDIA_ENGINES` (VCS0/VCS1/VECS0) + the
   small Gen9 forcewake domain table. Lane 4 display
   clocks + DPLL + watermarks: `intel_gpu_gen9_cdclk.rs`
-  (SKL CDCLK via LCPLL), the SKL WRPLL + CFGCR1/2,
-  `intel_gpu_gen9_wm.rs` (Gen9 DBUF geometry), and
+  (SKL CDCLK via LCPLL), the SKL WRPLL + CFGCR1/2
+  (`intel_gpu_gen9_dpll.rs`), `intel_gpu_gen9_wm.rs` (Gen9 DBUF geometry), and
   `intel_gpu_gen9_ddi.rs` (`DDI_BUF_TRANS` swing tables)
   + the SPT GMBUS pin table. Lane 5 modeset: the Gen9
   branches in `intel_gpu_modeset.rs` in Linux's SKL
@@ -1960,9 +1965,10 @@ section, it does not re-litigate scope.
   `OTHER_IMAGE_PAGES = 2` "shared by every Gen8+"
   claim is unverified for Gen9); the Gen9 GT1/GT2
   engine mask (Lane 3 reads the per-SKU `*_info` blocks);
-  the Gen9 watermark level count (Lane 4 reads
-  `skl_setup_wm_latency` in `display/skl_watermark.c` —
-  Gen11 is 8, Gen9 is not yet confirmed 8); the
+  the Gen9 watermark level count (Lane 4 read
+  `skl_setup_wm_latency` in `display/skl_watermark.c` — 8, the same
+  as Gen11: the 6-level arm needs `HAS_HW_SAGV_WM`, DISPLAY_VER >=
+  13, which Gen9 does not have); the
   display-9 `max_dc` / allowed-DC mask (Lane 6 reads
   `display/intel_display_power.c::get_allowed_dc_mask` —
   CLOSED by Lane 6: `max_dc` is 2, the allowed mask is
@@ -2806,8 +2812,9 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
   for modeset, Lane 5): MG PLL divisor search + TC-port
   programming and the TBT PLL fixed rows were delivered by
   Lane 8 (§12.3); the VBT AFC-startup `div0` (VBT fields not
-  parsed); the SKL WRPLL search + CFGCR1/2 (Gen9 lane —
-  `DPLL_CTRL1` on Gen9 is a different manager); ICL PHY
+  parsed); the SKL WRPLL search + CFGCR1/2 (delivered by Gen9 Lane 4:
+  `intel_gpu_gen9_dpll.rs`, with the DP `DPLL_CTRL1` state shared
+  from this module's SKL section); ICL PHY
   register programming of the selected DDI entries (Lane 5
   wiring); `display_supported()` stays unflipped for Gen11
   (Lane 5 flips it); the SAGV *control* pcode command and

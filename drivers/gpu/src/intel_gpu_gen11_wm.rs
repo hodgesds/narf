@@ -47,6 +47,12 @@
 //! - DBUF geometry is the same as Gen12: 2048 blocks total, slices
 //!   S1|S2, 512-byte blocks (`ICL_DISPLAY` in
 //!   `display/intel_display_device.c`).
+//! - **The Gen9 (DISPLAY_VER 9) variant lives in
+//!   [`crate::intel_gpu_gen9_wm`]** (Gen9 Lane 4): 8 levels, 892
+//!   blocks on one slice, method1 without the +1, the ver-9
+//!   `min(method1, method2)` rule, Wa #1126, level 0 without lines,
+//!   `min_ddb_alloc = blocks + 1`, and no transition watermarks
+//!   (`WaDisableTWM`).
 //!
 //! ## Algorithm (per plane, per level)
 //!

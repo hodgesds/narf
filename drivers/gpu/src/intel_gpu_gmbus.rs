@@ -221,6 +221,17 @@ pub const GMBUS0_BYTE_CNT_OVERRIDE: u32 = 1 << 6;
 /// 1/2/3 (`GMBUS_PIN_1_BXT`..`GMBUS_PIN_3_BXT`, "dpa"/"dpb"/"dpc" in
 /// `gmbus_pins_icp`) and Type-C TC1..TC6 = 9..14
 /// (`GMBUS_PIN_9_TC1_ICP`..`GMBUS_PIN_14_TC6_TGP`).
+///
+/// SPT numbering (Gen9, `gmbus_pins_spt`): the old
+/// `GMBUS_PIN_DPC` = 4 / `DPB` = 5 / `DPD` = 6. Rust forbids two
+/// variants sharing one discriminant (E0081), so there are no
+/// `Pin4SptDpc` / `Pin5SptDpb` aliases — the SPT meanings ride on
+/// the existing numbers: SPT pin 4 IS [`PinPair::Pin4Cnp`]'s number
+/// (wired "dpc" on SPT, "dpd" on CNP/DG1/DG2/MTP), SPT pin 5 IS
+/// [`PinPair::Pin5Mtp`]'s number ("dpb" on SPT, "dpe" on MTP), and
+/// SPT pin 6 is the new [`PinPair::Pin6SptDpd`]. The variant names
+/// are BXT/CNP-era labels; the discriminant is the ground truth,
+/// and [`GmbusPinTable::name`] disambiguates by table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PinPair {
@@ -232,10 +243,14 @@ pub enum PinPair {
     Pin2Bxt = 2,
     /// `GMBUS_PIN_3_BXT` ("dpc").
     Pin3Bxt = 3,
-    /// `GMBUS_PIN_4_CNP` ("dpd" on DG1/DG2/MTP).
+    /// `GMBUS_PIN_4_CNP` ("dpd" on DG1/DG2/MTP; "dpc" on SPT —
+    /// same number, different table).
     Pin4Cnp = 4,
-    /// `GMBUS_PIN_5_MTP` ("dpe" on MTP).
+    /// `GMBUS_PIN_5_MTP` ("dpe" on MTP; "dpb" on SPT — same
+    /// number, different table).
     Pin5Mtp = 5,
+    /// `GMBUS_PIN_DPD` = 6 on SPT ("dpd" in `gmbus_pins_spt`).
+    Pin6SptDpd = 6,
     /// `GMBUS_PIN_9_TC1_ICP` ("tc1").
     Pin9Tc1 = 9,
     /// `GMBUS_PIN_10_TC2_ICP` ("tc2").
@@ -286,17 +301,26 @@ pub enum GmbusPinTable {
     Dg2,
     /// `gmbus_pins_mtp` (PCH_MTL, PCH_LNL).
     Mtp,
-    /// `gmbus_pins_spt` (PCH_SPT — Skylake / Kaby Lake). The table
-    /// itself is not transcribed yet: SPT uses the old
-    /// `GMBUS_PIN_DPC` = 4 / `DPB` = 5 / `DPD` = 6 numbering
-    /// (`intel_gmbus.h`), which this module's `PinPair` (the
-    /// BXT/CNP-and-later numbering) cannot express, so no pin is
-    /// admitted on this table until Lane 4 transcribes it.
+    /// `gmbus_pins_spt` (PCH_SPT — Skylake / Kaby Lake), now
+    /// transcribed: exactly three pins, the old numbering
+    /// `GMBUS_PIN_DPC` = 4 ("dpc"), `DPB` = 5 ("dpb"),
+    /// `DPD` = 6 ("dpd"). `PinPair` expresses them as
+    /// `Pin4Cnp` (4), `Pin5Mtp` (5) and `Pin6SptDpd` (6) —
+    /// Rust forbids duplicate discriminants (E0081), so the
+    /// SPT meanings ride on those numbers and
+    /// [`GmbusPinTable::name`] disambiguates by table.
     /// Coffee Lake / Whiskey Lake / Comet Lake ride PCH_CNP
-    /// (`gmbus_pins_cnp`, expressible in the new numbering) — the
-    /// per-PCH split is Lane 4's too, since the driver does not
-    /// model PCH yet.
+    /// ([`GmbusPinTable::Cnp`]) — the per-PCH split is a
+    /// named remainder, since the driver does not model PCH
+    /// yet (see `for_generation`).
     Spt,
+    /// `gmbus_pins_cnp` (PCH_CNP — Coffee Lake / Whiskey Lake
+    /// / Comet Lake): pins 1-4, "dpb" / "dpc" / "misc" /
+    /// "dpd". The driver does not model PCH yet, so
+    /// `for_generation` still returns `Spt` for all of Gen9;
+    /// callers that know the PCH pass this table to
+    /// [`gen9_ddc_pin`] directly.
+    Cnp,
 }
 
 impl GmbusPinTable {
@@ -331,8 +355,20 @@ impl GmbusPinTable {
     /// `gmbus_pins_*[pin].name`, or `None` when the table has no such
     /// pin (`intel_gmbus_is_valid_pin` false).
     pub const fn name(self, pin: PinPair) -> Option<&'static str> {
-        use GmbusPinTable::{Dg1, Dg2, Icp, Mtp};
+        use GmbusPinTable::{Cnp, Dg1, Dg2, Icp, Mtp, Spt};
         Some(match (self, pin) {
+            // SPT has no pins 1-3 — the wildcard arms below
+            // would wrongly admit them.
+            (Spt, PinPair::Pin1Bxt | PinPair::Pin2Bxt | PinPair::Pin3Bxt) => return None,
+            // CNP renames pins 1-3: "dpb" / "dpc" / "misc".
+            (Cnp, PinPair::Pin1Bxt) => "dpb",
+            (Cnp, PinPair::Pin2Bxt) => "dpc",
+            (Cnp, PinPair::Pin3Bxt) => "misc",
+            (Cnp, PinPair::Pin4Cnp) => "dpd",
+            // SPT old numbering: 4 "dpc", 5 "dpb", 6 "dpd".
+            (Spt, PinPair::Pin4Cnp) => "dpc",
+            (Spt, PinPair::Pin5Mtp) => "dpb",
+            (Spt, PinPair::Pin6SptDpd) => "dpd",
             (_, PinPair::Pin1Bxt) => "dpa",
             (_, PinPair::Pin2Bxt) => "dpb",
             (_, PinPair::Pin3Bxt) => "dpc",
@@ -380,6 +416,37 @@ pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
         (_, Ddi::H) => None,
         (Gen12Platform::TigerLake, Ddi::I) => Some(PinPair::Pin14Tc6),
         (_, Ddi::I) => None,
+    }
+}
+
+/// The default DDC pin of a Gen9 DDI, with no VBT pin:
+/// `g4x_encoder_to_ddc_pin` (SPT) / `cnp_encoder_to_ddc_pin`
+/// (CNP) in `intel_hdmi.c`.
+///
+/// - SPT: B → DPB (5), C → DPC (4), D → DPD (6), A → DPB (5)
+///   (the source's `MISSING_CASE` fallback).
+/// - CNP: B → 1, C → 2, D → 4, A → 1 (fallback).
+///
+/// A DDI the PCH does not map (E and above) has no pin.
+/// Every result is valid in the table it was selected from.
+/// The TGP PCH Gen9 BC mapping (`gen9bc_tgp_encoder_to_ddc_pin`,
+/// TC pins 9+ by PHY) is out of scope: it needs PCH modeling
+/// plus the PHY mapping, neither of which this driver has yet.
+pub const fn gen9_ddc_pin(table: GmbusPinTable, ddi: Ddi) -> Option<PinPair> {
+    match table {
+        GmbusPinTable::Spt => match ddi {
+            Ddi::A | Ddi::B => Some(PinPair::Pin5Mtp),
+            Ddi::C => Some(PinPair::Pin4Cnp),
+            Ddi::D => Some(PinPair::Pin6SptDpd),
+            _ => None,
+        },
+        GmbusPinTable::Cnp => match ddi {
+            Ddi::A | Ddi::B => Some(PinPair::Pin1Bxt),
+            Ddi::C => Some(PinPair::Pin2Bxt),
+            Ddi::D => Some(PinPair::Pin4Cnp),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -608,8 +675,8 @@ impl GmbusStatus {
 
 impl TryFrom<u32> for PinPair {
     type Error = GmbusError;
-    /// Decode a pin number (exactly a `GMBUS_PIN_*` value; 6..8 and
-    /// 15+ name no pin in the BXT+ numbering).
+    /// Decode a pin number (exactly a `GMBUS_PIN_*` value; 7..8 and
+    /// 15+ name no pin in the BXT+ numbering; 6 is the SPT DPD pin).
     fn try_from(v: u32) -> Result<Self, Self::Error> {
         Ok(match v {
             0 => PinPair::Disabled,
@@ -618,6 +685,7 @@ impl TryFrom<u32> for PinPair {
             3 => PinPair::Pin3Bxt,
             4 => PinPair::Pin4Cnp,
             5 => PinPair::Pin5Mtp,
+            6 => PinPair::Pin6SptDpd,
             9 => PinPair::Pin9Tc1,
             10 => PinPair::Pin10Tc2,
             11 => PinPair::Pin11Tc3,
@@ -2274,9 +2342,9 @@ pub mod tests {
     );
 
     fn smoke_gmbus_pin_tables_match_linux() -> TestResult {
-        // intel_gmbus.c b90c984d gmbus_pins_icp/dg1/dg2/mtp.
-        let all = [0u32, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14];
-        let tables: [(GmbusPinTable, &[(u32, &str)]); 4] = [
+        // intel_gmbus.c b90c984d gmbus_pins_icp/dg1/dg2/mtp/spt/cnp.
+        let all = [0u32, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
+        let tables: [(GmbusPinTable, &[(u32, &str)]); 6] = [
             (
                 GmbusPinTable::Icp,
                 &[
@@ -2313,6 +2381,11 @@ pub mod tests {
                     (12, "tc4"),
                 ],
             ),
+            (GmbusPinTable::Spt, &[(4, "dpc"), (5, "dpb"), (6, "dpd")]),
+            (
+                GmbusPinTable::Cnp,
+                &[(1, "dpb"), (2, "dpc"), (3, "misc"), (4, "dpd")],
+            ),
         ];
         for (table, named) in tables {
             for v in all {
@@ -2337,15 +2410,46 @@ pub mod tests {
         {
             return TestResult::Fail("table selection must follow get_gmbus_pin");
         }
-        // The SPT table is not transcribed yet (old pin numbering),
-        // so no pin is valid on it — fail-closed until Lane 4.
-        for v in all {
-            let pin = match PinPair::try_from(v) {
-                Ok(pin) if pin.encode() == v => pin,
-                _ => return TestResult::Fail("GMBUS_PIN_* values must round-trip"),
-            };
-            if GmbusPinTable::Spt.is_valid(pin) {
-                return TestResult::Fail("untranscribed SPT table must admit no pin");
+        // The SPT table is transcribed now (old pin numbering):
+        // pins 4/5/6 are valid, pins 1-3 and 9-14 are not.
+        // The CNP table admits pins 1-4 only.
+        if !GmbusPinTable::Spt.is_valid(PinPair::Pin4Cnp)
+            || !GmbusPinTable::Spt.is_valid(PinPair::Pin5Mtp)
+            || !GmbusPinTable::Spt.is_valid(PinPair::Pin6SptDpd)
+            || GmbusPinTable::Spt.is_valid(PinPair::Pin1Bxt)
+            || GmbusPinTable::Spt.is_valid(PinPair::Pin9Tc1)
+            || !GmbusPinTable::Cnp.is_valid(PinPair::Pin1Bxt)
+            || !GmbusPinTable::Cnp.is_valid(PinPair::Pin4Cnp)
+            || GmbusPinTable::Cnp.is_valid(PinPair::Pin5Mtp)
+            || GmbusPinTable::Cnp.is_valid(PinPair::Pin9Tc1)
+        {
+            return TestResult::Fail("SPT/CNP table validity wrong");
+        }
+        // Gen9 DDC pins: SPT B→5, C→4, D→6, A→5 (fallback);
+        // CNP B→1, C→2, D→4, A→1 (fallback); E and above: none.
+        if gen9_ddc_pin(GmbusPinTable::Spt, Ddi::A) != Some(PinPair::Pin5Mtp)
+            || gen9_ddc_pin(GmbusPinTable::Spt, Ddi::B) != Some(PinPair::Pin5Mtp)
+            || gen9_ddc_pin(GmbusPinTable::Spt, Ddi::C) != Some(PinPair::Pin4Cnp)
+            || gen9_ddc_pin(GmbusPinTable::Spt, Ddi::D) != Some(PinPair::Pin6SptDpd)
+            || gen9_ddc_pin(GmbusPinTable::Spt, Ddi::E).is_some()
+            || gen9_ddc_pin(GmbusPinTable::Cnp, Ddi::A) != Some(PinPair::Pin1Bxt)
+            || gen9_ddc_pin(GmbusPinTable::Cnp, Ddi::B) != Some(PinPair::Pin1Bxt)
+            || gen9_ddc_pin(GmbusPinTable::Cnp, Ddi::C) != Some(PinPair::Pin2Bxt)
+            || gen9_ddc_pin(GmbusPinTable::Cnp, Ddi::D) != Some(PinPair::Pin4Cnp)
+            || gen9_ddc_pin(GmbusPinTable::Cnp, Ddi::E).is_some()
+            || gen9_ddc_pin(GmbusPinTable::Icp, Ddi::B).is_some()
+        {
+            return TestResult::Fail("Gen9 DDC pin mapping wrong");
+        }
+        // Every Gen9 DDC pin is valid in its own table.
+        for table in [GmbusPinTable::Spt, GmbusPinTable::Cnp] {
+            for ddi in [Ddi::A, Ddi::B, Ddi::C, Ddi::D] {
+                let Some(pin) = gen9_ddc_pin(table, ddi) else {
+                    return TestResult::Fail("Gen9 DDC pin must exist");
+                };
+                if !table.is_valid(pin) {
+                    return TestResult::Fail("Gen9 DDC pin must be valid in its table");
+                }
             }
         }
         if PinPair::type_c(0) != Some(PinPair::Pin9Tc1)
