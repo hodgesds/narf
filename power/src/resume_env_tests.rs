@@ -91,9 +91,14 @@ fn hkdf32(ikm: &[u8], info: &[u8]) -> [u8; 32] {
 
 /// Fixture custody anchor: published secret, honest presence gate
 /// (the P1 fixture, copied). Atomics keep it `Send + Sync` as the
-/// production trait bound requires.
+/// production trait bound requires. `kind` is `Test` by default;
+/// composition fixtures build token/TPM/passphrase-kind anchors
+/// with [`TestAnchor::with_kind`] — the wrap construction is
+/// kind-independent (params bind the anchor id), so a kind is
+/// only a slot label, exactly as the custody seam treats it.
 #[derive(Debug)]
 struct TestAnchor {
+    kind: AnchorKind,
     id: &'static str,
     secret: [u8; 32],
     presence: AtomicBool,
@@ -103,10 +108,18 @@ struct TestAnchor {
 impl TestAnchor {
     fn new(id: &'static str) -> Self {
         Self {
+            kind: AnchorKind::Test,
             id,
             secret: hkdf32(b"narf-suspend/test-anchor-secret", id.as_bytes()),
             presence: AtomicBool::new(false),
             wraps: AtomicU64::new(0),
+        }
+    }
+
+    fn with_kind(kind: AnchorKind, id: &'static str) -> Self {
+        Self {
+            kind,
+            ..Self::new(id)
         }
     }
 
@@ -125,7 +138,7 @@ impl TestAnchor {
 
 impl KeyCustodyAnchor for TestAnchor {
     fn kind(&self) -> AnchorKind {
-        AnchorKind::Test
+        self.kind
     }
 
     fn wrap(&self, ctx: &WrapCtx, secret: &Secret32) -> Result<WrappedSlot, AnchorError> {
@@ -412,6 +425,56 @@ fn sealed_token_image(image_len: usize) -> (MemImageStore, TestAnchor, Vec<u8>) 
     svc.seal_image(&mut store, token_policy(), &image)
         .expect("seal");
     (store, anchor, image)
+}
+
+fn token_tpm_policy() -> RecordedPolicy {
+    RecordedPolicy {
+        level: PolicyLevel::TokenTpm,
+        policy_epoch: 7,
+    }
+}
+
+/// Seal a TokenTpm image under the §8.5 composition: the SMS is
+/// XOR-split across a token-kind anchor and a TPM-kind anchor
+/// via the service's own `enroll_composition`, so the sealed
+/// slots are one share per group. Returns the store, the two
+/// anchors (presence NOT granted), and the plaintext.
+fn sealed_composition_image(image_len: usize) -> (MemImageStore, TestAnchor, TestAnchor, Vec<u8>) {
+    let mut svc = SuspendService::new(ScriptedEntropy::new(true));
+    svc.create_epoch().expect("epoch");
+    let token = TestAnchor::with_kind(AnchorKind::Token, "token");
+    let tpm = TestAnchor::with_kind(AnchorKind::Tpm, "tpm");
+    svc.enroll_composition(&[&token], &[&tpm])
+        .expect("enroll composition");
+    let image = pattern_image(image_len);
+    let mut store = MemImageStore::new(STORE_LEN);
+    svc.seal_image(&mut store, token_tpm_policy(), &image)
+        .expect("seal");
+    (store, token, tpm, image)
+}
+
+/// As [`sealed_composition_image`], with an enrolled passphrase
+/// recovery slot alongside the composition (the §10.3 shape:
+/// the recovery slot wraps the whole SMS, not a share).
+/// Returns the store, the token anchor, the TPM anchor, the
+/// recovery anchor (presence NOT granted on any of them), and
+/// the plaintext.
+fn sealed_composition_image_with_recovery(
+    image_len: usize,
+) -> (MemImageStore, TestAnchor, TestAnchor, TestAnchor, Vec<u8>) {
+    let mut svc = SuspendService::new(ScriptedEntropy::new(true));
+    svc.create_epoch().expect("epoch");
+    let token = TestAnchor::with_kind(AnchorKind::Token, "token");
+    let tpm = TestAnchor::with_kind(AnchorKind::Tpm, "tpm");
+    let recovery = TestAnchor::with_kind(AnchorKind::Passphrase, "recovery");
+    svc.enroll_composition(&[&token], &[&tpm])
+        .expect("enroll composition");
+    svc.enroll(&recovery).expect("enroll recovery");
+    let image = pattern_image(image_len);
+    let mut store = MemImageStore::new(STORE_LEN);
+    svc.seal_image(&mut store, token_tpm_policy(), &image)
+        .expect("seal");
+    (store, token, tpm, recovery, image)
 }
 
 // ── Fixture virtio-blk device model ──────────────────────────────────
@@ -1143,6 +1206,176 @@ fn smoke_power_resume_env_factor_classes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power", smoke_power_resume_env_factor_classes);
+
+// ── TokenTpm composition through `attempt_resume` (SEC-D1, #1297) ────
+//
+// The composition fixtures seal through the service's own
+// `enroll_composition`, so the shares in the image are the ones
+// `wrap_split` produced — the test would fail if the resume
+// side recombined them any other way.
+
+fn smoke_power_resume_env_tokentpm_composition_round_trip() -> TestResult {
+    // Both factors present: the two shares XOR back to the SMS
+    // and the image verifies, with the authenticated policy
+    // reading token+tpm and the plaintext round-tripping.
+    let (store, token, tpm, image) = sealed_composition_image(2048);
+    token.grant_presence();
+    tpm.grant_presence();
+    let mut prompt = RecordingPrompt::default();
+    let verified = match attempt_resume(&store, &[&token, &tpm], &mut prompt) {
+        Ok(v) => v,
+        Err(_) => {
+            return TestResult::Fail("TokenTpm resume refused a valid composition image");
+        }
+    };
+    if verified.policy().level != PolicyLevel::TokenTpm {
+        return TestResult::Fail("authenticated policy is not the sealed token+tpm policy");
+    }
+    match verified.read_all(&store) {
+        Ok(bytes) if bytes == image => {}
+        _ => return TestResult::Fail("composition image content does not round-trip"),
+    }
+    // Prompt discipline, as for the token round-trip: an attempt
+    // line naming token+tpm, then — only after verification —
+    // the verified line, in that order.
+    let attempt_at = prompt
+        .lines
+        .iter()
+        .position(|l| l.contains("attempting resume"));
+    let verified_at = prompt
+        .lines
+        .iter()
+        .position(|l| l.contains("image verified"));
+    match (attempt_at, verified_at) {
+        (Some(a), Some(v)) if a < v => {}
+        _ => return TestResult::Fail("prompt lines missing or out of order"),
+    }
+    if !prompt.lines[attempt_at.unwrap()].contains("token+tpm") {
+        return TestResult::Fail("the attempt line does not name the token+tpm policy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power",
+    smoke_power_resume_env_tokentpm_composition_round_trip
+);
+
+fn smoke_power_resume_env_tokentpm_missing_share_refuses() -> TestResult {
+    let (store, token, _tpm, _image) = sealed_composition_image(1024);
+    // No anchors at all: FactorUnavailable, not a silent trip
+    // down any weaker path.
+    let mut prompt = RecordingPrompt::default();
+    match attempt_resume(&store, &[], &mut prompt) {
+        Err(ResumeRefusal::FactorUnavailable) => {}
+        _ => {
+            return TestResult::Fail("composition image without anchors was not FactorUnavailable");
+        }
+    }
+    // One share alone must never open the image. Before the fix
+    // this case fed the lone share to the open as if it were
+    // the SMS and died as AuthenticationFailed; now the
+    // composition refuses before any share reaches the open,
+    // as FactorUnavailable — the TPM leg has no pairing at all.
+    token.grant_presence();
+    let mut prompt = RecordingPrompt::default();
+    match attempt_resume(&store, &[&token], &mut prompt) {
+        Err(ResumeRefusal::FactorUnavailable) => {}
+        _ => {
+            return TestResult::Fail("a lone token share did not refuse as FactorUnavailable");
+        }
+    }
+    if prompt.said_verified() {
+        return TestResult::Fail("a lone-share resume produced a verified line");
+    }
+    // Both factors presented, TPM presence withheld: the token
+    // share unwraps, the TPM leg refuses — FactorRefused, and
+    // no verified line.
+    let mut prompt = RecordingPrompt::default();
+    let (store, token, tpm, _image) = sealed_composition_image(1024);
+    token.grant_presence();
+    match attempt_resume(&store, &[&token, &tpm], &mut prompt) {
+        Err(ResumeRefusal::FactorRefused) => {}
+        _ => {
+            return TestResult::Fail("a refused TPM leg was not FactorRefused");
+        }
+    }
+    if prompt.said_verified() {
+        return TestResult::Fail("a refused composition produced a verified line");
+    }
+    // Mirror image: token presence withheld, TPM granted.
+    let (store, token, tpm, _image) = sealed_composition_image(1024);
+    tpm.grant_presence();
+    let mut prompt = RecordingPrompt::default();
+    match attempt_resume(&store, &[&token, &tpm], &mut prompt) {
+        Err(ResumeRefusal::FactorRefused) => {}
+        _ => {
+            return TestResult::Fail("a refused token leg was not FactorRefused");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power",
+    smoke_power_resume_env_tokentpm_missing_share_refuses
+);
+
+fn smoke_power_resume_env_tokentpm_recovery_opens() -> TestResult {
+    // The recovery slot opens the image on its own when the
+    // composition cannot complete (§10.3) — and only because
+    // it was enrolled and recorded at seal time.
+    let (store, _token, _tpm, recovery, image) = sealed_composition_image_with_recovery(2048);
+    recovery.grant_presence();
+    let mut prompt = RecordingPrompt::default();
+    let verified = match attempt_resume(&store, &[&recovery], &mut prompt) {
+        Ok(v) => v,
+        Err(_) => {
+            return TestResult::Fail("recovery anchor alone did not open a composition image");
+        }
+    };
+    if verified.policy().level != PolicyLevel::TokenTpm {
+        return TestResult::Fail("recovery-opened policy is not the sealed token+tpm policy");
+    }
+    match verified.read_all(&store) {
+        Ok(bytes) if bytes == image => {}
+        _ => return TestResult::Fail("recovery-opened image content does not round-trip"),
+    }
+    // Composition fails (TPM presence withheld) but the
+    // enrolled recovery anchor is present: the image still
+    // opens, via the recovery path.
+    let (store, token, tpm, recovery, image) = sealed_composition_image_with_recovery(2048);
+    token.grant_presence();
+    recovery.grant_presence();
+    let mut prompt = RecordingPrompt::default();
+    match attempt_resume(&store, &[&token, &tpm, &recovery], &mut prompt) {
+        Ok(v) => match v.read_all(&store) {
+            Ok(bytes) if bytes == image => {}
+            _ => {
+                return TestResult::Fail("recovery after a failed composition did not round-trip");
+            }
+        },
+        Err(_) => {
+            return TestResult::Fail(
+                "recovery did not open a composition image whose TPM leg refused",
+            );
+        }
+    }
+    // And the negative control: composition incomplete and the
+    // recovery anchor's presence withheld — every presented
+    // factor refused, so FactorRefused, never an open.
+    let (store, token, tpm, recovery, _image) = sealed_composition_image_with_recovery(1024);
+    token.grant_presence();
+    let mut prompt = RecordingPrompt::default();
+    match attempt_resume(&store, &[&token, &tpm, &recovery], &mut prompt) {
+        Err(ResumeRefusal::FactorRefused) => {}
+        _ => {
+            return TestResult::Fail(
+                "a refused composition with a refused recovery was not FactorRefused",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power", smoke_power_resume_env_tokentpm_recovery_opens);
 
 // ── The handoff gate + hook region (design §11 acceptance shape) ─────
 //

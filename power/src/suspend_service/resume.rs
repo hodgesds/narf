@@ -18,9 +18,14 @@
 //!    [`KeyCustodyAnchor`] seam: an OFF image opens under its
 //!    published derivation; a wrapped image opens only when an
 //!    anchor whose kind matches an enrolled slot unwraps the
-//!    slot secret. There is no fallback between paths — a
-//!    wrapped image with no matching anchor is
-//!    [`ResumeRefusal::FactorUnavailable`], never a quieter
+//!    slot secret. A TokenTpm image is the composition case
+//!    (design §8.5): one share is recovered from each factor
+//!    group and the two are XOR-recombined into the SMS —
+//!    either share alone is not the SMS and never reaches the
+//!    open — with an enrolled passphrase recovery slot as the
+//!    only alternate path (design §10.3). There is no fallback
+//!    between paths — a wrapped image with no matching anchor
+//!    is [`ResumeRefusal::FactorUnavailable`], never a quieter
 //!    policy (design §10.3).
 //! 4. Verify the whole image ([`OpenedImage::verify_all`]): the
 //!    manifest root must match the sealed header, and every
@@ -51,8 +56,9 @@ use alloc::format;
 use alloc::vec::Vec;
 use zeroize::Zeroizing;
 
-use super::anchor::{KeyCustodyAnchor, UnwrapCtx};
-use super::format::{ImageStore, PolicyLevel};
+use super::anchor::{AnchorKind, KeyCustodyAnchor, UnwrapCtx};
+use super::custody::Secret32;
+use super::format::{ImageClaims, ImageStore, PolicyLevel};
 use super::image::{open_with_sms, parse_claims, TrustedImage};
 use super::{off_policy_sms, ServiceError};
 
@@ -199,6 +205,40 @@ impl VerifiedResume {
     }
 }
 
+/// First successful unwrap of one factor kind: whether any
+/// (anchor, slot) pairing of `kind` existed, and the first
+/// share that unwrapped, if any. Refused, unavailable, or
+/// failed pairings are all "this factor did not open this
+/// slot" — the next pairing is tried, remembering only that a
+/// pairing was attempted. This is the per-kind half of the
+/// step-3 loop below, factored out so the composition arm can
+/// recover one share per group.
+fn unwrap_first_of_kind(
+    anchors: &[&dyn KeyCustodyAnchor],
+    claims: &ImageClaims,
+    kind: AnchorKind,
+) -> (bool, Option<Secret32>) {
+    let mut matched = false;
+    for anchor in anchors {
+        if anchor.kind() != kind {
+            continue;
+        }
+        for record in &claims.slots {
+            if record.kind != kind {
+                continue;
+            }
+            matched = true;
+            let ctx = UnwrapCtx {
+                sms_epoch: claims.sms_epoch,
+            };
+            if let Ok(share) = anchor.unwrap(&ctx, &record.wrapped()) {
+                return (true, Some(share));
+            }
+        }
+    }
+    (matched, None)
+}
+
 /// Drive one resume attempt over `store`, per the trust order in
 /// the module docs. `anchors` are the custody anchors available
 /// in the early environment (a token anchor, a TPM anchor, a
@@ -239,6 +279,72 @@ pub fn attempt_resume(
             match open_with_sms(store, claims, &off_policy_sms()) {
                 Ok(opened) => opened,
                 Err(e) => return refuse(prompt, ResumeRefusal::from_open(e)),
+            }
+        }
+        PolicyLevel::TokenTpm => {
+            // Composition (design §8.5, the mirror of
+            // `open_with_policy`'s Composition plan): recover
+            // one share from each factor group and XOR them
+            // into the SMS, with the exact share/XOR shape
+            // `wrap_split` sealed under. A single share is
+            // never the SMS — the old first-unwrap-wins loop
+            // fed it to `open_with_sms` and always died on
+            // the header seal — so no share reaches the open
+            // here until both legs have yielded one.
+            let (token_matched, token_share) =
+                unwrap_first_of_kind(anchors, &claims, AnchorKind::Token);
+            let (tpm_matched, tpm_share) = unwrap_first_of_kind(anchors, &claims, AnchorKind::Tpm);
+            let composed = match (token_share, tpm_share) {
+                (Some(a), Some(b)) => Some(a.with_bytes(|x| {
+                    b.with_bytes(|y| {
+                        let mut out = [0u8; 32];
+                        for i in 0..32 {
+                            out[i] = x[i] ^ y[i];
+                        }
+                        Secret32::mint(out)
+                    })
+                })),
+                _ => None,
+            };
+            match composed {
+                Some(sms) => match open_with_sms(store, claims, &sms) {
+                    Ok(opened) => opened,
+                    Err(e) => return refuse(prompt, ResumeRefusal::from_open(e)),
+                },
+                None => {
+                    // Recovery (design §10.3): an enrolled
+                    // passphrase slot opens the image on its
+                    // own — the only alternate path, tried
+                    // after the composition fails, exactly as
+                    // `open_with_policy` tries it. A missing
+                    // passphrase slot is a no-op here: no
+                    // pairing of that kind exists, so no
+                    // unwrap is attempted.
+                    let (_, recovery) =
+                        unwrap_first_of_kind(anchors, &claims, AnchorKind::Passphrase);
+                    match recovery {
+                        Some(sms) => match open_with_sms(store, claims, &sms) {
+                            Ok(opened) => opened,
+                            Err(e) => return refuse(prompt, ResumeRefusal::from_open(e)),
+                        },
+                        None => {
+                            // Refusal class, per leg: a required kind
+                            // with no (anchor, slot) pairing at all —
+                            // no anchor of the kind presented, or no
+                            // slot of the kind enrolled — is
+                            // FactorUnavailable; presented factors
+                            // that all refused are FactorRefused.
+                            // (A malformed slot set refuses here as
+                            // FactorUnavailable, never opens: the
+                            // composition is the only path to the SMS,
+                            // and it cannot complete.)
+                            if !token_matched || !tpm_matched {
+                                return refuse(prompt, ResumeRefusal::FactorUnavailable);
+                            }
+                            return refuse(prompt, ResumeRefusal::FactorRefused);
+                        }
+                    }
+                }
             }
         }
         _ => {
