@@ -167,10 +167,7 @@ pub fn parse_header(blob: &[u8]) -> Option<Header> {
 /// A block that starts before the map and extends past its start
 /// overlaps the map and is likewise malformed.
 pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> Option<usize> {
-    let hdr = match parse_header(blob) {
-        Some(h) => h,
-        None => return None,
-    };
+    let hdr = parse_header(blob)?;
     let reserve_start = hdr.off_mem_rsvmap as usize;
     let mut limit = hdr.totalsize as usize;
     for (start, end) in [
@@ -198,14 +195,8 @@ pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> Option<usize> 
         if cur + 16 > limit {
             return None;
         }
-        let addr = match be_u64(blob, cur) {
-            Some(v) => v,
-            None => return None,
-        };
-        let size = match be_u64(blob, cur + 8) {
-            Some(v) => v,
-            None => return None,
-        };
+        let addr = be_u64(blob, cur)?;
+        let size = be_u64(blob, cur + 8)?;
         if addr == 0 && size == 0 {
             break;
         }
