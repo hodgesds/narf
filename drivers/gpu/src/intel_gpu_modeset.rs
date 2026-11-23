@@ -983,8 +983,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // (24 bpp, uncompressed). LINK_N is written
         // last — it triggers the hardware update of all four.
         // Pre-training this carries the planned (or legacy
-        // derived) link configuration; the plan path reprograms
-        // it with the trained values after training (step 9b).
+        // derived) link configuration; step 9b reprograms it
+        // with the trained values after training, on every
+        // path.
         // An MST stream's M/N is per-stream: every stream
         // programs its own transcoder's values from its mode
         // against the one trained link.
@@ -1045,8 +1046,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // rate (`ComboPhy::training_update`, pattern 1 after a
         // dirty Configure), so the settled rate's link clock is
         // already programmed when training completes; the
-        // plan-path re-program below then rewrites the same
-        // rate, kept as a safety net.
+        // re-program below then rewrites the same rate on the
+        // plan path, kept as a safety net — and on the legacy
+        // path it is the only re-program: step 7b programmed
+        // M/N for the pixel-clock floor rate, so without it M/N
+        // would keep the start-rate values after a fallback
+        // (#2358).
         //
         // An MST secondary stream skips the whole step: the
         // link is already trained and the PHY already programmed
@@ -1761,14 +1766,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         match result {
             Ok(trained) => {
                 let pll = to_pll_rate(trained.rate);
-                // Dekel and negotiated modesets need the achieved width
-                // and payload. Legacy combo callers only use the PLL rate.
-                let out = if plan.is_some() || self.is_tc_port() {
-                    Some(trained)
-                } else {
-                    None
-                };
-                Ok((pll, out))
+                // Every path needs the achieved link: the plan
+                // and Type-C paths already did (negotiated width
+                // and SST payload capacity), and the legacy path
+                // needs it so step 9b can reprogram M/N for the
+                // settled link after a fallback (#2358). The
+                // legacy callers that only use the PLL rate
+                // (`modeset`, `modeset_fixed`) discard the link.
+                Ok((pll, Some(trained)))
             }
             Err(LinkError::CrFailed(_)) => Err(ModesetError::LinkTrainingCr),
             Err(LinkError::EqFailed(_)) => Err(ModesetError::LinkTrainingEq),
