@@ -792,7 +792,11 @@ pub mod tests {
         let io = MgModel::new();
         let port = MgPort::new(Ddi::C, Gen11Platform::IceLake).unwrap();
         // HBR2 levels (1, 2) → index 6 → {0x33, 0x00, 0x0C}.
-        // Preset the registers to all-ones to prove the masks.
+        // Preset the registers with every mask-relevant bit
+        // set to prove the masks — but not all-ones: an
+        // all-ones read is the device-gone sentinel
+        // (`MgPort::read` returns `PhyBusFailure` on
+        // `u32::MAX`), and bit 31 is in no mask below.
         for off in [
             mg_tx1_swingctrl(0, 0),
             mg_tx1_drvctrl(0, 0),
@@ -800,7 +804,7 @@ pub mod tests {
             mg_clkhub(0, 0),
             mg_tx1_dcc(0, 0),
         ] {
-            io.regs.borrow_mut().insert(off, u32::MAX);
+            io.regs.borrow_mut().insert(off, u32::MAX & !(1 << 31));
         }
         if port
             .signal_levels(&io, 540_000, &[(1, 2); 4], false)
@@ -921,8 +925,10 @@ pub mod tests {
             },
         );
         // Levels (1, 0) → index 4 → HBR2 entry {0x26, 0x00, 0x00}:
-        // DRVCTRL = 0x26 << 24 | override enable.
-        if aux.dpcd_write(0x103, &[0x09, 0]).is_err()
+        // DRVCTRL = 0x26 << 24 | override enable. The lane-set
+        // byte is swing in bits[1:0], pre-emphasis in bits[4:3],
+        // so (1, 0) is 0x01 — not 0x09, which is (1, 1).
+        if aux.dpcd_write(0x103, &[0x01, 0]).is_err()
             || io.read32(mg_tx1_drvctrl(0, 0)) != (0x26 << 24) | MG_TXDEEMPH_OVERRIDE_EN
         {
             return TestResult::Fail("source drive must follow sink's per-lane request");
