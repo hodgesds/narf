@@ -1543,8 +1543,7 @@ impl EpollInstance {
         // If an always-polled candidate filled the userspace batch first, put
         // any ready nodes detached behind it back at the tail. They were never
         // polled, so their occurrence is still pending.
-        let mut unprocessed: SmallBuf<Arc<EpollRegistration>, COLLECT_STACK_CAP> =
-            SmallBuf::new();
+        let mut unprocessed: SmallBuf<Arc<EpollRegistration>, COLLECT_STACK_CAP> = SmallBuf::new();
         for (_, item, dequeued) in snapshot.iter().skip(processed) {
             if *dequeued {
                 unprocessed.push(Arc::clone(&item.registration));
@@ -1557,7 +1556,8 @@ impl EpollInstance {
         let ready_remains = if needs_ready_write {
             let mut ready = self.ready.lock();
             for (registration, sub_id, dequeued, keep_ready, disarm_cold_indexes) in
-                ready_updates.iter() {
+                ready_updates.iter()
+            {
                 if *disarm_cold_indexes {
                     ready.remove_always_poll_version(registration, *sub_id);
                     ready.remove_deadline_poll_version(registration, *sub_id);
@@ -2808,10 +2808,8 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             // every park — the persisted finite deadline,
                             // or unbounded — as the handler top did for
                             // the first one.
-                            uc.sleep_deadline_ns.store(
-                                deadline_ns.unwrap_or(u64::MAX),
-                                Ordering::Release,
-                            );
+                            uc.sleep_deadline_ns
+                                .store(deadline_ns.unwrap_or(u64::MAX), Ordering::Release);
                             // Clamp the scheduler wake-up to the nearest armed
                             // timerfd in the interest set. A timerfd expiry does
                             // NOT fire a readiness notify (unlike socket data), so
