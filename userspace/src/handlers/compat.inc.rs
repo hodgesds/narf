@@ -11639,15 +11639,24 @@ impl core::ops::DerefMut for FutexWaitQueue {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.entries }
 }
 
+/// Benchmark variant B3 (plain spinlock bucket): the futex wait buckets
+/// use a plain `SpinLock`, not the IRQ-masking `IrqSafeSpinLock` — the
+/// Linux shape (`hb->lock` is a plain `spin_lock`). The IRQ-disable on
+/// every bucket acquire is pure cost here: no IRQ handler ever takes a
+/// futex bucket lock. Census at this tip: every acquirer runs in task or
+/// syscall context — the futex syscall handlers, the park-loop
+/// register/drop, the task-exit sweep, and requeue. An IRQ-context
+/// acquirer must never be added without restoring the IRQ-safe lock;
+/// each call site passes the `IrqsEnabled` witness to document that.
 #[repr(align(64))]
 struct FutexWaitBucket {
-    values: narf_lib::sync::IrqSafeSpinLock<FutexWaitQueue>,
+    values: narf_lib::sync::SpinLock<FutexWaitQueue>,
 }
 
 impl FutexWaitBucket {
     const fn new() -> Self {
         Self {
-            values: narf_lib::sync::IrqSafeSpinLock::new(FutexWaitQueue::new()),
+            values: narf_lib::sync::SpinLock::new(FutexWaitQueue::new()),
         }
     }
 }
@@ -11662,7 +11671,7 @@ pub(crate) fn publish_futex_wake_policy(
     policy: Option<alloc::sync::Arc<dyn crate::futex_policy::FutexWakePolicy>>,
 ) {
     for bucket in &FUTEX_WAITERS {
-        bucket.values.lock().policy = policy.clone();
+        bucket.values.lock(narf_lib::sync::IrqsEnabled).policy = policy.clone();
     }
 }
 
@@ -11773,7 +11782,7 @@ fn futex_drop_task_waiters(task_id: u64) {
     // them to, so sweep them all.
     if matches!(key, Some((_, true))) {
         for bucket in &FUTEX_WAITERS {
-            bucket.values.lock().retain(|w| w.tid != task_id || w.slot == FUTEX_PARK_SLOT);
+            bucket.values.lock(narf_lib::sync::IrqsEnabled).retain(|w| w.tid != task_id || w.slot == FUTEX_PARK_SLOT);
         }
     }
     let key = key.map(|(k, _)| k);
@@ -11784,7 +11793,7 @@ fn futex_drop_task_waiters(task_id: u64) {
         // Ctx already gone (racing teardown) — conservative full sweep.
         None => {
             for bucket in &FUTEX_WAITERS {
-                bucket.values.lock().retain(|w| w.tid != task_id);
+                bucket.values.lock(narf_lib::sync::IrqsEnabled).retain(|w| w.tid != task_id);
             }
         }
     }
@@ -11792,7 +11801,7 @@ fn futex_drop_task_waiters(task_id: u64) {
 
 fn futex_has_task_waiter(task_id: u64) -> bool {
     FUTEX_WAITERS.iter().any(|bucket| {
-        bucket.values.lock().iter().any(|(_, w)| w.tid == task_id)
+        bucket.values.lock(narf_lib::sync::IrqsEnabled).iter().any(|(_, w)| w.tid == task_id)
     })
 }
 
@@ -11813,7 +11822,7 @@ pub(crate) fn futex_register_waiter_key_bitset(
     waker: core::task::Waker,
     bitset: u32,
 ) {
-    let mut queue = futex_wait_bucket(key).values.lock();
+    let mut queue = futex_wait_bucket(key).values.lock(narf_lib::sync::IrqsEnabled);
     // The legacy re-execute park identifies its registration by task rather
     // than a saved handle. Refresh it in place, preserving arrival order.
     let existing = queue.iter().find(|(_, w)| {
@@ -11837,7 +11846,7 @@ pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
 }
 
 pub(crate) fn futex_drop_waiter_key(key: FutexKey, task_id: u64) {
-    let mut queue = futex_wait_bucket(key).values.lock();
+    let mut queue = futex_wait_bucket(key).values.lock(narf_lib::sync::IrqsEnabled);
     let handle = queue.iter().find(|(_, w)| {
         w.key == key && w.tid == task_id && w.slot == FUTEX_PARK_SLOT
     }).map(|(handle, _)| handle);
@@ -11857,7 +11866,7 @@ fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
 
 /// How many tasks have a waker registered on `key` — parked on the word.
 pub(crate) fn futex_waiter_count_key(key: FutexKey) -> usize {
-    futex_wait_bucket(key).values.lock().iter().filter(|(_, w)| w.key == key).count()
+    futex_wait_bucket(key).values.lock(narf_lib::sync::IrqsEnabled).iter().filter(|(_, w)| w.key == key).count()
 }
 
 pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
@@ -11873,7 +11882,7 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
     // slot links; once selected, removal is O(1), independent of task IDs.
     if n == 1 {
         let waiter = {
-            let mut queue = futex_wait_bucket(key).values.lock();
+            let mut queue = futex_wait_bucket(key).values.lock(narf_lib::sync::IrqsEnabled);
             let handle = futex_select_waiter(&queue, key, bitset);
             handle.and_then(|h| futex_remove_woken(&mut queue, h))
         };
@@ -11884,7 +11893,7 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
         return 0;
     }
     let drained = {
-        let mut queue = futex_wait_bucket(key).values.lock();
+        let mut queue = futex_wait_bucket(key).values.lock(narf_lib::sync::IrqsEnabled);
         futex_take_wake_waiters(&mut queue, key, n, bitset)
     };
     let count = drained.len();
@@ -11908,7 +11917,7 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
 /// our post-wake teardown, the Linux `mm_release` shape.
 pub(crate) fn futex_wake_one_key_spread(key: FutexKey) -> usize {
     let waiter = {
-        let mut queue = futex_wait_bucket(key).values.lock();
+        let mut queue = futex_wait_bucket(key).values.lock(narf_lib::sync::IrqsEnabled);
         let handle = futex_select_waiter(&queue, key, FUTEX_BITSET_MATCH_ANY);
         handle.and_then(|h| futex_remove_woken(&mut queue, h))
     };
@@ -12086,18 +12095,18 @@ pub(crate) fn futex_requeue_waiters_keyed(
     let source_bucket = futex_bucket_index(key);
     let destination_bucket = futex_bucket_index(key2);
     let (moved, retarget): (usize, alloc::vec::Vec<u64>) = if source_bucket == destination_bucket {
-        let mut values = FUTEX_WAITERS[source_bucket].values.lock();
+        let mut values = FUTEX_WAITERS[source_bucket].values.lock(narf_lib::sync::IrqsEnabled);
         futex_requeue_same_bucket(&mut values, key, key2, n_move)
     } else if source_bucket < destination_bucket {
         // A total bucket order makes opposite-direction concurrent requeues
         // deadlock-free.
-        let mut source = FUTEX_WAITERS[source_bucket].values.lock();
-        let mut destination = FUTEX_WAITERS[destination_bucket].values.lock();
+        let mut source = FUTEX_WAITERS[source_bucket].values.lock(narf_lib::sync::IrqsEnabled);
+        let mut destination = FUTEX_WAITERS[destination_bucket].values.lock(narf_lib::sync::IrqsEnabled);
         let movers = futex_take_waiters(&mut source, key, n_move, FUTEX_BITSET_MATCH_ANY);
         futex_insert_waiters(&mut destination, key2, movers)
     } else {
-        let mut destination = FUTEX_WAITERS[destination_bucket].values.lock();
-        let mut source = FUTEX_WAITERS[source_bucket].values.lock();
+        let mut destination = FUTEX_WAITERS[destination_bucket].values.lock(narf_lib::sync::IrqsEnabled);
+        let mut source = FUTEX_WAITERS[source_bucket].values.lock(narf_lib::sync::IrqsEnabled);
         let movers = futex_take_waiters(&mut source, key, n_move, FUTEX_BITSET_MATCH_ANY);
         futex_insert_waiters(&mut destination, key2, movers)
     };
@@ -12334,7 +12343,7 @@ pub fn __test_futex_wake_scoped(namespace: u64, uaddr: u64, n: u32) -> usize {
 /// `FUTEX_WAKE` — the lost-waiter signature the park census looks for.
 pub fn dbg_futex_waiter_registered(namespace: u64, uaddr: u64, tid: u64) -> bool {
     let key = futex_key(namespace, uaddr);
-    futex_wait_bucket(key).values.lock().iter().any(|(_, w)| w.key == key && w.tid == tid)
+    futex_wait_bucket(key).values.lock(narf_lib::sync::IrqsEnabled).iter().any(|(_, w)| w.key == key && w.tid == tid)
 }
 
 /// Fatal-path futex snapshot: `(bucket_generation_hint, registered_waiters)`.
@@ -12393,7 +12402,7 @@ fn futex_queue(
     bitset: u32,
     q: &alloc::sync::Arc<FutexQ>,
 ) {
-    let mut queue = futex_wait_bucket(key).values.lock();
+    let mut queue = futex_wait_bucket(key).values.lock(narf_lib::sync::IrqsEnabled);
     let mut location = q.location(idx).lock();
     assert_eq!(location.key, key);
     if let Some(waiter) = location.handle.and_then(|h| queue.get_mut(h)) {
@@ -12419,7 +12428,7 @@ fn futex_unqueue(q: &FutexQ, idx: usize, _tid: u64) -> bool {
     }
     loop {
         let before = *q.location(idx).lock();
-        let mut queue = futex_wait_bucket(before.key).values.lock();
+        let mut queue = futex_wait_bucket(before.key).values.lock(narf_lib::sync::IrqsEnabled);
         let mut location = q.location(idx).lock();
         if *location != before {
             continue;
