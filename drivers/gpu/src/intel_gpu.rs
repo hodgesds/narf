@@ -3584,9 +3584,11 @@ pub mod tests {
     /// `INTEL_ICL_IDS` / `INTEL_EHL_IDS` / `INTEL_JSL_IDS`
     /// classify as `Generation::IceLake` under their product
     /// ASIC, resolve to the Gen11 GT sub-platform with its GuC
-    /// firmware family, and stay display-gated. This pins the
-    /// whole set so a future reclassification — or arming the
-    /// Gen12 modeset against Gen11 silicon — fails here first.
+    /// firmware family, and carry the post-Lane-5/8
+    /// disposition (display, external display and backlight
+    /// armed). This pins the whole set so a future
+    /// reclassification — or arming the Gen12 modeset against
+    /// Gen11 silicon — fails here first.
     fn smoke_icelake_classification() -> TestResult {
         use crate::intel_gpu_gt::{Gen11Platform, GtPlatform};
         const ICL_DIDS: &[u16] = &[
@@ -3635,15 +3637,17 @@ pub mod tests {
                             && profile.minimum_version == (70, 1, 1) => {}
                     _ => return TestResult::Fail("Gen11 DID has the wrong GuC profile"),
                 }
-                // Lane 1 disposition: region map admitted, display
-                // and GT execution gated, pre-GMD presence.
-                if info.generation.display_supported()
-                    || info.generation.external_display_supported()
-                    || info.generation.backlight_supported()
+                // Post-Lane-5/8 disposition: display armed by
+                // Lane 5 (internal panel), external display and
+                // backlight armed by Lane 8, region map admitted,
+                // pre-GMD presence.
+                if !info.generation.display_supported()
+                    || !info.generation.external_display_supported()
+                    || !info.generation.backlight_supported()
                     || info.generation.region_generation() != Some(RegionGeneration::Gen11)
                     || info.generation.has_gmd_id()
                 {
-                    return TestResult::Fail("Gen11 disposition wrong after Lane 1");
+                    return TestResult::Fail("Gen11 disposition wrong after Lane 8");
                 }
             }
         }
