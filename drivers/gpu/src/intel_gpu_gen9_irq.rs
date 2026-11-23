@@ -359,11 +359,12 @@ pub fn gen8_display_irq_reset(io: &impl MmioWindow) {
     reset_irq_regs(io, DE_PCU_ISR, DE_PCU_IMR, DE_PCU_IIR, DE_PCU_IER);
 }
 
-/// Master-IRQ disable (`gen8_irq_handler` entry): write 0 to
-/// the master register and read back the pending mask.
+/// Master-IRQ disable (`gen8_irq_handler` entry): read the
+/// pending mask, then write 0 to the master register.
 pub fn master_intr_disable(io: &impl MmioWindow) -> u32 {
+    let pending = io.read32(GEN8_MASTER_IRQ);
     io.write32(GEN8_MASTER_IRQ, 0);
-    io.read32(GEN8_MASTER_IRQ)
+    pending
 }
 
 /// Master-IRQ enable (`gen8_irq_handler` exit): write the
