@@ -612,6 +612,82 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     );
 }
 
+/// Re-point the installed framebuffer console at the scanout the
+/// display is actually showing, if it isn't already there.
+///
+/// The console is installed early on the bootloader GOP buffer, and
+/// the only rebase (`fb-wc-remap`) runs before the GPU driver lights
+/// its native scanout: adoption (`narf_fb::adopt`) moves the
+/// registry's scanout record but never the installed console, so
+/// after native modeset the console — and the end-of-boot splash
+/// painted through it — lands in a buffer the display no longer
+/// scans out. The sloths never appear.
+///
+/// Called right before the end-of-boot splash, when the GPU drivers
+/// have finished their boot modesets and any console pause has been
+/// resumed. A no-op when the console already matches the active
+/// scanout (same base + geometry), and a no-op when no console is
+/// installed or no scanout is active.
+///
+/// Same geometry, different mapping: rebase in place, preserving
+/// scrollback. Different geometry: reinstall on the active scanout;
+/// `FbConsole::new` clears only the text region (the top beacon band
+/// is preserved) and the splash repaints the screen anyway.
+#[cfg(target_arch = "x86_64")]
+fn sync_fb_console_to_active_scanout() {
+    use narf_graphics::{FbConsole, Pixel32};
+
+    let Some(scanout) = narf_fb::select_active() else {
+        return;
+    };
+    // SAFETY: BSP, no concurrent draw; `framebuffer()` wraps the
+    // live mapping the active scanout publishes.
+    // SAFETY: Valid memory or trusted environment
+    let fb = unsafe { scanout.framebuffer() };
+    // Read the installed console's geometry, then drop the lock:
+    // both `rebase_installed` and `install_fb_console` take the
+    // lock themselves.
+    enum Action {
+        None,
+        Rebase,
+        Reinstall,
+    }
+    let action = {
+        let mut g = narf_graphics::console::GLOBAL_FB_CONSOLE.lock();
+        let Some(con) = g.as_mut() else {
+            return;
+        };
+        let cur = con.fb_mut();
+        if cur.base() == fb.base()
+            && cur.width == fb.width
+            && cur.height == fb.height
+            && cur.stride == fb.stride
+        {
+            Action::None
+        } else if cur.width == fb.width && cur.height == fb.height && cur.stride == fb.stride {
+            Action::Rebase
+        } else {
+            Action::Reinstall
+        }
+    };
+    match action {
+        Action::None => {}
+        Action::Rebase => {
+            // SAFETY: `fb.base()` is the active scanout's mapped
+            // virt, covering stride*height*4 bytes; the mapping
+            // outlives the console (adopted scanouts are never
+            // unmapped). Rebase is in place: no clear, scrollback
+            // and cursor preserved.
+            // SAFETY: Valid memory or trusted environment
+            unsafe { narf_graphics::console::rebase_installed(fb.base()) };
+        }
+        Action::Reinstall => {
+            let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);
+            narf_graphics::install_fb_console(con);
+        }
+    }
+}
+
 /// Parse `stop_at=<stage>` and `safe_mode[=...]` from the structured
 /// kernel command-line ([`narf_boot::args`]). Returns the highest stage
 /// that should run; defaults to `Stage::Late` (run everything). Unknown
@@ -4958,9 +5034,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // arrow cursor centred over everything. Visible when QEMU runs
     // with a display backend (`-display gtk` / `-vnc :1`); under
     // `-display none` it still paints into FB memory but isn't
-    // rendered to a host window.
+    // rendered to a host window. On real hardware the panel lands on
+    // the display only once the console is re-pointed at the GPU-lit
+    // scanout (see `sync_fb_console_to_active_scanout`); otherwise
+    // it paints into the retired GOP buffer the display no longer
+    // scans out.
     #[cfg(target_arch = "x86_64")]
     {
+        // The GPU driver may have adopted a native scanout after
+        // the console was installed: re-point the console at the
+        // display before painting, or the panel lands in the
+        // retired GOP buffer and the sloths never appear.
+        sync_fb_console_to_active_scanout();
         let arch_str = "x86_64";
         let backend = match narf_arch::effective_backend() {
             narf_arch::DomainBackend::Pks => "pks",
