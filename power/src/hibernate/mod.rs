@@ -11,6 +11,7 @@
 //! 5. Thaw the devices to write the image, sealed under a TPM-enrolled
 //!    slot.
 //! 6. Run the devices' poweroff callbacks and power down.
+//!
 //! The restored image comes back through step 4. It runs the restore
 //! callbacks and thaws everything, and its caller sees `Ok(())`.
 //!
@@ -256,7 +257,7 @@ fn snapshot_and_write(
     }
     let (taken, record) = match captured {
         Ok(Captured::Restored) => {
-            let _ = narf_console::write_str("  hibernate: restored, back in the image\n");
+            narf_console::write_str("  hibernate: restored, back in the image\n");
             // The image, back. `prealloc` still names the copy frames this
             // kernel allocated before the snapshot; dropping it frees them.
             drop(prealloc);
@@ -341,12 +342,12 @@ impl Secondary {
 
     fn restart(self) {
         for &cpu in &self.cpus {
-            let _ = narf_console::write_str(&alloc::format!("  hibernate: restarting CPU {cpu}\n"));
+            narf_console::write_str(&alloc::format!("  hibernate: restarting CPU {cpu}\n"));
             // SAFETY: stopped by `stop`, here or in the kernel this image
             // was taken from.
             if !unsafe { narf_scheduler::cpu_lifecycle::restart_parked(narf_scheduler::CpuId(cpu)) }
             {
-                let _ = narf_console::write_str(&alloc::format!(
+                narf_console::write_str(&alloc::format!(
                     "  hibernate: CPU {cpu} did not come back online\n"
                 ));
             }
@@ -403,7 +404,7 @@ fn write_image(
             PolicyLevel::Tpm
         }
         None => {
-            let _ = narf_console::write_str(&alloc::format!(
+            narf_console::write_str(&alloc::format!(
                 "  hibernate: narf.hibernate_policy=off: {}\n",
                 crate::suspend_service::OFF_POLICY_WARNING
             ));
@@ -419,7 +420,7 @@ fn write_image(
         .seal_source_registered(&mut store, policy, &source)
         .map_err(HibernateError::Seal)?;
     store.flush().map_err(HibernateError::Seal)?;
-    let _ = narf_console::write_str(&alloc::format!(
+    narf_console::write_str(&alloc::format!(
         "  hibernate: image of {} pages written; resume with narf.resume={} narf.resume_offset={}\n",
         snapshot.len(),
         file.device,
@@ -460,7 +461,7 @@ pub fn software_resume() -> ResumeSkip {
     };
     let offset: u64 = args.parse_value("narf.resume_offset").unwrap_or(0);
     let skip = resume_from(device, offset);
-    let _ = narf_console::write_str(&alloc::format!("  hibernate: no resume: {skip:?}\n"));
+    narf_console::write_str(&alloc::format!("  hibernate: no resume: {skip:?}\n"));
     skip
 }
 
@@ -499,7 +500,7 @@ fn resume_from(device: &str, offset: u64) -> ResumeSkip {
         Ok(loaded) => loaded,
         Err(e) => return ResumeSkip::Payload(e),
     };
-    let _ = narf_console::write_str(&alloc::format!(
+    narf_console::write_str(&alloc::format!(
         "  hibernate: staged {} image pages\n",
         loader.loaded()
     ));
@@ -540,7 +541,7 @@ fn resume_from(device: &str, offset: u64) -> ResumeSkip {
             });
         }
     };
-    let _ = narf_console::write_str(&alloc::format!(
+    narf_console::write_str(&alloc::format!(
         "  hibernate: devices quiesced, {} secondary CPU(s) stopped; entering the image at {:#x}\n",
         secondary.cpus.len(),
         record.entry

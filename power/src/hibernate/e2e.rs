@@ -28,7 +28,7 @@ const PATTERN_BYTES: usize = 16 << 20;
 static TOKEN: AtomicU64 = AtomicU64::new(0);
 
 fn say(text: &str) {
-    let _ = narf_console::write_str(&alloc::format!("{MARKER} {text}\n"));
+    narf_console::write_str(&alloc::format!("{MARKER} {text}\n"));
 }
 
 fn exit(code: u32) -> ! {
