@@ -2109,6 +2109,8 @@ existing `Cap<FirmwareRegistry, Read>`. Both registry open and immutable blob
 copy run through `Cap::invoke`. It selects `i915/mtl_guc_70.bin`, bounds and
 validates CSS before copying, requires the selected 70.53.0-or-newer ABI-70
 baseline and a 384-byte RSA signature, and retains the registry digest/signer.
+Gen11 and Gen12 profiles also accept the 256-byte signature carried by their
+GuC firmware. Each platform enforces its own minimum version.
 No ambient firmware authority or direct filesystem access is introduced.
 Registry authorization does not establish GuC boot-ROM authentication.
 
@@ -2239,8 +2241,10 @@ entire operation. The state machine issues GuC-domain reset, requires reset
 self-clear **and** MIA-in-reset status, validates prelocked WOPCM or programs
 and verifies its write-once registers, publishes scratch parameters and cache-
 cleaned memory, selects generation-correct GuC TLB invalidation, then starts
-CSS+uCode DMA to WOPCM offset 0x2000 with the RSA GGTT pointer separate. Default
-WOPCM is 2 MiB on Gen12 and qualified headless LNL/PTL, and 4 MiB on
+CSS+uCode DMA to WOPCM offset 0x2000. Before DMA, the driver writes the
+256-byte RSA signature as 64 little-endian dwords into UOS_RSA_SCRATCH or
+writes the GGTT address of a 384-byte signature into UOS_RSA_SCRATCH(0). Default
+WOPCM is 2 MiB on Gen11, Gen12 and qualified headless LNL/PTL, and 4 MiB on
 MTL/Arrow and admitted discrete profiles, with a 36 KiB hardware-context
 reservation. A prelocked layout is validated against the source's 8-MiB bound. BMG uses MOCS and the DESC1/DESC0
 TLB sequence. Reset, DMA and authentication have bounded deadlines; `wait`

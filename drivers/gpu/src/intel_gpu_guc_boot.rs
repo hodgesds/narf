@@ -6,7 +6,7 @@
 //! firmware boot allows CT/HWCONFIG discovery, not userspace submission.
 
 use crate::intel_gpu_aux::MmioWindow;
-use crate::intel_gpu_gt::{GtPlatform, GUC_GGTT_MIN};
+use crate::intel_gpu_gt::{GtPlatform, GuCRsaTransfer, GUC_GGTT_MIN};
 use crate::intel_gpu_guc::CssImage;
 use crate::intel_gpu_guc_firmware::GuCFirmware;
 use crate::intel_gpu_guc_transport::{MailboxRegisters, TransportError, XeLpgTransport};
@@ -22,6 +22,7 @@ use core::task::Poll;
 const PAGE: u32 = 4096;
 const GDRST: u64 = 0x941c;
 const STATUS: u64 = 0xc000;
+const UOS_RSA_SCRATCH: u64 = 0xc200;
 const DMA_CTRL: u64 = 0xc314;
 const ADS_PRIVATE: u32 = 0x6000;
 const LOG_BYTES: u32 = 0x115000; // state page + 16K crash + 64K events + 1M capture
@@ -341,6 +342,7 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     /// A locked media WOPCM cannot host the staged HuC: it is never uploaded.
     huc_blocked: bool,
     upload: u32,
+    rsa_transfer: GuCRsaTransfer,
     state: BootState,
     deadline: u64,
     released: bool,
@@ -491,7 +493,6 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         let profile = platform.guc().ok_or(BootError::Unsupported)?;
         if GtPlatform::from_pci(0x8086, config.device_id) != Some(platform)
             || image.version < profile.minimum_version
-            || image.signature.len() != 384
         {
             return Err(BootError::Device);
         }
@@ -505,7 +506,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         // `intel_wopcm_init_early` — 2 MiB from Gen11, 1 MiB before it;
         // the xe-era families staged here take the 4 MiB `plan` total).
         WopcmLayout::plan_for(platform, upload, config.huc_upload_bytes)?;
-        let image_pages = (upload + 384).div_ceil(PAGE);
+        let rsa_transfer = profile
+            .rsa_transfer(image.signature.len())
+            .ok_or(BootError::Device)?;
+        let image_pages = (upload + image.signature.len() as u32).div_ceil(PAGE);
         let ads_pages = (ADS_PRIVATE + image.private_data_bytes).div_ceil(PAGE);
         let mut allocations: Vec<A::Backing> = Vec::new();
         allocations
@@ -619,6 +623,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             huc_dma_done: false,
             huc_blocked: false,
             upload,
+            rsa_transfer,
             state: BootState::Staged,
             deadline: 0,
             released: false,
@@ -1174,7 +1179,18 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         // platform's GuC TLB invalidation path, as xe_ggtt/xe_guc_tlb_inval.
         let image = r.image.ggtt_offset();
         invalidate_guc_tlb(&self.mmio, self.platform);
-        self.mmio.write32(0xc200, image + self.upload);
+        // Linux guc_xfer_rsa: a 2048-bit signature occupies all 64 scratch
+        // registers. For the larger signature the ROM reads the GGTT address.
+        match self.rsa_transfer {
+            GuCRsaTransfer::ScratchRegisters => {
+                for word in 0..64 {
+                    let offset = 4 * word;
+                    let value = r.image.read32(u64::from(self.upload) + offset);
+                    self.mmio.write32(UOS_RSA_SCRATCH + offset, value);
+                }
+            }
+            GuCRsaTransfer::GgttPointer => self.mmio.write32(UOS_RSA_SCRATCH, image + self.upload),
+        }
         self.mmio.write32(0xc300, image);
         self.mmio.write32(0xc304, 8 << 16);
         self.mmio.write32(0xc308, 0x2000);
@@ -2091,15 +2107,19 @@ mod tests {
         (Window(shared.clone()), Arena(shared))
     }
     fn image() -> Vec<u8> {
-        let mut bytes = alloc::vec![0u8;528];
+        image_with_rsa(96)
+    }
+    fn image_with_rsa(words: u32) -> Vec<u8> {
+        let header_words = 32 + 2 * words + 1;
+        let mut bytes = alloc::vec![0u8; 144 + 4 * words as usize];
         for (at, value) in [
             (0, 6),
-            (4, 225),
+            (4, header_words),
             (8, 0x10000),
             (16, 0x8086),
-            (24, 229),
-            (28, 96),
-            (32, 96),
+            (24, header_words + 4),
+            (28, words),
+            (32, words),
             (36, 1),
             (64, 0x00463600),
             (68, 0x00010000),
@@ -2374,6 +2394,65 @@ mod tests {
         "drivers/gpu/intel_gpu_guc_boot",
         smoke_boot_workarounds_reject_bad_live_ip
     );
+
+    fn smoke_adlp_guc_rsa_scratch() -> TestResult {
+        let platform = GtPlatform::from_pci(0x8086, 0x46b3).unwrap();
+        let mut css = image_with_rsa(64);
+        crate::intel_gpu_uapi::put32(&mut css, 64, 0x0046_3104); // ADL-P 70.49.4
+        for i in 0..64 {
+            crate::intel_gpu_uapi::put32(&mut css, 144 + 4 * i, 0xfedc_ba00 | i as u32);
+        }
+        let firmware = GuCFirmware::from_fixture(platform, &css).unwrap();
+        let (window, arena) = model();
+        window.0.borrow_mut().profile = Some(platform);
+        let mut boot = GuCBoot::stage(
+            window.clone(),
+            arena,
+            &firmware,
+            BootConfig {
+                device_id: 0x46b3,
+                revision: 3,
+                huc_upload_bytes: 0,
+                uncached_mocs: None,
+            },
+        )
+        .unwrap();
+        ready(&mut boot, &window);
+        {
+            let device = window.0.borrow();
+            let start = device
+                .writes
+                .iter()
+                .position(|&(reg, _)| reg == 0xc200)
+                .unwrap();
+            for i in 0..64 {
+                assert_eq!(
+                    device.writes[start + i],
+                    (0xc200 + 4 * i as u64, 0xfedc_ba00 | i as u32)
+                );
+            }
+            assert_eq!(device.writes[start + 64], (0xc300, 0x2000_0000));
+            assert_eq!(device.regs[&0xc310], 144);
+        }
+        stop(&mut boot, &window);
+        for words in [63, 65, 95, 97] {
+            assert!(matches!(
+                GuCFirmware::from_fixture(platform, &image_with_rsa(words)),
+                Err(crate::intel_gpu_guc_firmware::FirmwareError::Image(
+                    crate::intel_gpu_guc::GuCError::FirmwareLayout
+                ))
+            ));
+        }
+        let mtl = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+        assert!(matches!(
+            GuCFirmware::from_fixture(mtl, &image_with_rsa(64)),
+            Err(crate::intel_gpu_guc_firmware::FirmwareError::Image(
+                crate::intel_gpu_guc::GuCError::FirmwareLayout
+            ))
+        ));
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_guc_boot", smoke_adlp_guc_rsa_scratch);
 
     fn smoke_boot_dma_ads_and_transport() -> TestResult {
         for platform in [
