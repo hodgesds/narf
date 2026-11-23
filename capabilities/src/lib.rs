@@ -261,8 +261,10 @@ impl<T, R: Rights> Cap<T, R> {
     /// (SEC-B5, #1293): `Cap<T, R>` cannot be constructed outside
     /// `capabilities/` — the only public entry points are
     /// `Cap::bootstrap` (fresh object-table entry),
-    /// `Cap::derive` (weaken a live cap), and `Cap::transfer`
-    /// (Grant-gated cross-table install). A `CapSlot` on its own
+    /// `Cap::derive` (weaken a live cap), `Cap::transfer`
+    /// (Grant-gated cross-table install), and
+    /// `Cap<T, Grant>::delegate` (Grant-gated derivation from
+    /// another holder's cap, SEC-B4 #1292). A `CapSlot` on its own
     /// carries no authority: it is ABI data, and without this
     /// constructor it cannot be re-typed into a `Cap`.
     ///
@@ -381,9 +383,58 @@ impl<T, R: Rights> Cap<T, R> {
         object_table::revoke_subtree(self.slot.index, self.slot.generation, self.slot.rights)
     }
 
-    /// Derive a weaker capability.
-    pub fn derive<R2: Rights + SubsetOf<R>>(&self) -> Result<Cap<T, R2>, CapError> {
+    /// Derive a weaker capability (self-weakening, SEC-B4 #1292).
+    ///
+    /// The caller weakens *its own* cap to a strict subset
+    /// (`R2: SubsetOf<R>` — e.g. `Write` → `Read`, `Grant` → any
+    /// lesser right). Weakening creates no new authority — the
+    /// derived cap names the same object, is live exactly while
+    /// the source object is live, and can do strictly less than
+    /// the source — so it needs no `Grant`: the `Grant` gate
+    /// belongs to *delegation* (handing a cap to another holder),
+    /// which stays Grant-gated via [`Cap::transfer`] (cross-task
+    /// install) and [`Cap::delegate`] (Grant-gated derivation
+    /// from another holder's cap). This is the derive-vs-delegate
+    /// split the #1292 fix shape allows: `derive` weakens, the
+    /// `Grant` methods delegate.
+    ///
+    /// What `derive` DOES verify at runtime, before minting
+    /// (the pre-#1292 hole: it checked only liveness, then
+    /// overwrote `slot.rights` — so a hand-forged slot whose type
+    /// said `Write` but whose slot carried `Read` (or nothing)
+    /// derived a fully valid `Read` cap out of thin air):
+    /// 1. Liveness: `check_live`, else `Revoked` (checked first,
+    ///    preserving the observable behaviour that a revoked cap
+    ///    reports `Revoked` regardless of its other fields).
+    /// 2. Slot type tag: `slot.type_tag == T::KIND`, else
+    ///    `TypeMismatch` — the slot-local leg of the #1282
+    ///    checks.
+    /// 3. Slot rights: `slot.rights == R::BITS`, else
+    ///    `RightsTooWeak`. Exact equality, not coverage: every
+    ///    legitimate construction path (`bootstrap`,
+    ///    `bootstrap_with`, `derive`, `transfer`) stamps exactly
+    ///    its type's bits, so a slot carrying more, fewer, or
+    ///    different bits than its type claims is forged.
+    ///
+    /// What this does NOT check: the object-table kind
+    /// cross-check (`epoch_and_kind`) that `invoke` performs.
+    /// The derived cap inherits the source's index, so a source
+    /// aliasing a wrong-kind object derives a cap `invoke` still
+    /// refuses at the kind leg — no execution path opens here.
+    /// `derive` stays a same-slot integer-compare path with a
+    /// single allocation-free table touch (`record_derivation`,
+    /// §9.6).
+    pub fn derive<R2: Rights + SubsetOf<R>>(&self) -> Result<Cap<T, R2>, CapError>
+    where
+        T: CapType,
+    {
         self.check_live()?;
+        if self.slot.type_tag != T::KIND as u32 {
+            return Err(CapError::TypeMismatch);
+        }
+        if self.slot.rights != R::BITS {
+            return Err(CapError::RightsTooWeak);
+        }
         let mut slot = self.slot;
         slot.rights = R2::BITS;
         // CDT (§9.6): record the derivation edge. Allocation-free
@@ -396,7 +447,10 @@ impl<T, R: Rights> Cap<T, R> {
             self.slot.rights,
             R2::BITS,
         );
-        // SAFETY: the operation upholds its documented invariant (see surrounding context).
+        // SAFETY: the source slot was just verified live with a
+        // matching type tag and exactly R::BITS, and the derived
+        // slot differs only in the rights field (R2::BITS, a
+        // subset of R by the SubsetOf bound).
         unsafe { Ok(Cap::mint(slot)) }
     }
 }
@@ -427,10 +481,88 @@ impl<T: CapType> Cap<T, Grant> {
         if self.slot.index != cap.slot.index {
             return Err(CapError::ObjectMismatch);
         }
+        // SEC-B4 (#1292), same class as `derive`: the `Grant`
+        // gate is a runtime property, not just the receiver's
+        // type — a hand-forged `Cap<T, Grant>` slot carrying no
+        // Grant bit (reachable only via unsafe `Cap::mint`)
+        // must not transfer. Likewise the transferred cap's
+        // slot must carry exactly `R::BITS` and the right type
+        // tag, or the install would launder a forged slot into
+        // the receiver's table. Legitimate caps always carry
+        // exactly their type's bits (see `derive`), so these
+        // legs reject only forgeries.
+        if self.slot.type_tag != T::KIND as u32 {
+            return Err(CapError::TypeMismatch);
+        }
+        if self.slot.rights != Grant::BITS {
+            return Err(CapError::RightsTooWeak);
+        }
         if cap.slot.type_tag != T::KIND as u32 {
             return Err(CapError::TypeMismatch);
         }
+        if cap.slot.rights != R::BITS {
+            return Err(CapError::RightsTooWeak);
+        }
         target.install_general(cap.slot)
+    }
+
+    /// Grant-gated derivation (SEC-B4 #1292 — the `delegate`
+    /// half of the derive-vs-delegate split).
+    ///
+    /// A `Grant` holder for object O authorises deriving a
+    /// weakened cap (`R2: SubsetOf<R>`) from *another holder's*
+    /// live cap `src` for the same object — the broker case
+    /// `derive` cannot express: `derive` weakens only the
+    /// caller's own cap, while `delegate` proves the *source*
+    /// cap was live and genuine at derivation time and that a
+    /// `Grant` holder for O authorised it. (A Grant holder
+    /// deriving from its own cap needs no `delegate`:
+    /// `Grant::derive::<R2>()` already covers it via the
+    /// lattice edges into `Grant`.)
+    ///
+    /// Checks, in order: both caps live (`Revoked`), both name
+    /// the same object (`ObjectMismatch` — a Grant cap for A
+    /// never authorises deriving from B's cap), the grant's
+    /// type tag (`TypeMismatch`) and Grant bit
+    /// (`RightsTooWeak` — reachable only via a hand-forged
+    /// slot, since the type system pins `R = Grant`), the
+    /// source's type tag (`TypeMismatch`) and exact rights
+    /// (`RightsTooWeak`, `slot.rights == R::BITS` — the same
+    /// laundering check `derive` performs). The derived cap
+    /// inherits the source's slot with rights narrowed to
+    /// `R2::BITS`; the grant itself is unaffected (sharing
+    /// semantics, like `transfer`).
+    pub fn delegate<R: Rights, R2: Rights + SubsetOf<R>>(
+        &self,
+        src: &Cap<T, R>,
+    ) -> Result<Cap<T, R2>, CapError> {
+        self.check_live()?;
+        src.check_live()?;
+        if self.slot.index != src.slot.index {
+            return Err(CapError::ObjectMismatch);
+        }
+        if self.slot.type_tag != T::KIND as u32 {
+            return Err(CapError::TypeMismatch);
+        }
+        if self.slot.rights != Grant::BITS {
+            return Err(CapError::RightsTooWeak);
+        }
+        if src.slot.type_tag != T::KIND as u32 {
+            return Err(CapError::TypeMismatch);
+        }
+        if src.slot.rights != R::BITS {
+            return Err(CapError::RightsTooWeak);
+        }
+        let mut slot = src.slot;
+        slot.rights = R2::BITS;
+        // SAFETY: the grant was just verified live with a
+        // matching type tag and exactly Grant::BITS, the source
+        // was just verified live with a matching type tag and
+        // exactly R::BITS, both name the same object, and the
+        // derived slot differs from the source only in the
+        // rights field (R2::BITS, a subset of R by the
+        // SubsetOf bound).
+        unsafe { Ok(Cap::mint(slot)) }
     }
 }
 

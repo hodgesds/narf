@@ -44,7 +44,14 @@ pub struct Read; pub struct Write; pub struct Grant;
 pub struct Spend; pub struct Invoke; pub struct Create;
 
 impl<T, R: Rights> Cap<T, R> {
-    pub fn derive<R2: Rights + SubsetOf<R>>(&self) -> Result<Cap<T, R2>, CapError>;
+    /// Self-weakening (SEC-B4, #1292): derives `R2: SubsetOf<R>`
+    /// from the caller's own cap. No `Grant` needed — weakening
+    /// creates no new authority — but the source slot is verified
+    /// at runtime first: live (`Revoked`), type tag (`TypeMismatch`),
+    /// exact rights `slot.rights == R::BITS` (`RightsTooWeak`).
+    pub fn derive<R2: Rights + SubsetOf<R>>(&self) -> Result<Cap<T, R2>, CapError>
+    where
+        T: CapType;
     pub fn badge(&self, badge: Badge)          -> Cap<T, R>;
 
     /// Legacy ungated mint (SEC-B1, #1281) — removal tracked in #1538.
@@ -98,7 +105,19 @@ impl<T: CapType> Cap<T, Grant> {
     /// into `target`'s table; returns the receiver's task-local slot
     /// number. Both caps must be live and name the same object, else
     /// `ObjectMismatch`. The sender retains its slot (sharing).
+    /// SEC-B4 (#1292): the Grant bit and the transferred cap's exact
+    /// rights are verified at runtime (`RightsTooWeak`), not just
+    /// by the receiver's type — a hand-forged `Cap<T, Grant>` slot
+    /// carrying no Grant bit cannot transfer.
     pub fn transfer<R: Rights>(&self, cap: &Cap<T, R>, target: &mut CapTable) -> Result<u32, CapError>;
+    /// Grant-gated derivation (SEC-B4, #1292 — the `delegate` half
+    /// of the derive-vs-delegate split). A `Grant` holder for O
+    /// authorises deriving a weakened cap (`R2: SubsetOf<R>`) from
+    /// another holder's live cap `src` for the same object; the
+    /// grant's bit and the source's exact rights are verified at
+    /// runtime. `derive` weakens the caller's own cap; `delegate`
+    /// is the broker case `derive` cannot express.
+    pub fn delegate<R: Rights, R2: Rights + SubsetOf<R>>(&self, src: &Cap<T, R>) -> Result<Cap<T, R2>, CapError>;
 }
 
 /// One task's capability table (§9.7). Dense slots; a position is the
@@ -661,7 +680,9 @@ The epoch and immutable kind come from one stable indexed metadata read
 (`object_table::epoch_and_kind`), with acquire publication and no global read
 lock. The type-tag and rights checks remain same-slot integer comparisons.
 `check_live` retains its epoch-only contract for derive/transfer/bootstrap,
-which perform their own type checks where needed.
+which perform their own type and rights checks where needed
+(§9.10 adds the exact-rights legs to `derive`/`transfer` and the
+new `delegate`).
 
 Why no domain check here: neither the cap nor the object-table
 entry records a domain, the wire format is frozen (§8), and no
@@ -713,6 +734,87 @@ Remainders: §8 step 5 is implemented at dispatch (#1547); the
 remaining items are the `DomainEnter`/`DomainExit` dynamic
 target-domain leg and the step-5 measurement plan, both listed
 above.
+
+### 9.10 Derive-time source verification + Grant-gated delegate (SEC-B4, #1292)
+
+**Decision:** split derivation into weakening vs delegation.
+`Cap::derive` weakens the caller's *own* cap to a strict subset
+(`R2: SubsetOf<R>`, same object, same holder). Weakening creates
+no new authority — the derived cap can do strictly less than the
+source, for the same object, while the object stays live — so it
+needs no `Grant`. The `Grant` gate belongs to *delegation*
+(handing a cap to another holder): cross-task install stays
+Grant-gated via `Cap<T, Grant>::transfer` (§9.1), and a new
+Grant-gated derivation entry point, `Cap<T, Grant>::delegate`,
+covers the broker case `derive` cannot express — a `Grant`
+holder for O authorising a weakened cap derived from *another*
+holder's live cap for O. Requiring a `Grant` argument on
+`derive` itself was rejected: the tree's ~112 `derive` call
+sites (73 files) weaken locally-held caps (`Write` → `Read`
+for firmware/authority handoffs, `Grant` → operational rights)
+under the lattice §3 documents, and none of them holds a `Grant`
+cap for the object — gating `derive` on `Grant` would force
+minting `Grant` caps at every site through the legacy ungated
+`bootstrap()` (§9.8, removal tracked in #1538), widening the
+SEC-B1 hole to close SEC-B4.
+
+**What `derive` verifies at runtime, before minting** (the
+pre-fix hole: it checked only liveness, then overwrote
+`slot.rights` — a hand-forged slot whose type said `Write` but
+whose slot carried `Read`, or nothing, derived a fully valid
+`Read` cap out of thin air): liveness (`Revoked`, checked
+first), slot type tag equals `T::KIND` (`TypeMismatch`), slot
+rights equal `R::BITS` exactly (`RightsTooWeak`). Exact
+equality, not coverage: every legitimate construction path
+(`bootstrap`, `bootstrap_with`, `derive`, `transfer`) stamps
+exactly its type's bits, so a slot carrying more, fewer, or
+different bits than its type claims is forged. The same legs
+land on the Grant-gated paths in the same change:
+`transfer` verifies the grant's type tag and Grant bit and the
+transferred cap's type tag and exact rights (the raw-slot twin
+`install_transfer` already checked the Grant bit; the typed
+path now matches it), and `delegate` verifies the grant's
+type tag and Grant bit, the source's type tag and exact rights,
+and same-object (`ObjectMismatch`).
+
+**What `derive` does NOT check:** the object-table kind
+cross-check (`epoch_and_kind`) that `invoke` performs. The
+derived cap inherits the source's index, so a source aliasing
+a wrong-kind object derives a cap `invoke` still refuses at
+the kind leg — no execution path opens here. `derive` stays a
+same-slot integer-compare path with a single allocation-free
+table touch (`record_derivation`, §9.6); `delegate` and
+`transfer` stay same-slot integer-compare paths with no table
+touch beyond the existing epoch reads.
+
+**Census (narf_signature_census):** 114 `.derive(` occurrences
+tree-wide; 112 are zero-arg `Cap::derive` call sites in 73
+files, 2 are unrelated methods with arguments
+(`intel_gpu_guc_gt.rs:595`, `mvm_pmf_tests.rs:538`). The only
+signature change is the added `where T: CapType` bound on
+`derive` (needed for the `T::KIND` type-tag leg, matching the
+bounds `invoke` and `transfer` already carry); every one of
+the 112 receivers is a concrete `Cap<T, R>` with `T: CapType`
+(authority caps, `Write`/`Grant` caps, test `TestObj` types),
+so zero call sites change. `delegate` is new API with no
+existing call sites; `transfer` changes no signature. All new
+legs pass legitimately minted caps unchanged (their slots
+already carry the right kind, type tag, and exact rights) —
+pinned by the existing derive/transfer smoke tests plus 7 new
+fixtures (`smoke_cap_derive_refuses_forged_rights`,
+`smoke_cap_derive_refuses_wrong_type_tag`,
+`smoke_cap_delegate_grant_gated_derivation`,
+`smoke_cap_delegate_refuses_wrong_object`,
+`smoke_cap_delegate_refuses_forged_grant`,
+`smoke_cap_delegate_refuses_forged_source_rights`,
+`smoke_cap_transfer_refuses_forged_rights`).
+
+Perf class (a) — no hot path: `derive`, `delegate`, and
+`transfer` are delegation/setup-time operations (cap handoff
+at task/driver/firmware-load setup), not per-operation
+dispatch paths; `invoke` — the hot path — is untouched. The
+added legs are same-cache-line integer compares on a slot the
+caller already holds; no new table reads, no locks.
 
 ## 10. ABI versioning
 
