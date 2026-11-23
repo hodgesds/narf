@@ -40,7 +40,12 @@ offset into that block.
 
 After the header at `off_mem_rsvmap`, a sequence of
 `(addr: u64_be, size: u64_be)` pairs terminated by an
-all-zeros pair.
+all-zeros pair. The map has no size field: it ends at the
+first block boundary after it (the nearer of the struct /
+strings block starts, or `totalsize`). A scan that reaches
+that boundary without a terminator is malformed, and
+`copy_reservations` reports it as `None` instead of parsing
+struct-block words as reservations.
 
 ## 4. Public API
 
@@ -65,7 +70,7 @@ pub struct Reservation {
     pub size: u64,
 }
 
-pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> usize;
+pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> Option<usize>;
 
 pub struct ReservedRegion {
     pub addr: u64,
@@ -217,6 +222,10 @@ pub fn rmem_cell(blob: &[u8], consumer: PropIter<'_>, id: &str) -> Result<RmemCe
 | `smoke_fdt_chosen_bootargs_oversized_clips_at_cap` | bootargs past `BOOTARGS_CAP` clipped to exactly the cap |
 | `smoke_fdt_memory_ranges`          | `/memory@N reg` decoded            |
 | `smoke_fdt_reservations`           | reserve-map decoded                |
+| `smoke_fdt_reserve_map_unterminated_rejected` | unterminated reserve map rejected, not scanned into struct block (#1302) |
+| `smoke_fdt_unterminated_node_name_aborts_walk` | node name with no NUL before `struct_end` aborts the walk (#1302) |
+| `smoke_fdt_prop_payload_past_struct_end_not_yielded` | property payload past `struct_end` not yielded (#1302) |
+| `smoke_fdt_header_rejects_reserve_past_total_and_overlap` | reserve map past `totalsize`, overlapping struct/strings blocks rejected (#1302) |
 | `smoke_fdt_reserved_memory_static_ranges` | `/reserved-memory` static range + flags |
 | `smoke_fdt_interrupts_extended_multiple_domains` | mixed interrupt domains decoded |
 | `smoke_fdt_pci_intx_interrupt_map_matches_linux` | QEMU virt slot/pin rotation, mask wrap, domain/pin refusal, nested nexus and level-low refusal |
