@@ -165,19 +165,19 @@ impl Generation {
     /// generation. The install programs the BXT-style PWM
     /// block (`BXT_BLC_PWM_CTL1`/`FREQ1`/`DUTY1` 0xC8250/54/58
     /// + `SOUTH_CHICKEN1` 0xC2000 bit 25), which Ice Lake
-    /// shares: Linux drives ICL through the same
-    /// `cnp_pwm_funcs` (`bxt_set_backlight` /
-    /// `bxt_get_backlight`, `display/intel_backlight.c`) —
-    /// "CNP has the BXT implementation of backlight, but with
-    /// only one controller". MTL's backlight path is owned by
-    /// the backlight composition lane (PR #1037, #947/#949/#951),
-    /// which flips this predicate when the MTL registers land.
-    /// Keeping it separate from `display_supported` lets the
-    /// MTL modeset ship without claiming a backlight it cannot
-    /// drive. The install's controller-1 hardcoding is
-    /// pre-existing Gen12 behavior (Linux takes the VBT
-    /// controller, defaulting to 0); on a VBT-controller-0
-    /// part FREQ1 may read 0 and the install no-ops harmlessly.
+    ///   shares: Linux drives ICL through the same
+    ///   `cnp_pwm_funcs` (`bxt_set_backlight` /
+    ///   `bxt_get_backlight`, `display/intel_backlight.c`) —
+    ///   "CNP has the BXT implementation of backlight, but with
+    ///   only one controller". MTL's backlight path is owned by
+    ///   the backlight composition lane (PR #1037, #947/#949/#951),
+    ///   which flips this predicate when the MTL registers land.
+    ///   Keeping it separate from `display_supported` lets the
+    ///   MTL modeset ship without claiming a backlight it cannot
+    ///   drive. The install's controller-1 hardcoding is
+    ///   pre-existing Gen12 behavior (Linux takes the VBT
+    ///   controller, defaulting to 0); on a VBT-controller-0
+    ///   part FREQ1 may read 0 and the install no-ops harmlessly.
     pub const fn backlight_supported(self) -> bool {
         matches!(
             self,

@@ -21,14 +21,14 @@
 //! - The MG PLL state is computed by
 //!   `intel_gpu_gen11_dpll::mg_pll_state` (the divisor search
 //!   + ICL MG register packing) and written to direct MMIO at
-//!   0x168xxx + (tc − 1) * 0x1000 — there is no HIP bank, no
-//!   FIA, and no Type-C cold-reference machinery on this path.
-//!   The TC subsystem side (TCSS/FIA lane acquisition,
-//!   `intel_tc.c` / DFLEXDPSP) is NOT modeled here: the modeset
-//!   programs the display side and assumes the TC port is
-//!   already in DP-alt mode with lanes available (firmware or a
-//!   later TCSS lane owns that). If silicon shows AUX failing
-//!   on TC ports, that lane owns it.
+//!     0x168xxx + (tc − 1) * 0x1000 — there is no HIP bank, no
+//!     FIA, and no Type-C cold-reference machinery on this path.
+//!     The TC subsystem side (TCSS/FIA lane acquisition,
+//!     `intel_tc.c` / DFLEXDPSP) is NOT modeled here: the modeset
+//!     programs the display side and assumes the TC port is
+//!     already in DP-alt mode with lanes available (firmware or a
+//!     later TCSS lane owns that). If silicon shows AUX failing
+//!     on TC ports, that lane owns it.
 //! - The transcoder clock uses the display-11 encoding
 //!   `TRANS_CLK_SEL_PORT(port) = (port + 1) << 29`
 //!   (`intel_ddi_enable_transcoder_clock`, DISPLAY_VER < 12
@@ -564,6 +564,12 @@ impl MgPort {
         self.wait_timeout(io, self.ddi.base(), 1 << 7, false, 10)
     }
 
+    // Only the kernel-test lifecycle test calls this today
+    // (the HPD / external-session lane will call it from
+    // production once Gen11 TC ports are threaded through
+    // `stop_pipeline`); cfg-gated, not deleted, so the
+    // Dekel-port API shape stays intact for that lane.
+    #[cfg(any(test, feature = "kernel-test"))]
     /// Stop the transport: clear `DP_TP_CTL` enable and the
     /// transcoder-clock route.
     pub(crate) fn stop_transport(
