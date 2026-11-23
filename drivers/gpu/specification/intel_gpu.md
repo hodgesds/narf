@@ -426,9 +426,17 @@ rev < 5 and `i915/cml_guc_70.1.1.bin` at rev >= 5
 70.1.1. The GuC profiles are admitted in Lane 1 because the
 device-table census fixture requires a qualified GT/GuC profile
 for every census DID; GuC submission stays optional on Gen9
-(execlists is the submission path) and the load itself is Lane 7's,
-as is the CML rev>=5 split — the driver does not model PCI
-revisions yet, so all Comet Lake takes the KBL blob until a
+(execlists is the submission path). GuC/HuC load is admitted (Lane 7):
+the HuC profiles are `i915/skl_huc_2.0.0.bin` and
+`i915/kbl_huc_4.0.0.bin` (`gt/uc/intel_uc_fw.c`
+`INTEL_HUC_FIRMWARE_DEFS`); the 2.0.0/4.0.0 is the HuC filename version,
+not an enforced minimum, because Linux applies no version matching
+to HuC. The 256-byte GuC signature goes through the scratch registers
+on Gen9 exactly as on Gen11/Gen12 (Linux `guc_xfer_rsa` selects on
+size, with no generation gate), and the Gen9-only `guc_prepare_xfer`
+writes (DOP clock gating, 5 us RC6 hold) run ahead of the DMA upload.
+The CML rev>=5 split stays a named remainder — the driver does not
+model PCI revisions yet, so all Comet Lake takes the KBL blob until a
 revision input lands. Gen9 shares the Gen12 BAR0/GTT partitioning
 (Gen8+ 16 MiB split), so its region table carries the verified
 Gen12 contents; it has a 39-bit DMA mask (`i915_pci.c`
@@ -439,8 +447,8 @@ config space (all-ones refuses) instead of reading 0xD8C/0xFF8,
 and `gmd_id` is `None` on Gen9. The WOPCM plan for Gen9 is the
 1 MiB total (`gt/intel_wopcm.c` `GEN9_WOPCM_SIZE`). The part binds
 and announces; display, external display and backlight stay gated
-(Lanes 5 and 8), submission stays gated (Lane 3), no media-engine
-table is admitted until Lane 3. Lane 4 admitted the display model:
+(Lanes 5 and 8). Execlists submission is admitted (Lane 3), with the
+Gen9 media-engine table. Lane 4 admitted the display model:
 SKL CDCLK via LCPLL (`intel_gpu_gen9_cdclk.rs`, VCO-aware ladders,
 Wa Display #1183), the SKL WRPLL + CFGCR1/2
 (`intel_gpu_gen9_dpll.rs`), the Gen9 watermarks

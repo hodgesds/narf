@@ -257,9 +257,20 @@ pub(crate) enum GuCRsaTransfer {
 }
 
 impl GuCProfile {
+    /// How the GuC ROM receives this image's RSA signature. Linux
+    /// `gt/uc/intel_guc_fw.c::guc_xfer_rsa` selects purely on size, with
+    /// no generation gate: a 256-byte (2048-bit) signature goes through
+    /// the 64 scratch registers (`guc_xfer_rsa_mmio`), and only a larger
+    /// signature (`intel_uc_fw.c`: `rsa_size > 256` sets `rsa_data`)
+    /// goes through the GGTT pointer (`guc_xfer_rsa_vma`). Gen9 takes
+    /// the same 256-byte scratch path as Gen11/Gen12 (Gen9 Lane 7):
+    /// the 70.1.1 blobs are RSA-2048 signed, so without this arm every
+    /// Gen9 GuC load failed at validation and staging with
+    /// `FirmwareLayout` / `BootError::Device` even though the profile
+    /// itself was admitted.
     pub(crate) fn rsa_transfer(self, bytes: usize) -> Option<GuCRsaTransfer> {
         match (bytes, self.platform) {
-            (256, GtPlatform::Gen11(_) | GtPlatform::Gen12(_)) => {
+            (256, GtPlatform::Gen9(_) | GtPlatform::Gen11(_) | GtPlatform::Gen12(_)) => {
                 Some(GuCRsaTransfer::ScratchRegisters)
             }
             (384, _) => Some(GuCRsaTransfer::GgttPointer),
@@ -650,6 +661,24 @@ mod tests {
                 0x4e51,
                 GtPlatform::Gen11(Gen11Platform::JasperLake),
                 "i915/ehl_guc_70.1.1.bin",
+                (70, 1, 1),
+            ),
+            (
+                0x1912,
+                GtPlatform::Gen9(Gen9Platform::Skylake),
+                "i915/skl_guc_70.1.1.bin",
+                (70, 1, 1),
+            ),
+            (
+                0x5912,
+                GtPlatform::Gen9(Gen9Platform::KabyLake),
+                "i915/kbl_guc_70.1.1.bin",
+                (70, 1, 1),
+            ),
+            (
+                0x9b41,
+                GtPlatform::Gen9(Gen9Platform::CometLake),
+                "i915/kbl_guc_70.1.1.bin",
                 (70, 1, 1),
             ),
             (
