@@ -1398,6 +1398,249 @@ fn smoke_aml_oregion_pci_config_resolves() -> TestResult {
 }
 kernel_test_in!("aml", smoke_aml_oregion_pci_config_resolves);
 
+// ── SEC-F5 (#1300): OpRegion length / EC window / overflow enforcement ──────
+//
+// The legacy `read_field`/`write_field` accessors must refuse any
+// access unit that runs past its OpRegion's declared length, any EC
+// offset at or past the 256-byte EC window, and any unit whose
+// `region.offset + byte_offset` overflows — before touching hardware.
+// Fixtures register regions/fields directly (precedent:
+// `strict_tests.rs` `register_field`) so every offset/length is exact.
+
+fn sec1300_register_region(
+    region_path: &str,
+    space: crate::oregion::RegionSpace,
+    offset: u64,
+    length: u64,
+) {
+    crate::oregion::register_region(crate::oregion::OpRegionInfo {
+        path: alloc::string::String::from(region_path),
+        space,
+        offset,
+        length,
+    });
+}
+
+fn sec1300_register_field(
+    field_path: &str,
+    region_path: &str,
+    bit_offset: u64,
+    bit_length: u64,
+    access_kind: u8,
+) {
+    crate::oregion::register_field(crate::oregion::FieldInfo {
+        path: alloc::string::String::from(field_path),
+        region_path: alloc::string::String::from(region_path),
+        bit_offset,
+        bit_length,
+        access_kind,
+        update_rule: 0,
+        lock_rule: false,
+        index_field: None,
+        bank_field: None,
+    });
+}
+
+fn sec1300_sysmem_field_past_length_rejected() -> TestResult {
+    crate::__reset_for_test();
+    crate::oregion::__reset_for_test();
+
+    // Frame-backed SystemMemory region, length 8.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let phys = frame.start_address();
+    let addr = phys.raw();
+    // SAFETY: the frame is exclusively ours; seed it through the direct map.
+    unsafe { phys.kernel_mut_ptr::<u64>().write(0xCAFEBABE_DEADBEEF_u64) };
+
+    sec1300_register_region("\\S13R", crate::oregion::RegionSpace::SystemMemory, addr, 8);
+    // In-region control: bits [0..32) read the low dword.
+    sec1300_register_field("\\S13O", "\\S13R", 0, 32, 3);
+    // Escape: byte 8 is one past the 8-byte region.
+    sec1300_register_field("\\S13E", "\\S13R", 64, 8, 1);
+    // Overflow: offset + byte_offset wraps (u64::MAX - 1) + 2.
+    // Length u64::MAX lets the unit past the length check so only
+    // the overflow check can reject it.
+    sec1300_register_region(
+        "\\S13V",
+        crate::oregion::RegionSpace::SystemMemory,
+        u64::MAX - 1,
+        u64::MAX,
+    );
+    sec1300_register_field("\\S13W", "\\S13V", 16, 8, 1);
+
+    let ok = crate::oregion::read_field("\\S13O");
+    let esc_r = crate::oregion::read_field("\\S13E");
+    let esc_w = crate::oregion::write_field("\\S13E", 1);
+    let ovf_r = crate::oregion::read_field("\\S13W");
+    let ovf_w = crate::oregion::write_field("\\S13W", 1);
+    narf_memory::frame::free_frame(frame);
+
+    if ok != Ok(0xDEADBEEF) {
+        return TestResult::Fail("in-region SystemMemory read changed value");
+    }
+    if esc_r != Err(crate::oregion::FieldAccessError::Unsupported) {
+        return TestResult::Fail("SystemMemory read past region length was not Unsupported");
+    }
+    if esc_w != Err(crate::oregion::FieldAccessError::Unsupported) {
+        return TestResult::Fail("SystemMemory write past region length was not Unsupported");
+    }
+    if ovf_r != Err(crate::oregion::FieldAccessError::Unsupported) {
+        return TestResult::Fail("SystemMemory read with overflowing offset was not Unsupported");
+    }
+    if ovf_w != Err(crate::oregion::FieldAccessError::Unsupported) {
+        return TestResult::Fail("SystemMemory write with overflowing offset was not Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", sec1300_sysmem_field_past_length_rejected);
+
+fn sec1300_sysio_field_past_length_rejected() -> TestResult {
+    crate::__reset_for_test();
+    crate::oregion::__reset_for_test();
+
+    // SystemIO region at 0x70, length 2. The field at byte 2
+    // escapes; the bound check must fire before any `in`/`out`
+    // touches port 0x72.
+    sec1300_register_region("\\S13I", crate::oregion::RegionSpace::SystemIO, 0x70, 2);
+    sec1300_register_field("\\S13P", "\\S13I", 16, 8, 1);
+
+    if crate::oregion::read_field("\\S13P") != Err(crate::oregion::FieldAccessError::Unsupported) {
+        return TestResult::Fail("SystemIO read past region length was not Unsupported");
+    }
+    if crate::oregion::write_field("\\S13P", 1)
+        != Err(crate::oregion::FieldAccessError::Unsupported)
+    {
+        return TestResult::Fail("SystemIO write past region length was not Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", sec1300_sysio_field_past_length_rejected);
+
+fn sec1300_ec_offsets_at_or_past_256_rejected() -> TestResult {
+    crate::__reset_for_test();
+    crate::oregion::__reset_for_test();
+
+    // Region declared length 512 — longer than the 256-byte EC
+    // window — so only the EC-specific check can reject these.
+    // (Pre-fix, byte 256 read EC offset 0 and byte 300 read
+    // offset 44 via the `as u8` truncation.)
+    sec1300_register_region("\\S13E", crate::oregion::RegionSpace::EmbeddedCtl, 0, 512);
+    sec1300_register_field("\\S13A", "\\S13E", 2048, 8, 1); // byte 256
+    sec1300_register_field("\\S13B", "\\S13E", 2400, 8, 1); // byte 300
+    sec1300_register_field("\\S13C", "\\S13E", 2040, 16, 2); // bytes 255..256, straddles
+    sec1300_register_field("\\S13D", "\\S13E", 2040, 8, 1); // byte 255, in-window control
+
+    // Second region, length exactly 256: byte 256 escapes by length too.
+    sec1300_register_region("\\S13G", crate::oregion::RegionSpace::EmbeddedCtl, 0, 256);
+    sec1300_register_field("\\S13F", "\\S13G", 2048, 8, 1); // byte 256
+
+    for path in ["\\S13A", "\\S13B", "\\S13C", "\\S13F"] {
+        if crate::oregion::read_field(path) != Err(crate::oregion::FieldAccessError::Unsupported) {
+            return TestResult::Fail("EC read at/past offset 256 was not Unsupported");
+        }
+    }
+    // Writes are asserted only for the fully out-of-window fields:
+    // the straddling field's in-window first unit would issue a
+    // real EC write before its second unit is rejected, so its
+    // write path is covered by the read assertion above.
+    for path in ["\\S13A", "\\S13B", "\\S13F"] {
+        if crate::oregion::write_field(path, 1)
+            != Err(crate::oregion::FieldAccessError::Unsupported)
+        {
+            return TestResult::Fail("EC write at/past offset 256 was not Unsupported");
+        }
+    }
+    // In-window control: byte 255 reads Ok (0 with no EC ports
+    // discovered; the live byte if an EC is present).
+    if crate::oregion::read_field("\\S13D").is_err() {
+        return TestResult::Fail("in-window EC read at byte 255 failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", sec1300_ec_offsets_at_or_past_256_rejected);
+
+fn sec1300_pci_config_field_past_length_rejected() -> TestResult {
+    // Device-blob shape copied from
+    // `smoke_aml_oregion_pci_config_resolves` so
+    // `resolve_pci_config_addr` can find _ADR/_BBN; the escaping
+    // field is registered directly at bit 128 (byte 16), one past
+    // the 16-byte region. Pre-fix, with ECAM present, this read
+    // the neighbouring function's config space.
+    crate::oregion::__reset_for_test();
+
+    // Device(\S13D): 0x5B 0x82, PkgLength = 46, rooted NameString '\'
+    let mut body: alloc::vec::Vec<u8> = alloc::vec![0x5B, 0x82, 46, b'\\'];
+    body.extend_from_slice(b"S13D");
+
+    // Name(_BBN, 0x00)
+    body.push(0x08);
+    body.extend_from_slice(b"_BBN");
+    body.push(0x00);
+
+    // Name(_ADR, DWord 0x00010000)
+    body.push(0x08);
+    body.extend_from_slice(b"_ADR");
+    body.push(0x0C);
+    body.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+
+    // OpRegion(S13R, PciConfig, 0x10, 0x10)
+    body.push(0x5B);
+    body.push(0x80);
+    body.extend_from_slice(b"S13R");
+    body.push(0x02);
+    body.push(0x0A);
+    body.push(0x10);
+    body.push(0x0A);
+    body.push(0x10);
+
+    // Field(S13R, DWordAcc, NoLock, Preserve) { S13X, 32 } at bit 0
+    // (in-region; proves the region resolved).
+    body.push(0x5B);
+    body.push(0x81);
+    body.push(0x0B);
+    body.extend_from_slice(b"S13R");
+    body.push(0x03);
+    body.extend_from_slice(b"S13X");
+    body.push(0x20);
+
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    // Escaping field: byte 16, DWordAcc, 32 bits.
+    sec1300_register_field("\\S13D.S13Y", "\\S13D.S13R", 128, 32, 3);
+
+    let ecam_present = narf_acpi::mcfg_ecam_base().is_some();
+    match crate::oregion::read_field("\\S13D.S13Y") {
+        Err(crate::oregion::FieldAccessError::Unsupported) => {}
+        Ok(_) => {
+            return TestResult::Fail("PciConfig read past region length succeeded");
+        }
+        Err(crate::oregion::FieldAccessError::NoField) => {
+            return TestResult::Fail("escaping PciConfig field not registered");
+        }
+        Err(crate::oregion::FieldAccessError::NoRegion) => {
+            return TestResult::Fail("PciConfig region missing");
+        }
+        Err(crate::oregion::FieldAccessError::TooWide) => {
+            return TestResult::Fail("escaping field TooWide");
+        }
+    }
+    if crate::oregion::write_field("\\S13D.S13Y", 1)
+        != Err(crate::oregion::FieldAccessError::Unsupported)
+    {
+        return TestResult::Fail("PciConfig write past region length was not Unsupported");
+    }
+    // Sanity: with ECAM present the in-region field still reads.
+    if ecam_present && crate::oregion::read_field("\\S13D.S13X").is_err() {
+        return TestResult::Fail("in-region PciConfig read failed despite ECAM present");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", sec1300_pci_config_field_past_length_rejected);
+
 fn smoke_aml_oregion_bank_field_writes_selector() -> TestResult {
     // BankField test: declare a SystemMemory region over a u64
     // backing buffer, a regular Field exposing the first byte as
