@@ -35,6 +35,39 @@ pub mod host {
     static __build_id_note_start: u8 = 0;
     #[no_mangle]
     static __build_id_note_end: u8 = 0;
+    // End of `.text` / `.rodata`, as the linker script emits them
+    // (same form as `drivers/usb/src/host_test_shims.rs`). Zeroed,
+    // equal to `__text_start`, so the ranges the KASLR / image
+    // scanners read are empty; those paths never run on host.
+    #[no_mangle]
+    static __text_end: u8 = 0;
+    #[no_mangle]
+    static __rodata_end: u8 = 0;
+    // Inert kallsyms anchors (`observability/src/kallsyms.rs`
+    // declares these `extern "C"`): the /proc/kallsyms feature
+    // (22a0e8077) made every binary that links `narf_filesystem`
+    // reference `_text`, which broke the `cargo-fuzz` link for
+    // the filesystem/ELF targets (fuzz-nightly red since
+    // 2026-11-19). On host the reservation is empty, so
+    // `kallsyms::table()` fails closed with `BadMagic` and no
+    // lookup ever dereferences these.
+    #[no_mangle]
+    static _text: u8 = 0;
+    #[no_mangle]
+    static __kallsyms_start: u8 = 0;
+    #[no_mangle]
+    static __kallsyms_end: u8 = 0;
+    // Bounds of the `.note.narf.probes` section, as the linker
+    // script emits them (same form as
+    // `drivers/usb/src/host_test_shims.rs`). Equal addresses give
+    // `tracing::probes()` an empty slice. The tracing kernel-test
+    // `smoke_tracing_note_section_present` references these, and
+    // kernel tests are compiled into every host rlib, so the link
+    // needs them even though no fuzz target exercises tracing.
+    #[no_mangle]
+    static __narf_probes_start: u8 = 0;
+    #[no_mangle]
+    static __narf_probes_end: u8 = 0;
 
     /// Inert NUMA topology (one node), as `frame/src/bare_main.rs`
     /// reports when ACPI has no SRAT.
@@ -53,6 +86,21 @@ pub mod host {
     #[no_mangle]
     extern "Rust" fn narf_numa_node_count() -> u32 {
         1
+    }
+
+    /// NUMA node of a physical address. No SRAT on host → node 0, as
+    /// `frame` reports for an address outside every SRAT range
+    /// (same form as `drivers/usb/src/host_test_shims.rs`).
+    #[no_mangle]
+    extern "Rust" fn narf_phys_to_node(_addr: u64) -> u32 {
+        0
+    }
+
+    /// NUMA node hosting a logical CPU. No SRAT on host → node 0, as
+    /// `frame` reports for a CPU with no proximity entry.
+    #[no_mangle]
+    extern "Rust" fn narf_cpu_to_node(_cpu: u32) -> u32 {
+        0
     }
 
     /// Base of the identity-mapped "physical" arena. On x86_64 the

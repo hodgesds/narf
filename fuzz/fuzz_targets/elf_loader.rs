@@ -17,8 +17,17 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use narf_fuzz::host;
 
 fuzz_target!(|data: &[u8]| {
+    // The parse itself needs no kernel services, but the link
+    // does: the `host` module carries the inert linker anchors
+    // (`__text_start`, `_text`, ...) the `narf_userspace` closure
+    // references, and the archive object is only pulled in when
+    // something calls into it. Same once-per-process ritual as
+    // the filesystem targets.
+    host::init();
+
     // libFuzzer inputs are bounded by -max_len in the nightly job;
     // the parser additionally caps its program-header table walk
     // at Linux's 64 KiB, so work per input is bounded by the input

@@ -17,7 +17,7 @@ edition = "2021"
 publish = false
 license = "GPL-2.0-or-later"
 repository = "https://github.com/hodgesds/narf"
-description = "libFuzzer targets for NARF parsers that consume untrusted bytes (ELF, filesystem images, BTF)."
+description = "libFuzzer targets for NARF parsers that consume untrusted bytes (ELF, filesystem images, BTF, ACPI/AML firmware tables, FDT blobs, EDID blocks)."
 
 [package.metadata]
 cargo-fuzz = true
@@ -38,6 +38,15 @@ narf-filesystem = { path = "../filesystem" }
 narf-lib = { path = "../lib" }
 narf-memory = { path = "../memory" }
 narf-scheduler = { path = "../scheduler" }
+narf-acpi = { path = "../acpi" }
+narf-aml = { path = "../aml" }
+narf-firmware-fdt = { path = "../firmware/fdt" }
+narf-edid = { path = "../edid" }
+# Provides the `narf_arch_cpu_id` / `narf_arch_current_domain`
+# hooks `narf-lib`'s unconditionally-compiled tests reference;
+# the FDT closure has no other crate that defines them (see
+# `fdt_blob.rs`).
+narf-arch = { path = "../arch" }
 
 # The targets. test/doc/bench disabled per cargo-fuzz convention so
 # `cargo test` / `cargo build` at the repo root never try to build
@@ -66,6 +75,34 @@ bench = false
 [[bin]]
 name = "btf_parse"
 path = "fuzz_targets/btf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acpi_table"
+path = "fuzz_targets/acpi_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aml_method"
+path = "fuzz_targets/aml_method.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fdt_blob"
+path = "fuzz_targets/fdt_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "edid_block"
+path = "fuzz_targets/edid_block.rs"
 test = false
 doc = false
 bench = false

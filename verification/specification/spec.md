@@ -352,6 +352,8 @@ coverage, reference revision and design invariants are recorded in
   - Narf-Ring message parser.
   - Virtio descriptor validator.
   - ELF loader (Stage 4).
+  - ACPI table decoders, AML namespace builder, FDT blob parser,
+    EDID block parser (firmware / display parsers, #1304).
 - Corpus stored in-tree under `fuzz/corpus/`; minimised weekly.
 - Crash reports become regression unit tests.
 

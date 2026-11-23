@@ -32,6 +32,10 @@ jobs:
           - fat_image
           - minix_image
           - btf_parse
+          - acpi_table
+          - aml_method
+          - fdt_blob
+          - edid_block
     steps:
       - uses: actions/checkout@v4
 
