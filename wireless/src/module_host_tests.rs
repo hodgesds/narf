@@ -282,8 +282,12 @@ fn smoke_module_host_operation_cancel_retains_started_work() -> TestResult {
     };
     unstarted.request_cancel();
     unstarted.advance(&mut cx);
+    // `polls` is 3, not 2: the started operation was polled twice before
+    // its cancel and once more for its terminal Ready above; the unstarted
+    // operation must add no poll of its own (a fourth would mean `advance`
+    // entered native work after the cancel dropped the future).
     if dropped.load(Ordering::Acquire) != 2
-        || polls.load(Ordering::Acquire) != 2
+        || polls.load(Ordering::Acquire) != 3
         || !matches!(unstarted.result, Some(Err(-125)))
     {
         return TestResult::Fail("unstarted module cancellation entered native work");
