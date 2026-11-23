@@ -679,7 +679,7 @@ pub(crate) fn remove_without_shrink(phys: PhysAddr, root: PhysAddr, va: VirtAddr
 /// shrink target is computed once per shard, after all of that shard's
 /// removals, instead of once per leaf.
 pub(crate) fn remove_batch(entries: &[(PhysAddr, PhysAddr, VirtAddr)]) {
-    for shard_index in 0..RMAP_SHARDS {
+    for (shard_index, _shard) in RMAP.iter().enumerate().take(RMAP_SHARDS) {
         // One scan per shard, no allocation: a shard with no entry in
         // this batch is skipped without touching its lock.
         if !entries
