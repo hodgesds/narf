@@ -1313,3 +1313,244 @@ fn smoke_cap_epoch_and_kind_single_read() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("capabilities", smoke_cap_epoch_and_kind_single_read);
+
+// ── derive-time source verification + Grant-gated delegate (#1292, SEC-B4) ──
+//
+// Before this fix `Cap::derive` checked only liveness, then
+// overwrote `slot.rights` — so a hand-forged slot whose type said
+// `Write` but whose slot carried `Read` (or nothing) derived a
+// fully valid `Read` cap out of thin air: the laundering hole.
+// The fixtures forge exactly those slots (via unsafe `Cap::mint`,
+// the only way to build a `Cap` outside mint/derive/transfer)
+// and pin the error each new leg produces. Forged slots are built
+// from a live bootstrap cap so the epoch is current and only the
+// field under test is wrong.
+
+fn smoke_cap_derive_refuses_forged_rights() -> TestResult {
+    // The laundering case: live Endpoint object, correct type tag,
+    // but the slot carries only the Read bit while the cap type
+    // demands Write. Pre-fix, `derive::<Read>()` succeeded and
+    // minted a Read cap indistinguishable from a legitimate one.
+    // Must report RightsTooWeak and mint nothing.
+    use crate::{Cap, CapError, CapKind, CapType, Read, Rights, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let real: Cap<TestObj, Write> = Cap::bootstrap();
+    let mut slot = real.slot();
+    slot.rights = Read::BITS;
+    // SAFETY: the slot names a live registered Endpoint object; only
+    // the rights field is altered, which is exactly the forgery
+    // under test.
+    let forged: Cap<TestObj, Write> = unsafe { Cap::mint(slot) };
+    match forged.derive::<Read>() {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("derive laundered a forged-rights cap"),
+    }
+    // Exact equality, not coverage: a slot carrying MORE bits than
+    // its type claims (Write | Read) is equally forged.
+    let mut wide = real.slot();
+    wide.rights = Write::BITS | Read::BITS;
+    // SAFETY: same live Endpoint object; only the rights field is
+    // altered, which is exactly the forgery under test.
+    let forged_wide: Cap<TestObj, Write> = unsafe { Cap::mint(wide) };
+    match forged_wide.derive::<Read>() {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("derive accepted a superset-rights slot"),
+    }
+    // A slot carrying NO rights at all must refuse the same way.
+    let mut bare = real.slot();
+    bare.rights = 0;
+    // SAFETY: same live Endpoint object; only the rights field is
+    // altered, which is exactly the forgery under test.
+    let forged_bare: Cap<TestObj, Write> = unsafe { Cap::mint(bare) };
+    match forged_bare.derive::<Read>() {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("derive accepted a zero-rights slot"),
+    }
+    // Positive control: the un-forged cap still derives.
+    if real.derive::<Read>().is_err() {
+        return TestResult::Fail("derive refused a legitimate Write cap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_derive_refuses_forged_rights);
+
+fn smoke_cap_derive_refuses_wrong_type_tag() -> TestResult {
+    // Live Endpoint object, correct rights, but the slot's type_tag
+    // claims Domain: the slot-local leg reports TypeMismatch.
+    use crate::{Cap, CapError, CapKind, CapType, Read, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let real: Cap<TestObj, Write> = Cap::bootstrap();
+    let mut slot = real.slot();
+    slot.type_tag = CapKind::Domain as u32;
+    // SAFETY: the slot names a live registered Endpoint object; only
+    // the type_tag field is altered, which is exactly the forgery
+    // under test.
+    let forged: Cap<TestObj, Write> = unsafe { Cap::mint(slot) };
+    match forged.derive::<Read>() {
+        Err(CapError::TypeMismatch) => {}
+        _ => return TestResult::Fail("derive accepted a wrong-type-tag cap"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_derive_refuses_wrong_type_tag);
+
+fn smoke_cap_delegate_grant_gated_derivation() -> TestResult {
+    // Positive path: a Grant holder derives a Read cap from another
+    // holder's live Write cap for the SAME object. The derived slot
+    // keeps the source's index/generation/type_tag and narrows
+    // rights to Read::BITS; the derived cap invokes, and neither
+    // the grant nor the source is consumed.
+    use crate::{Cap, CapKind, CapType, Grant, NoopOp, Read, Rights, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let write: Cap<TestObj, Write> = grant.derive().unwrap();
+    let read: Cap<TestObj, Read> = match grant.delegate(&write) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("Grant delegate failed"),
+    };
+    let s = read.slot();
+    if s.index != write.slot().index
+        || s.generation != write.slot().generation
+        || s.type_tag != write.slot().type_tag
+        || s.rights != Read::BITS
+    {
+        return TestResult::Fail("delegated cap slot did not match the source");
+    }
+    if read.invoke(NoopOp).is_err() {
+        return TestResult::Fail("invoke refused a legitimately delegated cap");
+    }
+    if !grant.is_live() || !write.is_live() {
+        return TestResult::Fail("delegate consumed the grant or the source");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_delegate_grant_gated_derivation);
+
+fn smoke_cap_delegate_refuses_wrong_object() -> TestResult {
+    // A Grant cap for A cannot authorise deriving from B's cap.
+    use crate::{Cap, CapError, CapKind, CapType, Grant, Read, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let other_write: Cap<TestObj, Write> = Cap::bootstrap();
+    match grant.delegate::<Write, Read>(&other_write) {
+        Err(CapError::ObjectMismatch) => {}
+        _ => return TestResult::Fail("cross-object delegate did not report ObjectMismatch"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_delegate_refuses_wrong_object);
+
+fn smoke_cap_delegate_refuses_forged_grant() -> TestResult {
+    // A hand-forged Grant cap (live, right object, but the Grant
+    // bit cleared — rights downgraded to Read) cannot delegate.
+    // Reachable only via unsafe `Cap::mint`, so this pins the
+    // runtime Grant-bit check rather than the type system (which
+    // already pins R = Grant).
+    use crate::{Cap, CapError, CapKind, CapType, Grant, Read, Rights, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let real: Cap<TestObj, Grant> = Cap::bootstrap();
+    let write: Cap<TestObj, Write> = real.derive().unwrap();
+    let mut slot = real.slot();
+    slot.rights = Read::BITS;
+    // SAFETY: the slot names a live registered Endpoint object; only
+    // the rights field is altered, which is exactly the forgery
+    // under test.
+    let forged: Cap<TestObj, Grant> = unsafe { Cap::mint(slot) };
+    match forged.delegate::<Write, Read>(&write) {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("delegate accepted a forged Grant cap"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_delegate_refuses_forged_grant);
+
+fn smoke_cap_delegate_refuses_forged_source_rights() -> TestResult {
+    // The laundering case, broker-side: the source Write cap's
+    // slot carries only Read, so delegating a Read cap from it
+    // must refuse RightsTooWeak even though the grant is genuine.
+    use crate::{Cap, CapError, CapKind, CapType, Grant, Read, Rights, Write};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    let grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let real_write: Cap<TestObj, Write> = grant.derive().unwrap();
+    let mut slot = real_write.slot();
+    slot.rights = Read::BITS;
+    // SAFETY: the slot names a live registered Endpoint object; only
+    // the rights field is altered, which is exactly the forgery
+    // under test.
+    let forged_write: Cap<TestObj, Write> = unsafe { Cap::mint(slot) };
+    match grant.delegate::<Write, Read>(&forged_write) {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("delegate laundered a forged-rights source cap"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "capabilities",
+    smoke_cap_delegate_refuses_forged_source_rights
+);
+
+fn smoke_cap_transfer_refuses_forged_rights() -> TestResult {
+    // Same-class hardening on the Grant-gated transfer path: a
+    // forged Grant cap (Grant bit cleared) cannot transfer, and a
+    // transferred cap whose slot does not carry exactly R::BITS
+    // cannot be installed into the receiver's table.
+    use crate::{Cap, CapError, CapKind, CapTable, CapType, Grant, Read, Rights};
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+    // Forged grant.
+    let real_grant: Cap<TestObj, Grant> = Cap::bootstrap();
+    let read: Cap<TestObj, Read> = real_grant.derive().unwrap();
+    let mut slot = real_grant.slot();
+    slot.rights = Read::BITS;
+    // SAFETY: the slot names a live registered Endpoint object; only
+    // the rights field is altered, which is exactly the forgery
+    // under test.
+    let forged_grant: Cap<TestObj, Grant> = unsafe { Cap::mint(slot) };
+    let mut target = CapTable::new();
+    match forged_grant.transfer(&read, &mut target) {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("transfer accepted a forged Grant cap"),
+    }
+    // Forged transferred cap: live Read cap for the same object,
+    // but the slot's rights downgraded to zero.
+    let grant2: Cap<TestObj, Grant> = Cap::bootstrap();
+    let real_read: Cap<TestObj, Read> = grant2.derive().unwrap();
+    let mut slot2 = real_read.slot();
+    slot2.rights = 0;
+    // SAFETY: the slot names a live registered Endpoint object; only
+    // the rights field is altered, which is exactly the forgery
+    // under test.
+    let forged_read: Cap<TestObj, Read> = unsafe { Cap::mint(slot2) };
+    let mut target2 = CapTable::new();
+    match grant2.transfer(&forged_read, &mut target2) {
+        Err(CapError::RightsTooWeak) => {}
+        _ => return TestResult::Fail("transfer installed a forged-rights cap"),
+    }
+    // Positive control: the un-forged pair still transfers.
+    let mut target3 = CapTable::new();
+    if grant2.transfer(&real_read, &mut target3).is_err() {
+        return TestResult::Fail("transfer refused a legitimate cap pair");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_transfer_refuses_forged_rights);
