@@ -718,19 +718,41 @@ generation gates below.
 
 ## 6. Out of scope
 
-- **Gen9 (Skylake / Kaby Lake / Coffee Lake)** — explicitly out
-  of scope. No device IDs are listed for it and none will be
-  added to this driver: the codec layer is Gen12-shaped
-  (combo-PHY DPLL, universal planes), so that generation would
-  need a separate display model, not more table rows. Gen11
-  (Ice Lake / Jasper Lake / Elkhart Lake) was excluded under this
-  bullet until Gen11 Lane 1 lifted it for identity + probe
-  (26 IDs in §5) and Lane 2 extended the lift to GEM mapping via
-  the legacy Gen8 PTE format; its display model is a separate
-  lane programme, and external display was gated until Lane 8
-  admitted it (§4, §12.3). GT execution
-  (execlists submission on RCS) was admitted by the Gen11
-  execlists lane (§8).
+- **Gen9 (Skylake / Kaby Lake / Coffee Lake / Whiskey Lake /
+  Comet Lake)** — in scope since Gen9 Lane 0 lifted the
+  exclusion (86-ID census to be added to §5 by Lane 1). The five families
+  are named explicitly: Comet Lake and Whiskey Lake were not
+  named in this bullet before the lift and must not stay
+  excluded by omission. Gen11 (Ice Lake / Jasper Lake /
+  Elkhart Lake) was excluded under this bullet until Gen11
+  Lane 1 lifted it for identity + probe (26 IDs in §5) and
+  Lane 2 extended the lift to GEM mapping via the legacy
+  Gen8 PTE format; its display model is a separate lane
+  programme, and external display was gated until Lane 8
+  admitted it (§4, §12.3). GT execution (execlists
+  submission on RCS) was admitted by the Gen11 execlists
+  lane (§8). Gen9 follows the same section-by-section
+  pattern: Lane 1 lifts identity + probe, Lane 2 GEM
+  mapping, Lane 3 execlists, Lane 4 the display clocks,
+  Lane 5 the modeset, Lane 6 power, Lane 7 GuC/HuC, Lane 8
+  external outputs (§12.4). The old reason for the
+  exclusion — "the codec layer is Gen12-shaped (combo-PHY
+  DPLL, universal planes), so that generation would need a
+  separate display model, not more table rows" — is now
+  only partly true and is no longer a reason to exclude:
+  universal planes are the Skylake invention, and the
+  Gen11 lanes have already transcribed the SKL
+  `DPLL_CTRL1` register (`intel_gpu_gen11_dpll.rs:711-830`).
+  The genuinely separate display model remains CDCLK via
+  LCPLL, the SKL WRPLL + CFGCR1/2, the SKL watermarks /
+  DBUF geometry, and the `DDI_BUF_TRANS` swing tables —
+  that is the Gen9 Lane 4 programme, not an exclusion.
+- **Gen9-LP (Broxton / Gemini Lake)** — explicitly out of
+  scope for the Gen9 programme (§12.4, Q3). 7 IDs (BXT
+  0A84/1A84/1A85/5A84/5A85, GLK 3184/3185), a different
+  DPIO PHY, and different DBUF geometry (512−4 / 1024−4
+  blocks, Linux `display/intel_display_device.c:848,863`).
+  A follow-up programme, not a Gen9 lane.
 - Arrow Lake display — identification landed (#1023, §5);
   display support rides #1016's Xe-LPG family via the shared
   Meteor Lake classification, not a separate Arrow Lake path.
@@ -1736,6 +1758,184 @@ register pins below.
   not program it either), and the VBT AFC-startup `div0`
   override are unmodelled. The EHL div-frac WA stays off
   (38.4 MHz ref on EHL B0+, stepping unmodelled).
+
+### 12.4 Gen9 scope (Lane 0)
+
+Gen9 (Skylake / Kaby Lake / Coffee Lake / Whiskey Lake /
+Comet Lake, display 9) is the second pre-Gen12 family
+admitted, after Gen11. Grounding:
+`~/workspace/queue/gen9-lane-grounding.md` (tip 7c66b42,
+re-validating the 2026-11-19 older-hardware audit at tip
+a9fc6637); every citation below was re-verified against
+the live tip at authoring time. This section is the
+scope anchor the implementation lanes extend the same way
+§8, §12.2 and §12.3 anchor the Gen11 lanes — each Gen9
+lane adds its per-lane section here or in its own
+section, it does not re-litigate scope.
+
+- **Lane plan** (Gen11 numbering reused where the scope
+  matches, so the two programmes diff lane by lane).
+  Lane 0 scope + spec (this section, no code). Lane 1
+  identity + probe: one `Generation` variant carrying
+  SKL–CML with a `Gen9Platform` sub-platform per product
+  (Skylake | KabyLake | CometLake; CFL rides the KBL
+  firmware family), 86 ID consts + `DEVICE_TABLE` rows
+  in `intel_gpu_pci_ids.rs` (§5 census), the pre-GMD
+  presence arm, `RegionGeneration::Gen9`, `PteFormat::Gen8`
+  + 39-bit DMA wiring, the VBT install arm. Lane 2 GT
+  bring-up: Gen9 arms at both exec sites
+  (`PteFormat::Gen8`, leaf 1, table policy 0) + fixtures.
+  Lane 3 execlists: `build_gen9_reg_state` from
+  `gen9_rcs_offsets`, 0x26 indirect offset, 6-entry CSB,
+  22-page render image, `gen9_init_indirectctx_bb` WA
+  batch, `GEN9_MEDIA_ENGINES` (VCS0/VCS1/VECS0) + the
+  small Gen9 forcewake domain table. Lane 4 display
+  clocks + DPLL + watermarks: `intel_gpu_gen9_cdclk.rs`
+  (SKL CDCLK via LCPLL), the SKL WRPLL + CFGCR1/2,
+  `intel_gpu_gen9_wm.rs` (Gen9 DBUF geometry), and
+  `intel_gpu_gen9_ddi.rs` (`DDI_BUF_TRANS` swing tables)
+  + the SPT GMBUS pin table. Lane 5 modeset: the Gen9
+  branches in `intel_gpu_modeset.rs` in Linux's SKL
+  order, first light on the internal display. Lane 6
+  power: `enable_gen9` (RC6 hysteresis 250),
+  `intel_gpu_gen9_dc_states.rs` (display-9 mask),
+  the Gen9 SAGV primitive (pcode 0x21). Lane 7 GuC/HuC
+  (deferrable, after Lane 3): the SKL/KBL/CML firmware
+  profiles + 1 MiB WOPCM. Lane 8 external outputs +
+  tests: the Gen9 DDI A–E port map, Gen9 IRQ routing,
+  and the Gen9 fixture families. Dependencies: Lane 1
+  blocks all. Lane 2 blocks Lane 3. Lane 4 blocks
+  Lane 5. Lanes 3 and 4 are independent of each other.
+  Lane 6 can run in parallel with Lanes 4/5. Lane 7 is
+  independent once Lane 3 lands. Lane 8 follows Lanes 5
+  and 3.
+- **What Gen9 inherits from Gen11's work** (no new code,
+  a Gen9 arm at the existing seam): the pre-GMD Stage-1
+  presence test (PCI config-space re-read, never 0xD8C /
+  0xFF8); the BAR0 16 MiB / GTT-at-8 MiB partitioning
+  (new `RegionGeneration::Gen9` arm, same contents);
+  `PteFormat::Gen8` legacy PPAT encode + both exec-site
+  wirings, GGTT with no PAT bits (`gen8_ggtt_pte_encode`),
+  the 39-bit DMA mask, and the 48-bit four-level PPGTT
+  walk (no VA-ceiling work — the EHL/JSL 36-bit note in
+  §5 is Gen11-only); the SKL plane admission rule
+  (256 KiB surface alignment, 32 KiB stride cap,
+  `intel_gpu_scanout.rs:74-92`); the forcewake engine
+  with the Gen9-named registers already modelled
+  (0xA278 / 0xA270 / 0xA188); the GMBUS block + protocol
+  (0xC5100); `DDI_BUF_CTL` addressing (0x64000, stride
+  0x100), DDI A–E a subset of the existing enum; the SKL
+  pcode CDCLK-notify protocol (cmd 0x7, pre 0x3, ready
+  0x1); the transcribed `DPLL_CTRL1` register (0x6C058)
+  + DP/HDMI ctrl1 computation
+  (`intel_gpu_gen11_dpll.rs:711-830`); the SKL watermark
+  algorithm core (`intel_gpu_gen11_wm.rs`); the
+  `gen9_dc_mask` source + the Gen11 DC module shape;
+  the DMC parse/load/verify machinery; the GuC 70.1.1
+  minimum-version profile shape; D3cold / runtime PM
+  (generation-independent, no arm); the VBT install path
+  (new Gen9 arm); the modeset dispatch pattern
+  (`gen11_platform` field, per-step branches,
+  `UnsupportedGeneration` hook).
+- **Genuinely new for Gen9** (no in-tree ancestor): the
+  86 IDs + `Generation` / `Gen9Platform`; `gen9_rcs_offsets`
+  + `build_gen9_reg_state`; the 6-entry CSB; the 0x26
+  indirect offset; the 22-page render image;
+  `gen9_init_indirectctx_bb`; SKL CDCLK via LCPLL; the
+  SKL WRPLL + CFGCR1/2; the SKL `DDI_BUF_TRANS` tables +
+  programming; the Gen9 media engine table (VCS0/VCS1/
+  VECS0); Gen9 IRQ routing; the Gen9 SAGV primitive;
+  the Gen9 DC mask/target; RC6 hysteresis 250.
+- **Gen11-only, do NOT carry to Gen9**: the ICL combo
+  PLL (CFGCR0 0x164000) + MG PLL + TBT PLL; the ICL
+  CDCLK table / voltage levels; the ICL/EHL/JSL DDI
+  tables; the Gen11 8-level watermark algorithm with
+  DBUF 2048 / S1|S2; the ICL DMC 1.09 / 0x6000; the
+  ICL/EHL GuC/HuC blobs; the QGV-point SAGV (0xe);
+  per-VDBOX/VEBOX forcewake; the 36-bit PPGTT note
+  (EHL/JSL only).
+- **Defaults and remainders** (open questions from the
+  grounding, §16 — recorded here with defaults so no
+  lane blocks on Daniel; he answers when he has a
+  minute):
+  - Q2 hardware target list: REMAINDER, unknown. The
+    lanes need at least one known test device per family;
+    GT1/GT2 vs GT3 matters (the GT3+ engine mask carries
+    VCS1, `i915_pci.c:497-500`; the GT1/GT2 mask is itself
+    a Lane 3 remainder below). Daniel's bringup testing
+    is his lane; the implementation lanes need the list.
+  - Q3 BXT/GLK (Gen9-LP): OUT of scope for this
+    programme — see §6. A follow-up, not a Gen9 lane.
+  - Q4 GuC requirement: DEFAULT execlists-only
+    submission, GuC-optional, mirroring Gen11 (Lane 7
+    after Lane 3). GuC submission stays optional on
+    Gen9 by design; the GuC is loaded where a GuC owner
+    exists, which is what HuC authentication requires.
+    Profiles (Linux `gt/uc/intel_uc_fw.c`
+    `INTEL_GUC_FIRMWARE_DEFS`): SKL `skl_guc_70.1.1`,
+    KBL/CFL/CML-rev<5 `kbl_guc_70.1.1`, CML-rev≥5
+    `cml_guc_70.1.1`, all at minimum 70.1.1. HuC
+    (`INTEL_HUC_FIRMWARE_DEFS`): SKL `skl_huc_2.0.0`,
+    KBL/CFL/CML-rev<5 `kbl_huc_4.0.0`, CML-rev≥5
+    `cml_huc_4.0.0`. WOPCM total is 1 MiB on Gen9
+    (`gt/intel_wopcm.c` `GEN9_WOPCM_SIZE`, vs 2 MiB
+    from Gen11).
+  - Q5 DMC requirement: DEFAULT REQUIRED for modeset,
+    mirroring Gen12 — this differs from Gen11, whose
+    load is best-effort / non-fatal. Blobs (Linux
+    `display/intel_dmc.c:166-183`): SKL
+    `skl_dmc_ver1_27`, KBL `kbl_dmc_ver1_04`, both with
+    a 0x3000 per-program ceiling (`BXT_DMC_MAX_FW_SIZE`,
+    half the ICL 0x6000). DMC gates DC5/DC6 entry, so a
+    modeset that claims power states without it is
+    incomplete; if Daniel overrules to best-effort, the
+    Gen9 DMC lane records it the Gen11 way instead.
+  - Q6 CML revision split: REMAINDER. CML rev ≥ 5 takes
+    the `cml_*` blobs, rev < 5 the KBL blobs
+    (`intel_uc_fw.c:106-107,127-128`), but the driver
+    does not model steppings/revisions yet. DEFAULT:
+    all CML takes KBL blobs until a rev≥5 part shows
+    up. Whether the revision becomes a probe-read PCI
+    revision ID, a build-time choice, or stays deferred
+    is the open question.
+  - Q7 display-vs-headless first: REMAINDER. Lanes 3
+    and 4 are independent, so either order works; the
+    answer sets which lane lands first, not the design.
+  - Q8 Gen11 follow-ups (EHL/JSL PORT_D + TBT alt-mode
+    + TCSS/FIA, the EHL/JSL 36-bit PPGTT ceiling, §5):
+    stay behind Gen9 rather than interleaving.
+- **Unverified items the lanes must settle** (grounding
+  §17 — each names its oracle; none is assumed here):
+  the 86-ID census per-ID (Lane 1 re-verifies each row
+  against `include/drm/intel/pciids.h`); the Gen9
+  context-descriptor upper-dword format (Lane 3 grounds
+  it against `gt/intel_lrc.c` descriptor construction —
+  do not copy the Gen11+ descriptor blindly); the Gen9
+  HWS CSB write-pointer dword (Lane 3 checks the Gen8
+  equivalent against `CNL_HWS_CSB_WRITE_INDEX`); the
+  Gen9 non-render context-image size (Lane 3 reads the
+  full switch in `gt/intel_engine_cs.c:274+` — the
+  `OTHER_IMAGE_PAGES = 2` "shared by every Gen8+"
+  claim is unverified for Gen9); the Gen9 GT1/GT2
+  engine mask (Lane 3 reads the per-SKU `*_info` blocks);
+  the Gen9 watermark level count (Lane 4 reads
+  `skl_setup_wm_latency` in `display/skl_watermark.c` —
+  Gen11 is 8, Gen9 is not yet confirmed 8); the
+  display-9 `max_dc` / allowed-DC mask (Lane 6 reads
+  `display/intel_display_power.c::get_allowed_dc_mask` —
+  the mask itself is UPTO_DC5 alone, the direct read of
+  `gen9_dc_mask` with no version arm adding anything);
+  the Gen9 scaler limits (Lane 5 or a scaler follow-up
+  reads `display/skl_scaler.c`'s display-9 branches —
+  panel fitting is not on the first-modeset path);
+  Gen9 interrupt routing register-by-register (Lane 8
+  grounds against `display/intel_display_irq.c` and
+  `gt/intel_gt_irq.c`).
+- **Stale pointer, not edited here**: §5's Gen11
+  paragraph still ends "Gen9 stays excluded (§6)".
+  That sentence is stale as of this lane; Lane 1 owns
+  §5 and updates it when it adds the Gen9 census —
+  do not edit §5 in a Lane 0 follow-up.
 
 ## 13. Suspend/resume + D-states (Stage 5 — `intel_gpu_pm`, #1015)
 
