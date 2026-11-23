@@ -12126,6 +12126,13 @@ const RING_CAP: usize = 64 * 1024;
 /// AF_UNIX socket starts with.
 const UNIX_DEFAULT_SNDBUF: usize = 212_992;
 
+/// Largest transfer that takes the synchronous handoff on the AF_UNIX
+/// fast path: a token-sized send/recv routes the selected exclusive
+/// waiter through `wake_urgent_task` (Linux `WF_SYNC`, as pipes already
+/// do for transfers below `PIPE_BUF` = 4096). Bulk transfers keep the
+/// ordinary wake so the running endpoint can batch.
+const UNIX_URGENT_HANDOFF_MAX: usize = 4096;
+
 /// `SKB_DATA_ALIGN(sizeof(struct skb_shared_info))` on x86_64/aarch64.
 const SKB_SHINFO_SIZE: usize = 320;
 
@@ -12150,6 +12157,14 @@ const UNIX_MAX_UNIT: usize = SKB_MAX_HEAD0 + 32 * 1024;
 /// 1000-byte, 49 3000-byte, 44 4096-byte, 24 8192-byte and 6 36544-byte
 /// sends before -EAGAIN.
 fn unix_skb_truesize(unit: usize) -> usize {
+    // Fast path: a unit this small never touches a page frag (`data_len`
+    // is 0 below `SKB_MAX_HEAD0`) and its 64-aligned head fits the
+    // 512-byte slab, so the charge is constant — exact for unit <= 192,
+    // where `unit.next_multiple_of(64) + SKB_SHINFO_SIZE <= 512`.
+    // This is the common case (100-byte socketpair messages charge 768).
+    if unit <= 192 {
+        return 512 + SKB_STRUCT_SIZE;
+    }
     let page_align = |n: usize| n.div_ceil(4096) * 4096;
     let data_len = if unit > SKB_MAX_HEAD0 {
         unit.min(page_align(unit - SKB_MAX_HEAD0))
@@ -12312,6 +12327,12 @@ pub struct RingBuf {
     /// release `inner` before taking this lock; publishers take it before
     /// sampling `inner`, so an older sample cannot overwrite a newer level.
     publish: IrqSafeSpinLock<()>,
+    /// Last readiness level published to [`Self::readiness`], mirrored here
+    /// so [`Self::publish_sampled`] can tell — without taking the cell lock
+    /// — whether a sampled level actually changed. Updated only under
+    /// `publish`, and the cell's mask is mutated only through that same
+    /// path, so the mirror is exact whenever `publish` is held.
+    published_mask: AtomicU32,
     closed: AtomicBool,
     /// The reading endpoint closed with data still queued: its writer's
     /// `sk_err` is ECONNRESET until consumed (see
@@ -12467,6 +12488,8 @@ impl RingBuf {
     fn new() -> Self {
         Self {
             publish: IrqSafeSpinLock::new(()),
+            // A fresh ring's cell starts at POLL_OUT (see `readiness` below).
+            published_mask: AtomicU32::new(narf_filesystem::POLL_OUT),
             inner: IrqSafeSpinLock::new(RingInner {
                 buf: VecDeque::new(),
                 packets: VecDeque::new(),
@@ -12522,22 +12545,43 @@ impl RingBuf {
         }
     }
 
-    /// Recompute the durable readiness cell from the current ring state and
-    /// publish the transition. POLL_IN = buffered data OR closed (a closed ring
-    /// is permanently readable so a parked reader wakes to a 0-byte EOF read),
-    /// POLL_OUT = has space (a closed ring still reports writable so a parked
-    /// writer wakes to discover EPIPE), POLL_HUP = closed. `set` bumps the edge
-    /// sequence and wakes armed waiters only on a rising edge, all under one
-    /// lock (drop-free), so a concurrent `arm` can never miss this transition.
-    /// Called after every write/read/close that changes occupancy; kept
-    /// alongside the legacy edge tokens + `wake_reader` during the migration.
-    fn sync_readiness(&self, event: u32) {
-        let publish = self.publish.lock();
-        let closed = self.closed.load(Ordering::Acquire);
-        let (data, space) = {
-            let g = self.inner.lock();
-            (!g.buf.is_empty() || !g.packets.is_empty(), g.has_space())
-        };
+    /// Publish a readiness transition from a level sampled while `publish`
+    /// is held. POLL_IN = buffered data OR closed (a closed ring is
+    /// permanently readable so a parked reader wakes to a 0-byte EOF read),
+    /// POLL_OUT = has space (a closed ring still reports writable so a
+    /// parked writer wakes to discover EPIPE), POLL_HUP = closed.
+    ///
+    /// Callers MUST hold [`Self::publish`] and MUST have sampled
+    /// (`data`, `space`) under [`Self::inner`] while holding it — the
+    /// write/read fast paths take `publish` before `inner` so the sample
+    /// and the publication are one atomic step and an older sample can
+    /// never overwrite a newer level. Folding the sample into the op's
+    /// own `inner` hold removes the second `inner` acquisition the old
+    /// `sync_readiness` paid on every send/recv.
+    ///
+    /// Fast path: when the level did not change AND no waiter is armed,
+    /// the cell update is skipped entirely — the cell already carries the
+    /// level, and with nobody registered no edge can be missed (a waiter
+    /// that arms concurrently checks the current level under the cell
+    /// lock before parking, so it observes the level either way). The
+    /// level comparison uses [`Self::published_mask`], which is exact
+    /// under `publish` because the cell's mask is mutated only here.
+    ///
+    /// Linux wait-queue wakeup: fire the waiters interested in the
+    /// DIRECTION that just saw activity even when the level did not change
+    /// (a follow-up write on an already-readable ring, a read that frees
+    /// space while POLL_OUT was already set) — so an epoll ready-list
+    /// edge is produced on every event, not just a rising level edge.
+    /// This is the job the per-ring readable/writable edge tokens used to
+    /// do. That edge is what the skip above forgoes when nobody is armed.
+    ///
+    /// `urgent` routes the selected exclusive waiter through the
+    /// scheduler's WF_SYNC-shaped handoff (`wake_urgent_task`, as pipes
+    /// do for token-sized transfers) so a small send/recv co-locates its
+    /// consumer instead of running the placement scan; bulk transfers
+    /// keep the ordinary wake so the running endpoint can batch. Closed
+    /// rings always wake all and never take the urgent route.
+    fn publish_sampled(&self, event: u32, data: bool, space: bool, closed: bool, urgent: bool) {
         let readable = data || closed;
         let add = (if readable {
             narf_filesystem::POLL_IN
@@ -12551,19 +12595,50 @@ impl RingBuf {
             narf_filesystem::POLL_IN
         }) | (if space { 0 } else { narf_filesystem::POLL_OUT })
             | (if closed { 0 } else { narf_filesystem::POLL_HUP });
-        // Linux wait-queue wakeup: fire the waiters interested in the DIRECTION
-        // that just saw activity even when the level did not change (a
-        // follow-up write on an already-readable ring, a read that frees space
-        // while POLL_OUT was already set) — so an epoll ready-list edge is
-        // produced on every event, not just a rising level edge. This is the
-        // job the per-ring readable/writable edge tokens used to do.
+        let old = self.published_mask.load(Ordering::Relaxed);
+        let new = (old & !clear) | add;
+        if !closed && new == old && !self.readiness.has_waiters() {
+            return;
+        }
         if closed {
             // Every blocked reader/writer must observe EOF/EPIPE, even if no
             // remaining data operation can relay the wake to another waiter.
             self.readiness.set_wake_all(add, clear);
+        } else if urgent {
+            let selected = self.readiness.set_event_with_exclusive_wake(
+                add,
+                clear,
+                event,
+                |task_id, waker| {
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                    narf_scheduler::wake_urgent_task(waker, task_id);
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    waker.wake_by_ref();
+                },
+            );
+            if let Some(task_id) = selected {
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                narf_scheduler::stackful::note_urgent_wake_preempt(task_id);
+            }
         } else {
             self.readiness.set_event(add, clear, event);
         }
+        self.published_mask.store(new, Ordering::Relaxed);
+    }
+
+    /// Recompute the durable readiness cell from the current ring state and
+    /// publish the transition. Kept for the paths that do not already hold
+    /// `inner` across their mutation (`close`, `set_sndbuf`); the
+    /// write/read fast paths fold their sample into the op's own `inner`
+    /// hold and call [`Self::publish_sampled`] directly.
+    fn sync_readiness(&self, event: u32) {
+        let publish = self.publish.lock();
+        let closed = self.closed.load(Ordering::Acquire);
+        let (data, space) = {
+            let g = self.inner.lock();
+            (!g.buf.is_empty() || !g.packets.is_empty(), g.has_space())
+        };
+        self.publish_sampled(event, data, space, closed, false);
         drop(publish);
     }
 
@@ -12607,6 +12682,9 @@ impl RingBuf {
     }
 
     fn write(&self, src: &[u8]) -> Result<usize, SockError> {
+        // Hold `publish` across the mutation so the sampled level and its
+        // publication are one atomic step (see `publish_sampled`).
+        let _publish = self.publish.lock();
         let mut g = self.inner.lock();
         let avail = RING_CAP.saturating_sub(g.buf.len());
         let n = core::cmp::min(src.len(), avail);
@@ -12615,17 +12693,27 @@ impl RingBuf {
             g.buf.extend(src[..n].iter().copied());
         }
         g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
+        let (data, space) = (!g.buf.is_empty() || !g.packets.is_empty(), g.has_space());
         drop(g);
         // Fire the readable wait-queue on EVERY write that adds bytes, not only
-        // on the empty->non-empty transition (sync_readiness `notify`s POLL_IN
-        // unconditionally). Linux re-fires an edge-triggered fd on every data
-        // arrival — so a follow-up write on a still-unread ring must also produce
-        // a fresh edge. Firing only on became-readable dropped the edge for bytes
-        // appended before the peer drained: an EPOLLET reader (dbus-broker on an
-        // accepted system-bus connection) never re-polled POLLIN and never read
-        // the client's follow-up bytes, stranding the D-Bus AUTH handshake.
+        // on the empty->non-empty transition (publish_sampled fires POLL_IN
+        // unconditionally while a waiter is armed). Linux re-fires an
+        // edge-triggered fd on every data arrival — so a follow-up write on a
+        // still-unread ring must also produce a fresh edge. Firing only on
+        // became-readable dropped the edge for bytes appended before the peer
+        // drained: an EPOLLET reader (dbus-broker on an accepted system-bus
+        // connection) never re-polled POLLIN and never read the client's
+        // follow-up bytes, stranding the D-Bus AUTH handshake. The skip in
+        // publish_sampled only fires with no waiter armed, so no EPOLLET
+        // reader can be waiting for that edge.
         if n != 0 {
-            self.sync_readiness(narf_filesystem::POLL_IN);
+            self.publish_sampled(
+                narf_filesystem::POLL_IN,
+                data,
+                space,
+                self.closed.load(Ordering::Acquire),
+                n <= UNIX_URGENT_HANDOFF_MAX,
+            );
         }
         Ok(n)
     }
@@ -12649,6 +12737,9 @@ impl RingBuf {
         fds: Vec<ScmRightsFile>,
         cred: Option<Ucred>,
     ) -> Result<usize, SockError> {
+        // Hold `publish` across the mutation so the sampled level and its
+        // publication are one atomic step (see `publish_sampled`).
+        let _publish = self.publish.lock();
         let mut g = self.inner.lock();
         let unit_max = (g.sndbuf >> 1).saturating_sub(64).clamp(1, UNIX_MAX_UNIT);
         let mut fds = Some(fds);
@@ -12698,12 +12789,19 @@ impl RingBuf {
             g.stream_wmem = g.stream_wmem.saturating_add(charge);
             sent += unit;
         }
+        let (data, space) = (!g.buf.is_empty() || !g.packets.is_empty(), g.has_space());
         drop(g);
         // See RingBuf::write: fire the readable wait-queue on every data-bearing
         // write so an EPOLLET reader re-fires on bytes appended before it
         // drained.
         if sent != 0 {
-            self.sync_readiness(narf_filesystem::POLL_IN);
+            self.publish_sampled(
+                narf_filesystem::POLL_IN,
+                data,
+                space,
+                self.closed.load(Ordering::Acquire),
+                sent <= UNIX_URGENT_HANDOFF_MAX,
+            );
         }
         Ok(sent)
     }
@@ -12729,6 +12827,9 @@ impl RingBuf {
         if src.len() > RING_CAP {
             return Err(SockError::MsgSize);
         }
+        // Hold `publish` across the mutation so the sampled level and its
+        // publication are one atomic step (see `publish_sampled`).
+        let _publish = self.publish.lock();
         let mut g = self.inner.lock();
         if src.len() > RING_CAP.saturating_sub(g.packet_bytes) {
             return Ok(0);
@@ -12740,15 +12841,29 @@ impl RingBuf {
         data.extend_from_slice(src);
         g.packets.push_back(PacketRecord { data, fds, cred });
         g.packet_bytes += src.len();
+        let (has_data, has_space) = (!g.buf.is_empty() || !g.packets.is_empty(), g.has_space());
         drop(g);
-        self.sync_readiness(narf_filesystem::POLL_IN);
+        self.publish_sampled(
+            narf_filesystem::POLL_IN,
+            has_data,
+            has_space,
+            self.closed.load(Ordering::Acquire),
+            src.len() <= UNIX_URGENT_HANDOFF_MAX,
+        );
         Ok(src.len())
     }
 
     fn read(&self, dst: &mut [u8], preserve_cred_boundary: bool) -> usize {
+        // Hold `publish` across the mutation so the sampled level and its
+        // publication are one atomic step (see `publish_sampled`).
+        let _publish = self.publish.lock();
         let mut g = self.inner.lock();
         let task = crate::handlers::current_task_id();
-        g.delivered_ancillary.remove(&task);
+        // Ancillary is attached only when a read actually delivered creds or
+        // fds; skip the map walk on the common no-ancillary fast path.
+        if !g.delivered_ancillary.is_empty() {
+            g.delivered_ancillary.remove(&task);
+        }
         let start = g.stream_read_seq;
         let mut active_cred = g.stream_read_cred;
         while g
@@ -12809,11 +12924,18 @@ impl RingBuf {
                 },
             );
         }
+        let (data, space) = (!g.buf.is_empty() || !g.packets.is_empty(), g.has_space());
         drop(g);
         if n != 0 {
             // Draining bytes can clear POLL_IN (ring now empty) and set POLL_OUT
             // (space freed); republish so a writer parked on this ring wakes.
-            self.sync_readiness(narf_filesystem::POLL_OUT);
+            self.publish_sampled(
+                narf_filesystem::POLL_OUT,
+                data,
+                space,
+                self.closed.load(Ordering::Acquire),
+                n <= UNIX_URGENT_HANDOFF_MAX,
+            );
         }
         n
     }
@@ -12822,7 +12944,11 @@ impl RingBuf {
     fn peek(&self, dst: &mut [u8], preserve_cred_boundary: bool) -> usize {
         let mut g = self.inner.lock();
         let task = crate::handlers::current_task_id();
-        g.delivered_ancillary.remove(&task);
+        // As in `read`: ancillary is attached only when a read actually
+        // delivered creds or fds.
+        if !g.delivered_ancillary.is_empty() {
+            g.delivered_ancillary.remove(&task);
+        }
         let start = g.stream_read_seq;
         let mut active_cred = g.stream_read_cred;
         let mut next_boundary = None;
@@ -12868,9 +12994,14 @@ impl RingBuf {
     /// Read exactly one record, discarding any tail that does not fit.
     /// Returns `(copied, full_record_len)`.
     fn read_packet(&self, dst: &mut [u8], peek: bool) -> Option<(usize, usize)> {
+        // Hold `publish` across the mutation so the sampled level and its
+        // publication are one atomic step (see `publish_sampled`).
+        let _publish = self.publish.lock();
         let mut g = self.inner.lock();
         let task = crate::handlers::current_task_id();
-        g.delivered_ancillary.remove(&task);
+        if !g.delivered_ancillary.is_empty() {
+            g.delivered_ancillary.remove(&task);
+        }
         let packet = g.packets.front()?;
         let full = packet.data.len();
         let copied = dst.len().min(full);
@@ -12887,10 +13018,17 @@ impl RingBuf {
                 .insert(task, DgramRecvAncillary { cred, fds });
         }
         if !peek {
+            let (data, space) = (!g.buf.is_empty() || !g.packets.is_empty(), g.has_space());
             drop(g);
             // A record was consumed: POLL_IN may fall (queue now empty) and
             // POLL_OUT may rise; republish for a writer parked on this ring.
-            self.sync_readiness(narf_filesystem::POLL_OUT);
+            self.publish_sampled(
+                narf_filesystem::POLL_OUT,
+                data,
+                space,
+                self.closed.load(Ordering::Acquire),
+                copied <= UNIX_URGENT_HANDOFF_MAX,
+            );
         }
         Some((copied, full))
     }

@@ -47,6 +47,7 @@
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Poll, Waker};
 
 use crate::sync::IrqSafeSpinLock;
@@ -164,6 +165,16 @@ impl Inner {
 /// A durable readiness cell owned by a blocking file/socket/pipe/etc.
 pub struct Readiness {
     inner: IrqSafeSpinLock<Inner>,
+    /// Lock-free waiter-presence signal for providers that must decide
+    /// whether a publication is observable without taking the cell lock.
+    /// Maintained exactly under `inner` at every `waiters` insert/remove:
+    /// +1 when an id is newly registered, -1 when a registered id leaves.
+    /// Over-counting would only publish more often (safe); under-counting
+    /// would skip a wake, so every mutation site below keeps it exact. A
+    /// stale read is harmless: a waiter that registers concurrently checks
+    /// the (current) level under the cell lock before parking, and the
+    /// skip it gates only fires when the level did not change.
+    waiters_present: AtomicUsize,
 }
 
 impl core::fmt::Debug for Readiness {
@@ -188,6 +199,7 @@ impl Readiness {
                 waiters: BTreeMap::new(),
                 exclusive_order: VecDeque::new(),
             }),
+            waiters_present: AtomicUsize::new(0),
         }
     }
 
@@ -355,19 +367,26 @@ impl Readiness {
         if ready != 0 {
             // Satisfied now: do not register — nothing to wake later.
             g.remove_exclusive_id(id);
-            g.waiters.remove(&id);
+            if g.waiters.remove(&id).is_some() {
+                self.waiters_present.fetch_sub(1, Ordering::Relaxed);
+            }
             return Poll::Ready(ready);
         }
         g.remove_exclusive_id(id);
-        g.waiters.insert(
-            id,
-            Waiter {
-                interest,
-                waker: waker.clone(),
-                exclusive,
-                persistent: false,
-            },
-        );
+        if g.waiters
+            .insert(
+                id,
+                Waiter {
+                    interest,
+                    waker: waker.clone(),
+                    exclusive,
+                    persistent: false,
+                },
+            )
+            .is_none()
+        {
+            self.waiters_present.fetch_add(1, Ordering::Relaxed);
+        }
         if exclusive {
             g.exclusive_order.push_back(id);
         }
@@ -388,15 +407,20 @@ impl Readiness {
     pub fn arm_persistent(&self, id: u64, interest: u32, waker: &Waker) -> u32 {
         let mut g = self.inner.lock();
         g.remove_exclusive_id(id);
-        g.waiters.insert(
-            id,
-            Waiter {
-                interest,
-                waker: waker.clone(),
-                exclusive: false,
-                persistent: true,
-            },
-        );
+        if g.waiters
+            .insert(
+                id,
+                Waiter {
+                    interest,
+                    waker: waker.clone(),
+                    exclusive: false,
+                    persistent: true,
+                },
+            )
+            .is_none()
+        {
+            self.waiters_present.fetch_add(1, Ordering::Relaxed);
+        }
         g.mask & interest
     }
 
@@ -408,15 +432,20 @@ impl Readiness {
     pub fn arm_persistent_exclusive(&self, id: u64, interest: u32, waker: &Waker) -> u32 {
         let mut g = self.inner.lock();
         g.remove_exclusive_id(id);
-        g.waiters.insert(
-            id,
-            Waiter {
-                interest,
-                waker: waker.clone(),
-                exclusive: true,
-                persistent: true,
-            },
-        );
+        if g.waiters
+            .insert(
+                id,
+                Waiter {
+                    interest,
+                    waker: waker.clone(),
+                    exclusive: true,
+                    persistent: true,
+                },
+            )
+            .is_none()
+        {
+            self.waiters_present.fetch_add(1, Ordering::Relaxed);
+        }
         g.exclusive_order.push_back(id);
         g.mask & interest
     }
@@ -448,13 +477,25 @@ impl Readiness {
     pub fn disarm(&self, id: u64) {
         let mut g = self.inner.lock();
         g.remove_exclusive_id(id);
-        g.waiters.remove(&id);
+        if g.waiters.remove(&id).is_some() {
+            self.waiters_present.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Number of currently-registered waiters. Diagnostics/tests only.
     #[must_use]
     pub fn waiter_count(&self) -> usize {
         self.inner.lock().waiters.len()
+    }
+
+    /// Whether any waiter is currently registered, WITHOUT taking the cell
+    /// lock. Providers use this on their publish fast path to decide
+    /// whether a level-unchanged publication is observable at all: with no
+    /// waiter armed, a same-level event has nobody to wake and the level
+    /// itself is already current, so the cell update can be skipped.
+    #[must_use]
+    pub fn has_waiters(&self) -> bool {
+        self.waiters_present.load(Ordering::Relaxed) != 0
     }
 }
 
@@ -971,6 +1012,44 @@ mod tests {
         assert_eq!(r.seq(), 1);
         r.set(IN, 0); // rising again
         assert_eq!(r.seq(), 2);
+    }
+
+    #[test]
+    fn has_waiters_tracks_arm_and_disarm_exactly() {
+        let r = Readiness::new(0);
+        let n = Arc::new(AtomicU32::new(0));
+        let w = counting_waker(&n);
+        assert!(!r.has_waiters());
+        // One-shot arm registers.
+        assert_eq!(r.arm(1, IN, &w), Poll::Pending);
+        assert!(r.has_waiters());
+        assert_eq!(r.waiter_count(), 1);
+        // Re-arming the same id replaces, not accumulates.
+        assert_eq!(r.arm(1, IN, &w), Poll::Pending);
+        assert!(r.has_waiters());
+        assert_eq!(r.waiter_count(), 1);
+        // A second id counts too; disarming one leaves the other.
+        assert_eq!(r.arm_exclusive(2, IN, &w), Poll::Pending);
+        assert_eq!(r.waiter_count(), 2);
+        r.disarm(1);
+        assert!(r.has_waiters());
+        assert_eq!(r.waiter_count(), 1);
+        // Disarming an absent id is a no-op (no under-count).
+        r.disarm(99);
+        assert!(r.has_waiters());
+        assert_eq!(r.waiter_count(), 1);
+        r.disarm(2);
+        assert!(!r.has_waiters());
+        assert_eq!(r.waiter_count(), 0);
+        // A satisfied arm never registers.
+        r.set(IN, 0);
+        assert_eq!(r.arm(3, IN, &w), Poll::Ready(IN));
+        assert!(!r.has_waiters());
+        // Persistent arms register too.
+        assert_eq!(r.arm_persistent(4, IN, &w), IN);
+        assert!(r.has_waiters());
+        r.disarm(4);
+        assert!(!r.has_waiters());
     }
 
     #[test]
