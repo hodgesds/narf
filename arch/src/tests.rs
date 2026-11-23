@@ -626,19 +626,19 @@ fn smoke_acpi_madt_vectors_capped() -> TestResult {
     // x2APICs (ids 100..103); the 8th IOAPIC is id 7; the 16th
     // override is source 15.
     match t.local_apics[59] {
-        acpi::MadtEntry::LocalApic { apic_id, .. } if apic_id == 59 => {}
+        acpi::MadtEntry::LocalApic { apic_id: 59, .. } => {}
         _ => return TestResult::Fail("60th local APIC not in place"),
     }
     match t.local_apics[63] {
-        acpi::MadtEntry::LocalX2Apic { x2apic_id, .. } if x2apic_id == 103 => {}
+        acpi::MadtEntry::LocalX2Apic { x2apic_id: 103, .. } => {}
         _ => return TestResult::Fail("x2APIC cap did not cut in table order"),
     }
     match t.io_apics[7] {
-        acpi::MadtEntry::IoApic { id, .. } if id == 7 => {}
+        acpi::MadtEntry::IoApic { id: 7, .. } => {}
         _ => return TestResult::Fail("8th IOAPIC not in place"),
     }
     match t.overrides[15] {
-        acpi::MadtEntry::IntOverride { source, .. } if source == 15 => {}
+        acpi::MadtEntry::IntOverride { source: 15, .. } => {}
         _ => return TestResult::Fail("16th override not in place"),
     }
     TestResult::Pass
