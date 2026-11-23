@@ -108,14 +108,16 @@ tags = ["drivers/wireless/iwlwifi", "drivers/net/iwlwifi"]
 path = "drivers/wireless/rtw"
 tags = ["drivers/wireless/rtw89", "drivers/wireless/rtw88"]
 
+# ath9k was promoted from the shared drivers/wireless crate into its own
+# nested crate by #2323.
+[[leaf]]
+path = "drivers/wireless/ath9k"
+tags = ["drivers/wireless/ath9k"]
+
 # Per-driver subdirs of the shared drivers/wireless crate.
 [[leaf]]
 path = "drivers/wireless/ath11k"
 tags = ["drivers/wireless/ath11k"]
-
-[[leaf]]
-path = "drivers/wireless/src/ath9k"
-tags = ["drivers/wireless/ath9k"]
 
 [[leaf]]
 path = "drivers/wireless/brcm/src/brcmfmac"
