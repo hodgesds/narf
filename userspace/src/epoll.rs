@@ -734,6 +734,110 @@ fn epoll_fd_waker(
     unsafe { core::task::Waker::from_raw(core::task::RawWaker::new(raw, &EPOLL_FD_VTABLE)) }
 }
 
+/// Stack-backed small buffer for the collect path.
+///
+/// `collect_ready_pass` built four heap `Vec`s per call (candidates,
+/// snapshot, results, ready-updates) — four small allocations per
+/// delivered event, under multi-threaded allocator contention, for
+/// batches that are almost always a handful of entries. Batches up to
+/// `COLLECT_STACK_CAP` entries stay on the stack; a larger batch spills
+/// to the heap exactly once, preserving the old behavior.
+const COLLECT_STACK_CAP: usize = 16;
+
+struct SmallBuf<T, const N: usize> {
+    stack: [Option<T>; N],
+    len: usize,
+    heap: Option<Vec<T>>,
+}
+
+impl<T, const N: usize> SmallBuf<T, N> {
+    fn new() -> Self {
+        Self {
+            stack: core::array::from_fn(|_| None),
+            len: 0,
+            heap: None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.heap.as_ref().map_or(self.len, |heap| heap.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn push(&mut self, value: T) {
+        if let Some(heap) = self.heap.as_mut() {
+            heap.push(value);
+            return;
+        }
+        if self.len < N {
+            self.stack[self.len] = Some(value);
+            self.len += 1;
+            return;
+        }
+        // Spill: move the stacked entries into a heap Vec once.
+        let mut heap = Vec::with_capacity(N * 2);
+        for slot in self.stack.iter_mut() {
+            if let Some(value) = slot.take() {
+                heap.push(value);
+            }
+        }
+        heap.push(value);
+        self.len = heap.len();
+        self.heap = Some(heap);
+    }
+
+    fn get(&self, idx: usize) -> Option<&T> {
+        if idx >= self.len() {
+            return None;
+        }
+        match &self.heap {
+            Some(heap) => heap.get(idx),
+            None => self.stack.get(idx).and_then(|slot| slot.as_ref()),
+        }
+    }
+
+    fn iter(&self) -> SmallBufIter<'_, T, N> {
+        SmallBufIter { buf: self, idx: 0 }
+    }
+
+    /// Rotate the filled prefix left by `mid` (the `scan_after` fairness
+    /// rotation of the fallback pass). `mid` is a position inside the
+    /// buffer, as produced by `Iterator::position`.
+    fn rotate_left(&mut self, mid: usize) {
+        if mid == 0 || self.len() <= 1 {
+            return;
+        }
+        match &mut self.heap {
+            Some(heap) => heap.rotate_left(mid),
+            None => self.stack[..self.len].rotate_left(mid),
+        }
+    }
+}
+
+impl<T, const N: usize> Default for SmallBuf<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct SmallBufIter<'a, T, const N: usize> {
+    buf: &'a SmallBuf<T, N>,
+    idx: usize,
+}
+
+impl<'a, T, const N: usize> Iterator for SmallBufIter<'a, T, N> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.buf.get(self.idx)?;
+        self.idx += 1;
+        Some(item)
+    }
+}
+
 impl EpollInstance {
     fn list_ready(&self, registration: &Arc<EpollRegistration>) -> bool {
         self.ready.lock().list(registration)
@@ -1208,8 +1312,13 @@ impl EpollInstance {
     /// non-cell-backed source, then (only if needed) a scan of the non-cell
     /// fallback set. Durable registrations make the ready-list authoritative
     /// for cell-backed files, so an empty eventfd/socket/pipe wait never scans
-    /// the cold interest tree.
-    fn collect_ready(&self, task_id: u64, maxevents: usize) -> Vec<(u32, u64)> {
+    /// the cold interest tree. Results come back in a stack-backed
+    /// [`SmallBuf`], not a heap `Vec` — see there.
+    fn collect_ready(
+        &self,
+        task_id: u64,
+        maxevents: usize,
+    ) -> SmallBuf<(u32, u64), COLLECT_STACK_CAP> {
         let fast = self.collect_ready_pass(task_id, maxevents, false);
         if !fast.is_empty() {
             return fast;
@@ -1235,7 +1344,12 @@ impl EpollInstance {
         }
     }
 
-    fn collect_ready_pass(&self, _task_id: u64, maxevents: usize, full: bool) -> Vec<(u32, u64)> {
+    fn collect_ready_pass(
+        &self,
+        _task_id: u64,
+        maxevents: usize,
+        full: bool,
+    ) -> SmallBuf<(u32, u64), COLLECT_STACK_CAP> {
         // Candidate snapshot, taken without holding the lock across the
         // poll_readiness() calls (which may themselves lock). Fast pass polls
         // the ready-list (fds whose per-fd waker fired or that were seeded at
@@ -1251,27 +1365,25 @@ impl EpollInstance {
         // changes it to PENDING, and write-back republishes that occurrence.
         // This is the role Linux's private txlist+ovflist pair serves, without a
         // global generation counter.
-        let snapshot: Vec<(i32, EpollSnapshot, bool)> = if full {
-            let (scan_after, fallback): (Option<i32>, Vec<(i32, Arc<EpollRegistration>)>) = {
+        let snapshot: SmallBuf<(i32, EpollSnapshot, bool), COLLECT_STACK_CAP> = if full {
+            let (scan_after, fallback): (
+                Option<i32>,
+                SmallBuf<(i32, Arc<EpollRegistration>), COLLECT_STACK_CAP>,
+            ) = {
                 let ready = self.ready.lock();
-                (
-                    ready.scan_after,
-                    ready
-                        .always_poll
-                        .iter()
-                        .map(|(fd, (registration, _))| (*fd, Arc::clone(registration)))
-                        .collect(),
-                )
+                let mut fallback = SmallBuf::new();
+                for (fd, (registration, _)) in ready.always_poll.iter() {
+                    fallback.push((*fd, Arc::clone(registration)));
+                }
+                (ready.scan_after, fallback)
             };
-            let mut entries: Vec<_> = fallback
-                .into_iter()
-                .filter_map(|(fd, registration)| {
-                    registration
-                        .active
-                        .load(Ordering::Acquire)
-                        .then(|| (fd, registration.snapshot(), false))
-                })
-                .collect();
+            let mut entries: SmallBuf<(i32, EpollSnapshot, bool), COLLECT_STACK_CAP> =
+                SmallBuf::new();
+            for (fd, registration) in fallback.iter() {
+                if registration.active.load(Ordering::Acquire) {
+                    entries.push((*fd, registration.snapshot(), false));
+                }
+            }
             if let Some(after) = scan_after {
                 if let Some(start) = entries.iter().position(|(fd, _, _)| *fd > after) {
                     entries.rotate_left(start);
@@ -1283,7 +1395,7 @@ impl EpollInstance {
             // Different waiters therefore reserve different FIFO nodes in O(1)
             // instead of searching a shared ordered index.
             let limit = maxevents.max(1);
-            let candidates: Vec<ReadyCandidate> = {
+            let candidates: SmallBuf<ReadyCandidate, COLLECT_STACK_CAP> = {
                 let mut ready = self.ready.lock();
                 let always = if ready.always_poll.is_empty() {
                     None
@@ -1312,7 +1424,7 @@ impl EpollInstance {
                 if always.is_some() && have_ready {
                     ready.prefer_always_poll = !ready.prefer_always_poll;
                 }
-                let mut candidates = Vec::with_capacity(limit + usize::from(always.is_some()));
+                let mut candidates = SmallBuf::new();
                 if always_first {
                     let registration = &always.as_ref().expect("always_first requires entry").1;
                     candidates.push((Arc::clone(registration), false));
@@ -1331,19 +1443,19 @@ impl EpollInstance {
                 candidates
             };
 
-            candidates
-                .into_iter()
-                .filter_map(|(registration, was_dequeued)| {
-                    if !registration.active.load(Ordering::Acquire) {
-                        return None;
-                    }
-                    let fd = registration.fd;
-                    Some((fd, registration.snapshot(), was_dequeued))
-                })
-                .collect()
+            let mut snapshot: SmallBuf<(i32, EpollSnapshot, bool), COLLECT_STACK_CAP> =
+                SmallBuf::new();
+            for (registration, was_dequeued) in candidates.iter() {
+                if !registration.active.load(Ordering::Acquire) {
+                    continue;
+                }
+                let fd = registration.fd;
+                snapshot.push((fd, registration.snapshot(), *was_dequeued));
+            }
+            snapshot
         };
 
-        let mut results = Vec::new();
+        let mut results: SmallBuf<(u32, u64), COLLECT_STACK_CAP> = SmallBuf::new();
         // Poll providers without epoll locks, then validate the subscription
         // version and commit delivery under the registration-state lock. A
         // concurrent CTL_MOD changes `sub_id`; a concurrent CTL_DEL clears
@@ -1351,9 +1463,12 @@ impl EpollInstance {
         // cannot acknowledge provider state, disarm a newly rearmed oneshot, or
         // overwrite the new edge mask.
         // (registration, sampled sub_id, was dequeued, keep ready, disarm cold indexes)
-        let mut ready_updates = Vec::new();
+        let mut ready_updates: SmallBuf<
+            (Arc<EpollRegistration>, u64, bool, bool, bool),
+            COLLECT_STACK_CAP,
+        > = SmallBuf::new();
         let mut processed = 0usize;
-        for (_fd, item, dequeued) in &snapshot {
+        for (_fd, item, dequeued) in snapshot.iter() {
             // `maxevents` limits acceptance, not merely userspace copying.
             // Do not poll, acknowledge, advance edge state, or disarm a one-shot
             // entry that this wait cannot return.
@@ -1428,28 +1543,31 @@ impl EpollInstance {
         // If an always-polled candidate filled the userspace batch first, put
         // any ready nodes detached behind it back at the tail. They were never
         // polled, so their occurrence is still pending.
-        let unprocessed: Vec<_> = snapshot[processed..]
-            .iter()
-            .filter(|(_, _, dequeued)| *dequeued)
-            .map(|(_, item, _)| Arc::clone(&item.registration))
-            .collect();
+        let mut unprocessed: SmallBuf<Arc<EpollRegistration>, COLLECT_STACK_CAP> = SmallBuf::new();
+        for (_, item, dequeued) in snapshot.iter().skip(processed) {
+            if *dequeued {
+                unprocessed.push(Arc::clone(&item.registration));
+            }
+        }
         let needs_ready_write = !unprocessed.is_empty()
             || ready_updates
                 .iter()
                 .any(|(_, _, dequeued, _, disarm_cold_indexes)| *dequeued || *disarm_cold_indexes);
         let ready_remains = if needs_ready_write {
             let mut ready = self.ready.lock();
-            for (registration, sub_id, dequeued, keep_ready, disarm_cold_indexes) in ready_updates {
-                if disarm_cold_indexes {
-                    ready.remove_always_poll_version(&registration, sub_id);
-                    ready.remove_deadline_poll_version(&registration, sub_id);
+            for (registration, sub_id, dequeued, keep_ready, disarm_cold_indexes) in
+                ready_updates.iter()
+            {
+                if *disarm_cold_indexes {
+                    ready.remove_always_poll_version(registration, *sub_id);
+                    ready.remove_deadline_poll_version(registration, *sub_id);
                 }
-                if dequeued {
-                    ready.finish_poll(&registration, keep_ready);
+                if *dequeued {
+                    ready.finish_poll(registration, *keep_ready);
                 }
             }
-            for registration in unprocessed {
-                ready.finish_poll(&registration, true);
+            for registration in unprocessed.iter() {
+                ready.finish_poll(registration, true);
             }
             !ready.is_empty()
         } else {
@@ -2677,14 +2795,29 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             // generic I/O waiter list and its wake-all herd.
                             uc.durable_io_wait
                                 .store(instance.wakes_only_through_ready_list(), Ordering::Release);
+                            // Re-publish this call's park deadline.
+                            // `own_stack_park_until` zeroes
+                            // `sleep_deadline_ns` when a park ends, and
+                            // `park_should_block` treats 0 as "no park
+                            // state": it skips every waker/timer
+                            // registration and returns "don't park" at
+                            // once. A wait resumed in place (below) that
+                            // re-parks without re-storing its deadline
+                            // would spin through collect -> park ->
+                            // immediate return. Publish the deadline on
+                            // every park — the persisted finite deadline,
+                            // or unbounded — as the handler top did for
+                            // the first one.
+                            uc.sleep_deadline_ns
+                                .store(deadline_ns.unwrap_or(u64::MAX), Ordering::Release);
                             // Clamp the scheduler wake-up to the nearest armed
                             // timerfd in the interest set. A timerfd expiry does
                             // NOT fire a readiness notify (unlike socket data), so
                             // without this clamp a timerfd-driven wait sleeps until
                             // the full timeout — or, with an infinite timeout (the
-                            // Wayland repaint loop), forever. On wake the syscall
-                            // re-executes from the top and re-polls, finding the
-                            // timer ready. (For a finite timeout this replaces the
+                            // Wayland repaint loop), forever. On wake the wait
+                            // resumes at the loop's collect and re-polls, finding
+                            // the timer ready. (For a finite timeout this replaces the
                             // persisted timeout deadline with the earlier timer one;
                             // since the timer is readable at that instant the re-poll
                             // returns its event before the timeout path is reached.
@@ -2719,20 +2852,37 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                             if own_stack {
                                 crate::handlers::own_stack_block(ctx);
+                                // `own_stack_block` returns IN PLACE on this
+                                // task's own stack once the park ends —
+                                // unlike the legacy hook below, which
+                                // longjmps out and re-enters the handler
+                                // from the top. Every local this call built
+                                // (the resolved instance, the validated
+                                // args, the persisted deadline) is still
+                                // live, so resume at the loop's collect
+                                // instead of returning to a RIP-rewound
+                                // re-execution that redoes the fd lookup,
+                                // validation, access_ok and deadline setup
+                                // for every delivered event. The undo is
+                                // the same fixed 2 bytes this handler
+                                // rewound — NOT
+                                // `resume_parked_syscall_in_place`, which
+                                // undoes the architecture's syscall-insn
+                                // length (4 on aarch64); the signal path
+                                // already undoes this handler's rewind the
+                                // same way.
                                 // `ep_poll`: a signal ends the wait with a
                                 // plain -EINTR — not a restart code, so a
                                 // stop/continue or a SA_RESTART handler still
                                 // sees EINTR (signal(7)) — after one more
                                 // look for events and the timeout, which
-                                // win over it. Run that pass now rather than
-                                // handing the exit trap a restart-pending
-                                // frame, which would restart the wait.
-                                if crate::handlers::has_interrupting_signal(task) {
-                                    ctx.set_rip(ctx.rip().wrapping_add(2));
-                                    uc.syscall_parked_restarting.store(false, Ordering::Release);
-                                    continue;
-                                }
-                                return;
+                                // win over it. The loop's next iteration
+                                // runs that pass before the park section's
+                                // EINTR return, so no restart-pending frame
+                                // is handed to the exit trap.
+                                ctx.set_rip(ctx.rip().wrapping_add(2));
+                                uc.syscall_parked_restarting.store(false, Ordering::Release);
+                                continue;
                             }
                             // `can_park_with_task_context` above established that
                             // the legacy execution path has its mandatory hook.
@@ -3186,8 +3336,11 @@ mod tests {
         if !parent.ctl_add(FD + 1, &child_ops, 0, EPOLLIN, 0x44, &parent_ops) {
             return TestResult::Fail("parent CTL_ADD failed");
         }
-        match parent.collect_ready(TASK, 1).as_slice() {
-            [(events, data)] if events & EPOLLIN != 0 && *data == 0x44 => {}
+        let ready = parent.collect_ready(TASK, 1);
+        let mut it = ready.iter();
+        match it.next() {
+            Some((events, data))
+                if *events & EPOLLIN != 0 && *data == 0x44 && it.next().is_none() => {}
             _ => {
                 return TestResult::Fail(
                     "nesting an already-ready epoll must seed the parent ready list",
