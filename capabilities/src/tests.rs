@@ -152,18 +152,23 @@ fn smoke_cap_revoke_subtree_enumerates_derivations() -> TestResult {
     // The count enumerates the derived rights-subsets covered; the
     // kill itself is object-wide (siblings die too — asserted here
     // so no caller mistakes the count for selective sparing).
-    use crate::{Cap, CapKind, CapType, Invoke, Read, Write};
+    use crate::{Cap, CapKind, CapType, Grant, Invoke, Read, Write};
 
     struct TestObj;
     impl CapType for TestObj {
         const KIND: CapKind = CapKind::Endpoint;
     }
 
-    // Edges: Write -> Read, Write -> Invoke, Invoke -> Read.
+    // Edges: Grant -> Write, Grant -> Invoke, Write -> Read,
+    // Invoke -> Read. Invoke is orthogonal to Write (spec §3
+    // lattice: Read | Write | Invoke is the observe / mutate /
+    // trigger triple), so only the Grant mint derives Invoke — a
+    // Write cap weakens to Read, never to Invoke.
     // Rooted at Read: only Read itself.
-    let w: Cap<TestObj, Write> = Cap::bootstrap();
+    let g: Cap<TestObj, Grant> = Cap::bootstrap();
+    let w: Cap<TestObj, Write> = g.derive().unwrap();
     let r1: Cap<TestObj, Read> = w.derive().unwrap();
-    let i1: Cap<TestObj, Invoke> = w.derive().unwrap();
+    let i1: Cap<TestObj, Invoke> = g.derive().unwrap();
     let _r2: Cap<TestObj, Read> = i1.derive().unwrap();
     if r1.revoke_subtree() != 1 {
         return TestResult::Fail("revoke_subtree(Read) covered more than the Read node");
@@ -172,9 +177,10 @@ fn smoke_cap_revoke_subtree_enumerates_derivations() -> TestResult {
         return TestResult::Fail("revoke_subtree(Read) left a sibling live");
     }
     // Rooted at Invoke: Invoke + Read.
-    let w: Cap<TestObj, Write> = Cap::bootstrap();
+    let g: Cap<TestObj, Grant> = Cap::bootstrap();
+    let w: Cap<TestObj, Write> = g.derive().unwrap();
     let _r1: Cap<TestObj, Read> = w.derive().unwrap();
-    let i1: Cap<TestObj, Invoke> = w.derive().unwrap();
+    let i1: Cap<TestObj, Invoke> = g.derive().unwrap();
     let _r2: Cap<TestObj, Read> = i1.derive().unwrap();
     if i1.revoke_subtree() != 2 {
         return TestResult::Fail("revoke_subtree(Invoke) did not cover Invoke + Read");
@@ -182,12 +188,14 @@ fn smoke_cap_revoke_subtree_enumerates_derivations() -> TestResult {
     if w.is_live() {
         return TestResult::Fail("revoke_subtree(Invoke) left the parent live");
     }
-    // Rooted at the mint: the whole tree.
-    let w: Cap<TestObj, Write> = Cap::bootstrap();
+    // Rooted at the mint (Grant): the whole tree.
+    let g: Cap<TestObj, Grant> = Cap::bootstrap();
+    let w: Cap<TestObj, Write> = g.derive().unwrap();
     let _r1: Cap<TestObj, Read> = w.derive().unwrap();
-    let _i1: Cap<TestObj, Invoke> = w.derive().unwrap();
-    if w.revoke_subtree() != 3 {
-        return TestResult::Fail("revoke_subtree(Write) did not cover the whole tree");
+    let _i1: Cap<TestObj, Invoke> = g.derive().unwrap();
+    let _r2: Cap<TestObj, Read> = _i1.derive().unwrap();
+    if g.revoke_subtree() != 4 {
+        return TestResult::Fail("revoke_subtree(Grant) did not cover the whole tree");
     }
     // An already-dead cap revokes nothing.
     let w: Cap<TestObj, Write> = Cap::bootstrap();
