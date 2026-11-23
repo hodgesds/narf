@@ -14,8 +14,9 @@
 //!   (`display/skl_watermark.c`) write `GEN9_SAGV_ENABLE` /
 //!   request `GEN9_SAGV_DISABLE` and poll for
 //!   `GEN9_SAGV_IS_DISABLED`. It is the Skylake (display 9)
-//!   path; `skl_sagv_pre/post_plane_update` runs it only
-//!   below display 11.
+//!   path, implemented in `intel_gpu_gen9_sagv`;
+//!   `skl_sagv_pre/post_plane_update` runs it only below
+//!   display 11.
 //! - On display 11 SAGV is controlled by restricting QGV
 //!   points: `icl_pcode_restrict_qgv_points`
 //!   (`display/intel_bw.c`) sends
