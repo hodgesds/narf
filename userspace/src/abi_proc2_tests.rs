@@ -4452,3 +4452,31 @@ kernel_test_in!(
     "syscall_abi/proc_snapshot",
     smoke_proc_cpu_time_split_matches_thread_and_sched_views
 );
+
+/// A task's `/proc/<pid>/schedstat` pcount comes from the dispatch counter:
+/// noting dispatches on the fixture task moves the snapshot's third field
+/// by exactly that much. Regression test for #2400: the count used to be
+/// folded only by the legacy longjmp poll tail, so a live thread's pcount
+/// stayed 0 and schbench divided runqueue_ns by it.
+#[cfg(feature = "kernel-test")]
+fn smoke_schedstat_pcount_counts_dispatches() -> TestResult {
+    with_setup(|| {
+        let before = crate::handlers::proc_sched_snapshot(FAKE_TASK).timeslices;
+        if !crate::task::__test_note_dispatch(FAKE_TASK) {
+            return Err("missing dispatch fixture task");
+        }
+        if !crate::task::__test_note_dispatch(FAKE_TASK) {
+            return Err("missing dispatch fixture task");
+        }
+        let after = crate::handlers::proc_sched_snapshot(FAKE_TASK).timeslices;
+        if after != before + 2 {
+            return Err("schedstat pcount did not count the dispatches");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/proc_snapshot",
+    smoke_schedstat_pcount_counts_dispatches
+);

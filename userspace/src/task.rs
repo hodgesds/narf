@@ -110,10 +110,6 @@ pub struct Task {
     /// threads and reaped children. Shared by every `CLONE_THREAD` sibling.
     pub(crate) process_cputime: Arc<crate::proc_cpu_time::ProcessCputime>,
     pub(crate) storage_io: Arc<narf_block::stats::ProcessStorageIo>,
-    /// Run slices this task has completed — Linux's third
-    /// `/proc/<pid>/schedstat` field (`se.statistics` "timeslices"), folded
-    /// at the slice boundary of the legacy (non-own-stack) user path.
-    timeslices: AtomicU64,
     /// Slices that ended because the task PARKED (`nr_voluntary_switches`).
     voluntary_switches: AtomicU64,
     /// Slices that ended any other way — the trap returned and the task was
@@ -266,7 +262,6 @@ impl Task {
             cputime,
             process_cputime,
             storage_io,
-            timeslices: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
             parked_this_slice: AtomicU32::new(0),
@@ -668,8 +663,19 @@ pub(crate) fn note_park(tid: u64) {
     }
 }
 
-/// Fold a completed run slice into the switch counters. Called at the same
-/// slice boundary of the legacy user path, so one slice is one count.
+/// Fold a completed run slice into the voluntary/involuntary switch
+/// counters. Called at the slice boundary of the legacy user path, so one
+/// slice is one count.
+///
+/// The dispatch count itself (`/proc/<pid>/schedstat`'s third field) no
+/// longer lives here: it is counted at slice start by the scheduler's
+/// `stamp_slice_start`, the single choke point every dispatch path shares.
+/// This fold used to count it too, but it only runs on the legacy (non-
+/// own-stack) x86_64 poll tail, which production boots never reach — so the
+/// count stayed 0 for every live thread and schbench divided by it (#2400).
+/// The two counters below still read 0 under own-stack (same root cause,
+/// different fields); fixing them needs a dispatch-time classification hook
+/// the scheduler cannot see, and is a separate remainder.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn note_slice_end() {
@@ -681,7 +687,6 @@ pub(crate) fn note_slice_end() {
     // — the scheduler published this pointer for the in-flight task and keeps
     // it pinned for the duration of the poll.
     let task = unsafe { &*ptr };
-    task.timeslices.fetch_add(1, Ordering::Relaxed);
     if task.parked_this_slice.swap(0, Ordering::Relaxed) != 0 {
         task.voluntary_switches.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -689,12 +694,14 @@ pub(crate) fn note_slice_end() {
     }
 }
 
-/// `(timeslices, voluntary_switches, involuntary_switches)` for `tid`.
+/// `(dispatches, voluntary_switches, involuntary_switches)` for `tid`:
+/// the task's slice-start count (Linux `sched_info.pcount`) and its two
+/// switch counters.
 #[inline]
 pub(crate) fn switch_counts(tid: u64) -> (u64, u64, u64) {
     task_get(tid).map_or((0, 0, 0), |task| {
         (
-            task.timeslices.load(Ordering::Relaxed),
+            task.cputime.dispatches(),
             task.voluntary_switches.load(Ordering::Relaxed),
             task.involuntary_switches.load(Ordering::Relaxed),
         )
@@ -766,6 +773,17 @@ pub fn __test_reset_cpu_ns(tid: u64) {
     if let Some(task) = task_get(tid) {
         task.cputime.__test_reset();
     }
+}
+
+/// Test hook: count one dispatch on a registered thread directly, as
+/// `stamp_slice_start` would have. Only for a thread that is not running
+/// (every ABI fixture identity).
+#[doc(hidden)]
+pub fn __test_note_dispatch(tid: u64) -> bool {
+    task_get(tid).is_some_and(|task| {
+        task.cputime.__test_note_dispatch();
+        true
+    })
 }
 
 /// Every live thread id in thread group `pid`.
