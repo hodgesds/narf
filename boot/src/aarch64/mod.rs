@@ -301,7 +301,15 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         let mut memory = [Reservation::default(); MAX_MEM_REGIONS];
         let memory_len = narf_firmware_fdt::copy_memory_ranges(blob, &mut memory);
         let mut reservations = [Reservation::default(); MAX_MEM_REGIONS * 2];
-        let mut reservation_len = narf_firmware_fdt::copy_reservations(blob, &mut reservations);
+        let mut reservation_len =
+            match narf_firmware_fdt::copy_reservations(blob, &mut reservations) {
+                Some(n) => n,
+                // An unterminated or out-of-block reserve map is
+                // malformed firmware: fail closed instead of booting
+                // with phantom reservations (or silently dropped
+                // ones) in the memory map.
+                None => return Err(BootError::MalformedBootInfo),
+            };
         let mut reserved_nodes = [ReservedRegion::default(); MAX_MEM_REGIONS];
         let reserved_len =
             narf_firmware_fdt::copy_reserved_memory_ranges(blob, &mut reserved_nodes);

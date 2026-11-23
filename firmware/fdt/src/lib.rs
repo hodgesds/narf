@@ -132,6 +132,8 @@ pub fn parse_header(blob: &[u8]) -> Option<Header> {
             || reserve_start < HEADER_LEN
             || struct_end > total
             || strings_end > total
+            || reserve_start > total
+            || (struct_start < strings_end && strings_start < struct_end)
         {
             return None;
         }
@@ -152,25 +154,57 @@ pub fn parse_header(blob: &[u8]) -> Option<Header> {
 }
 
 /// Decode the memory-reserve map. Returns the number of
-/// non-terminator entries copied.
-pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> usize {
+/// non-terminator entries copied, or `None` when the map is
+/// malformed. On `None`, `out` may be partially filled and
+/// must be ignored by the caller.
+///
+/// The reserve map carries no size field: it ends at the first
+/// block boundary after it (the nearer of the struct / strings
+/// block starts, or `totalsize`). A scan that reaches that
+/// boundary without seeing the all-zeros terminator is malformed
+/// — without the bound, struct-block words would parse as
+/// `(addr, size)` reservations and feed the boot memory map.
+/// A block that starts before the map and extends past its start
+/// overlaps the map and is likewise malformed.
+pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> Option<usize> {
     let hdr = match parse_header(blob) {
         Some(h) => h,
-        None => return 0,
+        None => return None,
     };
-    let mut cur = hdr.off_mem_rsvmap as usize;
+    let reserve_start = hdr.off_mem_rsvmap as usize;
+    let mut limit = hdr.totalsize as usize;
+    for (start, end) in [
+        (
+            hdr.off_dt_struct as usize,
+            hdr.off_dt_struct as usize + hdr.size_dt_struct as usize,
+        ),
+        (
+            hdr.off_dt_strings as usize,
+            hdr.off_dt_strings as usize + hdr.size_dt_strings as usize,
+        ),
+    ] {
+        if start >= reserve_start {
+            limit = limit.min(start);
+        } else if end > reserve_start {
+            return None;
+        }
+    }
+    if reserve_start >= limit {
+        return None;
+    }
+    let mut cur = reserve_start;
     let mut n = 0;
     loop {
-        if cur + 16 > blob.len() {
-            break;
+        if cur + 16 > limit {
+            return None;
         }
         let addr = match be_u64(blob, cur) {
             Some(v) => v,
-            None => break,
+            None => return None,
         };
         let size = match be_u64(blob, cur + 8) {
             Some(v) => v,
-            None => break,
+            None => return None,
         };
         if addr == 0 && size == 0 {
             break;
@@ -181,7 +215,7 @@ pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> usize {
         }
         cur += 16;
     }
-    n
+    Some(n)
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -254,6 +288,11 @@ impl<'a> Path<'a> {
 pub struct PropIter<'a> {
     blob: &'a [u8],
     cur: usize,
+    /// End of the struct block: property payloads are bounded
+    /// here, never at `blob.len()`, so a property whose declared
+    /// length runs past the struct block stops the iteration
+    /// instead of yielding strings-block bytes as a payload.
+    end: usize,
     strings: &'a [u8],
 }
 
@@ -261,6 +300,9 @@ impl<'a> Iterator for PropIter<'a> {
     type Item = (&'a str, &'a [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if self.cur + 4 > self.end {
+                return None;
+            }
             let token = be_u32(self.blob, self.cur)?;
             match token {
                 FDT_NOP => {
@@ -271,8 +313,8 @@ impl<'a> Iterator for PropIter<'a> {
                     let len = be_u32(self.blob, self.cur + 4)? as usize;
                     let nameoff = be_u32(self.blob, self.cur + 8)? as usize;
                     let payload_start = self.cur + 12;
-                    let payload_end = payload_start + len;
-                    if payload_end > self.blob.len() {
+                    let payload_end = payload_start.checked_add(len)?;
+                    if payload_end > self.end {
                         return None;
                     }
                     // Pad to 4 bytes.
@@ -385,8 +427,15 @@ where
                 cur += 4;
                 let name_start = cur;
                 let mut end = name_start;
-                while end < blob.len() && blob[end] != 0 {
+                while end < struct_end && blob[end] != 0 {
                     end += 1;
+                }
+                if end == struct_end {
+                    // Unterminated node name: the struct block ends
+                    // without a NUL, so there is no name to trust.
+                    // Abort the walk rather than letting strings-block
+                    // bytes become a node name.
+                    return;
                 }
                 let name = &blob[name_start..end];
                 cur = (end + 1 + 3) & !3;
@@ -401,7 +450,12 @@ where
 
                 // The cells governing THIS node's children. Spec says NOT inherited.
                 let mut my_cells = Cells::DEFAULT;
-                let prop_scan = PropIter { blob, cur, strings };
+                let prop_scan = PropIter {
+                    blob,
+                    cur,
+                    end: struct_end,
+                    strings,
+                };
                 for (pname, pval) in prop_scan {
                     if pname == "#address-cells" && pval.len() >= 4 {
                         my_cells.address = u32::from_be_bytes([pval[0], pval[1], pval[2], pval[3]]);
@@ -424,7 +478,12 @@ where
                         slab: &slab[..total_len as usize],
                         seg_lens: &seg_lens[..depth as usize + 1],
                     };
-                    let prop_iter = PropIter { blob, cur, strings };
+                    let prop_iter = PropIter {
+                        blob,
+                        cur,
+                        end: struct_end,
+                        strings,
+                    };
                     f(&path, prop_iter, parent_cells);
                     depth += 1;
                 }
@@ -461,7 +520,16 @@ fn skip_props(blob: &[u8], mut cur: usize, end: usize) -> usize {
                     Some(v) => v as usize,
                     None => return cur,
                 };
-                let payload_end = cur + 12 + len;
+                let payload_end = match (cur + 12).checked_add(len) {
+                    Some(e) => e,
+                    None => return cur,
+                };
+                if payload_end > end {
+                    // Declared length runs past the struct block:
+                    // do not advance past `end`. The walker reads
+                    // the FDT_PROP token again and aborts the walk.
+                    return cur;
+                }
                 cur = (payload_end + 3) & !3;
             }
             FDT_NOP => cur += 4,

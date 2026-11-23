@@ -299,7 +299,10 @@ fn smoke_fdt_reservations() -> TestResult {
         &[],
     );
     let mut out = [Reservation::default(); 4];
-    let n = fdt::copy_reservations(&blob, &mut out);
+    let n = match fdt::copy_reservations(&blob, &mut out) {
+        Some(n) => n,
+        None => return TestResult::Fail("valid reserve map rejected"),
+    };
     if n != 2
         || out[0]
             != (Reservation {
@@ -317,6 +320,146 @@ fn smoke_fdt_reservations() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_reservations);
+
+/// SEC-F7 (#1302): a reserve map with no terminator must be
+/// rejected, not scanned into the struct block. The fixture
+/// overwrites the all-zeros terminator with a second entry, so
+/// the scan would have to cross `off_dt_struct` to terminate.
+fn smoke_fdt_reserve_map_unterminated_rejected() -> TestResult {
+    let mut blob = build_blob(0, &[(0xC000_0000, 0x10_0000)], &[], &[]);
+    let hdr = fdt::parse_header(&blob).expect("header");
+    let term = hdr.off_mem_rsvmap as usize + 16;
+    blob[term..term + 8].copy_from_slice(&0xE000_0000u64.to_be_bytes());
+    blob[term + 8..term + 16].copy_from_slice(&0x1000u64.to_be_bytes());
+    let mut out = [Reservation::default(); 4];
+    if fdt::copy_reservations(&blob, &mut out).is_some() {
+        return TestResult::Fail("unterminated reserve map accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_reserve_map_unterminated_rejected);
+
+/// SEC-F7 (#1302): a node name with no NUL before `struct_end`
+/// must abort the walk — the node is never visited, so no
+/// strings-block bytes become a node name.
+fn smoke_fdt_unterminated_node_name_aborts_walk() -> TestResult {
+    let nodes = &[("memory@0", &[("device_type", b"memory\0" as &[u8])][..])];
+    let mut blob = build_blob(0, &[], &[], nodes);
+    let hdr = fdt::parse_header(&blob).expect("header");
+    let struct_start = hdr.off_dt_struct as usize;
+    let struct_end = struct_start + hdr.size_dt_struct as usize;
+    // Find the child BEGIN_NODE: the second FDT_BEGIN_NODE token.
+    let mut seen_begin = 0;
+    let mut name_start = None;
+    let mut cur = struct_start;
+    while cur + 4 <= struct_end {
+        let token = u32::from_be_bytes([blob[cur], blob[cur + 1], blob[cur + 2], blob[cur + 3]]);
+        if token == fdt::FDT_BEGIN_NODE {
+            seen_begin += 1;
+            if seen_begin == 2 {
+                name_start = Some(cur + 4);
+                break;
+            }
+        }
+        cur += 4;
+    }
+    let Some(name_start) = name_start else {
+        return TestResult::Fail("child BEGIN_NODE not found in fixture");
+    };
+    // Corrupt the name: no NUL anywhere up to struct_end.
+    for b in blob[name_start..struct_end].iter_mut() {
+        *b = b'X';
+    }
+    let mut visited_any = false;
+    fdt::walk_nodes(&blob, |_path, _props| {
+        visited_any = true;
+    });
+    if visited_any {
+        return TestResult::Fail("walk visited a node with an unterminated name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/fdt", smoke_fdt_unterminated_node_name_aborts_walk);
+
+/// SEC-F7 (#1302): a property whose declared length runs past
+/// `struct_end` (but stays inside the blob, reaching into the
+/// strings block) must not be yielded, and the walk must end.
+fn smoke_fdt_prop_payload_past_struct_end_not_yielded() -> TestResult {
+    let nodes = &[("memory@0", &[("device_type", b"memory\0" as &[u8])][..])];
+    let mut blob = build_blob(0, &[], &[], nodes);
+    let hdr = fdt::parse_header(&blob).expect("header");
+    let struct_start = hdr.off_dt_struct as usize;
+    let struct_end = struct_start + hdr.size_dt_struct as usize;
+    // Find the first FDT_PROP token and inflate its declared
+    // length so the payload ends 4 bytes past struct_end.
+    let mut prop_at = None;
+    let mut cur = struct_start;
+    while cur + 4 <= struct_end {
+        let token = u32::from_be_bytes([blob[cur], blob[cur + 1], blob[cur + 2], blob[cur + 3]]);
+        if token == fdt::FDT_PROP {
+            prop_at = Some(cur);
+            break;
+        }
+        cur += 4;
+    }
+    let Some(prop_at) = prop_at else {
+        return TestResult::Fail("FDT_PROP not found in fixture");
+    };
+    let payload_start = prop_at + 12;
+    let len = (struct_end - payload_start + 4) as u32;
+    // Shape sanity: the inflated payload must stay inside the
+    // blob (reaching the strings block) or the fixture would not
+    // discriminate the struct_end bound from the blob.len bound.
+    if struct_end + 4 > blob.len() {
+        return TestResult::Fail("fixture payload does not reach the strings block");
+    }
+    blob[prop_at + 4..prop_at + 8].copy_from_slice(&len.to_be_bytes());
+    let mut saw_node = false;
+    let mut saw_prop = false;
+    fdt::walk_nodes(&blob, |path, props| {
+        if path.matches(&["memory@0"]) {
+            saw_node = true;
+            for (name, _value) in props {
+                if name == "device_type" {
+                    saw_prop = true;
+                }
+            }
+        }
+    });
+    if !saw_node {
+        return TestResult::Fail("node not visited");
+    }
+    if saw_prop {
+        return TestResult::Fail("property with payload past struct_end was yielded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt",
+    smoke_fdt_prop_payload_past_struct_end_not_yielded
+);
+
+/// SEC-F7 (#1302): header rejects a reserve map starting past
+/// `totalsize` and struct/strings blocks that overlap.
+fn smoke_fdt_header_rejects_reserve_past_total_and_overlap() -> TestResult {
+    let blob = build_blob(0, &[], &[], &[]);
+    let hdr = fdt::parse_header(&blob).expect("header");
+    let mut bad_rsv = blob.clone();
+    bad_rsv[16..20].copy_from_slice(&(hdr.totalsize + 8).to_be_bytes());
+    if fdt::parse_header(&bad_rsv).is_some() {
+        return TestResult::Fail("accepted reserve map past totalsize");
+    }
+    let mut overlap = blob.clone();
+    overlap[12..16].copy_from_slice(&(hdr.off_dt_struct + 4).to_be_bytes());
+    if fdt::parse_header(&overlap).is_some() {
+        return TestResult::Fail("accepted overlapping struct/strings blocks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "firmware/fdt",
+    smoke_fdt_header_rejects_reserve_past_total_and_overlap
+);
 
 fn smoke_fdt_reserved_memory_static_ranges() -> TestResult {
     let mut reg = Vec::new();
