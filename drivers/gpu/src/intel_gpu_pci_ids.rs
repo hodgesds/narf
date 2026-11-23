@@ -3,6 +3,102 @@
 /// Intel Corporation (PCI Special Interest Group ID).
 pub const INTEL_VENDOR: u16 = 0x8086;
 
+// Skylake (Gen9). Linux INTEL_SKL_IDS (25).
+pub const SKL_1902: u16 = 0x1902;
+pub const SKL_1906: u16 = 0x1906;
+pub const SKL_190A: u16 = 0x190A;
+pub const SKL_190B: u16 = 0x190B;
+pub const SKL_190E: u16 = 0x190E;
+pub const SKL_1912: u16 = 0x1912;
+pub const SKL_1913: u16 = 0x1913;
+pub const SKL_1915: u16 = 0x1915;
+pub const SKL_1916: u16 = 0x1916;
+pub const SKL_1917: u16 = 0x1917;
+pub const SKL_191A: u16 = 0x191A;
+pub const SKL_191B: u16 = 0x191B;
+pub const SKL_191D: u16 = 0x191D;
+pub const SKL_191E: u16 = 0x191E;
+pub const SKL_1921: u16 = 0x1921;
+pub const SKL_1923: u16 = 0x1923;
+pub const SKL_1926: u16 = 0x1926;
+pub const SKL_1927: u16 = 0x1927;
+pub const SKL_192A: u16 = 0x192A;
+pub const SKL_192B: u16 = 0x192B;
+pub const SKL_192D: u16 = 0x192D;
+pub const SKL_1932: u16 = 0x1932;
+pub const SKL_193A: u16 = 0x193A;
+pub const SKL_193B: u16 = 0x193B;
+pub const SKL_193D: u16 = 0x193D;
+
+// Kabylake (Gen9). Linux INTEL_KBL_IDS (22).
+pub const KBL_5902: u16 = 0x5902;
+pub const KBL_5906: u16 = 0x5906;
+pub const KBL_5908: u16 = 0x5908;
+pub const KBL_590A: u16 = 0x590A;
+pub const KBL_590B: u16 = 0x590B;
+pub const KBL_590E: u16 = 0x590E;
+pub const KBL_5912: u16 = 0x5912;
+pub const KBL_5913: u16 = 0x5913;
+pub const KBL_5915: u16 = 0x5915;
+pub const KBL_5916: u16 = 0x5916;
+pub const KBL_5917: u16 = 0x5917;
+pub const KBL_591A: u16 = 0x591A;
+pub const KBL_591B: u16 = 0x591B;
+pub const KBL_591C: u16 = 0x591C;
+pub const KBL_591D: u16 = 0x591D;
+pub const KBL_591E: u16 = 0x591E;
+pub const KBL_5921: u16 = 0x5921;
+pub const KBL_5923: u16 = 0x5923;
+pub const KBL_5926: u16 = 0x5926;
+pub const KBL_5927: u16 = 0x5927;
+pub const KBL_593B: u16 = 0x593B;
+pub const KBL_87C0: u16 = 0x87C0;
+
+// Coffeelake (Gen9). Linux INTEL_CFL_IDS (17).
+pub const CFL_3E90: u16 = 0x3E90;
+pub const CFL_3E91: u16 = 0x3E91;
+pub const CFL_3E92: u16 = 0x3E92;
+pub const CFL_3E93: u16 = 0x3E93;
+pub const CFL_3E94: u16 = 0x3E94;
+pub const CFL_3E96: u16 = 0x3E96;
+pub const CFL_3E98: u16 = 0x3E98;
+pub const CFL_3E99: u16 = 0x3E99;
+pub const CFL_3E9A: u16 = 0x3E9A;
+pub const CFL_3E9B: u16 = 0x3E9B;
+pub const CFL_3E9C: u16 = 0x3E9C;
+pub const CFL_3EA5: u16 = 0x3EA5;
+pub const CFL_3EA6: u16 = 0x3EA6;
+pub const CFL_3EA7: u16 = 0x3EA7;
+pub const CFL_3EA8: u16 = 0x3EA8;
+pub const CFL_3EA9: u16 = 0x3EA9;
+pub const CFL_87CA: u16 = 0x87CA;
+
+// Whiskeylake (Gen9). Linux INTEL_WHL_IDS (5).
+pub const WHL_3EA0: u16 = 0x3EA0;
+pub const WHL_3EA1: u16 = 0x3EA1;
+pub const WHL_3EA2: u16 = 0x3EA2;
+pub const WHL_3EA3: u16 = 0x3EA3;
+pub const WHL_3EA4: u16 = 0x3EA4;
+
+// Cometlake (Gen9). Linux INTEL_CML_IDS (17).
+pub const CML_9B21: u16 = 0x9B21;
+pub const CML_9B41: u16 = 0x9B41;
+pub const CML_9BA2: u16 = 0x9BA2;
+pub const CML_9BA4: u16 = 0x9BA4;
+pub const CML_9BA5: u16 = 0x9BA5;
+pub const CML_9BA8: u16 = 0x9BA8;
+pub const CML_9BAA: u16 = 0x9BAA;
+pub const CML_9BAC: u16 = 0x9BAC;
+pub const CML_9BC2: u16 = 0x9BC2;
+pub const CML_9BC4: u16 = 0x9BC4;
+pub const CML_9BC5: u16 = 0x9BC5;
+pub const CML_9BC6: u16 = 0x9BC6;
+pub const CML_9BC8: u16 = 0x9BC8;
+pub const CML_9BCA: u16 = 0x9BCA;
+pub const CML_9BCC: u16 = 0x9BCC;
+pub const CML_9BE6: u16 = 0x9BE6;
+pub const CML_9BF6: u16 = 0x9BF6;
+
 // Ice Lake (Gen11). Linux `include/drm/intel/pciids.h`
 // INTEL_ICL_IDS (15): PORT_F 8A50/8A52–8A54/8A56–8A5C/8A70/8A71
 // plus 8A51 and 8A5D.
@@ -213,6 +309,21 @@ pub(crate) const ATSM_IDS: &[u16] = &[ATSM_56C0, ATSM_56C1, ATSM_56C2];
 /// uses Xe-LPG (different DDI / DPLL programming).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Generation {
+    /// Skylake / Kaby Lake / Coffee Lake / Whiskey Lake / Comet Lake —
+    /// Gen9. One variant for the whole Gen9 family, following the
+    /// `Generation::IceLake`-carries-all-Gen11 pattern: the GT/register
+    /// surface is shared and `asic` carries the product name
+    /// ("skylake" / "kabylake" / "coffeelake" / "whiskeylake" /
+    /// "cometlake"). The GuC firmware family is NOT shared (SKL takes
+    /// `skl_guc`, KBL/CFL/WHL and CML-rev<5 take `kbl_guc`, CML-rev>=5
+    /// takes `cml_guc`), so `GtPlatform` keeps a distinct `Gen9`
+    /// sub-platform per firmware family (see
+    /// `intel_gpu_gt::Gen9Platform`). Coffee Lake and Whiskey Lake
+    /// ride the Kaby Lake firmware family; the CML rev>=5 vs rev<5
+    /// split is a stepping input the driver does not model yet, so
+    /// all CML takes the KBL blob until a revision input lands
+    /// (Gen9 Lane 7 remainder).
+    Skylake,
     /// Ice Lake / Elkhart Lake / Jasper Lake — Gen11. One
     /// variant for the whole Gen11 family, following the
     /// Raptor-Lake-under-AlderLake pattern: the GT/register
@@ -287,6 +398,527 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
         did: 0x64b0,
         generation: Generation::LunarLake,
         asic: "lunarlake",
+    },
+    // Skylake (Gen9). Linux INTEL_SKL_IDS.
+    DeviceEntry {
+        name: "intel-gpu-skl-1902",
+        did: SKL_1902,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1906",
+        did: SKL_1906,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-190A",
+        did: SKL_190A,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-190B",
+        did: SKL_190B,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-190E",
+        did: SKL_190E,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1912",
+        did: SKL_1912,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1913",
+        did: SKL_1913,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1915",
+        did: SKL_1915,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1916",
+        did: SKL_1916,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1917",
+        did: SKL_1917,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-191A",
+        did: SKL_191A,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-191B",
+        did: SKL_191B,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-191D",
+        did: SKL_191D,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-191E",
+        did: SKL_191E,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1921",
+        did: SKL_1921,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1923",
+        did: SKL_1923,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1926",
+        did: SKL_1926,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1927",
+        did: SKL_1927,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-192A",
+        did: SKL_192A,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-192B",
+        did: SKL_192B,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-192D",
+        did: SKL_192D,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-1932",
+        did: SKL_1932,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-193A",
+        did: SKL_193A,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-193B",
+        did: SKL_193B,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-skl-193D",
+        did: SKL_193D,
+        generation: Generation::Skylake,
+        asic: "skylake",
+    },
+    // Kabylake (Gen9). Linux INTEL_KBL_IDS.
+    DeviceEntry {
+        name: "intel-gpu-kbl-5902",
+        did: KBL_5902,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5906",
+        did: KBL_5906,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5908",
+        did: KBL_5908,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-590A",
+        did: KBL_590A,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-590B",
+        did: KBL_590B,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-590E",
+        did: KBL_590E,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5912",
+        did: KBL_5912,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5913",
+        did: KBL_5913,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5915",
+        did: KBL_5915,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5916",
+        did: KBL_5916,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5917",
+        did: KBL_5917,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-591A",
+        did: KBL_591A,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-591B",
+        did: KBL_591B,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-591C",
+        did: KBL_591C,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-591D",
+        did: KBL_591D,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-591E",
+        did: KBL_591E,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5921",
+        did: KBL_5921,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5923",
+        did: KBL_5923,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5926",
+        did: KBL_5926,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-5927",
+        did: KBL_5927,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-593B",
+        did: KBL_593B,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-kbl-87C0",
+        did: KBL_87C0,
+        generation: Generation::Skylake,
+        asic: "kabylake",
+    },
+    // Coffeelake (Gen9). Linux INTEL_CFL_IDS.
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E90",
+        did: CFL_3E90,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E91",
+        did: CFL_3E91,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E92",
+        did: CFL_3E92,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E93",
+        did: CFL_3E93,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E94",
+        did: CFL_3E94,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E96",
+        did: CFL_3E96,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E98",
+        did: CFL_3E98,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E99",
+        did: CFL_3E99,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E9A",
+        did: CFL_3E9A,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E9B",
+        did: CFL_3E9B,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3E9C",
+        did: CFL_3E9C,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3EA5",
+        did: CFL_3EA5,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3EA6",
+        did: CFL_3EA6,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3EA7",
+        did: CFL_3EA7,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3EA8",
+        did: CFL_3EA8,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-3EA9",
+        did: CFL_3EA9,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cfl-87CA",
+        did: CFL_87CA,
+        generation: Generation::Skylake,
+        asic: "coffeelake",
+    },
+    // Whiskeylake (Gen9). Linux INTEL_WHL_IDS.
+    DeviceEntry {
+        name: "intel-gpu-whl-3EA0",
+        did: WHL_3EA0,
+        generation: Generation::Skylake,
+        asic: "whiskeylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-whl-3EA1",
+        did: WHL_3EA1,
+        generation: Generation::Skylake,
+        asic: "whiskeylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-whl-3EA2",
+        did: WHL_3EA2,
+        generation: Generation::Skylake,
+        asic: "whiskeylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-whl-3EA3",
+        did: WHL_3EA3,
+        generation: Generation::Skylake,
+        asic: "whiskeylake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-whl-3EA4",
+        did: WHL_3EA4,
+        generation: Generation::Skylake,
+        asic: "whiskeylake",
+    },
+    // Cometlake (Gen9). Linux INTEL_CML_IDS.
+    DeviceEntry {
+        name: "intel-gpu-cml-9B21",
+        did: CML_9B21,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9B41",
+        did: CML_9B41,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BA2",
+        did: CML_9BA2,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BA4",
+        did: CML_9BA4,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BA5",
+        did: CML_9BA5,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BA8",
+        did: CML_9BA8,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BAA",
+        did: CML_9BAA,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BAC",
+        did: CML_9BAC,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BC2",
+        did: CML_9BC2,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BC4",
+        did: CML_9BC4,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BC5",
+        did: CML_9BC5,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BC6",
+        did: CML_9BC6,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BC8",
+        did: CML_9BC8,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BCA",
+        did: CML_9BCA,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BCC",
+        did: CML_9BCC,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BE6",
+        did: CML_9BE6,
+        generation: Generation::Skylake,
+        asic: "cometlake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-cml-9BF6",
+        did: CML_9BF6,
+        generation: Generation::Skylake,
+        asic: "cometlake",
     },
     // Ice Lake (Gen11). Linux INTEL_ICL_IDS, in macro order.
     DeviceEntry {

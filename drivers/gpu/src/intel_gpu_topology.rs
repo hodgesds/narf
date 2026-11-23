@@ -43,6 +43,9 @@ impl L3Rule {
         Some(match platform {
             GtPlatform::Gen12(_) => Self::XeLp,
             GtPlatform::Gen11(_) => return None,
+            // Gen9: L3 rule unmodeled, like Gen11; the GT lanes
+            // derive it from the fuse registers.
+            GtPlatform::Gen9(_) => return None,
             GtPlatform::ArcticSoundM | GtPlatform::Alchemist => Self::Dg2,
             GtPlatform::Integrated(Generation::MeteorLake) => Self::XeLpg,
             GtPlatform::Battlemage | GtPlatform::Integrated(Generation::LunarLake) => Self::Xe2,

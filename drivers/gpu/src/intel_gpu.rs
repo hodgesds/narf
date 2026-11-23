@@ -30,7 +30,7 @@
 //!
 //! - **Stage 1** — PCI claim, BAR0 (GTTMMADR) mapping,
 //!   generation-aware presence test (`GMD_ID` on Gen12+,
-//!   PCI config-space re-read on pre-GMD Gen11), bound-driver
+//!   PCI config-space re-read on pre-GMD Gen11/Gen9), bound-driver
 //!   record.
 //! - **Stage 2** — Codec layer: GMBUS, DPLL, pipes, DDI, GTT
 //!   register-codecs in sibling `crate::intel_gpu_*` modules.
@@ -80,7 +80,10 @@ const PCI_CLASS_DISPLAY: u8 = 0x03;
 impl Generation {
     /// Map the sub-architecture to the BAR0 region-enumeration
     /// generation. TGL / ADL / RPL share the Xe-LP MMIO map
-    /// (`RegionGeneration::Gen12`); Gen11 (ICL / EHL / JSL)
+    /// (`RegionGeneration::Gen12`); Gen9 (SKL / KBL / CFL / WHL /
+    /// CML) shares that partitioning (`__gen11_fw_ranges`) and maps
+    /// to its own `RegionGeneration::Gen9` table, whose contents
+    /// are the verified Gen12 table carried over; Gen11 (ICL / EHL / JSL)
     /// shares that partitioning (`__gen11_fw_ranges`) and maps
     /// to its own `RegionGeneration::Gen11` table, whose contents
     /// are the verified Gen12 table carried over; Meteor Lake maps
@@ -92,6 +95,7 @@ impl Generation {
     /// are never conflated.
     pub const fn region_generation(self) -> Option<RegionGeneration> {
         match self {
+            Generation::Skylake => Some(RegionGeneration::Gen9),
             Generation::IceLake => Some(RegionGeneration::Gen11),
             Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
                 Some(RegionGeneration::Gen12)
@@ -104,13 +108,13 @@ impl Generation {
 
     /// Whether the generation publishes the Xe-era `GMD_ID` /
     /// `MTCFG_TRBLK` identification registers. Gen12+ does;
-    /// Gen11 predates GMD_ID, so what 0xD8C/0xFF8 read on
-    /// Gen11 silicon is ungrounded and must never be used as a
+    /// Gen11 and Gen9 predate GMD_ID, so what 0xD8C/0xFF8 read on
+    /// Gen11/Gen9 silicon is ungrounded and must never be used as a
     /// presence signal (a 0 read would pass the all-ones check
-    /// spuriously). Stage-1 presence for Gen11 re-reads PCI
+    /// spuriously). Stage-1 presence for Gen11/Gen9 re-reads PCI
     /// config space instead.
     pub const fn has_gmd_id(self) -> bool {
-        !matches!(self, Generation::IceLake)
+        !matches!(self, Generation::IceLake | Generation::Skylake)
     }
 
     /// Whether this lane programs the display engine for the
@@ -279,11 +283,11 @@ pub enum IntelGpuError {
 /// - Gen12+: the device is present iff neither identity read is
 ///   all-ones (a mapped BAR over a gone device reads all-ones).
 ///   Returns the `GMD_ID` value.
-/// - Gen11: the device is present iff the config-space re-read
+/// - Gen11/Gen9: the device is present iff the config-space re-read
 ///   is not all-ones. The MMIO pair is ignored entirely — even
 ///   all-ones `GMD_ID`/`MTCFG_TRBLK` values cannot refuse a
-///   Gen11 part, because those offsets predate GMD_ID and their
-///   Gen11 values are ungrounded. Returns `None`.
+///   Gen11/Gen9 part, because those offsets predate GMD_ID and their
+///   Gen11/Gen9 values are ungrounded. Returns `None`.
 fn stage1_presence(
     generation: Generation,
     gmd: Option<(u32, u32)>,
@@ -326,7 +330,7 @@ pub struct IntelGpu {
     pub gmadr: MmioRegion,
     pub chip: ChipInfo,
     /// `GMD_ID` value captured at probe time. `None` on pre-GMD
-    /// generations (Gen11), which have no such register — see
+    /// generations (Gen11, Gen9), which have no such register — see
     /// `has_gmd_id` / `stage1_presence`.
     pub gmd_id: Option<u32>,
     display_device: BusDevice,
@@ -390,9 +394,9 @@ impl IntelGpu {
 
         // Presence smoke test, generation-aware (see
         // `stage1_presence`). Gen12+ reads the Xe-era identity
-        // registers; pre-GMD Gen11 re-reads PCI config space —
+        // registers; pre-GMD Gen11/Gen9 re-reads PCI config space —
         // the GMD_ID / MTCFG_TRBLK offsets are never read on
-        // Gen11, where their values are ungrounded.
+        // Gen11/Gen9, where their values are ungrounded.
         let gmd_id = if chip.generation.has_gmd_id() {
             // SAFETY: identity-mapped MMIO.
             let gmd = unsafe { gtt_mmadr.read32(GMD_ID) };
@@ -404,7 +408,7 @@ impl IntelGpu {
             // PCI config-space dword 0 (vendor ID + device ID). A
             // device that has gone away answers config reads with
             // all-ones; BAR0 mapping success is already established
-            // above. No MMIO semantics are invented for Gen11.
+            // above. No MMIO semantics are invented for Gen11/Gen9.
             let config_id = narf_bus::pci::read_config32(cap, device, 0)
                 .map_err(|_| IntelGpuError::DeviceGone)?;
             stage1_presence(chip.generation, None, config_id)?
@@ -808,7 +812,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         use core::fmt::Write as _;
         let bar0_phys = dev.gtt_mmadr.phys.raw();
         let region_count = dev.regions().len();
-        // Pre-GMD generations (Gen11) have no GMD_ID to print.
+        // Pre-GMD generations (Gen11, Gen9) have no GMD_ID to print.
         let gmd = match dev.gmd_id {
             Some(v) => alloc::format!("{v:#010x}"),
             None => alloc::string::String::from("none"),
@@ -1684,7 +1688,7 @@ pub fn with_controller<R>(f: impl FnOnce(&IntelGpu) -> R) -> Option<R> {
 pub(crate) struct DisplayInfo {
     pub gtt_mmadr: MmioRegion,
     pub chip: ChipInfo,
-    /// `GMD_ID`, or `None` on pre-GMD generations (Gen11).
+    /// `GMD_ID`, or `None` on pre-GMD generations (Gen11, Gen9).
     pub gmd_id: Option<u32>,
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
@@ -3067,6 +3071,92 @@ pub mod tests {
             (0x6420, "lunarlake"),
             (0x64a0, "lunarlake"),
             (0x64b0, "lunarlake"),
+            (0x1902, "skylake"),
+            (0x1906, "skylake"),
+            (0x190A, "skylake"),
+            (0x190B, "skylake"),
+            (0x190E, "skylake"),
+            (0x1912, "skylake"),
+            (0x1913, "skylake"),
+            (0x1915, "skylake"),
+            (0x1916, "skylake"),
+            (0x1917, "skylake"),
+            (0x191A, "skylake"),
+            (0x191B, "skylake"),
+            (0x191D, "skylake"),
+            (0x191E, "skylake"),
+            (0x1921, "skylake"),
+            (0x1923, "skylake"),
+            (0x1926, "skylake"),
+            (0x1927, "skylake"),
+            (0x192A, "skylake"),
+            (0x192B, "skylake"),
+            (0x192D, "skylake"),
+            (0x1932, "skylake"),
+            (0x193A, "skylake"),
+            (0x193B, "skylake"),
+            (0x193D, "skylake"),
+            (0x5902, "kabylake"),
+            (0x5906, "kabylake"),
+            (0x5908, "kabylake"),
+            (0x590A, "kabylake"),
+            (0x590B, "kabylake"),
+            (0x590E, "kabylake"),
+            (0x5912, "kabylake"),
+            (0x5913, "kabylake"),
+            (0x5915, "kabylake"),
+            (0x5916, "kabylake"),
+            (0x5917, "kabylake"),
+            (0x591A, "kabylake"),
+            (0x591B, "kabylake"),
+            (0x591C, "kabylake"),
+            (0x591D, "kabylake"),
+            (0x591E, "kabylake"),
+            (0x5921, "kabylake"),
+            (0x5923, "kabylake"),
+            (0x5926, "kabylake"),
+            (0x5927, "kabylake"),
+            (0x593B, "kabylake"),
+            (0x87C0, "kabylake"),
+            (0x3E90, "coffeelake"),
+            (0x3E91, "coffeelake"),
+            (0x3E92, "coffeelake"),
+            (0x3E93, "coffeelake"),
+            (0x3E94, "coffeelake"),
+            (0x3E96, "coffeelake"),
+            (0x3E98, "coffeelake"),
+            (0x3E99, "coffeelake"),
+            (0x3E9A, "coffeelake"),
+            (0x3E9B, "coffeelake"),
+            (0x3E9C, "coffeelake"),
+            (0x3EA5, "coffeelake"),
+            (0x3EA6, "coffeelake"),
+            (0x3EA7, "coffeelake"),
+            (0x3EA8, "coffeelake"),
+            (0x3EA9, "coffeelake"),
+            (0x87CA, "coffeelake"),
+            (0x3EA0, "whiskeylake"),
+            (0x3EA1, "whiskeylake"),
+            (0x3EA2, "whiskeylake"),
+            (0x3EA3, "whiskeylake"),
+            (0x3EA4, "whiskeylake"),
+            (0x9B21, "cometlake"),
+            (0x9B41, "cometlake"),
+            (0x9BA2, "cometlake"),
+            (0x9BA4, "cometlake"),
+            (0x9BA5, "cometlake"),
+            (0x9BA8, "cometlake"),
+            (0x9BAA, "cometlake"),
+            (0x9BAC, "cometlake"),
+            (0x9BC2, "cometlake"),
+            (0x9BC4, "cometlake"),
+            (0x9BC5, "cometlake"),
+            (0x9BC6, "cometlake"),
+            (0x9BC8, "cometlake"),
+            (0x9BCA, "cometlake"),
+            (0x9BCC, "cometlake"),
+            (0x9BE6, "cometlake"),
+            (0x9BF6, "cometlake"),
             (0x8A50, "icelake"),
             (0x8A51, "icelake"),
             (0x8A52, "icelake"),
@@ -3457,6 +3547,22 @@ pub mod tests {
         {
             return TestResult::Fail("RKL must admit Gen12 GT regions while display stays gated");
         }
+        // Gen9 (Lane 1): identity + probe only. The BAR0 region
+        // map is admitted (Gen9 shares Gen12's partitioning) and
+        // the part is explicitly pre-GMD; display, external
+        // display and backlight stay gated — Lane 5 owns the
+        // internal-panel modeset, Lane 8 the external outputs
+        // and backlight. The part still binds and announces.
+        if Generation::Skylake.display_supported()
+            || Generation::Skylake.external_display_supported()
+            || Generation::Skylake.backlight_supported()
+            || Generation::Skylake.region_generation() != Some(RegionGeneration::Gen9)
+            || Generation::Skylake.has_gmd_id()
+        {
+            return TestResult::Fail(
+                "Gen9 must admit regions while display + external + backlight stay gated",
+            );
+        }
         // Gen11 (Lanes 5 + 8): identity + probe + internal-panel
         // modeset + external outputs + backlight. The BAR0 region
         // map is admitted (Gen11 shares Gen12's partitioning)
@@ -3654,6 +3760,112 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_icelake_classification);
+
+    /// Gen9 classification (Lane 1): all 86 IDs from Linux
+    /// `INTEL_SKL_IDS` (25) / `INTEL_KBL_IDS` (22) /
+    /// `INTEL_CFL_IDS` (17) / `INTEL_WHL_IDS` (5) /
+    /// `INTEL_CML_IDS` (17) — each row re-verified against
+    /// `include/drm/intel/pciids.h` (Linux 7.4-rc2) at authoring
+    /// time — classify as `Generation::Skylake` under their
+    /// product ASIC, resolve to the Gen9 GT sub-platform with
+    /// its GuC firmware family, and carry the Lane-1
+    /// disposition (regions admitted, pre-GMD presence,
+    /// display / external display / backlight gated). This
+    /// pins the whole set so a future reclassification — or
+    /// arming the Gen12 modeset against Gen9 silicon — fails
+    /// here first.
+    fn smoke_skylake_classification() -> TestResult {
+        use crate::intel_gpu_gt::{Gen9Platform, GtPlatform};
+        const SKL_DIDS: &[u16] = &[
+            SKL_1902, SKL_1906, SKL_190A, SKL_190B, SKL_190E, SKL_1912, SKL_1913, SKL_1915,
+            SKL_1916, SKL_1917, SKL_191A, SKL_191B, SKL_191D, SKL_191E, SKL_1921, SKL_1923,
+            SKL_1926, SKL_1927, SKL_192A, SKL_192B, SKL_192D, SKL_1932, SKL_193A, SKL_193B,
+            SKL_193D,
+        ];
+        const KBL_DIDS: &[u16] = &[
+            KBL_5902, KBL_5906, KBL_5908, KBL_590A, KBL_590B, KBL_590E, KBL_5912, KBL_5913,
+            KBL_5915, KBL_5916, KBL_5917, KBL_591A, KBL_591B, KBL_591C, KBL_591D, KBL_591E,
+            KBL_5921, KBL_5923, KBL_5926, KBL_5927, KBL_593B, KBL_87C0,
+        ];
+        const CFL_DIDS: &[u16] = &[
+            CFL_3E90, CFL_3E91, CFL_3E92, CFL_3E93, CFL_3E94, CFL_3E96, CFL_3E98, CFL_3E99,
+            CFL_3E9A, CFL_3E9B, CFL_3E9C, CFL_3EA5, CFL_3EA6, CFL_3EA7, CFL_3EA8, CFL_3EA9,
+            CFL_87CA,
+        ];
+        const WHL_DIDS: &[u16] = &[WHL_3EA0, WHL_3EA1, WHL_3EA2, WHL_3EA3, WHL_3EA4];
+        const CML_DIDS: &[u16] = &[
+            CML_9B21, CML_9B41, CML_9BA2, CML_9BA4, CML_9BA5, CML_9BA8, CML_9BAA, CML_9BAC,
+            CML_9BC2, CML_9BC4, CML_9BC5, CML_9BC6, CML_9BC8, CML_9BCA, CML_9BCC, CML_9BE6,
+            CML_9BF6,
+        ];
+        for (dids, asic, platform, firmware) in [
+            (
+                SKL_DIDS,
+                "skylake",
+                GtPlatform::Gen9(Gen9Platform::Skylake),
+                "i915/skl_guc_70.1.1.bin",
+            ),
+            (
+                KBL_DIDS,
+                "kabylake",
+                GtPlatform::Gen9(Gen9Platform::KabyLake),
+                "i915/kbl_guc_70.1.1.bin",
+            ),
+            (
+                CFL_DIDS,
+                "coffeelake",
+                GtPlatform::Gen9(Gen9Platform::KabyLake),
+                "i915/kbl_guc_70.1.1.bin",
+            ),
+            (
+                WHL_DIDS,
+                "whiskeylake",
+                GtPlatform::Gen9(Gen9Platform::KabyLake),
+                "i915/kbl_guc_70.1.1.bin",
+            ),
+            (
+                CML_DIDS,
+                "cometlake",
+                GtPlatform::Gen9(Gen9Platform::CometLake),
+                "i915/kbl_guc_70.1.1.bin",
+            ),
+        ] {
+            for did in dids {
+                let info = match chip_info_for_pci_id(INTEL_VENDOR, *did) {
+                    Some(i) => i,
+                    None => return TestResult::Fail("Gen9 DID does not classify"),
+                };
+                if info.asic != asic {
+                    return TestResult::Fail("Gen9 DID classifies to the wrong ASIC");
+                }
+                if info.generation != Generation::Skylake {
+                    return TestResult::Fail("Gen9 DID must classify as Skylake");
+                }
+                if GtPlatform::from_pci(INTEL_VENDOR, *did) != Some(platform) {
+                    return TestResult::Fail("Gen9 DID resolves to the wrong GT platform");
+                }
+                match platform.guc() {
+                    Some(profile)
+                        if profile.firmware == firmware
+                            && profile.minimum_version == (70, 1, 1) => {}
+                    _ => return TestResult::Fail("Gen9 DID has the wrong GuC profile"),
+                }
+                // Lane-1 disposition: regions admitted, pre-GMD
+                // presence, display / external display /
+                // backlight gated (Lanes 5 and 8 flip those).
+                if info.generation.display_supported()
+                    || info.generation.external_display_supported()
+                    || info.generation.backlight_supported()
+                    || info.generation.region_generation() != Some(RegionGeneration::Gen9)
+                    || info.generation.has_gmd_id()
+                {
+                    return TestResult::Fail("Gen9 disposition wrong after Lane 1");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu", smoke_skylake_classification);
 
     /// Generation-aware Stage-1 presence (`stage1_presence`):
     /// the Gen12 GMD path is unchanged, and the Gen11 path

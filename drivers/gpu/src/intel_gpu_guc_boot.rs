@@ -248,10 +248,16 @@ impl WopcmLayout {
     /// (`GEN11_WOPCM_SIZE`), which Gen12 and the headless families share;
     /// the xe-era families staged here take the 4 MiB `plan` total.
     /// Gen11 takes the 2 MiB total (Lane 7): planning 4 MiB on a 2 MiB
-    /// WOPCM would program a GuC region past the WOPCM top.
+    /// WOPCM would program a GuC region past the WOPCM top. Gen9
+    /// takes the 1 MiB total (`GEN9_WOPCM_SIZE`): planning 2 MiB or
+    /// more on a 1 MiB WOPCM would program past its top the same
+    /// way. The load itself is Gen9 Lane 7's; this only sizes the
+    /// plan honestly now that the platform exists.
     fn plan_for(platform: GtPlatform, upload: u32, huc: u32) -> Result<Self, BootError> {
         if platform.is_gen12() || platform.is_gen11() || platform.is_headless_integrated() {
             Self::plan_total(upload, huc, 0x200000)
+        } else if platform.is_gen9() {
+            Self::plan_total(upload, huc, 0x100000)
         } else {
             Self::plan(upload, huc)
         }

@@ -285,6 +285,10 @@ pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
         // Gen11: no PAT index is admitted until Lane 2 models the
         // legacy PPAT table. Refuse all binds that name one.
         GtPlatform::Gen11(_) => false,
+        // Gen9: no PAT index is admitted until Lane 2 models the
+        // legacy PPAT table. Refuse all binds that name one — the
+        // Gen9 GGTT has no PAT bits (`gen8_ggtt_pte_encode`).
+        GtPlatform::Gen9(_) => false,
         _ if platform.is_xe2() => matches!(pat, 1 | 2 | 4 | 5 | 7),
         GtPlatform::Battlemage => unreachable!("Xe2 handled above"),
         GtPlatform::WildcatLake => matches!(pat, 1 | 2 | 4 | 5 | 7),

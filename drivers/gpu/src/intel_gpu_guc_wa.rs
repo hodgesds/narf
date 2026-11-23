@@ -29,6 +29,14 @@ impl GuCWorkarounds {
             // KLVs: the 0x900b entry's 70.44 firmware gate is not met
             // by the 70.1.1 blob.
             GtPlatform::Gen11(_) => (0x44000, &[]),
+            // Gen9: neither flag — i915 `guc_ctl_wa_flags` sets
+            // POLLCS only for GRAPHICS_VER >= 11 (Wa_22012773006)
+            // and PRE_PARSER only for VER >= 11
+            // (`intel_engine_reset_needs_wa_22011802037` returns
+            // false below 11). No KLVs: the 0x900b entry's 70.44
+            // firmware gate is not met by the 70.1.1 blob, same
+            // as Gen11.
+            GtPlatform::Gen9(_) => (0, &[]),
             GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
                 let isolation = crate::intel_gpu_gt::is_dg2_g11(device);
                 // HOLD_CCS_SWITCHOUT, DUAL_QUEUE, PRE_PARSER, TSC check;

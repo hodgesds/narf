@@ -117,6 +117,13 @@ impl GuCFirmware {
             // ambiguous generation cannot choose. Use PCI identity
             // (`open_for_platform` with the `Gen11` sub-platform).
             Generation::IceLake => return Err(FirmwareError::Unsupported),
+            // Gen9 spans different firmware families the same way
+            // (SKL takes `skl_guc`, KBL/CFL/WHL take `kbl_guc`,
+            // CML takes `kbl_guc` at rev < 5 and `cml_guc` at
+            // rev >= 5); an ambiguous generation cannot choose.
+            // Use PCI identity (`open_for_platform` with the
+            // `Gen9` sub-platform).
+            Generation::Skylake => return Err(FirmwareError::Unsupported),
             _ => GtPlatform::Integrated(generation),
         };
         Self::open_for_platform(platform, authority)
