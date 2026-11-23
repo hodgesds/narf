@@ -11698,10 +11698,19 @@ impl FutexWaiter {
 
     /// Handler-driven waits observe their own completion record. No remote
     /// task lookup or write to a later syscall's park deadline is needed.
+    ///
+    /// Benchmark variant B1 (plain wake): a handler-driven waiter is woken
+    /// with a bare `Waker::wake()` — no `wake_preempt_task` direct handoff
+    /// (`hint_urgent_next_on` / `try_sync_wake_affine` / IPI kick) and no
+    /// preempt note. The waiter was already `mark_woken()`ed by its
+    /// dequeuer, so the plain wake still enqueues and kicks it via the
+    /// raw-waker path; only the urgency machinery is dropped. Compare
+    /// against the baseline (urgent handoff) and variant B2 (spread wake +
+    /// preempt note) with `perf bench futex` on hardware.
     fn wake(self, urgent: bool) {
         if self.q.is_some() {
             if urgent {
-                narf_scheduler::wake_preempt_task(self.waker, self.tid);
+                self.waker.wake();
             } else {
                 self.waker.wake();
                 narf_scheduler::stackful::note_wake_preempt(self.tid);
