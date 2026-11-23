@@ -4340,6 +4340,65 @@ kernel_test_in!(
     smoke_abi_pathx_getdents64_dotdot_of_a_bound_subdirectory
 );
 
+/// `getdents64` on a procfs root lists the static entries. The
+/// getdents path already had the synchronous-iterator fallback, so
+/// this pins that the mount-merge change below does not regress it.
+fn smoke_abi_pathx_getdents64_procfs_root() -> TestResult {
+    with_setup(|| {
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let procfs = registry()
+            .mount(&auth, "/p2133", narf_filesystem::procfs::ProcFs)
+            .map_err(|_| "mounting procfs for getdents test failed")?;
+        let result = (|| {
+            let dfd = open_fd(b"/p2133\0")?;
+            let entries = read_dirents64(dfd as u64, 4096)?;
+            let _ = call(Syscall::Close.raw(), a0(dfd as u64));
+            for name in ["cpuinfo", "meminfo", "stat", "version", "loadavg"] {
+                if !entries.iter().any(|e| e.3 == name) {
+                    return Err("getdents64(/proc) is missing a static entry");
+                }
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&procfs, "/p2133");
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents",
+    smoke_abi_pathx_getdents64_procfs_root
+);
+
+/// `getdents64` of a directory with a child mount lists the mount
+/// point as a directory entry, after the directory's own entries —
+/// the fd-keyed half of the `listdir` mount-merge pin above (#2133).
+fn smoke_abi_pathx_getdents64_lists_child_mounts() -> TestResult {
+    with_memfs("/m2133", "m2133", &[("seed", b"x")], || {
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let kid = registry()
+            .mount(&auth, "/m2133/kid", MemFs::new("m2133-kid"))
+            .map_err(|_| "mounting child memfs for getdents test failed")?;
+        let result = (|| {
+            let dfd = open_fd(b"/m2133\0")?;
+            let entries = read_dirents64(dfd as u64, 4096)?;
+            let _ = call(Syscall::Close.raw(), a0(dfd as u64));
+            if !entries.iter().any(|e| e.3 == "seed" && e.2 == 8) {
+                return Err("getdents64 of a mount parent is missing its own file");
+            }
+            if !entries.iter().any(|e| e.3 == "kid" && e.2 == 4) {
+                return Err("getdents64 of a mount parent is missing its child mount");
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&kid, "/m2133/kid");
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents",
+    smoke_abi_pathx_getdents64_lists_child_mounts
+);
+
 // ── listdir (NARF-native path_ptr, path_len, cursor, out, out_len) ──
 //
 // Path-based readdir: serialises the cursor-th entry as
@@ -4476,6 +4535,112 @@ fn smoke_abi_pathx_listdir_eof_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_listdir_eof_pos);
+
+// ── listdir readdir coverage (procfs + mount points) ────────────────
+//
+// `listdir` is the syscall libc `readdir` drives (`ls`, `ps`), so
+// these pin what userspace actually sees — not just what the
+// filesystem's own `iter()` yields.
+
+/// Every entry `listdir` reports for `path` (one entry per syscall,
+/// cursor 0..), decoded from the `[name_len:u32][file_type:u32][name…]`
+/// wire record, in enumeration order.
+fn listdir_all(path: &[u8]) -> Result<alloc::vec::Vec<(alloc::string::String, u32)>, &'static str> {
+    let mut out = alloc::vec::Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let mut buf = [0u8; 264];
+        match call(
+            Syscall::Listdir.raw(),
+            SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: path.len() as u64,
+                arg2: cursor,
+                arg3: buf.as_mut_ptr() as u64,
+                arg4: buf.len() as u64,
+                arg5: 0,
+            },
+        ) {
+            Some(0) => break,
+            Some(n) if n > 8 => {
+                let name_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                let ftype = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                if 8 + name_len > n as usize || name_len >= 256 {
+                    return Err("listdir record overruns its byte count");
+                }
+                let name = alloc::string::String::from(
+                    core::str::from_utf8(&buf[8..8 + name_len])
+                        .map_err(|_| "listdir name is not UTF-8")?,
+                );
+                out.push((name, ftype));
+                cursor += 1;
+                if cursor > 4096 {
+                    return Err("listdir did not terminate");
+                }
+            }
+            _ => return Err("listdir call failed"),
+        }
+    }
+    Ok(out)
+}
+
+/// `listdir` on a procfs root lists the static entries (`cpuinfo`,
+/// `meminfo`, `stat`, `version`, `loadavg`, `self`, …).
+///
+/// Regression pin for #2133: `ls /proc` printed nothing and `ps` saw
+/// no processes, because `sys_listdir` drove `enumerate_async` only
+/// and procfs never overrode it, so the default `Err(Unsupported)`
+/// became ENOTDIR and the first `readdir` returned NULL. Direct-path
+/// reads worked throughout, so only the enumeration surface is pinned
+/// here.
+fn smoke_abi_pathx_listdir_procfs_root() -> TestResult {
+    with_setup(|| {
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let procfs = registry()
+            .mount(&auth, "/p2133", narf_filesystem::procfs::ProcFs)
+            .map_err(|_| "mounting procfs for listdir test failed")?;
+        let result = (|| {
+            let entries = listdir_all(b"/p2133")?;
+            for name in ["cpuinfo", "meminfo", "stat", "version", "loadavg", "self"] {
+                if !entries.iter().any(|(n, _)| n == name) {
+                    return Err("listdir(/proc) is missing a static entry");
+                }
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&procfs, "/p2133");
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_listdir_procfs_root);
+
+/// `listdir` of a directory with a child mount lists the mount point
+/// as a directory entry, after the directory's own entries.
+///
+/// Regression pin for #2133 (related): `ls /` showed only the
+/// initramfs's own `NARF.TXT` — mount points (`bin`, `dev`, `proc`,
+/// `sys`, …) did not appear in `/` readdir.
+fn smoke_abi_pathx_listdir_lists_child_mounts() -> TestResult {
+    with_memfs("/m2133", "m2133", &[("seed", b"x")], || {
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let kid = registry()
+            .mount(&auth, "/m2133/kid", MemFs::new("m2133-kid"))
+            .map_err(|_| "mounting child memfs for listdir test failed")?;
+        let result = (|| {
+            let entries = listdir_all(b"/m2133")?;
+            if !entries.iter().any(|(n, t)| n == "seed" && *t == 0) {
+                return Err("listdir of a mount parent is missing its own file");
+            }
+            if !entries.iter().any(|(n, t)| n == "kid" && *t == 1) {
+                return Err("listdir of a mount parent is missing its child mount");
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&kid, "/m2133/kid");
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_listdir_lists_child_mounts);
 
 // ── utime (NUL-term path) → 0 / -EFAULT ────────────────────────────
 //

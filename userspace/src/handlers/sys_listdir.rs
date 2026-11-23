@@ -7,6 +7,89 @@ fn fail(errno: i64) -> SyscallReturn {
     SyscallReturn::ok((-errno) as u64)
 }
 
+/// Enumerate `max` entries of `dir` starting at `from`: async first,
+/// synchronous `enumerate()` when the async side answers `Unsupported`.
+/// `None` is a real enumeration failure (or no executor to park on);
+/// an empty vec is a clean end of entries. This is the `listdir` half
+/// of the fallback `getdents64`'s `enumerate_batch` applies — without
+/// it, directories that only implement the sync side (procfs, debugfs,
+/// efivarfs, mqueuefs) list as empty here, and the caller below reads
+/// that as "not a directory".
+///
+/// `enumerate_async` is still driven first, so disk-backed filesystems
+/// (FAT, ext2) that return `Vec::new()` from the sync `enumerate()`
+/// keep serving through their real async override. `poll_blocking`
+/// drives the future to completion via the same internally-polled
+/// NVMe/virtio-blk driver path that sys_open and sys_read rely on.
+fn enumerate_with_fallback(
+    dir: &alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    from: usize,
+    max: usize,
+) -> Option<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>> {
+    match poll_blocking(dir.enumerate_async(from, max)) {
+        Some(Ok(entries)) => Some(entries),
+        Some(Err(narf_filesystem::FsError::Unsupported)) => Some(dir.enumerate(from, max)),
+        _ => None,
+    }
+}
+
+/// The single directory entry `listdir` reports at `cursor`: `Some`
+/// with zero or one entries, `None` when enumeration itself fails
+/// (the caller maps that to ENOENT/ENOTDIR).
+///
+/// The stream is the filesystem's own entries first, then the
+/// immediate child mounts of `path` — mount points are dentries in
+/// the parent on Linux, so `ls /` must show `proc`, `sys`, `dev`, …
+/// A mount's type wins where its name collides with an underlying
+/// entry (the mount covers it), and a colliding mount is not listed
+/// twice. The mount half only runs once the filesystem's entries are
+/// exhausted at `cursor`, so a plain scan costs one mount-table
+/// lookup per call and nothing more; locating the mount index needs
+/// the filesystem's entry count, which is the listing up to `cursor`
+/// (the empty fetch above proves the count is at most `cursor`).
+/// Past [`MERGE_CURSOR_CAP`] the merge is skipped and the listing
+/// simply ends — mount-parent directories are small in practice, and
+/// a misplaced mount is worse than a missing one.
+const MERGE_CURSOR_CAP: usize = 4096;
+
+fn listdir_entry(
+    dir: &alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    path: &str,
+    cursor: usize,
+) -> Option<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>> {
+    let mounts = narf_filesystem::registry().child_mounts(path);
+    // The filesystem's entry at `cursor`, if any.
+    let entry = enumerate_with_fallback(dir, cursor, 1)?;
+    if let Some((name, ftype)) = entry.into_iter().next() {
+        let ftype = mounts
+            .iter()
+            .find(|(mname, _)| *mname == name)
+            .map(|(_, mtype)| *mtype)
+            .unwrap_or(ftype);
+        return Some(alloc::vec![(name, ftype)]);
+    }
+    // The filesystem is exhausted at `cursor`: mount children may follow.
+    if mounts.is_empty() {
+        return Some(alloc::vec::Vec::new());
+    }
+    if cursor > MERGE_CURSOR_CAP {
+        return Some(alloc::vec::Vec::new());
+    }
+    let fs_all = enumerate_with_fallback(dir, 0, cursor)?;
+    let Some(mount_index) = cursor.checked_sub(fs_all.len()) else {
+        // The directory grew between the two fetches; report end of
+        // directory rather than place a mount at a wrong index.
+        return Some(alloc::vec::Vec::new());
+    };
+    let mut visible = mounts
+        .iter()
+        .filter(|(mname, _)| !fs_all.iter().any(|(fname, _)| fname == mname));
+    match visible.nth(mount_index) {
+        Some((name, ftype)) => Some(alloc::vec![(name.clone(), *ftype)]),
+        None => Some(alloc::vec::Vec::new()),
+    }
+}
+
 /// `listdir` is NARF-native — there is no Linux syscall of this name — but it
 /// is `getdents64(2)` with the directory named by path instead of by an open
 /// fd, so it borrows that call's errno shape and check ORDER from
@@ -81,12 +164,10 @@ pub(crate) fn sys_listdir(ctx: &mut dyn TrapContext) {
                 }
                 cur
             };
-            // Use enumerate_async so disk-backed FSes (FAT, ext2) that
-            // return Vec::new() from the sync enumerate() still work.
-            // poll_blocking drives the future to completion via the
-            // same internally-polled NVMe/virtio-blk driver path that
-            // sys_open and sys_read already rely on.
-            poll_blocking(dir.enumerate_async(cursor, 1)).and_then(|r| r.ok())
+            // One entry at `cursor` from the merged stream: the
+            // filesystem's own entries first, then the immediate child
+            // mounts of `path` (see `listdir_entry`).
+            listdir_entry(&dir, &path, cursor)
         })
         .flatten();
 

@@ -1146,6 +1146,17 @@ setters carry Linux's low 12 `S_IALLUGO` bits (`07777`). A writable overlay
 copies up a lower-only directory before applying asynchronous mode or owner
 updates; a persistence or copy-up failure is returned to the syscall layer.
 
+Directory enumeration is async-first with a synchronous fallback:
+`DirOps::enumerate_async` defaults to the synchronous `enumerate()`
+(which defaults to walking `iter()`), so synthetic directories that
+only implement the sync side (procfs, debugfs, efivarfs, mqueuefs)
+enumerate through every readdir surface. Disk-backed filesystems
+override the async side — their sync `enumerate` is a stub that
+returns empty, so a caller that drove only the sync side would see
+nothing. Both readdir surfaces (`getdents64` and the NARF-native
+`listdir`) apply the fallback for an async `Unsupported`, so they
+agree entry for entry.
+
 ### 3.5 Mount
 
 ```rust

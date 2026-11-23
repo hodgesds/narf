@@ -4996,6 +4996,20 @@ fn current_covering_mount_info(abs: &str) -> Option<(alloc::string::String, u64)
     }
 }
 
+/// Immediate child mounts of directory `path` in the current task's
+/// mount namespace (the global registry when it has none) — the mount
+/// points a directory listing merges after the covering filesystem's
+/// own entries. Mirrors [`current_covering_mount_info`].
+fn current_child_mounts(
+    path: &str,
+) -> alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)> {
+    if let Some(ns) = current_mount_namespace() {
+        ns.child_mounts(path)
+    } else {
+        narf_filesystem::registry().child_mounts(path)
+    }
+}
+
 /// Every DISTINCT private mount namespace currently installed, deduplicated by
 /// `Arc` pointer identity (tasks that share a namespace via fork/plain-clone map
 /// to the same Arc). Keyed on the pointer, NOT `ns.id()`: the id allocator
