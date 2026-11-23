@@ -1551,7 +1551,8 @@ pub const MAX_EXTENTS: usize;                      // 169: what one locator bloc
 pub struct Extent { pub file_block: u64, pub device_block: u64, pub blocks: u64 }
 pub struct Locator { pub file_blocks: u64, pub extents: Vec<Extent> }
 impl Locator { pub fn from_map(map: &[u64]) -> Self; pub fn device_block(&self, b: u64) -> Option<u64>;
-               pub fn encode(&self) -> Option<[u8; 4096]>; pub fn decode(page: &[u8]) -> Result<Self, LocatorError>; }
+               pub fn encode(&self) -> Option<[u8; 4096]>; pub fn encode_into(&self, page: &mut [u8; 4096]) -> Option<()>;
+               pub fn decode(page: &[u8]) -> Result<Self, LocatorError>; }
 pub struct ExtentStore<D: ImageStore>;             // impl ImageStore: the file after its locator block
 pub enum ImageFileError { NoMount, NoDevice(String), Fs(FsError), Unmapped(u64), Fragmented(usize), Mismatch, Store }
 pub async fn prepare(path: &str, image_len: u64) -> Result<ImageFile, ImageFileError>;

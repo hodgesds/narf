@@ -21,6 +21,7 @@
 //! finds the locator at `narf.resume=<device> narf.resume_offset=<block>`,
 //! Linux's `resume=` and `resume_offset=` (4 KiB units).
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -94,11 +95,16 @@ impl Locator {
         Some(e.device_block + (file_block - e.file_block))
     }
 
-    pub fn encode(&self) -> Option<[u8; BLOCK as usize]> {
+    /// Encode into a caller-provided page, which is zeroed first. Writing
+    /// into the caller's page keeps the 4 KiB value out of the caller's
+    /// frame: returning it by value kept both the page and `encode`'s own
+    /// copy in `hibernate`'s poll (8552 bytes, over the frame budget).
+    /// Same shape as `PayloadHeader::encode_into`.
+    pub fn encode_into(&self, page: &mut [u8; BLOCK as usize]) -> Option<()> {
         if self.extents.len() > MAX_EXTENTS {
             return None;
         }
-        let mut page = [0u8; BLOCK as usize];
+        page.fill(0);
         page[..8].copy_from_slice(LOCATOR_MAGIC);
         page[8..12].copy_from_slice(&1u32.to_le_bytes());
         page[12..16].copy_from_slice(&(self.extents.len() as u32).to_le_bytes());
@@ -109,6 +115,12 @@ impl Locator {
             page[at + 8..at + 16].copy_from_slice(&e.device_block.to_le_bytes());
             page[at + 16..at + 24].copy_from_slice(&e.blocks.to_le_bytes());
         }
+        Some(())
+    }
+
+    pub fn encode(&self) -> Option<[u8; BLOCK as usize]> {
+        let mut page = [0u8; BLOCK as usize];
+        self.encode_into(&mut page)?;
         Some(page)
     }
 
@@ -341,8 +353,13 @@ pub async fn prepare(path: &str, image_len: u64) -> Result<ImageFile, ImageFileE
         map.push(device_block);
     }
     let locator = Locator::from_map(&map);
-    let page = locator
-        .encode()
+    // The locator page lives on the heap: building it by value in this
+    // poll kept both the page and `encode`'s own copy in the frame
+    // (8552 bytes, over the frame budget). Same shape as
+    // `PayloadSource::new` for the header page.
+    let mut page = Box::new([0u8; BLOCK as usize]);
+    locator
+        .encode_into(&mut page)
         .ok_or(ImageFileError::Fragmented(locator.extents.len()))?;
 
     // Prove the mapping and find the device: what the filesystem wrote must
@@ -355,7 +372,7 @@ pub async fn prepare(path: &str, image_len: u64) -> Result<ImageFile, ImageFileE
         let (r, _) = narf_memory::kaslr::random_u64();
         chunk.copy_from_slice(&(r ^ k as u64).to_le_bytes());
     }
-    write_through(&*file, 0, &page).await?;
+    write_through(&*file, 0, &page[..]).await?;
     write_through(&*file, (blocks - 1) * BLOCK, &marker).await?;
     file.fsync(false).await?;
     let holds = |dev: &BlockStore| {
