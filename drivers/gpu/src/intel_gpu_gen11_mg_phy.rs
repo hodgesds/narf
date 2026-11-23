@@ -841,15 +841,25 @@ pub mod tests {
         if io.read32(mg_tx1_piso_readload(0, 0)) & MG_CRI_CALCINIT == 0 {
             return TestResult::Fail("MG PISO_READLOAD must set CRI_CALCINIT");
         }
-        // RBR (162 MHz) takes the RBR/HBR table: entry 0
-        // {0x18, 0x00, 0x00} at (0, 0).
+        // RBR (162 MHz) takes the RBR/HBR table: levels (1, 2)
+        // → index 6 → {0x30, 0x00, 0x0F}, which differs from
+        // the HBR2 entry 6 {0x33, 0x00, 0x0C}, so this check
+        // actually pins the table selection. (Entry 0 is
+        // byte-identical in both tables, so levels (0, 0)
+        // could not distinguish them.)
         let io = MgModel::new();
         if port
-            .signal_levels(&io, 162_000, &[(0, 0); 4], false)
+            .signal_levels(&io, 162_000, &[(1, 2); 4], false)
             .is_err()
-            || io.read32(mg_tx1_swingctrl(0, 0)) & 0x3F != 0x18
         {
-            return TestResult::Fail("MG RBR must use the RBR/HBR table");
+            return TestResult::Fail("MG signal_levels must succeed");
+        }
+        if io.read32(mg_tx1_swingctrl(0, 0)) & 0x3F != 0x0F {
+            return TestResult::Fail("MG SWINGCTRL must carry the 17_12 field");
+        }
+        let drv = io.read32(mg_tx1_drvctrl(0, 0));
+        if drv >> 24 & 0x3F != 0x30 || drv >> 22 & 1 != 1 || drv >> 16 & 0x3F != 0x00 {
+            return TestResult::Fail("MG DRVCTRL must carry 11_6 / 5_0 + override enable");
         }
         // HDMI takes the HDMI table at the default entry 9
         // {0x36, 0x00, 0x09} regardless of the levels input.
