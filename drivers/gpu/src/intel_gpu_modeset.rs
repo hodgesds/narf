@@ -4644,10 +4644,12 @@ pub mod tests {
         if !mmio.writes_to(0x60540).is_empty() {
             return TestResult::Fail("Gen11 must never write the TGL transcoder DP_TP_CTL");
         }
-        // DDI_BUF_CTL for DDI B (0x64100) enabled at 4 lanes
-        // (ENABLE | (4-1)<<1, plus the IDLE bit the fixture
-        // serves pre-enable); DDI A is never enabled.
-        if mmio.writes_to(0x64100) != alloc::vec![0x8000_0086] {
+        // DDI_BUF_CTL for DDI B (0x64100): step 3's disable-first
+        // writes the readback (IDLE set, ENABLE clear: 0x80),
+        // then the enable writes ENABLE | (4-1)<<1 plus the
+        // IDLE bit the fixture serves pre-enable (0x8000_0086);
+        // DDI A is never enabled.
+        if mmio.writes_to(0x64100) != alloc::vec![0x80, 0x8000_0086] {
             return TestResult::Fail("Gen11 DDI B buffer must enable at 4 lanes");
         }
         if !mmio.writes_to(0x64000).is_empty() {
@@ -4677,7 +4679,7 @@ pub mod tests {
         // WRPLL coefficients for 148.5 MHz at 24 MHz (DCO 371 +
         // 0x2000, Q/3 K/2 P/2), written to the ICL CFGCR pair
         // for DPLL1 (0x164080/0x164084); DPLL0 untouched.
-        if mmio.writes_to(0x164080) != alloc::vec![0x8000_0173] {
+        if mmio.writes_to(0x164080) != alloc::vec![0x0080_0173] {
             return TestResult::Fail("Gen11 HDMI CFGCR0 must be the WRPLL row at 0x164080");
         }
         if mmio.writes_to(0x164084) != alloc::vec![0xE87] {
@@ -4710,8 +4712,11 @@ pub mod tests {
         if mmio.writes_to(phy + 0x604).last() != Some(&0) {
             return TestResult::Fail("HDMI must clear the common keeper");
         }
-        // DDI_BUF_CTL for DDI B enabled at 4 lanes.
-        if mmio.writes_to(0x64100) != alloc::vec![0x8000_0086] {
+        // DDI_BUF_CTL for DDI B enabled at 4 lanes: the
+        // disable-first stop write (readback 0x80, IDLE set,
+        // ENABLE clear) precedes the enable (0x8000_0086),
+        // same as the external-DP run.
+        if mmio.writes_to(0x64100) != alloc::vec![0x80, 0x8000_0086] {
             return TestResult::Fail("Gen11 HDMI DDI B buffer must enable at 4 lanes");
         }
         TestResult::Pass
