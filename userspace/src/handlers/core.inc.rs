@@ -5723,18 +5723,45 @@ fn read_pipe_user(
     endpoint: &CopyFdEndpoint,
     pipe: &crate::pipe::Endpoint<'_>,
     count: usize,
-    copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
+    mut copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
 ) {
-    match crate::pipe::read_endpoint(pipe, count, true, copy) {
-        Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        Err(errno) if errno == EAGAIN as u64 && !endpoint.nonblocking() => {
-            if has_interrupting_signal(current_task_id()) {
-                ctx.set_return(errno_ret(EINTR));
-            } else if !park_reexecute_on_fd(ctx, endpoint.ops.as_ref(), narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP) {
-                ctx.set_return(errno_ret(EAGAIN));
+    // A woken reader resumes in place instead of re-executing the whole
+    // syscall: the fd lookup, range validation and pipe resolution in the
+    // caller are already done, and a WouldBlock attempt moved no bytes, so
+    // retrying `read_endpoint` directly cannot duplicate a copy. This
+    // mirrors the socket `stream_wait_with_progress` in-place retry. A
+    // signal that ends the park keeps the rewound restart-pending frame
+    // (return without a value), so the exit trap still applies the
+    // EINTR/SA_RESTART rule exactly as a re-execution would.
+    loop {
+        match crate::pipe::read_endpoint(pipe, count, true, &mut copy) {
+            Ok(n) => {
+                ctx.set_return(SyscallReturn::ok(n as u64));
+                return;
+            }
+            Err(errno) if errno == EAGAIN as u64 && !endpoint.nonblocking() => {
+                if has_interrupting_signal(current_task_id()) {
+                    ctx.set_return(errno_ret(EINTR));
+                    return;
+                }
+                if !park_reexecute_on_fd(
+                    ctx,
+                    endpoint.ops.as_ref(),
+                    narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+                ) {
+                    ctx.set_return(errno_ret(EAGAIN));
+                    return;
+                }
+                if has_interrupting_signal(current_task_id()) {
+                    return;
+                }
+                resume_parked_syscall_in_place(ctx);
+            }
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno as i64));
+                return;
             }
         }
-        Err(errno) => ctx.set_return(errno_ret(errno as i64)),
     }
 }
 
@@ -5771,12 +5798,26 @@ unsafe fn write_pipe_user(
             if total == 0 { ctx.set_return(errno_ret(EAGAIN)); return; }
             break;
         }
-        // With no committed bytes the syscall can safely re-execute. Preserve
-        // its original arguments and restart-pending marker so signal delivery
-        // can distinguish SA_RESTART from EINTR. Once a prefix is committed,
-        // keep it on this stack and return it rather than replaying the write.
-        if total == 0 && park_reexecute_on_fd(ctx, endpoint.ops.as_ref(), narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR) {
-            return;
+        // With no committed bytes the syscall can safely resume in place:
+        // retrying the transfer keeps the resolved endpoint and skips the
+        // full syscall re-execution (fd lookup, validation, pipe
+        // resolution), mirroring the read side above. A signal that ends
+        // the park keeps the rewound restart-pending frame (return:
+        // re-execute as before) so signal delivery can distinguish
+        // SA_RESTART from EINTR. Once a prefix is committed, keep it on
+        // this stack and return it rather than replaying the write.
+        if total == 0
+            && park_reexecute_on_fd(
+                ctx,
+                endpoint.ops.as_ref(),
+                narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR,
+            )
+        {
+            if has_interrupting_signal(task) {
+                return;
+            }
+            resume_parked_syscall_in_place(ctx);
+            continue;
         }
         if has_interrupting_signal(task) {
             if total == 0 { ctx.set_return(errno_ret(EINTR)); return; }
