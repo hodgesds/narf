@@ -85,6 +85,23 @@ pub struct Task {
     /// stable outer id at the boundary, while the common non-container build
     /// returns it directly without contending on `TASK_TO_PID`.
     process_group_pid: AtomicU64,
+    /// Outer ProcessId naming this task's parent (Linux
+    /// `task_struct::real_parent` in `signal->pids[PIDTYPE_PID]` terms:
+    /// the parent's namespace-visible number, not its TaskId).
+    ///
+    /// Mirrors the authoritative `PARENT_OF` row the way
+    /// `process_group_pid` mirrors `PGID_TABLE`: the common
+    /// self-`getppid` path reads this one atomic instead of taking the
+    /// global `PARENT_OF` spinlock and then the sharded `TASK_TO_PID`
+    /// lock to translate the parent TaskId back to a visible pid.
+    /// `PARENT_PID_UNMIRRORED` means "no mirror yet — consult
+    /// `PARENT_OF`" (new tasks, and test stubs that install rows
+    /// directly). Writers of the parent link (`parent_of_set`,
+    /// `parent_of_remove`, the reparent half of exit) keep the mirror
+    /// in step with the row; `sys_getppid` fills it on its slow path
+    /// with a compare-exchange from `PARENT_PID_UNMIRRORED` so a
+    /// concurrent reparent can never lose to a stale fill.
+    parent_pid: AtomicU64,
     /// [`TASK_RUNNING`] | [`TASK_ZOMBIE`].
     pub state: AtomicU32,
     /// Explicit launch grant; inherited by fork/clone, never minted by a
@@ -254,6 +271,7 @@ impl Task {
             effective_ids: AtomicU64::new(0),
             process_group_id: AtomicU64::new(tid),
             process_group_pid: AtomicU64::new(pid),
+            parent_pid: AtomicU64::new(PARENT_PID_UNMIRRORED),
             state: AtomicU32::new(TASK_RUNNING),
             network_admin: IrqSafeSpinLock::new(None),
             proc_identity: crate::proc_identity::owner(tid),
@@ -527,6 +545,69 @@ pub(crate) fn current_process_group_pid() -> Option<u64> {
     Some(unsafe { (*ptr).process_group_pid.load(Ordering::Acquire) })
 }
 
+/// `Task::parent_pid` before any writer has mirrored a parent link into
+/// it: "not mirrored — consult `PARENT_OF`". Zero is a real value (no
+/// parent: orphan, init), so it cannot serve as the sentinel.
+pub(crate) const PARENT_PID_UNMIRRORED: u64 = u64::MAX;
+
+/// This task's parent as an outer ProcessId, from the `Task`-local mirror
+/// of the `PARENT_OF` row. `None` when there is no scheduler-published
+/// Task (kernel-test fixtures) or the mirror is unfilled — the caller
+/// falls back to the `PARENT_OF` lookup.
+#[inline]
+pub(crate) fn current_parent_pid() -> Option<u64> {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+    // in-flight `UserTaskFuture` retains that Arc while this hook can run.
+    let pid = unsafe { (*ptr).parent_pid.load(Ordering::Acquire) };
+    if pid == PARENT_PID_UNMIRRORED {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Mirror a parent link into `tid`'s `Task`, for writers of the
+/// authoritative `PARENT_OF` row (`parent_of_set` /
+/// `parent_of_remove`). Unconditional store: the row writer is the
+/// authority, so last-writer-wins is correct. No-op when `tid` has no
+/// registered `Task` (a child not yet spawned, a test stub).
+pub(crate) fn cache_parent_pid(tid: u64, parent_outer_pid: u64) {
+    if let Some(task) = task_get(tid) {
+        task.parent_pid.store(parent_outer_pid, Ordering::Release);
+    }
+}
+
+/// Fill `tid`'s parent mirror from a `PARENT_OF` read (the `sys_getppid`
+/// slow path). Compare-exchange from `PARENT_PID_UNMIRRORED` only: a
+/// concurrent reparent that already mirrored a newer parent must never
+/// lose to this stale fill. Returns `false` when the mirror was already
+/// filled (or the task is gone) and the value was not stored.
+pub(crate) fn fill_cached_parent_pid(tid: u64, parent_outer_pid: u64) -> bool {
+    let Some(task) = task_get(tid) else {
+        return false;
+    };
+    task.parent_pid
+        .compare_exchange(
+            PARENT_PID_UNMIRRORED,
+            parent_outer_pid,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Inspect the mirror without requiring a live scheduler stack context.
+/// Mirrors `__test_cached_identity` for the parent link. `None` when the
+/// task is gone; otherwise the raw mirror value, which is
+/// `PARENT_PID_UNMIRRORED` until a writer fills it.
+#[doc(hidden)]
+pub(crate) fn __test_parent_pid(tid: u64) -> Option<u64> {
+    task_get(tid).map(|task| task.parent_pid.load(Ordering::Acquire))
+}
+
 /// Current task identity from the scheduler-published `Task`, without cloning
 /// its Arc or consulting the task/credential registries. The packed effective
 /// ids are updated by the same credential mutation funnel that updates the
@@ -722,9 +803,43 @@ pub(crate) fn parked_in_syscall(tid: u64) -> bool {
     })
 }
 
+/// Whether any reader of the in-syscall number has ever run. The
+/// `in_syscall` stores on the syscall entry/exit path exist only for
+/// `/proc/<pid>/syscall` (via `running_syscall`), `/proc/<pid>/stack`
+/// (same hook) and the hung-task report: all rare, on-demand readers.
+/// Until the first such read the stores are pure overhead on every
+/// syscall — a Relaxed store pair plus the `current_user_task()`
+/// resolution in the versioned/compat entry paths — so writers skip
+/// them while this latch is clear. Sticky once set: a reader that has
+/// run once may run again at any time, and the number must be current
+/// from then on. A reader that runs while a syscall is already in
+/// flight (before the latch was set) observes `0` and reports
+/// "running", which is exactly what Linux's `task_current_syscall`
+/// prints for an on-CPU task.
+static IN_SYSCALL_TRACKING: AtomicBool = AtomicBool::new(false);
+
+/// Fast-path check for the `in_syscall` writers: one read-mostly load
+/// plus a not-taken branch when no reader has ever armed the latch (the
+/// same shape as `narf_lib::perf::syscall`'s `ENABLED` gate).
+#[inline]
+pub(crate) fn in_syscall_tracking_enabled() -> bool {
+    IN_SYSCALL_TRACKING.load(Ordering::Relaxed)
+}
+
+/// Arm the `in_syscall` writers. Called by every reader of the
+/// in-syscall number before it reads, so syscalls that begin after the
+/// first read are recorded.
+#[inline]
+pub(crate) fn note_in_syscall_reader() {
+    IN_SYSCALL_TRACKING.store(true, Ordering::Relaxed);
+}
+
 /// The raw number of the syscall `tid` is executing, if it is inside one
 /// (parked or not). A zombie is inside none.
 pub(crate) fn running_syscall(tid: u64) -> Option<u32> {
+    // Arm the writers first: a syscall that begins after this read must
+    // be recorded for the next one.
+    note_in_syscall_reader();
     let task = task_get(tid)?;
     if task.state.load(Ordering::Acquire) == TASK_ZOMBIE {
         return None;
@@ -1360,6 +1475,12 @@ pub fn check_hung_tasks(now_ns: u64, timeout_ns: u64, warnings: &AtomicU64) -> u
             "INFO: task {comm}:{pid} blocked for more than {} seconds.",
             blocked_ns / 1_000_000_000
         );
+        // A hung task's syscall number comes from `in_syscall`, which is
+        // only recorded once a reader has armed the latch (see
+        // `IN_SYSCALL_TRACKING`): arm it here so later reports name the
+        // syscall. This report itself may still read 0 ("running") for a
+        // syscall that began before the first arming.
+        note_in_syscall_reader();
         let syscall = t.uctx.in_syscall.load(Ordering::Relaxed);
         let (kind, site) = match crate::handlers::parked_wait_site(t.tid) {
             Some(lock) => ("lock", Some(lock)),
@@ -1868,3 +1989,72 @@ pub fn __test_reset_tasks() {
         release_task(task);
     }
 }
+
+// ── Parent-pid mirror + in_syscall latch tests ────────────────────────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_parent_pid_mirror_default_fill_and_cas() -> TestResult {
+    let tid = narf_scheduler::alloc_task_id().raw();
+    let task = Task::new_registered(tid, tid);
+    if __test_parent_pid(tid) != Some(PARENT_PID_UNMIRRORED) {
+        return TestResult::Fail("new task's parent mirror is not UNMIRRORED");
+    }
+    // Slow-path fill lands from UNMIRRORED.
+    if !fill_cached_parent_pid(tid, 42) {
+        return TestResult::Fail("first fill_cached_parent_pid did not land");
+    }
+    if __test_parent_pid(tid) != Some(42) {
+        return TestResult::Fail("filled parent mirror does not read back 42");
+    }
+    // A second fill must NOT overwrite: the reparent writer owns the
+    // mirror once it is filled.
+    if fill_cached_parent_pid(tid, 43) {
+        return TestResult::Fail("second fill overwrote an already-filled mirror");
+    }
+    if __test_parent_pid(tid) != Some(42) {
+        return TestResult::Fail("second fill changed the mirror value");
+    }
+    // The row writer's unconditional store replaces the mirror.
+    cache_parent_pid(tid, 44);
+    if __test_parent_pid(tid) != Some(44) {
+        return TestResult::Fail("cache_parent_pid did not replace the mirror");
+    }
+    // Clearing the mirror (orphan / reap) reads back as "no parent".
+    cache_parent_pid(tid, 0);
+    if __test_parent_pid(tid) != Some(0) {
+        return TestResult::Fail("cleared parent mirror does not read back 0");
+    }
+    // A fill after a clear must not land either: the mirror is filled,
+    // just with "no parent".
+    if fill_cached_parent_pid(tid, 45) {
+        return TestResult::Fail("fill landed over a cleared (0) mirror");
+    }
+    release_task(tid);
+    drop(task);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_parent_pid_mirror_default_fill_and_cas
+);
+
+fn smoke_running_syscall_arms_in_syscall_tracking() -> TestResult {
+    // `running_syscall` is the `/proc/<pid>/syscall` reader: it must arm
+    // the latch so later syscalls are recorded. The latch is sticky by
+    // design, so this test only asserts the arming direction (a latch
+    // armed by an earlier test stays armed).
+    let tid = narf_scheduler::alloc_task_id().raw();
+    let task = Task::new_registered(tid, tid);
+    let _ = running_syscall(tid);
+    if !in_syscall_tracking_enabled() {
+        return TestResult::Fail("running_syscall did not arm in_syscall tracking");
+    }
+    release_task(tid);
+    drop(task);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_running_syscall_arms_in_syscall_tracking
+);

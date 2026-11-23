@@ -57,10 +57,15 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) {
         // or queued the signal; deliver it below.
         None => None,
         Some(nr) => {
-            if let Some(u) = uctx {
-                // SAFETY: the in-flight task's poller-pinned context; atomic
-                // store only.
-                unsafe { (*u).in_syscall.store(nr.wrapping_add(1), Ordering::Relaxed) };
+            // The in-syscall number is recorded only once a reader has
+            // armed the latch (see `task::IN_SYSCALL_TRACKING`); the
+            // context is still resolved below for the park-restart flag.
+            if crate::task::in_syscall_tracking_enabled() {
+                if let Some(u) = uctx {
+                    // SAFETY: the in-flight task's poller-pinned context; atomic
+                    // store only.
+                    unsafe { (*u).in_syscall.store(nr.wrapping_add(1), Ordering::Relaxed) };
+                }
             }
             let served = match nr {
                 NR_SET_THREAD_AREA => {
@@ -77,7 +82,11 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) {
                 // SAFETY: as above.
                 unsafe {
                     (*u).parked_in_syscall.store(false, Ordering::Release);
-                    (*u).in_syscall.store(0, Ordering::Relaxed);
+                    // The in-syscall number is recorded only once a reader
+                    // has armed the latch (see `task::IN_SYSCALL_TRACKING`).
+                    if crate::task::in_syscall_tracking_enabled() {
+                        (*u).in_syscall.store(0, Ordering::Relaxed);
+                    }
                 }
             }
             served
