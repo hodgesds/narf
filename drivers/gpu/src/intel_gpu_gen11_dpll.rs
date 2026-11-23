@@ -971,7 +971,7 @@ pub mod tests {
             None => return TestResult::Fail("HBR2 19.2 MHz row must exist"),
         };
         let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
-        if cfgcr0 != 0x1C00_01A5 {
+        if cfgcr0 != 0x01C0_01A5 {
             return TestResult::Fail("HBR2 CFGCR0 must be frac 0x7000 << 10 | int 0x1A5");
         }
         // cfgcr1: QDIV 0 | KDIV_1 (1<<6) | PDIV_3 (2<<2) | CFREQ 3.
@@ -984,7 +984,7 @@ pub mod tests {
             None => return TestResult::Fail("HBR2 24 MHz row must exist"),
         };
         let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
-        if cfgcr0 != 0x1000_0151 || cfgcr1 != (1 << 6) | (2 << 2) | 3 {
+        if cfgcr0 != 0x0100_0151 || cfgcr1 != (1 << 6) | (2 << 2) | 3 {
             return TestResult::Fail("HBR2 24 MHz state wrong");
         }
         // EHL div-frac WA: 0x7000 halves to 0x3800.
@@ -993,7 +993,7 @@ pub mod tests {
             None => return TestResult::Fail("HBR2 row must exist"),
         };
         let (cfgcr0, _) = calc_dpll_state(&coeffs, true);
-        if cfgcr0 != 0x0E00_01A5 {
+        if cfgcr0 != 0x00E0_01A5 {
             return TestResult::Fail("EHL frac WA must halve 0x7000 to 0x3800");
         }
         // RBR/HBR/HBR3 rows pack without error too.
@@ -1316,7 +1316,7 @@ pub mod tests {
             None => return TestResult::Fail("TBT 24 MHz row must exist"),
         };
         let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
-        if cfgcr0 != 0x1000_0151 || cfgcr1 != 0x53 {
+        if cfgcr0 != 0x0100_0151 || cfgcr1 != 0x53 {
             return TestResult::Fail("TBT 24 MHz row wrong");
         }
         // 19.2 MHz row: DCO 0x1A5/0x7000, same dividers.
@@ -1325,7 +1325,7 @@ pub mod tests {
             None => return TestResult::Fail("TBT 19.2 MHz row must exist"),
         };
         let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
-        if cfgcr0 != 0x1C00_01A5 || cfgcr1 != 0x53 {
+        if cfgcr0 != 0x01C0_01A5 || cfgcr1 != 0x53 {
             return TestResult::Fail("TBT 19.2 MHz row wrong");
         }
         // 38.4 MHz falls through to the 19.2 MHz row.
@@ -1334,7 +1334,7 @@ pub mod tests {
             None => return TestResult::Fail("TBT 38.4 MHz row must exist"),
         };
         let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
-        if cfgcr0 != 0x1C00_01A5 || cfgcr1 != 0x53 {
+        if cfgcr0 != 0x01C0_01A5 || cfgcr1 != 0x53 {
             return TestResult::Fail("TBT 38.4 MHz row must fall through to 19.2 MHz");
         }
         if tbt_pll_coeffs(12_345).is_some() {
@@ -1401,7 +1401,7 @@ pub mod tests {
         if enable_writes != alloc::vec![PLL_POWER_ENABLE, PLL_POWER_ENABLE | PLL_ENABLE] {
             return TestResult::Fail("TBT enable sequence must be power then PLL enable");
         }
-        if mmio.writes_to(TBT_PLL_CFGCR0) != alloc::vec![0x1C00_01A5] {
+        if mmio.writes_to(TBT_PLL_CFGCR0) != alloc::vec![0x01C0_01A5] {
             return TestResult::Fail("TBT CFGCR0 must carry the 19.2 MHz row");
         }
         if mmio.writes_to(TBT_PLL_CFGCR1) != alloc::vec![0x53] {
