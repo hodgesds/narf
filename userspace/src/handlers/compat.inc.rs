@@ -12616,6 +12616,22 @@ pub(crate) fn futex_block(
     words: &[FutexWaitWord],
     deadline: Option<u64>,
 ) -> FutexBlock {
+    // Fast-fail BEFORE the wait machinery: the setup loop below fails the
+    // wait with the same errno when the first word already moved
+    // (`-EAGAIN`) or is unreadable (`-EFAULT`), and the legacy fallback
+    // reports the same errno from the same seqlock read — so deciding here
+    // changes no outcome. What it skips is the whole setup prefix the
+    // failing path never needed: the `FutexQ` cache touch, the entry
+    // location lock, and the queue registration. A passing word still goes
+    // through the loop, which takes its own fresh seqlock snapshot before
+    // queueing (the lost-wake protocol is unchanged).
+    if let Some(w) = words.first() {
+        match futex_wait_seqlock_read_key(w.key, || futex_read_user_word(w.uaddr)) {
+            None => return FutexBlock::Errno(EFAULT),
+            Some((_, current)) if current != w.val => return FutexBlock::Errno(EAGAIN),
+            Some(_) => {}
+        }
+    }
     if !narf_scheduler::stackful::user_own_stack_enabled() {
         return FutexBlock::NoExecutor;
     }

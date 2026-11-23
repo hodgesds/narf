@@ -50,16 +50,15 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     let private = (raw_op & FUTEX_PRIVATE) != 0;
     let cmd = raw_op & FUTEX_OP_MASK;
     let val = args.arg2 as u32;
-    // Start each futex op from clean park state so a stale `futex_uaddr` left
-    // by a prior wait (e.g. a wake that cleared only the deadline) can't make
-    // the poll routine re-register on the old word.
-    if let Some(uctx) = crate::user_task::current_user_task() {
-        // SAFETY: uctx is live for this trap; atomic field.
-        unsafe {
-            (*uctx).futex_uaddr.store(0, Ordering::Release);
-            (*uctx).futex_namespace.store(0, Ordering::Release);
-        }
-    }
+    // No per-op park-state clear here: every futex op used to pay a
+    // `current_user_task()` lookup plus two atomic stores clearing
+    // `futex_uaddr`/`futex_namespace`, but only the paths that actually
+    // park can leave park state behind, and each of those clears it
+    // itself — `futex_block` at its loop top, the park-loop exit paths,
+    // and `futex_lock_pi` at its entry (a woken PI locker re-executes and
+    // can take the lock while its park state is still set). A non-parking
+    // op (notably `FUTEX_WAKE`) therefore skips the lookup and stores
+    // entirely. `futex2` wait/wake never had this clear and are unchanged.
     // Step 1: the timespec is decoded in the syscall wrapper, before
     // `do_futex` sees the op. `futex_init_timeout` treats FUTEX_WAIT's
     // timespec as a RELATIVE duration and every other timeout-carrying
@@ -328,6 +327,19 @@ fn futex_lock_pi(
     deadline: Option<u64>,
     trylock: bool,
 ) {
+    // Start from clean park state: the park path below publishes
+    // `futex_uaddr` and parks, and a woken locker re-executes this function
+    // and can take the lock (or report EDEADLK/ESRCH) on the next pass while
+    // that park state is still set. `sys_futex` no longer clears it for
+    // every op, so this entry clear is what keeps a taken PI lock from
+    // leaving a stale park target for a later park loop to re-register on.
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: uctx is live for this trap; atomic fields.
+        unsafe {
+            (*uctx).futex_uaddr.store(0, Ordering::Release);
+            (*uctx).futex_namespace.store(0, Ordering::Release);
+        }
+    }
     let task = current_task_id();
     let me = (linux_tid_for_task(task) as u32) & FUTEX_TID_MASK;
     // Each pass either decides, or lost a compare-and-swap to another
