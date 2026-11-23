@@ -714,7 +714,8 @@ fn gsb_dispatch(region_path: &str, byte_offset: u64, op: GsbOp) -> u64 {
 ///   `ecam_base + ((segment << 28) | (bus << 20) | (device << 15) | (function << 12)) + region.offset`
 ///
 /// Returns `None` when no `_ADR` ancestor is found, when the ECAM base is
-/// unavailable, or when the namespace lookup fails.
+/// unavailable, when the namespace lookup fails, or when the ECAM
+/// address computation overflows (SEC-F5).
 fn resolve_pci_config_addr(region: &OpRegionInfo) -> Option<u64> {
     // mcfg_ecam_base is segment-0's base; we default segment to 0.
     let ecam_base = narf_acpi::mcfg_ecam_base()?;
@@ -799,7 +800,11 @@ fn resolve_pci_config_addr(region: &OpRegionInfo) -> Option<u64> {
 
     // ECAM offset per PCIe spec: bus[27:20] | device[19:15] | func[14:12]
     let ecam_offset = (seg_val << 28) | (bus << 20) | (device << 15) | (func << 12);
-    Some(ecam_base + ecam_offset + region.offset)
+    // Checked: a wrapping ECAM address would silently address the
+    // wrong device's config space (SEC-F5 offset-overflow check).
+    ecam_base
+        .checked_add(ecam_offset)?
+        .checked_add(region.offset)
 }
 
 // ── read_field ────────────────────────────────────────────────────────────────
@@ -966,11 +971,53 @@ fn access_unit_bytes(access_kind: u8) -> usize {
     }
 }
 
+/// SEC-F5: enforce one access unit's bounds against its OpRegion
+/// before any hardware access runs.
+///
+/// - `byte_offset + width` must stay inside the declared
+///   `region.length` (and must not overflow while being computed).
+///   Regions registered with `length = 0` — e.g. OpRegions whose
+///   offset/length TermArgs were computed expressions rather than
+///   flat literals — therefore refuse every access, matching the
+///   already-landed checked accessors (`oregion_checked.rs`).
+/// - `region.offset + byte_offset` must not overflow: that sum is
+///   the address the SystemMemory/SystemIO arms dereference.
+/// - EmbeddedCtl accesses must additionally stay inside the
+///   256-byte EC window. The EC offset is a `u8` on the wire, so
+///   without this a field declared past the window (even inside a
+///   region declared longer than 256 bytes) silently aliased to
+///   `offset mod 256` via the old `as u8` cast.
+///
+/// Returns the existing `Unsupported` range error in all cases;
+/// callers never touch hardware for a rejected unit.
+fn check_unit_bounds(
+    region: &OpRegionInfo,
+    byte_offset_in_region: u64,
+    width: usize,
+) -> Result<(), FieldAccessError> {
+    let width = width as u64;
+    let end = byte_offset_in_region
+        .checked_add(width)
+        .ok_or(FieldAccessError::Unsupported)?;
+    if end > region.length {
+        return Err(FieldAccessError::Unsupported);
+    }
+    region
+        .offset
+        .checked_add(byte_offset_in_region)
+        .ok_or(FieldAccessError::Unsupported)?;
+    if region.space == RegionSpace::EmbeddedCtl && end > 256 {
+        return Err(FieldAccessError::Unsupported);
+    }
+    Ok(())
+}
+
 fn read_unit(
     region: &OpRegionInfo,
     byte_offset_in_region: u64,
     width: usize,
 ) -> Result<u64, FieldAccessError> {
+    check_unit_bounds(region, byte_offset_in_region, width)?;
     match region.space {
         RegionSpace::SystemMemory => {
             // SAFETY: AML table declared a valid address.
@@ -986,7 +1033,12 @@ fn read_unit(
         }
         RegionSpace::PciConfig => match resolve_pci_config_addr(region) {
             // SAFETY: ECAM identity-mapped at boot.
-            Some(addr) => Ok(unsafe { mmio_read(addr + byte_offset_in_region, width) }),
+            Some(addr) => {
+                let addr = addr
+                    .checked_add(byte_offset_in_region)
+                    .ok_or(FieldAccessError::Unsupported)?;
+                Ok(unsafe { mmio_read(addr, width) })
+            }
             None => Err(FieldAccessError::Unsupported),
         },
         // EC: drive the firmware command/data-port protocol.
@@ -994,8 +1046,10 @@ fn read_unit(
         // weren't discovered at boot, so non-EC platforms keep
         // working.
         RegionSpace::EmbeddedCtl => {
-            // EC byte offsets fit in u8 by spec — the EC
-            // address space is 256 bytes max.
+            // EC byte offsets fit in u8: `check_unit_bounds`
+            // above already rejected any unit whose end exceeds
+            // the 256-byte EC window, so `byte_offset + i` can
+            // never wrap here (SEC-F5).
             let mut acc = 0u64;
             for i in 0..width.min(8) {
                 let off = (byte_offset_in_region + i as u64) as u8;
@@ -1055,6 +1109,7 @@ fn write_unit(
     width: usize,
     val: u64,
 ) -> Result<(), FieldAccessError> {
+    check_unit_bounds(region, byte_offset_in_region, width)?;
     match region.space {
         RegionSpace::SystemMemory => {
             // SAFETY: AML table declared a valid address.
@@ -1084,14 +1139,19 @@ fn write_unit(
                 // within that device's 4 KiB config space and `width` is the
                 // access-unit width (1/2/4/8) validated by the field decoder.
                 // SAFETY: Valid memory or trusted environment
+                let addr = addr
+                    .checked_add(byte_offset_in_region)
+                    .ok_or(FieldAccessError::Unsupported)?;
                 unsafe {
-                    mmio_write(addr + byte_offset_in_region, width, val);
+                    mmio_write(addr, width, val);
                 }
                 Ok(())
             }
             None => Err(FieldAccessError::Unsupported),
         },
-        // EC writes — drive the WR_EC protocol.
+        // EC writes — drive the WR_EC protocol. The `as u8`
+        // cast is in-range: `check_unit_bounds` rejected any
+        // unit whose end exceeds the 256-byte EC window (SEC-F5).
         RegionSpace::EmbeddedCtl => {
             for i in 0..width.min(8) {
                 let off = (byte_offset_in_region + i as u64) as u8;
