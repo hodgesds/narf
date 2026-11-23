@@ -76,6 +76,7 @@ extern "C" {
 /// # Safety
 /// - BSP, post-paging.
 /// - The first 1 GiB is identity-mapped (BSP's boot.S sets this up).
+///
 /// The CR3 the trampoline hands the APs, recorded at the first install.
 static AP_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

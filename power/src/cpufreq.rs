@@ -1111,6 +1111,7 @@ impl<S: Future<Output = ()>> Future for TickWait<S> {
         if take_sched_event(this.cpu) {
             return Poll::Ready(());
         }
+        // SAFETY: `sleep` is never moved after this future is pinned by the worker; projecting a `Pin<&mut S>` to the field is the standard manual projection.
         let sleep = unsafe { Pin::new_unchecked(&mut this.sleep) };
         sleep.poll(cx)
     }
