@@ -6907,6 +6907,17 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Op
         notify_wake_cpu_once(home, notified);
         return;
     }
+    // Linux `wake_affine`: a wakee homed on the waker's own CPU is already
+    // cache-local to the producer, which is about to sleep or yield between
+    // polls — keep the pair together instead of paying the policy callback
+    // + idle-sibling scan to split it. The fast path above already keeps a
+    // local wake when there is no backlog; this covers the backlogged case
+    // too, where migration would only move the consumer away from its
+    // producer. Only scan for an idle CPU when the wakee's home is elsewhere.
+    if h == me {
+        notify_wake_cpu_once(home, notified);
+        return;
+    }
     // Hard hrtimer expiry invokes this waker directly, including before the
     // architecture dispatcher publishes its IRQ-depth marker. With IRQs masked,
     // retain the durable owner notification and leave activation to the executor:
