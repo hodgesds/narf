@@ -915,7 +915,7 @@ fn resolve_exec_fast(
             return None;
         }
         if is_final {
-            return Some((alloc::string::String::from(expanded), node));
+            return Some((expanded, node));
         }
         // Intermediate component: it must be a real directory to keep
         // walking; anything else is the slow walk's error to report.

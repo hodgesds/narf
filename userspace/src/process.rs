@@ -498,6 +498,9 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             // cannot collide with pages already mapped.
             // SAFETY: Valid memory or trusted environment
             let interp_entry = match interp_fs_owned.as_ref() {
+                // SAFETY: Live AS, well-separated `interp_bias` (argument
+                // above): the interp segments cannot collide with pages
+                // already mapped.
                 Some((_, ops)) => unsafe {
                     load_elf_into_at_file(
                         interp_bytes,
@@ -507,6 +510,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
                         false,
                     )
                 }?,
+                // SAFETY: As above.
                 None => unsafe { load_elf_into_at(interp_bytes, &address_space, interp_bias) }?,
             };
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
