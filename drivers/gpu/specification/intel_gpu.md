@@ -446,8 +446,8 @@ ACK at 0x130044, and no HWCONFIG table (i915 requires graphics
 config space (all-ones refuses) instead of reading 0xD8C/0xFF8,
 and `gmd_id` is `None` on Gen9. The WOPCM plan for Gen9 is the
 1 MiB total (`gt/intel_wopcm.c` `GEN9_WOPCM_SIZE`). The part binds
-and announces; display, external display and backlight stay gated
-(Lanes 5 and 8). Execlists submission is admitted (Lane 3), with the
+and announces; the internal display modesets (Lane 5, see §12.6),
+external display and backlight stay gated (Lane 8). Execlists submission is admitted (Lane 3), with the
 Gen9 media-engine table. Lane 4 admitted the display model:
 SKL CDCLK via LCPLL (`intel_gpu_gen9_cdclk.rs`, VCO-aware ladders,
 Wa Display #1183), the SKL WRPLL + CFGCR1/2
@@ -2133,6 +2133,80 @@ correction:
   it needs the runtime-PM disable path to land on. The
   offset is recorded in `intel_gpu_rc6`'s header so that
   lane wires it without re-deriving it.
+
+### 12.6 Gen9 modeset (Lane 5)
+
+First light on the internal eDP panel, in Linux's SKL order
+(CDCLK → DPLL → DDI pre-enable → transcoder/pipe/M-N → DBUF +
+watermarks → plane → link training → DDI buffer → enables), on
+the legacy modeset path (post-#2377 shape — the trained link is
+returned on the legacy path). The Plan path refuses with
+`ModesetError::UnsupportedGeneration`: first light is the legacy
+path only.
+
+- DMC is REQUIRED (the §12.4 Q5 default, mirroring Gen12):
+  the probe loads `i915/skl_dmc_ver1_27.bin` (Skylake) or
+  `i915/kbl_dmc_ver1_04.bin` (Kaby Lake / Comet Lake) under the
+  0x3000 per-program ceiling (`intel_gpu_gen9_dmc.rs`, in the
+  Gen11 pattern; parse/load/verify machinery in
+  `intel_gpu_dmc.rs` reused), records the install in an
+  `AtomicBool`, and `modeset_display_family`'s Gen9 arm gates
+  on it with `ModesetError::DmcUnavailable` before any register
+  is touched. The probe itself continues either way — GT /
+  execlists still bind — and only the display modeset refuses.
+  Fallback if Daniel rules the other way on Q5: Gen11-style
+  best-effort/non-fatal (display still modesets).
+- Transcoder: the EDP transcoder binds the internal panel
+  (timing base 0x6F000, conf base 0x7F000 — not aliased to the
+  pipe block, unlike Gen12). Pipe A needs no power well
+  (always-on); PG1 is a no-op (PW_1 is DMC-handled); Pipes B/C
+  take PW_2 (idx 15); the DDI IO well is requested at
+  pre-enable (A|E 1, B 2, C 3, D 4).
+- CDCLK: the Gen9 program via LCPLL (`intel_gpu_gen9_cdclk.rs`),
+  VCO 8100, pcode pre/post voltage notifies (cmd 0x7); for the
+  1080p60 panel mode (148.5 MHz, floor 74.25 MHz) the rung is
+  337.5 MHz (freq_sel 2, decimal 673).
+- DPLL: DPLL0 for the eDP panel, DPLL1 otherwise
+  (`dpll_pool`); `DPLL_CTRL1` carries OVERRIDE + link rate,
+  `DPLL_CTRL2` routes the port, and there is no DPCLKA or TGL
+  CFGCR0 on SKL. `modeset_hdmi` refuses Gen9 outright (it
+  would otherwise run the Gen12 `program_dpll_coeffs` writes
+  on SKL); external outputs are Lane 8.
+- Training: the whole `DDI_BUF_TRANS` table is programmed at
+  pre-enable, then each training iteration applies the sink's
+  requested level via lane 0's level only (`preset_index` +
+  `skl_ddi_set_iboost` at that level + `DDI_BUF_TRANS_SELECT`
+  into `DDI_BUF_CTL` bits 27:24), and a dirty pattern-1
+  retunes the DPLL and re-prepares. The sink trains TPS1 →
+  TPS3 → off; `DP_TP_CTL` ends NORMAL (0x80040300).
+- Watermarks: the 8 SKL levels over the full 892-block DBUF
+  (TRANS 0 per WaDisableTWM), `PLANE_BUF_CFG` = the whole
+  DBUF, DBUF slice S1 power-requested.
+- Plane admission reuses the SKL rule (256 KiB surface
+  alignment, 32 KiB stride cap) — `gen11_alignment()` /
+  `gen11_max_stride()` renamed to `skl_alignment()` /
+  `skl_max_stride()` with the Gen11 call sites updated;
+  `gen12_alignment()` / `gen12_max_stride()` stay Gen12-only.
+- PSR is excluded on Gen9 (the `PsrLayout::from_generation`
+  fallback would program the TigerLake table on SKL); the
+  panel runs plain eDP. The VRR placeholder maps Skylake to
+  the Gen12 arm for exhaustiveness only — no VRR timings can
+  be computed (range is `None`) and no VRR path can fire.
+- Scaler DEFERRED (named remainder): the display-14 scaler
+  module is not wired. Verified display-9 limits from
+  `display/skl_scaler.c` (Linux 7.4-rc2): max src 4096×4096,
+  max dst 4096×4096; `calculate_max_scale` non-YUV 3.0× both
+  axes (0x30000−1), YUV semiplanar 2.0× (0x20000−1); NV12
+  scaler mode `SKL_PS_SCALER_MODE_NV12`. Panel fitting is not
+  on the first-light path (native-resolution modeset).
+- Lane 3 remainder (named): the WA-page allocation +
+  `lrc_init_wa_ctx`-equivalent bring-up — the template
+  indirect slot stays zero and the WA batch is inert until
+  then. First modeset does not need it (display-side; no GT
+  execution on the modeset path). Owned by Lane 3.
+- VBT boost levels are unplumbed caller inputs (Lane 4
+  remainder): `dp_boost` is false for first light and the
+  VBT boost level is not consumed.
 
 ## 13. Suspend/resume + D-states (Stage 5 — `intel_gpu_pm`, #1015)
 

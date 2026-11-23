@@ -71,7 +71,7 @@ pub(crate) fn gen12_max_stride(family: crate::intel_gpu_gt::Gen12Platform) -> u3
     }
 }
 
-/// Gen11 surface alignment (bytes) for a linear primary plane:
+/// SKL surface alignment (bytes) for a linear primary plane:
 /// `skl_plane_min_alignment` in Linux
 /// (`display/skl_universal_plane.c`), selected for
 /// DISPLAY_VER < 12. Linear and X-tiled surfaces pin at 256 KiB
@@ -79,15 +79,15 @@ pub(crate) fn gen12_max_stride(family: crate::intel_gpu_gt::Gen12Platform) -> u3
 /// only places linear surfaces. This is a GGTT *pinning*
 /// alignment, not a PLANE_SURF register constraint (SURF takes
 /// a 4K-aligned GGTT offset); the modeset enforces it for Gen11
-/// placements.
-pub(crate) fn gen11_alignment() -> u32 {
+/// and Gen9 placements (the same SKL rule on both).
+pub(crate) fn skl_alignment() -> u32 {
     256 * 1024
 }
 
-/// Gen11 maximum plane stride (bytes): `skl_plane_max_stride`
+/// SKL maximum plane stride (bytes): `skl_plane_max_stride`
 /// (`display/skl_universal_plane.c`), selected for
 /// DISPLAY_VER < 13 — 8192 pixels / 32 KiB.
-pub(crate) fn gen11_max_stride() -> u32 {
+pub(crate) fn skl_max_stride() -> u32 {
     32 * 1024
 }
 

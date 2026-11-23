@@ -145,6 +145,7 @@ impl Generation {
                 | Generation::AlderLake
                 | Generation::MeteorLake
                 | Generation::IceLake
+                | Generation::Skylake
         )
     }
 
@@ -898,6 +899,32 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     }
 
+    // Gen9 DMC load (Lane 5): the same `intel_dmc_init` shape
+    // for `i915/skl_dmc_ver1_27.bin` / `i915/kbl_dmc_ver1_04.bin`
+    // — but REQUIRED, not best-effort (the Q5 default,
+    // mirroring Gen12): a failed load leaves the installed flag
+    // clear and the display modeset refuses with
+    // `ModesetError::DmcUnavailable`. The probe itself continues
+    // either way (GT / execlists still bind); the load logs its
+    // own outcome.
+    if let Some(platform) = crate::intel_gpu_modeset::gen9_family_for_chip(dev.chip) {
+        let window = dev.mode_window();
+        let authority: Option<Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>> =
+            narf_firmware::trusted_loader_authority().and_then(|write| write.derive().ok());
+        match authority {
+            Some(authority) => {
+                let _ = crate::intel_gpu_gen9_dmc::load_for_display(&window, platform, &authority);
+            }
+            None => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu: no usable firmware registry authority; DMC not loaded, display modeset refused"
+                );
+            }
+        }
+    }
+
     let external_only =
         crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip).is_some_and(|family| {
             crate::intel_gpu_vbt::gen12_ddc_overrides().external_only_for(family)
@@ -1200,11 +1227,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // unverified — `PsrLayout::from_generation` falls back to
     // the TigerLake table for IceLake, and the stored layout is
     // inert until a lane grounds the real one — so the panel
-    // runs plain eDP.
+    // runs plain eDP. Gen9 PSR is excluded for the same reason
+    // (Gen9 Lane 5): `PsrLayout::from_generation` falls back
+    // to the TigerLake table for Skylake too, and programming
+    // the TGL-layout PSR registers on SKL silicon is not a
+    // modeset this lane can stand behind.
     if let Some(mode) = panel_mode.filter(|_| {
         dev.chip.generation.display_supported()
             && dev.chip.generation != Generation::MeteorLake
             && dev.chip.generation != Generation::IceLake
+            && dev.chip.generation != Generation::Skylake
     }) {
         crate::intel_gpu_edp::enable_psr_for_panel(&dev, &mode);
     }
@@ -3547,20 +3579,22 @@ pub mod tests {
         {
             return TestResult::Fail("RKL must admit Gen12 GT regions while display stays gated");
         }
-        // Gen9 (Lane 1): identity + probe only. The BAR0 region
-        // map is admitted (Gen9 shares Gen12's partitioning) and
-        // the part is explicitly pre-GMD; display, external
-        // display and backlight stay gated — Lane 5 owns the
-        // internal-panel modeset, Lane 8 the external outputs
-        // and backlight. The part still binds and announces.
-        if Generation::Skylake.display_supported()
+        // Gen9 (Lanes 1 + 5): identity + probe + internal-panel
+        // modeset. The BAR0 region map is admitted (Gen9 shares
+        // Gen12's partitioning) and the part is explicitly
+        // pre-GMD; display is admitted (fixture-validated,
+        // silicon untested) while external display and
+        // backlight stay gated — Lane 8 owns the external
+        // outputs and backlight. The part still binds and
+        // announces.
+        if !Generation::Skylake.display_supported()
             || Generation::Skylake.external_display_supported()
             || Generation::Skylake.backlight_supported()
             || Generation::Skylake.region_generation() != Some(RegionGeneration::Gen9)
             || Generation::Skylake.has_gmd_id()
         {
             return TestResult::Fail(
-                "Gen9 must admit regions while display + external + backlight stay gated",
+                "Gen9 must admit regions + display while external + backlight stay gated",
             );
         }
         // Gen11 (Lanes 5 + 8): identity + probe + internal-panel

@@ -59,8 +59,8 @@
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_dc_states::{
-    sanitize_target, write_dc_state_sticky, DcError, DC_STATE_DISABLE, DC_STATE_EN_DC9,
-    DC_STATE_EN_UPTO_DC5, DC_STATE_EN_UPTO_DC5_DC6_MASK, DC_STATE_EN_UPTO_DC6,
+    sanitize_target, write_dc_state_sticky, DcError, DC_STATE_DISABLE, DC_STATE_EN_UPTO_DC5,
+    DC_STATE_EN_UPTO_DC5_DC6_MASK, DC_STATE_EN_UPTO_DC6,
 };
 use crate::intel_gpu_dmc::DC_STATE_EN;
 
@@ -193,7 +193,7 @@ pub mod tests {
     //! implementation under test.
 
     use super::*;
-    use crate::intel_gpu_dc_states::DC_STATE_EN_DC3CO;
+    use crate::intel_gpu_dc_states::{DC_STATE_EN_DC3CO, DC_STATE_EN_DC9};
     use alloc::vec::Vec;
     use core::cell::RefCell;
     use narf_kernel_test::{kernel_test_in, TestResult};

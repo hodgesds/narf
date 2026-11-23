@@ -143,6 +143,9 @@ fn parse_for(platform: DmcPlatform, blob: &[u8]) -> Result<DmcFirmware<'_>, DmcE
         // platform is always display >= 14); the arm is here for
         // exhaustiveness, and parses with the Gen11 rules.
         DmcPlatform::Gen11 => crate::intel_gpu_dmc::parse_dmc_firmware_gen11(blob, b'*', b'*'),
+        // See Gen11: the service never runs on display 9
+        // either; parses with the Gen9 rules.
+        DmcPlatform::Gen9 => crate::intel_gpu_dmc::parse_dmc_firmware_gen9(blob, b'*', b'*'),
     }
 }
 
@@ -156,6 +159,9 @@ fn firmware_path(platform: DmcPlatform) -> &'static str {
         DmcPlatform::Gen12 | DmcPlatform::Xelpdp => MTL_DMC_FIRMWARE,
         // See parse_for: the service never runs on display 11.
         DmcPlatform::Gen11 => crate::intel_gpu_dmc::ICL_DMC_FIRMWARE,
+        // See parse_for: the service never runs on display 9
+        // either; the Skylake blob is the Gen9 answer.
+        DmcPlatform::Gen9 => crate::intel_gpu_dmc::SKL_DMC_FIRMWARE,
     }
 }
 
