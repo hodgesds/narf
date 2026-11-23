@@ -11871,6 +11871,16 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
 pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) -> usize {
     // Keep the single-wake path allocation-free. A bucket scan follows direct
     // slot links; once selected, removal is O(1), independent of task IDs.
+    //
+    // Benchmark variant B2 (urgent handoff OFF for the single wake): the
+    // single waiter is woken with the spread wake (`wake(false)` — plain
+    // `Waker::wake()` plus the generic `note_wake_preempt` hint) instead
+    // of the urgent direct handoff (`wake(true)` →
+    // `wake_preempt_task`, which names the wakee the caller's-CPU
+    // next-buddy and kicks it). The multi-wake path below already spreads
+    // for the same reason. Compare against the baseline (urgent single
+    // wake) and variant B1 (bare `waker.wake()`, no preempt note) with
+    // `perf bench futex` on hardware.
     if n == 1 {
         let waiter = {
             let mut queue = futex_wait_bucket(key).values.lock();
@@ -11878,7 +11888,7 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
             handle.and_then(|h| futex_remove_woken(&mut queue, h))
         };
         if let Some(waiter) = waiter {
-            waiter.wake(true);
+            waiter.wake(false);
             return 1;
         }
         return 0;
