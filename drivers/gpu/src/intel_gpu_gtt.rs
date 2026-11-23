@@ -144,7 +144,7 @@ pub const PTE_PAT2: u64 = 1 << 7;
 pub const PTE_PAT3: u64 = 1 << 62;
 /// Xe2 PPGTT PAT index bit 4 (MIT xe_gtt_defs.h: XELPG_PPGTT_PTE_PAT4).
 pub const PTE_PAT4: u64 = 1 << 61;
-/// Legacy Gen8 (Gen11) PPGTT PPAT encodings (Linux `gt/intel_gtt.h:135-138`):
+/// Legacy Gen8 (Gen9/Gen11) PPGTT PPAT encodings (Linux `gt/intel_gtt.h:135-138`):
 /// `PPAT_UNCACHED = _PAGE_PWT | _PAGE_PCD`, `PPAT_DISPLAY_ELLC = _PAGE_PCD`,
 /// `PPAT_CACHED = _PAGE_PAT`. On 4 KiB pages the x86 cache bits are
 /// PWT = bit 3, PCD = bit 4, PAT = bit 7 — the same bit positions as
@@ -164,7 +164,7 @@ pub const PTE_PHYS_MASK: u64 = 0x0000_3FFF_FFFF_F000;
 /// cache encoding; neither has the x86 NX bit previously emitted here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PteFormat {
-    /// Gen11 legacy PPAT encode (`gt/gen8_ppgtt.c::gen8_pte_encode`):
+    /// Gen9/Gen11 legacy PPAT encode (`gt/gen8_ppgtt.c::gen8_pte_encode`):
     /// the PPGTT leaf `pat_index` is an `i915_cache_level`, not a PAT
     /// index, and the GGTT has no PAT bits
     /// (`gt/intel_ggtt.c::gen8_ggtt_pte_encode`).
@@ -826,9 +826,13 @@ pub mod tests {
         // L3_LLC = 2, WT = 3): NONE -> PWT|PCD (bits 3,4), WT -> PCD (bit 4),
         // anything else cached -> PAT (bit 7). The GGTT has no PAT bits:
         // `gt/intel_ggtt.c::gen8_ggtt_pte_encode` returns addr | PRESENT for
-        // every pre-MTL generation, Gen11 included (the two PAT bits at
+        // every pre-MTL generation, Gen9 and Gen11 included (the two PAT bits at
         // 53:52 belong to `mtl_ggtt_pte_encode`, selected only at
-        // `GRAPHICS_VER_FULL >= IP_VER(12, 70)`).
+        // `GRAPHICS_VER_FULL >= IP_VER(12, 70)`). These vectors pin the
+        // Gen9 encode as well as Gen11's: Linux selects `gen8_pte_encode`
+        // for every `GRAPHICS_VER < 12` (`gt/gen8_ppgtt.c`), so the
+        // Gen9 exec leaf (pat 1 -> cached, 0x...83) and table policy
+        // (0 -> cached PDE) are the rows below.
         let phys = 0x0000_0123_4567_8000;
         let cases = [
             (
@@ -856,7 +860,7 @@ pub mod tests {
         ];
         for (actual, expected) in cases {
             if actual != Ok(expected) {
-                return TestResult::Fail("Gen11 legacy PPAT reference vector");
+                return TestResult::Fail("Gen9/Gen11 legacy PPAT reference vector");
             }
         }
         if PteFormat::Gen8.encode_ppgtt(phys, 4, true) != Err(GttError::InvalidPatIndex)

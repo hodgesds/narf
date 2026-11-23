@@ -747,9 +747,12 @@ mod tests {
         {
             return TestResult::Fail("BMG source five-level Xe2 PPGTT profile");
         }
-        // Gen11 (all three sub-platforms) takes the legacy Gen8 PPAT
+        // Gen9 and Gen11 (all sub-platforms) take the legacy Gen8 PPAT
         // format on a four-level walk; Gen12 keeps its own format.
         for platform in [
+            GtPlatform::Gen9(Gen9Platform::Skylake),
+            GtPlatform::Gen9(Gen9Platform::KabyLake),
+            GtPlatform::Gen9(Gen9Platform::CometLake),
             GtPlatform::Gen11(Gen11Platform::IceLake),
             GtPlatform::Gen11(Gen11Platform::ElkhartLake),
             GtPlatform::Gen11(Gen11Platform::JasperLake),
@@ -757,7 +760,7 @@ mod tests {
             if platform.ppgtt_root_level() != 3
                 || platform.pte_format() != crate::intel_gpu_gtt::PteFormat::Gen8
             {
-                return TestResult::Fail("Gen11 must select the Gen8 PTE format");
+                return TestResult::Fail("Gen9/Gen11 must select the Gen8 PTE format");
             }
         }
         if GtPlatform::Gen12(Gen12Platform::TigerLake).pte_format()
@@ -794,6 +797,9 @@ mod tests {
             (GtPlatform::Gen11(Gen11Platform::IceLake), 39),
             (GtPlatform::Gen11(Gen11Platform::ElkhartLake), 39),
             (GtPlatform::Gen11(Gen11Platform::JasperLake), 39),
+            (GtPlatform::Gen9(Gen9Platform::Skylake), 39),
+            (GtPlatform::Gen9(Gen9Platform::KabyLake), 39),
+            (GtPlatform::Gen9(Gen9Platform::CometLake), 39),
             (GtPlatform::Integrated(Generation::MeteorLake), 46),
             (GtPlatform::ArcticSoundM, 46),
             (GtPlatform::Alchemist, 46),
