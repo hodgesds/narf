@@ -295,6 +295,11 @@ rules apply.
 
 | ASIC (`ChipInfo::asic`) | Device IDs |
 | ----------------------- | ---------- |
+| skylake (Gen9) | 1902, 1906, 190A, 190B, 190E, 1912, 1913, 1915, 1916, 1917, 191A, 191B, 191D, 191E, 1921, 1923, 1926, 1927, 192A, 192B, 192D, 1932, 193A, 193B, 193D |
+| kabylake (Gen9) | 5902, 5906, 5908, 590A, 590B, 590E, 5912, 5913, 5915, 5916, 5917, 591A, 591B, 591C, 591D, 591E, 5921, 5923, 5926, 5927, 593B, 87C0 |
+| coffeelake (Gen9) | 3E90, 3E91, 3E92, 3E93, 3E94, 3E96, 3E98, 3E99, 3E9A, 3E9B, 3E9C, 3EA5, 3EA6, 3EA7, 3EA8, 3EA9, 87CA |
+| whiskeylake (Gen9) | 3EA0, 3EA1, 3EA2, 3EA3, 3EA4 |
+| cometlake (Gen9) | 9B21, 9B41, 9BA2, 9BA4, 9BA5, 9BA8, 9BAA, 9BAC, 9BC2, 9BC4, 9BC5, 9BC6, 9BC8, 9BCA, 9BCC, 9BE6, 9BF6 |
 | icelake (Gen11) | 8A50, 8A51, 8A52, 8A53, 8A54, 8A56, 8A57, 8A58, 8A59, 8A5A, 8A5B, 8A5C, 8A5D, 8A70, 8A71 |
 | elkhartlake (Gen11) | 4541, 4551, 4555, 4557, 4570, 4571 |
 | jasperlake (Gen11) | 4E51, 4E55, 4E57, 4E61, 4E71 |
@@ -401,7 +406,44 @@ to HuC. The WOPCM plan for Gen11 is the 2 MiB total
 hardware-context reservation at the top. GuC submission stays
 optional on Gen11 by design (execlists is the submission path);
 the GuC is loaded where a GuC owner exists, which is what HuC
-authentication requires. Gen9 stays excluded (§6).
+authentication requires.
+
+Gen9 (Skylake / Kaby Lake / Coffee Lake / Whiskey Lake / Comet Lake)
+is admitted for identity + probe (Gen9 Lane 1) only. Linux
+`include/drm/intel/pciids.h` supplies the exact 86-ID census
+(`INTEL_SKL_IDS` 25, `INTEL_KBL_IDS` 22, `INTEL_CFL_IDS` 17,
+`INTEL_WHL_IDS` 5, `INTEL_CML_IDS` 17); every row was re-verified
+against `pciids.h` (Linux 7.4-rc2) at authoring time — the audit's
+carried census, now re-derived. One `Generation::Skylake` carries
+all five products (the `Generation::IceLake`-carries-all-Gen11
+pattern) with `asic` per product, while `GtPlatform::Gen9` keeps
+a sub-platform per GuC firmware family — `Skylake`, `KabyLake`,
+`CometLake` — because the firmware family differs: Skylake takes
+`i915/skl_guc_70.1.1.bin`, Kaby Lake / Coffee Lake / Whiskey Lake
+take `i915/kbl_guc_70.1.1.bin`, Comet Lake takes the KBL blob at
+rev < 5 and `i915/cml_guc_70.1.1.bin` at rev >= 5
+(`gt/uc/intel_uc_fw.c` `INTEL_GUC_FIRMWARE_DEFS`), all at minimum
+70.1.1. The GuC profiles are admitted in Lane 1 because the
+device-table census fixture requires a qualified GT/GuC profile
+for every census DID; GuC submission stays optional on Gen9
+(execlists is the submission path) and the load itself is Lane 7's,
+as is the CML rev>=5 split — the driver does not model PCI
+revisions yet, so all Comet Lake takes the KBL blob until a
+revision input lands. Gen9 shares the Gen12 BAR0/GTT partitioning
+(Gen8+ 16 MiB split), so its region table carries the verified
+Gen12 contents; it has a 39-bit DMA mask (`i915_pci.c`
+GEN9_FEATURES `.dma_mask_size = 39`) and the Gen9 GT forcewake
+ACK at 0x130044, and no HWCONFIG table (i915 requires graphics
+12.55+). Gen9 predates GMD_ID, so Stage 1 presence re-reads PCI
+config space (all-ones refuses) instead of reading 0xD8C/0xFF8,
+and `gmd_id` is `None` on Gen9. The WOPCM plan for Gen9 is the
+1 MiB total (`gt/intel_wopcm.c` `GEN9_WOPCM_SIZE`). The part binds
+and announces; display, external display and backlight stay gated
+(Lanes 5 and 8), submission stays gated (Lane 3), no media-engine
+table is admitted until Lane 3, and the SPT GMBUS pin table is
+untranscribed until Lane 4 (SPT uses the old `GMBUS_PIN_DPC` = 4 /
+`DPB` = 5 / `DPD` = 6 numbering). Gen9 has no VRR (Linux `HAS_VRR`
+needs DISPLAY_VER >= 11). The §6 lift for Gen9 display is Lane 0's.
 
 Remainder (EHL/JSL 36-bit PPGTT): Linux `i915_pci.c` sets
 `.__runtime.ppgtt_size = 36` for Elkhart Lake and Jasper Lake only;

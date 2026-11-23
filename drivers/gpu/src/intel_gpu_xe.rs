@@ -378,6 +378,10 @@ impl XeFile {
                     crate::intel_gpu_gt::GtPlatform::Integrated(_)
                     | crate::intel_gpu_gt::GtPlatform::Gen12(_)
                     | crate::intel_gpu_gt::GtPlatform::Gen11(_) => 2,
+                    // Gen9 admits no SCANOUT flag: its display is
+                    // gated in Lane 1 (no KMS owner until Lane 5),
+                    // so no WC system object may satisfy it.
+                    crate::intel_gpu_gt::GtPlatform::Gen9(_) => 0,
                     crate::intel_gpu_gt::GtPlatform::ArcticSoundM
                     | crate::intel_gpu_gt::GtPlatform::Alchemist => {
                         if info.vram.is_some() {

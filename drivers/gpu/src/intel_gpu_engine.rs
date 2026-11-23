@@ -146,6 +146,8 @@ pub(crate) fn compute_instances(platform: GtPlatform, dss: u128, fuse4: u32) -> 
         GtPlatform::Gen12(_) => 0,
         // Gen11 has no compute engines (no CCS before Xe-HPG).
         GtPlatform::Gen11(_) => 0,
+        // Gen9 has no compute engines either (no CCS before Xe-HPG).
+        GtPlatform::Gen9(_) => 0,
         GtPlatform::Integrated(_) => 1,
         GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
             // get_num_dss_regs: one geometry and one compute register, so
@@ -455,6 +457,10 @@ pub(crate) fn uncached_mocs(platform: GtPlatform) -> u32 {
         // Gen11: i915's `get_mocs_settings` leaves `uc_index` at its
         // zeroed default for the ICL table (TGL is 3, MTL 9, DG2 1).
         GtPlatform::Gen11(_) => 0,
+        // Gen9: the same — `get_mocs_settings` takes the SKL table
+        // (`IS_GEN9_BC`) without setting `uc_index`, so it stays
+        // at the zeroed default, exactly as for Gen11.
+        GtPlatform::Gen9(_) => 0,
         GtPlatform::Integrated(_) => 9,
         GtPlatform::ArcticSoundM | GtPlatform::Alchemist => 1,
         GtPlatform::Battlemage => 3,

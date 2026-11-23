@@ -134,7 +134,18 @@ impl DisplayVrrIp {
             // ICL shares the TGL VRR behaviour: `compute_config_late`
             // documents the pipeline_full conversion as the ICL/TGL
             // one. Display itself stays gated until Lane 4.
-            Generation::IceLake | Generation::TigerLake | Generation::RocketLake => Self::Gen12,
+            // Gen9 has no VRR at all (Linux `HAS_VRR` needs
+            // DISPLAY_VER >= 11); this arm only satisfies
+            // exhaustiveness — no VRR timing is ever computed for
+            // a Gen9 part, because every caller is modeset-gated
+            // (the modeset returns `UnsupportedGeneration` for
+            // Gen9 until Lane 5) and `sink_vrr_range` takes its
+            // own `has_vrr` input. Lane 5 must not read this as
+            // a VRR claim.
+            Generation::IceLake
+            | Generation::TigerLake
+            | Generation::RocketLake
+            | Generation::Skylake => Self::Gen12,
             Generation::AlderLake => Self::Display13,
             Generation::MeteorLake => Self::Display14,
             Generation::LunarLake => Self::Display20,

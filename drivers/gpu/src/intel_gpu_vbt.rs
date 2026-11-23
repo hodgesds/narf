@@ -1827,6 +1827,16 @@ pub fn install_for_probe(
         // low-vswing bit install for the internal panel; the
         // Gen12 DDC overrides below are skipped for IceLake.
         Generation::IceLake => true,
+        // Gen9 (Lane 1): the VRR flag and the eDP low-vswing
+        // bit install for the internal panel, as for IceLake;
+        // the Gen12 DDC overrides below are skipped for
+        // Skylake. The VRR flag install is harmless on Gen9 —
+        // the hardware has no VRR (Linux `HAS_VRR` needs
+        // DISPLAY_VER >= 11) and `sink_vrr_range` additionally
+        // requires its own `has_vrr` input, so no VRR timing
+        // is ever computed from the installed flag before
+        // Lane 5 models the Gen9 modeset.
+        Generation::Skylake => true,
         _ => false,
     };
     if !applicable {

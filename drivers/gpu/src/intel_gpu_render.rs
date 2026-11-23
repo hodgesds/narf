@@ -140,6 +140,11 @@ impl SubmissionProfile {
             // execlists lane models it (GuC submission is optional
             // on Gen11 — execlists works without it).
             Generation::IceLake => Self::Unsupported,
+            // Gen9 submission is not admitted in Lane 1 either:
+            // the execlists lane (Gen9 Lane 3) models it the same
+            // way (GuC submission is optional on Gen9 — execlists
+            // works without it).
+            Generation::Skylake => Self::Unsupported,
             Generation::LunarLake | Generation::PantherLake => Self::Unsupported,
         }
     }
@@ -3662,9 +3667,10 @@ pub(crate) mod tests {
                         SubmissionProfile::Gen12GuC
                     }
                     Generation::MeteorLake => SubmissionProfile::XeLpgGuC,
-                    Generation::IceLake | Generation::LunarLake | Generation::PantherLake => {
-                        SubmissionProfile::Unsupported
-                    }
+                    Generation::IceLake
+                    | Generation::Skylake
+                    | Generation::LunarLake
+                    | Generation::PantherLake => SubmissionProfile::Unsupported,
                 };
                 if SubmissionProfile::for_generation(entry.generation) != expected {
                     return Err("submission generation dispatch");

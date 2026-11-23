@@ -285,6 +285,69 @@ pub static GEN11_REGIONS: &[Region] = &[
     },
 ];
 
+/// Gen9 region map — Skylake / Kaby Lake / Coffee Lake /
+/// Whiskey Lake / Comet Lake.
+///
+/// Contents are the verified Gen12 table carried over, not
+/// re-derived: Gen9 is Gen8+, so the same 16 MiB BAR0 / GTT-at-8
+/// MiB layout applies (Linux `gt/intel_ggtt.c:1183-1184`), and
+/// Linux `intel_uncore.c::__gen11_fw_ranges` gives Gen11 and
+/// Gen12 the same partitioning the Gen11 table already carries
+/// over. A distinct table — rather than aliasing `GEN11_REGIONS`
+/// or `GEN12_REGIONS` — keeps a home for any Gen9 delta a later
+/// lane grounds, and keeps Gen9 distinct in consumers that must
+/// not inherit Gen11/Gen12 claims (notably the media-engine set,
+/// which differs: Gen9 GT3+ is VCS0/VCS1/VECS0, not Gen11's
+/// VCS0/VCS2/VECS0 set).
+pub static GEN9_REGIONS: &[Region] = &[
+    Region {
+        kind: RegionKind::Gunit,
+        offset: 0x0000_0000,
+        size: 0x0001_0000,
+    },
+    Region {
+        kind: RegionKind::Fuse,
+        offset: 0x0000_9000,
+        size: 0x0000_1000,
+    },
+    Region {
+        kind: RegionKind::Punit,
+        offset: 0x0013_8000,
+        size: 0x0000_8000,
+    },
+    Region {
+        kind: RegionKind::Gt,
+        offset: 0x0000_2000,
+        size: 0x0000_4000,
+    },
+    Region {
+        kind: RegionKind::Display,
+        offset: 0x0006_0000,
+        size: 0x0001_0000,
+    },
+    // GMBUS sits inside the display block on i915's map, but the
+    // Stage-2 codec carries it as its own register file (matching
+    // the i915 `gmbus.c` block) so the enumeration mirrors that.
+    Region {
+        kind: RegionKind::Gmbus,
+        offset: 0x000C_5100,
+        size: 0x0000_0040,
+    },
+    Region {
+        kind: RegionKind::Dpll,
+        offset: 0x0016_4280,
+        size: 0x0000_0040,
+    },
+    // GTT entry array — second half of BAR0. 8 MiB on Gen9 maps
+    // 1M PTEs × 8 bytes; the codec layer in `intel_gpu_gtt` writes
+    // into this region via `intel_gpu.bar0_offset(GTTADR_BASE)`.
+    Region {
+        kind: RegionKind::GttAdr,
+        offset: 0x0080_0000,
+        size: 0x0080_0000,
+    },
+];
+
 /// Xe-LPG region map — Meteor Lake (#1016).
 ///
 /// Deltas vs Gen12, each grounded in the MTL display register
@@ -497,8 +560,12 @@ pub static XE3_LPD_REGIONS: &[Region] = &[
 
 /// Sub-architectures the Stage-0 enumeration covers. Tiger Lake /
 /// Alder Lake / Raptor Lake all share the Xe-LP register surface
-/// and are folded onto `GEN12_REGIONS`. Ice Lake / Elkhart Lake /
-/// Jasper Lake (Gen11) share Gen11/Gen12's partitioning
+/// and are folded onto `GEN12_REGIONS`. Gen9 (SKL / KBL / CFL /
+/// WHL / CML) shares Gen11/Gen12's partitioning (Gen8+ 16 MiB
+/// BAR0 / GTT-at-8 MiB) and maps to `GEN9_REGIONS`, whose
+/// contents are the verified Gen12 table carried over — kept
+/// distinct so Gen9 never inherits a Gen11/Gen12-only claim.
+/// Ice Lake / Elkhart Lake / Jasper Lake (Gen11) share Gen11/Gen12's partitioning
 /// (`__gen11_fw_ranges`) and map to `GEN11_REGIONS`, whose
 /// contents are the verified Gen12 table carried over — kept
 /// distinct so Gen11 never inherits a Gen12-only claim.
@@ -512,6 +579,8 @@ pub static XE3_LPD_REGIONS: &[Region] = &[
 /// IPs are never conflated.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegionGeneration {
+    /// Gen9 — SKL / KBL / CFL / WHL / CML. Same BAR0 partitioning as Gen12.
+    Gen9,
     /// Gen11 — ICL / EHL / JSL. Same BAR0 partitioning as Gen12.
     Gen11,
     /// Gen12 Xe-LP — TGL / ADL / RPL.
@@ -527,6 +596,7 @@ pub enum RegionGeneration {
 /// Resolve the region table for a generation.
 pub const fn regions_for(gen: RegionGeneration) -> &'static [Region] {
     match gen {
+        RegionGeneration::Gen9 => GEN9_REGIONS,
         RegionGeneration::Gen11 => GEN11_REGIONS,
         RegionGeneration::Gen12 => GEN12_REGIONS,
         RegionGeneration::XeLpg => XE_LPG_REGIONS,

@@ -286,6 +286,17 @@ pub enum GmbusPinTable {
     Dg2,
     /// `gmbus_pins_mtp` (PCH_MTL, PCH_LNL).
     Mtp,
+    /// `gmbus_pins_spt` (PCH_SPT — Skylake / Kaby Lake). The table
+    /// itself is not transcribed yet: SPT uses the old
+    /// `GMBUS_PIN_DPC` = 4 / `DPB` = 5 / `DPD` = 6 numbering
+    /// (`intel_gmbus.h`), which this module's `PinPair` (the
+    /// BXT/CNP-and-later numbering) cannot express, so no pin is
+    /// admitted on this table until Lane 4 transcribes it.
+    /// Coffee Lake / Whiskey Lake / Comet Lake ride PCH_CNP
+    /// (`gmbus_pins_cnp`, expressible in the new numbering) — the
+    /// per-PCH split is Lane 4's too, since the driver does not
+    /// model PCH yet.
+    Spt,
 }
 
 impl GmbusPinTable {
@@ -305,6 +316,12 @@ impl GmbusPinTable {
             | Generation::TigerLake
             | Generation::RocketLake
             | Generation::AlderLake => GmbusPinTable::Icp,
+            // Gen9 uses the SPT PCH pin table (SKL/KBL; CFL/WHL/
+            // CML ride CNP — see the `Spt` variant note). Gen9
+            // GMBUS programming itself is a later lane's work;
+            // this arm only keeps the table selection honest now
+            // that the generation exists.
+            Generation::Skylake => GmbusPinTable::Spt,
             Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
                 GmbusPinTable::Mtp
             }
@@ -2314,10 +2331,22 @@ pub mod tests {
         if GmbusPinTable::for_generation(Generation::TigerLake) != GmbusPinTable::Icp
             || GmbusPinTable::for_generation(Generation::AlderLake) != GmbusPinTable::Icp
             || GmbusPinTable::for_generation(Generation::IceLake) != GmbusPinTable::Icp
+            || GmbusPinTable::for_generation(Generation::Skylake) != GmbusPinTable::Spt
             || GmbusPinTable::for_generation(Generation::MeteorLake) != GmbusPinTable::Mtp
             || GmbusPinTable::for_generation(Generation::LunarLake) != GmbusPinTable::Mtp
         {
             return TestResult::Fail("table selection must follow get_gmbus_pin");
+        }
+        // The SPT table is not transcribed yet (old pin numbering),
+        // so no pin is valid on it — fail-closed until Lane 4.
+        for v in all {
+            let pin = match PinPair::try_from(v) {
+                Ok(pin) if pin.encode() == v => pin,
+                _ => return TestResult::Fail("GMBUS_PIN_* values must round-trip"),
+            };
+            if GmbusPinTable::Spt.is_valid(pin) {
+                return TestResult::Fail("untranscribed SPT table must admit no pin");
+            }
         }
         if PinPair::type_c(0) != Some(PinPair::Pin9Tc1)
             || PinPair::type_c(5) != Some(PinPair::Pin14Tc6)

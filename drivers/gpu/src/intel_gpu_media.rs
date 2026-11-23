@@ -210,6 +210,13 @@ pub fn media_engines_for(gen: RegionGeneration) -> &'static [EngineSpec] {
         // MTL's media engines sit on a separate media GT, not modelled.
         RegionGeneration::XeLpg => &[],
         RegionGeneration::Gen11 => &GEN11_MEDIA_ENGINES,
+        // Gen9 (Lane 1): no media-engine table is admitted yet.
+        // The Gen9 set (VCS0/VCS1/VECS0 on GT3+, Linux
+        // `i915_pci.c::SKL_GT3_PLUS_PLATFORM`) lands with Lane 3
+        // (`GEN9_MEDIA_ENGINES`); claiming the Gen11 or Gen12
+        // table meanwhile would announce an engine the part
+        // does not have.
+        RegionGeneration::Gen9 => &[],
         // Lunar Lake (Xe2-LPD) and Panther Lake (Xe3-LPD): their
         // region tables are modelled, but their media engines
         // sit on the same separate media GT as MTL's.

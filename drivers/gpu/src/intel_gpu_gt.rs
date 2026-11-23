@@ -95,6 +95,18 @@ impl GraphicsIp {
                 step: 0,
             });
         }
+        if platform.is_gen9() {
+            // Pre-GMD, like Gen11: SKL/KBL/CFL/WHL/CML are
+            // graphics 9 (`i915_pci.c` GEN9_FEATURES carries
+            // GEN(9)), so there is no GMD_ID to sample and the
+            // version is the generation itself (9.00) with no
+            // step. Without this arm the fall-through below would
+            // sample 0xD8C on a part that has no such register.
+            return Ok(Self {
+                version: 900,
+                step: 0,
+            });
+        }
         let a = mmio.read32(0xd8c);
         let b = mmio.read32(0xd8c);
         if a == u32::MAX || b == u32::MAX {
@@ -135,6 +147,14 @@ pub enum GtPlatform {
     /// firmware family differs by product (see `Gen11Platform`),
     /// and only the sub-platform selects the right blob.
     Gen11(Gen11Platform),
+    /// Gen9 — Skylake / Kaby Lake / Coffee Lake / Whiskey Lake /
+    /// Comet Lake, pre-GMD. Distinct from
+    /// `Integrated(Generation::Skylake)` for the same reason as
+    /// Gen11: the GuC firmware family differs by product (see
+    /// `Gen9Platform`), and only the sub-platform selects the
+    /// right blob. Lane 1 admits identity + probe only;
+    /// display and GT execution stay gated for later lanes.
+    Gen9(Gen9Platform),
     /// Wildcat Lake: PTL device descriptor/firmware, distinct 30.02 media
     /// and 30.03-30.05 graphics GMD contract.
     WildcatLake,
@@ -173,6 +193,25 @@ pub enum Gen11Platform {
     IceLake,
     ElkhartLake,
     JasperLake,
+}
+
+/// Gen9 sub-platforms. The GT/register surface is shared across
+/// Skylake, Kaby Lake, Coffee Lake, Whiskey Lake and Comet Lake
+/// (one `Generation::Skylake`), but the GuC firmware family is
+/// not: Skylake takes the `skl_guc` blob, Kaby Lake / Coffee Lake /
+/// Whiskey Lake take the `kbl_guc` blob, Comet Lake takes the
+/// `kbl_guc` blob at rev < 5 and the `cml_guc` blob at rev >= 5
+/// (`gt/uc/intel_uc_fw.c`, Linux 7.4-rc2
+/// `INTEL_GUC_FIRMWARE_DEFS`). The sub-platform is what selects
+/// the file, so it lives here — the same reason `Gen11Platform`
+/// exists for the Gen11 family. The driver does not model PCI
+/// revisions yet, so all Comet Lake takes the KBL blob until a
+/// revision input lands (Lane 7 remainder).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Gen9Platform {
+    Skylake,
+    KabyLake,
+    CometLake,
 }
 
 pub(crate) use crate::intel_gpu::{BMG_IDS, DG1_IDS, DG2_IDS};
@@ -267,7 +306,19 @@ impl GtPlatform {
                 "jasperlake" => Some(Gen11Platform::JasperLake),
                 _ => None,
             };
-            return Some(gen11.map_or(Self::Integrated(entry.generation), Self::Gen11));
+            if let Some(gen11) = gen11 {
+                return Some(Self::Gen11(gen11));
+            }
+            // Gen9 (Lane 1): Coffee Lake and Whiskey Lake ride
+            // the Kaby Lake firmware family (`kbl_guc_70.1.1`,
+            // `gt/uc/intel_uc_fw.c`).
+            let gen9 = match entry.asic {
+                "skylake" => Some(Gen9Platform::Skylake),
+                "kabylake" | "coffeelake" | "whiskeylake" => Some(Gen9Platform::KabyLake),
+                "cometlake" => Some(Gen9Platform::CometLake),
+                _ => None,
+            };
+            return Some(gen9.map_or(Self::Integrated(entry.generation), Self::Gen9));
         }
         if DG1_IDS.contains(&device) {
             Some(Self::Gen12(Gen12Platform::Dg1))
@@ -329,6 +380,12 @@ impl GtPlatform {
         matches!(self, Self::Gen11(_))
     }
 
+    /// Pre-GMD Gen9 (Skylake / Kaby Lake / Coffee Lake /
+    /// Whiskey Lake / Comet Lake).
+    pub const fn is_gen9(self) -> bool {
+        matches!(self, Self::Gen9(_))
+    }
+
     /// Shared Xe-HPG 12.55 mechanics. ATS-M remains a distinct policy
     /// identity even though Linux assigns it the DG2 platform architecture.
     pub const fn is_dg2(self) -> bool {
@@ -370,9 +427,15 @@ impl GtPlatform {
         self.is_dg2() || matches!(self, Self::Battlemage) || self.is_headless_integrated()
     }
     /// DG1 introduced the tile-master interrupt register even though its
-    /// graphics IP remains in the pre-GMD Gen12 family.
+    /// graphics IP remains in the pre-GMD Gen12 family. Gen9 has no
+    /// tile-master block: its IRQ routing is the pre-tile master-IRQ
+    /// model (Lane 8 grounds it against `intel_display_irq.c` /
+    /// `gt/intel_gt_irq.c`), so it takes the MASTER-only path
+    /// (`tiled = false`), which degrades to timer completion when
+    /// the install refuses.
     pub(crate) const fn has_tile_irq(self) -> bool {
-        !self.is_gen12() || matches!(self, Self::Gen12(Gen12Platform::Dg1))
+        (!self.is_gen12() && !matches!(self, Self::Gen9(_)))
+            || matches!(self, Self::Gen12(Gen12Platform::Dg1))
     }
     pub(crate) const fn ppgtt_root_level(self) -> u8 {
         if self.is_headless_integrated() || matches!(self, Self::Battlemage) {
@@ -386,7 +449,7 @@ impl GtPlatform {
             crate::intel_gpu_gtt::PteFormat::Xe2
         } else if self.is_gen12() || self.is_dg2() {
             crate::intel_gpu_gtt::PteFormat::Gen12
-        } else if matches!(self, Self::Gen11(_)) {
+        } else if matches!(self, Self::Gen11(_) | Self::Gen9(_)) {
             crate::intel_gpu_gtt::PteFormat::Gen8
         } else {
             crate::intel_gpu_gtt::PteFormat::XeLpg
@@ -399,6 +462,10 @@ impl GtPlatform {
             // Gen11: 39-bit DMA mask (`i915_pci.c` GEN11_FEATURES
             // inherits GEN9/GEN8's `.dma_mask_size = 39`).
             Self::Gen11(_) => 39,
+            // Gen9: 39-bit DMA mask (`i915_pci.c` GEN9_FEATURES
+            // `.dma_mask_size = 39` — the value Gen11 inherits
+            // above).
+            Self::Gen9(_) => 39,
             // Current Linux xe descriptors give every admitted post-Gen12
             // platform a 46-bit DMA mask. PTE address capacity is a separate
             // contract and must not widen DMA admission (notably DG2/BMG).
@@ -414,7 +481,8 @@ impl GtPlatform {
                 Generation::TigerLake
                 | Generation::RocketLake
                 | Generation::AlderLake
-                | Generation::IceLake,
+                | Generation::IceLake
+                | Generation::Skylake,
             ) => 39,
         }
     }
@@ -422,9 +490,10 @@ impl GtPlatform {
     /// xe_guc_hwconfig.c: only ADL-P among pre-XeHP families supplies a
     /// HWCONFIG table. Absence is a platform property, never a guessed table.
     /// Gen11 has none either: i915's `intel_guc_hwconfig.c::has_table`
-    /// requires graphics 12.55+, and Gen11 is graphics 11.
+    /// requires graphics 12.55+, and Gen11 is graphics 11. Gen9 has
+    /// none for the same reason (graphics 9).
     pub const fn has_hwconfig(self) -> bool {
-        if matches!(self, Self::Gen11(_)) {
+        if matches!(self, Self::Gen11(_) | Self::Gen9(_)) {
             return false;
         }
         !matches!(self, Self::Gen12(family) if !matches!(family, Gen12Platform::AlderLakeP))
@@ -442,9 +511,11 @@ impl GtPlatform {
             | Self::WildcatLake
             | Self::NovaLakeS
             | Self::Battlemage => Some(0xdfc),
-            Self::ArcticSoundM | Self::Alchemist | Self::Gen12(_) | Self::Gen11(_) => {
-                Some(0x130044)
-            }
+            Self::ArcticSoundM
+            | Self::Alchemist
+            | Self::Gen12(_)
+            | Self::Gen11(_)
+            | Self::Gen9(_) => Some(0x130044),
             _ => None,
         }
     }
@@ -467,6 +538,24 @@ impl GtPlatform {
             Self::Gen11(Gen11Platform::IceLake) => ("i915/icl_guc_70.1.1.bin", (70, 1, 1)),
             Self::Gen11(Gen11Platform::ElkhartLake | Gen11Platform::JasperLake) => {
                 ("i915/ehl_guc_70.1.1.bin", (70, 1, 1))
+            }
+            // Gen9 GuC is old-format like Gen11's: the blob filename
+            // carries its full version and the embedded CSS version
+            // is that same 70.1.1 (`gt/uc/intel_uc_fw.c`
+            // `INTEL_GUC_FIRMWARE_DEFS`: SKL `guc_mmp(skl, 70, 1,
+            // 1)`, KBL/CFL `guc_mmp(kbl, 70, 1, 1)`, CML rev>=5
+            // `guc_mmp(cml, 70, 1, 1)` / rev<5 `guc_mmp(kbl, 70, 1,
+            // 1)`). The minimum is the blob's own version — the
+            // same rule the Gen11 (70, 1, 1) pin follows. These
+            // arms exist in Lane 1 because the device-table census
+            // fixture requires a qualified GT/GuC profile for every
+            // census DID; GuC submission stays optional on Gen9
+            // (execlists works without it) and the load itself is
+            // Lane 7's, as is the CML rev>=5 split (all CML takes
+            // the KBL blob until a revision input is modeled).
+            Self::Gen9(Gen9Platform::Skylake) => ("i915/skl_guc_70.1.1.bin", (70, 1, 1)),
+            Self::Gen9(Gen9Platform::KabyLake | Gen9Platform::CometLake) => {
+                ("i915/kbl_guc_70.1.1.bin", (70, 1, 1))
             }
             Self::Integrated(Generation::MeteorLake) => ("i915/mtl_guc_70.bin", (70, 53, 0)),
             Self::ArcticSoundM | Self::Alchemist => ("i915/dg2_guc_70.bin", (70, 53, 0)),
