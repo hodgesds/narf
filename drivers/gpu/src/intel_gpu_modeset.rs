@@ -6161,13 +6161,13 @@ pub mod tests {
         }
         // Combo-PHY HDMI default levels (ICL HDMI table entry 6
         // {0x6, 0x7F, 0x35, 0x00, 0x0A}) at the PHY_B block:
-        // DW2 = swing 0x6 + RCOMP 0x98, DW7 = N-scalar 0x35,
+        // DW2 = swing 0x6 + RCOMP 0x98, DW7 = N-scalar 0x7F,
         // common keeper cleared.
         let phy = 0x06C000u64;
         if mmio.writes_to(phy + 0x888).last() != Some(&0x3098) {
             return TestResult::Fail("HDMI DW2 LN0 must carry the default-entry swing on PHY_B");
         }
-        if mmio.writes_to(phy + 0x89C).last() != Some(&0x3500_0000) {
+        if mmio.writes_to(phy + 0x89C).last() != Some(&0x7F00_0000) {
             return TestResult::Fail("HDMI DW7 LN0 must carry the default-entry N-scalar");
         }
         if mmio.writes_to(phy + 0x604).last() != Some(&0) {
