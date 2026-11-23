@@ -7,6 +7,7 @@
 //! 1. the payload header;
 //! 2. the frame table, which marks every image frame as forbidden;
 //! 3. each page into a safe frame.
+//!
 //! A frame the allocator hands out that the image needs is held, so it is
 //! never handed out again, and the next one is tried. The restore list's
 //! pages and the arch code's frames come from the same safe allocator.
