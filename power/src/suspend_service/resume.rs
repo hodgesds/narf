@@ -322,26 +322,28 @@ pub fn attempt_resume(
                     // unwrap is attempted.
                     let (_, recovery) =
                         unwrap_first_of_kind(anchors, &claims, AnchorKind::Passphrase);
-                    if let Some(sms) = recovery {
-                        match open_with_sms(store, claims, &sms) {
+                    match recovery {
+                        Some(sms) => match open_with_sms(store, claims, &sms) {
                             Ok(opened) => opened,
                             Err(e) => return refuse(prompt, ResumeRefusal::from_open(e)),
+                        },
+                        None => {
+                            // Refusal class, per leg: a required kind
+                            // with no (anchor, slot) pairing at all —
+                            // no anchor of the kind presented, or no
+                            // slot of the kind enrolled — is
+                            // FactorUnavailable; presented factors
+                            // that all refused are FactorRefused.
+                            // (A malformed slot set refuses here as
+                            // FactorUnavailable, never opens: the
+                            // composition is the only path to the SMS,
+                            // and it cannot complete.)
+                            if !token_matched || !tpm_matched {
+                                return refuse(prompt, ResumeRefusal::FactorUnavailable);
+                            }
+                            return refuse(prompt, ResumeRefusal::FactorRefused);
                         }
                     }
-                    // Refusal class, per leg: a required kind
-                    // with no (anchor, slot) pairing at all —
-                    // no anchor of the kind presented, or no
-                    // slot of the kind enrolled — is
-                    // FactorUnavailable; presented factors
-                    // that all refused are FactorRefused.
-                    // (A malformed slot set refuses here as
-                    // FactorUnavailable, never opens: the
-                    // composition is the only path to the SMS,
-                    // and it cannot complete.)
-                    if !token_matched || !tpm_matched {
-                        return refuse(prompt, ResumeRefusal::FactorUnavailable);
-                    }
-                    return refuse(prompt, ResumeRefusal::FactorRefused);
                 }
             }
         }
