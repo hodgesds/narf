@@ -3650,12 +3650,13 @@ fn execve_staged(mount_point: &'static str, elf: &[u8]) -> Option<crate::syscall
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_demand_image_loads_and_bails() -> TestResult {
-    // The handler-level half of #740: a 32-page image is over the
+    // The handler-level half of demand-paged exec: a 32-page image is over the
     // loader's demand floor, so the execve handler's load demand-pages
-    // it and packages the page-in plan for the completion paths. In
+    // it and the image's pages fault in on first touch after entry, with
+    // no eager page-in inside execve. In
     // the kernel-test harness there is no user ctx, so — exactly like
     // the minimal-ELF smoke above — success is the -ENOSYS bail AFTER
-    // the load. The plan's contents and the batch's effects are proven
+    // the load. The demand behaviour itself is proven
     // in `abi_execve_pagein_tests`, which drives the same load through
     // `ExecSource::File` directly.
     crate::syscall::__test_clear_global();
@@ -3680,10 +3681,10 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_truncated_eager_elf_enoexec() -> TestResult {
-    // Exec-semantics regression (#740): an 8-page segment is below the
+    // Exec-semantics regression: an 8-page segment is below the
     // demand floor and loads EAGERLY, so truncating it (4 of 8 pages
     // present) must keep failing execve synchronously with -ENOEXEC —
-    // the answer it gave before page-in clustering existed. The
+    // the answer it gave before demand paging existed. The
     // loader-level twin (same fixture shape, error-variant assertion)
     // is `smoke_execve_pagein_truncated_eager_fails_load`.
     crate::syscall::__test_clear_global();

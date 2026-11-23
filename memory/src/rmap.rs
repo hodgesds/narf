@@ -667,6 +667,88 @@ pub(crate) fn remove_without_shrink(phys: PhysAddr, root: PhysAddr, va: VirtAddr
     }
 }
 
+/// Batched counterpart to [`remove`]: retire many `(phys, root, va)`
+/// owners with one shard-lock acquisition per touched shard instead of
+/// one per entry.
+///
+/// Address-space teardown (`exit_mmap`-style) retires every present
+/// leaf's owner; per-leaf `remove` paid a lock acquisition plus a hash
+/// probe per page. The batch keeps `remove`'s exact per-entry semantics
+/// — a last-owner key becomes a bounded reuse shell or a tombstone, and
+/// the table shrink still allocates outside the shard lock — but the
+/// shrink target is computed once per shard, after all of that shard's
+/// removals, instead of once per leaf.
+pub(crate) fn remove_batch(entries: &[(PhysAddr, PhysAddr, VirtAddr)]) {
+    for shard_index in 0..RMAP_SHARDS {
+        // One scan per shard, no allocation: a shard with no entry in
+        // this batch is skipped without touching its lock.
+        if !entries
+            .iter()
+            .any(|(phys, _, _)| phys.raw() != 0 && shard(phys.raw()) == shard_index)
+        {
+            continue;
+        }
+        let shrink_target = {
+            let mut g = RMAP[shard_index].map.lock();
+            let Some(map) = g.as_mut() else {
+                continue;
+            };
+            let mut became_empty = false;
+            for &(phys, root, va) in entries {
+                let key = phys.raw();
+                if key == 0 || shard(key) != shard_index {
+                    continue;
+                }
+                if let Some(list) = map.get_mut(key) {
+                    let was_nonempty = list.len() != 0;
+                    list.remove(Owner { root, va });
+                    if was_nonempty && list.len() == 0 && list.reserved == 0 {
+                        became_empty = true;
+                        if map.retained_empty < RETAINED_EMPTY_KEYS_PER_SHARD {
+                            map.retained_empty += 1;
+                        } else {
+                            map.remove(key);
+                        }
+                    }
+                }
+            }
+            if became_empty {
+                map.shrink_target()
+            } else {
+                None
+            }
+        };
+        // Allocate with the IRQ-safe shard lock released, exactly as
+        // `remove` does; if allocation fails, leave the valid
+        // high-water table alone — a later removal can retry.
+        let Some(target) = shrink_target else {
+            continue;
+        };
+        let Some(slots) = RmapTable::try_empty_slots(target) else {
+            continue;
+        };
+        let mut slots = Some(slots);
+        let old = {
+            let mut g = RMAP[shard_index].map.lock();
+            g.as_mut().and_then(|map| {
+                // A racing add may have made the prepared table too small,
+                // while a racing removal may already have contracted past
+                // this target.
+                let current_target = map.shrink_target()?;
+                if current_target <= target && map.slots.len() > target {
+                    Some(map.replace_slots(slots.take().expect("prepared rmap slots missing")))
+                } else {
+                    None
+                }
+            })
+        };
+        // Deallocation may re-enter the heap, so release it outside the
+        // IRQ-safe shard lock just like the allocation above.
+        drop(slots);
+        drop(old);
+    }
+}
+
 /// Remove `owner` under the shard lock, returning the contraction target the
 /// removal made available.
 fn remove_owner(key: u64, owner: Owner) -> Option<usize> {

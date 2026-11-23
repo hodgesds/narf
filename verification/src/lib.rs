@@ -3107,8 +3107,6 @@ mod aarch64_el0_preemption_e2e {
             loaded_mappings: alloc::vec::Vec::new(),
             // Hand-built image at a fixed CODE_VADDR — no ELF load bias.
             program_bias: 0,
-            // Hand-built image: no loader, so no page-in plan (#740).
-            page_in_plan: alloc::vec::Vec::new(),
             ia32: false,
             segs: narf_userspace::UserSegments::default(),
         })
@@ -4029,8 +4027,6 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         loaded_mappings: alloc::vec::Vec::new(),
         // Hand-built image at a fixed CODE_VADDR — no ELF load bias.
         program_bias: 0,
-        // Hand-built image: no loader, so no page-in plan (#740).
-        page_in_plan: alloc::vec::Vec::new(),
         ia32: false,
         segs: narf_userspace::UserSegments::default(),
     };
