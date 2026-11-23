@@ -991,6 +991,43 @@ value, and the pointer slot stays zero on both (Gen11 has no indirect-context
 batch — Linux `lrc_init_wa_ctx` returns early for graphics 11). RING_CTL uses byte size
 minus one page (128 KiB encodes 0x1f001) and the CSB has 12 entries. Fixed
 source-cited vectors pin these values separately from the hardware model.
+The Gen9 template follows `intel_lrc.c` `gen9_rcs_offsets` /
+`gen9_xcs_offsets` instead: a 14-pair first group on RCS as well
+as XCS (Gen9 RCS has no trailing `0x180`), no `0x1b0` third
+group, a single-pair `R_PWR_CLK_STATE` group (`LRI(1, 0)`,
+engine-relative `0xc8`) at dword 0x41, and — unlike Gen11 RCS —
+the full 44-register extended group at 0x51, so Gen9 RCS ends
+at dword 0xaa like XCS. The LRI headers carry no
+`MI_LRI_LRM_CS_MMIO` bit (`set_offsets` sets it only for
+graphics 11+). The render image is 22 pages on Gen9
+(`GEN9_LR_CONTEXT_RENDER_SIZE`), still bounded by the 48-page
+allocation; the CSB depth is 6 (`GEN8_CSB_ENTRIES`) with the
+write pointer at dword 0x1f (`I915_HWS_CSB_WRITE_INDEX` —
+the 0x2f location is the Gen11+ `ICL_HWS_CSB_WRITE_INDEX`).
+The indirect-context offset default is Gen9 `0x26`,
+programmed `<< 6` into the Gen9 RCS template, and Gen9 —
+unlike Gen11 — has an indirect-context batch:
+`gen9_init_indirectctx_bb` (MI_ARB_DISABLE, the coherent-L3
+save/load/pipe-control/restore, the ClearSlm pipe-control,
+the three chicken fixes, and on pooled-EU parts the media-pool
+sequence, then MI_ARB_ENABLE), emitted by
+`gen9_init_indirectctx_bb` and programmed into the template
+by `setup_gen9_indirect_ctx`. The Gen9 context descriptor's
+upper dword carries the SW context id at bits 37:47 and
+nothing else — no engine instance/class fields (those are
+ORed in only for graphics 11+); the CSB "switched to/away"
+fields name the SW id on both generations (Linux parses both
+with the same `gen8_csb_parse`). The Gen9 media engines are
+VCS0/VCS1/VECS0 (GT3+ mask; GT1/GT2 parts carry VCS0 only —
+the trim is first-silicon work) at the pre-Gen11 ring bases
+(0x12000 / 0x1c000 / 0x1a000), driven through the aggregate
+media forcewake domain (Lane 6's `GEN9_FW_DOMAINS` table:
+0xA270, ack 0x0D88) since Gen9 has
+no per-VDBox sub-domains. The WA page allocation and its
+engine-init wiring (`lrc_init_wa_ctx` equivalent, including
+the GT scratch dword the coherent-L3 workaround saves to)
+is a follow-up; until it lands the template's indirect
+pointer slot stays zero and the WA batch is inert.
 Public interface:
 
 - `RcsEngine::new(mmio, alloc)` — allocate the engine status
@@ -1030,9 +1067,9 @@ Public interface:
   Production glue: `submit_dwords` /
   `poll_default_completions` attach lazily to the probed
   controller on a default context. The legacy submission lease
-  admits Tiger Lake, Alder Lake and Ice Lake; `attach_default`
+  admits Tiger Lake, Alder Lake, Ice Lake and Skylake; `attach_default`
   builds the engine for the probed generation, so a Gen11 part
-  gets the Gen11 template. `GraphicsIp::read` has a pre-GMD
+  gets the Gen11 template and a Gen9 part the Gen9 template. `GraphicsIp::read` has a pre-GMD
   arm for Gen11 (version 1100, no MMIO touch) — the Lane 1
   remainder — so the context-seed and GuC paths that sample
   the graphics IP work on Gen11 without reading `GMD_ID`.
@@ -1069,19 +1106,26 @@ Invariants:
 
 Flagged for first-silicon verification (single named
 constants in `intel_gpu_rcs`): `CSB_ENTRIES` = 12 (Gen11+
-CSB depth), `RCS_IMAGE_PAGES` = 48 (allocation bound above
-the hardware image size), and the descriptor Legacy-64B
+CSB depth; Gen9 is 6, `GEN9_CSB_ENTRIES`, with the write
+pointer at dword 0x1f), `RCS_IMAGE_PAGES` = 48 (allocation
+bound above the hardware image size — 14 pages Gen11/Gen12,
+22 pages Gen9), and the descriptor Legacy-64B
 mode choice. The Gen11 template, indirect-offset default,
 image bound and pre-GMD identity read are fixture-verified
-against the Linux Gen11 tables in this lane; first silicon
-execution on Gen11 hardware is still outstanding (Daniel's
+against the Linux Gen11 tables in this lane; the Gen9
+template, 0x26 indirect offset, 6-entry CSB, 22-page image,
+WA batch and Gen9 descriptor upper dword (SW id only, no
+instance/class) are fixture-verified against the Linux Gen9
+tables the same way; first silicon
+execution on Gen9 hardware is still outstanding (Daniel's
 bringup lane). One pre-existing NARF-wide deviation is
 recorded, not changed: the descriptor sets bit 5
 (`DESC_L3LLC_COHERENT`) on every generation, while Linux
 `lrc_descriptor` sets it only for graphics 8. The Gen12
 submission path ships with the bit set, so the lane keeps
 Gen11 identical to the verified Gen12 descriptor rather than
-diverging on an untested hunch.
+diverging on an untested hunch; the Gen9 lane re-grounded
+the descriptor and keeps Gen9 under the same policy.
 
 ## 9. PPGTT + GGTT discipline (Stage 4/5 — `intel_gpu_ppgtt`, #1012)
 

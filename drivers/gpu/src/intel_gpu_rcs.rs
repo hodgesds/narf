@@ -58,10 +58,13 @@
 //!   and the HWSP CSB offsets (`I915_HWS_CSB_BUF0_INDEX`,
 //!   `CNL_HWS_CSB_WRITE_INDEX`).
 //!
-//! The CSB depth is twelve (MIT intel_lrc_reg.h). The 48-page image
-//! allocation bounds the 14-page render image shared by Gen11 and
-//! Gen12 (`intel_engine_context_size`). The Gen11 template itself
-//! differs — see [`build_reg_state_for_generation`]. These model-checked
+//! The CSB depth is twelve on Gen11+ (MIT intel_lrc_reg.h) and six
+//! on Gen9 (`GEN8_CSB_ENTRIES`); see [`csb_entries`]. The 48-page
+//! image allocation bounds the 14-page render image shared by Gen11
+//! and Gen12 (`intel_engine_context_size`) and the 22-page Gen9
+//! render image (`GEN9_LR_CONTEXT_RENDER_SIZE`); see
+//! [`render_image_pages`]. The Gen11 template itself differs —
+//! see [`build_reg_state_for_generation`]. These model-checked
 //! encodings do not establish full GT setup, safe userspace execution,
 //! silicon cache completion or hardware reset; the userspace gate in
 //! intel_gpu_render remains closed until those owners exist.
@@ -356,7 +359,61 @@ pub const IDLE_SW_ID: u16 = 0x7FF;
 /// descriptor's engine class (bits 61:63) and engine instance
 /// (bits 48:53) come from the spec; the SW counter stays 0 —
 /// this driver matches CSB events by SW id + FIFO order.
+///
+/// This is the Gen11+ form; [`context_descriptor_for_generation`]
+/// selects the Gen9 layout for `Generation::Skylake`.
 pub fn context_descriptor_for(spec: &EngineSpec, lrca: u32, sw_ctx_id: u16) -> u64 {
+    context_descriptor_for_generation(
+        spec,
+        lrca,
+        sw_ctx_id,
+        crate::intel_gpu::Generation::TigerLake,
+    )
+}
+
+/// Build the 64-bit execlists context descriptor for the
+/// generation `generation` (MIT `intel_lrc.c`
+/// `lrc_descriptor` + `__execlists_schedule_in`).
+///
+/// The low dword is shared: valid, Legacy-64B mode, privileged,
+/// LRCA. The upper dword differs by generation — that is the
+/// Gen9-vs-Gen11+ difference the audit asserted without a
+/// citation, grounded here against the 7.4-rc2 source:
+///
+/// - Gen11+ packs the SW context id at bits 37:47, the engine
+///   instance at bits 48:53 and the engine class at bits 61:63
+///   (`intel_lrc.h` `GEN11_SW_CTX_ID_SHIFT` 37,
+///   `GEN11_ENGINE_INSTANCE_SHIFT` 48,
+///   `GEN11_ENGINE_CLASS_SHIFT` 61; the instance/class halves
+///   are ORed into the descriptor's upper dword from the
+///   engine's execlists cookie, `intel_execlists_submission.c`,
+///   only for graphics 11..12.55).
+/// - Gen9 (graphics 9) carries the SW context id at bits 37:47
+///   and nothing else above it: the tag is placed there by
+///   `__execlists_schedule_in` on every pre-XeHP generation
+///   (`(1 + tag) << (GEN11_SW_CTX_ID_SHIFT - 32)`), and the
+///   instance/class OR is skipped below graphics 11, so the
+///   remaining upper-dword bits are the pre-Gen11 21-bit context
+///   ID field's zero padding (group ID 0, `intel_lrc.c`
+///   descriptor comment). The SW-id extraction
+///   ([`descriptor_sw_id`]) is therefore the same on Gen9,
+///   and the CSB "switched to/away" fields name the SW id on
+///   both generations (Linux parses both with the same
+///   `gen8_csb_parse`).
+///
+/// The low dword keeps `DESC_L3LLC_COHERENT` set on Gen9, as
+/// on Gen11/Gen12: Linux `lrc_descriptor` sets it only for
+/// graphics 8, but the Gen11 lane recorded that as a deliberate
+/// NARF-wide deviation in the spec (§8) rather than diverging
+/// on an untested hunch, and this lane keeps Gen9 under the
+/// same policy. First silicon decides whether the bit is
+/// honored or ignored on Gen9.
+pub fn context_descriptor_for_generation(
+    spec: &EngineSpec,
+    lrca: u32,
+    sw_ctx_id: u16,
+    generation: crate::intel_gpu::Generation,
+) -> u64 {
     debug_assert!(lrca & 0xFFF == 0);
     debug_assert!(sw_ctx_id < IDLE_SW_ID);
     debug_assert!(spec.instance < 64);
@@ -366,8 +423,10 @@ pub fn context_descriptor_for(spec: &EngineSpec, lrca: u32, sw_ctx_id: u16) -> u
         | DESC_PRIVILEGE
         | (lrca as u64 & 0xFFFF_F000);
     let mut hi = ((sw_ctx_id as u64) & 0x7FF) << 5;
-    hi |= ((spec.instance as u64) & 0x3F) << 16;
-    hi |= spec.class.descriptor_value() << 29;
+    if !matches!(generation, crate::intel_gpu::Generation::Skylake) {
+        hi |= ((spec.instance as u64) & 0x3F) << 16;
+        hi |= spec.class.descriptor_value() << 29;
+    }
     (hi << 32) | lo
 }
 
@@ -453,6 +512,9 @@ pub const GEN11_CTX_RCS_END: usize = 0x44;
 /// Gen11 non-render context restore terminator (the template
 /// ends after the 44-register group).
 pub const GEN11_CTX_XCS_END: usize = 0xAA;
+/// `RING_INDIRECT_CTX_OFFSET` default for Gen9 (MIT
+/// `intel_lrc_reg.h` `GEN9_CTX_RCS_INDIRECT_CTX_OFFSET_DEFAULT`).
+pub const GEN9_INDIRECT_CTX_OFFSET_DEFAULT: u32 = 0x26;
 /// `RING_INDIRECT_CTX_OFFSET` default for Gen11 (MIT
 /// `intel_lrc_reg.h` `GEN11_CTX_RCS_INDIRECT_CTX_OFFSET_DEFAULT`).
 pub const GEN11_INDIRECT_CTX_OFFSET_DEFAULT: u32 = 0x1A;
@@ -472,6 +534,7 @@ pub const GEN12_INDIRECT_CTX_OFFSET_DEFAULT: u32 = 0x0D;
 /// pointer slot stays zero on both generations.
 pub const fn indirect_ctx_offset_default(generation: crate::intel_gpu::Generation) -> u32 {
     match generation {
+        crate::intel_gpu::Generation::Skylake => GEN9_INDIRECT_CTX_OFFSET_DEFAULT,
         crate::intel_gpu::Generation::IceLake => GEN11_INDIRECT_CTX_OFFSET_DEFAULT,
         _ => GEN12_INDIRECT_CTX_OFFSET_DEFAULT,
     }
@@ -504,6 +567,25 @@ pub const CTX_CONTROL_VALUE: u32 = {
     (restore_inhibit << 16) | (inhibit_syn_ctx_switch << 16) | inhibit_syn_ctx_switch
 };
 
+/// The `CONTEXT_CONTROL` value for `generation` (MIT
+/// `intel_lrc.c` `init_common_regs`): Gen11+ takes
+/// [`CTX_CONTROL_VALUE`]; Gen9 (graphics < 11) additionally
+/// masked-disables the save-inhibit (bit 2) and render-state
+/// context-enable (bit 1) fields (`intel_engine_regs.h`
+/// `CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT` /
+/// `CTX_CTRL_RS_CTX_ENABLE`), so its value is 0xF0008 rather
+/// than 0x90008.
+pub const fn ctx_control_value(generation: crate::intel_gpu::Generation) -> u32 {
+    match generation {
+        crate::intel_gpu::Generation::Skylake => {
+            const SAVE_INHIBIT: u32 = 1 << 2;
+            const RS_CTX_ENABLE: u32 = 1 << 1;
+            CTX_CONTROL_VALUE | ((SAVE_INHIBIT | RS_CTX_ENABLE) << 16)
+        }
+        _ => CTX_CONTROL_VALUE,
+    }
+}
+
 /// `RING_CTL` value for a ring of `ring_bytes` (power of two,
 /// page multiple): bit 0 = enable, bits20:12 = byte size minus one page.
 pub const fn ring_ctl_value(ring_bytes: u32) -> u32 {
@@ -526,7 +608,8 @@ pub const fn ring_ctl_value(ring_bytes: u32) -> u32 {
 /// `R_PWR_CLK_STATE` and the extended register state exist only in
 /// render-class templates. XCS terminates after the PDP group.
 /// This is the Gen12 form; [`build_reg_state_for_generation`]
-/// selects the Gen11 layout for `Generation::IceLake`.
+/// selects the Gen9 layout for `Generation::Skylake` and the
+/// Gen11 layout for `Generation::IceLake`.
 pub fn build_reg_state_for(
     spec: &EngineSpec,
     ring_ggtt: u32,
@@ -542,16 +625,21 @@ pub fn build_reg_state_for(
 
 /// Build the register-state template for a fresh context on
 /// the engine `spec` names for the generation `generation`.
-/// Gen11 (`Generation::IceLake`) takes the Gen11 layout
-/// ([`build_gen11_reg_state`]); every other generation keeps
-/// the existing Gen12-shaped template (the MTL+ tables are
-/// their own Linux tables and out of scope here).
+/// Gen9 (`Generation::Skylake`) takes the Gen9 layout
+/// ([`build_gen9_reg_state`]); Gen11 (`Generation::IceLake`)
+/// takes the Gen11 layout ([`build_gen11_reg_state`]); every
+/// other generation keeps the existing Gen12-shaped template
+/// (the MTL+ tables are their own Linux tables and out of scope
+/// here).
 pub fn build_reg_state_for_generation(
     spec: &EngineSpec,
     ring_ggtt: u32,
     ring_bytes: u32,
     generation: crate::intel_gpu::Generation,
 ) -> [u32; REG_STATE_DWORDS] {
+    if matches!(generation, crate::intel_gpu::Generation::Skylake) {
+        return build_gen9_reg_state(spec, ring_ggtt, ring_bytes);
+    }
     if matches!(generation, crate::intel_gpu::Generation::IceLake) {
         return build_gen11_reg_state(spec, ring_ggtt, ring_bytes);
     }
@@ -603,6 +691,18 @@ pub fn build_reg_state_for_generation(
     r[CTX_END] = MI_BATCH_BUFFER_END | 1;
     r
 }
+
+/// The 44-register extended group shared by the Gen9 RCS/XCS
+/// tables and the Gen11 XCS table (MIT `intel_lrc.c`
+/// `gen9_rcs_offsets` / `gen9_xcs_offsets`, the trailing group
+/// of both; the Gen12 extended list without the six `0x588`
+/// repeats and the trailing `0x84`).
+const XCS44: [u32; 44] = [
+    0x28, 0x9c, 0xc0, 0x178, 0x17c, 0x358, 0x170, 0x150, 0x154, 0x158, 0x41c, 0x600, 0x604, 0x608,
+    0x60c, 0x610, 0x614, 0x618, 0x61c, 0x620, 0x624, 0x628, 0x62c, 0x630, 0x634, 0x638, 0x63c,
+    0x640, 0x644, 0x648, 0x64c, 0x650, 0x654, 0x658, 0x65c, 0x660, 0x664, 0x668, 0x66c, 0x670,
+    0x674, 0x678, 0x67c, 0x68,
+];
 
 /// Gen11 register-state template (MIT `intel_lrc.c`:
 /// `gen11_rcs_offsets` for render, `gen9_xcs_offsets` for
@@ -665,13 +765,7 @@ fn build_gen11_reg_state(
         r[0x42] = b as u32 + 0x200;
         // Transcribed from `gen9_xcs_offsets`: the Gen12
         // extended list without the six 0x588 repeats and the
-        // trailing 0x84.
-        const XCS44: [u32; 44] = [
-            0x28, 0x9c, 0xc0, 0x178, 0x17c, 0x358, 0x170, 0x150, 0x154, 0x158, 0x41c, 0x600, 0x604,
-            0x608, 0x60c, 0x610, 0x614, 0x618, 0x61c, 0x620, 0x624, 0x628, 0x62c, 0x630, 0x634,
-            0x638, 0x63c, 0x640, 0x644, 0x648, 0x64c, 0x650, 0x654, 0x658, 0x65c, 0x660, 0x664,
-            0x668, 0x66c, 0x670, 0x674, 0x678, 0x67c, 0x68,
-        ];
+        // trailing 0x84 (see [`XCS44`]).
         r[0x51] = mi_load_register_imm(44, true) | RELATIVE;
         for (i, offset) in XCS44.iter().enumerate() {
             r[0x52 + i * 2] = b as u32 + offset;
@@ -692,10 +786,311 @@ fn build_gen11_reg_state(
     r
 }
 
+/// Gen9 register-state template (MIT `intel_lrc.c`:
+/// `gen9_rcs_offsets` for render, `gen9_xcs_offsets` for
+/// everything else — the table the Gen11 XCS half already
+/// reuses).
+///
+/// Transcribed, not re-derived, and diffed against
+/// [`build_gen11_reg_state`]. The first groups look
+/// near-identical (both start `LRI(14, POSTED)` with the same
+/// 0x244/0x34/0x30/… sequence); the divergence is in the later
+/// groups:
+///
+/// - The first group is 14 pairs on RCS as well as XCS: Gen9
+///   RCS has no trailing `0x180` pair, so the workaround-batch
+///   and indirect-context pairs sit at the same
+///   `GEN11_CTX_*` indices as the Gen11 XCS first group.
+/// - There is no `0x1b0` third group: Gen9 RCS goes straight
+///   from the PDP group to the single-pair
+///   `R_PWR_CLK_STATE` group (`LRI(1, 0)`, engine-relative
+///   `0xc8`, at `CTX_LRI_HEADER_2` / `CTX_R_PWR_CLK_STATE`).
+/// - Unlike Gen11 RCS, Gen9 RCS does NOT end there: it
+///   carries the full 44-register extended group at 0x51 and
+///   ends at dword 0xaa — the same terminator as XCS. The
+///   44-register list is [`XCS44`], identical in both tables.
+/// - The indirect-context offset value is Gen9's 0x26,
+///   programmed `<< 6` per `lrc_setup_indirect_ctx`.
+/// - The LRI headers carry NO `MI_LRI_LRM_CS_MMIO` bit
+///   (`RELATIVE`): Linux `set_offsets` sets it only for
+///   graphics 11+, so Gen9 headers are the bare
+///   `mi_load_register_imm` encoding.
+/// - The context-control value is Gen9's
+///   [`ctx_control_value`] (0xF0008, with the pre-11
+///   save-inhibit / RS-context-enable disables).
+fn build_gen9_reg_state(
+    spec: &EngineSpec,
+    ring_ggtt: u32,
+    ring_bytes: u32,
+) -> [u32; REG_STATE_DWORDS] {
+    let b = spec.base;
+    let mut r = [0u32; REG_STATE_DWORDS];
+    // The 14-pair first group is the same on RCS and XCS
+    // (`gen9_rcs_offsets` / `gen9_xcs_offsets` agree here).
+    const FIRST: [u32; 14] = [
+        0x244, 0x34, 0x30, 0x38, 0x3c, 0x168, 0x140, 0x110, 0x11c, 0x114, 0x118, 0x1c0, 0x1c4,
+        0x1c8,
+    ];
+    r[CTX_LRI_HEADER_0] = mi_load_register_imm(FIRST.len() as u32, true);
+    for (i, offset) in FIRST.iter().enumerate() {
+        r[2 + i * 2] = b as u32 + offset;
+    }
+    r[CTX_CONTEXT_CONTROL + 1] = ctx_control_value(crate::intel_gpu::Generation::Skylake);
+    r[CTX_RING_BUFFER_START + 1] = ring_ggtt;
+    r[CTX_RING_BUFFER_CONTROL + 1] = ring_ctl_value(ring_bytes);
+    r[CTX_LRI_HEADER_1] = mi_load_register_imm(9, true);
+    r[CTX_CTX_TIMESTAMP] = (b + 0x3a8) as u32;
+    for i in 0..4u32 {
+        let at = CTX_PDP3_UDW + i as usize * 4;
+        r[at] = ring_pdp_udw_at(b, 3 - i) as u32;
+        r[at + 2] = ring_pdp_ldw_at(b, 3 - i) as u32;
+    }
+    if !spec.has_pwr_clk_state() {
+        r[0x41] = mi_load_register_imm(1, true);
+        r[0x42] = b as u32 + 0x200;
+        r[0x51] = mi_load_register_imm(44, true);
+        for (i, offset) in XCS44.iter().enumerate() {
+            r[0x52 + i * 2] = b as u32 + offset;
+        }
+        r[GEN11_CTX_XCS_END] = MI_BATCH_BUFFER_END | 1;
+        return r;
+    }
+    // RCS only: the indirect-context offset default, programmed
+    // in the value slot of the shifted offset pair (see
+    // `GEN11_CTX_RCS_INDIRECT_CTX_OFFSET`). The pointer slot
+    // stays zero until the WA batch is wired (see
+    // [`setup_gen9_indirect_ctx`]).
+    r[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET + 1] = GEN9_INDIRECT_CTX_OFFSET_DEFAULT << 6;
+    r[0x41] = mi_load_register_imm(1, false);
+    r[0x42] = b as u32 + 0xC8;
+    r[0x51] = mi_load_register_imm(44, true);
+    for (i, offset) in XCS44.iter().enumerate() {
+        r[0x52 + i * 2] = b as u32 + offset;
+    }
+    r[GEN11_CTX_XCS_END] = MI_BATCH_BUFFER_END | 1;
+    r
+}
+
 /// Build the RCS0 register-state template (the historical form
 /// of [`build_reg_state_for`]).
 pub fn build_reg_state(ring_ggtt: u32, ring_bytes: u32) -> [u32; REG_STATE_DWORDS] {
     build_reg_state_for(&RCS0_SPEC, ring_ggtt, ring_bytes)
+}
+
+// ── Gen9 indirect-context workaround batch ────────────────────
+//
+// Linux `gt/intel_lrc.c` `gen9_init_indirectctx_bb` (wired by
+// `lrc_init_wa_ctx` for graphics 9 only — it returns early for
+// graphics 11+). The batch runs once per context switch, before
+// the context's own commands, with arbitration disabled; it
+// applies the Gen9 context-switch workarounds that cannot live
+// in the register-state template. No WA-batch function existed
+// in NARF before this lane.
+
+/// `MI_ARB_ON_OFF` (MIT `intel_gpu_commands.h`).
+pub const MI_ARB_ON_OFF: u32 = 0x08 << 23;
+/// `MI_ARB_DISABLE` — arbitration off for the WA batch.
+pub const MI_ARB_DISABLE: u32 = MI_ARB_ON_OFF;
+/// `MI_ARB_ENABLE` — arbitration back on at the end of the batch.
+pub const MI_ARB_ENABLE: u32 = MI_ARB_ON_OFF | 1;
+
+/// `GEN8_L3SQCREG4` (MIT `intel_gt_regs.h`, 0xb118).
+pub const GEN8_L3SQCREG4: u32 = 0xB118;
+/// `GEN8_LQSC_FLUSH_COHERENT_LINES` (bit 21 of `GEN8_L3SQCREG4`).
+pub const GEN8_LQSC_FLUSH_COHERENT_LINES: u32 = 1 << 21;
+
+/// `MI_STORE_REGISTER_MEM_GEN8` (MIT `intel_gpu_commands.h`).
+pub const MI_STORE_REGISTER_MEM_GEN8: u32 = (0x24 << 23) | 2;
+/// `MI_LOAD_REGISTER_MEM_GEN8`.
+pub const MI_LOAD_REGISTER_MEM_GEN8: u32 = (0x29 << 23) | 2;
+/// `MI_SRM_LRM_GLOBAL_GTT` — the save/restore address is a GGTT
+/// address, not a physical one.
+pub const MI_SRM_LRM_GLOBAL_GTT: u32 = 1 << 22;
+
+/// `GFX_OP_PIPE_CONTROL(6)` (MIT `intel_gpu_commands.h`).
+pub const PIPE_CONTROL_HEADER: u32 = 0x7A00_0004;
+/// `PIPE_CONTROL_FLUSH_L3` (bit 27).
+pub const PIPE_CONTROL_FLUSH_L3: u32 = 1 << 27;
+/// `PIPE_CONTROL_STORE_DATA_INDEX` (bit 21).
+pub const PIPE_CONTROL_STORE_DATA_INDEX: u32 = 1 << 21;
+/// `PIPE_CONTROL_CS_STALL` (bit 20).
+pub const PIPE_CONTROL_CS_STALL: u32 = 1 << 20;
+/// `PIPE_CONTROL_QW_WRITE` (bit 14).
+pub const PIPE_CONTROL_QW_WRITE: u32 = 1 << 14;
+/// `PIPE_CONTROL_DC_FLUSH_ENABLE` (bit 5).
+pub const PIPE_CONTROL_DC_FLUSH_ENABLE: u32 = 1 << 5;
+
+/// Per-context HWSP scratch dword address
+/// (`LRC_PPHWSP_SCRATCH_ADDR` = 0x34 * 4 = 0xd0, MIT
+/// `intel_lrc.h`).
+pub const LRC_PPHWSP_SCRATCH_ADDR: u32 = 0xD0;
+
+/// `COMMON_SLICE_CHICKEN2` (MIT `intel_gt_regs.h`, 0x7014).
+pub const COMMON_SLICE_CHICKEN2: u32 = 0x7014;
+/// `GEN9_DISABLE_GATHER_AT_SET_SHADER_COMMON_SLICE` (bit 12).
+pub const GEN9_DISABLE_GATHER_AT_SET_SHADER_COMMON_SLICE: u32 = 1 << 12;
+/// `FF_SLICE_CHICKEN` (MIT `intel_gt_regs.h`, 0x2088).
+pub const FF_SLICE_CHICKEN: u32 = 0x2088;
+/// `FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX` (bit 1).
+pub const FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX: u32 = 1 << 1;
+/// `_3D_CHICKEN3` (MIT `intel_gt_regs.h`, 0x2090).
+pub const CHICKEN3_3D: u32 = 0x2090;
+/// `_3D_CHICKEN_SF_PROVOKING_VERTEX_FIX` (bit 12).
+pub const CHICKEN3_SF_PROVOKING_VERTEX_FIX: u32 = 1 << 12;
+
+/// `GEN9_MEDIA_POOL_STATE` (MIT `intel_gpu_commands.h`).
+pub const GEN9_MEDIA_POOL_STATE: u32 = 0x7005_0004;
+/// `GEN9_MEDIA_POOL_ENABLE` (bit 31).
+pub const GEN9_MEDIA_POOL_ENABLE: u32 = 1 << 31;
+
+/// Dwords the Gen9 indirect-context WA batch occupies at most
+/// (33 dwords without the pooled-EU media-pool sequence, 39
+/// with it, both padded up to a whole number of 64-byte
+/// cachelines). The batch must fit in one page (Linux
+/// `CTX_WA_BB_SIZE` is a page); the caller supplies a
+/// `batch` slice of at least this length.
+pub const GEN9_INDIRECT_CTX_BB_DWORDS: usize = 48;
+
+/// Emit the Gen9 indirect-context workaround batch
+/// (`gen9_init_indirectctx_bb`) into `batch`, returning the
+/// number of dwords written (always a multiple of 16 — the
+/// batch is padded with `MI_NOOP` to the end of its last
+/// cacheline, as Linux pads to the end of the cacheline; no
+/// `MI_BATCH_BUFFER_END` is emitted, because execution length
+/// comes from the cacheline count in `CTX_RCS_INDIRECT_CTX`).
+///
+/// Layout, in order:
+/// - `MI_ARB_DISABLE`.
+/// - `WaFlushCoherentL3CacheLinesAtContextSwitch` (skl/bxt/glk):
+///   save `GEN8_L3SQCREG4` to the GT scratch dword
+///   `gt_scratch_ggtt`, load it with `0x40400000 |
+///   GEN8_LQSC_FLUSH_COHERENT_LINES`, a pipe-control
+///   (CS-stall + DC-flush), then restore the saved value.
+/// - `WaClearSlmSpaceAtContextSwitch` (skl/bxt/kbl/glk/cfl):
+///   a pipe-control (flush-L3 + store-data-index + CS-stall +
+///   QW-write) to the per-context HWSP scratch address.
+/// - `WaDisableGatherAtSetShaderCommonSlice` (skl/bxt/kbl/glk),
+///   the FF-slice provoking-vertex fix (BSpec 11391) and the
+///   3D-chicken provoking-vertex fix (BSpec 11299), as one
+///   non-posted `MI_LOAD_REGISTER_IMM(3)` group plus a trailing
+///   `MI_NOOP` (Linux `emit_lri`).
+/// - On pooled-EU parts (`pooled_eu`, Linux `HAS_POOLED_EU` —
+///   BXT/GLK only in the Gen9 family, `WaMediaPoolStateCmdInWABB`):
+///   `GEN9_MEDIA_POOL_STATE` / `GEN9_MEDIA_POOL_ENABLE` /
+///   `0x00777000` / 0 / 0 / 0.
+/// - `MI_ARB_ENABLE`.
+///
+/// `gt_scratch_ggtt` is the GGTT address of the GT scratch
+/// dword reserved for the coherent-L3 save/restore (Linux
+/// `INTEL_GT_SCRATCH_FIELD_COHERENTL3_WA`, GT scratch + 256 —
+/// "no one else is allowed to scribble over scratch + 256").
+/// NARF has no GT scratch allocation yet, so the caller
+/// supplies the address; the engine bring-up that owns the WA
+/// page (follow-up) will own it. The batch is inert until that
+/// bring-up programs the indirect-context pointer/offset pair
+/// (see [`setup_gen9_indirect_ctx`]).
+///
+/// Panics if `batch` is shorter than
+/// [`GEN9_INDIRECT_CTX_BB_DWORDS`].
+pub fn gen9_init_indirectctx_bb(batch: &mut [u32], pooled_eu: bool, gt_scratch_ggtt: u32) -> usize {
+    assert!(batch.len() >= GEN9_INDIRECT_CTX_BB_DWORDS);
+    let mut n = 0usize;
+    // MI_ARB_ON_OFF | MI_ARB_DISABLE.
+    batch[n] = MI_ARB_DISABLE;
+    n += 1;
+    // gen8_emit_flush_coherentl3_wa: MI_STORE_REGISTER_MEM_GEN8
+    // (global-GTT) saves GEN8_L3SQCREG4 to the scratch dword.
+    batch[n] = MI_STORE_REGISTER_MEM_GEN8 | MI_SRM_LRM_GLOBAL_GTT;
+    batch[n + 1] = GEN8_L3SQCREG4;
+    batch[n + 2] = gt_scratch_ggtt;
+    batch[n + 3] = 0;
+    n += 4;
+    // MI_LOAD_REGISTER_IMM(1): GEN8_L3SQCREG4 =
+    // 0x40400000 | GEN8_LQSC_FLUSH_COHERENT_LINES.
+    batch[n] = mi_load_register_imm(1, false);
+    batch[n + 1] = GEN8_L3SQCREG4;
+    batch[n + 2] = 0x4040_0000 | GEN8_LQSC_FLUSH_COHERENT_LINES;
+    n += 3;
+    // Pipe-control (CS-stall + DC-flush).
+    batch[n] = PIPE_CONTROL_HEADER;
+    batch[n + 1] = PIPE_CONTROL_CS_STALL | PIPE_CONTROL_DC_FLUSH_ENABLE;
+    batch[n + 2] = 0;
+    batch[n + 3] = 0;
+    batch[n + 4] = 0;
+    batch[n + 5] = 0;
+    n += 6;
+    // MI_LOAD_REGISTER_MEM_GEN8 (global-GTT) restores the saved
+    // GEN8_L3SQCREG4 value.
+    batch[n] = MI_LOAD_REGISTER_MEM_GEN8 | MI_SRM_LRM_GLOBAL_GTT;
+    batch[n + 1] = GEN8_L3SQCREG4;
+    batch[n + 2] = gt_scratch_ggtt;
+    batch[n + 3] = 0;
+    n += 4;
+    // gen8_emit_pipe_control: WaClearSlmSpaceAtContextSwitch.
+    batch[n] = PIPE_CONTROL_HEADER;
+    batch[n + 1] = PIPE_CONTROL_FLUSH_L3
+        | PIPE_CONTROL_STORE_DATA_INDEX
+        | PIPE_CONTROL_CS_STALL
+        | PIPE_CONTROL_QW_WRITE;
+    batch[n + 2] = LRC_PPHWSP_SCRATCH_ADDR;
+    batch[n + 3] = 0;
+    batch[n + 4] = 0;
+    batch[n + 5] = 0;
+    n += 6;
+    // emit_lri: the three chicken fixes, non-posted.
+    batch[n] = mi_load_register_imm(3, false);
+    batch[n + 1] = COMMON_SLICE_CHICKEN2;
+    batch[n + 2] = GEN9_DISABLE_GATHER_AT_SET_SHADER_COMMON_SLICE << 16;
+    batch[n + 3] = FF_SLICE_CHICKEN;
+    batch[n + 4] =
+        (FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX << 16) | FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX;
+    batch[n + 5] = CHICKEN3_3D;
+    batch[n + 6] = (CHICKEN3_SF_PROVOKING_VERTEX_FIX << 16) | CHICKEN3_SF_PROVOKING_VERTEX_FIX;
+    batch[n + 7] = MI_NOOP;
+    n += 8;
+    // WaMediaPoolStateCmdInWABB: pooled-EU parts only.
+    if pooled_eu {
+        batch[n] = GEN9_MEDIA_POOL_STATE;
+        batch[n + 1] = GEN9_MEDIA_POOL_ENABLE;
+        batch[n + 2] = 0x0077_7000;
+        batch[n + 3] = 0;
+        batch[n + 4] = 0;
+        batch[n + 5] = 0;
+        n += 6;
+    }
+    // MI_ARB_ON_OFF | MI_ARB_ENABLE.
+    batch[n] = MI_ARB_ENABLE;
+    n += 1;
+    // Pad to the end of the cacheline with MI_NOOP.
+    while n % 16 != 0 {
+        batch[n] = MI_NOOP;
+        n += 1;
+    }
+    n
+}
+
+/// Program the Gen9 indirect-context pair of a built register
+/// state `regs` (MIT `intel_lrc.c` `lrc_setup_indirect_ctx`):
+/// the pointer slot (`GEN11_CTX_RCS_INDIRECT_CTX`, index 0x1a —
+/// the same index on Gen9, `lrc_ring_indirect_ptr`) takes the
+/// WA batch's GGTT address ORed with its length in cachelines,
+/// and the offset slot (`GEN11_CTX_RCS_INDIRECT_CTX_OFFSET`,
+/// index 0x1c) takes the Gen9 default `0x26 << 6`.
+///
+/// `size_bytes` must be a nonzero multiple of 64 (one
+/// cacheline). The WA batch's owning bring-up (follow-up: the
+/// GGTT-resident WA page allocation + `lrc_init_wa_ctx`
+/// equivalent) calls this after [`gen9_init_indirectctx_bb`];
+/// until then the template's pointer slot stays zero and the
+/// offset value in the template is inert.
+pub fn setup_gen9_indirect_ctx(
+    regs: &mut [u32; REG_STATE_DWORDS],
+    wa_bb_ggtt: u32,
+    size_bytes: u32,
+) {
+    debug_assert!(size_bytes != 0 && size_bytes % 64 == 0);
+    regs[GEN11_CTX_RCS_INDIRECT_CTX + 1] = wa_bb_ggtt | (size_bytes / 64);
+    regs[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET + 1] = GEN9_INDIRECT_CTX_OFFSET_DEFAULT << 6;
 }
 
 // ── Context status buffer (Gen12 format) ────────────────────────
@@ -713,6 +1108,44 @@ pub const CSB_ENTRIES: u8 = 12;
 pub const CSB_BUF_BYTE: u64 = CSB_BUF0_DWORD * 4;
 /// Byte offset of the CSB write pointer in the status page.
 pub const CSB_WRITE_BYTE: u64 = CSB_WRITE_DWORD * 4;
+
+/// Dword index of the CSB write pointer on Gen9 (i915
+/// `I915_HWS_CSB_WRITE_INDEX`, 0x1f — the Gen11+ 0x2f location
+/// above is `ICL_HWS_CSB_WRITE_INDEX`, selected by
+/// `INTEL_HWS_CSB_WRITE_INDEX` only for graphics 11+;
+/// `intel_engine.h:201-205`).
+pub const GEN9_CSB_WRITE_DWORD: u64 = 0x1F;
+/// Number of CSB entries the Gen9 hardware rotates through
+/// (i915 `GEN8_CSB_ENTRIES` — the write pointer "wraps around
+/// after 5h", `intel_lrc_reg.h:64`).
+pub const GEN9_CSB_ENTRIES: u8 = 6;
+
+/// The CSB depth for `generation`: 6 on Gen9, 12 on Gen11+
+/// (MIT `intel_lrc_reg.h` `GEN8_CSB_ENTRIES` vs
+/// `GEN11_CSB_ENTRIES`; Linux `intel_execlists_submission.c`
+/// picks `GEN8_CSB_ENTRIES` for graphics < 11).
+pub const fn csb_entries(generation: crate::intel_gpu::Generation) -> u8 {
+    match generation {
+        crate::intel_gpu::Generation::Skylake => GEN9_CSB_ENTRIES,
+        _ => CSB_ENTRIES,
+    }
+}
+
+/// The CSB write-pointer dword index for `generation`:
+/// 0x1f on Gen9, 0x2f on Gen11+ (MIT `intel_engine.h`
+/// `I915_HWS_CSB_WRITE_INDEX` vs `ICL_HWS_CSB_WRITE_INDEX`).
+pub const fn csb_write_dword(generation: crate::intel_gpu::Generation) -> u64 {
+    match generation {
+        crate::intel_gpu::Generation::Skylake => GEN9_CSB_WRITE_DWORD,
+        _ => CSB_WRITE_DWORD,
+    }
+}
+
+/// Byte offset of the CSB write pointer in the status page for
+/// `generation`.
+pub const fn csb_write_byte(generation: crate::intel_gpu::Generation) -> u64 {
+    csb_write_dword(generation) * 4
+}
 
 /// One raw Gen12 CSB entry (two dwords as the hardware writes
 /// them into the status page).
@@ -1754,11 +2187,29 @@ pub const RCS_IMAGE_PAGES: u32 = 48;
 /// 11 and 12 alike). The 48-page allocation above bounds it
 /// on both generations; no per-generation bound is needed.
 pub const RENDER_IMAGE_PAGES: u32 = 14;
+
+/// Hardware render context image size in pages for
+/// `generation` (MIT `intel_engine_cs.c`:
+/// `intel_engine_context_size` returns
+/// `GEN9_LR_CONTEXT_RENDER_SIZE` — 22 pages — for graphics 9
+/// and `GEN11_LR_CONTEXT_RENDER_SIZE` — 14 pages — for
+/// graphics 11 and 12). The 48-page allocation above bounds
+/// the 22-page Gen9 image too, so no allocation change is
+/// needed — only the bound the engine reports.
+pub const fn render_image_pages(generation: crate::intel_gpu::Generation) -> u32 {
+    match generation {
+        crate::intel_gpu::Generation::Skylake => 22,
+        _ => RENDER_IMAGE_PAGES,
+    }
+}
 /// Hardware non-render (video decode / enhancement / copy /
 /// other) context image size in pages, shared by every Gen8+
 /// generation (MIT `intel_engine_cs.c`:
-/// `GEN8_LR_CONTEXT_OTHER_SIZE` — 2 pages). The media
-/// allocation bound (`MEDIA_IMAGE_PAGES` = 4) covers it.
+/// `GEN8_LR_CONTEXT_OTHER_SIZE` — 2 pages — returned by the
+/// non-render branch of `intel_engine_context_size` for every
+/// graphics version >= 8, verified for Gen9 in this lane).
+/// The media allocation bound (`MEDIA_IMAGE_PAGES` = 4) covers
+/// it.
 pub const OTHER_IMAGE_PAGES: u32 = 2;
 const _: () = assert!(RCS_IMAGE_PAGES >= RENDER_IMAGE_PAGES);
 /// Maximum simultaneous contexts on the engine.
@@ -1967,8 +2418,9 @@ pub struct ResidentSubmission {
 pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
     spec: EngineSpec,
     /// Generation selecting the context-image template
-    /// ([`build_reg_state_for_generation`]): Gen11 takes its
-    /// own layout, everything else the Gen12-shaped one.
+    /// ([`build_reg_state_for_generation`]): Gen9 takes its
+    /// own layout, Gen11 takes its own layout, everything else
+    /// the Gen12-shaped one.
     generation: crate::intel_gpu::Generation,
     mmio: M,
     alloc: A,
@@ -2006,8 +2458,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     }
 
     /// Bring up the RCS0 engine for the generation
-    /// `generation` (Gen11 takes its own context-image
-    /// template; see [`build_reg_state_for_generation`]).
+    /// `generation` (Gen9/Gen11 take their own context-image
+    /// templates; see [`build_reg_state_for_generation`]).
     pub fn new_for_generation(
         generation: crate::intel_gpu::Generation,
         mmio: M,
@@ -2036,7 +2488,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     ) -> Result<Self, SubmitError> {
         let status = alloc.alloc(1)?;
         mmio.write32(spec.hws_pga(), status.ggtt_offset());
-        let head = ((status.read32(CSB_WRITE_BYTE) & 0xFF) as u8) % CSB_ENTRIES;
+        let head =
+            ((status.read32(csb_write_byte(generation)) & 0xFF) as u8) % csb_entries(generation);
         Ok(Self {
             spec,
             generation,
@@ -2152,7 +2605,12 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         let generation = self.generations[slot];
         let sw_id = self.next_sw_id;
         self.next_sw_id += 1;
-        let descriptor = context_descriptor_for(&self.spec, image.ggtt_offset(), sw_id);
+        let descriptor = context_descriptor_for_generation(
+            &self.spec,
+            image.ggtt_offset(),
+            sw_id,
+            self.generation,
+        );
         self.contexts[slot] = Some(RcsContext {
             slot: slot as u32,
             generation,
@@ -2574,8 +3032,9 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         if self.completion_lost {
             return done;
         }
-        let tail = (self.status.read32(CSB_WRITE_BYTE) & 0xFF) as u8;
-        if tail >= CSB_ENTRIES {
+        let entries = csb_entries(self.generation);
+        let tail = (self.status.read32(csb_write_byte(self.generation)) & 0xFF) as u8;
+        if tail >= entries {
             self.completion_lost = true;
             return done;
         }
@@ -2583,7 +3042,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         fence(Ordering::Acquire);
         let mut head = self.csb_head;
         while head != tail {
-            head = (head + 1) % CSB_ENTRIES;
+            head = (head + 1) % entries;
             let base = CSB_BUF_BYTE + (head as u64) * 8;
             let entry = CsbEntry {
                 lower: self.status.read32(base),
@@ -2919,11 +3378,11 @@ pub fn production_idle() -> bool {
 }
 
 /// Generations whose execlists submission is admitted without any GuC.
-/// GuC submission is optional on Gen11 (Linux: execlists works without
+/// GuC submission is optional on Gen9/Gen11 (Linux: execlists works without
 /// GuC; GuC is required only for HuC auth and GuC submission), and the
 /// Gen12 path here predates the GuC owner the same way. Admission takes
 /// only the generation — no GuC profile, image or owner is consulted —
-/// so a Gen11 part submits on RCS with no GuC loaded; a GuC claim, if
+/// so a Gen9 or Gen11 part submits on RCS with no GuC loaded; a GuC claim, if
 /// one ever exists for the function, still excludes the legacy path
 /// through the ownership registry below.
 pub(crate) const fn legacy_submission_generation(generation: crate::intel_gpu::Generation) -> bool {
@@ -2932,6 +3391,7 @@ pub(crate) const fn legacy_submission_generation(generation: crate::intel_gpu::G
         crate::intel_gpu::Generation::TigerLake
             | crate::intel_gpu::Generation::AlderLake
             | crate::intel_gpu::Generation::IceLake
+            | crate::intel_gpu::Generation::Skylake
     )
 }
 
@@ -3217,6 +3677,11 @@ pub mod tests {
         regs: FakeRegs,
         registry: FakeObjectRegistry,
         status_ggtt: u32,
+        /// Generation selecting the CSB depth and write-pointer
+        /// dword this fake posts (`csb_entries` /
+        /// `csb_write_byte`): Gen9 posts a 6-entry CSB at dword
+        /// 0x1f, Gen11+ a 12-entry CSB at dword 0x2f.
+        generation: crate::intel_gpu::Generation,
         write_ptr: u8,
         consumed_elsp: usize,
         user_batches: BTreeMap<(u64, u64), alloc::sync::Weak<crate::intel_gpu_gem::GemObject>>,
@@ -3224,10 +3689,25 @@ pub mod tests {
 
     impl FakeHw {
         fn new(regs: FakeRegs, registry: FakeObjectRegistry, status_ggtt: u32) -> Self {
+            Self::for_generation(
+                regs,
+                registry,
+                status_ggtt,
+                crate::intel_gpu::Generation::TigerLake,
+            )
+        }
+
+        fn for_generation(
+            regs: FakeRegs,
+            registry: FakeObjectRegistry,
+            status_ggtt: u32,
+            generation: crate::intel_gpu::Generation,
+        ) -> Self {
             Self {
                 regs,
                 registry,
                 status_ggtt,
+                generation,
                 write_ptr: 0,
                 consumed_elsp: 0,
                 user_batches: BTreeMap::new(),
@@ -3388,12 +3868,16 @@ pub mod tests {
         }
 
         fn push_csb(&mut self, entry: CsbEntry) {
-            self.write_ptr = (self.write_ptr + 1) % CSB_ENTRIES;
+            self.write_ptr = (self.write_ptr + 1) % csb_entries(self.generation);
             let status = self.mem(self.status_ggtt);
             let off = CSB_BUF_BYTE + (self.write_ptr as u64) * 8;
             mem_wr(&status, off, entry.lower);
             mem_wr(&status, off + 4, entry.upper);
-            mem_wr(&status, CSB_WRITE_BYTE, self.write_ptr as u32);
+            mem_wr(
+                &status,
+                csb_write_byte(self.generation),
+                self.write_ptr as u32,
+            );
         }
 
         /// Post a CSB entry outside the normal execution flow
@@ -3425,7 +3909,7 @@ pub mod tests {
             Ok(e) => e,
             Err(_) => return Err(TestResult::Fail("engine init")),
         };
-        let hw = FakeHw::new(regs, registry, engine.status_ggtt());
+        let hw = FakeHw::for_generation(regs, registry, engine.status_ggtt(), generation);
         Ok((engine, hw))
     }
 
@@ -4015,6 +4499,336 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen11_context_image_bound);
+
+    fn smoke_gen9_reg_state_rcs() -> TestResult {
+        // MIT intel_lrc.c `gen9_rcs_offsets`: 14-pair first
+        // group (no trailing 0x180), the 9-pair PDP group, the
+        // single-pair R_PWR_CLK_STATE group (LRI(1, 0), 0xc8),
+        // then the 44-register group, terminator at 0xaa. The
+        // LRI headers carry no MI_LRI_LRM_CS_MMIO bit
+        // (`set_offsets` sets it only for graphics 11+), so
+        // every header here is the bare `mi_load_register_imm`
+        // encoding — 0x1100101b, not the Gen11 0x1108101b.
+        let t = build_reg_state_for_generation(
+            &RCS0_SPEC,
+            0x1000_5000,
+            RING_BYTES,
+            crate::intel_gpu::Generation::Skylake,
+        );
+        if t[0] != MI_NOOP || t[CTX_LRI_HEADER_0] != 0x1100_101b {
+            return TestResult::Fail("Gen9 RCS group 0 header");
+        }
+        if t[CTX_CONTEXT_CONTROL] != 0x2244 || t[CTX_CONTEXT_CONTROL + 1] != 0x000F_0008 {
+            return TestResult::Fail("Gen9 RCS context control pair");
+        }
+        if t[CTX_RING_HEAD] != 0x2034
+            || t[CTX_RING_TAIL] != 0x2030
+            || t[CTX_RING_BUFFER_START] != 0x2038
+            || t[CTX_RING_BUFFER_START + 1] != 0x1000_5000
+            || t[CTX_RING_BUFFER_CONTROL] != 0x203c
+            || t[CTX_RING_BUFFER_CONTROL + 1] != ring_ctl_value(RING_BYTES)
+        {
+            return TestResult::Fail("Gen9 RCS ring pairs");
+        }
+        if t[0x12] != 0x211c || t[0x14] != 0x2114 || t[0x16] != 0x2118 {
+            return TestResult::Fail("Gen9 RCS second-level batch pairs");
+        }
+        if t[GEN11_CTX_BB_PER_CTX_PTR] != 0x21c0
+            || t[GEN11_CTX_RCS_INDIRECT_CTX] != 0x21c4
+            || t[GEN11_CTX_RCS_INDIRECT_CTX + 1] != 0
+            || t[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET] != 0x21c8
+            || t[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET + 1] != 0x26 << 6
+        {
+            return TestResult::Fail("Gen9 RCS indirect ctx pairs");
+        }
+        // No trailing 0x180 in the first group: 0x1e is a NOP.
+        if t[0x1e] != 0 {
+            return TestResult::Fail("Gen9 RCS first group tail");
+        }
+        // No 0x1b0 third group: 0x34 is a NOP.
+        if t[0x34] != 0 {
+            return TestResult::Fail("Gen9 RCS must have no 0x1b0 group");
+        }
+        if t[CTX_LRI_HEADER_1] != 0x1100_1011 || t[CTX_CTX_TIMESTAMP] != 0x23a8 {
+            return TestResult::Fail("Gen9 RCS PDP group");
+        }
+        if t[0x41] != 0x1100_0001 || t[0x42] != 0x20c8 || t[0x43] != 0 {
+            return TestResult::Fail("Gen9 RCS R_PWR_CLK_STATE pair");
+        }
+        if t[0x51] != 0x1100_1057 || t[0x52] != 0x2028 || t[0xA8] != 0x2068 {
+            return TestResult::Fail("Gen9 RCS 44-register group");
+        }
+        if t[GEN11_CTX_XCS_END] != MI_BATCH_BUFFER_END | 1 {
+            return TestResult::Fail("Gen9 RCS terminator");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen9_reg_state_rcs);
+
+    fn smoke_gen9_reg_state_xcs() -> TestResult {
+        // MIT intel_lrc.c `gen9_xcs_offsets` — the same table
+        // the Gen11 XCS half already reuses, here without the
+        // Gen11 RELATIVE bit: 14-pair first group, the 0x200
+        // pair at 0x42, the 44-register group at 0x51,
+        // terminator at 0xaa.
+        let t = build_reg_state_for_generation(
+            &crate::intel_gpu_media::VECS0_SPEC,
+            0x1000_5000,
+            RING_BYTES,
+            crate::intel_gpu::Generation::Skylake,
+        );
+        if t[CTX_LRI_HEADER_0] != 0x1100_101b {
+            return TestResult::Fail("Gen9 XCS group 0 header");
+        }
+        if t[CTX_CONTEXT_CONTROL] != 0x1C_8244 || t[CTX_CONTEXT_CONTROL + 1] != 0x000F_0008 {
+            return TestResult::Fail("Gen9 XCS context control pair");
+        }
+        if t[0x1e] != 0 {
+            return TestResult::Fail("Gen9 XCS first group tail");
+        }
+        if t[CTX_LRI_HEADER_1] != 0x1100_1011 || t[CTX_PDP3_UDW] != 0x1C_828C {
+            return TestResult::Fail("Gen9 XCS PDP group");
+        }
+        if t[CTX_XCS_END] != 0 {
+            return TestResult::Fail("Gen9 XCS must not end at 0x34");
+        }
+        if t[0x41] != 0x1100_1001 || t[0x42] != 0x1C_8200 || t[0x43] != 0 {
+            return TestResult::Fail("Gen9 XCS 0x200 pair");
+        }
+        if t[0x51] != 0x1100_1057 || t[0x52] != 0x1C_8028 || t[0xA8] != 0x1C_8068 {
+            return TestResult::Fail("Gen9 XCS 44-register group");
+        }
+        if t.contains(&(R_PWR_CLK_STATE as u32)) {
+            return TestResult::Fail("Gen9 XCS template carries render group");
+        }
+        if t[GEN11_CTX_XCS_END] != MI_BATCH_BUFFER_END | 1 {
+            return TestResult::Fail("Gen9 XCS terminator");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen9_reg_state_xcs);
+
+    fn smoke_gen9_context_image_bound() -> TestResult {
+        // MIT intel_engine_cs.c `intel_engine_context_size`:
+        // Gen9 render images are GEN9_LR_CONTEXT_RENDER_SIZE
+        // (22 pages); Gen11/Gen12 are 14. Non-render images are
+        // GEN8_LR_CONTEXT_OTHER_SIZE (2 pages) on every Gen8+
+        // generation. MIT intel_lrc_reg.h: Gen9 CSB depth is
+        // GEN8_CSB_ENTRIES (6) with the write pointer at dword
+        // 0x1f; Gen11+ is 12 at 0x2f. MIT intel_lrc_reg.h:
+        // Gen9 indirect offset default is 0x26.
+        if render_image_pages(crate::intel_gpu::Generation::Skylake) != 22
+            || RCS_IMAGE_PAGES < render_image_pages(crate::intel_gpu::Generation::Skylake)
+            || render_image_pages(crate::intel_gpu::Generation::IceLake) != 14
+            || render_image_pages(crate::intel_gpu::Generation::TigerLake) != 14
+        {
+            return TestResult::Fail("Gen9 render image bound");
+        }
+        if OTHER_IMAGE_PAGES != 2 {
+            return TestResult::Fail("Gen9 non-render image bound");
+        }
+        if csb_entries(crate::intel_gpu::Generation::Skylake) != 6
+            || csb_entries(crate::intel_gpu::Generation::IceLake) != 12
+            || csb_entries(crate::intel_gpu::Generation::TigerLake) != 12
+        {
+            return TestResult::Fail("Gen9 CSB depth");
+        }
+        if csb_write_dword(crate::intel_gpu::Generation::Skylake) != 0x1f
+            || csb_write_dword(crate::intel_gpu::Generation::IceLake) != 0x2f
+            || csb_write_byte(crate::intel_gpu::Generation::Skylake) != 0x7c
+        {
+            return TestResult::Fail("Gen9 CSB write pointer");
+        }
+        if indirect_ctx_offset_default(crate::intel_gpu::Generation::Skylake) != 0x26 {
+            return TestResult::Fail("Gen9 indirect ctx offset default");
+        }
+        if ctx_control_value(crate::intel_gpu::Generation::Skylake) != 0x000F_0008
+            || ctx_control_value(crate::intel_gpu::Generation::IceLake) != CTX_CONTROL_VALUE
+        {
+            return TestResult::Fail("Gen9 context control value");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen9_context_image_bound);
+
+    fn smoke_gen9_descriptor() -> TestResult {
+        // MIT intel_lrc.c `lrc_descriptor` +
+        // `__execlists_schedule_in`: on Gen9 the upper dword
+        // carries the SW context id at bits 37:47 and nothing
+        // else — no engine instance (bits 48:53) or class (bits
+        // 61:63); those are ORed in only for graphics 11+.
+        let gen9 = crate::intel_gpu::Generation::Skylake;
+        let d = context_descriptor_for_generation(&RCS0_SPEC, 0x1000_0000, 5, gen9);
+        if d & DESC_VALID == 0 {
+            return TestResult::Fail("Gen9 VALID bit clear");
+        }
+        if d & DESC_MODE_LEGACY_64B != DESC_MODE_LEGACY_64B {
+            return TestResult::Fail("Gen9 mode is not Legacy-64B");
+        }
+        if d & DESC_PRIVILEGE == 0 {
+            return TestResult::Fail("Gen9 privilege flag lost");
+        }
+        if descriptor_lrca(d) != 0x1000_0000 {
+            return TestResult::Fail("Gen9 LRCA round-trip");
+        }
+        if descriptor_sw_id(d) != 5 {
+            return TestResult::Fail("Gen9 SW id round-trip");
+        }
+        // Upper dword: exactly the SW id field (bits 37:47).
+        if (d >> 32) != (5u64 << 5) {
+            return TestResult::Fail("Gen9 upper dword carries instance/class bits");
+        }
+        if descriptor_instance(d) != 0 || descriptor_class(d) != 0 {
+            return TestResult::Fail("Gen9 descriptor names an instance/class");
+        }
+        // Contrast: the Gen11+ form packs instance + class.
+        let vcs1 = crate::intel_gpu_media::VCS1_SPEC;
+        let d11 = context_descriptor_for_generation(&vcs1, 0x1000_0000, 7, gen9);
+        // (Gen9 descriptor for a media spec still carries no
+        // instance/class — the generation selects the layout,
+        // not the engine.)
+        if (d11 >> 32) != (7u64 << 5) {
+            return TestResult::Fail("Gen9 media descriptor carries instance/class bits");
+        }
+        let d11 = context_descriptor_for_generation(
+            &vcs1,
+            0x1000_0000,
+            7,
+            crate::intel_gpu::Generation::IceLake,
+        );
+        if (d11 >> 32) != (7u64 << 5) | (1u64 << 16) | (1u64 << 29) {
+            return TestResult::Fail("Gen11 descriptor upper dword");
+        }
+        if descriptor_instance(d11) != 1 || descriptor_class(d11) != 1 {
+            return TestResult::Fail("Gen11 descriptor instance/class round-trip");
+        }
+        // The plain constructor keeps the Gen11+ form.
+        if context_descriptor_for(&vcs1, 0x1000_0000, 7) != d11 {
+            return TestResult::Fail("plain descriptor constructor changed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen9_descriptor);
+
+    fn smoke_gen9_indirectctx_bb() -> TestResult {
+        // MIT intel_lrc.c `gen9_init_indirectctx_bb` wire
+        // vector (non-pooled-EU): MI_ARB_DISABLE, the
+        // coherent-L3 save/load/pipe-control/restore, the
+        // ClearSlm pipe-control, the three-chicken LRI group,
+        // MI_ARB_ENABLE, NOOP padding to the cacheline.
+        let mut batch = [0u32; GEN9_INDIRECT_CTX_BB_DWORDS];
+        let n = gen9_init_indirectctx_bb(&mut batch, false, 0x1234_5000);
+        if n != GEN9_INDIRECT_CTX_BB_DWORDS {
+            return TestResult::Fail("Gen9 WA batch length");
+        }
+        let want: [u32; 33] = [
+            0x0400_0000, // MI_ARB_DISABLE
+            0x1240_0002,
+            0x0000_B118,
+            0x1234_5000,
+            0x0000_0000, // save L3SQCREG4
+            0x1100_0001,
+            0x0000_B118,
+            0x4060_0000, // load flush bit
+            0x7A00_0004,
+            0x0010_0020,
+            0,
+            0,
+            0,
+            0, // pipe-control
+            0x14C0_0002,
+            0x0000_B118,
+            0x1234_5000,
+            0x0000_0000, // restore L3SQCREG4
+            0x7A00_0004,
+            0x0830_4000,
+            0x0000_00D0,
+            0,
+            0,
+            0, // ClearSlm pipe-control
+            0x1100_0005,
+            0x0000_7014,
+            0x1000_0000,
+            0x0000_2088,
+            0x0002_0002,
+            0x0000_2090,
+            0x1000_1000,
+            0x0000_0000, // chicken LRI group + NOOP
+            0x0400_0001, // MI_ARB_ENABLE
+        ];
+        if batch[..33] != want {
+            return TestResult::Fail("Gen9 WA batch wire vector");
+        }
+        if batch[33..].iter().any(|&w| w != MI_NOOP) {
+            return TestResult::Fail("Gen9 WA batch padding");
+        }
+        // Pooled-EU: the media-pool sequence lands between the
+        // chicken group and MI_ARB_ENABLE.
+        let mut pooled = [0u32; GEN9_INDIRECT_CTX_BB_DWORDS];
+        let n = gen9_init_indirectctx_bb(&mut pooled, true, 0x1234_5000);
+        if n != GEN9_INDIRECT_CTX_BB_DWORDS {
+            return TestResult::Fail("Gen9 pooled WA batch length");
+        }
+        if pooled[..32] != batch[..32] {
+            return TestResult::Fail("Gen9 pooled WA batch prefix");
+        }
+        if pooled[32] != GEN9_MEDIA_POOL_STATE
+            || pooled[33] != GEN9_MEDIA_POOL_ENABLE
+            || pooled[34] != 0x0077_7000
+            || pooled[35] != 0
+            || pooled[36] != 0
+            || pooled[37] != 0
+            || pooled[38] != MI_ARB_ENABLE
+        {
+            return TestResult::Fail("Gen9 pooled media-pool sequence");
+        }
+        if pooled[39..].iter().any(|&w| w != MI_NOOP) {
+            return TestResult::Fail("Gen9 pooled WA batch padding");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen9_indirectctx_bb);
+
+    fn smoke_gen9_indirect_ctx_setup() -> TestResult {
+        let mut regs = build_reg_state_for_generation(
+            &RCS0_SPEC,
+            0x1000_5000,
+            RING_BYTES,
+            crate::intel_gpu::Generation::Skylake,
+        );
+        // Three cachelines of WA batch at a GGTT address.
+        setup_gen9_indirect_ctx(&mut regs, 0x2000_0000, 3 * 64);
+        if regs[GEN11_CTX_RCS_INDIRECT_CTX + 1] != 0x2000_0003 {
+            return TestResult::Fail("Gen9 indirect ctx pointer");
+        }
+        if regs[GEN11_CTX_RCS_INDIRECT_CTX_OFFSET + 1] != 0x26 << 6 {
+            return TestResult::Fail("Gen9 indirect ctx offset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen9_indirect_ctx_setup);
+
+    fn smoke_gen9_batch_executes_on_rcs() -> TestResult {
+        let (mut engine, mut hw) =
+            make_engine_for_generation(crate::intel_gpu::Generation::Skylake).unwrap();
+        let ctx = engine.create_context().unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        let request = engine.submit(ctx, batch).unwrap();
+        hw.step();
+        let done = engine.poll_completions();
+        if done.len() != 1 || done[0].request != request || !engine.is_idle() {
+            return TestResult::Fail("Gen9 batch did not execute to completion on RCS");
+        }
+        // SAFETY: the model has completed and no peer runs afterwards.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_gen9_batch_executes_on_rcs
+    );
 
     fn smoke_gen11_batch_executes_on_rcs() -> TestResult {
         let (mut engine, mut hw) =

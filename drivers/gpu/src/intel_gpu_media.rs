@@ -118,6 +118,7 @@
 use alloc::vec::Vec;
 
 use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_forcewake::{FORCEWAKE_ACK_MEDIA_GEN9, FORCEWAKE_MEDIA_GEN9};
 use crate::intel_gpu_rcs::{
     production_arena, BarWindow, CompletedRequest, ContextId, EngineClass, EngineSpec, RcsEngine,
     SharedArena, SubmitError,
@@ -176,6 +177,48 @@ pub const VECS0_SPEC: EngineSpec = EngineSpec {
     image_pages: MEDIA_IMAGE_PAGES,
 };
 
+/// Gen9 VCS0 register block base (i915 `GEN6_BSD_RING_BASE`,
+/// `i915_reg.h`).
+pub const GEN9_VCS0_BASE: u64 = 0x12000;
+/// Gen9 VCS1 register block base (i915 `GEN8_BSD2_RING_BASE`,
+/// `i915_reg.h`).
+pub const GEN9_VCS1_BASE: u64 = 0x1C000;
+/// Gen9 VECS0 register block base (i915 `VEBOX_RING_BASE`,
+/// `i915_reg.h`).
+pub const GEN9_VECS0_BASE: u64 = 0x1A000;
+
+/// Gen9 VCS0: video-decode class, instance 0, at the
+/// pre-Gen11 ring base.
+pub const GEN9_VCS0_SPEC: EngineSpec = EngineSpec {
+    name: "vcs0",
+    class: EngineClass::VideoDecode,
+    instance: 0,
+    base: GEN9_VCS0_BASE,
+    image_pages: MEDIA_IMAGE_PAGES,
+};
+/// Gen9 VCS1: video-decode class, instance 1, at the
+/// pre-Gen11 ring base.
+pub const GEN9_VCS1_SPEC: EngineSpec = EngineSpec {
+    name: "vcs1",
+    class: EngineClass::VideoDecode,
+    instance: 1,
+    base: GEN9_VCS1_BASE,
+    image_pages: MEDIA_IMAGE_PAGES,
+};
+/// Gen9 VECS0: video-enhancement class, instance 0, at the
+/// pre-Gen11 ring base.
+pub const GEN9_VECS0_SPEC: EngineSpec = EngineSpec {
+    name: "vecs0",
+    class: EngineClass::VideoEnhance,
+    instance: 0,
+    base: GEN9_VECS0_BASE,
+    image_pages: MEDIA_IMAGE_PAGES,
+};
+
+/// The media engines of the Gen9 (Skylake / Kaby Lake /
+/// Comet Lake) GT, in instance order.
+pub const GEN9_MEDIA_ENGINES: [EngineSpec; 3] = [GEN9_VCS0_SPEC, GEN9_VCS1_SPEC, GEN9_VECS0_SPEC];
+
 /// The media engines of the Gen12 (Xe-LP) GT, in instance
 /// order.
 pub const GEN12_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS1_SPEC, VECS0_SPEC];
@@ -189,34 +232,37 @@ pub const GEN12_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS1_SPEC, VECS0_SP
 /// graphics-ver-11 BSD3 base).
 pub const GEN11_MEDIA_ENGINES: [EngineSpec; 3] = [VCS0_SPEC, VCS2_SPEC, VECS0_SPEC];
 
-/// The media engines a region generation carries. Gen12 and
-/// Gen11 are served; MTL/LNL/PTL GT support does not exist
-/// in the tree (their media engines sit on a separate media
-/// GT, not modelled), so no other generation can be asked
-/// about — when a second generation lands, its (possibly
-/// different) set goes here, not in a second table
+/// The media engines a region generation carries. Gen12,
+/// Gen11 and Gen9 are served; MTL/LNL/PTL GT support does
+/// not exist in the tree (their media engines sit on a
+/// separate media GT, not modelled), so no other generation
+/// can be asked about — when a second generation lands, its
+/// (possibly different) set goes here, not in a second table
 /// somewhere else.
 ///
 /// Gen11's set is VCS0/VCS2/VECS0 (Linux
 /// `i915_pci.c::icl_info`), not the Gen12 VCS0/VCS1/VECS0
 /// set: claiming the Gen12 table would announce a VCS1 the
-/// part does not have. The per-VDBox forcewake sub-domains
-/// (`MediaFwDomain`) are generic over the instance, so VCS2
-/// takes `VdBox(2)` (request 0xA548, ack 0x0D58) with no new
-/// domain code.
+/// part does not have. Gen9's set is VCS0/VCS1/VECS0 at the
+/// pre-Gen11 ring bases (Linux `i915_pci.c::SKL_GT3_PLUS_
+/// PLATFORM` engine mask `RCS0 | VCS0 | BCS0 | VECS0 | VCS1`)
+/// — the GT3+ mask; GT1/GT2 parts carry VCS0 only, and the
+/// trim is first-silicon work under the media module's
+/// existing per-SKU fusing convention. The per-VDBox
+/// forcewake sub-domains (`MediaFwDomain`) are generic over
+/// the instance, so VCS2 takes `VdBox(2)` (request 0xA548,
+/// ack 0x0D58) with no new domain code; Gen9 media engines
+/// take the aggregate media domain instead
+/// (`MediaFwDomain::Aggregate`).
 pub fn media_engines_for(gen: RegionGeneration) -> &'static [EngineSpec] {
     match gen {
         RegionGeneration::Gen12 => &GEN12_MEDIA_ENGINES,
         // MTL's media engines sit on a separate media GT, not modelled.
         RegionGeneration::XeLpg => &[],
         RegionGeneration::Gen11 => &GEN11_MEDIA_ENGINES,
-        // Gen9 (Lane 1): no media-engine table is admitted yet.
-        // The Gen9 set (VCS0/VCS1/VECS0 on GT3+, Linux
-        // `i915_pci.c::SKL_GT3_PLUS_PLATFORM`) lands with Lane 3
-        // (`GEN9_MEDIA_ENGINES`); claiming the Gen11 or Gen12
-        // table meanwhile would announce an engine the part
-        // does not have.
-        RegionGeneration::Gen9 => &[],
+        // Gen9 (Lane 3): the GT3+ set VCS0/VCS1/VECS0 at the
+        // pre-Gen11 ring bases.
+        RegionGeneration::Gen9 => &GEN9_MEDIA_ENGINES,
         // Lunar Lake (Xe2-LPD) and Panther Lake (Xe3-LPD): their
         // region tables are modelled, but their media engines
         // sit on the same separate media GT as MTL's.
@@ -248,6 +294,22 @@ impl MediaEngineId {
             MediaEngineId::Vcs1 => VCS1_SPEC,
             MediaEngineId::Vcs2 => VCS2_SPEC,
             MediaEngineId::Vecs0 => VECS0_SPEC,
+        }
+    }
+    /// The engine's identity for `generation`, or `None`
+    /// when the generation does not carry the engine. Gen9
+    /// has no VCS2 (its second decode engine is VCS1, at the
+    /// pre-Gen11 base); every other engine takes the Gen9
+    /// spec on Gen9 and the Gen11+ spec elsewhere.
+    pub const fn spec_for(self, generation: crate::intel_gpu::Generation) -> Option<EngineSpec> {
+        match generation {
+            crate::intel_gpu::Generation::Skylake => match self {
+                MediaEngineId::Vcs0 => Some(GEN9_VCS0_SPEC),
+                MediaEngineId::Vcs1 => Some(GEN9_VCS1_SPEC),
+                MediaEngineId::Vcs2 => None,
+                MediaEngineId::Vecs0 => Some(GEN9_VECS0_SPEC),
+            },
+            _ => Some(self.spec()),
         }
     }
 }
@@ -289,6 +351,13 @@ pub enum MediaFwDomain {
     VdBox(u8),
     /// The VEBox domain gating VECS instance `n`'s block.
     VeBox(u8),
+    /// The aggregate media forcewake domain (Gen9 only —
+    /// request `FORCEWAKE_MEDIA_GEN9` 0xA270, ack
+    /// `FORCEWAKE_ACK_MEDIA_GEN9` 0x0D88, Lane 6's
+    /// `GEN9_FW_DOMAINS` table in `intel_gpu_forcewake`).
+    /// Gen9 has no per-VDBox / per-VEBox sub-domains; every
+    /// media engine on a Gen9 part gates on this one domain.
+    Aggregate,
 }
 
 impl MediaFwDomain {
@@ -301,11 +370,30 @@ impl MediaFwDomain {
             _ => None,
         }
     }
+    /// The domain gating `spec`'s register block for
+    /// `generation`: the aggregate media domain on Gen9,
+    /// the per-engine sub-domain elsewhere. `of` is kept
+    /// unchanged for the Gen11+ callers.
+    pub fn of_generation(
+        spec: &EngineSpec,
+        generation: crate::intel_gpu::Generation,
+    ) -> Option<MediaFwDomain> {
+        match generation {
+            crate::intel_gpu::Generation::Skylake => match spec.class {
+                EngineClass::VideoDecode | EngineClass::VideoEnhance => {
+                    Some(MediaFwDomain::Aggregate)
+                }
+                _ => None,
+            },
+            _ => Self::of(spec),
+        }
+    }
     /// The domain's request register.
     pub const fn set_reg(self) -> u64 {
         match self {
             MediaFwDomain::VdBox(n) => FORCEWAKE_MEDIA_VDBOX_BASE + 4 * (n as u64),
             MediaFwDomain::VeBox(n) => FORCEWAKE_MEDIA_VEBOX_BASE + 4 * (n as u64),
+            MediaFwDomain::Aggregate => FORCEWAKE_MEDIA_GEN9,
         }
     }
     /// The domain's ack register.
@@ -313,16 +401,19 @@ impl MediaFwDomain {
         match self {
             MediaFwDomain::VdBox(n) => FORCEWAKE_ACK_MEDIA_VDBOX_BASE + 4 * (n as u64),
             MediaFwDomain::VeBox(n) => FORCEWAKE_ACK_MEDIA_VEBOX_BASE + 4 * (n as u64),
+            MediaFwDomain::Aggregate => FORCEWAKE_ACK_MEDIA_GEN9,
         }
     }
     /// Slot in the manager's refcount table. Slots 0..2 are
-    /// VDBox instances, 2..4 VEBox instances — the manager's
-    /// table is sized for the Gen11 sub-domain space this
-    /// driver can name, not just the three Gen12 engines.
+    /// VDBox instances, 2..4 VEBox instances, slot 4 the Gen9
+    /// aggregate media domain — the manager's table is sized
+    /// for the Gen11 sub-domain space this driver can name,
+    /// not just the three Gen12 engines.
     const fn slot(self) -> usize {
         match self {
             MediaFwDomain::VdBox(n) => n as usize,
             MediaFwDomain::VeBox(n) => 2 + n as usize,
+            MediaFwDomain::Aggregate => 4,
         }
     }
 }
@@ -359,7 +450,7 @@ pub enum MediaFwError {
 /// same seam the aggregate-domain manager uses.
 #[derive(Debug)]
 pub struct MediaForcewake {
-    counts: [u32; 4],
+    counts: [u32; 5],
 }
 
 impl Default for MediaForcewake {
@@ -371,7 +462,7 @@ impl Default for MediaForcewake {
 impl MediaForcewake {
     /// A manager with no holds.
     pub const fn new() -> Self {
-        Self { counts: [0; 4] }
+        Self { counts: [0; 5] }
     }
 
     /// Current hold count on `domain`.
@@ -464,17 +555,18 @@ impl MediaForcewake {
             MediaFwDomain::VdBox(1),
             MediaFwDomain::VeBox(0),
             MediaFwDomain::VeBox(1),
+            MediaFwDomain::Aggregate,
         ] {
             mmio.write32(domain.set_reg(), fw_masked_disable(0xFFFF));
         }
-        self.counts = [0; 4];
+        self.counts = [0; 5];
     }
 }
 
 // ── Production glue ─────────────────────────────────────────────
 //
 // Mirrors the RCS glue in `intel_gpu_rcs`: the media engines
-// attach lazily to the probed Gen12 controller, each with a
+// attach lazily to the probed controller, each with a
 // default context, the first time a submission is asked for.
 // All engines on the controller — RCS included — allocate
 // from the one production arena
@@ -507,6 +599,11 @@ type MediaProductionEngine = RcsEngine<BarWindow, SharedArena>;
 struct MediaState {
     window: BarWindow,
     fw: MediaForcewake,
+    /// Generation selecting the per-engine context-image
+    /// template and forcewake domain: Gen9 engines take the
+    /// Gen9 template and the aggregate media domain, Gen11+
+    /// the Gen11/Gen12 template and per-engine sub-domains.
+    generation: crate::intel_gpu::Generation,
     engines: Vec<(EngineSpec, MediaProductionEngine, Option<ContextId>)>,
 }
 
@@ -519,6 +616,7 @@ fn attach_media(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result<(
             return None;
         }
         let rg = gpu.chip_info().generation.region_generation()?;
+        let generation = gpu.chip_info().generation;
         let specs = media_engines_for(rg);
         if specs.is_empty() {
             return None;
@@ -529,16 +627,27 @@ fn attach_media(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result<(
         let mut engines = Vec::new();
         for spec in specs {
             // Engine bring-up programs MMIO (RING_HWS_PGA), so
-            // it runs inside the engine's sub-domain hold.
-            let domain = MediaFwDomain::of(spec)?;
+            // it runs inside the engine's forcewake hold.
+            // Threading the generation through
+            // `with_spec_for_generation` also corrects the
+            // Gen11 media engines: they previously took the
+            // Gen12 template (`with_spec`'s TigerLake
+            // default) instead of the Gen11 one.
+            let domain = MediaFwDomain::of_generation(spec, generation)?;
             fw.acquire(&window, domain).ok()?;
-            let eng = RcsEngine::with_spec(*spec, BarWindow::new(gpu.gtt_mmadr), arena.clone());
+            let eng = RcsEngine::with_spec_for_generation(
+                *spec,
+                generation,
+                BarWindow::new(gpu.gtt_mmadr),
+                arena.clone(),
+            );
             let _ = fw.release(&window, domain);
             engines.push((*spec, eng.ok()?, None));
         }
         Some(MediaState {
             window,
             fw,
+            generation,
             engines,
         })
     })
@@ -549,7 +658,7 @@ fn attach_media(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result<(
 }
 
 /// Submit raw batch dwords on the default context of a media
-/// engine of the probed Gen12 controller, attaching the media
+/// engine of the probed controller, attaching the media
 /// engines on first use. Returns the engine-wide request id;
 /// completion is observed through [`poll_media_completions`].
 /// A pending, failed or stopped GuC owner still excludes this legacy path.
@@ -560,7 +669,9 @@ fn attach_media(lease: &crate::intel_gpu_gt::ownership::LegacyLease) -> Result<(
 /// manager (#1013 / PR #1112) lands, its MEDIA domain hold is
 /// acquired immediately before the sub-domain hold here and
 /// released immediately after — the sub-domain hold nests
-/// inside the aggregate media well, as in i915.
+/// inside the aggregate media well, as in i915. On Gen9 the
+/// "sub-domain hold" is the aggregate media domain itself
+/// (`MediaFwDomain::Aggregate`).
 pub fn submit_media_dwords(engine: MediaEngineId, dwords: &[u32]) -> Result<u64, MediaError> {
     let lease = crate::intel_gpu_rcs::legacy_submission_lease()?;
     let mut guard = MEDIA_STATE.lock();
@@ -573,8 +684,11 @@ pub fn submit_media_dwords(engine: MediaEngineId, dwords: &[u32]) -> Result<u64,
     if !state.window.matches_legacy(&lease) {
         return Err(SubmitError::NoEngine.into());
     }
-    let spec = engine.spec();
-    let domain = MediaFwDomain::of(&spec).ok_or(SubmitError::NoEngine)?;
+    let spec = engine
+        .spec_for(state.generation)
+        .ok_or(SubmitError::NoEngine)?;
+    let domain =
+        MediaFwDomain::of_generation(&spec, state.generation).ok_or(SubmitError::NoEngine)?;
     let idx = state
         .engines
         .iter()
@@ -605,7 +719,9 @@ pub fn poll_media_completions(engine: MediaEngineId) -> Vec<CompletedRequest> {
     let mut guard = MEDIA_STATE.lock();
     match guard.as_mut() {
         Some(state) => {
-            let spec = engine.spec();
+            let Some(spec) = engine.spec_for(state.generation) else {
+                return Vec::new();
+            };
             match state.engines.iter_mut().find(|(s, _, _)| *s == spec) {
                 Some((_, eng, _)) => eng.poll_completions(),
                 None => Vec::new(),
@@ -634,10 +750,11 @@ pub mod tests {
     use core::cell::RefCell;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    use crate::intel_gpu_forcewake::{FORCEWAKE_ACK_MEDIA, FORCEWAKE_MEDIA};
     use crate::intel_gpu_rcs::{
         build_reg_state, build_reg_state_for, context_descriptor, context_descriptor_for,
-        descriptor_class, descriptor_instance, descriptor_lrca, descriptor_sw_id, GpuAllocator,
-        GpuBacking, BB_START_ASI_PPGTT, CSB_BUF_BYTE, CSB_ENTRIES, CSB_WRITE_BYTE,
+        csb_entries, csb_write_byte, descriptor_class, descriptor_instance, descriptor_lrca,
+        descriptor_sw_id, GpuAllocator, GpuBacking, BB_START_ASI_PPGTT, CSB_BUF_BYTE,
         CTX_CONTEXT_CONTROL, CTX_LRI_HEADER_0, CTX_LRI_HEADER_2, CTX_PDP3_UDW,
         CTX_RING_BUFFER_START, CTX_R_PWR_CLK_STATE, GGTT_ARENA_BASE, GGTT_ARENA_PAGES, IDLE_SW_ID,
         MI_BATCH_BUFFER_END, RCS0_SPEC, REG_STATE_PAGE_BYTE, RING_BYTES,
@@ -655,9 +772,12 @@ pub mod tests {
     }
 
     /// The ack register a forcewake *request* register drives,
-    /// per the Gen11 sub-domain register layout.
+    /// per the Gen11 sub-domain register layout — plus the
+    /// Gen9 aggregate media domain (0xA270 → 0x0D88).
     fn fw_ack_for_set(off: u64) -> Option<u64> {
-        if (FORCEWAKE_MEDIA_VDBOX_BASE..FORCEWAKE_MEDIA_VDBOX_BASE + 8).contains(&off)
+        if off == FORCEWAKE_MEDIA {
+            Some(FORCEWAKE_ACK_MEDIA)
+        } else if (FORCEWAKE_MEDIA_VDBOX_BASE..FORCEWAKE_MEDIA_VDBOX_BASE + 8).contains(&off)
             && (off - FORCEWAKE_MEDIA_VDBOX_BASE) % 4 == 0
         {
             Some(FORCEWAKE_ACK_MEDIA_VDBOX_BASE + (off - FORCEWAKE_MEDIA_VDBOX_BASE))
@@ -861,6 +981,10 @@ pub mod tests {
         registry: FakeObjectRegistry,
         status_ggtt: u32,
         elsp_off: u64,
+        /// Generation selecting the CSB depth and write-pointer
+        /// dword this fake posts: Gen9 posts a 6-entry CSB at
+        /// dword 0x1f, Gen11+ a 12-entry CSB at dword 0x2f.
+        generation: crate::intel_gpu::Generation,
         write_ptr: u8,
         consumed_elsp: usize,
         /// A wedged engine: its ELSP bursts are never consumed
@@ -871,17 +995,19 @@ pub mod tests {
     }
 
     impl FakeHw {
-        fn new(
+        fn for_generation(
             regs: FakeRegs,
             registry: FakeObjectRegistry,
             status_ggtt: u32,
             elsp_off: u64,
+            generation: crate::intel_gpu::Generation,
         ) -> Self {
             Self {
                 regs,
                 registry,
                 status_ggtt,
                 elsp_off,
+                generation,
                 write_ptr: 0,
                 consumed_elsp: 0,
                 stuck: false,
@@ -1027,12 +1153,16 @@ pub mod tests {
         }
 
         fn push_csb(&mut self, entry: crate::intel_gpu_rcs::CsbEntry) {
-            self.write_ptr = (self.write_ptr + 1) % CSB_ENTRIES;
+            self.write_ptr = (self.write_ptr + 1) % csb_entries(self.generation);
             let status = self.mem(self.status_ggtt);
             let off = CSB_BUF_BYTE + (self.write_ptr as u64) * 8;
             mem_wr(&status, off, entry.lower);
             mem_wr(&status, off + 4, entry.upper);
-            mem_wr(&status, CSB_WRITE_BYTE, self.write_ptr as u32);
+            mem_wr(
+                &status,
+                csb_write_byte(self.generation),
+                self.write_ptr as u32,
+            );
         }
     }
 
@@ -1058,15 +1188,29 @@ pub mod tests {
             &self,
             spec: EngineSpec,
         ) -> Result<(RcsEngine<FakeRegs, SharedFakeArena>, FakeHw), TestResult> {
-            let eng = match RcsEngine::with_spec(spec, self.regs.clone(), self.arena.clone()) {
+            self.engine_for_generation(spec, crate::intel_gpu::Generation::TigerLake)
+        }
+
+        fn engine_for_generation(
+            &self,
+            spec: EngineSpec,
+            generation: crate::intel_gpu::Generation,
+        ) -> Result<(RcsEngine<FakeRegs, SharedFakeArena>, FakeHw), TestResult> {
+            let eng = match RcsEngine::with_spec_for_generation(
+                spec,
+                generation,
+                self.regs.clone(),
+                self.arena.clone(),
+            ) {
                 Ok(e) => e,
                 Err(_) => return Err(TestResult::Fail("engine init")),
             };
-            let hw = FakeHw::new(
+            let hw = FakeHw::for_generation(
                 self.regs.clone(),
                 self.registry.clone(),
                 eng.status_ggtt(),
                 spec.elsp(),
+                generation,
             );
             Ok((eng, hw))
         }
@@ -1154,6 +1298,69 @@ pub mod tests {
             || MediaFwDomain::VeBox(0).ack_reg() != 0x0D70
         {
             return TestResult::Fail("forcewake register formulas");
+        }
+        // Gen9 serves the GT3+ set VCS0/VCS1/VECS0 at the
+        // pre-Gen11 ring bases (Linux `i915_pci.c`
+        // `SKL_GT3_PLUS_PLATFORM`), never the Gen11
+        // VCS0/VCS2/VECS0 set — and never VCS2, which Gen9
+        // does not carry.
+        let gen9 = media_engines_for(RegionGeneration::Gen9);
+        if gen9.len() != 3
+            || gen9[0] != GEN9_VCS0_SPEC
+            || gen9[1] != GEN9_VCS1_SPEC
+            || gen9[2] != GEN9_VECS0_SPEC
+        {
+            return TestResult::Fail("Gen9 media set must be VCS0/VCS1/VECS0");
+        }
+        if GEN9_VCS0_SPEC.base != 0x12000
+            || GEN9_VCS1_SPEC.base != 0x1C000
+            || GEN9_VECS0_SPEC.base != 0x1A000
+        {
+            return TestResult::Fail("Gen9 media ring bases");
+        }
+        if GEN9_VCS0_SPEC.class != EngineClass::VideoDecode
+            || GEN9_VCS1_SPEC.class != EngineClass::VideoDecode
+            || GEN9_VECS0_SPEC.class != EngineClass::VideoEnhance
+            || GEN9_VCS0_SPEC.instance != 0
+            || GEN9_VCS1_SPEC.instance != 1
+            || GEN9_VECS0_SPEC.instance != 0
+        {
+            return TestResult::Fail("Gen9 media engine classes/instances");
+        }
+        if GEN9_VCS0_SPEC.elsp() != 0x12230
+            || GEN9_VCS1_SPEC.elsp() != 0x1C230
+            || GEN9_VECS0_SPEC.hws_pga() != 0x1A080
+        {
+            return TestResult::Fail("Gen9 derived engine registers");
+        }
+        if MediaEngineId::Vcs2
+            .spec_for(crate::intel_gpu::Generation::Skylake)
+            .is_some()
+            || MediaEngineId::Vcs1.spec_for(crate::intel_gpu::Generation::Skylake)
+                != Some(GEN9_VCS1_SPEC)
+            || MediaEngineId::Vcs0.spec_for(crate::intel_gpu::Generation::Skylake)
+                != Some(GEN9_VCS0_SPEC)
+            || MediaEngineId::Vecs0.spec_for(crate::intel_gpu::Generation::Skylake)
+                != Some(GEN9_VECS0_SPEC)
+            || MediaEngineId::Vcs1.spec_for(crate::intel_gpu::Generation::TigerLake)
+                != Some(VCS1_SPEC)
+        {
+            return TestResult::Fail("Gen9 spec_for mapping");
+        }
+        // Gen9 media engines gate on the aggregate media
+        // domain, not the per-engine sub-domains; `of`
+        // (Gen11+) is unchanged by the addition.
+        let gen9_gen = crate::intel_gpu::Generation::Skylake;
+        if MediaFwDomain::of_generation(&GEN9_VCS0_SPEC, gen9_gen) != Some(MediaFwDomain::Aggregate)
+            || MediaFwDomain::of_generation(&GEN9_VECS0_SPEC, gen9_gen)
+                != Some(MediaFwDomain::Aggregate)
+            || MediaFwDomain::of_generation(&RCS0_SPEC, gen9_gen).is_some()
+            || MediaFwDomain::of_generation(&VCS0_SPEC, crate::intel_gpu::Generation::TigerLake)
+                != Some(MediaFwDomain::VdBox(0))
+            || MediaFwDomain::Aggregate.set_reg() != FORCEWAKE_MEDIA_GEN9
+            || MediaFwDomain::Aggregate.ack_reg() != FORCEWAKE_ACK_MEDIA_GEN9
+        {
+            return TestResult::Fail("Gen9 aggregate forcewake domain mapping");
         }
         TestResult::Pass
     }
@@ -1393,6 +1600,122 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_media",
         smoke_media_submit_vcs0_write_for_write
+    );
+
+    fn smoke_gen9_media_submit_vcs0_write_for_write() -> TestResult {
+        let rig = Rig::new();
+        let gen9 = crate::intel_gpu::Generation::Skylake;
+        let (mut eng, mut hw) = match rig.engine_for_generation(GEN9_VCS0_SPEC, gen9) {
+            Ok(p) => p,
+            Err(f) => return f,
+        };
+        // Bring-up programmed this engine's HWS_PGA (0x12080)
+        // and nothing else's.
+        if rig.regs.writes_to(0x12080) != [eng.status_ggtt()]
+            || !rig.regs.writes_to(0x2000 + 0x80).is_empty()
+        {
+            return TestResult::Fail("Gen9 HWS_PGA conversation");
+        }
+        let ctx = match eng.create_context() {
+            Ok(c) => c,
+            Err(_) => return TestResult::Fail("Gen9 create context"),
+        };
+        let batch = match eng.write_batch(&[0, MI_BATCH_BUFFER_END]) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("Gen9 write batch"),
+        };
+        let batch_ggtt = batch.ggtt_offset();
+        // The aggregate media forcewake hold wraps the
+        // submission: acquire at 0xA270 before the doorbell,
+        // release after it.
+        let mut fw = MediaForcewake::new();
+        if fw.acquire(&rig.regs, MediaFwDomain::Aggregate).is_err() {
+            return TestResult::Fail("Gen9 aggregate acquire");
+        }
+        if rig.regs.writes_to(0xA270) != [0x0001_0001]
+            || rig.regs.read32(0x0D88) & FORCEWAKE_KERNEL == 0
+        {
+            return TestResult::Fail("Gen9 aggregate hold / ack");
+        }
+        if eng.submit(ctx, batch).is_err() {
+            return TestResult::Fail("Gen9 submit");
+        }
+        if fw.release(&rig.regs, MediaFwDomain::Aggregate).is_err() {
+            return TestResult::Fail("Gen9 aggregate release");
+        }
+        let enable_at = rig.regs.write_index(0xA270, 0x0001_0001);
+        let elsp_at = rig
+            .regs
+            .writes
+            .borrow()
+            .iter()
+            .position(|(o, _)| *o == 0x12230);
+        let clear_at = rig.regs.write_index(0xA270, 0x0001_0000);
+        match (enable_at, elsp_at, clear_at) {
+            (Some(e), Some(d), Some(c)) if e < d && d < c => {}
+            _ => return TestResult::Fail("Gen9 hold does not wrap the doorbell"),
+        }
+        // The doorbell burst at Gen9 VCS0's ELSP (0x12230),
+        // in hardware order, and no other engine's ELSP was
+        // touched.
+        let elsp = rig.regs.writes_to(0x12230);
+        if elsp.len() != 4 || elsp[0] != 0 || elsp[1] != 0 {
+            return TestResult::Fail("Gen9 ELSP burst shape");
+        }
+        let desc = ((elsp[2] as u64) << 32) | elsp[3] as u64;
+        // The Gen9 descriptor carries no class/instance
+        // fields — the upper dword is the SW id alone.
+        if descriptor_class(desc) != 0
+            || descriptor_instance(desc) != 0
+            || descriptor_sw_id(desc) != 1
+        {
+            return TestResult::Fail("Gen9 ELSP descriptor fields");
+        }
+        // Arena order is deterministic: status, image, ring,
+        // hwsp, batch.
+        if eng.status_ggtt() != GGTT_ARENA_BASE || descriptor_lrca(desc) != GGTT_ARENA_BASE + 0x1000
+        {
+            return TestResult::Fail("Gen9 context placement");
+        }
+        if !rig.regs.writes_to(0x1C230).is_empty() || !rig.regs.writes_to(0x1A230).is_empty() {
+            return TestResult::Fail("another Gen9 engine's ELSP was rung");
+        }
+        // The image carries Gen9 VCS0's own register
+        // addresses, the Gen9 context-control value (0xF0008)
+        // and the ring placement.
+        let image = rig
+            .registry
+            .borrow()
+            .get(&descriptor_lrca(desc))
+            .expect("image in registry")
+            .clone();
+        let rs = REG_STATE_PAGE_BYTE;
+        if mem_rd(&image, rs + (CTX_RING_BUFFER_START as u64) * 4) != 0x12038
+            || mem_rd(&image, rs + ((CTX_RING_BUFFER_START + 1) as u64) * 4)
+                != GGTT_ARENA_BASE + 0x5000
+            || mem_rd(&image, rs + ((CTX_CONTEXT_CONTROL + 1) as u64) * 4) != 0x000F_0008
+        {
+            return TestResult::Fail("Gen9 image template addresses");
+        }
+        // Hardware runs it; the completion retires with the
+        // breadcrumb in the context's own status page, through
+        // the 6-entry Gen9 CSB.
+        hw.step();
+        if hw.bb_starts() != [(batch_ggtt, false)] {
+            return TestResult::Fail("Gen9 batch start conversation");
+        }
+        let done = eng.poll_completions();
+        if done.len() != 1 || done[0].ctx != ctx || done[0].seqno != 1 || done[0].request != 1 {
+            return TestResult::Fail("Gen9 completion");
+        }
+        if eng.hw_seqno(ctx) != Ok(1) {
+            return TestResult::Fail("Gen9 breadcrumb");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_media",
+        smoke_gen9_media_submit_vcs0_write_for_write
     );
 
     fn smoke_media_engines_do_not_alias() -> TestResult {
