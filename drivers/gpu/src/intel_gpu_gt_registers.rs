@@ -14,6 +14,8 @@ use crate::{
 use alloc::vec::Vec;
 use core::task::Poll;
 
+const MISCCPCTL: u64 = 0x9424;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegisterError {
     Identity,
@@ -203,6 +205,45 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt_registers",
         smoke_global_register_dg2_subplatform_vectors
+    );
+
+    fn smoke_firmware_locked_misccpctl() -> TestResult {
+        use crate::intel_gpu::Generation;
+        use crate::intel_gpu_gt::Gen12Platform;
+
+        let adlp = GtPlatform::Gen12(Gen12Platform::AlderLakeP);
+        for (platform, device) in [(adlp, 0x46b3), (GtPlatform::Alchemist, 0x56a0)] {
+            let (w, init) = fixture(platform, device, 0, 0, false, 1);
+            w.regs.borrow_mut().insert(0x9424, 0xabcd_0002);
+            w.reject.set(0x9424);
+            assert!(matches!(init.poll(&w, 11), Poll::Ready(Ok(_))));
+            assert!(w.writes.borrow().contains(&(0x9424, 0xabcd_0000)));
+            assert_eq!(w.read32(0x9424), 0xabcd_0002);
+        }
+
+        // The RMW still needs a readable value to preserve unrelated bits.
+        let (w, init) = fixture(adlp, 0x46b3, 0, 0, false, 1);
+        w.unavailable.set(0x9424);
+        assert_eq!(
+            init.poll(&w, 11),
+            Poll::Ready(Err(RegisterError::Unavailable))
+        );
+        assert!(!w.writes.borrow().iter().any(|&(reg, _)| reg == 0x9424));
+
+        // Meteor Lake A0 uses the same register with a verified workaround.
+        let mtl = GtPlatform::Integrated(Generation::MeteorLake);
+        let (w, init) = fixture(mtl, 0x7d55, 70, 0, false, 1);
+        w.regs.borrow_mut().insert(0x9424, 2);
+        w.reject.set(0x9424);
+        assert_eq!(
+            init.poll(&w, 11),
+            Poll::Ready(Err(RegisterError::Verify(0x9424)))
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt_registers",
+        smoke_firmware_locked_misccpctl
     );
 
     fn smoke_global_register_dg1_platform_workarounds_are_exact() -> TestResult {
@@ -946,7 +987,9 @@ impl RegisterInit {
                 clear,
                 set,
                 masked,
-                verify: true,
+                // i915 Wa_14015795083: Gen12 and DG2 firmware can lock
+                // MISCCPCTL. Still attempt the RMW, but a locked bit is valid.
+                verify: reg != MISCCPCTL || !(self.platform.is_gen12() || self.platform.is_dg2()),
                 target,
             })
         };
@@ -974,7 +1017,7 @@ impl RegisterInit {
                     );
                 }
                 add(0x9550, 0x200, 0x200, false, Dss); // 14011059788
-                add(0x9424, 2, 0, false, Direct); // 14015795083
+                add(MISCCPCTL, 2, 0, false, Direct); // 14015795083
                 add(0xb004, 0x80, 0, false, Direct); // L3 hashing tuning
                 add(0x20a0, 0x80000, 0x80000, false, Direct);
                 add(0xe4f4, 0x4100, 0x4100, true, Dss);
@@ -999,7 +1042,7 @@ impl RegisterInit {
             // Adding nothing is safer than reusing Gen12 entries.
             GtPlatform::Gen11(_) => {}
             GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
-                add(0x9424, 2, 0, false, Direct); // 14015795083
+                add(MISCCPCTL, 2, 0, false, Direct); // 14015795083
                 if crate::intel_gpu_gt::is_dg2_g10(self.device) {
                     add(0x9434, 0x20000, 0x20000, false, Direct); // 22010523718 G10
                     add(0x9524, 0x10000000, 0x10000000, false, Dss); // 14011006942 G10
@@ -1125,7 +1168,7 @@ impl RegisterInit {
             }
             GtPlatform::Integrated(_) => {
                 if self.seed.graphics <= 1271 && self.seed.step < 4 {
-                    add(0x9424, 2, 0, false, Direct); // 14015795083 before B0
+                    add(MISCCPCTL, 2, 0, false, Direct); // 14015795083 before B0
                 }
                 add(0xcf30, 8, 8, false, Instance0); // 14018575942
                 add(0x8718, 0x800000, 0x800000, false, Instance0); // 22016670082
