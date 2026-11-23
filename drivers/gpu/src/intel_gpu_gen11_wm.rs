@@ -184,8 +184,10 @@ pub fn adjust_latencies(raw: &[u16; 8], has_16gb_dimms: bool) -> [u16; NUM_WM_LE
 
 // ── Watermark computation ────────────────────────────────────
 
-/// One computed watermark level. A disabled level is all-zero
-/// and encodes to a zero PLANE_WM word.
+/// One computed watermark level. A disabled level encodes to
+/// a zero PLANE_WM word; validation only clears `enable` and
+/// preserves the other fields (notably the per-level SAGV
+/// admission flag — see [`apply_sagv_admission`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WmLevel {
     pub enable: bool,
@@ -390,10 +392,15 @@ pub fn compute_plane_watermarks(
 }
 
 /// `skl_check_wm_level`: a level whose minimum DDB allocation
-/// exceeds the plane's allocation is disabled outright.
+/// exceeds the plane's allocation is disabled — only `enable`
+/// is cleared. The other fields are preserved: the per-level
+/// SAGV admission flag (`can_sagv`) is independent of
+/// enablement (Linux annotates it while computing the level,
+/// before validation), and a disabled level still encodes to
+/// a zero PLANE_WM word via [`encode_wm_level`].
 fn check_level(level: &mut WmLevel, ddb_size: u16) {
     if level.min_ddb_alloc > ddb_size {
-        *level = WmLevel::default();
+        level.enable = false;
     }
 }
 
