@@ -141,7 +141,18 @@ pub fn load_from_bytes<M: MmioWindow + ?Sized>(
     mmio: &M,
     bytes: &[u8],
 ) -> Result<(u32, u8), Gen11DmcLoadError> {
-    let fw = parse_dmc_firmware_gen11(bytes, b'*', b'*').map_err(Gen11DmcLoadError::Parse)?;
+    let fw = parse_dmc_firmware_gen11(bytes, b'*', b'*').map_err(|error| match error {
+        // `parse_for` reports a main-less container as
+        // `NoMainProgram`; surface it as the load error of the
+        // same name instead of burying it under `Parse` —
+        // otherwise the `has_main()` gate below is unreachable
+        // (a successful parse always carries a main program)
+        // and callers cannot tell "no main program" from a
+        // malformed container. All other parse refusals stay
+        // `Parse`.
+        DmcError::NoMainProgram => Gen11DmcLoadError::NoMainProgram,
+        error => Gen11DmcLoadError::Parse(error),
+    })?;
     if !fw.has_main() {
         return Err(Gen11DmcLoadError::NoMainProgram);
     }
