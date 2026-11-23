@@ -137,6 +137,60 @@ jobs:
       - name: Package, install, verify, and remove an isolated UEFI payload
         run: packaging/test-packaging.sh
 
+  # ── Dual-build wifi crates as loadable .ko modules ──────────────
+  # The eight wifi family crates (ath9k, ath10k, ath11k, iwlwifi, mt76,
+  # brcm, rtw, rtl) are dual-build: `builtin` (default) links them into
+  # the kernel, `module` builds them as a loadable `.ko` against the
+  # KABI (see `cargo xtask build-module`). The rtw88-USB `.ko` already
+  # carries a real datapath (PRs #2327/#2337/#2338) and every other
+  # family crate builds a registration-only `.ko` — but no CI job ever
+  # built any of them, so a break in the module configuration (a
+  # `builtin`-only dep leaking into `module`, a missing `narf_driver!`
+  # entry) would ship silently until a human built one locally. This job
+  # builds all eight `.ko` outputs on both kernel arches and fails if
+  # any build — or the `nm -u` KSYMTAB gate inside `build-module` — fails.
+  #
+  # Ungated (like `fmt` / `packaging`): gating on the affected plan
+  # would need a new `cargo xtask affected` output, which is a follow-up,
+  # not part of this config-only change. The job builds `.ko` outputs
+  # only; it uploads no artifacts.
+  build-module:
+    name: build-module / wifi .ko / ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
+
+      # One `build-module` per family crate: `--no-default-features
+      # --features module` drops the `builtin` kernel-crate deps so the
+      # `.ko` links against KSYMTAB only. The loop fails on the first
+      # error, and the step log names the crate that broke.
+      - name: Build wifi family crates as .ko
+        run: |
+          set -euo pipefail
+          for pkg in \
+            narf-drivers-wireless-ath9k \
+            narf-drivers-wireless-ath10k \
+            narf-drivers-wireless-ath11k \
+            narf-drivers-wireless-iwlwifi \
+            narf-drivers-wireless-mt76 \
+            narf-drivers-wireless-brcm \
+            narf-drivers-wireless-rtw \
+            narf-drivers-wireless-rtl; do
+            echo "=== build-module $pkg (${{ matrix.arch }}) ==="
+            cargo xtask build-module --arch=${{ matrix.arch }} \
+              --package "$pkg" --no-default-features --features module
+          done
+
   clippy-kernel:
     name: clippy-kernel / ${{ matrix.arch }}
     needs: changes
