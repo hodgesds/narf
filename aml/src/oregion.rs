@@ -1032,11 +1032,11 @@ fn read_unit(
             Ok(unsafe { io_in(port as u16, width) })
         }
         RegionSpace::PciConfig => match resolve_pci_config_addr(region) {
-            // SAFETY: ECAM identity-mapped at boot.
             Some(addr) => {
                 let addr = addr
                     .checked_add(byte_offset_in_region)
                     .ok_or(FieldAccessError::Unsupported)?;
+                // SAFETY: ECAM identity-mapped at boot.
                 Ok(unsafe { mmio_read(addr, width) })
             }
             None => Err(FieldAccessError::Unsupported),
@@ -1142,6 +1142,7 @@ fn write_unit(
                 let addr = addr
                     .checked_add(byte_offset_in_region)
                     .ok_or(FieldAccessError::Unsupported)?;
+                // SAFETY: ECAM identity-mapped at boot; `addr` is the resolved config field address.
                 unsafe {
                     mmio_write(addr, width, val);
                 }

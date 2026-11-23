@@ -673,12 +673,12 @@ pub mod tests {
                 o if o == LCPLL2_CTL => self.ctl.borrow()[1],
                 o if o == WRPLL_CTL_0 => self.ctl.borrow()[2],
                 o if o == WRPLL_CTL_1 => self.ctl.borrow()[3],
-                o if o == 0x6C040 => self.cfgcr1.borrow()[0],
-                o if o == 0x6C048 => self.cfgcr1.borrow()[1],
-                o if o == 0x6C050 => self.cfgcr1.borrow()[2],
-                o if o == 0x6C044 => self.cfgcr2.borrow()[0],
-                o if o == 0x6C04C => self.cfgcr2.borrow()[1],
-                o if o == 0x6C054 => self.cfgcr2.borrow()[2],
+                0x6C040 => self.cfgcr1.borrow()[0],
+                0x6C048 => self.cfgcr1.borrow()[1],
+                0x6C050 => self.cfgcr1.borrow()[2],
+                0x6C044 => self.cfgcr2.borrow()[0],
+                0x6C04C => self.cfgcr2.borrow()[1],
+                0x6C054 => self.cfgcr2.borrow()[2],
                 o if o == DPLL_CTRL1 => *self.ctrl1.borrow(),
                 o if o == DPLL_CTRL2 => *self.ctrl2.borrow(),
                 o if o == DPLL_STATUS => self.status(),
@@ -693,12 +693,12 @@ pub mod tests {
                 o if o == LCPLL2_CTL => self.ctl.borrow_mut()[1] = val,
                 o if o == WRPLL_CTL_0 => self.ctl.borrow_mut()[2] = val,
                 o if o == WRPLL_CTL_1 => self.ctl.borrow_mut()[3] = val,
-                o if o == 0x6C040 => self.cfgcr1.borrow_mut()[0] = val,
-                o if o == 0x6C048 => self.cfgcr1.borrow_mut()[1] = val,
-                o if o == 0x6C050 => self.cfgcr1.borrow_mut()[2] = val,
-                o if o == 0x6C044 => self.cfgcr2.borrow_mut()[0] = val,
-                o if o == 0x6C04C => self.cfgcr2.borrow_mut()[1] = val,
-                o if o == 0x6C054 => self.cfgcr2.borrow_mut()[2] = val,
+                0x6C040 => self.cfgcr1.borrow_mut()[0] = val,
+                0x6C048 => self.cfgcr1.borrow_mut()[1] = val,
+                0x6C050 => self.cfgcr1.borrow_mut()[2] = val,
+                0x6C044 => self.cfgcr2.borrow_mut()[0] = val,
+                0x6C04C => self.cfgcr2.borrow_mut()[1] = val,
+                0x6C054 => self.cfgcr2.borrow_mut()[2] = val,
                 o if o == DPLL_CTRL1 => *self.ctrl1.borrow_mut() = val,
                 o if o == DPLL_CTRL2 => *self.ctrl2.borrow_mut() = val,
                 _ => {}
@@ -885,10 +885,10 @@ pub mod tests {
             return TestResult::Fail("an unprogrammed port clock must have no DP state");
         }
         // eDP takes DPLL0 only; everything else the pool.
-        if dpll_pool(true) != &[SklDpllId::Dpll0] {
+        if dpll_pool(true) != [SklDpllId::Dpll0] {
             return TestResult::Fail("eDP must take DPLL0 only");
         }
-        if dpll_pool(false) != &[SklDpllId::Dpll1, SklDpllId::Dpll2, SklDpllId::Dpll3] {
+        if dpll_pool(false) != [SklDpllId::Dpll1, SklDpllId::Dpll2, SklDpllId::Dpll3] {
             return TestResult::Fail("external outputs must take the DPLL1/2/3 pool");
         }
         TestResult::Pass
