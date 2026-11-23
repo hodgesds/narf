@@ -44,6 +44,20 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use narf_lib::percpu::MAX_CPUS;
+
+/// Maximum IOAPICs retained from a MADT. Mirrors the `acpi` crate
+/// (`acpi/src/lib.rs:47`): PC platforms ship 1; multi-IOAPIC configs
+/// max around 8. Excess entries are dropped, never stored.
+pub const MAX_IOAPICS: usize = 8;
+
+/// Maximum interrupt source overrides (ISA → GSI remappings)
+/// retained from a MADT. Mirrors the `acpi` crate
+/// (`acpi/src/lib.rs:52`): the MADT typically lists ≤ 4 on PC-class
+/// hardware; 16 covers any sane firmware. Excess entries are dropped,
+/// never stored.
+pub const MAX_ISA_OVERRIDES: usize = 16;
+
 /// 8-byte ASCII RSDP signature.
 pub const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
 
@@ -321,6 +335,15 @@ pub unsafe fn parse_xsdt(phys: u64) -> Result<Tables, AcpiError> {
     if &h.signature != b"XSDT" {
         return Err(AcpiError::NoXsdt);
     }
+    // SEC-F3 (#1299): the entry count below subtracts the 36-byte SDT
+    // header, so a declared length below 36 underflows (wrapping in
+    // release, panicking in debug) and then walks entry pointers far
+    // past the table. The `acpi` crate rejects `total < 36` in
+    // `read_table_header` (`acpi/src/lib.rs:213`); mirror it here,
+    // before the checksum runs over the declared length.
+    if h.length < 36 {
+        return Err(AcpiError::BadTable);
+    }
     // SAFETY: same.
     if !unsafe { checksum_ok(phys, h.length) } {
         return Err(AcpiError::BadChecksum);
@@ -364,12 +387,19 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
     let lapic_addr = unsafe { core::ptr::read_volatile(pv(phys + 36) as *const u32) };
     t.local_apic_base = Some(lapic_addr as u64);
     let mut off: u64 = 44;
-    while (off as u32) + 2 <= length {
+    // SEC-F3 (#1299): the old loop checked only `len >= <per-kind
+    // minimum>` per entry, never `off + len <= length`, so a trailing
+    // entry with a large `len` read up to 14 bytes past the table end
+    // via volatile direct-map reads. Mirror the `acpi` crate
+    // (`acpi/src/lib.rs:836`): break when the entry overruns the
+    // table. The loop bound is in u64, so the `off as u32` truncation
+    // the old condition carried is gone too.
+    while off + 2 <= length as u64 {
         // SAFETY: same.
         let kind = unsafe { core::ptr::read_volatile(pv(phys + off) as *const u8) };
         // SAFETY: same.
         let len = unsafe { core::ptr::read_volatile(pv(phys + off + 1) as *const u8) } as u64;
-        if len < 2 {
+        if len < 2 || off + len > length as u64 {
             break;
         }
         match kind {
@@ -381,11 +411,16 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
                 let aid = unsafe { core::ptr::read_volatile(pv(phys + off + 3) as *const u8) };
                 // SAFETY: same.
                 let flags = unsafe { core::ptr::read_volatile(pv(phys + off + 4) as *const u32) };
-                t.local_apics.push(MadtEntry::LocalApic {
-                    processor_uid: pid,
-                    apic_id: aid,
-                    flags,
-                });
+                // SEC-F3 (#1299): cap the vector like the `acpi`
+                // crate caps its CPU count at MAX_CPUS; excess
+                // entries are dropped and parsing continues.
+                if t.local_apics.len() < MAX_CPUS {
+                    t.local_apics.push(MadtEntry::LocalApic {
+                        processor_uid: pid,
+                        apic_id: aid,
+                        flags,
+                    });
+                }
             }
             1 if len >= 12 => {
                 // IOAPIC entry.
@@ -395,11 +430,15 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
                 let addr = unsafe { core::ptr::read_volatile(pv(phys + off + 4) as *const u32) };
                 // SAFETY: same.
                 let gsi = unsafe { core::ptr::read_volatile(pv(phys + off + 8) as *const u32) };
-                t.io_apics.push(MadtEntry::IoApic {
-                    id,
-                    address: addr,
-                    gsi_base: gsi,
-                });
+                // SEC-F3 (#1299): cap at MAX_IOAPICS like the `acpi`
+                // crate; excess entries are dropped.
+                if t.io_apics.len() < MAX_IOAPICS {
+                    t.io_apics.push(MadtEntry::IoApic {
+                        id,
+                        address: addr,
+                        gsi_base: gsi,
+                    });
+                }
             }
             2 if len >= 10 => {
                 // Interrupt Source Override.
@@ -411,12 +450,16 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
                 let gsi = unsafe { core::ptr::read_volatile(pv(phys + off + 4) as *const u32) };
                 // SAFETY: same.
                 let flags = unsafe { core::ptr::read_volatile(pv(phys + off + 8) as *const u16) };
-                t.overrides.push(MadtEntry::IntOverride {
-                    bus,
-                    source,
-                    gsi,
-                    flags,
-                });
+                // SEC-F3 (#1299): cap at MAX_ISA_OVERRIDES like the
+                // `acpi` crate; excess entries are dropped.
+                if t.overrides.len() < MAX_ISA_OVERRIDES {
+                    t.overrides.push(MadtEntry::IntOverride {
+                        bus,
+                        source,
+                        gsi,
+                        flags,
+                    });
+                }
             }
             9 if len >= 16 => {
                 // Local x2APIC entry.
@@ -426,11 +469,17 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
                 let flags = unsafe { core::ptr::read_volatile(pv(phys + off + 8) as *const u32) };
                 // SAFETY: same.
                 let pid = unsafe { core::ptr::read_volatile(pv(phys + off + 12) as *const u32) };
-                t.local_apics.push(MadtEntry::LocalX2Apic {
-                    x2apic_id: xid,
-                    flags,
-                    processor_uid: pid,
-                });
+                // SEC-F3 (#1299): Local x2APIC entries share the
+                // local-APIC vector and its MAX_CPUS cap, like the
+                // `acpi` crate's shared cpu_count; excess entries
+                // are dropped.
+                if t.local_apics.len() < MAX_CPUS {
+                    t.local_apics.push(MadtEntry::LocalX2Apic {
+                        x2apic_id: xid,
+                        flags,
+                        processor_uid: pid,
+                    });
+                }
             }
             _ => {}
         }
