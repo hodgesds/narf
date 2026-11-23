@@ -906,7 +906,7 @@ pub mod tests {
         if pll_enable(&mmio, SklDpllId::Dpll2, &state).is_err() {
             return TestResult::Fail("HDMI enable on DPLL2 must succeed");
         }
-        if mmio.writes_to(DPLL_CTRL1) != alloc::vec![state.ctrl1] {
+        if mmio.writes_to(DPLL_CTRL1) != alloc::vec![state.ctrl1 << 12] {
             return TestResult::Fail("enable must write CTRL1 once");
         }
         if mmio.writes_to(0x6C048) != alloc::vec![state.cfgcr1.unwrap()]
