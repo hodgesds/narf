@@ -828,6 +828,46 @@ kernel_abi! {
         }
     }
 
+    /// Open a versioned permanent wireless host with a per-session event
+    /// callback for native→module control-plane events (family `WIFI`:
+    /// cfg80211 scan/connect/key requests reach the module through this
+    /// callback instead of tunnelling through the netif `tx_callback`).
+    /// `event_callback` is an `extern "C" fn(u64, u32, *const u8, usize)
+    /// -> i32` in the calling module's text: it receives the probe device
+    /// token, the event id, and kernel-owned read-only payload bytes
+    /// borrowed only for the call, and runs in the module's effective
+    /// domain through the bus call gate. The callback address is stored in
+    /// the session and forgotten when the session closes or the device is
+    /// retired; the gate refuses a retired module. A null callback is
+    /// `-EINVAL` — use plain `narf_wireless_open` for no event channel.
+    /// No Rust object, MMIO mapping or firmware pointer crosses the
+    /// boundary. `out_session` receives a never-reused, owner-scoped id.
+    ///
+    /// # Safety
+    /// `dev` is this module's probe token; `event_callback` is 0 or the
+    /// address of an `extern "C" fn(u64, u32, *const u8, usize) -> i32` in
+    /// the calling module's text, which stays mapped until the module's
+    /// wireless session is closed or its device context is retired;
+    /// `out_session` is writable/aligned.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_wireless_open_with_event(
+        dev: u64, family: u32, version: u32, event_callback: usize, out_session: *mut u64,
+    ) -> i32 {
+        if event_callback == 0 || out_session.is_null() { return -22; }
+        // SAFETY: the caller promises the documented C callback address.
+        let event_callback: narf_bus::ModuleWirelessEventFn =
+            unsafe { core::mem::transmute(event_callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_wireless::open_with_event(owner, dev, family, version, event_callback) {
+            Ok(session) => {
+                // SAFETY: the module promises writable, aligned output storage.
+                unsafe { out_session.write(session) };
+                0
+            }
+            Err(error) => error,
+        }
+    }
+
     /// Copy one bounded family-protocol request into retained host work.
     /// Success means accepted; only poll's terminal result completes it.
     ///
@@ -1394,6 +1434,7 @@ fn smoke_kabi_netif_exports_require_cap() -> TestResult {
         "narf_netif_register",
         "narf_netif_register_with_context",
         "narf_wireless_open",
+        "narf_wireless_open_with_event",
         "narf_wireless_submit",
         "narf_wireless_poll",
         "narf_wireless_cancel",

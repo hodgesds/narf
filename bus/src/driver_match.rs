@@ -542,11 +542,28 @@ pub enum ModuleTxCallback {
 /// Domain/lifecycle gate for network-stack transmit callbacks.
 pub type ModuleTxCallGate = fn(u64, ModuleTxCallback, u64, &[u8]) -> i32;
 
+/// Wireless control-plane event callback. The native cfg80211 stack delivers
+/// scan/connect/key requests to a loadable Wi-Fi frontend through this
+/// per-session callback (family `WIFI`, version 1) instead of tunnelling them
+/// through the netif `tx_callback`. `dev_token` is the device token the
+/// session was opened against; `event` is one of the
+/// `narf_wireless::module_host` event ids; `payload` names kernel-owned,
+/// read-only bytes borrowed only for the duration of the call. The callback
+/// itself is never invoked from hard-IRQ context: an in-tree task enters
+/// module text through the call gate, exactly like the transmit callback.
+pub type ModuleWirelessEventFn =
+    extern "C" fn(dev_token: u64, event: u32, payload: *const u8, len: usize) -> i32;
+
+/// Domain/lifecycle gate for wireless control-plane event callbacks.
+pub type ModuleWirelessEventCallGate = fn(u64, ModuleWirelessEventFn, u64, u32, &[u8]) -> i32;
+
 static MODULE_PROBE_CALL_GATE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static MODULE_CALLBACK_CALL_GATE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static MODULE_TX_CALL_GATE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static MODULE_WIRELESS_EVENT_CALL_GATE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// Install the module subsystem's probe call gate. Idempotent; boot and test
@@ -564,6 +581,12 @@ pub fn set_module_callback_call_gate(gate: ModuleCallbackCallGate) {
 /// Install the module subsystem's network transmit call gate.
 pub fn set_module_tx_call_gate(gate: ModuleTxCallGate) {
     MODULE_TX_CALL_GATE.store(gate as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Install the module subsystem's wireless control-plane event call gate.
+/// Idempotent for the same reason as [`set_module_probe_call_gate`].
+pub fn set_module_wireless_event_call_gate(gate: ModuleWirelessEventCallGate) {
+    MODULE_WIRELESS_EVENT_CALL_GATE.store(gate as usize, core::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn call_module_probe(
@@ -616,6 +639,29 @@ pub(crate) fn call_module_callback(owner: u64, callback: ModuleCallbackFn, cooki
     // stores exactly a `ModuleCallbackCallGate` function address.
     let gate: ModuleCallbackCallGate = unsafe { core::mem::transmute(gate) };
     gate(owner, callback, cookie)
+}
+
+/// Deliver one wireless control-plane event to a loadable frontend through
+/// the installed call gate. `pub` (unlike `call_module_tx`) because the
+/// caller lives outside `bus`: the native wireless family host in
+/// `narf-wireless` owns the session and its stored callback. Returns
+/// `-ENODEV` when no gate is installed; the gate itself pins the live module
+/// and enters its effective domain, so a retired module is never entered.
+pub fn call_module_wireless_event(
+    owner: u64,
+    callback: ModuleWirelessEventFn,
+    token: u64,
+    event: u32,
+    payload: &[u8],
+) -> i32 {
+    let gate = MODULE_WIRELESS_EVENT_CALL_GATE.load(core::sync::atomic::Ordering::Acquire);
+    if gate == 0 {
+        return -19;
+    }
+    // SAFETY: only `set_module_wireless_event_call_gate` writes this atomic
+    // and it stores exactly a `ModuleWirelessEventCallGate` function address.
+    let gate: ModuleWirelessEventCallGate = unsafe { core::mem::transmute(gate) };
+    gate(owner, callback, token, event, payload)
 }
 
 fn call_module_tx(owner: u64, callback: ModuleTxCallback, token: u64, frame: &[u8]) -> i32 {

@@ -146,7 +146,10 @@ changed.
 
 The copy-mode wireless additions are `narf_wireless_open`,
 `narf_wireless_submit`, `narf_wireless_poll`, `narf_wireless_cancel` and
-`narf_wireless_close`. They preserve all older export signatures and use
+`narf_wireless_close`, plus the additive `narf_wireless_open_with_event`,
+which opens with a per-session event callback for native→module
+control-plane events (family `WIFI` scan/connect/key) instead of
+tunnelling them through the netif `tx_callback`. They preserve all older export signatures and use
 the same CRC/whole-table hash machinery. Each requires the existing
 `NetIface` manifest declaration; runtime authority still comes from the
 invoking module's exact current PCI probe context. Protocol payloads have

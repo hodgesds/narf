@@ -19,7 +19,20 @@ pub const MAX_REPLY: usize = 65_536;
 /// callback, allocation or await while holding service/device presence.
 pub type Publish<'a> = dyn FnMut(&[u8]) -> Result<(), i32> + 'a;
 
-pub type HostOpen = fn(u64, u64, u64, BusDevice, Cap<BusDeviceCap, Write>) -> Result<(), i32>;
+/// `event` is the per-session native→module control-plane callback the
+/// module registered through `narf_wireless_open_with_event`, or `None` for
+/// a plain `narf_wireless_open` session. A host that never emits events
+/// ignores it; a host that does (family `WIFI`) delivers native cfg80211
+/// operations through it, via the bus call gate, never by calling module
+/// text directly.
+pub type HostOpen = fn(
+    u64,
+    u64,
+    u64,
+    BusDevice,
+    Cap<BusDeviceCap, Write>,
+    Option<crate::ModuleWirelessEventFn>,
+) -> Result<(), i32>;
 
 /// Permanent, kernel-resident hooks. No hook may point into unloadable text.
 /// `poll` returns `(status, required_bytes)`; `-EAGAIN` retains an operation,
@@ -103,7 +116,36 @@ fn binding(owner: u64, token: u64, session: u64) -> Result<Binding, i32> {
 
 /// Open a service only on the exact device already granted to this module's
 /// probe. Unknown families/versions fail before the host performs device I/O.
+/// A plain open registers no event callback: the host may publish the wiphy
+/// and answer module→native requests, but native→module control-plane events
+/// have no channel until the session is opened with one.
 pub fn open(owner: u64, token: u64, family: u32, version: u32) -> Result<u64, i32> {
+    open_inner(owner, token, family, version, None)
+}
+
+/// Open with a per-session event callback for native→module control-plane
+/// events (family `WIFI` scan/connect/key). The callback address is handed
+/// to the host's `open` hook, which stores it in the session; the host
+/// invokes it only through the bus call gate, and only while the session is
+/// current. The callback never outlives the session: `close` (and device
+/// retirement) drops the session, and the gate refuses a retired module.
+pub fn open_with_event(
+    owner: u64,
+    token: u64,
+    family: u32,
+    version: u32,
+    event: crate::ModuleWirelessEventFn,
+) -> Result<u64, i32> {
+    open_inner(owner, token, family, version, Some(event))
+}
+
+fn open_inner(
+    owner: u64,
+    token: u64,
+    family: u32,
+    version: u32,
+    event: Option<crate::ModuleWirelessEventFn>,
+) -> Result<u64, i32> {
     let host = HOSTS
         .lock()
         .iter()
@@ -136,7 +178,7 @@ pub fn open(owner: u64, token: u64, family: u32, version: u32) -> Result<u64, i3
         // service, and a concurrent second open cannot duplicate native ownership.
         bindings.push(entry);
     }
-    if let Err(error) = (host.open)(owner, token, session, device, cap) {
+    if let Err(error) = (host.open)(owner, token, session, device, cap, event) {
         close(owner, token, session);
         return Err(error);
     }

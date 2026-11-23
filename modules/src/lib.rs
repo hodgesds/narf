@@ -219,10 +219,26 @@ fn module_tx_call_gate(
     })
 }
 
+/// Enter the module's effective domain and deliver one wireless
+/// control-plane event to its per-session callback. The payload is
+/// kernel-owned and borrowed only for the call.
+fn module_wireless_event_call_gate(
+    owner: u64,
+    callback: narf_bus::ModuleWirelessEventFn,
+    token: u64,
+    event: u32,
+    payload: &[u8],
+) -> i32 {
+    call_in_module_context(owner, || {
+        callback(token, event, payload.as_ptr(), payload.len())
+    })
+}
+
 fn install_bus_call_gate() {
     narf_bus::set_module_probe_call_gate(module_pci_probe_call_gate);
     narf_bus::set_module_callback_call_gate(module_callback_call_gate);
     narf_bus::set_module_tx_call_gate(module_tx_call_gate);
+    narf_bus::set_module_wireless_event_call_gate(module_wireless_event_call_gate);
     narf_bus::set_module_context_retired_hook(module_block::retire_token);
 }
 

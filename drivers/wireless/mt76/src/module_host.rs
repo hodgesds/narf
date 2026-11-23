@@ -157,6 +157,9 @@ fn open(
     id: u64,
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
+    // The copy-mode protocol is module-pulled (submit/poll); it has no
+    // native→module event channel, so a registered event callback is unused.
+    _event: Option<narf_bus::ModuleWirelessEventFn>,
 ) -> Result<(), i32> {
     if !((device.id.vendor == mt7921::MTK_VENDOR
         && mt7921::ALL_DEV_IDS.contains(&device.id.device))

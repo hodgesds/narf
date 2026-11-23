@@ -29,6 +29,7 @@ fn host_open(
     _: u64,
     _: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
+    _: Option<crate::ModuleWirelessEventFn>,
 ) -> Result<(), i32> {
     if owner != OWNER || token != TOKEN {
         return Err(-22);

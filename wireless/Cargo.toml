@@ -10,6 +10,7 @@ release-managed = true
 [dependencies]
 narf-lib = { path = "../lib" }
 narf-net = { path = "../net" }
+narf-bus = { path = "../bus" }
 narf-crypto = { path = "../crypto" }
 narf-capabilities = { path = "../capabilities" }
 narf-ipc = { path = "../ipc" }
