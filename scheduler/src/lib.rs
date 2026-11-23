@@ -2606,6 +2606,35 @@ pub fn set_resched_ipi_hook(f: fn(u32)) {
     RESCHED_IPI_HOOK.store(f as usize, Ordering::Release);
 }
 
+/// CPU-state edge hook for the built-in cpufreq governor (Linux
+/// `cpufreq_update_util` analogue: the governor learns about
+/// Idle↔Active transitions from the scheduler instead of polling
+/// for them). `0` = not installed → no notification. A hook (not
+/// a direct call) keeps `narf-scheduler` free of a `power`
+/// dependency; the governor installs it once from `start_workers`.
+static CPU_STATE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the CPU-state edge hook. The hook runs in the scheduler's
+/// `notify_cpu_state` path, after the run-queue/lifecycle locks
+/// are released, on every CPU-state edge — so it must be
+/// nonblocking, must not allocate, and must not take any scheduler
+/// lock. It may run in interrupt context; a hook that needs more
+/// than atomics must defer the work (e.g. via a stored waker).
+pub fn set_cpu_state_hook(f: fn(CpuId, CpuState, CpuState)) {
+    CPU_STATE_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// The installed CPU-state edge hook, if any.
+pub(crate) fn cpu_state_hook() -> Option<fn(CpuId, CpuState, CpuState)> {
+    let p = CPU_STATE_HOOK.load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    // SAFETY: `p` was set by `set_cpu_state_hook` from a
+    // `fn(CpuId, CpuState, CpuState)`.
+    Some(unsafe { core::mem::transmute::<usize, fn(CpuId, CpuState, CpuState)>(p) })
+}
+
 /// Hook to arm a one-shot architecture clockevent at the given cycle value
 /// (x86 boot wires `apic::arm_tsc_deadline_if_earlier`). Used for execution
 /// budget boundaries, budget replenishment, and restarting the periodic

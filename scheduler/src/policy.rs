@@ -1068,6 +1068,11 @@ pub(crate) fn notify_cpu_state(cpu: CpuId, current: CpuState, idle: Option<CpuId
             );
         }
     });
+    // Governor hook: the same edge, delivered with the same
+    // lock-free guarantee (no run-queue/lifecycle lock held).
+    if let Some(hook) = crate::cpu_state_hook() {
+        hook(cpu, previous, current);
+    }
 }
 
 /// Publish an executor-owned Active/Idle edge without racing a lifecycle
@@ -1111,6 +1116,11 @@ pub(crate) fn notify_cpu_executor_state(cpu: CpuId, current: CpuState, idle: Opt
                 );
             }
         });
+        // Governor hook: the same edge, delivered with the same
+        // lock-free guarantee (no run-queue/lifecycle lock held).
+        if let Some(hook) = crate::cpu_state_hook() {
+            hook(cpu, previous, current);
+        }
         return;
     }
 }

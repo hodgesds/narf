@@ -217,8 +217,19 @@ programs its own request MSR. Intel HWP starts in autonomous mode
 hardware selects the operating point within that CPU's policy and thermal
 bounds. The pinned worker applies changes to those bounds or EPP even when
 desired performance stays zero. CPUs that advertise EPP receive the policy's
-preference. AMD CPPC samples the local scheduler run queue every 100 ms
-to select a desired performance level.
+preference. AMD CPPC follows Linux amd-pstate in ACTIVE (EPP) mode: under
+`Balanced`, `Powersave`, and `Userspace` it writes `desired_perf = 0` and
+leaves frequency selection to the firmware under the EPP hint, inside the
+`[min, max]` window; only `Performance` writes an explicit desired (the
+capped max), and only the legacy `_PSS` backend keeps an explicit graded
+target. The utilisation signal is graded run-time accounting, Linux
+`schedutil` style: `cpu_times` deltas (busy over busy + idle + iowait)
+since the last sample, re-anchored at every scheduler Idle↔Active edge.
+The sample is event-driven — the scheduler calls the governor's edge hook
+on Idle↔Active transitions (rate-limited to 1 ms per CPU) and wakes the
+owning CPU's governor worker — with the 100 ms deferrable tick as the
+periodic backstop. A CPPC request that recomputes to the same bytes as
+the last write skips the WRMSR (the amd-pstate request cache).
 The syscall bridge rejects remote-CPU policy/EPP writes until an IPI
 rendezvous path can execute the operation on the named CPU.
 `Performance` requests highest with a nominal floor and EPP 0;
