@@ -2367,7 +2367,11 @@ source-defined modern instance zero. Modern firmware steering contention
 yields with a deadline; every acquired semaphore is released and the selector
 restored on success or error. Preflight refuses unavailable registers before
 WA writes; readback failures close admission and retain owned storage through
-full reset. DG2 CACHE_MODE_SS is not read back (Wa_14012342262). BMG also
+full reset. For Wa_14015795083 on Gen12 and DG2, firmware can lock MISCCPCTL.
+The host reads it to preserve unrelated bits and attempts to clear
+DOP_CLOCK_GATE_RENDER_ENABLE. A locked bit can retain its value. Early Xe-LPG
+still requires this bit to read back clear. DG2 CACHE_MODE_SS is not read back
+(Wa_14012342262). BMG also
 receives each BCS engine's ENGINE_BASE copies of Wa_16021639441/priority-read
 (CSFE_CHICKEN1 0x220d4 / 0x3ee0d4) and Wa_16023105232
 (RING_PSMI_CTL 0x22050 / 0x3ee050).
