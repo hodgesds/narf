@@ -816,9 +816,17 @@ pub(crate) mod intel_gpu_gen12_dmc;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen12_tc;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_gen9_cdclk;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gen9_dc_states;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_gen9_ddi;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_gen9_dpll;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gen9_sagv;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_gen9_wm;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_ggtt_ranges;
 #[cfg(feature = "intel")]

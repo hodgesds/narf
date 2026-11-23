@@ -58,8 +58,10 @@
 //! the hardware ignores on this generation. The SKL CFGCR1/2
 //! registers and the SKL WRPLL divider search
 //! (`skl_ddi_calculate_wrpll`, the even/odd-divider search over
-//! the 8.4/9.0/9.6 GHz central frequencies) are Gen9-lane work
-//! and are NOT ported here.
+//! the 8.4/9.0/9.6 GHz central frequencies) live in
+//! [`crate::intel_gpu_gen9_dpll`] (Gen9 Lane 4), not here — this
+//! module only supplies the shared `DPLL_CTRL1` helpers it
+//! imports.
 //!
 //! ## Not ported (remainders)
 //!
@@ -781,8 +783,9 @@ pub fn dp_ctrl1(port_clock_khz: u32) -> Option<u32> {
 }
 
 /// `skl_ddi_hdmi_pll_dividers` (ctrl1 half): HDMI always uses
-/// OVERRIDE | HDMI_MODE (the CFGCR1/2 half needs the SKL WRPLL
-/// divider search, a Gen9-lane remainder).
+/// OVERRIDE | HDMI_MODE (the CFGCR1/2 half is
+/// [`crate::intel_gpu_gen9_dpll::SklDpllState::from_wrpll`], Gen9
+/// Lane 4).
 pub fn hdmi_ctrl1() -> u32 {
     ctrl1_override(0) | ctrl1_hdmi_mode(0)
 }
