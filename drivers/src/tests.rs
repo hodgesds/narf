@@ -423,6 +423,101 @@ fn smoke_drivers_reset_default_is_noop() -> TestResult {
 }
 kernel_test_in!("drivers", smoke_drivers_reset_default_is_noop);
 
+fn smoke_drivers_revoke_and_reset_named() -> TestResult {
+    // SEC-B6 #1294: emergency revoke of a live driver revokes its
+    // handle AND drives its reset, so in-flight operations are
+    // halted even though the driver was never quiesced.
+    use crate::{
+        bootstrap_authority, registry, DomainPolicy, Driver, DriverEnv, DriverFuture,
+        DriverManifest, DriverPhase,
+    };
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    static RESETS: AtomicU32 = AtomicU32::new(0);
+
+    struct CountingDriver;
+    impl Driver for CountingDriver {
+        fn start<'a>(&'a mut self, _env: DriverEnv<'a>) -> DriverFuture<'a> {
+            Box::pin(async move {})
+        }
+        fn quiesce<'a>(&'a mut self) -> DriverFuture<'a> {
+            Box::pin(async move {})
+        }
+        fn reset<'a>(&'a mut self) -> DriverFuture<'a> {
+            Box::pin(async move {
+                RESETS.fetch_add(1, Ordering::Relaxed);
+            })
+        }
+    }
+
+    static MANIFEST: DriverManifest = DriverManifest {
+        name: "noop.revoke-reset-1",
+        domain_policy: DomainPolicy::Shared,
+        caps_required: &[],
+    };
+
+    // Unknown name: Err, and no driver is touched.
+    static BAD: AtomicBool = AtomicBool::new(false);
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::spawn(async {
+        if registry()
+            .revoke_and_reset_named("noop.does-not-exist")
+            .await
+            .is_ok()
+        {
+            BAD.store(true, Ordering::Relaxed);
+        }
+    });
+    narf_scheduler::run_until_empty();
+    if BAD.load(Ordering::Relaxed) {
+        return TestResult::Fail("revoke_and_reset_named on an unknown name returned Ok");
+    }
+
+    let authority = bootstrap_authority();
+    let handle = match registry().register(&authority, &MANIFEST, CountingDriver) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("register"),
+    };
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::spawn(async {
+        let _ = registry().start_named("noop.revoke-reset-1").await;
+    });
+    narf_scheduler::run_until_empty();
+    match registry().with_entry("noop.revoke-reset-1", |s| s.phase) {
+        Some(DriverPhase::Started) => {}
+        _ => return TestResult::Fail("post-start phase not Started"),
+    }
+
+    // Revoke + reset a live driver without quiescing first.
+    let resets_before = RESETS.load(Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+    narf_scheduler::spawn(async {
+        let _ = registry()
+            .revoke_and_reset_named("noop.revoke-reset-1")
+            .await;
+    });
+    narf_scheduler::run_until_empty();
+    if RESETS.load(Ordering::Relaxed) != resets_before + 1 {
+        return TestResult::Fail("revoke_and_reset_named did not drive reset");
+    }
+    if handle.is_live() {
+        return TestResult::Fail("driver self-cap still live after emergency revoke");
+    }
+    match registry().with_entry("noop.revoke-reset-1", |s| s.phase) {
+        Some(DriverPhase::Quiesced) => {}
+        _ => return TestResult::Fail("post-revoke phase not Quiesced"),
+    }
+    // Unbind can now proceed without a separate quiesce.
+    if registry().unbind_named("noop.revoke-reset-1").is_err() {
+        return TestResult::Fail("unbind_named after emergency revoke returned Err");
+    }
+    if registry().is_registered("noop.revoke-reset-1") {
+        return TestResult::Fail("entry still present after unbind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers", smoke_drivers_revoke_and_reset_named);
+
 fn smoke_drivers_unbind_after_quiesce() -> TestResult {
     use crate::{
         bootstrap_authority, registry, DomainPolicy, DriverManifest, DriverPhase, NoopDriver,

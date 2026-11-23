@@ -364,11 +364,38 @@ impl<T, R: Rights> Cap<T, R> {
         let _ = object_table::bump_epoch(self.slot.index);
     }
 
+    /// Revoke the derivation subtree rooted at this cap (spec §9.6,
+    /// SEC-B6 #1294): walk the CDT depth-first from this cap's
+    /// rights and bump the per-object epoch once at the end — not
+    /// once per descendant. Returns the number of distinct derived
+    /// rights-subsets the bump covered, including this cap's own
+    /// rights; `0` when the object is already dead.
+    ///
+    /// The kill is object-wide by construction: the epoch is per
+    /// object, not per cap, so siblings die with the subtree — the
+    /// CDT enumerates which derived rights-subsets were covered, it
+    /// does not spare siblings. The operation that revokes exactly
+    /// one holder is `CapTable::revoke_slot`, which clears one task's
+    /// table entry while the object and every other holder stay live.
+    pub fn revoke_subtree(self) -> usize {
+        object_table::revoke_subtree(self.slot.index, self.slot.generation, self.slot.rights)
+    }
+
     /// Derive a weaker capability.
     pub fn derive<R2: Rights + SubsetOf<R>>(&self) -> Result<Cap<T, R2>, CapError> {
         self.check_live()?;
         let mut slot = self.slot;
         slot.rights = R2::BITS;
+        // CDT (§9.6): record the derivation edge. Allocation-free
+        // (one epoch load + one `fetch_or` inside) so the per-I/O
+        // derive sites stay allocation-free; reflexive derives and
+        // multi-bit rights record nothing.
+        object_table::record_derivation(
+            self.slot.index,
+            self.slot.generation,
+            self.slot.rights,
+            R2::BITS,
+        );
         // SAFETY: the operation upholds its documented invariant (see surrounding context).
         unsafe { Ok(Cap::mint(slot)) }
     }
@@ -708,6 +735,30 @@ impl CapTable {
             return Err(CapError::TypeMismatch);
         }
         self.install_general(cap_entry)
+    }
+
+    /// Revoke exactly one holder (SEC-B6 #1294): clear the entry at
+    /// `position` so this task's later `lookup` of it fails
+    /// `Revoked`. The object itself is untouched — its epoch does
+    /// not move and every other holder keeps working — which is what
+    /// makes this selective where `Cap::revoke` / `revoke_subtree`
+    /// are object-wide. Returns `true` iff a live entry was cleared;
+    /// empty or out-of-range positions return `false`.
+    ///
+    /// The cleared position is never reused (the install cursors are
+    /// monotonic), so a stale presented slot for it can never alias
+    /// a later grant. No cross-task syscall wires this yet: revoking
+    /// another task's entry needs a task-manager path and an
+    /// authority decision (who may withdraw whose grant) that is a
+    /// separate interface call — this is the primitive it will use.
+    pub fn revoke_slot(&mut self, position: u32) -> bool {
+        match self.slots.get_mut(position as usize) {
+            Some(entry) if !entry.is_empty() => {
+                *entry = CapSlot::EMPTY;
+                true
+            }
+            _ => false,
+        }
     }
 }
 

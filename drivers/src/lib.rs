@@ -216,6 +216,10 @@ pub trait Driver: Send + 'static {
     ///   FLR (function-level reset) on the device.
     /// - Hot-unplug-then-replug, where the device is the same
     ///   physical part but driver state was for a now-dead session.
+    /// - Emergency revocation (SEC-B6 #1294): `revoke_and_reset_named`
+    ///   revokes a live driver's handle and then resets it — a bare
+    ///   revoke leaves an in-flight `invoke` holding the old
+    ///   authority, and the reset is what halts it.
     ///
     /// Default implementation is a no-op so existing drivers stay
     /// compatible — they get the documentation invariant ("reset
@@ -497,6 +501,58 @@ impl DriverRegistry {
         Ok(())
     }
 
+    /// Emergency revoke + reset (SEC-B6 #1294, capabilities/ §9.5):
+    /// revoke the named driver's self-cap AND drive its `reset`
+    /// future. This is the only sound way to revoke a live
+    /// (`Started`) driver's authority: a bare `Cap::revoke()` on the
+    /// handle kills future `invoke`s, but an `invoke` that already
+    /// loaded the old epoch completes with the old authority — and a
+    /// compromised driver cannot be trusted to quiesce, so the
+    /// framework halts its in-flight operations itself via `reset`.
+    /// The revoke lands first, so no new invoke can start while the
+    /// device is being halted; the entry is marked `Quiescing` under
+    /// the lock before the reset runs (the `quiesce_named` pattern),
+    /// so no concurrent lifecycle call can alias the `&mut` or
+    /// unbind the entry mid-reset, and it lands in `Quiesced`
+    /// afterwards so a later `unbind_named` can proceed without a
+    /// separate quiesce.
+    ///
+    /// Legal from `Loaded`, `Started`, or `Quiesced`; in-flight
+    /// start / quiesce, unbinding, and unbound entries return
+    /// `Ok(())` without touching the driver (same gate as
+    /// `reset_named`), and an unknown name returns `Err(())`.
+    pub async fn revoke_and_reset_named(&self, name: &str) -> Result<(), ()> {
+        let driver_ptr = {
+            let mut q = self.inner.lock();
+            let entry = q.iter_mut().find(|r| r.manifest.name == name).ok_or(())?;
+            match entry.phase {
+                DriverPhase::Loaded | DriverPhase::Started | DriverPhase::Quiesced => {
+                    entry.phase = DriverPhase::Quiescing;
+                }
+                _ => return Ok(()),
+            }
+            // Revoke first: authority dies before the reset runs.
+            // `Cap` is `Copy`, so this revokes the object while the
+            // entry keeps a (now dead) handle for later inspection.
+            entry.handle.revoke();
+            (&mut *entry.driver) as *mut dyn Driver
+        };
+        // SAFETY: the Quiescing phase gate above proves no concurrent
+        // start / quiesce / reset / unbind holds the &mut alias.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let driver: &mut dyn Driver = unsafe { &mut *driver_ptr };
+        driver.reset().await;
+        if let Some(e) = self
+            .inner
+            .lock()
+            .iter_mut()
+            .find(|r| r.manifest.name == name)
+        {
+            e.phase = DriverPhase::Quiesced;
+        }
+        Ok(())
+    }
+
     /// Record a reclaim token against the named driver. Drivers call
     /// this from `start` (or any helper invoked therein) so the
     /// framework can release the resource on `unbind_named`. Returns
@@ -519,6 +575,13 @@ impl DriverRegistry {
     /// past `Started` (i.e. Loaded → straight unbind, or Quiesced).
     /// Calls against an in-flight start/quiesce return `Err(())`
     /// so the caller can re-poll after the lifecycle settles.
+    ///
+    /// Normal teardown revokes only after quiesce, so in-flight work
+    /// is already drained and no reset is needed here. To revoke a
+    /// live (`Started`) driver that cannot be trusted to quiesce,
+    /// use `revoke_and_reset_named` instead — a bare revoke there
+    /// would leave in-flight operations running (capabilities/ §9.5,
+    /// SEC-B6 #1294).
     ///
     /// Released in reverse-registration order — drivers add resources
     /// in dependency order, so reverse order is the natural teardown.

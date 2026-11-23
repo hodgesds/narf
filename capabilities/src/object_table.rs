@@ -13,6 +13,22 @@
 //! is reused, whatever the new object is; readers never read the kind of an
 //! entry that is not live. An epoch that would wrap retires the entry for
 //! good (epoch 0), so a generation can never recur.
+//!
+//! The CDT (capability derivation tree, spec §9.6, SEC-B6 #1294) is
+//! recorded per entry as a 36-bit edge mask over the six single-bit
+//! rights (`Read`..`Create`): bit `p * 6 + c` is set when a cap with
+//! the single-bit right `1 << p` was derived into a cap with the
+//! single-bit right `1 << c`. A derivation never changes the slot's
+//! index, generation, or `type_tag`, so the rights pair identifies
+//! the edge completely; two derivations that yield the same rights
+//! are the same authority and share the edge. The mask is bounded
+//! (8 bytes per entry, cleared on index reuse), recorded with one
+//! `fetch_or` on the cold derive path, and never consulted by
+//! `check_live` / `invoke` — the authority check is still the single
+//! epoch comparison. `revoke_subtree` walks the mask to enumerate
+//! which derived rights-subsets a revoke covers, then bumps the
+//! per-object epoch once; the kill is object-wide by construction
+//! (siblings die too — see `revoke_subtree`).
 
 use crate::{CapError, CapKind};
 use alloc::alloc::{alloc, dealloc};
@@ -33,6 +49,11 @@ struct Entry {
     /// Next index on the free list while this one is released; `NONE`
     /// otherwise.
     next_free: AtomicU32,
+    /// CDT edge mask (spec §9.6): bit `p * 6 + c` set ⟺ a cap with
+    /// the single-bit right `1 << p` was derived into a cap with the
+    /// single-bit right `1 << c`. Cleared on index reuse; fresh
+    /// leaves are zero-initialized (see `allocate`).
+    cdt: AtomicU64,
 }
 struct Leaf {
     entries: [Entry; 256],
@@ -111,6 +132,7 @@ fn allocate(leaf: bool) -> Result<*mut (), CapError> {
                     kind: AtomicU32::new(0),
                     epoch: AtomicU32::new(0),
                     next_free: AtomicU32::new(NONE),
+                    cdt: AtomicU64::new(0),
                 });
             }
         } else {
@@ -188,6 +210,10 @@ pub fn try_register(kind: CapKind) -> Result<(u32, u32), CapError> {
         // Sole owner between pop and publication: nothing else reaches a
         // released entry's kind (readers stop at the even epoch).
         entry.kind.store(kind as u32, Ordering::Relaxed);
+        // The new incarnation starts with an empty CDT: edges recorded
+        // against the previous object must not pollute its
+        // `revoke_subtree` enumeration.
+        entry.cdt.store(0, Ordering::Relaxed);
         let released = entry.epoch.load(Ordering::Relaxed);
         debug_assert!(released != 0 && !is_live(released));
         let generation = released.wrapping_add(1);
@@ -256,6 +282,120 @@ pub fn bump_epoch(index: u32) -> Option<u32> {
         })
         .ok()
         .map(|previous| previous.checked_add(2).unwrap_or(0))
+}
+
+/// Bit position of a single-bit rights value (`Read` = 0 ..
+/// `Create` = 5), or `None` for zero, multi-bit, or out-of-range
+/// values. In-kernel minted caps always carry a single-bit rights
+/// value (`R::BITS`); a hand-forged slot can carry a combination,
+/// which has no CDT node and is never recorded.
+fn single_bit_position(rights: u32) -> Option<u32> {
+    if rights == 0 || rights & (rights - 1) != 0 {
+        return None;
+    }
+    let pos = rights.trailing_zeros();
+    (pos < 6).then_some(pos)
+}
+
+/// Record a CDT edge for a derivation `parent_rights -> child_rights`
+/// on the entry for `index`, whose live generation must still be
+/// `generation`. Allocation-free (one epoch load, one `fetch_or`)
+/// so the per-I/O derive sites (e.g. a filesystem deriving a `Read`
+/// cap per sector read) pay no table growth: the edge mask is fixed
+/// size and re-recording the same edge is idempotent. Reflexive
+/// derives (same rights — a copy, not a weakening) and multi-bit
+/// rights record nothing. An edge recorded while its object is
+/// concurrently released may land on the entry's next incarnation
+/// if the epoch check races the reuse; the walk below only ever
+/// enumerates rights-subsets and the kill is always the epoch bump,
+/// so a stale edge can inflate the reported count but can never
+/// revive or spare authority.
+pub fn record_derivation(index: u32, generation: u32, parent_rights: u32, child_rights: u32) {
+    if parent_rights == child_rights {
+        return;
+    }
+    let (Some(parent), Some(child)) = (
+        single_bit_position(parent_rights),
+        single_bit_position(child_rights),
+    ) else {
+        return;
+    };
+    let entry = match entry(index, false) {
+        Ok(Some(entry)) => entry,
+        _ => return,
+    };
+    // Do not record against a dead or recycled incarnation: the
+    // caller checked liveness before deriving, and a release +
+    // reuse since then names a different object.
+    if entry.epoch.load(Ordering::Acquire) != generation {
+        return;
+    }
+    entry
+        .cdt
+        .fetch_or(1u64 << (parent * 6 + child), Ordering::Relaxed);
+}
+
+/// Revoke the derivation subtree rooted at the cap with `rights` on
+/// object `index` (spec §9.6, SEC-B6 #1294): walk the CDT
+/// depth-first from `rights` and bump the per-object epoch once at
+/// the end — not once per descendant. Returns the number of distinct
+/// derived rights-subsets the bump covered, including the root
+/// cap's own rights; `0` when the cap's `generation` no longer
+/// matches the object's epoch (already revoked or released).
+///
+/// The kill is object-wide by construction: the epoch is per object,
+/// not per cap, so every other cap of the object — siblings included
+/// — dies with the subtree. The CDT enumerates WHICH derived
+/// rights-subsets were covered (for audit logs); it does not spare
+/// siblings. Per-node sparing would need a per-derivation epoch, and
+/// that is held, not implemented: `derive` runs per I/O (a filesystem
+/// derives a `Read` cap per sector read), `Cap` is `Copy` with no
+/// `Drop` and no in-tree release path for derived caps, so a
+/// per-derivation entry would grow the table at I/O rate with no
+/// reclaim — the unbounded-growth hole this issue's table bound had
+/// just closed. The selective operation this model does support is
+/// per-holder revocation: `CapTable::revoke_slot` clears one task's
+/// table entry while the object and every other holder stay live.
+pub fn revoke_subtree(index: u32, generation: u32, rights: u32) -> usize {
+    let entry = match entry(index, false) {
+        Ok(Some(entry)) => entry,
+        _ => return 0,
+    };
+    // A revoke bumps the epoch by two and leaves it odd, so parity
+    // alone cannot tell a revoked object from a live one — the
+    // caller's generation is the liveness test, exactly as in
+    // `check_live`.
+    if entry.epoch.load(Ordering::Acquire) != generation {
+        return 0;
+    }
+    let mut count = 1usize;
+    if let Some(root) = single_bit_position(rights) {
+        let mask = entry.cdt.load(Ordering::Acquire);
+        // At most six nodes; a fixed stack, no allocation. Nodes are
+        // marked visited at push time, so each is pushed at most once
+        // and the stack can never overflow.
+        let mut stack = [root; 6];
+        let mut len = 1usize;
+        let mut visited: u64 = 1u64 << root;
+        while len > 0 {
+            len -= 1;
+            let node = stack[len];
+            for child in 0..6u32 {
+                if mask & (1u64 << (node * 6 + child)) != 0 && visited & (1u64 << child) == 0 {
+                    visited |= 1u64 << child;
+                    stack[len] = child;
+                    len += 1;
+                }
+            }
+        }
+        count = visited.count_ones() as usize;
+    }
+    // The kill: one epoch bump, exactly as `revoke` does. It lands
+    // whether or not a concurrent revoke already bumped first (a
+    // second bump keeps the object dead); the returned count is what
+    // the CDT enumerated for this call.
+    let _ = bump_epoch(index);
+    count
 }
 
 /// Release a live object's index for reuse: every capability of it fails
@@ -396,4 +536,70 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("capabilities", smoke_cap_object_release_bounds_the_table);
+
+    /// A CDT edge recorded for one object does not survive its index
+    /// being released and handed to the next registration: reuse
+    /// clears the mask, so the new object's `revoke_subtree`
+    /// enumerates only itself.
+    fn smoke_cap_cdt_cleared_on_index_reuse() -> TestResult {
+        use crate::{Read, Rights, Write};
+        let (index, generation) = register(CapKind::Endpoint);
+        record_derivation(index, generation, Write::BITS, Read::BITS);
+        if release(index).is_none() {
+            return TestResult::Fail("release refused a live index");
+        }
+        let (again, generation_2) = register(CapKind::Ring);
+        if again != index {
+            // Another CPU may have taken the slot first; the released
+            // entry's edges went with it either way.
+            let _ = release(again);
+            return TestResult::Pass;
+        }
+        if revoke_subtree(again, generation_2, Write::BITS) != 1 {
+            return TestResult::Fail("reused index inherited the old object's CDT edges");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("capabilities", smoke_cap_cdt_cleared_on_index_reuse);
+
+    /// `revoke_subtree` walks the CDT from the given rights and
+    /// counts the distinct derived rights-subsets it covers — and
+    /// still kills the whole object (the epoch bump is object-wide).
+    fn smoke_cap_object_revoke_subtree_counts() -> TestResult {
+        use crate::{Invoke, Read, Rights, Write};
+        // Write -> Read, Write -> Invoke, Invoke -> Read.
+        let (index, generation) = register(CapKind::Endpoint);
+        record_derivation(index, generation, Write::BITS, Read::BITS);
+        record_derivation(index, generation, Write::BITS, Invoke::BITS);
+        record_derivation(index, generation, Invoke::BITS, Read::BITS);
+        // Rooted at Read: only Read itself.
+        if revoke_subtree(index, generation, Read::BITS) != 1 {
+            return TestResult::Fail("revoke_subtree(Read) covered more than the Read node");
+        }
+        if current_epoch(index) == Some(generation) {
+            return TestResult::Fail("revoke_subtree left the object live");
+        }
+        // Rooted at Invoke: Invoke + Read.
+        let (index, generation) = register(CapKind::Endpoint);
+        record_derivation(index, generation, Write::BITS, Read::BITS);
+        record_derivation(index, generation, Write::BITS, Invoke::BITS);
+        record_derivation(index, generation, Invoke::BITS, Read::BITS);
+        if revoke_subtree(index, generation, Invoke::BITS) != 2 {
+            return TestResult::Fail("revoke_subtree(Invoke) did not cover Invoke + Read");
+        }
+        // Rooted at Write: the whole tree.
+        let (index, generation) = register(CapKind::Endpoint);
+        record_derivation(index, generation, Write::BITS, Read::BITS);
+        record_derivation(index, generation, Write::BITS, Invoke::BITS);
+        record_derivation(index, generation, Invoke::BITS, Read::BITS);
+        if revoke_subtree(index, generation, Write::BITS) != 3 {
+            return TestResult::Fail("revoke_subtree(Write) did not cover the whole tree");
+        }
+        // A dead object revokes nothing.
+        if revoke_subtree(index, generation, Write::BITS) != 0 {
+            return TestResult::Fail("revoke_subtree on a dead object reported coverage");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("capabilities", smoke_cap_object_revoke_subtree_counts);
 }
