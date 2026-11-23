@@ -1502,7 +1502,10 @@ fn smoke_cap_delegate_refuses_forged_source_rights() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("capabilities", smoke_cap_delegate_refuses_forged_source_rights);
+kernel_test_in!(
+    "capabilities",
+    smoke_cap_delegate_refuses_forged_source_rights
+);
 
 fn smoke_cap_transfer_refuses_forged_rights() -> TestResult {
     // Same-class hardening on the Grant-gated transfer path: a
