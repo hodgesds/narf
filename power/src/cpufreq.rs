@@ -1649,12 +1649,22 @@ mod smoke_tests {
         }
         set_thermal_limit_permille(1000);
         let mut writes = alloc::vec::Vec::new();
-        let mut write = |req: u64| {
-            writes.push(req);
-            Ok(())
-        };
+        // The record closure borrows `writes`, so it is created fresh
+        // for each call and dropped before `writes` is read back: one
+        // closure live across the calls would make every `writes.len()`
+        // / `writes[i]` read a borrow error (E0502).
         // Balanced: desired 0, full window, balanced EPP.
-        if update_cppc_request(cpu, 0, &mut write) != Ok(1) || writes.len() != 1 {
+        {
+            let mut write = |req: u64| {
+                writes.push(req);
+                Ok(())
+            };
+            if update_cppc_request(cpu, 0, &mut write) != Ok(1) {
+                __reset_for_test();
+                return TestResult::Fail("balanced CPPC request must write once");
+            }
+        }
+        if writes.len() != 1 {
             __reset_for_test();
             return TestResult::Fail("balanced CPPC request must write once");
         }
@@ -1672,13 +1682,33 @@ mod smoke_tests {
             );
         }
         // Identical recompute: the request cache suppresses the write.
-        if update_cppc_request(cpu, 0, &mut write) != Ok(0) || writes.len() != 1 {
+        {
+            let mut write = |req: u64| {
+                writes.push(req);
+                Ok(())
+            };
+            if update_cppc_request(cpu, 0, &mut write) != Ok(0) {
+                __reset_for_test();
+                return TestResult::Fail("identical CPPC request must skip the WRMSR");
+            }
+        }
+        if writes.len() != 1 {
             __reset_for_test();
             return TestResult::Fail("identical CPPC request must skip the WRMSR");
         }
         // Thermal ceiling at 500 permille: max 110, desired still 0.
         set_thermal_limit_permille(500);
-        if update_cppc_request(cpu, 0, &mut write) != Ok(1) || writes.len() != 2 {
+        {
+            let mut write = |req: u64| {
+                writes.push(req);
+                Ok(())
+            };
+            if update_cppc_request(cpu, 0, &mut write) != Ok(1) {
+                __reset_for_test();
+                return TestResult::Fail("thermal cap change must re-program the CPPC request");
+            }
+        }
+        if writes.len() != 2 {
             __reset_for_test();
             return TestResult::Fail("thermal cap change must re-program the CPPC request");
         }
@@ -1693,7 +1723,17 @@ mod smoke_tests {
             let mut pc = PERCPU.lock();
             apply_policy_to_slot(&mut pc[cpu], Policy::Performance);
         }
-        if update_cppc_request(cpu, 200, &mut write) != Ok(1) || writes.len() != 3 {
+        {
+            let mut write = |req: u64| {
+                writes.push(req);
+                Ok(())
+            };
+            if update_cppc_request(cpu, 200, &mut write) != Ok(1) {
+                __reset_for_test();
+                return TestResult::Fail("performance CPPC request must write");
+            }
+        }
+        if writes.len() != 3 {
             __reset_for_test();
             return TestResult::Fail("performance CPPC request must write");
         }
