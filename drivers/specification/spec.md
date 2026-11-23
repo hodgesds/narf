@@ -621,6 +621,18 @@ expired):
    the allocator.
 5. **DROPPED.** Module-handle cap dropped. The module is gone.
 
+**Emergency revoke.** The protocol above assumes the driver can
+still quiesce (step 1). A compromised or misbehaving driver
+cannot be trusted to quiesce, and a bare cap revoke leaves an
+in-flight `invoke` holding the old authority (capabilities/
+§9.5). For that case the registry provides
+`revoke_and_reset_named`: it revokes the driver's handle and
+then drives `Driver::reset()` to halt in-flight operations,
+landing the entry in `Quiesced` so unbind can follow. The panic
+containment path (§7.4) runs from step 3 (REVOKED) with no
+quiesce; wiring it to `revoke_and_reset_named` is a separate
+step.
+
 The grace period in step 4 is essential: an IRQ for the device
 may have been delivered but not yet entered the dispatch
 table (between LAPIC delivery and `on_irq` running). Waiting

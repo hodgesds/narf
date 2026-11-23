@@ -10,7 +10,7 @@
 
 **Owns:** Per-task capability tables, the `Cap<T, R>` Rust type family,
 derivation rules (how a cap with rights R creates a weaker cap with
-rights R' ⊆ R), badging, revocation (CDT or refcount, TBD).
+rights R' ⊆ R), badging, revocation (CDT, §9.6).
 
 **Does NOT own:** Object lifetimes (the owning subsystem owns those),
 domain placement (`memory/`), threat model narrative (`security-model/`).
@@ -76,6 +76,13 @@ impl<T, R: Rights> Cap<T, R> {
     /// cap referencing the same object observes `Err(Revoked)` on
     /// next invoke.
     pub fn revoke(self);
+
+    /// Revoke the derivation subtree rooted at this cap (§9.6):
+    /// walk the CDT and bump the per-object epoch once; returns
+    /// the number of derived rights-subsets covered. The kill is
+    /// object-wide — siblings die too; per-holder revocation is
+    /// `CapTable::revoke_slot`.
+    pub fn revoke_subtree(self) -> usize;
 }
 
 impl<T: CapType, R: Rights> Cap<T, R> {
@@ -117,6 +124,12 @@ impl CapTable {
     /// `lookup` result, never presented bytes) into this table's
     /// general region; returns the receiver's fresh slot number.
     pub fn install_transfer(&mut self, grant_entry: CapSlot, cap_entry: CapSlot) -> Result<u32, CapError>;
+
+    /// Per-holder revocation (§9.6): clear the entry at `position`
+    /// so this task's later `lookup` fails `Revoked`; the object
+    /// and every other holder stay live. Returns `true` iff a live
+    /// entry was cleared. The position is never reused.
+    pub fn revoke_slot(&mut self, position: u32) -> bool;
 }
 
 pub enum CapError { Revoked, DomainMismatch, TypeMismatch, RightsTooWeak, CapTableFull, ObjectMismatch }
@@ -506,21 +519,67 @@ also call `Driver::reset()` on the affected instance to halt
 in-flight operations — same protocol the loader uses on unload
 (`drivers/spec` §7.3).
 
+**Reset protocol (SEC-B6 #1294).** Which revoke call sites must
+also reset, and which must not:
+- Emergency revoke of a live driver (compromised / misbehaving,
+  `Started`, cannot be trusted to quiesce): use
+  `DriverRegistry::revoke_and_reset_named`, which revokes the
+  handle and then drives `Driver::reset()`. Never a bare
+  `Cap::revoke()` on a live driver's handle — the in-flight race
+  above would leave its operations running.
+- Loader unload (`drivers/spec` §7.3): quiesce first (step 1),
+  then revoke (step 3). The quiesce already drains in-flight
+  work, so no reset is needed at the revoke step; `reset` remains
+  the recovery hook for a wedged device, not part of unload.
+- Normal teardown (`DriverRegistry::unbind_named`): same shape —
+  quiesce-then-revoke, no reset. Unbind refuses a `Started`
+  driver precisely so a caller cannot revoke past live work.
+- Panic containment (`drivers/spec` §7.4): runs the unload
+  protocol from step 3 (REVOKED) with no quiesce — a panicked
+  driver cannot quiesce. The registry primitive above now exists
+  for that path; wiring the panic handler to it is a separate
+  step, not part of this change.
+- Non-driver objects: no reset applies — there is no device to
+  halt. Epoch revocation alone is the whole mechanism.
+
 ### 9.6 Subtree revocation
 
-**Decision:** the CDT (capability derivation tree) is preserved
-per-object as a compact arena of `(parent_slot, child_slot)`
-pairs allocated alongside cap-table rows. `Cap::revoke_subtree(self)`
-walks the tree depth-first and bumps the **per-object** epoch
-once at the end — not once per descendant. The tree exists
-purely so audit logs and the `revoke_subtree` operation can
-identify which derived caps were affected; it is **never** on
-the hot path.
+**Decision (SEC-B6 #1294):** the CDT (capability derivation
+tree) is preserved per-object as a 36-bit edge mask in the
+object-table entry (`object_table::record_derivation`,
+`revoke_subtree`). A derivation never changes a slot's index,
+generation, or `type_tag` — only its rights — so a CDT edge is
+fully identified by its `(parent_rights, child_rights)` pair
+over the six single-bit rights (`Read`..`Create`): bit
+`p * 6 + c` is set when a cap with right `1 << p` was derived
+into a cap with right `1 << c`. Two derivations that yield the
+same rights are the same authority and share the edge.
+`Cap::revoke_subtree(self)` walks the mask depth-first from the
+cap's rights and bumps the **per-object** epoch once at the end
+— not once per descendant — and returns the number of distinct
+derived rights-subsets the bump covered. The tree exists purely
+so audit logs and the `revoke_subtree` operation can identify
+which derived caps were affected; it is **never** on the hot
+path (`check_live` / `invoke` still do the single epoch
+comparison, unchanged).
 
-CDT memory is bounded: each cap derivation adds one
-`(u32 parent, u32 child)` pair; a cap with N derivations costs
-8 × N bytes. The arena is in `DOMAIN_CAPS`. Revocation of the
-entire object frees the arena O(1).
+CDT memory is bounded: 8 bytes per object-table entry, cleared
+on index reuse; recording an edge is one `fetch_or` on the cold
+derive path, and `derive` stays allocation-free.
+
+**What `revoke_subtree` does NOT do:** spare siblings. The epoch
+is per object, not per cap, so the bump kills every cap of the
+object, siblings included. The selective operation this model
+supports is per-holder revocation: `CapTable::revoke_slot`
+clears one task's table entry while the object and every other
+holder stay live. Per-node sparing (revoke one derivation node
+and leave its parent live) would need a per-derivation epoch,
+and that is held, not implemented: `derive` runs per I/O (a
+filesystem derives a `Read` cap per sector read), `Cap` is
+`Copy` with no `Drop` and no in-tree release path for derived
+caps, so a per-derivation entry would grow the table at I/O
+rate with no reclaim — the unbounded-growth hole §9.7's bound
+had just closed. That redesign is Daniel's call.
 
 ### 9.7 Cap-table sizing
 

@@ -146,6 +146,83 @@ fn smoke_cap_revoke_invalidates() -> TestResult {
 }
 kernel_test_in!("capabilities", smoke_cap_revoke_invalidates);
 
+fn smoke_cap_revoke_subtree_enumerates_derivations() -> TestResult {
+    // SEC-B6 #1294, spec §9.6: `revoke_subtree` walks the CDT from
+    // the revoked cap's rights and bumps the per-object epoch once.
+    // The count enumerates the derived rights-subsets covered; the
+    // kill itself is object-wide (siblings die too — asserted here
+    // so no caller mistakes the count for selective sparing).
+    use crate::{Cap, CapKind, CapType, Invoke, Read, Write};
+
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+
+    // Edges: Write -> Read, Write -> Invoke, Invoke -> Read.
+    // Rooted at Read: only Read itself.
+    let w: Cap<TestObj, Write> = Cap::bootstrap();
+    let r1: Cap<TestObj, Read> = w.derive().unwrap();
+    let i1: Cap<TestObj, Invoke> = w.derive().unwrap();
+    let _r2: Cap<TestObj, Read> = i1.derive().unwrap();
+    if r1.revoke_subtree() != 1 {
+        return TestResult::Fail("revoke_subtree(Read) covered more than the Read node");
+    }
+    if w.is_live() || i1.is_live() {
+        return TestResult::Fail("revoke_subtree(Read) left a sibling live");
+    }
+    // Rooted at Invoke: Invoke + Read.
+    let w: Cap<TestObj, Write> = Cap::bootstrap();
+    let _r1: Cap<TestObj, Read> = w.derive().unwrap();
+    let i1: Cap<TestObj, Invoke> = w.derive().unwrap();
+    let _r2: Cap<TestObj, Read> = i1.derive().unwrap();
+    if i1.revoke_subtree() != 2 {
+        return TestResult::Fail("revoke_subtree(Invoke) did not cover Invoke + Read");
+    }
+    if w.is_live() {
+        return TestResult::Fail("revoke_subtree(Invoke) left the parent live");
+    }
+    // Rooted at the mint: the whole tree.
+    let w: Cap<TestObj, Write> = Cap::bootstrap();
+    let _r1: Cap<TestObj, Read> = w.derive().unwrap();
+    let _i1: Cap<TestObj, Invoke> = w.derive().unwrap();
+    if w.revoke_subtree() != 3 {
+        return TestResult::Fail("revoke_subtree(Write) did not cover the whole tree");
+    }
+    // An already-dead cap revokes nothing.
+    let w: Cap<TestObj, Write> = Cap::bootstrap();
+    let dead = w;
+    dead.revoke();
+    if dead.revoke_subtree() != 0 {
+        return TestResult::Fail("revoke_subtree on a dead cap reported coverage");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "capabilities",
+    smoke_cap_revoke_subtree_enumerates_derivations
+);
+
+fn smoke_cap_derive_from_revoked_parent_fails() -> TestResult {
+    // A revoked parent mints nothing: the epoch check runs before
+    // any CDT edge is recorded, so no derivation is registered
+    // against a dead object.
+    use crate::{Cap, CapError, CapKind, CapType, Read, Write};
+
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+
+    let w: Cap<TestObj, Write> = Cap::bootstrap();
+    w.revoke();
+    match w.derive::<Read>() {
+        Err(CapError::Revoked) => TestResult::Pass,
+        _ => TestResult::Fail("derive from a revoked parent succeeded"),
+    }
+}
+kernel_test_in!("capabilities", smoke_cap_derive_from_revoked_parent_fails);
+
 fn smoke_cap_independent_objects() -> TestResult {
     // Revoking one object does not invalidate caps to another object
     // of the same kind — epochs are per-index, not global.
@@ -694,6 +771,56 @@ fn smoke_cap_table_lookup_validation() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("capabilities", smoke_cap_table_lookup_validation);
+
+fn smoke_cap_table_revoke_slot() -> TestResult {
+    // SEC-B6 #1294: per-holder revocation. Clearing one task's table
+    // entry revokes that holder only — the object and every other
+    // holder stay live — and the cleared position is never reused.
+    use crate::{Cap, CapKind, CapSlot, CapTable, CapType, Write};
+
+    struct TestObj;
+    impl CapType for TestObj {
+        const KIND: CapKind = CapKind::Endpoint;
+    }
+
+    let a: Cap<TestObj, Write> = Cap::bootstrap();
+    let b: Cap<TestObj, Write> = Cap::bootstrap();
+    let mut t = CapTable::new();
+    let at_a = t.install_bootstrap(&a).unwrap();
+    let at_b = t.install_bootstrap(&b).unwrap();
+    if !t.revoke_slot(at_a) {
+        return TestResult::Fail("revoke_slot refused a live entry");
+    }
+    let s = a.slot();
+    if t.lookup(CapSlot::new(s.generation, at_a, s.rights, s.type_tag))
+        .is_ok()
+    {
+        return TestResult::Fail("revoked holder's slot still resolved");
+    }
+    if !a.is_live() {
+        return TestResult::Fail("revoke_slot killed the object for other holders");
+    }
+    let s = b.slot();
+    if t.lookup(CapSlot::new(s.generation, at_b, s.rights, s.type_tag))
+        .is_err()
+    {
+        return TestResult::Fail("revoke_slot killed a neighbouring holder");
+    }
+    // Empty / out-of-range positions revoke nothing.
+    if t.revoke_slot(at_a) || t.revoke_slot(CapTable::MAX_SLOTS as u32) {
+        return TestResult::Fail("revoke_slot reported a dead position as revoked");
+    }
+    // The cleared position is never reused: the next bootstrap
+    // install lands at the next fresh position, so a stale presented
+    // slot can never alias a new grant.
+    let c: Cap<TestObj, Write> = Cap::bootstrap();
+    let at_c = t.install_bootstrap(&c).unwrap();
+    if at_c == at_a {
+        return TestResult::Fail("revoke_slot freed its position for reuse");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("capabilities", smoke_cap_table_revoke_slot);
 
 fn smoke_cap_table_growth_and_cap() -> TestResult {
     // Growth doubles capacity (256 → 512 → …) and installing past
