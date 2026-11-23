@@ -206,6 +206,20 @@ pub const DMC_MAX_FW_SIZE_GEN12: usize = 0x6000;
 pub const ICL_DMC_MAX_FW_SIZE: usize = 0x6000;
 /// The display-11 DMC container name (`ICL_DMC_PATH`).
 pub const ICL_DMC_FIRMWARE: &str = "i915/icl_dmc_ver1_09.bin";
+/// Per-program payload ceiling on Gen9 for the Skylake blob
+/// (`SKL_DMC_MAX_FW_SIZE` = `BXT_DMC_MAX_FW_SIZE`), in bytes.
+/// Linux `display/intel_dmc.c:178-183`.
+pub const SKL_DMC_MAX_FW_SIZE: usize = 0x3000;
+/// Per-program payload ceiling on Gen9 for the Kaby Lake blob
+/// (`KBL_DMC_MAX_FW_SIZE` = `BXT_DMC_MAX_FW_SIZE`), in bytes.
+/// Linux `display/intel_dmc.c:174-175`. The same 0x3000 as the
+/// Skylake blob; kept as its own constant so the two blob
+/// ceilings stay independently pinned to their Linux defines.
+pub const KBL_DMC_MAX_FW_SIZE: usize = 0x3000;
+/// The display-9 Skylake DMC container name (`SKL_DMC_PATH`).
+pub const SKL_DMC_FIRMWARE: &str = "i915/skl_dmc_ver1_27.bin";
+/// The display-9 Kaby Lake DMC container name (`KBL_DMC_PATH`).
+pub const KBL_DMC_FIRMWARE: &str = "i915/kbl_dmc_ver1_04.bin";
 /// Load address for v1 programs (no start field in v1).
 pub const DMC_V1_LOAD_ADDR: u32 = 0x80000;
 /// MMIO sanity range for v1 headers (any id).
@@ -277,6 +291,15 @@ pub enum DmcPlatform {
     /// has no range for them on display 11), and PipeD skipped
     /// (ICL has pipes A–C).
     Gen11,
+    /// Display 9 (SKL/KBL/CFL/WHL/CML): the Gen11 rules
+    /// exactly — the same main/pipe geometry, v3 program
+    /// headers refused (`dmc_mmio_addr_sanity_check` has no
+    /// range for them on display < 12 either), PipeD skipped
+    /// (SKL has pipes A–C), no TGL/ADL-S event fixups — with
+    /// the smaller 0x3000 per-program payload ceiling
+    /// (`BXT_DMC_MAX_FW_SIZE`, shared by the SKL and KBL
+    /// blobs) instead of Gen11's 0x6000.
+    Gen9,
     /// Display 14 (MTL/ARL): display >= 13 pipe geometry, the
     /// 0x7000 payload ceiling, no TGL/ADL-S event fixups, and
     /// Wa_16015201720 around load/disable.
@@ -422,7 +445,7 @@ impl DmcId {
     /// display >= 13 main 0x8F000 and pipes 0x5F000 + 0x400·(id−1).
     pub fn evt_reg_base_for(self, platform: DmcPlatform) -> Option<u32> {
         match platform {
-            DmcPlatform::Gen11 | DmcPlatform::Gen12 => self.evt_reg_base(),
+            DmcPlatform::Gen9 | DmcPlatform::Gen11 | DmcPlatform::Gen12 => self.evt_reg_base(),
             DmcPlatform::Xelpdp
             | DmcPlatform::Xe2Lpd
             | DmcPlatform::Xe3Lpd
@@ -778,8 +801,9 @@ fn parse_program<'a>(
                 .mmio_range_v3()
                 .ok_or(DmcError::MmioOutOfRange { addr: mmioaddr[0] })?,
             // dmc_mmio_addr_sanity_check has no range for a v3
-            // header on display 11: refused outright.
-            DmcPlatform::Gen11 => {
+            // header on display 11 or display 9: refused
+            // outright.
+            DmcPlatform::Gen9 | DmcPlatform::Gen11 => {
                 return Err(DmcError::HeaderVersionUnsupported { header_ver });
             }
             // dmc_mmio_addr_sanity_check: main uses the TGL main
@@ -810,8 +834,9 @@ fn parse_program<'a>(
         DmcPlatform::Gen12 if header_ver == 3 => Some(id.program_range()),
         DmcPlatform::Gen12 => None,
         // Gen11 v1 programs load at 0x80000 unwidowed, like
-        // Gen12; v3 headers are refused above.
-        DmcPlatform::Gen11 => None,
+        // Gen12; v3 headers are refused above. Gen9 is the
+        // same: v1 at 0x80000 unwidowed, v3 refused.
+        DmcPlatform::Gen9 | DmcPlatform::Gen11 => None,
         // Both header versions are windowed on display 14 (a v1
         // program loads at 0x80000; a v1 pipe program therefore
         // never fits its pipe window).
@@ -882,6 +907,33 @@ pub fn parse_dmc_firmware_gen11(
         stepping,
         substepping,
         ICL_DMC_MAX_FW_SIZE,
+    )
+}
+
+/// Parse and validate a display-9 (Skylake / Kaby Lake /
+/// Coffee Lake / Whiskey Lake / Comet Lake) container — the
+/// `i915/skl_dmc_ver1_27.bin` or `i915/kbl_dmc_ver1_04.bin`
+/// blob — against the pinned `intel_dmc.c` rules for
+/// DISPLAY_VER == 9: the `BXT_DMC_MAX_FW_SIZE` (0x3000)
+/// payload ceiling, v1 headers in the shared 0x80000–0x8FFFF
+/// window, v3 headers refused (`dmc_mmio_addr_sanity_check`
+/// has no range for them on display < 12), no TGL/ADL-S
+/// event fixups, PipeD skipped (SKL has pipes A–C). Both
+/// shipped blobs are v1 packages, so every entry is the main
+/// DMC. The ceiling is the same 0x3000 for both blobs, so
+/// one entry point serves both; the blob name is the
+/// probe-time module's (`intel_gpu_gen9_dmc`) business.
+pub fn parse_dmc_firmware_gen9(
+    blob: &[u8],
+    stepping: u8,
+    substepping: u8,
+) -> Result<DmcFirmware<'_>, DmcError> {
+    parse_for(
+        blob,
+        DmcPlatform::Gen9,
+        stepping,
+        substepping,
+        SKL_DMC_MAX_FW_SIZE,
     )
 }
 
@@ -1066,8 +1118,9 @@ fn parse_for(
         };
         let skipped = match platform {
             DmcPlatform::Gen12 => matches!(id, DmcId::PipeC | DmcId::PipeD),
-            // ICL has pipes A–C: only PipeD is skipped.
-            DmcPlatform::Gen11 => matches!(id, DmcId::PipeD),
+            // ICL has pipes A–C: only PipeD is skipped. SKL
+            // likewise has pipes A–C.
+            DmcPlatform::Gen9 | DmcPlatform::Gen11 => matches!(id, DmcId::PipeD),
             DmcPlatform::Xelpdp
             | DmcPlatform::Xe2Lpd
             | DmcPlatform::Xe3Lpd
@@ -1176,7 +1229,8 @@ pub fn load_mmiodata(id: DmcId, addr: u32, data: u32) -> u32 {
 pub fn load_mmiodata_for(platform: DmcPlatform, id: DmcId, addr: u32, data: u32) -> u32 {
     match platform {
         DmcPlatform::Gen12 => load_mmiodata(id, addr, data),
-        DmcPlatform::Gen11
+        DmcPlatform::Gen9
+        | DmcPlatform::Gen11
         | DmcPlatform::Xelpdp
         | DmcPlatform::Xe2Lpd
         | DmcPlatform::Xe3Lpd
