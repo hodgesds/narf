@@ -1965,8 +1965,12 @@ section, it does not re-litigate scope.
   Gen11 is 8, Gen9 is not yet confirmed 8); the
   display-9 `max_dc` / allowed-DC mask (Lane 6 reads
   `display/intel_display_power.c::get_allowed_dc_mask` —
-  the mask itself is UPTO_DC5 alone, the direct read of
-  `gen9_dc_mask` with no version arm adding anything);
+  CLOSED by Lane 6: `max_dc` is 2, the allowed mask is
+  UPTO_DC6 = 0x2, the target is DC6, and the mask itself
+  is UPTO_DC5 | UPTO_DC6 = 0x3 — the grounding's "UPTO_DC5
+  alone" missed the `else` arm of `gen9_dc_mask`, which
+  adds UPTO_DC6 for display 9. DC9 is NOT allowed on
+  display 9; see §12.5);
   the Gen9 scaler limits (Lane 5 or a scaler follow-up
   reads `display/skl_scaler.c`'s display-9 branches —
   panel fitting is not on the first-modeset path);
@@ -1978,6 +1982,99 @@ section, it does not re-litigate scope.
   That sentence is stale as of this lane; Lane 1 owns
   §5 and updates it when it adds the Gen9 census —
   do not edit §5 in a Lane 0 follow-up.
+
+### 12.5 Gen9 power (Lane 6)
+
+Gen9 idle power, verified against Linux 7.4-rc2 (commit
+7475ea8b) rather than reused from the Gen11 modules — the
+re-verification found five RC6 divergences and one DC-mask
+correction:
+
+- RC6 (`intel_gpu_rc6`, `enable_gen9`): `gen9_rc6_enable`
+  is a different sequence from `gen11_rc6_enable`, not the
+  same sequence with a different hysteresis. The wake-rate
+  limit is platform-split — Skylake writes `108 << 16`
+  (`WaRsDoubleRc6WrlWithCoarsePowerGating:skl`), every
+  other Gen9 part writes `54 << 16` — and the
+  `GEN10_MEDIA_WAKE_RATE_LIMIT` write (150) does not exist
+  on this path at all. The coarse power-gating hysteresis
+  is 250, not 60. `GEN6_RC6_THRESHOLD` is 37500 (37.5/125
+  ms per EI), not 50000, and it is written *after* the
+  hysteresis writes, not before them. `GEN9_PG_ENABLE` is
+  render + media only (0x3): no media-sampler bit (that
+  enable is Gen11+) and no VDN bits — and on Skylake
+  GT3/GT4 parts the write is skipped entirely
+  (`WaRsDisableCoarsePowerGating:skl,cnl`,
+  `IS_SKYLAKE && (gt == 3 || gt == 4)`). The GT tier is
+  not modelled yet, so `enable_gen9` takes the WA as an
+  explicit caller input (`wa_disable_coarse_pg`); the
+  sub-platform alone cannot derive it. Finally, after the
+  sequence `intel_rc6_enable` zeroes `rc6->ctl_enable` for
+  GRAPHICS_VER == 9 (`NEEDS_RC6_CTX_CORRUPTION_WA`), so
+  Gen9 unpark writes 0 to `GEN6_RC_CONTROL`, not the
+  host-owned 0x88040000 — `Rc6` now carries the
+  enable-time control value and unpark restores it, while
+  park still arms RC6 with the RC6-enable bit alone +
+  target state 4 (its `manual` flag is latched from the
+  pre-zeroed value). The park target stays 4 on Gen9:
+  `has_rc6p` is 0 (Gen9 inherits `G75_FEATURES` via
+  `GEN8_FEATURES`, "RC6p removed-by HSW") and `HAS_RC6pp`
+  is always false. `enable_gen9` has no production caller
+  yet — the Gen12 PM seam owns the only live enable; the
+  Gen9 PM wiring calls it when it lands, as with Gen11's.
+- DC states (`intel_gpu_gen9_dc_states`): display 9 has
+  its own mask, derived from
+  `display/intel_display_power_well.c::gen9_dc_mask` (the
+  final `else` arm — the one display 9 takes — adds
+  UPTO_DC6 to the UPTO_DC5 base) and
+  `display/intel_display_power.c::get_allowed_dc_mask`
+  (`max_dc` 2, DC9 only for GLK/BXT or ver >= 11, requested
+  2 adds UPTO_DC6). The mask is UPTO_DC5 | UPTO_DC6 = 0x3,
+  the allowed mask is UPTO_DC6 = 0x2, the target is DC6.
+  The grounding's "UPTO_DC5 alone" recollection is wrong —
+  it missed the `else` arm — and DC9 is NOT allowed on
+  display 9 (the display-11 allowed mask DC9 | UPTO_DC6 =
+  0xA does not carry over). This closes the grounding §17
+  display-9 `max_dc` / allowed-DC-mask item. The module is
+  the mask + target + sticky-write core only, in the
+  display-11 module's shape, and DC6 is armed only with a
+  loaded SKL/KBL DMC program (`skl_dmc_ver1_27` /
+  `kbl_dmc_ver1_04`, Lane 5's load).
+- Forcewake (`intel_gpu_forcewake`): the Gen9 domain table
+  is the three aggregate domains — render 0xA278, media
+  0xA270, blitter 0xA188, acks 0x0D84 / 0x0D88 / 0x130044 —
+  pinned as `GEN9_FW_DOMAINS` with the Gen9-named register
+  constants. There are NO per-VDBOX/VEBOX sub-domains on
+  Gen9 (those are Gen11+ only); Lane 3 reuses this table
+  instead of duplicating it. The forcewake engine itself is
+  generation-shared and unchanged.
+- SAGV (`intel_gpu_gen9_sagv`): the Gen9 mechanism is the
+  pcode 0x21 primitive from `display/skl_watermark.c` —
+  `skl_sagv_enable` writes `GEN9_SAGV_ENABLE` (0x3) with
+  no wait, `skl_sagv_disable` re-sends
+  `GEN9_SAGV_DISABLE` (0x0) until the reply carries
+  `GEN9_SAGV_IS_DISABLED` (0x1), inside a 51 ms budget
+  (Linux's 1 ms base + 50 ms fallback). The display-11
+  QGV-point mechanism (0xe) is a different mechanism and
+  is not used here. Presence + status tracking
+  (`I915_SAGV_ENABLED / DISABLED / NOT_CONTROLLED`,
+  `intel_has_sagv`) and the pre/post-plane-update
+  sequencing belong to the bandwidth-state caller; these
+  are the primitives it will call.
+- D3cold / runtime PM: no Gen9 arm was needed.
+  `intel_gpu_d3cold` is generation-independent (root-port
+  PME + ACPI `_PR3` + VRAM threshold) and
+  `intel_gpu_runtime_power` carries no generation gating;
+  both were verified, not changed.
+- Remainder: the `pctx_corrupted` check
+  (`GEN8_RC6_CTX_INFO` 0x8504, `gt/intel_gt_regs.h:544`) —
+  Linux reads it at the tail of `intel_rc6_enable` and at
+  the head of `intel_rc6_park`, and a zeroed register
+  means the RC6 context was corrupted, disabling runtime
+  power management. It is NOT modelled in `enable_gen9`:
+  it needs the runtime-PM disable path to land on. The
+  offset is recorded in `intel_gpu_rc6`'s header so that
+  lane wires it without re-deriving it.
 
 ## 13. Suspend/resume + D-states (Stage 5 — `intel_gpu_pm`, #1015)
 

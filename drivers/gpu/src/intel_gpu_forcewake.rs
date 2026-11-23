@@ -119,6 +119,41 @@ pub const FORCEWAKE_ACK_MEDIA: u64 = 0x0D88;
 /// FORCEWAKE ack register, blitter domain (0x130044).
 pub const FORCEWAKE_ACK_BLITTER: u64 = 0x130044;
 
+// ── The Gen9 domain table (Lane 6) ────────────────────────────
+//
+// The three aggregate domains above ARE the Gen9 forcewake
+// table: on Gen9 (Skylake / Kaby Lake / Coffee Lake / Whiskey
+// Lake / Comet Lake) the GT has exactly these three domains —
+// render + media + blitter aggregates, at the Gen9-named
+// registers below. There are NO per-VDBOX/VEBOX sub-domains
+// on Gen9: those are Gen11+ only
+// (`FORCEWAKE_MEDIA_VDBOX_GEN11(n)` 0xA540+4n,
+// `FORCEWAKE_MEDIA_VEBOX_GEN11(n)` 0xA560+4n,
+// `intel_gpu_media.rs:248-313`). Lane 3 (execlists / media
+// engines) reuses this table instead of duplicating it — the
+// forcewake engine itself is generation-shared; only the
+// table differs, and on Gen9 the table is this one.
+
+/// FORCEWAKE request register, render domain, Gen9 name
+/// (`FORCEWAKE_RENDER_GEN9` in `i915_reg.h`).
+pub const FORCEWAKE_RENDER_GEN9: u64 = 0xA278;
+/// FORCEWAKE request register, media domain, Gen9 name
+/// (`FORCEWAKE_MEDIA_GEN9` in `i915_reg.h`).
+pub const FORCEWAKE_MEDIA_GEN9: u64 = 0xA270;
+/// FORCEWAKE request register, blitter domain, Gen9 name
+/// (`FORCEWAKE_BLITTER_GEN9` in `i915_reg.h`, the legacy
+/// `FORCEWAKE_MT` register).
+pub const FORCEWAKE_BLITTER_GEN9: u64 = 0xA188;
+/// FORCEWAKE ack register, render domain, Gen9 name
+/// (`FORCEWAKE_ACK_RENDER_GEN9` in `i915_reg.h`).
+pub const FORCEWAKE_ACK_RENDER_GEN9: u64 = 0x0D84;
+/// FORCEWAKE ack register, media domain, Gen9 name
+/// (`FORCEWAKE_ACK_MEDIA_GEN9` in `i915_reg.h`).
+pub const FORCEWAKE_ACK_MEDIA_GEN9: u64 = 0x0D88;
+/// FORCEWAKE ack register, blitter domain, Gen9 name
+/// (`FORCEWAKE_ACK_BLITTER_GEN9` in `i915_reg.h`).
+pub const FORCEWAKE_ACK_BLITTER_GEN9: u64 = 0x130044;
+
 /// The request bit owned by the kernel driver (i915
 /// `FORCEWAKE_KERNEL`). BIT(1) of the same registers is
 /// `FORCEWAKE_USER`, another requestor's bit; the masked-write
@@ -162,6 +197,13 @@ pub enum FwDomain {
 
 /// All domains, for iteration (sanitize, fixtures).
 pub const FW_DOMAINS: [FwDomain; 3] = [FwDomain::Render, FwDomain::Blitter, FwDomain::Media];
+
+/// The Gen9 forcewake domain table: render + media +
+/// blitter aggregates — the complete Gen9 set. Lane 3
+/// (execlists / media engines) reuses this table; it must
+/// not invent per-VDBOX/VEBOX sub-domains for Gen9 (those
+/// are Gen11+, see the register-map note above).
+pub const GEN9_FW_DOMAINS: [FwDomain; 3] = FW_DOMAINS;
 
 impl FwDomain {
     /// Canonical short name (matches i915's domain names).
@@ -553,6 +595,59 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_forcewake", smoke_register_map_pinned);
+
+    fn smoke_gen9_domain_table_pinned() -> TestResult {
+        // The Gen9 forcewake domain table (Lane 6): exactly
+        // the three aggregate domains, at the Gen9-named
+        // registers from i915_reg.h — render 0xA278 / media
+        // 0xA270 / blitter 0xA188, acks 0x0D84 / 0x0D88 /
+        // 0x130044. No per-VDBOX/VEBOX sub-domain exists in
+        // this table: those are Gen11+ only, and a Lane 3
+        // engine table that added one for Gen9 would be
+        // programming registers the hardware does not have.
+        if GEN9_FW_DOMAINS.len() != 3 {
+            return TestResult::Fail("the Gen9 forcewake table must have exactly three domains");
+        }
+        if GEN9_FW_DOMAINS != FW_DOMAINS {
+            return TestResult::Fail("the Gen9 forcewake table is the aggregate domain set");
+        }
+        if FORCEWAKE_RENDER_GEN9 != FORCEWAKE_RENDER
+            || FORCEWAKE_MEDIA_GEN9 != FORCEWAKE_MEDIA
+            || FORCEWAKE_BLITTER_GEN9 != FORCEWAKE_BLITTER
+        {
+            return TestResult::Fail("Gen9 request registers diverge from the domain accessors");
+        }
+        if FORCEWAKE_ACK_RENDER_GEN9 != FORCEWAKE_ACK_RENDER
+            || FORCEWAKE_ACK_MEDIA_GEN9 != FORCEWAKE_ACK_MEDIA
+            || FORCEWAKE_ACK_BLITTER_GEN9 != FORCEWAKE_ACK_BLITTER
+        {
+            return TestResult::Fail("Gen9 ack registers diverge from the domain accessors");
+        }
+        for domain in GEN9_FW_DOMAINS {
+            match domain {
+                FwDomain::Render => {
+                    if domain.set_reg() != 0xA278 || domain.ack_reg() != 0x0D84 {
+                        return TestResult::Fail("Gen9 render domain registers wrong");
+                    }
+                }
+                FwDomain::Media => {
+                    if domain.set_reg() != 0xA270 || domain.ack_reg() != 0x0D88 {
+                        return TestResult::Fail("Gen9 media domain registers wrong");
+                    }
+                }
+                FwDomain::Blitter => {
+                    if domain.set_reg() != 0xA188 || domain.ack_reg() != 0x130044 {
+                        return TestResult::Fail("Gen9 blitter domain registers wrong");
+                    }
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_forcewake",
+        smoke_gen9_domain_table_pinned
+    );
 
     fn smoke_acquire_release_conversation() -> TestResult {
         // The full hardware conversation, pinned write-for-write:

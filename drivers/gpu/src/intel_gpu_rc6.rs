@@ -1,4 +1,4 @@
-//! Intel Gen11/Gen12 RC6 — render power conservation and the
+//! Intel Gen9/Gen11/Gen12 RC6 — render power conservation and the
 //! coarse power-gating configuration that feeds it.
 //!
 //! ## What RC6 is (and is not)
@@ -10,7 +10,7 @@
 //! on the next wake. On a laptop this is the difference
 //! between an idle machine that sips power and one that drains
 //! its battery driving an idle GPU. This module owns the
-//! *host* side of RC6 on Gen11/Gen12 parts:
+//! *host* side of RC6 on Gen9/Gen11/Gen12 parts:
 //!
 //! - the enable sequence (wake-rate limits, evaluation
 //!   interval, idle hysteresis, per-engine max-idle, the RC6
@@ -69,6 +69,51 @@
 //!   (`intel_rc6_residency_ns`): the hardware counters are
 //!   32-bit, in 1.28 µs units on Gen11/12, and i915
 //!   accumulates wrap-safe deltas into a 64-bit total.
+//! - `drivers/gpu/drm/i915/gt/intel_rc6.c`:
+//!   `gen9_rc6_enable` (used for GRAPHICS_VER 9) is NOT the
+//!   Gen11 sequence with a different hysteresis — the Gen9
+//!   lane re-verified it in full and found five divergences
+//!   from `gen11_rc6_enable` (see `enable_gen9`):
+//!   (1) the wake-rate limit is platform-split — Skylake
+//!   writes `108 << 16` (`WaRsDoubleRc6WrlWithCoarsePowerGating:skl`,
+//!   doubling WRL only when coarse power gating is enabled),
+//!   every other Gen9 part writes `54 << 16` — and the
+//!   `GEN10_MEDIA_WAKE_RATE_LIMIT` write (150) does not
+//!   exist on this path at all; (2) the coarse power-gating
+//!   hysteresis is 250, not 60; (3) `GEN6_RC6_THRESHOLD` is
+//!   37500 (37.5/125 ms per EI), not 50000 — and it is
+//!   written *after* the hysteresis writes, not before
+//!   them; (4) `GEN9_PG_ENABLE` is render + media only
+//!   (0x3): no media-sampler bit (that enable is Gen11+,
+//!   `GEN11_MEDIA_SAMPLER_PG_ENABLE`) and no VDN bits —
+//!   and on Skylake GT3/GT4 parts the write is skipped
+//!   entirely (`WaRsDisableCoarsePowerGating:skl,cnl`,
+//!   `i915_drv.h`: `IS_SKYLAKE && (gt == 3 || gt == 4)`);
+//!   (5) after the sequence `intel_rc6_enable` zeroes
+//!   `rc6->ctl_enable` for GRAPHICS_VER == 9
+//!   (`NEEDS_RC6_CTX_CORRUPTION_WA`), so Gen9 unpark writes
+//!   0 to `GEN6_RC_CONTROL`, not the host-owned 0x88040000 —
+//!   while park still works, because `rc6->manual` is latched
+//!   from the pre-zeroed value and park writes
+//!   `GEN6_RC_CTL_RC6_ENABLE` + target 4 itself. The park
+//!   target stays 4 on Gen9: `has_rc6p` is 0 (Gen9 inherits
+//!   `G75_FEATURES` via `GEN8_FEATURES`, "RC6p removed-by
+//!   HSW") and `HAS_RC6pp` is always false.
+//!
+//! ## The Gen9 remainder in this file
+//!
+//! The `pctx_corrupted` check (`GEN8_RC6_CTX_INFO` 0x8504,
+//! `gt/intel_gt_regs.h:544`): Linux reads it at the tail of
+//! `intel_rc6_enable` and at the head of `intel_rc6_park` —
+//! a zeroed context-info register means the RC6 context was
+//! corrupted, and Linux then disables runtime power
+//! management (`intel_rc6_disable` from park; enable returns
+//! without setting `rc6->enabled`). That check needs the
+//! runtime-PM disable path to land on, so it is NOT modelled
+//! here: `enable_gen9` programs the thresholds and marks the
+//! state enabled exactly like the Gen11 path. The register
+//! offset is recorded here so the runtime-PM lane wires it
+//! without re-deriving it.
 //! - `drivers/gpu/drm/i915/gt/intel_gt_regs.h`: the register
 //!   offsets and `GEN6_RC_CTL_*` bit definitions used below.
 //! - `drivers/gpu/drm/i915/gt/intel_engine_regs.h`:
@@ -140,6 +185,7 @@
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_forcewake::{Forcewake, FwDomain, FwError, FW_DOMAINS};
+use crate::intel_gpu_gt::Gen9Platform;
 
 // ── Register map (intel_gt_regs.h) ──────────────────────────
 
@@ -249,6 +295,25 @@ pub const RC6_THRESHOLD_VALUE: u32 = 50_000;
 /// Gen11 coarse power-gating idle hysteresis (media and
 /// render).
 pub const PG_IDLE_HYSTERESIS_VALUE: u32 = 60;
+/// Gen9 coarse power-gating idle hysteresis (media and
+/// render): 250, not the Gen11 60 (`gen9_rc6_enable`).
+pub const PG_IDLE_HYSTERESIS_VALUE_GEN9: u32 = 250;
+/// Gen9 RC6 threshold: 37500 (37.5/125 ms per EI), not the
+/// Gen11/Gen12 50000 (`gen9_rc6_enable`).
+pub const RC6_THRESHOLD_VALUE_GEN9: u32 = 37_500;
+/// Gen9 wake-rate limit on Skylake: `108 << 16`
+/// (`WaRsDoubleRc6WrlWithCoarsePowerGating:skl` — doubling
+/// WRL only when coarse power gating is enabled).
+pub const RC6_WAKE_RATE_LIMIT_VALUE_GEN9_SKL: u32 = 108 << 16;
+/// Gen9 wake-rate limit off Skylake (Kaby Lake / Coffee
+/// Lake / Comet Lake): `54 << 16`.
+pub const RC6_WAKE_RATE_LIMIT_VALUE_GEN9: u32 = 54 << 16;
+/// The `GEN6_RC_CONTROL` value unpark restores on Gen9: 0.
+/// Linux zeroes `rc6->ctl_enable` for GRAPHICS_VER == 9
+/// (`NEEDS_RC6_CTX_CORRUPTION_WA`) after the enable
+/// sequence, so Gen9 unpark writes 0 — not the host-owned
+/// 0x88040000. See the module header.
+pub const RC6_CTL_GEN9: u32 = 0;
 /// GUC_MAX_IDLE_COUNT value (`gen11_rc6_enable` writes 0xA).
 pub const GUC_MAX_IDLE_COUNT_VALUE: u32 = 0xA;
 
@@ -286,19 +351,54 @@ impl From<FwError> for Rc6Error {
     }
 }
 
-/// RC6 state: whether the enable sequence has run. The
-/// register conversation itself is stateless beyond this —
-/// thresholds live in the hardware once programmed.
+/// The per-generation values of the RC6 enable sequence
+/// (`gen11_rc6_enable` vs `gen9_rc6_enable`): the wake-rate
+/// limit, whether the media wake-rate register is written
+/// at all (`None` on Gen9 — the write does not exist on
+/// that path), the RC6 threshold, the coarse power-gating
+/// hysteresis, the `GEN9_PG_ENABLE` value (`None` skips the
+/// write — the `WaRsDisableCoarsePowerGating` case), the
+/// control value unpark restores, and whether the threshold
+/// precedes the hysteresis writes (Gen11/Gen12) or follows
+/// them (Gen9).
+struct EnableSeq {
+    wake_rate_limit: u32,
+    media_wake_rate_limit: Option<u32>,
+    threshold: u32,
+    pg_hysteresis: u32,
+    pg_enable: Option<u32>,
+    ctl_enable: u32,
+    threshold_before_hysteresis: bool,
+}
+
+/// RC6 state: whether the enable sequence has run, and the
+/// `GEN6_RC_CONTROL` value unpark restores (Linux's
+/// `rc6->ctl_enable`). The register conversation itself is
+/// stateless beyond this — thresholds live in the hardware
+/// once programmed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Rc6 {
     enabled: bool,
+    ctl_enable: u32,
 }
 
 impl Rc6 {
     /// A fresh state: RC6 not enabled. The hardware side is
     /// reconciled by [`Rc6::sanitize`] at attach time.
+    /// `ctl_enable` is 0 until an enable runs; it is only
+    /// meaningful while `enabled` (unpark refuses otherwise).
     pub const fn new() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            ctl_enable: 0,
+        }
+    }
+
+    /// The `GEN6_RC_CONTROL` value the last enable programmed
+    /// unpark to restore (the host-owned value on Gen11/Gen12,
+    /// 0 on Gen9 — see [`RC6_CTL_GEN9`]).
+    pub fn ctl_enable(&self) -> u32 {
+        self.ctl_enable
     }
 
     /// Whether the enable sequence has run (and disable has
@@ -329,6 +429,17 @@ impl Rc6 {
     /// enable never carries them.
     pub const fn pg_enable_value_gen11() -> u32 {
         PG_RENDER_ENABLE | PG_MEDIA_ENABLE | PG_MEDIA_SAMPLER_ENABLE
+    }
+
+    /// The GEN9_PG_ENABLE value on Gen9: render + media
+    /// coarse gating only (0x3). No media-sampler bit — that
+    /// enable is Gen11+ (`GEN11_MEDIA_SAMPLER_PG_ENABLE`);
+    /// no VDN bits — those are Gen12-only. Skylake GT3/GT4
+    /// parts take the `WaRsDisableCoarsePowerGating` path
+    /// instead and never write `GEN9_PG_ENABLE` at all (see
+    /// [`Self::enable_gen9`]).
+    pub const fn pg_enable_value_gen9() -> u32 {
+        PG_RENDER_ENABLE | PG_MEDIA_ENABLE
     }
 
     /// Acquire every aggregate forcewake domain
@@ -411,7 +522,20 @@ impl Rc6 {
         engines: &[u64],
         vcs_count: u8,
     ) -> Result<(), Rc6Error> {
-        self.enable_inner(fw, regs, engines, vcs_count, false)
+        self.enable_inner(
+            fw,
+            regs,
+            engines,
+            EnableSeq {
+                wake_rate_limit: RC6_WAKE_RATE_LIMIT_VALUE,
+                media_wake_rate_limit: Some(MEDIA_WAKE_RATE_LIMIT_VALUE),
+                threshold: RC6_THRESHOLD_VALUE,
+                pg_hysteresis: PG_IDLE_HYSTERESIS_VALUE,
+                pg_enable: Some(Self::pg_enable_value(vcs_count)),
+                ctl_enable: RC6_CTL_HOST,
+                threshold_before_hysteresis: true,
+            },
+        )
     }
 
     /// The Gen11 enable sequence: the same thresholds and
@@ -430,7 +554,76 @@ impl Rc6 {
         regs: &M,
         engines: &[u64],
     ) -> Result<(), Rc6Error> {
-        self.enable_inner(fw, regs, engines, 0, true)
+        self.enable_inner(
+            fw,
+            regs,
+            engines,
+            EnableSeq {
+                wake_rate_limit: RC6_WAKE_RATE_LIMIT_VALUE,
+                media_wake_rate_limit: Some(MEDIA_WAKE_RATE_LIMIT_VALUE),
+                threshold: RC6_THRESHOLD_VALUE,
+                pg_hysteresis: PG_IDLE_HYSTERESIS_VALUE,
+                pg_enable: Some(Self::pg_enable_value_gen11()),
+                ctl_enable: RC6_CTL_HOST,
+                threshold_before_hysteresis: true,
+            },
+        )
+    }
+
+    /// The Gen9 enable sequence (`gt/intel_rc6.c::
+    /// gen9_rc6_enable`), run under FORCEWAKE_ALL. `engines`
+    /// lists the register base of each present engine that
+    /// takes a `RING_MAX_IDLE` write, in probe order (Gen9
+    /// production: RCS plus each present VCS/BCS/VECS base,
+    /// once Lane 3's `GEN9_MEDIA_ENGINES` table lands).
+    /// `platform` selects the wake-rate limit: Skylake writes
+    /// `108 << 16` (`WaRsDoubleRc6WrlWithCoarsePowerGating`),
+    /// every other Gen9 platform writes `54 << 16`.
+    /// `wa_disable_coarse_pg` is the
+    /// `WaRsDisableCoarsePowerGating:skl,cnl` input — true on
+    /// Skylake GT3/GT4 parts (`IS_SKYLAKE && (gt == 3 || gt
+    /// == 4)`), false everywhere else (Kaby Lake / Coffee
+    /// Lake / Comet Lake never take it): when true the
+    /// `GEN9_PG_ENABLE` write is skipped entirely. The
+    /// driver does not model the GT tier yet, so the caller
+    /// passes the WA input explicitly — it is a SKU fact,
+    /// not something this module can derive from the
+    /// sub-platform. No production caller wires this yet —
+    /// the Gen12 PM seam owns the only live enable — so this
+    /// is the sequence the Gen9 PM wiring will call.
+    /// If acquiring the holds fails, nothing is programmed
+    /// and `enabled` is unchanged.
+    pub fn enable_gen9<M: MmioWindow>(
+        &mut self,
+        fw: &mut Forcewake,
+        regs: &M,
+        engines: &[u64],
+        platform: Gen9Platform,
+        wa_disable_coarse_pg: bool,
+    ) -> Result<(), Rc6Error> {
+        let wake_rate_limit = match platform {
+            Gen9Platform::Skylake => RC6_WAKE_RATE_LIMIT_VALUE_GEN9_SKL,
+            Gen9Platform::KabyLake | Gen9Platform::CometLake => RC6_WAKE_RATE_LIMIT_VALUE_GEN9,
+        };
+        let pg_enable = if wa_disable_coarse_pg {
+            None
+        } else {
+            Some(Self::pg_enable_value_gen9())
+        };
+        self.enable_inner(
+            fw,
+            regs,
+            engines,
+            EnableSeq {
+                wake_rate_limit,
+                media_wake_rate_limit: None,
+                threshold: RC6_THRESHOLD_VALUE_GEN9,
+                pg_hysteresis: PG_IDLE_HYSTERESIS_VALUE_GEN9,
+                pg_enable,
+                ctl_enable: RC6_CTL_GEN9,
+                threshold_before_hysteresis: false,
+            },
+        )
     }
 
     fn enable_inner<M: MmioWindow>(
@@ -438,12 +631,13 @@ impl Rc6 {
         fw: &mut Forcewake,
         regs: &M,
         engines: &[u64],
-        vcs_count: u8,
-        gen11: bool,
+        seq: EnableSeq,
     ) -> Result<(), Rc6Error> {
         Self::acquire_all(fw, regs)?;
-        regs.write32(GEN6_RC6_WAKE_RATE_LIMIT, RC6_WAKE_RATE_LIMIT_VALUE);
-        regs.write32(GEN10_MEDIA_WAKE_RATE_LIMIT, MEDIA_WAKE_RATE_LIMIT_VALUE);
+        regs.write32(GEN6_RC6_WAKE_RATE_LIMIT, seq.wake_rate_limit);
+        if let Some(media_wake_rate) = seq.media_wake_rate_limit {
+            regs.write32(GEN10_MEDIA_WAKE_RATE_LIMIT, media_wake_rate);
+        }
         regs.write32(GEN6_RC_EVALUATION_INTERVAL, RC_EVALUATION_INTERVAL_VALUE);
         regs.write32(GEN6_RC_IDLE_HYSTERSIS, RC_IDLE_HYSTERSIS_VALUE);
         for base in engines {
@@ -451,15 +645,18 @@ impl Rc6 {
         }
         regs.write32(GUC_MAX_IDLE_COUNT, GUC_MAX_IDLE_COUNT_VALUE);
         regs.write32(GEN6_RC_SLEEP, 0);
-        regs.write32(GEN6_RC6_THRESHOLD, RC6_THRESHOLD_VALUE);
-        regs.write32(GEN9_MEDIA_PG_IDLE_HYSTERESIS, PG_IDLE_HYSTERESIS_VALUE);
-        regs.write32(GEN9_RENDER_PG_IDLE_HYSTERESIS, PG_IDLE_HYSTERESIS_VALUE);
-        let pg_enable = if gen11 {
-            Self::pg_enable_value_gen11()
-        } else {
-            Self::pg_enable_value(vcs_count)
-        };
-        regs.write32(GEN9_PG_ENABLE, pg_enable);
+        if seq.threshold_before_hysteresis {
+            regs.write32(GEN6_RC6_THRESHOLD, seq.threshold);
+        }
+        regs.write32(GEN9_MEDIA_PG_IDLE_HYSTERESIS, seq.pg_hysteresis);
+        regs.write32(GEN9_RENDER_PG_IDLE_HYSTERESIS, seq.pg_hysteresis);
+        if !seq.threshold_before_hysteresis {
+            regs.write32(GEN6_RC6_THRESHOLD, seq.threshold);
+        }
+        if let Some(pg_enable) = seq.pg_enable {
+            regs.write32(GEN9_PG_ENABLE, pg_enable);
+        }
+        self.ctl_enable = seq.ctl_enable;
         self.enabled = true;
         Self::release_all(fw, regs)
     }
@@ -475,17 +672,20 @@ impl Rc6 {
     }
 
     /// Unpark: GT activity is starting, so restore the
-    /// full host control value into GEN6_RC_CONTROL
-    /// (hardware evaluation timers back on). The write runs
-    /// inside a render forcewake hold — RC_CONTROL lives in
-    /// the render well, and the hold is what guarantees the
-    /// write lands while the well is up.
+    /// enable-time control value into GEN6_RC_CONTROL
+    /// (hardware evaluation timers back on). That value is
+    /// the host-owned value on Gen11/Gen12 and 0 on Gen9
+    /// (the `NEEDS_RC6_CTX_CORRUPTION_WA` zeroing — see
+    /// [`RC6_CTL_GEN9`]). The write runs inside a render
+    /// forcewake hold — RC_CONTROL lives in the render well,
+    /// and the hold is what guarantees the write lands while
+    /// the well is up.
     pub fn unpark<M: MmioWindow>(&self, fw: &mut Forcewake, regs: &M) -> Result<(), Rc6Error> {
         if !self.enabled {
             return Err(Rc6Error::NotEnabled);
         }
         fw.with_domain(regs, FwDomain::Render, || {
-            regs.write32(GEN6_RC_CONTROL, RC6_CTL_HOST);
+            regs.write32(GEN6_RC_CONTROL, self.ctl_enable);
         })?;
         Ok(())
     }
@@ -589,8 +789,8 @@ pub mod tests {
     //! forcewake module's own fixtures use), and every other
     //! register is a plain storage cell. Expected write
     //! sequences are hand-derived from intel_rc6.c's
-    //! `gen11_rc6_enable` / park / unpark — never recorded
-    //! from the implementation under test.
+    //! `gen11_rc6_enable` / `gen9_rc6_enable` / park / unpark
+    //! — never recorded from the implementation under test.
 
     use super::*;
     use crate::intel_gpu_rcs::RCS_BASE;
@@ -802,6 +1002,21 @@ pub mod tests {
         {
             return TestResult::Fail("PG_ENABLE composition diverges from gen11_rc6_enable");
         }
+        // Gen9 pins (gen9_rc6_enable): hysteresis 250 (not
+        // 60), threshold 37500 (not 50000), the platform-split
+        // wake-rate limit (SKL 108<<16, everything else
+        // 54<<16), PG_ENABLE render|media only (0x3, no
+        // sampler bit), and the Gen9 unpark value 0 (the
+        // RC6_CTX_CORRUPTION_WA zeroing).
+        if PG_IDLE_HYSTERESIS_VALUE_GEN9 != 250
+            || RC6_THRESHOLD_VALUE_GEN9 != 37_500
+            || RC6_WAKE_RATE_LIMIT_VALUE_GEN9_SKL != (108 << 16)
+            || RC6_WAKE_RATE_LIMIT_VALUE_GEN9 != (54 << 16)
+            || Rc6::pg_enable_value_gen9() != 0x3
+            || RC6_CTL_GEN9 != 0
+        {
+            return TestResult::Fail("Gen9 RC6 values diverge from gen9_rc6_enable");
+        }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_rc6", smoke_register_map_pinned);
@@ -907,6 +1122,157 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_rc6", smoke_enable_gen11_conversation);
+
+    fn smoke_enable_gen9_conversation() -> TestResult {
+        // The Gen9 enable sequence, pinned end to end
+        // (`gen9_rc6_enable`, Kaby Lake — the non-Skylake
+        // wake-rate arm): the wake-rate limit is 54<<16 with
+        // NO media wake-rate write, the threshold is 37500
+        // written AFTER the 250 hysteresis writes, and
+        // PG_ENABLE is render|media only (0x3).
+        let fake = FakeGt::new();
+        let mut fw = Forcewake::new();
+        let mut rc6 = Rc6::new();
+        if rc6.enable_gen9(
+            &mut fw,
+            &fake,
+            &[RCS_BASE, VCS0_BASE],
+            Gen9Platform::KabyLake,
+            false,
+        ) != Ok(())
+        {
+            return TestResult::Fail("Gen9 enable failed against the fake GT");
+        }
+        let mut expected = fw_acquire_writes();
+        expected.push((GEN6_RC6_WAKE_RATE_LIMIT, 0x0036_0000));
+        expected.push((GEN6_RC_EVALUATION_INTERVAL, 125_000));
+        expected.push((GEN6_RC_IDLE_HYSTERSIS, 25));
+        expected.push((RCS_BASE + RING_MAX_IDLE_OFFSET, 10));
+        expected.push((VCS0_BASE + RING_MAX_IDLE_OFFSET, 10));
+        expected.push((GUC_MAX_IDLE_COUNT, 0xA));
+        expected.push((GEN6_RC_SLEEP, 0));
+        expected.push((GEN9_MEDIA_PG_IDLE_HYSTERESIS, 250));
+        expected.push((GEN9_RENDER_PG_IDLE_HYSTERESIS, 250));
+        expected.push((GEN6_RC6_THRESHOLD, 37_500));
+        expected.push((GEN9_PG_ENABLE, 0x3));
+        expected.extend(fw_release_writes());
+        if fake.writes() != expected {
+            return TestResult::Fail("Gen9 enable conversation diverges from gen9_rc6_enable");
+        }
+        if !rc6.is_enabled() || rc6.ctl_enable() != 0 {
+            return TestResult::Fail("Gen9 enable must mark RC6 enabled with ctl_enable 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rc6", smoke_enable_gen9_conversation);
+
+    fn smoke_enable_gen9_skl_wake_rate() -> TestResult {
+        // Skylake doubles the wake-rate limit
+        // (WaRsDoubleRc6WrlWithCoarsePowerGating:skl): 108<<16,
+        // while the rest of the sequence is the Gen9 one.
+        // This is the masking-defeating case for a
+        // platform-blind `54 << 16` wake-rate value.
+        let fake = FakeGt::new();
+        let mut fw = Forcewake::new();
+        let mut rc6 = Rc6::new();
+        if rc6.enable_gen9(&mut fw, &fake, &[RCS_BASE], Gen9Platform::Skylake, false) != Ok(()) {
+            return TestResult::Fail("Skylake Gen9 enable failed against the fake GT");
+        }
+        let writes = fake.writes();
+        if !writes.contains(&(GEN6_RC6_WAKE_RATE_LIMIT, 0x006C_0000)) {
+            return TestResult::Fail("Skylake wake-rate limit must be 108 << 16");
+        }
+        if writes
+            .iter()
+            .any(|(off, _)| *off == GEN10_MEDIA_WAKE_RATE_LIMIT)
+        {
+            return TestResult::Fail("Gen9 enable must not write the media wake-rate register");
+        }
+        if !writes.contains(&(GEN9_PG_ENABLE, 0x3)) {
+            return TestResult::Fail("Skylake PG_ENABLE must be render|media only");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rc6", smoke_enable_gen9_skl_wake_rate);
+
+    fn smoke_enable_gen9_skl_gt3_skips_pg_enable() -> TestResult {
+        // WaRsDisableCoarsePowerGating (Skylake GT3/GT4):
+        // the PG_ENABLE write is skipped entirely — render
+        // and media coarse gating stay off with RC6. This is
+        // the masking-defeating case for an unconditional
+        // PG_ENABLE write.
+        let fake = FakeGt::new();
+        let mut fw = Forcewake::new();
+        let mut rc6 = Rc6::new();
+        if rc6.enable_gen9(&mut fw, &fake, &[RCS_BASE], Gen9Platform::Skylake, true) != Ok(()) {
+            return TestResult::Fail("Skylake GT3 Gen9 enable failed against the fake GT");
+        }
+        if fake.writes().iter().any(|(off, _)| *off == GEN9_PG_ENABLE) {
+            return TestResult::Fail("WaRsDisableCoarsePowerGating must skip the PG_ENABLE write");
+        }
+        if !rc6.is_enabled() {
+            return TestResult::Fail("skipping PG_ENABLE must still mark RC6 enabled");
+        }
+        // The thresholds are still programmed: the WA only
+        // drops the coarse-gating enable.
+        if !fake
+            .writes()
+            .contains(&(GEN9_RENDER_PG_IDLE_HYSTERESIS, 250))
+            || !fake.writes().contains(&(GEN6_RC6_THRESHOLD, 37_500))
+        {
+            return TestResult::Fail("the WA must not drop the threshold/hysteresis writes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rc6",
+        smoke_enable_gen9_skl_gt3_skips_pg_enable
+    );
+
+    fn smoke_gen9_park_unpark_conversation() -> TestResult {
+        // Gen9 park/unpark after a Gen9 enable: unpark
+        // writes 0 to GEN6_RC_CONTROL (the
+        // RC6_CTX_CORRUPTION_WA zeroing), while park still
+        // arms RC6 with the RC6-enable bit alone + target
+        // state 4 — `manual` is latched from the pre-zeroed
+        // control value.
+        let fake = FakeGt::new();
+        let mut fw = Forcewake::new();
+        let mut rc6 = Rc6::new();
+        if rc6.enable_gen9(&mut fw, &fake, &[RCS_BASE], Gen9Platform::CometLake, false) != Ok(()) {
+            return TestResult::Fail("Gen9 enable failed against the fake GT");
+        }
+        fake.clear_logs();
+        if rc6.unpark(&mut fw, &fake) != Ok(()) {
+            return TestResult::Fail("Gen9 unpark failed");
+        }
+        let expected = alloc::vec![
+            (FwDomain::Render.set_reg(), FW_ON),
+            (GEN6_RC_CONTROL, 0),
+            (FwDomain::Render.set_reg(), FW_OFF),
+        ];
+        if fake.writes() != expected {
+            return TestResult::Fail("Gen9 unpark must write GEN6_RC_CONTROL = 0");
+        }
+        fake.clear_logs();
+        if rc6.park(&mut fw, &fake) != Ok(()) {
+            return TestResult::Fail("Gen9 park failed");
+        }
+        let expected = alloc::vec![
+            (FwDomain::Render.set_reg(), FW_ON),
+            (GEN6_RC_CONTROL, RC_CTL_RC6_ENABLE),
+            (GEN6_RC_STATE, RC_TARGET_RC6),
+            (FwDomain::Render.set_reg(), FW_OFF),
+        ];
+        if fake.writes() != expected {
+            return TestResult::Fail("Gen9 park conversation diverges from intel_rc6_park");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rc6",
+        smoke_gen9_park_unpark_conversation
+    );
 
     fn smoke_enable_conversation_with_vcs() -> TestResult {
         // A second engine present: its RING_MAX_IDLE write
