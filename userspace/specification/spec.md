@@ -1075,7 +1075,13 @@ complete record, a later size, allocation, or copy failure returns the completed
 byte prefix and advances the directory cursor only through that prefix. The
 unsigned `count` argument is truncated to its native 32-bit ABI width.
 `d_ino` is `DirOps::entry_ino` of the entry where the directory answers it
-(devpts), otherwise a cursor placeholder.
+(devpts), otherwise a cursor placeholder. A listing appends the directory's
+immediate child mounts after the filesystem's own entries — mount points are
+dentries in the parent on Linux, so `ls /` shows `proc`, `sys`, `dev`, … — with
+a mount's type where its name collides with an underlying entry, and no
+duplicate. The NARF-native `listdir` path-keyed readdir shares this
+enumeration: async first, with the synchronous fallback, so both surfaces
+agree entry for entry.
 Every directory lists `.` at position 0 and `..` at position 1 (`DT_DIR`), as
 Linux's `dir_emit_dots` and the on-disk entries of ext2 and FAT
 subdirectories do, whatever the filesystem enumerates; the filesystem's own

@@ -2321,6 +2321,126 @@ fn smoke_vfs_mount_id_at_correctness() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e/mount", smoke_vfs_mount_id_at_correctness);
 
+/// `VfsRegistry::child_mounts` lists the immediate child mounts of a
+/// directory — the mount points a directory listing must merge after
+/// the covering filesystem's own entries (Linux shows them because
+/// they are dentries in the parent; NARF keeps mounts in a separate
+/// table).
+///
+/// Regression pin for #2133 (related): `ls /` showed only the
+/// initramfs's own `NARF.TXT` — the `proc`, `sys`, `dev`, … mounts
+/// were invisible to readdir.
+fn smoke_registry_child_mounts_lists_immediate_children() -> TestResult {
+    let auth = bootstrap_mount_authority();
+    let parent = match registry().mount(&auth, "/cm2133", MemFs::new("cm2133-parent")) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("parent mount for child-mounts test failed"),
+    };
+    let kid = match registry().mount(&auth, "/cm2133/kid", MemFs::new("cm2133-kid")) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&parent, "/cm2133");
+            return TestResult::Fail("child mount for child-mounts test failed");
+        }
+    };
+    let grand = match registry().mount(&auth, "/cm2133/kid/grand", MemFs::new("cm2133-grand")) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&kid, "/cm2133/kid");
+            let _ = registry().unmount(&parent, "/cm2133");
+            return TestResult::Fail("grandchild mount for child-mounts test failed");
+        }
+    };
+    let alpha = match registry().mount(&auth, "/cm2133/alpha", MemFs::new("cm2133-alpha")) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&grand, "/cm2133/kid/grand");
+            let _ = registry().unmount(&kid, "/cm2133/kid");
+            let _ = registry().unmount(&parent, "/cm2133");
+            return TestResult::Fail("second child mount for child-mounts test failed");
+        }
+    };
+    // A file bind under the parent: the child entry reports the bound
+    // file's type, not Dir.
+    let fsrc = match registry().mount(
+        &auth,
+        "/cm2133-fsrc",
+        MemFs::with_seeds("cm2133-fsrc", &[("f.txt", b"filedata")]),
+    ) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&alpha, "/cm2133/alpha");
+            let _ = registry().unmount(&grand, "/cm2133/kid/grand");
+            let _ = registry().unmount(&kid, "/cm2133/kid");
+            let _ = registry().unmount(&parent, "/cm2133");
+            return TestResult::Fail("file-bind source mount for child-mounts test failed");
+        }
+    };
+    let fbind = match registry().bind_mount(&auth, "/cm2133-fsrc/f.txt", "/cm2133/fbind") {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&fsrc, "/cm2133-fsrc");
+            let _ = registry().unmount(&alpha, "/cm2133/alpha");
+            let _ = registry().unmount(&grand, "/cm2133/kid/grand");
+            let _ = registry().unmount(&kid, "/cm2133/kid");
+            let _ = registry().unmount(&parent, "/cm2133");
+            return TestResult::Fail("file bind for child-mounts test failed");
+        }
+    };
+
+    let outcome = (|| {
+        // Sorted by name; the grandchild is a child of /kid, not /.
+        let expected: Vec<(String, FileType)> = vec![
+            (String::from("alpha"), FileType::Dir),
+            (String::from("fbind"), FileType::File),
+            (String::from("kid"), FileType::Dir),
+        ];
+        if registry().child_mounts("/cm2133") != expected {
+            return Err("child_mounts(/cm2133) is not [alpha, fbind, kid]");
+        }
+        // A trailing slash names the same directory.
+        if registry().child_mounts("/cm2133/") != expected {
+            return Err("child_mounts(/cm2133/) differs from child_mounts(/cm2133)");
+        }
+        if registry().child_mounts("/cm2133/kid") != vec![(String::from("grand"), FileType::Dir)] {
+            return Err("child_mounts(/cm2133/kid) is not [grand]");
+        }
+        if !registry().child_mounts("/cm2133/kid/grand").is_empty() {
+            return Err("child_mounts of a leaf mount is not empty");
+        }
+        if !registry().child_mounts("/cm2133/nope").is_empty() {
+            return Err("child_mounts of a missing directory is not empty");
+        }
+        // A stacked mount at the same child path lists the name once.
+        let kid2 = registry()
+            .mount(&auth, "/cm2133/kid", MemFs::new("cm2133-kid2"))
+            .map_err(|_| "stacked mount for child-mounts test failed")?;
+        let stacked = registry().child_mounts("/cm2133");
+        let _ = registry().unmount(&kid2, "/cm2133/kid");
+        if stacked != expected {
+            return Err("a stacked mount lists its child path twice");
+        }
+        Ok(())
+    })();
+
+    // Reverse attachment order: a parent with a live child is EBUSY.
+    let _ = registry().unmount(&fbind, "/cm2133/fbind");
+    let _ = registry().unmount(&fsrc, "/cm2133-fsrc");
+    let _ = registry().unmount(&alpha, "/cm2133/alpha");
+    let _ = registry().unmount(&grand, "/cm2133/kid/grand");
+    let _ = registry().unmount(&kid, "/cm2133/kid");
+    let _ = registry().unmount(&parent, "/cm2133");
+
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_registry_child_mounts_lists_immediate_children
+);
+
 // ── FS coverage matrix ────────────────────────────────────────────────
 //
 // The VFS layer is FS-agnostic: every FsInstance goes through the same

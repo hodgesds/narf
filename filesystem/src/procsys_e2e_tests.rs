@@ -1196,3 +1196,64 @@ fn e2e_global_node_types_file_symlink_dir() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("procsys_e2e/global", e2e_global_node_types_file_symlink_dir);
+
+// ── /proc readdir (enumerate_async) ──────────────────────────────────────────
+
+/// `ProcRoot::enumerate_async` returns the static entries (`meminfo`,
+/// `stat`, `cpuinfo`, `version`, `loadavg`, …) in the same order as the
+/// synchronous `enumerate()`.
+///
+/// Regression pin for #2133: the `DirOps::enumerate_async` default used
+/// to answer `Err(Unsupported)` for every directory that only implements
+/// the sync side, and `sys_listdir` — libc `readdir`'s backend, the
+/// only readdir surface `ls`/`ps` use — mapped that straight to
+/// ENOTDIR, so `ls /proc` printed nothing and `ps` saw no processes
+/// while direct-path reads worked. The async snapshot must agree with
+/// the sync one, entry for entry.
+fn e2e_global_root_enumerate_async_matches_sync() -> TestResult {
+    use alloc::sync::Arc;
+    let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
+    let sync_entries = root.enumerate(0, 64);
+    let async_entries = match poll_once(root.enumerate_async(0, 64)) {
+        Some(Ok(entries)) => entries,
+        Some(Err(_)) => return TestResult::Fail("ProcRoot::enumerate_async failed"),
+        None => return TestResult::Fail("ProcRoot::enumerate_async went pending"),
+    };
+    if async_entries != sync_entries {
+        return TestResult::Fail("ProcRoot::enumerate_async disagrees with enumerate()");
+    }
+    // The static entries come first, before registry entries and pids.
+    for (name, want) in [
+        ("cpuinfo", FileType::File),
+        ("meminfo", FileType::File),
+        ("stat", FileType::File),
+        ("version", FileType::File),
+        ("loadavg", FileType::File),
+        ("self", FileType::Symlink),
+        ("pressure", FileType::Dir),
+    ] {
+        match async_entries.iter().find(|(n, _)| n == name) {
+            Some((_, got)) if *got == want => {}
+            Some(_) => return TestResult::Fail("a /proc static entry has the wrong type"),
+            None => return TestResult::Fail("a /proc static entry is missing from readdir"),
+        }
+    }
+    // Windowed reads agree too: the first two entries, in order.
+    let first_two = match poll_once(root.enumerate_async(0, 2)) {
+        Some(Ok(entries)) => entries,
+        _ => return TestResult::Fail("ProcRoot::enumerate_async(0, 2) failed"),
+    };
+    if first_two.len() != 2 || first_two[0].0 != "cpuinfo" || first_two[1].0 != "meminfo" {
+        return TestResult::Fail("ProcRoot::enumerate_async(0, 2) is not [cpuinfo, meminfo]");
+    }
+    // Past the end is a clean empty snapshot, not an error.
+    match poll_once(root.enumerate_async(4096, 64)) {
+        Some(Ok(entries)) if entries.is_empty() => {}
+        _ => return TestResult::Fail("ProcRoot::enumerate_async past the end is not empty"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "procsys_e2e/global",
+    e2e_global_root_enumerate_async_matches_sync
+);

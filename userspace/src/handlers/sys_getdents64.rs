@@ -49,6 +49,62 @@ fn enumerate_batch(
     }
 }
 
+/// Snapshot up-to `max` merged-stream entries starting at `start`:
+/// the directory's own entries first, then its immediate child mounts.
+/// `path` is the fd's recorded path (`None` when the fd carries none).
+///
+/// With no child mounts this is exactly [`enumerate_batch`]. With
+/// children, a mount point is a directory entry the way Linux's
+/// dentries make it one, so `ls /` shows `proc`, `sys`, `dev`, … A
+/// mount's type wins where its name collides with an underlying entry
+/// (the mount covers it), and a colliding mount is not listed twice.
+///
+/// A full filesystem window cannot contain mounts — they come after
+/// every filesystem entry — so the fast path serves it untouched and
+/// the merge only runs once the filesystem is exhausted inside (or
+/// before) the window. Placing the mounts then needs the exact
+/// filesystem count and name set, which is the whole listing up to
+/// [`MERGE_ENTRY_CAP`]; past that cap the boundary is unknowable and
+/// the listing serves the filesystem's entries only. `d_ino` for a
+/// mount child stays the cursor placeholder `entry_ino` leaves for
+/// entries a directory cannot name without a lookup, as for procfs
+/// entries today.
+const MERGE_ENTRY_CAP: usize = 4096;
+
+fn merged_snapshot(
+    dir: &alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    path: Option<&str>,
+    start: usize,
+    max: usize,
+) -> Result<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>, i64> {
+    let mounts = path.map(current_child_mounts).unwrap_or_default();
+    if mounts.is_empty() {
+        return enumerate_batch(dir, start, max);
+    }
+    // A full filesystem window holds no mounts.
+    let window = enumerate_batch(dir, start, max)?;
+    if window.len() == max {
+        return Ok(window);
+    }
+    // The filesystem is exhausted inside (or before) this window; the
+    // merged stream needs the exact filesystem count and name set.
+    let fs = enumerate_batch(dir, 0, MERGE_ENTRY_CAP)?;
+    if fs.len() == MERGE_ENTRY_CAP && !enumerate_batch(dir, MERGE_ENTRY_CAP, 1)?.is_empty() {
+        // Too many filesystem entries to place the mounts: serve the
+        // filesystem window only. (`fs.len() == CAP` with an empty probe
+        // means the count is exactly CAP, and the merge below runs.)
+        return Ok(window);
+    }
+    let mut merged = fs;
+    for (mname, mtype) in mounts {
+        match merged.iter_mut().find(|(name, _)| *name == mname) {
+            Some((_, ftype)) => *ftype = mtype,
+            None => merged.push((mname, mtype)),
+        }
+    }
+    Ok(merged.into_iter().skip(start).take(max).collect())
+}
+
 /// Directory positions `dir_emit_dots` gives `.` and `..`; the filesystem's
 /// own entries start after them.
 const DOT_ENTRIES: usize = 2;
@@ -152,7 +208,12 @@ pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
     // Room for a `.` and `..` the filesystem lists itself, which are passed
     // over below, so they never stand in for an entry that would fit.
     let fs_batch = batch_max.saturating_add(DOT_ENTRIES);
-    let snapshot = match enumerate_batch(&dir, cursor.saturating_sub(DOT_ENTRIES), fs_batch) {
+    let snapshot = match merged_snapshot(
+        &dir,
+        name.as_ref().map(|name| &*name.path),
+        cursor.saturating_sub(DOT_ENTRIES),
+        fs_batch,
+    ) {
         Ok(snapshot) => snapshot,
         Err(errno) => {
             ctx.set_return(fail(errno));

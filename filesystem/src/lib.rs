@@ -2601,13 +2601,27 @@ pub trait DirOps: Send + Sync {
         Box::pin(async move { r })
     }
 
-    /// Snapshot entries asynchronously.
+    /// Snapshot entries asynchronously. Default delegates to the
+    /// synchronous [`DirOps::enumerate`], so a directory that only
+    /// implements the sync side (procfs, debugfs, efivarfs, mqueuefs)
+    /// enumerates through the async callers too — `sys_listdir`
+    /// (libc `readdir`'s backend) and `getdents64` both drive this,
+    /// and the old default (`Err(Unsupported)`) made every such
+    /// directory list as empty through `listdir`, which has no sync
+    /// fallback of its own: `ls /proc` printed nothing and `ps` saw
+    /// no processes while direct-path reads worked. Disk-backed
+    /// filesystems keep their real async override (their sync
+    /// `enumerate` is a stub that returns empty); a directory whose
+    /// sync enumeration cannot serve a request must override this
+    /// and return a real error, never rely on `Unsupported` to mean
+    /// "ask again synchronously".
     fn enumerate_async<'a>(
         &'a self,
-        _cursor: usize,
-        _max: usize,
+        cursor: usize,
+        max: usize,
     ) -> FsFuture<'a, alloc::vec::Vec<(alloc::string::String, FileType)>> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+        let entries = self.enumerate(cursor, max);
+        Box::pin(async move { Ok(entries) })
     }
 
     /// This directory's permission bits (low 12 bits of the mode).
@@ -4248,6 +4262,50 @@ fn mount_covers_path(mount_path: &str, abs: &str) -> bool {
         || (abs.starts_with(mount_path) && abs.as_bytes().get(mount_path.len()) == Some(&b'/'))
 }
 
+/// Immediate child mounts of directory `dir`, as `(name, file_type)`
+/// pairs sorted by name.
+///
+/// A directory listing must show mount points — on Linux they are
+/// dentries in the parent, so `ls /` shows `proc`, `sys`, `dev`, …
+/// even though the root filesystem holds none of those names. NARF
+/// keeps mounts in a separate table, so without this the parent's own
+/// enumeration is the whole listing and every mount point is invisible
+/// to `readdir` (`ls /` showed only the initramfs's own `NARF.TXT`).
+///
+/// Only STRICT children count: a mount at `dir/name` is listed, a
+/// deeper one (`dir/name/sub`) is not, and the mount at `dir` itself
+/// is the covering mount, not a child. When several mounts stack at
+/// one path the topmost (latest attachment) wins and the name is
+/// listed once. The type is the mounted root's own: `Dir`, except a
+/// file-rooted mount (`mount --bind` of a file), which reports the
+/// bound file's type. `dir` may carry a trailing slash; `/` names
+/// the root.
+fn child_mount_entries(mounts: &[Mount], dir: &str) -> Vec<(String, FileType)> {
+    let base = dir.trim_end_matches('/');
+    // Sorted by name, and a later (topmost) attachment overwrites an
+    // earlier one at the same path.
+    let mut by_name: alloc::collections::BTreeMap<String, FileType> =
+        alloc::collections::BTreeMap::new();
+    for mount in mounts {
+        let Some(rest) = mount.path.strip_prefix(base) else {
+            continue;
+        };
+        // `rest` is "" for the mount at `dir` itself and "/name" for a
+        // child (of "/" too, where `base` is "" and strips nothing).
+        let name = match rest.strip_prefix('/') {
+            Some(name) if !name.is_empty() && !name.contains('/') => name,
+            _ => continue,
+        };
+        let ftype = mount
+            .fs
+            .root_file()
+            .map(|file| file.stat().mode.file_type)
+            .unwrap_or(FileType::Dir);
+        by_name.insert(String::from(name), ftype);
+    }
+    by_name.into_iter().collect()
+}
+
 /// `do_move_mount`: detach the topmost mount at `source` together with every
 /// mount below it, and attach that tree on top at `target`
 /// (`attach_recursive_mnt`).
@@ -5322,6 +5380,15 @@ impl MountNamespace {
         covering_mount(&q, abs).map(|m| (m.path.clone(), m.group_id()))
     }
 
+    /// Immediate child mounts of directory `dir` in this namespace —
+    /// see [`child_mount_entries`]. Directory listings merge these
+    /// after the covering filesystem's own entries so mount points
+    /// appear in `readdir` the way Linux's dentries show them.
+    pub fn child_mounts(&self, dir: &str) -> Vec<(String, FileType)> {
+        let q = self.store().inner.lock();
+        child_mount_entries(&q, dir)
+    }
+
     /// The stored `MNT_*` flags (no superblock contribution) of the topmost
     /// mount at exactly `path` — what a read-modify-write of the
     /// attachment's own flags must start from.
@@ -6257,6 +6324,13 @@ impl VfsRegistry {
     pub fn covering_mount_info(&self, abs: &str) -> Option<(String, u64)> {
         let q = self.inner.lock();
         covering_mount(&q, abs).map(|m| (m.path.clone(), m.group_id()))
+    }
+
+    /// Immediate child mounts of directory `dir` in this registry —
+    /// see [`MountNamespace::child_mounts`].
+    pub fn child_mounts(&self, dir: &str) -> Vec<(String, FileType)> {
+        let q = self.inner.lock();
+        child_mount_entries(&q, dir)
     }
 
     /// See [`MountNamespace::mount_flags_exact`].
