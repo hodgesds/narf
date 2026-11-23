@@ -400,6 +400,252 @@ fn smoke_acpi_discover_xsdt() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/acpi", smoke_acpi_discover_xsdt);
 
+// ── SEC-F3 (#1299): legacy ACPI parser bounds ──────────────────────
+//
+// Fixtures are built from the specification (ACPI 6.5 §5.2.6 header,
+// §5.2.12 MADT) as byte buffers and handed to the parser as `phys`.
+// That is sound here because `pv()` ORs the direct-map offset
+// (`0xFFFF_C000_0000_0000` once live, 0 before), which is idempotent
+// on any canonical high-half kernel VA — and `acpi_fixture_phys`
+// verifies the identity at runtime, failing the test instead of
+// reading the wrong memory if the mapping ever changes.
+
+#[cfg(target_arch = "x86_64")]
+fn acpi_fixture_phys(buf: &[u8]) -> Result<u64, &'static str> {
+    let phys = buf.as_ptr() as u64;
+    if narf_lib::directmap::pv(phys) != phys {
+        return Err("pv() is not idempotent on the fixture address");
+    }
+    Ok(phys)
+}
+
+/// Write a 36-byte SDT header with a zero checksum byte; call
+/// `acpi_fix_checksum` after the body is laid out.
+#[cfg(target_arch = "x86_64")]
+fn acpi_write_sdt_header(buf: &mut [u8], sig: &[u8; 4], length: u32) {
+    buf[0..4].copy_from_slice(sig);
+    buf[4..8].copy_from_slice(&length.to_le_bytes());
+    buf[8] = 1; // revision
+    buf[9] = 0; // checksum placeholder
+    buf[10..16].copy_from_slice(b"NARFCO");
+    buf[16..24].copy_from_slice(b"NARFTBL_");
+    // OEM revision / creator id / creator revision stay zero.
+}
+
+/// Patch byte 9 so the first `len` bytes sum to 0 mod 256.
+#[cfg(target_arch = "x86_64")]
+fn acpi_fix_checksum(buf: &mut [u8], len: usize) {
+    let sum: u8 = buf[..len].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    buf[9] = (0u8).wrapping_sub(sum);
+}
+
+/// Append `bytes` at `*cur`, advancing the cursor.
+#[cfg(target_arch = "x86_64")]
+fn acpi_push(buf: &mut [u8], cur: &mut usize, bytes: &[u8]) {
+    let end = *cur + bytes.len();
+    buf[*cur..end].copy_from_slice(bytes);
+    *cur = end;
+}
+
+/// Wrap one child table in a checksummed XSDT and parse it. The
+/// child lives in `child_buf` (first `child_len` bytes); returns the
+/// parsed `Tables` on success.
+#[cfg(target_arch = "x86_64")]
+fn acpi_parse_via_xsdt(
+    child_buf: &[u8],
+    child_len: usize,
+) -> Result<crate::x86_64::acpi::Tables, crate::x86_64::acpi::AcpiError> {
+    let child_phys = match acpi_fixture_phys(&child_buf[..child_len]) {
+        Ok(p) => p,
+        Err(_) => return Err(crate::x86_64::acpi::AcpiError::BadTable),
+    };
+    let mut xsdt = [0u8; 64];
+    acpi_write_sdt_header(&mut xsdt, b"XSDT", 44);
+    xsdt[36..44].copy_from_slice(&child_phys.to_le_bytes());
+    acpi_fix_checksum(&mut xsdt, 44);
+    let xsdt_phys = match acpi_fixture_phys(&xsdt) {
+        Ok(p) => p,
+        Err(_) => return Err(crate::x86_64::acpi::AcpiError::BadTable),
+    };
+    // SAFETY: both tables are live fixture buffers; `pv()` was
+    // verified idempotent on them above.
+    unsafe { crate::x86_64::acpi::parse_xsdt(xsdt_phys) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_xsdt_short_length_rejected() -> TestResult {
+    use crate::x86_64::acpi;
+    // Declared lengths below the 36-byte SDT header: the old code
+    // computed `(length - 36) / 8` unguarded, which wraps in release
+    // (and panics in debug) and then walks entry pointers far past
+    // the table. Fixtures stay checksum-valid over the declared
+    // length, so only the length guard can reject them.
+    for declared in [0u32, 20, 35] {
+        let mut buf = [0u8; 36];
+        acpi_write_sdt_header(&mut buf, b"XSDT", declared);
+        acpi_fix_checksum(&mut buf, declared as usize);
+        let phys = match acpi_fixture_phys(&buf) {
+            Ok(p) => p,
+            Err(m) => return TestResult::Fail(m),
+        };
+        // SAFETY: live fixture buffer; the parser must reject on
+        // length alone, before reading past the header.
+        match unsafe { acpi::parse_xsdt(phys) } {
+            Err(acpi::AcpiError::BadTable) => {}
+            Err(_) => return TestResult::Fail("short XSDT rejected with the wrong error"),
+            Ok(_) => return TestResult::Fail("short XSDT length accepted"),
+        }
+    }
+    // Length 36, zero entries: the boundary case — parses cleanly.
+    let mut buf = [0u8; 36];
+    acpi_write_sdt_header(&mut buf, b"XSDT", 36);
+    acpi_fix_checksum(&mut buf, 36);
+    let phys = match acpi_fixture_phys(&buf) {
+        Ok(p) => p,
+        Err(m) => return TestResult::Fail(m),
+    };
+    // SAFETY: same.
+    match unsafe { acpi::parse_xsdt(phys) } {
+        Ok(t) => {
+            if !t.local_apics.is_empty() || !t.io_apics.is_empty() || !t.overrides.is_empty() {
+                return TestResult::Fail("empty XSDT yielded entries");
+            }
+        }
+        Err(_) => return TestResult::Fail("length-36 XSDT rejected"),
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/acpi", smoke_acpi_xsdt_short_length_rejected);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_madt_truncated_entry_stops() -> TestResult {
+    use crate::x86_64::acpi;
+    // One valid Local APIC entry, then a trailing IOAPIC entry whose
+    // declared `len` overruns the table: only its 2-byte kind/len
+    // prefix is present. The old code checked only `len >= 12` and
+    // read the entry body past the table end; the fix must stop at
+    // the truncation and keep the valid entry.
+    for trailing_len in [12u8, 200u8] {
+        let mut madt = [0u8; 64];
+        acpi_write_sdt_header(&mut madt, b"APIC", 54);
+        madt[36..40].copy_from_slice(&0xFEE0_0000u32.to_le_bytes());
+        // Entry area at 44: valid Local APIC (kind 0, len 8).
+        madt[44] = 0;
+        madt[45] = 8;
+        madt[46] = 0; // processor uid
+        madt[47] = 0; // apic id
+        madt[48..52].copy_from_slice(&1u32.to_le_bytes()); // flags: enabled
+        madt[52] = 1; // trailing entry: kind 1, declared len overruns the table
+        madt[53] = trailing_len;
+        acpi_fix_checksum(&mut madt, 54);
+        let t = match acpi_parse_via_xsdt(&madt, 54) {
+            Ok(t) => t,
+            Err(_) => return TestResult::Fail("valid MADT prefix rejected"),
+        };
+        if t.local_apics.len() != 1 {
+            return TestResult::Fail("valid MADT entry lost at truncation");
+        }
+        if !t.io_apics.is_empty() {
+            return TestResult::Fail("truncated MADT entry was read and stored");
+        }
+        match t.local_apics[0] {
+            acpi::MadtEntry::LocalApic { apic_id, flags, .. } if apic_id == 0 && flags == 1 => {}
+            _ => return TestResult::Fail("valid MADT entry decoded wrong"),
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/acpi", smoke_acpi_madt_truncated_entry_stops);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_madt_vectors_capped() -> TestResult {
+    use crate::x86_64::acpi;
+    use narf_lib::percpu::MAX_CPUS;
+    // 60 Local APIC + 10 Local x2APIC + 10 IOAPIC + 20 override
+    // entries: every vector overflows its cap. The caps mirror the
+    // `acpi` crate (MAX_CPUS shared across both Local APIC kinds,
+    // MAX_IOAPICS, MAX_ISA_OVERRIDES); excess entries are dropped
+    // in order and parsing continues.
+    let mut madt = [0u8; 1024];
+    let mut cur = 44usize;
+    acpi_write_sdt_header(&mut madt, b"APIC", 0);
+    madt[36..40].copy_from_slice(&0xFEE0_0000u32.to_le_bytes());
+    for i in 0..60u8 {
+        acpi_push(
+            &mut madt,
+            &mut cur,
+            &[0, 8, i, i, 1, 0, 0, 0], // Local APIC, enabled
+        );
+    }
+    for i in 0..10u32 {
+        let mut e = [0u8; 16];
+        e[0] = 9;
+        e[1] = 16;
+        e[4..8].copy_from_slice(&(100 + i).to_le_bytes()); // x2apic id
+        e[8..12].copy_from_slice(&1u32.to_le_bytes()); // flags: enabled
+        e[12..16].copy_from_slice(&(100 + i).to_le_bytes()); // uid
+        acpi_push(&mut madt, &mut cur, &e);
+    }
+    for i in 0..10u8 {
+        let mut e = [0u8; 12];
+        e[0] = 1;
+        e[1] = 12;
+        e[2] = i; // id
+        e[4..8].copy_from_slice(&0xFEC0_0000u32.to_le_bytes());
+        e[8..12].copy_from_slice(&((i as u32) * 24).to_le_bytes()); // gsi base
+        acpi_push(&mut madt, &mut cur, &e);
+    }
+    for i in 0..20u8 {
+        let mut e = [0u8; 10];
+        e[0] = 2;
+        e[1] = 10;
+        e[2] = 0; // bus
+        e[3] = i; // source
+        e[4..8].copy_from_slice(&(i as u32).to_le_bytes()); // gsi
+        acpi_push(&mut madt, &mut cur, &e);
+    }
+    let total = cur;
+    madt[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+    acpi_fix_checksum(&mut madt, total);
+    let t = match acpi_parse_via_xsdt(&madt, total) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("capped MADT fixture rejected"),
+    };
+    if t.local_apics.len() != MAX_CPUS {
+        return TestResult::Fail("local-APIC vector not capped at MAX_CPUS");
+    }
+    if t.io_apics.len() != acpi::MAX_IOAPICS {
+        return TestResult::Fail("IOAPIC vector not capped at MAX_IOAPICS");
+    }
+    if t.overrides.len() != acpi::MAX_ISA_OVERRIDES {
+        return TestResult::Fail("override vector not capped at MAX_ISA_OVERRIDES");
+    }
+    // Caps cut in table order: the 60 Local APICs, then the first 4
+    // x2APICs (ids 100..103); the 8th IOAPIC is id 7; the 16th
+    // override is source 15.
+    match t.local_apics[59] {
+        acpi::MadtEntry::LocalApic { apic_id, .. } if apic_id == 59 => {}
+        _ => return TestResult::Fail("60th local APIC not in place"),
+    }
+    match t.local_apics[63] {
+        acpi::MadtEntry::LocalX2Apic { x2apic_id, .. } if x2apic_id == 103 => {}
+        _ => return TestResult::Fail("x2APIC cap did not cut in table order"),
+    }
+    match t.io_apics[7] {
+        acpi::MadtEntry::IoApic { id, .. } if id == 7 => {}
+        _ => return TestResult::Fail("8th IOAPIC not in place"),
+    }
+    match t.overrides[15] {
+        acpi::MadtEntry::IntOverride { source, .. } if source == 15 => {}
+        _ => return TestResult::Fail("16th override not in place"),
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/acpi", smoke_acpi_madt_vectors_capped);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_tsc_calibrate_via_cpuid() -> TestResult {
     use crate::x86_64::tsc;
