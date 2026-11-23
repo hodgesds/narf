@@ -251,8 +251,7 @@ impl WopcmLayout {
     /// WOPCM would program a GuC region past the WOPCM top. Gen9
     /// takes the 1 MiB total (`GEN9_WOPCM_SIZE`): planning 2 MiB or
     /// more on a 1 MiB WOPCM would program past its top the same
-    /// way. The load itself is Gen9 Lane 7's; this only sizes the
-    /// plan honestly now that the platform exists.
+    /// way. Gen9 Lane 7 admits the load itself on this plan.
     fn plan_for(platform: GtPlatform, upload: u32, huc: u32) -> Result<Self, BootError> {
         if platform.is_gen12() || platform.is_gen11() || platform.is_headless_integrated() {
             Self::plan_total(upload, huc, 0x200000)
@@ -431,8 +430,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         mut config: BootConfig,
     ) -> Result<Self, BootError> {
         // The staged GuC and HuC must belong to the same primary GT, and
-        // that GT must have a primary-GT HuC profile: exact TGL, or a
-        // Gen11 sub-platform (Lane 7 — `icl_huc_9.0.0` / `ehl_huc_9.0.0`).
+        // that GT must have a primary-GT HuC profile: exact TGL, a Gen11
+        // sub-platform (Lane 7 — `icl_huc_9.0.0` / `ehl_huc_9.0.0`), or
+        // a Gen9 sub-platform (Gen9 Lane 7 — `skl_huc_2.0.0` /
+        // `kbl_huc_4.0.0`).
         if firmware.platform() != huc.platform()
             || crate::intel_gpu_huc::firmware_name(firmware.platform()).is_none()
         {
@@ -462,7 +463,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     }
 
     /// The exact-TGL main-GT HuC profile over a parsed CSS image, and the
-    /// Gen11 main-GT HuC profiles (Lane 7) over the same whole-file CSS.
+    /// Gen11 main-GT HuC profiles (Lane 7) and Gen9 main-GT HuC profiles
+    /// (Gen9 Lane 7) over the same whole-file CSS.
     #[cfg(any(test, feature = "kernel-test"))]
     fn stage_images(
         mmio: M,
@@ -1180,6 +1182,24 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             0x8602 | (u32::from(self.config.uncached_mocs.unwrap_or(0)) << 24),
         );
         self.mmio.write32(0x13816c, 1);
+        if self.platform.is_gen9() {
+            // Linux `gt/uc/intel_guc_fw.c::guc_prepare_xfer`, Gen9-only
+            // arm (Gen9 Lane 7): enable DOP clock gating for the GuC
+            // clocks (`GEN7_MISCCPCTL` 0x9424,
+            // `GEN8_DOP_CLOCK_GATE_GUC_ENABLE` bit 4, `gt/intel_gt_regs.h`)
+            // and hold RC6 off for 5 us in 10 ns units while the GuC
+            // loads (`GUC_ARAT_C6DIS` 0xA178 = 0x1FF,
+            // `gt/uc/intel_guc_reg.h`). The 0x13816c doorbell write above
+            // is the shared half of the same function; without the
+            // ARAT hold the GT could enter RC6 mid-upload on Gen9
+            // silicon. Gen11+ takes neither write.
+            let misccpctl = self.mmio.read32(0x9424);
+            if misccpctl == u32::MAX {
+                return Err(BootError::Unavailable);
+            }
+            self.mmio.write32(0x9424, misccpctl | (1 << 4));
+            self.mmio.write32(0xa178, 0x1ff);
+        }
         self.mmio.write32(0xa168, power_mask & !(1 << 9));
         // Posted-read barrier for newly installed GGTT entries, then the
         // platform's GuC TLB invalidation path, as xe_ggtt/xe_guc_tlb_inval.
@@ -2787,6 +2807,129 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_guc_boot",
         smoke_boot_gen11_wopcm_total_is_two_mib
+    );
+
+    fn smoke_boot_gen9_wopcm_total_is_one_mib() -> TestResult {
+        // Gen9 Lane 7 item 3: Linux `gt/intel_wopcm.c`
+        // `intel_wopcm_init_early` sizes the WOPCM at 1 MiB before Gen11
+        // (`GEN9_WOPCM_SIZE`), with the same 36 KiB hardware-context
+        // reservation at the top — the 0x9000 `WopcmLayout::validate`
+        // reserves. The 2 MiB Gen11 total would program a GuC region
+        // past the WOPCM top.
+        use crate::intel_gpu_gt::Gen9Platform;
+        let skl = GtPlatform::Gen9(Gen9Platform::Skylake);
+        let layout = match WopcmLayout::plan_for(skl, 0x10000, 0) {
+            Ok(layout) => layout,
+            Err(_) => return TestResult::Fail("Gen9 small GuC upload refused a WOPCM plan"),
+        };
+        if u64::from(layout.base) + u64::from(layout.size) > 0x100000 - 0x9000 {
+            return TestResult::Fail(
+                "Gen9 WOPCM plan exceeds the 1 MiB WOPCM minus context reservation",
+            );
+        }
+        // A ~1 MiB upload fits Gen11's 2 MiB total but not Gen9's 1 MiB:
+        // the plan must fail for Gen9 and pass for Ice Lake.
+        if WopcmLayout::plan_for(skl, 0xf0000, 0).is_ok()
+            || WopcmLayout::plan_for(
+                GtPlatform::Gen11(crate::intel_gpu_gt::Gen11Platform::IceLake),
+                0xf0000,
+                0,
+            )
+            .is_err()
+        {
+            return TestResult::Fail("Gen9 WOPCM total is not 1 MiB");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_boot",
+        smoke_boot_gen9_wopcm_total_is_one_mib
+    );
+
+    fn smoke_gen9_guc_rsa_scratch_and_prepare_xfer() -> TestResult {
+        // Gen9 Lane 7 items 4–5: the 256-byte GuC-signature scratch
+        // transfer inherited from Gen11/Gen12 (Linux
+        // `gt/uc/intel_guc_fw.c::guc_xfer_rsa` selects on size, with no
+        // generation gate) plus the Gen9-only `guc_prepare_xfer` writes
+        // (DOP clock gating, 5 us RC6 hold) ahead of the DMA upload.
+        let platform = GtPlatform::from_pci(0x8086, 0x1912).unwrap();
+        let mut css = image_with_rsa(64);
+        crate::intel_gpu_uapi::put32(&mut css, 64, 0x0046_0101); // SKL GuC 70.1.1
+        for i in 0..64 {
+            crate::intel_gpu_uapi::put32(&mut css, 144 + 4 * i, 0xfedc_ba00 | i as u32);
+        }
+        let firmware = GuCFirmware::from_fixture(platform, &css).unwrap();
+        let (window, arena) = model();
+        window.0.borrow_mut().profile = Some(platform);
+        let mut boot = GuCBoot::stage(
+            window.clone(),
+            arena,
+            &firmware,
+            BootConfig {
+                device_id: 0x1912,
+                revision: 3,
+                huc_upload_bytes: 0,
+                uncached_mocs: None,
+            },
+        )
+        .unwrap();
+        ready(&mut boot, &window);
+        {
+            let device = window.0.borrow();
+            if !device.writes.contains(&(0x9424, 0x10)) || !device.writes.contains(&(0xa178, 0x1ff))
+            {
+                return TestResult::Fail("Gen9 GuC prepare_xfer writes missing");
+            }
+            let start = device
+                .writes
+                .iter()
+                .position(|&(reg, _)| reg == 0xc200)
+                .unwrap();
+            for i in 0..64 {
+                assert_eq!(
+                    device.writes[start + i],
+                    (0xc200 + 4 * i as u64, 0xfedc_ba00 | i as u32)
+                );
+            }
+            assert_eq!(device.writes[start + 64], (0xc300, 0x2000_0000));
+            assert_eq!(device.regs[&0xc310], 144);
+        }
+        stop(&mut boot, &window);
+        // The 256-byte scratch path holds for every Gen9 sub-platform,
+        // and the 384-byte GGTT-pointer path covers Gen9 too.
+        for platform in [
+            GtPlatform::Gen9(crate::intel_gpu_gt::Gen9Platform::Skylake),
+            GtPlatform::Gen9(crate::intel_gpu_gt::Gen9Platform::KabyLake),
+            GtPlatform::Gen9(crate::intel_gpu_gt::Gen9Platform::CometLake),
+        ] {
+            if GuCFirmware::from_fixture(platform, &css).is_err()
+                || GuCFirmware::from_fixture(platform, &image_with_rsa(96)).is_err()
+            {
+                return TestResult::Fail("Gen9 GuC RSA transfer refused");
+            }
+        }
+        // Negative control: the Gen9 prepare writes are Gen9-only — a
+        // TGL stage must not emit them.
+        let tgl = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        let (window, arena) = model();
+        let mut boot = stage(window.clone(), arena.clone(), tgl);
+        ready(&mut boot, &window);
+        if window
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .any(|&(reg, _)| reg == 0x9424 || reg == 0xa178)
+        {
+            return TestResult::Fail("Gen9 prepare_xfer writes leaked to Gen12");
+        }
+        stop(&mut boot, &window);
+        drop(boot);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_boot",
+        smoke_gen9_guc_rsa_scratch_and_prepare_xfer
     );
 
     fn smoke_discrete_ct_needs_coherent_mapping() -> TestResult {

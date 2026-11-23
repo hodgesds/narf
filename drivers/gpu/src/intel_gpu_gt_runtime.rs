@@ -2124,7 +2124,8 @@ impl Owner {
             );
         }
         // HuC is default-off (`narf.intel.huc=1`) and only on a primary GT
-        // with a HuC profile: exact TGL, or a Gen11 sub-platform (Lane 7).
+        // with a HuC profile: exact TGL, a Gen11 sub-platform (Lane 7),
+        // or a Gen9 sub-platform (Gen9 Lane 7).
         // The media-GT HuC opt-in below is a separate path.
         let huc_enabled =
             crate::intel_gpu_huc::profile(platform, crate::intel_gpu_guc_boot::GuCRole::Primary)

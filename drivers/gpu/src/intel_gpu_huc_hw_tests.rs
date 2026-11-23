@@ -1172,3 +1172,63 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_huc",
     smoke_gen11_huc_profile_selection
 );
+
+fn smoke_gen9_huc_profile_selection() -> TestResult {
+    // Gen9 Lane 7 item 2: the Gen9 HuC family from Linux
+    // `gt/uc/intel_uc_fw.c` `INTEL_HUC_FIRMWARE_DEFS` —
+    // `huc_mmp(skl, 2, 0, 0)`, `huc_mmp(kbl, 4, 0, 0)`. The 2.0.0/4.0.0
+    // is the filename version, not an enforced minimum (Linux applies no
+    // version matching to HuC); the parsed CSS version is reported, not
+    // gated. Comet Lake takes the KBL blob at every revision today — the
+    // rev >= 5 `cml_huc_4.0.0.bin` split needs a PCI-revision input the
+    // driver does not model yet (Q6), so it stays a named remainder.
+    use crate::intel_gpu_gt::{Gen12Platform, Gen9Platform, GtPlatform};
+    let skl = GtPlatform::Gen9(Gen9Platform::Skylake);
+    let kbl = GtPlatform::Gen9(Gen9Platform::KabyLake);
+    let cml = GtPlatform::Gen9(Gen9Platform::CometLake);
+    if huc::firmware_name(skl) != Some("i915/skl_huc_2.0.0.bin")
+        || huc::firmware_name(kbl) != Some("i915/kbl_huc_4.0.0.bin")
+        || huc::firmware_name(cml) != Some("i915/kbl_huc_4.0.0.bin")
+        || huc::firmware_name(huc::PLATFORM) != Some("i915/tgl_huc.bin")
+        || huc::firmware_name(GtPlatform::Gen12(Gen12Platform::RocketLake)).is_some()
+        || huc::firmware_name(GtPlatform::Integrated(
+            crate::intel_gpu::Generation::MeteorLake,
+        ))
+        .is_some()
+    {
+        return TestResult::Fail("Gen9 HuC blob selection");
+    }
+    if !huc::profile(skl, crate::intel_gpu_guc_boot::GuCRole::Primary)
+        || !huc::profile(kbl, crate::intel_gpu_guc_boot::GuCRole::Primary)
+        || !huc::profile(cml, crate::intel_gpu_guc_boot::GuCRole::Primary)
+    {
+        return TestResult::Fail("Gen9 primary-GT HuC not admitted");
+    }
+    // Whole-file CSS carrying the file version: accepted on every Gen9
+    // sub-platform, with the parsed version reported.
+    let mut skl_bytes = css();
+    put32(&mut skl_bytes, 64, 0x0002_0000);
+    match huc::Firmware::from_fixture(skl, &skl_bytes) {
+        Ok(firmware) if firmware.load().version == (2, 0, 0) => {}
+        _ => return TestResult::Fail("Gen9 HuC 2.0.0 fixture rejected"),
+    }
+    let mut kbl_bytes = css();
+    put32(&mut kbl_bytes, 64, 0x0004_0000);
+    for platform in [kbl, cml] {
+        match huc::Firmware::from_fixture(platform, &kbl_bytes) {
+            Ok(firmware) if firmware.load().version == (4, 0, 0) => {}
+            _ => return TestResult::Fail("Gen9 HuC 4.0.0 fixture rejected"),
+        }
+    }
+    // A malformed CSS is refused on Gen9 exactly as on TGL/Gen11.
+    let mut bad = css();
+    put32(&mut bad, 0, 5);
+    if huc::Firmware::from_fixture(skl, &bad).is_ok() {
+        return TestResult::Fail("Gen9 HuC malformed CSS admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_huc",
+    smoke_gen9_huc_profile_selection
+);

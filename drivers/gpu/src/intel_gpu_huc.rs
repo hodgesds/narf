@@ -10,6 +10,16 @@
 //!   filename version, not an enforced minimum — Linux applies no version
 //!   matching to HuC: "there is no KMD interaction, hence no version
 //!   matching requirement");
+//! - Gen9 (Lane 7): the main GuC loads `i915/skl_huc_2.0.0.bin`
+//!   (Skylake) or `i915/kbl_huc_4.0.0.bin` (Kaby Lake / Coffee Lake /
+//!   Whiskey Lake / Comet Lake at rev < 5), both whole-file CSS like
+//!   Gen11's (`gt/uc/intel_uc_fw.c` `INTEL_HUC_FIRMWARE_DEFS`:
+//!   `huc_mmp(skl, 2, 0, 0)`, `huc_mmp(kbl, 4, 0, 0)`). Comet Lake at
+//!   rev >= 5 takes `i915/cml_huc_4.0.0.bin` (`huc_mmp(cml, 4, 0, 0)`);
+//!   all Comet Lake takes the KBL blob until a PCI-revision input is
+//!   modeled (the same default as the GuC side — see `Gen9Platform`).
+//!   The 2.0.0/4.0.0 is the filename version, not an enforced minimum,
+//!   for the same no-version-matching reason as Gen11's 9.0.0.
 //! - MTL/Arrow: the standalone media GuC loads `i915/mtl_huc_gsc.bin`, whose
 //!   GSC CPD headers embed the CSS that is DMA-uploaded (xe_uc_fw.c
 //!   parse_headers), and authenticates it via XE_HUC_AUTH_VIA_GUC.
@@ -19,7 +29,7 @@
 
 use crate::{
     intel_gpu_aux::MmioWindow,
-    intel_gpu_gt::{media::gsc, Gen11Platform, Gen12Platform, GtPlatform},
+    intel_gpu_gt::{media::gsc, Gen11Platform, Gen12Platform, Gen9Platform, GtPlatform},
     intel_gpu_guc::{GuCError, GuCMessage},
     intel_gpu_guc_boot::{BootAllocator, GuCRole},
     intel_gpu_guc_firmware::FirmwareError,
@@ -36,6 +46,13 @@ const NAME: &str = "i915/tgl_huc.bin";
 /// Linux 7.4-rc2: `huc_mmp(icl, 9, 0, 0)`, `huc_mmp(ehl, 9, 0, 0)`).
 const ICL_NAME: &str = "i915/icl_huc_9.0.0.bin";
 const EHL_NAME: &str = "i915/ehl_huc_9.0.0.bin";
+/// Gen9 (Lane 7): Skylake takes the `skl_huc` blob, Kaby Lake / Coffee
+/// Lake / Whiskey Lake take the `kbl_huc` blob, and Comet Lake takes the
+/// `kbl_huc` blob too — at rev < 5. The rev >= 5 Comet Lake blob is
+/// `i915/cml_huc_4.0.0.bin` (`huc_mmp(cml, 4, 0, 0)`); it has no const
+/// here because no arm selects it yet (see `firmware_name`).
+const SKL_NAME: &str = "i915/skl_huc_2.0.0.bin";
+const KBL_NAME: &str = "i915/kbl_huc_4.0.0.bin";
 const FIRST: u16 = 0x4000;
 const LAST: u16 = 0x7eff; // log sideband starts at7f00; SLPC at8000
 /// NARF bound on an acquired HuC file (Linux copies any size into its BO).
@@ -46,7 +63,11 @@ pub(crate) fn opted_in(args: narf_boot::args::KernelCmdline<'_>) -> bool {
 }
 
 /// The primary-GT HuC blob name for `platform`, if the platform has a
-/// primary-GT HuC at all: exact TGL plus the Gen11 sub-platforms (Lane 7).
+/// primary-GT HuC at all: exact TGL plus the Gen11 sub-platforms (Lane 7)
+/// and the Gen9 sub-platforms (Gen9 Lane 7). Comet Lake takes the KBL
+/// blob at every revision today — the rev >= 5 `cml_huc_4.0.0.bin` split
+/// needs a PCI-revision input the driver does not model yet (Q6), so it
+/// stays a named remainder, not a guessed arm.
 /// The media GT has no entry here — its name is `gsc::HUC_FIRMWARE`.
 /// The returned name is the registry key `Firmware::open` loads; the
 /// version embedded in a `_mmp` filename is the file's own version, not a
@@ -56,6 +77,8 @@ pub(crate) fn firmware_name(platform: GtPlatform) -> Option<&'static str> {
         p if p == PLATFORM => Some(NAME),
         GtPlatform::Gen11(Gen11Platform::IceLake) => Some(ICL_NAME),
         GtPlatform::Gen11(Gen11Platform::ElkhartLake | Gen11Platform::JasperLake) => Some(EHL_NAME),
+        GtPlatform::Gen9(Gen9Platform::Skylake) => Some(SKL_NAME),
+        GtPlatform::Gen9(Gen9Platform::KabyLake | Gen9Platform::CometLake) => Some(KBL_NAME),
         _ => None,
     }
 }
@@ -63,7 +86,7 @@ pub(crate) fn firmware_name(platform: GtPlatform) -> Option<&'static str> {
 /// xe_huc.c::xe_huc_init: whether the GuC in `role` owns `platform`'s HuC.
 /// Linux supports HuC on the primary GT only through graphics 12.55 and on
 /// the media GT otherwise; NARF admits exact TGL and the Gen11 primary GT
-/// (Lane 7), and the MTL/Arrow media GT.
+/// (Lane 7), the Gen9 primary GT (Gen9 Lane 7), and the MTL/Arrow media GT.
 pub(crate) fn profile(platform: GtPlatform, role: GuCRole) -> bool {
     match role {
         GuCRole::Primary => firmware_name(platform).is_some(),
@@ -192,8 +215,8 @@ impl<'a> Load<'a> {
 }
 
 fn validate(platform: GtPlatform, bytes: &[u8]) -> Result<Load<'_>, FirmwareError> {
-    // The primary-GT blobs (TGL's unversioned file and the Gen11 `_mmp`
-    // files) are all whole-file CSS (`gt/uc/intel_uc_fw.c`:
+    // The primary-GT blobs (TGL's unversioned file and the Gen11/Gen9
+    // `_mmp` files) are all whole-file CSS (`gt/uc/intel_uc_fw.c`:
     // non-GSC blobs take `check_ccs_header`); the media-GT blob is
     // GSC-headered and parses through `Load::media`.
     if firmware_name(platform).is_some() {
@@ -227,7 +250,9 @@ impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
         // xe_uc_fw.c XE_HUC_FIRMWARE_DEFS: TIGERLAKE no_ver(i915, huc, tgl)
         // and METEORLAKE no_ver(i915, huc_gsc, mtl); i915
         // INTEL_HUC_FIRMWARE_DEFS adds ICELAKE huc_mmp(icl, 9, 0, 0) and
-        // ELKHARTLAKE/JASPERLAKE huc_mmp(ehl, 9, 0, 0) (Lane 7).
+        // ELKHARTLAKE/JASPERLAKE huc_mmp(ehl, 9, 0, 0) (Lane 7), plus
+        // SKYLAKE huc_mmp(skl, 2, 0, 0) and KABYLAKE/COFFEELAKE/
+        // COMETLAKE-rev<5 huc_mmp(kbl, 4, 0, 0) (Gen9 Lane 7).
         let name = firmware_name(self.0).unwrap_or(gsc::HUC_FIRMWARE);
         let blob = match narf_firmware::open(name, cap) {
             Ok(b) => b,
