@@ -94,6 +94,7 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
                 crate::AmlError::AmlStoreFull => "aml store full",
                 crate::AmlError::MethodNotFound => "method not found",
                 crate::AmlError::RecursionDepthExceeded => "recursion depth exceeded",
+                crate::AmlError::OperandValue => "stall operand too large",
             })
         }
     };

@@ -1391,3 +1391,89 @@ fn e2e_aml_create_field_variable_width() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml/e2e", e2e_aml_create_field_variable_width);
+
+// ── SEC-F6 (#1301): Sleep/Stall bounds through the evaluator ────────────────
+//
+// F01/F02: an over-cap Stall aborts the method with OperandValue —
+// in statement position (eval_term) and as a TermArg (eval_term_arg).
+// F03/F04: an in-bounds Sleep stalls briefly and the method completes,
+// in both positions.
+
+fn e2e_aml_stall_over_cap_statement_aborts() -> TestResult {
+    // Method(\F01_, 0) { Stall(0xFFFFFFFF); Return(0) }
+    let body: &[u8] = &[
+        0x5B, 0x21, // StallOp
+        0x0C, 0xFF, 0xFF, 0xFF, 0xFF, // DWord 0xFFFFFFFF
+        0xA4, // ReturnOp
+        0x0A, 0x00, // BytePrefix 0
+    ];
+    let blob = method_blob(b"F01_", 0, body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("F01: parse failed");
+    }
+    match crate::eval::evaluate_method("\\F01", &[]) {
+        Err(crate::AmlError::OperandValue) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("F01: over-cap Stall must abort the method"),
+        Err(_) => TestResult::Fail("F01: expected OperandValue error"),
+    }
+}
+kernel_test_in!("aml/e2e", e2e_aml_stall_over_cap_statement_aborts);
+
+fn e2e_aml_stall_over_cap_termarg_aborts() -> TestResult {
+    // Method(\F02_, 0) { Return(Stall(0xFFFFFFFF)) }
+    let body: &[u8] = &[
+        0xA4, // ReturnOp
+        0x5B, 0x21, // StallOp
+        0x0C, 0xFF, 0xFF, 0xFF, 0xFF, // DWord 0xFFFFFFFF
+    ];
+    let blob = method_blob(b"F02_", 0, body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("F02: parse failed");
+    }
+    match crate::eval::evaluate_method("\\F02", &[]) {
+        Err(crate::AmlError::OperandValue) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("F02: over-cap Stall must abort the method"),
+        Err(_) => TestResult::Fail("F02: expected OperandValue error"),
+    }
+}
+kernel_test_in!("aml/e2e", e2e_aml_stall_over_cap_termarg_aborts);
+
+fn e2e_aml_sleep_in_bounds_statement_completes() -> TestResult {
+    // Method(\F03_, 0) { Sleep(1); Return(7) }
+    let body: &[u8] = &[
+        0x5B, 0x22, // SleepOp
+        0x0A, 0x01, // BytePrefix 1
+        0xA4, // ReturnOp
+        0x0A, 0x07, // BytePrefix 7
+    ];
+    let blob = method_blob(b"F03_", 0, body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("F03: parse failed");
+    }
+    match crate::eval::evaluate_method("\\F03", &[]) {
+        Ok(crate::Value::Integer(7)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("F03: expected Integer(7)"),
+        Err(_) => TestResult::Fail("F03: evaluate_method failed"),
+    }
+}
+kernel_test_in!("aml/e2e", e2e_aml_sleep_in_bounds_statement_completes);
+
+fn e2e_aml_sleep_in_bounds_termarg_completes() -> TestResult {
+    // Method(\F04_, 0) { Return(Sleep(1)) } — Sleep as a TermArg
+    // returns Integer(0).
+    let body: &[u8] = &[
+        0xA4, // ReturnOp
+        0x5B, 0x22, // SleepOp
+        0x0A, 0x01, // BytePrefix 1
+    ];
+    let blob = method_blob(b"F04_", 0, body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("F04: parse failed");
+    }
+    match crate::eval::evaluate_method("\\F04", &[]) {
+        Ok(crate::Value::Integer(0)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("F04: expected Integer(0)"),
+        Err(_) => TestResult::Fail("F04: evaluate_method failed"),
+    }
+}
+kernel_test_in!("aml/e2e", e2e_aml_sleep_in_bounds_termarg_completes);

@@ -969,12 +969,14 @@ fn eval_term(
                 // StallOp: 0x5B 0x21  TermArg(microseconds)
                 0x21 => {
                     let us = eval_term_arg(buf, cur, state)?.as_integer();
-                    crate::sync::stall(us as u32);
+                    // SEC-F6 (#1301): over-cap Stall aborts the
+                    // method (ACPICA AE_AML_OPERAND_VALUE).
+                    crate::sync::stall(us)?;
                 }
                 // SleepOp: 0x5B 0x22  TermArg(milliseconds)
                 0x22 => {
                     let ms = eval_term_arg(buf, cur, state)?.as_integer();
-                    crate::sync::sleep(ms as u32);
+                    crate::sync::sleep(ms);
                 }
                 // AcquireOp: 0x5B 0x23  SuperName  u16-timeout
                 0x23 => {
@@ -1749,13 +1751,15 @@ fn eval_term_arg_inner(
                 // StallOp: 0x5B 0x21  TermArg
                 0x21 => {
                     let us = eval_term_arg(buf, cur, state)?.as_integer();
-                    crate::sync::stall(us as u32);
+                    // SEC-F6 (#1301): over-cap Stall aborts the
+                    // method (ACPICA AE_AML_OPERAND_VALUE).
+                    crate::sync::stall(us)?;
                     Value::Integer(0)
                 }
                 // SleepOp: 0x5B 0x22  TermArg
                 0x22 => {
                     let ms = eval_term_arg(buf, cur, state)?.as_integer();
-                    crate::sync::sleep(ms as u32);
+                    crate::sync::sleep(ms);
                     Value::Integer(0)
                 }
                 // AcquireOp: 0x5B 0x23  SuperName  u16-timeout

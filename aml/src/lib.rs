@@ -131,6 +131,14 @@ pub enum AmlError {
     /// must treat the method as unevaluated, never as a default
     /// value. SEC-F1 (#1289).
     RecursionDepthExceeded,
+    /// A `Stall` operand exceeded the ACPICA bound (SEC-F6, #1301).
+    /// ACPI 6.2 Errata A §19.6.128 requires delays longer than
+    /// 100 µs to use `Sleep` instead of `Stall`, and ACPICA
+    /// (`acpi_ex_system_do_stall`) rejects anything over 255 µs
+    /// with `AE_AML_OPERAND_VALUE` (100 µs spec max plus slack for
+    /// existing BIOSes). The evaluation aborts; the method is
+    /// unevaluated, never stalled.
+    OperandValue,
 }
 
 /// Recursion budgets for AML evaluation and namespace build
