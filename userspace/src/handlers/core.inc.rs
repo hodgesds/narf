@@ -15560,16 +15560,35 @@ fn parent_of_set(child: u64, parent: u64) {
     parent_of_set_with_signal(child, parent, SIGCHLD);
 }
 
-fn parent_of_set_with_signal(child: u64, parent: u64, exit_signal: u8) {
-    let mut links = PARENT_OF.lock();
-    if let Some(m) = links.as_mut() {
-        let new = ChildLink {
-            parent,
-            exit_signal,
-        };
-        let old = m.insert(child, new);
-        adjust_parent_child_count(old, Some(new));
+/// Mirror a `PARENT_OF` row into the child's `Task::parent_pid` (the
+/// `getppid` fast path — see `task::cache_parent_pid`). Runs AFTER the
+/// row is published and the `PARENT_OF` lock is released: the lookup
+/// takes the pid/task locks, which must never nest under `PARENT_OF`.
+/// No-op when the child has no registered `Task` yet (a fork/clone
+/// child is not spawned until after its row is published — its first
+/// `getppid` fills the mirror from the row instead) or the parent has
+/// no registered pid (test stubs fall back to the raw TaskId, exactly
+/// as the `getppid` slow path does).
+fn mirror_parent_of_row(child_visible_pid: u64, parent_task: u64) {
+    let parent_outer = task_to_pid_raw(parent_task).unwrap_or(parent_task);
+    if let Some(child_task) = pid_to_task_raw(child_visible_pid) {
+        crate::task::cache_parent_pid(child_task, parent_outer);
     }
+}
+
+fn parent_of_set_with_signal(child: u64, parent: u64, exit_signal: u8) {
+    {
+        let mut links = PARENT_OF.lock();
+        if let Some(m) = links.as_mut() {
+            let new = ChildLink {
+                parent,
+                exit_signal,
+            };
+            let old = m.insert(child, new);
+            adjust_parent_child_count(old, Some(new));
+        }
+    }
+    mirror_parent_of_row(child, parent);
 }
 
 #[inline]
@@ -15609,10 +15628,23 @@ pub fn __test_parent_of_set_with_signal(child: u64, parent: u64, exit_signal: u8
 /// ECHILD after the last child is reaped — without this, stale entries make
 /// `wait4` think children still exist and block forever.
 fn parent_of_remove(child: u64) {
-    let mut links = PARENT_OF.lock();
-    if let Some(m) = links.as_mut() {
-        if let Some(old) = m.remove(&child) {
-            adjust_parent_child_count(Some(old), None);
+    let removed = {
+        let mut links = PARENT_OF.lock();
+        match links.as_mut().and_then(|m| m.remove(&child)) {
+            Some(old) => {
+                adjust_parent_child_count(Some(old), None);
+                true
+            }
+            None => false,
+        }
+    };
+    // Mirror the drop: a task with no parent row reads getppid() as 0.
+    // Only when a row actually went away — a row that never existed
+    // leaves an unfilled mirror alone so the first getppid still
+    // consults `PARENT_OF`.
+    if removed {
+        if let Some(child_task) = pid_to_task_raw(child) {
+            crate::task::cache_parent_pid(child_task, 0);
         }
     }
 }
@@ -17336,6 +17368,20 @@ pub fn current_task_pgid_user() -> u64 {
     // The syscall ABI harness has no scheduler-published Task. Retain its
     // table-backed fallback so synthetic contexts exercise the same contract.
     pgid_to_user(current_task_pgid())
+}
+
+/// Current task's parent pid in the caller's namespace view, from the
+/// `Task`-local parent mirror — the `getppid` fast path (Linux
+/// `task_tgid_vnr(rcu_dereference(current->real_parent))` is two
+/// derefs; this is one atomic load plus the namespace translation).
+/// `None` when the mirror is unfilled, so the caller falls back to the
+/// `PARENT_OF` lookup and fills the mirror from it.
+pub fn current_task_ppid_user() -> Option<u64> {
+    let outer = crate::task::current_parent_pid()?;
+    #[cfg(feature = "container")]
+    return Some(report_pid_to(current_task_id(), outer));
+    #[cfg(not(feature = "container"))]
+    return Some(outer);
 }
 
 /// Child inherits the parent's process-group id (POSIX fork semantics).

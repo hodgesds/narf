@@ -78,6 +78,15 @@ const IDLE_IDENTITY: usize = 1;
 /// sampled at this rate is still removed exactly, just from later spans.
 const STEAL_SAMPLE_NS: u64 = 1_000_000;
 
+/// Cached `ns_to_cycles(STEAL_SAMPLE_NS)`. The conversion costs two atomic
+/// loads plus a 128-bit multiply — far too much for every fold when the
+/// result only changes at clock calibration. Refreshed on the steal slow
+/// path itself (at most once per sample interval per CPU); a stale value
+/// only shifts the sampling cadence, and steal is removed exactly either
+/// way, just from later spans. Zero until the first fold populates it,
+/// which always takes the slow path.
+static STEAL_SAMPLE_CYCLES: AtomicU64 = AtomicU64::new(0);
+
 /// A packed context word: a `*const TaskCputime` (8-aligned) with the
 /// context and the nice flag in its low bits. A null task means "no task is
 /// charged".
@@ -441,9 +450,13 @@ fn fold(cell: &CpuCell, cpu: usize, now: u64) -> ContextWord {
     cell.irq_stamp.store(irq, Ordering::Relaxed);
     // Steal sampled now is removed from later spans, so a reader that saw
     // the open span before this fold never reads more than the fold adds.
+    // The threshold is the cached conversion (see STEAL_SAMPLE_CYCLES);
+    // refresh it here on the slow path so a recalibration takes effect
+    // within one sample interval.
     if now.saturating_sub(cell.steal_sampled.load(Ordering::Relaxed))
-        >= narf_time::ns_to_cycles(STEAL_SAMPLE_NS)
+        >= STEAL_SAMPLE_CYCLES.load(Ordering::Relaxed)
     {
+        STEAL_SAMPLE_CYCLES.store(narf_time::ns_to_cycles(STEAL_SAMPLE_NS), Ordering::Relaxed);
         cell.steal_sampled.store(now, Ordering::Relaxed);
         let steal_ns = crate::cpu_steal_ns(cpu);
         let seen = cell.steal_seen_ns.load(Ordering::Relaxed);

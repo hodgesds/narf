@@ -3810,14 +3810,19 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         // nothing here: the scheduler's accounting closed the user span at
         // the syscall entry and charges this task's on-CPU kernel time until
         // the return to user, never the sleep of a park in between.
-        if let Some(u) = crate::user_task::current_user_task() {
-            // SAFETY: in-flight task's poller-pinned UserTaskCtx.
-            let uc = unsafe { &*u };
-            // Only a syscall the task made: the kernel's own dispatches (the
-            // file-op ring bridge) run inside some other syscall's span.
-            if ctx.returning_to_user() {
-                uc.in_syscall
-                    .store(raw_n.wrapping_add(1), core::sync::atomic::Ordering::Relaxed);
+        // The in-syscall number is recorded only once a reader has armed
+        // the latch (see `task::IN_SYSCALL_TRACKING`); this entry path
+        // resolves the context solely for that store.
+        if crate::task::in_syscall_tracking_enabled() {
+            if let Some(u) = crate::user_task::current_user_task() {
+                // SAFETY: in-flight task's poller-pinned UserTaskCtx.
+                let uc = unsafe { &*u };
+                // Only a syscall the task made: the kernel's own dispatches (the
+                // file-op ring bridge) run inside some other syscall's span.
+                if ctx.returning_to_user() {
+                    uc.in_syscall
+                        .store(raw_n.wrapping_add(1), core::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         // `/proc/<pid>/io` accounting around the read/write family.
@@ -3838,7 +3843,9 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             let uc = unsafe { &*u };
             uc.parked_in_syscall
                 .store(false, core::sync::atomic::Ordering::Release);
-            if ctx.returning_to_user() {
+            // The in-syscall number is recorded only once a reader has
+            // armed the latch (see `task::IN_SYSCALL_TRACKING`).
+            if ctx.returning_to_user() && crate::task::in_syscall_tracking_enabled() {
                 uc.in_syscall
                     .store(0, core::sync::atomic::Ordering::Relaxed);
             }
@@ -4673,18 +4680,27 @@ pub fn kernel_syscall_entry_plain_with_state(
     // must NOT fire an exit-stop — the re-issued syscall will trace again.
     let entry_rip = ctx.rip();
     // `/proc/<pid>/stack` of a task inside this syscall that is not parked.
+    // The `in_syscall` pointer is resolved unconditionally: the exit path
+    // below also reads `syscall_parked_restarting` through it, which
+    // decides EINTR/SA_RESTART delivery for a parked syscall. Only the
+    // NUMBER stores are gated: they exist solely for the rare on-demand
+    // readers (`running_syscall`, the hung-task report), which arm the
+    // latch in `task::note_in_syscall_reader` before reading. While the
+    // latch is clear, every syscall skips both stores.
     let in_syscall = if user_state.is_null() {
         None
     } else {
         crate::user_task::current_user_task()
     };
-    if let Some(u) = in_syscall {
-        // SAFETY: the in-flight task's poller-pinned ctx; atomic store only.
-        unsafe {
-            (*u).in_syscall.store(
-                effective_num.wrapping_add(1),
-                core::sync::atomic::Ordering::Relaxed,
-            );
+    if crate::task::in_syscall_tracking_enabled() {
+        if let Some(u) = in_syscall {
+            // SAFETY: the in-flight task's poller-pinned ctx; atomic store only.
+            unsafe {
+                (*u).in_syscall.store(
+                    effective_num.wrapping_add(1),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
     }
     // `/proc/<pid>/io` for the read/write family, under the rule every entry
@@ -4706,13 +4722,15 @@ pub fn kernel_syscall_entry_plain_with_state(
         };
         class.account(ret, reissued);
     }
-    if let Some(u) = in_syscall {
-        // SAFETY: as above. The context is the task's own (it lives in its
-        // `Task`), so it stays valid and correct even when a park moved this
-        // continuation to another CPU; no per-CPU re-resolution is needed.
-        unsafe {
-            (*u).in_syscall
-                .store(0, core::sync::atomic::Ordering::Relaxed);
+    if crate::task::in_syscall_tracking_enabled() {
+        if let Some(u) = in_syscall {
+            // SAFETY: as above. The context is the task's own (it lives in its
+            // `Task`), so it stays valid and correct even when a park moved this
+            // continuation to another CPU; no per-CPU re-resolution is needed.
+            unsafe {
+                (*u).in_syscall
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
     // Return-value half of the trace. Without it the log shows what was
