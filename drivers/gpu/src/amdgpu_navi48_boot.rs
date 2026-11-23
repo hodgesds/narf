@@ -131,6 +131,14 @@ impl Firmware {
     pub(crate) fn images(&self) -> Result<[gfx::Image<'_>; 11], Error> {
         self.gfx.images().map_err(Error::Firmware)
     }
+    /// Parse one firmware image, without materializing the whole
+    /// `[Image; 11]` set. `draw_inputs` needs only the PFP version, and
+    /// building all eleven images (3872 bytes, measured) in its frame put
+    /// it over the 8 KiB budget (12424 bytes, main run 45082275318). Same
+    /// species as #2163's `Starts::from_firmware` fix.
+    pub(crate) fn image(&self, source: gfx::Source) -> Result<gfx::Image<'_>, Error> {
+        self.gfx.image(source).map_err(Error::Firmware)
+    }
     pub fn open(
         gpu: &AmdGpu,
         registry: &Cap<narf_firmware::FirmwareRegistry, Read>,
@@ -1143,14 +1151,10 @@ impl ColdBoot {
             return None;
         }
         let backend = &self.sequence.backend;
-        let images = backend.firmware.images().ok()?;
         Some(crate::amdgpu_gfx12_draw::Inputs {
             chip: crate::amdgpu_rdna4::Rdna4Chip::of(&backend.gpu)?,
             max_se: backend.gpu.gc_info?.num_se,
-            pfp_version: images
-                .iter()
-                .find(|i| i.source() == gfx::Source::Pfp)?
-                .version(),
+            pfp_version: backend.firmware.image(gfx::Source::Pfp).ok()?.version(),
         })
     }
     pub fn report(&self) -> Option<Report> {

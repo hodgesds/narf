@@ -278,7 +278,9 @@ fn job_emitted_wait() -> impl core::future::Future<Output = ()> {
 /// Detector task for one owner generation; exits on `stop` or device loss.
 pub(crate) async fn monitor(epoch: u64, generation: u64) {
     use core::fmt::Write;
-    let mut watchdog = Watchdog::new(TIMEOUT_MS);
+    // Boxed: the 14 slots live across every await below, and the detector's
+    // poll frame is frame-budgeted.
+    let mut watchdog = alloc::boxed::Box::new(Watchdog::new(TIMEOUT_MS));
     // The first sample covers work emitted before the detector started.
     let mut next = Some(0);
     loop {
@@ -316,7 +318,10 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
             crate::amdgpu_rdna2_client::backend() == crate::amdgpu_rdna2_client::Backend::Raphael;
         for hang in record(&mut watchdog, &samples, now_ms) {
             if let Some(ring) = hang.media {
-                if media_timeout(hang, ring, generation).await {
+                // Out of line: the media-timeout future holds a full device
+                // recovery (cold-boot bring-up), far too large for the
+                // detector's frame-budgeted poll.
+                if crate::out_of_line::boxed!(media_timeout(hang, ring, generation)).await {
                     return; // a recovered owner starts a fresh detector
                 }
                 continue;
@@ -389,7 +394,9 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
                     );
                     continue;
                 }
-                let result = crate::amdgpu_platform::recover().await;
+                // Out of line: the recovery future holds the cold-boot
+                // bring-up; it must not sit in the detector's poll frame.
+                let result = crate::out_of_line::boxed!(crate::amdgpu_platform::recover()).await;
                 let _ = writeln!(narf_console::Writer, "amdgpu: raphael recovery {result:?}");
                 return; // a recovered owner starts a fresh detector
             }
@@ -397,7 +404,12 @@ pub(crate) async fn monitor(epoch: u64, generation: u64) {
                 if claim_automatic_recovery() {
                     // SAFETY: the caller of set_automatic_recovery accepted
                     // recover()'s contract on behalf of every queue user.
-                    let result = unsafe { crate::amdgpu_navi22_platform::recover() }.await;
+                    // Out of line: the recovery future holds the cold-boot
+                    // bring-up; it must not sit in the detector's poll frame.
+                    let result = crate::out_of_line::boxed!(unsafe {
+                        crate::amdgpu_navi22_platform::recover()
+                    })
+                    .await;
                     let _ = writeln!(narf_console::Writer, "amdgpu: navi22 recovery {result:?}");
                     return; // a recovered owner starts a fresh detector
                 }
