@@ -1124,7 +1124,22 @@ pub mod tests {
         caps: [u8; 16],
         mstm_ctrl: u8,
         pattern: u8,
+        /// Clock recovery has locked at the current rate. Sticky
+        /// across the TPS1 → TPS2/3 pattern switch (a real sink
+        /// holds the lane status bits through equalization and
+        /// into normal operation); cleared by a new LINK_BW_SET
+        /// or power-down. Set only once the sink has been polled
+        /// past its settle rounds under TPS1 — a real hub does
+        /// not lock CR on the first status poll, and locking
+        /// instantly would return from clock recovery before
+        /// the source ever reads ADJUST_REQUEST, so the drive
+        /// levels would never leave their (0, 0) initial state.
+        /// Mirrors `DpSink` (`intel_gpu_dp.rs`).
+        cr_locked: bool,
+        /// Status reads since the training pattern last changed.
         polls: u32,
+        /// Polls a healthy rate needs before CR_DONE appears.
+        cr_rounds: u32,
         powered: bool,
         /// Source payload table: vcpi → (start, count).
         source_table: BTreeMap<u8, (u8, u8)>,
@@ -1169,7 +1184,9 @@ pub mod tests {
                 caps,
                 mstm_ctrl: 0,
                 pattern: 0,
+                cr_locked: false,
                 polls: 0,
+                cr_rounds: 1,
                 powered: false,
                 source_table: BTreeMap::new(),
                 payload_log: Vec::new(),
@@ -1187,17 +1204,13 @@ pub mod tests {
             }
         }
 
-        fn cr_locked(&self) -> bool {
-            self.powered && self.pattern >= 1
-        }
-
         fn eq_done(&self) -> bool {
-            self.pattern >= 2 && self.polls >= 1 && self.cr_locked()
+            self.pattern >= 2 && self.polls >= 1 && self.cr_locked
         }
 
         fn lane_status_byte(&self) -> u8 {
             let mut nibble = 0u8;
-            if self.cr_locked() {
+            if self.cr_locked {
                 nibble |= 0x1;
             }
             if self.eq_done() {
@@ -1233,6 +1246,11 @@ pub mod tests {
                     0x111 => self.mstm_ctrl,
                     0x202 => {
                         self.polls += 1;
+                        // CR locks once a healthy rate has been
+                        // polled past its settle rounds under TPS1.
+                        if self.powered && self.pattern == 1 && self.polls > self.cr_rounds {
+                            self.cr_locked = true;
+                        }
                         self.lane_status_byte()
                     }
                     0x203 => self.lane_status_byte(),
@@ -1287,13 +1305,23 @@ pub mod tests {
             for (i, b) in data.iter().enumerate() {
                 let a = addr + i as u32;
                 match a {
+                    0x100 => {
+                        // New rate: the CR lock belongs to the
+                        // old rate (mirrors `DpSink`).
+                        self.cr_locked = false;
+                    }
                     0x111 => self.mstm_ctrl = *b,
                     0x102 => {
                         self.pattern = b & 0x7;
                         self.polls = 0;
                         self.training_pattern_writes += 1;
                     }
-                    0x600 => self.powered = b & 0x1 != 0,
+                    0x600 => {
+                        self.powered = b & 0x1 != 0;
+                        if !self.powered {
+                            self.cr_locked = false;
+                        }
+                    }
                     0x2C0 => {
                         if b & 1 != 0 {
                             self.payload_updated = false;
