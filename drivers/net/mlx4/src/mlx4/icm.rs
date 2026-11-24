@@ -208,7 +208,12 @@ pub struct IcmLayout {
 
 impl IcmLayout {
     /// The INIT_HCA parameters this layout implies.
-    pub fn init_hca_params(&self, counts: &IcmCounts, log_uar_sz: u8, uar_page_sz: u8) -> InitHcaParams {
+    pub fn init_hca_params(
+        &self,
+        counts: &IcmCounts,
+        log_uar_sz: u8,
+        uar_page_sz: u8,
+    ) -> InitHcaParams {
         InitHcaParams {
             qpc_base: self.qpc.base,
             log_num_qps: self.qpc.log_num,
@@ -288,7 +293,10 @@ pub fn make_layout(dev: &DevCap, counts: &IcmCounts) -> IcmLayout {
     let srqc = place(counts.log_num_srqs, 64);
     let altc = place(counts.log_num_qps, dev.altc_entry_sz);
     let auxc = place(counts.log_num_qps, dev.auxc_entry_sz);
-    let rdmarc = place(counts.log_num_qps + counts.log_rd, dev.rdmarc_entry_sz.max(16));
+    let rdmarc = place(
+        counts.log_num_qps + counts.log_rd,
+        dev.rdmarc_entry_sz.max(16),
+    );
     let qpc = place(counts.log_num_qps, dev.qpc_entry_sz);
     let mcg = place(counts.log_mc_table_sz, 1u16 << counts.log_mc_entry_sz);
 

@@ -32,7 +32,10 @@ fn smoke_mlx4_go_word_layout() -> TestResult {
     check!(w & 0x0fff == 0x004, "opcode not in low 12 bits");
     let w2 = cmd::go_word(cmd::CmdOp::InitHca, 3, true, false);
     check!(w2 & cmd::HCR_TOGGLE != 0, "toggle not set");
-    check!((w2 >> cmd::HCR_OPMOD_SHIFT) & 0xf == 3, "op_modifier misplaced");
+    check!(
+        (w2 >> cmd::HCR_OPMOD_SHIFT) & 0xf == 3,
+        "op_modifier misplaced"
+    );
     check!(w2 & 0x0fff == 0x007, "InitHca opcode wrong");
     TestResult::Pass
 }
@@ -41,9 +44,15 @@ fn smoke_mlx4_status_decode() -> TestResult {
     // The status byte lives in the top 8 bits of the status dword.
     check!(cmd::status_of(0x1234_5678) == 0x12, "status_of wrong byte");
     check!(cmd::CmdStatus::from_raw(0).is_ok(), "0 not OK");
-    check!(cmd::CmdStatus::from_raw(0x03) == cmd::CmdStatus::BadParam, "0x03 != BadParam");
     check!(
-        matches!(cmd::CmdStatus::from_raw(0x7f), cmd::CmdStatus::Unknown(0x7f)),
+        cmd::CmdStatus::from_raw(0x03) == cmd::CmdStatus::BadParam,
+        "0x03 != BadParam"
+    );
+    check!(
+        matches!(
+            cmd::CmdStatus::from_raw(0x7f),
+            cmd::CmdStatus::Unknown(0x7f)
+        ),
         "unknown not surfaced"
     );
     TestResult::Pass
@@ -54,9 +63,15 @@ fn smoke_mlx4_is_pending() -> TestResult {
     check!(cmd::is_pending(cmd::HCR_GO, false), "GO should be pending");
     // GO clear, echoed toggle matches posted ⇒ done.
     check!(!cmd::is_pending(0, false), "clear+match should be done");
-    check!(!cmd::is_pending(cmd::HCR_TOGGLE, true), "clear+match(1) should be done");
+    check!(
+        !cmd::is_pending(cmd::HCR_TOGGLE, true),
+        "clear+match(1) should be done"
+    );
     // GO clear, toggle mismatch ⇒ still pending.
-    check!(cmd::is_pending(cmd::HCR_TOGGLE, false), "toggle mismatch pending");
+    check!(
+        cmd::is_pending(cmd::HCR_TOGGLE, false),
+        "toggle mismatch pending"
+    );
     TestResult::Pass
 }
 
@@ -72,7 +87,10 @@ fn smoke_mlx4_query_fw_decode() -> TestResult {
     wire::put_be16(&mut mb, 0x0a, 3); // cmd iface rev
     let fw = fw::decode_query_fw(&mb);
     check!(fw.fw_pages == 0x40, "fw_pages wrong");
-    check!(fw.major == 2 && fw.minor == 11 && fw.subminor == 40, "fw ver wrong");
+    check!(
+        fw.major == 2 && fw.minor == 11 && fw.subminor == 40,
+        "fw ver wrong"
+    );
     check!(fw.cmd_iface_rev == 3, "cmd iface rev wrong");
     TestResult::Pass
 }
@@ -113,8 +131,14 @@ fn smoke_mlx4_query_adapter_decode() -> TestResult {
 
 fn smoke_mlx4_vpm_mailbox() -> TestResult {
     let e = [
-        icm::VpmEntry { virt: 0x1000, phys: 0xdead_0000 },
-        icm::VpmEntry { virt: 0x2000, phys: 0xbeef_0000 },
+        icm::VpmEntry {
+            virt: 0x1000,
+            phys: 0xdead_0000,
+        },
+        icm::VpmEntry {
+            virt: 0x2000,
+            phys: 0xbeef_0000,
+        },
     ];
     let mb = icm::build_vpm_mailbox(&e);
     check!(mb.len() == 2 * icm::VPM_ENTRY_LEN, "mailbox length wrong");
@@ -146,11 +170,20 @@ fn smoke_mlx4_init_hca_layout() -> TestResult {
     // So mask the low byte when checking the base, and check the log byte
     // separately.
     const BASE_MASK: u64 = 0xffff_ffff_ffff_ff00;
-    check!(wire::get_be64(&m, 0x030) & BASE_MASK == 0x1_0000, "qpc_base misplaced");
+    check!(
+        wire::get_be64(&m, 0x030) & BASE_MASK == 0x1_0000,
+        "qpc_base misplaced"
+    );
     check!(m[0x037] == 7, "log_num_qps misplaced");
-    check!(wire::get_be64(&m, 0x050) & BASE_MASK == 0x2_0000, "cqc_base misplaced");
+    check!(
+        wire::get_be64(&m, 0x050) & BASE_MASK == 0x2_0000,
+        "cqc_base misplaced"
+    );
     check!(m[0x057] == 7, "log_num_cqs misplaced");
-    check!(wire::get_be64(&m, 0x080) & BASE_MASK == 0x3_0000, "eqc_base misplaced");
+    check!(
+        wire::get_be64(&m, 0x080) & BASE_MASK == 0x3_0000,
+        "eqc_base misplaced"
+    );
     check!(m[0x087] == 4, "log_num_eqs misplaced");
     check!(wire::get_be64(&m, 0x100) == 0x4_0000, "mtt_base misplaced");
     check!(wire::get_be64(&m, 0x0f0) == 0x5_0000, "dmpt_base misplaced");
@@ -177,7 +210,10 @@ fn smoke_mlx4_icm_layout_consistency() -> TestResult {
     let regions = l.regions();
     let mut last_end = 0u64;
     for (base, size) in regions {
-        check!(base % icm::ICM_PAGE_SIZE == 0, "region base not page aligned");
+        check!(
+            base % icm::ICM_PAGE_SIZE == 0,
+            "region base not page aligned"
+        );
         check!(base >= last_end, "regions overlap / not monotonic");
         last_end = base + size;
     }
@@ -215,9 +251,15 @@ fn smoke_mlx4_mpt_layout() -> TestResult {
     let flags = wire::get_be32(&m, 0x00);
     check!(flags & mr::MLX4_MPT_FLAG_MIO != 0, "MIO not set");
     check!(flags & mr::MLX4_MPT_FLAG_REGION != 0, "REGION not set");
-    check!(flags & mr::MLX4_MPT_FLAG_PHYSICAL != 0, "PHYSICAL not set for physical MR");
+    check!(
+        flags & mr::MLX4_MPT_FLAG_PHYSICAL != 0,
+        "PHYSICAL not set for physical MR"
+    );
     check!(wire::get_be64(&m, 0x18) == u64::MAX, "length misplaced");
-    check!(wire::get_be32(&m, 0x38) == 12, "entity_size (page shift) misplaced");
+    check!(
+        wire::get_be32(&m, 0x38) == 12,
+        "entity_size (page shift) misplaced"
+    );
     TestResult::Pass
 }
 
@@ -230,10 +272,16 @@ fn smoke_mlx4_eq_context() -> TestResult {
         mtt_base: 0x1_2345_0000,
         log_page_size: 0,
     });
-    check!(wire::get_be32(&c, 0x00) == 0x0000_0900, "status/state flags wrong");
+    check!(
+        wire::get_be32(&c, 0x00) == 0x0000_0900,
+        "status/state flags wrong"
+    );
     check!(c[0x0c] == 6, "log_eq_size misplaced");
     check!(c[0x1b] == 0x01, "mtt_base high byte misplaced");
-    check!(wire::get_be32(&c, 0x1c) == 0x2345_0000, "mtt_base low misplaced");
+    check!(
+        wire::get_be32(&c, 0x1c) == 0x2345_0000,
+        "mtt_base low misplaced"
+    );
     TestResult::Pass
 }
 
@@ -248,7 +296,10 @@ fn smoke_mlx4_eqe_decode() -> TestResult {
     // owner=1, cons=0, nent=64 ⇒ phase 0 ⇒ owned==phase false ⇒ not SW-owned.
     check!(!eq::eqe_is_sw_owned(0x80, 0, 64), "owner phase wrong");
     check!(eq::eqe_is_sw_owned(0x00, 0, 64), "sw-owned phase wrong");
-    check!(eq::eq_doorbell_word(5, true) == (5 | (1 << 31)), "doorbell word wrong");
+    check!(
+        eq::eq_doorbell_word(5, true) == (5 | (1 << 31)),
+        "doorbell word wrong"
+    );
     TestResult::Pass
 }
 
@@ -261,9 +312,15 @@ fn smoke_mlx4_cq_context() -> TestResult {
         comp_eqn: 0,
         db_rec_addr: 0xabcd_0000,
     });
-    check!(wire::get_be32(&c, 0x0c) == (7 << 24) | 128, "logsize_usrpage wrong");
+    check!(
+        wire::get_be32(&c, 0x0c) == (7 << 24) | 128,
+        "logsize_usrpage wrong"
+    );
     check!(c[0x17] == 0, "comp_eqn misplaced");
-    check!(wire::get_be64(&c, 0x38) == 0xabcd_0000, "db_rec_addr misplaced");
+    check!(
+        wire::get_be64(&c, 0x38) == 0xabcd_0000,
+        "db_rec_addr misplaced"
+    );
     TestResult::Pass
 }
 
@@ -299,7 +356,10 @@ fn smoke_mlx4_qp_context() -> TestResult {
     let mb = qp::build_modify_mailbox(&c, qp::QpTransition::RstToInit, 0);
     check!(mb.len() == 8 + qp::QP_CONTEXT_LEN, "modify mailbox length");
     let flags = wire::get_be32(&mb, 8);
-    check!((flags >> 28) & 0xf == qp::QpState::Init as u32, "state nibble not Init");
+    check!(
+        (flags >> 28) & 0xf == qp::QpState::Init as u32,
+        "state nibble not Init"
+    );
     TestResult::Pass
 }
 
@@ -307,18 +367,27 @@ fn smoke_mlx4_qp_context() -> TestResult {
 
 fn smoke_mlx4_set_port_general() -> TestResult {
     let m = port::build_set_port_general(1522);
-    check!(m[0x03] == port::SET_PORT_GEN_ALL_VALID, "validity flags misplaced");
+    check!(
+        m[0x03] == port::SET_PORT_GEN_ALL_VALID,
+        "validity flags misplaced"
+    );
     check!(wire::get_be16(&m, 0x06) == 1522, "mtu misplaced");
     TestResult::Pass
 }
 
 fn smoke_mlx4_mac_table_and_roundtrip() -> TestResult {
     let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
-    check!(port::u64_to_mac(port::mac_to_u64(mac)) == mac, "mac round-trip");
+    check!(
+        port::u64_to_mac(port::mac_to_u64(mac)) == mac,
+        "mac round-trip"
+    );
     let mb = port::build_mac_table(&[mac], 1);
     let v = wire::get_be64(&mb, 0);
     check!(v & port::MLX4_MAC_VALID != 0, "mac valid bit");
-    check!(v & port::MLX4_MAC_MASK == port::mac_to_u64(mac), "mac bytes");
+    check!(
+        v & port::MLX4_MAC_MASK == port::mac_to_u64(mac),
+        "mac bytes"
+    );
     TestResult::Pass
 }
 
@@ -346,7 +415,10 @@ fn smoke_mlx4_tx_wqe_tcp_udp_csum() -> TestResult {
     let w = wqe::build_tx_wqe(true, true, 0xdead_beef_0000, 0x1234, 1514);
     let flags = wqe::wqe_srcrb_flags(&w);
     check!(flags & wqe::CTRL_IP_CSUM != 0, "IP csum not requested");
-    check!(flags & wqe::CTRL_TCP_UDP_CSUM != 0, "L4 (TCP/UDP) csum not requested");
+    check!(
+        flags & wqe::CTRL_TCP_UDP_CSUM != 0,
+        "L4 (TCP/UDP) csum not requested"
+    );
     check!(flags & wqe::CTRL_CQ_UPDATE != 0, "completion not requested");
     let oo = wqe::wqe_owner_opcode(&w);
     check!(oo & wqe::DESC_OWN != 0, "owner bit not set");
@@ -354,13 +426,25 @@ fn smoke_mlx4_tx_wqe_tcp_udp_csum() -> TestResult {
     // Data segment: byte_count / lkey / addr.
     check!(wire::get_be32(&w, 0x10) == 1514, "data byte_count wrong");
     check!(wire::get_be32(&w, 0x14) == 0x1234, "data lkey wrong");
-    check!(wire::get_be64(&w, 0x18) == 0xdead_beef_0000, "data addr wrong");
+    check!(
+        wire::get_be64(&w, 0x18) == 0xdead_beef_0000,
+        "data addr wrong"
+    );
     // A plain (no-offload) send leaves the csum bits clear.
     let w2 = wqe::build_tx_wqe(false, false, 0, 0, 60);
     let f2 = wqe::wqe_srcrb_flags(&w2);
-    check!(f2 & (wqe::CTRL_IP_CSUM | wqe::CTRL_TCP_UDP_CSUM) == 0, "csum set without request");
-    check!(wqe::wqe_owner_opcode(&w2) & wqe::DESC_OWN == 0, "owner set without phase");
-    check!(wqe::tx_doorbell_word(0x40) == 0x40 << 8, "tx doorbell word wrong");
+    check!(
+        f2 & (wqe::CTRL_IP_CSUM | wqe::CTRL_TCP_UDP_CSUM) == 0,
+        "csum set without request"
+    );
+    check!(
+        wqe::wqe_owner_opcode(&w2) & wqe::DESC_OWN == 0,
+        "owner set without phase"
+    );
+    check!(
+        wqe::tx_doorbell_word(0x40) == 0x40 << 8,
+        "tx doorbell word wrong"
+    );
     TestResult::Pass
 }
 
@@ -369,7 +453,11 @@ fn smoke_mlx4_rx_cqe_tcp_csum_ok() -> TestResult {
     // reports the L4 checksum verified.
     let mut c = [0u8; 32];
     wire::put_be32(&mut c, 0x00, 0x40); // qpn
-    wire::put_be16(&mut c, 0x10, cq::CQE_STATUS_TCP | cq::CQE_STATUS_IPV4 | cq::CQE_STATUS_IPOK);
+    wire::put_be16(
+        &mut c,
+        0x10,
+        cq::CQE_STATUS_TCP | cq::CQE_STATUS_IPV4 | cq::CQE_STATUS_IPOK,
+    );
     wire::put_be16(&mut c, 0x1a, 0xffff); // checksum
     wire::put_be32(&mut c, 0x14, 1480); // byte_cnt
     wire::put_be16(&mut c, 0x18, 3); // wqe_index
@@ -386,14 +474,21 @@ fn smoke_mlx4_rx_cqe_tcp_csum_ok() -> TestResult {
 
 fn smoke_mlx4_rx_cqe_udp_csum_ok() -> TestResult {
     let mut c = [0u8; 32];
-    wire::put_be16(&mut c, 0x10, cq::CQE_STATUS_UDP | cq::CQE_STATUS_IPV4 | cq::CQE_STATUS_IPOK);
+    wire::put_be16(
+        &mut c,
+        0x10,
+        cq::CQE_STATUS_UDP | cq::CQE_STATUS_IPV4 | cq::CQE_STATUS_IPOK,
+    );
     wire::put_be16(&mut c, 0x1a, 0xffff);
     let v = cq::decode_cqe(&c);
     check!(v.l4_csum_ok(), "UDP L4 csum should be OK");
     // A non-0xffff folded checksum means the stack must re-verify.
     let mut c2 = c;
     wire::put_be16(&mut c2, 0x1a, 0x1234);
-    check!(!cq::decode_cqe(&c2).l4_csum_ok(), "partial csum must not claim OK");
+    check!(
+        !cq::decode_cqe(&c2).l4_csum_ok(),
+        "partial csum must not claim OK"
+    );
     // A bad-FCS completion is flagged for drop.
     let mut c3 = c;
     c3[0x13] = cq::CQE_BAD_FCS;
@@ -406,7 +501,10 @@ fn smoke_mlx4_rx_wqe() -> TestResult {
     check!(wire::get_be32(&w, 0x00) == 2048, "rx byte_count wrong");
     check!(wire::get_be32(&w, 0x04) == 0x1234, "rx lkey wrong");
     check!(wire::get_be64(&w, 0x08) == 0xcafe_0000, "rx addr wrong");
-    check!(wqe::rx_prod_doorbell_word(0x1_2345u32) == 0x2345, "rx prod db masks to 16 bits");
+    check!(
+        wqe::rx_prod_doorbell_word(0x1_2345u32) == 0x2345,
+        "rx prod db masks to 16 bits"
+    );
     TestResult::Pass
 }
 
