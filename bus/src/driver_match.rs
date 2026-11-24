@@ -1135,6 +1135,16 @@ fn with_bar<R>(
     cap.invoke(DeviceOp(|| f(&region))).ok()
 }
 
+/// Length in bytes of BAR handle `handle` mapped by `module_bar_map`. A
+/// driver bounds its register accesses and sizes its windows by it (ath11k
+/// MHI's `regs` length); the mapping itself never leaves the kernel.
+pub fn module_bar_len(owner: u64, token: u64, handle: u64) -> Option<u64> {
+    let g = DEVICE_CTXS.lock();
+    let ctx = g.iter().find(|c| c.owner == owner && c.token == token)?;
+    let index = usize::try_from(handle.checked_sub(1)?).ok()?;
+    ctx.bars.get(index).map(|region| region.len)
+}
+
 /// Read a 32-bit device register from a mapped BAR of a module-owned device.
 /// Reached from `narf_mmio_read32`. `None` on a bad token/handle/offset.
 pub fn module_mmio_read32(owner: u64, token: u64, handle: u64, off: u64) -> Option<u32> {

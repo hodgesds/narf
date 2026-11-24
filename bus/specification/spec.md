@@ -403,6 +403,7 @@ pub fn unregister_module_pci_drivers(owner: u64);
 
 pub fn module_pci_enable(owner: u64, dev: u64, bits: u16) -> i32;
 pub fn module_bar_map(owner: u64, dev: u64, bar: u8) -> u64;
+pub fn module_bar_len(owner: u64, dev: u64, bar: u64) -> Option<u64>;
 pub fn module_mmio_read32(owner: u64, dev: u64, bar: u64, off: u64) -> Option<u32>;
 pub fn module_mmio_write32(owner: u64, dev: u64, bar: u64, off: u64, val: u32) -> i32;
 pub fn module_mmio_wait32(

@@ -268,3 +268,60 @@ kernel_test_in!(
     "bus/module-pci",
     module_mapped_dma_is_masked_shared_with_the_handle_and_freed
 );
+
+/// `narf_bar_len` (`module_bar_len`): a mapped region's length by its
+/// handle, for the owning context only. Handle 0, a handle past the last
+/// mapping, another owner and a retired token are refused.
+fn module_bar_len_reports_only_owned_mapped_bars() -> TestResult {
+    let mut words = alloc::vec![0u32; 1024];
+    let (device, cfg) = function(&mut words);
+    // SAFETY: the aligned owned window remains live through the scoped map.
+    let _mapping =
+        unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
+    install_device_ctx(
+        OWNER,
+        TOKEN,
+        device,
+        Cap::<BusDeviceCap, Write>::bootstrap(),
+    );
+    let _restore = Restore;
+    let set_bars = |lens: &[u64]| {
+        let mut contexts = DEVICE_CTXS.lock();
+        if let Some(ctx) = contexts.iter_mut().find(|ctx| ctx.token == TOKEN) {
+            // Bookkeeping only: nothing is accessed through these regions.
+            ctx.bars.clear();
+            for &len in lens {
+                ctx.bars.push(crate::MmioRegion {
+                    phys: narf_memory::PhysAddr::new(0),
+                    virt: 0,
+                    len,
+                    kind: crate::BarKind::Mmio32 {
+                        prefetchable: false,
+                    },
+                });
+            }
+        }
+    };
+    set_bars(&[0x20_0000, 0x1000]);
+    let owned = module_bar_len(OWNER, TOKEN, 1) == Some(0x20_0000)
+        && module_bar_len(OWNER, TOKEN, 2) == Some(0x1000);
+    let refused = module_bar_len(OWNER, TOKEN, 0).is_none()
+        && module_bar_len(OWNER, TOKEN, 3).is_none()
+        && module_bar_len(OWNER + 1, TOKEN, 1).is_none()
+        && module_bar_len(OWNER, TOKEN + 1, 1).is_none();
+    // Teardown must not unmap the synthetic regions.
+    set_bars(&[]);
+    remove_device_ctx(TOKEN);
+    let retired = module_bar_len(OWNER, TOKEN, 1).is_none();
+    if !owned {
+        return TestResult::Fail("owned BAR handles did not report their lengths");
+    }
+    if !refused || !retired {
+        return TestResult::Fail("a BAR length leaked to a bad handle, owner or retired token");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bus/module-pci",
+    module_bar_len_reports_only_owned_mapped_bars
+);

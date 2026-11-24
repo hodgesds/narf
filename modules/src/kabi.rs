@@ -478,6 +478,26 @@ kernel_abi! {
         narf_bus::module_bar_map(owner, dev, bar_idx)
     }
 
+    /// Write the length in bytes of BAR handle `bar` through `out_len`.
+    /// Returns 0, or `-EINVAL` for a bad handle or null pointer.
+    ///
+    /// # Safety
+    /// `out_len` must point to writable `u64` storage.
+    fn narf_bar_len(dev: u64, bar: u64, out_len: *mut u64) -> i32 {
+        if out_len.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_bar_len(owner, dev, bar) {
+            Some(len) => {
+                // SAFETY: non-null; the module promises writable storage.
+                unsafe { out_len.write(len) };
+                0
+            }
+            None => -22,
+        }
+    }
+
     /// Read a 32-bit device register at `off` in BAR handle `bar`, storing it
     /// through `out`. Returns 0, or `-EINVAL` for a bad handle/offset/pointer.
     ///
@@ -2128,6 +2148,24 @@ kernel_test_in!(
     "modules/kabi",
     smoke_kabi_pci_ext_exports_validate_arguments
 );
+
+/// `narf_bar_len` refuses a null output and a token with no device context
+/// (the owned-handle cases are `bus/module-pci`'s).
+fn smoke_kabi_bar_len_validates_arguments() -> TestResult {
+    const UNKNOWN: u64 = (0x56u64 << 56) | 0xFEFF;
+    let mut len = 0x5a5a_u64;
+    // SAFETY: the pointer is null (to prove rejection) or names a live local.
+    let ok = unsafe {
+        narf_bar_len(UNKNOWN, 1, core::ptr::null_mut()) == -22
+            && narf_bar_len(UNKNOWN, 1, &mut len) == -22
+            && narf_bar_len(UNKNOWN, 0, &mut len) == -22
+    };
+    if !ok || len != 0x5a5a {
+        return TestResult::Fail("narf_bar_len accepted a null output or an unknown token");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_bar_len_validates_arguments);
 
 /// Device-bound additions need their manifest cap to resolve; the
 /// device-independent services need none.
