@@ -752,6 +752,7 @@ pub fn send_message_void<M: SmuMmio>(
 //   smu_v12_0.h:        SMU12_DRIVER_IF_VERSION   (Renoir / Lucienne / Cezanne)
 //   smu_v13_0_4.h:      SMU_13_0_4_DRIVER_IF_VERSION (Phoenix / HawkPoint1)
 //   smu13_driver_if_v13_0_0.h: SMU_13_0_0_DRIVER_IF_VERSION (Navi31/32/33 discrete)
+//   smu_v14_0_0_ppt.c:  SMU14_DRIVER_IF_VERSION_SMU_V14_0_1 (Strix Point, MP1 14.0.1)
 
 /// Renoir / Lucienne / Cezanne (SMU 12.0). Matches Linux
 /// `drivers/gpu/drm/amd/pm/swsmu/inc/smu_v12_0.h`.
@@ -766,6 +767,14 @@ pub const SMU_13_0_4_DRIVER_IF_VERSION: u32 = 0x07;
 /// carries 0x07 for Phoenix above — the Phoenix value predates that bump
 /// and is NOT changed here; it needs its own lane + CI verdict.
 pub const SMU_13_0_0_DRIVER_IF_VERSION: u32 = 0x3D;
+/// Strix Point (SMU 14.0.1). Matches Linux
+/// `drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c:69`
+/// (`#define SMU14_DRIVER_IF_VERSION_SMU_V14_0_1 0x6`, Linux 7.4-rc2),
+/// assigned when MP1 reports 14.0.1 (`smu_v14_0_0_set_ppt_funcs`); MP1
+/// 14.0.0 / 14.0.4 / 14.0.5 use the same v14_0_0 message table but report
+/// 0x7 (`SMU14_DRIVER_IF_VERSION_SMU_V14_0_0`) and are different parts,
+/// not admitted by the Strix owner.
+pub const SMU_14_0_1_DRIVER_IF_VERSION: u32 = 0x06;
 
 // ── Bring-up sequence ──────────────────────────────────────────────
 

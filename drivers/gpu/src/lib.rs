@@ -697,6 +697,8 @@ pub mod amdgpu_smu_raphael;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_rembrandt;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_strix;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_temp;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_v12;
@@ -705,7 +707,11 @@ pub mod amdgpu_smu_v13;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_v13_0;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_v14;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smuio14;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_strix_boot;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_uapi;
 #[cfg(feature = "amdgpu")]
