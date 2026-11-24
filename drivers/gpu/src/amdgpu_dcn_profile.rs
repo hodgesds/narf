@@ -25,6 +25,11 @@ pub(crate) enum Profile {
     Navi22,
     Dcn302,
     Dcn303,
+    /// Renoir / Cezanne / Lucienne / Barcelo: DCN 2.1 (`dcn21_resource.c`,
+    /// 4 pipes / 5 streams / 5 DDC). `Pipeline::new` refuses it — the
+    /// DCN 2.0/2.1 scanout blocks are the follow-up lane — but the PSP
+    /// 12.0 ring and the DMUB boot already resolve through it.
+    Dcn21,
     Dcn314,
     /// Rembrandt (`1002:1681`). See the module doc for which blocks admit it.
     Dcn312,
@@ -383,6 +388,8 @@ impl Profile {
             Self::Navi22 => 6,
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
+            // linux: n/a (literal in dcn21_resource.c: res_cap_dcn21.num_ddc)
+            Self::Dcn21 => 5,
             // Linux 7.4-rc2: dcn314_resource.c res_cap_dcn314.num_ddc = 5
             // (:895); dcn315_resource.c res_cap_dcn31.num_ddc = 5 (:882).
             // (The 3.1.5 caps struct is named res_cap_dcn31, not
@@ -439,6 +446,21 @@ impl Profile {
             {
                 Ok(Self::Dcn303)
             }
+            // DCN 2.1 on both dies: `dc_resource.c` maps
+            // ASICREV_IS_RENOIR and ASICREV_IS_GREEN_SARDINE to
+            // DCN_VERSION_2_1, superseding the APU audit's Renoir-2.0
+            // claim (the audit grounded Renoir from the DCN 2.0
+            // register window, which 2.1 shares). A (2, 0, 0) blob is
+            // refused fail-closed rather than driven as 2.1.
+            (2, 1, 0)
+                if gpu.chip.vid == amdgpu::AMD_VENDOR
+                    && matches!(
+                        gpu.chip.did,
+                        amdgpu::RENOIR | amdgpu::CEZANNE | amdgpu::LUCIENNE | amdgpu::BARCELO
+                    ) =>
+            {
+                Ok(Self::Dcn21)
+            }
             // Linux 7.4-rc2: dc/resource/dcn314/dcn314_resource.c.
             (3, 1, 4) => Ok(Self::Dcn314),
             // Bound to the one id that carries it, as DCN 3.1.5 is: Linux's
@@ -468,6 +490,8 @@ impl Profile {
             Self::Navi22 => 6,
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
+            // linux: n/a (literal in dcn21_resource.c: res_cap_dcn21.num_timing_generator)
+            Self::Dcn21 => 4,
             // Linux 7.4-rc2: dcn314_resource.c res_cap_dcn314
             // .num_timing_generator = 4 (:884).
             Self::Dcn314 => 4,
@@ -487,6 +511,8 @@ impl Profile {
             Self::Navi22 => 6,
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
+            // linux: n/a (literal in dcn21_resource.c: res_cap_dcn21.num_stream_encoder)
+            Self::Dcn21 => 5,
             // Linux 7.4-rc2: dcn314_resource.c res_cap_dcn314
             // .num_stream_encoder = 5 (:888).
             Self::Dcn314 => 5,
@@ -505,6 +531,7 @@ impl Profile {
             Self::Dcn302 => &[(3, 0, 2)],
             Self::Dcn303 => &[(3, 0, 3)],
             Self::Navi22 => &[(3, 0, 0)], // linux: n/a (DCE_HWIP IP_VERSION(3, 0, 0))
+            Self::Dcn21 => &[(2, 1, 0)],  // linux: n/a (DCN 2.1.0 path)
             Self::Dcn314 => &[(3, 1, 4)], // Linux 7.4-rc2: dcn314_resource.c.
             Self::Dcn312 => &[(3, 1, 2)], // linux: n/a (DCE_HWIP IP_VERSION(3, 1, 2))
             Self::Dcn315 => &[(3, 1, 5)], // linux: n/a (DCE_HWIP IP_VERSION(3, 1, 5))

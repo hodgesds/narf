@@ -516,6 +516,14 @@ enum Kind {
     /// only on 13.0.6/12/14/15). Every MP0 C2PMSG register sits at the same
     /// offset on `_BASE_IDX` 0 instead of 1 (`mp_13_0_5_offset.h`).
     Raphael,
+    /// PSP 12.0 (Renoir MP0 11.0.3, Cezanne/Green Sardine MP0 12.0.1):
+    /// Linux's `psp_v12_0`, which loads ASD + TA only — no TOC, no SOS
+    /// upload (`psp_v12_0_init_microcode` calls `psp_init_asd_microcode`
+    /// + `psp_init_ta_microcode`; the TOC mechanism is PSP v13+ only).
+    /// The ring protocol is version-identical to Phoenix/Raphael: the
+    /// MP0 C2PMSG registers sit at the same offsets on `_BASE_IDX` 0
+    /// (`mp_12_0_0_offset.h`).
+    Psp12,
     /// PSP 13.0.1/13.0.3: Linux's generic `psp_v13_0`, as Raphael's 13.0.5 —
     /// the same ring create/stop/destroy and write-pointer registers, and
     /// every MP0 C2PMSG register on `_BASE_IDX` 0. The 13.0.0/13.0.2/13.0.5
@@ -596,6 +604,8 @@ struct Session<I: Io> {
     smc_state: SmcState,
     /// An APU's PMFW is BIOS-resident (`smu_v13_0_5_ppt.c` loads no
     /// microcode): no SMC upload is possible, and none is awaited.
+    /// `psp_v12_0` has no SMC load either (`psp_v12_0.c` loads ASD +
+    /// TA only).
     smc_resident: bool,
     gfx_state: GfxLoadState,
     gfx_status: Option<GfxBootStatus>,
@@ -853,6 +863,24 @@ impl Layout {
                 // 0x475..0x477 in dcn_3_1_5_offset.h too.
                 let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 5)], 2, 0x477)?;
                 (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
+            }
+            Kind::Psp12 => {
+                // PSP 12.0 (Renoir MP0 11.0.3, Cezanne/Green Sardine MP0
+                // 12.0.1): `amdgpu_discovery_set_psp_ip_blocks` routes
+                // both to `psp_v12_0_ip_block`, and the MP0 C2PMSG
+                // registers sit on `_BASE_IDX` 0
+                // (`mp_12_0_0_offset.h`). DCN is 2.1 on both dies
+                // (`dc_resource.c` maps RENOIR and GREEN_SARDINE to
+                // `DCN_VERSION_2_1`); its FB location registers are
+                // 0x493..0x495 (`dcn_2_1_0_offset.h`, BASE_IDX 2).
+                // linux-lit: 0=mmMP0_SMN_C2PMSG_81_BASE_IDX
+                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 3), (12, 0, 1)], 0, SOS)?;
+                let nbio = nbio_bank_ungated(gpu)?;
+                let dcn = bank(gpu, discovery::HW_ID_DCN, &[(2, 1, 0)], 2, 0x495)?;
+                // linux-lit: 0x493=mmDCN_VM_FB_LOCATION_BASE
+                // linux-lit: 0x494=mmDCN_VM_FB_LOCATION_TOP
+                // linux-lit: 0x495=mmDCN_VM_FB_OFFSET
+                (mp0, nbio, dcn + 0x493 * 4, dcn + 0x494 * 4, dcn + 0x495 * 4)
             }
             Kind::Rembrandt => {
                 // MP0 C2PMSG on `_BASE_IDX` 0, as the generic `psp_v13_0`
@@ -1191,6 +1219,31 @@ impl Psp {
         // SAFETY: forwarded exclusive device/mapping/pool contract.
         unsafe { Self::with_kind(gpu, authority, pool, kind) }
     }
+    /// Claim the Renoir/Cezanne PSP 12.0 ring. Selection requires MP0
+    /// 11.0.3 or 12.0.1 beside DCN 2.1; any other pairing is refused.
+    ///
+    /// # Safety
+    /// `new`'s exclusive GPU, PSP/HDP/reset/PM ownership, trained VRAM,
+    /// permanent mapping and excluded pool contract applies. SOS is
+    /// BIOS-started on these APUs (`psp_v12_0_bootloader_load_sos`
+    /// returns early on a non-zero C2PMSG_81 sign-of-life);
+    /// `Engine::start` fails closed (`DeviceGone`) on a zero
+    /// sign-of-life register.
+    pub unsafe fn new_psp12(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        if crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 3), (12, 0, 1)], 0, 0)
+            .is_err()
+            || crate::amdgpu_dcn_profile::Profile::resolve(gpu)
+                != Ok(crate::amdgpu_dcn_profile::Profile::Dcn21)
+        {
+            return Err(Error::Unsupported);
+        }
+        // SAFETY: caller supplies the complete exclusive ownership contract.
+        unsafe { Self::with_kind(gpu, authority, pool, Kind::Psp12) }
+    }
     /// Claim Navi31's PSP13.0.0 ring after SOS bootstrap (or verified
     /// resident SOS). Selection requires the exact PCI/GC/MP0 identities
     /// (Navi31 DID, GC 11.0.0, MP0 13.0.0); Navi32/33 dies are refused.
@@ -1298,7 +1351,7 @@ impl Psp {
                 tmr: None,
                 tmr_ready: false,
                 smc_state: SmcState::Absent,
-                smc_resident: matches!(kind, Kind::Raphael | Kind::Rembrandt),
+                smc_resident: matches!(kind, Kind::Raphael | Kind::Rembrandt | Kind::Psp12),
                 gfx_state: GfxLoadState::Absent,
                 gfx_status: None,
                 media_firmware: MediaFirmware::default(),
@@ -1325,6 +1378,16 @@ impl Psp {
         self.session
             .setup_tmr_payload(Some(toc_payload(toc)?))
             .await
+    }
+    /// Reserve this Renoir/Cezanne ASIC's TMR with no TOC: PSP 12.0 has
+    /// no TOC mechanism (`psp_v12_0_init_microcode` loads ASD + TA
+    /// only), so `psp_tmr_init` uses the default 4 MiB TMR
+    /// (`PSP_TMR_SIZE`) and `psp_tmr_load` follows.
+    pub async fn setup_tmr_psp12(&mut self) -> Result<(), Error> {
+        if self.kind != Kind::Psp12 {
+            return Err(Error::Unsupported);
+        }
+        self.session.setup_tmr_payload(None).await
     }
     /// Reserve this Navi31 ASIC's TMR from its SOS container's embedded
     /// TOC. MP0 13.0.0 takes the SOS branch in
@@ -1426,13 +1489,28 @@ impl Psp {
     /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
     /// The DCN314 loader is the currently audited consumer of this operation.
     pub async fn load_dmub(&mut self, signed_instructions: &[u8]) -> Result<(), Error> {
-        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael | Kind::Rembrandt) {
+        if !matches!(
+            self.kind,
+            Kind::Phoenix | Kind::Raphael | Kind::Rembrandt | Kind::Psp12
+        ) {
             return Err(Error::Unsupported);
         }
         self.session
             .load_ip(signed_instructions, 51) // linux-lit: 51=GFX_FW_TYPE_DMUB
             .await
             .map(|_| ())
+    }
+    /// Load the ASD application through PSP (GFX_CMD_ID_LOAD_ASD = 4).
+    /// PSP 12.0 only: Renoir/Cezanne load no TOC and no SOS, so the ASD
+    /// container is the PSP image `prepare()` authenticated. The payload
+    /// is the ASD ucode slice (`asd_payload`), staged like every other
+    /// PSP load; the shared address/length are zero
+    /// (`psp_asd_initialize` sets PSP_ASD_SHARED_MEM_SIZE = 0).
+    pub async fn load_asd(&mut self, asd: &[u8]) -> Result<(), Error> {
+        if self.kind != Kind::Psp12 {
+            return Err(Error::Unsupported);
+        }
+        self.session.load_asd(asd).await
     }
     /// `amdgpu_vcn_psp_update_sram`: LOAD_IP_FW of VCN 3.0 instance
     /// `instance`'s DPG register list (offset/value dword pairs) as
@@ -1800,6 +1878,26 @@ impl<I: Io> Session<I> {
         self.release_payload();
         result
     }
+    /// `psp_asd_initialize` / `psp_ta_load` with
+    /// `ta_load_type = GFX_CMD_ID_LOAD_ASD`: the ASD ucode payload
+    /// staged in the PSP's private buffer, `app_len` the payload size,
+    /// shared address/length zero.
+    async fn load_asd(&mut self, asd: &[u8]) -> Result<(), Error> {
+        if !self.tmr_ready {
+            return Err(Error::Busy);
+        }
+        let payload = asd_payload(asd)?;
+        let (address, size) = self.stage(payload).await?;
+        let result = self
+            .engine
+            .submit(&command(
+                crate::amdgpu_psp::gfx_ctrl_cmd_id::LOAD_ASD,
+                &[address as u32, (address >> 32) as u32, size, 0, 0, 0],
+            ))
+            .await;
+        self.release_payload();
+        result.map(|_| ())
+    }
     /// Whether the SMU firmware the graphics autoload needs is running.
     fn smc_ready(&self) -> bool {
         self.smc_resident || self.smc_state == SmcState::Loaded
@@ -2150,6 +2248,30 @@ pub(crate) fn toc_payload(bytes: &[u8]) -> Result<&[u8], Error> {
         || h.size_bytes as usize != bytes.len()
         || h.header_size_bytes < 44 // linux-lit: 44=sizeof(struct psp_firmware_header_v1_0)
         || (h.header_version_major, h.header_version_minor) != (1, 0)
+        || h.ucode_array_offset_bytes < h.header_size_bytes
+        || h.ucode_size_bytes == 0
+        || h.ucode_size_bytes as usize > MAX_IMAGE
+    {
+        return Err(Error::Invalid);
+    }
+    bytes
+        .get(h.ucode_array_offset_bytes as usize..end as usize)
+        .ok_or(Error::Invalid)
+}
+/// The ASD application's ucode slice from a validated ASD container.
+/// `parse_psp_v1_bin_descriptor` performs no validation at all — it
+/// just reads `ucode_version`, `ucode_size_bytes` and
+/// `ucode_array_offset_bytes` — so this mirrors `toc_payload`'s
+/// structural checks without a header-version pin.
+pub(crate) fn asd_payload(bytes: &[u8]) -> Result<&[u8], Error> {
+    let h = crate::amdgpu_ucode_header::parse_common(bytes).map_err(|_| Error::Invalid)?;
+    let end = h
+        .ucode_array_offset_bytes
+        .checked_add(h.ucode_size_bytes)
+        .ok_or(Error::Invalid)?;
+    if bytes.len() > MAX_IMAGE + 4096
+        || h.size_bytes as usize != bytes.len()
+        || h.header_size_bytes < 44 // linux-lit: 44=sizeof(struct psp_firmware_header_v1_0)
         || h.ucode_array_offset_bytes < h.header_size_bytes
         || h.ucode_size_bytes == 0
         || h.ucode_size_bytes as usize > MAX_IMAGE

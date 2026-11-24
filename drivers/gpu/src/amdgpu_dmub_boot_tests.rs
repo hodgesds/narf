@@ -17,6 +17,9 @@ struct Fake {
     boot_ready: bool,
     stop_ack: bool,
     violation: bool,
+    /// This generation's DMCUB register map; the special cases below
+    /// model it, never the DCN 3.1.4 constants.
+    table: Regs,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -24,27 +27,38 @@ impl Io for Fake {
     }
     fn write(&mut self, reg: u32, value: u32) {
         self.writes.push((reg, value));
-        if self.locked_window && reg == 0x1b5 {
+        if self.locked_window && reg == self.table.cw_offset {
             return;
         }
-        if self.bad_reset && matches!(reg, CNTL | CNTL2 | HUB_RESET) {
+        if self.bad_reset
+            && (reg == self.table.cntl
+                || self.table.cntl2 == Some(reg)
+                || reg == self.table.hub_reset)
+        {
             return;
         }
         self.regs[reg as usize] = value;
-        if reg == GPINT && value == STOP && self.stop_ack {
-            self.regs[GPINT as usize] = 2 << 16;
-            self.regs[STOP_REPLY as usize] = 0xdeaddead;
-            self.regs[CNTL as usize] |= 1 << 20;
+        if reg == self.table.gpint && value == STOP && self.stop_ack {
+            self.regs[self.table.gpint as usize] = 2 << 16;
+            self.regs[self.table.stop_reply as usize] = 0xdeaddead;
+            self.regs[self.table.cntl as usize] |= 1 << 20;
         }
-        if reg == CNTL2 && value & 1 == 0 && self.boot_ready {
+        // The firmware reports ready when reset is released: DCN 3.x on
+        // the CNTL2 clear, DCN 2.0/2.1 on the CNTL enable (no CNTL2).
+        let released = match self.table.cntl2 {
+            Some(cntl2) => reg == cntl2 && value & 1 == 0,
+            None => reg == self.table.cntl && value & ENABLE != 0,
+        };
+        if released && self.boot_ready {
             if self.uploaded != self.vram.len() {
                 self.violation = true;
             }
-            self.regs[STATUS as usize] = 3;
+            self.regs[self.table.status as usize] = 3;
         }
     }
     fn upload(&mut self, offset: usize, bytes: &[u8]) -> bool {
-        if !reset_confirmed(self) || offset != self.uploaded {
+        let table = self.table;
+        if !reset_confirmed(table, self) || offset != self.uploaded {
             self.violation = true;
             return false;
         }
@@ -53,12 +67,11 @@ impl Io for Fake {
         true
     }
 }
-fn fixture() -> (Pool, Engine<Fake>) {
-    let bytes = super::super::amdgpu_dmub_firmware::tests::combined(256, 4);
-    let prepared = super::super::amdgpu_dmub_firmware::Image::parse(&bytes)
-        .unwrap()
-        .prepare_dcn314(&[0x3c; 512])
-        .unwrap();
+fn fixture_with(
+    prepared: super::super::amdgpu_dmub_firmware::Prepared<'_>,
+    table: Regs,
+    cached_inbox: bool,
+) -> (Pool, Engine<Fake>) {
     let layout = prepared.layout();
     let map = MmioRegion {
         phys: narf_memory::PhysAddr::new(0),
@@ -78,7 +91,9 @@ fn fixture() -> (Pool, Engine<Fake>) {
     let mut staging = vec![0; layout.size() as usize];
     prepared.stage(&mut staging).unwrap();
     let mut io = Fake {
-        regs: vec![0; 0x478],
+        // The register numbers reach 0x32a2 on DCN 2.1; size the model
+        // past the highest register either table addresses.
+        regs: vec![0; 0x32a3],
         vram: vec![0xa5; staging.len()],
         writes: Vec::new(),
         uploaded: 0,
@@ -87,8 +102,9 @@ fn fixture() -> (Pool, Engine<Fake>) {
         boot_ready: true,
         stop_ack: true,
         violation: false,
+        table,
     };
-    io.regs[CNTL as usize] = ENABLE;
+    io.regs[table.cntl as usize] = ENABLE;
     (
         pool,
         Engine {
@@ -102,8 +118,34 @@ fn fixture() -> (Pool, Engine<Fake>) {
             staging,
             state: State::Prepared,
             secure: false,
+            regs: table,
+            cached_inbox,
         },
     )
+}
+fn fixture() -> (Pool, Engine<Fake>) {
+    let bytes = super::super::amdgpu_dmub_firmware::tests::combined(256, 4);
+    let prepared = super::super::amdgpu_dmub_firmware::Image::parse(&bytes)
+        .unwrap()
+        .prepare_dcn314(&[0x3c; 512])
+        .unwrap();
+    fixture_with(prepared, Regs::DCN314, true)
+}
+/// A Renoir/Cezanne engine: the `prepare_dcn21` image for the
+/// requested mailbox mode, on the DCN 2.1 register map.
+fn fixture_dcn21(cached: bool) -> (Pool, Engine<Fake>) {
+    // The shipping green_sardine blob is 0x0101002B (uncached); a blob
+    // above 1.10.0 takes the cached CW4 path.
+    let version = if cached { 0x010b_0000 } else { 0x0101_002b };
+    let mut bytes = super::super::amdgpu_dmub_firmware::tests::combined(256, 4);
+    let meta = bytes.len() - 256 - 4 - 64;
+    bytes[meta + 12..meta + 16].copy_from_slice(&version.to_le_bytes());
+    let prepared = super::super::amdgpu_dmub_firmware::Image::parse(&bytes)
+        .unwrap()
+        .prepare_dcn21(&[0x3c; 512])
+        .unwrap();
+    assert_eq!(prepared.cached_inbox(), cached);
+    fixture_with(prepared, Regs::DCN21, cached)
 }
 
 fn dmub_psp_boot_preserves_secure_windows() -> TestResult {
@@ -111,15 +153,20 @@ fn dmub_psp_boot_preserves_secure_windows() -> TestResult {
     engine.secure = true;
     engine.io.regs[0x1ad] = WINDOW_ENABLE | 0x123fff;
     engine.io.regs[0x1ae] = WINDOW_ENABLE | 0x100ffff;
-    engine.io.regs[SEC_CNTL as usize] = 0x3400;
+    engine.io.regs[Regs::DCN314.sec_cntl as usize] = 0x3400;
     if narf_scheduler::block_on_spin(engine.boot(Default::default())).is_err() {
         return TestResult::Fail("PSP-configured windows rejected");
     }
+    // The PSP-owned secure windows: SEC_CNTL, CW0/1 BASE, CW0/1 TOP,
+    // CW0/1 OFFSET/HIGH — no host write may touch any of them.
+    let regs = Regs::DCN314;
     if engine.io.writes.iter().any(|(reg, _)| {
-        matches!(
-            *reg,
-            SEC_CNTL | 0x1a5 | 0x1a6 | 0x1ad | 0x1ae | 0x1b5..=0x1b8
-        )
+        *reg == regs.sec_cntl
+            || *reg == regs.cw_base
+            || *reg == regs.cw_base + 1
+            || *reg == regs.cw_top
+            || *reg == regs.cw_top + 1
+            || (regs.cw_offset..=regs.cw_offset + 3).contains(reg)
     }) {
         return TestResult::Fail("host overwrote PSP-owned secure windows");
     }
@@ -161,7 +208,7 @@ fn dmub_direct_boot_orders_reset_upload_and_windows() -> TestResult {
     {
         return TestResult::Fail("Linux DCN314 window address/limit ABI");
     }
-    if engine.io.writes.first() != Some(&(GPINT, STOP)) {
+    if engine.io.writes.first() != Some(&(Regs::DCN314.gpint, STOP)) {
         return TestResult::Fail("live firmware not asked to stop");
     }
     if narf_scheduler::block_on_spin(engine.stop()).is_err() || engine.state != State::Stopped {
@@ -272,7 +319,7 @@ fn dmub_locked_window_rejected_before_start() -> TestResult {
     if narf_scheduler::block_on_spin(engine.boot(BootOptions::default()))
         != Err(Error::ConfigurationFailed)
         || engine.state != State::Failed
-        || !reset_confirmed(&mut engine.io)
+        || !reset_confirmed(engine.regs, &mut engine.io)
     {
         return TestResult::Fail("unprogrammed firmware window released reset");
     }
@@ -353,8 +400,8 @@ fn dmub_s0ix_resume_checks_hw_init_and_reboots_a_lost_dmcub() -> TestResult {
     {
         return TestResult::Fail("a running DMCUB not seen as initialized");
     }
-    engine.io.regs[CNTL as usize] &= !ENABLE;
-    engine.io.regs[STATUS as usize] = 0;
+    engine.io.regs[Regs::DCN314.cntl as usize] &= !ENABLE;
+    engine.io.regs[Regs::DCN314.status as usize] = 0;
     if engine.is_hw_init() != Ok(false) {
         return TestResult::Fail("a powered-off DMCUB seen as initialized");
     }
@@ -372,4 +419,87 @@ fn dmub_s0ix_resume_checks_hw_init_and_reboots_a_lost_dmcub() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu-dmub",
     dmub_s0ix_resume_checks_hw_init_and_reboots_a_lost_dmcub
+);
+
+/// Renoir/Cezanne cached-mailbox boot: a firmware above 1.10.0 takes
+/// the CW4 window (inbox 0x64000000), on the DCN 2.1 register map.
+/// Window addresses, TOPs and mailbox bases mirror the DCN314 test.
+fn dmub_dcn21_cached_boot_programs_cw4_mailbox() -> TestResult {
+    let (pool, mut engine) = fixture_dcn21(true);
+    let full = pool.available() + engine.allocation.size();
+    if narf_scheduler::block_on_spin(engine.boot(BootOptions::default())).is_err()
+        || engine.state != State::Running
+        || engine.io.violation
+        || engine.io.vram != engine.staging
+    {
+        return TestResult::Fail("dcn21 cached reset/upload/start sequence");
+    }
+    let regs = &engine.io.regs;
+    let address =
+        |index: usize| regs[0x325f + index * 2] as u64 | (regs[0x3260 + index * 2] as u64) << 32;
+    if address(0) != 0x8000_0000
+        || address(1) != 0x8000_0000 + engine.layout.region(Window::Stack).offset as u64
+        || address(4) != engine.placement.inbox()
+        || regs[0x3257] != WINDOW_ENABLE | (engine.layout.region(Window::Instructions).size - 1)
+        || regs[0x325b] != WINDOW_ENABLE | 0x0400_0000 | engine.layout.region(Window::Mailbox).size
+        || regs[0x3259] != 0
+        || regs[0x327e] != 0x6400_0000
+        || regs[0x3286] != 0x6400_2000
+        || regs[0x327f] != 8192
+        || regs[0x3287] != 8192
+        || regs[0x329b] != (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9) | (1 << 27)
+    {
+        return TestResult::Fail("Linux DCN21 window address/limit ABI");
+    }
+    if engine.io.writes.first() != Some(&(Regs::DCN21.gpint, STOP)) {
+        return TestResult::Fail("live firmware not asked to stop");
+    }
+    if narf_scheduler::block_on_spin(engine.stop()).is_err() || engine.state != State::Stopped {
+        return TestResult::Fail("shutdown did not verify reset");
+    }
+    drop(engine);
+    if pool.available() != full {
+        return TestResult::Fail("stopped allocation not returned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu-dmub",
+    dmub_dcn21_cached_boot_programs_cw4_mailbox
+);
+
+/// The shipping green_sardine blob (0x0101002B) takes the uncached
+/// REGION4 mailbox: inbox/outbox at GPU 0x80000000/0x80002000, CW4
+/// skipped, REGION4 TOP = mailbox size - 1 with ENABLE.
+fn dmub_dcn21_uncached_boot_programs_region4_mailbox() -> TestResult {
+    let (_pool, mut engine) = fixture_dcn21(false);
+    if narf_scheduler::block_on_spin(engine.boot(BootOptions::default())).is_err()
+        || engine.state != State::Running
+        || engine.io.violation
+        || engine.io.vram != engine.staging
+    {
+        return TestResult::Fail("dcn21 uncached reset/upload/start sequence");
+    }
+    let regs = &engine.io.regs;
+    let mailbox = engine.layout.region(Window::Mailbox).size;
+    if regs[0x327e] != 0x8000_0000
+        || regs[0x3286] != 0x8000_2000
+        || regs[0x327f] != 8192
+        || regs[0x3287] != 8192
+        || regs[0x324b] != WINDOW_ENABLE | (mailbox - 1)
+        || regs[0x3240] != engine.placement.inbox() as u32
+        || regs[0x3241] != (engine.placement.inbox() >> 32) as u32
+        || regs[0x325b] != 0
+        || regs[0x3257] != WINDOW_ENABLE | (engine.layout.region(Window::Instructions).size - 1)
+    {
+        return TestResult::Fail("Linux DCN21 uncached mailbox ABI");
+    }
+    if narf_scheduler::block_on_spin(engine.stop()).is_err() || engine.state != State::Stopped {
+        return TestResult::Fail("shutdown did not verify reset");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu-dmub",
+    dmub_dcn21_uncached_boot_programs_region4_mailbox
 );
