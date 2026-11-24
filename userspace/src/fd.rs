@@ -1635,13 +1635,17 @@ pub const KDSIGACCEPT: u32 = 0x4B4E;
 /// `ioctl(fd, KDGETMODE, &int)` — query the VT graphics/text mode. agetty
 /// on a Linux VT probes this; NARF has no VT, so it reports `KD_TEXT` (0).
 pub const KDGETMODE: u32 = 0x4B3B;
-/// `ioctl(fd, VT_OPENQRY, &int)` — first free VT index. NARF has no VT
-/// layer; report ENOTTY so a VT-aware getty degrades to serial mode.
+/// `ioctl(fd, VT_OPENQRY, &int)` — first free VT index, forwarded to the
+/// VT layer like the other VT ioctls on this fd (see `ConsoleFile::ioctl`).
 pub const VT_OPENQRY: u32 = 0x5600;
 /// `ioctl(fd, VT_GETMODE, &vt_mode)` — current VT switching mode.
 pub const VT_GETMODE: u32 = 0x5601;
+/// `ioctl(fd, VT_SETMODE, &vt_mode)` — install the VT switching mode.
+pub const VT_SETMODE: u32 = 0x5602;
 /// `ioctl(fd, VT_GETSTATE, &vt_stat)` — active-VT state.
 pub const VT_GETSTATE: u32 = 0x5603;
+/// `ioctl(fd, VT_RELDISP, arg)` — acknowledge a VT switch release/acquire.
+pub const VT_RELDISP: u32 = 0x5605;
 /// `ioctl(fd, VT_ACTIVATE, vtnum)` — switch to VT `vtnum`.
 pub const VT_ACTIVATE: u32 = 0x5606;
 /// `ioctl(fd, VT_WAITACTIVE, vtnum)` — block until VT `vtnum` is active.
@@ -2020,13 +2024,107 @@ impl FileOps for ConsoleFile {
                 }
                 Ok(0)
             }
-            VT_OPENQRY | VT_GETMODE | VT_GETSTATE | VT_ACTIVATE | VT_WAITACTIVE => {
-                // Virtual-terminal control. NARF drives a serial/dumb console
-                // with no VT layer, so report ENOTTY (via Unsupported): a
-                // VT-aware agetty treats this as "not a VT" and degrades to
-                // plain serial operation rather than aborting. Distinct from
-                // a bare -1 — the errno is what lets getty branch correctly.
-                Err(FsError::Unsupported)
+            // ── VT layer (logical, single-console) ───────────────────
+            // fds 0/1/2 ARE /dev/console, so the VT ioctls forward to the
+            // VT layer exactly as the devfs console node does (#2137):
+            // the switch is a logical operation (`vt::activate` only flips
+            // the active-VT number and notifies), no UART hardware is
+            // involved, and the per-fd ops apply to the active VT — "the
+            // current console". The old arm answered all of these -ENOTTY
+            // on the grounds that NARF had no VT layer; the layer is real
+            // now (modes, controllers, sysfs `tty0/active`), so the
+            // rejection only stranded VT switching from the serial console.
+            VT_OPENQRY => {
+                // Lowest free VT the DM will run its session on (or -1).
+                let n = narf_filesystem::vt::openqry()
+                    .map(|n| n as i32)
+                    .unwrap_or(-1);
+                let bytes = n.to_le_bytes();
+                // SAFETY: `copy_to_user` validates `arg` through the SMAP
+                // window; the length is the fixed 4-byte `int` encoding.
+                // SAFETY: Valid memory or trusted environment
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
+            VT_GETSTATE => {
+                let active = narf_filesystem::vt::active_vt() as u16;
+                // v_state is a bitmask of in-use VTs; logind only reads
+                // v_active, so a minimal mask (active VT + VT1) is enough.
+                let state = (1u16 << active.min(15)) | 0x0002;
+                let mut bytes = [0u8; 6];
+                bytes[0..2].copy_from_slice(&active.to_le_bytes());
+                bytes[2..4].copy_from_slice(&0u16.to_le_bytes());
+                bytes[4..6].copy_from_slice(&state.to_le_bytes());
+                // SAFETY: `copy_to_user` validates `arg` through the SMAP
+                // window; the length is the fixed 6-byte `struct vt_stat`
+                // encoding.
+                // SAFETY: Valid memory or trusted environment
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
+            VT_ACTIVATE => {
+                let target = u32::try_from(arg).map_err(|_| FsError::InvalidData)?;
+                narf_filesystem::vt::activate(target)
+                    .map(|()| 0)
+                    .map_err(|()| FsError::InvalidData)
+            }
+            VT_WAITACTIVE => {
+                // The synchronous ioctl: succeed only when the target is
+                // already active; the async wait lives in the devfs
+                // `ioctl_user` path.
+                if !(1..=narf_filesystem::vt::MAX_VT as usize).contains(&arg) {
+                    Err(FsError::InvalidData)
+                } else if narf_filesystem::vt::active_vt() as usize == arg {
+                    Ok(0)
+                } else {
+                    Err(FsError::WouldBlock)
+                }
+            }
+            VT_GETMODE => {
+                let m = narf_filesystem::vt::get_mode(narf_filesystem::vt::active_vt());
+                let mut bytes = [0u8; 8];
+                bytes[0] = m.mode;
+                bytes[1] = m.waitv;
+                bytes[2..4].copy_from_slice(&m.relsig.to_le_bytes());
+                bytes[4..6].copy_from_slice(&m.acqsig.to_le_bytes());
+                bytes[6..8].copy_from_slice(&m.frsig.to_le_bytes());
+                // SAFETY: `copy_to_user` validates `arg` through the SMAP
+                // window; the length is the fixed 8-byte `struct vt_mode`
+                // encoding.
+                // SAFETY: Valid memory or trusted environment
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
+            VT_SETMODE => {
+                let mut bytes = [0u8; 8];
+                // SAFETY: `copy_from_user` validates `arg` through the SMAP
+                // window; the length is the fixed 8-byte buffer that
+                // receives the serialized `struct vt_mode`.
+                // SAFETY: Valid memory or trusted environment
+                if unsafe { crate::handlers::copy_from_user(&mut bytes, arg as u64) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
+                let mode = narf_filesystem::vt::VtMode {
+                    mode: bytes[0],
+                    waitv: bytes[1],
+                    relsig: i16::from_le_bytes([bytes[2], bytes[3]]),
+                    acqsig: i16::from_le_bytes([bytes[4], bytes[5]]),
+                    frsig: i16::from_le_bytes([bytes[6], bytes[7]]),
+                };
+                narf_filesystem::vt::set_mode(narf_filesystem::vt::active_vt(), mode)
+                    .map(|()| 0)
+                    .map_err(|()| FsError::InvalidData)
+            }
+            VT_RELDISP => {
+                narf_filesystem::vt::release_display(narf_filesystem::vt::active_vt(), arg as u64)
+                    .map(|()| 0)
+                    .map_err(|()| FsError::InvalidData)
             }
             _ => Err(FsError::Unsupported),
         }

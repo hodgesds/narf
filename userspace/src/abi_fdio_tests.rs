@@ -546,6 +546,59 @@ fn smoke_abi_fdio_ioctl_pos_enotty() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_ioctl_pos_enotty);
 
+// `VT_ACTIVATE` on the console fd, through the raw ioctl syscall (#2137):
+// fd 0 here is the pre-seeded stdio slot, an open of `/dev/console`
+// backed by `ConsoleFile` — the reproducer's shape (`procpoll tty`
+// issues raw `SYS_IOCTL` `VT_ACTIVATE` 2 then 1 on the console fd and
+// used to print `rc=-25` for both). The switch is a logical VT-layer
+// operation, so the serial console forwards it instead of answering
+// -ENOTTY.
+fn smoke_abi_fdio_console_vt_activate() -> TestResult {
+    with_setup(|| {
+        const VT_ACTIVATE: u64 = 0x5606;
+        const VT_GETSTATE: u64 = 0x5603;
+        const VT_WAITACTIVE: u64 = 0x5607;
+        narf_filesystem::vt::__reset_for_test();
+        if call(Syscall::Ioctl.raw(), a2(0, VT_ACTIVATE, 2)) != Some(0) {
+            return Err("VT_ACTIVATE(2) on the console fd was not 0");
+        }
+        if narf_filesystem::vt::active_vt() != 2 {
+            return Err("active VT did not follow VT_ACTIVATE on the console fd");
+        }
+        let mut state = [0u8; 6];
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(0, VT_GETSTATE, state.as_mut_ptr() as u64),
+        ) != Some(0)
+            || u16::from_le_bytes([state[0], state[1]]) != 2
+        {
+            return Err("VT_GETSTATE on the console fd did not report VT 2");
+        }
+        // Synchronous VT_WAITACTIVE: 0 when already active, -EAGAIN when
+        // not.
+        if call(Syscall::Ioctl.raw(), a2(0, VT_WAITACTIVE, 2)) != Some(0) {
+            return Err("VT_WAITACTIVE(2) on the console fd was not 0");
+        }
+        if call(Syscall::Ioctl.raw(), a2(0, VT_WAITACTIVE, 1)) != Some(EAGAIN) {
+            return Err("VT_WAITACTIVE(1) on the console fd was not -EAGAIN");
+        }
+        // Out-of-range targets are -EINVAL and leave the active VT alone.
+        if call(Syscall::Ioctl.raw(), a2(0, VT_ACTIVATE, 0)) != Some(EINVAL) {
+            return Err("VT_ACTIVATE(0) on the console fd was not -EINVAL");
+        }
+        if narf_filesystem::vt::active_vt() != 2 {
+            return Err("a rejected VT_ACTIVATE moved the active VT");
+        }
+        // Switch back: other tests in this image assume VT 1 is active.
+        if call(Syscall::Ioctl.raw(), a2(0, VT_ACTIVATE, 1)) != Some(0) {
+            return Err("VT_ACTIVATE(1) on the console fd was not 0");
+        }
+        narf_filesystem::vt::__reset_for_test();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_console_vt_activate);
+
 // ── lseek ──────────────────────────────────────────────────────────
 //
 // SEEK_SET = 0, SEEK_END = 2.

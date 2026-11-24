@@ -916,6 +916,13 @@ Rejection leaves the old VT active. A dead controller reverts to VT_AUTO.
 `VT_WAITACTIVE` through `FileOps::ioctl_user` sleeps on a registered wake and
 unregisters on cancellation; the direct synchronous ioctl returns WouldBlock
 until the target is active. `/dev/tty` forwards this async ioctl contract.
+The console aliases (`/dev/console`, `/dev/tty`) forward the VT ioctls
+(`VT_ACTIVATE`, `VT_GETMODE`, `VT_GETSTATE`, `VT_OPENQRY`, `VT_RELDISP`,
+`VT_SETMODE`, `VT_WAITACTIVE`) to the VT layer whichever port backs the
+console: the switch is a logical VT-layer operation, so a serial-backed
+console can switch VTs (#2137). The KD ioctls stay rejected on a
+serial-backed console, and a UART's own tty (`/dev/ttyS<n>`) answers both
+the VT and KD ioctls -ENOTTY.
 Userspace writes to console ttys (`/dev/console`, serial and virtual terminals)
 apply the selected tty's output processing and reach its output device without
 creating kernel log records. A kernel-log reader may print records to a tty and
@@ -1086,8 +1093,10 @@ discipline and foreground-group machinery (`filesystem/src/console_tty.rs`).
   register stride and clock), not the console UART's IRQ-fed byte
   ring: writes poll THRE per byte, reads poll DR, readability peeks
   at LSR without consuming. The `ttyS0` path is byte-identical and
-  untouched. The VT/KD ioctl guard applies to probed-UART ttys as it
-  does to `ttyS0` (they answer -ENOTTY).
+  untouched. The VT/KD ioctl guard applies to a probed-UART tty's own
+  node as it does to `ttyS0`'s (they answer -ENOTTY); it does not apply
+  to the console aliases (`/dev/console`, `/dev/tty`), which forward the
+  VT ioctls to the VT layer even when the console is backed by the UART.
 - **Console split (explicit).** Probed-UART ttys are data ttys, not
   registered consoles: `console=` still accepts only `ttyS0` (plus
   the VTs), `/dev/console` never selects a `ttyS1+` port, and
