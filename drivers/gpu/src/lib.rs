@@ -923,6 +923,8 @@ pub(crate) mod intel_gpu_legacy_gt;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_legacy_owner;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_legacy_power;
+#[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_lt_phy;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_media;

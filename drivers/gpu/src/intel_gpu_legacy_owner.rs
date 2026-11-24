@@ -35,6 +35,9 @@ use crate::intel_gpu_legacy_gt::{
     rcs_whitelist, rcs_workarounds, whitelist_writes, LegacyGt, Steering, WaList, WaPlatform,
     MCR_SELECTOR,
 };
+use crate::intel_gpu_legacy_power::{
+    rc6_disable, rc6_enable, rc6_park, rc6_unpark, rps_enable, rps_request, Caps, Governor, Step,
+};
 use crate::intel_gpu_rcs::{BarWindow, ContextId, RcsEngine, SharedArena, SubmitError};
 use crate::intel_gpu_user::{UserBackend, UserBatch, UserContext, UserJob, UserStatus};
 
@@ -293,9 +296,48 @@ struct Runtime {
     ctx_wa: Vec<u32>,
     contexts: Vec<Context>,
     jobs: Vec<Job>,
+    /// Frequency and park policy ([`crate::intel_gpu_legacy_power`]).
+    governor: Governor,
+    /// `RC_CONTROL` while unparked (`rc6->ctl_enable`).
+    rc6_ctl: u32,
 }
 
 impl Runtime {
+    /// `intel_rc6_unpark` + `intel_rps_unpark`: take forcewake back, leave
+    /// RC6 and request the efficient frequency before touching the engine.
+    /// Forcewake is acquired first, so a refused wake leaves the GT parked.
+    fn unpark(&mut self) -> Result<(), FsError> {
+        if !self.governor.parked() {
+            return Ok(());
+        }
+        self.fw
+            .acquire(&self.window, FwDomain::Render)
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
+        if self.fw.acquire(&self.window, FwDomain::Blitter).is_err() {
+            let _ = self.fw.release(&self.window, FwDomain::Render);
+            return Err(crate::intel_gpu_user::io_error());
+        }
+        let window = &self.window;
+        rc6_unpark(self.rc6_ctl, |r, v| window.write32(r, v));
+        if let Some(Some(freq)) = self.governor.unpark() {
+            rps_request(freq, |r, v| window.write32(r, v));
+        }
+        Ok(())
+    }
+
+    /// `intel_rps_park` + `intel_rc6_park`: the idle frequency (with the
+    /// render well still awake, so the PCU commits it), the software RC6
+    /// request, then forcewake released so the GT may enter RC6.
+    fn park(&mut self, idle: u32) {
+        let window = &self.window;
+        if idle != 0 {
+            rps_request(idle, |r, v| window.write32(r, v));
+        }
+        rc6_park(|r, v| window.write32(r, v));
+        let _ = self.fw.release(window, FwDomain::Blitter);
+        let _ = self.fw.release(window, FwDomain::Render);
+    }
+
     fn context_for(&mut self, user: &Arc<UserContext>) -> Result<ContextId, SubmitError> {
         if let Some(context) = self
             .contexts
@@ -329,7 +371,19 @@ impl Runtime {
         self.contexts.retain(|context| {
             context.user.strong_count() != 0 || engine.destroy_context(context.id).is_err()
         });
-        self.engine.completion_lost() || self.jobs.iter().any(|job| now >= job.deadline)
+        let lost = self.engine.completion_lost() || self.jobs.iter().any(|job| now >= job.deadline);
+        if !lost {
+            let busy = !self.jobs.is_empty() || !self.engine.is_idle();
+            match self.governor.tick(now, busy) {
+                Some(Step::Request(freq)) => {
+                    let window = &self.window;
+                    rps_request(freq, |r, v| window.write32(r, v));
+                }
+                Some(Step::Park(idle)) => self.park(idle),
+                None => {}
+            }
+        }
+        lost
     }
 }
 
@@ -338,6 +392,8 @@ pub(crate) struct Owner {
     platform: GtPlatform,
     wa: WaPlatform,
     revision: u8,
+    /// PCI device ID (`WaRsDisableCoarsePowerGating`'s Skylake GT3/GT4).
+    device: u16,
     bar: narf_bus::bar::MmioRegion,
     card: Arc<crate::drm_devfs_bridge::IntelGpuCard>,
     state: Mutex<Option<Runtime>>,
@@ -465,6 +521,19 @@ impl Owner {
             }
             return Err(InitError::Engine(error));
         }
+        // intel_rps_enable / intel_rc6_enable, then unparked: hardware RC6
+        // timers (Gen11) and RPS stay programmed across park/unpark.
+        let gt = self.wa.gt();
+        let caps = Caps::read(gt, |r| window.read32(r));
+        if let Some(caps) = caps {
+            rps_enable(gt, caps, self.clock.load(Ordering::Acquire), |r, v| {
+                window.write32(r, v)
+            });
+        } else {
+            log(self.index, "no RP_STATE_CAP; GPU frequency left to the PCU");
+        }
+        let rc6_ctl = rc6_enable(gt, self.device, |r, v| window.write32(r, v));
+        rc6_unpark(rc6_ctl, |r, v| window.write32(r, v));
         let epoch = crate::intel_gpu_user::next_epoch();
         *self.state.lock().await = Some(Runtime {
             engine,
@@ -474,6 +543,8 @@ impl Owner {
             ctx_wa,
             contexts: Vec::new(),
             jobs: Vec::new(),
+            governor: Governor::new(caps),
+            rc6_ctl,
         });
         self.epoch.store(epoch, Ordering::Release);
         Ok(())
@@ -487,6 +558,9 @@ impl Owner {
         let Some(mut runtime) = self.state.lock().await.take() else {
             return;
         };
+        // The reset sequence needs the render well awake; a refused wake
+        // still attempts it.
+        let _ = runtime.unpark();
         let mut reset = Reset::new();
         let result = loop {
             match reset.poll(&runtime.window, narf_time::monotonic_ns()) {
@@ -494,6 +568,7 @@ impl Owner {
                 Poll::Ready(result) => break result,
             }
         };
+        rc6_disable(|r, v| runtime.window.write32(r, v));
         let _ = runtime.fw.release(&runtime.window, FwDomain::Blitter);
         let _ = runtime.fw.release(&runtime.window, FwDomain::Render);
         if result.is_err() {
@@ -573,6 +648,7 @@ impl Owner {
             .as_mut()
             .filter(|r| r.epoch == epoch)
             .ok_or(FsError::NoDevice)?;
+        runtime.unpark()?;
         let claim = context.claim_resident(epoch)?;
         let id = runtime.context_for(&context).map_err(submit_error)?;
         let submission = runtime
@@ -672,6 +748,7 @@ pub(crate) fn install(
         platform,
         wa,
         revision,
+        device: device.id.device,
         bar,
         card,
         state: Mutex::new(None),
