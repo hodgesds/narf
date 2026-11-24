@@ -6306,7 +6306,10 @@ pub mod tests {
         ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::Skylake);
         ms.set_gen9_sku_family(crate::intel_gpu_gen9_ddi::SkuFamily::Desktop);
         // DMC gate: the HDMI entry refuses without DMC and
-        // writes nothing.
+        // writes nothing. The flag is global: a failed earlier
+        // Gen9 run can leave it set, so the precondition is set
+        // here.
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(false);
         let refused = ms.modeset_hdmi(&fb_1080p(), &mode_1080p60(), false, false);
         if refused != Err(ModesetError::DmcUnavailable) {
             return TestResult::Fail("Gen9 HDMI must refuse without DMC");
