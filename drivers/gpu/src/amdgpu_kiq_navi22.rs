@@ -575,6 +575,25 @@ impl Compute {
             Layout::resolve_raphael(gpu)?,
         )
     }
+    /// Reserve Rembrandt's KIQ and kernel-compute rings: GC 10.3.3 shares the
+    /// GC10.3 MEC queue geometry (`gfx_v10_0_sw_init`'s Sienna Cichlid group).
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Rembrandt.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            Layout::resolve_rembrandt(gpu)?,
+        )
+    }
     fn with_layout(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,

@@ -659,6 +659,10 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
         match (mp0.major, mp0.minor, mp0.revision) {
             (13, 0, 4) => Some("amdgpu/psp_13_0_4_toc.bin"),
             (13, 0, 5) => Some("amdgpu/psp_13_0_5_toc.bin"),
+            // Rembrandt: MP0 13.0.1 and 13.0.3 both decode to the `yellow_carp`
+            // legacy name (`amdgpu_ucode_legacy_naming`), so both load the
+            // same TOC (`psp_v13_0.c`).
+            (13, 0, 1) | (13, 0, 3) => Some("amdgpu/yellow_carp_toc.bin"),
             _ => None,
         }
     })
@@ -1544,12 +1548,12 @@ fn serve_clients(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
         alloc::sync::Arc::new(GraphicsSystemPm),
     );
 }
-/// On Raphael, hand the loader the graphics set so its PSP session loads every
-/// non-PSP firmware in Linux's order (`psp_load_non_psp_fw`) and starts the RLC
-/// autoload, instead of DMCUB alone; `amdgpu_raphael_boot` then brings the
-/// engines up. `amdgpu.rdna2_accel=0` keeps the display-only load. A set that
-/// cannot be opened or does not match the DMCUB the loader validated leaves
-/// the display path as it was, and says why.
+/// On an APU with a graphics ColdBoot (Raphael, Rembrandt), hand the loader
+/// the graphics set so its PSP session loads every non-PSP firmware in Linux's
+/// order (`psp_load_non_psp_fw`) and starts the RLC autoload, instead of DMCUB
+/// alone; the ColdBoot then brings the engines up. `amdgpu.rdna2_accel=0` keeps
+/// the display-only load. A set that cannot be opened or does not match the
+/// DMCUB the loader validated leaves the display path as it was, and says why.
 fn graphics(
     gpu: &AmdGpu,
     fw_cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
@@ -1566,13 +1570,21 @@ fn graphics(
         );
         return;
     }
-    let result = crate::amdgpu_gfx_navi22::Firmware::open_raphael(gpu, fw_cap)
-        .map_err(|e| alloc::format!("{e:?}"))
-        .and_then(|set| {
-            loader
-                .set_graphics(set)
-                .map_err(|e| alloc::format!("{e:?}"))
-        });
+    let result = match crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did) {
+        Some(p) if p == &crate::amdgpu_rdna2::RAPHAEL => {
+            crate::amdgpu_gfx_navi22::Firmware::open_raphael(gpu, fw_cap)
+        }
+        Some(p) if p == &crate::amdgpu_rdna2::REMBRANDT => {
+            crate::amdgpu_gfx_navi22::Firmware::open_rembrandt(gpu, fw_cap)
+        }
+        _ => return,
+    }
+    .map_err(|e| alloc::format!("{e:?}"))
+    .and_then(|set| {
+        loader
+            .set_graphics(set)
+            .map_err(|e| alloc::format!("{e:?}"))
+    });
     if let Err(why) = result {
         let _ = writeln!(
             narf_console::Writer,

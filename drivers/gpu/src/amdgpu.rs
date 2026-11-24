@@ -847,6 +847,32 @@ static STRIX_FW: &[FwEntry] = &[
     FwEntry::ta("amdgpu/psp_14_0_1_ta.bin"),
 ];
 
+/// Rembrandt — GFX **10.3.3**, DCN **3.1.2**, PSP **13.0.1**/**13.0.3**, SDMA 5.2.3,
+/// VCN 3.1.1.
+///
+/// Every name is Linux's `MODULE_FIRMWARE` for this IP set: `psp_v13_0.c`
+/// (TOC + TA, the `yellow_carp` legacy names for MP0 13.0.1 and 13.0.3),
+/// `gfx_v10_0.c`, `sdma_v5_2.c`, `amdgpu_vcn.c` (`FIRMWARE_YELLOW_CARP`) and
+/// `amdgpu_dm_dmub.h` (`FIRMWARE_YELLOW_CARP_DMUB`). GFX10 still has the CE and
+/// a separate MEC2 image, and no MES or IMU.
+///
+/// Order is `enum AMDGPU_UCODE_ID`: SDMA0, CP_CE, CP_PFP, CP_ME, CP_MEC1,
+/// CP_MEC2, RLC_G, VCN, DMCUB — the order `psp_load_non_psp_fw` sends them
+/// in. No SMU entry: an APU's PMFW is BIOS-resident.
+pub(crate) static REMBRANDT_FW: &[FwEntry] = &[
+    FwEntry::toc("amdgpu/yellow_carp_toc.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_sdma.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_ce.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_me.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_mec.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_mec2.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_vcn.bin"),
+    FwEntry::ip_fw("amdgpu/yellow_carp_dmcub.bin"),
+    FwEntry::ta("amdgpu/yellow_carp_ta.bin"),
+];
+
 /// Raphael — GFX **10.3.6**, DCN **3.1.5**, PSP **13.0.5**, SDMA 5.2.6,
 /// VCN 3.1.2.
 ///
@@ -977,13 +1003,15 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         // and has had no bring-up. Claiming it by handing it the Phoenix
         // family would put DCN 3.1.4 register sequences on DCN 3.5 silicon.
         STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", UNAUDITED_FW),
-        // Rembrandt is RDNA2 (GFX 10.3.3 / DCN 3.1.2) — not Phoenix, and
-        // not a generation this driver has any path for.
+        // Rembrandt is RDNA2 (GFX 10.3.3 / DCN 3.1.2) — not Phoenix. Its
+        // firmware set is `REMBRANDT_FW`; the PSP 13.0.1/13.0.3 ring loads
+        // the display's TOC and DMCUB (`amdgpu_platform`), and its graphics
+        // ColdBoot owner is `amdgpu_rembrandt_boot` (platform wiring follows).
         REMBRANDT => (
             Family::Navi2,
             "rembrandt",
             "amdgpu/rembrandt.bin",
-            UNAUDITED_FW,
+            REMBRANDT_FW,
         ),
         // Raphael is RDNA2 too (GFX 10.3.6 / DCN 3.1.5), and like Rembrandt
         // sits in the coarse Navi2 register family beside discrete parts;
@@ -3158,18 +3186,20 @@ impl AmdGpu {
         self.ip_block_base(amdgpu_discovery::HW_ID_MP1, 0)
     }
 
-    /// MP1 base window 1 — where the SMU mailbox registers live on Phoenix
-    /// (`mp_13_0_4_offset.h` gives `regMP1_SMN_C2PMSG_66_BASE_IDX` as 1).
+    /// MP1 base window — where the SMU mailbox registers live. The window
+    /// follows the MP1 version, not the family: Phoenix's 13.0.4/13.0.11 put
+    /// every C2PMSG register on `_BASE_IDX` 1 (`mp_13_0_4_offset.h`), while
+    /// the generic `psp_v13_0` family — 13.0.0/13.0.2/13.0.5 in the headers,
+    /// 13.0.1/13.0.3 by the same driver — puts them on `_BASE_IDX` 0.
     ///
-    /// Every `amdgpu_smu` call takes an `mp1_base`; they were being handed
-    /// window 0, so the mailbox writes went to the wrong window even once the
-    /// offsets were corrected.
+    /// Every `amdgpu_smu` call takes an `mp1_base`; handing it the wrong
+    /// window sends the mailbox writes to the wrong registers even once the
+    /// offsets are corrected.
     ///
-    /// Navi31 is the exception to the window-1 rule: `mp_13_0_0_offset.h`
-    /// gives `regMP1_SMN_C2PMSG_66_BASE_IDX` as 0, so the Navi31 mailbox
-    /// is MP1 window 0 — the same window `mp1_base()` returns. The C2PMSG
-    /// dword offsets themselves agree (`0x240 + N`: 66 is 0x0282, 82 is
-    /// 0x0292, in both headers); only the window differs.
+    /// Navi31 is window 0 by the same rule: `mp_13_0_0_offset.h` gives
+    /// `regMP1_SMN_C2PMSG_66_BASE_IDX` as 0. The C2PMSG dword offsets
+    /// themselves agree (`0x240 + N`: 66 is 0x0282, 82 is 0x0292, in both
+    /// headers); only the window differs.
     pub fn mp1_mailbox_base(&self) -> Option<u32> {
         // Discrete SMU11 has its own message map and owner. Never hand its
         // register window to the APU PowerUp/PowerDownGfx helpers.
@@ -3184,7 +3214,18 @@ impl AmdGpu {
         if !self.is_apu() {
             return None;
         }
-        self.ip_block_base_idx(amdgpu_discovery::HW_ID_MP1, 0, 1)
+        // The window follows the discovered MP1 version: 13.0.4/13.0.11 on
+        // window 1, the generic `psp_v13_0` family on window 0. Anything
+        // else keeps the old window-1 default (ungrounded for other
+        // versions; Renoir's SMU 12.0 keeps its current behaviour).
+        let window =
+            match amdgpu_discovery::find_ip(&self.ip_blocks, amdgpu_discovery::HW_ID_MP1, 0)
+                .map(|b| (b.major, b.minor, b.revision))
+            {
+                Some((13, 0, 1)) | Some((13, 0, 2)) | Some((13, 0, 3)) | Some((13, 0, 5)) => 0,
+                _ => 1,
+            };
+        self.ip_block_base_idx(amdgpu_discovery::HW_ID_MP1, 0, window)
     }
 
     /// SMU driver-interface schema version this driver was

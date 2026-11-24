@@ -97,6 +97,14 @@ pub const RAPHAEL_CG: u64 = cg::GFX_MGCG
 /// follows `PP_GFXOFF_MASK`, not these.
 pub const RAPHAEL_PG: u32 = pg::GFX_PG | pg::VCN | pg::VCN_DPG | pg::JPEG;
 
+/// nv.c `nv_common_early_init`, `case IP_VERSION(10, 3, 3)` (Rembrandt):
+/// Raphael's `cg_flags` plus `AMD_CG_SUPPORT_SDMA_MGCG` (the one flag the
+/// 10.3.3 case adds).
+pub const REMBRANDT_CG: u64 = RAPHAEL_CG | cg::SDMA_MGCG;
+
+/// The same case's `pg_flags`: identical to Raphael's.
+pub const REMBRANDT_PG: u32 = RAPHAEL_PG;
+
 /// `nv_common_early_init` flags for bare-metal discrete RDNA2.
 pub fn profile_flags(profile: &crate::amdgpu_rdna2::Profile) -> (u64, u32) {
     (profile.clock_gating_flags(), profile.power_gating_flags())
@@ -1196,6 +1204,89 @@ impl Gating {
                 authority,
                 // amdgpu_device_ip_early_init: cg_flags &= amdgpu_cg_mask.
                 cg_flags: RAPHAEL_CG & u64::from(cg_mask),
+                sdma_count: 1,
+                rom_force_on: false,
+                hub: Hub::V2_3,
+                athub,
+                common: false,
+                in_safe_mode: false,
+                state: State::Idle,
+            },
+        })
+    }
+    /// Rembrandt (GC 10.3.3): nv.c's flags for 10.3.3 under Linux's
+    /// `amdgpu.cg_mask` — Raphael's set plus `AMD_CG_SUPPORT_SDMA_MGCG` —
+    /// `mmhub_v2_3` on MMHUB 2.3.0/2.4.x (bank 1), ATHUB by version,
+    /// `navi10_ih`, and its one SDMA 5.2.3 in GC segment 0. NBIO 7.2 leaves
+    /// `nv_common` nothing to do. No register access.
+    ///
+    /// # Safety
+    /// Caller is Rembrandt's graphics coordinator: it exclusively owns the GPU's
+    /// engines with permanent mappings, and no other code writes these
+    /// clock-gating registers for the owner's lifetime.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        cg_mask: u32,
+    ) -> Result<Self, Error> {
+        let profile = &crate::amdgpu_rdna2::REMBRANDT;
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did) != Some(profile) {
+            return Err(Error::Unsupported);
+        }
+        let bank = |id, versions: &[(u8, u8, u8)], index, last| {
+            crate::amdgpu_psp_ring::bank(gpu, id, versions, index, last)
+                .map_err(|_| Error::Unsupported)
+        };
+        let mut sdma = gpu
+            .ip_blocks
+            .iter()
+            .filter(|b| b.hw_id == discovery::HW_ID_SDMA0 && b.instance == 0);
+        if sdma
+            .next()
+            .is_none_or(|b| (b.major, b.minor, b.revision) != profile.sdma_version)
+            || sdma.next().is_some()
+        {
+            return Err(Error::Unsupported);
+        }
+        let athub_ip = gpu
+            .ip_blocks
+            .iter()
+            .find(|b| b.hw_id == discovery::HW_ID_ATHUB && b.instance == 0)
+            .map(|b| (b.major, b.minor, b.revision));
+        let athub = Athub::for_version(athub_ip);
+        let io = Mmio {
+            regs: gpu.regs,
+            writes: 0,
+            gc0: bank(discovery::HW_ID_GC, &[profile.gc_version], 0, GC0_LAST)?,
+            gc1: bank(discovery::HW_ID_GC, &[profile.gc_version], 1, GC1_LAST)?,
+            gc2: None,
+            mmhub: bank(
+                discovery::HW_ID_MMHUB,
+                &[(2, 3, 0), (2, 4, 0), (2, 4, 1)],
+                1,
+                MM23_ATC_L2_CGTT_CLK_CTRL.offset,
+            )?,
+            athub: match (athub.register(), athub_ip) {
+                (Some(misc), Some(version)) => {
+                    bank(discovery::HW_ID_ATHUB, &[version], 0, misc.offset)?
+                }
+                _ => 0,
+            },
+            hdp: None,
+            osssys: bank(
+                discovery::HW_ID_OSSSYS,
+                crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS,
+                0,
+                IH_CLK_CTRL.offset,
+            )?,
+            smuio: None,
+        };
+        Ok(Self {
+            engine: Engine {
+                io,
+                authority,
+                // amdgpu_device_ip_early_init: cg_flags &= amdgpu_cg_mask.
+                cg_flags: REMBRANDT_CG & u64::from(cg_mask),
                 sdma_count: 1,
                 rom_force_on: false,
                 hub: Hub::V2_3,

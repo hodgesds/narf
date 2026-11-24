@@ -280,7 +280,7 @@ impl<I: Io> Engine<I> {
     }
     fn resync_dio_fifo(&mut self) -> Result<(), Error> {
         // dccg31 has no trigger_dio_fifo_resync.
-        if self.profile == Profile::Dcn315 {
+        if matches!(self.profile, Profile::Dcn312 | Profile::Dcn315) {
             return Err(Error::Unsupported);
         }
         let (_, read_divider) = self.dispclk_dividers()?;

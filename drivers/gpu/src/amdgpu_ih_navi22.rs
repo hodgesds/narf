@@ -447,20 +447,21 @@ impl Layout {
             )?),
         })
     }
-    /// Raphael: GC 10.3.6 with `navi10_ih` on OSSSYS 5.0.x/5.2.x, NBIO 7.2 and
+    /// Rembrandt: GC 10.3.3 with `navi10_ih` on OSSSYS 5.0.x/5.2.x, NBIO 7.2 and
     /// HDP 5.2.1. NBIO 7.2 keeps `INTERRUPT_CNTL`/`2` and the HDP remap at
     /// their NBIO 2.3 offsets on segment 2; only the doorbell range moves.
-    fn resolve_raphael(gpu: &AmdGpu) -> Result<Self, Error> {
+    fn resolve_rembrandt(gpu: &AmdGpu) -> Result<Self, Error> {
         if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
-            != Some(&crate::amdgpu_rdna2::RAPHAEL)
+            != Some(&crate::amdgpu_rdna2::REMBRANDT)
             || gpu.regs.len < 0x7f004
         {
             return Err(Error::Unsupported);
         }
+        let profile = &crate::amdgpu_rdna2::REMBRANDT;
         let resolve = |id, versions: &[(u8, u8, u8)], index, last| {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
-        resolve(ip::HW_ID_GC, &[(10, 3, 6)], 0, 0)?;
+        resolve(ip::HW_ID_GC, &[profile.gc_version], 0, 0)?;
         resolve(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
         let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
         Ok(Self {
@@ -1453,6 +1454,23 @@ impl Ih {
         device: BusDevice,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve_raphael(gpu)?;
+        Self::with_layout(gpu, authority, pool, device, layout)
+    }
+    /// Reserve Rembrandt's RB0 ring: GC 10.3.3, `navi10_ih` on OSSSYS 5.0.x/5.2.x,
+    /// NBIO 7.2 and HDP 5.2.1. The ring is in the carve-out, read through BAR0
+    /// with no HDP invalidate (HDP 5.2.1 has no read cache). No device I/O or
+    /// interrupt routing occurs during construction.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Rembrandt. NBIO's index pairs are shared through
+    /// `amdgpu_smn`.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        device: BusDevice,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve_rembrandt(gpu)?;
         Self::with_layout(gpu, authority, pool, device, layout)
     }
     fn with_layout(

@@ -154,7 +154,10 @@ pub enum State {
 fn layout_shift(profile: Profile, reg: u64) -> u64 {
     match profile {
         Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 => u64::from(reg >= OTG_CLOCK_CONTROL),
-        Profile::Dcn315 => u64::from(reg >= DCN315_INSERTED),
+        // DCN 3.1.2 and 3.1.5 share the DCN31 timing generator
+        // (`OPTC_COMMON_REG_LIST_DCN3_1`; `OPTC_COMMON_MASK_SH_LIST_DCN31X`
+        // is exactly `OPTC_COMMON_MASK_SH_LIST_DCN3_1`).
+        Profile::Dcn312 | Profile::Dcn315 => u64::from(reg >= DCN315_INSERTED),
         // DCN 3.2 agrees with 3.1.4 on every OTG register this module
         // touches (dcn_3_2_0_offset.h vs dcn_3_1_4_offset.h: H_TOTAL
         // 0x1b2a through VREADY 0x1b88 identical, no 3.1.5-style insert).
@@ -481,8 +484,9 @@ impl<I: Io> Engine<I> {
             }
             // linux-lit: 16=OTG0_OTG_CLOCK_CONTROL__OTG_BUSY__SHIFT
             if value & 1 << 16 == 0 {
-                if self.profile == Profile::Dcn315 {
-                    // optc1_clear_optc_underflow.
+                if matches!(self.profile, Profile::Dcn312 | Profile::Dcn315) {
+                    // optc1_clear_optc_underflow (dcn31_optc.c: the DCN31
+                    // timing generator clears it after the clock-disable wait).
                     self.update(
                         self.odm(OPTC_INPUT_GLOBAL_CONTROL),
                         OPTC_UNDERFLOW_CLEAR,

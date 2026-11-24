@@ -801,7 +801,7 @@ impl<I: Io> Block<I> {
                     Profile::Navi22 => 3,
                     Profile::Dcn302 => 2,
                     Profile::Dcn303 => 1,
-                    Profile::Dcn314 | Profile::Dcn315 => 0,
+                    Profile::Dcn312 | Profile::Dcn314 | Profile::Dcn315 => 0,
                     // Unreachable: this block is DCN 3.0-only
                     // (`is_dcn30` above). Mirrors Dcn314.
                     Profile::Dcn320 | Profile::Dcn321 => 0,

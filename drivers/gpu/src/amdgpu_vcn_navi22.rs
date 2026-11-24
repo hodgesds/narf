@@ -566,6 +566,36 @@ impl Layout {
         };
         Ok((layout, nbio))
     }
+    /// Rembrandt: GC 10.3.3 with `navi10_ih` on OSSSYS 5.0.x/5.2.x, NBIO 7.2 and
+    /// HDP 5.2.1. One VCN 3.1.1 instance (`smu_interface_type` 1) with JPEG
+    /// (`jpeg_v3_0`, no harvest read), as Raphael's 3.1.2 (`smu_interface_type`
+    /// 2). `vcn_bases` checks the profile's `vcn_versions`, so the 3.1.1/3.1.2
+    /// split is enforced there, not here.
+    pub(crate) fn resolve_rembrandt(
+        gpu: &AmdGpu,
+        instances: u8,
+    ) -> Result<(Self, crate::amdgpu_nbio_v7_2::Banks), Error> {
+        let profile = crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            .filter(|p| *p == &crate::amdgpu_rdna2::REMBRANDT)
+            .ok_or(Error::Unsupported)?;
+        if gpu.regs.len < 0x7f004 || instances != 1 {
+            return Err(Error::Unsupported);
+        }
+        let bank = |id, versions: &[(u8, u8, u8)], index, last| {
+            crate::amdgpu_psp_ring::bank(gpu, id, versions, index, last)
+                .map_err(|_| Error::Unsupported)
+        };
+        bank(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        let layout = Self {
+            vcn: [Some(vcn_bases(gpu, profile, 0)?), None],
+            gc: bank(ip::HW_ID_GC, &[profile.gc_version], 0, GB_ADDR_CONFIG)?,
+            nbio: nbio.bif,
+            hdp: None,
+            vcn_version: vcn_version(gpu)?,
+        };
+        Ok((layout, nbio))
+    }
     /// HDP 5.0's `HDP_READ_CACHE_INVALIDATE`, if this HDP has a read cache.
     pub(crate) fn hdp_invalidate(&self) -> Option<u64> {
         // linux-lit: 0xd1=mmHDP_READ_CACHE_INVALIDATE
@@ -2852,6 +2882,43 @@ impl Media {
         cg_flags: u64,
     ) -> Result<Self, Error> {
         let (layout, nbio) = Layout::resolve_raphael(gpu, 1)?;
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            1,
+            firmware_bytes,
+            layout,
+            Some(nbio),
+            (
+                StartMode::linux(pg_flags),
+                StaticPg::linux(pg_flags),
+                Mgcg::linux(cg_flags),
+            ),
+        )
+    }
+    /// Reserve Rembrandt's one VCN 3.1.1 instance and its JPEG: the same
+    /// `vcn_v3_0`/`jpeg_v3_0` start, with NBIO 7.2's doorbell range, no HDP
+    /// read cache, `smu_interface_type` 1 and no JPEG harvest read. PMFW must
+    /// have powered VCN and JPEG up (`PowerUpVcn`/`PowerUpJpeg`) before
+    /// `start`. `pg_flags` (Linux's, under `amdgpu.pg_mask`) choose the
+    /// start ([`StartMode::linux`]) and the static power gating
+    /// ([`StaticPg::linux`]); `cg_flags` (under `amdgpu.cg_mask`) the
+    /// media clock gating ([`Mgcg::linux`]).
+    ///
+    /// # Safety
+    /// As `new`, for Rembrandt.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: crate::amdgpu_cp_navi22::Doorbells,
+        firmware_bytes: usize,
+        pg_flags: u32,
+        cg_flags: u64,
+    ) -> Result<Self, Error> {
+        let (layout, nbio) = Layout::resolve_rembrandt(gpu, 1)?;
         Self::with_layout(
             gpu,
             authority,

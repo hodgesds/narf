@@ -121,18 +121,18 @@ impl Layout {
             )?),
         })
     }
-    /// Raphael: its one SDMA 5.2.6 in GC 10.3.6's bank zero, NBIO 7.2's
+    /// Rembrandt: its one SDMA 5.2.3 in GC 10.3.3's bank zero, NBIO 7.2's
     /// segment 2 (the HDP remap and MEMSIZE keep their NBIO 2.3 offsets), and
     /// HDP 5.2.1, which has no read cache to invalidate.
-    fn resolve_raphael(gpu: &AmdGpu) -> Result<Self, Error> {
+    fn resolve_rembrandt(gpu: &AmdGpu) -> Result<Self, Error> {
         if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
-            != Some(&crate::amdgpu_rdna2::RAPHAEL)
+            != Some(&crate::amdgpu_rdna2::REMBRANDT)
             // linux: n/a (BAR5 bound: MMIO_REG_HOLE_OFFSET + 4)
             || gpu.regs.len < 0x7f004
         {
             return Err(Error::Unsupported);
         }
-        let profile = &crate::amdgpu_rdna2::RAPHAEL;
+        let profile = &crate::amdgpu_rdna2::REMBRANDT;
         let mut blocks = gpu
             .ip_blocks
             .iter()
@@ -610,6 +610,18 @@ impl Sdma {
         pool: &Pool,
     ) -> Result<Self, Error> {
         Self::with_layout(gpu.regs, authority, pool, Layout::resolve_raphael(gpu)?)
+    }
+    /// Reserve Rembrandt's SDMA0 proof ring: SDMA 5.2.3 on GC 10.3.3, NBIO 7.2,
+    /// HDP 5.2.1 (no read cache). No device writes occur during construction.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Rembrandt.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        Self::with_layout(gpu.regs, authority, pool, Layout::resolve_rembrandt(gpu)?)
     }
     fn with_layout(
         registers: MmioRegion,
