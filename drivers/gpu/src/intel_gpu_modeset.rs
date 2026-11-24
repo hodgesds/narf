@@ -467,6 +467,9 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// one (EHL/JSL PORT_D, `arbitrate_combo_dpll`): clock routing and a
     /// mid-training retune use it.
     gen11_dpll: Option<crate::intel_gpu_gen11_dpll::IclDpllId>,
+    /// HDMI to a DVI sink (`!has_hdmi_sink`): the transcoder runs
+    /// `TRANS_DDI_MODE_SELECT_DVI`.
+    hdmi_dvi: bool,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -504,7 +507,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             tc_width: 4,
             gen9_panel_fit: None,
             gen11_dpll: None,
+            hdmi_dvi: false,
         }
+    }
+
+    /// Drive the HDMI entry's sink as DVI (`intel_ddi.c`: a TMDS output
+    /// without `has_hdmi_sink` selects `TRANS_DDI_MODE_SELECT_DVI`).
+    pub(crate) fn set_hdmi_dvi(&mut self, dvi: bool) {
+        self.hdmi_dvi = dvi;
     }
 
     /// EHL/JSL PORT_D: a combo port (it drives PHY A) where every other
@@ -1001,7 +1011,15 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// the fixed 4-lane width, scrambling bits per the plan).
     fn program_trans_ddi_func_ctl_hdmi(&mut self, scrambling: bool, high_tmds_char_rate: bool) {
         use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl_hdmi, TRANS_DDI_FUNC_CTL_OFFSET};
-        let val = build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate);
+        let val = if self.hdmi_dvi {
+            crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
+                self.ddi as u8,
+                crate::intel_gpu_pipes::TRANS_DDI_MODE_DVI,
+                4,
+            )
+        } else {
+            build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate)
+        };
         self.mmio
             .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
@@ -4120,6 +4138,34 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_gen9_panel_fit_programs_the_pipe_scaler
+    );
+
+    /// A DVI sink's transcoder selects DVI mode and never scrambles.
+    fn smoke_hdmi_dvi_sink_selects_dvi_mode() -> TestResult {
+        use crate::intel_gpu_pipes::{
+            Transcoder, TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_HDMI_SCRAMBLING, TRANS_DDI_MODE_DVI,
+            TRANS_DDI_MODE_HDMI,
+        };
+        let reg = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        let mode_bits = 7 << 24;
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::B);
+        ms.program_trans_ddi_func_ctl_hdmi(false, false);
+        ms.set_hdmi_dvi(true);
+        ms.program_trans_ddi_func_ctl_hdmi(true, true);
+        let writes = mmio.writes_to(reg);
+        if writes.len() != 2
+            || writes[0] & mode_bits != TRANS_DDI_MODE_HDMI
+            || writes[1] & mode_bits != TRANS_DDI_MODE_DVI
+            || writes[1] & TRANS_DDI_HDMI_SCRAMBLING != 0
+        {
+            return TestResult::Fail("a DVI sink must take TRANS_DDI_MODE_SELECT_DVI unscrambled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_hdmi_dvi_sink_selects_dvi_mode
     );
 
     fn smoke_gen12_internal_rgb_bypass_precedes_primary_and_refuses_live_pipe() -> TestResult {

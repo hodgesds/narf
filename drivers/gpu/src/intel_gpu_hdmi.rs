@@ -162,6 +162,42 @@ pub struct HfVsdb {
 /// offset (byte 2; 0 means the collection runs to the block
 /// end). Other vendor blocks (including the HDMI Licensing
 /// VSDB, OUI 0x000C03) are walked past, never matched.
+/// The HDMI Licensing VSDB OUI, `00-0C-03` little-endian
+/// (`HDMI_IEEE_OUI`).
+const HDMI_VSDB_OUI: [u8; 3] = [0x03, 0x0C, 0x00];
+/// DVI single-link ceiling (`hdmi_port_clock_valid`: a sink without an
+/// HDMI VSDB is limited to 165 MHz).
+pub const DVI_MAX_TMDS_KHZ: u32 = 165_000;
+
+/// `drm_display_info.is_hdmi` (`drm_parse_hdmi_vsdb_video` via
+/// `drm_parse_cea_ext`): a CTA extension carries the HDMI Licensing VSDB.
+/// A sink without one is DVI (`intel_has_hdmi_sink`): no infoframes, no
+/// audio, no SCDC, `TRANS_DDI_MODE_SELECT_DVI`.
+pub fn is_hdmi_sink(edid: &[u8]) -> bool {
+    edid.chunks_exact(128).skip(1).any(|block| {
+        if block[0] != 0x02 {
+            return false;
+        }
+        let limit = match block[2] {
+            0 => 127usize,
+            n => (n as usize).min(127),
+        };
+        let mut pos = 4usize;
+        while pos < limit {
+            let header = block[pos];
+            let (tag, len) = (header >> 5, (header & 0x1F) as usize);
+            if pos + 1 + len > 128 {
+                break;
+            }
+            if tag == 3 && len >= 3 && block[pos + 1..pos + 4] == HDMI_VSDB_OUI {
+                return true;
+            }
+            pos += 1 + len;
+        }
+        false
+    })
+}
+
 pub fn parse_hf_vsdb(edid: &[u8]) -> HfVsdb {
     let mut out = HfVsdb::default();
     for block in edid.chunks_exact(128).skip(1) {
@@ -489,6 +525,8 @@ pub enum HdmiError {
     /// HF-VSDB does not declare SCDC — the mode cannot be
     /// driven legally, and is refused rather than degraded.
     ScramblingUnsupported,
+    /// A DVI sink's mode exceeds the 165 MHz single-link TMDS clock.
+    DviClockTooHigh,
 }
 
 impl From<DdcError> for HdmiError {
@@ -529,6 +567,8 @@ pub struct HdmiSinkProbe {
     /// The mode's character rate exceeds 340 Mcsc, so SCDC
     /// scrambling is mandatory for this stream.
     pub scrambling_required: bool,
+    /// The sink is HDMI ([`is_hdmi_sink`]); `false` is a DVI sink.
+    pub hdmi_sink: bool,
 }
 
 /// A live HDMI connection.
@@ -597,7 +637,9 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
     let hf_vsdb = parse_hf_vsdb(&edid[..edid_len]);
+    let hdmi_sink = is_hdmi_sink(&edid[..edid_len]);
     Ok(HdmiSinkProbe {
+        hdmi_sink,
         ddi,
         pin,
         mode,
@@ -626,6 +668,11 @@ pub fn activate<M: MmioWindow + ?Sized>(
     let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
     let pin = probe.pin;
+    // A DVI sink is single-link TMDS: no SCDC, so the >340 Mcsc branch
+    // below is unreachable for it.
+    if !probe.hdmi_sink && probe.mode.pixel_clock_khz > DVI_MAX_TMDS_KHZ {
+        return Err(HdmiError::DviClockTooHigh);
+    }
     let mut scrambling = false;
     if probe.scrambling_required {
         configure_scdc(mmio, pin, &probe.hf_vsdb)?;
@@ -633,10 +680,15 @@ pub fn activate<M: MmioWindow + ?Sized>(
     }
     let mut modeset = Modeset::new(mmio, probe.ddi);
     modeset.set_source_family(family);
+    modeset.set_hdmi_dvi(!probe.hdmi_sink);
     let mode = modeset.modeset_hdmi(fb, &probe.mode, scrambling, scrambling)?;
 
-    let frame = pack_avi_infoframe(&mode);
-    write_avi_infoframe(mmio, Transcoder::A, &frame);
+    // Infoframes and audio are HDMI-sink only (`has_infoframe` and
+    // `has_audio` both require `has_hdmi_sink`).
+    if probe.hdmi_sink {
+        let frame = pack_avi_infoframe(&mode);
+        write_avi_infoframe(mmio, Transcoder::A, &frame);
+    }
     // The stream is scrambled from here on; only now can the sink report
     // its scrambler status.
     let scrambler_status = if scrambling {
@@ -651,7 +703,9 @@ pub fn activate<M: MmioWindow + ?Sized>(
         &probe.edid[..probe.edid_len],
         DisplayConnector::Hdmi,
         (probe.ddi as u64) + 1,
-    ) {
+    )
+    .filter(|_| probe.hdmi_sink)
+    {
         let channels = publication.lpcm_max_channels;
         publish_display_audio(sink_id_for(probe.ddi), publication);
         intel_gpu_audio::hdmi_audio_codec_enable(mmio, Transcoder::A, mode.pixel_clock_khz);
@@ -1981,4 +2035,31 @@ pub mod tests {
         "drivers/gpu/intel_gpu_hdmi",
         smoke_hdmi_gen11_gen9_source_families
     );
+
+    /// `is_hdmi_sink`: only the HDMI Licensing VSDB (00-0C-03) in a CTA
+    /// extension makes a sink HDMI; an HF-VSDB alone, a base block alone
+    /// or a non-CTA extension leave it DVI.
+    fn smoke_hdmi_vsdb_decides_dvi() -> TestResult {
+        let edid = |payload: &[u8], tag: u8| {
+            let mut e = [0u8; 256];
+            e[128] = tag;
+            e[129] = 3;
+            e[130] = (4 + 1 + payload.len()) as u8;
+            e[132] = (3 << 5) | payload.len() as u8;
+            e[133..133 + payload.len()].copy_from_slice(payload);
+            e
+        };
+        let hdmi = edid(&[0x03, 0x0C, 0x00, 0x10, 0x00], 0x02);
+        let hf_only = edid(&[0xD8, 0x5D, 0xC4, 0x01, 0x78], 0x02);
+        let not_cta = edid(&[0x03, 0x0C, 0x00, 0x10, 0x00], 0x70);
+        if !is_hdmi_sink(&hdmi)
+            || is_hdmi_sink(&hf_only)
+            || is_hdmi_sink(&not_cta)
+            || is_hdmi_sink(&hdmi[..128])
+        {
+            return TestResult::Fail("only the HDMI VSDB makes an HDMI sink");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_vsdb_decides_dvi);
 }
