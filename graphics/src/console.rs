@@ -237,6 +237,50 @@ impl FbConsole {
         self.cur_row = self.rows - 1;
     }
 
+    /// Repaint every cell of the text region from the RAM character grid,
+    /// without scrolling or moving the cursor. The grid is the source of
+    /// truth for what the text console should show; the physical pixels
+    /// may have diverged while another scanout owner held the framebuffer
+    /// (a DRM master compositor draws over it, and the console hook is
+    /// detached for the whole time it owns the scanout). A VT switch that
+    /// only flips state and waits for new output leaves the old owner's
+    /// pixels on screen as ghost text — this is the repaint that removes
+    /// them. Also clears a pending `repaint_scroll` and re-syncs the
+    /// scroll palette, since every cell was just painted with the current
+    /// palette. Linux `complete_change_console` redraws the new console's
+    /// screen the same way (`redraw_screen`); NARF's VTs share one grid,
+    /// so the repaint redraws that grid.
+    pub fn repaint_all(&mut self) {
+        self.repaint_all_with(Self::paint_cell);
+    }
+
+    // The paint callback lets tests count actual cell redraws without adding
+    // counters or hooks to the production console. Production monomorphizes
+    // this with the direct framebuffer painter above.
+    fn repaint_all_with(
+        &mut self,
+        mut paint: impl FnMut(&mut Framebuffer, u32, u32, u8, Pixel32, Pixel32),
+    ) {
+        let cols = self.cols as usize;
+        let rows = self.rows as usize;
+        for row in 0..rows {
+            let y = TOP_PX_OFFSET + (row as u32) * GLYPH_H;
+            for col in 0..cols {
+                let x = (col as u32) * GLYPH_W;
+                paint(
+                    &mut self.fb,
+                    x,
+                    y,
+                    self.chars[row * cols + col],
+                    self.fg,
+                    self.bg,
+                );
+            }
+        }
+        self.scroll_palette = (self.fg, self.bg);
+        self.repaint_scroll = false;
+    }
+
     fn paint_cell(fb: &mut Framebuffer, x: u32, y: u32, b: u8, fg: Pixel32, bg: Pixel32) {
         if b == 0 || b == b' ' {
             fb.fill_rect(x, y, GLYPH_W, GLYPH_H, bg);
@@ -353,6 +397,20 @@ pub unsafe fn rebase_installed(new_base: *mut u32) {
         // `set_base` does the same mapping-lifetime check.
         // SAFETY: Valid memory or trusted environment
         unsafe { c.fb.set_base(new_base) };
+    }
+}
+
+/// Repaint the installed framebuffer console's whole text region from its
+/// character grid (see [`FbConsole::repaint_all`]). Installed as the
+/// VT-switch hook by the boot path: a completed VT switch calls this with
+/// the newly active VT, so the text console's grid is redrawn over
+/// whatever the previous scanout owner left in the pixels.
+///
+/// No-op if no FbConsole is installed.
+pub fn repaint_installed(_vt: u32) {
+    let mut g = GLOBAL_FB_CONSOLE.lock();
+    if let Some(c) = g.as_mut() {
+        c.repaint_all();
     }
 }
 

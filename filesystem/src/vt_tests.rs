@@ -184,6 +184,57 @@ kernel_test_in!(
     smoke_vt_mode_replacement_cancels_pending_release
 );
 
+/// The VT-switch repaint hook (narf_console) records completed switches.
+static REPAINT_TARGETS: IrqSafeSpinLock<Vec<u32>> = IrqSafeSpinLock::new(Vec::new());
+
+fn record_switch(vt: u32) {
+    REPAINT_TARGETS.lock().push(vt);
+}
+
+struct SwitchHook {
+    prior: usize,
+}
+impl SwitchHook {
+    fn install() -> Self {
+        let prior = narf_console::take_vt_switch_hook();
+        __reset_for_test();
+        REPAINT_TARGETS.lock().clear();
+        narf_console::set_vt_switch_hook(record_switch);
+        Self { prior }
+    }
+}
+impl Drop for SwitchHook {
+    fn drop(&mut self) {
+        __reset_for_test();
+        narf_console::restore_vt_switch_hook(self.prior);
+    }
+}
+
+fn smoke_vt_switch_notifies_repaint_hook() -> TestResult {
+    let _hook = SwitchHook::install();
+    if activate(2).is_err() || active_vt() != 2 {
+        return TestResult::Fail("switch to VT 2 failed");
+    }
+    // Re-activating the already-active VT is a no-op: no switch, no repaint.
+    if activate(2).is_err() {
+        return TestResult::Fail("re-activating the active VT failed");
+    }
+    if activate(1).is_err() || active_vt() != 1 {
+        return TestResult::Fail("switch back to VT 1 failed");
+    }
+    let targets = REPAINT_TARGETS.lock().clone();
+    if targets != [2, 1] {
+        return TestResult::Fail(
+            "completed switches did not notify the repaint hook with the new active VT",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/vt/process",
+    smoke_vt_switch_notifies_repaint_hook
+);
+
 fn smoke_vt_wait_cancellation_and_ioctl() -> TestResult {
     use crate::{FsError, IoctlContext};
     struct ContextStub;

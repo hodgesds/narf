@@ -88,6 +88,12 @@ pub fn klog::set_console_loglevel(level: u32);
 pub fn set_text_grid(cols: u32, rows: u32);          // 0 clears
 pub fn text_grid() -> Option<(u16, u16)>;
 pub fn set_text_grid_hook(hook: fn(u16, u16));       // called now + on change
+// VT-switch repaint: the VT layer notifies on completed switches.
+pub type VtSwitchHook = fn(u32);                  // newly active VT
+pub fn set_vt_switch_hook(hook: VtSwitchHook);
+pub fn notify_vt_switch(vt: u32);                 // no-op when uninstalled
+pub fn take_vt_switch_hook() -> usize;            // test-only detach
+pub fn restore_vt_switch_hook(prior: usize);
 ```
 
 `write_str` always records into the kernel log store, then applies Linux's
@@ -170,6 +176,16 @@ hook at syscall init, which makes the grid the `TIOCGWINSZ` answer of
 foreground process group when it changed. The hook is called right away with
 the current grid, so installing it after the console came up loses nothing.
 Without a framebuffer console the tty keeps 80x24.
+
+`set_vt_switch_hook` is how the framebuffer console repaints on VT-switch
+completion: the VT layer calls `notify_vt_switch` with the newly active VT
+after the switch completes and the VT state lock is released, and the
+installed hook redraws the text console's character grid over whatever the
+previous scanout owner left in the pixels. The frame boot path installs
+`narf_graphics::console::repaint_installed` as the hook alongside the FB
+hook, so every console install carries the repaint with it. With no hook
+installed (serial-only boot) the notification is a no-op, and the hook never
+waits or re-enters VT state.
 
 ### 3.1 MMU-enable handoff protocol
 

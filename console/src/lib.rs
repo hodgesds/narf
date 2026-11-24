@@ -589,6 +589,53 @@ fn notify_text_grid(packed: u32) {
     }
 }
 
+/// Type of the VT-switch repaint hook: called with the newly active VT
+/// number whenever a virtual-terminal switch completes. Boot-time install
+/// only; no per-call allocation. The frame boot path installs
+/// `narf_graphics::console::repaint_installed` here alongside the FB hook,
+/// so a completed switch redraws the text console's character grid over
+/// whatever the previous scanout owner left in the pixels (ghost text).
+/// The hook runs after the VT state lock is released, must only repaint,
+/// and must neither wait nor re-enter VT state.
+pub type VtSwitchHook = fn(u32);
+
+/// Stored as `VtSwitchHook as usize`; 0 = none.
+static VT_SWITCH_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the VT-switch repaint hook. Installing after the framebuffer
+/// console came up loses nothing: switches before installation had no
+/// console to repaint, and the next switch notifies the hook.
+pub fn set_vt_switch_hook(hook: VtSwitchHook) {
+    VT_SWITCH_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Notify the installed VT-switch hook that VT `vt` just became active.
+/// No-op when no hook is installed (serial-only boot). Called by the VT
+/// layer (`narf_filesystem::vt`) from `notify_switch`, after the switch
+/// completed and the VT state lock was released.
+pub fn notify_vt_switch(vt: u32) {
+    let raw = VT_SWITCH_HOOK.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: stored as `VtSwitchHook as usize` by `set_vt_switch_hook`;
+        // fn pointers and usize share size and alignment.
+        let hook: VtSwitchHook = unsafe { core::mem::transmute(raw) };
+        hook(vt);
+    }
+}
+
+/// Atomically detach the VT-switch hook and return its prior value as an
+/// opaque token. Tests restore it with [`restore_vt_switch_hook`].
+#[must_use = "the returned token must be passed to restore_vt_switch_hook"]
+pub fn take_vt_switch_hook() -> usize {
+    VT_SWITCH_HOOK.swap(0, Ordering::AcqRel)
+}
+
+/// Re-install a previously-detached VT-switch hook. Pass the value returned
+/// by [`take_vt_switch_hook`]; passing 0 leaves the hook unset.
+pub fn restore_vt_switch_hook(prior: usize) {
+    VT_SWITCH_HOOK.store(prior, Ordering::Release);
+}
+
 /// Atomically detach the current FB-console fan-out and return its
 /// prior value as an opaque token. Subsequent kernel prints stay on
 /// the serial / UART backend until [`restore_fb_hook`] is called

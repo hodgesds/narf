@@ -907,6 +907,11 @@ a privileged signal enqueue callback before userspace runs. The callback must
 not wait or re-enter VT state. `VT_SETMODE(VT_PROCESS)` captures that thread;
 activation sends its release signal and waits for `VT_RELDISP` acceptance
 before publishing the active VT, notifying sysfs, and signalling acquisition.
+A completed switch also notifies the installed VT-switch repaint hook
+(`narf_console::notify_vt_switch`) with the new active VT, after the VT
+state lock is released, so the framebuffer console redraws its character
+grid over the previous scanout owner's pixels; with no hook installed the
+notification is a no-op.
 Rejection leaves the old VT active. A dead controller reverts to VT_AUTO.
 `VT_WAITACTIVE` through `FileOps::ioctl_user` sleeps on a registered wake and
 unregisters on cancellation; the direct synchronous ioctl returns WouldBlock

@@ -59,6 +59,11 @@ adapter that calls into the dedicated EDID parser.
 - Console scrolling shifts the RAM character grid and paints only changed
   cells, without framebuffer reads. Palette changes and access through
   `FbConsole::fb_mut` force a complete text-region repaint on the next scroll.
+  A completed VT switch repaints the whole text region at once
+  (`FbConsole::repaint_all`, reached as `console::repaint_installed` on the
+  installed console), redrawing every cell from the RAM character grid
+  without scrolling or moving the cursor — the previous scanout owner's
+  pixels are overwritten, so they cannot linger as ghost text.
 - Cursor compositor + boot splash: the end-of-boot panel paints one
   sloth tile per CPU across the top of the body (Tux-style, capped at
   what fits across the framebuffer width; a single tile is centered),
@@ -114,6 +119,12 @@ exclusion. No lock spans a hardware reset wait. These gates do not revoke
 previous raw framebuffer pointers or authorize destructive GPU reset: callers
 must independently own the function, backing and reset protocol. Tests use
 local gate instances and never close or reset the actual global gates.
+
+`console::repaint_installed(vt)` redraws the installed framebuffer console's
+whole text region from its character grid (`FbConsole::repaint_all`); it is
+the VT-switch repaint hook the boot path installs, and a no-op when no
+console is installed. `repaint_all` paints every cell with the current
+palette, clears a pending scroll repaint, and leaves the cursor where it was.
 
 `logo::blit` / `logo::blit_centered` copy a `Logo` (raw RGB565
 little-endian pixels, row-major, no header) opaque into a

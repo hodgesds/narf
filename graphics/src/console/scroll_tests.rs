@@ -23,6 +23,39 @@ fn scroll_count(console: &mut FbConsole) -> usize {
     count
 }
 
+fn repaint_count(console: &mut FbConsole) -> usize {
+    let mut count = 0;
+    console.repaint_all_with(|fb, x, y, byte, fg, bg| {
+        count += 1;
+        FbConsole::paint_cell(fb, x, y, byte, fg, bg);
+    });
+    count
+}
+
+fn smoke_console_repaint_all_redraws_every_cell() -> TestResult {
+    let mut pixels = vec![SENTINEL; (STRIDE * HEIGHT) as usize];
+    let mut expected = pixels.clone();
+    let mut actual = console(&mut pixels, Pixel32::WHITE);
+    actual.write_bytes(b"AB\nCD\nEF");
+    // The previous scanout owner overwrote the pixels: the text region no
+    // longer matches the grid. A repaint must restore every cell from the
+    // grid, including blank ones the scroll fast-path would skip, and
+    // leave the cursor where it was.
+    actual
+        .fb_mut()
+        .fill_rect(0, TOP_PX_OFFSET, WIDTH, 24, Pixel32::RED);
+    let mut reference = console(&mut expected, Pixel32::WHITE);
+    reference.write_bytes(b"AB\nCD\nEF");
+    if repaint_count(&mut actual) != 6 || pixels != expected || actual.cursor() != (2, 2) {
+        return TestResult::Fail("VT-switch repaint did not redraw every cell from the grid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "graphics/console",
+    smoke_console_repaint_all_redraws_every_cell
+);
+
 fn smoke_console_scroll_spares_unchanged_cells() -> TestResult {
     let mut pixels = vec![SENTINEL; (STRIDE * HEIGHT) as usize];
     let mut expected = pixels.clone();
