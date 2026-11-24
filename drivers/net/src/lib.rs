@@ -43,6 +43,8 @@ pub use narf_drivers_net_igb::igb;
 pub use narf_drivers_net_igc::igc;
 #[cfg(feature = "ixgbe")]
 pub use narf_drivers_net_ixgbe::ixgbe;
+#[cfg(feature = "mlx4")]
+pub use narf_drivers_net_mlx4::mlx4;
 #[cfg(feature = "mlx5")]
 pub use narf_drivers_net_mlx5::mlx5;
 // The Realtek family ships as one crate (dependency chain + shared rtl_phy).
@@ -74,6 +76,7 @@ pub use narf_drivers_net_core::*;
     feature = "igb",
     feature = "igc",
     feature = "ixgbe",
+    feature = "mlx4",
     feature = "mlx5",
     feature = "realtek",
     feature = "rtl8139",
@@ -147,6 +150,7 @@ pub fn register_initcalls() {
         feature = "i40e",
         feature = "igc",
         feature = "ixgbe",
+        feature = "mlx4",
         feature = "mlx5",
         feature = "realtek",
         feature = "rtl8139",
@@ -178,6 +182,11 @@ pub fn register_initcalls() {
     #[cfg(feature = "realtek")]
     narf_init::register(Stage::Subsys, "realtek", || {
         narf_drivers_net_realtek::register();
+        InitResult::Ok
+    });
+    #[cfg(feature = "mlx4")]
+    narf_init::register(Stage::Subsys, "mlx4", || {
+        narf_drivers_net_mlx4::register();
         InitResult::Ok
     });
     #[cfg(feature = "mlx5")]

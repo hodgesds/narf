@@ -77,6 +77,7 @@ members = [
     "drivers/net/igb",
     "drivers/net/igc",
     "drivers/net/ixgbe",
+    "drivers/net/mlx4",
     "drivers/net/mlx5",
     "drivers/net/realtek",
     "drivers/net/rtl8139",

@@ -37,6 +37,8 @@ pub enum NicModel {
     IntelIxgbe,
     /// Intel X710 / XL710 / XXV710 — "i40e".
     IntelI40e,
+    /// Mellanox ConnectX-3 (MT27500 / MT27520) — "mlx4_core".
+    MellanoxMlx4,
     /// Mellanox ConnectX-4 / 5 / 6 — "mlx5_core".
     MellanoxMlx5,
     /// Realtek RTL8139 — legacy smoke target.
@@ -72,6 +74,7 @@ impl NicModel {
             NicModel::IntelIgc => (0x8086, 0x15F3),
             NicModel::IntelIxgbe => (0x8086, 0x10B6),
             NicModel::IntelI40e => (0x8086, 0x1572),
+            NicModel::MellanoxMlx4 => (0x15B3, 0x1003),
             NicModel::MellanoxMlx5 => (0x15B3, 0x1013),
             NicModel::RealtekRtl8139 => (0x10EC, 0x8139),
             NicModel::RealtekRtl8168 => (0x10EC, 0x8168),

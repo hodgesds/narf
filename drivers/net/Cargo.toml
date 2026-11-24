@@ -38,6 +38,7 @@ narf-drivers-net-i40e      = { path = "i40e", optional = true }
 narf-drivers-net-igb       = { path = "igb", optional = true }
 narf-drivers-net-igc       = { path = "igc", optional = true }
 narf-drivers-net-ixgbe     = { path = "ixgbe", optional = true }
+narf-drivers-net-mlx4      = { path = "mlx4", optional = true }
 narf-drivers-net-mlx5      = { path = "mlx5", optional = true }
 narf-drivers-net-realtek   = { path = "realtek", optional = true }
 narf-drivers-net-rtl8139   = { path = "rtl8139", optional = true }
@@ -67,6 +68,7 @@ default = [
     "igb",
     "igc",
     "ixgbe",
+    "mlx4",
     "mlx5",
     "realtek",
     "rtl8139",
@@ -90,6 +92,7 @@ i40e = ["dep:narf-drivers-net-i40e"]
 igb = ["dep:narf-drivers-net-igb"]
 igc = ["dep:narf-drivers-net-igc"]
 ixgbe = ["dep:narf-drivers-net-ixgbe"]
+mlx4 = ["dep:narf-drivers-net-mlx4"]
 mlx5 = ["dep:narf-drivers-net-mlx5"]
 realtek = ["dep:narf-drivers-net-realtek"]
 rtl8139 = ["dep:narf-drivers-net-rtl8139"]
