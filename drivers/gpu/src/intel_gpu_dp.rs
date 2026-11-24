@@ -72,27 +72,54 @@ const OWNED: u32 = 0x00020000; // source-exposed combo B only; A may be internal
 const ALL_STATUS: u32 = 0x3333;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HpdProfile {
-    family: crate::intel_gpu_gt::Gen12Platform,
+    family: crate::intel_gpu_aux::SourceFamily,
     device: u16,
     address: u32,
     config: u64,
     subsystem: (u16, u16),
 }
 impl HpdProfile {
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn from_identity(
         family: crate::intel_gpu_gt::Gen12Platform,
         vendor: u16,
         device: u16,
         class: u32,
     ) -> Option<Self> {
+        Self::for_source(
+            crate::intel_gpu_aux::SourceFamily::Gen12(family),
+            vendor,
+            device,
+            class,
+        )
+    }
+    /// [`Self::from_identity`] for any source family. Gen11 pairs with an
+    /// ICP-class south display, the same `SHOTPLUG_CTL_DDI` / filter /
+    /// `SDE_DDI_HOTPLUG_ICP` bank (`icp_hpd_irq_setup`): Ice Lake with
+    /// ICP (`INTEL_PCH_ICP_DEVICE_ID_TYPE` 0x3480, `_ICP2_` 0x3880), EHL/JSL
+    /// with MCC (0x4B00, TGP-compatible) or JSP (0x4D80, ICP-compatible).
+    /// Gen9's SPT/KBP/CNP bank is a different layout and has no profile.
+    pub(crate) fn for_source(
+        family: crate::intel_gpu_aux::SourceFamily,
+        vendor: u16,
+        device: u16,
+        class: u32,
+    ) -> Option<Self> {
+        use crate::intel_gpu_aux::SourceFamily::{Gen11, Gen12};
+        use crate::intel_gpu_gt::Gen11Platform::{ElkhartLake, IceLake, JasperLake};
         use crate::intel_gpu_gt::Gen12Platform::*;
         if vendor != 0x8086 || class != 0x060100 {
             return None;
         }
         let allowed = matches!(
             (family, device & 0xff80),
-            (TigerLake, 0xa080 | 0x4380)
-                | (AlderLakeP | AlderLakeN, 0x7a80 | 0x5180 | 0x7a00 | 0x5480)
+            (Gen12(TigerLake), 0xa080 | 0x4380)
+                | (
+                    Gen12(AlderLakeP | AlderLakeN),
+                    0x7a80 | 0x5180 | 0x7a00 | 0x5480
+                )
+                | (Gen11(IceLake), 0x3480 | 0x3880)
+                | (Gen11(ElkhartLake | JasperLake), 0x4b00 | 0x4d80)
         );
         allowed.then_some(Self {
             family,
@@ -104,8 +131,21 @@ impl HpdProfile {
     }
     /// Observed PCI policy fact only. GPU MMIO still needs its own current
     /// capability/D0 check at every access; this grants no PCH config authority.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn from_observed(
         family: crate::intel_gpu_gt::Gen12Platform,
+        segment: u16,
+        devices: &[narf_bus::BusDevice],
+    ) -> Option<Self> {
+        Self::observed_for_source(
+            crate::intel_gpu_aux::SourceFamily::Gen12(family),
+            segment,
+            devices,
+        )
+    }
+    /// [`Self::from_observed`] for any source family ([`Self::for_source`]).
+    pub(crate) fn observed_for_source(
+        family: crate::intel_gpu_aux::SourceFamily,
         segment: u16,
         devices: &[narf_bus::BusDevice],
     ) -> Option<Self> {
@@ -121,7 +161,7 @@ impl HpdProfile {
             if found.is_some() {
                 return None;
             }
-            let profile = Self::from_identity(family, pch.id.vendor, pch.id.device, pch.id.class)
+            let profile = Self::for_source(family, pch.id.vendor, pch.id.device, pch.id.class)
                 .and_then(|mut profile| {
                     let BusKind::Pcie {
                         addr: actual,
@@ -1951,4 +1991,37 @@ pub mod tests {
         "drivers/gpu/intel_gpu_dp",
         smoke_dp_source_family_arb_slots_and_missing_foreign_metadata_refusal
     );
+
+    /// Gen11 sources get the ICP-class hotplug bank for their own PCHs
+    /// only; Gen9 has none, and a Gen12 PCH never qualifies a Gen11 GPU.
+    fn smoke_hpd_profile_gen11_icp_pchs() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gen9_ddi::SkuFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen9Platform};
+        let icl = SourceFamily::Gen11(Gen11Platform::IceLake);
+        let jsl = SourceFamily::Gen11(Gen11Platform::JasperLake);
+        let isa = 0x060100;
+        for (family, did, ok) in [
+            (icl, 0x3482, true),  // ICP-LP
+            (icl, 0x3882, true),  // ICP2
+            (jsl, 0x4b00, true),  // MCC
+            (jsl, 0x4d87, true),  // JSP
+            (icl, 0x4d87, false), // a JSL PCH on an ICL GPU
+            (jsl, 0x3482, false),
+            (icl, 0xa082, false), // TGP belongs to TGL
+        ] {
+            if HpdProfile::for_source(family, 0x8086, did, isa).is_some() != ok {
+                return TestResult::Fail("Gen11 HPD rows must follow intel_pch.c");
+            }
+        }
+        let skl = SourceFamily::Gen9 {
+            platform: Gen9Platform::Skylake,
+            sku: SkuFamily::Ult,
+        };
+        if HpdProfile::for_source(skl, 0x8086, 0x9d48, isa).is_some() {
+            return TestResult::Fail("SPT's hotplug bank is not the ICP layout");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_profile_gen11_icp_pchs);
 }

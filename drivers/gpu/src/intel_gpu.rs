@@ -1821,8 +1821,12 @@ impl crate::intel_gpu_aux::MmioWindow for ModeWindow {
         let BusAddr::Pcie(gpu) = self.device.addr else {
             return None;
         };
-        let family = crate::intel_gpu_aux::MmioWindow::gen12_display_family(self)?;
-        crate::intel_gpu_dp::HpdProfile::from_observed(family, gpu.segment, &narf_bus::devices())
+        let family = crate::intel_gpu_aux::SourceFamily::of(self)?;
+        crate::intel_gpu_dp::HpdProfile::observed_for_source(
+            family,
+            gpu.segment,
+            &narf_bus::devices(),
+        )
     }
     fn display_access_ok(&self) -> bool {
         self.powered()
