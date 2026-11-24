@@ -187,7 +187,11 @@ pub fn build_modify_mailbox(
     let flags_off = 8;
     let flags = get_be32(&out[flags_off..], 0x00);
     let state_nibble = trans.target_state() as u32;
-    put_be32(&mut out, flags_off, (flags & 0x0fff_ffff) | (state_nibble << 28));
+    put_be32(
+        &mut out,
+        flags_off,
+        (flags & 0x0fff_ffff) | (state_nibble << 28),
+    );
 
     out
 }

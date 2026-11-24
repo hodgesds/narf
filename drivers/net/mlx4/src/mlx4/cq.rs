@@ -73,7 +73,11 @@ pub fn build_cq_context(p: &CqParams) -> [u8; CQ_CONTEXT_LEN] {
     let mut c = [0u8; CQ_CONTEXT_LEN];
     // flags @0x00: status/state left 0 (firmware owns the state machine);
     // collapsed = 0.
-    wire::put_be32(&mut c, 0x0c, (u32::from(p.log_cq_size) << 24) | (p.uar_index & 0x00ff_ffff));
+    wire::put_be32(
+        &mut c,
+        0x0c,
+        (u32::from(p.log_cq_size) << 24) | (p.uar_index & 0x00ff_ffff),
+    );
     wire::put_u8(&mut c, 0x17, p.comp_eqn);
     wire::put_u8(&mut c, 0x18, p.log_page_size);
     wire::put_u8(&mut c, 0x1b, (p.mtt_base >> 32) as u8);

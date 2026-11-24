@@ -44,12 +44,8 @@ pub const EQE_SIZE: usize = 32;
 ///   - WQ_CATAS_ERROR       (0x05)
 ///   - LOCAL_WQ_INVALID_REQ (0x10)
 ///   - LOCAL_WQ_ACCESS_VIOL (0x11)
-pub const ASYNC_EVENT_MASK: u64 = (1 << 0x09)
-    | (1 << 0x04)
-    | (1 << 0x0a)
-    | (1 << 0x05)
-    | (1 << 0x10)
-    | (1 << 0x11);
+pub const ASYNC_EVENT_MASK: u64 =
+    (1 << 0x09) | (1 << 0x04) | (1 << 0x0a) | (1 << 0x05) | (1 << 0x10) | (1 << 0x11);
 
 /// Parameters for constructing an EQ context via `build_eq_context`.
 #[derive(Copy, Clone, Debug)]

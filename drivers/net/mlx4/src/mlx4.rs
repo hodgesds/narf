@@ -196,7 +196,8 @@ impl DatapathState {
         self.rx_pool.dma_addr_at((slot * RX_SLOT_LEN) as u64).raw()
     }
     fn tx_slot_cpu(&self, slot: usize) -> *mut u8 {
-        self.tx_pool.cpu_mut_ptr_at::<u8>((slot * TX_SLOT_LEN) as u64)
+        self.tx_pool
+            .cpu_mut_ptr_at::<u8>((slot * TX_SLOT_LEN) as u64)
     }
     fn tx_slot_va(&self, slot: usize) -> u64 {
         self.tx_pool.dma_addr_at((slot * TX_SLOT_LEN) as u64).raw()
@@ -296,7 +297,8 @@ impl Mlx4Eth {
     fn hcr_write(&self, off: u64, host_value: u32) {
         // SAFETY: identity-mapped MMIO; BE on wire, so swap the LE store.
         unsafe {
-            self.mmio.write32(cmd::HCR_BASE + off, host_value.swap_bytes());
+            self.mmio
+                .write32(cmd::HCR_BASE + off, host_value.swap_bytes());
         }
     }
 
@@ -334,7 +336,10 @@ impl Mlx4Eth {
         self.hcr_write(cmd::HCR_OUT_PARAM_L, out_param as u32);
         self.hcr_write(cmd::HCR_TOKEN, cmd::token_word(cmd::POLL_TOKEN));
         compiler_fence(Ordering::SeqCst);
-        self.hcr_write(cmd::HCR_STATUS, cmd::go_word(op, op_modifier, toggle, false));
+        self.hcr_write(
+            cmd::HCR_STATUS,
+            cmd::go_word(op, op_modifier, toggle, false),
+        );
 
         let done = narf_scheduler::responsive_spin_until(
             || self.hcr_read_status() & cmd::HCR_GO == 0,
@@ -368,7 +373,14 @@ impl Mlx4Eth {
         out_len: usize,
     ) -> Result<Vec<u8>, Mlx4Error> {
         let out_mb = self.alloc_mailbox()?;
-        self.cmd(0, in_modifier, op_modifier, op, out_mb.dma_addr().raw(), false)?;
+        self.cmd(
+            0,
+            in_modifier,
+            op_modifier,
+            op,
+            out_mb.dma_addr().raw(),
+            false,
+        )?;
         let mut buf = alloc::vec![0u8; out_len];
         // SAFETY: `out_mb` is a 4-KiB mailbox; `out_len <= MAILBOX_SIZE`.
         unsafe {
@@ -389,7 +401,11 @@ impl Mlx4Eth {
         let mb = self.alloc_mailbox()?;
         // SAFETY: `in_bytes.len() <= MAILBOX_SIZE` by contract.
         unsafe {
-            core::ptr::copy_nonoverlapping(in_bytes.as_ptr(), mb.cpu_mut_ptr_at::<u8>(0), in_bytes.len());
+            core::ptr::copy_nonoverlapping(
+                in_bytes.as_ptr(),
+                mb.cpu_mut_ptr_at::<u8>(0),
+                in_bytes.len(),
+            );
         }
         compiler_fence(Ordering::SeqCst);
         self.cmd(mb.dma_addr().raw(), in_modifier, op_modifier, op, 0, false)?;
@@ -542,7 +558,8 @@ impl Mlx4Eth {
         // yet (pumps spawn after this returns).
         let mut dev = dev;
         {
-            let d = Arc::get_mut(&mut dev).ok_or(Mlx4Error::Other("mlx4 Arc aliased during init"))?;
+            let d =
+                Arc::get_mut(&mut dev).ok_or(Mlx4Error::Other("mlx4 Arc aliased during init"))?;
             d.fw_info = fw_info;
             d.dev_cap = dev_cap;
             d.mtt_entry_sz = dev_cap.mtt_entry_sz.max(8);
@@ -609,10 +626,10 @@ impl Mlx4Eth {
         let wq = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
         let cq_buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
         let db_rec = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
-        let rx_pool =
-            alloc_coherent(RQ_N * RX_SLOT_LEN, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
-        let tx_pool =
-            alloc_coherent(SQ_N * TX_SLOT_LEN, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
+        let rx_pool = alloc_coherent(RQ_N * RX_SLOT_LEN, DomainId::DRIVER_0)
+            .map_err(|_| Mlx4Error::NoMemory)?;
+        let tx_pool = alloc_coherent(SQ_N * TX_SLOT_LEN, DomainId::DRIVER_0)
+            .map_err(|_| Mlx4Error::NoMemory)?;
 
         // Our object numbers sit at the first index past each resource's
         // firmware-reserved range (`QUERY_DEV_CAP`); the ICM tables were
@@ -785,7 +802,16 @@ impl Mlx4Eth {
             let sq_addr = dp.sq_base + (sq_slot * (1 << LOG_SQ_STRIDE)) as u64;
             dp.sq_prod = dp.sq_prod.wrapping_add(1);
             dp.tx_slots.record(wqe_idx, slot);
-            (slot, slot_cpu, slot_va, sq_slot, wqe_idx, own, dp.qp_number, sq_addr)
+            (
+                slot,
+                slot_cpu,
+                slot_va,
+                sq_slot,
+                wqe_idx,
+                own,
+                dp.qp_number,
+                sq_addr,
+            )
         };
         let _ = (slot, sq_slot);
         // Copy the frame into its staging slot.
@@ -807,7 +833,11 @@ impl Mlx4Eth {
         }
         compiler_fence(Ordering::SeqCst);
         // Ring the send doorbell (BAR2 UAR).
-        self.uar_write(self.uar_index, wqe::SEND_DOORBELL_UAR_OFFSET, wqe::tx_doorbell_word(qpn));
+        self.uar_write(
+            self.uar_index,
+            wqe::SEND_DOORBELL_UAR_OFFSET,
+            wqe::tx_doorbell_word(qpn),
+        );
         let _ = wqe_idx;
         Ok(())
     }
@@ -1073,7 +1103,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     narf_bus::pci::set_command(
         &cap,
         &device,
-        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::INTX_DISABLE,
+        narf_bus::pci::cmd::MEM_SPACE
+            | narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: probe holds exclusive authority over `device` + its cfg

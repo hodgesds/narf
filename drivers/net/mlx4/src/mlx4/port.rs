@@ -180,5 +180,10 @@ pub fn decode_query_port(mb: &[u8]) -> PortInfo {
         _ => None,
     };
 
-    PortInfo { link_up, mac, eth_mtu, speed_mbps }
+    PortInfo {
+        link_up,
+        mac,
+        eth_mtu,
+        speed_mbps,
+    }
 }
