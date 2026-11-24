@@ -46,13 +46,12 @@
 //! What this module deliberately does NOT do:
 //!
 //!   - It does not wire into `AmdGpu::initialize` or any APU platform
-//!     task: no APU platform singleton exists on main to attach it to,
-//!     and the mailbox adapter there borrows the register window. The
-//!     attach site owns that step: allocate the owner (or
-//!     [`ApuTelemetryOwner::with_coherent_buffer`]), call
+//!     task: the attach lives in `amdgpu_apu_platform::attach`, which
+//!     allocates the owner (or
+//!     [`ApuTelemetryOwner::with_coherent_buffer`]), calls
 //!     [`ApuTelemetryOwner::publish_dram_addr`] once, then
 //!     `let epoch = begin_epoch(); narf_scheduler::spawn(monitor(owner,
-//!     mmio, epoch))` once the owner and mailbox live somewhere
+//!     mmio, epoch))` with the owner and the owned mailbox retained
 //!     `'static` (cf. `amdgpu_navi22_power::start`, which spawns
 //!     against the discrete platform singleton).
 //!   - It does not register the `gpu_temp_mc` provider. That half lives

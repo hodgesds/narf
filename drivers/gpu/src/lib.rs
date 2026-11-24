@@ -143,6 +143,8 @@ pub enum GpuError {
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_apu_platform;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_atom_displayobj;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_atom_encoder_caps;

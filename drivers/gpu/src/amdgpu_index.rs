@@ -5,6 +5,19 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 use narf_driver_runtime::MmioRegion;
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// The INDEX/DATA pair is a shared hardware latch: a concurrent
+/// accessor between the index write and the data read takes the
+/// wrong register's value. Every entry point below holds this leaf
+/// lock for its whole sequence, so the pair is atomic by
+/// construction rather than by caller sequencing — the APU
+/// telemetry monitor (#1698) is the first continuously-running
+/// indexed-port user, and without the lock its refreshes could
+/// interleave with a modeset or bring-up read. The lock is a leaf:
+/// held only for one INDEX/DATA sequence, never across an await
+/// or another lock.
+static INDEX_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 const INDEX: u64 = 0;
 const DATA: u64 = 4;
@@ -81,25 +94,29 @@ fn write_with(io: &mut impl RegisterIo, dword: u32, value: u32) {
 /// Probe without reading/writing the selected register or changing its latch.
 ///
 /// # Safety
-/// `regs` is a live BAR5 mapping of at least eight bytes. The caller owns the
-/// index/data latch exclusively and holds current PCI authority.
+/// `regs` is a live BAR5 mapping of at least eight bytes. The caller holds
+/// current PCI authority; the INDEX/DATA latch is serialized by
+/// `INDEX_LOCK`, not by caller sequencing.
 pub(super) unsafe fn probe(regs: &MmioRegion) -> Result<(), ProbeError> {
+    let _guard = INDEX_LOCK.lock();
     probe_with(&mut Registers(regs))
 }
 
 /// Read a DWORD register ID through the byte-addressed index port.
 ///
 /// # Safety
-/// Same mapping, latch ownership and PCI authority contract as `probe`.
+/// Same mapping, latch and PCI authority contract as `probe`.
 pub(super) unsafe fn read(regs: &MmioRegion, dword: u32) -> u32 {
+    let _guard = INDEX_LOCK.lock();
     read_with(&mut Registers(regs), dword)
 }
 
 /// Write a DWORD register ID through the byte-addressed index port.
 ///
 /// # Safety
-/// Same mapping, latch ownership and PCI authority contract as `probe`.
+/// Same mapping, latch and PCI authority contract as `probe`.
 pub(super) unsafe fn write(regs: &MmioRegion, dword: u32, value: u32) {
+    let _guard = INDEX_LOCK.lock();
     write_with(&mut Registers(regs), dword, value);
 }
 
