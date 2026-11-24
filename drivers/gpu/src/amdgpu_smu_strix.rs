@@ -41,6 +41,10 @@ const MODE2_RESET: u32 = 2; // linux: MODE2_RESET
 /// `amdgpu_smu::bring_up`'s sentinel, echoed back by `TestMessage`.
 const TEST_SENTINEL: u32 = 0xDEAD_BEEF;
 
+#[allow(
+    dead_code,
+    reason = "read only by the kernel-test suite; production matches the failure variants"
+)]
 const RESP_OK: u32 = 1; // linux: PPSMC_Result_OK
 const RESP_FAILED: u32 = 0xff; // linux: PPSMC_Result_Failed
 const RESP_UNKNOWN: u32 = 0xfe; // linux: PPSMC_Result_UnknownCmd

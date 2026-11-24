@@ -2276,8 +2276,8 @@ struct Display {
     /// Strix's graphics engines, same retention policy as Phoenix's.
     /// Unreachable until the firmware lane lands `Firmware::open_strix`
     /// + the Strix `set_graphics` arm: no Strix set can be loaded today,
-    /// so `start()` never fills this in. Until the GMC/IH/SDMA/GFX/MES
-    /// lanes land, a run fails closed at MemoryHubs.
+    ///   so `start()` never fills this in. Until the GMC/IH/SDMA/GFX/MES
+    ///   lanes land, a run fails closed at MemoryHubs.
     graphics_strix: Option<crate::amdgpu_strix_boot::StrixColdBoot>,
     /// Strix owners a mode 2 recovery replaced; same quarantine policy.
     /// Unread until the Strix recovery lane lands (`recover()` has no

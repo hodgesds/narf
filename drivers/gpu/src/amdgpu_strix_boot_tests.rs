@@ -183,9 +183,7 @@ fn strix_boot_admits_strix_with_audited_layout() -> TestResult {
             }
             TestResult::Pass
         }
-        Err(_) => {
-            return TestResult::Fail("Strix cold boot refused the audited layout");
-        }
+        Err(_) => TestResult::Fail("Strix cold boot refused the audited layout"),
     }
 }
 kernel_test_in!(
