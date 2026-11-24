@@ -105,6 +105,9 @@ fn smoke_module_load_real_ko_round_trip() -> TestResult {
                         R::PltExhausted(_) => {
                             "sys_init_module: PLT exhausted (branch out of range)"
                         }
+                        R::GotExhausted(_) => {
+                            "sys_init_module: GOT exhausted (GOTPCREL with no slot)"
+                        }
                         R::SymbolNotFound(_) => "sys_init_module: unresolved symbol",
                         R::CapMissing(_) => "sys_init_module: export needs an undeclared cap",
                         R::NoTargetSection => {

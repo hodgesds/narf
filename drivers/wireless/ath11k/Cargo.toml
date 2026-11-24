@@ -5,8 +5,9 @@
 # per-driver crate on `narf-drivers-wireless-ath-core`. Built-in or a loadable
 # `.ko`; the `.ko` registers BOTH buses — PCI ids via `narf_register_pci_driver`
 # and the AHB DT compatibles via `narf_register_dt_driver` (the Tier-2 DT shim).
-# Registration-only: the probe thunk returns -ENOSYS until the device datapath
-# ABI lands.
+# As a module the same driver source runs inside the `.ko` over the KABI
+# (`src/ath11k/platform/`): MHI, QMI, CE, HTC, WMI, DP and the station MAC
+# with its in-driver supplicant, PCI (WCN6855) only.
 
 [package]
 name         = "narf-drivers-wireless-ath11k"
@@ -32,8 +33,15 @@ builtin = [
     "dep:narf-io", "dep:narf-ipc", "dep:narf-lib", "dep:narf-memory",
     "dep:narf-net", "dep:narf-power", "dep:narf-scheduler", "dep:narf-time",
     "dep:narf-wireless", "dep:zeroize",
+    "narf-crypto/kernel", "narf-wireless/kernel",
+    "narf-drivers-wireless-ath-core/kernel",
 ]
-module = []
+# The loadable driver: the kernel-free protocol crates and the module
+# runtime, linked into the `.ko`; everything else comes through the KABI.
+module = [
+    "dep:narf-module-rt", "dep:narf-crypto", "dep:narf-wireless",
+    "dep:narf-drivers-wireless-ath-core", "dep:zeroize",
+]
 kernel-test = [
     "builtin",
     "dep:narf-kernel-test", "dep:narf-wifi-fixtures",
@@ -41,6 +49,7 @@ kernel-test = [
     "narf-wireless/kernel-test", "narf-bus/kernel-test",
     "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test",
     "narf-drivers-wireless-ath-core/kernel-test",
+    "narf-drivers-qcom-soc/kernel-test",
 ]
 
 [dependencies]
@@ -51,10 +60,10 @@ narf-boot         = { path = "../../../boot", optional = true }
 narf-bus          = { path = "../../../bus", optional = true }
 narf-capabilities = { path = "../../../capabilities", optional = true }
 narf-console      = { path = "../../../console", optional = true }
-narf-crypto       = { path = "../../../crypto", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true, default-features = false }
 narf-drivers      = { path = "../..", optional = true }
 narf-drivers-qcom-soc = { path = "../../soc/qcom", optional = true }
-narf-drivers-wireless-ath-core = { path = "../ath-core", optional = true }
+narf-drivers-wireless-ath-core = { path = "../ath-core", optional = true, default-features = false }
 narf-drivers-wireless-core = { path = "../core", optional = true }
 narf-firmware     = { path = "../../../firmware", optional = true }
 narf-firmware-fdt = { path = "../../../firmware/fdt", optional = true }
@@ -68,8 +77,9 @@ narf-net          = { path = "../../../net", optional = true }
 narf-power        = { path = "../../../power", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-time         = { path = "../../../time", optional = true }
-narf-wireless     = { path = "../../../wireless", optional = true }
+narf-wireless     = { path = "../../../wireless", optional = true, default-features = false }
 zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
+narf-module-rt = { path = "../../../modules/rt", optional = true }
 
 # Test-only: harness + Wi-Fi fixtures, and iwlwifi as the reference oracle for
 # the AES-key-unwrap cross-check in mac_tests.

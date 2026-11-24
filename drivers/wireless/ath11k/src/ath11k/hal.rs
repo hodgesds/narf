@@ -46,8 +46,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_io::DmaBuffer;
-use narf_lib::id::DomainId;
+use crate::ath11k::platform::dma::DmaBuffer;
+use crate::ath11k::platform::dma::DomainId;
 
 use super::ce::CeAttr;
 use super::dp;
@@ -56,7 +56,7 @@ use super::power::ChipIo;
 
 // ── errors / diag ─────────────────────────────────────────────────
 
-/// Failing-step codes latched through `narf_memory::diag` (HAL 80–89,
+/// Failing-step codes latched through `crate::ath11k::platform::diag` (HAL 80–89,
 /// CE 90–99; MHI uses 10–35, PCI 1–5).
 pub mod step {
     /// Coherent DMA allocation failed (detail = bytes).
@@ -112,9 +112,9 @@ impl TransportError {
     /// Latch into the framebuffer diag line and print to the console.
     pub fn report(&self, what: &str) {
         use core::fmt::Write as _;
-        narf_memory::diag::latch_wifi_error(self.step, self.detail);
+        crate::ath11k::platform::diag::latch_wifi_error(self.step, self.detail);
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: {} failed: step {} detail {:#x} (-{})",
             what,
             self.step,
@@ -1059,11 +1059,12 @@ impl DmaMem {
     pub fn alloc(len: usize, align: usize) -> Result<DmaMem, TransportError> {
         let align = align.max(1);
         let total = len + if align > 1 { align } else { 0 };
-        let buf =
-            narf_io::alloc_coherent_masked(total.max(1), DMA_DOMAIN, ATH11K_COHERENT_DMA_MASK)
-                .map_err(|_| {
-                    TransportError::new(step::NO_DMA_MEMORY, total as u32, errno::ENOMEM)
-                })?;
+        let buf = crate::ath11k::platform::dma::alloc_coherent_masked(
+            total.max(1),
+            DMA_DOMAIN,
+            ATH11K_COHERENT_DMA_MASK,
+        )
+        .map_err(|_| TransportError::new(step::NO_DMA_MEMORY, total as u32, errno::ENOMEM))?;
         let raw = buf.dma_addr().raw();
         let aligned = (raw + (align as u64 - 1)) & !(align as u64 - 1);
         let off = (aligned - raw) as usize;

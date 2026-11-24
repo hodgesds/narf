@@ -53,6 +53,7 @@ pub struct PhyCapabilities {
     pub vht: Option<[u8; 12]>,
 }
 
+#[cfg(feature = "kernel")]
 pub type WirelessIface = dyn crate::WirelessNetIface;
 
 /// WMM queue identity, in firmware-independent BK/BE/VI/VO order.

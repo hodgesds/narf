@@ -403,6 +403,7 @@ pub fn unregister_module_pci_drivers(owner: u64);
 
 pub fn module_pci_enable(owner: u64, dev: u64, bits: u16) -> i32;
 pub fn module_bar_map(owner: u64, dev: u64, bar: u8) -> u64;
+pub fn module_bar_len(owner: u64, dev: u64, bar: u64) -> Option<u64>;
 pub fn module_mmio_read32(owner: u64, dev: u64, bar: u64, off: u64) -> Option<u32>;
 pub fn module_mmio_write32(owner: u64, dev: u64, bar: u64, off: u64, val: u32) -> i32;
 pub fn module_mmio_wait32(
@@ -428,8 +429,20 @@ pub fn module_dma_wait8(
     timeout_ns: u64,
 ) -> i32;
 pub fn module_dma_free(owner: u64, dev: u64, dma: u64) -> i32;
-pub fn module_msix_enable(owner: u64, dev: u64) -> i32;
+pub fn module_dma_alloc_mapped(
+    owner: u64,
+    dev: u64,
+    len: usize,
+    addr_bits: u32,
+    domain: DomainId,
+) -> Result<ModuleMappedDma, i32>; // { handle, cpu, bus, len }
+pub fn module_pci_identity(owner: u64, dev: u64) -> Result<[u8; 16], i32>;
+pub fn module_pcie_aspm(owner: u64, dev: u64, aspmc: u16) -> Result<u16, i32>;
+pub fn module_msix_enable(owner: u64, dev: u64) -> i32; // -EBUSY when plain MSI is set up
 pub fn module_msix_claim(owner: u64, dev: u64) -> Result<u16, i32>;
+pub fn module_msi_enable(owner: u64, dev: u64, want: u16) -> Result<ModuleMsiGrant, i32>;
+// { count, base_vector, addr, data }; delivery left disabled
+pub fn module_msi_set_enabled(owner: u64, dev: u64, enabled: bool) -> i32;
 pub fn module_irq_set_handler(
     owner: u64,
     dev: u64,

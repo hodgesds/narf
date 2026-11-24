@@ -398,9 +398,46 @@ pub fn build_board2(ies: &[(u32, Vec<FwIe>)]) -> Vec<u8> {
 // `check_smbios`/`check_smbios_in`) promoted to
 // `narf_drivers_wireless_ath_core::board` (shared with ath10k); re-exported
 // so this module's callers resolve them.
-pub use narf_drivers_wireless_ath_core::board::{
-    check_smbios, check_smbios_in, smbios_bdf_ext, SmbiosBdf,
-};
+#[cfg(feature = "builtin")]
+pub use narf_drivers_wireless_ath_core::board::{check_smbios, check_smbios_in};
+pub use narf_drivers_wireless_ath_core::board::{smbios_bdf_ext, SmbiosBdf};
+
+/// `ath11k_core_check_smbios` in the module build: the firmware's SMBIOS
+/// table through `narf_smbios_read`, walked the way `dmi_walk` walks it
+/// (formatted area, then its string set up to the double NUL), each
+/// structure handed to the shared parser. Empty without a table.
+#[cfg(feature = "module")]
+pub fn check_smbios() -> SmbiosBdf {
+    check_smbios_in_bytes(&super::platform::smbios_table())
+}
+
+/// The table walk behind [`check_smbios`], over raw structure-table bytes.
+#[cfg(feature = "module")]
+pub fn check_smbios_in_bytes(table: &[u8]) -> SmbiosBdf {
+    /// SMBIOS type 127: end of table.
+    const END_OF_TABLE: u8 = 127;
+    let mut state = SmbiosBdf::default();
+    let mut at = 0usize;
+    while at + 4 <= table.len() {
+        let len = usize::from(table[at + 1]);
+        if len < 4 || at + len > table.len() {
+            break;
+        }
+        // The string set ends at the first double NUL after the formatted
+        // area (an empty set is just the double NUL).
+        let mut end = at + len;
+        while end + 1 < table.len() && !(table[end] == 0 && table[end + 1] == 0) {
+            end += 1;
+        }
+        let end = (end + 2).min(table.len());
+        smbios_bdf_ext(&table[at..end], &mut state);
+        if table[at] == END_OF_TABLE {
+            break;
+        }
+        at = end;
+    }
+    state
+}
 
 // ── Devicetree variant / fixed memory ─────────────────────────────
 
@@ -420,12 +457,14 @@ pub struct DtFacts {
     pub reserved: Option<(u64, u64)>,
 }
 
+#[cfg(feature = "builtin")]
 /// `of_property_read_string`: the bytes before the first NUL; a value
 /// without a terminating NUL is `-EILSEQ` (ignored).
 fn dt_string(value: &[u8]) -> Option<&[u8]> {
     value.iter().position(|b| *b == 0).map(|end| &value[..end])
 }
 
+#[cfg(feature = "builtin")]
 /// `ath11k_core_check_dt` + the `memory-region` probe over one node.
 pub fn dt_facts_from_props(blob: &[u8], props: narf_firmware_fdt::PropIter<'_>) -> DtFacts {
     let (mut primary, mut legacy, mut region) = (None, None, None);
@@ -451,6 +490,7 @@ pub fn dt_facts_from_props(blob: &[u8], props: narf_firmware_fdt::PropIter<'_>) 
     }
 }
 
+#[cfg(feature = "builtin")]
 /// The node of PCI function `devfns` (root-bus hop first) under PCI
 /// `domain` in `blob`; `None` = no unique node (`-ENOENT`).
 pub fn dt_facts_in(blob: &[u8], domain: u16, devfns: &[u8]) -> Option<DtFacts> {
@@ -461,6 +501,7 @@ pub fn dt_facts_in(blob: &[u8], domain: u16, devfns: &[u8]) -> Option<DtFacts> {
     facts
 }
 
+#[cfg(feature = "builtin")]
 /// `DtFacts` for a probed PCI function from the boot Devicetree
 /// (`narf_bus::boot_dtb`); `None` without a DTB (x86_64, QEMU `-kernel`
 /// without `-dtb`) or without a node for this function.

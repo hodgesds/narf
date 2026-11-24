@@ -12,10 +12,17 @@ name = "narf_crypto"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../lib" }
-narf-arch         = { path = "../arch" }
-narf-capabilities = { path = "../capabilities" }
-narf-ipc          = { path = "../ipc" }
+# Kernel-resident dependencies, behind the default `kernel` feature: the
+# cap-gated key surface (`Cap<Key<Alg>, R>`), the architectural entropy
+# source and the post-quantum cap types. With `default-features = false`
+# the crate is the bare algorithm set — no kernel crate, no global state —
+# which is what a loadable module links (`modules/MODULE_AUTHORING.md`).
+narf-lib          = { path = "../lib", optional = true }
+narf-arch         = { path = "../arch", optional = true }
+narf-capabilities = { path = "../capabilities", optional = true }
+narf-ipc          = { path = "../ipc", optional = true }
+# Zero-dependency test registry; the algorithm files' smokes register
+# through it in every configuration.
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 # RustCrypto primitives. Default features disabled to keep no_std clean —
@@ -48,6 +55,11 @@ zeroize            = { version = "1",    default-features = false, features = ["
 subtle             = { version = "2",    default-features = false }
 
 [features]
+default = ["kernel"]
+# Everything that needs a kernel crate: `Cap<Key<Alg>, R>` and the cap-gated
+# primitives, hardware entropy (`try_fill_random_bytes` and friends), the
+# post-quantum cap types and the kernel-resident test suites.
+kernel = ["dep:narf-lib", "dep:narf-arch", "dep:narf-capabilities", "dep:narf-ipc"]
 # ECDSA/P-256 signing (RFC 6979 deterministic nonces). Off by default; the
 # verify path is always available. Pulled in by WPA3 SAE-PK AP-side generation.
 ecdsa-sign = []

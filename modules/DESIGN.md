@@ -157,6 +157,16 @@ their own explicit family/version and bounded little-endian records; no
 Rust trait, firmware view, DMA pointer or future crosses this ABI.
 See [the datapath contract](DATAPATH_ABI_DESIGN.md#wireless-copy-mode-host-services)
 for completion, cancellation and unload ownership.
+A PCIe driver that programs its own interrupt sources and walks DMA rings
+from the CPU (ath11k) also has `narf_pci_identity`, `narf_msi_enable` /
+`narf_msi_set_enabled` (aligned multi-message plain MSI), `narf_pcie_aspm`
+(Link Control's ASPM field only) and `narf_dma_alloc_mapped` (a coherent
+buffer under an address limit, with its CPU mapping — see the
+[DMA safety decision](DATAPATH_ABI_DESIGN.md#dma-safety-the-load-bearing-decision)),
+plus the device-independent `narf_udelay`, `narf_random_bytes`,
+`narf_smbios_read`, `narf_firmware_signed` and `narf_module_param`. Each is
+additive and goes through the same CRC/whole-table hash and cap-at-resolution
+gates.
 The exit hook now saves/sets/restores the same execution-owner context as
 probe/poller gates, so owner-scoped cleanup addresses the exiting module's
 existing resources. State/refcount/domain admission is unchanged; mandatory
@@ -184,8 +194,18 @@ rustc emits calls to exported kernel symbols as `R_X86_64_PLT32` — a
 signed 32-bit displacement. A module more than 2 GiB from the kernel
 cannot be relocated at all, only rejected. Sitting the window directly
 above the kernel image keeps every module within ~1.25 GiB, so PC32 and
-PLT32 resolve directly and no GOT or PLT is needed. Linux places
+PLT32 resolve directly and no PLT is needed. Linux places
 `MODULES_VADDR` the same way for the same reason.
+
+A GOT *is* needed, for a different reason: the kernel target builds with
+`-Z plt=no`, so LLVM reaches a symbol it cannot prove local — in practice
+the `memcpy`/`memset` libcalls of out-of-line `core`/`alloc` code — as
+`call *sym@GOTPCREL(%rip)`. That instruction loads a pointer from a GOT
+slot; `ld -r` leaves the relocation pending, so the loader reserves one
+8-byte slot per `GOTPCREL`-family relocation at the end of the
+read-only region, writes each resolved address there, and points the
+displacement at the slot (`crate::got`). The slots are sealed read-only
+with `.rodata`.
 
 The BPF text window (slot 273, ~131 TiB away) would overflow every such
 relocation. `bpf_text` gets away with that placement because the JIT
@@ -554,11 +574,6 @@ asserts:
 
 ## Open questions / future phases
 
-  * **Rust `core` object inclusion.** A module using anything from `core` the compiler
-    does not inline will come out with undefined references that
-    neither KSYMTAB nor the object satisfies. Linux links the needed
-    `core` objects into each Rust module; `build_module` does not yet.
-
   * **modprobe userspace daemon.** A userspace tool that walks
     `/lib/modules/`, resolves `depends=`, and submits modules in
     the right order. Currently the kernel exposes the syscalls
@@ -599,6 +614,7 @@ narf-modules/
     loader.rs            ← top-level pipeline + image layout
     relocator.rs         ← per-section .rela.* walker
     plt.rs               ← aarch64 long-branch veneers
+    got.rs               ← x86_64 GOT slots for GOTPCREL relocations
     kabi.rs              ← the C ABI surface modules may call
     symbols.rs           ← KSYMTAB + cap-typed exports
     lifecycle.rs         ← state machine + init/exit ABI

@@ -2,15 +2,21 @@
 
 extern crate alloc;
 
+#[cfg(feature = "kernel")]
 use alloc::boxed::Box;
+#[cfg(feature = "kernel")]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(feature = "kernel")]
 use async_trait::async_trait;
+#[cfg(feature = "kernel")]
 use narf_net::Interface;
 
 pub mod amsdu;
+#[cfg(feature = "kernel")]
 pub mod ap_control;
 pub mod association;
+#[cfg(feature = "kernel")]
 pub mod caps;
 pub mod ccmp;
 pub mod cqm;
@@ -19,14 +25,18 @@ pub mod iface;
 pub mod mfp;
 pub mod mgmt_defrag;
 pub mod mlme;
+#[cfg(feature = "kernel")]
 pub mod module_host;
 pub mod monitor;
+#[cfg(feature = "kernel")]
 pub mod nl80211;
 pub mod packet_key;
 pub mod rate;
+#[cfg(feature = "kernel")]
 pub mod reconnect;
 pub mod reg;
 pub mod reorder;
+#[cfg(feature = "kernel")]
 pub mod rfkill;
 pub mod rsn;
 pub mod sae;
@@ -35,7 +45,9 @@ pub mod station_security;
 pub mod txpower;
 pub mod wmm;
 
-pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
+#[cfg(feature = "kernel")]
+pub use iface::WirelessIface;
+pub use iface::{AccessCategory, WirelessError, WirelessIfaceInfo};
 pub use scan::{
     BssInfo, ColocatedAp, Scan6GhzPlan, Scan6GhzTarget, ScanFlags, ScanRandomMac, ScanRequest,
     ScanResult,
@@ -263,6 +275,7 @@ pub enum WirelessRight {
     Admin,
 }
 
+#[cfg(feature = "kernel")]
 /// A specialized network interface supporting 802.11 operations.
 #[async_trait]
 pub trait WirelessNetIface: Interface {
@@ -2435,10 +2448,12 @@ pub struct StationConfig {
     pub station_tx_power: Option<StationTxPower>,
 }
 
+#[cfg(feature = "kernel")]
 #[path = "wdev_registry.rs"]
 pub mod registry;
 
 /// Force-link hook.
+#[cfg(feature = "kernel")]
 pub fn register_initcalls() {
     narf_net::install_trusted_net_authority(narf_net::bootstrap_authority());
     let _ = nl80211::register();

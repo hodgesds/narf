@@ -478,6 +478,26 @@ kernel_abi! {
         narf_bus::module_bar_map(owner, dev, bar_idx)
     }
 
+    /// Write the length in bytes of BAR handle `bar` through `out_len`.
+    /// Returns 0, or `-EINVAL` for a bad handle or null pointer.
+    ///
+    /// # Safety
+    /// `out_len` must point to writable `u64` storage.
+    fn narf_bar_len(dev: u64, bar: u64, out_len: *mut u64) -> i32 {
+        if out_len.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_bar_len(owner, dev, bar) {
+            Some(len) => {
+                // SAFETY: non-null; the module promises writable storage.
+                unsafe { out_len.write(len) };
+                0
+            }
+            None => -22,
+        }
+    }
+
     /// Read a 32-bit device register at `off` in BAR handle `bar`, storing it
     /// through `out`. Returns 0, or `-EINVAL` for a bad handle/offset/pointer.
     ///
@@ -715,6 +735,287 @@ kernel_abi! {
         narf_bus::module_spawn_poller(owner, dev, callback, cookie)
     }
 
+
+    // ── Device datapath: identity, plain MSI, ASPM, mapped DMA ──────────
+    //
+    // What a PCIe driver with its own interrupt and ring programming needs
+    // beyond Stages 1–4 (ath11k is the first consumer). See
+    // `modules/DATAPATH_ABI_DESIGN.md`, "PCI identity, plain MSI and mapped
+    // DMA".
+
+    /// Fill `out` with the function's 16-byte identity record (vendor,
+    /// device, subsystem ids, revision, class, segment/bus/devfn; layout in
+    /// `narf_bus::driver_match::module_pci_identity`). `len` must be at least
+    /// 16. Returns 0, `-EINVAL`, or `-ENODEV`.
+    ///
+    /// # Safety
+    /// `out` must name `len` writable bytes for the call.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pci_identity(dev: u64, out: *mut u8, len: usize) -> i32 {
+        if out.is_null() || len < narf_bus::driver_match::MODULE_PCI_IDENTITY_LEN {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pci_identity(owner, dev) {
+            Ok(record) => {
+                // SAFETY: non-null and at least `record.len()` writable bytes.
+                unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len()) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Program multi-message MSI: exactly `want` vectors (power of two,
+    /// 1..=32) in an aligned block, delivery left disabled. Writes the vector
+    /// count, the first kernel vector, the Message Address and vector 0's
+    /// Message Data. Vector `i` is `base_vector + i` for
+    /// `narf_irq_set_handler`. `-ENOSPC` when the block cannot be had (ask
+    /// again with fewer), `-EOPNOTSUPP` without an MSI capability, `-EBUSY`
+    /// when MSI or MSI-X is already set up on the device.
+    ///
+    /// # Safety
+    /// Every output pointer must name writable storage of its type.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_msi_enable(
+        dev: u64,
+        want: u16,
+        out_count: *mut u16,
+        out_base_vector: *mut u16,
+        out_addr: *mut u64,
+        out_data: *mut u32,
+    ) -> i32 {
+        if out_count.is_null() || out_base_vector.is_null() || out_addr.is_null() || out_data.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_msi_enable(owner, dev, want) {
+            Ok(grant) => {
+                // SAFETY: all four are non-null; the module promises writable
+                // storage of each type.
+                unsafe {
+                    out_count.write(grant.count);
+                    out_base_vector.write(grant.base_vector);
+                    out_addr.write(grant.addr);
+                    out_data.write(grant.data);
+                }
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Enable (`enabled = 1`) or disable (`0`) delivery for the MSI block
+    /// `narf_msi_enable` programmed.
+    ///
+    /// # Safety
+    /// `dev` must be the live token supplied to the current module callback.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_msi_set_enabled(dev: u64, enabled: u32) -> i32 {
+        if enabled > 1 {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_msi_set_enabled(owner, dev, enabled != 0)
+    }
+
+    /// Set the PCIe Link Control ASPM field (bits 1:0: L0s, L1) to `aspmc`
+    /// and write the previous field through `out_prev`. `-EOPNOTSUPP` on a
+    /// function without a PCI Express capability.
+    ///
+    /// # Safety
+    /// `out_prev` must point to writable `u16` storage.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pcie_aspm(dev: u64, aspmc: u16, out_prev: *mut u16) -> i32 {
+        if out_prev.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pcie_aspm(owner, dev, aspmc) {
+            Ok(previous) => {
+                // SAFETY: non-null; the module promises writable storage.
+                unsafe { out_prev.write(previous) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Allocate a coherent DMA buffer the module's CPU code may dereference:
+    /// at least `len` bytes, wholly below `2^addr_bits` (32..=64), zeroed.
+    /// Writes the CPU address, the device address and the reserved length,
+    /// and returns a 1-based handle shared with `narf_dma_free`/`narf_dma_addr`
+    /// (0 on failure). The CPU mapping is valid until `narf_dma_free` of the
+    /// handle or device teardown.
+    ///
+    /// # Safety
+    /// Each output pointer must name writable storage of its type. The module
+    /// must not touch the mapping after freeing the handle.
+    requires narf_capabilities::CapKind::DmaBuffer;
+    fn narf_dma_alloc_mapped(
+        dev: u64,
+        len: usize,
+        addr_bits: u32,
+        out_cpu: *mut usize,
+        out_bus: *mut u64,
+        out_len: *mut usize,
+    ) -> u64 {
+        if out_cpu.is_null() || out_bus.is_null() || out_len.is_null() {
+            return 0;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        let domain = narf_lib::assert::current_domain();
+        if owner == crate::symbols::KERNEL_MODULE_ID.0 || domain == narf_lib::id::DomainId::FRAME {
+            return 0;
+        }
+        match narf_bus::driver_match::module_dma_alloc_mapped(owner, dev, len, addr_bits, domain) {
+            Ok(dma) => {
+                // SAFETY: all three non-null; the module promises storage.
+                unsafe {
+                    out_cpu.write(dma.cpu);
+                    out_bus.write(dma.bus);
+                    out_len.write(dma.len);
+                }
+                dma.handle
+            }
+            Err(_) => 0,
+        }
+    }
+
+    // ── Runtime services: delay, entropy, platform tables, parameters ───
+
+    /// Busy-wait `ns` nanoseconds (1 ns ..= 1 s) on the monotonic clock while
+    /// keeping the kernel's sleep pumps (framebuffer, cursor, console) ticking
+    /// — for hardware sequences with a mandated synchronous delay.
+    ///
+    /// # Safety
+    /// None beyond the ABI's blanket contract; it holds the calling upcall.
+    fn narf_udelay(ns: u64) -> i32 {
+        if ns == 0 || ns > 1_000_000_000 {
+            return -22;
+        }
+        let deadline = narf_time::Deadline::after_ns(ns);
+        narf_scheduler::responsive_spin_until(|| deadline.expired(), narf_time::Deadline::after_ns(ns + 1_000));
+        0
+    }
+
+    /// Fill `len` bytes (at most 4096 per call) with output of the kernel's
+    /// health-tested entropy source. `-EAGAIN` when no healthy source is
+    /// available — never a deterministic fallback.
+    ///
+    /// # Safety
+    /// `buf` must name `len` writable bytes.
+    fn narf_random_bytes(buf: *mut u8, len: usize) -> i32 {
+        if buf.is_null() || len == 0 || len > 4096 {
+            return -22;
+        }
+        // SAFETY: non-null; the module promises `len` writable bytes.
+        let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        match narf_crypto::try_fill_random_bytes(out) {
+            Ok(()) => 0,
+            Err(_) => {
+                out.fill(0);
+                -11
+            }
+        }
+    }
+
+    /// Copy the firmware's SMBIOS structure table, starting `off` bytes in,
+    /// into `buf` (up to `len` bytes; `len` may be 0 to only size it). The
+    /// table's total length is written through `out_total`. `-ENODATA` when
+    /// the firmware published no table, `-EINVAL` for `off` past its end.
+    ///
+    /// # Safety
+    /// `buf` must name `len` writable bytes (or be null with `len == 0`);
+    /// `out_total` must point to writable `usize` storage.
+    fn narf_smbios_read(off: usize, buf: *mut u8, len: usize, out_total: *mut usize) -> i32 {
+        if out_total.is_null() || (buf.is_null() && len != 0) {
+            return -22;
+        }
+        let Some(table) = narf_firmware_smbios::boot_table() else {
+            return -61;
+        };
+        let bytes = table.bytes();
+        if off > bytes.len() {
+            return -22;
+        }
+        let n = len.min(bytes.len() - off);
+        // SAFETY: `out_total` non-null; `buf` names `len >= n` writable bytes.
+        unsafe {
+            out_total.write(bytes.len());
+            if n != 0 {
+                core::ptr::copy_nonoverlapping(bytes[off..].as_ptr(), buf, n);
+            }
+        }
+        0
+    }
+
+    /// Report whether open firmware `handle` carries a verified signer: 1
+    /// signed, 0 unsigned, or a negative errno (`-EBADF`). Drivers that refuse
+    /// unsigned board or regulatory data (ath11k, as built in) check this
+    /// before using the bytes.
+    ///
+    /// # Safety
+    /// None beyond the ABI's blanket contract.
+    requires narf_capabilities::CapKind::Firmware;
+    fn narf_firmware_signed(handle: u64) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_firmware::module_fetch::signed(owner, handle) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(errno) => errno,
+        }
+    }
+
+    /// Copy the calling module's parameter `name` (its current value, after
+    /// any `<module>.<name>=` from the kernel command line) into `out`, and
+    /// write its length through `out_len`. `-ENOENT` if the module declares
+    /// no such parameter; `-ENOBUFS` (with the needed length written) when
+    /// `cap` is too small.
+    ///
+    /// # Safety
+    /// `name` names `name_len` readable bytes; `out` names `cap` writable
+    /// bytes (or is null with `cap == 0`); `out_len` names writable `usize`.
+    fn narf_module_param(
+        name: *const u8,
+        name_len: usize,
+        out: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || out_len.is_null() || (out.is_null() && cap != 0) {
+            return -22;
+        }
+        // SAFETY: the module promises `name_len` readable bytes at `name`.
+        let name = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(name) else {
+            return -22;
+        };
+        // Init runs under the init-attribution context; probe, poller and
+        // IRQ callbacks under the execution context. Either names the caller.
+        let mut owner = crate::symbols::current_execution_id();
+        if owner == crate::symbols::KERNEL_MODULE_ID {
+            owner = crate::symbols::current_init_id();
+        }
+        let Some(module) = crate::registry::lookup_by_id(owner) else {
+            return -19;
+        };
+        let Some(slot) = crate::params::find(&module.params, name) else {
+            return -2;
+        };
+        let value = slot.read();
+        // SAFETY: `out_len` is non-null and names writable `usize` storage.
+        unsafe { out_len.write(value.len()) };
+        if value.len() > cap {
+            return -105; // -ENOBUFS, with the needed length reported
+        }
+        if !value.is_empty() {
+            // SAFETY: `out` is non-null here (cap >= len > 0) and names
+            // `cap >= value.len()` writable bytes.
+            unsafe { core::ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
+        }
+        0
+    }
 
     // ── Device datapath: copy-mode network interface (Stage 4) ──────
 
@@ -1803,3 +2104,165 @@ kernel_test_in!(
     "modules/kabi",
     smoke_kabi_block_datapath_validates_arguments
 );
+
+/// The PCI-identity, plain-MSI, ASPM and mapped-DMA exports reject malformed
+/// arguments before touching any context, and an unknown device token gets
+/// `-ENODEV`, never a grant. The bus bridges' positive paths are covered
+/// against a synthetic function in `bus/module-pci`.
+fn smoke_kabi_pci_ext_exports_validate_arguments() -> TestResult {
+    const UNKNOWN: u64 = (0x56u64 << 56) | 0xFEFE;
+    let mut rec = [0u8; 16];
+    let (mut count, mut base, mut prev) = (0u16, 0u16, 0u16);
+    let (mut addr, mut data) = (0u64, 0u32);
+    let (mut cpu, mut bus, mut len) = (0usize, 0u64, 0usize);
+    // SAFETY: every pointer is null (to prove rejection) or names live,
+    // correctly sized local storage.
+    let ok = unsafe {
+        narf_pci_identity(UNKNOWN, core::ptr::null_mut(), 16) == -22
+            && narf_pci_identity(UNKNOWN, rec.as_mut_ptr(), 15) == -22
+            && narf_pci_identity(UNKNOWN, rec.as_mut_ptr(), 16) == -19
+            && narf_msi_enable(
+                UNKNOWN,
+                1,
+                core::ptr::null_mut(),
+                &mut base,
+                &mut addr,
+                &mut data,
+            ) == -22
+            && narf_msi_enable(UNKNOWN, 3, &mut count, &mut base, &mut addr, &mut data) == -22
+            && narf_msi_enable(UNKNOWN, 1, &mut count, &mut base, &mut addr, &mut data) == -19
+            && narf_msi_set_enabled(UNKNOWN, 2) == -22
+            && narf_msi_set_enabled(UNKNOWN, 1) == -19
+            && narf_pcie_aspm(UNKNOWN, 0, core::ptr::null_mut()) == -22
+            && narf_pcie_aspm(UNKNOWN, 0, &mut prev) == -19
+            && narf_dma_alloc_mapped(UNKNOWN, 4096, 32, core::ptr::null_mut(), &mut bus, &mut len)
+                == 0
+            && narf_dma_alloc_mapped(UNKNOWN, 4096, 32, &mut cpu, &mut bus, &mut len) == 0
+    };
+    if !ok || cpu != 0 || count != 0 {
+        return TestResult::Fail("a PCI extension export accepted a malformed argument or token");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/kabi",
+    smoke_kabi_pci_ext_exports_validate_arguments
+);
+
+/// `narf_bar_len` refuses a null output and a token with no device context
+/// (the owned-handle cases are `bus/module-pci`'s).
+fn smoke_kabi_bar_len_validates_arguments() -> TestResult {
+    const UNKNOWN: u64 = (0x56u64 << 56) | 0xFEFF;
+    let mut len = 0x5a5a_u64;
+    // SAFETY: the pointer is null (to prove rejection) or names a live local.
+    let ok = unsafe {
+        narf_bar_len(UNKNOWN, 1, core::ptr::null_mut()) == -22
+            && narf_bar_len(UNKNOWN, 1, &mut len) == -22
+            && narf_bar_len(UNKNOWN, 0, &mut len) == -22
+    };
+    if !ok || len != 0x5a5a {
+        return TestResult::Fail("narf_bar_len accepted a null output or an unknown token");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_bar_len_validates_arguments);
+
+/// Device-bound additions need their manifest cap to resolve; the
+/// device-independent services need none.
+fn smoke_kabi_pci_ext_and_runtime_exports_cap_gating() -> TestResult {
+    use narf_capabilities::CapKind;
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    for (name, kind) in [
+        ("narf_pci_identity", CapKind::BusDevice),
+        ("narf_msi_enable", CapKind::BusDevice),
+        ("narf_msi_set_enabled", CapKind::BusDevice),
+        ("narf_pcie_aspm", CapKind::BusDevice),
+        ("narf_dma_alloc_mapped", CapKind::DmaBuffer),
+        ("narf_firmware_signed", CapKind::Firmware),
+    ] {
+        match crate::symbols::resolve(name, None, &denied) {
+            Err(crate::symbols::ResolveError::CapMissing(k)) if k == kind => {}
+            _ => return TestResult::Fail("a device export resolved without its cap"),
+        }
+    }
+    for name in [
+        "narf_udelay",
+        "narf_random_bytes",
+        "narf_smbios_read",
+        "narf_module_param",
+    ] {
+        if crate::symbols::resolve(name, None, &denied).is_err() {
+            return TestResult::Fail("a runtime service export required a cap");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/kabi",
+    smoke_kabi_pci_ext_and_runtime_exports_cap_gating
+);
+
+/// The runtime services: bounded delay, entropy that fills (or refuses and
+/// zeroes), and an SMBIOS read whose pieces reassemble the table.
+fn smoke_kabi_runtime_services_behave() -> TestResult {
+    // SAFETY: argument-only calls.
+    let delay_ok = unsafe {
+        narf_udelay(0) == -22 && narf_udelay(1_000_000_001) == -22 && narf_udelay(10_000) == 0
+    };
+    if !delay_ok {
+        return TestResult::Fail("narf_udelay bounds or short delay misbehaved");
+    }
+
+    let mut a = [0u8; 64];
+    let mut b = [0u8; 64];
+    // SAFETY: each buffer names its length in writable bytes; the null and
+    // oversized calls are the rejected forms.
+    let (rc_a, rc_b, null, big) = unsafe {
+        (
+            narf_random_bytes(a.as_mut_ptr(), a.len()),
+            narf_random_bytes(b.as_mut_ptr(), b.len()),
+            narf_random_bytes(core::ptr::null_mut(), 8),
+            narf_random_bytes(a.as_mut_ptr(), 4097),
+        )
+    };
+    if null != -22 || big != -22 {
+        return TestResult::Fail("narf_random_bytes accepted a null or oversized buffer");
+    }
+    match (rc_a, rc_b) {
+        (0, 0) if a != b && a.iter().any(|&x| x != 0) => {}
+        (-11, _) | (_, -11) if a.iter().all(|&x| x == 0) || b.iter().all(|&x| x == 0) => {}
+        _ => return TestResult::Fail("narf_random_bytes neither filled distinctly nor refused"),
+    }
+
+    let mut total = 0usize;
+    // SAFETY: sizing call (null buffer, zero length) with live `total`.
+    let rc = unsafe { narf_smbios_read(0, core::ptr::null_mut(), 0, &mut total) };
+    match narf_firmware_smbios::boot_table() {
+        None if rc == -61 => {}
+        Some(table) if rc == 0 && total == table.bytes().len() => {
+            let mut whole = alloc::vec![0u8; total];
+            let split = total / 2;
+            // SAFETY: `whole` names `total` writable bytes; the two reads
+            // cover `[0, split)` and `[split, total)`.
+            let (r1, r2, past) = unsafe {
+                (
+                    narf_smbios_read(0, whole.as_mut_ptr(), split, &mut total),
+                    narf_smbios_read(
+                        split,
+                        whole[split..].as_mut_ptr(),
+                        total - split,
+                        &mut total,
+                    ),
+                    narf_smbios_read(total + 1, whole.as_mut_ptr(), 0, &mut total),
+                )
+            };
+            if r1 != 0 || r2 != 0 || past != -22 || whole.as_slice() != table.bytes() {
+                return TestResult::Fail("narf_smbios_read pieces do not reassemble the table");
+            }
+        }
+        _ => return TestResult::Fail("narf_smbios_read disagrees with the boot SMBIOS table"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_runtime_services_behave);

@@ -42,6 +42,7 @@ extern crate alloc;
 pub mod compression;
 pub mod domain;
 pub mod elf;
+pub mod got;
 pub mod kabi;
 pub mod lifecycle;
 pub mod loader;

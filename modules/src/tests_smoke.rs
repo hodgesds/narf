@@ -910,13 +910,18 @@ kernel_test_in!("modules/reloc", smoke_aarch64_call26_encoding);
 
 fn smoke_aarch64_scaled_lo12_encoding() -> TestResult {
     use crate::elf::reloc::{
-        R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_LDST128_ABS_LO12_NC, R_AARCH64_LDST32_ABS_LO12_NC,
-        R_AARCH64_LDST64_ABS_LO12_NC,
+        R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_LDST128_ABS_LO12_NC, R_AARCH64_LDST16_ABS_LO12_NC,
+        R_AARCH64_LDST32_ABS_LO12_NC, R_AARCH64_LDST64_ABS_LO12_NC, R_AARCH64_LDST8_ABS_LO12_NC,
     };
     // S + A crosses a page and ends in 0xabc. Use nonzero initial imm12
     // bits to verify the relocation replaces the entire field.
     for (ty, instruction, immediate) in [
         (R_AARCH64_ADD_ABS_LO12_NC, 0x9100_0021u32, 0xabc),
+        // ldrb w1, [x1] / ldrh w1, [x1]: byte loads are unscaled, halfword
+        // loads scale by two. A real rustc `.ko` emits both (a `static`
+        // `AtomicBool` is read with `ldrb`).
+        (R_AARCH64_LDST8_ABS_LO12_NC, 0x3940_0021, 0xabc),
+        (R_AARCH64_LDST16_ABS_LO12_NC, 0x7940_0021, 0x55e),
         (R_AARCH64_LDST32_ABS_LO12_NC, 0xb940_0021, 0x2af),
         (R_AARCH64_LDST64_ABS_LO12_NC, 0xf940_0021, 0x157),
         (R_AARCH64_LDST128_ABS_LO12_NC, 0x3dc0_0021, 0xab),
@@ -2046,4 +2051,44 @@ fn smoke_lifecycle_exit_preserves_device_kabi_owner() -> TestResult {
 kernel_test_in!(
     "modules/lifecycle",
     smoke_lifecycle_exit_preserves_device_kabi_owner
+);
+
+/// `<module>.<param>=` on the kernel command line, then the load string,
+/// override declared parameters only: another module's prefix, a bare
+/// prefix match (`ath11kx.`), an undeclared name and `domain=` change
+/// nothing, and the load string wins over the command line.
+fn smoke_param_overrides_follow_cmdline_then_load_string() -> TestResult {
+    use crate::params::ParamSlot;
+    let slots = alloc::vec![
+        ParamSlot::new("ssid", ""),
+        ParamSlot::new("passphrase", ""),
+        ParamSlot::new("scan", "0"),
+    ];
+    let cmdline = [
+        "console=ttyS0",
+        "ath11k.ssid=narf%20lab",
+        "ath11kx.scan=9",
+        "ath10k.scan=8",
+        "ath11k.unknown=1",
+        "ath11k.passphrase=from-cmdline",
+        "ath11k.scan",
+    ];
+    crate::syscalls::apply_param_overrides(
+        "ath11k",
+        &slots,
+        cmdline.into_iter(),
+        "domain=net passphrase=from-load ssid",
+    );
+    let got = |name: &str| crate::params::find(&slots, name).map(|slot| slot.read());
+    if got("ssid").as_deref() != Some("narf%20lab")
+        || got("passphrase").as_deref() != Some("from-load")
+        || got("scan").as_deref() != Some("0")
+    {
+        return TestResult::Fail("module parameter overrides applied in the wrong order or scope");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/params",
+    smoke_param_overrides_follow_cmdline_then_load_string
 );

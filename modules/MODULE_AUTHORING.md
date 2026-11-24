@@ -55,10 +55,16 @@ architecture-comparison overview, see the workspace-root
 > accepted only by kernels built with the explicit developer/CI
 > `module-allow-unsigned` feature.
 >
-> One live limitation: a module that uses `core` beyond what the
-> compiler inlines comes out with undefined references nothing can
-> satisfy. Keep to the exported ABI and your own code for now. See
-> [DESIGN.md](./DESIGN.md).
+> Out-of-line `core`, `alloc` and `compiler_builtins` code, and code
+> from kernel-free dependency crates, is linked into the `.ko` from the
+> staticlib archive: `build-module` offers the archive lazily after
+> your crate's own objects and section-GCs the result, so only what
+> your code reaches is kept. A module that wants a heap, `async` and
+> locks depends on [`narf-module-rt`](./rt) (see
+> [Writing against `narf-module-rt`](#writing-against-narf-module-rt)).
+> A dependency on a *kernel* crate (`narf-lib`, `narf-bus`, …) still
+> fails the `nm -u` gate: its symbols live in the kernel image, not in
+> any KSYMTAB.
 
 A NARF module is a stand-alone Cargo crate that builds to a single
 relocatable ELF object (`crate-type = "staticlib"`). A minimal
@@ -175,6 +181,7 @@ So the surface is small and grows deliberately. Today:
 | `narf_register_usb_driver` | `(*const u8, usize, u16, u16, u16, u8, u8, u8, usize) -> i32` | name, `match_flags`, vendor, product, interface class/subclass/protocol, probe; flags as Linux `usb_device_id` (1 VID/PID, 2 class, 4 subclass, 8 protocol). Offered only devices no built-in driver claimed; `-ENODEV` without a USB stack |
 | `narf_pci_enable` | `(u64, u16) -> i32` | enable command bits on the callback's device |
 | `narf_bar_map` | `(u64, u8) -> u64` | map a BAR and return an opaque handle |
+| `narf_bar_len` | `(u64, u64, *mut u64) -> i32` | length of a mapped BAR handle |
 | `narf_mmio_read32` | `(u64, u64, u64, *mut u32) -> i32` | bounded BAR read |
 | `narf_mmio_write32` | `(u64, u64, u64, u32) -> i32` | bounded BAR write |
 | `narf_mmio_wait32` | `(u64, u64, u64, u32, u32, u64) -> i32` | responsive masked register wait; 1 ns–1 s |
@@ -184,6 +191,11 @@ So the surface is small and grows deliberately. Today:
 | `narf_dma_read` | `(u64, u64, u64, *mut u8, usize) -> i32` | bounded copy out of DMA memory |
 | `narf_dma_wait8` | `(u64, u64, u64, u8, u8, u64) -> i32` | responsive masked DMA-status wait; 1 ns–1 s |
 | `narf_dma_free` | `(u64, u64) -> i32` | revoke and release a DMA handle |
+| `narf_dma_alloc_mapped` | `(u64, usize, u32, *mut usize, *mut u64, *mut usize) -> u64` | coherent buffer below `2^addr_bits` (32..=64) **with its CPU mapping**, for drivers whose rings the CPU walks; writes CPU address, device address and reserved length; handle shared with `narf_dma_free`/`narf_dma_addr`; requires `DmaBuffer` |
+| `narf_pci_identity` | `(u64, *mut u8, usize) -> i32` | 16-byte LE record: vendor, device, subsystem vendor/device, revision, class, segment, bus, devfn; requires `BusDevice` |
+| `narf_msi_enable` | `(u64, u16, *mut u16, *mut u16, *mut u64, *mut u32) -> i32` | exactly `want` (power of two ≤ 32) aligned plain-MSI vectors, delivery left off; writes count, first kernel vector, Message Address and vector 0's Data; `-28` ask for fewer, `-95` no MSI, `-16` MSI/MSI-X already set up; requires `BusDevice` |
+| `narf_msi_set_enabled` | `(u64, u32) -> i32` | flip MSI delivery for that block |
+| `narf_pcie_aspm` | `(u64, u16, *mut u16) -> i32` | set Link Control's ASPM field (bits 1:0) only; writes the previous field |
 | `narf_msix_enable` | `(u64) -> i32` | discover/retain MSI-X; `-95` when unsupported; requires `BusDevice` |
 | `narf_msix_claim` | `(u64, *mut u16) -> i32` | allocate/program one kernel IRQ vector |
 | `narf_irq_set_handler` | `(u64, u16, usize, u64) -> i32` | attach `extern "C" fn(u64) -> i32`; callback runs in task context |
@@ -206,6 +218,11 @@ So the surface is small and grows deliberately. Today:
 | `narf_blk_fill` | `(u64, u64, usize, *const u8, usize) -> i32` | inside a read request: copy module memory into the request (USB drivers) |
 | `narf_blk_fetch` | `(u64, u64, usize, *mut u8, usize) -> i32` | inside a write request: copy request bytes into module memory (USB drivers) |
 | `narf_usb_wait` | `(u64, u64, u64) -> i32` | wait up to 1 s for a callback-less bulk/interrupt request, polling it inline |
+| `narf_udelay` | `(u64) -> i32` | busy-wait 1 ns–1 s while the kernel sleep pumps keep ticking |
+| `narf_random_bytes` | `(*mut u8, usize) -> i32` | ≤ 4096 bytes from the health-tested entropy source; `-11` when none is healthy (output zeroed) |
+| `narf_smbios_read` | `(usize, *mut u8, usize, *mut usize) -> i32` | copy the firmware SMBIOS structure table from an offset; writes its total length; `-61` with no table |
+| `narf_firmware_signed` | `(u64) -> i32` | 1/0: whether an open firmware handle carries a verified signer; requires `Firmware` |
+| `narf_module_param` | `(*const u8, usize, *mut u8, usize, *mut usize) -> i32` | the calling module's parameter value (see [Module parameters](#module-parameters)); `-2` undeclared, `-105` with the needed length |
 
 Declare them as you would any foreign function:
 
@@ -274,11 +291,11 @@ boundary is unsafe as a whole, because nothing has verified your
 arguments, and marking only the pointer-taking ones would imply the rest
 had been checked.
 
-If you wrap them in safe helpers, mark the wrappers `#[inline]`. Anything
-left out of line in a *different crate* is a symbol
-`cargo xtask build-module` does not put in your `.ko`, so the module ends
-up referencing your Rust-mangled wrapper — which is in no kernel's
-KSYMTAB — instead of `narf_printk`.
+Safe wrappers may live in your crate or in a kernel-free dependency
+crate: `cargo xtask build-module` links out-of-line code from the
+crate's dependencies into the `.ko`, so a wrapper in another crate is
+resolved inside the module and only the `narf_*` export it calls is
+left for KSYMTAB.
 
 Each export carries a CRC computed from its signature. If the kernel's
 signature changes, your module is refused at load with a CRC mismatch
@@ -288,6 +305,31 @@ to do anything to opt into that.
 Referencing a symbol that is *not* exported is a load-time failure, not
 a link-time one: the relocator reports `SymbolNotFound` naming the
 symbol.
+
+## Writing against `narf-module-rt`
+
+[`narf-module-rt`](./rt) is a kernel-free crate built only from
+`narf_printk`, `narf_kmalloc`, `narf_kfree` and `narf_monotonic_ns`.
+Depending on it gives a module:
+
+| Piece | What it is |
+|---|---|
+| `heap::KernelHeap` | The module's `#[global_allocator]` (installed for you on the kernel target), so `alloc::{vec, boxed, string, format}` work. |
+| `printkln!` | Whole-line console output, split only at UTF-8 boundaries. |
+| `sync::SpinLock` | For state shared between concurrent upcalls; its guard is `!Send`. |
+| `sync::Mutex` | Async mutex whose guard may be held across `.await`. |
+| `time` | `now_ns`, `Deadline`, `sleep_until`/`sleep_ms`, `yield_now`, `spin_ns`. |
+| `exec::Executor` | Runs the module's own futures. Keep one in a `static` and call `run()` from every upcall (poller, IRQ vector callbacks, probe). Tasks must be `Send`. |
+
+The kernel never polls a module's futures: a `Future` cannot cross the
+KABI. The device poller (`narf_spawn_poller`, every 1 ms) is the
+executor's heartbeat; wakers and IRQ callbacks only bring the next pass
+forward. Module code always runs in task context, so the locks spin
+across CPUs but never mask interrupts.
+
+`modules/rt-smoke` is the reference: it allocates, formats and runs two
+futures under an async mutex from `narf_module_init`, and the
+`modules/e2e` kernel test loads it on both architectures.
 
 ## Lifecycle symbols
 
@@ -354,45 +396,48 @@ modules: load rejected — required cap BlockDevice missing for
 
 ## Module parameters
 
-A module that wants tunable parameters writes a `.narf_kparams`
-section. The simplest way is a sibling text file injected via
-`objcopy`:
-
-```
-# kparams.txt
-debug=0
-ring_size=4096
-```
-
-Then:
-
-```sh
-objcopy --add-section .narf_kparams=kparams.txt --set-section-flags \
-    .narf_kparams=alloc,readonly rtl9999.ko
-```
-
-At load time the kernel parses the section, populates the module's
-parameter slots, and creates `/sys/module/<name>/parameters/<p>`
-for each. Both reads and writes are supported.
-
-Inside your module, read the current value:
+A module declares its parameters, with defaults, in a `.narf_kparams`
+section: one `name=value` per line. The simplest way is a `#[used]`
+static, which survives `build-module`'s section GC (it is emitted
+`SHF_GNU_RETAIN`):
 
 ```rust
-fn my_init() -> Result<(), &'static str> {
-    if let Some(val) = narf_modules::params::find(
-        /* &self.params slice */,
-        "debug",
-    ) {
-        let raw = val.read();
-        // raw is the current text value; parse it.
-    }
-    Ok(())
-}
+#[used]
+#[link_section = ".narf_kparams"]
+static KPARAMS: [u8; 18] = *b"debug=0\nring=4096\n";
 ```
 
-Phase 1 caveat: parameters are stored as strings; the module is
-responsible for parsing. A future `narf_module_param!(debug: u32)`
-macro will plumb the typed accessor.
+(or inject a text file with `objcopy --add-section
+.narf_kparams=kparams.txt --set-section-flags .narf_kparams=alloc,readonly`
+after the build).
+
+At load the kernel parses the section into the module's parameter slots,
+then applies, in order:
+
+1. every `<module>.<name>=value` token on the kernel command line, where
+   `<module>` is the `.modinfo` `name=` (`ath11k.ssid=lab` sets `ssid`
+   for a module named `ath11k`), and
+2. the load's own `name=value` arguments (`init_module`'s parameter
+   string; `domain=` is the placement option, not a parameter) — so an
+   explicit load argument wins, as with Linux `modprobe`.
+
+Values for names the module does not declare are ignored. The result is
+mirrored at `/sys/module/<name>/parameters/<p>` (readable and writable).
+
+Inside the module, read the current value with `narf_module_param`
+(`-2` for an undeclared name, `-105` with the needed length when the
+buffer is short), or through `narf-module-rt`:
+
+```rust
+let debug = narf_module_rt::param::get("debug")
+    .ok()
+    .and_then(|v| v.parse::<u32>().ok())
+    .unwrap_or(0);
+```
+
+Values are strings; the module parses them. Anything on the kernel
+command line is readable by every process through `/proc/cmdline`, so
+secrets belong in a load-time argument, not there.
 
 ## Loading the module
 

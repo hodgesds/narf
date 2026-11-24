@@ -219,10 +219,13 @@ cap is live.
 
 ## DMA safety (the load-bearing decision)
 
-A module runs in a PKS-isolated domain; `DmaBuffer::cpu_ptr()` is a kernel
-direct-map pointer the module's domain cannot access, and `alloc_coherent`
-draws from the flat buddy allocator (not a domain-tagged heap) with the IOMMU
-in identity mode. Three options:
+`alloc_coherent` draws from the flat buddy allocator (not a domain-tagged
+heap) with the IOMMU in identity mode, and `DmaBuffer::cpu_ptr()` is a kernel
+direct-map pointer. Module scope narrows PKS/PCID to the module's own domain
+**plus the kernel's** (`modules/DESIGN.md`, "What this does NOT do"), and the
+direct map is the kernel's, so a module's domain can in fact reach that
+pointer; what a module lacks without an export is the pointer itself, and a
+lifetime contract for it. Three options:
 
 - **(A) Kernel-domain accessors (recommended for the slice).** The module never
   touches DMA memory directly; it builds descriptors and moves frame bytes via
@@ -234,8 +237,16 @@ in identity mode. Three options:
   module) broad physical reach. Defer until there's a per-domain IOMMU story.
 - **(C) Bounce via the iface DMA pool.** Only helps net.
 
-Recommendation: ship **(A)**; note (B) as a perf follow-up gated on IOMMU
-per-domain mapping.
+Recommendation (first slice): ship **(A)**; note (B) as a perf follow-up gated
+on IOMMU per-domain mapping.
+
+**(B) landed for ring-walking drivers** as `narf_dma_alloc_mapped` (see "PCI
+identity, plain MSI and mapped DMA" below), alongside (A). Its justification is
+the reachability fact above, not a per-domain mapping: the pointer grants no
+access the module's domain did not already have, and the export is the
+contract that a later per-domain DMA keying (with the IOMMU story) narrows. A
+driver with tens of descriptor rings and multi-megabyte link-descriptor banks
+(ath11k) cannot afford one cap-checked export call per descriptor word.
 
 ## Lifetime / unload (prerequisite)
 
@@ -306,6 +317,54 @@ Each stage is independently reviewable and testable; we stop/reassess after any.
   rather than widening this ABI speculatively.
 - **Perf.** Copy-mode DMA (A) is fine for bring-up/bulk-NIC but not for a
   high-rate datapath; (B) is the eventual answer and needs the IOMMU work.
+
+## PCI identity, plain MSI and mapped DMA
+
+Status: **implemented**; ath11k (WCN6855) is the first consumer. The
+additive exports, all primitive-only:
+
+```text
+narf_pci_identity(dev:u64, out:*mut u8, len:usize)->i32
+narf_msi_enable(dev:u64, want:u16, out_count:*mut u16, out_base_vector:*mut u16, out_addr:*mut u64, out_data:*mut u32)->i32
+narf_msi_set_enabled(dev:u64, enabled:u32)->i32
+narf_pcie_aspm(dev:u64, aspmc:u16, out_prev:*mut u16)->i32
+narf_dma_alloc_mapped(dev:u64, len:usize, addr_bits:u32, out_cpu:*mut usize, out_bus:*mut u64, out_len:*mut usize)->u64
+```
+
+- **Identity** is a fixed 16-byte little-endian record (vendor, device,
+  subsystem vendor/device, revision, 24-bit class, segment, bus, devfn).
+  Board-data names and calibration files key on it, and a driver that
+  registers one probe for several device ids learns which one it got.
+- **Plain MSI** programs exactly `want` vectors (a power of two, ≤ 32) as
+  one aligned kernel block, leaves delivery disabled and returns the block's
+  first vector with the Message Address and vector 0's Message Data — a
+  device that programs its own interrupt sources (ath11k writes `addr` and
+  `data + i` into SRNG/CE registers) needs both. A smaller grant is a
+  different interrupt layout, so it is refused with `-ENOSPC` and the module
+  asks again with fewer. Each vector takes `narf_irq_set_handler` like an
+  MSI-X claim; the hard handler is the same accounting stub. MSI and MSI-X are
+  exclusive per context (`-EBUSY`). Teardown clears MSI Enable before
+  detaching handlers and freeing the block.
+- **ASPM** writes only Link Control bits 1:0 and returns the previous field;
+  there is still no general config-space write.
+- **Mapped DMA** is `narf_dma_alloc` under an address limit with the CPU
+  mapping returned (see "DMA safety"). Handles share the `narf_dma_*`
+  namespace and are still never reused, so a driver that allocates per packet
+  pools large mapped buffers itself.
+
+Runtime services added with them, not tied to a device:
+
+```text
+narf_udelay(ns:u64)->i32                                   // 1 ns..=1 s, sleep pumps keep ticking
+narf_random_bytes(buf:*mut u8, len:usize)->i32             // ≤ 4096; -EAGAIN when no healthy source
+narf_smbios_read(off:usize, buf:*mut u8, len:usize, out_total:*mut usize)->i32
+narf_firmware_signed(handle:u64)->i32                      // 1 signed / 0 unsigned
+narf_module_param(name:*const u8, name_len:usize, out:*mut u8, cap:usize, out_len:*mut usize)->i32
+```
+
+`narf_module_param` serves the module's `.narf_kparams` slots after the loader
+applied `<module>.<param>=` from the kernel command line and then the load's
+own arguments (`modules/MODULE_AUTHORING.md`, "Module parameters").
 
 ## Wireless copy-mode host services
 
@@ -383,34 +442,47 @@ late cap revocation, teardown ordering, native-future cancellation and wire
 bounds are implemented. Their execution and dual module builds remain pending
 in the final coordinated validation pass; no RF acceptance is implied.
 
-WIFI family `0x77696669`, version 1 (generic host, `narf-wireless`), uses
-the following little-endian records. All reserved fields must be zero;
-input length must match exactly. One session per probe device (unlike the
-mt76 single-session host); one retained operation per session; the same
-cancellation contract as MT76 (unstarted work drops with `-ECANCELED`,
-started work is retained to terminal completion, a cancelled-but-successful
-operation reports `-EALREADY`). `open_with_event` registers the per-session
-event callback for native→module control-plane events; a plain open has no
-event channel. The callback is invoked only through the bus call gate and
-forgotten on close or device retirement.
+WIFI family `0x77696669`, **version 2** (generic host, `narf-wireless`),
+uses the following little-endian records. All reserved fields must be zero;
+input length must match exactly. One session per probe device; one retained
+operation per session (every v2 opcode completes at submit, the poll only
+collects the reply); the same cancellation contract as MT76.
+`open_with_event` registers the per-session event callback for native→module
+events; a plain open has no event channel. The callback is invoked only
+through the bus call gate and forgotten on close or device retirement.
+
+A module opens its session **before** registering its netdev: the netif
+bridge names a netdev on a device with a wireless session `wlan%d`, and
+`REGISTER_WIPHY` binds the wiphy shell to it by ifindex, taking its name —
+nl80211 resolves wiphy ↔ netdev by name, so the two form one `wlan0`.
 
 | Opcode | Request | Reply |
 |---|---|---|
-|1 REGISTER_WIPHY|MAC[6], modes u32, hw_caps u8, cipher count u8<=8, band count u8 1..3, reserved u8; cipher suites u32[]; per band freq u32, channel count u8 1..64, reserved u8, channels u8[]|assigned wiphy index u32|
-|2 SCAN_RESULT|Stage 4: one scan result (BSS)|not yet served (`-EOPNOTSUPP`)|
-|3 CONNECT_RESULT|Stage 4: connect/auth outcome|not yet served (`-EOPNOTSUPP`)|
-|4 DISCONNECT|Stage 4: link-loss reason|not yet served (`-EOPNOTSUPP`)|
-|5 SET_STATE|Stage 4: op-state (parked/awake)|not yet served (`-EOPNOTSUPP`)|
+|1 REGISTER_WIPHY|ifindex u32 (the module's own netdev on this device), MAC[6], modes u32, hw_caps u8, cipher count u8<=8, band count u8 1..3, flags u8, max scan SSIDs u8<=16, reserved u8, max scan IE len u16<=2048; cipher suites u32[]; per band freq u32, channel count u8 1..64, reserved u8, channels u8[]|assigned wiphy index u32|
+|2 SCAN_RESULT|BSSID[6], channel u8, security u8 (open/WEP/WPA/WPA2/WPA3=0..4), frequency u32, RSSI i8, reserved u8, SSID len u8<=32, reserved u8, IE len u16<=2048, SSID, IEs|empty|
+|3 SCAN_DONE|status i32 (0, or a negative errno)|empty|
+|4 CONNECT_RESULT|802.11 status u16 (0 = success), reserved u16, BSSID[6], reserved u16, frequency u32|empty; success raises carrier|
+|5 DISCONNECTED|reason u16, locally generated u8, reserved u8|empty; drops carrier, reports unsolicited loss to nl80211|
 
-Events (native→module, separate namespace): `SCAN_REQUEST = 0x01`,
-`CONNECT = 0x02`, `KEY = 0x03`, `TX_FRAME = 0x04`; payload layouts are
-specified with Stage 4. Modes are the `WirelessModes` bits
-(STATION=1, AP=2, MONITOR=4, P2P=8); `hw_caps` bits are HT=1, VHT=2, HE=4,
-EHT=8; cipher suites must be known `CIPHER_SUITE_*` values; bands must map
-to distinct wiphy bands (2.4/5/6 GHz); channels are 1..=233, unique within
-their band. The host publishes one `WirelessNetIface` shell per session
-under a unique `wlan{N}` name and unpublishes it on close. Perf class: no
-hot path (control plane only; frames never pass through the host).
+`flags` are the module's SME offloads: `PSK_OFFLOAD = 1` (4-way handshake
+from a PMK), `SAE_OFFLOAD = 2` (WPA3-SAE from a password),
+`REPORTS_DISCONNECT = 4`. The shell advertises them to nl80211, so a
+CONNECT's PMK or SAE password reaches the module's supplicant (the FullMAC
+split); a userspace SME (`SecurityConfig::External`) is refused.
+
+| Event | Payload |
+|---|---|
+|1 SCAN_REQUEST|flags u8 (bit0 active), frequency count u8, SSID count u8, reserved u8, IE len u16, reserved u16, frequencies u32[], SSIDs (len u8 + bytes)[], IEs|
+|2 CONNECT|BSSID[6] (zero = any), security u8 (open/PSK/SAE = 0..2), reserved u8, frequency u32 (0 = any), SSID len u8, reserved u8, IE len u16, secret len u16, reserved u16, SSID, IEs, secret (32-byte PMK or SAE password)|
+|3 DISCONNECT|reason u16, reserved u16|
+|4 SCAN_ABORT|empty|
+
+The callback's return is acceptance; the outcome is the matching report. The
+shell waits 15 s for `SCAN_DONE`, 20 s for `CONNECT_RESULT` and 3 s for
+`DISCONNECTED`, aborting the scan or withdrawing the connect on timeout.
+Modes are the `WirelessModes` bits (STATION=1, AP=2, MONITOR=4, P2P=8);
+`hw_caps` bits are HT=1, VHT=2, HE=4, EHT=8. Perf class: no hot path
+(control plane only; frames never pass through the host).
 
 ## USB transfer datapath
 

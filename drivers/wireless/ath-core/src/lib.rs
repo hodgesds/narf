@@ -14,6 +14,7 @@ extern crate alloc;
 
 pub mod board;
 pub mod eth;
+#[cfg(feature = "kernel")]
 pub mod qualcomm_pci;
 pub mod qualcomm_regulatory;
 pub mod wmi_nlo;

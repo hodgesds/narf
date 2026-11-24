@@ -658,7 +658,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             self.authorize().await?;
             self.setup_ps().await;
         }
-        narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
+        crate::ath11k::platform::diag::set_wifi_stage(
+            crate::ath11k::platform::diag::WifiStage::Connected,
+        );
         Ok(resp)
     }
 

@@ -170,7 +170,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
     pub(super) fn twt_add_dialog_event(&mut self, ev: TwtAddDialogEvent) {
         if ev.status != 0 {
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath11k::platform::Console,
                 "  ath11k: wmi add twt dialog event vdev {} dialog id {} status {}",
                 ev.vdev_id,
                 ev.dialog_id,

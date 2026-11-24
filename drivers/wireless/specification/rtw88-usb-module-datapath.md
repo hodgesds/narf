@@ -108,6 +108,15 @@ host lives in a native crate (candidate: `narf-wireless` or a new
 
 ## Opcode protocol (family `WIFI`, version 1) — initial set
 
+> **Superseded by version 2.** The generic host now speaks `WIFI` v2: the
+> wiphy binds to the module's `wlan%d` netdev by ifindex, and the station
+> control plane (`SCAN_RESULT`, `SCAN_DONE`, `CONNECT_RESULT`,
+> `DISCONNECTED`; events `SCAN_REQUEST`, `CONNECT`, `DISCONNECT`,
+> `SCAN_ABORT`) is implemented with in-driver SME offloads. The records
+> below are the v1 history; the current wire format is in
+> `modules/DATAPATH_ABI_DESIGN.md` ("Wireless copy-mode host services") and
+> `drivers/wireless/specification/spec.md` §4.1.
+
 Versioned, little-endian, bounded byte records. Starting set (extend by bumping
 version, never by silently repurposing an opcode):
 

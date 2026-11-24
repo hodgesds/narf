@@ -2265,56 +2265,44 @@ unrun; measured deployment assets and physical acceptance are separate gates.
 - **Handoff**: On successful probe, the framework mints a `Cap<WirelessIface, _>` and registers it with the global `IfaceRegistry` (see `net/spec` §3).
 - **Control Path**: High-level calls like `scan()` are dispatched to the driver's `WirelessDriver` implementation.
 
-### 4.1 Loadable-module family host (family `WIFI`, version 1)
+### 4.1 Loadable-module family host (family `WIFI`, version 2)
 
 The native wireless family host (`wireless/src/module_host.rs`) is the
 cfg80211 glue that makes Wi-Fi `.ko` datapaths work. It registers one
 permanent `module_wireless::Host` (family `0x7769_6669`, `"wifi"`,
-version 1) from `narf_wireless::register_initcalls` at boot, before any
+version 2) from `narf_wireless::register_initcalls` at boot, before any
 module can load. It coexists with the mt76 private family (`0x6d74_3736`,
 `"mt76"`), whose copy-mode protocol keeps native MCU/WFDMA execution in
-its own host; the generic host serves every other Wi-Fi `.ko`.
+its own host; the generic host serves every other Wi-Fi `.ko`. The wire
+records are in `modules/DATAPATH_ABI_DESIGN.md` ("Wireless copy-mode host
+services").
 
 - **Sessions.** A module opens its probe device with
-  `narf_wireless_open` (no event channel) or
-  `narf_wireless_open_with_event` (per-session event callback for native
-  cfg80211 scan/connect/key requests). One session per probe device. The
-  broker validates owner, device token, session and current probe cap on
-  every `submit` / `poll` / `cancel` / `close`; requests and replies are
-  bounded copies (`MAX_REQUEST` 4096 / `MAX_REPLY` 65536). The host
-  performs no device I/O — the module owns the chip; the host owns the
-  wiphy record.
-- **`REGISTER_WIPHY` (opcode `0x01`).** Little-endian, exact length:
-  `mac[6] | modes u32 | hw_caps u8 | cipher_count u8 | band_count u8 |
-  reserved u8`, then `cipher_count` cipher-suite `u32`s, then per band
-  `freq_mhz u32 | channel_count u8 | reserved u8 | channel_count`
-  channel `u8`s. Modes are the `WirelessModes` bits; `hw_caps` bits are
-  HT=1, VHT=2, HE=4, EHT=8; reserved bytes must be zero; ciphers must be
-  known suites, bands must map to distinct wiphy bands (2.4/5/6 GHz),
-  channels 1..=233 and unique within their band. The reply is the
-  assigned wiphy index (`u32`, little-endian). The host publishes a
-  `WirelessNetIface` shell in the wiphy registry under a unique
-  `wlan{N}` name, advertising the bands/channels through
-  `get_wireless_info` and the cipher suites through `cipher_suites`.
-  One `REGISTER_WIPHY` per session; a second fails with `-EBUSY`.
-- **Stage 4 opcodes are defined but unimplemented.** `SCAN_RESULT`
-  (`0x02`), `CONNECT_RESULT` (`0x03`), `DISCONNECT` (`0x04`) and
-  `SET_STATE` (`0x05`) report `-EOPNOTSUPP` until Stage 4 wires the
-  shell's `scan` / `associate` / `disassociate` / `set_config` to the
-  event channel. The host already carries the async-future operation
-  slot Stage 4 plugs into, so no reshape is needed.
-- **Events (native → module).** `SCAN_REQUEST` (`0x01`), `CONNECT`
-  (`0x02`), `KEY` (`0x03`), `TX_FRAME` (`0x04`), delivered through the
-  per-session callback via the bus call gate (which pins the live module
-  and enters its effective domain). The callback is forgotten when the
-  session closes or the device is retired; a plain-open session has no
-  event channel and delivery to it fails with `-ENODEV`.
-- **Stage 3 limitation.** The module registers its netdev itself via
-  `narf_netif_register_with_context`, which the bus names `eth%d`; the
-  host shell is `wlan{N}`. The shell↔netdev name binding (wifi-aware
-  netdev naming) is a follow-up, not part of the host.
-- **Perf class:** no hot path. The host runs at bring-up and at
-  scan/connect/key rates; TX/RX frames never pass through it.
+  `narf_wireless_open_with_event` (the per-session callback receives
+  native scan/connect/disconnect requests) or `narf_wireless_open` (no
+  event channel). One session per probe device. The broker validates
+  owner, device token, session and current probe cap on every call;
+  requests and replies are bounded copies. The host performs no device I/O.
+- **One `wlan0`.** The netif bridge names a netdev registered on a device
+  with a wireless session `wlan%d`. `REGISTER_WIPHY` carries that netdev's
+  ifindex (it must be this module's, on this device: `-ENODEV` otherwise)
+  and publishes the `WirelessNetIface` shell under the netdev's name, which
+  is how nl80211 binds the two.
+- **Station control plane.** The shell implements `scan` (`SCAN_REQUEST`
+  event → `SCAN_RESULT`s + `SCAN_DONE`), `associate` (`CONNECT` event →
+  `CONNECT_RESULT`), `disassociate` (`DISCONNECT` event → `DISCONNECTED`),
+  `connected_bssid`, `scan_information_elements` (IEs of every reported
+  BSS), `max_scan_ssids` / `max_scan_ie_len`, and the module's SME offloads
+  (`supports_handshake_offload`, `supports_sae_offload`,
+  `reports_disconnect_events`). Carrier follows `CONNECT_RESULT` /
+  `DISCONNECTED`; an unsolicited disconnect is reported through
+  `nl80211::notify_disconnect`. Close reports the disconnect and the
+  interface removal and unpublishes the shell.
+- **Not carried (version 2).** A userspace SME (`SecurityConfig::External`:
+  AUTHENTICATE/ASSOCIATE, control-port EAPOL, key installation) is refused;
+  so are AP/P2P/monitor roles, power save and station statistics. Those are
+  a later protocol version.
+- **Perf class:** no hot path. TX/RX frames never pass through the host.
 
 The implemented high-level control trait is `narf_wireless::WirelessNetIface`.
 The `nl80211` family bridges explicitly delegated scan/connect/disconnect

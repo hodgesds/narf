@@ -28,6 +28,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod accel;
+#[cfg(feature = "kernel")]
 pub mod pq;
 pub mod tpm;
 
@@ -47,10 +48,20 @@ pub mod cmac_aes128;
 pub mod cmac_aes256;
 pub mod curve25519;
 pub mod ed25519;
+#[cfg(feature = "kernel")]
 mod entropy;
+#[cfg(feature = "kernel")]
 pub use entropy::{
     has_hw_entropy, key_material_rng, try_fill_key_material, try_fill_random_bytes,
     try_per_task_rng,
+};
+// Kernel-free build: the same `try_fill_random_bytes`, drawing from a source
+// the embedding module installs (see `entropy_hook`).
+#[cfg(not(feature = "kernel"))]
+mod entropy_hook;
+#[cfg(not(feature = "kernel"))]
+pub use entropy_hook::{
+    has_entropy_source, install_entropy_source, try_fill_random_bytes, EntropySource,
 };
 pub mod gcm;
 pub mod hdcp;
@@ -63,17 +74,21 @@ pub mod rsaes_oaep;
 pub mod sha256;
 pub mod sha512;
 
+#[cfg(feature = "kernel")]
 mod e2e_tests;
 #[cfg(test)]
 mod primitive_tests;
+#[cfg(feature = "kernel")]
 mod tests;
 
 extern crate alloc;
 
 use core::marker::PhantomData;
 
+#[cfg(feature = "kernel")]
 use alloc::vec::Vec;
 
+#[cfg(feature = "kernel")]
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, Read};
 
 // ── Algorithm markers + Key<Alg> ─────────────────────────────────────
@@ -171,6 +186,7 @@ pub struct Key<Alg: KeyAlgorithm> {
 // All algorithms map to `CapKind::Key` — the algorithm distinction is
 // type-level, per spec §3.1's "type-parametric rule". The runtime cap
 // table needs exactly one slot per key, regardless of algorithm.
+#[cfg(feature = "kernel")]
 impl<Alg: KeyAlgorithm> CapType for Key<Alg> {
     const KIND: CapKind = CapKind::Key;
 }
@@ -202,6 +218,7 @@ pub enum CryptoError {
     EntropyUnavailable,
 }
 
+#[cfg(feature = "kernel")]
 impl From<CapError> for CryptoError {
     fn from(_: CapError) -> Self {
         CryptoError::KeyUnavailable
@@ -215,6 +232,7 @@ impl From<CapError> for CryptoError {
 // 4). Stage 3 takes the public-key bytes inline so manifest verification
 // can land alongside the cap-gated surface.
 
+#[cfg(feature = "kernel")]
 /// Verify an Ed25519 signature. The cap proves the caller is allowed to
 /// use the verify-key handle; the actual public key + message + sig
 /// arrive inline. Stage 4 promotes `verifying_key` to live behind the
@@ -244,6 +262,7 @@ pub fn ed25519_verify(
 // in-place AEAD seal/open. Stage 4 promotes `key_bytes` to live behind
 // the cap once the key-store is wired.
 
+#[cfg(feature = "kernel")]
 /// AEAD seal in place. `plaintext` is encrypted and the 16-byte
 /// Poly1305 tag is appended; final length is `plaintext.len() + 16`.
 pub fn chacha20_seal(
@@ -268,6 +287,7 @@ pub fn chacha20_seal(
         .map_err(|_| CryptoError::AeadFailure)
 }
 
+#[cfg(feature = "kernel")]
 /// AEAD open in place. `ciphertext` carries the trailing 16-byte tag;
 /// on success the tag is stripped and the buffer holds the plaintext.
 /// On tag-mismatch the buffer is left untouched and `AeadFailure` is
@@ -297,6 +317,7 @@ pub fn chacha20_open(
 
 // ── HKDF-SHA-256 ─────────────────────────────────────────────────────
 
+#[cfg(feature = "kernel")]
 /// HKDF-Expand using SHA-256. Stage-3 takes `ikm` inline; Stage 4
 /// promotes the ikm to live behind the cap.
 pub fn hkdf_expand(
@@ -327,6 +348,7 @@ pub fn hkdf_expand(
 
 // ── AES-XTS (block encryption) ──────────────────────────────────────
 
+#[cfg(feature = "kernel")]
 fn valid_xts_area(data: &[u8], sector_size: usize) -> bool {
     if sector_size < 16 || !sector_size.is_power_of_two() || data.len() < 16 {
         return false;
@@ -335,6 +357,7 @@ fn valid_xts_area(data: &[u8], sector_size: usize) -> bool {
     final_unit == 0 || final_unit >= 16
 }
 
+#[cfg(feature = "kernel")]
 /// AES-XTS-128 encryption using two 128-bit keys.
 ///
 /// `sector_id` is encoded little-endian as the Linux `plain64` tweak for the
@@ -371,6 +394,7 @@ pub fn aes_xts_128_encrypt(
     Ok(())
 }
 
+#[cfg(feature = "kernel")]
 /// AES-XTS-128 decryption; see [`aes_xts_128_encrypt`] for tweak semantics.
 pub fn aes_xts_128_decrypt(
     cap: &Cap<Key<AesXts128>, Grant>,
@@ -401,6 +425,7 @@ pub fn aes_xts_128_decrypt(
     Ok(())
 }
 
+#[cfg(feature = "kernel")]
 /// AES-XTS-256 encryption. `key_bytes` must be 64 bytes (two 256-bit keys).
 /// `sector_id` is encoded little-endian as the `plain64` tweak for the first
 /// 512-byte encryption sector; subsequent sectors increment it by one.
@@ -413,6 +438,7 @@ pub fn aes_xts_256_encrypt(
     aes_xts_256_encrypt_with_sector_size(cap, key_bytes, sector_id, 512, data)
 }
 
+#[cfg(feature = "kernel")]
 /// AES-XTS-256 encryption with an explicit data-unit size.
 pub fn aes_xts_256_encrypt_with_sector_size(
     cap: &Cap<Key<AesXts256>, Grant>,
@@ -446,6 +472,7 @@ pub fn aes_xts_256_encrypt_with_sector_size(
     Ok(())
 }
 
+#[cfg(feature = "kernel")]
 /// AES-XTS-256 decryption. `key_bytes` must be 64 bytes (two 256-bit keys).
 /// `sector_id` is encoded little-endian as the `plain64` tweak for the first
 /// 512-byte encryption sector; subsequent sectors increment it by one.
@@ -458,6 +485,7 @@ pub fn aes_xts_256_decrypt(
     aes_xts_256_decrypt_with_sector_size(cap, key_bytes, sector_id, 512, data)
 }
 
+#[cfg(feature = "kernel")]
 /// AES-XTS-256 decryption with an explicit data-unit size.
 pub fn aes_xts_256_decrypt_with_sector_size(
     cap: &Cap<Key<AesXts256>, Grant>,

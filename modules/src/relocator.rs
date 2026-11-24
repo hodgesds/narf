@@ -14,13 +14,17 @@
 //! kernel export declares a `required_cap`, the module must
 //! list that CapKind in its manifest.
 
-use crate::elf::reloc::{R_AARCH64_CALL26, R_AARCH64_JUMP26};
+use crate::elf::reloc::{
+    R_AARCH64_CALL26, R_AARCH64_JUMP26, R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX,
+    R_X86_64_REX_GOTPCRELX,
+};
 use crate::elf::{
     apply_aarch64, apply_x86_64, parse_rela, parse_section, section_name, Elf64Header, RelocError,
     SymbolTable, EM_AARCH64, EM_X86_64,
 };
 use core::fmt::Write as _;
 
+use crate::got::Got;
 use crate::manifest::Manifest;
 use crate::plt::Plt;
 use crate::symbols::{resolve, ResolveError};
@@ -38,6 +42,9 @@ pub struct RelocContext<'a> {
     /// is inside PC32 range of every kernel symbol by construction — see
     /// `crate::plt`.
     pub plt: Option<&'a mut Plt>,
+    /// x86_64 GOT arena for `GOTPCREL`-family relocations. `None` for an
+    /// aarch64 image, or an x86_64 one that has none — see `crate::got`.
+    pub got: Option<&'a mut Got>,
     /// Modules this image resolved a symbol from, deduplicated. The kernel's
     /// own exports are excluded — it never unloads. The loader takes a
     /// reference on each of these so a provider cannot be unloaded out from
@@ -64,6 +71,11 @@ pub enum RelocatorError {
     /// either the arena the layout pass sized is full, or the target is
     /// beyond ADRP's reach. Both mean the module cannot be relocated.
     PltExhausted(alloc::string::String),
+    /// An x86_64 `GOTPCREL`-family relocation had no GOT slot: the arena the
+    /// layout pass sized is missing or full. Patching the displacement at the
+    /// symbol instead would make the instruction load a pointer from the
+    /// symbol's own bytes, so the load fails.
+    GotExhausted(alloc::string::String),
 }
 
 /// Per-section layout — where the loader put one section in the module
@@ -217,6 +229,26 @@ pub fn apply_one_rela_section(
             } else {
                 (sym_value, r.r_addend)
             }
+        } else if hdr.e_machine == EM_X86_64
+            && matches!(
+                r.ty(),
+                R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX
+            )
+        {
+            // The instruction loads `S` from a GOT slot, so the displacement
+            // targets the slot: `G + GOT + A - P`. The slot holds the symbol
+            // value without the addend — the addend belongs to the
+            // instruction's own displacement (normally -4).
+            let name = symbols.name(&sym);
+            let got = ctx
+                .got
+                .as_deref_mut()
+                .ok_or_else(|| RelocatorError::GotExhausted(name.into()))?;
+            // SAFETY: relocation runs before `module_text::protect` seals the
+            // read-only region, so the arena is still mapped writable.
+            let slot = unsafe { got.slot_for(sym_value) }
+                .ok_or_else(|| RelocatorError::GotExhausted(name.into()))?;
+            (slot, r.r_addend)
         } else {
             (sym_value, r.r_addend)
         };

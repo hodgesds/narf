@@ -5,11 +5,13 @@
 //! `drivers/wireless/ath10k/` and `drivers/wireless/iwlwifi/` for the reference
 //! dual-build shape.
 //!
-//! ath11k is multi-bus: the real driver in [`ath11k`] binds QCA6390/WCN6855/
-//! QCN9074 over PCIe and IPQ8074/6018/5018 + WCN6750 over AHB/Devicetree. The
-//! `module` build registers BOTH — the PCI ids through `narf_register_pci_driver`
-//! and the AHB DT compatibles through `narf_register_dt_driver` — with a probe
-//! thunk that returns `-ENOSYS` (registration-only proof).
+//! ath11k is multi-bus: built in, the driver in [`ath11k`] binds
+//! QCA6390/WCN6855/QCN9074 over PCIe and IPQ8074/6018/5018 + WCN6750 over
+//! AHB/Devicetree. The `module` build is the same driver running inside the
+//! `.ko` for WCN6855 over PCIe: it registers the PCI id through
+//! `narf_register_pci_driver` and drives the card through the KABI (BAR
+//! access, plain MSI, mapped DMA, firmware), with its netdev and wiphy
+//! published through the netif bridge and the `WIFI` family host.
 //!
 //! ## Hardware validation is gated
 //!
@@ -20,7 +22,6 @@
 #![no_std]
 #![allow(dead_code)]
 
-#[cfg(feature = "builtin")]
 extern crate alloc;
 
 use narf_driver_macros::narf_driver;
@@ -31,11 +32,10 @@ use narf_driver_macros::narf_driver;
 #[cfg(feature = "builtin")]
 pub(crate) use narf_drivers_wireless_core::firmware_asset;
 
-#[cfg(feature = "builtin")]
+/// The driver. One source tree in both builds: kernel services come from
+/// [`ath11k::platform`], which is the kernel's crates built in and
+/// `narf-module-rt` + the KABI in the `.ko`.
 pub mod ath11k;
-
-#[cfg(feature = "module")]
-mod module_probe;
 
 narf_driver! {
     name: "ath11k",
@@ -45,7 +45,7 @@ narf_driver! {
         author: "narf",
         description: "Qualcomm ath11k Wi-Fi 6 (PCIe + IPQ AHB)",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write,Firmware:Read",
     },
     register: do_register,
 }
@@ -55,7 +55,16 @@ fn do_register() {
     ath11k::register();
 }
 
+/// The autoconnect bring-up aid's `ath11k.ssid=` / `ath11k.psk=` /
+/// `ath11k.passphrase=` / `ath11k.scan=` ([`ath11k::autoconnect`]), declared
+/// so the loader applies them from the kernel command line (and the load's
+/// own arguments) before init. Empty = not given.
+#[cfg(feature = "module")]
+#[used]
+#[link_section = ".narf_kparams"]
+static KPARAMS: [u8; 29] = *b"ssid=\npsk=\npassphrase=\nscan=\n";
+
 #[cfg(feature = "module")]
 fn do_register() {
-    module_probe::register();
+    ath11k::register_module();
 }

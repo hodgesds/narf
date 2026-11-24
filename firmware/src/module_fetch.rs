@@ -102,6 +102,21 @@ pub fn size_of(owner: u64, handle: u64) -> Result<usize, i32> {
         .ok_or(EBADF)
 }
 
+/// Whether `handle`'s blob carries a verified signer. The built-in drivers
+/// refuse unsigned board/regulatory data (`firmware_asset::load(.., signer:
+/// true)`); a module needs the same fact to apply the same policy.
+pub fn signed(owner: u64, handle: u64) -> Result<bool, i32> {
+    let blob = {
+        let bindings = BINDINGS.lock();
+        bindings
+            .iter()
+            .find(|b| b.owner == owner && b.handle == handle)
+            .map(|b| b.blob)
+            .ok_or(EBADF)?
+    };
+    Ok(crate::view_of(&blob).map_err(errno)?.signer.is_some())
+}
+
 /// Release one handle. `-EBADF` when the owner holds no such handle.
 pub fn close(owner: u64, handle: u64) -> i32 {
     let mut bindings = BINDINGS.lock();

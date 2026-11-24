@@ -2840,6 +2840,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-module-rt",
  "narf-net",
  "narf-power",
  "narf-scheduler",
@@ -3524,6 +3525,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-module-rt"
+version = "0.0.0"
+
+[[package]]
+name = "narf-module-rt-smoke"
+version = "0.0.0"
+dependencies = [
+ "narf-module-rt",
+]
+
+[[package]]
 name = "narf-modules"
 version = "0.0.0"
 dependencies = [
@@ -3536,6 +3548,7 @@ dependencies = [
  "narf-crypto",
  "narf-filesystem",
  "narf-firmware",
+ "narf-firmware-smbios",
  "narf-init",
  "narf-initramfs",
  "narf-kernel-test",

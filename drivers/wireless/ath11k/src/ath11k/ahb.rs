@@ -29,7 +29,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[cfg(feature = "builtin")]
 use narf_drivers_qcom_soc::dt::{self, DtError, PlatformDevice};
+#[cfg(feature = "builtin")]
 use narf_drivers_qcom_soc::platform::{self, Q6Platform, RprocKind};
 
 use super::ce::{CeAttr, CeRecv, CeSend, CE_ATTR_DIS_INTR, CE_ATTR_FLAGS};
@@ -726,6 +728,7 @@ pub const fn smp2p_power_save_value(seq_no: u16, msg: PowerSaveMsg) -> u32 {
 /// and [`AhbIo`] routes offsets at or above it to the CE mapping.
 pub const AHB_CE_WINDOW_OFFSET: u32 = 0x4000_0000;
 
+#[cfg(feature = "builtin")]
 /// `ath11k_ahb_read32`/`write32` (IPQ: `ab->mem + offset`, CE offsets via
 /// `ab->mem_ce`) and `ath11k_ahb_window_{read,write}32_wcn6750` (static
 /// windows). For WCN6750 `mem` is the BAR the QMI DEVICE_INFO response
@@ -738,6 +741,7 @@ pub struct AhbIo<R: narf_drivers_qcom_soc::io::RegIo> {
     pub window: Option<&'static HalRegs>,
 }
 
+#[cfg(feature = "builtin")]
 impl<R: narf_drivers_qcom_soc::io::RegIo> AhbIo<R> {
     /// The `ATH11K_CE_OFFSET` this mapping implies.
     pub fn ce_offset(&self) -> u32 {
@@ -761,6 +765,7 @@ impl<R: narf_drivers_qcom_soc::io::RegIo> AhbIo<R> {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl<R: narf_drivers_qcom_soc::io::RegIo> super::power::ChipIo for AhbIo<R> {
     fn read32(&self, offset: u32) -> u32 {
         let (r, o) = self.route(offset);
@@ -812,6 +817,7 @@ pub fn ce_irqs_set(io: &impl super::power::ChipIo, p: &AhbHwParams, ce_offset: u
 
 // ── resources ──────────────────────────────────────────────────────
 
+#[cfg(feature = "builtin")]
 /// Probe failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AhbError {
@@ -829,12 +835,14 @@ pub enum AhbError {
     Failed(i32),
 }
 
+#[cfg(feature = "builtin")]
 impl From<DtError> for AhbError {
     fn from(e: DtError) -> Self {
         AhbError::Dt(e)
     }
 }
 
+#[cfg(feature = "builtin")]
 /// WCN6750 hybrid-bus MSI (`ath11k_ahb_setup_msi_resources`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HybridMsi {
@@ -846,6 +854,7 @@ pub struct HybridMsi {
     pub irqs: Vec<u32>,
 }
 
+#[cfg(feature = "builtin")]
 /// Everything `ath11k_ahb_probe` reads from the devicetree.
 #[derive(Clone, Debug)]
 pub struct AhbResources {
@@ -868,6 +877,7 @@ pub struct AhbResources {
     pub wlan_smp2p_out: Option<(String, String, u32)>,
 }
 
+#[cfg(feature = "builtin")]
 /// Every AHB WiFi node in the tree with its chip.
 pub fn find_ahb_devices(blob: &[u8]) -> Vec<(PlatformDevice, AhbChip)> {
     let mut out = Vec::new();
@@ -881,6 +891,7 @@ pub fn find_ahb_devices(blob: &[u8]) -> Vec<(PlatformDevice, AhbChip)> {
     out
 }
 
+#[cfg(feature = "builtin")]
 /// `ath11k_ahb_probe`'s resource half.
 pub fn probe_resources(blob: &[u8], node: &PlatformDevice) -> Result<AhbResources, AhbError> {
     let chip = AhbChip::from_compatible(&node.compatible).ok_or(AhbError::Unsupported)?;
@@ -959,6 +970,7 @@ pub fn probe_resources(blob: &[u8], node: &PlatformDevice) -> Result<AhbResource
     Ok(res)
 }
 
+#[cfg(feature = "builtin")]
 /// `ath11k_core_get_rproc`: the remote processor behind `qcom,rproc`,
 /// resolved to its loader resources.
 #[derive(Clone, Debug)]
@@ -966,6 +978,7 @@ pub struct AhbRemote {
     pub platform: Q6Platform,
 }
 
+#[cfg(feature = "builtin")]
 impl AhbRemote {
     pub fn resolve(blob: &[u8], res: &AhbResources) -> Result<Self, AhbError> {
         let platform = platform::q6_platform(blob, res.rproc_phandle)?;

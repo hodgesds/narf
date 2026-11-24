@@ -66,6 +66,16 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 /// Register one permanent host per family. A replacement cannot silently
 /// change the implementation or protocol underneath existing sessions.
+/// Whether module `owner` holds a wireless session on device `token`. A
+/// netdev the module registers for such a device is a Wi-Fi interface, so the
+/// netif bridge names it `wlan%d` (and the family host binds its wiphy to it).
+pub(crate) fn has_session(owner: u64, token: u64) -> bool {
+    BINDINGS
+        .lock()
+        .iter()
+        .any(|binding| binding.owner == owner && binding.token == token)
+}
+
 pub fn register(host: &'static Host) -> Result<(), i32> {
     let mut hosts = HOSTS.lock();
     if let Some(old) = hosts.iter().find(|old| old.family == host.family) {

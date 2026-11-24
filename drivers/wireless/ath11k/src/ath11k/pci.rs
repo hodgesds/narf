@@ -42,16 +42,26 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
+#[cfg(feature = "builtin")]
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+#[cfg(feature = "builtin")]
 use narf_capabilities::{Cap, Write};
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::diag::{self, WifiStage};
+
+// The module build's PCI binding: same names (`NativeIo`, `MmioRegion`,
+// `MsiState`, `Ath11kDevice`, probe/registration, MSI and ASPM control)
+// over the KABI. Everything else in this file is shared.
+#[cfg(feature = "module")]
+#[path = "pci_kabi.rs"]
+mod kabi_binding;
+use crate::ath11k::platform::diag::{self, WifiStage};
+use crate::ath11k::platform::IrqSafeSpinLock;
+#[cfg(feature = "module")]
+pub use kabi_binding::*;
 
 use super::fw::{FwApi, ATH11K_FW_API2_FILE};
-use super::hw::{
-    self, name_for, refine_hw_rev, ChipInfo, HwParams, HwRev, ALL_DEV_IDS, MSI_CONFIG_ONE,
-    QCOM_VENDOR,
-};
+use super::hw::{self, refine_hw_rev, ChipInfo, HwParams, HwRev, MSI_CONFIG_ONE, QCOM_VENDOR};
+#[cfg(feature = "builtin")]
+use super::hw::{name_for, ALL_DEV_IDS};
 use super::mhi::{self, ATH11K_AMSS_FILE};
 use super::mhi_host::{
     self, ControllerParams, HifPower, MhiBus, MhiController, MhiError, MhiNotify,
@@ -59,7 +69,7 @@ use super::mhi_host::{
 use super::power::{self, ChipIo, PowerUpReport};
 use super::wlfw::{self, WlfwConfig};
 
-/// Failing-step codes latched into `narf_memory::diag` (shown on the
+/// Failing-step codes latched into `crate::ath11k::platform::diag` (shown on the
 /// framebuffer status panel as `wifi: <stage> FAILED step=N`).
 pub mod step {
     pub const BAR0_MAP: u32 = 1;
@@ -145,6 +155,7 @@ pub(super) fn validate_runtime_profile(hw_rev: HwRev) -> Result<(), ProbeError> 
     }
 }
 
+#[cfg(feature = "builtin")]
 /// MSI vectors granted to the chip. The chip itself is told
 /// `addr` + `ep_base_data + base_vector` per user (MHI, CE, DP) in
 /// later bring-up phases, so these must match what was programmed.
@@ -162,6 +173,7 @@ pub struct MsiState {
     pub ep_base_data: u32,
 }
 
+#[cfg(feature = "builtin")]
 /// One bound ath11k device. Holds the BAR0 mapping + the hw_rev
 /// derived from the TCSR version registers.
 pub struct Ath11kDevice {
@@ -180,6 +192,7 @@ pub struct Ath11kDevice {
     pub power: PowerUpReport,
 }
 
+#[cfg(feature = "builtin")]
 /// The exact PCI binding retained through MHI, CE and DP. Raw mappings
 /// alone never prove current access authority.
 #[derive(Copy, Clone, Debug)]
@@ -191,6 +204,7 @@ pub struct NativeIo {
     /// range takes window 2 (UMAC/DP: window 3).
     static_window: Option<&'static super::hw::HalRegs>,
 }
+#[cfg(feature = "builtin")]
 impl NativeIo {
     fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, narf_capabilities::CapError> {
         narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&self.cap, operation)
@@ -280,11 +294,7 @@ impl ChipIo for Bar0Io<'_> {
         self.0.write(offset, value, false)
     }
     fn delay_ms(&self, ms: u32) {
-        let deadline = narf_time::Deadline::after_ms(ms as u64);
-        narf_scheduler::responsive_spin_until(
-            || deadline.expired(),
-            narf_time::Deadline::after_ms(ms as u64 + 1),
-        );
+        crate::ath11k::platform::delay_ms(ms);
     }
     fn restore_window(&self) {
         // SAFETY: as `read32`.
@@ -298,9 +308,9 @@ pub static MSI_FIRES: AtomicU64 = AtomicU64::new(0);
 
 /// Vectors not yet claimed by a subsystem (CE / WAKE / DP until those
 /// phases land).
-fn msi_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
+fn msi_irq(_cookie: u64) -> crate::ath11k::platform::irq::IrqStatus {
     MSI_FIRES.fetch_add(1, Ordering::Relaxed);
-    narf_interrupts::IrqStatus::Handled
+    crate::ath11k::platform::irq::IrqStatus::Handled
 }
 
 /// `mhi_cntrl->irq[]` indexes that fired and the MHI task has not
@@ -315,13 +325,13 @@ static MHI_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
 /// wake the MHI task, which does the work. `cookie` is the bitmask of
 /// `irq[]` indexes this vector carries (all three when MSI fell back
 /// to one shared vector).
-fn mhi_msi_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+fn mhi_msi_irq(cookie: u64) -> crate::ath11k::platform::irq::IrqStatus {
     MSI_FIRES.fetch_add(1, Ordering::Relaxed);
     MHI_IRQ_PENDING.fetch_or(cookie as u32, Ordering::AcqRel);
     if let Some(w) = MHI_WAKER.lock().take() {
         w.wake();
     }
-    narf_interrupts::IrqStatus::Handled
+    crate::ath11k::platform::irq::IrqStatus::Handled
 }
 
 /// `ath11k_mhi_get_msi`: `(irq[] count, IDT vector of irq[0], one
@@ -352,6 +362,7 @@ pub fn mhi_vector_cookie(
     }
 }
 
+#[cfg(feature = "builtin")]
 /// Tear down the CPU-vector half of a partially constructed MSI setup.
 ///
 /// `enable_msi` only discovers the capability and `program_msi` writes an
@@ -373,10 +384,10 @@ pub(super) fn teardown_msi_vectors(
         narf_interrupts::disable_irq(vector);
         match mhi_vector_cookie(config, ep_base_data, n_vectors, i) {
             Some(cookie) => {
-                let _ = narf_interrupts::remove_handler(vector, "ath11k-mhi", cookie);
+                let _ = crate::ath11k::platform::irq::remove_handler(vector, "ath11k-mhi", cookie);
             }
             None => {
-                let _ = narf_interrupts::remove_handler(vector, "ath11k", i as u64);
+                let _ = crate::ath11k::platform::irq::remove_handler(vector, "ath11k", i as u64);
             }
         }
         narf_interrupts::dispatch::clear_all_wakers(vector);
@@ -385,6 +396,7 @@ pub(super) fn teardown_msi_vectors(
     }
 }
 
+#[cfg(feature = "builtin")]
 /// Keep a vector reserved when MSI delivery cannot be proven disabled.
 ///
 /// Reusing a vector that a still-live PCI function can target is worse than
@@ -400,6 +412,7 @@ fn quarantine_msi_vectors(n_vectors: u8, base_irq: u8) {
     }
 }
 
+#[cfg(feature = "builtin")]
 /// Disable MSI delivery and return the interrupt resources owned by a failed
 /// ath11k probe.  This is deliberately usable before the controller has been
 /// published: no MHI DMA buffers exist yet, but the IRQ plumbing does.
@@ -427,7 +440,7 @@ fn teardown_msi(state: &MsiState, cap: &Cap<BusDeviceCap, Write>) {
 
 /// Resolves when an MHI vector fires or the slice ends.
 struct MhiIrqWait {
-    sleep: narf_time::SleepUntil,
+    sleep: crate::ath11k::platform::time::SleepUntil,
 }
 
 impl Future for MhiIrqWait {
@@ -488,7 +501,7 @@ impl MhiBus for Bar0Mhi {
                 let report = power::sw_reset(&io, true, l1ss.as_ref());
                 if let Some(reg) = report.l1ss_failed_reg {
                     let _ = writeln!(
-                        narf_console::Writer,
+                        crate::ath11k::platform::Console,
                         "  ath11k: warning: failed to set pcie link register {:#010x}",
                         reg
                     );
@@ -500,16 +513,18 @@ impl MhiBus for Bar0Mhi {
     }
     fn wait_irq(&self, ms: u32) -> impl Future<Output = ()> + Send {
         MhiIrqWait {
-            sleep: narf_time::SleepUntil::new(
-                narf_time::Deadline::after_ms(ms as u64).as_instant(),
+            sleep: crate::ath11k::platform::time::SleepUntil::new(
+                crate::ath11k::platform::time::Deadline::after_ms(ms as u64).as_instant(),
             ),
         }
     }
     fn sleep(&self, ms: u32) -> impl Future<Output = ()> + Send {
-        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms as u64).as_instant())
+        crate::ath11k::platform::time::SleepUntil::new(
+            crate::ath11k::platform::time::Deadline::after_ms(ms as u64).as_instant(),
+        )
     }
     fn now_ms(&self) -> u64 {
-        narf_time::wall::monotonic_ns() / 1_000_000
+        crate::ath11k::platform::time::monotonic_ns() / 1_000_000
     }
     fn random_nonzero(&self, max: u32) -> Result<u32, MhiError> {
         let mut b = [0u8; 4];
@@ -531,14 +546,14 @@ impl MhiBus for Bar0Mhi {
             _ => {}
         }
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: notify status reason {:?}",
             ev
         );
     }
     fn log(&self, args: core::fmt::Arguments<'_>) {
         use core::fmt::Write as _;
-        let _ = writeln!(narf_console::Writer, "  ath11k: {}", args);
+        let _ = writeln!(crate::ath11k::platform::Console, "  ath11k: {}", args);
     }
 }
 
@@ -553,6 +568,7 @@ pub fn mhi_ready() -> bool {
 /// The WLFW session over the running MHI controller.
 pub type Wlfw = wlfw::Wlfw<MhiController<Bar0Mhi>, wlfw::NarfFirmware, wlfw::Dma32>;
 
+#[cfg(feature = "builtin")]
 /// What `ath11k_pci_aspm_disable` / `_restore` need: the function, the
 /// Link Control saved when ASPM was disabled (`ab_pci->link_ctl`),
 /// `ATH11K_PCI_ASPM_RESTORE`, and whether more than one MSI vector was
@@ -566,8 +582,10 @@ struct AspmRestore {
     restore: bool,
 }
 
+#[cfg(feature = "builtin")]
 static ASPM_RESTORE: IrqSafeSpinLock<Option<AspmRestore>> = IrqSafeSpinLock::new(None);
 
+#[cfg(feature = "builtin")]
 /// `ath11k_pci_aspm_restore`: if `ATH11K_PCI_ASPM_RESTORE` was set
 /// (`test_and_clear_bit`), put the saved ASPM bits back.
 fn pci_aspm_restore() {
@@ -587,7 +605,7 @@ fn pci_aspm_restore() {
             )
         });
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: ASPM restored (link_ctl {:#06x}): {}",
             a.link_ctl,
             if matches!(r, Ok(Ok(_))) {
@@ -600,6 +618,7 @@ fn pci_aspm_restore() {
     *ASPM_RESTORE.lock() = Some(a);
 }
 
+#[cfg(feature = "builtin")]
 /// `ath11k_pci_aspm_disable`: save Link Control, clear L0s / L1, set
 /// `ATH11K_PCI_ASPM_RESTORE`.
 fn pci_aspm_disable() {
@@ -620,6 +639,7 @@ fn pci_aspm_disable() {
     *ASPM_RESTORE.lock() = Some(a);
 }
 
+#[cfg(feature = "builtin")]
 /// `ath11k_pci_msi_enable` / `_disable` (`ath11k_pci_msi_config`).
 fn msi_set(enable: bool) {
     with_controller(|d| {
@@ -650,7 +670,7 @@ pub fn aspm_restore() {
         None => {}
         Some(false) => {
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath11k::platform::Console,
                 "  ath11k: leaving PCI ASPM disabled to avoid MHI M2 problems"
             );
         }
@@ -665,39 +685,42 @@ const FW_WAIT_MS: u64 = 60_000;
 const FW_RETRY_MS: u64 = 500;
 
 /// One `firmware_request_nowarn(ath11k/<fw_dir>/<file>)` (`Err` =
-/// positive errno).
+/// positive errno). `signed` is the board-data rule: a verified signer.
+fn request_file(
+    loader: &crate::ath11k::platform::firmware::Loader,
+    fw_dir: &str,
+    file: &str,
+    signed: bool,
+) -> Result<alloc::vec::Vec<u8>, i32> {
+    use crate::ath11k::platform::firmware::FwError;
+    let name = alloc::format!("ath11k/{}/{}", fw_dir, file);
+    loader
+        .load(&name, 16 * 1024 * 1024, signed)
+        .map_err(|error| match error {
+            FwError::NotFound => wlfw::ENOENT,
+            FwError::NoMemory => wlfw::ENOMEM,
+            _ => wlfw::EINVAL,
+        })
+}
+
 fn request_fw(
-    auth: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    loader: &crate::ath11k::platform::firmware::Loader,
     fw_dir: &str,
     file: &str,
 ) -> Result<alloc::vec::Vec<u8>, i32> {
-    let name = alloc::format!("ath11k/{}/{}", fw_dir, file);
-    crate::firmware_asset::load(auth, &name, 16 * 1024 * 1024, false)
-        .map(|asset| asset.bytes)
-        .map_err(|error| match error {
-            narf_firmware::FirmwareError::NotFound => wlfw::ENOENT,
-            narf_firmware::FirmwareError::OutOfMemory => wlfw::ENOMEM,
-            _ => wlfw::EINVAL,
-        })
+    request_file(loader, fw_dir, file, false)
 }
 
 fn request_board_fw(
-    auth: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    loader: &crate::ath11k::platform::firmware::Loader,
     fw_dir: &str,
     file: &str,
 ) -> Result<(), i32> {
-    let name = alloc::format!("ath11k/{}/{}", fw_dir, file);
-    crate::firmware_asset::load(auth, &name, 16 * 1024 * 1024, true)
-        .map(|_| ())
-        .map_err(|error| match error {
-            narf_firmware::FirmwareError::NotFound => wlfw::ENOENT,
-            narf_firmware::FirmwareError::OutOfMemory => wlfw::ENOMEM,
-            _ => wlfw::EINVAL,
-        })
+    request_file(loader, fw_dir, file, true).map(|_| ())
 }
 
 fn try_load_firmware_bundle(
-    auth: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
+    auth: &crate::ath11k::platform::firmware::Loader,
     fw_dir: &str,
     reported: &mut bool,
 ) -> Result<(alloc::vec::Vec<u8>, FwApi, bool), (&'static str, i32)> {
@@ -708,7 +731,7 @@ fn try_load_firmware_bundle(
         // still succeeds, with api 1.
         *reported = true;
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: ath11k/{}/{}: {:?} (-{}), using fw api 1",
             fw_dir,
             ATH11K_FW_API2_FILE,
@@ -749,32 +772,31 @@ fn try_load_firmware_bundle(
 /// MHI power-up so partial staging does not boot AMSS without QMI assets.
 async fn load_firmware(fw_dir: &str) -> Result<(alloc::vec::Vec<u8>, FwApi), MhiError> {
     use core::fmt::Write as _;
-    let start = narf_time::wall::monotonic_ns() / 1_000_000;
+    let start = crate::ath11k::platform::time::monotonic_ns() / 1_000_000;
     let mut reported = false;
     loop {
-        let auth = match narf_firmware::trusted_loader_authority() {
-            Some(root) => match root.derive() {
-                Ok(auth) => Some(auth),
-                Err(_) => {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  ath11k: revoked firmware authority for ath11k/{}",
-                        fw_dir
-                    );
-                    return Err(MhiError::new(
-                        mhi_host::step::FW_NOT_FOUND,
-                        1,
-                        mhi_host::errno::EIO,
-                    ));
-                }
-            },
-            None => None,
+        use crate::ath11k::platform::firmware::{FwError, Loader};
+        let auth = match Loader::new() {
+            Ok(loader) => Some(loader),
+            Err(FwError::NoAuthority) => None,
+            Err(_) => {
+                let _ = writeln!(
+                    crate::ath11k::platform::Console,
+                    "  ath11k: revoked firmware authority for ath11k/{}",
+                    fw_dir
+                );
+                return Err(MhiError::new(
+                    mhi_host::step::FW_NOT_FOUND,
+                    1,
+                    mhi_host::errno::EIO,
+                ));
+            }
         };
         if let Some(auth) = auth {
             match try_load_firmware_bundle(&auth, fw_dir, &mut reported) {
                 Ok((img, api, true)) => {
                     let _ = writeln!(
-                        narf_console::Writer,
+                        crate::ath11k::platform::Console,
                         "  ath11k: firmware ath11k/{}/{} (fw api 2: amss {} bytes, m3 {} bytes)",
                         fw_dir,
                         ATH11K_FW_API2_FILE,
@@ -785,7 +807,7 @@ async fn load_firmware(fw_dir: &str) -> Result<(alloc::vec::Vec<u8>, FwApi), Mhi
                 }
                 Ok((bytes, api, false)) => {
                     let _ = writeln!(
-                        narf_console::Writer,
+                        crate::ath11k::platform::Console,
                         "  ath11k: firmware ath11k/{}/{} ({} bytes, fw api {})",
                         fw_dir,
                         ATH11K_AMSS_FILE,
@@ -795,10 +817,10 @@ async fn load_firmware(fw_dir: &str) -> Result<(alloc::vec::Vec<u8>, FwApi), Mhi
                     return Ok((bytes, api));
                 }
                 Err((file, e)) => {
-                    let now = narf_time::wall::monotonic_ns() / 1_000_000;
+                    let now = crate::ath11k::platform::time::monotonic_ns() / 1_000_000;
                     if e != wlfw::ENOENT || now.saturating_sub(start) >= FW_WAIT_MS {
                         let _ = writeln!(
-                            narf_console::Writer,
+                            crate::ath11k::platform::Console,
                             "  ath11k: firmware ath11k/{}/{} not ready (-{})",
                             fw_dir,
                             file,
@@ -813,10 +835,10 @@ async fn load_firmware(fw_dir: &str) -> Result<(alloc::vec::Vec<u8>, FwApi), Mhi
                 }
             }
         } else {
-            let now = narf_time::wall::monotonic_ns() / 1_000_000;
+            let now = crate::ath11k::platform::time::monotonic_ns() / 1_000_000;
             if now.saturating_sub(start) >= FW_WAIT_MS {
                 let _ = writeln!(
-                    narf_console::Writer,
+                    crate::ath11k::platform::Console,
                     "  ath11k: no firmware authority for ath11k/{}",
                     fw_dir
                 );
@@ -827,7 +849,10 @@ async fn load_firmware(fw_dir: &str) -> Result<(alloc::vec::Vec<u8>, FwApi), Mhi
                 ));
             }
         }
-        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(FW_RETRY_MS).as_instant()).await;
+        crate::ath11k::platform::time::SleepUntil::new(
+            crate::ath11k::platform::time::Deadline::after_ms(FW_RETRY_MS).as_instant(),
+        )
+        .await;
     }
 }
 
@@ -865,7 +890,7 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
         ctrl.prepare_for_power_up()?;
         let (bhi, bhie) = ctrl.bhi_offsets();
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: mhi: BHI at {:#x}, BHIe at {:#x}, timeout {} ms",
             bhi,
             bhie,
@@ -892,7 +917,7 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
     }
     let st = ctrl.stats;
     let _ = writeln!(
-        narf_console::Writer,
+        crate::ath11k::platform::Console,
         "  ath11k: mhi: mission mode, IPCR ch20/21 started; irqs {:?} events {:?} \
          events-without-msi {} serial {:#x}",
         st.irqs,
@@ -902,7 +927,7 @@ async fn mhi_bring_up(s: MhiStart) -> Result<(MhiController<Bar0Mhi>, FwApi), Mh
     );
     if st.events_without_irq != 0 {
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: warning: MHI events arrived without MSI; running on polling"
         );
     }
@@ -951,7 +976,7 @@ pub async fn mhi_task(s: MhiStart) {
             abort_unowned_mhi_bring_up(s);
             diag::latch_wifi_error(e.step, e.detail);
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath11k::platform::Console,
                 "  ath11k: MHI bring-up failed: step {} detail {:#x} (-{})",
                 e.step,
                 e.detail,
@@ -970,7 +995,7 @@ fn wlfw_fail(e: wlfw::WlfwError) {
     use core::fmt::Write as _;
     diag::latch_wifi_error(e.step, e.detail);
     let _ = writeln!(
-        narf_console::Writer,
+        crate::ath11k::platform::Console,
         "  ath11k: QMI handshake failed: step {} detail {:#x} (-{})",
         e.step,
         e.detail,
@@ -997,15 +1022,21 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
     // then `ath11k_core_check_dt` on the function's Devicetree node
     // (`pci_set_of_node`), whose variant replaces it. The same node's
     // `memory-region` sets `ATH11K_FLAG_FIXED_MEM_RGN` (`ath11k_pci_probe`).
-    let (domain, bus, slot, function) = s.pci_addr;
-    let dt = narf_bus::devices()
-        .into_iter()
-        .find(|d| {
-            matches!(d.kind, narf_bus::BusKind::Pcie { addr, .. }
-                if (addr.segment, addr.bus, addr.device, addr.function)
-                    == (domain, bus, slot, function))
-        })
-        .and_then(|d| super::board::dt_facts(&d));
+    #[cfg(feature = "builtin")]
+    let dt = {
+        let (domain, bus, slot, function) = s.pci_addr;
+        narf_bus::devices()
+            .into_iter()
+            .find(|d| {
+                matches!(d.kind, narf_bus::BusKind::Pcie { addr, .. }
+                    if (addr.segment, addr.bus, addr.device, addr.function)
+                        == (domain, bus, slot, function))
+            })
+            .and_then(|d| super::board::dt_facts(&d))
+    };
+    // A module has no Devicetree view; PCI Wi-Fi on x86 laptops has none.
+    #[cfg(feature = "module")]
+    let dt: Option<super::board::DtFacts> = None;
     let bdf_ext = super::board::bdf_ext(super::board::check_smbios().bdf_ext, dt.as_ref());
     let Some(cfg) = WlfwConfig::pci(
         s.hw_rev,
@@ -1038,7 +1069,7 @@ async fn wlfw_bring_up(ctrl: MhiController<Bar0Mhi>, s: MhiStart, api: FwApi) {
         Ok(info) => {
             let st = w.client.stats;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath11k::platform::Console,
                 "  ath11k: qmi: FW_READY chip_id {:#x} board_id {:#x} soc_id {:#x} \
                  board {:?} regdb {:?} m3 {:#x}+{} target_mem {} seg (delayed {}) \
                  qrtr rx {} tx {} bad {}",
@@ -1083,6 +1114,7 @@ impl core::fmt::Debug for Ath11kDevice {
 /// part.
 static CONTROLLER: IrqSafeSpinLock<Option<Ath11kDevice>> = IrqSafeSpinLock::new(None);
 
+#[cfg(feature = "builtin")]
 /// Register every supported PCI device id with the bus driver
 /// match table. Mirrors the shape of Linux's
 /// `ath11k_pci_id_table`.
@@ -1099,6 +1131,7 @@ pub fn register_pci_driver() {
     }
 }
 
+#[cfg(feature = "builtin")]
 /// Probe entry called by `narf-bus::driver_match` when one of our
 /// vendor/device pairs surfaces.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1128,7 +1161,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         let (code, detail) = error.diag_code();
         diag::latch_wifi_error(code, detail);
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: {}: {:?}",
             chip.display_name,
             error
@@ -1182,7 +1215,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             let (code, detail) = e.diag_code();
             diag::latch_wifi_error(code, detail);
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath11k::platform::Console,
                 "  ath11k: {} ({:04x}:{:04x}) bring-up failed: {:?}",
                 chip.display_name,
                 chip.vid,
@@ -1194,7 +1227,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
 
     let _ = writeln!(
-        narf_console::Writer,
+        crate::ath11k::platform::Console,
         "  ath11k: probed {} ({:04x}:{:04x}) hw_rev={} fw=ath11k/{}",
         chip.display_name,
         chip.vid,
@@ -1204,7 +1237,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
     let p = &dev.power;
     let _ = writeln!(
-        narf_console::Writer,
+        crate::ath11k::platform::Console,
         "  ath11k: powered up: msi {}x@{} data={:#x} ltssm={:#x} hot_rst={:#x} \
          reset_cause={:#x} mhistatus={:#x} aspm_saved={:?}",
         dev.msi.n_vectors,
@@ -1219,20 +1252,20 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Linux only warns on these and carries on.
     if p.ltssm != power::PARM_LTSSM_VALUE {
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: warning: LTSSM did not settle ({:#x})",
             p.ltssm
         );
     }
     if p.link_down_after_reset {
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: warning: link down error during global reset"
         );
     }
     if let Some(reg) = p.l1ss_failed_reg {
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: warning: failed to set pcie link register {:#010x}",
             reg
         );
@@ -1275,13 +1308,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     *CONTROLLER.lock() = Some(dev);
     match start {
         Some(s) => {
-            narf_scheduler::spawn(mhi_task(s));
+            crate::ath11k::platform::spawn(mhi_task(s));
         }
         None => diag::latch_wifi_error(mhi_host::step::BAD_CONFIG, 0),
     }
     Ok(())
 }
 
+#[cfg(feature = "builtin")]
 /// Bring the chip up: map BAR0, resolve `hw_rev` from the TCSR
 /// version registers, allocate MSI, then run Linux's power-up
 /// sequence short of starting MHI.
@@ -1299,6 +1333,7 @@ pub unsafe fn bring_up(
     })
     .map_err(|_| ProbeError::PciConfiguration)?
 }
+#[cfg(feature = "builtin")]
 fn bring_up_current(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
@@ -1392,6 +1427,7 @@ fn bring_up_current(
     })
 }
 
+#[cfg(feature = "builtin")]
 /// Linux `ath11k_pci_alloc_msi`: the chip's full vector count, else
 /// one shared vector with `MSI_CONFIG_ONE`. Programs the message and
 /// installs the handler, then leaves MSI *disabled* — power-up
@@ -1441,10 +1477,15 @@ unsafe fn alloc_msi(
     for i in 0..state.n_vectors {
         let v = state.base_irq + i;
         match mhi_vector_cookie(state.config, state.ep_base_data, state.n_vectors, i) {
-            Some(cookie) => {
-                narf_interrupts::install_handler_named(v, "ath11k-mhi", cookie, mhi_msi_irq)
+            Some(cookie) => crate::ath11k::platform::irq::install_handler_named(
+                v,
+                "ath11k-mhi",
+                cookie,
+                mhi_msi_irq,
+            ),
+            None => {
+                crate::ath11k::platform::irq::install_handler_named(v, "ath11k", i as u64, msi_irq)
             }
-            None => narf_interrupts::install_handler_named(v, "ath11k", i as u64, msi_irq),
         }
     }
     // SAFETY: caller owns cfg space exclusively.
@@ -1664,6 +1705,7 @@ mod native_authority_tests {
             return TestResult::Fail("revoked ath11k probe authority reached native bring-up");
         }
         let (write, read) = narf_firmware::bootstrap_authority();
+        let read = crate::ath11k::platform::firmware::Loader::from_cap(read);
         let dir = "narf-staged-bundle";
         let mut reported = false;
         if try_load_firmware_bundle(&read, dir, &mut reported)

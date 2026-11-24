@@ -4203,10 +4203,11 @@ mod module_signature_tests {
 /// A module crate is `crate-type = ["staticlib"]`, which produces an
 /// **archive** — not a loadable object. Two things have to happen to it:
 ///
-///  1. Take only the crate's own members. The archive also contains every
-///     `core` and `compiler_builtins` object the linker might have wanted;
-///     pulling those in would produce a multi-megabyte module out of a
-///     hundred bytes of driver.
+///  1. Root the link at the crate's own members. The archive also contains
+///     every `core`, `alloc` and `compiler_builtins` object the linker might
+///     have wanted; linking all of them would produce a multi-megabyte module
+///     out of a hundred bytes of driver, so they are only offered lazily
+///     (see below).
 ///  2. `ld -r` them together. Besides combining the members, this **merges
 ///     same-named sections** — which matters more than it sounds, because
 ///     rustc emits one `.modinfo` section per `#[link_section]` static
@@ -4214,11 +4215,18 @@ mod module_signature_tests {
 ///     exactly this merge. The loader tolerates the un-merged form too, but
 ///     a `.ko` should be the merged one.
 ///
-/// A module that calls into `core` beyond what the compiler inlines will
-/// come out with undefined references that neither the kernel's KSYMTAB nor
-/// this object can satisfy, and will fail to load naming the symbol. Linking
-/// the needed `core` members in as well is the next step for that case;
-/// nothing in-tree needs it yet.
+/// A module that calls out-of-line code in `core`, `alloc`,
+/// `compiler_builtins` or a dependency crate (a kernel-free library such as
+/// `narf-module-rt`) gets that code through the archive itself: it is passed
+/// to the link *after* the crate's own members, so the linker extracts only
+/// the members that define a still-undefined symbol, transitively — the
+/// usual archive semantics, which LLD and GNU ld apply under `-r` too. A
+/// module whose only undefined symbols are KABI exports pulls nothing (no
+/// archive member defines a `narf_*` export), so its object is unchanged.
+/// The link runs with section GC rooted at every global the crate's own
+/// objects define, so of an extracted member only the sections the crate
+/// reaches survive. Anything the closure cannot satisfy is left undefined
+/// and caught by the `nm -u` gate below.
 /// Pick a linker that can do `-r` on either target's objects.
 ///
 /// The host `ld` is built for one architecture and refuses a foreign object
@@ -4380,12 +4388,31 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating module output directory {}", parent.display()))?;
     }
+    let own: Vec<PathBuf> = members.iter().map(|m| work.join(m)).collect();
+    let roots = module_defined_globals(&own)?;
     let (linker, linker_args) = module_linker(root)?;
     let mut link = Command::new(&linker);
     link.args(&linker_args).arg("-r").arg("-o").arg(&out);
-    for m in &members {
-        link.arg(work.join(m));
+    // Section GC, rooted at every global the crate's own objects define. An
+    // extracted archive member is a whole codegen unit, most of which the
+    // module never reaches — and some of which references helpers the
+    // module build deliberately omits (`compiler-builtins-no-f16-f128`
+    // leaves core's f16 conversions without `__extendhfsf2`). Discarding
+    // the unreachable sections keeps the image small and the `nm -u` gate
+    // meaningful. Sections nothing references but the loader reads —
+    // `.modinfo`, a `.narf_kparams` static — come from `#[used]` statics,
+    // which rustc emits `SHF_GNU_RETAIN`, so GC keeps them; a
+    // `.narf_kparams` attached with objcopy after the link is untouched.
+    link.arg("--gc-sections");
+    for name in &roots {
+        link.arg("-u").arg(name);
     }
+    link.args(&own);
+    // The archive last: its members are lazy, extracted only to resolve a
+    // symbol the crate's own objects (or an already-extracted member) leave
+    // undefined. This is how out-of-line `core`/`alloc`/dependency code
+    // reaches the `.ko` without dragging in the whole sysroot.
+    link.arg(&archive);
     if !link
         .status()
         .with_context(|| format!("failed to run `{linker} -r`"))?
@@ -4605,6 +4632,35 @@ fn module_undefined_symbols(ko: &Path) -> Result<Vec<String>> {
         }
     }
     bail!("could not run `nm -u` (install binutils or llvm-tools)")
+}
+
+/// The global symbols the given objects define, via `nm -g --defined-only`.
+/// These are the GC roots of a module link: everything the crate itself
+/// defines (its lifecycle entry points, probe thunks, `#[no_mangle]`
+/// globals), so only code pulled in from the archive and reachable from none
+/// of it is discarded.
+fn module_defined_globals(objects: &[PathBuf]) -> Result<Vec<String>> {
+    for nm in ["nm", "llvm-nm"] {
+        let mut cmd = Command::new(nm);
+        cmd.arg("-g").arg("--defined-only").args(objects);
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                let mut names: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    // `<addr> <type> <name>`; skip the `file.o:` headers that
+                    // multi-object output interleaves.
+                    .filter(|l| !l.trim_end().ends_with(':'))
+                    .filter_map(|l| l.split_whitespace().nth(2))
+                    .map(str::to_string)
+                    .collect();
+                names.sort();
+                names.dedup();
+                return Ok(names);
+            }
+            _ => continue,
+        }
+    }
+    bail!("could not run `nm -g --defined-only` (install binutils or llvm-tools)")
 }
 
 /// Fail the build if the `.ko` leaves any symbol undefined that is not a
@@ -5615,6 +5671,25 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
         match build_fixture(true) {
             Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko.lz4".into(), bytes)),
             Err(e) => println!("xtask: compressed test module unavailable ({e})"),
+        }
+        // A module built on `narf-module-rt`: out-of-line core/alloc code and
+        // a dependency crate, linked from the archive and section-GC'd. The
+        // `modules/e2e` runtime smoke loads it on both arches.
+        let rt_smoke = BuildModuleArgs {
+            arch: args.arch,
+            package: "narf-module-rt-smoke".into(),
+            manifest_path: None,
+            out: None,
+            features: Vec::new(),
+            no_default_features: false,
+            kernel_abi: None,
+            compress: false,
+            signature: None,
+            public_key: None,
+        };
+        match build_module(&rt_smoke, &root).and_then(|ko| Ok(std::fs::read(&ko)?)) {
+            Ok(bytes) => fixtures.push(("lib/modules/narf_module_rt_smoke.ko".into(), bytes)),
+            Err(e) => println!("xtask: runtime smoke module unavailable ({e})"),
         }
         // A real dual-build driver `.ko` for the loadable-driver e2e smoke.
         match build_module_fixture("narf-drivers-net-e1000", args.arch, &root) {
@@ -16239,7 +16314,22 @@ fn host_test_cmd() -> Result<()> {
                 // detection and command construction must remain host-safe.
                 "-p",
                 "cargo-narf",
+                // The loadable-module runtime: its executor, locks and
+                // console splitting run against host stand-ins for the KABI,
+                // so the concurrency and UTF-8 cases are checked on every
+                // push rather than only inside a booted kernel.
+                "-p",
+                "narf-module-rt",
             ],
+        ),
+        (
+            // Its own invocation: with the default `kernel` feature the crate
+            // pulls in the kernel graph and cannot build for the host, and in
+            // the shared invocation above cargo would unify that feature on.
+            // Without it this is the algorithm set a loadable module links,
+            // plus the module-installed entropy source.
+            "kernel-free narf-crypto",
+            &["test", "-p", "narf-crypto", "--no-default-features"],
         ),
         (
             "isolated login-core workspace",
