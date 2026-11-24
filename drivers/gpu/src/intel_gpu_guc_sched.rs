@@ -788,7 +788,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             wq,
             comm: None,
             pid: None,
-            snapshot_time: None,
+            snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
         })
     }
 
@@ -1859,7 +1859,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                                     engines: self.engines,
                                     process_name: None,
                                     pid: None,
-                                    snapshot_time: None,
+                                    snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
                                 },
                                 contexts,
                                 |offset| {
@@ -2377,7 +2377,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             engines: self.engines,
                             process_name: None,
                             pid: None,
-                            snapshot_time: None,
+                            snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
                         },
                         contexts,
                         |_| None,

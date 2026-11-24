@@ -121,6 +121,16 @@ pub(crate) struct Capture {
     pub pid: Option<u32>,
     pub snapshot_time: Option<(u64, u32)>,
 }
+/// `ktime_get_real` at capture: the wall clock as (seconds, nanoseconds),
+/// the devcoredump header's "Snapshot time". Before the wall clock is
+/// anchored this counts from boot.
+pub(crate) fn wall_snapshot() -> (u64, u32) {
+    let wall = (narf_time::monotonic_ns() as i64)
+        .saturating_add(narf_time::wall_offset_ns())
+        .max(0) as u64;
+    (wall / 1_000_000_000, (wall % 1_000_000_000) as u32)
+}
+
 impl Capture {
     #[allow(dead_code)]
     pub(crate) fn with_process(mut self, name: &'static str, pid: u32) -> Self {
