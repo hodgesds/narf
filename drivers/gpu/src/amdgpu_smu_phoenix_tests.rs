@@ -1,4 +1,5 @@
 use super::*;
+use crate::amdgpu_smu::{MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL};
 use alloc::{collections::VecDeque, vec, vec::Vec};
 use core::{
     future::Future,
@@ -248,15 +249,15 @@ fn smu_phoenix_vcn_jpeg_gfxoff_messages() -> TestResult {
     }
     let base = e.io.log.len();
     // Each control message writes (RESP, 0), (ARG, 0), (MSG, id).
-    if run(e.set_vcn_power(true)).is_err()
+    if run(e.started(v13::V13_MSG_POWER_UP_VCN)).is_err()
         || e.io.log.last() != Some(&(MSG, v13::V13_MSG_POWER_UP_VCN))
-        || run(e.set_vcn_power(false)).is_err()
+        || run(e.started(v13::V13_MSG_POWER_DOWN_VCN)).is_err()
         || e.io.log.last() != Some(&(MSG, v13::V13_MSG_POWER_DOWN_VCN))
-        || run(e.set_jpeg_power(true)).is_err()
+        || run(e.started(v13::V13_MSG_POWER_UP_JPEG)).is_err()
         || e.io.log.last() != Some(&(MSG, v13::V13_MSG_POWER_UP_JPEG))
-        || run(e.set_jpeg_power(false)).is_err()
+        || run(e.started(v13::V13_MSG_POWER_DOWN_JPEG)).is_err()
         || e.io.log.last() != Some(&(MSG, v13::V13_MSG_POWER_DOWN_JPEG))
-        || run(e.set_gfxoff(true)).is_err()
+        || run(e.started(v13::V13_MSG_ALLOW_GFX_OFF)).is_err()
         || e.io.log.last() != Some(&(MSG, v13::V13_MSG_ALLOW_GFX_OFF))
         || e.io.log.len() != base + 5 * 3
     {

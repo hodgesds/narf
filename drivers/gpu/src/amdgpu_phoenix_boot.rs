@@ -49,7 +49,7 @@
 use crate::amdgpu::AmdGpu;
 use crate::amdgpu_cp_navi22::{self as cp22, Doorbells};
 use crate::amdgpu_gfx::{
-    self as gfx, ComputeContext, Fence, Gfx11Sequence, GfxContext, GfxStep, SubmitError,
+    self as gfx, ComputeContext, Gfx11Sequence, GfxContext, GfxStep, SubmitError,
 };
 use crate::amdgpu_gfx11_topology::{self as topo11, Topology};
 use crate::amdgpu_gmc_navi31::{self as gmc31, Gmc};
@@ -63,7 +63,6 @@ use crate::amdgpu_smu_phoenix::{self as smu, Smu};
 use crate::amdgpu_vram::Pool;
 use crate::{amdgpu_discovery as ip, amdgpu_psp_ring::bank};
 use alloc::boxed::Box;
-use core::sync::atomic::{compiler_fence, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_driver_runtime::{alloc_coherent, DmaBuffer, DomainId};
@@ -325,15 +324,15 @@ impl PowerGating for GcPower<'_> {
         let rlc_pg_cntl = gc1 + crate::amdgpu_cp_rdna3::RLC_PG_CNTL * 4;
         let safe_mode = gc1 + RLC_SAFE_MODE * 4;
         let pg_delay_3 = gc1 + RLC_PG_DELAY_3 * 4;
-        let live_cntl = self.read(rlc_cntl)?;
-        let live_pg = self.read(rlc_pg_cntl)?;
+        let live_cntl = self.read(u64::from(rlc_cntl))?;
+        let live_pg = self.read(u64::from(rlc_pg_cntl))?;
         let rlc_on = live_cntl & crate::amdgpu_cp_rdna3::RLC_ENABLE_F32 != 0;
         let cg = gating::cg::GFX_CGCG | gating::cg::GFX_MGCG | gating::cg::GFX_3D_CGCG;
         let safe = rlc_on && (gating::PHOENIX_CG & cg) != 0;
         if safe {
             // `gfx_v11_0_set_safe_mode` (enter): CMD | (1 << MESSAGE).
-            self.write(safe_mode, 0x1 | (1 << 1))?;
-            self.poll_safe_mode_clear(safe_mode).await?;
+            self.write(u64::from(safe_mode), 0x1 | (1 << 1))?;
+            self.poll_safe_mode_clear(u64::from(safe_mode)).await?;
         }
         // `gfx_v11_cntl_power_gating`: RLC_PG_CNTL bit 0, only when enabling
         // and the PG flags carry GFX_PG.
@@ -343,14 +342,14 @@ impl PowerGating for GcPower<'_> {
         } else {
             live_pg & !0x1
         };
-        self.write(rlc_pg_cntl, want)?;
+        self.write(u64::from(rlc_pg_cntl), want)?;
         if pg_enable {
             // 11.0.1 only: RLC_PG_DELAY_3 = 0x1388.
-            self.write(pg_delay_3, RLC_PG_DELAY_3_DEFAULT_11_0_1)?;
+            self.write(u64::from(pg_delay_3), RLC_PG_DELAY_3_DEFAULT_11_0_1)?;
         }
         if safe {
-            self.write(safe_mode, 0x1)?;
-            self.poll_safe_mode_clear(safe_mode).await?;
+            self.write(u64::from(safe_mode), 0x1)?;
+            self.poll_safe_mode_clear(u64::from(safe_mode)).await?;
         }
         Ok(())
     }
@@ -569,6 +568,19 @@ pub struct PhoenixColdBoot {
     gfxoff_enabled: bool,
 }
 
+/// `AmdGpu` has no `Debug` impl, so the derived form is unavailable; the
+/// coordinator still formats its boot state for the failure path.
+impl core::fmt::Debug for PhoenixColdBoot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PhoenixColdBoot")
+            .field("state", &self.state)
+            .field("gart_ready", &self.gart_ready)
+            .field("client_vmids_lent", &self.client_vmids_lent)
+            .field("gfxoff_enabled", &self.gfxoff_enabled)
+            .finish_non_exhaustive()
+    }
+}
+
 fn is_phoenix_did(vid: u16, did: u16) -> bool {
     // Strix shares Family::Phoenix but is RDNA3.5 with its own bring-up;
     // every Phoenix owner DID-gates on these three.
@@ -678,7 +690,7 @@ impl PhoenixColdBoot {
             let ih = Rings::new(&gpu, authority, pool).map_err(Error::Interrupts)?;
             let sdma = SdmaRing::new().map_err(|e| Error::Queues(e.into()))?;
             let doorbells = Doorbells::map_phoenix(device).map_err(Error::Doorbells)?;
-            let gfx = GfxContext::new(cp22::doorbell_assignment::GFX_RING0)
+            let gfx = GfxContext::new(crate::amdgpu_ring::doorbell_assignment::GFX_RING0)
                 .map_err(|e| Error::Queues(e.into()))?;
             let compute = ComputeContext::new(0, 0, 0, 0).map_err(Error::Compute)?;
             let mes_sched = MesQueue::new(MES_FRAMES, MES_SCHED_DOORBELL_DW).map_err(Error::Mes)?;
@@ -691,17 +703,27 @@ impl PhoenixColdBoot {
             // (0x92); NBIF idx 2 is version-ungated, bounded by the doorbell
             // aperture enable (0x00c0).
             let banks = Banks {
-                gc0: bank(&gpu, ip::HW_ID_GC, &[(11, 0, 1)], 0, 0x1fb8)
-                    .map_err(|_| Error::Unsupported)?,
-                gc1: bank(&gpu, ip::HW_ID_GC, &[(11, 0, 1)], 1, 0x5b96)
-                    .map_err(|_| Error::Unsupported)?,
-                sdma0: bank(&gpu, ip::HW_ID_SDMA0, &[(6, 0, 1)], 0, 0x92)
-                    .map_err(|_| Error::Unsupported)?,
+                gc0: u32::try_from(
+                    bank(&gpu, ip::HW_ID_GC, &[(11, 0, 1)], 0, 0x1fb8)
+                        .map_err(|_| Error::Unsupported)?,
+                )
+                .map_err(|_| Error::Unsupported)?,
+                gc1: u32::try_from(
+                    bank(&gpu, ip::HW_ID_GC, &[(11, 0, 1)], 1, 0x5b96)
+                        .map_err(|_| Error::Unsupported)?,
+                )
+                .map_err(|_| Error::Unsupported)?,
+                sdma0: u32::try_from(
+                    bank(&gpu, ip::HW_ID_SDMA0, &[(6, 0, 1)], 0, 0x92)
+                        .map_err(|_| Error::Unsupported)?,
+                )
+                .map_err(|_| Error::Unsupported)?,
                 nbio: nbio_bank(&gpu)?,
             };
             let options = BootOptions::parse(narf_boot::args().raw());
             let pg_flags = gating::PHOENIX_PG & options.pg_mask;
-            let cg_flags = gating::PHOENIX_CG & u64::from(options.cg_mask);
+            // Reserved: no clock-gating owner consumes the CG mask yet.
+            let _cg_flags = gating::PHOENIX_CG & u64::from(options.cg_mask);
             Ok(Self {
                 gpu,
                 authority,
@@ -805,7 +827,7 @@ fn progress(stage: Stage, result: Option<Result<(), Error>>) {
 fn hw_segments(gpu: &AmdGpu, id: u16, versions: &[(u8, u8, u8)]) -> [u32; 5] {
     let mut out = [0u32; 5];
     for (i, slot) in out.iter_mut().enumerate() {
-        *slot = bank(gpu, id, versions, i as u32, 0)
+        *slot = bank(gpu, id, versions, i, 0)
             .ok()
             .and_then(|b| u32::try_from(b).ok())
             .unwrap_or(0);
@@ -836,12 +858,17 @@ impl PhoenixColdBoot {
             Ok(())
         })
     }
-    fn gc_power(&mut self) -> GcPower<'_> {
+    fn gc_power(
+        smu: &mut Smu,
+        banks: Banks,
+        authority: Cap<BusDeviceCap, Write>,
+        regs: MmioRegion,
+    ) -> GcPower<'_> {
         GcPower {
-            smu: &mut self.smu,
-            banks: self.banks,
-            authority: self.authority,
-            regs: self.gpu.regs,
+            smu,
+            banks,
+            authority,
+            regs,
         }
     }
 
@@ -969,7 +996,7 @@ impl PhoenixColdBoot {
             self.banks.sdma0,
             self.banks.gc1,
             self.sdma.ring.phys_addr(),
-            crate::amdgpu_ring::RING_SIZE_DW,
+            crate::amdgpu_ring::RING_SIZE_DW as u32,
             self.sdma.ring.doorbell_index_dw(),
             self.sdma.rptr_phys(),
             self.sdma.wptr_poll_phys(),
@@ -981,10 +1008,11 @@ impl PhoenixColdBoot {
             }
             Ok(())
         })?;
+        let sdma0 = self.banks.sdma0;
         let rb_cntl = self.access(|io| {
             read(
                 io,
-                u64::from(self.banks.sdma0 + crate::amdgpu_sdma::SDMA6_QUEUE0_RB_CNTL_REL),
+                u64::from(sdma0 + crate::amdgpu_sdma::SDMA6_QUEUE0_RB_CNTL_REL),
             )
         })?;
         let rb_enabled = rb_cntl & crate::amdgpu_sdma::SDMA_RB_ENABLE != 0;
@@ -1065,13 +1093,13 @@ impl PhoenixColdBoot {
         // GFX ring 0: `build_gfx11_ring_init` (selects pipe 0 via live
         // GRBM_GFX_CNTL; `mdelay(1)` before the second CP_RB0_CNTL write).
         let grbm = self.access(|io| read(io, u64::from(gc1 + meshw::GRBM_GFX_CNTL * 4)))?;
-        let doorbell_dw = u32::from(cp22::doorbell_assignment::GFX_RING0) << 1;
+        let doorbell_dw = u32::from(crate::amdgpu_ring::doorbell_assignment::GFX_RING0) << 1;
         let ring_seq = gfx::build_gfx11_ring_init(
             gc0,
             gc1,
             grbm,
             self.gfx.ring_phys(),
-            u64::from(crate::amdgpu_ring::RING_SIZE_DW) * 4,
+            (crate::amdgpu_ring::RING_SIZE_DW as u64) * 4,
             doorbell_dw,
             true,
             self.gfx.rptr_phys(),
@@ -1104,6 +1132,8 @@ impl PhoenixColdBoot {
         self.apply_sequence(&enable)?;
         // Firmware versions, per pipe (0 = not running). The reader handles
         // its own GRBM selection and restores it.
+        // SAFETY: ColdBoot holds the GPU exclusively (&mut self) during
+        // bring-up; the reader selects GRBM itself and restores it.
         let (sched, kiq) = unsafe { self.gpu.read_mes_fw_versions() }.ok_or(Error::Invalid)?;
         if !sched.is_running() || !kiq.is_running() {
             return Err(Error::Invalid);
@@ -1199,10 +1229,11 @@ impl PhoenixColdBoot {
         // Queue 0 IS the production queue (one SDMA instance), programmed
         // by SdmaTest; this stage re-verifies RB_CNTL still enabled after
         // the intervening stages and records the queue.
+        let sdma0 = self.banks.sdma0;
         let rb_cntl = self.access(|io| {
             read(
                 io,
-                u64::from(self.banks.sdma0 + crate::amdgpu_sdma::SDMA6_QUEUE0_RB_CNTL_REL),
+                u64::from(sdma0 + crate::amdgpu_sdma::SDMA6_QUEUE0_RB_CNTL_REL),
             )
         })?;
         if rb_cntl & crate::amdgpu_sdma::SDMA_RB_ENABLE == 0 {
@@ -1225,6 +1256,9 @@ impl PhoenixColdBoot {
         }
         // GFX ring test via IB.
         self.access(|io| write(io, scratch_byte, gfx::RING_TEST_SEED))?;
+        // SAFETY: the GFX ring is the coordinator's own, bound in
+        // step_gfx_setup and mapped in step_gfx_ring; this is its first
+        // submission, so none overlaps.
         let fence = unsafe {
             self.gfx
                 .submit_ib(self.ib_buf.dma_addr().raw(), packet.len() as u32)
@@ -1253,6 +1287,9 @@ impl PhoenixColdBoot {
         // Compute ring test via IB (re-seed first — both rings write the
         // same scratch register).
         self.access(|io| write(io, scratch_byte, gfx::RING_TEST_SEED))?;
+        // SAFETY: the compute ring is the coordinator's own, mapped
+        // through MES in step_compute_queues; the GFX fence completed
+        // above, so no submission overlaps.
         let cfence = unsafe {
             self.compute
                 .submit_ib(self.ib_buf.dma_addr().raw(), packet.len() as u32)
@@ -1341,7 +1378,7 @@ impl PhoenixColdBoot {
         // SAFETY: same exclusive ownership as `new`; reads GC registers and
         // the NBIO strap.
         let topology =
-            unsafe { topo11::read_phoenix(&self.gpu, self.authority) }.map_err(Error::Topology)?;
+            unsafe { topo11::read_phoenix(&self.gpu, &self.authority) }.map_err(Error::Topology)?;
         self.topology = Some(topology);
         Ok(())
     }
@@ -1355,7 +1392,7 @@ impl PhoenixColdBoot {
             return Err(Error::Busy);
         }
         // GFX is powered: the count is still 1 until the GATE below.
-        let mut hw = self.gc_power();
+        let mut hw = Self::gc_power(&mut self.smu, self.banks, self.authority, self.gpu.regs);
         let allow = self.gfxoff.gate(&mut hw).await.map_err(Error::GfxOff)?;
         schedule(allow);
         Ok(())
@@ -1365,22 +1402,26 @@ impl PhoenixColdBoot {
     /// gating off). GFX is powered on `Ok`. There is no clock-gating owner
     /// to ungate.
     pub(crate) async fn ungate_gfx(&mut self) -> Result<(), Error> {
-        let mut hw = self.gc_power();
+        let mut hw = Self::gc_power(&mut self.smu, self.banks, self.authority, self.gpu.regs);
         self.gfxoff.ungate(&mut hw).await.map_err(Error::GfxOff)
     }
     /// `amdgpu_device_delay_enable_gfx_off` for an allow this coordinator
     /// scheduled; `Ok(false)` when it was cancelled or is from a lifetime
     /// before a re-arm.
     pub(crate) async fn delayed_gfx_off(&mut self, allow: gfxoff::Allow) -> Result<bool, Error> {
-        let mut hw = self.gc_power();
+        let mut hw = Self::gc_power(&mut self.smu, self.banks, self.authority, self.gpu.regs);
         self.gfxoff
             .delayed(allow, &mut hw)
             .await
             .map_err(Error::GfxOff)
     }
     /// `amdgpu_device_prepare`'s flush of the delayed GFXOFF allow.
+    #[allow(
+        dead_code,
+        reason = "no Phoenix s0ix path calls the flush yet; prepare_graphics_s0ix flushes Raphael's coordinator"
+    )]
     pub(crate) async fn flush_gfx_off(&mut self) -> Result<bool, Error> {
-        let mut hw = self.gc_power();
+        let mut hw = Self::gc_power(&mut self.smu, self.banks, self.authority, self.gpu.regs);
         self.gfxoff.flush(&mut hw).await.map_err(Error::GfxOff)
     }
     /// Quiesce for a mode 2 reset: disable the IH rings. No client queues
