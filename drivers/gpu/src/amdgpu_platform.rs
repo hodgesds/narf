@@ -2138,10 +2138,13 @@ pub(crate) fn start() -> bool {
         {
             let mut guard = DISPLAY.lock().await;
             let display = guard.as_mut().unwrap();
-            let result = async {
+            // Boxed, like the graphics bring-up below: the PSP/DMUB boot,
+            // sink discovery and arming would otherwise make this task's
+            // own poll frame exceed the kernel stack-frame budget.
+            let result = alloc::boxed::Box::pin(async {
                 display.loader.boot(Default::default()).await?;
                 display.loader.enable_notifications().await
-            }
+            })
             .await;
             if let Err(error) = result {
                 use core::fmt::Write as _;
@@ -2198,13 +2201,13 @@ pub(crate) fn start() -> bool {
             if crate::amdgpu_usbc::begin_cycle() {
                 let result = {
                     let mut guard = DISPLAY.lock().await;
-                    guard.as_mut().unwrap().loader.discover_sinks().await
+                    alloc::boxed::Box::pin(guard.as_mut().unwrap().loader.discover_sinks()).await
                 };
                 match result {
                     Ok(found) => {
                         {
                             let mut guard = DISPLAY.lock().await;
-                            arm(guard.as_mut().unwrap(), &found).await;
+                            alloc::boxed::Box::pin(arm(guard.as_mut().unwrap(), &found)).await;
                         }
                         crate::amdgpu_usbc::publish_sinks(found);
                     }
