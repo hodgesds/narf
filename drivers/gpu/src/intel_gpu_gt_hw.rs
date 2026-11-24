@@ -763,7 +763,12 @@ impl HardwareInit {
                 3
             }
             GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
+                // xe_pat.c xelp_pat_table, multicast under the selector
+                // above: PAT0 WB (coherent), PAT1 WC, PAT2 WT, PAT3 UC.
                 mmio.write32(0x4800, 3); // Xe-LP PAT0: WB, coherent
+                mmio.write32(0x4804, 1);
+                mmio.write32(0x4808, 2);
+                mmio.write32(0x480c, 0);
                 let l3 = [0x90, 0xd0, 0x50, 0xb0];
                 for i in 0..32 {
                     let low = *l3.get(i * 2).unwrap_or(&0xb0);

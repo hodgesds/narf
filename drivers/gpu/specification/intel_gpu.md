@@ -3525,7 +3525,8 @@ allocations reserve frames/VA without writing inherited GGTT entries. Installed
 policies use MTL PAT3, DG2 PAT0 and BMG PAT2; BMG uses the Xe2 five-bit leaf
 encoding and source five-level root. MTL also installs UC PAT2 for
 non-leaf PPGTT reads and Linux's non-coherent WT PAT1 (Mesa's scanout and
-write-combining index). MTL display PAT0 is preserved.
+write-combining index). DG2 installs the rest of Linux's Xe-LP table (PAT1
+WC, PAT2 WT, PAT3 UC). MTL display PAT0 is preserved.
 MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
 
 `intel_gpu_gt_runtime` starts a persistent per-function owner from Stage::Late,
@@ -3955,8 +3956,8 @@ write-combining before publication (TTM `set_pages_array_wc`), user mmaps
 are WC, kernel copies end with SFENCE and device publication needs no
 CLFLUSH. Pages are restored write-back only after the last mapping, VM
 binding and job drop the object. SCANOUT is admitted on the iGPU and is
-EINVAL with WB caching. XE_COH_NONE binds (MTL PAT1 WT, PAT2 UC) are EINVAL
-for WB objects and USERPTR. Deviation: PAT0, also XE_COH_NONE in Linux,
+EINVAL with WB caching. XE_COH_NONE binds (MTL PAT1 WT, PAT2 UC; Gen12 and
+DG2 PAT1 WC, PAT2 WT, PAT3 UC) are EINVAL for WB objects and USERPTR. Deviation: PAT0, also XE_COH_NONE in Linux,
 stays refused because its definition is left to firmware for the inherited
 display. dGPU system memory stays WB as in Linux. aarch64 refuses WC
 creation (`NotImplemented`): the kernel's linear map cannot be retyped.
