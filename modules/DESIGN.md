@@ -554,11 +554,6 @@ asserts:
 
 ## Open questions / future phases
 
-  * **Rust `core` object inclusion.** A module using anything from `core` the compiler
-    does not inline will come out with undefined references that
-    neither KSYMTAB nor the object satisfies. Linux links the needed
-    `core` objects into each Rust module; `build_module` does not yet.
-
   * **modprobe userspace daemon.** A userspace tool that walks
     `/lib/modules/`, resolves `depends=`, and submits modules in
     the right order. Currently the kernel exposes the syscalls
