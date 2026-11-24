@@ -1536,6 +1536,15 @@ fn install_profile(
     mode: Option<crate::intel_gpu_modeset::Mode>,
     display: DisplayOwner,
 ) -> bool {
+    // Gen9/Gen11 run on execlists, as Linux does by default: i915 has no GuC
+    // submission below graphics 11 and does not enable it below 12.
+    if GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .and_then(crate::intel_gpu_legacy_gt::LegacyGt::for_platform)
+        .is_some()
+    {
+        let revision = narf_bus::pci::read_config32(&cap, &device, 0x08).map_or(0, |v| v as u8);
+        return crate::intel_gpu_legacy_owner::install(index, card, &device, revision, bar);
+    }
     if GtPlatform::from_pci(device.id.vendor, device.id.device)
         .and_then(GtPlatform::guc)
         .is_none()
@@ -1572,6 +1581,7 @@ fn install_profile(
 }
 
 pub(crate) fn start_pending() {
+    crate::intel_gpu_legacy_owner::start_pending();
     let pending = core::mem::take(&mut *PENDING.lock());
     for p in pending {
         let name = alloc::format!("intel-gt-{}", p.index);

@@ -15,10 +15,6 @@
 //! `intel_mocs_init_engine`) and `gt/intel_gt_regs.h`. Every value here is a
 //! transcription; the tests pin them against hand-expanded macro values.
 
-// The execlists owner that drives these tables lands with the Gen9/Gen11
-// render lane; until then only the tests read them.
-#![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
-
 use crate::intel_gpu_engine::Engine;
 use crate::intel_gpu_gt::GtPlatform;
 
@@ -290,6 +286,9 @@ pub(crate) const fn skip_caching_clear(gt: LegacyGt) -> bool {
     true
 }
 
+// get_mocs_settings refuses a Gen9 table that sets these bits; ours never does.
+const _: () = assert!(skip_caching_clear(LegacyGt::Gen9));
+
 // ── Workarounds (`intel_workarounds.c`) ─────────────────────────────
 
 /// The sub-platform split Linux's workaround dispatch keys on. `IS_COFFEELAKE`
@@ -447,6 +446,7 @@ impl WaList {
         self.add(reg, 0, mask << 16 | value, mask, true);
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn entries(&self) -> &[Wa] {
         &self.0
     }

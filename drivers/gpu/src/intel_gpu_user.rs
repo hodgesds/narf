@@ -868,6 +868,32 @@ impl UserContext {
     }
 }
 
+impl UserContext {
+    /// The execlists owner's claim: [`Self::claim`]'s epoch, busy and
+    /// priority discipline without a saved image. That owner keeps one
+    /// hardware context per user context rather than restoring a pooled one.
+    pub(crate) fn claim_resident(self: &Arc<Self>, epoch: u64) -> Result<ContextClaim, FsError> {
+        let mut state = self.state.lock();
+        Self::check_state_epoch(&mut state, epoch)?;
+        if state.busy || state.last.as_ref().is_some_and(|f| f.result().is_none()) {
+            return Err(FsError::WouldBlock);
+        }
+        state.busy = true;
+        let own = state.staged.take().unwrap_or(state.policy.0);
+        let behind = state
+            .queued
+            .iter()
+            .position(|count| *count != 0)
+            .map_or(own, |band| band as u32);
+        state.job_policy = (own.min(behind), state.policy.1);
+        Ok(ContextClaim {
+            context: self.clone(),
+            epoch,
+            published: false,
+        })
+    }
+}
+
 impl Drop for UserContext {
     fn drop(&mut self) {
         STATE_BYTES.fetch_sub(self.state.lock().image.len() * 4, Ordering::AcqRel);
