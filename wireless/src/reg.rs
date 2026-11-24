@@ -1,8 +1,14 @@
 use alloc::vec::Vec;
+#[cfg(feature = "kernel")]
 use narf_lib::sync::IrqSafeSpinLock;
 
+// The regulatory *rules* (domains, rules, WMM limits, 6 GHz power types) are
+// pure data. The database that holds the active domain and the policy that
+// loads the signed regdb are kernel state, behind `kernel`.
+#[cfg(feature = "kernel")]
 #[path = "reg/linux.rs"]
 pub(crate) mod linux;
+#[cfg(feature = "kernel")]
 #[path = "reg/policy.rs"]
 pub mod policy;
 #[path = "reg/witness.rs"]
@@ -289,6 +295,7 @@ pub fn parse_policy(bytes: &[u8]) -> Result<RegulatoryDomain, &'static str> {
     })
 }
 
+#[cfg(feature = "kernel")]
 pub mod db {
     use super::*;
     use alloc::sync::Arc;
