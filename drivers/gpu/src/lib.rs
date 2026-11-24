@@ -327,6 +327,8 @@ pub mod amdgpu_gfx;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx10_topology;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_gfx11_topology;
+#[cfg(feature = "amdgpu")]
 mod amdgpu_gfx12_draw;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx12_queue;
@@ -372,6 +374,8 @@ pub mod amdgpu_ih;
 pub mod amdgpu_ih7;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_ih_drainer;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_ih_phoenix;
 #[path = "amdgpu_ih_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_ih;
@@ -664,6 +668,8 @@ pub mod amdgpu_dp_bridge;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_nbio_v7_2;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_phoenix_boot;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_raphael_boot;
 #[cfg(feature = "amdgpu")]
 pub(crate) mod amdgpu_raphael_gfxoff;
@@ -684,6 +690,8 @@ pub mod amdgpu_smu_apu_telemetry;
 pub mod amdgpu_smu_navi48;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48_telemetry;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_phoenix;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_raphael;
 #[cfg(feature = "amdgpu")]

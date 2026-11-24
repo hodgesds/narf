@@ -129,6 +129,23 @@ impl Doorbells {
         // SAFETY: the same BAR2 doorbell page; forwarded mapping contract.
         unsafe { Self::map_navi22(device) }
     }
+    /// Map Phoenix's BAR2 doorbell page: the same single-page BAR2 mapping
+    /// Raphael uses (`amdgpu_doorbell_init` takes BAR2 on APUs as on discrete
+    /// parts). Gated on `Family::Phoenix`, not on a PCI-ID list, so Strix
+    /// (which also maps to `Family::Phoenix` today) is refused by the
+    /// coordinator's DID gate before it can reach this.
+    ///
+    /// # Safety
+    /// As `map_rdna2`, for Phoenix.
+    pub unsafe fn map_phoenix(device: &narf_bus::BusDevice) -> Result<Self, Error> {
+        if crate::amdgpu::family_for_pci_id(device.id.vendor, device.id.device)
+            != Some(crate::amdgpu::Family::Phoenix)
+        {
+            return Err(Error::Unsupported);
+        }
+        // SAFETY: the same BAR2 doorbell page; forwarded mapping contract.
+        unsafe { Self::map_navi22(device) }
+    }
     /// Map Rembrandt's BAR2 doorbell page: `amdgpu_doorbell_init` takes BAR2 on
     /// APUs as on discrete parts.
     ///

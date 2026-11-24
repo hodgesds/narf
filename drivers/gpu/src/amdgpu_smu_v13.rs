@@ -49,6 +49,9 @@ pub const V13_MSG_SET_DRAM_ADDR_LO: u32 = 0x0E;
 pub const V13_MSG_XFER_SMU2DRAM: u32 = 0x0F;
 /// `PPSMC_MSG_TransferTableDram2Smu` — host DRAM → SMU table (0x10).
 pub const V13_MSG_XFER_DRAM2SMU: u32 = 0x10;
+/// `PPSMC_MSG_GfxDeviceDriverReset` — driver-initiated GPU reset (0x11).
+/// Argument is a `Mode_Reset_e`: MODE1_RESET = 1, MODE2_RESET = 2.
+pub const V13_MSG_GFX_DEVICE_DRIVER_RESET: u32 = 0x11;
 /// `PPSMC_MSG_GetGfxclkFrequency` — current GFXCLK in MHz (0x17).
 pub const V13_MSG_GET_GFXCLK: u32 = 0x17;
 /// `PPSMC_MSG_GetFclkFrequency` — current FCLK in MHz (0x18).
@@ -65,6 +68,10 @@ pub const V13_MSG_SET_HARD_MIN_GFXCLK: u32 = 0x1C;
 pub const V13_MSG_SET_SOFT_MAX_SOCCLK: u32 = 0x1D;
 /// `PPSMC_MSG_SetSoftMaxFclkByFreq` — soft-max FCLK in MHz (0x1E).
 pub const V13_MSG_SET_SOFT_MAX_FCLK: u32 = 0x1E;
+/// `PPSMC_MSG_PowerDownJpeg` — power-gate JPEG (0x21).
+pub const V13_MSG_POWER_DOWN_JPEG: u32 = 0x21;
+/// `PPSMC_MSG_PowerUpJpeg` — wake JPEG (0x22).
+pub const V13_MSG_POWER_UP_JPEG: u32 = 0x22;
 /// `PPSMC_MSG_SetHardMinFclkByFreq` — hard-min FCLK in MHz (0x23).
 pub const V13_MSG_SET_HARD_MIN_FCLK: u32 = 0x23;
 /// `PPSMC_MSG_SetSoftMinSocclkByFreq` — soft-min SOCCLK in MHz (0x24).

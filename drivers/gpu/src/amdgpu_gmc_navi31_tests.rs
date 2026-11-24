@@ -84,9 +84,9 @@ fn pool() -> Pool {
     // SAFETY: Fake owns all memory accesses; mapping is never dereferenced.
     unsafe { Pool::from_owned_range(map, 0x8_0000_4000) }.unwrap()
 }
-fn layout_for(die: Navi31Die) -> Layout {
+fn layout_for(die: Gfx11Die) -> Layout {
     let (gfx, gfx_vmhub) = match die {
-        Navi31Die::Navi32 => (GFX_11_0_3, GFXHUB_V3_0_3),
+        Gfx11Die::Navi32 => (GFX_11_0_3, GFXHUB_V3_0_3),
         _ => (GFX, GFXHUB_V3_0),
     };
     Layout {
@@ -98,7 +98,7 @@ fn layout_for(die: Navi31Die) -> Layout {
         osssys: 0x40000,
     }
 }
-fn fixture_for(die: Navi31Die) -> (Pool, Engine<Fake>) {
+fn fixture_for(die: Gfx11Die) -> (Pool, Engine<Fake>) {
     let pool = pool();
     let mut io = Fake::new();
     let layout = layout_for(die);
@@ -118,26 +118,27 @@ fn fixture_for(die: Navi31Die) -> (Pool, Engine<Fake>) {
     (pool, engine)
 }
 fn fixture() -> (Pool, Engine<Fake>) {
-    fixture_for(Navi31Die::Navi31)
+    fixture_for(Gfx11Die::Navi31)
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(future)
 }
 
-/// The corrected die↔GC pairing (lane 1), and Phoenix's GC 11.0.1
-/// refused by every Navi31/32/33 entry point.
+/// The corrected die↔GC pairing (lane 1), now including Phoenix's
+/// GC 11.0.1 as a first-class die of this owner.
 fn gmc_navi31_die_identity() -> TestResult {
-    if Navi31Die::from_gc((11, 0, 0)) != Some(Navi31Die::Navi31)
-        || Navi31Die::from_gc((11, 0, 3)) != Some(Navi31Die::Navi32)
-        || Navi31Die::from_gc((11, 0, 2)) != Some(Navi31Die::Navi33)
-        || Navi31Die::from_gc((11, 0, 1)).is_some()
-        || Navi31Die::from_gc((11, 5, 0)).is_some()
+    if Gfx11Die::from_gc((11, 0, 0)) != Some(Gfx11Die::Navi31)
+        || Gfx11Die::from_gc((11, 0, 3)) != Some(Gfx11Die::Navi32)
+        || Gfx11Die::from_gc((11, 0, 2)) != Some(Gfx11Die::Navi33)
+        || Gfx11Die::from_gc((11, 0, 1)) != Some(Gfx11Die::Phoenix)
+        || Gfx11Die::from_gc((11, 5, 0)).is_some()
     {
         return TestResult::Fail("die from GC version");
     }
-    if Navi31Die::Navi31.gc_version() != (11, 0, 0)
-        || Navi31Die::Navi32.gc_version() != (11, 0, 3)
-        || Navi31Die::Navi33.gc_version() != (11, 0, 2)
+    if Gfx11Die::Navi31.gc_version() != (11, 0, 0)
+        || Gfx11Die::Navi32.gc_version() != (11, 0, 3)
+        || Gfx11Die::Navi33.gc_version() != (11, 0, 2)
+        || Gfx11Die::Phoenix.gc_version() != (11, 0, 1)
     {
         return TestResult::Fail("GC version round trip");
     }
@@ -165,7 +166,7 @@ fn gmc_navi31_die_identity() -> TestResult {
             base_addrs: [0x4000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         },
     ];
-    if Navi31Die::from_ip_blocks(&blocks).is_some() {
+    if Gfx11Die::from_ip_blocks(&blocks).is_some() {
         return TestResult::Fail("duplicate GC block accepted");
     }
     if GART_SIZE != 512 << 20 || GART_TABLE_PAGES != 131072 {
@@ -320,7 +321,7 @@ fn gmc_navi31_constructor_checks_exact_banks_and_pool_before_allocation() -> Tes
         Ok(gmc) => gmc,
         Err(_) => return TestResult::Fail("happy path"),
     };
-    if gmc.die() != Navi31Die::Navi31
+    if gmc.die() != Gfx11Die::Navi31
         || gmc.state() != State::Prepared
         || gmc.aperture().is_some()
         || gmc.framebuffer().is_some()
@@ -333,6 +334,67 @@ fn gmc_navi31_constructor_checks_exact_banks_and_pool_before_allocation() -> Tes
 kernel_test_in!(
     "drivers/gpu/gmc-navi31",
     gmc_navi31_constructor_checks_exact_banks_and_pool_before_allocation
+);
+
+/// Phoenix takes the same owner with MMHUB 3.0.1 on BASE_IDX 1: the GC
+/// bank is 11.0.1, the MMHUB bank is (3,0,1) at window 1, and the GFX
+/// table is the 11.0.0 one. Strix, a discrete GC version on a Phoenix
+/// DID, and a 3.0.0 MMHUB on Phoenix are all refused.
+fn gmc_navi31_phoenix_resolves_mmhub_3_0_1_on_window_1() -> TestResult {
+    let pool = pool();
+    let cap = || Cap::bootstrap();
+    let phoenix = |f: fn(&mut AmdGpu)| {
+        let mut gpu = descriptor(|_| {});
+        gpu.chip = __test_chip_info_for_pci_id(0x1002, 0x15BF).unwrap();
+        (
+            gpu.ip_blocks[0].major,
+            gpu.ip_blocks[0].minor,
+            gpu.ip_blocks[0].revision,
+        ) = (11, 0, 1);
+        (
+            gpu.ip_blocks[1].major,
+            gpu.ip_blocks[1].minor,
+            gpu.ip_blocks[1].revision,
+        ) = (3, 0, 1);
+        gpu.ip_blocks[1].num_bases = 2;
+        gpu.ip_blocks[1].base_addrs[1] = 0x8000;
+        f(&mut gpu);
+        gpu
+    };
+    let gpu = phoenix(|_| {});
+    let gmc = match gmc_new(&gpu, cap(), &pool) {
+        Ok(gmc) => gmc,
+        Err(_) => return TestResult::Fail("Phoenix happy path"),
+    };
+    if gmc.die() != Gfx11Die::Phoenix || gmc.state() != State::Prepared {
+        return TestResult::Fail("Phoenix die or state");
+    }
+    drop(gmc);
+    let cases: [(&str, fn(&mut AmdGpu)); 4] = [
+        ("Strix DID", |g| {
+            g.chip = __test_chip_info_for_pci_id(0x1002, 0x150E).unwrap();
+        }),
+        ("discrete GC on Phoenix DID", |g| {
+            g.ip_blocks[0].revision = 0;
+        }),
+        ("MMHUB 3.0.0 on Phoenix", |g| {
+            g.ip_blocks[1].revision = 0;
+        }),
+        ("MMHUB window 0 on Phoenix", |g| {
+            g.ip_blocks[1].num_bases = 1;
+        }),
+    ];
+    for (name, mutate) in cases {
+        let gpu = phoenix(mutate);
+        if gmc_new(&gpu, cap(), &pool).is_ok() || pool.available() != BYTES {
+            return TestResult::Fail(name);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi31",
+    gmc_navi31_phoenix_resolves_mmhub_3_0_1_on_window_1
 );
 
 /// VMID0 bring-up on both hubs, with the GFX11 literals from
@@ -441,7 +503,7 @@ kernel_test_in!(
 /// Navi32's GFX hub programs through the shifted 11.0.3 table; the
 /// MMHUB table is shared with Navi31/33.
 fn gmc_navi31_navi32_programs_shifted_registers() -> TestResult {
-    let (_pool, mut engine) = fixture_for(Navi31Die::Navi32);
+    let (_pool, mut engine) = fixture_for(Gfx11Die::Navi32);
     if run(engine.initialize()).is_err() {
         return TestResult::Fail("Navi32 initialize");
     }

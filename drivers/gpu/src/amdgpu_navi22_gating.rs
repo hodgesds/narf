@@ -39,6 +39,8 @@ pub mod cg {
     pub const ATHUB_MGCG: u64 = 1 << 29; // linux: AMD_CG_SUPPORT_ATHUB_MGCG
     pub const JPEG_MGCG: u64 = 1 << 30; // linux: AMD_CG_SUPPORT_JPEG_MGCG
     pub const GFX_FGCG: u64 = 1 << 31; // linux: AMD_CG_SUPPORT_GFX_FGCG
+    pub const REPEATER_FGCG: u64 = 1 << 32; // linux: AMD_CG_SUPPORT_REPEATER_FGCG
+    pub const GFX_PERF_CLK: u64 = 1 << 33; // linux: AMD_CG_SUPPORT_GFX_PERF_CLK
 }
 /// amd_shared.h `AMD_PG_SUPPORT_*`.
 pub mod pg {
@@ -104,6 +106,33 @@ pub const REMBRANDT_CG: u64 = RAPHAEL_CG | cg::SDMA_MGCG;
 
 /// The same case's `pg_flags`: identical to Raphael's.
 pub const REMBRANDT_PG: u32 = RAPHAEL_PG;
+
+/// `soc21.c` `nv_common_early_init`, `case IP_VERSION(11, 0, 1)`
+/// (Phoenix). The full GC11 `Gating` owner — the `gfx_v11_0_update_gfx_*
+/// clock_gating` tables — is still a flagged remainder; these flags are
+/// what the Phoenix coordinator records and the power-gating predicate
+/// (`gfx_v11_cntl_pg` runs only with `GFX_PG`) reads.
+pub const PHOENIX_CG: u64 = cg::GFX_CGCG
+    | cg::GFX_CGLS
+    | cg::GFX_MGCG
+    | cg::GFX_FGCG
+    | cg::REPEATER_FGCG
+    | cg::GFX_PERF_CLK
+    | cg::MC_MGCG
+    | cg::MC_LS
+    | cg::HDP_MGCG
+    | cg::HDP_LS
+    | cg::ATHUB_MGCG
+    | cg::ATHUB_LS
+    | cg::IH_CG
+    | cg::BIF_MGCG
+    | cg::BIF_LS
+    | cg::VCN_MGCG
+    | cg::JPEG_MGCG;
+
+/// The same case's `pg_flags`: identical to Raphael's — GFX_PG (which
+/// gates `gfx_v11_cntl_pg`), VCN, VCN_DPG, JPEG.
+pub const PHOENIX_PG: u32 = pg::GFX_PG | pg::VCN | pg::VCN_DPG | pg::JPEG;
 
 /// `nv_common_early_init` flags for bare-metal discrete RDNA2.
 pub fn profile_flags(profile: &crate::amdgpu_rdna2::Profile) -> (u64, u32) {

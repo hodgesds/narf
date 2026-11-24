@@ -1500,6 +1500,8 @@ pub struct ComputeContext {
     me: u32,
     pipe: u32,
     queue: u32,
+    /// Next sequence number to publish, as on [`GfxContext`].
+    next_seq: u64,
 }
 
 /// `v11_compute_mqd` is 512 dwords, like the graphics image.
@@ -1553,6 +1555,7 @@ impl ComputeContext {
             me: mec + 1,
             pipe,
             queue,
+            next_seq: 0,
         })
     }
 
@@ -1645,6 +1648,97 @@ impl ComputeContext {
             mqd_addr: self.mqd_phys(),
             wptr_addr: self.wptr_phys(),
             queue_type: crate::amdgpu_mes::MesQueueType::Compute,
+        }
+    }
+
+    /// How far the MEC has consumed this ring, read back from the writeback
+    /// page. Mirrors [`GfxContext::ring_rptr`]: before the engine has run it
+    /// reads 0, which makes the ring behave as write-once.
+    pub fn ring_rptr(&self) -> u64 {
+        // SAFETY: identity-mapped DMA-coherent page owned by this context;
+        // the slot is within it and the MEC only ever writes this dword.
+        let rptr: u32 =
+            unsafe { core::ptr::read_volatile(self.wb.cpu_ptr_at::<u32>(WB_RPTR_OFFSET)) };
+        u64::from(rptr)
+    }
+
+    /// Publish the host write pointer to the shadow the MEC polls, then ring
+    /// the doorbell. Mirrors [`GfxContext::commit`].
+    ///
+    /// # Safety
+    /// `bar2` must map the doorbell window of this GPU, and the caller owns
+    /// the doorbell range for this queue.
+    pub unsafe fn commit(&self, bar2: &narf_driver_runtime::MmioRegion) {
+        let payload = self.ring.doorbell_payload();
+        // SAFETY: identity-mapped page this context owns; one aligned 64-bit
+        // store, matching Linux's atomic64.
+        unsafe {
+            core::ptr::write_volatile(self.wb.cpu_mut_ptr_at::<u64>(WB_WPTR_OFFSET), payload);
+        }
+        // The shadow has to be visible before the doorbell announces it.
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: caller-asserted doorbell ownership.
+        unsafe { self.ring.ring_doorbell(bar2) };
+    }
+
+    /// Submit a pre-built IB and request the MEC publish a fence when it
+    /// retires. Same 9-dword layout as [`GfxContext::submit_ib`]
+    /// (`INDIRECT_BUFFER` + `WRITE_DATA`), so one IB-test shape covers both
+    /// kernel rings.
+    ///
+    /// # Safety
+    /// Caller owns the ring exclusively for this call. Subsequent
+    /// submissions to the same queue must not overlap. The ring must have
+    /// been mapped through MES and the MEC unhalted; otherwise the doorbell
+    /// write in [`ComputeContext::commit`] has no effect.
+    pub unsafe fn submit_ib(
+        &mut self,
+        ib_phys: u64,
+        ib_size_dw: u32,
+    ) -> Result<Fence, SubmitError> {
+        self.next_seq += 1;
+        let seq = self.next_seq;
+
+        let mut staging = [0u32; 9];
+        {
+            let mut b = Pm4Builder::new(&mut staging);
+            b.indirect_buffer(ib_phys, ib_size_dw, 0)?;
+            b.write_data(self.fence_phys(), seq as u32)?;
+        }
+
+        // SAFETY: caller-promised ring exclusivity.
+        unsafe {
+            self.ring.submit(&staging, self.ring_rptr())?;
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        Ok(Fence { seq })
+    }
+
+    /// Has the MEC retired through (or past) `fence`? Mirrors
+    /// [`GfxContext::fence_completed`].
+    pub fn fence_completed(&self, fence: &Fence) -> bool {
+        let observed: u32 =
+            // SAFETY: identity-mapped DMA backing, exclusive owner.
+            unsafe { core::ptr::read_volatile(self.wb.cpu_ptr_at::<u32>(WB_FENCE_OFFSET)) };
+        (observed as u64) >= fence.seq
+    }
+
+    /// Most-recently-issued fence (for diagnostics).
+    pub fn last_fence_seq(&self) -> u64 {
+        self.next_seq
+    }
+}
+
+impl ComputeContext {
+    /// Test scaffolding: simulate the MEC retiring through `seq` by
+    /// writing the fence dword directly. Mirrors
+    /// [`GfxContext::set_fence_for_test`]; production callers never reach
+    /// for this (the MEC writes the fence dword).
+    pub fn set_fence_for_test(&self, seq: u32) {
+        // SAFETY: identity-mapped DMA backing, exclusive owner.
+        unsafe {
+            core::ptr::write_volatile(self.wb.cpu_mut_ptr_at::<u32>(WB_FENCE_OFFSET), seq);
         }
     }
 }
