@@ -56,13 +56,19 @@ pub enum VcnVersion {
     /// VCN 2.0 — Renoir, Lucienne. H.264/HEVC/VP9 dec; H.264/HEVC
     /// enc. No AV1.
     V2_0,
-    /// VCN 2.5 — Cezanne / Barcelo refresh. Same codecs as 2.0
-    /// but a different firmware blob (green_sardine).
+    /// VCN 2.5 — UVD 2.5.0 (GC 9.4.1 die). Same codecs as 2.0.
+    /// No APU in scope reports UVD 2.5.0 — Cezanne/Barcelo are
+    /// UVD 2.2.0 and map to `V2_0` per Linux (`vcn_v2_0` block).
+    /// Kept so the Linux block stays representable.
     V2_5,
     /// VCN 3.0 — Navi2 RDNA2.
     V3_0,
-    /// VCN 4.0.5 — Phoenix / HawkPoint. AV1 dec + enc. Strix
-    /// also uses this revision.
+    /// VCN 4.0 — Navi3 (UVD 4.0.0) / Phoenix (UVD 4.0.2).
+    /// AV1 dec + enc. Linux `vcn_v4_0` block
+    /// (`amdgpu_discovery.c`: 4.0.0/4.0.2/4.0.4 → `vcn_v4_0`).
+    V4_0_2,
+    /// VCN 4.0.5 — Strix (UVD 4.0.5/4.0.6). AV1 dec + enc.
+    /// Linux `vcn_v4_0_5` block.
     V4_0_5,
 }
 
@@ -72,8 +78,8 @@ impl VcnVersion {
         match f {
             Family::Renoir => Some(VcnVersion::V2_0),
             Family::Navi2 => Some(VcnVersion::V3_0),
-            Family::Navi3 => Some(VcnVersion::V4_0_5),
-            Family::Phoenix => Some(VcnVersion::V4_0_5),
+            Family::Navi3 => Some(VcnVersion::V4_0_2),
+            Family::Phoenix => Some(VcnVersion::V4_0_2),
             // Vega has no VCN — it carries the older VCE / UVD
             // blocks; this scaffold doesn't cover them.
             Family::Vega => None,
@@ -108,6 +114,16 @@ impl VcnVersion {
                     | CodecBits::HEVC_ENC
                     | CodecBits::VP9_DEC
                     | CodecBits::AV1_DEC
+                    | CodecBits::JPEG_DEC
+            }
+            VcnVersion::V4_0_2 => {
+                CodecBits::H264_DEC
+                    | CodecBits::H264_ENC
+                    | CodecBits::HEVC_DEC
+                    | CodecBits::HEVC_ENC
+                    | CodecBits::VP9_DEC
+                    | CodecBits::AV1_DEC
+                    | CodecBits::AV1_ENC
                     | CodecBits::JPEG_DEC
             }
             VcnVersion::V4_0_5 => {
@@ -520,7 +536,9 @@ impl EncodeSession {
             return Err(VideoError::BadHandle);
         }
         // vcn_v4+ uses a unified queue (one ring for both dec + enc).
-        let unified_ring = matches!(ip, VcnVersion::V4_0_5);
+        // Both 4.0-family variants (V4_0_2 for Navi3/Phoenix,
+        // V4_0_5 for Strix) use it.
+        let unified_ring = matches!(ip, VcnVersion::V4_0_2 | VcnVersion::V4_0_5);
         Ok(Self {
             ip,
             codec,
@@ -855,8 +873,11 @@ mod smoke_tests {
         if VcnVersion::from_family(Family::Renoir) != Some(VcnVersion::V2_0) {
             return TestResult::Fail("Renoir VCN version wrong");
         }
-        if VcnVersion::from_family(Family::Phoenix) != Some(VcnVersion::V4_0_5) {
+        if VcnVersion::from_family(Family::Phoenix) != Some(VcnVersion::V4_0_2) {
             return TestResult::Fail("Phoenix VCN version wrong");
+        }
+        if VcnVersion::from_family(Family::Navi3) != Some(VcnVersion::V4_0_2) {
+            return TestResult::Fail("Navi3 VCN version wrong");
         }
         if VcnVersion::from_family(Family::Navi2) != Some(VcnVersion::V3_0) {
             return TestResult::Fail("Navi2 VCN version wrong");
@@ -870,7 +891,7 @@ mod smoke_tests {
 
     fn smoke_vcn_codec_capability_matrix() -> TestResult {
         // Phoenix has AV1 encode.
-        if !VcnVersion::V4_0_5.supports_encode(Codec::Av1) {
+        if !VcnVersion::V4_0_2.supports_encode(Codec::Av1) {
             return TestResult::Fail("Phoenix should support AV1 enc");
         }
         // Renoir does NOT have AV1.
@@ -885,7 +906,7 @@ mod smoke_tests {
             return TestResult::Fail("Navi2 should not support AV1 enc");
         }
         // VP9 is decode-only everywhere.
-        if VcnVersion::V4_0_5.supports_encode(Codec::Vp9) {
+        if VcnVersion::V4_0_2.supports_encode(Codec::Vp9) {
             return TestResult::Fail("VP9 enc not supported by VCN");
         }
         // H.264 dec everywhere.
@@ -893,6 +914,7 @@ mod smoke_tests {
             VcnVersion::V2_0,
             VcnVersion::V2_5,
             VcnVersion::V3_0,
+            VcnVersion::V4_0_2,
             VcnVersion::V4_0_5,
         ] {
             if !v.supports_decode(Codec::H264) {
@@ -910,7 +932,7 @@ mod smoke_tests {
             _ => return TestResult::Fail("Renoir+AV1 should reject"),
         }
         // Phoenix + AV1 succeeds.
-        let s = DecodeSession::new(VcnVersion::V4_0_5, Codec::Av1, 1920, 1080);
+        let s = DecodeSession::new(VcnVersion::V4_0_2, Codec::Av1, 1920, 1080);
         if s.is_err() {
             return TestResult::Fail("Phoenix+AV1 should succeed");
         }
