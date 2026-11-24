@@ -2735,6 +2735,56 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         Ok(())
     }
 
+    /// `execlists_reset_rewind` after the caller reset this engine alone
+    /// (`intel_engine_reset`). The context on port 0 hung: every request of
+    /// it, in flight or queued, fails with [`JobError::Hang`] and its batches
+    /// are released. Ports load only while the engine is idle, so no other
+    /// context had started: their requests go back to the queue in order,
+    /// with their images untouched. The status page address and the CSB
+    /// pointers are restored (the reset clears both) and the queue is pumped.
+    /// Returns the hung context and the failed request ids.
+    ///
+    /// # Safety
+    /// The caller completed a reset of this engine, so the hardware no
+    /// longer references any of its batch, ring or context memory.
+    pub unsafe fn reset_rewind(&mut self) -> Result<(Option<ContextId>, Vec<u64>), SubmitError> {
+        if self.completion_lost {
+            return Err(SubmitError::CompletionLost);
+        }
+        let guilty = self.active[0].or(self.pending[0]);
+        let guilty_id = guilty.and_then(|slot| {
+            self.contexts
+                .get(slot as usize)
+                .and_then(Option::as_ref)
+                .map(|ctx| ContextId::pack(ctx.slot, ctx.generation))
+        });
+        self.active = [None, None];
+        self.pending = [None, None];
+        let mut failed = Vec::new();
+        let mut requeue = VecDeque::new();
+        let older: Vec<_> = self.inflight.drain(..).collect();
+        for request in older.into_iter().chain(self.queue.drain(..)) {
+            if Some(request.ctx_slot) == guilty {
+                failed.push(request);
+            } else {
+                requeue.push_back(request);
+            }
+        }
+        fence(Ordering::Acquire);
+        let mut ids = Vec::with_capacity(failed.len());
+        for request in failed {
+            ids.push(request.id);
+            request.batch.release(&mut self.alloc);
+            request.fence.signal(Err(JobError::Hang));
+        }
+        self.mmio
+            .write32(self.spec.hws_pga(), self.status.ggtt_offset());
+        self.reset_csb_pointers()?;
+        self.queue = requeue;
+        self.pump();
+        Ok((guilty_id, ids))
+    }
+
     /// Append `words` to an idle, unqueued context's ring ahead of its
     /// next request: the per-context setup Linux records into the default
     /// context image (the context workaround `MI_LOAD_REGISTER_IMM`). The
@@ -6373,5 +6423,62 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_rcs",
         smoke_legacy_default_image_seeds_new_contexts
+    );
+
+    /// An engine reset with context A hung on port 0 and context B queued
+    /// behind it: A's request fails with Hang and its batch is released, B
+    /// is loaded again, the status page address and CSB pointers are
+    /// restored, and B then completes.
+    fn smoke_legacy_engine_reset_rewinds_innocent_requests() -> TestResult {
+        let skl = crate::intel_gpu::Generation::Skylake;
+        let (mut engine, mut hw) = make_engine_for_generation(skl).unwrap();
+        let a = engine.create_context().unwrap();
+        let b = engine.create_context().unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        let hung = engine.submit(a, batch).unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        let innocent = engine.submit(b, batch).unwrap();
+        let hung_fence = engine
+            .inflight
+            .iter()
+            .find(|r| r.id == hung)
+            .map(|r| r.fence.clone())
+            .unwrap();
+        let live = engine.live_allocations();
+        // The hardware never completes A. Reset the engine alone.
+        let elsp_before = hw.regs.writes_to(engine.spec().elsp()).len();
+        // The hardware took A's submission and never completed it.
+        hw.consumed_elsp = elsp_before;
+        // SAFETY: the modelled engine was reset and runs nothing.
+        let (guilty, failed) = unsafe { engine.reset_rewind() }.unwrap();
+        if guilty != Some(a) || failed != alloc::vec![hung] {
+            return TestResult::Fail("the port-0 context is the guilty one");
+        }
+        if hung_fence.result() != Some(Err(JobError::Hang)) || engine.live_allocations() != live - 1
+        {
+            return TestResult::Fail("the hung request fails and releases its batch");
+        }
+        if hw.regs.writes_to(engine.spec().hws_pga()).last() != Some(&engine.status_ggtt())
+            || hw.regs.writes_to(engine.spec().elsp()).len() == elsp_before
+        {
+            return TestResult::Fail("HWS_PGA restored and the innocent context reloaded");
+        }
+        // The reset also rewound the hardware's CSB write pointer.
+        hw.write_ptr = csb_entries(skl) - 1;
+        hw.step();
+        let done = engine.poll_completions();
+        if done.len() != 1 || done[0].request != innocent || !engine.is_idle() {
+            return TestResult::Fail("the innocent request completes after the reset");
+        }
+        engine.destroy_context(a).unwrap();
+        // SAFETY: every modelled request completed.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_legacy_engine_reset_rewinds_innocent_requests
     );
 }

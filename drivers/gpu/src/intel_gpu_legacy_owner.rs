@@ -54,6 +54,8 @@ const READY_TO_RESET: u32 = 1 << 1;
 /// `GEN6_GDRST`; `GEN6_GRDOM_FULL` / `GEN11_GRDOM_FULL` is bit 0 on both.
 const GDRST: u64 = 0x941c;
 const GRDOM_FULL: u32 = 1;
+/// `GEN6_GRDOM_RENDER` / `GEN11_GRDOM_RENDER`.
+const GRDOM_RENDER: u32 = 1 << 1;
 
 const fn masked_enable(bits: u32) -> u32 {
     bits << 16 | bits
@@ -91,6 +93,8 @@ enum ResetPhase {
 pub(crate) struct Reset {
     phase: ResetPhase,
     deadline: u64,
+    /// The `GDRST` domain pulsed: the full GT, or RCS0 alone.
+    domain: u32,
 }
 
 impl Reset {
@@ -98,6 +102,17 @@ impl Reset {
         Self {
             phase: ResetPhase::Start,
             deadline: 0,
+            domain: GRDOM_FULL,
+        }
+    }
+
+    /// `intel_engine_reset` of RCS0 (`gen6_reset_engines` with the render
+    /// domain): the same stop and handshake, then only `GRDOM_RENDER`.
+    pub(crate) const fn render() -> Self {
+        Self {
+            phase: ResetPhase::Start,
+            deadline: 0,
+            domain: GRDOM_RENDER,
         }
     }
 
@@ -126,7 +141,7 @@ impl Reset {
                 if mmio.read32(RESET_CTL) & READY_TO_RESET == 0 && now < self.deadline {
                     return Poll::Pending;
                 }
-                mmio.write32(GDRST, GRDOM_FULL);
+                mmio.write32(GDRST, self.domain);
                 self.phase = ResetPhase::Resetting;
                 self.deadline = now + 500_000_000;
                 Poll::Pending
@@ -136,7 +151,7 @@ impl Reset {
                 if status == u32::MAX {
                     return Poll::Ready(Err(InitError::Unavailable));
                 }
-                if status & GRDOM_FULL != 0 {
+                if status & self.domain != 0 {
                     if now < self.deadline {
                         return Poll::Pending;
                     }
@@ -211,6 +226,21 @@ pub(crate) fn program(
     for (reg, value) in l3cc_writes(gt) {
         mmio.write32(reg, value);
     }
+    resume_rcs(mmio, platform, steering, &mut report);
+    report
+}
+
+/// RCS0's engine state, which an engine reset clears as well as a full one
+/// (`execlists_resume`): its workarounds, whitelist, MOCS bank and
+/// `enable_execlists`. The caller then points `RING_HWS_PGA` at the status
+/// page.
+pub(crate) fn resume_rcs(
+    mmio: &impl MmioWindow,
+    platform: WaPlatform,
+    steering: Steering,
+    report: &mut Programmed,
+) {
+    let gt = platform.gt();
     apply(&rcs_workarounds(platform), mmio, steering, &mut report.lost);
     for (reg, value) in whitelist_writes(RCS, &rcs_whitelist(platform)) {
         mmio.write32(reg, value);
@@ -239,7 +269,6 @@ pub(crate) fn program(
     mmio.write32(RCS + 0xb0, u32::MAX);
     report.error_status = mmio.read32(RCS + 0xb8);
     mmio.write32(RCS + 0xb4, !1);
-    report
 }
 
 /// `read_clock_frequency` for graphics 9 (big core) and 11: the command
@@ -287,6 +316,16 @@ struct Context {
     id: ContextId,
 }
 
+/// What a service pass found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Service {
+    Ok,
+    /// A job overran its deadline: reset RCS0 alone.
+    Hung,
+    /// Completion tracking is lost: only a full GT reset recovers.
+    Lost,
+}
+
 struct Runtime {
     engine: Engine,
     fw: Forcewake,
@@ -298,6 +337,8 @@ struct Runtime {
     jobs: Vec<Job>,
     /// Frequency and park policy ([`crate::intel_gpu_legacy_power`]).
     governor: Governor,
+    /// MCR steering for re-applying RCS0's workarounds after an engine reset.
+    steering: Steering,
     /// `RC_CONTROL` while unparked (`rc6->ctl_enable`).
     rc6_ctl: u32,
 }
@@ -359,9 +400,9 @@ impl Runtime {
     }
 
     /// Retire landed jobs and drop hardware contexts whose user context is
-    /// gone. `true` when the GT must be reset: a completion could not be
-    /// proven, or a job outlived its deadline.
-    fn service(&mut self, now: u64) -> bool {
+    /// gone. [`Service::Lost`] when a completion could not be proven (only a
+    /// GT reset recovers), [`Service::Hung`] when a job outlived its deadline.
+    fn service(&mut self, now: u64) -> Service {
         for done in self.engine.poll_completions() {
             if let Some(i) = self.jobs.iter().position(|j| j.request == done.request) {
                 self.jobs.swap_remove(i).job.finish(false);
@@ -371,8 +412,13 @@ impl Runtime {
         self.contexts.retain(|context| {
             context.user.strong_count() != 0 || engine.destroy_context(context.id).is_err()
         });
-        let lost = self.engine.completion_lost() || self.jobs.iter().any(|job| now >= job.deadline);
-        if !lost {
+        if self.engine.completion_lost() {
+            return Service::Lost;
+        }
+        if self.jobs.iter().any(|job| now >= job.deadline) {
+            return Service::Hung;
+        }
+        {
             let busy = !self.jobs.is_empty() || !self.engine.is_idle();
             match self.governor.tick(now, busy) {
                 Some(Step::Request(freq)) => {
@@ -383,7 +429,7 @@ impl Runtime {
                 None => {}
             }
         }
-        lost
+        Service::Ok
     }
 }
 
@@ -544,6 +590,7 @@ impl Owner {
             contexts: Vec::new(),
             jobs: Vec::new(),
             governor: Governor::new(caps),
+            steering,
             rc6_ctl,
         });
         self.epoch.store(epoch, Ordering::Release);
@@ -609,22 +656,76 @@ impl Owner {
             }
             attempts = 0;
             loop {
-                let (reset, busy) = {
+                let (service, busy) = {
                     let mut state = self.state.lock().await;
                     let Some(runtime) = state.as_mut() else {
                         break;
                     };
-                    let reset = runtime.service(narf_time::monotonic_ns());
-                    (reset, !runtime.jobs.is_empty())
+                    let service = runtime.service(narf_time::monotonic_ns());
+                    (service, !runtime.jobs.is_empty())
                 };
-                if reset {
-                    log(self.index, "job hung or completion lost; resetting the GT");
+                let full_reset = match service {
+                    Service::Ok => false,
+                    Service::Lost => {
+                        log(self.index, "completion lost; resetting the GT");
+                        true
+                    }
+                    Service::Hung => match self.reset_engine().await {
+                        Ok(()) => false,
+                        Err(_) => {
+                            log(self.index, "RCS0 reset failed; resetting the GT");
+                            true
+                        }
+                    },
+                };
+                if full_reset {
                     self.tear_down().await;
                     break;
                 }
                 sleep_us(if busy { 50 } else { 1000 }).await;
             }
         }
+    }
+
+    /// `intel_engine_reset` for a hung job: stop and reset RCS0 alone,
+    /// restore its engine state, fail and ban only the hung context and put
+    /// every other request back on the engine (`__intel_engine_reset_bh`).
+    /// The other jobs get a fresh deadline. An error leaves the full GT
+    /// reset to the caller.
+    async fn reset_engine(&self) -> Result<(), InitError> {
+        let mut state = self.state.lock().await;
+        let runtime = state.as_mut().ok_or(InitError::Unavailable)?;
+        runtime.unpark().map_err(|_| InitError::Forcewake)?;
+        let mut reset = Reset::render();
+        loop {
+            match reset.poll(&runtime.window, narf_time::monotonic_ns()) {
+                Poll::Pending => sleep_us(20).await,
+                Poll::Ready(result) => break result?,
+            }
+        }
+        let mut report = Programmed::default();
+        resume_rcs(&runtime.window, self.wa, runtime.steering, &mut report);
+        // SAFETY: the render-domain reset above completed, so RCS0 no longer
+        // reads or writes any of its batch, ring or context memory.
+        let (guilty, failed) =
+            unsafe { runtime.engine.reset_rewind() }.map_err(InitError::Engine)?;
+        let now = narf_time::monotonic_ns();
+        for request in failed {
+            if let Some(i) = runtime.jobs.iter().position(|j| j.request == request) {
+                runtime.jobs.swap_remove(i).job.finish_hung();
+            }
+        }
+        for job in &mut runtime.jobs {
+            job.deadline = now.saturating_add(JOB_TIMEOUT_NS);
+        }
+        if let Some(guilty) = guilty {
+            let engine = &mut runtime.engine;
+            runtime
+                .contexts
+                .retain(|context| context.id != guilty || engine.destroy_context(guilty).is_err());
+        }
+        log(self.index, "RCS0 reset; the hung context is banned");
+        Ok(())
     }
 
     async fn submit(
