@@ -179,6 +179,8 @@ members = [
     "drivers/media",
     "drivers/serial",
     "modules",
+    "modules/rt",
+    "modules/rt-smoke",
     "modules/test-module",
 ]
 # narf-testbin / userspace/init / userspace/shell are built out-of-

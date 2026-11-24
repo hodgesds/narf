@@ -3524,6 +3524,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-module-rt"
+version = "0.0.0"
+
+[[package]]
+name = "narf-module-rt-smoke"
+version = "0.0.0"
+dependencies = [
+ "narf-module-rt",
+]
+
+[[package]]
 name = "narf-modules"
 version = "0.0.0"
 dependencies = [

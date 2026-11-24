@@ -1,0 +1,32 @@
+# Runtime for loadable modules that need more than raw KABI calls.
+#
+# A `.ko` links against the kernel only through the C KABI
+# (`modules/src/kabi.rs`); it cannot use `narf-lib`, `narf-scheduler` or
+# `narf-time`, which are `repr(Rust)` and resident in the kernel image. This
+# crate rebuilds the pieces a driver of any size needs — a heap, console
+# lines, locks, a monotonic clock and an executor for its own futures — on
+# top of four KABI exports, and nothing else. It depends on no kernel crate,
+# so `xtask build-module` links it into the module from the staticlib
+# archive and the `nm -u` gate still sees only `narf_*` exports.
+#
+# Host tests (`cargo xtask host-test`) swap the four exports for in-process
+# stand-ins; see `src/abi.rs`.
+
+[package]
+name         = "narf-module-rt"
+description  = "Kernel-free runtime (heap, console, locks, clock, executor) for NARF loadable modules."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_module_rt"
+
+[dependencies]
+# None: everything below is built from the KABI. A dependency on a kernel
+# crate here would put mangled Rust symbols into every module that uses it.
+
+[lints]
+workspace = true

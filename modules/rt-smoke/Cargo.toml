@@ -1,0 +1,28 @@
+# Loadable module that exercises `narf-module-rt` end to end.
+#
+# Where `modules/test-module` is the minimal authoring shape (no dependencies
+# at all), this one is the shape of a module written against `alloc` and
+# `async`: it allocates, formats, and runs futures on its own executor. Its
+# object therefore needs out-of-line `core`/`alloc` code and the runtime
+# crate, which `xtask build-module` links in lazily from the staticlib
+# archive. `cargo xtask module-rt-smoke` boots it and checks its console
+# tokens.
+
+[package]
+name         = "narf-module-rt-smoke"
+description  = "NARF module exercising the module runtime (heap, console, locks, clock, executor)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name       = "narf_module_rt_smoke"
+crate-type = ["staticlib"]
+
+[dependencies]
+narf-module-rt = { path = "../rt" }
+
+[lints]
+workspace = true

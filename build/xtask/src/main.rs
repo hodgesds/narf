@@ -5672,6 +5672,25 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko.lz4".into(), bytes)),
             Err(e) => println!("xtask: compressed test module unavailable ({e})"),
         }
+        // A module built on `narf-module-rt`: out-of-line core/alloc code and
+        // a dependency crate, linked from the archive and section-GC'd. The
+        // `modules/e2e` runtime smoke loads it on both arches.
+        let rt_smoke = BuildModuleArgs {
+            arch: args.arch,
+            package: "narf-module-rt-smoke".into(),
+            manifest_path: None,
+            out: None,
+            features: Vec::new(),
+            no_default_features: false,
+            kernel_abi: None,
+            compress: false,
+            signature: None,
+            public_key: None,
+        };
+        match build_module(&rt_smoke, &root).and_then(|ko| Ok(std::fs::read(&ko)?)) {
+            Ok(bytes) => fixtures.push(("lib/modules/narf_module_rt_smoke.ko".into(), bytes)),
+            Err(e) => println!("xtask: runtime smoke module unavailable ({e})"),
+        }
         // A real dual-build driver `.ko` for the loadable-driver e2e smoke.
         match build_module_fixture("narf-drivers-net-e1000", args.arch, &root) {
             Ok(bytes)
@@ -16295,6 +16314,12 @@ fn host_test_cmd() -> Result<()> {
                 // detection and command construction must remain host-safe.
                 "-p",
                 "cargo-narf",
+                // The loadable-module runtime: its executor, locks and
+                // console splitting run against host stand-ins for the KABI,
+                // so the concurrency and UTF-8 cases are checked on every
+                // push rather than only inside a booted kernel.
+                "-p",
+                "narf-module-rt",
             ],
         ),
         (

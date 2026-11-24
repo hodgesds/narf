@@ -55,10 +55,16 @@ architecture-comparison overview, see the workspace-root
 > accepted only by kernels built with the explicit developer/CI
 > `module-allow-unsigned` feature.
 >
-> One live limitation: a module that uses `core` beyond what the
-> compiler inlines comes out with undefined references nothing can
-> satisfy. Keep to the exported ABI and your own code for now. See
-> [DESIGN.md](./DESIGN.md).
+> Out-of-line `core`, `alloc` and `compiler_builtins` code, and code
+> from kernel-free dependency crates, is linked into the `.ko` from the
+> staticlib archive: `build-module` offers the archive lazily after
+> your crate's own objects and section-GCs the result, so only what
+> your code reaches is kept. A module that wants a heap, `async` and
+> locks depends on [`narf-module-rt`](./rt) (see
+> [Writing against `narf-module-rt`](#writing-against-narf-module-rt)).
+> A dependency on a *kernel* crate (`narf-lib`, `narf-bus`, …) still
+> fails the `nm -u` gate: its symbols live in the kernel image, not in
+> any KSYMTAB.
 
 A NARF module is a stand-alone Cargo crate that builds to a single
 relocatable ELF object (`crate-type = "staticlib"`). A minimal
@@ -274,11 +280,11 @@ boundary is unsafe as a whole, because nothing has verified your
 arguments, and marking only the pointer-taking ones would imply the rest
 had been checked.
 
-If you wrap them in safe helpers, mark the wrappers `#[inline]`. Anything
-left out of line in a *different crate* is a symbol
-`cargo xtask build-module` does not put in your `.ko`, so the module ends
-up referencing your Rust-mangled wrapper — which is in no kernel's
-KSYMTAB — instead of `narf_printk`.
+Safe wrappers may live in your crate or in a kernel-free dependency
+crate: `cargo xtask build-module` links out-of-line code from the
+crate's dependencies into the `.ko`, so a wrapper in another crate is
+resolved inside the module and only the `narf_*` export it calls is
+left for KSYMTAB.
 
 Each export carries a CRC computed from its signature. If the kernel's
 signature changes, your module is refused at load with a CRC mismatch
@@ -288,6 +294,31 @@ to do anything to opt into that.
 Referencing a symbol that is *not* exported is a load-time failure, not
 a link-time one: the relocator reports `SymbolNotFound` naming the
 symbol.
+
+## Writing against `narf-module-rt`
+
+[`narf-module-rt`](./rt) is a kernel-free crate built only from
+`narf_printk`, `narf_kmalloc`, `narf_kfree` and `narf_monotonic_ns`.
+Depending on it gives a module:
+
+| Piece | What it is |
+|---|---|
+| `heap::KernelHeap` | The module's `#[global_allocator]` (installed for you on the kernel target), so `alloc::{vec, boxed, string, format}` work. |
+| `printkln!` | Whole-line console output, split only at UTF-8 boundaries. |
+| `sync::SpinLock` | For state shared between concurrent upcalls; its guard is `!Send`. |
+| `sync::Mutex` | Async mutex whose guard may be held across `.await`. |
+| `time` | `now_ns`, `Deadline`, `sleep_until`/`sleep_ms`, `yield_now`, `spin_ns`. |
+| `exec::Executor` | Runs the module's own futures. Keep one in a `static` and call `run()` from every upcall (poller, IRQ vector callbacks, probe). Tasks must be `Send`. |
+
+The kernel never polls a module's futures: a `Future` cannot cross the
+KABI. The device poller (`narf_spawn_poller`, every 1 ms) is the
+executor's heartbeat; wakers and IRQ callbacks only bring the next pass
+forward. Module code always runs in task context, so the locks spin
+across CPUs but never mask interrupts.
+
+`modules/rt-smoke` is the reference: it allocates, formats and runs two
+futures under an async mutex from `narf_module_init`, and the
+`modules/e2e` kernel test loads it on both architectures.
 
 ## Lifecycle symbols
 

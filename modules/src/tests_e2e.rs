@@ -881,6 +881,72 @@ fn e2e_real_rust_module_loads_raw_and_compressed() -> TestResult {
 }
 kernel_test_in!("modules/e2e", e2e_real_rust_module_loads_raw_and_compressed);
 
+// ── Smoke 8b: a module built on `narf-module-rt` (alloc + async) ───────
+
+/// Load the rustc-built `narf-module-rt-smoke` `.ko`. Unlike the reference
+/// test module, its object carries out-of-line `core`/`alloc` code and the
+/// runtime crate, linked in from the staticlib archive and section-GC'd by
+/// `xtask build-module`; this is the proof that such an object relocates and
+/// runs. Its `narf_module_init` allocates through its `#[global_allocator]`,
+/// formats with `alloc::format!`, and drives two futures on its own executor
+/// (a 3 ms sleep under an async mutex and a waiter on that mutex), returning
+/// a negative errno if any of those misbehaves — so a successful load is the
+/// assertion.
+fn e2e_runtime_module_allocates_and_runs_futures() -> TestResult {
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("no staged initramfs for runtime module smoke");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/narf_module_rt_smoke.ko")
+    else {
+        return TestResult::Skip("narf_module_rt_smoke.ko was not staged");
+    };
+
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::Ed25519Verifier));
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+
+    let mut image = staged.to_vec();
+    const PLACEHOLDER: &[u8] = b"kernel_abi=0x00000000";
+    let Some(value_at) = image
+        .windows(PLACEHOLDER.len())
+        .position(|window| window == PLACEHOLDER)
+        .map(|start| start + b"kernel_abi=0x".len())
+    else {
+        return TestResult::Fail("runtime module has no ABI placeholder");
+    };
+    let stamped = format!("{abi:08x}");
+    image[value_at..value_at + 8].copy_from_slice(stamped.as_bytes());
+
+    let module = match sys_init_module(&image) {
+        Ok(module) => module,
+        Err(_) => {
+            return TestResult::Fail(
+                "runtime module failed to load, or its init reported a heap/executor fault",
+            )
+        }
+    };
+    if module.name() != "module_rt_smoke"
+        || *module.state.lock() != crate::lifecycle::ModuleState::Live
+    {
+        return TestResult::Fail("runtime module did not reach Live under its manifest name");
+    }
+    drop(module);
+    if sys_delete_module("module_rt_smoke").is_err() {
+        return TestResult::Fail("runtime module exit/unload failed");
+    }
+    if crate::registry::contains("module_rt_smoke") {
+        return TestResult::Fail("runtime module remained registered after unload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e", e2e_runtime_module_allocates_and_runs_futures);
+
 // ── Smoke 9: a real dual-build driver `.ko` loads and DRIVES the device ──
 
 /// The capstone of the loadable-driver work: load the rustc-built
