@@ -20,6 +20,12 @@
 //!   Wa_14011503117 (the DE fatal-error mask around the enable) is display
 //!   13 only.
 //!
+//! Display 9 (Skylake through Comet Lake, [`plan_display9`]) takes the same
+//! window and registers with its own limits: a 4096x4096 source and
+//! destination, 3.0 both ways on either scaler, two scalers on pipes A and B
+//! and one on C, `SKL_PS_SCALER_MODE_HQ` on scaler 0 of a two-scaler pipe
+//! (`_DYN` on pipe C), and no programmable filter (GLK+).
+//!
 //! Qualified profile: upscaling only. A downscaled source raises the pipe
 //! pixel rate (`ilk_pipe_pixel_rate`) and with it CDCLK and the watermarks,
 //! which the display-14 resource model does not carry; it is a typed
@@ -69,6 +75,11 @@ pub enum ScalerRefusal {
     Ratio,
     /// Downscaling: unqualified (pipe pixel rate, CDCLK, watermarks).
     Downscale,
+    /// The pipe has no scaler (display 9 pipe D does not exist).
+    NoScaler,
+    /// A filter this display cannot program (nearest neighbour before
+    /// GLK).
+    Filter,
 }
 
 /// One pipe scaler bound to the pipe (`scaler_state->scalers[id]`).
@@ -82,6 +93,9 @@ pub struct PipeScaler {
     pub hscale: u32,
     pub vscale: u32,
     pub filter: Filter,
+    /// `scaler_state->scalers[id].mode`: `PS_SCALER_MODE_NORMAL` (0) on
+    /// display 10+, `SKL_PS_SCALER_MODE_HQ`/`_DYN` on display 9.
+    pub mode: u32,
 }
 
 /// `skl_scaler_max_src_size` (display 14).
@@ -227,6 +241,84 @@ pub fn plan(
         hscale,
         vscale,
         filter,
+        mode: 0,
+    }))
+}
+
+/// `skl_scaler_max_src_size` / `skl_scaler_max_dst_size` before display 11.
+const D9_MAX: u32 = 4096;
+/// `SKL_PS_SCALER_MODE_MASK` (bits 29:28, skl/bxt): `_DYN` and `_HQ`.
+pub const SKL_PS_SCALER_MODE_DYN: u32 = 0;
+pub const SKL_PS_SCALER_MODE_HQ: u32 = 1 << 28;
+
+/// Scalers on a display-9 pipe (`intel_display_device.c`: two on A and
+/// B, one on C; display 9 has no pipe D).
+pub const fn display9_scalers(pipe: Pipe) -> u32 {
+    match pipe {
+        Pipe::A | Pipe::B => 2,
+        Pipe::C => 1,
+        Pipe::D => 0,
+    }
+}
+
+/// [`plan`] for display 9 on `pipe`: `skl_update_scaler`'s display-9
+/// ranges, `calculate_max_scale`'s 3.0 both ways (RGB, either scaler), and
+/// `intel_atomic_setup_scaler`'s display-9 mode: a lone user on a pipe with
+/// two scalers takes scaler 0 in HQ mode, otherwise dynamic mode.
+pub fn plan_display9(
+    native: &Mode,
+    src_w: u32,
+    src_h: u32,
+    mode: ScalingMode,
+    filter: Filter,
+    pipe: Pipe,
+) -> Result<Option<PipeScaler>, ScalerRefusal> {
+    let Some(window) = panel_fit(native, src_w, src_h, mode) else {
+        return Ok(None);
+    };
+    let scalers = display9_scalers(pipe);
+    if scalers == 0 {
+        return Err(ScalerRefusal::NoScaler);
+    }
+    // The scaling-filter property is GLK+ (`intel_crtc_init`): display 9
+    // has only the medium filter.
+    if filter != Filter::Default {
+        return Err(ScalerRefusal::Filter);
+    }
+    if u64::from(window.x) + u64::from(window.width) > u64::from(native.h_active)
+        || u64::from(window.y) + u64::from(window.height) > u64::from(native.v_active)
+    {
+        return Err(ScalerRefusal::OutOfRange);
+    }
+    if src_w < MIN_SIZE
+        || src_h < MIN_SIZE
+        || window.width < MIN_SIZE
+        || window.height < MIN_SIZE
+        || src_w > D9_MAX
+        || src_h > D9_MAX
+        || window.width > D9_MAX
+        || window.height > D9_MAX
+    {
+        return Err(ScalerRefusal::OutOfRange);
+    }
+    let max = 0x30000 - 1;
+    let hscale = checked_scale(src_w << 16, window.width, 0, max)?;
+    let vscale = checked_scale(src_h << 16, window.height, 0, max)?;
+    if hscale > 0x10000 || vscale > 0x10000 {
+        return Err(ScalerRefusal::Downscale);
+    }
+    let mode = if scalers > 1 {
+        SKL_PS_SCALER_MODE_HQ
+    } else {
+        SKL_PS_SCALER_MODE_DYN
+    };
+    Ok(Some(PipeScaler {
+        id: 0,
+        window,
+        hscale,
+        vscale,
+        filter,
+        mode,
     }))
 }
 
@@ -245,7 +337,7 @@ pub fn calc_phase(scale: u32) -> u16 {
 /// `PS_PHASE_MASK` (u2.13) and `PS_PHASE_TRIP`.
 const PS_PHASE_MASK: u16 = 0x7fff << 1;
 const PS_PHASE_TRIP: u16 = 1;
-/// `PS_SCALER_EN`, `PS_BINDING_PIPE`, `PS_SCALER_MODE_NORMAL`.
+/// `PS_SCALER_EN` (`PS_BINDING_PIPE` and `PS_SCALER_MODE_NORMAL` are 0).
 pub const PS_SCALER_EN: u32 = 1 << 31;
 /// `PS_FILTER_PROGRAMMED` with every filter select on set 0.
 pub const PS_FILTER_PROGRAMMED: u32 = 1 << 23;
@@ -308,6 +400,7 @@ impl PipeScaler {
     /// `PS_CTRL`: enabled, bound to the pipe, normal mode, the filter.
     pub fn ctrl(&self) -> u32 {
         PS_SCALER_EN
+            | self.mode
             | match self.filter {
                 // PS_FILTER_MEDIUM is 0.
                 Filter::Default => 0,
@@ -353,6 +446,19 @@ pub fn disable_writes(pipe: Pipe) -> [(u64, u32); 6] {
         (ps_win_pos(pipe, 1), 0),
         (ps_win_sz(pipe, 1), 0),
     ]
+}
+
+/// `skl_scaler_disable` on a display-9 pipe: only the scalers it has.
+pub fn disable_writes_display9(pipe: Pipe) -> alloc::vec::Vec<(u64, u32)> {
+    (0..display9_scalers(pipe))
+        .flat_map(|id| {
+            [
+                (ps_ctrl(pipe, id), 0),
+                (ps_win_pos(pipe, id), 0),
+                (ps_win_sz(pipe, id), 0),
+            ]
+        })
+        .collect()
 }
 
 /// `skl_scaler_1st_prefill_lines` and `skl_scaler_2nd_prefill_lines`

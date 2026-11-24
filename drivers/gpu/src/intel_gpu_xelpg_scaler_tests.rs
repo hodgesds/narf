@@ -240,3 +240,125 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_scaler",
     smoke_xelpg_scaler_prefill_lines
 );
+
+/// Display 9 (`plan_display9`): 4096x4096 limits, 3.0 both ways on either
+/// scaler, HQ on a two-scaler pipe and DYN on pipe C, no pipe D, the medium
+/// filter only, and only the scalers a pipe has detached.
+fn smoke_display9_scaler_profile() -> TestResult {
+    let qhd = panel(2560, 1440);
+    let Ok(Some(a)) = plan_display9(
+        &qhd,
+        1920,
+        1080,
+        ScalingMode::Aspect,
+        Filter::Default,
+        Pipe::A,
+    ) else {
+        return TestResult::Fail("1080p must fit a 1440p panel on pipe A");
+    };
+    if a.id != 0
+        || a.mode != SKL_PS_SCALER_MODE_HQ
+        || a.window
+            != (Window {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            })
+        || a.ctrl() != PS_SCALER_EN | SKL_PS_SCALER_MODE_HQ
+    {
+        return TestResult::Fail("pipe A must take scaler 0 in HQ mode, full panel");
+    }
+    let Ok(Some(c)) = plan_display9(
+        &qhd,
+        1920,
+        1080,
+        ScalingMode::Aspect,
+        Filter::Default,
+        Pipe::C,
+    ) else {
+        return TestResult::Fail("pipe C has one scaler");
+    };
+    if c.mode != SKL_PS_SCALER_MODE_DYN || c.ctrl() != PS_SCALER_EN {
+        return TestResult::Fail("pipe C's lone scaler runs in dynamic mode");
+    }
+    for (got, want, why) in [
+        (
+            plan_display9(
+                &qhd,
+                1920,
+                1080,
+                ScalingMode::Aspect,
+                Filter::Default,
+                Pipe::D,
+            ),
+            Err(ScalerRefusal::NoScaler),
+            "display 9 has no pipe D",
+        ),
+        (
+            plan_display9(
+                &qhd,
+                1920,
+                1080,
+                ScalingMode::Aspect,
+                Filter::NearestNeighbor,
+                Pipe::A,
+            ),
+            Err(ScalerRefusal::Filter),
+            "nearest neighbour is GLK+",
+        ),
+        (
+            plan_display9(
+                &qhd,
+                3200,
+                1800,
+                ScalingMode::Fullscreen,
+                Filter::Default,
+                Pipe::A,
+            ),
+            Err(ScalerRefusal::Downscale),
+            "a downscale stays refused",
+        ),
+        (
+            plan_display9(
+                &qhd,
+                2560,
+                1440,
+                ScalingMode::Aspect,
+                Filter::Default,
+                Pipe::A,
+            ),
+            Ok(None),
+            "a native source needs no scaler",
+        ),
+    ] {
+        if got != want {
+            return TestResult::Fail(why);
+        }
+    }
+    // 5K panels are past display 9's 4096 destination maximum, where
+    // display 14 (8192) admits them.
+    let five_k = panel(5120, 2880);
+    if plan_display9(
+        &five_k,
+        2560,
+        1440,
+        ScalingMode::Fullscreen,
+        Filter::Default,
+        Pipe::A,
+    ) != Err(ScalerRefusal::OutOfRange)
+    {
+        return TestResult::Fail("a 5120-wide destination exceeds display 9");
+    }
+    if disable_writes_display9(Pipe::C).len() != 3
+        || disable_writes_display9(Pipe::A).len() != 6
+        || !disable_writes_display9(Pipe::D).is_empty()
+    {
+        return TestResult::Fail("only a pipe's own scalers are detached");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_scaler",
+    smoke_display9_scaler_profile
+);

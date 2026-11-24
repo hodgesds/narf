@@ -460,6 +460,9 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     edp_hobl: bool,
     edp_low_vswing: bool,
     tc_width: u8,
+    /// Display-9 panel fitting (`set_gen9_panel_fit`): the pipe source
+    /// size and the bound pipe scaler. `None` scans out at the mode size.
+    gen9_panel_fit: Option<(u16, u16, crate::intel_gpu_xelpg_scaler::PipeScaler)>,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -495,7 +498,42 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             edp_hobl: false,
             edp_low_vswing: false,
             tc_width: 4,
+            gen9_panel_fit: None,
         }
+    }
+
+    /// Fit a `src_w` x `src_h` pipe source to `native` (the panel's fixed
+    /// mode, the one this run commits) with display 9's pipe scaler:
+    /// Linux's `pch_panel_fitting` + `skl_update_scaler_crtc` +
+    /// `skl_pfit_enable`. Gen9 runs only, after `set_gen9_platform`; a
+    /// native-size source clears the fit.
+    pub fn set_gen9_panel_fit(
+        &mut self,
+        native: &Mode,
+        src_w: u16,
+        src_h: u16,
+        mode: crate::intel_gpu_xelpg_scaler::ScalingMode,
+    ) -> Result<(), crate::intel_gpu_xelpg_scaler::ScalerRefusal> {
+        if self.gen9_platform.is_none() {
+            return Err(crate::intel_gpu_xelpg_scaler::ScalerRefusal::NoScaler);
+        }
+        self.gen9_panel_fit = crate::intel_gpu_xelpg_scaler::plan_display9(
+            native,
+            u32::from(src_w),
+            u32::from(src_h),
+            mode,
+            crate::intel_gpu_xelpg_scaler::Filter::Default,
+            self.pipe,
+        )?
+        .map(|scaler| (src_w, src_h, scaler));
+        Ok(())
+    }
+
+    /// The pipe source and primary-plane size: the panel-fit source, or
+    /// the mode's active area.
+    fn pipe_source(&self, mode: &Mode) -> (u16, u16) {
+        self.gen9_panel_fit
+            .map_or((mode.h_active, mode.v_active), |(w, h, _)| (w, h))
     }
 
     pub(crate) fn set_gen12_family(&mut self, family: crate::intel_gpu_gt::Gen12Platform) {
@@ -1782,9 +1820,27 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             Ok(p) => p,
             Err(_) => return,
         };
+        let (src_w, src_h) = self.pipe_source(mode);
+        let srcsz = if self.gen9_panel_fit.is_some() {
+            (u32::from(src_w) - 1) << 16 | (u32::from(src_h) - 1)
+        } else {
+            prog.srcsz
+        };
         // PIPE_SRCSZ lives inside the pipe MMIO block.
         self.mmio
-            .write32(self.pipe.trans_base() + PIPE_SRCSZ_OFFSET, prog.srcsz);
+            .write32(self.pipe.trans_base() + PIPE_SRCSZ_OFFSET, srcsz);
+        // Display 9: skl_pfit_enable for a fitted source; otherwise
+        // skl_detach_scalers frees whatever scaler an earlier owner bound.
+        if self.gen9_platform.is_some() {
+            let pipe = self.pipe;
+            let writes = match self.gen9_panel_fit {
+                Some((_, _, scaler)) => scaler.enable_writes(pipe),
+                None => crate::intel_gpu_xelpg_scaler::disable_writes_display9(pipe),
+            };
+            for (reg, val) in writes {
+                self.mmio.write32(reg, val);
+            }
+        }
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -1820,9 +1876,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             // opaque by the pipe when the surface is XRGB).
             PixelFormat::Xrgb8888 => PipeFmt::Argb8888,
         };
+        let (plane_w, plane_h) = self.pipe_source(mode);
         let prog = match build_primary_plane(
-            mode.h_active,
-            mode.v_active,
+            plane_w,
+            plane_h,
             fb.stride_bytes,
             fb.phys_addr as u32,
             pipe_fmt,
@@ -3920,6 +3977,88 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_program_pipe_writes_srcsz
+    );
+
+    /// Gen9 panel fitting: a 1024x768 source on a 1920x1080 panel takes
+    /// PIPE_SRCSZ and the plane size from the source, binds scaler 0 in HQ
+    /// mode (`skl_pfit_enable`) and pillarboxes it; without a fit the pipe
+    /// detaches its scalers. Other generations refuse the fit.
+    fn smoke_gen9_panel_fit_programs_the_pipe_scaler() -> TestResult {
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, PIPE_SRCSZ_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET,
+        };
+        use crate::intel_gpu_xelpg_scaler::{
+            ps_ctrl, ps_win_pos, ps_win_sz, ScalerRefusal, ScalingMode, PS_SCALER_EN,
+            SKL_PS_SCALER_MODE_HQ,
+        };
+        let panel = Mode {
+            pixel_clock_khz: 148_500,
+            h_active: 1920,
+            h_total: 2200,
+            h_sync_start: 2008,
+            h_sync_end: 2052,
+            v_active: 1080,
+            v_total: 1125,
+            v_sync_start: 1084,
+            v_sync_end: 1089,
+            ..Mode::VESA_1024X768_60
+        };
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 4096,
+            format: PixelFormat::Xrgb8888,
+        };
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        if ms.set_gen9_panel_fit(&panel, 1024, 768, ScalingMode::Aspect)
+            != Err(ScalerRefusal::NoScaler)
+        {
+            return TestResult::Fail("a non-Gen9 run must refuse the Gen9 panel fitter");
+        }
+        ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::KabyLake);
+        if ms.set_gen9_panel_fit(&panel, 1024, 768, ScalingMode::Aspect) != Ok(()) {
+            return TestResult::Fail("a 1024x768 upscale must fit a 1080p panel");
+        }
+        ms.program_pipe(&panel);
+        ms.program_plane(&fb, &panel);
+        let a = PipeIdx::A;
+        if mmio.writes_to(a.trans_base() + PIPE_SRCSZ_OFFSET) != alloc::vec![(1023 << 16) | 767] {
+            return TestResult::Fail("PIPE_SRCSZ must carry the fitted source");
+        }
+        if mmio.writes_to(a.base() + PLANE_PRIMARY_OFFSET + PLANE_SIZE_OFFSET)
+            != alloc::vec![(767 << 16) | 1023]
+        {
+            return TestResult::Fail("the primary plane must scan out the source size");
+        }
+        if mmio.writes_to(ps_ctrl(a, 0)) != alloc::vec![PS_SCALER_EN | SKL_PS_SCALER_MODE_HQ] {
+            return TestResult::Fail("scaler 0 must bind the pipe in HQ mode");
+        }
+        // Aspect 4:3 on 16:9: 1440x1080 pillarboxed at x = 240.
+        if mmio.writes_to(ps_win_pos(a, 0)) != alloc::vec![240 << 16]
+            || mmio.writes_to(ps_win_sz(a, 0)) != alloc::vec![(1440 << 16) | 1080]
+        {
+            return TestResult::Fail("the pillarbox window is wrong");
+        }
+        // A native source clears the fit; the pipe then detaches both
+        // scalers and scans out the mode size.
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::KabyLake);
+        if ms.set_gen9_panel_fit(&panel, 1920, 1080, ScalingMode::Aspect) != Ok(()) {
+            return TestResult::Fail("a native source must clear the fit");
+        }
+        ms.program_pipe(&panel);
+        if mmio.writes_to(a.trans_base() + PIPE_SRCSZ_OFFSET) != alloc::vec![(1919 << 16) | 1079]
+            || mmio.writes_to(ps_ctrl(a, 0)) != alloc::vec![0]
+            || mmio.writes_to(ps_ctrl(a, 1)) != alloc::vec![0]
+        {
+            return TestResult::Fail("a native Gen9 pipe must detach its scalers");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen9_panel_fit_programs_the_pipe_scaler
     );
 
     fn smoke_gen12_internal_rgb_bypass_precedes_primary_and_refuses_live_pipe() -> TestResult {
