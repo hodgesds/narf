@@ -474,9 +474,39 @@ pub fn plan_modeset(
         // where it matters: `regOTG0_OTG_V_BLANK_START_END` is 0x1b36 on
         // 3.1.4 and 0x1b38 on 3.5, `V_SYNC_A` 0x1b37 against 0x1b39, and
         // `OTG_CONTROL` 0x1b41 against 0x1b43. DCN 3.1.4 agrees with DCN 2.0
-        // on all seven OTG registers, so the 2.0 sequence is the correct one
-        // for it. Selecting the 3.5 sequence here put every vertical timing
-        // register and the master enable two dwords past where they live.
+        // on every OTG register the 2.0 sequence touches, so the 2.0 sequence
+        // is the correct one for it. Selecting the 3.5 sequence here put every
+        // vertical timing register and the master enable two dwords past where
+        // they live.
+        //
+        // Verified against Linux 7.4-rc2 (`dcn_2_0_0_offset.h` vs
+        // `dcn_3_1_4_offset.h`): H_TOTAL 0x1b2a, H_BLANK_START_END 0x1b2b,
+        // H_SYNC_A 0x1b2c, V_TOTAL 0x1b2f, V_BLANK_START_END 0x1b36,
+        // V_SYNC_A 0x1b37, V_SYNC_A_CNTL 0x1b38, OTG_CONTROL 0x1b41 and
+        // OTG_INTERRUPT_CONTROL 0x1b59 are identical on both. The DCN 2.0
+        // caps split (Navi10 `res_cap_nv10` 6/6/6, Navi14 mobile
+        // `res_cap_nv14` 5/5/5, `dcn20_resource.c:683/721`) is a pipe-count
+        // difference only — the register layout is one shared header.
+        // Renoir and Green Sardine are not DCN 2.0 consumers at all: Linux
+        // maps them to DCN 2.1 (`dc_resource.c`, `dcn21_resource.c`
+        // `res_cap_rn` 4/5/5), whose OTG ids match 2.0's in
+        // `dcn_2_1_0_offset.h`.
+        //
+        // Raphael (DCN 3.1.5) takes the same 2.0 sequence through the `_`
+        // arm below, and that routing is correct: 3.1.5 has no hwseq of its
+        // own — `dcn315_resource.c:2325` calls `dcn31_hw_sequencer_construct`,
+        // and that table (`dcn31_init.c` `dcn31_funcs`) assigns the modeset
+        // path (front-end program, plane-address update, stream
+        // enable/unblank, TG lock, bandwidth) to `dcn20_*` functions — and
+        // every register the sequence touches is at the same id in
+        // `dcn_3_1_5_offset.h`, except one: `OTG_INTERRUPT_CONTROL` (0x1b59)
+        // has no 3.1.5 register (the id is unassigned; the OTG block jumps
+        // from 0x1b58 to 0x1b62). The sequence only ever writes 0 there
+        // (interrupts off), so the write cannot set anything — it stays,
+        // documented, rather than splitting the sequence for a zero-valued
+        // write. Linux's own DCN 2.0 hwseq never touches that register
+        // either (`dcn20_hwseq.c`: vupdate interrupts go through
+        // `setup_vertical_interrupt2`, 0x1b67, which 3.1.5 does have).
         //
         // `dcn35_modeset_sequence` is kept for Strix, which really is 3.5.
         Family::Phoenix => dcn20_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
