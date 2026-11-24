@@ -34,7 +34,7 @@
 extern crate alloc;
 
 use core::fmt::Write as _;
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -726,6 +726,12 @@ impl HwStatus {
 /// (same discipline as e1000's `TX_RING_USABLE`).
 pub const TX_RING_USABLE: usize = TX_RING_LEN - 1;
 
+/// TX watchdog timeout (Linux `dev->watchdog_timeo` is 5 s by
+/// default, and e1000 / r8169 use the same 5 s): a TX descriptor
+/// posted longer ago than this with no completion is a wedged
+/// ring, not congestion (issue #796).
+const TX_TIMEOUT_NS: u64 = 5_000_000_000;
+
 /// Descriptors outstanding: `(prod - cons)` modulo the ring size.
 /// Callers must keep the result `< TX_RING_LEN` (the
 /// `TX_RING_USABLE` gate in `transmit` does) — at `TX_RING_LEN`
@@ -753,6 +759,17 @@ pub fn advance_tx_cons(sw_cons: u32, hw_cons: u32, prod: u32) -> (u32, u32) {
     (cons, reclaimed)
 }
 
+/// True when any posted TX descriptor has waited longer than
+/// `timeout` cycles for its completion — the ring is wedged
+/// (r8169 `tx_stalled` shape, per-slot so a later post cannot
+/// mask an older stuck one). Factored pure so the fixture pins
+/// the decision the watchdog uses (issue #796).
+fn tx_stalled(posted_at: &[u64; TX_RING_LEN], now: u64, timeout: u64) -> bool {
+    posted_at
+        .iter()
+        .any(|&posted| posted != 0 && now.saturating_sub(posted) > timeout)
+}
+
 // ── Errors ──────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -773,6 +790,10 @@ pub enum NicError {
     /// The device is suspended for system suspend (issue #793):
     /// the datapath gates refuse TX and RX while suspended.
     Suspended,
+    /// A TX entry point raced watchdog recovery: the reset owns
+    /// the rings, so a frame posted mid-reset would be silently
+    /// dropped (issue #796).
+    Recovering,
     /// Data path not implemented yet (placeholder for paths not
     /// fully wired to silicon yet).
     NotImplemented,
@@ -861,6 +882,24 @@ pub struct Tg3Nic {
     /// Set by `suspend`, cleared by `resume`: the datapath gates
     /// refuse TX and RX while this is set (issue #793).
     suspended: AtomicBool,
+    /// Cycle-stamp of the TX post occupying each ring slot (`0` =
+    /// nothing outstanding). `transmit` stamps on post;
+    /// `poll_tx_completions` clears on reap; the watchdog ages the
+    /// oldest stamp against `TX_TIMEOUT_NS` (issue #796).
+    tx_posted_at: IrqSafeSpinLock<[u64; TX_RING_LEN]>,
+    /// Live carrier sample for the watchdog, updated by the RX
+    /// pump from `live_link_up` and initialised from the bring-up
+    /// BMSR sample. A plain MMIO link-status read does not exist
+    /// on this family — link lives in the PHY behind the MDIO bus,
+    /// and the watchdog timer callback must not wait on it.
+    carrier_up: AtomicBool,
+    /// Set while [`Tg3Nic::recover`] owns the reset sequence: TX
+    /// posted mid-reset would be silently dropped.
+    recovering: AtomicBool,
+    /// TX stalls the watchdog counted (Linux `tx_timeout_count`).
+    tx_timeouts: AtomicU64,
+    /// Controller resets performed by [`Tg3Nic::recover`].
+    tx_resets: AtomicU64,
 
     // IPC integration
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -1111,6 +1150,11 @@ impl Tg3Nic {
             addr: device.addr,
             ifname: crate::publish::IfName::new(),
             suspended: AtomicBool::new(false),
+            tx_posted_at: IrqSafeSpinLock::new([0; TX_RING_LEN]),
+            carrier_up: AtomicBool::new(link_up),
+            recovering: AtomicBool::new(false),
+            tx_timeouts: AtomicU64::new(0),
+            tx_resets: AtomicU64::new(0),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
@@ -1286,6 +1330,10 @@ impl Tg3Nic {
         // The reset can clear the HOSTCC registers: re-program the
         // status-block address so TX completions keep flowing.
         self.program_status_block();
+        // The reset discarded every in-flight descriptor: reset the
+        // TX software state so no stale post-time survives to
+        // false-fire the watchdog after resume (issue #796).
+        self.reset_tx_software_state();
         self.suspended.store(false, Ordering::Release);
         crate::publish::publish_link(
             self.ifname(),
@@ -1311,6 +1359,9 @@ impl Tg3Nic {
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<u32, NicError> {
         if self.suspended.load(Ordering::Acquire) {
             return Err(NicError::Suspended);
+        }
+        if self.recovering.load(Ordering::Acquire) {
+            return Err(NicError::Recovering);
         }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
@@ -1352,6 +1403,11 @@ impl Tg3Nic {
         }
         compiler_fence(Ordering::SeqCst);
 
+        // Stamp the post time before the doorbell makes the
+        // descriptor visible to the chip: the watchdog ages the
+        // slot from here (issue #796).
+        self.tx_posted_at.lock()[slot] = narf_time::now_cycles();
+
         let returned = *head_g;
         *head_g = (*head_g + 1) % (TX_RING_LEN as u32);
         // Stage 3: ring the doorbell with the post-increment
@@ -1376,15 +1432,27 @@ impl Tg3Nic {
     /// will call it (or its IRQ-driven successor) to age
     /// outstanding descriptors.
     pub fn poll_tx_completions(&self) -> u32 {
-        // Lock order is `tx_head` -> `tx_cons` everywhere:
-        // `transmit` takes `tx_cons` while holding `tx_head`, so
-        // taking them in the same order here keeps the pair
-        // deadlock-free.
+        // Lock order is `tx_head` -> `tx_cons` -> `tx_posted_at`
+        // everywhere: `transmit` takes `tx_cons` while holding
+        // `tx_head`, so taking them in the same order here keeps
+        // the set deadlock-free.
         let head_g = self.tx_head.lock();
         let mut cons_g = self.tx_cons.lock();
         let hw_cons = self.read_hw_tx_consumer();
+        let old_cons = *cons_g;
         let (new_cons, reclaimed) = advance_tx_cons(*cons_g, hw_cons, *head_g);
         *cons_g = new_cons;
+        if reclaimed != 0 {
+            // Clear the post times of the slots the chip just
+            // completed, so the watchdog never ages a finished
+            // frame (issue #796).
+            let mut posted = self.tx_posted_at.lock();
+            let mut slot = old_cons;
+            for _ in 0..reclaimed {
+                posted[slot as usize % TX_RING_LEN] = 0;
+                slot = (slot + 1) % (TX_RING_LEN as u32);
+            }
+        }
         reclaimed
     }
 
@@ -1400,6 +1468,104 @@ impl Tg3Nic {
         // chip's latest DMA without tearing the u16 field.
         let s = unsafe { core::ptr::read_volatile(p) };
         s.tx_consumer() as u32
+    }
+
+    /// TX stall recoveries (Linux `tx_timeout_count`).
+    pub fn tx_timeouts(&self) -> u64 {
+        self.tx_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Controller resets performed by [`Tg3Nic::recover`].
+    pub fn tx_resets(&self) -> u64 {
+        self.tx_resets.load(Ordering::Relaxed)
+    }
+
+    // Fixture-only: its only callers live in the x86_64-only
+    // `smoke` module, so the method is gated to match (otherwise
+    // it is dead code on aarch64, where clippy runs `-D dead-code`).
+    #[cfg(target_arch = "x86_64")]
+    /// One watchdog pass, synchronously (the fixture): the core
+    /// watchdog's check, then `ndo_tx_timeout` if it fired. Returns
+    /// true when recovery fired and succeeded.
+    fn check_tx_watchdog_at(&self, now: u64) -> bool {
+        use narf_net::watchdog::NetdevWatchdog;
+        if !self.tx_timed_out(now) {
+            return false;
+        }
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.recover().is_ok()
+    }
+
+    /// Reset the TX software cursors after the chip was reset:
+    /// posted descriptors will never complete, so their slots are
+    /// free and their post times are void. Shared by watchdog
+    /// recovery and resume — both re-run the chip reset, and both
+    /// must leave the watchdog with no stale stamps to age.
+    fn reset_tx_software_state(&self) {
+        *self.tx_head.lock() = 0;
+        *self.tx_cons.lock() = 0;
+        self.tx_posted_at.lock().fill(0);
+    }
+
+    /// TX-timeout recovery (Linux `tg3_tx_timeout` +
+    /// `tg3_reset_task` shape): re-run the chip reset, reprogram
+    /// the status-block address the reset can clear, zero the TX
+    /// ring + status block, and reset the software cursors —
+    /// descriptors posted before the reset will never complete. A
+    /// reset that never self-clears reports `ResetTimeout` and
+    /// leaves the device stopped; a concurrent recovery reports
+    /// `Recovering` without touching the device. The ring-base
+    /// programming + SNDBDS_MODE enable slices are still missing
+    /// from this driver, so recovery re-runs exactly the
+    /// bring-up/resume program and nothing more.
+    pub fn recover(&self) -> Result<(), NicError> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(NicError::Suspended);
+        }
+        if self.recovering.swap(true, Ordering::AcqRel) {
+            return Err(NicError::Recovering);
+        }
+        let result = self.recover_inner();
+        self.recovering.store(false, Ordering::Release);
+        if result.is_ok() {
+            self.tx_resets.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn recover_inner(&self) -> Result<(), NicError> {
+        // 1. Chip reset (the same program bring-up and resume run).
+        // A reset bit that never clears leaves the device stopped
+        // — the cursors stay put so a retry sees the pre-reset
+        // state.
+        if !pm::chip_reset_plan(&pm::MmioBank::new(&self.mmio)) {
+            return Err(NicError::ResetTimeout);
+        }
+        // 2. The reset can clear the HOSTCC registers: re-program
+        // the status-block address so TX completions keep flowing
+        // (same step as resume).
+        self.program_status_block();
+        // 3. Zero the TX ring + status block: a descriptor the
+        // reset abandoned keeps whatever state it had, and a stale
+        // consumer index must not stand in for a dropped frame.
+        // SAFETY: the TX ring is a coherent DMA buffer of exactly
+        // `TX_RING_LEN * size_of::<TxBufferDesc>()` bytes; the
+        // status block is a `TG3_HW_STATUS_SIZE` coherent buffer.
+        unsafe {
+            core::ptr::write_bytes(
+                self.tx_ring.cpu_mut_ptr_at::<u8>(0),
+                0,
+                TX_RING_LEN * core::mem::size_of::<TxBufferDesc>(),
+            );
+            for i in 0..TG3_HW_STATUS_SIZE {
+                core::ptr::write_volatile(self.status_block.cpu_mut_ptr_at::<u8>(i as u64), 0);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        // 4. Reset the software cursors now that the rings are
+        // fresh.
+        self.reset_tx_software_state();
+        Ok(())
     }
 
     /// Stage 2: read the descriptor at the current RX consumer
@@ -1548,6 +1714,30 @@ impl Tg3Nic {
     }
 }
 
+impl narf_net::watchdog::NetdevWatchdog for Tg3Nic {
+    /// A TX descriptor waited past `TX_TIMEOUT_NS` with carrier up,
+    /// and the device is awake and not already recovering. The
+    /// completion reap runs first, so a frame the chip finished
+    /// since the last TX never reads as a stall.
+    fn tx_timed_out(&self, now: u64) -> bool {
+        if self.suspended.load(Ordering::Acquire) || self.recovering.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.carrier_up.load(Ordering::Acquire) {
+            return false;
+        }
+        self.poll_tx_completions();
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        tx_stalled(&self.tx_posted_at.lock(), now, timeout)
+    }
+
+    /// Count the timeout and reset the transmit path (task context).
+    fn tx_timeout(&self) {
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+        let _ = self.recover();
+    }
+}
+
 impl narf_power::device_pm::DevicePmOps for Tg3Nic {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
         self.suspend()
@@ -1684,6 +1874,13 @@ fn spawn_pumps(
         tg3_rx_pump(d1, rx_prod).await;
     });
 
+    // `dev_watchdog` (issue #796): a timer every `watchdog_timeo`
+    // (5 s) that queues the reset when a transmit is stuck; it
+    // stops with the device.
+    let weak: alloc::sync::Weak<dyn narf_net::watchdog::NetdevWatchdog> =
+        alloc::sync::Arc::downgrade(&device) as _;
+    narf_net::watchdog::DevWatchdog::start_for_device(weak, TX_TIMEOUT_NS);
+
     let d2 = device;
     narf_scheduler::spawn(async move {
         tg3_tx_pump(d2, tx_cons).await;
@@ -1698,6 +1895,10 @@ async fn tg3_rx_pump(device: Arc<Tg3Nic>, mut rx_prod: Producer<Frame, RX_RING_N
     let mut last_up = device.live_link_up();
     loop {
         let up = device.live_link_up();
+        // Keep the watchdog's carrier sample current: the timer
+        // callback must not wait on the MDIO bus itself (issue
+        // #796).
+        device.carrier_up.store(up, Ordering::Release);
         if up != last_up {
             last_up = up;
             crate::publish::publish_link(
@@ -2275,4 +2476,225 @@ mod smoke {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/tg3", smoke_tg3_tx_completion_arithmetic);
+
+    fn smoke_tg3_tx_stall_detection() -> TestResult {
+        // Pure watchdog decision (issue #796): the fixture pins
+        // the boundary `tx_timed_out` uses, without a device.
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let mut posted = [0u64; TX_RING_LEN];
+        if tx_stalled(&posted, 1_000_000, timeout) {
+            return TestResult::Fail("tg3 idle TX ring reported stalled");
+        }
+        let now = 10_000_000u64;
+        posted[0] = now;
+        if tx_stalled(&posted, now + timeout, timeout) {
+            return TestResult::Fail("tg3 TX stall fired at exactly the timeout");
+        }
+        if !tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("tg3 TX stall did not fire past the timeout");
+        }
+        // A second, later post does not mask the older stuck one...
+        posted[1] = now + 100;
+        if !tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("tg3 later TX post masked the stuck descriptor");
+        }
+        // ...and reaping the oldest clears the stall once nothing
+        // aged remains.
+        posted[0] = 0;
+        if tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("tg3 TX stall survived reaping the stuck slot");
+        }
+        posted[1] = 0;
+        if tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("tg3 empty TX ring reported stalled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_tx_stall_detection);
+
+    /// Fake BCM57xx for the TX-timeout fixture: a 32 KiB MMIO
+    /// backing page (the BAR0 low window covers GRC_MODE /
+    /// GRC_MISC_CFG at 0x6800 and the TX producer mailbox at
+    /// 0x0304) plus a sleep-pump that emulates the two hardware
+    /// behaviours recovery depends on — the core-clock reset bit
+    /// self-clearing (tg3.h: GRC_MISC_CFG.CORECLK_RESET) and TX
+    /// completion via the host-coalescing status block once the
+    /// test arms it. Built from the spec (register offsets, reset
+    /// semantics), never from the implementation's constants.
+    static FIXTURE_MMIO: AtomicU64 = AtomicU64::new(0);
+    static FIXTURE_STATUS_BLOCK: AtomicU64 = AtomicU64::new(0);
+    static FIXTURE_COMPLETE_TX: AtomicBool = AtomicBool::new(false);
+    static FIXTURE_PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    fn fixture_pump() {
+        let base = FIXTURE_MMIO.load(Ordering::Acquire);
+        if base == 0 {
+            return;
+        }
+        // SAFETY: fixture-owned fake MMIO; base is published by the
+        // fixture and cleared on drop. The backing page is 32 KiB,
+        // so every register offset below is in bounds.
+        unsafe {
+            let misc = core::ptr::read_volatile((base + super::REG_GRC_MISC_CFG) as *const u32);
+            if misc & super::GRC_MISC_CFG_CORECLK_RESET != 0 {
+                core::ptr::write_volatile(
+                    (base + super::REG_GRC_MISC_CFG) as *mut u32,
+                    misc & !super::GRC_MISC_CFG_CORECLK_RESET,
+                );
+            }
+            if FIXTURE_COMPLETE_TX.load(Ordering::Acquire) {
+                // The chip completed everything the driver posted:
+                // the doorbell mailbox low word (0x0304) holds the
+                // latest producer index; mirror it into the status
+                // block's tx_consumer (HwStatus offset 18, pinned by
+                // `smoke_tg3_hw_status_layout_matches_linux`) so
+                // `poll_tx_completions` reaps it.
+                let prod = core::ptr::read_volatile(
+                    (base + super::REG_MAILBOX_SNDHOST_PROD_IDX_0 + super::TG3_64BIT_REG_LOW)
+                        as *const u32,
+                );
+                let status = FIXTURE_STATUS_BLOCK.load(Ordering::Acquire);
+                if status != 0 {
+                    core::ptr::write_volatile((status + 18) as *mut u16, prod as u16);
+                }
+            }
+        }
+    }
+
+    struct TxTimeoutFixture {
+        device: Tg3Nic,
+        _mmio_mem: DmaBuffer,
+    }
+
+    impl TxTimeoutFixture {
+        fn new() -> Self {
+            // 32 KiB fake BAR0 low window.
+            let mut mem = alloc_coherent(32 * 1024, DomainId::DRIVER_0).unwrap();
+            mem.as_mut_slice().fill(0);
+            let csr = MmioRegion {
+                phys: mem.phys_addr(),
+                virt: mem.as_mut_ptr() as u64,
+                len: mem.len() as u64,
+                kind: narf_bus::BarKind::Mmio32 {
+                    prefetchable: false,
+                },
+            };
+            FIXTURE_MMIO.store(csr.virt, Ordering::Release);
+            if !FIXTURE_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
+                narf_scheduler::sleep_pumps::register_nested_only(fixture_pump);
+            }
+            let tx_ring = alloc_coherent(TX_RING_BYTES, DomainId::DRIVER_0).unwrap();
+            let mut tx_pool = alloc::vec::Vec::with_capacity(TX_RING_LEN);
+            for _ in 0..TX_RING_LEN {
+                tx_pool.push(alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).unwrap());
+            }
+            let rx_ring = alloc_coherent(RX_STD_RING_BYTES, DomainId::DRIVER_0).unwrap();
+            let mut rx_pool = alloc::vec::Vec::with_capacity(RX_STD_RING_LEN);
+            for _ in 0..RX_STD_RING_LEN {
+                rx_pool.push(alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).unwrap());
+            }
+            let status_block = alloc_coherent(TG3_HW_STATUS_SIZE, DomainId::DRIVER_0).unwrap();
+            FIXTURE_STATUS_BLOCK.store(status_block.cpu_ptr_at::<u8>(0) as u64, Ordering::Release);
+            let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+            let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
+            let device = Tg3Nic {
+                mmio: csr,
+                tx_ring,
+                tx_pool,
+                tx_head: IrqSafeSpinLock::new(0),
+                status_block,
+                tx_cons: IrqSafeSpinLock::new(0),
+                rx_ring,
+                rx_pool,
+                rx_head: IrqSafeSpinLock::new(0),
+                mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                device_id: super::BCM_5751,
+                link_up: true,
+                reset_done: true,
+                addr: narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 0, 0, 0)),
+                ifname: crate::publish::IfName::new(),
+                suspended: AtomicBool::new(false),
+                tx_posted_at: IrqSafeSpinLock::new([0; TX_RING_LEN]),
+                carrier_up: AtomicBool::new(true),
+                recovering: AtomicBool::new(false),
+                tx_timeouts: AtomicU64::new(0),
+                tx_resets: AtomicU64::new(0),
+                rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+                tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            };
+            Self {
+                device,
+                _mmio_mem: mem,
+            }
+        }
+    }
+
+    impl Drop for TxTimeoutFixture {
+        fn drop(&mut self) {
+            FIXTURE_COMPLETE_TX.store(false, Ordering::Release);
+            FIXTURE_STATUS_BLOCK.store(0, Ordering::Release);
+            FIXTURE_MMIO.store(0, Ordering::Release);
+        }
+    }
+
+    fn smoke_tg3_tx_timeout_recovery_fixture() -> TestResult {
+        let fixture = TxTimeoutFixture::new();
+        let device = &fixture.device;
+        let frame = [0xAAu8; 64];
+        // 1. Stall: post one frame; the fake chip never completes it.
+        if device.transmit(&frame, &TxMeta::plain()).is_err() {
+            return TestResult::Fail("tg3 TX post failed on a fresh ring");
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let posted = device.tx_posted_at.lock()[0];
+        if posted == 0 {
+            return TestResult::Fail("tg3 TX post did not stamp a post time");
+        }
+        // 2. The watchdog does not fire inside the grace period...
+        if device.check_tx_watchdog_at(posted + timeout) {
+            return TestResult::Fail("tg3 watchdog fired at exactly the timeout");
+        }
+        if device.tx_resets() != 0 || device.tx_timeouts() != 0 {
+            return TestResult::Fail("tg3 watchdog counted a recovery it did not fire");
+        }
+        // ...but fires past it, resets the controller, and the ring
+        // comes back.
+        if !device.check_tx_watchdog_at(posted + timeout + 1) {
+            return TestResult::Fail("tg3 watchdog did not fire past the timeout");
+        }
+        if device.tx_timeouts() != 1 || device.tx_resets() != 1 {
+            return TestResult::Fail("tg3 watchdog recovery was not counted");
+        }
+        // SAFETY: fixture-owned fake MMIO.
+        unsafe {
+            if device.mmio.read32(super::REG_GRC_MODE) & super::GRC_MODE_HOST_STACKUP == 0 {
+                return TestResult::Fail("tg3 recovery left GRC_MODE without HOST_STACKUP");
+            }
+        }
+        if device.tx_head() != 0 || device.tx_cons() != 0 {
+            return TestResult::Fail("tg3 recovery left stale TX cursors");
+        }
+        if device.tx_posted_at.lock().iter().any(|&t| t != 0) {
+            return TestResult::Fail("tg3 TX stall survived the recovery");
+        }
+        // 3. Traffic resumes: with the fake chip completing
+        // descriptors again, a fresh post completes and the
+        // watchdog stays quiet on the live ring.
+        FIXTURE_COMPLETE_TX.store(true, Ordering::Release);
+        if device.transmit(&frame, &TxMeta::plain()).is_err() {
+            return TestResult::Fail("tg3 TX did not resume after recovery");
+        }
+        // Drive the completion pump so the status block reports the
+        // new post complete before the grace check reads it.
+        fixture_pump();
+        let posted2 = device.tx_posted_at.lock()[0];
+        if posted2 == 0 {
+            return TestResult::Fail("tg3 resumed TX post did not stamp a post time");
+        }
+        if device.check_tx_watchdog_at(posted2 + timeout) {
+            return TestResult::Fail("tg3 watchdog re-fired on a live ring");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/tg3", smoke_tg3_tx_timeout_recovery_fixture);
 }
