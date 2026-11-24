@@ -2207,6 +2207,34 @@ kernel_test_in!(
     smoke_drm_laptop_display_audio_apply_executes_audio_after_video
 );
 
+// Navi3 (Navi31, DCN 3.2) has no DCN32 modeset sequence yet, so
+// `plan_modeset` refuses instead of applying the legacy DCN 2.0
+// sequence to the wrong OTG registers (RDNA3 audit B3).
+#[cfg(feature = "amdgpu")]
+fn smoke_navi3_plan_modeset_refuses() -> TestResult {
+    use crate::amdgpu::Family;
+    use crate::amdgpu_modeset::{plan_modeset, KmsError};
+    let kms = laptop_audio_kms();
+    match plan_modeset(
+        &kms,
+        Family::Navi3,
+        1,
+        1920,
+        1080,
+        60,
+        1920,
+        0x8000_0000,
+        0x5000,
+        0x9000,
+    ) {
+        Err(KmsError::UnsupportedMode) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("Navi3 plan_modeset must refuse until a DCN32 sequence exists"),
+        Err(_) => TestResult::Fail("Navi3 plan_modeset refused with the wrong error"),
+    }
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu/e2e", smoke_navi3_plan_modeset_refuses);
+
 #[cfg(feature = "amdgpu")]
 fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {
     use crate::amdgpu::{has_saved_display_audio_for_test, Family, Mode};

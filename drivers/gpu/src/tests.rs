@@ -2997,7 +2997,7 @@ kernel_test_in!(
 /// A modeset with no panel leaves the level untouched (#948):
 /// a discrete GPU programs its mode but stores nothing and never
 /// touches the PWM registers, and a modeset that fails before
-/// programming (no firmware, Navi4 refusal) stores nothing.
+/// programming (no firmware, Navi4/Navi3 refusal) stores nothing.
 #[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
 fn smoke_amd_modeset_without_panel_leaves_level_untouched() -> TestResult {
     use crate::amdgpu::{AmdgpuError, Mode};
@@ -3057,6 +3057,27 @@ fn smoke_amd_modeset_without_panel_leaves_level_untouched() -> TestResult {
     }
     if gpu.backlight_percent.is_some() {
         return TestResult::Fail("refused modeset stored a level");
+    }
+    // Navi3 (Navi31, DCN 3.2): no DCN32 sequence exists yet, so the
+    // modeset refuses before any programming (RDNA3 audit B3)
+    // instead of applying the legacy DCN 2.0 sequence to the wrong
+    // OTG registers.
+    let mut words = [0u32; 16];
+    let mut gpu = amd_modeset_fixture(&mut words, false);
+    gpu.chip.family = crate::amdgpu::Family::Navi3;
+    // SAFETY: Navi3 refuses before dereferencing the register mapping.
+    let outcome = unsafe {
+        gpu.set_mode(Mode {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+        })
+    };
+    if outcome != Err(AmdgpuError::UnknownAsic) {
+        return TestResult::Fail("Navi3 modeset did not refuse");
+    }
+    if gpu.backlight_percent.is_some() || words != [0u32; 16] {
+        return TestResult::Fail("refused Navi3 modeset stored a level or touched MMIO");
     }
     TestResult::Pass
 }
