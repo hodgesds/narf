@@ -2234,3 +2234,316 @@ kernel_test_in!(
     "drivers/net/mlx5",
     smoke_mlx5_eqe_sample_never_mixes_occupants
 );
+
+// ── Stage 17: Ethernet datapath (pumps + publication) ───────────────
+//
+// Fixture-validated end-to-end without silicon: the TX→RX loopback
+// smoke drives the exact production helpers in pump order
+// (build_send_wqe → HW copy → CQE → pop_completion → classify →
+// repost), plus the TX slot pool and the setup params
+// `setup_datapath` feeds the firmware builders.
+
+use super::{classify_cqe, CqeClass, TxSlotPool};
+
+fn smoke_mlx5_datapath_tx_slot_pool() -> TestResult {
+    let mut pool = TxSlotPool::new();
+    if pool.free_count() != super::MLX5_TX_STAGE_N {
+        return TestResult::Fail("slot pool does not start full");
+    }
+    // Claim every slot; each claim must hand out a distinct slot.
+    let mut claimed = [usize::MAX; super::MLX5_TX_STAGE_N];
+    for (wqe_idx, slot) in claimed.iter_mut().enumerate() {
+        match pool.claim() {
+            Some(s) => *slot = s,
+            None => return TestResult::Fail("claim failed before pool empty"),
+        }
+        // Record the post at this SQ index so the completion can
+        // find it again.
+        pool.record(wqe_idx as u32, *slot);
+    }
+    if pool.free_count() != 0 {
+        return TestResult::Fail("pool not empty after claiming all slots");
+    }
+    if pool.claim().is_some() {
+        return TestResult::Fail("claim succeeded on an empty pool");
+    }
+    for (wqe_idx, slot) in claimed.iter().enumerate() {
+        match pool.release(wqe_idx as u16) {
+            Some(s) if s == *slot => {}
+            _ => return TestResult::Fail("release returned the wrong slot"),
+        }
+    }
+    if pool.free_count() != super::MLX5_TX_STAGE_N {
+        return TestResult::Fail("pool not full after releasing all slots");
+    }
+    // A stray / duplicate completion releases nothing.
+    if pool.release(0).is_some() {
+        return TestResult::Fail("duplicate release freed a slot twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_datapath_tx_slot_pool);
+
+fn smoke_mlx5_datapath_cqe_classification() -> TestResult {
+    // Helper: classify a synthetic completed CQE.
+    fn classify(byte_count: u32, status: u8, wqe_counter: u16, opcode: CqeOpcode) -> CqeClass {
+        let mut raw = [0u8; CQE_RING_LEN];
+        simulate_cqe(&mut raw, byte_count, status, wqe_counter, 0x42, opcode);
+        classify_cqe(&decode_cqe(&raw))
+    }
+    if classify(1514, 0x00, 7, CqeOpcode::ResponderSend)
+        != (CqeClass::RxComplete {
+            wqe_counter: 7,
+            byte_count: 1514,
+        })
+    {
+        return TestResult::Fail("RX success CQE misclassified");
+    }
+    if classify(1514, 0x00, 3, CqeOpcode::Requester) != (CqeClass::TxComplete { wqe_counter: 3 }) {
+        return TestResult::Fail("TX success CQE misclassified");
+    }
+    // Error completions still retire their WQE.
+    if classify(0, 0x01, 5, CqeOpcode::Requester) != (CqeClass::TxError { wqe_counter: 5 }) {
+        return TestResult::Fail("TX error CQE must free its slot");
+    }
+    if classify(0, 0x02, 9, CqeOpcode::ResponderSend) != (CqeClass::RxError { wqe_counter: 9 }) {
+        return TestResult::Fail("RX error CQE must repost its slot");
+    }
+    if classify(0, 0x00, 0, CqeOpcode::NoOp) != CqeClass::Ignored {
+        return TestResult::Fail("unexpected opcode CQE must be ignored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_datapath_cqe_classification);
+
+fn smoke_mlx5_datapath_tx_rx_loopback() -> TestResult {
+    // Fixture model of the datapath, in pump order:
+    //   TX pump: build_send_wqe → (HW DMAs the payload) →
+    //   RX side: HW writes the payload into RQ slot `rq_idx`,
+    //   posts a ResponderSend CQE → RX pump: pop_completion →
+    //   classify → deliver → build_recv_wqe repost.
+    // Device-visible memory is one flat array; a WQE's `va` is an
+    // offset into it (the mkey's start_addr is 0 in the fixture).
+    const PAYLOAD_LEN: usize = 60;
+    const RQ_IDX: u16 = 5;
+    const SQ_IDX: u16 = 3;
+    const QP_NUM: u32 = 0x42;
+    const LKEY: u32 = 0x00C0_FFEE;
+    let mut payload = [0u8; PAYLOAD_LEN];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7).wrapping_add(0xA5);
+    }
+
+    // ── TX: the pump posts a Send WQE for the payload ──
+    let tx_wqe = match build_send_wqe(
+        QP_NUM,
+        SQ_IDX,
+        SendOpcode::Send,
+        CqeRequest::AlwaysCqe,
+        &[IoVec {
+            va: 0,
+            l_key: LKEY,
+            len: PAYLOAD_LEN as u32,
+        }],
+    ) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("TX build_send_wqe failed"),
+    };
+    let mut seg = [0u8; DATA_SEG_LEN];
+    seg.copy_from_slice(&tx_wqe[CTRL_SEG_LEN..CTRL_SEG_LEN + DATA_SEG_LEN]);
+    let (bc, lk, va) = decode_data_seg_ptr(&seg);
+    if bc != PAYLOAD_LEN as u32 || lk != LKEY || va != 0 {
+        return TestResult::Fail("TX WQE data segment does not carry the payload");
+    }
+    let mut ctrl = [0u8; CTRL_SEG_LEN];
+    ctrl.copy_from_slice(&tx_wqe[..CTRL_SEG_LEN]);
+    if ctrl_wqe_idx(&ctrl) != SQ_IDX {
+        return TestResult::Fail("TX WQE control segment wqe_idx wrong");
+    }
+
+    // ── HW: copy the payload into RQ slot RQ_IDX, post the CQE ──
+    let mut dev_mem = [0u8; 4096];
+    dev_mem[..PAYLOAD_LEN].copy_from_slice(&payload);
+    let rx_off = (RQ_IDX as usize) * super::MLX5_RX_SLOT_LEN;
+    let mut rx_mem = alloc::vec![0u8; super::MLX5_RQ_N * super::MLX5_RX_SLOT_LEN];
+    rx_mem[rx_off..rx_off + PAYLOAD_LEN]
+        .copy_from_slice(&dev_mem[va as usize..va as usize + bc as usize]);
+    // CQ ring: every slot HW-owned except slot 0, which carries
+    // the RX completion.
+    let mut cq = [0u8; 64 * CQE_STRIDE];
+    for i in 0..64 {
+        cq[i * CQE_STRIDE + 0x3F] |= 1;
+    }
+    let mut cqe = [0u8; CQE_RING_LEN];
+    simulate_cqe(
+        &mut cqe,
+        PAYLOAD_LEN as u32,
+        0x00,
+        RQ_IDX,
+        QP_NUM,
+        CqeOpcode::ResponderSend,
+    );
+    cq[..CQE_STRIDE].copy_from_slice(&cqe);
+
+    // ── RX pump: pop the completion, classify, verify bytes ──
+    let (view, next) = match pop_completion(&cq, 64, 0) {
+        Some(v) => v,
+        None => return TestResult::Fail("RX completion not found in CQ ring"),
+    };
+    if next != 1 {
+        return TestResult::Fail("CQ consumer did not advance");
+    }
+    if classify_cqe(&view)
+        != (CqeClass::RxComplete {
+            wqe_counter: RQ_IDX,
+            byte_count: PAYLOAD_LEN as u32,
+        })
+    {
+        return TestResult::Fail("RX completion misclassified");
+    }
+    if view.qp_num != QP_NUM {
+        return TestResult::Fail("RX completion qp_num wrong");
+    }
+    if rx_mem[rx_off..rx_off + PAYLOAD_LEN] != payload {
+        return TestResult::Fail("RX slot bytes differ from the TX payload");
+    }
+
+    // ── RX pump: repost the slot it just consumed ──
+    let repost = match build_recv_wqe(&[IoVec {
+        va: rx_off as u64,
+        l_key: LKEY,
+        len: super::MLX5_RX_SLOT_LEN as u32,
+    }]) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("RX repost build_recv_wqe failed"),
+    };
+    seg.copy_from_slice(&repost[CTRL_SEG_LEN..CTRL_SEG_LEN + DATA_SEG_LEN]);
+    let (rbc, rlk, rva) = decode_data_seg_ptr(&seg);
+    if rbc != super::MLX5_RX_SLOT_LEN as u32 || rlk != LKEY || rva != rx_off as u64 {
+        return TestResult::Fail("RX repost WQE does not name the freed slot");
+    }
+
+    // ── TX completion: the Send WQE retires, freeing its slot ──
+    let mut tx_pool = TxSlotPool::new();
+    let slot = match tx_pool.claim() {
+        Some(s) => s,
+        None => return TestResult::Fail("TX slot claim failed"),
+    };
+    tx_pool.record(SQ_IDX as u32, slot);
+    let mut tx_cqe = [0u8; CQE_RING_LEN];
+    simulate_cqe(&mut tx_cqe, 0, 0x00, SQ_IDX, QP_NUM, CqeOpcode::Requester);
+    let tx_view = decode_cqe(&tx_cqe);
+    if classify_cqe(&tx_view)
+        != (CqeClass::TxComplete {
+            wqe_counter: SQ_IDX,
+        })
+    {
+        return TestResult::Fail("TX completion misclassified");
+    }
+    if tx_pool.release(SQ_IDX) != Some(slot) {
+        return TestResult::Fail("TX completion freed the wrong slot");
+    }
+    if tx_pool.free_count() != super::MLX5_TX_STAGE_N {
+        return TestResult::Fail("TX pool not full after completion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_datapath_tx_rx_loopback);
+
+fn smoke_mlx5_datapath_setup_params() -> TestResult {
+    // The exact params `setup_datapath` feeds the firmware
+    // builders must all validate, and the rings must fit the
+    // single-page constraint the Stage-11 primitives assume
+    // (`post_send` / `post_recv` / `poll_cq` index `pages[0]`).
+    let pages = [0x1_0000_0000u64];
+    if build_create_eq_input(
+        EqParams {
+            log_eq_size: super::MLX5_LOG_EQ_SIZE,
+            uar_page: 0,
+            intr_vector: 0,
+            log_page_size: super::MLX5_LOG_PAGE_SIZE,
+        },
+        &pages,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup EQ params rejected");
+    }
+    if build_create_cq_input(
+        CqParams {
+            log_cq_size: super::MLX5_LOG_CQ_SIZE,
+            uar_page: 0,
+            log_page_size: super::MLX5_LOG_PAGE_SIZE,
+            c_eqn: 0,
+        },
+        &pages,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup CQ params rejected");
+    }
+    if build_create_qp_input(
+        QpParams {
+            qp_type: QpType::RawEthernet,
+            pd: 0,
+            cqn_snd: 0,
+            cqn_rcv: 0,
+            log_sq_size: super::MLX5_LOG_SQ_SIZE,
+            log_rq_size: super::MLX5_LOG_RQ_SIZE,
+            log_page_size: super::MLX5_LOG_PAGE_SIZE,
+            uar_page: 0,
+        },
+        &pages,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup QP params rejected");
+    }
+    if build_create_tir_input(TirParams {
+        disp_type: TIR_DISP_DIRECT,
+        inline_rqn: 0,
+        transport_domain: 0,
+    })
+    .is_empty()
+    {
+        return TestResult::Fail("setup TIR input empty");
+    }
+    if build_create_tis_input(TisParams {
+        priority: 0,
+        transport_domain: 0,
+    })
+    .is_empty()
+    {
+        return TestResult::Fail("setup TIS input empty");
+    }
+    let pool_pages = [0x1_0000_0000u64; 16];
+    if build_create_mkey_input(
+        MkeyParams {
+            pd: 0,
+            access: MKC_ACCESS_LOCAL_WRITE | MKC_ACCESS_LOCAL_READ,
+            start_addr: 0x1_0000_0000,
+            length: (super::MLX5_RQ_N * super::MLX5_RX_SLOT_LEN) as u64,
+            log_page_size: 12,
+        },
+        &pool_pages,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup RX pool mkey params rejected");
+    }
+    if sq_size_bytes(super::MLX5_LOG_SQ_SIZE) + rq_size_bytes(super::MLX5_LOG_RQ_SIZE) > 4096 {
+        return TestResult::Fail("SQ+RQ overflows the single QP page");
+    }
+    if (1usize << super::MLX5_LOG_CQ_SIZE) * CQE_STRIDE > 4096 {
+        return TestResult::Fail("CQ overflows its single page");
+    }
+    if (1usize << super::MLX5_LOG_EQ_SIZE) * CQE_STRIDE > 4096 {
+        return TestResult::Fail("EQ overflows its single page");
+    }
+    // Max simultaneous completions (SQ + RQ depth) fit the CQ.
+    if super::MLX5_SQ_N + super::MLX5_RQ_N > (1usize << super::MLX5_LOG_CQ_SIZE) {
+        return TestResult::Fail("outstanding WQEs can overrun the CQ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_datapath_setup_params);

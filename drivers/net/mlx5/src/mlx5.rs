@@ -233,6 +233,13 @@ pub enum Mlx5Error {
     UnknownQp,
     /// Stage 11: poll_cq referenced a cq_number not in the registry.
     UnknownCq,
+    /// Stage 17: the TX staging pool is exhausted — every slot is
+    /// posted and awaiting its send completion. Retryable: the RX
+    /// pump frees slots as TX CQEs land.
+    TxSlotsExhausted,
+    /// Stage 17: the frame is larger than one TX staging slot
+    /// (`MLX5_TX_SLOT_LEN`). Not retryable — the frame is dropped.
+    FrameTooLarge,
     /// Stage 12: vport-context decoder rejected the response.
     VportDecode,
     /// Stage 13: caller-supplied mkey parameters were invalid.
@@ -243,7 +250,7 @@ pub enum Mlx5Error {
 
 impl narf_net::Interface for Mlx5Hca {
     fn name(&self) -> &str {
-        "mlx5"
+        self.ifname()
     }
     fn mac(&self) -> [u8; 6] {
         self.nic_state().mac
@@ -374,6 +381,19 @@ pub struct Mlx5Hca {
     // IPC integration
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    /// Stage 17: live datapath (queues + buffer pools), built once
+    /// by `setup_datapath` in `bring_up`. `None` only before setup
+    /// runs; the pumps idle until it is `Some`.
+    datapath: IrqSafeSpinLock<Option<DatapathState>>,
+    /// Stage 17: RX producer the pumps push received frames into.
+    /// Behind a lock (rather than moved into the pump task) so the
+    /// synchronous `mlx5_rx_pump_step` drain — installed for
+    /// syscall-context busy-wait paths — can deliver through the
+    /// same path as the async pump (vmxnet3's `rx_ipc_prod` shape).
+    rx_ipc_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
+    /// Stage 17: published `eth%d` name, set once by probe
+    /// (`crate::publish::IfName`); empty before publication.
+    ifname: crate::publish::IfName,
 }
 
 // SAFETY: the only non-`Send` members are the `MmioRegion`/`DmaBuffer` raw
@@ -396,6 +416,207 @@ pub struct NicCachedState {
 
 /// Default BAR0 offset where UAR pages live on ConnectX-4..6.
 const UAR_BASE_DEFAULT: u64 = 0x100000;
+
+// ── Stage 17: Ethernet datapath ─────────────────────────────────────
+//
+// The pumps (`mlx5_rx_pump` / `mlx5_tx_pump`) run on the Stage-11
+// primitives. Sizing is dictated by a Stage-11 constraint the
+// primitives carry: `post_send` / `post_recv` / `poll_cq` index
+// `pages[0]` of the QP/CQ/EQ buffer by byte offset, so each ring
+// must fit in a single 4-KiB page —
+//   EQ:  log 6 → 64 EQEs × 64 B = 4 KiB
+//   CQ:  log 6 → 64 CQEs × 64 B = 4 KiB
+//   SQ:  log 4 → 16 WQEs × 64 B = 1 KiB
+//   RQ:  log 5 → 32 WQEs × 64 B = 2 KiB  (SQ + RQ = 3 KiB ≤ 4 KiB)
+// Max simultaneous completions (16 TX + 32 RX = 48) stay under the
+// 64-entry CQ, so a full drain budget can never overrun it.
+
+/// log2 SQ depth (16 send WQEs).
+const MLX5_LOG_SQ_SIZE: u8 = 4;
+/// SQ depth in WQEs.
+const MLX5_SQ_N: usize = 1 << MLX5_LOG_SQ_SIZE;
+/// log2 RQ depth (32 receive WQEs).
+const MLX5_LOG_RQ_SIZE: u8 = 5;
+/// RQ depth in WQEs — also the RX pool slot count.
+const MLX5_RQ_N: usize = 1 << MLX5_LOG_RQ_SIZE;
+/// log2 CQ depth (64 CQEs).
+const MLX5_LOG_CQ_SIZE: u8 = 6;
+/// log2 EQ depth (64 EQEs).
+const MLX5_LOG_EQ_SIZE: u8 = 6;
+/// log2 buffer-page size for every datapath object (4-KiB pages).
+const MLX5_LOG_PAGE_SIZE: u8 = 12;
+
+/// One RX slot: MTU-sized (1518 B wire frame + headroom).
+const MLX5_RX_SLOT_LEN: usize = 2048;
+/// One TX staging slot: same MTU-sized bound; larger frames are
+/// dropped by `transmit` (`Mlx5Error::FrameTooLarge`).
+const MLX5_TX_SLOT_LEN: usize = 2048;
+/// TX staging slots in the pool. 8 ≤ SQ depth 16, so a full pool
+/// can always be posted without wrapping the SQ.
+const MLX5_TX_STAGE_N: usize = 8;
+
+/// RX drain budget per pump pass. Mirrors e1000/vmxnet3's
+/// `RX_DRAIN_BUDGET` (64): one pass can clear the whole CQ.
+const MLX5_RX_DRAIN_BUDGET: usize = 64;
+/// RX poll interval while the CQ is empty — 1 ms, the vmxnet3
+/// no-MSI-X fallback shape (no vector is bound yet, so there is
+/// no IRQ waiter).
+const MLX5_RX_POLL_INTERVAL_NS: u64 = 1_000_000;
+/// TX pump retries on `TxSlotsExhausted` before dropping the
+/// frame (~100 ms of 1 ms sleeps; the RX pump frees slots as TX
+/// CQEs land, so a healthy NIC never reaches the cap).
+const MLX5_TX_RETRY_MAX: u32 = 100;
+
+/// Which side of the datapath a successful CQE belongs to.
+/// Decided purely from the decoded `CqeView`, so the fixture can
+/// drive it without hardware.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CqeClass {
+    /// A send completion: `wqe_counter` is the SQ index whose TX
+    /// staging slot may now be recycled.
+    TxComplete { wqe_counter: u16 },
+    /// A receive completion: `wqe_counter` is the RQ index holding
+    /// `byte_count` fresh bytes.
+    RxComplete { wqe_counter: u16, byte_count: u32 },
+    /// A failed send completion: the WQE retired with an error, so
+    /// its TX staging slot is ours again — free it, deliver nothing.
+    TxError { wqe_counter: u16 },
+    /// A failed receive completion: the WQE retired with an error,
+    /// so its RQ slot is ours again — repost it, deliver nothing.
+    RxError { wqe_counter: u16 },
+    /// Anything else (unexpected opcode): drop, do not act on it.
+    Ignored,
+}
+
+/// Classify a decoded CQE for the datapath drain. A `Requester`
+/// CQE frees the TX slot posted at `wqe_counter`; a
+/// `ResponderSend` CQE delivers the RQ slot at `wqe_counter`.
+/// Error completions still retire their WQE — the slot returns to
+/// the driver (freed for TX, reposted for RX) — so a bad frame
+/// cannot wedge the ring by leaking its slot.
+pub fn classify_cqe(cqe: &cqe::CqeView) -> CqeClass {
+    match cqe.opcode {
+        cqe::CqeOpcode::Requester => {
+            if cqe.status == cqe::CqeStatus::Success {
+                CqeClass::TxComplete {
+                    wqe_counter: cqe.wqe_counter,
+                }
+            } else {
+                CqeClass::TxError {
+                    wqe_counter: cqe.wqe_counter,
+                }
+            }
+        }
+        cqe::CqeOpcode::ResponderSend => {
+            if cqe.status == cqe::CqeStatus::Success {
+                CqeClass::RxComplete {
+                    wqe_counter: cqe.wqe_counter,
+                    byte_count: cqe.byte_count,
+                }
+            } else {
+                CqeClass::RxError {
+                    wqe_counter: cqe.wqe_counter,
+                }
+            }
+        }
+        _ => CqeClass::Ignored,
+    }
+}
+
+/// TX staging-slot bookkeeping — pure data, no DMA, so the fixture
+/// drives it directly. `by_wqe[w]` records the staging slot posted
+/// at SQ index `w`; a TX CQE names `w` and releases exactly that
+/// slot. Recording the mapping at post time (rather than deriving
+/// a slot from `wqe_counter % N`) is what keeps the release exact
+/// when the SQ wraps.
+#[derive(Clone, Debug)]
+pub struct TxSlotPool {
+    free: [bool; MLX5_TX_STAGE_N],
+    by_wqe: [Option<usize>; MLX5_SQ_N],
+}
+
+impl TxSlotPool {
+    pub fn new() -> Self {
+        Self {
+            free: [true; MLX5_TX_STAGE_N],
+            by_wqe: [None; MLX5_SQ_N],
+        }
+    }
+
+    /// Claim a free staging slot. Returns `None` when the pool is
+    /// empty (`TxSlotsExhausted` at the `transmit` layer).
+    pub fn claim(&mut self) -> Option<usize> {
+        let slot = self.free.iter().position(|&f| f)?;
+        self.free[slot] = false;
+        Some(slot)
+    }
+
+    /// Record that the WQE posted at SQ index `wqe_idx` carries
+    /// `slot`. Called by `transmit` while still holding the
+    /// datapath lock, immediately after `post_send` returns — the
+    /// completion cannot be reaped before this record lands,
+    /// because reaping takes the same lock.
+    pub fn record(&mut self, wqe_idx: u32, slot: usize) {
+        self.by_wqe[(wqe_idx as usize) % MLX5_SQ_N] = Some(slot);
+    }
+
+    /// Release the staging slot posted at SQ index `wqe_counter`.
+    /// Returns the freed slot, or `None` if that WQE never held
+    /// one (duplicate / stray completion).
+    pub fn release(&mut self, wqe_counter: u16) -> Option<usize> {
+        let slot = self.by_wqe[(wqe_counter as usize) % MLX5_SQ_N].take()?;
+        self.free[slot] = true;
+        Some(slot)
+    }
+
+    /// Free staging slots (TX backpressure headroom).
+    pub fn free_count(&self) -> usize {
+        self.free.iter().filter(|&&f| f).count()
+    }
+}
+
+impl Default for TxSlotPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Live datapath state, built once by `setup_datapath` in
+/// `bring_up` and never replaced: the RX/TX pools are DMA regions
+/// the HCA may be writing into at any moment, so their addresses
+/// must stay stable for the controller's lifetime. Private: only
+/// `Mlx5Hca` methods touch it (and `DmaBuffer` has no `Debug`,
+/// so a derived impl is impossible).
+struct DatapathState {
+    pub qp_number: u32,
+    pub cq_number: u32,
+    /// L_KEY covering the RX pool (one mkey over the whole pool).
+    pub rx_lkey: u32,
+    /// L_KEY covering the TX staging pool.
+    pub tx_lkey: u32,
+    /// RX pool: `MLX5_RQ_N` slots of `MLX5_RX_SLOT_LEN` bytes.
+    /// Slot `i` backs RQ index `i`; completions arrive in RQ
+    /// order, so `wqe_counter % MLX5_RQ_N` names the slot.
+    pub rx_pool: DmaBuffer,
+    /// TX staging pool: `MLX5_TX_STAGE_N` slots of
+    /// `MLX5_TX_SLOT_LEN` bytes.
+    pub tx_pool: DmaBuffer,
+    pub tx_slots: TxSlotPool,
+}
+
+impl DatapathState {
+    /// CPU-side VA of RX slot `i`.
+    pub fn rx_slot_va(&self, slot: usize) -> u64 {
+        self.rx_pool
+            .cpu_ptr_at::<u8>((slot * MLX5_RX_SLOT_LEN) as u64) as u64
+    }
+
+    /// CPU-side VA of TX staging slot `i`.
+    pub fn tx_slot_va(&self, slot: usize) -> u64 {
+        self.tx_pool
+            .cpu_ptr_at::<u8>((slot * MLX5_TX_SLOT_LEN) as u64) as u64
+    }
+}
 
 impl fmt::Debug for Mlx5Hca {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -427,6 +648,12 @@ impl Mlx5Hca {
     ///
     /// Stage 4 will issue the first NOP from probe; Stage 3 only
     /// stages the transport.
+    ///
+    /// Stage 17 builds the Ethernet datapath (`setup_datapath`:
+    /// EQ/CQ/QP + TIS/TIR steering + RX/TX buffer pools + posted
+    /// recvs) and spawns the RX/TX pumps. A setup failure fails
+    /// bring_up — a bound-but-trafficless NIC is worse than an
+    /// unbound one, and failing here leaves no pump task behind.
     ///
     /// # Safety
     /// Caller owns the device's BARs exclusively for the duration of
@@ -493,10 +720,20 @@ impl Mlx5Hca {
             nic_state: IrqSafeSpinLock::new(NicCachedState::default()),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            datapath: IrqSafeSpinLock::new(None),
+            rx_ipc_prod: IrqSafeSpinLock::new(Some(rx_prod)),
+            ifname: crate::publish::IfName::new(),
         });
 
+        // Stage 17: build the datapath (EQ/CQ/QP + steering + buffer
+        // pools + posted recvs) BEFORE spawning the pumps, so a
+        // pump never runs against a half-built datapath and a setup
+        // failure leaves no spinning pump behind — bring_up fails
+        // and probe reports BadDevice with nothing retained.
+        hca.setup_datapath()?;
+
         // Spawn pumps
-        spawn_pumps(hca.clone(), rx_prod, tx_cons);
+        spawn_pumps(hca.clone(), tx_cons);
 
         // Return the `Arc` directly: unwrapping it back to `Self`
         // (the old `Arc::try_unwrap` tail) always failed — the pump
@@ -1504,6 +1741,304 @@ impl Mlx5Hca {
     }
 }
 
+// ── Stage 17: Ethernet datapath ─────────────────────────────────────
+
+impl Mlx5Hca {
+    /// Published `eth%d` name, or `"mlx5"` before probe publishes
+    /// one (the pre-publication fallback the frame-ring registry
+    /// has always seen).
+    pub fn ifname(&self) -> &'static str {
+        let name = self.ifname.get();
+        if name.is_empty() {
+            "mlx5"
+        } else {
+            name
+        }
+    }
+
+    /// `true` once `setup_datapath` has built the queues + pools.
+    pub fn datapath_ready(&self) -> bool {
+        self.datapath.lock().is_some()
+    }
+
+    /// Build the Ethernet datapath, in dependency order:
+    ///
+    /// 1. UAR + PD.
+    /// 2. EQ (polling only — `intr_vector` 0, no MSI-X bound yet)
+    ///    and a CQ bound to it.
+    /// 3. A Raw-Ethernet QP on that CQ, driven RST → INIT → RTR →
+    ///    RTS via the Stage-9 zero-input `MODIFY_QP` form.
+    /// 4. Steering endpoints: a TIS for TX and a direct TIR for RX
+    ///    (inline RQN = this QP; no RQT — single-queue, no RSS).
+    /// 5. RX pool (`MLX5_RQ_N` slots) + TX staging pool
+    ///    (`MLX5_TX_STAGE_N` slots), each covered by one mkey.
+    /// 6. Post one recv WQE per RQ slot so the RQ starts full.
+    ///
+    /// Runs in `bring_up`, before the pumps spawn. On any failure
+    /// the caller fails bring_up; objects created so far stay
+    /// registered on the driver (their DMA drops with the `Arc`),
+    /// but no pump ever runs against the half-built datapath.
+    ///
+    /// Known remainders (see the spec changelog): RX steering on
+    /// silicon also needs a flow-table root + rule — Stage 14 has
+    /// no builder for either, so this wires TIR/TIS/RQT only; and
+    /// `post_recv` advances the software RQ tail without writing
+    /// an RQ doorbell record (no in-tree layout for it yet).
+    fn setup_datapath(&self) -> Result<(), Mlx5Error> {
+        let uar = self.alloc_uar()?;
+        let pd = self.alloc_pd()?;
+        let eq_number = self.create_eq(
+            eq::EqParams {
+                log_eq_size: MLX5_LOG_EQ_SIZE,
+                uar_page: uar,
+                intr_vector: 0,
+                log_page_size: MLX5_LOG_PAGE_SIZE,
+            },
+            1,
+        )?;
+        let c_eqn =
+            u8::try_from(eq_number).map_err(|_| Mlx5Error::Other("mlx5 eq number exceeds u8"))?;
+        let cq_number = self.create_cq(
+            cq::CqParams {
+                log_cq_size: MLX5_LOG_CQ_SIZE,
+                uar_page: uar,
+                log_page_size: MLX5_LOG_PAGE_SIZE,
+                c_eqn,
+            },
+            1,
+        )?;
+        let qp_number = self.create_qp(
+            qp::QpParams {
+                qp_type: qp::QpType::RawEthernet,
+                pd,
+                cqn_snd: cq_number,
+                cqn_rcv: cq_number,
+                log_sq_size: MLX5_LOG_SQ_SIZE,
+                log_rq_size: MLX5_LOG_RQ_SIZE,
+                log_page_size: MLX5_LOG_PAGE_SIZE,
+                uar_page: uar,
+            },
+            1,
+        )?;
+        self.modify_qp(qp_number, qp::QpTransition::RstToInit)?;
+        self.modify_qp(qp_number, qp::QpTransition::InitToRtr)?;
+        self.modify_qp(qp_number, qp::QpTransition::RtrToRts)?;
+        let _tisn = self.create_tis(steering::TisParams {
+            priority: 0,
+            transport_domain: 0,
+        })?;
+        let _tirn = self.create_tir(steering::TirParams {
+            disp_type: steering::TIR_DISP_DIRECT,
+            inline_rqn: qp_number,
+            transport_domain: 0,
+        })?;
+        let rx_pool = alloc_coherent(MLX5_RQ_N * MLX5_RX_SLOT_LEN, DomainId::DRIVER_0)
+            .map_err(|_| Mlx5Error::NoMemory)?;
+        let rx_lkey = self.register_pool(&rx_pool, pd)?;
+        let tx_pool = alloc_coherent(MLX5_TX_STAGE_N * MLX5_TX_SLOT_LEN, DomainId::DRIVER_0)
+            .map_err(|_| Mlx5Error::NoMemory)?;
+        let tx_lkey = self.register_pool(&tx_pool, pd)?;
+        *self.datapath.lock() = Some(DatapathState {
+            qp_number,
+            cq_number,
+            rx_lkey,
+            tx_lkey,
+            rx_pool,
+            tx_pool,
+            tx_slots: TxSlotPool::new(),
+        });
+        for slot in 0..MLX5_RQ_N {
+            self.repost_recv(qp_number, slot)?;
+        }
+        Ok(())
+    }
+
+    /// Register one buffer pool under a single mkey (Stage 13
+    /// physical-address form): `start_addr` is the pool's CPU VA,
+    /// the PA list is the per-page device address. Returns the
+    /// L_KEY WQE data segments carry.
+    fn register_pool(&self, pool: &DmaBuffer, pd: u32) -> Result<u32, Mlx5Error> {
+        let pages: Vec<u64> = (0..pool.len().div_ceil(4096))
+            .map(|i| pool.dma_addr_at((i * 4096) as u64).raw())
+            .collect();
+        self.create_mkey(
+            mkey::MkeyParams {
+                pd,
+                access: mkey::MKC_ACCESS_LOCAL_WRITE | mkey::MKC_ACCESS_LOCAL_READ,
+                start_addr: pool.cpu_ptr::<u8>() as u64,
+                length: pool.len() as u64,
+                log_page_size: 12,
+            },
+            &pages,
+        )
+    }
+
+    /// Post one recv WQE for RX pool slot `slot` (repost after a
+    /// completion, or the initial fill from `setup_datapath`).
+    /// RQ completions arrive in RQ order, so reposting one recv
+    /// per completion keeps the ring full with the reposted index
+    /// tracking the completed one.
+    fn repost_recv(&self, qp_number: u32, slot: usize) -> Result<(), Mlx5Error> {
+        let (va, lkey) = {
+            let dp = self.datapath.lock();
+            let dp = dp
+                .as_ref()
+                .ok_or(Mlx5Error::Other("mlx5 datapath not set up"))?;
+            (dp.rx_slot_va(slot), dp.rx_lkey)
+        };
+        self.post_recv(
+            qp_number,
+            &[ring::IoVec {
+                va,
+                l_key: lkey,
+                len: MLX5_RX_SLOT_LEN as u32,
+            }],
+        )
+        .map(|_| ())
+    }
+
+    /// Transmit one frame through the datapath — the cookie send
+    /// path (`mlx5_send_frame`) and the TX pump share this.
+    /// Copies the payload into a free TX staging slot and posts a
+    /// `Send` WQE with `AlwaysCqe` so the slot is reclaimed on its
+    /// completion. The datapath lock is held across claim + copy +
+    /// post + record: the TX CQE cannot be reaped before the
+    /// wqe→slot record lands, because reaping takes the same lock.
+    /// No offloads are advertised, so the frame goes out plain.
+    pub fn transmit(&self, frame: &[u8]) -> Result<(), Mlx5Error> {
+        if frame.len() > MLX5_TX_SLOT_LEN {
+            return Err(Mlx5Error::FrameTooLarge);
+        }
+        let mut dp = self.datapath.lock();
+        let dp = dp
+            .as_mut()
+            .ok_or(Mlx5Error::Other("mlx5 datapath not set up"))?;
+        let slot = dp.tx_slots.claim().ok_or(Mlx5Error::TxSlotsExhausted)?;
+        let slot_va = dp.tx_slot_va(slot);
+        // SAFETY: the slot is exclusively ours (claimed above) and
+        // `slot_va` names `MLX5_TX_SLOT_LEN` coherent DMA bytes;
+        // `frame.len()` is bounded by the slot.
+        unsafe {
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), slot_va as *mut u8, frame.len());
+        }
+        compiler_fence(Ordering::SeqCst);
+        let qp_number = dp.qp_number;
+        let tx_lkey = dp.tx_lkey;
+        // `post_send` takes the QP lock (nested under the datapath
+        // lock); no path nests the reverse way, so no lock-order
+        // cycle exists.
+        let wqe_idx = self.post_send(
+            qp_number,
+            wqe::SendOpcode::Send,
+            wqe::CqeRequest::AlwaysCqe,
+            &[ring::IoVec {
+                va: slot_va,
+                l_key: tx_lkey,
+                len: frame.len() as u32,
+            }],
+        )?;
+        dp.tx_slots.record(wqe_idx, slot);
+        Ok(())
+    }
+
+    /// Drain up to `budget` CQEs off the datapath CQ — the single
+    /// drain path shared by the async RX pump and the synchronous
+    /// `mlx5_rx_pump_step`. TX completions free their staging
+    /// slot; RX completions deliver the frame (ring mirror, then
+    /// stack) and repost the slot; error completions still retire
+    /// their WQE (free / repost) so a bad frame cannot leak its
+    /// slot. Returns the number of CQEs handled.
+    pub fn drain_datapath(&self, budget: usize) -> usize {
+        let snap = {
+            let dp = self.datapath.lock();
+            dp.as_ref().map(|d| {
+                (
+                    d.qp_number,
+                    d.cq_number,
+                    d.rx_lkey,
+                    d.rx_pool.cpu_ptr::<u8>() as usize,
+                )
+            })
+        };
+        let Some((qp_number, cq_number, rx_lkey, rx_base)) = snap else {
+            return 0;
+        };
+        let mut handled = 0usize;
+        while handled < budget {
+            let cqe = match self.poll_cq(cq_number) {
+                Ok(Some(c)) => c,
+                _ => break,
+            };
+            match classify_cqe(&cqe) {
+                CqeClass::TxComplete { wqe_counter } | CqeClass::TxError { wqe_counter } => {
+                    let mut dp = self.datapath.lock();
+                    if let Some(dp) = dp.as_mut() {
+                        dp.tx_slots.release(wqe_counter);
+                    }
+                }
+                CqeClass::RxComplete {
+                    wqe_counter,
+                    byte_count,
+                } => {
+                    self.rx_complete(qp_number, rx_base, rx_lkey, wqe_counter, byte_count);
+                }
+                CqeClass::RxError { wqe_counter } => {
+                    let slot = (wqe_counter as usize) % MLX5_RQ_N;
+                    let _ = self.repost_recv(qp_number, slot);
+                }
+                CqeClass::Ignored => {}
+            }
+            handled += 1;
+        }
+        handled
+    }
+
+    /// Deliver one RX completion: mirror a pristine copy to the
+    /// frame ring (a full ring drops the mirror, never the packet),
+    /// hand the pool bytes to the kernel stack (synchronous — the
+    /// stack may rewrite them in place), then repost the slot.
+    /// `byte_count` is clamped to the slot; a zero-length
+    /// completion reposts without delivering.
+    fn rx_complete(
+        &self,
+        qp_number: u32,
+        rx_base: usize,
+        rx_lkey: u32,
+        wqe_counter: u16,
+        byte_count: u32,
+    ) {
+        let slot = (wqe_counter as usize) % MLX5_RQ_N;
+        let len = (byte_count as usize).min(MLX5_RX_SLOT_LEN);
+        let slot_ptr = (rx_base + slot * MLX5_RX_SLOT_LEN) as *const u8;
+        if len > 0 {
+            if let Ok(buf) = alloc_coherent(len, DomainId::DRIVER_0) {
+                // SAFETY: `slot_ptr` names `MLX5_RX_SLOT_LEN`
+                // coherent DMA bytes the HCA just filled; `len` is
+                // clamped to the slot.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(slot_ptr, buf.cpu_mut_ptr_at::<u8>(0), len);
+                }
+                let frame = Frame::new(buf, len as u32);
+                if let Some(prod) = self.rx_ipc_prod.lock().as_mut() {
+                    let _ = prod.try_send(frame);
+                }
+            }
+            // SAFETY: same slot bounds as above; `deliver_rx`
+            // returns before the slot is reposted below.
+            let slot_bytes = unsafe { core::slice::from_raw_parts_mut(slot_ptr as *mut u8, len) };
+            crate::publish::deliver_rx(self.ifname(), slot_bytes);
+        }
+        let _ = self.post_recv(
+            qp_number,
+            &[ring::IoVec {
+                va: slot_ptr as u64,
+                l_key: rx_lkey,
+                len: MLX5_RX_SLOT_LEN as u32,
+            }],
+        );
+    }
+}
+
 // ── cmdq register programming ──────────────────────────────────────
 
 /// Program the init-segment's `cmdq_addr_high` (BAR0+0x10) and
@@ -1532,10 +2067,9 @@ pub(crate) fn program_cmdq_registers(mmio: &MmioRegion, cmdq_phys: u64, log_size
 /// pattern, so a second ConnectX on the same machine probes and
 /// binds instead of being dropped by a singleton slot (issue
 /// #1631). The vec never shrinks, so a live controller's index
-/// stays valid for the kernel lifetime. (Unlike the other families
-/// converted here, mlx5 publishes no iface yet — its TX/RX
-/// datapath is still a stub — so there is no cookie send path to
-/// key by the index.)
+/// stays valid for the kernel lifetime — and is the cookie the
+/// kernel-side stack's send path resolves through
+/// [`mlx5_send_frame`].
 static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<Mlx5Hca>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
@@ -1568,8 +2102,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // failing probe — a NOP timeout might be a slow host, not a
     // broken device.
     let _ = dev.run_nop_selftest();
-    // Retain before any queue DMA address reaches the device.
-    CONTROLLERS.lock().push(dev.clone());
+    // Retain before any queue DMA address reaches the device; the
+    // index is this instance's send-path cookie (see `CONTROLLERS`).
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(dev.clone());
+        g.len() - 1
+    };
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
@@ -1578,32 +2117,47 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
+    // Stage 17: publish to the kernel-side stack (issue #800): a
+    // dynamic `eth%d` name + carrier metadata via the shared
+    // helper. The send hook carries this instance's `CONTROLLERS`
+    // index as its cookie, so each port's outbound frames resolve
+    // to its own HCA. MAC comes from a best-effort vport-context
+    // refresh — without it the cached MAC is all-zero and the
+    // published iface would carry a zero address.
+    let state = dev.refresh_nic_state().unwrap_or_default();
+    let name = crate::publish::publish_netdev_with_context(
+        state.mac,
+        index as u64,
+        mlx5_send_frame,
+        crate::publish::LinkSample::carrier_only(state.link_up),
+    );
+    let bus_info = match device.addr {
+        narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
+        narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
+    };
+    narf_net::iface::set_driver_info(&name, "mlx5", None, bus_info);
+    dev.ifname.set(name.clone());
+    narf_net::iface::install_rx_drain(mlx5_rx_pump_step);
+    // One RX queue, MTU-sized descriptors: software GRO is what
+    // amortizes the shared stack work under burst, e1000's rationale.
+    let _ = narf_net::iface::set_software_gro(&name, true);
+
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
         Some(a) => a.derive().ok(),
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(
-            &auth,
-            Mlx5NetIface {
-                nic: dev.clone(),
-                name: "mlx5",
-            },
-        );
+        let _ = narf_net::registry().register(&auth, Mlx5NetIface { nic: dev.clone() });
     }
 
     Ok(())
 }
 
-fn spawn_pumps(
-    device: Arc<Mlx5Hca>,
-    rx_prod: Producer<Frame, RX_RING_N>,
-    tx_cons: Consumer<Frame, TX_RING_N>,
-) {
+fn spawn_pumps(device: Arc<Mlx5Hca>, tx_cons: Consumer<Frame, TX_RING_N>) {
     let d1 = device.clone();
     narf_scheduler::spawn(async move {
-        mlx5_rx_pump(d1, rx_prod).await;
+        mlx5_rx_pump(d1).await;
     });
 
     let d2 = device;
@@ -1612,18 +2166,65 @@ fn spawn_pumps(
     });
 }
 
-async fn mlx5_rx_pump(_device: Arc<Mlx5Hca>, mut _rx_prod: Producer<Frame, RX_RING_N>) {
-    // TODO: implement mlx5 RX path (Stage 15+)
+async fn mlx5_rx_pump(device: Arc<Mlx5Hca>) {
+    // No MSI-X vector is bound yet, so there is no IRQ waiter: poll
+    // the CQ every millisecond (vmxnet3's no-vector fallback
+    // shape). Once awake, drain without yielding until the CQ is
+    // empty — a burst clears in one pass.
+    let poll_cycles = narf_time::ns_to_cycles(MLX5_RX_POLL_INTERVAL_NS);
     loop {
-        narf_scheduler::yield_now().await;
+        if device.drain_datapath(MLX5_RX_DRAIN_BUDGET) != 0 {
+            continue;
+        }
+        narf_time::sleep_cycles(poll_cycles).await;
     }
 }
 
-async fn mlx5_tx_pump(_device: Arc<Mlx5Hca>, mut _tx_cons: Consumer<Frame, TX_RING_N>) {
-    // TODO: implement mlx5 TX path (Stage 15+)
-    loop {
-        narf_scheduler::yield_now().await;
+async fn mlx5_tx_pump(device: Arc<Mlx5Hca>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    while let Ok(frame) = tx_cons.recv().await {
+        // Oversize frames are dropped, never retried.
+        if frame.len() as usize > MLX5_TX_SLOT_LEN {
+            continue;
+        }
+        // Slot exhaustion is transient — the RX pump frees slots
+        // as TX CQEs land — so retry briefly before dropping.
+        let mut tries = 0u32;
+        loop {
+            match device.transmit(frame.payload()) {
+                Ok(()) => break,
+                Err(Mlx5Error::TxSlotsExhausted) if tries < MLX5_TX_RETRY_MAX => {
+                    tries += 1;
+                    narf_time::sleep_cycles(narf_time::ns_to_cycles(MLX5_RX_POLL_INTERVAL_NS))
+                        .await;
+                }
+                Err(_) => break,
+            }
+        }
     }
+}
+
+/// Single synchronous CQ drain over every probed controller, for
+/// kernel-side busy-wait paths (ARP / TCP handshake) that cannot
+/// wait on the spawned RX pump while parked in
+/// `responsive_spin_until` (e1000/vmxnet3's `rx_pump_step` shape).
+/// Returns `true` when any controller handled a completion.
+pub fn mlx5_rx_pump_step() -> bool {
+    let controllers = CONTROLLERS.lock().clone();
+    let mut any = false;
+    for c in controllers {
+        any |= c.drain_datapath(MLX5_RX_DRAIN_BUDGET) != 0;
+    }
+    any
+}
+
+/// Stack `SendCtxFn`: transmit through the cookie's controller.
+/// Clone the `Arc` out rather than holding the IRQ-masking
+/// `CONTROLLERS` lock across `transmit` (e1000's thundering-herd
+/// note). No offloads are advertised, so `meta` is ignored and
+/// every frame goes out plain.
+fn mlx5_send_frame(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = controller(usize::try_from(cookie).map_err(|_| ())?).ok_or(())?;
+    ctrl.transmit(frame).map_err(|_| ())
 }
 
 /// Register the driver against every ConnectX-4..6 device id we
@@ -1689,13 +2290,11 @@ pub fn with_controller<R>(index: usize, f: impl FnOnce(&Mlx5Hca) -> R) -> Option
 pub struct Mlx5NetIface {
     /// This port's controller; the rings are borrowed out of it.
     nic: Arc<Mlx5Hca>,
-    /// Pre-publish fallback name, used by [`narf_net::Interface::name`].
-    name: &'static str,
 }
 
 impl narf_net::Interface for Mlx5NetIface {
     fn name(&self) -> &str {
-        self.name
+        self.nic.ifname()
     }
     fn mac(&self) -> [u8; 6] {
         self.nic.nic_state().mac
@@ -1723,7 +2322,7 @@ impl narf_net::Interface for Mlx5NetIface {
 
 impl crate::HwNic for Mlx5Hca {
     fn name(&self) -> &'static str {
-        "mlx5"
+        self.ifname()
     }
     fn mac(&self) -> [u8; 6] {
         self.nic_state().mac
