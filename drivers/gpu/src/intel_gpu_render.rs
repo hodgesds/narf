@@ -573,7 +573,9 @@ impl Namespaces {
             return Err(FsError::InvalidData);
         }
         let media = if matches!(legacy, abi::EXEC_BSD | abi::EXEC_VEBOX) {
-            if !info.platform.is_gen12() {
+            // Gen12 media runs on GuC, Gen9/Gen11 on the execlists owner;
+            // either way only a published engine is selectable below.
+            if !(info.platform.is_gen12() || info.platform.is_gen11() || info.platform.is_gen9()) {
                 return Err(FsError::InvalidData);
             }
             let present = info.user_status().ok_or(FsError::NoDevice)?.engines;

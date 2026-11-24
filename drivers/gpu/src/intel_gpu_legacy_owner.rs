@@ -300,12 +300,125 @@ pub(crate) fn timestamp_frequency(gt: LegacyGt, mut read: impl FnMut(u64) -> u32
 // ── Runtime ─────────────────────────────────────────────────────────
 
 type Engine = RcsEngine<BarWindow, SharedArena>;
+use crate::intel_gpu_engine::Engine as HwEngine;
+use crate::intel_gpu_media::{MediaForcewake, MediaFwDomain};
+use crate::intel_gpu_rcs::{EngineClass, EngineSpec};
+
+/// Gen9/Gen11 BCS0 (`BLT_RING_BASE`): a copy engine with the two-page
+/// non-render context image.
+const BCS0: EngineSpec = EngineSpec {
+    name: "bcs0",
+    class: EngineClass::Copy,
+    instance: 0,
+    base: 0x22000,
+    image_pages: crate::intel_gpu_media::MEDIA_IMAGE_PAGES,
+};
+
+/// `GEN11_GT_VEBOX_VDBOX_DISABLE`: VDBox disables [7:0], VEBox [23:16].
+const GEN11_VDBOX_VEBOX_DISABLE: u64 = 0x9140;
+
+/// The copy and media engines run beside RCS0 (`intel_engines_init_mmio`):
+/// BCS0, VCS0 and VECS0, present on every Gen9 and Gen11 part this owner
+/// admits, except a Gen11 VDBox or VEBox its fuse register disables.
+fn xcs_engines(gt: LegacyGt, mut read: impl FnMut(u64) -> u32) -> Vec<(HwEngine, EngineSpec)> {
+    use crate::intel_gpu_media as media;
+    match gt {
+        LegacyGt::Gen9 => alloc::vec![
+            (HwEngine::Bcs0, BCS0),
+            (HwEngine::Vcs0, media::GEN9_VCS0_SPEC),
+            (HwEngine::Vecs0, media::GEN9_VECS0_SPEC),
+        ],
+        LegacyGt::Gen11 => {
+            let fuse = read(GEN11_VDBOX_VEBOX_DISABLE);
+            let fuse = if fuse == u32::MAX { 0xff_00ff } else { fuse };
+            let mut engines = alloc::vec![(HwEngine::Bcs0, BCS0)];
+            if fuse & 1 == 0 {
+                engines.push((HwEngine::Vcs0, media::VCS0_SPEC));
+            }
+            if fuse & (1 << 16) == 0 {
+                engines.push((HwEngine::Vecs0, media::VECS0_SPEC));
+            }
+            engines
+        }
+    }
+}
+
+/// `enable_execlists` and the engine MOCS bank for a copy or media engine
+/// (`execlists_resume`): every HWSP write unmasked, execlists mode, the ring
+/// running, error interrupts cleared with only instruction errors unmasked.
+fn resume_xcs(mmio: &impl MmioWindow, gt: LegacyGt, which: HwEngine, base: u64) {
+    for (reg, value) in engine_mocs_writes(gt, which).into_iter().flatten() {
+        mmio.write32(reg, value);
+    }
+    mmio.write32(base + 0x98, u32::MAX);
+    mmio.write32(
+        base + 0x29c,
+        match gt {
+            LegacyGt::Gen11 => masked_enable(1 << 3),
+            LegacyGt::Gen9 => masked_enable(1 << 15),
+        },
+    );
+    mmio.write32(base + 0x9c, masked_disable(STOP_RING));
+    mmio.write32(base + 0xb4, u32::MAX);
+    mmio.write32(base + 0xb0, u32::MAX);
+    mmio.write32(base + 0xb4, !1);
+}
+
+/// The media forcewake domain gating `which`: Gen9's aggregate media well,
+/// Gen11's per-VDBox / per-VEBox wells. `None` for the copy engine, which
+/// the blitter domain covers.
+fn media_domain(gt: LegacyGt, which: HwEngine) -> Option<MediaFwDomain> {
+    match (gt, which) {
+        (_, HwEngine::Bcs0 | HwEngine::Rcs0) => None,
+        (LegacyGt::Gen9, _) => Some(MediaFwDomain::Aggregate),
+        (LegacyGt::Gen11, HwEngine::Vcs0) => Some(MediaFwDomain::VdBox(0)),
+        (LegacyGt::Gen11, HwEngine::Vecs0) => Some(MediaFwDomain::VeBox(0)),
+        _ => None,
+    }
+}
+
+/// One copy or media engine beside RCS0.
+struct Lane {
+    which: HwEngine,
+    engine: Engine,
+    contexts: Vec<Context>,
+}
+
+/// The hardware context of `user` on `engine`, created on first use with
+/// `setup` (the render context workarounds; nothing on other engines).
+fn context_on(
+    engine: &mut Engine,
+    contexts: &mut Vec<Context>,
+    setup: &[u32],
+    user: &Arc<UserContext>,
+) -> Result<ContextId, SubmitError> {
+    if let Some(context) = contexts
+        .iter()
+        .find(|c| core::ptr::eq(c.user.as_ptr(), Arc::as_ptr(user)))
+    {
+        return Ok(context.id);
+    }
+    let id = engine.create_context()?;
+    if !setup.is_empty() {
+        if let Err(error) = engine.emit_context_setup(id, setup) {
+            let _ = engine.destroy_context(id);
+            return Err(error);
+        }
+    }
+    contexts.push(Context {
+        user: Arc::downgrade(user),
+        id,
+    });
+    Ok(id)
+}
 
 /// A job is declared hung after this long without retiring (Linux's
 /// heartbeat declares a hang after a few 2.5 s pulses).
 const JOB_TIMEOUT_NS: u64 = 10_000_000_000;
 
 struct Job {
+    /// The engine running the request; request ids are per engine.
+    which: HwEngine,
     request: u64,
     job: UserJob,
     deadline: u64,
@@ -320,15 +433,22 @@ struct Context {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Service {
     Ok,
-    /// A job overran its deadline: reset RCS0 alone.
-    Hung,
+    /// A job overran its deadline on this engine: RCS0 resets alone, any
+    /// other engine through the full GT reset.
+    Hung(HwEngine),
     /// Completion tracking is lost: only a full GT reset recovers.
     Lost,
 }
 
 struct Runtime {
     engine: Engine,
+    /// The copy and media engines ([`xcs_engines`]) that came up.
+    xcs: Vec<Lane>,
+    gt: LegacyGt,
     fw: Forcewake,
+    /// The media wells the media lanes need (Gen9 aggregate, Gen11
+    /// VDBox/VEBox), held whenever render forcewake is.
+    media_fw: MediaForcewake,
     window: BarWindow,
     epoch: u64,
     /// The context workaround LRI each new hardware context starts with.
@@ -358,6 +478,11 @@ impl Runtime {
             let _ = self.fw.release(&self.window, FwDomain::Render);
             return Err(crate::intel_gpu_user::io_error());
         }
+        if !self.acquire_media() {
+            let _ = self.fw.release(&self.window, FwDomain::Blitter);
+            let _ = self.fw.release(&self.window, FwDomain::Render);
+            return Err(crate::intel_gpu_user::io_error());
+        }
         let window = &self.window;
         rc6_unpark(self.rc6_ctl, |r, v| window.write32(r, v));
         if let Some(Some(freq)) = self.governor.unpark() {
@@ -375,36 +500,90 @@ impl Runtime {
             rps_request(idle, |r, v| window.write32(r, v));
         }
         rc6_park(|r, v| window.write32(r, v));
-        let _ = self.fw.release(window, FwDomain::Blitter);
-        let _ = self.fw.release(window, FwDomain::Render);
+        self.release_media();
+        let _ = self.fw.release(&self.window, FwDomain::Blitter);
+        let _ = self.fw.release(&self.window, FwDomain::Render);
     }
 
-    fn context_for(&mut self, user: &Arc<UserContext>) -> Result<ContextId, SubmitError> {
-        if let Some(context) = self
-            .contexts
+    /// Every media well a media lane needs; on failure nothing extra is held.
+    fn acquire_media(&mut self) -> bool {
+        let domains: Vec<_> = self
+            .xcs
             .iter()
-            .find(|c| core::ptr::eq(c.user.as_ptr(), Arc::as_ptr(user)))
-        {
-            return Ok(context.id);
+            .filter_map(|lane| media_domain(self.gt, lane.which))
+            .collect();
+        let mut held = Vec::new();
+        for domain in domains {
+            if held.contains(&domain) {
+                continue;
+            }
+            if self.media_fw.acquire(&self.window, domain).is_err() {
+                for domain in held {
+                    let _ = self.media_fw.release(&self.window, domain);
+                }
+                return false;
+            }
+            held.push(domain);
         }
-        let id = self.engine.create_context()?;
-        if let Err(error) = self.engine.emit_context_setup(id, &self.ctx_wa) {
-            let _ = self.engine.destroy_context(id);
-            return Err(error);
+        true
+    }
+
+    fn release_media(&mut self) {
+        let mut released = Vec::new();
+        for lane in &self.xcs {
+            if let Some(domain) = media_domain(self.gt, lane.which) {
+                if !released.contains(&domain) {
+                    let _ = self.media_fw.release(&self.window, domain);
+                    released.push(domain);
+                }
+            }
         }
-        self.contexts.push(Context {
-            user: Arc::downgrade(user),
-            id,
-        });
-        Ok(id)
+    }
+
+    /// The hardware engine and context for `user`'s engine.
+    fn context_for(
+        &mut self,
+        user: &Arc<UserContext>,
+    ) -> Result<(&mut Engine, ContextId), SubmitError> {
+        let which = user.engine();
+        if which == HwEngine::Rcs0 {
+            let id = context_on(&mut self.engine, &mut self.contexts, &self.ctx_wa, user)?;
+            return Ok((&mut self.engine, id));
+        }
+        let lane = self
+            .xcs
+            .iter_mut()
+            .find(|lane| lane.which == which)
+            .ok_or(SubmitError::NoEngine)?;
+        let id = context_on(&mut lane.engine, &mut lane.contexts, &[], user)?;
+        Ok((&mut lane.engine, id))
     }
 
     /// Retire landed jobs and drop hardware contexts whose user context is
     /// gone. [`Service::Lost`] when a completion could not be proven (only a
     /// GT reset recovers), [`Service::Hung`] when a job outlived its deadline.
     fn service(&mut self, now: u64) -> Service {
-        for done in self.engine.poll_completions() {
-            if let Some(i) = self.jobs.iter().position(|j| j.request == done.request) {
+        let mut done: Vec<_> = self
+            .engine
+            .poll_completions()
+            .into_iter()
+            .map(|done| (HwEngine::Rcs0, done.request))
+            .collect();
+        for lane in &mut self.xcs {
+            let which = lane.which;
+            done.extend(
+                lane.engine
+                    .poll_completions()
+                    .into_iter()
+                    .map(|d| (which, d.request)),
+            );
+        }
+        for (which, request) in done {
+            if let Some(i) = self
+                .jobs
+                .iter()
+                .position(|j| j.which == which && j.request == request)
+            {
                 self.jobs.swap_remove(i).job.finish(false);
             }
         }
@@ -412,14 +591,22 @@ impl Runtime {
         self.contexts.retain(|context| {
             context.user.strong_count() != 0 || engine.destroy_context(context.id).is_err()
         });
-        if self.engine.completion_lost() {
+        for lane in &mut self.xcs {
+            let engine = &mut lane.engine;
+            lane.contexts.retain(|context| {
+                context.user.strong_count() != 0 || engine.destroy_context(context.id).is_err()
+            });
+        }
+        if self.engine.completion_lost() || self.xcs.iter().any(|l| l.engine.completion_lost()) {
             return Service::Lost;
         }
-        if self.jobs.iter().any(|job| now >= job.deadline) {
-            return Service::Hung;
+        if let Some(job) = self.jobs.iter().find(|job| now >= job.deadline) {
+            return Service::Hung(job.which);
         }
         {
-            let busy = !self.jobs.is_empty() || !self.engine.is_idle();
+            let busy = !self.jobs.is_empty()
+                || !self.engine.is_idle()
+                || self.xcs.iter().any(|l| !l.engine.is_idle());
             match self.governor.tick(now, busy) {
                 Some(Step::Request(freq)) => {
                     let window = &self.window;
@@ -445,6 +632,8 @@ pub(crate) struct Owner {
     state: Mutex<Option<Runtime>>,
     epoch: AtomicU64,
     clock: AtomicU64,
+    /// The published engine set's bits (RCS0 plus the lanes that came up).
+    engines: core::sync::atomic::AtomicU32,
     topology: narf_lib::sync::IrqSafeSpinLock<Option<crate::intel_gpu_legacy_gt::LegacyTopology>>,
 }
 
@@ -580,10 +769,61 @@ impl Owner {
         }
         let rc6_ctl = rc6_enable(gt, self.device, |r, v| window.write32(r, v));
         rc6_unpark(rc6_ctl, |r, v| window.write32(r, v));
+        // BCS0, VCS0 and VECS0: each its own execlists engine on the shared
+        // arena. An engine that does not come up is left out of the
+        // published set; RCS0 still runs.
+        let mut media_fw = MediaForcewake::new();
+        let mut xcs = Vec::new();
+        for (which, spec) in xcs_engines(gt, |r| window.read32(r)) {
+            if let Some(domain) = media_domain(gt, which) {
+                if media_fw.acquire(&window, domain).is_err() {
+                    log(self.index, "media forcewake refused; engine left out");
+                    continue;
+                }
+            }
+            resume_xcs(&window, gt, which, spec.base);
+            let lane = RcsEngine::with_spec_for_generation(
+                spec,
+                generation,
+                BarWindow::new(self.bar),
+                crate::intel_gpu_rcs::production_arena(self.bar),
+            )
+            .and_then(|mut engine| match engine.reset_csb_pointers() {
+                Ok(()) => Ok(engine),
+                Err(error) => {
+                    // SAFETY: nothing was submitted on this engine.
+                    unsafe { engine.release_after_reset() };
+                    Err(error)
+                }
+            });
+            match lane {
+                Ok(engine) => xcs.push(Lane {
+                    which,
+                    engine,
+                    contexts: Vec::new(),
+                }),
+                Err(_) => {
+                    if let Some(domain) = media_domain(gt, which) {
+                        let _ = media_fw.release(&window, domain);
+                    }
+                    log(self.index, "copy/media engine did not come up; left out");
+                }
+            }
+        }
+        let engines = core::iter::once(HwEngine::Rcs0)
+            .chain(xcs.iter().map(|lane| lane.which))
+            .collect::<Vec<_>>();
+        self.engines.store(
+            crate::intel_gpu_engine::EngineSet::of(&engines).bits(),
+            Ordering::Release,
+        );
         let epoch = crate::intel_gpu_user::next_epoch();
         *self.state.lock().await = Some(Runtime {
             engine,
+            xcs,
+            gt,
             fw,
+            media_fw,
             window,
             epoch,
             ctx_wa,
@@ -616,6 +856,7 @@ impl Owner {
             }
         };
         rc6_disable(|r, v| runtime.window.write32(r, v));
+        runtime.release_media();
         let _ = runtime.fw.release(&runtime.window, FwDomain::Blitter);
         let _ = runtime.fw.release(&runtime.window, FwDomain::Render);
         if result.is_err() {
@@ -627,9 +868,13 @@ impl Owner {
         for job in runtime.jobs.drain(..) {
             job.job.finish(true);
         }
-        // SAFETY: the full-domain reset above completed, so the engine no
-        // longer reads or writes any context, ring or batch memory.
+        // SAFETY: the full-domain reset above completed, so no engine reads
+        // or writes any context, ring or batch memory any more.
         unsafe { runtime.engine.release_after_reset() };
+        for lane in runtime.xcs.drain(..) {
+            // SAFETY: as above; the full-domain reset covers every engine.
+            unsafe { lane.engine.release_after_reset() };
+        }
     }
 
     async fn run(self: Arc<Self>) {
@@ -652,7 +897,7 @@ impl Owner {
                     log(self.index, "render backend already installed");
                     return;
                 }
-                log(self.index, "RCS0 published");
+                log(self.index, "engines published");
             }
             attempts = 0;
             loop {
@@ -670,7 +915,11 @@ impl Owner {
                         log(self.index, "completion lost; resetting the GT");
                         true
                     }
-                    Service::Hung => match self.reset_engine().await {
+                    Service::Hung(engine) if engine != HwEngine::Rcs0 => {
+                        log(self.index, "copy/media job hung; resetting the GT");
+                        true
+                    }
+                    Service::Hung(_) => match self.reset_engine().await {
                         Ok(()) => false,
                         Err(_) => {
                             log(self.index, "RCS0 reset failed; resetting the GT");
@@ -711,7 +960,11 @@ impl Owner {
             unsafe { runtime.engine.reset_rewind() }.map_err(InitError::Engine)?;
         let now = narf_time::monotonic_ns();
         for request in failed {
-            if let Some(i) = runtime.jobs.iter().position(|j| j.request == request) {
+            if let Some(i) = runtime
+                .jobs
+                .iter()
+                .position(|j| j.which == HwEngine::Rcs0 && j.request == request)
+            {
                 runtime.jobs.swap_remove(i).job.finish_hung();
             }
         }
@@ -737,8 +990,10 @@ impl Owner {
         if epoch == 0 {
             return Err(FsError::NoDevice);
         }
+        let published =
+            crate::intel_gpu_engine::EngineSet::from_bits(self.engines.load(Ordering::Acquire));
         if batch.0.platform() != Some(self.platform)
-            || context.engine() != crate::intel_gpu_engine::Engine::Rcs0
+            || !published.contains(context.engine())
             || context.parallel().is_some()
             || context.placements() != crate::intel_gpu_engine::EngineSet::of(&[context.engine()])
         {
@@ -751,13 +1006,11 @@ impl Owner {
             .ok_or(FsError::NoDevice)?;
         runtime.unpark()?;
         let claim = context.claim_resident(epoch)?;
-        let id = runtime.context_for(&context).map_err(submit_error)?;
-        let submission = runtime
-            .engine
-            .submit_resident(id, batch.0)
-            .map_err(submit_error)?;
+        let (engine, id) = runtime.context_for(&context).map_err(submit_error)?;
+        let submission = engine.submit_resident(id, batch.0).map_err(submit_error)?;
         let fence = submission.fence.clone();
         runtime.jobs.push(Job {
+            which: context.engine(),
             request: submission.request,
             job: claim.publish(fence.clone()),
             deadline: narf_time::monotonic_ns().saturating_add(JOB_TIMEOUT_NS),
@@ -786,9 +1039,9 @@ impl UserBackend for Backend {
             epoch,
             platform: self.0.platform,
             submission_version: (0, 0, 0),
-            engines: crate::intel_gpu_engine::EngineSet::of(&[
-                crate::intel_gpu_engine::Engine::Rcs0,
-            ]),
+            engines: crate::intel_gpu_engine::EngineSet::from_bits(
+                self.0.engines.load(Ordering::Acquire),
+            ),
         })
     }
 
@@ -855,6 +1108,7 @@ pub(crate) fn install(
         state: Mutex::new(None),
         epoch: AtomicU64::new(0),
         clock: AtomicU64::new(0),
+        engines: core::sync::atomic::AtomicU32::new(0),
         topology: narf_lib::sync::IrqSafeSpinLock::new(None),
     }));
     true
@@ -1095,5 +1349,60 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_legacy_owner",
         smoke_legacy_owner_claim_resident
+    );
+
+    /// BCS0, VCS0 and VECS0 beside RCS0 at their Gen9 and Gen11 bases; a
+    /// Gen11 VDBox or VEBox fused off is left out (an unreadable fuse
+    /// register keeps only the copy engine); each media engine names its
+    /// forcewake well.
+    fn smoke_legacy_owner_copy_and_media_engines() -> TestResult {
+        let bases = |gt, fuse| {
+            xcs_engines(gt, |_| fuse)
+                .into_iter()
+                .map(|(which, spec)| (which, spec.base))
+                .collect::<Vec<_>>()
+        };
+        if bases(LegacyGt::Gen9, 0xffff_ffff)
+            != alloc::vec![
+                (HwEngine::Bcs0, 0x22000),
+                (HwEngine::Vcs0, 0x12000),
+                (HwEngine::Vecs0, 0x1a000),
+            ]
+        {
+            return TestResult::Fail("Gen9 copy and media engines");
+        }
+        if bases(LegacyGt::Gen11, 0)
+            != alloc::vec![
+                (HwEngine::Bcs0, 0x22000),
+                (HwEngine::Vcs0, 0x1c0000),
+                (HwEngine::Vecs0, 0x1c8000),
+            ]
+            || bases(LegacyGt::Gen11, 1)
+                != alloc::vec![(HwEngine::Bcs0, 0x22000), (HwEngine::Vecs0, 0x1c8000)]
+            || bases(LegacyGt::Gen11, u32::MAX) != alloc::vec![(HwEngine::Bcs0, 0x22000)]
+        {
+            return TestResult::Fail("Gen11 engines follow GEN11_GT_VEBOX_VDBOX_DISABLE");
+        }
+        if media_domain(LegacyGt::Gen9, HwEngine::Vecs0) != Some(MediaFwDomain::Aggregate)
+            || media_domain(LegacyGt::Gen11, HwEngine::Vcs0) != Some(MediaFwDomain::VdBox(0))
+            || media_domain(LegacyGt::Gen11, HwEngine::Vecs0) != Some(MediaFwDomain::VeBox(0))
+            || media_domain(LegacyGt::Gen11, HwEngine::Bcs0).is_some()
+        {
+            return TestResult::Fail("media engines name their forcewake wells");
+        }
+        let regs = Regs::default();
+        resume_xcs(&regs, LegacyGt::Gen9, HwEngine::Vcs0, 0x12000);
+        let writes = regs.writes.borrow();
+        if !writes.contains(&(0x1229c, 1 << 31 | 1 << 15))
+            || !writes.contains(&(0x1209c, 1 << 24))
+            || writes.first().map(|w| w.0) != Some(0xc900)
+        {
+            return TestResult::Fail("VCS0 resume: MOCS bank, execlists mode, ring running");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_owner",
+        smoke_legacy_owner_copy_and_media_engines
     );
 }
