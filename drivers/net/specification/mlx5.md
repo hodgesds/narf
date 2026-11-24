@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v1.0** (Stage 16: destroy paths + teardown — feature-complete clean-room).
+> Status: **v1.1** (Stage 17: Ethernet datapath — RX/TX pumps + iface publication, fixture-validated; silicon RX steering is a remainder, see §8).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,41 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v1.1** (Stage 17): Ethernet datapath + iface publication
+  (issue #800, mlx5 slice). `setup_datapath` (called from
+  `bring_up`, before the pumps spawn) builds UAR + PD, an EQ +
+  a CQ bound to it, a Raw-Ethernet QP driven RST → INIT → RTR →
+  RTS via the Stage-9 zero-input `MODIFY_QP` form, a TIS + a
+  direct TIR (inline RQN = the QP; no RQT — single-queue, no
+  RSS), one mkey per buffer pool, and posts one recv WQE per RQ
+  slot. Ring sizing is pinned by the Stage-11 constraint that
+  `post_send` / `post_recv` / `poll_cq` index `pages[0]` by byte
+  offset: SQ log 4 (16), RQ log 5 (32), CQ/EQ log 6 (64) — SQ+RQ
+  = 3 KiB in one page, max 48 simultaneous completions under
+  the 64-entry CQ. `transmit` copies into a TX staging slot
+  (8 × 2048 B pool, one mkey) and posts a `Send` WQE with
+  `AlwaysCqe`; the wqe→slot map (`TxSlotPool`) is recorded
+  under the datapath lock so a TX CQE can only reap a recorded
+  slot. `drain_datapath` (shared by the async RX pump and the
+  synchronous `mlx5_rx_pump_step`) classifies each CQE
+  (`classify_cqe`): TX completions free their slot, RX
+  completions mirror a pristine copy to the frame ring then
+  deliver the pool bytes to the kernel stack and repost the
+  slot; error completions still retire their WQE. Pumps poll
+  the CQ every 1 ms (no MSI-X vector bound yet). Probe
+  publishes a dynamic `eth%d` iface via
+  `publish_netdev_with_context` with the `CONTROLLERS` index as
+  the cookie send path (`mlx5_send_frame`), after a
+  best-effort vport-context refresh for the MAC, plus driver
+  info + software GRO + the sync RX drain. Four new smokes,
+  including a TX→RX loopback fixture driving the production
+  WQE/CQE/ring helpers in pump order. Remainders, all
+  unprovable without a ConnectX in CI: RX steering on silicon
+  also needs a flow-table root + rule (Stage 14 has no builder
+  for either — TIR/TIS/RQT only); `post_recv` advances the
+  software RQ tail without writing an RQ doorbell record (no
+  in-tree layout for it yet); the QP transitions use the
+  zero-input `MODIFY_QP` form. No live-silicon validation.
 - **v1.0** (Stage 16): destroy / dealloc paths. Five new
   opcodes — `DestroyEq` (0x302), `DestroyCq` (0x401),
   `DeallocPd` (0x801), `DeallocUar` (0x803). (`DestroyQp`
