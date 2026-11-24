@@ -2217,18 +2217,19 @@ fn smoke_mtl_external_service_dp_precedence_and_hdmi_refusals() -> TestResult {
     {
         return TestResult::Fail("DP-only DDI B must refuse without DDC traffic");
     }
-    // An HDMI clock without a source table refuses after the probe.
-    let io = hdmi_on_ddi_b(edid_for(123_450, 1024, 320, 24, 136, 768, 38, 3, 6));
+    // A TMDS clock past the 600 MHz source maximum refuses after the probe
+    // (C10 computes any untabled clock below it).
+    let io = hdmi_on_ddi_b(edid_for(620_000, 1024, 320, 24, 136, 768, 38, 3, 6));
     let mut service = MtlExternalService::new();
     if !matches!(
         service.handle(&io, connect, &mut fb_for),
         ServiceOutcome::Refused {
-            error: RouteError::Hdmi(HdmiError::UnsupportedClock(123_450)),
+            error: RouteError::Hdmi(HdmiError::UnsupportedClock(620_000)),
             ..
         }
     ) || service.route().is_some()
     {
-        return TestResult::Fail("untabled TMDS clock must refuse with its clock");
+        return TestResult::Fail("a TMDS clock past the source maximum must refuse with its clock");
     }
     // No scanout memory: refused, nothing owned.
     let io = hdmi_on_ddi_b(edid_1024());

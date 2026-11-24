@@ -57,9 +57,9 @@
 //! the sink declares no scrambling for or above its declared maximum,
 //! FRL and the FRL-ambiguous TMDS clocks 300/600 MHz (`intel_hdmi_is_frl`
 //! would select FRL clocking), clocks above the 600 MHz source maximum
-//! or without a source table (the SNPS C10 and computed C20 algorithms
-//! are not implemented; the latter also needs the MTL-U / ARL-S
-//! `tx_misc` platform fact), Type-C DP-alt (HDMI needs a legacy port), an
+//! (a clock without a source table computes: SNPS C10 always, C20 when the
+//! mapping reports its MTL-U / ARL-S `tx_misc` fact), Type-C DP-alt (HDMI
+//! needs a legacy port), an
 //! active DDI, no free Pipe B–D, a lit Pipe A that is not the owned panel
 //! profile, and the Pipe B–D owner's resource refusals (all before the
 //! first write). PM demand runs at the TMDS clock (Linux's
@@ -374,6 +374,230 @@ pub fn compute_c20_hdmi_tmds(port_clock_khz: u32, tx_cfg1: u16) -> Option<C20Pll
     })
 }
 
+/// The kernel's 64-bit helpers, as `intel_snps_hdmi_pll.c` sees them:
+/// `do_div` (and so `DIV_ROUND_DOWN_ULL` / `DIV_ROUND_UP_ULL`) truncates
+/// its divisor to 32 bits, the `DIV64_U64_*` forms keep 64, and all of it
+/// wraps like C. A divisor that is zero after truncation ends the
+/// computation (the C would trap).
+mod snps {
+    pub(super) fn div_down(ll: u64, d: u64) -> Option<u64> {
+        ll.checked_div(u64::from(d as u32))
+    }
+    pub(super) fn div_up_ull(ll: u64, d: u64) -> Option<u64> {
+        div_down(ll.wrapping_add(d).wrapping_sub(1), d)
+    }
+    pub(super) fn div64_up(ll: u64, d: u64) -> Option<u64> {
+        ll.wrapping_add(d).wrapping_sub(1).checked_div(d)
+    }
+    pub(super) fn div64_closest(n: u64, d: u64) -> Option<u64> {
+        n.wrapping_add(d / 2).checked_div(d)
+    }
+    /// `int_sqrt`: the floor square root.
+    pub(super) fn int_sqrt(x: u64) -> u64 {
+        if x <= 1 {
+            return x;
+        }
+        let (mut x, mut y) = (x, 0u64);
+        let mut m = 1u64 << ((63 - x.leading_zeros()) & !1);
+        while m != 0 {
+            let b = y + m;
+            y >>= 1;
+            if x >= b {
+                x -= b;
+                y += m;
+            }
+            m >>= 2;
+        }
+        y
+    }
+    /// `interp`: its `s64` operands go through `DIV64_U64_ROUND_UP` as
+    /// `u64`, so a falling curve segment wraps exactly as in C.
+    pub(super) fn interp(x: u64, x1: u64, x2: u64, y1: u64, y2: u64) -> Option<u64> {
+        let dydx = div64_up(
+            y2.wrapping_sub(y1).wrapping_mul(100_000),
+            x2.wrapping_sub(x1),
+        )?;
+        Some(y1.wrapping_add(div64_up(dydx.wrapping_mul(x.wrapping_sub(x1)), 100_000)?))
+    }
+}
+
+/// `intel_snps_hdmi_pll_compute_c10pll` (`intel_snps_hdmi_pll.c`): the C10
+/// PLL state for an HDMI TMDS `port_clock_khz` without a precomputed
+/// table, before `intel_c10pll_update_pll` clears the SSC bytes. Ported
+/// operation for operation, including that `do_div(vco_clk, ...)` leaves
+/// the quotient in `vco_clk`, so the VCO segment and the charge-pump
+/// interpolation see that quotient; the output matches Linux's compiled
+/// function byte for byte.
+pub fn compute_c10_hdmi_tmds(port_clock_khz: u32) -> Option<C10PllState> {
+    use snps::{div64_closest, div64_up, div_down, div_up_ull, int_sqrt, interp};
+    const HZ_4999: u64 = 4_999_999_900;
+    const HZ_9999: u64 = 2 * HZ_4999;
+    const HZ_16G: u64 = 16_000_000_000;
+    const FREQ: [[u64; 8]; 2] = [
+        [
+            2_500_000_000,
+            3_000_000_000,
+            3_000_000_000,
+            3_500_000_000,
+            3_500_000_000,
+            4_000_000_000,
+            4_000_000_000,
+            5_000_000_000,
+        ],
+        [
+            4_000_000_000,
+            4_600_000_000,
+            4_601_000_000,
+            5_400_000_000,
+            5_401_000_000,
+            6_600_000_000,
+            6_601_000_000,
+            8_001_000_000,
+        ],
+    ];
+    const CURVE_0: [[u64; 8]; 2] = [
+        [
+            41174500, 48605500, 42973700, 49433100, 42408600, 47681900, 40297400, 49131400,
+        ],
+        [
+            82056800, 94420700, 82323400, 96370600, 81273300, 98630100, 81728700, 99105700,
+        ],
+    ];
+    const CURVE_1: [[u64; 8]; 2] = [
+        [
+            73_300_000_000_000,
+            66_000_000_000_000,
+            83_100_000_000_000,
+            75_300_000_000_000,
+            99_700_000_000_000,
+            92_300_000_000_000,
+            125_000_000_000_000,
+            110_000_000_000_000,
+        ],
+        [
+            53_700_000_000_000,
+            47_700_000_000_000,
+            62_200_000_000_000,
+            54_400_000_000_000,
+            75_100_000_000_000,
+            63_400_000_000_000,
+            90_600_000_000_000,
+            76_300_000_000_000,
+        ],
+    ];
+    const CURVE_2: [[u64; 8]; 2] = [
+        [
+            2_415_790_000,
+            3_136_460_000,
+            2_581_990_000,
+            3_222_670_000,
+            2_529_330_000,
+            3_042_020_000,
+            2_336_970_000,
+            3_191_460_000,
+        ],
+        [
+            4_808_390_000,
+            5_994_250_000,
+            4_832_730_000,
+            6_193_730_000,
+            4_737_700_000,
+            6_428_750_000,
+            4_779_200_000,
+            6_479_340_000,
+        ],
+    ];
+    const CURVE0_MULTIPLIER: u64 = 1_000_000_000;
+    const CURVE1_MULTIPLIER: u64 = 100;
+    const CURVE2_MULTIPLIER: u64 = 1_000_000_000_000;
+    const REFCLK: u64 = 38_400_000; // prescaler_divider 0
+    const CP_INT_GS: u8 = 30;
+    const CP_PROP_GS: u8 = 28;
+
+    // compute_hdmi_tmds_pll
+    let datarate = u64::from(port_clock_khz).wrapping_mul(10_000);
+    if datarate == 0 {
+        return None;
+    }
+    let (v2i, tx_clk_div) = if datarate <= HZ_9999 {
+        (2u64, (HZ_9999 / datarate).checked_ilog2()?)
+    } else {
+        (3, (HZ_16G / datarate).checked_ilog2()?)
+    };
+    let mut vco_clk = datarate.wrapping_shl(tx_clk_div) >> 1;
+    let integer = div_down(vco_clk, REFCLK)? as u32;
+    let rem = vco_clk % REFCLK;
+    vco_clk /= REFCLK; // do_div leaves the quotient here
+    let fracn = div_down(rem << 32, REFCLK)? as u32;
+    let fracn_quot = fracn >> 16;
+    let mut fracn_rem = fracn & 0xFFFF;
+    fracn_rem -= fracn_rem >> 15;
+    let fracn_den: u32 = 0xFFFF;
+    let fracn_en = u8::from(fracn_quot != 0 || fracn_rem != 0);
+    let multiplier = integer.wrapping_sub(16).wrapping_mul(2);
+    let c = (v2i - 2) as usize;
+    let (mut a, mut ana_freq_vco) = (0usize, 0u8);
+    for i in (0..8).step_by(2) {
+        if vco_clk <= FREQ[c][i + 1] {
+            a = i;
+            ana_freq_vco = 3 - (a >> 1) as u8;
+            break;
+        }
+    }
+
+    // get_ana_cp_int_prop
+    let vco_div_refclk = vco_clk.wrapping_mul(div_down(1_000_000_000_000, REFCLK)?);
+    let (x1, x2) = (FREQ[c][a], FREQ[c][a + 1]);
+    let c0 = interp(vco_clk, x1, x2, CURVE_0[c][a], CURVE_0[c][a + 1])?;
+    let c2 = interp(vco_clk, x1, x2, CURVE_2[c][a], CURVE_2[c][a + 1])?;
+    let c1 = interp(vco_clk, x1, x2, CURVE_1[c][a], CURVE_1[c][a + 1])?;
+    let c1 = div_down(c1, CURVE1_MULTIPLIER)?;
+    let temp = c2.wrapping_mul(4 - v2i);
+    let c2_scaled1 = div_down(temp, 16_000)?;
+    let c2_scaled2 = div_down(temp, 160)?;
+    let scaled1 = 112_008_301u64.wrapping_mul(div_down(vco_div_refclk, 100_000)?);
+    let adjusted1 = CURVE2_MULTIPLIER.wrapping_mul(div_down(
+        scaled1,
+        c0.wrapping_mul(div_down(c1, CURVE0_MULTIPLIER)?),
+    )?);
+    let cp_int = div64_closest(div_down(adjusted1, c2_scaled1)?, CURVE2_MULTIPLIER)?.clamp(1, 127);
+    let c2_scaled_int = c2_scaled1.wrapping_mul(cp_int);
+    let product = c1.wrapping_mul(c2_scaled_int.wrapping_mul(div_down(c0, CURVE0_MULTIPLIER)?));
+    let sqrt =
+        int_sqrt(div64_up(product, vco_div_refclk)?.wrapping_mul(div_down(1_000_000_000_000, 55)?));
+    let scaled2 = div_up_ull(vco_div_refclk, 1_000_000)?;
+    let adjusted2 = 1_460_281u64.wrapping_mul(div64_up(sqrt.wrapping_mul(scaled2), c1)?);
+    // `*ana_cp_prop` is a u32: the quotient truncates before the clamp.
+    let cp_prop = u64::from((div64_up(adjusted2, c2_scaled2)? as u32).clamp(1, 127));
+    let (cp_int, cp_prop, v2i) = (cp_int as u8, cp_prop as u8, v2i as u8);
+
+    let mut pll = [0u8; 20];
+    // C10_PLL0: DIV5CLK_EN (mpll_div5_en 1), FRACEN, PMIX_EN (= fracn_en),
+    // ANA_FREQ_VCO.
+    pll[0] = (1 << 2) | (fracn_en << 4) | (fracn_en << 5) | ((ana_freq_vco & 3) << 6);
+    pll[2] = multiplier as u8;
+    pll[3] = ((multiplier >> 8) & 0xF) as u8;
+    pll[8] = 1 << 5; // SSC_UP_SPREAD
+    pll[9] = fracn_den as u8;
+    pll[10] = (fracn_den >> 8) as u8;
+    pll[11] = fracn_quot as u8;
+    pll[12] = (fracn_quot >> 8) as u8;
+    pll[13] = fracn_rem as u8;
+    pll[14] = (fracn_rem >> 8) as u8;
+    // TXCLKDIV (2:0) | HDMIDIV(1) (5:3)
+    pll[15] = (tx_clk_div as u8 & 7) | (1 << 3);
+    // REG_FIELD_PREP masks each field, as the C does.
+    pll[16] = (cp_int & 0x7F) | ((CP_INT_GS << 7) & 0x80);
+    pll[17] = ((CP_INT_GS >> 1) & 0x3F) | ((cp_prop << 6) & 0xC0);
+    pll[18] = ((cp_prop >> 2) & 0x1F) | ((CP_PROP_GS << 5) & 0xE0);
+    pll[19] = ((CP_PROP_GS >> 3) & 0xF) | ((v2i << 4) & 0x30);
+    Some(C10PllState {
+        tx: 0x10,
+        cmn: 0x01,
+        pll,
+    })
+}
+
 /// Resolve the HDMI TMDS PLL request for `port` at `clock_khz`
 /// (`intel_c10pll_calc_state` / `intel_c20pll_calc_state`, table path).
 pub fn hdmi_pll_request(
@@ -384,10 +608,11 @@ pub fn hdmi_pll_request(
     hdmi_pll_request_computed(port, clock_khz, legacy, None)
 }
 
-/// [`hdmi_pll_request`] with Linux's fallback: a C20 clock with no ideal
-/// table is computed (`intel_c20pll_calc_state` tries the tables first,
-/// "since the calculated values, although correct, may not be optimal")
-/// when the platform's `tx[1]` word is known. C10 clocks stay table-only.
+/// [`hdmi_pll_request`] with Linux's C20 fallback: a C20 clock with no
+/// ideal table is computed (`intel_c20pll_calc_state` tries the tables
+/// first, "since the calculated values, although correct, may not be
+/// optimal") when the platform's `tx[1]` word is known. C10 always falls
+/// back to the SNPS algorithm (`compute_c10_hdmi_tmds`).
 pub fn hdmi_pll_request_computed(
     port: XeLpgPort,
     clock_khz: u32,
@@ -405,10 +630,13 @@ pub fn hdmi_pll_request_computed(
     }
     let state = match port.phy() {
         PhyKind::C10 => {
+            // intel_c10pll_calc_state: the tables, then for HDMI the SNPS
+            // algorithm.
             let mut state = C10_HDMI_TABLES
                 .iter()
                 .find(|(clock, _)| *clock == clock_khz)
                 .map(|(_, state)| *state)
+                .or_else(|| compute_c10_hdmi_tmds(clock_khz))
                 .ok_or(HdmiError::UnsupportedClock(clock_khz))?;
             // intel_c10pll_update_pll: HDMI has no SSC.
             for byte in &mut state.pll[4..9] {
