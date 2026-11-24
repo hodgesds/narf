@@ -955,7 +955,16 @@ fn smoke_userspace_hung_job_is_retired_alone() -> TestResult {
             0xdfc,
         ),
     ] {
-        for reset in [false, true] {
+        // CONTEXT_RESET_NOTIFICATION, and NOTIFY_MEMORY_CAT_ERROR with and
+        // without the opt-in type dword, which xe handles as the same reset.
+        let notices: [(u32, &[u32]); 4] = [
+            (0, &[]),
+            (0x1008, &[0]),
+            (0x6000, &[0]),
+            (0x6000, &[0, 0xdeadbeef]),
+        ];
+        for notice in notices {
+            let reset = notice.0 != 0;
             let (w, arena, mut gt) = hardware_model(platform, ack);
             prime(&mut gt, &w, ack);
             let epoch = gt.user_epoch();
@@ -1020,7 +1029,9 @@ fn smoke_userspace_hung_job_is_retired_alone() -> TestResult {
             assert!(!text.contains("lrca") && !text.contains("bbaddr"));
             assert!(crate::intel_gpu_error::clear(index, generation));
             if reset {
-                event(&ct_memory(&w), 0x1008, &[u32::from(id)]);
+                let mut payload = notice.1.to_vec();
+                payload[0] = u32::from(id);
+                event(&ct_memory(&w), notice.0, &payload);
             }
             assert!(service_contexts(&w, &mut registered, false).contains(&0x1001));
             for now in HANG_TIMEOUT + 131..HANG_TIMEOUT + 200 {

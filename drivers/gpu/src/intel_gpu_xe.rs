@@ -1105,17 +1105,22 @@ impl XeFile {
         if queue.vm.lr && sync.has_fence_outputs() {
             return Err(FsError::InvalidData);
         }
+        // Mesa passes canonical (sign-extended) batch addresses; bindings
+        // are recorded by their 48-bit VA (intel_48b_address).
         let addresses = if parallel.is_some() && count != 0 {
             let vector = read(user, u64_at(&wire, 24), width * 8)?;
             Some(
                 vector
                     .chunks_exact(8)
-                    .map(|word| u64_at(word, 0))
-                    .collect::<alloc::vec::Vec<_>>(),
+                    .map(|word| crate::intel_gpu_exec::decanonicalize(u64_at(word, 0)))
+                    .collect::<Result<alloc::vec::Vec<_>, _>>()?,
             )
         } else {
             None
         };
+        let batch = (count == 1 && parallel.is_none())
+            .then(|| crate::intel_gpu_exec::decanonicalize(u64_at(&wire, 24)))
+            .transpose()?;
         let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
         let _order = queue.context.serial.lock().await;
         sync.wait().await;
@@ -1162,7 +1167,7 @@ impl XeFile {
                 ResidentBatch::from_vm(
                     status.platform,
                     &state.mappings,
-                    (count == 1).then_some(u64_at(&wire, 24)),
+                    batch,
                     queue.vm.scratch,
                     sync.user_fence,
                 )?

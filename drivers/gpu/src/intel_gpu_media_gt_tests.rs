@@ -935,7 +935,7 @@ fn smoke_media_gt_shared_ggtt_invalidates_media_guc_tlb_only_while_registered() 
     store(GT0_INV, SENTINEL);
     let cleared = pte(&second);
     alloc.free(second);
-    kt_assert_eq!(load(cleared), 0);
+    kt_assert_eq!(load(cleared), arena.cleared_pte() as u32);
     kt_assert_eq!(load(MEDIA_INV), 1);
     kt_assert_eq!(load(GT0_INV), 1);
     // Unregistered after the media GuC's proven stop: identical GT0 path.
@@ -1082,7 +1082,7 @@ fn smoke_media_gt_default_off_gate_and_absent_option_leave_gt0_unchanged() -> Te
     kt_assert_ne!(load(pte), 0);
     alloc.free(second);
     alloc.free(first);
-    kt_assert_eq!(load(pte), 0);
+    kt_assert_eq!(load(pte), arena.cleared_pte() as u32);
     kt_assert_eq!(load(0x38cee8), SENTINEL);
     kt_assert_eq!(load(0xcee8), 1);
     kt_assert_eq!(arena.live_allocations(), 0);

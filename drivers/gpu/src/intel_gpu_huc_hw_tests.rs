@@ -626,10 +626,13 @@ fn production_huc_ptes() {
         assert_ne!(u64::from(lo & !0xfff) | u64::from(hi) << 32, 0);
     }
     drop(boot);
+    // xe_ggtt_clear: the released range maps the scratch page.
+    let scratch = arena.cleared_pte();
+    assert_ne!(scratch, 0);
     for page in 0..pages {
         assert_eq!(
             (memory[index + page * 2], memory[index + page * 2 + 1]),
-            (0, 0)
+            (scratch as u32, (scratch >> 32) as u32)
         );
     }
     assert_eq!(arena.live_allocations(), 0);

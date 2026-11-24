@@ -3,7 +3,7 @@
 //! CTX_TIMESTAMP counts only while this context executes. A restore batch
 //! marks the saved timestamp active; context save replaces that marker.
 
-use super::{SchedulingError, TIMEOUT};
+use super::{protocol, SchedulingError, TIMEOUT};
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_engine::{Engine, EngineSet, REGS},
@@ -77,14 +77,14 @@ pub(super) fn observed_engine(
     }
     match image.read32(START) {
         0 => return Ok(None),
-        found if found != stamp => return Err(SchedulingError::Protocol),
+        found if found != stamp => return Err(protocol!()),
         _ => {}
     }
     let receipt = image.read32(ENGINE_RECEIPT);
     placements
         .decode_hardware_id(receipt)
         .map(Some)
-        .ok_or(SchedulingError::Protocol)
+        .ok_or_else(|| protocol!())
 }
 
 /// Sample CTX_TIMESTAMP before publishing the start stamp. Both writes are
@@ -139,10 +139,10 @@ impl Runtime {
                 self.previous_active = None;
                 return Ok((false, false));
             }
-            found if found != stamp => return Err(SchedulingError::Protocol),
+            found if found != stamp => return Err(protocol!()),
             _ => {}
         }
-        let engine = observed_engine(image, stamp, placements)?.ok_or(SchedulingError::Protocol)?;
+        let engine = observed_engine(image, stamp, placements)?.ok_or_else(|| protocol!())?;
         // The saved CTX_TIMESTAMP lives in the same moved slot the
         // restore batch marks ACTIVE (issue #1871): reading the stale
         // 0x23 slot on non-Gen12 Rcs0 would return the second LRI
@@ -150,14 +150,14 @@ impl Runtime {
         let timestamp = REGS + engine.timestamp_value_slot(platform) * 4;
         let rpm = window.read32(0xd00);
         if rpm == u32::MAX || rpm != window.read32(0xd00) {
-            return Err(SchedulingError::Protocol);
+            return Err(protocol!());
         }
         let crystal = match (rpm >> 3) & 7 {
             0 => 24_000_000u64,
             1 => 19_200_000,
             2 => 38_400_000,
             3 => 25_000_000,
-            _ => return Err(SchedulingError::Protocol),
+            _ => return Err(protocol!()),
         };
         let frequency = crystal >> (3 - ((rpm >> 1) & 3));
         let mut saved = image.read32(timestamp);
@@ -169,7 +169,7 @@ impl Runtime {
             current = window.read32(base + 0x3a8);
             let after = window.read32(base + 0x240);
             if before == u32::MAX || after == u32::MAX {
-                return Err(SchedulingError::Protocol);
+                return Err(protocol!());
             }
             // A context can switch out between the saved-state and MMIO
             // reads. In that case its new saved value wins over the other
@@ -191,7 +191,7 @@ impl Runtime {
                     self.previous_active = None;
                     return Ok((false, false));
                 } else if current == u32::MAX {
-                    return Err(SchedulingError::Protocol);
+                    return Err(protocol!());
                 } else {
                     active = true;
                 }

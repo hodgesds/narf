@@ -290,8 +290,13 @@ fn smoke_ggtt_tlb_arena_gt0_mmio_every_update_per_platform() -> TestResult {
         kt_assert_eq!(bar.written().as_slice(), expected);
         bar.rearm();
         let cleared = pte(&second);
+        let mapped = bar.load(cleared);
         alloc.free(second);
-        kt_assert_eq!(bar.load(cleared), 0);
+        // xe_ggtt_clear: the cleared PTE maps the scratch page, not 0.
+        let scratch = arena.cleared_pte();
+        kt_assert_ne!(scratch, 0);
+        kt_assert_ne!(bar.load(cleared), mapped);
+        kt_assert_eq!(bar.load(cleared), scratch as u32);
         kt_assert_eq!(bar.written().as_slice(), expected);
         // MMIO invalidation completes at once: nothing is retained.
         kt_assert!(arena.guc_tlb_retained().is_empty());
@@ -340,7 +345,7 @@ fn smoke_ggtt_tlb_arena_gt0_ct_removal_blocks_reuse_until_done() -> TestResult {
     alloc.free(first);
     // PTEs are cleared at once, but no MMIO invalidation in CT mode and the
     // range is retained with its frames.
-    kt_assert_eq!(bar.load(cleared), 0);
+    kt_assert_eq!(bar.load(cleared), arena.cleared_pte() as u32);
     kt_assert!(bar.written().is_empty());
     kt_assert_eq!(arena.guc_tlb_retained(), alloc::vec![range]);
     kt_assert_eq!(arena.live_allocations(), live);

@@ -3640,7 +3640,12 @@ fn smoke_hardware_cache_policy_and_current_authority() -> TestResult {
     assert_eq!(entry & 0xfff0000000000fff, 0x0030000000000001);
     assert_eq!(backing.coherent_for_device(), cfg!(target_arch = "x86_64"));
     arena.free(backing);
-    assert_eq!(memory[pte], 0);
+    let scratch = arena.cleared_pte();
+    assert_ne!(scratch, 0);
+    assert_eq!(
+        (memory[pte], memory[pte + 1]),
+        (scratch as u32, (scratch >> 32) as u32)
+    );
     let old = memory[0x4000 / 4];
     cap.revoke();
     assert_eq!(window.read32(0x4000), u32::MAX);

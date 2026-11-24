@@ -1063,7 +1063,7 @@ impl PpgttProbeResult {
     }
 }
 
-fn decanonicalize(address: u64) -> Result<u64, FsError> {
+pub(crate) fn decanonicalize(address: u64) -> Result<u64, FsError> {
     let low = address & (VA_SIZE - 1);
     // Accept the canonical sign-extended representation or the zero-extended
     // 48-bit address. Reject arbitrary high bits rather than truncating them.
