@@ -2123,6 +2123,480 @@ kernel_test_in!(
     smoke_thinkpad_dock_hkey_decode
 );
 
+// ── thinkpad_acpi LED fixtures ───────────────────────────────────────
+// (audit lane 2, mechanism record §1/§4.8 — fixtures modeled on the
+// `\HFNF` fan fixture above and the backlight crate's fixture DSDT:
+// fully-qualified names in method bodies, PkgLength solved per
+// wrapper, sentinel values no setter can produce.)
+
+#[cfg(feature = "kernel-test")]
+/// ScopeOp (`0x10`) wrapper — the `fx_wrap` idiom for scopes (no
+/// `ExtOpPrefix`; the backlight fixture's `Scope (\_SB)`).
+fn fx_scope(seg: &[u8; 4], inside: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let rest = 1 + 4 + inside.len();
+    let value = if rest + 1 < 64 { rest + 1 } else { rest + 2 };
+    let mut v = Vec::new();
+    v.push(0x10); // ScopeOp
+    if value < 64 {
+        v.push(value as u8);
+    } else {
+        v.push(0x40 | (value as u8 & 0x0F));
+        v.push((value >> 4) as u8);
+    }
+    v.push(b'\\');
+    v.extend_from_slice(seg);
+    v.extend_from_slice(inside);
+    v
+}
+
+#[cfg(feature = "kernel-test")]
+/// Fully-qualified multi-segment NameString: root char +
+/// MultiNamePrefix + segment count + segments (the backlight
+/// fixture's `root_multi_name`).
+fn fx_ref_multi(segs: &[&[u8; 4]]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let mut v = Vec::new();
+    v.push(b'\\');
+    v.push(0x2F); // MultiNamePrefix
+    v.push(segs.len() as u8);
+    for s in segs {
+        v.extend_from_slice(*s);
+    }
+    v
+}
+
+#[cfg(feature = "kernel-test")]
+/// MethodOp with a solved 1- or 2-byte PkgLength. The `fx_method`
+/// helper assumes a 1-byte length, which breaks once a body with
+/// two fully-qualified refs reaches 64 bytes — the LED method does
+/// (58-byte body → length 64, which a 1-byte PkgLength would
+/// mis-decode as a 2-byte form).
+fn fx_method_wide(seg: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    let content = 4 + 1 + body.len(); // name + flags + body
+    let mut width = 1usize;
+    let mut len = width + content;
+    if len >= 64 {
+        width = 2;
+        len = width + content;
+    }
+    let mut v = Vec::new();
+    v.push(0x14); // MethodOp
+    if width == 1 {
+        v.push(len as u8);
+    } else {
+        v.push(0x40 | (len as u8 & 0x0F));
+        v.push((len >> 4) as u8);
+    }
+    v.extend_from_slice(seg);
+    v.push(flags);
+    v.extend_from_slice(body);
+    v
+}
+
+#[cfg(feature = "kernel-test")]
+/// Nested ThinkPad LED fixture (mechanism record §1):
+///
+/// ```asl
+/// Scope (\_SB) {
+///     Device (PCI0) {
+///         Device (LPCB) {
+///             Device (EC) {
+///                 Name (LEDI, 0xAA)   // sentinel: never written
+///                 Name (LEDV, 0xAA)
+///                 Method (LED, 2) {
+///                     Store (Arg0, \_SB.PCI0.LPCB.EC.LEDI)
+///                     Store (Arg1, \_SB.PCI0.LPCB.EC.LEDV)
+///                 }
+///                 Device (HKEY) {
+///                     Name (MLVL, 0x200)  // bit 9 set, level 0
+///                     Name (SMUT, 0xAA)
+///                     Name (MMUT, 0xAA)
+///                     Method (MLCS, 1) { Add (Arg0, 0x200, MLVL) }
+///                     Method (MLCG, 1) { Return (MLVL) }
+///                     Method (SSMS, 1) { Store (Arg0, SMUT) }
+///                     Method (MMTS, 1) { Store (Arg0, MMUT) }
+///                 }
+///             }
+///         }
+///     }
+/// }
+/// ```
+///
+/// The paths are the production `HKEY_PATH` / `EC_PATH` constants,
+/// so the tests drive the real call paths. `MLCS` folds the level
+/// into `MLVL` with bit 9 set (the Linux kbdlight probe's
+/// discriminator), so `MLCG` both proves support and round-trips
+/// the level. Sentinels are values no setter can produce.
+fn fx_thinkpad_leds() -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+
+    /// Absolute path to a Name under the HKEY device.
+    fn hkey_ref(name: &[u8; 4]) -> Vec<u8> {
+        fx_ref_multi(&[b"_SB_", b"PCI0", b"LPCB", b"EC__", b"HKEY", name])
+    }
+    /// Absolute path to a Name under the EC device.
+    fn ec_ref(name: &[u8; 4]) -> Vec<u8> {
+        fx_ref_multi(&[b"_SB_", b"PCI0", b"LPCB", b"EC__", name])
+    }
+
+    // Device (HKEY) { MLVL/SMUT/MMUT, MLCS/MLCG/SSMS/MMTS }
+    let mut hkey = Vec::new();
+    // MLVL starts at 0x200: MLCG bit 9 set (probe passes), level 0.
+    hkey.extend_from_slice(&fx_name_word(b"MLVL", 0x200));
+    hkey.extend_from_slice(&fx_name_byte(b"SMUT", 0xAA));
+    hkey.extend_from_slice(&fx_name_byte(b"MMUT", 0xAA));
+    // Method (MLCS, 1) { Add (Arg0, 0x200, MLVL) }
+    let mut mlcs = alloc::vec![0x72, 0x68, 0x0B, 0x00, 0x02]; // AddOp, Arg0, Word 0x200
+    mlcs.extend_from_slice(&hkey_ref(b"MLVL"));
+    hkey.extend_from_slice(&fx_method_wide(b"MLCS", 1, &mlcs));
+    // Method (MLCG, 1) { Return (MLVL) }
+    let mut mlcg = alloc::vec![0xA4]; // ReturnOp
+    mlcg.extend_from_slice(&hkey_ref(b"MLVL"));
+    hkey.extend_from_slice(&fx_method_wide(b"MLCG", 1, &mlcg));
+    // Method (SSMS, 1) { Store (Arg0, SMUT) }
+    let mut ssms = alloc::vec![0x70, 0x68]; // StoreOp, Arg0
+    ssms.extend_from_slice(&hkey_ref(b"SMUT"));
+    hkey.extend_from_slice(&fx_method_wide(b"SSMS", 1, &ssms));
+    // Method (MMTS, 1) { Store (Arg0, MMUT) }
+    let mut mmts = alloc::vec![0x70, 0x68]; // StoreOp, Arg0
+    mmts.extend_from_slice(&hkey_ref(b"MMUT"));
+    hkey.extend_from_slice(&fx_method_wide(b"MMTS", 1, &mmts));
+    let hkey_dev = fx_wrap(0x82, b"HKEY", &hkey);
+
+    // Device (EC) { LEDI/LEDV, Method (LED, 2), HKEY }
+    let mut ec = Vec::new();
+    ec.extend_from_slice(&fx_name_byte(b"LEDI", 0xAA));
+    ec.extend_from_slice(&fx_name_byte(b"LEDV", 0xAA));
+    // Method (LED, 2) { Store (Arg0, LEDI); Store (Arg1, LEDV) }
+    let mut led = alloc::vec![0x70, 0x68]; // StoreOp, Arg0
+    led.extend_from_slice(&ec_ref(b"LEDI"));
+    led.extend_from_slice(&[0x70, 0x69]); // StoreOp, Arg1
+    led.extend_from_slice(&ec_ref(b"LEDV"));
+    ec.extend_from_slice(&fx_method_wide(b"LED_", 2, &led));
+    ec.extend_from_slice(&hkey_dev);
+    let ec_dev = fx_wrap(0x82, b"EC__", &ec);
+
+    // Device (LPCB) { EC } → Device (PCI0) { LPCB } → Scope (\_SB)
+    let lpcb = fx_wrap(0x82, b"LPCB", &ec_dev);
+    let pci0 = fx_wrap(0x82, b"PCI0", &lpcb);
+    fx_scope(b"_SB_", &pci0)
+}
+
+#[cfg(feature = "kernel-test")]
+/// Parse the LED fixture into the (scoped) namespace; fail the
+/// test if the parse or any expected node is missing. Exactly 15
+/// nodes: Scope \_SB + Devices PCI0/LPCB/EC/HKEY + Names
+/// MLVL/SMUT/MMUT/LEDI/LEDV + Methods MLCS/MLCG/SSMS/MMTS/LED.
+fn install_thinkpad_led_fixture() -> Result<(), &'static str> {
+    use crate::thinkpad_acpi::{
+        EC_LED_PATH, HKEY_MLCG_PATH, HKEY_MLCS_PATH, HKEY_MMTS_PATH, HKEY_SSMS_PATH,
+    };
+    let blob = fx_thinkpad_leds();
+    let parsed =
+        narf_aml::__parse_body_for_test(&blob, "\\").map_err(|_| "LED fixture parse failed")?;
+    if parsed != 15 {
+        return Err("LED fixture parsed an unexpected node count");
+    }
+    for p in [
+        EC_LED_PATH,
+        HKEY_MLCS_PATH,
+        HKEY_MLCG_PATH,
+        HKEY_SSMS_PATH,
+        HKEY_MMTS_PATH,
+    ] {
+        if narf_aml::find_node(p).is_none() {
+            return Err("LED fixture method missing from the namespace");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kernel-test")]
+/// The LED fixture's methods resolve at the production paths.
+fn smoke_thinkpad_led_fixture_paths() -> TestResult {
+    // SAFETY: serialized test; the scope puts the boot namespace back
+    // on drop, after the fixture replaced it (backlight idiom).
+    let _namespace = unsafe { narf_aml::__test_namespace_scope() };
+    crate::thinkpad_acpi::__test_reset();
+    match install_thinkpad_led_fixture() {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_led_fixture_paths
+);
+
+#[cfg(feature = "kernel-test")]
+/// Generic-LED sets write the exact Linux argument shapes
+/// (`led_set_status`: index + 0x00/0x80/0xC0) and update the cache.
+fn smoke_thinkpad_generic_led_set_writes_index_and_arg() -> TestResult {
+    use crate::thinkpad_acpi::{generic_led_state, set_generic_led, LedState};
+    // SAFETY: serialized test; the scope puts the boot namespace back
+    // on drop, after the fixture replaced it (backlight idiom).
+    let _namespace = unsafe { narf_aml::__test_namespace_scope() };
+    crate::thinkpad_acpi::__test_reset();
+    if let Err(e) = install_thinkpad_led_fixture() {
+        return TestResult::Fail(e);
+    }
+
+    // Power on: LED(0, 0x80).
+    if set_generic_led(0, LedState::On).is_err() {
+        return TestResult::Fail("set_generic_led(0, On) failed");
+    }
+    if fx_name_int("\\_SB.PCI0.LPCB.EC.LEDI") != Some(0)
+        || fx_name_int("\\_SB.PCI0.LPCB.EC.LEDV") != Some(0x80)
+    {
+        return TestResult::Fail("LED(0, On) did not write index 0 / arg 0x80");
+    }
+    if generic_led_state(0) != Some(LedState::On) {
+        return TestResult::Fail("cache did not record power On");
+    }
+    // Standby blink: LED(7, 0xC0).
+    if set_generic_led(7, LedState::Blink).is_err() {
+        return TestResult::Fail("set_generic_led(7, Blink) failed");
+    }
+    if fx_name_int("\\_SB.PCI0.LPCB.EC.LEDI") != Some(7)
+        || fx_name_int("\\_SB.PCI0.LPCB.EC.LEDV") != Some(0xC0)
+    {
+        return TestResult::Fail("LED(7, Blink) did not write index 7 / arg 0xC0");
+    }
+    if generic_led_state(7) != Some(LedState::Blink) {
+        return TestResult::Fail("cache did not record standby Blink");
+    }
+    // ThinkVantage off: LED(12, 0x00).
+    if set_generic_led(12, LedState::Off).is_err() {
+        return TestResult::Fail("set_generic_led(12, Off) failed");
+    }
+    if fx_name_int("\\_SB.PCI0.LPCB.EC.LEDI") != Some(12)
+        || fx_name_int("\\_SB.PCI0.LPCB.EC.LEDV") != Some(0x00)
+    {
+        return TestResult::Fail("LED(12, Off) did not write index 12 / arg 0x00");
+    }
+    if generic_led_state(12) != Some(LedState::Off) {
+        return TestResult::Fail("cache did not record thinkvantage Off");
+    }
+    // Lid-logo-dot on: LED(10, 0x80) — and the power cache entry
+    // from the first set is untouched (per-index state).
+    if set_generic_led(10, LedState::On).is_err() {
+        return TestResult::Fail("set_generic_led(10, On) failed");
+    }
+    if generic_led_state(0) != Some(LedState::On) || generic_led_state(10) != Some(LedState::On) {
+        return TestResult::Fail("per-index cache entries interfered");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_generic_led_set_writes_index_and_arg
+);
+
+#[cfg(feature = "kernel-test")]
+/// Restricted and out-of-range generic-LED indices are rejected
+/// without touching AML (the audit's trap: index 8 is dock_status1,
+/// restricted — not the kbdlight; battery 1/2 are restricted too).
+fn smoke_thinkpad_generic_led_rejects_restricted_and_oob() -> TestResult {
+    use crate::thinkpad_acpi::{set_generic_led, GenericLed, LedError, LedState};
+    // SAFETY: serialized test; the scope puts the boot namespace back
+    // on drop, after the fixture replaced it (backlight idiom).
+    let _namespace = unsafe { narf_aml::__test_namespace_scope() };
+    crate::thinkpad_acpi::__test_reset();
+    if let Err(e) = install_thinkpad_led_fixture() {
+        return TestResult::Fail(e);
+    }
+
+    for idx in [1u8, 2, 3, 4, 5, 6, 8, 9, 11, 13, 14, 15] {
+        if set_generic_led(idx, LedState::On) != Err(LedError::RestrictedIndex(idx)) {
+            return TestResult::Fail("restricted generic-LED index was not rejected");
+        }
+    }
+    for idx in [16u8, 255] {
+        if set_generic_led(idx, LedState::On) != Err(LedError::InvalidIndex(idx)) {
+            return TestResult::Fail("out-of-range generic-LED index was not rejected");
+        }
+    }
+    // No AML call happened: the LED argument cells still hold their
+    // sentinels.
+    if fx_name_int("\\_SB.PCI0.LPCB.EC.LEDI") != Some(0xAA)
+        || fx_name_int("\\_SB.PCI0.LPCB.EC.LEDV") != Some(0xAA)
+    {
+        return TestResult::Fail("rejected set still wrote to the LED method");
+    }
+    // The safe-index type only admits the four safe LEDs.
+    if GenericLed::from_index(0) != Some(GenericLed::Power)
+        || GenericLed::from_index(7) != Some(GenericLed::Standby)
+        || GenericLed::from_index(10) != Some(GenericLed::LidLogoDot)
+        || GenericLed::from_index(12) != Some(GenericLed::ThinkVantage)
+    {
+        return TestResult::Fail("GenericLed::from_index missed a safe LED");
+    }
+    if GenericLed::from_index(1).is_some() || GenericLed::from_index(8).is_some() {
+        return TestResult::Fail("GenericLed::from_index admitted a restricted index");
+    }
+    if GenericLed::Power.linux_name() != "tpacpi::power"
+        || GenericLed::ThinkVantage.linux_name() != "tpacpi::thinkvantage"
+    {
+        return TestResult::Fail("GenericLed Linux names wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_generic_led_rejects_restricted_and_oob
+);
+
+#[cfg(feature = "kernel-test")]
+/// Kbdlight set/get round-trips through MLCS/MLCG, the support
+/// probe is the full Linux bit-9 test, and level 3 is rejected.
+fn smoke_thinkpad_kbdlight_set_get_round_trip() -> TestResult {
+    use crate::thinkpad_acpi::{
+        get_kbdlight_level, kbdlight_supported, set_kbdlight_level, LedError,
+    };
+    // SAFETY: serialized test; the scope puts the boot namespace back
+    // on drop, after the fixture replaced it (backlight idiom).
+    let _namespace = unsafe { narf_aml::__test_namespace_scope() };
+    crate::thinkpad_acpi::__test_reset();
+    if let Err(e) = install_thinkpad_led_fixture() {
+        return TestResult::Fail(e);
+    }
+
+    // Fixture MLVL starts at 0x200: bit 9 set, level 0.
+    if !kbdlight_supported() {
+        return TestResult::Fail("kbdlight probe failed on the fixture");
+    }
+    if get_kbdlight_level() != Ok(0) {
+        return TestResult::Fail("initial kbdlight level != 0");
+    }
+    if set_kbdlight_level(2).is_err() || get_kbdlight_level() != Ok(2) {
+        return TestResult::Fail("kbdlight set(2)/get did not round-trip");
+    }
+    if set_kbdlight_level(1).is_err() || get_kbdlight_level() != Ok(1) {
+        return TestResult::Fail("kbdlight set(1)/get did not round-trip");
+    }
+    if set_kbdlight_level(0).is_err() || get_kbdlight_level() != Ok(0) {
+        return TestResult::Fail("kbdlight set(0)/get did not round-trip");
+    }
+    // Level 3 is outside the classdev max (2): rejected, and the
+    // firmware cell is untouched.
+    if set_kbdlight_level(3) != Err(LedError::InvalidLevel(3)) {
+        return TestResult::Fail("kbdlight level 3 was not rejected");
+    }
+    if fx_name_int("\\_SB.PCI0.LPCB.EC.HKEY.MLVL") != Some(0x200) {
+        return TestResult::Fail("rejected kbdlight set still wrote MLVL");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_kbdlight_set_get_round_trip
+);
+
+#[cfg(feature = "kernel-test")]
+/// Mute/micmute sets write the exact Linux argument shapes
+/// (SSMS 1/0, MMTS 2/0), and the 0x60C0 notify re-asserts the
+/// cached mic-mute state through the wired arm.
+fn smoke_thinkpad_mute_micmute_set() -> TestResult {
+    use crate::thinkpad_acpi::{
+        handle_hkey_notify, micmute_available, micmute_state, mute_available, set_micmute, set_mute,
+    };
+    // SAFETY: serialized test; the scope puts the boot namespace back
+    // on drop, after the fixture replaced it (backlight idiom).
+    let _namespace = unsafe { narf_aml::__test_namespace_scope() };
+    crate::thinkpad_acpi::__test_reset();
+    if let Err(e) = install_thinkpad_led_fixture() {
+        return TestResult::Fail(e);
+    }
+
+    if !mute_available() || !micmute_available() {
+        return TestResult::Fail("mute/micmute methods not reported available");
+    }
+    if set_mute(true).is_err() || fx_name_int("\\_SB.PCI0.LPCB.EC.HKEY.SMUT") != Some(1) {
+        return TestResult::Fail("SSMS(1) did not write mute on");
+    }
+    if set_mute(false).is_err() || fx_name_int("\\_SB.PCI0.LPCB.EC.HKEY.SMUT") != Some(0) {
+        return TestResult::Fail("SSMS(0) did not write mute off");
+    }
+    if set_micmute(true).is_err() || fx_name_int("\\_SB.PCI0.LPCB.EC.HKEY.MMUT") != Some(2) {
+        return TestResult::Fail("MMTS(2) did not write micmute on");
+    }
+    if !micmute_state() {
+        return TestResult::Fail("micmute cache did not record on");
+    }
+    // 0x60C0 re-asserts the cached state through the wired arm.
+    handle_hkey_notify(0x60C0);
+    if fx_name_int("\\_SB.PCI0.LPCB.EC.HKEY.MMUT") != Some(2) {
+        return TestResult::Fail("0x60C0 notify did not re-assert micmute on");
+    }
+    if set_micmute(false).is_err() || fx_name_int("\\_SB.PCI0.LPCB.EC.HKEY.MMUT") != Some(0) {
+        return TestResult::Fail("MMTS(0) did not write micmute off");
+    }
+    if micmute_state() {
+        return TestResult::Fail("micmute cache did not record off");
+    }
+    handle_hkey_notify(0x60C0);
+    if fx_name_int("\\_SB.PCI0.LPCB.EC.HKEY.MMUT") != Some(0) {
+        return TestResult::Fail("0x60C0 notify did not re-assert micmute off");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_mute_micmute_set
+);
+
+#[cfg(feature = "kernel-test")]
+/// With no LED methods in the namespace, the probes report
+/// unavailable and every setter fails closed without an AML call.
+/// (No fixture is installed here — the scoped namespace starts
+/// empty, so absence is exact, not order-dependent.)
+fn smoke_thinkpad_led_methods_absent() -> TestResult {
+    use crate::thinkpad_acpi::{
+        get_kbdlight_level, kbdlight_supported, micmute_available, mute_available, set_generic_led,
+        set_kbdlight_level, set_micmute, set_mute, LedError, LedState,
+    };
+    // SAFETY: serialized test; the scope puts the boot namespace back
+    // on drop (backlight idiom). No fixture is installed.
+    let _namespace = unsafe { narf_aml::__test_namespace_scope() };
+    crate::thinkpad_acpi::__test_reset();
+
+    if kbdlight_supported() || mute_available() || micmute_available() {
+        return TestResult::Fail("absent LED methods reported available");
+    }
+    if set_mute(true) != Err(LedError::MethodUnavailable("SSMS")) {
+        return TestResult::Fail("set_mute did not fail closed on absent SSMS");
+    }
+    if set_micmute(true) != Err(LedError::MethodUnavailable("MMTS")) {
+        return TestResult::Fail("set_micmute did not fail closed on absent MMTS");
+    }
+    if set_kbdlight_level(1) != Err(LedError::Aml(narf_aml::AmlError::MethodNotFound)) {
+        return TestResult::Fail("set_kbdlight_level did not fail closed on absent MLCS");
+    }
+    if get_kbdlight_level() != Err(LedError::Aml(narf_aml::AmlError::MethodNotFound)) {
+        return TestResult::Fail("get_kbdlight_level did not fail closed on absent MLCG");
+    }
+    if set_generic_led(0, LedState::On) != Err(LedError::Aml(narf_aml::AmlError::MethodNotFound)) {
+        return TestResult::Fail("set_generic_led did not fail closed on absent LED");
+    }
+    // Index validation still precedes the AML call when absent.
+    if set_generic_led(1, LedState::On) != Err(LedError::RestrictedIndex(1)) {
+        return TestResult::Fail("restricted-index check did not precede the AML call");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/platform/thinkpad_acpi",
+    smoke_thinkpad_led_methods_absent
+);
+
 // ── dell_laptop ────────────────────────────────────────────────────────
 
 /// Dell SMBIOS class/select/cmd encode (4-byte header).

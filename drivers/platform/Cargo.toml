@@ -47,7 +47,11 @@ narf-crypto       = { path = "../../crypto", features = ["ecdsa-sign"] }
 async-trait       = "0.1"
 
 [features]
-kernel-test = ["narf-power/wake-test"]
+# The LED-fixture smokes (thinkpad_acpi LED surface, lane 2) parse
+# fixtures into the real AML namespace behind
+# `narf_aml::__test_namespace_scope`, which lives behind
+# `narf-aml/kernel-test` (backlight idiom).
+kernel-test = ["narf-power/wake-test", "narf-aml/kernel-test"]
 
 [lints]
 workspace = true
