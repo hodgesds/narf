@@ -11,6 +11,9 @@ pub enum WirelessError {
     Denied,
 }
 
+/// Cloned when a host shell re-emits its advertisement (the module host
+/// holds one copy and `get_wireless_info` returns another per call).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WirelessIfaceInfo {
     pub base_name: String,
     pub base_mac: [u8; 6],
@@ -19,6 +22,7 @@ pub struct WirelessIfaceInfo {
     pub hw_caps: HwCaps,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WirelessBand {
     pub freq_mhz: u32,
     pub channels: Vec<u32>,
@@ -34,6 +38,7 @@ bitflags::bitflags! {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HwCaps {
     pub ht_supported: bool,
     pub vht_supported: bool,

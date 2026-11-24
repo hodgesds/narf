@@ -19,6 +19,7 @@ pub mod iface;
 pub mod mfp;
 pub mod mgmt_defrag;
 pub mod mlme;
+pub mod module_host;
 pub mod monitor;
 pub mod nl80211;
 pub mod packet_key;
@@ -2441,6 +2442,10 @@ pub mod registry;
 pub fn register_initcalls() {
     narf_net::install_trusted_net_authority(narf_net::bootstrap_authority());
     let _ = nl80211::register();
+    // The native wireless family host (family WIFI, version 1): without
+    // it every `narf_wireless_open` fails and no Wi-Fi `.ko` can publish
+    // a wiphy. Registered here, at boot, before any module can load.
+    module_host::register();
 }
 
 // ── Smoke Tests ───────────────────────────────────────────────────

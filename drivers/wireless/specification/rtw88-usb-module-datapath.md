@@ -13,9 +13,16 @@ Today every Wi-Fi `.ko` probe returns `-ENOSYS` for one concrete reason: the
 wireless datapath ABI is **unused scaffolding**. The C-ABI entry points exist
 (`narf_wireless_open/submit/poll/cancel/close`, `narf_netif_register[_with_context]`,
 `narf_netif_rx`, and the full `narf_usb_*` transport family), and the native
-broker `bus/src/module_wireless.rs` is in place — but **no family host is
-registered** (`register_host` has zero callers), so `narf_wireless_open` fails
-for every family. Building rtw88-USB means standing up the first host.
+broker `bus/src/module_wireless.rs` is in place — but until Stage 3 landed,
+**no generic family host was registered** (`register_host` has zero callers),
+so `narf_wireless_open` failed for every family. The generic host now exists:
+`narf-wireless` registers family `WIFI` (`0x7769_6669`), version 1 (see
+"The native wireless family host" below and
+`drivers/wireless/specification/spec.md` §4.1). The one pre-existing host is
+the mt76 private family (`0x6d74_3736`), a copy-mode protocol that keeps
+native MCU/WFDMA execution in the host — not a generic host, and not a
+substitute for one. Building rtw88-USB means standing up the first consumer
+on the generic host.
 
 ## What already helps us
 
@@ -119,6 +126,28 @@ version, never by silently repurposing an opcode):
 (The exact wire layout is specified per-opcode in a follow-up once the first two
 stages land; keeping it minimal avoids over-committing the contract.)
 
+`REGISTER_WIPHY` (opcode `0x01`) is fully specified — the Stage 3 follow-up
+this lane is. Request, little-endian, exact length:
+
+```text
+mac[6] | modes u32 | hw_caps u8 | cipher_count u8 | band_count u8 | reserved u8
+cipher_count x cipher_suite u32
+per band: freq_mhz u32 | channel_count u8 | reserved u8 | channel_count x channel u8
+```
+
+Modes are the `WirelessModes` bits (STATION=1, AP=2, MONITOR=4, P2P=8);
+`hw_caps` bits are HT=1, VHT=2, HE=4, EHT=8 (at most 8 ciphers, 1..=3 bands,
+1..=64 channels per band, channels 1..=233). Reserved bytes must be zero;
+ciphers must be known suites, bands must map to distinct wiphy bands,
+channels unique within their band. Reply: assigned wiphy index (`u32`,
+little-endian). One `REGISTER_WIPHY` per session; the host publishes a
+`WirelessNetIface` shell under a unique `wlan{N}` name. The Stage 4
+opcodes (`SCAN_RESULT`, `CONNECT_RESULT`, `DISCONNECT`, `SET_STATE`) are
+defined above but report `-EOPNOTSUPP` until Stage 4 wires them; their
+payload layouts are specified with Stage 4. Events are numbered in their
+own namespace: `SCAN_REQUEST = 0x01`, `CONNECT = 0x02`, `KEY = 0x03`,
+`TX_FRAME = 0x04`.
+
 ## MAC/PHY/RF/station via an extracted `RegIo` core
 
 MAC/PHY/RF/IQK/station bring-up is ~2–3k lines of chip register programming.
@@ -158,7 +187,10 @@ the `.ko`.
 3. **Native wireless family host + `REGISTER_WIPHY` + netdev.** Stand up the
    host, register the family, publish the wiphy/netdev
    (`narf_netif_register_with_context`), wire RX via `narf_netif_rx` and TX via
-   the callback. Data plane live.
+   the callback. Data plane live. — Host done: `narf-wireless` registers
+   family `WIFI` v1 at boot; `REGISTER_WIPHY` publishes the wiphy shell and
+   returns its index. The module-side netdev + Stage 4 control plane are
+   still open (see Stage 4).
 4. **cfg80211 control plane.** Implement the scan/connect/key opcodes + events
    end to end.
 
@@ -171,19 +203,39 @@ and are where the host grows.
   to `narf_wireless_open` (ABI addition) so native cfg80211 ops reach the module
   cleanly, rather than tunnelling them through the `netif` `tx_callback`. Lands
   in Stage 3/4 when the control plane is wired.
+  Implemented as an **additive** export, `narf_wireless_open_with_event`
+  (Stage 3): the existing `narf_wireless_open` signature is preserved — the
+  mt76 `.ko` calls it, and changing it would break that module's CRC — and
+  the callback travels through a new `open_with_event` broker path into the
+  host session, invoked only through a bus call gate. A plain-open session
+  has no event channel.
 - **Host crate → `narf-wireless`.** The native family host lives in the existing
-  cfg80211 core crate, not a new crate.
+  cfg80211 core crate, not a new crate. Implemented (Stage 3):
+  `wireless/src/module_host.rs`, registered from
+  `narf_wireless::register_initcalls`.
 
 ## Risks / open questions (for review)
 - **Async over a sync poll ABI.** rtw88's Backend is `async`; `narf_usb_poll` is
   a one-shot poll with `on_event`. The module needs a small executor that drives
   the futures off completion callbacks (ftdi does a synchronous version). Reuse
   `future_heap` + a module-local poll loop.
+  Grounded (Stage 3): the host side follows the mt76 precedent — each session
+  holds one operation slot with a boxed future advanced with a noop waker on
+  each poll, so Stage 4 async work plugs in without reshaping the host. No
+  Daniel call needed; the module-side executor is Lane B's problem.
 - **Which native crate hosts the family.** `narf-wireless` (already the cfg80211
   core) vs a new `narf-drivers-wireless-host`. Leaning `narf-wireless`.
+  Resolved and implemented (Stage 3): `narf-wireless`.
 - **DMA/URB lifetime across unload.** `close` must retain in-flight URBs until
   terminal completion (the ABI already specifies this for both USB and
   wireless); the module executor must not free buffers a pending `poll` owns.
+  Grounded (Stage 3): the host side follows the existing contract — `close`
+  unpublishes the wiphy, revokes the cap, and retains started native work in
+  a spawned task until its terminal completion, independently of module text.
+  The URB/buffer side lives in the module (Lane B); no Daniel call needed.
+  Known Stage 3 limitation (follow-up, not a blocker): the module's netdev
+  is named `eth%d` by the bus while the host shell is `wlan{N}` — the
+  shell↔netdev name binding needs wifi-aware netdev naming.
 
 ## Non-goals (this effort)
 
