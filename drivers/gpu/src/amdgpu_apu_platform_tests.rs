@@ -12,7 +12,6 @@
 //! half of the attach (the step that refuses any SMU generation
 //! outside 12 / 13.0.4 by the SMU's own answer).
 
-use super::*;
 use crate::amdgpu_smu::{
     detect_version, MockSmu, SmuVersion, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL,
     MP1_C2PMSG_RESP_REL, SMU_13_0_0_DRIVER_IF_VERSION, SMU_RESP_OK,
