@@ -2268,7 +2268,7 @@ struct Display {
     retired: Vec<crate::amdgpu_raphael_boot::ColdBoot>,
     /// Phoenix's graphics engines, same retention policy as Raphael's.
     /// Unreachable until the firmware lane lands `Firmware::open_phoenix`
-    /// + the Phoenix `set_graphics` arm: no Phoenix set can be loaded
+    /// and the Phoenix `set_graphics` arm: no Phoenix set can be loaded
     /// today, so `start()` never fills this in.
     graphics_phoenix: Option<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
     /// Phoenix owners a mode 2 recovery replaced; same quarantine policy.

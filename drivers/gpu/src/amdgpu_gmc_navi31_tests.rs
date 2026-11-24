@@ -336,6 +336,9 @@ kernel_test_in!(
     gmc_navi31_constructor_checks_exact_banks_and_pool_before_allocation
 );
 
+/// One GMC rejection case: a name and the mutation that must fail `gmc_new`.
+type GmcCase<'a> = (&'a str, fn(&mut AmdGpu));
+
 /// Phoenix takes the same owner with MMHUB 3.0.1 on BASE_IDX 1: the GC
 /// bank is 11.0.1, the MMHUB bank is (3,0,1) at window 1, and the GFX
 /// table is the 11.0.0 one. Strix, a discrete GC version on a Phoenix
@@ -370,7 +373,7 @@ fn gmc_navi31_phoenix_resolves_mmhub_3_0_1_on_window_1() -> TestResult {
         return TestResult::Fail("Phoenix die or state");
     }
     drop(gmc);
-    let cases: [(&str, fn(&mut AmdGpu)); 4] = [
+    let cases: [GmcCase<'_>; 4] = [
         ("Strix DID", |g| {
             g.chip = __test_chip_info_for_pci_id(0x1002, 0x150E).unwrap();
         }),
