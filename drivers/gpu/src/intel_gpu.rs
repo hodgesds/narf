@@ -1983,6 +1983,40 @@ fn poll_external_hpd<M: crate::intel_gpu_aux::MmioWindow>(
     crate::intel_gpu_dp::poll_hpd_event(mmio)
 }
 
+/// The AUX / DDI IO well requests this driver holds for each Gen12 combo
+/// port with a sink attached, indexed by DDI.
+static PORT_WELLS: IrqSafeSpinLock<[crate::intel_gpu_dp::PortWells; 9]> =
+    IrqSafeSpinLock::new([crate::intel_gpu_dp::PortWells { aux: 0, ddi: 0 }; 9]);
+
+/// Power the connected port's DDI IO and AUX wells before any session
+/// talks to the sink (Gen12 combo ports; a no-op elsewhere).
+fn hold_port_wells(ddi: crate::intel_gpu_ddi::Ddi) {
+    let got = with_display_info(|gpu| {
+        let window = gpu.mode_window();
+        crate::intel_gpu_aux::SourceFamily::of(&window)
+            .and_then(|family| family.gen12())
+            .map(|family| crate::intel_gpu_dp::request_port_wells(&window, family, ddi))
+    })
+    .flatten()
+    .unwrap_or_default();
+    let mut held = PORT_WELLS.lock();
+    let slot = &mut held[ddi as usize];
+    slot.aux |= got.aux;
+    slot.ddi |= got.ddi;
+}
+
+/// Drop the well requests [`hold_port_wells`] raised for `ddi` once its
+/// sink is gone and its session is down.
+fn drop_port_wells(ddi: crate::intel_gpu_ddi::Ddi) {
+    let held = core::mem::take(&mut PORT_WELLS.lock()[ddi as usize]);
+    if held == crate::intel_gpu_dp::PortWells::default() {
+        return;
+    }
+    let _ = with_display_info(|gpu| {
+        crate::intel_gpu_dp::release_port_wells(&gpu.mode_window(), held);
+    });
+}
+
 fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
     use crate::intel_gpu_dp::HpdEvent;
     match event {
@@ -1992,6 +2026,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             if external_session_owns(ddi) {
                 return;
             }
+            hold_port_wells(ddi);
             // An MST branch device (hub / dock / daisy-chain
             // monitor) gets the MST session (#1017): if the
             // device advertises MST and a stream comes up, the
@@ -2066,46 +2101,11 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             }
         }
         HpdEvent::Disconnected(ddi) => {
-            if mst_session_ddi() == Some(ddi) {
-                if mst_disconnect(ddi) {
-                    publish_scanout(None);
-                }
-                return;
-            }
-            let owns = DP_SESSION
-                .lock()
-                .as_ref()
-                .is_some_and(|state| state.conn.ddi == ddi);
-            if owns {
-                let bar = with_display_info(|gpu| gpu.gtt_mmadr);
-                if let Some(bar) = bar {
-                    let _ = step_external_sst_inner(&bar, true);
-                }
-                return;
-            }
-            let session = HDMI_SESSION.lock().take();
-            if let Some(state) = session {
-                if state.conn.ddi == ddi {
-                    let stopped = with_display_info(|gpu| {
-                        let window = gpu.mode_window();
-                        let stopped = crate::intel_gpu_hdmi::disconnect(&window, &state.conn);
-                        if stopped {
-                            // The pipe is proven stopped: give it back and
-                            // repartition the DBUF over the pipes still lit.
-                            crate::intel_gpu_multipipe::release_pipe(state.conn.pipe, ddi);
-                            crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
-                        }
-                        stopped
-                    })
-                    .unwrap_or(false);
-                    if stopped {
-                        withdraw_external_scanout(state.serial);
-                    } else {
-                        *HDMI_SESSION.lock() = Some(state);
-                    }
-                } else {
-                    *HDMI_SESSION.lock() = Some(state);
-                }
+            disconnect_sessions(ddi);
+            // A stop that was not proven keeps its session, and with it the
+            // port's wells.
+            if !external_session_owns(ddi) {
+                drop_port_wells(ddi);
             }
         }
         HpdEvent::RetrainRequired(ddi) => {
@@ -2119,6 +2119,51 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             // A retrain may change timing/resources. Preserve the already-owned
             // graph; the bounded next17 owner only retires an explicit loss.
             // Fresh retrain/activation remains a separate resource transaction.
+        }
+    }
+}
+
+/// Tear down whichever session owns `ddi` after its sink went away.
+fn disconnect_sessions(ddi: crate::intel_gpu_ddi::Ddi) {
+    if mst_session_ddi() == Some(ddi) {
+        if mst_disconnect(ddi) {
+            publish_scanout(None);
+        }
+        return;
+    }
+    let owns = DP_SESSION
+        .lock()
+        .as_ref()
+        .is_some_and(|state| state.conn.ddi == ddi);
+    if owns {
+        let bar = with_display_info(|gpu| gpu.gtt_mmadr);
+        if let Some(bar) = bar {
+            let _ = step_external_sst_inner(&bar, true);
+        }
+        return;
+    }
+    let session = HDMI_SESSION.lock().take();
+    if let Some(state) = session {
+        if state.conn.ddi == ddi {
+            let stopped = with_display_info(|gpu| {
+                let window = gpu.mode_window();
+                let stopped = crate::intel_gpu_hdmi::disconnect(&window, &state.conn);
+                if stopped {
+                    // The pipe is proven stopped: give it back and
+                    // repartition the DBUF over the pipes still lit.
+                    crate::intel_gpu_multipipe::release_pipe(state.conn.pipe, ddi);
+                    crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+                }
+                stopped
+            })
+            .unwrap_or(false);
+            if stopped {
+                withdraw_external_scanout(state.serial);
+            } else {
+                *HDMI_SESSION.lock() = Some(state);
+            }
+        } else {
+            *HDMI_SESSION.lock() = Some(state);
         }
     }
 }

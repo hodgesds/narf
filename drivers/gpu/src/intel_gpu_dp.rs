@@ -530,6 +530,97 @@ pub fn source_caps(family: Option<crate::intel_gpu_aux::SourceFamily>, ddi: Ddi)
     }
 }
 
+/// `ICL_PWR_WELL_CTL_AUX2`: the driver's request register for the per-port
+/// AUX wells (`ICL_PW_CTL_IDX_AUX_*`, `TGL_PW_CTL_IDX_AUX_TC*`).
+pub(crate) const PWR_WELL_CTL_AUX2: u64 = 0x4_5444;
+/// `ICL_PWR_WELL_CTL_DDI2`: the driver's request register for the per-port
+/// DDI IO wells (`ICL_PW_CTL_IDX_DDI_*`, `TGL_PW_CTL_IDX_DDI_TC*`).
+pub(crate) const PWR_WELL_CTL_DDI2: u64 = 0x4_5454;
+
+/// The AUX and DDI IO well index of a display-12 combo port, in the
+/// platform's power-well map: A and B are `ICL_PW_CTL_IDX_{AUX,DDI}_A/B`
+/// (0/1) on Tiger, Rocket and Alder Lake P/N; Rocket Lake's TC1/TC2 combo
+/// ports (DDI D/E, PHY C/D) take `TGL_PW_CTL_IDX_*_TC1/TC2` (3/4,
+/// `rkl_power_wells_ddi_aux`). Type-C ports own their wells through the
+/// Type-C PHY ([`crate::intel_gpu_gen12_tc`]); Alder Lake S's map is its
+/// own and is not owned here.
+pub(crate) const fn combo_port_well(
+    family: crate::intel_gpu_gt::Gen12Platform,
+    ddi: Ddi,
+) -> Option<u32> {
+    use crate::intel_gpu_gt::Gen12Platform;
+    match (family, ddi) {
+        (Gen12Platform::AlderLakeS, _) => None,
+        (_, Ddi::A) => Some(0),
+        (_, Ddi::B) => Some(1),
+        (Gen12Platform::RocketLake, Ddi::D) => Some(3),
+        (Gen12Platform::RocketLake, Ddi::E) => Some(4),
+        _ => None,
+    }
+}
+
+/// The well request bits this driver set (and so may clear) in
+/// [`PWR_WELL_CTL_AUX2`] and [`PWR_WELL_CTL_DDI2`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PortWells {
+    pub(crate) aux: u32,
+    pub(crate) ddi: u32,
+}
+
+/// Power a display-12 combo port's DDI IO and AUX wells for a connected
+/// sink, as Linux takes the port's `ddi_io_power_domain`
+/// (`intel_ddi_pre_enable`) and its AUX domain (`intel_dp_aux_xfer`):
+/// `hsw_power_well_enable` sets the driver REQUEST bit and waits 1 ms for
+/// STATE. Like `hsw_wait_for_power_well_enable` a timeout does not fail
+/// (the AUX transfer or the modeset that needs the well reports it). A
+/// request already set (another owner, or BIOS state in the driver
+/// register) is left alone and not returned, so [`release_port_wells`]
+/// never drops a well this call did not raise.
+pub(crate) fn request_port_wells<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    family: crate::intel_gpu_gt::Gen12Platform,
+    ddi: Ddi,
+) -> PortWells {
+    let Some(idx) = combo_port_well(family, ddi) else {
+        return PortWells::default();
+    };
+    let (req, state) = (2u32 << (idx * 2), 1u32 << (idx * 2));
+    let raise = |reg: u64| {
+        let cur = mmio.read32(reg);
+        if cur == u32::MAX || !mmio.display_access_ok() || cur & req != 0 {
+            return 0;
+        }
+        mmio.write32(reg, cur | req);
+        let _ = narf_scheduler::responsive_spin_until(
+            || mmio.read32(reg) & state != 0,
+            narf_time::Deadline::after_us(1_000),
+        );
+        req
+    };
+    let ddi_bit = raise(PWR_WELL_CTL_DDI2);
+    let aux_bit = raise(PWR_WELL_CTL_AUX2);
+    PortWells {
+        aux: aux_bit,
+        ddi: ddi_bit,
+    }
+}
+
+/// `hsw_power_well_disable` for the requests in `held`: clear them (AUX
+/// first, the reverse of [`request_port_wells`]). Another requester keeps
+/// its well on.
+pub(crate) fn release_port_wells<M: MmioWindow + ?Sized>(mmio: &M, held: PortWells) {
+    for (reg, bits) in [(PWR_WELL_CTL_AUX2, held.aux), (PWR_WELL_CTL_DDI2, held.ddi)] {
+        if bits == 0 {
+            continue;
+        }
+        let cur = mmio.read32(reg);
+        if cur == u32::MAX || !mmio.display_access_ok() {
+            continue;
+        }
+        mmio.write32(reg, cur & !bits);
+    }
+}
+
 /// Errors the DP session can return. Each variant names the
 /// layer that failed so callers log precisely.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2280,4 +2371,81 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_profile_gen11_icp_pchs);
+
+    /// A power-well block whose STATE bits follow REQUEST in the driver
+    /// AUX and DDI request registers.
+    struct Wells {
+        regs: core::cell::RefCell<alloc::collections::BTreeMap<u64, u32>>,
+        grant: bool,
+    }
+    impl MmioWindow for Wells {
+        fn read32(&self, off: u64) -> u32 {
+            let raw = *self.regs.borrow().get(&off).unwrap_or(&0);
+            if self.grant && (off == super::PWR_WELL_CTL_AUX2 || off == super::PWR_WELL_CTL_DDI2) {
+                raw | ((raw & 0xAAAA_AAAA) >> 1)
+            } else {
+                raw
+            }
+        }
+        fn write32(&self, off: u64, val: u32) {
+            self.regs.borrow_mut().insert(off, val & 0xAAAA_AAAA);
+        }
+    }
+
+    /// Display-12 combo ports raise their DDI IO and AUX wells for a
+    /// connected sink (`intel_ddi_pre_enable`'s `ddi_io_power_domain`,
+    /// `intel_dp_aux_xfer`'s AUX domain): DDI B is index 1 on Tiger Lake,
+    /// Rocket Lake's TC1 combo port index 3. Only bits this driver raised
+    /// are dropped, a pre-set request survives, Type-C and ADL-S ports own
+    /// nothing here, and a well that never grants does not fail.
+    fn smoke_dp_combo_port_wells_follow_the_sink() -> TestResult {
+        use super::{release_port_wells, request_port_wells, PortWells};
+        use crate::intel_gpu_gt::Gen12Platform::{AlderLakeS, RocketLake, TigerLake};
+        let (aux2, ddi2) = (super::PWR_WELL_CTL_AUX2, super::PWR_WELL_CTL_DDI2);
+        let io = Wells {
+            regs: Default::default(),
+            grant: true,
+        };
+        let held = request_port_wells(&io, TigerLake, Ddi::B);
+        if held != (PortWells { aux: 0x8, ddi: 0x8 })
+            || io.read32(aux2) & 0xC != 0xC
+            || io.read32(ddi2) & 0xC != 0xC
+        {
+            return TestResult::Fail("TGL DDI B must raise and see AUX_B and DDI_IO_B");
+        }
+        release_port_wells(&io, held);
+        if io.read32(aux2) != 0 || io.read32(ddi2) != 0 {
+            return TestResult::Fail("releasing must drop the bits this driver raised");
+        }
+        // Another owner's AUX_B request is not ours to drop.
+        io.write32(aux2, 0x8);
+        let held = request_port_wells(&io, TigerLake, Ddi::B);
+        release_port_wells(&io, held);
+        if held.aux != 0 || io.read32(aux2) & 0x8 == 0 {
+            return TestResult::Fail("a pre-set request must survive the release");
+        }
+        io.regs.borrow_mut().clear();
+        if request_port_wells(&io, RocketLake, Ddi::D)
+            != (PortWells {
+                aux: 0x80,
+                ddi: 0x80,
+            })
+            || request_port_wells(&io, TigerLake, Ddi::D) != PortWells::default()
+            || request_port_wells(&io, AlderLakeS, Ddi::B) != PortWells::default()
+        {
+            return TestResult::Fail("only display-12 combo ports own these wells");
+        }
+        let dead = Wells {
+            regs: Default::default(),
+            grant: false,
+        };
+        if request_port_wells(&dead, TigerLake, Ddi::B) != (PortWells { aux: 0x8, ddi: 0x8 }) {
+            return TestResult::Fail("a timed-out grant still holds the request, as Linux does");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_dp_combo_port_wells_follow_the_sink
+    );
 }
