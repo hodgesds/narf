@@ -55,6 +55,10 @@
 //! an engine is reading — and a fence handle returned for work that will never
 //! run is worse than a refusal, because a client waits on it forever. A
 //! well-formed request therefore parses, validates, and then reports ENODEV.
+//! The GFX11 submitter surface (`amdgpu_gfx11_submit`) now exists for
+//! Navi31/32/33 — the frame encoder, fences, context switch and the
+//! clear-state preamble install — but it has no ring backend until the CP
+//! rings and PSP dispatch land, so a Navi31 card still reports ENODEV.
 //! `AMDGPU_INFO_ACCEL_WORKING` reports false for the same reason, so no Mesa
 //! client reaches this ioctl at all; it is reachable only by something that
 //! ignored that answer.
