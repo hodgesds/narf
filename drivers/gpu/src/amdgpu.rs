@@ -457,9 +457,14 @@ pub enum Family {
     Navi3,
     /// Phoenix / HawkPoint — Zen4 APUs, GFX 11.0.1 with DCN 3.1.4
     /// (`dcn_3_1_4_offset.h`). Kept distinct from `Navi3` because the
-    /// DCN 3.1.4 register layout differs from DCN 3.2 (Navi31). Strix
-    /// (GFX 11.5 / DCN 3.5) is held here only so it is refused, never driven.
+    /// DCN 3.1.4 register layout differs from DCN 3.2 (Navi31).
     Phoenix,
+    /// Strix Point / Strix Halo — Zen5 APUs, GFX 11.5.0 with DCN 3.5
+    /// (`dcn_3_5_0_offset.h`), PSP 14.0.1. A distinct family from
+    /// Phoenix: the PSP TOC branch, the DCN register layout and the
+    /// firmware set all differ (Linux: `psp_v13_0` TOC for MP0 14.0.1,
+    /// `gfx_v11_0` for GC 11.5.x, `vcn_v4_0_5` for VCN 4.0.5).
+    Strix,
     /// Navi 4x — RDNA4. Separate from both the RDNA3 APUs and Navi3.
     Navi4,
 }
@@ -528,7 +533,7 @@ impl Family {
     /// is available, `AmdGpu::is_apu` uses the exact GC version instead.
     pub const fn is_apu(self) -> bool {
         match self {
-            Family::Renoir | Family::Phoenix => true,
+            Family::Renoir | Family::Phoenix | Family::Strix => true,
             Family::Vega | Family::Navi1 | Family::Navi2 | Family::Navi3 | Family::Navi4 => false,
         }
     }
@@ -582,6 +587,10 @@ impl Family {
             Family::Navi4 => None,
             Family::Renoir => None,
             Family::Phoenix => None,
+            // Strix is a discovery part like Navi3: Linux takes its MP0
+            // base from the on-die discovery blob, so there is no static
+            // base to put here either.
+            Family::Strix => None,
         }
     }
 }
@@ -825,13 +834,17 @@ fn is_rlc_blob(name: &str) -> bool {
 /// No SMU entry, for the same reason Phoenix has none: Strix is an APU and
 /// `smu_14_0_1.bin` does not exist in linux-firmware.
 ///
-/// Reaching this table does not mean Strix is supported — see the mapping,
-/// which routes Strix to `UNAUDITED_FW`. Its DCN 3.5 display path, SMU 14
-/// interface and GFX 11.5 differences have had no bring-up. The table is
-/// kept correct so that work starts from facts rather than from this file.
-// Unused: the mapping routes Strix to `UNAUDITED_FW` until it has a real
-// bring-up. Kept correct so that work does not start by re-deriving it.
-#[allow(dead_code)]
+/// Every name is Linux's `MODULE_FIRMWARE` for this IP set: `psp_v13_0.c`
+/// (TOC + TA for MP0 14.0.1, the `psp_v13_0` TOC branch), `sdma_v6_0.c`,
+/// `gfx_v11_0.c` (GC 11.5.0 → `gfx_v11_0`), `mes_v11_0.c` (11.5.0 takes
+/// `mes_2` + `mes1`, no `mes.bin`), `amdgpu_vcn.c`
+/// (`FIRMWARE_VCN4_0_5`), `amdgpu_dm_dmub.h` (`FIRMWARE_DCN_35_DMUB`).
+/// The `gc_11_5_0_imu.bin` entry is grounded outside the ref tree: it is
+/// in the firmware list the 6.8 kernel wants for Strix (Ubuntu bug 2076180)
+/// and in a public Framework 13 (AMD AI 300) boot log. Order is the PSP
+/// load order (TOC, SDMA, CP, MES, IMU, RLC, VCN, DMCUB, TA), RLC last
+/// of the graphics firmwares so the PSP autoload fires only once the rest
+/// have landed.
 static STRIX_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_14_0_1_toc.bin"),
     FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
@@ -1002,10 +1015,12 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             "amdgpu/phoenix.bin",
             PHOENIX_FW,
         ),
-        // Strix is a different IP stack (GFX 11.5 / DCN 3.5 / PSP 14.0.1)
-        // and has had no bring-up. Claiming it by handing it the Phoenix
-        // family would put DCN 3.1.4 register sequences on DCN 3.5 silicon.
-        STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", UNAUDITED_FW),
+        // Strix is its own family (GFX 11.5 / DCN 3.5 / PSP 14.0.1): a
+        // different IP stack from Phoenix, with its own firmware table.
+        // Its ColdBoot owner does not exist yet — `graphics_boot` refuses
+        // Strix until one lands — but the display path (PSP TOC + DMCUB)
+        // is live.
+        STRIX_POINT => (Family::Strix, "strix", "amdgpu/strix.bin", STRIX_FW),
         // Rembrandt is RDNA2 (GFX 10.3.3 / DCN 3.1.2) — not Phoenix. Its
         // firmware set is `REMBRANDT_FW`; the PSP 13.0.1/13.0.3 ring loads
         // the display's TOC and DMCUB (`amdgpu_platform`), and its graphics
@@ -1449,7 +1464,9 @@ impl AmdGpu {
     fn gfx_generation(&self) -> Option<crate::amdgpu_gfx::GfxGeneration> {
         Some(match self.chip.family {
             Family::Navi4 => return None,
-            Family::Phoenix | Family::Navi3 => crate::amdgpu_gfx::GfxGeneration::Gfx11,
+            Family::Phoenix | Family::Strix | Family::Navi3 => {
+                crate::amdgpu_gfx::GfxGeneration::Gfx11
+            }
             _ => crate::amdgpu_gfx::GfxGeneration::Gfx9,
         })
     }
@@ -1822,8 +1839,10 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
-        if matches!(self.chip.family, Family::Phoenix | Family::Navi4)
-            || crate::amdgpu_rdna2::for_pci_id(self.chip.vid, self.chip.did).is_some()
+        if matches!(
+            self.chip.family,
+            Family::Phoenix | Family::Strix | Family::Navi4
+        ) || crate::amdgpu_rdna2::for_pci_id(self.chip.vid, self.chip.did).is_some()
         {
             // Navi22 SOS uses amdgpu_psp_boot and an owned GPU VRAM staging
             // buffer; this legacy entry point cannot satisfy that contract.
@@ -2012,8 +2031,10 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<MultiFwReport, AmdgpuError> {
-        if matches!(self.chip.family, Family::Phoenix | Family::Navi4)
-            || crate::amdgpu_rdna2::for_pci_id(self.chip.vid, self.chip.did).is_some()
+        if matches!(
+            self.chip.family,
+            Family::Phoenix | Family::Strix | Family::Navi4
+        ) || crate::amdgpu_rdna2::for_pci_id(self.chip.vid, self.chip.did).is_some()
         {
             return Err(AmdgpuError::UnsupportedFirmwareLoad);
         }
@@ -2038,7 +2059,7 @@ impl AmdGpu {
         let mut skipped_optional = 0usize;
         let mut last_optional_skip: Option<alloc::string::String> = None;
 
-        let autoload = matches!(self.chip.family, Family::Phoenix);
+        let autoload = matches!(self.chip.family, Family::Phoenix | Family::Strix);
         for entry in self.chip.fw_list {
             // SAFETY: caller-asserted exclusive BAR5; mp0_base
             // is resolved live (not stale).
@@ -2163,21 +2184,17 @@ impl AmdGpu {
         //
         // Branch by family: Navi3 (Navi31/32 DCN 3.2.0, Navi33 DCN 3.2.1)
         // runs the DCN 3.2 sequence on pipe 0 — the single-display path
-        // has no KMS CRTC to take a pipe from. Strix runs DCN 3.5
-        // (different OTG register layout — see `amdgpu_dcn` module header
-        // for the per-register shifts). Phoenix / HawkPoint are DCN
-        // **3.1.4**, not 3.5: they agree with DCN 2.0 on every OTG register
-        // the 2.0 sequence touches (Linux 7.4-rc2, `dcn_2_0_0_offset.h` vs
-        // `dcn_3_1_4_offset.h`), so they take the 2.0 sequence here, as does
-        // Raphael (DCN 3.1.5 — same agreement except `OTG_INTERRUPT_CONTROL`,
-        // which has no 3.1.5 register; the full verdict is in
-        // `plan_modeset`). Both modeset paths now agree on the 2.0 sequence
-        // for Phoenix and Raphael; this is the one `set_mode` uses, which is
-        // what the PM resume path re-runs.
-        // LINUX-GAP: Strix is routed to the 2.0 sequence here too, not the
-        // 3.5 one — `STRIX_POINT` maps to `Family::Phoenix`, so there is no
-        // family value that reaches `dcn35_modeset_sequence`. A Strix family
-        // has to exist first (see the LINUX-GAP note there).
+        // has no KMS CRTC to take a pipe from. Strix runs the DCN 3.5
+        // sequence (different OTG register layout — see `amdgpu_dcn`
+        // module header for the per-register shifts). Phoenix / HawkPoint
+        // are DCN **3.1.4**, not 3.5: they agree with DCN 2.0 on every
+        // OTG register the 2.0 sequence touches (Linux 7.4-rc2,
+        // `dcn_2_0_0_offset.h` vs `dcn_3_1_4_offset.h`), so they take the
+        // 2.0 sequence here, as does Raphael (DCN 3.1.5 — same agreement
+        // except `OTG_INTERRUPT_CONTROL`, which has no 3.1.5 register;
+        // the full verdict is in `plan_modeset`). Both modeset paths now
+        // agree on the 2.0 sequence for Phoenix and Raphael; this is the
+        // one `set_mode` uses, which is what the PM resume path re-runs.
         // Everything else with a discoverable DCN block today is DCN 2.0/2.1
         // (Renoir, Cezanne, Lucienne).
         let seq = if self.chip.family == Family::Navi3 {
@@ -2189,6 +2206,13 @@ impl AmdGpu {
                 0,
             )
             .ok_or(AmdgpuError::UnknownAsic)?
+        } else if self.chip.family == Family::Strix {
+            crate::amdgpu_dcn::dcn35_modeset_sequence(
+                &timing,
+                self.vram.base,
+                mode.stride,
+                dcn_base,
+            )
         } else {
             crate::amdgpu_dcn::dcn20_modeset_sequence(
                 &timing,
@@ -3243,7 +3267,11 @@ impl AmdGpu {
     /// SMU driver-interface schema version this driver was
     /// compiled to talk to, per family. Renoir = SMU 12.0,
     /// Phoenix = SMU 13.0.4, Navi3 = SMU 13.0.0. Other families
-    /// don't have an SMU bring-up path in this scaffold.
+    /// don't have an SMU bring-up path in this scaffold. Strix
+    /// is an explicit `None`: its SMU is 14.0.1 and the 14.0.1
+    /// driver-interface version is ungrounded (no `smu14/`
+    /// sources in the ref tree); Navi48's 0x2e is 14.0.2's, not
+    /// 14.0.1's, and must not be copied across.
     pub fn expected_smu_driver_if_version(&self) -> Option<u32> {
         use crate::amdgpu_smu::{
             SMU12_DRIVER_IF_VERSION, SMU_13_0_0_DRIVER_IF_VERSION, SMU_13_0_4_DRIVER_IF_VERSION,
@@ -3252,6 +3280,7 @@ impl AmdGpu {
             Family::Renoir => Some(SMU12_DRIVER_IF_VERSION),
             Family::Phoenix => Some(SMU_13_0_4_DRIVER_IF_VERSION),
             Family::Navi3 => Some(SMU_13_0_0_DRIVER_IF_VERSION),
+            Family::Strix => None,
             _ => None,
         }
     }

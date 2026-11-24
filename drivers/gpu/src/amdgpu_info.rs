@@ -84,6 +84,9 @@ pub(crate) fn family_id(snap: &Snapshot) -> Option<u32> {
         // Both RDNA4 dies are AMDGPU_FAMILY_GC_12_0_0 (amdgpu_discovery.c's
         // GC 12.0.0 / 12.0.1 case); Mesa tells them apart by external_rev.
         Family::Navi4 => rdna4(snap).map(|_| uapi::AMDGPU_FAMILY_GC_12_0_0),
+        // Strix is GC 11.5.0 (amdgpu_discovery.c's GC 11.5.0 case:
+        // AMDGPU_FAMILY_GC_11_5_0).
+        Family::Strix => Some(uapi::AMDGPU_FAMILY_GC_11_5_0),
         // Anything else has had no bring-up; refusing is better than naming a
         // family whose userspace path we have not exercised.
         _ => None,

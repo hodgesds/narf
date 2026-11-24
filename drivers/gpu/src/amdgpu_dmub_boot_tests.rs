@@ -120,6 +120,8 @@ fn fixture_with(
             secure: false,
             regs: table,
             cached_inbox,
+            hub_reset: HUB_RESET,
+            dcn35: false,
         },
     )
 }

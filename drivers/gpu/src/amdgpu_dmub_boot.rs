@@ -24,6 +24,29 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 /// Generation-independent DMCUB field values (`dcn_2_1_0_sh_mask.h` and
 /// `dcn_3_1_4_sh_mask.h` agree on all of these). The register offsets
 /// live in [`Regs`].
+/// `regMMHUBBUB_SOFT_RESET` — 0x342 on DCN 3.1.4 / 3.2, 0x341 on DCN 3.5
+/// (`dcn_3_5_0_offset.h` vs `dcn_3_1_4_offset.h`). The `DMUIF_SOFT_RESET`
+/// bit is 1 << 8 in both (`*_sh_mask.h`). The version-resolved register
+/// is carried in `Engine::hub_reset`; neither constant is used directly
+/// outside the version selection in `Loader::new`.
+const HUB_RESET: u32 = 0x342;
+const HUB_RESET_DCN35: u32 = 0x341;
+/// `regDMU_CLK_CNTL` — same offset (0xcb) on 3.1.4 and 3.5. Linux's
+/// `dmub_dcn35_reset_release` disables the three LONO clock gates here;
+/// the 3.1.4 / 3.2 releases never touch the register, so the write is
+/// gated on DCN 3.5 in `configure()`. Bit positions are
+/// `dcn_3_5_0_sh_mask.h`: DISPCLK 29, SOCCLK 30, DMCUBCLK 31.
+const DMU_CLK_CNTL: u32 = 0xcb;
+const LONO_GATE_DISABLE: u32 = (1 << 29) | (1 << 30) | (1 << 31);
+/// `regDMCUB_REGION6_OFFSET` / `_OFFSET_HIGH` / `_TOP_ADDRESS` — the
+/// shared-state window Linux's `dmub_dcn35_setup_windows` programs.
+/// Same offsets on 3.1.4 (the register exists there too), but only a
+/// 3.5 image declares shared state, so `configure()` programs the
+/// window only when the layout's SharedState region is non-empty.
+/// TOP holds the size minus one with the ENABLE bit, like REGION5's.
+const REGION6_OFFSET: u32 = 0x19a;
+const REGION6_OFFSET_HIGH: u32 = 0x19b;
+const REGION6_TOP: u32 = 0x1a3;
 const ENABLE: u32 = 1 << 16;
 const SOFT_RESET: u32 = 1 << 17;
 const HUB_RESET_BIT: u32 = 1 << 8;
@@ -249,6 +272,13 @@ struct Engine<I: Io> {
     /// Whether the firmware's mailbox is the cached CW4 one (`Prepared`
     /// decided this from the firmware version).
     cached_inbox: bool,
+    /// Version-resolved `MMHUBBUB_SOFT_RESET` register: 0x342 on
+    /// DCN 3.1.4 / 3.2, 0x341 on DCN 3.5.
+    hub_reset: u32,
+    /// DCN 3.5.0: `configure()` additionally disables the LONO clock
+    /// gates (Linux's `dmub_dcn35_reset_release` does; the 3.1.4 / 3.2
+    /// releases never touch `DMU_CLK_CNTL`).
+    dcn35: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -348,6 +378,8 @@ impl<I: Io> Engine<I> {
         let secure = self.secure;
         let regs = self.regs;
         let cached_inbox = self.cached_inbox;
+        let hub_reset = self.hub_reset;
+        let dcn35 = self.dcn35;
         self.access(|io| {
             configure(
                 &regs,
@@ -359,6 +391,8 @@ impl<I: Io> Engine<I> {
                 fb_offset,
                 options,
                 secure,
+                hub_reset,
+                dcn35,
             )
         })??;
         self.wait_for_auto_load().await
@@ -429,6 +463,10 @@ impl<I: Io> Engine<I> {
     }
 }
 
+// Version-dependent DMCUB reset quirks (`hub_reset`, `dcn35`) thread
+// through as extra parameters; the allow matches the established
+// precedent for wide private helpers in this crate.
+#[allow(clippy::too_many_arguments)]
 fn configure(
     regs: &Regs,
     cached_inbox: bool,
@@ -439,6 +477,8 @@ fn configure(
     fb_offset: u64,
     options: BootOptions,
     secure: bool,
+    hub_reset: u32,
+    dcn35: bool,
 ) -> Result<(), Error> {
     // CW0/1 use translated MC addresses; CW3..6 use GPU addresses directly.
     let translate = |w| {
@@ -498,6 +538,15 @@ fn configure(
             WINDOW_ENABLE | (size - 1),
         );
     }
+    // DCN 3.5 only, when the image declares shared state: program the
+    // REGION6 window Linux's `dmub_dcn35_setup_windows` programs (GPU
+    // address directly, like CW3..6; TOP is size - 1 with ENABLE, like
+    // REGION5 below). Images without shared state keep a zero-size
+    // region, which stays unprogrammed — as on 3.1.4/3.2.
+    let shared = layout.region(Window::SharedState);
+    if shared.size > 0 {
+        write_region6(io, place.address(Window::SharedState), shared.size)?;
+    }
     let trace = place.address(Window::Trace);
     io.write(regs.region5_offset, trace as u32);
     io.write(regs.region5_offset_high, (trace >> 32) as u32);
@@ -530,8 +579,14 @@ fn configure(
     {
         return Err(Error::ConfigurationFailed);
     }
-    update(io, regs.hub_reset, HUB_RESET_BIT, 0);
+    update(io, hub_reset, HUB_RESET_BIT, 0);
     io.write(regs.psp_version, options.psp_version & 0x0011_00ff);
+    // DCN 3.5 only: Linux's `dmub_dcn35_reset_release` disables the LONO
+    // clock gates in DMU_CLK_CNTL; the 3.1.4/3.2 releases never touch the
+    // register, so other versions keep the old behavior.
+    if dcn35 {
+        update(io, DMU_CLK_CNTL, LONO_GATE_DISABLE, LONO_GATE_DISABLE);
+    }
     update(io, regs.cntl, ENABLE | (1 << 19), ENABLE | (1 << 19));
     fence(Ordering::SeqCst);
     if let Some(cntl2) = regs.cntl2 {
@@ -561,6 +616,26 @@ fn write_window(
         || io.read(regs.cw_base + index) & ADDRESS_MASK != base & ADDRESS_MASK
         || io.read(regs.cw_top + index) & (WINDOW_ENABLE | ADDRESS_MASK)
             != WINDOW_ENABLE | ((base + size - u32::from(inclusive)) & ADDRESS_MASK)
+    {
+        return Err(Error::ConfigurationFailed);
+    }
+    Ok(())
+}
+
+/// Program the REGION6 shared-state window, following Linux
+/// `dmub_dcn35_setup_windows`: offset (lo/hi) plus TOP as size - 1 with
+/// the ENABLE bit — the same shape as REGION5's programming above, and
+/// the same read-back verification as `write_window`. Only called with
+/// a non-empty region; `size` is the aligned region size, so `size - 1`
+/// cannot underflow.
+fn write_region6(io: &mut impl Io, address: u64, size: u32) -> Result<(), Error> {
+    io.write(REGION6_OFFSET, address as u32);
+    io.write(REGION6_OFFSET_HIGH, (address >> 32) as u32);
+    io.write(REGION6_TOP, WINDOW_ENABLE | ((size - 1) & ADDRESS_MASK));
+    if io.read(REGION6_OFFSET) & 0xffff_ff00 != address as u32
+        || io.read(REGION6_OFFSET_HIGH) & 0xffff != (address >> 32) as u32
+        || io.read(REGION6_TOP) & (WINDOW_ENABLE | ADDRESS_MASK)
+            != WINDOW_ENABLE | ((size - 1) & ADDRESS_MASK)
     {
         return Err(Error::ConfigurationFailed);
     }
@@ -638,6 +713,10 @@ impl Loader {
         }
         let regs = amdgpu_dmub::Regs::for_version((ip.major, ip.minor, ip.revision))
             .ok_or(Error::Unsupported)?;
+        // DCN 3.5.0 only: `MMHUBBUB_SOFT_RESET` moved 0x342 → 0x341
+        // (`dcn_3_5_0_offset.h` vs `dcn_3_1_4_offset.h`).
+        let dcn35 = (ip.major, ip.minor, ip.revision) == (3, 5, 0);
+        let hub_reset = if dcn35 { HUB_RESET_DCN35 } else { HUB_RESET };
         let base = ip.base_addrs[2] as u64 * 4;
         if base
             .checked_add(regs.bound as u64 * 4)
@@ -717,6 +796,8 @@ impl Loader {
                 secure: false,
                 regs,
                 cached_inbox: prepared.cached_inbox(),
+                hub_reset,
+                dcn35,
             },
             fb: gpu.fb_bar,
             transport: None,

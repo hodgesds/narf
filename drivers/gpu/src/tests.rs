@@ -10728,12 +10728,37 @@ fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
     }
 
     // Silicon with no bring-up must not borrow another family's firmware.
-    for did in [amdgpu::STRIX_POINT, amdgpu::REMBRANDT, amdgpu::RAPHAEL] {
+    // Strix used to be in this list; it now has its own audited bundle
+    // (see the Strix check below and `amdgpu_strix`).
+    for did in [amdgpu::REMBRANDT, amdgpu::RAPHAEL] {
         match amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, did) {
             Some(info) if info.fw_list.is_empty() => {}
             Some(_) => return TestResult::Fail("unaudited silicon was given a firmware bundle"),
             None => return TestResult::Fail("an id in the match table resolves to no chip"),
         }
+    }
+    // Strix Point (0x150E) has its own family and bundle now: the PSP
+    // 14.0.1 TOC first, no SMU entry (APU PMFW is BIOS-resident), the
+    // 14.0.1 TA last.
+    let Some(strix) = amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, amdgpu::STRIX_POINT)
+    else {
+        return TestResult::Fail("Strix Point's device id resolves to no chip");
+    };
+    if strix.family != amdgpu::Family::Strix {
+        return TestResult::Fail("Strix Point must resolve to Family::Strix, not Phoenix");
+    }
+    if strix.fw_list.is_empty()
+        || !strix.fw_list[0].name.contains("psp_14_0_1_toc.bin")
+        || strix
+            .fw_list
+            .iter()
+            .any(|e| e.cmd == amdgpu::SMU_LOAD_PMFW_MP1)
+        || !strix
+            .fw_list
+            .last()
+            .is_some_and(|e| e.name.contains("psp_14_0_1_ta.bin"))
+    {
+        return TestResult::Fail("Strix bundle is not the audited 14.0.1 set");
     }
     TestResult::Pass
 }

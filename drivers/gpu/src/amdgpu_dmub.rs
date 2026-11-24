@@ -1,6 +1,6 @@
-//! DCN 2.1 / 3.1.4 / 3.1.5 / 3.2.0 / 3.2.1 DMUB command transport. ABI
+//! DCN 2.1 / 3.1.4 / 3.1.5 / 3.2.0 / 3.2.1 / 3.5.0 DMUB command transport. ABI
 //! checked against Linux display/dmub/inc/dmub_cmd.h and
-//! dmub_dcn20.c/dmub_dcn21.c/dmub_dcn31.c/dmub_dcn314.c/dmub_dcn32.c.
+//! dmub_dcn20.c/dmub_dcn21.c/dmub_dcn31.c/dmub_dcn314.c/dmub_dcn32.c/dmub_dcn35.c.
 //!
 //! Attachment requires an already running DAL firmware and a mailbox wholly
 //! inside the mapped VRAM aperture. This does not load firmware or reset DMCUB.
@@ -106,6 +106,49 @@ impl Regs {
         cw_count: 8,
         bound: 0x478,
     };
+    /// DCN 3.5.0 (`dcn_3_5_0_offset.h`): every offset this module reads
+    /// sits at the same offset as in `dcn_3_1_4_offset.h` — only the
+    /// Loader's hub-reset register moved, 0x342 → 0x341
+    /// (`MMHUBBUB_SOFT_RESET`).
+    pub(crate) const DCN35: Self = Self {
+        cntl: 0x1f6,
+        cntl2: Some(0x200),
+        hub_reset: 0x341,
+        sec_cntl: 0x1ce,
+        gpint: 0x1f8,
+        status: 0x1e3,
+        stop_reply: 0x1ea,
+        fb_base: 0x475,
+        fb_top: 0x476,
+        fb_offset: 0x477,
+        supported: 0xca,
+        region5_offset: 0x198,
+        region5_offset_high: 0x199,
+        region5_top: 0x1a2,
+        region4_offset: None,
+        region4_offset_high: None,
+        region4_top: None,
+        outbox0_base: 0x1d8,
+        outbox0_size: 0x1d9,
+        outbox0_wptr: 0x1da,
+        outbox0_rptr: 0x1db,
+        inbox1_base: 0x1d4,
+        inbox1_size: 0x1d5,
+        inbox1_wptr: 0x1d6,
+        inbox1_rptr: 0x1d7,
+        outbox1_base: 0x1dc,
+        outbox1_size: 0x1dd,
+        outbox1_wptr: 0x1de,
+        outbox1_rptr: 0x1df,
+        options: 0x1f1,
+        psp_version: 0x1f2,
+        cw_base: 0x1a5,
+        cw_top: 0x1ad,
+        cw_offset: 0x1b5,
+        cw_offset_high: 0x1b6,
+        cw_count: 8,
+        bound: 0x478,
+    };
     /// DCN 2.1 (`dcn_2_1_0_offset.h`, all BASE_IDX 2). `dmub_dcn21.c`
     /// is a 56-line register table over DCN 2.0's functions, and
     /// `dmub_srv_hw_setup` gives DCN20/21 the same `dmub_srv_dcn20`
@@ -154,6 +197,7 @@ impl Regs {
         match version {
             (2, 1, 0) => Some(Self::DCN21),
             (3, 1, 4) | (3, 1, 5) | (3, 2, 0) | (3, 2, 1) => Some(Self::DCN314),
+            (3, 5, 0) => Some(Self::DCN35),
             _ => None,
         }
     }
@@ -221,6 +265,7 @@ impl Firmware {
         match (ip.major, ip.minor, ip.revision) {
             (2, 1, 0) => self.prepare_dcn21(vbios.bytes()),
             (3, 2, 0) | (3, 2, 1) => self.prepare_dcn32(vbios.bytes()),
+            (3, 5, 0) => self.prepare_dcn35(vbios.bytes()),
             _ => self.prepare(vbios.bytes()),
         }
     }
@@ -251,6 +296,7 @@ impl Firmware {
             (3, 1, 5) => firmware::DCN315_FIRMWARE,
             (3, 2, 0) => firmware::DCN320_FIRMWARE,
             (3, 2, 1) => firmware::DCN321_FIRMWARE,
+            (3, 5, 0) => firmware::DCN35_FIRMWARE,
             _ => firmware::DCN314_FIRMWARE,
         };
         let bytes = authority.invoke(OpenFirmware(name)).map_err(|_| {
@@ -291,6 +337,17 @@ impl Firmware {
             .prepare_dcn21(vbios)
             .map_err(FirmwareError::Image)
     }
+    /// Prepare a DCN 3.5 image (combined layout plus the Region6
+    /// shared-state window — see [`firmware::Image::prepare_dcn35`]).
+    /// Callers select by the discovery-resolved DCN version.
+    pub fn prepare_dcn35<'a>(
+        &'a self,
+        vbios: &'a [u8],
+    ) -> Result<firmware::Prepared<'a>, FirmwareError> {
+        self.image()?
+            .prepare_dcn35(vbios)
+            .map_err(FirmwareError::Image)
+    }
 }
 
 /// The DCN versions whose DMUB this module boots. Not a register window — the
@@ -323,7 +380,24 @@ impl Firmware {
 /// sits at the same offset in `dcn_2_1_0_offset.h` as in
 /// `dcn_2_0_0_offset.h`. The 2.1-specific reset and mailbox setup live
 /// in `amdgpu_dmub_boot` (via `Regs::DCN21`), not here.
-const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(2, 1, 0), (3, 1, 4), (3, 1, 5), (3, 2, 0), (3, 2, 1)];
+///
+/// DCN 3.5.0 rides the same attach for the same reason: every register
+/// `attach_regions` reads sits at the same offset in
+/// `dcn_3_5_0_offset.h` as in `dcn_3_1_4_offset.h`. Two things do differ
+/// and live outside this module: the Loader's hub-reset register is
+/// `MMHUBBUB_SOFT_RESET` 0x341 on 3.5, not 0x342 (`amdgpu_dmub_boot`),
+/// and `dmub_dcn35_setup_windows` programs a REGION6 shared-state
+/// window (`prepare_dcn35` carries it; the Loader programs it only
+/// when the image declares shared state). The 3.5-specific reset and
+/// mailbox setup live in `amdgpu_dmub_dcn35`, not here.
+const DMUB_VERSIONS: &[(u8, u8, u8)] = &[
+    (2, 1, 0),
+    (3, 1, 4),
+    (3, 1, 5),
+    (3, 2, 0),
+    (3, 2, 1),
+    (3, 5, 0),
+];
 
 pub(crate) fn dmub_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
     let mut blocks = gpu
@@ -379,6 +453,9 @@ pub(crate) fn dpia_count(ip: &crate::amdgpu_discovery::IpBlock) -> u8 {
     match (ip.major, ip.minor, ip.revision) {
         (3, 1, 4) => 4,
         (3, 2, 0) | (3, 2, 1) => 0,
+        // linux: n/a (no `dcn35_resource.c` in the ref tree to say
+        // otherwise; fail-closed, no DPIA commands are sent).
+        (3, 5, 0) => 0,
         _ => 0,
     }
 }
