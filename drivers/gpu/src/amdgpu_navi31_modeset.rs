@@ -54,7 +54,9 @@ impl Navi31Modeset {
     }
 
     /// The resolved DCN 3.2 profile (3.2.0 on Navi31/32, 3.2.1 on Navi33).
-    /// Crate-visible only: `Profile` itself is `pub(crate)`.
+    /// Crate-visible only: `Profile` itself is `pub(crate)`. Test-only:
+    /// the kernel-test module is its only caller.
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn profile(&self) -> Profile {
         self.profile
     }
