@@ -66,6 +66,8 @@ fn scheduler_caps(info: &DeviceInfo) -> i32 {
 struct ParamFacts {
     /// set_proto_ctx_param's intel_uc_uses_guc_submission for LOW_LATENCY.
     low_latency: bool,
+    /// GETPARAM GTT_SIZE: the context VM's `vm->total`.
+    gtt_size: u64,
     scheduler: i32,
     sys_admin: bool,
     sys_nice: bool,
@@ -95,6 +97,7 @@ impl ParamFacts {
         };
         Self {
             low_latency,
+            gtt_size: info.platform.ppgtt_va_size(),
             scheduler,
             sys_admin,
             sys_nice,
@@ -686,7 +689,7 @@ impl Namespaces {
             // GETPARAM never reads the input size; it reports size 0.
             context.finalized = true;
             let value = match param {
-                abi::CONTEXT_PARAM_GTT_SIZE => 1 << 48,
+                abi::CONTEXT_PARAM_GTT_SIZE => facts.gtt_size,
                 abi::CONTEXT_PARAM_NO_ERROR_CAPTURE => {
                     u64::from(context.no_error_capture.protected())
                 }

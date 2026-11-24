@@ -140,6 +140,8 @@ impl ExecRequest {
         if self.has_async() && !platform.is_some_and(object_async_profile) {
             return Err(FsError::InvalidData);
         }
+        // The VM's `vm->total`: 64 GiB on EHL/JSL, 48 bits elsewhere.
+        let va_size = platform.map_or(VA_SIZE, GtPlatform::ppgtt_va_size);
         if self.objects.is_empty()
             || self.objects.len() > MAX_OBJECTS
             || self.objects.iter().any(|entry| {
@@ -148,7 +150,7 @@ impl ExecRequest {
                     || entry
                         .va
                         .checked_add(entry.object.size())
-                        .is_none_or(|end| end > VA_SIZE - PAGE)
+                        .is_none_or(|end| end > va_size - PAGE)
             })
         {
             return Err(FsError::InvalidData);
@@ -160,7 +162,7 @@ impl ExecRequest {
         if self.batch_len == 0
             || self.batch_va % 8 != 0
             || self.batch_len % 8 != 0
-            || end > VA_SIZE
+            || end > va_size
             || !self.objects.iter().any(|entry| {
                 self.batch_va >= entry.va
                     && entry

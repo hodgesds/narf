@@ -455,6 +455,17 @@ impl GtPlatform {
         (!self.is_gen12() && !matches!(self, Self::Gen9(_)))
             || matches!(self, Self::Gen12(Gen12Platform::Dg1))
     }
+    /// `vm->total` for a full PPGTT: `BIT_ULL(RUNTIME_INFO->ppgtt_size)`.
+    /// Elkhart Lake and Jasper Lake are 36-bit (`ehl_info`/`jsl_info` in
+    /// `i915_pci.c`), still a four-level walk (`i915_vm_is_4lvl` is
+    /// `total > 4 GiB`); every other platform here is 48-bit.
+    pub const fn ppgtt_va_size(self) -> u64 {
+        match self {
+            Self::Gen11(Gen11Platform::ElkhartLake | Gen11Platform::JasperLake) => 1 << 36,
+            _ => 1 << 48,
+        }
+    }
+
     pub(crate) const fn ppgtt_root_level(self) -> u8 {
         if self.is_headless_integrated() || matches!(self, Self::Battlemage) {
             4
@@ -1022,4 +1033,26 @@ mod tests {
         "drivers/gpu/intel_gpu_gt",
         smoke_cml_firmware_follows_revision
     );
+
+    /// Q8: EHL/JSL VMs are 36-bit (`ppgtt_size = 36`), still four-level;
+    /// Ice Lake and the rest stay 48-bit.
+    fn smoke_ehl_jsl_ppgtt_ceiling() -> TestResult {
+        for (platform, size) in [
+            (GtPlatform::Gen11(Gen11Platform::ElkhartLake), 1u64 << 36),
+            (GtPlatform::Gen11(Gen11Platform::JasperLake), 1 << 36),
+            (GtPlatform::Gen11(Gen11Platform::IceLake), 1 << 48),
+            (GtPlatform::Gen9(Gen9Platform::KabyLake), 1 << 48),
+            (GtPlatform::Gen12(Gen12Platform::TigerLake), 1 << 48),
+        ] {
+            if platform.ppgtt_va_size() != size {
+                return TestResult::Fail("ppgtt_va_size does not follow i915_pci.c");
+            }
+            // Above 4 GiB the walk is four-level (`i915_vm_is_4lvl`).
+            if platform.ppgtt_root_level() != 3 {
+                return TestResult::Fail("a 36-bit VM still walks four levels");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_gt", smoke_ehl_jsl_ppgtt_ceiling);
 }
