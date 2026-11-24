@@ -287,7 +287,43 @@ pub const RAPHAEL: Profile = Profile {
     vcn_versions: &[(3, 1, 2)],
 };
 
-pub const APU_PROFILES: &[Profile] = &[RAPHAEL];
+/// Rembrandt (`1002:1681`), the RDNA2 APU in Ryzen 6000 mobile parts
+/// (Radeon 680M). Not in [`PROFILES`], for the same reason as Raphael: a
+/// backend serves it only once it resolves [`apu_for_pci_id`] itself.
+///
+/// `sos` and `smc` are empty, as on Raphael: an APU's PSP secure OS and PMFW
+/// are BIOS-resident (`psp_v13_0` loads only `yellow_carp_{toc,ta}.bin`).
+/// The other names are Linux's `MODULE_FIRMWARE` declarations in
+/// `sdma_v5_2.c`, `gfx_v10_0.c`, `amdgpu_vcn.c` (`FIRMWARE_YELLOW_CARP`) and
+/// `amdgpu_dm_dmub.c`, and agree with `amdgpu::REMBRANDT_FW`.
+///
+/// `psp_version` is (13, 0, 1): the MP0 version with in-tree ppsmc/pmfw
+/// headers. MP0 13.0.3 decodes to the same legacy name and loads the same
+/// TOC, so `amdgpu_platform::prepare` accepts both.
+pub const REMBRANDT: Profile = Profile {
+    asic: "rembrandt",
+    pci_ids: &[0x1681],
+    firmware: Firmware {
+        sos: "",
+        smc: "",
+        sdma: "amdgpu/yellow_carp_sdma.bin",
+        ce: "amdgpu/yellow_carp_ce.bin",
+        pfp: "amdgpu/yellow_carp_pfp.bin",
+        me: "amdgpu/yellow_carp_me.bin",
+        mec: "amdgpu/yellow_carp_mec.bin",
+        mec2: "amdgpu/yellow_carp_mec2.bin",
+        rlc: "amdgpu/yellow_carp_rlc.bin",
+        vcn: "amdgpu/yellow_carp_vcn.bin",
+        dmcub: "amdgpu/yellow_carp_dmcub.bin",
+    },
+    gc_version: (10, 3, 3),
+    psp_version: (13, 0, 1),
+    sdma_version: (5, 2, 3),
+    dcn_version: (3, 1, 2),
+    vcn_versions: &[(3, 1, 1)],
+};
+
+pub const APU_PROFILES: &[Profile] = &[RAPHAEL, REMBRANDT];
 
 /// Exact vendor/device lookup for an RDNA2 APU; never one [`for_pci_id`] returns.
 pub fn apu_for_pci_id(vendor: u16, device: u16) -> Option<&'static Profile> {

@@ -355,6 +355,15 @@ pub(crate) fn resolve_raphael(gpu: &AmdGpu) -> Result<(Layout, usize), Error> {
     }
     Ok((layout, count))
 }
+/// Rembrandt's one SDMA 5.2.3 engine; a second is refused (NBIO 7.2 has one
+/// SDMA doorbell range).
+pub(crate) fn resolve_rembrandt(gpu: &AmdGpu) -> Result<(Layout, usize), Error> {
+    let (layout, count) = engines(gpu, Layout::resolve_rembrandt(gpu)?)?;
+    if count != 1 {
+        return Err(Error::Unsupported);
+    }
+    Ok((layout, count))
+}
 /// The contiguous discovered SDMA engines of `layout`'s profile.
 fn engines(gpu: &AmdGpu, mut layout: Layout) -> Result<(Layout, usize), Error> {
     use crate::amdgpu_discovery as ip;
@@ -478,6 +487,20 @@ impl Sdma {
         let (layout, count) = resolve_raphael(gpu)?;
         Self::with_layout(gpu, authority, pool, doorbells, layout, count)
     }
+    /// Reserve Rembrandt's single SDMA 5.2.3 queue, whose doorbell range is
+    /// NBIO 7.2's GDC0 one.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Rembrandt.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        let (layout, count) = resolve_rembrandt(gpu)?;
+        Self::with_layout(gpu, authority, pool, doorbells, layout, count)
+    }
     fn with_layout(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
@@ -515,7 +538,9 @@ impl Sdma {
                 queues,
                 state: State::Prepared,
                 proof: Proof::default(),
-                nbio_v7_2: if layout.profile == &crate::amdgpu_rdna2::RAPHAEL {
+                nbio_v7_2: if layout.profile == &crate::amdgpu_rdna2::RAPHAEL
+                    || layout.profile == &crate::amdgpu_rdna2::REMBRANDT
+                {
                     Some(crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?)
                 } else {
                     None

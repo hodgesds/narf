@@ -232,6 +232,47 @@ impl Layout {
             mmhub,
         })
     }
+    /// Rembrandt: GC 10.3.3's gfxhub_v2_1 (Navi22's;
+    /// `gmc_v10_0_set_gfxhub_funcs` gives 10.3.3 the same backend),
+    /// mmhub_v2_3 on MMHUB 2.3.0/2.4.0/2.4.1 (`gmc_v10_0_set_mmhub_funcs`),
+    /// NBIO 7.2 and HDP 5.2.1. The MMHUB list is the mmhub_v2_3 backend's,
+    /// as Raphael's; discovery decides.
+    fn resolve_rembrandt(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::REMBRANDT)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let profile = &crate::amdgpu_rdna2::REMBRANDT;
+        let reg = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        let mmhub = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MMHUB, 0)
+            .map(|b| (b.major, b.minor, b.revision))
+            .ok_or(Error::Unsupported)?;
+        // The highest MM23 register: engine 17's ADDR_RANGE_HI32.
+        let mm_last = MM23.inv_range + 17 * MM23.eng_addr_distance + 1;
+        reg(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        Ok(Self {
+            bases: [
+                // linux-lit: 0x1703=mmGCMC_VM_MX_L1_TLB_CNTL@gc
+                reg(ip::HW_ID_GC, &[profile.gc_version], 0, 0x1703)?,
+                reg(
+                    ip::HW_ID_MMHUB,
+                    &[(2, 3, 0), (2, 4, 0), (2, 4, 1)],
+                    1,
+                    mm_last,
+                )?,
+            ],
+            hubs: [GFX, MM23],
+            nbio: nbio.bif,
+            init: NbioInit::V7_2(nbio),
+            hdp: None,
+            mmhub,
+        })
+    }
 }
 trait Io {
     fn read(&mut self, address: u64) -> u32;
@@ -874,6 +915,21 @@ impl Gmc {
         pool: &Pool,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve_raphael(gpu)?;
+        Ok(Self {
+            engine: Engine::new(Mmio(gpu.regs), authority, layout, pool, gpu.vram.size)?,
+        })
+    }
+    /// Build Rembrandt's hub owner: GC 10.3.3's gfxhub_v2_1, mmhub_v2_3,
+    /// NBIO 7.2 and HDP 5.2.1.
+    ///
+    /// # Safety
+    /// As `new_raphael`, for Rembrandt.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve_rembrandt(gpu)?;
         Ok(Self {
             engine: Engine::new(Mmio(gpu.regs), authority, layout, pool, gpu.vram.size)?,
         })

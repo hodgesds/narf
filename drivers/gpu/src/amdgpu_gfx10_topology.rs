@@ -306,6 +306,22 @@ pub unsafe fn read_revision_raphael(
         .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout, strap)))
         .map_err(|_| Error::Revoked)?
 }
+/// Rembrandt's revision strap, from the register its NBIO 7.2 version uses.
+///
+/// # Safety
+/// As `read_revision`.
+pub unsafe fn read_revision_rembrandt(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<u8, Error> {
+    let layout = Layout::resolve_rembrandt(gpu).map_err(|_| Error::Unsupported)?;
+    // nbio_v7_2_get_rev_id's strap register depends on the NBIO version.
+    let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+    let strap = crate::amdgpu_nbio_v7_2::strap0(banks.version);
+    authority
+        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout, strap)))
+        .map_err(|_| Error::Revoked)?
+}
 /// Sample and derive Raphael's topology, skipping the shader arrays
 /// `gfx_v10_3_get_disabled_sa` reports.
 ///
@@ -317,6 +333,22 @@ pub unsafe fn read_raphael(
 ) -> Result<Topology, Error> {
     let limits = Limits::from_gc(gpu.gc_info.as_ref().ok_or(Error::Invalid)?)?;
     let layout = Layout::resolve_raphael(gpu).map_err(|_| Error::Unsupported)?;
+    let raw = authority
+        .invoke(Op(|| sample(&mut Mmio(gpu.regs), &layout, limits)))
+        .map_err(|_| Error::Revoked)??;
+    derive(limits, &raw)
+}
+/// Sample and derive Rembrandt's topology, skipping the shader arrays
+/// `gfx_v10_3_get_disabled_sa` reports.
+///
+/// # Safety
+/// As `read`, for Rembrandt.
+pub unsafe fn read_rembrandt(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<Topology, Error> {
+    let limits = Limits::from_gc(gpu.gc_info.as_ref().ok_or(Error::Invalid)?)?;
+    let layout = Layout::resolve_rembrandt(gpu).map_err(|_| Error::Unsupported)?;
     let raw = authority
         .invoke(Op(|| sample(&mut Mmio(gpu.regs), &layout, limits)))
         .map_err(|_| Error::Revoked)??;

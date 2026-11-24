@@ -129,6 +129,17 @@ impl Doorbells {
         // SAFETY: the same BAR2 doorbell page; forwarded mapping contract.
         unsafe { Self::map_navi22(device) }
     }
+    /// Map Rembrandt's BAR2 doorbell page: `amdgpu_doorbell_init` takes BAR2 on
+    /// APUs as on discrete parts.
+    ///
+    /// # Safety
+    /// As `map_rdna2`, for Rembrandt.
+    pub unsafe fn map_rembrandt(device: &narf_bus::BusDevice) -> Result<Self, Error> {
+        crate::amdgpu_rdna2::apu_for_pci_id(device.id.vendor, device.id.device)
+            .ok_or(Error::Unsupported)?;
+        // SAFETY: the same BAR2 doorbell page; forwarded mapping contract.
+        unsafe { Self::map_navi22(device) }
+    }
     pub fn bus_address(&self) -> u64 {
         self.bus
     }
@@ -232,6 +243,43 @@ impl Layout {
             return Err(Error::Unsupported);
         }
         let profile = &crate::amdgpu_rdna2::RAPHAEL;
+        let reg = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        reg(ip::HW_ID_SDMA0, &[profile.sdma_version], 0, 0)?;
+        reg(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        let layout = Self {
+            profile,
+            sdma_high: None,
+            gc: [
+                reg(ip::HW_ID_GC, &[profile.gc_version], 0, LAST_GC0)?,
+                reg(ip::HW_ID_GC, &[profile.gc_version], 1, LAST_GC1)?,
+            ],
+            nbio: nbio.bif,
+            hdp: None,
+            oss: reg(
+                ip::HW_ID_OSSSYS,
+                crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS,
+                0,
+                crate::amdgpu_navi22_submit::IH_VMID_LUT_LAST,
+            )?,
+        };
+        Self::validated(gpu, layout)
+    }
+    /// Rembrandt: GC 10.3.3 with SDMA 5.2.3, the NBIO 7.2 segment-2 bank (the
+    /// doorbell aperture, self-ring and HDP flush request/done keep their NBIO
+    /// 2.3 offsets there), HDP 5.2.1 and OSSSYS 5.0.x/5.2.x (`navi10_ih`, one
+    /// header) for the IH VMID LUT — the same layout as Raphael's, under
+    /// Rembrandt's versions. The golden table is `golden::for_gc((10, 3, 3))`.
+    pub(crate) fn resolve_rembrandt(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::REMBRANDT)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let profile = &crate::amdgpu_rdna2::REMBRANDT;
         let reg = |id, versions: &[(u8, u8, u8)], index, last| {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
@@ -1776,6 +1824,26 @@ impl Gfx {
             Layout::resolve_raphael(gpu)?,
         )
     }
+    /// Reserve Rembrandt's GFX ring: GC 10.3.3 shares the GC10.3 queue
+    /// geometry with Raphael's 10.3.6 (`gfx_v10_0_sw_init`'s Sienna Cichlid
+    /// group), under Rembrandt's golden table and SDMA 5.2.3.
+    ///
+    /// # Safety
+    /// As `new_raphael`, for Rembrandt.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        doorbells: Doorbells,
+    ) -> Result<Self, Error> {
+        Self::with_layout(
+            gpu,
+            authority,
+            pool,
+            doorbells,
+            Layout::resolve_rembrandt(gpu)?,
+        )
+    }
     fn with_layout(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
@@ -1981,6 +2049,23 @@ pub unsafe fn enable_doorbell_apertures_raphael(
     };
     hw.access(|io, l| enable_doorbells(io, l, doorbells.bus))
 }
+/// Rembrandt's doorbell apertures, as `enable_doorbell_apertures_raphael`.
+///
+/// # Safety
+/// As `enable_doorbell_apertures_raphael`; nothing rings a doorbell until
+/// the apertures are enabled.
+pub unsafe fn enable_doorbell_apertures_rembrandt(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let mut hw = Hw {
+        layout: Layout::resolve_rembrandt(gpu)?,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(|io, l| enable_doorbells(io, l, doorbells.bus))
+}
 /// Raphael's `nv_common_hw_fini` for an s0ix suspend: both apertures off
 /// ([`disable_doorbells`]). `enable_doorbell_apertures_raphael` is the
 /// resume's half (`nv_common_hw_init`, then `nv_common_late_init`'s
@@ -1996,6 +2081,26 @@ pub unsafe fn disable_doorbell_apertures_raphael(
 ) -> Result<(), Error> {
     let mut hw = Hw {
         layout: Layout::resolve_raphael(gpu)?,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(disable_doorbells)
+}
+/// Rembrandt's `nv_common_hw_fini` for an s0ix suspend: both apertures off
+/// ([`disable_doorbells`]). `enable_doorbell_apertures_rembrandt` is the
+/// resume's half (`nv_common_hw_init`, then `nv_common_late_init`'s
+/// self-ring enable).
+///
+/// # Safety
+/// As `enable_doorbell_apertures_rembrandt`; nothing rings a doorbell until
+/// the apertures are enabled again.
+pub unsafe fn disable_doorbell_apertures_rembrandt(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let mut hw = Hw {
+        layout: Layout::resolve_rembrandt(gpu)?,
         io: Mmio::new(gpu, doorbells),
         authority,
     };
@@ -2092,6 +2197,23 @@ pub unsafe fn enable_fence_interrupts_raphael(
     doorbells: Doorbells,
 ) -> Result<(), Error> {
     let (layout, count) = crate::amdgpu_sdma_navi22_queues::resolve_raphael(gpu)?;
+    let mut hw = Hw {
+        layout,
+        io: Mmio::new(gpu, doorbells),
+        authority,
+    };
+    hw.access(|io, l| enable_fence_irqs_for(io, l, count))
+}
+/// Rembrandt's fence interrupts, as `enable_fence_interrupts_raphael`.
+///
+/// # Safety
+/// As `enable_fence_interrupts_raphael`.
+pub unsafe fn enable_fence_interrupts_rembrandt(
+    gpu: &AmdGpu,
+    authority: Cap<BusDeviceCap, Write>,
+    doorbells: Doorbells,
+) -> Result<(), Error> {
+    let (layout, count) = crate::amdgpu_sdma_navi22_queues::resolve_rembrandt(gpu)?;
     let mut hw = Hw {
         layout,
         io: Mmio::new(gpu, doorbells),

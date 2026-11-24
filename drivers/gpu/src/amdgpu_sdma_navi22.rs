@@ -156,6 +156,41 @@ impl Layout {
             hdp: None,
         })
     }
+    /// Rembrandt: its one SDMA 5.2.3 in GC 10.3.3's bank zero, NBIO 7.2's
+    /// segment 2 (the HDP remap and MEMSIZE keep their NBIO 2.3 offsets), and
+    /// HDP 5.2.1, which has no read cache to invalidate.
+    fn resolve_rembrandt(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::REMBRANDT)
+            // linux: n/a (BAR5 bound: MMIO_REG_HOLE_OFFSET + 4)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let profile = &crate::amdgpu_rdna2::REMBRANDT;
+        let mut blocks = gpu
+            .ip_blocks
+            .iter()
+            .filter(|b| b.hw_id == ip::HW_ID_SDMA0 && b.instance == 0);
+        let sdma = blocks.next().ok_or(Error::Unsupported)?;
+        if blocks.next().is_some()
+            || (sdma.major, sdma.minor, sdma.revision) != profile.sdma_version
+        {
+            return Err(Error::Unsupported);
+        }
+        let resolve = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        resolve(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let nbio = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        Ok(Self {
+            vram_size: gpu.vram.size,
+            // linux-lit: 0=mmGCMC_VM_FB_LOCATION_TOP_BASE_IDX@gc; 0x16fd=mmGCMC_VM_FB_LOCATION_TOP@gc
+            gc: resolve(ip::HW_ID_GC, &[profile.gc_version], 0, 0x16fd)?,
+            nbio: nbio.bif,
+            hdp: None,
+        })
+    }
 }
 trait Io {
     fn read(&mut self, address: u64) -> u32;
@@ -610,6 +645,18 @@ impl Sdma {
         pool: &Pool,
     ) -> Result<Self, Error> {
         Self::with_layout(gpu.regs, authority, pool, Layout::resolve_raphael(gpu)?)
+    }
+    /// Reserve Rembrandt's SDMA0 proof ring: SDMA 5.2.3 on GC 10.3.3, NBIO 7.2,
+    /// HDP 5.2.1 (no read cache). No device writes occur during construction.
+    ///
+    /// # Safety
+    /// As `new_rdna2`, for Rembrandt.
+    pub unsafe fn new_rembrandt(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        Self::with_layout(gpu.regs, authority, pool, Layout::resolve_rembrandt(gpu)?)
     }
     fn with_layout(
         registers: MmioRegion,

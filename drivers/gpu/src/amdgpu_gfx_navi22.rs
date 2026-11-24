@@ -63,10 +63,10 @@ fn check_rdna2_device(gpu: &AmdGpu) -> Result<&'static crate::amdgpu_rdna2::Prof
     vcn_instances(gpu)?;
     Ok(profile)
 }
-/// Raphael's preparation gate: the exact APU profile, then every IP its
-/// containers belong to — GC 10.3.6, MP1 13.0.5, SDMA 5.2.6, one VCN 3.1.2
-/// and DCN 3.1.5. Like [`check_rdna2_device`] this authorizes no hardware path.
-fn check_raphael_device(gpu: &AmdGpu) -> Result<&'static crate::amdgpu_rdna2::Profile, Error> {
+/// An APU's preparation gate: the exact APU profile, then every IP its
+/// containers belong to — GC, MP1, SDMA, one VCN and DCN, all from the
+/// profile. Like [`check_rdna2_device`] this authorizes no hardware path.
+fn check_apu_device(gpu: &AmdGpu) -> Result<&'static crate::amdgpu_rdna2::Profile, Error> {
     let profile = crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
         .ok_or(Error::Unsupported)?;
     for (id, versions) in [
@@ -92,7 +92,7 @@ fn check_raphael_device(gpu: &AmdGpu) -> Result<&'static crate::amdgpu_rdna2::Pr
     }
     // Linux counts VCN instances from discovery
     // (`amdgpu_discovery_reg_base_init`). This preparation is bounded to the
-    // single VCN 3.1.2 instance 0 and refuses any other shape rather than
+    // single VCN instance 0 and refuses any other shape rather than
     // guess which payload a second instance would take.
     let mut vcn = gpu
         .ip_blocks
@@ -233,7 +233,30 @@ impl Firmware {
         gpu: &AmdGpu,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, Error> {
-        let profile = check_raphael_device(gpu)?;
+        let profile = check_apu_device(gpu)?;
+        let mut bytes = core::array::from_fn(|_| None);
+        for (slot, source) in bytes.iter_mut().zip(Source::ORDER) {
+            *slot = optional(
+                source,
+                authority
+                    .invoke(Open(source, profile))
+                    .map_err(|_| Error::Revoked)?,
+            )?;
+        }
+        Ok(Self {
+            profile,
+            bytes,
+            vcn: 1,
+        })
+    }
+    /// Prepare Rembrandt's set: the same UCODE_ID order and container formats
+    /// (`gfx_v10_0`, `sdma_v5_2`, `vcn_v3_0`, DCN31 DMCUB) under its own names
+    /// (`yellow_carp_*`). Touches no hardware and authorizes no load.
+    pub fn open_rembrandt(
+        gpu: &AmdGpu,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, Error> {
+        let profile = check_apu_device(gpu)?;
         let mut bytes = core::array::from_fn(|_| None);
         for (slot, source) in bytes.iter_mut().zip(Source::ORDER) {
             *slot = optional(

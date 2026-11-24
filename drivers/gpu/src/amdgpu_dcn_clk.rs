@@ -703,13 +703,30 @@ impl ClockManager {
             )?;
             (Mailbox::Dcn315, mp1, Some(nbio))
         } else {
+            // `dcn31_smu.c` is `dcn314_smu.c`: the same C2PMSG_67/83/91
+            // registers and VBIOSSMC message IDs. The window differs by MP1
+            // version: 13.0.4/13.0.11 put every C2PMSG register on `_BASE_IDX`
+            // 1 (`mp_13_0_4_offset.h`), while the generic `psp_v13_0` family
+            // — 13.0.0/13.0.2/13.0.5 in the headers, and 13.0.1/13.0.3 by the
+            // same driver — puts them on `_BASE_IDX` 0. DPREFCLK is 600 MHz
+            // on both (`dcn31_clk_mgr.c`,
+            // `clk_mgr->base.dprefclk_khz = 600000`).
             let mp1 = bank(
                 gpu,
                 discovery::HW_ID_MP1,
                 &[(13, 0, 4), (13, 0, 11)],
                 1,
                 RESPONSE as u32,
-            )?;
+            )
+            .or_else(|_| {
+                bank(
+                    gpu,
+                    discovery::HW_ID_MP1,
+                    &[(13, 0, 1), (13, 0, 3)],
+                    0,
+                    RESPONSE as u32,
+                )
+            })?;
             (Mailbox::Dcn314, mp1, None)
         };
         let table = pool

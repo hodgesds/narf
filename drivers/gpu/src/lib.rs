@@ -675,6 +675,10 @@ pub(crate) mod amdgpu_rdna2_client;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_vcn;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_rembrandt_boot;
+#[cfg(feature = "amdgpu")]
+pub(crate) mod amdgpu_rembrandt_reset;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_apu_telemetry;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_navi48;
@@ -682,6 +686,8 @@ pub mod amdgpu_smu_navi48;
 pub mod amdgpu_smu_navi48_telemetry;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_raphael;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_rembrandt;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_temp;
 #[cfg(feature = "amdgpu")]

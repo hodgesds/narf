@@ -516,6 +516,13 @@ enum Kind {
     /// only on 13.0.6/12/14/15). Every MP0 C2PMSG register sits at the same
     /// offset on `_BASE_IDX` 0 instead of 1 (`mp_13_0_5_offset.h`).
     Raphael,
+    /// PSP 13.0.1/13.0.3: Linux's generic `psp_v13_0`, as Raphael's 13.0.5 —
+    /// the same ring create/stop/destroy and write-pointer registers, and
+    /// every MP0 C2PMSG register on `_BASE_IDX` 0. The 13.0.0/13.0.2/13.0.5
+    /// headers all give `_BASE_IDX` 0 (no 13.0.1 header is in the ref tree);
+    /// Phoenix's 13.0.4 is the exception, with its own `psp_v13_0_4` driver
+    /// and `_BASE_IDX` 1. SOS and PMFW are BIOS-resident, as on Raphael.
+    Rembrandt,
     Navi22,
     Rdna2(&'static crate::amdgpu_rdna2::Profile),
     /// PSP 13.0.0 (Navi31, GC 11.0.0): Linux's generic `psp_v13_0`, like
@@ -550,6 +557,7 @@ impl Kind {
     fn graphics_profile(self) -> Option<&'static crate::amdgpu_rdna2::Profile> {
         match self {
             Self::Raphael => Some(&crate::amdgpu_rdna2::RAPHAEL),
+            Self::Rembrandt => Some(&crate::amdgpu_rdna2::REMBRANDT),
             _ => self.rdna2_profile(),
         }
     }
@@ -846,6 +854,32 @@ impl Layout {
                 let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 5)], 2, 0x477)?;
                 (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
             }
+            Kind::Rembrandt => {
+                // MP0 C2PMSG on `_BASE_IDX` 0, as the generic `psp_v13_0`
+                // path (see `Kind::Rembrandt`).
+                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 1), (13, 0, 3)], 0, SOS)?;
+                // NBIO 7.2/7.7 index pair, as Raphael's: REMAP_HDP_MEM_FLUSH_CNTL
+                // 0x12d and RCC_CONFIG_MEMSIZE 0xc3 on _BASE_IDX 2.
+                let nbio = bank(
+                    gpu,
+                    discovery::HW_ID_NBIF,
+                    &[
+                        (7, 2, 0),
+                        (7, 2, 1),
+                        (7, 3, 0),
+                        (7, 5, 0),
+                        (7, 5, 1),
+                        (7, 7, 0),
+                        (7, 7, 1),
+                    ],
+                    2,
+                    0x12d,
+                )?;
+                // regDCN_VM_FB_LOCATION_BASE/TOP and regDCN_VM_FB_OFFSET are
+                // 0x475..0x477 in dcn_3_1_2_offset.h too.
+                let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 2)], 2, 0x477)?;
+                (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
+            }
             Kind::Navi31 => {
                 // MP0 13.0.0 on `_BASE_IDX` 0 (`psp_v13_0.c`,
                 // `soc21.c:477,1023`); GC 11.0.0 on index 0 — the
@@ -1112,7 +1146,8 @@ pub(crate) fn nbio_bank_ungated(gpu: &AmdGpu) -> Result<u64, Error> {
     Ok(base)
 }
 impl Psp {
-    /// Claim the Phoenix PSP13 ring. Navi22 uses `new_navi22` instead.
+    /// Claim an APU PSP13 ring (Phoenix, Raphael or Rembrandt). Navi22 uses
+    /// `new_navi22` instead.
     /// # Safety
     /// Caller owns this physical GPU (not an SR-IOV VF), PSP/PM/HDP exclusively,
     /// with permanent mappings and this GPU's exclusively free VRAM pool. No
@@ -1123,7 +1158,9 @@ impl Psp {
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
     ) -> Result<Self, Error> {
-        // PSP 13.0.5 is Raphael's, and only with DCN 3.1.5 beside it.
+        // PSP 13.0.5 is Raphael's, and only with DCN 3.1.5 beside it; PSP
+        // 13.0.1/13.0.3 is Rembrandt's, and only with DCN 3.1.2 beside it.
+        // Anything else falls through to Phoenix's 13.0.4 ring.
         let kind = if crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 5)], 0, 0)
             .is_ok()
         {
@@ -1133,6 +1170,21 @@ impl Psp {
                 return Err(Error::Unsupported);
             }
             Kind::Raphael
+        } else if crate::amdgpu_psp_ring::bank(
+            gpu,
+            discovery::HW_ID_MP0,
+            &[(13, 0, 1), (13, 0, 3)],
+            0,
+            0,
+        )
+        .is_ok()
+        {
+            if crate::amdgpu_dcn_profile::Profile::resolve(gpu)
+                != Ok(crate::amdgpu_dcn_profile::Profile::Dcn312)
+            {
+                return Err(Error::Unsupported);
+            }
+            Kind::Rembrandt
         } else {
             Kind::Phoenix
         };
@@ -1246,7 +1298,7 @@ impl Psp {
                 tmr: None,
                 tmr_ready: false,
                 smc_state: SmcState::Absent,
-                smc_resident: kind == Kind::Raphael,
+                smc_resident: matches!(kind, Kind::Raphael | Kind::Rembrandt),
                 gfx_state: GfxLoadState::Absent,
                 gfx_status: None,
                 media_firmware: MediaFirmware::default(),
@@ -1267,7 +1319,7 @@ impl Psp {
     /// Phoenix's standalone authenticated TOC container. Navi22 uses the
     /// embedded TOC from the SOS container through `setup_tmr_navi22`.
     pub async fn setup_tmr(&mut self, toc: &[u8]) -> Result<(), Error> {
-        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael) {
+        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael | Kind::Rembrandt) {
             return Err(Error::Unsupported);
         }
         self.session
@@ -1374,7 +1426,7 @@ impl Psp {
     /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
     /// The DCN314 loader is the currently audited consumer of this operation.
     pub async fn load_dmub(&mut self, signed_instructions: &[u8]) -> Result<(), Error> {
-        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael) {
+        if !matches!(self.kind, Kind::Phoenix | Kind::Raphael | Kind::Rembrandt) {
             return Err(Error::Unsupported);
         }
         self.session
