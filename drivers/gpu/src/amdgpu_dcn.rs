@@ -815,6 +815,158 @@ pub fn dcn35_modeset_sequence(
     writes
 }
 
+// ── DCN 3.2 modeset path (Navi31 / Navi32 3.2.0, Navi33 3.2.1) ─────
+//
+// DCN 3.2 uses the DCN 2.0 / 3.1.4 OTG layout, NOT the 3.5 one
+// (`dcn_3_2_0_offset.h` and `dcn_3_2_1_offset.h` vs `dcn_3_1_4_offset.h`,
+// verified register by register):
+//
+//   reg                       3.1.4    3.2.0    3.2.1    3.5
+//   OTG_H_TOTAL               0x1b2a   0x1b2a   0x1b2a   0x1b2a
+//   OTG_H_BLANK_START_END     0x1b2b   0x1b2b   0x1b2b   0x1b2b
+//   OTG_H_SYNC_A              0x1b2c   0x1b2c   0x1b2c   0x1b2c
+//   OTG_V_TOTAL               0x1b2f   0x1b2f   0x1b2f   0x1b2f
+//   OTG_V_BLANK_START_END     0x1b36   0x1b36   0x1b36   0x1b38
+//   OTG_V_SYNC_A              0x1b37   0x1b37   0x1b37   0x1b39
+//   OTG_V_SYNC_A_CNTL         0x1b38   0x1b38   0x1b38   —
+//   OTG_CONTROL               0x1b41   0x1b41   0x1b41   0x1b43
+//   OTG_STATUS                0x1b49   0x1b49   0x1b49   0x1b49
+//   OTG_INTERRUPT_CONTROL     0x1b59   0x1b59   0x1b59   0x1b5a
+//
+// The HUBP / HUBPREQ / OPP anchors agree too (HUBP0 0x05f3, PITCH 0x0607,
+// SURFACE 0x060a/0x060b, OPP_PIPE_CONTROL 0x188c on both 3.1.4 and 3.2.0),
+// and so do the per-pipe strides (HUBP 0xdc, OPP 0x5a, OTG 0x80 —
+// `regHUBP1_DCHUBP_CNTL` 0x06cf, `regOPP_PIPE1_OPP_PIPE_CONTROL` 0x18e6,
+// `regOTG1_OTG_H_TOTAL` 0x1baa on `dcn_3_2_0_offset.h`). The sequence body
+// is therefore the same shape as DCN 2.0, with the pipe folded in through
+// the shared strides — unlike the pipe-0-only `dcn20_modeset_sequence`.
+// Navi31 has 4 pipes (`dcn32_resource.c`: `num_timing_generator = 4`,
+// `dcn321_resource.c` the same), not the 6 the old `KmsState::new` call
+// site assumed; a pipe at or above 4 returns `None` instead of
+// programming another pipe's registers.
+
+/// Pipes on DCN 3.2.0 / 3.2.1 (`dcn32_resource.c` / `dcn321_resource.c`).
+pub const DCN32_PIPES: u8 = 4;
+
+/// DCN 3.2 register dword ids, from `dcn_3_2_0_offset.h` (3.2.1 agrees on
+/// every id below). Values equal the DCN 2.0 / 3.1.4 ids; the names exist
+/// so a future 3.2 divergence lands here instead of silently reusing the
+/// 2.0 table.
+pub const DCN32_OTG0_OTG_H_TOTAL: u32 = 0x1b2a;
+pub const DCN32_OTG0_OTG_H_BLANK_START_END: u32 = 0x1b2b;
+pub const DCN32_OTG0_OTG_H_SYNC_A: u32 = 0x1b2c;
+pub const DCN32_OTG0_OTG_V_TOTAL: u32 = 0x1b2f;
+pub const DCN32_OTG0_OTG_V_BLANK_START_END: u32 = 0x1b36;
+pub const DCN32_OTG0_OTG_V_SYNC_A: u32 = 0x1b37;
+pub const DCN32_OTG0_OTG_CONTROL: u32 = 0x1b41;
+pub const DCN32_OTG0_OTG_STATUS: u32 = 0x1b49;
+pub const DCN32_OTG0_OTG_INTERRUPT_CONTROL: u32 = 0x1b59;
+
+/// DCN 3.2 modeset sequence. Same prologue/body/epilogue shape as
+/// `dcn20_modeset_sequence`, with the pipe folded in: HUBP, OPP and OTG
+/// bases advance by their per-pipe strides, so pipe 1 programs OTG1
+/// (`OTG_CONTROL` at dword 0x1bc1) rather than re-programming pipe 0.
+///
+/// Linux reference: `drivers/gpu/drm/amd/display/dc/dcn32/` (uses the
+/// OPTC3 / DCN30 timing programmer, reused unchanged for DCN 3.2)
+/// together with the DCN 3.2 offset headers above. Returns `None` when
+/// `pipe` is not a DCN 3.2 pipe (`pipe >= DCN32_PIPES`).
+pub fn dcn32_modeset_sequence(
+    timing: &ModeTiming,
+    surface_addr_bytes: u64,
+    stride_pixels: u32,
+    dcn_base: u32,
+    pipe: u8,
+) -> Option<alloc::vec::Vec<DcnWrite>> {
+    if pipe >= DCN32_PIPES {
+        return None;
+    }
+    let mut writes = alloc::vec::Vec::with_capacity(16);
+
+    // Per-pipe block bases: each block advances by its own stride, so pipe
+    // 1's HUBP sits 0xdc dwords past pipe 0's while its OTG sits 0x80 past.
+    let hubp = dcn_base + (pipe as u32) * HUBP_PIPE_STRIDE;
+    let hubpreq = dcn_base + (pipe as u32) * HUBP_PIPE_STRIDE;
+    let opp = dcn_base + (pipe as u32) * OPP_PIPE_STRIDE;
+    let otg = dcn_base + (pipe as u32) * OTG_PIPE_STRIDE;
+
+    // 1. Disable scanout.
+    writes.push(DcnWrite {
+        addr: hubp + HUBP0_DCHUBP_CNTL,
+        value: HUBP_BLANK_FORCE,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_INTERRUPT_CONTROL,
+        value: 0,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_CONTROL,
+        value: 0,
+    });
+
+    // 2. HUBP surface address + pitch.
+    let surf_lo = surface_addr_bytes as u32;
+    let surf_hi = (surface_addr_bytes >> 32) as u32;
+    writes.push(DcnWrite {
+        addr: hubpreq + HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH,
+        value: surf_hi,
+    });
+    writes.push(DcnWrite {
+        addr: hubpreq + HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS,
+        value: surf_lo,
+    });
+    let pitch_field = stride_pixels.saturating_sub(1) & 0x1FFF;
+    writes.push(DcnWrite {
+        addr: hubpreq + HUBPREQ0_DCSURF_SURFACE_PITCH,
+        value: pitch_field,
+    });
+
+    // 3. OPP pipe enable + linear gamma.
+    writes.push(DcnWrite {
+        addr: opp + OPP_PIPE0_OPP_PIPE_CONTROL,
+        value: OPP_PIPE_ENABLE,
+    });
+
+    // 4. OTG timing.
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_H_TOTAL,
+        value: (timing.h_total - 1) as u32,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_V_TOTAL,
+        value: (timing.v_total - 1) as u32,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_H_BLANK_START_END,
+        value: pack_pair(timing.h_blank_end, timing.h_blank_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_V_BLANK_START_END,
+        value: pack_pair(timing.v_blank_end, timing.v_blank_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_H_SYNC_A,
+        value: pack_pair(timing.h_sync_end, timing.h_sync_start),
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_V_SYNC_A,
+        value: pack_pair(timing.v_sync_end, timing.v_sync_start),
+    });
+
+    // 5. Re-enable scanout. OTG_MASTER_EN lands on the DCN 3.2
+    // OTG_CONTROL offset (dword 0x1B41), the same slot as DCN 2.0.
+    writes.push(DcnWrite {
+        addr: hubp + HUBP0_DCHUBP_CNTL,
+        value: 0,
+    });
+    writes.push(DcnWrite {
+        addr: otg + DCN32_OTG0_OTG_CONTROL,
+        value: OTG_MASTER_EN,
+    });
+
+    Some(writes)
+}
+
 /// Build a DCN 2.0 modeset write list from the IP discovery
 /// table. Returns `None` when the discovery blob does not enumerate
 /// a `HW_ID_DCN` block (older silicon / QEMU / parse failed); the
@@ -986,4 +1138,68 @@ pub mod tests {
         }
     }
     kernel_test_in!("drivers/gpu/amdgpu_dcn", smoke_modeset_rejects_bad_stride);
+
+    fn smoke_dcn32_modeset_sequence() -> TestResult {
+        let timing = match timing_for_mode(1920, 1080, 60) {
+            Some(t) => t,
+            None => return TestResult::Fail("FHD@60 missing"),
+        };
+        // Pipe 0 on DCN 3.2 programs exactly the DCN 2.0 registers:
+        // the 3.2 OTG layout IS the 2.0/3.1.4 layout (dcn_3_2_0_offset.h).
+        let seq32 = match dcn32_modeset_sequence(&timing, 0x8000_0000, 1920, 0x5000, 0) {
+            Some(s) => s,
+            None => return TestResult::Fail("pipe 0 rejected"),
+        };
+        let seq20 = dcn20_modeset_sequence(&timing, 0x8000_0000, 1920, 0x5000);
+        if seq32 != seq20 {
+            return TestResult::Fail("DCN 3.2 pipe-0 sequence differs from DCN 2.0");
+        }
+        // Pipe 1 folds each block by its own stride: HUBP +0xdc, OPP
+        // +0x5a, OTG +0x80 — so OTG_CONTROL lands at 0x5000+0x1bc1.
+        let seq1 = match dcn32_modeset_sequence(&timing, 0x8000_0000, 1920, 0x5000, 1) {
+            Some(s) => s,
+            None => return TestResult::Fail("pipe 1 rejected"),
+        };
+        if seq1.first().copied()
+            != Some(DcnWrite {
+                addr: 0x5000 + 0xdc + 0x05f3,
+                value: HUBP_BLANK_FORCE,
+            })
+        {
+            return TestResult::Fail("pipe-1 HUBP blank must stride by 0xdc");
+        }
+        let last = match seq1.last().copied() {
+            Some(w) => w,
+            None => return TestResult::Fail("pipe-1 sequence empty"),
+        };
+        if last.addr != 0x5000 + 0x80 + DCN32_OTG0_OTG_CONTROL || last.value != OTG_MASTER_EN {
+            return TestResult::Fail("pipe-1 master enable must land on OTG1_CONTROL");
+        }
+        // No OTG write on any pipe may land on a DCN 3.5-shifted id:
+        // V_BLANK 0x1b38 / V_SYNC_A 0x1b39 / CONTROL 0x1b43 would program
+        // V_SYNC_A_CNTL, not the timing generator.
+        for pipe in 0..DCN32_PIPES {
+            let seq = match dcn32_modeset_sequence(&timing, 0x8000_0000, 1920, 0x5000, pipe) {
+                Some(s) => s,
+                None => return TestResult::Fail("valid pipe rejected"),
+            };
+            let otg = 0x5000 + (pipe as u32) * OTG_PIPE_STRIDE;
+            for w in seq
+                .iter()
+                .filter(|w| (otg + 0x1b2a..otg + 0x1b5a).contains(&w.addr))
+            {
+                if matches!(w.addr - otg, 0x1b38 | 0x1b39 | 0x1b43) {
+                    return TestResult::Fail("DCN 3.2 sequence wrote a DCN 3.5 OTG id");
+                }
+            }
+        }
+        // Pipe 4 does not exist on Navi31 (dcn32_resource.c: 4 pipes).
+        if dcn32_modeset_sequence(&timing, 0x8000_0000, 1920, 0x5000, DCN32_PIPES).is_some()
+            || dcn32_modeset_sequence(&timing, 0x8000_0000, 1920, 0x5000, u8::MAX).is_some()
+        {
+            return TestResult::Fail("out-of-range pipe admitted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/amdgpu_dcn", smoke_dcn32_modeset_sequence);
 }

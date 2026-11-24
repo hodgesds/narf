@@ -1987,7 +1987,8 @@ impl AmdGpu {
         })
     }
 
-    /// Program a scanout mode through DCN 2.0.
+    /// Program a scanout mode through DCN 2.0 — or DCN 3.2 on Navi3
+    /// (Navi31/32 3.2.0, Navi33 3.2.1), whose OTG layout is the 2.0 one.
     ///
     /// Path:
     ///   1. Look up the DCN register window from the IP
@@ -1999,9 +2000,9 @@ impl AmdGpu {
     ///   2. Translate `mode.width × mode.height @ 60 Hz` to a
     ///      `ModeTiming` via the VESA / CEA-861 table in
     ///      `amdgpu_dcn::timing_for_mode`.
-    ///   3. Build the full DCN 2.0 modeset write sequence
-    ///      (prologue + body + epilogue) via
-    ///      `dcn20_modeset_sequence`.
+    ///   3. Build the full modeset write sequence (prologue + body +
+    ///      epilogue) via `dcn20_modeset_sequence` — or
+    ///      `dcn32_modeset_sequence` on Navi3, pipe 0.
     ///   4. Execute through `execute_modeset` against BAR5's
     ///      `MM_INDEX / MM_DATA` indexed access pair.
     ///   5. Stash the programmed mode so the `FbScanout` impl
@@ -2022,11 +2023,9 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR0 + BAR5 exclusively.
     pub unsafe fn set_mode(&mut self, mode: Mode) -> Result<(), AmdgpuError> {
-        // Navi3 (Navi31, DCN 3.2) has no DCN32 modeset sequence yet:
-        // the legacy DCN 2.0 sequence programs the wrong OTG registers
-        // on it. Fail closed like Navi4 until the DCN 3.2 lane lands
-        // (RDNA3 audit B3).
-        if self.chip.family == Family::Navi4 || self.chip.family == Family::Navi3 {
+        // Navi4 has no legacy modeset path: its display goes through the
+        // native Navi48 platform path only.
+        if self.chip.family == Family::Navi4 {
             return Err(AmdgpuError::UnknownAsic);
         }
         if !self.fw_loaded {
@@ -2049,19 +2048,36 @@ impl AmdGpu {
         // Build the sequence. `mode.stride` is in pixels — DCN's
         // DCSURF_SURFACE_PITCH field also expects pixels.
         //
-        // No family branch here: this path always uses the DCN 2.0
-        // sequence. Phoenix / HawkPoint are DCN 3.1.4, which agrees
-        // with DCN 2.0 on all seven OTG registers (see `plan_modeset`
-        // for the register offsets) — an earlier pass corrected
-        // `amdgpu_modeset` to the 2.0 sequence, and this call site
-        // agrees. This is the sequence `set_mode` uses, which is what
-        // the PM resume path re-runs.
-        let seq = crate::amdgpu_dcn::dcn20_modeset_sequence(
-            &timing,
-            self.vram.base,
-            mode.stride,
-            dcn_base,
-        );
+        // Branch by family: Navi3 (Navi31/32 DCN 3.2.0, Navi33 DCN 3.2.1)
+        // runs the DCN 3.2 sequence on pipe 0 — the single-display path
+        // has no KMS CRTC to take a pipe from. Phoenix / HawkPoint /
+        // Strix run DCN 3.5 (different OTG register layout — see
+        // `amdgpu_dcn` module header for the per-register shifts).
+        // Everything else with a discoverable DCN block today is DCN 2.0
+        // (Renoir, Cezanne, Lucienne).
+        // LINUX-GAP: this selected `dcn35_modeset_sequence` for Phoenix.
+        // Phoenix is DCN **3.1.4**, which agrees with DCN 2.0 on all nine OTG
+        // registers; DCN 3.5 moves four of them. `amdgpu_modeset` was
+        // corrected to the 2.0 sequence in an earlier pass and this call site
+        // was not, so the two modeset paths disagreed — and this is the one
+        // `set_mode` uses, which is what the PM resume path re-runs.
+        let seq = if self.chip.family == Family::Navi3 {
+            crate::amdgpu_dcn::dcn32_modeset_sequence(
+                &timing,
+                self.vram.base,
+                mode.stride,
+                dcn_base,
+                0,
+            )
+            .ok_or(AmdgpuError::UnknownAsic)?
+        } else {
+            crate::amdgpu_dcn::dcn20_modeset_sequence(
+                &timing,
+                self.vram.base,
+                mode.stride,
+                dcn_base,
+            )
+        };
 
         // Drive the sequencer.
         // SAFETY: caller-asserted exclusive ownership of BAR5.

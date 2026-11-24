@@ -1,5 +1,6 @@
-//! DCN 3.1.4 DMUB command transport. ABI checked against Linux
-//! display/dmub/inc/dmub_cmd.h and dmub_dcn31.c/dmub_dcn314.c.
+//! DCN 3.1.4 / 3.1.5 / 3.2.0 / 3.2.1 DMUB command transport. ABI checked
+//! against Linux display/dmub/inc/dmub_cmd.h and
+//! dmub_dcn31.c/dmub_dcn314.c/dmub_dcn32.c.
 //!
 //! Attachment requires an already running DAL firmware and a mailbox wholly
 //! inside the mapped VRAM aperture. This does not load firmware or reset DMCUB.
@@ -68,9 +69,12 @@ impl Firmware {
         &'a self,
         gpu: &'a AmdGpu,
     ) -> Result<firmware::Prepared<'a>, FirmwareError> {
-        dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        let ip = dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
         let vbios = gpu.vbios.as_ref().ok_or(FirmwareError::VbiosUnavailable)?;
-        self.prepare(vbios.bytes())
+        match (ip.major, ip.minor, ip.revision) {
+            (3, 2, 0) | (3, 2, 1) => self.prepare_dcn32(vbios.bytes()),
+            _ => self.prepare(vbios.bytes()),
+        }
     }
     /// Choose firmware from exact IP discovery, independently of the coarse
     /// PCI family table. DCN 3.5 requires a different hardware boot sequence.
@@ -81,6 +85,8 @@ impl Firmware {
         let ip = dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
         let name = match (ip.major, ip.minor, ip.revision) {
             (3, 1, 5) => firmware::DCN315_FIRMWARE,
+            (3, 2, 0) => firmware::DCN320_FIRMWARE,
+            (3, 2, 1) => firmware::DCN321_FIRMWARE,
             _ => firmware::DCN314_FIRMWARE,
         };
         let bytes = authority.invoke(OpenFirmware(name)).map_err(|_| {
@@ -98,6 +104,17 @@ impl Firmware {
             .prepare_dcn314(vbios)
             .map_err(FirmwareError::Image)
     }
+    /// Prepare a DCN 3.2 image (combined layout, as for 3.1.4 — see
+    /// [`firmware::Image::prepare_dcn32`]). Callers select by the
+    /// discovery-resolved DCN version; `prepare` stays the 3.1.x path.
+    pub fn prepare_dcn32<'a>(
+        &'a self,
+        vbios: &'a [u8],
+    ) -> Result<firmware::Prepared<'a>, FirmwareError> {
+        self.image()?
+            .prepare_dcn32(vbios)
+            .map_err(FirmwareError::Image)
+    }
 }
 
 /// The DCN versions whose DMUB this module boots. Not a register window — the
@@ -113,7 +130,16 @@ impl Firmware {
 /// every DMCUB register both headers define sits at the same offset. DCN 3.1.5
 /// lacks `DMCUB_EXT_INTERRUPT_STATUS` and `DMCUB_GPINT_DATAIN2..5`, which this
 /// module does not use.
-const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4), (3, 1, 5)];
+///
+/// DCN 3.2.0 / 3.2.1 ride the same sequence for the same reason: every DMCUB
+/// register `attach_regions` reads sits at the same offset in
+/// `dcn_3_2_0_offset.h` / `dcn_3_2_1_offset.h` as in `dcn_3_1_4_offset.h`
+/// (CNTL 0x1f6, CNTL2 0x200, SCRATCH0 0x1e3, SCRATCH7 0x1ea, INBOX1/OUTBOX1
+/// 0x1d4–0x1df, CW4 base/top/offset 0x1a9/0x1b1/0x1bd/0x1be, FB_LOCATION
+/// 0x475/0x476), and `dmub_dcn32_setup_windows` takes the same combined-image
+/// layout as 3.1.4. The 3.2-specific reset and mailbox setup live in
+/// `amdgpu_dmub_dcn32`, not here.
+const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4), (3, 1, 5), (3, 2, 0), (3, 2, 1)];
 
 pub(crate) fn dcn31x_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
     let mut blocks = gpu
@@ -159,10 +185,13 @@ pub struct Dmub {
 }
 /// The USB4 DPIAs this DCN's firmware serves: `dcn314_resource.c` sets
 /// `usb4_dpia_count = 4`; `dcn315_resource.c` sets none, so Linux never sends
-/// Raphael's firmware a DPIA command, and neither does this.
+/// Raphael's firmware a DPIA command, and neither does this. Neither
+/// `dcn32_resource.c` nor `dcn321_resource.c` sets one either, so DCN 3.2
+/// serves none.
 pub(crate) fn dpia_count(ip: &crate::amdgpu_discovery::IpBlock) -> u8 {
     match (ip.major, ip.minor, ip.revision) {
         (3, 1, 4) => 4,
+        (3, 2, 0) | (3, 2, 1) => 0,
         _ => 0,
     }
 }
@@ -606,6 +635,29 @@ pub(crate) mod tests {
         if !matches!(Firmware::open(&gpu, &read), Err(FirmwareError::Unsupported)) {
             return TestResult::Fail("DCN35 used the DCN314 firmware path");
         }
+        // DCN 3.2.0 / 3.2.1 are admitted past the version gate (the revoked
+        // authority is what refuses them here, not the version): the blob
+        // names are `dcn_3_2_0_dmcub.bin` / `dcn_3_2_1_dmcub.bin`.
+        for revision in [0, 1] {
+            gpu.ip_blocks[0].minor = 2;
+            gpu.ip_blocks[0].revision = revision;
+            if !matches!(
+                Firmware::open(&gpu, &read),
+                Err(FirmwareError::Registry(
+                    narf_firmware::FirmwareError::AuthorityRevoked
+                ))
+            ) {
+                return TestResult::Fail("DCN 3.2 firmware path refused at the gate");
+            }
+            let prepared = match firmware.prepare_from_gpu(&gpu) {
+                Ok(prepared) => prepared,
+                Err(_) => return TestResult::Fail("DCN 3.2 image preparation refused"),
+            };
+            let mut staged = alloc::vec![0; prepared.layout().size() as usize];
+            if prepared.stage(&mut staged).is_err() {
+                return TestResult::Fail("DCN 3.2 image staging refused");
+            }
+        }
         TestResult::Pass
     }
     kernel_test_in!(
@@ -720,22 +772,26 @@ pub(crate) mod tests {
 
     /// DCN 3.1.4 serves four DPIAs (`dcn314_resource.c`); DCN 3.1.5 serves none
     /// (`dcn315_resource.c` sets no `usb4_dpia_count`), so the sink scan sends
-    /// Raphael's firmware no DPIA command.
+    /// Raphael's firmware no DPIA command. DCN 3.2.0 / 3.2.1 serve none
+    /// either (`dcn32_resource.c` / `dcn321_resource.c` set none).
     fn dmub_dpia_count_follows_the_dcn() -> TestResult {
         use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
-        let ip = |revision| IpBlock {
+        let ip = |minor, revision| IpBlock {
             hw_id: HW_ID_DCN,
             instance: 0,
             major: 3,
-            minor: 1,
+            minor,
             revision,
             sub_revision: 0,
             variant: 0,
             base_addrs: [0; MAX_BASE_ADDRS],
             num_bases: 3,
         };
-        if dpia_count(&ip(4)) != 4 || dpia_count(&ip(5)) != 0 {
+        if dpia_count(&ip(1, 4)) != 4 || dpia_count(&ip(1, 5)) != 0 {
             return TestResult::Fail("DPIA count per DCN");
+        }
+        if dpia_count(&ip(2, 0)) != 0 || dpia_count(&ip(2, 1)) != 0 {
+            return TestResult::Fail("DCN 3.2 must serve no DPIA");
         }
         TestResult::Pass
     }

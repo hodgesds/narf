@@ -156,7 +156,11 @@ impl Routing {
             Self::Legacy(Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 | Profile::Dcn315) => {
                 (DIG_BE_EN_CNTL - 1, DIG_STRIDE)
             }
-            Self::Legacy(Profile::Dcn314) => (DIG_BE_EN_CNTL, DIG_STRIDE),
+            // dcn_3_2_0_offset.h / dcn_3_2_1_offset.h agree with 3.1.4:
+            // regDIG0_DIG_BE_EN_CNTL 0x20b2, DIG1 0x21b2 (stride 0x100).
+            Self::Legacy(Profile::Dcn314 | Profile::Dcn320 | Profile::Dcn321) => {
+                (DIG_BE_EN_CNTL, DIG_STRIDE)
+            }
             // dcn_4_1_0_offset.h DIG0..3_DIG_BE_EN_CNTL.
             Self::Navi48 => (0x20bd, 0x124), // linux: n/a (DCN 4.0.1 path)
         }

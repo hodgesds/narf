@@ -57,7 +57,9 @@ use alloc::vec::Vec;
 
 use crate::amdgpu::Family;
 use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayPath};
-use crate::amdgpu_dcn::{dcn20_modeset_sequence, timing_for_mode, DcnWrite, ModeTiming};
+use crate::amdgpu_dcn::{
+    dcn20_modeset_sequence, dcn32_modeset_sequence, timing_for_mode, DcnWrite, ModeTiming,
+};
 
 // ── Connector ────────────────────────────────────────────────────
 
@@ -452,11 +454,22 @@ pub fn plan_modeset(
     let crtc_idx = conn.bound_crtc.ok_or(KmsError::NoCrtc)?;
     let timing = timing_for_mode(width, height, refresh_hz).ok_or(KmsError::UnsupportedMode)?;
     let writes = match family {
-        // Navi3 (Navi31, DCN 3.2) has no DCN32 modeset sequence yet:
-        // fail closed like Navi4 until the DCN 3.2 lane lands
-        // (RDNA3 audit B3) instead of applying the legacy DCN 2.0
-        // sequence to the wrong OTG registers.
-        Family::Navi3 | Family::Navi4 => return Err(KmsError::UnsupportedMode),
+        // Navi4 has no legacy modeset path: its display goes through
+        // the native Navi48 platform path only.
+        Family::Navi4 => return Err(KmsError::UnsupportedMode),
+        // Navi3 (Navi31/32 DCN 3.2.0, Navi33 DCN 3.2.1) runs the DCN 3.2
+        // sequence on the bound CRTC's pipe. A pipe at or above 4 —
+        // reachable only while the KMS pool still mints the old
+        // six-pipe assumption (lane 0 owns that fix) — fails closed
+        // here instead of programming another pipe's registers.
+        Family::Navi3 => {
+            let pipe = kms
+                .crtcs
+                .get(crtc_idx as usize)
+                .map_or(crtc_idx, |c| c.pipe);
+            dcn32_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base, pipe)
+                .ok_or(KmsError::UnsupportedMode)?
+        }
         // Phoenix is DCN **3.1.4**, not 3.5 — and the two differ exactly
         // where it matters: `regOTG0_OTG_V_BLANK_START_END` is 0x1b36 on
         // 3.1.4 and 0x1b38 on 3.5, `V_SYNC_A` 0x1b37 against 0x1b39, and
