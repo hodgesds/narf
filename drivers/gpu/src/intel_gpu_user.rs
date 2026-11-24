@@ -219,6 +219,16 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     ) -> FsFuture<'_, Arc<CompletionFence>> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
+    /// Zero an integrated Xe2/Xe3 object's flat-CCS metadata before its
+    /// first compressed binding in `epoch`. `None` when the device has no
+    /// flat CCS to clear.
+    fn clear_system_ccs(
+        &self,
+        _object: Arc<crate::intel_gpu_gem::GemObject>,
+        _epoch: u64,
+    ) -> FsFuture<'_, Option<Arc<CompletionFence>>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     /// Revalidate terminal initialization and current whole-DPA ownership at
     /// actual handle publication. Only opted-in smallbar callers use this;
     /// unsupported backends cannot publish by returning a cached epoch.

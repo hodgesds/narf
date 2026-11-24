@@ -3151,9 +3151,9 @@ autosuspend off.
 KMS owner. Probe then moves the console onto an owned surface in the Pipe-A
 console window (the MTL probe pattern, `lnl_console_handoff`). Its GGTT
 entries carry the PAT index of the firmware's own lit surface PTE
-(`xelpg_ggtt_pte_flags` bits 52/53, used on Xe2), which must be 0: the GT
-owner never redefines Xe2 PAT0, so the console keeps the firmware's scanout
-policy. Any other index or a failed allocation keeps the firmware surface
+(`xelpg_ggtt_pte_flags` bits 52/53, used on Xe2), which must be 0. Once the
+GT owner programs `xe2_pat_table`, PAT0 is Linux's (L4 uncached,
+non-coherent), which display fetches treat as the firmware's. Any other index or a failed allocation keeps the firmware surface
 and installs no KMS owner. `intel_gpu_kms::install` admits Lunar Lake only
 after reading `GMD_ID_DISPLAY` 20.00. GEM flips then map with
 `intel_gpu_scanout_io::display_pte`: `PteFormat::Xe2` and xe_pat.c's display
@@ -3527,7 +3527,10 @@ policies use MTL PAT3, DG2 PAT0 and BMG PAT2; BMG uses the Xe2 five-bit leaf
 encoding and source five-level root. MTL also installs UC PAT2 for
 non-leaf PPGTT reads and Linux's non-coherent WT PAT1 (Mesa's scanout and
 write-combining index). DG2 installs the rest of Linux's Xe-LP table (PAT1
-WC, PAT2 WT, PAT3 UC). MTL display PAT0 is preserved.
+WC, PAT2 WT, PAT3 UC). MTL installs PAT0 (WB, non-coherent) as Linux does,
+under the inherited display's PTEs. Xe2 and Xe3 install all of
+`xe2_pat_table` / `xe3_lpg_pat_table` (Battlemage's first 28 entries,
+Wa_16023588340), `PAT_ATS` and, on Battlemage, `PAT_PTA`.
 MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
 
 `intel_gpu_gt_runtime` starts a persistent per-function owner from Stage::Late,
@@ -3958,9 +3961,12 @@ are WC, kernel copies end with SFENCE and device publication needs no
 CLFLUSH. Pages are restored write-back only after the last mapping, VM
 binding and job drop the object. SCANOUT is admitted on the iGPU and is
 EINVAL with WB caching. XE_COH_NONE binds (MTL PAT1 WT, PAT2 UC; Gen12 and
-DG2 PAT1 WC, PAT2 WT, PAT3 UC) are EINVAL for WB objects and USERPTR. Deviation: PAT0, also XE_COH_NONE in Linux,
-stays refused because its definition is left to firmware for the inherited
-display. dGPU system memory stays WB as in Linux. aarch64 refuses WC
+DG2 PAT1 WC, PAT2 WT, PAT3 UC; MTL PAT0; every non-coherent Xe2/Xe3 entry)
+are EINVAL for objects created with WB CPU caching and for USERPTR;
+discrete WC objects and VRAM qualify (`bo->cpu_caching`). Compressed
+Xe2/Xe3 indices are EINVAL for USERPTR and NO_COMPRESSION objects; reserved
+indices and those past `n_entries` are EINVAL for every map, NULL included.
+dGPU system memory stays WB as in Linux. aarch64 refuses WC
 creation (`NotImplemented`): the kernel's linear map cannot be retyped.
 
 Hung user jobs are recovered per context (MIT Linux

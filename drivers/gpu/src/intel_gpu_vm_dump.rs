@@ -138,7 +138,7 @@ impl<'a> VmCapture<'a> {
                             .is_some_and(|end| end <= object.size());
                     let coherent =
                         crate::intel_gpu_xe_vm::pat_allowed(self.platform, u16::from(mapping.pat))
-                            || (object.is_wc()
+                            || (!object.cpu_caching_wb()
                                 && crate::intel_gpu_xe_vm::pat_noncoherent(
                                     self.platform,
                                     u16::from(mapping.pat),

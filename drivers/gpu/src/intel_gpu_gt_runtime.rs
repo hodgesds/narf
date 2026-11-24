@@ -569,6 +569,41 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 .attach_log_stream(session, epoch, narf_time::monotonic_ns(), digest)
         })
     }
+    fn clear_system_ccs(
+        &self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+    ) -> narf_filesystem::FsFuture<'_, Option<Arc<CompletionFence>>> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let awake = Awake::take(&owner).await?;
+            let mut state = owner.lock_running().await;
+            if state.phase != Phase::Running
+                || epoch == 0
+                || owner.user_epoch.load(Ordering::Acquire) != epoch
+                || owner.suspended.load(Ordering::Acquire)
+            {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            let gt = state
+                .gt
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let fence = gt
+                .clear_system_ccs(narf_time::monotonic_ns(), object, epoch)
+                .map_err(|error| match error {
+                    GtError::Busy => narf_filesystem::FsError::WouldBlock,
+                    _ => narf_filesystem::FsError::NoDevice,
+                })?;
+            if let Some(fence) = &fence {
+                awake.until(fence.clone());
+            }
+            Ok(fence)
+        })
+    }
     fn clear_vram(
         &self,
         object: Arc<crate::intel_gpu_gem::GemObject>,

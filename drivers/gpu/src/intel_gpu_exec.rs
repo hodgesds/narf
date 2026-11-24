@@ -23,7 +23,7 @@ const PAGE: u64 = 4096;
 
 #[path = "intel_gpu_vram_clear.rs"]
 pub(crate) mod vram_clear;
-pub(crate) use vram_clear::{prepare_smallbar_clear, prepare_vram_clear};
+pub(crate) use vram_clear::{prepare_smallbar_clear, prepare_system_ccs_clear, prepare_vram_clear};
 
 #[path = "intel_gpu_copy.rs"]
 pub mod copy;

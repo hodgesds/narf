@@ -118,6 +118,16 @@ pub struct GemObject {
     wc: Option<narf_memory::pageattr::WcPages>,
     /// XE_BO_FLAG_SCANOUT: created for scanout, or made a framebuffer.
     scanout: AtomicBool,
+    /// DRM_XE_GEM_CPU_CACHING_WC on a discrete part, whose system pages stay
+    /// write-back because PCIe snoops (xe_ttm_tt_create); the object still
+    /// counts as WC for XE_COH_NONE binds, as `bo->cpu_caching` does.
+    wc_caching: AtomicBool,
+    /// DRM_XE_GEM_CREATE_FLAG_NO_COMPRESSION: no compressed PAT binds.
+    no_compression: AtomicBool,
+    /// Integrated Xe2/Xe3: the flat-CCS metadata behind these pages has been
+    /// zeroed (`bo->ccs_cleared`). Held across the clear so concurrent
+    /// first compressed binds run it once.
+    system_ccs: Mutex<bool>,
     /// Published VM bindings naming this object (Linux xe_bo_is_vm_bound).
     vm_binds: core::sync::atomic::AtomicU32,
     size: u64,
@@ -212,6 +222,9 @@ impl GemObject {
             ccs: AtomicU8::new(0),
             wc: None,
             scanout: AtomicBool::new(false),
+            wc_caching: AtomicBool::new(false),
+            no_compression: AtomicBool::new(false),
+            system_ccs: Mutex::new(false),
             vm_binds: core::sync::atomic::AtomicU32::new(0),
             size,
             offset,
@@ -287,6 +300,33 @@ impl GemObject {
 
     pub(crate) fn is_wc(&self) -> bool {
         self.wc.is_some()
+    }
+
+    /// Created with DRM_XE_GEM_CPU_CACHING_WC on a discrete part.
+    pub(crate) fn mark_wc_caching(&self) {
+        self.wc_caching.store(true, Ordering::Release);
+    }
+
+    /// `bo->cpu_caching == DRM_XE_GEM_CPU_CACHING_WB`: CPU writes may sit in
+    /// caches the GPU only sees through a snooping PAT. WC system pages, VRAM
+    /// and discrete WC objects are not.
+    pub(crate) fn cpu_caching_wb(&self) -> bool {
+        !(self.is_wc() || self.is_vram() || self.wc_caching.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn mark_no_compression(&self) {
+        self.no_compression.store(true, Ordering::Release);
+    }
+
+    /// DRM_XE_GEM_CREATE_FLAG_NO_COMPRESSION.
+    pub(crate) fn no_compression(&self) -> bool {
+        self.no_compression.load(Ordering::Acquire)
+    }
+
+    /// Whether this object's flat-CCS metadata has been zeroed; see
+    /// [`crate::intel_gpu_exec::prepare_system_ccs_clear`].
+    pub(crate) fn system_ccs(&self) -> &Mutex<bool> {
+        &self.system_ccs
     }
 
     /// DRM_XE_GEM_CREATE_FLAG_SCANOUT, or made a framebuffer since.

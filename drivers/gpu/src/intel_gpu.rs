@@ -584,8 +584,8 @@ fn lnl_console_handoff(dev: &mut IntelGpu, mode: &crate::intel_gpu_modeset::Mode
 /// The Panther Lake display-30 console handoff: the Lunar Lake pattern
 /// (`lnl_console_handoff`) through the display-30 view, whose reads take
 /// Wa_15015404425's flush only when `flush` (`intel_gpu_xe3lpd::
-/// wa_15015404425`). PTL's GT owner programs the Xe2-format GGTT PTEs with
-/// `xe3_lpg_pat_table`, whose PAT0 it never redefines either.
+/// wa_15015404425`). PTL's GT owner programs `xe3_lpg_pat_table`, whose
+/// PAT0 matches Xe2's.
 fn ptl_console_handoff(
     dev: &mut IntelGpu,
     mode: &crate::intel_gpu_modeset::Mode,

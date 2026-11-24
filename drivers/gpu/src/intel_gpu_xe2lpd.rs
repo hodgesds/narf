@@ -809,10 +809,10 @@ pub(crate) const fn firmware_pte_pat(low: u32, high: u32) -> Option<u8> {
 }
 
 /// The PAT index the display-20 console is mapped with: the firmware's own
-/// lit surface's, which must be 0. NARF's GT owner never redefines Xe2 PAT0
-/// (it programs PAT1–5 and PAT7), so the console keeps exactly the
-/// firmware's scanout cache policy; GEM flips use PAT3 only after the GT
-/// owner programmed it.
+/// lit surface's, which must be 0. The GT owner later programs Linux's PAT0
+/// (`xe2_pat_table`: L4 uncached, non-coherent) beneath it, as Linux does
+/// beneath an inherited plane; GEM flips use PAT3 only after the GT owner
+/// programmed it.
 pub(crate) const fn console_pat(firmware: Option<u8>) -> Option<u8> {
     match firmware {
         Some(0) => Some(0),
