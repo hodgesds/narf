@@ -1343,6 +1343,25 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     }
 
     let scanout_mode = dev.current_mode();
+    // A Meteor/Arrow Lake board with no owned panel (a desktop, or a panel
+    // takeover that failed) still scanning the GOP framebuffer: retain it
+    // for fixed-mode KMS, as an external-only Gen12 board does, and keep
+    // hotplug modesets and system suspend off the inherited pipe.
+    if firmware_scanout.is_none()
+        && scanout_mode.is_none()
+        && dev.chip.generation == Generation::MeteorLake
+    {
+        firmware_scanout = crate::intel_gpu_vram::boot_framebuffer().and_then(|fb| {
+            firmware_display::scanout(&dev.mode_window(), dev.gmadr.phys.raw(), dev.gmadr.len, fb)
+        });
+        if firmware_scanout.is_some() {
+            dev.firmware_display = true;
+            log_probe(
+                "no owned panel, retaining the active firmware framebuffer for fixed-mode KMS",
+                &device,
+            );
+        }
+    }
     let kms_console = scanout_mode.clone();
     let kms_generation = dev.chip.generation;
     let platform = crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device);
@@ -1352,6 +1371,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // live firmware plane can refer to an unowned GGTT entry. Keep this
     // separate from LNL/PTL, whose headless profile requires a driver FLR.
     let firmware_handoff = firmware_scanout.and_then(|fb| {
+        if dev.chip.generation == Generation::MeteorLake {
+            return FirmwareRenderHandoff::discover_display14(
+                &dev.mode_window(),
+                dev.gmadr.phys.raw(),
+                dev.gmadr.len,
+                fb,
+            );
+        }
         let family = crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip)?;
         FirmwareRenderHandoff::discover(
             family,

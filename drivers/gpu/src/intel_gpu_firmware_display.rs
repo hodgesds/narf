@@ -100,6 +100,27 @@ impl FirmwareRenderHandoff {
             TigerLake => 6,
             Dg1 => return None,
         };
+        Self::with_sprites(sprites, io, aperture, len, fb)
+    }
+
+    /// The Meteor/Arrow Lake (display 14) desktop handoff: the same skl
+    /// universal-plane proof with display 14's four sprites per pipe.
+    pub(super) fn discover_display14(
+        io: &impl MmioWindow,
+        aperture: u64,
+        len: u64,
+        fb: GenericFb,
+    ) -> Option<Self> {
+        Self::with_sprites(4, io, aperture, len, fb)
+    }
+
+    fn with_sprites(
+        sprites: u64,
+        io: &impl MmioWindow,
+        aperture: u64,
+        len: u64,
+        fb: GenericFb,
+    ) -> Option<Self> {
         const {
             assert!(
                 crate::intel_gpu_gtt::SCANOUT_GTT_OFFSET_PIPE_A
@@ -307,6 +328,8 @@ mod tests {
             assert!(FirmwareRenderHandoff::discover(family, &io, aperture, size, fb).is_some());
         }
         assert!(FirmwareRenderHandoff::discover(Dg1, &io, aperture, size, fb).is_none());
+        // Meteor/Arrow Lake desktops: display 14's universal planes.
+        assert!(FirmwareRenderHandoff::discover_display14(&io, aperture, size, fb).is_some());
         let handoff = FirmwareRenderHandoff::discover(AlderLakeP, &io, aperture, size, fb).unwrap();
         let pipe = Pipe::B.base();
         let mut frame = None;
