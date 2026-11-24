@@ -290,6 +290,20 @@ fn smoke_display30_gt_preserves_wildcat_panel_and_checks_only_implemented_pipes(
         Receipt::admit_display_ptl(device, bar, &m, || true).err(),
         Some(Error::Unsupported),
     );
+    // Nova Lake-S display 35 kept on its firmware primary: the same
+    // display-preserving receipt through its own admission only. Its Pipe D
+    // exists and reads back, unlike Wildcat Lake's above.
+    for reg in [0x73008, 0x73080, 0x73180, 0x73d08, 0x5fc78, 0x432c8] {
+        m.set(reg, 0);
+    }
+    m.set(0x45250, 1); // Only Pipe A's DMC runs, under the lit primary.
+    let receipt = Receipt::admit_display_nvl(device, bar, &m, || true).unwrap();
+    assert!(receipt.display_preserving() && receipt.matches(device, bar, &m));
+    let (ptl, ptl_bar) = identity(0xb080);
+    assert_eq!(
+        Receipt::admit_display_nvl(ptl, ptl_bar, &m, || true).err(),
+        Some(Error::Unsupported),
+    );
     assert!(m.writes().is_empty());
     TestResult::Pass
 }

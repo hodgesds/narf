@@ -790,6 +790,33 @@ const fn display_fetchers_stopped_values(pipeconf: [u32; 4]) -> bool {
 mod firmware_display;
 pub(crate) use firmware_display::FirmwareRenderHandoff;
 
+/// Fixed-mode KMS over a retained firmware framebuffer, for owners outside
+/// this module (the Nova Lake-S display-35 route).
+pub(crate) fn firmware_fixed_mode_card(
+    fb: narf_graphics_driver::generic::GenericFb,
+) -> crate::drm::card::Card {
+    firmware_display::fixed_mode_card(fb)
+}
+
+/// The boot framebuffer when it is the Nova Lake-S firmware primary: the
+/// same size and pitch at 32 bpp in an XRGB/ARGB layout, with the primary's
+/// GGTT surface wholly below the GT arena, which can then never alias it.
+fn nvl_boot_framebuffer(
+    primary: &crate::intel_gpu_xe3plpd::FirmwarePrimary,
+) -> Option<narf_graphics_driver::generic::GenericFb> {
+    use crate::drm::card::PixelFormat;
+    let fb = crate::intel_gpu_vram::boot_framebuffer()?;
+    let g = primary.geometry;
+    let end = u64::from(primary.gtt_offset) + u64::from(g.pitch) * u64::from(g.height);
+    (matches!(
+        primary.format,
+        PixelFormat::Xrgb8888 | PixelFormat::Argb8888
+    ) && fb.bpp == 32
+        && (fb.width, fb.height, fb.pitch) == (g.width, g.height, g.pitch)
+        && end <= u64::from(crate::intel_gpu_rcs::GGTT_ARENA_BASE))
+    .then_some(fb)
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if device.id.vendor != INTEL_VENDOR {
         return Err(narf_bus::ProbeError::NotForThisDriver);
@@ -807,13 +834,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
         return Err(narf_bus::ProbeError::NotForThisDriver);
     };
-    // Nova's explicit firmware-observation route terminates here even if
-    // the live plane cannot be reconstructed. PCI parking and the headless
-    // GT's driver FLR would destroy state this option exists to observe.
+    // Nova's explicit firmware route terminates here even if the live plane
+    // cannot be reconstructed: PCI parking and the headless GT's driver FLR
+    // would destroy the state this option exists to keep. A primary that is
+    // the boot framebuffer becomes fixed-mode KMS beside a display-preserving
+    // GT; anything else is only observed.
     if let Some(result) = crate::intel_gpu_lt_phy::probe_firmware_primary(platform, &device, &cap) {
         use core::fmt::Write as _;
         match result {
             Ok(primary) => {
+                if let Some(fb) = nvl_boot_framebuffer(&primary) {
+                    log_probe(
+                        "display 35: retaining the firmware primary for fixed-mode KMS",
+                        &device,
+                    );
+                    return crate::intel_gpu_gt_runtime::probe_nvl_display(device, cap, fb);
+                }
                 let _ = writeln!(
                     narf_console::Writer,
                     "intel-gpu {:04x}:{:04x} firmware Pipe A {}x{} {:?}, pitch {} bytes, GGTT {:#x}",

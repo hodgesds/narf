@@ -197,6 +197,10 @@ enum DisplayOwner {
     LunarLake,
     PantherLake,
     Firmware(crate::intel_gpu::FirmwareRenderHandoff),
+    /// Nova Lake-S display 35 still scanning its firmware primary
+    /// (`narf.intel.nvl_display`): fixed-mode KMS, and the GT starts
+    /// display-preserving beside it, never with the headless driver FLR.
+    NovaLake,
 }
 
 struct Pending {
@@ -215,14 +219,16 @@ struct Pending {
 
 impl Pending {
     fn allows_system_suspend(&self) -> bool {
-        !matches!(self.display, DisplayOwner::Firmware(_))
-            && system_suspend_admitted(
-                self.smallbar,
-                matches!(
-                    self.display,
-                    DisplayOwner::LunarLake | DisplayOwner::PantherLake
-                ),
-            )
+        !matches!(
+            self.display,
+            DisplayOwner::Firmware(_) | DisplayOwner::NovaLake
+        ) && system_suspend_admitted(
+            self.smallbar,
+            matches!(
+                self.display,
+                DisplayOwner::LunarLake | DisplayOwner::PantherLake
+            ),
+        )
     }
 }
 
@@ -1065,8 +1071,10 @@ impl crate::intel_gpu_user::UserBackend for Backend {
         // observed its two firmware frames. Advertise Mesa submission on
         // that route only after the live engine has passed the normal probes.
         self.owner.upgrade().is_some_and(|owner| {
-            !matches!(owner.pending.display, DisplayOwner::Firmware(_))
-                || self.epoch.load(Ordering::Acquire) != 0
+            !matches!(
+                owner.pending.display,
+                DisplayOwner::Firmware(_) | DisplayOwner::NovaLake
+            ) || self.epoch.load(Ordering::Acquire) != 0
         })
     }
     fn display_preserving(&self) -> bool {
@@ -2105,6 +2113,21 @@ impl Owner {
                 return Err(RuntimeError::Configuration);
             }
             let receipt = crate::intel_gpu_gt::lnl::Receipt::admit_display_ptl(
+                p.device,
+                p.bar,
+                &mmio,
+                || validate_pci(p, &mmio).is_ok(),
+            )
+            .map_err(RuntimeError::Takeover)?;
+            SharedArena::new(
+                GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
+                    .map_err(|_| RuntimeError::State)?,
+            )
+        } else if matches!(p.display, DisplayOwner::NovaLake) {
+            // Nova Lake-S display 35 on its firmware primary: the
+            // display-preserving cold start (GT-only GuC and full reset, no
+            // driver FLR), admitted while only Pipe A's primary fetches.
+            let receipt = crate::intel_gpu_gt::lnl::Receipt::admit_display_nvl(
                 p.device,
                 p.bar,
                 &mmio,
@@ -3959,6 +3982,70 @@ fn seed_discrete_display_card(
 
 /// Arc cards bind to a GT-only device or discrete display (`DG2` / `BMG`).
 /// BAR0 and authority remain with the per-function startup service.
+/// The Nova Lake-S display-35 route (`narf.intel.nvl_display=1`) once the
+/// firmware primary matched the boot framebuffer `fb`: register fixed-mode
+/// KMS over it (the CPU copies each flip into it, as for an external-only
+/// Gen12 board) and install the display-preserving GT owner beside it.
+pub(crate) fn probe_nvl_display(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    fb: narf_graphics_driver::generic::GenericFb,
+) -> Result<(), narf_bus::ProbeError> {
+    if GtPlatform::from_pci(device.id.vendor, device.id.device) != Some(GtPlatform::NovaLakeS) {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    if PENDING.lock().iter().any(|p| p.device.addr == device.addr)
+        || OWNERS
+            .lock()
+            .iter()
+            .any(|o| o.pending.device.addr == device.addr)
+    {
+        return Ok(());
+    }
+    narf_bus::pci::set_command(
+        &cap,
+        &device,
+        narf_bus::pci::cmd::MEM_SPACE
+            | narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::INTX_DISABLE,
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // SAFETY: the PCI probe grants exclusive ownership of this function's BAR0.
+    let bar = unsafe { narf_bus::bar::map_bar(&device, 0) }
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let index = crate::drm_registry::count() as u32;
+    let card = Arc::new(IntelGpuCard::new(
+        alloc::format!("card{index}"),
+        device.id.vendor,
+        device.id.device,
+        device.id.subsystem_vendor,
+        device.id.subsystem_id,
+    ));
+    let assigned = crate::drm_registry::register_drm_card_with_state(
+        card.clone(),
+        crate::intel_gpu::firmware_fixed_mode_card(fb),
+    );
+    if !install_profile(
+        assigned,
+        card,
+        device,
+        cap,
+        bar,
+        None,
+        DisplayOwner::NovaLake,
+    ) {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name: alloc::string::String::from("intel-gpu"),
+        kind: narf_drivers::BoundKind::Graphics,
+        pci_vid: Some(device.id.vendor),
+        pci_did: Some(device.id.device),
+        domain: narf_drivers::BoundKind::Graphics.default_domain(),
+    });
+    Ok(())
+}
+
 pub(crate) fn probe_discrete(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,

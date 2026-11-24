@@ -168,6 +168,17 @@ impl Receipt {
         )
     }
 
+    /// Keep Nova Lake-S display 35.00 scanning the firmware primary while
+    /// the GT starts: the same proof, with the firmware owning Pipe A.
+    pub(crate) fn admit_display_nvl(
+        device: narf_bus::BusDevice,
+        bar: narf_bus::bar::MmioRegion,
+        mmio: &impl MmioWindow,
+        current: impl FnOnce() -> bool,
+    ) -> Result<Self, Error> {
+        Self::admit_route(device, bar, mmio, current, &[DisplayIdentity::NovaLakeS])
+    }
+
     fn admit_route(
         device: narf_bus::BusDevice,
         bar: narf_bus::bar::MmioRegion,
