@@ -1,5 +1,5 @@
 use super::*;
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// The Phoenix GC table: 1 SE, 2 SA/SE, 6 CU/SA (3 WGPs), 2 RB/SE.

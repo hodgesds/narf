@@ -128,7 +128,8 @@ impl<I: SmuMmio> Engine<I> {
     /// mistake that for a response, so liveness is checked before every
     /// send, mirroring Raphael's poll-site check.
     fn check_alive(&mut self) -> Result<(), Error> {
-        let resp = self.access(|io| io.read(self.mp1_base + MP1_C2PMSG_RESP_REL))?;
+        let mp1_base = self.mp1_base;
+        let resp = self.access(|io| io.read(mp1_base + MP1_C2PMSG_RESP_REL))?;
         if resp == u32::MAX {
             return Err(Error::DeviceGone);
         }
