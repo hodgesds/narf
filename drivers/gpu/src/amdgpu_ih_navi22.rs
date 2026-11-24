@@ -447,6 +447,35 @@ impl Layout {
             )?),
         })
     }
+    /// Raphael: GC 10.3.6 with `navi10_ih` on OSSSYS 5.0.x/5.2.x, NBIO 7.2 and
+    /// HDP 5.2.1. NBIO 7.2 keeps `INTERRUPT_CNTL`/`2` and the HDP remap at
+    /// their NBIO 2.3 offsets on segment 2; only the doorbell range moves.
+    fn resolve_raphael(gpu: &AmdGpu) -> Result<Self, Error> {
+        if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did)
+            != Some(&crate::amdgpu_rdna2::RAPHAEL)
+            || gpu.regs.len < 0x7f004
+        {
+            return Err(Error::Unsupported);
+        }
+        let resolve = |id, versions: &[(u8, u8, u8)], index, last| {
+            bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
+        };
+        resolve(ip::HW_ID_GC, &[(10, 3, 6)], 0, 0)?;
+        resolve(ip::HW_ID_HDP, &[(5, 2, 1)], 0, 0)?;
+        let banks = crate::amdgpu_nbio_v7_2::Banks::resolve(gpu).ok_or(Error::Unsupported)?;
+        Ok(Self {
+            oss: resolve(
+                ip::HW_ID_OSSSYS,
+                crate::amdgpu_rdna2::NAVI10_IH_OSSSYS_VERSIONS,
+                0,
+                IH_CNTL2,
+            )?,
+            nbio: banks.bif,
+            hdp: None,
+            nbio_v7_2: Some(banks),
+            self_wptr_update: self_wptr_update(gpu),
+        })
+    }
     /// Rembrandt: GC 10.3.3 with `navi10_ih` on OSSSYS 5.0.x/5.2.x, NBIO 7.2 and
     /// HDP 5.2.1. NBIO 7.2 keeps `INTERRUPT_CNTL`/`2` and the HDP remap at
     /// their NBIO 2.3 offsets on segment 2; only the doorbell range moves.

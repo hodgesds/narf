@@ -151,11 +151,16 @@ impl Routing {
     }
     fn backend(self) -> (u64, u64) {
         match self {
-            // dcn_3_1_5_offset.h regDIG0_DIG_BE_EN_CNTL is 0x20b1, DCN30's
-            // offset, not DCN 3.1.4's 0x20b2; the stride is the same 0x100.
-            Self::Legacy(Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 | Profile::Dcn315) => {
-                (DIG_BE_EN_CNTL - 1, DIG_STRIDE)
-            }
+            // dcn_3_1_2_offset.h and dcn_3_1_5_offset.h regDIG0_DIG_BE_EN_CNTL
+            // is 0x20b1, DCN30's offset, not DCN 3.1.4's 0x20b2; the stride is
+            // the same 0x100.
+            Self::Legacy(
+                Profile::Navi22
+                | Profile::Dcn302
+                | Profile::Dcn303
+                | Profile::Dcn312
+                | Profile::Dcn315,
+            ) => (DIG_BE_EN_CNTL - 1, DIG_STRIDE),
             // dcn_3_2_0_offset.h / dcn_3_2_1_offset.h agree with 3.1.4:
             // regDIG0_DIG_BE_EN_CNTL 0x20b2, DIG1 0x21b2 (stride 0x100).
             Self::Legacy(Profile::Dcn314 | Profile::Dcn320 | Profile::Dcn321) => {

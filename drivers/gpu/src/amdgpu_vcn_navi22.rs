@@ -54,6 +54,8 @@ pub enum Error {
     Power(crate::amdgpu_smu_navi22::Error),
     /// SMU 13.0.5 (Raphael) refused or missed a VCN power message.
     Pmfw(crate::amdgpu_smu_raphael::Error),
+    /// SMU 13.0.1/13.0.3 (Rembrandt) refused or missed a VCN power message.
+    PmfwRembrandt(crate::amdgpu_smu_rembrandt::Error),
     /// The discovery harvest table could not be trusted.
     Harvest(ip::DiscoveryError),
     /// PSP refused the DPG register list (`amdgpu_vcn_psp_update_sram`).

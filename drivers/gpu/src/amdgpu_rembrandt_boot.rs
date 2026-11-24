@@ -1073,7 +1073,10 @@ impl vcn::idle::Control for MediaPower<'_> {
         if !instances[0] {
             return Ok(false);
         }
-        self.smu.set_vcn_power(on).await.map_err(vcn::Error::Pmfw)?;
+        self.smu
+            .set_vcn_power(on)
+            .await
+            .map_err(vcn::Error::PmfwRembrandt)?;
         Ok(true)
     }
 }
