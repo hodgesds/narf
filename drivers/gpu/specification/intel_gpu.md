@@ -435,9 +435,13 @@ to HuC. The 256-byte GuC signature goes through the scratch registers
 on Gen9 exactly as on Gen11/Gen12 (Linux `guc_xfer_rsa` selects on
 size, with no generation gate), and the Gen9-only `guc_prepare_xfer`
 writes (DOP clock gating, 5 us RC6 hold) run ahead of the DMA upload.
-The CML rev>=5 split stays a named remainder — the driver does not
-model PCI revisions yet, so all Comet Lake takes the KBL blob until a
-revision input lands. Gen9 shares the Gen12 BAR0/GTT partitioning
+The CML rev>=5 split follows the PCI revision ID, which the GT runtime's
+`validate_pci` already reads at config offset 0x08: `GtPlatform::
+guc_for_revision` and `intel_gpu_huc::firmware_name_for_revision` take
+the `cml_*` blobs at revision 5 and above, as `__uc_fw_auto_select`
+takes the first `INTEL_REVID` row the device reaches. The revision stays
+out of `GtPlatform` itself, because GT, render and scheduler objects
+compare their platforms for equality. Gen9 shares the Gen12 BAR0/GTT partitioning
 (Gen8+ 16 MiB split), so its region table carries the verified
 Gen12 contents; it has a 39-bit DMA mask (`i915_pci.c`
 GEN9_FEATURES `.dma_mask_size = 39`) and the Gen9 GT forcewake
@@ -1989,14 +1993,13 @@ section, it does not re-litigate scope.
     modeset that claims power states without it is
     incomplete; if Daniel overrules to best-effort, the
     Gen9 DMC lane records it the Gen11 way instead.
-  - Q6 CML revision split: REMAINDER. CML rev ≥ 5 takes
-    the `cml_*` blobs, rev < 5 the KBL blobs
-    (`intel_uc_fw.c:106-107,127-128`), but the driver
-    does not model steppings/revisions yet. DEFAULT:
-    all CML takes KBL blobs until a rev≥5 part shows
-    up. Whether the revision becomes a probe-read PCI
-    revision ID, a build-time choice, or stays deferred
-    is the open question.
+  - Q6 CML revision split: RESOLVED (Daniel: read the
+    PCI revision ID). CML rev ≥ 5 takes the `cml_*`
+    blobs, rev < 5 the KBL blobs
+    (`intel_uc_fw.c:106-107,127-128`); the GT runtime
+    passes the probe-read revision to the GuC and HuC
+    opens (`open_for_revision`). Silicon untested: no
+    rev ≥ 5 part has booted.
   - Q7 display-vs-headless first: REMAINDER. Lanes 3
     and 4 are independent, so either order works; the
     answer sets which lane lands first, not the design.

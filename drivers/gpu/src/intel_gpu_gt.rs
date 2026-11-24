@@ -204,15 +204,22 @@ pub enum Gen11Platform {
 /// (`gt/uc/intel_uc_fw.c`, Linux 7.4-rc2
 /// `INTEL_GUC_FIRMWARE_DEFS`). The sub-platform is what selects
 /// the file, so it lives here — the same reason `Gen11Platform`
-/// exists for the Gen11 family. The driver does not model PCI
-/// revisions yet, so all Comet Lake takes the KBL blob until a
-/// revision input lands (Lane 7 remainder).
+/// exists for the Gen11 family. The Comet Lake revision split is
+/// not a sub-platform: it is the PCI revision ID, which
+/// [`GtPlatform::guc_for_revision`] and
+/// `intel_gpu_huc::firmware_name_for_revision` take, as Linux's
+/// firmware tables key on `INTEL_REVID`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Gen9Platform {
     Skylake,
     KabyLake,
     CometLake,
 }
+
+/// The first Comet Lake PCI revision that takes the `cml_*` GuC and HuC
+/// blobs; earlier revisions take Kaby Lake's (`gt/uc/intel_uc_fw.c`
+/// `INTEL_GUC_FIRMWARE_DEFS` / `INTEL_HUC_FIRMWARE_DEFS`).
+pub const CML_FIRMWARE_REVISION: u8 = 5;
 
 pub(crate) use crate::intel_gpu::{BMG_IDS, DG1_IDS, DG2_IDS};
 
@@ -531,7 +538,26 @@ impl GtPlatform {
         }
     }
 
+    /// [`Self::guc`] for a device whose PCI revision ID is `revision`.
+    /// Only Comet Lake's firmware depends on it: Linux's
+    /// `INTEL_GUC_FIRMWARE_DEFS` lists `fw_def(COMETLAKE, 5, guc_mmp(cml,
+    /// 70, 1, 1))` before `fw_def(COMETLAKE, 0, guc_mmp(kbl, 70, 1, 1))`,
+    /// and `__uc_fw_auto_select` takes the first row whose revision the
+    /// device's `INTEL_REVID` reaches (`gt/uc/intel_uc_fw.c`).
+    pub const fn guc_for_revision(self, revision: u8) -> Option<GuCProfile> {
+        if matches!(self, Self::Gen9(Gen9Platform::CometLake)) && revision >= CML_FIRMWARE_REVISION
+        {
+            return Some(GuCProfile {
+                platform: self,
+                firmware: "i915/cml_guc_70.1.1.bin",
+                minimum_version: (70, 1, 1),
+            });
+        }
+        self.guc()
+    }
+
     /// Supported GuC boot ABI, not permission to publish a display or engine.
+    /// Comet Lake gets its revision-0 row here; see [`Self::guc_for_revision`].
     pub const fn guc(self) -> Option<GuCProfile> {
         let (firmware, minimum_version) = match self {
             Self::Gen12(Gen12Platform::Dg1) => ("i915/dg1_guc_70.bin", (70, 44, 1)),
@@ -562,8 +588,8 @@ impl GtPlatform {
             // fixture requires a qualified GT/GuC profile for every
             // census DID; GuC submission stays optional on Gen9
             // (execlists works without it) and the load itself is
-            // Lane 7's, as is the CML rev>=5 split (all CML takes
-            // the KBL blob until a revision input is modeled).
+            // Lane 7's. This arm is CML below revision 5; the
+            // rev>=5 blob is `guc_for_revision`'s.
             Self::Gen9(Gen9Platform::Skylake) => ("i915/skl_guc_70.1.1.bin", (70, 1, 1)),
             Self::Gen9(Gen9Platform::KabyLake | Gen9Platform::CometLake) => {
                 ("i915/kbl_guc_70.1.1.bin", (70, 1, 1))
@@ -944,5 +970,56 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_gt_identity_and_firmware_profiles
+    );
+
+    /// Q6: Comet Lake's GuC and HuC follow the PCI revision ID, as
+    /// Linux's `INTEL_REVID` rows do; no other platform's do.
+    fn smoke_cml_firmware_follows_revision() -> TestResult {
+        let cml = GtPlatform::Gen9(Gen9Platform::CometLake);
+        for (revision, guc, huc) in [
+            (0, "i915/kbl_guc_70.1.1.bin", "i915/kbl_huc_4.0.0.bin"),
+            (4, "i915/kbl_guc_70.1.1.bin", "i915/kbl_huc_4.0.0.bin"),
+            (5, "i915/cml_guc_70.1.1.bin", "i915/cml_huc_4.0.0.bin"),
+            (6, "i915/cml_guc_70.1.1.bin", "i915/cml_huc_4.0.0.bin"),
+        ] {
+            let Some(profile) = cml.guc_for_revision(revision) else {
+                return TestResult::Fail("CML lost its GuC profile");
+            };
+            if profile.firmware != guc
+                || profile.minimum_version != (70, 1, 1)
+                || profile.platform != cml
+            {
+                return TestResult::Fail("CML GuC blob does not follow the revision");
+            }
+            if crate::intel_gpu_huc::firmware_name_for_revision(cml, revision) != Some(huc) {
+                return TestResult::Fail("CML HuC blob does not follow the revision");
+            }
+        }
+        // The revision-less entry points are revision 0.
+        if cml.guc() != cml.guc_for_revision(0)
+            || crate::intel_gpu_huc::firmware_name(cml)
+                != crate::intel_gpu_huc::firmware_name_for_revision(cml, 0)
+        {
+            return TestResult::Fail("revision-less CML lookup is not revision 0");
+        }
+        // Kaby Lake (and the CFL/WHL that ride it) and Skylake ignore it.
+        for platform in [
+            GtPlatform::Gen9(Gen9Platform::KabyLake),
+            GtPlatform::Gen9(Gen9Platform::Skylake),
+            GtPlatform::Gen11(Gen11Platform::IceLake),
+            GtPlatform::Gen12(Gen12Platform::TigerLake),
+        ] {
+            if platform.guc_for_revision(9) != platform.guc()
+                || crate::intel_gpu_huc::firmware_name_for_revision(platform, 9)
+                    != crate::intel_gpu_huc::firmware_name(platform)
+            {
+                return TestResult::Fail("a non-CML blob moved with the revision");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_cml_firmware_follows_revision
     );
 }

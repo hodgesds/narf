@@ -121,19 +121,34 @@ impl GuCFirmware {
             // (SKL takes `skl_guc`, KBL/CFL/WHL take `kbl_guc`,
             // CML takes `kbl_guc` at rev < 5 and `cml_guc` at
             // rev >= 5); an ambiguous generation cannot choose.
-            // Use PCI identity (`open_for_platform` with the
-            // `Gen9` sub-platform).
+            // Use PCI identity (`open_for_revision` with the
+            // `Gen9` sub-platform and the PCI revision).
             Generation::Skylake => return Err(FirmwareError::Unsupported),
             _ => GtPlatform::Integrated(generation),
         };
         Self::open_for_platform(platform, authority)
     }
 
+    /// The GuC for `platform` at PCI revision 0: Comet Lake gets the Kaby
+    /// Lake blob. A probed device knows its revision; use
+    /// [`Self::open_for_revision`].
     pub fn open_for_platform(
         platform: GtPlatform,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
-        let profile = platform.guc().ok_or(FirmwareError::Unsupported)?;
+        Self::open_for_revision(platform, 0, authority)
+    }
+
+    /// The GuC for `platform` at PCI revision `revision`
+    /// ([`GtPlatform::guc_for_revision`]).
+    pub fn open_for_revision(
+        platform: GtPlatform,
+        revision: u8,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, FirmwareError> {
+        let profile = platform
+            .guc_for_revision(revision)
+            .ok_or(FirmwareError::Unsupported)?;
         authority
             .invoke(Open(profile))
             .map_err(|_| FirmwareError::Revoked)?

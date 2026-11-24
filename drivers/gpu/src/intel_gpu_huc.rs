@@ -15,9 +15,9 @@
 //!   Whiskey Lake / Comet Lake at rev < 5), both whole-file CSS like
 //!   Gen11's (`gt/uc/intel_uc_fw.c` `INTEL_HUC_FIRMWARE_DEFS`:
 //!   `huc_mmp(skl, 2, 0, 0)`, `huc_mmp(kbl, 4, 0, 0)`). Comet Lake at
-//!   rev >= 5 takes `i915/cml_huc_4.0.0.bin` (`huc_mmp(cml, 4, 0, 0)`);
-//!   all Comet Lake takes the KBL blob until a PCI-revision input is
-//!   modeled (the same default as the GuC side — see `Gen9Platform`).
+//!   rev >= 5 takes `i915/cml_huc_4.0.0.bin` (`huc_mmp(cml, 4, 0, 0)`):
+//!   the PCI revision ID chooses, as on the GuC side
+//!   (`firmware_name_for_revision`).
 //!   The 2.0.0/4.0.0 is the filename version, not an enforced minimum,
 //!   for the same no-version-matching reason as Gen11's 9.0.0.
 //! - MTL/Arrow: the standalone media GuC loads `i915/mtl_huc_gsc.bin`, whose
@@ -48,11 +48,11 @@ const ICL_NAME: &str = "i915/icl_huc_9.0.0.bin";
 const EHL_NAME: &str = "i915/ehl_huc_9.0.0.bin";
 /// Gen9 (Lane 7): Skylake takes the `skl_huc` blob, Kaby Lake / Coffee
 /// Lake / Whiskey Lake take the `kbl_huc` blob, and Comet Lake takes the
-/// `kbl_huc` blob too — at rev < 5. The rev >= 5 Comet Lake blob is
-/// `i915/cml_huc_4.0.0.bin` (`huc_mmp(cml, 4, 0, 0)`); it has no const
-/// here because no arm selects it yet (see `firmware_name`).
+/// `kbl_huc` blob too — at rev < 5. Comet Lake at rev >= 5 takes
+/// `i915/cml_huc_4.0.0.bin` (`huc_mmp(cml, 4, 0, 0)`).
 const SKL_NAME: &str = "i915/skl_huc_2.0.0.bin";
 const KBL_NAME: &str = "i915/kbl_huc_4.0.0.bin";
+const CML_NAME: &str = "i915/cml_huc_4.0.0.bin";
 const FIRST: u16 = 0x4000;
 const LAST: u16 = 0x7eff; // log sideband starts at7f00; SLPC at8000
 /// NARF bound on an acquired HuC file (Linux copies any size into its BO).
@@ -64,10 +64,8 @@ pub(crate) fn opted_in(args: narf_boot::args::KernelCmdline<'_>) -> bool {
 
 /// The primary-GT HuC blob name for `platform`, if the platform has a
 /// primary-GT HuC at all: exact TGL plus the Gen11 sub-platforms (Lane 7)
-/// and the Gen9 sub-platforms (Gen9 Lane 7). Comet Lake takes the KBL
-/// blob at every revision today — the rev >= 5 `cml_huc_4.0.0.bin` split
-/// needs a PCI-revision input the driver does not model yet (Q6), so it
-/// stays a named remainder, not a guessed arm.
+/// and the Gen9 sub-platforms (Gen9 Lane 7). This is the revision-0 name;
+/// Comet Lake's rev >= 5 blob is [`firmware_name_for_revision`]'s.
 /// The media GT has no entry here — its name is `gsc::HUC_FIRMWARE`.
 /// The returned name is the registry key `Firmware::open` loads; the
 /// version embedded in a `_mmp` filename is the file's own version, not a
@@ -80,6 +78,23 @@ pub(crate) fn firmware_name(platform: GtPlatform) -> Option<&'static str> {
         GtPlatform::Gen9(Gen9Platform::Skylake) => Some(SKL_NAME),
         GtPlatform::Gen9(Gen9Platform::KabyLake | Gen9Platform::CometLake) => Some(KBL_NAME),
         _ => None,
+    }
+}
+
+/// [`firmware_name`] for a device at PCI revision `revision`. i915's
+/// `INTEL_HUC_FIRMWARE_DEFS` lists `fw_def(COMETLAKE, 5, huc_mmp(cml, 4, 0,
+/// 0))` before the revision-0 Kaby Lake row.
+pub(crate) fn firmware_name_for_revision(
+    platform: GtPlatform,
+    revision: u8,
+) -> Option<&'static str> {
+    match platform {
+        GtPlatform::Gen9(Gen9Platform::CometLake)
+            if revision >= crate::intel_gpu_gt::CML_FIRMWARE_REVISION =>
+        {
+            Some(CML_NAME)
+        }
+        _ => firmware_name(platform),
     }
 }
 
@@ -240,7 +255,7 @@ pub(crate) struct Firmware {
     _digest: [u8; 32],
     _signer: Option<[u8; 32]>,
 }
-struct Open(GtPlatform);
+struct Open(GtPlatform, u8);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
     type Output = Result<Firmware, FirmwareError>;
     fn execute(
@@ -252,8 +267,9 @@ impl CapOp<narf_firmware::FirmwareRegistry, Read> for Open {
         // INTEL_HUC_FIRMWARE_DEFS adds ICELAKE huc_mmp(icl, 9, 0, 0) and
         // ELKHARTLAKE/JASPERLAKE huc_mmp(ehl, 9, 0, 0) (Lane 7), plus
         // SKYLAKE huc_mmp(skl, 2, 0, 0) and KABYLAKE/COFFEELAKE/
-        // COMETLAKE-rev<5 huc_mmp(kbl, 4, 0, 0) (Gen9 Lane 7).
-        let name = firmware_name(self.0).unwrap_or(gsc::HUC_FIRMWARE);
+        // COMETLAKE-rev<5 huc_mmp(kbl, 4, 0, 0) (Gen9 Lane 7), and
+        // COMETLAKE-rev>=5 huc_mmp(cml, 4, 0, 0).
+        let name = firmware_name_for_revision(self.0, self.1).unwrap_or(gsc::HUC_FIRMWARE);
         let blob = match narf_firmware::open(name, cap) {
             Ok(b) => b,
             Err(e) => return Ok(Err(FirmwareError::Registry(e))),
@@ -286,8 +302,19 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyImage {
     }
 }
 impl Firmware {
+    /// The HuC for `platform` at PCI revision 0 (the media GT's path).
     pub(crate) fn open(
         platform: GtPlatform,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, FirmwareError> {
+        Self::open_for_revision(platform, 0, authority)
+    }
+
+    /// The HuC for `platform` at PCI revision `revision`
+    /// ([`firmware_name_for_revision`]).
+    pub(crate) fn open_for_revision(
+        platform: GtPlatform,
+        revision: u8,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
         if firmware_name(platform).is_none()
@@ -296,7 +323,7 @@ impl Firmware {
             return Err(FirmwareError::Unsupported);
         }
         authority
-            .invoke(Open(platform))
+            .invoke(Open(platform, revision))
             .map_err(|_| FirmwareError::Revoked)?
     }
     /// An authorized-equivalent image for native fixtures.

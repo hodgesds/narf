@@ -2212,6 +2212,13 @@ system RAM as discrete GPU memory. `GuCFirmware::open_for_platform` uses the
 same invoked-capability acquisition for `i915/dg1_guc_70.bin` (70.44.1+),
 `i915/dg2_guc_70.bin` (70.53.0+) and
 `xe/bmg_guc_70.bin` (70.54.0+), retaining the selected platform with the bytes.
+`GuCFirmware::open_for_revision(platform, revision, authority)` and
+`intel_gpu_huc::Firmware::open_for_revision` take the device's PCI revision ID
+as well (`GtPlatform::guc_for_revision`, `huc::firmware_name_for_revision`):
+only Comet Lake depends on it, taking `i915/cml_guc_70.1.1.bin` and
+`i915/cml_huc_4.0.0.bin` at revision `CML_FIRMWARE_REVISION` (5) and above and
+the Kaby Lake blobs below. `open_for_platform` / `open` are revision 0. The GT
+runtime passes the revision `validate_pci` reads.
 
 `intel_gpu_guc_boot::GuCBoot::stage` consumes a GT `BootAllocator`, an invoked-
 authority firmware image and the actual PCI ID/revision, HuC upload extent and

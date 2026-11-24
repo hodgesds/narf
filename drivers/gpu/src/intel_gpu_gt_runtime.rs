@@ -2119,7 +2119,7 @@ impl Owner {
                     .derive()
                     .map_err(|_| RuntimeError::Authority)?;
             state.firmware = Some(
-                GuCFirmware::open_for_platform(platform, &authority)
+                GuCFirmware::open_for_revision(platform, revision, &authority)
                     .map_err(RuntimeError::Firmware)?,
             );
         }
@@ -2136,7 +2136,7 @@ impl Owner {
                 .derive()
                 .map_err(|_| RuntimeError::Authority)?;
             state.huc = Some(
-                crate::intel_gpu_huc::Firmware::open(platform, &authority)
+                crate::intel_gpu_huc::Firmware::open_for_revision(platform, revision, &authority)
                     .map_err(RuntimeError::Firmware)?,
             );
         }
