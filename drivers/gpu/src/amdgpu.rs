@@ -1809,6 +1809,14 @@ impl AmdGpu {
         // command in `chip.fw_list` (`LOAD_IP_FW`, `LOAD_TA`, `LOAD_ASD`,
         // `LOAD_TOC`) is a GPCOM ring `cmd_id`, which `amdgpu_psp_ring`
         // submits. Fail closed until this is rewired onto that ring.
+        //
+        // Navi31's ring now exists to be rewired onto
+        // (`Psp::new_navi31`, `setup_tmr_navi31`, `load_smc_navi31`) —
+        // but not from this sync entry point: the ring is async, needs
+        // a VRAM `Pool` + `BusDeviceCap` + running SOS, and this
+        // signature carries none of those. The Navi31 platform `run()`
+        // drives step 1 through the ring, as Navi48's ColdBoot does;
+        // this function stays fail-closed for Navi31 by design.
         let _ = (mp0_base, phys, size, entry.cmd, view.sha256, view.signer);
         Err(AmdgpuError::UnsupportedFirmwareLoad)
     }
