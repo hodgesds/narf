@@ -1,6 +1,7 @@
-//! Phoenix PSP13, discrete RDNA2 PSP11 and Navi48 PSP14 GPCOM rings. Wire layouts and
-//! sequencing follow Linux psp_gfx_if.h, psp_v{11_0,13_0_4,14_0}.c, amdgpu_psp.c,
-//! nbio_v2_3.c, gfxhub_v2_1.c and hdp_v5_0.c.
+//! Phoenix PSP13, discrete RDNA2 PSP11, Navi31 PSP13.0.0 and Navi48 PSP14
+//! GPCOM rings. Wire layouts and sequencing follow Linux psp_gfx_if.h,
+//! psp_v{11_0,13_0,13_0_4,14_0}.c, amdgpu_psp.c, nbio_v2_3.c, gfxhub_v2_1.c
+//! and hdp_v5_0.c.
 //! All addresses on the ring are GPU addresses, not host physical addresses.
 use crate::{
     amdgpu::AmdGpu,
@@ -517,6 +518,22 @@ enum Kind {
     Raphael,
     Navi22,
     Rdna2(&'static crate::amdgpu_rdna2::Profile),
+    /// PSP 13.0.0 (Navi31, GC 11.0.0): Linux's generic `psp_v13_0`, like
+    /// Raphael's 13.0.5 and unlike Phoenix's 13.0.4 — same ring
+    /// create/stop/destroy and write-pointer registers, MP0 C2PMSG on
+    /// `_BASE_IDX` 0 (`psp_v13_0.c` uses `SOC15_REG_OFFSET(MP0, 0, ...)`
+    /// throughout; `soc21.c:477,1023` reads C2PMSG_81 the same way).
+    /// `psp_v13_0_init_microcode` takes the SOS branch for 13.0.0
+    /// (`psp_init_sos_microcode` + `psp_init_ta_microcode`), so there is
+    /// no standalone TOC: the TMR's TOC comes from the SOS container's
+    /// embedded TOC, as on Navi22 — `setup_tmr` (Phoenix's standalone
+    /// TOC) stays refused for this kind.
+    ///
+    /// Per-die parameters use the corrected pairing (Navi31 GC 11.0.0,
+    /// Navi32 GC 11.0.3, Navi33 GC 11.0.2): the layout gates the GC bank
+    /// on exactly (11, 0, 0), so a Navi32/33 die is refused here, never
+    /// silently driven as Navi31.
+    Navi31,
     Navi48(u8),
 }
 impl Kind {
@@ -829,6 +846,34 @@ impl Layout {
                 let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 5)], 2, 0x477)?;
                 (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
             }
+            Kind::Navi31 => {
+                // MP0 13.0.0 on `_BASE_IDX` 0 (`psp_v13_0.c`,
+                // `soc21.c:477,1023`); GC 11.0.0 on index 0 — the
+                // corrected die pairing, so Navi32 (11.0.3) and Navi33
+                // (11.0.2) are refused by the exact-version gate, never
+                // driven as Navi31. The NBIO bank is resolved without a
+                // version gate (see `nbio_bank_ungated`); the HDP bank
+                // and the invalidate rule come from the shared tail
+                // below, as for Phoenix. FB location registers are
+                // GC 11.0.0's (`gc_11_0_0_offset.h`, all BASE_IDX 0).
+                if gpu.chip.did != crate::amdgpu::NAVI31 {
+                    return Err(Error::Unsupported);
+                }
+                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 0)], 0, SOS)?;
+                let nbio = nbio_bank_ungated(gpu)?;
+                // linux-lit: 0x1679=regGCMC_VM_FB_LOCATION_TOP
+                let gc = bank(gpu, discovery::HW_ID_GC, &[(11, 0, 0)], 0, 0x1679)?;
+                (
+                    mp0,
+                    nbio,
+                    // linux-lit: 0x1678=regGCMC_VM_FB_LOCATION_BASE
+                    gc + 0x1678 * 4,
+                    // linux-lit: 0x1679=regGCMC_VM_FB_LOCATION_TOP
+                    gc + 0x1679 * 4,
+                    // linux-lit: 0x15a7=regGCMC_VM_FB_OFFSET
+                    gc + 0x15a7 * 4,
+                )
+            }
             Kind::Navi22 | Kind::Rdna2(_) => {
                 let profile = kind.rdna2_profile().ok_or(Error::Unsupported)?;
                 if crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did) != Some(profile)
@@ -1039,6 +1084,33 @@ pub(crate) fn bank(
     }
     Ok(base)
 }
+/// Resolve the NBIF bank without gating on an NBIO version: no Linux
+/// source maps a Navi3x die to an NBIO version (versions come from the
+/// firmware discovery blob), so the caller takes discovery's NBIF block
+/// at BASE_IDX 2 and validates it with the remap magic — the
+/// `REMAP_HDP_MEM_FLUSH_CNTL` dword is 0x12d on every NBIO generation
+/// NARF has (`nbio_2_3`, `nbio_6_3_2`, `nbio_7_2_0`, `nbio_7_7_0`
+/// offset headers). Same shape as the GMC v11 owner's `nbio_bank`.
+/// Unexamined lead, NOT a rule: tinygrad's device table maps gfx1100
+/// (Navi31) to NBIO 4.3.0.
+pub(crate) fn nbio_bank_ungated(gpu: &AmdGpu) -> Result<u64, Error> {
+    let mut blocks = gpu
+        .ip_blocks
+        .iter()
+        .filter(|ip| ip.hw_id == discovery::HW_ID_NBIF && ip.instance == 0);
+    let ip = blocks.next().ok_or(Error::Unsupported)?;
+    if blocks.next().is_some() || ip.num_bases < 3 {
+        return Err(Error::Unsupported);
+    }
+    let base = ip.base_addrs[2] as u64 * 4;
+    if base
+        .checked_add((0x12d_u64 + 1) * 4)
+        .is_none_or(|end| end > gpu.regs.len)
+    {
+        return Err(Error::Invalid);
+    }
+    Ok(base)
+}
 impl Psp {
     /// Claim the Phoenix PSP13 ring. Navi22 uses `new_navi22` instead.
     /// # Safety
@@ -1066,6 +1138,28 @@ impl Psp {
         };
         // SAFETY: forwarded exclusive device/mapping/pool contract.
         unsafe { Self::with_kind(gpu, authority, pool, kind) }
+    }
+    /// Claim Navi31's PSP13.0.0 ring after SOS bootstrap (or verified
+    /// resident SOS). Selection requires the exact PCI/GC/MP0 identities
+    /// (Navi31 DID, GC 11.0.0, MP0 13.0.0); Navi32/33 dies are refused.
+    ///
+    /// # Safety
+    /// `new`'s exclusive GPU, PSP/HDP/reset/PM ownership, trained VRAM,
+    /// permanent mapping and excluded pool contract applies. SOS must
+    /// already be running: `Engine::start` fails closed (`DeviceGone`)
+    /// on a zero sign-of-life register, and the 13.0.0 SOS bootstrap
+    /// itself is the follow-up to lane 2's PSP13 firmware set (no
+    /// `amdgpu_psp_boot` target for 13.0.0 exists yet).
+    pub unsafe fn new_navi31(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        if gpu.chip.did != crate::amdgpu::NAVI31 {
+            return Err(Error::Unsupported);
+        }
+        // SAFETY: caller supplies the complete exclusive ownership contract.
+        unsafe { Self::with_kind(gpu, authority, pool, Kind::Navi31) }
     }
     /// Claim the Navi22 PSP11 ring after SOS bootstrap (or verified resident SOS).
     /// Validates GMC10 GPU VRAM addresses against the caller's BAR0 pool.
@@ -1179,6 +1273,24 @@ impl Psp {
         self.session
             .setup_tmr_payload(Some(toc_payload(toc)?))
             .await
+    }
+    /// Reserve this Navi31 ASIC's TMR from its SOS container's embedded
+    /// TOC. MP0 13.0.0 takes the SOS branch in
+    /// `psp_v13_0_init_microcode` (`psp_init_sos_microcode`), so there is
+    /// no standalone TOC blob: `toc` is the embedded TOC bytes already
+    /// selected from the validated PSP 13.0.0 SOS container, as
+    /// `setup_tmr_navi22` takes them from the PSP11 SOS container.
+    /// SETUP_TMR remains deferred until `load_smc_navi31` has loaded
+    /// PMFW (PMFW-centralized C-state order, which
+    /// `load_smc_centralized` lists 13.0.0 under).
+    pub async fn setup_tmr_navi31(&mut self, toc: &[u8]) -> Result<(), Error> {
+        if self.kind != Kind::Navi31 {
+            return Err(Error::Unsupported);
+        }
+        if toc.is_empty() {
+            return Err(Error::Invalid);
+        }
+        self.session.init_tmr(Some(toc)).await
     }
     /// `psp_tmr_init`: LOAD_TOC from the validated SOS container's embedded
     /// TOC (or PSP11's 4 MiB default) and reserve the TMR. MP0 11.0.11 has
@@ -1320,6 +1432,21 @@ impl Psp {
             .load_ip(&bytes, firmware_type)
             .await
             .map(|_| ())
+    }
+    /// Load Navi31 SMU 13.0.0 once during cold boot, after LOAD_TOC/TMR
+    /// reservation and before other IP firmware, then SETUP_TMR
+    /// (PMFW-centralized C-state order, as `load_smc_navi22`). The
+    /// payload is the `smu_13_0_0.bin` microcode (never the header/PPT);
+    /// lane 2's PSP13 firmware set names the blob, and the SMU is
+    /// PSP-loaded on this part, never MP1-mailbox-loaded. Completion
+    /// means PSP accepted both the upload and the TMR setup; use the
+    /// SMU bring-up handshake to check runtime responsiveness. This
+    /// does not implement BACO/resume/reload.
+    pub async fn load_smc_navi31(&mut self, smc: &[u8]) -> Result<(), Error> {
+        if self.kind != Kind::Navi31 {
+            return Err(Error::Unsupported);
+        }
+        self.session.load_smc_centralized(smc).await
     }
     /// Load Navi22 SMC once during cold boot, after LOAD_TOC/TMR reservation
     /// and before other IP firmware, then SETUP_TMR (psp_hw_start's

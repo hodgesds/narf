@@ -406,6 +406,9 @@ kernel_test_in!(
 #[path = "amdgpu_psp_navi22_tests.rs"]
 mod navi22;
 
+#[path = "amdgpu_psp_navi31_tests.rs"]
+mod navi31;
+
 /// A Raphael discovery set: MP0 13.0.5, NBIO 7.7.1, DCN 3.1.5, HDP 5.2.1,
 /// GC 10.3.6. MP0's segments 0 and 1 differ so the base index is observable.
 fn raphael_gpu() -> AmdGpu {
