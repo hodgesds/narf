@@ -156,6 +156,175 @@ pub const RENOIR: u16 = 0x1636;
 pub const NAVI22: u16 = 0x73DF;
 /// Navi 31 (Radeon RX 7900 family).
 pub const NAVI31: u16 = 0x744C;
+/// Navi 31 USB controller function — the GPU's xHCI function (PCI
+/// class 0x0c03), not a display device. It resolves in the identity
+/// table below (it *is* a Navi31 function) but is deliberately NOT
+/// registered for probe: Linux's amdgpu reaches Navi31 only through
+/// its VGA / display-other / accelerator class matches, never the USB
+/// function, which belongs to xhci.
+pub const NAVI31_USB: u16 = 0x7446;
+
+/// Which Navi3 die a board id belongs to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Navi3Die {
+    Navi31,
+    Navi32,
+    Navi33,
+}
+
+/// One Navi31/32/33 board id.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Navi3Device {
+    pub did: u16,
+    pub die: Navi3Die,
+    /// `pci.ids` device name.
+    pub name: &'static str,
+}
+
+/// All Navi31/32/33 board ids, verified against pci.ids v2026.11.22.
+/// Every entry routes to `Family::Navi3` (see `chip_info_for_pci_id`);
+/// the die only selects the asic name and firmware placeholder. Lane 2
+/// (`amdgpu_rdna3.rs`) may relocate this table next to the per-die IP
+/// versions.
+pub const NAVI3_DEVICES: &[Navi3Device] = &[
+    // Navi31 — 0x744C is the already-registered RX 7900 XT/XTX/GRE.
+    Navi3Device {
+        did: NAVI31_USB,
+        die: Navi3Die::Navi31,
+        name: "Navi 31 USB",
+    },
+    Navi3Device {
+        did: 0x7448,
+        die: Navi3Die::Navi31,
+        name: "Navi 31 [Radeon Pro W7900]",
+    },
+    Navi3Device {
+        did: 0x7449,
+        die: Navi3Die::Navi31,
+        name: "Navi 31 [Radeon Pro W7800 48GB]",
+    },
+    Navi3Device {
+        did: 0x744A,
+        die: Navi3Die::Navi31,
+        name: "Navi 31 [Radeon Pro W7900 Dual Slot]",
+    },
+    // pci.ids identifies 0x744B as Navi31 (Pro W7900D), not RDNA4:
+    // its `amdgpu_rdna4::KICKER_DEVICES` entry is a firmware-selection
+    // kicker, not a probe registration, and 0x744B is not in
+    // `KNOWN_DEVICES`, so the RDNA4 lookup above cannot claim it.
+    Navi3Device {
+        did: 0x744B,
+        die: Navi3Die::Navi31,
+        name: "Navi 31 [Radeon Pro W7900D]",
+    },
+    Navi3Device {
+        did: NAVI31,
+        die: Navi3Die::Navi31,
+        name: "Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]",
+    },
+    Navi3Device {
+        did: 0x745E,
+        die: Navi3Die::Navi31,
+        name: "Navi 31 [Radeon Pro W7800]",
+    },
+    // Navi32.
+    Navi3Device {
+        did: 0x7460,
+        die: Navi3Die::Navi32,
+        name: "Navi 32 GL-XL [AMD Radeon PRO V710]",
+    },
+    Navi3Device {
+        did: 0x7461,
+        die: Navi3Die::Navi32,
+        name: "Navi 32 [AMD Radeon PRO V710]",
+    },
+    Navi3Device {
+        did: 0x7470,
+        die: Navi3Die::Navi32,
+        name: "Navi 32 [Radeon PRO W7700]",
+    },
+    Navi3Device {
+        did: 0x747E,
+        die: Navi3Die::Navi32,
+        name: "Navi 32 [Radeon RX 7700 XT / 7800 XT]",
+    },
+    // Navi33. 0x73F0 is not in NARF's RDNA2 table
+    // (`amdgpu_rdna2.rs`), so the RDNA2 lookup above cannot claim it.
+    Navi3Device {
+        did: 0x73F0,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Radeon RX 7600M XT]",
+    },
+    Navi3Device {
+        did: 0x7480,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Radeon RX 7600/7600 XT/7600M XT/7600S/7700S / PRO W7600]",
+    },
+    Navi3Device {
+        did: 0x7481,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Steam Machine]",
+    },
+    Navi3Device {
+        did: 0x7483,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Radeon RX 7600M/7600M XT]",
+    },
+    Navi3Device {
+        did: 0x7487,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Radeon Graphics]",
+    },
+    Navi3Device {
+        did: 0x7489,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Radeon Pro W7500]",
+    },
+    Navi3Device {
+        did: 0x748B,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Radeon Graphics]",
+    },
+    Navi3Device {
+        did: 0x7499,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Radeon RX 7400/7300/Pro W7400]",
+    },
+    Navi3Device {
+        did: 0x749F,
+        die: Navi3Die::Navi33,
+        name: "Navi 33 [Radeon RX 7500]",
+    },
+];
+
+/// Look up a Navi31/32/33 board id in [`NAVI3_DEVICES`].
+pub fn navi3_device(did: u16) -> Option<&'static Navi3Device> {
+    NAVI3_DEVICES.iter().find(|d| d.did == did)
+}
+
+/// `ChipInfo` for a Navi31/32/33 board id. All three dies share
+/// `Family::Navi3` and the unaudited-firmware placeholder; only the
+/// asic name and firmware placeholder name differ per die. The
+/// `amdgpu/navi3*.bin` names are placeholders, not real blobs (lane 3
+/// supplies the PSP13/SMU 13.0.0 tables).
+fn navi3_chip_info(vid: u16, did: u16, device: &Navi3Device) -> ChipInfo {
+    let (asic, fw_name) = match device.die {
+        Navi3Die::Navi31 => ("navi31", "amdgpu/navi31.bin"),
+        Navi3Die::Navi32 => ("navi32", "amdgpu/navi32.bin"),
+        Navi3Die::Navi33 => ("navi33", "amdgpu/navi33.bin"),
+    };
+    ChipInfo {
+        vid,
+        did,
+        family: Family::Navi3,
+        asic,
+        fw_name,
+        fw_list: UNAUDITED_FW,
+        revision: 0,
+        rev_id: 0,
+        mall_size: 0,
+    }
+}
 /// Navi 48 (RX 9070 / 9070 XT / 9070 GRE). The PCI ID does not identify
 /// the SKU's enabled topology; discovery supplies maximum geometry, while
 /// enabled CU counts require GFX12's harvested-WGP register inventory.
@@ -702,6 +871,9 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     if let Some(known) = crate::amdgpu_rdna4::known_device(did) {
         return Some(rdna4_chip_info(did, known.chip));
     }
+    if let Some(navi3) = navi3_device(did) {
+        return Some(navi3_chip_info(vid, did, navi3));
+    }
     let (family, asic, fw_name, fw_list) = match did {
         // Phoenix1 / Phoenix2 / HawkPoint are RDNA3: GFX 11.0.1 with
         // **DCN 3.1.4**. The comment that used to stand here said all three
@@ -756,7 +928,6 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             GREEN_SARDINE_FW,
         ),
         RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin", RENOIR_FW),
-        NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin", UNAUDITED_FW),
         _ => return None,
     };
     Some(ChipInfo {
@@ -2212,10 +2383,13 @@ impl AmdGpu {
     ) {
         use crate::amdgpu_atom_displayobj::DisplayObjectTable;
         use crate::amdgpu_modeset::KmsState;
-        // Desktop Navi3 needs 6 pipes; everything else ships 4
-        // (KmsState::new's own doc).
-        let n_pipes = if family == Family::Navi3 { 6 } else { 4 };
-        let mut kms = KmsState::new(n_pipes);
+        // Every family mints 4 CRTCs: APUs ship 4 pipes, and Navi31
+        // (DCN 3.2) has 4 too (`num_timing_generator = 4` in
+        // `dcn32_resource.c`). The "Desktop Navi3 needs 6" claim this
+        // replaced was wrong; `family` stays in the signature for the
+        // DCN32 lane, which may mint per-family state here.
+        let _ = family;
+        let mut kms = KmsState::new(4);
         let hpd = crate::amdgpu_hpd::HpdMachine::new();
         let Ok(atom) = crate::amdgpu_atombios::Atombios::parse(vbios) else {
             return (kms, hpd);
@@ -3787,7 +3961,6 @@ pub fn register_pci_driver() {
         ("amdgpu-raphael", AMD_VENDOR, RAPHAEL),
         ("amdgpu-cezanne", AMD_VENDOR, CEZANNE),
         ("amdgpu-renoir", AMD_VENDOR, RENOIR),
-        ("amdgpu-navi31", AMD_VENDOR, NAVI31),
     ];
     for (name, v, d) in exact.iter().copied() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -3795,6 +3968,30 @@ pub fn register_pci_driver() {
             kind: narf_bus::MatchKind::VendorDevice {
                 vendor: v,
                 device: d,
+            },
+            probe,
+        });
+    }
+    // Every Navi31/32/33 display DID. The Navi31 USB function
+    // (`NAVI31_USB`, class 0x0c03) is excluded: it is not a display
+    // device, Linux's amdgpu never claims it (its pciidlist reaches
+    // Navi31 only via the VGA / display-other / accelerator class
+    // matches), and claiming it here would steal the GPU's xHCI
+    // function from the USB driver. It still resolves in
+    // `chip_info_for_pci_id`.
+    for device in NAVI3_DEVICES {
+        if device.did == NAVI31_USB {
+            continue;
+        }
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name: match device.die {
+                Navi3Die::Navi31 => "amdgpu-navi31",
+                Navi3Die::Navi32 => "amdgpu-navi32",
+                Navi3Die::Navi33 => "amdgpu-navi33",
+            },
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: AMD_VENDOR,
+                device: device.did,
             },
             probe,
         });
