@@ -895,6 +895,47 @@ async unsafe fn run_graphics(
         }
     }
 }
+/// Build a Phoenix graphics owner without running it: construct the
+/// coordinator (no register I/O) and box it.
+///
+/// `#[inline(never)]` is load-bearing for the frame budget: the
+/// construction `Result` is 2464 bytes, and inlining this helper into
+/// `graphics_boot_phoenix` would put that temporary back into the boot
+/// future's poll frame. Kept out of line, the temporary lives in this
+/// function's own frame (~2.6 KiB, well under budget) and the async
+/// boot future holds only the box.
+///
+/// # Safety
+/// This display owner holds the whole GPU after the boot handoff: no
+/// other graphics owner exists, the pool is its free carve-out, and the
+/// PSP has loaded the graphics set. Construction performs no register I/O.
+#[inline(never)]
+fn build_phoenix_boot(
+    pool: &Pool,
+    mes_start: [u64; 2],
+) -> Option<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>> {
+    use core::fmt::Write as _;
+    let authority = crate::amdgpu::pci_authority()?;
+    let device = crate::amdgpu::pci_device()?;
+    let boot = crate::amdgpu::with_controller(|gpu| {
+        // SAFETY: as documented on this function.
+        unsafe {
+            crate::amdgpu_phoenix_boot::PhoenixColdBoot::new(
+                gpu, authority, pool, &device, mes_start,
+            )
+        }
+    })?;
+    match boot {
+        Ok(boot) => Some(alloc::boxed::Box::new(boot)),
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: phoenix graphics refused: {error:?}"
+            );
+            None
+        }
+    }
+}
 /// Bring Phoenix's graphics engines up on the display path's pool, once its
 /// PSP session loaded the graphics set and the RLC autoload completed. A
 /// failure is reported and leaves the display as it is; the owner is returned
@@ -904,33 +945,18 @@ async unsafe fn run_graphics(
 async fn graphics_boot_phoenix(
     pool: &Pool,
     mes_start: [u64; 2],
-) -> Option<crate::amdgpu_phoenix_boot::PhoenixColdBoot> {
-    use core::fmt::Write as _;
-    let authority = crate::amdgpu::pci_authority()?;
-    let device = crate::amdgpu::pci_device()?;
-    let boot = crate::amdgpu::with_controller(|gpu| {
-        // SAFETY: this display owner holds the whole GPU after the boot
-        // handoff: no other graphics owner exists, the pool is its free
-        // carve-out, and the PSP has loaded the graphics set. Construction
-        // performs no register I/O.
-        unsafe {
-            crate::amdgpu_phoenix_boot::PhoenixColdBoot::new(
-                gpu, authority, pool, &device, mes_start,
-            )
-        }
-    })?;
-    let mut boot = match boot {
-        Ok(boot) => boot,
-        Err(error) => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "amdgpu: phoenix graphics refused: {error:?}"
-            );
-            return None;
-        }
-    };
-    // SAFETY: as above, and the RLC autoload has completed.
-    unsafe { run_graphics_phoenix(&mut boot) }.await;
+) -> Option<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>> {
+    // Boxed: the owner is 2464 bytes and this future holds it across the
+    // `run_graphics_phoenix` await; inline, the future carried the owner,
+    // its construction `Result`, and the `Option` return slot by value,
+    // and the start task's poll frame measured 9080 bytes against the
+    // 8192 budget (run 45447920311). Built in `build_phoenix_boot`, the
+    // future holds only the box (~1.5 KiB) and the frame is independent
+    // of the owner's size.
+    let mut boot = build_phoenix_boot(pool, mes_start)?;
+    // SAFETY: the owner is new, this display owner holds the whole GPU,
+    // and the RLC autoload has completed.
+    unsafe { run_graphics_phoenix(&mut *boot) }.await;
     Some(boot)
 }
 /// Run `boot`'s stages and report them.
@@ -1310,7 +1336,7 @@ async fn recover_phoenix(display: &mut Display) -> Result<(), RecoveryError> {
     if !display
         .graphics_phoenix
         .as_ref()
-        .is_some_and(crate::amdgpu_phoenix_boot::PhoenixColdBoot::queues_verified)
+        .is_some_and(|boot| boot.queues_verified())
     {
         return Err(RecoveryError::Busy);
     }
@@ -1393,8 +1419,8 @@ async fn recover_phoenix(display: &mut Display) -> Result<(), RecoveryError> {
 async fn rebuild_graphics_phoenix(
     loader: &mut Loader,
     pool: &Pool,
-    graphics: &mut Option<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
-    retired: &mut Vec<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
+    graphics: &mut Option<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>>,
+    retired: &mut Vec<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>>,
 ) -> Result<(), RecoveryError> {
     use core::fmt::Write as _;
     if !loader.graphics_booted() {
@@ -2267,12 +2293,15 @@ struct Display {
     /// recovery leaks its old owners' carve-out).
     retired: Vec<crate::amdgpu_raphael_boot::ColdBoot>,
     /// Phoenix's graphics engines, same retention policy as Raphael's.
+    /// Boxed: the owner is 2464 bytes and the boot future holds it across
+    /// an await (see `graphics_boot_phoenix`); the box keeps that future
+    /// and the start task's poll frame independent of the owner's size.
     /// Unreachable until the firmware lane lands `Firmware::open_phoenix`
     /// + the Phoenix `set_graphics` arm: no Phoenix set can be loaded
     /// today, so `start()` never fills this in.
-    graphics_phoenix: Option<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
+    graphics_phoenix: Option<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>>,
     /// Phoenix owners a mode 2 recovery replaced; same quarantine policy.
-    retired_phoenix: Vec<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
+    retired_phoenix: Vec<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>>,
     /// Strix's graphics engines, same retention policy as Phoenix's.
     /// Unreachable until the firmware lane lands `Firmware::open_strix`
     /// + the Strix `set_graphics` arm: no Strix set can be loaded today,
@@ -2306,7 +2335,7 @@ impl Graphics {
     pub(crate) fn get_phoenix(
         &mut self,
     ) -> Option<&mut crate::amdgpu_phoenix_boot::PhoenixColdBoot> {
-        self.0.as_mut()?.graphics_phoenix.as_mut()
+        self.0.as_mut()?.graphics_phoenix.as_deref_mut()
     }
     /// The coordinator with the PSP session that loaded its VCN.
     pub(crate) fn media(
