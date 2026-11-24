@@ -159,10 +159,10 @@ impl Generation {
     /// external-session layer (`enable_external_hpd`,
     /// `dp_connect`, `hdmi_connect`, `mst_connect`) admits each
     /// of them by its source family. Rocket Lake joins for its
-    /// combo DDI B (the port the HPD monitor owns): its PLL,
-    /// clock routing, PHY and DDC pin there are Tiger Lake's,
-    /// and the modeset takes its own CDCLK table and power-well
-    /// map. Its internal panel and backlight stay gated
+    /// combo DDI B and its TC1/TC2 combo ports (DDI D/E, PHY C/D,
+    /// arbitrated over its three PLLs), with its own CDCLK table,
+    /// power-well map, DPCLKA layout and hotplug pins. Its
+    /// internal panel and backlight stay gated
     /// (`display_supported`, `backlight_supported`).
     pub const fn external_display_supported(self) -> bool {
         matches!(

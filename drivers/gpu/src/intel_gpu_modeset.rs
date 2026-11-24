@@ -77,7 +77,7 @@ pub(crate) mod training;
 // The DRIVER source uses `HSW_PWR_WELL_CTL2`.
 
 /// DRIVER source's power-well control register.
-const PWR_WELL_CTL2: u64 = 0x4_5404;
+pub(crate) const PWR_WELL_CTL2: u64 = 0x4_5404;
 
 /// Compute the REQUEST bit for a given power-well index.
 const fn pwr_well_req(pw_idx: u32) -> u32 {
@@ -163,6 +163,36 @@ const fn dpll_enable_off(dpll_idx: u32) -> u64 {
         1 => DPLL1_ENABLE,
         _ => DPLL2_ENABLE,
     }
+}
+
+/// `RKL_DPLL_CFGCR0(pll)`: the TGL bases at stride 8 (`_MMIO_PLL`), so
+/// DPLL4 (id 2) sits at the DPLL2 slot.
+const fn rkl_dpll_cfgcr0(dpll_idx: u32) -> u64 {
+    match dpll_idx {
+        0 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
+        1 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL1,
+        _ => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL2,
+    }
+}
+
+/// `RKL_DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(phy)`: `_PICK(phy, 0, 2, 4, 27)`.
+const fn rkl_dpclka_sel_shift(phy: u32) -> u32 {
+    match phy {
+        0 => 0,
+        1 => 2,
+        2 => 4,
+        _ => 27,
+    }
+}
+
+/// `RKL_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK(phy)`.
+const fn rkl_dpclka_clk_sel_mask(phy: u32) -> u32 {
+    0x3 << rkl_dpclka_sel_shift(phy)
+}
+
+/// `RKL_DPCLKA_CFGCR0_DDI_CLK_OFF(phy)`: `REG_BIT(phy + 10)`.
+const fn rkl_dpclka_clk_off(phy: u32) -> u32 {
+    1 << (phy + 10)
 }
 
 /// Combo PHY DDIs A/B/C use DPLL 0/1/2. Type-C dispatches through
@@ -492,6 +522,13 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// one (EHL/JSL PORT_D, `arbitrate_combo_dpll`): clock routing and a
     /// mid-training retune use it.
     gen11_dpll: Option<crate::intel_gpu_gen11_dpll::IclDpllId>,
+    /// The Rocket Lake combo PLL (0/1/2: DPLL0, DPLL1, DPLL4 at the
+    /// DPLL2 registers) this run took ([`Self::rkl_combo_dpll`]): clock
+    /// routing and a mid-training retune use it.
+    rkl_dpll: Option<u32>,
+    /// Whether [`Self::rkl_dpll`] is another port's PLL, shared at this
+    /// state.
+    rkl_dpll_shared: bool,
     /// HDMI to a DVI sink (`!has_hdmi_sink`): the transcoder runs
     /// `TRANS_DDI_MODE_SELECT_DVI`.
     hdmi_dvi: bool,
@@ -540,6 +577,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             tc_width: 4,
             gen9_panel_fit: None,
             gen11_dpll: None,
+            rkl_dpll: None,
+            rkl_dpll_shared: false,
             hdmi_dvi: false,
             hdmi_bpc: 8,
             hdmi_ycbcr420: false,
@@ -587,6 +626,67 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// without `has_hdmi_sink` selects `TRANS_DDI_MODE_SELECT_DVI`).
     pub(crate) fn set_hdmi_dvi(&mut self, dvi: bool) {
         self.hdmi_dvi = dvi;
+    }
+
+    /// Rocket Lake's TC1/TC2 (DDI D/E): combo ports on PHY C/D
+    /// (`intel_port_to_phy`'s RKL case) where Tiger Lake's DDI D/E are
+    /// Type-C, so the `ddi >= D` Type-C dispatches skip them.
+    fn is_rkl_combo_tc(&self) -> bool {
+        self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+            && matches!(self.ddi, Ddi::D | Ddi::E)
+    }
+
+    /// Rocket Lake's combo PHY index for this run's DDI: A/B are PHY A/B,
+    /// TC1/TC2 (DDI D/E) PHY C/D.
+    fn rkl_phy(&self) -> Option<u32> {
+        match self.ddi {
+            Ddi::A => Some(0),
+            Ddi::B => Some(1),
+            Ddi::D => Some(2),
+            Ddi::E => Some(3),
+            _ => None,
+        }
+    }
+
+    /// `intel_find_dpll` over Rocket Lake's {DPLL0, DPLL1, DPLL4}
+    /// (`rkl_pll_mgr`; DPLL4 is id 2 at the DPLL2 registers) for a run
+    /// whose PLL state is `cfgcr0`/`cfgcr1`. A PLL is held by another port
+    /// when it is enabled and another PHY's `DPCLKA_CFGCR0` clock is on and
+    /// selects it. A held PLL already running this state is shared
+    /// (`true`); otherwise the port's own PLL (A, B, TC1: DPLL0, DPLL1,
+    /// DPLL4, the conflict-free assignment) or, when another port holds
+    /// it, the first PLL nobody holds. `None` when every PLL is held with
+    /// another state.
+    fn rkl_combo_dpll(&self, cfgcr0: u32, cfgcr1: u32) -> Option<(u32, bool)> {
+        let phy = self.rkl_phy()?;
+        let dpclka = self.mmio.read32(crate::intel_gpu_pll::DPCLKA_CFGCR0);
+        let held = |idx: u32| {
+            self.mmio.read32(dpll_enable_off(idx)) & PLL_ENABLE != 0
+                && (0..4u32).filter(|&other| other != phy).any(|other| {
+                    dpclka & rkl_dpclka_clk_off(other) == 0
+                        && (dpclka & rkl_dpclka_clk_sel_mask(other)) >> rkl_dpclka_sel_shift(other)
+                            == idx
+                })
+        };
+        let cfgcr = |idx: u32| {
+            let off = rkl_dpll_cfgcr0(idx);
+            (
+                self.mmio.read32(off),
+                self.mmio.read32(crate::intel_gpu_pll::dpll_cfgcr1(off)),
+            )
+        };
+        if let Some(idx) = (0..3u32).find(|&idx| held(idx) && cfgcr(idx) == (cfgcr0, cfgcr1)) {
+            return Some((idx, true));
+        }
+        let own = match self.ddi {
+            Ddi::A => Some(0),
+            Ddi::B => Some(1),
+            Ddi::D => Some(2),
+            _ => None,
+        };
+        own.filter(|&idx| !held(idx))
+            .or_else(|| (0..3u32).find(|&idx| !held(idx)))
+            .map(|idx| (idx, false))
     }
 
     /// EHL/JSL PORT_D: a combo port (it drives PHY A) where every other
@@ -714,7 +814,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 use crate::intel_gpu_gen11_ddi::{phy_for_port, Gen11Phy};
                 matches!(phy_for_port(platform, self.ddi), Some(Gen11Phy::Mg { .. }))
             }
-            None => self.ddi as u8 >= Ddi::D as u8,
+            None => self.ddi as u8 >= Ddi::D as u8 && !self.is_rkl_combo_tc(),
         }
     }
 
@@ -989,7 +1089,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Gen12 Type-C ports have no HDMI modeset here (their
         // DDI is a Dekel port); Gen11 TC ports do — the MG PHY
         // drives HDMI through the MG PLL + MG HDMI table below.
-        if self.gen11_platform.is_none() && self.ddi as u8 >= Ddi::D as u8 {
+        if self.gen11_platform.is_none()
+            && self.ddi as u8 >= Ddi::D as u8
+            && !self.is_rkl_combo_tc()
+        {
             return Err(ModesetError::UnsupportedGeneration);
         }
         // YCbCr 4:2:0 output is display 10+ (`ycbcr_420_allowed`), and the
@@ -1529,6 +1632,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             };
         }
         if self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake) {
+            // TC1/TC2's lanes and AUX sit in PW_3's domains
+            // (`RKL_PW_3_POWER_DOMAINS`), whatever pipe drives them.
+            if self.is_rkl_combo_tc() {
+                self.enable_power_well(PowerWell::Pg3 as u32)?;
+            }
             return match pipe {
                 Pipe::A => Ok(()),
                 Pipe::B => self.enable_power_well(PowerWell::Pg3 as u32),
@@ -1716,6 +1824,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.gen9_platform.is_none()
             && self.ddi as u8 >= Ddi::D as u8
             && !self.is_gen11_combo_port_d()
+            && !self.is_rkl_combo_tc()
         {
             crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?
                 .stop_transport(self.mmio, self.transcoder())?;
@@ -1761,7 +1870,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.gen9_platform.is_some() {
             return self.program_dpll_gen9(rate);
         }
-        if self.ddi as u8 >= Ddi::D as u8 && !self.is_gen11_combo_port_d() {
+        if self.ddi as u8 >= Ddi::D as u8
+            && !self.is_gen11_combo_port_d()
+            && !self.is_rkl_combo_tc()
+        {
             let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
             return port.enable(
                 self.mmio,
@@ -1929,8 +2041,24 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     ) -> Result<(), ModesetError> {
         // Combo PHY DDIs A/B/C program DPLL 0/1/2 respectively
         // (the DPCLKA default assignment). Type-C has already dispatched
-        // to its per-port Dekel PLL; this path is combo-only.
-        let dpll_idx: u32 = dpll_index_for(self.ddi);
+        // to its per-port Dekel PLL; this path is combo-only. Rocket Lake
+        // arbitrates its three PLLs over four ports (`rkl_combo_dpll`); a
+        // PLL another port already runs at this state is shared as is.
+        let cfgcr0 = encode_cfgcr0(coeffs);
+        let dpll_idx: u32 =
+            if self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake) {
+                let (idx, shared) = self
+                    .rkl_combo_dpll(cfgcr0, coeffs.cfgcr1)
+                    .ok_or(ModesetError::DisplayResourceUnavailable)?;
+                self.rkl_dpll = Some(idx);
+                self.rkl_dpll_shared = shared;
+                if shared {
+                    return Ok(());
+                }
+                idx
+            } else {
+                dpll_index_for(self.ddi)
+            };
         let dpll_enable = dpll_enable_off(dpll_idx);
 
         // Step 1 — power the PLL up.
@@ -1942,7 +2070,6 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         }
 
         // Step 2 — CFGCR0 / CFGCR1.
-        let cfgcr0 = encode_cfgcr0(coeffs);
         let cfgcr0_off = match dpll_idx {
             0 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
             1 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL1,
@@ -2443,7 +2570,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 return Err(error);
             }
             result
-        } else if self.ddi as u8 >= Ddi::D as u8 && !self.is_gen11_combo_port_d() {
+        } else if self.ddi as u8 >= Ddi::D as u8
+            && !self.is_gen11_combo_port_d()
+            && !self.is_rkl_combo_tc()
+        {
             let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
             port.start_training(
                 self.mmio,
@@ -2502,7 +2632,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                     self.ddi == Ddi::A,
                     self.edp_hobl,
                     self.edp_low_vswing,
-                )?,
+                )?
+                .with_rkl_pll(self.rkl_dpll.map(|idx| (idx, self.rkl_dpll_shared))),
             };
             phy.prepare(
                 self.mmio,
@@ -2576,9 +2707,30 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             crate::intel_gpu_gen9_dpll::enable_clock(self.mmio, self.ddi, id);
             return Ok(());
         }
-        if self.ddi as u8 >= Ddi::D as u8 && !self.is_gen11_combo_port_d() {
+        if self.ddi as u8 >= Ddi::D as u8
+            && !self.is_gen11_combo_port_d()
+            && !self.is_rkl_combo_tc()
+        {
             return crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?
                 .route_clock(self.mmio);
+        }
+        // Rocket Lake: the PLL `rkl_combo_dpll` took, routed on the port's
+        // PHY with RKL's DPCLKA layout (`rkl_ddi_enable_clock`).
+        if self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake) {
+            let phy = self.rkl_phy().ok_or(ModesetError::UnsupportedGeneration)?;
+            let select = self
+                .rkl_dpll
+                .ok_or(ModesetError::DisplayResourceUnavailable)?;
+            let reg = crate::intel_gpu_pll::DPCLKA_CFGCR0;
+            let cur = self.mmio.read32(reg);
+            let selected = (cur & !rkl_dpclka_clk_sel_mask(phy) & !rkl_dpclka_clk_off(phy))
+                | (select << rkl_dpclka_sel_shift(phy))
+                | rkl_dpclka_clk_off(phy);
+            self.mmio.write32(reg, selected);
+            compiler_fence(Ordering::SeqCst);
+            self.mmio.write32(reg, selected & !rkl_dpclka_clk_off(phy));
+            compiler_fence(Ordering::SeqCst);
+            return Ok(());
         }
         use crate::intel_gpu_pll::{
             dpclka_clk_off, dpclka_clk_sel, dpclka_clk_sel_mask, DPCLKA_CFGCR0,
@@ -5311,9 +5463,10 @@ pub mod tests {
                     }
                     v
                 }
-                0x46010 | 0x46014 | 0x46020 | 0x46030 | 0x46034 | 0x46038 | 0x4603C => {
-                    // Any ICL PLL enable register (combo DPLL0/1,
-                    // TBT, MG TC1–TC4): POWER_STATE follows
+                0x46010 | 0x46014 | 0x46018 | 0x46020 | 0x46030 | 0x46034 | 0x46038 | 0x4603C => {
+                    // Any ICL PLL enable register (combo DPLL0/1, the
+                    // DPLL2 slot RKL's DPLL4 uses, TBT, MG TC1–TC4):
+                    // POWER_STATE follows
                     // POWER_ENABLE, LOCK follows ENABLE.
                     let stored = self.get(off);
                     let mut v = stored;
@@ -6856,6 +7009,121 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_rkl_external_dp_ddi_b_full_run
+    );
+
+    /// Rocket Lake TC1 (DDI D) is a combo port on PHY C: external DP at
+    /// HBR2 x4 programs DPLL4 (id 2, `RKL_DPLL_CFGCR0(2)` 0x164294), routes
+    /// it on PHY C with RKL's DPCLKA layout (select 2 at bits 5:4, CLK_OFF
+    /// bit 12), requests PW_3 (the TC1 lanes' well), drives PHY C's
+    /// registers (0x160000), selects port D in TRANS_DDI_FUNC_CTL and
+    /// enables DDI D's buffer — never a Dekel register.
+    fn smoke_rkl_external_dp_ddi_d_runs_phy_c() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::D, Pipe::A);
+        ms.set_gen12_family(Gen12Platform::RocketLake);
+        let plan = LinkPlan {
+            rate: crate::dp_link_training::LinkRate::Hbr2,
+            lanes: 4,
+        };
+        if ms
+            .modeset_with_plan(&fb_1080p(), &mode_1080p60(), plan)
+            .is_err()
+        {
+            return TestResult::Fail("RKL external DP on TC1 must succeed");
+        }
+        if mmio.writes_to(0x164294) != alloc::vec![0x01C0_01A5]
+            || mmio.writes_to(0x164298) != alloc::vec![0x4B]
+            || !mmio.writes_to(0x16428C).is_empty()
+        {
+            return TestResult::Fail("RKL TC1 must program DPLL4 (the DPLL2 slot) at HBR2");
+        }
+        if mmio.writes_to(0x164280) != alloc::vec![0x1020, 0x20] {
+            return TestResult::Fail("RKL DPCLKA must select DPLL4 on PHY C, clock on");
+        }
+        let pw3 = super::pwr_well_req(super::PowerWell::Pg3 as u32);
+        if mmio.writes_to(PWR_WELL_CTL2).iter().all(|v| v & pw3 == 0) {
+            return TestResult::Fail("RKL TC1 must request PW_3");
+        }
+        // PHY C's DW2 lane 0 carries the trained swing; PHY D is untouched.
+        if mmio.writes_to(0x160000 + 0x888).is_empty()
+            || !mmio.writes_to(0x161000 + 0x888).is_empty()
+        {
+            return TestResult::Fail("RKL TC1 must drive combo PHY C");
+        }
+        let func = mmio.writes_to(0x60400);
+        if func.last().map(|v| (v >> 27) & 0xF) != Some(4) {
+            return TestResult::Fail("TRANS_DDI_FUNC_CTL must select port D ((3 + 1) << 27)");
+        }
+        if mmio
+            .writes_to(0x64300)
+            .last()
+            .is_none_or(|v| v & (1 << 31) == 0)
+        {
+            return TestResult::Fail("DDI D's buffer must end enabled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_external_dp_ddi_d_runs_phy_c
+    );
+
+    /// Rocket Lake TC2 (DDI E, PHY D) has no PLL of its own
+    /// (`intel_find_dpll` over {DPLL0, DPLL1, DPLL4}): with DPLL4 held by
+    /// PHY C at another state it takes the first PLL nobody holds (DPLL0)
+    /// and routes it at PHY D's field (bits 28:27, CLK_OFF bit 13); with
+    /// DPLL4 held at its own state it shares it and programs no PLL.
+    fn smoke_rkl_ddi_e_arbitrates_and_shares_its_pll() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        let run = |held_cfgcr1: u32| {
+            let mmio = ScriptedSinkMmio::new(1 << 29);
+            // DPLL4 enabled and locked; PHY C clock on selecting it.
+            mmio.set(0x46018, super::PLL_ENABLE | super::PLL_POWER_ENABLE);
+            mmio.set(0x164294, 0x01C0_01A5);
+            mmio.set(0x164298, held_cfgcr1);
+            mmio.set(0x164280, (2 << 4) | (1 << 13));
+            let mut ms = Modeset::for_pipe(&mmio, Ddi::E, Pipe::A);
+            ms.set_gen12_family(Gen12Platform::RocketLake);
+            let plan = LinkPlan {
+                rate: crate::dp_link_training::LinkRate::Hbr2,
+                lanes: 4,
+            };
+            let ok = ms
+                .modeset_with_plan(&fb_1080p(), &mode_1080p60(), plan)
+                .is_ok();
+            (ok, mmio)
+        };
+        // DPLL4 at RBR (CFGCR1 0x93): TC2 takes DPLL0.
+        let (ok, mmio) = run(0x93);
+        let dpclka = mmio.writes_to(0x164280);
+        if !ok
+            || mmio.writes_to(0x164284) != alloc::vec![0x01C0_01A5]
+            || mmio.writes_to(0x164288) != alloc::vec![0x4B]
+            || !mmio.writes_to(0x164298).is_empty()
+            || dpclka
+                .last()
+                .is_none_or(|v| (v >> 27) & 3 != 0 || v & (1 << 13) != 0)
+        {
+            return TestResult::Fail("RKL TC2 must take DPLL0 when DPLL4 runs another state");
+        }
+        // DPLL4 at HBR2 (CFGCR1 0x4B): TC2 shares it.
+        let (ok, mmio) = run(0x4B);
+        let dpclka = mmio.writes_to(0x164280);
+        if !ok
+            || !mmio.writes_to(0x164284).is_empty()
+            || !mmio.writes_to(0x164294).is_empty()
+            || dpclka
+                .last()
+                .is_none_or(|v| (v >> 27) & 3 != 2 || v & (1 << 13) != 0)
+        {
+            return TestResult::Fail("RKL TC2 must share DPLL4 at its own state");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_ddi_e_arbitrates_and_shares_its_pll
     );
 
     fn smoke_gen11_hdmi_ddi_b_full_run() -> TestResult {

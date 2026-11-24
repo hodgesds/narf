@@ -337,8 +337,13 @@ PHY B's PLL (DPLL1, `RKL_DPLL_CFGCR*(1)`), its `DPCLKA_CFGCR0` field and its
 DDC pin (`rkl_encoder_to_ddc_pin`) are Tiger Lake's, and the modeset takes
 `rkl_cdclk_table` and the RKL power-well map (no PW_2; Pipe B under PW_3,
 Pipe C under PW_4). Hotplug pairs RKL with TGP (ICP bank) or CMP/CMP2 (SPT
-bank). TC1/TC2 (combo PHY C/D, DPLL4 and the PCH-dependent DDC pins) and the
-internal panel stay unadmitted, so the internal display path still preserves
+bank). TC1/TC2 (DDI D/E) are admitted too as the combo ports they are: PHY C/D
+(`_RKL_COMBOPHY_D` 0x161000), Linux's {DPLL0, DPLL1, DPLL4} pool (a port
+shares a PLL another port runs at its state, else takes its own or the first
+unheld one, as held is read from `DPCLKA_CFGCR0`), RKL's DPCLKA layout, PW_3
+for their lanes and AUX, hotplug on the TGP Type-C pins or the CMP port C/D
+pins, and `rkl_encoder_to_ddc_pin`'s PCH-dependent DDC pins. The internal panel
+stays unadmitted, so the internal display path still preserves
 a firmware-lit display and only an all-pipes-stopped function may start the
 display-less GuC owner.
 

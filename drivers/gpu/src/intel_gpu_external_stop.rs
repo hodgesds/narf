@@ -363,9 +363,14 @@ fn checked(io: &impl MmioWindow, r: u64, v: u32) -> Result<(), FsError> {
 }
 impl Original {
     fn capture(io: &impl MmioWindow, c: &DpConnection, fb: &Framebuffer) -> Result<Self, FsError> {
-        // The stop proof is the DDI B one.
+        // The stop proof is the combo-DDI one: B, and Rocket Lake's TC1/TC2
+        // combo ports (DDI D/E); other display-12 DDIs D and up are Type-C.
+        use crate::intel_gpu_ddi::Ddi;
+        let combo = c.ddi == Ddi::B
+            || (c.family.gen12() == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+                && matches!(c.ddi, Ddi::D | Ddi::E));
         if crate::intel_gpu_aux::SourceFamily::of(io) != Some(c.family)
-            || c.ddi != crate::intel_gpu_ddi::Ddi::B
+            || !combo
             || c.family.gen12() == Some(crate::intel_gpu_gt::Gen12Platform::AlderLakeS)
             || !matches!(c.pipe, Pipe::A | Pipe::B | Pipe::C)
         {

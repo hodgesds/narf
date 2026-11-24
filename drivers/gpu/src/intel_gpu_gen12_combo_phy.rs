@@ -714,6 +714,9 @@ pub struct ComboPhy {
     /// The Gen11 combo PLL the modeset took for a port with no fixed one
     /// (EHL/JSL PORT_D, `arbitrate_combo_dpll`), for a mid-training retune.
     gen11_dpll: Option<crate::intel_gpu_gen11_dpll::IclDpllId>,
+    /// The Rocket Lake PLL index (0/1/2) the modeset arbitrated, and
+    /// whether another port already runs it (a retune must not touch it).
+    rkl_pll: Option<(u32, bool)>,
     family: Gen12Platform,
     /// Gen11 platform when this PHY drives a Gen11 modeset
     /// (Lane 5). `family` is then unused — the table selection
@@ -751,13 +754,20 @@ impl ComboPhy {
         hobl: bool,
         low_vswing: bool,
     ) -> Result<Self, ModesetError> {
-        if ddi as u8 >= Ddi::D as u8 {
-            return Err(ModesetError::UnsupportedGeneration);
-        }
+        // Rocket Lake's TC1/TC2 are combo ports on PHY C/D
+        // (`intel_port_to_phy`); every other display-12 DDI D and up is
+        // Type-C.
+        let phy = match (family, ddi) {
+            (Some(Gen12Platform::RocketLake), Ddi::D) => Ddi::C,
+            (Some(Gen12Platform::RocketLake), Ddi::E) => Ddi::D,
+            (_, ddi) if (ddi as u8) < Ddi::D as u8 => ddi,
+            _ => return Err(ModesetError::UnsupportedGeneration),
+        };
         Ok(Self {
             ddi,
-            phy: ddi,
+            phy,
             gen11_dpll: None,
+            rkl_pll: None,
             family: family.unwrap_or(Gen12Platform::TigerLake),
             gen11: None,
             tgl_uy,
@@ -796,6 +806,7 @@ impl ComboPhy {
             ddi,
             phy,
             gen11_dpll: None,
+            rkl_pll: None,
             family: Gen12Platform::TigerLake,
             gen11: Some(platform),
             tgl_uy: false,
@@ -803,6 +814,13 @@ impl ComboPhy {
             hobl: false,
             low_vswing,
         })
+    }
+
+    /// The Rocket Lake PLL the modeset arbitrated (index, shared with
+    /// another port); `retune_dpll` reprograms it, and refuses a shared one.
+    pub(crate) fn with_rkl_pll(mut self, pll: Option<(u32, bool)>) -> Self {
+        self.rkl_pll = pll;
+        self
     }
 
     /// The combo PLL the modeset arbitrated for a port without a fixed one
@@ -835,6 +853,8 @@ impl ComboPhy {
             Ddi::A => 0x162_000,
             Ddi::B => 0x06C_000,
             Ddi::C => 0x160_000,
+            // PHY D: Rocket Lake's TC2 (`_RKL_COMBOPHY_D`).
+            Ddi::D => 0x161_000,
             _ => 0x160_000,
         }
     }
@@ -843,10 +863,21 @@ impl ComboPhy {
     /// DDIs A/B/C use DPLL 0/1/2 (the DPCLKA default assignment
     /// — the same mapping as `intel_gpu_modeset::dpll_index_for`).
     const fn dpll_enable_off(self) -> u64 {
-        match self.ddi {
-            Ddi::A => DPLL0_ENABLE,
-            Ddi::B => DPLL1_ENABLE,
+        match self.dpll_index() {
+            0 => DPLL0_ENABLE,
+            1 => DPLL1_ENABLE,
             _ => DPLL2_ENABLE,
+        }
+    }
+
+    /// The PLL index this PHY runs from: the Rocket Lake arbitration's, or
+    /// the fixed A/B/C → 0/1/2 assignment.
+    const fn dpll_index(self) -> u32 {
+        match (self.rkl_pll, self.ddi) {
+            (Some((idx, _)), _) => idx,
+            (None, Ddi::A) => 0,
+            (None, Ddi::B) => 1,
+            _ => 2,
         }
     }
 
@@ -1206,6 +1237,10 @@ impl ComboPhy {
             Some(c) => c,
             None => return Err(ModesetError::PllLockTimeout),
         };
+        // Another port runs this PLL: retuning it would move that link too.
+        if self.rkl_pll.is_some_and(|(_, shared)| shared) {
+            return Err(ModesetError::DisplayResourceUnavailable);
+        }
         let enable = self.dpll_enable_off();
         // 1. Stop the DDI buffer + the pattern driver.
         self.rmw(
@@ -1239,9 +1274,9 @@ impl ComboPhy {
         let cur = self.read(io, enable) & !DPLL_STATUS_BITS;
         self.write(io, enable, cur | DPLL_PLL_POWER_ENABLE);
         self.wait(io, enable, DPLL_PLL_POWER_STATE, true, 1)?;
-        let cfgcr0_off = match self.ddi {
-            Ddi::A => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
-            Ddi::B => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL1,
+        let cfgcr0_off = match self.dpll_index() {
+            0 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
+            1 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL1,
             _ => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL2,
         };
         self.write(io, cfgcr0_off, encode_cfgcr0(&coeffs));

@@ -268,6 +268,12 @@ fn pll_hole(family: crate::intel_gpu_aux::SourceFamily, ddi: Option<Ddi>) -> Opt
             crate::intel_gpu_gen11_ddi::phy_for_port(platform, ddi),
             Some(crate::intel_gpu_gen11_ddi::Gen11Phy::Mg { .. })
         ),
+        // Rocket Lake's and Alder Lake S's TC ports are combo PHYs
+        // (`intel_phy_is_tc` false).
+        SourceFamily::Gen12(
+            crate::intel_gpu_gt::Gen12Platform::RocketLake
+            | crate::intel_gpu_gt::Gen12Platform::AlderLakeS,
+        ) => false,
         SourceFamily::Gen12(_) => ddi as u8 >= Ddi::D as u8,
     };
     Some((500_000, if tc { 532_800 } else { 533_200 }))
@@ -1121,7 +1127,9 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
 ) -> Result<HdmiSinkProbe, HdmiError> {
     let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
-    let pch = mmio.gen12_hpd_profile().and_then(|p| p.gen9_gmbus_table());
+    let pch = mmio
+        .gen12_hpd_profile()
+        .and_then(|p| p.gen9_gmbus_table().or_else(|| p.rkl_gmbus_table()));
     let pin = ddc_pin(family, ddc, pch, ddi).ok_or(DdcError::NoPinPair)?;
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
@@ -1303,7 +1311,18 @@ fn ddc_pin(
     ddi: Ddi,
 ) -> Option<PinPair> {
     use crate::intel_gpu_aux::SourceFamily;
+    use crate::intel_gpu_gmbus::GmbusPinTable;
+    use crate::intel_gpu_gt::Gen12Platform::RocketLake;
     match family {
+        // `rkl_encoder_to_ddc_pin`: TC1/TC2 (PHY C/D) take the Type-C pins
+        // with TGP and `GMBUS_PIN_1_BXT + phy` with CMP.
+        SourceFamily::Gen12(RocketLake) => ddc.pin(RocketLake, ddi).or(match (pch, ddi) {
+            (Some(GmbusPinTable::Icp), Ddi::D) => Some(PinPair::Pin9Tc1),
+            (Some(GmbusPinTable::Icp), Ddi::E) => Some(PinPair::Pin10Tc2),
+            (Some(GmbusPinTable::Cnp), Ddi::D) => Some(PinPair::Pin3Bxt),
+            (Some(GmbusPinTable::Cnp), Ddi::E) => Some(PinPair::Pin4Cnp),
+            _ => None,
+        }),
         SourceFamily::Gen12(family) => ddc.pin(family, ddi),
         SourceFamily::Gen11(platform) => crate::intel_gpu_gmbus::gen11_ddc_pin(platform, ddi),
         SourceFamily::Gen9 { .. } => {
@@ -2968,6 +2987,22 @@ pub mod tests {
             || ddc_pin(gen9, &ddc, Some(GmbusPinTable::Cnp), Ddi::C) != Some(PinPair::Pin2Bxt)
         {
             return TestResult::Fail("a Gen9 pin comes from the observed PCH's pin table");
+        }
+        // rkl_encoder_to_ddc_pin: B is pin 2 with either PCH; TC1/TC2 (PHY
+        // C/D) take the Type-C pins with TGP and pins 3/4 with CMP, and have
+        // no default without the PCH. Their HDMI PLL hole is the combo one.
+        let rkl = SourceFamily::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+        if ddc_pin(rkl, &ddc, None, Ddi::B) != Some(PinPair::Pin2Bxt)
+            || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Icp), Ddi::D) != Some(PinPair::Pin9Tc1)
+            || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Icp), Ddi::E) != Some(PinPair::Pin10Tc2)
+            || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Cnp), Ddi::D) != Some(PinPair::Pin3Bxt)
+            || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Cnp), Ddi::E) != Some(PinPair::Pin4Cnp)
+            || ddc_pin(rkl, &ddc, None, Ddi::D).is_some()
+            || pll_hole(rkl, Some(Ddi::D)) != Some((500_000, 533_200))
+        {
+            return TestResult::Fail(
+                "RKL TC1/TC2 DDC pins and PLL hole must follow rkl_encoder_to_ddc_pin",
+            );
         }
         // Probing without a family still refuses before any access.
         if !matches!(

@@ -82,41 +82,92 @@ enum HpdBank {
     Spt,
 }
 
+/// `SHOTPLUG_CTL_TC` (ICP class): the Type-C hotplug pins' nibbles.
+const SHOTPLUG_TC: u64 = 0xc4034;
+
+/// One owned port's bits in its south-display hotplug bank: the SDE
+/// ISR/IMR/IER/IIR bit, the control register holding its nibble, and in it
+/// the enable, the status field and the field's long-pulse value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct HpdPort {
+    ddi: Ddi,
+    owned: u32,
+    ctl: u64,
+    enable: u32,
+    status: u32,
+    long: u32,
+}
+
+/// ICP class, combo B: `SDE_DDI_HOTPLUG_ICP(HPD_PORT_B)`, `SHOTPLUG_CTL_DDI`
+/// bits 7:4.
+const ICP_B: HpdPort = HpdPort {
+    ddi: Ddi::B,
+    owned: 1 << 17,
+    ctl: SHOTPLUG,
+    enable: 0x80,
+    status: 0x30,
+    long: 0x20,
+};
+/// ICP class, Rocket Lake TC1 (DDI D) with TGP (`tgl_hpd_pin`):
+/// `SDE_TC_HOTPLUG_ICP(HPD_PORT_TC1)`, `SHOTPLUG_CTL_TC` bits 3:0.
+const ICP_TC1: HpdPort = HpdPort {
+    ddi: Ddi::D,
+    owned: 1 << 24,
+    ctl: SHOTPLUG_TC,
+    enable: 0x8,
+    status: 0x3,
+    long: 0x2,
+};
+/// ICP class, Rocket Lake TC2 (DDI E): `SHOTPLUG_CTL_TC` bits 7:4.
+const ICP_TC2: HpdPort = HpdPort {
+    ddi: Ddi::E,
+    owned: 1 << 25,
+    ctl: SHOTPLUG_TC,
+    enable: 0x80,
+    status: 0x30,
+    long: 0x20,
+};
+/// SPT class, port B: `SDE_PORTB_HOTPLUG_CPT`, `PCH_PORT_HOTPLUG` bits 4
+/// and 1:0.
+const SPT_B: HpdPort = HpdPort {
+    ddi: Ddi::B,
+    owned: 1 << 21,
+    ctl: SHOTPLUG,
+    enable: 1 << 4,
+    status: 0x3,
+    long: 0x2,
+};
+/// SPT class, Rocket Lake TC1 (DDI D) with CMP (`rkl_hpd_pin`:
+/// `HPD_PORT_C`): `SDE_PORTC_HOTPLUG_CPT`, bits 12 and 9:8.
+const SPT_C: HpdPort = HpdPort {
+    ddi: Ddi::D,
+    owned: 1 << 22,
+    ctl: SHOTPLUG,
+    enable: 1 << 12,
+    status: 0x300,
+    long: 0x200,
+};
+/// SPT class, Rocket Lake TC2 (DDI E) with CMP (`HPD_PORT_D`):
+/// `SDE_PORTD_HOTPLUG_CPT`, bits 20 and 17:16.
+const SPT_D: HpdPort = HpdPort {
+    ddi: Ddi::E,
+    owned: 1 << 23,
+    ctl: SHOTPLUG,
+    enable: 1 << 20,
+    status: 0x3_0000,
+    long: 0x2_0000,
+};
+
 impl HpdBank {
-    /// The owned port's SDE ISR/IMR/IER/IIR bit.
-    const fn owned(self) -> u32 {
-        match self {
-            Self::Icp => 1 << 17,
-            Self::Spt => 1 << 21,
-        }
-    }
-    /// The owned port's hotplug enable in the control register.
-    const fn enable(self) -> u32 {
-        match self {
-            Self::Icp => 0x80,
-            Self::Spt => 1 << 4,
-        }
-    }
-    /// The owned port's status field, and its long-pulse value.
-    const fn status(self) -> u32 {
-        match self {
-            Self::Icp => 0x30,
-            Self::Spt => 0x3,
-        }
-    }
-    const fn long(self) -> u32 {
-        match self {
-            Self::Icp => 0x20,
-            Self::Spt => 0x2,
-        }
-    }
-    /// Every port's write-1-to-clear status bits in the control register,
-    /// kept zero on a write so other ports' events survive.
-    const fn all_status(self) -> u32 {
-        match self {
-            Self::Icp => 0x3333,
+    /// Every port's write-1-to-clear status bits in control register
+    /// `ctl`, kept zero on a write so other ports' events survive.
+    const fn all_status(self, ctl: u64) -> u32 {
+        match (self, ctl) {
+            // TC1..TC6, one nibble each.
+            (Self::Icp, SHOTPLUG_TC) => 0x0033_3333,
+            (Self::Icp, _) => 0x3333,
             // PORTB 1:0, PORTC 9:8, PORTD 17:16, PORTA 25:24.
-            Self::Spt => 0x0303_0303,
+            (Self::Spt, _) => 0x0303_0303,
         }
     }
 }
@@ -217,6 +268,23 @@ impl HpdProfile {
             _ => None,
         }
     }
+    /// The GMBUS pin table of a Rocket Lake source's observed PCH:
+    /// `gmbus_pins_icp` with TGP, `gmbus_pins_cnp` with CMP/CMP2 (CNP
+    /// compatible). `None` for every other family.
+    pub(crate) fn rkl_gmbus_table(&self) -> Option<crate::intel_gpu_gmbus::GmbusPinTable> {
+        use crate::intel_gpu_gmbus::GmbusPinTable;
+        if self.family
+            != crate::intel_gpu_aux::SourceFamily::Gen12(
+                crate::intel_gpu_gt::Gen12Platform::RocketLake,
+            )
+        {
+            return None;
+        }
+        Some(match self.bank() {
+            HpdBank::Icp => GmbusPinTable::Icp,
+            HpdBank::Spt => GmbusPinTable::Cnp,
+        })
+    }
     /// The bank this profile's south display uses: the SPT layout for an
     /// SPT-class PCH (every Gen9 pairing, and Rocket Lake on CMP), the ICP
     /// layout otherwise.
@@ -224,6 +292,22 @@ impl HpdProfile {
         match self.device & 0xff80 {
             0xa100 | 0x9d00 | 0xa280 | 0xa300 | 0x9d80 | 0x0280 | 0x0680 | 0xa380 => HpdBank::Spt,
             _ => HpdBank::Icp,
+        }
+    }
+    /// The ports this profile's monitor owns: combo B, and on Rocket Lake
+    /// also its TC1/TC2 combo ports (DDI D/E) on the PCH's pins for them.
+    const fn ports(&self) -> &'static [HpdPort] {
+        let rkl = matches!(
+            self.family,
+            crate::intel_gpu_aux::SourceFamily::Gen12(
+                crate::intel_gpu_gt::Gen12Platform::RocketLake
+            )
+        );
+        match (self.bank(), rkl) {
+            (HpdBank::Icp, false) => &[ICP_B],
+            (HpdBank::Icp, true) => &[ICP_B, ICP_TC1, ICP_TC2],
+            (HpdBank::Spt, false) => &[SPT_B],
+            (HpdBank::Spt, true) => &[SPT_B, SPT_C, SPT_D],
         }
     }
     /// [`Self::from_observed`] for any source family ([`Self::for_source`]).
@@ -297,14 +381,17 @@ pub enum HpdEvent {
     RetrainRequired(Ddi),
 }
 
-/// Combo DDIs the monitor watches, in poll order.
-const COMBO_DDIS: [Ddi; 1] = [Ddi::B];
+/// Most ports one profile owns ([`HpdProfile::ports`]).
+const MAX_PORTS: usize = 3;
 
-/// Retained source-exposed combo-B latch monitor. Probe and the existing runtime actor poll it;
+/// The control registers a bank's ports live in.
+const CTL_REGS: [u64; 2] = [SHOTPLUG, SHOTPLUG_TC];
+
+/// Retained source-exposed combo latch monitor. Probe and the existing runtime actor poll it;
 /// owned interrupt sources remain masked until a display IRQ owner exists.
 #[derive(Debug, Default)]
 pub struct HpdMonitor {
-    level: [bool; 1],
+    level: [bool; MAX_PORTS],
     pending: u32,
     long: u32,
     profile: Option<HpdProfile>,
@@ -314,7 +401,7 @@ pub struct HpdMonitor {
 impl HpdMonitor {
     pub const fn new() -> Self {
         Self {
-            level: [false; 1],
+            level: [false; MAX_PORTS],
             pending: 0,
             long: 0,
             profile: None,
@@ -327,6 +414,26 @@ impl HpdMonitor {
     }
     fn bank(&self) -> HpdBank {
         self.profile.map_or(HpdBank::Icp, |p| p.bank())
+    }
+    fn ports(&self) -> &'static [HpdPort] {
+        self.profile.map_or(&[ICP_B], |p| p.ports())
+    }
+    /// The owned SDE bits, and per control register the owned enables and
+    /// status fields (`(reg, enable, status)`, registers no port uses
+    /// skipped).
+    fn owned(&self) -> (u32, [(u64, u32, u32); 2]) {
+        let mut sde = 0;
+        let mut regs = CTL_REGS.map(|reg| (reg, 0, 0));
+        for port in self.ports() {
+            sde |= port.owned;
+            for (reg, enable, status) in regs.iter_mut() {
+                if *reg == port.ctl {
+                    *enable |= port.enable;
+                    *status |= port.status;
+                }
+            }
+        }
+        (sde, regs)
     }
     fn qualify<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
         let Some(profile) = io.gen12_hpd_profile() else {
@@ -353,7 +460,7 @@ impl HpdMonitor {
             return;
         }
         let bank = self.bank();
-        let owned = bank.owned();
+        let (owned, regs) = self.owned();
         let ier = io.read32(SDE_IER);
         let imr = io.read32(SDE_IMR);
         if !io.display_access_ok() {
@@ -383,25 +490,32 @@ impl HpdMonitor {
         if captured != 0 {
             io.write32(SDE_IIR, captured);
         }
-        let ctl = io.read32(SHOTPLUG);
-        if ctl == u32::MAX || !io.display_access_ok() {
-            self.uncertain = true;
-            return;
+        for (reg, enable, status) in regs {
+            if enable == 0 {
+                continue;
+            }
+            let ctl = io.read32(reg);
+            if ctl == u32::MAX || !io.display_access_ok() {
+                self.uncertain = true;
+                return;
+            }
+            io.write32(reg, (ctl & !bank.all_status(reg)) | (ctl & status) | enable);
         }
-        io.write32(
-            SHOTPLUG,
-            (ctl & !bank.all_status()) | (ctl & bank.status()) | bank.enable(),
-        );
         let observed_ier = io.read32(SDE_IER);
         let observed_imr = io.read32(SDE_IMR);
-        let observed_ctl = io.read32(SHOTPLUG);
-        if !io.display_access_ok()
-            || observed_ier & owned != owned
-            || observed_imr & owned != owned
-            || observed_ctl == u32::MAX
-            || observed_ctl & bank.enable() != bank.enable()
-            || observed_ctl & bank.status() != 0
-        {
+        let mut ok = io.display_access_ok()
+            && observed_ier & owned == owned
+            && observed_imr & owned == owned;
+        for (reg, enable, status) in regs {
+            if enable == 0 {
+                continue;
+            }
+            let observed_ctl = io.read32(reg);
+            ok &= observed_ctl != u32::MAX
+                && observed_ctl & enable == enable
+                && observed_ctl & status == 0;
+        }
+        if !ok || !io.display_access_ok() {
             self.uncertain = true;
         } else {
             self.pending &= !captured;
@@ -414,7 +528,8 @@ impl HpdMonitor {
             return None;
         }
         let bank = self.bank();
-        let owned = bank.owned();
+        let ports = self.ports();
+        let (owned, _) = self.owned();
         if !self.initialized {
             self.enable_interrupts(io);
             if !self.initialized || self.uncertain {
@@ -431,25 +546,38 @@ impl HpdMonitor {
         self.pending |= captured; // retain before the first owned W1C
         if captured != 0 {
             io.write32(SDE_IIR, captured); // source ACK order: south IIR before SHOTPLUG
-            let ctl = io.read32(SHOTPLUG);
-            if ctl == u32::MAX || !io.display_access_ok() {
-                self.uncertain = true;
-                return None;
-            }
-            let status = ctl & bank.status();
-            if status & bank.long() == bank.long() {
-                self.long |= owned;
-            }
-            // Never carry another owner's read-one status into a W1C write.
-            io.write32(SHOTPLUG, (ctl & !bank.all_status()) | status);
-            if !io.display_access_ok() {
-                self.uncertain = true;
-                return None;
+            for reg in CTL_REGS {
+                let in_reg = || {
+                    ports
+                        .iter()
+                        .filter(|p| p.ctl == reg && captured & p.owned != 0)
+                };
+                if in_reg().next().is_none() {
+                    continue;
+                }
+                let ctl = io.read32(reg);
+                if ctl == u32::MAX || !io.display_access_ok() {
+                    self.uncertain = true;
+                    return None;
+                }
+                let mut status = 0;
+                for port in in_reg() {
+                    let own = ctl & port.status;
+                    if own & port.long == port.long {
+                        self.long |= port.owned;
+                    }
+                    status |= own;
+                }
+                // Never carry another owner's read-one status into a W1C write.
+                io.write32(reg, (ctl & !bank.all_status(reg)) | status);
+                if !io.display_access_ok() {
+                    self.uncertain = true;
+                    return None;
+                }
             }
         }
-        for (index, ddi) in COMBO_DDIS.iter().copied().enumerate() {
-            // COMBO_DDIS is combo B alone: the bank's owned bit.
-            let bit = owned;
+        for (index, port) in ports.iter().enumerate() {
+            let (ddi, bit) = (port.ddi, port.owned);
             let now = levels & bit != 0;
             // Live ISR may be low during a legal short pulse. Source long
             // detection gates removal; no single low sample proves unplug.
@@ -476,7 +604,6 @@ impl HpdMonitor {
     }
 }
 
-/// The process-wide HPD monitor the production poll path uses.
 static HPD_MONITOR: IrqSafeSpinLock<HpdMonitor> = IrqSafeSpinLock::new(HpdMonitor::new());
 
 /// Poll the shared HPD monitor once (production entry point;
@@ -584,8 +711,8 @@ pub(crate) fn request_port_wells<M: MmioWindow + ?Sized>(
     let Some(idx) = combo_port_well(family, ddi) else {
         return PortWells::default();
     };
-    let (req, state) = (2u32 << (idx * 2), 1u32 << (idx * 2));
-    let raise = |reg: u64| {
+    let raise = |reg: u64, idx: u32| {
+        let (req, state) = (2u32 << (idx * 2), 1u32 << (idx * 2));
         let cur = mmio.read32(reg);
         if cur == u32::MAX || !mmio.display_access_ok() || cur & req != 0 {
             return 0;
@@ -597,8 +724,14 @@ pub(crate) fn request_port_wells<M: MmioWindow + ?Sized>(
         );
         req
     };
-    let ddi_bit = raise(PWR_WELL_CTL_DDI2);
-    let aux_bit = raise(PWR_WELL_CTL_AUX2);
+    // Rocket Lake's TC1/TC2 lanes and AUX sit in PW_3's domains
+    // (`RKL_PW_3_POWER_DOMAINS`). PW_3 is also Pipe B's well, which the
+    // modeset raises and never drops, so it is raised here and not held.
+    if family == crate::intel_gpu_gt::Gen12Platform::RocketLake && matches!(ddi, Ddi::D | Ddi::E) {
+        let _ = raise(crate::intel_gpu_modeset::PWR_WELL_CTL2, 2);
+    }
+    let ddi_bit = raise(PWR_WELL_CTL_DDI2, idx);
+    let aux_bit = raise(PWR_WELL_CTL_AUX2, idx);
     PortWells {
         aux: aux_bit,
         ddi: ddi_bit,
@@ -2359,18 +2492,146 @@ pub mod tests {
             }
         }
         // SPT's PORTB: ISR bit 21, enable bit 4, status 1:0 (long 2).
-        let spt = HpdBank::Spt;
-        if spt.owned() != 1 << 21
-            || spt.enable() != 1 << 4
-            || spt.status() != 3
-            || spt.long() != 2
-            || spt.all_status() & spt.status() != spt.status()
+        let spt = super::SPT_B;
+        if spt.owned != 1 << 21
+            || spt.enable != 1 << 4
+            || spt.status != 3
+            || spt.long != 2
+            || HpdBank::Spt.all_status(super::SHOTPLUG) & spt.status != spt.status
         {
             return TestResult::Fail("the SPT bank must follow PCH_PORT_HOTPLUG");
         }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_profile_gen11_icp_pchs);
+
+    /// A south display alone: a fixed PCH profile, ISR levels, IIR latches
+    /// cleared by their write-1 ACK, and write-1-to-clear status in both
+    /// hotplug control registers.
+    struct SouthHpd {
+        profile: HpdProfile,
+        level: core::cell::Cell<u32>,
+        iir: core::cell::Cell<u32>,
+        regs: core::cell::RefCell<alloc::collections::BTreeMap<u64, u32>>,
+        writes: core::cell::RefCell<Vec<(u64, u32)>>,
+    }
+    impl SouthHpd {
+        fn new(family: crate::intel_gpu_gt::Gen12Platform, pch: u16) -> Self {
+            Self {
+                profile: HpdProfile::from_identity(family, 0x8086, pch, 0x060100)
+                    .expect("a qualified PCH"),
+                level: Default::default(),
+                iir: Default::default(),
+                regs: Default::default(),
+                writes: Default::default(),
+            }
+        }
+        fn reg(&self, off: u64) -> u32 {
+            *self.regs.borrow().get(&off).unwrap_or(&0)
+        }
+        fn writes_to(&self, off: u64) -> Vec<u32> {
+            self.writes
+                .borrow()
+                .iter()
+                .filter(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
+                .collect()
+        }
+    }
+    impl MmioWindow for SouthHpd {
+        fn gen12_hpd_profile(&self) -> Option<HpdProfile> {
+            Some(self.profile)
+        }
+        fn read32(&self, off: u64) -> u32 {
+            match off {
+                SDE_ISR => self.level.get(),
+                SDE_IIR => self.iir.get(),
+                super::FILTER => 0xf8,
+                _ => self.reg(off),
+            }
+        }
+        fn write32(&self, off: u64, val: u32) {
+            self.writes.borrow_mut().push((off, val));
+            match off {
+                SDE_IIR => self.iir.set(self.iir.get() & !val),
+                super::SHOTPLUG | super::SHOTPLUG_TC => {
+                    let w1c = self.profile.bank().all_status(off);
+                    let old = self.reg(off);
+                    self.regs
+                        .borrow_mut()
+                        .insert(off, (val & !w1c) | (old & w1c & !val));
+                }
+                _ => {
+                    self.regs.borrow_mut().insert(off, val);
+                }
+            }
+        }
+    }
+
+    /// Rocket Lake's monitor owns TC1/TC2 beside combo B: with TGP on the
+    /// Type-C pins (`SDE_TC_HOTPLUG_ICP` bits 24/25, `SHOTPLUG_CTL_TC`
+    /// nibbles 3:0 and 7:4), with CMP as SPT ports C/D (bits 22/23,
+    /// `PCH_PORT_HOTPLUG` enables 12/20). A TC1 plug reports DDI D, its
+    /// long-pulse unplug clears only its own TC nibble. Tiger Lake keeps
+    /// combo B alone and never touches `SHOTPLUG_CTL_TC`.
+    fn smoke_hpd_rkl_owns_tc1_tc2_on_either_pch() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform::{RocketLake, TigerLake};
+        let tgp = SouthHpd::new(RocketLake, 0x4388);
+        let mut monitor = HpdMonitor::new();
+        if monitor.poll(&tgp).is_some()
+            || tgp.read32(SDE_IMR) & 0x0302_0000 != 0x0302_0000
+            || tgp.read32(SDE_IER) & 0x0302_0000 != 0x0302_0000
+            || tgp.reg(super::SHOTPLUG) & 0x80 == 0
+            || tgp.reg(super::SHOTPLUG_TC) & 0x88 != 0x88
+        {
+            return TestResult::Fail("RKL+TGP must arm B and the TC1/TC2 pins");
+        }
+        tgp.level.set(1 << 24);
+        if monitor.poll(&tgp) != Some(HpdEvent::Connected(Ddi::D)) {
+            return TestResult::Fail("a TC1 level must connect DDI D");
+        }
+        // Unplug: level low, IIR latched, TC1's long pulse in SHOTPLUG_CTL_TC
+        // beside TC2's (foreign) short pulse.
+        tgp.level.set(0);
+        tgp.iir.set(1 << 24);
+        tgp.regs
+            .borrow_mut()
+            .insert(super::SHOTPLUG_TC, 0x88 | 0x2 | 0x10);
+        tgp.writes.borrow_mut().clear();
+        if monitor.poll(&tgp) != Some(HpdEvent::Disconnected(Ddi::D)) {
+            return TestResult::Fail("TC1's long-pulse unplug must disconnect DDI D");
+        }
+        if tgp.writes_to(super::SHOTPLUG_TC) != [0x88 | 0x2]
+            || tgp.reg(super::SHOTPLUG_TC) != 0x88 | 0x10
+        {
+            return TestResult::Fail("the ACK must clear TC1's status and keep TC2's");
+        }
+        let cmp = SouthHpd::new(RocketLake, 0x0687);
+        let mut monitor = HpdMonitor::new();
+        let _ = monitor.poll(&cmp);
+        let enables = (1 << 4) | (1 << 12) | (1 << 20);
+        if cmp.read32(SDE_IMR) & 0x00E0_0000 != 0x00E0_0000
+            || cmp.reg(super::SHOTPLUG) & enables != enables
+            || !cmp.writes_to(super::SHOTPLUG_TC).is_empty()
+        {
+            return TestResult::Fail("RKL+CMP must arm SPT ports B, C and D");
+        }
+        cmp.level.set(1 << 23);
+        if monitor.poll(&cmp) != Some(HpdEvent::Connected(Ddi::E)) {
+            return TestResult::Fail("SPT port D must connect RKL's DDI E");
+        }
+        let tgl = SouthHpd::new(TigerLake, 0xa082);
+        let mut monitor = HpdMonitor::new();
+        let _ = monitor.poll(&tgl);
+        if tgl.read32(SDE_IMR) != 1 << 17 || !tgl.writes_to(super::SHOTPLUG_TC).is_empty() {
+            return TestResult::Fail("Tiger Lake must keep combo B alone");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_hpd_rkl_owns_tc1_tc2_on_either_pch
+    );
 
     /// A power-well block whose STATE bits follow REQUEST in the driver
     /// AUX and DDI request registers.
