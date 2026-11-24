@@ -2608,23 +2608,24 @@ fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
     //
     // The frame binary doesn't expose these as library symbols, so
     // we check the system-register state directly: `str` + `ltr`
-    // operate on the task-register selector (TSS_SEL = 0x18), and
+    // operate on the task-register selector (TSS_SEL = 0x40), and
     // MSR reads for IA32_GS_BASE are always legal at CPL=0.
     use core::arch::asm;
     use narf_arch::x86_64::msr;
+    use narf_arch::x86_64::segments::TSS_SELECTOR;
 
     const IA32_GS_BASE: u32 = 0xC0000101;
     const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
 
     // Confirm the task register still points at the TSS selector
-    // GDT installed (0x18). A failure here means boot changed
+    // GDT installed (0x40). A failure here means boot changed
     // something we shouldn't have.
     let tr: u16;
     // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("str {t:x}", t = out(reg) tr, options(nomem, nostack, preserves_flags));
     }
-    if tr != 0x18 {
+    if tr != TSS_SELECTOR {
         return TestResult::Fail("task register is not the post-init TSS selector");
     }
 
