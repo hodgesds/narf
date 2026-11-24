@@ -11,6 +11,9 @@
 //!
 //! - Linux `drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c` — VCN 4.0
 //!   (Phoenix / Strix family) ring + decode-buffer setup
+//! - Linux `drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c` — VCN 4.0.3
+//!   (separate `vcn_v4_0_3` + `jpeg_v4_0_3` blocks; unified ring;
+//!   firmware `amdgpu/vcn_4_0_3.bin`)
 //! - Linux `drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c` — VCN 3.0
 //!   (Navi2, RDNA2)
 //! - Linux `drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c` — VCN 2.0
@@ -56,17 +59,22 @@ pub enum VcnVersion {
     /// VCN 2.0 — Renoir, Lucienne. H.264/HEVC/VP9 dec; H.264/HEVC
     /// enc. No AV1.
     V2_0,
-    /// VCN 2.5 — UVD 2.5.0 (GC 9.4.1 die). Same codecs as 2.0.
-    /// No APU in scope reports UVD 2.5.0 — Cezanne/Barcelo are
-    /// UVD 2.2.0 and map to `V2_0` per Linux (`vcn_v2_0` block).
-    /// Kept so the Linux block stays representable.
-    V2_5,
     /// VCN 3.0 — Navi2 RDNA2.
     V3_0,
     /// VCN 4.0 — Navi3 (UVD 4.0.0) / Phoenix (UVD 4.0.2).
     /// AV1 dec + enc. Linux `vcn_v4_0` block
     /// (`amdgpu_discovery.c`: 4.0.0/4.0.2/4.0.4 → `vcn_v4_0`).
     V4_0_2,
+    /// VCN 4.0.3 — UVD 4.0.3. Linux `vcn_v4_0_3` block
+    /// (`amdgpu_discovery.c`: 4.0.3 → `vcn_v4_0_3` + `jpeg_v4_0_3`;
+    /// firmware `amdgpu/vcn_4_0_3.bin`, `amdgpu_vcn.c`). No
+    /// family is known to report 4.0.3 — no hardcoded per-die
+    /// entry assigns it — so it is reached only via
+    /// `from_uvd_version`, never `from_family`. Unified ring
+    /// (`vcn_v4_0_3_unified_ring_*`). Codec set mirrors the 4.0
+    /// family; whether 4.0.3 behaves differently from `vcn_v4_0`
+    /// beyond the ring is unpinned (audit lane 10).
+    V4_0_3,
     /// VCN 4.0.5 — Strix (UVD 4.0.5/4.0.6). AV1 dec + enc.
     /// Linux `vcn_v4_0_5` block.
     V4_0_5,
@@ -88,18 +96,37 @@ impl VcnVersion {
         }
     }
 
+    /// Resolve from a discovered UVD (VCN) IP version triple, as
+    /// reported by the discovery blob (`major`, `minor`,
+    /// `revision` — `amdgpu_discovery::IpBlock`). This mirrors the
+    /// Linux `amdgpu_discovery.c` VCN switch verbatim (7.4-rc2):
+    /// 2.0.0/2.0.2/2.2.0 → `vcn_v2_0`; 3.0.0/3.0.16/3.1.1/3.1.2/
+    /// 3.0.2/3.0.33 → `vcn_v3_0`; 4.0.0/4.0.2/4.0.4 → `vcn_v4_0`;
+    /// 4.0.3 → `vcn_v4_0_3`; 4.0.5/4.0.6 → `vcn_v4_0_5`.
+    /// Returns `None` where Linux adds no block (2.0.3) or where
+    /// no variant exists: 2.5.0 (`vcn_v2_5`, GC 9.4.1 die — no
+    /// in-scope chip reports it) and 2.6.0 (`vcn_v2_6`), the 1.x
+    /// UVD blocks, and 5.x (VCN5, the Navi48 owner's domain).
+    /// `from_family` stays the family-level routing; this is the
+    /// per-chip routing, so any chip reporting 4.0.3 lands on
+    /// `V4_0_3` without a family assignment.
+    pub fn from_uvd_version(major: u8, minor: u8, revision: u8) -> Option<Self> {
+        match (major, minor, revision) {
+            (2, 0, 0) | (2, 0, 2) | (2, 2, 0) => Some(VcnVersion::V2_0),
+            (3, 0, 0) | (3, 0, 16) | (3, 1, 1) | (3, 1, 2) | (3, 0, 2) | (3, 0, 33) => {
+                Some(VcnVersion::V3_0)
+            }
+            (4, 0, 0) | (4, 0, 2) | (4, 0, 4) => Some(VcnVersion::V4_0_2),
+            (4, 0, 3) => Some(VcnVersion::V4_0_3),
+            (4, 0, 5) | (4, 0, 6) => Some(VcnVersion::V4_0_5),
+            _ => None,
+        }
+    }
+
     /// Codec coverage flags. Bitmask of [`CodecBits`].
     pub fn codec_caps(self) -> u32 {
         match self {
             VcnVersion::V2_0 => {
-                CodecBits::H264_DEC
-                    | CodecBits::H264_ENC
-                    | CodecBits::HEVC_DEC
-                    | CodecBits::HEVC_ENC
-                    | CodecBits::VP9_DEC
-                    | CodecBits::JPEG_DEC
-            }
-            VcnVersion::V2_5 => {
                 CodecBits::H264_DEC
                     | CodecBits::H264_ENC
                     | CodecBits::HEVC_DEC
@@ -117,6 +144,16 @@ impl VcnVersion {
                     | CodecBits::JPEG_DEC
             }
             VcnVersion::V4_0_2 => {
+                CodecBits::H264_DEC
+                    | CodecBits::H264_ENC
+                    | CodecBits::HEVC_DEC
+                    | CodecBits::HEVC_ENC
+                    | CodecBits::VP9_DEC
+                    | CodecBits::AV1_DEC
+                    | CodecBits::AV1_ENC
+                    | CodecBits::JPEG_DEC
+            }
+            VcnVersion::V4_0_3 => {
                 CodecBits::H264_DEC
                     | CodecBits::H264_ENC
                     | CodecBits::HEVC_DEC
@@ -536,9 +573,12 @@ impl EncodeSession {
             return Err(VideoError::BadHandle);
         }
         // vcn_v4+ uses a unified queue (one ring for both dec + enc).
-        // Both 4.0-family variants (V4_0_2 for Navi3/Phoenix,
-        // V4_0_5 for Strix) use it.
-        let unified_ring = matches!(ip, VcnVersion::V4_0_2 | VcnVersion::V4_0_5);
+        // All 4.0-family variants use it: V4_0_2 (Navi3/Phoenix),
+        // V4_0_3 (`vcn_v4_0_3_unified_ring_*`), V4_0_5 (Strix).
+        let unified_ring = matches!(
+            ip,
+            VcnVersion::V4_0_2 | VcnVersion::V4_0_3 | VcnVersion::V4_0_5
+        );
         Ok(Self {
             ip,
             codec,
@@ -885,6 +925,31 @@ mod smoke_tests {
         if VcnVersion::from_family(Family::Vega).is_some() {
             return TestResult::Fail("Vega should report no VCN");
         }
+        // Per-chip discovery routing mirrors the Linux switch.
+        if VcnVersion::from_uvd_version(4, 0, 3) != Some(VcnVersion::V4_0_3) {
+            return TestResult::Fail("UVD 4.0.3 should route to V4_0_3");
+        }
+        if VcnVersion::from_uvd_version(4, 0, 0) != Some(VcnVersion::V4_0_2)
+            || VcnVersion::from_uvd_version(4, 0, 4) != Some(VcnVersion::V4_0_2)
+        {
+            return TestResult::Fail("UVD 4.0.0/4.0.4 should route to V4_0_2");
+        }
+        if VcnVersion::from_uvd_version(4, 0, 5) != Some(VcnVersion::V4_0_5)
+            || VcnVersion::from_uvd_version(4, 0, 6) != Some(VcnVersion::V4_0_5)
+        {
+            return TestResult::Fail("UVD 4.0.5/4.0.6 should route to V4_0_5");
+        }
+        if VcnVersion::from_uvd_version(2, 0, 3).is_some() {
+            return TestResult::Fail("UVD 2.0.3 adds no block in Linux");
+        }
+        // 2.5.0 has a Linux block but no variant: no in-scope chip
+        // reports it, so it is unrepresentable by design.
+        if VcnVersion::from_uvd_version(2, 5, 0).is_some() {
+            return TestResult::Fail("UVD 2.5.0 should route to no variant");
+        }
+        if VcnVersion::from_uvd_version(5, 0, 0).is_some() {
+            return TestResult::Fail("UVD 5.x belongs to the VCN5 owner, not this map");
+        }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_vcn_version_per_family);
@@ -893,6 +958,10 @@ mod smoke_tests {
         // Phoenix has AV1 encode.
         if !VcnVersion::V4_0_2.supports_encode(Codec::Av1) {
             return TestResult::Fail("Phoenix should support AV1 enc");
+        }
+        // 4.0.3 mirrors the 4.0 family: AV1 encode.
+        if !VcnVersion::V4_0_3.supports_encode(Codec::Av1) {
+            return TestResult::Fail("VCN 4.0.3 should support AV1 enc");
         }
         // Renoir does NOT have AV1.
         if VcnVersion::V2_0.supports_decode(Codec::Av1) {
@@ -912,9 +981,9 @@ mod smoke_tests {
         // H.264 dec everywhere.
         for v in [
             VcnVersion::V2_0,
-            VcnVersion::V2_5,
             VcnVersion::V3_0,
             VcnVersion::V4_0_2,
+            VcnVersion::V4_0_3,
             VcnVersion::V4_0_5,
         ] {
             if !v.supports_decode(Codec::H264) {
