@@ -321,7 +321,7 @@ impl Plan {
         boot_framebuffer: Range<u64>,
         other_clients: &[Range<u64>],
     ) -> Result<Self, Error> {
-        let ip = amdgpu_dmub::dcn31x_ip(gpu).map_err(|_| Error::Unsupported)?;
+        let ip = amdgpu_dmub::dmub_ip(gpu).map_err(|_| Error::Unsupported)?;
         if ip.num_bases < 3 {
             return Err(Error::Unsupported);
         }

@@ -136,7 +136,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
 fn fixture_dcn21(cached: bool) -> (Pool, Engine<Fake>) {
     // The shipping green_sardine blob is 0x0101002B (uncached); a blob
     // above 1.10.0 takes the cached CW4 path.
-    let version = if cached { 0x010b_0000 } else { 0x0101_002b };
+    let version: u32 = if cached { 0x010b_0000 } else { 0x0101_002b };
     let mut bytes = super::super::amdgpu_dmub_firmware::tests::combined(256, 4);
     let meta = bytes.len() - 256 - 4 - 64;
     bytes[meta + 12..meta + 16].copy_from_slice(&version.to_le_bytes());

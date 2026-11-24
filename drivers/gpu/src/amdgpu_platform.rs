@@ -762,7 +762,7 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
             // Rembrandt: MP0 13.0.1 and 13.0.3 both decode to the `yellow_carp`
             // legacy name (`amdgpu_ucode_legacy_naming`), so both load the
             // same TOC (`psp_v13_0.c`).
-            (13, 0, 1) | (13, 0, 3) => Some("amdgpu/yellow_carp_toc.bin"),
+            (13, 0, 1) | (13, 0, 3) => Some(("amdgpu/yellow_carp_toc.bin", true)),
             _ => None,
         }
     })

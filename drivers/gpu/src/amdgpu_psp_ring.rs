@@ -1891,7 +1891,7 @@ impl<I: Io> Session<I> {
         let result = self
             .engine
             .submit(&command(
-                crate::amdgpu_psp::gfx_ctrl_cmd_id::LOAD_ASD,
+                crate::amdgpu_psp::gfx_cmd_id::LOAD_ASD,
                 &[address as u32, (address >> 32) as u32, size, 0, 0, 0],
             ))
             .await;

@@ -580,7 +580,8 @@ kernel_test_in!(
 /// `version` is the header version pair; `asd_payload` must not pin it.
 fn asd_container(payload_len: usize, version: (u16, u16)) -> Vec<u8> {
     let mut bytes = vec![0u8; 44 + payload_len];
-    bytes[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+    let len = bytes.len() as u32;
+    bytes[0..4].copy_from_slice(&len.to_le_bytes());
     bytes[4..8].copy_from_slice(&44u32.to_le_bytes());
     bytes[8..10].copy_from_slice(&version.0.to_le_bytes());
     bytes[10..12].copy_from_slice(&version.1.to_le_bytes());
