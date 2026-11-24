@@ -911,9 +911,23 @@ impl Platform for Physical {
         ) {
             return Err(crate::dp_aux::AuxError::Nacked);
         }
-        // XELPDP AUX_A is the DDI A block (XeLpgPort::A.aux_base()).
-        crate::intel_gpu_aux::IntelAux::new(self, crate::intel_gpu_ddi::Ddi::A)
-            .transact(request, reply)
+        // XELPDP AUX_A is the DDI A block (XeLpgPort::A.aux_base()); on
+        // display >= 20 it lives in the PICA block (`__xe2lpd_aux_ch_idx`).
+        match self.generation {
+            Generation::LunarLake => {
+                let pica = crate::intel_gpu_xe2lpd::PicaFlushed(self);
+                crate::intel_gpu_aux::IntelAux::new(&pica, crate::intel_gpu_ddi::Ddi::A)
+                    .transact(request, reply)
+            }
+            Generation::PantherLake => {
+                let flush = self.display30.is_some_and(|d30| d30.flush);
+                let view = crate::intel_gpu_xe3lpd::View::new(self, flush);
+                crate::intel_gpu_aux::IntelAux::new(&view, crate::intel_gpu_ddi::Ddi::A)
+                    .transact(request, reply)
+            }
+            _ => crate::intel_gpu_aux::IntelAux::new(self, crate::intel_gpu_ddi::Ddi::A)
+                .transact(request, reply),
+        }
     }
     fn psr_wm_level_disabled(&self) -> Option<bool> {
         crate::intel_gpu_psr::wm_level_disabled()
@@ -977,7 +991,7 @@ fn with_panel_modeset<R>(
 ) -> Result<R, FsError> {
     use crate::intel_gpu_aux::MmioWindow;
     use crate::intel_gpu_modeset_xelpg::XeLpgModeset;
-    use crate::intel_gpu_xe2lpd::{DisplayIp, Flushed};
+    use crate::intel_gpu_xe2lpd::{DisplayIp, PicaFlushed};
     use crate::intel_gpu_xe3lpd::View;
     use crate::intel_gpu_xelpg::XeLpgPort;
     match io.generation {
@@ -987,8 +1001,9 @@ fn with_panel_modeset<R>(
             f(&mut ms).map_err(panel_modeset_error)
         }
         Generation::LunarLake => {
-            let flushed = Flushed(io);
-            let view: &dyn MmioWindow = &flushed;
+            // Display 20: DDI A's PHY and AUX live in the PICA block.
+            let pica = PicaFlushed(io);
+            let view: &dyn MmioWindow = &pica;
             let mut ms = XeLpgModeset::new(view, XeLpgPort::A).with_display_ip(DisplayIp::Xe2Lpd);
             f(&mut ms).map_err(panel_modeset_error)
         }
