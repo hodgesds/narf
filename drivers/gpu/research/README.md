@@ -32,6 +32,9 @@
   RDNA2 APU's graphics needs beyond the discrete Navi22 cold boot: GC 10.3.6
   against 10.3.2 in `gfx_v10_0.c`, PSP/SMU 13.0.5, MMHUB 2.3, NBIO 7.x, who
   owns the PSP, and the order of work.
+- [Intel GPU follow-ups plan](intel-followups-plan.md) — the remaining Gen9
+  and Gen11 remainders, display gaps, Open capability rows and §6 programmes,
+  in lane order, with the scope and Comet Lake revision decisions.
 
 ## Open research questions
 
