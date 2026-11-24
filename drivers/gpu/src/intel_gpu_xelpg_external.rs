@@ -651,6 +651,7 @@ pub(crate) fn external_pipe(
         combo_phy: port.tc_index().is_none().then_some(port.phy_index() as u8),
         dsc,
         pipe_bpp,
+        scaler: None,
     })
 }
 

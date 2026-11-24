@@ -437,7 +437,7 @@ impl ExtFake {
     }
 
     /// Light the owned panel with `ip`'s resource state.
-    fn light_panel_ip(&self, ip: DisplayIp) -> Option<Mode> {
+    pub(crate) fn light_panel_ip(&self, ip: DisplayIp) -> Option<Mode> {
         let mode = Mode::VESA_1024X768_60;
         self.display_ip.set(ip);
         self.phy.c20_port_b.set(ip == DisplayIp::Xe3Lpd);

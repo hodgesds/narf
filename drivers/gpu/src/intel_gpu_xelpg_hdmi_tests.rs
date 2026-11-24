@@ -274,6 +274,7 @@ fn hdmi_probe_b() -> MtlHdmiProbe {
         sink: SinkScdc::default(),
         link: TmdsLink::default(),
         ddc: PinPair::Pin2Bxt,
+        format: crate::intel_gpu_hdmi::SinkFormat::Rgb,
         edid: alloc::boxed::Box::new([0; crate::intel_gpu_hdmi::EDID_CAPACITY]),
         edid_len: 0,
     }
@@ -639,6 +640,112 @@ fn smoke_mtl_routes_leave_stack_for_resource_planning() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_hdmi",
     smoke_mtl_routes_leave_stack_for_resource_planning
+);
+
+/// HDMI VSDB (`cea_db_is_hdmi_vsdb`): vendor tag 3, payload 5, the HDMI
+/// OUI LSB first, physical address 1.0.0.0.
+const HDMI_VSDB: [u8; 6] = [(3 << 5) | 5, 0x03, 0x0C, 0x00, 0x10, 0x00];
+
+/// A 4K60 (VIC 97) sink with an HDMI VSDB and no HF-VSDB, so 594 MHz RGB
+/// has no valid TMDS link, plus `blocks`.
+fn edid_4k60_y420(blocks: &[u8]) -> Vec<u8> {
+    let mut all = HDMI_VSDB.to_vec();
+    all.extend_from_slice(blocks);
+    edid_with_cta(edid_4k60(), &all)
+}
+
+/// `intel_hdmi_compute_output_format` on the Xe route: a Y420VDB VIC goes
+/// out as 4:2:0 at half the TMDS clock (297 MHz, no scrambling), its pipe
+/// runs the 1:1 scaler, the BT.709 output CSC and the `PIPE_MISC` YUV
+/// encoding, and the stop clears all three.
+fn smoke_mtl_hdmi_420_only_vic_runs_ycbcr420() -> TestResult {
+    use crate::intel_gpu_hdmi::SinkFormat;
+    // Y420VDB (extended tag 0x0E) naming VIC 97.
+    let io = ddi_b_hdmi_sink(&edid_4k60_y420(&[(7 << 5) | 2, 0x0E, 97]));
+    let probe = match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("a 4:2:0-only 4K60 sink must probe"),
+    };
+    if probe.format != SinkFormat::Ycbcr420
+        || probe.pll.port_clock_khz != 297_000
+        || probe.link != TmdsLink::default()
+    {
+        return TestResult::Fail("a Y420VDB VIC must run 4:2:0 at 297 MHz without scrambling");
+    }
+    let fb = Framebuffer {
+        phys_addr: 0x100_0000,
+        stride_bytes: 3840 * 4,
+        format: PixelFormat::Xrgb8888,
+    };
+    let mut route = match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == HdmiRouteState::Live => route,
+        _ => return TestResult::Fail("4:2:0 HDMI must light Pipe B"),
+    };
+    let pipe = Pipe::B;
+    let misc = pipe.base() + crate::intel_gpu_xelpg_dsc::PIPE_MISC_OFFSET;
+    let csc_mode = 0x4_9028 + 0x100 * pipe as u64;
+    let ps_ctrl = crate::intel_gpu_xelpg_scaler::ps_ctrl(pipe, 0);
+    let yuv = crate::intel_gpu_modeset::PIPE_MISC_YCBCR420;
+    if io.read32(misc) & yuv != yuv
+        || io.read32(csc_mode) & (1 << 30) == 0
+        || io.read32(ps_ctrl) & (1 << 31) == 0
+        || io.phy.writes_to(0x6_4130) != [297_000]
+    {
+        return TestResult::Fail(
+            "the 4:2:0 pipe must run the scaler, the YCbCr CSC and PIPE_MISC YUV",
+        );
+    }
+    // BT.709 RGB-to-YCbCr: the first coefficient pair and the luma
+    // post-offset.
+    let coeff = 0x4_9050 + 0x100 * pipe as u64;
+    if io.read32(coeff) != (0x1e08 << 16 | 0x9cc0) || io.read32(coeff + 0x28) != 0x100 {
+        return TestResult::Fail("the output CSC must carry ilk_csc_matrix_rgb_to_ycbcr");
+    }
+    if route.stop(&io).is_err()
+        || io.read32(misc) & yuv != 0
+        || io.read32(csc_mode) & (1 << 30) != 0
+        || io.read32(ps_ctrl) != 0
+    {
+        return TestResult::Fail("the stop must clear the scaler, the CSC and PIPE_MISC YUV");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_mtl_hdmi_420_only_vic_runs_ycbcr420
+);
+
+/// The 4:2:0-also fallback (Y420CMDB): RGB first, 4:2:0 only when RGB has
+/// no valid TMDS link. Display 30 carries no 4:2:0 here and refuses RGB.
+fn smoke_xe_hdmi_420_also_falls_back_and_display30_refuses() -> TestResult {
+    use crate::intel_gpu_hdmi::SinkFormat;
+    // A VDB naming VIC 97 and a Y420CMDB (extended tag 0x0F) marking it.
+    let blocks = [(2 << 5) | 1, 97, (7 << 5) | 2, 0x0F, 0x01];
+    let probe = |generation| {
+        let io = ddi_b_hdmi_sink(&edid_4k60_y420(&blocks));
+        if generation == Generation::PantherLake {
+            io.light_panel_ip(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd);
+        }
+        probe_hdmi(&io, generation, XeLpgPort::B, false, ddc_pin(XeLpgPort::B))
+            .map(|p| (p.format, p.pll.port_clock_khz))
+    };
+    if probe(Generation::MeteorLake) != Ok((SinkFormat::Ycbcr420, 297_000)) {
+        return TestResult::Fail("RGB without a valid link must fall back to 4:2:0-also");
+    }
+    if probe(Generation::PantherLake) != Err(HdmiError::ScramblingRequired(594_000)) {
+        return TestResult::Fail("display 30 must keep RGB and refuse it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_xe_hdmi_420_also_falls_back_and_display30_refuses
 );
 
 fn smoke_mtl_hdmi_594_scrambled_route_scdc_order_and_reset() -> TestResult {

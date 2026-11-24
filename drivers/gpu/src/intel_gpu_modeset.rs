@@ -2094,61 +2094,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// `ilk_csc_matrix_rgb_to_ycbcr`, written by `icl_update_output_csc`,
     /// enabled by `ICL_OUTPUT_CSC_ENABLE`).
     fn program_ycbcr420_output(&mut self, mode: &Mode) {
-        use crate::intel_gpu_xelpg_scaler::{Filter, PipeScaler, Window};
-        let scaler = PipeScaler {
-            id: 0,
-            window: Window {
-                x: 0,
-                y: 0,
-                width: u32::from(mode.h_active),
-                height: u32::from(mode.v_active),
-            },
-            hscale: 0x10000,
-            vscale: 0x10000,
-            filter: Filter::Default,
-            mode: 0,
-        };
-        for (reg, val) in scaler.enable_writes(self.pipe) {
-            self.mmio.write32(reg, val);
-        }
-        let base = PIPE_CSC_OUTPUT_COEFF_RY_GY + self.pipe as u64 * PIPE_COLOR_STRIDE;
-        const COEFF: [u32; 9] = [
-            0x1e08, 0x9cc0, 0xb528, 0x2ba8, 0x09d8, 0x37e8, 0xbce8, 0x9ad8, 0x1e08,
-        ];
-        const POSTOFF: [u32; 3] = [0x0800, 0x0100, 0x0800];
-        // icl_update_output_csc's order: pre-offsets, coefficients,
-        // post-offsets.
-        for reg in [0x18u64, 0x1c, 0x20] {
-            self.mmio.write32(base + reg, 0);
-        }
-        for (row, reg) in [0x00u64, 0x08, 0x10].into_iter().enumerate() {
-            self.mmio
-                .write32(base + reg, COEFF[row * 3] << 16 | COEFF[row * 3 + 1]);
-            self.mmio.write32(base + reg + 4, COEFF[row * 3 + 2] << 16);
-        }
-        for (i, reg) in [0x24u64, 0x28, 0x2c].into_iter().enumerate() {
-            self.mmio.write32(base + reg, POSTOFF[i]);
-        }
-        let csc_mode = PIPE_CSC_MODE + self.pipe as u64 * PIPE_COLOR_STRIDE;
-        let cur = self.mmio.read32(csc_mode);
-        self.mmio.write32(csc_mode, cur | ICL_OUTPUT_CSC_ENABLE);
-        compiler_fence(Ordering::SeqCst);
+        program_ycbcr420_pipe(self.mmio, self.pipe, mode);
     }
 
-    /// Undo [`Modeset::program_ycbcr420_output`] once the pipe is down:
-    /// detach the pipe's scalers (`skl_scaler_disable`), drop the output
-    /// CSC enable and the `PIPE_MISC` YUV encoding.
+    /// Undo [`Modeset::program_ycbcr420_output`] once the pipe is down
+    /// ([`clear_ycbcr420_pipe`]).
     pub(crate) fn clear_ycbcr420_output(&mut self) {
-        for (reg, val) in crate::intel_gpu_xelpg_scaler::disable_writes(self.pipe) {
-            self.mmio.write32(reg, val);
-        }
-        let csc_mode = PIPE_CSC_MODE + self.pipe as u64 * PIPE_COLOR_STRIDE;
-        let cur = self.mmio.read32(csc_mode);
-        self.mmio.write32(csc_mode, cur & !ICL_OUTPUT_CSC_ENABLE);
-        let misc = self.pipe.base() + 0x30;
-        let cur = self.mmio.read32(misc);
-        self.mmio.write32(misc, cur & !PIPE_MISC_YUV_MASK);
-        compiler_fence(Ordering::SeqCst);
+        clear_ycbcr420_pipe(self.mmio, self.pipe);
     }
 
     fn initialize_internal_color(&mut self) -> Result<(), ModesetError> {
@@ -3496,6 +3448,78 @@ pub(crate) fn modeset_display<M: MmioWindow + ?Sized>(
     // Skylake arm fails closed the same way.
     modeset_display_family(mmio, generation, None, false, None, None, None, fb, mode)
 }
+
+/// The pipe side of a YCbCr 4:2:0 HDMI stream on display 11+, with the pipe
+/// off: a 1:1 pipe scaler (the 4:2:0 downsampler; `skl_update_scaler_crtc`
+/// requires one for `INTEL_OUTPUT_FORMAT_YCBCR420`), then the BT.709
+/// limited-range RGB-to-YCbCr output CSC (`ilk_csc_matrix_rgb_to_ycbcr`,
+/// `icl_update_output_csc`: pre-offsets, coefficients, post-offsets) and
+/// `ICL_OUTPUT_CSC_ENABLE`. The `PIPE_MISC` YUV bits are the caller's
+/// (`bdw_set_pipe_misc`).
+pub(crate) fn program_ycbcr420_pipe<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe, mode: &Mode) {
+    for (reg, val) in ycbcr420_scaler(mode).enable_writes(pipe) {
+        io.write32(reg, val);
+    }
+    let base = PIPE_CSC_OUTPUT_COEFF_RY_GY + pipe as u64 * PIPE_COLOR_STRIDE;
+    const COEFF: [u32; 9] = [
+        0x1e08, 0x9cc0, 0xb528, 0x2ba8, 0x09d8, 0x37e8, 0xbce8, 0x9ad8, 0x1e08,
+    ];
+    const POSTOFF: [u32; 3] = [0x0800, 0x0100, 0x0800];
+    for reg in [0x18u64, 0x1c, 0x20] {
+        io.write32(base + reg, 0);
+    }
+    for (row, reg) in [0x00u64, 0x08, 0x10].into_iter().enumerate() {
+        io.write32(base + reg, COEFF[row * 3] << 16 | COEFF[row * 3 + 1]);
+        io.write32(base + reg + 4, COEFF[row * 3 + 2] << 16);
+    }
+    for (i, reg) in [0x24u64, 0x28, 0x2c].into_iter().enumerate() {
+        io.write32(base + reg, POSTOFF[i]);
+    }
+    let csc_mode = PIPE_CSC_MODE + pipe as u64 * PIPE_COLOR_STRIDE;
+    let cur = io.read32(csc_mode);
+    io.write32(csc_mode, cur | ICL_OUTPUT_CSC_ENABLE);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// The 1:1 pipe scaler a 4:2:0 stream runs through (`skl_pfit_enable`:
+/// scaler 0, normal mode, the medium filter, the full active window).
+pub(crate) fn ycbcr420_scaler(mode: &Mode) -> crate::intel_gpu_xelpg_scaler::PipeScaler {
+    use crate::intel_gpu_xelpg_scaler::{Filter, PipeScaler, Window};
+    PipeScaler {
+        id: 0,
+        window: Window {
+            x: 0,
+            y: 0,
+            width: u32::from(mode.h_active),
+            height: u32::from(mode.v_active),
+        },
+        hscale: 0x10000,
+        vscale: 0x10000,
+        filter: Filter::Default,
+        mode: 0,
+    }
+}
+
+/// Undo [`program_ycbcr420_pipe`] once the pipe is down: detach the pipe's
+/// scalers (`skl_scaler_disable`), drop the output CSC enable and the
+/// `PIPE_MISC` YUV encoding.
+pub(crate) fn clear_ycbcr420_pipe<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe) {
+    for (reg, val) in crate::intel_gpu_xelpg_scaler::disable_writes(pipe) {
+        io.write32(reg, val);
+    }
+    let csc_mode = PIPE_CSC_MODE + pipe as u64 * PIPE_COLOR_STRIDE;
+    let cur = io.read32(csc_mode);
+    io.write32(csc_mode, cur & !ICL_OUTPUT_CSC_ENABLE);
+    let misc = pipe.base() + 0x30;
+    let cur = io.read32(misc);
+    io.write32(misc, cur & !PIPE_MISC_YUV_MASK);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// `PIPE_MISC`'s YCbCr 4:2:0 encoding (`bdw_set_pipe_misc`): YUV420 enable,
+/// full-blend mode and the YUV output colorspace.
+pub(crate) const PIPE_MISC_YCBCR420: u32 =
+    PIPE_MISC_YUV420_ENABLE | PIPE_MISC_YUV420_MODE_FULL_BLEND | PIPE_MISC_OUTPUT_COLORSPACE_YUV;
 
 /// Exact known PCI family; no P/S/N inference from the broad generation.
 pub(crate) fn gen12_family_for_chip(

@@ -71,8 +71,12 @@
 //! first write). PM demand runs at the TMDS clock (Linux's
 //! `crtc_state->port_clock` for HDMI). Linux only logs an SCDC failure; here a
 //! stream that needs the sink scrambling fails activation instead (and
-//! is locally stopped). Audio, deep color, YCbCr and HDMI 2.1 FRL remain
-//! out of scope.
+//! is locally stopped). YCbCr 4:2:0 follows `intel_hdmi_compute_output_format`
+//! at 8 bpc on display 14 and 20 (a Y420VDB VIC, or a Y420CMDB VIC whose RGB
+//! link is invalid): half the TMDS clock, the 1:1 pipe scaler in the
+//! resource transaction's prefill, the BT.709 output CSC, `PIPE_MISC` YUV
+//! and the Y420 AVI infoframe; display 30 keeps RGB. Audio, deep color,
+//! YCbCr 4:4:4 and HDMI 2.1 FRL remain out of scope.
 //!
 //! DDC pins come from the corrected GMBUS numbering
 //! ([`crate::intel_gpu_gmbus::PinPair`], `gmbus_pins_mtp`): DDI B is pin 2
@@ -733,6 +737,8 @@ pub struct MtlHdmiProbe {
     /// The DDC pin EDID and SCDC traffic use (the port policy's
     /// `intel_hdmi_ddc_pin` result).
     pub ddc: PinPair,
+    /// The output format (`intel_hdmi_compute_output_format` at 8 bpc).
+    pub format: crate::intel_gpu_hdmi::SinkFormat,
     /// EDID bytes (`edid_len` valid).
     pub edid: alloc::boxed::Box<[u8; crate::intel_gpu_hdmi::EDID_CAPACITY]>,
     /// Valid EDID length.
@@ -811,15 +817,17 @@ pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
     let (edid, edid_len) = read_edid_ddc(io, pin).map_err(rollback)?;
     let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len])
         .map_err(|_| rollback(HdmiError::Edid))?;
-    let pll = hdmi_pll_request_kind(
-        crate::intel_gpu_xelpg::phy_kind(io, port),
-        mode.pixel_clock_khz,
+    let sink = parse_sink_scdc(&edid[..edid_len]);
+    let (format, pll, link) = output_for(
+        io,
+        display_ip,
+        port,
         type_c,
-        io.c20_hdmi_tx_cfg1(),
+        &mode,
+        &edid[..edid_len],
+        &sink,
     )
     .map_err(rollback)?;
-    let sink = parse_sink_scdc(&edid[..edid_len]);
-    let link = tmds_link(mode.pixel_clock_khz, &sink).map_err(rollback)?;
     if !io.display_access_ok() {
         return Err(rollback(ExternalError::AccessLost.into()));
     }
@@ -832,9 +840,49 @@ pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
         sink,
         link,
         ddc: pin,
+        format,
         edid: alloc::boxed::Box::new(edid),
         edid_len,
     })
+}
+
+/// `intel_hdmi_compute_output_format` at 8 bpc for `mode` on `port`: a
+/// 4:2:0-only VIC (Y420VDB) goes out as YCbCr 4:2:0 on an HDMI sink, any
+/// other mode as RGB, falling back to 4:2:0 when RGB has no valid TMDS
+/// link and the VIC is 4:2:0-also (Y420CMDB). 4:2:0 halves the TMDS clock
+/// (`intel_hdmi_tmds_clock`) and needs the pipe scaler, which takes at most
+/// 8192 active pixels (`skl_scaler_mode_valid` compares `hdisplay` with
+/// the display-14 maximum source height). Display 30 is not qualified for
+/// it: its VRR timing-generator guardband carries no scaler prefill here.
+/// Returns the format with its PLL request and TMDS link.
+fn output_for<M: MmioWindow + ?Sized>(
+    io: &M,
+    ip: DisplayIp,
+    port: XeLpgPort,
+    type_c: bool,
+    mode: &Mode,
+    edid: &[u8],
+    sink: &SinkScdc,
+) -> Result<(crate::intel_gpu_hdmi::SinkFormat, PllRequest, TmdsLink), HdmiError> {
+    use crate::intel_gpu_hdmi::{
+        parse_hdmi_vsdb, parse_ycbcr420, tmds_clock_for, vic_for_mode, SinkFormat,
+    };
+    let kind = crate::intel_gpu_xelpg::phy_kind(io, port);
+    let link_for = |format| {
+        let clock = tmds_clock_for(mode.pixel_clock_khz, 8, format);
+        let pll = hdmi_pll_request_kind(kind, clock, type_c, io.c20_hdmi_tx_cfg1())?;
+        Ok((format, pll, tmds_link(clock, sink)?))
+    };
+    let y420 = parse_ycbcr420(edid);
+    let vic = vic_for_mode(mode);
+    let allowed = parse_hdmi_vsdb(edid).is_some() && !ip.is_display30() && mode.h_active <= 8192;
+    if allowed && y420.only(vic) {
+        return link_for(SinkFormat::Ycbcr420);
+    }
+    match link_for(SinkFormat::Rgb) {
+        Err(e) if allowed && y420.also(vic) => link_for(SinkFormat::Ycbcr420).map_err(|_| e),
+        result => result,
+    }
 }
 
 /// Release a probe's Type-C ownership (DDI B owns nothing).
@@ -926,7 +974,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         }
     }
     // crtc_state->port_clock is the TMDS clock for HDMI.
-    let ext = match external_pipe(
+    let mut ext = match external_pipe(
         &choice,
         probe.port,
         &probe.mode,
@@ -938,6 +986,10 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         Ok(ext) => ext,
         Err(e) => return Err((Err(probe), e.into())),
     };
+    // A 4:2:0 stream's 1:1 scaler joins the pipe's prefill term.
+    if probe.format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420 {
+        ext.scaler = Some(crate::intel_gpu_modeset::ycbcr420_scaler(&probe.mode));
+    }
     if let Err(e) = choice.pipes.admit(io, &ext) {
         return Err((Err(probe), e.into()));
     }
@@ -982,11 +1034,12 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     let port = route.probe.port;
     let mode = route.probe.mode;
     let link = route.probe.link;
-    let (scrambling, ddc, pll, ip) = (
+    let (scrambling, ddc, pll, ip, format) = (
         route.probe.sink.scrambling,
         route.probe.ddc,
         route.probe.pll,
         route.probe.display_ip,
+        route.probe.format,
     );
     let rp = reservation(route)?;
     let (pipe, trans) = (rp.pipe, rp.transcoder());
@@ -996,10 +1049,18 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     crate::intel_gpu_hdmi::write_avi_infoframe(
         io,
         trans,
-        &crate::intel_gpu_hdmi::pack_avi_infoframe(&mode),
+        &crate::intel_gpu_hdmi::pack_avi_infoframe_for(&mode, format),
     );
     // hsw_crtc_enable: source size, timings, RGB bypass (pipe off).
     rp.pipes.program_timings(io, pipe)?;
+    // A 4:2:0 stream: bdw_set_pipe_misc's YUV encoding, skl_pfit_enable's
+    // 1:1 downsampler and the RGB-to-YCbCr output CSC, still pipe off.
+    if format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420 {
+        let misc = pipe.base() + crate::intel_gpu_xelpg_dsc::PIPE_MISC_OFFSET;
+        let cur = rd(io, misc)?;
+        wr(io, misc, cur | crate::intel_gpu_modeset::PIPE_MISC_YCBCR420)?;
+        crate::intel_gpu_modeset::program_ycbcr420_pipe(io, pipe, &mode);
+    }
     // intel_ddi_enable: transcoder function, then the transcoder.
     let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(
         port.func_ctl_index(),
@@ -1103,10 +1164,11 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     route: &mut MtlHdmiRoute,
 ) -> Result<(), HdmiError> {
     let port = route.probe.port;
-    let (scrambling, ddc, ip) = (
+    let (scrambling, ddc, ip, format) = (
         route.probe.sink.scrambling,
         route.probe.ddc,
         route.probe.display_ip,
+        route.probe.format,
     );
     let stop_failed: HdmiError =
         ExternalError::Modeset(ModesetError::PipelineStopUnavailable).into();
@@ -1125,6 +1187,10 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
         PipeEnableError::Timeout => stop_failed,
         e => e.into(),
     })?;
+    // skl_scaler_disable and the color/PIPE_MISC state of a 4:2:0 stream.
+    if format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420 {
+        crate::intel_gpu_modeset::clear_ycbcr420_pipe(io, pipe);
+    }
     let func = rd(io, trans_ddi_func_ctl(trans))?;
     wr(
         io,
