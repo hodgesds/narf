@@ -2088,4 +2088,7 @@ fn smoke_param_overrides_follow_cmdline_then_load_string() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("modules/params", smoke_param_overrides_follow_cmdline_then_load_string);
+kernel_test_in!(
+    "modules/params",
+    smoke_param_overrides_follow_cmdline_then_load_string
+);

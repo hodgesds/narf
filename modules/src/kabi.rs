@@ -2101,14 +2101,22 @@ fn smoke_kabi_pci_ext_exports_validate_arguments() -> TestResult {
         narf_pci_identity(UNKNOWN, core::ptr::null_mut(), 16) == -22
             && narf_pci_identity(UNKNOWN, rec.as_mut_ptr(), 15) == -22
             && narf_pci_identity(UNKNOWN, rec.as_mut_ptr(), 16) == -19
-            && narf_msi_enable(UNKNOWN, 1, core::ptr::null_mut(), &mut base, &mut addr, &mut data) == -22
+            && narf_msi_enable(
+                UNKNOWN,
+                1,
+                core::ptr::null_mut(),
+                &mut base,
+                &mut addr,
+                &mut data,
+            ) == -22
             && narf_msi_enable(UNKNOWN, 3, &mut count, &mut base, &mut addr, &mut data) == -22
             && narf_msi_enable(UNKNOWN, 1, &mut count, &mut base, &mut addr, &mut data) == -19
             && narf_msi_set_enabled(UNKNOWN, 2) == -22
             && narf_msi_set_enabled(UNKNOWN, 1) == -19
             && narf_pcie_aspm(UNKNOWN, 0, core::ptr::null_mut()) == -22
             && narf_pcie_aspm(UNKNOWN, 0, &mut prev) == -19
-            && narf_dma_alloc_mapped(UNKNOWN, 4096, 32, core::ptr::null_mut(), &mut bus, &mut len) == 0
+            && narf_dma_alloc_mapped(UNKNOWN, 4096, 32, core::ptr::null_mut(), &mut bus, &mut len)
+                == 0
             && narf_dma_alloc_mapped(UNKNOWN, 4096, 32, &mut cpu, &mut bus, &mut len) == 0
     };
     if !ok || cpu != 0 || count != 0 {
@@ -2116,7 +2124,10 @@ fn smoke_kabi_pci_ext_exports_validate_arguments() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("modules/kabi", smoke_kabi_pci_ext_exports_validate_arguments);
+kernel_test_in!(
+    "modules/kabi",
+    smoke_kabi_pci_ext_exports_validate_arguments
+);
 
 /// Device-bound additions need their manifest cap to resolve; the
 /// device-independent services need none.
@@ -2149,7 +2160,10 @@ fn smoke_kabi_pci_ext_and_runtime_exports_cap_gating() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("modules/kabi", smoke_kabi_pci_ext_and_runtime_exports_cap_gating);
+kernel_test_in!(
+    "modules/kabi",
+    smoke_kabi_pci_ext_and_runtime_exports_cap_gating
+);
 
 /// The runtime services: bounded delay, entropy that fills (or refuses and
 /// zeroes), and an SMBIOS read whose pieces reassemble the table.
@@ -2196,7 +2210,12 @@ fn smoke_kabi_runtime_services_behave() -> TestResult {
             let (r1, r2, past) = unsafe {
                 (
                     narf_smbios_read(0, whole.as_mut_ptr(), split, &mut total),
-                    narf_smbios_read(split, whole[split..].as_mut_ptr(), total - split, &mut total),
+                    narf_smbios_read(
+                        split,
+                        whole[split..].as_mut_ptr(),
+                        total - split,
+                        &mut total,
+                    ),
                     narf_smbios_read(total + 1, whole.as_mut_ptr(), 0, &mut total),
                 )
             };

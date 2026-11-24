@@ -56,8 +56,14 @@ fn module_pci_identity_reports_the_exact_function() -> TestResult {
     let mut words = alloc::vec![0u32; 1024];
     let (device, cfg) = function(&mut words);
     // SAFETY: the aligned owned window remains live through the scoped map.
-    let _mapping = unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
-    install_device_ctx(OWNER, TOKEN, device, Cap::<BusDeviceCap, Write>::bootstrap());
+    let _mapping =
+        unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
+    install_device_ctx(
+        OWNER,
+        TOKEN,
+        device,
+        Cap::<BusDeviceCap, Write>::bootstrap(),
+    );
     let _restore = Restore;
 
     if module_pci_identity(OWNER + 1, TOKEN) != Err(-19) {
@@ -85,8 +91,14 @@ fn module_pcie_aspm_changes_only_the_aspm_field() -> TestResult {
     let mut words = alloc::vec![0u32; 1024];
     let (device, cfg) = function(&mut words);
     // SAFETY: as above.
-    let _mapping = unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
-    install_device_ctx(OWNER, TOKEN, device, Cap::<BusDeviceCap, Write>::bootstrap());
+    let _mapping =
+        unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
+    install_device_ctx(
+        OWNER,
+        TOKEN,
+        device,
+        Cap::<BusDeviceCap, Write>::bootstrap(),
+    );
     let _restore = Restore;
 
     if module_pcie_aspm(OWNER, TOKEN, 0x4) != Err(-22) || words[LNKCTL / 4] != 0x42 {
@@ -108,14 +120,23 @@ fn module_pcie_aspm_changes_only_the_aspm_field() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("bus/module-pci", module_pcie_aspm_changes_only_the_aspm_field);
+kernel_test_in!(
+    "bus/module-pci",
+    module_pcie_aspm_changes_only_the_aspm_field
+);
 
 fn module_msi_programs_an_aligned_block_and_tears_it_down() -> TestResult {
     let mut words = alloc::vec![0u32; 1024];
     let (device, cfg) = function(&mut words);
     // SAFETY: as above.
-    let _mapping = unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
-    install_device_ctx(OWNER, TOKEN, device, Cap::<BusDeviceCap, Write>::bootstrap());
+    let _mapping =
+        unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
+    install_device_ctx(
+        OWNER,
+        TOKEN,
+        device,
+        Cap::<BusDeviceCap, Write>::bootstrap(),
+    );
     let restore = Restore;
 
     for bad in [0u16, 3, 64] {
@@ -187,8 +208,14 @@ fn module_mapped_dma_is_masked_shared_with_the_handle_and_freed() -> TestResult 
     let mut words = alloc::vec![0u32; 1024];
     let (device, cfg) = function(&mut words);
     // SAFETY: as above.
-    let _mapping = unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
-    install_device_ctx(OWNER, TOKEN, device, Cap::<BusDeviceCap, Write>::bootstrap());
+    let _mapping =
+        unsafe { crate::ecam::__test_windows(&[(cfg, words.as_mut_ptr().cast(), 4096)]) };
+    install_device_ctx(
+        OWNER,
+        TOKEN,
+        device,
+        Cap::<BusDeviceCap, Write>::bootstrap(),
+    );
     let _restore = Restore;
     let domain = narf_lib::id::DomainId::SCRATCH;
 
@@ -214,7 +241,10 @@ fn module_mapped_dma_is_masked_shared_with_the_handle_and_freed() -> TestResult 
     let cpu = dma.cpu as *mut u8;
     // SAFETY: the allocation spans `dma.len` bytes and is live until freed.
     unsafe {
-        if core::slice::from_raw_parts(cpu, dma.len).iter().any(|&b| b != 0) {
+        if core::slice::from_raw_parts(cpu, dma.len)
+            .iter()
+            .any(|&b| b != 0)
+        {
             return TestResult::Fail("mapped DMA was not zeroed");
         }
         for i in 0..16 {
