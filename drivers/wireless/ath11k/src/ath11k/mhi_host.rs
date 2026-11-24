@@ -79,12 +79,12 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
 
-use narf_io::DmaBuffer;
-use narf_lib::id::DomainId;
+use crate::ath11k::platform::dma::DmaBuffer;
+use crate::ath11k::platform::dma::DomainId;
 
 use super::mhi::*;
 
-/// Failing-step codes latched into `narf_memory::diag` by the PCI
+/// Failing-step codes latched into `crate::ath11k::platform::diag` by the PCI
 /// glue (`wifi: <stage> FAILED step=N detail=D`). Continues
 /// [`super::pci::step`].
 pub mod step {
@@ -353,7 +353,7 @@ struct Dma {
 
 impl Dma {
     fn alloc(len: usize, mask: u64) -> Result<Dma, MhiError> {
-        narf_io::alloc_coherent_masked(len.max(1), DMA_DOMAIN, mask)
+        crate::ath11k::platform::dma::alloc_coherent_masked(len.max(1), DMA_DOMAIN, mask)
             .map(|buf| Dma { buf })
             .map_err(|_| MhiError::new(step::NO_DMA_MEMORY, len as u32, errno::ENOMEM))
     }

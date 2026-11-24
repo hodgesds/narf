@@ -71,7 +71,7 @@ use super::qmi::{QmiResponse, QMI_RESULT_SUCCESS_V01};
 use super::qmi_client::{Inbound, QmiClient, QrtrPipe, TxnError};
 use super::qmi_wlfw::*;
 
-/// Failing-step codes latched into `narf_memory::diag` while the QMI
+/// Failing-step codes latched into `crate::ath11k::platform::diag` while the QMI
 /// handshake runs (`WifiStage::Control`). Continues `mhi_host::step`
 /// (10–35). Request failures carry `detail = kind << 16 | value`:
 /// kind 1 timeout, 2 QMI result failure (value = QMI error code),
@@ -1426,12 +1426,12 @@ impl core::fmt::Display for Lossy<'_> {
 #[derive(Debug, Default)]
 pub struct Dma32;
 
-impl CoherentMem for narf_io::DmaBuffer {
+impl CoherentMem for crate::ath11k::platform::dma::DmaBuffer {
     fn dma_addr(&self) -> u64 {
-        narf_io::DmaBuffer::dma_addr(self).raw()
+        crate::ath11k::platform::dma::DmaBuffer::dma_addr(self).raw()
     }
     fn size(&self) -> usize {
-        narf_io::DmaBuffer::len(self)
+        crate::ath11k::platform::dma::DmaBuffer::len(self)
     }
     fn write(&mut self, off: usize, data: &[u8]) {
         self.as_mut_slice()[off..off + data.len()].copy_from_slice(data);
@@ -1442,7 +1442,7 @@ impl CoherentMem for narf_io::DmaBuffer {
 }
 
 impl DmaAllocator for Dma32 {
-    type Mem = narf_io::DmaBuffer;
+    type Mem = crate::ath11k::platform::dma::DmaBuffer;
     fn iomem_write(
         &mut self,
         phys: u64,
@@ -1450,21 +1450,31 @@ impl DmaAllocator for Dma32 {
         off: usize,
         data: &[u8],
     ) -> Result<(), i32> {
-        use narf_drivers_qcom_soc::io::{write_bytes, MmioRegs};
         if off.checked_add(data.len()).is_none_or(|end| end > map_len) {
             return Err(EINVAL);
         }
-        let win = MmioRegs::map(phys, map_len as u64).map_err(|_| EIO)?;
-        write_bytes(&win, off as u32, data);
-        Ok(())
+        #[cfg(feature = "builtin")]
+        {
+            use narf_drivers_qcom_soc::io::{write_bytes, MmioRegs};
+            let win = MmioRegs::map(phys, map_len as u64).map_err(|_| EIO)?;
+            write_bytes(&win, off as u32, data);
+            Ok(())
+        }
+        // The fixed board-data window is an AHB (IPQ/WCN6750) SoC region; a
+        // PCI card never takes this path, and a module maps no SoC MMIO.
+        #[cfg(feature = "module")]
+        {
+            let _ = phys;
+            Err(EOPNOTSUPP)
+        }
     }
-    fn alloc_coherent(&mut self, size: usize) -> Option<narf_io::DmaBuffer> {
+    fn alloc_coherent(&mut self, size: usize) -> Option<crate::ath11k::platform::dma::DmaBuffer> {
         if size == 0 {
             return None;
         }
-        narf_io::alloc_coherent_masked(
+        crate::ath11k::platform::dma::alloc_coherent_masked(
             size,
-            narf_lib::id::DomainId::DRIVER_0,
+            crate::ath11k::platform::dma::DomainId::DRIVER_0,
             super::mhi::ATH11K_PCI_COHERENT_DMA_MASK,
         )
         .ok()
@@ -1472,9 +1482,11 @@ impl DmaAllocator for Dma32 {
 }
 
 /// A firmware blob held open by its read cap.
+#[cfg(feature = "builtin")]
 #[derive(Debug)]
 pub struct FwBlob(crate::firmware_asset::Asset);
 
+#[cfg(feature = "builtin")]
 impl AsRef<[u8]> for FwBlob {
     fn as_ref(&self) -> &[u8] {
         if self.0.current() {
@@ -1486,11 +1498,13 @@ impl AsRef<[u8]> for FwBlob {
 }
 
 /// `firmware_request_nowarn` against the NARF firmware registry.
+#[cfg(feature = "builtin")]
 #[derive(Debug)]
 pub struct NarfFirmware {
     auth: narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
 }
 
+#[cfg(feature = "builtin")]
 impl NarfFirmware {
     /// `None` when no trusted loader authority exists yet.
     pub fn new() -> Option<Self> {
@@ -1499,14 +1513,65 @@ impl NarfFirmware {
     }
 }
 
+/// Board, regulatory and calibration data must carry a verified signer.
+fn requires_signer(path: &str) -> Result<bool, i32> {
+    let file = path.rsplit('/').next().ok_or(EINVAL)?;
+    Ok(matches!(
+        file,
+        "board.bin" | "board-2.bin" | "regdb.bin" | "caldata.bin"
+    ) || file.starts_with("cal-") && file.ends_with(".bin"))
+}
+
+/// A firmware file read whole into the module (module build).
+#[cfg(feature = "module")]
+#[derive(Debug)]
+pub struct FwBlob(alloc::vec::Vec<u8>);
+
+#[cfg(feature = "module")]
+impl AsRef<[u8]> for FwBlob {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// `firmware_request_nowarn` through `narf_firmware_*` (module build),
+/// under the same signer rule as the built-in loader.
+#[cfg(feature = "module")]
+#[derive(Debug)]
+pub struct NarfFirmware {
+    loader: crate::ath11k::platform::firmware::Loader,
+}
+
+#[cfg(feature = "module")]
+impl NarfFirmware {
+    pub fn new() -> Option<Self> {
+        Some(Self {
+            loader: crate::ath11k::platform::firmware::Loader::new().ok()?,
+        })
+    }
+}
+
+#[cfg(feature = "module")]
 impl FirmwareLoader for NarfFirmware {
     type Blob = FwBlob;
     fn request(&mut self, path: &str) -> Result<FwBlob, i32> {
-        let file = path.rsplit('/').next().ok_or(EINVAL)?;
-        let board = matches!(
-            file,
-            "board.bin" | "board-2.bin" | "regdb.bin" | "caldata.bin"
-        ) || file.starts_with("cal-") && file.ends_with(".bin");
+        use crate::ath11k::platform::firmware::FwError;
+        self.loader
+            .load(path, 16 * 1024 * 1024, requires_signer(path)?)
+            .map(FwBlob)
+            .map_err(|error| match error {
+                FwError::NotFound => ENOENT,
+                FwError::NoMemory => ENOMEM,
+                _ => EINVAL,
+            })
+    }
+}
+
+#[cfg(feature = "builtin")]
+impl FirmwareLoader for NarfFirmware {
+    type Blob = FwBlob;
+    fn request(&mut self, path: &str) -> Result<FwBlob, i32> {
+        let board = requires_signer(path)?;
         crate::firmware_asset::load(&self.auth, path, 16 * 1024 * 1024, board)
             .map(FwBlob)
             .map_err(|error| match error {
@@ -1634,7 +1699,7 @@ mod asset_authority_tests {
     }
     struct NoTargetDma(alloc::sync::Arc<core::sync::atomic::AtomicUsize>);
     impl DmaAllocator for NoTargetDma {
-        type Mem = narf_io::DmaBuffer;
+        type Mem = crate::ath11k::platform::dma::DmaBuffer;
         fn alloc_coherent(&mut self, _: usize) -> Option<Self::Mem> {
             self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             None

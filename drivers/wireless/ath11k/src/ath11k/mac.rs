@@ -463,9 +463,9 @@ impl MacError {
     /// Latch into the framebuffer diag line and print to the console.
     pub fn report(&self, what: &str) {
         use core::fmt::Write as _;
-        narf_memory::diag::latch_wifi_error(self.step, self.detail);
+        crate::ath11k::platform::diag::latch_wifi_error(self.step, self.detail);
         let _ = writeln!(
-            narf_console::Writer,
+            crate::ath11k::platform::Console,
             "  ath11k: mac: {} failed: step {} detail {:#x} (-{})",
             what,
             self.step,
@@ -2648,7 +2648,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         // Associated with its keys back in firmware: the panel shows the
         // station connected again, as after the original join.
-        narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
+        crate::ath11k::platform::diag::set_wifi_stage(
+            crate::ath11k::platform::diag::WifiStage::Connected,
+        );
         Ok(())
     }
 
@@ -3718,7 +3720,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 };
                 self.teardown(send_deauth, reason).await;
                 self.disconnect = Some(loss.disconnect(bssid));
-                narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Scan);
+                crate::ath11k::platform::diag::set_wifi_stage(
+                    crate::ath11k::platform::diag::WifiStage::Scan,
+                );
             }
         }
         loss
@@ -5199,7 +5203,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         if let Err(e) = self.dp.mon_status_default(false).await {
             use core::fmt::Write as _;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath11k::platform::Console,
                 "  ath11k: mac: failed to clear rx_filter for monitor status ring: (-{})",
                 e
             );
@@ -5646,7 +5650,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         if let Err(e) = self.dp.monitor_mode(false).await {
             use core::fmt::Write as _;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath11k::platform::Console,
                 "  ath11k: mac: failed to configure htt monitor mode ring during stop: (-{})",
                 e
             );
@@ -9196,10 +9200,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                     if let Some((q, mu_edca, bssid)) = qos_update {
                         self.dp.set_sta_wme(bssid, true);
                         let result = match mu_edca {
-                            Some(mu_edca) => narf_scheduler::block_on_spin(
+                            Some(mu_edca) => crate::ath11k::platform::block_on_spin(
                                 self.conf_tx_all_with_mu_edca(&q, &mu_edca),
                             ),
-                            None => narf_scheduler::block_on_spin(self.conf_tx_all(&q)),
+                            None => crate::ath11k::platform::block_on_spin(self.conf_tx_all(&q)),
                         };
                         if let Err(e) = result {
                             e.report("beacon WMM parameter update");
@@ -9855,7 +9859,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         } else {
             Vec::new()
         };
-        narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Scan);
+        crate::ath11k::platform::diag::set_wifi_stage(
+            crate::ath11k::platform::diag::WifiStage::Scan,
+        );
         let r = self
             .hw_scan_with_duration(
                 &ssids,
@@ -10025,7 +10031,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 self.authorize().await?;
                 self.setup_ps().await;
             }
-            narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
+            crate::ath11k::platform::diag::set_wifi_stage(
+                crate::ath11k::platform::diag::WifiStage::Connected,
+            );
             return Ok(());
         }
         // ── wpa_supplicant ──
@@ -10034,7 +10042,9 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         }
         self.authorize().await?;
         self.setup_ps().await;
-        narf_memory::diag::set_wifi_stage(narf_memory::diag::WifiStage::Connected);
+        crate::ath11k::platform::diag::set_wifi_stage(
+            crate::ath11k::platform::diag::WifiStage::Connected,
+        );
         Ok(())
     }
 

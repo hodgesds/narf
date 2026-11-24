@@ -56,8 +56,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::future::Future;
 
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::diag::{self, WifiStage};
+use crate::ath11k::platform::diag::{self, WifiStage};
+use crate::ath11k::platform::IrqSafeSpinLock;
 
 use super::ce::{self, Ce, CeIrq, CeMsi, CeRecv, MsiCeIrq};
 use super::hal::TransportError;
@@ -667,7 +667,7 @@ pub struct Ath11kCore<H: Hif, Q: QmiFw> {
 
 fn log(args: core::fmt::Arguments<'_>) {
     use core::fmt::Write as _;
-    let _ = writeln!(narf_console::Writer, "  ath11k: {}", args);
+    let _ = writeln!(crate::ath11k::platform::Console, "  ath11k: {}", args);
 }
 
 /// HTC error → detail word: kind << 16 | value.

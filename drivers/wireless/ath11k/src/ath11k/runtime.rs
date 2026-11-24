@@ -37,9 +37,9 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use narf_lib::mutex::{Mutex, MutexGuard};
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::diag::{self, WifiStage};
+use crate::ath11k::platform::diag::{self, WifiStage};
+use crate::ath11k::platform::IrqSafeSpinLock;
+use crate::ath11k::platform::{Mutex, MutexGuard};
 
 use super::ce::{self, CeIrq, CeMsi, MsiCeIrq};
 use super::core::{Ath11kCore, CeHif, CoreHooks, FirmwareCrashDump, FwNotice, Hif, QmiFw};
@@ -434,7 +434,7 @@ pub const RX_QUEUE_MAX: usize = 1024;
 pub const ATH11K_FLUSH_TIMEOUT_MS: u32 = 5000;
 
 fn log(args: core::fmt::Arguments<'_>) {
-    let _ = writeln!(narf_console::Writer, "  ath11k: {}", args);
+    let _ = writeln!(crate::ath11k::platform::Console, "  ath11k: {}", args);
 }
 
 // ── DP ext interrupts (pcic.c `ath11k_pcic_ext_irq_config`) ────────
@@ -498,9 +498,9 @@ pub static DP_MSI_FIRES: AtomicU64 = AtomicU64::new(0);
 /// while ext interrupts are disabled, as Linux. MSI is edge-triggered,
 /// so there is no per-group mask to set (Linux `disable_irq_nosync` →
 /// NAPI → `enable_irq`).
-fn dp_msi_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+fn dp_msi_irq(cookie: u64) -> crate::ath11k::platform::irq::IrqStatus {
     raise_dp(cookie as u32);
-    narf_interrupts::IrqStatus::Handled
+    crate::ath11k::platform::irq::IrqStatus::Handled
 }
 
 /// Record that the ext groups in `mask` interrupted and wake the device
@@ -541,7 +541,12 @@ pub fn install_dp_irq_handlers(
     }
     for i in 0..n_vectors {
         if let Some(cookie) = dp_vector_cookie(mask, config, i as u32) {
-            narf_interrupts::install_handler_named(base_irq + i, "ath11k-dp", cookie, dp_msi_irq);
+            crate::ath11k::platform::irq::install_handler_named(
+                base_irq + i,
+                "ath11k-dp",
+                cookie,
+                dp_msi_irq,
+            );
         }
     }
     Ok(())
@@ -4636,7 +4641,10 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
             initial_reg.as_deref(),
         );
         let m = caps.mac_addr;
+        #[cfg(feature = "builtin")]
         let name = super::iface::register_pci(shared.clone(), mac, m, slot);
+        #[cfg(feature = "module")]
+        let name = super::iface_module::register_pci_module(shared.clone(), mac, m, slot);
         log(format_args!(
             "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
             name, m[0], m[1], m[2], m[3], m[4], m[5]
@@ -4649,7 +4657,7 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
 /// (`ath11k_hw_wcn6750_get_tcl_ring_selector`, `skb_get_hash`), computed
 /// only when the chip uses it.
 pub fn tx_ring_selector(rev: super::hw::HwRev, flow_hash: impl FnOnce() -> u32) -> u32 {
-    let cpu = narf_lib::percpu::current_cpu() as u32;
+    let cpu = crate::ath11k::platform::current_cpu();
     match rev.hw_ops().map(|o| o.ring_selector) {
         Some(super::hw_ops::RingSelector::FlowHash) => flow_hash(),
         _ => cpu,
@@ -4664,6 +4672,7 @@ pub type AhbStart<Io, Irq, Q> = (
     Result<Vec<[u8; 6]>, TransportError>,
 );
 
+#[cfg(feature = "builtin")]
 /// The AHB counterpart of [`start_pci`], after
 /// `ath11k_core_qmi_firmware_ready`: the runtime over the ready core and
 /// its DP ([`Rt`] + [`Shared`]), then `ath11k_mac_register`'s output —
@@ -4713,6 +4722,7 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     register_ahb_radios(shared, hw_cfg, single, radios, initial_reg)
 }
 
+#[cfg(feature = "builtin")]
 /// Registration starts after the core/DP construction temporaries have
 /// left the stack. The same Shared retains every radio on all outcomes.
 #[inline(never)]

@@ -56,7 +56,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use narf_lib::sync::IrqSafeSpinLock;
+use crate::ath11k::platform::IrqSafeSpinLock;
 
 use super::hal::{
     ce_get_desc_size, errno, flags, DmaMem, Hal, HalCeDesc, HalRingType, SrngParams, TransportError,
@@ -174,7 +174,7 @@ pub const fn ce_need_shadow_fix(ce_id: u32) -> bool {
     ce_id == 4
 }
 
-/// CE failing-step codes (`narf_memory::diag`). Bring-up failures
+/// CE failing-step codes (`crate::ath11k::platform::diag`). Bring-up failures
 /// ([`Ce::alloc`], [`Ce::init_pipes`]) are latched by those calls;
 /// [`Ce::send`] returns its errors for the caller (HTC) to report if it
 /// gives up.
@@ -326,9 +326,9 @@ pub static CE_MSI_FIRES: AtomicU64 = AtomicU64::new(0);
 /// `ath11k_pcic_ce_interrupt_handler`: note the CEs (cookie) and wake
 /// the owner task (the tasklet's work runs there). Ignored while CE
 /// interrupts are disabled, as in Linux.
-fn ce_msi_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+fn ce_msi_irq(cookie: u64) -> crate::ath11k::platform::irq::IrqStatus {
     raise_ce(cookie as u32);
-    narf_interrupts::IrqStatus::Handled
+    crate::ath11k::platform::irq::IrqStatus::Handled
 }
 
 /// Record that the CEs in `mask` interrupted and wake the owner task
@@ -360,7 +360,12 @@ pub fn install_ce_irq_handlers(
     }
     for i in 0..n_vectors {
         if let Some(cookie) = ce_vector_cookie(host_ce_config, config, i as u32) {
-            narf_interrupts::install_handler_named(base_irq + i, "ath11k-ce", cookie, ce_msi_irq);
+            crate::ath11k::platform::irq::install_handler_named(
+                base_irq + i,
+                "ath11k-ce",
+                cookie,
+                ce_msi_irq,
+            );
         }
     }
 }
@@ -391,7 +396,7 @@ pub trait CeIrq {
 pub struct MsiCeIrq;
 
 struct CeIrqWait {
-    sleep: narf_time::SleepUntil,
+    sleep: crate::ath11k::platform::time::SleepUntil,
 }
 
 impl Future for CeIrqWait {
@@ -415,8 +420,8 @@ impl CeIrq for MsiCeIrq {
     }
     fn wait(&self, ms: u32) -> impl Future<Output = ()> + Send {
         CeIrqWait {
-            sleep: narf_time::SleepUntil::new(
-                narf_time::Deadline::after_ms(ms as u64).as_instant(),
+            sleep: crate::ath11k::platform::time::SleepUntil::new(
+                crate::ath11k::platform::time::Deadline::after_ms(ms as u64).as_instant(),
             ),
         }
     }
@@ -424,7 +429,7 @@ impl CeIrq for MsiCeIrq {
 
 /// Monotonic milliseconds (the real [`Ce`] clock).
 pub fn monotonic_ms() -> u64 {
-    narf_time::wall::monotonic_ns() / 1_000_000
+    crate::ath11k::platform::time::monotonic_ns() / 1_000_000
 }
 
 // ── rings / pipes ─────────────────────────────────────────────────

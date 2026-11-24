@@ -1,4 +1,6 @@
-//! Bring-up aid: scan / connect from the kernel command line.
+//! Bring-up aid: scan / connect from the kernel command line (built in) or
+//! the same-named module parameters (`ath11k.ko`: the loader applies
+//! `ath11k.<name>=` from the command line to them).
 //!
 //! Userspace can drive the station over nl80211 — Wi-Fi mutations
 //! (TRIGGER_SCAN, CONNECT) follow Linux's genetlink permissions, so a
@@ -90,11 +92,34 @@ pub fn unescape(v: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Parse the `ath11k.*` parameters; `Ok(None)` when none asks for
-/// anything.
+/// Parse the `ath11k.*` parameters from the kernel command line (built
+/// in); `Ok(None)` when none asks for anything.
+#[cfg(feature = "builtin")]
 pub fn parse(cmdline: &str) -> Result<Option<AutoCfg>, CfgError> {
     let args = narf_boot::args::KernelCmdline::new(cmdline);
-    let ssid = match args.value("ath11k.ssid") {
+    parse_with(|key| args.value(key).map(alloc::string::String::from))
+}
+
+/// The same parameters as the module's load parameters: the loader has
+/// already applied any `ath11k.<name>=` from the kernel command line to
+/// them, so the command-line interface is unchanged. An empty value (the
+/// declared default) is "not given".
+#[cfg(feature = "module")]
+pub fn parse_params() -> Result<Option<AutoCfg>, CfgError> {
+    parse_with(|key| {
+        let name = key.strip_prefix("ath11k.")?;
+        narf_module_rt::param::get(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// Parse the `ath11k.*` parameters through `value` (key → value).
+pub fn parse_with(
+    value: impl Fn(&str) -> Option<alloc::string::String>,
+) -> Result<Option<AutoCfg>, CfgError> {
+    let ssid_value = value("ath11k.ssid");
+    let ssid = match ssid_value.as_deref() {
         Some(v) => {
             let s = unescape(v).ok_or(CfgError::BadSsid)?;
             if s.is_empty() || s.len() > 32 {
@@ -105,7 +130,8 @@ pub fn parse(cmdline: &str) -> Result<Option<AutoCfg>, CfgError> {
         None => None,
     };
     let mut passphrase = None;
-    let pmk = match (args.value("ath11k.psk"), args.value("ath11k.passphrase")) {
+    let (psk_value, passphrase_value) = (value("ath11k.psk"), value("ath11k.passphrase"));
+    let pmk = match (psk_value.as_deref(), passphrase_value.as_deref()) {
         (Some(hex), _) => {
             let h = hex.as_bytes();
             if h.len() != 64 {
@@ -137,7 +163,7 @@ pub fn parse(cmdline: &str) -> Result<Option<AutoCfg>, CfgError> {
     if pmk.is_some() && ssid.is_none() {
         return Err(CfgError::KeyWithoutSsid);
     }
-    let scan = args.value("ath11k.scan").is_some_and(|v| v != "0");
+    let scan = value("ath11k.scan").is_some_and(|v| v != "0");
     if ssid.is_none() && !scan {
         return Ok(None);
     }
@@ -180,7 +206,7 @@ fn sec_name(s: BssSecurity) -> &'static str {
 }
 
 fn log(args: core::fmt::Arguments<'_>) {
-    let _ = writeln!(narf_console::Writer, "  ath11k: {}", args);
+    let _ = writeln!(crate::ath11k::platform::Console, "  ath11k: {}", args);
 }
 
 /// The scan request for `cfg`: active and directed at the SSID when
@@ -292,16 +318,34 @@ pub fn report(name: &str, bss: &[BssInfo]) {
 
 /// An interface the autoconnect associates in the kernel's own name: a
 /// firmware recovery restores such a connection by itself, unlike one
-/// userspace asked for over nl80211.
+/// userspace asked for over nl80211. Exactly what the loop needs, so the
+/// module build (which has no `WirelessNetIface`) can provide it too.
 #[async_trait::async_trait]
-pub trait KernelConnect: narf_wireless::WirelessNetIface {
+pub trait KernelConnect: Send + Sync {
+    fn name(&self) -> &str;
+    fn connected_bssid(&self) -> Option<[u8; 6]>;
+    fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>>;
+    async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError>;
     async fn associate_kernel(&self, req: AssociateRequest) -> Result<(), WirelessError>;
 }
 
+#[cfg(feature = "builtin")]
 #[async_trait::async_trait]
 impl<Io: super::runtime::RtIo, Irq: super::runtime::DpIrq, Q: super::runtime::RtQmi> KernelConnect
     for super::iface::Ath11kNetdev<Io, Irq, Q>
 {
+    fn name(&self) -> &str {
+        <Self as narf_net::Interface>::name(self)
+    }
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        <Self as narf_wireless::WirelessNetIface>::connected_bssid(self)
+    }
+    fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
+        <Self as narf_wireless::WirelessNetIface>::scan_information_elements(self, bssid)
+    }
+    async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        <Self as narf_wireless::WirelessNetIface>::scan(self, req).await
+    }
     async fn associate_kernel(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         super::iface::Ath11kNetdev::associate_kernel(self, req).await
     }
@@ -368,6 +412,9 @@ pub async fn run<I: KernelConnect + ?Sized>(dev: alloc::sync::Arc<I>, cfg: AutoC
                 }
             }
         }
-        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(RETRY_MS).as_instant()).await;
+        crate::ath11k::platform::time::SleepUntil::new(
+            crate::ath11k::platform::time::Deadline::after_ms(RETRY_MS).as_instant(),
+        )
+        .await;
     }
 }

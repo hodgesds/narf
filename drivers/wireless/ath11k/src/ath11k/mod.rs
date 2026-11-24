@@ -43,8 +43,11 @@
 #![allow(dead_code)]
 
 pub mod ahb;
+#[cfg(feature = "builtin")]
 pub mod ahb_hif;
+#[cfg(feature = "builtin")]
 pub mod ahb_live;
+#[cfg(feature = "builtin")]
 pub mod ahb_probe;
 pub mod autoconnect;
 pub mod board;
@@ -64,7 +67,10 @@ pub mod htc;
 pub mod htt;
 pub mod hw;
 pub mod hw_ops;
+#[cfg(feature = "builtin")]
 pub mod iface;
+#[cfg(feature = "module")]
+pub mod iface_module;
 pub mod ipq8074;
 pub mod mac;
 pub mod mac_frame;
@@ -73,16 +79,19 @@ pub mod mac_reg;
 pub mod mhi;
 pub mod mhi_host;
 pub mod pci;
+pub mod platform;
 pub mod power;
 pub mod qcn9074;
 pub mod qmi;
 pub mod qmi_client;
 pub mod qmi_wlfw;
 pub mod qrtr;
+#[cfg(feature = "builtin")]
 pub mod qrtr_glink;
 pub mod runtime;
 pub mod rx_descriptor;
 pub mod tx_hdr;
+#[cfg(feature = "builtin")]
 pub mod tx_offload;
 pub mod txq;
 pub mod wlfw;
@@ -93,14 +102,25 @@ pub use hw::{
     chip_for_pci_id, name_for, ChipInfo, HwRev, ATH11K_DEV_QCA6390, ATH11K_DEV_QCN9074,
     ATH11K_DEV_WCN6855, QCOM_VENDOR,
 };
-pub use pci::{probe, register_pci_driver, Ath11kDevice, ProbeError};
+#[cfg(feature = "builtin")]
+pub use pci::probe;
+pub use pci::{register_pci_driver, Ath11kDevice, ProbeError};
 
 /// Entry point invoked from the wireless crate's
 /// `register_initcalls` (one level up in
 /// `drivers/wireless/src/lib.rs`).
+#[cfg(feature = "builtin")]
 pub fn register() {
     register_pci_driver();
     ahb_probe::register_dt_driver();
+}
+
+/// `narf_module_init`: install the kernel DRBG as the protocol code's
+/// entropy source, then register the PCI match. The rest happens in probe.
+#[cfg(feature = "module")]
+pub fn register_module() {
+    platform::install_entropy();
+    register_pci_driver();
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
