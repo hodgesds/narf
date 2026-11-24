@@ -1924,7 +1924,7 @@ impl crate::HwNic for Rtl8126NicIface {
         self.nic.link_up
     }
     fn model(&self) -> crate::NicModel {
-        crate::NicModel::RealtekRtl8168
+        crate::NicModel::RealtekRtl8126
     }
     fn caps(&self) -> crate::NicCaps {
         let (tx_checksum, tso) = current_tx_offloads(&self.nic);

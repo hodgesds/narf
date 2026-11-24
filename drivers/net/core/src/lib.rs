@@ -43,6 +43,12 @@ pub enum NicModel {
     RealtekRtl8139,
     /// Realtek RTL8168 / RTL8111 — modern PCIe Gigabit family.
     RealtekRtl8168,
+    /// Realtek RTL8125 — 2.5 GbE PCIe.
+    RealtekRtl8125,
+    /// Realtek RTL8126 — 5 GbE PCIe.
+    RealtekRtl8126,
+    /// Realtek RTL8127 — 10 GbE PCIe.
+    RealtekRtl8127,
     /// Atheros / Attansic L1c / L2c Gigabit.
     AtherosAtl1c,
     /// Nvidia nForce MAC — "forcedeth".
@@ -69,6 +75,9 @@ impl NicModel {
             NicModel::MellanoxMlx5 => (0x15B3, 0x1013),
             NicModel::RealtekRtl8139 => (0x10EC, 0x8139),
             NicModel::RealtekRtl8168 => (0x10EC, 0x8168),
+            NicModel::RealtekRtl8125 => (0x10EC, 0x8125),
+            NicModel::RealtekRtl8126 => (0x10EC, 0x8126),
+            NicModel::RealtekRtl8127 => (0x10EC, 0x8127),
             NicModel::AtherosAtl1c => (0x1969, 0x1063),
             NicModel::NvidiaForcedeth => (0x10DE, 0x0372),
             NicModel::BroadcomTg3 => (0x14E4, 0x1644),

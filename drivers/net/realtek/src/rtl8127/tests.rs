@@ -809,3 +809,76 @@ fn smoke_rtl8127_mtu_switch() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_mtu_switch);
+
+// ── NicModel mapping (#2447) ───────────────────────────────────────
+
+fn smoke_rtl8127_model() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicBool;
+
+    use super::{
+        alloc_coherent, DomainId, IrqSafeSpinLock, MacVersion, MmioRegion, Rtl8127Nic,
+        Rtl8127NicIface, RING_BYTES, RTL_DEV_8127, RTL_VENDOR,
+    };
+    use crate::{HwNic, NicModel};
+
+    // The enum → PCI id pair for this device id.
+    if NicModel::RealtekRtl8127.primary_pci_id() != (RTL_VENDOR, RTL_DEV_8127) {
+        return TestResult::Fail("RealtekRtl8127 primary_pci_id != (0x10EC, 0x8127)");
+    }
+    // Fixture NIC: a 4 KiB fake MMIO backing + descriptor rings, no
+    // register programming — `model()` never touches the hardware,
+    // so the fixture only has to be structurally valid. Allocation
+    // shape mirrors the r8169 TX-timeout fixture.
+    let mut mem = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("fixture MMIO alloc failed"),
+    };
+    mem.as_mut_slice().fill(0);
+    let csr = MmioRegion {
+        phys: mem.phys_addr(),
+        virt: mem.as_mut_ptr() as u64,
+        len: mem.len() as u64,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let tx_ring = match alloc_coherent(RING_BYTES, DomainId::DRIVER_0) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("fixture TX ring alloc failed"),
+    };
+    let nic = Rtl8127Nic {
+        mmio: csr,
+        tx_ring,
+        tx_pool: alloc::vec::Vec::new(),
+        tx_head: IrqSafeSpinLock::new(0),
+        rx_queues: alloc::vec::Vec::new(),
+        rss_config: None,
+        mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        mac_version: MacVersion::Ver80,
+        mtu: IrqSafeSpinLock::new(1500),
+        wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
+        link_up: false,
+        suspended: AtomicBool::new(false),
+        irq_vector: None,
+        irq_vectors: alloc::vec::Vec::new(),
+        msix: None,
+        addr: narf_bus::BusAddr::Mmio(mem.phys_addr()),
+        ifname: crate::publish::IfName::new(),
+        rx_ipc_ring: IrqSafeSpinLock::new(None),
+        tx_ipc_ring: IrqSafeSpinLock::new(None),
+        rx_mirror: IrqSafeSpinLock::new(None),
+    };
+    let iface = Rtl8127NicIface {
+        nic: Arc::new(nic),
+        name: "rtl8127",
+    };
+    if iface.model() != NicModel::RealtekRtl8127 {
+        return TestResult::Fail("rtl8127 model() != RealtekRtl8127");
+    }
+    // Keep the fake MMIO backing alive until the iface is dropped.
+    drop(iface);
+    drop(mem);
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8127", smoke_rtl8127_model);
