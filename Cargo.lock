@@ -1710,6 +1710,7 @@ dependencies = [
  "narf-drivers-net-igb",
  "narf-drivers-net-igc",
  "narf-drivers-net-ixgbe",
+ "narf-drivers-net-mlx4",
  "narf-drivers-net-mlx5",
  "narf-drivers-net-realtek",
  "narf-drivers-net-rtl8139",
@@ -1986,6 +1987,31 @@ dependencies = [
 
 [[package]]
 name = "narf-drivers-net-ixgbe"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-power",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-mlx4"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
