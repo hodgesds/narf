@@ -892,6 +892,13 @@ impl IntelHda {
                 let map = self.hdmi_state(super::hdmi::hdmi_pcm_of(id.index)).chmap;
                 Ok(ControlValue::integers(&map.map(i32::from)))
             }
+            // The HDA backend exposes no mic-mute control (the
+            // Realtek mixer surface owns `ControlKind::MicMute`); this
+            // arm exists only because the match is exhaustive. It is
+            // unreachable in practice: `mixer_controls()` never lists
+            // MicMute, so the `contains` guard above rejects such an
+            // id before the match.
+            ControlKind::MicMute => Err(SoundError::NoSuchControl),
         }
     }
     pub(super) fn set_mixer(
