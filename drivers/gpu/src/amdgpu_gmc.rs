@@ -75,7 +75,8 @@ pub enum GartError {
     /// `phys_addr` isn't 4 KiB aligned.
     UnalignedPhys,
     /// PFN doesn't fit in 28 bits (PFN ≥ 1 TiB). Phoenix extends
-    /// to bits[47:12] (4 PiB) — caller uses `make_pte_phoenix`.
+    /// to bits[47:12] (4 PiB), but no Phoenix PTE builder exists yet
+    /// (APU audit lane 5) — the Gfx9 builder returns this error.
     PfnOverflow,
 }
 

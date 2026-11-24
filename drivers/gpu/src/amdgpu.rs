@@ -737,7 +737,8 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         // Raphael is RDNA2 too (GFX 10.3.6 / DCN 3.1.5), and like Rembrandt
         // sits in the coarse Navi2 register family beside discrete parts;
         // `ChipInfo::is_apu` and the GC list say it is an APU. Its firmware
-        // set is `RAPHAEL_FW`, but no PSP 13.0.5 load path exists yet, so it
+        // set is `RAPHAEL_FW`, but its graphics bring-up does not exist yet —
+        // the PSP 13.0.5 ring loads only the display's TOC and DMCUB — so it
         // is routed to `UNAUDITED_FW` as Strix is.
         RAPHAEL => (Family::Navi2, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
         CEZANNE => (
@@ -1869,17 +1870,13 @@ impl AmdGpu {
         // Build the sequence. `mode.stride` is in pixels — DCN's
         // DCSURF_SURFACE_PITCH field also expects pixels.
         //
-        // Branch by family: Phoenix / HawkPoint / Strix run DCN 3.5
-        // (different OTG register layout — see `amdgpu_dcn` module
-        // header for the per-register shifts). Everything else with
-        // a discoverable DCN block today is DCN 2.0 (Renoir,
-        // Cezanne, Lucienne).
-        // LINUX-GAP: this selected `dcn35_modeset_sequence` for Phoenix.
-        // Phoenix is DCN **3.1.4**, which agrees with DCN 2.0 on all nine OTG
-        // registers; DCN 3.5 moves four of them. `amdgpu_modeset` was
-        // corrected to the 2.0 sequence in an earlier pass and this call site
-        // was not, so the two modeset paths disagreed — and this is the one
-        // `set_mode` uses, which is what the PM resume path re-runs.
+        // No family branch here: this path always uses the DCN 2.0
+        // sequence. Phoenix / HawkPoint are DCN 3.1.4, which agrees
+        // with DCN 2.0 on all seven OTG registers (see `plan_modeset`
+        // for the register offsets) — an earlier pass corrected
+        // `amdgpu_modeset` to the 2.0 sequence, and this call site
+        // agrees. This is the sequence `set_mode` uses, which is what
+        // the PM resume path re-runs.
         let seq = crate::amdgpu_dcn::dcn20_modeset_sequence(
             &timing,
             self.vram.base,
