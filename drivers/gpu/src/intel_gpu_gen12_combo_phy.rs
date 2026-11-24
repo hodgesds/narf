@@ -708,6 +708,12 @@ struct LevelProgram<'a> {
 #[derive(Copy, Clone, Debug)]
 pub struct ComboPhy {
     ddi: Ddi,
+    /// The combo PHY the port drives: the port's own letter, except EHL/JSL
+    /// PORT_D, which drives PHY A.
+    phy: Ddi,
+    /// The Gen11 combo PLL the modeset took for a port with no fixed one
+    /// (EHL/JSL PORT_D, `arbitrate_combo_dpll`), for a mid-training retune.
+    gen11_dpll: Option<crate::intel_gpu_gen11_dpll::IclDpllId>,
     family: Gen12Platform,
     /// Gen11 platform when this PHY drives a Gen11 modeset
     /// (Lane 5). `family` is then unused — the table selection
@@ -750,6 +756,8 @@ impl ComboPhy {
         }
         Ok(Self {
             ddi,
+            phy: ddi,
+            gen11_dpll: None,
             family: family.unwrap_or(Gen12Platform::TigerLake),
             gen11: None,
             tgl_uy,
@@ -777,11 +785,17 @@ impl ComboPhy {
         is_edp: bool,
         low_vswing: bool,
     ) -> Result<Self, ModesetError> {
-        if ddi as u8 >= Ddi::D as u8 {
-            return Err(ModesetError::UnsupportedGeneration);
-        }
+        // EHL/JSL PORT_D drives combo PHY A (`intel_port_to_phy`'s
+        // special case); its DDI registers stay port D's.
+        let phy = match (platform, ddi) {
+            (Gen11Platform::ElkhartLake | Gen11Platform::JasperLake, Ddi::D) => Ddi::A,
+            (_, ddi) if (ddi as u8) < Ddi::D as u8 => ddi,
+            _ => return Err(ModesetError::UnsupportedGeneration),
+        };
         Ok(Self {
             ddi,
+            phy,
+            gen11_dpll: None,
             family: Gen12Platform::TigerLake,
             gen11: Some(platform),
             tgl_uy: false,
@@ -789,6 +803,16 @@ impl ComboPhy {
             hobl: false,
             low_vswing,
         })
+    }
+
+    /// The combo PLL the modeset arbitrated for a port without a fixed one
+    /// (EHL/JSL PORT_D); `retune_dpll` reprograms it.
+    pub(crate) fn with_gen11_dpll(
+        mut self,
+        dpll: Option<crate::intel_gpu_gen11_dpll::IclDpllId>,
+    ) -> Self {
+        self.gen11_dpll = dpll;
+        self
     }
 
     /// `DP_TP_CTL` address for this PHY: the TGL
@@ -807,7 +831,7 @@ impl ComboPhy {
     /// `intel_combo_phy_regs.h`). Construction guarantees
     /// DDI A–C; the fallback arm is unreachable in practice.
     const fn phy_base(self) -> u64 {
-        match self.ddi {
+        match self.phy {
             Ddi::A => 0x162_000,
             Ddi::B => 0x06C_000,
             Ddi::C => 0x160_000,
@@ -1252,11 +1276,12 @@ impl ComboPhy {
         };
         // The fixed combo-PLL assignment (ICL A/B, EHL/JSL
         // A/B/C); TC ports never reach this path — the modeset
-        // dispatches them to MgPort — and EHL/JSL PORT_D has no
-        // fixed assignment (shared PHY A, see `combo_dpll_id`).
+        // dispatches them to MgPort — and EHL/JSL PORT_D takes the
+        // PLL the modeset arbitrated (`with_gen11_dpll`).
         let id = match self
             .gen11
             .and_then(|platform| combo_dpll_id(platform, self.ddi))
+            .or(self.gen11_dpll)
         {
             Some(id) => id,
             None => return Err(ModesetError::UnsupportedGeneration),

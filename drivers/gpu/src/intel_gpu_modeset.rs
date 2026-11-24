@@ -463,6 +463,10 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// Display-9 panel fitting (`set_gen9_panel_fit`): the pipe source
     /// size and the bound pipe scaler. `None` scans out at the mode size.
     gen9_panel_fit: Option<(u16, u16, crate::intel_gpu_xelpg_scaler::PipeScaler)>,
+    /// The Gen11 combo PLL this run programmed for a port with no fixed
+    /// one (EHL/JSL PORT_D, `arbitrate_combo_dpll`): clock routing and a
+    /// mid-training retune use it.
+    gen11_dpll: Option<crate::intel_gpu_gen11_dpll::IclDpllId>,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -499,7 +503,44 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             edp_low_vswing: false,
             tc_width: 4,
             gen9_panel_fit: None,
+            gen11_dpll: None,
         }
+    }
+
+    /// EHL/JSL PORT_D: a combo port (it drives PHY A) where every other
+    /// DDI D is Type-C, so the `ddi >= D` Type-C dispatches skip it.
+    fn is_gen11_combo_port_d(&self) -> bool {
+        matches!(
+            self.gen11_platform,
+            Some(
+                crate::intel_gpu_gt::Gen11Platform::ElkhartLake
+                    | crate::intel_gpu_gt::Gen11Platform::JasperLake
+            )
+        ) && self.ddi == Ddi::D
+    }
+
+    /// Program the Gen11 combo PLL for `ddi` with `cfgcr0`/`cfgcr1`: the
+    /// fixed `combo_dpll_id` assignment, or for EHL/JSL PORT_D the pool
+    /// PLL `arbitrate_combo_dpll` picks. A shared PLL already runs the
+    /// state and is left alone, as Linux enables a shared PLL once.
+    fn enable_gen11_combo_pll(&mut self, cfgcr0: u32, cfgcr1: u32) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen11_dpll::{arbitrate_combo_dpll, combo_dpll_id, combo_pll_enable};
+        let platform = self
+            .gen11_platform
+            .ok_or(ModesetError::UnsupportedGeneration)?;
+        let (id, shared) = match combo_dpll_id(platform, self.ddi) {
+            Some(id) => (id, false),
+            None if self.is_gen11_combo_port_d() => {
+                arbitrate_combo_dpll(self.mmio, platform, self.ddi, cfgcr0, cfgcr1)
+                    .ok_or(ModesetError::DisplayResourceUnavailable)?
+            }
+            None => return Err(ModesetError::UnsupportedGeneration),
+        };
+        self.gen11_dpll = Some(id);
+        if shared {
+            return Ok(());
+        }
+        combo_pll_enable(self.mmio, id, cfgcr0, cfgcr1).map_err(|_| ModesetError::PllLockTimeout)
     }
 
     /// Fit a `src_w` x `src_h` pipe source to `native` (the panel's fixed
@@ -1493,7 +1534,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.mmio.read32(ddi_off) & DDI_BUF_CTL_ENABLE != 0 {
             return Err(ModesetError::PipelineStopUnavailable);
         }
-        if self.gen9_platform.is_none() && self.ddi as u8 >= Ddi::D as u8 {
+        if self.gen9_platform.is_none()
+            && self.ddi as u8 >= Ddi::D as u8
+            && !self.is_gen11_combo_port_d()
+        {
             crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?
                 .stop_transport(self.mmio, self.transcoder())?;
         }
@@ -1547,7 +1591,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.gen9_platform.is_some() {
             return self.program_dpll_gen9(rate);
         }
-        if self.ddi as u8 >= Ddi::D as u8 {
+        if self.ddi as u8 >= Ddi::D as u8 && !self.is_gen11_combo_port_d() {
             let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
             return port.enable(
                 self.mmio,
@@ -1582,24 +1626,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// remainder, not a guess. The fixed assignment comes from
     /// `combo_dpll_id`: ICL A/B and EHL/JSL A/B/C. ICL TC ports
     /// never reach here (dispatched to the MG PLL in
-    /// `program_dpll_with_rate`); EHL/JSL PORT_D has no fixed
-    /// assignment and refuses.
+    /// `program_dpll_with_rate`); EHL/JSL PORT_D takes a pool PLL
+    /// (`enable_gen11_combo_pll`).
     fn program_dpll_gen11(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
-        use crate::intel_gpu_gen11_dpll::{calc_dpll_state, combo_dpll_id, combo_pll_enable};
-        let platform = self
-            .gen11_platform
-            .ok_or(ModesetError::UnsupportedGeneration)?;
-        let id = match combo_dpll_id(platform, self.ddi) {
-            Some(id) => id,
-            None => return Err(ModesetError::UnsupportedGeneration),
-        };
+        use crate::intel_gpu_gen11_dpll::calc_dpll_state;
         let family = decode_refclk_family(self.mmio.read32(DSSM));
         let coeffs = match combo_coeffs(rate, family) {
             Some(c) => c,
             None => return Err(ModesetError::PllLockTimeout),
         };
         let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
-        combo_pll_enable(self.mmio, id, cfgcr0, cfgcr1).map_err(|_| ModesetError::PllLockTimeout)
+        self.enable_gen11_combo_pll(cfgcr0, cfgcr1)
     }
 
     /// Bring the Gen9 SKL DPLL up for `rate`:
@@ -1690,7 +1727,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         coeffs: &crate::intel_gpu_pll::DpllCoeffs,
         pixel_clock_khz: u32,
     ) -> Result<(), ModesetError> {
-        use crate::intel_gpu_gen11_dpll::{calc_dpll_state, combo_dpll_id, combo_pll_enable};
+        use crate::intel_gpu_gen11_dpll::calc_dpll_state;
         let platform = self
             .gen11_platform
             .ok_or(ModesetError::UnsupportedGeneration)?;
@@ -1705,13 +1742,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 )
             }
             Some(crate::intel_gpu_gen11_ddi::Gen11Phy::Combo) => {
-                let id = match combo_dpll_id(platform, self.ddi) {
-                    Some(id) => id,
-                    None => return Err(ModesetError::UnsupportedGeneration),
-                };
                 let (cfgcr0, cfgcr1) = calc_dpll_state(coeffs, false);
-                combo_pll_enable(self.mmio, id, cfgcr0, cfgcr1)
-                    .map_err(|_| ModesetError::PllLockTimeout)
+                self.enable_gen11_combo_pll(cfgcr0, cfgcr1)
             }
             None => Err(ModesetError::UnsupportedGeneration),
         }
@@ -2183,7 +2215,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 return Err(error);
             }
             result
-        } else if self.ddi as u8 >= Ddi::D as u8 {
+        } else if self.ddi as u8 >= Ddi::D as u8 && !self.is_gen11_combo_port_d() {
             let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
             port.start_training(
                 self.mmio,
@@ -2233,7 +2265,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                     platform,
                     self.ddi == Ddi::A,
                     self.edp_low_vswing,
-                )?,
+                )?
+                .with_gen11_dpll(self.gen11_dpll),
                 None => crate::intel_gpu_gen12_combo_phy::ComboPhy::new(
                     self.ddi,
                     self.gen12_family,
@@ -2315,17 +2348,26 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             crate::intel_gpu_gen9_dpll::enable_clock(self.mmio, self.ddi, id);
             return Ok(());
         }
-        if self.ddi as u8 >= Ddi::D as u8 {
+        if self.ddi as u8 >= Ddi::D as u8 && !self.is_gen11_combo_port_d() {
             return crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?
                 .route_clock(self.mmio);
         }
         use crate::intel_gpu_pll::{
             dpclka_clk_off, dpclka_clk_sel, dpclka_clk_sel_mask, DPCLKA_CFGCR0,
         };
-        let phy = self.ddi as u32;
+        // EHL/JSL PORT_D clocks PHY A from the PLL it arbitrated
+        // (`icl_ddi_combo_enable_clock` keys the field by PHY).
+        let (phy, select) = if self.is_gen11_combo_port_d() {
+            let id = self
+                .gen11_dpll
+                .ok_or(ModesetError::DisplayResourceUnavailable)?;
+            (Ddi::A as u32, id.clock_select())
+        } else {
+            (self.ddi as u32, dpll_index_for(self.ddi))
+        };
         let cur = self.mmio.read32(DPCLKA_CFGCR0);
         let selected = (cur & !dpclka_clk_sel_mask(phy) & !dpclka_clk_off(phy))
-            | dpclka_clk_sel(dpll_index_for(self.ddi), phy)
+            | dpclka_clk_sel(select, phy)
             | dpclka_clk_off(phy);
         self.mmio.write32(DPCLKA_CFGCR0, selected);
         compiler_fence(Ordering::SeqCst);
