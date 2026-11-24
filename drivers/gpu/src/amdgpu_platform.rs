@@ -956,7 +956,7 @@ async fn graphics_boot_phoenix(
     let mut boot = build_phoenix_boot(pool, mes_start)?;
     // SAFETY: the owner is new, this display owner holds the whole GPU,
     // and the RLC autoload has completed.
-    unsafe { run_graphics_phoenix(&mut *boot) }.await;
+    unsafe { run_graphics_phoenix(&mut boot) }.await;
     Some(boot)
 }
 /// Run `boot`'s stages and report them.
@@ -1420,7 +1420,7 @@ async fn rebuild_graphics_phoenix(
     loader: &mut Loader,
     pool: &Pool,
     graphics: &mut Option<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>>,
-    retired: &mut Vec<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>>,
+    retired: &mut Vec<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
 ) -> Result<(), RecoveryError> {
     use core::fmt::Write as _;
     if !loader.graphics_booted() {
@@ -1430,7 +1430,7 @@ async fn rebuild_graphics_phoenix(
         return Err(RecoveryError::NoGraphics);
     };
     if let Some(old) = graphics.take() {
-        retired.push(old);
+        retired.push(*old);
     }
     *graphics = alloc::boxed::Box::pin(graphics_boot_phoenix(pool, mes_start)).await;
     let new = graphics
@@ -2301,7 +2301,7 @@ struct Display {
     /// today, so `start()` never fills this in.
     graphics_phoenix: Option<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>>,
     /// Phoenix owners a mode 2 recovery replaced; same quarantine policy.
-    retired_phoenix: Vec<alloc::boxed::Box<crate::amdgpu_phoenix_boot::PhoenixColdBoot>>,
+    retired_phoenix: Vec<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
     /// Strix's graphics engines, same retention policy as Phoenix's.
     /// Unreachable until the firmware lane lands `Firmware::open_strix`
     /// + the Strix `set_graphics` arm: no Strix set can be loaded today,
