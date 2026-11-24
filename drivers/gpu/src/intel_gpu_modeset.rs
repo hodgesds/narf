@@ -1504,6 +1504,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// is refused with the same `PowerWellTimeout` a grant
     /// failure surfaces as, so callers see one clean error.
     ///
+    /// Rocket Lake has no PW_2 (`rkl_power_wells`): Pipe A sits in
+    /// PW_1 with transcoder A and DDI A/B, Pipe B under PW_3 and Pipe C
+    /// under PW_4, so Pipe A requests no per-pipe well.
+    ///
     /// Gen9 uses the SKL map instead (`skl_power_wells`):
     /// Pipe A is in no gated well (always-on set — the pipe,
     /// the EDP transcoder, the DDI A lanes and AUX A are all
@@ -1521,6 +1525,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             return match pipe {
                 Pipe::A => Ok(()),
                 Pipe::B | Pipe::C => self.enable_power_well(15),
+                Pipe::D => Err(ModesetError::PowerWellTimeout),
+            };
+        }
+        if self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake) {
+            return match pipe {
+                Pipe::A => Ok(()),
+                Pipe::B => self.enable_power_well(PowerWell::Pg3 as u32),
+                Pipe::C => self.enable_power_well(PowerWell::Pg4 as u32),
                 Pipe::D => Err(ModesetError::PowerWellTimeout),
             };
         }
@@ -2668,8 +2680,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             return self.program_cdclk_floor_gen11(mode, platform);
         }
         use crate::intel_gpu_gen12_cdclk as cdclk;
+        let table = cdclk::table_for(self.gen12_family);
         let current =
-            cdclk::Current::read(self.mmio).map_err(|_| ModesetError::CdclkUnavailable)?;
+            cdclk::Current::read(self.mmio, table).map_err(|_| ModesetError::CdclkUnavailable)?;
         let floor_khz = mode.pixel_clock_khz.div_ceil(2);
         if let Some(known) = current.known {
             if known.cdclk_khz >= floor_khz {
@@ -2677,7 +2690,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             }
         }
         self.refuse_shared_cdclk(current.known.map(|k| k.cdclk_khz), mode)?;
-        let target = match cdclk::calc_cdclk(current.refclk_khz, floor_khz) {
+        let target = match cdclk::calc_cdclk(table, current.refclk_khz, floor_khz) {
             Some(r) => r,
             None => return Ok(()), // beyond the table; leave firmware CDCLK
         };
@@ -4018,6 +4031,50 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_modeset", smoke_enable_pg3_for_pipe_b);
+
+    /// Rocket Lake has no PW_2 (`rkl_power_wells`): Pipe A requests no
+    /// per-pipe well, Pipe B requests PW_3 and Pipe C PW_4, and no run
+    /// ever requests PW_2.
+    fn smoke_rkl_pipe_power_wells_skip_pw2() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        let pg2 = super::pwr_well_req(super::PowerWell::Pg2 as u32);
+        for (pipe, well) in [
+            (Pipe::A, None),
+            (Pipe::B, Some(super::PowerWell::Pg3)),
+            (Pipe::C, Some(super::PowerWell::Pg4)),
+        ] {
+            let mut mmio = FakeMmio::new();
+            mmio.state_offset = super::PWR_WELL_CTL2;
+            mmio.state_value = well.map_or(0, |w| super::pwr_well_state(w as u32));
+            let mut ms = Modeset::for_pipe(&mmio, Ddi::B, pipe);
+            ms.set_gen12_family(Gen12Platform::RocketLake);
+            if ms.enable_pipe_power_well(pipe).is_err() {
+                return TestResult::Fail("RKL per-pipe well must enable");
+            }
+            let writes = mmio.writes_to(super::PWR_WELL_CTL2);
+            match well {
+                None if !writes.is_empty() => {
+                    return TestResult::Fail("RKL Pipe A must request no per-pipe well");
+                }
+                Some(w)
+                    if writes
+                        .iter()
+                        .all(|v| v & super::pwr_well_req(w as u32) == 0) =>
+                {
+                    return TestResult::Fail("RKL Pipe B/C must request PW_3/PW_4");
+                }
+                _ => {}
+            }
+            if writes.iter().any(|v| v & pg2 != 0) {
+                return TestResult::Fail("RKL must never request PW_2");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_pipe_power_wells_skip_pw2
+    );
 
     fn smoke_enable_pg4_for_pipe_c() -> TestResult {
         // Pipe C lives under PG4 (#1017).
@@ -6718,6 +6775,63 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_gen11_external_dp_ddi_b_full_run
+    );
+
+    /// Rocket Lake external DP on combo DDI B / Pipe A at HBR2 x4,
+    /// 1080p60, 19.2 MHz strap. Hand-computed RKL deltas from the TGL run:
+    /// CDCLK from `rkl_cdclk_table` (floor 74.25 MHz -> 172.8 MHz at ratio
+    /// 36, VCO / 4: DE_PLL_ENABLE [0, 36, 0x80000024], CDCLK_CTL DIV_SEL 2
+    /// | pipe none | decimal 344 = 0x00B80158) and no PW_2 request. DDI B's
+    /// PLL and clock routing are Tiger Lake's on RKL: DPLL1 at
+    /// `RKL_DPLL_CFGCR0/1(1)` = 0x16428C / 0x164290 (the HBR2 row), and
+    /// DPCLKA phy B select 1 at bits 3:2 with CLK_OFF bit 11.
+    fn smoke_rkl_external_dp_ddi_b_full_run() -> TestResult {
+        use crate::intel_gpu_gen12_cdclk::{CDCLK_CTL, DE_PLL_ENABLE};
+        use crate::intel_gpu_gt::Gen12Platform;
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::B, Pipe::A);
+        ms.set_gen12_family(Gen12Platform::RocketLake);
+        let plan = LinkPlan {
+            rate: crate::dp_link_training::LinkRate::Hbr2,
+            lanes: 4,
+        };
+        let trained = match ms.modeset_with_plan(&fb_1080p(), &mode_1080p60(), plan) {
+            Ok((_, t)) => t,
+            Err(_) => return TestResult::Fail("RKL external DP on DDI B must succeed"),
+        };
+        if trained.rate != crate::dp_link_training::LinkRate::Hbr2 || trained.lanes != 4 {
+            return TestResult::Fail("RKL DDI B must train at HBR2 x4");
+        }
+        if mmio.writes_to(DE_PLL_ENABLE) != alloc::vec![0, 36, 0x8000_0024] {
+            return TestResult::Fail("RKL CDCLK PLL must relock at the rkl_cdclk_table ratio 36");
+        }
+        if mmio.writes_to(CDCLK_CTL) != alloc::vec![0x00B8_0158] {
+            return TestResult::Fail("RKL CDCLK_CTL must divide the 691.2 MHz VCO by 4");
+        }
+        let pg2 = super::pwr_well_req(super::PowerWell::Pg2 as u32);
+        if mmio.writes_to(PWR_WELL_CTL2).iter().any(|v| v & pg2 != 0) {
+            return TestResult::Fail("RKL must never request PW_2");
+        }
+        if mmio.writes_to(0x16428C) != alloc::vec![0x01C0_01A5]
+            || mmio.writes_to(0x164290) != alloc::vec![0x4B]
+        {
+            return TestResult::Fail("RKL DDI B must program DPLL1 at the HBR2 row");
+        }
+        if mmio.writes_to(0x164280) != alloc::vec![0x804, 0x4] {
+            return TestResult::Fail("RKL DPCLKA must select DPLL1 for PHY B, clock on");
+        }
+        let tp = crate::intel_gpu_pipes::Transcoder::A.base() + 0x540;
+        if mmio.writes_to(tp).last() != Some(&0x8004_0300) {
+            return TestResult::Fail("RKL DP_TP_CTL is transcoder-based and must end at NORMAL");
+        }
+        if mmio.sink.borrow().pattern_history != alloc::vec![1u8, 3, 0] {
+            return TestResult::Fail("RKL DDI B training must run TPS1, TPS3, off");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_external_dp_ddi_b_full_run
     );
 
     fn smoke_gen11_hdmi_ddi_b_full_run() -> TestResult {

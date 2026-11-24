@@ -149,7 +149,10 @@ impl HpdProfile {
     /// ICP (`INTEL_PCH_ICP_DEVICE_ID_TYPE` 0x3480, `_ICP2_` 0x3880), EHL/JSL
     /// with MCC (0x4B00, TGP-compatible) or JSP (0x4D80, ICP-compatible).
     /// Gen9 pairs with an SPT-class PCH (SPT, KBP, CNP, CMP), whose bank is
-    /// the SPT layout ([`HpdBank::Spt`]).
+    /// the SPT layout ([`HpdBank::Spt`]). Rocket Lake pairs with TGP (the
+    /// ICP-class bank) or with CMP/CMP2, which `intel_pch_type` reports as
+    /// CNP ("CometPoint is CNP Compatible", `hpd_spt`); `rkl_hpd_pin` puts
+    /// DDI B on `HPD_PORT_B` with either.
     pub(crate) fn for_source(
         family: crate::intel_gpu_aux::SourceFamily,
         vendor: u16,
@@ -165,6 +168,7 @@ impl HpdProfile {
         let allowed = matches!(
             (family, device & 0xff80),
             (Gen12(TigerLake), 0xa080 | 0x4380)
+                | (Gen12(RocketLake), 0xa080 | 0x4380 | 0x0280 | 0x0680)
                 | (
                     Gen12(AlderLakeP | AlderLakeN),
                     0x7a80 | 0x5180 | 0x7a00 | 0x5480
@@ -213,10 +217,12 @@ impl HpdProfile {
             _ => None,
         }
     }
-    /// The bank this profile's south display uses.
+    /// The bank this profile's south display uses: the SPT layout for an
+    /// SPT-class PCH (every Gen9 pairing, and Rocket Lake on CMP), the ICP
+    /// layout otherwise.
     const fn bank(&self) -> HpdBank {
-        match self.family {
-            crate::intel_gpu_aux::SourceFamily::Gen9 { .. } => HpdBank::Spt,
+        match self.device & 0xff80 {
+            0xa100 | 0x9d00 | 0xa280 | 0xa300 | 0x9d80 | 0x0280 | 0x0680 | 0xa380 => HpdBank::Spt,
             _ => HpdBank::Icp,
         }
     }
@@ -2245,6 +2251,21 @@ pub mod tests {
         if HpdProfile::for_source(icl, 0x8086, 0x3482, isa).map(|p| p.bank()) != Some(HpdBank::Icp)
         {
             return TestResult::Fail("Gen11 keeps the ICP bank");
+        }
+        // Rocket Lake pairs with TGP (ICP bank) or CMP/CMP2 (CNP-compatible,
+        // the SPT bank); ADP and CMP-V do not qualify it.
+        let rkl = SourceFamily::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+        for (did, bank) in [
+            (0x4388, Some(HpdBank::Icp)), // TGP-H
+            (0xa082, Some(HpdBank::Icp)), // TGP-LP
+            (0x0284, Some(HpdBank::Spt)), // CMP
+            (0x0687, Some(HpdBank::Spt)), // CMP2
+            (0xa3c8, None),               // CMP-V (KBP-based)
+            (0x7a84, None),               // ADP-S
+        ] {
+            if HpdProfile::for_source(rkl, 0x8086, did, isa).map(|p| p.bank()) != bank {
+                return TestResult::Fail("RKL HPD rows must follow intel_pch.c and rkl_hpd_pin");
+            }
         }
         // SPT's PORTB: ISR bit 21, enable bit 4, status 1:0 (long 2).
         let spt = HpdBank::Spt;

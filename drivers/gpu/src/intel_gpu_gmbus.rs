@@ -401,10 +401,16 @@ impl GmbusPinTable {
 /// Lake and TC1..TC4 (DDI D..G) on ADL-P/N, per the platform port masks
 /// in `intel_display_device.c`. A DDI the platform does not have (the
 /// source's WARN paths) has no pin. Every result is valid in
-/// `gmbus_pins_icp`, the table these PCHs select.
+/// `gmbus_pins_icp`, the table these PCHs select. Rocket Lake takes
+/// `rkl_encoder_to_ddc_pin`: PHY A/B → `GMBUS_PIN_1_BXT + phy` with
+/// either PCH, but its TC1/TC2 ports (combo PHY C/D) take the Type-C
+/// pins only with TGP and `GMBUS_PIN_1_BXT + phy` with CMP, so without
+/// the PCH they have no default.
 pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
     match (family, ddi) {
         (_, Ddi::A) => Some(PinPair::Pin1Bxt),
+        (Gen12Platform::RocketLake, Ddi::B) => Some(PinPair::Pin2Bxt),
+        (Gen12Platform::RocketLake, _) => None,
         (Gen12Platform::AlderLakeS, Ddi::B | Ddi::C | Ddi::H | Ddi::I) => None,
         (_, Ddi::B) => Some(PinPair::Pin2Bxt),
         (_, Ddi::C) => None,
@@ -2247,7 +2253,7 @@ pub mod tests {
         // icl_encoder_to_ddc_pin on TGL/ADL-P/ADL-N (combo A/B =
         // GMBUS_PIN_1_BXT + port, TC = GMBUS_PIN_9_TC1_ICP + tc),
         // adls_encoder_to_ddc_pin on ADL-S (A = 1, TC1..4 = 9..12).
-        use Gen12Platform::{AlderLakeN, AlderLakeP, AlderLakeS, TigerLake};
+        use Gen12Platform::{AlderLakeN, AlderLakeP, AlderLakeS, RocketLake, TigerLake};
         let ddis = [
             Ddi::A,
             Ddi::B,
@@ -2259,7 +2265,7 @@ pub mod tests {
             Ddi::H,
             Ddi::I,
         ];
-        let rows: [(Gen12Platform, [Option<u32>; 9]); 4] = [
+        let rows: [(Gen12Platform, [Option<u32>; 9]); 5] = [
             (
                 TigerLake,
                 [
@@ -2315,6 +2321,10 @@ pub mod tests {
                     None,
                     None,
                 ],
+            ),
+            (
+                RocketLake,
+                [Some(1), Some(2), None, None, None, None, None, None, None],
             ),
         ];
         for (family, want) in rows {

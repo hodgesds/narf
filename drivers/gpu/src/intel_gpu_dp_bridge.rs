@@ -109,8 +109,14 @@ pub fn connector_to_ddi(connector: ConnectorId) -> Option<Ddi> {
 /// TC1..TC4 → C..F (`icl_display`: PORT_C..PORT_F are TC_PORT_1..4). Other
 /// sources have no Type-C ports for this bridge.
 pub fn connector_to_ddi_for(family: SourceFamily, connector: ConnectorId) -> Option<Ddi> {
+    use crate::intel_gpu_gt::Gen12Platform;
     match family {
-        SourceFamily::Gen12(_) => connector_to_ddi(connector),
+        // Rocket Lake and Alder Lake S have no Type-C PHY: their TC1..TC4
+        // ports are combo PHYs (`intel_phy_is_tc` is false), which
+        // `DklPort` refuses.
+        SourceFamily::Gen12(
+            Gen12Platform::TigerLake | Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN,
+        ) => connector_to_ddi(connector),
         SourceFamily::Gen11(crate::intel_gpu_gt::Gen11Platform::IceLake) => {
             match connector.as_u32() {
                 0 => Some(Ddi::C),
@@ -697,8 +703,8 @@ pub mod tests {
         smoke_connector_to_ddi_maps_tc1_through_tc6
     );
 
-    /// Ice Lake's TC1..TC4 are DDI C..F; EHL/JSL and Gen9 have no Type-C
-    /// connectors for the bridge.
+    /// Ice Lake's TC1..TC4 are DDI C..F; EHL/JSL, Gen9, Rocket Lake and
+    /// Alder Lake S have no Type-C connectors for the bridge.
     fn smoke_connector_to_ddi_for_ice_lake() -> TestResult {
         use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, Gen9Platform};
         let icl = SourceFamily::Gen11(Gen11Platform::IceLake);
@@ -723,8 +729,14 @@ pub mod tests {
                 ConnectorId::from_index(0),
             )
             .is_some()
+            || [Gen12Platform::RocketLake, Gen12Platform::AlderLakeS]
+                .iter()
+                .any(|f| {
+                    super::connector_to_ddi_for(SourceFamily::Gen12(*f), ConnectorId::from_index(0))
+                        .is_some()
+                })
         {
-            return TestResult::Fail("only Gen12 and Ice Lake have bridge connectors");
+            return TestResult::Fail("only Type-C Gen12 and Ice Lake have bridge connectors");
         }
         TestResult::Pass
     }

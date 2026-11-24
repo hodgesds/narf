@@ -164,11 +164,55 @@ pub(crate) const TABLE: [Rung; 18] = [
     },
 ];
 
-/// `bxt_calc_cdclk`: the first rung at `refclk_khz` at or above
-/// `min_khz`. Linux WARNs and clamps past the table; the modeset
+const fn rkl_rung(refclk_khz: u32, cdclk_khz: u32, ratio: u32) -> Rung {
+    Rung {
+        refclk_khz,
+        cdclk_khz,
+        ratio,
+    }
+}
+
+/// `rkl_cdclk_table` (`display/intel_cdclk.c`), which Rocket Lake takes
+/// instead of the ICL table (`intel_init_cdclk_hooks`, `tgl_cdclk_funcs`
+/// otherwise). The same CDCLK ladder, but every VCO doubles the ICL
+/// one: CDCLK = VCO / 4, except 326.4 / 324 MHz at VCO / 8.
+pub(crate) const RKL_TABLE: [Rung; 18] = [
+    rkl_rung(19_200, 172_800, 36),
+    rkl_rung(19_200, 192_000, 40),
+    rkl_rung(19_200, 307_200, 64),
+    rkl_rung(19_200, 326_400, 136),
+    rkl_rung(19_200, 556_800, 116),
+    rkl_rung(19_200, 652_800, 136),
+    rkl_rung(24_000, 180_000, 30),
+    rkl_rung(24_000, 192_000, 32),
+    rkl_rung(24_000, 312_000, 52),
+    rkl_rung(24_000, 324_000, 108),
+    rkl_rung(24_000, 552_000, 92),
+    rkl_rung(24_000, 648_000, 108),
+    rkl_rung(38_400, 172_800, 18),
+    rkl_rung(38_400, 192_000, 20),
+    rkl_rung(38_400, 307_200, 32),
+    rkl_rung(38_400, 326_400, 68),
+    rkl_rung(38_400, 556_800, 58),
+    rkl_rung(38_400, 652_800, 68),
+];
+
+/// The CDCLK table `family` runs: [`RKL_TABLE`] on Rocket Lake, the ICL
+/// [`TABLE`] on every other display-12 family (and with no family).
+pub(crate) const fn table_for(
+    family: Option<crate::intel_gpu_gt::Gen12Platform>,
+) -> &'static [Rung] {
+    match family {
+        Some(crate::intel_gpu_gt::Gen12Platform::RocketLake) => &RKL_TABLE,
+        _ => &TABLE,
+    }
+}
+
+/// `bxt_calc_cdclk`: the first rung of `table` at `refclk_khz` at or
+/// above `min_khz`. Linux WARNs and clamps past the table; the modeset
 /// refuses instead (leaves the firmware clock alone).
-pub(crate) fn calc_cdclk(refclk_khz: u32, min_khz: u32) -> Option<Rung> {
-    TABLE
+pub(crate) fn calc_cdclk(table: &[Rung], refclk_khz: u32, min_khz: u32) -> Option<Rung> {
+    table
         .iter()
         .copied()
         .find(|r| r.refclk_khz == refclk_khz && r.cdclk_khz >= min_khz)
@@ -193,7 +237,8 @@ fn decimal(cdclk_khz: u32) -> u32 {
 /// VCO / CDCLK (`cdclk_divider` with a zero waveform), mapped to the
 /// field value (2 -> DIV_SEL_1, 3 -> 1_5, 4 -> 2, 8 -> 4). `None`
 /// when the rung's VCO/CDCLK ratio is not a programmed divider —
-/// every `TABLE` rung divides by 2 or 4.
+/// every `TABLE` rung divides by 2 or 4, every `RKL_TABLE` rung by 4
+/// or 8.
 fn div_sel(rung: Rung) -> Option<u32> {
     let vco = rung.ratio * rung.refclk_khz;
     let div = (vco + rung.cdclk_khz / 2) / rung.cdclk_khz;
@@ -277,11 +322,14 @@ pub(crate) fn current_khz(
 }
 
 impl Current {
-    /// [`Current`] sanitized against the table and the CTL encoding:
+    /// [`Current`] sanitized against `table` and the CTL encoding:
     /// a known rung matches the decoded rate, the PLL ratio, and the
     /// CTL value (ignoring the CD2X pipe field, which firmware may
     /// have set for its own pipe).
-    pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Self, CdclkError> {
+    pub(crate) fn read(
+        io: &(impl MmioWindow + ?Sized),
+        table: &[Rung],
+    ) -> Result<Self, CdclkError> {
         let refclk_khz = crate::intel_gpu_pll::refclk_khz(read(io, DSSM)?);
         let pll = read(io, DE_PLL_ENABLE)?;
         let ctl = read(io, CDCLK_CTL)?;
@@ -295,7 +343,7 @@ impl Current {
         // bxt_sanitize_cdclk: PLL off, a rate outside the table, a VCO
         // that is not the table's, or a CTL other than bxt_cdclk_ctl
         // (ignoring the CD2X pipe field) are all "unknown".
-        let known = TABLE.iter().copied().find(|r| {
+        let known = table.iter().copied().find(|r| {
             r.refclk_khz == refclk_khz
                 && r.cdclk_khz == actual_khz
                 && pll & PLL_ENABLE != 0
@@ -555,38 +603,38 @@ pub mod tests {
     /// programmed state for readback assertions.
     fn program_from_cold(dssm: u32, target: Rung) -> Result<(CdclkMmio, Current), CdclkError> {
         let mmio = CdclkMmio::new(dssm);
-        let old = Current::read(&mmio)?;
+        let old = Current::read(&mmio, &TABLE)?;
         program(&mmio, &old, target)?;
-        let after = Current::read(&mmio)?;
+        let after = Current::read(&mmio, &TABLE)?;
         Ok((mmio, after))
     }
 
     fn smoke_tgl_cdclk_table_lookup() -> TestResult {
         // 19.2 MHz: first rung at or above the minimum.
-        if calc_cdclk(19_200, 1) != Some(rung(19_200, 172_800)) {
+        if calc_cdclk(&TABLE, 19_200, 1) != Some(rung(19_200, 172_800)) {
             return TestResult::Fail("19.2 MHz floor must be the 172.8 MHz rung");
         }
-        if calc_cdclk(19_200, 200_000) != Some(rung(19_200, 307_200)) {
+        if calc_cdclk(&TABLE, 19_200, 200_000) != Some(rung(19_200, 307_200)) {
             return TestResult::Fail("19.2 MHz 200 MHz floor must be the 307.2 MHz rung");
         }
-        if calc_cdclk(19_200, 652_800) != Some(rung(19_200, 652_800)) {
+        if calc_cdclk(&TABLE, 19_200, 652_800) != Some(rung(19_200, 652_800)) {
             return TestResult::Fail("19.2 MHz top rung must resolve");
         }
-        if calc_cdclk(19_200, 652_801).is_some() {
+        if calc_cdclk(&TABLE, 19_200, 652_801).is_some() {
             return TestResult::Fail("past the 19.2 MHz table must refuse");
         }
         // 24 MHz has its own rungs (180/312/324/552/648 MHz).
-        if calc_cdclk(24_000, 200_000) != Some(rung(24_000, 312_000)) {
+        if calc_cdclk(&TABLE, 24_000, 200_000) != Some(rung(24_000, 312_000)) {
             return TestResult::Fail("24 MHz 200 MHz floor must be the 312 MHz rung");
         }
-        if calc_cdclk(24_000, 648_001).is_some() {
+        if calc_cdclk(&TABLE, 24_000, 648_001).is_some() {
             return TestResult::Fail("past the 24 MHz table must refuse");
         }
         // 38.4 MHz.
-        if calc_cdclk(38_400, 600_000) != Some(rung(38_400, 652_800)) {
+        if calc_cdclk(&TABLE, 38_400, 600_000) != Some(rung(38_400, 652_800)) {
             return TestResult::Fail("38.4 MHz 600 MHz floor must be the 652.8 MHz rung");
         }
-        if calc_cdclk(24_000, 1).is_some_and(|r| r.refclk_khz != 24_000) {
+        if calc_cdclk(&TABLE, 24_000, 1).is_some_and(|r| r.refclk_khz != 24_000) {
             return TestResult::Fail("lookup must not cross reference straps");
         }
         TestResult::Pass
@@ -594,6 +642,51 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gen12_cdclk",
         smoke_tgl_cdclk_table_lookup
+    );
+
+    /// `rkl_cdclk_table`: Rocket Lake selects it, the other display-12
+    /// families keep the ICL table, every rung's VCO divides by 4 or 8
+    /// (CD2X DIV_SEL 2 / 4), and a lookup walks the RKL ladder.
+    fn smoke_rkl_cdclk_table_and_dividers() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        if table_for(Some(Gen12Platform::RocketLake)) != &RKL_TABLE[..]
+            || table_for(Some(Gen12Platform::TigerLake)) != &TABLE[..]
+            || table_for(Some(Gen12Platform::AlderLakeS)) != &TABLE[..]
+            || table_for(None) != &TABLE[..]
+        {
+            return TestResult::Fail("only Rocket Lake takes rkl_cdclk_table");
+        }
+        for r in RKL_TABLE {
+            let div = (r.ratio * r.refclk_khz) / r.cdclk_khz;
+            let want = match (r.refclk_khz, r.cdclk_khz) {
+                (_, 326_400) | (_, 324_000) => 3 << 22,
+                _ => 2 << 22,
+            };
+            if r.ratio * r.refclk_khz != div * r.cdclk_khz || div_sel(r) != Some(want) {
+                return TestResult::Fail("every RKL rung must divide its VCO by 4 or 8");
+            }
+        }
+        // 19.2 MHz: 172.8 MHz (691.2 / 4) -> CTL 0x00B80158; 326.4 MHz
+        // (2611.2 / 8) -> DIV_SEL 4 with decimal 651.
+        let low = calc_cdclk(&RKL_TABLE, 19_200, 74_250);
+        if low != Some(rkl_rung(19_200, 172_800, 36))
+            || ctl_value(rkl_rung(19_200, 172_800, 36)) != Some(0x00B8_0158)
+        {
+            return TestResult::Fail("RKL 172.8 MHz rung must be ratio 36 at DIV_SEL 2");
+        }
+        if calc_cdclk(&RKL_TABLE, 19_200, 310_000) != Some(rkl_rung(19_200, 326_400, 136))
+            || ctl_value(rkl_rung(19_200, 326_400, 136)) != Some((3 << 22) | (7 << 19) | 651)
+        {
+            return TestResult::Fail("RKL 326.4 MHz rung must be ratio 136 at DIV_SEL 4");
+        }
+        if calc_cdclk(&RKL_TABLE, 24_000, 648_001).is_some() {
+            return TestResult::Fail("the RKL ladder tops out at 648 MHz on the 24 MHz strap");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen12_cdclk",
+        smoke_rkl_cdclk_table_and_dividers
     );
 
     fn smoke_tgl_cdclk_dividers_and_voltage() -> TestResult {
@@ -660,7 +753,7 @@ pub mod tests {
         let mmio = CdclkMmio::new(1 << 29);
         *mmio.pll.borrow_mut() = PLL_ENABLE | 18;
         *mmio.ctl.borrow_mut() = (7 << 19) | 344;
-        let cur = match Current::read(&mmio) {
+        let cur = match Current::read(&mmio, &TABLE) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("known clock must read"),
         };
@@ -672,7 +765,7 @@ pub mod tests {
         }
         // PLL off: unknown, actual 0.
         let mmio = CdclkMmio::new(1 << 29);
-        let cur = match Current::read(&mmio) {
+        let cur = match Current::read(&mmio, &TABLE) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("PLL-off clock must read"),
         };
@@ -683,14 +776,14 @@ pub mod tests {
         let mut mmio = CdclkMmio::new(1 << 29);
         mmio.grant_lock = false;
         *mmio.pll.borrow_mut() = PLL_ENABLE | 18;
-        if Current::read(&mmio) != Err(CdclkError::Unlocked) {
+        if Current::read(&mmio, &TABLE) != Err(CdclkError::Unlocked) {
             return TestResult::Fail("unlocked PLL must error, not decode");
         }
         // Ratio outside the table: decoded but unknown.
         let mmio = CdclkMmio::new(1 << 29);
         *mmio.pll.borrow_mut() = PLL_ENABLE | 17;
         *mmio.ctl.borrow_mut() = (7 << 19) | 344;
-        let cur = match Current::read(&mmio) {
+        let cur = match Current::read(&mmio, &TABLE) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("off-table ratio must read"),
         };
@@ -739,7 +832,7 @@ pub mod tests {
         let mmio = CdclkMmio::new(1 << 29);
         *mmio.pll.borrow_mut() = PLL_ENABLE | 68;
         *mmio.ctl.borrow_mut() = (2 << 22) | (7 << 19) | 651;
-        let old = match Current::read(&mmio) {
+        let old = match Current::read(&mmio, &TABLE) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("326.4 MHz start must read as known"),
         };
@@ -766,7 +859,7 @@ pub mod tests {
         let mmio = CdclkMmio::new(1 << 29);
         *mmio.pll.borrow_mut() = PLL_ENABLE | 18;
         *mmio.ctl.borrow_mut() = (7 << 19) | 344;
-        let old = match Current::read(&mmio) {
+        let old = match Current::read(&mmio, &TABLE) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("target clock must read as known"),
         };
@@ -786,7 +879,7 @@ pub mod tests {
     fn smoke_tgl_cdclk_pcode_refusal_writes_nothing() -> TestResult {
         let mut mmio = CdclkMmio::new(1 << 29);
         mmio.pcode_status = 0x1;
-        let old = match Current::read(&mmio) {
+        let old = match Current::read(&mmio, &TABLE) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("cold clock must read"),
         };
@@ -808,7 +901,7 @@ pub mod tests {
     fn smoke_tgl_cdclk_pll_lock_timeout() -> TestResult {
         let mut mmio = CdclkMmio::new(1 << 29);
         mmio.grant_lock = false;
-        let old = match Current::read(&mmio) {
+        let old = match Current::read(&mmio, &TABLE) {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("cold clock must read"),
         };

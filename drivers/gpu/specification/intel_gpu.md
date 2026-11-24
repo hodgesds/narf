@@ -331,10 +331,16 @@ three-level-VM integrated profile; and `xe_uc_fw.c` selects
 `i915/tgl_guc_70.bin` at ABI 70.44.1 or newer. The separate
 `Gen12Platform::RocketLake` identity preserves those GT facts. Linux display
 data also gives RKL three pipes, the display-12 minimized plane set, and the
-distinct A/B/TC1/TC2-to-combo-PHY A/B/C/D map. NARF records those VBT facts
-but does not yet admit RKL display programming: no RKL DPLL/clock sequence
-has been qualified, so a firmware-lit display is preserved and only an
-all-pipes-stopped function may start the display-less GuC owner.
+distinct A/B/TC1/TC2-to-combo-PHY A/B/C/D map. NARF admits RKL external DP,
+HDMI and MST on combo DDI B, the port the external HPD monitor owns: there
+PHY B's PLL (DPLL1, `RKL_DPLL_CFGCR*(1)`), its `DPCLKA_CFGCR0` field and its
+DDC pin (`rkl_encoder_to_ddc_pin`) are Tiger Lake's, and the modeset takes
+`rkl_cdclk_table` and the RKL power-well map (no PW_2; Pipe B under PW_3,
+Pipe C under PW_4). Hotplug pairs RKL with TGP (ICP bank) or CMP/CMP2 (SPT
+bank). TC1/TC2 (combo PHY C/D, DPLL4 and the PCH-dependent DDC pins) and the
+internal panel stay unadmitted, so the internal display path still preserves
+a firmware-lit display and only an all-pipes-stopped function may start the
+display-less GuC owner.
 
 DG1 is likewise not a DG2 alias. Linux `xe_pci.c` identifies it as discrete
 Xe-LP+ graphics 12.10 with a 39-bit DMA mask and three-level VM, and
@@ -766,8 +772,8 @@ silently into the same `BadDevice` used for dead hardware.
 
 Internal display programming admits qualified Gen12 (Tiger Lake / Alder Lake /
 Raptor Lake) and the separate Meteor/Arrow Lake Xe-LPG sequence. Rocket Lake
-has an exact GT and VBT metadata profile but its display-programming gate stays
-closed until its distinct clocks and port sequence are qualified.
+has an exact GT and VBT metadata profile; its external outputs on DDI B are
+admitted, and its internal display-programming gate stays closed.
 Arrow Lake shares the `MeteorLake` classification and Linux's `mtl_desc`
 display descriptor. Panther Lake refuses display programming. Lunar Lake
 keeps its headless execution profile unless a per-device display-20 route

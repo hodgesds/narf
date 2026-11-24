@@ -157,16 +157,18 @@ impl Generation {
     /// DDI B–E DP + HDMI, SKL WRPLL + DDI tables, same
     /// fixture-validated, silicon-untested status). The HPD /
     /// external-session layer (`enable_external_hpd`,
-    /// `dp_connect`, `hdmi_connect`, `mst_connect`) still
-    /// implements Gen12 only and fails closed for Gen11 and
-    /// Gen9 — its Gen12 gates return `None` on a Gen11/Gen9
-    /// adapter — so flipping this predicate does not arm any
-    /// session path; threading that layer for Gen11/Gen9 is a
-    /// follow-up lane.
+    /// `dp_connect`, `hdmi_connect`, `mst_connect`) admits each
+    /// of them by its source family. Rocket Lake joins for its
+    /// combo DDI B (the port the HPD monitor owns): its PLL,
+    /// clock routing, PHY and DDC pin there are Tiger Lake's,
+    /// and the modeset takes its own CDCLK table and power-well
+    /// map. Its internal panel and backlight stay gated
+    /// (`display_supported`, `backlight_supported`).
     pub const fn external_display_supported(self) -> bool {
         matches!(
             self,
             Generation::TigerLake
+                | Generation::RocketLake
                 | Generation::AlderLake
                 | Generation::IceLake
                 | Generation::Skylake
@@ -3714,11 +3716,13 @@ pub mod tests {
             return TestResult::Fail("LNL/PTL must skip the Gen12/MTL probe path (owned routes)");
         }
         if Generation::RocketLake.display_supported()
-            || Generation::RocketLake.external_display_supported()
+            || !Generation::RocketLake.external_display_supported()
             || Generation::RocketLake.backlight_supported()
             || Generation::RocketLake.region_generation() != Some(RegionGeneration::Gen12)
         {
-            return TestResult::Fail("RKL must admit Gen12 GT regions while display stays gated");
+            return TestResult::Fail(
+                "RKL must admit Gen12 GT regions and external outputs while the panel stays gated",
+            );
         }
         // Gen9 (Lanes 1 + 5 + 8): identity + probe +
         // internal-panel modeset + external outputs +
