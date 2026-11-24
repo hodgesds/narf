@@ -964,6 +964,89 @@ async unsafe fn run_graphics_phoenix(boot: &mut crate::amdgpu_phoenix_boot::Phoe
         }
     }
 }
+/// Bring Strix's graphics engines up on the display path's pool, once its
+/// PSP session loaded the graphics set and the RLC autoload completed. A
+/// failure is reported and leaves the display as it is; the owner is returned
+/// either way, since an engine may still reach memory it published.
+/// `mes_start` is the MES program-counter entry points (sched + KIQ) from
+/// the loader; see `Loader::mes_start_addrs`.
+///
+/// The DID dispatch (not `Family::Strix`, which does not exist yet) is in
+/// `start`'s spawn task, checked before the Phoenix branch: Strix maps to
+/// `Family::Phoenix` today, so the Phoenix branch would claim it first.
+/// Until the GMC/IH/SDMA/GFX/MES lanes land, `run` fails closed at
+/// MemoryHubs and this returns a failed owner.
+async fn graphics_boot_strix(
+    pool: &Pool,
+    mes_start: [u64; 2],
+) -> Option<crate::amdgpu_strix_boot::StrixColdBoot> {
+    use core::fmt::Write as _;
+    let authority = crate::amdgpu::pci_authority()?;
+    let device = crate::amdgpu::pci_device()?;
+    let boot = crate::amdgpu::with_controller(|gpu| {
+        // SAFETY: this display owner holds the whole GPU after the boot
+        // handoff: no other graphics owner exists, the pool is its free
+        // carve-out, and the PSP has loaded the graphics set. Construction
+        // performs no register I/O.
+        unsafe {
+            crate::amdgpu_strix_boot::StrixColdBoot::new(gpu, authority, pool, &device, mes_start)
+        }
+    })?;
+    let mut boot = match boot {
+        Ok(boot) => boot,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: strix graphics refused: {error:?}"
+            );
+            return None;
+        }
+    };
+    // SAFETY: as above, and the RLC autoload has completed.
+    unsafe { run_graphics_strix(&mut boot) }.await;
+    Some(boot)
+}
+/// Run `boot`'s stages and report them.
+///
+/// # Safety
+/// `StrixColdBoot::run`'s: the owner is new, this display owner holds the
+/// whole GPU, and the RLC autoload has completed.
+async unsafe fn run_graphics_strix(boot: &mut crate::amdgpu_strix_boot::StrixColdBoot) {
+    use core::fmt::Write as _;
+    // SAFETY: forwarded.
+    match unsafe { boot.run() }.await {
+        Ok(report) => {
+            // The rings stay unadvertised until a client submitter registers.
+            // No `amdgpu_info` publication yet: its boot struct is
+            // Navi22/gfx10-typed, and Strix's topology is its own struct.
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: strix graphics up: smu {:#x}, {} stages",
+                report.smu.smu,
+                report.stages_completed
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: strix graphics failed: {error:?}"
+            );
+        }
+    }
+}
+/// VCN and JPEG on a completed Strix graphics boot. There is no VCN 4.0
+/// owner yet, so this is a remainder no-op that says so; media is not one
+/// of the cold boot's sixteen stages.
+async fn media_boot_strix(graphics: &mut crate::amdgpu_strix_boot::StrixColdBoot) {
+    use core::fmt::Write as _;
+    if !graphics.queues_verified() {
+        return;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: strix media: no VCN 4.0 owner yet; graphics only"
+    );
+}
 /// VCN and JPEG on a completed Phoenix graphics boot. There is no VCN 4.0
 /// owner yet, so this is a remainder no-op that says so; media is not one
 /// of the cold boot's sixteen stages.
@@ -1847,6 +1930,19 @@ async fn gate_graphics_phoenix(graphics: &mut crate::amdgpu_phoenix_boot::Phoeni
         let _ = writeln!(narf_console::Writer, "amdgpu: phoenix GFX gate {error:?}");
     }
 }
+/// `amdgpu_device_ip_late_init`'s `set_pg_state(GATE)` for Strix GFX,
+/// once clients are served. There is no GFXOFF/GfxOff owner yet, so this is
+/// a remainder no-op that says so; graphics stays up with GFX powered.
+async fn gate_graphics_strix(graphics: &mut crate::amdgpu_strix_boot::StrixColdBoot) {
+    use core::fmt::Write as _;
+    if !graphics.queues_verified() {
+        return;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: strix GFX gate: no GFXOFF owner yet; GFX stays powered"
+    );
+}
 /// `gfx_off_delay_work`: deliver `allow` [`DELAY_MS`] from now to the
 /// coordinator that scheduled it. A disable request in between, or a newer
 /// coordinator lifetime, makes it a no-op.
@@ -1898,6 +1994,21 @@ fn serve_clients_phoenix(graphics: &mut crate::amdgpu_phoenix_boot::PhoenixColdB
     let _ = writeln!(
         narf_console::Writer,
         "amdgpu: phoenix graphics up but no client submitter yet; ACCEL not set"
+    );
+}
+/// Publish a completed Strix graphics boot to clients: there is no client
+/// submitter yet, so nothing is registered and `ACCEL` is not set — the
+/// rings stay unadvertised until a submitter registers. No
+/// `GraphicsSystemPm` is registered either: no S3 / s0ix path exists for
+/// Strix yet.
+fn serve_clients_strix(graphics: &mut crate::amdgpu_strix_boot::StrixColdBoot) {
+    use core::fmt::Write as _;
+    if !graphics.queues_verified() {
+        return;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: strix graphics up but no client submitter yet; ACCEL not set"
     );
 }
 /// `gfx_off_delay_work` for a Phoenix coordinator: deliver `allow`
@@ -2162,6 +2273,19 @@ struct Display {
     graphics_phoenix: Option<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
     /// Phoenix owners a mode 2 recovery replaced; same quarantine policy.
     retired_phoenix: Vec<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
+    /// Strix's graphics engines, same retention policy as Phoenix's.
+    /// Unreachable until the firmware lane lands `Firmware::open_strix`
+    /// + the Strix `set_graphics` arm: no Strix set can be loaded today,
+    /// so `start()` never fills this in. Until the GMC/IH/SDMA/GFX/MES
+    /// lanes land, a run fails closed at MemoryHubs.
+    graphics_strix: Option<crate::amdgpu_strix_boot::StrixColdBoot>,
+    /// Strix owners a mode 2 recovery replaced; same quarantine policy.
+    /// Unread until the Strix recovery lane lands (`recover()` has no
+    /// Strix arm yet — it falls through to `Busy`); the recovery lane
+    /// pushes the replaced owner here, as `rebuild_graphics_phoenix`
+    /// does for Phoenix.
+    #[allow(dead_code, reason = "read by the Strix recovery lane")]
+    retired_strix: Vec<crate::amdgpu_strix_boot::StrixColdBoot>,
     /// Where a system transition left the graphics (`GraphicsPm`).
     graphics_pm: GraphicsPm,
     /// The client buffers a hibernation moved out of the carve-out, with
@@ -2241,6 +2365,8 @@ pub(crate) fn start() -> bool {
         retired: Vec::new(),
         graphics_phoenix: None,
         retired_phoenix: Vec::new(),
+        graphics_strix: None,
+        retired_strix: Vec::new(),
         graphics_pm: GraphicsPm::Running,
         evicted: Vec::new(),
     });
@@ -2268,11 +2394,42 @@ pub(crate) fn start() -> bool {
             if display.loader.graphics_booted() {
                 // Boxed: these futures hold the whole bring-up, which inline
                 // would make this task's own frame and future too large.
+                // Strix first: it maps to Family::Phoenix today, so the
+                // Phoenix branch below would claim it. Checked by DID, not
+                // by family — Family::Strix does not exist yet (the
+                // parallel bringup lane owns it); when it lands, this
+                // check can switch to the family.
+                let is_strix = crate::amdgpu::pci_device().is_some_and(|d| {
+                    (d.id.vendor, d.id.device)
+                        == (crate::amdgpu::AMD_VENDOR, crate::amdgpu::STRIX_POINT)
+                });
                 let is_phoenix = crate::amdgpu::pci_device().is_some_and(|d| {
                     crate::amdgpu::family_for_pci_id(d.id.vendor, d.id.device)
                         == Some(crate::amdgpu::Family::Phoenix)
                 });
-                if is_phoenix {
+                if is_strix {
+                    match display.loader.mes_start_addrs() {
+                        Some(mes_start) => {
+                            display.graphics_strix = alloc::boxed::Box::pin(graphics_boot_strix(
+                                &display.pool,
+                                mes_start,
+                            ))
+                            .await;
+                            if let Some(graphics) = display.graphics_strix.as_mut() {
+                                alloc::boxed::Box::pin(media_boot_strix(graphics)).await;
+                                serve_clients_strix(graphics);
+                                gate_graphics_strix(graphics).await;
+                            }
+                        }
+                        None => {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "amdgpu: strix graphics skipped: no MES entry points (firmware lane)"
+                            );
+                        }
+                    }
+                } else if is_phoenix {
                     match display.loader.mes_start_addrs() {
                         Some(mes_start) => {
                             display.graphics_phoenix = alloc::boxed::Box::pin(
