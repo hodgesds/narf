@@ -1405,8 +1405,11 @@ fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
         != Some(ExternalError::UnsupportedGeneration)
         || probe_sink(&NoAccess, Generation::MeteorLake, XeLpgPort::A, false).err()
             != Some(ExternalError::UnsupportedPort)
-        || probe_sink(&NoAccess, Generation::LunarLake, XeLpgPort::B, false).err()
+        || probe_sink(&NoAccess, Generation::PantherLake, XeLpgPort::B, false).err()
             != Some(ExternalError::UnsupportedPort)
+        || !ExternalDisplayProfile::for_ip(DisplayIp::Xe2Lpd).admits_port(XeLpgPort::B)
+        || ExternalDisplayProfile::for_ip(DisplayIp::Xe2Lpd).admits_port(XeLpgPort::A)
+        || ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd).admits_port(XeLpgPort::B)
         || probe_link_profile(
             &NoAccess,
             ExternalDisplayProfile::WILDCAT_LAKE,

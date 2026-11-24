@@ -86,12 +86,13 @@
 //! manager and a single primary transport across independent Pipe B-D
 //! streams. Native/legacy VBT lane reversal reaches the PHY; DP-alt cable
 //! flip remains a TCSS mux operation.
-//! Lunar and Panther Lake admit TC1–TC4 only: PICA power and display-20+
+//! Lunar Lake admits combo DDI B (C10, through the display-20 PICA register
+//! view) and TC1–TC4; Panther Lake TC1–TC4 only. PICA power and display-20+
 //! TCSS pin assignment are retained by the probe and D2D enable/state move
 //! to `DDI_BUF_CTL`. The Pipe B–D owner uses the exact display-20/30
 //! resource transaction; on display 30 it also computes the fixed-refresh
-//! guardband and runs the mandatory VRR timing generator. Combo DDI B and
-//! HDMI remain typed refusals on both IPs.
+//! guardband and runs the mandatory VRR timing generator. Panther Lake's
+//! C20 DDI B and HDMI remain typed refusals.
 //! Wildcat Lake retains the same display-30 C20/PICA sequence but its distinct
 //! descriptor admits only TC1/TC2 and Pipes A–C. The service stores an exact
 //! [`ExternalDisplayProfile`] so broad `Generation::PantherLake` can never
@@ -229,10 +230,16 @@ impl ExternalDisplayProfile {
         self.generation
     }
 
+    /// The external ports this source drives. Lunar Lake's combo DDI B is
+    /// C10 like Meteor Lake's (`intel_encoder_is_c10phy`) and reaches its
+    /// PHY and AUX through the PICA view the display-20 pass applies
+    /// ([`crate::intel_gpu_xe2lpd::PicaFlushed`]). Panther Lake's DDI B is
+    /// a non-Type-C C20 PHY, which this route does not program yet.
     pub(crate) const fn admits_port(self, port: XeLpgPort) -> bool {
         match self.display_ip {
             DisplayIp::Xelpdp => !matches!(port, XeLpgPort::A),
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => port.tc_index().is_some(),
+            DisplayIp::Xe2Lpd => matches!(port, XeLpgPort::B) || port.tc_index().is_some(),
+            DisplayIp::Xe3Lpd => port.tc_index().is_some(),
             DisplayIp::WildcatLake => {
                 matches!(port, XeLpgPort::Tc1 | XeLpgPort::Tc2)
             }
@@ -802,10 +809,11 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
     legacy_port: bool,
 ) -> Result<LinkProbe, ExternalError> {
     let display_ip = profile.display_ip;
-    // Display >= 20 relocates combo DDI B's PHY/AUX register views into PICA.
-    // TC1–TC4 already use the PICA-layout addresses carried by XeLpgPort;
-    // admit only that source-qualified USB-C path for now. Display 30's
-    // mandatory fixed-refresh VRR timing generator is owned by Pipes.
+    // Display >= 20 relocates combo DDI B's PHY/AUX register views into
+    // PICA; the display-20 pass runs over `PicaFlushed`, which applies it.
+    // TC1–TC4 already use the PICA-layout addresses carried by XeLpgPort.
+    // Display 30's mandatory fixed-refresh VRR timing generator is owned by
+    // Pipes.
     if !profile.admits_port(port) {
         return Err(ExternalError::UnsupportedPort);
     }

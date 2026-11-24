@@ -2774,7 +2774,7 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
         };
         match gpu.chip.generation {
             Generation::LunarLake => {
-                let view = crate::intel_gpu_xe2lpd::Flushed(&window);
+                let view = crate::intel_gpu_xe2lpd::PicaFlushed(&window);
                 mtl_external_pass_profile(
                     &view,
                     profile,

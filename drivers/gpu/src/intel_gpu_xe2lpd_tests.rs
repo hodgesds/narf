@@ -1064,3 +1064,42 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe2lpd_modeset",
     smoke_xe2lpd_probe_window_flushes_every_read
 );
+
+/// `PicaFlushed`: DDI A/B's PHY and AUX registers move to the PICA block at
+/// `0x16f200 + (PORT_TC4 + 1 + port - PORT_TC1) * 0x200` (DDI B: 0x16fc00),
+/// `DDI_BUF_CTL` stays `_MMIO_PORT`, Type-C addresses pass through, and every
+/// read follows `Flushed`'s four dummy writes.
+fn smoke_xe2lpd_pica_view_relocates_ddi_b() -> TestResult {
+    let regs = Regs::default();
+    let view = PicaFlushed(&regs);
+    // DDI B: PORT_BUF_CTL1, AUX_CH_CTL, M2P_MSGBUS_CTL ln0, MSGBUS_TIMER
+    // ln0, PORT_CLOCK_CTL, then DDI_BUF_CTL and a TC1 register unmoved.
+    for (display14, display20) in [
+        (0x64104u64, 0x16fc00u64),
+        (0x64110, 0x16fc10),
+        (0x64140, 0x16fc40),
+        (0x641d8, 0x16fc58),
+        (0x641e0, 0x16fc60),
+        (0x64100, 0x64100),
+        (0x16f210, 0x16f210),
+    ] {
+        view.write32(display14, 0x1234);
+        if regs.writes.borrow().last() != Some(&(display20, 0x1234)) {
+            return TestResult::Fail("DDI B PHY/AUX writes must land in the PICA block");
+        }
+    }
+    regs.writes.borrow_mut().clear();
+    regs.values.borrow_mut().insert(0x16fc10, 0xabcd);
+    if view.read32(0x64110) != 0xabcd {
+        return TestResult::Fail("DDI B AUX reads must come from the PICA block");
+    }
+    let writes = regs.writes.borrow();
+    if writes.len() != 4 || writes.iter().any(|&(r, _)| r == 0x16fc10 || r == 0x64110) {
+        return TestResult::Fail("a read takes Flushed's four dummy writes, nothing else");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe2lpd",
+    smoke_xe2lpd_pica_view_relocates_ddi_b
+);

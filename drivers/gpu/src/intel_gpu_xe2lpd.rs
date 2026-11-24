@@ -762,6 +762,36 @@ impl<M: MmioWindow + ?Sized> MmioWindow for Flushed<'_, M> {
     }
 }
 
+/// The display-20 register view of the external route: [`Flushed`]'s
+/// dummy writes before every read, and DDI A/B's PHY and AUX registers
+/// relocated into the PICA block as on every display >= 20
+/// (`__xe2lpd_port_idx`, `__xe2lpd_aux_ch_idx`,
+/// [`crate::intel_gpu_xe3lpd::pica_port_reg`]). The display-14 Cx0 code
+/// then addresses combo DDI B's C10 PHY and AUX where display 20 has them.
+pub(crate) struct PicaFlushed<'a, M: MmioWindow + ?Sized>(pub(crate) &'a M);
+
+impl<M: MmioWindow + ?Sized> MmioWindow for PicaFlushed<'_, M> {
+    fn display_access_ok(&self) -> bool {
+        self.0.display_access_ok()
+    }
+    fn cx0_xe3(&self) -> bool {
+        self.0.cx0_xe3()
+    }
+    fn read32(&self, off: u64) -> u32 {
+        for _ in 0..4 {
+            self.0.write32(MMIO_FLUSH_DUMMY, 0);
+        }
+        self.0
+            .read32(crate::intel_gpu_xe3lpd::pica_port_reg(off).unwrap_or(off))
+    }
+    fn write32(&self, off: u64, val: u32) {
+        self.0.write32(
+            crate::intel_gpu_xe3lpd::pica_port_reg(off).unwrap_or(off),
+            val,
+        )
+    }
+}
+
 /// The GGTT PAT index of a present firmware scanout PTE (xe_ggtt.c
 /// `xelpg_ggtt_pte_flags`, used on Xe2: `XELPG_GGTT_PTE_PAT0` bit 52,
 /// `XELPG_GGTT_PTE_PAT1` bit 53). `None` for an absent or unreadable entry.
