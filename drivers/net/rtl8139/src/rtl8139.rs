@@ -26,7 +26,7 @@
 //! | 0x44   | RCR       | u32   | RX Configuration Register     |
 //! | 0x52   | CONFIG1   | u8    | Configuration Register 1      |
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
@@ -87,6 +87,12 @@ const RX_RING_BYTES: usize = 65536 + 16 + 1500;
 const TX_BUF_COUNT: usize = 4;
 const TX_BUF_BYTES: usize = 2048;
 
+/// TX watchdog timeout (Linux `dev->watchdog_timeo` is 5 s by
+/// default, and e1000 / r8169 / tg3 use the same 5 s): a TX buffer
+/// posted longer ago than this with no TOK is a wedged ring, not
+/// congestion (issue #796).
+const TX_TIMEOUT_NS: u64 = 5_000_000_000;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Rtl8139Error {
     BarMapFailed,
@@ -118,6 +124,94 @@ fn tx_slot_free(tsd: u32) -> bool {
     tsd & TSD_OWN != 0 || tsd & TSD_TOK != 0
 }
 
+/// True when any posted TX buffer has waited longer than `timeout`
+/// cycles for its TOK — the ring is wedged (r8169 `tx_stalled`
+/// shape, per-slot so a later post cannot mask an older stuck
+/// one). Factored pure so the fixture pins the decision the
+/// watchdog uses (issue #796).
+fn tx_stalled(posted_at: &[u64; TX_BUF_COUNT], now: u64, timeout: u64) -> bool {
+    posted_at
+        .iter()
+        .any(|&posted| posted != 0 && now.saturating_sub(posted) > timeout)
+}
+
+/// Software reset (bring-up steps 1–2): power on + take out of
+/// low-power mode (CONFIG1 = 0), then CR.RST and poll until it
+/// self-clears. Shared by bring-up and watchdog recovery so both
+/// run the same reset program.
+fn software_reset(mmio: &MmioRegion) -> Result<(), Rtl8139Error> {
+    // 1. Power on + take out of low-power mode (CONFIG1 = 0).
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        mmio.write8(REG_CONFIG1, 0);
+    }
+
+    // 2. Software reset — write CR.RST, poll until self-clears.
+    // SAFETY: same.
+    unsafe {
+        mmio.write8(REG_CR, CR_RST);
+    }
+    // SAFETY: identity-mapped MMIO. responsive_spin_until ticks
+    // sleep_pumps so FB cursor / serial drain stay alive. RTL8139
+    // CR.RST self-clears within tens of microseconds typical;
+    // 100 ms is the "real wedge" threshold.
+    narf_scheduler::responsive_spin_until(
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        || unsafe { mmio.read8(REG_CR) } & CR_RST == 0,
+        narf_time::Deadline::after_ms(100),
+    );
+    // SAFETY: same.
+    let post = unsafe { mmio.read8(REG_CR) };
+    if post & CR_RST != 0 {
+        return Err(Rtl8139Error::ResetTimeout);
+    }
+    Ok(())
+}
+
+/// Program the RX/TX ring addresses + config (bring-up steps
+/// 5–8): RX buffer start, TX descriptor bases, RX/TX config,
+/// IRQ mask + status clear, RX + TX enable. Shared by bring-up
+/// and watchdog recovery so both run the same program.
+fn program_rings(mmio: &MmioRegion, rx_ring: &DmaBuffer, tx_bufs: &[DmaBuffer; TX_BUF_COUNT]) {
+    // 5. Program RX buffer + TX descriptor base addresses.
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        mmio.write32(REG_RBSTART, (rx_ring.dma_addr().raw() & 0xFFFF_FFFF) as u32);
+        for (i, buf) in tx_bufs.iter().enumerate() {
+            mmio.write32(
+                REG_TSAD0 + (i as u64) * 4,
+                (buf.dma_addr().raw() & 0xFFFF_FFFF) as u32,
+            );
+        }
+    }
+
+    // 6. RX configuration: accept broadcast + physical match +
+    //    multicast + all-packets (promisc), wrap, 64 KB ring.
+    // SAFETY: same.
+    unsafe {
+        mmio.write32(
+            REG_RCR,
+            RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_WRAP | RCR_RBLEN_64K,
+        );
+        // TX configuration: leave at default (chip auto-tunes).
+        mmio.write32(REG_TCR, 0);
+    }
+
+    // 7. Mask all IRQs (we poll); clear status by writing back.
+    // SAFETY: same.
+    unsafe {
+        mmio.write16(REG_IMR, 0);
+        let isr = mmio.read16(REG_ISR);
+        mmio.write16(REG_ISR, isr);
+    }
+
+    // 8. Enable RX + TX.
+    // SAFETY: same.
+    unsafe {
+        mmio.write8(REG_CR, CR_TE | CR_RE);
+    }
+}
+
 pub struct Rtl8139 {
     mmio: MmioRegion,
     mac: [u8; 6],
@@ -127,6 +221,18 @@ pub struct Rtl8139 {
     rx_offset: IrqSafeSpinLock<usize>,
     /// Round-robin index for the next TX descriptor.
     tx_index: IrqSafeSpinLock<usize>,
+    /// Cycle-stamp of the TX post occupying each TX buffer (`0` =
+    /// nothing outstanding). `tx` stamps on post;
+    /// `poll_tx_completions` clears on TOK reap; the watchdog ages
+    /// the oldest stamp against `TX_TIMEOUT_NS` (issue #796).
+    tx_posted_at: IrqSafeSpinLock<[u64; TX_BUF_COUNT]>,
+    /// Set while [`Rtl8139::recover`] owns the reset sequence: a
+    /// TX posted mid-reset would be silently dropped.
+    recovering: AtomicBool,
+    /// TX stalls the watchdog counted (Linux `tx_timeout_count`).
+    tx_timeouts: AtomicU64,
+    /// Controller resets performed by [`Rtl8139::recover`].
+    tx_resets: AtomicU64,
     pub ready: bool,
     /// PCI address of the function this instance drives. Probe
     /// refuses a second bind of the same address (issue #1631): two
@@ -178,31 +284,9 @@ impl Rtl8139 {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let mmio = unsafe { map_bar(device, 1) }.map_err(|_| Rtl8139Error::BarMapFailed)?;
 
-        // 1. Power on + take out of low-power mode (CONFIG1 = 0).
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            mmio.write8(REG_CONFIG1, 0);
-        }
-
-        // 2. Software reset — write CR.RST, poll until self-clears.
-        // SAFETY: same.
-        unsafe {
-            mmio.write8(REG_CR, CR_RST);
-        }
-        // SAFETY: identity-mapped MMIO. responsive_spin_until ticks
-        // sleep_pumps so FB cursor / serial drain stay alive. RTL8139
-        // CR.RST self-clears within tens of microseconds typical;
-        // 100 ms is the "real wedge" threshold.
-        narf_scheduler::responsive_spin_until(
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            || unsafe { mmio.read8(REG_CR) } & CR_RST == 0,
-            narf_time::Deadline::after_ms(100),
-        );
-        // SAFETY: same.
-        let post = unsafe { mmio.read8(REG_CR) };
-        if post & CR_RST != 0 {
-            return Err(Rtl8139Error::ResetTimeout);
-        }
+        // Bring-up steps 1–2: power on + software reset (see
+        // `software_reset`; shared with watchdog recovery).
+        software_reset(&mmio)?;
 
         // 3. Read MAC from IDR0..5.
         let mut mac = [0u8; 6];
@@ -227,43 +311,10 @@ impl Rtl8139 {
                 .map_err(|_| Rtl8139Error::BarMapFailed)?,
         ];
 
-        // 5. Program RX buffer + TX descriptor base addresses.
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            mmio.write32(REG_RBSTART, (rx_ring.dma_addr().raw() & 0xFFFF_FFFF) as u32);
-            for (i, buf) in tx_bufs.iter().enumerate() {
-                mmio.write32(
-                    REG_TSAD0 + (i as u64) * 4,
-                    (buf.dma_addr().raw() & 0xFFFF_FFFF) as u32,
-                );
-            }
-        }
-
-        // 6. RX configuration: accept broadcast + physical match +
-        //    multicast + all-packets (promisc), wrap, 64 KB ring.
-        // SAFETY: same.
-        unsafe {
-            mmio.write32(
-                REG_RCR,
-                RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_WRAP | RCR_RBLEN_64K,
-            );
-            // TX configuration: leave at default (chip auto-tunes).
-            mmio.write32(REG_TCR, 0);
-        }
-
-        // 7. Mask all IRQs (we poll); clear status by writing back.
-        // SAFETY: same.
-        unsafe {
-            mmio.write16(REG_IMR, 0);
-            let isr = mmio.read16(REG_ISR);
-            mmio.write16(REG_ISR, isr);
-        }
-
-        // 8. Enable RX + TX.
-        // SAFETY: same.
-        unsafe {
-            mmio.write8(REG_CR, CR_TE | CR_RE);
-        }
+        // Bring-up steps 5–8: ring addresses + config + IRQ mask
+        // + RX/TX enable (see `program_rings`; shared with
+        // watchdog recovery).
+        program_rings(&mmio, &rx_ring, &tx_bufs);
 
         let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
         let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
@@ -275,6 +326,10 @@ impl Rtl8139 {
             tx_bufs,
             rx_offset: IrqSafeSpinLock::new(0),
             tx_index: IrqSafeSpinLock::new(0),
+            tx_posted_at: IrqSafeSpinLock::new([0; TX_BUF_COUNT]),
+            recovering: AtomicBool::new(false),
+            tx_timeouts: AtomicU64::new(0),
+            tx_resets: AtomicU64::new(0),
             ready: true,
             addr: device.addr,
             ifname: crate::publish::IfName::new(),
@@ -303,6 +358,9 @@ impl Rtl8139 {
     pub fn tx(&self, frame: &[u8]) -> Result<(), Rtl8139Error> {
         if frame.is_empty() || frame.len() > TX_BUF_BYTES {
             return Err(Rtl8139Error::QueueTooSmall);
+        }
+        if self.recovering.load(Ordering::Acquire) {
+            return Err(Rtl8139Error::Other("rtl8139 TX recovery in progress"));
         }
         let mut idx_lock = self.tx_index.lock();
         let idx = *idx_lock;
@@ -344,7 +402,91 @@ impl Rtl8139 {
         unsafe {
             self.mmio.write32(REG_TSD0 + (idx as u64) * 4, len as u32);
         }
+        // Stamp the post time once the chip owns the slot: the
+        // watchdog ages the buffer from here (issue #796).
+        self.tx_posted_at.lock()[idx] = narf_time::now_cycles();
         *idx_lock = (idx + 1) % TX_BUF_COUNT;
+        Ok(())
+    }
+
+    /// Reap TX buffers the chip reports complete: TOK set means
+    /// the previous frame transmitted OK, so the buffer's post
+    /// time is void and the watchdog must not age it. TOK — not
+    /// OWN — is the reap signal: OWN=1 + TOK=0 is also the
+    /// never-posted idle state after reset, so reaping on OWN
+    /// would clear a stamp the buffer never earned (issue #796;
+    /// see `tx_slot_free`).
+    pub fn poll_tx_completions(&self) {
+        let mut posted = self.tx_posted_at.lock();
+        for i in 0..TX_BUF_COUNT {
+            // SAFETY: identity-mapped MMIO.
+            let tsd = unsafe { self.mmio.read32(REG_TSD0 + (i as u64) * 4) };
+            if tsd & TSD_TOK != 0 {
+                posted[i] = 0;
+            }
+        }
+    }
+
+    /// TX stall recoveries (Linux `tx_timeout_count`).
+    pub fn tx_timeouts(&self) -> u64 {
+        self.tx_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Controller resets performed by [`Rtl8139::recover`].
+    pub fn tx_resets(&self) -> u64 {
+        self.tx_resets.load(Ordering::Relaxed)
+    }
+
+    /// One watchdog pass, synchronously (the fixture): the core
+    /// watchdog's check, then `ndo_tx_timeout` if it fired. Returns
+    /// true when recovery fired and succeeded.
+    fn check_tx_watchdog_at(&self, now: u64) -> bool {
+        use narf_net::watchdog::NetdevWatchdog;
+        if !self.tx_timed_out(now) {
+            return false;
+        }
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.recover().is_ok()
+    }
+
+    /// TX-timeout recovery (Linux `rtl8139_tx_timeout` shape):
+    /// software-reset the chip and reprogram the rings and config
+    /// from the bring-up values. The TX cursors reset —
+    /// descriptors posted before the reset will never complete. A
+    /// reset that never self-clears reports `ResetTimeout` and
+    /// leaves the device stopped; a concurrent recovery reports
+    /// `Other` without touching the device. The reset leaves every
+    /// TSD at 0x2000 (OWN set, TOK clear), so the next post finds
+    /// its slot free at once.
+    pub fn recover(&self) -> Result<(), Rtl8139Error> {
+        if self.recovering.swap(true, Ordering::AcqRel) {
+            return Err(Rtl8139Error::Other(
+                "rtl8139 TX recovery already in progress",
+            ));
+        }
+        let result = self.recover_inner();
+        self.recovering.store(false, Ordering::Release);
+        if result.is_ok() {
+            self.tx_resets.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn recover_inner(&self) -> Result<(), Rtl8139Error> {
+        // 1. Software reset (bring-up steps 1–2). A reset that
+        // never self-clears leaves the device stopped — the cursors
+        // stay put so a retry sees the pre-reset state.
+        software_reset(&self.mmio)?;
+        // 2. Reprogram the rings + config from the bring-up values
+        // (bring-up steps 5–8): the reset clears the descriptor
+        // base addresses and the RX/TX enables.
+        program_rings(&self.mmio, &self.rx_ring, &self.tx_bufs);
+        // 3. Reset the software cursors now that the rings are
+        // fresh: posted buffers will never complete, so their slots
+        // are free and their post times are void.
+        *self.tx_index.lock() = 0;
+        *self.rx_offset.lock() = 0;
+        self.tx_posted_at.lock().fill(0);
         Ok(())
     }
 
@@ -419,6 +561,33 @@ impl Rtl8139 {
         // SAFETY: identity-mapped MMIO.
         let msr = unsafe { self.mmio.read8(0x58) };
         msr & (1 << 2) == 0
+    }
+}
+
+/// The core transmit watchdog's view of the device (`dev_watchdog` +
+/// `rtl8139_tx_timeout` → the reset task, issue #796).
+impl narf_net::watchdog::NetdevWatchdog for Rtl8139 {
+    /// A TX buffer waited past `TX_TIMEOUT_NS` with carrier up and
+    /// no recovery in progress. The TOK reap runs first, so a frame
+    /// the chip finished since the last TX never reads as a stall.
+    /// `link_up` is a single MSR read — no wait — so it is safe in
+    /// the timer callback.
+    fn tx_timed_out(&self, now: u64) -> bool {
+        if self.recovering.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.link_up() {
+            return false;
+        }
+        self.poll_tx_completions();
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        tx_stalled(&self.tx_posted_at.lock(), now, timeout)
+    }
+
+    /// Count the timeout and reset the transmit path (task context).
+    fn tx_timeout(&self) {
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+        let _ = self.recover();
     }
 }
 
@@ -648,6 +817,13 @@ fn spawn_pumps(
         rtl8139_rx_pump(d1, rx_prod).await;
     });
 
+    // `dev_watchdog` (issue #796): a timer every `watchdog_timeo`
+    // (5 s) that queues the reset when a transmit is stuck; it
+    // stops with the device.
+    let weak: alloc::sync::Weak<dyn narf_net::watchdog::NetdevWatchdog> =
+        alloc::sync::Arc::downgrade(&device) as _;
+    narf_net::watchdog::DevWatchdog::start_for_device(weak, TX_TIMEOUT_NS);
+
     let d2 = device;
     narf_scheduler::spawn(async move {
         rtl8139_tx_pump(d2, tx_cons).await;
@@ -714,9 +890,11 @@ pub fn register_pci_driver() {
 // ── Tests ───────────────────────────────────────────────────────────
 
 mod tests {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use super::{tx_slot_free, TSD_OWN, TSD_TOK};
+    use super::*;
 
     /// TX free-slot predicate (issue #2251). The fixture models the
     /// TSD values real silicon / QEMU produce, not a zero-filled
@@ -754,5 +932,222 @@ mod tests {
     kernel_test_in!(
         "drivers/net/rtl8139",
         smoke_rtl8139_tx_slot_free_reset_and_post_tx
+    );
+
+    fn smoke_rtl8139_tx_stall_detection() -> TestResult {
+        // Pure watchdog decision (issue #796): the fixture pins
+        // the boundary `tx_timed_out` uses, without a device.
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let mut posted = [0u64; TX_BUF_COUNT];
+        if tx_stalled(&posted, 1_000_000, timeout) {
+            return TestResult::Fail("rtl8139 idle TX ring reported stalled");
+        }
+        let now = 10_000_000u64;
+        posted[0] = now;
+        if tx_stalled(&posted, now + timeout, timeout) {
+            return TestResult::Fail("rtl8139 TX stall fired at exactly the timeout");
+        }
+        if !tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("rtl8139 TX stall did not fire past the timeout");
+        }
+        // A second, later post does not mask the older stuck one...
+        posted[1] = now + 100;
+        if !tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("rtl8139 later TX post masked the stuck buffer");
+        }
+        // ...and a TOK reap clears the stall once nothing aged
+        // remains.
+        posted[0] = 0;
+        if tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("rtl8139 TX stall survived the TOK reap");
+        }
+        posted[1] = 0;
+        if tx_stalled(&posted, now + timeout + 1, timeout) {
+            return TestResult::Fail("rtl8139 empty TX ring reported stalled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/rtl8139", smoke_rtl8139_tx_stall_detection);
+
+    /// Fake RTL8139 for the TX-timeout fixture: a 4 KiB MMIO
+    /// backing page (registers top out at MSR 0x58) plus a
+    /// sleep-pump that emulates the two hardware behaviours
+    /// recovery depends on — CR.RST self-clear (Programming Guide
+    /// §1) and TX completion (TOK) once the test arms it. Built
+    /// from the spec (register offsets, reset semantics), never
+    /// from the implementation's constants.
+    static FIXTURE_MMIO: AtomicU64 = AtomicU64::new(0);
+    static FIXTURE_COMPLETE_TX: AtomicBool = AtomicBool::new(false);
+    static FIXTURE_PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    fn fixture_pump() {
+        let base = FIXTURE_MMIO.load(Ordering::Acquire);
+        if base == 0 {
+            return;
+        }
+        // SAFETY: fixture-owned fake MMIO; base is published by the
+        // fixture and cleared on drop. The backing page is 4 KiB,
+        // so every register offset below is in bounds.
+        unsafe {
+            // CR.RST self-clear: the reset also leaves every TSD at
+            // 0x2000 (TxHostOwns), so the next post finds its slot
+            // free at once.
+            let cr = core::ptr::read_volatile((base + super::REG_CR) as *const u8);
+            if cr & super::CR_RST != 0 {
+                core::ptr::write_volatile((base + super::REG_CR) as *mut u8, cr & !super::CR_RST);
+                for i in 0..super::TX_BUF_COUNT {
+                    core::ptr::write_volatile(
+                        (base + super::REG_TSD0 + (i as u64) * 4) as *mut u32,
+                        super::TSD_OWN,
+                    );
+                }
+            }
+            if FIXTURE_COMPLETE_TX.load(Ordering::Acquire) {
+                // The chip finished every posted frame: a size-only
+                // TSD (chip owns it, no status bits) gains TOK|OWN.
+                for i in 0..super::TX_BUF_COUNT {
+                    let tsd = core::ptr::read_volatile(
+                        (base + super::REG_TSD0 + (i as u64) * 4) as *const u32,
+                    );
+                    if tsd & (super::TSD_OWN | super::TSD_TOK) == 0 {
+                        core::ptr::write_volatile(
+                            (base + super::REG_TSD0 + (i as u64) * 4) as *mut u32,
+                            tsd | super::TSD_OWN | super::TSD_TOK,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    struct TxTimeoutFixture {
+        device: Rtl8139,
+        _mmio_mem: DmaBuffer,
+    }
+
+    impl TxTimeoutFixture {
+        fn new() -> Self {
+            // 4 KiB fake BAR1.
+            let mut mem = alloc_coherent(4096, DomainId::DRIVER_0).unwrap();
+            mem.as_mut_slice().fill(0);
+            let csr = MmioRegion {
+                phys: mem.phys_addr(),
+                virt: mem.as_mut_ptr() as u64,
+                len: mem.len() as u64,
+                kind: narf_bus::BarKind::Mmio32 {
+                    prefetchable: false,
+                },
+            };
+            FIXTURE_MMIO.store(csr.virt, Ordering::Release);
+            if !FIXTURE_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
+                narf_scheduler::sleep_pumps::register_nested_only(fixture_pump);
+            }
+            // Reset state: every TSD reads 0x2000 (TxHostOwns), so
+            // the first post finds its slot free at once.
+            for i in 0..TX_BUF_COUNT {
+                // SAFETY: fixture-owned fake MMIO.
+                unsafe {
+                    csr.write32(REG_TSD0 + (i as u64) * 4, TSD_OWN);
+                }
+            }
+            let rx_ring = alloc_coherent(RX_RING_BYTES, DomainId::DRIVER_0).unwrap();
+            let tx_bufs: [DmaBuffer; TX_BUF_COUNT] = [
+                alloc_coherent(TX_BUF_BYTES, DomainId::DRIVER_0).unwrap(),
+                alloc_coherent(TX_BUF_BYTES, DomainId::DRIVER_0).unwrap(),
+                alloc_coherent(TX_BUF_BYTES, DomainId::DRIVER_0).unwrap(),
+                alloc_coherent(TX_BUF_BYTES, DomainId::DRIVER_0).unwrap(),
+            ];
+            let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+            let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
+            let device = Rtl8139 {
+                mmio: csr,
+                mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                rx_ring,
+                tx_bufs,
+                rx_offset: IrqSafeSpinLock::new(0),
+                tx_index: IrqSafeSpinLock::new(0),
+                tx_posted_at: IrqSafeSpinLock::new([0; TX_BUF_COUNT]),
+                recovering: AtomicBool::new(false),
+                tx_timeouts: AtomicU64::new(0),
+                tx_resets: AtomicU64::new(0),
+                ready: true,
+                addr: narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0, 0, 0, 0)),
+                ifname: crate::publish::IfName::new(),
+                rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+                tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            };
+            Self {
+                device,
+                _mmio_mem: mem,
+            }
+        }
+    }
+
+    impl Drop for TxTimeoutFixture {
+        fn drop(&mut self) {
+            FIXTURE_COMPLETE_TX.store(false, Ordering::Release);
+            FIXTURE_MMIO.store(0, Ordering::Release);
+        }
+    }
+
+    fn smoke_rtl8139_tx_timeout_recovery_fixture() -> TestResult {
+        let fixture = TxTimeoutFixture::new();
+        let device = &fixture.device;
+        let frame = [0xAAu8; 64];
+        // 1. Stall: post one frame; the fake chip never completes it.
+        if device.tx(&frame).is_err() {
+            return TestResult::Fail("rtl8139 TX post failed on a fresh ring");
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        let posted = device.tx_posted_at.lock()[0];
+        if posted == 0 {
+            return TestResult::Fail("rtl8139 TX post did not stamp a post time");
+        }
+        // 2. The watchdog does not fire inside the grace period...
+        if device.check_tx_watchdog_at(posted + timeout) {
+            return TestResult::Fail("rtl8139 watchdog fired at exactly the timeout");
+        }
+        if device.tx_resets() != 0 || device.tx_timeouts() != 0 {
+            return TestResult::Fail("rtl8139 watchdog counted a recovery it did not fire");
+        }
+        // ...but fires past it, resets the controller, and the ring
+        // comes back.
+        if !device.check_tx_watchdog_at(posted + timeout + 1) {
+            return TestResult::Fail("rtl8139 watchdog did not fire past the timeout");
+        }
+        if device.tx_timeouts() != 1 || device.tx_resets() != 1 {
+            return TestResult::Fail("rtl8139 watchdog recovery was not counted");
+        }
+        // SAFETY: fixture-owned fake MMIO.
+        unsafe {
+            if device.mmio.read8(super::REG_CR) & (super::CR_TE | super::CR_RE) == 0 {
+                return TestResult::Fail("rtl8139 recovery left TX/RX disabled");
+            }
+        }
+        if device.tx_posted_at.lock().iter().any(|&t| t != 0) {
+            return TestResult::Fail("rtl8139 TX stall survived the recovery");
+        }
+        // 3. Traffic resumes: with the fake chip completing
+        // descriptors again, a fresh post completes (TOK set) and
+        // the watchdog stays quiet on the live ring.
+        FIXTURE_COMPLETE_TX.store(true, Ordering::Release);
+        if device.tx(&frame).is_err() {
+            return TestResult::Fail("rtl8139 TX did not resume after recovery");
+        }
+        // Drive the completion pump so the TSD reports TOK before
+        // the grace check reads it.
+        fixture_pump();
+        let posted2 = device.tx_posted_at.lock()[0];
+        if posted2 == 0 {
+            return TestResult::Fail("rtl8139 resumed TX post did not stamp a post time");
+        }
+        if device.check_tx_watchdog_at(posted2 + timeout) {
+            return TestResult::Fail("rtl8139 watchdog re-fired on a live ring");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/rtl8139",
+        smoke_rtl8139_tx_timeout_recovery_fixture
     );
 }
