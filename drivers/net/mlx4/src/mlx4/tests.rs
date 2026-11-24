@@ -83,6 +83,7 @@ fn smoke_mlx4_query_dev_cap_decode() -> TestResult {
     mb[0x13] = 0x11; // max_qps log = 0x11 & 0x1f
     mb[0x1b] = 0x10; // max_cqs log
     mb[0x1f] = 0x08; // max_eqs log & 0xf
+    mb[0x48] = 0x30; // reserved_uars = 0x30 >> 4 = 3
     wire::put_be16(&mut mb, 0x82, 256); // qpc_entry_sz
     wire::put_be16(&mut mb, 0x8a, 64); // cqc_entry_sz
     wire::put_be16(&mut mb, 0x88, 32); // eqc_entry_sz
@@ -93,6 +94,7 @@ fn smoke_mlx4_query_dev_cap_decode() -> TestResult {
     check!(dc.qpc_entry_sz == 256, "qpc_entry_sz wrong");
     check!(dc.cqc_entry_sz == 64, "cqc_entry_sz wrong");
     check!(dc.mtt_entry_sz == 8, "mtt_entry_sz wrong");
+    check!(dc.reserved_uars == 3, "reserved_uars wrong");
     TestResult::Pass
 }
 

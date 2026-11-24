@@ -122,6 +122,9 @@ pub struct DevCap {
     /// Log₂ of the UAR region size; the raw 6-bit value is biased by +20
     /// so the minimum legal value maps to 1 MiB.
     pub log2_uar_sz: u8,
+    /// Number of firmware-reserved UAR pages at the low end of the UAR
+    /// region; the driver's own doorbell UAR is the first page past them.
+    pub reserved_uars: u8,
 }
 
 /// Decode a `QUERY_DEV_CAP` output mailbox.
@@ -143,6 +146,7 @@ pub struct DevCap {
 /// | 0x20   | hi4  | log2_rsvd_mtts    |
 /// | 0x22   | 0x0f | log2_rsvd_mrws    |
 /// | 0x37   | 0x0f | num_ports         |
+/// | 0x48   | hi4  | reserved_uars     |
 /// | 0x49   | 0x3f | log2_uar_sz (+20) |
 /// | 0x80   | —    | rdmarc_entry_sz   |
 /// | 0x82   | —    | qpc_entry_sz      |
@@ -167,6 +171,7 @@ pub fn decode_query_dev_cap(mb: &[u8]) -> DevCap {
         log2_rsvd_mtts: get_u8(mb, 0x20) >> 4,
         log2_rsvd_mrws: get_u8(mb, 0x22) & 0x0f,
         num_ports: get_u8(mb, 0x37) & 0x0f,
+        reserved_uars: get_u8(mb, 0x48) >> 4,
         log2_uar_sz: (get_u8(mb, 0x49) & 0x3f) + 20,
         rdmarc_entry_sz: get_be16(mb, 0x80),
         qpc_entry_sz: get_be16(mb, 0x82),
