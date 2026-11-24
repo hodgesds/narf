@@ -717,10 +717,24 @@ fn display_fetchers_stopped(io: &(impl crate::intel_gpu_aux::MmioWindow + ?Sized
 }
 
 /// Every enabled universal plane and cursor of a Gen9/Gen11 display fetches
-/// from GGTT below the GT arena, with room left for a 64 MiB surface, so the
-/// execlists owner's arena cannot alias a live firmware scanout. Up to seven
-/// planes per pipe (Ice Lake); absent ones read as disabled.
+/// from GGTT below the GT arena ([`planes_below_arena`]): three pipes of up to
+/// seven planes (Ice Lake), no DSB.
 fn legacy_planes_below_arena(io: &(impl crate::intel_gpu_aux::MmioWindow + ?Sized)) -> bool {
+    planes_below_arena(io, 3, 7, false)
+}
+
+/// Every enabled universal plane and cursor on the first `pipes` pipes
+/// (`planes` universal planes each, the source inventory) fetches from GGTT
+/// below the GT arena, with room left for a 64 MiB surface, and with `dsb`
+/// no display state buffer is running that could re-point one. A GT owner,
+/// which writes GGTT entries only from the arena up, then cannot alias a
+/// live firmware scanout. Absent registers read all ones and refuse.
+pub(crate) fn planes_below_arena(
+    io: &(impl crate::intel_gpu_aux::MmioWindow + ?Sized),
+    pipes: usize,
+    planes: u64,
+    dsb: bool,
+) -> bool {
     use crate::intel_gpu_pipes::{
         Pipe, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
     };
@@ -728,18 +742,39 @@ fn legacy_planes_below_arena(io: &(impl crate::intel_gpu_aux::MmioWindow + ?Size
         return false;
     }
     let limit = crate::intel_gpu_rcs::GGTT_ARENA_BASE - (64 << 20);
-    [Pipe::A, Pipe::B, Pipe::C].into_iter().all(|pipe| {
-        let base = pipe.base();
-        let planes = (0..7).all(|id| {
-            let plane = base + PLANE_PRIMARY_OFFSET + id * 0x100;
-            let ctl = io.read32(plane + PLANE_CTL_OFFSET);
-            ctl != u32::MAX
-                && (ctl & PLANE_CTL_ENABLE == 0
-                    || io.read32(plane + PLANE_SURF_OFFSET) & !0xfff < limit)
-        });
-        // CURCNTR's MCURSOR_MODE_MASK, then CURBASE.
-        planes && (io.read32(base + 0x80) & 0x27 == 0 || io.read32(base + 0x84) & !0xfff < limit)
-    })
+    [Pipe::A, Pipe::B, Pipe::C, Pipe::D]
+        .into_iter()
+        .take(pipes)
+        .all(|pipe| {
+            let base = pipe.base();
+            let planes = (0..planes).all(|id| {
+                let plane = base + PLANE_PRIMARY_OFFSET + id * 0x100;
+                let ctl = io.read32(plane + PLANE_CTL_OFFSET);
+                ctl != u32::MAX
+                    && (ctl & PLANE_CTL_ENABLE == 0
+                        || io.read32(plane + PLANE_SURF_OFFSET) & !0xfff < limit)
+            });
+            // DSB_CTRL (intel_dsb_regs.h): DSB_ENABLE or DSB_STATUS_BUSY.
+            let dsb_idle = !dsb
+                || (0..3).all(|id| io.read32(base + 0xb08 + id * 0x100) & ((1 << 31) | 1) == 0);
+            // CURCNTR's MCURSOR_MODE_MASK, then CURBASE.
+            planes
+                && dsb_idle
+                && (io.read32(base + 0x80) & 0x27 == 0 || io.read32(base + 0x84) & !0xfff < limit)
+        })
+}
+
+/// Universal planes per pipe on a Gen12 or Xe-LPG desktop display
+/// (intel_display_device.c): Tiger Lake's display 12 has six sprites, display
+/// 13 and 14 four.
+fn desktop_planes(platform: crate::intel_gpu_gt::GtPlatform) -> Option<u64> {
+    use crate::intel_gpu_gt::{Gen12Platform, GtPlatform};
+    match platform {
+        GtPlatform::Gen12(Gen12Platform::TigerLake) => Some(7),
+        GtPlatform::Gen12(Gen12Platform::Dg1) => None,
+        GtPlatform::Gen12(_) | GtPlatform::Integrated(Generation::MeteorLake) => Some(5),
+        _ => None,
+    }
 }
 
 const fn display_fetchers_stopped_values(pipeconf: [u32; 4]) -> bool {
@@ -1340,6 +1375,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 || platform == crate::intel_gpu_gt::GtPlatform::Integrated(Generation::MeteorLake))
                 && display_fetchers_stopped(&dev.mode_window())
         });
+    // A Gen12 or Meteor/Arrow Lake desktop whose GOP-lit display matches no
+    // firmware handoff (several outputs, a tiled or offset surface, Arrow
+    // Lake): the GuC owner's arena starts at 256 MiB, so it coexists with a
+    // display whose every plane and cursor fetches below it and whose DSBs
+    // are idle. The firmware display stays as it is; no KMS owner installs.
+    let below_arena_gt = scanout_mode.is_none()
+        && firmware_handoff.is_none()
+        && platform
+            .and_then(desktop_planes)
+            .is_some_and(|planes| planes_below_arena(&dev.mode_window(), 4, planes, true));
     // Power management (Q9, #1015) covers the Gen12 register
     // map only. Xe-LPG now has a region map and a display
     // engine (#1016); its separate GT owner handles system PM below.
@@ -1464,7 +1509,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::intel_gpu_gt_runtime::install_ptl_display(
             card_index, gt_card, device, cap, gt_bar, panel_mode,
         )
-    } else if owns_scanout || stopped_display_gt || firmware_handoff.is_some() || execlists_gt {
+    } else if owns_scanout
+        || stopped_display_gt
+        || below_arena_gt
+        || firmware_handoff.is_some()
+        || execlists_gt
+    {
         crate::intel_gpu_gt_runtime::install(
             card_index,
             gt_card,

@@ -8896,6 +8896,11 @@ register/sideband fixtures. Test and build results are recorded in STATUS.md.
   `DiscreteDisplayIp::{Dg2, Xe2Hpd}` identifies discrete display engines on
   `Alchemist` and `Battlemage` (`GMD_ID_DISPLAY` 14.01), seeding DRM mode
   state (`intel_vram_scanout = true`) in `probe_discrete` and installing KMS
-  via `install_discrete` when firmware Pipe A is lit. `PteFormat::encode_ggtt_vram`
+  via `install_discrete` when firmware Pipe A is lit. The GT owner starts
+  beside a lit DG1/DG2/BMG display while every plane and cursor fetches below
+  192 MiB and no DSB runs (`validate_discrete_display`), and a function probed
+  lit keeps D0. Gen12 and Meteor/Arrow Lake desktops whose lit display matches
+  no firmware handoff start the GuC owner under the same rule, with no KMS
+  owner. `PteFormat::encode_ggtt_vram`
   and `Presenter::with_vram_scanout` program GGTT entries with `PTE_DM`, and
   `addfb2_intel` marks admitted VRAM scanouts non-evictable under normal OOM.

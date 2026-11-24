@@ -209,6 +209,8 @@ struct Pending {
     smallbar: bool,
     display: DisplayOwner,
     window: AuthorizedWindow,
+    /// A discrete function probed with a lit display keeps D0.
+    display_lit: bool,
 }
 
 impl Pending {
@@ -1611,6 +1613,7 @@ fn install_profile(
         smallbar,
         display,
         window,
+        display_lit: false,
     });
     true
 }
@@ -1653,7 +1656,7 @@ pub(crate) fn start_pending() {
         ));
         let profile = display_rpm::profile(
             GtPlatform::from_pci(p.device.id.vendor, p.device.id.device),
-            p.mode.is_some(),
+            p.mode.is_some() || p.display_lit,
             p.smallbar,
         );
         // Every pipe already reported lit (KMS install's owned Pipe A) holds
@@ -1800,7 +1803,7 @@ fn validate_pci(p: &Pending, mmio: &impl MmioWindow) -> Result<u8, RuntimeError>
     if let Some(platform) = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
         .filter(|platform| platform.is_discrete() && platform.has_display() && !p.smallbar)
     {
-        validate_discrete_display_idle(platform, mmio)?;
+        validate_discrete_display(platform, mmio)?;
     }
     if narf_bus::pci::power_state(&p.cap, &p.device).ok().flatten()
         != Some(narf_bus::pci::PciPowerState::D0)
@@ -1810,10 +1813,23 @@ fn validate_pci(p: &Pending, mmio: &impl MmioWindow) -> Result<u8, RuntimeError>
     Ok(revision)
 }
 
-/// Source display inventory only; no display activation. DG1 has Display 12's
-/// six sprites plus the primary plane; DG2/BMG expose four sprites plus the
+/// Universal planes per discrete display pipe: DG1 has Display 12's six
+/// sprites plus the primary plane; DG2/BMG expose four sprites plus the
 /// primary. MIT intel_display_device.c:1788-1793 and the platform descriptors.
-fn validate_discrete_display_idle(
+fn discrete_planes(platform: GtPlatform) -> u64 {
+    if platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1) {
+        7
+    } else {
+        5
+    }
+}
+
+/// Source display inventory only; no display activation. The GT owner writes
+/// GGTT entries only from its 256 MiB arena up and never resets the display,
+/// so a firmware-lit display may stay lit while every plane and cursor
+/// fetches below the arena and no DSB runs ([`crate::intel_gpu::
+/// planes_below_arena`]); the discrete KMS owner takes over from there.
+fn validate_discrete_display(
     platform: GtPlatform,
     mmio: &impl MmioWindow,
 ) -> Result<(), RuntimeError> {
@@ -1823,20 +1839,28 @@ fn validate_discrete_display_idle(
     if !platform.has_display() {
         return Ok(());
     }
-    let planes = if platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1) {
-        7
+    if crate::intel_gpu::planes_below_arena(mmio, 4, discrete_planes(platform), true) {
+        Ok(())
     } else {
-        5
-    };
-    for pipe in 0..4 {
-        for plane in 0..planes {
-            let ctl = mmio.read32(0x70180 + pipe * 0x1000 + plane * 0x100);
-            if ctl == u32::MAX || ctl & (1 << 31) != 0 {
-                return Err(RuntimeError::Device);
-            }
-        }
+        Err(RuntimeError::Device)
     }
-    Ok(())
+}
+
+/// Any discrete plane or cursor enabled at probe: the function keeps a lit
+/// display and must stay in D0 (no runtime autosuspend).
+fn discrete_display_lit(platform: GtPlatform, mmio: &impl MmioWindow) -> bool {
+    use crate::intel_gpu_pipes::{Pipe, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET};
+    platform.has_display()
+        && [Pipe::A, Pipe::B, Pipe::C, Pipe::D]
+            .into_iter()
+            .any(|pipe| {
+                let base = pipe.base();
+                (0..discrete_planes(platform)).any(|id| {
+                    mmio.read32(base + PLANE_PRIMARY_OFFSET + id * 0x100 + PLANE_CTL_OFFSET)
+                        & PLANE_CTL_ENABLE
+                        != 0
+                }) || mmio.read32(base + 0x80) & 0x27 != 0
+            })
 }
 
 fn pci_identity(
@@ -3996,7 +4020,16 @@ pub(crate) fn probe_discrete(
     } else {
         crate::drm_registry::register_drm_card(card.clone())
     };
-    install(assigned, card, device, cap, bar, None, None);
+    let lit = discrete_display_lit(platform, &display_window);
+    if install(assigned, card, device, cap, bar, None, None) && lit {
+        if let Some(pending) = PENDING
+            .lock()
+            .iter_mut()
+            .find(|p| p.device.addr == device.addr)
+        {
+            pending.display_lit = true;
+        }
+    }
     if let (Some(ip), Some(console)) = (discrete_display, discrete_console) {
         crate::intel_gpu_kms::install_discrete(assigned, ip, bar, device, cap, console);
     }
@@ -4232,12 +4265,14 @@ mod tests {
         "drivers/gpu/intel_gpu_gt",
         smoke_gt_pci_identity_and_virtualization_admission
     );
-    fn smoke_gt_discrete_display_inventory_denies_absent_planes_and_refuses_each_live_fetcher(
-    ) -> TestResult {
+    /// A lit discrete display admits the GT while every plane and cursor
+    /// fetches below the arena and no DSB runs; a fetch near or in the arena,
+    /// a running DSB or an unreadable plane refuses. Planes past the source
+    /// inventory are never read; integrated parts take no discrete path.
+    fn smoke_gt_discrete_display_admits_fetches_below_the_arena() -> TestResult {
         use core::cell::Cell;
         struct Io {
-            live: Option<u64>,
-            unavailable: Option<u64>,
+            values: BTreeMap<u64, u32>,
             missing_high_planes: bool,
             absent: Cell<usize>,
         }
@@ -4250,66 +4285,59 @@ mod tests {
                     self.absent.set(self.absent.get() + 1);
                     return u32::MAX;
                 }
-                if self.unavailable == Some(r) {
-                    return u32::MAX;
-                }
-                if self.live == Some(r) {
-                    1 << 31
-                } else {
-                    0
-                }
+                *self.values.get(&r).unwrap_or(&0)
             }
             fn write32(&self, _: u64, _: u32) {
                 panic!("read-only discrete display admission wrote MMIO")
             }
         }
-        for platform in [GtPlatform::Alchemist, GtPlatform::Battlemage] {
-            let io = Io {
-                live: None,
-                unavailable: None,
-                missing_high_planes: true,
-                absent: Cell::new(0),
-            };
-            assert_eq!(validate_discrete_display_idle(platform, &io), Ok(()));
-            assert_eq!(io.absent.get(), 0);
-            for pipe in 0..4 {
-                for plane in 0..5 {
-                    let r = 0x70180 + pipe * 0x1000 + plane * 0x100;
-                    for unavailable in [false, true] {
-                        let io = Io {
-                            live: (!unavailable).then_some(r),
-                            unavailable: unavailable.then_some(r),
-                            missing_high_planes: true,
-                            absent: Cell::new(0),
-                        };
-                        assert_eq!(
-                            validate_discrete_display_idle(platform, &io),
-                            Err(RuntimeError::Device)
-                        );
-                        assert_eq!(io.absent.get(), 0);
-                    }
-                }
-            }
-        }
-        let dg1 = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
-        let io = Io {
-            live: None,
-            unavailable: None,
-            missing_high_planes: false,
+        let io = |values: &[(u64, u32)], missing_high_planes| Io {
+            values: values.iter().copied().collect(),
+            missing_high_planes,
             absent: Cell::new(0),
         };
-        assert_eq!(validate_discrete_display_idle(dg1, &io), Ok(()));
-        for pipe in 0..4 {
-            for plane in 0..7 {
-                let r = 0x70180 + pipe * 0x1000 + plane * 0x100;
-                let io = Io {
-                    live: Some(r),
-                    unavailable: None,
-                    missing_high_planes: false,
-                    absent: Cell::new(0),
-                };
+        let dg1 = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        for (platform, planes) in [
+            (GtPlatform::Alchemist, 5),
+            (GtPlatform::Battlemage, 5),
+            (dg1, 7),
+        ] {
+            let high = planes == 5;
+            let dark = io(&[], high);
+            assert_eq!(validate_discrete_display(platform, &dark), Ok(()));
+            assert!(!discrete_display_lit(platform, &dark));
+            for pipe in 0..4 {
+                for plane in 0..planes {
+                    let ctl = 0x70180 + pipe * 0x1000 + plane * 0x100;
+                    // GOP scanout at GGTT 0, or anywhere below 192 MiB.
+                    for surf in [0, 0x0bff_f000] {
+                        let lit = io(&[(ctl, 1 << 31), (ctl + 0x1c, surf)], high);
+                        assert_eq!(validate_discrete_display(platform, &lit), Ok(()));
+                        assert!(discrete_display_lit(platform, &lit));
+                        assert_eq!(lit.absent.get(), 0);
+                    }
+                    for refused in [
+                        io(&[(ctl, 1 << 31), (ctl + 0x1c, 0x0c00_0000)], high),
+                        io(&[(ctl, 1 << 31), (ctl + 0x1c, 0x1000_0000)], high),
+                        io(&[(ctl, u32::MAX)], high),
+                    ] {
+                        assert_eq!(
+                            validate_discrete_display(platform, &refused),
+                            Err(RuntimeError::Device)
+                        );
+                        assert_eq!(refused.absent.get(), 0);
+                    }
+                }
+                let base = 0x70000 + pipe * 0x1000;
+                let cursor = io(&[(base + 0x80, 0x27), (base + 0x84, 0x1000_0000)], high);
                 assert_eq!(
-                    validate_discrete_display_idle(dg1, &io),
+                    validate_discrete_display(platform, &cursor),
+                    Err(RuntimeError::Device)
+                );
+                assert!(discrete_display_lit(platform, &cursor));
+                let dsb = io(&[(base + 0xc08, 1 << 31)], high);
+                assert_eq!(
+                    validate_discrete_display(platform, &dsb),
                     Err(RuntimeError::Device)
                 );
             }
@@ -4324,15 +4352,16 @@ mod tests {
             }
         }
         assert_eq!(
-            validate_discrete_display_idle(GtPlatform::ArcticSoundM, &NoRead),
+            validate_discrete_display(GtPlatform::ArcticSoundM, &NoRead),
             Ok(())
         );
+        assert!(!discrete_display_lit(GtPlatform::ArcticSoundM, &NoRead));
         for platform in [
             GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake),
             GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
         ] {
             assert_eq!(
-                validate_discrete_display_idle(platform, &NoRead),
+                validate_discrete_display(platform, &NoRead),
                 Err(RuntimeError::Device)
             );
         }
@@ -4340,6 +4369,6 @@ mod tests {
     }
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
-        smoke_gt_discrete_display_inventory_denies_absent_planes_and_refuses_each_live_fetcher
+        smoke_gt_discrete_display_admits_fetches_below_the_arena
     );
 }
