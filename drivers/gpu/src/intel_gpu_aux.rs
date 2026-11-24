@@ -253,6 +253,12 @@ pub trait MmioWindow {
     )> {
         None
     }
+    /// The C20 HDMI `tx[1]` word for this exact owned PCI mapping
+    /// (`intel_gpu_xelpg_hdmi::c20_hdmi_tx_cfg1`), when its platform fact
+    /// is known; `None` keeps the C20 HDMI clocks table-only.
+    fn c20_hdmi_tx_cfg1(&self) -> Option<u16> {
+        None
+    }
     /// Whether this exact owned PCI mapping is a Tiger Lake UY
     /// (GT2) part (`intel_gpu_gen12_combo_phy::is_tgl_uy`): on
     /// such parts the combo-PHY table selection uses the UY HBR2

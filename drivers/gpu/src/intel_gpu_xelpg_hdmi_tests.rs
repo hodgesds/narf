@@ -816,3 +816,55 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_hdmi",
     smoke_mtl_hdmi_scdc_low_rates_reset_and_failures
 );
+
+/// `intel_c20_compute_hdmi_tmds_pll`, worked by hand at 148.5 MHz: the
+/// divider, multiplier, fraction, VCO band and HDMI divider match Linux's
+/// ideal `mtl_c20_hdmi_148_5` table (only its tuned charge-pump gains and
+/// fractional denominator differ), and the `tx[1]` word follows the
+/// platform's `tx_misc`.
+fn smoke_c20_hdmi_computed_pll() -> TestResult {
+    let mtl_h = c20_hdmi_tx_cfg1(7, 2);
+    if mtl_h != 0x5807 || c20_hdmi_tx_cfg1(3, 2) != 0x5803 || c20_hdmi_tx_cfg1(5, 4) != 0x9805 {
+        return TestResult::Fail("tx[1] must pack tx_misc, DCC range 8, DCC bypass and term ctl");
+    }
+    let Some(state) = compute_c20_hdmi_tmds(148_500, mtl_h) else {
+        return TestResult::Fail("148.5 MHz must compute");
+    };
+    let table = C20_HDMI_TMDS_TABLES
+        .iter()
+        .find(|(clock, _)| *clock == 148_500)
+        .map(|(_, s)| *s)
+        .expect("ideal 148.5 MHz table");
+    for i in [0, 1, 2, 6, 8, 9, 10] {
+        if state.mpllb[i] != table.mpllb[i] {
+            return TestResult::Fail("computed MPLLB word differs from the ideal table");
+        }
+    }
+    if state.tx != [0xBE88, mtl_h, 0]
+        || state.cmn != table.cmn
+        || state.mpllb[3] != 0x8F1C
+        || state.mpllb[7] != 0xFFFF
+    {
+        return TestResult::Fail("fixed C20 words must follow intel_c20_compute_hdmi_tmds_pll");
+    }
+    // Range: 25.175..=600 MHz.
+    if compute_c20_hdmi_tmds(25_174, mtl_h).is_some()
+        || compute_c20_hdmi_tmds(600_001, mtl_h).is_some()
+        || compute_c20_hdmi_tmds(600_000, mtl_h).is_none()
+    {
+        return TestResult::Fail("the computed PLL covers 25.175-600 MHz only");
+    }
+    // A clock no table carries: refused table-only, computed with the
+    // platform fact, on a C20 port; C10 stays table-only.
+    if hdmi_pll_request(XeLpgPort::Tc1, 108_000, true).is_ok()
+        || hdmi_pll_request_computed(XeLpgPort::Tc1, 108_000, true, Some(mtl_h)).is_err()
+        || hdmi_pll_request_computed(XeLpgPort::B, 108_108, false, Some(mtl_h)).is_ok()
+    {
+        return TestResult::Fail("only C20 falls back to the computed PLL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_c20_hdmi_computed_pll
+);

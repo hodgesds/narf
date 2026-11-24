@@ -1813,6 +1813,24 @@ impl crate::intel_gpu_aux::MmioWindow for ModeWindow {
             _ => None,
         }
     }
+    fn c20_hdmi_tx_cfg1(&self) -> Option<u16> {
+        use crate::intel_gpu_gt::GtPlatform;
+        use crate::intel_gpu_xelpg_hdmi::c20_hdmi_tx_cfg1;
+        match GtPlatform::from_pci(self.device.id.vendor, self.device.id.device)? {
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
+                // INTEL_MTL_U_IDS, or an Arrow Lake-S host bridge
+                // (`is_arrowlake_s_by_host_bridge`).
+                let mtl_u = matches!(self.device.id.device, 0x7D40 | 0x7D45);
+                let arl_s = narf_bus::devices().iter().any(|d| {
+                    d.id.vendor == 0x8086
+                        && d.id.class >> 8 == 0x0600
+                        && matches!(d.id.device, 0x7D1C | 0x7D2D | 0x7D2E | 0x7D2F)
+                });
+                Some(c20_hdmi_tx_cfg1(if mtl_u || arl_s { 3 } else { 7 }, 2))
+            }
+            _ => None,
+        }
+    }
     fn tgl_uy(&self) -> bool {
         crate::intel_gpu_gen12_combo_phy::is_tgl_uy(self.device.id.device)
     }

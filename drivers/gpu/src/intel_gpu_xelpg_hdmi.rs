@@ -312,12 +312,87 @@ pub fn sink_scrambling<M: MmioWindow + ?Sized>(
         .map_err(HdmiError::Scdc)
 }
 
+/// `intel_c20_hdmi_tmds_tx_cgf_1`: the C20 HDMI `tx[1]` word for a
+/// platform's `tx_misc` and termination control (DCC calibration range 8,
+/// DCC bypass). Linux takes `tx_misc` 5 with termination 4 on display 20+,
+/// 0 on Battlemage, 3 on Meteor Lake-U (`INTEL_MTL_U_IDS`) and on an Arrow
+/// Lake-S host bridge, and 7 otherwise, all with termination 2 below
+/// display 20.
+pub const fn c20_hdmi_tx_cfg1(tx_misc: u16, term_ctl: u16) -> u16 {
+    (tx_misc & 0xFF) | (8 << 8) | (1 << 12) | ((term_ctl & 7) << 13)
+}
+
+/// `intel_c20_compute_hdmi_tmds_pll`: the C20 MPLLB state for an HDMI TMDS
+/// `port_clock_khz` without an ideal table, against the 38.4 MHz
+/// reference, with the platform's `tx[1]` word ([`c20_hdmi_tx_cfg1`]).
+/// `None` outside 25.175-600 MHz.
+pub fn compute_c20_hdmi_tmds(port_clock_khz: u32, tx_cfg1: u16) -> Option<C20PllState> {
+    if !(25_175..=600_000).contains(&port_clock_khz) {
+        return None;
+    }
+    const REFCLK: u64 = 38_400_000;
+    const CLOCK_4999MHZ: u64 = 4_999_999_999;
+    const CLOCK_9999MHZ: u64 = 9_999_999_999;
+    let datarate = u64::from(port_clock_khz) * 1000 * 10;
+    let tx_clk_div = (CLOCK_9999MHZ / datarate).ilog2() as u16;
+    let vco_freq_shift = (CLOCK_4999MHZ * 256 / datarate).ilog2();
+    let vco_freq = (datarate << vco_freq_shift) >> 8;
+    let multiplier = (vco_freq << 28) / (REFCLK >> 4);
+    let mpll_multiplier = (2 * (multiplier >> 32)) as u16;
+    let fracn_quot = ((multiplier >> 16) & 0xFFFF) as u16;
+    let fracn_rem = (multiplier & 0xFFFF) as u16;
+    let div_multiplier = ((vco_freq * 16 + (datarate >> 1)) / datarate).min(255) as u16;
+    let ana_freq_vco: u16 = match vco_freq {
+        f if f <= 3_000_000_000 => 3,
+        f if f <= 3_500_000_000 => 2,
+        f if f <= 4_000_000_000 => 1,
+        _ => 0,
+    };
+    Some(C20PllState {
+        tx: [0xBE88, tx_cfg1, 0x0000],
+        cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+        mpllb: [
+            // MPLL_TX_CLK_DIV (15:13) | MPLL_MULTIPLIER (11:0)
+            (tx_clk_div << 13) | (mpll_multiplier & 0xFFF),
+            // CAL_DAC_CODE(31) (14:10) | WORD_CLK_DIV | MPLL_DIV_MULTIPLIER
+            (31 << 10) | (1 << 8) | div_multiplier,
+            // MPLLB_ANA_FREQ_VCO (15:14) | CP_PROP(20) (13:7) | CP_INT(6)
+            (ana_freq_vco << 14) | (20 << 7) | 6,
+            // V2I(2) (15:14) | CP_PROP_GS(30) (13:7) | CP_INT_GS(28)
+            (2 << 14) | (30 << 7) | 28,
+            0x0000,
+            0x0000,
+            // C20_MPLLB_FRACEN | SSC_UP_SPREAD
+            (1 << 13) | (1 << 9),
+            // MPLL_FRACN_DEN
+            0xFFFF,
+            fracn_quot,
+            fracn_rem,
+            // HDMI_DIV(1)
+            1,
+        ],
+    })
+}
+
 /// Resolve the HDMI TMDS PLL request for `port` at `clock_khz`
 /// (`intel_c10pll_calc_state` / `intel_c20pll_calc_state`, table path).
 pub fn hdmi_pll_request(
     port: XeLpgPort,
     clock_khz: u32,
     legacy: bool,
+) -> Result<PllRequest, HdmiError> {
+    hdmi_pll_request_computed(port, clock_khz, legacy, None)
+}
+
+/// [`hdmi_pll_request`] with Linux's fallback: a C20 clock with no ideal
+/// table is computed (`intel_c20pll_calc_state` tries the tables first,
+/// "since the calculated values, although correct, may not be optimal")
+/// when the platform's `tx[1]` word is known. C10 clocks stay table-only.
+pub fn hdmi_pll_request_computed(
+    port: XeLpgPort,
+    clock_khz: u32,
+    legacy: bool,
+    c20_tx_cfg1: Option<u16>,
 ) -> Result<PllRequest, HdmiError> {
     if FRL_CLOCKS_KHZ.contains(&clock_khz) {
         return Err(HdmiError::FrlClock(clock_khz));
@@ -346,6 +421,7 @@ pub fn hdmi_pll_request(
                 .iter()
                 .find(|(clock, _)| *clock == clock_khz)
                 .map(|(_, state)| *state)
+                .or_else(|| c20_tx_cfg1.and_then(|cfg| compute_c20_hdmi_tmds(clock_khz, cfg)))
                 .ok_or(HdmiError::UnsupportedClock(clock_khz))?;
             Cx0PllState::C20(state, C20Vdr::hdmi_tmds())
         }
@@ -464,7 +540,8 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     let (edid, edid_len) = read_edid_ddc(io, pin).map_err(rollback)?;
     let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len])
         .map_err(|_| rollback(HdmiError::Edid))?;
-    let pll = hdmi_pll_request(port, mode.pixel_clock_khz, type_c).map_err(rollback)?;
+    let pll = hdmi_pll_request_computed(port, mode.pixel_clock_khz, type_c, io.c20_hdmi_tx_cfg1())
+        .map_err(rollback)?;
     let sink = parse_sink_scdc(&edid[..edid_len]);
     let link = tmds_link(mode.pixel_clock_khz, &sink).map_err(rollback)?;
     if !io.display_access_ok() {
