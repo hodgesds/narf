@@ -1842,7 +1842,11 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR0 + BAR5 exclusively.
     pub unsafe fn set_mode(&mut self, mode: Mode) -> Result<(), AmdgpuError> {
-        if self.chip.family == Family::Navi4 {
+        // Navi3 (Navi31, DCN 3.2) has no DCN32 modeset sequence yet:
+        // the legacy DCN 2.0 sequence programs the wrong OTG registers
+        // on it. Fail closed like Navi4 until the DCN 3.2 lane lands
+        // (RDNA3 audit B3).
+        if self.chip.family == Family::Navi4 || self.chip.family == Family::Navi3 {
             return Err(AmdgpuError::UnknownAsic);
         }
         if !self.fw_loaded {

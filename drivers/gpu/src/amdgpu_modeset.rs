@@ -450,7 +450,11 @@ pub fn plan_modeset(
     let crtc_idx = conn.bound_crtc.ok_or(KmsError::NoCrtc)?;
     let timing = timing_for_mode(width, height, refresh_hz).ok_or(KmsError::UnsupportedMode)?;
     let writes = match family {
-        Family::Navi4 => return Err(KmsError::UnsupportedMode),
+        // Navi3 (Navi31, DCN 3.2) has no DCN32 modeset sequence yet:
+        // fail closed like Navi4 until the DCN 3.2 lane lands
+        // (RDNA3 audit B3) instead of applying the legacy DCN 2.0
+        // sequence to the wrong OTG registers.
+        Family::Navi3 | Family::Navi4 => return Err(KmsError::UnsupportedMode),
         // Phoenix is DCN **3.1.4**, not 3.5 — and the two differ exactly
         // where it matters: `regOTG0_OTG_V_BLANK_START_END` is 0x1b36 on
         // 3.1.4 and 0x1b38 on 3.5, `V_SYNC_A` 0x1b37 against 0x1b39, and
