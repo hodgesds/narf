@@ -336,6 +336,10 @@ pub struct MtlHpdMonitor {
     pending: [Option<MtlHpdKind>; 5],
     initialized: bool,
     uncertain: bool,
+    /// The south display is MTP's (`mtp_hpd_irq_setup`: the 250 µs
+    /// filter and `mtp_hpd_invert`). Display 20+ south display is
+    /// `PCH_LNL` (`xe2lpd_sde_hpd_irq_setup`), which programs neither.
+    mtp_south: bool,
 }
 
 impl MtlHpdMonitor {
@@ -347,6 +351,17 @@ impl MtlHpdMonitor {
             pending: [None; 5],
             initialized: false,
             uncertain: false,
+            mtp_south: true,
+        }
+    }
+
+    /// Select the south-display setup for `generation` before the first
+    /// enable (`intel_pch_fake_for_south_display`: display 20+ is
+    /// `PCH_LNL`, Meteor Lake `PCH_MTL`). An initialized monitor keeps
+    /// the setup it established.
+    pub fn set_generation(&mut self, generation: crate::intel_gpu::Generation) {
+        if !self.initialized {
+            self.mtp_south = matches!(generation, crate::intel_gpu::Generation::MeteorLake);
         }
     }
 
@@ -488,14 +503,17 @@ impl MtlHpdMonitor {
             }
             io.write32(port_hotplug_ctl(tc), ctl | PORT_HOTPLUG_ENABLES);
         }
-        // South display: `mtp_hpd_irq_setup`.
-        io.write32(SHPD_FILTER_CNT, SHPD_FILTER_CNT_250);
-        let chicken = io.read32(SOUTH_CHICKEN1);
-        if chicken == u32::MAX || !io.display_access_ok() {
-            self.lose();
-            return;
+        // South display: `mtp_hpd_irq_setup` programs the filter and the
+        // HPD inversion; `xe2lpd_sde_hpd_irq_setup` (display 20+) neither.
+        if self.mtp_south {
+            io.write32(SHPD_FILTER_CNT, SHPD_FILTER_CNT_250);
+            let chicken = io.read32(SOUTH_CHICKEN1);
+            if chicken == u32::MAX || !io.display_access_ok() {
+                self.lose();
+                return;
+            }
+            io.write32(SOUTH_CHICKEN1, chicken | MTP_HPD_INVERT);
         }
-        io.write32(SOUTH_CHICKEN1, chicken | MTP_HPD_INVERT);
         let simr = io.read32(SDE_IMR);
         io.write32(SDE_IMR, simr | sde);
         if !io.display_access_ok() || io.read32(SDE_IMR) & sde != sde {
@@ -538,8 +556,9 @@ impl MtlHpdMonitor {
         // Read back every owned setting.
         let mut ok = io.read32(PICA_IMR) & pica == pica
             && io.read32(PICA_IER) & pica == pica
-            && io.read32(SHPD_FILTER_CNT) == SHPD_FILTER_CNT_250
-            && io.read32(SOUTH_CHICKEN1) & MTP_HPD_INVERT == MTP_HPD_INVERT
+            && (!self.mtp_south
+                || io.read32(SHPD_FILTER_CNT) == SHPD_FILTER_CNT_250
+                    && io.read32(SOUTH_CHICKEN1) & MTP_HPD_INVERT == MTP_HPD_INVERT)
             && io.read32(SDE_IMR) & sde == sde
             && io.read32(SDE_IER) & sde == sde;
         for tc in 0..4u8 {
@@ -790,7 +809,9 @@ pub fn poll_hpd_event<M: MmioWindow + ?Sized>(
     if !hpd_generation_supported(generation) {
         return None;
     }
-    MTL_HPD.lock().poll(io)
+    let mut monitor = MTL_HPD.lock();
+    monitor.set_generation(generation);
+    monitor.poll(io)
 }
 
 /// Configure the process-wide monitor's board facts before its first poll

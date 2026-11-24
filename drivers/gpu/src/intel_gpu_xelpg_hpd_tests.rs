@@ -211,6 +211,50 @@ kernel_test_in!(
     smoke_mtl_hpd_setup_masks_before_enable_and_baselines
 );
 
+/// Display 20+ south display is `PCH_LNL`: `xe2lpd_sde_hpd_irq_setup`
+/// programs neither the MTP 250 µs filter nor `mtp_hpd_invert`, so DDI B
+/// reads its live level uninverted. Meteor Lake keeps both.
+fn smoke_lnl_hpd_south_setup_skips_mtp_filter_and_invert() -> TestResult {
+    use crate::intel_gpu::Generation;
+    for generation in [Generation::LunarLake, Generation::PantherLake] {
+        let io = HpdFake::new();
+        io.set(SDE_ISR, sde_ddi_hotplug(1));
+        let mut monitor = MtlHpdMonitor::new(MtlHpdConfig::TYPE_C);
+        monitor.set_generation(generation);
+        let events = drain(&mut monitor, &io);
+        if events
+            != [MtlHpdEvent {
+                pin: MtlHpdPin::DdiB,
+                kind: MtlHpdKind::Connected(LiveMode::Native),
+            }]
+        {
+            return TestResult::Fail("display 20+ must still publish DDI B");
+        }
+        if !io.writes_to(SHPD_FILTER_CNT).is_empty() || !io.writes_to(SOUTH_CHICKEN1).is_empty() {
+            return TestResult::Fail("display 20+ must not program the MTP filter or inversion");
+        }
+        if io.get(SHOTPLUG_CTL_DDI) & shotplug_ddi_enable(1) == 0 {
+            return TestResult::Fail("display 20+ still enables DDI B detection");
+        }
+    }
+    // Meteor Lake, and a generation set after initialization, keep MTP's.
+    let io = HpdFake::new();
+    let mut monitor = MtlHpdMonitor::new(MtlHpdConfig::TYPE_C);
+    monitor.set_generation(Generation::MeteorLake);
+    let _ = drain(&mut monitor, &io);
+    monitor.set_generation(Generation::LunarLake);
+    if io.get(SHPD_FILTER_CNT) != SHPD_FILTER_CNT_250
+        || io.get(SOUTH_CHICKEN1) & MTP_HPD_INVERT != MTP_HPD_INVERT
+    {
+        return TestResult::Fail("Meteor Lake keeps the MTP south setup");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hpd",
+    smoke_lnl_hpd_south_setup_skips_mtp_filter_and_invert
+);
+
 fn smoke_mtl_hpd_long_pulse_connect_redetect_disconnect() -> TestResult {
     let io = HpdFake::new();
     let mut monitor = MtlHpdMonitor::new(MtlHpdConfig::TYPE_C);
