@@ -11,6 +11,10 @@ use core::ops::Range;
 pub const DCN314_FIRMWARE: &str = "amdgpu/dcn_3_1_4_dmcub.bin";
 /// `FIRMWARE_DCN_315_DMUB` (`amdgpu_dm_dmub.h`).
 pub const DCN315_FIRMWARE: &str = "amdgpu/dcn_3_1_5_dmcub.bin";
+/// `FIRMWARE_DCN_V3_2_0_DMCUB` (`amdgpu_dm_dmub.h:57`): Navi31 / Navi32.
+pub const DCN320_FIRMWARE: &str = "amdgpu/dcn_3_2_0_dmcub.bin";
+/// `FIRMWARE_DCN_V3_2_1_DMCUB` (`amdgpu_dm_dmub.h:58`): Navi33.
+pub const DCN321_FIRMWARE: &str = "amdgpu/dcn_3_2_1_dmcub.bin";
 const HEADER_SIZE: usize = 40; // linux: sizeof(struct dmcub_firmware_header_v1_0)
 const PSP_HEADER_SIZE: usize = 256; // linux: PSP_HEADER_BYTES_256
 const META_SIZE: usize = 64; // linux: sizeof(union dmub_fw_meta)
@@ -188,6 +192,15 @@ impl<'a> Image<'a> {
     /// belong to this GPU; this method bounds its storage, but does not parse
     /// ATOM tables or authenticate it. No VRAM reservation is implied.
     pub fn prepare_dcn314(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
+        self.prepare_combined(vbios)
+    }
+
+    /// Prepare the seven DCN 3.2 cache-window regions — the same combined-image
+    /// layout as DCN 3.1.4. Linux's `dmub_dcn32_setup_windows` programs CW3/4/5/6
+    /// plus REGION5 and ignores both CW2 and the shared-state region6, so a
+    /// DCN 3.2 image carries no separate BSS window and no shared-state window,
+    /// exactly as `prepare_combined` requires.
+    pub fn prepare_dcn32(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
         self.prepare_combined(vbios)
     }
 

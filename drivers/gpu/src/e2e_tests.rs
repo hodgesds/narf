@@ -2207,15 +2207,17 @@ kernel_test_in!(
     smoke_drm_laptop_display_audio_apply_executes_audio_after_video
 );
 
-// Navi3 (Navi31, DCN 3.2) has no DCN32 modeset sequence yet, so
-// `plan_modeset` refuses instead of applying the legacy DCN 2.0
-// sequence to the wrong OTG registers (RDNA3 audit B3).
+// Navi3 plans through the DCN 3.2 sequence (RDNA3 lane 5): the DP
+// connector is bound to CRTC pipe 1, so the plan's last video write must
+// assert OTG_MASTER_EN on OTG1_CONTROL (0x1b41 + 0x80), never on a
+// DCN 3.5-shifted id.
 #[cfg(feature = "amdgpu")]
-fn smoke_navi3_plan_modeset_refuses() -> TestResult {
+fn smoke_navi3_plan_modeset_uses_dcn32() -> TestResult {
     use crate::amdgpu::Family;
-    use crate::amdgpu_modeset::{plan_modeset, KmsError};
+    use crate::amdgpu_dcn::OTG_MASTER_EN;
+    use crate::amdgpu_modeset::plan_modeset;
     let kms = laptop_audio_kms();
-    match plan_modeset(
+    let plan = match plan_modeset(
         &kms,
         Family::Navi3,
         1,
@@ -2227,13 +2229,30 @@ fn smoke_navi3_plan_modeset_refuses() -> TestResult {
         0x5000,
         0x9000,
     ) {
-        Err(KmsError::UnsupportedMode) => TestResult::Pass,
-        Ok(_) => TestResult::Fail("Navi3 plan_modeset must refuse until a DCN32 sequence exists"),
-        Err(_) => TestResult::Fail("Navi3 plan_modeset refused with the wrong error"),
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("Navi3 plan_modeset failed"),
+    };
+    if plan.crtc_idx != 1 || plan.writes.is_empty() {
+        return TestResult::Fail("Navi3 plan has no pipe-1 writes");
     }
+    let last = match plan.writes.last().copied() {
+        Some(w) => w,
+        None => return TestResult::Fail("Navi3 plan writes empty"),
+    };
+    if last.addr != 0x5000 + 0x1b41 + 0x80 || last.value != OTG_MASTER_EN {
+        return TestResult::Fail("Navi3 plan must end on OTG1_CONTROL master enable");
+    }
+    for w in &plan.writes {
+        if (0x5000 + 0x1b2a + 0x80..0x5000 + 0x1b5a + 0x80).contains(&w.addr)
+            && matches!(w.addr - 0x5000 - 0x80, 0x1b38 | 0x1b39 | 0x1b43)
+        {
+            return TestResult::Fail("Navi3 plan wrote a DCN 3.5 OTG id");
+        }
+    }
+    TestResult::Pass
 }
 #[cfg(feature = "amdgpu")]
-kernel_test_in!("drivers/gpu/e2e", smoke_navi3_plan_modeset_refuses);
+kernel_test_in!("drivers/gpu/e2e", smoke_navi3_plan_modeset_uses_dcn32);
 
 #[cfg(feature = "amdgpu")]
 fn smoke_drm_laptop_display_audio_set_mode_replays_saved_audio() -> TestResult {

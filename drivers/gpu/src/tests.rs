@@ -3062,7 +3062,7 @@ kernel_test_in!(
 /// A modeset with no panel leaves the level untouched (#948):
 /// a discrete GPU programs its mode but stores nothing and never
 /// touches the PWM registers, and a modeset that fails before
-/// programming (no firmware, Navi4/Navi3 refusal) stores nothing.
+/// programming (no firmware, Navi4 refusal) stores nothing.
 #[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
 fn smoke_amd_modeset_without_panel_leaves_level_untouched() -> TestResult {
     use crate::amdgpu::{AmdgpuError, Mode};
@@ -3123,14 +3123,17 @@ fn smoke_amd_modeset_without_panel_leaves_level_untouched() -> TestResult {
     if gpu.backlight_percent.is_some() {
         return TestResult::Fail("refused modeset stored a level");
     }
-    // Navi3 (Navi31, DCN 3.2): no DCN32 sequence exists yet, so the
-    // modeset refuses before any programming (RDNA3 audit B3)
-    // instead of applying the legacy DCN 2.0 sequence to the wrong
-    // OTG registers.
+    // Navi3 (Navi31, DCN 3.2): the DCN 3.2 sequence exists now (RDNA3 lane 5),
+    // so the modeset programs pipe 0 like the discrete path above — the
+    // latch still holds the sequence's last write (OTG_CONTROL =
+    // OTG_MASTER_EN at the 2.0/3.2 offset 0x1b41) and no panel level is
+    // stored. The fixture's DCN discovery is Navi22-shaped (only the
+    // family is flipped), so this pins that the sequence executes, not
+    // the DCN-version routing — that is the Navi31 modeset owner's test.
     let mut words = [0u32; 16];
     let mut gpu = amd_modeset_fixture(&mut words, false);
     gpu.chip.family = crate::amdgpu::Family::Navi3;
-    // SAFETY: Navi3 refuses before dereferencing the register mapping.
+    // SAFETY: fixture-owned RAM model; see the tests above.
     let outcome = unsafe {
         gpu.set_mode(Mode {
             width: 1920,
@@ -3138,11 +3141,14 @@ fn smoke_amd_modeset_without_panel_leaves_level_untouched() -> TestResult {
             stride: 1920,
         })
     };
-    if outcome != Err(AmdgpuError::UnknownAsic) {
-        return TestResult::Fail("Navi3 modeset did not refuse");
+    if outcome.is_err() {
+        return TestResult::Fail("Navi3 modeset did not program");
     }
-    if gpu.backlight_percent.is_some() || words != [0u32; 16] {
-        return TestResult::Fail("refused Navi3 modeset stored a level or touched MMIO");
+    if gpu.backlight_percent.is_some() {
+        return TestResult::Fail("Navi3 modeset stored a panel level");
+    }
+    if words[0] != OTG0_OTG_CONTROL || words[1] != OTG_MASTER_EN {
+        return TestResult::Fail("Navi3 modeset latch is not the DCN32 master enable");
     }
     TestResult::Pass
 }

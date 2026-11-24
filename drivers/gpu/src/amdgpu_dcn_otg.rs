@@ -155,7 +155,10 @@ fn layout_shift(profile: Profile, reg: u64) -> u64 {
     match profile {
         Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 => u64::from(reg >= OTG_CLOCK_CONTROL),
         Profile::Dcn315 => u64::from(reg >= DCN315_INSERTED),
-        Profile::Dcn314 => 0,
+        // DCN 3.2 agrees with 3.1.4 on every OTG register this module
+        // touches (dcn_3_2_0_offset.h vs dcn_3_1_4_offset.h: H_TOTAL
+        // 0x1b2a through VREADY 0x1b88 identical, no 3.1.5-style insert).
+        Profile::Dcn314 | Profile::Dcn320 | Profile::Dcn321 => 0,
     }
 }
 

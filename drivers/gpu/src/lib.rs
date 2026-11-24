@@ -281,6 +281,8 @@ pub mod amdgpu_dmub;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dmub_boot;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_dmub_dcn32;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dmub_firmware;
 #[path = "amdgpu_dmub_navi22.rs"]
 #[cfg(feature = "amdgpu")]
@@ -522,6 +524,8 @@ pub mod amdgpu_rdna2_thermal;
 /// Compatibility alias for the original Navi22 API.
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_thermal as amdgpu_navi22_thermal;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_navi31_modeset;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi31_platform;
 #[cfg(feature = "amdgpu")]

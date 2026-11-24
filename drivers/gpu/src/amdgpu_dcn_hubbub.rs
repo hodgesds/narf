@@ -67,11 +67,13 @@ const DET_APPLY_POLLS: u32 = 30;
 /// dcn315 sets none.
 const DCN314_MIN_Z8_RESIDENCY_US: u32 = 2100; // linux: n/a (dcn314 debug_defaults_drv)
 
-/// `config_return_buffer_size_in_kbytes`: 1792 on DCN 3.1.4, 1024 on 3.1.5.
+/// `config_return_buffer_size_in_kbytes`: 1792 on DCN 3.1.4, 1024 on 3.1.5,
+/// 1280 on DCN 3.2.0 and 3.2.1 (`dcn32_fpu.c` / `dcn321_fpu.c`).
 fn crb_kbytes(profile: Profile) -> Option<u32> {
     match profile {
         Profile::Dcn314 => Some(1792),
         Profile::Dcn315 => Some(1024),
+        Profile::Dcn320 | Profile::Dcn321 => Some(1280),
         _ => None,
     }
 }
