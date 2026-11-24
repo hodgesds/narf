@@ -57,51 +57,24 @@ use crate::class::{led_devices, LedDevice};
 use crate::triggers::Trigger;
 
 // ── Trigger ↔ name conversion ─────────────────────────────────────────
+//
+// Delegated to `triggers` (the single home for trigger-name logic):
+// builtin names win on collision, module-trigger names resolve
+// through the registry, and the default-trigger map lives there
+// too. These wrappers keep the sysfs call sites' shapes.
 
 /// Convert a `Trigger` to its Linux sysfs name string.
 /// Linux ref: `drivers/leds/led-triggers.c` trigger list.
-fn trigger_name(t: &Trigger) -> &'static str {
-    match t {
-        Trigger::None => "none",
-        Trigger::DefaultOn => "default-on",
-        Trigger::Heartbeat => "heartbeat",
-        Trigger::Timer { .. } => "timer",
-        Trigger::OneShot { .. } => "oneshot",
-        Trigger::DiskActivity => "disk-activity",
-        Trigger::NetworkActivity { .. } => "netdev",
-        Trigger::KeyboardCapsLock => "capslock",
-        Trigger::KeyboardNumLock => "numlock",
-        Trigger::KeyboardScrollLock => "scrolllock",
-        Trigger::AcOnline => "ac-online",
-        Trigger::BatteryCharging => "charging",
-        Trigger::AudioMute => "audio-mute",
-    }
+/// A module trigger whose registry entry is gone displays `"none"`.
+fn trigger_name(t: &Trigger) -> alloc::string::String {
+    crate::triggers::name_of_trigger(t).unwrap_or_else(|| alloc::string::String::from("none"))
 }
 
 /// Parse a trigger name into a `Trigger` value.
 /// Returns `None` for unrecognised names.
 /// Linux ref: `led_trigger_write` (led-triggers.c:52) string comparison.
 fn parse_trigger(name: &str) -> Option<Trigger> {
-    match name {
-        "none" => Some(Trigger::None),
-        "default-on" => Some(Trigger::DefaultOn),
-        "heartbeat" => Some(Trigger::Heartbeat),
-        "timer" => Some(Trigger::Timer {
-            on_ms: 500,
-            off_ms: 500,
-        }),
-        "oneshot" => Some(Trigger::OneShot {
-            delay_ms: 0,
-            on_ms: 100,
-            off_ms: 100,
-        }),
-        "disk-activity" => Some(Trigger::DiskActivity),
-        "netdev" | "network-activity" => Some(Trigger::NetworkActivity { iface: "eth0" }),
-        "ac-online" => Some(Trigger::AcOnline),
-        "charging" => Some(Trigger::BatteryCharging),
-        "audio-mute" => Some(Trigger::AudioMute),
-        _ => None,
-    }
+    crate::triggers::trigger_from_name(name)
 }
 
 // ── Per-device timer delay state ──────────────────────────────────────

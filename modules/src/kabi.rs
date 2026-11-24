@@ -24,6 +24,16 @@
 //!   * Sizes and counts are `usize`; addresses are raw pointers.
 //!   * Anything with kernel-side lifetime is an opaque `u64` handle, never a
 //!     borrowed reference.
+//!   * Arguments are flat C primitives: no `repr(C)` struct is shared
+//!     across the boundary. A struct-pointer argument's signature CRC
+//!     covers only the struct's *name*, not its layout, while flat
+//!     arguments put every field into the stringified signature the
+//!     CRC hashes — and a module redeclares the signatures by hand
+//!     anyway, so a kernel-side struct definition would not prevent
+//!     layout drift. (The USB register export states the same rule
+//!     for `usb_device_id`.) Multi-field values cross as flat
+//!     parallel arguments, NUL-separated buffers, or the AML quad
+//!     stream (see `kabi_platform.rs`).
 //!   * No function may unwind. Every one is `extern "C"` and the kernel is
 //!     built `panic=abort`, so this holds by construction.
 //!   * **Every export is `unsafe`**, including ones taking no pointers. The
@@ -1752,6 +1762,160 @@ kernel_abi! {
                 unsafe { out_ifindex.write(ifindex) };
                 0
             }
+    // ── Platform-driver family (tracker #2448) ──────────────────────
+    //
+    // ACPI driver binding, AML evaluation, HID discovery, notify
+    // handlers, LED + trigger registration for loadable `.ko`
+    // drivers. The registries and the module-text shims live in
+    // `kabi_platform.rs`; these exports are validation + delegation.
+    // All arguments are flat C primitives (no `repr(C)` struct is
+    // shared across the boundary — see the USB export's comment
+    // above and `kabi_platform.rs`).
+
+    /// Register an ACPI driver for this module (Linux
+    /// `acpi_bus_register_driver` with an `.ids` table). `hids` is a
+    /// NUL-separated list of HID strings (`"LEN0268\0IBM0068\0"`);
+    /// `probe` is `extern "C" fn(cookie: u64, path_ptr: *const u8,
+    /// path_len: usize) -> i32`, called through the module call
+    /// gate, in task context, for each already-enumerated device
+    /// matching the table — a `0` return claims the device, a
+    /// negative errno declines it. `remove` is the optional
+    /// (`0` = no-op) `extern "C" fn(cookie: u64, path_ptr: *const u8,
+    /// path_len: usize)` unbind notification. One driver per module;
+    /// returns `0`, `-EINVAL` for a null/empty/non-UTF-8 name, no
+    /// HIDs, a null probe, or a malformed HID buffer, `-EBUSY` when
+    /// this module already has an ACPI driver registered.
+    ///
+    /// # Safety
+    /// `name` must name `name_len` readable bytes; `hids` must name
+    /// `hids_len` readable bytes; `probe` (and `remove`, when
+    /// non-zero) must stay mapped for as long as the driver is
+    /// registered — unload removes them before unmapping the text.
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_register_acpi_driver(
+        name: *const u8,
+        name_len: usize,
+        hids: *const u8,
+        hids_len: usize,
+        probe: usize,
+        remove: usize,
+        cookie: u64,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || hids.is_null() || probe == 0 {
+            return -22;
+        }
+        // SAFETY: the module promises the byte ranges are readable.
+        let name_bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(name_bytes) else {
+            return -22;
+        };
+        // SAFETY: same promise for the HID buffer.
+        let hid_bytes = unsafe { core::slice::from_raw_parts(hids, hids_len) };
+        let Ok(hid_list) = crate::kabi_platform::parse_hid_buffer(hid_bytes) else {
+            return -22;
+        };
+        let owner = crate::kabi_platform::calling_owner();
+        crate::kabi_platform::register_acpi_driver(owner, name, hid_list, probe, remove, cookie)
+    }
+
+    /// Unregister this module's ACPI driver, calling its `remove`
+    /// callback (when one was registered) for each claimed device
+    /// first. Returns `0`, or `-ENODEV` when this module has no ACPI
+    /// driver registered.
+    ///
+    /// # Safety
+    /// No pointers are taken. The call is unsafe because it is part
+    /// of the module ABI surface (see the header): it mutates
+    /// module-owned registration state on the caller's behalf.
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_unregister_acpi_driver() -> i32 {
+        let owner = crate::kabi_platform::calling_owner();
+        crate::kabi_platform::unregister_acpi_driver(owner)
+    }
+
+    /// Evaluate an AML method (Linux `acpi_evaluate_object` /
+    /// `acpi_evalf`), generic over the argument/result shapes — not
+    /// ThinkPad-specific. The future `_PSS` module reuses this
+    /// export to fetch the `_PSS` Package.
+    ///
+    /// Arguments arrive as a quad stream + payload region (see
+    /// `kabi_platform.rs` for the 32-byte quad layout): `arg_quads`
+    /// names `arg_quads_len` bytes of pre-order quads (a multiple of
+    /// 32, at most 64 nodes, nesting depth at most 4),
+    /// `arg_payload` names `arg_payload_len` bytes of String/Buffer
+    /// payload bytes (offsets in the quads are relative to its base,
+    /// at most 4096 bytes). The result is written into `out` in the
+    /// same single-buffer layout (quads first, payload bytes after);
+    /// `out_needed` is always written on success and on `-ENOSPC`
+    /// with the total bytes the result needs, so the caller retries
+    /// with the required size. Returns `0`, `-EINVAL` for bad
+    /// pointers, unknown tags, over-deep/over-wide args, or a
+    /// non-UTF-8 path, `-ENODEV` when the method does not exist on
+    /// this machine, `-EIO` for other evaluation failures, `-ENOSPC`
+    /// when `out` is too small.
+    ///
+    /// # Safety
+    /// `path` must name `path_len` readable bytes; `arg_quads` must
+    /// name `arg_quads_len` readable bytes; `arg_payload` must name
+    /// `arg_payload_len` readable bytes when non-null; `out` must
+    /// name `out_len` writable bytes; `out_needed` must be a writable
+    /// `usize`. All pointers must stay valid for the call.
+    #[allow(clippy::too_many_arguments)]
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_aml_evaluate_method(
+        path: *const u8,
+        path_len: usize,
+        arg_quads: *const u8,
+        arg_quads_len: usize,
+        arg_payload: *const u8,
+        arg_payload_len: usize,
+        out: *mut u8,
+        out_len: usize,
+        out_needed: *mut usize,
+    ) -> i32 {
+        if path.is_null() || path_len == 0 || out.is_null() || out_needed.is_null() {
+            return -22;
+        }
+        if (arg_quads.is_null() && arg_quads_len != 0)
+            || (arg_payload.is_null() && arg_payload_len != 0)
+        {
+            return -22;
+        }
+        // SAFETY: the module promises the byte ranges are readable.
+        let path_bytes = unsafe { core::slice::from_raw_parts(path, path_len) };
+        let Ok(path) = core::str::from_utf8(path_bytes) else {
+            return -22;
+        };
+        let quads = if arg_quads_len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: non-null (checked) and promised readable.
+            unsafe { core::slice::from_raw_parts(arg_quads, arg_quads_len) }
+        };
+        let payload = if arg_payload_len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: non-null (checked) and promised readable.
+            unsafe { core::slice::from_raw_parts(arg_payload, arg_payload_len) }
+        };
+        let Ok(args) = crate::kabi_platform::decode_aml_args(quads, payload) else {
+            return -22;
+        };
+        let value = match narf_aml::eval::evaluate_method(path, &args) {
+            Ok(v) => v,
+            Err(e) => return crate::kabi_platform::aml_errno(e),
+        };
+        let needed = crate::kabi_platform::encoded_aml_len(&value);
+        // SAFETY: `out_needed` is non-null (checked).
+        unsafe { *out_needed = needed };
+        if out_len < needed {
+            return -28; // -ENOSPC
+        }
+        // SAFETY: `out` names `out_len` writable bytes (checked
+        // `out_len >= needed` above).
+        let out_slice = unsafe { core::slice::from_raw_parts_mut(out, out_len) };
+        match crate::kabi_platform::encode_aml_result(&value, out_slice) {
+            Ok(_) => 0,
             Err(errno) => errno,
         }
     }
@@ -2003,6 +2167,310 @@ kernel_abi! {
             Ok(None) => -61,
             Err(errno) => errno,
         }
+    /// Discover ACPI devices by HID (Linux `acpi_get_devices` /
+    /// the namespace walk by HID). Writes the matching device paths
+    /// NUL-separated into `out_buf`, in namespace order; `out_count`
+    /// is the number of paths written and `out_needed` the total
+    /// bytes required. `0` on success, including zero matches (an
+    /// empty result is a valid answer, not an error — the driver
+    /// treats "no EC" as "no LEDs on this machine"). Returns
+    /// `-EINVAL` for a null/empty/non-UTF-8 HID or null out
+    /// pointers, `-ENOSPC` when `out_buf` is too small (with
+    /// `out_needed` set for an exact retry). A null `out_buf` with
+    /// `out_buf_len == 0` is a size query.
+    ///
+    /// # Safety
+    /// `hid` must name `hid_len` readable bytes; `out_buf` must name
+    /// `out_buf_len` writable bytes when non-null; `out_count` and
+    /// `out_needed` must be writable `usize`s.
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_acpi_find_devices_by_hid(
+        hid: *const u8,
+        hid_len: usize,
+        out_buf: *mut u8,
+        out_buf_len: usize,
+        out_count: *mut usize,
+        out_needed: *mut usize,
+    ) -> i32 {
+        if hid.is_null() || hid_len == 0 || out_count.is_null() || out_needed.is_null() {
+            return -22;
+        }
+        if out_buf.is_null() && out_buf_len != 0 {
+            return -22;
+        }
+        // SAFETY: the module promises the HID bytes are readable.
+        let hid_bytes = unsafe { core::slice::from_raw_parts(hid, hid_len) };
+        let Ok(hid) = core::str::from_utf8(hid_bytes) else {
+            return -22;
+        };
+        let nodes = narf_aml::find_all_devices_by_hid(hid);
+        let mut needed = 0usize;
+        for node in &nodes {
+            needed += node.path.len() + 1;
+        }
+        // SAFETY: both out pointers are non-null (checked).
+        unsafe {
+            *out_count = 0;
+            *out_needed = needed;
+        }
+        if out_buf_len < needed {
+            return -28; // -ENOSPC
+        }
+        if needed == 0 {
+            return 0;
+        }
+        // SAFETY: `out_buf` names `out_buf_len >= needed` writable
+        // bytes (checked above).
+        let out_slice = unsafe { core::slice::from_raw_parts_mut(out_buf, out_buf_len) };
+        let mut pos = 0usize;
+        for node in &nodes {
+            out_slice[pos..pos + node.path.len()].copy_from_slice(node.path.as_bytes());
+            pos += node.path.len();
+            out_slice[pos] = 0;
+            pos += 1;
+        }
+        // SAFETY: `out_count` is non-null (checked).
+        unsafe { *out_count = nodes.len() };
+        0
+    }
+
+    /// Subscribe to ACPI notifies on one device path (Linux
+    /// `acpi_install_notify_handler`). `handler` is `extern "C"
+    /// fn(cookie: u64, target_path: *const u8, target_path_len:
+    /// usize, value: u64)`; the path pointer is core-owned and valid
+    /// for the call duration only. Dispatch runs through the module
+    /// call gate and holds no core lock while calling handlers.
+    /// Returns `0`, `-EINVAL` for a null/empty/non-UTF-8 path or a
+    /// null handler, `-ENODEV` when no device exists at the path,
+    /// `-EEXIST` when the exact (path, handler, cookie) triple is
+    /// already subscribed.
+    ///
+    /// # Safety
+    /// `path` must name `path_len` readable bytes; `handler` must
+    /// stay mapped while subscribed — unload removes it before
+    /// unmapping the text.
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_acpi_register_notify_handler(
+        path: *const u8,
+        path_len: usize,
+        handler: usize,
+        cookie: u64,
+    ) -> i32 {
+        if path.is_null() || path_len == 0 || handler == 0 {
+            return -22;
+        }
+        // SAFETY: the module promises the path bytes are readable.
+        let path_bytes = unsafe { core::slice::from_raw_parts(path, path_len) };
+        let Ok(path) = core::str::from_utf8(path_bytes) else {
+            return -22;
+        };
+        if narf_aml::find_node(path).is_none() {
+            return -19; // -ENODEV: no such device path.
+        }
+        let owner = crate::kabi_platform::calling_owner();
+        crate::kabi_platform::register_notify_shim(owner, path, handler, cookie)
+    }
+
+    /// Unsubscribe a notify handler registered with
+    /// [`narf_acpi_register_notify_handler`]. Returns `0`, or
+    /// `-ENODEV` when nothing matched (`path`, `handler`) for this
+    /// module.
+    ///
+    /// # Safety
+    /// `path` must name `path_len` readable bytes.
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_acpi_unregister_notify_handler(
+        path: *const u8,
+        path_len: usize,
+        handler: usize,
+    ) -> i32 {
+        if path.is_null() || path_len == 0 || handler == 0 {
+            return -22;
+        }
+        // SAFETY: the module promises the path bytes are readable.
+        let path_bytes = unsafe { core::slice::from_raw_parts(path, path_len) };
+        let Ok(path) = core::str::from_utf8(path_bytes) else {
+            return -22;
+        };
+        let owner = crate::kabi_platform::calling_owner();
+        crate::kabi_platform::unregister_notify_shim(owner, path, handler)
+    }
+
+    /// Register an LED with the LED class (Linux
+    /// `led_classdev_register`). `set_brightness` is `extern "C"
+    /// fn(cookie: u64, level: u32)` (infallible — the core clamps to
+    /// `[0, max_brightness()]` first); `get_brightness` is
+    /// `extern "C" fn(cookie: u64) -> u32` (`0` on failure);
+    /// `set_trigger` is the optional (`0` = engine-owned) `extern
+    /// "C" fn(cookie: u64, name_ptr: *const u8, name_len: usize)`
+    /// the core calls when a trigger is installed. `default_trigger`
+    /// is the trigger the LED wants by default (`"audio-mute"`,
+    /// `"audio-micmute"`); an empty/absent name means none, and a
+    /// not-yet-loaded trigger is applied when its module registers.
+    /// Publication is dynamic (#956): a LED registered after
+    /// `Stage::Device` is published immediately. Returns `0`,
+    /// `-EINVAL` for a null/empty/non-UTF-8 name, `max_brightness ==
+    /// 0`, a null required callback, or a bad default-trigger name,
+    /// `-EBUSY` when another module owns this LED name or when
+    /// called from inside a LED/trigger module callback.
+    ///
+    /// # Safety
+    /// `name` must name `name_len` readable bytes; `default_trigger`
+    /// must name `default_trigger_len` readable bytes when non-null;
+    /// the callbacks must stay mapped while registered — unload
+    /// removes them before unmapping the text.
+    #[allow(clippy::too_many_arguments)]
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_led_register(
+        name: *const u8,
+        name_len: usize,
+        max_brightness: u32,
+        set_brightness: usize,
+        get_brightness: usize,
+        set_trigger: usize,
+        cookie: u64,
+        default_trigger: *const u8,
+        default_trigger_len: usize,
+    ) -> i32 {
+        if name.is_null()
+            || name_len == 0
+            || max_brightness == 0
+            || set_brightness == 0
+            || get_brightness == 0
+        {
+            return -22;
+        }
+        if crate::kabi_platform::in_led_callback() {
+            return -16; // -EBUSY: no re-entrant registration.
+        }
+        // SAFETY: the module promises the name bytes are readable.
+        let name_bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(name_bytes) else {
+            return -22;
+        };
+        let trigger = if default_trigger.is_null() || default_trigger_len == 0 {
+            None
+        } else {
+            // SAFETY: non-null (checked) and promised readable.
+            let trigger_bytes =
+                unsafe { core::slice::from_raw_parts(default_trigger, default_trigger_len) };
+            let Ok(trigger) = core::str::from_utf8(trigger_bytes) else {
+                return -22;
+            };
+            Some(trigger)
+        };
+        let owner = crate::kabi_platform::calling_owner();
+        crate::kabi_platform::register_module_led(
+            owner,
+            name,
+            max_brightness,
+            set_brightness,
+            get_brightness,
+            set_trigger,
+            cookie,
+            trigger,
+        )
+    }
+
+    /// Unregister an LED by name. The LED is driven to brightness
+    /// `0` through the gate first (while the module is still Live on
+    /// the exit path); if the gate refuses, the unregister proceeds
+    /// anyway. Returns `0`, `-ENODEV` for an unknown name (to this
+    /// module), `-EBUSY` when called from inside a LED/trigger
+    /// module callback.
+    ///
+    /// # Safety
+    /// `name` must name `name_len` readable bytes.
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_led_unregister(name: *const u8, name_len: usize) -> i32 {
+        if name.is_null() || name_len == 0 {
+            return -22;
+        }
+        if crate::kabi_platform::in_led_callback() {
+            return -16; // -EBUSY: no re-entrant registration.
+        }
+        // SAFETY: the module promises the name bytes are readable.
+        let name_bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(name_bytes) else {
+            return -22;
+        };
+        let owner = crate::kabi_platform::calling_owner();
+        crate::kabi_platform::unregister_module_led(owner, name, true)
+    }
+
+    /// Register a LED trigger as a module (Linux
+    /// `led_trigger_register`; triggers are `tristate` modules).
+    /// `compute` is `extern "C" fn(cookie: u64,
+    /// led_max_brightness: u32, ticks: u32) -> u32`, called from the
+    /// 100 ms worker tick through the gate; the core clamps the
+    /// result to `[0, max_brightness]`. The first trigger module is
+    /// `audio-micmute`. Returns `0`, `-EINVAL` for a null/empty/
+    /// non-UTF-8 name or a null compute callback, `-EEXIST` when a
+    /// builtin trigger already has this name, `-EBUSY` when called
+    /// from inside a LED/trigger module callback.
+    ///
+    /// # Safety
+    /// `name` must name `name_len` readable bytes; `compute` must
+    /// stay mapped while registered — unload removes it before
+    /// unmapping the text.
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_led_register_trigger(
+        name: *const u8,
+        name_len: usize,
+        compute: usize,
+        cookie: u64,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || compute == 0 {
+            return -22;
+        }
+        if crate::kabi_platform::in_led_callback() {
+            return -16; // -EBUSY: no re-entrant registration.
+        }
+        // SAFETY: the module promises the name bytes are readable.
+        let name_bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(name_bytes) else {
+            return -22;
+        };
+        let owner = crate::kabi_platform::calling_owner();
+        crate::kabi_platform::register_module_trigger(owner, name, compute, cookie)
+    }
+
+    /// Unregister a trigger by name. Returns `0`, `-ENODEV` for an
+    /// unknown name (to this module), `-EBUSY` while any LED's
+    /// current trigger is this trigger (move those LEDs first — the
+    /// loader backstop force-reverts them instead) or when called
+    /// from inside a LED/trigger module callback.
+    ///
+    /// # Safety
+    /// `name` must name `name_len` readable bytes.
+    requires narf_capabilities::CapKind::PlatformDriver;
+    fn narf_led_unregister_trigger(name: *const u8, name_len: usize) -> i32 {
+        if name.is_null() || name_len == 0 {
+            return -22;
+        }
+        if crate::kabi_platform::in_led_callback() {
+            return -16; // -EBUSY: no re-entrant registration.
+        }
+        // SAFETY: the module promises the name bytes are readable.
+        let name_bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(name_bytes) else {
+            return -22;
+        };
+        let owner = crate::kabi_platform::calling_owner();
+        crate::kabi_platform::unregister_module_trigger(owner, name)
+    }
+
+    /// Read the core audio mic-mute state bit (`1` muted, `0`
+    /// unmuted) for the `audio-micmute` trigger module. Mirrors
+    /// `triggers::audio_muted()`; the bit defaults `false` until
+    /// the lane-4 sound feed lands. No cap: a read-only state bit,
+    /// like the other plain state reads.
+    ///
+    /// # Safety
+    /// No pointers are taken. The call is unsafe because it is part
+    /// of the module ABI surface (see the header).
+    fn narf_led_audio_mic_muted() -> u8 {
+        u8::from(narf_drivers_leds::triggers::audio_mic_muted())
     }
 }
 
@@ -2207,6 +2675,211 @@ fn smoke_kabi_softmac_exports() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_softmac_exports);
+/// Platform-driver access is privileged at link time as well as at
+/// handle invocation. A module that omits
+/// `required_caps=PlatformDriver:*` must never receive the function
+/// address to call in the first place. The mic-mute state read is
+/// deliberately ungated (read-only state bit) and must resolve
+/// without any cap declaration.
+fn smoke_kabi_platform_exports_require_cap() -> TestResult {
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    for name in [
+        "narf_register_acpi_driver",
+        "narf_unregister_acpi_driver",
+        "narf_aml_evaluate_method",
+        "narf_acpi_find_devices_by_hid",
+        "narf_acpi_register_notify_handler",
+        "narf_acpi_unregister_notify_handler",
+        "narf_led_register",
+        "narf_led_unregister",
+        "narf_led_register_trigger",
+        "narf_led_unregister_trigger",
+    ] {
+        match crate::symbols::resolve(name, None, &denied) {
+            Err(crate::symbols::ResolveError::CapMissing(
+                narf_capabilities::CapKind::PlatformDriver,
+            )) => {}
+            _ => {
+                return TestResult::Fail(
+                    "platform export resolved without PlatformDriver cap declaration",
+                );
+            }
+        }
+    }
+
+    let mut allowed = crate::manifest::Manifest::default();
+    allowed.required_caps.push(crate::manifest::RequiredCap {
+        kind: narf_capabilities::CapKind::PlatformDriver,
+        right: <narf_capabilities::Write as narf_capabilities::Rights>::BITS,
+    });
+    for name in [
+        "narf_register_acpi_driver",
+        "narf_aml_evaluate_method",
+        "narf_acpi_find_devices_by_hid",
+        "narf_acpi_register_notify_handler",
+        "narf_led_register",
+        "narf_led_register_trigger",
+    ] {
+        if crate::symbols::resolve(name, None, &allowed).is_err() {
+            return TestResult::Fail(
+                "platform export stayed hidden with PlatformDriver cap declaration",
+            );
+        }
+    }
+    // The read export resolves with no cap at all.
+    if crate::symbols::resolve("narf_led_audio_mic_muted", None, &denied).is_err() {
+        return TestResult::Fail("mic-mute read must resolve without any cap declaration");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_platform_exports_require_cap);
+
+/// The platform exports reject malformed arguments before reaching
+/// any registry or the AML evaluator.
+fn smoke_kabi_platform_exports_validate_args() -> TestResult {
+    let name = b"test-led";
+    let hids = c"LEN0268".to_bytes_with_nul();
+    let good_probe = 0x1000usize;
+    // SAFETY: every pointer below is either null (the case under
+    // test) or names literal bytes that outlive the call.
+    let r_null_name = unsafe {
+        narf_register_acpi_driver(
+            core::ptr::null(),
+            name.len(),
+            hids.as_ptr(),
+            hids.len(),
+            good_probe,
+            0,
+            0,
+        )
+    };
+    // SAFETY: same as above.
+    let r_empty_name = unsafe {
+        narf_register_acpi_driver(
+            name.as_ptr(),
+            0,
+            hids.as_ptr(),
+            hids.len(),
+            good_probe,
+            0,
+            0,
+        )
+    };
+    // SAFETY: same as above.
+    let r_null_probe = unsafe {
+        narf_register_acpi_driver(
+            name.as_ptr(),
+            name.len(),
+            hids.as_ptr(),
+            hids.len(),
+            0,
+            0,
+            0,
+        )
+    };
+    if r_null_name != -22 || r_empty_name != -22 || r_null_probe != -22 {
+        return TestResult::Fail("narf_register_acpi_driver accepted a null name or probe");
+    }
+    let mut needed = 0usize;
+    let mut out = [0u8; 32];
+    // SAFETY: `out` names 32 writable bytes; every other pointer
+    // is null (the case under test).
+    let r_null_path = unsafe {
+        narf_aml_evaluate_method(
+            core::ptr::null(),
+            4,
+            core::ptr::null(),
+            0,
+            core::ptr::null(),
+            0,
+            out.as_mut_ptr(),
+            out.len(),
+            &mut needed,
+        )
+    };
+    if r_null_path != -22 {
+        return TestResult::Fail("narf_aml_evaluate_method accepted a null path");
+    }
+    let mut count = 0usize;
+    // SAFETY: `out_count`/`out_needed` name live locals; the HID
+    // and output pointers are null (the case under test).
+    let r_null_hid = unsafe {
+        narf_acpi_find_devices_by_hid(
+            core::ptr::null(),
+            4,
+            core::ptr::null_mut(),
+            0,
+            &mut count,
+            &mut needed,
+        )
+    };
+    if r_null_hid != -22 {
+        return TestResult::Fail("narf_acpi_find_devices_by_hid accepted a null HID");
+    }
+    // SAFETY: `name` names literal bytes; the null callback is the
+    // case under test in each call.
+    let r_max_zero = unsafe {
+        narf_led_register(
+            name.as_ptr(),
+            name.len(),
+            0,
+            good_probe,
+            good_probe,
+            0,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    // SAFETY: same as above.
+    let r_null_set = unsafe {
+        narf_led_register(
+            name.as_ptr(),
+            name.len(),
+            1,
+            0,
+            good_probe,
+            0,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    // SAFETY: same as above.
+    let r_null_get = unsafe {
+        narf_led_register(
+            name.as_ptr(),
+            name.len(),
+            1,
+            good_probe,
+            0,
+            0,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    if r_max_zero != -22 || r_null_set != -22 || r_null_get != -22 {
+        return TestResult::Fail("narf_led_register accepted max 0 or a null callback");
+    }
+    // SAFETY: `name` names literal bytes; the null compute is the
+    // case under test.
+    let r_null_compute = unsafe { narf_led_register_trigger(name.as_ptr(), name.len(), 0, 0) };
+    if r_null_compute != -22 {
+        return TestResult::Fail("narf_led_register_trigger accepted a null compute");
+    }
+    // SAFETY: `name` names literal bytes; the empty length is the
+    // case under test.
+    let r_unreg_empty = unsafe { narf_led_unregister(name.as_ptr(), 0) };
+    // SAFETY: same as above.
+    let r_unreg_trig_empty = unsafe { narf_led_unregister_trigger(name.as_ptr(), 0) };
+    if r_unreg_empty != -22 || r_unreg_trig_empty != -22 {
+        return TestResult::Fail("unregister accepted an empty name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_platform_exports_validate_args);
 
 /// Registration is idempotent: a second call must not duplicate entries,
 /// because the ABI hash sums over the table and would change.

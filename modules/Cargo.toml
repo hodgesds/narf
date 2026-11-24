@@ -24,6 +24,13 @@ narf-capabilities = { path = "../capabilities" }
 narf-bus          = { path = "../bus" }
 narf-firmware     = { path = "../firmware" }
 narf-block        = { path = "../block" }
+# The platform-driver KABI family (tracker #2448) wraps these two
+# crates: AML evaluation / HID discovery / notify handlers come from
+# narf-aml, and LED / trigger registration goes to narf-drivers-leds
+# (same shape as the existing narf-block dependency, whose registry
+# the `narf_blk_*` exports write to).
+narf-aml          = { path = "../aml" }
+narf-drivers-leds = { path = "../drivers/leds" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-filesystem   = { path = "../filesystem" }
 narf-initramfs    = { path = "../initramfs" }

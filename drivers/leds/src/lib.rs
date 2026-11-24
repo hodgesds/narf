@@ -70,7 +70,7 @@ pub use leds_input_num::LedNumLock;
 pub use leds_input_scroll::LedScrollLock;
 pub use leds_pwm::LedPwm;
 pub use multicolor::{register_rgb_led, rgb_led_devices, RgbLed, SimpleRgbLed};
-pub use triggers::Trigger;
+pub use triggers::{set_led_default_trigger, Trigger};
 pub use worker::{
     submit_command, ACTION_BLINK, ACTION_OFF, ACTION_SET_BRIGHTNESS, ACTION_SET_COLOR,
 };
