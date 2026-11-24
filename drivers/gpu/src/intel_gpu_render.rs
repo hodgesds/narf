@@ -2227,7 +2227,8 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
             }
             i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
         }
-        23 => 1, // I915_PARAM_HAS_GEM_USERPTR
+        // I915_PARAM_HAS_SECURE_BATCHES: graphics 6+ never grants them.
+        23 => 0,
         abi::PARAM_PERF_REVISION => i32::from(
             info.backend
                 .as_ref()
@@ -3972,15 +3973,16 @@ pub(crate) mod tests {
             let file = RenderFile::new();
             let user = User::new();
 
-            // 1. Verify I915_PARAM_HAS_GEM_USERPTR reports 1
+            // 1. GETPARAM 23 is I915_PARAM_HAS_SECURE_BATCHES, never granted
+            // from graphics 6 on; userptr support is the ioctl itself.
             let mut getparam_req = [0; 16];
-            put32(&mut getparam_req, 0, 23); // I915_PARAM_HAS_GEM_USERPTR
+            put32(&mut getparam_req, 0, 23);
             put64(&mut getparam_req, 8, 1024);
             user.store(64, &getparam_req);
             invoke(&file, &user, abi::GETPARAM).map_err(|_| "getparam 23")?;
             let val = i32::from_le_bytes(user.load(1024, 4).try_into().unwrap());
-            if val != 1 {
-                return Err("I915_PARAM_HAS_GEM_USERPTR != 1");
+            if val != 0 {
+                return Err("I915_PARAM_HAS_SECURE_BATCHES != 0");
             }
 
             // 2. Alignment checks: unaligned pointer or unaligned size
