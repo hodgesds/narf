@@ -751,6 +751,7 @@ pub fn send_message_void<M: SmuMmio>(
 // Values per Linux:
 //   smu_v12_0.h:        SMU12_DRIVER_IF_VERSION   (Renoir / Lucienne / Cezanne)
 //   smu_v13_0_4.h:      SMU_13_0_4_DRIVER_IF_VERSION (Phoenix / HawkPoint1)
+//   smu13_driver_if_v13_0_0.h: SMU_13_0_0_DRIVER_IF_VERSION (Navi31/32/33 discrete)
 
 /// Renoir / Lucienne / Cezanne (SMU 12.0). Matches Linux
 /// `drivers/gpu/drm/amd/pm/swsmu/inc/smu_v12_0.h`.
@@ -758,6 +759,13 @@ pub const SMU12_DRIVER_IF_VERSION: u32 = 0x0F;
 /// Phoenix HawkPoint1 / Phoenix2 (SMU 13.0.4). Matches Linux
 /// `drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu_v13_0_4.h`.
 pub const SMU_13_0_4_DRIVER_IF_VERSION: u32 = 0x07;
+/// Navi31 / Navi32 / Navi33 discrete (SMU 13.0.0). Matches Linux
+/// `drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu13_driver_if_v13_0_0.h:27`
+/// (`#define SMU13_0_0_DRIVER_IF_VERSION 0x3D`, Linux 7.4-rc2).
+/// NOTE: the same header family puts 13.0.4 at 8 in 7.4-rc2 while NARF
+/// carries 0x07 for Phoenix above — the Phoenix value predates that bump
+/// and is NOT changed here; it needs its own lane + CI verdict.
+pub const SMU_13_0_0_DRIVER_IF_VERSION: u32 = 0x3D;
 
 // ── Bring-up sequence ──────────────────────────────────────────────
 

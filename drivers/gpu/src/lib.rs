@@ -587,6 +587,8 @@ mod amdgpu_admission;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_psp;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_psp13;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_psp_boot;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_psp_firmware;
@@ -684,6 +686,8 @@ pub mod amdgpu_smu_temp;
 pub mod amdgpu_smu_v12;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smu_v13;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_smu_v13_0;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smuio14;
 #[cfg(feature = "amdgpu")]

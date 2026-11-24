@@ -270,6 +270,12 @@ fn smoke_amdgpu_family_table_documented_offsets() -> TestResult {
     // pending datasheet sourcing. Lock this in so accidentally
     // shipping a placeholder offset for an undocumented family
     // surfaces as a test failure.
+    // Navi3 is NOT TBD: its static `None` is by design — Navi31 is a
+    // discovery part and Linux takes its MP0 base from the discovery
+    // blob, so there is no static constant to put here (see
+    // `Family::mp0_base`). `AmdGpu::mp0_base()` resolves it from
+    // discovery instead; that path is pinned by
+    // `smoke_amdgpu_navi31_mp0_mp1_bases`.
     use crate::amdgpu::Family;
     if Family::Vega.mp0_base() != Some(0x000B_0000) {
         return TestResult::Fail("Vega MP0 base wrong");
@@ -281,7 +287,7 @@ fn smoke_amdgpu_family_table_documented_offsets() -> TestResult {
         return TestResult::Fail("Navi2 should be TBD");
     }
     if Family::Navi3.mp0_base().is_some() {
-        return TestResult::Fail("Navi3 should be TBD");
+        return TestResult::Fail("Navi3 has no static MP0 base by design");
     }
     if Family::Renoir.mp0_base().is_some() {
         return TestResult::Fail("Renoir should be TBD");
@@ -1506,6 +1512,8 @@ fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult 
     if Family::Vega.mp0_base() != Some(0x000B_0000) {
         return TestResult::Fail("Vega compile-time fallback");
     }
+    // Navi3 has no static MP0 base by design (discovery-sourced);
+    // the runtime registry is the only way to give it one.
     if Family::Navi3.mp0_base().is_some() {
         return TestResult::Fail("Navi3 should default None");
     }
@@ -6633,6 +6641,331 @@ fn smoke_amdgpu_smu_v13_message_ids() -> TestResult {
 }
 #[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/amdgpu/smu", smoke_amdgpu_smu_v13_message_ids);
+
+/// The SMU 13.0.0 message ids, spelled out from
+/// `smu_v13_0_0_ppsmc.h`. Pins the bring-up quartet, the five
+/// generic by-frequency ids the `amdgpu_dpm.rs` LINUX-GAP comment
+/// documents, the GFXOFF pair — and the fact that the GFXOFF ids
+/// are the mirror image of 13.0.4's: 0x28/0x29 here is GFXOFF,
+/// while 0x19/0x1A here is `SetSoftMin/MaxByFreq` and GFXOFF on
+/// Phoenix. Per-clock variants have no 13.0.0 message at all.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_smu_v13_0_0_message_ids() -> TestResult {
+    use crate::amdgpu_smu::PpsmcMsg;
+    use crate::amdgpu_smu_v13_0::*;
+    if V13_0_0_MSG_TEST != 0x01
+        || V13_0_0_MSG_GET_SMU_VERSION != 0x02
+        || V13_0_0_MSG_GET_DRIVER_IF != 0x03
+    {
+        return TestResult::Fail("TestMessage/GetSmuVersion/GetDriverIfVersion are 0x01..0x03");
+    }
+    if V13_0_0_MSG_SET_DRAM_ADDR_HI != 0x0E
+        || V13_0_0_MSG_SET_DRAM_ADDR_LO != 0x0F
+        || V13_0_0_MSG_XFER_SMU2DRAM != 0x12
+        || V13_0_0_MSG_XFER_DRAM2SMU != 0x13
+    {
+        return TestResult::Fail("the metrics-table transfer quartet is 0x0E..0x13");
+    }
+    // The five ids the DPM LINUX-GAP comment says are correct for
+    // 13.0.0 and mean something else on Phoenix.
+    if V13_0_0_MSG_SET_SOFT_MIN_BY_FREQ != 0x19
+        || V13_0_0_MSG_SET_SOFT_MAX_BY_FREQ != 0x1A
+        || V13_0_0_MSG_SET_HARD_MIN_BY_FREQ != 0x1B
+        || V13_0_0_MSG_SET_HARD_MAX_BY_FREQ != 0x1C
+        || V13_0_0_MSG_SET_WORKLOAD_MASK != 0x24
+    {
+        return TestResult::Fail("the by-frequency ids are 0x19..0x1C + 0x24");
+    }
+    // GFXOFF is 0x28/0x29 here — and 0x19/0x1A on 13.0.4, which is
+    // exactly the crossed-wire the DPM comment warns about.
+    if V13_0_0_MSG_ALLOW_GFX_OFF != 0x28 || V13_0_0_MSG_DISALLOW_GFX_OFF != 0x29 {
+        return TestResult::Fail("GFXOFF control is 0x28/0x29 on SMU 13.0.0");
+    }
+    if crate::amdgpu_smu_v13::V13_MSG_ALLOW_GFX_OFF != 0x19
+        || crate::amdgpu_smu_v13::V13_MSG_DISALLOW_GFX_OFF != 0x1A
+    {
+        return TestResult::Fail("13.0.4 GFXOFF must stay 0x19/0x1A (untouched table)");
+    }
+    if V13_0_0_MSG_POWER_UP_VCN != 0x2A
+        || V13_0_0_MSG_POWER_DOWN_VCN != 0x2B
+        || V13_0_0_MSG_POWER_UP_JPEG != 0x2C
+        || V13_0_0_MSG_POWER_DOWN_JPEG != 0x2D
+        || V13_0_0_MSG_PREPARE_MP1_UNLOAD != 0x2E
+    {
+        return TestResult::Fail("VCN/JPEG power + unload ids are 0x2A..0x2E");
+    }
+    // `PPSMC_Message_Count` is 0x52; anything at or above it is not
+    // a message.
+    if V13_0_0_MSG_COUNT != 0x52 || V13_0_0_MSG_MODE1_RESET >= V13_0_0_MSG_COUNT {
+        return TestResult::Fail("message ids must be below PPSMC_Message_Count 0x52");
+    }
+    // Shared-enum routing: the mailbox handshake + GFXOFF + transfer
+    // quartet resolve; every per-clock variant is unmapped on 13.0.0
+    // (generic *ByFreq set instead — clock ids ungrounded, see the
+    // module docs).
+    if msg_id(PpsmcMsg::TestMessage) != Some(0x01)
+        || msg_id(PpsmcMsg::GetSmuVersion) != Some(0x02)
+        || msg_id(PpsmcMsg::GetDriverIfVersion) != Some(0x03)
+        || msg_id(PpsmcMsg::AllowGfxOff) != Some(0x28)
+        || msg_id(PpsmcMsg::DisallowGfxOff) != Some(0x29)
+        || msg_id(PpsmcMsg::PrepareMp1ForUnload) != Some(0x2E)
+        || msg_id(PpsmcMsg::TransferTableSmu2Dram) != Some(0x12)
+        || msg_id(PpsmcMsg::TransferTableDram2Smu) != Some(0x13)
+    {
+        return TestResult::Fail("shared-enum routing resolves the 13.0.0 core set");
+    }
+    for per_clock in [
+        PpsmcMsg::GetGfxclkFrequency,
+        PpsmcMsg::GetFclkFrequency,
+        PpsmcMsg::SetSoftMinGfxclk,
+        PpsmcMsg::SetSoftMaxGfxClk,
+        PpsmcMsg::SetHardMinGfxClk,
+        PpsmcMsg::SetSoftMinFclk,
+        PpsmcMsg::SetSoftMaxFclk,
+        PpsmcMsg::SetHardMinFclk,
+        PpsmcMsg::SetSoftMinSocclk,
+        PpsmcMsg::SetSoftMaxSocclk,
+        PpsmcMsg::PowerUpGfx,
+    ] {
+        if msg_id(per_clock).is_some() {
+            return TestResult::Fail("per-clock messages have no 13.0.0 id");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_v13_0_0_message_ids
+);
+
+/// PSP 13.0.0 firmware set selection + SOS container parsing.
+/// Names are `psp_v13_0.c` `MODULE_FIRMWARE`; the container is the
+/// same v1.0 layout Linux parses in `psp_init_sos_microcode`, with
+/// the common header's IP version at 13.0.0 instead of 11.0.0.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_psp13_firmware_set() -> TestResult {
+    use crate::amdgpu_psp13::Psp13FirmwareSet;
+    use crate::amdgpu_psp_firmware::{Error, Image};
+    // Base vs kicker selection.
+    let base = Psp13FirmwareSet::select(false);
+    if base.sos != "amdgpu/psp_13_0_0_sos.bin"
+        || base.ta != "amdgpu/psp_13_0_0_ta.bin"
+        || base.smu != "amdgpu/smu_13_0_0.bin"
+    {
+        return TestResult::Fail("base PSP 13.0.0 set names wrong");
+    }
+    let kicker = Psp13FirmwareSet::select(true);
+    if kicker.sos != "amdgpu/psp_13_0_0_sos_kicker.bin"
+        || kicker.ta != "amdgpu/psp_13_0_0_ta_kicker.bin"
+        || kicker.smu != "amdgpu/smu_13_0_0_kicker.bin"
+    {
+        return TestResult::Fail("kicker PSP 13.0.0 set names wrong");
+    }
+    // Minimal v1.0 SOS container: 44-byte header + 64-byte payload.
+    // sos.offset_bytes = 16, sos.size_bytes = 16, so the payload
+    // holds a 16-byte system part and a 16-byte SOS part.
+    fn container(ip_major: u8) -> [u8; 108] {
+        let mut b = [0u8; 108];
+        let put32 = |b: &mut [u8; 108], off: usize, v: u32| {
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes())
+        };
+        put32(&mut b, 0, 108); // size_bytes
+        put32(&mut b, 4, 44); // header_size_bytes
+        b[8] = 1; // header_version_major (minor 10..12 is 0; IP version at 12..16)
+        b[12] = ip_major;
+        put32(&mut b, 16, 0x0001_0000); // ucode_version
+        put32(&mut b, 20, 64); // ucode_size_bytes
+        put32(&mut b, 24, 44); // ucode_array_offset_bytes
+        put32(&mut b, 36, 16); // sos.offset_bytes
+        put32(&mut b, 40, 16); // sos.size_bytes
+        b
+    }
+    let bytes13 = container(13);
+    let image = match Image::parse_psp13(&bytes13) {
+        Ok(image) => image,
+        Err(_) => return TestResult::Fail("parse_psp13 rejected a valid 13.0.0 container"),
+    };
+    if image.version() != 0x0001_0000 || image.sos_version() != 0x0001_0000 {
+        return TestResult::Fail("PSP13 container version wrong");
+    }
+    if image.toc().is_some() {
+        return TestResult::Fail("v1.0 container must have no TOC");
+    }
+    let mut parts = image.components();
+    match (parts.next(), parts.next(), parts.next()) {
+        (
+            Some((crate::amdgpu_psp_firmware::Component::SystemDriver, _)),
+            Some((crate::amdgpu_psp_firmware::Component::SecureOs, _)),
+            None,
+        ) => {}
+        _ => return TestResult::Fail("PSP13 container must yield SystemDriver then SecureOs"),
+    }
+    // The IP version is load-bearing: each parser accepts only its own.
+    if Image::parse(&bytes13).err() != Some(Error::Unsupported) {
+        return TestResult::Fail("PSP11 parse must reject a 13.0.0 container");
+    }
+    if Image::parse_psp14(&bytes13).err() != Some(Error::Unsupported) {
+        return TestResult::Fail("PSP14 parse must reject a 13.0.0 container");
+    }
+    let bytes11 = container(11);
+    if Image::parse_psp13(&bytes11).err() != Some(Error::Unsupported) {
+        return TestResult::Fail("PSP13 parse must reject an 11.0.0 container");
+    }
+    if Image::parse(&bytes11).is_err() {
+        return TestResult::Fail("PSP11 parse must still accept an 11.0.0 container");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu/amdgpu/psp", smoke_amdgpu_psp13_firmware_set);
+
+/// The Navi31 multi-IP firmware table: non-empty (no fall-through to
+/// the legacy single-blob path), Linux load order, every blob name
+/// Linux's `MODULE_FIRMWARE` for GC 11.0.0 — and no SMU entry, because
+/// the PMFW is PSP-loaded on Navi31 and must never take the MP1
+/// mailbox path.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_navi31_fw_table() -> TestResult {
+    use crate::amdgpu::{AMD_VENDOR, NAVI31, SMU_LOAD_PMFW_MP1};
+    use crate::amdgpu_psp::{PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC};
+    let chip = match crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, NAVI31) {
+        Some(chip) => chip,
+        None => return TestResult::Fail("NAVI31 must be in the probe table"),
+    };
+    let list = chip.fw_list;
+    if list.is_empty() {
+        return TestResult::Fail("Navi31 fw_list must not be empty (UNAUDITED_FW fall-through)");
+    }
+    let names: alloc::vec::Vec<&str> = list.iter().map(|e| e.name).collect();
+    let expected: [&str; 12] = [
+        "amdgpu/gc_11_0_0_toc.bin",
+        "amdgpu/sdma_6_0_0.bin",
+        "amdgpu/gc_11_0_0_pfp.bin",
+        "amdgpu/gc_11_0_0_me.bin",
+        "amdgpu/gc_11_0_0_mec.bin",
+        "amdgpu/gc_11_0_0_mes.bin",
+        "amdgpu/gc_11_0_0_mes_2.bin",
+        "amdgpu/gc_11_0_0_mes1.bin",
+        "amdgpu/gc_11_0_0_rlc.bin",
+        "amdgpu/vcn_4_0_0.bin",
+        "amdgpu/dcn_3_2_0_dmcub.bin",
+        "amdgpu/psp_13_0_0_ta.bin",
+    ];
+    if names.as_slice() != expected {
+        return TestResult::Fail("Navi31 fw table names/order wrong");
+    }
+    if list[0].cmd != PSP_CMD_LOAD_TOC || list[11].cmd != PSP_CMD_LOAD_TA {
+        return TestResult::Fail("Navi31 table must open with TOC and close with TA");
+    }
+    if list.iter().any(|e| e.cmd == SMU_LOAD_PMFW_MP1) {
+        return TestResult::Fail("Navi31 must not route SMU PMFW through the MP1 mailbox");
+    }
+    if names
+        .iter()
+        .any(|n| n.contains("kicker") || n.contains("rlc_1"))
+    {
+        return TestResult::Fail("rev-gated RLC variants must not be in the base table");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu/amdgpu", smoke_amdgpu_navi31_fw_table);
+
+/// Navi31 MP0/MP1 bases + SMU driver-IF version, resolved from a
+/// synthetic discovery blob. The static `Family::mp0_base()` stays
+/// `None` for Navi3 by design (discovery-sourced); the device-level
+/// resolution is what the bring-up actually uses — and the MP1 window
+/// is 0 here, not Phoenix's 1 (`mp_13_0_0_offset.h` puts the C2PMSG
+/// registers at `BASE_IDX 0`).
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+fn smoke_amdgpu_navi31_mp0_mp1_bases() -> TestResult {
+    use crate::amdgpu::{AMD_VENDOR, NAVI31, PHOENIX_HAWKPOINT1};
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_GC, HW_ID_MP0, HW_ID_MP1, MAX_BASE_ADDRS};
+    fn block(hw_id: u16, v: (u8, u8, u8), bases: [u32; MAX_BASE_ADDRS], n: u8) -> IpBlock {
+        IpBlock {
+            hw_id,
+            instance: 0,
+            major: v.0,
+            minor: v.1,
+            revision: v.2,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: bases,
+            num_bases: n,
+        }
+    }
+    let mut mp0_bases = [0u32; MAX_BASE_ADDRS];
+    mp0_bases[0] = 0x0001_1000;
+    let mut mp1_bases = [0u32; MAX_BASE_ADDRS];
+    mp1_bases[0] = 0x0001_2000; // window 0: the 13.0.0 mailbox window
+    mp1_bases[1] = 0x0001_3000; // window 1: Phoenix's mailbox window
+    let mut gpu = crate::amdgpu_gfx_navi22::tests::gpu();
+    gpu.chip = match crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, NAVI31) {
+        Some(chip) => chip,
+        None => return TestResult::Fail("NAVI31 must be in the probe table"),
+    };
+    gpu.ip_blocks = alloc::vec![
+        block(HW_ID_GC, (11, 0, 0), [0u32; MAX_BASE_ADDRS], 1),
+        block(HW_ID_MP0, (13, 0, 0), mp0_bases, 1),
+        block(HW_ID_MP1, (13, 0, 0), mp1_bases, 2),
+    ];
+    if gpu.is_apu() {
+        return TestResult::Fail("Navi31 GC 11.0.0 must read as discrete");
+    }
+    if gpu.mp0_base() != Some(0x0001_1000) {
+        return TestResult::Fail("Navi31 mp0_base must resolve from discovery");
+    }
+    if gpu.mp1_base() != Some(0x0001_2000) {
+        return TestResult::Fail("Navi31 mp1_base must be window 0");
+    }
+    if gpu.mp1_mailbox_base() != Some(0x0001_2000) {
+        return TestResult::Fail("Navi31 mailbox must be MP1 window 0, not Phoenix window 1");
+    }
+    if gpu.expected_smu_driver_if_version() != Some(0x3D) {
+        return TestResult::Fail("Navi31 driver-IF version must be SMU 13.0.0 0x3D");
+    }
+    // Same discovery shape, Phoenix chip: mailbox moves to window 1
+    // and the driver-IF version is 13.0.4's — the window split is real.
+    gpu.chip = match crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, PHOENIX_HAWKPOINT1) {
+        Some(chip) => chip,
+        None => return TestResult::Fail("Phoenix must be in the probe table"),
+    };
+    if let Some(gc) = gpu.ip_blocks.iter_mut().find(|b| b.hw_id == HW_ID_GC) {
+        (gc.major, gc.minor, gc.revision) = (11, 0, 1);
+    }
+    if !gpu.is_apu() {
+        return TestResult::Fail("Phoenix GC 11.0.1 must read as an APU");
+    }
+    if gpu.mp1_mailbox_base() != Some(0x0001_3000) {
+        return TestResult::Fail("Phoenix mailbox must stay MP1 window 1");
+    }
+    if gpu.expected_smu_driver_if_version() != Some(0x07) {
+        return TestResult::Fail("Phoenix driver-IF version must stay 0x07");
+    }
+    // Navi22 (discrete, SMU11 owner): no shared-path SMU bring-up.
+    gpu.chip = match crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, crate::amdgpu::NAVI22) {
+        Some(chip) => chip,
+        None => return TestResult::Fail("Navi22 must be in the probe table"),
+    };
+    // Reset the GC version to Navi22's own: the Phoenix leg above set
+    // (11, 0, 1), and `is_apu()` is discovery-driven — leaving the
+    // Phoenix GC in place makes this discrete leg read as an APU and
+    // take the shared mailbox path. (10, 3, 2) is Navi22's GC version
+    // per `amdgpu_rdna2::NAVI22`.
+    if let Some(gc) = gpu.ip_blocks.iter_mut().find(|b| b.hw_id == HW_ID_GC) {
+        (gc.major, gc.minor, gc.revision) = (10, 3, 2);
+    }
+    if gpu.is_apu() {
+        return TestResult::Fail("Navi22 GC 10.3.2 must read as discrete");
+    }
+    if gpu.mp1_mailbox_base().is_some() || gpu.expected_smu_driver_if_version().is_some() {
+        return TestResult::Fail("Navi22 must not take the shared SMU bring-up path");
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "amdgpu", feature = "kernel-test"))]
+kernel_test_in!("drivers/gpu/amdgpu/smu", smoke_amdgpu_navi31_mp0_mp1_bases);
 
 // ── DMA-buf smokes ────────────────────────────────────────────────────
 

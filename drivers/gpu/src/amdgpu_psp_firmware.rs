@@ -1,4 +1,4 @@
-//! PSP 11/14 signed SOS containers (Linux `amdgpu_ucode.h` and
+//! PSP 11/13/14 signed SOS containers (Linux `amdgpu_ucode.h` and
 //! `amdgpu_psp.c::psp_init_sos_microcode`). Offsets are payload-relative.
 //! Parsing checks structure only; the firmware registry and PSP authenticate
 //! the image. No untrusted descriptor becomes an MMIO address.
@@ -8,6 +8,20 @@ pub const PSP14_0_2_SOS: &str = "amdgpu/psp_14_0_2_sos.bin";
 pub const PSP14_0_3_SOS: &str = "amdgpu/psp_14_0_3_sos.bin";
 /// `psp_init_sos_microcode` on an `amdgpu_is_kicker_fw` board.
 pub const PSP14_0_3_SOS_KICKER: &str = "amdgpu/psp_14_0_3_sos_kicker.bin";
+/// PSP 13.0.0 (Navi31, MP0 13.0.0) SOS container.
+/// `psp_v13_0.c` `MODULE_FIRMWARE`, `IP_VERSION(13, 0, 0)` arm of
+/// `psp_v13_0_init_microcode` (SOS + TA, no TOC).
+pub const PSP13_0_0_SOS: &str = "amdgpu/psp_13_0_0_sos.bin";
+/// PSP 13.0.0 SOS container for an `amdgpu_is_kicker_fw` board.
+/// Same `psp_v13_0.c` `MODULE_FIRMWARE` list; which Navi31 boards
+/// take the kicker variant is UNRESOLVED (see `amdgpu_psp13`).
+pub const PSP13_0_0_SOS_KICKER: &str = "amdgpu/psp_13_0_0_sos_kicker.bin";
+/// PSP 13.0.0 trusted application.
+/// `psp_v13_0.c` `MODULE_FIRMWARE`, loaded by
+/// `psp_init_ta_microcode` for `IP_VERSION(13, 0, 0)`.
+pub const PSP13_0_0_TA: &str = "amdgpu/psp_13_0_0_ta.bin";
+/// PSP 13.0.0 TA for an `amdgpu_is_kicker_fw` board.
+pub const PSP13_0_0_TA_KICKER: &str = "amdgpu/psp_13_0_0_ta_kicker.bin";
 pub const STAGING_SIZE: usize = 1024 * 1024; // linux: PSP_1_MEG
 const MAX_CONTAINER: usize = 8 * STAGING_SIZE; // linux: n/a (NARF bound)
 
@@ -60,6 +74,23 @@ impl<'a> Image<'a> {
     /// including non-boot TOC/RL/alternate images, must lie in the payload and
     /// not overlap. v1.2's reserved descriptor is deliberately ignored.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_v1(bytes, [11, 0, 0, 0])
+    }
+    /// Accept PSP 13.0.0 SOS containers: the same v1.0–v1.3 header layout
+    /// Linux parses in `psp_init_sos_microcode` (`header_version_major == 1`
+    /// selects the v1 path for every MP0 13.0.x part), with the common
+    /// header's IP version at 13.0.0 instead of 11.0.0. The container
+    /// layout is identical — only the IP version differs — so the v1
+    /// parser is shared; `parse` still rejects a 13.0.0 blob and this
+    /// still rejects an 11.0.0 one. Wired to the Navi31 PSP boot owner
+    /// by the PSP13 lane; the SOS/TA names live in `amdgpu_psp13`.
+    pub fn parse_psp13(bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_v1(bytes, [13, 0, 0, 0])
+    }
+    /// Shared v1 container parser. `ip` is the common header's IP version
+    /// (`bytes[12..16]`): `[11, 0, 0, 0]` for PSP11, `[13, 0, 0, 0]` for
+    /// PSP13. PSP14 uses the v2.0 descriptor table (`parse_psp14`) instead.
+    fn parse_v1(bytes: &'a [u8], ip: [u8; 4]) -> Result<Self, Error> {
         // linux-lit: 44=sizeof(struct psp_firmware_header_v1_0)
         if bytes.len() < 44 || bytes.len() > MAX_CONTAINER {
             return Err(Error::Invalid);
@@ -67,7 +98,7 @@ impl<'a> Image<'a> {
         // linux-lit: 10=offsetof(struct common_firmware_header, header_version_minor)
         let minor = u16::from_le_bytes([bytes[10], bytes[11]]);
         // linux-lit: 8=offsetof(struct common_firmware_header, header_version_major); 12=offsetof(struct common_firmware_header, ip_version_major)
-        if bytes[8..10] != [1, 0] || minor > 3 || bytes[12..16] != [11, 0, 0, 0] {
+        if bytes[8..10] != [1, 0] || minor > 3 || bytes[12..16] != ip {
             return Err(Error::Unsupported);
         }
         let header_size = match minor {
