@@ -115,7 +115,6 @@ fn strix_dcn35_profile_resolves() -> TestResult {
         return TestResult::Fail("DCN 3.5 did not resolve");
     };
     if profile != Profile::Dcn35
-        || !profile.is_dcn35()
         || profile.is_dcn32()
         || profile.is_dcn314()
         || (profile.pipes(), profile.streams(), profile.channels()) != (4, 5, 5)

@@ -411,7 +411,6 @@ mod tests {
             return TestResult::Fail("DCN 3.5 did not resolve");
         };
         if profile != Profile::Dcn35
-            || !profile.is_dcn35()
             || profile.is_dcn32()
             || profile.is_dcn314()
             || (profile.pipes(), profile.streams(), profile.channels()) != (4, 5, 5)
@@ -481,11 +480,6 @@ impl Profile {
     /// generator touches, so its OTG layout shift is 0 like Dcn314's.
     pub fn is_dcn32(self) -> bool {
         matches!(self, Self::Dcn320 | Self::Dcn321)
-    }
-    /// Whether this profile is the DCN 3.5 one (Strix). Its OTG layout
-    /// differs from 3.1.4's in the piecewise shift `layout_shift` applies.
-    pub fn is_dcn35(self) -> bool {
-        self == Self::Dcn35
     }
     pub fn has_plane_power_gating(self) -> bool {
         self != Self::Dcn303
