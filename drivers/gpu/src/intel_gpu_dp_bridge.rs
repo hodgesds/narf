@@ -6,7 +6,8 @@
 //! DDI). Per VESA DP Alt Mode v2.0 §6 and Tiger Lake / Alder Lake
 //! PRM Vol. 12 §"DDI Buffer", the source side does:
 //!
-//! 1. Map USB-C connector → DDI (TC1..TC6 → Ddi::D..I on Gen12).
+//! 1. Map USB-C connector → DDI (TC1..TC6 → Ddi::D..I on Gen12,
+//!    TC1..TC4 → Ddi::C..F on Ice Lake).
 //! 2. Bind a Pipe + Transcoder to that DDI.
 //! 3. Open an AUX channel — DPCD reads now flow over the USB-C aux
 //!    pins. EDID over I²C-over-AUX gives the sink's preferred mode.
@@ -24,6 +25,9 @@
 //! - Tiger Lake and Alder Lake-P/N use their own banked Dekel PLL, clock
 //!   routing and TX presets. Negotiation respects the PD lane limit and
 //!   source training patterns/levels track the shared sink algorithm.
+//! - Ice Lake drives its MG PHYs: the FIA ownership handshake
+//!   (`icl_tc_phy_connect`), the MG PLL and levels through the Gen11
+//!   modeset, and the handshake's release on detach.
 //!
 //! ## USB-C connector → DDI mapping
 //!
@@ -48,17 +52,25 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::dp_edid::read_panel_edid;
 use crate::intel_gpu;
-use crate::intel_gpu_aux::{IntelAux, MmioWindow};
+use crate::intel_gpu_aux::{IntelAux, MmioWindow, SourceFamily};
 use crate::intel_gpu_ddi::Ddi;
+use crate::intel_gpu_gen11_mg_phy::{MgPort, TcMode};
 use crate::intel_gpu_gen12_tc::DklPort;
 use crate::intel_gpu_gtt::ContiguousScanout;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, Modeset, ModesetError, PixelFormat};
 use crate::intel_gpu_multipipe::{self, PipeOwner, PipeUse};
 use crate::intel_gpu_pipes::Pipe;
 
+/// The Type-C PHY a session owns: Gen12's Dekel port or Ice Lake's MG port.
+#[derive(Copy, Clone, Debug)]
+enum BridgePort {
+    Dekel(DklPort),
+    Mg(MgPort),
+}
+
 #[derive(Copy, Clone, Debug)]
 struct BridgeSession {
-    port: DklPort,
+    port: BridgePort,
     bar: u64,
     pipe: Option<Pipe>,
     publication_serial: u64,
@@ -93,6 +105,45 @@ pub fn connector_to_ddi(connector: ConnectorId) -> Option<Ddi> {
     }
 }
 
+/// [`connector_to_ddi`] for `family`: Gen12's TC1..TC6 → D..I, Ice Lake's
+/// TC1..TC4 → C..F (`icl_display`: PORT_C..PORT_F are TC_PORT_1..4). Other
+/// sources have no Type-C ports for this bridge.
+pub fn connector_to_ddi_for(family: SourceFamily, connector: ConnectorId) -> Option<Ddi> {
+    match family {
+        SourceFamily::Gen12(_) => connector_to_ddi(connector),
+        SourceFamily::Gen11(crate::intel_gpu_gt::Gen11Platform::IceLake) => {
+            match connector.as_u32() {
+                0 => Some(Ddi::C),
+                1 => Some(Ddi::D),
+                2 => Some(Ddi::E),
+                3 => Some(Ddi::F),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The source this bridge drives on `chip`: a Gen12 family, or Ice Lake.
+fn bridge_family(chip: crate::intel_gpu::ChipInfo) -> Option<SourceFamily> {
+    if let Some(family) = crate::intel_gpu_modeset::gen12_family_for_chip(chip) {
+        return Some(SourceFamily::Gen12(family));
+    }
+    match crate::intel_gpu_gt::GtPlatform::from_pci(chip.vid, chip.did) {
+        Some(crate::intel_gpu_gt::GtPlatform::Gen11(
+            platform @ crate::intel_gpu_gt::Gen11Platform::IceLake,
+        )) => Some(SourceFamily::Gen11(platform)),
+        _ => None,
+    }
+}
+
+/// The ddi a probed controller maps `connector` to.
+fn probed_ddi(connector: ConnectorId) -> Option<Ddi> {
+    intel_gpu::with_display_info(|gpu| bridge_family(gpu.chip))
+        .flatten()
+        .and_then(|family| connector_to_ddi_for(family, connector))
+}
+
 // ── MMIO adapter ─────────────────────────────────────────────────
 
 /// Adapter that lets [`IntelAux`] / [`Modeset`] (which want an
@@ -103,7 +154,7 @@ pub fn connector_to_ddi(connector: ConnectorId) -> Option<Ddi> {
 /// for the whole driver lifetime.
 struct MmioRegionWindow<'a> {
     region: &'a MmioRegion,
-    family: crate::intel_gpu_gt::Gen12Platform,
+    family: SourceFamily,
     /// Tiger Lake UY (GT2) part, from the owning chip's PCI
     /// device ID — carried so a `Modeset` built over this
     /// window selects the UY HBR2 table on combo DDIs (the
@@ -114,11 +165,7 @@ struct MmioRegionWindow<'a> {
 }
 
 impl<'a> MmioRegionWindow<'a> {
-    fn new(
-        region: &'a MmioRegion,
-        family: crate::intel_gpu_gt::Gen12Platform,
-        tgl_uy: bool,
-    ) -> Self {
+    fn new(region: &'a MmioRegion, family: SourceFamily, tgl_uy: bool) -> Self {
         Self {
             region,
             family,
@@ -129,7 +176,13 @@ impl<'a> MmioRegionWindow<'a> {
 
 impl<'a> MmioWindow for MmioRegionWindow<'a> {
     fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
-        Some(self.family)
+        self.family.gen12()
+    }
+    fn gen11_display_platform(&self) -> Option<crate::intel_gpu_gt::Gen11Platform> {
+        match self.family {
+            SourceFamily::Gen11(platform) => Some(platform),
+            _ => None,
+        }
     }
     fn tgl_uy(&self) -> bool {
         self.tgl_uy
@@ -163,19 +216,18 @@ impl DpAltModeGpuBridge for IntelDpBridge {
     }
 
     fn enter_dp_mode(&self, cfg: &DpLinkConfig) -> Result<(), DpBridgeError> {
-        // Resolve the DDI for this USB-C connector. If the index
-        // doesn't fit our Type-C mapping, pass — another bridge
-        // (amdgpu / nvidia) might own this connector.
-        let Some(ddi) = connector_to_ddi(cfg.connector) else {
-            return Err(DpBridgeError::NoSuchConnector);
-        };
-
         // Need a live Intel iGPU controller. If we're on a non-Intel
         // platform, defer to the next bridge in the registry by
         // signalling "no connector here".
         if !intel_gpu::is_probed() {
             return Err(DpBridgeError::NoSuchConnector);
         }
+        // Resolve the DDI for this USB-C connector on the probed source.
+        // If the index doesn't fit its Type-C mapping, pass — another
+        // bridge (amdgpu / nvidia) might own this connector.
+        let Some(ddi) = probed_ddi(cfg.connector) else {
+            return Err(DpBridgeError::NoSuchConnector);
+        };
 
         let display =
             intel_gpu::with_controller(|gpu| crate::intel_gpu_kms::display_for_bar(&gpu.gtt_mmadr))
@@ -199,7 +251,7 @@ impl DpAltModeGpuBridge for IntelDpBridge {
     }
 
     fn exit_dp_mode(&self, connector: ConnectorId) -> Result<(), DpBridgeError> {
-        let Some(ddi) = connector_to_ddi(connector) else {
+        let Some(ddi) = probed_ddi(connector) else {
             return Ok(());
         };
         if SESSIONS.try_lock().ok_or(DpBridgeError::NotReady)?[ddi as usize].is_none() {
@@ -230,13 +282,12 @@ impl IntelDpBridge {
         if !gpu.chip.generation.external_display_supported() {
             return Err(DpBridgeError::NoSuchConnector);
         }
-        let family = crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip)
-            .ok_or(DpBridgeError::NoSuchConnector)?;
+        let family = bridge_family(gpu.chip).ok_or(DpBridgeError::NoSuchConnector)?;
         let publication_serial =
             intel_gpu::next_external_scanout_serial().ok_or(DpBridgeError::NotReady)?;
         use core::fmt::Write as _;
-        // Pre-GMD generations (Gen11) have no GMD_ID; the bridge
-        // itself is Gen12-only, so this is a display-only path.
+        // Pre-GMD generations (Gen12, Ice Lake) have no GMD_ID; this is a
+        // display-only path.
         let gmd = match gpu.gmd_id {
             Some(v) => alloc::format!("{v:#010x}"),
             None => alloc::string::String::from("none"),
@@ -261,7 +312,14 @@ impl IntelDpBridge {
         if !matches!(cfg.lanes, 2 | 4) {
             return Err(DpBridgeError::ModesetFailed);
         }
-        let port = DklPort::new(&mmio, ddi).map_err(|_| DpBridgeError::NoSuchConnector)?;
+        let port = match family {
+            SourceFamily::Gen11(platform) => BridgePort::Mg(
+                MgPort::new(ddi, platform).map_err(|_| DpBridgeError::NoSuchConnector)?,
+            ),
+            _ => BridgePort::Dekel(
+                DklPort::new(&mmio, ddi).map_err(|_| DpBridgeError::NoSuchConnector)?,
+            ),
+        };
         {
             let mut sessions = SESSIONS.try_lock().ok_or(DpBridgeError::NotReady)?;
             if sessions[ddi as usize].is_some() {
@@ -274,9 +332,17 @@ impl IntelDpBridge {
                 publication_serial,
             });
         }
-        let assigned_lanes = port
-            .acquire_dp_alt(&mmio, gpu.gtt_mmadr.phys.raw())
-            .map_err(|_| DpBridgeError::NotReady)?;
+        // Ice Lake: claim the PHY from the FIA once its live state says
+        // DP-alt (`icl_tc_phy_connect`); any lane count the pin assignment
+        // carries is accepted here and bounded by the PD lanes below.
+        let assigned_lanes = match port {
+            BridgePort::Dekel(port) => port
+                .acquire_dp_alt(&mmio, gpu.gtt_mmadr.phys.raw())
+                .map_err(|_| DpBridgeError::NotReady)?,
+            BridgePort::Mg(port) => port
+                .connect(&mmio, TcMode::DpAlt, 1)
+                .map_err(|_| DpBridgeError::NotReady)?,
+        };
         let max_lanes = cfg.lanes.min(assigned_lanes);
 
         // Try an EDID readback over AUX. AUX may not yet be reachable
@@ -344,6 +410,7 @@ impl IntelDpBridge {
         // machine, the pipe gets its DBUF share and the pipes
         // already live are reprogrammed to theirs.
         let mut modeset = Modeset::for_pipe(&mmio, ddi, pipe);
+        modeset.set_source_family(family);
         modeset.set_typec_width(max_lanes);
         let active = intel_gpu_multipipe::active_pipes();
         if active.len() >= 2 {
@@ -358,7 +425,7 @@ impl IntelDpBridge {
                     .map_err(|_| ModesetError::EdidUnavailable)
                     .and_then(|caps| {
                         let source = crate::dp_link_training::SourceCaps {
-                            max_rate: crate::dp_link_training::LinkRate::Hbr3,
+                            max_rate: crate::intel_gpu_dp::source_caps(Some(family), ddi).max_rate,
                             max_lanes,
                         };
                         let plan = crate::dp_link_training::negotiate(
@@ -399,7 +466,8 @@ impl IntelDpBridge {
                 // unreachable AUX (or a non-capable sink) clears the
                 // stored range/timings, so no stale timings can ever
                 // engage VRR for an unknown sink.
-                if pipe == crate::intel_gpu_pipes::Pipe::A {
+                // VRR is Gen12's (Ice Lake has none).
+                if let (crate::intel_gpu_pipes::Pipe::A, Some(family)) = (pipe, family.gen12()) {
                     let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(family);
                     let range = crate::intel_gpu_dp::vrr_range_from_aux(&mmio, ddi);
                     // VRR readback/sanitize at modeset setup (#1772):
@@ -481,26 +549,32 @@ fn stop_session(gpu: &intel_gpu::DisplayInfo, ddi: Ddi) -> Result<(), DpBridgeEr
     if session.bar != gpu.gtt_mmadr.phys.raw() {
         return Err(DpBridgeError::NotReady);
     }
-    let family =
-        crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).ok_or(DpBridgeError::NotReady)?;
+    let family = bridge_family(gpu.chip).ok_or(DpBridgeError::NotReady)?;
     let io = MmioRegionWindow::new(
         &gpu.gtt_mmadr,
         family,
         crate::intel_gpu_gen12_combo_phy::is_tgl_uy(gpu.chip.did),
     );
     if let Some(pipe) = session.pipe {
-        Modeset::for_pipe(&io, ddi, pipe)
+        let mut modeset = Modeset::for_pipe(&io, ddi, pipe);
+        modeset.set_source_family(family);
+        modeset
             .try_teardown()
             .map_err(|_| DpBridgeError::ModesetFailed)?;
     }
-    session
-        .port
-        .disable(&io)
-        .map_err(|_| DpBridgeError::ModesetFailed)?;
-    session
-        .port
-        .disconnect(&io, session.bar)
-        .map_err(|_| DpBridgeError::ModesetFailed)?;
+    match session.port {
+        BridgePort::Dekel(port) => {
+            port.disable(&io)
+                .map_err(|_| DpBridgeError::ModesetFailed)?;
+            port.disconnect(&io, session.bar)
+                .map_err(|_| DpBridgeError::ModesetFailed)?;
+        }
+        BridgePort::Mg(port) => {
+            port.disable(&io)
+                .map_err(|_| DpBridgeError::ModesetFailed)?;
+            port.disconnect(&io, TcMode::DpAlt);
+        }
+    }
     if let Some(pipe) = session.pipe {
         intel_gpu_multipipe::release_pipe(pipe, ddi);
     }
@@ -620,6 +694,42 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_dp_bridge",
         smoke_connector_to_ddi_maps_tc1_through_tc6
+    );
+
+    /// Ice Lake's TC1..TC4 are DDI C..F; EHL/JSL and Gen9 have no Type-C
+    /// connectors for the bridge.
+    fn smoke_connector_to_ddi_for_ice_lake() -> TestResult {
+        use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, Gen9Platform};
+        let icl = SourceFamily::Gen11(Gen11Platform::IceLake);
+        for (idx, want) in [(0, Ddi::C), (1, Ddi::D), (2, Ddi::E), (3, Ddi::F)] {
+            if super::connector_to_ddi_for(icl, ConnectorId::from_index(idx)) != Some(want) {
+                return TestResult::Fail("Ice Lake TC1..TC4 must map to DDI C..F");
+            }
+        }
+        let tgl = SourceFamily::Gen12(Gen12Platform::TigerLake);
+        if super::connector_to_ddi_for(icl, ConnectorId::from_index(4)).is_some()
+            || super::connector_to_ddi_for(tgl, ConnectorId::from_index(0)) != Some(Ddi::D)
+            || super::connector_to_ddi_for(
+                SourceFamily::Gen11(Gen11Platform::ElkhartLake),
+                ConnectorId::from_index(0),
+            )
+            .is_some()
+            || super::connector_to_ddi_for(
+                SourceFamily::Gen9 {
+                    platform: Gen9Platform::KabyLake,
+                    sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+                },
+                ConnectorId::from_index(0),
+            )
+            .is_some()
+        {
+            return TestResult::Fail("only Gen12 and Ice Lake have bridge connectors");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp_bridge",
+        smoke_connector_to_ddi_for_ice_lake
     );
 
     fn smoke_connector_to_ddi_unmaps_out_of_range() -> TestResult {
