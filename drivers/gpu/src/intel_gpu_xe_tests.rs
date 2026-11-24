@@ -2175,13 +2175,14 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
             let query_file = RenderFile::new();
             let query_user = Cpu::new();
             let config = xe_query(&query_file, &info, &query_user, 2);
-            assert_eq!(u64_at(&config, 16), 2); // low latency only; no VRAM/USM/compression
-            for flags in [2, 8] {
-                assert_eq!(
-                    create_placed(&query_file, &info, &query_user, 4096, 1, flags, 1),
-                    Err(FsError::InvalidData)
-                );
-            }
+            // Low latency and, as on every graphics 20+ part, the
+            // NO_COMPRESSION hint; no VRAM/USM.
+            assert_eq!(u64_at(&config, 16), 10);
+            assert_eq!(
+                create_placed(&query_file, &info, &query_user, 4096, 1, 2, 1),
+                Err(FsError::InvalidData)
+            );
+            assert!(create_placed(&query_file, &info, &query_user, 4096, 1, 8, 1).is_ok());
             assert_eq!(
                 create_placed(&query_file, &info, &query_user, 4096, 2, 0, 1),
                 Err(FsError::InvalidData)

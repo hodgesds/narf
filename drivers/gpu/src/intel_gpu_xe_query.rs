@@ -198,7 +198,8 @@ fn query_wire(
             if crate::intel_gpu_xe::low_latency_supported(info) {
                 config_flags |= crate::intel_gpu_xe_uapi::QUERY_CONFIG_HAS_LOW_LATENCY;
             }
-            if info.platform.is_xe2() && !info.platform.is_xe3_lpg() {
+            // DRM_XE_QUERY_CONFIG_FLAG_HAS_NO_COMPRESSION_HINT: graphics 20+.
+            if info.platform.is_xe2() {
                 config_flags |= 8;
             }
             if info.vram.is_some() {

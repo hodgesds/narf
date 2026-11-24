@@ -394,14 +394,20 @@ impl XeFile {
                     crate::intel_gpu_gt::GtPlatform::NovaLakeS => 0,
                 };
                 // xe_gem_create_ioctl's EINVAL classes, then refused features.
+                // NO_COMPRESSION (8) is a known flag everywhere, honoured on
+                // graphics 20+ (no compressed PAT is ever programmed) and
+                // EOPNOTSUPP below.
                 if size == 0
                     || size % 4096 != 0
                     || placement == 0
                     || placement & !regions != 0
-                    || flags & !supported_flags != 0
+                    || flags & !(supported_flags | 8) != 0
                     || (flags & 4 != 0 && placement & 2 == 0)
                 {
                     return Err(FsError::InvalidData);
+                }
+                if flags & 8 != 0 && !info.platform.is_xe2() {
+                    return Err(FsError::Unsupported);
                 }
                 let caching = u16::from_le_bytes(wire[32..34].try_into().unwrap());
                 // VRAM needs WC, and scanout is never coherent with WB.

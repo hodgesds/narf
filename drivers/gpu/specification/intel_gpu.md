@@ -3218,9 +3218,10 @@ Tile4 reach the presenter and its PLANE_CTL never sets decompression.
 Xe `SCANOUT` at creation. `DRM_XE_GEM_CREATE_FLAG_SCANOUT` is admitted on
 the display-preserving profile (`UserBackend::display_preserving`) as
 xe_bo.c::xe_gem_create_ioctl takes it: a WC system object marked for
-scanout, EINVAL with WB caching. Headless LNL and PTL keep refusing it, and
-`NO_COMPRESSION` stays refused; the bind layer never admits a compressed
-PAT on Xe2.
+scanout, EINVAL with WB caching. Headless LNL and PTL keep refusing it.
+`NO_COMPRESSION` is admitted on every graphics 20+ part, which also
+advertises `HAS_NO_COMPRESSION_HINT`, and is EOPNOTSUPP below, as in Linux;
+the hint always holds, since the bind layer never admits a compressed PAT.
 
 DC service. KMS install creates the DC service for display 20
 (`intel_gpu_dc_states::service_profile`) under `DmcPlatform::Xe2Lpd`: after
