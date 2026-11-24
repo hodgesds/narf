@@ -1699,8 +1699,9 @@ pub mod tests {
             return TestResult::Fail("another Gen9 engine's ELSP was rung");
         }
         // The image carries Gen9 VCS0's own register
-        // addresses, the Gen9 context-control value (0xF0008)
-        // and the ring placement.
+        // addresses, the Gen9 context-control value (0xF0008,
+        // with restore inhibited until its first save) and the
+        // ring placement.
         let image = rig
             .registry
             .borrow()
@@ -1711,7 +1712,7 @@ pub mod tests {
         if mem_rd(&image, rs + (CTX_RING_BUFFER_START as u64) * 4) != 0x12038
             || mem_rd(&image, rs + ((CTX_RING_BUFFER_START + 1) as u64) * 4)
                 != GGTT_ARENA_BASE + 0x5000
-            || mem_rd(&image, rs + ((CTX_CONTEXT_CONTROL + 1) as u64) * 4) != 0x000F_0008
+            || mem_rd(&image, rs + ((CTX_CONTEXT_CONTROL + 1) as u64) * 4) != 0x000F_0009
         {
             return TestResult::Fail("Gen9 image template addresses");
         }

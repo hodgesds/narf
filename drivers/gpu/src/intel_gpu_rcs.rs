@@ -2505,6 +2505,10 @@ struct RcsContext<A: GpuAllocator> {
     /// raw attachment's caller owns its tables; `submit_resident` instead
     /// retains their owner in the request through verified retirement.
     ppgtt_root: Option<u64>,
+    /// The image holds hardware-saved engine state. Gen9/Gen11 contexts
+    /// start with restore inhibited (Linux `init_common_regs` with no
+    /// default image) and clear it once their first request retires.
+    restore_valid: bool,
 }
 
 impl<A: GpuAllocator> core::fmt::Debug for RcsContext<A> {
@@ -2590,6 +2594,9 @@ pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
     spurious_csb: u32,
     next_sw_id: u16,
     completion_lost: bool,
+    /// Gen9's engine-wide indirect-context workaround batch and the GT
+    /// scratch page it saves `GEN8_L3SQCREG4` into ([`Self::install_gen9_wa_bb`]).
+    wa_bb: Option<(A::Backing, A::Backing, u32)>,
 }
 
 impl<M: MmioWindow, A: GpuAllocator> core::fmt::Debug for RcsEngine<M, A> {
@@ -2661,7 +2668,38 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             spurious_csb: 0,
             next_sw_id: 1,
             completion_lost: false,
+            wa_bb: None,
         })
+    }
+
+    /// `lrc_init_wa_ctx` for Gen9 RCS: build [`gen9_init_indirectctx_bb`]
+    /// once per engine in a GGTT page, against a GT scratch page (the
+    /// coherent-L3 save dword at scratch + 256), and point every context
+    /// created afterwards at it ([`setup_gen9_indirect_ctx`]). Big-core
+    /// Gen9 has no pooled EUs (`WaMediaPoolStateCmdInWABB` is BXT/GLK).
+    /// Other generations and engines take no batch.
+    pub fn install_gen9_wa_bb(&mut self) -> Result<(), SubmitError> {
+        if !matches!(self.generation, crate::intel_gpu::Generation::Skylake)
+            || self.spec.class != EngineClass::Render
+            || self.wa_bb.is_some()
+        {
+            return Ok(());
+        }
+        let scratch = self.alloc.alloc(1)?;
+        let bb = match self.alloc.alloc(1) {
+            Ok(bb) => bb,
+            Err(error) => {
+                self.alloc.free(scratch);
+                return Err(error);
+            }
+        };
+        let mut words = [MI_NOOP; GEN9_INDIRECT_CTX_BB_DWORDS];
+        let n = gen9_init_indirectctx_bb(&mut words, false, scratch.ggtt_offset() + 256);
+        for (i, word) in words[..n].iter().enumerate() {
+            bb.write32(i as u64 * 4, *word);
+        }
+        self.wa_bb = Some((scratch, bb, n as u32 * 4));
+        Ok(())
     }
 
     /// `reset_csb_pointers`: after an engine reset the hardware writes CSB
@@ -2790,12 +2828,21 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 return Err(e);
             }
         };
-        let template = build_reg_state_for_generation(
+        let mut template = build_reg_state_for_generation(
             &self.spec,
             ring_mem.ggtt_offset(),
             RING_BYTES,
             self.generation,
         );
+        if let Some((_, bb, bytes)) = &self.wa_bb {
+            setup_gen9_indirect_ctx(&mut template, bb.ggtt_offset(), *bytes);
+        }
+        // No default image: the first load must not restore engine state
+        // from an image the hardware never saved.
+        let restore_valid = !gen8_csb(self.generation);
+        if !restore_valid {
+            template[CTX_CONTEXT_CONTROL + 1] |= 1;
+        }
         for (i, dw) in template.iter().enumerate() {
             image.write32(REG_STATE_PAGE_BYTE + (i as u64) * 4, *dw);
         }
@@ -2820,6 +2867,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             next_seqno: 1,
             last_completed_seqno: 0,
             ppgtt_root: None,
+            restore_valid,
         });
         Ok(ContextId::pack(slot as u32, generation))
     }
@@ -3442,6 +3490,13 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 .image
                 .read32(REG_STATE_PAGE_BYTE + ((CTX_RING_HEAD + 1) as u64) * 4);
             ctx.ring.head = saved_head & (RING_BYTES - 1);
+            if !ctx.restore_valid {
+                // The hardware has saved this context once: later loads
+                // restore it.
+                let control = REG_STATE_PAGE_BYTE + ((CTX_CONTEXT_CONTROL + 1) as u64) * 4;
+                ctx.image.write32(control, ctx.image.read32(control) & !1);
+                ctx.restore_valid = true;
+            }
             for r in &batches {
                 ctx.last_completed_seqno = r.seqno;
             }
@@ -3488,6 +3543,10 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             self.alloc.free(ctx.image);
             self.alloc.free(ctx.ring_mem);
             self.alloc.free(ctx.hwsp);
+        }
+        if let Some((scratch, bb, _)) = self.wa_bb.take() {
+            self.alloc.free(bb);
+            self.alloc.free(scratch);
         }
         self.alloc.free(self.status);
     }
@@ -6053,5 +6112,57 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_rcs",
         smoke_legacy_resident_batch_and_context_setup
+    );
+
+    /// A fresh Gen9/Gen11 context loads with restore inhibited and clears it
+    /// after its first save; Gen9 contexts point at the engine's indirect
+    /// workaround batch. Gen12 is untouched.
+    fn smoke_legacy_context_restore_inhibit_and_wa_bb() -> TestResult {
+        let control = REG_STATE_PAGE_BYTE + ((CTX_CONTEXT_CONTROL + 1) as u64) * 4;
+        let indirect = REG_STATE_PAGE_BYTE + ((GEN11_CTX_RCS_INDIRECT_CTX + 1) as u64) * 4;
+        let skl = crate::intel_gpu::Generation::Skylake;
+        let (mut engine, mut hw) = make_engine_for_generation(skl).unwrap();
+        engine.install_gen9_wa_bb().unwrap();
+        let (bb, bytes) = match &engine.wa_bb {
+            Some((_, bb, bytes)) => (bb.ggtt_offset(), *bytes),
+            None => return TestResult::Fail("Gen9 RCS installs its WA batch"),
+        };
+        let ctx = engine.create_context().unwrap();
+        let image = &engine.context(ctx).unwrap().image;
+        if image.read32(control) != ctx_control_value(skl) | 1
+            || image.read32(indirect) != bb | (bytes / 64)
+            || bytes % 64 != 0
+        {
+            return TestResult::Fail("restore inhibit and the indirect WA pointer");
+        }
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(ctx, batch).unwrap();
+        hw.step();
+        if engine.poll_completions().len() != 1
+            || engine.context(ctx).unwrap().image.read32(control) != ctx_control_value(skl)
+        {
+            return TestResult::Fail("first retirement clears restore inhibit");
+        }
+        // SAFETY: every modelled request completed.
+        unsafe {
+            engine.release_after_reset();
+        }
+        let (mut engine, _hw) = make_engine().unwrap();
+        engine.install_gen9_wa_bb().unwrap();
+        let ctx = engine.create_context().unwrap();
+        if engine.wa_bb.is_some()
+            || engine.context(ctx).unwrap().image.read32(control) != CTX_CONTROL_VALUE
+        {
+            return TestResult::Fail("Gen12 keeps its template");
+        }
+        // SAFETY: nothing was submitted.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_legacy_context_restore_inhibit_and_wa_bb
     );
 }
