@@ -390,6 +390,32 @@ fn legacy_render_request(gen11: bool, start: [u32; 3], address: u64, seqno: u32)
     words
 }
 
+/// One Gen9/Gen11 copy or media request, MIT Linux v6.12
+/// `gen8_engine_cs.c`: `gen8_emit_flush_xcs` with `EMIT_INVALIDATE` (TLB,
+/// plus the BSD cache on video decode, with a store-index write to the
+/// PPHWSP scratch as its command barrier), the no-arbitration
+/// `gen8_emit_bb_start_noarb`, then `gen8_emit_fini_breadcrumb_xcs`'s GGTT
+/// seqno write. Each resident batch brings its own PPGTT, so the TLB
+/// invalidate is what keeps a previous job's translations out.
+fn legacy_xcs_request(video: bool, start: [u32; 3], address: u64, seqno: u32) -> Vec<u32> {
+    // MI_FLUSH_DW (4 dwords) | STORE_INDEX | OP_STOREDW | INVALIDATE_TLB,
+    // plus INVALIDATE_BSD on VCS.
+    let invalidate = 0x1300_0002 | 1 << 21 | 1 << 14 | 1 << 18 | if video { 1 << 7 } else { 0 };
+    let mut words = Vec::with_capacity(14);
+    words.extend_from_slice(&[invalidate, PPHWSP_SCRATCH, 0, 0, MI_ARB_DISABLE]);
+    words.extend_from_slice(&start);
+    // MI_FLUSH_DW | OP_STOREDW, GGTT address (USE_GTT), seqno.
+    words.extend_from_slice(&[
+        0x1300_4002,
+        address as u32 | 4,
+        (address >> 32) as u32,
+        seqno,
+        MI_ARB_CHECK,
+        MI_NOOP,
+    ]);
+    words
+}
+
 /// Encode an `MI_LOAD_REGISTER_IMM` header for `n` register
 /// pairs. `force_posted` sets the posted-write bit the PRM
 /// requires for context-restore batches.
@@ -3137,7 +3163,11 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         } else {
             crate::intel_gpu_gtt::PteFormat::Gen12
         };
-        if batch.format() != format || self.spec.class != EngineClass::Render {
+        // Gen12 resident jobs run on RCS0 here (GuC owns the rest); Gen9 and
+        // Gen11 run every execlists engine this way.
+        if batch.format() != format
+            || (self.spec.class != EngineClass::Render && !gen8_csb(self.generation))
+        {
             return Err(SubmitError::NoEngine);
         }
         let ctx = self.context(id)?;
@@ -3203,6 +3233,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         }
         let request_id = self.next_request_id;
         let render = self.spec.class == EngineClass::Render;
+        let video = self.spec.class == EngineClass::VideoDecode;
         let engine_generation = self.generation;
         let seqno = {
             let ctx = self.context_mut(id)?;
@@ -3215,13 +3246,17 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             let address = ctx.hwsp.ggtt_offset() as u64 + HWSP_SEQNO_BYTE;
             let mut prologue = [MI_NOOP; 16];
             prologue[..3].copy_from_slice(&start);
-            let legacy = (render && gen8_csb(engine_generation)).then(|| {
-                legacy_render_request(
-                    matches!(engine_generation, crate::intel_gpu::Generation::IceLake),
-                    start,
-                    address,
-                    seqno,
-                )
+            let legacy = gen8_csb(engine_generation).then(|| {
+                if render {
+                    legacy_render_request(
+                        matches!(engine_generation, crate::intel_gpu::Generation::IceLake),
+                        start,
+                        address,
+                        seqno,
+                    )
+                } else {
+                    legacy_xcs_request(video, start, address, seqno)
+                }
             });
             let length = if legacy.is_some() {
                 0
@@ -4337,7 +4372,11 @@ pub mod tests {
                         let lo = mem_rd(&ring, ((pos + 4) & mask) as u64) as u64;
                         let hi = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
                         let data = mem_rd(&ring, ((pos + 12) & mask) as u64);
-                        self.write_ggtt((lo & !7) | (hi << 32), data);
+                        // Store-index posts into the context's PPHWSP scratch
+                        // (the Gen9/Gen11 XCS invalidate): no GGTT write.
+                        if dw & (1 << 21) == 0 {
+                            self.write_ggtt((lo & !7) | (hi << 32), data);
+                        }
                         pos = (pos + 16) & mask;
                     }
                     0x31 => {
