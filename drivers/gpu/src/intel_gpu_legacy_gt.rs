@@ -839,6 +839,122 @@ pub(crate) fn gtt_workarounds(gt: LegacyGt) -> WaList {
     w
 }
 
+// ── Topology (`gen9_sseu_info_init` / `gen11_sseu_info_init`) ──────
+
+/// The slice / subslice / EU layout i915 records for these generations and
+/// reports through `DRM_I915_QUERY_TOPOLOGY_INFO` and the SSEU GETPARAMs.
+/// Gen9 big core is three slices of four subslices of eight EUs, each slice
+/// with its own EU fuses; Gen11 one slice of eight (Ice Lake) or four
+/// (Elkhart/Jasper Lake) subslices sharing one EU fuse byte.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LegacyTopology {
+    max_slices: u8,
+    max_subslices: u8,
+    slices: u8,
+    /// Enabled subslices of each slice.
+    subslices: [u8; 3],
+    /// Enabled EUs of each (slice, subslice).
+    eus: [[u8; 8]; 3],
+}
+
+impl LegacyTopology {
+    pub(crate) fn read(platform: WaPlatform, mut read: impl FnMut(u64) -> u32) -> Option<Self> {
+        let mut topology = Self {
+            max_slices: 1,
+            max_subslices: 8,
+            slices: 0,
+            subslices: [0; 3],
+            eus: [[0; 8]; 3],
+        };
+        match platform {
+            WaPlatform::Gen9 { .. } => {
+                topology.max_slices = 3;
+                topology.max_subslices = 4;
+                let fuse2 = read(GEN8_FUSE2);
+                topology.slices = ((fuse2 >> 25) & 0x7) as u8;
+                let subslices = (0xf & !((fuse2 >> 20) & 0xf)) as u8;
+                for s in 0..3 {
+                    if topology.slices & 1 << s == 0 {
+                        continue;
+                    }
+                    topology.subslices[s] = subslices;
+                    let disable = read(GEN9_EU_DISABLE + 4 * s as u64);
+                    for ss in 0..4 {
+                        if subslices & 1 << ss != 0 {
+                            topology.eus[s][ss] = !(disable >> (8 * ss)) as u8;
+                        }
+                    }
+                }
+            }
+            WaPlatform::Gen11 { jsl_ehl, .. } => {
+                topology.max_subslices = if jsl_ehl { 4 } else { 8 };
+                // gen11_compute_sseu_info: slice 0 regardless of the
+                // enable fuse, which i915 only warns about.
+                topology.slices = 1;
+                let valid = (1u32 << topology.max_subslices) - 1;
+                let subslices = (!read(GEN11_GT_SUBSLICE_DISABLE) & valid) as u8;
+                topology.subslices[0] = subslices;
+                let eus = !(read(GEN9_EU_DISABLE) & 0xff) as u8;
+                for ss in 0..usize::from(topology.max_subslices) {
+                    if subslices & 1 << ss != 0 {
+                        topology.eus[0][ss] = eus;
+                    }
+                }
+            }
+        }
+        (topology.slices != 0 && topology.subslices.iter().any(|&m| m != 0)).then_some(topology)
+    }
+
+    /// `I915_PARAM_SLICE_MASK`.
+    pub fn slice_mask(&self) -> u32 {
+        u32::from(self.slices)
+    }
+    /// `I915_PARAM_SUBSLICE_MASK`: the first slice's subslices only.
+    pub fn subslice_mask(&self) -> u32 {
+        u32::from(self.subslices[0])
+    }
+    /// `I915_PARAM_SUBSLICE_TOTAL` (`intel_sseu_subslice_total`).
+    pub fn subslice_total(&self) -> u32 {
+        self.subslices.iter().map(|m| m.count_ones()).sum()
+    }
+    /// `I915_PARAM_EU_TOTAL` (`compute_eu_total`).
+    pub fn eu_total(&self) -> u32 {
+        self.eus.iter().flatten().map(|m| m.count_ones()).sum()
+    }
+
+    /// `fill_topology_info`: the 16-byte header, the slice mask byte, one
+    /// subslice byte per slice and one EU byte per (slice, subslice).
+    pub fn i915_bytes(&self) -> alloc::vec::Vec<u8> {
+        let slices = usize::from(self.max_slices);
+        let subslices = usize::from(self.max_subslices);
+        let eu_offset = 1 + slices;
+        let mut bytes = alloc::vec![0; 16 + eu_offset + slices * subslices];
+        for (i, value) in [
+            0u16,
+            u16::from(self.max_slices),
+            u16::from(self.max_subslices),
+            8,
+            1,
+            1,
+            eu_offset as u16,
+            1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bytes[i * 2..i * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[16] = self.slices;
+        for s in 0..slices {
+            bytes[17 + s] = self.subslices[s];
+            for ss in 0..subslices {
+                bytes[16 + eu_offset + s * subslices + ss] = self.eus[s][ss];
+            }
+        }
+        bytes
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
@@ -1332,5 +1448,83 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_legacy_gt",
         smoke_legacy_gt_apply_and_verify
+    );
+
+    /// The SSEU decode and i915's topology blob, hand-built: a two-slice
+    /// Gen9 GT3 with subslice 0 fused off and one 7-EU subslice, and an Ice
+    /// Lake with subslices 6/7 fused off and one EU pair disabled.
+    fn smoke_legacy_topology_follows_sseu_info_init() -> TestResult {
+        let regs = |map: &'static [(u64, u32)]| {
+            move |reg: u64| map.iter().find(|(r, _)| *r == reg).map_or(0, |(_, v)| *v)
+        };
+        let gt3 = LegacyTopology::read(
+            gen9(Gen9Kind::Skylake, 6),
+            regs(&[
+                (0x9120, 0x3 << 25 | 1 << 20),
+                (0x9134, 0x0000_8000),
+                (0x9138, 0),
+            ]),
+        )
+        .unwrap();
+        if gt3.slice_mask() != 3
+            || gt3.subslice_mask() != 0xe
+            || gt3.subslice_total() != 6
+            || gt3.eu_total() != 47
+        {
+            return TestResult::Fail("Gen9 slice / subslice / EU counts");
+        }
+        let blob = gt3.i915_bytes();
+        let header: alloc::vec::Vec<u16> = blob[..16]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if header != [0, 3, 4, 8, 1, 1, 4, 1]
+            || blob.len() != 32
+            || blob[16..20] != [3, 0xe, 0xe, 0]
+            || blob[20..24] != [0, 0x7f, 0xff, 0xff]
+            || blob[24..28] != [0, 0xff, 0xff, 0xff]
+            || blob[28..32] != [0; 4]
+        {
+            return TestResult::Fail("Gen9 topology blob");
+        }
+        let icl = LegacyTopology::read(
+            WaPlatform::Gen11 {
+                jsl_ehl: false,
+                revision: 0,
+            },
+            regs(&[(0x913c, 0xc0), (0x9134, 0x03)]),
+        )
+        .unwrap();
+        let blob = icl.i915_bytes();
+        if icl.subslice_total() != 6
+            || icl.eu_total() != 36
+            || blob.len() != 16 + 2 + 8
+            || blob[2..4] != [1, 0]
+            || blob[4..6] != [8, 0]
+            || blob[16..18] != [1, 0x3f]
+            || blob[18..24] != [0xfc; 6]
+            || blob[24..26] != [0, 0]
+        {
+            return TestResult::Fail("Ice Lake topology blob");
+        }
+        let jsl = LegacyTopology::read(
+            WaPlatform::Gen11 {
+                jsl_ehl: true,
+                revision: 0,
+            },
+            regs(&[(0x913c, 0xf0)]),
+        )
+        .unwrap();
+        if jsl.subslice_mask() != 0xf || jsl.i915_bytes().len() != 16 + 2 + 4 {
+            return TestResult::Fail("EHL/JSL carry four subslices");
+        }
+        if LegacyTopology::read(gen9(Gen9Kind::Skylake, 6), regs(&[(0x9120, 0)])).is_some() {
+            return TestResult::Fail("no enabled slice means no topology");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_gt",
+        smoke_legacy_topology_follows_sseu_info_init
     );
 }

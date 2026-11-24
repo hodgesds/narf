@@ -343,6 +343,7 @@ pub(crate) struct Owner {
     state: Mutex<Option<Runtime>>,
     epoch: AtomicU64,
     clock: AtomicU64,
+    topology: narf_lib::sync::IrqSafeSpinLock<Option<crate::intel_gpu_legacy_gt::LegacyTopology>>,
 }
 
 impl core::fmt::Debug for Owner {
@@ -387,6 +388,8 @@ impl Owner {
             }
         }
         let steering = Steering::read(self.wa, |reg| window.read32(reg)).ok_or(InitError::Fuses)?;
+        *self.topology.lock() =
+            crate::intel_gpu_legacy_gt::LegacyTopology::read(self.wa, |reg| window.read32(reg));
         let report = program(&window, self.wa, steering);
         if !report.lost.is_empty() {
             log(self.index, "some workarounds did not stick");
@@ -580,6 +583,10 @@ impl UserBackend for Backend {
         })
     }
 
+    fn legacy_topology(&self) -> Option<crate::intel_gpu_legacy_gt::LegacyTopology> {
+        *self.0.topology.lock()
+    }
+
     fn submit<'a>(
         &'a self,
         context: Arc<UserContext>,
@@ -624,6 +631,7 @@ pub(crate) fn install(
         state: Mutex::new(None),
         epoch: AtomicU64::new(0),
         clock: AtomicU64::new(0),
+        topology: narf_lib::sync::IrqSafeSpinLock::new(None),
     }));
     true
 }

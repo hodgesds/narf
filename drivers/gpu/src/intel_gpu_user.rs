@@ -191,6 +191,12 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn native_xe(&self) -> bool {
         false
     }
+    /// The Gen9/Gen11 SSEU layout the execlists owner read from the fuses,
+    /// for the i915 topology query and SSEU GETPARAMs. Default: none (later
+    /// generations publish a `GtTopology` instead).
+    fn legacy_topology(&self) -> Option<crate::intel_gpu_legacy_gt::LegacyTopology> {
+        None
+    }
     /// This function's GT owner runs beside a display it preserves (the
     /// Lunar Lake display-20 route's `DisplayPreserving` profile), so its
     /// objects may be created for scanout. Default: headless or not an
