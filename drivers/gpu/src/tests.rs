@@ -6948,6 +6948,17 @@ fn smoke_amdgpu_navi31_mp0_mp1_bases() -> TestResult {
         Some(chip) => chip,
         None => return TestResult::Fail("Navi22 must be in the probe table"),
     };
+    // Reset the GC version to Navi22's own: the Phoenix leg above set
+    // (11, 0, 1), and `is_apu()` is discovery-driven — leaving the
+    // Phoenix GC in place makes this discrete leg read as an APU and
+    // take the shared mailbox path. (10, 3, 2) is Navi22's GC version
+    // per `amdgpu_rdna2::NAVI22`.
+    if let Some(gc) = gpu.ip_blocks.iter_mut().find(|b| b.hw_id == HW_ID_GC) {
+        (gc.major, gc.minor, gc.revision) = (10, 3, 2);
+    }
+    if gpu.is_apu() {
+        return TestResult::Fail("Navi22 GC 10.3.2 must read as discrete");
+    }
     if gpu.mp1_mailbox_base().is_some() || gpu.expected_smu_driver_if_version().is_some() {
         return TestResult::Fail("Navi22 must not take the shared SMU bring-up path");
     }
