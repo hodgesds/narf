@@ -61,6 +61,11 @@ pub const GART_PTE_PFN_SHIFT: u64 = 12;
 /// PFN field mask after the shift — 28 bits on GFX9 (covers 1 TiB
 /// of system memory at 4 KiB pages, enough for the bring-up targets).
 pub const GART_PTE_PFN_MASK: u64 = 0x0FFF_FFFF;
+/// PFN field mask after the shift on GFX11 (Phoenix / Navi31/32/33):
+/// 36 bits, bits[47:12] of the entry (`gmc_v11_0.c` comment + the
+/// `pte_addr_mask = 0x0000FFFFFFFFF000` in `gmc_v11_0_sw_init`).
+/// A PFN ≥ 1 TiB is valid here; only phys ≥ 2^48 overflows.
+pub const GART_PTE_PFN_MASK_GFX11: u64 = 0xF_FFFF_FFFF;
 
 /// Composite flag set for the typical "sysmem readable + writable
 /// cacheable + snoop" mapping the driver creates for GTT pages.
@@ -103,6 +108,32 @@ pub fn parse_pte(pte: u64) -> (u64, u64) {
     (phys, flags)
 }
 
+/// Encode a GART PTE for a single 4 KiB page on GFX11 (Phoenix /
+/// Navi31/32/33): the same low-12 flag field as [`make_pte_gfx9`],
+/// but the PFN is 36 bits (bits[47:12]), so physical addresses up to
+/// 2^48 − 1 are representable and only phys ≥ 2^48 fails closed with
+/// [`GartError::PfnOverflow`]. GFX9's 28-bit mask rejects anything
+/// ≥ 1 TiB; GFX11 must not, or the GART could not cover a 16 GiB
+/// VRAM aperture, let alone system memory above 1 TiB.
+pub fn make_pte_phoenix(phys_addr: u64, flags: u64) -> Result<u64, GartError> {
+    if phys_addr & 0xFFF != 0 {
+        return Err(GartError::UnalignedPhys);
+    }
+    let pfn = phys_addr >> GART_PTE_PFN_SHIFT;
+    if pfn & !GART_PTE_PFN_MASK_GFX11 != 0 {
+        return Err(GartError::PfnOverflow);
+    }
+    Ok((pfn << GART_PTE_PFN_SHIFT) | (flags & 0xFFF))
+}
+
+/// Decode a GFX11 GART PTE: returns (phys_addr, flag_bits[11:0]).
+pub fn parse_pte_phoenix(pte: u64) -> (u64, u64) {
+    let pfn = (pte >> GART_PTE_PFN_SHIFT) & GART_PTE_PFN_MASK_GFX11;
+    let phys = pfn << GART_PTE_PFN_SHIFT;
+    let flags = pte & 0xFFF;
+    (phys, flags)
+}
+
 /// Is the entry valid (V bit set)?
 pub fn pte_is_valid(pte: u64) -> bool {
     pte & GART_PTE_VALID != 0
@@ -122,7 +153,11 @@ pub const VM_PTE_PAGE_SIZE_SHIFT: u64 = 57;
 pub const VM_PTE_VALID: u64 = 1 << 0;
 /// VM PTE bit 1 — system memory (vs VRAM).
 pub const VM_PTE_SYSTEM: u64 = 1 << 1;
-/// VM PTE bit 2 — readable.
+/// VM PTE bit 2 — snooped (cache-coherent with the CPU).
+pub const VM_PTE_SNOOPED: u64 = 1 << 2;
+/// VM PTE bit 4 — executable.
+pub const VM_PTE_EXECUTABLE: u64 = 1 << 4;
+/// VM PTE bit 5 — readable.
 pub const VM_PTE_READABLE: u64 = 1 << 5;
 /// VM PTE bit 6 — writable.
 pub const VM_PTE_WRITABLE: u64 = 1 << 6;

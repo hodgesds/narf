@@ -147,6 +147,31 @@ pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
     cntl_shift: 0,
 };
 
+// ── GFX11 GFXHUB v3.0.3 (Navi32, GC 11.0.3) ─────────────────────────
+// gc_11_0_3_offset.h: the whole GCMC/GCVM block sits 0x10 above the
+// 11.0.0 table (CONTEXT0_CNTL 0x1698 vs 0x1688, PT_BASE 0x1703 vs
+// 0x16f3), while the invalidate block keeps the same +0x12 REQ→ACK
+// layout (REQ 0x16bb, ACK 0x16cd, SEM 0x16a9). Navi33 (GC 11.0.2)
+// uses the 11.0.0 table: `gmc_v11_0_set_gfxhub_funcs` selects the
+// default `gfxhub_v3_0_funcs` for every GC version except 11.0.3.
+pub const GFXHUB_V3_0_3: VmHubRegs = VmHubRegs {
+    ctx0_pt_base_lo: 0x1703,
+    ctx0_pt_base_hi: 0x1704,
+    ctx0_pt_start_lo: 0x1723,
+    ctx0_pt_start_hi: 0x1724,
+    ctx0_pt_end_lo: 0x1743,
+    ctx0_pt_end_hi: 0x1744,
+    ctx_addr_distance: 2,
+    ctx0_cntl: 0x1698,
+    ctx_distance: 1,
+    inv_eng0_req: 0x16bb,
+    inv_eng0_ack: 0x16cd,
+    inv_eng0_sem: 0x16a9,
+    eng_distance: 1,
+    semaphore: false,
+    cntl_shift: 0,
+};
+
 // ── MMHUB v3.0 (Phoenix) ───────────────────────────────────────────
 //
 // regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 = 0x07ab

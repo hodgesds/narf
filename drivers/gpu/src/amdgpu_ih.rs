@@ -164,8 +164,31 @@ pub const CLIENT_ID_SDMA1: u8 = 0x09;
 pub const CLIENT_ID_VCN: u8 = 0x10;
 /// `SOC15_IH_CLIENTID_VMC` — page faults from the memory controller.
 pub const CLIENT_ID_VMC: u8 = 0x12;
-/// `SOC15_IH_CLIENTID_GRBM_CP` — GFX command processor.
+/// `SOC15_IH_CLIENTID_GRBM_CP` — GFX command processor. This is the
+/// client Linux's `gfx_v11_0.c` registers CP events under on GFX11
+/// (EOP source 181, bad opcode 183, privileged register 184,
+/// privileged instruction 185). It is NOT the GC client on SOC21:
+/// that is [`CLIENT_ID_GFX_SOC21`] (0x0a). Do not "fix" this constant
+/// to 0x0a — the CP-event demux would break.
 pub const CLIENT_ID_GFX: u8 = 0x14;
+/// `SOC21_IH_CLIENTID_GFX` — the GC client on SOC21 (GFX11/GFX12),
+/// distinct from the GRBM_CP client above. Linux's `gfx_v11_0.c`
+/// registers the RLC GC FED error under it
+/// (`GFX_11_0_0__SRCID__RLC_GC_FED_INTERRUPT` = 128), and
+/// `gmc_v11_0.c` registers the UTCL2 VM-fault IRQ under it
+/// (`UTCL2_1_0__SRCID__FAULT` = 0). GFX11-wide (Phoenix included —
+/// Phoenix runs the same `gfx_v11_0.c` / `gmc_v11_0.c`), not
+/// Navi31-scoped. On GFX12 the same 0x0a client also carries EOP and
+/// friends; on GFX11 those stay under GRBM_CP 0x14, so do not copy
+/// the GFX12 classifier.
+pub const CLIENT_ID_GFX_SOC21: u8 = 0x0a;
+/// `GFX_11_0_0__SRCID__RLC_GC_FED_INTERRUPT` — the RLC GC FED error,
+/// raised under [`CLIENT_ID_GFX_SOC21`].
+pub const SOURCE_ID_GFX_RLC_FED: u8 = 128;
+/// `UTCL2_1_0__SRCID__FAULT` — the UTCL2 VM fault, raised under
+/// [`CLIENT_ID_GFX_SOC21`] (and under [`CLIENT_ID_VMC`] as source 0
+/// for the VMC fault itself).
+pub const SOURCE_ID_GFX_UTCL2_FAULT: u8 = 0;
 /// `SOC15_IH_CLIENTID_UTCL2` — the L2 translation cache.
 pub const CLIENT_ID_UTCL2: u8 = 0x1B;
 /// `SOC15_IH_CLIENTID_MP0` — PSP.

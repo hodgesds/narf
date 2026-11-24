@@ -4888,6 +4888,66 @@ kernel_test_in!(
     smoke_amdgpu_ih_cookie_header_round_trip
 );
 
+// SOC21 has TWO GFX clients: GRBM_CP (0x14, the shared
+// CLIENT_ID_GFX — CP events on GFX11) and GC (0x0a — the RLC FED
+// error and the UTCL2 fault). The shared constant must stay 0x14;
+// the 0x0a client is a separate constant, so a cookie for one can
+// never decode as the other.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_ih_soc21_gfx_client_distinct_from_grbm_cp() -> TestResult {
+    use crate::amdgpu_ih::{
+        IhCookieHeader, CLIENT_ID_GFX, CLIENT_ID_GFX_SOC21, SOURCE_ID_GFX_RLC_FED,
+        SOURCE_ID_GFX_UTCL2_FAULT,
+    };
+    if CLIENT_ID_GFX != 0x14 {
+        return TestResult::Fail("shared CLIENT_ID_GFX is not GRBM_CP 0x14");
+    }
+    if CLIENT_ID_GFX_SOC21 != 0x0a || SOURCE_ID_GFX_RLC_FED != 128 || SOURCE_ID_GFX_UTCL2_FAULT != 0
+    {
+        return TestResult::Fail("SOC21 GFX client or source ids do not match the headers");
+    }
+    // The RLC FED error (GC client, source 128) and a CP EOP event
+    // (GRBM_CP client, source 181) are distinct cookies.
+    let fed = IhCookieHeader {
+        client_id: CLIENT_ID_GFX_SOC21,
+        source_id: SOURCE_ID_GFX_RLC_FED,
+        ring_id: 0,
+        reserved: 0,
+    };
+    let eop = IhCookieHeader {
+        client_id: CLIENT_ID_GFX,
+        source_id: 181,
+        ring_id: 0,
+        reserved: 0,
+    };
+    if fed.to_dword() == eop.to_dword() || IhCookieHeader::from_dword(fed.to_dword()) != fed {
+        return TestResult::Fail("SOC21 GC cookie collides with a GRBM_CP cookie");
+    }
+    // The UTCL2 fault shares source 0 with the VMC fault, but under
+    // the GC client — not the VMC client.
+    let fault = IhCookieHeader {
+        client_id: CLIENT_ID_GFX_SOC21,
+        source_id: SOURCE_ID_GFX_UTCL2_FAULT,
+        ring_id: 0,
+        reserved: 0,
+    };
+    let vmc = IhCookieHeader {
+        client_id: 0x12,
+        source_id: 0,
+        ring_id: 0,
+        reserved: 0,
+    };
+    if fault.to_dword() == vmc.to_dword() {
+        return TestResult::Fail("UTCL2 fault cookie collides with the VMC fault cookie");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ih",
+    smoke_amdgpu_ih_soc21_gfx_client_distinct_from_grbm_cp
+);
+
 #[cfg(feature = "amdgpu")]
 fn smoke_amdgpu_ih_enable_strictly_after_disable() -> TestResult {
     use crate::amdgpu_ih::{build_ih4_ring_init, IH_RB_CNTL_REL, IH_RB_ENABLE};
@@ -5104,6 +5164,54 @@ fn smoke_amdgpu_gmc_gart_pte_rejects_unaligned_and_oversize() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/gmc",
     smoke_amdgpu_gmc_gart_pte_rejects_unaligned_and_oversize
+);
+
+// GFX11 (Phoenix / Navi31/32/33) extends the GART PFN to 36 bits
+// (bits[47:12]): a PFN ≥ 1 TiB is valid here, where GFX9 rejects it,
+// and only phys ≥ 2^48 fails closed.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_gmc_gart_pte_phoenix_wide_pfn() -> TestResult {
+    use crate::amdgpu_gmc::{
+        make_pte_gfx9, make_pte_phoenix, parse_pte_phoenix, GartError, GART_PTE_FLAGS_GTT_DEFAULT,
+        GART_PTE_PFN_MASK_GFX11,
+    };
+    if GART_PTE_PFN_MASK_GFX11 != 0xF_FFFF_FFFF {
+        return TestResult::Fail("GFX11 PFN mask is not 36 bits");
+    }
+    // 1 TiB: rejected on GFX9, accepted on GFX11.
+    let phys_1tib: u64 = 1 << 40;
+    if make_pte_gfx9(phys_1tib, GART_PTE_FLAGS_GTT_DEFAULT).is_ok() {
+        return TestResult::Fail("GFX9 accepted a PFN ≥ 1 TiB");
+    }
+    let pte = match make_pte_phoenix(phys_1tib, GART_PTE_FLAGS_GTT_DEFAULT) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("GFX11 rejected a 1 TiB phys"),
+    };
+    let (back_phys, back_flags) = parse_pte_phoenix(pte);
+    if back_phys != phys_1tib || back_flags != (GART_PTE_FLAGS_GTT_DEFAULT & 0xFFF) {
+        return TestResult::Fail("GFX11 PTE round-trip lost bits");
+    }
+    // Just below 2^48: the widest representable address.
+    let phys_max: u64 = (1 << 48) - 4096;
+    if make_pte_phoenix(phys_max, GART_PTE_FLAGS_GTT_DEFAULT).is_err() {
+        return TestResult::Fail("GFX11 rejected phys just below 2^48");
+    }
+    // At 2^48 the PFN no longer fits 36 bits.
+    match make_pte_phoenix(1u64 << 48, GART_PTE_FLAGS_GTT_DEFAULT) {
+        Err(GartError::PfnOverflow) => {}
+        _ => return TestResult::Fail("phys ≥ 2^48 must overflow on GFX11"),
+    }
+    // Unaligned phys is still rejected.
+    match make_pte_phoenix(phys_1tib | 0x800, GART_PTE_FLAGS_GTT_DEFAULT) {
+        Err(GartError::UnalignedPhys) => {}
+        _ => return TestResult::Fail("unaligned phys must be rejected on GFX11"),
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gmc",
+    smoke_amdgpu_gmc_gart_pte_phoenix_wide_pfn
 );
 
 #[cfg(feature = "amdgpu")]
