@@ -161,6 +161,9 @@ impl Routing {
                 | Profile::Dcn312
                 | Profile::Dcn315,
             ) => (DIG_BE_EN_CNTL - 1, DIG_STRIDE),
+            // dcn_2_1_0_offset.h mmDIG0_DIG_BE_EN_CNTL is 0x20b0, DIG1
+            // 0x21b0 (stride 0x100); dcn_2_0_0_offset.h agrees.
+            Self::Legacy(Profile::Dcn21) => (DIG_BE_EN_CNTL - 2, DIG_STRIDE),
             // dcn_3_2_0_offset.h / dcn_3_2_1_offset.h agree with 3.1.4:
             // regDIG0_DIG_BE_EN_CNTL 0x20b2, DIG1 0x21b2 (stride 0x100).
             Self::Legacy(Profile::Dcn314 | Profile::Dcn320 | Profile::Dcn321) => {

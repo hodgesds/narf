@@ -1,4 +1,5 @@
-//! DCN314 direct-load lifecycle, following Linux dmub_dcn31.c/dmub_srv.c.
+//! DCN 2.1 / 3.1.4 direct-load lifecycle, following Linux
+//! dmub_dcn20.c/dmub_dcn31.c/dmub_srv.c.
 //!
 //! This is the explicitly selected direct-load method, not a PSP fallback.
 //! The caller supplies a pool of known-free VRAM and a validated VBIOS image.
@@ -6,7 +7,7 @@
 //! PSP load method are separate from this lifecycle.
 use super::{
     amdgpu::AmdGpu,
-    amdgpu_dmub::{self, Channel, Dmub},
+    amdgpu_dmub::{self, Channel, Dmub, Regs},
     amdgpu_dmub_firmware::{Layout, Placement, Prepared, Window, RING_SIZE},
     amdgpu_usbc::{claim_loader, LoaderOwnership},
     amdgpu_vram::{Pool, Reservation},
@@ -20,14 +21,11 @@ use core::{
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-const CNTL: u32 = 0x1f6;
-const CNTL2: u32 = 0x200;
-const HUB_RESET: u32 = 0x342;
-const SEC_CNTL: u32 = 0x1ce;
-const GPINT: u32 = 0x1f8;
-const STATUS: u32 = 0x1e3;
-const STOP_REPLY: u32 = 0x1ea;
+/// Generation-independent DMCUB field values (`dcn_2_1_0_sh_mask.h` and
+/// `dcn_3_1_4_sh_mask.h` agree on all of these). The register offsets
+/// live in [`Regs`].
 const ENABLE: u32 = 1 << 16;
+const SOFT_RESET: u32 = 1 << 17;
 const HUB_RESET_BIT: u32 = 1 << 8;
 const STOP: u32 = (1 << 28) | (2 << 16);
 const WINDOW_ENABLE: u32 = 1 << 31;
@@ -110,7 +108,7 @@ struct Mmio {
 }
 impl Io for Mmio {
     fn read(&mut self, reg: u32) -> u32 {
-        // SAFETY: constructor bounds the entire DCN314 register bank.
+        // SAFETY: constructor bounds the entire DMCUB register bank.
         unsafe { self.regs.read32(self.base + reg as u64 * 4) }
     }
     fn write(&mut self, reg: u32, value: u32) {
@@ -154,38 +152,80 @@ fn update(io: &mut impl Io, reg: u32, mask: u32, bits: u32) {
     let old = io.read(reg);
     io.write(reg, (old & !mask) | bits);
 }
-fn reset_confirmed(io: &mut impl Io) -> bool {
-    let cntl = io.read(CNTL);
-    let reset = io.read(CNTL2);
-    let hub = io.read(HUB_RESET);
-    cntl != u32::MAX
-        && reset != u32::MAX
-        && hub != u32::MAX
-        && cntl & ENABLE == 0
-        && reset & 1 == 1
-        && hub & HUB_RESET_BIT != 0
-}
-fn force_reset(io: &mut impl Io) -> bool {
-    if io.read(CNTL) == u32::MAX || io.read(CNTL2) == u32::MAX || io.read(HUB_RESET) == u32::MAX {
+fn reset_confirmed(regs: Regs, io: &mut impl Io) -> bool {
+    let cntl = io.read(regs.cntl);
+    let hub = io.read(regs.hub_reset);
+    if cntl == u32::MAX || hub == u32::MAX || cntl & ENABLE != 0 || hub & HUB_RESET_BIT == 0 {
         return false;
     }
-    update(io, CNTL2, 1, 1);
-    update(io, HUB_RESET, HUB_RESET_BIT, HUB_RESET_BIT);
-    update(io, CNTL, ENABLE, 0);
-    fence(Ordering::SeqCst);
-    reset_confirmed(io)
+    match regs.cntl2 {
+        // DCN 3.1.4: reset is requested through CNTL2 bit 0.
+        Some(cntl2) => {
+            let reset = io.read(cntl2);
+            reset != u32::MAX && reset & 1 == 1
+        }
+        // DCN 2.0/2.1 has no CNTL2: reset is CNTL's own SOFT_RESET bit 17.
+        None => cntl & SOFT_RESET != 0,
+    }
 }
-fn clear_mailboxes(io: &mut impl Io, secure: bool) {
-    for reg in [0x1d6, 0x1d7, 0x1da, 0x1db, 0x1de, 0x1df, STATUS, GPINT] {
+fn force_reset(regs: Regs, io: &mut impl Io) -> bool {
+    if io.read(regs.cntl) == u32::MAX || io.read(regs.hub_reset) == u32::MAX {
+        return false;
+    }
+    if let Some(cntl2) = regs.cntl2 {
+        if io.read(cntl2) == u32::MAX {
+            return false;
+        }
+        update(io, cntl2, 1, 1);
+    }
+    update(io, regs.hub_reset, HUB_RESET_BIT, HUB_RESET_BIT);
+    // DCN 3.1.4 clears ENABLE here (reset rides CNTL2); DCN 2.0/2.1
+    // asserts SOFT_RESET in the same write.
+    match regs.cntl2 {
+        Some(_) => update(io, regs.cntl, ENABLE, 0),
+        None => update(io, regs.cntl, ENABLE | SOFT_RESET, SOFT_RESET),
+    }
+    fence(Ordering::SeqCst);
+    reset_confirmed(regs, io)
+}
+fn clear_mailboxes(regs: Regs, io: &mut impl Io, secure: bool) {
+    for reg in [
+        regs.inbox1_wptr,
+        regs.inbox1_rptr,
+        regs.outbox0_wptr,
+        regs.outbox0_rptr,
+        regs.outbox1_wptr,
+        regs.outbox1_rptr,
+        regs.status,
+        regs.gpint,
+    ] {
         io.write(reg, 0);
     }
     // Disable stale cache windows, including CW2/CW7 that this image won't use.
     // PSP owns the secure instruction and stack windows. Never clear those
     // on the PSP path, including between load completion and reset release.
-    for reg in (if secure { 0x1af } else { 0x1ad })..=0x1b4 {
+    let first = if secure { regs.cw_top + 2 } else { regs.cw_top };
+    for reg in first..=regs.cw_top + regs.cw_count - 1 {
         io.write(reg, 0);
     }
-    io.write(0x1a2, 0);
+    io.write(regs.region5_top, 0);
+    // DCN 2.0/2.1: the uncached-mailbox window, stale from a previous
+    // boot in either mailbox mode.
+    if let Some(region4_top) = regs.region4_top {
+        io.write(region4_top, 0);
+    }
+}
+/// A DMCUB with its firmware running: enabled and not in reset. DCN 3.1.4
+/// carries reset in CNTL2 bit 0; DCN 2.0/2.1 in CNTL's own SOFT_RESET bit.
+fn dmcub_active(regs: Regs, io: &mut impl Io) -> bool {
+    let cntl = io.read(regs.cntl);
+    if cntl & ENABLE == 0 {
+        return false;
+    }
+    match regs.cntl2 {
+        Some(cntl2) => io.read(cntl2) & 1 == 0,
+        None => cntl & SOFT_RESET == 0,
+    }
 }
 async fn tick() {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
@@ -203,6 +243,12 @@ struct Engine<I: Io> {
     staging: Vec<u8>,
     state: State,
     secure: bool,
+    /// This generation's DMCUB register map (`Regs::DCN314` or
+    /// `Regs::DCN21`).
+    regs: Regs,
+    /// Whether the firmware's mailbox is the cached CW4 one (`Prepared`
+    /// decided this from the firmware version).
+    cached_inbox: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -214,23 +260,24 @@ impl<I: Io> Engine<I> {
     async fn quiesce(&mut self, cleanup: bool) -> Result<(), Error> {
         // Teardown retains authority over previously owned hardware even after
         // revocation; it may only stop access, never publish new work.
+        let regs = self.regs;
         let active = if cleanup {
-            self.io.read(CNTL) & ENABLE != 0 && self.io.read(CNTL2) & 1 == 0
+            dmcub_active(regs, &mut self.io)
         } else {
-            self.access(|io| io.read(CNTL) & ENABLE != 0 && io.read(CNTL2) & 1 == 0)?
+            self.access(|io| dmcub_active(regs, io))?
         };
         if active {
             if cleanup {
-                self.io.write(GPINT, STOP);
+                self.io.write(regs.gpint, STOP);
             } else {
-                self.access(|io| io.write(GPINT, STOP))?;
+                self.access(|io| io.write(regs.gpint, STOP))?;
             }
             let deadline = narf_time::Deadline::after_ms(100);
             loop {
                 let finished = |io: &mut I| {
-                    io.read(GPINT) == 2 << 16
-                        && io.read(STOP_REPLY) == 0xdeaddead
-                        && io.read(CNTL) & (1 << 20) != 0
+                    io.read(regs.gpint) == 2 << 16
+                        && io.read(regs.stop_reply) == 0xdeaddead
+                        && io.read(regs.cntl) & (1 << 20) != 0
                 };
                 if (if cleanup {
                     finished(&mut self.io)
@@ -246,16 +293,16 @@ impl<I: Io> Engine<I> {
         let deadline = narf_time::Deadline::after_ms(100);
         loop {
             let reset = if cleanup {
-                force_reset(&mut self.io)
+                force_reset(regs, &mut self.io)
             } else {
-                self.access(force_reset)?
+                self.access(|io| force_reset(regs, io))?
             };
             if reset {
                 if cleanup {
-                    clear_mailboxes(&mut self.io, self.secure);
+                    clear_mailboxes(regs, &mut self.io, self.secure);
                 } else {
                     let secure = self.secure;
-                    self.access(|io| clear_mailboxes(io, secure))?;
+                    self.access(|io| clear_mailboxes(regs, io, secure))?;
                 }
                 return Ok(());
             }
@@ -299,21 +346,36 @@ impl<I: Io> Engine<I> {
         let fb_base = self.fb_base;
         let fb_offset = self.fb_offset;
         let secure = self.secure;
-        self.access(|io| configure(io, layout, placement, fb_base, fb_offset, options, secure))??;
+        let regs = self.regs;
+        let cached_inbox = self.cached_inbox;
+        self.access(|io| {
+            configure(
+                &regs,
+                cached_inbox,
+                io,
+                layout,
+                placement,
+                fb_base,
+                fb_offset,
+                options,
+                secure,
+            )
+        })??;
         self.wait_for_auto_load().await
     }
     /// `dmub_srv_wait_for_auto_load`: the DAL firmware and its mailbox ready
     /// (SCRATCH0's `dal_fw` and `mailbox_rdy`) on a running, unreset DMCUB,
     /// within 100 ms (`dm_dmub_hw_resume`'s 100000 us).
     async fn wait_for_auto_load(&mut self) -> Result<(), Error> {
+        let regs = self.regs;
         let deadline = narf_time::Deadline::after_ms(100);
         loop {
             if self.access(|io| {
-                let status = io.read(STATUS);
+                let status = io.read(regs.status);
                 status != u32::MAX
                     && status & 3 == 3
-                    && io.read(CNTL) & ENABLE != 0
-                    && io.read(CNTL2) & 1 == 0
+                    && io.read(regs.cntl) & ENABLE != 0
+                    && regs.cntl2.is_none_or(|cntl2| io.read(cntl2) & 1 == 0)
             })? {
                 return Ok(());
             }
@@ -326,9 +388,10 @@ impl<I: Io> Engine<I> {
     /// `dmub_dcn31_is_hw_init`: DMCUB enabled with the DAL firmware's boot
     /// bit (`dal_fw`, SCRATCH0 bit 0) set.
     fn is_hw_init(&mut self) -> Result<bool, Error> {
+        let regs = self.regs;
         self.access(|io| {
-            let status = io.read(STATUS);
-            status != u32::MAX && status & 1 != 0 && io.read(CNTL) & ENABLE != 0
+            let status = io.read(regs.status);
+            status != u32::MAX && status & 1 != 0 && io.read(regs.cntl) & ENABLE != 0
         })
     }
     async fn stop(&mut self) -> Result<(), Error> {
@@ -353,10 +416,10 @@ impl<I: Io> Engine<I> {
         if matches!(self.state, State::Prepared | State::Stopped) {
             return true;
         }
-        if !force_reset(&mut self.io) {
+        if !force_reset(self.regs, &mut self.io) {
             return false;
         }
-        clear_mailboxes(&mut self.io, self.secure);
+        clear_mailboxes(self.regs, &mut self.io, self.secure);
         // SAFETY: synchronous forced reset verified all stop bits. No await in Drop.
         unsafe {
             self.allocation.stopped();
@@ -367,6 +430,8 @@ impl<I: Io> Engine<I> {
 }
 
 fn configure(
+    regs: &Regs,
+    cached_inbox: bool,
     io: &mut impl Io,
     layout: Layout,
     place: Placement,
@@ -387,21 +452,26 @@ fn configure(
     let inst = translate(Window::Instructions)?;
     let stack = translate(Window::Stack)?;
     if secure {
-        for reg in [0x1ad, 0x1ae] {
+        for reg in [regs.cw_top, regs.cw_top + 1] {
             let value = io.read(reg);
             if value == u32::MAX || value & WINDOW_ENABLE == 0 {
                 return Err(Error::ConfigurationFailed);
             }
         }
     } else {
-        update(io, SEC_CNTL, 1 << 16, 1 << 16);
+        update(io, regs.sec_cntl, 1 << 16, 1 << 16);
         for (window, address) in [(Window::Instructions, inst), (Window::Stack, stack)] {
-            write_window(io, window, address, layout.region(window).size, true)?;
+            write_window(regs, io, window, address, layout.region(window).size, true)?;
         }
-        update(io, SEC_CNTL, (1 << 16) | 0x3f00, 0x2000);
+        update(io, regs.sec_cntl, (1 << 16) | 0x3f00, 0x2000);
     }
     for window in [Window::Vbios, Window::Mailbox, Window::Trace, Window::State] {
+        // The mailbox window is REGION4, not CW4, on the uncached path.
+        if window == Window::Mailbox && !cached_inbox {
+            continue;
+        }
         write_window(
+            regs,
             io,
             window,
             place.address(window),
@@ -409,36 +479,68 @@ fn configure(
             false,
         )?;
     }
+    if !cached_inbox {
+        // `dmub_dcn20_setup_windows`: the mailbox memory's GPU address in
+        // REGION4's OFFSET, TOP = size - 1 with ENABLE. The firmware reads
+        // the inbox at GPU 0x80000000 through this window.
+        let mailbox = place.address(Window::Mailbox);
+        let size = layout.region(Window::Mailbox).size;
+        io.write(
+            regs.region4_offset.ok_or(Error::Unsupported)?,
+            mailbox as u32,
+        );
+        io.write(
+            regs.region4_offset_high.ok_or(Error::Unsupported)?,
+            (mailbox >> 32) as u32,
+        );
+        io.write(
+            regs.region4_top.ok_or(Error::Unsupported)?,
+            WINDOW_ENABLE | (size - 1),
+        );
+    }
     let trace = place.address(Window::Trace);
-    io.write(0x198, trace as u32);
-    io.write(0x199, (trace >> 32) as u32);
+    io.write(regs.region5_offset, trace as u32);
+    io.write(regs.region5_offset_high, (trace >> 32) as u32);
     io.write(
-        0x1a2,
+        regs.region5_top,
         WINDOW_ENABLE | (layout.region(Window::Trace).size - 1),
     );
-    io.write(0x1d8, 0xa000_0010);
-    io.write(0x1d9, layout.region(Window::Trace).size - 16);
-    for (base, address) in [(0x1d4, 0x6400_0000), (0x1dc, 0x6400_0000 + RING_SIZE)] {
+    io.write(regs.outbox0_base, 0xa000_0010);
+    io.write(regs.outbox0_size, layout.region(Window::Trace).size - 16);
+    // The inbox/outbox rings: the cached CW4 window base 0x64000000, or
+    // the uncached REGION4 base 0x80000000.
+    let mailbox_base = if cached_inbox {
+        0x6400_0000
+    } else {
+        0x8000_0000
+    };
+    for (base, address) in [
+        (regs.inbox1_base, mailbox_base),
+        (regs.outbox1_base, mailbox_base + RING_SIZE),
+    ] {
         io.write(base, address);
         io.write(base + 1, RING_SIZE);
         if io.read(base) != address || io.read(base + 1) != RING_SIZE {
             return Err(Error::ConfigurationFailed);
         }
     }
-    io.write(0x1f1, options.bits());
-    if (!secure && io.read(SEC_CNTL) & ((1 << 16) | 0x3f00) != 0x2000)
-        || io.read(0x1f1) != options.bits()
+    io.write(regs.options, options.bits());
+    if (!secure && io.read(regs.sec_cntl) & ((1 << 16) | 0x3f00) != 0x2000)
+        || io.read(regs.options) != options.bits()
     {
         return Err(Error::ConfigurationFailed);
     }
-    update(io, HUB_RESET, HUB_RESET_BIT, 0);
-    io.write(0x1f2, options.psp_version & 0x0011_00ff);
-    update(io, CNTL, ENABLE | (1 << 19), ENABLE | (1 << 19));
+    update(io, regs.hub_reset, HUB_RESET_BIT, 0);
+    io.write(regs.psp_version, options.psp_version & 0x0011_00ff);
+    update(io, regs.cntl, ENABLE | (1 << 19), ENABLE | (1 << 19));
     fence(Ordering::SeqCst);
-    update(io, CNTL2, 1, 0);
+    if let Some(cntl2) = regs.cntl2 {
+        update(io, cntl2, 1, 0);
+    }
     Ok(())
 }
 fn write_window(
+    regs: &Regs,
     io: &mut impl Io,
     window: Window,
     address: u64,
@@ -447,17 +549,17 @@ fn write_window(
 ) -> Result<(), Error> {
     let index = window as u32;
     let base = 0x6000_0000 + (index << 24);
-    io.write(0x1b5 + index * 2, address as u32);
-    io.write(0x1b6 + index * 2, (address >> 32) as u32);
-    io.write(0x1a5 + index, base);
+    io.write(regs.cw_offset + index * 2, address as u32);
+    io.write(regs.cw_offset_high + index * 2, (address >> 32) as u32);
+    io.write(regs.cw_base + index, base);
     io.write(
-        0x1ad + index,
+        regs.cw_top + index,
         WINDOW_ENABLE | ((base + size - u32::from(inclusive)) & ADDRESS_MASK),
     );
-    if io.read(0x1b5 + index * 2) & 0xffff_ff00 != address as u32
-        || io.read(0x1b6 + index * 2) & 0xffff != (address >> 32) as u32
-        || io.read(0x1a5 + index) & ADDRESS_MASK != base & ADDRESS_MASK
-        || io.read(0x1ad + index) & (WINDOW_ENABLE | ADDRESS_MASK)
+    if io.read(regs.cw_offset + index * 2) & 0xffff_ff00 != address as u32
+        || io.read(regs.cw_offset_high + index * 2) & 0xffff != (address >> 32) as u32
+        || io.read(regs.cw_base + index) & ADDRESS_MASK != base & ADDRESS_MASK
+        || io.read(regs.cw_top + index) & (WINDOW_ENABLE | ADDRESS_MASK)
             != WINDOW_ENABLE | ((base + size - u32::from(inclusive)) & ADDRESS_MASK)
     {
         return Err(Error::ConfigurationFailed);
@@ -476,6 +578,10 @@ pub struct Loader {
     psp: Option<crate::amdgpu_psp_ring::Psp>,
     signed_instructions: Vec<u8>,
     toc: Vec<u8>,
+    /// The ASD container for the PSP 12.0 load method; empty on the
+    /// TOC method. A non-empty ASD is the PSP 12.0 dispatch signal in
+    /// `boot`.
+    asd: Vec<u8>,
     dpias: u8,
     /// Raphael's graphics set, loaded through the PSP in place of DMCUB alone.
     graphics: Option<crate::amdgpu_gfx_navi22::Firmware>,
@@ -517,21 +623,24 @@ impl Loader {
     /// `authority` must control this GPU. The caller must retain its mappings
     /// and exclusive device ownership (including resets/hot-unplug) for this
     /// loader's lifetime. `pool` must be known-free VRAM on this same GPU;
-    /// `prepared` must contain the authenticated DCN314 image and this GPU's
-    /// validated VBIOS. Select this only on a platform supporting direct load.
+    /// `prepared` must contain the authenticated DMCUB image for this GPU's
+    /// DCN version and this GPU's validated VBIOS. Select this only on a
+    /// platform supporting direct load.
     pub unsafe fn new(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
         prepared: &Prepared<'_>,
     ) -> Result<Self, Error> {
-        let ip = amdgpu_dmub::dcn31x_ip(gpu).map_err(|_| Error::Unsupported)?;
+        let ip = amdgpu_dmub::dmub_ip(gpu).map_err(|_| Error::Unsupported)?;
         if ip.num_bases < 3 {
             return Err(Error::Unsupported);
         }
+        let regs = amdgpu_dmub::Regs::for_version((ip.major, ip.minor, ip.revision))
+            .ok_or(Error::Unsupported)?;
         let base = ip.base_addrs[2] as u64 * 4;
         if base
-            .checked_add(0x478 * 4)
+            .checked_add(regs.bound as u64 * 4)
             .is_none_or(|end| end > gpu.regs.len)
         {
             return Err(Error::Invalid);
@@ -545,10 +654,10 @@ impl Loader {
         let (fb_base, fb_end, fb_offset, supported) = authority
             .invoke(IoOp(|| {
                 (
-                    ((io.read(0x475) & 0xff_ffff) as u64) << 24,
-                    (((io.read(0x476) & 0xff_ffff) as u64) + 1) << 24,
-                    ((io.read(0x477) & 0xff_ffff) as u64) << 24,
-                    io.read(0xca),
+                    ((io.read(regs.fb_base) & 0xff_ffff) as u64) << 24,
+                    (((io.read(regs.fb_top) & 0xff_ffff) as u64) + 1) << 24,
+                    ((io.read(regs.fb_offset) & 0xff_ffff) as u64) << 24,
+                    io.read(regs.supported),
                 )
             }))
             .map_err(|_| Error::Revoked)?;
@@ -606,6 +715,8 @@ impl Loader {
                 staging,
                 state: State::Prepared,
                 secure: false,
+                regs,
+                cached_inbox: prepared.cached_inbox(),
             },
             fb: gpu.fb_bar,
             transport: None,
@@ -616,6 +727,7 @@ impl Loader {
             graphics_booted: false,
             signed_instructions: Vec::new(),
             toc: Vec::new(),
+            asd: Vec::new(),
         })
     }
     /// Construct the PSP load method. Both firmware containers must have been
@@ -653,6 +765,48 @@ impl Loader {
         // SAFETY: inherited permanent pool, exact physical GPU and exclusive PSP.
         loader.psp = Some(
             unsafe { crate::amdgpu_psp_ring::Psp::new(gpu, authority, pool) }
+                .map_err(Error::Psp)?,
+        );
+        loader.engine.secure = true;
+        Ok(loader)
+    }
+    /// Construct the PSP 12.0 load method for Renoir/Cezanne. The ASD
+    /// container must have been authenticated by the registry, as the TOC
+    /// must for `new_psp`. No fallback to direct load is performed.
+    ///
+    /// # Safety
+    /// The device/mapping/pool ownership requirements of `new` apply, together
+    /// with exclusive PSP, HDP and power-management ownership from
+    /// `Psp::new_psp12`. Existing engines must not depend on a
+    /// driver-managed TMR being replaced.
+    pub unsafe fn new_psp12(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        firmware: &amdgpu_dmub::Firmware,
+        asd: &[u8],
+    ) -> Result<Self, Error> {
+        let prepared = firmware.prepare_from_gpu(gpu).map_err(Error::Firmware)?;
+        crate::amdgpu_psp_ring::asd_payload(asd).map_err(Error::Psp)?;
+        // SAFETY: caller owns both engines and the shared pool; construction
+        // performs no resets/uploads. Loader's claim excludes other owners.
+        let mut loader = unsafe { Self::new(gpu, authority, pool, &prepared) }?;
+        let image = firmware.image().map_err(Error::Firmware)?;
+        loader
+            .signed_instructions
+            .try_reserve_exact(image.signed_instructions().len())
+            .map_err(|_| Error::Allocation)?;
+        loader
+            .signed_instructions
+            .extend_from_slice(image.signed_instructions());
+        loader
+            .asd
+            .try_reserve_exact(asd.len())
+            .map_err(|_| Error::Allocation)?;
+        loader.asd.extend_from_slice(asd);
+        // SAFETY: inherited permanent pool, exact physical GPU and exclusive PSP.
+        loader.psp = Some(
+            unsafe { crate::amdgpu_psp_ring::Psp::new_psp12(gpu, authority, pool) }
                 .map_err(Error::Psp)?,
         );
         loader.engine.secure = true;
@@ -763,17 +917,27 @@ impl Loader {
             self.engine.quiesce(false).await?;
             let psp = self.psp.as_mut().unwrap();
             psp.start().await.map_err(Error::Psp)?;
-            psp.setup_tmr(&self.toc).await.map_err(Error::Psp)?;
-            match self.graphics.as_ref() {
-                Some(graphics) => {
-                    psp.load_gfx_rdna2(graphics).await.map_err(Error::Psp)?;
-                    psp.wait_gfx_boot_rdna2().await.map_err(Error::Psp)?;
-                    self.graphics_booted = true;
+            if self.asd.is_empty() {
+                psp.setup_tmr(&self.toc).await.map_err(Error::Psp)?;
+                match self.graphics.as_ref() {
+                    Some(graphics) => {
+                        psp.load_gfx_rdna2(graphics).await.map_err(Error::Psp)?;
+                        psp.wait_gfx_boot_rdna2().await.map_err(Error::Psp)?;
+                        self.graphics_booted = true;
+                    }
+                    None => psp
+                        .load_dmub(&self.signed_instructions)
+                        .await
+                        .map_err(Error::Psp)?,
                 }
-                None => psp
-                    .load_dmub(&self.signed_instructions)
+            } else {
+                // PSP 12.0 order (`psp_hw_start`): TOC-less TMR, then the
+                // DMUB load, then the ASD load.
+                psp.setup_tmr_psp12().await.map_err(Error::Psp)?;
+                psp.load_dmub(&self.signed_instructions)
                     .await
-                    .map_err(Error::Psp)?,
+                    .map_err(Error::Psp)?;
+                psp.load_asd(&self.asd).await.map_err(Error::Psp)?;
             }
             self.engine.state = State::Stopped;
         }
@@ -800,12 +964,16 @@ impl Loader {
     }
     fn attach_transport(&mut self) -> Result<(), Error> {
         let io = &self.engine.io;
+        let regs = self.engine.regs;
+        let cached_inbox = self.engine.cached_inbox;
         let transport = self
             .engine
             .authority
             .invoke(IoOp(|| {
-                // SAFETY: this loader owns the verified running DCN314 and all mappings.
-                unsafe { Dmub::attach_regions(io.regs, self.fb, io.base, self.dpias) }
+                // SAFETY: this loader owns the verified running DMCUB and all mappings.
+                unsafe {
+                    Dmub::attach_regions(io.regs, self.fb, io.base, self.dpias, regs, cached_inbox)
+                }
             }))
             .map_err(|_| Error::Revoked)
             .and_then(|result| result.map_err(Error::Transport));

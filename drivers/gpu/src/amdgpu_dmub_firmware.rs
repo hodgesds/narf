@@ -15,6 +15,10 @@ pub const DCN315_FIRMWARE: &str = "amdgpu/dcn_3_1_5_dmcub.bin";
 pub const DCN320_FIRMWARE: &str = "amdgpu/dcn_3_2_0_dmcub.bin";
 /// `FIRMWARE_DCN_V3_2_1_DMCUB` (`amdgpu_dm_dmub.h:58`): Navi33.
 pub const DCN321_FIRMWARE: &str = "amdgpu/dcn_3_2_1_dmcub.bin";
+/// `FIRMWARE_RENOIR_DMUB` (`amdgpu_dm_dmub.h:46`).
+pub const DCN21_RENOIR_FIRMWARE: &str = "amdgpu/renoir_dmcub.bin";
+/// `FIRMWARE_GREEN_SARDINE_DMUB` (`amdgpu_dm_dmub.h:49`).
+pub const DCN21_GREEN_SARDINE_FIRMWARE: &str = "amdgpu/green_sardine_dmcub.bin";
 const HEADER_SIZE: usize = 40; // linux: sizeof(struct dmcub_firmware_header_v1_0)
 const PSP_HEADER_SIZE: usize = 256; // linux: PSP_HEADER_BYTES_256
 const META_SIZE: usize = 64; // linux: sizeof(union dmub_fw_meta)
@@ -195,6 +199,26 @@ impl<'a> Image<'a> {
         self.prepare_combined(vbios)
     }
 
+    /// Prepare the seven DCN 2.1 cache-window regions — the same
+    /// combined-image layout as DCN 3.1.4 — and record which mailbox
+    /// path the firmware version needs. `dmub_dcn20_use_cached_inbox`
+    /// is false for versions in [1.0.0, 1.10.0] and true otherwise; the
+    /// shipping green_sardine blob is 0x0101002B (1.1.43), so it takes
+    /// the uncached REGION4 path. Old firmware is NOT refused here — a
+    /// cached-only port would refuse the shipping blob. The header ip
+    /// version is not pinned: the filename (selected by MP0 version in
+    /// `Firmware::open`) identifies the blob, and only green_sardine's
+    /// header (ip 3.0) was verified.
+    pub fn prepare_dcn21(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
+        // linux-lit: 0x01000000=DMUB_FW_VERSION(1, 0, 0)
+        // linux-lit: 0x010a0000=DMUB_FW_VERSION(1, 10, 0)
+        let cached_inbox =
+            !(self.metadata.version >= 0x0100_0000 && self.metadata.version <= 0x010a_0000);
+        let mut prepared = self.prepare_combined(vbios)?;
+        prepared.cached_inbox = cached_inbox;
+        Ok(prepared)
+    }
+
     /// Prepare the seven DCN 3.2 cache-window regions — the same combined-image
     /// layout as DCN 3.1.4. Linux's `dmub_dcn32_setup_windows` programs CW3/4/5/6
     /// plus REGION5 and ignores both CW2 and the shared-state region6, so a
@@ -284,6 +308,7 @@ impl<'a> Image<'a> {
             image: self,
             vbios,
             layout,
+            cached_inbox: true,
         })
     }
 }
@@ -367,17 +392,26 @@ impl Placement {
     }
 }
 
-/// A complete CPU-side image for a future DCN314 loader. Creating or staging
+/// A complete CPU-side image for a future DMCUB loader. Creating or staging
 /// this object never implies that firmware has been loaded or booted.
 #[derive(Debug)]
 pub struct Prepared<'a> {
     image: Image<'a>,
     vbios: &'a [u8],
     layout: Layout,
+    /// Whether the firmware's mailbox is the cached CW4 one, decided
+    /// from the firmware version by `prepare_dcn21`. Every other
+    /// prepare path leaves the cached default.
+    cached_inbox: bool,
 }
 impl Prepared<'_> {
     pub fn layout(&self) -> Layout {
         self.layout
+    }
+    /// Whether the firmware's mailbox is the cached CW4 window
+    /// (`true`) or the uncached REGION4 window (`false`).
+    pub fn cached_inbox(&self) -> bool {
+        self.cached_inbox
     }
     /// Populate ordinary writable RAM, including zeroed padding, stack,
     /// mailbox, trace and state. Do not pass an MMIO mapping as a Rust slice;

@@ -480,3 +480,221 @@ kernel_test_in!(
     "drivers/gpu/psp-ring",
     psp_raphael_layout_uses_mp0_segment_zero_and_dcn315
 );
+
+/// A Renoir discovery set: MP0 11.0.3, NBIO (ungated by the Psp12
+/// arm, so the fixture version is arbitrary), DCN 2.1, HDP 5.2.1,
+/// GC 9.3.0. MP0's segments 0 and 1 differ so the base index is
+/// observable.
+fn renoir_gpu() -> AmdGpu {
+    use crate::amdgpu_discovery as d;
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(
+        crate::amdgpu::AMD_VENDOR,
+        crate::amdgpu::RENOIR,
+    )
+    .unwrap();
+    let template = gpu.ip_blocks[0];
+    let ip = |id, v: (u8, u8, u8), bases: [u32; 3]| {
+        let mut block = template;
+        block.hw_id = id;
+        (block.major, block.minor, block.revision) = v;
+        block.num_bases = 3;
+        block.base_addrs[..3].copy_from_slice(&bases);
+        block
+    };
+    gpu.ip_blocks = vec![
+        ip(d::HW_ID_MP0, (11, 0, 3), [0x1000, 0x2000, 0]),
+        ip(d::HW_ID_NBIF, (7, 2, 0), [0, 0, 0x3000]),
+        ip(d::HW_ID_DCN, (2, 1, 0), [0, 0, 0x4000]),
+        ip(d::HW_ID_HDP, (5, 2, 1), [0x5000, 0, 0]),
+        ip(d::HW_ID_GC, (9, 3, 0), [0x6000, 0x7000, 0]),
+    ];
+    gpu
+}
+/// Cezanne differs from Renoir only in the MP0 revision (12.0.1)
+/// and the PCI DID.
+fn cezanne_gpu() -> AmdGpu {
+    let mut gpu = renoir_gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(
+        crate::amdgpu::AMD_VENDOR,
+        crate::amdgpu::CEZANNE,
+    )
+    .unwrap();
+    gpu.ip_blocks[0].revision = 1;
+    gpu.ip_blocks[0].minor = 0;
+    gpu.ip_blocks[0].major = 12;
+    gpu
+}
+
+/// PSP 12.0 (`psp_v12_0`): the MP0 C2PMSG registers on `_BASE_IDX` 0
+/// (`mp_12_0_0_offset.h`), NBIO ungated, and the DCN framebuffer
+/// location at 0x493..0x495 of DCN 2.1. Both Renoir (MP0 11.0.3) and
+/// Cezanne (MP0 12.0.1) resolve through the same arm; Phoenix MP0
+/// (13.0.4) and DCN 3.1.4 are refused by it, and the reverse.
+fn psp_psp12_layout_uses_mp0_segment_zero_and_dcn21() -> TestResult {
+    let gpu = renoir_gpu();
+    let Ok(layout) = Layout::resolve(&gpu, Kind::Psp12) else {
+        return TestResult::Fail("Renoir PSP12 layout");
+    };
+    if layout.mp0 != 0x1000 * 4
+        || layout.nbio != 0x3000 * 4
+        || (layout.fb_base, layout.fb_top, layout.fb_offset)
+            != (
+                (0x4000 + 0x493) * 4,
+                (0x4000 + 0x494) * 4,
+                (0x4000 + 0x495) * 4,
+            )
+        || layout.invalidate_reg.is_some()
+        || layout.gfx_status_regs.is_some()
+    {
+        return TestResult::Fail("Renoir PSP12 banks");
+    }
+    if Layout::resolve(&cezanne_gpu(), Kind::Psp12).is_err() {
+        return TestResult::Fail("Cezanne PSP12 layout");
+    }
+    if Layout::resolve(&gpu, Kind::Phoenix).is_ok() {
+        return TestResult::Fail("PSP 12.0 taken by the 13.0.4 layout");
+    }
+    let mut phoenix_mp0 = renoir_gpu();
+    phoenix_mp0.ip_blocks[0].major = 13;
+    phoenix_mp0.ip_blocks[0].minor = 0;
+    phoenix_mp0.ip_blocks[0].revision = 4;
+    if Layout::resolve(&phoenix_mp0, Kind::Psp12).is_ok() {
+        return TestResult::Fail("PSP 13.0.4 taken by the 12.0 layout");
+    }
+    let mut dcn314 = renoir_gpu();
+    dcn314.ip_blocks[2].major = 3;
+    dcn314.ip_blocks[2].minor = 1;
+    dcn314.ip_blocks[2].revision = 4;
+    if Layout::resolve(&dcn314, Kind::Psp12).is_ok() {
+        return TestResult::Fail("PSP 12.0 beside a DCN 3.1.4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_psp12_layout_uses_mp0_segment_zero_and_dcn21
+);
+
+/// A synthetic PSP v1 ASD container: 44-byte header + payload.
+/// `version` is the header version pair; `asd_payload` must not pin it.
+fn asd_container(payload_len: usize, version: (u16, u16)) -> Vec<u8> {
+    let mut bytes = vec![0u8; 44 + payload_len];
+    let len = bytes.len() as u32;
+    bytes[0..4].copy_from_slice(&len.to_le_bytes());
+    bytes[4..8].copy_from_slice(&44u32.to_le_bytes());
+    bytes[8..10].copy_from_slice(&version.0.to_le_bytes());
+    bytes[10..12].copy_from_slice(&version.1.to_le_bytes());
+    bytes[16..20].copy_from_slice(&0x0100_0001u32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    bytes[24..28].copy_from_slice(&44u32.to_le_bytes());
+    bytes[44..].fill(0xa5);
+    bytes
+}
+
+fn psp_asd_payload_parses_without_version_pin() -> TestResult {
+    // A v1 container with a (2, 0) header: toc_payload refuses it
+    // (it pins (1, 0)); asd_payload must not — Linux's
+    // parse_psp_v1_bin_descriptor performs no validation at all.
+    let bytes = asd_container(256, (2, 0));
+    if toc_payload(&bytes).is_ok() {
+        return TestResult::Fail("TOC pin did not refuse a (2, 0) header");
+    }
+    let Ok(payload) = asd_payload(&bytes) else {
+        return TestResult::Fail("ASD payload rejected");
+    };
+    if payload.len() != 256 || payload != &bytes[44..] {
+        return TestResult::Fail("ASD payload slice");
+    }
+    // Truncated and empty-ucode containers are refused.
+    if asd_payload(&bytes[..bytes.len() - 1]).is_ok()
+        || asd_payload(&asd_container(0, (1, 0))).is_ok()
+    {
+        return TestResult::Fail("invalid ASD container accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_asd_payload_parses_without_version_pin
+);
+
+/// A `Session` on the small ring engine, with a pool big enough for
+/// the 4 MiB TOC-less TMR plus payload staging. The small pool stays
+/// alive beside the session: it owns the ring memory.
+fn session_fixture() -> (Pool, Session<Fake>) {
+    let (small_pool, engine) = fixture();
+    let map = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: 8 << 20,
+        kind: narf_bus::BarKind::Mmio32 { prefetchable: true },
+    };
+    // SAFETY: bookkeeping-only pool; Fake implements all memory accesses.
+    let pool = unsafe { Pool::from_owned_range(map, 0x2_0000_0000) }.unwrap();
+    let session = Session {
+        engine,
+        pool: pool.clone(),
+        payload: None,
+        tmr: None,
+        tmr_ready: false,
+        smc_state: SmcState::Absent,
+        smc_resident: true,
+        gfx_state: GfxLoadState::Absent,
+        gfx_status: None,
+        media_firmware: MediaFirmware::default(),
+        dmub_image: None,
+        gfx12_vcn_version: None,
+        fb_base: 0x2_0000_0000,
+        fb_offset: 0x8000_0000,
+        secure_dmub: None,
+    };
+    (small_pool, session)
+}
+
+/// PSP 12.0 TMR + ASD load: no TOC, the default 4 MiB TMR via
+/// SETUP_TMR (cmd 5), then LOAD_ASD (cmd 4) with the staged ucode
+/// payload address/length and zero shared address/length.
+fn psp_psp12_tmr_and_asd_load() -> TestResult {
+    let (_small_pool, mut session) = session_fixture();
+    if run(session.engine.start()).is_err() {
+        return TestResult::Fail("ring create");
+    }
+    let asd = asd_container(256, (1, 0));
+    if run(session.load_asd(&asd)) != Err(Error::Busy) {
+        return TestResult::Fail("ASD load without TMR accepted");
+    }
+    if run(session.setup_tmr_payload(None)).is_err()
+        || !session.tmr_ready
+        || session.tmr.as_ref().map(|tmr| tmr.size()) != Some(DEFAULT_TMR_SIZE)
+    {
+        return TestResult::Fail("TOC-less TMR setup");
+    }
+    let tmr_frame = session.engine.io.submissions[0];
+    if tmr_frame[2] != 5
+        || tmr_frame[7..13] != [0, 2, 0x400000, 2, 0x8000_0000, 0]
+        || session.engine.io.tmr_address != 0x2_0000_0000
+    {
+        return TestResult::Fail("SETUP_TMR command ABI");
+    }
+    if run(session.load_asd(&asd_container(0, (1, 0)))) != Err(Error::Invalid) {
+        return TestResult::Fail("empty ASD container accepted");
+    }
+    if run(session.load_asd(&asd)).is_err() {
+        return TestResult::Fail("ASD load");
+    }
+    let frame = session.engine.io.submissions[1];
+    if frame[0..2] != [0, 0]
+        || frame[2] != 4
+        || frame[3..7] != [0, 0, 0, 0]
+        || frame[7..13] != [0x0040_0000, 2, 256, 0, 0, 0]
+        || frame[13..].iter().any(|v| *v != 0)
+    {
+        return TestResult::Fail("LOAD_ASD command ABI");
+    }
+    if session.engine.io.payload != vec![0xa5; 256] {
+        return TestResult::Fail("ASD payload not staged");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/psp-ring", psp_psp12_tmr_and_asd_load);

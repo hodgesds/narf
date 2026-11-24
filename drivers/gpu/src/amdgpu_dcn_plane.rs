@@ -804,7 +804,7 @@ impl<I: Io> Block<I> {
                     Profile::Dcn312 | Profile::Dcn314 | Profile::Dcn315 => 0,
                     // Unreachable: this block is DCN 3.0-only
                     // (`is_dcn30` above). Mirrors Dcn314.
-                    Profile::Dcn320 | Profile::Dcn321 => 0,
+                    Profile::Dcn21 | Profile::Dcn320 | Profile::Dcn321 => 0,
                 };
                 for unit in 0..units {
                     let shift = 8 * unit;

@@ -1,6 +1,6 @@
-//! DCN 3.1.4 / 3.1.5 / 3.2.0 / 3.2.1 DMUB command transport. ABI checked
-//! against Linux display/dmub/inc/dmub_cmd.h and
-//! dmub_dcn31.c/dmub_dcn314.c/dmub_dcn32.c.
+//! DCN 2.1 / 3.1.4 / 3.1.5 / 3.2.0 / 3.2.1 DMUB command transport. ABI
+//! checked against Linux display/dmub/inc/dmub_cmd.h and
+//! dmub_dcn20.c/dmub_dcn21.c/dmub_dcn31.c/dmub_dcn314.c/dmub_dcn32.c.
 //!
 //! Attachment requires an already running DAL firmware and a mailbox wholly
 //! inside the mapped VRAM aperture. This does not load firmware or reset DMCUB.
@@ -11,6 +11,153 @@ use narf_bus::MmioRegion;
 use super::amdgpu_dmub_firmware as firmware;
 use alloc::vec::Vec;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
+
+/// One generation's DMCUB register map, as a DCN base-index-2 register
+/// number table (`u32`, matching `Io::read`/`write` in
+/// `amdgpu_dmub_boot`). DCN 2.0/2.1 and DCN 3.1.4 share the field
+/// layout — CNTL ENABLE bit 16, SOFT_RESET bit 17, TRACEPORT_EN bit
+/// 19, PWAIT bit 20 — but not the offsets, and DCN 2.0/2.1 has no
+/// CNTL2: reset is CNTL's own SOFT_RESET bit. The 3.x table is the
+/// current constants, byte-identical behavior; the 2.1 table is
+/// `dcn_2_1_0_offset.h` (all BASE_IDX 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Regs {
+    pub(crate) cntl: u32,
+    /// DCN 3.x reset register; `None` on DCN 2.0/2.1 (see `SOFT_RESET`).
+    pub(crate) cntl2: Option<u32>,
+    pub(crate) hub_reset: u32,
+    pub(crate) sec_cntl: u32,
+    pub(crate) gpint: u32,
+    pub(crate) status: u32,
+    pub(crate) stop_reply: u32,
+    pub(crate) fb_base: u32,
+    pub(crate) fb_top: u32,
+    pub(crate) fb_offset: u32,
+    pub(crate) supported: u32,
+    pub(crate) region5_offset: u32,
+    pub(crate) region5_offset_high: u32,
+    pub(crate) region5_top: u32,
+    /// DCN 2.0/2.1 uncached-mailbox window; `None` on DCN 3.x.
+    pub(crate) region4_offset: Option<u32>,
+    pub(crate) region4_offset_high: Option<u32>,
+    pub(crate) region4_top: Option<u32>,
+    pub(crate) outbox0_base: u32,
+    pub(crate) outbox0_size: u32,
+    pub(crate) outbox0_wptr: u32,
+    pub(crate) outbox0_rptr: u32,
+    pub(crate) inbox1_base: u32,
+    pub(crate) inbox1_size: u32,
+    pub(crate) inbox1_wptr: u32,
+    pub(crate) inbox1_rptr: u32,
+    pub(crate) outbox1_base: u32,
+    pub(crate) outbox1_size: u32,
+    pub(crate) outbox1_wptr: u32,
+    pub(crate) outbox1_rptr: u32,
+    pub(crate) options: u32,
+    pub(crate) psp_version: u32,
+    pub(crate) cw_base: u32,
+    pub(crate) cw_top: u32,
+    pub(crate) cw_offset: u32,
+    pub(crate) cw_offset_high: u32,
+    /// Cache windows in this generation: 8 on DCN 3.x, 7 on DCN 2.0/2.1.
+    pub(crate) cw_count: u32,
+    /// Exclusive end of the DMCUB register bank, for bounds checks.
+    pub(crate) bound: u32,
+}
+impl Regs {
+    /// DCN 3.1.4 (`dcn_3_1_4_offset.h`); DCN 3.1.5 / 3.2.0 / 3.2.1
+    /// share every offset this module reads.
+    pub(crate) const DCN314: Self = Self {
+        cntl: 0x1f6,
+        cntl2: Some(0x200),
+        hub_reset: 0x342,
+        sec_cntl: 0x1ce,
+        gpint: 0x1f8,
+        status: 0x1e3,
+        stop_reply: 0x1ea,
+        fb_base: 0x475,
+        fb_top: 0x476,
+        fb_offset: 0x477,
+        supported: 0xca,
+        region5_offset: 0x198,
+        region5_offset_high: 0x199,
+        region5_top: 0x1a2,
+        region4_offset: None,
+        region4_offset_high: None,
+        region4_top: None,
+        outbox0_base: 0x1d8,
+        outbox0_size: 0x1d9,
+        outbox0_wptr: 0x1da,
+        outbox0_rptr: 0x1db,
+        inbox1_base: 0x1d4,
+        inbox1_size: 0x1d5,
+        inbox1_wptr: 0x1d6,
+        inbox1_rptr: 0x1d7,
+        outbox1_base: 0x1dc,
+        outbox1_size: 0x1dd,
+        outbox1_wptr: 0x1de,
+        outbox1_rptr: 0x1df,
+        options: 0x1f1,
+        psp_version: 0x1f2,
+        cw_base: 0x1a5,
+        cw_top: 0x1ad,
+        cw_offset: 0x1b5,
+        cw_offset_high: 0x1b6,
+        cw_count: 8,
+        bound: 0x478,
+    };
+    /// DCN 2.1 (`dcn_2_1_0_offset.h`, all BASE_IDX 2). `dmub_dcn21.c`
+    /// is a 56-line register table over DCN 2.0's functions, and
+    /// `dmub_srv_hw_setup` gives DCN20/21 the same `dmub_srv_dcn20`
+    /// functions with only the register table swapped, so this table
+    /// serves Renoir and Cezanne alike.
+    pub(crate) const DCN21: Self = Self {
+        cntl: 0x32a0,
+        cntl2: None,
+        hub_reset: 0x0343,
+        sec_cntl: 0x3278,
+        gpint: 0x32a2,
+        status: 0x328d,
+        stop_reply: 0x3294,
+        fb_base: 0x493,
+        fb_top: 0x494,
+        fb_offset: 0x495,
+        supported: 0xca,
+        region5_offset: 0x3242,
+        region5_offset_high: 0x3243,
+        region5_top: 0x324c,
+        region4_offset: Some(0x3240),
+        region4_offset_high: Some(0x3241),
+        region4_top: Some(0x324b),
+        outbox0_base: 0x3282,
+        outbox0_size: 0x3283,
+        outbox0_wptr: 0x3284,
+        outbox0_rptr: 0x3285,
+        inbox1_base: 0x327e,
+        inbox1_size: 0x327f,
+        inbox1_wptr: 0x3280,
+        inbox1_rptr: 0x3281,
+        outbox1_base: 0x3286,
+        outbox1_size: 0x3287,
+        outbox1_wptr: 0x3288,
+        outbox1_rptr: 0x3289,
+        options: 0x329b,
+        psp_version: 0x329c,
+        cw_base: 0x324f,
+        cw_top: 0x3257,
+        cw_offset: 0x325f,
+        cw_offset_high: 0x3260,
+        cw_count: 7,
+        bound: 0x496,
+    };
+    pub(crate) fn for_version(version: (u8, u8, u8)) -> Option<Self> {
+        match version {
+            (2, 1, 0) => Some(Self::DCN21),
+            (3, 1, 4) | (3, 1, 5) | (3, 2, 0) | (3, 2, 1) => Some(Self::DCN314),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FirmwareError {
@@ -69,9 +216,10 @@ impl Firmware {
         &'a self,
         gpu: &'a AmdGpu,
     ) -> Result<firmware::Prepared<'a>, FirmwareError> {
-        let ip = dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        let ip = dmub_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
         let vbios = gpu.vbios.as_ref().ok_or(FirmwareError::VbiosUnavailable)?;
         match (ip.major, ip.minor, ip.revision) {
+            (2, 1, 0) => self.prepare_dcn21(vbios.bytes()),
             (3, 2, 0) | (3, 2, 1) => self.prepare_dcn32(vbios.bytes()),
             _ => self.prepare(vbios.bytes()),
         }
@@ -82,8 +230,24 @@ impl Firmware {
         gpu: &AmdGpu,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, FirmwareError> {
-        let ip = dcn31x_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
+        let ip = dmub_ip(gpu).map_err(|_| FirmwareError::Unsupported)?;
         let name = match (ip.major, ip.minor, ip.revision) {
+            (2, 1, 0) => {
+                // The DMCUB blob is named per APU, not per DCN version:
+                // Renoir (MP0 11.0.3) takes renoir_dmcub.bin, Cezanne
+                // (MP0 12.0.1) takes green_sardine_dmcub.bin.
+                match crate::amdgpu_discovery::find_ip(
+                    &gpu.ip_blocks,
+                    crate::amdgpu_discovery::HW_ID_MP0,
+                    0,
+                )
+                .map(|mp0| (mp0.major, mp0.minor, mp0.revision))
+                {
+                    Some((11, 0, 3)) => firmware::DCN21_RENOIR_FIRMWARE,
+                    Some((12, 0, 1)) => firmware::DCN21_GREEN_SARDINE_FIRMWARE,
+                    _ => return Err(FirmwareError::Unsupported),
+                }
+            }
             (3, 1, 5) => firmware::DCN315_FIRMWARE,
             (3, 2, 0) => firmware::DCN320_FIRMWARE,
             (3, 2, 1) => firmware::DCN321_FIRMWARE,
@@ -115,6 +279,18 @@ impl Firmware {
             .prepare_dcn32(vbios)
             .map_err(FirmwareError::Image)
     }
+    /// Prepare a DCN 2.1 image (combined layout, as for 3.1.4 — see
+    /// [`firmware::Image::prepare_dcn21`]). The returned `Prepared`
+    /// records whether the firmware version takes the cached CW4
+    /// mailbox or the uncached REGION4 one.
+    pub fn prepare_dcn21<'a>(
+        &'a self,
+        vbios: &'a [u8],
+    ) -> Result<firmware::Prepared<'a>, FirmwareError> {
+        self.image()?
+            .prepare_dcn21(vbios)
+            .map_err(FirmwareError::Image)
+    }
 }
 
 /// The DCN versions whose DMUB this module boots. Not a register window — the
@@ -139,9 +315,17 @@ impl Firmware {
 /// 0x475/0x476), and `dmub_dcn32_setup_windows` takes the same combined-image
 /// layout as 3.1.4. The 3.2-specific reset and mailbox setup live in
 /// `amdgpu_dmub_dcn32`, not here.
-const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4), (3, 1, 5), (3, 2, 0), (3, 2, 1)];
+///
+/// DCN 2.1 rides the same sequence for the same reason: `dmub_srv.c`
+/// gives `DMUB_ASIC_DCN21` the DCN 2.0 functions (`dmub_srv_dcn20_regs`
+/// + dcn20 funcs, with only the register table swapped to
+/// `dmub_srv_dcn21_regs`), and every DMCUB register both tables define
+/// sits at the same offset in `dcn_2_1_0_offset.h` as in
+/// `dcn_2_0_0_offset.h`. The 2.1-specific reset and mailbox setup live
+/// in `amdgpu_dmub_boot` (via `Regs::DCN21`), not here.
+const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(2, 1, 0), (3, 1, 4), (3, 1, 5), (3, 2, 0), (3, 2, 1)];
 
-pub(crate) fn dcn31x_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
+pub(crate) fn dmub_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
     let mut blocks = gpu
         .ip_blocks
         .iter()
@@ -182,12 +366,15 @@ pub struct Dmub {
     read: u32,
     poisoned: bool,
     dpias: u8,
+    /// This generation's DMCUB register map, for the mailbox pointers.
+    table: Regs,
 }
 /// The USB4 DPIAs this DCN's firmware serves: `dcn314_resource.c` sets
 /// `usb4_dpia_count = 4`; `dcn315_resource.c` sets none, so Linux never sends
 /// Raphael's firmware a DPIA command, and neither does this. Neither
 /// `dcn32_resource.c` nor `dcn321_resource.c` sets one either, so DCN 3.2
-/// serves none.
+/// serves none. Neither `dcn20_resource.c` nor `dcn21_resource.c` sets one
+/// either, so DCN 2.1 serves none.
 pub(crate) fn dpia_count(ip: &crate::amdgpu_discovery::IpBlock) -> u8 {
     match (ip.major, ip.minor, ip.revision) {
         (3, 1, 4) => 4,
@@ -200,23 +387,57 @@ impl Dmub {
     /// Caller exclusively owns the GPU's DMUB mailbox for the returned
     /// object's lifetime, including power management and firmware replacement.
     pub unsafe fn attach(gpu: &AmdGpu) -> Result<Self, Error> {
-        let ip = dcn31x_ip(gpu)?;
+        let ip = dmub_ip(gpu)?;
         if ip.num_bases < 3 {
             return Err(Error::Unsupported);
         }
+        let table =
+            Regs::for_version((ip.major, ip.minor, ip.revision)).ok_or(Error::Unsupported)?;
         let base = ip.base_addrs[2] as u64 * 4;
+        // Bound-check the bank before probing it: the probe below reads
+        // a register inside it.
+        if base
+            .checked_add(table.bound as u64 * 4)
+            .is_none_or(|end| end > gpu.regs.len)
+        {
+            return Err(Error::Invalid);
+        }
+        // The running firmware's mailbox mode: an uncached firmware
+        // leaves INBOX1_BASE at the fixed 0x80000000, a cached one at
+        // the CW4 window base. A stopped DMCUB reads 0 here and is
+        // refused as NotReady below, so the cached default is safe.
+        // SAFETY: bound-checked above; inherited mapping and exclusive
+        // mailbox ownership.
+        let cached_inbox =
+            unsafe { gpu.regs.read32(base + u64::from(table.inbox1_base) * 4) } != 0x8000_0000;
         // SAFETY: inherited mapping and exclusive mailbox ownership.
-        unsafe { Self::attach_regions(gpu.regs, gpu.fb_bar, base, dpia_count(ip)) }
+        unsafe {
+            Self::attach_regions(
+                gpu.regs,
+                gpu.fb_bar,
+                base,
+                dpia_count(ip),
+                table,
+                cached_inbox,
+            )
+        }
     }
     /// # Safety
-    /// Valid DCN314 mappings and exclusive DMUB ownership must outlive Self.
+    /// Valid DCN mappings and exclusive DMUB ownership must outlive Self.
+    /// `table` is the register map for this GPU's DCN version, and
+    /// `cached_inbox` is the mailbox mode the running firmware uses.
     pub(crate) unsafe fn attach_regions(
         regs: MmioRegion,
         fb: MmioRegion,
         base: u64,
         dpias: u8,
+        table: Regs,
+        cached_inbox: bool,
     ) -> Result<Self, Error> {
-        if base.checked_add(0x478 * 4).is_none_or(|end| end > regs.len) {
+        if base
+            .checked_add(table.bound as u64 * 4)
+            .is_none_or(|end| end > regs.len)
+        {
             return Err(Error::Invalid);
         }
         let mut d = Self {
@@ -231,29 +452,65 @@ impl Dmub {
             read: 0,
             poisoned: false,
             dpias,
+            table,
         };
-        if d.reg(0x1f6) & (1 << 16) == 0 || d.reg(0x1e3) & 3 != 3 {
+        if d.reg(u64::from(table.cntl)) & (1 << 16) == 0 || d.reg(u64::from(table.status)) & 3 != 3
+        {
             return Err(Error::NotReady);
         }
-        let window_base = d.reg(0x1a9) & 0x1fff_ffff;
-        let top = d.reg(0x1b1);
-        if top & (1 << 31) == 0 {
-            return Err(Error::NotReady);
-        }
-        let window_end = (top & 0x1fff_ffff) as u64;
-        let address = d.reg(0x1bd) as u64 | ((d.reg(0x1be) as u64 & 0xffff) << 32);
-        // Read the DCN314 aperture base from this IP's discovery window;
+        // The mailbox window: the cached CW4 window, or the uncached
+        // REGION4 window whose implied base is the fixed 0x80000000
+        // (`dmub_dcn20_setup_windows`).
+        let (window_base, window_end, address) = if cached_inbox {
+            let window_base = d.reg(u64::from(table.cw_base + 4)) & 0x1fff_ffff;
+            let top = d.reg(u64::from(table.cw_top + 4));
+            if top & (1 << 31) == 0 {
+                return Err(Error::NotReady);
+            }
+            let window_end = (top & 0x1fff_ffff) as u64;
+            let address = d.reg(u64::from(table.cw_offset + 8)) as u64
+                | ((d.reg(u64::from(table.cw_offset_high + 8)) as u64 & 0xffff) << 32);
+            (window_base, window_end, address)
+        } else {
+            let region4_offset = table.region4_offset.ok_or(Error::Unsupported)?;
+            let region4_offset_high = table.region4_offset_high.ok_or(Error::Unsupported)?;
+            let region4_top = table.region4_top.ok_or(Error::Unsupported)?;
+            let top = d.reg(u64::from(region4_top));
+            if top & (1 << 31) == 0 {
+                return Err(Error::NotReady);
+            }
+            let address = d.reg(u64::from(region4_offset)) as u64
+                | ((d.reg(u64::from(region4_offset_high)) as u64 & 0xffff) << 32);
+            // REGION4 has no BASE register; its implied base is 0x80000000.
+            // TOP holds size - 1, so the window ends one past TOP.
+            let window_end = 0x8000_0000u64 + (top & !0x8000_0000) as u64 + 1;
+            (0x8000_0000, window_end, address)
+        };
+        // Read the aperture base from this IP's discovery window;
         // legacy MC offsets are not valid on every Phoenix revision.
-        let fb_base = ((d.reg(0x475) & 0x00ff_ffff) as u64) << 24;
-        let fb_top = (((d.reg(0x476) & 0x00ff_ffff) as u64) + 1) << 24;
+        let fb_base = ((d.reg(u64::from(table.fb_base)) & 0x00ff_ffff) as u64) << 24;
+        let fb_top = (((d.reg(u64::from(table.fb_top)) & 0x00ff_ffff) as u64) + 1) << 24;
         if fb_top <= fb_base || address >= fb_top {
             return Err(Error::Invalid);
         }
         let offset = address.checked_sub(fb_base).ok_or(Error::Invalid)?;
-        let inbox_base = d.reg(0x1d4) & 0x1fff_ffff;
-        let outbox_base = d.reg(0x1dc) & 0x1fff_ffff;
-        d.inbox_size = d.reg(0x1d5);
-        d.outbox_size = d.reg(0x1dd);
+        // The cached path programs the rings' window bases in
+        // INBOX1/OUTBOX1 (0x64000000 / 0x64002000); the uncached path
+        // programs the raw 0x80000000 / 0x80002000 GPU addresses, which
+        // must NOT be masked — the top bit is part of the address there.
+        let (inbox_base, outbox_base) = if cached_inbox {
+            (
+                d.reg(u64::from(table.inbox1_base)) & 0x1fff_ffff,
+                d.reg(u64::from(table.outbox1_base)) & 0x1fff_ffff,
+            )
+        } else {
+            (
+                d.reg(u64::from(table.inbox1_base)),
+                d.reg(u64::from(table.outbox1_base)),
+            )
+        };
+        d.inbox_size = d.reg(u64::from(table.inbox1_size));
+        d.outbox_size = d.reg(u64::from(table.outbox1_size));
         d.inbox = mailbox_offset(
             offset,
             window_base,
@@ -273,10 +530,10 @@ impl Dmub {
         if d.inbox < d.outbox + d.outbox_size as u64 && d.outbox < d.inbox + d.inbox_size as u64 {
             return Err(Error::Invalid);
         }
-        d.write = d.reg(0x1d6);
-        let read = d.reg(0x1d7);
-        d.read = d.reg(0x1df);
-        let write = d.reg(0x1de);
+        d.write = d.reg(u64::from(table.inbox1_wptr));
+        let read = d.reg(u64::from(table.inbox1_rptr));
+        d.read = d.reg(u64::from(table.outbox1_rptr));
+        let write = d.reg(u64::from(table.outbox1_wptr));
         if !valid_pointer(d.write, d.inbox_size)
             || !valid_pointer(read, d.inbox_size)
             || !valid_pointer(d.read, d.outbox_size)
@@ -306,7 +563,7 @@ impl Dmub {
         bytes
     }
     fn outbox(&mut self) -> Result<Option<[u8; 64]>, Error> {
-        let write = self.reg(0x1de);
+        let write = self.reg(u64::from(self.table.outbox1_wptr));
         if !valid_pointer(write, self.outbox_size) {
             self.poisoned = true;
             return Err(Error::Invalid);
@@ -318,7 +575,7 @@ impl Dmub {
         let command = self.read_slot(self.outbox + self.read as u64);
         self.read = (self.read + 64) % self.outbox_size;
         fence(Ordering::Release);
-        self.write_reg(0x1df, self.read);
+        self.write_reg(u64::from(self.table.outbox1_rptr), self.read);
         Ok(Some(command))
     }
     pub async fn command(&mut self, command: [u8; 64]) -> Result<[u8; 64], Error> {
@@ -329,7 +586,7 @@ impl Dmub {
             return Err(Error::Invalid);
         }
         let next = (self.write + 64) % self.inbox_size;
-        let read = self.reg(0x1d7);
+        let read = self.reg(u64::from(self.table.inbox1_rptr));
         if !valid_pointer(read, self.inbox_size) {
             self.poisoned = true;
             return Err(Error::Invalid);
@@ -353,10 +610,10 @@ impl Dmub {
         fence(Ordering::SeqCst);
         self.write = next;
         self.poisoned = true;
-        self.write_reg(0x1d6, next);
+        self.write_reg(u64::from(self.table.inbox1_wptr), next);
         let deadline = narf_time::Deadline::after_ms(200);
         loop {
-            let read = self.reg(0x1d7);
+            let read = self.reg(u64::from(self.table.inbox1_rptr));
             if read == next {
                 fence(Ordering::Acquire);
                 let reply = self.read_slot(slot);
@@ -606,7 +863,7 @@ pub(crate) mod tests {
             return TestResult::Fail("firmware preparation ignored revoked registry authority");
         }
         gpu.ip_blocks.push(ip);
-        if dcn31x_ip(&gpu).is_ok() {
+        if dmub_ip(&gpu).is_ok() {
             return TestResult::Fail("ambiguous DCN discovery accepted");
         }
         gpu.ip_blocks.pop();
@@ -694,6 +951,7 @@ pub(crate) mod tests {
             read: 0,
             poisoned: false,
             dpias: 4,
+            table: Regs::DCN314,
         };
         let mut cx = Context::from_waker(Waker::noop());
         for next in [64u32, 0, 64] {

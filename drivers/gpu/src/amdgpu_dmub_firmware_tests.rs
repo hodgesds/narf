@@ -276,3 +276,47 @@ kernel_test_in!(
     "drivers/gpu/amdgpu-dmub",
     dmub_firmware_unsupported_layout_and_bios_bounds
 );
+
+fn dmub_firmware_prepare_dcn21_selects_mailbox_by_version() -> TestResult {
+    // The shipping green_sardine blob is 0x0101002B (1.1.43): inside
+    // [1.0.0, 1.10.0], so the uncached REGION4 path. A blob above
+    // 1.10.0 takes the cached CW4 path. The layout is otherwise the
+    // combined layout `prepare_dcn314` produces.
+    for (version, cached) in [
+        (0x0101_002b, false), // shipping green_sardine
+        (0x0100_0000, false), // 1.0.0, lower bound
+        (0x010a_0000, false), // 1.10.0, upper bound
+        (0x010a_0001, true),
+        (0x010b_0000, true),
+    ] {
+        let mut bytes = combined(256, 4);
+        let meta = bytes.len() - 256 - 4 - META_SIZE;
+        put32(&mut bytes, meta + 12, version);
+        let image = match Image::parse(&bytes) {
+            Ok(image) => image,
+            Err(_) => return TestResult::Fail("dcn21 test image rejected"),
+        };
+        if image.version() != 0x0800_5d00 || image.metadata().version != version {
+            return TestResult::Fail("dcn21 test image version not patched");
+        }
+        let prepared = match image.prepare_dcn21(&[0x3c; 512]) {
+            Ok(prepared) => prepared,
+            Err(_) => return TestResult::Fail("dcn21 combined image refused"),
+        };
+        if prepared.cached_inbox() != cached {
+            return TestResult::Fail("dcn21 mailbox path not selected by version");
+        }
+        let dcn314 = match Image::parse(&bytes).unwrap().prepare_dcn314(&[0x3c; 512]) {
+            Ok(prepared) => prepared,
+            Err(_) => return TestResult::Fail("dcn314 control image refused"),
+        };
+        if prepared.layout() != dcn314.layout() {
+            return TestResult::Fail("dcn21 layout differs from dcn314");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu-dmub",
+    dmub_firmware_prepare_dcn21_selects_mailbox_by_version
+);

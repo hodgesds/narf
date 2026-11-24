@@ -161,7 +161,9 @@ fn layout_shift(profile: Profile, reg: u64) -> u64 {
         // DCN 3.2 agrees with 3.1.4 on every OTG register this module
         // touches (dcn_3_2_0_offset.h vs dcn_3_1_4_offset.h: H_TOTAL
         // 0x1b2a through VREADY 0x1b88 identical, no 3.1.5-style insert).
-        Profile::Dcn314 | Profile::Dcn320 | Profile::Dcn321 => 0,
+        // DCN 2.1 joins the zero arm: no inserted register is known in
+        // its OTG block; revisit when the DCN 2.1 OTG block is ported.
+        Profile::Dcn21 | Profile::Dcn314 | Profile::Dcn320 | Profile::Dcn321 => 0,
     }
 }
 

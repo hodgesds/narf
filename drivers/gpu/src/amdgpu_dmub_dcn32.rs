@@ -12,7 +12,7 @@
 //! HPD subscriptions are OUT of scope for this lane (the IH lane owns
 //! them); this module never arms an HPD interrupt.
 
-use super::amdgpu_dmub::{dcn31x_ip, Dmub, Error};
+use super::amdgpu_dmub::{dmub_ip, Dmub, Error};
 use crate::amdgpu::AmdGpu;
 
 /// `regDMCUB_CNTL` — `DMCUB_ENABLE` is bit 16, `DMCUB_PWAIT_MODE_STATUS`
@@ -158,7 +158,7 @@ pub fn setup_mailbox(io: &mut impl DmubIo, inbox_base: u32, inbox_size: u32) -> 
 /// Caller exclusively owns the GPU's DMUB mailbox for the returned
 /// object's lifetime, including power management and firmware replacement.
 pub unsafe fn attach(gpu: &AmdGpu) -> Result<Dmub, Error> {
-    let ip = dcn31x_ip(gpu)?;
+    let ip = dmub_ip(gpu)?;
     if !matches!((ip.major, ip.minor, ip.revision), (3, 2, 0) | (3, 2, 1)) {
         return Err(Error::Unsupported);
     }

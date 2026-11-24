@@ -1133,6 +1133,59 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_kms_modeset_plan_round_trip);
 
+    /// Cezanne (0x1638) shares `Family::Renoir` with Renoir (0x1636),
+    /// so the same `dcn20_modeset_sequence` serves it. Pins that a
+    /// Cezanne plan flows through the 2.0 sequence: the master enable
+    /// lands on OTG_CONTROL 0x1b41 (the 3.5 sequence would put it at
+    /// 0x1b43, two dwords past where it lives on DCN 2.1).
+    fn smoke_kms_modeset_plan_cezanne_uses_dcn20_sequence() -> TestResult {
+        let mut s = KmsState::new(4);
+        s.ingest_atom_paths(
+            [DisplayPath {
+                device_tag: 0x0040,
+                connector_kind: ConnectorKind::Edp,
+                connector_index: 0,
+                gpu_object_id: 0x2100,
+            }]
+            .iter()
+            .copied(),
+        );
+        s.pick_crtc(0).expect("pick_crtc");
+        let plan = match plan_modeset(
+            &s,
+            Family::Renoir,
+            0,
+            1920,
+            1080,
+            60,
+            1920,
+            0x8000_0000,
+            0x0000_5000,
+            0,
+        ) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("plan_modeset failed"),
+        };
+        if plan.writes.is_empty() {
+            return TestResult::Fail("plan writes empty");
+        }
+        if !plan
+            .writes
+            .iter()
+            .any(|w| w.addr == 0x0000_5000 + crate::amdgpu_dcn::OTG0_OTG_CONTROL)
+        {
+            return TestResult::Fail("no OTG master-enable write at 0x1b41");
+        }
+        if plan.writes.iter().any(|w| w.addr == 0x0000_5000 + 0x1b43) {
+            return TestResult::Fail("DCN 3.5 OTG address in a DCN 2.1 plan");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_kms_modeset_plan_cezanne_uses_dcn20_sequence
+    );
+
     fn smoke_kms_modeset_plan_display_audio() -> TestResult {
         use crate::amdgpu_dcn20_audio::{
             AFMT_AUDIO_PACKET_CONTROL, DCCG_AUDIO_DTO_SOURCE, DIG_STRIDE,

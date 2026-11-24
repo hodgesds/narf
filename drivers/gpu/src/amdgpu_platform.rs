@@ -65,6 +65,47 @@ impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenToc {
         blob.invoke(CopyToc)
     }
 }
+struct CopyAsd;
+impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyAsd {
+    type Output = Result<Vec<u8>, Error>;
+    fn execute(
+        self,
+        cap: &Cap<narf_firmware::FirmwareBlob, Read>,
+    ) -> Result<Self::Output, CapError> {
+        Ok((|| {
+            let view = narf_firmware::view_of(cap).map_err(|_| Error::Invalid)?;
+            crate::amdgpu_psp_ring::asd_payload(view.bytes).map_err(Error::Psp)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(view.bytes.len())
+                .map_err(|_| Error::Allocation)?;
+            bytes.extend_from_slice(view.bytes);
+            Ok(bytes)
+        })())
+    }
+}
+struct OpenAsd(&'static str);
+impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenAsd {
+    type Output = Result<Vec<u8>, Error>;
+    fn execute(
+        self,
+        cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self::Output, CapError> {
+        let blob = match narf_firmware::open(self.0, cap) {
+            Ok(blob) => blob,
+            Err(_) => return Ok(Err(Error::Invalid)),
+        };
+        blob.invoke(CopyAsd)
+    }
+}
+
+/// The PSP image `prepare()` authenticated: a standalone TOC for PSP
+/// 13.0.4/13.0.5, or the ASD container for PSP 12.0 (Renoir/Cezanne),
+/// which loads ASD + TA only and has no TOC.
+enum PspImage {
+    Toc(Vec<u8>),
+    Asd(Vec<u8>),
+}
 
 // ── The boot-inventory register windows ───────────────────────────────────
 //
@@ -162,6 +203,14 @@ const GFXHUB_WINDOWS: &[VmWindow] = &[
         base_idx: 0,
         ctx0_cntl: 0x1624,
     },
+    // Renoir / Cezanne: `gmc_v9_0_set_gfxhub_funcs` gives every
+    // non-multi-AID GFX9 part `gfxhub_v1_0_funcs`; `gc_9_0_offset.h`
+    // puts `mmVM_CONTEXT0_CNTL` at 0x0880 on `_BASE_IDX` 0.
+    VmWindow {
+        version: (9, 3, 0),
+        base_idx: 0,
+        ctx0_cntl: 0x0880,
+    },
 ];
 
 /// The MMHUB 3.0.x headers share no window, which is why this is a table and
@@ -233,6 +282,27 @@ const MMHUB_WINDOWS: &[VmWindow] = &[
     // GMC10's MMHUB2.1 uses mmhub_v2_0 / mmhub_2_0_0_offset.h.
     VmWindow {
         version: (2, 1, 0),
+        base_idx: 0,
+        ctx0_cntl: 0x06c0,
+    },
+];
+
+/// GFX9's MMHUB table (`gmc_v9_0.c` includes
+/// `mmhub/mmhub_1_0_offset.h` and sends both MMHUB (1, 5, 0) and
+/// (2, 4, 0) to `mmhub_v1_0_funcs`). There is no
+/// `mmhub_1_5_0_offset.h` in Linux: on GFX9 both versions are the
+/// v1.0 layout, `mmVM_CONTEXT0_CNTL` 0x06c0 on `_BASE_IDX` 0.
+/// MMHUB (2, 4, 0) is ambiguous across generations — the GFX10 table
+/// above carries it at 0x0740/base 1 — so `inventory` selects this
+/// table when the GC bank is 9.x.
+const MMHUB_WINDOWS_GFX9: &[VmWindow] = &[
+    VmWindow {
+        version: (1, 5, 0),
+        base_idx: 0,
+        ctx0_cntl: 0x06c0,
+    },
+    VmWindow {
+        version: (2, 4, 0),
         base_idx: 0,
         ctx0_cntl: 0x06c0,
     },
@@ -402,8 +472,25 @@ const DCN_3_0_3: SurfaceWindow = SurfaceWindow {
     pipes: 2,
     ..DCN_3_0_0
 };
+/// `dcn/dcn_2_1_0_offset.h` — Renoir / Cezanne. DCN 2.1 shares DCN
+/// 2.0's surface window: every HUBP/cursor/OTG register the scan
+/// reads sits at the same offset as in DCN 3.1.4 (HUBP stride 0xdc,
+/// OTG stride 0x80), and `dcn21_resource.c` supplies the same 4
+/// pipes as DCN 3.1.4.
+///
+/// The APU audit claimed Renoir is DCN 2.0; `dc_resource.c` maps both
+/// ASICREV_IS_RENOIR and ASICREV_IS_GREEN_SARDINE to DCN_VERSION_2_1,
+/// and the kernel APU table agrees — so this row is (2, 1, 0), and a
+/// (2, 0, 0) blob is refused fail-closed rather than driven as 2.1.
+/// (A version-keyed (2, 0, 0) row would also match Navi10/14
+/// discrete parts with the wrong pipe counts.)
+const DCN_2_1_0: SurfaceWindow = SurfaceWindow {
+    version: (2, 1, 0),
+    ..DCN_3_1_4
+};
 const SURFACE_WINDOWS: &[SurfaceWindow] = &[
     DCN_3_0_2, DCN_3_0_3, DCN_3_1_4, DCN_3_1_5, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0,
+    DCN_2_1_0,
 ];
 
 // Field masks. `dcn_3_1_4_sh_mask.h` and `dcn_3_5_0_sh_mask.h` agree on every
@@ -442,7 +529,15 @@ fn inventory(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Result<Vec<Range<u
     use crate::amdgpu_psp_ring::bank_for;
     let (dcn, surface) = bank_for(gpu, ip::HW_ID_DCN, SURFACE_WINDOWS).map_err(Error::Psp)?;
     let (gc, gfxhub) = bank_for(gpu, ip::HW_ID_GC, GFXHUB_WINDOWS).map_err(Error::Psp)?;
-    let (hub, mmhub) = bank_for(gpu, ip::HW_ID_MMHUB, MMHUB_WINDOWS).map_err(Error::Psp)?;
+    // MMHUB (2, 4, 0) is ambiguous: on GFX9 (`gmc_v9_0`) it is the v1.0
+    // layout (0x06c0, base 0), on GFX10 (`gmc_v10_0`) the v2.3 layout
+    // (0x0740, base 1). The GC bank's major version selects the table.
+    let mmhub_windows = if gfxhub.version.0 == 9 {
+        MMHUB_WINDOWS_GFX9
+    } else {
+        MMHUB_WINDOWS
+    };
+    let (hub, mmhub) = bank_for(gpu, ip::HW_ID_MMHUB, mmhub_windows).map_err(Error::Psp)?;
     if gpu.fw_loaded || gpu.mode.is_some() {
         return Err(Error::Busy);
     }
@@ -606,7 +701,7 @@ fn scan_surfaces(
 /// Two variants are reachable from more than one place, so the stage name
 /// carries the information the variant cannot: `Invalid` from the boot
 /// framebuffer record and from its geometry arithmetic, `Revoked` from PCI
-/// authority, the firmware registry and the TOC.
+/// authority, the firmware registry and the PSP image.
 fn stage_failed<T>(stage: &str, result: Result<T, Error>) -> Result<T, Error> {
     if let Err(error) = &result {
         use core::fmt::Write as _;
@@ -650,30 +745,44 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
             .and_then(|a| a.derive().map_err(|_| Error::Revoked)),
     )?;
     // psp_init_toc_microcode: the TOC is named for the PSP's own version.
-    let toc_name = crate::amdgpu::with_controller(|gpu| {
+    // PSP 12.0 (Renoir MP0 11.0.3, Cezanne MP0 12.0.1) has no TOC: its
+    // PSP image is the ASD container (`psp_v12_0_init_microcode` loads
+    // ASD + TA only).
+    let psp_image = crate::amdgpu::with_controller(|gpu| {
         let mp0 = crate::amdgpu_discovery::find_ip(
             &gpu.ip_blocks,
             crate::amdgpu_discovery::HW_ID_MP0,
             0,
         )?;
         match (mp0.major, mp0.minor, mp0.revision) {
-            (13, 0, 4) => Some("amdgpu/psp_13_0_4_toc.bin"),
-            (13, 0, 5) => Some("amdgpu/psp_13_0_5_toc.bin"),
+            (13, 0, 4) => Some(("amdgpu/psp_13_0_4_toc.bin", true)),
+            (13, 0, 5) => Some(("amdgpu/psp_13_0_5_toc.bin", true)),
+            (11, 0, 3) => Some(("amdgpu/renoir_asd.bin", false)),
+            (12, 0, 1) => Some(("amdgpu/green_sardine_asd.bin", false)),
             // Rembrandt: MP0 13.0.1 and 13.0.3 both decode to the `yellow_carp`
             // legacy name (`amdgpu_ucode_legacy_naming`), so both load the
             // same TOC (`psp_v13_0.c`).
-            (13, 0, 1) | (13, 0, 3) => Some("amdgpu/yellow_carp_toc.bin"),
+            (13, 0, 1) | (13, 0, 3) => Some(("amdgpu/yellow_carp_toc.bin", true)),
             _ => None,
         }
     })
     .flatten();
-    let toc_name = stage_failed("psp-version", toc_name.ok_or(Error::Unsupported))?;
-    let toc = stage_failed(
-        "psp-toc-open",
-        fw_cap
-            .invoke(OpenToc(toc_name))
-            .map_err(|_| Error::Revoked)?,
-    )?;
+    let (psp_name, is_toc) = stage_failed("psp-version", psp_image.ok_or(Error::Unsupported))?;
+    let psp_image = if is_toc {
+        PspImage::Toc(stage_failed(
+            "psp-toc-open",
+            fw_cap
+                .invoke(OpenToc(psp_name))
+                .map_err(|_| Error::Revoked)?,
+        )?)
+    } else {
+        PspImage::Asd(stage_failed(
+            "psp-asd-open",
+            fw_cap
+                .invoke(OpenAsd(psp_name))
+                .map_err(|_| Error::Revoked)?,
+        )?)
+    };
     crate::amdgpu::with_controller(|gpu| {
         let firmware = stage_failed(
             "firmware-open",
@@ -694,7 +803,10 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
         // SAFETY: exact GPU, authenticated containers, lifetime mappings and
         // exclusive PSP/DMUB ownership are retained by the loader and pool.
         let mut loader = stage_failed("psp-loader", unsafe {
-            Loader::new_psp(gpu, cap, &pool, &firmware, &toc)
+            match &psp_image {
+                PspImage::Toc(toc) => Loader::new_psp(gpu, cap, &pool, &firmware, toc),
+                PspImage::Asd(asd) => Loader::new_psp12(gpu, cap, &pool, &firmware, asd),
+            }
         })?;
         graphics(gpu, &fw_cap, &mut loader);
         Ok((loader, pool))
@@ -2646,6 +2758,14 @@ mod tests {
                 base_idx: 0,
                 ctx0_cntl: 0x1624,
             },
+            // gc_9_0_offset.h: mmVM_CONTEXT0_CNTL 0x0880 _BASE_IDX 0;
+            // gmc_v9_0.c gives every non-multi-AID GFX9 part
+            // gfxhub_v1_0_funcs. Renoir / Cezanne are GC 9.3.0.
+            VmWindow {
+                version: (9, 3, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x0880,
+            },
         ];
         if GFXHUB_WINDOWS != gfxhub_expected {
             return TestResult::Fail("a GFXHUB row does not match gc_11_0_0_offset.h");
@@ -2710,6 +2830,24 @@ mod tests {
         if MMHUB_WINDOWS != mmhub_expected {
             return TestResult::Fail("an MMHUB row does not match its mmhub_3_0_x_offset.h");
         }
+        // GFX9's MMHUB table: gmc_v9_0.c sends both (1, 5, 0) and
+        // (2, 4, 0) to mmhub_v1_0_funcs, mmhub_1_0_offset.h:
+        // mmVM_CONTEXT0_CNTL 0x06c0 _BASE_IDX 0, last 0x06cf.
+        let mmhub_gfx9_expected = [
+            VmWindow {
+                version: (1, 5, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x06c0,
+            },
+            VmWindow {
+                version: (2, 4, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x06c0,
+            },
+        ];
+        if MMHUB_WINDOWS_GFX9 != mmhub_gfx9_expected {
+            return TestResult::Fail("a GFX9 MMHUB row does not match mmhub_1_0_offset.h");
+        }
         // regGCVM_CONTEXT15_CNTL 0x1697, regMMVM_CONTEXT15_CNTL 0x074f: both
         // hubs run sixteen contexts one dword apart, and the window's `last`
         // must reach the sixteenth.
@@ -2718,7 +2856,11 @@ mod tests {
         }
         {
             use crate::amdgpu_psp_ring::RegWindow as _;
-            if GFXHUB_WINDOWS[1].last() != 0x1697 || MMHUB_WINDOWS[1].last() != 0x074f {
+            if GFXHUB_WINDOWS[1].last() != 0x1697
+                || MMHUB_WINDOWS[1].last() != 0x074f
+                || MMHUB_WINDOWS_GFX9[0].last() != 0x06cf
+                || MMHUB_WINDOWS_GFX9[1].last() != 0x06cf
+            {
                 return TestResult::Fail("a VM window stops short of CONTEXT15_CNTL");
             }
         }
@@ -2806,6 +2948,13 @@ mod tests {
                 dcn300_expected,
                 dcn401_expected,
                 dcn410_expected,
+                // dcn/dcn_2_1_0_offset.h: the DCN 2.1 surface window is
+                // DCN 3.1.4's (HUBP stride 0xdc, OTG stride 0x80, 4
+                // pipes per dcn21_resource.c).
+                SurfaceWindow {
+                    version: (2, 1, 0),
+                    ..dcn314_expected
+                },
             ]
         {
             return TestResult::Fail("a DCN row does not match its dcn_x_y_z_offset.h");
