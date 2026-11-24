@@ -73,6 +73,7 @@ pub fn smbios_bdf_ext(structure: &[u8], state: &mut SmbiosBdf) {
     state.bdf_ext = v[..v.len().min(ATH11K_QMI_BDF_EXT_STR_LENGTH - 1)].to_vec();
 }
 
+#[cfg(feature = "kernel")]
 /// `ath11k_core_check_smbios` over `table`: `bdf_ext` cleared, then
 /// `dmi_walk(ath11k_core_check_cc_code_bdfext)`. Only type-0xF8
 /// structures are handed over — the callback returns at once for every
@@ -85,6 +86,7 @@ pub fn check_smbios_in(table: &narf_firmware_smbios::RawTable) -> SmbiosBdf {
     state
 }
 
+#[cfg(feature = "kernel")]
 /// `ath11k_core_check_smbios` against the table the boot-time DMI scan
 /// retained. Empty (Linux's `-ENODATA`, "SMBIOS bdf variant name not
 /// set") when the firmware gave no table or no valid `BDF_` string.

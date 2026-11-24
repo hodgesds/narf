@@ -28,14 +28,24 @@ name = "narf_drivers_wireless_ath_core"
 path = "src/lib.rs"
 
 [features]
-default = []
-kernel-test = ["dep:narf-kernel-test"]
+default = ["kernel"]
+# The PCI bring-up helpers (`qualcomm_pci`) and the boot-table SMBIOS scan
+# need kernel crates. Without `kernel` the crate is the pure ath-family
+# tables and parsers (802.1d classification, WMI NLO, SMBIOS BDF variant
+# parsing, regulatory maps), linkable into a loadable driver module.
+kernel = [
+    "dep:narf-bus",
+    "dep:narf-capabilities",
+    "dep:narf-firmware-smbios",
+    "narf-wireless/kernel",
+]
+kernel-test = ["kernel", "dep:narf-kernel-test"]
 
 [dependencies]
-narf-bus             = { path = "../../../bus" }
-narf-capabilities    = { path = "../../../capabilities" }
-narf-firmware-smbios = { path = "../../../firmware/smbios" }
-narf-wireless        = { path = "../../../wireless" }
+narf-bus             = { path = "../../../bus", optional = true }
+narf-capabilities    = { path = "../../../capabilities", optional = true }
+narf-firmware-smbios = { path = "../../../firmware/smbios", optional = true }
+narf-wireless        = { path = "../../../wireless", default-features = false }
 narf-kernel-test     = { path = "../../../verification/kernel-test", optional = true }
 
 [lints]
