@@ -154,6 +154,49 @@ kernel_test_in!(
     navi48_boot_order_failure_and_cancellation
 );
 
+/// The 21 ColdBoot stages are one shared sequence for both RDNA4 dies:
+/// there is a single `STAGES` const and no die parameter anywhere in the
+/// sequencer, so GC 12.0.0 (Navi44) runs exactly this order, with per-die
+/// differences handled inside the stage owners (see the lane 3 record).
+/// The sequencer itself takes no GPU, so a Navi44-shaped run would only
+/// assert the fake's own report back; the only die input in the boot file
+/// is `draw_inputs`, which needs a real MemoryReady run and is not
+/// fixture-testable here.
+fn navi44_boot_shares_navi48_stage_sequence() -> TestResult {
+    if STAGES
+        != [
+            Stage::MemoryTraining,
+            Stage::Sos,
+            Stage::Ring,
+            Stage::TrustedMemory,
+            Stage::Smc,
+            Stage::SmuVersions,
+            Stage::ReadBoard,
+            Stage::UploadBoard,
+            Stage::StopDmub,
+            Stage::Graphics,
+            Stage::RlcBoot,
+            Stage::ConfigureRs64,
+            Stage::PowerSetup,
+            Stage::ReadTopology,
+            Stage::MemoryTranslation,
+            Stage::InterruptRings,
+            Stage::DmaProof,
+            Stage::SetupGraphics,
+            Stage::StartMes,
+            Stage::KernelQueueProof,
+            Stage::StartDmub,
+        ]
+    {
+        return TestResult::Fail("ColdBoot stage sequence is not the shared 21-stage order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48_boot",
+    navi44_boot_shares_navi48_stage_sequence
+);
+
 /// The reserve follows the original aperture, with a 32 MiB floor and
 /// 512 MiB cap, after existing owners and requested media have been charged.
 fn navi48_client_vram_keeps_a_bounded_driver_reserve() -> TestResult {

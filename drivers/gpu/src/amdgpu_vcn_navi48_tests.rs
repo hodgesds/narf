@@ -990,6 +990,50 @@ kernel_test_in!(
     vcn5_layout_rejects_foreign_ip_and_truncated_register_banks
 );
 
+/// Navi44 shares the Navi48 VCN 5.0.0 bank: the same layout resolves on
+/// GC 12.0.0 / DID 0x7590. Whether real Navi44 silicon reports VCN 5.0.0
+/// is unverified on hardware — this pins the code's shared-bank behavior,
+/// not the silicon revision.
+fn vcn5_layout_resolves_on_navi44_and_pins_vcn_5_0_0() -> TestResult {
+    let descriptor = || {
+        let mut regs = vec![0; 0x80000 / 4];
+        let mut gpu = crate::amdgpu_gmc_navi48::tests::descriptor(&mut regs);
+        let nbif = &mut gpu.ip_blocks[2];
+        (nbif.major, nbif.minor, nbif.revision) = (6, 3, 1);
+        let mut vcn = gpu.ip_blocks[0];
+        vcn.hw_id = ip::HW_ID_VCN;
+        (vcn.major, vcn.minor, vcn.revision) = (5, 0, 0);
+        vcn.base_addrs[1] = 0x18000;
+        gpu.ip_blocks.push(vcn);
+        let mut oss = vcn;
+        oss.hw_id = ip::HW_ID_OSSSYS;
+        (oss.major, oss.minor, oss.revision) = (7, 0, 0);
+        oss.base_addrs[0] = 0x1a000;
+        gpu.ip_blocks.push(oss);
+        gpu // metadata only; no MMIO into this expired register fixture
+    };
+    let mut gpu = descriptor();
+    crate::amdgpu_rdna4::tests::Profile::Navi44.apply(&mut gpu);
+    if crate::amdgpu_rdna4::Rdna4Chip::of(&gpu) != Some(crate::amdgpu_rdna4::Rdna4Chip::Navi44) {
+        return TestResult::Fail("Navi44 fixture identified as another die");
+    }
+    let layout = Layout::resolve(&gpu).unwrap();
+    assert_eq!(
+        (layout.vcn, layout.nbio, layout.gc),
+        (0x60000, 0x30000, 0x10000)
+    );
+    // The VCN bank pins (5, 0, 0) only, on either die.
+    let mut gpu = descriptor();
+    crate::amdgpu_rdna4::tests::Profile::Navi44.apply(&mut gpu);
+    gpu.ip_blocks[5].revision = 1;
+    assert!(Layout::resolve(&gpu).is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vcn-navi48",
+    vcn5_layout_resolves_on_navi44_and_pins_vcn_5_0_0
+);
+
 struct Irqs {
     signals: Arc<[AtomicU32; 2]>,
     vector: Option<u8>,
