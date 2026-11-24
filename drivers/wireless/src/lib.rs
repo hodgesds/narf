@@ -168,7 +168,11 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "ath11k", || {
+        #[cfg(not(feature = "ath11k-module-only"))]
         ath11k::register();
+        // ath11k.ko owns the PCI ids; the AHB binder stays built in.
+        #[cfg(feature = "ath11k-module-only")]
+        ath11k::ahb_probe::register_dt_driver();
         InitResult::Ok
     });
     // ath11k AHB (IPQ8074/6018/5018, WCN6750): bind the DT nodes the

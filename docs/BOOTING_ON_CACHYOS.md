@@ -642,6 +642,39 @@ firmware/MHI bring-up, a registered `wlan*` data path, and scan results. The
 kernel-test PCI smoke intentionally stops before those asynchronous stages; it
 validates the bound device, revision, firmware directory, and MSI layout only.
 
+To run the same driver as a loadable module (`ath11k.ko`, built from the same
+source; see `drivers/wireless/specification/spec.md` §4.2), stage the module,
+step the built-in PCI claim aside, and pass the parameters on the kernel
+command line:
+
+```sh
+cargo xtask usb-image --arch=x86_64 \
+  --module-crate drivers/wireless/ath11k --allow-unsigned-modules \
+  --features narf-drivers-wireless/ath11k-module-only \
+  --initramfs-firmware "ath11k/WCN6855/hw2.1/*" \
+  --cmdline "ath11k.ssid=<ssid> ath11k.passphrase=<passphrase>"
+```
+
+`ath11k.scan=1` alone scans and prints the results. The boot log shows these
+lines in order:
+
+1. `modules: autoloaded ath11k from lib/modules/narf_drivers_wireless_ath11k.ko`;
+2. the WCN6855 probe;
+3. MHI mission mode;
+4. `qmi: FW_READY`;
+5. `wlan… registered`;
+6. the scan list;
+7. the association.
+
+The module build carries the station path only. It has no firmware crash
+recovery (a crash leaves the radio down until the next boot), and no AP,
+monitor, WoW/suspend or userspace-supplicant support. Keep Ethernet
+(`r8169`) attached for logs.
+
+The `hw2.1` files are symlinks into `hw2.0`. The import follows them; the
+`nfa765/` subdirectory is a Devicetree-only variant and is not used on this
+laptop.
+
 ## CPU and isolation status
 
 NARF selects its x86_64 domain backend at boot. It uses PKS when exposed by

@@ -1678,6 +1678,74 @@ fn e2e_intel_gpu_module_registration() -> TestResult {
 }
 kernel_test_in!("modules/e2e/intel-gpu", e2e_intel_gpu_module_registration);
 
+/// The real ath11k `.ko` (`narf-drivers-wireless-ath11k --features module`:
+/// the whole WCN6855 station driver — MHI, QMI, CE, WMI, DP, MAC and its
+/// supplicant — over `narf-module-rt` and the KABI). The compiler's
+/// relocations for several MiB of driver, `core`/`alloc` and protocol code
+/// resolve and init runs; the module claims exactly the WCN6855 id (not the
+/// built-in-only QCA6390 / QCN9074), declares the autoconnect parameters and
+/// takes a load argument, refuses a probe with no device context before any
+/// device access, and unloads leaving no match behind. QEMU has no WCN6855,
+/// so bring-up itself is proven on hardware.
+fn e2e_ath11k_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const QCOM: u16 = 0x17cb;
+    const WCN6855: u16 = 0x1103;
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath11k.ko")
+    else {
+        return TestResult::Fail("ath11k module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("ath11k module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("ath11k.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let declared = ["ssid", "psk", "passphrase", "scan"]
+        .iter()
+        .all(|name| crate::params::find(&module.params, name).is_some());
+    let applied = crate::params::find(&module.params, "ssid")
+        .is_some_and(|s| s.read() == "narf-e2e")
+        && crate::params::find(&module.params, "passphrase").is_some_and(|s| s.read().is_empty());
+    let claims = module.name() == "ath11k"
+        && count() == before + 1
+        && __module_thunk_for_test(QCOM, WCN6855).is_some()
+        && __module_thunk_for_test(QCOM, 0x1101).is_none()
+        && __module_thunk_for_test(QCOM, 0x1104).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let refused = __module_thunk_for_test(QCOM, WCN6855).is_some_and(|thunk| thunk(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("ath11k").is_err() {
+        return TestResult::Fail("could not unload ath11k.ko");
+    }
+    if !live || !declared || !applied {
+        return TestResult::Fail("ath11k.ko not Live, or its parameters missing or not applied");
+    }
+    if !claims {
+        return TestResult::Fail("ath11k.ko did not claim exactly the WCN6855 PCI id");
+    }
+    if !refused {
+        return TestResult::Fail("ath11k.ko probe accepted a token with no device context");
+    }
+    if count() != before || __module_thunk_for_test(QCOM, WCN6855).is_some() {
+        return TestResult::Fail("ath11k.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]

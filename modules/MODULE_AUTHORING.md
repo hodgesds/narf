@@ -331,6 +331,13 @@ across CPUs but never mask interrupts.
 futures under an async mutex from `narf_module_init`, and the
 `modules/e2e` kernel test loads it on both architectures.
 
+`drivers/wireless/ath11k` is the full-driver example: a whole Wi-Fi driver
+that builds both built in and as a `.ko` from one source tree. Its kernel
+services sit behind one `platform` module that re-exports the kernel crates
+(built in) or `narf-module-rt` plus KABI wrappers (module) under the same
+names. Pure protocol crates are linked with their `kernel` feature off.
+`modules/e2e/ath11k` loads it.
+
 ## Lifecycle symbols
 
 Every NARF module exports two C-ABI symbols the kernel calls:

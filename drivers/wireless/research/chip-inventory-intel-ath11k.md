@@ -82,6 +82,8 @@ Firmware API here is not one Intel-style filename integer: actual MHI/QMI firmwa
 
 Other major/minor1101/1103 combinations refine to `Unknown` and are rejected, not fallback support. PCI IDs1107/1109 (ath12k-class devices) are not matched. Linux AHB/SoC IPQ8074/IPQ6018/IPQ5018/WCN6750 are **not actual NARF matches** and are excluded from the estimated chip total; porting them would be additional bus/platform/HAL work rather than completing an admitted PCI profile.
 
+Loadable build: every `1103` refinement above (WCN6855 HW2.0/HW2.1, QCA2066, QCA6698AQ) is also claimed by `ath11k.ko`, which is the same driver source over the KABI. It carries the station subset only: no crash recovery, AP/P2P/monitor, WoW or userspace SME (`drivers/wireless/specification/spec.md` §4.2). `1101` and `1104` stay built-in only.
+
 Hardware/firmware-inapplicable distinctions with primary evidence:
 
 * Linux `ath11k/core.c::ath11k_hw_params` sets `supports_monitor=false` and `spectral.max_fft_bins=0` for QCA6390,WCN6855HW2.0/HW2.1,QCA2066,QCA6698AQ. Do **not** count missing host monitor/spectral as five required chip ports. QCN9074 has monitor/full-monitor and spectral FFT parameters, so its native implementation is missing software. Mesh is present in QCN's interface mask and absent in these client profiles' masks; do not add a mesh backend five times.

@@ -5707,6 +5707,11 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/intel_gpu.ko".into(), bytes)),
             Err(e) => println!("xtask: Intel GPU driver module unavailable ({e})"),
         }
+        // The whole ath11k driver as a `.ko` (WCN6855 over the KABI).
+        match build_module_fixture("narf-drivers-wireless-ath11k", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath11k.ko".into(), bytes)),
+            Err(e) => println!("xtask: ath11k driver module unavailable ({e})"),
+        }
     }
 
     if !fixtures.is_empty() {
