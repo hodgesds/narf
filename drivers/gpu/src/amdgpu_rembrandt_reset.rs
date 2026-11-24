@@ -14,6 +14,12 @@
 //! A failed PMFW message is reported after the config state is restored and
 //! the scratch bit cleared, as Linux does. The caller re-initializes every
 //! IP afterwards (`amdgpu_device_reinit_after_reset`).
+
+// The module's only production caller is `ColdBoot::mode2_reset`, itself
+// unwired pending platform wiring (amdgpu.rs:1012); the kernel-test suite
+// exercises `sequence` directly. Allow until the wiring lands (tracker #2467).
+#![allow(dead_code)]
+
 use crate::{amdgpu::AmdGpu, amdgpu_smu_rembrandt as smu};
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
