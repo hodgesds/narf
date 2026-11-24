@@ -1379,16 +1379,29 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     }
 
     let scanout_mode = dev.current_mode();
-    // A Meteor/Arrow Lake board with no owned panel (a desktop, or a panel
-    // takeover that failed) still scanning the GOP framebuffer: retain it
-    // for fixed-mode KMS, as an external-only Gen12 board does, and keep
-    // hotplug modesets and system suspend off the inherited pipe.
-    if firmware_scanout.is_none()
-        && scanout_mode.is_none()
-        && dev.chip.generation == Generation::MeteorLake
+    // A Meteor/Arrow Lake, Ice Lake or Skylake-class board with no owned
+    // panel (a desktop, or a panel takeover that failed) still scanning the
+    // GOP framebuffer: retain it for fixed-mode KMS, as an external-only
+    // Gen12 board does, and keep hotplug modesets and system suspend off the
+    // inherited pipe. Displays 9 and 11 have three pipes. On Gen9/Gen11 the
+    // execlists owner already starts beside it (its planes fetch below the
+    // GT arena); Meteor Lake's GuC owner takes the firmware handoff below.
+    let fixed_pipes = match dev.chip.generation {
+        Generation::MeteorLake => Some(4),
+        Generation::IceLake | Generation::Skylake => Some(3),
+        _ => None,
+    };
+    if let Some(pipes) =
+        fixed_pipes.filter(|_| firmware_scanout.is_none() && scanout_mode.is_none())
     {
         firmware_scanout = crate::intel_gpu_vram::boot_framebuffer().and_then(|fb| {
-            firmware_display::scanout(&dev.mode_window(), dev.gmadr.phys.raw(), dev.gmadr.len, fb)
+            firmware_display::scanout_on(
+                &dev.mode_window(),
+                dev.gmadr.phys.raw(),
+                dev.gmadr.len,
+                fb,
+                pipes,
+            )
         });
         if firmware_scanout.is_some() {
             dev.firmware_display = true;
