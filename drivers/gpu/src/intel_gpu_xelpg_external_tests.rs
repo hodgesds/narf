@@ -437,9 +437,10 @@ impl ExtFake {
     }
 
     /// Light the owned panel with `ip`'s resource state.
-    fn light_panel_ip(&self, ip: DisplayIp) -> Option<Mode> {
+    pub(crate) fn light_panel_ip(&self, ip: DisplayIp) -> Option<Mode> {
         let mode = Mode::VESA_1024X768_60;
         self.display_ip.set(ip);
+        self.phy.c20_port_b.set(ip == DisplayIp::Xe3Lpd);
         let release = if ip == DisplayIp::WildcatLake { 2 } else { 0 };
         self.phy
             .write32(0x5_10A0, (u32::from(ip.ver()) << 22) | (release << 14));
@@ -534,6 +535,9 @@ impl MmioWindow for ExtFake {
     }
     fn cx0_xe3(&self) -> bool {
         self.display_ip.get().is_display30()
+    }
+    fn cx0_c20_port_b(&self) -> bool {
+        self.phy.c20_port_b.get()
     }
     fn read32(&self, off: u64) -> u32 {
         if !self.access.get() {
@@ -955,6 +959,70 @@ fn smoke_lnl_external_tc_dp_alt_uses_display20_d2d() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_lnl_external_tc_dp_alt_uses_display20_d2d
+);
+
+/// Panther Lake's DDI B is a non-Type-C C20 (`intel_encoder_is_c10phy`):
+/// the route programs it without Type-C ownership, stages a DP 1.4
+/// `mtl_c20_dp_*` MPLLB state through the C20 SRAM window (the states
+/// `xe3lpd_c20_dp_edp_tables` carries at those rates), never opens the C10
+/// VDR batch, and powers the PHY down to P4PG when it stops.
+fn smoke_ptl_external_ddi_b_programs_its_c20() -> TestResult {
+    use crate::intel_gpu_xelpg::{
+        c20_pll_state, lane_powerdown_new_state, phy_kind, PhyKind, C10_VDR_CONTROL_1,
+        P4PG_STATE_DISABLE, POWERDOWN_NEW_STATE_MASK_BOTH,
+    };
+    let port = XeLpgPort::B;
+    let io = ExtFake::new(port, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel_ip(DisplayIp::Xe3Lpd) else {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    };
+    if phy_kind(&io, port) != PhyKind::C20 {
+        return TestResult::Fail("Panther Lake DDI B must be a C20");
+    }
+    let probe = match probe_sink(&io, Generation::PantherLake, port, false) {
+        Ok(probe) => probe,
+        Err(_) => return TestResult::Fail("PTL DDI B probe must succeed"),
+    };
+    if probe.tc.is_some() || probe.display_version() != 30 {
+        return TestResult::Fail("PTL DDI B has no Type-C ownership and keeps display 30");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let display = MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: &NoPipeDmc,
+    };
+    let mut route = match activate(&io, probe, fb, &display) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("PTL DDI B DP must activate beside Pipe A"),
+    };
+    let words = io.phy.sram_values();
+    let staged = [162_000u32, 270_000, 540_000, 810_000].iter().any(|clock| {
+        c20_pll_state(*clock).is_some_and(|s| s.mpllb.iter().all(|w| words.contains(w)))
+    });
+    if !staged {
+        return TestResult::Fail("the C20 SRAM must hold a DP 1.4 MPLLB state");
+    }
+    if (0..2).any(|lane| io.phy.vdr_get(lane, C10_VDR_CONTROL_1) != 0) {
+        return TestResult::Fail("a C20 port must never open the C10 VDR batch");
+    }
+    if route.stop(&io).is_err() || route.state() != RouteState::Stopped {
+        return TestResult::Fail("PTL DDI B must stop");
+    }
+    let p4pg = lane_powerdown_new_state(0, P4PG_STATE_DISABLE)
+        | lane_powerdown_new_state(1, P4PG_STATE_DISABLE);
+    if !io
+        .phy
+        .writes_to(port.buf_ctl2())
+        .iter()
+        .any(|w| w & POWERDOWN_NEW_STATE_MASK_BOTH == p4pg)
+    {
+        return TestResult::Fail("the C20 DDI B must power down to P4PG");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ptl_external_ddi_b_programs_its_c20
 );
 
 fn smoke_ptl_external_tc_dp_uses_fixed_vrr_tg() -> TestResult {
@@ -1405,8 +1473,15 @@ fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
         != Some(ExternalError::UnsupportedGeneration)
         || probe_sink(&NoAccess, Generation::MeteorLake, XeLpgPort::A, false).err()
             != Some(ExternalError::UnsupportedPort)
-        || probe_sink(&NoAccess, Generation::LunarLake, XeLpgPort::B, false).err()
+        || probe_sink(&NoAccess, Generation::PantherLake, XeLpgPort::A, false).err()
             != Some(ExternalError::UnsupportedPort)
+        || !ExternalDisplayProfile::for_ip(DisplayIp::Xe2Lpd).admits_port(XeLpgPort::B)
+        || ExternalDisplayProfile::for_ip(DisplayIp::Xe2Lpd).admits_port(XeLpgPort::A)
+        || !ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd).admits_port(XeLpgPort::B)
+        || ExternalDisplayProfile::WILDCAT_LAKE.admits_port(XeLpgPort::B)
+        || !ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd).c20_port_b()
+        || ExternalDisplayProfile::WILDCAT_LAKE.c20_port_b()
+        || ExternalDisplayProfile::for_ip(DisplayIp::Xe2Lpd).c20_port_b()
         || probe_link_profile(
             &NoAccess,
             ExternalDisplayProfile::WILDCAT_LAKE,
@@ -1956,6 +2031,118 @@ pub fn hdmi_on_ddi_b(edid: Vec<u8>) -> ExtFake {
     io
 }
 
+/// Light HDMI on DDI B beside the display-`ip` panel and return the live
+/// route, or why not.
+fn hdmi_ddi_b_route(
+    io: &ExtFake,
+    ip: DisplayIp,
+    generation: Generation,
+) -> Result<crate::intel_gpu_xelpg_hdmi::MtlHdmiRoute, &'static str> {
+    use crate::intel_gpu_xelpg_hdmi::{activate_hdmi, ddc_pin, probe_hdmi, HdmiRouteState};
+    let panel = io
+        .light_panel_ip(ip)
+        .ok_or("the fixture must light the panel")?;
+    let port = XeLpgPort::B;
+    let probe = probe_hdmi(io, generation, port, false, ddc_pin(port))
+        .map_err(|_| "the DDI B HDMI probe must read the sink's EDID")?;
+    let fb = fb_for(&probe.mode).ok_or("the mode must have a scanout")?;
+    let display = MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: &NoPipeDmc,
+    };
+    match activate_hdmi(io, probe, fb, &display) {
+        Ok(route) if route.state() == HdmiRouteState::Live && route.pipe() == Pipe::B => Ok(route),
+        _ => Err("DDI B HDMI must light Pipe B beside the panel"),
+    }
+}
+
+/// Lunar Lake HDMI on its C10 DDI B: display 20 keeps the D2D request in
+/// `DDI_BUF_CTL` (`mtl_ddi_enable_d2d`, and `intel_ddi_enable_hdmi`'s
+/// `XE2LPD_DDI_BUF_D2D_LINK_ENABLE` in the full DDI write), never in the
+/// display-14 `PORT_BUF_CTL1`, and the stop clears it there.
+fn smoke_lnl_hdmi_ddi_b_keeps_d2d_in_ddi_buf_ctl() -> TestResult {
+    use crate::intel_gpu_xe2lpd::{DDI_BUF_D2D_LINK_ENABLE, DDI_BUF_D2D_LINK_STATE};
+    let io = hdmi_on_ddi_b(edid_1024());
+    let mut route = match hdmi_ddi_b_route(&io, DisplayIp::Xe2Lpd, Generation::LunarLake) {
+        Ok(route) => route,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let port = XeLpgPort::B;
+    let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, false, false);
+    let ddi = io.read32(port.ddi_buf_ctl());
+    let d2d = DDI_BUF_CTL_ENABLE | DDI_BUF_D2D_LINK_ENABLE | DDI_BUF_D2D_LINK_STATE;
+    if io.read32(TRANS_DDI_FUNC_CTL_B) != func
+        || ddi & d2d != d2d
+        || io
+            .writes_to(port.buf_ctl1())
+            .iter()
+            .any(|v| v & crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_ENABLE != 0)
+    {
+        return TestResult::Fail("display-20 HDMI must hold D2D in DDI_BUF_CTL only");
+    }
+    if route.stop(&io).is_err()
+        || io.read32(port.ddi_buf_ctl()) & (DDI_BUF_CTL_ENABLE | DDI_BUF_D2D_LINK_ENABLE) != 0
+        || io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
+    {
+        return TestResult::Fail("the stop must drop the DDI and its D2D request");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_lnl_hdmi_ddi_b_keeps_d2d_in_ddi_buf_ctl
+);
+
+/// Panther Lake HDMI on its C20 DDI B: the TMDS state from
+/// `mtl_c20_hdmi_tables` goes through the C20 SRAM window, and display 30
+/// scans the transcoder out through the fixed-refresh VRR timing
+/// generator, started after `TRANS_DDI_FUNC_CTL` and before `TRANSCONF`.
+fn smoke_ptl_hdmi_ddi_b_runs_its_c20_through_the_vrr_tg() -> TestResult {
+    use crate::intel_gpu_vrr::{TRANS_VRR_CTL_OFFSET, VRR_CTL_VRR_ENABLE};
+    let io = hdmi_on_ddi_b(edid_1080());
+    let mut route = match hdmi_ddi_b_route(&io, DisplayIp::Xe3Lpd, Generation::PantherLake) {
+        Ok(route) => route,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if route.probe.pll.port_clock_khz != 148_500
+        || !matches!(
+            route.probe.pll.state,
+            crate::intel_gpu_xelpg::Cx0PllState::C20(..)
+        )
+        || io.phy.sram_values().is_empty()
+        || (0..2).any(|lane| {
+            io.phy
+                .vdr_get(lane, crate::intel_gpu_xelpg::C10_VDR_CONTROL_1)
+                != 0
+        })
+    {
+        return TestResult::Fail("PTL DDI B HDMI must program its C20 at 148.5 MHz");
+    }
+    let base = Pipe::B.transcoder().base();
+    let func = io.first_write(|o, v| o == TRANS_DDI_FUNC_CTL_B && v & TRANS_DDI_FUNC_ENABLE != 0);
+    let tg = io.first_write(|o, v| o == base + TRANS_VRR_CTL_OFFSET && v & VRR_CTL_VRR_ENABLE != 0);
+    let conf = io.first_write(|o, v| o == PIPECONF_B && v & ENABLE != 0);
+    match (func, tg, conf) {
+        (Some(f), Some(t), Some(c)) if f < t && t < c => {}
+        _ => {
+            return TestResult::Fail(
+                "display 30 must start the VRR TG between FUNC_CTL and TRANSCONF",
+            )
+        }
+    }
+    if route.stop(&io).is_err()
+        || io.read32(base + TRANS_VRR_CTL_OFFSET) & VRR_CTL_VRR_ENABLE != 0
+        || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
+    {
+        return TestResult::Fail("the stop must turn the VRR TG and the DDI off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ptl_hdmi_ddi_b_runs_its_c20_through_the_vrr_tg
+);
+
 fn ddi_b_event(kind: MtlHpdKind) -> MtlHpdEvent {
     MtlHpdEvent {
         pin: MtlHpdPin::DdiB,
@@ -2217,18 +2404,19 @@ fn smoke_mtl_external_service_dp_precedence_and_hdmi_refusals() -> TestResult {
     {
         return TestResult::Fail("DP-only DDI B must refuse without DDC traffic");
     }
-    // An HDMI clock without a source table refuses after the probe.
-    let io = hdmi_on_ddi_b(edid_for(123_450, 1024, 320, 24, 136, 768, 38, 3, 6));
+    // A TMDS clock past the 600 MHz source maximum refuses after the probe
+    // (C10 computes any untabled clock below it).
+    let io = hdmi_on_ddi_b(edid_for(620_000, 1024, 320, 24, 136, 768, 38, 3, 6));
     let mut service = MtlExternalService::new();
     if !matches!(
         service.handle(&io, connect, &mut fb_for),
         ServiceOutcome::Refused {
-            error: RouteError::Hdmi(HdmiError::UnsupportedClock(123_450)),
+            error: RouteError::Hdmi(HdmiError::UnsupportedClock(620_000)),
             ..
         }
     ) || service.route().is_some()
     {
-        return TestResult::Fail("untabled TMDS clock must refuse with its clock");
+        return TestResult::Fail("a TMDS clock past the source maximum must refuse with its clock");
     }
     // No scanout memory: refused, nothing owned.
     let io = hdmi_on_ddi_b(edid_1024());
@@ -2654,7 +2842,18 @@ fn smoke_mtl_dp_ssc_follows_vbt_and_sink_downspread() -> TestResult {
     // intel_c10pll_update_pll: the non-SSC C10 state zeroes PLL bytes 4..8
     // and keeps the rest; C20 tables are used as shipped.
     let rate = crate::intel_gpu_pll::LinkRate::DpHbr2;
-    let c10 = |ssc| dp_pll_request(XeLpgPort::B, rate, 4, false, false, ssc).unwrap();
+    let c10 = |ssc| {
+        dp_pll_request(
+            crate::intel_gpu_xelpg::PhyKind::C10,
+            XeLpgPort::B,
+            rate,
+            4,
+            false,
+            false,
+            ssc,
+        )
+        .unwrap()
+    };
     match (c10(true).state, c10(false).state) {
         (Cx0PllState::C10(on), Cx0PllState::C10(off))
             if on.pll[4..9] != [0; 5]
@@ -2665,7 +2864,18 @@ fn smoke_mtl_dp_ssc_follows_vbt_and_sink_downspread() -> TestResult {
                 && !c10(false).ssc => {}
         _ => return TestResult::Fail("C10 non-SSC form must zero PLL bytes 4..8 only"),
     }
-    let c20 = |ssc| dp_pll_request(XeLpgPort::Tc1, rate, 4, true, false, ssc).unwrap();
+    let c20 = |ssc| {
+        dp_pll_request(
+            crate::intel_gpu_xelpg::PhyKind::C20,
+            XeLpgPort::Tc1,
+            rate,
+            4,
+            true,
+            false,
+            ssc,
+        )
+        .unwrap()
+    };
     if c20(true).state != c20(false).state || !c20(true).ssc || c20(false).ssc {
         return TestResult::Fail("C20 keeps its table; only the SSC request differs");
     }

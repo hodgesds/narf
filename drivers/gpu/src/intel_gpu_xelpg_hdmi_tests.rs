@@ -84,7 +84,12 @@ fn smoke_mtl_hdmi_pll_tables_and_typed_refusals() -> TestResult {
         (XeLpgPort::B, 300_000, HdmiError::FrlClock(300_000)),
         (XeLpgPort::B, 600_000, HdmiError::FrlClock(600_000)),
         (XeLpgPort::B, 650_000, HdmiError::UnsupportedClock(650_000)),
-        (XeLpgPort::B, 123_456, HdmiError::UnsupportedClock(123_456)),
+        // C10 computes untabled clocks; C20 needs the platform fact.
+        (
+            XeLpgPort::Tc1,
+            123_456,
+            HdmiError::UnsupportedClock(123_456),
+        ),
         (XeLpgPort::B, 20_000, HdmiError::UnsupportedClock(20_000)),
         (XeLpgPort::Tc1, 25_200, HdmiError::UnsupportedClock(25_200)),
         (
@@ -149,6 +154,7 @@ kernel_test_in!(
 
 fn dp_pll_request_for_test(port: XeLpgPort) -> PllRequest {
     crate::intel_gpu_xelpg::dp_pll_request(
+        port.phy(),
         port,
         crate::intel_gpu_pll::LinkRate::DpHbr2,
         4,
@@ -261,12 +267,14 @@ fn hdmi_probe_b() -> MtlHdmiProbe {
     let mode = Mode::VESA_1024X768_60;
     MtlHdmiProbe {
         port: XeLpgPort::B,
+        display_ip: crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
         tc: None,
         mode,
         pll: hdmi_pll_request(XeLpgPort::B, mode.pixel_clock_khz, false).unwrap(),
         sink: SinkScdc::default(),
         link: TmdsLink::default(),
         ddc: PinPair::Pin2Bxt,
+        format: crate::intel_gpu_hdmi::SinkFormat::Rgb,
         edid: alloc::boxed::Box::new([0; crate::intel_gpu_hdmi::EDID_CAPACITY]),
         edid_len: 0,
     }
@@ -378,15 +386,15 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
         ),
         (
             Generation::LunarLake,
-            XeLpgPort::Tc1,
-            true,
-            HdmiError::Route(ExternalError::UnsupportedGeneration),
+            XeLpgPort::A,
+            false,
+            HdmiError::Route(ExternalError::UnsupportedPort),
         ),
         (
             Generation::PantherLake,
-            XeLpgPort::Tc1,
-            true,
-            HdmiError::Route(ExternalError::UnsupportedGeneration),
+            XeLpgPort::A,
+            false,
+            HdmiError::Route(ExternalError::UnsupportedPort),
         ),
         (
             Generation::MeteorLake,
@@ -406,6 +414,20 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
             Err(e) if e == error => {}
             _ => return TestResult::Fail("HDMI probe refusals must precede MMIO"),
         }
+    }
+    // Wildcat Lake's exact 30.02 profile has no HDMI route; Panther Lake's
+    // generation never stands in for it.
+    if crate::intel_gpu_xelpg_hdmi::probe_hdmi_profile(
+        &NoAccess,
+        crate::intel_gpu_xelpg_external::ExternalDisplayProfile::WILDCAT_LAKE,
+        XeLpgPort::Tc1,
+        true,
+        ddc_pin(XeLpgPort::Tc1),
+    )
+    .err()
+        != Some(HdmiError::Route(ExternalError::UnsupportedGeneration))
+    {
+        return TestResult::Fail("Wildcat Lake HDMI must refuse before MMIO");
     }
     // Corrected GMBUS numbering (Linux b90c984d): DDI B = GMBUS_PIN_2_BXT
     // ("dpb"), TCn = GMBUS_PIN_9_TC1_ICP + n - 1, all in gmbus_pins_mtp.
@@ -620,6 +642,112 @@ kernel_test_in!(
     smoke_mtl_routes_leave_stack_for_resource_planning
 );
 
+/// HDMI VSDB (`cea_db_is_hdmi_vsdb`): vendor tag 3, payload 5, the HDMI
+/// OUI LSB first, physical address 1.0.0.0.
+const HDMI_VSDB: [u8; 6] = [(3 << 5) | 5, 0x03, 0x0C, 0x00, 0x10, 0x00];
+
+/// A 4K60 (VIC 97) sink with an HDMI VSDB and no HF-VSDB, so 594 MHz RGB
+/// has no valid TMDS link, plus `blocks`.
+fn edid_4k60_y420(blocks: &[u8]) -> Vec<u8> {
+    let mut all = HDMI_VSDB.to_vec();
+    all.extend_from_slice(blocks);
+    edid_with_cta(edid_4k60(), &all)
+}
+
+/// `intel_hdmi_compute_output_format` on the Xe route: a Y420VDB VIC goes
+/// out as 4:2:0 at half the TMDS clock (297 MHz, no scrambling), its pipe
+/// runs the 1:1 scaler, the BT.709 output CSC and the `PIPE_MISC` YUV
+/// encoding, and the stop clears all three.
+fn smoke_mtl_hdmi_420_only_vic_runs_ycbcr420() -> TestResult {
+    use crate::intel_gpu_hdmi::SinkFormat;
+    // Y420VDB (extended tag 0x0E) naming VIC 97.
+    let io = ddi_b_hdmi_sink(&edid_4k60_y420(&[(7 << 5) | 2, 0x0E, 97]));
+    let probe = match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("a 4:2:0-only 4K60 sink must probe"),
+    };
+    if probe.format != SinkFormat::Ycbcr420
+        || probe.pll.port_clock_khz != 297_000
+        || probe.link != TmdsLink::default()
+    {
+        return TestResult::Fail("a Y420VDB VIC must run 4:2:0 at 297 MHz without scrambling");
+    }
+    let fb = Framebuffer {
+        phys_addr: 0x100_0000,
+        stride_bytes: 3840 * 4,
+        format: PixelFormat::Xrgb8888,
+    };
+    let mut route = match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == HdmiRouteState::Live => route,
+        _ => return TestResult::Fail("4:2:0 HDMI must light Pipe B"),
+    };
+    let pipe = Pipe::B;
+    let misc = pipe.base() + crate::intel_gpu_xelpg_dsc::PIPE_MISC_OFFSET;
+    let csc_mode = 0x4_9028 + 0x100 * pipe as u64;
+    let ps_ctrl = crate::intel_gpu_xelpg_scaler::ps_ctrl(pipe, 0);
+    let yuv = crate::intel_gpu_modeset::PIPE_MISC_YCBCR420;
+    if io.read32(misc) & yuv != yuv
+        || io.read32(csc_mode) & (1 << 30) == 0
+        || io.read32(ps_ctrl) & (1 << 31) == 0
+        || io.phy.writes_to(0x6_4130) != [297_000]
+    {
+        return TestResult::Fail(
+            "the 4:2:0 pipe must run the scaler, the YCbCr CSC and PIPE_MISC YUV",
+        );
+    }
+    // BT.709 RGB-to-YCbCr: the first coefficient pair and the luma
+    // post-offset.
+    let coeff = 0x4_9050 + 0x100 * pipe as u64;
+    if io.read32(coeff) != (0x1e08 << 16 | 0x9cc0) || io.read32(coeff + 0x28) != 0x100 {
+        return TestResult::Fail("the output CSC must carry ilk_csc_matrix_rgb_to_ycbcr");
+    }
+    if route.stop(&io).is_err()
+        || io.read32(misc) & yuv != 0
+        || io.read32(csc_mode) & (1 << 30) != 0
+        || io.read32(ps_ctrl) != 0
+    {
+        return TestResult::Fail("the stop must clear the scaler, the CSC and PIPE_MISC YUV");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_mtl_hdmi_420_only_vic_runs_ycbcr420
+);
+
+/// The 4:2:0-also fallback (Y420CMDB): RGB first, 4:2:0 only when RGB has
+/// no valid TMDS link. Display 30 carries no 4:2:0 here and refuses RGB.
+fn smoke_xe_hdmi_420_also_falls_back_and_display30_refuses() -> TestResult {
+    use crate::intel_gpu_hdmi::SinkFormat;
+    // A VDB naming VIC 97 and a Y420CMDB (extended tag 0x0F) marking it.
+    let blocks = [(2 << 5) | 1, 97, (7 << 5) | 2, 0x0F, 0x01];
+    let probe = |generation| {
+        let io = ddi_b_hdmi_sink(&edid_4k60_y420(&blocks));
+        if generation == Generation::PantherLake {
+            io.light_panel_ip(crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd);
+        }
+        probe_hdmi(&io, generation, XeLpgPort::B, false, ddc_pin(XeLpgPort::B))
+            .map(|p| (p.format, p.pll.port_clock_khz))
+    };
+    if probe(Generation::MeteorLake) != Ok((SinkFormat::Ycbcr420, 297_000)) {
+        return TestResult::Fail("RGB without a valid link must fall back to 4:2:0-also");
+    }
+    if probe(Generation::PantherLake) != Err(HdmiError::ScramblingRequired(594_000)) {
+        return TestResult::Fail("display 30 must keep RGB and refuse it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_xe_hdmi_420_also_falls_back_and_display30_refuses
+);
+
 fn smoke_mtl_hdmi_594_scrambled_route_scdc_order_and_reset() -> TestResult {
     let io = ddi_b_hdmi_sink(&edid_with_cta(edid_4k60(), &hf_vsdb(120, 0x80)));
     let probe = match probe_hdmi(
@@ -815,4 +943,103 @@ fn smoke_mtl_hdmi_scdc_low_rates_reset_and_failures() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_hdmi",
     smoke_mtl_hdmi_scdc_low_rates_reset_and_failures
+);
+
+/// `intel_c20_compute_hdmi_tmds_pll`, worked by hand at 148.5 MHz: the
+/// divider, multiplier, fraction, VCO band and HDMI divider match Linux's
+/// ideal `mtl_c20_hdmi_148_5` table (only its tuned charge-pump gains and
+/// fractional denominator differ), and the `tx[1]` word follows the
+/// platform's `tx_misc`.
+fn smoke_c20_hdmi_computed_pll() -> TestResult {
+    let mtl_h = c20_hdmi_tx_cfg1(7, 2);
+    if mtl_h != 0x5807 || c20_hdmi_tx_cfg1(3, 2) != 0x5803 || c20_hdmi_tx_cfg1(5, 4) != 0x9805 {
+        return TestResult::Fail("tx[1] must pack tx_misc, DCC range 8, DCC bypass and term ctl");
+    }
+    let Some(state) = compute_c20_hdmi_tmds(148_500, mtl_h) else {
+        return TestResult::Fail("148.5 MHz must compute");
+    };
+    let table = C20_HDMI_TMDS_TABLES
+        .iter()
+        .find(|(clock, _)| *clock == 148_500)
+        .map(|(_, s)| *s)
+        .expect("ideal 148.5 MHz table");
+    for i in [0, 1, 2, 6, 8, 9, 10] {
+        if state.mpllb[i] != table.mpllb[i] {
+            return TestResult::Fail("computed MPLLB word differs from the ideal table");
+        }
+    }
+    if state.tx != [0xBE88, mtl_h, 0]
+        || state.cmn != table.cmn
+        || state.mpllb[3] != 0x8F1C
+        || state.mpllb[7] != 0xFFFF
+    {
+        return TestResult::Fail("fixed C20 words must follow intel_c20_compute_hdmi_tmds_pll");
+    }
+    // Range: 25.175..=600 MHz.
+    if compute_c20_hdmi_tmds(25_174, mtl_h).is_some()
+        || compute_c20_hdmi_tmds(600_001, mtl_h).is_some()
+        || compute_c20_hdmi_tmds(600_000, mtl_h).is_none()
+    {
+        return TestResult::Fail("the computed PLL covers 25.175-600 MHz only");
+    }
+    // A clock no table carries: refused table-only, computed with the
+    // platform fact, on a C20 port; C10 stays table-only.
+    if hdmi_pll_request(XeLpgPort::Tc1, 108_000, true).is_ok()
+        || hdmi_pll_request_computed(XeLpgPort::Tc1, 108_000, true, Some(mtl_h)).is_err()
+    {
+        return TestResult::Fail("C20 falls back to the computed PLL with the platform fact");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_c20_hdmi_computed_pll
+);
+
+/// `intel_snps_hdmi_pll_compute_c10pll`, against Linux's own function
+/// compiled on the host (kernel `do_div`/`DIV64_U64_*` semantics, wrapping
+/// arithmetic): every byte of `pll`, `tx` and `cmn` for clocks inside and
+/// outside the ideal tables. A clock without a table now resolves on C10,
+/// with the SSC bytes cleared (`intel_c10pll_update_pll`).
+fn smoke_c10_hdmi_snps_pll_matches_linux() -> TestResult {
+    #[rustfmt::skip]
+    const LINUX: [(u32, [u8; 20], u8, u8); 18] = [
+        (25175, [0xF4, 0x00, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x55, 0xE5, 0x55, 0x55, 0x0D, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (27000, [0xF4, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x80, 0x00, 0x00, 0x0D, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (54000, [0xF4, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x80, 0x00, 0x00, 0x0C, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (74250, [0xF4, 0x00, 0x7A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x58, 0x00, 0x00, 0x0B, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (108000, [0xF4, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x80, 0x00, 0x00, 0x0B, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (148500, [0xF4, 0x00, 0x7A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x58, 0x00, 0x00, 0x0A, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (162000, [0xF4, 0x00, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x60, 0x00, 0x00, 0x0A, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (222750, [0xF4, 0x00, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x04, 0x00, 0x00, 0x0A, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (297000, [0xF4, 0x00, 0x7A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x58, 0x00, 0x00, 0x09, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (340000, [0xF4, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0xAA, 0x8A, 0xA9, 0xAA, 0x09, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (445500, [0xF4, 0x00, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x04, 0x00, 0x00, 0x09, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (594000, [0xF4, 0x00, 0x7A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x58, 0x00, 0x00, 0x08, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (600000, [0xF4, 0x00, 0x7C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x20, 0x00, 0x00, 0x08, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (33750, [0xF4, 0x00, 0x6C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0x50, 0x00, 0x00, 0x0C, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (185625, [0xF4, 0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0xAE, 0x00, 0x00, 0x0A, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (241500, [0xF4, 0x00, 0xDA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0xC8, 0x00, 0x00, 0x0A, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (266000, [0xF4, 0x00, 0x6A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x55, 0x45, 0x55, 0x55, 0x09, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+        (371250, [0xF4, 0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0x00, 0xAE, 0x00, 0x00, 0x09, 0x01, 0x4F, 0x80, 0x23], 0x10, 0x01),
+    ];
+    for (clock, pll, tx, cmn) in LINUX {
+        match compute_c10_hdmi_tmds(clock) {
+            Some(s) if s.pll == pll && s.tx == tx && s.cmn == cmn => {}
+            _ => return TestResult::Fail("C10 SNPS state differs from Linux's"),
+        }
+    }
+    // 108.108 MHz has no C10 table: it now resolves, SSC bytes cleared.
+    let Ok(req) = hdmi_pll_request(XeLpgPort::B, 108_108, false) else {
+        return TestResult::Fail("a C10 clock without a table must compute");
+    };
+    match req.state {
+        Cx0PllState::C10(s) if s.pll[4..9].iter().all(|&b| b == 0) => {}
+        _ => return TestResult::Fail("a computed C10 HDMI state must clear its SSC bytes"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_c10_hdmi_snps_pll_matches_linux
 );

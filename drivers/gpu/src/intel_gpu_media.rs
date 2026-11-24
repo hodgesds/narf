@@ -1047,6 +1047,24 @@ pub mod tests {
                 if port0 == 0 {
                     continue;
                 }
+                if crate::intel_gpu_rcs::gen8_csb(self.generation) {
+                    // Gen9/Gen11 post Gen8-format entries: IDLE_ACTIVE, then
+                    // COMPLETE | ELEMENT_SWITCH / COMPLETE | ACTIVE_IDLE.
+                    let entry = |lower: u32, desc: u64| crate::intel_gpu_rcs::CsbEntry {
+                        lower,
+                        upper: (desc >> 32) as u32,
+                    };
+                    self.push_csb(entry(crate::intel_gpu_rcs::GEN8_CSB_IDLE_ACTIVE, port0));
+                    self.execute(port0);
+                    if port1 != 0 {
+                        self.push_csb(entry(1 << 4 | 1 << 2, port0));
+                        self.execute(port1);
+                        self.push_csb(entry(1 << 4 | 1 << 3, port1));
+                    } else {
+                        self.push_csb(entry(1 << 4 | 1 << 3, port0));
+                    }
+                    continue;
+                }
                 self.push_csb(csb_promote(descriptor_sw_id(port0)));
                 self.execute(port0);
                 if port1 != 0 {
@@ -1681,8 +1699,9 @@ pub mod tests {
             return TestResult::Fail("another Gen9 engine's ELSP was rung");
         }
         // The image carries Gen9 VCS0's own register
-        // addresses, the Gen9 context-control value (0xF0008)
-        // and the ring placement.
+        // addresses, the Gen9 context-control value (0xF0008,
+        // with restore inhibited until its first save) and the
+        // ring placement.
         let image = rig
             .registry
             .borrow()
@@ -1693,7 +1712,7 @@ pub mod tests {
         if mem_rd(&image, rs + (CTX_RING_BUFFER_START as u64) * 4) != 0x12038
             || mem_rd(&image, rs + ((CTX_RING_BUFFER_START + 1) as u64) * 4)
                 != GGTT_ARENA_BASE + 0x5000
-            || mem_rd(&image, rs + ((CTX_CONTEXT_CONTROL + 1) as u64) * 4) != 0x000F_0008
+            || mem_rd(&image, rs + ((CTX_CONTEXT_CONTROL + 1) as u64) * 4) != 0x000F_0009
         {
             return TestResult::Fail("Gen9 image template addresses");
         }

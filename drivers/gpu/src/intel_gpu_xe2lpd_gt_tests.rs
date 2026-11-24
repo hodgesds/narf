@@ -462,7 +462,8 @@ pub(crate) fn xe_gem_create(
 /// system object marked for scanout (xe_bo.c::xe_gem_create_ioctl sets
 /// `XE_BO_FLAG_SCANOUT`; xe_ttm_tt_create keeps the iGPU WC caching) and,
 /// as xe does, refuses SCANOUT with WB caching. The headless profile keeps
-/// refusing the flag, and `NO_COMPRESSION` (8) stays refused on both.
+/// refusing the flag. `NO_COMPRESSION` (8) is honoured on both, as on every
+/// graphics 20+ part, and EOPNOTSUPP on Meteor Lake.
 #[cfg(target_arch = "x86_64")]
 fn smoke_xe2lpd_gt_scanout_create_flag_follows_display_profile() -> TestResult {
     use crate::intel_gpu::Generation;
@@ -496,9 +497,16 @@ fn smoke_xe2lpd_gt_scanout_create_flag_follows_display_profile() -> TestResult {
         xe_gem_create(&display, &gem, 2, 1),
         Err(FsError::InvalidData)
     );
+    assert!(xe_gem_create(&display, &gem, 8, 2).is_ok());
+    assert!(xe_gem_create(&info(lnl, Some(false)), &gem, 8, 2).is_ok());
     assert_eq!(
-        xe_gem_create(&display, &gem, 8, 2),
-        Err(FsError::InvalidData)
+        xe_gem_create(
+            &info(GtPlatform::Integrated(Generation::MeteorLake), Some(false)),
+            &gem,
+            8,
+            2
+        ),
+        Err(FsError::Unsupported)
     );
     // The headless profile (or no GT owner) has no scanout representation.
     for headless in [info(lnl, Some(false)), info(lnl, None)] {

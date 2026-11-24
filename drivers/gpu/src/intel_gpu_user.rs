@@ -191,6 +191,12 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn native_xe(&self) -> bool {
         false
     }
+    /// The Gen9/Gen11 SSEU layout the execlists owner read from the fuses,
+    /// for the i915 topology query and SSEU GETPARAMs. Default: none (later
+    /// generations publish a `GtTopology` instead).
+    fn legacy_topology(&self) -> Option<crate::intel_gpu_legacy_gt::LegacyTopology> {
+        None
+    }
     /// This function's GT owner runs beside a display it preserves (the
     /// Lunar Lake display-20 route's `DisplayPreserving` profile), so its
     /// objects may be created for scanout. Default: headless or not an
@@ -211,6 +217,16 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
         _object: Arc<crate::intel_gpu_gem::GemObject>,
         _epoch: u64,
     ) -> FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// Zero an integrated Xe2/Xe3 object's flat-CCS metadata before its
+    /// first compressed binding in `epoch`. `None` when the device has no
+    /// flat CCS to clear.
+    fn clear_system_ccs(
+        &self,
+        _object: Arc<crate::intel_gpu_gem::GemObject>,
+        _epoch: u64,
+    ) -> FsFuture<'_, Option<Arc<CompletionFence>>> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
     /// Revalidate terminal initialization and current whole-DPA ownership at
@@ -853,6 +869,32 @@ impl UserContext {
         // The staged i915 request's own band, raised by every request queued
         // behind it (update_context_prio takes the highest band counted);
         // any other claim takes the stored policy.
+        let own = state.staged.take().unwrap_or(state.policy.0);
+        let behind = state
+            .queued
+            .iter()
+            .position(|count| *count != 0)
+            .map_or(own, |band| band as u32);
+        state.job_policy = (own.min(behind), state.policy.1);
+        Ok(ContextClaim {
+            context: self.clone(),
+            epoch,
+            published: false,
+        })
+    }
+}
+
+impl UserContext {
+    /// The execlists owner's claim: [`Self::claim`]'s epoch, busy and
+    /// priority discipline without a saved image. That owner keeps one
+    /// hardware context per user context rather than restoring a pooled one.
+    pub(crate) fn claim_resident(self: &Arc<Self>, epoch: u64) -> Result<ContextClaim, FsError> {
+        let mut state = self.state.lock();
+        Self::check_state_epoch(&mut state, epoch)?;
+        if state.busy || state.last.as_ref().is_some_and(|f| f.result().is_none()) {
+            return Err(FsError::WouldBlock);
+        }
+        state.busy = true;
         let own = state.staged.take().unwrap_or(state.policy.0);
         let behind = state
             .queued

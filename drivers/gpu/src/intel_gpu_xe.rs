@@ -4,7 +4,7 @@
 use crate::{
     drm::syncobj::{self as so, SyncObjTable},
     intel_gpu_exec::{ResidentBatch, VmMapping},
-    intel_gpu_gem::{GemState, Placement},
+    intel_gpu_gem::{GemObject, GemState, Placement},
     intel_gpu_render::DeviceInfo,
     intel_gpu_uapi::{put32, put64, u32_at, u64_at},
     intel_gpu_user::{UserBackend, UserBatch, UserContext},
@@ -22,6 +22,29 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_filesystem::{FsError, IoctlContext};
 use narf_lib::sync::IrqSafeSpinLock;
+
+/// Run the flat-CCS clear for `object` once, holding its CCS state across
+/// the clear so concurrent first compressed binds wait for the same one.
+async fn ensure_system_ccs(info: &DeviceInfo, object: Arc<GemObject>) -> Result<(), FsError> {
+    let mut cleared = object.system_ccs().lock().await;
+    if *cleared {
+        return Ok(());
+    }
+    let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
+    let epoch = backend
+        .status()
+        .filter(|s| s.platform == info.platform && s.epoch != 0)
+        .ok_or(FsError::NoDevice)?
+        .epoch;
+    if let Some(fence) = backend.clear_system_ccs(object.clone(), epoch).await? {
+        fence
+            .wait()
+            .await
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
+    }
+    *cleared = true;
+    Ok(())
+}
 
 async fn ensure_vram_residency(
     backend: &dyn UserBackend,
@@ -394,14 +417,20 @@ impl XeFile {
                     crate::intel_gpu_gt::GtPlatform::NovaLakeS => 0,
                 };
                 // xe_gem_create_ioctl's EINVAL classes, then refused features.
+                // NO_COMPRESSION (8) is a known flag everywhere, honoured on
+                // graphics 20+ (its object takes no compressed PAT) and
+                // EOPNOTSUPP below.
                 if size == 0
                     || size % 4096 != 0
                     || placement == 0
                     || placement & !regions != 0
-                    || flags & !supported_flags != 0
+                    || flags & !(supported_flags | 8) != 0
                     || (flags & 4 != 0 && placement & 2 == 0)
                 {
                     return Err(FsError::InvalidData);
+                }
+                if flags & 8 != 0 && !info.platform.is_xe2() {
+                    return Err(FsError::Unsupported);
                 }
                 let caching = u16::from_le_bytes(wire[32..34].try_into().unwrap());
                 // VRAM needs WC, and scanout is never coherent with WB.
@@ -451,10 +480,16 @@ impl XeFile {
                         user.write(address, &wire)
                     },
                 )?;
-                if flags & 2 != 0 {
-                    // XE_BO_FLAG_SCANOUT; ADDFB may also set it later.
-                    if let Ok(object) = gem.object(handle) {
+                if let Ok(object) = gem.object(handle) {
+                    if flags & 2 != 0 {
+                        // XE_BO_FLAG_SCANOUT; ADDFB may also set it later.
                         object.mark_scanout();
+                    }
+                    if flags & 8 != 0 {
+                        object.mark_no_compression();
+                    }
+                    if caching == 2 && info.platform.is_discrete() {
+                        object.mark_wc_caching();
                     }
                 }
                 Ok(())
@@ -841,16 +876,31 @@ impl XeFile {
             vm.check()?;
         }
         let owner = vm.as_ref().map(|vm| vm.identity);
+        // bo->cpu_caching and XE_BO_FLAG_NO_COMPRESSION, for bind admission.
+        let mark = |object: &crate::intel_gpu_gem::GemObject| {
+            if caching == 2 {
+                object.mark_wc_caching();
+            }
+            if flags & 8 != 0 {
+                object.mark_no_compression();
+            }
+        };
+        let mark_handle = |handle| {
+            if let Ok(object) = gem.object(handle) {
+                mark(&object);
+            }
+        };
         if placement & 2 == 0 {
             let names = self.names.lock();
             if let Some(vm) = &vm {
                 vm.check()?;
             }
-            gem.create_for_vm(size, owner, |handle, _| {
+            let handle = gem.create_for_vm(size, owner, |handle, _| {
                 extensions?;
                 put32(&mut wire, 28, handle);
                 user.write(address, &wire)
             })?;
+            mark_handle(handle);
             drop(names);
             return Ok(());
         }
@@ -881,11 +931,12 @@ impl XeFile {
                         if let Some(vm) = &vm {
                             vm.check()?;
                         }
-                        gem.create_for_vm(size, owner, |handle, _| {
+                        let handle = gem.create_for_vm(size, owner, |handle, _| {
                             extensions?;
                             put32(&mut wire, 28, handle);
                             user.write(address, &wire)
                         })?;
+                        mark_handle(handle);
                         drop(names);
                         return Ok(());
                     }
@@ -897,6 +948,7 @@ impl XeFile {
         // The VRAM object exists: a refused extension drops it unpublished,
         // before any clear is submitted.
         extensions?;
+        mark(&pending.object());
         let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
         let epoch = backend
             .status()
@@ -1004,6 +1056,18 @@ impl XeFile {
         let sync = Sync::read(user, u64_at(&wire, 112), u32_at(&wire, 108), table)?;
         if vm.lr && sync.has_fence_outputs() {
             return Err(FsError::InvalidData);
+        }
+        // Integrated Xe2/Xe3 flat CCS: zero an object's compression metadata
+        // before its first compressed mapping. Linux clears it for every
+        // buffer it populates; doing it on first compressed use spares
+        // buffers never bound compressed.
+        if info.platform.is_headless_integrated() {
+            for object in binds
+                .iter()
+                .filter_map(|bind| bind.compressed_object(info.platform))
+            {
+                ensure_system_ccs(info, object).await?;
+            }
         }
         let _order = match &queue {
             Some(queue) => Some(queue.context.serial.lock().await),

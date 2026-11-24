@@ -77,10 +77,11 @@
 //!
 //! Supported on display 30: opted-in eDP takeover, linear, X-tiled and
 //! Tile4 primary flips through DPT, the 64x64 cursor, CTM and double-buffered
-//! LUTs, DSB transactions, the Xe `SCANOUT` create flag, and TC1–TC4 USB-C
-//! DP 1.4 beside the panel through the fixed-refresh VRR timing generator.
-//! Refused on display 30: eDP on Type-C and its untranscribed intermediate
-//! C20 tables, combo DDI B, HDMI, PSR and panel replay, FBC (and its dirty
+//! LUTs, DSB transactions, the Xe `SCANOUT` create flag, and DP 1.4 on
+//! TC1–TC4 USB-C and on the C20 DDI B beside the panel through the
+//! fixed-refresh VRR timing generator. Refused on display 30: eDP on Type-C
+//! and its untranscribed intermediate C20 tables, HDMI FRL, PSR and panel
+//! replay, FBC (and its dirty
 //! rectangles), compressed primaries, DC states, system suspend and relight.
 //! Wildcat Lake additionally retains only Pipes A-C and ports A/B/TC1/TC2;
 //! its distinct production option carries the proved 30.02 identity through
@@ -314,11 +315,23 @@ pub(crate) const fn pica_port_reg(off: u64) -> Option<u64> {
 pub(crate) struct View<'a, M: MmioWindow + ?Sized> {
     raw: &'a M,
     flush: bool,
+    c20_port_b: bool,
 }
 
 impl<'a, M: MmioWindow + ?Sized> View<'a, M> {
     pub(crate) fn new(raw: &'a M, flush: bool) -> Self {
-        Self { raw, flush }
+        Self {
+            raw,
+            flush,
+            c20_port_b: false,
+        }
+    }
+
+    /// This view drives Panther Lake 30.00's ports, where DDI B is a C20
+    /// ([`phy_kind`]); Wildcat Lake's DDI B stays a C10.
+    pub(crate) fn with_c20_port_b(mut self, c20: bool) -> Self {
+        self.c20_port_b = c20;
+        self
     }
 }
 
@@ -328,6 +341,9 @@ impl<M: MmioWindow + ?Sized> MmioWindow for View<'_, M> {
     }
     fn cx0_xe3(&self) -> bool {
         true
+    }
+    fn cx0_c20_port_b(&self) -> bool {
+        self.c20_port_b
     }
     fn read32(&self, off: u64) -> u32 {
         if self.flush {

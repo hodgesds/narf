@@ -208,7 +208,8 @@ impl XeLpgPort {
             XeLpgPort::Tc4 => Some(3),
         }
     }
-    /// The PHY behind this port.
+    /// The PHY behind this port on Meteor and Lunar Lake. Panther Lake's
+    /// DDI B is a C20; the PHY code asks [`phy_kind`].
     pub const fn phy(self) -> PhyKind {
         match self {
             XeLpgPort::A | XeLpgPort::B => PhyKind::C10,
@@ -592,7 +593,23 @@ impl PhyLaneConfig {
     }
 }
 
+/// `intel_encoder_is_c10phy` for `port` behind `mmio`: [`XeLpgPort::phy`],
+/// except that Panther Lake's DDI B is a C20
+/// ([`MmioWindow::cx0_c20_port_b`]).
+pub fn phy_kind<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort) -> PhyKind {
+    if port == XeLpgPort::B && mmio.cx0_c20_port_b() {
+        PhyKind::C20
+    } else {
+        port.phy()
+    }
+}
+
 impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
+    /// The PHY behind this transport's port ([`phy_kind`]).
+    pub fn kind(&self) -> PhyKind {
+        phy_kind(self.mmio, self.port)
+    }
+
     /// Create a transport for `port` over the BAR0 window `mmio`.
     pub fn new(mmio: &'a M, port: XeLpgPort) -> Self {
         Self {
@@ -861,7 +878,7 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
     /// C20 has no such gate — i915's helper early-returns for
     /// non-C10 PHYs — so this is a no-op on TC ports.
     pub fn msgbus_access_begin(&self, lane_mask: u8) -> Result<(), Cx0Error> {
-        if self.port.phy() != PhyKind::C10 {
+        if self.kind() != PhyKind::C10 {
             return Ok(());
         }
         self.rmw(
@@ -877,7 +894,7 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
     /// MASTER_LANE for PLL programming) in the control register.
     /// No-op on C20, mirroring `msgbus_access_begin`.
     pub fn msgbus_access_commit(&self, lane_mask: u8, master_lane: bool) -> Result<(), Cx0Error> {
-        if self.port.phy() != PhyKind::C10 {
+        if self.kind() != PhyKind::C10 {
             return Ok(());
         }
         let mut val = C10_VDR_CTRL_UPDATE_CFG;
@@ -1653,7 +1670,7 @@ fn program_pll_state<M: MmioWindow + ?Sized>(
     phy: &Cx0Phy<'_, M>,
     port_clock_khz: u32,
 ) -> Result<(), Cx0Error> {
-    match phy.port.phy() {
+    match phy.kind() {
         PhyKind::C10 => {
             let state = c10_pll_state(port_clock_khz, phy.port.is_edp())
                 .ok_or(Cx0Error::UnsupportedRate)?;
@@ -1709,7 +1726,7 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
     if !req.lanes.admits(req.lane_count) || (req.dp_alt && req.lanes.reversed) {
         return Err(Cx0Error::UnsupportedRate);
     }
-    let c10 = match (&req.state, port.phy()) {
+    let c10 = match (&req.state, phy_kind(mmio, port)) {
         (Cx0PllState::C10(_), PhyKind::C10) => true,
         (Cx0PllState::C20(..), PhyKind::C20) => false,
         _ => return Err(Cx0Error::UnsupportedRate),
@@ -1770,6 +1787,7 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
 /// and PORT_CLOCK_CTL leaves `SSC_ENABLE_PLLB` clear. The C20 tables are
 /// used as shipped either way; only the PORT_CLOCK_CTL bit follows `ssc`.
 pub fn dp_pll_request(
+    kind: PhyKind,
     port: XeLpgPort,
     rate: LinkRate,
     lane_count: u8,
@@ -1778,7 +1796,7 @@ pub fn dp_pll_request(
     ssc: bool,
 ) -> Result<PllRequest, Cx0Error> {
     let port_clock_khz = dp_port_clock_khz(rate).ok_or(Cx0Error::UnsupportedRate)?;
-    let state = match port.phy() {
+    let state = match kind {
         PhyKind::C10 => {
             let mut state =
                 *c10_pll_state(port_clock_khz, port.is_edp()).ok_or(Cx0Error::UnsupportedRate)?;
@@ -1812,13 +1830,13 @@ pub fn dp_pll_request(
 /// TX lanes take the HDMI default entry — the last `mtl_c10_trans_dp14`
 /// preset on C10, `mtl_c20_trans_hdmi` preset 0 on C20.
 pub fn set_signal_levels_hdmi<M: MmioWindow + ?Sized>(phy: &Cx0Phy<'_, M>) -> Result<(), Cx0Error> {
-    let entry = match phy.port.phy() {
+    let entry = match phy.kind() {
         PhyKind::C10 => C10_TRANS_DP14[9],
         PhyKind::C20 => C20_TRANS_HDMI[0],
     };
     phy.program_msgbus_timer();
     phy.msgbus_access_begin(BOTH_LANES)?;
-    if phy.port.phy() == PhyKind::C10 {
+    if phy.kind() == PhyKind::C10 {
         phy.rmw(
             BOTH_LANES,
             c10_vdr_cmn(3),
@@ -1965,7 +1983,7 @@ pub fn disable_port_pll_lanes<M: MmioWindow + ?Sized>(
 ) -> Result<(), Cx0Error> {
     let phy = Cx0Phy::with_lanes(mmio, port, lanes);
     phy.program_msgbus_timer();
-    let state = match port.phy() {
+    let state = match phy.kind() {
         PhyKind::C10 => P2PG_STATE_DISABLE,
         PhyKind::C20 => P4PG_STATE_DISABLE,
     };
@@ -2110,10 +2128,10 @@ pub fn set_signal_levels_khz<M: MmioWindow + ?Sized>(
     if !phy.lanes.admits(lane_count) {
         return Err(Cx0Error::ProtocolMismatch);
     }
-    let table = trans_table(phy.port.phy());
+    let table = trans_table(phy.kind());
     phy.program_msgbus_timer();
     phy.msgbus_access_begin(phy.lanes.owned)?;
-    if phy.port.phy() == PhyKind::C10 {
+    if phy.kind() == PhyKind::C10 {
         // `intel_c10_get_tx_vboost_lvl` / `..._term_ctl`, DP
         // branch: external (non-eDP) HBR2/HBR3 links get the
         // hotter settings.
@@ -2316,6 +2334,9 @@ pub mod tests {
         pub model_tcss: Cell<bool>,
         /// TCSS power never acknowledges a request.
         pub tcss_power_stuck: Cell<bool>,
+        /// DDI B is Panther Lake's C20 ([`MmioWindow::cx0_c20_port_b`]):
+        /// the SRAM staging window exists on it.
+        pub c20_port_b: Cell<bool>,
     }
 
     impl FakePhy {
@@ -2333,6 +2354,7 @@ pub mod tests {
                 model_ddi_idle: Cell::new(false),
                 model_tcss: Cell::new(false),
                 tcss_power_stuck: Cell::new(false),
+                c20_port_b: Cell::new(false),
             }
         }
         pub fn set_fail(&self, f: Fail) {
@@ -2379,6 +2401,10 @@ pub mod tests {
             }
             vdr.push((lane, addr, val));
         }
+        /// Every word staged through the C20 SRAM window.
+        pub fn sram_values(&self) -> Vec<u16> {
+            self.sram.borrow().iter().map(|(_, v)| *v).collect()
+        }
         pub fn sram_get(&self, addr: u16) -> u16 {
             for (a, v) in self.sram.borrow().iter() {
                 if *a == addr {
@@ -2424,6 +2450,9 @@ pub mod tests {
     }
 
     impl MmioWindow for FakePhy {
+        fn cx0_c20_port_b(&self) -> bool {
+            self.c20_port_b.get()
+        }
         fn read32(&self, off: u64) -> u32 {
             let ln0 = self.port.msgbus_ctl_ln0();
             for lane in 0..2u64 {
@@ -2528,7 +2557,7 @@ pub mod tests {
                         // Write transaction: apply the byte. The
                         // SRAM staging window only exists on C20
                         // (on C10, 0xC04 is an ordinary PLL byte).
-                        if addr == C20_WR_DATA_L && self.port.phy() == PhyKind::C20 {
+                        if addr == C20_WR_DATA_L && phy_kind(self, self.port) == PhyKind::C20 {
                             let a = ((self.vdr_get(lane as u8, C20_WR_ADDRESS_H) as u16) << 8)
                                 | self.vdr_get(lane as u8, C20_WR_ADDRESS_L) as u16;
                             let d = ((self.vdr_get(lane as u8, C20_WR_DATA_H) as u16) << 8)
@@ -3018,13 +3047,23 @@ pub mod tests {
     );
 
     fn smoke_xelpg_complete_pll_disable_sequence() -> TestResult {
-        for (port, state) in [
-            (XeLpgPort::B, P2PG_STATE_DISABLE),
-            (XeLpgPort::Tc2, P4PG_STATE_DISABLE),
+        // Panther Lake's DDI B (`c20_port_b`) is a C20: P4PG, and its PLL
+        // state goes through the C20 SRAM window.
+        for (port, c20_port_b, state) in [
+            (XeLpgPort::B, false, P2PG_STATE_DISABLE),
+            (XeLpgPort::B, true, P4PG_STATE_DISABLE),
+            (XeLpgPort::Tc2, false, P4PG_STATE_DISABLE),
         ] {
             let fake = FakePhy::new(port);
+            fake.c20_port_b.set(c20_port_b);
             if enable_port_pll(&fake, port, LinkRate::DpHbr2, 4).is_err() {
                 return TestResult::Fail("enable before complete disable failed");
+            }
+            let c20 = phy_kind(&fake, port) == PhyKind::C20;
+            let staged_mpllb = c20_pll_state(540_000)
+                .is_some_and(|s| s.mpllb.iter().all(|w| fake.sram_values().contains(w)));
+            if c20 != staged_mpllb || (fake.vdr_get(0, C10_VDR_CONTROL_1) != 0) == c20 {
+                return TestResult::Fail("the PHY kind must pick the C10 bytes or the C20 SRAM");
             }
             if disable_port_pll_complete(&fake, port).is_err() {
                 return TestResult::Fail("complete disable failed against healthy PHY");

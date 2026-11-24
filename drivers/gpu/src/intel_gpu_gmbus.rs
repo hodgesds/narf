@@ -401,10 +401,16 @@ impl GmbusPinTable {
 /// Lake and TC1..TC4 (DDI D..G) on ADL-P/N, per the platform port masks
 /// in `intel_display_device.c`. A DDI the platform does not have (the
 /// source's WARN paths) has no pin. Every result is valid in
-/// `gmbus_pins_icp`, the table these PCHs select.
+/// `gmbus_pins_icp`, the table these PCHs select. Rocket Lake takes
+/// `rkl_encoder_to_ddc_pin`: PHY A/B → `GMBUS_PIN_1_BXT + phy` with
+/// either PCH, but its TC1/TC2 ports (combo PHY C/D) take the Type-C
+/// pins only with TGP and `GMBUS_PIN_1_BXT + phy` with CMP, so without
+/// the PCH they have no default.
 pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
     match (family, ddi) {
         (_, Ddi::A) => Some(PinPair::Pin1Bxt),
+        (Gen12Platform::RocketLake, Ddi::B) => Some(PinPair::Pin2Bxt),
+        (Gen12Platform::RocketLake, _) => None,
         (Gen12Platform::AlderLakeS, Ddi::B | Ddi::C | Ddi::H | Ddi::I) => None,
         (_, Ddi::B) => Some(PinPair::Pin2Bxt),
         (_, Ddi::C) => None,
@@ -416,6 +422,30 @@ pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
         (_, Ddi::H) => None,
         (Gen12Platform::TigerLake, Ddi::I) => Some(PinPair::Pin14Tc6),
         (_, Ddi::I) => None,
+    }
+}
+
+/// The default DDC pin of a Gen11 DDI, with no VBT pin
+/// (`intel_hdmi_default_ddc_pin`). Ice Lake's ICP takes
+/// `icl_encoder_to_ddc_pin`: a combo port gets `GMBUS_PIN_1 + port`, a
+/// Type-C port `GMBUS_PIN_9_TC1 + tc`. Elkhart/Jasper Lake depend on the
+/// PCH beyond A and B: MCC is TGP-compatible and takes
+/// `mcc_encoder_to_ddc_pin` (PHY C → pin 9, PORT_D on PHY A → pin 1),
+/// while JSP is ICP-compatible (C → pin 3, D → pin 4, which
+/// `gmbus_pins_icp` lacks). Without the PCH, C and D have no default.
+pub const fn gen11_ddc_pin(
+    platform: crate::intel_gpu_gt::Gen11Platform,
+    ddi: Ddi,
+) -> Option<PinPair> {
+    use crate::intel_gpu_gt::Gen11Platform;
+    match (platform, ddi) {
+        (_, Ddi::A) => Some(PinPair::Pin1Bxt),
+        (_, Ddi::B) => Some(PinPair::Pin2Bxt),
+        (Gen11Platform::IceLake, Ddi::C) => Some(PinPair::Pin9Tc1),
+        (Gen11Platform::IceLake, Ddi::D) => Some(PinPair::Pin10Tc2),
+        (Gen11Platform::IceLake, Ddi::E) => Some(PinPair::Pin11Tc3),
+        (Gen11Platform::IceLake, Ddi::F) => Some(PinPair::Pin12Tc4),
+        _ => None,
     }
 }
 
@@ -2223,7 +2253,7 @@ pub mod tests {
         // icl_encoder_to_ddc_pin on TGL/ADL-P/ADL-N (combo A/B =
         // GMBUS_PIN_1_BXT + port, TC = GMBUS_PIN_9_TC1_ICP + tc),
         // adls_encoder_to_ddc_pin on ADL-S (A = 1, TC1..4 = 9..12).
-        use Gen12Platform::{AlderLakeN, AlderLakeP, AlderLakeS, TigerLake};
+        use Gen12Platform::{AlderLakeN, AlderLakeP, AlderLakeS, RocketLake, TigerLake};
         let ddis = [
             Ddi::A,
             Ddi::B,
@@ -2235,7 +2265,7 @@ pub mod tests {
             Ddi::H,
             Ddi::I,
         ];
-        let rows: [(Gen12Platform, [Option<u32>; 9]); 4] = [
+        let rows: [(Gen12Platform, [Option<u32>; 9]); 5] = [
             (
                 TigerLake,
                 [
@@ -2291,6 +2321,10 @@ pub mod tests {
                     None,
                     None,
                 ],
+            ),
+            (
+                RocketLake,
+                [Some(1), Some(2), None, None, None, None, None, None, None],
             ),
         ];
         for (family, want) in rows {

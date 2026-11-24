@@ -94,6 +94,18 @@ pub enum IclDpllId {
 }
 
 impl IclDpllId {
+    /// The DDI clock select for this PLL in `ICL_DPCLKA_CFGCR0`
+    /// (`ICL_DPCLKA_CFGCR0_DDI_CLK_SEL(pll->info->id, phy)`): Linux's
+    /// `enum intel_dpll_id` value, `DPLL_ID_ICL_DPLL0` 0, `_DPLL1` 1 and
+    /// `DPLL_ID_EHL_DPLL4` 2.
+    pub const fn clock_select(self) -> u32 {
+        match self {
+            IclDpllId::Dpll0 => 0,
+            IclDpllId::Dpll1 => 1,
+            IclDpllId::Dpll4 => 2,
+        }
+    }
+
     /// `_PICK_EVEN(pll, a, b)` index for the CFGCR macros:
     /// DPLL0 → 0, DPLL1 → 1, DPLL4 → 4.
     const fn index(self) -> u64 {
@@ -119,9 +131,9 @@ impl IclDpllId {
 /// - ICL PORT_C and above are Type-C ports driven by MG PLLs,
 ///   not combo DPLLs (see `intel_gpu_gen11_mg_phy`).
 /// - EHL/JSL PORT_D shares combo PHY A with PORT_A and has no
-///   dedicated PLL — Linux arbitrates the shared {0, 1, 4} pool
-///   per atomic commit, a sharing model this driver does not
-///   have; callers refuse it with a documented remainder.
+///   dedicated PLL: [`arbitrate_combo_dpll`] takes it from the
+///   {0, 1, 4} pool at modeset time, as Linux's `intel_find_dpll`
+///   does per atomic commit.
 pub fn combo_dpll_id(platform: Gen11Platform, ddi: Ddi) -> Option<IclDpllId> {
     match (platform, ddi) {
         (Gen11Platform::IceLake, Ddi::A) => Some(IclDpllId::Dpll0),
@@ -137,6 +149,48 @@ pub fn combo_dpll_id(platform: Gen11Platform, ddi: Ddi) -> Option<IclDpllId> {
         }
         _ => None,
     }
+}
+
+/// `icl_get_combo_phy_dpll`'s DPLL mask for `ddi`, in `intel_find_dpll`'s
+/// walk order (the platform's DPLL table: DPLL0, DPLL1, then EHL's
+/// DPLL4). EHL/JSL ports other than PORT_A may take DPLL4; every other
+/// Gen11 combo port takes DPLL0 or DPLL1.
+pub const fn combo_dpll_pool(platform: Gen11Platform, ddi: Ddi) -> &'static [IclDpllId] {
+    match (platform, ddi) {
+        (Gen11Platform::ElkhartLake | Gen11Platform::JasperLake, Ddi::B | Ddi::C | Ddi::D) => {
+            &[IclDpllId::Dpll0, IclDpllId::Dpll1, IclDpllId::Dpll4]
+        }
+        _ => &[IclDpllId::Dpll0, IclDpllId::Dpll1],
+    }
+}
+
+/// `intel_find_dpll` for a port without a fixed PLL (EHL/JSL PORT_D, which
+/// shares PHY A with PORT_A): a pool PLL that is enabled and already runs
+/// `cfgcr0`/`cfgcr1` is shared (`true`), otherwise the first disabled one
+/// is taken (`false`). `None` when every pool PLL runs another state.
+pub fn arbitrate_combo_dpll(
+    io: &(impl MmioWindow + ?Sized),
+    platform: Gen11Platform,
+    ddi: Ddi,
+    cfgcr0: u32,
+    cfgcr1: u32,
+) -> Option<(IclDpllId, bool)> {
+    let pool = combo_dpll_pool(platform, ddi);
+    let enabled = |id: IclDpllId| io.read32(icl_dpll_enable_reg(id)) & PLL_ENABLE != 0;
+    pool.iter()
+        .copied()
+        .find(|&id| {
+            enabled(id)
+                && io.read32(icl_dpll_cfgcr0(id)) == cfgcr0
+                && io.read32(icl_dpll_cfgcr1(id)) == cfgcr1
+        })
+        .map(|id| (id, true))
+        .or_else(|| {
+            pool.iter()
+                .copied()
+                .find(|&id| !enabled(id))
+                .map(|id| (id, false))
+        })
 }
 
 /// `_ICL_DPLL0_CFGCR0` 0x164000, stride 0x80 per PLL
@@ -1391,6 +1445,67 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gen11_dpll",
         smoke_mg_pll_enable_disable
+    );
+
+    /// EHL/JSL PORT_D (Q8): `intel_find_dpll` over the {DPLL0, DPLL1,
+    /// DPLL4} pool. The first disabled PLL in table order is taken, an
+    /// enabled one already running the state is shared, a pool with every
+    /// PLL busy elsewhere refuses, and PORT_A never sees DPLL4.
+    fn smoke_ehl_port_d_dpll_arbitration() -> TestResult {
+        use Gen11Platform as P;
+        let (cfgcr0, cfgcr1) = (0x0000_01A5, 0x53);
+        let ehl = P::ElkhartLake;
+        // Nothing enabled: DPLL0.
+        let mmio = DpllMmio::new();
+        if arbitrate_combo_dpll(&mmio, ehl, Ddi::D, cfgcr0, cfgcr1)
+            != Some((IclDpllId::Dpll0, false))
+        {
+            return TestResult::Fail("an idle pool must give PORT_D DPLL0");
+        }
+        // DPLL0 busy with another state: DPLL1.
+        if combo_pll_enable(&mmio, IclDpllId::Dpll0, 0x1234, 0x5).is_err() {
+            return TestResult::Fail("fixture DPLL0 enable");
+        }
+        if arbitrate_combo_dpll(&mmio, ehl, Ddi::D, cfgcr0, cfgcr1)
+            != Some((IclDpllId::Dpll1, false))
+        {
+            return TestResult::Fail("a busy DPLL0 must move PORT_D to DPLL1");
+        }
+        // DPLL1 busy with the same state: shared.
+        if combo_pll_enable(&mmio, IclDpllId::Dpll1, cfgcr0, cfgcr1).is_err() {
+            return TestResult::Fail("fixture DPLL1 enable");
+        }
+        if arbitrate_combo_dpll(&mmio, ehl, Ddi::D, cfgcr0, cfgcr1)
+            != Some((IclDpllId::Dpll1, true))
+        {
+            return TestResult::Fail("an identical running state must be shared");
+        }
+        // DPLL0 and DPLL1 run other states: a new state takes DPLL4.
+        if arbitrate_combo_dpll(&mmio, ehl, Ddi::D, 0x77, 0x1) != Some((IclDpllId::Dpll4, false)) {
+            return TestResult::Fail("DPLL4 must be the last free pool PLL");
+        }
+        if combo_pll_enable(&mmio, IclDpllId::Dpll4, 0x99, 0x2).is_err() {
+            return TestResult::Fail("fixture DPLL4 enable");
+        }
+        if arbitrate_combo_dpll(&mmio, ehl, Ddi::D, 0x77, 0x1).is_some() {
+            return TestResult::Fail("a pool with every PLL busy must refuse");
+        }
+        // The pools: PORT_A and every ICL port never take DPLL4.
+        if combo_dpll_pool(P::JasperLake, Ddi::A) != [IclDpllId::Dpll0, IclDpllId::Dpll1]
+            || combo_dpll_pool(P::IceLake, Ddi::B) != [IclDpllId::Dpll0, IclDpllId::Dpll1]
+            || combo_dpll_pool(P::JasperLake, Ddi::D)
+                != [IclDpllId::Dpll0, IclDpllId::Dpll1, IclDpllId::Dpll4]
+        {
+            return TestResult::Fail("icl_get_combo_phy_dpll mask mismatch");
+        }
+        if IclDpllId::Dpll4.clock_select() != 2 || IclDpllId::Dpll1.clock_select() != 1 {
+            return TestResult::Fail("DPCLKA clock select must be the intel_dpll_id value");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_dpll",
+        smoke_ehl_port_d_dpll_arbitration
     );
 
     fn smoke_tbt_pll_enable_disable() -> TestResult {

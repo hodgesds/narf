@@ -66,6 +66,8 @@ fn scheduler_caps(info: &DeviceInfo) -> i32 {
 struct ParamFacts {
     /// set_proto_ctx_param's intel_uc_uses_guc_submission for LOW_LATENCY.
     low_latency: bool,
+    /// GETPARAM GTT_SIZE: the context VM's `vm->total`.
+    gtt_size: u64,
     scheduler: i32,
     sys_admin: bool,
     sys_nice: bool,
@@ -95,6 +97,7 @@ impl ParamFacts {
         };
         Self {
             low_latency,
+            gtt_size: info.platform.ppgtt_va_size(),
             scheduler,
             sys_admin,
             sys_nice,
@@ -686,7 +689,7 @@ impl Namespaces {
             // GETPARAM never reads the input size; it reports size 0.
             context.finalized = true;
             let value = match param {
-                abi::CONTEXT_PARAM_GTT_SIZE => 1 << 48,
+                abi::CONTEXT_PARAM_GTT_SIZE => facts.gtt_size,
                 abi::CONTEXT_PARAM_NO_ERROR_CAPTURE => {
                     u64::from(context.no_error_capture.protected())
                 }
@@ -2105,7 +2108,29 @@ fn observed_topology(info: &DeviceInfo) -> Result<&crate::intel_gpu_topology::Gt
         .ok_or(FsError::NoDevice)
 }
 
+/// The Gen9/Gen11 SSEU layout, when this card's backend read one.
+fn legacy_topology(info: &DeviceInfo) -> Option<crate::intel_gpu_legacy_gt::LegacyTopology> {
+    info.backend.as_ref()?.legacy_topology()
+}
+
 fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
+    if let Some(topology) = legacy_topology(info) {
+        // i915_getparam.c: the gen9/gen11 sseu_dev_info, with a zero mask
+        // ENODEV.
+        let value = match param {
+            33 => Some(topology.subslice_total()),
+            34 => Some(topology.eu_total()),
+            46 => Some(topology.slice_mask()),
+            47 => Some(topology.subslice_mask()),
+            _ => None,
+        };
+        if let Some(value) = value {
+            return match value {
+                0 => Err(FsError::NoDevice),
+                v => i32::try_from(v).map_err(|_| FsError::NoDevice),
+            };
+        }
+    }
     Ok(match param {
         // Obsolete UMS/DRI parameters are ENODEV in Linux, not fabricated zero.
         1..=3 | 14 => return Err(FsError::NoDevice),
@@ -2224,7 +2249,8 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
             }
             i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
         }
-        23 => 1, // I915_PARAM_HAS_GEM_USERPTR
+        // I915_PARAM_HAS_SECURE_BATCHES: graphics 6+ never grants them.
+        23 => 0,
         abi::PARAM_PERF_REVISION => i32::from(
             info.backend
                 .as_ref()
@@ -2451,6 +2477,15 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
                 }
                 abi::QUERY_HWCONFIG => {
                     Cow::Borrowed(info.hwconfig.as_ref().ok_or(FsError::NoDevice)?.as_bytes())
+                }
+                // query_geometry_subslices is ENODEV below 12.50.
+                abi::QUERY_TOPOLOGY | abi::QUERY_GEOMETRY_SUBSLICES
+                    if legacy_topology(info).is_some() =>
+                {
+                    if id == abi::QUERY_GEOMETRY_SUBSLICES {
+                        return Err(FsError::NoDevice);
+                    }
+                    Cow::Owned(legacy_topology(info).expect("checked").i915_bytes())
                 }
                 abi::QUERY_TOPOLOGY | abi::QUERY_GEOMETRY_SUBSLICES => {
                     let topology = info.topology.as_ref().ok_or(FsError::NoDevice)?;
@@ -3969,15 +4004,16 @@ pub(crate) mod tests {
             let file = RenderFile::new();
             let user = User::new();
 
-            // 1. Verify I915_PARAM_HAS_GEM_USERPTR reports 1
+            // 1. GETPARAM 23 is I915_PARAM_HAS_SECURE_BATCHES, never granted
+            // from graphics 6 on; userptr support is the ioctl itself.
             let mut getparam_req = [0; 16];
-            put32(&mut getparam_req, 0, 23); // I915_PARAM_HAS_GEM_USERPTR
+            put32(&mut getparam_req, 0, 23);
             put64(&mut getparam_req, 8, 1024);
             user.store(64, &getparam_req);
             invoke(&file, &user, abi::GETPARAM).map_err(|_| "getparam 23")?;
             let val = i32::from_le_bytes(user.load(1024, 4).try_into().unwrap());
-            if val != 1 {
-                return Err("I915_PARAM_HAS_GEM_USERPTR != 1");
+            if val != 0 {
+                return Err("I915_PARAM_HAS_SECURE_BATCHES != 0");
             }
 
             // 2. Alignment checks: unaligned pointer or unaligned size
@@ -4590,4 +4626,77 @@ pub(crate) mod tests {
     mod discovery {
         include!("intel_gpu_i915_info_tests.rs");
     }
+
+    /// Gen9/Gen11: the execlists backend's fuse topology answers the SSEU
+    /// GETPARAMs, and a published backend that is not native Xe is the
+    /// i915 node Mesa expects on these generations.
+    fn smoke_i915_legacy_topology_getparams() -> TestResult {
+        use crate::intel_gpu_legacy_gt::{Gen9Kind, LegacyTopology, WaPlatform};
+        struct Legacy(LegacyTopology);
+        impl core::fmt::Debug for Legacy {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("Legacy")
+            }
+        }
+        const CML: GtPlatform = GtPlatform::Gen9(crate::intel_gpu_gt::Gen9Platform::CometLake);
+        impl crate::intel_gpu_user::UserBackend for Legacy {
+            fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+                Some(crate::intel_gpu_user::UserStatus {
+                    epoch: 7,
+                    platform: CML,
+                    submission_version: (0, 0, 0),
+                    engines: crate::intel_gpu_engine::EngineSet::of(&[
+                        crate::intel_gpu_engine::Engine::Rcs0,
+                    ]),
+                })
+            }
+            fn legacy_topology(&self) -> Option<LegacyTopology> {
+                Some(self.0)
+            }
+            fn submit<'a>(
+                &'a self,
+                _: Arc<crate::intel_gpu_user::UserContext>,
+                _: crate::intel_gpu_user::UserBatch,
+            ) -> narf_filesystem::FsFuture<'a, Arc<crate::intel_gpu_fence::CompletionFence>>
+            {
+                alloc::boxed::Box::pin(async { Err(FsError::Unsupported) })
+            }
+        }
+        check(|| {
+            // One slice, subslice 0 fused off, every EU on.
+            let topology = LegacyTopology::read(
+                WaPlatform::Gen9 {
+                    kind: Gen9Kind::CometLake,
+                    revision: 0,
+                },
+                |reg| if reg == 0x9120 { 1 << 25 | 1 << 20 } else { 0 },
+            )
+            .ok_or("topology")?;
+            let info = DeviceInfo {
+                device_id: 0x9bc4,
+                platform: CML,
+                memory_bytes: 0x8000_0000,
+                hwconfig: None,
+                topology: None,
+                vram: None,
+                backend: Some(Arc::new(Legacy(topology))),
+            };
+            if info.native_xe() || !info.submission_ready() {
+                return Err("an execlists backend publishes the i915 node");
+            }
+            if getparam(&info, 46) != Ok(1)
+                || getparam(&info, 47) != Ok(0xe)
+                || getparam(&info, 33) != Ok(3)
+                || getparam(&info, 34) != Ok(24)
+                || getparam(&info, 23) != Ok(0)
+            {
+                return Err("SSEU getparams from the fuse topology");
+            }
+            Ok(())
+        })
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_i915_legacy_topology_getparams
+    );
 }

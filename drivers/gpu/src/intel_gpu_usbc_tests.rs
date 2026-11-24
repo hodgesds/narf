@@ -24,7 +24,8 @@ fn smoke_usbc_pin_d_pll_signal_and_stop_preserve_usb_lane() -> TestResult {
     }
     io.writes.borrow_mut().clear();
     let lanes = PhyLaneConfig::for_route(true, 2, false).unwrap();
-    let mut request = dp_pll_request(port, LinkRate::DpHbr2, 2, true, false, false).unwrap();
+    let mut request =
+        dp_pll_request(port.phy(), port, LinkRate::DpHbr2, 2, true, false, false).unwrap();
     request.lanes = lanes;
     let phy = Cx0Phy::with_lanes(&io, port, lanes);
     if enable_port_pll_state(&io, port, &request).is_err()
@@ -63,7 +64,8 @@ kernel_test_in!(
 fn smoke_usbc_board_reversal_selects_lane1_clock_and_high_txs() -> TestResult {
     let port = XeLpgPort::B;
     let io = FakePhy::new(port);
-    let mut request = dp_pll_request(port, LinkRate::DpHbr2, 2, false, false, false).unwrap();
+    let mut request =
+        dp_pll_request(port.phy(), port, LinkRate::DpHbr2, 2, false, false, false).unwrap();
     request.lanes = PhyLaneConfig::for_route(false, 4, true).unwrap();
     if enable_port_pll_state(&io, port, &request).is_err() {
         return TestResult::Fail("reversed PLL must enable");

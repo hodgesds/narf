@@ -77,7 +77,7 @@ pub(crate) mod training;
 // The DRIVER source uses `HSW_PWR_WELL_CTL2`.
 
 /// DRIVER source's power-well control register.
-const PWR_WELL_CTL2: u64 = 0x4_5404;
+pub(crate) const PWR_WELL_CTL2: u64 = 0x4_5404;
 
 /// Compute the REQUEST bit for a given power-well index.
 const fn pwr_well_req(pw_idx: u32) -> u32 {
@@ -106,6 +106,24 @@ enum PowerWell {
 /// module's is private (the Gen11 MG PHY keeps its own copy
 /// the same way).
 const GEN9_DP_TP_CTL_OFFSET: u64 = 0x40;
+
+/// `PIPE_MISC` (pipe base + 0x30) YCbCr bits: `PIPE_MISC_YUV420_ENABLE`
+/// (27), `PIPE_MISC_YUV420_MODE_FULL_BLEND` (26),
+/// `PIPE_MISC_OUTPUT_COLORSPACE_YUV` (11).
+const PIPE_MISC_YUV420_ENABLE: u32 = 1 << 27;
+const PIPE_MISC_YUV420_MODE_FULL_BLEND: u32 = 1 << 26;
+const PIPE_MISC_OUTPUT_COLORSPACE_YUV: u32 = 1 << 11;
+const PIPE_MISC_YUV_MASK: u32 =
+    PIPE_MISC_YUV420_ENABLE | PIPE_MISC_YUV420_MODE_FULL_BLEND | PIPE_MISC_OUTPUT_COLORSPACE_YUV;
+/// `PIPE_CSC_MODE(pipe)` (`_PIPE_A_CSC_MODE` 0x49028, pipe stride 0x100)
+/// and `ICL_OUTPUT_CSC_ENABLE` (30).
+const PIPE_CSC_MODE: u64 = 0x49028;
+const ICL_OUTPUT_CSC_ENABLE: u32 = 1 << 30;
+/// `PIPE_CSC_OUTPUT_COEFF_RY_GY(pipe)` (`_PIPE_A_OUTPUT_CSC_COEFF_RY_GY`
+/// 0x49050); BY/RU_GU/BU/RV_GV/BV follow at +4 each, the pre-offsets at
+/// +0x18/+0x1c/+0x20 and the post-offsets at +0x24/+0x28/+0x2c.
+const PIPE_CSC_OUTPUT_COEFF_RY_GY: u64 = 0x49050;
+const PIPE_COLOR_STRIDE: u64 = 0x100;
 const GEN9_DP_TP_CTL_ENABLE: u32 = 1 << 31;
 const GEN9_DP_TP_CTL_ENHANCED_FRAME_ENABLE: u32 = 1 << 18;
 const GEN9_DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
@@ -145,6 +163,36 @@ const fn dpll_enable_off(dpll_idx: u32) -> u64 {
         1 => DPLL1_ENABLE,
         _ => DPLL2_ENABLE,
     }
+}
+
+/// `RKL_DPLL_CFGCR0(pll)`: the TGL bases at stride 8 (`_MMIO_PLL`), so
+/// DPLL4 (id 2) sits at the DPLL2 slot.
+const fn rkl_dpll_cfgcr0(dpll_idx: u32) -> u64 {
+    match dpll_idx {
+        0 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
+        1 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL1,
+        _ => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL2,
+    }
+}
+
+/// `RKL_DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(phy)`: `_PICK(phy, 0, 2, 4, 27)`.
+const fn rkl_dpclka_sel_shift(phy: u32) -> u32 {
+    match phy {
+        0 => 0,
+        1 => 2,
+        2 => 4,
+        _ => 27,
+    }
+}
+
+/// `RKL_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK(phy)`.
+const fn rkl_dpclka_clk_sel_mask(phy: u32) -> u32 {
+    0x3 << rkl_dpclka_sel_shift(phy)
+}
+
+/// `RKL_DPCLKA_CFGCR0_DDI_CLK_OFF(phy)`: `REG_BIT(phy + 10)`.
+const fn rkl_dpclka_clk_off(phy: u32) -> u32 {
+    1 << (phy + 10)
 }
 
 /// Combo PHY DDIs A/B/C use DPLL 0/1/2. Type-C dispatches through
@@ -379,6 +427,13 @@ pub fn to_pll_rate(rate: crate::dp_link_training::LinkRate) -> LinkRate {
     }
 }
 
+/// The link rate a run without a negotiated plan (the legacy panel
+/// entry and the fixed-mode restore) starts training at, and so the
+/// rate its link clock is first programmed for. The training
+/// callbacks retune the clock when the fallback ladder steps down.
+const UNPLANNED_START_RATE: crate::dp_link_training::LinkRate =
+    crate::dp_link_training::LinkRate::Hbr2;
+
 /// How the link-training step of a modeset run is satisfied.
 /// The legacy eDP-shaped entry trains and discards the result
 /// (historical behaviour); the plan entries train at the
@@ -460,6 +515,31 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     edp_hobl: bool,
     edp_low_vswing: bool,
     tc_width: u8,
+    /// Display-9 panel fitting (`set_gen9_panel_fit`): the pipe source
+    /// size and the bound pipe scaler. `None` scans out at the mode size.
+    gen9_panel_fit: Option<(u16, u16, crate::intel_gpu_xelpg_scaler::PipeScaler)>,
+    /// The Gen11 combo PLL this run programmed for a port with no fixed
+    /// one (EHL/JSL PORT_D, `arbitrate_combo_dpll`): clock routing and a
+    /// mid-training retune use it.
+    gen11_dpll: Option<crate::intel_gpu_gen11_dpll::IclDpllId>,
+    /// The Rocket Lake combo PLL (0/1/2: DPLL0, DPLL1, DPLL4 at the
+    /// DPLL2 registers) this run took ([`Self::rkl_combo_dpll`]): clock
+    /// routing and a mid-training retune use it.
+    rkl_dpll: Option<u32>,
+    /// Whether [`Self::rkl_dpll`] is another port's PLL, shared at this
+    /// state.
+    rkl_dpll_shared: bool,
+    /// HDMI to a DVI sink (`!has_hdmi_sink`): the transcoder runs
+    /// `TRANS_DDI_MODE_SELECT_DVI`.
+    hdmi_dvi: bool,
+    /// HDMI bits per colour (8, 10 or 12): the port runs at the TMDS clock
+    /// `pixel_clock * bpc / 8` with the matching `TRANS_DDI_BPC`.
+    hdmi_bpc: u8,
+    /// The HDMI entry drives YCbCr 4:2:0 (display 11/12).
+    hdmi_ycbcr420: bool,
+    /// Another pipe is live beside this run's, so the CDCLK it runs on
+    /// cannot be reprogrammed here.
+    shared_cdclk: bool,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -495,6 +575,206 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             edp_hobl: false,
             edp_low_vswing: false,
             tc_width: 4,
+            gen9_panel_fit: None,
+            gen11_dpll: None,
+            rkl_dpll: None,
+            rkl_dpll_shared: false,
+            hdmi_dvi: false,
+            hdmi_bpc: 8,
+            hdmi_ycbcr420: false,
+            shared_cdclk: false,
+        }
+    }
+
+    /// Another pipe scans out beside this run's (the multi-pipe
+    /// coordinator handed it a DBUF share). Linux raises CDCLK for a new
+    /// pipe in an atomic commit that modesets every pipe the change
+    /// touches (`intel_modeset_calc_cdclk`); this run does not own the
+    /// other pipes, so a floor above the current CDCLK refuses with
+    /// `CdclkUnavailable` at the CDCLK step instead of retuning the clock
+    /// under a live pipe.
+    pub fn set_shared_cdclk(&mut self, shared: bool) {
+        self.shared_cdclk = shared;
+    }
+
+    /// The shared-CDCLK refusal: `current_khz` below this mode's floor.
+    fn refuse_shared_cdclk(
+        &self,
+        current_khz: Option<u32>,
+        mode: &Mode,
+    ) -> Result<(), ModesetError> {
+        let floor = mode.pixel_clock_khz.div_ceil(2);
+        if self.shared_cdclk && current_khz.is_none_or(|khz| khz < floor) {
+            return Err(ModesetError::CdclkUnavailable);
+        }
+        Ok(())
+    }
+
+    /// Drive the HDMI entry's link as YCbCr 4:2:0 (`sink_format ==
+    /// INTEL_OUTPUT_FORMAT_YCBCR420`).
+    pub(crate) fn set_hdmi_ycbcr420(&mut self, ycbcr420: bool) {
+        self.hdmi_ycbcr420 = ycbcr420;
+    }
+
+    /// The HDMI entry's port depth (`intel_hdmi_compute_bpc`'s result);
+    /// anything but 10 or 12 is 8.
+    pub(crate) fn set_hdmi_bpc(&mut self, bpc: u8) {
+        self.hdmi_bpc = if matches!(bpc, 10 | 12) { bpc } else { 8 };
+    }
+
+    /// Drive the HDMI entry's sink as DVI (`intel_ddi.c`: a TMDS output
+    /// without `has_hdmi_sink` selects `TRANS_DDI_MODE_SELECT_DVI`).
+    pub(crate) fn set_hdmi_dvi(&mut self, dvi: bool) {
+        self.hdmi_dvi = dvi;
+    }
+
+    /// Rocket Lake's TC1/TC2 (DDI D/E): combo ports on PHY C/D
+    /// (`intel_port_to_phy`'s RKL case) where Tiger Lake's DDI D/E are
+    /// Type-C, so the `ddi >= D` Type-C dispatches skip them.
+    fn is_rkl_combo_tc(&self) -> bool {
+        self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+            && matches!(self.ddi, Ddi::D | Ddi::E)
+    }
+
+    /// Rocket Lake's combo PHY index for this run's DDI: A/B are PHY A/B,
+    /// TC1/TC2 (DDI D/E) PHY C/D.
+    fn rkl_phy(&self) -> Option<u32> {
+        match self.ddi {
+            Ddi::A => Some(0),
+            Ddi::B => Some(1),
+            Ddi::D => Some(2),
+            Ddi::E => Some(3),
+            _ => None,
+        }
+    }
+
+    /// `intel_find_dpll` over Rocket Lake's {DPLL0, DPLL1, DPLL4}
+    /// (`rkl_pll_mgr`; DPLL4 is id 2 at the DPLL2 registers) for a run
+    /// whose PLL state is `cfgcr0`/`cfgcr1`. A PLL is held by another port
+    /// when it is enabled and another PHY's `DPCLKA_CFGCR0` clock is on and
+    /// selects it. A held PLL already running this state is shared
+    /// (`true`); otherwise the port's own PLL (A, B, TC1: DPLL0, DPLL1,
+    /// DPLL4, the conflict-free assignment) or, when another port holds
+    /// it, the first PLL nobody holds. `None` when every PLL is held with
+    /// another state.
+    fn rkl_combo_dpll(&self, cfgcr0: u32, cfgcr1: u32) -> Option<(u32, bool)> {
+        let phy = self.rkl_phy()?;
+        let dpclka = self.mmio.read32(crate::intel_gpu_pll::DPCLKA_CFGCR0);
+        let held = |idx: u32| {
+            self.mmio.read32(dpll_enable_off(idx)) & PLL_ENABLE != 0
+                && (0..4u32).filter(|&other| other != phy).any(|other| {
+                    dpclka & rkl_dpclka_clk_off(other) == 0
+                        && (dpclka & rkl_dpclka_clk_sel_mask(other)) >> rkl_dpclka_sel_shift(other)
+                            == idx
+                })
+        };
+        let cfgcr = |idx: u32| {
+            let off = rkl_dpll_cfgcr0(idx);
+            (
+                self.mmio.read32(off),
+                self.mmio.read32(crate::intel_gpu_pll::dpll_cfgcr1(off)),
+            )
+        };
+        if let Some(idx) = (0..3u32).find(|&idx| held(idx) && cfgcr(idx) == (cfgcr0, cfgcr1)) {
+            return Some((idx, true));
+        }
+        let own = match self.ddi {
+            Ddi::A => Some(0),
+            Ddi::B => Some(1),
+            Ddi::D => Some(2),
+            _ => None,
+        };
+        own.filter(|&idx| !held(idx))
+            .or_else(|| (0..3u32).find(|&idx| !held(idx)))
+            .map(|idx| (idx, false))
+    }
+
+    /// EHL/JSL PORT_D: a combo port (it drives PHY A) where every other
+    /// DDI D is Type-C, so the `ddi >= D` Type-C dispatches skip it.
+    fn is_gen11_combo_port_d(&self) -> bool {
+        matches!(
+            self.gen11_platform,
+            Some(
+                crate::intel_gpu_gt::Gen11Platform::ElkhartLake
+                    | crate::intel_gpu_gt::Gen11Platform::JasperLake
+            )
+        ) && self.ddi == Ddi::D
+    }
+
+    /// Program the Gen11 combo PLL for `ddi` with `cfgcr0`/`cfgcr1`: the
+    /// fixed `combo_dpll_id` assignment, or for EHL/JSL PORT_D the pool
+    /// PLL `arbitrate_combo_dpll` picks. A shared PLL already runs the
+    /// state and is left alone, as Linux enables a shared PLL once.
+    fn enable_gen11_combo_pll(&mut self, cfgcr0: u32, cfgcr1: u32) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen11_dpll::{arbitrate_combo_dpll, combo_dpll_id, combo_pll_enable};
+        let platform = self
+            .gen11_platform
+            .ok_or(ModesetError::UnsupportedGeneration)?;
+        let (id, shared) = match combo_dpll_id(platform, self.ddi) {
+            Some(id) => (id, false),
+            None if self.is_gen11_combo_port_d() => {
+                arbitrate_combo_dpll(self.mmio, platform, self.ddi, cfgcr0, cfgcr1)
+                    .ok_or(ModesetError::DisplayResourceUnavailable)?
+            }
+            None => return Err(ModesetError::UnsupportedGeneration),
+        };
+        self.gen11_dpll = Some(id);
+        if shared {
+            return Ok(());
+        }
+        combo_pll_enable(self.mmio, id, cfgcr0, cfgcr1).map_err(|_| ModesetError::PllLockTimeout)
+    }
+
+    /// Fit a `src_w` x `src_h` pipe source to `native` (the panel's fixed
+    /// mode, the one this run commits) with display 9's pipe scaler:
+    /// Linux's `pch_panel_fitting` + `skl_update_scaler_crtc` +
+    /// `skl_pfit_enable`. Gen9 runs only, after `set_gen9_platform`; a
+    /// native-size source clears the fit.
+    pub fn set_gen9_panel_fit(
+        &mut self,
+        native: &Mode,
+        src_w: u16,
+        src_h: u16,
+        mode: crate::intel_gpu_xelpg_scaler::ScalingMode,
+    ) -> Result<(), crate::intel_gpu_xelpg_scaler::ScalerRefusal> {
+        if self.gen9_platform.is_none() {
+            return Err(crate::intel_gpu_xelpg_scaler::ScalerRefusal::NoScaler);
+        }
+        self.gen9_panel_fit = crate::intel_gpu_xelpg_scaler::plan_display9(
+            native,
+            u32::from(src_w),
+            u32::from(src_h),
+            mode,
+            crate::intel_gpu_xelpg_scaler::Filter::Default,
+            self.pipe,
+        )?
+        .map(|scaler| (src_w, src_h, scaler));
+        Ok(())
+    }
+
+    /// The pipe source and primary-plane size: the panel-fit source, or
+    /// the mode's active area.
+    fn pipe_source(&self, mode: &Mode) -> (u16, u16) {
+        self.gen9_panel_fit
+            .map_or((mode.h_active, mode.v_active), |(w, h, _)| (w, h))
+    }
+
+    /// Configure the run for `family`: the Gen12 family, or the Gen11 /
+    /// Gen9 sub-platform (with the Gen9 SKU family) whose per-step
+    /// branches the modeset takes.
+    pub(crate) fn set_source_family(&mut self, family: crate::intel_gpu_aux::SourceFamily) {
+        use crate::intel_gpu_aux::SourceFamily;
+        match family {
+            SourceFamily::Gen12(family) => self.set_gen12_family(family),
+            SourceFamily::Gen11(platform) => {
+                self.gen12_family = None;
+                self.set_gen11_platform(platform);
+            }
+            SourceFamily::Gen9 { platform, sku } => {
+                self.gen12_family = None;
+                self.set_gen9_platform(platform);
+                self.set_gen9_sku_family(sku);
+            }
         }
     }
 
@@ -534,7 +814,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 use crate::intel_gpu_gen11_ddi::{phy_for_port, Gen11Phy};
                 matches!(phy_for_port(platform, self.ddi), Some(Gen11Phy::Mg { .. }))
             }
-            None => self.ddi as u8 >= Ddi::D as u8,
+            None => self.ddi as u8 >= Ddi::D as u8 && !self.is_rkl_combo_tc(),
         }
     }
 
@@ -809,8 +1089,27 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Gen12 Type-C ports have no HDMI modeset here (their
         // DDI is a Dekel port); Gen11 TC ports do — the MG PHY
         // drives HDMI through the MG PLL + MG HDMI table below.
-        if self.gen11_platform.is_none() && self.ddi as u8 >= Ddi::D as u8 {
+        if self.gen11_platform.is_none()
+            && self.ddi as u8 >= Ddi::D as u8
+            && !self.is_rkl_combo_tc()
+        {
             return Err(ModesetError::UnsupportedGeneration);
+        }
+        // YCbCr 4:2:0 output is display 10+ (`ycbcr_420_allowed`), and the
+        // pipe scaler that downsamples it takes at most `skl_scaler_mode_valid`'s
+        // width (Linux compares hdisplay with the max source height).
+        if self.hdmi_ycbcr420 {
+            let max = if self.gen11_platform.is_some() {
+                4096
+            } else {
+                8192
+            };
+            if self.gen9_platform.is_some() {
+                return Err(ModesetError::UnsupportedGeneration);
+            }
+            if u32::from(mode.h_active) > max {
+                return Err(ModesetError::DisplayResourceUnavailable);
+            }
         }
         validate_framebuffer_mode(primary_fb, mode)?;
         // Gen9 SKL admission, as the DP path applies it in
@@ -820,16 +1119,24 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             self.validate_framebuffer_skl(primary_fb)?;
         }
 
+        // The port clock is the TMDS clock (`intel_hdmi_tmds_clock`).
+        let format = if self.hdmi_ycbcr420 {
+            crate::intel_gpu_hdmi::SinkFormat::Ycbcr420
+        } else {
+            crate::intel_gpu_hdmi::SinkFormat::Rgb
+        };
+        let port_clock =
+            crate::intel_gpu_hdmi::tmds_clock_for(mode.pixel_clock_khz, self.hdmi_bpc, format);
         self.enable_pg1()?;
         self.disable_pipeline();
         // Gen9: the SKL WRPLL row (`program_dpll_gen9_hdmi`),
         // not the TGL coefficients — the search below is
         // skipped entirely for Gen9.
         if self.gen9_platform.is_some() {
-            self.program_dpll_gen9_hdmi(mode.pixel_clock_khz)?;
+            self.program_dpll_gen9_hdmi(port_clock)?;
         } else {
             let coeffs = match crate::intel_gpu_pll::hdmi_wrpll_coeffs(
-                mode.pixel_clock_khz,
+                port_clock,
                 // Same DSSM-strap family selection as the DP path
                 // (Q6, #1024).
                 decode_refclk_family(self.mmio.read32(DSSM)),
@@ -841,7 +1148,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             // MG PLL on a TC port — never the TGL CFGCR0
             // `program_dpll_coeffs` writes below.
             if self.gen11_platform.is_some() {
-                self.program_dpll_gen11_hdmi(&coeffs, mode.pixel_clock_khz)?;
+                self.program_dpll_gen11_hdmi(&coeffs, port_clock)?;
             } else {
                 self.program_dpll_coeffs(&coeffs)?;
             }
@@ -851,6 +1158,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.enable_pipe_power_well(self.pipe)?;
         self.program_transcoder(mode);
         self.program_pipe(mode);
+        if self.hdmi_ycbcr420 {
+            self.program_ycbcr420_output(mode);
+        }
+        self.program_pipe_misc_bpc();
         // No step 7b: HDMI has no M/N.
         self.program_trans_ddi_func_ctl_hdmi(scrambling, high_tmds_char_rate);
         self.enable_dbuf_slices()?;
@@ -872,13 +1183,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             match phy_for_port(platform, self.ddi) {
                 Some(Gen11Phy::Mg { .. }) => {
                     let port = crate::intel_gpu_gen11_mg_phy::MgPort::new(self.ddi, platform)?;
-                    port.set_hdmi_default_levels(self.mmio, mode.pixel_clock_khz)?;
+                    port.set_hdmi_default_levels(self.mmio, port_clock)?;
                 }
                 _ => {
                     let phy = crate::intel_gpu_gen12_combo_phy::ComboPhy::new_gen11(
                         self.ddi, platform, false, false,
                     )?;
-                    phy.set_hdmi_default_levels(self.mmio, mode.pixel_clock_khz)?;
+                    phy.set_hdmi_default_levels(self.mmio, port_clock)?;
                 }
             }
         } else {
@@ -890,7 +1201,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 false,
                 false,
             )?;
-            phy.set_hdmi_default_levels(self.mmio, mode.pixel_clock_khz)?;
+            phy.set_hdmi_default_levels(self.mmio, port_clock)?;
         }
         self.enable_ddi_buffer(4);
         self.enable_transcoder();
@@ -903,10 +1214,36 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// the fixed 4-lane width, scrambling bits per the plan).
     fn program_trans_ddi_func_ctl_hdmi(&mut self, scrambling: bool, high_tmds_char_rate: bool) {
         use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl_hdmi, TRANS_DDI_FUNC_CTL_OFFSET};
-        let val = build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate);
+        let val = if self.hdmi_dvi {
+            crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
+                self.ddi as u8,
+                crate::intel_gpu_pipes::TRANS_DDI_MODE_DVI,
+                4,
+            )
+        } else {
+            build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate)
+        };
+        let val = self.trans_ddi_port(val);
+        // TRANS_DDI_BPC_10 / _12 (bits 22:20); the builders set BPC_8.
+        let val = match self.hdmi_bpc {
+            10 => (val & !(7 << 20)) | (1 << 20),
+            12 => (val & !(7 << 20)) | (3 << 20),
+            _ => val,
+        };
         self.mmio
             .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
+    }
+
+    /// The port select this run's display version takes: the builders
+    /// encode display 12's `(index + 1) << 27`; display 9–11 use
+    /// `index << 28`.
+    fn trans_ddi_port(&self, val: u32) -> u32 {
+        if self.gen11_platform.is_some() || self.gen9_platform.is_some() {
+            crate::intel_gpu_pipes::with_pre_tgl_port(val, self.ddi as u8)
+        } else {
+            val
+        }
     }
 
     /// Tear down only this run's pipe pipeline (plane → pipe →
@@ -1017,8 +1354,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // intel_gpu_pll exposes `build_cfgcr0/1` for the encoding;
         // Stage 1 wires the actual MMIO writes here. The DPLL
         // synthesises the *link* clock: on the plan path that is
-        // the negotiated rate; the legacy path derives the lowest
-        // sufficient rate from the pixel clock. An MST secondary
+        // the negotiated rate; a run without a plan takes the rate
+        // its training starts at (`UNPLANNED_START_RATE`), so the
+        // sink never trains against a clock for another rate. An
+        // MST secondary
         // stream skips this entirely — the primary stream's run
         // already clocked the shared link, and re-running the
         // PLL power/enable sequence would glitch it.
@@ -1032,11 +1371,21 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.gen11_platform.is_some() || self.gen9_platform.is_some() {
             self.program_cdclk_floor(&mode)?;
         }
+        // Gen11 Type-C: the FIA main-link lane count precedes the PLL
+        // (`intel_ddi_pre_pll_enable` → `intel_tc_port_set_fia_lane_count`).
+        if tc_port && already_trained.is_none() {
+            if let Some(platform) = self.gen11_platform {
+                let lanes = plan.map_or(self.tc_width, |plan| plan.lanes);
+                crate::intel_gpu_gen11_mg_phy::MgPort::new(self.ddi, platform)?
+                    .set_fia_lanes(self.mmio, lanes, false)?;
+            }
+        }
         match (plan, already_trained) {
             (Some(p), _) => self.program_dpll_with_rate(&mode, to_pll_rate(p.rate))?,
             (None, Some(_)) => {}
-            (None, None) if tc_port => self.program_dpll_with_rate(&mode, LinkRate::DpHbr2)?,
-            (None, None) => self.program_dpll(&mode)?,
+            (None, None) => {
+                self.program_dpll_with_rate(&mode, to_pll_rate(UNPLANNED_START_RATE))?
+            }
         }
 
         // Step 4b (lane 1, #1010): raise CDCLK to the floor this
@@ -1258,6 +1607,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// is refused with the same `PowerWellTimeout` a grant
     /// failure surfaces as, so callers see one clean error.
     ///
+    /// Rocket Lake has no PW_2 (`rkl_power_wells`): Pipe A sits in
+    /// PW_1 with transcoder A and DDI A/B, Pipe B under PW_3 and Pipe C
+    /// under PW_4, so Pipe A requests no per-pipe well.
+    ///
     /// Gen9 uses the SKL map instead (`skl_power_wells`):
     /// Pipe A is in no gated well (always-on set — the pipe,
     /// the EDP transcoder, the DDI A lanes and AUX A are all
@@ -1275,6 +1628,19 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             return match pipe {
                 Pipe::A => Ok(()),
                 Pipe::B | Pipe::C => self.enable_power_well(15),
+                Pipe::D => Err(ModesetError::PowerWellTimeout),
+            };
+        }
+        if self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake) {
+            // TC1/TC2's lanes and AUX sit in PW_3's domains
+            // (`RKL_PW_3_POWER_DOMAINS`), whatever pipe drives them.
+            if self.is_rkl_combo_tc() {
+                self.enable_power_well(PowerWell::Pg3 as u32)?;
+            }
+            return match pipe {
+                Pipe::A => Ok(()),
+                Pipe::B => self.enable_power_well(PowerWell::Pg3 as u32),
+                Pipe::C => self.enable_power_well(PowerWell::Pg4 as u32),
                 Pipe::D => Err(ModesetError::PowerWellTimeout),
             };
         }
@@ -1455,7 +1821,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.mmio.read32(ddi_off) & DDI_BUF_CTL_ENABLE != 0 {
             return Err(ModesetError::PipelineStopUnavailable);
         }
-        if self.gen9_platform.is_none() && self.ddi as u8 >= Ddi::D as u8 {
+        if self.gen9_platform.is_none()
+            && self.ddi as u8 >= Ddi::D as u8
+            && !self.is_gen11_combo_port_d()
+            && !self.is_rkl_combo_tc()
+        {
             crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?
                 .stop_transport(self.mmio, self.transcoder())?;
         }
@@ -1464,11 +1834,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     // ── DPLL ─────────────────────────────────────────────────
 
-    /// Program a Combo PHY DPLL for the requested pixel clock.
-    /// Picks the lowest DP link rate that meets the bandwidth
-    /// requirement of `mode`'s 24-bpp scanout, looks up the
-    /// PRM-published Combo-PHY coefficients, programs CFGCR0/1,
-    /// and brings the DPLL up:
+    /// Program this run's DPLL for the link `rate` (the
+    /// negotiated rate on the plan path, #1092; the training
+    /// start rate otherwise). On a Combo PHY: look up the
+    /// PRM-published coefficients, then
     ///
     ///   1. Power-up via PLL_POWER_ENABLE + wait for PLL_POWER_STATE.
     ///   2. Write CFGCR0 (DCO integer + fraction) and CFGCR1 (Q/K/P
@@ -1478,14 +1847,6 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     ///
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_dpll.c
     /// (`icl_pll_power_enable`, `icl_pll_enable`).
-    fn program_dpll(&mut self, mode: &Mode) -> Result<(), ModesetError> {
-        let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
-        self.program_dpll_with_rate(mode, rate)
-    }
-
-    /// Program the Combo PHY DPLL for an explicit link `rate`
-    /// (the negotiated rate on the plan path, #1092) instead of
-    /// the pixel-clock-derived floor `program_dpll` picks.
     fn program_dpll_with_rate(&mut self, mode: &Mode, rate: LinkRate) -> Result<(), ModesetError> {
         if self.gen11_platform.is_some() && self.is_tc_port() {
             // Gen11 Type-C: the MG PLL for the link clock
@@ -1509,7 +1870,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.gen9_platform.is_some() {
             return self.program_dpll_gen9(rate);
         }
-        if self.ddi as u8 >= Ddi::D as u8 {
+        if self.ddi as u8 >= Ddi::D as u8
+            && !self.is_gen11_combo_port_d()
+            && !self.is_rkl_combo_tc()
+        {
             let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
             return port.enable(
                 self.mmio,
@@ -1544,24 +1908,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// remainder, not a guess. The fixed assignment comes from
     /// `combo_dpll_id`: ICL A/B and EHL/JSL A/B/C. ICL TC ports
     /// never reach here (dispatched to the MG PLL in
-    /// `program_dpll_with_rate`); EHL/JSL PORT_D has no fixed
-    /// assignment and refuses.
+    /// `program_dpll_with_rate`); EHL/JSL PORT_D takes a pool PLL
+    /// (`enable_gen11_combo_pll`).
     fn program_dpll_gen11(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
-        use crate::intel_gpu_gen11_dpll::{calc_dpll_state, combo_dpll_id, combo_pll_enable};
-        let platform = self
-            .gen11_platform
-            .ok_or(ModesetError::UnsupportedGeneration)?;
-        let id = match combo_dpll_id(platform, self.ddi) {
-            Some(id) => id,
-            None => return Err(ModesetError::UnsupportedGeneration),
-        };
+        use crate::intel_gpu_gen11_dpll::calc_dpll_state;
         let family = decode_refclk_family(self.mmio.read32(DSSM));
         let coeffs = match combo_coeffs(rate, family) {
             Some(c) => c,
             None => return Err(ModesetError::PllLockTimeout),
         };
         let (cfgcr0, cfgcr1) = calc_dpll_state(&coeffs, false);
-        combo_pll_enable(self.mmio, id, cfgcr0, cfgcr1).map_err(|_| ModesetError::PllLockTimeout)
+        self.enable_gen11_combo_pll(cfgcr0, cfgcr1)
     }
 
     /// Bring the Gen9 SKL DPLL up for `rate`:
@@ -1652,7 +2009,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         coeffs: &crate::intel_gpu_pll::DpllCoeffs,
         pixel_clock_khz: u32,
     ) -> Result<(), ModesetError> {
-        use crate::intel_gpu_gen11_dpll::{calc_dpll_state, combo_dpll_id, combo_pll_enable};
+        use crate::intel_gpu_gen11_dpll::calc_dpll_state;
         let platform = self
             .gen11_platform
             .ok_or(ModesetError::UnsupportedGeneration)?;
@@ -1667,13 +2024,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 )
             }
             Some(crate::intel_gpu_gen11_ddi::Gen11Phy::Combo) => {
-                let id = match combo_dpll_id(platform, self.ddi) {
-                    Some(id) => id,
-                    None => return Err(ModesetError::UnsupportedGeneration),
-                };
                 let (cfgcr0, cfgcr1) = calc_dpll_state(coeffs, false);
-                combo_pll_enable(self.mmio, id, cfgcr0, cfgcr1)
-                    .map_err(|_| ModesetError::PllLockTimeout)
+                self.enable_gen11_combo_pll(cfgcr0, cfgcr1)
             }
             None => Err(ModesetError::UnsupportedGeneration),
         }
@@ -1689,8 +2041,24 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     ) -> Result<(), ModesetError> {
         // Combo PHY DDIs A/B/C program DPLL 0/1/2 respectively
         // (the DPCLKA default assignment). Type-C has already dispatched
-        // to its per-port Dekel PLL; this path is combo-only.
-        let dpll_idx: u32 = dpll_index_for(self.ddi);
+        // to its per-port Dekel PLL; this path is combo-only. Rocket Lake
+        // arbitrates its three PLLs over four ports (`rkl_combo_dpll`); a
+        // PLL another port already runs at this state is shared as is.
+        let cfgcr0 = encode_cfgcr0(coeffs);
+        let dpll_idx: u32 =
+            if self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake) {
+                let (idx, shared) = self
+                    .rkl_combo_dpll(cfgcr0, coeffs.cfgcr1)
+                    .ok_or(ModesetError::DisplayResourceUnavailable)?;
+                self.rkl_dpll = Some(idx);
+                self.rkl_dpll_shared = shared;
+                if shared {
+                    return Ok(());
+                }
+                idx
+            } else {
+                dpll_index_for(self.ddi)
+            };
         let dpll_enable = dpll_enable_off(dpll_idx);
 
         // Step 1 — power the PLL up.
@@ -1702,7 +2070,6 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         }
 
         // Step 2 — CFGCR0 / CFGCR1.
-        let cfgcr0 = encode_cfgcr0(coeffs);
         let cfgcr0_off = match dpll_idx {
             0 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0,
             1 => crate::intel_gpu_pll::DPLL_CFGCR0_DPLL1,
@@ -1782,10 +2149,85 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             Ok(p) => p,
             Err(_) => return,
         };
+        let (src_w, src_h) = self.pipe_source(mode);
+        let srcsz = if self.gen9_panel_fit.is_some() {
+            (u32::from(src_w) - 1) << 16 | (u32::from(src_h) - 1)
+        } else {
+            prog.srcsz
+        };
         // PIPE_SRCSZ lives inside the pipe MMIO block.
         self.mmio
-            .write32(self.pipe.trans_base() + PIPE_SRCSZ_OFFSET, prog.srcsz);
+            .write32(self.pipe.trans_base() + PIPE_SRCSZ_OFFSET, srcsz);
+        // Display 9: skl_pfit_enable for a fitted source; otherwise
+        // skl_detach_scalers frees whatever scaler an earlier owner bound.
+        if self.gen9_platform.is_some() {
+            let pipe = self.pipe;
+            let writes = match self.gen9_panel_fit {
+                Some((_, _, scaler)) => scaler.enable_writes(pipe),
+                None => crate::intel_gpu_xelpg_scaler::disable_writes_display9(pipe),
+            };
+            for (reg, val) in writes {
+                self.mmio.write32(reg, val);
+            }
+        }
         compiler_fence(Ordering::SeqCst);
+    }
+
+    /// `bdw_set_pipe_misc`'s BPC field for an HDMI deep-colour pipe:
+    /// `PIPE_MISC_BPC_10` at 10 bpc. At 12 bpc only display 13 has a
+    /// pipe encoding (`PIPE_MISC_BPC_12_ADLP`); earlier displays leave the
+    /// field at 8 bpc and the port alone runs 12. An 8 bpc run leaves
+    /// `PIPE_MISC` as it found it.
+    fn program_pipe_misc_bpc(&mut self) {
+        let field = match (self.hdmi_bpc, self.gen12_family) {
+            (10, _) => Some(1),
+            (
+                12,
+                Some(
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                    | crate::intel_gpu_gt::Gen12Platform::AlderLakeN,
+                ),
+            ) => Some(4),
+            (12, _) => Some(0),
+            _ => None,
+        };
+        // `bdw_set_pipe_misc`: a 4:2:0 output sets the YUV colorspace, the
+        // 4:2:0 enable and full-blend mode (display < 30).
+        let yuv = if self.hdmi_ycbcr420 {
+            PIPE_MISC_YUV420_ENABLE
+                | PIPE_MISC_YUV420_MODE_FULL_BLEND
+                | PIPE_MISC_OUTPUT_COLORSPACE_YUV
+        } else {
+            0
+        };
+        if field.is_none() && yuv == 0 {
+            return;
+        }
+        let reg = self.pipe.base() + 0x30;
+        let cur = self.mmio.read32(reg);
+        let mut val = (cur & !PIPE_MISC_YUV_MASK) | yuv;
+        if let Some(field) = field {
+            val = (val & !(7 << 5)) | (field << 5);
+        }
+        self.mmio.write32(reg, val);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// YCbCr 4:2:0 on the TMDS link (display 11/12): the pipe scaler at
+    /// 1:1 does the chroma downsampling (`pch_panel_fitting` keeps the
+    /// fitter on for a native 4:2:0 mode; `skl_pfit_enable` binds scaler 0
+    /// in normal mode with the medium filter), and the output CSC converts
+    /// to BT.709 limited-range YCbCr (`icl_assign_csc`'s
+    /// `ilk_csc_matrix_rgb_to_ycbcr`, written by `icl_update_output_csc`,
+    /// enabled by `ICL_OUTPUT_CSC_ENABLE`).
+    fn program_ycbcr420_output(&mut self, mode: &Mode) {
+        program_ycbcr420_pipe(self.mmio, self.pipe, mode);
+    }
+
+    /// Undo [`Modeset::program_ycbcr420_output`] once the pipe is down
+    /// ([`clear_ycbcr420_pipe`]).
+    pub(crate) fn clear_ycbcr420_output(&mut self) {
+        clear_ycbcr420_pipe(self.mmio, self.pipe);
     }
 
     fn initialize_internal_color(&mut self) -> Result<(), ModesetError> {
@@ -1820,9 +2262,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             // opaque by the pipe when the surface is XRGB).
             PixelFormat::Xrgb8888 => PipeFmt::Argb8888,
         };
+        let (plane_w, plane_h) = self.pipe_source(mode);
         let prog = match build_primary_plane(
-            mode.h_active,
-            mode.v_active,
+            plane_w,
+            plane_h,
             fb.stride_bytes,
             fb.phys_addr as u32,
             pipe_fmt,
@@ -2051,15 +2494,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         &mut self,
         plan: Option<LinkPlan>,
     ) -> Result<(LinkRate, Option<crate::dp_link_training::TrainedLink>), ModesetError> {
-        use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
+        use crate::dp_link_training::{train_link, LinkError};
         let aux = IntelAux::new(self.mmio, self.ddi);
-        // The legacy path starts at HBR2/4-lane and falls back
-        // via `train_link`'s policy — the broadest envelope a
-        // modern eDP panel will accept. The plan path starts at
-        // the negotiated configuration (#1092).
+        // A run without a plan starts at HBR2/4-lane (the clock
+        // step 4 programmed) and falls back via `train_link`'s
+        // policy — the broadest envelope a modern eDP panel will
+        // accept. The plan path starts at the negotiated
+        // configuration (#1092).
         let (initial_rate, lanes) = match plan {
             Some(p) => (p.rate, p.lanes),
-            None => (TrainRate::Hbr2, self.tc_width),
+            None => (UNPLANNED_START_RATE, self.tc_width),
         };
         let result = if self.gen11_platform.is_some() && self.is_tc_port() {
             // Gen11 Type-C: the MG PHY is the training source
@@ -2126,7 +2570,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 return Err(error);
             }
             result
-        } else if self.ddi as u8 >= Ddi::D as u8 {
+        } else if self.ddi as u8 >= Ddi::D as u8
+            && !self.is_gen11_combo_port_d()
+            && !self.is_rkl_combo_tc()
+        {
             let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
             port.start_training(
                 self.mmio,
@@ -2176,7 +2623,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                     platform,
                     self.ddi == Ddi::A,
                     self.edp_low_vswing,
-                )?,
+                )?
+                .with_gen11_dpll(self.gen11_dpll),
                 None => crate::intel_gpu_gen12_combo_phy::ComboPhy::new(
                     self.ddi,
                     self.gen12_family,
@@ -2184,7 +2632,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                     self.ddi == Ddi::A,
                     self.edp_hobl,
                     self.edp_low_vswing,
-                )?,
+                )?
+                .with_rkl_pll(self.rkl_dpll.map(|idx| (idx, self.rkl_dpll_shared))),
             };
             phy.prepare(
                 self.mmio,
@@ -2258,17 +2707,47 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             crate::intel_gpu_gen9_dpll::enable_clock(self.mmio, self.ddi, id);
             return Ok(());
         }
-        if self.ddi as u8 >= Ddi::D as u8 {
+        if self.ddi as u8 >= Ddi::D as u8
+            && !self.is_gen11_combo_port_d()
+            && !self.is_rkl_combo_tc()
+        {
             return crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?
                 .route_clock(self.mmio);
+        }
+        // Rocket Lake: the PLL `rkl_combo_dpll` took, routed on the port's
+        // PHY with RKL's DPCLKA layout (`rkl_ddi_enable_clock`).
+        if self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake) {
+            let phy = self.rkl_phy().ok_or(ModesetError::UnsupportedGeneration)?;
+            let select = self
+                .rkl_dpll
+                .ok_or(ModesetError::DisplayResourceUnavailable)?;
+            let reg = crate::intel_gpu_pll::DPCLKA_CFGCR0;
+            let cur = self.mmio.read32(reg);
+            let selected = (cur & !rkl_dpclka_clk_sel_mask(phy) & !rkl_dpclka_clk_off(phy))
+                | (select << rkl_dpclka_sel_shift(phy))
+                | rkl_dpclka_clk_off(phy);
+            self.mmio.write32(reg, selected);
+            compiler_fence(Ordering::SeqCst);
+            self.mmio.write32(reg, selected & !rkl_dpclka_clk_off(phy));
+            compiler_fence(Ordering::SeqCst);
+            return Ok(());
         }
         use crate::intel_gpu_pll::{
             dpclka_clk_off, dpclka_clk_sel, dpclka_clk_sel_mask, DPCLKA_CFGCR0,
         };
-        let phy = self.ddi as u32;
+        // EHL/JSL PORT_D clocks PHY A from the PLL it arbitrated
+        // (`icl_ddi_combo_enable_clock` keys the field by PHY).
+        let (phy, select) = if self.is_gen11_combo_port_d() {
+            let id = self
+                .gen11_dpll
+                .ok_or(ModesetError::DisplayResourceUnavailable)?;
+            (Ddi::A as u32, id.clock_select())
+        } else {
+            (self.ddi as u32, dpll_index_for(self.ddi))
+        };
         let cur = self.mmio.read32(DPCLKA_CFGCR0);
         let selected = (cur & !dpclka_clk_sel_mask(phy) & !dpclka_clk_off(phy))
-            | dpclka_clk_sel(dpll_index_for(self.ddi), phy)
+            | dpclka_clk_sel(select, phy)
             | dpclka_clk_off(phy);
         self.mmio.write32(DPCLKA_CFGCR0, selected);
         compiler_fence(Ordering::SeqCst);
@@ -2305,15 +2784,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             return self.program_cdclk_floor_gen11(mode, platform);
         }
         use crate::intel_gpu_gen12_cdclk as cdclk;
+        let table = cdclk::table_for(self.gen12_family);
         let current =
-            cdclk::Current::read(self.mmio).map_err(|_| ModesetError::CdclkUnavailable)?;
+            cdclk::Current::read(self.mmio, table).map_err(|_| ModesetError::CdclkUnavailable)?;
         let floor_khz = mode.pixel_clock_khz.div_ceil(2);
         if let Some(known) = current.known {
             if known.cdclk_khz >= floor_khz {
                 return Ok(());
             }
         }
-        let target = match cdclk::calc_cdclk(current.refclk_khz, floor_khz) {
+        self.refuse_shared_cdclk(current.known.map(|k| k.cdclk_khz), mode)?;
+        let target = match cdclk::calc_cdclk(table, current.refclk_khz, floor_khz) {
             Some(r) => r,
             None => return Ok(()), // beyond the table; leave firmware CDCLK
         };
@@ -2353,6 +2834,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if current.cdclk_khz >= floor_khz {
             return Ok(());
         }
+        self.refuse_shared_cdclk(Some(current.cdclk_khz), mode)?;
         let vco = cdclk::select_vco(platform, None);
         let target = cdclk::calc_cdclk(floor_khz, vco);
         if target < floor_khz {
@@ -2388,6 +2870,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 return Ok(());
             }
         }
+        self.refuse_shared_cdclk(current.known.map(|k| k.cdclk_khz), mode)?;
         let target = match cdclk::calc_cdclk(current.refclk_khz, floor_khz) {
             Some(r) => r,
             None => return Ok(()), // beyond the table; leave firmware CDCLK
@@ -2436,7 +2919,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// stream runs (#1017).
     fn program_trans_ddi_func_ctl_mode(&mut self, lanes: u8, mode: u32) {
         use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl, TRANS_DDI_FUNC_CTL_OFFSET};
-        let val = build_trans_ddi_func_ctl(self.ddi as u8, mode, lanes);
+        let val = self.trans_ddi_port(build_trans_ddi_func_ctl(self.ddi as u8, mode, lanes));
         self.mmio
             .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
@@ -3118,6 +3601,78 @@ pub(crate) fn modeset_display<M: MmioWindow + ?Sized>(
     modeset_display_family(mmio, generation, None, false, None, None, None, fb, mode)
 }
 
+/// The pipe side of a YCbCr 4:2:0 HDMI stream on display 11+, with the pipe
+/// off: a 1:1 pipe scaler (the 4:2:0 downsampler; `skl_update_scaler_crtc`
+/// requires one for `INTEL_OUTPUT_FORMAT_YCBCR420`), then the BT.709
+/// limited-range RGB-to-YCbCr output CSC (`ilk_csc_matrix_rgb_to_ycbcr`,
+/// `icl_update_output_csc`: pre-offsets, coefficients, post-offsets) and
+/// `ICL_OUTPUT_CSC_ENABLE`. The `PIPE_MISC` YUV bits are the caller's
+/// (`bdw_set_pipe_misc`).
+pub(crate) fn program_ycbcr420_pipe<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe, mode: &Mode) {
+    for (reg, val) in ycbcr420_scaler(mode).enable_writes(pipe) {
+        io.write32(reg, val);
+    }
+    let base = PIPE_CSC_OUTPUT_COEFF_RY_GY + pipe as u64 * PIPE_COLOR_STRIDE;
+    const COEFF: [u32; 9] = [
+        0x1e08, 0x9cc0, 0xb528, 0x2ba8, 0x09d8, 0x37e8, 0xbce8, 0x9ad8, 0x1e08,
+    ];
+    const POSTOFF: [u32; 3] = [0x0800, 0x0100, 0x0800];
+    for reg in [0x18u64, 0x1c, 0x20] {
+        io.write32(base + reg, 0);
+    }
+    for (row, reg) in [0x00u64, 0x08, 0x10].into_iter().enumerate() {
+        io.write32(base + reg, COEFF[row * 3] << 16 | COEFF[row * 3 + 1]);
+        io.write32(base + reg + 4, COEFF[row * 3 + 2] << 16);
+    }
+    for (i, reg) in [0x24u64, 0x28, 0x2c].into_iter().enumerate() {
+        io.write32(base + reg, POSTOFF[i]);
+    }
+    let csc_mode = PIPE_CSC_MODE + pipe as u64 * PIPE_COLOR_STRIDE;
+    let cur = io.read32(csc_mode);
+    io.write32(csc_mode, cur | ICL_OUTPUT_CSC_ENABLE);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// The 1:1 pipe scaler a 4:2:0 stream runs through (`skl_pfit_enable`:
+/// scaler 0, normal mode, the medium filter, the full active window).
+pub(crate) fn ycbcr420_scaler(mode: &Mode) -> crate::intel_gpu_xelpg_scaler::PipeScaler {
+    use crate::intel_gpu_xelpg_scaler::{Filter, PipeScaler, Window};
+    PipeScaler {
+        id: 0,
+        window: Window {
+            x: 0,
+            y: 0,
+            width: u32::from(mode.h_active),
+            height: u32::from(mode.v_active),
+        },
+        hscale: 0x10000,
+        vscale: 0x10000,
+        filter: Filter::Default,
+        mode: 0,
+    }
+}
+
+/// Undo [`program_ycbcr420_pipe`] once the pipe is down: detach the pipe's
+/// scalers (`skl_scaler_disable`), drop the output CSC enable and the
+/// `PIPE_MISC` YUV encoding.
+pub(crate) fn clear_ycbcr420_pipe<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe) {
+    for (reg, val) in crate::intel_gpu_xelpg_scaler::disable_writes(pipe) {
+        io.write32(reg, val);
+    }
+    let csc_mode = PIPE_CSC_MODE + pipe as u64 * PIPE_COLOR_STRIDE;
+    let cur = io.read32(csc_mode);
+    io.write32(csc_mode, cur & !ICL_OUTPUT_CSC_ENABLE);
+    let misc = pipe.base() + 0x30;
+    let cur = io.read32(misc);
+    io.write32(misc, cur & !PIPE_MISC_YUV_MASK);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// `PIPE_MISC`'s YCbCr 4:2:0 encoding (`bdw_set_pipe_misc`): YUV420 enable,
+/// full-blend mode and the YUV output colorspace.
+pub(crate) const PIPE_MISC_YCBCR420: u32 =
+    PIPE_MISC_YUV420_ENABLE | PIPE_MISC_YUV420_MODE_FULL_BLEND | PIPE_MISC_OUTPUT_COLORSPACE_YUV;
+
 /// Exact known PCI family; no P/S/N inference from the broad generation.
 pub(crate) fn gen12_family_for_chip(
     chip: crate::intel_gpu::ChipInfo,
@@ -3653,6 +4208,50 @@ pub mod tests {
     }
     kernel_test_in!("drivers/gpu/intel_gpu_modeset", smoke_enable_pg3_for_pipe_b);
 
+    /// Rocket Lake has no PW_2 (`rkl_power_wells`): Pipe A requests no
+    /// per-pipe well, Pipe B requests PW_3 and Pipe C PW_4, and no run
+    /// ever requests PW_2.
+    fn smoke_rkl_pipe_power_wells_skip_pw2() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        let pg2 = super::pwr_well_req(super::PowerWell::Pg2 as u32);
+        for (pipe, well) in [
+            (Pipe::A, None),
+            (Pipe::B, Some(super::PowerWell::Pg3)),
+            (Pipe::C, Some(super::PowerWell::Pg4)),
+        ] {
+            let mut mmio = FakeMmio::new();
+            mmio.state_offset = super::PWR_WELL_CTL2;
+            mmio.state_value = well.map_or(0, |w| super::pwr_well_state(w as u32));
+            let mut ms = Modeset::for_pipe(&mmio, Ddi::B, pipe);
+            ms.set_gen12_family(Gen12Platform::RocketLake);
+            if ms.enable_pipe_power_well(pipe).is_err() {
+                return TestResult::Fail("RKL per-pipe well must enable");
+            }
+            let writes = mmio.writes_to(super::PWR_WELL_CTL2);
+            match well {
+                None if !writes.is_empty() => {
+                    return TestResult::Fail("RKL Pipe A must request no per-pipe well");
+                }
+                Some(w)
+                    if writes
+                        .iter()
+                        .all(|v| v & super::pwr_well_req(w as u32) == 0) =>
+                {
+                    return TestResult::Fail("RKL Pipe B/C must request PW_3/PW_4");
+                }
+                _ => {}
+            }
+            if writes.iter().any(|v| v & pg2 != 0) {
+                return TestResult::Fail("RKL must never request PW_2");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_pipe_power_wells_skip_pw2
+    );
+
     fn smoke_enable_pg4_for_pipe_c() -> TestResult {
         // Pipe C lives under PG4 (#1017).
         let mut mmio = FakeMmio::new();
@@ -3772,7 +4371,7 @@ pub mod tests {
         mmio.state_value = super::PLL_POWER_STATE | super::PLL_LOCK;
         let mut ms = Modeset::new(&mmio, Ddi::A);
         let mode = Mode::VESA_1024X768_60;
-        match ms.program_dpll(&mode) {
+        match ms.program_dpll_with_rate(&mode, LinkRate::DpRbr) {
             Ok(()) => {}
             Err(e) => {
                 let _ = e;
@@ -3920,6 +4519,153 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_program_pipe_writes_srcsz
+    );
+
+    /// Gen9 panel fitting: a 1024x768 source on a 1920x1080 panel takes
+    /// PIPE_SRCSZ and the plane size from the source, binds scaler 0 in HQ
+    /// mode (`skl_pfit_enable`) and pillarboxes it; without a fit the pipe
+    /// detaches its scalers. Other generations refuse the fit.
+    fn smoke_gen9_panel_fit_programs_the_pipe_scaler() -> TestResult {
+        use crate::intel_gpu_pipes::{
+            Pipe as PipeIdx, PIPE_SRCSZ_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET,
+        };
+        use crate::intel_gpu_xelpg_scaler::{
+            ps_ctrl, ps_win_pos, ps_win_sz, ScalerRefusal, ScalingMode, PS_SCALER_EN,
+            SKL_PS_SCALER_MODE_HQ,
+        };
+        let panel = Mode {
+            pixel_clock_khz: 148_500,
+            h_active: 1920,
+            h_total: 2200,
+            h_sync_start: 2008,
+            h_sync_end: 2052,
+            v_active: 1080,
+            v_total: 1125,
+            v_sync_start: 1084,
+            v_sync_end: 1089,
+            ..Mode::VESA_1024X768_60
+        };
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 4096,
+            format: PixelFormat::Xrgb8888,
+        };
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        if ms.set_gen9_panel_fit(&panel, 1024, 768, ScalingMode::Aspect)
+            != Err(ScalerRefusal::NoScaler)
+        {
+            return TestResult::Fail("a non-Gen9 run must refuse the Gen9 panel fitter");
+        }
+        ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::KabyLake);
+        if ms.set_gen9_panel_fit(&panel, 1024, 768, ScalingMode::Aspect) != Ok(()) {
+            return TestResult::Fail("a 1024x768 upscale must fit a 1080p panel");
+        }
+        ms.program_pipe(&panel);
+        ms.program_plane(&fb, &panel);
+        let a = PipeIdx::A;
+        if mmio.writes_to(a.trans_base() + PIPE_SRCSZ_OFFSET) != alloc::vec![(1023 << 16) | 767] {
+            return TestResult::Fail("PIPE_SRCSZ must carry the fitted source");
+        }
+        if mmio.writes_to(a.base() + PLANE_PRIMARY_OFFSET + PLANE_SIZE_OFFSET)
+            != alloc::vec![(767 << 16) | 1023]
+        {
+            return TestResult::Fail("the primary plane must scan out the source size");
+        }
+        if mmio.writes_to(ps_ctrl(a, 0)) != alloc::vec![PS_SCALER_EN | SKL_PS_SCALER_MODE_HQ] {
+            return TestResult::Fail("scaler 0 must bind the pipe in HQ mode");
+        }
+        // Aspect 4:3 on 16:9: 1440x1080 pillarboxed at x = 240.
+        if mmio.writes_to(ps_win_pos(a, 0)) != alloc::vec![240 << 16]
+            || mmio.writes_to(ps_win_sz(a, 0)) != alloc::vec![(1440 << 16) | 1080]
+        {
+            return TestResult::Fail("the pillarbox window is wrong");
+        }
+        // A native source clears the fit; the pipe then detaches both
+        // scalers and scans out the mode size.
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::KabyLake);
+        if ms.set_gen9_panel_fit(&panel, 1920, 1080, ScalingMode::Aspect) != Ok(()) {
+            return TestResult::Fail("a native source must clear the fit");
+        }
+        ms.program_pipe(&panel);
+        if mmio.writes_to(a.trans_base() + PIPE_SRCSZ_OFFSET) != alloc::vec![(1919 << 16) | 1079]
+            || mmio.writes_to(ps_ctrl(a, 0)) != alloc::vec![0]
+            || mmio.writes_to(ps_ctrl(a, 1)) != alloc::vec![0]
+        {
+            return TestResult::Fail("a native Gen9 pipe must detach its scalers");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen9_panel_fit_programs_the_pipe_scaler
+    );
+
+    /// A DVI sink's transcoder selects DVI mode and never scrambles.
+    fn smoke_hdmi_dvi_sink_selects_dvi_mode() -> TestResult {
+        use crate::intel_gpu_pipes::{
+            Transcoder, TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_HDMI_SCRAMBLING, TRANS_DDI_MODE_DVI,
+            TRANS_DDI_MODE_HDMI,
+        };
+        let reg = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        let mode_bits = 7 << 24;
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::B);
+        ms.program_trans_ddi_func_ctl_hdmi(false, false);
+        ms.set_hdmi_dvi(true);
+        ms.program_trans_ddi_func_ctl_hdmi(true, true);
+        let writes = mmio.writes_to(reg);
+        if writes.len() != 2
+            || writes[0] & mode_bits != TRANS_DDI_MODE_HDMI
+            || writes[1] & mode_bits != TRANS_DDI_MODE_DVI
+            || writes[1] & TRANS_DDI_HDMI_SCRAMBLING != 0
+        {
+            return TestResult::Fail("a DVI sink must take TRANS_DDI_MODE_SELECT_DVI unscrambled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_hdmi_dvi_sink_selects_dvi_mode
+    );
+
+    /// Deep colour: TRANS_DDI_BPC_10/_12, PIPE_MISC_BPC_10, and 12 bpc in
+    /// PIPE_MISC only on display 13.
+    fn smoke_hdmi_deep_colour_bpc_fields() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        use crate::intel_gpu_pipes::{Transcoder, TRANS_DDI_FUNC_CTL_OFFSET};
+        let func = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        let misc = 0x70030;
+        for (family, bpc, trans_bpc, misc_bpc) in [
+            (Gen12Platform::TigerLake, 10, 1, Some(1)),
+            (Gen12Platform::TigerLake, 12, 3, Some(0)),
+            (Gen12Platform::AlderLakeP, 12, 3, Some(4)),
+            (Gen12Platform::TigerLake, 8, 0, None),
+        ] {
+            let mmio = FakeMmio::new();
+            let mut ms = Modeset::new(&mmio, Ddi::B);
+            ms.set_gen12_family(family);
+            ms.set_hdmi_bpc(bpc);
+            ms.program_trans_ddi_func_ctl_hdmi(false, false);
+            ms.program_pipe_misc_bpc();
+            let f = mmio.writes_to(func);
+            if f.len() != 1 || (f[0] >> 20) & 7 != trans_bpc {
+                return TestResult::Fail("TRANS_DDI_FUNC_CTL BPC must follow the HDMI depth");
+            }
+            let m = mmio.writes_to(misc);
+            match misc_bpc {
+                Some(v) if m.len() == 1 && (m[0] >> 5) & 7 == v => {}
+                None if m.is_empty() => {}
+                _ => return TestResult::Fail("PIPE_MISC BPC must follow bdw_set_pipe_misc"),
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_hdmi_deep_colour_bpc_fields
     );
 
     fn smoke_gen12_internal_rgb_bypass_precedes_primary_and_refuses_live_pipe() -> TestResult {
@@ -4144,6 +4890,78 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_program_routing_and_watermarks
+    );
+
+    /// Display 9–11 select the port at bits[30:28] = index
+    /// (`TRANS_DDI_SELECT_PORT`); display 12 at bits[30:27] =
+    /// index + 1. Only DDI B encodes the same in both.
+    fn smoke_pre_tgl_trans_ddi_port_select() -> TestResult {
+        use crate::intel_gpu_gt::{Gen11Platform, Gen9Platform};
+        use crate::intel_gpu_pipes::{
+            Transcoder, TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_MODE_DP_SST,
+        };
+        let sst = (1u32 << 31) | (2 << 24) | (3 << 1);
+        for (ddi, gen, want) in [
+            (Ddi::A, Some(11), sst),
+            (Ddi::B, Some(11), sst | (1 << 28)),
+            (Ddi::C, Some(11), sst | (2 << 28)),
+            (Ddi::E, Some(9), sst | (4 << 28)),
+            (Ddi::A, Some(9), sst),
+            (Ddi::C, None, sst | (3 << 27)),
+        ] {
+            let mmio = FakeMmio::new();
+            let mut ms = Modeset::new(&mmio, ddi);
+            match gen {
+                Some(11) => ms.set_gen11_platform(Gen11Platform::IceLake),
+                Some(9) => ms.set_gen9_platform(Gen9Platform::KabyLake),
+                _ => {}
+            }
+            ms.program_trans_ddi_func_ctl_mode(4, TRANS_DDI_MODE_DP_SST);
+            let base = ms.transcoder().base();
+            if mmio.writes_to(base + TRANS_DDI_FUNC_CTL_OFFSET) != alloc::vec![want] {
+                return TestResult::Fail(
+                    "TRANS_DDI_FUNC_CTL port select must follow the display version",
+                );
+            }
+        }
+        // HDMI on Gen11 DDI C: HDMI mode, port 2 at bits[30:28].
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::C);
+        ms.set_gen11_platform(Gen11Platform::IceLake);
+        ms.program_trans_ddi_func_ctl_hdmi(false, false);
+        let func = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        if mmio.writes_to(func) != alloc::vec![(1u32 << 31) | (2 << 28) | (3 << 1)] {
+            return TestResult::Fail("Gen11 HDMI must select DDI C as port 2");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_pre_tgl_trans_ddi_port_select
+    );
+
+    /// A run beside a live pipe takes the CDCLK it finds: a floor above it
+    /// (or an unknown clock) refuses; a lone run may raise it.
+    fn smoke_shared_cdclk_refuses_a_raise() -> TestResult {
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::B);
+        let mut p2160 = mode_1080p60();
+        p2160.pixel_clock_khz = 594_000;
+        if ms.refuse_shared_cdclk(Some(300_000), &p2160).is_err() {
+            return TestResult::Fail("a lone run may raise CDCLK");
+        }
+        ms.set_shared_cdclk(true);
+        if ms.refuse_shared_cdclk(Some(296_999), &p2160) != Err(ModesetError::CdclkUnavailable)
+            || ms.refuse_shared_cdclk(None, &p2160) != Err(ModesetError::CdclkUnavailable)
+            || ms.refuse_shared_cdclk(Some(307_200), &p2160).is_err()
+        {
+            return TestResult::Fail("a shared run must refuse a CDCLK raise");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_shared_cdclk_refuses_a_raise
     );
 
     fn smoke_gen12_tc_sst_refuses_insufficient_payload_before_writes() -> TestResult {
@@ -4645,9 +5463,10 @@ pub mod tests {
                     }
                     v
                 }
-                0x46010 | 0x46014 | 0x46020 | 0x46030 | 0x46034 | 0x46038 | 0x4603C => {
-                    // Any ICL PLL enable register (combo DPLL0/1,
-                    // TBT, MG TC1–TC4): POWER_STATE follows
+                0x46010 | 0x46014 | 0x46018 | 0x46020 | 0x46030 | 0x46034 | 0x46038 | 0x4603C => {
+                    // Any ICL PLL enable register (combo DPLL0/1, the
+                    // DPLL2 slot RKL's DPLL4 uses, TBT, MG TC1–TC4):
+                    // POWER_STATE follows
                     // POWER_ENABLE, LOCK follows ENABLE.
                     let stored = self.get(off);
                     let mut v = stored;
@@ -4855,10 +5674,17 @@ pub mod tests {
         {
             return TestResult::Fail("modeset must return the EDID preferred mode");
         }
-        // DPLL: RBR row of the 19.2 MHz family.
+        // DPLL: the HBR2 row of the 19.2 MHz family — the rate
+        // training starts at. CFGCR0 is the one DCO word every DP
+        // row of the family shares; CFGCR1 (KDIV_1 | PDIV_3 |
+        // CFREQ = 0x4B) is the rate witness.
         let cfgcr0 = mmio.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
         if cfgcr0 != alloc::vec![0x01C0_01A5] {
-            return TestResult::Fail("CFGCR0 must be the 19.2-family RBR row");
+            return TestResult::Fail("CFGCR0 must be the 19.2-family DP DCO word");
+        }
+        let cfgcr1 = crate::intel_gpu_pll::dpll_cfgcr1(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
+        if mmio.writes_to(cfgcr1) != alloc::vec![0x4B] {
+            return TestResult::Fail("CFGCR1 must be the HBR2 row training starts at");
         }
         // CDCLK: 148.5 MHz pixel clock, floor 74.25 MHz, 19.2 MHz
         // strap -> the 172.8 MHz icl rung (ratio 18, DIV_SEL_1,
@@ -5136,11 +5962,17 @@ pub mod tests {
         {
             return TestResult::Fail("Gen11 modeset must return the EDID preferred mode");
         }
-        // DPLL: the RBR row of the 19.2 MHz family, written to
-        // the ICL CFGCR0 (0x164000) — never the TGL CFGCR0
-        // (0x164284).
+        // DPLL: the HBR2 row of the 19.2 MHz family (the rate
+        // training starts at), written to the ICL CFGCR0/1
+        // (0x164000/0x164004) — never the TGL CFGCR0
+        // (0x164284). CFGCR1 = KDIV_1 | PDIV_3 | CFREQ.
         if mmio.writes_to(0x164000) != alloc::vec![0x01C0_01A5] {
-            return TestResult::Fail("Gen11 CFGCR0 must be the 19.2-family RBR row at 0x164000");
+            return TestResult::Fail(
+                "Gen11 CFGCR0 must be the 19.2-family DP DCO word at 0x164000",
+            );
+        }
+        if mmio.writes_to(0x164004) != alloc::vec![0x4B] {
+            return TestResult::Fail("Gen11 CFGCR1 must be the HBR2 row at 0x164004");
         }
         if !mmio.writes_to(0x164284).is_empty() {
             return TestResult::Fail("Gen11 must never write the TGL CFGCR0");
@@ -5821,22 +6653,18 @@ pub mod tests {
             );
         }
         // DDI_BUF_CTL for DDI B (0x64100): the disable-first
-        // write (readback 0x80), at least one level-4
-        // set-levels write (0x04000080), then the enable
+        // write (readback 0x80); the level-0 select the training
+        // core's first TRAINING_LANE_SET (0, 0) asks for
+        // (TRANS_SELECT 0, so the same 0x80 — Linux's
+        // `hsw_set_signal_levels` writes DDI_BUF_CTL on every
+        // level change); the sink's swing-1 request at CR and
+        // again at EQ (level 4, 0x04000080); then the enable
         // (0x84000086 — IDLE bit RMW'd in, as on the panel
-        // run); DDI A is never enabled.
-        let buf_ctl = mmio.writes_to(0x64100);
-        if buf_ctl.len() < 3
-            || buf_ctl.first() != Some(&0x80)
-            || buf_ctl.last() != Some(&0x8400_0086)
-        {
-            return TestResult::Fail("DDI_BUF_CTL B must be [0x80, 0x04000080.., 0x84000086]");
-        }
-        if buf_ctl[1..buf_ctl.len() - 1]
-            .iter()
-            .any(|w| *w != 0x0400_0080)
-        {
-            return TestResult::Fail("DDI_BUF_CTL B middle writes must be the level-4 value");
+        // run). DDI A is never enabled.
+        if mmio.writes_to(0x64100) != [0x80, 0x80, 0x0400_0080, 0x0400_0080, 0x8400_0086] {
+            return TestResult::Fail(
+                "DDI_BUF_CTL B must be [0x80, 0x80, 0x04000080, 0x04000080, 0x84000086]",
+            );
         }
         if !mmio.writes_to(0x64000).is_empty() {
             return TestResult::Fail("Gen9 DDI B run must not touch DDI A");
@@ -5911,7 +6739,10 @@ pub mod tests {
         ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::Skylake);
         ms.set_gen9_sku_family(crate::intel_gpu_gen9_ddi::SkuFamily::Desktop);
         // DMC gate: the HDMI entry refuses without DMC and
-        // writes nothing.
+        // writes nothing. The flag is global: a failed earlier
+        // Gen9 run can leave it set, so the precondition is set
+        // here.
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(false);
         let refused = ms.modeset_hdmi(&fb_1080p(), &mode_1080p60(), false, false);
         if refused != Err(ModesetError::DmcUnavailable) {
             return TestResult::Fail("Gen9 HDMI must refuse without DMC");
@@ -6123,6 +6954,178 @@ pub mod tests {
         smoke_gen11_external_dp_ddi_b_full_run
     );
 
+    /// Rocket Lake external DP on combo DDI B / Pipe A at HBR2 x4,
+    /// 1080p60, 19.2 MHz strap. Hand-computed RKL deltas from the TGL run:
+    /// CDCLK from `rkl_cdclk_table` (floor 74.25 MHz -> 172.8 MHz at ratio
+    /// 36, VCO / 4: DE_PLL_ENABLE [0, 36, 0x80000024], CDCLK_CTL DIV_SEL 2
+    /// | pipe none | decimal 344 = 0x00B80158) and no PW_2 request. DDI B's
+    /// PLL and clock routing are Tiger Lake's on RKL: DPLL1 at
+    /// `RKL_DPLL_CFGCR0/1(1)` = 0x16428C / 0x164290 (the HBR2 row), and
+    /// DPCLKA phy B select 1 at bits 3:2 with CLK_OFF bit 11.
+    fn smoke_rkl_external_dp_ddi_b_full_run() -> TestResult {
+        use crate::intel_gpu_gen12_cdclk::{CDCLK_CTL, DE_PLL_ENABLE};
+        use crate::intel_gpu_gt::Gen12Platform;
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::B, Pipe::A);
+        ms.set_gen12_family(Gen12Platform::RocketLake);
+        let plan = LinkPlan {
+            rate: crate::dp_link_training::LinkRate::Hbr2,
+            lanes: 4,
+        };
+        let trained = match ms.modeset_with_plan(&fb_1080p(), &mode_1080p60(), plan) {
+            Ok((_, t)) => t,
+            Err(_) => return TestResult::Fail("RKL external DP on DDI B must succeed"),
+        };
+        if trained.rate != crate::dp_link_training::LinkRate::Hbr2 || trained.lanes != 4 {
+            return TestResult::Fail("RKL DDI B must train at HBR2 x4");
+        }
+        if mmio.writes_to(DE_PLL_ENABLE) != alloc::vec![0, 36, 0x8000_0024] {
+            return TestResult::Fail("RKL CDCLK PLL must relock at the rkl_cdclk_table ratio 36");
+        }
+        if mmio.writes_to(CDCLK_CTL) != alloc::vec![0x00B8_0158] {
+            return TestResult::Fail("RKL CDCLK_CTL must divide the 691.2 MHz VCO by 4");
+        }
+        let pg2 = super::pwr_well_req(super::PowerWell::Pg2 as u32);
+        if mmio.writes_to(PWR_WELL_CTL2).iter().any(|v| v & pg2 != 0) {
+            return TestResult::Fail("RKL must never request PW_2");
+        }
+        if mmio.writes_to(0x16428C) != alloc::vec![0x01C0_01A5]
+            || mmio.writes_to(0x164290) != alloc::vec![0x4B]
+        {
+            return TestResult::Fail("RKL DDI B must program DPLL1 at the HBR2 row");
+        }
+        if mmio.writes_to(0x164280) != alloc::vec![0x804, 0x4] {
+            return TestResult::Fail("RKL DPCLKA must select DPLL1 for PHY B, clock on");
+        }
+        let tp = crate::intel_gpu_pipes::Transcoder::A.base() + 0x540;
+        if mmio.writes_to(tp).last() != Some(&0x8004_0300) {
+            return TestResult::Fail("RKL DP_TP_CTL is transcoder-based and must end at NORMAL");
+        }
+        if mmio.sink.borrow().pattern_history != alloc::vec![1u8, 3, 0] {
+            return TestResult::Fail("RKL DDI B training must run TPS1, TPS3, off");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_external_dp_ddi_b_full_run
+    );
+
+    /// Rocket Lake TC1 (DDI D) is a combo port on PHY C: external DP at
+    /// HBR2 x4 programs DPLL4 (id 2, `RKL_DPLL_CFGCR0(2)` 0x164294), routes
+    /// it on PHY C with RKL's DPCLKA layout (select 2 at bits 5:4, CLK_OFF
+    /// bit 12), requests PW_3 (the TC1 lanes' well), drives PHY C's
+    /// registers (0x160000), selects port D in TRANS_DDI_FUNC_CTL and
+    /// enables DDI D's buffer — never a Dekel register.
+    fn smoke_rkl_external_dp_ddi_d_runs_phy_c() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        let mmio = ScriptedSinkMmio::new(1 << 29);
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::D, Pipe::A);
+        ms.set_gen12_family(Gen12Platform::RocketLake);
+        let plan = LinkPlan {
+            rate: crate::dp_link_training::LinkRate::Hbr2,
+            lanes: 4,
+        };
+        if ms
+            .modeset_with_plan(&fb_1080p(), &mode_1080p60(), plan)
+            .is_err()
+        {
+            return TestResult::Fail("RKL external DP on TC1 must succeed");
+        }
+        if mmio.writes_to(0x164294) != alloc::vec![0x01C0_01A5]
+            || mmio.writes_to(0x164298) != alloc::vec![0x4B]
+            || !mmio.writes_to(0x16428C).is_empty()
+        {
+            return TestResult::Fail("RKL TC1 must program DPLL4 (the DPLL2 slot) at HBR2");
+        }
+        if mmio.writes_to(0x164280) != alloc::vec![0x1020, 0x20] {
+            return TestResult::Fail("RKL DPCLKA must select DPLL4 on PHY C, clock on");
+        }
+        let pw3 = super::pwr_well_req(super::PowerWell::Pg3 as u32);
+        if mmio.writes_to(PWR_WELL_CTL2).iter().all(|v| v & pw3 == 0) {
+            return TestResult::Fail("RKL TC1 must request PW_3");
+        }
+        // PHY C's DW2 lane 0 carries the trained swing; PHY D is untouched.
+        if mmio.writes_to(0x160000 + 0x888).is_empty()
+            || !mmio.writes_to(0x161000 + 0x888).is_empty()
+        {
+            return TestResult::Fail("RKL TC1 must drive combo PHY C");
+        }
+        let func = mmio.writes_to(0x60400);
+        if func.last().map(|v| (v >> 27) & 0xF) != Some(4) {
+            return TestResult::Fail("TRANS_DDI_FUNC_CTL must select port D ((3 + 1) << 27)");
+        }
+        if mmio
+            .writes_to(0x64300)
+            .last()
+            .is_none_or(|v| v & (1 << 31) == 0)
+        {
+            return TestResult::Fail("DDI D's buffer must end enabled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_external_dp_ddi_d_runs_phy_c
+    );
+
+    /// Rocket Lake TC2 (DDI E, PHY D) has no PLL of its own
+    /// (`intel_find_dpll` over {DPLL0, DPLL1, DPLL4}): with DPLL4 held by
+    /// PHY C at another state it takes the first PLL nobody holds (DPLL0)
+    /// and routes it at PHY D's field (bits 28:27, CLK_OFF bit 13); with
+    /// DPLL4 held at its own state it shares it and programs no PLL.
+    fn smoke_rkl_ddi_e_arbitrates_and_shares_its_pll() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        let run = |held_cfgcr1: u32| {
+            let mmio = ScriptedSinkMmio::new(1 << 29);
+            // DPLL4 enabled and locked; PHY C clock on selecting it.
+            mmio.set(0x46018, super::PLL_ENABLE | super::PLL_POWER_ENABLE);
+            mmio.set(0x164294, 0x01C0_01A5);
+            mmio.set(0x164298, held_cfgcr1);
+            mmio.set(0x164280, (2 << 4) | (1 << 13));
+            let mut ms = Modeset::for_pipe(&mmio, Ddi::E, Pipe::A);
+            ms.set_gen12_family(Gen12Platform::RocketLake);
+            let plan = LinkPlan {
+                rate: crate::dp_link_training::LinkRate::Hbr2,
+                lanes: 4,
+            };
+            let ok = ms
+                .modeset_with_plan(&fb_1080p(), &mode_1080p60(), plan)
+                .is_ok();
+            (ok, mmio)
+        };
+        // DPLL4 at RBR (CFGCR1 0x93): TC2 takes DPLL0.
+        let (ok, mmio) = run(0x93);
+        let dpclka = mmio.writes_to(0x164280);
+        if !ok
+            || mmio.writes_to(0x164284) != alloc::vec![0x01C0_01A5]
+            || mmio.writes_to(0x164288) != alloc::vec![0x4B]
+            || !mmio.writes_to(0x164298).is_empty()
+            || dpclka
+                .last()
+                .is_none_or(|v| (v >> 27) & 3 != 0 || v & (1 << 13) != 0)
+        {
+            return TestResult::Fail("RKL TC2 must take DPLL0 when DPLL4 runs another state");
+        }
+        // DPLL4 at HBR2 (CFGCR1 0x4B): TC2 shares it.
+        let (ok, mmio) = run(0x4B);
+        let dpclka = mmio.writes_to(0x164280);
+        if !ok
+            || !mmio.writes_to(0x164284).is_empty()
+            || !mmio.writes_to(0x164294).is_empty()
+            || dpclka
+                .last()
+                .is_none_or(|v| (v >> 27) & 3 != 2 || v & (1 << 13) != 0)
+        {
+            return TestResult::Fail("RKL TC2 must share DPLL4 at its own state");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_ddi_e_arbitrates_and_shares_its_pll
+    );
+
     fn smoke_gen11_hdmi_ddi_b_full_run() -> TestResult {
         use crate::intel_gpu_gt::Gen11Platform;
         // DSSM strap: 24 MHz (field 0) — the WRPLL row for
@@ -6308,16 +7311,16 @@ pub mod tests {
         if mmio.sink.borrow().pattern_history != alloc::vec![1u8, 0, 1, 2, 0] {
             return TestResult::Fail("fallback must retry training at the lower rate");
         }
-        // DPLL: programmed at the RBR floor row for the 1080p
-        // mode (CFGCR1 KDIV_2 | PDIV_5 | CFREQ = 0x93), then
+        // DPLL: programmed at the HBR2 row the first attempt
+        // trains at (CFGCR1 KDIV_1 | PDIV_3 | CFREQ = 0x4B), then
         // retuned mid-training to HBR (KDIV_2 | PDIV_3 |
         // CFREQ = 0x8B) when the fallback retry opened. CFGCR0
         // is the same DCO row at both rates, so CFGCR1 is the
         // rate witness.
         let cfgcr1 = crate::intel_gpu_pll::dpll_cfgcr1(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
-        if mmio.writes_to(cfgcr1) != alloc::vec![0x93, 0x8B] {
+        if mmio.writes_to(cfgcr1) != alloc::vec![0x4B, 0x8B] {
             return TestResult::Fail(
-                "fallback must reprogram CFGCR1 from the RBR row to the HBR row",
+                "fallback must reprogram CFGCR1 from the HBR2 row to the HBR row",
             );
         }
         // DPLL enable cycled by the retune: step-4 power +
@@ -6403,7 +7406,7 @@ pub mod tests {
         }
         let cfgcr0 = mmio.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
         if cfgcr0 != alloc::vec![0x0100_0151] {
-            return TestResult::Fail("CFGCR0 must be the 24-family RBR row");
+            return TestResult::Fail("CFGCR0 must be the 24-family DP DCO word");
         }
         TestResult::Pass
     }

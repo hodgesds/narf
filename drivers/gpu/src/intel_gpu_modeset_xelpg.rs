@@ -130,6 +130,9 @@ impl<M: MmioWindow + ?Sized> MmioWindow for CheckedWindow<'_, M> {
     fn cx0_xe3(&self) -> bool {
         self.raw.cx0_xe3()
     }
+    fn cx0_c20_port_b(&self) -> bool {
+        self.raw.cx0_c20_port_b()
+    }
     fn display_access_ok(&self) -> bool {
         if self.failed.get() || !self.raw.display_access_ok() {
             self.failed.set(true);
@@ -850,16 +853,13 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 .map_err(|_| ModesetError::PanelPowerTimeout)?;
         }
 
-        // Step 5: enable the port PLL. The existing 8 bpc sequence takes
-        // the rate this pixel clock needs (the same bandwidth rule the
-        // Gen12 path picks its DPLL rate with) on four lanes; a 6 bpc or
+        // Step 5: enable the port PLL. The existing 8 bpc sequence starts
+        // at the HBR2 x4 its training starts at (`train_dp_link`), so the
+        // sink never trains against a clock for another rate; a 6 bpc or
         // rate-table panel takes Linux's computed link; a compressed eDP
         // stream runs at the plan's (maximum) link.
         let (mut link_khz, mut lanes) = match plan {
-            EdpPlan::Legacy => (
-                link_rate_for_pixel_clock(mode.pixel_clock_khz).megabits_per_sec() * 100,
-                4,
-            ),
+            EdpPlan::Legacy => (LEGACY_START_KHZ, 4),
             EdpPlan::Link { link, .. } => (link.link_rate, link.lanes),
             EdpPlan::Dsc { plan, .. } => {
                 (dsc_link_rate(&plan)?.megabits_per_sec() * 100, plan.lanes)
@@ -958,8 +958,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                         )?,
                     ),
                     None => {
+                        let mut pll = (link_khz, lanes);
                         let (rate, lanes, levels) =
-                            self.train_dp_link_at(train_rate(&plan)?, plan.lanes)?;
+                            self.train_dp_link_at(train_rate(&plan)?, plan.lanes, &mut pll)?;
                         (rate.megabits_per_sec() * 100, lanes, levels)
                     }
                 };
@@ -972,8 +973,14 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 self.train_planned_link(&mode, link, select, &caps, &mut link_khz, &mut lanes)?
             }
             EdpPlan::Legacy => {
-                let (rate, lanes, levels) = self.train_dp_link()?;
-                (rate.megabits_per_sec() * 100, lanes, levels)
+                // The training callback moves the PLL (and the PHY width)
+                // with the fallback ladder, so step 12 starts from the
+                // rate it left; a width change still rewrites the port
+                // and transcoder widths there.
+                let mut pll = (link_khz, lanes);
+                let trained = self.train_dp_link(&mut pll)?;
+                link_khz = pll.0;
+                (trained.0.megabits_per_sec() * 100, trained.1, trained.2)
             }
         };
 
@@ -1130,11 +1137,37 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// One training attempt at exactly `select` x `lanes` (no fallback
-    /// ladder), with this port's AUX: the converged levels.
+    /// ladder), with this port's AUX: the converged levels. The source
+    /// follows each step ([`Self::training_source_update`]) at the
+    /// selected rate.
     fn train_select(&mut self, select: RateSelect, lanes: u8) -> Result<LaneLevels, ModesetError> {
         use crate::dp_link_training::{train_link_select, LinkError};
-        let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
-        match train_link_select(&mut aux, select, lanes, |_us| core::hint::spin_loop()) {
+        use crate::intel_gpu_modeset::training::{State, TrainingAux};
+        let (khz, rate) = match select {
+            RateSelect::LinkBw(rate) => (
+                rate.rate_kbps() / 10,
+                crate::intel_gpu_modeset::to_pll_rate(rate),
+            ),
+            RateSelect::Table { link_rate, .. } => (link_rate, LinkRate::DpHbr2),
+        };
+        let pll = Cell::new((khz, lanes));
+        let mut failure = None;
+        let result = {
+            let aux = IntelAux::with_base(self.mmio, self.port.aux_base());
+            let mut aux =
+                TrainingAux::new(aux, State::new(rate, lanes), |state: &State, change| {
+                    self.training_source_update(Some(khz), &pll, state, change)
+                        .map_err(|error| {
+                            failure = Some(error);
+                            crate::dp_aux::AuxError::Nacked
+                        })
+                });
+            train_link_select(&mut aux, select, lanes, |_us| core::hint::spin_loop())
+        };
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        match result {
             Ok(trained) => {
                 let mut levels = [(0u8, 0u8); 4];
                 for (i, lane) in trained.lanes.iter().enumerate() {
@@ -1941,12 +1974,32 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         compiler_fence(Ordering::SeqCst);
     }
 
+    /// DP_TP_CTL for a training step: the pattern field and the
+    /// scrambling-disable bit (7) from `training::State::pattern_bits`,
+    /// as the external route writes them.
+    fn program_dp_tp_ctl_bits(&self, bits: u32) {
+        use crate::intel_gpu_pipes::Transcoder;
+        let off = Transcoder::A.base() + DP_TP_CTL_OFFSET;
+        let cur = self.mmio.read32(off);
+        let val = (cur & !(DP_TP_CTL_LINK_TRAIN_MASK | (1 << 7)))
+            | DP_TP_CTL_ENABLE
+            | DP_TP_CTL_ENHANCED_FRAME
+            | bits;
+        self.mmio.write32(off, val);
+        compiler_fence(Ordering::SeqCst);
+    }
+
     /// Run DPCD link training over this port's AUX channel
     /// (the shared `dp_link_training` state machine; HBR2 start,
     /// 4 lanes, the codec's fallback ladder). Returns the
-    /// trained (rate, lanes, per-lane (swing, pre-emphasis)).
-    fn train_dp_link(&mut self) -> Result<(LinkRate, u8, LaneLevels), ModesetError> {
-        self.train_dp_link_at(crate::dp_link_training::LinkRate::Hbr2, 4)
+    /// trained (rate, lanes, per-lane (swing, pre-emphasis)). `pll` is the
+    /// PHY PLL rate (kHz) and width the port runs, which the source
+    /// follows into each fallback attempt.
+    fn train_dp_link(
+        &mut self,
+        pll: &mut (u32, u8),
+    ) -> Result<(LinkRate, u8, LaneLevels), ModesetError> {
+        self.train_dp_link_at(crate::dp_link_training::LinkRate::Hbr2, 4, pll)
     }
 
     /// [`Self::train_dp_link`] from `rate` x `lanes`.
@@ -1954,10 +2007,29 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         &mut self,
         rate: crate::dp_link_training::LinkRate,
         lanes: u8,
+        pll: &mut (u32, u8),
     ) -> Result<(LinkRate, u8, LaneLevels), ModesetError> {
         use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
-        let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
-        match train_link(&mut aux, rate, lanes, |_us| core::hint::spin_loop()) {
+        use crate::intel_gpu_modeset::training::{State, TrainingAux};
+        let tracked = Cell::new(*pll);
+        let mut failure = None;
+        let result = {
+            let aux = IntelAux::with_base(self.mmio, self.port.aux_base());
+            let state = State::new(crate::intel_gpu_modeset::to_pll_rate(rate), lanes);
+            let mut aux = TrainingAux::new(aux, state, |state: &State, change| {
+                self.training_source_update(None, &tracked, state, change)
+                    .map_err(|error| {
+                        failure = Some(error);
+                        crate::dp_aux::AuxError::Nacked
+                    })
+            });
+            train_link(&mut aux, rate, lanes, |_us| core::hint::spin_loop())
+        };
+        *pll = tracked.get();
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        match result {
             Ok(trained) => {
                 let rate = match trained.rate {
                     TrainRate::Rbr => LinkRate::DpRbr,
@@ -1975,6 +2047,61 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             Err(LinkError::EqFailed(_)) => Err(ModesetError::LinkTrainingEq),
             Err(LinkError::Aborted) => Err(ModesetError::LinkTrainingCr),
             Err(LinkError::AuxFailure(e)) => Err(ModesetError::AuxFailure(e)),
+        }
+    }
+
+    /// The source side of one training step, as Linux's
+    /// `intel_dp_link_training.c` drives it: the sink's requested drive
+    /// levels (`intel_dp_update_link_train` → `intel_cx0_phy_set_signal_levels`)
+    /// and the pattern generator (`intel_dp_program_link_training_pattern`),
+    /// each before the sink write that asks the sink to measure them. A
+    /// pattern-1 write after a dirty Configure opens a fallback attempt at
+    /// another link: the PHY PLL and width move to it first (`pll` tracks
+    /// them). `fixed_khz` is the rate of a `DP_LINK_RATE_SET` attempt,
+    /// which `DP_LINK_BW_SET` does not name.
+    fn training_source_update(
+        &self,
+        fixed_khz: Option<u32>,
+        pll: &Cell<(u32, u8)>,
+        state: &crate::intel_gpu_modeset::training::State,
+        change: crate::intel_gpu_modeset::training::Change,
+    ) -> Result<(), ModesetError> {
+        use crate::intel_gpu_modeset::training::Change;
+        let khz = fixed_khz.unwrap_or(state.rate.megabits_per_sec() * 100);
+        let phy = Cx0Phy::new(self.mmio, self.port);
+        match change {
+            Change::Configure => Ok(()),
+            Change::Levels if !state.dirty => {
+                set_signal_levels_khz(&phy, khz, state.lanes, &state.levels).map_err(map_cx0_err)
+            }
+            // The sink is about to be reconfigured; its levels follow.
+            Change::Levels => Ok(()),
+            Change::Pattern => {
+                if state.pattern == 1 && state.dirty {
+                    let (cur_khz, cur_lanes) = pll.get();
+                    if khz != cur_khz {
+                        reprogram_pll_khz(self.mmio, self.port, khz).map_err(map_cx0_err)?;
+                    }
+                    if state.lanes != cur_lanes {
+                        crate::intel_gpu_xelpg::reprogram_phy_lanes(
+                            self.mmio,
+                            self.port,
+                            state.lanes,
+                            false,
+                        )
+                        .map_err(map_cx0_err)?;
+                        program_port_buf_ctl(self.mmio, self.port, state.lanes);
+                    }
+                    pll.set((khz, state.lanes));
+                    set_signal_levels_khz(&phy, khz, state.lanes, &state.levels)
+                        .map_err(map_cx0_err)?;
+                }
+                let bits = state
+                    .pattern_bits()
+                    .map_err(|_| ModesetError::LinkTrainingCr)?;
+                self.program_dp_tp_ctl_bits(bits);
+                Ok(())
+            }
         }
     }
 
@@ -2177,22 +2304,9 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 }
 
-/// Pick the lowest DP link rate that can deliver
-/// `pixel_clock_khz` of 24-bpp scanout over 4 lanes — the same
-/// bandwidth rule as the Gen12 orchestrator (24 bpp / 0.8 coding
-/// efficiency ⇒ required per-lane kbps = pixel_clock × 30 / 4).
-fn link_rate_for_pixel_clock(pixel_clock_khz: u32) -> LinkRate {
-    let required_kbps = (pixel_clock_khz.saturating_mul(30)) / 4;
-    if required_kbps <= 1_620_000 {
-        LinkRate::DpRbr
-    } else if required_kbps <= 2_700_000 {
-        LinkRate::DpHbr
-    } else if required_kbps <= 5_400_000 {
-        LinkRate::DpHbr2
-    } else {
-        LinkRate::DpHbr3
-    }
-}
+/// The PHY PLL rate (kHz) the legacy 8 bpc panel sequence starts at: the
+/// HBR2 its training starts at (`train_dp_link`, 4 lanes).
+const LEGACY_START_KHZ: u32 = 540_000;
 
 /// The PHY PLL rate of a DSC plan's link (RBR..HBR3 only).
 fn dsc_link_rate(plan: &DscPlan) -> Result<LinkRate, ModesetError> {
@@ -2734,11 +2848,10 @@ pub mod tests {
         if fake.writes_to(TRANS_CLK_SEL_A) != [0x1000_0000u32] {
             return TestResult::Fail("TRANS_CLK_SEL must route PHY A (0x10000000)");
         }
-        // Training converged at HBR2 while the PLL started at
-        // RBR for this pixel clock, so VALFREQ shows the
-        // reprogram: 162000 then 540000.
-        if fake.writes_to(0x6_4030) != [162_000u32, 540_000] {
-            return TestResult::Fail("VALFREQ must show RBR then HBR2 after training fallback");
+        // The PLL starts at the HBR2 training starts at and training
+        // converges there, so VALFREQ is written once.
+        if fake.writes_to(0x6_4030) != [540_000u32] {
+            return TestResult::Fail("VALFREQ must show the HBR2 start rate only");
         }
         // Power wells: PW_1 + PW_A requested in CTL2; AUX_A powered
         // by its own XELPDP_DP_AUX_CH_CTL request (0x64010 bit 19,
@@ -3363,13 +3476,13 @@ pub mod tests {
         use crate::intel_gpu_xelpg_dsc::EdpVbt;
         // 24 bpp fits and there is no rate table: the existing sequence
         // writes neither PIPE_MISC nor the MSA, and still trains with
-        // DP_LINK_BW_SET from HBR2 (VALFREQ RBR, then HBR2).
+        // DP_LINK_BW_SET from HBR2, its PLL starting there (VALFREQ HBR2).
         let fake = MtlFake::new(XeLpgPort::A);
         let mode = Mode::VESA_1024X768_60;
         if run_with(&fake, &mode, EdpVbt::Missing, 0) != Ok(mode)
             || !fake.writes_to(0x7_0030).is_empty()
             || !fake.writes_to(0x6_0410).is_empty()
-            || fake.writes_to(0x6_4030) != [162_000, 540_000]
+            || fake.writes_to(0x6_4030) != [540_000]
             || fake.writes_to(0x6_0400) != [func_a(4, 0)]
         {
             return TestResult::Fail("the 8 bpc sequence must keep its write stream");
@@ -3603,10 +3716,11 @@ pub mod tests {
     );
 
     fn smoke_mtl_modeset_training_fallback_reprograms_pll() -> TestResult {
-        // Sink refuses clock recovery at HBR2; training falls
-        // back to HBR and the PLL (started at RBR for this
-        // pixel clock) must be reprogrammed to the trained
-        // rate — VALFREQ tells the story: 162000, then 270000.
+        // Sink refuses clock recovery at HBR2; training falls back to
+        // HBR. The PLL starts at the HBR2 the first attempt trains at,
+        // and the source moves it to HBR before the HBR attempt's TPS1
+        // (the training callback), so the sink never trains against a
+        // clock for another rate — VALFREQ: 540000, then 270000.
         let fake = MtlFake::new(XeLpgPort::A);
         fake.hbr2_cr_fails.set(true);
         let mut ms = XeLpgModeset::new(&fake, XeLpgPort::A);
@@ -3616,8 +3730,36 @@ pub mod tests {
         {
             return TestResult::Fail("fallback training must still complete the modeset");
         }
-        if fake.writes_to(0x6_4030) != [162_000u32, 270_000] {
-            return TestResult::Fail("PLL must be reprogrammed RBR -> HBR after fallback");
+        if fake.writes_to(0x6_4030) != [540_000u32, 270_000] {
+            return TestResult::Fail("PLL must start at HBR2 and move to HBR for the retry");
+        }
+        // The HBR retune precedes the HBR attempt's TPS1: the sink
+        // measures nothing before TRAINING_PATTERN_SET asks it to.
+        let retune = fake.write_index(0, |o, v| o == 0x6_4030 && v == 270_000);
+        let hbr_tps1 = {
+            let dpcd = fake.dpcd_writes.borrow();
+            let hbr = dpcd.iter().position(|(a, v, _)| *a == 0x100 && *v == 0x0A);
+            hbr.and_then(|i| {
+                dpcd[i..]
+                    .iter()
+                    .find(|(a, v, _)| *a == 0x102 && v & 3 == 1)
+                    .map(|(_, _, at)| *at)
+            })
+        };
+        if retune.zip(hbr_tps1).is_none_or(|(r, t)| r >= t) {
+            return TestResult::Fail("the PLL must move before the sink trains at HBR");
+        }
+        // The pattern generator follows training: TPS1 for clock
+        // recovery, then an equalization pattern (TPS2/3/4), then normal.
+        let patterns: Vec<u32> = fake
+            .writes_to(0x6_0540)
+            .iter()
+            .map(|v| (v >> 8) & 7)
+            .collect();
+        let eq = patterns.iter().position(|p| matches!(p, 1 | 4 | 5));
+        let normal = patterns.iter().rposition(|p| *p == 3);
+        if patterns.first() != Some(&0) || eq.zip(normal).is_none_or(|(e, n)| e > n) {
+            return TestResult::Fail("DP_TP_CTL must run TPS1, then an EQ pattern, then normal");
         }
         // The sink's final LINK_BW_SET is HBR (0x0A).
         if fake.dpcd.borrow()[0x100] != 0x0A {

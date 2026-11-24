@@ -849,6 +849,15 @@ impl RegisterInit {
             if a == b && crate::intel_gpu_vram::VramLayout::dg2(a).is_ok() {
                 vram = Some(crate::intel_gpu_vram::VramRegisters::Dg2(a));
             }
+        } else if self.platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1) {
+            // xe_vram.c: DG1 reads only GSMBASE, as a stable 2x32 pair.
+            let read = || crate::intel_gpu_vram::Dg1VramRegisters {
+                gsm_base: u64::from(mmio.read32(0x108104)) << 32 | u64::from(mmio.read32(0x108100)),
+            };
+            let a = read();
+            if a == read() && crate::intel_gpu_vram::VramLayout::dg1(a).is_ok() {
+                vram = Some(crate::intel_gpu_vram::VramRegisters::Dg1(a));
+            }
         }
         let flat = if self.platform.is_headless_integrated() {
             self.steer(mmio, selector, Target::Instance0)?;

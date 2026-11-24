@@ -419,6 +419,95 @@ pub(crate) const MTL_L3CC: [u16; 16] = [
     0xb0, 0xb0, 0x90, 0x90, 0xd0, 0xd0, 0x10, 0x10, 0x50, 0x50, 0xb0, 0xb0, 0xb0, 0xb0, 0xb0, 0x50,
 ];
 
+/// xe_pat.c `XE2_PAT(no_promote, comp_en, l3clos, l3_policy, l4_policy,
+/// coh_mode)`.
+const fn xe2_pat_bits(no_promote: u32, comp_en: u32, clos: u32, l3: u32, l4: u32, coh: u32) -> u32 {
+    no_promote << 10 | comp_en << 9 | clos << 6 | l3 << 4 | l4 << 2 | coh
+}
+/// `XE2_COMP_EN`: the entry compresses through flat CCS.
+pub(crate) const XE2_COMP_EN: u32 = 1 << 9;
+/// `XE2_COH_MODE`: zero is non-coherent; 2 one-way and 3 two-way snoop.
+pub(crate) const XE2_COH_MODE: u32 = 3;
+/// `xe2_pat_table`. `None` marks the reserved 16..19, programmed as zero;
+/// graphics 30 (`xe3_lpg_pat_table`) also defines 16 ([`XE3_PAT16`]).
+const XE2_PAT_TABLE: [Option<u32>; 32] = {
+    const fn p(n: u32, c: u32, clos: u32, l3: u32, l4: u32, coh: u32) -> Option<u32> {
+        Some(xe2_pat_bits(n, c, clos, l3, l4, coh))
+    }
+    [
+        p(0, 0, 0, 0, 3, 0),
+        p(0, 0, 0, 0, 3, 2),
+        p(0, 0, 0, 0, 3, 3),
+        p(0, 0, 0, 3, 3, 0),
+        p(0, 0, 0, 3, 0, 2),
+        p(0, 0, 0, 3, 3, 2),
+        p(1, 0, 0, 1, 3, 0),
+        p(0, 0, 0, 3, 0, 3),
+        p(0, 0, 0, 3, 0, 0),
+        p(0, 1, 0, 0, 3, 0),
+        p(0, 1, 0, 3, 0, 0),
+        p(1, 1, 0, 1, 3, 0),
+        p(0, 1, 0, 3, 3, 0),
+        p(0, 0, 0, 0, 0, 0),
+        p(0, 1, 0, 0, 0, 0),
+        p(1, 1, 0, 1, 1, 0),
+        None,
+        None,
+        None,
+        None,
+        p(0, 0, 1, 0, 3, 0),
+        p(0, 1, 1, 0, 3, 0),
+        p(0, 0, 1, 0, 3, 2),
+        p(0, 0, 1, 0, 3, 3),
+        p(0, 0, 2, 0, 3, 0),
+        p(0, 1, 2, 0, 3, 0),
+        p(0, 0, 2, 0, 3, 2),
+        p(0, 0, 2, 0, 3, 3),
+        p(0, 0, 3, 0, 3, 0),
+        p(0, 1, 3, 0, 3, 0),
+        p(0, 0, 3, 0, 3, 2),
+        p(0, 0, 3, 0, 3, 3),
+    ]
+};
+/// `xe3_lpg_pat_table[16]`: compressed write-back, one-way coherent.
+const XE3_PAT16: u32 = xe2_pat_bits(0, 1, 0, 0, 3, 2);
+/// `xe2_pat_ats` and the discrete-only `xe2_pat_pta`.
+const XE2_PAT_ATS: u32 = xe2_pat_bits(0, 0, 0, 0, 3, 3);
+const XE2_PAT_PTA: u32 = xe2_pat_bits(0, 0, 0, 0, 3, 0);
+const PAT_ATS: u64 = 0x47fc;
+const PAT_PTA: u64 = 0x4820;
+
+/// `xe->pat.n_entries` on Xe2/Xe3: Battlemage (graphics 20.01) stops at 28,
+/// disabling CLOS3 (Wa_16023588340).
+pub(crate) fn xe2_pat_entries(platform: GtPlatform) -> u16 {
+    if platform == GtPlatform::Battlemage {
+        28
+    } else {
+        32
+    }
+}
+
+/// The value the GT owner programs at Xe2/Xe3 PAT `index`; `None` for a
+/// reserved index or one past [`xe2_pat_entries`].
+pub(crate) fn xe2_pat_value(platform: GtPlatform, index: u16) -> Option<u32> {
+    if index >= xe2_pat_entries(platform) {
+        return None;
+    }
+    if index == 16 && platform.is_xe3_lpg() {
+        return Some(XE3_PAT16);
+    }
+    XE2_PAT_TABLE[usize::from(index)]
+}
+
+/// xe_pat.c `_PAT_INDEX`: indices 0..7 from 0x4800, the rest from 0x4848.
+pub(crate) const fn pat_index_reg(index: u16) -> u64 {
+    if index < 8 {
+        0x4800 + index as u64 * 4
+    } else {
+        0x4848 + (index as u64 - 8) * 4
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HardwareError {
     Unsupported,
@@ -741,8 +830,11 @@ impl HardwareInit {
             // semaphore is acquired, above.
             GtPlatform::Gen9(_) => unreachable!("Gen9 cache policy refused above"),
             GtPlatform::Integrated(_) if !self.platform.is_headless_integrated() => {
-                // Xe-LPG PAT3: WB L4, one-way coherent. PAT0, used by the
-                // inherited display, is deliberately not redefined.
+                // xelpg_pat_table PAT0: WB L4, non-coherent. The inherited
+                // display's PTEs name it too; display fetches ignore the
+                // GT's L4 policy, as under Linux, which programs it as well.
+                mmio.write32(0x4800, 0);
+                // Xe-LPG PAT3: WB L4, one-way coherent.
                 mmio.write32(0x480c, 2);
                 mmio.write32(0x4810, 3); // Xe-LPG PAT4: two-way coherent WB
                                          // XELPG_PAT_1_WT, non-coherent: Mesa's scanout and
@@ -763,7 +855,12 @@ impl HardwareInit {
                 3
             }
             GtPlatform::ArcticSoundM | GtPlatform::Alchemist => {
+                // xe_pat.c xelp_pat_table, multicast under the selector
+                // above: PAT0 WB (coherent), PAT1 WC, PAT2 WT, PAT3 UC.
                 mmio.write32(0x4800, 3); // Xe-LP PAT0: WB, coherent
+                mmio.write32(0x4804, 1);
+                mmio.write32(0x4808, 2);
+                mmio.write32(0x480c, 0);
                 let l3 = [0x90, 0xd0, 0x50, 0xb0];
                 for i in 0..32 {
                     let low = *l3.get(i * 2).unwrap_or(&0xb0);
@@ -776,14 +873,18 @@ impl HardwareInit {
             | GtPlatform::WildcatLake
             | GtPlatform::NovaLakeS
             | GtPlatform::Integrated(_) => {
-                mmio.write32(0x4804, 0xe); // Xe2 coherent PAT1,4,5,7
-                if self.platform.is_headless_integrated() {
-                    mmio.write32(0x480c, 0x3c);
-                } // Xe2 UC PAT3
-                mmio.write32(0x4808, 0xf); // Xe2 default WB PAT2: L3 WB, L4 UC, two-way coherent
-                mmio.write32(0x4810, 0x32);
-                mmio.write32(0x4814, 0x3e);
-                mmio.write32(0x481c, 0x33);
+                // xe2lpg_program_pat: the whole table (reserved entries as
+                // zero), then ATS and, on discrete parts, PTA. PAT2 (L3 WB,
+                // L4 UC, two-way coherent) is the kernel's WB policy; PAT3
+                // (UC) is the display's.
+                for index in 0..xe2_pat_entries(self.platform) {
+                    let value = xe2_pat_value(self.platform, index).unwrap_or(0);
+                    mmio.write32(pat_index_reg(index), value);
+                }
+                mmio.write32(PAT_ATS, XE2_PAT_ATS);
+                if self.platform.is_discrete() {
+                    mmio.write32(PAT_PTA, XE2_PAT_PTA);
+                }
                 let table = [0xc, 0x10c, 0x130, 0x13c, 0x100];
                 for i in 0..16 {
                     mmio.write32(0x4000 + i as u64 * 4, *table.get(i).unwrap_or(&0x100));

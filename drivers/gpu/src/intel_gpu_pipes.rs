@@ -225,6 +225,20 @@ pub const fn build_trans_ddi_func_ctl(ddi_index: u8, mode: u32, lanes: u8) -> u3
         | trans_ddi_port_width(lanes)
 }
 
+/// Display 9–11's port-select field, bits[30:28] = the port index
+/// (`TRANS_DDI_SELECT_PORT`). Display 12 widened it to bits[30:27] and
+/// moved to `index + 1` (`TGL_TRANS_DDI_SELECT_PORT`); the two agree
+/// only for DDI B.
+pub const TRANS_DDI_PORT_SHIFT_PRE_TGL: u32 = 28;
+
+/// Re-encode a [`build_trans_ddi_func_ctl`] value's port select for a
+/// display 9–11 transcoder, as `intel_ddi_transcoder_func_reg_val_get`
+/// picks `TRANS_DDI_SELECT_PORT` below display 12.
+pub const fn with_pre_tgl_port(val: u32, ddi_index: u8) -> u32 {
+    (val & !(0xF << TRANS_DDI_FUNC_CTL_DDI_SHIFT))
+        | ((ddi_index as u32) << TRANS_DDI_PORT_SHIFT_PRE_TGL)
+}
+
 /// `TRANS_DDI_FUNC_CTL[0]` — HDMI scrambling enable (TGL PRM
 /// Vol. 2c, TRANS_DDI_FUNC_CTL: "Setting this bit enables
 /// scrambling over the HDMI link. Scrambling must be enabled

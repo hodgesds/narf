@@ -58,10 +58,19 @@ pub struct Dg2VramRegisters {
     pub gsm_base: u64,
 }
 
+/// DG1 (graphics 12.10) has no tile address range or flat CCS: Linux
+/// xe_vram.c::tile_vram_size takes the whole LMEM BAR at offset zero and
+/// ends usable memory at GSMBASE.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Dg1VramRegisters {
+    pub gsm_base: u64,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VramRegisters {
     Xe2(Xe2VramRegisters),
     Dg2(Dg2VramRegisters),
+    Dg1(Dg1VramRegisters),
 }
 
 impl VramLayout {
@@ -69,7 +78,24 @@ impl VramLayout {
         match regs {
             VramRegisters::Xe2(regs) => Self::xe2(regs),
             VramRegisters::Dg2(regs) => Self::dg2(regs),
+            VramRegisters::Dg1(regs) => Self::dg1(regs),
         }
+    }
+
+    /// DG1: usable memory is everything below GSMBASE (stolen memory sits
+    /// above it); the pool is further bounded by the mapped LMEM BAR.
+    pub fn dg1(regs: Dg1VramRegisters) -> Result<Self, VramError> {
+        if regs.gsm_base == u64::MAX {
+            return Err(VramError::Unavailable);
+        }
+        if regs.gsm_base == 0 || regs.gsm_base % 4096 != 0 || regs.gsm_base > 1 << 39 {
+            return Err(VramError::Layout);
+        }
+        Ok(Self {
+            tile_size: regs.gsm_base,
+            tile_offset: 0,
+            usable: regs.gsm_base,
+        })
     }
 
     pub fn dg2(regs: Dg2VramRegisters) -> Result<Self, VramError> {
@@ -570,6 +596,29 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_vram", smoke_xe2_vram_layout_vectors);
+
+    /// DG1: GSMBASE bounds the usable tile from offset zero; an absent,
+    /// zero, unaligned or impossible base withholds VRAM.
+    fn smoke_dg1_vram_layout() -> TestResult {
+        let gsm = 4 * GIB - 0x400_0000;
+        let layout =
+            VramLayout::from_registers(VramRegisters::Dg1(Dg1VramRegisters { gsm_base: gsm }));
+        if layout.map(|l| (l.tile_offset, l.usable)) != Ok((0, gsm)) {
+            return TestResult::Fail("DG1 usable VRAM ends at GSMBASE");
+        }
+        for (base, error) in [
+            (u64::MAX, VramError::Unavailable),
+            (0, VramError::Layout),
+            (gsm + 0x800, VramError::Layout),
+            (1 << 40, VramError::Layout),
+        ] {
+            if VramLayout::dg1(Dg1VramRegisters { gsm_base: base }) != Err(error) {
+                return TestResult::Fail("DG1 refuses a bad GSMBASE");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_vram", smoke_dg1_vram_layout);
 
     fn smoke_xe2_vram_layout_refusals() -> TestResult {
         let tile = 12u32 << 8;

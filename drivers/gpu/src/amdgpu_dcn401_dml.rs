@@ -2991,6 +2991,13 @@ fn mcache_shapes(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<Shape>
 /// DC enables dynamic ODM only for one stream on DCN401. A failed
 /// candidate ends the search, retaining all supported partial progress;
 /// mode support alone validates candidates, before DPMM chooses clocks.
+///
+/// Never inlined: its candidate shapes and the closure's mode-support
+/// result are kilobytes of locals. Inlined into `pstate::search_config`
+/// they added 1440 bytes to that already-listed frame, and whether LLVM
+/// inlines it depends on how the crate's codegen units happen to merge
+/// (release builds run with LTO off and 16 units).
+#[inline(never)]
 fn optimize_vmin(
     soc: &Soc,
     modes: &[Mode],

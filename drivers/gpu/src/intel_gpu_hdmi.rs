@@ -154,6 +154,12 @@ pub struct HfVsdb {
     /// Max TMDS character rate in kHz (5 MHz units on the
     /// wire); 0 when the block carries no rate byte.
     pub max_tmds_char_rate_khz: u32,
+    /// Max FRL rate in Gbps (`hf_scds[7]` bits 7:4 through
+    /// `drm_get_max_frl_rate`); 0 for a sink without FRL.
+    pub max_frl_gbps: u8,
+    /// Max FRL rate for DSC transport (`hf_scds[12]` bits 7:4, when the
+    /// block declares DSC 1.2); 0 otherwise.
+    pub dsc_max_frl_gbps: u8,
 }
 
 /// Scan a complete EDID's CTA extensions for the HF-VSDB.
@@ -162,6 +168,257 @@ pub struct HfVsdb {
 /// offset (byte 2; 0 means the collection runs to the block
 /// end). Other vendor blocks (including the HDMI Licensing
 /// VSDB, OUI 0x000C03) are walked past, never matched.
+/// The HDMI Licensing VSDB OUI, `00-0C-03` little-endian
+/// (`HDMI_IEEE_OUI`).
+const HDMI_VSDB_OUI: [u8; 3] = [0x03, 0x0C, 0x00];
+/// DVI single-link ceiling (`hdmi_port_clock_valid`: a sink without an
+/// HDMI VSDB is limited to 165 MHz).
+pub const DVI_MAX_TMDS_KHZ: u32 = 165_000;
+
+/// The HDMI Licensing VSDB (`drm_parse_hdmi_vsdb_video`): the deep-colour
+/// flags (byte 6) and the max TMDS clock (byte 7, 5 MHz units).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HdmiVsdb {
+    /// `DRM_EDID_HDMI_DC_30`: 10 bpc RGB 4:4:4.
+    pub dc_30: bool,
+    /// `DRM_EDID_HDMI_DC_36`: 12 bpc RGB 4:4:4.
+    pub dc_36: bool,
+    /// `max_tmds_clock` in kHz; 0 when the block has no rate byte.
+    pub max_tmds_khz: u32,
+}
+
+/// The sink's HDMI VSDB, `None` for a DVI sink.
+pub fn parse_hdmi_vsdb(edid: &[u8]) -> Option<HdmiVsdb> {
+    for block in edid.chunks_exact(128).skip(1) {
+        if block[0] != 0x02 {
+            continue;
+        }
+        let limit = match block[2] {
+            0 => 127usize,
+            n => (n as usize).min(127),
+        };
+        let mut pos = 4usize;
+        while pos < limit {
+            let header = block[pos];
+            let (tag, len) = (header >> 5, (header & 0x1F) as usize);
+            if pos + 1 + len > 128 {
+                break;
+            }
+            let payload = &block[pos + 1..pos + 1 + len];
+            if tag == 3 && len >= 3 && payload[..3] == HDMI_VSDB_OUI {
+                let flags = payload.get(5).copied().unwrap_or(0);
+                return Some(HdmiVsdb {
+                    dc_30: flags & (1 << 4) != 0,
+                    dc_36: flags & (1 << 5) != 0,
+                    max_tmds_khz: payload.get(6).map_or(0, |&b| u32::from(b) * 5_000),
+                });
+            }
+            pos += 1 + len;
+        }
+    }
+    None
+}
+
+/// `drm_display_info.is_hdmi` (`drm_parse_hdmi_vsdb_video` via
+/// `drm_parse_cea_ext`): a CTA extension carries the HDMI Licensing VSDB.
+/// A sink without one is DVI (`intel_has_hdmi_sink`): no infoframes, no
+/// audio, no SCDC, `TRANS_DDI_MODE_SELECT_DVI`.
+pub fn is_hdmi_sink(edid: &[u8]) -> bool {
+    parse_hdmi_vsdb(edid).is_some()
+}
+
+/// `intel_hdmi_source_max_tmds_clock` (no VBT cap): 600 MHz on display
+/// 13 and ADL-S, 594 MHz on display 10-12, 300 MHz on display 9.
+pub const fn source_max_tmds_khz(family: crate::intel_gpu_aux::SourceFamily) -> u32 {
+    use crate::intel_gpu_aux::SourceFamily;
+    use crate::intel_gpu_gt::Gen12Platform;
+    match family {
+        SourceFamily::Gen12(
+            Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN | Gen12Platform::AlderLakeS,
+        ) => 600_000,
+        SourceFamily::Gen12(_) | SourceFamily::Gen11(_) => 594_000,
+        SourceFamily::Gen9 { .. } => 300_000,
+    }
+}
+
+/// `intel_hdmi_tmds_clock` for RGB: `DIV_ROUND_CLOSEST(clock * bpc, 8)`.
+pub const fn tmds_clock_khz(pixel_clock_khz: u32, bpc: u8) -> u32 {
+    (pixel_clock_khz * bpc as u32 + 4) / 8
+}
+
+/// `intel_hdmi_tmds_clock`: a YCbCr 4:2:0 link carries half the pixel
+/// clock (integer halving, as Linux), then the bpc scaling.
+pub const fn tmds_clock_for(pixel_clock_khz: u32, bpc: u8, format: SinkFormat) -> u32 {
+    let clock = match format {
+        SinkFormat::Ycbcr420 => pixel_clock_khz / 2,
+        SinkFormat::Rgb => pixel_clock_khz,
+    };
+    tmds_clock_khz(clock, bpc)
+}
+
+/// The PLL hole `hdmi_port_clock_valid` refuses for `ddi` on `family`
+/// (exclusive kHz bounds): ICL+ combo PHYs cannot generate 500-533.2 MHz,
+/// ICL+ Type-C PHYs 500-532.8 MHz. Display 9 has none.
+fn pll_hole(family: crate::intel_gpu_aux::SourceFamily, ddi: Option<Ddi>) -> Option<(u32, u32)> {
+    use crate::intel_gpu_aux::SourceFamily;
+    let ddi = ddi?;
+    let tc = match family {
+        SourceFamily::Gen9 { .. } => return None,
+        SourceFamily::Gen11(platform) => matches!(
+            crate::intel_gpu_gen11_ddi::phy_for_port(platform, ddi),
+            Some(crate::intel_gpu_gen11_ddi::Gen11Phy::Mg { .. })
+        ),
+        // Rocket Lake's and Alder Lake S's TC ports are combo PHYs
+        // (`intel_phy_is_tc` false).
+        SourceFamily::Gen12(
+            crate::intel_gpu_gt::Gen12Platform::RocketLake
+            | crate::intel_gpu_gt::Gen12Platform::AlderLakeS,
+        ) => false,
+        SourceFamily::Gen12(_) => ddi as u8 >= Ddi::D as u8,
+    };
+    Some((500_000, if tc { 532_800 } else { 533_200 }))
+}
+
+/// `hdmi_port_clock_valid` with downstream limits: at least 25 MHz, at
+/// most the source maximum and the sink's `max_tmds_clock` (HF-VSDB above
+/// 340 MHz, else the VSDB; 165 MHz for DVI), outside the PHY's PLL hole,
+/// and — this driver's SCDC gate — above 340 MHz only on an SCDC sink.
+fn port_clock_valid(
+    family: crate::intel_gpu_aux::SourceFamily,
+    ddi: Option<Ddi>,
+    tmds: u32,
+    vsdb: Option<HdmiVsdb>,
+    hf: &HfVsdb,
+) -> bool {
+    let sink_max = match vsdb {
+        None => DVI_MAX_TMDS_KHZ,
+        Some(_) if hf.present && hf.max_tmds_char_rate_khz > SCRAMBLING_THRESHOLD_KHZ => {
+            hf.max_tmds_char_rate_khz
+        }
+        Some(v) => v.max_tmds_khz,
+    };
+    tmds >= 25_000
+        && tmds <= source_max_tmds_khz(family)
+        && (sink_max == 0 || tmds <= sink_max)
+        && (tmds <= SCRAMBLING_THRESHOLD_KHZ || hf.scdc_present)
+        && !pll_hole(family, ddi).is_some_and(|(lo, hi)| tmds > lo && tmds < hi)
+}
+
+/// `intel_hdmi_compute_clock` for `format`, from 12 bpc down (the max_bpc
+/// property defaults to its 12 bpc maximum): `intel_hdmi_source_bpc_possible`
+/// (10 bpc needs display 11+), the sink's deep-colour flags (the VSDB's for
+/// RGB, the HF-VSDB's 4:2:0 flags for 4:2:0; DVI is 8 bpc only), and
+/// [`port_clock_valid`] at the TMDS clock. `None` when not even 8 bpc fits.
+/// Returns `(bpc, tmds_khz)`.
+pub fn compute_clock(
+    family: crate::intel_gpu_aux::SourceFamily,
+    ddi: Option<Ddi>,
+    pixel_clock_khz: u32,
+    vsdb: Option<HdmiVsdb>,
+    hf: &HfVsdb,
+    y420: &Ycbcr420Caps,
+    format: SinkFormat,
+) -> Option<(u8, u32)> {
+    let (dc_36, dc_30) = match (vsdb, format) {
+        (None, _) => (false, false),
+        (Some(_), SinkFormat::Ycbcr420) => (y420.dc_36, y420.dc_30),
+        (Some(v), SinkFormat::Rgb) => (v.dc_36, v.dc_30),
+    };
+    let gen9 = matches!(family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. });
+    [(12u8, dc_36), (10, dc_30 && !gen9), (8, true)]
+        .into_iter()
+        .filter(|&(_, possible)| possible)
+        .map(|(bpc, _)| (bpc, tmds_clock_for(pixel_clock_khz, bpc, format)))
+        .find(|&(_, tmds)| port_clock_valid(family, ddi, tmds, vsdb, hf))
+}
+
+/// `intel_hdmi_compute_bpc` for an RGB 4:4:4 stream (see [`compute_clock`]),
+/// with no PHY known: anything that fits nowhere is 8 bpc at the pixel
+/// clock. Returns `(bpc, tmds_khz)`.
+pub fn compute_bpc(
+    family: crate::intel_gpu_aux::SourceFamily,
+    pixel_clock_khz: u32,
+    vsdb: Option<HdmiVsdb>,
+    hf: &HfVsdb,
+) -> (u8, u32) {
+    compute_clock(
+        family,
+        None,
+        pixel_clock_khz,
+        vsdb,
+        hf,
+        &Ycbcr420Caps::default(),
+        SinkFormat::Rgb,
+    )
+    .unwrap_or((8, pixel_clock_khz))
+}
+
+/// `connector->base.ycbcr_420_allowed`: display 10+ (`intel_hdmi_init_connector`).
+pub const fn ycbcr420_allowed(family: crate::intel_gpu_aux::SourceFamily) -> bool {
+    !matches!(family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. })
+}
+
+/// `intel_hdmi_compute_output_format`: a 4:2:0-only VIC goes out as 4:2:0
+/// on an HDMI sink the source allows it for; otherwise RGB, falling back
+/// to 4:2:0 when RGB fits at no depth and the VIC is 4:2:0-also. When
+/// nothing fits the RGB 8 bpc pixel clock is returned, and the modeset
+/// refuses it. Returns `(format, bpc, tmds_khz)`.
+pub fn compute_output(
+    family: crate::intel_gpu_aux::SourceFamily,
+    ddi: Ddi,
+    mode: &Mode,
+    vsdb: Option<HdmiVsdb>,
+    hf: &HfVsdb,
+    y420: &Ycbcr420Caps,
+) -> (SinkFormat, u8, u32) {
+    let vic = vic_for_mode(mode);
+    let allowed = vsdb.is_some() && ycbcr420_allowed(family);
+    let clock = |format| {
+        compute_clock(
+            family,
+            Some(ddi),
+            mode.pixel_clock_khz,
+            vsdb,
+            hf,
+            y420,
+            format,
+        )
+        .map(|(bpc, tmds)| (format, bpc, tmds))
+    };
+    let first = if allowed && y420.only(vic) {
+        SinkFormat::Ycbcr420
+    } else {
+        SinkFormat::Rgb
+    };
+    clock(first)
+        .or_else(|| {
+            (first == SinkFormat::Rgb && allowed && y420.also(vic))
+                .then(|| clock(SinkFormat::Ycbcr420))
+                .flatten()
+        })
+        .unwrap_or((SinkFormat::Rgb, 8, mode.pixel_clock_khz))
+}
+
+/// `gcp_default_phase_possible`: deep colour packs pixels in groups (4 per
+/// 5 clocks at 10 bpc, 2 per 3 at 12 bpc); the default phase holds when
+/// every horizontal timing point lands on a group boundary.
+pub fn gcp_default_phase_possible(bpc: u8, mode: &Mode) -> bool {
+    let group = match bpc {
+        10 => 4,
+        12 => 2,
+        _ => return false,
+    };
+    // hblank start/end are hdisplay/htotal: the modeset has no borders.
+    [
+        mode.h_active,
+        mode.h_total,
+        mode.h_sync_start,
+        mode.h_sync_end,
+    ]
+    .iter()
+    .all(|&v| v % group == 0)
+}
+
 pub fn parse_hf_vsdb(edid: &[u8]) -> HfVsdb {
     let mut out = HfVsdb::default();
     for block in edid.chunks_exact(128).skip(1) {
@@ -189,6 +446,17 @@ pub fn parse_hf_vsdb(edid: &[u8]) -> HfVsdb {
                     out.scdc_present = features & 0x80 != 0;
                     out.scdc_read_request_capable = features & 0x40 != 0;
                     out.lte_340mcsc_scramble = features & 0x08 != 0;
+                }
+                // drm_parse_hdmi_forum_scds: hf_scds[7] (payload[6]) carries
+                // the max FRL rate; hf_scds[11] bit 7 is DSC 1.2 and
+                // hf_scds[12] its max FRL rate.
+                if let Some(&frl) = payload.get(6) {
+                    out.max_frl_gbps = crate::dp_pcon::frl_rate_gbps(frl >> 4);
+                }
+                if payload.get(10).is_some_and(|b| b & (1 << 7) != 0) {
+                    if let Some(&dsc) = payload.get(11) {
+                        out.dsc_max_frl_gbps = crate::dp_pcon::frl_rate_gbps(dsc >> 4);
+                    }
                 }
             }
             pos += 1 + len;
@@ -307,38 +575,251 @@ fn infoframe_checksum(frame: &[u8], checksum_index: usize) -> u8 {
     ((256 - (sum % 256)) % 256) as u8
 }
 
-/// The CEA-861 VIC for a mode, from its resolution + clock
-/// band. 0 ("no VIC — timings govern") for modes outside the
-/// table this driver pins; sinks accept VIC 0 with explicit
-/// timings, and guessing a VIC for an unlisted mode would be
-/// worse than none.
-pub fn vic_for_mode(mode: &Mode) -> u8 {
-    match (mode.h_active, mode.v_active) {
-        (640, 480) => 1,
-        // 720x480 is anamorphic (4:3 or 16:9 over the same
-        // storage); the VIC split needs the pixel aspect,
-        // which this mode shape does not carry — pin the 4:3
-        // VIC, the sink still gets exact timings.
-        (720, 480) => 2,
-        (1280, 720) => 4,
-        (1920, 1080) => {
-            if mode.pixel_clock_khz >= 140_000 {
-                16 // 1080p60
-            } else if mode.pixel_clock_khz >= 70_000 {
-                34 // 1080p30
-            } else {
-                0
-            }
+/// The CTA-861 timings this driver matches modes against
+/// (`edid_cea_modes_1`): VIC, horizontal active/sync start/sync
+/// end/total, the vertical four, the nominal clock (kHz), the refresh
+/// (Hz) and whether both syncs are positive.
+struct CtaTiming {
+    vic: u8,
+    h: [u16; 4],
+    v: [u16; 4],
+    clock_khz: u32,
+    refresh: u8,
+    positive_sync: bool,
+}
+
+const CTA_TIMINGS: [CtaTiming; 22] = {
+    const fn t(
+        vic: u8,
+        h: [u16; 4],
+        v: [u16; 4],
+        clock_khz: u32,
+        refresh: u8,
+        positive_sync: bool,
+    ) -> CtaTiming {
+        CtaTiming {
+            vic,
+            h,
+            v,
+            clock_khz,
+            refresh,
+            positive_sync,
         }
-        (3840, 2160) => {
-            if mode.pixel_clock_khz >= 500_000 {
-                97 // 2160p60
-            } else {
-                95 // 2160p30
-            }
-        }
-        _ => 0,
     }
+    const V480: [u16; 4] = [480, 489, 495, 525];
+    const V576: [u16; 4] = [576, 581, 586, 625];
+    const V720: [u16; 4] = [720, 725, 730, 750];
+    const V1080: [u16; 4] = [1080, 1084, 1089, 1125];
+    const V2160: [u16; 4] = [2160, 2168, 2178, 2250];
+    [
+        t(
+            1,
+            [640, 656, 752, 800],
+            [480, 490, 492, 525],
+            25_175,
+            60,
+            false,
+        ),
+        t(2, [720, 736, 798, 858], V480, 27_000, 60, false),
+        t(3, [720, 736, 798, 858], V480, 27_000, 60, false),
+        t(4, [1280, 1390, 1430, 1650], V720, 74_250, 60, true),
+        t(16, [1920, 2008, 2052, 2200], V1080, 148_500, 60, true),
+        t(17, [720, 732, 796, 864], V576, 27_000, 50, false),
+        t(18, [720, 732, 796, 864], V576, 27_000, 50, false),
+        t(19, [1280, 1720, 1760, 1980], V720, 74_250, 50, true),
+        t(31, [1920, 2448, 2492, 2640], V1080, 148_500, 50, true),
+        t(32, [1920, 2558, 2602, 2750], V1080, 74_250, 24, true),
+        t(33, [1920, 2448, 2492, 2640], V1080, 74_250, 25, true),
+        t(34, [1920, 2008, 2052, 2200], V1080, 74_250, 30, true),
+        t(93, [3840, 5116, 5204, 5500], V2160, 297_000, 24, true),
+        t(94, [3840, 4896, 4984, 5280], V2160, 297_000, 25, true),
+        t(95, [3840, 4016, 4104, 4400], V2160, 297_000, 30, true),
+        t(96, [3840, 4896, 4984, 5280], V2160, 594_000, 50, true),
+        t(97, [3840, 4016, 4104, 4400], V2160, 594_000, 60, true),
+        t(98, [4096, 5116, 5204, 5500], V2160, 297_000, 24, true),
+        t(99, [4096, 5064, 5152, 5280], V2160, 297_000, 25, true),
+        t(100, [4096, 4184, 4272, 4400], V2160, 297_000, 30, true),
+        t(101, [4096, 5064, 5152, 5280], V2160, 594_000, 50, true),
+        t(102, [4096, 4184, 4272, 4400], V2160, 594_000, 60, true),
+    ]
+};
+
+/// `cea_mode_alternate_clock`: the 59.94/29.97/23.976 Hz twin of a
+/// 60/30/24 Hz timing (the table holds 59.94 Hz for the 480-line modes).
+const fn cta_alternate_clock(t: &CtaTiming) -> u32 {
+    if t.refresh % 6 != 0 {
+        t.clock_khz
+    } else if t.v[0] == 480 {
+        (t.clock_khz * 1001 + 500) / 1000
+    } else {
+        (t.clock_khz * 1000 + 500) / 1001
+    }
+}
+
+/// The CTA-861 VIC for a mode, `drm_match_cea_mode` over the timings this
+/// driver pins: the clock's period (`KHZ2PICOS`) equals the VIC's or its
+/// 1000/1001 twin's, and every timing point and the sync polarity match. 0
+/// ("no VIC — timings govern") for anything else; sinks accept VIC 0 with
+/// explicit timings. The first match wins, so the anamorphic 480p/576p
+/// pairs take their 4:3 VIC.
+pub fn vic_for_mode(mode: &Mode) -> u8 {
+    const fn picos(khz: u32) -> u32 {
+        1_000_000_000 / khz
+    }
+    if mode.pixel_clock_khz == 0 {
+        return 0;
+    }
+    let period = picos(mode.pixel_clock_khz);
+    CTA_TIMINGS
+        .iter()
+        .find(|t| {
+            (period == picos(t.clock_khz) || period == picos(cta_alternate_clock(t)))
+                && [
+                    mode.h_active,
+                    mode.h_sync_start,
+                    mode.h_sync_end,
+                    mode.h_total,
+                ] == t.h
+                && [
+                    mode.v_active,
+                    mode.v_sync_start,
+                    mode.v_sync_end,
+                    mode.v_total,
+                ] == t.v
+                && mode.h_sync_positive == t.positive_sync
+                && mode.v_sync_positive == t.positive_sync
+        })
+        .map_or(0, |t| t.vic)
+}
+
+// ── YCbCr 4:2:0 ────────────────────────────────────────────────
+
+/// The pixel encoding on the TMDS link (`crtc_state->sink_format`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SinkFormat {
+    #[default]
+    Rgb,
+    Ycbcr420,
+}
+
+/// The sink's YCbCr 4:2:0 capabilities as `drm_parse_cea_ext` keeps them:
+/// the VICs it takes only as 4:2:0 (Y420VDB, `y420_vdb_modes`), the VICs it
+/// also takes as 4:2:0 (Y420CMDB over the VDB's SVDs, `y420_cmdb_modes`),
+/// and the HF-VSDB's 4:2:0 deep-colour flags (`y420_dc_modes`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ycbcr420Caps {
+    only: [u64; 4],
+    also: [u64; 4],
+    /// `DRM_EDID_YCBCR420_DC_30`.
+    pub dc_30: bool,
+    /// `DRM_EDID_YCBCR420_DC_36`.
+    pub dc_36: bool,
+}
+
+impl Ycbcr420Caps {
+    fn mark(bits: &mut [u64; 4], vic: u8) {
+        bits[usize::from(vic / 64)] |= 1 << (vic % 64);
+    }
+    fn has(bits: &[u64; 4], vic: u8) -> bool {
+        vic != 0 && bits[usize::from(vic / 64)] & (1 << (vic % 64)) != 0
+    }
+    /// `drm_mode_is_420_only` for a mode matching `vic`.
+    pub fn only(&self, vic: u8) -> bool {
+        Self::has(&self.only, vic)
+    }
+    /// `drm_mode_is_420_also` for a mode matching `vic`.
+    pub fn also(&self, vic: u8) -> bool {
+        Self::has(&self.also, vic)
+    }
+}
+
+/// `svd_to_vic`: bit 7 is the native flag for VICs 1..=64.
+const fn svd_to_vic(svd: u8) -> u8 {
+    if matches!(svd, 1..=64 | 129..=192) {
+        svd & 127
+    } else {
+        svd
+    }
+}
+
+/// `drm_valid_cea_vic`: the VICs CTA-861 defines (1..=127, 193..=219).
+const fn valid_cta_vic(vic: u8) -> bool {
+    matches!(vic, 1..=127 | 193..=219)
+}
+
+/// Every CTA-861 data block of every CTA extension, as `(tag, payload)`.
+fn for_each_cta_block(edid: &[u8], mut f: impl FnMut(u8, &[u8])) {
+    for block in edid.chunks_exact(128).skip(1) {
+        if block[0] != 0x02 {
+            continue;
+        }
+        let limit = match block[2] {
+            0 => 127usize,
+            n => (n as usize).min(127),
+        };
+        let mut pos = 4usize;
+        while pos < limit {
+            let header = block[pos];
+            let (tag, len) = (header >> 5, (header & 0x1F) as usize);
+            if pos + 1 + len > 128 {
+                break;
+            }
+            f(tag, &block[pos + 1..pos + 1 + len]);
+            pos += 1 + len;
+        }
+    }
+}
+
+/// `drm_parse_cea_ext`'s 4:2:0 parse: Y420VDB VICs (extended tag 14),
+/// the Y420CMDB bitmap (extended tag 15, at most 8 bytes; an empty map
+/// marks every SVD) applied to the first 64 SVDs across all video data
+/// blocks (`update_cta_y420cmdb`), and the HF-VSDB's 4:2:0 deep colour.
+pub fn parse_ycbcr420(edid: &[u8]) -> Ycbcr420Caps {
+    let mut caps = Ycbcr420Caps::default();
+    let mut vics = [0u8; 64];
+    let mut vics_len = 0usize;
+    let mut cmdb: u64 = 0;
+    for_each_cta_block(edid, |tag, payload| match tag {
+        2 => {
+            for &svd in payload {
+                let vic = svd_to_vic(svd);
+                if vics_len < vics.len() {
+                    vics[vics_len] = if valid_cta_vic(vic) { vic } else { 0 };
+                }
+                vics_len += 1;
+            }
+        }
+        3 if payload.len() >= 7 && payload[..3] == HF_VSDB_OUI => {
+            caps.dc_30 = payload[6] & 1 != 0;
+            caps.dc_36 = payload[6] & 2 != 0;
+        }
+        7 if payload.first() == Some(&0x0E) => {
+            for &svd in &payload[1..] {
+                let vic = svd_to_vic(svd);
+                if valid_cta_vic(vic) {
+                    Ycbcr420Caps::mark(&mut caps.only, vic);
+                }
+            }
+        }
+        7 if payload.first() == Some(&0x0F) => {
+            let map = &payload[1..];
+            cmdb = if map.is_empty() {
+                u64::MAX
+            } else {
+                map.iter()
+                    .take(8)
+                    .enumerate()
+                    .fold(0, |m, (i, &b)| m | (u64::from(b) << (8 * i)))
+            };
+        }
+        _ => {}
+    });
+    for (i, &vic) in vics.iter().take(vics_len.min(64)).enumerate() {
+        if vic != 0 && cmdb & (1 << i) != 0 {
+            Ycbcr420Caps::mark(&mut caps.also, vic);
+        }
+    }
+    caps
 }
 
 /// Pack the AVI infoframe for `mode` (17 bytes: 4 header +
@@ -349,6 +830,13 @@ pub fn vic_for_mode(mode: &Mode) -> u8 {
 /// HD VICs, ITU-601 for SD), full quantization range for RGB,
 /// the mode's VIC, no bars.
 pub fn pack_avi_infoframe(mode: &Mode) -> [u8; 17] {
+    pack_avi_infoframe_for(mode, SinkFormat::Rgb)
+}
+
+/// [`pack_avi_infoframe`] for `format`, as `intel_hdmi_compute_avi_infoframe`
+/// fills it: a YCbCr 4:2:0 stream carries colorspace Y420 (DB1 Y = 3), the
+/// default RGB quantization field and limited YCC quantization (DB5 YQ = 0).
+pub fn pack_avi_infoframe_for(mode: &Mode, format: SinkFormat) -> [u8; 17] {
     let vic = vic_for_mode(mode);
     let picture_aspect: u8 = if mode.v_active != 0 && mode.h_active * 9 == mode.v_active * 16 {
         2 // 16:9
@@ -378,6 +866,13 @@ pub fn pack_avi_infoframe(mode: &Mode) -> [u8; 17] {
     frame[6] = 2 << 2;
     // DB4: the VIC.
     frame[7] = vic & 0x7F;
+    if format == SinkFormat::Ycbcr420 {
+        // DB1: Y420 (3) << 5 | active-aspect present; DB3: quantization
+        // default; DB5: YQ limited (0).
+        frame[4] = (3 << 5) | (1 << 4);
+        frame[6] = 0;
+        frame[8] = 0;
+    }
     frame[3] = infoframe_checksum(&frame, 3);
     frame
 }
@@ -431,6 +926,31 @@ pub const VIDEO_DIP_AVI_DATA_OFFSET: u64 = 0x220;
 pub const VIDEO_DIP_ENABLE_AVI: u32 = 1 << 12;
 /// VIDEO_DIP_CTL GCP enable bit (HSW encoding).
 pub const VIDEO_DIP_ENABLE_GCP: u32 = 1 << 16;
+/// `HSW_TVIDEO_DIP_GCP` offset from the transcoder timing base.
+pub const VIDEO_DIP_GCP_OFFSET: u64 = 0x210;
+/// `GCP_COLOR_INDICATION` and `GCP_DEFAULT_PHASE_ENABLE`.
+pub const GCP_COLOR_INDICATION: u32 = 1 << 2;
+pub const GCP_DEFAULT_PHASE_ENABLE: u32 = 1 << 1;
+
+/// The General Control Packet (`intel_hdmi_compute_gcp_infoframe` +
+/// `hsw_set_infoframes`): every HDMI sink with infoframes gets it, with
+/// the colour indication above 8 bpc and the default phase when the
+/// timing is group-aligned.
+pub fn write_gcp<M: MmioWindow + ?Sized>(mmio: &M, trans: Transcoder, bpc: u8, mode: &Mode) {
+    let mut gcp = 0;
+    if bpc > 8 {
+        gcp |= GCP_COLOR_INDICATION;
+    }
+    if gcp_default_phase_possible(bpc, mode) {
+        gcp |= GCP_DEFAULT_PHASE_ENABLE;
+    }
+    mmio.write32(trans.base() + VIDEO_DIP_GCP_OFFSET, gcp);
+    let ctl = trans.base() + VIDEO_DIP_CTL_OFFSET;
+    let cur = mmio.read32(ctl);
+    mmio.write32(ctl, cur | VIDEO_DIP_ENABLE_GCP);
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Total DIP data-bank size in bytes (8 dwords).
 pub const VIDEO_DIP_DATA_SIZE: usize = 32;
 
@@ -489,6 +1009,8 @@ pub enum HdmiError {
     /// HF-VSDB does not declare SCDC — the mode cannot be
     /// driven legally, and is refused rather than degraded.
     ScramblingUnsupported,
+    /// A DVI sink's mode exceeds the 165 MHz single-link TMDS clock.
+    DviClockTooHigh,
 }
 
 impl From<DdcError> for HdmiError {
@@ -529,15 +1051,27 @@ pub struct HdmiSinkProbe {
     /// The mode's character rate exceeds 340 Mcsc, so SCDC
     /// scrambling is mandatory for this stream.
     pub scrambling_required: bool,
+    /// The sink is HDMI ([`is_hdmi_sink`]); `false` is a DVI sink.
+    pub hdmi_sink: bool,
+    /// The link's pixel encoding ([`compute_output`]).
+    pub format: SinkFormat,
+    /// The port's bits per colour ([`compute_output`]): 8, 10 or 12.
+    pub bpc: u8,
+    /// The TMDS clock at that depth (the port clock).
+    pub tmds_clock_khz: u32,
 }
 
 /// A live HDMI connection.
 #[derive(Clone, Debug)]
 pub struct HdmiConnection {
     /// Exact source family retained through disconnect.
-    pub family: crate::intel_gpu_gt::Gen12Platform,
+    pub family: crate::intel_gpu_aux::SourceFamily,
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
+    /// The pipe scanning this connection out (Pipe A for [`activate`]).
+    pub pipe: crate::intel_gpu_pipes::Pipe,
+    /// The link's pixel encoding.
+    pub format: SinkFormat,
     /// The mode being scanned out.
     pub mode: Mode,
     /// Whether an ELD was published for this connection.
@@ -591,21 +1125,31 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
     ddi: Ddi,
     ddc: &Gen12DdcOverrides,
 ) -> Result<HdmiSinkProbe, HdmiError> {
-    let family = mmio
-        .gen12_display_family()
+    let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
-    let pin = ddc.pin(family, ddi).ok_or(DdcError::NoPinPair)?;
+    let pch = mmio
+        .gen12_hpd_profile()
+        .and_then(|p| p.gen9_gmbus_table().or_else(|| p.rkl_gmbus_table()));
+    let pin = ddc_pin(family, ddc, pch, ddi).ok_or(DdcError::NoPinPair)?;
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
     let hf_vsdb = parse_hf_vsdb(&edid[..edid_len]);
+    let vsdb = parse_hdmi_vsdb(&edid[..edid_len]);
+    let hdmi_sink = vsdb.is_some();
+    let y420 = parse_ycbcr420(&edid[..edid_len]);
+    let (format, bpc, tmds_clock_khz) = compute_output(family, ddi, &mode, vsdb, &hf_vsdb, &y420);
     Ok(HdmiSinkProbe {
+        hdmi_sink,
+        format,
+        bpc,
+        tmds_clock_khz,
         ddi,
         pin,
         mode,
         edid,
         edid_len,
         hf_vsdb,
-        scrambling_required: mode.pixel_clock_khz > SCRAMBLING_THRESHOLD_KHZ,
+        scrambling_required: tmds_clock_khz > SCRAMBLING_THRESHOLD_KHZ,
     })
 }
 
@@ -624,21 +1168,51 @@ pub fn activate<M: MmioWindow + ?Sized>(
     probe: &HdmiSinkProbe,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
-    let family = mmio
-        .gen12_display_family()
+    activate_on_pipe(mmio, probe, fb, crate::intel_gpu_pipes::Pipe::A, None)
+}
+
+/// [`activate`] on `pipe`, claimed from `intel_gpu_multipipe` by the glue,
+/// with `dbuf_share` when the coordinator computed one: the modeset, the
+/// infoframes, GCP and the audio codec all run on that pipe's transcoder.
+pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    probe: &HdmiSinkProbe,
+    fb: &Framebuffer,
+    pipe: crate::intel_gpu_pipes::Pipe,
+    dbuf_share: Option<(u16, u16)>,
+) -> Result<HdmiConnection, HdmiError> {
+    let trans = pipe.transcoder();
+    let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
     let pin = probe.pin;
+    // A DVI sink is single-link TMDS: no SCDC, so the >340 Mcsc branch
+    // below is unreachable for it.
+    if !probe.hdmi_sink && probe.mode.pixel_clock_khz > DVI_MAX_TMDS_KHZ {
+        return Err(HdmiError::DviClockTooHigh);
+    }
     let mut scrambling = false;
     if probe.scrambling_required {
         configure_scdc(mmio, pin, &probe.hf_vsdb)?;
         scrambling = true;
     }
-    let mut modeset = Modeset::new(mmio, probe.ddi);
-    modeset.set_gen12_family(family);
+    let mut modeset = Modeset::for_pipe(mmio, probe.ddi, pipe);
+    modeset.set_source_family(family);
+    if let Some((start, end)) = dbuf_share {
+        modeset.set_dbuf_share(start, end);
+        modeset.set_shared_cdclk(true);
+    }
+    modeset.set_hdmi_dvi(!probe.hdmi_sink);
+    modeset.set_hdmi_bpc(probe.bpc);
+    modeset.set_hdmi_ycbcr420(probe.format == SinkFormat::Ycbcr420);
     let mode = modeset.modeset_hdmi(fb, &probe.mode, scrambling, scrambling)?;
 
-    let frame = pack_avi_infoframe(&mode);
-    write_avi_infoframe(mmio, Transcoder::A, &frame);
+    // Infoframes and audio are HDMI-sink only (`has_infoframe` and
+    // `has_audio` both require `has_hdmi_sink`).
+    if probe.hdmi_sink {
+        let frame = pack_avi_infoframe_for(&mode, probe.format);
+        write_avi_infoframe(mmio, trans, &frame);
+        write_gcp(mmio, trans, probe.bpc, &mode);
+    }
     // The stream is scrambled from here on; only now can the sink report
     // its scrambler status.
     let scrambler_status = if scrambling {
@@ -653,11 +1227,13 @@ pub fn activate<M: MmioWindow + ?Sized>(
         &probe.edid[..probe.edid_len],
         DisplayConnector::Hdmi,
         (probe.ddi as u64) + 1,
-    ) {
+    )
+    .filter(|_| probe.hdmi_sink)
+    {
         let channels = publication.lpcm_max_channels;
         publish_display_audio(sink_id_for(probe.ddi), publication);
-        intel_gpu_audio::hdmi_audio_codec_enable(mmio, Transcoder::A, mode.pixel_clock_khz);
-        intel_gpu_audio::set_eld_valid(mmio, Transcoder::A, true);
+        intel_gpu_audio::hdmi_audio_codec_enable(mmio, trans, probe.tmds_clock_khz);
+        intel_gpu_audio::set_eld_valid(mmio, trans, true);
         audio_published = true;
         audio_infoframe = Some(pack_audio_infoframe(channels));
     }
@@ -665,6 +1241,8 @@ pub fn activate<M: MmioWindow + ?Sized>(
     Ok(HdmiConnection {
         family,
         ddi: probe.ddi,
+        pipe,
+        format: probe.format,
         mode,
         audio_published,
         scrambling,
@@ -682,7 +1260,7 @@ pub fn connect<M: MmioWindow + ?Sized>(
     ddc: &Gen12DdcOverrides,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
-    mmio.gen12_display_family()
+    crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
     let probe = probe_sink(mmio, ddi, ddc)?;
     activate(mmio, &probe, fb)
@@ -697,20 +1275,60 @@ pub fn connect<M: MmioWindow + ?Sized>(
 /// source refusal or an unobserved/partial local stop; retain the
 /// complete session.
 pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bool {
-    if mmio.gen12_display_family() != Some(conn.family) {
+    if crate::intel_gpu_aux::SourceFamily::of(mmio) != Some(conn.family) {
         return false;
     }
+    let trans = conn.pipe.transcoder();
     if conn.audio_published {
-        intel_gpu_audio::hdmi_audio_codec_disable(mmio, Transcoder::A);
+        intel_gpu_audio::hdmi_audio_codec_disable(mmio, trans);
         clear_display_audio(sink_id_for(conn.ddi));
     }
-    disable_infoframes(mmio, Transcoder::A);
+    disable_infoframes(mmio, trans);
     if conn.scrambling {
         let _ = handle_sink_scrambling(mmio, conn.pin, false, false);
     }
-    let mut modeset = Modeset::new(mmio, conn.ddi);
-    modeset.set_gen12_family(conn.family);
-    modeset.try_teardown().is_ok()
+    let mut modeset = Modeset::for_pipe(mmio, conn.ddi, conn.pipe);
+    modeset.set_source_family(conn.family);
+    if modeset.try_teardown().is_err() {
+        return false;
+    }
+    // The 4:2:0 scaler, output CSC and PIPE_MISC encoding go with the
+    // pipe (`skl_scaler_disable`), so a later RGB run starts clean.
+    if conn.format == SinkFormat::Ycbcr420 {
+        modeset.clear_ycbcr420_output();
+    }
+    true
+}
+
+/// The HDMI DDC pin for `ddi` on `family`: the Gen12 VBT overrides or
+/// platform default, the Gen11 ICP default (`gen11_ddc_pin`), or the Gen9
+/// default from the observed PCH's pin table (`pch`, SPT or CNP;
+/// `gen9_ddc_pin`). A Gen9 source whose PCH was not observed has no pin.
+fn ddc_pin(
+    family: crate::intel_gpu_aux::SourceFamily,
+    ddc: &Gen12DdcOverrides,
+    pch: Option<crate::intel_gpu_gmbus::GmbusPinTable>,
+    ddi: Ddi,
+) -> Option<PinPair> {
+    use crate::intel_gpu_aux::SourceFamily;
+    use crate::intel_gpu_gmbus::GmbusPinTable;
+    use crate::intel_gpu_gt::Gen12Platform::RocketLake;
+    match family {
+        // `rkl_encoder_to_ddc_pin`: TC1/TC2 (PHY C/D) take the Type-C pins
+        // with TGP and `GMBUS_PIN_1_BXT + phy` with CMP.
+        SourceFamily::Gen12(RocketLake) => ddc.pin(RocketLake, ddi).or(match (pch, ddi) {
+            (Some(GmbusPinTable::Icp), Ddi::D) => Some(PinPair::Pin9Tc1),
+            (Some(GmbusPinTable::Icp), Ddi::E) => Some(PinPair::Pin10Tc2),
+            (Some(GmbusPinTable::Cnp), Ddi::D) => Some(PinPair::Pin3Bxt),
+            (Some(GmbusPinTable::Cnp), Ddi::E) => Some(PinPair::Pin4Cnp),
+            _ => None,
+        }),
+        SourceFamily::Gen12(family) => ddc.pin(family, ddi),
+        SourceFamily::Gen11(platform) => crate::intel_gpu_gmbus::gen11_ddc_pin(platform, ddi),
+        SourceFamily::Gen9 { .. } => {
+            pch.and_then(|table| crate::intel_gpu_gmbus::gen9_ddc_pin(table, ddi))
+        }
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1074,6 +1692,10 @@ pub mod tests {
             let pipeconf_offs = [
                 PipeIdx::A.base() + PIPECONF_OFFSET,
                 Transcoder::A.conf_base() + PIPECONF_OFFSET,
+                PipeIdx::B.base() + PIPECONF_OFFSET,
+                Transcoder::B.conf_base() + PIPECONF_OFFSET,
+                PipeIdx::C.base() + PIPECONF_OFFSET,
+                Transcoder::C.conf_base() + PIPECONF_OFFSET,
             ];
             if pipeconf_offs.contains(&off) {
                 use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_STATE};
@@ -1269,7 +1891,415 @@ pub mod tests {
         }
     }
 
+    /// VIC 97's timing (`edid_cea_modes_1`).
+    fn mode_2160p60() -> Mode {
+        Mode {
+            pixel_clock_khz: 594_000,
+            h_active: 3840,
+            h_total: 4400,
+            h_sync_start: 4016,
+            h_sync_end: 4104,
+            v_active: 2160,
+            v_total: 2250,
+            v_sync_start: 2168,
+            v_sync_end: 2178,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        }
+    }
+
+    /// A base block plus one CTA extension holding `blocks` (each a full
+    /// data block, header byte first).
+    fn cta_edid(blocks: &[&[u8]]) -> Vec<u8> {
+        let mut e = alloc::vec![0u8; 256];
+        e[128] = 0x02;
+        e[129] = 3;
+        let mut p = 132;
+        for b in blocks {
+            e[p..p + b.len()].copy_from_slice(b);
+            p += b.len();
+        }
+        e[130] = p as u8 - 128;
+        e
+    }
+
     // ── Smokes ──────────────────────────────────────────────────
+
+    /// `drm_match_cea_mode`: the full timing, the clock or its 1000/1001
+    /// twin, and the sync polarity select the VIC.
+    fn smoke_hdmi_vic_matches_cta_timings() -> TestResult {
+        let p1080 = mode_1080p();
+        let mut p1080_50 = p1080;
+        p1080_50.h_total = 2640;
+        p1080_50.h_sync_start = 2448;
+        p1080_50.h_sync_end = 2492;
+        let mut p1080_5994 = p1080;
+        p1080_5994.pixel_clock_khz = 148_352;
+        let mut negative = p1080;
+        negative.h_sync_positive = false;
+        let p2160 = mode_2160p60();
+        let mut p2160_50 = p2160;
+        p2160_50.h_total = 5280;
+        p2160_50.h_sync_start = 4896;
+        p2160_50.h_sync_end = 4984;
+        let mut p2160_30 = p2160;
+        p2160_30.pixel_clock_khz = 297_000;
+        for (mode, vic) in [
+            (p1080, 16),
+            (p1080_50, 31),
+            (p1080_5994, 16),
+            (negative, 0),
+            (p2160, 97),
+            (p2160_50, 96),
+            (p2160_30, 95),
+            (Mode::VESA_1024X768_60, 0),
+        ] {
+            if vic_for_mode(&mode) != vic {
+                return TestResult::Fail("the VIC must follow the full CTA timing");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_vic_matches_cta_timings
+    );
+
+    /// `drm_parse_cea_ext`'s 4:2:0 parse: Y420VDB VICs, the Y420CMDB bitmap
+    /// over the SVDs across every video data block, an empty CMDB marking
+    /// all of them, and the HF-VSDB's 4:2:0 deep colour.
+    fn smoke_hdmi_ycbcr420_parse() -> TestResult {
+        // VDB 1: 16 (native flag set), 96; VDB 2: 97. Y420VDB: 102.
+        // Y420CMDB: bit 2, the third SVD overall (97). HF-VSDB: DC_30|DC_36
+        // for 4:2:0 in its seventh payload byte.
+        let edid = cta_edid(&[
+            &[(2 << 5) | 2, 0x80 | 16, 96],
+            &[(2 << 5) | 1, 97],
+            &[(7 << 5) | 2, 0x0E, 102],
+            &[(7 << 5) | 2, 0x0F, 0b100],
+            &[(3 << 5) | 7, 0xD8, 0x5D, 0xC4, 1, 120, 0x80, 0x03],
+        ]);
+        let caps = parse_ycbcr420(&edid);
+        if !caps.only(102) || caps.only(97) || caps.only(16) {
+            return TestResult::Fail("Y420VDB VICs are 4:2:0-only");
+        }
+        if !caps.also(97) || caps.also(96) || caps.also(16) || caps.also(102) {
+            return TestResult::Fail("Y420CMDB marks the SVD it indexes across every VDB");
+        }
+        if !caps.dc_30 || !caps.dc_36 {
+            return TestResult::Fail("the HF-VSDB carries the 4:2:0 deep colour");
+        }
+        let all = parse_ycbcr420(&cta_edid(&[&[(2 << 5) | 2, 16, 97], &[(7 << 5) | 1, 0x0F]]));
+        if !all.also(16) || !all.also(97) || all.dc_30 {
+            return TestResult::Fail("an empty Y420CMDB marks every SVD");
+        }
+        if parse_ycbcr420(&cta_edid(&[&[(2 << 5) | 1, 97]])) != Ycbcr420Caps::default() {
+            return TestResult::Fail("no 4:2:0 blocks means no 4:2:0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_ycbcr420_parse);
+
+    /// `drm_parse_hdmi_forum_scds`: the max FRL rate in `hf_scds[7]` and,
+    /// with DSC 1.2 declared in `hf_scds[11]`, the DSC max FRL rate in
+    /// `hf_scds[12]`.
+    fn smoke_hf_vsdb_frl_rates() -> TestResult {
+        let edid = cta_edid(&[&[
+            (3 << 5) | 12,
+            0xD8,
+            0x5D,
+            0xC4,
+            1,
+            120,
+            0x80,
+            0x60,
+            0,
+            0,
+            0,
+            0x80,
+            0x30,
+        ]]);
+        let hf = parse_hf_vsdb(&edid);
+        if hf.max_frl_gbps != 48 || hf.dsc_max_frl_gbps != 24 {
+            return TestResult::Fail("the HF-VSDB must carry 48G FRL and 24G DSC FRL");
+        }
+        let no_dsc = cta_edid(&[&[
+            (3 << 5) | 12,
+            0xD8,
+            0x5D,
+            0xC4,
+            1,
+            120,
+            0x80,
+            0x30,
+            0,
+            0,
+            0,
+            0,
+            0x30,
+        ]]);
+        let hf = parse_hf_vsdb(&no_dsc);
+        if hf.max_frl_gbps != 24 || hf.dsc_max_frl_gbps != 0 {
+            return TestResult::Fail("the DSC FRL rate needs DSC 1.2");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hf_vsdb_frl_rates);
+
+    /// `intel_hdmi_compute_output_format`: 4:2:0-only VICs, the 4:2:0-also
+    /// fallback when RGB fits at no depth (a TMDS limit or the ICL+ combo
+    /// PLL hole), the halved clock, 4:2:0 deep colour, and no 4:2:0 on
+    /// display 9 or a DVI sink.
+    fn smoke_hdmi_output_format_selection() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, Gen9Platform};
+        let tgl = SourceFamily::Gen12(Gen12Platform::TigerLake);
+        let icl = SourceFamily::Gen11(Gen11Platform::IceLake);
+        let kbl = SourceFamily::Gen9 {
+            platform: Gen9Platform::KabyLake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        let hdmi14 = Some(HdmiVsdb {
+            dc_30: false,
+            dc_36: false,
+            max_tmds_khz: 340_000,
+        });
+        let none = HfVsdb::default();
+        let scdc = HfVsdb {
+            present: true,
+            scdc_present: true,
+            max_tmds_char_rate_khz: 600_000,
+            ..HfVsdb::default()
+        };
+        let also = parse_ycbcr420(&cta_edid(&[&[(2 << 5) | 1, 97], &[(7 << 5) | 1, 0x0F]]));
+        let only = parse_ycbcr420(&cta_edid(&[
+            &[(7 << 5) | 2, 0x0E, 97],
+            &[(3 << 5) | 7, 0xD8, 0x5D, 0xC4, 1, 120, 0x80, 0x02],
+        ]));
+        let p2160 = mode_2160p60();
+        let cases = [
+            // RGB 594 MHz does not fit a 340 MHz sink; 4:2:0 at 297 does.
+            (
+                tgl,
+                hdmi14,
+                &none,
+                &also,
+                (SinkFormat::Ycbcr420, 8, 297_000),
+            ),
+            // An SCDC sink takes RGB at 594 MHz.
+            (tgl, hdmi14, &scdc, &also, (SinkFormat::Rgb, 8, 594_000)),
+            // 4:2:0-only goes out as 4:2:0, at 12 bpc with DC_36 for 4:2:0.
+            (
+                tgl,
+                hdmi14,
+                &scdc,
+                &only,
+                (SinkFormat::Ycbcr420, 12, 445_500),
+            ),
+            // Display 9 never drives 4:2:0: RGB, which then cannot fit.
+            (kbl, hdmi14, &none, &also, (SinkFormat::Rgb, 8, 594_000)),
+            // A DVI sink has no 4:2:0.
+            (tgl, None, &none, &also, (SinkFormat::Rgb, 8, 594_000)),
+        ];
+        for (family, vsdb, hf, y420, want) in cases {
+            if compute_output(family, Ddi::B, &p2160, vsdb, hf, y420) != want {
+                return TestResult::Fail("the sink format must follow compute_output_format");
+            }
+        }
+        // ICL combo DDI B cannot make 500-533.2 MHz: a 525 MHz RGB mode
+        // falls back to 4:2:0 at 262.5 MHz; Type-C DDI C's hole ends at
+        // 532.8 MHz, so 533 MHz fits there and not on the combo port.
+        let mut hole = p2160;
+        hole.pixel_clock_khz = 525_000;
+        let vic97 = Ycbcr420Caps {
+            also: also.also,
+            ..Ycbcr420Caps::default()
+        };
+        if vic_for_mode(&hole) != 0
+            || compute_clock(
+                icl,
+                Some(Ddi::B),
+                525_000,
+                hdmi14,
+                &scdc,
+                &vic97,
+                SinkFormat::Rgb,
+            )
+            .is_some()
+            || compute_clock(
+                icl,
+                Some(Ddi::B),
+                533_000,
+                hdmi14,
+                &scdc,
+                &vic97,
+                SinkFormat::Rgb,
+            )
+            .is_some()
+            || compute_clock(
+                icl,
+                Some(Ddi::C),
+                533_000,
+                hdmi14,
+                &scdc,
+                &vic97,
+                SinkFormat::Rgb,
+            ) != Some((8, 533_000))
+            || compute_clock(
+                icl,
+                Some(Ddi::B),
+                525_000,
+                hdmi14,
+                &none,
+                &vic97,
+                SinkFormat::Ycbcr420,
+            ) != Some((8, 262_500))
+        {
+            return TestResult::Fail("the ICL+ PLL holes refuse their clocks per PHY");
+        }
+        if tmds_clock_for(594_001, 10, SinkFormat::Ycbcr420) != 371_250 {
+            return TestResult::Fail("4:2:0 halves the pixel clock before the bpc scaling");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_output_format_selection
+    );
+
+    /// A 4:2:0 connect on Tiger Lake: the TMDS PLL at half the pixel clock
+    /// (the same WRPLL as a 297 MHz RGB stream), the 1:1 pipe scaler, the
+    /// BT.709 output CSC, the `PIPE_MISC` encoding and AVI Y420; disconnect
+    /// clears the scaler, CSC enable and encoding.
+    fn smoke_hdmi_ycbcr420_connect() -> TestResult {
+        use crate::intel_gpu_pipes::Pipe;
+        use crate::intel_gpu_xelpg_scaler::{calc_phase, ps_ctrl, ps_hphase, ps_win_sz};
+        let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Absent);
+        let rgb = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid.clone()));
+        let Ok(mut probe) = probe_sink(&rgb, Ddi::B, &Gen12DdcOverrides::NONE) else {
+            return TestResult::Fail("probe");
+        };
+        // The RGB reference: a 297 MHz TMDS stream.
+        probe.mode = mode_2160p60();
+        probe.mode.pixel_clock_khz = 297_000;
+        probe.tmds_clock_khz = 297_000;
+        if activate(&rgb, &probe, &test_fb(16384)).is_err() {
+            return TestResult::Fail("the RGB reference must activate");
+        }
+        clear_display_audio(sink_id_for(Ddi::B));
+        let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
+        probe.mode = mode_2160p60();
+        probe.format = SinkFormat::Ycbcr420;
+        let conn = match activate(&mmio, &probe, &test_fb(16384)) {
+            Ok(conn) => conn,
+            Err(_) => return TestResult::Fail("the 4:2:0 connect must activate"),
+        };
+        if conn.format != SinkFormat::Ycbcr420
+            || mmio.writes_to(DPLL_CFGCR0_DPLL1) != rgb.writes_to(DPLL_CFGCR0_DPLL1)
+            || mmio.writes_to(dpll_cfgcr1(DPLL_CFGCR0_DPLL1))
+                != rgb.writes_to(dpll_cfgcr1(DPLL_CFGCR0_DPLL1))
+        {
+            return TestResult::Fail("4:2:0 runs the TMDS PLL at half the pixel clock");
+        }
+        if mmio.writes_to(ps_ctrl(Pipe::A, 0)) != alloc::vec![1 << 31]
+            || mmio.writes_to(ps_win_sz(Pipe::A, 0)) != alloc::vec![(3840 << 16) | 2160]
+            || mmio.writes_to(ps_hphase(Pipe::A, 0)) != alloc::vec![u32::from(calc_phase(0x10000))]
+        {
+            return TestResult::Fail("scaler 0 must run 1:1 over the whole mode");
+        }
+        let csc = [
+            (0x49050, 0x1e08_9cc0),
+            (0x49054, 0xb528_0000),
+            (0x49058, 0x2ba8_09d8),
+            (0x4905c, 0x37e8_0000),
+            (0x49060, 0xbce8_9ad8),
+            (0x49064, 0x1e08_0000),
+            (0x49068, 0),
+            (0x49074, 0x800),
+            (0x49078, 0x100),
+            (0x4907c, 0x800),
+        ];
+        if csc
+            .iter()
+            .any(|&(r, v)| mmio.writes_to(r) != alloc::vec![v])
+            || mmio
+                .writes_to(0x49028)
+                .last()
+                .is_none_or(|v| v & (1 << 30) == 0)
+        {
+            return TestResult::Fail("the output CSC must carry the BT.709 RGB->YCbCr matrix");
+        }
+        let misc = mmio.writes_to(Pipe::A.base() + 0x30);
+        if misc.last().is_none_or(|v| v & 0x0C00_0800 != 0x0C00_0800) {
+            return TestResult::Fail("PIPE_MISC must select YUV 4:2:0 full blend");
+        }
+        let avi = mmio.writes_to(Transcoder::A.base() + VIDEO_DIP_AVI_DATA_OFFSET + 4);
+        if avi.last().is_none_or(|v| (v >> 8) & 0xFF != 0x70) {
+            return TestResult::Fail("AVI DB1 must carry Y420");
+        }
+        if !disconnect(&mmio, &conn) {
+            return TestResult::Fail("the 4:2:0 disconnect must stop");
+        }
+        if mmio.writes_to(ps_ctrl(Pipe::A, 0)).last() != Some(&0)
+            || mmio
+                .writes_to(0x49028)
+                .last()
+                .is_none_or(|v| v & (1 << 30) != 0)
+            || mmio
+                .writes_to(Pipe::A.base() + 0x30)
+                .last()
+                .is_none_or(|v| v & 0x0C00_0800 != 0)
+        {
+            return TestResult::Fail("disconnect must clear the scaler, CSC and encoding");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_ycbcr420_connect);
+
+    /// An HDMI route on a claimed pipe: the modeset, infoframes and
+    /// teardown run on that pipe's transcoder, and Transcoder A (the
+    /// panel's) is never touched.
+    fn smoke_hdmi_on_claimed_pipe() -> TestResult {
+        use crate::intel_gpu_pipes::Pipe;
+        let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Absent);
+        let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
+        let Ok(probe) = probe_sink(&mmio, Ddi::B, &Gen12DdcOverrides::NONE) else {
+            return TestResult::Fail("probe");
+        };
+        let conn = match activate_on_pipe(&mmio, &probe, &test_fb(8192), Pipe::B, None) {
+            Ok(conn) => conn,
+            Err(_) => return TestResult::Fail("HDMI must light on Pipe B"),
+        };
+        let func_b = Transcoder::B.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        let func_a = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        if conn.pipe != Pipe::B
+            || mmio.writes_to(func_b) != alloc::vec![0x9000_0006]
+            || !mmio.writes_to(func_a).is_empty()
+        {
+            return TestResult::Fail("Transcoder B must bind DDI B; Transcoder A stays untouched");
+        }
+        let avi_b = Transcoder::B.base() + VIDEO_DIP_AVI_DATA_OFFSET;
+        let avi_a = Transcoder::A.base() + VIDEO_DIP_AVI_DATA_OFFSET;
+        if mmio.writes_to(avi_b).is_empty() || !mmio.writes_to(avi_a).is_empty() {
+            return TestResult::Fail("the AVI infoframe must go out on Transcoder B");
+        }
+        if !disconnect(&mmio, &conn) {
+            return TestResult::Fail("the Pipe B route must stop");
+        }
+        if mmio
+            .writes_to(Transcoder::B.base() + VIDEO_DIP_CTL_OFFSET)
+            .last()
+            .is_none_or(|v| v & VIDEO_DIP_ENABLE_AVI != 0)
+            || !mmio
+                .writes_to(Transcoder::A.base() + VIDEO_DIP_CTL_OFFSET)
+                .is_empty()
+        {
+            return TestResult::Fail("disconnect must stop Transcoder B's infoframes only");
+        }
+        clear_display_audio(sink_id_for(Ddi::B));
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_on_claimed_pipe);
 
     fn smoke_hdmi_infoframe_packing() -> TestResult {
         // AVI for 1080p60 (VIC 16), pinned byte-for-byte
@@ -1288,10 +2318,7 @@ pub mod tests {
             return TestResult::Fail("AVI frame must sum to 0 mod 256");
         }
         // 4K60: VIC 97, checksum 0x4E.
-        let mut mode4k = mode_1080p();
-        mode4k.pixel_clock_khz = 594_000;
-        mode4k.h_active = 3840;
-        mode4k.v_active = 2160;
+        let mode4k = mode_2160p60();
         let avi4k = pack_avi_infoframe(&mode4k);
         if avi4k[7] != 97 || avi4k[3] != 0x4E {
             return TestResult::Fail("4K60 AVI must carry VIC 97 + its checksum");
@@ -1421,12 +2448,16 @@ pub mod tests {
         if dwords1.first() != Some(&0x08A8_109F) {
             return TestResult::Fail("DIP dword 1 must carry checksum + DB1..DB3");
         }
+        // The AVI write clears then sets its enable; the GCP every HDMI
+        // sink gets then adds its own enable, keeping AVI's.
         let ctl_writes = mmio.writes_to(Transcoder::A.base() + VIDEO_DIP_CTL_OFFSET);
-        if ctl_writes.len() != 2
+        if ctl_writes.len() != 3
             || ctl_writes[0] & VIDEO_DIP_ENABLE_AVI != 0
             || ctl_writes[1] & VIDEO_DIP_ENABLE_AVI == 0
+            || ctl_writes[2] & (VIDEO_DIP_ENABLE_AVI | VIDEO_DIP_ENABLE_GCP)
+                != VIDEO_DIP_ENABLE_AVI | VIDEO_DIP_ENABLE_GCP
         {
-            return TestResult::Fail("DIP CTL must clear, then set, the AVI enable");
+            return TestResult::Fail("DIP CTL must clear, then set, the AVI enable, then add GCP");
         }
         // Audio: ELD published with the HDMI connection type
         // (byte 5 bits[3:2] == 0) and the fixture's LPCM SAD.
@@ -1832,7 +2863,10 @@ pub mod tests {
             );
             *mmio.family.borrow_mut() = Some(family);
             let conn = connect(&mmio, ddi, &Gen12DdcOverrides::NONE, &test_fb(8192)).unwrap();
-            assert_eq!(conn.family, family);
+            assert_eq!(
+                conn.family,
+                crate::intel_gpu_aux::SourceFamily::Gen12(family)
+            );
             assert_eq!(mmio.writes_to(0x70180).last(), Some(&expected));
             let before = mmio.writes.borrow().len();
             *mmio.family.borrow_mut() = Some(if family == Gen12Platform::AlderLakeP {
@@ -1875,5 +2909,250 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hdmi",
         smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal
+    );
+
+    /// A mapping that reports one Gen11 or Gen9 identity and nothing else.
+    struct Identity {
+        gen11: Option<crate::intel_gpu_gt::Gen11Platform>,
+        gen9: Option<(
+            crate::intel_gpu_gt::Gen9Platform,
+            crate::intel_gpu_gen9_ddi::SkuFamily,
+        )>,
+    }
+    impl MmioWindow for Identity {
+        fn gen11_display_platform(&self) -> Option<crate::intel_gpu_gt::Gen11Platform> {
+            self.gen11
+        }
+        fn gen9_display_platform(
+            &self,
+        ) -> Option<(
+            crate::intel_gpu_gt::Gen9Platform,
+            crate::intel_gpu_gen9_ddi::SkuFamily,
+        )> {
+            self.gen9
+        }
+        fn read32(&self, _: u64) -> u32 {
+            0
+        }
+        fn write32(&self, _: u64, _: u32) {}
+    }
+
+    /// Gen11 and Gen9 sources reach the session layer: `SourceFamily::of`
+    /// reports them (Gen12 metadata first), the Ice Lake HDMI pin follows
+    /// `icl_encoder_to_ddc_pin`, EHL/JSL C/D have no default, and Gen9 pins
+    /// come from the observed PCH's table.
+    fn smoke_hdmi_gen11_gen9_source_families() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gen9_ddi::SkuFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen9Platform};
+        let icl = Identity {
+            gen11: Some(Gen11Platform::IceLake),
+            gen9: None,
+        };
+        let kbl = Identity {
+            gen11: None,
+            gen9: Some((Gen9Platform::KabyLake, SkuFamily::Ult)),
+        };
+        let none = Identity {
+            gen11: None,
+            gen9: None,
+        };
+        if SourceFamily::of(&icl) != Some(SourceFamily::Gen11(Gen11Platform::IceLake))
+            || SourceFamily::of(&kbl)
+                != Some(SourceFamily::Gen9 {
+                    platform: Gen9Platform::KabyLake,
+                    sku: SkuFamily::Ult,
+                })
+            || SourceFamily::of(&none).is_some()
+        {
+            return TestResult::Fail("SourceFamily::of must report the mapping's identity");
+        }
+        let ddc = Gen12DdcOverrides::NONE;
+        let gen11 = |p, ddi| ddc_pin(SourceFamily::Gen11(p), &ddc, None, ddi);
+        if gen11(Gen11Platform::IceLake, Ddi::A) != Some(PinPair::Pin1Bxt)
+            || gen11(Gen11Platform::IceLake, Ddi::D) != Some(PinPair::Pin10Tc2)
+            || gen11(Gen11Platform::JasperLake, Ddi::B) != Some(PinPair::Pin2Bxt)
+            || gen11(Gen11Platform::JasperLake, Ddi::C).is_some()
+            || gen11(Gen11Platform::ElkhartLake, Ddi::D).is_some()
+        {
+            return TestResult::Fail("Gen11 DDC defaults must follow icl_encoder_to_ddc_pin");
+        }
+        let gen9 = SourceFamily::Gen9 {
+            platform: Gen9Platform::Skylake,
+            sku: SkuFamily::Desktop,
+        };
+        use crate::intel_gpu_gmbus::GmbusPinTable;
+        if ddc_pin(gen9, &ddc, None, Ddi::B).is_some()
+            || ddc_pin(gen9, &ddc, Some(GmbusPinTable::Spt), Ddi::B) != Some(PinPair::Pin5Mtp)
+            || ddc_pin(gen9, &ddc, Some(GmbusPinTable::Cnp), Ddi::C) != Some(PinPair::Pin2Bxt)
+        {
+            return TestResult::Fail("a Gen9 pin comes from the observed PCH's pin table");
+        }
+        // rkl_encoder_to_ddc_pin: B is pin 2 with either PCH; TC1/TC2 (PHY
+        // C/D) take the Type-C pins with TGP and pins 3/4 with CMP, and have
+        // no default without the PCH. Their HDMI PLL hole is the combo one.
+        let rkl = SourceFamily::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+        if ddc_pin(rkl, &ddc, None, Ddi::B) != Some(PinPair::Pin2Bxt)
+            || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Icp), Ddi::D) != Some(PinPair::Pin9Tc1)
+            || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Icp), Ddi::E) != Some(PinPair::Pin10Tc2)
+            || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Cnp), Ddi::D) != Some(PinPair::Pin3Bxt)
+            || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Cnp), Ddi::E) != Some(PinPair::Pin4Cnp)
+            || ddc_pin(rkl, &ddc, None, Ddi::D).is_some()
+            || pll_hole(rkl, Some(Ddi::D)) != Some((500_000, 533_200))
+        {
+            return TestResult::Fail(
+                "RKL TC1/TC2 DDC pins and PLL hole must follow rkl_encoder_to_ddc_pin",
+            );
+        }
+        // Probing without a family still refuses before any access.
+        if !matches!(
+            probe_sink(&none, Ddi::B, &ddc),
+            Err(HdmiError::Modeset(ModesetError::UnsupportedGeneration))
+        ) {
+            return TestResult::Fail("a mapping with no family must refuse");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_gen11_gen9_source_families
+    );
+
+    /// `is_hdmi_sink`: only the HDMI Licensing VSDB (00-0C-03) in a CTA
+    /// extension makes a sink HDMI; an HF-VSDB alone, a base block alone
+    /// or a non-CTA extension leave it DVI.
+    fn smoke_hdmi_vsdb_decides_dvi() -> TestResult {
+        let edid = |payload: &[u8], tag: u8| {
+            let mut e = [0u8; 256];
+            e[128] = tag;
+            e[129] = 3;
+            e[130] = (4 + 1 + payload.len()) as u8;
+            e[132] = (3 << 5) | payload.len() as u8;
+            e[133..133 + payload.len()].copy_from_slice(payload);
+            e
+        };
+        let hdmi = edid(&[0x03, 0x0C, 0x00, 0x10, 0x00], 0x02);
+        let hf_only = edid(&[0xD8, 0x5D, 0xC4, 0x01, 0x78], 0x02);
+        let not_cta = edid(&[0x03, 0x0C, 0x00, 0x10, 0x00], 0x70);
+        if !is_hdmi_sink(&hdmi)
+            || is_hdmi_sink(&hf_only)
+            || is_hdmi_sink(&not_cta)
+            || is_hdmi_sink(&hdmi[..128])
+        {
+            return TestResult::Fail("only the HDMI VSDB makes an HDMI sink");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_vsdb_decides_dvi);
+
+    /// `intel_hdmi_compute_bpc`: the deepest depth the source, the sink's
+    /// DC flags and both TMDS limits allow, 8 bpc otherwise.
+    fn smoke_hdmi_deep_colour_selection() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gen9_ddi::SkuFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, Gen9Platform};
+        let tgl = SourceFamily::Gen12(Gen12Platform::TigerLake);
+        let icl = SourceFamily::Gen11(Gen11Platform::IceLake);
+        let skl = SourceFamily::Gen9 {
+            platform: Gen9Platform::Skylake,
+            sku: SkuFamily::Desktop,
+        };
+        let dc = |dc_30, dc_36, max| {
+            Some(HdmiVsdb {
+                dc_30,
+                dc_36,
+                max_tmds_khz: max,
+            })
+        };
+        let none = HfVsdb::default();
+        let scdc = HfVsdb {
+            present: true,
+            scdc_present: true,
+            max_tmds_char_rate_khz: 600_000,
+            ..HfVsdb::default()
+        };
+        for (family, clock, vsdb, hf, want, why) in [
+            (
+                tgl,
+                148_500,
+                dc(true, true, 340_000),
+                &none,
+                (12, 222_750),
+                "1080p60 at 12 bpc",
+            ),
+            (
+                tgl,
+                297_000,
+                dc(true, true, 340_000),
+                &none,
+                (8, 297_000),
+                "4K30 12 bpc needs > 340",
+            ),
+            (
+                tgl,
+                297_000,
+                dc(true, true, 0),
+                &scdc,
+                (12, 445_500),
+                "SCDC sinks go past 340",
+            ),
+            (
+                icl,
+                148_500,
+                dc(true, false, 0),
+                &none,
+                (10, 185_625),
+                "10 bpc on display 11",
+            ),
+            (
+                skl,
+                148_500,
+                dc(true, false, 0),
+                &none,
+                (8, 148_500),
+                "no 10 bpc on display 9",
+            ),
+            (
+                skl,
+                148_500,
+                dc(true, true, 0),
+                &none,
+                (12, 222_750),
+                "12 bpc on display 9",
+            ),
+            (
+                skl,
+                297_000,
+                dc(true, true, 0),
+                &scdc,
+                (8, 297_000),
+                "display 9 stops at 300 MHz",
+            ),
+            (
+                tgl,
+                148_500,
+                dc(false, false, 0),
+                &none,
+                (8, 148_500),
+                "no DC flags",
+            ),
+            (
+                tgl,
+                148_500,
+                None,
+                &none,
+                (8, 148_500),
+                "a DVI sink is 8 bpc",
+            ),
+        ] {
+            if compute_bpc(family, clock, vsdb, hf) != want {
+                return TestResult::Fail(why);
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_deep_colour_selection
     );
 }

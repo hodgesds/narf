@@ -23,7 +23,7 @@ const PAGE: u64 = 4096;
 
 #[path = "intel_gpu_vram_clear.rs"]
 pub(crate) mod vram_clear;
-pub(crate) use vram_clear::{prepare_smallbar_clear, prepare_vram_clear};
+pub(crate) use vram_clear::{prepare_smallbar_clear, prepare_system_ccs_clear, prepare_vram_clear};
 
 #[path = "intel_gpu_copy.rs"]
 pub mod copy;
@@ -140,6 +140,8 @@ impl ExecRequest {
         if self.has_async() && !platform.is_some_and(object_async_profile) {
             return Err(FsError::InvalidData);
         }
+        // The VM's `vm->total`: 64 GiB on EHL/JSL, 48 bits elsewhere.
+        let va_size = platform.map_or(VA_SIZE, GtPlatform::ppgtt_va_size);
         if self.objects.is_empty()
             || self.objects.len() > MAX_OBJECTS
             || self.objects.iter().any(|entry| {
@@ -148,7 +150,7 @@ impl ExecRequest {
                     || entry
                         .va
                         .checked_add(entry.object.size())
-                        .is_none_or(|end| end > VA_SIZE - PAGE)
+                        .is_none_or(|end| end > va_size - PAGE)
             })
         {
             return Err(FsError::InvalidData);
@@ -160,7 +162,7 @@ impl ExecRequest {
         if self.batch_len == 0
             || self.batch_va % 8 != 0
             || self.batch_len % 8 != 0
-            || end > VA_SIZE
+            || end > va_size
             || !self.objects.iter().any(|entry| {
                 self.batch_va >= entry.va
                     && entry
@@ -677,7 +679,12 @@ impl ResidentBatch {
                 {
                     return Err(FsError::InvalidData);
                 }
-                if (platform.is_gen12() || platform.is_headless_integrated()) && object.is_vram() {
+                // Only DG1 among the Gen12 parts has local memory; its 4 KiB
+                // pages map with GEN12_PPGTT_PTE_LM.
+                let dg1 = platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+                if ((platform.is_gen12() && !dg1) || platform.is_headless_integrated())
+                    && object.is_vram()
+                {
                     return Err(FsError::InvalidData);
                 }
                 if object.is_vram()
@@ -1101,7 +1108,9 @@ impl AddressSpace {
             .diagnostic_tables()
             .all(|phys| phys >> bits == 0)
             && self.objects.iter().all(|(object, _)| {
-                (!platform.is_gen12() || !object.is_vram())
+                (!platform.is_gen12()
+                    || platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1)
+                    || !object.is_vram())
                     && object.pages().all(|phys| phys >> bits == 0)
             })
     }

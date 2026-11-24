@@ -1200,6 +1200,46 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         Ok(fence)
     }
 
+    /// Zero an integrated Xe2/Xe3 object's flat-CCS metadata on BCS0
+    /// ([`crate::intel_gpu_exec::prepare_system_ccs_clear`]). `None` when
+    /// firmware disabled flat CCS (`XE2_FLAT_CCS_BASE_RANGE_LOWER` bit 0
+    /// clear, Linux `probe_has_flat_ccs`): compression then has no metadata
+    /// to clear.
+    pub(crate) fn clear_system_ccs(
+        &mut self,
+        now: u64,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+    ) -> Result<Option<Arc<crate::intel_gpu_fence::CompletionFence>>, GtError> {
+        let platform = self.parts.boot.platform();
+        if epoch == 0 || self.user_epoch() != Some(epoch) || !platform.is_headless_integrated() {
+            return Err(GtError::State);
+        }
+        self.awake()?;
+        let flat_ccs = self.parts.boot.window().read32(0x8800);
+        if flat_ccs == u32::MAX {
+            return Err(GtError::Unavailable);
+        }
+        if flat_ccs & 1 == 0 {
+            return Ok(None);
+        }
+        self.admit_scheduling()?;
+        let batch = crate::intel_gpu_exec::prepare_system_ccs_clear(platform, object)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
+        // SAFETY: the factory maps only its private code and zero storage and
+        // the caller's object, and emits only CCS copies, the CCS flush and
+        // BB_END; no user command runs in this context.
+        let (_, fence) = unsafe {
+            self.parts
+                .scheduler
+                .as_mut()
+                .ok_or(GtError::State)?
+                .submit_resident_on(now, crate::intel_gpu_engine::Engine::Bcs0, batch)
+                .map_err(GtError::Scheduling)?
+        };
+        Ok(Some(fence))
+    }
+
     /// Copy only the retained owned ranges on this device; a raw address or
     /// foreign local-memory pool cannot select a DMA source/destination.
     pub(crate) fn copy_objects(

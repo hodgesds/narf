@@ -1,8 +1,14 @@
-//! Intel Xe-LPDP (Meteor Lake / Arrow Lake) HDMI TMDS output.
+//! Intel Xe-LPDP (Meteor Lake / Arrow Lake), Xe2_LPD (Lunar Lake) and
+//! Xe3_LPD (Panther Lake) HDMI TMDS output.
 //!
 //! The HDMI counterpart of [`crate::intel_gpu_xelpg_external`]: one
-//! owned TMDS stream on a Pipe B–D and its transcoder over DDI B (C10) or
-//! a Type-C port in legacy mode (C20), next to the lit internal panel. The
+//! owned TMDS stream on a Pipe B–D and its transcoder over DDI B (C10, or
+//! C20 on Panther Lake) or a Type-C port in legacy mode (C20), next to the
+//! lit internal panel. Display 20 and 30 take the DP route's deltas: the
+//! D2D link in `DDI_BUF_CTL` (kept set by the full DDI write,
+//! `intel_ddi_enable_hdmi`'s `XE2LPD_DDI_BUF_D2D_LINK_ENABLE`), the IP's
+//! pipe resources and Type-C profile, and on display 30 the fixed-refresh
+//! VRR timing generator. Wildcat Lake's 30.02 profile has no HDMI route. The
 //! pipe side (power wells, resource transaction, pipe DMC, timings, plane
 //! arm, release) is the shared Pipe B–D owner
 //! ([`crate::intel_gpu_xelpg_pipes`]) through the DP route's helpers.
@@ -57,16 +63,20 @@
 //! the sink declares no scrambling for or above its declared maximum,
 //! FRL and the FRL-ambiguous TMDS clocks 300/600 MHz (`intel_hdmi_is_frl`
 //! would select FRL clocking), clocks above the 600 MHz source maximum
-//! or without a source table (the SNPS C10 and computed C20 algorithms
-//! are not implemented; the latter also needs the MTL-U / ARL-S
-//! `tx_misc` platform fact), Type-C DP-alt (HDMI needs a legacy port), an
+//! (a clock without a source table computes: SNPS C10 always, C20 when the
+//! mapping reports its MTL-U / ARL-S `tx_misc` fact), Type-C DP-alt (HDMI
+//! needs a legacy port), an
 //! active DDI, no free Pipe B–D, a lit Pipe A that is not the owned panel
 //! profile, and the Pipe B–D owner's resource refusals (all before the
 //! first write). PM demand runs at the TMDS clock (Linux's
 //! `crtc_state->port_clock` for HDMI). Linux only logs an SCDC failure; here a
 //! stream that needs the sink scrambling fails activation instead (and
-//! is locally stopped). Audio, deep color, YCbCr and HDMI 2.1 FRL remain
-//! out of scope.
+//! is locally stopped). YCbCr 4:2:0 follows `intel_hdmi_compute_output_format`
+//! at 8 bpc on display 14 and 20 (a Y420VDB VIC, or a Y420CMDB VIC whose RGB
+//! link is invalid): half the TMDS clock, the 1:1 pipe scaler in the
+//! resource transaction's prefill, the BT.709 output CSC, `PIPE_MISC` YUV
+//! and the Y420 AVI infoframe; display 30 keeps RGB. Audio, deep color,
+//! YCbCr 4:4:4 and HDMI 2.1 FRL remain out of scope.
 //!
 //! DDC pins come from the corrected GMBUS numbering
 //! ([`crate::intel_gpu_gmbus::PinPair`], `gmbus_pins_mtp`): DDI B is pin 2
@@ -80,20 +90,21 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gmbus::PinPair;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_pipes::Pipe;
+use crate::intel_gpu_xe2lpd::{disable_d2d, enable_d2d, DisplayIp};
 use crate::intel_gpu_xelpg::{
-    disable_d2d, disable_port_pll_complete, enable_d2d, enable_port_pll_state, port_width,
-    set_signal_levels_hdmi, wait_port_buf_active, wait_port_buf_idle, C10PllState, C20PllState,
-    C20Vdr, Cx0Error, Cx0Phy, Cx0PllState, PhyKind, PllRequest, XeLpgPort, PORT_BUF_PHY_IDLE,
-    PORT_WIDTH_MASK,
+    disable_port_pll_complete, enable_port_pll_state, port_width, set_signal_levels_hdmi,
+    wait_port_buf_active, wait_port_buf_idle, C10PllState, C20PllState, C20Vdr, Cx0Error, Cx0Phy,
+    Cx0PllState, PhyKind, PllRequest, XeLpgPort, PORT_BUF_PHY_IDLE, PORT_WIDTH_MASK,
 };
 use crate::intel_gpu_xelpg_external::{
-    external_pipe, preflight, request_pipe_wells, reserve_pipe, trans_clk_sel, trans_clk_sel_port,
-    trans_ddi_func_ctl, ExternalError, MtlDisplay, PipeRefusal, RoutePipe,
+    ddi_enable_value, external_pipe, preflight_ip, request_pipe_wells, reserve_pipe, trans_clk_sel,
+    trans_clk_sel_port, trans_ddi_func_ctl, ExternalDisplayProfile, ExternalError, MtlDisplay,
+    PipeRefusal, RoutePipe,
 };
 use crate::intel_gpu_xelpg_pipes::PipeEnableError;
 use crate::intel_gpu_xelpg_tc::{
     connect_for as tc_connect_for, connection_intact, disconnect as tc_disconnect, TcConnection,
-    TcDisplayProfile, TcMode,
+    TcMode,
 };
 
 include!("intel_gpu_xelpg_hdmi_tables.rs");
@@ -159,6 +170,12 @@ impl From<crate::intel_gpu_xelpg_tc::TcError> for HdmiError {
     fn from(e: crate::intel_gpu_xelpg_tc::TcError) -> Self {
         HdmiError::Route(e.into())
     }
+}
+
+fn d2d_err(_: crate::intel_gpu_xe2lpd::IpError) -> HdmiError {
+    // The same failed 100-us state observation the display-14 helper
+    // reports as a PHY timeout.
+    phy_err(Cx0Error::Timeout)
 }
 
 fn phy_err(e: Cx0Error) -> HdmiError {
@@ -312,12 +329,323 @@ pub fn sink_scrambling<M: MmioWindow + ?Sized>(
         .map_err(HdmiError::Scdc)
 }
 
+/// `intel_c20_hdmi_tmds_tx_cgf_1`: the C20 HDMI `tx[1]` word for a
+/// platform's `tx_misc` and termination control (DCC calibration range 8,
+/// DCC bypass). Linux takes `tx_misc` 5 with termination 4 on display 20+,
+/// 0 on Battlemage, 3 on Meteor Lake-U (`INTEL_MTL_U_IDS`) and on an Arrow
+/// Lake-S host bridge, and 7 otherwise, all with termination 2 below
+/// display 20.
+pub const fn c20_hdmi_tx_cfg1(tx_misc: u16, term_ctl: u16) -> u16 {
+    (tx_misc & 0xFF) | (8 << 8) | (1 << 12) | ((term_ctl & 7) << 13)
+}
+
+/// `intel_c20_compute_hdmi_tmds_pll`: the C20 MPLLB state for an HDMI TMDS
+/// `port_clock_khz` without an ideal table, against the 38.4 MHz
+/// reference, with the platform's `tx[1]` word ([`c20_hdmi_tx_cfg1`]).
+/// `None` outside 25.175-600 MHz.
+pub fn compute_c20_hdmi_tmds(port_clock_khz: u32, tx_cfg1: u16) -> Option<C20PllState> {
+    if !(25_175..=600_000).contains(&port_clock_khz) {
+        return None;
+    }
+    const REFCLK: u64 = 38_400_000;
+    const CLOCK_4999MHZ: u64 = 4_999_999_999;
+    const CLOCK_9999MHZ: u64 = 9_999_999_999;
+    let datarate = u64::from(port_clock_khz) * 1000 * 10;
+    let tx_clk_div = (CLOCK_9999MHZ / datarate).ilog2() as u16;
+    let vco_freq_shift = (CLOCK_4999MHZ * 256 / datarate).ilog2();
+    let vco_freq = (datarate << vco_freq_shift) >> 8;
+    let multiplier = (vco_freq << 28) / (REFCLK >> 4);
+    let mpll_multiplier = (2 * (multiplier >> 32)) as u16;
+    let fracn_quot = ((multiplier >> 16) & 0xFFFF) as u16;
+    let fracn_rem = (multiplier & 0xFFFF) as u16;
+    let div_multiplier = ((vco_freq * 16 + (datarate >> 1)) / datarate).min(255) as u16;
+    let ana_freq_vco: u16 = match vco_freq {
+        f if f <= 3_000_000_000 => 3,
+        f if f <= 3_500_000_000 => 2,
+        f if f <= 4_000_000_000 => 1,
+        _ => 0,
+    };
+    Some(C20PllState {
+        tx: [0xBE88, tx_cfg1, 0x0000],
+        cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+        mpllb: [
+            // MPLL_TX_CLK_DIV (15:13) | MPLL_MULTIPLIER (11:0)
+            (tx_clk_div << 13) | (mpll_multiplier & 0xFFF),
+            // CAL_DAC_CODE(31) (14:10) | WORD_CLK_DIV | MPLL_DIV_MULTIPLIER
+            (31 << 10) | (1 << 8) | div_multiplier,
+            // MPLLB_ANA_FREQ_VCO (15:14) | CP_PROP(20) (13:7) | CP_INT(6)
+            (ana_freq_vco << 14) | (20 << 7) | 6,
+            // V2I(2) (15:14) | CP_PROP_GS(30) (13:7) | CP_INT_GS(28)
+            (2 << 14) | (30 << 7) | 28,
+            0x0000,
+            0x0000,
+            // C20_MPLLB_FRACEN | SSC_UP_SPREAD
+            (1 << 13) | (1 << 9),
+            // MPLL_FRACN_DEN
+            0xFFFF,
+            fracn_quot,
+            fracn_rem,
+            // HDMI_DIV(1)
+            1,
+        ],
+    })
+}
+
+/// The kernel's 64-bit helpers, as `intel_snps_hdmi_pll.c` sees them:
+/// `do_div` (and so `DIV_ROUND_DOWN_ULL` / `DIV_ROUND_UP_ULL`) truncates
+/// its divisor to 32 bits, the `DIV64_U64_*` forms keep 64, and all of it
+/// wraps like C. A divisor that is zero after truncation ends the
+/// computation (the C would trap).
+mod snps {
+    pub(super) fn div_down(ll: u64, d: u64) -> Option<u64> {
+        ll.checked_div(u64::from(d as u32))
+    }
+    pub(super) fn div_up_ull(ll: u64, d: u64) -> Option<u64> {
+        div_down(ll.wrapping_add(d).wrapping_sub(1), d)
+    }
+    pub(super) fn div64_up(ll: u64, d: u64) -> Option<u64> {
+        ll.wrapping_add(d).wrapping_sub(1).checked_div(d)
+    }
+    pub(super) fn div64_closest(n: u64, d: u64) -> Option<u64> {
+        n.wrapping_add(d / 2).checked_div(d)
+    }
+    /// `int_sqrt`: the floor square root.
+    pub(super) fn int_sqrt(x: u64) -> u64 {
+        if x <= 1 {
+            return x;
+        }
+        let (mut x, mut y) = (x, 0u64);
+        let mut m = 1u64 << ((63 - x.leading_zeros()) & !1);
+        while m != 0 {
+            let b = y + m;
+            y >>= 1;
+            if x >= b {
+                x -= b;
+                y += m;
+            }
+            m >>= 2;
+        }
+        y
+    }
+    /// `interp`: its `s64` operands go through `DIV64_U64_ROUND_UP` as
+    /// `u64`, so a falling curve segment wraps exactly as in C.
+    pub(super) fn interp(x: u64, x1: u64, x2: u64, y1: u64, y2: u64) -> Option<u64> {
+        let dydx = div64_up(
+            y2.wrapping_sub(y1).wrapping_mul(100_000),
+            x2.wrapping_sub(x1),
+        )?;
+        Some(y1.wrapping_add(div64_up(dydx.wrapping_mul(x.wrapping_sub(x1)), 100_000)?))
+    }
+}
+
+/// `intel_snps_hdmi_pll_compute_c10pll` (`intel_snps_hdmi_pll.c`): the C10
+/// PLL state for an HDMI TMDS `port_clock_khz` without a precomputed
+/// table, before `intel_c10pll_update_pll` clears the SSC bytes. Ported
+/// operation for operation, including that `do_div(vco_clk, ...)` leaves
+/// the quotient in `vco_clk`, so the VCO segment and the charge-pump
+/// interpolation see that quotient; the output matches Linux's compiled
+/// function byte for byte.
+pub fn compute_c10_hdmi_tmds(port_clock_khz: u32) -> Option<C10PllState> {
+    use snps::{div64_closest, div64_up, div_down, div_up_ull, int_sqrt, interp};
+    const HZ_4999: u64 = 4_999_999_900;
+    const HZ_9999: u64 = 2 * HZ_4999;
+    const HZ_16G: u64 = 16_000_000_000;
+    const FREQ: [[u64; 8]; 2] = [
+        [
+            2_500_000_000,
+            3_000_000_000,
+            3_000_000_000,
+            3_500_000_000,
+            3_500_000_000,
+            4_000_000_000,
+            4_000_000_000,
+            5_000_000_000,
+        ],
+        [
+            4_000_000_000,
+            4_600_000_000,
+            4_601_000_000,
+            5_400_000_000,
+            5_401_000_000,
+            6_600_000_000,
+            6_601_000_000,
+            8_001_000_000,
+        ],
+    ];
+    const CURVE_0: [[u64; 8]; 2] = [
+        [
+            41174500, 48605500, 42973700, 49433100, 42408600, 47681900, 40297400, 49131400,
+        ],
+        [
+            82056800, 94420700, 82323400, 96370600, 81273300, 98630100, 81728700, 99105700,
+        ],
+    ];
+    const CURVE_1: [[u64; 8]; 2] = [
+        [
+            73_300_000_000_000,
+            66_000_000_000_000,
+            83_100_000_000_000,
+            75_300_000_000_000,
+            99_700_000_000_000,
+            92_300_000_000_000,
+            125_000_000_000_000,
+            110_000_000_000_000,
+        ],
+        [
+            53_700_000_000_000,
+            47_700_000_000_000,
+            62_200_000_000_000,
+            54_400_000_000_000,
+            75_100_000_000_000,
+            63_400_000_000_000,
+            90_600_000_000_000,
+            76_300_000_000_000,
+        ],
+    ];
+    const CURVE_2: [[u64; 8]; 2] = [
+        [
+            2_415_790_000,
+            3_136_460_000,
+            2_581_990_000,
+            3_222_670_000,
+            2_529_330_000,
+            3_042_020_000,
+            2_336_970_000,
+            3_191_460_000,
+        ],
+        [
+            4_808_390_000,
+            5_994_250_000,
+            4_832_730_000,
+            6_193_730_000,
+            4_737_700_000,
+            6_428_750_000,
+            4_779_200_000,
+            6_479_340_000,
+        ],
+    ];
+    const CURVE0_MULTIPLIER: u64 = 1_000_000_000;
+    const CURVE1_MULTIPLIER: u64 = 100;
+    const CURVE2_MULTIPLIER: u64 = 1_000_000_000_000;
+    const REFCLK: u64 = 38_400_000; // prescaler_divider 0
+    const CP_INT_GS: u8 = 30;
+    const CP_PROP_GS: u8 = 28;
+
+    // compute_hdmi_tmds_pll
+    let datarate = u64::from(port_clock_khz).wrapping_mul(10_000);
+    if datarate == 0 {
+        return None;
+    }
+    let (v2i, tx_clk_div) = if datarate <= HZ_9999 {
+        (2u64, (HZ_9999 / datarate).checked_ilog2()?)
+    } else {
+        (3, (HZ_16G / datarate).checked_ilog2()?)
+    };
+    let mut vco_clk = datarate.wrapping_shl(tx_clk_div) >> 1;
+    let integer = div_down(vco_clk, REFCLK)? as u32;
+    let rem = vco_clk % REFCLK;
+    vco_clk /= REFCLK; // do_div leaves the quotient here
+    let fracn = div_down(rem << 32, REFCLK)? as u32;
+    let fracn_quot = fracn >> 16;
+    let mut fracn_rem = fracn & 0xFFFF;
+    fracn_rem -= fracn_rem >> 15;
+    let fracn_den: u32 = 0xFFFF;
+    let fracn_en = u8::from(fracn_quot != 0 || fracn_rem != 0);
+    let multiplier = integer.wrapping_sub(16).wrapping_mul(2);
+    let c = (v2i - 2) as usize;
+    let (mut a, mut ana_freq_vco) = (0usize, 0u8);
+    for i in (0..8).step_by(2) {
+        if vco_clk <= FREQ[c][i + 1] {
+            a = i;
+            ana_freq_vco = 3 - (a >> 1) as u8;
+            break;
+        }
+    }
+
+    // get_ana_cp_int_prop
+    let vco_div_refclk = vco_clk.wrapping_mul(div_down(1_000_000_000_000, REFCLK)?);
+    let (x1, x2) = (FREQ[c][a], FREQ[c][a + 1]);
+    let c0 = interp(vco_clk, x1, x2, CURVE_0[c][a], CURVE_0[c][a + 1])?;
+    let c2 = interp(vco_clk, x1, x2, CURVE_2[c][a], CURVE_2[c][a + 1])?;
+    let c1 = interp(vco_clk, x1, x2, CURVE_1[c][a], CURVE_1[c][a + 1])?;
+    let c1 = div_down(c1, CURVE1_MULTIPLIER)?;
+    let temp = c2.wrapping_mul(4 - v2i);
+    let c2_scaled1 = div_down(temp, 16_000)?;
+    let c2_scaled2 = div_down(temp, 160)?;
+    let scaled1 = 112_008_301u64.wrapping_mul(div_down(vco_div_refclk, 100_000)?);
+    let adjusted1 = CURVE2_MULTIPLIER.wrapping_mul(div_down(
+        scaled1,
+        c0.wrapping_mul(div_down(c1, CURVE0_MULTIPLIER)?),
+    )?);
+    let cp_int = div64_closest(div_down(adjusted1, c2_scaled1)?, CURVE2_MULTIPLIER)?.clamp(1, 127);
+    let c2_scaled_int = c2_scaled1.wrapping_mul(cp_int);
+    let product = c1.wrapping_mul(c2_scaled_int.wrapping_mul(div_down(c0, CURVE0_MULTIPLIER)?));
+    let sqrt =
+        int_sqrt(div64_up(product, vco_div_refclk)?.wrapping_mul(div_down(1_000_000_000_000, 55)?));
+    let scaled2 = div_up_ull(vco_div_refclk, 1_000_000)?;
+    let adjusted2 = 1_460_281u64.wrapping_mul(div64_up(sqrt.wrapping_mul(scaled2), c1)?);
+    // `*ana_cp_prop` is a u32: the quotient truncates before the clamp.
+    let cp_prop = u64::from((div64_up(adjusted2, c2_scaled2)? as u32).clamp(1, 127));
+    let (cp_int, cp_prop, v2i) = (cp_int as u8, cp_prop as u8, v2i as u8);
+
+    let mut pll = [0u8; 20];
+    // C10_PLL0: DIV5CLK_EN (mpll_div5_en 1), FRACEN, PMIX_EN (= fracn_en),
+    // ANA_FREQ_VCO.
+    pll[0] = (1 << 2) | (fracn_en << 4) | (fracn_en << 5) | ((ana_freq_vco & 3) << 6);
+    pll[2] = multiplier as u8;
+    pll[3] = ((multiplier >> 8) & 0xF) as u8;
+    pll[8] = 1 << 5; // SSC_UP_SPREAD
+    pll[9] = fracn_den as u8;
+    pll[10] = (fracn_den >> 8) as u8;
+    pll[11] = fracn_quot as u8;
+    pll[12] = (fracn_quot >> 8) as u8;
+    pll[13] = fracn_rem as u8;
+    pll[14] = (fracn_rem >> 8) as u8;
+    // TXCLKDIV (2:0) | HDMIDIV(1) (5:3)
+    pll[15] = (tx_clk_div as u8 & 7) | (1 << 3);
+    // REG_FIELD_PREP masks each field, as the C does.
+    pll[16] = (cp_int & 0x7F) | ((CP_INT_GS << 7) & 0x80);
+    pll[17] = ((CP_INT_GS >> 1) & 0x3F) | ((cp_prop << 6) & 0xC0);
+    pll[18] = ((cp_prop >> 2) & 0x1F) | ((CP_PROP_GS << 5) & 0xE0);
+    pll[19] = ((CP_PROP_GS >> 3) & 0xF) | ((v2i << 4) & 0x30);
+    Some(C10PllState {
+        tx: 0x10,
+        cmn: 0x01,
+        pll,
+    })
+}
+
 /// Resolve the HDMI TMDS PLL request for `port` at `clock_khz`
 /// (`intel_c10pll_calc_state` / `intel_c20pll_calc_state`, table path).
 pub fn hdmi_pll_request(
     port: XeLpgPort,
     clock_khz: u32,
     legacy: bool,
+) -> Result<PllRequest, HdmiError> {
+    hdmi_pll_request_computed(port, clock_khz, legacy, None)
+}
+
+/// [`hdmi_pll_request`] with Linux's C20 fallback: a C20 clock with no
+/// ideal table is computed (`intel_c20pll_calc_state` tries the tables
+/// first, "since the calculated values, although correct, may not be
+/// optimal") when the platform's `tx[1]` word is known. C10 always falls
+/// back to the SNPS algorithm (`compute_c10_hdmi_tmds`).
+pub fn hdmi_pll_request_computed(
+    port: XeLpgPort,
+    clock_khz: u32,
+    legacy: bool,
+    c20_tx_cfg1: Option<u16>,
+) -> Result<PllRequest, HdmiError> {
+    hdmi_pll_request_kind(port.phy(), clock_khz, legacy, c20_tx_cfg1)
+}
+
+/// [`hdmi_pll_request_computed`] for the PHY `kind` behind the port
+/// ([`crate::intel_gpu_xelpg::phy_kind`]: Panther Lake's DDI B is a C20).
+pub fn hdmi_pll_request_kind(
+    kind: PhyKind,
+    clock_khz: u32,
+    legacy: bool,
+    c20_tx_cfg1: Option<u16>,
 ) -> Result<PllRequest, HdmiError> {
     if FRL_CLOCKS_KHZ.contains(&clock_khz) {
         return Err(HdmiError::FrlClock(clock_khz));
@@ -328,12 +656,15 @@ pub fn hdmi_pll_request(
     if clock_khz > SOURCE_MAX_TMDS_KHZ {
         return Err(HdmiError::UnsupportedClock(clock_khz));
     }
-    let state = match port.phy() {
+    let state = match kind {
         PhyKind::C10 => {
+            // intel_c10pll_calc_state: the tables, then for HDMI the SNPS
+            // algorithm.
             let mut state = C10_HDMI_TABLES
                 .iter()
                 .find(|(clock, _)| *clock == clock_khz)
                 .map(|(_, state)| *state)
+                .or_else(|| compute_c10_hdmi_tmds(clock_khz))
                 .ok_or(HdmiError::UnsupportedClock(clock_khz))?;
             // intel_c10pll_update_pll: HDMI has no SSC.
             for byte in &mut state.pll[4..9] {
@@ -346,6 +677,7 @@ pub fn hdmi_pll_request(
                 .iter()
                 .find(|(clock, _)| *clock == clock_khz)
                 .map(|(_, state)| *state)
+                .or_else(|| c20_tx_cfg1.and_then(|cfg| compute_c20_hdmi_tmds(clock_khz, cfg)))
                 .ok_or(HdmiError::UnsupportedClock(clock_khz))?;
             Cx0PllState::C20(state, C20Vdr::hdmi_tmds())
         }
@@ -358,7 +690,7 @@ pub fn hdmi_pll_request(
         dp_alt: false,
         ssc: false,
         hdmi: true,
-        protocol_switch: legacy && port.phy() == PhyKind::C20,
+        protocol_switch: legacy && kind == PhyKind::C20,
     })
 }
 
@@ -389,6 +721,9 @@ pub const fn ddc_pin(port: XeLpgPort) -> Option<PinPair> {
 pub struct MtlHdmiProbe {
     /// The port.
     pub port: XeLpgPort,
+    /// The display IP the route runs on (its D2D register, `DDI_BUF_CTL`
+    /// value, pipe resources and display-30 VRR timing generator).
+    pub(crate) display_ip: DisplayIp,
     /// Legacy Type-C ownership (TC ports only).
     pub tc: Option<TcConnection>,
     /// Preferred mode.
@@ -402,6 +737,8 @@ pub struct MtlHdmiProbe {
     /// The DDC pin EDID and SCDC traffic use (the port policy's
     /// `intel_hdmi_ddc_pin` result).
     pub ddc: PinPair,
+    /// The output format (`intel_hdmi_compute_output_format` at 8 bpc).
+    pub format: crate::intel_gpu_hdmi::SinkFormat,
     /// EDID bytes (`edid_len` valid).
     pub edid: alloc::boxed::Box<[u8; crate::intel_gpu_hdmi::EDID_CAPACITY]>,
     /// Valid EDID length.
@@ -432,10 +769,26 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     legacy_port: bool,
     ddc: Option<PinPair>,
 ) -> Result<MtlHdmiProbe, HdmiError> {
-    if generation != Generation::MeteorLake {
+    let profile = ExternalDisplayProfile::for_generation(generation)
+        .ok_or(HdmiError::Route(ExternalError::UnsupportedGeneration))?;
+    probe_hdmi_profile(io, profile, port, legacy_port, ddc)
+}
+
+/// [`probe_hdmi`] for an exact source profile. Meteor, Lunar and Panther
+/// Lake drive HDMI on their admitted ports; Wildcat Lake's 30.02 profile
+/// has no qualified HDMI route.
+pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    port: XeLpgPort,
+    legacy_port: bool,
+    ddc: Option<PinPair>,
+) -> Result<MtlHdmiProbe, HdmiError> {
+    let display_ip = profile.display_ip();
+    if display_ip == DisplayIp::WildcatLake {
         return Err(ExternalError::UnsupportedGeneration.into());
     }
-    if port == XeLpgPort::A {
+    if port == XeLpgPort::A || !profile.admits_port(port) {
         return Err(ExternalError::UnsupportedPort.into());
     }
     let type_c = port.tc_index().is_some();
@@ -446,7 +799,7 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     // A legacy Type-C port is owned in legacy mode before its DDC is used,
     // as the DP probe owns the PHY before AUX.
     let tc = if type_c {
-        let conn = tc_connect_for(io, port, true, HDMI_LANES, TcDisplayProfile::XeLpdp)?;
+        let conn = tc_connect_for(io, port, true, HDMI_LANES, profile.tc_profile())?;
         if conn.mode != TcMode::Legacy {
             let _ = tc_disconnect(io, &conn);
             return Err(HdmiError::NotLegacy);
@@ -464,23 +817,72 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     let (edid, edid_len) = read_edid_ddc(io, pin).map_err(rollback)?;
     let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len])
         .map_err(|_| rollback(HdmiError::Edid))?;
-    let pll = hdmi_pll_request(port, mode.pixel_clock_khz, type_c).map_err(rollback)?;
     let sink = parse_sink_scdc(&edid[..edid_len]);
-    let link = tmds_link(mode.pixel_clock_khz, &sink).map_err(rollback)?;
+    let (format, pll, link) = output_for(
+        io,
+        display_ip,
+        port,
+        type_c,
+        &mode,
+        &edid[..edid_len],
+        &sink,
+    )
+    .map_err(rollback)?;
     if !io.display_access_ok() {
         return Err(rollback(ExternalError::AccessLost.into()));
     }
     Ok(MtlHdmiProbe {
         port,
+        display_ip,
         tc,
         mode,
         pll,
         sink,
         link,
         ddc: pin,
+        format,
         edid: alloc::boxed::Box::new(edid),
         edid_len,
     })
+}
+
+/// `intel_hdmi_compute_output_format` at 8 bpc for `mode` on `port`: a
+/// 4:2:0-only VIC (Y420VDB) goes out as YCbCr 4:2:0 on an HDMI sink, any
+/// other mode as RGB, falling back to 4:2:0 when RGB has no valid TMDS
+/// link and the VIC is 4:2:0-also (Y420CMDB). 4:2:0 halves the TMDS clock
+/// (`intel_hdmi_tmds_clock`) and needs the pipe scaler, which takes at most
+/// 8192 active pixels (`skl_scaler_mode_valid` compares `hdisplay` with
+/// the display-14 maximum source height). Display 30 is not qualified for
+/// it: its VRR timing-generator guardband carries no scaler prefill here.
+/// Returns the format with its PLL request and TMDS link.
+fn output_for<M: MmioWindow + ?Sized>(
+    io: &M,
+    ip: DisplayIp,
+    port: XeLpgPort,
+    type_c: bool,
+    mode: &Mode,
+    edid: &[u8],
+    sink: &SinkScdc,
+) -> Result<(crate::intel_gpu_hdmi::SinkFormat, PllRequest, TmdsLink), HdmiError> {
+    use crate::intel_gpu_hdmi::{
+        parse_hdmi_vsdb, parse_ycbcr420, tmds_clock_for, vic_for_mode, SinkFormat,
+    };
+    let kind = crate::intel_gpu_xelpg::phy_kind(io, port);
+    let link_for = |format| {
+        let clock = tmds_clock_for(mode.pixel_clock_khz, 8, format);
+        let pll = hdmi_pll_request_kind(kind, clock, type_c, io.c20_hdmi_tx_cfg1())?;
+        Ok((format, pll, tmds_link(clock, sink)?))
+    };
+    let y420 = parse_ycbcr420(edid);
+    let vic = vic_for_mode(mode);
+    let allowed = parse_hdmi_vsdb(edid).is_some() && !ip.is_display30() && mode.h_active <= 8192;
+    if allowed && y420.only(vic) {
+        return link_for(SinkFormat::Ycbcr420);
+    }
+    match link_for(SinkFormat::Rgb) {
+        Err(e) if allowed && y420.also(vic) => link_for(SinkFormat::Ycbcr420).map_err(|_| e),
+        result => result,
+    }
 }
 
 /// Release a probe's Type-C ownership (DDI B owns nothing).
@@ -562,7 +964,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     if let Err(e) = crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &probe.mode) {
         return Err((Err(probe), ExternalError::Modeset(e).into()));
     }
-    let choice = match preflight(io, probe.port, display) {
+    let choice = match preflight_ip(io, probe.port, display, probe.display_ip) {
         Ok(choice) => choice,
         Err(e) => return Err((Err(probe), e.into())),
     };
@@ -572,7 +974,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         }
     }
     // crtc_state->port_clock is the TMDS clock for HDMI.
-    let ext = match external_pipe(
+    let mut ext = match external_pipe(
         &choice,
         probe.port,
         &probe.mode,
@@ -584,6 +986,10 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         Ok(ext) => ext,
         Err(e) => return Err((Err(probe), e.into())),
     };
+    // A 4:2:0 stream's 1:1 scaler joins the pipe's prefill term.
+    if probe.format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420 {
+        ext.scaler = Some(crate::intel_gpu_modeset::ycbcr420_scaler(&probe.mode));
+    }
     if let Err(e) = choice.pipes.admit(io, &ext) {
         return Err((Err(probe), e.into()));
     }
@@ -628,10 +1034,12 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     let port = route.probe.port;
     let mode = route.probe.mode;
     let link = route.probe.link;
-    let (scrambling, ddc, pll) = (
+    let (scrambling, ddc, pll, ip, format) = (
         route.probe.sink.scrambling,
         route.probe.ddc,
         route.probe.pll,
+        route.probe.display_ip,
+        route.probe.format,
     );
     let rp = reservation(route)?;
     let (pipe, trans) = (rp.pipe, rp.transcoder());
@@ -641,10 +1049,18 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     crate::intel_gpu_hdmi::write_avi_infoframe(
         io,
         trans,
-        &crate::intel_gpu_hdmi::pack_avi_infoframe(&mode),
+        &crate::intel_gpu_hdmi::pack_avi_infoframe_for(&mode, format),
     );
     // hsw_crtc_enable: source size, timings, RGB bypass (pipe off).
     rp.pipes.program_timings(io, pipe)?;
+    // A 4:2:0 stream: bdw_set_pipe_misc's YUV encoding, skl_pfit_enable's
+    // 1:1 downsampler and the RGB-to-YCbCr output CSC, still pipe off.
+    if format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420 {
+        let misc = pipe.base() + crate::intel_gpu_xelpg_dsc::PIPE_MISC_OFFSET;
+        let cur = rd(io, misc)?;
+        wr(io, misc, cur | crate::intel_gpu_modeset::PIPE_MISC_YCBCR420)?;
+        crate::intel_gpu_modeset::program_ycbcr420_pipe(io, pipe, &mode);
+    }
     // intel_ddi_enable: transcoder function, then the transcoder.
     let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(
         port.func_ctl_index(),
@@ -652,9 +1068,13 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         link.high_tmds_clock_ratio,
     );
     wr(io, trans_ddi_func_ctl(trans), func)?;
+    // Display 30 always scans out through the VRR timing generator,
+    // programmed and enabled after TRANS_DDI_FUNC_CTL and before TRANSCONF
+    // (a no-op on display 14 and 20).
+    rp.pipes.enable_fixed_tg(io, pipe)?;
     let start = rd(io, pipe.base() + FRMCOUNT)?;
     rp.pipes.enable(io, pipe)?;
-    // intel_ddi_enable_hdmi (display 14): sink scrambling/ratio over
+    // intel_ddi_enable_hdmi (display 14+): sink scrambling/ratio over
     // SCDC (only for a scrambling-capable sink), D2D, levels,
     // PORT_BUF_CTL1 width, DDI_CTL_DE with the TMDS lane width, buffer
     // active. Linux only logs an SCDC failure; a stream that needs the
@@ -665,7 +1085,10 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
             return scdc;
         }
     }
-    enable_d2d(io, port).map_err(phy_err)?;
+    // D2D lives in PORT_BUF_CTL1 on display 14 and in DDI_BUF_CTL on
+    // display 20+, where the DDI_BUF_CTL write keeps it set
+    // (XE2LPD_DDI_BUF_D2D_LINK_ENABLE in intel_ddi_enable_hdmi's buf_ctl).
+    enable_d2d(io, ip, port).map_err(d2d_err)?;
     set_signal_levels_hdmi(&Cx0Phy::with_lanes(io, port, pll.lanes)).map_err(phy_err)?;
     let buf = rd(io, port.buf_ctl1())?;
     wr(
@@ -673,11 +1096,7 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         port.buf_ctl1(),
         (buf & !PORT_WIDTH_MASK) | port_width(HDMI_LANES),
     )?;
-    wr(
-        io,
-        port.ddi_buf_ctl(),
-        port_width(HDMI_LANES) | DDI_BUF_CTL_ENABLE,
-    )?;
+    wr(io, port.ddi_buf_ctl(), ddi_enable_value(ip, HDMI_LANES))?;
     wait_port_buf_active(io, port).map_err(phy_err)?;
     // intel_update_crtc: the primary, armed under vblank evasion.
     rp.pipes.arm_primary(io, pipe)?;
@@ -745,7 +1164,12 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     route: &mut MtlHdmiRoute,
 ) -> Result<(), HdmiError> {
     let port = route.probe.port;
-    let (scrambling, ddc) = (route.probe.sink.scrambling, route.probe.ddc);
+    let (scrambling, ddc, ip, format) = (
+        route.probe.sink.scrambling,
+        route.probe.ddc,
+        route.probe.display_ip,
+        route.probe.format,
+    );
     let stop_failed: HdmiError =
         ExternalError::Modeset(ModesetError::PipelineStopUnavailable).into();
     let Some(rp) = route.reservation.as_mut() else {
@@ -763,6 +1187,10 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
         PipeEnableError::Timeout => stop_failed,
         e => e.into(),
     })?;
+    // skl_scaler_disable and the color/PIPE_MISC state of a 4:2:0 stream.
+    if format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420 {
+        crate::intel_gpu_modeset::clear_ycbcr420_pipe(io, pipe);
+    }
     let func = rd(io, trans_ddi_func_ctl(trans))?;
     wr(
         io,
@@ -773,7 +1201,7 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     let ddi = rd(io, port.ddi_buf_ctl())?;
     wr(io, port.ddi_buf_ctl(), ddi & !DDI_BUF_CTL_ENABLE)?;
     wait_port_buf_idle(io, port).map_err(|_| stop_failed)?;
-    disable_d2d(io, port).map_err(|_| stop_failed)?;
+    disable_d2d(io, ip, port).map_err(|_| stop_failed)?;
     wr(io, trans_clk_sel(trans), 0)?;
     disable_port_pll_complete(io, port).map_err(|_| stop_failed)?;
     let ddi = rd(io, port.ddi_buf_ctl())?;

@@ -68,31 +68,169 @@ pub const SDE_IIR: u64 = 0xc4008;
 pub const SDE_IER: u64 = 0xc400c;
 const SHOTPLUG: u64 = 0xc4030;
 const FILTER: u64 = 0xc4038;
-const OWNED: u32 = 0x00020000; // source-exposed combo B only; A may be internal
-const ALL_STATUS: u32 = 0x3333;
+
+/// The south-display hotplug bank's layout for the one port the monitor
+/// owns (combo B; A may be internal). ICP-class south displays (ICP, MCC,
+/// JSP, TGP, ADP) put B at `SDE_DDI_HOTPLUG_ICP` bit 17 and its nibble in
+/// `SHOTPLUG_CTL_DDI` bits 7:4; SPT-class ones (SPT, KBP, CNP, CMP: Linux
+/// runs `spt_hpd_irq_setup` for every PCH from SPT to ICP) put it at
+/// `SDE_PORTB_HOTPLUG_CPT` bit 21 and `PCH_PORT_HOTPLUG` bits 4 and 1:0,
+/// at the same 0xC4030, with no hotplug filter register.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum HpdBank {
+    Icp,
+    Spt,
+}
+
+/// `SHOTPLUG_CTL_TC` (ICP class): the Type-C hotplug pins' nibbles.
+const SHOTPLUG_TC: u64 = 0xc4034;
+
+/// One owned port's bits in its south-display hotplug bank: the SDE
+/// ISR/IMR/IER/IIR bit, the control register holding its nibble, and in it
+/// the enable, the status field and the field's long-pulse value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct HpdPort {
+    ddi: Ddi,
+    owned: u32,
+    ctl: u64,
+    enable: u32,
+    status: u32,
+    long: u32,
+}
+
+/// ICP class, combo B: `SDE_DDI_HOTPLUG_ICP(HPD_PORT_B)`, `SHOTPLUG_CTL_DDI`
+/// bits 7:4.
+const ICP_B: HpdPort = HpdPort {
+    ddi: Ddi::B,
+    owned: 1 << 17,
+    ctl: SHOTPLUG,
+    enable: 0x80,
+    status: 0x30,
+    long: 0x20,
+};
+/// ICP class, Rocket Lake TC1 (DDI D) with TGP (`tgl_hpd_pin`):
+/// `SDE_TC_HOTPLUG_ICP(HPD_PORT_TC1)`, `SHOTPLUG_CTL_TC` bits 3:0.
+const ICP_TC1: HpdPort = HpdPort {
+    ddi: Ddi::D,
+    owned: 1 << 24,
+    ctl: SHOTPLUG_TC,
+    enable: 0x8,
+    status: 0x3,
+    long: 0x2,
+};
+/// ICP class, Rocket Lake TC2 (DDI E): `SHOTPLUG_CTL_TC` bits 7:4.
+const ICP_TC2: HpdPort = HpdPort {
+    ddi: Ddi::E,
+    owned: 1 << 25,
+    ctl: SHOTPLUG_TC,
+    enable: 0x80,
+    status: 0x30,
+    long: 0x20,
+};
+/// SPT class, port B: `SDE_PORTB_HOTPLUG_CPT`, `PCH_PORT_HOTPLUG` bits 4
+/// and 1:0.
+const SPT_B: HpdPort = HpdPort {
+    ddi: Ddi::B,
+    owned: 1 << 21,
+    ctl: SHOTPLUG,
+    enable: 1 << 4,
+    status: 0x3,
+    long: 0x2,
+};
+/// SPT class, Rocket Lake TC1 (DDI D) with CMP (`rkl_hpd_pin`:
+/// `HPD_PORT_C`): `SDE_PORTC_HOTPLUG_CPT`, bits 12 and 9:8.
+const SPT_C: HpdPort = HpdPort {
+    ddi: Ddi::D,
+    owned: 1 << 22,
+    ctl: SHOTPLUG,
+    enable: 1 << 12,
+    status: 0x300,
+    long: 0x200,
+};
+/// SPT class, Rocket Lake TC2 (DDI E) with CMP (`HPD_PORT_D`):
+/// `SDE_PORTD_HOTPLUG_CPT`, bits 20 and 17:16.
+const SPT_D: HpdPort = HpdPort {
+    ddi: Ddi::E,
+    owned: 1 << 23,
+    ctl: SHOTPLUG,
+    enable: 1 << 20,
+    status: 0x3_0000,
+    long: 0x2_0000,
+};
+
+impl HpdBank {
+    /// Every port's write-1-to-clear status bits in control register
+    /// `ctl`, kept zero on a write so other ports' events survive.
+    const fn all_status(self, ctl: u64) -> u32 {
+        match (self, ctl) {
+            // TC1..TC6, one nibble each.
+            (Self::Icp, SHOTPLUG_TC) => 0x0033_3333,
+            (Self::Icp, _) => 0x3333,
+            // PORTB 1:0, PORTC 9:8, PORTD 17:16, PORTA 25:24.
+            (Self::Spt, _) => 0x0303_0303,
+        }
+    }
+}
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HpdProfile {
-    family: crate::intel_gpu_gt::Gen12Platform,
+    family: crate::intel_gpu_aux::SourceFamily,
     device: u16,
     address: u32,
     config: u64,
     subsystem: (u16, u16),
 }
 impl HpdProfile {
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn from_identity(
         family: crate::intel_gpu_gt::Gen12Platform,
         vendor: u16,
         device: u16,
         class: u32,
     ) -> Option<Self> {
+        Self::for_source(
+            crate::intel_gpu_aux::SourceFamily::Gen12(family),
+            vendor,
+            device,
+            class,
+        )
+    }
+    /// [`Self::from_identity`] for any source family. Gen11 pairs with an
+    /// ICP-class south display, the same `SHOTPLUG_CTL_DDI` / filter /
+    /// `SDE_DDI_HOTPLUG_ICP` bank (`icp_hpd_irq_setup`): Ice Lake with
+    /// ICP (`INTEL_PCH_ICP_DEVICE_ID_TYPE` 0x3480, `_ICP2_` 0x3880), EHL/JSL
+    /// with MCC (0x4B00, TGP-compatible) or JSP (0x4D80, ICP-compatible).
+    /// Gen9 pairs with an SPT-class PCH (SPT, KBP, CNP, CMP), whose bank is
+    /// the SPT layout ([`HpdBank::Spt`]). Rocket Lake pairs with TGP (the
+    /// ICP-class bank) or with CMP/CMP2, which `intel_pch_type` reports as
+    /// CNP ("CometPoint is CNP Compatible", `hpd_spt`); `rkl_hpd_pin` puts
+    /// DDI B on `HPD_PORT_B` with either.
+    pub(crate) fn for_source(
+        family: crate::intel_gpu_aux::SourceFamily,
+        vendor: u16,
+        device: u16,
+        class: u32,
+    ) -> Option<Self> {
+        use crate::intel_gpu_aux::SourceFamily::{Gen11, Gen12, Gen9};
+        use crate::intel_gpu_gt::Gen11Platform::{ElkhartLake, IceLake, JasperLake};
         use crate::intel_gpu_gt::Gen12Platform::*;
         if vendor != 0x8086 || class != 0x060100 {
             return None;
         }
         let allowed = matches!(
             (family, device & 0xff80),
-            (TigerLake, 0xa080 | 0x4380)
-                | (AlderLakeP | AlderLakeN, 0x7a80 | 0x5180 | 0x7a00 | 0x5480)
+            (Gen12(TigerLake), 0xa080 | 0x4380)
+                | (Gen12(RocketLake), 0xa080 | 0x4380 | 0x0280 | 0x0680)
+                | (
+                    Gen12(AlderLakeP | AlderLakeN),
+                    0x7a80 | 0x5180 | 0x7a00 | 0x5480
+                )
+                | (Gen11(IceLake), 0x3480 | 0x3880)
+                | (Gen11(ElkhartLake | JasperLake), 0x4b00 | 0x4d80)
+                // SPT/SPT-LP, KBP, CNP/CNP-LP, CMP/CMP2/CMP-V.
+                | (
+                    Gen9 { .. },
+                    0xa100 | 0x9d00 | 0xa280 | 0xa300 | 0x9d80 | 0x0280 | 0x0680 | 0xa380
+                )
         );
         allowed.then_some(Self {
             family,
@@ -104,8 +242,77 @@ impl HpdProfile {
     }
     /// Observed PCI policy fact only. GPU MMIO still needs its own current
     /// capability/D0 check at every access; this grants no PCH config authority.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn from_observed(
         family: crate::intel_gpu_gt::Gen12Platform,
+        segment: u16,
+        devices: &[narf_bus::BusDevice],
+    ) -> Option<Self> {
+        Self::observed_for_source(
+            crate::intel_gpu_aux::SourceFamily::Gen12(family),
+            segment,
+            devices,
+        )
+    }
+    /// The GMBUS pin table of a Gen9 source's observed PCH (`intel_pch.c`):
+    /// SPT, KBP and CMP-V (KBP-based, "SPT compatible") take `gmbus_pins_spt`,
+    /// CNP and CMP the CNP pins. `None` for every other family.
+    pub(crate) fn gen9_gmbus_table(&self) -> Option<crate::intel_gpu_gmbus::GmbusPinTable> {
+        use crate::intel_gpu_gmbus::GmbusPinTable;
+        if !matches!(self.family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. }) {
+            return None;
+        }
+        match self.device & 0xff80 {
+            0xa100 | 0x9d00 | 0xa280 | 0xa380 => Some(GmbusPinTable::Spt),
+            0xa300 | 0x9d80 | 0x0280 | 0x0680 => Some(GmbusPinTable::Cnp),
+            _ => None,
+        }
+    }
+    /// The GMBUS pin table of a Rocket Lake source's observed PCH:
+    /// `gmbus_pins_icp` with TGP, `gmbus_pins_cnp` with CMP/CMP2 (CNP
+    /// compatible). `None` for every other family.
+    pub(crate) fn rkl_gmbus_table(&self) -> Option<crate::intel_gpu_gmbus::GmbusPinTable> {
+        use crate::intel_gpu_gmbus::GmbusPinTable;
+        if self.family
+            != crate::intel_gpu_aux::SourceFamily::Gen12(
+                crate::intel_gpu_gt::Gen12Platform::RocketLake,
+            )
+        {
+            return None;
+        }
+        Some(match self.bank() {
+            HpdBank::Icp => GmbusPinTable::Icp,
+            HpdBank::Spt => GmbusPinTable::Cnp,
+        })
+    }
+    /// The bank this profile's south display uses: the SPT layout for an
+    /// SPT-class PCH (every Gen9 pairing, and Rocket Lake on CMP), the ICP
+    /// layout otherwise.
+    const fn bank(&self) -> HpdBank {
+        match self.device & 0xff80 {
+            0xa100 | 0x9d00 | 0xa280 | 0xa300 | 0x9d80 | 0x0280 | 0x0680 | 0xa380 => HpdBank::Spt,
+            _ => HpdBank::Icp,
+        }
+    }
+    /// The ports this profile's monitor owns: combo B, and on Rocket Lake
+    /// also its TC1/TC2 combo ports (DDI D/E) on the PCH's pins for them.
+    const fn ports(&self) -> &'static [HpdPort] {
+        let rkl = matches!(
+            self.family,
+            crate::intel_gpu_aux::SourceFamily::Gen12(
+                crate::intel_gpu_gt::Gen12Platform::RocketLake
+            )
+        );
+        match (self.bank(), rkl) {
+            (HpdBank::Icp, false) => &[ICP_B],
+            (HpdBank::Icp, true) => &[ICP_B, ICP_TC1, ICP_TC2],
+            (HpdBank::Spt, false) => &[SPT_B],
+            (HpdBank::Spt, true) => &[SPT_B, SPT_C, SPT_D],
+        }
+    }
+    /// [`Self::from_observed`] for any source family ([`Self::for_source`]).
+    pub(crate) fn observed_for_source(
+        family: crate::intel_gpu_aux::SourceFamily,
         segment: u16,
         devices: &[narf_bus::BusDevice],
     ) -> Option<Self> {
@@ -121,7 +328,7 @@ impl HpdProfile {
             if found.is_some() {
                 return None;
             }
-            let profile = Self::from_identity(family, pch.id.vendor, pch.id.device, pch.id.class)
+            let profile = Self::for_source(family, pch.id.vendor, pch.id.device, pch.id.class)
                 .and_then(|mut profile| {
                     let BusKind::Pcie {
                         addr: actual,
@@ -174,14 +381,17 @@ pub enum HpdEvent {
     RetrainRequired(Ddi),
 }
 
-/// Combo DDIs the monitor watches, in poll order.
-const COMBO_DDIS: [Ddi; 1] = [Ddi::B];
+/// Most ports one profile owns ([`HpdProfile::ports`]).
+const MAX_PORTS: usize = 3;
 
-/// Retained source-exposed combo-B latch monitor. Probe and the existing runtime actor poll it;
+/// The control registers a bank's ports live in.
+const CTL_REGS: [u64; 2] = [SHOTPLUG, SHOTPLUG_TC];
+
+/// Retained source-exposed combo latch monitor. Probe and the existing runtime actor poll it;
 /// owned interrupt sources remain masked until a display IRQ owner exists.
 #[derive(Debug, Default)]
 pub struct HpdMonitor {
-    level: [bool; 1],
+    level: [bool; MAX_PORTS],
     pending: u32,
     long: u32,
     profile: Option<HpdProfile>,
@@ -191,7 +401,7 @@ pub struct HpdMonitor {
 impl HpdMonitor {
     pub const fn new() -> Self {
         Self {
-            level: [false; 1],
+            level: [false; MAX_PORTS],
             pending: 0,
             long: 0,
             profile: None,
@@ -201,6 +411,29 @@ impl HpdMonitor {
     }
     pub fn uncertain(&self) -> bool {
         self.uncertain
+    }
+    fn bank(&self) -> HpdBank {
+        self.profile.map_or(HpdBank::Icp, |p| p.bank())
+    }
+    fn ports(&self) -> &'static [HpdPort] {
+        self.profile.map_or(&[ICP_B], |p| p.ports())
+    }
+    /// The owned SDE bits, and per control register the owned enables and
+    /// status fields (`(reg, enable, status)`, registers no port uses
+    /// skipped).
+    fn owned(&self) -> (u32, [(u64, u32, u32); 2]) {
+        let mut sde = 0;
+        let mut regs = CTL_REGS.map(|reg| (reg, 0, 0));
+        for port in self.ports() {
+            sde |= port.owned;
+            for (reg, enable, status) in regs.iter_mut() {
+                if *reg == port.ctl {
+                    *enable |= port.enable;
+                    *status |= port.status;
+                }
+            }
+        }
+        (sde, regs)
     }
     fn qualify<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
         let Some(profile) = io.gen12_hpd_profile() else {
@@ -213,12 +446,12 @@ impl HpdMonitor {
             self.uncertain = true;
             return false;
         }
-        if io.read32(FILTER) != 0xf8 {
+        if profile.bank() == HpdBank::Icp && io.read32(FILTER) != 0xf8 {
             if self.profile.is_some() {
                 self.uncertain = true;
             }
             return false;
-        } // shared source250us filter; never seize it
+        } // shared source250us filter (ICP-class only); never seize it
         self.profile = Some(profile);
         true
     }
@@ -226,6 +459,8 @@ impl HpdMonitor {
         if !self.qualify(io) || self.uncertain || self.initialized {
             return;
         }
+        let bank = self.bank();
+        let (owned, regs) = self.owned();
         let ier = io.read32(SDE_IER);
         let imr = io.read32(SDE_IMR);
         if !io.display_access_ok() {
@@ -234,13 +469,13 @@ impl HpdMonitor {
         }
         // Mask/readback first: inherited IMR may have this source unmasked
         // while its IER latch was disabled. Never transiently enable an IRQ.
-        io.write32(SDE_IMR, imr | OWNED);
+        io.write32(SDE_IMR, imr | owned);
         let masked = io.read32(SDE_IMR);
-        if !io.display_access_ok() || masked & OWNED != OWNED {
+        if !io.display_access_ok() || masked & owned != owned {
             self.uncertain = true;
             return;
         }
-        io.write32(SDE_IER, ier | OWNED);
+        io.write32(SDE_IER, ier | owned);
         // Establish the first owned status incarnation. A stale orphan LONG
         // without IIR must not contaminate the first later SHORT. The source
         // setup RMW clears observed owned W1C status while enabling detection.
@@ -250,31 +485,41 @@ impl HpdMonitor {
             self.uncertain = true;
             return;
         }
-        let captured = inherited & OWNED;
+        let captured = inherited & owned;
         self.pending |= captured;
         if captured != 0 {
             io.write32(SDE_IIR, captured);
         }
-        let ctl = io.read32(SHOTPLUG);
-        if ctl == u32::MAX || !io.display_access_ok() {
-            self.uncertain = true;
-            return;
+        for (reg, enable, status) in regs {
+            if enable == 0 {
+                continue;
+            }
+            let ctl = io.read32(reg);
+            if ctl == u32::MAX || !io.display_access_ok() {
+                self.uncertain = true;
+                return;
+            }
+            io.write32(reg, (ctl & !bank.all_status(reg)) | (ctl & status) | enable);
         }
-        io.write32(SHOTPLUG, (ctl & !ALL_STATUS) | (ctl & 0x30) | 0x80);
         let observed_ier = io.read32(SDE_IER);
         let observed_imr = io.read32(SDE_IMR);
-        let observed_ctl = io.read32(SHOTPLUG);
-        if !io.display_access_ok()
-            || observed_ier & OWNED != OWNED
-            || observed_imr & OWNED != OWNED
-            || observed_ctl == u32::MAX
-            || observed_ctl & 0x80 != 0x80
-            || observed_ctl & 0x30 != 0
-        {
+        let mut ok = io.display_access_ok()
+            && observed_ier & owned == owned
+            && observed_imr & owned == owned;
+        for (reg, enable, status) in regs {
+            if enable == 0 {
+                continue;
+            }
+            let observed_ctl = io.read32(reg);
+            ok &= observed_ctl != u32::MAX
+                && observed_ctl & enable == enable
+                && observed_ctl & status == 0;
+        }
+        if !ok || !io.display_access_ok() {
             self.uncertain = true;
         } else {
             self.pending &= !captured;
-            self.long &= !OWNED;
+            self.long &= !owned;
             self.initialized = true;
         }
     }
@@ -282,6 +527,9 @@ impl HpdMonitor {
         if !self.qualify(io) || self.uncertain {
             return None;
         }
+        let bank = self.bank();
+        let ports = self.ports();
+        let (owned, _) = self.owned();
         if !self.initialized {
             self.enable_interrupts(io);
             if !self.initialized || self.uncertain {
@@ -294,28 +542,42 @@ impl HpdMonitor {
             self.uncertain = true;
             return None;
         }
-        let captured = edges & OWNED;
+        let captured = edges & owned;
         self.pending |= captured; // retain before the first owned W1C
         if captured != 0 {
             io.write32(SDE_IIR, captured); // source ACK order: south IIR before SHOTPLUG
-            let ctl = io.read32(SHOTPLUG);
-            if ctl == u32::MAX || !io.display_access_ok() {
-                self.uncertain = true;
-                return None;
-            }
-            let status = ctl & 0x30;
-            if status & 0x20 != 0 {
-                self.long |= 1 << 17;
-            }
-            // Never carry another owner's read-one status into a W1C write.
-            io.write32(SHOTPLUG, (ctl & !ALL_STATUS) | status);
-            if !io.display_access_ok() {
-                self.uncertain = true;
-                return None;
+            for reg in CTL_REGS {
+                let in_reg = || {
+                    ports
+                        .iter()
+                        .filter(|p| p.ctl == reg && captured & p.owned != 0)
+                };
+                if in_reg().next().is_none() {
+                    continue;
+                }
+                let ctl = io.read32(reg);
+                if ctl == u32::MAX || !io.display_access_ok() {
+                    self.uncertain = true;
+                    return None;
+                }
+                let mut status = 0;
+                for port in in_reg() {
+                    let own = ctl & port.status;
+                    if own & port.long == port.long {
+                        self.long |= port.owned;
+                    }
+                    status |= own;
+                }
+                // Never carry another owner's read-one status into a W1C write.
+                io.write32(reg, (ctl & !bank.all_status(reg)) | status);
+                if !io.display_access_ok() {
+                    self.uncertain = true;
+                    return None;
+                }
             }
         }
-        for (index, ddi) in COMBO_DDIS.iter().copied().enumerate() {
-            let bit = hotplug_bit(ddi).unwrap();
+        for (index, port) in ports.iter().enumerate() {
+            let (ddi, bit) = (port.ddi, port.owned);
             let now = levels & bit != 0;
             // Live ISR may be low during a legal short pulse. Source long
             // detection gates removal; no single low sample proves unplug.
@@ -342,7 +604,6 @@ impl HpdMonitor {
     }
 }
 
-/// The process-wide HPD monitor the production poll path uses.
 static HPD_MONITOR: IrqSafeSpinLock<HpdMonitor> = IrqSafeSpinLock::new(HpdMonitor::new());
 
 /// Poll the shared HPD monitor once (production entry point;
@@ -366,6 +627,132 @@ pub const INTEL_SOURCE_CAPS: SourceCaps = SourceCaps {
     max_rate: LinkRate::Hbr3,
     max_lanes: 4,
 };
+
+/// The source envelope for `family` on `ddi`, as
+/// `intel_dp_set_source_rates` limits it below display 12: display 9 tops
+/// out at HBR2 (`skl_rates`), Ice Lake's combo PHYs at HBR2 for an external
+/// sink and its Type-C ports at HBR3 (`icl_max_source_rate`), and
+/// Elkhart/Jasper Lake external ports at HBR3 (`ehl_max_source_rate`).
+/// Gen12 keeps [`INTEL_SOURCE_CAPS`] on every port. That is a deliberate
+/// divergence: Linux's `icl_max_source_rate` also caps Tiger Lake's combo
+/// ports at HBR2 for a non-eDP sink, and this source offers HBR3 there.
+/// Negotiation still settles on the sink's rate, and the training fallback
+/// steps down from HBR3 when a link will not hold it.
+pub fn source_caps(family: Option<crate::intel_gpu_aux::SourceFamily>, ddi: Ddi) -> SourceCaps {
+    use crate::intel_gpu_aux::SourceFamily;
+    use crate::intel_gpu_gt::Gen11Platform;
+    let max_rate = match family {
+        Some(SourceFamily::Gen9 { .. }) => LinkRate::Hbr2,
+        Some(SourceFamily::Gen11(Gen11Platform::IceLake)) => {
+            match crate::intel_gpu_gen11_ddi::phy_for_port(Gen11Platform::IceLake, ddi) {
+                Some(crate::intel_gpu_gen11_ddi::Gen11Phy::Mg { .. }) => LinkRate::Hbr3,
+                _ => LinkRate::Hbr2,
+            }
+        }
+        _ => INTEL_SOURCE_CAPS.max_rate,
+    };
+    SourceCaps {
+        max_rate,
+        max_lanes: INTEL_SOURCE_CAPS.max_lanes,
+    }
+}
+
+/// `ICL_PWR_WELL_CTL_AUX2`: the driver's request register for the per-port
+/// AUX wells (`ICL_PW_CTL_IDX_AUX_*`, `TGL_PW_CTL_IDX_AUX_TC*`).
+pub(crate) const PWR_WELL_CTL_AUX2: u64 = 0x4_5444;
+/// `ICL_PWR_WELL_CTL_DDI2`: the driver's request register for the per-port
+/// DDI IO wells (`ICL_PW_CTL_IDX_DDI_*`, `TGL_PW_CTL_IDX_DDI_TC*`).
+pub(crate) const PWR_WELL_CTL_DDI2: u64 = 0x4_5454;
+
+/// The AUX and DDI IO well index of a display-12 combo port, in the
+/// platform's power-well map: A and B are `ICL_PW_CTL_IDX_{AUX,DDI}_A/B`
+/// (0/1) on Tiger, Rocket and Alder Lake P/N; Rocket Lake's TC1/TC2 combo
+/// ports (DDI D/E, PHY C/D) take `TGL_PW_CTL_IDX_*_TC1/TC2` (3/4,
+/// `rkl_power_wells_ddi_aux`). Type-C ports own their wells through the
+/// Type-C PHY ([`crate::intel_gpu_gen12_tc`]); Alder Lake S's map is its
+/// own and is not owned here.
+pub(crate) const fn combo_port_well(
+    family: crate::intel_gpu_gt::Gen12Platform,
+    ddi: Ddi,
+) -> Option<u32> {
+    use crate::intel_gpu_gt::Gen12Platform;
+    match (family, ddi) {
+        (Gen12Platform::AlderLakeS, _) => None,
+        (_, Ddi::A) => Some(0),
+        (_, Ddi::B) => Some(1),
+        (Gen12Platform::RocketLake, Ddi::D) => Some(3),
+        (Gen12Platform::RocketLake, Ddi::E) => Some(4),
+        _ => None,
+    }
+}
+
+/// The well request bits this driver set (and so may clear) in
+/// [`PWR_WELL_CTL_AUX2`] and [`PWR_WELL_CTL_DDI2`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PortWells {
+    pub(crate) aux: u32,
+    pub(crate) ddi: u32,
+}
+
+/// Power a display-12 combo port's DDI IO and AUX wells for a connected
+/// sink, as Linux takes the port's `ddi_io_power_domain`
+/// (`intel_ddi_pre_enable`) and its AUX domain (`intel_dp_aux_xfer`):
+/// `hsw_power_well_enable` sets the driver REQUEST bit and waits 1 ms for
+/// STATE. Like `hsw_wait_for_power_well_enable` a timeout does not fail
+/// (the AUX transfer or the modeset that needs the well reports it). A
+/// request already set (another owner, or BIOS state in the driver
+/// register) is left alone and not returned, so [`release_port_wells`]
+/// never drops a well this call did not raise.
+pub(crate) fn request_port_wells<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    family: crate::intel_gpu_gt::Gen12Platform,
+    ddi: Ddi,
+) -> PortWells {
+    let Some(idx) = combo_port_well(family, ddi) else {
+        return PortWells::default();
+    };
+    let raise = |reg: u64, idx: u32| {
+        let (req, state) = (2u32 << (idx * 2), 1u32 << (idx * 2));
+        let cur = mmio.read32(reg);
+        if cur == u32::MAX || !mmio.display_access_ok() || cur & req != 0 {
+            return 0;
+        }
+        mmio.write32(reg, cur | req);
+        let _ = narf_scheduler::responsive_spin_until(
+            || mmio.read32(reg) & state != 0,
+            narf_time::Deadline::after_us(1_000),
+        );
+        req
+    };
+    // Rocket Lake's TC1/TC2 lanes and AUX sit in PW_3's domains
+    // (`RKL_PW_3_POWER_DOMAINS`). PW_3 is also Pipe B's well, which the
+    // modeset raises and never drops, so it is raised here and not held.
+    if family == crate::intel_gpu_gt::Gen12Platform::RocketLake && matches!(ddi, Ddi::D | Ddi::E) {
+        let _ = raise(crate::intel_gpu_modeset::PWR_WELL_CTL2, 2);
+    }
+    let ddi_bit = raise(PWR_WELL_CTL_DDI2, idx);
+    let aux_bit = raise(PWR_WELL_CTL_AUX2, idx);
+    PortWells {
+        aux: aux_bit,
+        ddi: ddi_bit,
+    }
+}
+
+/// `hsw_power_well_disable` for the requests in `held`: clear them (AUX
+/// first, the reverse of [`request_port_wells`]). Another requester keeps
+/// its well on.
+pub(crate) fn release_port_wells<M: MmioWindow + ?Sized>(mmio: &M, held: PortWells) {
+    for (reg, bits) in [(PWR_WELL_CTL_AUX2, held.aux), (PWR_WELL_CTL_DDI2, held.ddi)] {
+        if bits == 0 {
+            continue;
+        }
+        let cur = mmio.read32(reg);
+        if cur == u32::MAX || !mmio.display_access_ok() {
+            continue;
+        }
+        mmio.write32(reg, cur & !bits);
+    }
+}
 
 /// Errors the DP session can return. Each variant names the
 /// layer that failed so callers log precisely.
@@ -438,7 +825,7 @@ pub struct DpSinkProbe {
 #[derive(Clone, Debug)]
 pub struct DpConnection {
     /// Exact source family retained through retrain/disconnect.
-    pub family: crate::intel_gpu_gt::Gen12Platform,
+    pub family: crate::intel_gpu_aux::SourceFamily,
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
     /// The pipe scanning this connection out, claimed from
@@ -454,6 +841,41 @@ pub struct DpConnection {
     pub caps: DpcdCaps,
     /// Whether an ELD was published for this connection.
     pub audio_published: bool,
+    /// What a DP-to-HDMI 2.1 PCON's HDMI side runs
+    /// ([`crate::dp_pcon::check_frl_training`]).
+    pub pcon: crate::dp_pcon::PconLink,
+}
+
+/// `intel_dp_check_frl_training` for the sink behind `ddi`: a
+/// source-control PCON driving an HDMI 2.1 sink (the EDID read through it
+/// carries the HDMI VSDB and a max FRL rate) trains FRL, falling back to
+/// TMDS. Anything else is left untouched, as is a PCON whose caps cannot
+/// be read.
+pub fn pcon_frl_training<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    ddi: Ddi,
+    dpcd_rev: u8,
+    edid: &[u8],
+) -> crate::dp_pcon::PconLink {
+    use crate::dp_pcon::{check_frl_training, read_pcon_caps, sink_max_frl_gbps, PconLink};
+    let mut aux = IntelAux::new(mmio, ddi);
+    let Ok(Some(pcon)) = read_pcon_caps(&mut aux, dpcd_rev) else {
+        return PconLink::Untouched;
+    };
+    let hf = crate::intel_gpu_hdmi::parse_hf_vsdb(edid);
+    let sink_max = sink_max_frl_gbps(hf.max_frl_gbps, hf.dsc_max_frl_gbps, &pcon);
+    check_frl_training(
+        &mut aux,
+        &pcon,
+        crate::intel_gpu_hdmi::is_hdmi_sink(edid),
+        sink_max,
+        |us| {
+            let _ = narf_scheduler::responsive_spin_until(
+                || false,
+                narf_time::Deadline::after_ns(u64::from(us) * 1000),
+            );
+        },
+    )
 }
 
 /// The display-audio sink id for a DDI: DDI index + 1 (0 is
@@ -503,7 +925,8 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Result<DpSinkPr
     // 24 bpp uncompressed SST — the stream shape the modeset
     // programs today.
     let demand = crate::dp_link_training::stream_demand_kbps(mode.pixel_clock_khz, 24);
-    let negotiated = negotiate(&INTEL_SOURCE_CAPS, &caps, demand);
+    let source = source_caps(crate::intel_gpu_aux::SourceFamily::of(mmio), ddi);
+    let negotiated = negotiate(&source, &caps, demand);
     // VRR capability is decided here, at discovery, from the same
     // DPCD caps + EDID the probe already read (Linux
     // `intel_vrr_is_capable`). `HAS_VRR` holds for every display IP
@@ -625,17 +1048,25 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
     pipe: Pipe,
     dbuf_share: Option<(u16, u16)>,
 ) -> Result<DpConnection, DpError> {
-    let family = mmio
-        .gen12_display_family()
+    let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(DpError::Modeset(ModesetError::UnsupportedGeneration))?;
     let plan = LinkPlan {
         rate: probe.negotiated.rate,
         lanes: probe.negotiated.lanes,
     };
+    // A PCON trains its HDMI side before the DP link trains
+    // (`intel_ddi_pre_enable_dp` → `intel_dp_check_frl_training`).
+    let pcon = pcon_frl_training(
+        mmio,
+        probe.ddi,
+        probe.caps.dpcd_rev,
+        &probe.edid[..probe.edid_len],
+    );
     let mut modeset = Modeset::for_pipe(mmio, probe.ddi, pipe);
-    modeset.set_gen12_family(family);
+    modeset.set_source_family(family);
     if let Some((start, end)) = dbuf_share {
         modeset.set_dbuf_share(start, end);
+        modeset.set_shared_cdclk(true);
     }
     let (mode, trained) = modeset.modeset_with_plan(fb, &probe.mode, plan)?;
 
@@ -662,8 +1093,10 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
     // (Card::vrr_enabled) is the install hook's job — this path
     // has no card index in scope — and the sequencing lane (#1769)
     // owns publishing modeset results to the card.
-    if pipe == Pipe::A {
-        let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(family);
+    // VRR is modelled for the Gen12 display IPs only; Gen11 and Gen9
+    // sessions scan out at a fixed rate.
+    if let (Pipe::A, Some(gen12)) = (pipe, family.gen12()) {
+        let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(gen12);
         crate::intel_gpu_vrr::reconcile_vrr_at_setup(
             mmio,
             crate::intel_gpu_vrr::VrrTranscoder::A,
@@ -698,6 +1131,7 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
         trained,
         caps: probe.caps,
         audio_published,
+        pcon,
     })
 }
 
@@ -718,7 +1152,7 @@ pub fn connect_on_pipe<M: MmioWindow + ?Sized>(
     fb: &Framebuffer,
     pipe: Pipe,
 ) -> Result<DpConnection, DpError> {
-    mmio.gen12_display_family()
+    crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(DpError::Modeset(ModesetError::UnsupportedGeneration))?;
     let probe = probe_sink(mmio, ddi)?;
     activate_on_pipe(mmio, &probe, fb, pipe, None)
@@ -729,7 +1163,7 @@ pub fn connect_on_pipe<M: MmioWindow + ?Sized>(
 /// an ELD whose display is already gone. False means source refusal or an
 /// unobserved/partial local stop; the caller must retain the session graph.
 pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) -> bool {
-    if mmio.gen12_display_family() != Some(conn.family) {
+    if crate::intel_gpu_aux::SourceFamily::of(mmio) != Some(conn.family) {
         return false;
     }
     if conn.audio_published {
@@ -737,7 +1171,7 @@ pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) -> bool
         clear_display_audio(sink_id_for(conn.ddi));
     }
     let mut modeset = Modeset::for_pipe(mmio, conn.ddi, conn.pipe);
-    modeset.set_gen12_family(conn.family);
+    modeset.set_source_family(conn.family);
     modeset.try_teardown().is_ok()
 }
 
@@ -752,7 +1186,7 @@ pub fn retrain<M: MmioWindow + ?Sized>(
     conn: &DpConnection,
     fb: &Framebuffer,
 ) -> Result<DpConnection, DpError> {
-    if mmio.gen12_display_family() != Some(conn.family) {
+    if crate::intel_gpu_aux::SourceFamily::of(mmio) != Some(conn.family) {
         return Err(DpError::Modeset(ModesetError::UnsupportedGeneration));
     }
     let mut aux = IntelAux::new(mmio, conn.ddi);
@@ -1548,6 +1982,53 @@ pub mod tests {
     }
     kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_dp_hbr3_sink_trains_hbr3);
 
+    /// `intel_dp_set_source_rates` below display 12: Gen9 stops at HBR2, Ice
+    /// Lake combo ports at HBR2 and its Type-C ports at HBR3, EHL/JSL and
+    /// Gen12 at HBR3.
+    fn smoke_dp_source_caps_follow_the_source() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, Gen9Platform};
+        let gen9 = SourceFamily::Gen9 {
+            platform: Gen9Platform::Skylake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Desktop,
+        };
+        for (family, ddi, want) in [
+            (Some(gen9), Ddi::B, LinkRate::Hbr2),
+            (Some(gen9), Ddi::E, LinkRate::Hbr2),
+            (
+                Some(SourceFamily::Gen11(Gen11Platform::IceLake)),
+                Ddi::B,
+                LinkRate::Hbr2,
+            ),
+            (
+                Some(SourceFamily::Gen11(Gen11Platform::IceLake)),
+                Ddi::C,
+                LinkRate::Hbr3,
+            ),
+            (
+                Some(SourceFamily::Gen11(Gen11Platform::ElkhartLake)),
+                Ddi::B,
+                LinkRate::Hbr3,
+            ),
+            (
+                Some(SourceFamily::Gen12(Gen12Platform::TigerLake)),
+                Ddi::B,
+                LinkRate::Hbr3,
+            ),
+            (None, Ddi::B, LinkRate::Hbr3),
+        ] {
+            let caps = source_caps(family, ddi);
+            if caps.max_rate != want || caps.max_lanes != 4 {
+                return TestResult::Fail("the source rate cap must follow the platform and port");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_dp_source_caps_follow_the_source
+    );
+
     fn smoke_dp_hbr3_failure_falls_back() -> TestResult {
         // The sink advertises HBR3 but never locks CR at HBR3 —
         // training must fall back to HBR2 and the modeset must
@@ -1902,7 +2383,10 @@ pub mod tests {
             );
             *mmio.family.borrow_mut() = Some(family);
             let conn = connect_on_pipe(&mmio, Ddi::B, &test_fb(), Pipe::B).unwrap();
-            assert_eq!(conn.family, family);
+            assert_eq!(
+                conn.family,
+                crate::intel_gpu_aux::SourceFamily::Gen12(family)
+            );
             assert_eq!(mmio.writes_to(0x71180).last(), Some(&expected));
             let before = mmio.writes.borrow().len();
             let other = if family == Gen12Platform::AlderLakeP {
@@ -1946,5 +2430,283 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_dp",
         smoke_dp_source_family_arb_slots_and_missing_foreign_metadata_refusal
+    );
+
+    /// Gen11 sources get the ICP-class hotplug bank for their own PCHs
+    /// only, Gen9 the SPT bank for SPT-class PCHs, and a PCH of another
+    /// generation never qualifies a GPU.
+    fn smoke_hpd_profile_gen11_icp_pchs() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gen9_ddi::SkuFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen9Platform};
+        let icl = SourceFamily::Gen11(Gen11Platform::IceLake);
+        let jsl = SourceFamily::Gen11(Gen11Platform::JasperLake);
+        let isa = 0x060100;
+        for (family, did, ok) in [
+            (icl, 0x3482, true),  // ICP-LP
+            (icl, 0x3882, true),  // ICP2
+            (jsl, 0x4b00, true),  // MCC
+            (jsl, 0x4d87, true),  // JSP
+            (icl, 0x4d87, false), // a JSL PCH on an ICL GPU
+            (jsl, 0x3482, false),
+            (icl, 0xa082, false), // TGP belongs to TGL
+        ] {
+            if HpdProfile::for_source(family, 0x8086, did, isa).is_some() != ok {
+                return TestResult::Fail("Gen11 HPD rows must follow intel_pch.c");
+            }
+        }
+        let skl = SourceFamily::Gen9 {
+            platform: Gen9Platform::Skylake,
+            sku: SkuFamily::Ult,
+        };
+        // Gen9 takes its SPT-class PCHs with the SPT bank; an ICP-class
+        // PCH never qualifies it.
+        for (did, ok) in [
+            (0x9d48, true),
+            (0xa282, true),
+            (0x0284, true),
+            (0x3482, false),
+        ] {
+            let profile = HpdProfile::for_source(skl, 0x8086, did, isa);
+            if profile.is_some() != ok || profile.is_some_and(|p| p.bank() != HpdBank::Spt) {
+                return TestResult::Fail("Gen9 HPD rows must follow intel_pch.c's SPT-class PCHs");
+            }
+        }
+        if HpdProfile::for_source(icl, 0x8086, 0x3482, isa).map(|p| p.bank()) != Some(HpdBank::Icp)
+        {
+            return TestResult::Fail("Gen11 keeps the ICP bank");
+        }
+        // Rocket Lake pairs with TGP (ICP bank) or CMP/CMP2 (CNP-compatible,
+        // the SPT bank); ADP and CMP-V do not qualify it.
+        let rkl = SourceFamily::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+        for (did, bank) in [
+            (0x4388, Some(HpdBank::Icp)), // TGP-H
+            (0xa082, Some(HpdBank::Icp)), // TGP-LP
+            (0x0284, Some(HpdBank::Spt)), // CMP
+            (0x0687, Some(HpdBank::Spt)), // CMP2
+            (0xa3c8, None),               // CMP-V (KBP-based)
+            (0x7a84, None),               // ADP-S
+        ] {
+            if HpdProfile::for_source(rkl, 0x8086, did, isa).map(|p| p.bank()) != bank {
+                return TestResult::Fail("RKL HPD rows must follow intel_pch.c and rkl_hpd_pin");
+            }
+        }
+        // SPT's PORTB: ISR bit 21, enable bit 4, status 1:0 (long 2).
+        let spt = super::SPT_B;
+        if spt.owned != 1 << 21
+            || spt.enable != 1 << 4
+            || spt.status != 3
+            || spt.long != 2
+            || HpdBank::Spt.all_status(super::SHOTPLUG) & spt.status != spt.status
+        {
+            return TestResult::Fail("the SPT bank must follow PCH_PORT_HOTPLUG");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_profile_gen11_icp_pchs);
+
+    /// A south display alone: a fixed PCH profile, ISR levels, IIR latches
+    /// cleared by their write-1 ACK, and write-1-to-clear status in both
+    /// hotplug control registers.
+    struct SouthHpd {
+        profile: HpdProfile,
+        level: core::cell::Cell<u32>,
+        iir: core::cell::Cell<u32>,
+        regs: core::cell::RefCell<alloc::collections::BTreeMap<u64, u32>>,
+        writes: core::cell::RefCell<Vec<(u64, u32)>>,
+    }
+    impl SouthHpd {
+        fn new(family: crate::intel_gpu_gt::Gen12Platform, pch: u16) -> Self {
+            Self {
+                profile: HpdProfile::from_identity(family, 0x8086, pch, 0x060100)
+                    .expect("a qualified PCH"),
+                level: Default::default(),
+                iir: Default::default(),
+                regs: Default::default(),
+                writes: Default::default(),
+            }
+        }
+        fn reg(&self, off: u64) -> u32 {
+            *self.regs.borrow().get(&off).unwrap_or(&0)
+        }
+        fn writes_to(&self, off: u64) -> Vec<u32> {
+            self.writes
+                .borrow()
+                .iter()
+                .filter(|(o, _)| *o == off)
+                .map(|(_, v)| *v)
+                .collect()
+        }
+    }
+    impl MmioWindow for SouthHpd {
+        fn gen12_hpd_profile(&self) -> Option<HpdProfile> {
+            Some(self.profile)
+        }
+        fn read32(&self, off: u64) -> u32 {
+            match off {
+                SDE_ISR => self.level.get(),
+                SDE_IIR => self.iir.get(),
+                super::FILTER => 0xf8,
+                _ => self.reg(off),
+            }
+        }
+        fn write32(&self, off: u64, val: u32) {
+            self.writes.borrow_mut().push((off, val));
+            match off {
+                SDE_IIR => self.iir.set(self.iir.get() & !val),
+                super::SHOTPLUG | super::SHOTPLUG_TC => {
+                    let w1c = self.profile.bank().all_status(off);
+                    let old = self.reg(off);
+                    self.regs
+                        .borrow_mut()
+                        .insert(off, (val & !w1c) | (old & w1c & !val));
+                }
+                _ => {
+                    self.regs.borrow_mut().insert(off, val);
+                }
+            }
+        }
+    }
+
+    /// Rocket Lake's monitor owns TC1/TC2 beside combo B: with TGP on the
+    /// Type-C pins (`SDE_TC_HOTPLUG_ICP` bits 24/25, `SHOTPLUG_CTL_TC`
+    /// nibbles 3:0 and 7:4), with CMP as SPT ports C/D (bits 22/23,
+    /// `PCH_PORT_HOTPLUG` enables 12/20). A TC1 plug reports DDI D, its
+    /// long-pulse unplug clears only its own TC nibble. Tiger Lake keeps
+    /// combo B alone and never touches `SHOTPLUG_CTL_TC`.
+    fn smoke_hpd_rkl_owns_tc1_tc2_on_either_pch() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform::{RocketLake, TigerLake};
+        let tgp = SouthHpd::new(RocketLake, 0x4388);
+        let mut monitor = HpdMonitor::new();
+        if monitor.poll(&tgp).is_some()
+            || tgp.read32(SDE_IMR) & 0x0302_0000 != 0x0302_0000
+            || tgp.read32(SDE_IER) & 0x0302_0000 != 0x0302_0000
+            || tgp.reg(super::SHOTPLUG) & 0x80 == 0
+            || tgp.reg(super::SHOTPLUG_TC) & 0x88 != 0x88
+        {
+            return TestResult::Fail("RKL+TGP must arm B and the TC1/TC2 pins");
+        }
+        tgp.level.set(1 << 24);
+        if monitor.poll(&tgp) != Some(HpdEvent::Connected(Ddi::D)) {
+            return TestResult::Fail("a TC1 level must connect DDI D");
+        }
+        // Unplug: level low, IIR latched, TC1's long pulse in SHOTPLUG_CTL_TC
+        // beside TC2's (foreign) short pulse.
+        tgp.level.set(0);
+        tgp.iir.set(1 << 24);
+        tgp.regs
+            .borrow_mut()
+            .insert(super::SHOTPLUG_TC, 0x88 | 0x2 | 0x10);
+        tgp.writes.borrow_mut().clear();
+        if monitor.poll(&tgp) != Some(HpdEvent::Disconnected(Ddi::D)) {
+            return TestResult::Fail("TC1's long-pulse unplug must disconnect DDI D");
+        }
+        if tgp.writes_to(super::SHOTPLUG_TC) != [0x88 | 0x2]
+            || tgp.reg(super::SHOTPLUG_TC) != 0x88 | 0x10
+        {
+            return TestResult::Fail("the ACK must clear TC1's status and keep TC2's");
+        }
+        let cmp = SouthHpd::new(RocketLake, 0x0687);
+        let mut monitor = HpdMonitor::new();
+        let _ = monitor.poll(&cmp);
+        let enables = (1 << 4) | (1 << 12) | (1 << 20);
+        if cmp.read32(SDE_IMR) & 0x00E0_0000 != 0x00E0_0000
+            || cmp.reg(super::SHOTPLUG) & enables != enables
+            || !cmp.writes_to(super::SHOTPLUG_TC).is_empty()
+        {
+            return TestResult::Fail("RKL+CMP must arm SPT ports B, C and D");
+        }
+        cmp.level.set(1 << 23);
+        if monitor.poll(&cmp) != Some(HpdEvent::Connected(Ddi::E)) {
+            return TestResult::Fail("SPT port D must connect RKL's DDI E");
+        }
+        let tgl = SouthHpd::new(TigerLake, 0xa082);
+        let mut monitor = HpdMonitor::new();
+        let _ = monitor.poll(&tgl);
+        if tgl.read32(SDE_IMR) != 1 << 17 || !tgl.writes_to(super::SHOTPLUG_TC).is_empty() {
+            return TestResult::Fail("Tiger Lake must keep combo B alone");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_hpd_rkl_owns_tc1_tc2_on_either_pch
+    );
+
+    /// A power-well block whose STATE bits follow REQUEST in the driver
+    /// AUX and DDI request registers.
+    struct Wells {
+        regs: core::cell::RefCell<alloc::collections::BTreeMap<u64, u32>>,
+        grant: bool,
+    }
+    impl MmioWindow for Wells {
+        fn read32(&self, off: u64) -> u32 {
+            let raw = *self.regs.borrow().get(&off).unwrap_or(&0);
+            if self.grant && (off == super::PWR_WELL_CTL_AUX2 || off == super::PWR_WELL_CTL_DDI2) {
+                raw | ((raw & 0xAAAA_AAAA) >> 1)
+            } else {
+                raw
+            }
+        }
+        fn write32(&self, off: u64, val: u32) {
+            self.regs.borrow_mut().insert(off, val & 0xAAAA_AAAA);
+        }
+    }
+
+    /// Display-12 combo ports raise their DDI IO and AUX wells for a
+    /// connected sink (`intel_ddi_pre_enable`'s `ddi_io_power_domain`,
+    /// `intel_dp_aux_xfer`'s AUX domain): DDI B is index 1 on Tiger Lake,
+    /// Rocket Lake's TC1 combo port index 3. Only bits this driver raised
+    /// are dropped, a pre-set request survives, Type-C and ADL-S ports own
+    /// nothing here, and a well that never grants does not fail.
+    fn smoke_dp_combo_port_wells_follow_the_sink() -> TestResult {
+        use super::{release_port_wells, request_port_wells, PortWells};
+        use crate::intel_gpu_gt::Gen12Platform::{AlderLakeS, RocketLake, TigerLake};
+        let (aux2, ddi2) = (super::PWR_WELL_CTL_AUX2, super::PWR_WELL_CTL_DDI2);
+        let io = Wells {
+            regs: Default::default(),
+            grant: true,
+        };
+        let held = request_port_wells(&io, TigerLake, Ddi::B);
+        if held != (PortWells { aux: 0x8, ddi: 0x8 })
+            || io.read32(aux2) & 0xC != 0xC
+            || io.read32(ddi2) & 0xC != 0xC
+        {
+            return TestResult::Fail("TGL DDI B must raise and see AUX_B and DDI_IO_B");
+        }
+        release_port_wells(&io, held);
+        if io.read32(aux2) != 0 || io.read32(ddi2) != 0 {
+            return TestResult::Fail("releasing must drop the bits this driver raised");
+        }
+        // Another owner's AUX_B request is not ours to drop.
+        io.write32(aux2, 0x8);
+        let held = request_port_wells(&io, TigerLake, Ddi::B);
+        release_port_wells(&io, held);
+        if held.aux != 0 || io.read32(aux2) & 0x8 == 0 {
+            return TestResult::Fail("a pre-set request must survive the release");
+        }
+        io.regs.borrow_mut().clear();
+        if request_port_wells(&io, RocketLake, Ddi::D)
+            != (PortWells {
+                aux: 0x80,
+                ddi: 0x80,
+            })
+            || request_port_wells(&io, TigerLake, Ddi::D) != PortWells::default()
+            || request_port_wells(&io, AlderLakeS, Ddi::B) != PortWells::default()
+        {
+            return TestResult::Fail("only display-12 combo ports own these wells");
+        }
+        let dead = Wells {
+            regs: Default::default(),
+            grant: false,
+        };
+        if request_port_wells(&dead, TigerLake, Ddi::B) != (PortWells { aux: 0x8, ddi: 0x8 }) {
+            return TestResult::Fail("a timed-out grant still holds the request, as Linux does");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_dp_combo_port_wells_follow_the_sink
     );
 }

@@ -4,8 +4,8 @@
 //! there. A kernel task freezes it in the middle of that loop, in user
 //! mode, which only the timer tick can interrupt. It then checks that the
 //! count holds still while frozen and moves again after the thaw. That
-//! covers the tick's yield during a freeze and the own-stack park loop's
-//! freeze point on each arch.
+//! covers the user-mode tick's freeze point (`freeze_on_user_tick`) and the
+//! own-stack park loop's on each arch.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -35,7 +35,7 @@ fn counting_loop() -> Vec<u8> {
         0x83, 0x3C, 0x25, 0x00, 0x00, 0x42, 0x00, 0x00, // cmp dword [DATA], 0
         0x74, 0xEE, // je 1b
         0x48, 0xC7, 0xC0, exit[0], exit[1], exit[2], exit[3], // mov rax, exit
-        0xCD, 0x80, // int 0x80
+        0x0F, 0x05, // syscall (int 0x80 is the ia32 entry)
         0xEB, 0xFE, // jmp $
     ]
 }

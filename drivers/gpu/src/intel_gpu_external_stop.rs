@@ -1,6 +1,9 @@
-//! Checked retirement of one already-owned Gen12 SST link. No allocator,
-//! timing change, shared DDB repartition or inferred stop on GT reset.
-//! MIT Linux b90c984d intel_display.c352/503, intel_ddi.c680/3099/3125.
+//! Checked retirement of one already-owned Gen12, Gen11 or Gen9 SST link.
+//! No allocator, timing change, shared DDB repartition or inferred stop on
+//! GT reset. MIT Linux b90c984d intel_display.c352/503,
+//! intel_ddi.c680/3099/3125. Display 9-11 differ where
+//! `intel_ddi_post_disable_dp` does: the transcoder clock (3-bit field at
+//! bits 31:29) stops before the DDI buffer, and `DP_TP_CTL` is port-based.
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_dp::DpConnection,
@@ -113,7 +116,9 @@ impl<L> Session<L> {
         if self.phase == Phase::Quarantined {
             return Err(FsError::NoDevice);
         }
-        if !io.display_access_ok() || io.gen12_display_family() != Some(self.conn.family) {
+        if !io.display_access_ok()
+            || crate::intel_gpu_aux::SourceFamily::of(io) != Some(self.conn.family)
+        {
             return Err(FsError::NoDevice);
         }
         let old = self.original.ok_or(FsError::NoDevice)?;
@@ -122,8 +127,10 @@ impl<L> Session<L> {
         let conf = trans.conf_base() + 8;
         let func = trans.base() + TRANS_DDI_FUNC_CTL_OFFSET;
         let buf = self.conn.ddi.base();
-        let tp = trans.base() + 0x540;
+        let tp = transport_reg(&self.conn);
         let clk = 0x46140 + self.conn.pipe as u64 * 4;
+        let (clock_mask, _) = clock_field(&self.conn);
+        let pre_tgl = pre_tgl(&self.conn);
         idle_companions(io, &self.conn)?;
         for (register, value) in old.image {
             if read(io, register)? != value {
@@ -134,7 +141,12 @@ impl<L> Session<L> {
         // writes or another owner cannot turn a partial stop into a new grant.
         let plane_off = !matches!(self.phase, Phase::Settling | Phase::Live | Phase::Plane);
         let function_off = matches!(self.phase, Phase::Buffer | Phase::Transport | Phase::Clock);
-        let buffer_off = matches!(self.phase, Phase::Transport | Phase::Clock);
+        let buffer_off = if pre_tgl {
+            self.phase == Phase::Transport
+        } else {
+            matches!(self.phase, Phase::Transport | Phase::Clock)
+        };
+        let clock_off = pre_tgl && matches!(self.phase, Phase::Buffer | Phase::Transport);
         let conf_expected = if plane_off {
             old.conf & !(1 << 31)
         } else {
@@ -154,7 +166,7 @@ impl<L> Session<L> {
             || read(io, buf)? & !(1 << 7)
                 != old.buffer & !(1 << 7) & if buffer_off { !(1 << 31) } else { u32::MAX }
             || read(io, tp)? != old.transport & if buffer_off { !(1 << 31) } else { u32::MAX }
-            || read(io, clk)? != old.clock
+            || read(io, clk)? != old.clock & if clock_off { !clock_mask } else { u32::MAX }
             || conf_value & !(1 << 30) != conf_expected & !(1 << 30)
             || (matches!(
                 self.phase,
@@ -179,8 +191,10 @@ impl<L> Session<L> {
         let conf = trans.conf_base() + 8;
         let func = trans.base() + TRANS_DDI_FUNC_CTL_OFFSET;
         let buf = self.conn.ddi.base();
-        let tp = trans.base() + 0x540;
+        let tp = transport_reg(&self.conn);
         let clk = 0x46140 + self.conn.pipe as u64 * 4;
+        let (clock_mask, _) = clock_field(&self.conn);
+        let pre_tgl = pre_tgl(&self.conn);
         if self.phase == Phase::Settling {
             if live_witness(io, &self.conn, &old)? {
                 self.phase = Phase::Live;
@@ -234,7 +248,8 @@ impl<L> Session<L> {
                     func,
                     old.function & !((1 << 31) | (15 << 27) | (7 << 24)),
                 )?;
-                self.phase = Phase::Buffer;
+                // Display 9-11 stop the transcoder clock before the buffer.
+                self.phase = if pre_tgl { Phase::Clock } else { Phase::Buffer };
             }
             Phase::Buffer => {
                 let value = read(io, buf)?;
@@ -245,7 +260,7 @@ impl<L> Session<L> {
                 if read(io, buf)? & (1 << 31) != 0 {
                     return Err(FsError::NoDevice);
                 }
-                // Gen12 source disables transport/FEC before its idle wait.
+                // The source disables transport/FEC before its idle wait.
                 if read(io, tp)? != old.transport {
                     return Err(FsError::NoDevice);
                 }
@@ -261,21 +276,23 @@ impl<L> Session<L> {
                     }
                     return Ok(false);
                 }
+                if pre_tgl {
+                    final_proof(io, conf, plane, buf, tp)?;
+                    self.phase = Phase::Stopped;
+                    return Ok(true);
+                }
                 self.phase = Phase::Clock;
             }
             Phase::Clock => {
                 if read(io, clk)? != old.clock {
                     return Err(FsError::NoDevice);
                 }
-                checked(io, clk, old.clock & !(15 << 28))?;
-                // Independent final local proof before publication can change.
-                if read(io, conf)? & ((1 << 31) | (1 << 30)) != 0
-                    || read(io, plane)? & (1 << 31) != 0
-                    || read(io, buf)? & ((1 << 31) | (1 << 7)) != (1 << 7)
-                    || read(io, tp)? & (1 << 31) != 0
-                {
-                    return Err(FsError::NoDevice);
+                checked(io, clk, old.clock & !clock_mask)?;
+                if pre_tgl {
+                    self.phase = Phase::Buffer;
+                    return Ok(false);
                 }
+                final_proof(io, conf, plane, buf, tp)?;
                 self.phase = Phase::Stopped;
                 return Ok(true);
             }
@@ -283,6 +300,47 @@ impl<L> Session<L> {
         }
         Ok(false)
     }
+}
+/// Display 9-11 sources (no Gen12 family).
+fn pre_tgl(c: &DpConnection) -> bool {
+    c.family.gen12().is_none()
+}
+/// `DP_TP_CTL`: per transcoder on display 12 (`TGL_DP_TP_CTL`), per port
+/// below it (DDI base + 0x40), as `dp_tp_ctl_reg` picks.
+fn transport_reg(c: &DpConnection) -> u64 {
+    if pre_tgl(c) {
+        c.ddi.base() + 0x40
+    } else {
+        c.pipe.transcoder().base() + 0x540
+    }
+}
+/// `TRANS_CLK_SEL` port field (mask, value for `c.ddi`): display 12's
+/// `TGL_TRANS_CLK_SEL_PORT` at bits 31:28, display 9-11's
+/// `TRANS_CLK_SEL_PORT` at bits 31:29; both encode port + 1.
+fn clock_field(c: &DpConnection) -> (u32, u32) {
+    let port = u32::from(c.ddi as u8) + 1;
+    if pre_tgl(c) {
+        (7 << 29, port << 29)
+    } else {
+        (15 << 28, port << 28)
+    }
+}
+/// Independent final local proof before publication can change.
+fn final_proof(
+    io: &impl MmioWindow,
+    conf: u64,
+    plane: u64,
+    buf: u64,
+    tp: u64,
+) -> Result<(), FsError> {
+    if read(io, conf)? & ((1 << 31) | (1 << 30)) != 0
+        || read(io, plane)? & (1 << 31) != 0
+        || read(io, buf)? & ((1 << 31) | (1 << 7)) != (1 << 7)
+        || read(io, tp)? & (1 << 31) != 0
+    {
+        return Err(FsError::NoDevice);
+    }
+    Ok(())
 }
 fn read(io: &impl MmioWindow, r: u64) -> Result<u32, FsError> {
     if !io.display_access_ok() {
@@ -305,9 +363,15 @@ fn checked(io: &impl MmioWindow, r: u64, v: u32) -> Result<(), FsError> {
 }
 impl Original {
     fn capture(io: &impl MmioWindow, c: &DpConnection, fb: &Framebuffer) -> Result<Self, FsError> {
-        if io.gen12_display_family() != Some(c.family)
-            || c.ddi != crate::intel_gpu_ddi::Ddi::B
-            || c.family == crate::intel_gpu_gt::Gen12Platform::AlderLakeS
+        // The stop proof is the combo-DDI one: B, and Rocket Lake's TC1/TC2
+        // combo ports (DDI D/E); other display-12 DDIs D and up are Type-C.
+        use crate::intel_gpu_ddi::Ddi;
+        let combo = c.ddi == Ddi::B
+            || (c.family.gen12() == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+                && matches!(c.ddi, Ddi::D | Ddi::E));
+        if crate::intel_gpu_aux::SourceFamily::of(io) != Some(c.family)
+            || !combo
+            || c.family.gen12() == Some(crate::intel_gpu_gt::Gen12Platform::AlderLakeS)
             || !matches!(c.pipe, Pipe::A | Pipe::B | Pipe::C)
         {
             return Err(FsError::Unsupported);
@@ -343,7 +407,7 @@ impl Original {
             surf: read(io, plane + 0x1c)?,
             function: read(io, trans.base() + 0x400)?,
             buffer: read(io, c.ddi.base())?,
-            transport: read(io, trans.base() + 0x540)?,
+            transport: read(io, transport_reg(c))?,
             clock: read(io, 0x46140 + c.pipe as u64 * 4)?,
             conf: read(io, trans.conf_base() + 8)?,
             image,
@@ -353,6 +417,15 @@ impl Original {
             crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
             c.trained.lanes,
         );
+        let (route, control) = match c.family.gen12() {
+            Some(family) => (route, crate::intel_gpu_pipes::gen12_xrgb_control(family)),
+            None => (
+                crate::intel_gpu_pipes::with_pre_tgl_port(route, c.ddi as u8),
+                crate::intel_gpu_pipes::PLANE_CTL_ENABLE
+                    | crate::intel_gpu_pipes::PixelFormat::Argb8888.encode_for_plane_ctl(),
+            ),
+        };
+        let (clock_mask, clock_port) = clock_field(c);
         if ![1, 2, 4].contains(&c.trained.lanes)
             || fb.stride_bytes % 64 != 0
             || fb.stride_bytes < u32::from(c.mode.h_active) * 4
@@ -362,7 +435,7 @@ impl Original {
                 != (u32::from(c.mode.v_active) - 1) << 16 | (u32::from(c.mode.h_active) - 1)
             || read(io, trans.base() + 0x1c)?
                 != (u32::from(c.mode.h_active) - 1) << 16 | (u32::from(c.mode.v_active) - 1)
-            || o.ctl != crate::intel_gpu_pipes::gen12_xrgb_control(c.family)
+            || o.ctl != control
             || o.stride != fb.stride_bytes / 64
             || u64::from(o.surf) != fb.phys_addr
             || o.function != route
@@ -374,7 +447,7 @@ impl Original {
             || read(io, plane + 0x40)? != 0
             || read(io, plane + 0x44)? != 0
             || read(io, plane + 0x48)? != 0
-            || o.clock & (15 << 28) != (u32::from(c.ddi as u8) + 1) << 28
+            || o.clock & clock_mask != clock_port
         {
             return Err(FsError::Unsupported);
         }
@@ -392,24 +465,50 @@ fn idle_companions(io: &impl MmioWindow, c: &DpConnection) -> Result<(), FsError
     let base = c.pipe.base();
     if read(io, 0x43208)? & (1 << 31) != 0
         || read(io, base + 0x80)? & 0x27 != 0
-        || read(io, c.pipe.trans_base() + 0x404)? != 0
         || read(io, 0x420c0 + c.pipe as u64 * 4)? & (1 << 23) != 0
     {
         return Err(FsError::Unsupported);
     }
-    for plane in 2..=crate::intel_gpu_pipes::gen12_plane_count(c.family) {
+    use crate::intel_gpu_aux::SourceFamily;
+    // TRANS_DDI_FUNC_CTL2 exists from display 11.
+    if !matches!(c.family, SourceFamily::Gen9 { .. }) && read(io, c.pipe.trans_base() + 0x404)? != 0
+    {
+        return Err(FsError::Unsupported);
+    }
+    // Universal planes per pipe: display 12 per family, display 11's 7,
+    // display 9's 3 on Pipes A/B and 2 on Pipe C.
+    let planes = match c.family {
+        SourceFamily::Gen12(family) => crate::intel_gpu_pipes::gen12_plane_count(family),
+        SourceFamily::Gen11(_) => 7,
+        SourceFamily::Gen9 { .. } if c.pipe == Pipe::C => 2,
+        SourceFamily::Gen9 { .. } => 3,
+    };
+    for plane in 2..=planes {
         if read(io, base + 0x80 + plane * 0x100)? & (1 << 31) != 0 {
             return Err(FsError::Unsupported);
         }
     }
-    for dsb in 0..3u64 {
-        if read(io, base + 0xb08 + dsb * 0x100)? & ((1 << 31) | 1) != 0 {
-            return Err(FsError::Unsupported);
+    // DSB engines exist from display 12.
+    if c.family.gen12().is_some() {
+        for dsb in 0..3u64 {
+            if read(io, base + 0xb08 + dsb * 0x100)? & ((1 << 31) | 1) != 0 {
+                return Err(FsError::Unsupported);
+            }
         }
     }
-    let dss = 0x78000 + c.pipe as u64 * 0x200;
-    if read(io, dss)? & 0xf0f00000 != 0 || read(io, dss + 4)? & 0xc0008000 != 0 {
-        return Err(FsError::Unsupported);
+    // The pipe's DSS (VDSC/joiner) control, from display 11: per pipe on
+    // display 12; on display 11 Pipe A's is the transcoder one at 0x67400
+    // (`dss_ctl1_reg`, `is_pipe_dsc`). Display 9 has none.
+    let dss = match c.family {
+        SourceFamily::Gen12(_) => Some(0x78000 + c.pipe as u64 * 0x200),
+        SourceFamily::Gen11(_) if c.pipe == Pipe::A => Some(0x67400),
+        SourceFamily::Gen11(_) => Some(0x78000 + c.pipe as u64 * 0x200),
+        SourceFamily::Gen9 { .. } => None,
+    };
+    if let Some(dss) = dss {
+        if read(io, dss)? & 0xf0f00000 != 0 || read(io, dss + 4)? & 0xc0008000 != 0 {
+            return Err(FsError::Unsupported);
+        }
     }
     Ok(())
 }

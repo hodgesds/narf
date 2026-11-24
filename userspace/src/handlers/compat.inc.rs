@@ -10438,6 +10438,27 @@ pub fn timer_tick_raise_due_signals() {
     crate::posix_timer::itimer_cpu_tick();
 }
 
+/// The freezer's freeze point for a task interrupted in user mode: Linux's
+/// exit-to-user path, where the freezer's fake signal reaches `get_signal`
+/// and `try_to_freeze`. Each arch's IRQ tail calls this on a user-mode timer
+/// tick, after EOI, interrupt accounting (and on aarch64 the RCU IRQ section)
+/// and the tick's own preemption, on the task's own kernel stack: the state a
+/// preemption switches from. [`refrigerator`](crate::user_task::refrigerator)
+/// parks the task there until the thaw, and the tail then returns to the
+/// interrupted instruction. One atomic load outside a freeze.
+///
+/// Own-stack model only. The legacy model's tick yield
+/// ([`timer_preempt_user_task`]) returns the task to the executor, whose
+/// poll gate freezes it.
+pub fn freeze_on_user_tick() {
+    if !narf_power::freezer::freezing() || !narf_scheduler::stackful::user_own_stack_enabled() {
+        return;
+    }
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        crate::user_task::refrigerator(uctx);
+    }
+}
+
 /// Preemptive time-slice: hand a CPU-bound user task back to the
 /// cooperative executor from the timer ISR so sibling tasks make
 /// progress instead of being monopolized. Mirrors `sys_yield`'s

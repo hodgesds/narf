@@ -767,6 +767,7 @@ pub mod dp_edid;
 pub mod dp_link_training;
 pub mod dp_mst;
 pub mod dp_mst_mgr;
+pub mod dp_pcon;
 pub mod drm;
 pub mod drm_devfs_bridge;
 pub mod drm_dsc;
@@ -918,6 +919,10 @@ mod intel_gpu_hwmon;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_kms;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_legacy_gt;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_legacy_owner;
+#[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_lt_phy;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_media;
@@ -963,6 +968,8 @@ pub mod intel_gpu_rcs;
 pub mod intel_gpu_regions;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_render;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_renderstate;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_reset_policy;
 #[cfg(feature = "intel")]

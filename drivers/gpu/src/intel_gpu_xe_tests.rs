@@ -1409,13 +1409,14 @@ fn smoke_xe_igpu_wc_objects_scanout_noncoherent_binds_and_restore() -> TestResul
     assert_eq!(view.memory_type, narf_memory::MemoryType::WriteCombining);
     assert_eq!(view.frames, pages);
     drop(view);
-    // xe_vm_bind_ioctl_validate_bo: XE_COH_NONE needs a non-WB object. PAT0 is
-    // left to firmware and refused; a missing handle is ENOENT first.
+    // xe_vm_bind_ioctl_validate_bo: XE_COH_NONE (xelpg PAT0 WB, PAT1 WT,
+    // PAT2 UC) needs a non-WB object; xelpg has five entries; a missing
+    // handle is ENOENT first.
     let vm = create_vm(&file, &info, &user);
     for (handle, pat, expected) in [
+        (wb, 0, Err(FsError::InvalidData)),
         (wb, 1, Err(FsError::InvalidData)),
         (wb, 2, Err(FsError::InvalidData)),
-        (wc, 0, Err(FsError::InvalidData)),
         (wc, 5, Err(FsError::InvalidData)),
         (0x7fff_0000, 1, Err(FsError::NotFound)),
     ] {
@@ -1427,7 +1428,7 @@ fn smoke_xe_igpu_wc_objects_scanout_noncoherent_binds_and_restore() -> TestResul
         );
         assert_eq!(bind_now(&file, &info, &user), expected, "pat {pat}");
     }
-    for (va, pat) in [(0x6000_0000, 2), (0x7000_0000, 3)] {
+    for (va, pat) in [(0x6000_0000, 2), (0x7000_0000, 3), (0x8000_0000, 0)] {
         bind_wire(&user, vm, &[mapping(wc, va, 0, 8192, pat, 0)], &[]);
         assert_eq!(bind_now(&file, &info, &user), Ok(0));
     }
@@ -1493,6 +1494,128 @@ fn smoke_xe_igpu_wc_objects_scanout_noncoherent_binds_and_restore() -> TestResul
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_xe_igpu_wc_objects_scanout_noncoherent_binds_and_restore
+);
+
+/// Completes every flat-CCS clear at once and counts them.
+#[derive(Debug)]
+struct CcsBackend {
+    platform: GtPlatform,
+    clears: core::sync::atomic::AtomicU32,
+}
+impl UserBackend for CcsBackend {
+    fn status(&self) -> Option<UserStatus> {
+        Some(UserStatus {
+            epoch: 7,
+            platform: self.platform,
+            submission_version: (1, 0, 0),
+            engines: crate::intel_gpu_engine::EngineSet::of(&[]),
+        })
+    }
+    fn native_xe(&self) -> bool {
+        true
+    }
+    fn submit<'a>(
+        &'a self,
+        _: Arc<UserContext>,
+        _: UserBatch,
+    ) -> FsFuture<'a, Arc<CompletionFence>> {
+        Box::pin(async { Err(FsError::NoDevice) })
+    }
+    fn clear_system_ccs(
+        &self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+    ) -> FsFuture<'_, Option<Arc<CompletionFence>>> {
+        Box::pin(async move {
+            if epoch != 7 || object.is_vram() {
+                return Err(FsError::NoDevice);
+            }
+            self.clears
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            let fence = Arc::new(CompletionFence::new());
+            fence.signal(Ok(()));
+            Ok(Some(fence))
+        })
+    }
+}
+
+/// Xe2 compressed PATs on the iGPU: an object's first compressed bind zeroes
+/// its flat-CCS metadata once; uncompressed binds never do; NO_COMPRESSION
+/// objects and USERPTR refuse compressed indices; reserved indices are
+/// EINVAL.
+fn smoke_xe2_compressed_binds_clear_flat_ccs_once() -> TestResult {
+    use core::sync::atomic::Ordering;
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
+    let backend = Arc::new(CcsBackend {
+        platform,
+        clears: core::sync::atomic::AtomicU32::new(0),
+    });
+    let info = DeviceInfo {
+        device_id: 0x6420,
+        platform,
+        memory_bytes: 0x8000_0000,
+        hwconfig: None,
+        topology: None,
+        vram: None,
+        backend: Some(backend.clone()),
+    };
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    // The clear batch: 4 MiB passes of XY_CTRL_SURF_COPY_BLT from direct zero
+    // storage into the object's indirect CCS, then MI_FLUSH_DW_CCS.
+    let words = crate::intel_gpu_exec::vram_clear::system_ccs_clear_words(9 << 20);
+    assert_eq!(words.len(), 3 * 5 + 5 + 1 + 1);
+    assert_eq!(words[0], 0x5227_fe03);
+    assert_eq!(words[2] >> 28, 3);
+    assert_eq!(words[5], 0x5227_fe03);
+    assert_eq!(words[10], 0x5221_fe03);
+    assert_eq!(
+        (u64::from(words[14]) << 32 | u64::from(words[13])) & !(0xf << 60),
+        0x2345_0080_0000
+    );
+    assert_eq!(&words[15..], &[0x1301_0003, 0, 0, 0, 0, 0x0500_0000, 0]);
+    // Refused off the integrated Xe2/Xe3 parts.
+    let object = crate::intel_gpu_gem::GemObject::private_system(4096).unwrap();
+    assert!(crate::intel_gpu_exec::prepare_system_ccs_clear(GtPlatform::Battlemage, object)
+        .is_err());
+    let vm = create_vm(&file, &info, &user);
+    let wb = create_placed(&file, &info, &user, 8192, 1, 0, 1).unwrap();
+    if !cfg!(target_arch = "x86_64") {
+        // Only x86_64 retypes kernel RAM aliases, so no WC object exists.
+        assert_eq!(
+            create_placed(&file, &info, &user, 8192, 1, 0, 2),
+            Err(FsError::NotImplemented)
+        );
+        return TestResult::Pass;
+    }
+    let wc = create_placed(&file, &info, &user, 8192, 1, 0, 2).unwrap();
+    let plain = create_placed(&file, &info, &user, 8192, 1, 8, 2).unwrap();
+    let bind = |object, va, pat| {
+        bind_wire(&user, vm, &[mapping(object, va, 0, 8192, pat, 0)], &[]);
+        bind_now(&file, &info, &user)
+    };
+    // PAT6 (Mesa's scanout index, XE_COH_NONE) on the WC object, PAT2 on WB.
+    assert_eq!(bind(wc, 0x10_0000, 6), Ok(0));
+    assert_eq!(bind(wb, 0x18_0000, 2), Ok(0));
+    assert_eq!(backend.clears.load(Ordering::Acquire), 0);
+    for va in [0x20_0000, 0x30_0000] {
+        assert_eq!(bind(wc, va, 9), Ok(0));
+    }
+    assert_eq!(bind(wc, 0x38_0000, 11), Ok(0));
+    assert_eq!(backend.clears.load(Ordering::Acquire), 1);
+    // Compressed indices are XE_COH_NONE: never on a WB object.
+    assert_eq!(bind(wb, 0x3c_0000, 12), Err(FsError::InvalidData));
+    assert_eq!(bind(plain, 0x40_0000, 11), Err(FsError::InvalidData));
+    assert_eq!(bind(plain, 0x40_0000, 3), Ok(0));
+    for pat in [16, 19, 32] {
+        assert_eq!(bind(wc, 0x50_0000, pat), Err(FsError::InvalidData));
+    }
+    assert_eq!(backend.clears.load(Ordering::Acquire), 1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_xe2_compressed_binds_clear_flat_ccs_once
 );
 
 fn smoke_xe_vm_slices_nulls_private_objects_and_transactions() -> TestResult {
@@ -1888,13 +2011,20 @@ fn smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion() -
         assert!(gt.vram_layout().is_none());
         {
             let d = w.0.borrow();
+            // All of xe2_pat_table (PAT0, PAT6 scanout, PAT9 compressed,
+            // PAT31 CLOS3 two-way) and PAT_ATS.
             for (reg, value) in [
+                (0x4800, 0xc),
                 (0x4804, 0xe),
                 (0x4808, 0xf),
                 (0x480c, 0x3c),
                 (0x4810, 0x32),
                 (0x4814, 0x3e),
+                (0x4818, 0x41c),
                 (0x481c, 0x33),
+                (0x484c, 0x20c),
+                (0x48a4, 0xcf),
+                (0x47fc, 0xf),
             ] {
                 assert_eq!(d.regs[&reg], value);
             }
@@ -1974,12 +2104,22 @@ fn smoke_lnl_native_xe_all_physical_engines_private_vm_cancel_and_completion() -
                 Ok(0)
             );
         }
-        // LNL exposes only programmed noncompressed coherent policies.
-        for pat in [0, 3, 6, 8, 15, 16, 31] {
+        // LNL programs all of xe2_pat_table: coherent entries bind any
+        // object, XE_COH_NONE ones only non-WB objects; 16..19 are reserved.
+        for pat in [0, 3, 6, 8, 15, 16, 19, 32] {
             assert!(!crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
         }
-        for pat in [1, 2, 4, 5, 7] {
+        for pat in [1, 2, 4, 5, 7, 22, 31] {
             assert!(crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
+        }
+        for pat in [0, 3, 6, 9, 11, 12, 28] {
+            assert!(crate::intel_gpu_xe_vm::pat_noncoherent(platform, pat));
+        }
+        for pat in 0..32 {
+            assert_eq!(
+                crate::intel_gpu_xe_vm::pat_compressed(platform, pat),
+                matches!(pat, 9..=12 | 14 | 15 | 21 | 25 | 29)
+            );
         }
         hardware_stop(&mut gt, &w, 0xdfc);
         drop(gt);
@@ -2175,13 +2315,14 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
             let query_file = RenderFile::new();
             let query_user = Cpu::new();
             let config = xe_query(&query_file, &info, &query_user, 2);
-            assert_eq!(u64_at(&config, 16), 2); // low latency only; no VRAM/USM/compression
-            for flags in [2, 8] {
-                assert_eq!(
-                    create_placed(&query_file, &info, &query_user, 4096, 1, flags, 1),
-                    Err(FsError::InvalidData)
-                );
-            }
+            // Low latency and, as on every graphics 20+ part, the
+            // NO_COMPRESSION hint; no VRAM/USM.
+            assert_eq!(u64_at(&config, 16), 10);
+            assert_eq!(
+                create_placed(&query_file, &info, &query_user, 4096, 1, 2, 1),
+                Err(FsError::InvalidData)
+            );
+            assert!(create_placed(&query_file, &info, &query_user, 4096, 1, 8, 1).is_ok());
             assert_eq!(
                 create_placed(&query_file, &info, &query_user, 4096, 2, 0, 1),
                 Err(FsError::InvalidData)
@@ -2255,13 +2396,15 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                     Ok(0)
                 );
             }
-            // These integrated GTs expose the programmed coherent PAT entries.
-            for pat in [0, 3, 6, 8, 15, 16, 31] {
+            // xe3_lpg_pat_table: Xe2's entries plus 16, compressed and
+            // one-way coherent; 17..19 are reserved.
+            for pat in [0, 3, 6, 8, 15, 17, 19, 32] {
                 assert!(!crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
             }
-            for pat in [1, 2, 4, 5, 7] {
+            for pat in [1, 2, 4, 5, 7, 16, 31] {
                 assert!(crate::intel_gpu_xe_vm::pat_allowed(platform, pat));
             }
+            assert!(crate::intel_gpu_xe_vm::pat_compressed(platform, 16));
             hardware_stop(&mut gt, &w, 0xdfc);
             drop(gt);
             assert_eq!(arena.live_allocations(), 0);

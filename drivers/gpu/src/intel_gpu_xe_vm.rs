@@ -278,39 +278,77 @@ pub(crate) struct Bind {
     pub prefetch_region: u32,
 }
 
-/// PAT indices coherent with CPU caches that this driver programs.
-pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
+/// One programmed PAT index (xe_pat.c): whether it snoops CPU caches
+/// (`coh_mode` at least one-way) and whether it compresses through flat CCS
+/// (`XE2_COMP_EN`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PatEntry {
+    pub coherent: bool,
+    pub compressed: bool,
+}
+
+/// The PAT table the GT owner programs, indexed as userspace names it.
+/// `None` for an index past `n_entries` or a hardware-reserved one, which
+/// Linux refuses (`vm_bind_ioctl_check_args`). Gen9/Gen11 bind through the
+/// i915 node, never this table.
+pub(crate) fn pat_entry(platform: GtPlatform, pat: u16) -> Option<PatEntry> {
+    let plain = |coherent| {
+        Some(PatEntry {
+            coherent,
+            compressed: false,
+        })
+    };
     match platform {
-        GtPlatform::ArcticSoundM | GtPlatform::Alchemist | GtPlatform::Gen12(_) => pat == 0,
-        // Gen11: no PAT index is admitted until Lane 2 models the
-        // legacy PPAT table. Refuse all binds that name one.
-        GtPlatform::Gen11(_) => false,
-        // Gen9: no PAT index is admitted until Lane 2 models the
-        // legacy PPAT table. Refuse all binds that name one — the
-        // Gen9 GGTT has no PAT bits (`gen8_ggtt_pte_encode`).
-        GtPlatform::Gen9(_) => false,
-        _ if platform.is_xe2() => matches!(pat, 1 | 2 | 4 | 5 | 7),
-        GtPlatform::Battlemage => unreachable!("Xe2 handled above"),
-        GtPlatform::WildcatLake => matches!(pat, 1 | 2 | 4 | 5 | 7),
-        GtPlatform::NovaLakeS => matches!(pat, 1 | 2 | 4 | 5 | 7),
-        GtPlatform::Integrated(_) => matches!(pat, 3 | 4),
+        // xelp_pat_table: PAT0 WB (at least one-way), PAT1 WC, PAT2 WT,
+        // PAT3 UC.
+        GtPlatform::ArcticSoundM | GtPlatform::Alchemist | GtPlatform::Gen12(_) => match pat {
+            0 => plain(true),
+            1..=3 => plain(false),
+            _ => None,
+        },
+        GtPlatform::Gen11(_) | GtPlatform::Gen9(_) => None,
+        _ if platform.is_xe2() => {
+            let value = crate::intel_gpu_gt_hw::xe2_pat_value(platform, pat)?;
+            Some(PatEntry {
+                coherent: value & crate::intel_gpu_gt_hw::XE2_COH_MODE != 0,
+                compressed: value & crate::intel_gpu_gt_hw::XE2_COMP_EN != 0,
+            })
+        }
+        GtPlatform::Battlemage | GtPlatform::WildcatLake | GtPlatform::NovaLakeS => {
+            unreachable!("Xe2 handled above")
+        }
+        // xelpg_pat_table: the coherency mode is the entry's low two bits.
+        GtPlatform::Integrated(_) => crate::intel_gpu_gt::media::XELPG_PAT
+            .get(usize::from(pat))
+            .and_then(|value| plain(value & 3 != 0)),
     }
 }
 
-/// Programmed XE_COH_NONE indices: Gen12 PAT1/2/3 (WC/WT/UC), and
-/// Xe-LPG PAT1 (WT) and PAT2 (UC). Linux
-/// also admits PAT0, whose definition this driver leaves to firmware for the
-/// inherited display, so it stays refused.
+/// PAT indices coherent with CPU caches, admitted for any object.
+pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
+    pat_entry(platform, pat).is_some_and(|entry| entry.coherent)
+}
+
+/// XE_COH_NONE indices, admitted only for objects created without
+/// write-back CPU caching (`xe_vm_bind_ioctl_validate_bo`).
 pub(crate) fn pat_noncoherent(platform: GtPlatform, pat: u16) -> bool {
-    match platform {
-        GtPlatform::Gen12(_) => matches!(pat, 1..=3),
-        _ if platform.is_headless_integrated() => pat == 3, // noncompressed UC, xe_pat.c
-        GtPlatform::Integrated(_) => matches!(pat, 1 | 2),
-        _ => false,
-    }
+    pat_entry(platform, pat).is_some_and(|entry| !entry.coherent)
+}
+
+/// Indices that compress through flat CCS (Xe2/Xe3 only).
+pub(crate) fn pat_compressed(platform: GtPlatform, pat: u16) -> bool {
+    pat_entry(platform, pat).is_some_and(|entry| entry.compressed)
 }
 
 impl Bind {
+    /// The object a MAP names through a compressed PAT index.
+    pub(crate) fn compressed_object(&self, platform: GtPlatform) -> Option<Arc<GemObject>> {
+        self.mapping
+            .as_ref()
+            .filter(|mapping| pat_compressed(platform, u16::from(mapping.pat)))
+            .and_then(|mapping| mapping.object.clone())
+    }
+
     pub fn read(
         wire: &[u8],
         vm: &Vm,
@@ -372,8 +410,13 @@ impl Bind {
         if op == 2 {
             // DRM_XE_VM_BIND_OP_MAP_USERPTR (vm_bind_ioctl_check_args): no
             // object, not NULL, a coherent uncompressed PAT and an aligned
-            // address. Every admitted PAT is coherent and uncompressed.
-            if object != 0 || flags & 4 != 0 || !pat_allowed(platform, pat) || offset % 4096 != 0 {
+            // address.
+            if object != 0
+                || flags & 4 != 0
+                || !pat_allowed(platform, pat)
+                || pat_compressed(platform, pat)
+                || offset % 4096 != 0
+            {
                 return Err(FsError::InvalidData);
             }
             return Ok(Self {
@@ -420,16 +463,16 @@ impl Bind {
             return Err(FsError::InvalidData);
         }
         let null = flags & 4 != 0;
+        let entry = pat_entry(platform, pat);
         let object_arc = if null {
-            if object != 0 || offset != 0 || flags & 1 != 0 || pat > 15 {
+            if object != 0 || offset != 0 || flags & 1 != 0 || entry.is_none() {
                 return Err(FsError::InvalidData);
             }
             None
         } else {
-            let noncoherent = pat_noncoherent(platform, pat);
-            if !(pat_allowed(platform, pat) || noncoherent) || offset % 4096 != 0 {
+            let Some(entry) = entry.filter(|_| offset % 4096 == 0) else {
                 return Err(FsError::InvalidData);
-            }
+            };
             let object = gem.object(object)?;
             if object.is_vram()
                 && object.vram_page_size() == 65536
@@ -438,8 +481,10 @@ impl Bind {
                 return Err(FsError::InvalidData);
             }
             // xe_vm_bind_ioctl_validate_bo: XE_COH_NONE on a WB object would
-            // let the GPU miss dirty CPU lines (or the CPU miss GPU writes).
-            if (noncoherent && !object.is_wc())
+            // let the GPU miss dirty CPU lines (or the CPU miss GPU writes),
+            // and a NO_COMPRESSION object takes no compressed index.
+            if (!entry.coherent && object.cpu_caching_wb())
+                || (entry.compressed && object.no_compression())
                 || object.vm_owner().is_some_and(|owner| owner != vm.identity)
                 || offset
                     .checked_add(length)

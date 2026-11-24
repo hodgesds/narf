@@ -51,6 +51,7 @@ fn external(pipe: Pipe) -> ExternalPipe {
         combo_phy: Some(1),
         dsc: None,
         pipe_bpp: 24,
+        scaler: None,
     }
 }
 

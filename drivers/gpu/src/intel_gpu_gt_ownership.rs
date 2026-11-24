@@ -38,6 +38,7 @@ impl Bar {
 enum Owner {
     Legacy,
     GuC,
+    Execlists,
 }
 #[derive(Debug)]
 struct Entry {
@@ -77,6 +78,14 @@ impl Registry {
         Ok(LegacyLease { function, bar: key })
     }
     fn guc(&mut self, function: BusAddr, bar: MmioRegion) -> Result<(), ClaimError> {
+        self.exclusive(function, bar, Owner::GuC)
+    }
+    fn exclusive(
+        &mut self,
+        function: BusAddr,
+        bar: MmioRegion,
+        owner: Owner,
+    ) -> Result<(), ClaimError> {
         if !matches!(function, BusAddr::Pcie(_)) {
             return Err(ClaimError::Invalid);
         }
@@ -92,7 +101,7 @@ impl Registry {
         self.0.push(Entry {
             function,
             bar: key,
-            owner: Owner::GuC,
+            owner,
         });
         Ok(())
     }
@@ -124,6 +133,12 @@ pub(crate) fn claim_legacy(function: BusAddr, bar: MmioRegion) -> Result<LegacyL
 /// A failed owner keeps this claim: reset cannot make legacy state coexist.
 pub(crate) fn claim_guc(function: BusAddr, bar: MmioRegion) -> Result<(), ClaimError> {
     OWNERS.lock().guc(function, bar)
+}
+
+/// The Gen9/Gen11 execlists owner: exclusive like the GuC owner, so neither
+/// the GuC owner nor the legacy kernel-batch glue can attach beside it.
+pub(crate) fn claim_execlists(function: BusAddr, bar: MmioRegion) -> Result<(), ClaimError> {
+    OWNERS.lock().exclusive(function, bar, Owner::Execlists)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

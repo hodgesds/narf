@@ -1341,6 +1341,7 @@ fn smoke_xelpg_resources_bigjoiner_and_panel_fitter_allocation() -> TestResult {
             hscale: 0x10000,
             vscale: 0x10000,
             filter: crate::intel_gpu_xelpg_scaler::Filter::Default,
+            mode: 0,
         });
     }
     if compute(&request, &latency()).is_err() {
@@ -1360,6 +1361,7 @@ fn smoke_xelpg_resources_bigjoiner_and_panel_fitter_allocation() -> TestResult {
             hscale: 0x10000,
             vscale: 0x10000,
             filter: crate::intel_gpu_xelpg_scaler::Filter::Default,
+            mode: 0,
         });
     }
     if compute(&request, &latency()) != Err(ResourceError::Unsupported) {

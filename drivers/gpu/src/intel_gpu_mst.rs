@@ -46,6 +46,11 @@
 //!   program only their own pipe/transcoder — per-stream M/N
 //!   against the trained link — and never retrain.
 //!
+//! The link binds its source family (`SourceFamily::of`: Gen12, Gen11 or
+//! Gen9) at its first connect and hands it to every stream's modeset, which
+//! takes that family's DPLL, PHY, port-based or per-transcoder `DP_TP_CTL`
+//! and port-select branches. A window reporting another family refuses.
+//!
 //! ## Failure discipline
 //!
 //! - Bandwidth is checked *locally before any allocation
@@ -83,9 +88,9 @@ use crate::dp_aux::AuxError;
 use crate::dp_link_training::{negotiate, DpcdCaps, TrainedLink};
 use crate::dp_mst;
 use crate::dp_mst_mgr::{Manager, MstError as MgrError, Sink, Topology};
-use crate::intel_gpu_aux::{IntelAux, MmioWindow};
+use crate::intel_gpu_aux::{IntelAux, MmioWindow, SourceFamily};
 use crate::intel_gpu_ddi::Ddi;
-use crate::intel_gpu_dp::{mode_from_edid, DpError, INTEL_SOURCE_CAPS};
+use crate::intel_gpu_dp::{mode_from_edid, DpError};
 use crate::intel_gpu_modeset::{Framebuffer, LinkPlan, Mode, Modeset, ModesetError};
 use crate::intel_gpu_pipes::Pipe;
 
@@ -285,7 +290,7 @@ pub enum MstEvent {
 #[derive(Debug)]
 pub struct MstLink {
     ddi: Ddi,
-    family: Option<crate::intel_gpu_gt::Gen12Platform>,
+    family: Option<SourceFamily>,
     mgr: Manager,
     caps: Option<DpcdCaps>,
     topology: Option<Topology>,
@@ -316,16 +321,14 @@ impl MstLink {
         self.ddi
     }
 
-    pub fn family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+    /// The source family the link bound at its first connect.
+    pub fn family(&self) -> Option<SourceFamily> {
         self.family
     }
 
-    fn check_family(
-        &self,
-        mmio: &(impl MmioWindow + ?Sized),
-    ) -> Result<crate::intel_gpu_gt::Gen12Platform, MstError> {
+    fn check_family(&self, mmio: &(impl MmioWindow + ?Sized)) -> Result<SourceFamily, MstError> {
         let family = self.family.ok_or(MstError::NotConnected)?;
-        if mmio.gen12_display_family() != Some(family) {
+        if SourceFamily::of(mmio) != Some(family) {
             return Err(MstError::Modeset(ModesetError::UnsupportedGeneration));
         }
         Ok(family)
@@ -365,9 +368,8 @@ impl MstLink {
         caps: DpcdCaps,
         raw_caps: &[u8; 16],
     ) -> Result<(), MstError> {
-        let family = mmio
-            .gen12_display_family()
-            .ok_or(MstError::Modeset(ModesetError::UnsupportedGeneration))?;
+        let family =
+            SourceFamily::of(mmio).ok_or(MstError::Modeset(ModesetError::UnsupportedGeneration))?;
         if self.family.is_some_and(|old| old != family) {
             return Err(MstError::Modeset(ModesetError::UnsupportedGeneration));
         }
@@ -527,7 +529,8 @@ impl MstLink {
             // `lane_count = limits->max_lane_count`,
             // `port_clock = limits->max_rate`). An unbounded
             // demand walks `negotiate` to that ceiling.
-            let negotiated = negotiate(&INTEL_SOURCE_CAPS, &caps, u64::MAX);
+            let source = crate::intel_gpu_dp::source_caps(Some(family), self.ddi);
+            let negotiated = negotiate(&source, &caps, u64::MAX);
             Some(LinkPlan {
                 rate: negotiated.rate,
                 lanes: negotiated.lanes,
@@ -571,10 +574,12 @@ impl MstLink {
         // mode from the start); a secondary stream programs
         // only its own pipe from the trained configuration.
         let mut modeset = Modeset::for_pipe(mmio, self.ddi, pipe);
-        modeset.set_gen12_family(family);
+        modeset.set_source_family(family);
         if let Some((start, end)) = dbuf_share {
             modeset.set_dbuf_share(start, end);
         }
+        // A secondary stream's pipe lights beside the primary's.
+        modeset.set_shared_cdclk(dbuf_share.is_some() || !primary);
         let trained_now = if primary {
             let (.., trained) = modeset.modeset_mst_primary(fb, &mode, plan.unwrap())?;
             Some(trained)
@@ -668,7 +673,7 @@ impl MstLink {
             return;
         };
         let mut modeset = Modeset::for_pipe(mmio, self.ddi, pipe);
-        modeset.set_gen12_family(family);
+        modeset.set_source_family(family);
         if self.streams.is_empty() {
             modeset.teardown();
             self.trained = None;
@@ -756,7 +761,7 @@ impl MstLink {
         // and the trained state down with it; any other stream
         // leaves the link running for its survivors.
         let mut modeset = Modeset::for_pipe(mmio, self.ddi, stream.pipe);
-        modeset.set_gen12_family(family);
+        modeset.set_source_family(family);
         if self.streams.len() == 1 {
             modeset.try_teardown()?;
             self.trained = None;
@@ -1695,7 +1700,7 @@ pub mod tests {
 
     #[derive(Debug)]
     struct HubMmio {
-        family: RefCell<Option<crate::intel_gpu_gt::Gen12Platform>>,
+        family: RefCell<Option<SourceFamily>>,
         /// Tiger Lake UY (GT2) part: when true the window
         /// reports `tgl_uy`, so a `Modeset` built over it
         /// selects the UY HBR2 table. Default false.
@@ -1707,12 +1712,20 @@ pub mod tests {
         aux_reply: RefCell<Vec<u8>>,
         aux_data: RefCell<[u8; 20]>,
         aux_ctl_state: RefCell<u32>,
+        /// The pcode mailbox and its two data dwords: CDCLK notifies and
+        /// frequency requests complete (the primary stream's CDCLK
+        /// program then leaves a known clock for later streams); other
+        /// commands answer ILLEGAL_CMD.
+        pcode_mailbox: RefCell<u32>,
+        pcode_data: RefCell<[u32; 2]>,
     }
 
     impl HubMmio {
         fn new(hub: Hub) -> Self {
             Self {
-                family: RefCell::new(Some(crate::intel_gpu_gt::Gen12Platform::TigerLake)),
+                family: RefCell::new(Some(SourceFamily::Gen12(
+                    crate::intel_gpu_gt::Gen12Platform::TigerLake,
+                ))),
                 tgl_uy: RefCell::new(false),
                 regs: RefCell::new(BTreeMap::new()),
                 writes: RefCell::new(Vec::new()),
@@ -1721,7 +1734,30 @@ pub mod tests {
                 aux_reply: RefCell::new(Vec::new()),
                 aux_data: RefCell::new([0u8; 20]),
                 aux_ctl_state: RefCell::new(0),
+                pcode_mailbox: RefCell::new(0),
+                pcode_data: RefCell::new([0; 2]),
             }
+        }
+
+        fn pcode_execute(&self, cmd_word: u32) {
+            use crate::intel_gpu_pcode::{
+                PCODE_CMD_CDCLK_CONTROL, PCODE_CMD_DE_WRITE_FREQ_REQ, SKL_CDCLK_PREPARE_FOR_CHANGE,
+                SKL_CDCLK_READY_FOR_CHANGE,
+            };
+            let status = match cmd_word & 0xFF {
+                PCODE_CMD_DE_WRITE_FREQ_REQ => 0,
+                PCODE_CMD_CDCLK_CONTROL => {
+                    let mut data = self.pcode_data.borrow_mut();
+                    data[0] = if data[0] == SKL_CDCLK_PREPARE_FOR_CHANGE {
+                        SKL_CDCLK_READY_FOR_CHANGE
+                    } else {
+                        0
+                    };
+                    0
+                }
+                _ => 0x1,
+            };
+            *self.pcode_mailbox.borrow_mut() = status;
         }
 
         fn stored(&self, off: u64) -> u32 {
@@ -1760,14 +1796,38 @@ pub mod tests {
 
     impl MmioWindow for HubMmio {
         fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
-            *self.family.borrow()
+            self.family.borrow().and_then(SourceFamily::gen12)
+        }
+        fn gen11_display_platform(&self) -> Option<crate::intel_gpu_gt::Gen11Platform> {
+            match *self.family.borrow() {
+                Some(SourceFamily::Gen11(platform)) => Some(platform),
+                _ => None,
+            }
+        }
+        fn gen9_display_platform(
+            &self,
+        ) -> Option<(
+            crate::intel_gpu_gt::Gen9Platform,
+            crate::intel_gpu_gen9_ddi::SkuFamily,
+        )> {
+            match *self.family.borrow() {
+                Some(SourceFamily::Gen9 { platform, sku }) => Some((platform, sku)),
+                _ => None,
+            }
         }
         fn tgl_uy(&self) -> bool {
             *self.tgl_uy.borrow()
         }
         fn read32(&self, off: u64) -> u32 {
+            use crate::intel_gpu_pcode::{PCODE_DATA0, PCODE_DATA1, PCODE_MAILBOX};
             if off == self.aux_ctl_off() {
                 return *self.aux_ctl_state.borrow();
+            }
+            match off {
+                o if o == PCODE_MAILBOX => return *self.pcode_mailbox.borrow(),
+                o if o == PCODE_DATA0 => return self.pcode_data.borrow()[0],
+                o if o == PCODE_DATA1 => return self.pcode_data.borrow()[1],
+                _ => {}
             }
             if let Some(idx) = self.is_aux_data(off) {
                 let reply = self.aux_reply.borrow();
@@ -1782,7 +1842,26 @@ pub mod tests {
             if off == PWR_WELL_CTL2 {
                 return v | ((v & 0xAAAA_AAAA) >> 1);
             }
-            if (0x4_6010..=0x4_6018).contains(&off) && (off - 0x4_6010) % 4 == 0 {
+            if off == crate::intel_gpu_gen9_dpll::DPLL_STATUS {
+                // Gen9: SKL DPLL lock follows each DPLL's CTL
+                // ENABLE (`skl_ddi_pll_enable` polls this).
+                use crate::intel_gpu_gen9_dpll::{ctl_reg, dpll_lock_bit, SklDpllId, PLL_ENABLE};
+                return [
+                    SklDpllId::Dpll0,
+                    SklDpllId::Dpll1,
+                    SklDpllId::Dpll2,
+                    SklDpllId::Dpll3,
+                ]
+                .into_iter()
+                .filter(|id| self.stored(ctl_reg(*id)) & PLL_ENABLE != 0)
+                .fold(0, |v, id| v | dpll_lock_bit(id));
+            }
+            if off == crate::intel_gpu_gen12_cdclk::DE_PLL_ENABLE {
+                // The CDCLK PLL locks once enabled.
+                let lock = if v & PLL_ENABLE != 0 { PLL_LOCK } else { 0 };
+                return (v & !PLL_LOCK) | lock;
+            }
+            if (0x4_6010..=0x4_603C).contains(&off) && (off - 0x4_6010) % 4 == 0 {
                 // Same derived-bits shape as `SinkMmio`: LOCK
                 // follows ENABLE, POWER_STATE follows
                 // POWER_ENABLE. An unconditional OR can never
@@ -1830,8 +1909,21 @@ pub mod tests {
         }
 
         fn write32(&self, off: u64, val: u32) {
+            use crate::intel_gpu_pcode::{PCODE_DATA0, PCODE_DATA1, PCODE_MAILBOX, PCODE_READY};
             self.writes.borrow_mut().push((off, val));
             self.regs.borrow_mut().insert(off, val);
+            match off {
+                o if o == PCODE_DATA0 => self.pcode_data.borrow_mut()[0] = val,
+                o if o == PCODE_DATA1 => self.pcode_data.borrow_mut()[1] = val,
+                o if o == PCODE_MAILBOX => {
+                    if val & PCODE_READY != 0 {
+                        self.pcode_execute(val);
+                    } else {
+                        *self.pcode_mailbox.borrow_mut() = val;
+                    }
+                }
+                _ => {}
+            }
             if let Some(idx) = self.is_aux_data(off) {
                 let mut data = self.aux_data.borrow_mut();
                 for b in 0..4 {
@@ -2550,24 +2642,26 @@ pub mod tests {
             (Gen12Platform::AlderLakeN, 0x94000000),
         ] {
             let mut fx = Fixture::new(two_level_hub());
-            *fx.mmio.family.borrow_mut() = Some(family);
+            *fx.mmio.family.borrow_mut() = Some(SourceFamily::Gen12(family));
             fx.connect_and_probe().unwrap();
             let s1 = Sink { branch: 0, port: 1 };
             let s2 = Sink { branch: 1, port: 1 };
             let (phys, stride) = fb_1080p(0x3000000);
             fx.add(s1, Pipe::B, phys, stride).unwrap();
             fx.add(s2, Pipe::C, 0x5000000, 10240).unwrap();
-            assert_eq!(fx.link.family(), Some(family));
+            assert_eq!(fx.link.family(), Some(SourceFamily::Gen12(family)));
             assert_eq!(fx.mmio.writes_to(0x71180).last(), Some(&expected));
             assert_eq!(fx.mmio.writes_to(0x72180).last(), Some(&expected));
             let mode = fx.mode_of(s1).unwrap();
             let before = fx.mmio.writes.borrow().len();
             let available = fx.link.available_pbn(s1);
-            *fx.mmio.family.borrow_mut() = Some(if family == Gen12Platform::AlderLakeP {
-                Gen12Platform::AlderLakeN
-            } else {
-                Gen12Platform::AlderLakeP
-            });
+            *fx.mmio.family.borrow_mut() = Some(SourceFamily::Gen12(
+                if family == Gen12Platform::AlderLakeP {
+                    Gen12Platform::AlderLakeN
+                } else {
+                    Gen12Platform::AlderLakeP
+                },
+            ));
             assert!(matches!(
                 fx.add_mode(s1, mode, Pipe::A, 0x7000000, stride),
                 Err(MstError::Modeset(ModesetError::UnsupportedGeneration))
@@ -2589,11 +2683,11 @@ pub mod tests {
             assert_eq!(fx.mmio.writes.borrow().len(), before);
             assert_eq!(fx.link.streams().len(), 2);
             assert_eq!(fx.link.available_pbn(s1), available);
-            *fx.mmio.family.borrow_mut() = Some(family);
+            *fx.mmio.family.borrow_mut() = Some(SourceFamily::Gen12(family));
             fx.link.remove_stream(&fx.mmio, &mut aux, s2).unwrap();
             fx.link.remove_stream(&fx.mmio, &mut aux, s1).unwrap();
             fx.link.disconnect(&fx.mmio, &mut aux).unwrap();
-            assert_eq!(fx.link.family(), Some(family));
+            assert_eq!(fx.link.family(), Some(SourceFamily::Gen12(family)));
             assert_eq!(
                 fx.mmio.writes_to(0x71180).last().unwrap() & 0x70000000,
                 expected & 0x70000000
@@ -2605,14 +2699,14 @@ pub mod tests {
             let mut hub = two_level_hub();
             hub.nak_allocate = true;
             let mut rollback = Fixture::new(hub);
-            *rollback.mmio.family.borrow_mut() = Some(family);
+            *rollback.mmio.family.borrow_mut() = Some(SourceFamily::Gen12(family));
             rollback.connect_and_probe().unwrap();
             assert!(matches!(
                 rollback.add(s1, Pipe::B, phys, stride),
                 Err(MstError::Mgr(_))
             ));
             assert!(rollback.link.streams().is_empty());
-            assert_eq!(rollback.link.family(), Some(family));
+            assert_eq!(rollback.link.family(), Some(SourceFamily::Gen12(family)));
             assert_eq!(
                 rollback.mmio.writes_to(0x71180).last().unwrap() & 0x70000000,
                 expected & 0x70000000
@@ -2636,4 +2730,108 @@ pub mod tests {
         "drivers/gpu/intel_gpu_mst",
         smoke_mst_source_family_retained_across_streams_rollback_and_drain
     );
+
+    /// Two streams over one DDI B link on `family`: the link binds the
+    /// family at connect, each stream's modeset takes the family's
+    /// branches, and the second stream never retrains.
+    fn mst_two_streams_on(family: SourceFamily) -> TestResult {
+        use crate::intel_gpu_pipes::{TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_MODE_DP_MST};
+        let mut fx = Fixture::new(two_level_hub());
+        *fx.mmio.family.borrow_mut() = Some(family);
+        if fx.connect_and_probe().is_err() || fx.link.family() != Some(family) {
+            return TestResult::Fail("connect must bind the Gen11/Gen9 family");
+        }
+        let s1 = Sink { branch: 0, port: 1 };
+        let s2 = Sink { branch: 1, port: 1 };
+        let (phys, stride) = fb_1080p(0x300_0000);
+        if fx.add(s1, Pipe::B, phys, stride).is_err() {
+            return TestResult::Fail("stream 1 must light on a Gen11/Gen9 source");
+        }
+        let trained_writes = fx.hub(|h| h.training_pattern_writes);
+        if fx.add(s2, Pipe::C, 0x500_0000, 10240).is_err() {
+            return TestResult::Fail("stream 2 must light on a Gen11/Gen9 source");
+        }
+        if fx.hub(|h| h.training_pattern_writes) != trained_writes {
+            return TestResult::Fail("the second stream must not retrain the link");
+        }
+        // Both transcoders bind DDI B in DP-MST mode with the display
+        // 9-11 port select (port 1 at bits 30:28, bit 27 clear).
+        for trans in [Transcoder::B, Transcoder::C] {
+            let func = fx
+                .mmio
+                .writes_to(trans.base() + TRANS_DDI_FUNC_CTL_OFFSET)
+                .last()
+                .copied()
+                .unwrap_or(0);
+            if func & (7 << 24) != TRANS_DDI_MODE_DP_MST || (func >> 27) & 0xF != 0b0010 {
+                return TestResult::Fail("each stream must bind DDI B in DP-MST mode");
+            }
+        }
+        // DP_TP_CTL is port-based (DDI B + 0x40); the display-12
+        // per-transcoder copies stay untouched.
+        if fx.mmio.writes_to(0x64140).is_empty()
+            || !fx.mmio.writes_to(0x61540).is_empty()
+            || !fx.mmio.writes_to(0x62540).is_empty()
+        {
+            return TestResult::Fail("training must use the port-based DP_TP_CTL");
+        }
+        // The link clock: the ICL combo DPLL1 (CFGCR0 0x164080) on
+        // Gen11, the SKL DPLL_CTRL1 link rate on Gen9.
+        let clocked = match family {
+            SourceFamily::Gen9 { .. } => {
+                !fx.mmio
+                    .writes_to(crate::intel_gpu_gen11_dpll::DPLL_CTRL1)
+                    .is_empty()
+                    && fx.mmio.writes_to(0x164080).is_empty()
+            }
+            _ => !fx.mmio.writes_to(0x164080).is_empty(),
+        };
+        if !clocked {
+            return TestResult::Fail("the link clock must come from the family's DPLL");
+        }
+        // A foreign family refuses before any write.
+        let mode = match fx.mode_of(s1) {
+            Ok(mode) => mode,
+            Err(_) => return TestResult::Fail("sink mode"),
+        };
+        let before = fx.mmio.writes.borrow().len();
+        *fx.mmio.family.borrow_mut() = Some(SourceFamily::Gen12(
+            crate::intel_gpu_gt::Gen12Platform::TigerLake,
+        ));
+        if !matches!(
+            fx.add_mode(s1, mode, Pipe::A, 0x700_0000, stride),
+            Err(MstError::Modeset(ModesetError::UnsupportedGeneration))
+        ) || fx.mmio.writes.borrow().len() != before
+        {
+            return TestResult::Fail("a foreign family must refuse before any write");
+        }
+        *fx.mmio.family.borrow_mut() = Some(family);
+        let mut aux = test_aux(&fx.mmio);
+        if fx.link.remove_stream(&fx.mmio, &mut aux, s2).is_err()
+            || fx.link.remove_stream(&fx.mmio, &mut aux, s1).is_err()
+            || fx.link.disconnect(&fx.mmio, &mut aux).is_err()
+        {
+            return TestResult::Fail("teardown must succeed on the bound family");
+        }
+        if fx.link.trained().is_some() || fx.link.family() != Some(family) {
+            return TestResult::Fail("teardown untrains the link and keeps the family");
+        }
+        TestResult::Pass
+    }
+
+    fn smoke_mst_gen11_gen9_sources() -> TestResult {
+        use crate::intel_gpu_gt::{Gen11Platform, Gen9Platform};
+        let gen11 = mst_two_streams_on(SourceFamily::Gen11(Gen11Platform::IceLake));
+        if !matches!(gen11, TestResult::Pass) {
+            return gen11;
+        }
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(true);
+        let gen9 = mst_two_streams_on(SourceFamily::Gen9 {
+            platform: Gen9Platform::KabyLake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        });
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(false);
+        gen9
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_mst", smoke_mst_gen11_gen9_sources);
 }

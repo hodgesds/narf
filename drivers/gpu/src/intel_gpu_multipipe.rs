@@ -68,6 +68,8 @@ pub enum PipeUse {
     ExternalMst,
     /// A USB-C DP Alt-Mode bridge session.
     AltModeBridge,
+    /// An external HDMI session.
+    ExternalHdmi,
 }
 
 /// A pipe claim: the DDI whose session owns the pipe, and why.
@@ -220,6 +222,23 @@ pub const DBUF_TOTAL_BLOCKS: u16 = 1024;
 /// two or more pipes are active, so a lone pipe keeps its
 /// pre-boot programming.
 pub fn dbuf_shares(active: &[Pipe]) -> Vec<(Pipe, u16, u16)> {
+    dbuf_shares_in(active, DBUF_TOTAL_BLOCKS)
+}
+
+/// The DBUF pool the shares split on `mmio`'s source: slice S1's
+/// 1024 blocks on display 11 and 12, display 9's single slice of
+/// 892 (`skl_display`: `.dbuf.size = 896 - 4`).
+pub fn dbuf_pool_blocks<M: MmioWindow + ?Sized>(mmio: &M) -> u16 {
+    match crate::intel_gpu_aux::SourceFamily::of(mmio) {
+        Some(crate::intel_gpu_aux::SourceFamily::Gen9 { .. }) => {
+            crate::intel_gpu_gen9_wm::DBUF_TOTAL_BLOCKS
+        }
+        _ => DBUF_TOTAL_BLOCKS,
+    }
+}
+
+/// [`dbuf_shares`] over a `total`-block pool.
+pub fn dbuf_shares_in(active: &[Pipe], total: u16) -> Vec<(Pipe, u16, u16)> {
     let mut pipes: Vec<Pipe> = active.to_vec();
     pipes.sort_by_key(|p| *p as u8);
     pipes.dedup();
@@ -227,7 +246,7 @@ pub fn dbuf_shares(active: &[Pipe]) -> Vec<(Pipe, u16, u16)> {
     if n == 0 {
         return Vec::new();
     }
-    let total = DBUF_TOTAL_BLOCKS as u32;
+    let total = total as u32;
     pipes
         .iter()
         .enumerate()
@@ -239,9 +258,14 @@ pub fn dbuf_shares(active: &[Pipe]) -> Vec<(Pipe, u16, u16)> {
         .collect()
 }
 
-/// The share `pipe` would get if `active` were the active set.
-pub fn share_for(active: &[Pipe], pipe: Pipe) -> Option<(u16, u16)> {
-    dbuf_shares(active)
+/// The share `pipe` would get on `mmio`'s source if `active` were the
+/// active set.
+pub fn share_for<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    active: &[Pipe],
+    pipe: Pipe,
+) -> Option<(u16, u16)> {
+    dbuf_shares_in(active, dbuf_pool_blocks(mmio))
         .into_iter()
         .find(|(p, _, _)| *p == pipe)
         .map(|(_, start, end)| (start, end))
@@ -257,7 +281,7 @@ pub fn reprogram_dbuf_shares<M: MmioWindow + ?Sized>(mmio: &M, allocator: &PipeA
     if active.len() < 2 {
         return;
     }
-    for (pipe, start, end) in dbuf_shares(&active) {
+    for (pipe, start, end) in dbuf_shares_in(&active, dbuf_pool_blocks(mmio)) {
         program_pipe_dbuf_share(mmio, pipe, start, end);
     }
 }
@@ -467,6 +491,14 @@ pub mod tests {
         }
         if covered != DBUF_TOTAL_BLOCKS as u32 {
             return TestResult::Fail("shares must cover the whole pool");
+        }
+        // Display 9's pool is one 892-block slice.
+        if dbuf_shares_in(
+            &[Pipe::A, Pipe::B],
+            crate::intel_gpu_gen9_wm::DBUF_TOTAL_BLOCKS,
+        ) != alloc::vec![(Pipe::A, 0, 445), (Pipe::B, 446, 891)]
+        {
+            return TestResult::Fail("Gen9 shares must split the 892-block slice");
         }
         TestResult::Pass
     }

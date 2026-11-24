@@ -1441,11 +1441,14 @@ pub fn thaw_workqueues();
 - `live`: the registered tasks that have not exited;
 - `kick`: a non-delivering signal wake (`fake_signal_wake_up`).
 
-The freeze points are a user task's first poll, before user mode, and the
-top of the own-stack park loop and `wait4`'s loop. Linux's freezable
-sleeps are the model. The timer tick yields a user-mode task while
-`freezing()` holds, even with nothing else runnable, so a busy task
-reaches the park within a tick.
+The freeze points are a user task's first poll, before user mode, the
+top of the own-stack park loop and `wait4`'s loop, and a user-mode timer
+tick: Linux's exit-to-user path, where `get_signal` calls `try_to_freeze`.
+In the own-stack model each arch's IRQ tail calls `freeze_on_user_tick`
+after the tick's preemption, from the same state a preemption switches
+from; the legacy model's tick yields the task to the executor and its poll
+gate. A task running in user mode therefore freezes within a tick. Linux's
+freezable sleeps are the model for the park-loop points.
 
 `freeze_processes` passes over the live tasks like `try_to_freeze_tasks`:
 it kicks each one that is not frozen, then sleeps 1 ms, doubling to 8 ms,

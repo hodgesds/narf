@@ -160,6 +160,12 @@ fn dispatch_irq(frame: &mut TrapFrame) {
             narf_scheduler::stackful::try_preempt_aarch64_irq(frame, tick);
         }
     }
+    // The freezer's exit-to-user freeze point, from the state the
+    // preemption above switches from: after EOI, accounting and the RCU IRQ
+    // section. A no-op outside a freeze.
+    if tick && frame.spsr & 0xF == 0 {
+        narf_userspace::handlers::freeze_on_user_tick();
+    }
 }
 
 /// Default generic-timer countdown in CNTPCT ticks. At QEMU virt's

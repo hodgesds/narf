@@ -115,6 +115,9 @@ pub(crate) struct ExternalPipe {
     pub(crate) dsc: Option<crate::intel_gpu_xelpg_dsc::DscTerm>,
     /// `crtc_state->pipe_bpp`: 24, or 18 for a 6 bpc DP route.
     pub(crate) pipe_bpp: u32,
+    /// The pipe scaler the stream runs through (an HDMI 4:2:0 route's 1:1
+    /// downsampler), for the resource transaction's prefill term.
+    pub(crate) scaler: Option<crate::intel_gpu_xelpg_scaler::PipeScaler>,
 }
 
 /// Typed pipe-owner failures.
@@ -193,7 +196,7 @@ fn request(ext: &ExternalPipe) -> PipeRequest {
         dsc: ext.dsc,
         src_w: None,
         src_h: None,
-        scaler: None,
+        scaler: ext.scaler,
         bigjoiner_slave: None,
     }
 }

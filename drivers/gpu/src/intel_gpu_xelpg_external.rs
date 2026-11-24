@@ -86,12 +86,15 @@
 //! manager and a single primary transport across independent Pipe B-D
 //! streams. Native/legacy VBT lane reversal reaches the PHY; DP-alt cable
 //! flip remains a TCSS mux operation.
-//! Lunar and Panther Lake admit TC1–TC4 only: PICA power and display-20+
+//! Lunar Lake admits combo DDI B (C10, through the display-20 PICA register
+//! view) and TC1–TC4; Panther Lake its C20 DDI B (through the display-30
+//! view) and TC1–TC4. PICA power and display-20+
 //! TCSS pin assignment are retained by the probe and D2D enable/state move
 //! to `DDI_BUF_CTL`. The Pipe B–D owner uses the exact display-20/30
 //! resource transaction; on display 30 it also computes the fixed-refresh
-//! guardband and runs the mandatory VRR timing generator. Combo DDI B and
-//! HDMI remain typed refusals on both IPs.
+//! guardband and runs the mandatory VRR timing generator. Both take HDMI
+//! TMDS on DDI B and declared legacy Type-C ports through the same
+//! display-20/30 steps ([`crate::intel_gpu_xelpg_hdmi`]).
 //! Wildcat Lake retains the same display-30 C20/PICA sequence but its distinct
 //! descriptor admits only TC1/TC2 and Pipes A–C. The service stores an exact
 //! [`ExternalDisplayProfile`] so broad `Generation::PantherLake` can never
@@ -161,7 +164,7 @@ use crate::intel_gpu_xelpg::{
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
-    activate_hdmi, probe_hdmi, release_hdmi_probe, HdmiError, HdmiRouteState, MtlHdmiRoute,
+    activate_hdmi, probe_hdmi_profile, release_hdmi_probe, HdmiError, HdmiRouteState, MtlHdmiRoute,
 };
 use crate::intel_gpu_xelpg_hpd::{LiveMode, MtlHpdConfig, MtlHpdEvent, MtlHpdKind, MtlHpdPin};
 use crate::intel_gpu_xelpg_pipes::{ExternalPipe, PipeEnableError, Pipes};
@@ -211,12 +214,17 @@ impl ExternalDisplayProfile {
         }
     }
 
-    #[cfg(any(test, doc, feature = "kernel-test"))]
     pub(crate) const fn display_ip(self) -> DisplayIp {
         self.display_ip
     }
 
-    const fn tc_profile(self) -> TcDisplayProfile {
+    /// Whether this source's DDI B is a C20 PHY (Panther Lake 30.00; see
+    /// [`crate::intel_gpu_aux::MmioWindow::cx0_c20_port_b`]).
+    pub(crate) const fn c20_port_b(self) -> bool {
+        matches!(self.display_ip, DisplayIp::Xe3Lpd)
+    }
+
+    pub(crate) const fn tc_profile(self) -> TcDisplayProfile {
         match self.display_ip {
             DisplayIp::Xelpdp => TcDisplayProfile::XeLpdp,
             DisplayIp::Xe2Lpd => TcDisplayProfile::Xe2Lpd,
@@ -229,10 +237,19 @@ impl ExternalDisplayProfile {
         self.generation
     }
 
+    /// The external ports this source drives. Lunar Lake's combo DDI B is
+    /// C10 like Meteor Lake's (`intel_encoder_is_c10phy`) and Panther
+    /// Lake's is a non-Type-C C20 ([`crate::intel_gpu_xelpg::phy_kind`],
+    /// the `mtl_c20_dp_*` states `xe3lpd_c20_dp_edp_tables` carries at the
+    /// DP 1.4 rates). Both reach their PHY and AUX through the PICA view
+    /// their pass applies ([`crate::intel_gpu_xe2lpd::PicaFlushed`],
+    /// [`crate::intel_gpu_xe3lpd::View`]).
     pub(crate) const fn admits_port(self, port: XeLpgPort) -> bool {
         match self.display_ip {
             DisplayIp::Xelpdp => !matches!(port, XeLpgPort::A),
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => port.tc_index().is_some(),
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+                matches!(port, XeLpgPort::B) || port.tc_index().is_some()
+            }
             DisplayIp::WildcatLake => {
                 matches!(port, XeLpgPort::Tc1 | XeLpgPort::Tc2)
             }
@@ -307,7 +324,7 @@ const fn ddi_port_width(lanes: u8) -> u32 {
 
 /// `intel_dp->DP` when `intel_ddi_buf_enable` starts the port. Linux keeps
 /// the display >= 20 D2D request in `DDI_BUF_CTL` across that full write.
-const fn ddi_enable_value(ip: DisplayIp, lanes: u8) -> u32 {
+pub(crate) const fn ddi_enable_value(ip: DisplayIp, lanes: u8) -> u32 {
     ddi_port_width(lanes)
         | DDI_BUF_CTL_ENABLE
         | if ip.xe2_plus() {
@@ -563,17 +580,6 @@ fn free_pipe<M: MmioWindow + ?Sized>(
     Err(ExternalError::NoFreePipe)
 }
 
-/// No-write preflight: the target DDI and its PLL are off, a Pipe B–D is
-/// free, and whatever Pipe A runs is adopted — nothing when it is off, the
-/// owned panel profile for `display.panel` when it is lit.
-pub(crate) fn preflight<M: MmioWindow + ?Sized>(
-    io: &M,
-    port: XeLpgPort,
-    display: &MtlDisplay,
-) -> Result<PipeChoice, ExternalError> {
-    preflight_lanes(io, port, display, PhyLaneConfig::NATIVE)
-}
-
 fn pll_clock_mask(lanes: PhyLaneConfig) -> u32 {
     let mut mask = 0;
     for lane in 0..2 {
@@ -585,22 +591,17 @@ fn pll_clock_mask(lanes: PhyLaneConfig) -> u32 {
     mask
 }
 
-fn preflight_lanes<M: MmioWindow + ?Sized>(
+/// No-write preflight on display IP `ip`: the target DDI and its PLL are
+/// off, a Pipe B–D the IP has is free, and whatever Pipe A runs is adopted
+/// — nothing when it is off, the owned panel profile for `display.panel`
+/// when it is lit.
+pub(crate) fn preflight_ip<M: MmioWindow + ?Sized>(
     io: &M,
     port: XeLpgPort,
     display: &MtlDisplay,
-    lanes: PhyLaneConfig,
+    ip: DisplayIp,
 ) -> Result<PipeChoice, ExternalError> {
-    preflight_clock(io, port, display, pll_clock_mask(lanes))
-}
-
-fn preflight_clock<M: MmioWindow + ?Sized>(
-    io: &M,
-    port: XeLpgPort,
-    display: &MtlDisplay,
-    clock_mask: u32,
-) -> Result<PipeChoice, ExternalError> {
-    preflight_clock_ip(io, port, display, clock_mask, DisplayIp::Xelpdp)
+    preflight_clock_ip(io, port, display, pll_clock_mask(PhyLaneConfig::NATIVE), ip)
 }
 
 fn preflight_clock_ip<M: MmioWindow + ?Sized>(
@@ -650,6 +651,7 @@ pub(crate) fn external_pipe(
         combo_phy: port.tc_index().is_none().then_some(port.phy_index() as u8),
         dsc,
         pipe_bpp,
+        scaler: None,
     })
 }
 
@@ -802,10 +804,11 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
     legacy_port: bool,
 ) -> Result<LinkProbe, ExternalError> {
     let display_ip = profile.display_ip;
-    // Display >= 20 relocates combo DDI B's PHY/AUX register views into PICA.
-    // TC1–TC4 already use the PICA-layout addresses carried by XeLpgPort;
-    // admit only that source-qualified USB-C path for now. Display 30's
-    // mandatory fixed-refresh VRR timing generator is owned by Pipes.
+    // Display >= 20 relocates combo DDI B's PHY/AUX register views into
+    // PICA; the display-20 pass runs over `PicaFlushed`, which applies it.
+    // TC1–TC4 already use the PICA-layout addresses carried by XeLpgPort.
+    // Display 30's mandatory fixed-refresh VRR timing generator is owned by
+    // Pipes.
     if !profile.admits_port(port) {
         return Err(ExternalError::UnsupportedPort);
     }
@@ -1407,9 +1410,16 @@ fn enable_clock<M: MmioWindow + ?Sized>(
     if probe.tbt() {
         enable_tbt_clock(io, port, rate).map_err(phy_err)?;
     } else {
-        let mut request =
-            dp_pll_request(port, rate, lanes, probe.dp_alt(), probe.legacy(), probe.ssc)
-                .map_err(phy_err)?;
+        let mut request = dp_pll_request(
+            crate::intel_gpu_xelpg::phy_kind(io, port),
+            port,
+            rate,
+            lanes,
+            probe.dp_alt(),
+            probe.legacy(),
+            probe.ssc,
+        )
+        .map_err(phy_err)?;
         request.lanes = probe.phy_lanes()?;
         enable_port_pll_state(io, port, &request).map_err(phy_err)?;
     }
@@ -2506,13 +2516,10 @@ impl MtlExternalService {
         };
         let legacy = live == LiveMode::Legacy;
         let mut plan = route_plan(port, self.policy.decl(port), live);
-        // The display-20 DP path is source-qualified below. HDMI still
-        // carries display-14 PHY/D2D programming, so do not reach it by a
-        // DDI-B fallback or a VBT HDMI-only declaration.
-        if matches!(
-            profile.display_ip,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake
-        ) {
+        // Lunar and Panther Lake HDMI runs on their display-20/30 D2D,
+        // DDI_BUF_CTL and (display 30) VRR-TG steps. Wildcat Lake's exact
+        // 30.02 profile has no qualified HDMI route.
+        if profile.display_ip == DisplayIp::WildcatLake {
             plan = match plan {
                 RoutePlan::DpThenHdmi => RoutePlan::Dp,
                 RoutePlan::Hdmi => RoutePlan::Refuse,
@@ -2647,11 +2654,10 @@ impl MtlExternalService {
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let ddc = self.policy.ddc_pin(port);
-        let generation = self
+        let profile = self
             .profile
-            .expect("HDMI connect follows a source-qualified route plan")
-            .generation();
-        let mut probe = match probe_hdmi(io, generation, port, legacy, ddc) {
+            .expect("HDMI connect follows a source-qualified route plan");
+        let mut probe = match probe_hdmi_profile(io, profile, port, legacy, ddc) {
             Ok(probe) => probe,
             Err(e) => {
                 return ServiceOutcome::Refused {

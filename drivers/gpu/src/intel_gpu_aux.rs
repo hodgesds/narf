@@ -189,6 +189,42 @@ impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
     }
 }
 
+/// The display source an external session programs, from the exact owned
+/// PCI mapping: the Gen12 family, or the Gen11 or Gen9 sub-platform (Gen9
+/// with the DDI SKU family its buffer tables select on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceFamily {
+    Gen12(crate::intel_gpu_gt::Gen12Platform),
+    Gen11(crate::intel_gpu_gt::Gen11Platform),
+    Gen9 {
+        platform: crate::intel_gpu_gt::Gen9Platform,
+        sku: crate::intel_gpu_gen9_ddi::SkuFamily,
+    },
+}
+
+impl SourceFamily {
+    /// The family `mmio` reports, `None` when it reports none (a session
+    /// must then refuse).
+    pub fn of<M: MmioWindow + ?Sized>(mmio: &M) -> Option<Self> {
+        mmio.gen12_display_family()
+            .map(Self::Gen12)
+            .or_else(|| mmio.gen11_display_platform().map(Self::Gen11))
+            .or_else(|| {
+                mmio.gen9_display_platform()
+                    .map(|(platform, sku)| Self::Gen9 { platform, sku })
+            })
+    }
+
+    /// The Gen12 family, for the Gen12-only paths (VRR, the external stop
+    /// proof).
+    pub const fn gen12(self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        match self {
+            Self::Gen12(family) => Some(family),
+            _ => None,
+        }
+    }
+}
+
 /// Minimal MMIO-window interface the transport needs. Lets us
 /// inject mocks in tests without depending on the kernel's real
 /// `Bar0` type. Real callers wrap `narf_drivers_pci`'s mapped BAR
@@ -199,6 +235,28 @@ pub trait MmioWindow {
     /// Generation::AlderLake. None permits diagnostics, but source-dependent
     /// external activation must refuse. This is not current MMIO authority.
     fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
+        None
+    }
+    /// The Gen11 sub-platform of this exact owned PCI mapping, from the
+    /// PCI-ID table like `gen12_display_family`; `None` on every other
+    /// source.
+    fn gen11_display_platform(&self) -> Option<crate::intel_gpu_gt::Gen11Platform> {
+        None
+    }
+    /// The Gen9 sub-platform and DDI SKU family (`sku_family_for_did`) of
+    /// this exact owned PCI mapping; `None` on every other source.
+    fn gen9_display_platform(
+        &self,
+    ) -> Option<(
+        crate::intel_gpu_gt::Gen9Platform,
+        crate::intel_gpu_gen9_ddi::SkuFamily,
+    )> {
+        None
+    }
+    /// The C20 HDMI `tx[1]` word for this exact owned PCI mapping
+    /// (`intel_gpu_xelpg_hdmi::c20_hdmi_tx_cfg1`), when its platform fact
+    /// is known; `None` keeps the C20 HDMI clocks table-only.
+    fn c20_hdmi_tx_cfg1(&self) -> Option<u16> {
         None
     }
     /// Whether this exact owned PCI mapping is a Tiger Lake UY
@@ -229,6 +287,14 @@ pub trait MmioWindow {
     /// (`intel_gpu_xe3lpd::PortView`) answers `true`; every wrapper that
     /// sits between it and the PHY code forwards it.
     fn cx0_xe3(&self) -> bool {
+        false
+    }
+    /// Whether DDI B's Cx0 PHY is a C20 (`intel_encoder_is_c10phy` false
+    /// for PHY B): Panther Lake 30.00 only. Meteor and Lunar Lake put a C10
+    /// behind PHY B, and so does Wildcat Lake (`phy <= PHY_B`). Only the
+    /// Panther Lake external view answers `true`; every wrapper between it
+    /// and the PHY code forwards it.
+    fn cx0_c20_port_b(&self) -> bool {
         false
     }
     /// Whether this exact source platform has Linux's LT PHY. This is a

@@ -450,6 +450,12 @@ plan, `MtlSinkProbe::pipe_bpp` its pipe bpp (18 for a 6 bpc route), and
 `train_channel_equalization_select` are the shared rate-select training
 path; `intel_gpu_xelpg::{enable_port_pll_khz, reprogram_pll_khz,
 set_signal_levels_khz}` take a kHz port clock (eDP intermediate rates).
+`dp_pcon` is the DP-to-HDMI 2.1 PCON FRL path (`read_pcon_caps`,
+`check_frl_training` → `PconLink`); the Intel DP session runs it before its
+modeset (`intel_gpu_dp::pcon_frl_training`) and records the outcome in
+`DpConnection::pcon`. `intel_gpu_hdmi::compute_output` picks the HDMI
+link's `SinkFormat` (RGB or YCbCr 4:2:0), bpc and TMDS clock;
+`intel_gpu_dp::source_caps` is the per-source DP rate cap.
 The Gen12 orchestrator writes `vblank_display13` on ADL-P/ADL-N, and
 `intel_gpu_dsb::Owner::reserve_gen12` takes a `display13` flag that drops
 `TRANS_VBLANK`'s start field from its timing proof (`Timing::check`'s
@@ -2212,6 +2218,13 @@ system RAM as discrete GPU memory. `GuCFirmware::open_for_platform` uses the
 same invoked-capability acquisition for `i915/dg1_guc_70.bin` (70.44.1+),
 `i915/dg2_guc_70.bin` (70.53.0+) and
 `xe/bmg_guc_70.bin` (70.54.0+), retaining the selected platform with the bytes.
+`GuCFirmware::open_for_revision(platform, revision, authority)` and
+`intel_gpu_huc::Firmware::open_for_revision` take the device's PCI revision ID
+as well (`GtPlatform::guc_for_revision`, `huc::firmware_name_for_revision`):
+only Comet Lake depends on it, taking `i915/cml_guc_70.1.1.bin` and
+`i915/cml_huc_4.0.0.bin` at revision `CML_FIRMWARE_REVISION` (5) and above and
+the Kaby Lake blobs below. `open_for_platform` / `open` are revision 0. The GT
+runtime passes the revision `validate_pci` reads.
 
 `intel_gpu_guc_boot::GuCBoot::stage` consumes a GT `BootAllocator`, an invoked-
 authority firmware image and the actual PCI ID/revision, HuC upload extent and
