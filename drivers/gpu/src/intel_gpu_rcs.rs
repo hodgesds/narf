@@ -64,7 +64,16 @@
 //! and Gen12 (`intel_engine_context_size`) and the 22-page Gen9
 //! render image (`GEN9_LR_CONTEXT_RENDER_SIZE`); see
 //! [`render_image_pages`]. The Gen11 template itself differs —
-//! see [`build_reg_state_for_generation`]. These model-checked
+//! see [`build_reg_state_for_generation`].
+//!
+//! Gen9 and Gen11 follow Linux's execlists path rather than the Gen12
+//! shape: their CSB entries are Gen8-format ([`gen8_csb_step`], each
+//! consumed entry reset to all-ones as `csb_read` does), Gen11 loads its
+//! ports through the execlist submit queue ([`uses_submit_queue`]), a
+//! render request is the `gen8_engine_cs.c` invalidate / batch / flush /
+//! breadcrumb stream, resident batches use the Gen8 PTE format, and ports
+//! are only loaded into an idle engine, since this engine handles no
+//! preemption. These model-checked
 //! encodings do not establish full GT setup, safe userspace execution,
 //! silicon cache completion or hardware reset; the userspace gate in
 //! intel_gpu_render remains closed until those owners exist.
@@ -234,6 +243,19 @@ impl EngineSpec {
     pub const fn execlist_status(&self) -> u64 {
         self.base + RING_EXECLIST_STATUS_OFF
     }
+    /// Absolute `RING_EXECLIST_SQ_CONTENTS` (port n at +8n, low dword
+    /// first) for this engine.
+    pub const fn execlist_sq(&self) -> u64 {
+        self.base + 0x510
+    }
+    /// Absolute `RING_EXECLIST_CONTROL` for this engine.
+    pub const fn execlist_control(&self) -> u64 {
+        self.base + 0x550
+    }
+    /// Absolute `RING_CONTEXT_STATUS_PTR` for this engine.
+    pub const fn context_status_ptr(&self) -> u64 {
+        self.base + 0x3a0
+    }
     /// Whether the register-state template carries the
     /// render-only `R_PWR_CLK_STATE` group (i915 programs
     /// `CTX_R_PWR_CLK_STATE` only for render-class contexts;
@@ -322,6 +344,50 @@ fn render_breadcrumb(address: u64, seqno: u32) -> [u32; 12] {
         seqno,
         0,
     ]
+}
+
+/// `GFX_OP_PIPE_CONTROL(6)`.
+const PIPE_CONTROL6: u32 = 0x7a00_0004;
+/// `MI_ARB_CHECK`.
+const MI_ARB_CHECK: u32 = 0x0280_0000;
+/// `LRC_PPHWSP_SCRATCH_ADDR`: the per-context HWSP scratch dword the
+/// invalidate's store-data-index post-sync lands in.
+const PPHWSP_SCRATCH: u32 = 0x34 * 4;
+
+/// One Gen9/Gen11 render request, MIT Linux v6.12 `gen8_engine_cs.c`:
+/// `gen8_emit_flush_rcs` / `gen11_emit_flush_rcs` with `EMIT_INVALIDATE`
+/// (Gen9 first emits the null PIPE_CONTROL its VF invalidate needs), the
+/// no-arbitration `gen8_emit_bb_start_noarb`, then
+/// `gen8_emit_fini_breadcrumb_rcs` / `gen11_...`: a cache-flush
+/// PIPE_CONTROL (Gen11 adds the tile cache), the GGTT QW seqno write and
+/// `gen8_emit_wa_tail`. The KBL-before-C0 DC flush workaround is not
+/// emitted (pre-production steppings only).
+fn legacy_render_request(gen11: bool, start: [u32; 3], address: u64, seqno: u32) -> Vec<u32> {
+    let mut words = Vec::with_capacity(30);
+    if !gen11 {
+        words.extend_from_slice(&[PIPE_CONTROL6, 0, 0, 0, 0, 0]);
+    }
+    // CS stall, TLB / instruction / texture / VF / constant / state cache
+    // invalidate, QW write with store-data-index (Gen11: command cache).
+    let invalidate = 0x0034_4c1c | if gen11 { 1 << 29 } else { 0 };
+    words.extend_from_slice(&[PIPE_CONTROL6, invalidate, PPHWSP_SCRATCH, 0, 0, 0]);
+    words.push(MI_ARB_DISABLE);
+    words.extend_from_slice(&start);
+    // CS stall, TLB invalidate, render target / depth / DC flush (Gen11:
+    // tile cache flush).
+    let flush = 0x0014_1021 | if gen11 { 1 << 28 } else { 0 };
+    words.extend_from_slice(&[PIPE_CONTROL6, flush, 0, 0, 0, 0]);
+    // Flush enable, CS stall, global GTT, QW write.
+    words.extend_from_slice(&[
+        PIPE_CONTROL6,
+        0x0110_4080,
+        address as u32,
+        (address >> 32) as u32,
+        seqno,
+        0,
+    ]);
+    words.extend_from_slice(&[MI_ARB_CHECK, MI_NOOP]);
+    words
 }
 
 /// Encode an `MI_LOAD_REGISTER_IMM` header for `n` register
@@ -1222,6 +1288,46 @@ pub fn csb_step(entry: &CsbEntry, any_active: bool) -> CsbStep {
         return CsbStep::Complete;
     }
     CsbStep::Nop
+}
+
+/// Whether `generation` posts Gen8-format CSB entries: Linux parses
+/// graphics 9 and 11 with `gen8_csb_parse` (status bits in the low dword,
+/// no switched-to/away ids it relies on) and Gen12 with `gen12_csb_parse`.
+pub const fn gen8_csb(generation: crate::intel_gpu::Generation) -> bool {
+    matches!(
+        generation,
+        crate::intel_gpu::Generation::Skylake | crate::intel_gpu::Generation::IceLake
+    )
+}
+
+/// Whether ports are loaded through the execlist submit queue
+/// (`HAS_LOGICAL_RING_ELSQ`, graphics 11+) rather than the four-write
+/// legacy ELSP. Only Gen11 takes it here: Linux uses the queue on Gen12
+/// as well, but this engine's Gen12 form is fixture-only (Gen12 submits
+/// through the GuC) and keeps its historical ELSP write.
+pub const fn uses_submit_queue(generation: crate::intel_gpu::Generation) -> bool {
+    matches!(generation, crate::intel_gpu::Generation::IceLake)
+}
+
+/// `GEN8_CTX_STATUS_IDLE_ACTIVE`.
+pub const GEN8_CSB_IDLE_ACTIVE: u32 = 1 << 0;
+/// `GEN8_CTX_STATUS_PREEMPTED`.
+pub const GEN8_CSB_PREEMPTED: u32 = 1 << 1;
+
+/// Classify one Gen8-format entry the way `process_csb` does with
+/// `gen8_csb_parse`: idle→active or preempted promotes the pending ports
+/// (a preemption also displaces the active context); any other entry
+/// completes the active port 0.
+pub fn gen8_csb_step(entry: &CsbEntry, any_active: bool) -> CsbStep {
+    if entry.lower & GEN8_CSB_PREEMPTED != 0 && any_active {
+        CsbStep::Preempt
+    } else if entry.lower & (GEN8_CSB_IDLE_ACTIVE | GEN8_CSB_PREEMPTED) != 0 {
+        CsbStep::Promote
+    } else if any_active {
+        CsbStep::Complete
+    } else {
+        CsbStep::Nop
+    }
 }
 
 // ── Errors ──────────────────────────────────────────────────────
@@ -2558,6 +2664,49 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         })
     }
 
+    /// `reset_csb_pointers`: after an engine reset the hardware writes CSB
+    /// entry 0 next, so the read head and the status page's write pointer
+    /// both point at the last entry, every entry is marked unwritten
+    /// (all-ones), and `RING_CONTEXT_STATUS_PTR` is forced to match ("Ice
+    /// Lake forgets to reset its pointers on a GPU reset"). Only valid with
+    /// nothing loaded on the engine.
+    pub fn reset_csb_pointers(&mut self) -> Result<(), SubmitError> {
+        if !self.is_idle() {
+            return Err(SubmitError::ContextBusy);
+        }
+        let entries = csb_entries(self.generation);
+        let reset = u32::from(entries - 1);
+        let ptr = self.spec.context_status_ptr();
+        self.mmio.write32(ptr, 0xffff << 16 | reset << 8 | reset);
+        let _ = self.mmio.read32(ptr);
+        self.csb_head = entries - 1;
+        self.status.write32(csb_write_byte(self.generation), reset);
+        for i in 0..u64::from(entries) {
+            self.status.write32(CSB_BUF_BYTE + i * 8, u32::MAX);
+            self.status.write32(CSB_BUF_BYTE + i * 8 + 4, u32::MAX);
+        }
+        fence(Ordering::Release);
+        self.mmio.write32(ptr, 0xffff << 16 | reset << 8 | reset);
+        let _ = self.mmio.read32(ptr);
+        Ok(())
+    }
+
+    /// Append `words` to an idle, unqueued context's ring ahead of its
+    /// next request: the per-context setup Linux records into the default
+    /// context image (the context workaround `MI_LOAD_REGISTER_IMM`). The
+    /// next submission's tail covers them. `words` must be an even count.
+    pub fn emit_context_setup(&mut self, id: ContextId, words: &[u32]) -> Result<(), SubmitError> {
+        let slot = self.context(id)?.slot;
+        if self.ctx_covered(slot) || self.queue.iter().any(|r| r.ctx_slot == slot) {
+            return Err(SubmitError::ContextBusy);
+        }
+        if words.len() % 2 != 0 {
+            return Err(SubmitError::RingFull);
+        }
+        let ctx = self.context_mut(id)?;
+        ring_emit(&ctx.ring_mem, &mut ctx.ring, words)
+    }
+
     /// GGTT offset of the engine status page (the CSB page).
     pub fn status_ggtt(&self) -> u32 {
         self.status.ggtt_offset()
@@ -2791,9 +2940,13 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         if self.completion_lost {
             return Err(SubmitError::CompletionLost);
         }
-        if batch.format() != crate::intel_gpu_gtt::PteFormat::Gen12
-            || self.spec.class != EngineClass::Render
-        {
+        // Gen9/Gen11 PPGTTs use the Gen8 leaf format (prepare_for_gt).
+        let format = if gen8_csb(self.generation) {
+            crate::intel_gpu_gtt::PteFormat::Gen8
+        } else {
+            crate::intel_gpu_gtt::PteFormat::Gen12
+        };
+        if batch.format() != format || self.spec.class != EngineClass::Render {
             return Err(SubmitError::NoEngine);
         }
         let ctx = self.context(id)?;
@@ -2859,6 +3012,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         }
         let request_id = self.next_request_id;
         let render = self.spec.class == EngineClass::Render;
+        let engine_generation = self.generation;
         let seqno = {
             let ctx = self.context_mut(id)?;
             let seqno = ctx.next_seqno;
@@ -2870,7 +3024,17 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             let address = ctx.hwsp.ggtt_offset() as u64 + HWSP_SEQNO_BYTE;
             let mut prologue = [MI_NOOP; 16];
             prologue[..3].copy_from_slice(&start);
-            let length = if render {
+            let legacy = (render && gen8_csb(engine_generation)).then(|| {
+                legacy_render_request(
+                    matches!(engine_generation, crate::intel_gpu::Generation::IceLake),
+                    start,
+                    address,
+                    seqno,
+                )
+            });
+            let length = if legacy.is_some() {
+                0
+            } else if render {
                 prologue[3..15].copy_from_slice(&render_breadcrumb(address, seqno));
                 16
             } else {
@@ -2883,7 +3047,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 ]);
                 8
             };
-            if let Err(e) = ring_emit(&ctx.ring_mem, &mut ctx.ring, &prologue[..length]) {
+            let words = legacy.as_deref().unwrap_or(&prologue[..length]);
+            if let Err(e) = ring_emit(&ctx.ring_mem, &mut ctx.ring, words) {
                 // End the mutable borrow of `self` held through
                 // `ctx` so `self.alloc` is usable on this error
                 // path. `ctx` is a reference, so nothing is (or
@@ -3013,6 +3178,13 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         {
             return;
         }
+        // Gen9/Gen11 batches run with arbitration off and this engine has
+        // no preemption handling, so ports are only loaded into an idle
+        // engine: every load is then idle→active, never a preemption or
+        // lite restore of a running context.
+        if gen8_csb(self.generation) && self.active.iter().any(|a| a.is_some()) {
+            return;
+        }
         let first = self.queue[0].ctx_slot;
         let mut chosen = [Some(first), None];
         for r in self.queue.iter() {
@@ -3050,6 +3222,18 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// register is read instead).
     fn elsp_write(&mut self, port0: u64, port1: u64) {
         fence(Ordering::Release);
+        if uses_submit_queue(self.generation) {
+            // execlists_submit_ports: every port written, highest first,
+            // low dword then high, then EL_CTRL_LOAD.
+            let sq = self.spec.execlist_sq();
+            self.mmio.write32(sq + 8, port1 as u32);
+            self.mmio.write32(sq + 12, (port1 >> 32) as u32);
+            self.mmio.write32(sq, port0 as u32);
+            self.mmio.write32(sq + 4, (port0 >> 32) as u32);
+            self.mmio.write32(self.spec.execlist_control(), 1);
+            let _ = self.mmio.read32(self.spec.execlist_status());
+            return;
+        }
         self.mmio.write32(self.spec.elsp(), (port1 >> 32) as u32);
         self.mmio.write32(self.spec.elsp(), port1 as u32);
         self.mmio.write32(self.spec.elsp(), (port0 >> 32) as u32);
@@ -3088,14 +3272,27 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         }
         // GPU publishes the cursor after the CSB entries and saved state.
         fence(Ordering::Acquire);
+        let consume = gen8_csb(self.generation);
         let mut head = self.csb_head;
         while head != tail {
-            head = (head + 1) % entries;
-            let base = CSB_BUF_BYTE + (head as u64) * 8;
+            let next = (head + 1) % entries;
+            let base = CSB_BUF_BYTE + (next as u64) * 8;
             let entry = CsbEntry {
                 lower: self.status.read32(base),
                 upper: self.status.read32(base + 4),
             };
+            if consume {
+                // csb_read (icl:HSDES#1806554093): the write pointer can be
+                // observed before the entry. An entry still all-ones is not
+                // written yet; leave it for the next poll. Each consumed
+                // entry is reset so its reuse is visible.
+                if entry.lower == u32::MAX && entry.upper == u32::MAX {
+                    break;
+                }
+                self.status.write32(base, u32::MAX);
+                self.status.write32(base + 4, u32::MAX);
+            }
+            head = next;
             self.process_csb(entry, &mut done);
             if self.completion_lost {
                 break;
@@ -3108,6 +3305,35 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
 
     fn process_csb(&mut self, entry: CsbEntry, done: &mut Vec<CompletedRequest>) {
         let any_active = self.active.iter().any(|a| a.is_some());
+        if gen8_csb(self.generation) {
+            // Gen8-format entries carry no id this engine relies on: like
+            // i915, attribute them to the ports in order.
+            let first = self.active.iter().flatten().copied().next();
+            match gen8_csb_step(&entry, any_active) {
+                CsbStep::Promote => {
+                    if self.pending.iter().any(|p| p.is_some()) {
+                        self.active = self.pending;
+                        self.pending = [None, None];
+                    } else {
+                        self.spurious_csb += 1;
+                    }
+                }
+                CsbStep::Preempt => {
+                    if let Some(slot) = first {
+                        self.unschedule(slot);
+                    }
+                    self.active = self.pending;
+                    self.pending = [None, None];
+                }
+                CsbStep::Complete => {
+                    if let Some(slot) = first {
+                        self.retire(slot, done);
+                    }
+                }
+                CsbStep::Nop => self.spurious_csb += 1,
+            }
+            return;
+        }
         match csb_step(&entry, any_active) {
             CsbStep::Promote => {
                 // A promote names the pair most recently written
@@ -3775,20 +4001,71 @@ pub mod tests {
         /// context's ring in port order, and post the CSB
         /// stream real hardware would produce.
         fn step(&mut self) {
-            let elsp: Vec<u32> = self
+            let queue = uses_submit_queue(self.generation);
+            let sq = RCS0_SPEC.execlist_sq();
+            let elsp: Vec<(u64, u32)> = self
                 .regs
                 .writes
                 .borrow()
                 .iter()
-                .filter(|(o, _)| *o == RING_ELSP)
-                .map(|(_, v)| *v)
+                .filter(|(o, _)| {
+                    if queue {
+                        (sq..sq + 16).contains(o)
+                    } else {
+                        *o == RING_ELSP
+                    }
+                })
+                .copied()
                 .collect();
             while self.consumed_elsp + 4 <= elsp.len() {
                 let g = &elsp[self.consumed_elsp..self.consumed_elsp + 4];
                 self.consumed_elsp += 4;
-                let port1 = ((g[0] as u64) << 32) | g[1] as u64;
-                let port0 = ((g[2] as u64) << 32) | g[3] as u64;
+                let (port0, port1) = if queue {
+                    // Port 1 low/high at +8/+12, then port 0 low/high.
+                    assert_eq!(
+                        [g[0].0, g[1].0, g[2].0, g[3].0],
+                        [sq + 8, sq + 12, sq, sq + 4],
+                        "submit queue write order"
+                    );
+                    (
+                        ((g[3].1 as u64) << 32) | g[2].1 as u64,
+                        ((g[1].1 as u64) << 32) | g[0].1 as u64,
+                    )
+                } else {
+                    (
+                        ((g[2].1 as u64) << 32) | g[3].1 as u64,
+                        ((g[0].1 as u64) << 32) | g[1].1 as u64,
+                    )
+                };
                 if port0 == 0 {
+                    continue;
+                }
+                if gen8_csb(self.generation) {
+                    // Gen8 format: status in the low dword, the context's
+                    // descriptor id dword in the high one.
+                    let id = |desc: u64| (desc >> 32) as u32;
+                    self.push_csb(CsbEntry {
+                        lower: GEN8_CSB_IDLE_ACTIVE,
+                        upper: id(port0),
+                    });
+                    self.execute(port0);
+                    if port1 != 0 {
+                        // COMPLETE | ELEMENT_SWITCH, then COMPLETE | ACTIVE_IDLE.
+                        self.push_csb(CsbEntry {
+                            lower: 1 << 4 | 1 << 2,
+                            upper: id(port0),
+                        });
+                        self.execute(port1);
+                        self.push_csb(CsbEntry {
+                            lower: 1 << 4 | 1 << 3,
+                            upper: id(port1),
+                        });
+                    } else {
+                        self.push_csb(CsbEntry {
+                            lower: 1 << 4 | 1 << 3,
+                            upper: id(port0),
+                        });
+                    }
                     continue;
                 }
                 self.push_csb(csb_promote(descriptor_sw_id(port0)));
@@ -3829,7 +4106,9 @@ pub mod tests {
                         // follows a separate cache drain/stall command.
                         assert_eq!(dw & 0xff, 4, "PIPE_CONTROL length");
                         let flags = mem_rd(&ring, ((pos + 4) & mask) as u64);
-                        if flags & (1 << 14) != 0 {
+                        // Store-data-index posts into the context's PPHWSP
+                        // scratch (the Gen9/Gen11 invalidate): no GGTT write.
+                        if flags & (1 << 14) != 0 && flags & (1 << 21) == 0 {
                             assert_ne!(flags & (1 << 24), 0, "post-sync must use GGTT");
                             let lo = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
                             let hi = mem_rd(&ring, ((pos + 12) & mask) as u64) as u64;
@@ -4007,6 +4286,16 @@ pub mod tests {
         ResidentBatch,
         alloc::sync::Weak<crate::intel_gpu_gem::GemObject>,
     ) {
+        resident_fixture_with(hw, crate::intel_gpu_gtt::PteFormat::Gen12)
+    }
+
+    fn resident_fixture_with(
+        hw: &mut FakeHw,
+        format: crate::intel_gpu_gtt::PteFormat,
+    ) -> (
+        ResidentBatch,
+        alloc::sync::Weak<crate::intel_gpu_gem::GemObject>,
+    ) {
         use crate::intel_gpu_exec::{ExecObject, ExecRequest};
         let gem = crate::intel_gpu_gem::GemState::new();
         let handle = gem.create(4096, |_, _| Ok(())).unwrap();
@@ -4028,9 +4317,7 @@ pub mod tests {
                 capture: false,
             }],
         };
-        let batch = request
-            .prepare(crate::intel_gpu_gtt::PteFormat::Gen12, 0)
-            .unwrap();
+        let batch = request.prepare(format, 0).unwrap();
         let translated = batch.space().translate(va).unwrap();
         assert!(
             matches!(translated, crate::intel_gpu_ppgtt::WalkOutcome::Mapped(phys)
@@ -5524,4 +5811,247 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_detach_ppgtt_zeroes_pdps);
+
+    /// The Gen9/Gen11 request stream, hand-expanded from gen8_engine_cs.c.
+    fn smoke_legacy_request_stream_follows_linux() -> TestResult {
+        let start = mi_batch_buffer_start_ppgtt(0x1_2345_6000);
+        let gen9 = legacy_render_request(false, start, 0xabc0, 7);
+        let want9: [u32; 30] = [
+            0x7a00_0004,
+            0,
+            0,
+            0,
+            0,
+            0, // VF invalidate needs a null PIPE_CONTROL first
+            0x7a00_0004,
+            0x0034_4c1c,
+            0xd0,
+            0,
+            0,
+            0, // EMIT_INVALIDATE into PPHWSP scratch
+            0x0400_0000,
+            start[0],
+            start[1],
+            start[2], // ARB off, batch
+            0x7a00_0004,
+            0x0014_1021,
+            0,
+            0,
+            0,
+            0, // fini flush
+            0x7a00_0004,
+            0x0110_4080,
+            0xabc0,
+            0,
+            7,
+            0, // GGTT seqno
+            0x0280_0000,
+            0, // MI_ARB_CHECK, MI_NOOP
+        ];
+        if gen9 != want9 {
+            return TestResult::Fail("Gen9 render request");
+        }
+        let gen11 = legacy_render_request(true, start, 0xabc0, 7);
+        if gen11.len() != 24
+            || gen11[..6] != [0x7a00_0004, 0x2034_4c1c, 0xd0, 0, 0, 0]
+            || gen11[10..12] != [0x7a00_0004, 0x1014_1021]
+            || gen11[16..] != want9[22..]
+        {
+            return TestResult::Fail(
+                "Gen11 adds the command / tile cache bits, no null PIPE_CONTROL",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_legacy_request_stream_follows_linux
+    );
+
+    /// gen8_csb_parse: idle→active and preempted promote; everything else
+    /// completes the active port 0.
+    fn smoke_gen8_csb_step() -> TestResult {
+        let e = |lower: u32| CsbEntry { lower, upper: 0 };
+        if gen8_csb_step(&e(GEN8_CSB_IDLE_ACTIVE), false) != CsbStep::Promote
+            || gen8_csb_step(&e(GEN8_CSB_PREEMPTED | 1 << 15), true) != CsbStep::Preempt
+            || gen8_csb_step(&e(GEN8_CSB_PREEMPTED), false) != CsbStep::Promote
+            || gen8_csb_step(&e(1 << 4 | 1 << 2), true) != CsbStep::Complete
+            || gen8_csb_step(&e(1 << 4 | 1 << 3), true) != CsbStep::Complete
+            || gen8_csb_step(&e(1 << 4 | 1 << 3), false) != CsbStep::Nop
+        {
+            return TestResult::Fail("Gen8 CSB classification");
+        }
+        if !gen8_csb(crate::intel_gpu::Generation::Skylake)
+            || !gen8_csb(crate::intel_gpu::Generation::IceLake)
+            || gen8_csb(crate::intel_gpu::Generation::TigerLake)
+            || !uses_submit_queue(crate::intel_gpu::Generation::IceLake)
+            || uses_submit_queue(crate::intel_gpu::Generation::Skylake)
+        {
+            return TestResult::Fail("CSB format and port write per generation");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_rcs", smoke_gen8_csb_step);
+
+    /// Gen11 loads ports through RING_EXECLIST_SQ_CONTENTS + EL_CTRL_LOAD,
+    /// never the legacy ELSP.
+    fn smoke_gen11_ports_load_through_submit_queue() -> TestResult {
+        let (mut engine, hw) =
+            make_engine_for_generation(crate::intel_gpu::Generation::IceLake).unwrap();
+        let ctx = engine.create_context().unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(ctx, batch).unwrap();
+        let writes: Vec<(u64, u32)> = hw
+            .regs
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(o, _)| (0x2510..0x2520).contains(o) || *o == 0x2550 || *o == RING_ELSP)
+            .copied()
+            .collect();
+        let regs: Vec<u64> = writes.iter().map(|w| w.0).collect();
+        if regs != [0x2518, 0x251c, 0x2510, 0x2514, 0x2550]
+            || writes[0].1 != 0
+            || writes[1].1 != 0
+            || writes[4].1 != 1
+        {
+            return TestResult::Fail("Gen11 port write order");
+        }
+        let desc = (writes[3].1 as u64) << 32 | writes[2].1 as u64;
+        if descriptor_sw_id(desc) != 1 || descriptor_lrca(desc) == 0 {
+            return TestResult::Fail("Gen11 port 0 descriptor");
+        }
+        drop(hw);
+        // SAFETY: the model never ran; nothing else references it.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_gen11_ports_load_through_submit_queue
+    );
+
+    /// Ports are only loaded into an idle Gen9 engine, completions retire
+    /// in port order, and a stale (still all-ones) entry waits for the next
+    /// poll.
+    fn smoke_gen9_ports_load_only_when_idle() -> TestResult {
+        let (mut engine, mut hw) =
+            make_engine_for_generation(crate::intel_gpu::Generation::Skylake).unwrap();
+        engine.reset_csb_pointers().unwrap();
+        hw.write_ptr = GEN9_CSB_ENTRIES - 1;
+        if hw.regs.writes_to(RCS0_SPEC.context_status_ptr()) != [0xffff_0505, 0xffff_0505]
+            || engine
+                .status
+                .read32(csb_write_byte(crate::intel_gpu::Generation::Skylake))
+                != 5
+            || engine.status.read32(CSB_BUF_BYTE) != u32::MAX
+        {
+            return TestResult::Fail("reset_csb_pointers");
+        }
+        let a = engine.create_context().unwrap();
+        let b = engine.create_context().unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(a, batch).unwrap();
+        let elsp = hw.regs.writes_to(RING_ELSP);
+        let port0 = (elsp[2] as u64) << 32 | elsp[3] as u64;
+        // The write pointer moves before the entry lands.
+        engine
+            .status
+            .write32(csb_write_byte(crate::intel_gpu::Generation::Skylake), 0);
+        if !engine.poll_completions().is_empty() || engine.csb_head != 5 {
+            return TestResult::Fail("an unwritten entry must wait");
+        }
+        hw.write_ptr = 5;
+        hw.inject_csb(CsbEntry {
+            lower: GEN8_CSB_IDLE_ACTIVE,
+            upper: (port0 >> 32) as u32,
+        });
+        if !engine.poll_completions().is_empty()
+            || engine.active[0].is_none()
+            || engine.status.read32(CSB_BUF_BYTE) != u32::MAX
+        {
+            return TestResult::Fail("promote consumes its entry");
+        }
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(b, batch).unwrap();
+        if hw.regs.writes_to(RING_ELSP).len() != 4 {
+            return TestResult::Fail("a busy Gen9 engine must not be reloaded");
+        }
+        hw.execute(port0);
+        hw.inject_csb(CsbEntry {
+            lower: 1 << 4 | 1 << 3,
+            upper: (port0 >> 32) as u32,
+        });
+        let done = engine.poll_completions();
+        if done.len() != 1 || done[0].ctx != a || hw.regs.writes_to(RING_ELSP).len() != 8 {
+            return TestResult::Fail("completion retires port 0 and loads the next context");
+        }
+        hw.consumed_elsp = 4;
+        hw.step();
+        let done = engine.poll_completions();
+        if done.len() != 1 || done[0].ctx != b || !engine.is_idle() || engine.spurious_csb() != 0 {
+            return TestResult::Fail("second context retires");
+        }
+        // SAFETY: every modelled request completed.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_gen9_ports_load_only_when_idle
+    );
+
+    /// Resident batches take the Gen8 PTE format on Gen9/Gen11 and refuse
+    /// the Gen12 one; context setup words precede the first request.
+    fn smoke_legacy_resident_batch_and_context_setup() -> TestResult {
+        for generation in [
+            crate::intel_gpu::Generation::Skylake,
+            crate::intel_gpu::Generation::IceLake,
+        ] {
+            let (mut engine, mut hw) = make_engine_for_generation(generation).unwrap();
+            let ctx = engine.create_context().unwrap();
+            let (wrong, _) = resident_fixture_with(&mut hw, crate::intel_gpu_gtt::PteFormat::Gen12);
+            if engine.submit_resident(ctx, wrong).err() != Some(SubmitError::NoEngine) {
+                return TestResult::Fail("a Gen12-format PPGTT is not a Gen9/Gen11 batch");
+            }
+            if engine
+                .emit_context_setup(ctx, &[0x2200_0001, 0x7004, 0x0042_0042, 0])
+                .is_err()
+                || engine.emit_context_setup(ctx, &[0]).is_ok()
+            {
+                return TestResult::Fail("context setup accepts even-length words");
+            }
+            let (batch, weak) =
+                resident_fixture_with(&mut hw, crate::intel_gpu_gtt::PteFormat::Gen8);
+            let submission = engine.submit_resident(ctx, batch).unwrap();
+            if engine.emit_context_setup(ctx, &[0, 0]) != Err(SubmitError::ContextBusy) {
+                return TestResult::Fail("setup only lands ahead of the next request");
+            }
+            let context = engine.context(ctx).unwrap();
+            if context.ring_mem.read32(4) != 0x7004 || context.ring_mem.read32(16) != 0x7a00_0004 {
+                return TestResult::Fail("setup words precede the request");
+            }
+            hw.step();
+            let done = engine.poll_completions();
+            if done.len() != 1
+                || submission.fence.result() != Some(Ok(()))
+                || weak.upgrade().is_some()
+            {
+                return TestResult::Fail("Gen8-format resident batch completes");
+            }
+            // SAFETY: every modelled request completed.
+            unsafe {
+                engine.release_after_reset();
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_legacy_resident_batch_and_context_setup
+    );
 }

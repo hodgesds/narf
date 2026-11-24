@@ -1047,6 +1047,24 @@ pub mod tests {
                 if port0 == 0 {
                     continue;
                 }
+                if crate::intel_gpu_rcs::gen8_csb(self.generation) {
+                    // Gen9/Gen11 post Gen8-format entries: IDLE_ACTIVE, then
+                    // COMPLETE | ELEMENT_SWITCH / COMPLETE | ACTIVE_IDLE.
+                    let entry = |lower: u32, desc: u64| crate::intel_gpu_rcs::CsbEntry {
+                        lower,
+                        upper: (desc >> 32) as u32,
+                    };
+                    self.push_csb(entry(crate::intel_gpu_rcs::GEN8_CSB_IDLE_ACTIVE, port0));
+                    self.execute(port0);
+                    if port1 != 0 {
+                        self.push_csb(entry(1 << 4 | 1 << 2, port0));
+                        self.execute(port1);
+                        self.push_csb(entry(1 << 4 | 1 << 3, port1));
+                    } else {
+                        self.push_csb(entry(1 << 4 | 1 << 3, port0));
+                    }
+                    continue;
+                }
                 self.push_csb(csb_promote(descriptor_sw_id(port0)));
                 self.execute(port0);
                 if port1 != 0 {
