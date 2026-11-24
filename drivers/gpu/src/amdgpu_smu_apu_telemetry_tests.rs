@@ -613,3 +613,58 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/smu_apu_telemetry",
     apu_monitor_publishes_first_refresh_then_exits_on_epoch_change
 );
+
+fn apu_attach_publishes_snapshot_and_gpu_temp() -> TestResult {
+    // The attach seam, end to end on a synthetic Phoenix APU:
+    // publish the owner's buffer through the scripted mailbox,
+    // begin the epoch, drive the monitor exactly as the spawned
+    // task would, and read the temperature back through the
+    // provider — the same chain production runs, minus the
+    // controller resolution, the DMA allocation and the spawn
+    // itself (all three need live hardware / the executor).
+    let mut smu = MockSmu::new();
+    stage_ok(&mut smu, MP1_BASE);
+    stage_ok(&mut smu, MP1_BASE);
+    stage_ok(&mut smu, MP1_BASE);
+    let mut buf = FakeBuffer::new(DMA_ADDR);
+    buf.stage_dma_table(&v13_table());
+    let mut owner = match ApuTelemetryOwner::new(SmuVersion::V13, MP1_BASE, buf) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("owner construction failed"),
+    };
+    let epoch = match crate::amdgpu_apu_platform::publish_and_begin_epoch(&mut owner, &mut smu) {
+        Ok(epoch) => epoch,
+        Err(_) => return TestResult::Fail("attach publish failed"),
+    };
+    if !owner.is_published() {
+        return TestResult::Fail("attach must publish the DRAM address");
+    }
+    // First poll: refresh + publish, then Pending on the 1 s sleep.
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut fut = alloc::boxed::Box::pin(monitor(&mut owner, &mut smu, epoch));
+    if !matches!(fut.as_mut().poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("monitor must pend on its first sleep after publishing");
+    }
+    drop(fut); // dropping cancels the timer-wheel slot
+    stop();
+    let snap = match snapshot() {
+        Some(s) => s,
+        None => return TestResult::Fail("attach must publish a snapshot"),
+    };
+    if snap.edge_temperature_milli_c() != Some(52350) {
+        return TestResult::Fail("attached snapshot edge must be 52350 mC");
+    }
+    // The provider reads the attach-published snapshot through its
+    // APU arm. The live `gpu_temp_mc()` composition is covered by
+    // the Navi22 fuse test (`amdgpu_smu_temp_tests`); this asserts
+    // the APU arm itself, which is order-independent against the
+    // discrete snapshots other tests publish.
+    if crate::amdgpu_smu_temp::gpu_temp_mc_from(None, None, snapshot()) != Some(52350) {
+        return TestResult::Fail("gpu_temp_mc must be 52350 mC on the synthetic APU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu_apu_telemetry",
+    apu_attach_publishes_snapshot_and_gpu_temp
+);

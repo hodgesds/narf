@@ -1791,6 +1791,11 @@ pub(crate) async fn graphics_owner() -> Graphics {
 }
 
 pub(crate) fn start() -> bool {
+    // Telemetry is independent of display: attach the APU SMU owner
+    // first, so Renoir/Cezanne/Rembrandt get a temperature even though
+    // `prepare()` refuses their display path (#1698). A refusal logs
+    // and leaves the display bring-up to proceed without it.
+    crate::amdgpu_apu_platform::attach();
     // Every `false` below means "the native path did not take"; the caller
     // then falls back to attaching to running DAL firmware, which leaves the
     // panel on the UEFI framebuffer. That fallback used to be silent and

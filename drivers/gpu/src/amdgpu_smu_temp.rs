@@ -24,13 +24,10 @@
 //!
 //! A machine with no telemetry owner publishing a sample yields
 //! `None` — the field stays unknown rather than reporting a
-//! fabricated zero (the hwmon class rule). That still includes
-//! APU-only machines (Renoir/Phoenix, SMU 12/13) until the APU owner
-//! is attached: the owner exists (`amdgpu_smu_apu_telemetry`) and
-//! this module already reads its last published sample, but no APU
-//! platform singleton exists to retain the owner and spawn its 1 s
-//! monitor, so no live APU sample is published yet; the attach is
-//! the remaining #1698 remainder.
+//! fabricated zero (the hwmon class rule). On APU-only machines
+//! (Renoir/Phoenix, SMU 12/13) the sample comes from the APU owner
+//! (`amdgpu_smu_apu_telemetry`), attached by the APU platform
+//! singleton (`amdgpu_apu_platform::attach`, #1698).
 
 use alloc::sync::Arc;
 

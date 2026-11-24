@@ -3346,6 +3346,42 @@ impl<'a> crate::amdgpu_smu::SmuMmio for SmuRegsAdapter<'a> {
     }
 }
 
+/// Owned `SmuMmio` adapter over a copied [`MmioRegion`].
+///
+/// The borrowed [`SmuRegsAdapter`] lives in `initialize`'s frame; the
+/// APU telemetry attach (#1698) needs a mailbox that outlives boot —
+/// the monitor task holds it for the device lifetime. [`MmioRegion`]
+/// is `Copy` (phys/virt/len: a handle, not an owned mapping), so
+/// copying it duplicates no ownership: the BAR mapping lives for the
+/// device lifetime under PCI authority, exactly as the borrowed
+/// adapter's `&MmioRegion` did. The shared MM_INDEX/MM_DATA latch
+/// is serialized inside `index` (see `amdgpu_index`), so two
+/// adapters cannot interleave an INDEX/DATA pair.
+pub(crate) struct SmuRegsOwned {
+    regs: MmioRegion,
+}
+
+impl SmuRegsOwned {
+    /// Build an owned mailbox adapter over a copy of the controller's
+    /// register window.
+    pub(crate) fn new(regs: MmioRegion) -> Self {
+        Self { regs }
+    }
+}
+
+impl crate::amdgpu_smu::SmuMmio for SmuRegsOwned {
+    fn read(&mut self, addr: u32) -> u32 {
+        // SAFETY: as in `SmuRegsAdapter::read` — `regs` is the live
+        // BAR5 mapping of the bound AMD controller, retained for the
+        // device lifetime by the APU platform singleton (#1698).
+        unsafe { mm_read(&self.regs, addr) }
+    }
+    fn write(&mut self, addr: u32, value: u32) {
+        // SAFETY: same.
+        unsafe { mm_write(&self.regs, addr, value) }
+    }
+}
+
 /// Indexed register read through MM_INDEX / MM_DATA.
 ///
 /// # Safety
