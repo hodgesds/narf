@@ -211,6 +211,16 @@ pub fn register_initcalls() {
             let _ = writeln!(narf_console::Writer, "amd-pmf: not bound: {error:?}");
             InitResult::NotPresent
         }
+    // ThinkPad LEDs (tracker #2448): the dual-build driver crate
+    // registers the seven available LEDs with the LED class.
+    // Stage::Device, next to the LED class's own Device initcall —
+    // registration is dynamic (#956), so the stage only orders boot
+    // logging; an LED registered before the class exists is picked
+    // up by the class's re-reconcile, and vice versa.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Device, "thinkpad-led", || {
+        narf_drivers_platform_thinkpad_led::builtin::register();
+        InitResult::Ok
     });
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-ec", || {

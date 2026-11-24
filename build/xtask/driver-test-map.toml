@@ -134,3 +134,15 @@ tags = ["drivers/wireless/rtl8xxxu"]
 [[leaf]]
 path = "drivers/wireless/rtl/src/rtlwifi"
 tags = ["drivers/wireless/rtlwifi"]
+
+# ThinkPad LED driver (dual-build crate, tracker #2448) and the
+# audio-micmute trigger module. The LED driver registers its tests
+# under `drivers/platform/thinkpad-led`; the trigger module under
+# `drivers/leds/audio-micmute`.
+[[leaf]]
+path = "drivers/platform/thinkpad_led"
+tags = ["drivers/platform/thinkpad-led"]
+
+[[leaf]]
+path = "drivers/leds/audio_micmute"
+tags = ["drivers/leds/audio-micmute"]
