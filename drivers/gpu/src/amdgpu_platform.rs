@@ -763,6 +763,12 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
             // legacy name (`amdgpu_ucode_legacy_naming`), so both load the
             // same TOC (`psp_v13_0.c`).
             (13, 0, 1) | (13, 0, 3) => Some(("amdgpu/yellow_carp_toc.bin", true)),
+            // MP0 14.0.0 / 14.0.1 (Strix) take the `psp_v13_0` TOC branch
+            // (`psp_v13_0.c`: `case IP_VERSION(14, 0, 1)`). Both
+            // revisions ship on Strix-family silicon — a public
+            // Framework 13 (AMD AI 300) boot log loads the 14.0.0 TOC.
+            (14, 0, 0) => Some(("amdgpu/psp_14_0_0_toc.bin", true)),
+            (14, 0, 1) => Some(("amdgpu/psp_14_0_1_toc.bin", true)),
             _ => None,
         }
     })
@@ -830,6 +836,23 @@ async fn graphics_boot(
     firmware: Option<crate::amdgpu_info_navi22::Firmware>,
 ) -> Option<crate::amdgpu_raphael_boot::ColdBoot> {
     use core::fmt::Write as _;
+    // Strix has no ColdBoot owner yet: its SMU is 14.0.1, whose PPSMC
+    // message map is ungrounded (no `smu14/` sources in the ref tree),
+    // and the GFX11 pieces it would stand on (lane 5's Phoenix PTE,
+    // lane 4's SDMA 6.0 bring-up) do not exist yet. Refuse by name
+    // instead of falling through to the Raphael owner's profile check,
+    // whose error would mislabel the chip. Display still comes up; only
+    // the graphics engines stay down.
+    let is_strix =
+        crate::amdgpu::with_controller(|gpu| gpu.chip.family == crate::amdgpu::Family::Strix)
+            .unwrap_or(false);
+    if is_strix {
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: strix graphics refused: no ColdBoot owner yet (SMU 14.0.1 grounding outstanding, #2467)"
+        );
+        return None;
+    }
     let authority = crate::amdgpu::pci_authority()?;
     let device = crate::amdgpu::pci_device()?;
     let boot = crate::amdgpu::with_controller(|gpu| {

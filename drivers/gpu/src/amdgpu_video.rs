@@ -88,6 +88,9 @@ impl VcnVersion {
             Family::Navi2 => Some(VcnVersion::V3_0),
             Family::Navi3 => Some(VcnVersion::V4_0_2),
             Family::Phoenix => Some(VcnVersion::V4_0_2),
+            // Strix is VCN 4.0.5 (UVD 4.0.5/4.0.6): Linux `vcn_v4_0_5`
+            // for VCN 4.0.5/4.0.6 in `amdgpu_discovery.c`.
+            Family::Strix => Some(VcnVersion::V4_0_5),
             // Vega has no VCN — it carries the older VCE / UVD
             // blocks; this scaffold doesn't cover them.
             Family::Vega => None,

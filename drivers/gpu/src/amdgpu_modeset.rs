@@ -58,7 +58,8 @@ use alloc::vec::Vec;
 use crate::amdgpu::Family;
 use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayPath};
 use crate::amdgpu_dcn::{
-    dcn20_modeset_sequence, dcn32_modeset_sequence, timing_for_mode, DcnWrite, ModeTiming,
+    dcn20_modeset_sequence, dcn32_modeset_sequence, dcn35_modeset_sequence, timing_for_mode,
+    DcnWrite, ModeTiming,
 };
 
 // ── Connector ────────────────────────────────────────────────────
@@ -510,6 +511,10 @@ pub fn plan_modeset(
         //
         // `dcn35_modeset_sequence` is kept for Strix, which really is 3.5.
         Family::Phoenix => dcn20_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
+        // Strix runs the DCN 3.5 sequence on the bound CRTC's pipe
+        // (pipe-0-only like the 2.0 sequence: the single-display path
+        // has no KMS CRTC to take a pipe from).
+        Family::Strix => dcn35_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
         _ => dcn20_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
     };
     // Display audio rides the same plan for the families the 2.0

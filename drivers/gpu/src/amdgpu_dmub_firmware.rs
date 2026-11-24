@@ -19,6 +19,8 @@ pub const DCN321_FIRMWARE: &str = "amdgpu/dcn_3_2_1_dmcub.bin";
 pub const DCN21_RENOIR_FIRMWARE: &str = "amdgpu/renoir_dmcub.bin";
 /// `FIRMWARE_GREEN_SARDINE_DMUB` (`amdgpu_dm_dmub.h:49`).
 pub const DCN21_GREEN_SARDINE_FIRMWARE: &str = "amdgpu/green_sardine_dmcub.bin";
+/// `FIRMWARE_DCN_35_DMUB` (`amdgpu_dm_dmub.h:59`): Strix Point (DCN 3.5.0).
+pub const DCN35_FIRMWARE: &str = "amdgpu/dcn_3_5_dmcub.bin";
 const HEADER_SIZE: usize = 40; // linux: sizeof(struct dmcub_firmware_header_v1_0)
 const PSP_HEADER_SIZE: usize = 256; // linux: PSP_HEADER_BYTES_256
 const META_SIZE: usize = 64; // linux: sizeof(union dmub_fw_meta)
@@ -265,6 +267,32 @@ impl<'a> Image<'a> {
         }
         // Linux DMUB_FW_HEADER_SHARED_STATE_SIZE: six 256-byte feature blocks.
         let shared = self.metadata.shared_state_size.max(1536) as usize;
+        self.prepare_regions(vbios, shared)
+    }
+
+    /// DCN 3.5.0 uses the same combined-image layout plus the Region6
+    /// shared-state window Linux's `dmub_dcn35_setup_windows` programs
+    /// (CW3/4/5/6 + REGION5 + REGION6, unlike 3.2 which ignores
+    /// region6). The shared-state contract is the DMUB-wide one
+    /// `prepare_dcn401` encodes: the declared region must fit the
+    /// declared feature blocks, floored at the six 256-byte feature
+    /// blocks. An image declaring no shared state at all keeps a
+    /// zero-size region6, which the Loader leaves unprogrammed.
+    pub fn prepare_dcn35(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
+        let features = self.metadata.shared_state_features as u32;
+        let declared = self.metadata.shared_state_size;
+        if (u16_at(self.bytes, 12), u16_at(self.bytes, 14)) != (3, 5)
+            || !self.data.is_empty()
+            || (features != 0 || declared != 0) && (features + 1) * 256 > declared
+        {
+            return Err(Error::UnsupportedLayout);
+        }
+        // Linux DMUB_FW_HEADER_SHARED_STATE_SIZE: six 256-byte feature blocks.
+        let shared = if declared == 0 {
+            0
+        } else {
+            declared.max(1536) as usize
+        };
         self.prepare_regions(vbios, shared)
     }
 
