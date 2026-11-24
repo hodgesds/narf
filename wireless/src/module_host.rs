@@ -550,7 +550,9 @@ impl WirelessNetIface for ModuleWiphy {
             return Err(error);
         }
         let reported = self
-            .wait_for(CONNECT_TIMEOUT_MS, |state| state.pending != Pending::Connect)
+            .wait_for(CONNECT_TIMEOUT_MS, |state| {
+                state.pending != Pending::Connect
+            })
             .await;
         let outcome = core::mem::replace(&mut self.state.lock().pending, Pending::Idle);
         match outcome {
@@ -998,8 +1000,9 @@ fn register_wiphy(session: &Arc<Session>, request: &[u8]) -> Result<Vec<u8>, i32
     let decoded = decode_register_wiphy(request)?;
     // The wiphy is the module's netdev's: registered by this very module on
     // this very device, with this ifindex.
-    let name = narf_bus::driver_match::module_netif_name(session.owner, session.token, decoded.ifindex)
-        .ok_or(-19)?;
+    let name =
+        narf_bus::driver_match::module_netif_name(session.owner, session.token, decoded.ifindex)
+            .ok_or(-19)?;
     let _guard = REGISTER_GUARD.lock();
     if session.wiphy.lock().is_some() {
         return Err(-16);

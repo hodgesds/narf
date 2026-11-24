@@ -544,7 +544,7 @@ pub type ModuleTxCallGate = fn(u64, ModuleTxCallback, u64, &[u8]) -> i32;
 
 /// Wireless control-plane event callback. The native cfg80211 stack delivers
 /// scan/connect/key requests to a loadable Wi-Fi frontend through this
-/// per-session callback (family `WIFI`, version 1) instead of tunnelling them
+/// per-session callback (family `WIFI`) instead of tunnelling them
 /// through the netif `tx_callback`. `dev_token` is the device token the
 /// session was opened against; `event` is one of the
 /// `narf_wireless::module_host` event ids; `payload` names kernel-owned,
@@ -2513,7 +2513,12 @@ pub fn __install_module_netif_for_test(
             subsystem_id: 0,
         },
     };
-    install_device_ctx(owner, token, device, Cap::<BusDeviceCap, Write>::bootstrap());
+    install_device_ctx(
+        owner,
+        token,
+        device,
+        Cap::<BusDeviceCap, Write>::bootstrap(),
+    );
     let ifindex = module_netif_register_with_context(owner, token, mac, discard_tx).ok()?;
     Some((module_netif_name(owner, token, ifindex)?, ifindex))
 }

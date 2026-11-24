@@ -333,7 +333,11 @@ fn smoke_module_host_connect_encoding_follows_the_offloads() -> TestResult {
         password: b"correct horse".to_vec(),
     };
     let ext = SecurityConfig::External(crate::ExternalSecurity::default());
-    if encode_connect(&req(SecurityConfig::Wpa2 { psk: [0; 32] }), FLAG_SAE_OFFLOAD).is_ok()
+    if encode_connect(
+        &req(SecurityConfig::Wpa2 { psk: [0; 32] }),
+        FLAG_SAE_OFFLOAD,
+    )
+    .is_ok()
         || encode_connect(&req(sae), FLAG_PSK_OFFLOAD).is_ok()
         || encode_connect(&req(ext), all).is_ok()
         || !matches!(encode_connect(&req(SecurityConfig::Open), 0), Ok(ref v) if v[6] == SECURITY_OPEN)
@@ -439,7 +443,11 @@ fn smoke_module_host_register_wiphy_binds_to_the_module_netdev() -> TestResult {
     }
     // A netdev this module does not own (wrong ifindex) is refused, and no
     // report is accepted before a wiphy exists.
-    if report(f.id, OP_REGISTER_WIPHY, &valid_request(f.ifindex + 1000, f.mac)) != -19
+    if report(
+        f.id,
+        OP_REGISTER_WIPHY,
+        &valid_request(f.ifindex + 1000, f.mac),
+    ) != -19
         || report(f.id, OP_SCAN_DONE, &0i32.to_le_bytes()) != -22
     {
         return TestResult::Fail("wiphy bound to a foreign netdev or report without a wiphy");
@@ -474,7 +482,12 @@ fn smoke_module_host_register_wiphy_binds_to_the_module_netdev() -> TestResult {
     if report(f.id, OP_REGISTER_WIPHY, &valid_request(f.ifindex, f.mac)) != -16 {
         return TestResult::Fail("second REGISTER_WIPHY did not fail with EBUSY");
     }
-    if submit(f.id.wrapping_add(0x1000_0000), OP_SCAN_DONE, &0i32.to_le_bytes()) != Err(-19) {
+    if submit(
+        f.id.wrapping_add(0x1000_0000),
+        OP_SCAN_DONE,
+        &0i32.to_le_bytes(),
+    ) != Err(-19)
+    {
         return TestResult::Fail("foreign wireless handle entered the host");
     }
     TestResult::Pass
@@ -554,7 +567,10 @@ extern "C" fn scripted_module(token: u64, event: u32, payload: *const u8, len: u
     LAST_LEN.store(len, Ordering::Release);
     // SAFETY: the gate passes a live payload borrow for the call duration.
     let bytes = unsafe { core::slice::from_raw_parts(payload, len) };
-    LAST_BYTE6.store(bytes.get(6).copied().unwrap_or(0) as usize, Ordering::Release);
+    LAST_BYTE6.store(
+        bytes.get(6).copied().unwrap_or(0) as usize,
+        Ordering::Release,
+    );
     let id = SCRIPT_SESSION.load(Ordering::Acquire);
     let mode = SCRIPT_MODE.load(Ordering::Acquire);
     if mode == 0 {
@@ -565,7 +581,11 @@ extern "C" fn scripted_module(token: u64, event: u32, payload: *const u8, len: u
     }
     match event {
         EVENT_SCAN_REQUEST => {
-            let _ = report(id, OP_SCAN_RESULT, &scan_result(AP, b"narf", 2437, 6, &[0x30, 0]));
+            let _ = report(
+                id,
+                OP_SCAN_RESULT,
+                &scan_result(AP, b"narf", 2437, 6, &[0x30, 0]),
+            );
             let _ = report(id, OP_SCAN_RESULT, &scan_result(AP2, b"lab", 5180, 36, &[]));
             let _ = report(id, OP_SCAN_DONE, &0i32.to_le_bytes());
         }
