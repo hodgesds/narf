@@ -886,6 +886,34 @@ guest-originated DNS query through SLIRP. The ordinary kernel-test module suite
 continues to cover load/unload, capability gates, domain placement, DMA handle
 lifetime, and deterministic descriptor injection.
 
+## Loadable ath11k (WCN6855)
+
+The ath11k driver now builds from one source either built in or as
+`ath11k.ko`. The module runs the whole PCI station path over the KABI:
+
+- MHI, QMI/WLFW, CE, HTC, WMI, DP and the MAC;
+- the in-driver WPA2/WPA3 supplicant;
+- one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
+  family host.
+
+It claims `17cb:1103` only. `narf-drivers-wireless/ath11k-module-only`
+steps the built-in PCI claim aside; AHB stays built in. The module links on
+x86_64 and aarch64, and every undefined symbol is a KABI export.
+
+`modules/e2e/ath11k` loads the real `.ko` and checks:
+
+- relocations and init;
+- the declared `ath11k.*` parameters;
+- the exact PCI claim;
+- refusal of a probe with no device context;
+- clean unload.
+
+Not in the module build: firmware crash recovery, AP/P2P/monitor, WoW and
+system PM, power save, checksum offload and the userspace SME. QEMU has no
+WCN6855, so bring-up through the module (MHI, FW_READY, scan, association)
+is first proven on the Lenovo 21ME (`docs/BOOTING_ON_CACHYOS.md`); that boot
+has not yet run.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

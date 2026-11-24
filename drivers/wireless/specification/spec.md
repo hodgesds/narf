@@ -2513,6 +2513,72 @@ association for an external SAE supplicant remain owned by hostapd through
 registered management frames. These paths have not been run on target silicon
 in this implementation pass.
 
+### 4.2 `ath11k.ko`: the WCN6855 driver as a loadable module
+
+`narf-drivers-wireless-ath11k --no-default-features --features module` is the
+whole PCI station driver (MHI, QMI/WLFW, CE, HTC, WMI, DP and the MAC with
+its in-driver WPA2/WPA3 supplicant) built into a `.ko` (x86_64 and aarch64)
+from the same source as the built-in. Kernel services come from
+`src/ath11k/platform/`, one module re-exporting the same names in both
+builds: `kernel.rs` re-exports the kernel crates; `kabi.rs` implements them
+over `narf-module-rt` and the KABI. `narf-crypto`, `narf-wireless` and
+`narf-drivers-wireless-ath-core` are linked kernel-free (their `kernel`
+feature off).
+
+- **Claim.** `17cb:1103` (WCN6855) only. QCA6390, QCN9074 and the AHB parts
+  stay built-in only. `narf-drivers-wireless/ath11k-module-only` leaves the
+  built-in PCI ids unclaimed so an early-loaded `ath11k.ko` owns the device;
+  the AHB binder stays built in.
+- **Probe** (`pci_kabi.rs`, Linux `ath11k_pci_probe` order).
+  1. `narf_pci_identity`, then the runtime profile check; firmware-owned
+     DMA is retained on teardown from the start.
+  2. `narf_pci_prepare_probe`, then memory decode on.
+  3. BAR0 is mapped; `narf_bar_len` must report at least 1 MiB.
+  4. TCSR, then the hardware revision is refined.
+  5. MSI: `narf_msi_enable` for the chip's full vector count, else one
+     vector with `MSI_CONFIG_ONE`.
+  6. Software reset.
+  7. ASPM L0s/L1 off through `narf_pcie_aspm` (`ath11k_pci_aspm_disable`).
+     It is restored once firmware is up, or on power-down, as in Linux.
+  8. MSI delivery on, then bus master.
+  9. An internal executor runs from the 1 ms poller and every vector's
+     upcall. It carries MHI to mission mode, then QMI to FW_READY, then
+     the core, DP and runtime.
+- **DMA.** All coherent memory comes from `narf_dma_alloc_mapped`, with the
+  CPU pointer accessed directly. KABI DMA handles are never reused, so
+  per-packet buffers come from a size-class pool (4–64 KiB, carved from
+  1 MiB mapped chunks).
+- **Netdev and wiphy** (`iface_module.rs`).
+  - The netif bridge names the netdev `wlan%d`.
+  - `REGISTER_WIPHY` (§4.1) advertises the radio's enabled channels,
+    HT/VHT/HE, eight cipher suites and `PSK_OFFLOAD | SAE_OFFLOAD |
+    REPORTS_DISCONNECT`.
+  - The station subset runs over the same `Shared` runtime and `Mac` the
+    built-in netdev drives:
+    - scan, with the radio-wide scan lease;
+    - connect: open, in-driver PSK, or in-driver SAE. A `CONNECT` without
+      a BSSID resolves to the strongest matching network of the last scan.
+    - disconnect;
+    - link-loss reports from the MAC poll.
+  - RX goes through `narf_netif_rx`; TX is queued into the per-AC TXQs.
+- **Parameters.** `.narf_kparams` declares `ssid`, `psk`, `passphrase` and
+  `scan`, so `ath11k.<name>=` on the kernel command line reaches the
+  autoconnect bring-up aid unchanged.
+- **Not carried (built-in only).**
+  - Firmware crash recovery: the radio stays down until reload, and the
+    driver logs this.
+  - AP, P2P and monitor roles, and virtual interfaces.
+  - WoW and system PM.
+  - Power-save control.
+  - Checksum offload.
+  - The userspace SME (`SecurityConfig::External`).
+- **Proof.** `modules/e2e/ath11k` loads the real `.ko` on both
+  architectures. It checks that the relocations resolve, init runs, the
+  parameters are declared and a load argument applies, exactly the WCN6855
+  id is claimed, a probe with no device context is refused, and unload
+  leaves no match. QEMU emulates no WCN6855, so bring-up and RF behavior
+  are first proven on hardware (`docs/BOOTING_ON_CACHYOS.md`).
+
 ## 5. Buffer Management
 
 - **Data Path**: Uses standard `DmaBuffer` caps provided by `io/spec`.

@@ -280,8 +280,8 @@ pub mod dma {
         bus: u64,
     }
 
-    /// Free blocks per (address-limit, class). Index 0: 32-bit pool;
-    /// index 1: unrestricted.
+    /// Free blocks per (address limit, class). Index 0: the 32-bit pool;
+    /// index 1: unrestricted. Other limits are allocated directly.
     static POOLS: IrqSafeSpinLock<[[Vec<Block>; CLASSES]; 2]> = IrqSafeSpinLock::new([
         [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
@@ -339,7 +339,9 @@ pub mod dma {
     ) -> Result<DmaBuffer, NoMemory> {
         let bits = addr_bits(mask).clamp(32, 64);
         let size = len.max(1).next_power_of_two().max(PAGE);
-        if size > MAX_POOLED {
+        // A pool holds blocks of one address limit: a block carved under a
+        // 64-bit limit must never satisfy a narrower request.
+        if size > MAX_POOLED || !matches!(bits, 32 | 64) {
             let (handle, cpu, bus, got) = mapped(size, bits)?;
             return Ok(DmaBuffer {
                 cpu,
@@ -348,7 +350,7 @@ pub mod dma {
                 origin: Origin::Direct { handle },
             });
         }
-        let pool = usize::from(bits > 32);
+        let pool = usize::from(bits == 64);
         let class = (size / PAGE).trailing_zeros() as usize;
         let block = {
             let mut pools = POOLS.lock();

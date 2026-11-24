@@ -303,9 +303,14 @@ fn alloc_msi(dev: u64, want: &'static hw::MsiConfig) -> Result<MsiState, ProbeEr
         // SAFETY: the four outputs are live locals.
         let rc =
             unsafe { ffi::narf_msi_enable(dev, n, &mut count, &mut base, &mut addr, &mut data) };
+        // The shared MSI code (and the handler table) keys vectors as `u8`;
+        // a block past 255 (possible on aarch64 GICs) is refused, not
+        // truncated onto another device's vectors.
+        let base_irq = u8::try_from(base).ok()?;
+        u8::try_from(u32::from(base) + u32::from(n) - 1).ok()?;
         (rc == 0 && count == n).then_some(MsiState {
             config,
-            base_irq: base as u8,
+            base_irq,
             n_vectors: n as u8,
             addr,
             ep_base_data: data,
@@ -408,6 +413,19 @@ fn bring_up(dev: u64, chip: ChipInfo) -> Result<Ath11kDevice, ProbeError> {
 
 /// Probe thunk the kernel's PCI match calls (task context, module domain).
 extern "C" fn probe_c(dev: u64, _reserved: u64) -> i32 {
+    // Every device export after this point takes the bound token
+    // (`platform::device`): a second function must not replace it.
+    if CONTROLLER.lock().is_some() {
+        return EBUSY;
+    }
+    let rc = probe_device(dev);
+    if rc != 0 && CONTROLLER.lock().is_none() {
+        crate::ath11k::platform::set_device(0);
+    }
+    rc
+}
+
+fn probe_device(dev: u64) -> i32 {
     use core::fmt::Write as _;
     crate::ath11k::platform::set_device(dev);
     let Some(Identity {
@@ -423,9 +441,6 @@ extern "C" fn probe_c(dev: u64, _reserved: u64) -> i32 {
     let Some(chip) = hw::chip_for_pci_id(vendor, device) else {
         return ENODEV;
     };
-    if CONTROLLER.lock().is_some() {
-        return EBUSY;
-    }
     if let Err(error) = validate_runtime_profile(chip.default_hw_rev) {
         let (code, detail) = error.diag_code();
         diag::latch_wifi_error(code, detail);
