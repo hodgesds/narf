@@ -21,14 +21,12 @@
 //! - The MG PLL state is computed by
 //!   `intel_gpu_gen11_dpll::mg_pll_state` (the divisor search
 //!   + ICL MG register packing) and written to direct MMIO at
-//!     0x168xxx + (tc − 1) * 0x1000 — there is no HIP bank, no
-//!     FIA, and no Type-C cold-reference machinery on this path.
-//!     The TC subsystem side (TCSS/FIA lane acquisition,
-//!     `intel_tc.c` / DFLEXDPSP) is NOT modeled here: the modeset
-//!     programs the display side and assumes the TC port is
-//!     already in DP-alt mode with lanes available (firmware or a
-//!     later TCSS lane owns that). If silicon shows AUX failing
-//!     on TC ports, that lane owns it.
+//!     0x168xxx + (tc − 1) * 0x1000 — there is no HIP bank and
+//!     no Type-C cold-reference machinery on this path.
+//! - The FIA side (`icl_tc_phy_ops` in `intel_tc.c`) is `connect` /
+//!   `disconnect` (the `DFLEXDPCSSS` ownership handshake, live mode from
+//!   `DFLEXDPSP`) and `set_fia_lanes` (`DFLEXDPMLE1`), which the modeset
+//!   programs before the PLL.
 //! - The transcoder clock uses the display-11 encoding
 //!   `TRANS_CLK_SEL_PORT(port) = (port + 1) << 29`
 //!   (`intel_ddi_enable_transcoder_clock`, DISPLAY_VER < 12
@@ -435,8 +433,9 @@ impl MgPort {
     }
 
     /// `intel_tc_port_set_fia_lane_count`: the main-link lanes in
-    /// `DFLEXDPMLE1`, lane-reversed (ML3 / ML3_2) on a reversed DP-alt
-    /// connector. Legacy connectors are never reversed here.
+    /// `DFLEXDPMLE1`, lane-reversed (ML3 / ML3_2) only on a legacy
+    /// connector whose board reverses it (`dig_port->lane_reversal`; Linux
+    /// warns on a reversed DP-alt port, whose orientation the FIA owns).
     pub fn set_fia_lanes(
         self,
         io: &(impl MmioWindow + ?Sized),
@@ -701,13 +700,14 @@ impl MgPort {
     /// Start link training on a TC port: the Dekel
     /// `start_training` shape with Gen11 specifics — the
     /// transcoder clock uses the display-11 encoding and
-    /// `DP_TP_CTL` is port-based (DDI base + 0x40). No FIA
-    /// lane programming (see the module header: the TC
-    /// subsystem side is not modeled).
+    /// `DP_TP_CTL` is port-based (DDI base + 0x40).
     ///
     /// On retune (`retune = true`): stop the DDI buffer and
-    /// TP_CTL, disable and re-enable the MG PLL at the new
-    /// rate, and re-route the clock — then proceed as usual.
+    /// TP_CTL, program the retry's FIA lane count, disable and
+    /// re-enable the MG PLL at the new rate, and re-route the
+    /// clock — then proceed as usual. The FIA lanes precede the
+    /// PLL as in `intel_ddi_pre_pll_enable`; the first attempt's
+    /// are the modeset's.
     pub(crate) fn start_training(
         self,
         io: &(impl MmioWindow + ?Sized),
@@ -723,6 +723,7 @@ impl MgPort {
             self.wait_timeout(io, self.ddi.base(), 1 << 7, true, 10)?;
             self.rmw(io, tp, 1 << 31, 0)?;
             self.disable(io)?;
+            self.set_fia_lanes(io, lanes, false)?;
             let refclk = crate::intel_gpu_pll::refclk_khz(self.read(io, DSSM)?);
             let port_clock = port_clock_khz(rate).ok_or(ModesetError::PllLockTimeout)?;
             self.enable(io, port_clock, true, refclk)?;

@@ -1179,6 +1179,15 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.gen11_platform.is_some() || self.gen9_platform.is_some() {
             self.program_cdclk_floor(&mode)?;
         }
+        // Gen11 Type-C: the FIA main-link lane count precedes the PLL
+        // (`intel_ddi_pre_pll_enable` → `intel_tc_port_set_fia_lane_count`).
+        if tc_port && already_trained.is_none() {
+            if let Some(platform) = self.gen11_platform {
+                let lanes = plan.map_or(self.tc_width, |plan| plan.lanes);
+                crate::intel_gpu_gen11_mg_phy::MgPort::new(self.ddi, platform)?
+                    .set_fia_lanes(self.mmio, lanes, false)?;
+            }
+        }
         match (plan, already_trained) {
             (Some(p), _) => self.program_dpll_with_rate(&mode, to_pll_rate(p.rate))?,
             (None, Some(_)) => {}
