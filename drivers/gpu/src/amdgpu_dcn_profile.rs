@@ -141,8 +141,9 @@ mod tests {
         dcn_rdna2_constructors_follow_physical_capacity
     );
     /// DCN 3.1.5 binds only on Raphael, admits the blocks whose layout is
-    /// shared with DCN 3.1.4 or ported (four pipes, as `res_cap_dcn315`), and
-    /// refuses the ones whose layouts differ and are not yet ported.
+    /// shared with DCN 3.1.4 or ported (four pipes, as `res_cap_dcn31` in
+    /// `dcn315_resource.c`), and refuses the ones whose layouts differ and
+    /// are not yet ported.
     fn dcn315_admits_shared_blocks_and_refuses_unported_ones() -> TestResult {
         use crate::{amdgpu, amdgpu_dcn_dccg::Dccg};
         let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
@@ -202,6 +203,51 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/dcn-profile",
         dcn315_admits_shared_blocks_and_refuses_unported_ones
+    );
+
+    /// DCN 3.1.4 (Phoenix) resolves with the resource caps from
+    /// `dcn314_resource.c` (4 pipes, 5 streams, 5 channels:
+    /// `res_cap_dcn314` `num_timing_generator` :884, `num_stream_encoder`
+    /// :888, `num_ddc` :895), and the OTG / stream-encoder constructors
+    /// bound all four pipes / five encoders. Linux 7.4-rc2.
+    fn dcn314_resolves_with_verified_caps() -> TestResult {
+        let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        let mut dcn = gpu.ip_blocks[0];
+        dcn.hw_id = ip::HW_ID_DCN;
+        dcn.instance = 0;
+        dcn.major = 3;
+        dcn.minor = 1;
+        dcn.revision = 4;
+        dcn.num_bases = 4;
+        dcn.base_addrs[..4].copy_from_slice(&[0, 0x1000, 0x4000, 0x9000]);
+        gpu.ip_blocks.push(dcn);
+        let Ok(profile) = Profile::resolve(&gpu) else {
+            return TestResult::Fail("DCN 3.1.4 did not resolve");
+        };
+        if profile != Profile::Dcn314
+            || !profile.is_dcn314()
+            || profile.is_dcn30()
+            || profile.is_dcn32()
+            || (profile.pipes(), profile.streams(), profile.channels()) != (4, 5, 5)
+            || !profile.has_plane_power_gating()
+        {
+            return TestResult::Fail("DCN 3.1.4 resource caps are not dcn314_resource.c's");
+        }
+        let cap = Cap::bootstrap();
+        // SAFETY: constructors only validate the inert maps, never access them.
+        unsafe {
+            if Otg::new(&gpu, cap, 3).is_err() || Otg::new(&gpu, cap, 4).is_ok() {
+                return TestResult::Fail("DCN 3.1.4 OTG capacity is not four pipes");
+            }
+            if Stream::new(&gpu, cap, 4).is_err() || Stream::new(&gpu, cap, 5).is_ok() {
+                return TestResult::Fail("DCN 3.1.4 stream encoder capacity is not five");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/dcn-profile",
+        dcn314_resolves_with_verified_caps
     );
 
     /// DCN 3.1.2 binds only on Rembrandt, admits the blocks whose layout is
@@ -337,8 +383,11 @@ impl Profile {
             Self::Navi22 => 6,
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
-            // linux: n/a (literals in dcn31_resource.c: res_cap_dcn31.num_ddc
-            // and dcn315_resource.c: res_cap_dcn315.num_ddc)
+            // Linux 7.4-rc2: dcn314_resource.c res_cap_dcn314.num_ddc = 5
+            // (:895); dcn315_resource.c res_cap_dcn31.num_ddc = 5 (:882).
+            // (The 3.1.5 caps struct is named res_cap_dcn31, not
+            // res_cap_dcn315; Dcn312's 5 is the dcn31_resource.c
+            // res_cap_dcn31.num_ddc literal.)
             Self::Dcn312 | Self::Dcn314 | Self::Dcn315 => 5,
             // linux: n/a (literals in dcn32_resource.c / dcn321_resource.c:
             // res_cap_dcn32.num_ddc / res_cap_dcn321.num_ddc)
@@ -390,7 +439,8 @@ impl Profile {
             {
                 Ok(Self::Dcn303)
             }
-            (3, 1, 4) => Ok(Self::Dcn314), // linux: n/a (DCN 3.1.4 path)
+            // Linux 7.4-rc2: dc/resource/dcn314/dcn314_resource.c.
+            (3, 1, 4) => Ok(Self::Dcn314),
             // Bound to the one id that carries it, as DCN 3.1.5 is: Linux's
             // DCN 3.1.2 case covers no other shipping part.
             (3, 1, 2)
@@ -418,10 +468,13 @@ impl Profile {
             Self::Navi22 => 6,
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
-            Self::Dcn314 => 4, // linux: n/a (DCN 3.1.4 path)
-            // linux: n/a (literals in dcn31_resource.c:
-            // res_cap_dcn31.num_timing_generator and dcn315_resource.c:
-            // res_cap_dcn315.num_timing_generator)
+            // Linux 7.4-rc2: dcn314_resource.c res_cap_dcn314
+            // .num_timing_generator = 4 (:884).
+            Self::Dcn314 => 4,
+            // Linux 7.4-rc2: dcn315_resource.c res_cap_dcn31
+            // .num_timing_generator = 4 (:871). The caps struct is named
+            // res_cap_dcn31, not res_cap_dcn315; Dcn312's 4 is the
+            // dcn31_resource.c res_cap_dcn31.num_timing_generator literal.
             Self::Dcn312 | Self::Dcn315 => 4,
             // linux: n/a (literals in dcn32_resource.c / dcn321_resource.c:
             // res_cap_dcn32.num_timing_generator / res_cap_dcn321.num_timing_generator)
@@ -434,10 +487,13 @@ impl Profile {
             Self::Navi22 => 6,
             Self::Dcn302 => 5,
             Self::Dcn303 => 2,
-            Self::Dcn314 => 5, // linux: n/a (DCN 3.1.4 path)
-            // linux: n/a (literals in dcn31_resource.c:
-            // res_cap_dcn31.num_stream_encoder and dcn315_resource.c:
-            // res_cap_dcn315.num_stream_encoder)
+            // Linux 7.4-rc2: dcn314_resource.c res_cap_dcn314
+            // .num_stream_encoder = 5 (:888).
+            Self::Dcn314 => 5,
+            // Linux 7.4-rc2: dcn315_resource.c res_cap_dcn31
+            // .num_stream_encoder = 5 (:875). The caps struct is named
+            // res_cap_dcn31, not res_cap_dcn315; Dcn312's 5 is the
+            // dcn31_resource.c res_cap_dcn31.num_stream_encoder literal.
             Self::Dcn312 | Self::Dcn315 => 5,
             // linux: n/a (literals in dcn32_resource.c / dcn321_resource.c:
             // res_cap_dcn32.num_stream_encoder / res_cap_dcn321.num_stream_encoder)
@@ -449,7 +505,7 @@ impl Profile {
             Self::Dcn302 => &[(3, 0, 2)],
             Self::Dcn303 => &[(3, 0, 3)],
             Self::Navi22 => &[(3, 0, 0)], // linux: n/a (DCE_HWIP IP_VERSION(3, 0, 0))
-            Self::Dcn314 => &[(3, 1, 4)], // linux: n/a (DCN 3.1.4 path)
+            Self::Dcn314 => &[(3, 1, 4)], // Linux 7.4-rc2: dcn314_resource.c.
             Self::Dcn312 => &[(3, 1, 2)], // linux: n/a (DCE_HWIP IP_VERSION(3, 1, 2))
             Self::Dcn315 => &[(3, 1, 5)], // linux: n/a (DCE_HWIP IP_VERSION(3, 1, 5))
             Self::Dcn320 => &[(3, 2, 0)], // linux: n/a (DCN 3.2.0 path)
