@@ -827,10 +827,15 @@ generation gates below.
   `LegacyGt::Gen9Lp` (CHV snooping PPAT, Broxton MOCS, the LP
   workarounds, one slice of three subslices with pooled EUs,
   the 19.2 MHz crystal, `BXT_RP_STATE_CAP`, RC6 behind
-  `bxt_check_bios_rc6_setup`). The display stays out: its DPIO
-  PHY and DBUF geometry (512−4 / 1024−4 blocks, Linux
-  `display/intel_display_device.c:848,863`) are not modelled,
-  so a GOP framebuffer is kept only as fixed-mode KMS.
+  `bxt_check_bios_rc6_setup`). The display runs the Skylake
+  modeset with the LP blocks in place (`Modeset::gen9_lp`): the
+  DPIO PHY (`intel_gpu_bxt_phy`), per-port PLLs
+  (`intel_gpu_bxt_dpll`), the DE-PLL CDCLK (`intel_gpu_bxt_cdclk`),
+  the 512−4 / 1024−4 DBUF (Linux
+  `display/intel_display_device.c:848,863`), Gemini Lake's
+  display-10 watermarks, the PPS at `PPS_BASE`, and DP/HDMI on DDI
+  B/C with the display-engine hotplug bank (`HpdBank::Bxt`). A GOP
+  framebuffer stays fixed-mode KMS when no modeset runs.
   Not run on silicon.
 - Arrow Lake display — identification landed (#1023, §5);
   display support rides #1016's Xe-LPG family via the shared

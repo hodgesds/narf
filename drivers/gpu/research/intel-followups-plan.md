@@ -116,6 +116,39 @@ did.
     HDCP needs the same MEI/CSME client as PXP. The PUNIT blob stays
     excluded: it is firmware NARF does not load.
 
+## Status after #2489 (`feat/intel-gpu-remaining`)
+
+#2489 landed lanes 0-8 and most of 9 and 10. Several §20 capability rows
+still read Open for work the code now has (LNL/PTL FBC, i915
+`GEM_USERPTR`). This branch then landed:
+
+- the Lunar Lake panel's PHY/AUX in the PICA block (and PTL's PSR AUX);
+- Gen9/Gen11 RPS and RC6 under a busy/idle governor, per-engine reset with
+  innocent replay, the golden render state (#2489) and BCS0/VCS0/VECS0
+  beside RCS0;
+- fixed-mode KMS beside a running GT on Meteor/Arrow Lake desktops and on
+  Nova Lake-S (`narf.intel.nvl_display=1`, display-preserving GT start);
+- the devcoredump wall-clock snapshot time, and the guilty context's
+  process (`narf_filesystem::caller`, installed by userspace);
+- fixed-mode KMS on Gen9 and Gen11 desktops;
+- Broxton and Gemini Lake: identity, the Gen9-LP GT profile on the
+  execlists owner (CHV PPAT, Broxton MOCS, LP workarounds, pooled EUs,
+  BXT RPS, RC6 behind the BIOS check), and the display: the DPIO PHY,
+  port PLLs and CDCLK, the eDP modeset, and DP/HDMI on DDI B and C with
+  the display-engine hotplug bank (fixed-mode KMS when no modeset runs);
+- Gen11 VCS0/VECS0 engine reset with the SFC lock;
+- Gen9/Gen11 timeslicing and priority-band preemption (Linux's execlists
+  preempt-to-busy model).
+
+Still open, each needing its own grounding first:
+
+- Gen9-LP display remainders: the VBT HPD-invert bits, Gemini Lake's
+  YCbCr 4:2:0 and HDMI 2.0 scrambling, DC states.
+- The Nova Lake-S owned modeset through the LT PHY.
+- The MEI/CSME GSC proxy, and PXP and HDCP behind it.
+- D3cold through `_PR3` power resources (NARF evaluates no AML), and
+  VRAM PRIME/P2P.
+
 ## Shared files
 
 The display session layer (`intel_gpu_modeset.rs`, the hotplug service)
