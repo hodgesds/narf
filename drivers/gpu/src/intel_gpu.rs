@@ -1787,6 +1787,32 @@ impl crate::intel_gpu_aux::MmioWindow for ModeWindow {
             _ => None,
         }
     }
+    fn gen11_display_platform(&self) -> Option<crate::intel_gpu_gt::Gen11Platform> {
+        match crate::intel_gpu_gt::GtPlatform::from_pci(
+            self.device.id.vendor,
+            self.device.id.device,
+        ) {
+            Some(crate::intel_gpu_gt::GtPlatform::Gen11(platform)) => Some(platform),
+            _ => None,
+        }
+    }
+    fn gen9_display_platform(
+        &self,
+    ) -> Option<(
+        crate::intel_gpu_gt::Gen9Platform,
+        crate::intel_gpu_gen9_ddi::SkuFamily,
+    )> {
+        match crate::intel_gpu_gt::GtPlatform::from_pci(
+            self.device.id.vendor,
+            self.device.id.device,
+        ) {
+            Some(crate::intel_gpu_gt::GtPlatform::Gen9(platform)) => Some((
+                platform,
+                crate::intel_gpu_gen9_ddi::sku_family_for_did(self.device.id.device),
+            )),
+            _ => None,
+        }
+    }
     fn tgl_uy(&self) -> bool {
         crate::intel_gpu_gen12_combo_phy::is_tgl_uy(self.device.id.device)
     }
@@ -2122,7 +2148,7 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
             Ok(conn) => (conn, true),
             Err(_) => (
                 crate::intel_gpu_dp::DpConnection {
-                    family,
+                    family: crate::intel_gpu_aux::SourceFamily::Gen12(family),
                     ddi,
                     pipe,
                     mode: probe.mode,

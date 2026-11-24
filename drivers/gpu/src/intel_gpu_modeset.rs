@@ -577,6 +577,25 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             .map_or((mode.h_active, mode.v_active), |(w, h, _)| (w, h))
     }
 
+    /// Configure the run for `family`: the Gen12 family, or the Gen11 /
+    /// Gen9 sub-platform (with the Gen9 SKU family) whose per-step
+    /// branches the modeset takes.
+    pub(crate) fn set_source_family(&mut self, family: crate::intel_gpu_aux::SourceFamily) {
+        use crate::intel_gpu_aux::SourceFamily;
+        match family {
+            SourceFamily::Gen12(family) => self.set_gen12_family(family),
+            SourceFamily::Gen11(platform) => {
+                self.gen12_family = None;
+                self.set_gen11_platform(platform);
+            }
+            SourceFamily::Gen9 { platform, sku } => {
+                self.gen12_family = None;
+                self.set_gen9_platform(platform);
+                self.set_gen9_sku_family(sku);
+            }
+        }
+    }
+
     pub(crate) fn set_gen12_family(&mut self, family: crate::intel_gpu_gt::Gen12Platform) {
         self.gen12_family = Some(family);
     }

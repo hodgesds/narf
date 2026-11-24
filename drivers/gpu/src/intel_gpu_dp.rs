@@ -438,7 +438,7 @@ pub struct DpSinkProbe {
 #[derive(Clone, Debug)]
 pub struct DpConnection {
     /// Exact source family retained through retrain/disconnect.
-    pub family: crate::intel_gpu_gt::Gen12Platform,
+    pub family: crate::intel_gpu_aux::SourceFamily,
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
     /// The pipe scanning this connection out, claimed from
@@ -625,15 +625,14 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
     pipe: Pipe,
     dbuf_share: Option<(u16, u16)>,
 ) -> Result<DpConnection, DpError> {
-    let family = mmio
-        .gen12_display_family()
+    let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(DpError::Modeset(ModesetError::UnsupportedGeneration))?;
     let plan = LinkPlan {
         rate: probe.negotiated.rate,
         lanes: probe.negotiated.lanes,
     };
     let mut modeset = Modeset::for_pipe(mmio, probe.ddi, pipe);
-    modeset.set_gen12_family(family);
+    modeset.set_source_family(family);
     if let Some((start, end)) = dbuf_share {
         modeset.set_dbuf_share(start, end);
     }
@@ -662,8 +661,10 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
     // (Card::vrr_enabled) is the install hook's job — this path
     // has no card index in scope — and the sequencing lane (#1769)
     // owns publishing modeset results to the card.
-    if pipe == Pipe::A {
-        let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(family);
+    // VRR is modelled for the Gen12 display IPs only; Gen11 and Gen9
+    // sessions scan out at a fixed rate.
+    if let (Pipe::A, Some(gen12)) = (pipe, family.gen12()) {
+        let ip = crate::intel_gpu_vrr::DisplayVrrIp::from_gen12_platform(gen12);
         crate::intel_gpu_vrr::reconcile_vrr_at_setup(
             mmio,
             crate::intel_gpu_vrr::VrrTranscoder::A,
@@ -718,7 +719,7 @@ pub fn connect_on_pipe<M: MmioWindow + ?Sized>(
     fb: &Framebuffer,
     pipe: Pipe,
 ) -> Result<DpConnection, DpError> {
-    mmio.gen12_display_family()
+    crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(DpError::Modeset(ModesetError::UnsupportedGeneration))?;
     let probe = probe_sink(mmio, ddi)?;
     activate_on_pipe(mmio, &probe, fb, pipe, None)
@@ -729,7 +730,7 @@ pub fn connect_on_pipe<M: MmioWindow + ?Sized>(
 /// an ELD whose display is already gone. False means source refusal or an
 /// unobserved/partial local stop; the caller must retain the session graph.
 pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) -> bool {
-    if mmio.gen12_display_family() != Some(conn.family) {
+    if crate::intel_gpu_aux::SourceFamily::of(mmio) != Some(conn.family) {
         return false;
     }
     if conn.audio_published {
@@ -737,7 +738,7 @@ pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) -> bool
         clear_display_audio(sink_id_for(conn.ddi));
     }
     let mut modeset = Modeset::for_pipe(mmio, conn.ddi, conn.pipe);
-    modeset.set_gen12_family(conn.family);
+    modeset.set_source_family(conn.family);
     modeset.try_teardown().is_ok()
 }
 
@@ -752,7 +753,7 @@ pub fn retrain<M: MmioWindow + ?Sized>(
     conn: &DpConnection,
     fb: &Framebuffer,
 ) -> Result<DpConnection, DpError> {
-    if mmio.gen12_display_family() != Some(conn.family) {
+    if crate::intel_gpu_aux::SourceFamily::of(mmio) != Some(conn.family) {
         return Err(DpError::Modeset(ModesetError::UnsupportedGeneration));
     }
     let mut aux = IntelAux::new(mmio, conn.ddi);
@@ -1902,7 +1903,10 @@ pub mod tests {
             );
             *mmio.family.borrow_mut() = Some(family);
             let conn = connect_on_pipe(&mmio, Ddi::B, &test_fb(), Pipe::B).unwrap();
-            assert_eq!(conn.family, family);
+            assert_eq!(
+                conn.family,
+                crate::intel_gpu_aux::SourceFamily::Gen12(family)
+            );
             assert_eq!(mmio.writes_to(0x71180).last(), Some(&expected));
             let before = mmio.writes.borrow().len();
             let other = if family == Gen12Platform::AlderLakeP {

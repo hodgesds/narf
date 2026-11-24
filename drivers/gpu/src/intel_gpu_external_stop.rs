@@ -113,7 +113,9 @@ impl<L> Session<L> {
         if self.phase == Phase::Quarantined {
             return Err(FsError::NoDevice);
         }
-        if !io.display_access_ok() || io.gen12_display_family() != Some(self.conn.family) {
+        if !io.display_access_ok()
+            || crate::intel_gpu_aux::SourceFamily::of(io) != Some(self.conn.family)
+        {
             return Err(FsError::NoDevice);
         }
         let old = self.original.ok_or(FsError::NoDevice)?;
@@ -305,9 +307,13 @@ fn checked(io: &impl MmioWindow, r: u64, v: u32) -> Result<(), FsError> {
 }
 impl Original {
     fn capture(io: &impl MmioWindow, c: &DpConnection, fb: &Framebuffer) -> Result<Self, FsError> {
-        if io.gen12_display_family() != Some(c.family)
+        // The stop proof is the Gen12 DDI B one.
+        let Some(family) = c.family.gen12() else {
+            return Err(FsError::Unsupported);
+        };
+        if io.gen12_display_family() != Some(family)
             || c.ddi != crate::intel_gpu_ddi::Ddi::B
-            || c.family == crate::intel_gpu_gt::Gen12Platform::AlderLakeS
+            || family == crate::intel_gpu_gt::Gen12Platform::AlderLakeS
             || !matches!(c.pipe, Pipe::A | Pipe::B | Pipe::C)
         {
             return Err(FsError::Unsupported);
@@ -362,7 +368,7 @@ impl Original {
                 != (u32::from(c.mode.v_active) - 1) << 16 | (u32::from(c.mode.h_active) - 1)
             || read(io, trans.base() + 0x1c)?
                 != (u32::from(c.mode.h_active) - 1) << 16 | (u32::from(c.mode.v_active) - 1)
-            || o.ctl != crate::intel_gpu_pipes::gen12_xrgb_control(c.family)
+            || o.ctl != crate::intel_gpu_pipes::gen12_xrgb_control(family)
             || o.stride != fb.stride_bytes / 64
             || u64::from(o.surf) != fb.phys_addr
             || o.function != route
@@ -397,7 +403,8 @@ fn idle_companions(io: &impl MmioWindow, c: &DpConnection) -> Result<(), FsError
     {
         return Err(FsError::Unsupported);
     }
-    for plane in 2..=crate::intel_gpu_pipes::gen12_plane_count(c.family) {
+    let family = c.family.gen12().ok_or(FsError::Unsupported)?;
+    for plane in 2..=crate::intel_gpu_pipes::gen12_plane_count(family) {
         if read(io, base + 0x80 + plane * 0x100)? & (1 << 31) != 0 {
             return Err(FsError::Unsupported);
         }

@@ -419,6 +419,30 @@ pub const fn gen12_ddc_pin(family: Gen12Platform, ddi: Ddi) -> Option<PinPair> {
     }
 }
 
+/// The default DDC pin of a Gen11 DDI, with no VBT pin
+/// (`intel_hdmi_default_ddc_pin`). Ice Lake's ICP takes
+/// `icl_encoder_to_ddc_pin`: a combo port gets `GMBUS_PIN_1 + port`, a
+/// Type-C port `GMBUS_PIN_9_TC1 + tc`. Elkhart/Jasper Lake depend on the
+/// PCH beyond A and B: MCC is TGP-compatible and takes
+/// `mcc_encoder_to_ddc_pin` (PHY C → pin 9, PORT_D on PHY A → pin 1),
+/// while JSP is ICP-compatible (C → pin 3, D → pin 4, which
+/// `gmbus_pins_icp` lacks). Without the PCH, C and D have no default.
+pub const fn gen11_ddc_pin(
+    platform: crate::intel_gpu_gt::Gen11Platform,
+    ddi: Ddi,
+) -> Option<PinPair> {
+    use crate::intel_gpu_gt::Gen11Platform;
+    match (platform, ddi) {
+        (_, Ddi::A) => Some(PinPair::Pin1Bxt),
+        (_, Ddi::B) => Some(PinPair::Pin2Bxt),
+        (Gen11Platform::IceLake, Ddi::C) => Some(PinPair::Pin9Tc1),
+        (Gen11Platform::IceLake, Ddi::D) => Some(PinPair::Pin10Tc2),
+        (Gen11Platform::IceLake, Ddi::E) => Some(PinPair::Pin11Tc3),
+        (Gen11Platform::IceLake, Ddi::F) => Some(PinPair::Pin12Tc4),
+        _ => None,
+    }
+}
+
 /// The default DDC pin of a Gen9 DDI, with no VBT pin:
 /// `g4x_encoder_to_ddc_pin` (SPT) / `cnp_encoder_to_ddc_pin`
 /// (CNP) in `intel_hdmi.c`.

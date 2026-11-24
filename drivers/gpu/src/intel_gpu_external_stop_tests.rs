@@ -115,7 +115,7 @@ impl Io {
     }
     fn conn(&self) -> DpConnection {
         DpConnection {
-            family: self.family,
+            family: crate::intel_gpu_aux::SourceFamily::Gen12(self.family),
             ddi: self.ddi,
             pipe: self.pipe,
             mode: Mode::VESA_1024X768_60,

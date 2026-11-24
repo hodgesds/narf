@@ -535,7 +535,7 @@ pub struct HdmiSinkProbe {
 #[derive(Clone, Debug)]
 pub struct HdmiConnection {
     /// Exact source family retained through disconnect.
-    pub family: crate::intel_gpu_gt::Gen12Platform,
+    pub family: crate::intel_gpu_aux::SourceFamily,
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
     /// The mode being scanned out.
@@ -591,10 +591,9 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
     ddi: Ddi,
     ddc: &Gen12DdcOverrides,
 ) -> Result<HdmiSinkProbe, HdmiError> {
-    let family = mmio
-        .gen12_display_family()
+    let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
-    let pin = ddc.pin(family, ddi).ok_or(DdcError::NoPinPair)?;
+    let pin = ddc_pin(family, ddc, ddi).ok_or(DdcError::NoPinPair)?;
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
     let hf_vsdb = parse_hf_vsdb(&edid[..edid_len]);
@@ -624,8 +623,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     probe: &HdmiSinkProbe,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
-    let family = mmio
-        .gen12_display_family()
+    let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
     let pin = probe.pin;
     let mut scrambling = false;
@@ -634,7 +632,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
         scrambling = true;
     }
     let mut modeset = Modeset::new(mmio, probe.ddi);
-    modeset.set_gen12_family(family);
+    modeset.set_source_family(family);
     let mode = modeset.modeset_hdmi(fb, &probe.mode, scrambling, scrambling)?;
 
     let frame = pack_avi_infoframe(&mode);
@@ -682,7 +680,7 @@ pub fn connect<M: MmioWindow + ?Sized>(
     ddc: &Gen12DdcOverrides,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
-    mmio.gen12_display_family()
+    crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
     let probe = probe_sink(mmio, ddi, ddc)?;
     activate(mmio, &probe, fb)
@@ -697,7 +695,7 @@ pub fn connect<M: MmioWindow + ?Sized>(
 /// source refusal or an unobserved/partial local stop; retain the
 /// complete session.
 pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bool {
-    if mmio.gen12_display_family() != Some(conn.family) {
+    if crate::intel_gpu_aux::SourceFamily::of(mmio) != Some(conn.family) {
         return false;
     }
     if conn.audio_published {
@@ -709,8 +707,25 @@ pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bo
         let _ = handle_sink_scrambling(mmio, conn.pin, false, false);
     }
     let mut modeset = Modeset::new(mmio, conn.ddi);
-    modeset.set_gen12_family(conn.family);
+    modeset.set_source_family(conn.family);
     modeset.try_teardown().is_ok()
+}
+
+/// The HDMI DDC pin for `ddi` on `family`: the Gen12 VBT overrides or
+/// platform default, the Gen11 ICP default (`gen11_ddc_pin`). Gen9's
+/// default depends on the PCH (SPT or CNP pin table), which the session
+/// does not observe, so a Gen9 HDMI session has no pin yet.
+fn ddc_pin(
+    family: crate::intel_gpu_aux::SourceFamily,
+    ddc: &Gen12DdcOverrides,
+    ddi: Ddi,
+) -> Option<PinPair> {
+    use crate::intel_gpu_aux::SourceFamily;
+    match family {
+        SourceFamily::Gen12(family) => ddc.pin(family, ddi),
+        SourceFamily::Gen11(platform) => crate::intel_gpu_gmbus::gen11_ddc_pin(platform, ddi),
+        SourceFamily::Gen9 { .. } => None,
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1832,7 +1847,10 @@ pub mod tests {
             );
             *mmio.family.borrow_mut() = Some(family);
             let conn = connect(&mmio, ddi, &Gen12DdcOverrides::NONE, &test_fb(8192)).unwrap();
-            assert_eq!(conn.family, family);
+            assert_eq!(
+                conn.family,
+                crate::intel_gpu_aux::SourceFamily::Gen12(family)
+            );
             assert_eq!(mmio.writes_to(0x70180).last(), Some(&expected));
             let before = mmio.writes.borrow().len();
             *mmio.family.borrow_mut() = Some(if family == Gen12Platform::AlderLakeP {
@@ -1875,5 +1893,92 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hdmi",
         smoke_hdmi_source_family_arb_slots_and_missing_foreign_metadata_refusal
+    );
+
+    /// A mapping that reports one Gen11 or Gen9 identity and nothing else.
+    struct Identity {
+        gen11: Option<crate::intel_gpu_gt::Gen11Platform>,
+        gen9: Option<(
+            crate::intel_gpu_gt::Gen9Platform,
+            crate::intel_gpu_gen9_ddi::SkuFamily,
+        )>,
+    }
+    impl MmioWindow for Identity {
+        fn gen11_display_platform(&self) -> Option<crate::intel_gpu_gt::Gen11Platform> {
+            self.gen11
+        }
+        fn gen9_display_platform(
+            &self,
+        ) -> Option<(
+            crate::intel_gpu_gt::Gen9Platform,
+            crate::intel_gpu_gen9_ddi::SkuFamily,
+        )> {
+            self.gen9
+        }
+        fn read32(&self, _: u64) -> u32 {
+            0
+        }
+        fn write32(&self, _: u64, _: u32) {}
+    }
+
+    /// Gen11 and Gen9 sources reach the session layer: `SourceFamily::of`
+    /// reports them (Gen12 metadata first), the Ice Lake HDMI pin follows
+    /// `icl_encoder_to_ddc_pin`, and the PCH-dependent pins (EHL/JSL C/D,
+    /// every Gen9 port) have no default.
+    fn smoke_hdmi_gen11_gen9_source_families() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gen9_ddi::SkuFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen9Platform};
+        let icl = Identity {
+            gen11: Some(Gen11Platform::IceLake),
+            gen9: None,
+        };
+        let kbl = Identity {
+            gen11: None,
+            gen9: Some((Gen9Platform::KabyLake, SkuFamily::Ult)),
+        };
+        let none = Identity {
+            gen11: None,
+            gen9: None,
+        };
+        if SourceFamily::of(&icl) != Some(SourceFamily::Gen11(Gen11Platform::IceLake))
+            || SourceFamily::of(&kbl)
+                != Some(SourceFamily::Gen9 {
+                    platform: Gen9Platform::KabyLake,
+                    sku: SkuFamily::Ult,
+                })
+            || SourceFamily::of(&none).is_some()
+        {
+            return TestResult::Fail("SourceFamily::of must report the mapping's identity");
+        }
+        let ddc = Gen12DdcOverrides::NONE;
+        let gen11 = |p, ddi| ddc_pin(SourceFamily::Gen11(p), &ddc, ddi);
+        if gen11(Gen11Platform::IceLake, Ddi::A) != Some(PinPair::Pin1Bxt)
+            || gen11(Gen11Platform::IceLake, Ddi::D) != Some(PinPair::Pin10Tc2)
+            || gen11(Gen11Platform::JasperLake, Ddi::B) != Some(PinPair::Pin2Bxt)
+            || gen11(Gen11Platform::JasperLake, Ddi::C).is_some()
+            || gen11(Gen11Platform::ElkhartLake, Ddi::D).is_some()
+        {
+            return TestResult::Fail("Gen11 DDC defaults must follow icl_encoder_to_ddc_pin");
+        }
+        let gen9 = SourceFamily::Gen9 {
+            platform: Gen9Platform::Skylake,
+            sku: SkuFamily::Desktop,
+        };
+        if ddc_pin(gen9, &ddc, Ddi::B).is_some() {
+            return TestResult::Fail("a Gen9 pin needs the PCH's pin table");
+        }
+        // Probing without a family still refuses before any access.
+        if !matches!(
+            probe_sink(&none, Ddi::B, &ddc),
+            Err(HdmiError::Modeset(ModesetError::UnsupportedGeneration))
+        ) {
+            return TestResult::Fail("a mapping with no family must refuse");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_gen11_gen9_source_families
     );
 }
