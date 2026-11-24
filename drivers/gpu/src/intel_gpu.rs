@@ -2790,7 +2790,8 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
             }
             Generation::PantherLake => {
                 let flush = crate::intel_gpu_xe3lpd::wa_15015404425_active(&window);
-                let view = crate::intel_gpu_xe3lpd::View::new(&window, flush);
+                let view = crate::intel_gpu_xe3lpd::View::new(&window, flush)
+                    .with_c20_port_b(profile.c20_port_b());
                 mtl_external_pass_profile(
                     &view,
                     profile,

@@ -289,6 +289,14 @@ pub trait MmioWindow {
     fn cx0_xe3(&self) -> bool {
         false
     }
+    /// Whether DDI B's Cx0 PHY is a C20 (`intel_encoder_is_c10phy` false
+    /// for PHY B): Panther Lake 30.00 only. Meteor and Lunar Lake put a C10
+    /// behind PHY B, and so does Wildcat Lake (`phy <= PHY_B`). Only the
+    /// Panther Lake external view answers `true`; every wrapper between it
+    /// and the PHY code forwards it.
+    fn cx0_c20_port_b(&self) -> bool {
+        false
+    }
     /// Whether this exact source platform has Linux's LT PHY. This is a
     /// platform fact, not a display-version test: current Linux defines
     /// `HAS_LT_PHY(display)` as `platform.novalake`, while display-30

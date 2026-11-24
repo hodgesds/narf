@@ -154,6 +154,7 @@ kernel_test_in!(
 
 fn dp_pll_request_for_test(port: XeLpgPort) -> PllRequest {
     crate::intel_gpu_xelpg::dp_pll_request(
+        port.phy(),
         port,
         crate::intel_gpu_pll::LinkRate::DpHbr2,
         4,

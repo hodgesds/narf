@@ -440,6 +440,7 @@ impl ExtFake {
     fn light_panel_ip(&self, ip: DisplayIp) -> Option<Mode> {
         let mode = Mode::VESA_1024X768_60;
         self.display_ip.set(ip);
+        self.phy.c20_port_b.set(ip == DisplayIp::Xe3Lpd);
         let release = if ip == DisplayIp::WildcatLake { 2 } else { 0 };
         self.phy
             .write32(0x5_10A0, (u32::from(ip.ver()) << 22) | (release << 14));
@@ -534,6 +535,9 @@ impl MmioWindow for ExtFake {
     }
     fn cx0_xe3(&self) -> bool {
         self.display_ip.get().is_display30()
+    }
+    fn cx0_c20_port_b(&self) -> bool {
+        self.phy.c20_port_b.get()
     }
     fn read32(&self, off: u64) -> u32 {
         if !self.access.get() {
@@ -955,6 +959,70 @@ fn smoke_lnl_external_tc_dp_alt_uses_display20_d2d() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_lnl_external_tc_dp_alt_uses_display20_d2d
+);
+
+/// Panther Lake's DDI B is a non-Type-C C20 (`intel_encoder_is_c10phy`):
+/// the route programs it without Type-C ownership, stages a DP 1.4
+/// `mtl_c20_dp_*` MPLLB state through the C20 SRAM window (the states
+/// `xe3lpd_c20_dp_edp_tables` carries at those rates), never opens the C10
+/// VDR batch, and powers the PHY down to P4PG when it stops.
+fn smoke_ptl_external_ddi_b_programs_its_c20() -> TestResult {
+    use crate::intel_gpu_xelpg::{
+        c20_pll_state, lane_powerdown_new_state, phy_kind, PhyKind, C10_VDR_CONTROL_1,
+        P4PG_STATE_DISABLE, POWERDOWN_NEW_STATE_MASK_BOTH,
+    };
+    let port = XeLpgPort::B;
+    let io = ExtFake::new(port, Sink::new(0x14, edid_1024()));
+    let Some(panel) = io.light_panel_ip(DisplayIp::Xe3Lpd) else {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    };
+    if phy_kind(&io, port) != PhyKind::C20 {
+        return TestResult::Fail("Panther Lake DDI B must be a C20");
+    }
+    let probe = match probe_sink(&io, Generation::PantherLake, port, false) {
+        Ok(probe) => probe,
+        Err(_) => return TestResult::Fail("PTL DDI B probe must succeed"),
+    };
+    if probe.tc.is_some() || probe.display_version() != 30 {
+        return TestResult::Fail("PTL DDI B has no Type-C ownership and keeps display 30");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let display = MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: &NoPipeDmc,
+    };
+    let mut route = match activate(&io, probe, fb, &display) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("PTL DDI B DP must activate beside Pipe A"),
+    };
+    let words = io.phy.sram_values();
+    let staged = [162_000u32, 270_000, 540_000, 810_000].iter().any(|clock| {
+        c20_pll_state(*clock).is_some_and(|s| s.mpllb.iter().all(|w| words.contains(w)))
+    });
+    if !staged {
+        return TestResult::Fail("the C20 SRAM must hold a DP 1.4 MPLLB state");
+    }
+    if (0..2).any(|lane| io.phy.vdr_get(lane, C10_VDR_CONTROL_1) != 0) {
+        return TestResult::Fail("a C20 port must never open the C10 VDR batch");
+    }
+    if route.stop(&io).is_err() || route.state() != RouteState::Stopped {
+        return TestResult::Fail("PTL DDI B must stop");
+    }
+    let p4pg = lane_powerdown_new_state(0, P4PG_STATE_DISABLE)
+        | lane_powerdown_new_state(1, P4PG_STATE_DISABLE);
+    if !io
+        .phy
+        .writes_to(port.buf_ctl2())
+        .iter()
+        .any(|w| w & POWERDOWN_NEW_STATE_MASK_BOTH == p4pg)
+    {
+        return TestResult::Fail("the C20 DDI B must power down to P4PG");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ptl_external_ddi_b_programs_its_c20
 );
 
 fn smoke_ptl_external_tc_dp_uses_fixed_vrr_tg() -> TestResult {
@@ -1405,11 +1473,15 @@ fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
         != Some(ExternalError::UnsupportedGeneration)
         || probe_sink(&NoAccess, Generation::MeteorLake, XeLpgPort::A, false).err()
             != Some(ExternalError::UnsupportedPort)
-        || probe_sink(&NoAccess, Generation::PantherLake, XeLpgPort::B, false).err()
+        || probe_sink(&NoAccess, Generation::PantherLake, XeLpgPort::A, false).err()
             != Some(ExternalError::UnsupportedPort)
         || !ExternalDisplayProfile::for_ip(DisplayIp::Xe2Lpd).admits_port(XeLpgPort::B)
         || ExternalDisplayProfile::for_ip(DisplayIp::Xe2Lpd).admits_port(XeLpgPort::A)
-        || ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd).admits_port(XeLpgPort::B)
+        || !ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd).admits_port(XeLpgPort::B)
+        || ExternalDisplayProfile::WILDCAT_LAKE.admits_port(XeLpgPort::B)
+        || !ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd).c20_port_b()
+        || ExternalDisplayProfile::WILDCAT_LAKE.c20_port_b()
+        || ExternalDisplayProfile::for_ip(DisplayIp::Xe2Lpd).c20_port_b()
         || probe_link_profile(
             &NoAccess,
             ExternalDisplayProfile::WILDCAT_LAKE,
@@ -2658,7 +2730,18 @@ fn smoke_mtl_dp_ssc_follows_vbt_and_sink_downspread() -> TestResult {
     // intel_c10pll_update_pll: the non-SSC C10 state zeroes PLL bytes 4..8
     // and keeps the rest; C20 tables are used as shipped.
     let rate = crate::intel_gpu_pll::LinkRate::DpHbr2;
-    let c10 = |ssc| dp_pll_request(XeLpgPort::B, rate, 4, false, false, ssc).unwrap();
+    let c10 = |ssc| {
+        dp_pll_request(
+            crate::intel_gpu_xelpg::PhyKind::C10,
+            XeLpgPort::B,
+            rate,
+            4,
+            false,
+            false,
+            ssc,
+        )
+        .unwrap()
+    };
     match (c10(true).state, c10(false).state) {
         (Cx0PllState::C10(on), Cx0PllState::C10(off))
             if on.pll[4..9] != [0; 5]
@@ -2669,7 +2752,18 @@ fn smoke_mtl_dp_ssc_follows_vbt_and_sink_downspread() -> TestResult {
                 && !c10(false).ssc => {}
         _ => return TestResult::Fail("C10 non-SSC form must zero PLL bytes 4..8 only"),
     }
-    let c20 = |ssc| dp_pll_request(XeLpgPort::Tc1, rate, 4, true, false, ssc).unwrap();
+    let c20 = |ssc| {
+        dp_pll_request(
+            crate::intel_gpu_xelpg::PhyKind::C20,
+            XeLpgPort::Tc1,
+            rate,
+            4,
+            true,
+            false,
+            ssc,
+        )
+        .unwrap()
+    };
     if c20(true).state != c20(false).state || !c20(true).ssc || c20(false).ssc {
         return TestResult::Fail("C20 keeps its table; only the SSC request differs");
     }

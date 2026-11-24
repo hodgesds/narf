@@ -751,6 +751,9 @@ impl<M: MmioWindow + ?Sized> MmioWindow for Flushed<'_, M> {
     fn cx0_xe3(&self) -> bool {
         self.0.cx0_xe3()
     }
+    fn cx0_c20_port_b(&self) -> bool {
+        self.0.cx0_c20_port_b()
+    }
     fn read32(&self, off: u64) -> u32 {
         for _ in 0..4 {
             self.0.write32(MMIO_FLUSH_DUMMY, 0);
@@ -776,6 +779,9 @@ impl<M: MmioWindow + ?Sized> MmioWindow for PicaFlushed<'_, M> {
     }
     fn cx0_xe3(&self) -> bool {
         self.0.cx0_xe3()
+    }
+    fn cx0_c20_port_b(&self) -> bool {
+        self.0.cx0_c20_port_b()
     }
     fn read32(&self, off: u64) -> u32 {
         for _ in 0..4 {

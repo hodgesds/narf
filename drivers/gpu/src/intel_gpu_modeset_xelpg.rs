@@ -130,6 +130,9 @@ impl<M: MmioWindow + ?Sized> MmioWindow for CheckedWindow<'_, M> {
     fn cx0_xe3(&self) -> bool {
         self.raw.cx0_xe3()
     }
+    fn cx0_c20_port_b(&self) -> bool {
+        self.raw.cx0_c20_port_b()
+    }
     fn display_access_ok(&self) -> bool {
         if self.failed.get() || !self.raw.display_access_ok() {
             self.failed.set(true);

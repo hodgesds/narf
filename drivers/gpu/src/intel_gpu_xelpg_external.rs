@@ -87,12 +87,13 @@
 //! streams. Native/legacy VBT lane reversal reaches the PHY; DP-alt cable
 //! flip remains a TCSS mux operation.
 //! Lunar Lake admits combo DDI B (C10, through the display-20 PICA register
-//! view) and TC1–TC4; Panther Lake TC1–TC4 only. PICA power and display-20+
+//! view) and TC1–TC4; Panther Lake its C20 DDI B (through the display-30
+//! view) and TC1–TC4. PICA power and display-20+
 //! TCSS pin assignment are retained by the probe and D2D enable/state move
 //! to `DDI_BUF_CTL`. The Pipe B–D owner uses the exact display-20/30
 //! resource transaction; on display 30 it also computes the fixed-refresh
-//! guardband and runs the mandatory VRR timing generator. Panther Lake's
-//! C20 DDI B and HDMI remain typed refusals.
+//! guardband and runs the mandatory VRR timing generator. HDMI remains a
+//! typed refusal on both IPs.
 //! Wildcat Lake retains the same display-30 C20/PICA sequence but its distinct
 //! descriptor admits only TC1/TC2 and Pipes A–C. The service stores an exact
 //! [`ExternalDisplayProfile`] so broad `Generation::PantherLake` can never
@@ -217,6 +218,12 @@ impl ExternalDisplayProfile {
         self.display_ip
     }
 
+    /// Whether this source's DDI B is a C20 PHY (Panther Lake 30.00; see
+    /// [`crate::intel_gpu_aux::MmioWindow::cx0_c20_port_b`]).
+    pub(crate) const fn c20_port_b(self) -> bool {
+        matches!(self.display_ip, DisplayIp::Xe3Lpd)
+    }
+
     const fn tc_profile(self) -> TcDisplayProfile {
         match self.display_ip {
             DisplayIp::Xelpdp => TcDisplayProfile::XeLpdp,
@@ -231,15 +238,18 @@ impl ExternalDisplayProfile {
     }
 
     /// The external ports this source drives. Lunar Lake's combo DDI B is
-    /// C10 like Meteor Lake's (`intel_encoder_is_c10phy`) and reaches its
-    /// PHY and AUX through the PICA view the display-20 pass applies
-    /// ([`crate::intel_gpu_xe2lpd::PicaFlushed`]). Panther Lake's DDI B is
-    /// a non-Type-C C20 PHY, which this route does not program yet.
+    /// C10 like Meteor Lake's (`intel_encoder_is_c10phy`) and Panther
+    /// Lake's is a non-Type-C C20 ([`crate::intel_gpu_xelpg::phy_kind`],
+    /// the `mtl_c20_dp_*` states `xe3lpd_c20_dp_edp_tables` carries at the
+    /// DP 1.4 rates). Both reach their PHY and AUX through the PICA view
+    /// their pass applies ([`crate::intel_gpu_xe2lpd::PicaFlushed`],
+    /// [`crate::intel_gpu_xe3lpd::View`]).
     pub(crate) const fn admits_port(self, port: XeLpgPort) -> bool {
         match self.display_ip {
             DisplayIp::Xelpdp => !matches!(port, XeLpgPort::A),
-            DisplayIp::Xe2Lpd => matches!(port, XeLpgPort::B) || port.tc_index().is_some(),
-            DisplayIp::Xe3Lpd => port.tc_index().is_some(),
+            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd => {
+                matches!(port, XeLpgPort::B) || port.tc_index().is_some()
+            }
             DisplayIp::WildcatLake => {
                 matches!(port, XeLpgPort::Tc1 | XeLpgPort::Tc2)
             }
@@ -1415,9 +1425,16 @@ fn enable_clock<M: MmioWindow + ?Sized>(
     if probe.tbt() {
         enable_tbt_clock(io, port, rate).map_err(phy_err)?;
     } else {
-        let mut request =
-            dp_pll_request(port, rate, lanes, probe.dp_alt(), probe.legacy(), probe.ssc)
-                .map_err(phy_err)?;
+        let mut request = dp_pll_request(
+            crate::intel_gpu_xelpg::phy_kind(io, port),
+            port,
+            rate,
+            lanes,
+            probe.dp_alt(),
+            probe.legacy(),
+            probe.ssc,
+        )
+        .map_err(phy_err)?;
         request.lanes = probe.phy_lanes()?;
         enable_port_pll_state(io, port, &request).map_err(phy_err)?;
     }
