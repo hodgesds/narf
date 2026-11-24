@@ -679,7 +679,12 @@ impl ResidentBatch {
                 {
                     return Err(FsError::InvalidData);
                 }
-                if (platform.is_gen12() || platform.is_headless_integrated()) && object.is_vram() {
+                // Only DG1 among the Gen12 parts has local memory; its 4 KiB
+                // pages map with GEN12_PPGTT_PTE_LM.
+                let dg1 = platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1);
+                if ((platform.is_gen12() && !dg1) || platform.is_headless_integrated())
+                    && object.is_vram()
+                {
                     return Err(FsError::InvalidData);
                 }
                 if object.is_vram()
@@ -1103,7 +1108,9 @@ impl AddressSpace {
             .diagnostic_tables()
             .all(|phys| phys >> bits == 0)
             && self.objects.iter().all(|(object, _)| {
-                (!platform.is_gen12() || !object.is_vram())
+                (!platform.is_gen12()
+                    || platform == GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1)
+                    || !object.is_vram())
                     && object.pages().all(|phys| phys >> bits == 0)
             })
     }
