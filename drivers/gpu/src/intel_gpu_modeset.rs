@@ -1033,6 +1033,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         } else {
             build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate)
         };
+        let val = self.trans_ddi_port(val);
         // TRANS_DDI_BPC_10 / _12 (bits 22:20); the builders set BPC_8.
         let val = match self.hdmi_bpc {
             10 => (val & !(7 << 20)) | (1 << 20),
@@ -1042,6 +1043,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.mmio
             .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
+    }
+
+    /// The port select this run's display version takes: the builders
+    /// encode display 12's `(index + 1) << 27`; display 9–11 use
+    /// `index << 28`.
+    fn trans_ddi_port(&self, val: u32) -> u32 {
+        if self.gen11_platform.is_some() || self.gen9_platform.is_some() {
+            crate::intel_gpu_pipes::with_pre_tgl_port(val, self.ddi as u8)
+        } else {
+            val
+        }
     }
 
     /// Tear down only this run's pipe pipeline (plane → pipe →
@@ -2615,7 +2627,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// stream runs (#1017).
     fn program_trans_ddi_func_ctl_mode(&mut self, lanes: u8, mode: u32) {
         use crate::intel_gpu_pipes::{build_trans_ddi_func_ctl, TRANS_DDI_FUNC_CTL_OFFSET};
-        let val = build_trans_ddi_func_ctl(self.ddi as u8, mode, lanes);
+        let val = self.trans_ddi_port(build_trans_ddi_func_ctl(self.ddi as u8, mode, lanes));
         self.mmio
             .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
         compiler_fence(Ordering::SeqCst);
@@ -4470,6 +4482,54 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_program_routing_and_watermarks
+    );
+
+    /// Display 9–11 select the port at bits[30:28] = index
+    /// (`TRANS_DDI_SELECT_PORT`); display 12 at bits[30:27] =
+    /// index + 1. Only DDI B encodes the same in both.
+    fn smoke_pre_tgl_trans_ddi_port_select() -> TestResult {
+        use crate::intel_gpu_gt::{Gen11Platform, Gen9Platform};
+        use crate::intel_gpu_pipes::{
+            Transcoder, TRANS_DDI_FUNC_CTL_OFFSET, TRANS_DDI_MODE_DP_SST,
+        };
+        let sst = (1u32 << 31) | (2 << 24) | (3 << 1);
+        for (ddi, gen, want) in [
+            (Ddi::A, Some(11), sst),
+            (Ddi::B, Some(11), sst | (1 << 28)),
+            (Ddi::C, Some(11), sst | (2 << 28)),
+            (Ddi::E, Some(9), sst | (4 << 28)),
+            (Ddi::A, Some(9), sst),
+            (Ddi::C, None, sst | (3 << 27)),
+        ] {
+            let mmio = FakeMmio::new();
+            let mut ms = Modeset::new(&mmio, ddi);
+            match gen {
+                Some(11) => ms.set_gen11_platform(Gen11Platform::IceLake),
+                Some(9) => ms.set_gen9_platform(Gen9Platform::KabyLake),
+                _ => {}
+            }
+            ms.program_trans_ddi_func_ctl_mode(4, TRANS_DDI_MODE_DP_SST);
+            let base = ms.transcoder().base();
+            if mmio.writes_to(base + TRANS_DDI_FUNC_CTL_OFFSET) != alloc::vec![want] {
+                return TestResult::Fail(
+                    "TRANS_DDI_FUNC_CTL port select must follow the display version",
+                );
+            }
+        }
+        // HDMI on Gen11 DDI C: HDMI mode, port 2 at bits[30:28].
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::C);
+        ms.set_gen11_platform(Gen11Platform::IceLake);
+        ms.program_trans_ddi_func_ctl_hdmi(false, false);
+        let func = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        if mmio.writes_to(func) != alloc::vec![(1u32 << 31) | (2 << 28) | (3 << 1)] {
+            return TestResult::Fail("Gen11 HDMI must select DDI C as port 2");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_pre_tgl_trans_ddi_port_select
     );
 
     fn smoke_gen12_tc_sst_refuses_insufficient_payload_before_writes() -> TestResult {
