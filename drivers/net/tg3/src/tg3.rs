@@ -1480,6 +1480,10 @@ impl Tg3Nic {
         self.tx_resets.load(Ordering::Relaxed)
     }
 
+    // Fixture-only: its only callers live in the x86_64-only
+    // `smoke` module, so the method is gated to match (otherwise
+    // it is dead code on aarch64, where clippy runs `-D dead-code`).
+    #[cfg(target_arch = "x86_64")]
     /// One watchdog pass, synchronously (the fixture): the core
     /// watchdog's check, then `ndo_tx_timeout` if it fired. Returns
     /// true when recovery fired and succeeded.
