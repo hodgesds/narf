@@ -90,7 +90,7 @@ use crate::dp_mst;
 use crate::dp_mst_mgr::{Manager, MstError as MgrError, Sink, Topology};
 use crate::intel_gpu_aux::{IntelAux, MmioWindow, SourceFamily};
 use crate::intel_gpu_ddi::Ddi;
-use crate::intel_gpu_dp::{mode_from_edid, DpError, INTEL_SOURCE_CAPS};
+use crate::intel_gpu_dp::{mode_from_edid, DpError};
 use crate::intel_gpu_modeset::{Framebuffer, LinkPlan, Mode, Modeset, ModesetError};
 use crate::intel_gpu_pipes::Pipe;
 
@@ -529,7 +529,8 @@ impl MstLink {
             // `lane_count = limits->max_lane_count`,
             // `port_clock = limits->max_rate`). An unbounded
             // demand walks `negotiate` to that ceiling.
-            let negotiated = negotiate(&INTEL_SOURCE_CAPS, &caps, u64::MAX);
+            let source = crate::intel_gpu_dp::source_caps(Some(family), self.ddi);
+            let negotiated = negotiate(&source, &caps, u64::MAX);
             Some(LinkPlan {
                 rate: negotiated.rate,
                 lanes: negotiated.lanes,

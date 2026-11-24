@@ -930,3 +930,192 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dp",
     smoke_gen12_external_hpd_fresh_owned_status_clears_inherited_long_before_short_low
 );
+
+/// A display 9 or 11 source holding one DDI B SST link on `pipe`: the
+/// register image the Gen11/Gen9 modeset leaves (port-based `DP_TP_CTL`,
+/// `TRANS_CLK_SEL` port at bits 31:29) plus a foreign value in the display
+/// 12 per-transcoder `DP_TP_CTL` slot that must never be touched.
+#[derive(Debug)]
+struct PreTglIo {
+    family: crate::intel_gpu_aux::SourceFamily,
+    regs: RefCell<BTreeMap<u64, u32>>,
+    writes: RefCell<Vec<(u64, u32)>>,
+    reads: RefCell<Vec<u64>>,
+    pipe: Pipe,
+}
+impl PreTglIo {
+    fn new(family: crate::intel_gpu_aux::SourceFamily, pipe: Pipe) -> Self {
+        let io = Self {
+            family,
+            regs: RefCell::new(BTreeMap::new()),
+            writes: RefCell::new(Vec::new()),
+            reads: RefCell::new(Vec::new()),
+            pipe,
+        };
+        let p = pipe.base() + 0x180;
+        let t = pipe.trans_base();
+        for (r, v) in [
+            (p, 0x84000000),
+            (p + 8, 64),
+            (p + 0x10, 0x02ff03ff),
+            (p + 0x1c, 0x4000000),
+            (p + 0x2c, 0x4000000),
+            (pipe.base() + 8, 0xc0000000),
+            (t, 0x053f03ff),
+            (t + 4, 0x053f03ff),
+            (t + 8, 0x049f0417),
+            (t + 0x0c, 0x032502ff),
+            (t + 0x10, 0x032502ff),
+            (t + 0x14, 0x03080302),
+            (t + 0x1c, 0x03ff02ff),
+            (t + 0x400, 0x92000006),
+            (t + 0x540, 0x12340000),
+            (Ddi::B.base(), 0x80000006),
+            (Ddi::B.base() + 0x40, 0x80040300),
+            (0x46140 + pipe as u64 * 4, 2 << 29),
+        ] {
+            io.set(r, v);
+        }
+        io
+    }
+    fn set(&self, r: u64, v: u32) {
+        self.regs.borrow_mut().insert(r, v);
+    }
+    fn raw(&self, r: u64) -> u32 {
+        self.regs.borrow().get(&r).copied().unwrap_or(0)
+    }
+    fn conn(&self) -> DpConnection {
+        let mut conn = Io::new(Gen12Platform::TigerLake, self.pipe, Ddi::B).conn();
+        conn.family = self.family;
+        conn
+    }
+    fn written(&self, r: u64) -> Option<usize> {
+        self.writes.borrow().iter().position(|&(w, _)| w == r)
+    }
+}
+impl MmioWindow for PreTglIo {
+    fn gen11_display_platform(&self) -> Option<crate::intel_gpu_gt::Gen11Platform> {
+        match self.family {
+            crate::intel_gpu_aux::SourceFamily::Gen11(platform) => Some(platform),
+            _ => None,
+        }
+    }
+    fn gen9_display_platform(
+        &self,
+    ) -> Option<(
+        crate::intel_gpu_gt::Gen9Platform,
+        crate::intel_gpu_gen9_ddi::SkuFamily,
+    )> {
+        match self.family {
+            crate::intel_gpu_aux::SourceFamily::Gen9 { platform, sku } => Some((platform, sku)),
+            _ => None,
+        }
+    }
+    fn read32(&self, r: u64) -> u32 {
+        self.reads.borrow_mut().push(r);
+        self.raw(r)
+    }
+    fn write32(&self, r: u64, v: u32) {
+        self.writes.borrow_mut().push((r, v));
+        if r == self.pipe.base() + 8 {
+            // TRANSCONF STATE follows ENABLE.
+            self.set(r, v & !0x40000000);
+        } else if r == Ddi::B.base() && v & 0x80000000 == 0 {
+            // DDI_BUF_CTL reports idle once disabled.
+            self.set(r, v | 0x80);
+        } else {
+            self.set(r, v);
+        }
+    }
+}
+
+/// Display 9 and 11 retire the link in `intel_ddi_post_disable_dp`'s
+/// pre-display-12 order: the transcoder clock stops before the DDI buffer,
+/// `DP_TP_CTL` is the port's, and no DSB (nor, on display 9, DSS) register
+/// is read.
+fn smoke_external_stop_display9_and_11_order() -> TestResult {
+    use crate::intel_gpu_aux::SourceFamily;
+    for family in [
+        SourceFamily::Gen11(crate::intel_gpu_gt::Gen11Platform::IceLake),
+        SourceFamily::Gen9 {
+            platform: crate::intel_gpu_gt::Gen9Platform::KabyLake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        },
+    ] {
+        for pipe in [Pipe::A, Pipe::B] {
+            let io = PreTglIo::new(family, pipe);
+            let fb = Io::new(Gen12Platform::TigerLake, pipe, Ddi::B).fb();
+            let mut owner = Session::adopt(&io, io.conn(), fb, Arc::new(()), 17, 0xabc000);
+            if !owner.live() {
+                return TestResult::Fail("a display 9/11 DDI B link must adopt live");
+            }
+            owner.request_stop();
+            let mut stopped = false;
+            for n in 0..8 {
+                match owner.step(&io, n * 250_000) {
+                    Ok(true) => {
+                        stopped = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(_) => return TestResult::Fail("the display 9/11 stop must not fail"),
+                }
+            }
+            if !stopped {
+                return TestResult::Fail("the display 9/11 stop must finish");
+            }
+            let t = pipe.trans_base();
+            let clock = 0x46140 + pipe as u64 * 4;
+            let (Some(func), Some(clk), Some(buf), Some(tp)) = (
+                io.written(t + 0x400),
+                io.written(clock),
+                io.written(Ddi::B.base()),
+                io.written(Ddi::B.base() + 0x40),
+            ) else {
+                return TestResult::Fail("function, clock, buffer and transport must all stop");
+            };
+            if !(func < clk && clk < buf && buf < tp) {
+                return TestResult::Fail("display 9/11 stop the clock before the buffer");
+            }
+            if io.raw(clock) & (7 << 29) != 0
+                || io.raw(Ddi::B.base()) & (1 << 31) != 0
+                || io.raw(Ddi::B.base() + 0x40) & (1 << 31) != 0
+            {
+                return TestResult::Fail("clock, buffer and transport must end off");
+            }
+            if io.written(t + 0x540).is_some() || io.raw(t + 0x540) != 0x12340000 {
+                return TestResult::Fail("the display-12 DP_TP_CTL slot must stay untouched");
+            }
+            let base = pipe.base();
+            let reads = io.reads.borrow();
+            if reads.iter().any(|&r| (base + 0xb08..base + 0xb08 + 0x300).contains(&r)) {
+                return TestResult::Fail("display 9/11 have no DSB to read");
+            }
+            if matches!(family, SourceFamily::Gen9 { .. })
+                && reads
+                    .iter()
+                    .any(|&r| r == 0x67400 || (0x78000..0x78800).contains(&r) || r == t + 0x404)
+            {
+                return TestResult::Fail("display 9 has no DSS or TRANS_DDI_FUNC_CTL2");
+            }
+            if matches!(family, SourceFamily::Gen11(_))
+                && !reads.contains(&if pipe == Pipe::A { 0x67400 } else { 0x78200 })
+            {
+                return TestResult::Fail("display 11 must check the pipe's DSS control");
+            }
+        }
+        // A window reporting another family adopts quarantined.
+        let io = PreTglIo::new(family, Pipe::B);
+        let mut conn = io.conn();
+        conn.family = SourceFamily::Gen12(Gen12Platform::TigerLake);
+        let fb = Io::new(Gen12Platform::TigerLake, Pipe::B, Ddi::B).fb();
+        if Session::adopt(&io, conn, fb, Arc::new(()), 17, 0xabc000).live() {
+            return TestResult::Fail("a foreign family must not adopt");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp",
+    smoke_external_stop_display9_and_11_order
+);

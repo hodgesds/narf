@@ -916,13 +916,12 @@ Plane geometry, pitch and the complete 32-bit GGTT surface extent are
 validated before pipeline teardown. This does not enable Xe-LPG PM or
 establish physical display/suspend acceptance.
 The external-session gate is separate: combo HPD enable/poll, DP, HDMI,
-MST and USB-C DP Alt Mode remain Gen12-only until their Xe-LPG port
-sequences exist. The modeset-level external outputs are implemented for
-Gen11 Ice Lake (Lane 8, §12.3) — `external_display_supported()` is
-flipped for it — but the session layer's Gen12 gates still return `None`
-on a Gen11 adapter, so no session path arms there. Unsupported generations
-return before HPD register access; enabling the Xe-LPG internal panel
-must not enable Gen12 ports.
+MST and USB-C DP Alt Mode stay off Xe-LPG until their port sequences
+exist. Gen12, Gen11 and Gen9 sources arm combo HPD, DP SST (with the
+display 9-11 stop order), HDMI and MST through `SourceFamily::of`; USB-C
+DP Alt Mode stays Gen12-only. Unsupported generations return before HPD
+register access; enabling the Xe-LPG internal panel must not enable Gen12
+ports.
 The Gen12 gate is necessary but insufficient: physical combo-B HPD/SST also
 requires exact TGL/ADL-P/N GPU and actually observed matching PCH policy.
 

@@ -1960,7 +1960,9 @@ pub fn poll_dp_hpd_events() {
 }
 
 fn enable_external_hpd<M: crate::intel_gpu_aux::MmioWindow>(mmio: &M, generation: Generation) {
-    if generation.external_display_supported() && mmio.gen12_display_family().is_some() {
+    if generation.external_display_supported()
+        && crate::intel_gpu_aux::SourceFamily::of(mmio).is_some()
+    {
         crate::intel_gpu_dp::enable_hpd_interrupts(mmio);
     }
 }
@@ -1969,7 +1971,9 @@ fn poll_external_hpd<M: crate::intel_gpu_aux::MmioWindow>(
     mmio: &M,
     generation: Generation,
 ) -> Option<crate::intel_gpu_dp::HpdEvent> {
-    if !generation.external_display_supported() || mmio.gen12_display_family().is_none() {
+    if !generation.external_display_supported()
+        || crate::intel_gpu_aux::SourceFamily::of(mmio).is_none()
+    {
         return None;
     }
     crate::intel_gpu_dp::poll_hpd_event(mmio)
@@ -2115,13 +2119,11 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
     }
     let serial = next_external_scanout_serial()?;
     with_display_info(|gpu| {
-        if !gpu.chip.generation.external_display_supported()
-            || crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).is_none()
-        {
+        if !gpu.chip.generation.external_display_supported() {
             return None;
         }
-        let family = crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip)?;
         let window = gpu.mode_window();
+        let family = crate::intel_gpu_aux::SourceFamily::of(&window)?;
         let probe = crate::intel_gpu_dp::probe_sink(&window, ddi).ok()?;
         let pipe =
             crate::intel_gpu_multipipe::claim_pipe_for(crate::intel_gpu_multipipe::PipeOwner {
@@ -2170,7 +2172,7 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
             Ok(conn) => (conn, true),
             Err(_) => (
                 crate::intel_gpu_dp::DpConnection {
-                    family: crate::intel_gpu_aux::SourceFamily::Gen12(family),
+                    family,
                     ddi,
                     pipe,
                     mode: probe.mode,
@@ -2218,12 +2220,11 @@ fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi:
         return None;
     }
     with_display_info(|gpu| {
-        if !gpu.chip.generation.external_display_supported()
-            || crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).is_none()
-        {
+        if !gpu.chip.generation.external_display_supported() {
             return None;
         }
         let window = gpu.mode_window();
+        crate::intel_gpu_aux::SourceFamily::of(&window)?;
         let ddc = crate::intel_gpu_vbt::gen12_ddc_overrides();
         let probe = crate::intel_gpu_hdmi::probe_sink(&window, ddi, &ddc).ok()?;
         let width = probe.mode.h_active as u32;

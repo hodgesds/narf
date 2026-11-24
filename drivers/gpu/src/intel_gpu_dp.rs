@@ -495,6 +495,35 @@ pub const INTEL_SOURCE_CAPS: SourceCaps = SourceCaps {
     max_lanes: 4,
 };
 
+/// The source envelope for `family` on `ddi`, as
+/// `intel_dp_set_source_rates` limits it below display 12: display 9 tops
+/// out at HBR2 (`skl_rates`), Ice Lake's combo PHYs at HBR2 for an external
+/// sink and its Type-C ports at HBR3 (`icl_max_source_rate`), and
+/// Elkhart/Jasper Lake external ports at HBR3 (`ehl_max_source_rate`).
+/// Gen12 keeps [`INTEL_SOURCE_CAPS`] on every port. That is a deliberate
+/// divergence: Linux's `icl_max_source_rate` also caps Tiger Lake's combo
+/// ports at HBR2 for a non-eDP sink, and this source offers HBR3 there.
+/// Negotiation still settles on the sink's rate, and the training fallback
+/// steps down from HBR3 when a link will not hold it.
+pub fn source_caps(family: Option<crate::intel_gpu_aux::SourceFamily>, ddi: Ddi) -> SourceCaps {
+    use crate::intel_gpu_aux::SourceFamily;
+    use crate::intel_gpu_gt::Gen11Platform;
+    let max_rate = match family {
+        Some(SourceFamily::Gen9 { .. }) => LinkRate::Hbr2,
+        Some(SourceFamily::Gen11(Gen11Platform::IceLake)) => {
+            match crate::intel_gpu_gen11_ddi::phy_for_port(Gen11Platform::IceLake, ddi) {
+                Some(crate::intel_gpu_gen11_ddi::Gen11Phy::Mg { .. }) => LinkRate::Hbr3,
+                _ => LinkRate::Hbr2,
+            }
+        }
+        _ => INTEL_SOURCE_CAPS.max_rate,
+    };
+    SourceCaps {
+        max_rate,
+        max_lanes: INTEL_SOURCE_CAPS.max_lanes,
+    }
+}
+
 /// Errors the DP session can return. Each variant names the
 /// layer that failed so callers log precisely.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -631,7 +660,8 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(mmio: &M, ddi: Ddi) -> Result<DpSinkPr
     // 24 bpp uncompressed SST — the stream shape the modeset
     // programs today.
     let demand = crate::dp_link_training::stream_demand_kbps(mode.pixel_clock_khz, 24);
-    let negotiated = negotiate(&INTEL_SOURCE_CAPS, &caps, demand);
+    let source = source_caps(crate::intel_gpu_aux::SourceFamily::of(mmio), ddi);
+    let negotiated = negotiate(&source, &caps, demand);
     // VRR capability is decided here, at discovery, from the same
     // DPCD caps + EDID the probe already read (Linux
     // `intel_vrr_is_capable`). `HAS_VRR` holds for every display IP
@@ -1676,6 +1706,53 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_dp_hbr3_sink_trains_hbr3);
+
+    /// `intel_dp_set_source_rates` below display 12: Gen9 stops at HBR2, Ice
+    /// Lake combo ports at HBR2 and its Type-C ports at HBR3, EHL/JSL and
+    /// Gen12 at HBR3.
+    fn smoke_dp_source_caps_follow_the_source() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, Gen9Platform};
+        let gen9 = SourceFamily::Gen9 {
+            platform: Gen9Platform::Skylake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Desktop,
+        };
+        for (family, ddi, want) in [
+            (Some(gen9), Ddi::B, LinkRate::Hbr2),
+            (Some(gen9), Ddi::E, LinkRate::Hbr2),
+            (
+                Some(SourceFamily::Gen11(Gen11Platform::IceLake)),
+                Ddi::B,
+                LinkRate::Hbr2,
+            ),
+            (
+                Some(SourceFamily::Gen11(Gen11Platform::IceLake)),
+                Ddi::C,
+                LinkRate::Hbr3,
+            ),
+            (
+                Some(SourceFamily::Gen11(Gen11Platform::ElkhartLake)),
+                Ddi::B,
+                LinkRate::Hbr3,
+            ),
+            (
+                Some(SourceFamily::Gen12(Gen12Platform::TigerLake)),
+                Ddi::B,
+                LinkRate::Hbr3,
+            ),
+            (None, Ddi::B, LinkRate::Hbr3),
+        ] {
+            let caps = source_caps(family, ddi);
+            if caps.max_rate != want || caps.max_lanes != 4 {
+                return TestResult::Fail("the source rate cap must follow the platform and port");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_dp_source_caps_follow_the_source
+    );
 
     fn smoke_dp_hbr3_failure_falls_back() -> TestResult {
         // The sink advertises HBR3 but never locks CR at HBR3 —
