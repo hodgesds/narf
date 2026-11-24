@@ -225,7 +225,8 @@ pub enum CrtcState {
 }
 
 /// One KMS CRTC. Maps 1:1 to a DCN pipe; AMD chips ship 4 pipes
-/// on consumer parts (Renoir / Phoenix), 6 on Navi3x desktop.
+/// on consumer parts (Renoir / Phoenix) and on Navi31 (DCN 3.2:
+/// `num_timing_generator = 4` in `dcn32_resource.c`).
 #[derive(Clone, Debug)]
 pub struct Crtc {
     /// Hardware pipe index (0..n_pipes).
@@ -260,9 +261,10 @@ pub struct KmsState {
 }
 
 impl KmsState {
-    /// Mint the CRTC pool. AMD APUs ship 4 pipes (HUBP/DPP/OPP/OTG
-    /// quads) so we always allocate 4 inactive CRTCs at startup.
-    /// Desktop Navi3 needs 6 — pass `n_pipes = 6` in that case.
+    /// Mint the CRTC pool with `n_pipes` inactive CRTCs. Callers pass
+    /// 4: AMD APUs ship 4 pipes (HUBP/DPP/OPP/OTG quads), and Navi31
+    /// (DCN 3.2) has 4 too (`num_timing_generator = 4` in
+    /// `dcn32_resource.c`).
     pub fn new(n_pipes: u8) -> Self {
         let crtcs = (0..n_pipes)
             .map(|pipe| Crtc {

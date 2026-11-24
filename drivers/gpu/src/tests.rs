@@ -207,6 +207,25 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
             return TestResult::Fail("missing amdgpu VID/DID match");
         }
     }
+    // Every Navi31/32/33 display DID is registered for probe; the
+    // Navi31 USB function (0x7446) is deliberately absent — it is a
+    // USB-class function, not a display device (see
+    // `register_pci_driver`).
+    for known in amdgpu::NAVI3_DEVICES {
+        if known.did == amdgpu::NAVI31_USB {
+            continue;
+        }
+        if !regs.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice { vendor: 0x1002, device } if device == known.did)
+        }) {
+            return TestResult::Fail("missing Navi3 PCI match");
+        }
+    }
+    if regs.iter().any(|m| {
+        matches!(m.kind, MatchKind::VendorDevice { vendor: 0x1002, device } if device == amdgpu::NAVI31_USB)
+    }) {
+        return TestResult::Fail("Navi31 USB function must not be claimed by amdgpu");
+    }
     for profile in crate::amdgpu_rdna2::PROFILES {
         for &did in profile.pci_ids {
             if !regs.iter().any(|m| {
@@ -1228,6 +1247,52 @@ fn smoke_amdgpu_kms_from_vbios_topology() -> TestResult {
 }
 #[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_from_vbios_topology);
+
+/// Navi31/32/33 identity (#2455, lane 0): every DID in
+/// `NAVI3_DEVICES` (pci.ids v2026.11.22) resolves to `Family::Navi3`
+/// with its die's asic name and firmware placeholder, and
+/// `kms_from_vbios` mints 4 CRTCs for Navi3 — Navi31 has 4 pipes
+/// (`num_timing_generator = 4` in `dcn32_resource.c`), not 6.
+#[cfg(feature = "amdgpu")]
+fn smoke_navi3_chip_identity_and_four_pipes() -> TestResult {
+    use crate::amdgpu::Family;
+    use crate::amdgpu::{self, Navi3Die};
+    for known in amdgpu::NAVI3_DEVICES {
+        let Some(info) = amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, known.did) else {
+            return TestResult::Fail("a Navi3 device id resolves to no chip");
+        };
+        if info.family != Family::Navi3 {
+            return TestResult::Fail("a Navi3 device id resolves to the wrong family");
+        }
+        let (want_asic, want_fw) = match known.die {
+            Navi3Die::Navi31 => ("navi31", "amdgpu/navi31.bin"),
+            Navi3Die::Navi32 => ("navi32", "amdgpu/navi32.bin"),
+            Navi3Die::Navi33 => ("navi33", "amdgpu/navi33.bin"),
+        };
+        if info.asic != want_asic || info.fw_name != want_fw {
+            return TestResult::Fail("a Navi3 device id has the wrong asic or firmware name");
+        }
+        if info.is_apu() || !info.fw_list.is_empty() {
+            return TestResult::Fail("a Navi3 device id must be discrete with unaudited firmware");
+        }
+    }
+    // 0x744D is a hole in pci.ids v2026.11.22: an unlisted
+    // Navi31-range id must still fail probe with UnknownAsic, not
+    // resolve by range.
+    if amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, 0x744D).is_some() {
+        return TestResult::Fail("an unlisted Navi31-range id resolved as Navi3");
+    }
+    // Pipe count: 4 CRTCs for Navi3, as for every other family.
+    for family in [Family::Navi3, Family::Navi2, Family::Phoenix] {
+        let (kms, _) = crate::amdgpu::AmdGpu::kms_from_vbios(&[0u8; 16], family);
+        if kms.crtcs.len() != 4 {
+            return TestResult::Fail("kms_from_vbios must mint 4 CRTCs");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu", smoke_navi3_chip_identity_and_four_pipes);
 
 /// HPD binding from inventory paths (#1712): selectors bind by
 /// device tag, 0 means no pin, an unknown tag binds nothing.
