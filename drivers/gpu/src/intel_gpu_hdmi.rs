@@ -169,14 +169,23 @@ const HDMI_VSDB_OUI: [u8; 3] = [0x03, 0x0C, 0x00];
 /// HDMI VSDB is limited to 165 MHz).
 pub const DVI_MAX_TMDS_KHZ: u32 = 165_000;
 
-/// `drm_display_info.is_hdmi` (`drm_parse_hdmi_vsdb_video` via
-/// `drm_parse_cea_ext`): a CTA extension carries the HDMI Licensing VSDB.
-/// A sink without one is DVI (`intel_has_hdmi_sink`): no infoframes, no
-/// audio, no SCDC, `TRANS_DDI_MODE_SELECT_DVI`.
-pub fn is_hdmi_sink(edid: &[u8]) -> bool {
-    edid.chunks_exact(128).skip(1).any(|block| {
+/// The HDMI Licensing VSDB (`drm_parse_hdmi_vsdb_video`): the deep-colour
+/// flags (byte 6) and the max TMDS clock (byte 7, 5 MHz units).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HdmiVsdb {
+    /// `DRM_EDID_HDMI_DC_30`: 10 bpc RGB 4:4:4.
+    pub dc_30: bool,
+    /// `DRM_EDID_HDMI_DC_36`: 12 bpc RGB 4:4:4.
+    pub dc_36: bool,
+    /// `max_tmds_clock` in kHz; 0 when the block has no rate byte.
+    pub max_tmds_khz: u32,
+}
+
+/// The sink's HDMI VSDB, `None` for a DVI sink.
+pub fn parse_hdmi_vsdb(edid: &[u8]) -> Option<HdmiVsdb> {
+    for block in edid.chunks_exact(128).skip(1) {
         if block[0] != 0x02 {
-            return false;
+            continue;
         }
         let limit = match block[2] {
             0 => 127usize,
@@ -189,13 +198,105 @@ pub fn is_hdmi_sink(edid: &[u8]) -> bool {
             if pos + 1 + len > 128 {
                 break;
             }
-            if tag == 3 && len >= 3 && block[pos + 1..pos + 4] == HDMI_VSDB_OUI {
-                return true;
+            let payload = &block[pos + 1..pos + 1 + len];
+            if tag == 3 && len >= 3 && payload[..3] == HDMI_VSDB_OUI {
+                let flags = payload.get(5).copied().unwrap_or(0);
+                return Some(HdmiVsdb {
+                    dc_30: flags & (1 << 4) != 0,
+                    dc_36: flags & (1 << 5) != 0,
+                    max_tmds_khz: payload.get(6).map_or(0, |&b| u32::from(b) * 5_000),
+                });
             }
             pos += 1 + len;
         }
-        false
-    })
+    }
+    None
+}
+
+/// `drm_display_info.is_hdmi` (`drm_parse_hdmi_vsdb_video` via
+/// `drm_parse_cea_ext`): a CTA extension carries the HDMI Licensing VSDB.
+/// A sink without one is DVI (`intel_has_hdmi_sink`): no infoframes, no
+/// audio, no SCDC, `TRANS_DDI_MODE_SELECT_DVI`.
+pub fn is_hdmi_sink(edid: &[u8]) -> bool {
+    parse_hdmi_vsdb(edid).is_some()
+}
+
+/// `intel_hdmi_source_max_tmds_clock` (no VBT cap): 600 MHz on display
+/// 13 and ADL-S, 594 MHz on display 10-12, 300 MHz on display 9.
+pub const fn source_max_tmds_khz(family: crate::intel_gpu_aux::SourceFamily) -> u32 {
+    use crate::intel_gpu_aux::SourceFamily;
+    use crate::intel_gpu_gt::Gen12Platform;
+    match family {
+        SourceFamily::Gen12(
+            Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN | Gen12Platform::AlderLakeS,
+        ) => 600_000,
+        SourceFamily::Gen12(_) | SourceFamily::Gen11(_) => 594_000,
+        SourceFamily::Gen9 { .. } => 300_000,
+    }
+}
+
+/// `intel_hdmi_tmds_clock` for RGB: `DIV_ROUND_CLOSEST(clock * bpc, 8)`.
+pub const fn tmds_clock_khz(pixel_clock_khz: u32, bpc: u8) -> u32 {
+    (pixel_clock_khz * bpc as u32 + 4) / 8
+}
+
+/// `intel_hdmi_compute_bpc` for an RGB 4:4:4 stream, from 12 bpc down
+/// (the max_bpc property defaults to its 12 bpc maximum):
+/// `intel_hdmi_source_bpc_possible` (10 bpc needs display 11+), the sink's
+/// deep-colour flags, and `hdmi_port_clock_valid` at the TMDS clock (the
+/// source maximum and the sink's `max_tmds_clock`, HF-VSDB above 340 MHz
+/// over the VSDB's). A TMDS clock above 340 MHz also needs SCDC. DVI and
+/// anything that fits nowhere else is 8 bpc. Returns `(bpc, tmds_khz)`.
+pub fn compute_bpc(
+    family: crate::intel_gpu_aux::SourceFamily,
+    pixel_clock_khz: u32,
+    vsdb: Option<HdmiVsdb>,
+    hf: &HfVsdb,
+) -> (u8, u32) {
+    let deep = vsdb.map(|v| {
+        let sink_max = if hf.present && hf.max_tmds_char_rate_khz > SCRAMBLING_THRESHOLD_KHZ {
+            hf.max_tmds_char_rate_khz
+        } else {
+            v.max_tmds_khz
+        };
+        (v, sink_max)
+    });
+    if let Some((v, sink_max)) = deep {
+        for (bpc, sink_ok) in [(12u8, v.dc_36), (10, v.dc_30)] {
+            let source_ok =
+                bpc == 12 || !matches!(family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. });
+            let tmds = tmds_clock_khz(pixel_clock_khz, bpc);
+            if source_ok
+                && sink_ok
+                && tmds <= source_max_tmds_khz(family)
+                && (sink_max == 0 || tmds <= sink_max)
+                && (tmds <= SCRAMBLING_THRESHOLD_KHZ || hf.scdc_present)
+            {
+                return (bpc, tmds);
+            }
+        }
+    }
+    (8, pixel_clock_khz)
+}
+
+/// `gcp_default_phase_possible`: deep colour packs pixels in groups (4 per
+/// 5 clocks at 10 bpc, 2 per 3 at 12 bpc); the default phase holds when
+/// every horizontal timing point lands on a group boundary.
+pub fn gcp_default_phase_possible(bpc: u8, mode: &Mode) -> bool {
+    let group = match bpc {
+        10 => 4,
+        12 => 2,
+        _ => return false,
+    };
+    // hblank start/end are hdisplay/htotal: the modeset has no borders.
+    [
+        mode.h_active,
+        mode.h_total,
+        mode.h_sync_start,
+        mode.h_sync_end,
+    ]
+    .iter()
+    .all(|&v| v % group == 0)
 }
 
 pub fn parse_hf_vsdb(edid: &[u8]) -> HfVsdb {
@@ -467,6 +568,31 @@ pub const VIDEO_DIP_AVI_DATA_OFFSET: u64 = 0x220;
 pub const VIDEO_DIP_ENABLE_AVI: u32 = 1 << 12;
 /// VIDEO_DIP_CTL GCP enable bit (HSW encoding).
 pub const VIDEO_DIP_ENABLE_GCP: u32 = 1 << 16;
+/// `HSW_TVIDEO_DIP_GCP` offset from the transcoder timing base.
+pub const VIDEO_DIP_GCP_OFFSET: u64 = 0x210;
+/// `GCP_COLOR_INDICATION` and `GCP_DEFAULT_PHASE_ENABLE`.
+pub const GCP_COLOR_INDICATION: u32 = 1 << 2;
+pub const GCP_DEFAULT_PHASE_ENABLE: u32 = 1 << 1;
+
+/// The General Control Packet (`intel_hdmi_compute_gcp_infoframe` +
+/// `hsw_set_infoframes`): every HDMI sink with infoframes gets it, with
+/// the colour indication above 8 bpc and the default phase when the
+/// timing is group-aligned.
+pub fn write_gcp<M: MmioWindow + ?Sized>(mmio: &M, trans: Transcoder, bpc: u8, mode: &Mode) {
+    let mut gcp = 0;
+    if bpc > 8 {
+        gcp |= GCP_COLOR_INDICATION;
+    }
+    if gcp_default_phase_possible(bpc, mode) {
+        gcp |= GCP_DEFAULT_PHASE_ENABLE;
+    }
+    mmio.write32(trans.base() + VIDEO_DIP_GCP_OFFSET, gcp);
+    let ctl = trans.base() + VIDEO_DIP_CTL_OFFSET;
+    let cur = mmio.read32(ctl);
+    mmio.write32(ctl, cur | VIDEO_DIP_ENABLE_GCP);
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Total DIP data-bank size in bytes (8 dwords).
 pub const VIDEO_DIP_DATA_SIZE: usize = 32;
 
@@ -569,6 +695,10 @@ pub struct HdmiSinkProbe {
     pub scrambling_required: bool,
     /// The sink is HDMI ([`is_hdmi_sink`]); `false` is a DVI sink.
     pub hdmi_sink: bool,
+    /// The port's bits per colour ([`compute_bpc`]): 8, 10 or 12.
+    pub bpc: u8,
+    /// The TMDS clock at that depth (the port clock).
+    pub tmds_clock_khz: u32,
 }
 
 /// A live HDMI connection.
@@ -637,16 +767,20 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
     let hf_vsdb = parse_hf_vsdb(&edid[..edid_len]);
-    let hdmi_sink = is_hdmi_sink(&edid[..edid_len]);
+    let vsdb = parse_hdmi_vsdb(&edid[..edid_len]);
+    let hdmi_sink = vsdb.is_some();
+    let (bpc, tmds_clock_khz) = compute_bpc(family, mode.pixel_clock_khz, vsdb, &hf_vsdb);
     Ok(HdmiSinkProbe {
         hdmi_sink,
+        bpc,
+        tmds_clock_khz,
         ddi,
         pin,
         mode,
         edid,
         edid_len,
         hf_vsdb,
-        scrambling_required: mode.pixel_clock_khz > SCRAMBLING_THRESHOLD_KHZ,
+        scrambling_required: tmds_clock_khz > SCRAMBLING_THRESHOLD_KHZ,
     })
 }
 
@@ -681,6 +815,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     let mut modeset = Modeset::new(mmio, probe.ddi);
     modeset.set_source_family(family);
     modeset.set_hdmi_dvi(!probe.hdmi_sink);
+    modeset.set_hdmi_bpc(probe.bpc);
     let mode = modeset.modeset_hdmi(fb, &probe.mode, scrambling, scrambling)?;
 
     // Infoframes and audio are HDMI-sink only (`has_infoframe` and
@@ -688,6 +823,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     if probe.hdmi_sink {
         let frame = pack_avi_infoframe(&mode);
         write_avi_infoframe(mmio, Transcoder::A, &frame);
+        write_gcp(mmio, Transcoder::A, probe.bpc, &mode);
     }
     // The stream is scrambled from here on; only now can the sink report
     // its scrambler status.
@@ -708,7 +844,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     {
         let channels = publication.lpcm_max_channels;
         publish_display_audio(sink_id_for(probe.ddi), publication);
-        intel_gpu_audio::hdmi_audio_codec_enable(mmio, Transcoder::A, mode.pixel_clock_khz);
+        intel_gpu_audio::hdmi_audio_codec_enable(mmio, Transcoder::A, probe.tmds_clock_khz);
         intel_gpu_audio::set_eld_valid(mmio, Transcoder::A, true);
         audio_published = true;
         audio_infoframe = Some(pack_audio_infoframe(channels));
@@ -1490,12 +1626,16 @@ pub mod tests {
         if dwords1.first() != Some(&0x08A8_109F) {
             return TestResult::Fail("DIP dword 1 must carry checksum + DB1..DB3");
         }
+        // The AVI write clears then sets its enable; the GCP every HDMI
+        // sink gets then adds its own enable, keeping AVI's.
         let ctl_writes = mmio.writes_to(Transcoder::A.base() + VIDEO_DIP_CTL_OFFSET);
-        if ctl_writes.len() != 2
+        if ctl_writes.len() != 3
             || ctl_writes[0] & VIDEO_DIP_ENABLE_AVI != 0
             || ctl_writes[1] & VIDEO_DIP_ENABLE_AVI == 0
+            || ctl_writes[2] & (VIDEO_DIP_ENABLE_AVI | VIDEO_DIP_ENABLE_GCP)
+                != VIDEO_DIP_ENABLE_AVI | VIDEO_DIP_ENABLE_GCP
         {
-            return TestResult::Fail("DIP CTL must clear, then set, the AVI enable");
+            return TestResult::Fail("DIP CTL must clear, then set, the AVI enable, then add GCP");
         }
         // Audio: ELD published with the HDMI connection type
         // (byte 5 bits[3:2] == 0) and the fixture's LPCM SAD.
@@ -2062,4 +2202,115 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_vsdb_decides_dvi);
+
+    /// `intel_hdmi_compute_bpc`: the deepest depth the source, the sink's
+    /// DC flags and both TMDS limits allow, 8 bpc otherwise.
+    fn smoke_hdmi_deep_colour_selection() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gen9_ddi::SkuFamily;
+        use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, Gen9Platform};
+        let tgl = SourceFamily::Gen12(Gen12Platform::TigerLake);
+        let icl = SourceFamily::Gen11(Gen11Platform::IceLake);
+        let skl = SourceFamily::Gen9 {
+            platform: Gen9Platform::Skylake,
+            sku: SkuFamily::Desktop,
+        };
+        let dc = |dc_30, dc_36, max| {
+            Some(HdmiVsdb {
+                dc_30,
+                dc_36,
+                max_tmds_khz: max,
+            })
+        };
+        let none = HfVsdb::default();
+        let scdc = HfVsdb {
+            present: true,
+            scdc_present: true,
+            max_tmds_char_rate_khz: 600_000,
+            ..HfVsdb::default()
+        };
+        for (family, clock, vsdb, hf, want, why) in [
+            (
+                tgl,
+                148_500,
+                dc(true, true, 340_000),
+                &none,
+                (12, 222_750),
+                "1080p60 at 12 bpc",
+            ),
+            (
+                tgl,
+                297_000,
+                dc(true, true, 340_000),
+                &none,
+                (8, 297_000),
+                "4K30 12 bpc needs > 340",
+            ),
+            (
+                tgl,
+                297_000,
+                dc(true, true, 0),
+                &scdc,
+                (12, 445_500),
+                "SCDC sinks go past 340",
+            ),
+            (
+                icl,
+                148_500,
+                dc(true, false, 0),
+                &none,
+                (10, 185_625),
+                "10 bpc on display 11",
+            ),
+            (
+                skl,
+                148_500,
+                dc(true, false, 0),
+                &none,
+                (8, 148_500),
+                "no 10 bpc on display 9",
+            ),
+            (
+                skl,
+                148_500,
+                dc(true, true, 0),
+                &none,
+                (12, 222_750),
+                "12 bpc on display 9",
+            ),
+            (
+                skl,
+                297_000,
+                dc(true, true, 0),
+                &scdc,
+                (8, 297_000),
+                "display 9 stops at 300 MHz",
+            ),
+            (
+                tgl,
+                148_500,
+                dc(false, false, 0),
+                &none,
+                (8, 148_500),
+                "no DC flags",
+            ),
+            (
+                tgl,
+                148_500,
+                None,
+                &none,
+                (8, 148_500),
+                "a DVI sink is 8 bpc",
+            ),
+        ] {
+            if compute_bpc(family, clock, vsdb, hf) != want {
+                return TestResult::Fail(why);
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_deep_colour_selection
+    );
 }

@@ -470,6 +470,9 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// HDMI to a DVI sink (`!has_hdmi_sink`): the transcoder runs
     /// `TRANS_DDI_MODE_SELECT_DVI`.
     hdmi_dvi: bool,
+    /// HDMI bits per colour (8, 10 or 12): the port runs at the TMDS clock
+    /// `pixel_clock * bpc / 8` with the matching `TRANS_DDI_BPC`.
+    hdmi_bpc: u8,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -508,7 +511,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             gen9_panel_fit: None,
             gen11_dpll: None,
             hdmi_dvi: false,
+            hdmi_bpc: 8,
         }
+    }
+
+    /// The HDMI entry's port depth (`intel_hdmi_compute_bpc`'s result);
+    /// anything but 10 or 12 is 8.
+    pub(crate) fn set_hdmi_bpc(&mut self, bpc: u8) {
+        self.hdmi_bpc = if matches!(bpc, 10 | 12) { bpc } else { 8 };
     }
 
     /// Drive the HDMI entry's sink as DVI (`intel_ddi.c`: a TMDS output
@@ -928,16 +938,18 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             self.validate_framebuffer_skl(primary_fb)?;
         }
 
+        // The port clock is the TMDS clock (`intel_hdmi_tmds_clock`).
+        let port_clock = crate::intel_gpu_hdmi::tmds_clock_khz(mode.pixel_clock_khz, self.hdmi_bpc);
         self.enable_pg1()?;
         self.disable_pipeline();
         // Gen9: the SKL WRPLL row (`program_dpll_gen9_hdmi`),
         // not the TGL coefficients — the search below is
         // skipped entirely for Gen9.
         if self.gen9_platform.is_some() {
-            self.program_dpll_gen9_hdmi(mode.pixel_clock_khz)?;
+            self.program_dpll_gen9_hdmi(port_clock)?;
         } else {
             let coeffs = match crate::intel_gpu_pll::hdmi_wrpll_coeffs(
-                mode.pixel_clock_khz,
+                port_clock,
                 // Same DSSM-strap family selection as the DP path
                 // (Q6, #1024).
                 decode_refclk_family(self.mmio.read32(DSSM)),
@@ -949,7 +961,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             // MG PLL on a TC port — never the TGL CFGCR0
             // `program_dpll_coeffs` writes below.
             if self.gen11_platform.is_some() {
-                self.program_dpll_gen11_hdmi(&coeffs, mode.pixel_clock_khz)?;
+                self.program_dpll_gen11_hdmi(&coeffs, port_clock)?;
             } else {
                 self.program_dpll_coeffs(&coeffs)?;
             }
@@ -959,6 +971,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.enable_pipe_power_well(self.pipe)?;
         self.program_transcoder(mode);
         self.program_pipe(mode);
+        self.program_pipe_misc_bpc();
         // No step 7b: HDMI has no M/N.
         self.program_trans_ddi_func_ctl_hdmi(scrambling, high_tmds_char_rate);
         self.enable_dbuf_slices()?;
@@ -980,13 +993,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             match phy_for_port(platform, self.ddi) {
                 Some(Gen11Phy::Mg { .. }) => {
                     let port = crate::intel_gpu_gen11_mg_phy::MgPort::new(self.ddi, platform)?;
-                    port.set_hdmi_default_levels(self.mmio, mode.pixel_clock_khz)?;
+                    port.set_hdmi_default_levels(self.mmio, port_clock)?;
                 }
                 _ => {
                     let phy = crate::intel_gpu_gen12_combo_phy::ComboPhy::new_gen11(
                         self.ddi, platform, false, false,
                     )?;
-                    phy.set_hdmi_default_levels(self.mmio, mode.pixel_clock_khz)?;
+                    phy.set_hdmi_default_levels(self.mmio, port_clock)?;
                 }
             }
         } else {
@@ -998,7 +1011,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 false,
                 false,
             )?;
-            phy.set_hdmi_default_levels(self.mmio, mode.pixel_clock_khz)?;
+            phy.set_hdmi_default_levels(self.mmio, port_clock)?;
         }
         self.enable_ddi_buffer(4);
         self.enable_transcoder();
@@ -1019,6 +1032,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             )
         } else {
             build_trans_ddi_func_ctl_hdmi(self.ddi as u8, scrambling, high_tmds_char_rate)
+        };
+        // TRANS_DDI_BPC_10 / _12 (bits 22:20); the builders set BPC_8.
+        let val = match self.hdmi_bpc {
+            10 => (val & !(7 << 20)) | (1 << 20),
+            12 => (val & !(7 << 20)) | (3 << 20),
+            _ => val,
         };
         self.mmio
             .write32(self.transcoder().base() + TRANS_DDI_FUNC_CTL_OFFSET, val);
@@ -1910,6 +1929,30 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 self.mmio.write32(reg, val);
             }
         }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// `bdw_set_pipe_misc`'s BPC field for an HDMI deep-colour pipe:
+    /// `PIPE_MISC_BPC_10` at 10 bpc. At 12 bpc only display 13 has a
+    /// pipe encoding (`PIPE_MISC_BPC_12_ADLP`); earlier displays leave the
+    /// field at 8 bpc and the port alone runs 12. An 8 bpc run leaves
+    /// `PIPE_MISC` as it found it.
+    fn program_pipe_misc_bpc(&mut self) {
+        let field = match (self.hdmi_bpc, self.gen12_family) {
+            (10, _) => 1,
+            (
+                12,
+                Some(
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                    | crate::intel_gpu_gt::Gen12Platform::AlderLakeN,
+                ),
+            ) => 4,
+            (12, _) => 0,
+            _ => return,
+        };
+        let reg = self.pipe.base() + 0x30;
+        let cur = self.mmio.read32(reg);
+        self.mmio.write32(reg, (cur & !(7 << 5)) | (field << 5));
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -4166,6 +4209,43 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_hdmi_dvi_sink_selects_dvi_mode
+    );
+
+    /// Deep colour: TRANS_DDI_BPC_10/_12, PIPE_MISC_BPC_10, and 12 bpc in
+    /// PIPE_MISC only on display 13.
+    fn smoke_hdmi_deep_colour_bpc_fields() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        use crate::intel_gpu_pipes::{Transcoder, TRANS_DDI_FUNC_CTL_OFFSET};
+        let func = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        let misc = 0x70030;
+        for (family, bpc, trans_bpc, misc_bpc) in [
+            (Gen12Platform::TigerLake, 10, 1, Some(1)),
+            (Gen12Platform::TigerLake, 12, 3, Some(0)),
+            (Gen12Platform::AlderLakeP, 12, 3, Some(4)),
+            (Gen12Platform::TigerLake, 8, 0, None),
+        ] {
+            let mmio = FakeMmio::new();
+            let mut ms = Modeset::new(&mmio, Ddi::B);
+            ms.set_gen12_family(family);
+            ms.set_hdmi_bpc(bpc);
+            ms.program_trans_ddi_func_ctl_hdmi(false, false);
+            ms.program_pipe_misc_bpc();
+            let f = mmio.writes_to(func);
+            if f.len() != 1 || (f[0] >> 20) & 7 != trans_bpc {
+                return TestResult::Fail("TRANS_DDI_FUNC_CTL BPC must follow the HDMI depth");
+            }
+            let m = mmio.writes_to(misc);
+            match misc_bpc {
+                Some(v) if m.len() == 1 && (m[0] >> 5) & 7 == v => {}
+                None if m.is_empty() => {}
+                _ => return TestResult::Fail("PIPE_MISC BPC must follow bdw_set_pipe_misc"),
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_hdmi_deep_colour_bpc_fields
     );
 
     fn smoke_gen12_internal_rgb_bypass_precedes_primary_and_refuses_live_pipe() -> TestResult {
