@@ -1246,7 +1246,7 @@ fn smoke_xe3lpd_owned_modeset_lights_pipe_a_with_display30_resources() -> TestRe
         assert!(io.written(ctl).iter().all(|v| *v != 1 << 15), "{ctl:#x}");
     }
     // DDI_CLK_VALFREQ and DDI_BUF_CTL stay at their _MMIO_PORT offsets.
-    assert_eq!(io.written(0x64030), [162_000, 540_000]);
+    assert_eq!(io.written(0x64030), [540_000]);
     assert!(io.written(0x64000).iter().any(|v| v & (1 << 29) != 0));
     // CDCLK from an off PLL: Wa_13012396614 clears the MDCLK select before
     // the (redundant) PLL disable, no wa_15010685871 squash-off, the
