@@ -66,6 +66,16 @@ pub fn sys_init_module_with_params(
     // moment the module can call through one of those pointers.
     take_dependency_refs(&module);
 
+    // Parameter values the module's init must already see: the kernel
+    // command line's `<module>.<param>=value`, then this load's own
+    // `param=value` arguments.
+    apply_param_overrides(
+        module.name(),
+        &module.params,
+        narf_boot::args().tokens(),
+        params,
+    );
+
     // Call the init function; if it fails, unwind everything the load put in
     // place and surface the error.
     // SAFETY: we just loaded the module and own its placements.
@@ -89,6 +99,46 @@ pub fn sys_init_module_with_params(
         return Err(ModuleSyscallError::InitFailed(e));
     }
     Ok(module)
+}
+
+/// Apply load-time values to the parameters `module` declares (its
+/// `.narf_kparams` section): first every `<module>.<param>=value` token of the
+/// kernel command line, in order, then every `param=value` of the load's own
+/// parameter string — so an explicit load argument wins, as with Linux's
+/// `modprobe`, which merges `/proc/cmdline` options before the command
+/// line's. `domain=` is the loader's placement option, not a parameter.
+/// Values for parameters the module does not declare are ignored, matching
+/// Linux's "unknown parameter ignored" for command-line module options.
+pub(crate) fn apply_param_overrides<'a>(
+    name: &str,
+    slots: &[crate::params::ParamSlot],
+    cmdline: impl Iterator<Item = &'a str>,
+    params: &str,
+) {
+    for token in cmdline {
+        let Some(rest) = token
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('.'))
+        else {
+            continue;
+        };
+        if let Some((key, value)) = rest.split_once('=') {
+            if let Some(slot) = crate::params::find(slots, key) {
+                slot.write(value);
+            }
+        }
+    }
+    for token in params.split_ascii_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        if key == "domain" {
+            continue;
+        }
+        if let Some(slot) = crate::params::find(slots, key) {
+            slot.write(value);
+        }
+    }
 }
 
 /// Take a reference on each module `module` resolved a symbol from.

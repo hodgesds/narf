@@ -345,3 +345,18 @@ fn block_on_drives_a_self_advancing_future() {
     });
     assert_eq!(out, 42);
 }
+
+// ── parameters ──────────────────────────────────────────────────────
+
+#[test]
+fn param_reads_short_and_long_values_and_reports_undeclared() {
+    use crate::abi::set_param;
+    use crate::param::{get, ParamError};
+    set_param("ssid", "narf-lab");
+    let long: String = core::iter::repeat_n('p', 200).collect();
+    set_param("passphrase", &long);
+    assert_eq!(get("ssid").as_deref(), Ok("narf-lab"));
+    // Longer than the first 64-byte attempt: the -ENOBUFS retry path.
+    assert_eq!(get("passphrase"), Ok(long));
+    assert_eq!(get("psk"), Err(ParamError::Undeclared));
+}

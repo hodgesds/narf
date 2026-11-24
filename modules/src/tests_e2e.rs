@@ -947,6 +947,63 @@ fn e2e_runtime_module_allocates_and_runs_futures() -> TestResult {
 }
 kernel_test_in!("modules/e2e", e2e_runtime_module_allocates_and_runs_futures);
 
+/// Load parameters reach a module's init through `narf_module_param`. The
+/// runtime smoke declares `greeting=default` and `expect=default` in its
+/// `.narf_kparams` and fails init unless they are equal: overriding both in
+/// the load string must load, overriding only one must fail init — and the
+/// `domain=` placement option must not be taken for a parameter.
+fn e2e_runtime_module_reads_load_parameters() -> TestResult {
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("no staged initramfs for runtime module smoke");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/narf_module_rt_smoke.ko")
+    else {
+        return TestResult::Skip("narf_module_rt_smoke.ko was not staged");
+    };
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::Ed25519Verifier));
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("runtime module has no ABI placeholder");
+    };
+
+    match crate::syscalls::sys_init_module_with_params(
+        &image,
+        "domain=scratch greeting=hello expect=hello",
+    ) {
+        Ok(module) => {
+            let slot = crate::params::find(&module.params, "greeting").map(|p| p.read());
+            drop(module);
+            let _ = sys_delete_module("module_rt_smoke");
+            if slot.as_deref() != Some("hello") {
+                return TestResult::Fail("load-string parameter did not reach the module's slot");
+            }
+        }
+        Err(_) => {
+            return TestResult::Fail("module rejected matching load-string parameters");
+        }
+    }
+    match crate::syscalls::sys_init_module_with_params(&image, "greeting=hello") {
+        Err(ModuleSyscallError::InitFailed(_)) => {}
+        Ok(_) => {
+            let _ = sys_delete_module("module_rt_smoke");
+            return TestResult::Fail("init accepted a parameter override it could not see");
+        }
+        Err(_) => return TestResult::Fail("runtime module failed to load before init"),
+    }
+    if crate::registry::contains("module_rt_smoke") {
+        return TestResult::Fail("failed init left the module registered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e", e2e_runtime_module_reads_load_parameters);
+
 // ── Smoke 9: a real dual-build driver `.ko` loads and DRIVES the device ──
 
 /// The capstone of the loadable-driver work: load the rustc-built

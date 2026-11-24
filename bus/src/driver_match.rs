@@ -757,6 +757,9 @@ struct DeviceCtx {
     /// MSI-X objects remain kernel-owned; modules see only bounded vector
     /// numbers and callback cookies.
     msix: Option<crate::msix::MsixTable>,
+    /// Plain multi-message MSI, programmed by `module_msi_enable`. Exclusive
+    /// with `msix`; its vectors are in `irqs` like MSI-X claims.
+    msi: Option<crate::msi::MsiConfig>,
     irqs: Vec<ModuleIrq>,
     /// At most one periodic poller per device. A unique id prevents a task
     /// from an old registration from matching a replacement.
@@ -834,6 +837,10 @@ mod module_wireless_tests;
 mod module_probe_tests;
 
 #[cfg(feature = "kernel-test")]
+#[path = "module_pci_ext_tests.rs"]
+mod module_pci_ext_tests;
+
+#[cfg(feature = "kernel-test")]
 #[path = "module_dt_tests.rs"]
 mod module_dt_tests;
 
@@ -851,6 +858,7 @@ fn install_device_ctx(owner: u64, token: u64, device: BusDevice, cap: Cap<BusDev
         dmabufs: Vec::new(),
         retain_dma_on_teardown: false,
         msix: None,
+        msi: None,
         irqs: Vec::new(),
         poller: None,
         net_iface: None,
@@ -897,6 +905,13 @@ fn teardown_device_ctx(mut ctx: DeviceCtx) {
         // SAFETY: same exclusive config-space ownership; every allocated
         // entry was function-masked above.
         unsafe { msix.disable() };
+    }
+    if let Some(cfg) = ctx.msi.as_ref() {
+        // Stop plain-MSI delivery before detaching the block's handlers.
+        // SAFETY: the context exclusively owns this function's config space.
+        let _ = ctx
+            .cap
+            .invoke(DeviceOp(|| unsafe { crate::msi::disable(cfg) }));
     }
     if ctx.enabled_bits != 0 {
         // Best effort: a revoked cap already prevents further access, which
@@ -1373,6 +1388,9 @@ pub fn module_msix_enable(owner: u64, token: u64) -> i32 {
         if ctx.msix.is_some() {
             return 0;
         }
+        if ctx.msi.is_some() {
+            return -16; // -EBUSY: plain MSI owns this function's interrupts
+        }
         (ctx.device, ctx.cap)
     };
     let table = match cap.invoke(DeviceOp(|| crate::msix::enable_msix(&cap, &device))) {
@@ -1654,6 +1672,302 @@ pub fn module_irq_set_handler(
         }
     });
     0
+}
+
+// ── Device datapath: identity, plain MSI, ASPM, mapped DMA ──────────────
+
+/// Bytes in the record [`module_pci_identity`] fills.
+pub const MODULE_PCI_IDENTITY_LEN: usize = 16;
+
+/// The PCI identity of a module-owned function, as the fixed little-endian
+/// record `narf_pci_identity` hands the module:
+///
+/// | off | size | field |
+/// |---|---|---|
+/// | 0 | 2 | vendor |
+/// | 2 | 2 | device |
+/// | 4 | 2 | subsystem vendor |
+/// | 6 | 2 | subsystem device |
+/// | 8 | 1 | revision |
+/// | 9 | 3 | class code (prog-if, subclass, base class) |
+/// | 12 | 2 | segment |
+/// | 14 | 1 | bus |
+/// | 15 | 1 | devfn (`device << 3 \| function`) |
+///
+/// Board-data and calibration names need these (ath11k:
+/// `bus=pci,vendor=…,subsystem-device=…`), and a driver registering one
+/// probe for several device ids needs to know which one it got.
+pub fn module_pci_identity(owner: u64, token: u64) -> Result<[u8; MODULE_PCI_IDENTITY_LEN], i32> {
+    let (cap, device) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return Err(-19);
+        };
+        (ctx.cap, ctx.device)
+    };
+    let BusAddr::Pcie(addr) = device.addr else {
+        return Err(-95);
+    };
+    // Revision + class share dword 0x08; DeviceId keeps class, not revision.
+    let rev_class = match cap.invoke(DeviceOp(|| crate::pci::read_config32(&cap, &device, 0x08))) {
+        Ok(Ok(v)) => v,
+        _ => return Err(-19),
+    };
+    let mut out = [0u8; MODULE_PCI_IDENTITY_LEN];
+    out[0..2].copy_from_slice(&device.id.vendor.to_le_bytes());
+    out[2..4].copy_from_slice(&device.id.device.to_le_bytes());
+    out[4..6].copy_from_slice(&device.id.subsystem_vendor.to_le_bytes());
+    out[6..8].copy_from_slice(&device.id.subsystem_id.to_le_bytes());
+    out[8] = rev_class as u8;
+    out[9..12].copy_from_slice(&(rev_class >> 8).to_le_bytes()[..3]);
+    out[12..14].copy_from_slice(&addr.segment.to_le_bytes());
+    out[14] = addr.bus;
+    out[15] = (addr.device << 3) | (addr.function & 7);
+    Ok(out)
+}
+
+/// What [`module_msi_enable`] granted.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModuleMsiGrant {
+    /// Vectors in the block (the `want` asked for).
+    pub count: u16,
+    /// First kernel vector; vector `i` of the device is `base_vector + i`.
+    /// Each one takes `narf_irq_set_handler` like an MSI-X claim.
+    pub base_vector: u16,
+    /// Programmed Message Address.
+    pub addr: u64,
+    /// Message Data of vector 0 (Linux `ep_base_data`); the device signals
+    /// vector `i` with `data + i`. Drivers that program their own interrupt
+    /// sources (ath11k's SRNG and CE rings) need both values.
+    pub data: u32,
+}
+
+/// Set up multi-message MSI for a module-owned function: exactly `want`
+/// vectors (a power of two, 1..=32), in an aligned block, with the message
+/// programmed and delivery left **disabled** — the module enables it with
+/// [`module_msi_set_enabled`] once its handlers are attached. A smaller grant
+/// is a different interrupt layout, so it is refused (`-ENOSPC`) rather than
+/// silently substituted; the module asks again with fewer.
+///
+/// Exclusive with MSI-X on the same context (`-EBUSY`).
+pub fn module_msi_enable(owner: u64, token: u64, want: u16) -> Result<ModuleMsiGrant, i32> {
+    if want == 0 || want > 32 || !want.is_power_of_two() {
+        return Err(-22);
+    }
+    let (cap, device) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return Err(-19);
+        };
+        if ctx.msi.is_some() || ctx.msix.is_some() {
+            return Err(-16);
+        }
+        (ctx.cap, ctx.device)
+    };
+    let mut cfg = match cap.invoke(DeviceOp(|| crate::msi::enable_msi(&cap, &device, want))) {
+        Ok(Ok(cfg)) => cfg,
+        Ok(Err(crate::msi::MsiError::CapabilityNotFound | crate::msi::MsiError::NotPcie)) => {
+            return Err(-95);
+        }
+        Ok(Err(crate::msi::MsiError::TooManyVectors)) => return Err(-28),
+        _ => return Err(-5),
+    };
+    if cfg.vectors_enabled() != want {
+        return Err(-28);
+    }
+    let n = want as u8;
+    let Ok(base) = narf_interrupts::vector::alloc_block_aligned(n, n) else {
+        return Err(-28);
+    };
+    let free_block = || {
+        for i in 0..n {
+            let _ = narf_interrupts::vector::free(base + i);
+        }
+    };
+    let programmed = cap.invoke(DeviceOp(|| {
+        // SAFETY: the context exclusively owns this function's config space,
+        // and `base..base+n` was just reserved for it.
+        unsafe { crate::msi::program_msi(&mut cfg, 0, base) }
+    }));
+    let addr = match programmed {
+        Ok(Ok(addr)) => addr,
+        _ => {
+            free_block();
+            return Err(-5);
+        }
+    };
+    let parked = cap.invoke(DeviceOp(|| {
+        // SAFETY: same exclusive config-space ownership.
+        unsafe { crate::msi::disable(&cfg) }
+    }));
+    if !matches!(parked, Ok(Ok(()))) {
+        free_block();
+        return Err(-5);
+    }
+    for i in 0..n {
+        narf_interrupts::install_handler_named(
+            base + i,
+            MODULE_IRQ_HANDLER_NAME,
+            token,
+            module_irq_claim_stub,
+        );
+    }
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g
+        .iter_mut()
+        .find(|c| c.owner == owner && c.token == token && c.msi.is_none() && c.msix.is_none())
+    else {
+        drop(g);
+        for i in 0..n {
+            let _ = narf_interrupts::remove_handler(base + i, MODULE_IRQ_HANDLER_NAME, token);
+            narf_interrupts::synchronize_irq(base + i);
+        }
+        free_block();
+        return Err(-19);
+    };
+    for i in 0..n {
+        ctx.irqs.push(ModuleIrq {
+            table_idx: u16::MAX,
+            vector: base + i,
+            callback: None,
+            cookie: 0,
+            callback_id: 0,
+        });
+    }
+    ctx.msi = Some(cfg);
+    Ok(ModuleMsiGrant {
+        count: want,
+        base_vector: base as u16,
+        addr,
+        data: base as u32,
+    })
+}
+
+/// Flip MSI delivery for the block [`module_msi_enable`] programmed. ath11k
+/// toggles it around power-up and reset (Linux `ath11k_pci_msi_enable` /
+/// `_disable`).
+pub fn module_msi_set_enabled(owner: u64, token: u64, enabled: bool) -> i32 {
+    let g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+        return -19;
+    };
+    let Some(cfg) = ctx.msi.as_ref() else {
+        return -22;
+    };
+    let cap = ctx.cap;
+    // SAFETY: the context exclusively owns config space; the block's
+    // handlers were installed before the context recorded it.
+    let result = cap.invoke(DeviceOp(|| unsafe {
+        if enabled {
+            crate::msi::enable(cfg)
+        } else {
+            crate::msi::disable(cfg)
+        }
+    }));
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(_)) => -5,
+        Err(_) => -19,
+    }
+}
+
+/// Set the PCIe Link Control ASPM field (L0s/L1, bits 1:0) of a module-owned
+/// function and return the previous field. Only that field: a module has no
+/// general config-space write. ath11k disables ASPM for firmware download and
+/// restores it afterwards (Linux `ath11k_pci_aspm_disable` / `_restore`).
+pub fn module_pcie_aspm(owner: u64, token: u64, aspmc: u16) -> Result<u16, i32> {
+    if aspmc & !crate::pci_express::LNKCTL_ASPMC != 0 {
+        return Err(-22);
+    }
+    let (cap, device) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return Err(-19);
+        };
+        (ctx.cap, ctx.device)
+    };
+    match cap.invoke(DeviceOp(|| {
+        crate::pci_express::clear_and_set_link_control(
+            &cap,
+            &device,
+            crate::pci_express::LNKCTL_ASPMC,
+            aspmc,
+        )
+    })) {
+        Ok(Ok(previous)) => Ok(previous & crate::pci_express::LNKCTL_ASPMC),
+        Ok(Err(_)) => Err(-95),
+        Err(_) => Err(-19),
+    }
+}
+
+/// A coherent DMA buffer whose CPU mapping the module may dereference.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModuleMappedDma {
+    /// Handle for `narf_dma_free` / `narf_dma_addr` (same namespace as
+    /// `narf_dma_alloc`).
+    pub handle: u64,
+    /// CPU address of byte 0.
+    pub cpu: usize,
+    /// Device-visible address of byte 0.
+    pub bus: u64,
+    /// Bytes actually reserved (a power-of-two page count ≥ the request).
+    pub len: usize,
+}
+
+/// [`module_dma_alloc`] for a driver whose rings the CPU walks word by word:
+/// the same coherent allocation in the module's effective domain, under a
+/// device addressing limit (`addr_bits`, 32..=64), returned together with its
+/// CPU mapping. The mapping stays valid until `narf_dma_free` of the handle
+/// or device teardown (or, with `narf_dma_retain_on_teardown`, until the
+/// retained buffer is released by the kernel).
+///
+/// Reachability: module scope keeps the kernel's domain — which holds the
+/// direct map these frames live in — reachable (`modules/DESIGN.md`, "What
+/// this does NOT do"), so the pointer grants no access the module's domain
+/// did not already have. The export is the contract that lets a later
+/// per-domain DMA keying narrow exactly these pages.
+pub fn module_dma_alloc_mapped(
+    owner: u64,
+    token: u64,
+    len: usize,
+    addr_bits: u32,
+    domain: narf_lib::id::DomainId,
+) -> Result<ModuleMappedDma, i32> {
+    if len == 0 || !(32..=64).contains(&addr_bits) {
+        return Err(-22);
+    }
+    let mask = if addr_bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << addr_bits) - 1
+    };
+    let device_cap = {
+        let g = DEVICE_CTXS.lock();
+        match g.iter().find(|c| c.owner == owner && c.token == token) {
+            Some(ctx) => ctx.cap,
+            None => return Err(-19),
+        }
+    };
+    if device_cap.invoke(DeviceOp(|| ())).is_err() {
+        return Err(-19);
+    }
+    let buffer = narf_io::alloc_coherent_masked(len, domain, mask).map_err(|_| -12)?;
+    let cpu = buffer.cpu_mut_ptr::<u8>() as usize;
+    let bus = buffer.dma_addr().raw();
+    let reserved = buffer.len();
+    let dma_cap = narf_io::register_with_cap(buffer);
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        narf_io::unregister(dma_cap);
+        return Err(-19);
+    };
+    ctx.dmabufs.push(Some(dma_cap));
+    Ok(ModuleMappedDma {
+        handle: ctx.dmabufs.len() as u64,
+        cpu,
+        bus,
+        len: reserved,
+    })
 }
 
 /// Spawn one periodic task-context callback for a module-owned device. It

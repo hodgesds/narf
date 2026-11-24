@@ -4,12 +4,13 @@
 # (`modules/src/kabi.rs`); it cannot use `narf-lib`, `narf-scheduler` or
 # `narf-time`, which are `repr(Rust)` and resident in the kernel image. This
 # crate rebuilds the pieces a driver of any size needs — a heap, console
-# lines, locks, a monotonic clock and an executor for its own futures — on
-# top of four KABI exports, and nothing else. It depends on no kernel crate,
-# so `xtask build-module` links it into the module from the staticlib
-# archive and the `nm -u` gate still sees only `narf_*` exports.
+# lines, locks, a monotonic clock, an executor for its own futures and its
+# load parameters — on top of five KABI exports, and nothing else. It
+# depends on no kernel crate, so `xtask build-module` links it into the
+# module from the staticlib archive and the `nm -u` gate still sees only
+# `narf_*` exports.
 #
-# Host tests (`cargo xtask host-test`) swap the four exports for in-process
+# Host tests (`cargo xtask host-test`) swap the five exports for in-process
 # stand-ins; see `src/abi.rs`.
 
 [package]

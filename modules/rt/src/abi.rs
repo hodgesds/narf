@@ -17,6 +17,16 @@ unsafe extern "C" {
     pub fn narf_kfree(ptr: *mut u8, size: usize, align: usize);
     /// Nanoseconds on the kernel's monotonic clock.
     pub fn narf_monotonic_ns() -> u64;
+    /// Copy the calling module's parameter `name` into `out`; the value's
+    /// length goes to `out_len`. `-ENOENT` for an undeclared parameter,
+    /// `-ENOBUFS` (length still written) when `cap` is too small.
+    pub fn narf_module_param(
+        name: *const u8,
+        name_len: usize,
+        out: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32;
 }
 
 #[cfg(test)]
@@ -34,6 +44,40 @@ mod host {
     std::thread_local! {
         static TRANSCRIPT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static CLOCK_NS: Cell<u64> = const { Cell::new(0) };
+        static PARAMS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Host stand-in: this thread's declared parameters.
+    pub unsafe fn narf_module_param(
+        name: *const u8,
+        name_len: usize,
+        out: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32 {
+        // SAFETY: callers pass a live `&str` and a live output buffer.
+        let name = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Some(value) = PARAMS.with(|p| {
+            p.borrow()
+                .iter()
+                .find(|(k, _)| k.as_bytes() == name)
+                .map(|(_, v)| v.clone())
+        }) else {
+            return -2;
+        };
+        // SAFETY: as above.
+        unsafe { out_len.write(value.len()) };
+        if value.len() > cap {
+            return -105;
+        }
+        // SAFETY: `out` names `cap >= value.len()` bytes.
+        unsafe { core::ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
+        0
+    }
+
+    /// Declare a parameter for this thread's stand-in.
+    pub fn set_param(name: &str, value: &str) {
+        PARAMS.with(|p| p.borrow_mut().push((name.into(), value.into())));
     }
 
     /// Host stand-in: record the bytes, enforcing the kernel's UTF-8 rule.

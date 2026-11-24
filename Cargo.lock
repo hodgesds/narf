@@ -3547,6 +3547,7 @@ dependencies = [
  "narf-crypto",
  "narf-filesystem",
  "narf-firmware",
+ "narf-firmware-smbios",
  "narf-init",
  "narf-initramfs",
  "narf-kernel-test",

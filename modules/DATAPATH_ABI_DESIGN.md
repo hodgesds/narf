@@ -219,10 +219,13 @@ cap is live.
 
 ## DMA safety (the load-bearing decision)
 
-A module runs in a PKS-isolated domain; `DmaBuffer::cpu_ptr()` is a kernel
-direct-map pointer the module's domain cannot access, and `alloc_coherent`
-draws from the flat buddy allocator (not a domain-tagged heap) with the IOMMU
-in identity mode. Three options:
+`alloc_coherent` draws from the flat buddy allocator (not a domain-tagged
+heap) with the IOMMU in identity mode, and `DmaBuffer::cpu_ptr()` is a kernel
+direct-map pointer. Module scope narrows PKS/PCID to the module's own domain
+**plus the kernel's** (`modules/DESIGN.md`, "What this does NOT do"), and the
+direct map is the kernel's, so a module's domain can in fact reach that
+pointer; what a module lacks without an export is the pointer itself, and a
+lifetime contract for it. Three options:
 
 - **(A) Kernel-domain accessors (recommended for the slice).** The module never
   touches DMA memory directly; it builds descriptors and moves frame bytes via
@@ -234,8 +237,16 @@ in identity mode. Three options:
   module) broad physical reach. Defer until there's a per-domain IOMMU story.
 - **(C) Bounce via the iface DMA pool.** Only helps net.
 
-Recommendation: ship **(A)**; note (B) as a perf follow-up gated on IOMMU
-per-domain mapping.
+Recommendation (first slice): ship **(A)**; note (B) as a perf follow-up gated
+on IOMMU per-domain mapping.
+
+**(B) landed for ring-walking drivers** as `narf_dma_alloc_mapped` (see "PCI
+identity, plain MSI and mapped DMA" below), alongside (A). Its justification is
+the reachability fact above, not a per-domain mapping: the pointer grants no
+access the module's domain did not already have, and the export is the
+contract that a later per-domain DMA keying (with the IOMMU story) narrows. A
+driver with tens of descriptor rings and multi-megabyte link-descriptor banks
+(ath11k) cannot afford one cap-checked export call per descriptor word.
 
 ## Lifetime / unload (prerequisite)
 
@@ -306,6 +317,54 @@ Each stage is independently reviewable and testable; we stop/reassess after any.
   rather than widening this ABI speculatively.
 - **Perf.** Copy-mode DMA (A) is fine for bring-up/bulk-NIC but not for a
   high-rate datapath; (B) is the eventual answer and needs the IOMMU work.
+
+## PCI identity, plain MSI and mapped DMA
+
+Status: **implemented**; ath11k (WCN6855) is the first consumer. The
+additive exports, all primitive-only:
+
+```text
+narf_pci_identity(dev:u64, out:*mut u8, len:usize)->i32
+narf_msi_enable(dev:u64, want:u16, out_count:*mut u16, out_base_vector:*mut u16, out_addr:*mut u64, out_data:*mut u32)->i32
+narf_msi_set_enabled(dev:u64, enabled:u32)->i32
+narf_pcie_aspm(dev:u64, aspmc:u16, out_prev:*mut u16)->i32
+narf_dma_alloc_mapped(dev:u64, len:usize, addr_bits:u32, out_cpu:*mut usize, out_bus:*mut u64, out_len:*mut usize)->u64
+```
+
+- **Identity** is a fixed 16-byte little-endian record (vendor, device,
+  subsystem vendor/device, revision, 24-bit class, segment, bus, devfn).
+  Board-data names and calibration files key on it, and a driver that
+  registers one probe for several device ids learns which one it got.
+- **Plain MSI** programs exactly `want` vectors (a power of two, ≤ 32) as
+  one aligned kernel block, leaves delivery disabled and returns the block's
+  first vector with the Message Address and vector 0's Message Data — a
+  device that programs its own interrupt sources (ath11k writes `addr` and
+  `data + i` into SRNG/CE registers) needs both. A smaller grant is a
+  different interrupt layout, so it is refused with `-ENOSPC` and the module
+  asks again with fewer. Each vector takes `narf_irq_set_handler` like an
+  MSI-X claim; the hard handler is the same accounting stub. MSI and MSI-X are
+  exclusive per context (`-EBUSY`). Teardown clears MSI Enable before
+  detaching handlers and freeing the block.
+- **ASPM** writes only Link Control bits 1:0 and returns the previous field;
+  there is still no general config-space write.
+- **Mapped DMA** is `narf_dma_alloc` under an address limit with the CPU
+  mapping returned (see "DMA safety"). Handles share the `narf_dma_*`
+  namespace and are still never reused, so a driver that allocates per packet
+  pools large mapped buffers itself.
+
+Runtime services added with them, not tied to a device:
+
+```text
+narf_udelay(ns:u64)->i32                                   // 1 ns..=1 s, sleep pumps keep ticking
+narf_random_bytes(buf:*mut u8, len:usize)->i32             // ≤ 4096; -EAGAIN when no healthy source
+narf_smbios_read(off:usize, buf:*mut u8, len:usize, out_total:*mut usize)->i32
+narf_firmware_signed(handle:u64)->i32                      // 1 signed / 0 unsigned
+narf_module_param(name:*const u8, name_len:usize, out:*mut u8, cap:usize, out_len:*mut usize)->i32
+```
+
+`narf_module_param` serves the module's `.narf_kparams` slots after the loader
+applied `<module>.<param>=` from the kernel command line and then the load's
+own arguments (`modules/MODULE_AUTHORING.md`, "Module parameters").
 
 ## Wireless copy-mode host services
 

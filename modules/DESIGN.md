@@ -157,6 +157,16 @@ their own explicit family/version and bounded little-endian records; no
 Rust trait, firmware view, DMA pointer or future crosses this ABI.
 See [the datapath contract](DATAPATH_ABI_DESIGN.md#wireless-copy-mode-host-services)
 for completion, cancellation and unload ownership.
+A PCIe driver that programs its own interrupt sources and walks DMA rings
+from the CPU (ath11k) also has `narf_pci_identity`, `narf_msi_enable` /
+`narf_msi_set_enabled` (aligned multi-message plain MSI), `narf_pcie_aspm`
+(Link Control's ASPM field only) and `narf_dma_alloc_mapped` (a coherent
+buffer under an address limit, with its CPU mapping — see the
+[DMA safety decision](DATAPATH_ABI_DESIGN.md#dma-safety-the-load-bearing-decision)),
+plus the device-independent `narf_udelay`, `narf_random_bytes`,
+`narf_smbios_read`, `narf_firmware_signed` and `narf_module_param`. Each is
+additive and goes through the same CRC/whole-table hash and cap-at-resolution
+gates.
 The exit hook now saves/sets/restores the same execution-owner context as
 probe/poller gates, so owner-scoped cleanup addresses the exiting module's
 existing resources. State/refcount/domain admission is unchanged; mandatory

@@ -4,7 +4,9 @@
 //!
 //! 1. allocate through its `#[global_allocator]` (a `Vec` sum),
 //! 2. format with `alloc::format!` and write a whole console line,
-//! 3. run futures on its own executor — a task that sleeps while holding an
+//! 3. read its load parameters (`greeting`, `expect`; init fails unless
+//!    they are equal),
+//! 4. run futures on its own executor — a task that sleeps while holding an
 //!    async mutex, and a second task that must wait for it.
 //!
 //! No device is bound, so there is no kernel poller to drive the executor;
@@ -22,6 +24,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_module_rt::exec::{Executor, Run};
+use narf_module_rt::param;
 use narf_module_rt::printkln;
 use narf_module_rt::sync::Mutex;
 use narf_module_rt::time::{self, Deadline};
@@ -54,6 +57,14 @@ static MODINFO_TARGET_DOMAIN: [u8; 22] = *b"target_domain=scratch\0";
 #[link_section = ".modinfo"]
 static MODINFO_KERNEL_ABI: [u8; 22] = *b"kernel_abi=0x00000000\0";
 
+// Declared parameters with defaults. `#[used]` keeps the section through the
+// module link's section GC (it is emitted SHF_GNU_RETAIN). Init requires
+// `greeting == expect`, so a load that overrides only one of them fails —
+// which is how the e2e test proves the override reached the module.
+#[used]
+#[link_section = ".narf_kparams"]
+static KPARAMS: [u8; 32] = *b"greeting=default\nexpect=default\n";
+
 static EXEC: Executor = Executor::new();
 static ORDER: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static STEPS: AtomicU32 = AtomicU32::new(0);
@@ -71,6 +82,18 @@ pub extern "C" fn narf_module_init() -> i32 {
     printkln!("{line}");
     if sum != 500_500 {
         return -22;
+    }
+
+    // Load parameters: both declared, and equal unless the loader set only
+    // one of them.
+    match (param::get("greeting"), param::get("expect")) {
+        (Ok(greeting), Ok(expect)) if greeting == expect => {
+            printkln!("narf-module-rt-smoke: params ok greeting={greeting}");
+        }
+        (greeting, expect) => {
+            printkln!("narf-module-rt-smoke: params mismatch {greeting:?} vs {expect:?}");
+            return -22;
+        }
     }
 
     // 3: executor, sleep and async mutex.

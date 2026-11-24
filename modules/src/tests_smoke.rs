@@ -2052,3 +2052,40 @@ kernel_test_in!(
     "modules/lifecycle",
     smoke_lifecycle_exit_preserves_device_kabi_owner
 );
+
+/// `<module>.<param>=` on the kernel command line, then the load string,
+/// override declared parameters only: another module's prefix, a bare
+/// prefix match (`ath11kx.`), an undeclared name and `domain=` change
+/// nothing, and the load string wins over the command line.
+fn smoke_param_overrides_follow_cmdline_then_load_string() -> TestResult {
+    use crate::params::ParamSlot;
+    let slots = alloc::vec![
+        ParamSlot::new("ssid", ""),
+        ParamSlot::new("passphrase", ""),
+        ParamSlot::new("scan", "0"),
+    ];
+    let cmdline = [
+        "console=ttyS0",
+        "ath11k.ssid=narf%20lab",
+        "ath11kx.scan=9",
+        "ath10k.scan=8",
+        "ath11k.unknown=1",
+        "ath11k.passphrase=from-cmdline",
+        "ath11k.scan",
+    ];
+    crate::syscalls::apply_param_overrides(
+        "ath11k",
+        &slots,
+        cmdline.into_iter(),
+        "domain=net passphrase=from-load ssid",
+    );
+    let got = |name: &str| crate::params::find(&slots, name).map(|slot| slot.read());
+    if got("ssid").as_deref() != Some("narf%20lab")
+        || got("passphrase").as_deref() != Some("from-load")
+        || got("scan").as_deref() != Some("0")
+    {
+        return TestResult::Fail("module parameter overrides applied in the wrong order or scope");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/params", smoke_param_overrides_follow_cmdline_then_load_string);

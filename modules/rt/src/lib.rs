@@ -3,14 +3,17 @@
 //! A `.ko` crosses into the kernel only through the primitive C KABI. That is
 //! enough for a hundred-line driver that polls a ring; it is not enough for a
 //! driver written against `alloc`, `async` and locks. This crate supplies
-//! those, built from four KABI exports (`narf_printk`, `narf_kmalloc`,
-//! `narf_kfree`, `narf_monotonic_ns`) and nothing else:
+//! those, built from five KABI exports (`narf_printk`, `narf_kmalloc`,
+//! `narf_kfree`, `narf_monotonic_ns`, `narf_module_param`) and nothing
+//! else:
 //!
 //! * [`heap`] — the module's `#[global_allocator]`, over the kernel heap.
 //! * [`console`] — whole-line console output ([`printkln!`]).
 //! * [`sync`] — a spin lock whose guard is `!Send` and an async mutex.
 //! * [`time`] — the monotonic clock, deadlines and sleep futures.
 //! * [`exec`] — an executor for the module's own futures.
+//! * [`param`] — the module's load parameters (`.narf_kparams`, overridden
+//!   by `<module>.<param>=` on the kernel command line or the load string).
 //!
 //! ## Execution model
 //!
@@ -37,6 +40,7 @@ mod abi;
 pub mod console;
 pub mod exec;
 pub mod heap;
+pub mod param;
 pub mod sync;
 pub mod time;
 
