@@ -355,6 +355,10 @@ fn mid(max: u8) -> u8 {
 // has one message per clock, which `amdgpu_smu_v13` carries and this now
 // routes through: `set_range_msgs` returns the pair for a domain, and the
 // param is a bare frequency in MHz with no domain byte.
+//
+// The 13.0.0 side of this split now lives in `amdgpu_smu_v13_0` (verified
+// against `smu_v13_0_0_ppsmc.h`: the five ids above, plus GFXOFF 0x28/0x29
+// and the VCN/JPEG power pair). Nothing in this file routes 13.0.0.
 
 /// LINUX-GAP: `PPSMC_MSG_SetWorkloadMask` does not exist on SMU 13.0.4 —
 /// there is no workload-hint message in its 0x01..0x30 space. The power

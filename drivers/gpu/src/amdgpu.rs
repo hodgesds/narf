@@ -303,15 +303,29 @@ pub fn navi3_device(did: u16) -> Option<&'static Navi3Device> {
 }
 
 /// `ChipInfo` for a Navi31/32/33 board id. All three dies share
-/// `Family::Navi3` and the unaudited-firmware placeholder; only the
-/// asic name and firmware placeholder name differ per die. The
-/// `amdgpu/navi3*.bin` names are placeholders, not real blobs (lane 3
-/// supplies the PSP13/SMU 13.0.0 tables).
+/// `Family::Navi3`; only the asic name and firmware placeholder name
+/// differ per die. The `amdgpu/navi3*.bin` names are placeholders, not
+/// real blobs — except 0x744C (Navi31 RX 7900 XT/XTX/GRE), whose
+/// `NAVI31_FW` table this PR supplies (PSP 13.0.0 / SMU 13.0.0). The
+/// other Navi31 SKUs and Navi32/33 stay on `UNAUDITED_FW` until their
+/// tables land; the per-DID (not per-die) gate keeps this table scoped
+/// to the one DID the PSP13/SMU lane audited.
 fn navi3_chip_info(vid: u16, did: u16, device: &Navi3Device) -> ChipInfo {
     let (asic, fw_name) = match device.die {
         Navi3Die::Navi31 => ("navi31", "amdgpu/navi31.bin"),
         Navi3Die::Navi32 => ("navi32", "amdgpu/navi32.bin"),
         Navi3Die::Navi33 => ("navi33", "amdgpu/navi33.bin"),
+    };
+    // The pre-rebase form of this PR added a `NAVI31` arm to the
+    // `chip_info_for_pci_id` match below; on the current tip that arm
+    // is unreachable — `navi3_device` claims 0x744C first and returns
+    // here. The table is wired here instead, so the Navi31 firmware
+    // test (`smoke_amdgpu_navi31_fw_table`) sees the real 12-entry
+    // table rather than the empty placeholder.
+    let fw_list = if did == NAVI31 {
+        NAVI31_FW
+    } else {
+        UNAUDITED_FW
     };
     ChipInfo {
         vid,
@@ -319,7 +333,7 @@ fn navi3_chip_info(vid: u16, did: u16, device: &Navi3Device) -> ChipInfo {
         family: Family::Navi3,
         asic,
         fw_name,
-        fw_list: UNAUDITED_FW,
+        fw_list,
         revision: 0,
         rev_id: 0,
         mall_size: 0,
@@ -541,6 +555,18 @@ impl Family {
     /// 3. `None` for families whose offsets need datasheet
     ///    sourcing — `load_firmware` fails closed rather than
     ///    poking the wrong register window.
+    ///
+    /// Navi3's `None` here is by design, not TBD: Navi31 is a
+    /// discovery part and Linux takes its MP0 base from the on-die
+    /// discovery blob (`base_address[]` of the `HW_ID_MP0` entry) —
+    /// there is no static MP0 base table for it in Linux either, and
+    /// no groundable constant to put here. Copying Vega's `0xB0000`
+    /// would poke the wrong window: bases vary per generation
+    /// (Strix's MP1 base is `0x16000`). On real silicon
+    /// `AmdGpu::mp0_base()` resolves Navi3 from discovery (window 0:
+    /// `mp_13_0_0_offset.h` puts the MP0 C2PMSG registers at
+    /// `BASE_IDX 0`); the static `None` only bites when discovery is
+    /// absent, where failing closed is correct.
     pub fn mp0_base(self) -> Option<u32> {
         // Runtime override wins.
         let runtime = crate::amdgpu_offsets::offsets_of(self);
@@ -729,6 +755,59 @@ static PHOENIX_FW: &[FwEntry] = &[
     FwEntry::ip_fw("amdgpu/vcn_4_0_2.bin"),
     FwEntry::ip_fw("amdgpu/dcn_3_1_4_dmcub.bin"),
     FwEntry::ta("amdgpu/psp_13_0_4_ta.bin"),
+];
+
+/// Navi31 — GFX **11.0.0**, DCN **3.2.0**, PSP **13.0.0**, SDMA 6.0.0,
+/// VCN 4.0.0.
+///
+/// Every name here is the one Linux declares for this IP set:
+/// `gfx_v11_0.c` (`gc_11_0_0_pfp/me/mec/rlc/toc`), `mes_v11_0.c`
+/// (`gc_11_0_0_mes/mes_2/mes1`), `sdma_v6_0.c` (`sdma_6_0_0`),
+/// `amdgpu_vcn.c` (`FIRMWARE_VCN4_0_0`), `amdgpu_dm_dmub.h`
+/// (`FIRMWARE_DCN_V3_2_0_DMCUB`), `psp_v13_0.c` (`psp_13_0_0_ta`).
+///
+/// Order mirrors `PHOENIX_FW` (Linux's `psp_load_non_psp_fw` walk of
+/// `enum AMDGPU_UCODE_ID`): TOC → SDMA → CP → MES → RLC → VCN → DMCUB → TA.
+///
+/// Deliberately absent, with the reason each time:
+///
+/// * No SOS entry. The SOS (`psp_13_0_0_sos.bin`, see `amdgpu_psp13`)
+///   loads on the PSP bootloader path (`psp_bootloader_load_sos`), not
+///   in the multi-IP walk. There is no `LOAD_SOS` `FwEntry` command.
+/// * No SMU entry. `smu_13_0_0.bin` is PSP-loaded on Navi31
+///   (`AMDGPU_FW_LOAD_PSP`; Linux's `smu_v13_0_load_microcode` is
+///   `#if 0`), and 13.0.0 has no `LoadMicrocode` message — routing it
+///   through `SMU_LOAD_PMFW_MP1` would send 0x02, which is
+///   `GetSmuVersion` here. The name is tabled in `amdgpu_psp13`.
+/// * No IMU entry. No `gc_11_0_0_imu.bin` exists in the Linux tree
+///   (unlike Phoenix's `gc_11_0_1_imu.bin`).
+/// * No `rlc_1` / kicker RLC. `gc_11_0_0_rlc_1.bin` is GC 11.0.0 with
+///   PCI revision 0xCE only, and the `_kicker` variants follow the
+///   ungrounded `amdgpu_is_kicker_fw` rule (see `amdgpu_psp13`).
+///
+/// Wiring this table in does not make `initialize()` succeed yet: the
+/// dispatch still fails closed on the shared GPCOM-ring gap
+/// (`psp_dispatch_one`'s LINUX-GAP — the mailbox carries no image load).
+/// What it does unblock is the fall-through: Navi31 no longer drops to
+/// the legacy single-blob path and its `mp0_base()` failure, and every
+/// base/version the bring-up needs now resolves (see `mp0_base`,
+/// `mp1_mailbox_base`, `expected_smu_driver_if_version`).
+static NAVI31_FW: &[FwEntry] = &[
+    FwEntry::toc("amdgpu/gc_11_0_0_toc.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_0_0.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_me.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_mec.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_mes.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_mes_2.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_mes1.bin"),
+    // RLC last of the graphics firmwares: the PSP's autoload state machine
+    // starts the moment this one lands, and it expects every other graphics
+    // blob to have been received already.
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/vcn_4_0_0.bin"),
+    FwEntry::ip_fw("amdgpu/dcn_3_2_0_dmcub.bin"),
+    FwEntry::ta("amdgpu/psp_13_0_0_ta.bin"),
 ];
 
 /// Whether `name` is the RLC blob, which is what triggers the PSP's autoload.
@@ -3085,10 +3164,24 @@ impl AmdGpu {
     /// Every `amdgpu_smu` call takes an `mp1_base`; they were being handed
     /// window 0, so the mailbox writes went to the wrong window even once the
     /// offsets were corrected.
+    ///
+    /// Navi31 is the exception to the window-1 rule: `mp_13_0_0_offset.h`
+    /// gives `regMP1_SMN_C2PMSG_66_BASE_IDX` as 0, so the Navi31 mailbox
+    /// is MP1 window 0 — the same window `mp1_base()` returns. The C2PMSG
+    /// dword offsets themselves agree (`0x240 + N`: 66 is 0x0282, 82 is
+    /// 0x0292, in both headers); only the window differs.
     pub fn mp1_mailbox_base(&self) -> Option<u32> {
         // Discrete SMU11 has its own message map and owner. Never hand its
         // register window to the APU PowerUp/PowerDownGfx helpers.
-        if self.chip.family == Family::Navi4 || !self.is_apu() {
+        if self.chip.family == Family::Navi4 {
+            return None;
+        }
+        // Navi31 (SMU 13.0.0): mailbox registers are MP1 window 0
+        // (`mp_13_0_0_offset.h`, `regMP1_SMN_C2PMSG_66_BASE_IDX 0`).
+        if self.chip.family == Family::Navi3 {
+            return self.ip_block_base_idx(amdgpu_discovery::HW_ID_MP1, 0, 0);
+        }
+        if !self.is_apu() {
             return None;
         }
         self.ip_block_base_idx(amdgpu_discovery::HW_ID_MP1, 0, 1)
@@ -3096,13 +3189,16 @@ impl AmdGpu {
 
     /// SMU driver-interface schema version this driver was
     /// compiled to talk to, per family. Renoir = SMU 12.0,
-    /// Phoenix = SMU 13.0.4. Other families don't have an SMU
-    /// bring-up path in this scaffold.
+    /// Phoenix = SMU 13.0.4, Navi3 = SMU 13.0.0. Other families
+    /// don't have an SMU bring-up path in this scaffold.
     pub fn expected_smu_driver_if_version(&self) -> Option<u32> {
-        use crate::amdgpu_smu::{SMU12_DRIVER_IF_VERSION, SMU_13_0_4_DRIVER_IF_VERSION};
+        use crate::amdgpu_smu::{
+            SMU12_DRIVER_IF_VERSION, SMU_13_0_0_DRIVER_IF_VERSION, SMU_13_0_4_DRIVER_IF_VERSION,
+        };
         match self.chip.family {
             Family::Renoir => Some(SMU12_DRIVER_IF_VERSION),
             Family::Phoenix => Some(SMU_13_0_4_DRIVER_IF_VERSION),
+            Family::Navi3 => Some(SMU_13_0_0_DRIVER_IF_VERSION),
             _ => None,
         }
     }
