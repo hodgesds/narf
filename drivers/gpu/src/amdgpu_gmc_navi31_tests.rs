@@ -53,6 +53,10 @@ impl Io for Fake {
     fn write(&mut self, address: u64, value: u32) {
         self.writes.push((address, value));
         self.registers.insert(address, value);
+        // A released MMHUB semaphore reads 1 (acquired) on the next sample.
+        if address == 0x20000 + u64::from(MM.inv_sem) * 4 && value == 0 {
+            self.registers.insert(address, 1);
+        }
         if let Some((when, cap)) = self.revoke_on {
             if address == when {
                 cap.revoke();
@@ -346,7 +350,7 @@ fn gmc_navi31_initialize_programs_both_hubs_and_flushes_tlb() -> TestResult {
         return TestResult::Fail("ready state");
     }
     // The aperture starts on a 2 MiB boundary past the 16 GiB VRAM.
-    if aperture.start != 0xc0000000 || aperture.size != APERTURE_SIZE {
+    if aperture.start != 0xc_0000_0000 || aperture.size != APERTURE_SIZE {
         return TestResult::Fail("aperture placement");
     }
     let reg = |base: u64, r: u32| engine.io.registers.get(&(base + u64::from(r) * 4)).copied();
@@ -480,9 +484,11 @@ fn gmc_navi31_client_contexts_start_at_an_empty_root() -> TestResult {
     if engine.state != State::ClientsReady || !engine.state.vmid0_ready() {
         return TestResult::Fail("clients ready state");
     }
-    // The empty root: 512 entries of PDE_PTE (bit 63), none VALID.
+    // The empty root: 512 entries of PDE_PTE (bit 54 on GMC 11 —
+    // `AMDGPU_PDE_PTE`, `amdgpu_vm.h`; bit 63 is the GFX12 pattern),
+    // none VALID.
     let root = 16384 / 4;
-    if (0..512).any(|i| engine.io.memory[root + 2 * i..root + 2 * i + 2] != [0, 0x8000_0000]) {
+    if (0..512).any(|i| engine.io.memory[root + 2 * i..root + 2 * i + 2] != [0, 0x0040_0000]) {
         return TestResult::Fail("empty root pattern");
     }
     // depth 3 at 2:1, block size 9 encodes as 0 (the field holds

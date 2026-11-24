@@ -349,9 +349,9 @@ pub mod amdgpu_rdna2_gmc;
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_gmc as amdgpu_gmc_navi22;
 #[cfg(feature = "amdgpu")]
-pub mod amdgpu_gmc_navi48;
-#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gmc_navi31;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_gmc_navi48;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_hdmi_audio;
 #[cfg(feature = "amdgpu")]
