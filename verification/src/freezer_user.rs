@@ -4,8 +4,8 @@
 //! there. A kernel task freezes it in the middle of that loop, in user
 //! mode, which only the timer tick can interrupt. It then checks that the
 //! count holds still while frozen and moves again after the thaw. That
-//! covers the tick's yield during a freeze and the own-stack park loop's
-//! freeze point on each arch.
+//! covers the user-mode tick's freeze point (`freeze_on_user_tick`) and the
+//! own-stack park loop's on each arch.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

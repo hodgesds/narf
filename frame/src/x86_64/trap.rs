@@ -2042,6 +2042,13 @@ fn dispatch_trap(frame: &mut TrapFrame) {
                 narf_userspace::handlers::timer_preempt_user_task(&mut ctx);
             }
         }
+        // (c) The freezer's exit-to-user freeze point. A task the freezer
+        // finds running in user mode parks here at its next tick, from the
+        // state the own-stack preemption above switches from (own kernel
+        // stack, after EOI and accounting). A no-op outside a freeze.
+        if is_tick && (frame.cs & 3) == 3 {
+            narf_userspace::handlers::freeze_on_user_tick();
+        }
         return;
     }
 
