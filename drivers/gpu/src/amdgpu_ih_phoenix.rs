@@ -630,19 +630,6 @@ impl Rings {
             }
         }
     }
-    /// Back to Prepared on the same ring reservations after a reset, with
-    /// the read pointers and overflow streak reset; [`Self::initialize`]
-    /// re-programs the rings from there. The GPU must have been reset: the
-    /// hardware read pointers are at their reset values.
-    ///
-    /// # Safety
-    /// The GPU was reset since the rings were disabled.
-    pub(crate) unsafe fn rearm(&mut self) {
-        self.0.state = State::Prepared;
-        self.0.rptr = [0; 2];
-        self.0.consumed = [0; 2];
-        self.0.streak = 0;
-    }
     pub fn report(&self) -> Option<Report> {
         (self.0.state == State::Ready).then(|| self.0.report())
     }
