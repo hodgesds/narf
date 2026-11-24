@@ -159,9 +159,15 @@ pub struct ColdBoot {
     topology: Option<crate::amdgpu_gfx10_topology::Topology>,
     state: State,
     /// GFX power gating and GFXOFF for this lifetime (`amdgpu_raphael_gfxoff`).
+    // Unwired: read by `gate_gfx`/`hold_gc` once the platform wiring lands
+    // (amdgpu.rs:1012); the owner is complete, its caller is not.
+    #[allow(dead_code)]
     gfxoff: gfxoff::GfxOff,
     /// Clock gating (`amdgpu_device_set_cg_state`); `None` if its banks did
     /// not resolve, and the clocks then stay ungated.
+    // Unwired: read by `set_clock_gating`/`rearm` once the platform wiring
+    // lands (amdgpu.rs:1012).
+    #[allow(dead_code)]
     gating: Option<gating::Gating>,
     /// `adev->pg_flags` and `cg_flags`: [`gating::REMBRANDT_PG`] and
     /// [`gating::REMBRANDT_CG`] under `amdgpu.pg_mask` and `amdgpu.cg_mask`
@@ -170,6 +176,9 @@ pub struct ColdBoot {
     cg_flags: u64,
 }
 /// PMFW's GFXOFF messages and RLC's power gating, for `gfxoff`.
+// Unwired: constructed by `gate_gfx` et al. once the platform wiring lands
+// (amdgpu.rs:1012).
+#[allow(dead_code)]
 struct GcPower<'a> {
     smu: &'a mut smu::Smu,
     gfx: &'a mut cp::Gfx,
@@ -184,6 +193,11 @@ impl gfxoff::PowerGating for GcPower<'_> {
         self.gfx.set_power_gating(enable).await.map_err(drop)
     }
 }
+// The method surface is the Rembrandt owner, complete but unwired: no
+// platform caller holds a `ColdBoot` yet (amdgpu.rs:1012), so every
+// `pub(crate)`/private method reads dead until the wiring lands. The `pub`
+// methods are live roots; this only silences the rest. Tracker #2467.
+#[allow(dead_code)]
 impl ColdBoot {
     /// Reserve every owner: no register I/O. Refused unless every engine
     /// resolves Rembrandt's layout.
@@ -1058,6 +1072,9 @@ impl ColdBoot {
 /// `PowerUpVcn`/`PowerDownVcn` (`yellow_carp_dpm_set_vcn_enable`; always
 /// sent, there is no MM_DPM_PG feature to consult), and the DPG register
 /// lists through the PSP session that loaded VCN.
+// Unwired: constructed by `submit_media` once the platform wiring lands
+// (amdgpu.rs:1012).
+#[allow(dead_code)]
 struct MediaPower<'a> {
     smu: &'a mut smu::Smu,
     psp: &'a mut crate::amdgpu_psp_ring::Psp,
@@ -1165,6 +1182,9 @@ fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
 /// Hand a delayed `AllowGfxOff` to the display owner's task. The platform's
 /// `schedule_gfx_off` routes only to the Raphael owner, so on Rembrandt the
 /// allow is dropped until the follow-up adds the Rembrandt routing.
+// Unwired: called by `gate_gfx`/`release_gc` once the platform wiring lands
+// (amdgpu.rs:1012).
+#[allow(dead_code)]
 fn schedule(allow: Option<gfxoff::Allow>) {
     if let Some(allow) = allow {
         crate::amdgpu_platform::schedule_gfx_off(allow);
