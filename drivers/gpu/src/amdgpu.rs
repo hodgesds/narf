@@ -885,9 +885,12 @@ pub(crate) static REMBRANDT_FW: &[FwEntry] = &[
 /// Order is `enum AMDGPU_UCODE_ID`: SDMA0, CP_CE, CP_PFP, CP_ME, CP_MEC1,
 /// CP_MEC2, RLC_G, VCN, DMCUB — the order `psp_load_non_psp_fw` sends them
 /// in. No SMU entry: an APU's PMFW is BIOS-resident.
-// Unused: the mapping routes Raphael to `UNAUDITED_FW` until its graphics
-// bring-up exists; the PSP 13.0.5 ring loads only the display's TOC and DMCUB
-// (`amdgpu_platform`). Kept correct so that work starts from Linux's names.
+// The `chip_info_for_pci_id` mapping routes Raphael to `UNAUDITED_FW`, not
+// this table: its graphics bring-up (`amdgpu_raphael_boot::ColdBoot`, wired
+// via `amdgpu_platform::graphics_boot`) runs on the set the display path's
+// PSP 13.0.5 session loads (`Firmware::open_raphael` +
+// `Loader::set_graphics`). Kept correct so that work starts from Linux's
+// names; the RDNA2 Raphael profile contract test pins this table's order.
 #[allow(dead_code)]
 pub(crate) static RAPHAEL_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_13_0_5_toc.bin"),
@@ -1016,9 +1019,12 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         // Raphael is RDNA2 too (GFX 10.3.6 / DCN 3.1.5), and like Rembrandt
         // sits in the coarse Navi2 register family beside discrete parts;
         // `ChipInfo::is_apu` and the GC list say it is an APU. Its firmware
-        // set is `RAPHAEL_FW`, but its graphics bring-up does not exist yet —
-        // the PSP 13.0.5 ring loads only the display's TOC and DMCUB — so it
-        // is routed to `UNAUDITED_FW` as Strix is.
+        // set is `RAPHAEL_FW`, and its graphics bring-up exists
+        // (`amdgpu_raphael_boot::ColdBoot`, wired via
+        // `amdgpu_platform::graphics_boot`) — but the set it runs on arrives
+        // through the display path's PSP 13.0.5 session
+        // (`Firmware::open_raphael` + `Loader::set_graphics`), not
+        // `chip.fw_list`, so it stays routed to `UNAUDITED_FW` here.
         RAPHAEL => (Family::Navi2, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
         CEZANNE => (
             Family::Renoir,
