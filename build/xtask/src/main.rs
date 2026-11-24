@@ -16323,6 +16323,15 @@ fn host_test_cmd() -> Result<()> {
             ],
         ),
         (
+            // Its own invocation: with the default `kernel` feature the crate
+            // pulls in the kernel graph and cannot build for the host, and in
+            // the shared invocation above cargo would unify that feature on.
+            // Without it this is the algorithm set a loadable module links,
+            // plus the module-installed entropy source.
+            "kernel-free narf-crypto",
+            &["test", "-p", "narf-crypto", "--no-default-features"],
+        ),
+        (
             "isolated login-core workspace",
             &["test", "--manifest-path", "userspace/login-core/Cargo.toml"],
         ),
