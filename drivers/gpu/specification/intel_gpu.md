@@ -2722,11 +2722,12 @@ connect, the index cycle and GMBUS5 enable bit, sink NACK,
 parsing past a decoy HDMI Licensing VSDB, infoframe byte
 pins, and disconnect teardown order.
 
-Deliberate remainders: DVI signalling (same TMDS path,
-no infoframes/SCDC — a follow-up, not filed here), YCbCr
-4:2:0 and deep colour (character rate ≠ pixel clock —
-the rate rule's premise is 8 bpc RGB), HDCP (separate
-programme), HDMI 2.1 FRL, Type-C HDMI alt mode.
+DVI sinks, deep colour (10/12 bpc) and YCbCr 4:2:0 on display 11/12
+(Y420VDB/Y420CMDB, `intel_hdmi_compute_output_format`, the 1:1 pipe
+scaler, the BT.709 output CSC) are implemented with native fixtures.
+Deliberate remainders: 4:2:0 on display 14 (`intel_gpu_xelpg_hdmi`),
+HDCP (separate programme), native HDMI 2.1 FRL (i915 has none; its FRL
+is the DP PCON's), Type-C HDMI alt mode.
 
 ## 16. Multi-pipe display + DP MST (lane Q11 — `intel_gpu_multipipe`, `intel_gpu_mst`, #1017)
 

@@ -106,6 +106,24 @@ enum PowerWell {
 /// module's is private (the Gen11 MG PHY keeps its own copy
 /// the same way).
 const GEN9_DP_TP_CTL_OFFSET: u64 = 0x40;
+
+/// `PIPE_MISC` (pipe base + 0x30) YCbCr bits: `PIPE_MISC_YUV420_ENABLE`
+/// (27), `PIPE_MISC_YUV420_MODE_FULL_BLEND` (26),
+/// `PIPE_MISC_OUTPUT_COLORSPACE_YUV` (11).
+const PIPE_MISC_YUV420_ENABLE: u32 = 1 << 27;
+const PIPE_MISC_YUV420_MODE_FULL_BLEND: u32 = 1 << 26;
+const PIPE_MISC_OUTPUT_COLORSPACE_YUV: u32 = 1 << 11;
+const PIPE_MISC_YUV_MASK: u32 =
+    PIPE_MISC_YUV420_ENABLE | PIPE_MISC_YUV420_MODE_FULL_BLEND | PIPE_MISC_OUTPUT_COLORSPACE_YUV;
+/// `PIPE_CSC_MODE(pipe)` (`_PIPE_A_CSC_MODE` 0x49028, pipe stride 0x100)
+/// and `ICL_OUTPUT_CSC_ENABLE` (30).
+const PIPE_CSC_MODE: u64 = 0x49028;
+const ICL_OUTPUT_CSC_ENABLE: u32 = 1 << 30;
+/// `PIPE_CSC_OUTPUT_COEFF_RY_GY(pipe)` (`_PIPE_A_OUTPUT_CSC_COEFF_RY_GY`
+/// 0x49050); BY/RU_GU/BU/RV_GV/BV follow at +4 each, the pre-offsets at
+/// +0x18/+0x1c/+0x20 and the post-offsets at +0x24/+0x28/+0x2c.
+const PIPE_CSC_OUTPUT_COEFF_RY_GY: u64 = 0x49050;
+const PIPE_COLOR_STRIDE: u64 = 0x100;
 const GEN9_DP_TP_CTL_ENABLE: u32 = 1 << 31;
 const GEN9_DP_TP_CTL_ENHANCED_FRAME_ENABLE: u32 = 1 << 18;
 const GEN9_DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
@@ -473,6 +491,8 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// HDMI bits per colour (8, 10 or 12): the port runs at the TMDS clock
     /// `pixel_clock * bpc / 8` with the matching `TRANS_DDI_BPC`.
     hdmi_bpc: u8,
+    /// The HDMI entry drives YCbCr 4:2:0 (display 11/12).
+    hdmi_ycbcr420: bool,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -512,7 +532,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             gen11_dpll: None,
             hdmi_dvi: false,
             hdmi_bpc: 8,
+            hdmi_ycbcr420: false,
         }
+    }
+
+    /// Drive the HDMI entry's link as YCbCr 4:2:0 (`sink_format ==
+    /// INTEL_OUTPUT_FORMAT_YCBCR420`).
+    pub(crate) fn set_hdmi_ycbcr420(&mut self, ycbcr420: bool) {
+        self.hdmi_ycbcr420 = ycbcr420;
     }
 
     /// The HDMI entry's port depth (`intel_hdmi_compute_bpc`'s result);
@@ -930,6 +957,22 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.gen11_platform.is_none() && self.ddi as u8 >= Ddi::D as u8 {
             return Err(ModesetError::UnsupportedGeneration);
         }
+        // YCbCr 4:2:0 output is display 10+ (`ycbcr_420_allowed`), and the
+        // pipe scaler that downsamples it takes at most `skl_scaler_mode_valid`'s
+        // width (Linux compares hdisplay with the max source height).
+        if self.hdmi_ycbcr420 {
+            let max = if self.gen11_platform.is_some() {
+                4096
+            } else {
+                8192
+            };
+            if self.gen9_platform.is_some() {
+                return Err(ModesetError::UnsupportedGeneration);
+            }
+            if u32::from(mode.h_active) > max {
+                return Err(ModesetError::DisplayResourceUnavailable);
+            }
+        }
         validate_framebuffer_mode(primary_fb, mode)?;
         // Gen9 SKL admission, as the DP path applies it in
         // `modeset_impl` (`validate_framebuffer_skl`): a bad
@@ -939,7 +982,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         }
 
         // The port clock is the TMDS clock (`intel_hdmi_tmds_clock`).
-        let port_clock = crate::intel_gpu_hdmi::tmds_clock_khz(mode.pixel_clock_khz, self.hdmi_bpc);
+        let format = if self.hdmi_ycbcr420 {
+            crate::intel_gpu_hdmi::SinkFormat::Ycbcr420
+        } else {
+            crate::intel_gpu_hdmi::SinkFormat::Rgb
+        };
+        let port_clock =
+            crate::intel_gpu_hdmi::tmds_clock_for(mode.pixel_clock_khz, self.hdmi_bpc, format);
         self.enable_pg1()?;
         self.disable_pipeline();
         // Gen9: the SKL WRPLL row (`program_dpll_gen9_hdmi`),
@@ -971,6 +1020,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.enable_pipe_power_well(self.pipe)?;
         self.program_transcoder(mode);
         self.program_pipe(mode);
+        if self.hdmi_ycbcr420 {
+            self.program_ycbcr420_output(mode);
+        }
         self.program_pipe_misc_bpc();
         // No step 7b: HDMI has no M/N.
         self.program_trans_ddi_func_ctl_hdmi(scrambling, high_tmds_char_rate);
@@ -1960,20 +2012,101 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// `PIPE_MISC` as it found it.
     fn program_pipe_misc_bpc(&mut self) {
         let field = match (self.hdmi_bpc, self.gen12_family) {
-            (10, _) => 1,
+            (10, _) => Some(1),
             (
                 12,
                 Some(
                     crate::intel_gpu_gt::Gen12Platform::AlderLakeP
                     | crate::intel_gpu_gt::Gen12Platform::AlderLakeN,
                 ),
-            ) => 4,
-            (12, _) => 0,
-            _ => return,
+            ) => Some(4),
+            (12, _) => Some(0),
+            _ => None,
         };
+        // `bdw_set_pipe_misc`: a 4:2:0 output sets the YUV colorspace, the
+        // 4:2:0 enable and full-blend mode (display < 30).
+        let yuv = if self.hdmi_ycbcr420 {
+            PIPE_MISC_YUV420_ENABLE
+                | PIPE_MISC_YUV420_MODE_FULL_BLEND
+                | PIPE_MISC_OUTPUT_COLORSPACE_YUV
+        } else {
+            0
+        };
+        if field.is_none() && yuv == 0 {
+            return;
+        }
         let reg = self.pipe.base() + 0x30;
         let cur = self.mmio.read32(reg);
-        self.mmio.write32(reg, (cur & !(7 << 5)) | (field << 5));
+        let mut val = (cur & !PIPE_MISC_YUV_MASK) | yuv;
+        if let Some(field) = field {
+            val = (val & !(7 << 5)) | (field << 5);
+        }
+        self.mmio.write32(reg, val);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// YCbCr 4:2:0 on the TMDS link (display 11/12): the pipe scaler at
+    /// 1:1 does the chroma downsampling (`pch_panel_fitting` keeps the
+    /// fitter on for a native 4:2:0 mode; `skl_pfit_enable` binds scaler 0
+    /// in normal mode with the medium filter), and the output CSC converts
+    /// to BT.709 limited-range YCbCr (`icl_assign_csc`'s
+    /// `ilk_csc_matrix_rgb_to_ycbcr`, written by `icl_update_output_csc`,
+    /// enabled by `ICL_OUTPUT_CSC_ENABLE`).
+    fn program_ycbcr420_output(&mut self, mode: &Mode) {
+        use crate::intel_gpu_xelpg_scaler::{Filter, PipeScaler, Window};
+        let scaler = PipeScaler {
+            id: 0,
+            window: Window {
+                x: 0,
+                y: 0,
+                width: u32::from(mode.h_active),
+                height: u32::from(mode.v_active),
+            },
+            hscale: 0x10000,
+            vscale: 0x10000,
+            filter: Filter::Default,
+            mode: 0,
+        };
+        for (reg, val) in scaler.enable_writes(self.pipe) {
+            self.mmio.write32(reg, val);
+        }
+        let base = PIPE_CSC_OUTPUT_COEFF_RY_GY + self.pipe as u64 * PIPE_COLOR_STRIDE;
+        const COEFF: [u32; 9] = [
+            0x1e08, 0x9cc0, 0xb528, 0x2ba8, 0x09d8, 0x37e8, 0xbce8, 0x9ad8, 0x1e08,
+        ];
+        const POSTOFF: [u32; 3] = [0x0800, 0x0100, 0x0800];
+        // icl_update_output_csc's order: pre-offsets, coefficients,
+        // post-offsets.
+        for reg in [0x18u64, 0x1c, 0x20] {
+            self.mmio.write32(base + reg, 0);
+        }
+        for (row, reg) in [0x00u64, 0x08, 0x10].into_iter().enumerate() {
+            self.mmio
+                .write32(base + reg, COEFF[row * 3] << 16 | COEFF[row * 3 + 1]);
+            self.mmio.write32(base + reg + 4, COEFF[row * 3 + 2] << 16);
+        }
+        for (i, reg) in [0x24u64, 0x28, 0x2c].into_iter().enumerate() {
+            self.mmio.write32(base + reg, POSTOFF[i]);
+        }
+        let csc_mode = PIPE_CSC_MODE + self.pipe as u64 * PIPE_COLOR_STRIDE;
+        let cur = self.mmio.read32(csc_mode);
+        self.mmio.write32(csc_mode, cur | ICL_OUTPUT_CSC_ENABLE);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Undo [`Modeset::program_ycbcr420_output`] once the pipe is down:
+    /// detach the pipe's scalers (`skl_scaler_disable`), drop the output
+    /// CSC enable and the `PIPE_MISC` YUV encoding.
+    pub(crate) fn clear_ycbcr420_output(&mut self) {
+        for (reg, val) in crate::intel_gpu_xelpg_scaler::disable_writes(self.pipe) {
+            self.mmio.write32(reg, val);
+        }
+        let csc_mode = PIPE_CSC_MODE + self.pipe as u64 * PIPE_COLOR_STRIDE;
+        let cur = self.mmio.read32(csc_mode);
+        self.mmio.write32(csc_mode, cur & !ICL_OUTPUT_CSC_ENABLE);
+        let misc = self.pipe.base() + 0x30;
+        let cur = self.mmio.read32(misc);
+        self.mmio.write32(misc, cur & !PIPE_MISC_YUV_MASK);
         compiler_fence(Ordering::SeqCst);
     }
 
