@@ -63,7 +63,7 @@ impl<B: GpuBacking> Group<B> {
         match self.scratch.read32(JOIN_DONE) {
             0 => Ok(false),
             value if value == stamp => Ok(true),
-            _ => Err(SchedulingError::Protocol),
+            _ => Err(protocol!()),
         }
     }
     /// All payloads may have completed while the parent is still switching

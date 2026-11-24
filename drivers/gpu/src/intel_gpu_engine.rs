@@ -393,6 +393,19 @@ impl Engine {
             0x1108101d
         }
     }
+    /// The first-group header to expect in an image a context save wrote,
+    /// given the header `found` there. A Gen12 render save rewrites the group
+    /// in the native gen12_rcs_offsets layout, LRI(13, POSTED), dropping the
+    /// OACTXCONTROL NARF's builder appends; `apply_oa_oactxcontrol` scans for
+    /// that slot and tolerates its absence. Every other engine saves the
+    /// header `first_lri` names.
+    pub(crate) fn saved_lri(self, platform: GtPlatform, found: u32) -> u32 {
+        if self == Self::Rcs0 && platform.is_gen12() && found == 0x11081019 {
+            found
+        } else {
+            self.first_lri(platform)
+        }
+    }
     /// Dword index (relative to REGS) of the CTX_TIMESTAMP (0x3a8) value
     /// slot in this engine's LRC image. The second LRI group starts with
     /// 0x3a8 (see `xcs_image` and `context_image` in guc_sched.rs);
@@ -856,6 +869,17 @@ pub(crate) mod tests {
             )),
             0x1108101b
         );
+        // A Gen12 render save rewrites that group as gen12_rcs_offsets'
+        // LRI(13, POSTED); only that header is accepted besides first_lri.
+        let tgl = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        assert_eq!(Engine::Rcs0.saved_lri(tgl, 0x11081019), 0x11081019);
+        assert_eq!(Engine::Rcs0.saved_lri(tgl, 0x1108101b), 0x1108101b);
+        assert_eq!(Engine::Rcs0.saved_lri(tgl, 0x11081017), 0x1108101b);
+        assert_eq!(
+            Engine::Rcs0.saved_lri(GtPlatform::Alchemist, 0x11081019),
+            0x1108101f
+        );
+        assert_eq!(Engine::Bcs0.saved_lri(tgl, 0x1108101b), 0x11081019);
         // CTX_TIMESTAMP value slot (#1871): moved to 0x25 on non-Gen12
         // render with the #1821 group growth; 0x23 elsewhere.
         assert_eq!(

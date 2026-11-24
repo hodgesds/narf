@@ -401,6 +401,11 @@ fn sync(kind: u32, handle: u64, point: u64, signal: bool) -> [u8; 48] {
     put64(&mut wire, 24, point);
     wire
 }
+/// A second binding of the batch whose 48-bit VA has bit 47 set, so its
+/// canonical form, which Mesa submits (intel_canonical_address), differs
+/// from the recorded binding.
+const BATCH_VA: u64 = 0xfffe_1234_0000;
+const BATCH_CANONICAL: u64 = 0xffff_fffe_1234_0000;
 fn exec_wire(user: &Cpu, queue: u32, batch: bool, syncs: &[[u8; 48]]) {
     let mut wire = [0; 56];
     put32(&mut wire, 8, queue);
@@ -428,6 +433,14 @@ fn close(
     user.wire.store(64, &wire);
     invoke(file, info, user, cmd)
 }
+fn batch_pat(platform: GtPlatform) -> u16 {
+    match platform {
+        GtPlatform::Alchemist | GtPlatform::Gen12(_) => 0,
+        _ if platform.is_headless_integrated() => 2,
+        GtPlatform::Battlemage => 2,
+        _ => 3,
+    }
+}
 fn buffers(file: &RenderFile, info: &DeviceInfo, user: &Cpu, vm: u32) -> [u32; 2] {
     let code = create_bo(file, info, user, 8192, 0);
     let data = create_bo(file, info, user, 4096, 0);
@@ -435,12 +448,7 @@ fn buffers(file: &RenderFile, info: &DeviceInfo, user: &Cpu, vm: u32) -> [u32; 2
     let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
     file.gem.object(code).unwrap().write(4096, &bytes).unwrap();
     *user.mapping.lock() = Some(file.gem.object(data).unwrap().backing(0, 4096).unwrap());
-    let pat = match info.platform {
-        GtPlatform::Alchemist | GtPlatform::Gen12(_) => 0,
-        _ if info.platform.is_headless_integrated() => 2,
-        GtPlatform::Battlemage => 2,
-        _ => 3,
-    };
+    let pat = batch_pat(info.platform);
     bind_wire(
         user,
         vm,
@@ -594,6 +602,26 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         let output = file.syncobjs.lock().create(0).unwrap();
         let core = file.syncobjs.lock().get(output).unwrap().core().clone();
         let value = 0x1122334455667788;
+        // Mesa binds by 48-bit VA and submits canonical addresses: alias the
+        // batch above bit 47 and execute it through its canonical form.
+        bind_wire(
+            &user,
+            vm,
+            &[mapping(handles[0], BATCH_VA, 4096, 4096, batch_pat(platform), 1)],
+            &[],
+        );
+        assert_eq!(bind_now(&file, &info, &user), Ok(0));
+        // A batch address with high bits that are neither canonical nor
+        // zero-extended is refused before any submission.
+        let mut bad = [0; 56];
+        put32(&mut bad, 8, queue);
+        put64(&mut bad, 24, BATCH_CANONICAL ^ 1 << 63);
+        bad[32] = 1;
+        user.wire.store(64, &bad);
+        assert_eq!(
+            narf_scheduler::block_on_spin(file.dispatch_user(&info, xe::EXEC, 64, &user)),
+            Some(Err(FsError::InvalidData))
+        );
         exec_wire(
             &user,
             queue,
@@ -603,6 +631,7 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
                 sync(2, 0x2345_0000_0090, value, true),
             ],
         );
+        user.wire.store(64 + 24, &BATCH_CANONICAL.to_le_bytes());
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
         assert!(call
             .as_mut()
@@ -2117,7 +2146,9 @@ fn smoke_xe3_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
                 let ring_psmi = engine.base() + 0x50;
                 let saves = ads_registers(&w, engine);
                 assert_eq!(
-                    w.0.borrow().writes.contains(&(u64::from(ring_psmi), 0x1000_1000)),
+                    w.0.borrow()
+                        .writes
+                        .contains(&(u64::from(ring_psmi), 0x1000_1000)),
                     release <= 1
                 );
                 assert_eq!(saves.contains_key(&ring_psmi), release <= 1);
@@ -2270,7 +2301,16 @@ fn smoke_xe_mtl_media_gt1_unpublished_and_placements_refuse_before_allocation() 
     }
     let vm = create_vm(&file, &info, &user);
     let before = arena.live_allocations();
-    for (class, gt_id) in [(2u8, 1u8), (3, 1), (2, 0), (3, 0), (0, 1), (1, 1), (4, 1), (5, 1)] {
+    for (class, gt_id) in [
+        (2u8, 1u8),
+        (3, 1),
+        (2, 0),
+        (3, 0),
+        (0, 1),
+        (1, 1),
+        (4, 1),
+        (5, 1),
+    ] {
         user.wire.store(512, &[class, 0, 0, 0, gt_id, 0, 0, 0]);
         let mut queue = [0; 48];
         put32(&mut queue, 8, 0x00010001);
@@ -2336,7 +2376,11 @@ fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
     assert_eq!(gts.len(), 8 + 2 * 96);
     assert_eq!(u32_at(&gts, 0), 2);
     assert_eq!(&gts[8..14], &[0u8; 6], "type MAIN, tile 0, gt_id 0");
-    assert_eq!(&gts[104..110], &[1, 0, 0, 0, 1, 0], "type MEDIA, tile 0, gt_id 1");
+    assert_eq!(
+        &gts[104..110],
+        &[1, 0, 0, 0, 1, 0],
+        "type MEDIA, tile 0, gt_id 1"
+    );
     assert_eq!(u32_at(&gts, 116), 19_200_000);
     assert_eq!(u64_at(&gts, 120), 1, "near: system memory");
     assert_eq!(u64_at(&gts, 128), 0, "far: none on the iGPU");
@@ -2360,7 +2404,11 @@ fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
     let try_queue = |instances: &[[u8; 8]], width: u32, vm: u32| {
         user.wire.store(512, &instances.concat());
         let mut queue = [0; 48];
-        put32(&mut queue, 8, width | (instances.len() as u32 / width) << 16);
+        put32(
+            &mut queue,
+            8,
+            width | (instances.len() as u32 / width) << 16,
+        );
         put32(&mut queue, 12, vm);
         put64(&mut queue, 24, 512);
         user.wire.store(64, &queue);
@@ -2447,7 +2495,10 @@ fn smoke_xe_mtl_media_gt1_published_queries_queues_and_exec() -> TestResult {
     assert_eq!(pending.context.check_epoch(status.epoch), Ok(()));
     user.mapping.lock().take();
     for id in [queue, bind_id, parallel_id] {
-        assert_eq!(close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, id), Ok(0));
+        assert_eq!(
+            close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, id),
+            Ok(0)
+        );
     }
     assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
     guc.begin_stop(now + 1);

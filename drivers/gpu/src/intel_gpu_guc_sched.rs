@@ -98,6 +98,35 @@ pub enum SchedulingError {
     Slpc(SlpcError),
 }
 
+/// `SchedulingError::Protocol`, naming the rejecting site and any offending
+/// values on the console. A protocol error always loses the GT, so this runs
+/// on the fatal path alone and perturbs nothing that is still scheduling.
+macro_rules! protocol {
+    () => {
+        $crate::intel_gpu_guc_sched::SchedulingError::protocol(file!(), line!(), format_args!(""))
+    };
+    ($($arg:tt)+) => {
+        $crate::intel_gpu_guc_sched::SchedulingError::protocol(
+            file!(),
+            line!(),
+            format_args!($($arg)+),
+        )
+    };
+}
+pub(crate) use protocol;
+
+impl SchedulingError {
+    #[cold]
+    pub(crate) fn protocol(file: &str, line: u32, detail: core::fmt::Arguments<'_>) -> Self {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "intel-guc: protocol violation at {file}:{line} {detail}"
+        );
+        Self::Protocol
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct EngineAds {
     pub golden: u32,
@@ -772,7 +801,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             .iter()
             .any(|e| mmio.read32(u64::from(e.base()) + 0x8c) == u32::MAX)
         {
-            return Err(SchedulingError::Protocol);
+            return Err(protocol!());
         }
         // xe_hw_engine_enable_ring: render-well and GT wake are held by GuCGt.
         self.published = true;
@@ -1619,7 +1648,13 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 fence(Ordering::Acquire);
                 let seq = context.image.read32(BREADCRUMB);
                 if seq != 0 && seq != context.stamp {
-                    return Err(SchedulingError::Protocol);
+                    return Err(protocol!(
+                        "breadcrumb ctx={} engine={:?} seq={:#x} stamp={:#x}",
+                        context.id,
+                        context.engine,
+                        seq,
+                        context.stamp
+                    ));
                 }
                 if seq != 0 && !context.primary_finished {
                     let physical = job_timeout::observed_engine(
@@ -1627,7 +1662,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         context.stamp,
                         context.placements,
                     )?
-                    .ok_or(SchedulingError::Protocol)?;
+                    .ok_or_else(|| protocol!())?;
                     resources
                         .engines
                         .iter_mut()
@@ -1642,7 +1677,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .sync_for_cpu(&group.scratch)
                         .map_err(|_| SchedulingError::Cache)?;
                     if !group.valid_wq() {
-                        return Err(SchedulingError::Protocol);
+                        return Err(protocol!());
                     }
                     group.join_complete(context.stamp)?;
                     for lane in &mut group.children {
@@ -1653,7 +1688,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         fence(Ordering::Acquire);
                         let seq = lane.image.read32(BREADCRUMB);
                         if seq != 0 && seq != context.stamp {
-                            return Err(SchedulingError::Protocol);
+                            return Err(protocol!());
                         }
                         if seq != 0 && !lane.finished {
                             let physical = job_timeout::observed_engine(
@@ -1661,7 +1696,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                                 context.stamp,
                                 lane.placements,
                             )?
-                            .ok_or(SchedulingError::Protocol)?;
+                            .ok_or_else(|| protocol!())?;
                             resources
                                 .engines
                                 .iter_mut()
@@ -1760,7 +1795,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             context.stamp,
                             context.placements,
                         )?
-                        .ok_or(SchedulingError::Protocol)?;
+                        .ok_or_else(|| protocol!())?;
                         resources
                             .engines
                             .iter_mut()
@@ -1789,7 +1824,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                                     context.stamp,
                                     lane.placements,
                                 )?
-                                .ok_or(SchedulingError::Protocol)?;
+                                .ok_or_else(|| protocol!())?;
                                 resources
                                     .engines
                                     .iter_mut()
@@ -2115,18 +2150,20 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Ok(());
         }
         if message.kind != 1 || message.auxiliary >> 16 != 0 {
-            return Err(SchedulingError::Protocol);
+            return Err(protocol!(
+                "g2h kind={} aux={:#x} payload={:x?}",
+                message.kind,
+                message.auxiliary,
+                &message.payload[..]
+            ));
         }
         let action = message.auxiliary as u16;
         // xe_guc_error_capture_handler, only with registered capture lists:
         // one status dword, NOSPACE = 1. The GT owner processes the output.
         if action == crate::intel_gpu_error::capture::NOTIFICATION {
-            let capture = self
-                .error_capture
-                .as_mut()
-                .ok_or(SchedulingError::Protocol)?;
+            let capture = self.error_capture.as_mut().ok_or_else(|| protocol!())?;
             if message.payload.len() != 1 {
-                return Err(SchedulingError::Protocol);
+                return Err(protocol!());
             }
             if message.payload[0] & 0xff == 1 {
                 capture.nospace = capture.nospace.saturating_add(1);
@@ -2136,15 +2173,36 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         // ENGINE_FAILURE_NOTIFICATION (0x1009, GuC could not reset an engine)
         // stays a protocol loss: Linux answers it with a GT reset.
-        if !matches!(action, 0x1002 | 0x1008 | 0x4600 | 0x7001) {
-            return Err(SchedulingError::Protocol);
+        if !matches!(action, 0x1002 | 0x1008 | 0x4600 | 0x6000 | 0x7001) {
+            return Err(protocol!(
+                "g2h action={action:#x} payload={:x?}",
+                &message.payload[..]
+            ));
         }
-        let len = if action == 0x1002 { 2 } else { 1 };
-        // CONTEXT_RESET_NOTIFICATION carries the GuC context ID alone.
-        if message.payload.len() != len {
-            return Err(SchedulingError::Protocol);
+        // CONTEXT_RESET_NOTIFICATION carries the GuC context ID alone;
+        // NOTIFY_MEMORY_CAT_ERROR may append the opt-in CAT error type.
+        let len_ok = match action {
+            0x1002 => message.payload.len() == 2,
+            0x6000 => (1..=2).contains(&message.payload.len()),
+            _ => message.payload.len() == 1,
+        };
+        if !len_ok {
+            return Err(protocol!(
+                "g2h action={action:#x} payload={:x?}",
+                &message.payload[..]
+            ));
         }
         let cookie = message.payload[0];
+        // xe_guc_exec_queue_memory_cat_error_handler: GUC_ID_UNKNOWN means
+        // GuC could not attribute the fault to any context; only report it.
+        if action == 0x6000 && cookie == u32::MAX {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "intel-guc: unattributed memory CAT error"
+            );
+            return Ok(());
+        }
         let index = self
             .resources
             .contexts
@@ -2156,10 +2214,19 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     cookie >= u32::from(c.id) && cookie < u32::from(c.id) + c.width() as u32
                 }
             })
-            .ok_or(SchedulingError::Protocol)?;
+            .ok_or_else(|| protocol!("g2h action={action:#x} unowned cookie={cookie:#x}"))?;
         let resources = &mut *self.resources;
         let diagnostic_total = resources.contexts.iter().map(Context::width).sum();
         let c = &mut resources.contexts[index];
+        if action == 0x6000 {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "intel-guc: memory CAT error on {:?} context {}",
+                c.engine,
+                c.id
+            );
+        }
         if action == 0x4600 || (action == 0x7001 && c.phase == Phase::RetireInvalidating) {
             for backing in c.backings() {
                 resources
@@ -2169,7 +2236,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
             fence(Ordering::Acquire);
         }
-        match (action, c.phase, message.payload.get(1).copied()) {
+        // A memory CAT error is handled as GuC's own engine reset of the
+        // context (xe: "Treat the same as engine reset"); its optional
+        // second dword is a hardware-defined type, not a phase operand.
+        let (action, operand) = if action == 0x6000 {
+            (0x1008, None)
+        } else {
+            (action, message.payload.get(1).copied())
+        };
+        match (action, c.phase, operand) {
             (0x7001, Phase::Invalidating, None) if cookie == c.stamp => c.phase = Phase::Register,
             (0x7001, Phase::RetireInvalidating, None) if cookie == (c.stamp | 0x80000000) => {
                 fence(Ordering::Acquire);
@@ -2178,7 +2253,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 if !aborted
                     && (!c.all_finished() || c.parallel.as_ref().is_some_and(|g| !g.valid_wq()))
                 {
-                    return Err(SchedulingError::Protocol);
+                    return Err(protocol!());
                 }
                 // A hung or explicitly killed job's saved state is never captured.
                 if let Some(user) = c.user.as_ref().filter(|_| !aborted) {
@@ -2187,20 +2262,21 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .sync_for_cpu(&c.image)
                         .map_err(|_| SchedulingError::Cache)?;
                     job_timeout::observed_engine(&c.image, c.stamp, c.placements)?
-                        .ok_or(SchedulingError::Protocol)?;
+                        .ok_or_else(|| protocol!())?;
+                    let header = c.engine.saved_lri(self.platform, c.image.read32(REGS + 4));
                     if let Some(group) = &c.parallel {
                         for lane in &group.children {
                             job_timeout::observed_engine(&lane.image, c.stamp, lane.placements)?
-                                .ok_or(SchedulingError::Protocol)?;
+                                .ok_or_else(|| protocol!())?;
                         }
                         user.capture_lanes(
                             core::iter::once(&c.image)
                                 .chain(group.children.iter().map(|lane| &lane.image)),
-                            c.engine.first_lri(self.platform),
+                            header,
                         )
                         .map_err(SchedulingError::Residency)?;
                     } else {
-                        user.capture(&c.image, c.engine.first_lri(self.platform))
+                        user.capture(&c.image, header)
                             .map_err(SchedulingError::Residency)?;
                     }
                 }
@@ -2320,7 +2396,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 // unreachable for every ban kill and the poll fails the GT
                 // with a protocol error instead of retiring the job as Hang.
                 if !finished && !c.timed_out && !c.reset && !c.killed {
-                    return Err(SchedulingError::Protocol);
+                    return Err(protocol!());
                 }
                 // A job that completed while it was being disabled was slow,
                 // not hung: it retires normally unless GuC reset it.
@@ -2329,7 +2405,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 }
                 c.phase = Phase::RetireInvalidate;
             }
-            _ => return Err(SchedulingError::Protocol),
+            _ => {
+                return Err(protocol!(
+                    "g2h action={action:#x} ctx={} phase={:?} payload={:x?}",
+                    c.id,
+                    c.phase,
+                    &message.payload[..]
+                ))
+            }
         }
         Ok(())
     }
@@ -2342,12 +2425,17 @@ impl<A: BootAllocator> GuCScheduler<A> {
             .map_err(|_| SchedulingError::Cache)?;
         // The seed was fully retired, then a different context executed and
         // retired. The image cannot still be resident in the engine.
-        if image.read32(REGS + 4) != engine.first_lri(self.platform)
+        let header = image.read32(REGS + 4);
+        if header != engine.saved_lri(self.platform, header)
             || image.size_pages() != engine.lrc_pages(self.platform)
             || image.read32(REGS + 0x33 * 4) != 0
             || image.read32(REGS + 0x31 * 4) != 0
         {
-            return Err(SchedulingError::Protocol);
+            return Err(protocol!(
+                "default {engine:?} header={header:#x} pages={} pdp0_set={}",
+                image.size_pages(),
+                image.read32(REGS + 0x31 * 4) | image.read32(REGS + 0x33 * 4) != 0
+            ));
         }
         let golden = &state_of(&r.engines, engine).golden;
         golden.zero_fill();

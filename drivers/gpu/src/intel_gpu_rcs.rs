@@ -1886,9 +1886,10 @@ impl GpuAllocator for GgttArena {
     fn free(&mut self, backing: FrameBacking) {
         let published = backing.mapped && !self.retired;
         if published {
+            let cleared = self.cleared_pte();
             for p in 0..backing.pages {
                 if self
-                    .write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, 0)
+                    .write_pte(backing.ggtt + p * GTT_PAGE_SIZE as u32, cleared)
                     .is_err()
                 {
                     core::mem::forget(backing);
@@ -1920,7 +1921,48 @@ impl GpuAllocator for GgttArena {
     }
 }
 
+/// Physical address of the zeroed frame behind every cleared GGTT PTE, or 0
+/// before the first clear. PTEs naming it outlive any one arena (a GT reset
+/// does not rewrite the GGTT), so the frame is never returned.
+static GGTT_SCRATCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn ggtt_scratch() -> Option<u64> {
+    let phys = GGTT_SCRATCH.load(Ordering::Acquire);
+    if phys != 0 {
+        return Some(phys);
+    }
+    let frame = narf_memory::frame::alloc_frame().ok()?;
+    // SAFETY: a frame this call owns, reached through its direct-map page.
+    unsafe {
+        core::ptr::write_bytes(
+            frame.start_address().kernel_mut_ptr::<u8>(),
+            0,
+            GTT_PAGE_SIZE as usize,
+        );
+    }
+    let raw = frame.start_address().raw();
+    match GGTT_SCRATCH.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Some(raw),
+        Err(winner) => {
+            narf_memory::frame::free_frame(frame);
+            Some(winner)
+        }
+    }
+}
+
 impl GgttArena {
+    /// xe_ggtt.c::xe_ggtt_clear: a cleared PTE maps the zeroed scratch page,
+    /// never an invalid entry. An engine can still touch a context's GGTT
+    /// range after GuC deregistered it (the idle, still-resident context is
+    /// saved, or its WA batch fetched, on the next switch); scratch absorbs
+    /// that access where an invalid PTE raises NOTIFY_MEMORY_CAT_ERROR and
+    /// loses the GT. Without a scratch frame the clear falls back to 0.
+    pub(crate) fn cleared_pte(&self) -> u64 {
+        ggtt_scratch()
+            .and_then(|phys| self.encode_pte(phys).ok())
+            .unwrap_or(0)
+    }
+
     /// Return a range whose clear every GuC has invalidated: its frames to
     /// the frame allocator and its GGTT pages to the free list.
     fn release(&mut self, range: RetainedRange) {
@@ -2082,6 +2124,12 @@ impl SharedArena {
     pub(crate) fn media_guc_ct(&self) -> bool {
         self.guc_tlb_mode(crate::intel_gpu_ggtt_tlb::GuCTlb::Media)
             == crate::intel_gpu_ggtt_tlb::Mode::Ct
+    }
+
+    /// The PTE `free` writes over a cleared range (see `GgttArena::cleared_pte`).
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn cleared_pte(&self) -> u64 {
+        self.inner.lock().cleared_pte()
     }
 
     pub(crate) fn retire_ggtt(&self) -> Result<(), SubmitError> {

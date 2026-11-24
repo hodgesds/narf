@@ -418,7 +418,7 @@ fn smoke_bmg_smallbar_actual_flr_media_and_first_cache_pte() -> TestResult {
         assert_eq!(p.load(0xd8c), 0);
         p.set(0xd8c, (20 << 22) | release << 14);
         arena.free(backing);
-        assert_eq!(p.load(pte), 0);
+        assert_eq!(p.load(pte), arena.cleared_pte() as u32);
         assert_eq!(arena.live_allocations(), 0);
         p.set(0xd8c, (20 << 22) | release << 14);
         assert!(matches!(
