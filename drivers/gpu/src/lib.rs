@@ -963,6 +963,8 @@ pub mod intel_gpu_regions;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_render;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_renderstate;
+#[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_reset_policy;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_scanout;

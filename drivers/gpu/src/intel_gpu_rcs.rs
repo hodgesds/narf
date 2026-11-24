@@ -2597,6 +2597,11 @@ pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
     /// Gen9's engine-wide indirect-context workaround batch and the GT
     /// scratch page it saves `GEN8_L3SQCREG4` into ([`Self::install_gen9_wa_bb`]).
     wa_bb: Option<(A::Backing, A::Backing, u32)>,
+    /// Linux `engine->default_state`: the image the hardware saved for a
+    /// context that ran the context workarounds and, on Gen9, the null
+    /// render state ([`Self::begin_default_image`]). Later contexts start
+    /// from it instead of restore-inhibited.
+    default_image: Option<A::Backing>,
 }
 
 impl<M: MmioWindow, A: GpuAllocator> core::fmt::Debug for RcsEngine<M, A> {
@@ -2669,6 +2674,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             next_sw_id: 1,
             completion_lost: false,
             wa_bb: None,
+            default_image: None,
         })
     }
 
@@ -2743,6 +2749,80 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         }
         let ctx = self.context_mut(id)?;
         ring_emit(&ctx.ring_mem, &mut ctx.ring, words)
+    }
+
+    /// `__engines_record_defaults`, first half: on a fresh restore-inhibited
+    /// Gen9/Gen11 render context, run `setup` (the context workaround LRI)
+    /// and then the golden batch: Gen9's null render state
+    /// ([`crate::intel_gpu_renderstate::gen9_null_state`]), an empty batch on
+    /// Gen11, which Linux gives no render state. Returns the context and the
+    /// request to wait for; [`Self::finish_default_image`] records the image
+    /// once it retires.
+    pub fn begin_default_image(&mut self, setup: &[u32]) -> Result<(ContextId, u64), SubmitError> {
+        if !gen8_csb(self.generation)
+            || self.spec.class != EngineClass::Render
+            || self.default_image.is_some()
+        {
+            return Err(SubmitError::NoEngine);
+        }
+        let id = self.create_context()?;
+        let batch = self.emit_context_setup(id, setup).and_then(|()| {
+            let backing = self.alloc.alloc(1)?;
+            let words = if matches!(self.generation, crate::intel_gpu::Generation::Skylake) {
+                crate::intel_gpu_renderstate::gen9_null_state(u64::from(backing.ggtt_offset()))
+            } else {
+                crate::intel_gpu_renderstate::empty_state()
+            };
+            for (i, word) in words.iter().enumerate() {
+                backing.write32(i as u64 * 4, *word);
+            }
+            Ok(BatchBuf {
+                backing,
+                dwords: words.len() as u32,
+            })
+        });
+        match batch.and_then(|batch| self.submit(id, batch)) {
+            Ok(request) => Ok((id, request)),
+            Err(error) => {
+                let _ = self.destroy_context(id);
+                Err(error)
+            }
+        }
+    }
+
+    /// `__engines_record_defaults`, second half: once the golden request
+    /// on `id` retired (the hardware saved its image when it switched the
+    /// context out), copy the image as the engine default and destroy the
+    /// context.
+    pub fn finish_default_image(&mut self, id: ContextId) -> Result<(), SubmitError> {
+        let ctx = self.context(id)?;
+        if self.default_image.is_some() {
+            return Err(SubmitError::NoEngine);
+        }
+        if !ctx.restore_valid
+            || ctx.last_completed_seqno == 0
+            || self.ctx_covered(ctx.slot)
+            || self.queue.iter().any(|r| r.ctx_slot == ctx.slot)
+        {
+            return Err(SubmitError::ContextBusy);
+        }
+        let pages = ctx.image.size_pages();
+        let copy = self.alloc.alloc(pages)?;
+        let ctx = self.context(id)?;
+        for offset in (0..u64::from(pages) * GTT_PAGE_SIZE).step_by(4) {
+            copy.write32(offset, ctx.image.read32(offset));
+        }
+        if let Err(error) = self.destroy_context(id) {
+            self.alloc.free(copy);
+            return Err(error);
+        }
+        self.default_image = Some(copy);
+        Ok(())
+    }
+
+    /// Whether later contexts start from a recorded default image.
+    pub fn has_default_image(&self) -> bool {
+        self.default_image.is_some()
     }
 
     /// GGTT offset of the engine status page (the CSB page).
@@ -2837,9 +2917,22 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         if let Some((_, bb, bytes)) = &self.wa_bb {
             setup_gen9_indirect_ctx(&mut template, bb.ggtt_offset(), *bytes);
         }
-        // No default image: the first load must not restore engine state
-        // from an image the hardware never saved.
-        let restore_valid = !gen8_csb(self.generation);
+        // `lrc_init_state`: with a default image, start from it with the
+        // per-context status page cleared, then rewrite the register state.
+        // Without one the first load must not restore engine state from an
+        // image the hardware never saved.
+        if let Some(default) = &self.default_image {
+            let pages = default.size_pages().min(image.size_pages());
+            for offset in (0..u64::from(pages) * GTT_PAGE_SIZE).step_by(4) {
+                let value = if offset < REG_STATE_PAGE_BYTE {
+                    0
+                } else {
+                    default.read32(offset)
+                };
+                image.write32(offset, value);
+            }
+        }
+        let restore_valid = !gen8_csb(self.generation) || self.default_image.is_some();
         if !restore_valid {
             template[CTX_CONTEXT_CONTROL + 1] |= 1;
         }
@@ -3548,6 +3641,9 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             self.alloc.free(bb);
             self.alloc.free(scratch);
         }
+        if let Some(default) = self.default_image.take() {
+            self.alloc.free(default);
+        }
         self.alloc.free(self.status);
     }
 
@@ -4018,7 +4114,15 @@ pub mod tests {
         write_ptr: u8,
         consumed_elsp: usize,
         user_batches: BTreeMap<(u64, u64), alloc::sync::Weak<crate::intel_gpu_gem::GemObject>>,
+        /// 3D (GFXPIPE) commands executed from GGTT batches; a context that
+        /// ran any saves [`SAVED_3D_MARKER`] into its engine state.
+        gfx_commands: u32,
     }
+
+    /// Where the fake "saves" 3D state in a render image: page 2, past the
+    /// register state the driver writes.
+    const SAVED_3D_BYTE: u64 = 2 * GTT_PAGE_SIZE;
+    const SAVED_3D_MARKER: u32 = 0x3d3d_0000;
 
     impl FakeHw {
         fn new(regs: FakeRegs, registry: FakeObjectRegistry, status_ggtt: u32) -> Self {
@@ -4044,6 +4148,7 @@ pub mod tests {
                 write_ptr: 0,
                 consumed_elsp: 0,
                 user_batches: BTreeMap::new(),
+                gfx_commands: 0,
             }
         }
 
@@ -4156,6 +4261,7 @@ pub mod tests {
             let mut pos = head & mask;
             let tail = tail & mask;
             let mut guard = 0u32;
+            let gfx_before = self.gfx_commands;
             while pos != tail && guard < RING_BYTES {
                 guard += 4;
                 let dw = mem_rd(&ring, pos as u64);
@@ -4216,6 +4322,9 @@ pub mod tests {
                     _ => pos = (pos + 4) & mask,
                 }
             }
+            if self.gfx_commands != gfx_before {
+                mem_wr(&image, SAVED_3D_BYTE, SAVED_3D_MARKER | self.gfx_commands);
+            }
             mem_wr(&image, rs + ((CTX_RING_HEAD + 1) as u64) * 4, tail);
         }
 
@@ -4225,6 +4334,18 @@ pub mod tests {
             let mut pos = 0u64;
             while pos + 4 <= len {
                 let dw = mem_rd(&batch, pos);
+                if dw >> 29 == 3 {
+                    // GFXPIPE: step over by length. PIPELINE_SELECT and
+                    // VF_STATISTICS are single dwords; SO_DECL_LIST has a
+                    // nine-bit length.
+                    self.gfx_commands += 1;
+                    pos += 4 * match dw >> 16 {
+                        0x6904 | 0x680b => 1,
+                        0x7917 => u64::from(dw & 0x1ff) + 2,
+                        _ => u64::from(dw & 0xff) + 2,
+                    };
+                    continue;
+                }
                 match dw >> 23 {
                     0x0A => break,
                     0x20 => {
@@ -6164,5 +6285,93 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_rcs",
         smoke_legacy_context_restore_inhibit_and_wa_bb
+    );
+
+    /// `__engines_record_defaults`: Gen9 runs the context setup and the null
+    /// render state on a restore-inhibited context, records the saved image,
+    /// and later contexts start from it (status page cleared, register state
+    /// rewritten, restore not inhibited). Gen11 records with an empty batch;
+    /// Gen12 has no default image.
+    fn smoke_legacy_default_image_seeds_new_contexts() -> TestResult {
+        let control = REG_STATE_PAGE_BYTE + ((CTX_CONTEXT_CONTROL + 1) as u64) * 4;
+        let indirect = REG_STATE_PAGE_BYTE + ((GEN11_CTX_RCS_INDIRECT_CTX + 1) as u64) * 4;
+        let start = REG_STATE_PAGE_BYTE + ((CTX_RING_BUFFER_START + 1) as u64) * 4;
+        let skl = crate::intel_gpu::Generation::Skylake;
+        let (mut engine, mut hw) = make_engine_for_generation(skl).unwrap();
+        engine.install_gen9_wa_bb().unwrap();
+        let live = engine.live_allocations();
+        let setup = [mi_load_register_imm(1, false), 0x7004, 0x0001_0001, MI_NOOP];
+        let (golden, request) = engine.begin_default_image(&setup).unwrap();
+        if engine.finish_default_image(golden) != Err(SubmitError::ContextBusy) {
+            return TestResult::Fail("the image is recorded only after it retires");
+        }
+        hw.step();
+        let done = engine.poll_completions();
+        if done.len() != 1 || done[0].request != request {
+            return TestResult::Fail("the golden request retires");
+        }
+        // The null render state ran: 84 GFXPIPE commands.
+        let saved = SAVED_3D_MARKER | 84;
+        if engine.context(golden).unwrap().image.read32(SAVED_3D_BYTE) != saved {
+            return TestResult::Fail("Gen9 golden batch is the null render state");
+        }
+        engine.finish_default_image(golden).unwrap();
+        if engine.context(golden).is_ok()
+            || !engine.has_default_image()
+            || engine.live_allocations() != live + 1
+            || engine.begin_default_image(&setup) != Err(SubmitError::NoEngine)
+        {
+            return TestResult::Fail("one default image replaces the golden context");
+        }
+        let ctx = engine.create_context().unwrap();
+        let image = &engine.context(ctx).unwrap().image;
+        let ring = engine.context(ctx).unwrap().ring_mem.ggtt_offset();
+        let (bb, bytes) = match &engine.wa_bb {
+            Some((_, bb, bytes)) => (bb.ggtt_offset(), *bytes),
+            None => return TestResult::Fail("Gen9 RCS installs its WA batch"),
+        };
+        if image.read32(SAVED_3D_BYTE) != saved
+            || image.read32(control) != ctx_control_value(skl)
+            || image.read32(indirect) != bb | (bytes / 64)
+            || image.read32(start) != ring
+            || (0..GTT_PAGE_SIZE)
+                .step_by(4)
+                .any(|at| image.read32(at) != 0)
+            || !engine.context(ctx).unwrap().restore_valid
+        {
+            return TestResult::Fail("new contexts start from the default image");
+        }
+        // SAFETY: every modelled request completed.
+        unsafe {
+            engine.release_after_reset();
+        }
+        let icl = crate::intel_gpu::Generation::IceLake;
+        let (mut engine, mut hw) = make_engine_for_generation(icl).unwrap();
+        let (golden, _) = engine.begin_default_image(&setup).unwrap();
+        hw.step();
+        let _ = engine.poll_completions();
+        let empty = engine.context(golden).unwrap().image.read32(SAVED_3D_BYTE) == 0;
+        let recorded = engine.finish_default_image(golden).is_ok();
+        let ctx = engine.create_context().unwrap();
+        if !empty || !recorded || engine.context(ctx).unwrap().image.read32(control) & 1 != 0 {
+            return TestResult::Fail("Gen11 records an empty-batch default image");
+        }
+        // SAFETY: every modelled request completed.
+        unsafe {
+            engine.release_after_reset();
+        }
+        let (mut engine, _hw) = make_engine().unwrap();
+        if engine.begin_default_image(&setup) != Err(SubmitError::NoEngine) {
+            return TestResult::Fail("Gen12 records no default image");
+        }
+        // SAFETY: nothing was submitted.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_legacy_default_image_seeds_new_contexts
     );
 }

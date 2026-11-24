@@ -368,8 +368,33 @@ async fn sleep_us(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
 
+/// `__engines_record_defaults`: run the context workarounds and the golden
+/// batch ([`RcsEngine::begin_default_image`]) and record the saved image,
+/// waiting as long as Linux does (`I915_GEM_IDLE_TIMEOUT`, 200 ms).
+async fn record_defaults(engine: &mut Engine, ctx_wa: &[u32]) -> Result<(), SubmitError> {
+    let (id, request) = engine.begin_default_image(ctx_wa)?;
+    let deadline = narf_time::monotonic_ns().saturating_add(200_000_000);
+    loop {
+        if engine
+            .poll_completions()
+            .iter()
+            .any(|done| done.request == request)
+        {
+            return engine.finish_default_image(id);
+        }
+        if engine.completion_lost() {
+            return Err(SubmitError::CompletionLost);
+        }
+        if narf_time::monotonic_ns() >= deadline {
+            return Err(SubmitError::Timeout);
+        }
+        sleep_us(50).await;
+    }
+}
+
 impl Owner {
-    /// Reset and program the GT, bring RCS0 up and publish a new epoch.
+    /// Reset and program the GT, bring RCS0 up, record the default context
+    /// image and publish a new epoch.
     async fn bring_up(&self) -> Result<(), InitError> {
         let window = BarWindow::new(self.bar);
         let mut fw = Forcewake::new();
@@ -419,13 +444,34 @@ impl Owner {
             unsafe { engine.release_after_reset() };
             return Err(InitError::Engine(error));
         }
+        let ctx_wa = ctx_workarounds(self.wa, steering).load_register_imm();
+        if let Err(error) = record_defaults(&mut engine, &ctx_wa).await {
+            log(self.index, "no default context image");
+            // The golden request may still be running: only a completed
+            // reset frees what it references.
+            let mut reset = Reset::new();
+            let result = loop {
+                match reset.poll(&window, narf_time::monotonic_ns()) {
+                    Poll::Pending => sleep_us(20).await,
+                    Poll::Ready(result) => break result,
+                }
+            };
+            if result.is_ok() {
+                // SAFETY: the full-domain reset above completed, so the
+                // engine no longer reads or writes any of its memory.
+                unsafe { engine.release_after_reset() };
+            } else {
+                core::mem::forget(engine);
+            }
+            return Err(InitError::Engine(error));
+        }
         let epoch = crate::intel_gpu_user::next_epoch();
         *self.state.lock().await = Some(Runtime {
             engine,
             fw,
             window,
             epoch,
-            ctx_wa: ctx_workarounds(self.wa, steering).load_register_imm(),
+            ctx_wa,
             contexts: Vec::new(),
             jobs: Vec::new(),
         });
