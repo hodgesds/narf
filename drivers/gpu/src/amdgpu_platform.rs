@@ -345,7 +345,7 @@ const DCN_3_1_5: SurfaceWindow = SurfaceWindow {
     ..DCN_3_1_4
 };
 
-/// `dcn/dcn_3_5_0_offset.h` — Strix / HawkPoint, the other display generation
+/// `dcn/dcn_3_5_0_offset.h` — Strix, the other display generation
 /// `amdgpu_dcn` carries a modeset table for.
 ///
 /// This is why the window is a table rather than one set of constants: DCN 3.5

@@ -2163,17 +2163,21 @@ impl AmdGpu {
         //
         // Branch by family: Navi3 (Navi31/32 DCN 3.2.0, Navi33 DCN 3.2.1)
         // runs the DCN 3.2 sequence on pipe 0 — the single-display path
-        // has no KMS CRTC to take a pipe from. HawkPoint / Strix run DCN 3.5
+        // has no KMS CRTC to take a pipe from. Strix runs DCN 3.5
         // (different OTG register layout — see `amdgpu_dcn` module header
-        // for the per-register shifts). Phoenix is DCN **3.1.4**, not 3.5:
-        // it agrees with DCN 2.0 on every OTG register the 2.0 sequence
-        // touches (Linux 7.4-rc2, `dcn_2_0_0_offset.h` vs
-        // `dcn_3_1_4_offset.h`), so it takes the 2.0 sequence here, as does
+        // for the per-register shifts). Phoenix / HawkPoint are DCN
+        // **3.1.4**, not 3.5: they agree with DCN 2.0 on every OTG register
+        // the 2.0 sequence touches (Linux 7.4-rc2, `dcn_2_0_0_offset.h` vs
+        // `dcn_3_1_4_offset.h`), so they take the 2.0 sequence here, as does
         // Raphael (DCN 3.1.5 — same agreement except `OTG_INTERRUPT_CONTROL`,
         // which has no 3.1.5 register; the full verdict is in
         // `plan_modeset`). Both modeset paths now agree on the 2.0 sequence
         // for Phoenix and Raphael; this is the one `set_mode` uses, which is
         // what the PM resume path re-runs.
+        // LINUX-GAP: Strix is routed to the 2.0 sequence here too, not the
+        // 3.5 one — `STRIX_POINT` maps to `Family::Phoenix`, so there is no
+        // family value that reaches `dcn35_modeset_sequence`. A Strix family
+        // has to exist first (see the LINUX-GAP note there).
         // Everything else with a discoverable DCN block today is DCN 2.0/2.1
         // (Renoir, Cezanne, Lucienne).
         let seq = if self.chip.family == Family::Navi3 {

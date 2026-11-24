@@ -655,9 +655,9 @@ pub fn dcn20_modeset_sequence(
     writes
 }
 
-// ── DCN 3.5 modeset path (Phoenix / HawkPoint / Strix Point) ─────
+// ── DCN 3.5 modeset path (Strix Point) ─────
 //
-// On Phoenix (RDNA 3.5 iGPU) the display IP is DCN 3.5. The
+// On Strix Point (RDNA 3.5 iGPU) the display IP is DCN 3.5. The
 // register block bases inside the DCN window stay where DCN 2.0
 // put them — HUBP0 anchors near `mmHUBP0_DCHUBP_CNTL`
 // (dword 0x05F3), OPP_PIPE0 anchors near
@@ -674,7 +674,7 @@ pub fn dcn20_modeset_sequence(
 //   OTG_CONTROL               0x1B41           0x1B43   (+8 B)
 //   OTG_INTERRUPT_CONTROL     0x1B59           0x1B5A   (+4 B)
 //
-// Programming OTG_CONTROL at the DCN 2.0 offset on Phoenix lands
+// Programming OTG_CONTROL at the DCN 2.0 offset on Strix Point lands
 // on `OTG0_OTG_V_SYNC_A_CNTL` (dword 0x1B41 in DCN35) — silently
 // programming the wrong field instead of asserting OTG_MASTER_EN.
 // This is exactly the kind of silent collision the smokes pin.
@@ -720,7 +720,7 @@ pub const DCN35_OTG0_OTG_INTERRUPT_CONTROL: u32 = 0x1b5a;
 
 /// DCN 3.5 modeset sequence. Same prologue/body/epilogue shape
 /// as `dcn20_modeset_sequence`; absolute addresses fold against
-/// the DCN 3.5 per-OTG register layout so Phoenix doesn't silently
+/// the DCN 3.5 per-OTG register layout so Strix doesn't silently
 /// land OTG_MASTER_EN on `OTG_V_SYNC_A_CNTL` (the register that
 /// sits at the DCN 2.0 OTG_CONTROL slot on DCN 3.5 hardware).
 ///
