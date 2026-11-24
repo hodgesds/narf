@@ -110,6 +110,49 @@ kernel_test_in!(
     "drivers/gpu/jpeg-navi48",
     jpeg5_layout_rejects_wrong_mmhub_or_truncated_jpeg_banks
 );
+
+/// Navi44 shares the Navi48 JPEG 5.0.0 bank: the same layout resolves on
+/// GC 12.0.0 / DID 0x7590. Whether real Navi44 silicon reports VCN 5.0.0
+/// is unverified on hardware — this pins the code's shared-bank behavior,
+/// not the silicon revision.
+fn jpeg5_layout_resolves_on_navi44_and_pins_vcn_5_0_0() -> TestResult {
+    let descriptor = || {
+        let mut backing = vec![0; 0x80000 / 4];
+        let mut gpu = crate::amdgpu_gmc_navi48::tests::descriptor(&mut backing);
+        let nbif = &mut gpu.ip_blocks[2];
+        (nbif.major, nbif.minor, nbif.revision) = (6, 3, 1);
+        let mut vcn = gpu.ip_blocks[0];
+        vcn.hw_id = ip::HW_ID_VCN;
+        (vcn.major, vcn.minor, vcn.revision) = (5, 0, 0);
+        vcn.base_addrs[1] = 0x18000;
+        gpu.ip_blocks.push(vcn);
+        // IH_VMID_0_LUT_MM for client PASID mapping.
+        let mut oss = vcn;
+        oss.hw_id = ip::HW_ID_OSSSYS;
+        (oss.major, oss.minor, oss.revision) = (7, 0, 0);
+        oss.base_addrs[0] = 0x1a000;
+        gpu.ip_blocks.push(oss);
+        gpu // Metadata only; no access into the expired register backing.
+    };
+    let mut gpu = descriptor();
+    crate::amdgpu_rdna4::tests::Profile::Navi44.apply(&mut gpu);
+    if crate::amdgpu_rdna4::Rdna4Chip::of(&gpu) != Some(crate::amdgpu_rdna4::Rdna4Chip::Navi44) {
+        return TestResult::Fail("Navi44 fixture identified as another die");
+    }
+    assert_eq!(Layout::resolve(&gpu).unwrap().vcn, 0x60000);
+    assert_eq!(Layout::resolve(&gpu).unwrap().oss, 0x68000);
+    // The VCN bank pins (5, 0, 0) only, on either die.
+    let mut gpu = descriptor();
+    crate::amdgpu_rdna4::tests::Profile::Navi44.apply(&mut gpu);
+    gpu.ip_blocks[5].revision = 1;
+    assert!(Layout::resolve(&gpu).is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/jpeg-navi48",
+    jpeg5_layout_resolves_on_navi44_and_pins_vcn_5_0_0
+);
+
 struct Fake {
     sram: crate::amdgpu_navi48_media_power::tests::Program,
     picture: decode_tests::Model,

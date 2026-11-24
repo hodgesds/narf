@@ -165,6 +165,25 @@ fn rdna4_per_die_policy_matches_linux() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/rdna4", rdna4_per_die_policy_matches_linux);
 
+/// `gc_version`/`asic` are the die's identity in the other direction:
+/// every die round-trips through its GC version and names itself for the
+/// boot log and Mesa's GFX1200/GFX1201 split.
+fn rdna4_chip_identity_round_trips_through_gc_version_and_asic() -> TestResult {
+    for die in Rdna4Chip::ALL {
+        if Rdna4Chip::from_gc(die.gc_version()) != Some(die) {
+            return TestResult::Fail("die did not round-trip through its GC version");
+        }
+    }
+    if Rdna4Chip::Navi48.asic() != "navi48" || Rdna4Chip::Navi44.asic() != "navi44" {
+        return TestResult::Fail("die asic name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4",
+    rdna4_chip_identity_round_trips_through_gc_version_and_asic
+);
+
 /// The resource pool is per device: a new bind forgets the previous
 /// device's fuses until its own CC_DC_PIPE_DIS read publishes them.
 fn rdna4_pipe_pool_is_reset_per_bind() -> TestResult {
