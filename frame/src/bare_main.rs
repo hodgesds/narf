@@ -600,6 +600,7 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     let (cols, rows) = (con.cols(), con.rows());
     narf_graphics::install_fb_console(con);
     console::set_fb_hook(narf_graphics::console::write_bytes);
+    console::set_vt_switch_hook(narf_graphics::console::repaint_installed);
     let _ = writeln!(
         console::Writer,
         "  early-fb: console installed via {} ({}x{} → {}x{} chars; wc-mtrr={:?})",
@@ -3831,6 +3832,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 let backend = scanout.name();
                 narf_graphics::install_fb_console(con);
                 console::set_fb_hook(narf_graphics::console::write_bytes);
+                console::set_vt_switch_hook(narf_graphics::console::repaint_installed);
                 let _ = writeln!(
                     console::Writer,
                     "  splash: {}x{} {} framebuffer console installed \

@@ -18,7 +18,10 @@
 //!
 //! Logical switching still needs the Linux VT_PROCESS handshake: the old
 //! controller must drop DRM master before acknowledging release, then the new
-//! controller may acquire it. No framebuffer repaint is performed here.
+//! controller may acquire it. A completed switch notifies the installed
+//! framebuffer-repaint hook (see `notify_switch`), so the text console
+//! redraws its character grid over whatever the previous scanout owner
+//! left in the pixels.
 //! Linux ref: `drivers/tty/vt/vt_ioctl.c`, `include/uapi/linux/vt.h`.
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -145,9 +148,18 @@ fn complete_switch(state: &mut State, target: u32) {
     }
 }
 
-fn notify_switch() {
+/// A switch completed: sysfs and waiters are notified after the VT state
+/// lock is released, and the installed framebuffer-repaint hook is told the
+/// new active VT. The previous scanout owner may have overwritten the
+/// framebuffer pixels while it held the display (a DRM master compositor
+/// takes the framebuffer on acquire and releases it on close); repainting
+/// the text console from its character grid is what stops the old owner's
+/// pixels lingering as ghost text until new output arrives. No-op when no
+/// hook is installed (serial-only boot). Runs under no VT lock.
+fn notify_switch(target: u32) {
     crate::sysfs::notify_tty_active();
     ACTIVE_CHANGED.notify(1);
+    narf_console::notify_vt_switch(target);
 }
 
 /// The default VT node owner — `root:tty` (`gid 5`), as devtmpfs creates
@@ -188,7 +200,7 @@ pub fn activate(n: u32) -> Result<(), ()> {
         }
         complete_switch(&mut state, n);
     }
-    notify_switch();
+    notify_switch(n);
     Ok(())
 }
 
@@ -196,6 +208,7 @@ pub fn activate(n: u32) -> Result<(), ()> {
 /// acknowledge acquisition (2) when no release is pending. Linux vt_reldisp
 /// requires VT_PROCESS and rejects release acknowledgements without a request.
 pub fn release_display(vt: u32, response: u64) -> Result<(), ()> {
+    let target: u32;
     {
         let mut state = STATE.lock();
         if state
@@ -208,13 +221,13 @@ pub fn release_display(vt: u32, response: u64) -> Result<(), ()> {
         if state.active != vt || state.pending.is_none() {
             return if response == 2 { Ok(()) } else { Err(()) };
         }
-        let target = state.pending.take().unwrap();
+        target = state.pending.take().unwrap();
         if response == 0 {
             return Ok(());
         }
         complete_switch(&mut state, target);
     }
-    notify_switch();
+    notify_switch(target);
     Ok(())
 }
 
