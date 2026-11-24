@@ -8,8 +8,12 @@
 //!   last-written cache, failed-set behavior, kbdlight re-seed,
 //!   0x60C0 re-assert, availability per kind.
 //! - Builtin probe on non-ThinkPad hardware: registers nothing and
-//!   does not panic (the real registration path is hardware-tested
-//!   by Daniel on the P14s).
+//!   does not panic; builtin registration against the AML fixture
+//!   publishes all seven LEDs with the `LED_DEFS` maxima and the
+//!   default triggers (micmute's stays pending until the
+//!   `audio-micmute` module trigger registers). The AML paths are
+//!   still DSDT-UNVERIFIED — Daniel hardware-tests registration
+//!   on the P14s.
 //!
 //! The module backend's KABI calls are exercised by the `.ko` build
 //! (`cargo xtask build-module` compiles + `nm -u` gate) and by the
@@ -318,6 +322,83 @@ fn smoke_thinkpad_led_builtin_probe_no_hardware() -> TestResult {
 kernel_test_in!(
     "drivers/platform/thinkpad-led",
     smoke_thinkpad_led_builtin_probe_no_hardware
+);
+
+#[cfg(feature = "kernel-test")]
+/// `builtin::register()` against the ThinkPad LED fixture publishes
+/// all seven LEDs with the `LED_DEFS` maxima, resolves the builtin
+/// `audio-mute` default trigger immediately, and leaves the
+/// `platform::micmute` default pending until the `audio-micmute`
+/// module trigger registers.
+///
+/// The micmute default stays `Trigger::None` at registration time
+/// on purpose: `"audio-micmute"` is a module trigger, and no module
+/// trigger is registered in this harness, so `set_led_default_trigger`
+/// records it pending and `resolve_pending_defaults_for` only fires
+/// when a module trigger of that name registers. A test asserting
+/// micmute already carries a module trigger here would be wrong.
+fn smoke_thinkpad_led_builtin_register_with_fixture() -> TestResult {
+    use narf_drivers_leds::Trigger;
+    // SAFETY: serialized test; the scope puts the boot namespace back
+    // on drop, after the fixture replaced it (backlight idiom).
+    let _namespace = unsafe { narf_aml::__test_namespace_scope() };
+    narf_drivers_leds::__reset_all_for_test();
+    reset();
+    if let Err(e) = install_thinkpad_led_fixture() {
+        return TestResult::Fail(e);
+    }
+
+    crate::builtin::register();
+
+    let devs = narf_drivers_leds::led_devices();
+    if devs.len() != LED_DEFS.len() {
+        return TestResult::Fail("builtin register must publish all seven LEDs on the fixture");
+    }
+    // Every def is present with its `LED_DEFS` maximum, and its
+    // current trigger matches its default: the builtin `audio-mute`
+    // default resolves immediately on `platform::mute`; the other
+    // six stay `Trigger::None` — micmute's `audio-micmute` default
+    // is pending (see the doc comment).
+    for (idx, def) in LED_DEFS.iter().enumerate() {
+        let dev = match devs.iter().find(|d| d.name() == def.name) {
+            Some(dev) => dev,
+            None => return TestResult::Fail("a LED_DEF LED is missing from the registry"),
+        };
+        if dev.max_brightness() != def.max_brightness {
+            return TestResult::Fail("registered LED max_brightness does not match LED_DEFS");
+        }
+        let want = if idx == MUTE_IDX {
+            Trigger::AudioMute
+        } else {
+            Trigger::None
+        };
+        if dev.current_trigger() != want {
+            return TestResult::Fail("registered LED trigger does not match its default");
+        }
+    }
+    // The pending default resolves when the module trigger registers.
+    let handle = match narf_drivers_leds::triggers::register_module_trigger(
+        "audio-micmute",
+        alloc::sync::Arc::new(|max: u32, _ticks: u32| max),
+    ) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("audio-micmute module-trigger registration failed"),
+    };
+    let micmute = match narf_drivers_leds::lookup_led_by_name(LED_DEFS[MICMUTE_IDX].name) {
+        Some(dev) => dev,
+        None => return TestResult::Fail("micmute LED is missing from the registry"),
+    };
+    if micmute.current_trigger() != Trigger::Module(handle) {
+        return TestResult::Fail("micmute default did not resolve to the audio-micmute trigger");
+    }
+    narf_drivers_leds::__reset_all_for_test();
+    reset();
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "drivers/platform/thinkpad-led",
+    smoke_thinkpad_led_builtin_register_with_fixture
 );
 
 // ── AML fixture helpers (moved from lane 2, drivers/platform/src/tests.rs) ──
