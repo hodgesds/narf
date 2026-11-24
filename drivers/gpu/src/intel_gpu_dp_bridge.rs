@@ -416,6 +416,7 @@ impl IntelDpBridge {
         if active.len() >= 2 {
             if let Some((start, end)) = intel_gpu_multipipe::share_for(&mmio, &active, pipe) {
                 modeset.set_dbuf_share(start, end);
+                modeset.set_shared_cdclk(true);
             }
         }
         let outcome = match preferred_mode {

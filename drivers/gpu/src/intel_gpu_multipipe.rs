@@ -68,6 +68,8 @@ pub enum PipeUse {
     ExternalMst,
     /// A USB-C DP Alt-Mode bridge session.
     AltModeBridge,
+    /// An external HDMI session.
+    ExternalHdmi,
 }
 
 /// A pipe claim: the DDI whose session owns the pipe, and why.

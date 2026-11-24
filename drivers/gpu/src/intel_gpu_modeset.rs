@@ -493,6 +493,9 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     hdmi_bpc: u8,
     /// The HDMI entry drives YCbCr 4:2:0 (display 11/12).
     hdmi_ycbcr420: bool,
+    /// Another pipe is live beside this run's, so the CDCLK it runs on
+    /// cannot be reprogrammed here.
+    shared_cdclk: bool,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -533,7 +536,32 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             hdmi_dvi: false,
             hdmi_bpc: 8,
             hdmi_ycbcr420: false,
+            shared_cdclk: false,
         }
+    }
+
+    /// Another pipe scans out beside this run's (the multi-pipe
+    /// coordinator handed it a DBUF share). Linux raises CDCLK for a new
+    /// pipe in an atomic commit that modesets every pipe the change
+    /// touches (`intel_modeset_calc_cdclk`); this run does not own the
+    /// other pipes, so a floor above the current CDCLK refuses with
+    /// `CdclkUnavailable` at the CDCLK step instead of retuning the clock
+    /// under a live pipe.
+    pub fn set_shared_cdclk(&mut self, shared: bool) {
+        self.shared_cdclk = shared;
+    }
+
+    /// The shared-CDCLK refusal: `current_khz` below this mode's floor.
+    fn refuse_shared_cdclk(
+        &self,
+        current_khz: Option<u32>,
+        mode: &Mode,
+    ) -> Result<(), ModesetError> {
+        let floor = mode.pixel_clock_khz.div_ceil(2);
+        if self.shared_cdclk && current_khz.is_none_or(|khz| khz < floor) {
+            return Err(ModesetError::CdclkUnavailable);
+        }
+        Ok(())
     }
 
     /// Drive the HDMI entry's link as YCbCr 4:2:0 (`sink_format ==
@@ -2646,6 +2674,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 return Ok(());
             }
         }
+        self.refuse_shared_cdclk(current.known.map(|k| k.cdclk_khz), mode)?;
         let target = match cdclk::calc_cdclk(current.refclk_khz, floor_khz) {
             Some(r) => r,
             None => return Ok(()), // beyond the table; leave firmware CDCLK
@@ -2686,6 +2715,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if current.cdclk_khz >= floor_khz {
             return Ok(());
         }
+        self.refuse_shared_cdclk(Some(current.cdclk_khz), mode)?;
         let vco = cdclk::select_vco(platform, None);
         let target = cdclk::calc_cdclk(floor_khz, vco);
         if target < floor_khz {
@@ -2721,6 +2751,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 return Ok(());
             }
         }
+        self.refuse_shared_cdclk(current.known.map(|k| k.cdclk_khz), mode)?;
         let target = match cdclk::calc_cdclk(current.refclk_khz, floor_khz) {
             Some(r) => r,
             None => return Ok(()), // beyond the table; leave firmware CDCLK
@@ -4672,6 +4703,30 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_pre_tgl_trans_ddi_port_select
+    );
+
+    /// A run beside a live pipe takes the CDCLK it finds: a floor above it
+    /// (or an unknown clock) refuses; a lone run may raise it.
+    fn smoke_shared_cdclk_refuses_a_raise() -> TestResult {
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::B);
+        let mut p2160 = mode_1080p60();
+        p2160.pixel_clock_khz = 594_000;
+        if ms.refuse_shared_cdclk(Some(300_000), &p2160).is_err() {
+            return TestResult::Fail("a lone run may raise CDCLK");
+        }
+        ms.set_shared_cdclk(true);
+        if ms.refuse_shared_cdclk(Some(296_999), &p2160) != Err(ModesetError::CdclkUnavailable)
+            || ms.refuse_shared_cdclk(None, &p2160) != Err(ModesetError::CdclkUnavailable)
+            || ms.refuse_shared_cdclk(Some(307_200), &p2160).is_err()
+        {
+            return TestResult::Fail("a shared run must refuse a CDCLK raise");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_shared_cdclk_refuses_a_raise
     );
 
     fn smoke_gen12_tc_sst_refuses_insufficient_payload_before_writes() -> TestResult {

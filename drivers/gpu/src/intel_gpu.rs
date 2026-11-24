@@ -1904,6 +1904,8 @@ struct HdmiSessionState {
     conn: crate::intel_gpu_hdmi::HdmiConnection,
     fb: crate::intel_gpu_modeset::Framebuffer,
     alloc: ScanoutAllocation,
+    /// The publication serial: an HDMI unplug withdraws only its own image.
+    serial: u64,
 }
 
 static HDMI_SESSION: IrqSafeSpinLock<Option<HdmiSessionState>> = IrqSafeSpinLock::new(None);
@@ -1983,7 +1985,9 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
     use crate::intel_gpu_dp::HpdEvent;
     match event {
         HpdEvent::Connected(ddi) => {
-            if DP_SESSION.lock().is_some() {
+            // Sessions admit per connector: a sink on another DDI gets its
+            // own route on its own pipe beside the ones already live.
+            if external_session_owns(ddi) {
                 return;
             }
             // An MST branch device (hub / dock / daisy-chain
@@ -2043,16 +2047,19 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                 // same way.
                 let stored = {
                     let session = HDMI_SESSION.lock();
-                    session.as_ref().map(|s| (s.alloc, s.fb))
+                    session.as_ref().map(|s| (s.alloc, s.fb, s.serial))
                 };
-                if let Some((alloc, fb)) = stored {
-                    publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
-                        alloc.phys_base,
-                        conn.mode.h_active as u32,
-                        conn.mode.v_active as u32,
-                        fb.stride_bytes,
-                        32,
-                    )));
+                if let Some((alloc, fb, serial)) = stored {
+                    publish_external_scanout(
+                        narf_graphics_driver::generic::GenericFb::new(
+                            alloc.phys_base,
+                            conn.mode.h_active as u32,
+                            conn.mode.v_active as u32,
+                            fb.stride_bytes,
+                            32,
+                        ),
+                        serial,
+                    );
                 }
             }
         }
@@ -2079,11 +2086,18 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                 if state.conn.ddi == ddi {
                     let stopped = with_display_info(|gpu| {
                         let window = gpu.mode_window();
-                        crate::intel_gpu_hdmi::disconnect(&window, &state.conn)
+                        let stopped = crate::intel_gpu_hdmi::disconnect(&window, &state.conn);
+                        if stopped {
+                            // The pipe is proven stopped: give it back and
+                            // repartition the DBUF over the pipes still lit.
+                            crate::intel_gpu_multipipe::release_pipe(state.conn.pipe, ddi);
+                            crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+                        }
+                        stopped
                     })
                     .unwrap_or(false);
                     if stopped {
-                        publish_scanout(None);
+                        withdraw_external_scanout(state.serial);
                     } else {
                         *HDMI_SESSION.lock() = Some(state);
                     }
@@ -2217,9 +2231,10 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
 /// The HPD handler tries this only after the DP probe did
 /// not answer — an HDMI sink never answers AUX.
 fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi::HdmiConnection> {
-    if DP_SESSION.lock().is_some() {
+    if HDMI_SESSION.lock().is_some() {
         return None;
     }
+    let serial = next_external_scanout_serial()?;
     with_display_info(|gpu| {
         if !gpu.chip.generation.external_display_supported() {
             return None;
@@ -2228,33 +2243,86 @@ fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi:
         crate::intel_gpu_aux::SourceFamily::of(&window)?;
         let ddc = crate::intel_gpu_vbt::gen12_ddc_overrides();
         let probe = crate::intel_gpu_hdmi::probe_sink(&window, ddi, &ddc).ok()?;
+        // The HDMI route claims its own pipe beside the panel and any other
+        // external, as the DP route does; a second (or third) lit pipe takes
+        // its DBUF share and the live pipes are reprogrammed to theirs.
+        let pipe =
+            crate::intel_gpu_multipipe::claim_pipe_for(crate::intel_gpu_multipipe::PipeOwner {
+                ddi,
+                used_for: crate::intel_gpu_multipipe::PipeUse::ExternalHdmi,
+            })?;
+        let share = {
+            let active = crate::intel_gpu_multipipe::active_pipes();
+            if active.len() >= 2 {
+                crate::intel_gpu_multipipe::share_for(&window, &active, pipe)
+            } else {
+                None
+            }
+        };
         let width = probe.mode.h_active as u32;
         let height = probe.mode.v_active as u32;
         let stride_bytes = padded_stride_bytes(width);
         let size_bytes = scanout_size_bytes(width, height);
-        let alloc =
-            crate::intel_gpu_gtt::alloc_contiguous_scanout(&gpu.gtt_mmadr, size_bytes).ok()?;
-        let alloc = ScanoutAllocation {
-            gtt_offset: alloc.gtt_offset,
-            phys_base: alloc.phys_base(),
-            order: alloc.order,
-            size_bytes: alloc.size_bytes,
+        let Ok(alloc) = crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
+            &gpu.gtt_mmadr,
+            crate::intel_gpu_multipipe::scanout_gtt_offset(pipe),
+            size_bytes,
+        ) else {
+            crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+            return None;
         };
         let fb = crate::intel_gpu_modeset::Framebuffer {
             phys_addr: alloc.gtt_offset as u64,
             stride_bytes,
             format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
         };
-        let conn = crate::intel_gpu_hdmi::activate(&window, &probe, &fb).ok()?;
-        *HDMI_SESSION.lock() = Some(HdmiSessionState {
-            bar: gpu.gtt_mmadr.phys.raw(),
-            conn: conn.clone(),
-            fb,
-            alloc,
-        });
-        Some(conn)
+        match crate::intel_gpu_hdmi::activate_on_pipe(&window, &probe, &fb, pipe, share) {
+            Ok(conn) => {
+                crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+                *HDMI_SESSION.lock() = Some(HdmiSessionState {
+                    bar: gpu.gtt_mmadr.phys.raw(),
+                    conn: conn.clone(),
+                    serial,
+                    fb,
+                    alloc: ScanoutAllocation {
+                        gtt_offset: alloc.gtt_offset,
+                        phys_base: alloc.phys_base(),
+                        order: alloc.order,
+                        size_bytes: alloc.size_bytes,
+                    },
+                });
+                Some(conn)
+            }
+            Err(_) => {
+                // A failed activation may have programmed part of the pipe.
+                // Only a proven local stop gives the pipe and its backing
+                // back; otherwise both stay claimed.
+                let mut modeset = crate::intel_gpu_modeset::Modeset::for_pipe(&window, ddi, pipe);
+                if let Some(family) = crate::intel_gpu_aux::SourceFamily::of(&window) {
+                    modeset.set_source_family(family);
+                }
+                if modeset.try_teardown().is_ok() {
+                    crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                    crate::intel_gpu_gtt::free_contiguous_scanout(&alloc);
+                }
+                None
+            }
+        }
     })
     .flatten()
+}
+
+/// The DDI some external session (DP SST, HDMI or MST) already owns.
+fn external_session_owns(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
+    DP_SESSION
+        .lock()
+        .as_ref()
+        .is_some_and(|state| state.conn.ddi == ddi)
+        || HDMI_SESSION
+            .lock()
+            .as_ref()
+            .is_some_and(|state| state.conn.ddi == ddi)
+        || mst_session_ddi() == Some(ddi)
 }
 
 /// One current-authority bounded local step. No wait or GT mutex is held.
@@ -2902,6 +2970,10 @@ fn mst_session_ddi() -> Option<crate::intel_gpu_ddi::Ddi> {
 /// falls back to the SST connect.
 fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
     use crate::dp_aux::AuxChannel as _;
+    // One MST link at a time: a second hub never replaces a live one.
+    if MST_SESSION.lock().is_some() {
+        return false;
+    }
     let state = with_display_info(|gpu| {
         if !gpu.chip.generation.external_display_supported() {
             return None;

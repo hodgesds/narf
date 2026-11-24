@@ -578,6 +578,8 @@ impl MstLink {
         if let Some((start, end)) = dbuf_share {
             modeset.set_dbuf_share(start, end);
         }
+        // A secondary stream's pipe lights beside the primary's.
+        modeset.set_shared_cdclk(dbuf_share.is_some() || !primary);
         let trained_now = if primary {
             let (.., trained) = modeset.modeset_mst_primary(fb, &mode, plan.unwrap())?;
             Some(trained)
@@ -1710,6 +1712,12 @@ pub mod tests {
         aux_reply: RefCell<Vec<u8>>,
         aux_data: RefCell<[u8; 20]>,
         aux_ctl_state: RefCell<u32>,
+        /// The pcode mailbox and its two data dwords: CDCLK notifies and
+        /// frequency requests complete (the primary stream's CDCLK
+        /// program then leaves a known clock for later streams); other
+        /// commands answer ILLEGAL_CMD.
+        pcode_mailbox: RefCell<u32>,
+        pcode_data: RefCell<[u32; 2]>,
     }
 
     impl HubMmio {
@@ -1726,7 +1734,30 @@ pub mod tests {
                 aux_reply: RefCell::new(Vec::new()),
                 aux_data: RefCell::new([0u8; 20]),
                 aux_ctl_state: RefCell::new(0),
+                pcode_mailbox: RefCell::new(0),
+                pcode_data: RefCell::new([0; 2]),
             }
+        }
+
+        fn pcode_execute(&self, cmd_word: u32) {
+            use crate::intel_gpu_pcode::{
+                PCODE_CMD_CDCLK_CONTROL, PCODE_CMD_DE_WRITE_FREQ_REQ, SKL_CDCLK_PREPARE_FOR_CHANGE,
+                SKL_CDCLK_READY_FOR_CHANGE,
+            };
+            let status = match cmd_word & 0xFF {
+                PCODE_CMD_DE_WRITE_FREQ_REQ => 0,
+                PCODE_CMD_CDCLK_CONTROL => {
+                    let mut data = self.pcode_data.borrow_mut();
+                    data[0] = if data[0] == SKL_CDCLK_PREPARE_FOR_CHANGE {
+                        SKL_CDCLK_READY_FOR_CHANGE
+                    } else {
+                        0
+                    };
+                    0
+                }
+                _ => 0x1,
+            };
+            *self.pcode_mailbox.borrow_mut() = status;
         }
 
         fn stored(&self, off: u64) -> u32 {
@@ -1788,8 +1819,15 @@ pub mod tests {
             *self.tgl_uy.borrow()
         }
         fn read32(&self, off: u64) -> u32 {
+            use crate::intel_gpu_pcode::{PCODE_DATA0, PCODE_DATA1, PCODE_MAILBOX};
             if off == self.aux_ctl_off() {
                 return *self.aux_ctl_state.borrow();
+            }
+            match off {
+                o if o == PCODE_MAILBOX => return *self.pcode_mailbox.borrow(),
+                o if o == PCODE_DATA0 => return self.pcode_data.borrow()[0],
+                o if o == PCODE_DATA1 => return self.pcode_data.borrow()[1],
+                _ => {}
             }
             if let Some(idx) = self.is_aux_data(off) {
                 let reply = self.aux_reply.borrow();
@@ -1871,8 +1909,21 @@ pub mod tests {
         }
 
         fn write32(&self, off: u64, val: u32) {
+            use crate::intel_gpu_pcode::{PCODE_DATA0, PCODE_DATA1, PCODE_MAILBOX, PCODE_READY};
             self.writes.borrow_mut().push((off, val));
             self.regs.borrow_mut().insert(off, val);
+            match off {
+                o if o == PCODE_DATA0 => self.pcode_data.borrow_mut()[0] = val,
+                o if o == PCODE_DATA1 => self.pcode_data.borrow_mut()[1] = val,
+                o if o == PCODE_MAILBOX => {
+                    if val & PCODE_READY != 0 {
+                        self.pcode_execute(val);
+                    } else {
+                        *self.pcode_mailbox.borrow_mut() = val;
+                    }
+                }
+                _ => {}
+            }
             if let Some(idx) = self.is_aux_data(off) {
                 let mut data = self.aux_data.borrow_mut();
                 for b in 0..4 {

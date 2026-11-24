@@ -836,6 +836,7 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
     modeset.set_source_family(family);
     if let Some((start, end)) = dbuf_share {
         modeset.set_dbuf_share(start, end);
+        modeset.set_shared_cdclk(true);
     }
     let (mode, trained) = modeset.modeset_with_plan(fb, &probe.mode, plan)?;
 

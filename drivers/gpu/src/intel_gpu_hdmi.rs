@@ -1062,6 +1062,8 @@ pub struct HdmiConnection {
     pub family: crate::intel_gpu_aux::SourceFamily,
     /// The DDI the sink hangs off.
     pub ddi: Ddi,
+    /// The pipe scanning this connection out (Pipe A for [`activate`]).
+    pub pipe: crate::intel_gpu_pipes::Pipe,
     /// The link's pixel encoding.
     pub format: SinkFormat,
     /// The mode being scanned out.
@@ -1158,6 +1160,20 @@ pub fn activate<M: MmioWindow + ?Sized>(
     probe: &HdmiSinkProbe,
     fb: &Framebuffer,
 ) -> Result<HdmiConnection, HdmiError> {
+    activate_on_pipe(mmio, probe, fb, crate::intel_gpu_pipes::Pipe::A, None)
+}
+
+/// [`activate`] on `pipe`, claimed from `intel_gpu_multipipe` by the glue,
+/// with `dbuf_share` when the coordinator computed one: the modeset, the
+/// infoframes, GCP and the audio codec all run on that pipe's transcoder.
+pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    probe: &HdmiSinkProbe,
+    fb: &Framebuffer,
+    pipe: crate::intel_gpu_pipes::Pipe,
+    dbuf_share: Option<(u16, u16)>,
+) -> Result<HdmiConnection, HdmiError> {
+    let trans = pipe.transcoder();
     let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
     let pin = probe.pin;
@@ -1171,8 +1187,12 @@ pub fn activate<M: MmioWindow + ?Sized>(
         configure_scdc(mmio, pin, &probe.hf_vsdb)?;
         scrambling = true;
     }
-    let mut modeset = Modeset::new(mmio, probe.ddi);
+    let mut modeset = Modeset::for_pipe(mmio, probe.ddi, pipe);
     modeset.set_source_family(family);
+    if let Some((start, end)) = dbuf_share {
+        modeset.set_dbuf_share(start, end);
+        modeset.set_shared_cdclk(true);
+    }
     modeset.set_hdmi_dvi(!probe.hdmi_sink);
     modeset.set_hdmi_bpc(probe.bpc);
     modeset.set_hdmi_ycbcr420(probe.format == SinkFormat::Ycbcr420);
@@ -1182,8 +1202,8 @@ pub fn activate<M: MmioWindow + ?Sized>(
     // `has_audio` both require `has_hdmi_sink`).
     if probe.hdmi_sink {
         let frame = pack_avi_infoframe_for(&mode, probe.format);
-        write_avi_infoframe(mmio, Transcoder::A, &frame);
-        write_gcp(mmio, Transcoder::A, probe.bpc, &mode);
+        write_avi_infoframe(mmio, trans, &frame);
+        write_gcp(mmio, trans, probe.bpc, &mode);
     }
     // The stream is scrambled from here on; only now can the sink report
     // its scrambler status.
@@ -1204,8 +1224,8 @@ pub fn activate<M: MmioWindow + ?Sized>(
     {
         let channels = publication.lpcm_max_channels;
         publish_display_audio(sink_id_for(probe.ddi), publication);
-        intel_gpu_audio::hdmi_audio_codec_enable(mmio, Transcoder::A, probe.tmds_clock_khz);
-        intel_gpu_audio::set_eld_valid(mmio, Transcoder::A, true);
+        intel_gpu_audio::hdmi_audio_codec_enable(mmio, trans, probe.tmds_clock_khz);
+        intel_gpu_audio::set_eld_valid(mmio, trans, true);
         audio_published = true;
         audio_infoframe = Some(pack_audio_infoframe(channels));
     }
@@ -1213,6 +1233,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     Ok(HdmiConnection {
         family,
         ddi: probe.ddi,
+        pipe,
         format: probe.format,
         mode,
         audio_published,
@@ -1249,15 +1270,16 @@ pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bo
     if crate::intel_gpu_aux::SourceFamily::of(mmio) != Some(conn.family) {
         return false;
     }
+    let trans = conn.pipe.transcoder();
     if conn.audio_published {
-        intel_gpu_audio::hdmi_audio_codec_disable(mmio, Transcoder::A);
+        intel_gpu_audio::hdmi_audio_codec_disable(mmio, trans);
         clear_display_audio(sink_id_for(conn.ddi));
     }
-    disable_infoframes(mmio, Transcoder::A);
+    disable_infoframes(mmio, trans);
     if conn.scrambling {
         let _ = handle_sink_scrambling(mmio, conn.pin, false, false);
     }
-    let mut modeset = Modeset::new(mmio, conn.ddi);
+    let mut modeset = Modeset::for_pipe(mmio, conn.ddi, conn.pipe);
     modeset.set_source_family(conn.family);
     if modeset.try_teardown().is_err() {
         return false;
@@ -1651,6 +1673,10 @@ pub mod tests {
             let pipeconf_offs = [
                 PipeIdx::A.base() + PIPECONF_OFFSET,
                 Transcoder::A.conf_base() + PIPECONF_OFFSET,
+                PipeIdx::B.base() + PIPECONF_OFFSET,
+                Transcoder::B.conf_base() + PIPECONF_OFFSET,
+                PipeIdx::C.base() + PIPECONF_OFFSET,
+                Transcoder::C.conf_base() + PIPECONF_OFFSET,
             ];
             if pipeconf_offs.contains(&off) {
                 use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_STATE};
@@ -2210,6 +2236,51 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_ycbcr420_connect);
+
+    /// An HDMI route on a claimed pipe: the modeset, infoframes and
+    /// teardown run on that pipe's transcoder, and Transcoder A (the
+    /// panel's) is never touched.
+    fn smoke_hdmi_on_claimed_pipe() -> TestResult {
+        use crate::intel_gpu_pipes::Pipe;
+        let edid = fixture_edid_hdmi(148_500, 1920, 280, 1080, 45, HfFixture::Absent);
+        let mmio = HdmiSinkMmio::new(Ddi::B, GmbusSink::new(edid));
+        let Ok(probe) = probe_sink(&mmio, Ddi::B, &Gen12DdcOverrides::NONE) else {
+            return TestResult::Fail("probe");
+        };
+        let conn = match activate_on_pipe(&mmio, &probe, &test_fb(8192), Pipe::B, None) {
+            Ok(conn) => conn,
+            Err(_) => return TestResult::Fail("HDMI must light on Pipe B"),
+        };
+        let func_b = Transcoder::B.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        let func_a = Transcoder::A.base() + TRANS_DDI_FUNC_CTL_OFFSET;
+        if conn.pipe != Pipe::B
+            || mmio.writes_to(func_b) != alloc::vec![0x9000_0006]
+            || !mmio.writes_to(func_a).is_empty()
+        {
+            return TestResult::Fail("Transcoder B must bind DDI B; Transcoder A stays untouched");
+        }
+        let avi_b = Transcoder::B.base() + VIDEO_DIP_AVI_DATA_OFFSET;
+        let avi_a = Transcoder::A.base() + VIDEO_DIP_AVI_DATA_OFFSET;
+        if mmio.writes_to(avi_b).is_empty() || !mmio.writes_to(avi_a).is_empty() {
+            return TestResult::Fail("the AVI infoframe must go out on Transcoder B");
+        }
+        if !disconnect(&mmio, &conn) {
+            return TestResult::Fail("the Pipe B route must stop");
+        }
+        if mmio
+            .writes_to(Transcoder::B.base() + VIDEO_DIP_CTL_OFFSET)
+            .last()
+            .is_none_or(|v| v & VIDEO_DIP_ENABLE_AVI != 0)
+            || !mmio
+                .writes_to(Transcoder::A.base() + VIDEO_DIP_CTL_OFFSET)
+                .is_empty()
+        {
+            return TestResult::Fail("disconnect must stop Transcoder B's infoframes only");
+        }
+        clear_display_audio(sink_id_for(Ddi::B));
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_on_claimed_pipe);
 
     fn smoke_hdmi_infoframe_packing() -> TestResult {
         // AVI for 1080p60 (VIC 16), pinned byte-for-byte
