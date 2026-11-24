@@ -1,8 +1,14 @@
-//! Intel Xe-LPDP (Meteor Lake / Arrow Lake) HDMI TMDS output.
+//! Intel Xe-LPDP (Meteor Lake / Arrow Lake), Xe2_LPD (Lunar Lake) and
+//! Xe3_LPD (Panther Lake) HDMI TMDS output.
 //!
 //! The HDMI counterpart of [`crate::intel_gpu_xelpg_external`]: one
-//! owned TMDS stream on a Pipe B–D and its transcoder over DDI B (C10) or
-//! a Type-C port in legacy mode (C20), next to the lit internal panel. The
+//! owned TMDS stream on a Pipe B–D and its transcoder over DDI B (C10, or
+//! C20 on Panther Lake) or a Type-C port in legacy mode (C20), next to the
+//! lit internal panel. Display 20 and 30 take the DP route's deltas: the
+//! D2D link in `DDI_BUF_CTL` (kept set by the full DDI write,
+//! `intel_ddi_enable_hdmi`'s `XE2LPD_DDI_BUF_D2D_LINK_ENABLE`), the IP's
+//! pipe resources and Type-C profile, and on display 30 the fixed-refresh
+//! VRR timing generator. Wildcat Lake's 30.02 profile has no HDMI route. The
 //! pipe side (power wells, resource transaction, pipe DMC, timings, plane
 //! arm, release) is the shared Pipe B–D owner
 //! ([`crate::intel_gpu_xelpg_pipes`]) through the DP route's helpers.
@@ -80,20 +86,21 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gmbus::PinPair;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_pipes::Pipe;
+use crate::intel_gpu_xe2lpd::{disable_d2d, enable_d2d, DisplayIp};
 use crate::intel_gpu_xelpg::{
-    disable_d2d, disable_port_pll_complete, enable_d2d, enable_port_pll_state, port_width,
-    set_signal_levels_hdmi, wait_port_buf_active, wait_port_buf_idle, C10PllState, C20PllState,
-    C20Vdr, Cx0Error, Cx0Phy, Cx0PllState, PhyKind, PllRequest, XeLpgPort, PORT_BUF_PHY_IDLE,
-    PORT_WIDTH_MASK,
+    disable_port_pll_complete, enable_port_pll_state, port_width, set_signal_levels_hdmi,
+    wait_port_buf_active, wait_port_buf_idle, C10PllState, C20PllState, C20Vdr, Cx0Error, Cx0Phy,
+    Cx0PllState, PhyKind, PllRequest, XeLpgPort, PORT_BUF_PHY_IDLE, PORT_WIDTH_MASK,
 };
 use crate::intel_gpu_xelpg_external::{
-    external_pipe, preflight, request_pipe_wells, reserve_pipe, trans_clk_sel, trans_clk_sel_port,
-    trans_ddi_func_ctl, ExternalError, MtlDisplay, PipeRefusal, RoutePipe,
+    ddi_enable_value, external_pipe, preflight_ip, request_pipe_wells, reserve_pipe, trans_clk_sel,
+    trans_clk_sel_port, trans_ddi_func_ctl, ExternalDisplayProfile, ExternalError, MtlDisplay,
+    PipeRefusal, RoutePipe,
 };
 use crate::intel_gpu_xelpg_pipes::PipeEnableError;
 use crate::intel_gpu_xelpg_tc::{
     connect_for as tc_connect_for, connection_intact, disconnect as tc_disconnect, TcConnection,
-    TcDisplayProfile, TcMode,
+    TcMode,
 };
 
 include!("intel_gpu_xelpg_hdmi_tables.rs");
@@ -159,6 +166,12 @@ impl From<crate::intel_gpu_xelpg_tc::TcError> for HdmiError {
     fn from(e: crate::intel_gpu_xelpg_tc::TcError) -> Self {
         HdmiError::Route(e.into())
     }
+}
+
+fn d2d_err(_: crate::intel_gpu_xe2lpd::IpError) -> HdmiError {
+    // The same failed 100-us state observation the display-14 helper
+    // reports as a PHY timeout.
+    phy_err(Cx0Error::Timeout)
 }
 
 fn phy_err(e: Cx0Error) -> HdmiError {
@@ -619,6 +632,17 @@ pub fn hdmi_pll_request_computed(
     legacy: bool,
     c20_tx_cfg1: Option<u16>,
 ) -> Result<PllRequest, HdmiError> {
+    hdmi_pll_request_kind(port.phy(), clock_khz, legacy, c20_tx_cfg1)
+}
+
+/// [`hdmi_pll_request_computed`] for the PHY `kind` behind the port
+/// ([`crate::intel_gpu_xelpg::phy_kind`]: Panther Lake's DDI B is a C20).
+pub fn hdmi_pll_request_kind(
+    kind: PhyKind,
+    clock_khz: u32,
+    legacy: bool,
+    c20_tx_cfg1: Option<u16>,
+) -> Result<PllRequest, HdmiError> {
     if FRL_CLOCKS_KHZ.contains(&clock_khz) {
         return Err(HdmiError::FrlClock(clock_khz));
     }
@@ -628,7 +652,7 @@ pub fn hdmi_pll_request_computed(
     if clock_khz > SOURCE_MAX_TMDS_KHZ {
         return Err(HdmiError::UnsupportedClock(clock_khz));
     }
-    let state = match port.phy() {
+    let state = match kind {
         PhyKind::C10 => {
             // intel_c10pll_calc_state: the tables, then for HDMI the SNPS
             // algorithm.
@@ -662,7 +686,7 @@ pub fn hdmi_pll_request_computed(
         dp_alt: false,
         ssc: false,
         hdmi: true,
-        protocol_switch: legacy && port.phy() == PhyKind::C20,
+        protocol_switch: legacy && kind == PhyKind::C20,
     })
 }
 
@@ -693,6 +717,9 @@ pub const fn ddc_pin(port: XeLpgPort) -> Option<PinPair> {
 pub struct MtlHdmiProbe {
     /// The port.
     pub port: XeLpgPort,
+    /// The display IP the route runs on (its D2D register, `DDI_BUF_CTL`
+    /// value, pipe resources and display-30 VRR timing generator).
+    pub(crate) display_ip: DisplayIp,
     /// Legacy Type-C ownership (TC ports only).
     pub tc: Option<TcConnection>,
     /// Preferred mode.
@@ -736,10 +763,26 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     legacy_port: bool,
     ddc: Option<PinPair>,
 ) -> Result<MtlHdmiProbe, HdmiError> {
-    if generation != Generation::MeteorLake {
+    let profile = ExternalDisplayProfile::for_generation(generation)
+        .ok_or(HdmiError::Route(ExternalError::UnsupportedGeneration))?;
+    probe_hdmi_profile(io, profile, port, legacy_port, ddc)
+}
+
+/// [`probe_hdmi`] for an exact source profile. Meteor, Lunar and Panther
+/// Lake drive HDMI on their admitted ports; Wildcat Lake's 30.02 profile
+/// has no qualified HDMI route.
+pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    port: XeLpgPort,
+    legacy_port: bool,
+    ddc: Option<PinPair>,
+) -> Result<MtlHdmiProbe, HdmiError> {
+    let display_ip = profile.display_ip();
+    if display_ip == DisplayIp::WildcatLake {
         return Err(ExternalError::UnsupportedGeneration.into());
     }
-    if port == XeLpgPort::A {
+    if port == XeLpgPort::A || !profile.admits_port(port) {
         return Err(ExternalError::UnsupportedPort.into());
     }
     let type_c = port.tc_index().is_some();
@@ -750,7 +793,7 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     // A legacy Type-C port is owned in legacy mode before its DDC is used,
     // as the DP probe owns the PHY before AUX.
     let tc = if type_c {
-        let conn = tc_connect_for(io, port, true, HDMI_LANES, TcDisplayProfile::XeLpdp)?;
+        let conn = tc_connect_for(io, port, true, HDMI_LANES, profile.tc_profile())?;
         if conn.mode != TcMode::Legacy {
             let _ = tc_disconnect(io, &conn);
             return Err(HdmiError::NotLegacy);
@@ -768,8 +811,13 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     let (edid, edid_len) = read_edid_ddc(io, pin).map_err(rollback)?;
     let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len])
         .map_err(|_| rollback(HdmiError::Edid))?;
-    let pll = hdmi_pll_request_computed(port, mode.pixel_clock_khz, type_c, io.c20_hdmi_tx_cfg1())
-        .map_err(rollback)?;
+    let pll = hdmi_pll_request_kind(
+        crate::intel_gpu_xelpg::phy_kind(io, port),
+        mode.pixel_clock_khz,
+        type_c,
+        io.c20_hdmi_tx_cfg1(),
+    )
+    .map_err(rollback)?;
     let sink = parse_sink_scdc(&edid[..edid_len]);
     let link = tmds_link(mode.pixel_clock_khz, &sink).map_err(rollback)?;
     if !io.display_access_ok() {
@@ -777,6 +825,7 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     }
     Ok(MtlHdmiProbe {
         port,
+        display_ip,
         tc,
         mode,
         pll,
@@ -867,7 +916,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     if let Err(e) = crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &probe.mode) {
         return Err((Err(probe), ExternalError::Modeset(e).into()));
     }
-    let choice = match preflight(io, probe.port, display) {
+    let choice = match preflight_ip(io, probe.port, display, probe.display_ip) {
         Ok(choice) => choice,
         Err(e) => return Err((Err(probe), e.into())),
     };
@@ -933,10 +982,11 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     let port = route.probe.port;
     let mode = route.probe.mode;
     let link = route.probe.link;
-    let (scrambling, ddc, pll) = (
+    let (scrambling, ddc, pll, ip) = (
         route.probe.sink.scrambling,
         route.probe.ddc,
         route.probe.pll,
+        route.probe.display_ip,
     );
     let rp = reservation(route)?;
     let (pipe, trans) = (rp.pipe, rp.transcoder());
@@ -957,9 +1007,13 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         link.high_tmds_clock_ratio,
     );
     wr(io, trans_ddi_func_ctl(trans), func)?;
+    // Display 30 always scans out through the VRR timing generator,
+    // programmed and enabled after TRANS_DDI_FUNC_CTL and before TRANSCONF
+    // (a no-op on display 14 and 20).
+    rp.pipes.enable_fixed_tg(io, pipe)?;
     let start = rd(io, pipe.base() + FRMCOUNT)?;
     rp.pipes.enable(io, pipe)?;
-    // intel_ddi_enable_hdmi (display 14): sink scrambling/ratio over
+    // intel_ddi_enable_hdmi (display 14+): sink scrambling/ratio over
     // SCDC (only for a scrambling-capable sink), D2D, levels,
     // PORT_BUF_CTL1 width, DDI_CTL_DE with the TMDS lane width, buffer
     // active. Linux only logs an SCDC failure; a stream that needs the
@@ -970,7 +1024,10 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
             return scdc;
         }
     }
-    enable_d2d(io, port).map_err(phy_err)?;
+    // D2D lives in PORT_BUF_CTL1 on display 14 and in DDI_BUF_CTL on
+    // display 20+, where the DDI_BUF_CTL write keeps it set
+    // (XE2LPD_DDI_BUF_D2D_LINK_ENABLE in intel_ddi_enable_hdmi's buf_ctl).
+    enable_d2d(io, ip, port).map_err(d2d_err)?;
     set_signal_levels_hdmi(&Cx0Phy::with_lanes(io, port, pll.lanes)).map_err(phy_err)?;
     let buf = rd(io, port.buf_ctl1())?;
     wr(
@@ -978,11 +1035,7 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         port.buf_ctl1(),
         (buf & !PORT_WIDTH_MASK) | port_width(HDMI_LANES),
     )?;
-    wr(
-        io,
-        port.ddi_buf_ctl(),
-        port_width(HDMI_LANES) | DDI_BUF_CTL_ENABLE,
-    )?;
+    wr(io, port.ddi_buf_ctl(), ddi_enable_value(ip, HDMI_LANES))?;
     wait_port_buf_active(io, port).map_err(phy_err)?;
     // intel_update_crtc: the primary, armed under vblank evasion.
     rp.pipes.arm_primary(io, pipe)?;
@@ -1050,7 +1103,11 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     route: &mut MtlHdmiRoute,
 ) -> Result<(), HdmiError> {
     let port = route.probe.port;
-    let (scrambling, ddc) = (route.probe.sink.scrambling, route.probe.ddc);
+    let (scrambling, ddc, ip) = (
+        route.probe.sink.scrambling,
+        route.probe.ddc,
+        route.probe.display_ip,
+    );
     let stop_failed: HdmiError =
         ExternalError::Modeset(ModesetError::PipelineStopUnavailable).into();
     let Some(rp) = route.reservation.as_mut() else {
@@ -1078,7 +1135,7 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     let ddi = rd(io, port.ddi_buf_ctl())?;
     wr(io, port.ddi_buf_ctl(), ddi & !DDI_BUF_CTL_ENABLE)?;
     wait_port_buf_idle(io, port).map_err(|_| stop_failed)?;
-    disable_d2d(io, port).map_err(|_| stop_failed)?;
+    disable_d2d(io, ip, port).map_err(|_| stop_failed)?;
     wr(io, trans_clk_sel(trans), 0)?;
     disable_port_pll_complete(io, port).map_err(|_| stop_failed)?;
     let ddi = rd(io, port.ddi_buf_ctl())?;

@@ -2031,6 +2031,118 @@ pub fn hdmi_on_ddi_b(edid: Vec<u8>) -> ExtFake {
     io
 }
 
+/// Light HDMI on DDI B beside the display-`ip` panel and return the live
+/// route, or why not.
+fn hdmi_ddi_b_route(
+    io: &ExtFake,
+    ip: DisplayIp,
+    generation: Generation,
+) -> Result<crate::intel_gpu_xelpg_hdmi::MtlHdmiRoute, &'static str> {
+    use crate::intel_gpu_xelpg_hdmi::{activate_hdmi, ddc_pin, probe_hdmi, HdmiRouteState};
+    let panel = io
+        .light_panel_ip(ip)
+        .ok_or("the fixture must light the panel")?;
+    let port = XeLpgPort::B;
+    let probe = probe_hdmi(io, generation, port, false, ddc_pin(port))
+        .map_err(|_| "the DDI B HDMI probe must read the sink's EDID")?;
+    let fb = fb_for(&probe.mode).ok_or("the mode must have a scanout")?;
+    let display = MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: &NoPipeDmc,
+    };
+    match activate_hdmi(io, probe, fb, &display) {
+        Ok(route) if route.state() == HdmiRouteState::Live && route.pipe() == Pipe::B => Ok(route),
+        _ => Err("DDI B HDMI must light Pipe B beside the panel"),
+    }
+}
+
+/// Lunar Lake HDMI on its C10 DDI B: display 20 keeps the D2D request in
+/// `DDI_BUF_CTL` (`mtl_ddi_enable_d2d`, and `intel_ddi_enable_hdmi`'s
+/// `XE2LPD_DDI_BUF_D2D_LINK_ENABLE` in the full DDI write), never in the
+/// display-14 `PORT_BUF_CTL1`, and the stop clears it there.
+fn smoke_lnl_hdmi_ddi_b_keeps_d2d_in_ddi_buf_ctl() -> TestResult {
+    use crate::intel_gpu_xe2lpd::{DDI_BUF_D2D_LINK_ENABLE, DDI_BUF_D2D_LINK_STATE};
+    let io = hdmi_on_ddi_b(edid_1024());
+    let mut route = match hdmi_ddi_b_route(&io, DisplayIp::Xe2Lpd, Generation::LunarLake) {
+        Ok(route) => route,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let port = XeLpgPort::B;
+    let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(1, false, false);
+    let ddi = io.read32(port.ddi_buf_ctl());
+    let d2d = DDI_BUF_CTL_ENABLE | DDI_BUF_D2D_LINK_ENABLE | DDI_BUF_D2D_LINK_STATE;
+    if io.read32(TRANS_DDI_FUNC_CTL_B) != func
+        || ddi & d2d != d2d
+        || io
+            .writes_to(port.buf_ctl1())
+            .iter()
+            .any(|v| v & crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_ENABLE != 0)
+    {
+        return TestResult::Fail("display-20 HDMI must hold D2D in DDI_BUF_CTL only");
+    }
+    if route.stop(&io).is_err()
+        || io.read32(port.ddi_buf_ctl()) & (DDI_BUF_CTL_ENABLE | DDI_BUF_D2D_LINK_ENABLE) != 0
+        || io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
+    {
+        return TestResult::Fail("the stop must drop the DDI and its D2D request");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_lnl_hdmi_ddi_b_keeps_d2d_in_ddi_buf_ctl
+);
+
+/// Panther Lake HDMI on its C20 DDI B: the TMDS state from
+/// `mtl_c20_hdmi_tables` goes through the C20 SRAM window, and display 30
+/// scans the transcoder out through the fixed-refresh VRR timing
+/// generator, started after `TRANS_DDI_FUNC_CTL` and before `TRANSCONF`.
+fn smoke_ptl_hdmi_ddi_b_runs_its_c20_through_the_vrr_tg() -> TestResult {
+    use crate::intel_gpu_vrr::{TRANS_VRR_CTL_OFFSET, VRR_CTL_VRR_ENABLE};
+    let io = hdmi_on_ddi_b(edid_1080());
+    let mut route = match hdmi_ddi_b_route(&io, DisplayIp::Xe3Lpd, Generation::PantherLake) {
+        Ok(route) => route,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if route.probe.pll.port_clock_khz != 148_500
+        || !matches!(
+            route.probe.pll.state,
+            crate::intel_gpu_xelpg::Cx0PllState::C20(..)
+        )
+        || io.phy.sram_values().is_empty()
+        || (0..2).any(|lane| {
+            io.phy
+                .vdr_get(lane, crate::intel_gpu_xelpg::C10_VDR_CONTROL_1)
+                != 0
+        })
+    {
+        return TestResult::Fail("PTL DDI B HDMI must program its C20 at 148.5 MHz");
+    }
+    let base = Pipe::B.transcoder().base();
+    let func = io.first_write(|o, v| o == TRANS_DDI_FUNC_CTL_B && v & TRANS_DDI_FUNC_ENABLE != 0);
+    let tg = io.first_write(|o, v| o == base + TRANS_VRR_CTL_OFFSET && v & VRR_CTL_VRR_ENABLE != 0);
+    let conf = io.first_write(|o, v| o == PIPECONF_B && v & ENABLE != 0);
+    match (func, tg, conf) {
+        (Some(f), Some(t), Some(c)) if f < t && t < c => {}
+        _ => {
+            return TestResult::Fail(
+                "display 30 must start the VRR TG between FUNC_CTL and TRANSCONF",
+            )
+        }
+    }
+    if route.stop(&io).is_err()
+        || io.read32(base + TRANS_VRR_CTL_OFFSET) & VRR_CTL_VRR_ENABLE != 0
+        || io.read32(XeLpgPort::B.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
+    {
+        return TestResult::Fail("the stop must turn the VRR TG and the DDI off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ptl_hdmi_ddi_b_runs_its_c20_through_the_vrr_tg
+);
+
 fn ddi_b_event(kind: MtlHpdKind) -> MtlHpdEvent {
     MtlHpdEvent {
         pin: MtlHpdPin::DdiB,

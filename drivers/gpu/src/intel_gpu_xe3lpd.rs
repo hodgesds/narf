@@ -80,7 +80,7 @@
 //! LUTs, DSB transactions, the Xe `SCANOUT` create flag, and DP 1.4 on
 //! TC1–TC4 USB-C and on the C20 DDI B beside the panel through the
 //! fixed-refresh VRR timing generator. Refused on display 30: eDP on Type-C
-//! and its untranscribed intermediate C20 tables, HDMI, PSR and panel
+//! and its untranscribed intermediate C20 tables, HDMI FRL, PSR and panel
 //! replay, FBC (and its dirty
 //! rectangles), compressed primaries, DC states, system suspend and relight.
 //! Wildcat Lake additionally retains only Pipes A-C and ports A/B/TC1/TC2;

@@ -267,6 +267,7 @@ fn hdmi_probe_b() -> MtlHdmiProbe {
     let mode = Mode::VESA_1024X768_60;
     MtlHdmiProbe {
         port: XeLpgPort::B,
+        display_ip: crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp,
         tc: None,
         mode,
         pll: hdmi_pll_request(XeLpgPort::B, mode.pixel_clock_khz, false).unwrap(),
@@ -384,15 +385,15 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
         ),
         (
             Generation::LunarLake,
-            XeLpgPort::Tc1,
-            true,
-            HdmiError::Route(ExternalError::UnsupportedGeneration),
+            XeLpgPort::A,
+            false,
+            HdmiError::Route(ExternalError::UnsupportedPort),
         ),
         (
             Generation::PantherLake,
-            XeLpgPort::Tc1,
-            true,
-            HdmiError::Route(ExternalError::UnsupportedGeneration),
+            XeLpgPort::A,
+            false,
+            HdmiError::Route(ExternalError::UnsupportedPort),
         ),
         (
             Generation::MeteorLake,
@@ -412,6 +413,20 @@ fn smoke_mtl_hdmi_probe_refusals_before_mmio() -> TestResult {
             Err(e) if e == error => {}
             _ => return TestResult::Fail("HDMI probe refusals must precede MMIO"),
         }
+    }
+    // Wildcat Lake's exact 30.02 profile has no HDMI route; Panther Lake's
+    // generation never stands in for it.
+    if crate::intel_gpu_xelpg_hdmi::probe_hdmi_profile(
+        &NoAccess,
+        crate::intel_gpu_xelpg_external::ExternalDisplayProfile::WILDCAT_LAKE,
+        XeLpgPort::Tc1,
+        true,
+        ddc_pin(XeLpgPort::Tc1),
+    )
+    .err()
+        != Some(HdmiError::Route(ExternalError::UnsupportedGeneration))
+    {
+        return TestResult::Fail("Wildcat Lake HDMI must refuse before MMIO");
     }
     // Corrected GMBUS numbering (Linux b90c984d): DDI B = GMBUS_PIN_2_BXT
     // ("dpb"), TCn = GMBUS_PIN_9_TC1_ICP + n - 1, all in gmbus_pins_mtp.

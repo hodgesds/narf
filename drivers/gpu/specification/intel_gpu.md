@@ -8341,8 +8341,10 @@ Fixtures, all new and unexecuted in this slice:
 
 The display-preserving Lunar Lake GT/KMS owner, display-20 resource profile,
 FBC count, PSR1 deltas and TC1–TC4 Type-C/PICA external route described by
-this workstream are implemented. Remaining output work includes combo DDI B,
-HDMI and UHBR. Panther Lake's additional display-30 deltas are recorded in
+this workstream are implemented, as are DP and HDMI TMDS on combo DDI B (and
+HDMI on declared legacy Type-C ports) through the display-20 D2D/DDI_BUF_CTL
+programming. Remaining output work includes UHBR. Panther Lake's additional
+display-30 deltas are recorded in
 `intel_gpu_xe3lpd`.
 
 ### Lunar Lake display 20: GT owner, KMS flips and DC6 — native fixtures added
@@ -8874,7 +8876,9 @@ register/sideband fixtures. Test and build results are recorded in STATUS.md.
   KMS/external paths. Panther Lake reuses the DP 1.4 C20 tables through its
   PICA/Cx0 register view and runs each external pipe through the mandatory
   fixed-refresh VRR timing generator with guardband-aware watermarks. Combo
-  DDI B and HDMI remain refused on display 20/30.
+  DDI B (C10 on Lunar Lake, C20 on Panther Lake) takes DP, and HDMI TMDS runs
+  on DDI B and declared legacy Type-C ports of both; Wildcat Lake's 30.02
+  profile keeps TC1/TC2 DP only.
 - **Discrete Arc Display Bring-Up (`DG2` Display 13 & `BMG` `Xe2_HPD` 14.01)**:
   `DiscreteDisplayIp::{Dg2, Xe2Hpd}` identifies discrete display engines on
   `Alchemist` and `Battlemage` (`GMD_ID_DISPLAY` 14.01), seeding DRM mode
