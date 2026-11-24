@@ -66,6 +66,10 @@ fn gfx11_topology_applies_fuse_and_user_harvesting() -> TestResult {
     };
     // SH1: fused-off WGP2 (CC INACTIVE_WGPS bit 2). SH0: user-disabled
     // WGP0 (GC_USER bit 0). Bits above max_cu_per_sh/2 are ignored.
+    // Full Phoenix is 12 CUs (2 SA x 6); SH0 loses WGP0 (2 CUs, 0x3c)
+    // and SH1 loses WGP2 (2 CUs, 0x0f), so 12 - 2 - 2 = 8. Linux's
+    // gfx_v11_0_get_cu_info sums the per-(SE,SH) CU-bitmap popcounts
+    // into cu_info->number, so active_cus is that same sum.
     raw.wgp_disable[0][1] = 1 << (16 + 2);
     raw.wgp_disable[0][0] = (1 << 16) | (1 << (16 + 9));
     // RB0 disabled in the global BACKEND_DISABLE field (bits[31:4]).
@@ -73,7 +77,7 @@ fn gfx11_topology_applies_fuse_and_user_harvesting() -> TestResult {
     // TCC 3 and HI_TCC 0: 0x8 | 1 << 16.
     raw.tcc_disable = (1 << (16 + 3)) | (1 << 8);
     let t = derive(limits(), &raw).unwrap();
-    if t.active_cus != 10
+    if t.active_cus != 8
         || t.cu_bitmap[0][0] != 0x3c
         || t.cu_bitmap[0][1] != 0x0f
         || t.cu_bitmap[1][0] != 0
