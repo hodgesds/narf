@@ -68,8 +68,58 @@ pub const SDE_IIR: u64 = 0xc4008;
 pub const SDE_IER: u64 = 0xc400c;
 const SHOTPLUG: u64 = 0xc4030;
 const FILTER: u64 = 0xc4038;
-const OWNED: u32 = 0x00020000; // source-exposed combo B only; A may be internal
-const ALL_STATUS: u32 = 0x3333;
+
+/// The south-display hotplug bank's layout for the one port the monitor
+/// owns (combo B; A may be internal). ICP-class south displays (ICP, MCC,
+/// JSP, TGP, ADP) put B at `SDE_DDI_HOTPLUG_ICP` bit 17 and its nibble in
+/// `SHOTPLUG_CTL_DDI` bits 7:4; SPT-class ones (SPT, KBP, CNP, CMP: Linux
+/// runs `spt_hpd_irq_setup` for every PCH from SPT to ICP) put it at
+/// `SDE_PORTB_HOTPLUG_CPT` bit 21 and `PCH_PORT_HOTPLUG` bits 4 and 1:0,
+/// at the same 0xC4030, with no hotplug filter register.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum HpdBank {
+    Icp,
+    Spt,
+}
+
+impl HpdBank {
+    /// The owned port's SDE ISR/IMR/IER/IIR bit.
+    const fn owned(self) -> u32 {
+        match self {
+            Self::Icp => 1 << 17,
+            Self::Spt => 1 << 21,
+        }
+    }
+    /// The owned port's hotplug enable in the control register.
+    const fn enable(self) -> u32 {
+        match self {
+            Self::Icp => 0x80,
+            Self::Spt => 1 << 4,
+        }
+    }
+    /// The owned port's status field, and its long-pulse value.
+    const fn status(self) -> u32 {
+        match self {
+            Self::Icp => 0x30,
+            Self::Spt => 0x3,
+        }
+    }
+    const fn long(self) -> u32 {
+        match self {
+            Self::Icp => 0x20,
+            Self::Spt => 0x2,
+        }
+    }
+    /// Every port's write-1-to-clear status bits in the control register,
+    /// kept zero on a write so other ports' events survive.
+    const fn all_status(self) -> u32 {
+        match self {
+            Self::Icp => 0x3333,
+            // PORTB 1:0, PORTC 9:8, PORTD 17:16, PORTA 25:24.
+            Self::Spt => 0x0303_0303,
+        }
+    }
+}
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HpdProfile {
     family: crate::intel_gpu_aux::SourceFamily,
@@ -98,14 +148,15 @@ impl HpdProfile {
     /// `SDE_DDI_HOTPLUG_ICP` bank (`icp_hpd_irq_setup`): Ice Lake with
     /// ICP (`INTEL_PCH_ICP_DEVICE_ID_TYPE` 0x3480, `_ICP2_` 0x3880), EHL/JSL
     /// with MCC (0x4B00, TGP-compatible) or JSP (0x4D80, ICP-compatible).
-    /// Gen9's SPT/KBP/CNP bank is a different layout and has no profile.
+    /// Gen9 pairs with an SPT-class PCH (SPT, KBP, CNP, CMP), whose bank is
+    /// the SPT layout ([`HpdBank::Spt`]).
     pub(crate) fn for_source(
         family: crate::intel_gpu_aux::SourceFamily,
         vendor: u16,
         device: u16,
         class: u32,
     ) -> Option<Self> {
-        use crate::intel_gpu_aux::SourceFamily::{Gen11, Gen12};
+        use crate::intel_gpu_aux::SourceFamily::{Gen11, Gen12, Gen9};
         use crate::intel_gpu_gt::Gen11Platform::{ElkhartLake, IceLake, JasperLake};
         use crate::intel_gpu_gt::Gen12Platform::*;
         if vendor != 0x8086 || class != 0x060100 {
@@ -120,6 +171,11 @@ impl HpdProfile {
                 )
                 | (Gen11(IceLake), 0x3480 | 0x3880)
                 | (Gen11(ElkhartLake | JasperLake), 0x4b00 | 0x4d80)
+                // SPT/SPT-LP, KBP, CNP/CNP-LP, CMP/CMP2/CMP-V.
+                | (
+                    Gen9 { .. },
+                    0xa100 | 0x9d00 | 0xa280 | 0xa300 | 0x9d80 | 0x0280 | 0x0680 | 0xa380
+                )
         );
         allowed.then_some(Self {
             family,
@@ -142,6 +198,27 @@ impl HpdProfile {
             segment,
             devices,
         )
+    }
+    /// The GMBUS pin table of a Gen9 source's observed PCH (`intel_pch.c`):
+    /// SPT, KBP and CMP-V (KBP-based, "SPT compatible") take `gmbus_pins_spt`,
+    /// CNP and CMP the CNP pins. `None` for every other family.
+    pub(crate) fn gen9_gmbus_table(&self) -> Option<crate::intel_gpu_gmbus::GmbusPinTable> {
+        use crate::intel_gpu_gmbus::GmbusPinTable;
+        if !matches!(self.family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. }) {
+            return None;
+        }
+        match self.device & 0xff80 {
+            0xa100 | 0x9d00 | 0xa280 | 0xa380 => Some(GmbusPinTable::Spt),
+            0xa300 | 0x9d80 | 0x0280 | 0x0680 => Some(GmbusPinTable::Cnp),
+            _ => None,
+        }
+    }
+    /// The bank this profile's south display uses.
+    const fn bank(&self) -> HpdBank {
+        match self.family {
+            crate::intel_gpu_aux::SourceFamily::Gen9 { .. } => HpdBank::Spt,
+            _ => HpdBank::Icp,
+        }
     }
     /// [`Self::from_observed`] for any source family ([`Self::for_source`]).
     pub(crate) fn observed_for_source(
@@ -242,6 +319,9 @@ impl HpdMonitor {
     pub fn uncertain(&self) -> bool {
         self.uncertain
     }
+    fn bank(&self) -> HpdBank {
+        self.profile.map_or(HpdBank::Icp, |p| p.bank())
+    }
     fn qualify<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
         let Some(profile) = io.gen12_hpd_profile() else {
             if self.profile.is_some() {
@@ -253,12 +333,12 @@ impl HpdMonitor {
             self.uncertain = true;
             return false;
         }
-        if io.read32(FILTER) != 0xf8 {
+        if profile.bank() == HpdBank::Icp && io.read32(FILTER) != 0xf8 {
             if self.profile.is_some() {
                 self.uncertain = true;
             }
             return false;
-        } // shared source250us filter; never seize it
+        } // shared source250us filter (ICP-class only); never seize it
         self.profile = Some(profile);
         true
     }
@@ -266,6 +346,8 @@ impl HpdMonitor {
         if !self.qualify(io) || self.uncertain || self.initialized {
             return;
         }
+        let bank = self.bank();
+        let owned = bank.owned();
         let ier = io.read32(SDE_IER);
         let imr = io.read32(SDE_IMR);
         if !io.display_access_ok() {
@@ -274,13 +356,13 @@ impl HpdMonitor {
         }
         // Mask/readback first: inherited IMR may have this source unmasked
         // while its IER latch was disabled. Never transiently enable an IRQ.
-        io.write32(SDE_IMR, imr | OWNED);
+        io.write32(SDE_IMR, imr | owned);
         let masked = io.read32(SDE_IMR);
-        if !io.display_access_ok() || masked & OWNED != OWNED {
+        if !io.display_access_ok() || masked & owned != owned {
             self.uncertain = true;
             return;
         }
-        io.write32(SDE_IER, ier | OWNED);
+        io.write32(SDE_IER, ier | owned);
         // Establish the first owned status incarnation. A stale orphan LONG
         // without IIR must not contaminate the first later SHORT. The source
         // setup RMW clears observed owned W1C status while enabling detection.
@@ -290,7 +372,7 @@ impl HpdMonitor {
             self.uncertain = true;
             return;
         }
-        let captured = inherited & OWNED;
+        let captured = inherited & owned;
         self.pending |= captured;
         if captured != 0 {
             io.write32(SDE_IIR, captured);
@@ -300,21 +382,24 @@ impl HpdMonitor {
             self.uncertain = true;
             return;
         }
-        io.write32(SHOTPLUG, (ctl & !ALL_STATUS) | (ctl & 0x30) | 0x80);
+        io.write32(
+            SHOTPLUG,
+            (ctl & !bank.all_status()) | (ctl & bank.status()) | bank.enable(),
+        );
         let observed_ier = io.read32(SDE_IER);
         let observed_imr = io.read32(SDE_IMR);
         let observed_ctl = io.read32(SHOTPLUG);
         if !io.display_access_ok()
-            || observed_ier & OWNED != OWNED
-            || observed_imr & OWNED != OWNED
+            || observed_ier & owned != owned
+            || observed_imr & owned != owned
             || observed_ctl == u32::MAX
-            || observed_ctl & 0x80 != 0x80
-            || observed_ctl & 0x30 != 0
+            || observed_ctl & bank.enable() != bank.enable()
+            || observed_ctl & bank.status() != 0
         {
             self.uncertain = true;
         } else {
             self.pending &= !captured;
-            self.long &= !OWNED;
+            self.long &= !owned;
             self.initialized = true;
         }
     }
@@ -322,6 +407,8 @@ impl HpdMonitor {
         if !self.qualify(io) || self.uncertain {
             return None;
         }
+        let bank = self.bank();
+        let owned = bank.owned();
         if !self.initialized {
             self.enable_interrupts(io);
             if !self.initialized || self.uncertain {
@@ -334,7 +421,7 @@ impl HpdMonitor {
             self.uncertain = true;
             return None;
         }
-        let captured = edges & OWNED;
+        let captured = edges & owned;
         self.pending |= captured; // retain before the first owned W1C
         if captured != 0 {
             io.write32(SDE_IIR, captured); // source ACK order: south IIR before SHOTPLUG
@@ -343,19 +430,20 @@ impl HpdMonitor {
                 self.uncertain = true;
                 return None;
             }
-            let status = ctl & 0x30;
-            if status & 0x20 != 0 {
-                self.long |= 1 << 17;
+            let status = ctl & bank.status();
+            if status & bank.long() == bank.long() {
+                self.long |= owned;
             }
             // Never carry another owner's read-one status into a W1C write.
-            io.write32(SHOTPLUG, (ctl & !ALL_STATUS) | status);
+            io.write32(SHOTPLUG, (ctl & !bank.all_status()) | status);
             if !io.display_access_ok() {
                 self.uncertain = true;
                 return None;
             }
         }
         for (index, ddi) in COMBO_DDIS.iter().copied().enumerate() {
-            let bit = hotplug_bit(ddi).unwrap();
+            // COMBO_DDIS is combo B alone: the bank's owned bit.
+            let bit = owned;
             let now = levels & bit != 0;
             // Live ISR may be low during a legal short pulse. Source long
             // detection gates removal; no single low sample proves unplug.
@@ -1993,7 +2081,8 @@ pub mod tests {
     );
 
     /// Gen11 sources get the ICP-class hotplug bank for their own PCHs
-    /// only; Gen9 has none, and a Gen12 PCH never qualifies a Gen11 GPU.
+    /// only, Gen9 the SPT bank for SPT-class PCHs, and a PCH of another
+    /// generation never qualifies a GPU.
     fn smoke_hpd_profile_gen11_icp_pchs() -> TestResult {
         use crate::intel_gpu_aux::SourceFamily;
         use crate::intel_gpu_gen9_ddi::SkuFamily;
@@ -2018,8 +2107,32 @@ pub mod tests {
             platform: Gen9Platform::Skylake,
             sku: SkuFamily::Ult,
         };
-        if HpdProfile::for_source(skl, 0x8086, 0x9d48, isa).is_some() {
-            return TestResult::Fail("SPT's hotplug bank is not the ICP layout");
+        // Gen9 takes its SPT-class PCHs with the SPT bank; an ICP-class
+        // PCH never qualifies it.
+        for (did, ok) in [
+            (0x9d48, true),
+            (0xa282, true),
+            (0x0284, true),
+            (0x3482, false),
+        ] {
+            let profile = HpdProfile::for_source(skl, 0x8086, did, isa);
+            if profile.is_some() != ok || profile.is_some_and(|p| p.bank() != HpdBank::Spt) {
+                return TestResult::Fail("Gen9 HPD rows must follow intel_pch.c's SPT-class PCHs");
+            }
+        }
+        if HpdProfile::for_source(icl, 0x8086, 0x3482, isa).map(|p| p.bank()) != Some(HpdBank::Icp)
+        {
+            return TestResult::Fail("Gen11 keeps the ICP bank");
+        }
+        // SPT's PORTB: ISR bit 21, enable bit 4, status 1:0 (long 2).
+        let spt = HpdBank::Spt;
+        if spt.owned() != 1 << 21
+            || spt.enable() != 1 << 4
+            || spt.status() != 3
+            || spt.long() != 2
+            || spt.all_status() & spt.status() != spt.status()
+        {
+            return TestResult::Fail("the SPT bank must follow PCH_PORT_HOTPLUG");
         }
         TestResult::Pass
     }

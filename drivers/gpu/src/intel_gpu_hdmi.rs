@@ -763,7 +763,8 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
 ) -> Result<HdmiSinkProbe, HdmiError> {
     let family = crate::intel_gpu_aux::SourceFamily::of(mmio)
         .ok_or(HdmiError::Modeset(ModesetError::UnsupportedGeneration))?;
-    let pin = ddc_pin(family, ddc, ddi).ok_or(DdcError::NoPinPair)?;
+    let pch = mmio.gen12_hpd_profile().and_then(|p| p.gen9_gmbus_table());
+    let pin = ddc_pin(family, ddc, pch, ddi).ok_or(DdcError::NoPinPair)?;
     let (edid, edid_len) = read_edid(mmio, pin)?;
     let mode = mode_from_edid(&edid[..edid_len])?;
     let hf_vsdb = parse_hf_vsdb(&edid[..edid_len]);
@@ -902,19 +903,22 @@ pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bo
 }
 
 /// The HDMI DDC pin for `ddi` on `family`: the Gen12 VBT overrides or
-/// platform default, the Gen11 ICP default (`gen11_ddc_pin`). Gen9's
-/// default depends on the PCH (SPT or CNP pin table), which the session
-/// does not observe, so a Gen9 HDMI session has no pin yet.
+/// platform default, the Gen11 ICP default (`gen11_ddc_pin`), or the Gen9
+/// default from the observed PCH's pin table (`pch`, SPT or CNP;
+/// `gen9_ddc_pin`). A Gen9 source whose PCH was not observed has no pin.
 fn ddc_pin(
     family: crate::intel_gpu_aux::SourceFamily,
     ddc: &Gen12DdcOverrides,
+    pch: Option<crate::intel_gpu_gmbus::GmbusPinTable>,
     ddi: Ddi,
 ) -> Option<PinPair> {
     use crate::intel_gpu_aux::SourceFamily;
     match family {
         SourceFamily::Gen12(family) => ddc.pin(family, ddi),
         SourceFamily::Gen11(platform) => crate::intel_gpu_gmbus::gen11_ddc_pin(platform, ddi),
-        SourceFamily::Gen9 { .. } => None,
+        SourceFamily::Gen9 { .. } => {
+            pch.and_then(|table| crate::intel_gpu_gmbus::gen9_ddc_pin(table, ddi))
+        }
     }
 }
 
@@ -2117,8 +2121,8 @@ pub mod tests {
 
     /// Gen11 and Gen9 sources reach the session layer: `SourceFamily::of`
     /// reports them (Gen12 metadata first), the Ice Lake HDMI pin follows
-    /// `icl_encoder_to_ddc_pin`, and the PCH-dependent pins (EHL/JSL C/D,
-    /// every Gen9 port) have no default.
+    /// `icl_encoder_to_ddc_pin`, EHL/JSL C/D have no default, and Gen9 pins
+    /// come from the observed PCH's table.
     fn smoke_hdmi_gen11_gen9_source_families() -> TestResult {
         use crate::intel_gpu_aux::SourceFamily;
         use crate::intel_gpu_gen9_ddi::SkuFamily;
@@ -2146,7 +2150,7 @@ pub mod tests {
             return TestResult::Fail("SourceFamily::of must report the mapping's identity");
         }
         let ddc = Gen12DdcOverrides::NONE;
-        let gen11 = |p, ddi| ddc_pin(SourceFamily::Gen11(p), &ddc, ddi);
+        let gen11 = |p, ddi| ddc_pin(SourceFamily::Gen11(p), &ddc, None, ddi);
         if gen11(Gen11Platform::IceLake, Ddi::A) != Some(PinPair::Pin1Bxt)
             || gen11(Gen11Platform::IceLake, Ddi::D) != Some(PinPair::Pin10Tc2)
             || gen11(Gen11Platform::JasperLake, Ddi::B) != Some(PinPair::Pin2Bxt)
@@ -2159,8 +2163,12 @@ pub mod tests {
             platform: Gen9Platform::Skylake,
             sku: SkuFamily::Desktop,
         };
-        if ddc_pin(gen9, &ddc, Ddi::B).is_some() {
-            return TestResult::Fail("a Gen9 pin needs the PCH's pin table");
+        use crate::intel_gpu_gmbus::GmbusPinTable;
+        if ddc_pin(gen9, &ddc, None, Ddi::B).is_some()
+            || ddc_pin(gen9, &ddc, Some(GmbusPinTable::Spt), Ddi::B) != Some(PinPair::Pin5Mtp)
+            || ddc_pin(gen9, &ddc, Some(GmbusPinTable::Cnp), Ddi::C) != Some(PinPair::Pin2Bxt)
+        {
+            return TestResult::Fail("a Gen9 pin comes from the observed PCH's pin table");
         }
         // Probing without a family still refuses before any access.
         if !matches!(
