@@ -1557,6 +1557,12 @@ fn stamp_fixture_abi(staged: &[u8], abi: u32) -> Option<Vec<u8>> {
     Some(image)
 }
 
+/// The PCI identity table `intel_gpu.ko` registers from. The module crate
+/// includes this same file, so the expected row count follows the table.
+#[path = "../../drivers/gpu/src/intel_gpu_pci_ids.rs"]
+#[allow(dead_code, unused_imports)]
+mod intel_gpu_pci_ids;
+
 fn e2e_intel_gpu_module_registration() -> TestResult {
     use narf_bus::driver_match::{
         __module_device_context_count_for_test, __module_thunk_for_test, count, registered,
@@ -1622,12 +1628,13 @@ fn e2e_intel_gpu_module_registration() -> TestResult {
         0x9a49, 0x4c80, 0x46b3, 0x7d55, 0x7d41, 0x6420, 0xb080, 0xfd80, 0xd740, 0x4905, 0x56a0,
         0xe202, 0x56c0, 0x674c, 0x6750, 0xd750, 0xd75f, 0xb0a1, 0xd74a, 0xd74b,
     ];
-    let matches_installed = module.name() == "intel_gpu"
-        && module.domain == narf_lib::id::DomainId::DRIVER_2
-        && count() == before + 168
-        && representatives
-            .iter()
-            .all(|&id| __module_thunk_for_test(0x8086, id).is_some())
+    let identity_ok =
+        module.name() == "intel_gpu" && module.domain == narf_lib::id::DomainId::DRIVER_2;
+    let expected_rows = intel_gpu_pci_ids::pci_matches().count();
+    let installed_rows = count().saturating_sub(before);
+    let ids_ok = representatives
+        .iter()
+        .all(|&id| __module_thunk_for_test(0x8086, id).is_some())
         && [0xb0a2, 0xd746, 0xd74c, 0xd758, 0x6751, 0xffff]
             .iter()
             .all(|&id| __module_thunk_for_test(0x8086, id).is_none());
@@ -1662,10 +1669,20 @@ fn e2e_intel_gpu_module_registration() -> TestResult {
     if sys_delete_module("intel_gpu").is_err() {
         return TestResult::Fail("could not unload the Intel GPU module");
     }
-    if !matches_installed || !declined {
-        return TestResult::Fail(
-            "Intel module registration, graphics domain or probe fallback mismatch",
-        );
+    if !identity_ok {
+        return TestResult::Fail("Intel module name or graphics domain mismatch");
+    }
+    if installed_rows != expected_rows {
+        narf_console::write_str(&format!(
+            "intel-gpu: module installed {installed_rows} PCI matches, table has {expected_rows}\n"
+        ));
+        return TestResult::Fail("Intel module did not register every table row");
+    }
+    if !ids_ok {
+        return TestResult::Fail("Intel module PCI match set differs from the table");
+    }
+    if !declined {
+        return TestResult::Fail("Intel module probe did not decline and release its context");
     }
     if count() != before
         || representatives
