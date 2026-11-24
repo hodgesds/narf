@@ -3284,10 +3284,10 @@ fn smoke_dcn35_uses_different_offsets_than_dcn20() -> TestResult {
         DCN35_OTG0_OTG_V_SYNC_A, OTG0_OTG_CONTROL, OTG0_OTG_INTERRUPT_CONTROL,
         OTG0_OTG_V_BLANK_START_END, OTG0_OTG_V_SYNC_A,
     };
-    // Phoenix's DCN 3.5 shifted V_BLANK / V_SYNC / OTG_CONTROL /
+    // Strix's DCN 3.5 shifted V_BLANK / V_SYNC / OTG_CONTROL /
     // INTERRUPT_CONTROL inside the OTG block vs DCN 2.0 (Renoir).
     // If any of these ever drift to match the DCN 2.0 value the
-    // Phoenix path would silently program the wrong register on
+    // Strix path would silently program the wrong register on
     // real hardware — pin the invariant.
     if OTG0_OTG_V_BLANK_START_END == DCN35_OTG0_OTG_V_BLANK_START_END {
         return TestResult::Fail("DCN35 V_BLANK offset must differ from DCN20");
@@ -9120,7 +9120,7 @@ kernel_test_in!(
 //   - Renoir family — 1002:1636 (Renoir Vega8/9, DCN 2.0) and
 //                     1002:1638 (Cezanne, DCN 2.1) — both routed to
 //                     Family::Renoir (GFX9 / SMU 12.0 / PSP 12.0).
-//   - Phoenix HawkPoint1 — 1002:1900 (DCN 3.5, GFX 11.5, SMU 14).
+//   - Phoenix HawkPoint1 — 1002:1900 (DCN 3.1.4, GFX 11.0.1, SMU 13.0.4).
 // Lock the three explicit PCI IDs in so an accidental rename or
 // table edit surfaces immediately.
 
