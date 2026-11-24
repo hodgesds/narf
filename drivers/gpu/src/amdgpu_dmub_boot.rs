@@ -725,6 +725,16 @@ impl Loader {
     pub fn graphics_booted(&self) -> bool {
         self.graphics_booted
     }
+    /// The MES program-counter entry points (`uc_start_addr`, sched + KIQ)
+    /// for a loaded Phoenix graphics set, for the Phoenix cold boot's
+    /// `mes_start`. `None` until the firmware lane lands
+    /// `Firmware::open_phoenix` + the Phoenix `set_graphics` arm: no Phoenix
+    /// set can be loaded today, so there are no entry points to report.
+    /// That lane parses them from the MES image header (see
+    /// `amdgpu_phoenix_boot::parse_mes_start_addrs`) once the set exists.
+    pub(crate) fn mes_start_addrs(&self) -> Option<[u64; 2]> {
+        None
+    }
     /// After a graphics boot, what VCN's start needs from the PSP session
     /// that loaded it: the session itself (for the DPG register lists it
     /// writes into VCN's SRAM), the VCN TMR addresses it recorded, and the

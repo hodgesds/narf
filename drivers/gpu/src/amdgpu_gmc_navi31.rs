@@ -1,28 +1,35 @@
-//! RDNA3 (Navi31/32/33) GMC v11 owner: VMID0 bring-up for an owned VRAM
-//! test aperture, client VMID setup, TLB flush, and PASID mapping.
+//! GFX11 (Navi31/32/33 + Phoenix) GMC v11 owner: VMID0 bring-up for an
+//! owned VRAM test aperture, client VMID setup, TLB flush, and PASID
+//! mapping.
 //!
 //! Linux `gmc_v11_0.c` / `gfxhub_v3_0.c` (+ `gfxhub_v3_0_3.c` for Navi32)
-//! / `mmhub_v3_0.c`. No clock gating, KIQ/MES invalidation, retry-fault
-//! recovery, GART bind/unbind, or implicit reset — the GART table and the
-//! GPUVM stack are the follow-up; this owner brings up VMID0, arms the
-//! client VMIDs, and owns the TLB/PASID surface the submitter will use.
+//! / `mmhub_v3_0.c` (+ `mmhub_v3_0_1.c` for Phoenix). No clock gating,
+//! KIQ/MES invalidation, retry-fault recovery, GART bind/unbind, or
+//! implicit reset — the GART table and the GPUVM stack are the follow-up;
+//! this owner brings up VMID0, arms the client VMIDs, and owns the
+//! TLB/PASID surface the submitter will use.
 //!
 //! ## Per-die parameters (corrected pairing, lane 1)
 //!
-//! | die    | GC version | GFXHUB table | MMHUB |
-//! |--------|------------|--------------|-------|
-//! | Navi31 | 11.0.0     | `gfxhub_v3_0` (`GFXHUB_V3_0`) | 3.0.0 |
-//! | Navi32 | 11.0.3     | `gfxhub_v3_0_3` (`GFXHUB_V3_0_3`) | 3.0.0 |
-//! | Navi33 | 11.0.2     | `gfxhub_v3_0` (`GFXHUB_V3_0`) | 3.0.0 |
+//! | die     | GC version | GFXHUB table | MMHUB |
+//! |---------|------------|--------------|-------|
+//! | Navi31  | 11.0.0     | `gfxhub_v3_0` (`GFXHUB_V3_0`) | 3.0.0 |
+//! | Navi32  | 11.0.3     | `gfxhub_v3_0_3` (`GFXHUB_V3_0_3`) | 3.0.0 |
+//! | Navi33  | 11.0.2     | `gfxhub_v3_0` (`GFXHUB_V3_0`) | 3.0.0 |
+//! | Phoenix | 11.0.1     | `gfxhub_v3_0` (`GFXHUB_V3_0`) | 3.0.1, BASE_IDX 1 |
 //!
 //! Navi33 shares the 11.0.0 function table because
 //! `gmc_v11_0_set_gfxhub_funcs` selects the default `gfxhub_v3_0_funcs`
 //! for every GC version except 11.0.3 and the 11.5/11.7 APUs. Navi32's
 //! GFXHUB registers sit 0x10 higher (`gc_11_0_3_offset.h`), which is why
-//! it has its own table. MMHUB 3.0.0 for all three dies is the
+//! it has its own table. MMHUB 3.0.0 for all three discrete dies is the
 //! `amdgpu_platform::MMHUB_WINDOWS` attribution ("Navi3x"); the
 //! discovery blob is the only source that could contradict it, and the
 //! owner fails closed (`Unsupported`) if a die reports another version.
+//! Phoenix's MMHUB is 3.0.1 on BASE_IDX 1: Linux's `mmhub_v3_0_1.c`
+//! differs from `mmhub_v3_0.c` only in its client-ID table — the
+//! programming backend and register offsets are the same, so Phoenix
+//! reuses the `MM` table and the `MMHUB_V3_0` VM-hub table.
 //!
 //! ## VMID split (`gmc_v11_0_sw_init`)
 //!
@@ -69,25 +76,28 @@ const EMPTY_ROOT: u64 = 16384;
 const APERTURE_SIZE: u64 = 2 << 20; // 512 flat PTEs; only two are present
 const LIMIT: u64 = 1 << 48;
 
-/// The RDNA3 die discovery describes, by GC version.
+/// The GFX11 die discovery describes, by GC version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Navi31Die {
+pub enum Gfx11Die {
     Navi31,
     Navi32,
     Navi33,
+    Phoenix,
 }
 
-impl Navi31Die {
-    /// All GC versions Linux's `gmc_v11_0` drives for discrete RDNA3.
-    /// GC 11.0.1 is Phoenix — an APU with its own GMC path — and is
-    /// deliberately absent: this owner never claims it.
-    pub const GC_VERSIONS: &[(u8, u8, u8)] = &[(11, 0, 0), (11, 0, 2), (11, 0, 3)];
+impl Gfx11Die {
+    /// All GC versions Linux's `gmc_v11_0` drives: the discrete RDNA3
+    /// dies plus Phoenix 11.0.1, whose GMC programming reuses the same
+    /// GFXHUB tables and aperture registers (only the MMHUB version and
+    /// window differ — see `Layout::resolve`).
+    pub const GC_VERSIONS: &[(u8, u8, u8)] = &[(11, 0, 0), (11, 0, 2), (11, 0, 3), (11, 0, 1)];
 
     pub const fn from_gc(version: (u8, u8, u8)) -> Option<Self> {
         match version {
             (11, 0, 0) => Some(Self::Navi31),
             (11, 0, 3) => Some(Self::Navi32),
             (11, 0, 2) => Some(Self::Navi33),
+            (11, 0, 1) => Some(Self::Phoenix),
             _ => None,
         }
     }
@@ -97,11 +107,12 @@ impl Navi31Die {
             Self::Navi31 => (11, 0, 0),
             Self::Navi32 => (11, 0, 3),
             Self::Navi33 => (11, 0, 2),
+            Self::Phoenix => (11, 0, 1),
         }
     }
 
     /// The die discovery describes: exactly one GC instance 0, of a
-    /// discrete-RDNA3 GC version. Duplicate or absent GC fails closed.
+    /// GFX11 GC version. Duplicate or absent GC fails closed.
     pub fn from_ip_blocks(blocks: &[ip::IpBlock]) -> Option<Self> {
         let mut gc = blocks
             .iter()
@@ -113,18 +124,41 @@ impl Navi31Die {
         Self::from_gc((first.major, first.minor, first.revision))
     }
 
-    /// The RDNA3 die this probed AMD GPU is, or `None` for every other
+    /// The GFX11 die this probed AMD GPU is, or `None` for every other
     /// part. A device id the PCI table assigns to another family is
-    /// refused even with RDNA3 discovery: the identity would be
-    /// self-contradictory.
+    /// refused even with GFX11 discovery: the identity would be
+    /// self-contradictory — a Navi3 DID reporting GC 11.0.1, or a
+    /// Phoenix DID reporting a discrete GC version, is refused the same
+    /// way. Phoenix is DID-gated on top of the family check: Strix
+    /// shares `Family::Phoenix` but is RDNA3.5, not GC 11.0.1, and must
+    /// not take this path.
     pub fn of(gpu: &AmdGpu) -> Option<Self> {
-        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
-            || crate::amdgpu::family_for_pci_id(gpu.chip.vid, gpu.chip.did)
-                != Some(crate::amdgpu::Family::Navi3)
-        {
+        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR {
             return None;
         }
-        Self::from_ip_blocks(&gpu.ip_blocks)
+        let die = Self::from_ip_blocks(&gpu.ip_blocks)?;
+        match crate::amdgpu::family_for_pci_id(gpu.chip.vid, gpu.chip.did)? {
+            crate::amdgpu::Family::Navi3 => {
+                if die == Self::Phoenix {
+                    return None;
+                }
+                Some(die)
+            }
+            crate::amdgpu::Family::Phoenix => {
+                if die != Self::Phoenix
+                    || !matches!(
+                        gpu.chip.did,
+                        crate::amdgpu::PHOENIX_HAWKPOINT1
+                            | crate::amdgpu::PHOENIX1
+                            | crate::amdgpu::PHOENIX2
+                    )
+                {
+                    return None;
+                }
+                Some(die)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -187,7 +221,7 @@ pub struct Aperture {
 }
 #[derive(Clone, Copy, Debug)]
 struct Layout {
-    die: Navi31Die,
+    die: Gfx11Die,
     bases: [u64; 2],
     /// The GC hub's and the MM hub's full programming tables, in
     /// `bases` order. Navi32's GFX table is `GFX_11_0_3`.
@@ -218,27 +252,30 @@ fn nbio_bank(gpu: &AmdGpu) -> Result<u64, Error> {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        let die = Navi31Die::of(gpu).ok_or(Error::Unsupported)?;
+        let die = Gfx11Die::of(gpu).ok_or(Error::Unsupported)?;
         let reg = |id, versions: &[(u8, u8, u8)], index, last| {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
         // Highest dword the owner touches through each base: the GFX
-        // hub's PT_END (0x1733 on 11.0.0/11.0.2, 0x1743 on 11.0.3),
+        // hub's PT_END (0x1733 on 11.0.0/11.0.1/11.0.2, 0x1743 on 11.0.3),
         // the MM hub's L1 TLB control (0x08f3).
         let gfx_last = match die {
-            Navi31Die::Navi32 => 0x1743,
+            Gfx11Die::Navi32 => 0x1743,
             _ => 0x1733,
         };
         let (gfx, gfx_vmhub) = match die {
-            Navi31Die::Navi32 => (GFX_11_0_3, GFXHUB_V3_0_3),
+            Gfx11Die::Navi32 => (GFX_11_0_3, GFXHUB_V3_0_3),
             _ => (GFX, GFXHUB_V3_0),
+        };
+        // Phoenix's MMHUB is 3.0.1 on BASE_IDX 1; the discrete dies are
+        // 3.0.0 on BASE_IDX 0. Same offsets either way (see module docs).
+        let mmhub = match die {
+            Gfx11Die::Phoenix => reg(ip::HW_ID_MMHUB, &[(3, 0, 1)], 1, 0x08f3)?,
+            _ => reg(ip::HW_ID_MMHUB, &[(3, 0, 0)], 0, 0x08f3)?,
         };
         Ok(Self {
             die,
-            bases: [
-                reg(ip::HW_ID_GC, &[die.gc_version()], 0, gfx_last)?,
-                reg(ip::HW_ID_MMHUB, &[(3, 0, 0)], 0, 0x08f3)?,
-            ],
+            bases: [reg(ip::HW_ID_GC, &[die.gc_version()], 0, gfx_last)?, mmhub],
             hubs: [gfx, MM],
             vmhub: [gfx_vmhub, MMHUB_V3_0],
             nbio: nbio_bank(gpu)?,
@@ -827,8 +864,9 @@ pub struct Gmc {
 }
 impl Gmc {
     /// Reserve backing pages without I/O. Only a physical Navi31/32/33 PF
-    /// is supported: AMD vendor, a discrete-RDNA3 GC version (11.0.0 /
-    /// 11.0.2 / 11.0.3), MMHUB 3.0.0, OSSSYS 6.0.0.
+    /// or a Phoenix APU is supported: AMD vendor, a GFX11 GC version
+    /// (11.0.0 / 11.0.2 / 11.0.3 discrete, 11.0.1 Phoenix), MMHUB 3.0.0
+    /// (3.0.1 on BASE_IDX 1 for Phoenix), OSSSYS 6.0.0.
     /// # Safety
     /// Caller owns both hubs, HDP, VRAM and the matching permanent pool,
     /// with no active GPU queues/VMs, GFXOFF, hub gating, reset or PM transition.
@@ -857,7 +895,7 @@ impl Gmc {
         })
     }
     /// The die this owner was built for.
-    pub fn die(&self) -> Navi31Die {
+    pub fn die(&self) -> Gfx11Die {
         self.engine.layout.die
     }
     /// # Safety

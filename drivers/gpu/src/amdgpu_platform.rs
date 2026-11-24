@@ -783,6 +783,88 @@ async unsafe fn run_graphics(
         }
     }
 }
+/// Bring Phoenix's graphics engines up on the display path's pool, once its
+/// PSP session loaded the graphics set and the RLC autoload completed. A
+/// failure is reported and leaves the display as it is; the owner is returned
+/// either way, since an engine may still reach memory it published.
+/// `mes_start` is the MES program-counter entry points (sched + KIQ) from
+/// the loader; see `Loader::mes_start_addrs`.
+async fn graphics_boot_phoenix(
+    pool: &Pool,
+    mes_start: [u64; 2],
+) -> Option<crate::amdgpu_phoenix_boot::PhoenixColdBoot> {
+    use core::fmt::Write as _;
+    let authority = crate::amdgpu::pci_authority()?;
+    let device = crate::amdgpu::pci_device()?;
+    let boot = crate::amdgpu::with_controller(|gpu| {
+        // SAFETY: this display owner holds the whole GPU after the boot
+        // handoff: no other graphics owner exists, the pool is its free
+        // carve-out, and the PSP has loaded the graphics set. Construction
+        // performs no register I/O.
+        unsafe {
+            crate::amdgpu_phoenix_boot::PhoenixColdBoot::new(
+                gpu, authority, pool, &device, mes_start,
+            )
+        }
+    })?;
+    let mut boot = match boot {
+        Ok(boot) => boot,
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: phoenix graphics refused: {error:?}"
+            );
+            return None;
+        }
+    };
+    // SAFETY: as above, and the RLC autoload has completed.
+    unsafe { run_graphics_phoenix(&mut boot) }.await;
+    Some(boot)
+}
+/// Run `boot`'s stages and report them.
+///
+/// # Safety
+/// `PhoenixColdBoot::run`'s: the owner is new, this display owner holds the
+/// whole GPU, and the RLC autoload has completed.
+async unsafe fn run_graphics_phoenix(boot: &mut crate::amdgpu_phoenix_boot::PhoenixColdBoot) {
+    use core::fmt::Write as _;
+    // SAFETY: forwarded.
+    match unsafe { boot.run() }.await {
+        Ok(report) => {
+            // The rings stay unadvertised until a client submitter registers.
+            // No `amdgpu_info` publication yet: its boot struct is
+            // Navi22/gfx10-typed, and Phoenix's topology is its own struct.
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: phoenix graphics up: smu {:#x}, {} CUs, RB mask {:#x}, mes {:#x}/{:#x}",
+                report.smu.smu,
+                report.topology.active_cus,
+                report.topology.enabled_rb_mask,
+                report.mes.sched_version,
+                report.mes.kiq_version
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: phoenix graphics failed: {error:?}"
+            );
+        }
+    }
+}
+/// VCN and JPEG on a completed Phoenix graphics boot. There is no VCN 4.0
+/// owner yet, so this is a remainder no-op that says so; media is not one
+/// of the cold boot's sixteen stages.
+async fn media_boot_phoenix(graphics: &mut crate::amdgpu_phoenix_boot::PhoenixColdBoot) {
+    use core::fmt::Write as _;
+    if !graphics.queues_verified() {
+        return;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: phoenix media: no VCN 4.0 owner yet; graphics only"
+    );
+}
 /// VCN and JPEG on a completed Raphael graphics boot, through the PSP session
 /// that loaded them. Failure is reported and leaves graphics and display be.
 async fn media_boot(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot, loader: &mut Loader) {
@@ -830,9 +912,11 @@ pub(crate) enum RecoveryError {
     /// No display owner with a completed graphics boot to recover.
     Busy,
     Quiesce(crate::amdgpu_raphael_boot::Error),
+    QuiescePhoenix(crate::amdgpu_phoenix_boot::Error),
     Display(crate::amdgpu_dcn_display::Error),
     Psp(crate::amdgpu_dmub_boot::Error),
     Reset(crate::amdgpu_raphael_reset::Error),
+    ResetPhoenix(crate::amdgpu_phoenix_boot::Error),
     /// The PSP session came back without the graphics set loaded.
     NoGraphics,
     /// The rebuilt graphics owner did not complete its boot.
@@ -865,6 +949,9 @@ pub(crate) async fn recover() -> Result<(), RecoveryError> {
     let mut guard = DISPLAY.lock().await;
     let display = guard.as_mut().ok_or(RecoveryError::Busy)?;
     let device = crate::amdgpu::pci_device().ok_or(RecoveryError::Busy)?;
+    if display.graphics_phoenix.is_some() {
+        return recover_phoenix(display).await;
+    }
     if !display
         .graphics
         .as_ref()
@@ -1011,6 +1098,131 @@ async fn rebuild_graphics(
         narf_console::Writer,
         "amdgpu: raphael graphics {} ({} retired owners, {} MiB of the carve-out free)",
         if rearmed { "re-armed" } else { "rebuilt" },
+        retired.len(),
+        pool.available() >> 20
+    );
+    Ok(())
+}
+/// Phoenix's `amdgpu_device_gpu_recover` with a mode 2 reset, mirroring
+/// [`recover`] but rebuild-only: the Phoenix coordinator has no `rearm`
+/// (the rings' host write pointers live in contexts with no reset API), so
+/// the spent coordinator is always retired, quarantined, and a new one built.
+/// No client path exists yet (no submitter), so there is nothing to
+/// withdraw or re-register beyond the IH disable and fence abandonment.
+/// Unlike Raphael's reset, the Phoenix PMFW message needs no device.
+async fn recover_phoenix(display: &mut Display) -> Result<(), RecoveryError> {
+    use core::fmt::Write as _;
+    if !display
+        .graphics_phoenix
+        .as_ref()
+        .is_some_and(crate::amdgpu_phoenix_boot::PhoenixColdBoot::queues_verified)
+    {
+        return Err(RecoveryError::Busy);
+    }
+    let _ = writeln!(narf_console::Writer, "amdgpu: phoenix MODE2 reset");
+    // 1. Quiesce.
+    crate::amdgpu_navi22_tdr::stop();
+    let Display {
+        loader,
+        pool,
+        stream,
+        graphics_phoenix,
+        retired_phoenix,
+        ..
+    } = display;
+    let old = graphics_phoenix.as_mut().ok_or(RecoveryError::Busy)?;
+    // amdgpu_device_ip_suspend's UNGATE: GFX powered for what follows.
+    if let Err(error) = old.ungate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: phoenix GFX ungate {error:?}");
+    }
+    // SAFETY: no client path exists yet; `old` is retired below.
+    old.quiesce_for_reset()
+        .await
+        .map_err(RecoveryError::QuiescePhoenix)?;
+    crate::amdgpu_fence_navi22::abandon_all();
+    if let Some(running) = stream.as_mut() {
+        running
+            .pipeline
+            .disable(loader)
+            .await
+            .map_err(RecoveryError::Display)?;
+    }
+    // 2-3. psp_suspend, then the reset of everything that ran from the TMR.
+    // SAFETY: the mode 2 reset follows at once, and the loader boots again
+    // before the display or graphics are used.
+    unsafe { loader.stop_for_reset() }
+        .await
+        .map_err(RecoveryError::Psp)?;
+    // SAFETY: quiesced above, TMR released; everything is rebuilt below.
+    // The scratch3 save/restore + memsize wrapper is a flagged remainder
+    // (needs the Phoenix NBIO 7.4 banks).
+    old.mode2_reset()
+        .await
+        .map_err(RecoveryError::ResetPhoenix)?;
+    // 4. Re-initialization.
+    loader
+        .boot(Default::default())
+        .await
+        .map_err(RecoveryError::Psp)?;
+    loader
+        .enable_notifications()
+        .await
+        .map_err(RecoveryError::Psp)?;
+    // Contexts from before the reset see it (amdgpu_ctx::recoveries).
+    rebuild_graphics_phoenix(loader, pool, graphics_phoenix, retired_phoenix).await?;
+    // 5. The stream, as `resume` puts it back.
+    if let Some(running) = stream.as_mut() {
+        running
+            .pipeline
+            .start()
+            .await
+            .map_err(RecoveryError::Display)?;
+        running
+            .pipeline
+            .enable(
+                loader,
+                &running.scanout,
+                &running.timing,
+                &running.platform,
+                running.depth,
+                running.caps,
+            )
+            .await
+            .map_err(RecoveryError::Display)?;
+    }
+    Ok(())
+}
+/// After the PSP session loaded the graphics set again: build a new Phoenix
+/// coordinator (rebuild-only, no re-arm), then media and client registration.
+/// The spent coordinator is retired, quarantined, and a new one built.
+async fn rebuild_graphics_phoenix(
+    loader: &mut Loader,
+    pool: &Pool,
+    graphics: &mut Option<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
+    retired: &mut Vec<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
+) -> Result<(), RecoveryError> {
+    use core::fmt::Write as _;
+    if !loader.graphics_booted() {
+        return Err(RecoveryError::NoGraphics);
+    }
+    let Some(mes_start) = loader.mes_start_addrs() else {
+        return Err(RecoveryError::NoGraphics);
+    };
+    if let Some(old) = graphics.take() {
+        retired.push(old);
+    }
+    *graphics = alloc::boxed::Box::pin(graphics_boot_phoenix(pool, mes_start)).await;
+    let new = graphics
+        .as_mut()
+        .filter(|g| g.queues_verified())
+        .ok_or(RecoveryError::Graphics)?;
+    alloc::boxed::Box::pin(media_boot_phoenix(new)).await;
+    RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    serve_clients_phoenix(new);
+    gate_graphics_phoenix(new).await;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: phoenix graphics rebuilt ({} retired owners, {} MiB of the carve-out free)",
         retired.len(),
         pool.available() >> 20
     );
@@ -1510,6 +1722,19 @@ async fn gate_graphics(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
         let _ = writeln!(narf_console::Writer, "amdgpu: raphael GFX gate {error:?}");
     }
 }
+/// `amdgpu_device_ip_late_init`'s `set_pg_state(GATE)` for Phoenix GFX,
+/// once clients are served: power gating on and GFXOFF allowed after its
+/// delay. There is no clock-gating owner yet, so the clocks stay ungated.
+/// Failure is reported; graphics stays up with GFX powered.
+async fn gate_graphics_phoenix(graphics: &mut crate::amdgpu_phoenix_boot::PhoenixColdBoot) {
+    use core::fmt::Write as _;
+    if !graphics.queues_verified() {
+        return;
+    }
+    if let Err(error) = graphics.gate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: phoenix GFX gate {error:?}");
+    }
+}
 /// `gfx_off_delay_work`: deliver `allow` [`DELAY_MS`] from now to the
 /// coordinator that scheduled it. A disable request in between, or a newer
 /// coordinator lifetime, makes it a no-op.
@@ -1548,6 +1773,42 @@ fn serve_clients(graphics: &mut crate::amdgpu_raphael_boot::ColdBoot) {
         alloc::sync::Arc::new(GraphicsSystemPm),
     );
 }
+/// Publish a completed Phoenix graphics boot to clients: there is no client
+/// submitter yet (the RDNA3 submitter lane owns it), so nothing is
+/// registered and `ACCEL` is not set — the rings stay unadvertised until a
+/// submitter registers. No `GraphicsSystemPm` is registered either: no S3 /
+/// s0ix path exists for Phoenix yet.
+fn serve_clients_phoenix(graphics: &mut crate::amdgpu_phoenix_boot::PhoenixColdBoot) {
+    use core::fmt::Write as _;
+    if !graphics.queues_verified() {
+        return;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: phoenix graphics up but no client submitter yet; ACCEL not set"
+    );
+}
+/// `gfx_off_delay_work` for a Phoenix coordinator: deliver `allow`
+/// [`DELAY_MS`] from now. A disable request in between, or a newer
+/// coordinator lifetime, makes it a no-op.
+///
+/// [`DELAY_MS`]: crate::amdgpu_raphael_gfxoff::DELAY_MS
+pub(crate) fn schedule_gfx_off_phoenix(allow: crate::amdgpu_raphael_gfxoff::Allow) {
+    narf_scheduler::spawn(async move {
+        use core::fmt::Write as _;
+        let delay = crate::amdgpu_raphael_gfxoff::DELAY_MS;
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(delay).as_instant()).await;
+        let mut owner = graphics_owner().await;
+        if let Some(boot) = owner.get_phoenix() {
+            if let Err(error) = boot.delayed_gfx_off(allow).await {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: phoenix GFXOFF allow {error:?}"
+                );
+            }
+        }
+    });
+}
 /// On an APU with a graphics ColdBoot (Raphael, Rembrandt), hand the loader
 /// the graphics set so its PSP session loads every non-PSP firmware in Linux's
 /// order (`psp_load_non_psp_fw`) and starts the RLC autoload, instead of DMCUB
@@ -1560,13 +1821,26 @@ fn graphics(
     loader: &mut Loader,
 ) {
     use core::fmt::Write as _;
-    if crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did).is_none() {
+    let is_phoenix = crate::amdgpu::family_for_pci_id(gpu.chip.vid, gpu.chip.did)
+        == Some(crate::amdgpu::Family::Phoenix);
+    if !is_phoenix && crate::amdgpu_rdna2::apu_for_pci_id(gpu.chip.vid, gpu.chip.did).is_none() {
         return;
     }
     if !crate::amdgpu_rdna2::options::BootOptions::parse(narf_boot::args().raw()).accel {
         let _ = writeln!(
             narf_console::Writer,
             "amdgpu: graphics firmware not loaded (amdgpu.rdna2_accel=0)"
+        );
+        return;
+    }
+    if is_phoenix {
+        // No Phoenix firmware-set opener exists yet (`Firmware::open_phoenix`
+        // + the Phoenix `Loader::set_graphics` arm are the firmware lane's),
+        // so the Phoenix graphics path is wired but unreachable: the display
+        // stays display-only until that lane lands.
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: phoenix graphics firmware not loaded (no Firmware::open_phoenix yet); display only"
         );
         return;
     }
@@ -1769,6 +2043,13 @@ struct Display {
     /// the memory they published stays quarantined (Navi22's policy: each
     /// recovery leaks its old owners' carve-out).
     retired: Vec<crate::amdgpu_raphael_boot::ColdBoot>,
+    /// Phoenix's graphics engines, same retention policy as Raphael's.
+    /// Unreachable until the firmware lane lands `Firmware::open_phoenix`
+    /// + the Phoenix `set_graphics` arm: no Phoenix set can be loaded
+    /// today, so `start()` never fills this in.
+    graphics_phoenix: Option<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
+    /// Phoenix owners a mode 2 recovery replaced; same quarantine policy.
+    retired_phoenix: Vec<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
     /// Where a system transition left the graphics (`GraphicsPm`).
     graphics_pm: GraphicsPm,
     /// The client buffers a hibernation moved out of the carve-out, with
@@ -1785,6 +2066,11 @@ pub(crate) struct Graphics(narf_lib::mutex::MutexGuard<'static, Option<Display>>
 impl Graphics {
     pub(crate) fn get(&mut self) -> Option<&mut crate::amdgpu_raphael_boot::ColdBoot> {
         self.0.as_mut()?.graphics.as_mut()
+    }
+    pub(crate) fn get_phoenix(
+        &mut self,
+    ) -> Option<&mut crate::amdgpu_phoenix_boot::PhoenixColdBoot> {
+        self.0.as_mut()?.graphics_phoenix.as_mut()
     }
     /// The coordinator with the PSP session that loaded its VCN.
     pub(crate) fn media(
@@ -1841,6 +2127,8 @@ pub(crate) fn start() -> bool {
         attempted: false,
         graphics: None,
         retired: Vec::new(),
+        graphics_phoenix: None,
+        retired_phoenix: Vec::new(),
         graphics_pm: GraphicsPm::Running,
         evicted: Vec::new(),
     });
@@ -1868,13 +2156,40 @@ pub(crate) fn start() -> bool {
             if display.loader.graphics_booted() {
                 // Boxed: these futures hold the whole bring-up, which inline
                 // would make this task's own frame and future too large.
-                let firmware = display.loader.graphics_versions();
-                display.graphics =
-                    alloc::boxed::Box::pin(graphics_boot(&display.pool, firmware)).await;
-                if let Some(graphics) = display.graphics.as_mut() {
-                    alloc::boxed::Box::pin(media_boot(graphics, &mut display.loader)).await;
-                    serve_clients(graphics);
-                    gate_graphics(graphics).await;
+                let is_phoenix = crate::amdgpu::pci_device().is_some_and(|d| {
+                    crate::amdgpu::family_for_pci_id(d.id.vendor, d.id.device)
+                        == Some(crate::amdgpu::Family::Phoenix)
+                });
+                if is_phoenix {
+                    match display.loader.mes_start_addrs() {
+                        Some(mes_start) => {
+                            display.graphics_phoenix = alloc::boxed::Box::pin(
+                                graphics_boot_phoenix(&display.pool, mes_start),
+                            )
+                            .await;
+                            if let Some(graphics) = display.graphics_phoenix.as_mut() {
+                                alloc::boxed::Box::pin(media_boot_phoenix(graphics)).await;
+                                serve_clients_phoenix(graphics);
+                                gate_graphics_phoenix(graphics).await;
+                            }
+                        }
+                        None => {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "amdgpu: phoenix graphics skipped: no MES entry points (firmware lane)"
+                            );
+                        }
+                    }
+                } else {
+                    let firmware = display.loader.graphics_versions();
+                    display.graphics =
+                        alloc::boxed::Box::pin(graphics_boot(&display.pool, firmware)).await;
+                    if let Some(graphics) = display.graphics.as_mut() {
+                        alloc::boxed::Box::pin(media_boot(graphics, &mut display.loader)).await;
+                        serve_clients(graphics);
+                        gate_graphics(graphics).await;
+                    }
                 }
             }
         }
