@@ -57,6 +57,21 @@ const GRDOM_FULL: u32 = 1;
 /// `GEN6_GRDOM_RENDER` / `GEN11_GRDOM_RENDER`.
 const GRDOM_RENDER: u32 = 1 << 1;
 
+/// The `GDRST` domain resetting `which` alone (`gen6_hw_engine_mask`,
+/// `gen11_hw_engine_mask`). Gen11 video and enhancement engines take none:
+/// their reset must first lock the SFC they may share (`gen11_lock_sfc`),
+/// which this owner does not model, so they reset with the whole GT.
+pub(crate) const fn engine_reset_domain(gt: LegacyGt, which: HwEngine) -> Option<u32> {
+    match (gt, which) {
+        (_, HwEngine::Rcs0) => Some(GRDOM_RENDER),
+        (LegacyGt::Gen9, HwEngine::Bcs0) => Some(1 << 3),
+        (LegacyGt::Gen9, HwEngine::Vcs0) => Some(1 << 2),
+        (LegacyGt::Gen9, HwEngine::Vecs0) => Some(1 << 4),
+        (LegacyGt::Gen11, HwEngine::Bcs0) => Some(1 << 2),
+        _ => None,
+    }
+}
+
 const fn masked_enable(bits: u32) -> u32 {
     bits << 16 | bits
 }
@@ -93,52 +108,54 @@ enum ResetPhase {
 pub(crate) struct Reset {
     phase: ResetPhase,
     deadline: u64,
-    /// The `GDRST` domain pulsed: the full GT, or RCS0 alone.
+    /// The engine whose CS is stopped and whose reset handshake is asked.
+    base: u64,
+    /// The `GDRST` domain pulsed: the full GT, or one engine.
     domain: u32,
 }
 
 impl Reset {
     pub(crate) const fn new() -> Self {
-        Self {
-            phase: ResetPhase::Start,
-            deadline: 0,
-            domain: GRDOM_FULL,
-        }
+        Self::engine(RCS, GRDOM_FULL)
     }
 
-    /// `intel_engine_reset` of RCS0 (`gen6_reset_engines` with the render
-    /// domain): the same stop and handshake, then only `GRDOM_RENDER`.
-    pub(crate) const fn render() -> Self {
+    /// `intel_engine_reset` of the engine at `base`: stop its CS, ask its
+    /// reset handshake, pulse its `GDRST` `domain` ([`engine_reset_domain`]).
+    pub(crate) const fn engine(base: u64, domain: u32) -> Self {
         Self {
             phase: ResetPhase::Start,
             deadline: 0,
-            domain: GRDOM_RENDER,
+            base,
+            domain,
         }
     }
 
     pub(crate) fn poll(&mut self, mmio: &impl MmioWindow, now: u64) -> Poll<Result<(), InitError>> {
         match self.phase {
             ResetPhase::Start => {
-                if mmio.read32(MI_MODE) == u32::MAX {
+                if mmio.read32(self.base + (MI_MODE - RCS)) == u32::MAX {
                     return Poll::Ready(Err(InitError::Unavailable));
                 }
-                mmio.write32(MI_MODE, masked_enable(STOP_RING));
+                mmio.write32(self.base + (MI_MODE - RCS), masked_enable(STOP_RING));
                 self.phase = ResetPhase::Stopping;
                 self.deadline = now + 1_000_000;
                 Poll::Pending
             }
             ResetPhase::Stopping => {
                 // A CS that will not idle is reset anyway, as Linux does.
-                if mmio.read32(MI_MODE) & MODE_IDLE == 0 && now < self.deadline {
+                if mmio.read32(self.base + (MI_MODE - RCS)) & MODE_IDLE == 0 && now < self.deadline
+                {
                     return Poll::Pending;
                 }
-                mmio.write32(RESET_CTL, masked_enable(REQUEST_RESET));
+                mmio.write32(self.base + (RESET_CTL - RCS), masked_enable(REQUEST_RESET));
                 self.phase = ResetPhase::Preparing;
                 self.deadline = now + 700_000;
                 Poll::Pending
             }
             ResetPhase::Preparing => {
-                if mmio.read32(RESET_CTL) & READY_TO_RESET == 0 && now < self.deadline {
+                if mmio.read32(self.base + (RESET_CTL - RCS)) & READY_TO_RESET == 0
+                    && now < self.deadline
+                {
                     return Poll::Pending;
                 }
                 mmio.write32(GDRST, self.domain);
@@ -155,10 +172,10 @@ impl Reset {
                     if now < self.deadline {
                         return Poll::Pending;
                     }
-                    mmio.write32(RESET_CTL, masked_disable(REQUEST_RESET));
+                    mmio.write32(self.base + (RESET_CTL - RCS), masked_disable(REQUEST_RESET));
                     return Poll::Ready(Err(InitError::ResetTimeout));
                 }
-                mmio.write32(RESET_CTL, masked_disable(REQUEST_RESET));
+                mmio.write32(self.base + (RESET_CTL - RCS), masked_disable(REQUEST_RESET));
                 Poll::Ready(Ok(()))
             }
         }
@@ -915,14 +932,13 @@ impl Owner {
                         log(self.index, "completion lost; resetting the GT");
                         true
                     }
-                    Service::Hung(engine) if engine != HwEngine::Rcs0 => {
-                        log(self.index, "copy/media job hung; resetting the GT");
-                        true
-                    }
-                    Service::Hung(_) => match self.reset_engine().await {
+                    Service::Hung(engine) => match self.reset_engine(engine).await {
                         Ok(()) => false,
                         Err(_) => {
-                            log(self.index, "RCS0 reset failed; resetting the GT");
+                            log(
+                                self.index,
+                                "engine reset unavailable or failed; resetting the GT",
+                            );
                             true
                         }
                     },
@@ -936,34 +952,61 @@ impl Owner {
         }
     }
 
-    /// `intel_engine_reset` for a hung job: stop and reset RCS0 alone,
-    /// restore its engine state, fail and ban only the hung context and put
-    /// every other request back on the engine (`__intel_engine_reset_bh`).
-    /// The other jobs get a fresh deadline. An error leaves the full GT
-    /// reset to the caller.
-    async fn reset_engine(&self) -> Result<(), InitError> {
+    /// `intel_engine_reset` for a hung job on `which`: stop and reset that
+    /// engine alone, restore its engine state, fail and ban only the hung
+    /// context and put every other request back on it
+    /// (`__intel_engine_reset_bh`). Every surviving job gets a fresh
+    /// deadline. An error, or an engine with no reset domain of its own,
+    /// leaves the full GT reset to the caller.
+    async fn reset_engine(&self, which: HwEngine) -> Result<(), InitError> {
         let mut state = self.state.lock().await;
         let runtime = state.as_mut().ok_or(InitError::Unavailable)?;
+        let domain = engine_reset_domain(runtime.gt, which).ok_or(InitError::Unavailable)?;
+        let lane = if which == HwEngine::Rcs0 {
+            None
+        } else {
+            Some(
+                runtime
+                    .xcs
+                    .iter()
+                    .position(|lane| lane.which == which)
+                    .ok_or(InitError::Unavailable)?,
+            )
+        };
+        let base = lane.map_or(RCS, |i| runtime.xcs[i].engine.spec().base);
         runtime.unpark().map_err(|_| InitError::Forcewake)?;
-        let mut reset = Reset::render();
+        let mut reset = Reset::engine(base, domain);
         loop {
             match reset.poll(&runtime.window, narf_time::monotonic_ns()) {
                 Poll::Pending => sleep_us(20).await,
                 Poll::Ready(result) => break result?,
             }
         }
-        let mut report = Programmed::default();
-        resume_rcs(&runtime.window, self.wa, runtime.steering, &mut report);
-        // SAFETY: the render-domain reset above completed, so RCS0 no longer
-        // reads or writes any of its batch, ring or context memory.
-        let (guilty, failed) =
-            unsafe { runtime.engine.reset_rewind() }.map_err(InitError::Engine)?;
+        let (engine, contexts) = match lane {
+            None => {
+                let mut report = Programmed::default();
+                resume_rcs(&runtime.window, self.wa, runtime.steering, &mut report);
+                (&mut runtime.engine, &mut runtime.contexts)
+            }
+            Some(i) => {
+                resume_xcs(&runtime.window, runtime.gt, which, base);
+                let lane = &mut runtime.xcs[i];
+                (&mut lane.engine, &mut lane.contexts)
+            }
+        };
+        // SAFETY: the engine-domain reset above completed, so this engine no
+        // longer reads or writes any of its batch, ring or context memory.
+        let (guilty, failed) = unsafe { engine.reset_rewind() }.map_err(InitError::Engine)?;
+        if let Some(guilty) = guilty {
+            contexts
+                .retain(|context| context.id != guilty || engine.destroy_context(guilty).is_err());
+        }
         let now = narf_time::monotonic_ns();
         for request in failed {
             if let Some(i) = runtime
                 .jobs
                 .iter()
-                .position(|j| j.which == HwEngine::Rcs0 && j.request == request)
+                .position(|j| j.which == which && j.request == request)
             {
                 runtime.jobs.swap_remove(i).job.finish_hung();
             }
@@ -971,13 +1014,7 @@ impl Owner {
         for job in &mut runtime.jobs {
             job.deadline = now.saturating_add(JOB_TIMEOUT_NS);
         }
-        if let Some(guilty) = guilty {
-            let engine = &mut runtime.engine;
-            runtime
-                .contexts
-                .retain(|context| context.id != guilty || engine.destroy_context(guilty).is_err());
-        }
-        log(self.index, "RCS0 reset; the hung context is banned");
+        log(self.index, "engine reset; the hung context is banned");
         Ok(())
     }
 
@@ -1404,5 +1441,52 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_legacy_owner",
         smoke_legacy_owner_copy_and_media_engines
+    );
+
+    /// Per-engine reset domains (`gen6_hw_engine_mask`,
+    /// `gen11_hw_engine_mask`), and an engine reset that stops and
+    /// handshakes the hung engine's own CS before pulsing only its domain.
+    fn smoke_legacy_owner_engine_reset_domains() -> TestResult {
+        let expect = [
+            (LegacyGt::Gen9, HwEngine::Rcs0, Some(1 << 1)),
+            (LegacyGt::Gen9, HwEngine::Bcs0, Some(1 << 3)),
+            (LegacyGt::Gen9, HwEngine::Vcs0, Some(1 << 2)),
+            (LegacyGt::Gen9, HwEngine::Vecs0, Some(1 << 4)),
+            (LegacyGt::Gen11, HwEngine::Rcs0, Some(1 << 1)),
+            (LegacyGt::Gen11, HwEngine::Bcs0, Some(1 << 2)),
+            (LegacyGt::Gen11, HwEngine::Vcs0, None),
+            (LegacyGt::Gen11, HwEngine::Vecs0, None),
+        ];
+        if expect
+            .iter()
+            .any(|&(gt, which, domain)| engine_reset_domain(gt, which) != domain)
+        {
+            return TestResult::Fail("engine reset domains follow Linux's masks");
+        }
+        let regs = Regs::default();
+        let mut reset = Reset::engine(0x22000, 1 << 3);
+        let mut now = 0;
+        let done = loop {
+            if let Poll::Ready(result) = reset.poll(&regs, now) {
+                break result;
+            }
+            // The domain bit self-clears once the engine reset completes.
+            regs.values.borrow_mut().insert(GDRST, 0);
+            now += 1000;
+        };
+        let writes = regs.writes.borrow();
+        if done != Ok(())
+            || writes.first() != Some(&(0x2209c, masked_enable(STOP_RING)))
+            || !writes.contains(&(0x220d0, masked_enable(REQUEST_RESET)))
+            || !writes.contains(&(GDRST, 1 << 3))
+            || writes.iter().any(|&(r, _)| r == MI_MODE || r == RESET_CTL)
+        {
+            return TestResult::Fail("BCS0 reset uses BCS0's CS and only the blitter domain");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_owner",
+        smoke_legacy_owner_engine_reset_domains
     );
 }
