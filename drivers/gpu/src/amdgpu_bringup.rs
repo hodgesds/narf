@@ -158,6 +158,135 @@ pub const CP_RESUME_ASYNC: &[BringupStep] = &[
     ),
 ];
 
+/// `gfx_v11_0_cp_resume` on a PSP-loading, RS64, MES-KIQ Navi31 part —
+/// the async plan above with the Navi31 differences made explicit.
+///
+/// Two steps the Phoenix plan does not have:
+///
+/// * `rlc_start` first: the gfx IP block's `.start` hook
+///   (`amdgpu_cp_rdna3::build_rlc_start`). `gfx_v11_0_hw_init` resumes
+///   the RLC before the CP, and the CP/MES sequences below depend on the
+///   RLC running (the KIQ setting tells the RLC which queue is the KIQ).
+/// * `kiq_enable_queue` + `kiq_ring_test`: `mes_v11_0_kiq_enable_queue` —
+///   the MAP_QUEUES packet that binds the scheduler ring onto the KIQ
+///   ring, then the KIQ ring test. Linux nests both inside
+///   `mes_v11_0_queue_init(SCHED_PIPE)`, after the scheduler MQD is
+///   written; they are listed separately here so the first hardware
+///   proof point is enumerable, and the ordering test pins them between
+///   the scheduler pipe init and `SET_HW_RSRC`.
+///
+/// The KIQ ring test uses the WRITE_DATA packet
+/// (`amdgpu_cp_rdna3::build_kiq_ring_test_packet`), not the
+/// SET_UCONFIG_REG packet the gfx/compute ring tests use: the KIQ ring
+/// is tested through `gfx_v11_0_ring_emit_wreg`.
+pub const CP_RESUME_NAVI31: &[BringupStep] = &[
+    step(
+        "rlc_start",
+        "gfx_v11_0_rlc_start",
+        Implemented::By("amdgpu_cp_rdna3::build_rlc_start"),
+    ),
+    step(
+        "doorbell_range",
+        "gfx_v11_0_cp_set_doorbell_range",
+        Implemented::By("amdgpu_gfx::build_cp_set_doorbell_range"),
+    ),
+    step(
+        "compute_enable",
+        "gfx_v11_0_cp_compute_enable",
+        Implemented::By("amdgpu_gfx::cp_compute_enable_value"),
+    ),
+    step(
+        "gfx_enable",
+        "gfx_v11_0_cp_gfx_enable",
+        Implemented::By("amdgpu_cp_fw::cp_enable"),
+    ),
+    // ── amdgpu_mes_kiq_hw_init -> mes_v11_0_kiq_hw_init ──
+    step(
+        "mes_enable",
+        "mes_v11_0_enable",
+        Implemented::By("amdgpu_mes_hw::build_mes_enable"),
+    ),
+    step(
+        "mes_fw_version",
+        "mes_v11_0_get_fw_version",
+        Implemented::By("AmdGpu::read_mes_fw_versions"),
+    ),
+    step(
+        "kiq_setting",
+        "mes_v11_0_kiq_setting",
+        Implemented::By("amdgpu_cp_rdna3::kiq_rlc_schedulers_value"),
+    ),
+    step(
+        "kiq_pipe_mqd",
+        "mes_v11_0_queue_init(KIQ_PIPE)",
+        Implemented::By("MesQueue::write_mqd + queue_init_sequence"),
+    ),
+    // ── mes_v11_0_hw_init ──
+    step(
+        "sched_pipe_mqd",
+        "mes_v11_0_queue_init(SCHED_PIPE)",
+        Implemented::By("MesQueue::write_mqd + queue_init_sequence"),
+    ),
+    step(
+        "kiq_enable_queue",
+        "mes_v11_0_kiq_enable_queue",
+        Implemented::By("amdgpu_compute::build_map_queue"),
+    ),
+    step(
+        "kiq_ring_test",
+        "amdgpu_ring_test_helper(kiq_ring)",
+        Implemented::By("amdgpu_cp_rdna3::build_kiq_ring_test_packet"),
+    ),
+    step(
+        "set_hw_resources",
+        "mes_v11_0_set_hw_resources",
+        Implemented::By("MesQueue::hw_resources + build_set_hw_resources"),
+    ),
+    step(
+        "query_sched_status",
+        "mes_v11_0_query_sched_status",
+        Implemented::By("amdgpu_mes::build_query_mes_status"),
+    ),
+    // ── gfx_v11_0_kcq_resume ──
+    step(
+        "kcq_mqd",
+        "gfx_v11_0_kcq_init_queue",
+        Implemented::By("ComputeContext::write_mqd"),
+    ),
+    step(
+        "kcq_map",
+        "amdgpu_gfx_enable_kcq",
+        Implemented::By("ComputeContext::map_legacy_args + MesQueue::map_legacy_queue"),
+    ),
+    // ── gfx_v11_0_cp_async_gfx_ring_resume ──
+    step(
+        "kgq_mqd",
+        "gfx_v11_0_kgq_init_queue",
+        Implemented::By("GfxContext::write_mqd"),
+    ),
+    step(
+        "kgq_map",
+        "amdgpu_gfx_enable_kgq",
+        Implemented::By("GfxContext::map_legacy_args + MesQueue::map_legacy_queue"),
+    ),
+    step(
+        "clear_state",
+        "gfx_v11_0_cp_gfx_start",
+        Implemented::By("amdgpu_clearstate::build_preamble"),
+    ),
+    // ── the ring tests cp_resume ends with ──
+    step(
+        "gfx_ring_test",
+        "amdgpu_ring_test_helper(gfx_ring)",
+        Implemented::By("amdgpu_gfx::build_ring_test_packet"),
+    ),
+    step(
+        "compute_ring_test",
+        "amdgpu_ring_test_helper(compute_ring)",
+        Implemented::By("amdgpu_gfx::build_ring_test_packet"),
+    ),
+];
+
 /// Index of `name` in `plan`, or `None`.
 pub fn position(plan: &[BringupStep], name: &str) -> Option<usize> {
     plan.iter().position(|s| s.name == name)
@@ -316,4 +445,136 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/amdgpu/bringup", smoke_bringup_declared_gaps);
+
+    /// The Navi31 plan's ordering constraints: the RLC starts first, the
+    /// MES-KIQ proof points sit between the scheduler pipe init and
+    /// `SET_HW_RSRC`, and every step has an implementation.
+    fn smoke_navi31_bringup_order_invariants() -> TestResult {
+        let plan = CP_RESUME_NAVI31;
+        let at = |n: &str| position(plan, n);
+
+        for s in plan {
+            if at(s.name).is_none() {
+                return TestResult::Fail("a Navi31 step's name does not resolve");
+            }
+        }
+        for (i, s) in plan.iter().enumerate() {
+            if plan.iter().skip(i + 1).any(|o| o.name == s.name) {
+                return TestResult::Fail("two Navi31 steps share a name");
+            }
+        }
+        if missing(plan).next().is_some() {
+            return TestResult::Fail("a Navi31 step has no implementation");
+        }
+
+        let (
+            Some(rlc),
+            Some(doorbell),
+            Some(compute_en),
+            Some(gfx_en),
+            Some(mes_en),
+            Some(kiq_set),
+            Some(kiq_mqd),
+            Some(sched_mqd),
+            Some(kiq_en),
+            Some(kiq_test),
+            Some(hw_rsrc),
+            Some(query),
+            Some(kcq_mqd),
+            Some(kcq_map),
+            Some(kgq_mqd),
+            Some(kgq_map),
+            Some(clear),
+            Some(gfx_test),
+            Some(compute_test),
+        ) = (
+            at("rlc_start"),
+            at("doorbell_range"),
+            at("compute_enable"),
+            at("gfx_enable"),
+            at("mes_enable"),
+            at("kiq_setting"),
+            at("kiq_pipe_mqd"),
+            at("sched_pipe_mqd"),
+            at("kiq_enable_queue"),
+            at("kiq_ring_test"),
+            at("set_hw_resources"),
+            at("query_sched_status"),
+            at("kcq_mqd"),
+            at("kcq_map"),
+            at("kgq_mqd"),
+            at("kgq_map"),
+            at("clear_state"),
+            at("gfx_ring_test"),
+            at("compute_ring_test"),
+        )
+        else {
+            return TestResult::Fail("a required Navi31 step is missing from the plan");
+        };
+
+        // The RLC is the first thing that starts: everything after it
+        // depends on the RLC running.
+        if rlc != 0 {
+            return TestResult::Fail("the RLC start is the first Navi31 step");
+        }
+        if doorbell > compute_en || doorbell > gfx_en {
+            return TestResult::Fail("the doorbell ranges are set before the engines start");
+        }
+        // The MES is executing before anything is asked of it.
+        if mes_en > kiq_set || mes_en > kiq_mqd || mes_en > hw_rsrc {
+            return TestResult::Fail("the MES must be enabled before any packet");
+        }
+        // The KIQ pipe is brought up in `mes_v11_0_kiq_hw_init` and the
+        // scheduler pipe in `mes_v11_0_hw_init`, which it calls afterwards.
+        if kiq_mqd > sched_mqd {
+            return TestResult::Fail("the KIQ pipe is initialised before the scheduler pipe");
+        }
+        // The scheduler ring is MAP_QUEUES-bound onto the KIQ ring only
+        // after its own descriptor is written, and the KIQ ring test runs
+        // on the bound ring — both before the scheduler is told what
+        // hardware it has.
+        if sched_mqd > kiq_en || kiq_en > kiq_test || kiq_test > hw_rsrc {
+            return TestResult::Fail("the KIQ enable-queue proof precedes SET_HW_RSRC");
+        }
+        // `SET_HW_RSRC` tells the scheduler which pipes and VMIDs exist. An
+        // ADD_QUEUE before it names resources the scheduler does not know
+        // about.
+        if hw_rsrc > kcq_map || hw_rsrc > kgq_map {
+            return TestResult::Fail("SET_HW_RSRC must precede any queue mapping");
+        }
+        // And the scheduler is confirmed alive before the driver trusts it
+        // with a queue.
+        if query > kcq_map || query > kgq_map {
+            return TestResult::Fail("the scheduler is queried before queues are mapped");
+        }
+        // A descriptor is written before the queue it describes is mapped.
+        if kcq_mqd > kcq_map {
+            return TestResult::Fail("the compute descriptor precedes its mapping");
+        }
+        if kgq_mqd > kgq_map {
+            return TestResult::Fail("the graphics descriptor precedes its mapping");
+        }
+        // The clear-state preamble goes onto a ring the engine is already
+        // reading, so it follows the map.
+        if kgq_map > clear {
+            return TestResult::Fail("the clear-state preamble follows the queue mapping");
+        }
+        // And the ring tests are last: they are the evidence, so everything
+        // they are evidence of comes first.
+        if clear > gfx_test {
+            return TestResult::Fail("the ring tests come after the preamble");
+        }
+        if gfx_test != plan.len() - 2 || compute_test != plan.len() - 1 {
+            return TestResult::Fail("the two ring tests end the Navi31 plan");
+        }
+        // kcq_resume runs before the graphics ring comes up.
+        if kcq_map > kgq_mqd {
+            return TestResult::Fail("kcq_resume precedes cp_async_gfx_ring_resume");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/bringup",
+        smoke_navi31_bringup_order_invariants
+    );
 }

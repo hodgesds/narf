@@ -179,6 +179,8 @@ pub(crate) mod out_of_line;
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_cp as amdgpu_cp_navi22;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_cp_rdna3;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_cs;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_ctx;
