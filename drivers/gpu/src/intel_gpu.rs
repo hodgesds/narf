@@ -716,6 +716,32 @@ fn display_fetchers_stopped(io: &(impl crate::intel_gpu_aux::MmioWindow + ?Sized
     display_fetchers_stopped_values(pipeconf)
 }
 
+/// Every enabled universal plane and cursor of a Gen9/Gen11 display fetches
+/// from GGTT below the GT arena, with room left for a 64 MiB surface, so the
+/// execlists owner's arena cannot alias a live firmware scanout. Up to seven
+/// planes per pipe (Ice Lake); absent ones read as disabled.
+fn legacy_planes_below_arena(io: &(impl crate::intel_gpu_aux::MmioWindow + ?Sized)) -> bool {
+    use crate::intel_gpu_pipes::{
+        Pipe, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
+    };
+    if !io.display_access_ok() {
+        return false;
+    }
+    let limit = crate::intel_gpu_rcs::GGTT_ARENA_BASE - (64 << 20);
+    [Pipe::A, Pipe::B, Pipe::C].into_iter().all(|pipe| {
+        let base = pipe.base();
+        let planes = (0..7).all(|id| {
+            let plane = base + PLANE_PRIMARY_OFFSET + id * 0x100;
+            let ctl = io.read32(plane + PLANE_CTL_OFFSET);
+            ctl != u32::MAX
+                && (ctl & PLANE_CTL_ENABLE == 0
+                    || io.read32(plane + PLANE_SURF_OFFSET) & !0xfff < limit)
+        });
+        // CURCNTR's MCURSOR_MODE_MASK, then CURBASE.
+        planes && (io.read32(base + 0x80) & 0x27 == 0 || io.read32(base + 0x84) & !0xfff < limit)
+    })
+}
+
 const fn display_fetchers_stopped_values(pipeconf: [u32; 4]) -> bool {
     use crate::intel_gpu_pipes::{PIPECONF_ENABLE, PIPECONF_STATE};
     let busy = PIPECONF_ENABLE | PIPECONF_STATE;
@@ -1300,6 +1326,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             fb,
         )
     });
+    // The Gen9/Gen11 execlists owner touches only GT registers and its GGTT
+    // arena from 256 MiB, and its full-domain GT reset leaves the display
+    // alone. It coexists with a lit firmware display whose planes all fetch
+    // below the arena.
+    let execlists_gt = platform
+        .and_then(crate::intel_gpu_legacy_gt::LegacyGt::for_platform)
+        .is_some()
+        && legacy_planes_below_arena(&dev.mode_window());
     let stopped_display_gt = scanout_mode.is_none()
         && platform.is_some_and(|platform| {
             (platform.is_gen12()
@@ -1430,7 +1464,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::intel_gpu_gt_runtime::install_ptl_display(
             card_index, gt_card, device, cap, gt_bar, panel_mode,
         )
-    } else if owns_scanout || stopped_display_gt || firmware_handoff.is_some() {
+    } else if owns_scanout || stopped_display_gt || firmware_handoff.is_some() || execlists_gt {
         crate::intel_gpu_gt_runtime::install(
             card_index,
             gt_card,
@@ -3700,6 +3734,56 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu",
         smoke_headless_gt_requires_every_display_fetcher_stopped
+    );
+
+    /// The Gen9/Gen11 execlists owner coexists with a lit display only while
+    /// every enabled plane and cursor fetches below the GT arena.
+    fn smoke_execlists_gt_needs_planes_below_arena() -> TestResult {
+        struct Regs(alloc::collections::BTreeMap<u64, u32>);
+        impl crate::intel_gpu_aux::MmioWindow for Regs {
+            fn read32(&self, off: u64) -> u32 {
+                *self.0.get(&off).unwrap_or(&0)
+            }
+            fn write32(&self, _: u64, _: u32) {}
+        }
+        let lit = |plane: u64, surf: u32| {
+            Regs(alloc::collections::BTreeMap::from([
+                (plane, 1 << 31),
+                (plane + 0x1c, surf),
+            ]))
+        };
+        // GOP scanout at GGTT 0 on pipe A plane 1, the driver's at 16 MiB.
+        if !legacy_planes_below_arena(&Regs(Default::default()))
+            || !legacy_planes_below_arena(&lit(0x70180, 0))
+            || !legacy_planes_below_arena(&lit(0x71180, 0x0100_0000))
+            || !legacy_planes_below_arena(&lit(0x72780, 0x0bff_f000))
+        {
+            return TestResult::Fail("planes below the arena admit the owner");
+        }
+        // A plane, or Ice Lake's seventh plane, too close to 256 MiB; a
+        // disabled plane's stale address does not count.
+        if legacy_planes_below_arena(&lit(0x70180, 0x0c00_0000))
+            || legacy_planes_below_arena(&lit(0x72780, 0x1000_0000))
+            || !legacy_planes_below_arena(&Regs(alloc::collections::BTreeMap::from([(
+                0x7019c,
+                0x2000_0000,
+            )])))
+        {
+            return TestResult::Fail("a plane near or in the arena refuses the owner");
+        }
+        let cursor = Regs(alloc::collections::BTreeMap::from([
+            (0x71080, 0x27),
+            (0x71084, 0x1000_0000),
+        ]));
+        let gone = Regs(alloc::collections::BTreeMap::from([(0x70180, u32::MAX)]));
+        if legacy_planes_below_arena(&cursor) || legacy_planes_below_arena(&gone) {
+            return TestResult::Fail("a cursor in the arena or an absent display refuses");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_execlists_gt_needs_planes_below_arena
     );
 
     /// Regression for the 1366-wide panel panic: the unpadded
