@@ -58,11 +58,17 @@ the TCP/UDP acceptance that matters for the driver:
 
 ## Silicon validation (open)
 
-The wire encodings are unit-validated; the following are confirmed on a
+The wire encodings are unit-validated, and the resource numbers are now
+derived from `QUERY_DEV_CAP` rather than hardcoded: the driver's doorbell
+UAR page is the first page past `reserved_uars`; the EQ/CQ/QP/MPT numbers
+and the MTT base sit at the first index past each resource's reserved
+range; and the ICM context tables are sized to cover `reserved + 1` so
+those objects always fit. The following are still confirmed on a
 ConnectX-3 card at boot (QEMU cannot exercise them):
 
 - End-to-end bring-up (firmware handshake, ICM mapping, `INIT_HCA` accept).
-- The ICM-layout sizing (`icm::IcmCounts` defaults) and cMPT placement.
-- The driver UAR index (`DRIVER_UAR_INDEX`) and reserved QPN/MPT/MTT bases.
-- Whether a pre-driver hardware reset is required on this board.
+- The cMPT sub-table placement within the ICM layout.
+- Whether a pre-driver hardware reset is required on this board (left out
+  deliberately — a blind, untested reset risks wedging bring-up; add it
+  only once silicon shows it is needed).
 - Live TCP/UDP throughput (the follow-on performance pass).

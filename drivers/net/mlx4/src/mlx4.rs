@@ -58,9 +58,6 @@ const ALL_DEV_IDS: &[u16] = &[MLX4_DEV_CX3, MLX4_DEV_CX3_PRO];
 
 /// Startup wait for the firmware command interface (PRM §9.6).
 const CMD_DEADLINE_MS: u64 = 10_000;
-/// UAR page the driver's doorbells live in (BAR2). Past the
-/// firmware-reserved low pages; silicon-validated at boot.
-const DRIVER_UAR_INDEX: u32 = 128;
 /// UAR page size (4 KiB).
 const UAR_PAGE_SIZE: u64 = 4096;
 
@@ -224,6 +221,9 @@ pub struct Mlx4Eth {
     dev_cap: fw::DevCap,
     fw_info: fw::FwInfo,
     mtt_entry_sz: u16,
+    /// BAR2 UAR page index the driver rings its doorbells through — the
+    /// first page past the firmware-reserved UARs (`QUERY_DEV_CAP`).
+    uar_index: u32,
     pub addr: narf_bus::BusAddr,
     nic_state: IrqSafeSpinLock<NicCachedState>,
     datapath: IrqSafeSpinLock<Option<DatapathState>>,
@@ -449,6 +449,7 @@ impl Mlx4Eth {
             dev_cap: fw::DevCap::default(),
             fw_info: fw::FwInfo::default(),
             mtt_entry_sz: 8,
+            uar_index: 0,
             addr: device.addr,
             nic_state: IrqSafeSpinLock::new(NicCachedState {
                 mac: [0; 6],
@@ -498,7 +499,17 @@ impl Mlx4Eth {
         let dev_cap = fw::decode_query_dev_cap(&dc_mb);
 
         // 5. Plan ICM + SET_ICM_SIZE + MAP_ICM_AUX + MAP_ICM(tables).
-        let counts = icm::IcmCounts::default();
+        // Size each context table to cover the device's reserved range
+        // plus the driver's own object, so our objects (placed at the
+        // first index past the reserved range) always fit.
+        let counts = icm::IcmCounts {
+            log_num_qps: (dev_cap.log2_rsvd_qps + 1).max(7),
+            log_num_cqs: (dev_cap.log2_rsvd_cqs + 1).max(7),
+            log_num_eqs: (dev_cap.log2_rsvd_eqs + 1).max(4),
+            log_num_mpts: (dev_cap.log2_rsvd_mrws + 1).max(7),
+            log_num_mtts: (dev_cap.log2_rsvd_mtts + 1).max(14),
+            ..icm::IcmCounts::default()
+        };
         let layout = icm::make_layout(&dev_cap, &counts);
         let aux_pages = dev.cmd(layout.total, 0, 0, CmdOp::SetIcmSize, 0, true)?;
         let aux_pages = (aux_pages as usize).max(1);
@@ -512,8 +523,10 @@ impl Mlx4Eth {
             icm_pages.append(&mut chunk);
         }
 
-        // 6. INIT_HCA.
-        let init = layout.init_hca_params(&counts, 0, 0);
+        // 6. INIT_HCA. UAR region holds `num_uars = uar_bytes / 4 KiB`
+        // pages; `uar_page_sz = PAGE_SHIFT - 12 = 0` for 4-KiB pages.
+        let log_uar_sz = dev_cap.log2_uar_sz.saturating_sub(12);
+        let init = layout.init_hca_params(&counts, log_uar_sz, 0);
         let init_mb = icm::build_init_hca(&init);
         dev.cmd_in_mailbox(CmdOp::InitHca, 0, 0, &init_mb)?;
 
@@ -533,6 +546,10 @@ impl Mlx4Eth {
             d.fw_info = fw_info;
             d.dev_cap = dev_cap;
             d.mtt_entry_sz = dev_cap.mtt_entry_sz.max(8);
+            // Driver doorbell UAR + MTT bump base live past the
+            // firmware-reserved ranges.
+            d.uar_index = u32::from(dev_cap.reserved_uars);
+            *d.next_mtt.lock() = 1u64 << dev_cap.log2_rsvd_mtts;
             d._fw_area.lock().extend(fw_area);
             d._icm.lock().extend(icm_aux);
             d._icm.lock().extend(icm_pages);
@@ -597,6 +614,15 @@ impl Mlx4Eth {
         let tx_pool =
             alloc_coherent(SQ_N * TX_SLOT_LEN, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
 
+        // Our object numbers sit at the first index past each resource's
+        // firmware-reserved range (`QUERY_DEV_CAP`); the ICM tables were
+        // sized in bring-up to cover reserved + these.
+        let dc = self.dev_cap;
+        let uar_index = self.uar_index;
+        let eq_number = 1u32 << dc.log2_rsvd_eqs;
+        let cq_number = 1u32 << dc.log2_rsvd_cqs;
+        let qp_number = 1u32 << dc.log2_rsvd_qps;
+
         // One physical MR covering the whole address space — the
         // mlx4_en idiom. Data segments then carry device physical
         // addresses directly with this lkey.
@@ -606,7 +632,6 @@ impl Mlx4Eth {
         let eq_buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
         let eq_mtt = self.alloc_mtt(1);
         self.write_mtt(eq_mtt, &[eq_buf.dma_addr().raw()])?;
-        let eq_number = 0u32;
         let eq_ctx = eq::build_eq_context(&eq::EqParams {
             log_eq_size: LOG_EQ_SIZE,
             intr: 0,
@@ -619,10 +644,9 @@ impl Mlx4Eth {
         // CQ.
         let cq_mtt = self.alloc_mtt(1);
         self.write_mtt(cq_mtt, &[cq_buf.dma_addr().raw()])?;
-        let cq_number = 0u32;
         let cq_ctx = cq::build_cq_context(&cq::CqParams {
             log_cq_size: LOG_CQ_SIZE,
-            uar_index: DRIVER_UAR_INDEX,
+            uar_index,
             mtt_base: self.mtt_addr(cq_mtt),
             log_page_size: 0,
             comp_eqn: eq_number as u8,
@@ -633,10 +657,9 @@ impl Mlx4Eth {
         // QP (SQ+RQ in one page).
         let qp_mtt = self.alloc_mtt(1);
         self.write_mtt(qp_mtt, &[wq.dma_addr().raw()])?;
-        let qp_number = 0x40u32; // past the firmware-reserved low QPNs.
         let qp_ctx = qp::build_qp_context(&qp::QpEthParams {
             pd: 0,
-            uar_index: DRIVER_UAR_INDEX,
+            uar_index,
             cqn_send: cq_number,
             cqn_recv: cq_number,
             mtt_base: self.mtt_addr(qp_mtt),
@@ -707,7 +730,7 @@ impl Mlx4Eth {
     /// device address space; its lkey tags every datapath data
     /// segment (the mlx4_en idiom).
     fn create_physical_mr(&self) -> Result<u32, Mlx4Error> {
-        let mpt_index = 0x10u32; // past the firmware-reserved MPTs.
+        let mpt_index = 1u32 << self.dev_cap.log2_rsvd_mrws; // first free MPT.
         let key = mr::hw_index_to_key(mpt_index);
         let mpt = mr::build_mpt(&mr::MptParams {
             pd: 0,
@@ -784,7 +807,7 @@ impl Mlx4Eth {
         }
         compiler_fence(Ordering::SeqCst);
         // Ring the send doorbell (BAR2 UAR).
-        self.uar_write(DRIVER_UAR_INDEX, wqe::SEND_DOORBELL_UAR_OFFSET, wqe::tx_doorbell_word(qpn));
+        self.uar_write(self.uar_index, wqe::SEND_DOORBELL_UAR_OFFSET, wqe::tx_doorbell_word(qpn));
         let _ = wqe_idx;
         Ok(())
     }
@@ -900,7 +923,7 @@ impl Mlx4Eth {
         };
         // Doorbell record: set_ci slot (host memory) + UAR arm.
         self.uar_write64(
-            DRIVER_UAR_INDEX,
+            self.uar_index,
             cq::CQ_DOORBELL_UAR_OFFSET,
             cq::cq_arm_uar_words(cqn, cons, 0, cq::CQ_DB_REQ_NOT),
         );
