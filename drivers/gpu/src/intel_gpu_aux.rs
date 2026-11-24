@@ -215,8 +215,8 @@ impl SourceFamily {
             })
     }
 
-    /// The Gen12 family, for the Gen12-only paths (VRR, MST, the external
-    /// stop proof).
+    /// The Gen12 family, for the Gen12-only paths (VRR, the external stop
+    /// proof).
     pub const fn gen12(self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         match self {
             Self::Gen12(family) => Some(family),

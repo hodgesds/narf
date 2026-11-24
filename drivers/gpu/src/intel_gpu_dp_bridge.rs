@@ -347,7 +347,7 @@ impl IntelDpBridge {
         modeset.set_typec_width(max_lanes);
         let active = intel_gpu_multipipe::active_pipes();
         if active.len() >= 2 {
-            if let Some((start, end)) = intel_gpu_multipipe::share_for(&active, pipe) {
+            if let Some((start, end)) = intel_gpu_multipipe::share_for(&mmio, &active, pipe) {
                 modeset.set_dbuf_share(start, end);
             }
         }

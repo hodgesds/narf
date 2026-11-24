@@ -2134,7 +2134,7 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
         let share = {
             let active = crate::intel_gpu_multipipe::active_pipes();
             if active.len() >= 2 {
-                crate::intel_gpu_multipipe::share_for(&active, pipe)
+                crate::intel_gpu_multipipe::share_for(&window, &active, pipe)
             } else {
                 None
             }
@@ -2901,12 +2901,11 @@ fn mst_session_ddi() -> Option<crate::intel_gpu_ddi::Ddi> {
 fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
     use crate::dp_aux::AuxChannel as _;
     let state = with_display_info(|gpu| {
-        if !gpu.chip.generation.external_display_supported()
-            || crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).is_none()
-        {
+        if !gpu.chip.generation.external_display_supported() {
             return None;
         }
         let window = gpu.mode_window();
+        crate::intel_gpu_aux::SourceFamily::of(&window)?;
         // Capability gate: DP 1.2+ and MSTM_CAP set. Anything
         // less is an SST device and not this path's business.
         let mut aux = crate::intel_gpu_aux::IntelAux::new(&window, ddi);
@@ -2974,7 +2973,7 @@ fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
             let share = {
                 let active = crate::intel_gpu_multipipe::active_pipes();
                 if active.len() >= 2 {
-                    crate::intel_gpu_multipipe::share_for(&active, pipe)
+                    crate::intel_gpu_multipipe::share_for(&window, &active, pipe)
                 } else {
                     None
                 }
@@ -3032,7 +3031,7 @@ fn mst_disconnect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
     };
     let stopped = with_display_info(|gpu| {
         let window = gpu.mode_window();
-        if crate::intel_gpu_aux::MmioWindow::gen12_display_family(&window) != state.link.family() {
+        if crate::intel_gpu_aux::SourceFamily::of(&window) != state.link.family() {
             return false;
         }
         let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
@@ -3075,7 +3074,7 @@ fn mst_poll_notifications(ddi: crate::intel_gpu_ddi::Ddi) {
     let Some(mut state) = state else { return };
     with_display_info(|gpu| {
         let window = gpu.mode_window();
-        if crate::intel_gpu_aux::MmioWindow::gen12_display_family(&window) != state.link.family() {
+        if crate::intel_gpu_aux::SourceFamily::of(&window) != state.link.family() {
             return;
         }
         let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
