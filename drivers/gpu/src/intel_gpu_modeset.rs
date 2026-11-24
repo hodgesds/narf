@@ -397,6 +397,13 @@ pub fn to_pll_rate(rate: crate::dp_link_training::LinkRate) -> LinkRate {
     }
 }
 
+/// The link rate a run without a negotiated plan (the legacy panel
+/// entry and the fixed-mode restore) starts training at, and so the
+/// rate its link clock is first programmed for. The training
+/// callbacks retune the clock when the fallback ladder steps down.
+const UNPLANNED_START_RATE: crate::dp_link_training::LinkRate =
+    crate::dp_link_training::LinkRate::Hbr2;
+
 /// How the link-training step of a modeset run is satisfied.
 /// The legacy eDP-shaped entry trains and discards the result
 /// (historical behaviour); the plan entries train at the
@@ -1244,8 +1251,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // intel_gpu_pll exposes `build_cfgcr0/1` for the encoding;
         // Stage 1 wires the actual MMIO writes here. The DPLL
         // synthesises the *link* clock: on the plan path that is
-        // the negotiated rate; the legacy path derives the lowest
-        // sufficient rate from the pixel clock. An MST secondary
+        // the negotiated rate; a run without a plan takes the rate
+        // its training starts at (`UNPLANNED_START_RATE`), so the
+        // sink never trains against a clock for another rate. An
+        // MST secondary
         // stream skips this entirely — the primary stream's run
         // already clocked the shared link, and re-running the
         // PLL power/enable sequence would glitch it.
@@ -1271,8 +1280,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         match (plan, already_trained) {
             (Some(p), _) => self.program_dpll_with_rate(&mode, to_pll_rate(p.rate))?,
             (None, Some(_)) => {}
-            (None, None) if tc_port => self.program_dpll_with_rate(&mode, LinkRate::DpHbr2)?,
-            (None, None) => self.program_dpll(&mode)?,
+            (None, None) => {
+                self.program_dpll_with_rate(&mode, to_pll_rate(UNPLANNED_START_RATE))?
+            }
         }
 
         // Step 4b (lane 1, #1010): raise CDCLK to the floor this
@@ -1703,11 +1713,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
     // ── DPLL ─────────────────────────────────────────────────
 
-    /// Program a Combo PHY DPLL for the requested pixel clock.
-    /// Picks the lowest DP link rate that meets the bandwidth
-    /// requirement of `mode`'s 24-bpp scanout, looks up the
-    /// PRM-published Combo-PHY coefficients, programs CFGCR0/1,
-    /// and brings the DPLL up:
+    /// Program this run's DPLL for the link `rate` (the
+    /// negotiated rate on the plan path, #1092; the training
+    /// start rate otherwise). On a Combo PHY: look up the
+    /// PRM-published coefficients, then
     ///
     ///   1. Power-up via PLL_POWER_ENABLE + wait for PLL_POWER_STATE.
     ///   2. Write CFGCR0 (DCO integer + fraction) and CFGCR1 (Q/K/P
@@ -1717,14 +1726,6 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     ///
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_dpll.c
     /// (`icl_pll_power_enable`, `icl_pll_enable`).
-    fn program_dpll(&mut self, mode: &Mode) -> Result<(), ModesetError> {
-        let rate = link_rate_for_pixel_clock(mode.pixel_clock_khz);
-        self.program_dpll_with_rate(mode, rate)
-    }
-
-    /// Program the Combo PHY DPLL for an explicit link `rate`
-    /// (the negotiated rate on the plan path, #1092) instead of
-    /// the pixel-clock-derived floor `program_dpll` picks.
     fn program_dpll_with_rate(&mut self, mode: &Mode, rate: LinkRate) -> Result<(), ModesetError> {
         if self.gen11_platform.is_some() && self.is_tc_port() {
             // Gen11 Type-C: the MG PLL for the link clock
@@ -2402,15 +2403,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         &mut self,
         plan: Option<LinkPlan>,
     ) -> Result<(LinkRate, Option<crate::dp_link_training::TrainedLink>), ModesetError> {
-        use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
+        use crate::dp_link_training::{train_link, LinkError};
         let aux = IntelAux::new(self.mmio, self.ddi);
-        // The legacy path starts at HBR2/4-lane and falls back
-        // via `train_link`'s policy — the broadest envelope a
-        // modern eDP panel will accept. The plan path starts at
-        // the negotiated configuration (#1092).
+        // A run without a plan starts at HBR2/4-lane (the clock
+        // step 4 programmed) and falls back via `train_link`'s
+        // policy — the broadest envelope a modern eDP panel will
+        // accept. The plan path starts at the negotiated
+        // configuration (#1092).
         let (initial_rate, lanes) = match plan {
             Some(p) => (p.rate, p.lanes),
-            None => (TrainRate::Hbr2, self.tc_width),
+            None => (UNPLANNED_START_RATE, self.tc_width),
         };
         let result = if self.gen11_platform.is_some() && self.is_tc_port() {
             // Gen11 Type-C: the MG PHY is the training source
@@ -4136,7 +4138,7 @@ pub mod tests {
         mmio.state_value = super::PLL_POWER_STATE | super::PLL_LOCK;
         let mut ms = Modeset::new(&mmio, Ddi::A);
         let mode = Mode::VESA_1024X768_60;
-        match ms.program_dpll(&mode) {
+        match ms.program_dpll_with_rate(&mode, LinkRate::DpRbr) {
             Ok(()) => {}
             Err(e) => {
                 let _ = e;
@@ -5438,10 +5440,17 @@ pub mod tests {
         {
             return TestResult::Fail("modeset must return the EDID preferred mode");
         }
-        // DPLL: RBR row of the 19.2 MHz family.
+        // DPLL: the HBR2 row of the 19.2 MHz family — the rate
+        // training starts at. CFGCR0 is the one DCO word every DP
+        // row of the family shares; CFGCR1 (KDIV_1 | PDIV_3 |
+        // CFREQ = 0x4B) is the rate witness.
         let cfgcr0 = mmio.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
         if cfgcr0 != alloc::vec![0x01C0_01A5] {
-            return TestResult::Fail("CFGCR0 must be the 19.2-family RBR row");
+            return TestResult::Fail("CFGCR0 must be the 19.2-family DP DCO word");
+        }
+        let cfgcr1 = crate::intel_gpu_pll::dpll_cfgcr1(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
+        if mmio.writes_to(cfgcr1) != alloc::vec![0x4B] {
+            return TestResult::Fail("CFGCR1 must be the HBR2 row training starts at");
         }
         // CDCLK: 148.5 MHz pixel clock, floor 74.25 MHz, 19.2 MHz
         // strap -> the 172.8 MHz icl rung (ratio 18, DIV_SEL_1,
@@ -5719,11 +5728,17 @@ pub mod tests {
         {
             return TestResult::Fail("Gen11 modeset must return the EDID preferred mode");
         }
-        // DPLL: the RBR row of the 19.2 MHz family, written to
-        // the ICL CFGCR0 (0x164000) — never the TGL CFGCR0
-        // (0x164284).
+        // DPLL: the HBR2 row of the 19.2 MHz family (the rate
+        // training starts at), written to the ICL CFGCR0/1
+        // (0x164000/0x164004) — never the TGL CFGCR0
+        // (0x164284). CFGCR1 = KDIV_1 | PDIV_3 | CFREQ.
         if mmio.writes_to(0x164000) != alloc::vec![0x01C0_01A5] {
-            return TestResult::Fail("Gen11 CFGCR0 must be the 19.2-family RBR row at 0x164000");
+            return TestResult::Fail(
+                "Gen11 CFGCR0 must be the 19.2-family DP DCO word at 0x164000",
+            );
+        }
+        if mmio.writes_to(0x164004) != alloc::vec![0x4B] {
+            return TestResult::Fail("Gen11 CFGCR1 must be the HBR2 row at 0x164004");
         }
         if !mmio.writes_to(0x164284).is_empty() {
             return TestResult::Fail("Gen11 must never write the TGL CFGCR0");
@@ -6404,22 +6419,18 @@ pub mod tests {
             );
         }
         // DDI_BUF_CTL for DDI B (0x64100): the disable-first
-        // write (readback 0x80), at least one level-4
-        // set-levels write (0x04000080), then the enable
+        // write (readback 0x80); the level-0 select the training
+        // core's first TRAINING_LANE_SET (0, 0) asks for
+        // (TRANS_SELECT 0, so the same 0x80 — Linux's
+        // `hsw_set_signal_levels` writes DDI_BUF_CTL on every
+        // level change); the sink's swing-1 request at CR and
+        // again at EQ (level 4, 0x04000080); then the enable
         // (0x84000086 — IDLE bit RMW'd in, as on the panel
-        // run); DDI A is never enabled.
-        let buf_ctl = mmio.writes_to(0x64100);
-        if buf_ctl.len() < 3
-            || buf_ctl.first() != Some(&0x80)
-            || buf_ctl.last() != Some(&0x8400_0086)
-        {
-            return TestResult::Fail("DDI_BUF_CTL B must be [0x80, 0x04000080.., 0x84000086]");
-        }
-        if buf_ctl[1..buf_ctl.len() - 1]
-            .iter()
-            .any(|w| *w != 0x0400_0080)
-        {
-            return TestResult::Fail("DDI_BUF_CTL B middle writes must be the level-4 value");
+        // run). DDI A is never enabled.
+        if mmio.writes_to(0x64100) != [0x80, 0x80, 0x0400_0080, 0x0400_0080, 0x8400_0086] {
+            return TestResult::Fail(
+                "DDI_BUF_CTL B must be [0x80, 0x80, 0x04000080, 0x04000080, 0x84000086]",
+            );
         }
         if !mmio.writes_to(0x64000).is_empty() {
             return TestResult::Fail("Gen9 DDI B run must not touch DDI A");
@@ -6894,16 +6905,16 @@ pub mod tests {
         if mmio.sink.borrow().pattern_history != alloc::vec![1u8, 0, 1, 2, 0] {
             return TestResult::Fail("fallback must retry training at the lower rate");
         }
-        // DPLL: programmed at the RBR floor row for the 1080p
-        // mode (CFGCR1 KDIV_2 | PDIV_5 | CFREQ = 0x93), then
+        // DPLL: programmed at the HBR2 row the first attempt
+        // trains at (CFGCR1 KDIV_1 | PDIV_3 | CFREQ = 0x4B), then
         // retuned mid-training to HBR (KDIV_2 | PDIV_3 |
         // CFREQ = 0x8B) when the fallback retry opened. CFGCR0
         // is the same DCO row at both rates, so CFGCR1 is the
         // rate witness.
         let cfgcr1 = crate::intel_gpu_pll::dpll_cfgcr1(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
-        if mmio.writes_to(cfgcr1) != alloc::vec![0x93, 0x8B] {
+        if mmio.writes_to(cfgcr1) != alloc::vec![0x4B, 0x8B] {
             return TestResult::Fail(
-                "fallback must reprogram CFGCR1 from the RBR row to the HBR row",
+                "fallback must reprogram CFGCR1 from the HBR2 row to the HBR row",
             );
         }
         // DPLL enable cycled by the retune: step-4 power +
@@ -6989,7 +7000,7 @@ pub mod tests {
         }
         let cfgcr0 = mmio.writes_to(crate::intel_gpu_pll::DPLL_CFGCR0_DPLL0);
         if cfgcr0 != alloc::vec![0x0100_0151] {
-            return TestResult::Fail("CFGCR0 must be the 24-family RBR row");
+            return TestResult::Fail("CFGCR0 must be the 24-family DP DCO word");
         }
         TestResult::Pass
     }
