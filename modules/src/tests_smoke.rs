@@ -910,13 +910,18 @@ kernel_test_in!("modules/reloc", smoke_aarch64_call26_encoding);
 
 fn smoke_aarch64_scaled_lo12_encoding() -> TestResult {
     use crate::elf::reloc::{
-        R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_LDST128_ABS_LO12_NC, R_AARCH64_LDST32_ABS_LO12_NC,
-        R_AARCH64_LDST64_ABS_LO12_NC,
+        R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_LDST128_ABS_LO12_NC, R_AARCH64_LDST16_ABS_LO12_NC,
+        R_AARCH64_LDST32_ABS_LO12_NC, R_AARCH64_LDST64_ABS_LO12_NC, R_AARCH64_LDST8_ABS_LO12_NC,
     };
     // S + A crosses a page and ends in 0xabc. Use nonzero initial imm12
     // bits to verify the relocation replaces the entire field.
     for (ty, instruction, immediate) in [
         (R_AARCH64_ADD_ABS_LO12_NC, 0x9100_0021u32, 0xabc),
+        // ldrb w1, [x1] / ldrh w1, [x1]: byte loads are unscaled, halfword
+        // loads scale by two. A real rustc `.ko` emits both (a `static`
+        // `AtomicBool` is read with `ldrb`).
+        (R_AARCH64_LDST8_ABS_LO12_NC, 0x3940_0021, 0xabc),
+        (R_AARCH64_LDST16_ABS_LO12_NC, 0x7940_0021, 0x55e),
         (R_AARCH64_LDST32_ABS_LO12_NC, 0xb940_0021, 0x2af),
         (R_AARCH64_LDST64_ABS_LO12_NC, 0xf940_0021, 0x157),
         (R_AARCH64_LDST128_ABS_LO12_NC, 0x3dc0_0021, 0xab),

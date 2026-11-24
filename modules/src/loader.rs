@@ -15,9 +15,11 @@ use narf_memory::module_text::{self, ModuleTextError, Prot};
 use crate::domain;
 use crate::elf::{
     enumerate_sections, parse_header, parse_section, sections::SECT_MODINFO,
-    sections::SECT_NARF_KPARAMS, Elf64Header, HeaderError, SymbolTable, EM_AARCH64, SHF_ALLOC,
-    SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+    sections::SECT_NARF_KPARAMS, Elf64Header, HeaderError, SymbolTable, EM_AARCH64, EM_X86_64,
+    SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB,
+    SHT_SYMTAB,
 };
+use crate::got::{Got, SLOT_BYTES as GOT_SLOT_BYTES};
 use crate::lifecycle::{ModuleExitFn, ModuleInitFn, ModuleState};
 use crate::manifest::{Manifest, ManifestError};
 use crate::params::{self, ParamSlot};
@@ -423,6 +425,38 @@ fn count_branch_relocs(bytes: &[u8], hdr: &Elf64Header) -> usize {
     n
 }
 
+/// Upper bound on the GOT slots an x86_64 module needs: one per
+/// `GOTPCREL`-family relocation (see `crate::got` for why a `-Z plt=no`
+/// object has them). Over-counts for the same reason
+/// [`count_branch_relocs`] does — `Got::slot_for` folds repeats.
+fn count_got_relocs(bytes: &[u8], hdr: &Elf64Header) -> usize {
+    use crate::elf::reloc::{R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX};
+
+    let mut n = 0usize;
+    for i in 0..hdr.e_shnum as usize {
+        let Ok(shdr) = parse_section(bytes, hdr, i) else {
+            continue;
+        };
+        if shdr.sh_type != SHT_RELA || shdr.sh_entsize == 0 {
+            continue;
+        }
+        let count = (shdr.sh_size / shdr.sh_entsize) as usize;
+        for e in 0..count {
+            let off = shdr.sh_offset as usize + e * shdr.sh_entsize as usize;
+            let Some(r) = crate::elf::parse_rela(bytes, off) else {
+                continue;
+            };
+            if matches!(
+                r.ty(),
+                R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX
+            ) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// A page-aligned plan for the module image.
 #[derive(Debug)]
 struct ImageLayout {
@@ -434,6 +468,12 @@ struct ImageLayout {
     /// Veneer slots reserved — an upper bound (see [`count_branch_relocs`]),
     /// and zero on x86_64.
     plt_slots: usize,
+    /// Offset of the x86_64 GOT arena within the image. Always inside the
+    /// read-only data region; meaningless when `got_slots` is zero.
+    got_offset: u64,
+    /// GOT slots reserved — an upper bound (see [`count_got_relocs`]), and
+    /// zero on aarch64.
+    got_slots: usize,
     text_pages: usize,
     rodata_pages: usize,
     total_pages: usize,
@@ -452,6 +492,8 @@ fn plan_layout(bytes: &[u8], hdr: &Elf64Header) -> Result<ImageLayout, LoadError
     let mut region_end = [0u64; REGION_ORDER.len()];
     let mut plt_offset = 0u64;
     let mut plt_slots = 0usize;
+    let mut got_offset = 0u64;
+    let mut got_slots = 0usize;
 
     for (ri, region) in REGION_ORDER.iter().enumerate() {
         cursor = page_up(cursor);
@@ -499,6 +541,18 @@ fn plan_layout(bytes: &[u8], hdr: &Elf64Header) -> Result<ImageLayout, LoadError
             };
             cursor = cursor.wrapping_add((plt_slots * VENEER_BYTES) as u64);
         }
+        // The GOT is data the module only reads, so it goes at the end of
+        // the read-only region and is sealed with it (RELRO's property).
+        if *region == Region::Rodata {
+            cursor = (cursor + GOT_SLOT_BYTES as u64 - 1) & !(GOT_SLOT_BYTES as u64 - 1);
+            got_offset = cursor;
+            got_slots = if hdr.e_machine == EM_X86_64 {
+                count_got_relocs(bytes, hdr)
+            } else {
+                0
+            };
+            cursor = cursor.wrapping_add((got_slots * GOT_SLOT_BYTES) as u64);
+        }
         region_end[ri] = cursor;
     }
 
@@ -510,6 +564,8 @@ fn plan_layout(bytes: &[u8], hdr: &Elf64Header) -> Result<ImageLayout, LoadError
         sections,
         plt_offset,
         plt_slots,
+        got_offset,
+        got_slots,
         text_pages: ((page_up(region_end[0]) - region_start[0]) / PAGE) as usize,
         rodata_pages: ((page_up(region_end[1]) - region_start[1]) / PAGE) as usize,
         total_pages: (total / PAGE) as usize,
@@ -572,9 +628,12 @@ fn build_image(
     let symbols = SymbolTable::new(bytes, symtab_pair.0, symtab_pair.1);
     let mut plt = (layout.plt_slots > 0)
         .then(|| Plt::new(mem.entry_base() + layout.plt_offset, layout.plt_slots));
+    let mut got = (layout.got_slots > 0)
+        .then(|| Got::new(mem.entry_base() + layout.got_offset, layout.got_slots));
     let mut ctx = RelocContext {
         manifest,
         plt: plt.as_mut(),
+        got: got.as_mut(),
         deps: Vec::new(),
     };
     let _ = apply_all_relas(bytes, hdr, &symbols, &mut placements, &mut ctx)?;

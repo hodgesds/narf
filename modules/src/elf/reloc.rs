@@ -56,6 +56,7 @@ pub const R_X86_64_32: u32 = 10;
 pub const R_X86_64_32S: u32 = 11;
 pub const R_X86_64_PC64: u32 = 24;
 pub const R_X86_64_GOTPCREL: u32 = 9;
+pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 
 // ── aarch64 relocation types ─────────────────────────────────────────
@@ -67,6 +68,8 @@ pub const R_AARCH64_PREL64: u32 = 260;
 pub const R_AARCH64_PREL32: u32 = 261;
 pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
 pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+pub const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
+pub const R_AARCH64_LDST16_ABS_LO12_NC: u32 = 284;
 pub const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
 pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
@@ -144,7 +147,15 @@ pub fn apply_x86_64(
             }
             write_u32(dest, loc, val as u32)
         }
-        R_X86_64_PC32 | R_X86_64_PLT32 | R_X86_64_GOTPCREL | R_X86_64_REX_GOTPCRELX => {
+        // The GOT forms are PC-relative to the symbol's *GOT slot*
+        // (`G + GOT + A - P`), not to the symbol: the caller passes that
+        // slot's address as `sym_value` (see `crate::got`). Given the slot,
+        // the arithmetic is PC32's.
+        R_X86_64_PC32
+        | R_X86_64_PLT32
+        | R_X86_64_GOTPCREL
+        | R_X86_64_GOTPCRELX
+        | R_X86_64_REX_GOTPCRELX => {
             let diff = (val as i64).wrapping_sub(place as i64);
             if diff < i32::MIN as i64 || diff > i32::MAX as i64 {
                 return Err(RelocError::Overflow);
@@ -265,13 +276,16 @@ pub fn apply_aarch64(
             write_u32(dest, loc, new)
         }
         R_AARCH64_ADD_ABS_LO12_NC
+        | R_AARCH64_LDST8_ABS_LO12_NC
+        | R_AARCH64_LDST16_ABS_LO12_NC
         | R_AARCH64_LDST32_ABS_LO12_NC
         | R_AARCH64_LDST64_ABS_LO12_NC
         | R_AARCH64_LDST128_ABS_LO12_NC => {
             // Linux apply_relocate_add encodes the low page offset in
             // units of the access width. _NC discards low alignment bits.
             let shift = match ty {
-                R_AARCH64_ADD_ABS_LO12_NC => 0,
+                R_AARCH64_ADD_ABS_LO12_NC | R_AARCH64_LDST8_ABS_LO12_NC => 0,
+                R_AARCH64_LDST16_ABS_LO12_NC => 1,
                 R_AARCH64_LDST32_ABS_LO12_NC => 2,
                 R_AARCH64_LDST64_ABS_LO12_NC => 3,
                 _ => 4,
