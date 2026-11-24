@@ -8,6 +8,7 @@
 //! refreshes PMFW metrics on a one-second cadence through the retained
 //! SMU owner and publishes the last sample (`amdgpu_navi22_power` for
 //! SMU11/Navi22, `amdgpu_navi48_power` for SMU14/Navi48,
+//! `amdgpu_navi31_power` for SMU 13.0.0/Navi31,
 //! `amdgpu_smu_apu_telemetry` for SMU 12/13 Renoir/Phoenix APUs, the
 //! same cached table Linux serves sysfs reads from). This module reads
 //! the last published **edge** temperature from those owners and
@@ -35,6 +36,7 @@ use narf_power::bootstrap_power_authority;
 use narf_power::service::{register_state_providers, StateProviders};
 
 use crate::amdgpu_navi22_power::Snapshot as Navi22Snapshot;
+use crate::amdgpu_navi31_power::Snapshot as Navi31Snapshot;
 use crate::amdgpu_navi48_power::Snapshot as Navi48Snapshot;
 use crate::amdgpu_smu_apu_telemetry::ApuSnapshot;
 
@@ -56,6 +58,17 @@ fn edge_from_navi48(snapshot: Option<Navi48Snapshot>) -> Option<i32> {
         .map(|t| t.metrics.edge_milli)
 }
 
+/// Edge temperature in milli-degrees Celsius from one generation's
+/// last published snapshot. `None` when the owner never published,
+/// or its last sample is absent (owner started, no refresh yet). The
+/// Navi31 owner publishes no sample until its platform run loop lands
+/// (#2459), so this arm reads `None` until then.
+fn edge_from_navi31(snapshot: Option<Navi31Snapshot>) -> Option<i32> {
+    snapshot
+        .and_then(|s| s.telemetry)
+        .map(|t| t.metrics.edge_milli)
+}
+
 /// Edge temperature in milli-degrees Celsius from the APU owner's
 /// last published snapshot. `None` when the owner never published,
 /// or its last sample is absent (owner started, no refresh yet).
@@ -64,28 +77,30 @@ fn edge_from_apu(snapshot: Option<ApuSnapshot>) -> Option<i32> {
 }
 
 /// First live edge reading across the telemetry owners, in
-/// milli-degrees Celsius. Navi22 is consulted first, then Navi48,
-/// then the APU owner; a snapshot without telemetry does not shadow
-/// a live reading from another owner. `None` when no owner has a
-/// sample.
+/// milli-degrees Celsius. Navi22 is consulted first, then Navi48, then
+/// Navi31, then the APU owner; a snapshot without telemetry does not shadow
+/// a live reading from another owner. `None` when no owner has a sample.
 pub(crate) fn gpu_temp_mc_from(
     navi22: Option<Navi22Snapshot>,
     navi48: Option<Navi48Snapshot>,
+    navi31: Option<Navi31Snapshot>,
     apu: Option<ApuSnapshot>,
 ) -> Option<i32> {
     edge_from_navi22(navi22)
         .or_else(|| edge_from_navi48(navi48))
+        .or_else(|| edge_from_navi31(navi31))
         .or_else(|| edge_from_apu(apu))
 }
 
 /// Current GPU package temperature in milli-degrees Celsius, read
 /// live from the last published telemetry sample: the Navi22 (SMU11),
-/// Navi48 (SMU14), or APU (SMU 12/13) owner's edge temperature.
-/// `None` when no owner has published a sample.
+/// Navi48 (SMU14), Navi31 (SMU 13.0.0), or APU (SMU 12/13) owner's edge
+/// temperature. `None` when no owner has published a sample.
 pub fn gpu_temp_mc() -> Option<i32> {
     gpu_temp_mc_from(
         crate::amdgpu_navi22_power::snapshot(),
         crate::amdgpu_navi48_power::snapshot(),
+        crate::amdgpu_navi31_power::snapshot(),
         crate::amdgpu_smu_apu_telemetry::snapshot(),
     )
 }
