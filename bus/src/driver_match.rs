@@ -2089,7 +2089,15 @@ fn module_netif_register_inner(
         return Err(-19);
     }
 
-    let name = narf_net::iface::register_with_context("eth%d", mac, token, module_net_tx_bridge);
+    // A device with an open wireless session is a Wi-Fi interface: nl80211
+    // binds a wiphy to its netdev by name, and userspace (NetworkManager,
+    // udev's DEVTYPE=wlan) recognises Wi-Fi by the `wlan` name.
+    let pattern = if crate::module_wireless::has_session(owner, token) {
+        "wlan%d"
+    } else {
+        "eth%d"
+    };
+    let name = narf_net::iface::register_with_context(pattern, mac, token, module_net_tx_bridge);
     let bus_info = match device.addr {
         crate::BusAddr::Pcie(address) => alloc::format!("{address:?}"),
         crate::BusAddr::Mmio(_) => alloc::string::String::new(),
@@ -2132,6 +2140,19 @@ fn module_netif_register_inner(
 }
 
 /// Deliver one copied receive frame from module memory into the kernel stack.
+/// The name of the netdev module `owner` registered on device `token`, if
+/// its ifindex is `ifindex`. Lets a wireless family host bind its wiphy to
+/// exactly that interface.
+pub fn module_netif_name(owner: u64, token: u64, ifindex: u32) -> Option<alloc::string::String> {
+    DEVICE_CTXS
+        .lock()
+        .iter()
+        .find(|ctx| ctx.owner == owner && ctx.token == token)
+        .and_then(|ctx| ctx.net_iface.as_ref())
+        .filter(|iface| iface.ifindex == ifindex)
+        .map(|iface| iface.name.clone())
+}
+
 pub fn module_netif_rx(owner: u64, token: u64, ifindex: u32, frame: &mut [u8]) -> i32 {
     let (cap, name) = {
         let g = DEVICE_CTXS.lock();
@@ -2461,6 +2482,46 @@ pub fn __module_netif_send_for_device_for_test(owner: u64, token: u64, frame: &[
         .and_then(|ctx| ctx.net_iface.as_ref())
         .map(|iface| iface.ifindex);
     ifindex.is_some_and(|index| narf_net::iface::send_on_ifindex(index, frame).is_ok())
+}
+
+#[doc(hidden)]
+/// Test-only: give `(owner, token)` a module device context (a fabricated
+/// virtio-mmio function no hardware backs) and a module netdev registered the
+/// way `narf_netif_register_with_context` does, returning its name and
+/// ifindex. Lets a wireless family host's tests bind a wiphy to a real
+/// netdev. [`__remove_module_device_for_test`] tears it down.
+pub fn __install_module_netif_for_test(
+    owner: u64,
+    token: u64,
+    mac: [u8; 6],
+) -> Option<(alloc::string::String, u32)> {
+    extern "C" fn discard_tx(_token: u64, _frame: *const u8, _len: usize) -> i32 {
+        0
+    }
+    let device = BusDevice {
+        addr: crate::BusAddr::Mmio(narf_memory::PhysAddr::new(0)),
+        kind: BusKind::VirtioMmio {
+            base: narf_memory::PhysAddr::new(0),
+            len: 0x200,
+            device_id: 1,
+        },
+        id: crate::DeviceId {
+            vendor: 0xffff,
+            device: 0xffff,
+            class: 0x028000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+    };
+    install_device_ctx(owner, token, device, Cap::<BusDeviceCap, Write>::bootstrap());
+    let ifindex = module_netif_register_with_context(owner, token, mac, discard_tx).ok()?;
+    Some((module_netif_name(owner, token, ifindex)?, ifindex))
+}
+
+#[doc(hidden)]
+/// Test-only: tear down a context [`__install_module_netif_for_test`] made.
+pub fn __remove_module_device_for_test(token: u64) {
+    remove_device_ctx(token);
 }
 
 #[doc(hidden)]

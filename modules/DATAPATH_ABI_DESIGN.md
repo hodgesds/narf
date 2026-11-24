@@ -442,34 +442,47 @@ late cap revocation, teardown ordering, native-future cancellation and wire
 bounds are implemented. Their execution and dual module builds remain pending
 in the final coordinated validation pass; no RF acceptance is implied.
 
-WIFI family `0x77696669`, version 1 (generic host, `narf-wireless`), uses
-the following little-endian records. All reserved fields must be zero;
-input length must match exactly. One session per probe device (unlike the
-mt76 single-session host); one retained operation per session; the same
-cancellation contract as MT76 (unstarted work drops with `-ECANCELED`,
-started work is retained to terminal completion, a cancelled-but-successful
-operation reports `-EALREADY`). `open_with_event` registers the per-session
-event callback for native→module control-plane events; a plain open has no
-event channel. The callback is invoked only through the bus call gate and
-forgotten on close or device retirement.
+WIFI family `0x77696669`, **version 2** (generic host, `narf-wireless`),
+uses the following little-endian records. All reserved fields must be zero;
+input length must match exactly. One session per probe device; one retained
+operation per session (every v2 opcode completes at submit, the poll only
+collects the reply); the same cancellation contract as MT76.
+`open_with_event` registers the per-session event callback for native→module
+events; a plain open has no event channel. The callback is invoked only
+through the bus call gate and forgotten on close or device retirement.
+
+A module opens its session **before** registering its netdev: the netif
+bridge names a netdev on a device with a wireless session `wlan%d`, and
+`REGISTER_WIPHY` binds the wiphy shell to it by ifindex, taking its name —
+nl80211 resolves wiphy ↔ netdev by name, so the two form one `wlan0`.
 
 | Opcode | Request | Reply |
 |---|---|---|
-|1 REGISTER_WIPHY|MAC[6], modes u32, hw_caps u8, cipher count u8<=8, band count u8 1..3, reserved u8; cipher suites u32[]; per band freq u32, channel count u8 1..64, reserved u8, channels u8[]|assigned wiphy index u32|
-|2 SCAN_RESULT|Stage 4: one scan result (BSS)|not yet served (`-EOPNOTSUPP`)|
-|3 CONNECT_RESULT|Stage 4: connect/auth outcome|not yet served (`-EOPNOTSUPP`)|
-|4 DISCONNECT|Stage 4: link-loss reason|not yet served (`-EOPNOTSUPP`)|
-|5 SET_STATE|Stage 4: op-state (parked/awake)|not yet served (`-EOPNOTSUPP`)|
+|1 REGISTER_WIPHY|ifindex u32 (the module's own netdev on this device), MAC[6], modes u32, hw_caps u8, cipher count u8<=8, band count u8 1..3, flags u8, max scan SSIDs u8<=16, reserved u8, max scan IE len u16<=2048; cipher suites u32[]; per band freq u32, channel count u8 1..64, reserved u8, channels u8[]|assigned wiphy index u32|
+|2 SCAN_RESULT|BSSID[6], channel u8, security u8 (open/WEP/WPA/WPA2/WPA3=0..4), frequency u32, RSSI i8, reserved u8, SSID len u8<=32, reserved u8, IE len u16<=2048, SSID, IEs|empty|
+|3 SCAN_DONE|status i32 (0, or a negative errno)|empty|
+|4 CONNECT_RESULT|802.11 status u16 (0 = success), reserved u16, BSSID[6], reserved u16, frequency u32|empty; success raises carrier|
+|5 DISCONNECTED|reason u16, locally generated u8, reserved u8|empty; drops carrier, reports unsolicited loss to nl80211|
 
-Events (native→module, separate namespace): `SCAN_REQUEST = 0x01`,
-`CONNECT = 0x02`, `KEY = 0x03`, `TX_FRAME = 0x04`; payload layouts are
-specified with Stage 4. Modes are the `WirelessModes` bits
-(STATION=1, AP=2, MONITOR=4, P2P=8); `hw_caps` bits are HT=1, VHT=2, HE=4,
-EHT=8; cipher suites must be known `CIPHER_SUITE_*` values; bands must map
-to distinct wiphy bands (2.4/5/6 GHz); channels are 1..=233, unique within
-their band. The host publishes one `WirelessNetIface` shell per session
-under a unique `wlan{N}` name and unpublishes it on close. Perf class: no
-hot path (control plane only; frames never pass through the host).
+`flags` are the module's SME offloads: `PSK_OFFLOAD = 1` (4-way handshake
+from a PMK), `SAE_OFFLOAD = 2` (WPA3-SAE from a password),
+`REPORTS_DISCONNECT = 4`. The shell advertises them to nl80211, so a
+CONNECT's PMK or SAE password reaches the module's supplicant (the FullMAC
+split); a userspace SME (`SecurityConfig::External`) is refused.
+
+| Event | Payload |
+|---|---|
+|1 SCAN_REQUEST|flags u8 (bit0 active), frequency count u8, SSID count u8, reserved u8, IE len u16, reserved u16, frequencies u32[], SSIDs (len u8 + bytes)[], IEs|
+|2 CONNECT|BSSID[6] (zero = any), security u8 (open/PSK/SAE = 0..2), reserved u8, frequency u32 (0 = any), SSID len u8, reserved u8, IE len u16, secret len u16, reserved u16, SSID, IEs, secret (32-byte PMK or SAE password)|
+|3 DISCONNECT|reason u16, reserved u16|
+|4 SCAN_ABORT|empty|
+
+The callback's return is acceptance; the outcome is the matching report. The
+shell waits 15 s for `SCAN_DONE`, 20 s for `CONNECT_RESULT` and 3 s for
+`DISCONNECTED`, aborting the scan or withdrawing the connect on timeout.
+Modes are the `WirelessModes` bits (STATION=1, AP=2, MONITOR=4, P2P=8);
+`hw_caps` bits are HT=1, VHT=2, HE=4, EHT=8. Perf class: no hot path
+(control plane only; frames never pass through the host).
 
 ## USB transfer datapath
 
