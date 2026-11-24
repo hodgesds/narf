@@ -284,6 +284,55 @@ pub struct MgPort {
     pub tc: u8,
 }
 
+/// Ice Lake's one FIA (`tc_phy_load_fia_params(tc, false)`: not modular, so
+/// every TC port sits in FIA1 at its own index).
+const FIA1: u64 = 0x163000;
+/// `PORT_TX_DFLEXDPSP`: live state and the pin (lane) assignment.
+const PORT_TX_DFLEXDPSP: u64 = FIA1 + 0x8A0;
+/// `PORT_TX_DFLEXDPPMS`: `DP_PHY_MODE_STATUS_COMPLETED(idx)`.
+const PORT_TX_DFLEXDPPMS: u64 = FIA1 + 0x890;
+/// `PORT_TX_DFLEXDPCSSS`: `DP_PHY_MODE_STATUS_NOT_SAFE(idx)`, display's
+/// ownership claim.
+const PORT_TX_DFLEXDPCSSS: u64 = FIA1 + 0x894;
+/// `PORT_TX_DFLEXDPMLE1`: the main-link lanes display drives.
+const PORT_TX_DFLEXDPMLE1: u64 = FIA1 + 0x8C0;
+/// `SDEISR`: the ICP south hotplug status (`SDE_TC_HOTPLUG_ICP`, bit
+/// 24 + TC index, is a legacy Type-C connector's live state).
+const SDEISR: u64 = 0xC4000;
+
+/// What drives a Type-C port (`enum tc_port_mode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcMode {
+    /// A native DP/HDMI connector wired to the Type-C PHY.
+    Legacy,
+    /// DisplayPort alternate mode over a USB-C cable.
+    DpAlt,
+    /// Thunderbolt alternate mode: the TBT controller owns the PHY.
+    TbtAlt,
+}
+
+/// `icl_tc_phy_hpd_live_status`'s mask.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcLive {
+    pub legacy: bool,
+    pub dp_alt: bool,
+    pub tbt_alt: bool,
+}
+
+impl TcLive {
+    /// `tc_phy_hpd_live_mode`: the one live mode, or `None` when nothing
+    /// or more than one mode is live (Linux then keeps the port
+    /// disconnected).
+    pub fn mode(self) -> Option<TcMode> {
+        match (self.legacy, self.dp_alt, self.tbt_alt) {
+            (true, false, false) => Some(TcMode::Legacy),
+            (false, true, false) => Some(TcMode::DpAlt),
+            (false, false, true) => Some(TcMode::TbtAlt),
+            _ => None,
+        }
+    }
+}
+
 impl MgPort {
     /// Qualify a DDI port as a Type-C port: IceLake DDI C–F
     /// only (TC1–TC4). Combo ports and EHL/JSL ports (which
@@ -293,6 +342,122 @@ impl MgPort {
             Some(Gen11Phy::Mg { tc }) => Ok(Self { ddi, tc }),
             _ => Err(ModesetError::UnsupportedGeneration),
         }
+    }
+
+    /// `icl_tc_phy_hpd_live_status`: TBT-alt and DP-alt from the FIA,
+    /// legacy from the ICP south ISR. `None` while the PHY is in TCCOLD
+    /// (an all-ones FIA read: nothing connected).
+    pub fn live_status(self, io: &(impl MmioWindow + ?Sized)) -> Option<TcLive> {
+        let fia = io.read32(PORT_TX_DFLEXDPSP);
+        if fia == u32::MAX {
+            return None;
+        }
+        let idx = u32::from(self.tc);
+        Some(TcLive {
+            tbt_alt: fia & (1 << (idx * 8 + 6)) != 0,
+            dp_alt: fia & (1 << (idx * 8 + 5)) != 0,
+            legacy: io.read32(SDEISR) & (1 << (24 + idx)) != 0,
+        })
+    }
+
+    /// `intel_tc_port_max_lane_count` for DP-alt: the pin assignment in
+    /// `DFLEXDPSP` (`DP_LANE_ASSIGNMENT_MASK`) through
+    /// `icl_get_max_lane_count`. Legacy ports have all four.
+    fn max_lanes(self, io: &(impl MmioWindow + ?Sized), mode: TcMode) -> Result<u8, ModesetError> {
+        if mode == TcMode::Legacy {
+            return Ok(4);
+        }
+        let assigned = (io.read32(PORT_TX_DFLEXDPSP) >> (u32::from(self.tc) * 8)) & 0xF;
+        match assigned {
+            1 | 2 | 4 | 8 => Ok(1),
+            3 | 12 => Ok(2),
+            15 => Ok(4),
+            _ => Err(ModesetError::PhyBusFailure),
+        }
+    }
+
+    /// `icl_tc_phy_connect`: claim the PHY from the FIA for a legacy or
+    /// DP-alt sink and return the lanes it can carry. The IOM must report
+    /// the PHY ready (`DFLEXDPPMS`) before display sets its `NOT_SAFE`
+    /// ownership bit in `DFLEXDPCSSS`; a DP-alt sink that went away or has
+    /// fewer than `required_lanes` lanes releases it again. TBT-alt takes
+    /// no ownership: the TBT controller keeps the PHY (`connect` returns
+    /// the full width, which the TBT link itself bounds). Ice Lake has no
+    /// TC-cold to block (no power well backs `TC_COLD_OFF`).
+    pub fn connect(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+        mode: TcMode,
+        required_lanes: u8,
+    ) -> Result<u8, ModesetError> {
+        if mode == TcMode::TbtAlt {
+            return Ok(4);
+        }
+        let bit = 1u32 << self.tc;
+        let ready = io.read32(PORT_TX_DFLEXDPPMS);
+        let owned = io.read32(PORT_TX_DFLEXDPCSSS);
+        if ready == u32::MAX || owned == u32::MAX || ready & bit == 0 {
+            return Err(ModesetError::PhyBusFailure);
+        }
+        io.write32(PORT_TX_DFLEXDPCSSS, owned | bit);
+        let verified = match mode {
+            TcMode::Legacy => Ok(4),
+            _ => match self.live_status(io) {
+                Some(live) if live.dp_alt => self.max_lanes(io, mode).and_then(|max| {
+                    (max >= required_lanes)
+                        .then_some(max)
+                        .ok_or(ModesetError::PhyBusFailure)
+                }),
+                _ => Err(ModesetError::PhyBusFailure),
+            },
+        };
+        if verified.is_err() {
+            self.release(io);
+        }
+        verified
+    }
+
+    /// Clear display's `NOT_SAFE` claim (`icl_tc_phy_take_ownership(tc,
+    /// false)`).
+    fn release(self, io: &(impl MmioWindow + ?Sized)) {
+        let owned = io.read32(PORT_TX_DFLEXDPCSSS);
+        if owned != u32::MAX {
+            io.write32(PORT_TX_DFLEXDPCSSS, owned & !(1u32 << self.tc));
+        }
+    }
+
+    /// `icl_tc_phy_disconnect`: legacy and DP-alt give the PHY back;
+    /// TBT-alt never took it.
+    pub fn disconnect(self, io: &(impl MmioWindow + ?Sized), mode: TcMode) {
+        if mode != TcMode::TbtAlt {
+            self.release(io);
+        }
+    }
+
+    /// `intel_tc_port_set_fia_lane_count`: the main-link lanes in
+    /// `DFLEXDPMLE1`, lane-reversed (ML3 / ML3_2) on a reversed DP-alt
+    /// connector. Legacy connectors are never reversed here.
+    pub fn set_fia_lanes(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+        width: u8,
+        lane_reversal: bool,
+    ) -> Result<(), ModesetError> {
+        let idx = u32::from(self.tc) * 4;
+        let lanes = match (width, lane_reversal) {
+            (1, false) => 1,
+            (1, true) => 8,
+            (2, false) => 3,
+            (2, true) => 12,
+            (4, _) => 15,
+            _ => return Err(ModesetError::PhyBusFailure),
+        };
+        let cur = io.read32(PORT_TX_DFLEXDPMLE1);
+        if cur == u32::MAX {
+            return Err(ModesetError::PhyBusFailure);
+        }
+        io.write32(PORT_TX_DFLEXDPMLE1, (cur & !(0xF << idx)) | (lanes << idx));
+        Ok(())
     }
 
     /// `MG_PLL_ENABLE(tc_port)` for this port.
@@ -401,6 +566,27 @@ impl MgPort {
     /// `ICL_DPCLKA_CFGCR0_TC_CLK_OFF` bit.
     pub fn route_clock(self, io: &(impl MmioWindow + ?Sized)) -> Result<(), ModesetError> {
         self.rmw(io, ddi_clk_sel(self.ddi), 0xF << 28, DDI_CLK_SEL_MG)?;
+        self.rmw(io, DPCLKA_CFGCR0, self.clock_off(), 0)
+    }
+
+    /// `icl_ddi_tc_enable_clock` on the TBT PLL (TBT-alt): `DDI_CLK_SEL`
+    /// takes the TBT tap for the link clock (`icl_pll_to_ddi_clk_sel`:
+    /// 162/270/540/810 MHz → 0xC..0xF), then the port's DPCLKA TC clock
+    /// gate opens. The TBT PLL itself is `intel_gpu_gen11_dpll::
+    /// tbt_pll_enable`'s; other link clocks have no TBT tap.
+    pub fn route_tbt_clock(
+        self,
+        io: &(impl MmioWindow + ?Sized),
+        port_clock_khz: u32,
+    ) -> Result<(), ModesetError> {
+        let select = match port_clock_khz {
+            162_000 => 0xC,
+            270_000 => 0xD,
+            540_000 => 0xE,
+            810_000 => 0xF,
+            _ => return Err(ModesetError::PllLockTimeout),
+        };
+        self.rmw(io, ddi_clk_sel(self.ddi), 0xF << 28, select << 28)?;
         self.rmw(io, DPCLKA_CFGCR0, self.clock_off(), 0)
     }
 
@@ -738,6 +924,117 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_gen11_mg_phy", smoke_gen11_mg_tables);
+
+    /// Q8: the ICL Type-C connect/disconnect flow through FIA1. TC2
+    /// (DDI D) is index 1 everywhere.
+    fn smoke_icl_tc_fia_ownership() -> TestResult {
+        let port = match MgPort::new(Ddi::D, Gen11Platform::IceLake) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("ICL DDI D is TC2"),
+        };
+        let io = MgModel::new();
+        let set = |off: u64, v: u32| {
+            io.regs.borrow_mut().insert(off, v);
+        };
+        // TCCOLD: the FIA reads all-ones, nothing is connected.
+        set(PORT_TX_DFLEXDPSP, u32::MAX);
+        if port.live_status(&io).is_some() {
+            return TestResult::Fail("an all-ones FIA is TCCOLD, not a live mode");
+        }
+        // DP-alt live (bit 8 + 5) with pin assignment ML1_0 (2 lanes),
+        // the PHY ready (bit 1): ownership is taken, 2 lanes reported.
+        set(PORT_TX_DFLEXDPSP, (1 << 13) | (3 << 8));
+        set(PORT_TX_DFLEXDPPMS, 1 << 1);
+        set(PORT_TX_DFLEXDPCSSS, 1 << 0);
+        let live = port.live_status(&io).unwrap_or_default();
+        if live.mode() != Some(TcMode::DpAlt) {
+            return TestResult::Fail("bit 13 is TC2's DP-alt live state");
+        }
+        if port.connect(&io, TcMode::DpAlt, 2) != Ok(2) {
+            return TestResult::Fail("a ready 2-lane DP-alt PHY must connect");
+        }
+        if io.writes_to(PORT_TX_DFLEXDPCSSS) != alloc::vec![(1 << 0) | (1 << 1)] {
+            return TestResult::Fail("ownership must add NOT_SAFE(1) beside TC1's claim");
+        }
+        if port.set_fia_lanes(&io, 2, true).is_err()
+            || io.writes_to(PORT_TX_DFLEXDPMLE1) != alloc::vec![12 << 4]
+        {
+            return TestResult::Fail("a reversed 2-lane link is ML3_2");
+        }
+        port.disconnect(&io, TcMode::DpAlt);
+        if io.writes_to(PORT_TX_DFLEXDPCSSS).last() != Some(&(1 << 0)) {
+            return TestResult::Fail("disconnect must clear only this port's claim");
+        }
+        // Needing 4 lanes on a 2-lane assignment releases the claim.
+        let io = MgModel::new();
+        io.regs
+            .borrow_mut()
+            .insert(PORT_TX_DFLEXDPSP, (1 << 13) | (3 << 8));
+        io.regs.borrow_mut().insert(PORT_TX_DFLEXDPPMS, 1 << 1);
+        if port.connect(&io, TcMode::DpAlt, 4).is_ok()
+            || io.writes_to(PORT_TX_DFLEXDPCSSS) != alloc::vec![1 << 1, 0]
+        {
+            return TestResult::Fail("too few lanes must give the PHY back");
+        }
+        // Not ready: no ownership write at all.
+        let io = MgModel::new();
+        io.regs.borrow_mut().insert(PORT_TX_DFLEXDPSP, 1 << 13);
+        if port.connect(&io, TcMode::DpAlt, 1).is_ok()
+            || !io.writes_to(PORT_TX_DFLEXDPCSSS).is_empty()
+        {
+            return TestResult::Fail("an unready PHY must not be claimed");
+        }
+        // Legacy: the ICP ISR bit (24 + 1), four lanes; TBT-alt: no claim.
+        let io = MgModel::new();
+        io.regs.borrow_mut().insert(SDEISR, 1 << 25);
+        io.regs.borrow_mut().insert(PORT_TX_DFLEXDPPMS, 1 << 1);
+        if port.live_status(&io).and_then(TcLive::mode) != Some(TcMode::Legacy)
+            || port.connect(&io, TcMode::Legacy, 4) != Ok(4)
+        {
+            return TestResult::Fail("a legacy connector connects with four lanes");
+        }
+        let io = MgModel::new();
+        io.regs.borrow_mut().insert(PORT_TX_DFLEXDPSP, 1 << 14);
+        if port.live_status(&io).and_then(TcLive::mode) != Some(TcMode::TbtAlt)
+            || port.connect(&io, TcMode::TbtAlt, 4) != Ok(4)
+            || !io.writes_to(PORT_TX_DFLEXDPCSSS).is_empty()
+        {
+            return TestResult::Fail("TBT-alt keeps the PHY with the TBT controller");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_mg_phy",
+        smoke_icl_tc_fia_ownership
+    );
+
+    /// TBT-alt routes the port to the TBT PLL's tap for its link clock.
+    fn smoke_icl_tbt_clock_routing() -> TestResult {
+        let Ok(port) = MgPort::new(Ddi::E, Gen11Platform::IceLake) else {
+            return TestResult::Fail("ICL DDI E is TC3");
+        };
+        for (clock, select) in [
+            (162_000, 0xC),
+            (270_000, 0xD),
+            (540_000, 0xE),
+            (810_000, 0xF),
+        ] {
+            let io = MgModel::new();
+            if port.route_tbt_clock(&io, clock).is_err()
+                || io.writes_to(ddi_clk_sel(Ddi::E)) != alloc::vec![select << 28]
+            {
+                return TestResult::Fail("DDI_CLK_SEL must take the TBT tap for the rate");
+            }
+        }
+        if port.route_tbt_clock(&MgModel::new(), 216_000).is_ok() {
+            return TestResult::Fail("a link clock without a TBT tap must refuse");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen11_mg_phy",
+        smoke_icl_tbt_clock_routing
+    );
 
     fn smoke_gen11_mg_port_qualification() -> TestResult {
         let icl = Gen11Platform::IceLake;
