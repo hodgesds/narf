@@ -3878,6 +3878,25 @@ pub(crate) fn claim_navi48<R, E>(
         prepare,
     )
 }
+
+/// Whether the bound GPU is an RDNA3 die (Navi31, Navi32 or Navi33, by
+/// discovered GC). The `navi31` names predate Navi32/33 and cover the whole
+/// family, as the `navi48` names do for RDNA4.
+pub(crate) fn is_navi31() -> bool {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .is_some_and(|gpu| crate::amdgpu_rdna3::Rdna3Chip::of(gpu).is_some())
+}
+/// `claim_navi22`'s counterpart for any RDNA3 die.
+pub(crate) fn claim_navi31<R, E>(
+    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
+) -> Option<Result<R, E>> {
+    claim_matching(
+        |gpu| crate::amdgpu_rdna3::Rdna3Chip::of(gpu).is_some(),
+        prepare,
+    )
+}
 fn claim_matching<R, E>(
     matches: impl FnOnce(&AmdGpu) -> bool,
     prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
@@ -4016,6 +4035,52 @@ mod navi22_ownership_tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22",
         navi22_boot_claim_excludes_legacy_access_and_suspend
+    );
+
+    fn navi31_boot_claim_excludes_wrong_owner() -> TestResult {
+        if is_probed() {
+            return TestResult::Skip("real controller owns the global slot");
+        }
+        // Every RDNA3 die takes the same exclusive skeleton claim.
+        for profile in crate::amdgpu_rdna3::tests::Profile::ALL {
+            let mut gpu = crate::amdgpu_gfx_navi22::tests::gpu();
+            profile.apply(&mut gpu);
+            let did = gpu.chip.did;
+            *CONTROLLER.lock() = Some(gpu);
+            let claimed = is_navi31()
+                && claim_navi22(|_| Ok::<_, ()>(())).is_none()
+                && claim_navi48(|_| Ok::<_, ()>(())).is_none()
+                && claim_navi31(|_| Ok::<_, ()>(())) == Some(Ok(()))
+                && info_snapshot().is_some_and(|info| info.did == u32::from(did));
+            *CONTROLLER.lock() = None;
+            DISCRETE_OWNED.store(false, Ordering::Release);
+            if !claimed {
+                return TestResult::Fail("RDNA3 profile skeleton claim");
+            }
+        }
+        // A failed prepare releases the claim; a successful one excludes
+        // every other owner, including the RDNA2/RDNA4 claims.
+        *CONTROLLER.lock() = Some(crate::amdgpu_rdna3::tests::gpu());
+        let failed: Option<Result<(), ()>> = claim_navi31(|_| Err(()));
+        let released = failed == Some(Err(())) && with_controller(|_| true) == Some(true);
+        let claimed = claim_navi31(|_| Ok::<_, ()>(())) == Some(Ok(()));
+        let exclusive = with_controller(|_| true).is_none()
+            && with_controller_mut(|_| true).is_none()
+            && claim_navi31(|_| Ok::<_, ()>(())).is_none()
+            && claim_navi22(|_| Ok::<_, ()>(())).is_none()
+            && claim_navi48(|_| Ok::<_, ()>(())).is_none()
+            && info_snapshot().is_some_and(|info| info.did == u32::from(NAVI31))
+            && is_navi31();
+        *CONTROLLER.lock() = None;
+        DISCRETE_OWNED.store(false, Ordering::Release);
+        if !(released && claimed && exclusive) {
+            return TestResult::Fail("Navi31 ownership rollback or exclusivity");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi31",
+        navi31_boot_claim_excludes_wrong_owner
     );
 }
 

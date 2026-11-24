@@ -521,6 +521,8 @@ pub mod amdgpu_rdna2_thermal;
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_thermal as amdgpu_navi22_thermal;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_navi31_platform;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_boot;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_dispatch;
@@ -591,6 +593,8 @@ mod amdgpu_rdna2_mmr;
 pub mod amdgpu_rdna2_reset;
 #[cfg(feature = "amdgpu")]
 mod amdgpu_rdna2_vram;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_rdna3;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna4;
 #[cfg(feature = "amdgpu")]

@@ -1,6 +1,7 @@
 //! Boot-only CPU framebuffer handoff for discrete AMD GDDR6 training. This is not a
 //! runtime pause API: mmap writers cannot be stopped by a software flag.
 use core::sync::atomic::{AtomicBool, Ordering};
+use narf_drivers_gpu::amdgpu_navi31_platform as navi31;
 use narf_drivers_gpu::amdgpu_navi48_platform as navi48;
 use narf_drivers_gpu::amdgpu_rdna2_platform as platform;
 use narf_init::InitResult;
@@ -67,7 +68,21 @@ pub(super) fn start() -> InitResult {
         narf_drivers_gpu::amdgpu::with_controller(narf_drivers_gpu::amdgpu_rdna4::Rdna4Chip::of)
             .flatten();
     let navi48 = rdna4.is_some();
-    let generation = rdna4.map_or("navi22", |die| die.asic());
+    // Any RDNA3 die (Navi31, Navi32 or Navi33, by discovered GC) takes the
+    // `amdgpu_navi31_platform` skeleton path; the log names the die. The
+    // skeleton claims the card and retains its identity; no bring-up stage
+    // exists yet, so the inherited display is left alone.
+    let rdna3 = if navi48 {
+        None
+    } else {
+        narf_drivers_gpu::amdgpu::with_controller(narf_drivers_gpu::amdgpu_rdna3::Rdna3Chip::of)
+            .flatten()
+    };
+    let navi31 = rdna3.is_some();
+    let generation = rdna4.map_or_else(
+        || rdna3.map_or("navi22", |die| die.asic()),
+        |die| die.asic(),
+    );
     // The pause exists for one hazard: CPU writers drawing into THIS GPU's
     // VRAM while training/reset owns it. A boot framebuffer provably outside
     // the GPU's VRAM aperture (the iGPU GOP console with the discrete card as
@@ -95,6 +110,9 @@ pub(super) fn start() -> InitResult {
     let prepared = if navi48 {
         // SAFETY: same final boot handoff and paused writers described above.
         unsafe { navi48::prepare(framebuffer) }.map_err(|e| refused(generation, e))
+    } else if navi31 {
+        // SAFETY: same final boot handoff and paused writers described above.
+        unsafe { navi31::prepare(framebuffer) }.map_err(|e| refused(generation, e))
     } else {
         // SAFETY: same final boot handoff and paused writers described above.
         unsafe { platform::prepare(framebuffer) }.map_err(|e| refused(generation, e))
@@ -135,6 +153,8 @@ pub(super) fn start() -> InitResult {
     // here they gave every boot — GPU or not — a 20 KiB frame.
     let ok = if navi48 {
         bring_up_navi48(generation, &options, console_off_gpu)
+    } else if navi31 {
+        bring_up_navi31(generation)
     } else {
         bring_up_navi22(generation, &options)
     };
@@ -156,7 +176,7 @@ pub(super) fn start() -> InitResult {
     {
         navi48::set_max_bpc(bpc);
     }
-    if ok && !navi48 {
+    if ok && !navi48 && !navi31 {
         navi22_after_bring_up(&options, console_off_gpu);
     }
     // `amdgpu.dcfeaturemask`: bit 0x400 (Linux's DC_FRL_MASK)
@@ -225,6 +245,18 @@ fn bring_up_navi48(
             narf_drivers_gpu::amdgpu_navi48_runtime_pm::register(runpm, console_on_gpu)
         });
     }
+    result.is_ok()
+}
+
+/// Navi31 (RDNA3) identity skeleton: no bring-up stage exists yet, so the
+/// run reports the retained identity with zero stages complete and leaves
+/// the inherited display alone. Later lanes replace the skeleton stages
+/// one at a time; the first real stage fails closed in `navi31::run`.
+#[inline(never)]
+fn bring_up_navi31(generation: &str) -> bool {
+    // SAFETY: the retained prepared owner and paused CPU writers persist.
+    let result = block_on_boxed(|| unsafe { navi31::run() });
+    completed(generation, result, navi31::status());
     result.is_ok()
 }
 

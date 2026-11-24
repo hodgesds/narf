@@ -4761,6 +4761,57 @@ interleave GB_ADDR_CONFIG, zero CUs/RBs, or GC dimensions beyond the GFX10
 DRM layout are refused; only device loss or revoked authority fails the
 cold-boot stage.
 
+### RDNA3 family: Navi31, Navi32 and Navi33 (RX 7000)
+
+Every "Navi 31" section below applies to all three RDNA3 discrete dies.
+What selects a die is `amdgpu_rdna3::Rdna3Chip`, by discovered GC — never
+the PCI device id, which only names the board.
+
+**Identification.** Linux binds RDNA3 through `amdgpu_drv.c`'s generic AMD
+`PCI_CLASS_DISPLAY_VGA` / `_OTHER` entries (`CHIP_IP_DISCOVERY`) and decides
+everything from the discovery blob. NARF does the same: the class-match
+backstop reaches `probe` for any AMD display function; `Rdna3Chip::of(gpu)`
+is the only RDNA3 gate: AMD vendor, `Family::Navi3`, a device id the PCI
+table does not give another family, and one GC0 of 11.0.0 (`Navi31`),
+11.0.3 (`Navi32`) or 11.0.2 (`Navi33`). `is_navi31()` / `claim_navi31()`
+match any RDNA3 die. `amdgpu_rdna3::KNOWN_DEVICES` is the one RDNA3 PCI id
+list — the 20 `pci.ids` v2026.11.22 ids (Navi31 0x7446/0x7448/0x7449/0x744A/
+0x744B/0x744C/0x745E, Navi32 0x7460/0x7461/0x7470/0x747E, Navi33 0x73F0/
+0x7480/0x7481/0x7483/0x7487/0x7489/0x748B/0x7499/0x749F) — used only for
+exact bus matches, the probe log's `pci.ids` name and tests; unlisted ids
+bind by discovery alone. `amdgpu::NAVI31` remains a named constant, not a
+gate. Register banks accept `amdgpu_rdna3::GC_VERSIONS` (11.0.0, 11.0.2,
+11.0.3) and `MP_VERSIONS` (13.0.0, 13.0.7, 13.0.10: one `psp_v13_0` /
+`smu_v13_0`).
+
+**The die↔GC pairing is the opposite of the pre-launch guess.** Early
+(July 2022) patch tables had Navi32 at GC 11.0.2 and Navi33 at 11.0.3.
+The firmware sets say otherwise: Ubuntu LP#2034103 files the GC 11.0.3
+set (`gc_11_0_3` + `psp_13_0_10` + `sdma_6_0_3` + `smu_13_0_10` +
+`vcn_4_0_0`) for Navi32 hardware, and the Gentoo AMDGPU firmware table
+lists NAVI32 on that set and NAVI33 on the GC 11.0.2 set (`gc_11_0_2` +
+`psp_13_0_7` + `sdma_6_0_2` + `smu_13_0_7` + `dcn_3_2_1_dmcub` +
+`vcn_4_0_4`). Mesa's drm-shim `navi33` entry (device 0x7480) reports
+`external_rev = 0x10`, which is `soc21_common_early_init`'s GC 11.0.2
+assignment (`rev_id + 0x10`; 11.0.3 assigns `+ 0x20`, 11.0.0 `+ 0x1`).
+No extracted Linux file names the dies, so the pairing rests on the
+firmware sets; per-die versions are `Rdna3Chip::ip_versions`. Navi31 and
+Navi32 share DCN 3.2.0 (`dcn_3_2_0_dmcub.bin`); Navi33 is DCN 3.2.1.
+All three dies' VCN versions (4.0.0, 4.0.0, 4.0.4) take the `vcn_v4_0`
+block, which is why the Navi3 → `V4_0_2` map holds for the whole family;
+Navi33's 4.0.4 is Gentoo-table-only and lane 10 re-checks it against
+`vcn_v4_0.c`.
+
+**Owner skeleton.** `amdgpu_navi31_platform` claims the bound card, retains
+the discovered die (`Skeleton`, `Status::Retained(Diagnostics)`) and
+reports a `Report` with zero stages complete and `next_stage` the first
+unimplemented stage. It performs no device writes, loads no firmware and
+touches no engine; the fb boot dispatch (`fb/src/amdgpu_boot.rs`) routes
+any RDNA3 die to it, and a Navi31 card boots exactly as before (GOP
+framebuffer) until the PSP/SMU lane lands the first real stage. The
+stage list is the tracker (#2455) lane order: memory training, PSP, SMU,
+GMC, IH, DCN, CP, SDMA, submitter, VCN, thermal.
+
 ### RDNA4 family: Navi48 and Navi44 (RX 9000)
 
 Every "Navi 48" section below applies to both RDNA4 dies. The `navi48`
