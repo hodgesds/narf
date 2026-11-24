@@ -2183,6 +2183,7 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
                     },
                     caps: probe.caps,
                     audio_published: false,
+                    pcon: crate::dp_pcon::PconLink::Untouched,
                 },
                 false,
             ),

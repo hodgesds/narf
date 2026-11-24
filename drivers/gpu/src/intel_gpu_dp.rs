@@ -611,6 +611,41 @@ pub struct DpConnection {
     pub caps: DpcdCaps,
     /// Whether an ELD was published for this connection.
     pub audio_published: bool,
+    /// What a DP-to-HDMI 2.1 PCON's HDMI side runs
+    /// ([`crate::dp_pcon::check_frl_training`]).
+    pub pcon: crate::dp_pcon::PconLink,
+}
+
+/// `intel_dp_check_frl_training` for the sink behind `ddi`: a
+/// source-control PCON driving an HDMI 2.1 sink (the EDID read through it
+/// carries the HDMI VSDB and a max FRL rate) trains FRL, falling back to
+/// TMDS. Anything else is left untouched, as is a PCON whose caps cannot
+/// be read.
+pub fn pcon_frl_training<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    ddi: Ddi,
+    dpcd_rev: u8,
+    edid: &[u8],
+) -> crate::dp_pcon::PconLink {
+    use crate::dp_pcon::{check_frl_training, read_pcon_caps, sink_max_frl_gbps, PconLink};
+    let mut aux = IntelAux::new(mmio, ddi);
+    let Ok(Some(pcon)) = read_pcon_caps(&mut aux, dpcd_rev) else {
+        return PconLink::Untouched;
+    };
+    let hf = crate::intel_gpu_hdmi::parse_hf_vsdb(edid);
+    let sink_max = sink_max_frl_gbps(hf.max_frl_gbps, hf.dsc_max_frl_gbps, &pcon);
+    check_frl_training(
+        &mut aux,
+        &pcon,
+        crate::intel_gpu_hdmi::is_hdmi_sink(edid),
+        sink_max,
+        |us| {
+            let _ = narf_scheduler::responsive_spin_until(
+                || false,
+                narf_time::Deadline::after_ns(u64::from(us) * 1000),
+            );
+        },
+    )
 }
 
 /// The display-audio sink id for a DDI: DDI index + 1 (0 is
@@ -789,6 +824,14 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
         rate: probe.negotiated.rate,
         lanes: probe.negotiated.lanes,
     };
+    // A PCON trains its HDMI side before the DP link trains
+    // (`intel_ddi_pre_enable_dp` → `intel_dp_check_frl_training`).
+    let pcon = pcon_frl_training(
+        mmio,
+        probe.ddi,
+        probe.caps.dpcd_rev,
+        &probe.edid[..probe.edid_len],
+    );
     let mut modeset = Modeset::for_pipe(mmio, probe.ddi, pipe);
     modeset.set_source_family(family);
     if let Some((start, end)) = dbuf_share {
@@ -857,6 +900,7 @@ pub fn activate_on_pipe<M: MmioWindow + ?Sized>(
         trained,
         caps: probe.caps,
         audio_published,
+        pcon,
     })
 }
 

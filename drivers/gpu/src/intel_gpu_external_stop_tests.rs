@@ -136,6 +136,7 @@ impl Io {
                 msa_timing_par_ignored: false,
             },
             audio_published: false,
+            pcon: crate::dp_pcon::PconLink::Untouched,
         }
     }
     fn fb(&self) -> Framebuffer {

@@ -154,6 +154,12 @@ pub struct HfVsdb {
     /// Max TMDS character rate in kHz (5 MHz units on the
     /// wire); 0 when the block carries no rate byte.
     pub max_tmds_char_rate_khz: u32,
+    /// Max FRL rate in Gbps (`hf_scds[7]` bits 7:4 through
+    /// `drm_get_max_frl_rate`); 0 for a sink without FRL.
+    pub max_frl_gbps: u8,
+    /// Max FRL rate for DSC transport (`hf_scds[12]` bits 7:4, when the
+    /// block declares DSC 1.2); 0 otherwise.
+    pub dsc_max_frl_gbps: u8,
 }
 
 /// Scan a complete EDID's CTA extensions for the HF-VSDB.
@@ -434,6 +440,17 @@ pub fn parse_hf_vsdb(edid: &[u8]) -> HfVsdb {
                     out.scdc_present = features & 0x80 != 0;
                     out.scdc_read_request_capable = features & 0x40 != 0;
                     out.lte_340mcsc_scramble = features & 0x08 != 0;
+                }
+                // drm_parse_hdmi_forum_scds: hf_scds[7] (payload[6]) carries
+                // the max FRL rate; hf_scds[11] bit 7 is DSC 1.2 and
+                // hf_scds[12] its max FRL rate.
+                if let Some(&frl) = payload.get(6) {
+                    out.max_frl_gbps = crate::dp_pcon::frl_rate_gbps(frl >> 4);
+                }
+                if payload.get(10).is_some_and(|b| b & (1 << 7) != 0) {
+                    if let Some(&dsc) = payload.get(11) {
+                        out.dsc_max_frl_gbps = crate::dp_pcon::frl_rate_gbps(dsc >> 4);
+                    }
                 }
             }
             pos += 1 + len;
@@ -1937,6 +1954,52 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hdmi_ycbcr420_parse);
+
+    /// `drm_parse_hdmi_forum_scds`: the max FRL rate in `hf_scds[7]` and,
+    /// with DSC 1.2 declared in `hf_scds[11]`, the DSC max FRL rate in
+    /// `hf_scds[12]`.
+    fn smoke_hf_vsdb_frl_rates() -> TestResult {
+        let edid = cta_edid(&[&[
+            (3 << 5) | 12,
+            0xD8,
+            0x5D,
+            0xC4,
+            1,
+            120,
+            0x80,
+            0x60,
+            0,
+            0,
+            0,
+            0x80,
+            0x30,
+        ]]);
+        let hf = parse_hf_vsdb(&edid);
+        if hf.max_frl_gbps != 48 || hf.dsc_max_frl_gbps != 24 {
+            return TestResult::Fail("the HF-VSDB must carry 48G FRL and 24G DSC FRL");
+        }
+        let no_dsc = cta_edid(&[&[
+            (3 << 5) | 12,
+            0xD8,
+            0x5D,
+            0xC4,
+            1,
+            120,
+            0x80,
+            0x30,
+            0,
+            0,
+            0,
+            0,
+            0x30,
+        ]]);
+        let hf = parse_hf_vsdb(&no_dsc);
+        if hf.max_frl_gbps != 24 || hf.dsc_max_frl_gbps != 0 {
+            return TestResult::Fail("the DSC FRL rate needs DSC 1.2");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_hdmi", smoke_hf_vsdb_frl_rates);
 
     /// `intel_hdmi_compute_output_format`: 4:2:0-only VICs, the 4:2:0-also
     /// fallback when RGB fits at no depth (a TMDS limit or the ICL+ combo
