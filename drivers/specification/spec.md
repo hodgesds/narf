@@ -388,6 +388,93 @@ error reaches `write(2)` as its Linux errno:
 Not ported from Linux spd5118: the nvmem EEPROM view, thermal-zone
 registration, and the register cache across suspend.
 
+### 3.9 AMD PMF static power slider (`narf_drivers_platform::amd_pmf`)
+
+`amd_pmf` ports the static-slider ("SPS") part of Linux
+`drivers/platform/x86/amd/pmf`.
+
+**Binding.** It binds the first present (`_STA` bit 0) ACPI device whose
+HID is one of `AMDI0102`, `AMDI0103`, `AMDI0105`, `AMDI0107` or `AMDI0108`.
+`AMDI0100` binds only with `amd_pmf.force_load`, which is parsed like
+`param_set_bool`. The root complex `00:00.0` must be Rembrandt, Phoenix or a
+1Ah M20H/M60H part.
+
+**SMU mailbox.** `amd_smu` holds the mailbox that `amd_pmc` and `amd_pmf`
+share:
+
+- the window is reached through SMN `0x13B102E8`/`EC`, plus `0x10000`, over
+  a 4 KiB page;
+- the protocol is `amd_*_send_cmd` with a 1 s response timeout;
+- `SmuError::{Timeout, Busy, Unknown, Failed}` cover the response codes.
+
+PMF's registers in that window are message `0xA18`, argument `0xA58` and
+response `0xA78`. SMN reads go through `narf_bus::amd_smn::read`, the single
+locked index/data path (`amd_smn_read`). k10temp and amd_pmc use it too.
+
+**Probe.** Probe reads these APMF functions:
+
+| Function | Name | Use |
+|---|---|---|
+| 0 | `VERIFY_INTERFACE` | interface version, notification mask, supported-function bitmap (bit `n-1` = function `n`) |
+| 1 | `GET_SYS_PARAMS` | heartbeat interval |
+| 9 | `STATIC_SLIDER_GRANULAR` | the power-limit tables |
+
+Every buffer is checked as `apmf_if_call_store_buffer` checks it. The
+tables come in two forms:
+
+- **Interface v1:** six limit sets, one per source (AC/DC) and mode
+  (performance / balanced / power-saver).
+- **Interface v2:** per-(source, mode) indices into the 16-entry
+  `APTS(1, i, 0)` table.
+
+The log line names the version, the bitmap, and the advertised functions
+this driver does not handle.
+
+**`amd-pmf` platform-profile backend.** The choices are `low-power`,
+`balanced` and `performance`. It starts in `balanced`, and probe pushes
+that slider's limits.
+
+A profile change follows `amd_pmf_profile_set`:
+
+1. tell the BIOS through `OS_POWER_SLIDER_UPDATE` (function 8; slider bits
+   `DC_BEST_PERF`..`AC_BETTER_BATTERY`);
+2. push the table row to the SMU:
+   - **v1:** `SET_SPL`, `FPPT`, `SPPT`, `SPPT_APU_ONLY`, `STT_MIN` and the
+     Q8.8 APU/HS2 skin limits;
+   - **v2:** `SET_PMF_PPT`, `PMF_PPT_APU_ONLY`, `STT_MIN` and the two skin
+     limits.
+
+SMU rejections are logged, and the rest of the row is still sent, as in
+Linux.
+
+**Power-source changes.** An AC transition (`narf_power::ac` events, now
+raised by ACPI `Notify(ACPI0003, 0x00/0x01/0x80)`) re-pushes the row for the
+new source, then re-tells the BIOS. The power source follows
+`power_supply_is_system_supplied`: on AC if any adapter is online, or if
+there is no adapter at all.
+
+**Heartbeats.** A v1 BIOS with a non-zero interval gets the function-4
+heartbeat every interval until a call fails. A BIOS with function 16 gets
+the v2 load heartbeat.
+
+**Locking.** Mailbox batches hold the mailbox lock. No AML method runs
+under it, and AML is evaluated with no lock held.
+
+**Deviations from Linux.**
+
+- If a table is advertised but unreadable, no limits are pushed. Linux
+  copies an uninitialised buffer in that case.
+
+**Not ported:**
+
+- Auto Mode and CnQF (their transitions and the metrics table);
+- Smart PC (it needs the PSP TEE);
+- SBIOS request notifications;
+- suspend/resume heartbeats;
+- the debugfs `current_power_limits`;
+- the hidden `quiet` / `balanced-performance` choices, which have no slot in
+  the single-backend list.
+
 ## 4. ABI versioning
 
 Modelled directly on `userspace/syscall.rs`'s syscall versioning

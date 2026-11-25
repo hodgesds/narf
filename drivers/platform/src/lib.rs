@@ -26,6 +26,7 @@ pub mod amd_aoac;
 pub mod amd_asf;
 pub mod amd_pmc;
 pub mod amd_pmc_quirks;
+pub mod amd_pmf;
 pub mod amd_smu;
 /// Battery / lid / buttons all consume the EC's platform-event
 /// feed. On aarch64 the equivalent path goes through SoC-specific
@@ -190,6 +191,20 @@ pub fn register_initcalls() {
             }
         }
         InitResult::Ok
+    });
+    // `amd_pmf_probe` (static slider): after PCI enumeration has listed the
+    // root complex, before the Stage::Late platform_profile publication.
+    #[cfg(target_arch = "x86_64")]
+    narf_init::register(Stage::Device, "amd-pmf", || match amd_pmf::init() {
+        Ok(()) => InitResult::Ok,
+        Err(amd_pmf::PmfError::Absent | amd_pmf::PmfError::UnknownCpu(_)) => {
+            InitResult::NotPresent
+        }
+        Err(error) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "amd-pmf: not bound: {error:?}");
+            InitResult::NotPresent
+        }
     });
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-ec", || {
