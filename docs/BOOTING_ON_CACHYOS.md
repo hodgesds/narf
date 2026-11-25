@@ -506,6 +506,49 @@ rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.targe
 `systemd_pid1` on the command line selects the systemd PID 1 kernel build, as
 `--root-policy` does for `grub-image`.
 
+#### An ext4 root, read-write
+
+`narf.disks=root-rw` takes an ext4 root as well as a btrfs one, the
+LUKS-unlocked root above included:
+
+```sh
+cargo xtask efi-image --output target/narf-root-rw.efi \
+  --cmdline "narf.disks=root-rw root=UUID=<LUKS_UUID> rd.luks.uuid=<LUKS_UUID> \
+rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
+```
+
+- **No journal.** NARF writes ext4 metadata in place and never writes the
+  journal. Its writes follow an order in which a crash leaves only what
+  e2fsck repairs: a leaked block, a directory entry reachable twice, a link
+  count one too high. A crash never leaves a name pointing at a freed inode,
+  or a block mapped by two files.
+- **Not clean while mounted.** Because nothing is journaled, a read-write
+  mount clears the clean bit and counts a mount, as Linux does without a
+  journal (`dumpe2fs -h` shows `Filesystem state: not clean`). A remount
+  read-only or an unmount sets it again. After a NARF crash the next CachyOS
+  boot finds the root not clean, and its fsck runs a full e2fsck.
+- **The gate.** The root mounts read-only instead, with the reason on the
+  boot banner, when the filesystem:
+  - has recorded errors or was not cleanly unmounted (run e2fsck);
+  - has a journal needing recovery (boot CachyOS once);
+  - has an orphan list that isn't empty;
+  - has features NARF cannot write: quota, project, bigalloc, verity,
+    legacy `gdt_csum`;
+  - has a default directory hash other than legacy, half-MD4 or TEA.
+
+  A root with an incompat feature NARF cannot read (`meta_bg`,
+  `inline_data`, `encrypt`, `casefold`, `largedir`, `ea_inode`, `mmp`) does
+  not mount at all. A mkfs.ext4 default root (metadata_csum, 64bit,
+  flex_bg, orphan_file, dir_nlink, huge_file) passes.
+- **Before the first `root-rw` boot**, back up the root. Then boot the
+  `root-ro` image above once, to prove the unlock and the mount with nothing
+  written. Shut NARF down cleanly (`systemctl poweroff`). Back in CachyOS,
+  `sudo dumpe2fs -h "$(findmnt -no SOURCE /)" | grep -i state` must say
+  `clean`.
+- **Testing.** The writer runs against real `mkfs.ext4` images on the host
+  (`cargo xtask ext4-host-rw`, judged by `e2fsck -fn`, debugfs and a NARF
+  remount) and in QEMU. It has not been validated on hardware.
+
 The exact accepted profiles and work limits are documented in the
 [encrypted-block specification](../block/specification/encrypted.md).
 
