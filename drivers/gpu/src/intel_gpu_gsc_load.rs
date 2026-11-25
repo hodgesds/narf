@@ -413,6 +413,9 @@ enum Step {
     ProxyBind,
     /// proxy_query: a proxy packet in flight.
     Proxy,
+    /// intel_hdcp_gsc_msg_send: an HDCP command packet in flight
+    /// (`crate::intel_hdcp_live`'s mailbox).
+    Hdcp,
 }
 
 /// The proxy channel: `to_gsc` at 0, `from_gsc` at 32 KiB of one GGTT
@@ -452,6 +455,8 @@ pub(crate) struct GscUc<P, B> {
     woke: bool,
     /// The running proxy request is xe_gsc_proxy_start's, inside FW_LOAD.
     proxy_for_load: bool,
+    /// The HDCP mailbox ticket in flight and its output length.
+    hdcp: Option<(u64, usize)>,
 }
 
 fn put_words(backing: &impl GpuBacking, at: u64, bytes: &[u8]) {
@@ -559,6 +564,7 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
             input: Vec::new(),
             woke: false,
             proxy_for_load: false,
+            hdcp: None,
         }
     }
 
@@ -701,6 +707,7 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
         if !self.idle() {
             return Err(LoadError::Busy);
         }
+        crate::intel_hdcp_live::gsc_set_ready(false);
         let mut objects = Vec::new();
         objects.extend(self.packet.take());
         objects.extend(self.proxy.take().map(|proxy| proxy.channel));
@@ -764,6 +771,12 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
     /// xe_gsc_load_start queues the load again.
     pub(crate) fn abort(&mut self, mmio: &impl MmioWindow) {
         self.actions = 0;
+        crate::intel_hdcp_live::gsc_set_ready(false);
+        if let Some((ticket, _)) = self.hdcp.take() {
+            crate::intel_hdcp_live::gsc_complete(ticket, Err(-(narf_lib::errno::ENODEV as i32)));
+            self.step = Step::Idle;
+            return;
+        }
         if self.step == Step::Idle {
             return;
         }
@@ -793,15 +806,35 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
         huc: &mut HucGsc<B>,
         mut csme: Option<&mut C>,
     ) -> Poll<()> {
+        if crate::intel_hdcp_live::enabled() {
+            // intel_hdcp_gsc_check_status, published for HDCP.
+            crate::intel_hdcp_live::gsc_set_ready(
+                self.status == Status::Running
+                    && !self.wedged
+                    && self.packet.is_some()
+                    && gsccs.holds_wake()
+                    && proxy_init_done(mmio) == Ok(true),
+            );
+        }
         loop {
             let progressed = match self.step {
                 Step::Idle => {
                     if self.actions == 0 {
+                        if self.hdcp_submit(now, gsccs) {
+                            continue;
+                        }
                         return Poll::Ready(());
                     }
                     self.begin_work(mmio, now, gsccs.holds_wake());
                     true
                 }
+                Step::Hdcp => match self.job(now, gsccs) {
+                    None => false,
+                    Some(result) => {
+                        self.hdcp_replied(result);
+                        true
+                    }
+                },
                 Step::Wake => self.woken(mmio, now, gsccs, huc),
                 Step::Upload => match self.job(now, gsccs) {
                     None => false,
@@ -860,6 +893,60 @@ impl<P: GpuBacking, B: GpuBacking> GscUc<P, B> {
                 return Poll::Pending;
             }
         }
+    }
+
+    /// xe_hdcp_gsc.c::xe_gsc_send_sync for HDCP: an idle, running GSC
+    /// whose queue owner holds XE_FW_GSC takes the mailbox's framed command
+    /// into the packet object's input half and submits it with the output
+    /// half sized to the reply (`xe_gsc_pkt_submit_kernel`). The pending
+    /// retry is the HDCP side's (`intel_hdcp_gsc_msg_send`).
+    fn hdcp_submit<Q: Gsccs>(&mut self, now: u64, gsccs: &mut Q) -> bool {
+        if self.status != Status::Running || self.wedged || !gsccs.holds_wake() {
+            return false;
+        }
+        let Some(packet) = self.packet.as_ref() else {
+            return false;
+        };
+        let Some((ticket, input, out_len)) = crate::intel_hdcp_live::gsc_take() else {
+            return false;
+        };
+        if input.len() > PACKET_HALF as usize || out_len > PACKET_HALF as usize {
+            crate::intel_hdcp_live::gsc_complete(ticket, Err(-(narf_lib::errno::ENOSPC as i32)));
+            return true;
+        }
+        put_words(packet, 0, &input);
+        let address = u64::from(packet.ggtt_offset());
+        let submitted = heci_packet(
+            address,
+            input.len() as u32,
+            address + u64::from(PACKET_HALF),
+            out_len as u32,
+        )
+        .map_err(LoadError::Packet)
+        .and_then(|batch| gsccs.submit(&batch));
+        if let Err(error) = submitted {
+            crate::intel_hdcp_live::gsc_complete(ticket, Err(error.errno()));
+            return true;
+        }
+        self.hdcp = Some((ticket, out_len));
+        self.deadline = now.saturating_add(JOB_NS);
+        self.step = Step::Hdcp;
+        true
+    }
+
+    /// The HDCP packet's job ended: hand the output half (GSC header and
+    /// reply) back to the mailbox.
+    fn hdcp_replied(&mut self, result: Result<(), LoadError>) {
+        self.step = Step::Idle;
+        let Some((ticket, out_len)) = self.hdcp.take() else {
+            return;
+        };
+        let reply = match (result, self.packet.as_ref()) {
+            (Ok(()), Some(packet)) => Ok(get_words(packet, u64::from(PACKET_HALF), out_len)),
+            (Ok(()), None) => Err(-(narf_lib::errno::ENODEV as i32)),
+            (Err(error), _) => Err(error.errno()),
+        };
+        crate::intel_hdcp_live::gsc_complete(ticket, reply);
     }
 
     /// gsc_work: take the queued actions and request XE_FW_GSC, or take a

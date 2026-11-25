@@ -734,7 +734,8 @@ pub(crate) fn lt_phy<'a, M: MmioWindow + ?Sized>(
     if !io.has_lt_phy() {
         return Ok(None);
     }
-    let port = crate::intel_gpu_lt_phy::LtPort::from_xelpg(port).ok_or(ExternalError::UnsupportedPort)?;
+    let port =
+        crate::intel_gpu_lt_phy::LtPort::from_xelpg(port).ok_or(ExternalError::UnsupportedPort)?;
     crate::intel_gpu_lt_phy::LtPhy::new(io, port, dp_alt, max_lanes, reversed)
         .map(Some)
         .map_err(phy_err)
@@ -774,8 +775,11 @@ fn port_levels<M: MmioWindow + ?Sized>(
             for (slot, &(swing, pre_emph)) in index.iter_mut().zip(levels) {
                 *slot = crate::intel_gpu_xelpg::preset_index(swing, pre_emph) as u8;
             }
-            lt.program_signal_levels(crate::intel_gpu_lt_phy::LtSignalProtocol::Dp14, &index[..lanes])
-                .map_err(phy_err)
+            lt.program_signal_levels(
+                crate::intel_gpu_lt_phy::LtSignalProtocol::Dp14,
+                &index[..lanes],
+            )
+            .map_err(phy_err)
         }
         None => set_signal_levels(
             &Cx0Phy::with_lanes(io, probe.port, probe.phy_lanes()?),
@@ -2419,6 +2423,12 @@ impl MtlRoute {
     }
 
     fn stop<M: MmioWindow + ?Sized>(&mut self, io: &M) -> Result<(), RouteError> {
+        // HDCP off before the transcoder goes down (`intel_hdcp_disable`);
+        // inert without `narf.intel.hdcp=1`.
+        crate::intel_hdcp_live::route_stopping(
+            io,
+            crate::intel_hdcp_live::xelpg_key(self.port() as u8, self.pipe().transcoder() as u8),
+        );
         match self {
             MtlRoute::Dp(r) => r.stop(io).map_err(RouteError::Dp),
             MtlRoute::Hdmi(r) => r.stop(io).map_err(RouteError::Hdmi),
@@ -3191,6 +3201,34 @@ pub fn routes_stopped() -> bool {
 /// [`external_route_blocks_dc`], which also refuses while a pass runs.
 pub fn route_live() -> bool {
     PRESENCE.live()
+}
+
+/// HDCP (`crate::intel_hdcp_live`): the live SST DP or HDMI route, unless
+/// a pass holds the service. MST is not reported.
+pub(crate) fn hdcp_route() -> Option<crate::intel_hdcp_live::XelpgRoute> {
+    use crate::intel_hdcp_live::{RouteLink, XelpgRoute};
+    let service = SERVICE.try_lock()?;
+    let route = service.route.as_ref().filter(|r| r.live())?;
+    let (protocol, link) = match route {
+        MtlRoute::Dp(r) => (
+            crate::intel_hdcp::Protocol::Dp,
+            RouteLink::Dp(crate::intel_hdcp_shim::AuxPort::XeLpdp {
+                base: r.probe.port.aux_base(),
+                tbt_io: r.probe.tbt(),
+            }),
+        ),
+        MtlRoute::Hdmi(r) => (
+            crate::intel_hdcp::Protocol::Hdmi,
+            RouteLink::Hdmi(r.probe.ddc),
+        ),
+        MtlRoute::Mst(_) => return None,
+    };
+    Some(XelpgRoute {
+        port: route.port() as u8,
+        transcoder: route.pipe().transcoder() as u8,
+        protocol,
+        link,
+    })
 }
 
 /// Process-wide reset/suspend teardown: stop/release the route, then

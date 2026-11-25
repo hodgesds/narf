@@ -1420,7 +1420,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             },
         );
         if nvl_console_handoff(&mut dev, &mode) {
-            log_probe("display 35 console moved to an owned Pipe-A surface", &device);
+            log_probe(
+                "display 35 console moved to an owned Pipe-A surface",
+                &device,
+            );
         } else {
             log_probe(
                 "display 35 console handoff refused; firmware surface retained for fixed-mode KMS",
@@ -1760,10 +1763,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Gen9 DC states: hardware readout is done. The Init reference drops
     // (DC5/DC6 may be entered once idle) only with the DMC loaded and the
     // internal panel owned on Pipe A; inert without the Gen9 service.
-    crate::intel_gpu_gen9_dc_states::probe_complete(
-        &gt_bar,
-        owns_scanout && panel_mode.is_some(),
-    );
+    crate::intel_gpu_gen9_dc_states::probe_complete(&gt_bar, owns_scanout && panel_mode.is_some());
 
     // Power management (Q9, #1015): retain the PCI authority,
     // note the takeover mode for resume re-light, and register
@@ -2071,6 +2071,10 @@ impl DisplayInfo {
     /// its DPCD write off the snapshot.
     pub(crate) fn mode_window(&self) -> ModeWindow {
         ModeWindow::new(self.gtt_mmadr, self.device, self.cap)
+    }
+    /// The display function's PCI (vendor, device).
+    pub(crate) fn pci_id(&self) -> (u16, u16) {
+        (self.device.id.vendor, self.device.id.device)
     }
 }
 
@@ -2452,6 +2456,8 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
 
 /// Tear down whichever session owns `ddi` after its sink went away.
 fn disconnect_sessions(ddi: crate::intel_gpu_ddi::Ddi) {
+    // HDCP off before the port goes down (`intel_hdcp_disable`).
+    with_display_info(|gpu| crate::intel_hdcp_live::route_stopping_gen12(&gpu.mode_window(), ddi));
     if mst_session_ddi() == Some(ddi) {
         if mst_disconnect(ddi) {
             publish_scanout(None);
@@ -2812,6 +2818,9 @@ fn step_external_sst(bar: &MmioRegion, stop: bool) -> Result<bool, narf_filesyst
 }
 /// Existing runtime actor calls this outside the GT mutex. No executor bridge.
 pub(crate) fn service_external_sst(bar: &MmioRegion) {
+    // HDCP (`narf.intel.hdcp=1`; inert otherwise) on the routes as they
+    // stand before this pass's hotplug work.
+    crate::intel_hdcp_live::service(bar);
     service_mtl_external_for_bar(bar);
     let active = DP_SESSION
         .lock()
@@ -2836,6 +2845,12 @@ pub(crate) fn service_external_sst(bar: &MmioRegion) {
     let stop = DP_SESSION.lock().as_ref().is_some_and(|state| {
         event == Some(crate::intel_gpu_dp::HpdEvent::Disconnected(state.conn.ddi))
     });
+    if let (true, Some(crate::intel_gpu_dp::HpdEvent::Disconnected(ddi))) = (stop, event) {
+        // HDCP off before the port goes down (`intel_hdcp_disable`).
+        with_display_info(|gpu| {
+            crate::intel_hdcp_live::route_stopping_gen12(&gpu.mode_window(), ddi)
+        });
+    }
     if crate::intel_gpu_dp::hpd_uncertain() {
         if let Some(state) = DP_SESSION.lock().as_mut() {
             state.quarantine();
@@ -2843,6 +2858,34 @@ pub(crate) fn service_external_sst(bar: &MmioRegion) {
     }
     let _ = step_external_sst_inner(bar, stop);
 }
+/// HDCP (`crate::intel_hdcp_live`): the live Gen12 SST sessions on `bar` as
+/// (DDI, CPU transcoder index, DDC pin for an HDMI session). MST is not
+/// listed.
+pub(crate) fn hdcp_gen12_sessions(
+    bar: &MmioRegion,
+) -> alloc::vec::Vec<(
+    crate::intel_gpu_ddi::Ddi,
+    u8,
+    Option<crate::intel_gpu_gmbus::PinPair>,
+)> {
+    let mut out = alloc::vec::Vec::new();
+    if let Some(state) = DP_SESSION.lock().as_ref() {
+        if state.bar == bar.phys.raw() && state.live() {
+            out.push((state.conn.ddi, state.conn.pipe.transcoder() as u8, None));
+        }
+    }
+    if let Some(state) = HDMI_SESSION.lock().as_ref() {
+        if state.bar == bar.phys.raw() {
+            out.push((
+                state.conn.ddi,
+                state.conn.pipe.transcoder() as u8,
+                Some(state.conn.pin),
+            ));
+        }
+    }
+    out
+}
+
 /// No stop is inferred for unsupported HDMI/MST. Stopped SST leases remain
 /// permanently reserved; this is an admission fact, never permission to reuse.
 fn unsupported_external_for_bar(bar: &MmioRegion) -> bool {
@@ -3278,7 +3321,9 @@ pub(crate) async fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_fil
     };
     // Display 35's route stops through the view it was lit over: DDI B's
     // PHY and AUX in PICA, the LT PHY behind it.
-    let nova = display.as_ref().and_then(|display| display.integrated_display_ip())
+    let nova = display
+        .as_ref()
+        .and_then(|display| display.integrated_display_ip())
         == Some(crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS);
     let window = gpu.mode_window();
     let done = if nova {

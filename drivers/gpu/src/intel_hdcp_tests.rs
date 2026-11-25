@@ -1572,3 +1572,76 @@ fn smoke_intel_hdcp_aksv_transports() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp_aksv_transports);
+
+// ── Refusals ─────────────────────────────────────────────────────────
+
+fn smoke_intel_hdcp_refusals_without_option() -> TestResult {
+    use crate::intel_hdcp_live as live;
+    // The fixture kernel boots without narf.intel.hdcp=1.
+    if live::enabled() || opted_in() {
+        return TestResult::Skip("narf.intel.hdcp=1 on the test command line");
+    }
+    live::__reset_for_test();
+    let bar = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0x1000_0000),
+        virt: 0x1000_0000,
+        len: 16 << 20,
+        kind: narf_bus::BarKind::Mmio64 {
+            prefetchable: false,
+        },
+    };
+    // Inert: nothing attached, no register touched on a route stop.
+    live::service(&bar);
+    let regs = Regs::new(0);
+    live::route_stopping(&regs, live::gen12_key(crate::intel_gpu_ddi::Ddi::B));
+    if live::__connector_count() != 0 || !regs.0.lock().writes.is_empty() {
+        return TestResult::Fail("HDCP acted without its option");
+    }
+    // A request for a connector without the property changes nothing.
+    live::request(0, 3, 1, 0);
+    if live::last_error(0, 3).is_some() || live::__connector_count() != 0 {
+        return TestResult::Fail("request without an attached connector");
+    }
+    // The firmware-route readout: platform, MST, two outputs.
+    use crate::intel_gpu_gt::Gen12Platform as P;
+    let regs = Regs::new(0);
+    let func = |sel: u32, mode: u32| (1u32 << 31) | (sel << 27) | (mode << 24);
+    if live::inherited_gen12_route(&regs, P::RocketLake) != Err(HdcpError::Unsupported) {
+        return TestResult::Fail("Rocket Lake readout not refused");
+    }
+    if live::inherited_gen12_route(&regs, P::AlderLakeP) != Ok(None) {
+        return TestResult::Fail("dark display found a route");
+    }
+    regs.write32(trans_ddi_func_ctl(0), func(2, 3));
+    if live::inherited_gen12_route(&regs, P::AlderLakeP) != Err(HdcpError::Unsupported) {
+        return TestResult::Fail("MST route not refused");
+    }
+    // HDMI on DDI B (select 2), pin 2.
+    regs.write32(trans_ddi_func_ctl(0), func(2, 0));
+    let Ok(Some(r)) = live::inherited_gen12_route(&regs, P::AlderLakeP) else {
+        return TestResult::Fail("firmware HDMI route not read back");
+    };
+    if r.protocol != Protocol::Hdmi
+        || r.transcoder != 0
+        || r.link != live::RouteLink::Hdmi(crate::intel_gpu_gmbus::PinPair::Pin2Bxt)
+        || r.key != live::gen12_key(crate::intel_gpu_ddi::Ddi::B)
+    {
+        return TestResult::Fail("firmware HDMI route fields");
+    }
+    // DP on a Type-C DDI (TC1, select 4): refused before any AUX.
+    regs.write32(trans_ddi_func_ctl(0), func(4, 2));
+    if live::inherited_gen12_route(&regs, P::AlderLakeP) != Err(HdcpError::Unsupported) {
+        return TestResult::Fail("Type-C DP readout not refused");
+    }
+    // Two lit transcoders: no single route.
+    regs.write32(trans_ddi_func_ctl(0), func(2, 0));
+    regs.write32(trans_ddi_func_ctl(1), func(4, 0));
+    if live::inherited_gen12_route(&regs, P::AlderLakeP) != Err(HdcpError::NoRoute) {
+        return TestResult::Fail("two firmware routes not refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_hdcp",
+    smoke_intel_hdcp_refusals_without_option
+);
