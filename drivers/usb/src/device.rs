@@ -401,6 +401,56 @@ impl USBDevice {
             .map_err(UsbError::from_xhci)
     }
 
+    /// Drop configured endpoints `dcis` from this slot (Configure Endpoint
+    /// with Drop Context flags). Each must be idle.
+    pub async fn drop_endpoints(&self, dcis: &[u8]) -> Result<(), UsbError> {
+        self.controller
+            .drop_endpoints_generation(self.slot_id, self.generation, dcis)
+            .await
+            .map_err(UsbError::from_xhci)
+    }
+
+    /// The kind of configured endpoint `dci`, `None` when not configured.
+    pub fn endpoint_kind(&self, dci: u8) -> Option<crate::xhci::EndpointKind> {
+        self.controller
+            .endpoint_kind(self.slot_id, self.generation, dci)
+    }
+
+    /// Whether endpoint `dci` reads back Halted on the controller.
+    pub fn endpoint_halted(&self, dci: u8) -> bool {
+        self.controller
+            .endpoint_halted(self.slot_id, self.generation, dci)
+    }
+
+    /// Recover a Halted endpoint's host side only (Reset Endpoint + Set TR
+    /// Dequeue), without the CLEAR_FEATURE that
+    /// [`Self::clear_endpoint_halt`] also sends.
+    pub async fn reset_host_endpoint(&self, dci: u8) -> Result<(), UsbError> {
+        self.controller
+            .reset_endpoint(self.slot_id, self.generation, dci)
+            .await
+            .map_err(UsbError::from_xhci)
+    }
+
+    /// The slot generation this handle was minted for.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Submit one interrupt-IN TD with a bulk receipt.
+    pub fn begin_interrupt_in(&self, dci: u8, length: usize) -> Result<BulkToken, UsbError> {
+        self.controller
+            .begin_interrupt_in(self.slot_id, dci, self.generation, length)
+            .map_err(UsbError::from_xhci)
+    }
+
+    /// Submit one interrupt-OUT TD with a bulk receipt.
+    pub fn begin_interrupt_out(&self, dci: u8, data: &[u8]) -> Result<BulkToken, UsbError> {
+        self.controller
+            .begin_interrupt_out(self.slot_id, dci, self.generation, data)
+            .map_err(UsbError::from_xhci)
+    }
+
     /// Read the 18-byte Device Descriptor.
     pub async fn get_device_descriptor(&self) -> Result<[u8; 18], UsbError> {
         self.controller

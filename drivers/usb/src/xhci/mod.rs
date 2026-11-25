@@ -3599,7 +3599,17 @@ impl Xhci {
                     .get_mut(usize::from(dci - 2))
                     .and_then(Option::as_mut)
                     .ok_or(XhciError::CmdFailed(0xfa))?;
-                if !matches!(ep.kind, EndpointKind::BulkIn | EndpointKind::BulkOut) {
+                // Interrupt endpoints qualify since their TDs may carry a
+                // bulk receipt (`begin_interrupt_in`/`_out`): the same
+                // owner state is quarantined, and an `arm_interrupt_in`
+                // TRB holds no receipt to quarantine.
+                if !matches!(
+                    ep.kind,
+                    EndpointKind::BulkIn
+                        | EndpointKind::BulkOut
+                        | EndpointKind::InterruptIn
+                        | EndpointKind::InterruptOut
+                ) {
                     return Err(XhciError::CmdFailed(0xf8));
                 }
                 let identity = ep
@@ -5511,6 +5521,171 @@ impl Xhci {
         Ok(())
     }
 
+    /// Issue Configure Endpoint (§4.6.6) with the Drop Context flags of
+    /// `dcis` set, the inverse of [`Self::configure_endpoints_generation`]:
+    /// Linux `usb_hcd_alloc_bandwidth` drops the old alternate setting's
+    /// endpoints before adding the new one's (`xhci_drop_endpoint`).
+    ///
+    /// Every listed endpoint must be configured and idle: a retained bulk
+    /// or isochronous TD still owns its ring and DMA page, so the drop is
+    /// refused with `NotReady` rather than freeing memory the controller
+    /// may write. An armed interrupt TRB is not retained and is discarded
+    /// with the endpoint, as the controller discards it.
+    pub(crate) async fn drop_endpoints_generation(
+        &self,
+        slot_id: u8,
+        generation: u64,
+        dcis: &[u8],
+    ) -> Result<(), XhciError> {
+        if dcis.is_empty() {
+            return Ok(());
+        }
+        let mut drop_mask = 0u32;
+        for &dci in dcis {
+            if !(2..=31).contains(&dci) || drop_mask & (1u32 << dci) != 0 {
+                return Err(XhciError::CmdFailed(0xFB));
+            }
+            drop_mask |= 1u32 << dci;
+        }
+        let max_dci = {
+            let mut devices = self.devices.lock();
+            let device = devices
+                .get_mut(slot_id as usize)
+                .and_then(Option::as_mut)
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            if generation == 0 || device.generation != generation {
+                return Err(XhciError::CmdFailed(0xFD));
+            }
+            let busy = dcis.iter().any(|&dci| {
+                match device
+                    .eps
+                    .get(usize::from(dci - 2))
+                    .and_then(Option::as_ref)
+                {
+                    None => true,
+                    Some(ep) => ep.bulk.active() || ep.isoch.active(),
+                }
+            });
+            if device.control.active() || device.endpoint_configuration || busy {
+                return Err(XhciError::NotReady);
+            }
+            device.endpoint_configuration = true;
+            device
+                .eps
+                .iter()
+                .flatten()
+                .map(|ep| u32::from(ep.dci))
+                .filter(|&dci| drop_mask & (1u32 << dci) == 0)
+                .max()
+                .unwrap_or(1)
+        };
+        let mut claim = EndpointConfiguration {
+            controller: self,
+            slot: slot_id,
+            generation,
+            published: false,
+        };
+        let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
+        let input_phys = input.dma_addr().raw();
+        // SAFETY: identity-mapped DMA; fresh 4 KiB page.
+        unsafe {
+            core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
+        }
+        // The Slot Context is copied whole and its Context Entries lowered
+        // to the highest endpoint that remains, as on the add path (F-31).
+        let slot_context = {
+            let devices = self.devices.lock();
+            let device = devices
+                .get(usize::from(slot_id))
+                .and_then(Option::as_ref)
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            if device.generation != generation {
+                return Err(XhciError::NotReady);
+            }
+            device._device_ctx.sync(0, 16);
+            device_dma_barrier();
+            let mut words = [0u32; 4];
+            for (index, word) in words.iter_mut().enumerate() {
+                // SAFETY: the retained output context covers these four dwords.
+                *word = unsafe {
+                    core::ptr::read_volatile(
+                        device._device_ctx.cpu_ptr_at::<u32>((index * 4) as u64),
+                    )
+                };
+            }
+            words
+        };
+        let slot_ctx_off = self.context_stride();
+        // SAFETY: identity-mapped DMA; every offset lies in the zeroed page.
+        unsafe {
+            for (index, word) in slot_context.iter().enumerate() {
+                let value = if index == 0 {
+                    (word & !(0x1Fu32 << 27)) | (max_dci << 27)
+                } else {
+                    *word
+                };
+                core::ptr::write_volatile(
+                    input.cpu_mut_ptr_at::<u32>(slot_ctx_off + index as u64 * 4),
+                    value,
+                );
+            }
+            // Input Control Context: dword0 = drop flags, dword1 = add
+            // flags (A0 so the engine refreshes Context Entries).
+            core::ptr::write_volatile(input.cpu_mut_ptr_at::<u32>(0), drop_mask);
+            core::ptr::write_volatile(input.cpu_mut_ptr_at::<u32>(4), 1);
+        }
+        let trb_type = TRB_TYPE_CONFIGURE_ENDPOINT_CMD << TRB_TYPE_SHIFT;
+        let dword3 = trb_type | ((slot_id as u32) << 24);
+        input.sync(0, input.len());
+        device_dma_barrier();
+        let mut retained = bulk_owner::CommandDma::new(input);
+        retained.publish();
+        claim.published = true;
+        let command_trb =
+            self.submit_command_record(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
+        let ev = self
+            .await_command_event(command_trb, |event| {
+                bulk_owner::command_matches(event, slot_id, command_trb)
+            })
+            .await?;
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
+        let input = retained.complete();
+        let dropped: alloc::vec::Vec<EndpointState> = {
+            let mut devices = self.devices.lock();
+            let device = devices
+                .get_mut(slot_id as usize)
+                .and_then(Option::as_mut)
+                .ok_or(XhciError::CmdFailed(0xFC))?;
+            if device.generation != generation || !device.endpoint_configuration {
+                return Err(XhciError::NotReady);
+            }
+            let dropped = dcis
+                .iter()
+                .filter_map(|&dci| device.eps.get_mut(usize::from(dci - 2))?.take())
+                .collect();
+            device.endpoint_configuration = false;
+            dropped
+        };
+        claim.published = false;
+        // Transfer Events the dropped endpoints posted before the command
+        // name rings that no longer exist; no poller may consume them.
+        self.transfer_events.lock().retain(|event| {
+            let slot = (event[3] >> 24) as u8;
+            let dci = ((event[3] >> 16) & 0x1F) as u8;
+            slot != slot_id || drop_mask & (1u32 << dci) == 0
+        });
+        for &dci in dcis {
+            self.clear_endpoint_waker(slot_id, dci);
+        }
+        // The Success event proves the controller released the rings.
+        drop(dropped);
+        drop(input);
+        Ok(())
+    }
+
     /// Enqueue a single Normal TRB on the bulk endpoint at `dci`
     /// pointing at `phys`+`len`, with IOC set so the engine fires
     /// a Transfer Event on completion.
@@ -5891,6 +6066,11 @@ impl Xhci {
     /// Begin one bounded bulk TD. The endpoint retains its DMA page until
     /// the exact originating TRB completes; dropping the receipt is not a
     /// cancellation or permission to overwrite that page.
+    ///
+    /// `interrupt` posts the same Normal TD on an interrupt endpoint: xHCI
+    /// moves bulk and interrupt data with identical TRBs (§4.11.2.2), so an
+    /// interrupt URB gets the bulk receipt's exact completion and stop.
+    #[allow(clippy::too_many_arguments)]
     fn begin_bulk(
         &self,
         slot_id: u8,
@@ -5899,9 +6079,11 @@ impl Xhci {
         direction: BulkDirection,
         length: usize,
         data: &[u8],
+        interrupt: bool,
     ) -> Result<BulkToken, XhciError> {
         if !(2..=31).contains(&dci)
-            || !(1..=4096).contains(&length)
+            || length > 4096
+            || (length == 0 && direction == BulkDirection::In)
             || (direction == BulkDirection::Out && data.len() != length)
         {
             return Err(XhciError::CmdFailed(0xF9));
@@ -5923,9 +6105,11 @@ impl Xhci {
                 .get_mut(usize::from(dci - 2))
                 .and_then(Option::as_mut)
                 .ok_or(XhciError::CmdFailed(0xFA))?;
-            let expected = match direction {
-                BulkDirection::In => EndpointKind::BulkIn,
-                BulkDirection::Out => EndpointKind::BulkOut,
+            let expected = match (direction, interrupt) {
+                (BulkDirection::In, false) => EndpointKind::BulkIn,
+                (BulkDirection::Out, false) => EndpointKind::BulkOut,
+                (BulkDirection::In, true) => EndpointKind::InterruptIn,
+                (BulkDirection::Out, true) => EndpointKind::InterruptOut,
             };
             if ep.kind != expected {
                 return Err(XhciError::CmdFailed(0xF8));
@@ -5994,7 +6178,77 @@ impl Xhci {
         generation: u64,
         length: usize,
     ) -> Result<BulkToken, XhciError> {
-        self.begin_bulk(slot_id, dci, generation, BulkDirection::In, length, &[])
+        self.begin_bulk(
+            slot_id,
+            dci,
+            generation,
+            BulkDirection::In,
+            length,
+            &[],
+            false,
+        )
+    }
+
+    /// Submit one interrupt-IN TD with a bulk receipt: polled with
+    /// [`Self::poll_bulk_in`] and cancelled with [`Self::stop_bulk`]. Not
+    /// for an endpoint a driver drives with [`Self::arm_interrupt_in`].
+    pub fn begin_interrupt_in(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        generation: u64,
+        length: usize,
+    ) -> Result<BulkToken, XhciError> {
+        self.begin_bulk(
+            slot_id,
+            dci,
+            generation,
+            BulkDirection::In,
+            length,
+            &[],
+            true,
+        )
+    }
+
+    /// Submit one interrupt-OUT TD with a bulk receipt, the mirror of
+    /// [`Self::begin_interrupt_in`].
+    pub fn begin_interrupt_out(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        generation: u64,
+        data: &[u8],
+    ) -> Result<BulkToken, XhciError> {
+        self.begin_bulk(
+            slot_id,
+            dci,
+            generation,
+            BulkDirection::Out,
+            data.len(),
+            data,
+            true,
+        )
+    }
+
+    /// Whether endpoint `dci` of `slot_id` reads back Halted (Endpoint
+    /// Context EP State 2, §6.2.3): a STALL, babble or transaction error
+    /// stopped it, and [`Self::reset_endpoint`] must run before it moves
+    /// data again.
+    pub fn endpoint_halted(&self, slot_id: u8, generation: u64, dci: u8) -> bool {
+        self.endpoint_context_snapshot(slot_id, generation, dci)
+            .is_ok_and(|(state, _)| state == 2)
+    }
+
+    /// The kind of endpoint `dci` of `slot_id` in its current generation,
+    /// or `None` when that endpoint is not configured on the controller.
+    pub fn endpoint_kind(&self, slot_id: u8, generation: u64, dci: u8) -> Option<EndpointKind> {
+        let devices = self.devices.lock();
+        let device = devices.get(usize::from(slot_id))?.as_ref()?;
+        if device.generation != generation {
+            return None;
+        }
+        let ep = device.eps.get(dci_ep_index(dci).ok()?)?.as_ref()?;
+        Some(ep.kind)
     }
 
     /// Stage and submit a bulk-OUT TD with retained scratch ownership.
@@ -6012,6 +6266,7 @@ impl Xhci {
             BulkDirection::Out,
             data.len(),
             data,
+            false,
         )
     }
 

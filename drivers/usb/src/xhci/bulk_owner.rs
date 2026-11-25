@@ -182,7 +182,9 @@ impl State {
         if generation == 0 || slot == 0 || !(2..=31).contains(&endpoint) {
             return Err(Error::Stale);
         }
-        if !(1..=4096).contains(&length) {
+        // A zero-length OUT TD is a zero-length packet (xHCI §4.11.2.2);
+        // an IN TD always has room for data.
+        if length > 4096 || (length == 0 && direction == Direction::In) {
             return Err(Error::BadLength);
         }
         let serial = self.next;
