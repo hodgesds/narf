@@ -58,6 +58,12 @@ pub const PS2_CMD: u16 = 0x64;
 /// Controller-status bits (read from port 0x64).
 const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_INPUT_FULL: u8 = 1 << 1;
+/// The output-buffer byte came from the AUX (mouse) port (Linux
+/// `I8042_STR_AUXDATA`).
+pub(crate) const STATUS_AUX_DATA: u8 = 1 << 5;
+/// Bytes one [`poll`] call drains at most, so a controller that keeps
+/// reporting data cannot hold the caller. Matches [`flush_output`].
+const POLL_BURST: usize = 32;
 
 /// Controller commands (write to port 0x64).
 const CMD_DISABLE_KBD: u8 = 0xAD;
@@ -970,22 +976,82 @@ fn process_byte(byte: u8) {
     emit_key(decode(make, extended), pressed);
 }
 
-/// IRQ-1 handler. Reads one byte from 0x60 and runs it through the
-/// decode state machine.
+/// IRQ-1 handler. Under [`PORT_LOCK`], takes the controller's byte if
+/// it still holds one and runs it through the decode state machine (or,
+/// if the status says it is a mouse byte, the mouse decoder).
 ///
 /// # Safety
 /// IRQ context only.
 pub unsafe fn on_irq1() {
-    // SAFETY: 0x60 is the i8042 data port.
-    let byte = unsafe { inb(PS2_DATA) };
-
-    // LED exchange responses (ACK / RESEND for an in-flight Set
-    // LEDs) are protocol bytes, not scancodes.
-    if led_route_byte(byte) {
+    let port = PORT_LOCK.lock();
+    // `i8042_interrupt`: an interrupt whose byte another reader (`poll`
+    // on another CPU) already took carries no data.
+    let Some((status, byte)) = read_byte_locked() else {
+        return;
+    };
+    if status & STATUS_AUX_DATA != 0 {
+        drop(port);
+        crate::i8042_mouse::feed_aux_byte(byte);
         return;
     }
+    keyboard_byte(byte);
+}
 
-    process_byte(byte);
+/// Linux `i8042_lock`: one reader of the controller at a time. The IRQ
+/// handlers and [`poll`] run at once on different CPUs while a prompt
+/// polls with the BSP's interrupts masked. Reading the data port after
+/// another reader emptied the output buffer returns the last byte again,
+/// a keystroke typed twice, and two decoders fed in parallel reorder keys:
+/// the console prompt got a wrong passphrase that way. Keyboard bytes are
+/// decoded under the lock, so they stay in order.
+pub(crate) static PORT_LOCK: narf_lib::sync::IrqSafeSpinLock<()> =
+    narf_lib::sync::IrqSafeSpinLock::new(());
+
+/// Take the controller's byte if it holds one: `(status, byte)`. The
+/// caller holds [`PORT_LOCK`].
+pub(crate) fn read_byte_locked() -> Option<(u8, u8)> {
+    // SAFETY: status-register read at CPL 0; 0x64 is the i8042 status
+    // port and the read has no side effects.
+    let status = unsafe { inb(PS2_STATUS) };
+    if status & STATUS_OUTPUT_FULL == 0 {
+        return None;
+    }
+    // SAFETY: data-port read with the output buffer full; it consumes
+    // exactly the byte the status read reported.
+    Some((status, unsafe { inb(PS2_DATA) }))
+}
+
+/// A byte from the keyboard port: an LED exchange reply (ACK / RESEND for
+/// an in-flight Set LEDs is a protocol byte, not a scancode), or a
+/// scancode. The caller holds [`PORT_LOCK`].
+pub(crate) fn keyboard_byte(byte: u8) {
+    if !led_route_byte(byte) {
+        process_byte(byte);
+    }
+}
+
+/// Receive by polling, for code that runs with interrupts masked: the
+/// boot credential prompt runs inside the initcalls, before the BSP
+/// first enables interrupts, so IRQ1 never fires there (it may on another
+/// CPU, which [`PORT_LOCK`] orders against this). Linux `i8042_interrupt`
+/// does the same status-then-data read: the status register's AUX bit
+/// says which port the byte came from. Keyboard bytes take the IRQ
+/// handler's exact path (LED exchange, then the decoder); mouse bytes go
+/// to the mouse packet decoder so its framing stays in sync. Registered
+/// with `narf_input::register_keyboard_poller` once the controller is up.
+pub fn poll() {
+    for _ in 0..POLL_BURST {
+        let port = PORT_LOCK.lock();
+        let Some((status, byte)) = read_byte_locked() else {
+            return;
+        };
+        if status & STATUS_AUX_DATA != 0 {
+            drop(port);
+            crate::i8042_mouse::feed_aux_byte(byte);
+        } else {
+            keyboard_byte(byte);
+        }
+    }
 }
 
 /// Test-only: process a synthetic byte stream through the same

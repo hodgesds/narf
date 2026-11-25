@@ -136,6 +136,8 @@ fn register_i8042_initcalls() {
         // channels, resume re-scans + re-enables them. Covers the
         // mouse channel too (same controller, same "i8042" entry).
         i8042::register_device_pm();
+        // Polled receive for a prompt that runs before interrupts are on.
+        let _ = narf_input::register_keyboard_poller(i8042::poll);
         // SAFETY: ISA IRQ → IOAPIC routing call; the handler is
         // `pub unsafe fn on_irq1` because the i8042 read it does
         // is unsafe at module level, but installation through the

@@ -2035,8 +2035,18 @@ fn feed_relative_byte(byte: u8) {
 /// # Safety
 /// IRQ context only.
 pub unsafe fn on_irq12() {
-    // SAFETY: 0x60 data port read.
-    let byte = unsafe { inb(PS2_DATA) };
+    let port = crate::i8042::PORT_LOCK.lock();
+    // `i8042_interrupt`: no byte (another reader took it) is no data, and
+    // the status register's AUX bit, not the IRQ line, says whose byte
+    // it is.
+    let Some((status, byte)) = crate::i8042::read_byte_locked() else {
+        return;
+    };
+    if status & crate::i8042::STATUS_AUX_DATA == 0 {
+        crate::i8042::keyboard_byte(byte);
+        return;
+    }
+    drop(port);
     let irqs = narf_input::I8042_MOUSE_IRQ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     // Log every 64 IRQs and at IRQ 1 — the user can grep
     // /dev/kmsg to see if PS/2 mouse activity is reaching the
@@ -2055,6 +2065,16 @@ pub unsafe fn on_irq12() {
     }
 
     feed_byte(byte);
+}
+
+/// One AUX byte read outside the IRQ12 handler (by [`crate::i8042::poll`],
+/// or by IRQ1 finding a mouse byte). Dropped when the mouse channel never
+/// initialised, so a byte cannot reach a decoder whose protocol was never
+/// negotiated.
+pub(crate) fn feed_aux_byte(byte: u8) {
+    if narf_input::I8042_MOUSE_INIT_OK.load(Ordering::Acquire) {
+        feed_byte(byte);
+    }
 }
 
 #[doc(hidden)]
