@@ -22,7 +22,7 @@ narrowing surface as the generation gets newer:
 | Rocket Lake (Gen12 Xe-LP) | Gen12 PRMs plus Linux's exact pre-GMD platform data  | GT feasible; display separately qualifies |
 | Alder Lake / Raptor Lake  | full PRMs (Gen12 carries forward)                    | full driver feasible   |
 | Meteor Lake (Xe-LPG)      | display + media PRMs published; 3D / compute thinner | display / KMS feasible |
-| Lunar Lake (Xe2)          | architecture whitepapers only as of mid-2026        | wait for PRM           |
+| Lunar Lake (Xe2)          | architecture whitepapers only as of mid-2026        | driven from Linux i915/xe source |
 
 ## 2. Public reference set
 
@@ -71,16 +71,15 @@ the canonical bit definition without re-deriving it.
 
 ### Stage 1 (landed) — PCI claim + presence test
 - `intel_gpu.rs`: vendor `0x8086`, class `0x03`, exact match table
-  for documented Gen12 device IDs (TGL-U/H, ADL-S/P, RPL-S/P, MTL-P)
-  and Gen11 device IDs (ICL, EHL, JSL — identity + probe only),
+  (§5, Gen9 through Nova Lake-S plus the discrete lists),
   plus a class-match backstop that filters on vendor.
 - BAR0 (GTTMMADR) maps the unified MMIO + GTT window. BAR2 maps
   the stolen-memory frame-buffer aperture on iGPUs.
 - Presence test is generation-aware. Gen12+ reads `GMD_ID`
   (Graphics Media Device Identifier, MMIO 0xD8C) plus the
   `MTCFG_TRBLK` cookie (0xFF8); all-ones means the BAR is mapped
-  but no silicon backs it. Pre-GMD Gen11 (Ice Lake / Elkhart
-  Lake / Jasper Lake) has no such registers, so its presence test
+  but no silicon backs it. Pre-GMD Gen9 and Gen11 have no such
+  registers, so their presence test
   re-reads PCI config space (vendor/device dword, offset 0);
   all-ones refuses, and `gmd_id` is `None`.
 - Records `BoundDriver { name: "intel-gpu", kind: Graphics }` on
@@ -144,18 +143,14 @@ Stage-3 driver core consumes these codecs through the
   (§9).
 - Single-rectangle scanout from a CPU-mapped buffer.
 
-### Stage 5+ (partially landed) — 3D / compute (qualified Gen12 families)
+### Stage 5+ (partially landed) — 3D / compute
 - Command streamer (RCS0) ring submission — **landed** as the
   execlists path in `intel_gpu_rcs` (§8), with GGTT batches and
   attached-context PPGTT batches (§18).
 - PPGTT per-context page tables and media submission — **landed**
   (§9, §18).
-- Remaining: GT initialization, complete context/completion/reset ownership,
-  Xe-LPG GuC submission and Mesa interoperability. The storage/context/query
-  UAPI and immutable residency admission are described in §19.
-  Out of scope for v1; the
-  kernel-resident driver only needs a display surface plus
-  batch submission.
+- GuC submission, the Xe and i915 UAPI and the remaining work are
+  in §19 and §20. Mesa interoperability is unproven.
 
 ## 5. PCI device ID table
 
@@ -193,7 +188,7 @@ rules apply.
 | jasperlake (Gen11) | 4E51, 4E55, 4E57, 4E61, 4E71 |
 | lunarlake (Xe2-LPG; display 20 opt-in) | 6420, 64A0, 64B0 |
 | tigerlake (Gen12) | 9A40, 9A49, 9A59, 9A60, 9A68, 9A70, 9A78, 9AC0, 9AC9, 9AD9, 9AF8 |
-| rocketlake (Gen12 GT; display gated) | 4C80, 4C8A, 4C8B, 4C8C, 4C90, 4C9A |
+| rocketlake (Gen12; internal display gated) | 4C80, 4C8A, 4C8B, 4C8C, 4C90, 4C9A |
 | alderlake-p (Gen12) | 4626, 4628, 462A, 4636, 4638, 463A, 46A0, 46A1, 46A2, 46A3, 46A6, 46A8, 46AA, 46B0, 46B1, 46B2, 46B3, 46B6, 46B8, 46BA |
 | raptorlake-p (Gen12) | A720, A7A0, A7A8, A7AA, A7AB |
 | raptorlake-u (Gen12) | A721, A7A1, A7A9, A7AC, A7AD |
@@ -204,8 +199,8 @@ rules apply.
 | meteorlake (Xe-LPG) | 7D40, 7D45, 7D55, 7D60, 7DD5 |
 | arrowlake (Xe-LPG) | 7D41, 7D51, 7D67, 7DD1, B640 |
 | pantherlake (Xe3-LPG) | B080, B081, B082, B083, B084, B085, B086, B087, B08F, B090, B0A0, B0A1, B0B0 |
-| wildcatlake (Xe3-LPG; display 30.02 gated) | FD80, FD81 |
-| novalake-s (Xe3-LPG; display 35.00 gated) | D740, D741, D742, D743, D744, D745, D74A, D74B |
+| wildcatlake (Xe3-LPG; display 30.02 opt-in) | FD80, FD81 |
+| novalake-s (Xe3-LPG; display 35.00 opt-in) | D740, D741, D742, D743, D744, D745, D74A, D74B |
 
 Linux `INTEL_ADLP_IDS` includes 46B0–46B3. The historical
 `intel-gpu-rpl-46B*` registration names for these four devices remain
@@ -231,9 +226,9 @@ shares a PLL another port runs at its state, else takes its own or the first
 unheld one, as held is read from `DPCLKA_CFGCR0`), RKL's DPCLKA layout, PW_3
 for their lanes and AUX, hotplug on the TGP Type-C pins or the CMP port C/D
 pins, and `rkl_encoder_to_ddc_pin`'s PCH-dependent DDC pins. The internal panel
-stays unadmitted, so the internal display path still preserves
-a firmware-lit display and only an all-pipes-stopped function may start the
-display-less GuC owner.
+stays unadmitted, so the internal display path preserves a firmware-lit
+display; the display-less GuC owner starts beside it when every enabled
+plane and cursor fetches below 192 MiB and no DSB runs (`planes_below_arena`).
 
 DG1 is likewise not a DG2 alias. Linux `xe_pci.c` identifies it as discrete
 Xe-LP+ graphics 12.10 with a 39-bit DMA mask and three-level VM, and
@@ -241,10 +236,11 @@ Xe-LP+ graphics 12.10 with a 39-bit DMA mask and three-level VM, and
 dedicated `Gen12Platform::Dg1` preserves those facts and selects DG1's exact
 64-entry MOCS/L3CC table (undefined rows copy WB-L3 index 5; the published UC,
 fractional-cache and reserved rows remain literal). Before the Gen12 reset,
-the discrete owner proves all four pipes' primary plus six sprite fetchers are
-disabled; an unavailable or live plane fails closed. System-memory GuC
-execution may then start. DG1 local-memory geometry is not the DG2 flat-CCS
-layout, so BAR2 is retained but no VRAM pool is published. DG1 shares RKL's
+the discrete owner proves every enabled plane and cursor on the four pipes
+fetches below 192 MiB and no DSB runs (`validate_discrete_display`); an
+unreadable plane fails closed. DG1 has no flat CCS and no tile range register,
+so its VRAM pool is the LMEM BAR from offset zero up to `GSMBASE`
+(`xe_vram.c`), in 4 KiB pages CPU-cleared through the BAR. DG1 shares RKL's
 display-12 port/AUX mapping and has its own DG1 GMBUS/default-pin metadata,
 but no KMS route is admitted yet.
 
@@ -290,8 +286,8 @@ the MG PLL divisor search + TC-port programming, the TBT PLL
 fixed rows, external DP on combo-PHY/TC ports, HDMI on combo
 and TC ports, and the backlight PWM install (BXT-style block,
 shared with Gen12 — §12.3). `external_display_supported()` and
-`backlight_supported()` are flipped for Ice Lake; the HPD /
-external-session layer still fails closed for Gen11 (§7).
+`backlight_supported()` are flipped for Ice Lake, and the HPD /
+external-session layer admits Gen11 through `SourceFamily::of` (§7).
 Execlists submission (Lane 3) is admitted — a Gen11
 batch executes on RCS with no GuC loaded — and GuC/HuC load
 (Lane 7) is admitted: the GuC profiles are `i915/icl_guc_70.1.1.bin`
@@ -308,7 +304,8 @@ the GuC is loaded where a GuC owner exists, which is what HuC
 authentication requires.
 
 Gen9 (Skylake / Kaby Lake / Coffee Lake / Whiskey Lake / Comet Lake)
-is admitted for identity + probe (Gen9 Lane 1) only. Linux
+is admitted from identity + probe (Gen9 Lane 1) through the external
+outputs (Lane 8, §12.7). Linux
 `include/drm/intel/pciids.h` supplies the exact 86-ID census
 (`INTEL_SKL_IDS` 25, `INTEL_KBL_IDS` 22, `INTEL_CFL_IDS` 17,
 `INTEL_WHL_IDS` 5, `INTEL_CML_IDS` 17); every row was re-verified
@@ -348,9 +345,9 @@ ACK at 0x130044, and no HWCONFIG table (i915 requires graphics
 12.55+). Gen9 predates GMD_ID, so Stage 1 presence re-reads PCI
 config space (all-ones refuses) instead of reading 0xD8C/0xFF8,
 and `gmd_id` is `None` on Gen9. The WOPCM plan for Gen9 is the
-1 MiB total (`gt/intel_wopcm.c` `GEN9_WOPCM_SIZE`). The part binds
-and announces; the internal display modesets (Lane 5, see §12.6),
-external display and backlight stay gated (Lane 8). Execlists submission is admitted (Lane 3), with the
+1 MiB total (`gt/intel_wopcm.c` `GEN9_WOPCM_SIZE`). The internal
+display modesets (Lane 5, §12.6); external display and backlight are
+admitted (Lane 8, §12.7). Execlists submission is admitted (Lane 3), with the
 Gen9 media-engine table. Lane 4 admitted the display model:
 SKL CDCLK via LCPLL (`intel_gpu_gen9_cdclk.rs`, VCO-aware ladders,
 Wa Display #1183), the SKL WRPLL + CFGCR1/2
@@ -361,16 +358,33 @@ transition watermarks) and the `DDI_BUF_TRANS` swing tables
 (`intel_gpu_gmbus.rs`: SPT pins 4/5/6 = DPC/DPB/DPD). Gen9 has no VRR (Linux `HAS_VRR`
 needs DISPLAY_VER >= 11). The §6 lift for Gen9 display is Lane 0's.
 
-Remainder (EHL/JSL 36-bit PPGTT): Linux `i915_pci.c` sets
+Gen9 LP (Broxton / Gemini Lake): the 7 IDs (BXT
+0A84/1A84/1A85/5A84/5A85, GLK 3184/3185) are `Generation::Broxton`. The
+execlists owner runs them as `LegacyGt::Gen9Lp` (CHV snooping PPAT, Broxton
+MOCS, the LP workarounds, one slice of three subslices with pooled EUs, the
+19.2 MHz crystal, `BXT_RP_STATE_CAP`, RC6 behind `bxt_check_bios_rc6_setup`).
+The display runs the Skylake modeset with the LP blocks in place
+(`Modeset::gen9_lp`): the DPIO PHY (`intel_gpu_bxt_phy`), per-port PLLs
+(`intel_gpu_bxt_dpll`), the DE-PLL CDCLK (`intel_gpu_bxt_cdclk`), the
+512−4 / 1024−4 DBUF (Linux `display/intel_display_device.c:848,863`), Gemini
+Lake's display-10 watermarks, the PPS at `PPS_BASE`, and DP/HDMI on DDI B/C
+with the display-engine hotplug bank (`HpdBank::Bxt`, its sense inversion
+from the VBT's `hpd_invert`). The backlight runs on the VBT panel's PWM
+controller (`BXT_BLC_PWM_*(controller)`). HDMI refuses the DPLL ranges Gen9
+LP cannot generate; Gemini Lake reaches 594 MHz scrambled and runs YCbCr
+4:2:0 through the pipe CSC with a linear degamma (display 10 has no output
+CSC). A GOP framebuffer stays fixed-mode KMS when no modeset runs. Not run on
+silicon.
+
+EHL/JSL 36-bit PPGTT: Linux `i915_pci.c` sets
 `.__runtime.ppgtt_size = 36` for Elkhart Lake and Jasper Lake only;
 Ice Lake inherits the Gen8 default 48. The walk stays four-level on
 all three (`gen8_ppgtt.c`: `ppgtt->vm.top = i915_vm_is_4lvl(...) ? 3 : 2`,
 and `(2^36 - 1) >> 32` is nonzero, so `i915_vm_is_4lvl` is true), so
 NARF's root level 3 is correct as-is — only the VA ceiling differs
-(2^36 vs 2^48). NARF's `Ppgtt` and exec layer hardcode a 48-bit VA
-ceiling (`PPGTT_VA_BITS`, `VA_SIZE`), so they over-admit EHL/JSL VAs
-at or above 2^36. Threading a per-platform VA ceiling through `Ppgtt`
-and the exec VA checks is a follow-up lane, not this one.
+(2^36 vs 2^48). `GtPlatform::ppgtt_va_size` carries that total: the
+i915 `CONTEXT_PARAM_GTT_SIZE` reports it, and exec preparation bounds
+every softpinned object and the batch by it.
 
 Wildcat Lake IDs FD80/FD81 are exact `INTEL_WCL_IDS`. Linux deliberately binds
 them to the same `ptl_desc` as Panther Lake and selects the PTL GuC profile.
@@ -402,38 +416,38 @@ VDR write image, the complete nine-rate eDP table, LT transmitter
 ownership/masking, and distinct DP 1.4/UHBR/eDP signal tables.
 `MmioWindow::has_lt_phy()` preserves Linux's exact
 `HAS_LT_PHY(display) == platform.novalake` boundary instead of inferring the
-PHY from display version. Its crate-private, disconnected transport serializes
+PHY from display version. Its transport (`LtPhy`) serializes
 the 81 committed PLL writes through the display-35 Cx0 bus and implements Linux's three-attempt
 P2P transmitter flow, including ordinary ACK validation, bus reset on failure,
-the 150 us settle bound and P2P-ready clearing. Fake-MMIO fixtures are its only
-caller. The same disconnected transport applies the selected DP 1.4 or UHBR
-table with committed per-lane LT `TXY_CTL{8,2,3,4}` RMWs. It does not construct
-an operational display IP. The complete disconnected DP enable/disable machine
-adds LT lane reset, P2/P0 power transitions, display-35 clock selection,
-rate-update calibration and DDI clock-value programming in Linux source order.
-The disconnected eDP selector adds the five intermediate 216/243/324/432/675
+the 150 us settle bound and P2P-ready clearing. The same transport applies the
+selected DP 1.4 or UHBR table with committed per-lane LT `TXY_CTL{8,2,3,4}`
+RMWs. The DP enable/disable machine adds LT lane reset, P2/P0 power
+transitions, display-35 clock selection, rate-update calibration and DDI
+clock-value programming in Linux source order.
+The eDP selector adds the five intermediate 216/243/324/432/675
 MHz images to the four shared 162/270/540/810 MHz DP images. Each preserves the
-source VDR config bytes and all thirteen PLL registers; no production caller
-programs them yet. The HDMI table selector likewise preserves the five literal
+source VDR config bytes and all thirteen PLL registers. The HDMI table selector
+likewise preserves the five literal
 25.2/27.2/74.25/148.5/594 MHz images. Every other clock uses a source-order,
 bounded Q32 DCO/divider search that emits all thirteen PLL registers or refuses
-the clock; table hits retain priority. A disconnected HDMI TMDS transport now
+the clock; table hits retain priority. The HDMI TMDS transport
 applies those images through the shared lane-reset/P2/P0/rate-update sequence,
 requires four non-DP-alt transmitters, excludes FRL, and uses DP1.4 entry zero
-by default (or a valid VBT level) exactly as Linux does. It still grants no
-live HDMI route or display-resource ownership.
+by default (or a valid VBT level) exactly as Linux does.
 The separate ten-entry eDP signal table preserves its lower
-main-cursor values and is exercised through the disconnected per-lane
+main-cursor values and is written through the per-lane
 `TXY_CTL{8,2,3,4}` writer rather than reusing external DP 1.4 levels.
-The disconnected CDCLK model pins all 31 `xe3p_lpd_cdclk_table` rungs from
+The CDCLK table (`intel_gpu_xelpg_cdclk::NOVA_LAKE_TABLE`) pins all 31
+`xe3p_lpd_cdclk_table` rungs from
 151.2 through 787.2 MHz, including the ratio-21 squash waveforms, the 19.2 MHz
-crawl ladder, display-30-style MDCLK source and zero-voltage-level hook. It
-requires DC-off and Type-C/D2D/AUX ownership from a future caller; no
-production route supplies those preconditions. On Nova Lake-S,
+crawl ladder, display-30-style MDCLK source and zero-voltage-level hook. On Nova Lake-S,
 `narf.intel.nvl_display=1` reports the firmware primary at PCI probe and skips
 the headless GT reset for that boot, including when readout fails. For an
 enabled SST output on port A it checks two live scanout snapshots and reports
-the format, dimensions, byte pitch and GGTT offset. Firmware keeps the panel
+the format, dimensions, byte pitch and GGTT offset. A primary that is the boot
+framebuffer becomes fixed-mode KMS beside the display-preserving GT
+(`DisplayOwner::NovaLake`, `admit_display_nvl`: no driver FLR, GT-only GuC and
+full reset); any other primary is only reported. Firmware keeps the panel
 unless `narf.intel.nvl_modeset=1` is also given: then, before the GT starts,
 the probe runs the display-14 orchestrator on `DisplayIp::NovaLakeS` at the
 panel's EDID mode on the unchanged firmware surface, with the port PLL,
@@ -460,8 +474,8 @@ admits_port` opens B/TC1/TC2 for `NovaLakeS`, and `admits_view` refuses a
 profile whose PHY family the view does not report). UHBR, Thunderbolt alt
 mode (`ExternalError::LtTbtAlt`) and HDMI FRL stay refused.
 WCL uses its separate C10/C20 route.
-`intel_gpu_nvl_resources` supplies the pure ownership boundary for that future
-owner. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT
+`intel_gpu_nvl_resources` is a separate, pure ownership model; the owned
+route above does not use it. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT
 port B/Pipes B-D, and DP-alt on LT TC1/TC2/Pipes B-D. Each plan retains the
 same-index transcoder and HPD source; DC-off, PW1 and the pipe well; PW2 for
 Pipes C/D or either Type-C lane domain; and the D2D requirement. DP/eDP plans
@@ -469,16 +483,13 @@ retain the exact AUX control register and LT-only request/status handshake,
 while native HDMI retains no AUX lease and requires a VBT-qualified GMBUS/DDC
 route. TC1/TC2 plans additionally
 retain PICA_TC and the TCSS PHY index. Crossed port/connector roles and an
-external Pipe A refuse before MMIO. These plans are crate-private and
-disconnected: they neither create an operational `DisplayIp` nor claim that
-Nova USB-C DP works on hardware.
+external Pipe A refuse before MMIO.
 The shared Xe-LPDP AUX power owner branches only on the exact
 `MmioWindow::has_lt_phy()` platform fact. Nova LT windows raise the same
 per-channel request bit but require `POWER_STATUS` within 2 ms and require it
 to clear within 1 ms on release; timeout, lost access and an in-flight AUX
 transaction are distinct typed failures. C10/C20 windows retain their existing
-600-us enable and 10-us disable delays. This qualifies the AUX prerequisite
-but does not connect the Nova resource plan to a production route.
+600-us enable and 10-us disable delays.
 Panther and Wildcat Lake Type-C power transitions run Wa_14020908590 before
 changing `XELPDP_TCSS_POWER_REQUEST`: wait up to 10 ms for the TCSS display
 mailbox to become idle, write enable/disable data, issue command 1 with
@@ -492,14 +503,13 @@ The shared Type-C owner retains `TcDisplayProfile` instead of a broad
 assignment and the Display-30 mailbox workaround, and it must agree with the
 MMIO view's exact `cx0_xe3`/`has_lt_phy` facts before any Type-C access. Nova
 therefore exercises PICA/TCSS ownership without inheriting the Display-30
-mailbox; Meteor retains FIA pin assignment and no PICA. This qualifies the
-Nova Type-C lease lifecycle but still does not install a live Nova route.
+mailbox; Meteor retains FIA pin assignment and no PICA.
 `NovaResourcePlan::{enable_d2d,disable_d2d}` realizes the plan's D2D
 dependency through Display >=20's `DDI_BUF_CTL` bits 29/28 and the source
 100-us state bounds. The shared low-level helper is separated from
 operational `DisplayIp`, but Nova requires `has_lt_phy()` before its first
 register access. Missing state is typed and a crossed non-LT view writes
-nothing. This remains a disconnected prerequisite rather than a modeset.
+nothing.
 `NovaResourcePlan::acquire_main_wells` requests PW1, optional PW2 and the
 selected PW_A--D in dependency order, waits up to 1 ms for each state and
 fuse-distribution indication (failing closed where Linux only warns), and
@@ -508,7 +518,6 @@ grants for reverse-order release and never clears pre-existing DRIVER
 requests. BIOS, KVMR or
 debug requests may keep a released well raised, matching Linux's forced-on
 rule. The exact LT-PHY platform fact is checked before the first register read.
-This raw disconnected lease is not the future live owner's global refcount.
 `NovaPortLease` prepares a dark DDI with the caller holding DC-off and
 serializing access to the port and PICA. It acquires main wells, then PICA and
 TCSS ownership for live native DP-alt on TC1/TC2, then LT AUX for DP/eDP.
@@ -517,22 +526,21 @@ AUX and PHY, including BUF_CTL5 and P2P responses. The shared mapping
 preserves the separate DDI control and clock value/frequency addresses.
 The Type-C connection retains the negotiated pin assignment and lane ceiling
 for the LT PHY. Existing PICA, TCSS and AUX ownership, a live DDI, and
-fabric-only USB4/TBT HPD cause refusal. An opted-in firmware-lit panel must
-first be retired by a future live owner.
+fabric-only USB4/TBT HPD cause refusal.
 Following the i915 `intel_ddi_pre_pll_enable` and
 `mtl_ddi_prepare_link_retrain` phases, D2D is requested separately after PLL
 setup. D2D release requires the DDI enable bit clear and PHY idle observed.
 After retiring the PLL, the caller releases AUX, Type-C ownership, TCSS,
 PICA, and the main wells. Failed preparation attempts reverse-order cleanup.
 An unconfirmed release returns the failing step and leaves the outstanding
-requests with the same lease for retry. The production route remains gated.
-Display 35's disconnected watermark path forces the reported level-0 latency
+requests with the same lease for retry.
+Display 35's watermarks force the reported level-0 latency
 to zero before the 6-us WaWmMemoryReadLatency adjustment and selects method 2
 for every linear plane; unpanned Tile4 retains the display-30 calculation.
-Its disconnected MDCLK image uses the Xe3P MBUS throttle field at bits 16:13
+Its MDCLK image uses the Xe3P MBUS throttle field at bits 16:13
 and the five-bit DBUF minimum tracker at bits 20:16. The lowest clock's ratio
 is 6 and becomes 12 when MBUS is joined, which would be truncated by the
-display-20 field. The register images are pure and perform no MMIO.
+display-20 field.
 
 `intel_gpu_nvl_dbuf::NovaDbufPlan` computes a complete set of primary and
 cursor allocations for unscaled XR24 scanout on the available Pipes A through
@@ -542,8 +550,8 @@ CDCLK rung that meets it. A single Pipe A or B joins both MBUS banks. When
 pipes share a bank, the allocator splits it by active width and reserves the
 cursor at the end of each pipe's range. A hidden cursor retains its allocation.
 The plan produces the full-modeset MBUS, slice request/tracker, active DBOX,
-and plane/cursor watermark and DDB images. The live commit and PM-demand
-transaction are pending.
+and plane/cursor watermark and DDB images. It is the fixture oracle for the
+live display-35 resource transaction, which computes its own images.
 Display 35's disconnected FBC helpers preserve the source format boundary:
 the Lunar five-format set, four 64-bit integer formats, and only ARGB/ABGR
 FP16. Only the FP16 pair receives `PLANE_PIXEL_NORMALIZE_ENABLE` with the 1.0
@@ -551,12 +559,13 @@ factor on HDR planes 1--3. The 2 MiB system-cache image uses the stolen offset
 in 4 KiB units and the range in 64 KiB units, with cache reads disabled for
 Wa_14025769978. The live FBC owner and production Nova route do not call these
 helpers.
-`intel_gpu_xe3plpd` holds the disconnected modeset deltas that must not fall
+`intel_gpu_xe3plpd` also types the display-35 deltas that must not fall
 through display 30: no `TRANS_VSYNCSHIFT` write or transcoder interlace bits,
 interlace readback always false, linear/X reflection admitted with Tile4
 reflection refused, and semiplanar YUV aligned vertically by two (both axes
-when rotated). Its fixtures produce only typed plans/refusals; KMS does not
-call it. The same disconnected module decodes each pipe's four six-plane
+when rotated). The live transcoder path skips `TRANS_VSYNCSHIFT` itself
+(`intel_gpu_xelpg_pipes`); KMS does not call these typed plans. The module
+also decodes each pipe's four six-plane
 `UNDERRUN_DBG1` reasons, frozen 11-bit frame/20-bit line counters, optional FBC
 decompression starvation and the package-C-state memory-blocking latch. It
 returns Linux's exact write-one-to-clear images (full nonzero DBG1; only the
@@ -571,7 +580,8 @@ on Pipes A/B. These are disconnected admission facts, not color UAPI or MMIO.
 The same module decodes Display 35's `MTL_MEM_SS_INFO_GLOBAL` and retains the
 source 65 GB/s `xe3lpd_sa_info` ceiling. `XE3P_ECC_IMPACTING_DE` is a typed
 refusal because Linux 7.0-rc7 states that Bspec supplies no handling rule;
-there is no guessed derating and no live resource transaction.
+there is no guessed derating, and the live bandwidth read
+(`intel_gpu_xelpg_bw`) refuses it the same way.
 The DMC parser separately tags Panther (`xe3lpd_dmc.bin`), Wildcat
 (`xe3lpd_3002_dmc.bin`) and Nova (`xe3p_lpd_dmc.bin`) under their shared
 0x8000 ceiling. Panther/Wildcat KMS passes its retained exact identity and
@@ -595,9 +605,8 @@ MOCS table and display/media 35.00. Firmware packages supply
 `xe/nvl_guc_70.55.4.bin` from Linux 7.0-rc7's `xe_uc_fw.c`. Both images
 must meet the 70.55.4 minimum. `GtPlatform::NovaLakeS` admits the
 source graphics-GMD set 30.03/30.04/30.05 plus media 35.00 on the driver-FLR
-headless route. It never enters the display-30 route; its distinct read-only
-display option proves 35.00 without selecting the disconnected LT transport.
-Programming remains gated until its clock/PHY/modeset policy is qualified.
+headless route unless `narf.intel.nvl_display=1` selects the
+display-preserving route above.
 
 Nova Lake-P IDs D750 through D757 and D75F use their own Xe descriptor.
 The driver registers these nine IDs and reports the product before PCI
@@ -696,81 +705,24 @@ probe returns `NotForThisDriver` — it no longer collapses
 silently into the same `BadDevice` used for dead hardware.
 
 Internal display programming admits qualified Gen12 (Tiger Lake / Alder Lake /
-Raptor Lake) and the separate Meteor/Arrow Lake Xe-LPG sequence. Rocket Lake
-has an exact GT and VBT metadata profile; its external outputs on DDI B are
-admitted, and its internal display-programming gate stays closed.
+Raptor Lake), Gen11, Gen9 and Gen9 LP, and the separate Meteor/Arrow Lake
+Xe-LPG sequence. Rocket Lake
+has an exact GT and VBT metadata profile; its external outputs on DDI B and
+TC1/TC2 are admitted, and its internal display-programming gate stays closed.
 Arrow Lake shares the `MeteorLake` classification and Linux's `mtl_desc`
-display descriptor. Panther Lake refuses display programming. Lunar Lake
-keeps its headless execution profile unless a per-device display-20 route
-is requested and admitted (§17, "Xe2_LPD"); the generation-level gates
-still refuse it. External sessions and PWM retain their separate
-generation gates below.
+display descriptor. Lunar, Panther and Wildcat Lake and Nova Lake-S keep
+their headless execution profile unless their per-device route is requested
+and admitted (`narf.intel.lnl_display=1`, `narf.intel.ptl_display=1`,
+`narf.intel.wcl_display=1`, `narf.intel.nvl_display=1`; §17 and above); the
+generation-level gates still refuse them. External sessions and PWM retain
+their separate generation gates below.
 
 ## 6. Out of scope
 
-- **Gen9 (Skylake / Kaby Lake / Coffee Lake / Whiskey Lake /
-  Comet Lake)** — in scope since Gen9 Lane 0 lifted the
-  exclusion (86-ID census to be added to §5 by Lane 1). The five families
-  are named explicitly: Comet Lake and Whiskey Lake were not
-  named in this bullet before the lift and must not stay
-  excluded by omission. Gen11 (Ice Lake / Jasper Lake /
-  Elkhart Lake) was excluded under this bullet until Gen11
-  Lane 1 lifted it for identity + probe (26 IDs in §5) and
-  Lane 2 extended the lift to GEM mapping via the legacy
-  Gen8 PTE format; its display model is a separate lane
-  programme, and external display was gated until Lane 8
-  admitted it (§4, §12.3). GT execution (execlists
-  submission on RCS) was admitted by the Gen11 execlists
-  lane (§8). Gen9 follows the same section-by-section
-  pattern: Lane 1 lifts identity + probe, Lane 2 GEM
-  mapping, Lane 3 execlists, Lane 4 the display clocks,
-  Lane 5 the modeset, Lane 6 power, Lane 7 GuC/HuC, Lane 8
-  external outputs (§12.4). The old reason for the
-  exclusion — "the codec layer is Gen12-shaped (combo-PHY
-  DPLL, universal planes), so that generation would need a
-  separate display model, not more table rows" — is now
-  only partly true and is no longer a reason to exclude:
-  universal planes are the Skylake invention, and the
-  Gen11 lanes have already transcribed the SKL
-  `DPLL_CTRL1` register (`intel_gpu_gen11_dpll.rs:711-830`).
-  The genuinely separate display model remains CDCLK via
-  LCPLL, the SKL WRPLL + CFGCR1/2, the SKL watermarks /
-  DBUF geometry, and the `DDI_BUF_TRANS` swing tables —
-  that is the Gen9 Lane 4 programme, not an exclusion.
-- **Gen9-LP (Broxton / Gemini Lake)** — out of scope for
-  the Gen9 programme (§12.4, Q3), and since taken up as its
-  own follow-up for the GT only. The 7 IDs (BXT
-  0A84/1A84/1A85/5A84/5A85, GLK 3184/3185) are
-  `Generation::Broxton`; the execlists owner runs them as
-  `LegacyGt::Gen9Lp` (CHV snooping PPAT, Broxton MOCS, the LP
-  workarounds, one slice of three subslices with pooled EUs,
-  the 19.2 MHz crystal, `BXT_RP_STATE_CAP`, RC6 behind
-  `bxt_check_bios_rc6_setup`). The display runs the Skylake
-  modeset with the LP blocks in place (`Modeset::gen9_lp`): the
-  DPIO PHY (`intel_gpu_bxt_phy`), per-port PLLs
-  (`intel_gpu_bxt_dpll`), the DE-PLL CDCLK (`intel_gpu_bxt_cdclk`),
-  the 512−4 / 1024−4 DBUF (Linux
-  `display/intel_display_device.c:848,863`), Gemini Lake's
-  display-10 watermarks, the PPS at `PPS_BASE`, and DP/HDMI on DDI
-  B/C with the display-engine hotplug bank (`HpdBank::Bxt`, its
-  sense inversion from the VBT's `hpd_invert`). The backlight runs
-  on the VBT panel's PWM controller (`BXT_BLC_PWM_*(controller)`).
-  HDMI refuses the DPLL ranges Gen9 LP cannot generate; Gemini Lake
-  reaches 594 MHz scrambled and runs YCbCr 4:2:0 through the pipe CSC
-  with a linear degamma (display 10 has no output CSC).
-  A GOP framebuffer stays fixed-mode KMS when no modeset runs.
-  Not run on silicon.
-- Arrow Lake display — identification landed (#1023, §5);
-  display support rides #1016's Xe-LPG family via the shared
-  Meteor Lake classification, not a separate Arrow Lake path.
-- Lunar Lake / Battlemage 3D — wait for PRM.
-- Discrete Arc (Alchemist / Battlemage) — could plug into the
-  same code path but requires the higher Xe-HPG / Xe2-HPG PRM
-  set, which is partial today.
 - Power/thermal-firmware blob (PUNIT) — opaque, loaded by the
   platform.
-- HDCP — HDCP 1.4 and 2.2 on external SST DP and HDMI landed behind
-  `narf.intel.hdcp=1` (§20, "HDCP 1.4 and 2.2"); DP MST HDCP stays out.
+- DP MST HDCP. HDCP 1.4 and 2.2 on external SST DP and HDMI run
+  behind `narf.intel.hdcp=1` (§20, "HDCP 1.4 and 2.2").
 
 ## 7. Lane 1 (#1010) — display correctness core + publication
 
