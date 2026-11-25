@@ -28,7 +28,10 @@ pub(super) trait Regs {
     fn write16(&self, reg: u16, value: u16) -> Result<(), AccessError>;
     fn write32(&self, reg: u16, value: u32) -> Result<(), AccessError>;
     fn settle_map_data(&self) {
-        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(50));
+        crate::platform::scheduler::responsive_spin_until(
+            || false,
+            crate::platform::time::Deadline::after_us(50),
+        );
     }
 }
 
@@ -256,7 +259,7 @@ impl Owner {
             *byte = map_byte(io, address as u16)?;
         }
         let mut logical = Box::new([0xff; 512]);
-        narf_drivers_wireless_rtw::rtw88::efuse::decode_map(&raw[..], &mut logical[..256])
+        narf_drivers_wireless_rtl_chip::efuse::decode_map(&raw[..], &mut logical[..256])
             .map_err(|_| Error::Map)?;
         if logical[..] != factory.logical {
             return Err(Error::Identity);
@@ -336,7 +339,7 @@ fn map_byte(io: &impl Regs, address: u16) -> Result<u8, Error> {
     begin_read(io, address)?;
     let mut reads = 0;
     let mut status = Ok(false);
-    narf_scheduler::responsive_spin_until(
+    crate::platform::scheduler::responsive_spin_until(
         || {
             if reads > 10_000 {
                 return true;
@@ -345,7 +348,7 @@ fn map_byte(io: &impl Regs, address: u16) -> Result<u8, Error> {
             status = live32(io, CTRL).map(|v| v & (1 << 31) != 0);
             !matches!(status, Ok(false)) || reads > 10_000
         },
-        narf_time::Deadline::after_ms(100),
+        crate::platform::time::Deadline::after_ms(100),
     );
     if !status? {
         return Err(Error::Timeout);
@@ -367,7 +370,7 @@ fn physical(io: &impl Regs, address: u16) -> Result<u8, Error> {
     let mut status = Ok(false);
     // The attempt guard remains authoritative if the scheduler invokes done
     // once more at the time ceiling. Never issue a1002nd ready read.
-    narf_scheduler::responsive_spin_until(
+    crate::platform::scheduler::responsive_spin_until(
         || {
             if reads > READY_REPEATS {
                 return true;
@@ -382,7 +385,7 @@ fn physical(io: &impl Regs, address: u16) -> Result<u8, Error> {
             });
             !matches!(status, Ok(false)) || reads > READY_REPEATS
         },
-        narf_time::Deadline::after_ms(100),
+        crate::platform::time::Deadline::after_ms(100),
     );
     if !status? {
         return Err(Error::Timeout);

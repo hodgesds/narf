@@ -2,7 +2,7 @@
 //! Exact source helpers bound before N21C measurement issuance. This
 //! conservatively invalidates a record on source-text changes; it is not
 //! executable signing, a compiler attestation or physical RF evidence.
-use narf_lib::sync::OnceLock;
+use crate::platform::lib::sync::OnceLock;
 
 pub(super) fn digest() -> [u8; 32] {
     static DIGEST: OnceLock<[u8; 32]> = OnceLock::new();

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Exact registered AE cold/factory/calibration capsule and lifetime retention.
 use super::{cold_storage, factory};
+use crate::platform::bus::BusAddr;
+use crate::platform::lib::{
+    mutex::Mutex,
+    sync::{IrqSafeSpinLock, OnceLock},
+};
 use crate::rtlwifi::{
     efuse::Factory,
     firmware_native::PciIo,
@@ -12,11 +17,6 @@ use alloc::sync::Arc;
 use core::{
     mem::ManuallyDrop,
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
-};
-use narf_bus::BusAddr;
-use narf_lib::{
-    mutex::Mutex,
-    sync::{IrqSafeSpinLock, OnceLock},
 };
 
 /// Sealed to the rtlwifi package. Production implements only original PciIo;
@@ -164,7 +164,7 @@ impl<I: Backend> Retained<I> {
             let wiphy = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
                 (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
             });
-            !narf_wireless::rfkill::blocked(wiphy)
+            !crate::platform::wireless::rfkill::blocked(wiphy)
         })
     }
     pub(in crate::rtlwifi) fn registered_for(&self, firmware: &Arc<Owner<I>>) -> bool {

@@ -12,6 +12,7 @@ use super::{
     retained::{Backend, Phase, Retained},
     txpower,
 };
+use crate::platform::lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use crate::rtlwifi::{
     firmware_transport::{Io, Stage as FirmwareStage},
     prepare::Error,
@@ -23,7 +24,6 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll, Waker},
 };
-use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 /// Exact source stage retained by the original registered PCI owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,7 +232,7 @@ impl<I: Backend> Work<I> {
     pub(super) async fn fixture(
         root: Arc<Retained<I>>,
         program: Arc<QualifiedProgram>,
-        database: Arc<narf_wireless::reg::db::Database>,
+        database: Arc<crate::platform::regdb::Database>,
         op: envelope::Operating,
     ) -> Result<Self, Error> {
         let state = root.state.lock().await;
@@ -444,7 +444,7 @@ impl<I: Backend> Retained<I> {
         let _admission = self.admission.lock().await;
         let program = self.program(op).await?;
         let program = Arc::new(QualifiedProgram::registered(program)?);
-        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::State)?;
+        let domain = crate::platform::regdb::snapshot().ok_or(Error::State)?;
         let (inputs, identity, cold) = {
             let state = self.state.lock().await;
             if state.phase != Phase::InputsReady || state.work.is_some() {
@@ -492,7 +492,7 @@ impl<I: Backend> Retained<I> {
             state.work = Some(work);
         }
         let root = self.clone();
-        narf_scheduler::spawn(async move {
+        crate::platform::scheduler::spawn(async move {
             let _ = core::future::poll_fn(|cx| root.poll_preparation(cx)).await;
         });
         ticket.await

@@ -3,10 +3,10 @@
 //! prove that a native receiver has programmed a40MHz RF/BB state or cut RX.
 use super::ht40_geometry::Geometry;
 use super::{Error, Executable, Proof, Request};
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::{FirmwareBlob, FirmwareError};
 use crate::rtl8xxxu::device_init::Factory;
 use alloc::{format, sync::Arc};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
 
 pub(super) const HEADER: usize = 192;
 pub(super) const ROWS: usize = 10;
@@ -90,7 +90,7 @@ impl Qualification {
         if base.permission().channel() != geometry.primary() {
             return Err(Error::State);
         }
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive::<Read>().ok())
             .ok_or(Error::Policy)?;
         let source = match crate::firmware_asset::load(

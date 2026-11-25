@@ -24,8 +24,8 @@
 
 #![allow(dead_code)]
 
-use narf_bus::MmioRegion;
-use narf_time::Deadline;
+use crate::platform::bus::MmioRegion;
+use crate::platform::time::Deadline;
 
 use super::regs::*;
 
@@ -229,7 +229,7 @@ pub unsafe fn init_llt_table(mmio: &MmioRegion, did: u16) -> Result<(), MacInitE
 
     // Poll AUTO_LLT[+2] bit0 back to 0 (load complete).
     let offset = REG_AUTO_LLT + 2;
-    let done = narf_scheduler::responsive_spin_until(
+    let done = crate::platform::scheduler::responsive_spin_until(
         || {
             // SAFETY: same.
             unsafe { mmio.read8(offset) & 0x01 == 0 }
@@ -265,9 +265,9 @@ pub unsafe fn init_mac(mmio: &MmioRegion, did: u16) -> Result<(), MacInitError> 
     unsafe {
         // 1. Release MAC IO reset.  `hw.c:780..794`.
         mmio.write8(REG_CR, 0xFF);
-        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(2_000_000));
+        crate::platform::time::busy_wait_cycles(crate::platform::time::ns_to_cycles(2_000_000));
         mmio.write8(REG_HWSEQ_CTRL, 0x7F);
-        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(2_000_000));
+        crate::platform::time::busy_wait_cycles(crate::platform::time::ns_to_cycles(2_000_000));
 
         // Wakeup-online bits: `hw.c:789..792`.
         let bytetmp = mmio.read8(REG_SYS_CLKR);

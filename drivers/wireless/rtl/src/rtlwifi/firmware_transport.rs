@@ -4,13 +4,13 @@
 //! rtl8723com/fw_common.c. Profiles: RTL8188EE, RTL8821AE, RTL8192EE,
 //! RTL8192CE/8188CE (normal images), RTL8723BE and RTL8723AE.
 //! PCI bus mastering remains parked. This does not install native packet rings.
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
-use narf_firmware::FirmwareError;
-use narf_lib::{
+use crate::platform::firmware::FirmwareError;
+use crate::platform::lib::{
     mutex::Mutex,
     sync::{IrqSafeSpinLock, OnceLock},
 };
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const HEADER: usize = 32;
 const PAGE: usize = 4096;
@@ -58,7 +58,7 @@ pub struct Info {
 /// header validated; the bytes are downloaded later by the WoWLAN
 /// card-disable branch (`rtl8821ae_set_fw_related_for_wowlan(true)`).
 pub(crate) fn registered_wowlan_image() -> Result<Vec<u8>, Error> {
-    let loader = narf_firmware::trusted_loader_authority()
+    let loader = crate::platform::firmware::trusted_loader_authority()
         .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
     let authority = loader
         .derive()
@@ -146,10 +146,12 @@ pub trait Io: Send + Sync {
     }
     async fn delay_us(&self, micros: u64) {
         if micros == 0 {
-            narf_scheduler::yield_now().await;
+            crate::platform::scheduler::yield_now().await;
         } else {
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(micros.saturating_mul(1000)))
-                .await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                micros.saturating_mul(1000),
+            ))
+            .await;
         }
     }
 }
@@ -248,13 +250,21 @@ pub(crate) struct Identity {
     /// Actual selected/validated header bytes, not a filename or caller's
     /// guessed chip version. Short inert fixtures carry no header facts.
     pub(super) version: Option<(u16, u8)>,
-    source: Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+    source: Option<
+        crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareBlob,
+            crate::platform::capabilities::Read,
+        >,
+    >,
 }
 impl Identity {
     fn from_bytes(
         bytes: &[u8],
         source: Option<
-            narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+            crate::platform::capabilities::Cap<
+                crate::platform::firmware::FirmwareBlob,
+                crate::platform::capabilities::Read,
+            >,
         >,
     ) -> Self {
         let mut h = narf_crypto::sha256::Sha256::new();
@@ -275,7 +285,10 @@ impl Identity {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn fixture_with_source(
         bytes: &[u8],
-        source: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+        source: crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareBlob,
+            crate::platform::capabilities::Read,
+        >,
     ) -> Self {
         Self::from_bytes(bytes, Some(source))
     }
@@ -283,15 +296,15 @@ impl Identity {
         &self,
         operation: impl FnOnce() -> Result<T, super::prepare::Error>,
     ) -> Result<T, super::prepare::Error> {
-        use narf_capabilities::{Cap, CapError, CapOp, Read};
+        use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
         struct Current<F>(F);
         impl<T, F: FnOnce() -> Result<T, super::prepare::Error>>
-            CapOp<narf_firmware::FirmwareBlob, Read> for Current<F>
+            CapOp<crate::platform::firmware::FirmwareBlob, Read> for Current<F>
         {
             type Output = Result<T, super::prepare::Error>;
             fn execute(
                 self,
-                _: &Cap<narf_firmware::FirmwareBlob, Read>,
+                _: &Cap<crate::platform::firmware::FirmwareBlob, Read>,
             ) -> Result<Self::Output, CapError> {
                 Ok((self.0)())
             }
@@ -358,7 +371,7 @@ struct PacketState {
     // Historical metadata from the original owner's single actual inquiry.
     // Its presence consumes qualification even when no signed asset exists.
     request: OnceLock<super::rtl8821ae::coex_program::Request>,
-    scalar: narf_lib::sync::IrqSafeSpinLock<()>,
+    scalar: crate::platform::lib::sync::IrqSafeSpinLock<()>,
     retired: AtomicBool,
 }
 impl PacketState {
@@ -366,7 +379,7 @@ impl PacketState {
         Self {
             program: OnceLock::new(),
             request: OnceLock::new(),
-            scalar: narf_lib::sync::IrqSafeSpinLock::new(()),
+            scalar: crate::platform::lib::sync::IrqSafeSpinLock::new(()),
             retired: AtomicBool::new(false),
         }
     }
@@ -631,7 +644,8 @@ impl<I: Io> Owner<I> {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) async fn ae_fixture_lock(
         &self,
-    ) -> narf_lib::mutex::MutexGuard<'_, Option<Box<super::rtl8723ae::init::Owner>>> {
+    ) -> crate::platform::lib::mutex::MutexGuard<'_, Option<Box<super::rtl8723ae::init::Owner>>>
+    {
         self.ae_cold.lock().await
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -788,7 +802,7 @@ impl<I: Io> Owner<I> {
         if self.started.load(Ordering::Acquire) {
             return Err(Error::AlreadyStarted);
         }
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
         let authority = loader
             .derive()
@@ -891,9 +905,9 @@ impl<I: Io> Owner<I> {
     }
     pub(super) async fn initialize_registered_from(
         &self,
-        authority: &narf_capabilities::Cap<
-            narf_firmware::FirmwareRegistry,
-            narf_capabilities::Read,
+        authority: &crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareRegistry,
+            crate::platform::capabilities::Read,
         >,
         name: &str,
     ) -> Result<Info, Error> {
@@ -936,9 +950,9 @@ impl<I: Io> Owner<I> {
     #[cfg(feature = "kernel-test")]
     pub(super) async fn initialize_registered_fixture(
         &self,
-        authority: &narf_capabilities::Cap<
-            narf_firmware::FirmwareRegistry,
-            narf_capabilities::Read,
+        authority: &crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareRegistry,
+            crate::platform::capabilities::Read,
         >,
         name: &str,
     ) -> Result<Info, Error> {
@@ -949,9 +963,9 @@ impl<I: Io> Owner<I> {
     }
     async fn load_registered(
         &self,
-        authority: &narf_capabilities::Cap<
-            narf_firmware::FirmwareRegistry,
-            narf_capabilities::Read,
+        authority: &crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareRegistry,
+            crate::platform::capabilities::Read,
         >,
         name: &str,
     ) -> Result<Info, Error> {
@@ -1017,7 +1031,7 @@ impl<I: Io> Owner<I> {
         if self.did == super::regs::RTL_DEV_8192DE {
             return self.run_8192de(info, payload).await;
         }
-        narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
+        crate::platform::time::timeout(crate::platform::time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
             // Linux _rtl88ee_init_mac sets the CPU clock before firmware.
             // Packet engines stay closed until a later retained ring owner:
@@ -1094,7 +1108,7 @@ impl<I: Io> Owner<I> {
     async fn run_8821ae(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
         // FW_8821AE_POLLING_TIMEOUT_COUNT x 5 us twice plus 1000 page chunks
         // fits well inside the EE one-second bound.
-        narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
+        crate::platform::time::timeout(crate::platform::time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
             let control = self.read8(0x100).await?;
             self.io.write8(0x100, control & !0xcf)?;
@@ -1128,7 +1142,7 @@ impl<I: Io> Owner<I> {
     async fn run_8192ee(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
         // 2999 checksum reads plus 3001 x 50 us WINTINI polls fit well inside
         // the one-second bound.
-        narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
+        crate::platform::time::timeout(crate::platform::time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
             let control = self.read8(0x100).await?;
             self.io.write8(0x100, control & !0xcf)?;
@@ -1161,7 +1175,7 @@ impl<I: Io> Owner<I> {
     async fn run_8192ce(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
         // 1000 x 100 us APFM poll, 99 checksum reads and 101 x 5 ms WINTINI
         // polls fit inside the one-second bound.
-        narf_time::timeout(narf_time::Deadline::after_ms(1000), async {
+        crate::platform::time::timeout(crate::platform::time::Deadline::after_ms(1000), async {
             self.set(Stage::Preparing, None);
             if self.io.read32(MCU)? == u32::MAX {
                 return Err(Error::Gone);
@@ -1203,7 +1217,7 @@ impl<I: Io> Owner<I> {
     async fn run_8723be(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
         // 5999 undelayed checksum reads plus 6001 x 5 ms WINTINI polls
         // (FW_8723B_POLLING_TIMEOUT_COUNT) bound the Linux wait at ~30 s.
-        narf_time::timeout(narf_time::Deadline::after_ms(31_000), async {
+        crate::platform::time::timeout(crate::platform::time::Deadline::after_ms(31_000), async {
             self.set(Stage::Preparing, None);
             if self.io.read32(MCU)? == u32::MAX {
                 return Err(Error::Gone);
@@ -1233,7 +1247,7 @@ impl<I: Io> Owner<I> {
     /// The 5000 x 500 us dual-MAC wait plus the checksum and ready
     /// polls bound the Linux wait near 2.5 s.
     async fn run_8192de(&self, info: Info, payload: &[u8]) -> Result<Info, Error> {
-        narf_time::timeout(narf_time::Deadline::after_ms(6_000), async {
+        crate::platform::time::timeout(crate::platform::time::Deadline::after_ms(6_000), async {
             self.set(Stage::Preparing, None);
             if self.io.read32(MCU)? == u32::MAX {
                 return Err(Error::Gone);
@@ -1300,8 +1314,8 @@ impl<I: Io> Owner<I> {
             Ok(info)
         };
         let mut work = core::pin::pin!(work);
-        narf_time::timeout(
-            narf_time::Deadline::after_ms(6_000),
+        crate::platform::time::timeout(
+            crate::platform::time::Deadline::after_ms(6_000),
             core::future::poll_fn(|cx| match io.poll(work.as_mut(), cx) {
                 Ok(poll) => poll,
                 Err(error) => core::task::Poll::Ready(Err(error)),

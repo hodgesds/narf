@@ -18,14 +18,14 @@ use super::{
     management_runtime::{Candidate, SecurityMode},
     packet_transport::{Io as PacketIo, UsbIo},
 };
+use crate::platform::ipc::{Consumer, Producer};
+use crate::platform::lib::{mutex::Mutex, sync::IrqSafeSpinLock};
+use crate::platform::net::{Frame, Interface, RX_RING_N, TX_RING_N};
+use crate::platform::wireless::WirelessNetIface;
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use narf_ipc::{Consumer, Producer};
-use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
-use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessConfig, WirelessError,
-    WirelessNetIface,
 };
 use zeroize::Zeroizing;
 
@@ -47,10 +47,10 @@ const PM1_GRACE_MS: u64 = 100;
 const HOME_GRACE_MS: u64 = 200;
 
 fn now_ms() -> u64 {
-    narf_time::wall::monotonic_ns() / 1_000_000
+    crate::platform::time::wall::monotonic_ns() / 1_000_000
 }
 async fn pause() {
-    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(1_000_000)).await;
 }
 fn nonce() -> Option<[u8; 32]> {
     let mut nonce = [0; 32];
@@ -436,8 +436,8 @@ impl<C: ControlIo, B: PacketIo> core::fmt::Debug for Device<C, B> {
 
 impl<C: ControlIo, B: PacketIo> Device<C, B> {
     pub(super) fn new(name: &str, radio: Radio<C, B>, authority: Authority) -> Self {
-        let (rx, rx_consumer) = narf_ipc::channel();
-        let (tx_producer, tx) = narf_ipc::channel();
+        let (rx, rx_consumer) = crate::platform::ipc::channel();
+        let (tx_producer, tx) = crate::platform::ipc::channel();
         let mac = radio.local();
         let channel = radio.channel();
         let channels = authority.channels();
@@ -487,7 +487,7 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
         // never changes the operator's administrative IFF_UP.
         let published = self.publish_carrier(up);
         if was_up && !up && published {
-            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            crate::platform::wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
     }
     fn fail(&self, state: &mut State<C, B>) {
@@ -550,9 +550,10 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
                 }
             }
             for bytes in &frames {
-                if let Ok(buffer) =
-                    narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
-                {
+                if let Ok(buffer) = crate::platform::io::alloc_coherent(
+                    bytes.len(),
+                    crate::platform::lib::id::DomainId::DRIVER_0,
+                ) {
                     let mut frame = Frame::new(buffer, bytes.len() as u32);
                     frame.payload_mut().copy_from_slice(bytes);
                     let _ = state.rx.try_send(frame);
@@ -564,11 +565,15 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
             if self.failed.load(Ordering::Acquire) {
                 break;
             }
-            narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+            crate::platform::net::iface::on_rx_frame_from(&self.name, &mut frame);
         }
         progress
     }
-    pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    pub(super) fn enqueue(
+        &self,
+        bytes: &[u8],
+        meta: crate::platform::net::TxMeta,
+    ) -> Result<(), ()> {
         if !self.up.load(Ordering::Acquire)
             || self.failed.load(Ordering::Acquire)
             || !transmit_admitted(bytes, self.mac)
@@ -576,8 +581,11 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
         {
             return Err(());
         }
-        let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
-            .map_err(|_| ())?;
+        let buffer = crate::platform::io::alloc_coherent(
+            bytes.len(),
+            crate::platform::lib::id::DomainId::DRIVER_0,
+        )
+        .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
         frame.set_tx_meta(meta);
@@ -591,22 +599,22 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
 }
 
 trait Endpoint: Send + Sync {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
+    fn send(&self, bytes: &[u8], meta: crate::platform::net::TxMeta) -> Result<(), ()>;
     fn drain(&self) -> bool;
 }
 impl<C: ControlIo + 'static, B: PacketIo + 'static> Endpoint for Device<C, B> {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    fn send(&self, bytes: &[u8], meta: crate::platform::net::TxMeta) -> Result<(), ()> {
         self.enqueue(bytes, meta)
     }
     fn drain(&self) -> bool {
         Device::drain(self)
     }
 }
-/// `narf_net::iface::SendFn` carries no interface identity, so the gen2
+/// `crate::platform::net::iface::SendFn` carries no interface identity, so the gen2
 /// publication is one netdev per boot (as the RTL8188EU one).
 static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
 static CLAIMED: AtomicBool = AtomicBool::new(false);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+fn send(bytes: &[u8], meta: crate::platform::net::TxMeta) -> Result<(), ()> {
     let active = ACTIVE.lock().clone().ok_or(())?;
     active.send(bytes, meta)
 }
@@ -623,7 +631,8 @@ pub async fn attach(
     channels: Authority,
     grant: Grant,
 ) -> Result<Arc<Device<UsbControl, UsbIo>>, gen2_radio::Error> {
-    let authority = narf_net::trusted_net_authority()
+    #[cfg(feature = "builtin")]
+    let authority = crate::platform::net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(gen2_radio::Error::Profile)?;
     let usb = firmware.usb_device();
@@ -634,21 +643,38 @@ pub async fn attach(
     // register_netdevice starts IFF_DOWN: finish the actual USB/MAC/chip
     // park before publication rather than leave a powered radio under DOWN.
     radio.park_idle().await?;
-    let name = narf_net::iface::reserve_name("wlan%d");
+    let name = crate::platform::net::iface::reserve_name("wlan%d");
     let device = Arc::new(Device::new(name, radio, channels));
-    narf_net::registry()
-        .register(&authority, Registered(device.clone()))
+    #[cfg(feature = "builtin")]
+    {
+        crate::platform::net::registry()
+            .register(&authority, Registered(device.clone()))
+            .map_err(|_| gen2_radio::Error::Profile)?;
+        *ACTIVE.lock() = Some(device.clone());
+        crate::platform::net::iface::register(name, device.mac, send);
+        crate::platform::net::iface::set_link_state(name, false);
+        let registration =
+            crate::platform::net::iface::lookup(name).ok_or(gen2_radio::Error::State)?;
+        device.bind_admin(registration)?;
+        crate::platform::net::iface::install_rx_drain(drain);
+        narf_wireless::registry::register(device.clone());
+    }
+    // `rtl.ko`: the module netdev (no wiphy for a USB function), its TX
+    // entering through the same send hook; the device stays unbound from
+    // an administrative target, so it is open from publication on.
+    #[cfg(feature = "module")]
+    {
+        *ACTIVE.lock() = Some(device.clone());
+        crate::platform::scheduler::spawn(device.clone().module_open());
+        crate::module_netdev::attach_usb(
+            device.clone(),
+            alloc::boxed::Box::new(|bytes| send(bytes, crate::platform::net::TxMeta::default())),
+        )
         .map_err(|_| gen2_radio::Error::Profile)?;
-    *ACTIVE.lock() = Some(device.clone());
-    narf_net::iface::register(name, device.mac, send);
-    narf_net::iface::set_link_state(name, false);
-    let registration = narf_net::iface::lookup(name).ok_or(gen2_radio::Error::State)?;
-    device.bind_admin(registration)?;
-    narf_net::iface::install_rx_drain(drain);
-    narf_wireless::registry::register(device.clone());
+    }
     crate::watchdog_work::start(&device, gen2_radio::WATCHDOG_MS);
     let worker = device.clone();
-    narf_scheduler::spawn(async move {
+    crate::platform::scheduler::spawn(async move {
         loop {
             worker.maintain().await;
             worker.drain();
@@ -1190,7 +1216,7 @@ fn bss_info(b: Candidate) -> BssInfo {
         security,
     }
 }
-fn offloads_admitted(meta: narf_net::TxMeta) -> bool {
+fn offloads_admitted(meta: crate::platform::net::TxMeta) -> bool {
     meta.csum_l4.is_none() && meta.tso_mss.is_none() && meta.vlan_tag.is_none()
 }
 fn transmit_admitted(bytes: &[u8], own: [u8; 6]) -> bool {

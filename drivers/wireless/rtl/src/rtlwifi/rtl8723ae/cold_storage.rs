@@ -2,9 +2,9 @@
 //! Original AE cold Box retention, not calibration authority.
 //! Requires init::Owner::history from the accompanying cold-history patch.
 use super::{init, phy::PgStore, version::Version};
+use crate::platform::lib::sync::OnceLock;
 use crate::rtlwifi::prepare::Error;
 use alloc::{boxed::Box, sync::Arc};
-use narf_lib::sync::OnceLock;
 
 /// Observed PCI identity from PciIo::ae_identity(), not EEPROM subvendor IDs.
 /// The native constructor is deliberately in firmware_native.rs, beside the
@@ -12,16 +12,20 @@ use narf_lib::sync::OnceLock;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rtlwifi) struct PciIdentity {
     fields: [u16; 4],
-    address: narf_bus::BusAddr,
+    address: crate::platform::bus::BusAddr,
 }
 
 impl PciIdentity {
     /// Read real config-space facts under current PCI authority. This is
     /// metadata, never a calibration or release grant. PciIo::ae_identity
     /// must call this with its OWN retained device/cap inside access().
+    #[cfg(feature = "builtin")]
     pub(in crate::rtlwifi) fn read(
         device: narf_bus::BusDevice,
-        cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+        cap: &crate::platform::capabilities::Cap<
+            narf_bus::BusDeviceCap,
+            crate::platform::capabilities::Write,
+        >,
     ) -> Result<Self, crate::rtlwifi::firmware_transport::Error> {
         use crate::rtlwifi::firmware_transport::Error;
         narf_drivers_wireless_rtw::rtw88::pci_park::invoke(cap, || {
@@ -47,15 +51,24 @@ impl PciIdentity {
         })
         .map_err(|_| Error::Access)?
     }
+    /// `rtl.ko`: the identity `narf_pci_identity` reported, read by the
+    /// module's `PciIo` inside its own command-gated access.
+    #[cfg(feature = "module")]
+    pub(in crate::rtlwifi) fn from_fields(
+        fields: [u16; 4],
+        address: crate::platform::bus::BusAddr,
+    ) -> Self {
+        Self { fields, address }
+    }
     #[cfg(any(test, feature = "kernel-test"))]
-    pub(in crate::rtlwifi) fn fixture(address: narf_bus::BusAddr) -> Self {
+    pub(in crate::rtlwifi) fn fixture(address: crate::platform::bus::BusAddr) -> Self {
         // Explicit inert fixture identity; native PciIo ALWAYS reads real PCI.
         Self {
             fields: [0x10ec, 0x8723, 0x10ec, 0x8723],
             address,
         }
     }
-    pub(in crate::rtlwifi) fn address(&self) -> narf_bus::BusAddr {
+    pub(in crate::rtlwifi) fn address(&self) -> crate::platform::bus::BusAddr {
         self.address
     }
 }

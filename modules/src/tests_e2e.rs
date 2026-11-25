@@ -2181,6 +2181,155 @@ fn e2e_rtw88_module_registration() -> TestResult {
 }
 kernel_test_in!("modules/e2e/rtw88", e2e_rtw88_module_registration);
 
+// ── rtl.ko (legacy Realtek rtlwifi PCIe + rtl8xxxu USB) ───────────────
+
+/// The id tables `rtl.ko` registers from. The module crate uses this same
+/// file, so the expected rows follow the table.
+#[path = "../../drivers/wireless/rtl/src/module_ids.rs"]
+#[allow(dead_code)]
+mod rtl_module_ids;
+
+/// A USB probe that must never run: the test registers it under a foreign
+/// owner only to observe which USB matches `rtl.ko` holds (`-EBUSY`).
+extern "C" fn rtl_e2e_foreign_usb_probe(_dev: u64, _reserved: u64) -> i32 {
+    -19
+}
+
+/// An owner id no loaded module has.
+const RTL_E2E_FOREIGN_OWNER: u64 = u64::MAX - 0x7274_6c00;
+
+/// Register `(vid, pid)` under [`RTL_E2E_FOREIGN_OWNER`]: `-EBUSY` while
+/// another module holds the match, `-ENODEV` with no USB stack, 0 (then
+/// withdrawn again) when the match is free.
+fn rtl_e2e_foreign_usb_claim(vid: u16, pid: u16) -> i32 {
+    use narf_bus::module_usb::{
+        register_module_usb_driver, unregister_module_usb_drivers, ModuleUsbMatch,
+        MATCH_VENDOR_PRODUCT,
+    };
+    let Ok(m) = ModuleUsbMatch::from_flags(MATCH_VENDOR_PRODUCT, vid, pid, 0, 0, 0) else {
+        return -22;
+    };
+    // SAFETY: the probe is kernel text that stays mapped; the match is
+    // withdrawn below before this function returns.
+    let rc = unsafe {
+        register_module_usb_driver(
+            RTL_E2E_FOREIGN_OWNER,
+            "rtl-e2e-foreign",
+            m,
+            rtl_e2e_foreign_usb_probe as usize,
+        )
+    };
+    unregister_module_usb_drivers(RTL_E2E_FOREIGN_OWNER);
+    rc
+}
+
+/// The real `rtl.ko` (`narf-drivers-wireless-rtl --features module`: the
+/// whole rtlwifi PCIe driver — identification, firmware, native preparation
+/// and the station with its `wlan%d`/wiphy — plus rtl8xxxu, over
+/// `narf-module-rt` and the KABI). Relocations for ~6.8 MB of driver,
+/// `core`/`alloc` and protocol code resolve and
+/// init runs to Live; the module claims exactly the rtlwifi PCI table (not
+/// rtw88's RTL8822BE) and, where the kernel has a USB stack, every rtl8xxxu
+/// VID/PID (not rtw88's RTL8821CU); a probe with no device context is
+/// refused before any device access; unload leaves no match. QEMU emulates
+/// no Realtek Wi-Fi device, so bring-up itself is proven on hardware.
+fn e2e_rtl_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    use rtl_module_ids::{PCI_DEVICES, PCI_VENDOR, USB_IDS};
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/rtl.ko")
+    else {
+        return TestResult::Fail("rtl module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("rtl module has no ABI placeholder");
+    };
+    let before = count();
+    // The match a foreign owner can take before load decides whether this
+    // kernel has a USB stack to check against.
+    let usb_stack = rtl_e2e_foreign_usb_claim(USB_IDS[0].0, USB_IDS[0].1) != -19;
+    let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("rtl.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    // The USB station's parameter-driven SME.
+    let params = ["ssid", "psk", "passphrase"]
+        .iter()
+        .all(|name| crate::params::find(&module.params, name).is_some())
+        && crate::params::find(&module.params, "ssid").is_some_and(|s| s.read() == "narf-e2e")
+        && crate::params::find(&module.params, "psk").is_some_and(|s| s.read().is_empty());
+    let installed = count().saturating_sub(before);
+    let pci_claims = module.name() == "rtl"
+        && installed == PCI_DEVICES.len()
+        && PCI_DEVICES
+            .iter()
+            .all(|&did| __module_thunk_for_test(PCI_VENDOR, did).is_some())
+        // RTL8822BE belongs to rtw88.
+        && __module_thunk_for_test(PCI_VENDOR, 0xB822).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let refused = PCI_DEVICES
+        .iter()
+        .filter_map(|&did| __module_thunk_for_test(PCI_VENDOR, did))
+        .all(|thunk| thunk(0, 0) != 0);
+    let usb_claims = !usb_stack
+        || (USB_IDS
+            .iter()
+            .all(|&(vid, pid)| rtl_e2e_foreign_usb_claim(vid, pid) == -16)
+            // RTL8821CU belongs to rtw88.
+            && rtl_e2e_foreign_usb_claim(0x0BDA, 0xC811) == 0);
+    drop(module);
+    if sys_delete_module("rtl").is_err() {
+        return TestResult::Fail("could not unload rtl.ko");
+    }
+    if !live {
+        return TestResult::Fail("rtl.ko not Live after init");
+    }
+    if !params {
+        return TestResult::Fail("rtl.ko parameters missing or the load argument not applied");
+    }
+    if !pci_claims {
+        narf_console::write_str(&format!(
+            "rtl: module installed {installed} PCI matches, table has {}\n",
+            PCI_DEVICES.len()
+        ));
+        return TestResult::Fail("rtl.ko did not claim exactly the rtlwifi PCI table");
+    }
+    if !refused {
+        return TestResult::Fail("rtl.ko probe accepted a token with no device context");
+    }
+    if !usb_claims {
+        return TestResult::Fail("rtl.ko did not hold exactly the rtl8xxxu USB table");
+    }
+    if count() != before
+        || PCI_DEVICES
+            .iter()
+            .any(|&did| __module_thunk_for_test(PCI_VENDOR, did).is_some())
+    {
+        return TestResult::Fail("rtl.ko unload left a PCI match");
+    }
+    if usb_stack
+        && USB_IDS
+            .iter()
+            .any(|&(vid, pid)| rtl_e2e_foreign_usb_claim(vid, pid) != 0)
+    {
+        return TestResult::Fail("rtl.ko unload left a USB match");
+    }
+    if !usb_stack {
+        narf_console::write_str("rtl: no USB stack in this kernel; USB claims not checked\n");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/rtl", e2e_rtl_module_registration);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]

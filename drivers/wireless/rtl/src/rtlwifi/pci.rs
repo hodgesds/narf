@@ -14,13 +14,22 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
+#[cfg(feature = "builtin")]
+use core::sync::atomic::Ordering;
 
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, Write};
-use narf_ipc::{channel, Consumer, Producer};
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
+use crate::platform::bus::MmioRegion;
+use crate::platform::ipc::{channel, Consumer, Producer};
+use crate::platform::lib::sync::IrqSafeSpinLock;
+use crate::platform::net::{Frame, RX_RING_N, TX_RING_N};
+#[cfg(feature = "builtin")]
+use crate::platform::{
+    capabilities::{Cap, Write},
+    net::Interface,
+};
+#[cfg(feature = "builtin")]
+use narf_bus::{BusDevice, BusDeviceCap};
+#[cfg(feature = "builtin")]
 use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessIfaceInfo,
     WirelessNetIface,
@@ -29,7 +38,6 @@ use narf_wireless::{
 use super::efuse;
 use super::firmware_native::PciIo;
 use super::firmware_transport::Owner as FirmwareOwner;
-use super::irq;
 use super::mac;
 use super::power;
 use super::regs::*;
@@ -37,7 +45,7 @@ use super::regs::*;
 /// A bound rtlwifi PCIe device.  Holds BAR2 + MAC + device-ID.
 pub struct RtlwifiDevice {
     /// Retained bus identity; a repeat probe must not park the active owner.
-    pub(crate) bus_addr: narf_bus::BusAddr,
+    pub(crate) bus_addr: crate::platform::bus::BusAddr,
     pub(super) name: &'static str,
     pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
@@ -305,6 +313,7 @@ impl RtlwifiDevice {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl Interface for RtlwifiDevice {
     fn name(&self) -> &str {
         self.native
@@ -335,6 +344,7 @@ impl Interface for RtlwifiDevice {
     }
 }
 
+#[cfg(feature = "builtin")]
 #[async_trait::async_trait]
 impl WirelessNetIface for RtlwifiDevice {
     fn rts_threshold(&self) -> Option<u32> {
@@ -454,6 +464,7 @@ mod pci_bindings;
 static CONTROLLERS: IrqSafeSpinLock<pci_bindings::Bindings> =
     IrqSafeSpinLock::new(pci_bindings::Bindings::new());
 
+#[cfg(feature = "builtin")]
 /// Register one PCI-match entry per supported device ID.
 pub fn register_pci_driver() {
     for &did in ALL_DEV_IDS {
@@ -469,6 +480,7 @@ pub fn register_pci_driver() {
     }
 }
 
+#[cfg(feature = "builtin")]
 /// Linux v7.2 `pci.c::rtl_pci_remove`: `ieee80211_unregister_hw` (netdev
 /// withdrawal, then `rtl_op_stop` → `rtl_pci_stop`: `disable_interrupt`
 /// and `rtl88ee_card_disable`), `rtl_pci_deinit` (`free_irq` /
@@ -479,9 +491,9 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
     let Some(owner) = detach(device.addr) else {
         return;
     };
-    narf_scheduler::spawn(crate::future_heap::build(|| async move {
+    crate::platform::scheduler::spawn(crate::future_heap::build(|| async move {
         let reclaimed = finish_removal(owner, device.addr).await;
-        narf_console::klog!(
+        crate::platform::console::klog!(
             "rtlwifi: removed; DMA {}\n",
             if reclaimed {
                 "reclaimed"
@@ -491,12 +503,14 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         );
     }));
 }
+#[cfg(feature = "builtin")]
 /// Take the bound owner for `address` out of the controller slot and
 /// quarantine the address until its removal proves DMA idle.
-fn detach(address: narf_bus::BusAddr) -> Option<RtlwifiDevice> {
+fn detach(address: crate::platform::bus::BusAddr) -> Option<RtlwifiDevice> {
     CONTROLLERS.lock().detach(address)
 }
-async fn finish_removal(owner: RtlwifiDevice, address: narf_bus::BusAddr) -> bool {
+#[cfg(feature = "builtin")]
+async fn finish_removal(owner: RtlwifiDevice, address: crate::platform::bus::BusAddr) -> bool {
     if let Some(ae) = owner.ae.clone() {
         // Only CURRENT original PCI may restrict packet/IRQ gates after
         // sources/registration retire. This never proves RF reset/DMA idle.
@@ -505,7 +519,7 @@ async fn finish_removal(owner: RtlwifiDevice, address: narf_bus::BusAddr) -> boo
             let _ = native.remove().await;
         } else if !owner.name.is_empty() {
             narf_wireless::registry::unregister(owner.name);
-            narf_net::iface::unregister(owner.name);
+            crate::platform::net::iface::unregister(owner.name);
         }
         ae.quarantine_controller(owner);
         return false;
@@ -517,7 +531,7 @@ async fn finish_removal(owner: RtlwifiDevice, address: narf_bus::BusAddr) -> boo
             let name = owner.name;
             if !name.is_empty() {
                 narf_wireless::registry::unregister(name);
-                narf_net::iface::unregister(name);
+                crate::platform::net::iface::unregister(name);
             }
             true
         }
@@ -529,6 +543,7 @@ async fn finish_removal(owner: RtlwifiDevice, address: narf_bus::BusAddr) -> boo
     reclaimed
 }
 
+#[cfg(feature = "builtin")]
 /// PCI probe callback.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     match CONTROLLERS.lock().reserve(device.addr) {
@@ -546,16 +561,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
     };
 
-    let name = dev.name;
-    let address = dev.bus_addr;
-    let mac = dev.mac;
     let did = dev.device_id;
-    let native = dev.native.clone();
-    let ae = dev.ae.clone();
-    if !CONTROLLERS.lock().commit(dev) {
+    if !bind(dev) {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(did)),
         kind: narf_drivers::BoundKind::Net,
@@ -563,14 +572,37 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
+    Ok(())
+}
+
+/// Retain a brought-up function, publish it and start its native
+/// preparation (the rest of probe, shared with `rtl.ko`). `false` when the
+/// controller slot or publication refused it.
+pub(super) fn bind(dev: RtlwifiDevice) -> bool {
+    let name = dev.name;
+    let address = dev.bus_addr;
+    let mac = dev.mac;
+    let native = dev.native.clone();
+    let ae = dev.ae.clone();
+    if !CONTROLLERS.lock().commit(dev) {
+        return false;
+    }
 
     if let Some(native) = native.clone() {
         // The controller already retains the complete device before either
         // registry can expose it. Current net authority is required before
         // the station facade may open native DMA.
-        super::interface::publish(native).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+        if super::interface::publish(native).is_err() {
+            return false;
+        }
     } else {
-        narf_net::iface::register(name, mac, send_frame_unimpl);
+        #[cfg(feature = "builtin")]
+        crate::platform::net::iface::register(name, mac, send_frame_unimpl);
+        #[cfg(feature = "module")]
+        if crate::module_netdev::publish_diagnostic(mac).is_err() {
+            return false;
+        }
+        let _ = name;
     }
     if let Some(native) = native.filter(|_| ae.is_none()) {
         // Initial boot and a later missing-input retry share the exact same
@@ -580,7 +612,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // holding it by value in this block blew the 8 KiB kernel
         // stack-frame budget (`rtlwifi::pci::probe` measured 20_984 bytes
         // on main). Behaviour is unchanged.
-        narf_scheduler::spawn(crate::future_heap::build(|| async move {
+        crate::platform::scheduler::spawn(crate::future_heap::build(|| async move {
             if let Err(error) = Box::pin(drive_scheduled(
                 120,
                 || {
@@ -593,13 +625,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     .unwrap_or(false)
                 },
                 || native.provision(),
-                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+                || {
+                    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                        500_000_000,
+                    ))
+                },
             ))
             .await
             {
                 use core::fmt::Write;
                 let _ = writeln!(
-                    narf_console::Writer,
+                    crate::platform::console::Writer,
                     "rtlwifi-8188ee native preparation: {:?}",
                     error
                 );
@@ -607,19 +643,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }));
     }
     if let Some(ae) = ae {
-        narf_scheduler::spawn(crate::future_heap::build(|| async move {
+        crate::platform::scheduler::spawn(crate::future_heap::build(|| async move {
             let _ = Box::pin(drive_scheduled(
                 120,
                 || ae.can_retry(),
                 || ae.provision_native(super::rtl8723ae::envelope::Operating::twenty(1)),
-                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
+                || {
+                    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                        500_000_000,
+                    ))
+                },
             ))
             .await;
         }));
     }
-    Ok(())
+    true
 }
 
+#[cfg(feature = "builtin")]
 /// Park PCI DMA, map BAR2, apply the existing power table and read factory
 /// EFUSE identity with device IRQs masked. Retains the qualified firmware
 /// owner; probe starts it asynchronously after publishing ownership.
@@ -645,9 +686,6 @@ pub unsafe fn bring_up(
     // BT-coexist boards included: the coexistence owner binds) RTL8723AE.
     // Every other matched chip stays diagnostic.
     let rtl8192ce = super::rtl8192ce::is_8192ce(did);
-    let rtl8723be = did == RTL_DEV_8723BE;
-    let rtl8192de = did == RTL_DEV_8192DE;
-    let rtl8723ae = did == RTL_DEV_8723AE;
     let retained = matches!(
         did,
         RTL_DEV_8188EE
@@ -661,7 +699,7 @@ pub unsafe fn bring_up(
     // dual-function parts such as RTL8192DE); the EFUSE read and the
     // cold bring-up channel both select from it.
     let function = match device.addr {
-        narf_bus::BusAddr::Pcie(addr) => addr.function,
+        crate::platform::bus::BusAddr::Pcie(addr) => addr.function,
         _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
     };
     let (registers, factory) =
@@ -669,17 +707,7 @@ pub unsafe fn bring_up(
             let registers =
                 narf_drivers_wireless_rtw::rtw88::pci_park::map_bar_control(device, cap, 2)
                     .map_err(|_| ProbeError::RegisterBarMapFailed)?;
-            if registers.len < REG_EFUSE_ACCESS + 1
-                || (device.id.device == RTL_DEV_8188EE && registers.len < 0x2000)
-                || (device.id.device == RTL_DEV_8821AE
-                    && registers.len < super::rtl8821ae::MMIO_SIZE as u64)
-                || (device.id.device == RTL_DEV_8192EE
-                    && registers.len < super::rtl8192ee::MMIO_SIZE as u64)
-                || (device.id.device == RTL_DEV_8723AE
-                    && registers.len < super::rtl8723ae::MMIO_SIZE as u64)
-                || (rtl8192ce && registers.len < super::rtl8192ce::MMIO_SIZE as u64)
-                || (rtl8723be && registers.len < super::rtl8723be::MMIO_SIZE as u64)
-            {
+            if !super::identity::control_bar_ok(did, registers.len) {
                 return Err(ProbeError::RegisterBarMapFailed);
             }
 
@@ -690,182 +718,62 @@ pub unsafe fn bring_up(
                 control.disable_aspm().map_err(|_| ProbeError::PciAccess)?;
             }
 
-            // Power-on (cardemu → active).  Optional — chips not in the table
-            // are tolerated for forward compat; the rest fall through to MAC
-            // init unchanged.
-            if power::power_on_table_for(did).is_some() {
-                // SAFETY: BAR2 mapped, no other thread holds the chip.
-                unsafe { power::power_on(&registers, did) }?;
-            }
-
-            // The diagnostic identity stage does not own packet DMA or an IRQ
-            // handler. Keep interrupt masks clear and defer MAC TX/RX/ring setup.
-            // SAFETY: BAR2 mapped and owned.
-            unsafe { irq::disable_interrupts_for(&registers, did) };
-
-            // rtl8723ae/hw.c::rtl8723e_read_eeprom_info selects the Wi-Fi EFUSE
-            // bank (REG_EFUSE_TEST[9:8] = EFUSE_WIFI_SEL_0) before reading it.
-            if did == RTL_DEV_8723AE {
-                use super::rtl8723ae::adapter::{efuse_test_wifi_sel, REG_EFUSE_TEST};
-                // SAFETY: BAR2 mapped (length covers REG_EFUSE_ACCESS) and owned.
-                unsafe {
-                    let value = registers.read32(u64::from(REG_EFUSE_TEST));
-                    registers.write32(u64::from(REG_EFUSE_TEST), efuse_test_wifi_sel(value));
-                }
-            }
-
+            // Power-on (cardemu → active) where the chip has a table, IRQ
+            // masks cleared (the diagnostic identity stage owns no packet DMA
+            // or IRQ handler; MAC TX/RX/ring setup is deferred), the
+            // RTL8723AE Wi-Fi EFUSE bank, then the factory map: the stage
+            // `rtl.ko` runs too (`identity::identify`).
             let factory = Box::new(
-                // SAFETY: BAR2 is mapped and exclusively owned, with EFUSE read
-                // clocks configured by the helper. The actual PCI function picks
-                // the dual-MAC factory address; boxing changes metadata storage.
-                unsafe { efuse::read_factory(&registers, did, function) }
-                    .map_err(ProbeError::Efuse)?,
+                // SAFETY: BAR2 is mapped and exclusively owned, bus mastering
+                // parked. The actual PCI function picks the dual-MAC factory
+                // address; boxing changes metadata storage.
+                unsafe { super::identity::identify(&registers, did, function) }.map_err(
+                    |error| match error {
+                        super::identity::Error::PowerOn(e) => ProbeError::PowerOn(e),
+                        super::identity::Error::Efuse(e) => ProbeError::Efuse(e),
+                    },
+                )?,
             );
 
-            // RTL8192EE: the facts `configure_rtl8192ee` re-derives, checked
-            // before the function is retained. A test chip, an unprovisioned
-            // map, a BT-coexist board (`rtl92ee_read_bt_coexist_info_from_hwpg`
-            // board type 1) or a map without TX power (`0x11 == 0xff`, Linux's
-            // autoload-fail TX power branch) stays diagnostic.
-            let admissible = did != RTL_DEV_8192EE || {
-                use super::rtl8192ee::{adapter, txpower};
-                // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                let (sys_cfg1, cr9346) = unsafe {
-                    (
-                        registers.read32(u64::from(adapter::REG_SYS_CFG1)),
-                        registers.read8(u64::from(adapter::REG_9346CR)),
-                    )
-                };
-                adapter::Adapter::from_hardware(sys_cfg1, cr9346, &factory.logical)
-                    .is_ok_and(|facts| !facts.bt_coexist && facts.mac == factory.mac)
-                    && txpower::Efuse::from_logical(&factory.logical).is_ok()
-            };
-
-            // RTL8192CE / RTL8188CE: the facts `configure_rtl8192ce`
-            // re-derives. `_rtl92ce_read_chip_version` must qualify (no
-            // `TRP_VAUX_EN` test chip, no `CHIP_BONDING_92C_1T2R`, no unknown
-            // cut, so the RF type is RF_1T1R or RF_2T2R), the map must be
-            // provisioned (`REG_9346CR` EFUSE boot, autoload, `0x8129`), the
-            // board must not be BT-coexist (`RF_OPTION1[7:5]`), the EFUSE MAC
-            // must be the factory identity and the TX-power areas must decode.
-            let admissible = admissible
-                && (!rtl8192ce || {
-                    use super::rtl8192ce::{adapter, txpower, version};
-                    // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                    let (sys_cfg, cr9346) = unsafe {
-                        (
-                            registers.read32(u64::from(version::REG_SYS_CFG)),
-                            registers.read8(u64::from(adapter::REG_9346CR)),
-                        )
-                    };
-                    // SAFETY: as above (HPON_FSM is read only for 92C serials).
-                    let hpon = || unsafe { registers.read32(u64::from(version::REG_HPON_FSM)) };
-                    version::Version::from_registers(sys_cfg, hpon).is_ok_and(|qualified| {
-                        adapter::Adapter::from_hardware(qualified, cr9346, &factory.logical)
-                            .is_ok_and(|facts| {
-                                !facts.bt_coexistence()
-                                    && facts.mac == factory.mac
-                                    && txpower::Efuse::from_hwinfo(&facts.hwinfo).is_ok()
-                            })
-                    })
-                });
-
-            // RTL8723BE: the facts `configure_rtl8723be` re-derives.
-            // `_rtl8723be_read_chip_version` must carry `CHIP_8723B`, the map
-            // must be provisioned (`REG_9346CR` EFUSE boot, autoload, `0x8129`;
-            // `_rtl8723be_read_package_type` reads physical `0x1fb`, 0 after a
-            // timeout), the EFUSE MAC must be the factory identity and the
-            // path-A TX-power area must decode (`0x11 != 0xff`).
-            let admissible = admissible
-                && (!rtl8723be || {
-                    use super::rtl8723be::{adapter, txpower, version};
-                    // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                    let (sys_cfg1, sys_cfg, cr9346, multi_func_ctrl) = unsafe {
-                        (
-                            registers.read32(u64::from(version::REG_SYS_CFG1)),
-                            registers.read32(u64::from(version::REG_SYS_CFG)),
-                            registers.read8(u64::from(adapter::REG_9346CR)),
-                            registers.read32(u64::from(adapter::REG_MULTI_FUNC_CTRL)),
-                        )
-                    };
-                    // SAFETY: as above; only the EFUSE read registers are touched.
-                    let package = unsafe {
-                        efuse::read_physical_byte(&registers, adapter::EFUSE_PACKAGE_ADDR)
-                    }
-                    .unwrap_or(0);
-                    version::Version::from_registers(sys_cfg1, sys_cfg).is_ok_and(|qualified| {
-                        adapter::Adapter::from_hardware(
-                            qualified,
-                            cr9346,
-                            multi_func_ctrl,
-                            &factory.logical,
-                            package,
-                        )
-                        .is_ok_and(|facts| facts.mac == factory.mac)
-                    }) && txpower::Efuse::from_logical(&factory.logical).is_ok()
-                });
-
-            // RTL8723AE: the facts `configure_rtl8723ae` would re-derive.
-            // `_rtl8723e_read_chip_version` must qualify (no `TRP_VAUX_EN`
-            // test chip, `BT_FUNC` set so Linux assigns `RF_1T1R`), the map
-            // must be provisioned (`REG_9346CR` EFUSE boot, autoload,
-            // `0x8129`) and the EFUSE MAC must be the factory identity. A
-            // BT-coexist board is the norm for this combo chip, not a refusal.
-            let admissible = admissible
-                && (!rtl8723ae || {
-                    use super::rtl8723ae::{adapter, version};
-                    // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                    let (sys_cfg, gpio, multi, cr9346) = unsafe {
-                        (
-                            registers.read32(u64::from(version::REG_SYS_CFG)),
-                            registers.read32(u64::from(version::REG_GPIO_OUTSTS)),
-                            registers.read32(u64::from(version::REG_MULTI_FUNC_CTRL)),
-                            registers.read8(u64::from(adapter::REG_9346CR)),
-                        )
-                    };
-                    version::Version::from_registers(sys_cfg, || gpio, || multi).is_ok_and(
-                        |qualified| {
-                            adapter::Adapter::from_hardware(
-                                qualified,
-                                cr9346,
-                                multi,
-                                &factory.logical,
-                            )
-                            .is_ok_and(|facts| facts.mac == factory.mac)
-                        },
-                    )
-                });
-
-            // RTL8192DE: the facts `configure_rtl8192de` / `prepare_rtl8192de`
-            // re-derive. `_rtl92de_read_chip_version` must not be a test chip
-            // (`REG_SYS_CFG` version bits), EFUSE autoload must have succeeded
-            // (`REG_9346CR` BIT(5): an autoload-failed board has no power-group
-            // store for the channel step) and the PROM mode
-            // (`rtl92d_read_eeprom_info` `EEPROM_MAC_FUNCTION`) must give this
-            // function a bandset holding the 2.4 GHz station plan (a dual-dual
-            // MAC0 is 5 GHz only; the composed station is 2.4 GHz legacy).
-            let admissible = admissible
-                && (!rtl8192de || {
-                    use super::rtl8192de::{mode_from_prom, native_channel, version, Interface};
-                    // SAFETY: BAR2 mapped, length checked above, owned exclusively.
-                    let (sys_cfg, cr9346) = unsafe {
-                        (
-                            registers.read32(u64::from(version::REG_SYS_CFG)),
-                            registers.read8(u64::from(version::REG_9346CR)),
-                        )
-                    };
-                    sys_cfg != u32::MAX
-                        && sys_cfg & version::SYS_CFG_VERSION_MASK != 0
-                        && cr9346 & version::CR9346_AUTOLOAD_OK != 0
-                        && mode_from_prom(Interface::Pci, &factory.logical)
-                            .is_some_and(|mode| native_channel(1, mode, function))
-                });
+            // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+            let admissible =
+                unsafe { super::identity::admissible(&registers, did, function, &factory) };
 
             Ok((registers, (factory, admissible)))
         })
         .map_err(|_| ProbeError::PciAccess)??;
     let (factory, admissible) = factory;
-    let retained = retained && admissible;
+    // SAFETY: probe parked this exact function and exclusively owns BAR2.
+    // PciIo rechecks current authority and parked BME at every access.
+    let make_io = || unsafe { PciIo::new(*device, *cap, registers) };
+    assemble(
+        device.addr,
+        device.id.device,
+        registers,
+        factory,
+        retained && admissible,
+        make_io,
+    )
+}
+
+/// The rest of `bring_up`, shared with `rtl.ko`'s binding: retain the
+/// firmware owner, the preparation slot, the factory and (RTL8723AE) the
+/// original cold owner, reserve the netdev name and build the native station
+/// device for an admitted function; a diagnostic function keeps only its
+/// identity. `make_io` mints the function's retained PCI authority.
+pub(super) fn assemble(
+    bus_addr: crate::platform::bus::BusAddr,
+    did: u16,
+    registers: MmioRegion,
+    factory: Box<efuse::Factory>,
+    retained: bool,
+    make_io: impl Fn() -> PciIo,
+) -> Result<RtlwifiDevice, ProbeError> {
+    let function = match bus_addr {
+        crate::platform::bus::BusAddr::Pcie(addr) => addr.function,
+        #[allow(unreachable_patterns)]
+        _ => return Err(ProbeError::Efuse(efuse::EfuseError::UnsupportedChip)),
+    };
     let mac = factory.mac;
     let factory = retained.then(|| Arc::<efuse::Factory>::from(factory));
 
@@ -873,9 +781,7 @@ pub unsafe fn bring_up(
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let firmware = if retained {
-        // SAFETY: probe parked this exact function and exclusively owns BAR2.
-        // PciIo rechecks current authority and parked BME at every access.
-        let io = unsafe { PciIo::new(*device, *cap, registers) };
+        let io = make_io();
         Some(Arc::new(FirmwareOwner::new(io, did)))
     } else {
         None
@@ -894,7 +800,7 @@ pub unsafe fn bring_up(
         ae.attach_transport(prepared.as_ref().ok_or(ProbeError::PciAccess)?.clone())
             .map_err(|_| ProbeError::PciAccess)?;
     }
-    let name = narf_net::iface::reserve_name("wlan%d");
+    let name = crate::platform::net::iface::reserve_name("wlan%d");
     if let Some(ae) = &ae {
         ae.attach_name(name).map_err(|_| ProbeError::PciAccess)?;
     }
@@ -932,11 +838,11 @@ pub unsafe fn bring_up(
             .map_err(|_| ProbeError::PciAccess)?;
     }
     let device_arc = Arc::new(RtlwifiDevice {
-        bus_addr: device.addr,
+        bus_addr,
         name,
         registers,
         mac,
-        device_id: device.id.device,
+        device_id: did,
         firmware: firmware.clone(),
         prepared: prepared.clone(),
         factory: factory.clone(),
@@ -946,16 +852,21 @@ pub unsafe fn bring_up(
         rx_ring: IrqSafeSpinLock::new(Some(rx_cons)),
         tx_ring: IrqSafeSpinLock::new(Some(tx_prod)),
     });
+    // A diagnostic function is published as a `WirelessNetIface` built in;
+    // `rtl.ko` publishes the same profile through its family host.
+    #[cfg(feature = "builtin")]
     if native.is_none() {
         narf_wireless::registry::register(device_arc);
     }
+    #[cfg(feature = "module")]
+    drop(device_arc);
 
     Ok(RtlwifiDevice {
-        bus_addr: device.addr,
+        bus_addr,
         name,
         registers,
         mac,
-        device_id: device.id.device,
+        device_id: did,
         firmware,
         prepared,
         factory,
@@ -967,26 +878,12 @@ pub unsafe fn bring_up(
     })
 }
 
-pub fn send_frame_unimpl(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+#[cfg(feature = "builtin")]
+pub fn send_frame_unimpl(_frame: &[u8], _meta: crate::platform::net::TxMeta) -> Result<(), ()> {
     Err(())
 }
 
-/// Human-readable driver name for a given device ID.
-pub const fn name_for(did: u16) -> &'static str {
-    match did {
-        RTL_DEV_8188EE => "rtlwifi-8188ee",
-        RTL_DEV_8192CE => "rtlwifi-8192ce",
-        RTL_DEV_8192CE_ALT => "rtlwifi-8192ce-alt",
-        RTL_DEV_8192CE_8177 => "rtlwifi-8192ce-8177",
-        RTL_DEV_8192CE_8191 => "rtlwifi-8192ce-8191",
-        RTL_DEV_8192DE => "rtlwifi-8192de",
-        RTL_DEV_8192EE => "rtlwifi-8192ee",
-        RTL_DEV_8723AE => "rtlwifi-8723ae",
-        RTL_DEV_8723BE => "rtlwifi-8723be",
-        RTL_DEV_8821AE => "rtlwifi-8821ae",
-        _ => "rtlwifi",
-    }
-}
+pub use super::regs::name_for;
 
 /// True if a device has been bound through probe.
 pub fn is_probed() -> bool {
@@ -1000,7 +897,7 @@ pub fn with_controller<R>(f: impl FnOnce(&RtlwifiDevice) -> R) -> Option<R> {
 
 /// Borrow the exact bound PCI function; no fallback to another radio.
 pub fn with_controller_at<R>(
-    address: narf_bus::BusAddr,
+    address: crate::platform::bus::BusAddr,
     f: impl FnOnce(&RtlwifiDevice) -> R,
 ) -> Option<R> {
     CONTROLLERS.lock().get(address).map(f)
@@ -1086,9 +983,10 @@ where
     }
     Err(last_err)
 }
-static PROVISIONING: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
+static PROVISIONING: crate::platform::lib::mutex::Mutex<()> =
+    crate::platform::lib::mutex::Mutex::new(());
 async fn provision_with(
-    control: &narf_lib::mutex::Mutex<()>,
+    control: &crate::platform::lib::mutex::Mutex<()>,
     binding: impl FnOnce() -> Result<Provisioning, super::prepare::Error>,
 ) -> Result<(), super::prepare::Error> {
     let _control = control.lock().await;
@@ -1111,7 +1009,9 @@ pub async fn provision() -> Result<(), super::prepare::Error> {
     provision_at(address).await
 }
 /// Provision only the exact retained function selected by the caller.
-pub async fn provision_at(address: narf_bus::BusAddr) -> Result<(), super::prepare::Error> {
+pub async fn provision_at(
+    address: crate::platform::bus::BusAddr,
+) -> Result<(), super::prepare::Error> {
     if let Some(ae) = with_controller_at(address, |controller| controller.ae.clone()).flatten() {
         return ae
             .provision_native(super::rtl8723ae::envelope::Operating::twenty(1))
@@ -1132,7 +1032,7 @@ pub async fn provision_at(address: narf_bus::BusAddr) -> Result<(), super::prepa
 /// Prepare one exact AE function under its separately signed native recipe.
 /// This keeps packet DMA/MAC closed and publishes no station interface.
 pub async fn prepare_rtl8723ae_at(
-    address: narf_bus::BusAddr,
+    address: crate::platform::bus::BusAddr,
     operating: super::rtl8723ae::envelope::Operating,
 ) -> Result<(), super::prepare::Error> {
     let ae = with_controller_at(address, |controller| controller.ae.clone())
@@ -1144,7 +1044,7 @@ pub async fn prepare_rtl8723ae_at(
 /// Adopt the original AE port and publish only retained inactive DMA32 rings
 /// under NASR. This grants no generic station, MLME, BME or MAC readiness.
 pub async fn prepare_rtl8723ae_station_transport_at(
-    address: narf_bus::BusAddr,
+    address: crate::platform::bus::BusAddr,
 ) -> Result<(), super::prepare::Error> {
     let ae = with_controller_at(address, |controller| controller.ae.clone())
         .flatten()
@@ -1156,7 +1056,7 @@ pub async fn prepare_rtl8723ae_station_transport_at(
 /// The interface retains its original name, factory, firmware and ring owner.
 /// This does not enable LPS/IPS, retune/reset or DMA reclamation.
 pub async fn activate_rtl8723ae_station_at(
-    address: narf_bus::BusAddr,
+    address: crate::platform::bus::BusAddr,
 ) -> Result<(), super::prepare::Error> {
     let ae = with_controller_at(address, |controller| controller.ae.clone())
         .flatten()
@@ -1182,9 +1082,9 @@ mod provision_tests {
         fixture_on(RTL_DEV_8188EE)
     }
     fn fixture_on(did: u16) -> RtlwifiDevice {
-        let address = narf_bus::PcieAddr::new(0xfffe, 0xfd, 0x19, 0);
+        let address = crate::platform::bus::PcieAddr::new(0xfffe, 0xfd, 0x19, 0);
         let device = BusDevice {
-            addr: narf_bus::BusAddr::Pcie(address),
+            addr: crate::platform::bus::BusAddr::Pcie(address),
             id: narf_bus::DeviceId {
                 vendor: 0x10ec,
                 device: did,
@@ -1217,7 +1117,7 @@ mod provision_tests {
             mac: [2, 1, 2, 3, 4, 5],
             device_id: did,
             firmware: Some(Arc::new(FirmwareOwner::new(io, did))),
-            prepared: Some(Arc::new(narf_lib::mutex::Mutex::new(None))),
+            prepared: Some(Arc::new(crate::platform::lib::mutex::Mutex::new(None))),
             factory: Some(Arc::new(efuse::Factory {
                 mac: [2, 1, 2, 3, 4, 5],
                 logical: [0xff; 512],
@@ -1314,7 +1214,7 @@ mod provision_tests {
             return TestResult::Fail("EE retry cloned a new hardware/prepared/factory owner");
         }
         drop(admitted);
-        let control = narf_lib::mutex::Mutex::new(());
+        let control = crate::platform::lib::mutex::Mutex::new(());
         let guard = control.try_lock().unwrap();
         let entered = core::cell::Cell::new(false);
         {
@@ -1346,7 +1246,7 @@ mod provision_tests {
         // The supplied-byte diagnostic retains its original one-shot rule:
         // invalid input consumes that attempt before native I/O, making this
         // genuinely Failed owner ineligible for the public staging retry.
-        if narf_scheduler::block_on(firmware.initialize(&[])).is_ok()
+        if crate::platform::scheduler::block_on(firmware.initialize(&[])).is_ok()
             || firmware.status().stage != super::super::firmware_transport::Stage::Failed
             || provisioning(Some(&controller)).is_ok()
         {
@@ -1367,7 +1267,9 @@ mod provision_tests {
         __reset_for_test();
         let controller = fixture();
         let address = controller.bus_addr;
-        let other = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0xfffe, 0xfd, 0x1a, 0));
+        let other = crate::platform::bus::BusAddr::Pcie(crate::platform::bus::PcieAddr::new(
+            0xfffe, 0xfd, 0x1a, 0,
+        ));
         CONTROLLERS.lock().reserve(address);
         CONTROLLERS.lock().commit(controller);
         if detach(other).is_some() || !is_probed() || CONTROLLERS.lock().quarantined(address) {
@@ -1391,7 +1293,7 @@ mod provision_tests {
                 subsystem_id: 0xffff,
             },
             kind: match address {
-                narf_bus::BusAddr::Pcie(addr) => narf_bus::BusKind::Pcie {
+                crate::platform::bus::BusAddr::Pcie(addr) => narf_bus::BusKind::Pcie {
                     addr,
                     cfg_phys: narf_memory::PhysAddr::new(0),
                 },
@@ -1403,7 +1305,7 @@ mod provision_tests {
         if probe(device, cap) != Err(narf_bus::ProbeError::BadDevice) || is_probed() {
             return TestResult::Fail("EE quarantined function was re-probed");
         }
-        if !narf_scheduler::block_on(finish_removal(owner, address))
+        if !crate::platform::scheduler::block_on(finish_removal(owner, address))
             || CONTROLLERS.lock().quarantined(address)
         {
             return TestResult::Fail("EE owner without published DMA kept its quarantine");
@@ -1421,7 +1323,9 @@ mod provision_tests {
         let a = fixture();
         let aa = a.bus_addr;
         let mut b = fixture();
-        let ba = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0xfffe, 0xfd, 0x1a, 0));
+        let ba = crate::platform::bus::BusAddr::Pcie(crate::platform::bus::PcieAddr::new(
+            0xfffe, 0xfd, 0x1a, 0,
+        ));
         b.bus_addr = ba;
         let firmware_a = a.firmware.clone().unwrap();
         let firmware_b = b.firmware.clone().unwrap();

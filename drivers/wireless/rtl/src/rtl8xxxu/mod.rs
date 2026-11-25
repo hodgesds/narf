@@ -90,6 +90,8 @@ pub mod security_runtime;
 pub mod service_runtime;
 pub mod station_runtime;
 pub mod usb;
+#[cfg(feature = "module")]
+pub mod usb_kabi;
 mod wmm_runtime;
 
 pub use ht_runtime::Request as Ht20Request;
@@ -103,6 +105,7 @@ pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
 // chip-independent; only the TX submission path differs between
 // iwlwifi (PCIe UMAC cmd) and rtl8xxxu (bulk-OUT with TxDesc header).
 
+#[cfg(feature = "builtin")]
 pub use narf_drivers_wireless_iwlwifi::iwlwifi::mlme::{
     auth_algorithm, build_assoc_request, build_assoc_request_rsn, build_open_auth_body,
     parse_beacon, parse_beacon_to_bss, AssocParams, AssocParamsRsn, AssocResponseFields,
@@ -123,7 +126,8 @@ pub use narf_drivers_wireless_iwlwifi::iwlwifi::mlme::{
 /// `rtw8822bu.c::rtw_8822bu_id_table`) are bound by rtw88
 /// (`rtw88::usb_driver`), as in Linux; they are not listed here.
 // `RTL8XXXU_USB_IDS` moved to `narf_drivers_wireless_rtl_usb` (shared with rtw88).
-pub use narf_drivers_wireless_rtl_usb::RTL8XXXU_USB_IDS;
+#[cfg(feature = "builtin")]
+pub use crate::platform::rtl_usb::RTL8XXXU_USB_IDS;
 
 /// USB class probe function. Called by the class registry when a
 /// newly-enumerated USB device matches `RTL8XXXU_USB_IDS`. Stores
@@ -134,8 +138,9 @@ pub use narf_drivers_wireless_rtl_usb::RTL8XXXU_USB_IDS;
 ///
 /// Linux analogue: `rtl8xxxu_probe` in
 /// `drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu_core.c` (~L7692).
+#[cfg(feature = "builtin")]
 pub fn rtl8xxxu_probe(
-    device: alloc::sync::Arc<narf_drivers_usb::device::USBDevice>,
+    device: alloc::sync::Arc<crate::platform::usb::USBDevice>,
     _hub_port: Option<(u8, u8)>,
 ) -> Result<(), narf_drivers_usb::class_registry::UsbProbeError> {
     use narf_drivers_usb::class_registry::UsbProbeError;
@@ -171,40 +176,51 @@ pub fn rtl8xxxu_probe(
 
     use core::fmt::Write as _;
     let _ = writeln!(
-        narf_console::Writer,
+        crate::platform::console::Writer,
         "  rtl8xxxu: {:04x}:{:04x} {} slot={}",
         vid,
         pid,
         family.name(),
         device.slot_id()
     );
+    start(family, firmware);
+    Ok(())
+}
 
+/// The rest of `rtl8xxxu_probe`, shared with `rtl.ko`'s USB binding: the
+/// family's retained factory/power/firmware owner and, once separately
+/// admitted, its station. Other families stay detection-only.
+pub(crate) fn start(
+    family: regs::ChipFamily,
+    firmware: alloc::sync::Arc<firmware_transport::Owner<firmware_transport::UsbControl>>,
+) {
+    use core::fmt::Write as _;
     if family == regs::ChipFamily::Rtl8188eu {
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::console::Writer,
             "  rtl8188eu:   firmware required at /firmware/rtlwifi/rtl8188eufw.bin"
         );
         // Initialization futures contain calibration/attachment state well
         // beyond this probe. Retain it on the heap before scheduler transfer.
-        narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
+        crate::platform::scheduler::spawn(alloc::boxed::Box::pin(async move {
             let result = firmware.wait_initialize_registered().await;
             use core::fmt::Write as _;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::console::Writer,
                 "  rtl8188eu: firmware attempt {:?}",
                 result
             );
             if result.is_ok() {
                 if let Some(factory) = firmware.factory() {
                     let _ = writeln!(
-                        narf_console::Writer,
+                        crate::platform::console::Writer,
                         "  rtl8188eu:   calibration required at /firmware/{}",
                         power_policy::Calibration::asset_name(factory),
                     );
                 }
                 let service = interface::wait_attach(firmware.clone()).await;
                 let _ = writeln!(
-                    narf_console::Writer,
+                    crate::platform::console::Writer,
                     "  rtl8188eu: channel1 station service {:?}",
                     service
                 );
@@ -212,14 +228,14 @@ pub fn rtl8xxxu_probe(
         }));
     } else if family == regs::ChipFamily::Rtl8192eu {
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::console::Writer,
             "  rtl8192eu:   firmware required at /firmware/rtlwifi/rtl8192eu_nic.bin"
         );
-        narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
+        crate::platform::scheduler::spawn(alloc::boxed::Box::pin(async move {
             let result = firmware.wait_initialize_registered().await;
             use core::fmt::Write as _;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::console::Writer,
                 "  rtl8192eu: firmware attempt {:?}",
                 result
             );
@@ -228,7 +244,7 @@ pub fn rtl8xxxu_probe(
             }
             if let Some(factory) = firmware.factory_8192e() {
                 let _ = writeln!(
-                    narf_console::Writer,
+                    crate::platform::console::Writer,
                     "  {}:   signed record required at /firmware/{}",
                     factory.identity.name(),
                     rtl8192e_policy::Calibration::asset_name(&factory),
@@ -237,7 +253,7 @@ pub fn rtl8xxxu_probe(
             // Unprovisioned (no record/policy/authority) stays unadmitted.
             let admitted = rtl8192e_admission::wait_admit(firmware.clone()).await;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::console::Writer,
                 "  rtl8192eu: admission {:?}",
                 admitted.as_ref().map(|a| a.permission)
             );
@@ -248,21 +264,21 @@ pub fn rtl8xxxu_probe(
             let (authority, grant) = gen2_radio::Authority::from_8192e(admitted);
             let device = gen2_interface::attach(firmware.clone(), authority, grant).await;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::console::Writer,
                 "  rtl8192eu: station {:?}",
                 device.as_ref().map(|_| ())
             );
         }));
     } else if family == regs::ChipFamily::Rtl8723bu {
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::console::Writer,
             "  rtl8723bu:   firmware required at /firmware/rtlwifi/rtl8723bu_nic.bin"
         );
-        narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
+        crate::platform::scheduler::spawn(alloc::boxed::Box::pin(async move {
             let result = firmware.wait_initialize_registered().await;
             use core::fmt::Write as _;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::console::Writer,
                 "  rtl8723bu: firmware attempt {:?}",
                 result
             );
@@ -271,7 +287,7 @@ pub fn rtl8xxxu_probe(
             }
             if let Some(factory) = firmware.factory_8723b() {
                 let _ = writeln!(
-                    narf_console::Writer,
+                    crate::platform::console::Writer,
                     "  rtl8723bu:   signed record required at /firmware/{}",
                     rtl8723b_policy::Calibration::asset_name(&factory),
                 );
@@ -279,7 +295,7 @@ pub fn rtl8xxxu_probe(
             // Unprovisioned (no record/policy/authority) stays unadmitted.
             let admitted = rtl8723b_admission::wait_admit(firmware.clone()).await;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::console::Writer,
                 "  rtl8723bu: admission {:?}",
                 admitted.as_ref().map(|a| a.permission)
             );
@@ -289,29 +305,28 @@ pub fn rtl8xxxu_probe(
             let (authority, grant) = gen2_radio::Authority::from_8723b(admitted);
             let device = gen2_interface::attach(firmware.clone(), authority, grant).await;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::console::Writer,
                 "  rtl8723bu: station {:?}",
                 device.as_ref().map(|_| ())
             );
         }));
     }
-
-    Ok(())
 }
 
 /// Entry for one bound RTL8XXXU device in the global registry.
 #[derive(Debug)]
 pub struct Rtl8xxxuDevice {
-    pub device: alloc::sync::Arc<narf_drivers_usb::device::USBDevice>,
+    pub device: alloc::sync::Arc<crate::platform::usb::USBDevice>,
     pub family: regs::ChipFamily,
     pub firmware: alloc::sync::Arc<firmware_transport::Owner<firmware_transport::UsbControl>>,
 }
 
 /// Global registry of bound RTL8XXXU USB-WiFi devices.
-pub static DEVICES: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<Rtl8xxxuDevice>> =
-    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+pub static DEVICES: crate::platform::lib::sync::IrqSafeSpinLock<alloc::vec::Vec<Rtl8xxxuDevice>> =
+    crate::platform::lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 /// Entry point registered by `drivers/wireless/src/lib.rs`.
+#[cfg(feature = "builtin")]
 pub fn register() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "rtl8xxxu-usb-ids", || {

@@ -277,11 +277,12 @@ pub use crate::rtl8xxxu::regs::USB_INTR_CONTENT_LEN as RTL_INTR_LEN;
 /// exactly that many bytes from the device into `out`.
 ///
 /// Returns the number of bytes the controller reports as transferred.
+#[cfg(feature = "builtin")]
 pub async fn read_register(
-    dev: &narf_drivers_usb::device::USBDevice,
+    dev: &crate::platform::usb::USBDevice,
     addr: u16,
     out: &mut [u8],
-) -> Result<usize, narf_drivers_usb::device::UsbError> {
+) -> Result<usize, crate::platform::usb::UsbError> {
     let setup = UsbControlSetup::read(addr, out.len() as u16);
     dev.control_in(
         setup.bm_request_type,
@@ -295,11 +296,12 @@ pub async fn read_register(
 
 /// Forward a Realtek vendor register WRITE (1 / 2 / 4 byte payload).
 /// Symmetric to [`read_register`].
+#[cfg(feature = "builtin")]
 pub async fn write_register(
-    dev: &narf_drivers_usb::device::USBDevice,
+    dev: &crate::platform::usb::USBDevice,
     addr: u16,
     data: &[u8],
-) -> Result<usize, narf_drivers_usb::device::UsbError> {
+) -> Result<usize, crate::platform::usb::UsbError> {
     let setup = UsbControlSetup::write(addr, data.len() as u16);
     dev.control_out(
         setup.bm_request_type,
@@ -314,22 +316,24 @@ pub async fn write_register(
 /// Submit a `build_bulk_out_frame` payload (TxDesc32 || mpdu) on a
 /// bulk-OUT endpoint. `ep_addr` is the USB-side endpoint address
 /// (low nibble = endpoint number, bit 7 clear for OUT).
+#[cfg(feature = "builtin")]
 pub async fn bulk_out_frame(
-    dev: &narf_drivers_usb::device::USBDevice,
+    dev: &crate::platform::usb::USBDevice,
     ep_addr: u8,
     frame: &[u8],
-) -> Result<usize, narf_drivers_usb::device::UsbError> {
+) -> Result<usize, crate::platform::usb::UsbError> {
     narf_drivers_usb::bulk::bulk_out(dev, ep_addr, frame).await
 }
 
 /// Receive a single bulk-IN frame (one RxDesc16 + MPDU). `out` is
 /// sized to the maximum URB length the chip will deliver
 /// (RxDesc16 + jumbo). Returns the bytes copied.
+#[cfg(feature = "builtin")]
 pub async fn bulk_in_frame(
-    dev: &narf_drivers_usb::device::USBDevice,
+    dev: &crate::platform::usb::USBDevice,
     ep_addr: u8,
     out: &mut [u8],
-) -> Result<usize, narf_drivers_usb::device::UsbError> {
+) -> Result<usize, crate::platform::usb::UsbError> {
     narf_drivers_usb::bulk::bulk_in(dev, ep_addr, out).await
 }
 
@@ -337,20 +341,22 @@ pub async fn bulk_in_frame(
 /// by the rtl8xxxu watcher to surface TX_OK / RX_AVL / C2H events.
 ///
 /// `ep_addr` is the USB-side endpoint address (bit 7 set: IN).
+#[cfg(feature = "builtin")]
 pub fn arm_intr_in(
-    dev: &narf_drivers_usb::device::USBDevice,
+    dev: &crate::platform::usb::USBDevice,
     ep_addr: u8,
-) -> Result<u64, narf_drivers_usb::device::UsbError> {
+) -> Result<u64, crate::platform::usb::UsbError> {
     narf_drivers_usb::intr::arm(dev, ep_addr, USB_INTR_CONTENT_LEN as u32)
 }
 
 /// Non-blocking drain of the most recent 56-byte interrupt-IN frame
 /// into an [`IntrIn`]. `Ok(Some(_))` when a fresh frame arrived;
 /// `Ok(None)` when no event has been demuxed for this endpoint yet.
+#[cfg(feature = "builtin")]
 pub fn poll_intr_in(
-    dev: &narf_drivers_usb::device::USBDevice,
+    dev: &crate::platform::usb::USBDevice,
     ep_addr: u8,
-) -> Result<Option<IntrIn>, narf_drivers_usb::device::UsbError> {
+) -> Result<Option<IntrIn>, crate::platform::usb::UsbError> {
     let mut buf = [0u8; USB_INTR_CONTENT_LEN];
     match narf_drivers_usb::intr::poll(dev, ep_addr, &mut buf)? {
         Some(n) if n == USB_INTR_CONTENT_LEN => Ok(Some(IntrIn { data: buf })),

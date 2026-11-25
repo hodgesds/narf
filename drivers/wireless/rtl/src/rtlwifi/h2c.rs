@@ -27,8 +27,8 @@
 
 #![allow(dead_code)]
 
-use narf_bus::MmioRegion;
-use narf_time::Deadline;
+use crate::platform::bus::MmioRegion;
+use crate::platform::time::Deadline;
 
 use super::regs::*;
 
@@ -124,7 +124,7 @@ pub unsafe fn send_h2c(
     let (box_reg, ext_reg) = box_reg(boxnum);
 
     // Poll up to ~10 ms for the box to be free.
-    let done = narf_scheduler::responsive_spin_until(
+    let done = crate::platform::scheduler::responsive_spin_until(
         || {
             // SAFETY: caller-asserted.
             unsafe { fw_box_read(mmio, boxnum) }
@@ -257,7 +257,7 @@ pub unsafe fn write_fw_page(mmio: &MmioRegion, page: u32, data: &[u8]) {
 /// Caller must own BAR0 exclusively.
 pub unsafe fn poll_fw_ready(mmio: &MmioRegion) -> Result<(), FwDlError> {
     // Step 1: wait for checksum report.
-    let chk_ok = narf_scheduler::responsive_spin_until(
+    let chk_ok = crate::platform::scheduler::responsive_spin_until(
         || {
             // SAFETY: caller-asserted.
             let v = unsafe { mmio.read32(REG_MCUFWDL) };
@@ -288,7 +288,7 @@ pub unsafe fn poll_fw_ready(mmio: &MmioRegion) -> Result<(), FwDlError> {
         mmio.write8(REG_RSV_CTRL + 1, v & !0x01);
         let v = mmio.read8(REG_SYS_FUNC_EN + 1);
         mmio.write8(REG_SYS_FUNC_EN + 1, v & !0x04);
-        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(50 * 1_000));
+        crate::platform::time::busy_wait_cycles(crate::platform::time::ns_to_cycles(50 * 1_000));
         let v = mmio.read8(REG_RSV_CTRL + 1);
         mmio.write8(REG_RSV_CTRL + 1, v | 0x01);
         let v = mmio.read8(REG_SYS_FUNC_EN + 1);
@@ -296,7 +296,7 @@ pub unsafe fn poll_fw_ready(mmio: &MmioRegion) -> Result<(), FwDlError> {
     }
 
     // Step 4: poll for WINTINI_RDY.
-    let init_ok = narf_scheduler::responsive_spin_until(
+    let init_ok = crate::platform::scheduler::responsive_spin_until(
         || {
             // SAFETY: caller-asserted.
             let v = unsafe { mmio.read32(REG_MCUFWDL) };

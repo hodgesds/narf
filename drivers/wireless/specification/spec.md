@@ -3076,6 +3076,151 @@ into the module; the rtw88 and rtw89 PCIe ids stay registration-only
   Realtek USB Wi-Fi device, so bring-up, RF and association through the
   module are unproven until run on hardware.
 
+### 4.9 `rtl.ko`: rtlwifi (PCIe) and rtl8xxxu (USB) as a loadable module
+
+`narf-drivers-wireless-rtl --no-default-features --features module` builds
+`rtl.ko` for x86_64 and aarch64. The rtlwifi and rtl8xxxu sources build both
+ways: built in they are unchanged, and in the `.ko` they run over
+`narf-module-rt` and the KABI.
+
+- **Platform.** Kernel services come from `src/platform/`, one name in
+  both builds.
+  - `kernel.rs` re-exports the kernel crates (`narf_time` as `time`,
+    `narf_lib` as `lib`, ...), so a built-in path is the kernel's own item.
+  - `kabi.rs` implements the paths the drivers use: locks and the async
+    mutex, `OnceLock`, the clock, sleeps and `timeout`, spawn and
+    `block_on`, coherent DMA, frame channels, firmware assets, the
+    regulatory domain, and the `Interface` / `WirelessNetIface` traits.
+  - `usb_kabi.rs` implements the shared Realtek USB transport
+    (`ControlIo`, `Io`) over `narf_usb_*`.
+  - The kernel-free crates are linked with their `kernel` feature off:
+    `narf-crypto`, `narf-wireless`, `narf-drivers-wireless-ath-core` and
+    `narf-drivers-wireless-rtl-chip`.
+- **Claim.** The tables are in `src/module_ids.rs`. A kernel test pins them
+  to `ALL_DEV_IDS` / `RTL8XXXU_USB_IDS`, and the e2e test reads the same
+  file.
+  - PCI: all ten rtlwifi ids, `10ec:{8179, 8178, 8176, 8177, 8191, 8193,
+    818b, 8723, b723, 8821}`. RTL8822BE (`b822`) is rtw88's.
+  - USB: all 23 `RTL8XXXU_USB_IDS` rows. RTL8821CU / RTL8822BU are
+    rtw88's.
+  - `narf-drivers-wireless/rtl-module-only` leaves both built-in tables to
+    an early-loaded `rtl.ko`, giving up the built-in drivers.
+  - One device binds per module.
+- **PCI probe** (`rtlwifi/pci_kabi.rs`, the built-in `probe` / `bring_up`
+  order).
+  1. `narf_pci_identity`: an rtlwifi id, and its PCI function.
+  2. `narf_pci_prepare_probe`.
+  3. BAR2 sized and mapped with Device attributes while decode is off
+     (`narf_bar_map_control`), then memory decode on, the built-in
+     `map_bar_control` order. Its length is checked by
+     `identity::control_bar_ok`.
+  4. ASPM off.
+  5. `identity::identify` (NIC-enable power table, IRQ masks, the
+     RTL8723AE EFUSE bank, the factory map and MAC), then
+     `identity::admissible`. Both are the functions `pci::bring_up` calls.
+  6. `pci::assemble` and `pci::bind`, also shared with the built-in:
+     - the authenticated firmware owner, the preparation slot and (for
+       RTL8723AE) the original cold owner;
+     - the native station device;
+     - publication;
+     - the native preparation task.
+
+  The kernel's 1 ms device poller and the MSI upcall drive the module's
+  executor. DMA is retained on teardown (`narf_dma_retain_on_teardown`).
+- **PCI authority** (`rtlwifi/firmware_native_kabi.rs`, the module's
+  `PciIo` with the built-in API).
+  - Every access passes the built-in `command_gate` on `narf_pci_command`
+    (read with clear = set = 0): absent function, decode, INTx disabled,
+    and bus mastering only in packet mode.
+  - Every access also re-checks `narf_pci_identity`.
+  - Bus mastering is set and cleared through `narf_pci_command`, read
+    back.
+  - Register widths go through `narf_mmio_read8/16/32` and
+    `narf_mmio_write8/16/32`.
+  - MSI: one vector (`narf_msi_enable`) whose upcall raises the device's
+    signal. A withdrawn vector stays granted with delivery off and is
+    reused.
+  - ASPM: the endpoint policy is "off" (`narf_pcie_aspm`). A module
+    cannot see the parent link's policy, and off is the built-in answer
+    for an unknown bridge.
+- **DMA.** `narf_dma_alloc_mapped` under each allocation's address limit,
+  from a 4-64 KiB size-class pool carved from 1 MiB chunks, as in
+  `ath11k.ko`. KABI mapped DMA is cache-coherent, so `DmaBuffer::sync` is
+  an ordering fence.
+- **Firmware and signed records.** `narf_firmware_open/read/signed`. A
+  retained asset's `Cap<FirmwareBlob, Read>` is its open handle, and
+  `invoke` re-checks it before every enclosed effect. Every
+  calibration/envelope record still requires a verified signer, as built
+  in. The KABI reports only that one exists, not which.
+- **Regulatory domain.** `narf_wireless_regdomain` returns the kernel's
+  installation (bootstrapped from the signed policy, or Linux world `00`,
+  as `reg::db::ensure_domain` does). The module decodes the record with the
+  shared `narf_wireless::reg::parse_domain_record`. rtl8xxxu's
+  `reg::policy::load` reads the same installation.
+- **PCIe station** (`module_netdev.rs`, through `interface::publish`). The
+  worker loop, MSI, watchdog and runtime power save (IPS/LPS) are shared
+  with the built-in.
+  - The netdev is `wlan%d` (`narf_netif_register_with_context`). TX enters
+    the device's own send hook. RX goes from the device's drain to
+    `narf_netif_rx`.
+  - `REGISTER_WIPHY` (§4.1) is built from the device's own bands, HT/VHT,
+    ciphers (CCMP) and `PSK_OFFLOAD | REPORTS_DISCONNECT`.
+  - The host's `SCAN_REQUEST` / `CONNECT` / `DISCONNECT` events run the
+    device's `scan` / `associate` / `disassociate`, which includes the
+    in-driver WPA2-PSK supplicant. A `CONNECT` without a BSSID takes the
+    strongest match of the last scan.
+  - Unsolicited link loss is reported as `DISCONNECTED`.
+  - A function whose native station is not admitted is published as the
+    built-in diagnostic profile: no event channel, so scan and connect
+    answer `NotSupported`.
+- **USB** (`rtl8xxxu/usb_kabi.rs`, the built-in `rtl8xxxu_probe`).
+  1. Classify the dongle with `ChipFamily::from_usb_id` and refuse an
+     unknown family.
+  2. Start the device poller (`narf_usb_spawn_poller`).
+  3. Configure the configuration's bulk/interrupt endpoints
+     (`narf_usb_configure`).
+  4. Run the family's chain unchanged (`rtl8xxxu::start`). RTL8188EU,
+     RTL8192EU and RTL8723BU go through firmware, calibration and
+     admission to the station. The others are detection-only.
+
+  The station publishes a netdev through `narf_usb_netif_register_with_context`
+  and runs `run_admin`'s UP branch at once (`module_open`), because the
+  bridge delivers no `IFF_UP`.
+
+  A USB function has no wiphy. The `WIFI` host binds sessions to a bus
+  context's `Cap<BusDeviceCap>`, and minting one for USB would be a
+  capability-model change. Its in-driver SME is therefore driven by
+  `rtl.ssid=` and `rtl.psk=` (64 hex digits) / `rtl.passphrase=`
+  (`.narf_kparams`), as in `rtw88.ko`: scan for the SSID, associate to the
+  strongest match, and retry every 5 s while unassociated.
+- **KABI.** Added by this module, in its own block:
+  - `narf_bar_map_control`;
+  - `narf_mmio_read8`, `narf_mmio_read16`;
+  - `narf_mmio_write8`, `narf_mmio_write16`.
+
+  Used from other branches: `narf_pci_command` (mt76),
+  `narf_wireless_regdomain`, `narf_usb_spawn_poller`,
+  `narf_usb_netif_register_with_context` and `narf_usb_netif_rx` (rtw88).
+- **Not carried (built-in only).**
+  - System suspend and WoWLAN: D-states, PME wake, config save/restore.
+  - ASPM enable.
+  - Removal's DMA-quiescence proof (DMA stays retained).
+  - The userspace SME.
+  - On USB: nl80211 control (no wiphy), and endpoint-halt recovery (the
+    KABI has no clear-halt, so a stalled bulk pipe ends the attempt).
+- **Match budget.** `rtl.ko` registers 23 USB matches. With `rtw88.ko`'s
+  50 that fits the 128-entry module USB table.
+- **Proof.** `modules/e2e/rtl` loads the real `.ko` and checks:
+  - init runs to Live;
+  - exactly the PCI table is claimed, and not `b822`;
+  - with a USB stack, every rtl8xxxu row is held (a foreign registration
+    gets `-EBUSY`), and not `0bda:c811`;
+  - a probe with no device context is refused;
+  - unload leaves no match.
+
+  QEMU emulates no Realtek Wi-Fi device. Bring-up, firmware, calibration,
+  association and data on silicon are unverified until a hardware boot.
+
 ## 5. Buffer Management
 
 - **Data Path**: Uses standard `DmaBuffer` caps provided by `io/spec`.

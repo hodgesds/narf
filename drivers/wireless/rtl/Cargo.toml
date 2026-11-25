@@ -8,8 +8,9 @@
 # rtw88's efuse decoder from their already-promoted crates. Built-in or a
 # loadable `.ko`; the `.ko` registers BOTH buses — rtl8xxxu's Realtek USB
 # VID/PIDs via `narf_register_usb_driver` and rtlwifi's Realtek PCIe ids via
-# `narf_register_pci_driver`. Registration-only: the probe thunk returns
-# -ENOSYS until the Wi-Fi device datapath ABI lands.
+# `narf_register_pci_driver` — and runs the drivers' own identification code
+# over the KABI (`src/platform/`): rtlwifi's power-on, IRQ masking and EFUSE
+# factory read, then `wlan%d` through the netif bridge and the WIFI host.
 
 [package]
 name         = "narf-drivers-wireless-rtl"
@@ -38,8 +39,16 @@ builtin = [
     # The reused inner modules (iwlwifi::mlme, rtw88::efuse) sit behind those
     # crates' own `builtin` gate, so cascade it.
     "narf-drivers-wireless-iwlwifi/builtin", "narf-drivers-wireless-rtw/builtin",
+    # Linked kernel-free in the module; their kernel parts built in.
+    "narf-crypto/kernel", "narf-wireless/kernel",
+    "narf-drivers-wireless-ath-core/kernel",
 ]
-module = []
+# The loadable driver: the module runtime and the kernel-free Realtek chip
+# core, linked into the `.ko`; everything else comes through the KABI.
+module = [
+    "dep:narf-module-rt", "dep:narf-crypto", "dep:narf-wireless",
+    "dep:narf-drivers-wireless-ath-core", "dep:zeroize",
+]
 kernel-test = [
     "builtin",
     "dep:narf-kernel-test", "dep:narf-wifi-fixtures",
@@ -54,14 +63,17 @@ kernel-test = [
 [dependencies]
 narf-driver-macros = { path = "../../../driver-macros" }
 async-trait        = "0.1"
+# Kernel-free (`core` only): the shared EFUSE map decoder both builds use.
+narf-drivers-wireless-rtl-chip = { path = "../rtl-chip" }
+narf-module-rt = { path = "../../../modules/rt", optional = true }
 
 narf-bus          = { path = "../../../bus", optional = true }
 narf-capabilities = { path = "../../../capabilities", optional = true }
 narf-console      = { path = "../../../console", optional = true }
-narf-crypto       = { path = "../../../crypto", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true, default-features = false }
 narf-drivers      = { path = "../..", optional = true }
 narf-drivers-usb  = { path = "../../usb", optional = true }
-narf-drivers-wireless-ath-core = { path = "../ath-core", optional = true }
+narf-drivers-wireless-ath-core = { path = "../ath-core", optional = true, default-features = false }
 narf-drivers-wireless-core = { path = "../core", optional = true }
 narf-drivers-wireless-iwlwifi = { path = "../iwlwifi", default-features = false, optional = true }
 narf-drivers-wireless-rtl-usb = { path = "../rtl-usb", optional = true }
@@ -77,7 +89,7 @@ narf-net          = { path = "../../../net", optional = true }
 narf-power        = { path = "../../../power", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-time         = { path = "../../../time", optional = true }
-narf-wireless     = { path = "../../../wireless", optional = true }
+narf-wireless     = { path = "../../../wireless", optional = true, default-features = false }
 zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 # Test-only: harness + Wi-Fi fixtures.

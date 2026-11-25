@@ -5,8 +5,8 @@ use super::{
     firmware_transport::{Owner, PacketIo},
     prepare::{Error, Memory, Prepared},
 };
+use crate::platform::io::DmaBuffer;
 use alloc::sync::Arc;
-use narf_io::DmaBuffer;
 
 #[derive(Debug)]
 pub(super) struct Coherent(DmaBuffer);
@@ -206,7 +206,7 @@ fn allocate_rtl8192ee(owner: Arc<Owner<PciIo>>) -> Result<NativePrepared, Error>
     Prepared::allocate_rtl8192ee(port, |_| blocks.next().ok_or(Error::Memory))
 }
 
-pub(super) type Retained = narf_lib::mutex::Mutex<Option<NativePrepared>>;
+pub(super) type Retained = crate::platform::lib::mutex::Mutex<Option<NativePrepared>>;
 
 /// The controller and diagnostic interface share this storage before the
 /// worker starts. Place all resources there before the first BAR publication;
@@ -251,7 +251,7 @@ pub(super) async fn prepare_rtl8821ae(
     {
         return Ok(());
     }
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::platform::regdb::ensure_domain()
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
     admit_rtl8821ae(prepared, &factory, &domain, channel).await
 }
@@ -326,7 +326,7 @@ pub(super) async fn prepare_rtl8192ee(
     {
         return Ok(());
     }
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::platform::regdb::ensure_domain()
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
     admit_rtl8192ee(prepared, &factory, &domain, channel).await
 }
@@ -372,7 +372,7 @@ pub(super) async fn prepare_rtl8192ce(
     {
         return Ok(());
     }
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::platform::regdb::ensure_domain()
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
     admit_rtl8192ce(prepared, &factory, &domain, channel).await
 }
@@ -460,7 +460,7 @@ pub(super) async fn prepare_rtl8723be(
     {
         return Ok(());
     }
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::platform::regdb::ensure_domain()
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
     admit_rtl8723be(prepared, &factory, &domain, channel).await
 }
@@ -601,7 +601,7 @@ pub(super) async fn prepare_rtl8192de(
     {
         return Ok(());
     }
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::platform::regdb::ensure_domain()
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
     admit_rtl8192de(prepared, &factory, &domain, channel).await
 }
@@ -696,7 +696,7 @@ pub(super) async fn initialize_registered_on_channel(
         }
         let storage = retained.lock().await;
         let owner = storage.as_ref().ok_or(Error::State)?;
-        let domain = narf_wireless::reg::db::ensure_domain()
+        let domain = crate::platform::regdb::ensure_domain()
             .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
         return owner.rtl8723ae_ready(&factory, channel, &domain);
     }
@@ -746,7 +746,7 @@ pub(super) async fn initialize_registered_on_channel(
     }
     let calibration =
         super::channel_power::Calibration::load_registered(&factory).map_err(Error::Power)?;
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::platform::regdb::ensure_domain()
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
     let permission = calibration
         .permission(&domain, channel)

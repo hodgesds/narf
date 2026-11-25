@@ -9,8 +9,8 @@
 //! physical metadata (`set_link_metadata_for`/`withdraw_link_metadata_for`)
 //! and never changes the operator's IFF_UP.
 use super::*;
+use crate::platform::net::iface::{NetIfaceSnapshot, OpenStopEvent, OpenStopTarget};
 use alloc::sync::Weak;
-use narf_net::iface::{NetIfaceSnapshot, OpenStopEvent, OpenStopTarget};
 
 pub(super) struct Admin {
     binding: Option<NetIfaceSnapshot>,
@@ -88,10 +88,10 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
         let binding = self.admin.lock().binding.clone();
         match binding {
             Some(binding) if up => {
-                narf_net::iface::set_link_metadata_for(&binding, true, None, None)
+                crate::platform::net::iface::set_link_metadata_for(&binding, true, None, None)
             }
-            Some(binding) => narf_net::iface::withdraw_link_metadata_for(&binding),
-            None => narf_net::iface::set_link_metadata(&self.name, up, None, None),
+            Some(binding) => crate::platform::net::iface::withdraw_link_metadata_for(&binding),
+            None => crate::platform::net::iface::set_link_metadata(&self.name, up, None, None),
         }
     }
     pub(super) fn administratively_open(&self) -> bool {
@@ -105,7 +105,7 @@ impl<C: ControlIo, B: PacketIo> Device<C, B> {
     pub(super) async fn control_state(
         &self,
         allow_closed: bool,
-    ) -> Result<narf_lib::mutex::MutexGuard<'_, State<C, B>>, WirelessError> {
+    ) -> Result<crate::platform::lib::mutex::MutexGuard<'_, State<C, B>>, WirelessError> {
         let (bound, running) = {
             let admin = self.admin.lock();
             (admin.binding.is_some(), admin.running)
@@ -147,7 +147,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> Device<C, B> {
         }
         admin.binding = Some(registration.clone());
         drop(admin);
-        if !narf_net::iface::set_open_stop_target(
+        if !crate::platform::net::iface::set_open_stop_target(
             &registration,
             Arc::new(Target(Arc::downgrade(self))),
         ) {
@@ -159,7 +159,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> Device<C, B> {
     }
     fn request_admin(self: &Arc<Self>, event: OpenStopEvent) {
         let binding = if event.up() {
-            let Some(binding) = narf_net::iface::lookup(event.name()) else {
+            let Some(binding) = crate::platform::net::iface::lookup(event.name()) else {
                 return;
             };
             if !event.current() {
@@ -192,7 +192,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> Device<C, B> {
             self.up.store(false, Ordering::Release);
             *self.rx.lock() = None;
             if let Some(binding) = &admin.binding {
-                narf_net::iface::withdraw_link_metadata_for(binding);
+                crate::platform::net::iface::withdraw_link_metadata_for(binding);
             }
             admin.event = Some(event);
             let spawn = !admin.running;
@@ -201,9 +201,33 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> Device<C, B> {
         };
         if spawn {
             let device = self.clone();
-            narf_scheduler::spawn(async move {
+            crate::platform::scheduler::spawn(async move {
                 device.run_admin().await;
             });
+        }
+    }
+    /// `rtl.ko`: the `IFF_UP` a module never receives (the netif bridge owns
+    /// its netdev), run once at publication: `run_admin`'s UP branch.
+    #[cfg(feature = "module")]
+    pub(in crate::rtl8xxxu) async fn module_open(self: Arc<Self>) {
+        let mut state = self.state.lock().await;
+        state.clear_transmit();
+        let result = match state.park().await {
+            Ok(()) => state.wake().await,
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            state.slot = Slot::Failed;
+            state.clear_transmit();
+            drop(state);
+            self.close();
+            return;
+        }
+        if !self.failed.load(Ordering::Acquire) {
+            let (producer, consumer) = crate::platform::ipc::channel();
+            state.rx = producer;
+            *self.rx.lock() = Some(consumer);
+            self.closed.store(false, Ordering::Release);
         }
     }
     async fn run_admin(self: Arc<Self>) {
@@ -242,7 +266,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static> Device<C, B> {
                 let same = admin.generation == generation;
                 if event.up() && same && current && !self.failed.load(Ordering::Acquire) {
                     // A fresh RX Narf-Ring generation for the reopened netdev.
-                    let (producer, consumer) = narf_ipc::channel();
+                    let (producer, consumer) = crate::platform::ipc::channel();
                     state.rx = producer;
                     *self.rx.lock() = Some(consumer);
                     self.closed.store(false, Ordering::Release);

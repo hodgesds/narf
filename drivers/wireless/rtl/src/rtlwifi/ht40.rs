@@ -237,7 +237,7 @@ impl Grant {
         firmware: super::super::firmware_transport::Identity,
         primary: u8,
     ) -> Result<alloc::vec::Vec<Arc<Self>>, Error> {
-        let authority = narf_firmware::trusted_loader_authority()
+        let authority = crate::platform::firmware::trusted_loader_authority()
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or(Error::Power(super::super::channel_power::Error::Authority))?;
         let mut grants = alloc::vec::Vec::new();

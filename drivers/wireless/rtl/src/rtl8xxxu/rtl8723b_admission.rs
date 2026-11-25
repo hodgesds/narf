@@ -9,8 +9,8 @@ use super::firmware_transport::{ControlIo, Owner as Firmware, Stage};
 use super::rtl8192e_radio::Width;
 use super::rtl8723b_policy::{Calibration, Error as PolicyError, Permission};
 use super::service_runtime::Error;
+use crate::platform::firmware::FirmwareError;
 use alloc::sync::Arc;
-use narf_firmware::FirmwareError;
 
 /// The initial operating channel, as the RTL8188EU/RTL8192EU stations start.
 pub const INITIAL_PRIMARY: u8 = 1;
@@ -26,13 +26,13 @@ pub enum Admission {
 pub(super) fn classify(
     has_net_authority: bool,
     has_loader_authority: bool,
-    domain: &Result<narf_wireless::reg::RegulatoryDomain, narf_wireless::reg::policy::Error>,
+    domain: &Result<narf_wireless::reg::RegulatoryDomain, crate::platform::regpolicy::Error>,
     record: &Result<Calibration, PolicyError>,
 ) -> Result<Admission, Error> {
     let domain = match domain {
         Ok(_) => true,
-        Err(narf_wireless::reg::policy::Error::Firmware(FirmwareError::NotFound)) => false,
-        Err(narf_wireless::reg::policy::Error::Authority) if !has_loader_authority => false,
+        Err(crate::platform::regpolicy::Error::Firmware(FirmwareError::NotFound)) => false,
+        Err(crate::platform::regpolicy::Error::Authority) if !has_loader_authority => false,
         Err(_) => return Err(Error::Profile),
     };
     let record = match record {
@@ -104,9 +104,9 @@ pub async fn wait_admit<I: ControlIo>(firmware: Arc<Firmware<I>>) -> Result<Admi
         }
         let factory = firmware.factory_8723b().ok_or(Error::State)?;
         let (vid, pid) = firmware.usb_identity().ok_or(Error::State)?;
-        let has_loader = narf_firmware::trusted_loader_authority().is_some();
-        let has_net = narf_net::trusted_net_authority().is_some();
-        let domain = narf_wireless::reg::policy::load();
+        let has_loader = crate::platform::firmware::trusted_loader_authority().is_some();
+        let has_net = crate::platform::net::trusted_net_authority().is_some();
+        let domain = crate::platform::regpolicy::load();
         let record = Calibration::load_registered(&factory, vid, pid);
         match classify(has_net, has_loader, &domain, &record)? {
             Admission::Ready => {
@@ -116,7 +116,10 @@ pub async fn wait_admit<I: ControlIo>(firmware: Arc<Firmware<I>>) -> Result<Admi
                 return admit(&firmware, domain, record);
             }
             Admission::PendingAssets => {
-                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
+                crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                    500_000_000,
+                ))
+                .await;
             }
         }
     }

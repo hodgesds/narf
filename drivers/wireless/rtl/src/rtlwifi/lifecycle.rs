@@ -3,8 +3,8 @@
 //! Leases hold no lock through a stack callback. A closed generation must
 //! drain them before its frontend can admit a replacement hardware owner.
 use super::station::{Admission, Error};
+use crate::platform::lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 pub(super) struct Lifecycle {
     pub(super) control: Mutex<()>,
@@ -91,12 +91,12 @@ impl Lifecycle {
     /// TX queue publications that entered before close; it does not drive or
     /// infer a hardware/DMA completion. No lock crosses the cooperative yield.
     pub(super) async fn drain_publications(&self) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(1000);
+        let deadline = crate::platform::time::Deadline::after_ms(1000);
         while self.publications.load(Ordering::Acquire) != 0 {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_scheduler::yield_now().await;
+            crate::platform::scheduler::yield_now().await;
         }
         Ok(())
     }

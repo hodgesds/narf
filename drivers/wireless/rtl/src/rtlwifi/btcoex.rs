@@ -27,7 +27,7 @@ mod tests;
 
 use super::h2c::{send_h2c, H2cError, H2cState};
 use super::regs::*;
-use narf_bus::MmioRegion;
+use crate::platform::bus::MmioRegion;
 
 /// True for chips that ship a BT radio (combo silicon).
 pub const fn has_bt(did: u16) -> bool {

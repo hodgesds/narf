@@ -7,10 +7,10 @@
 //! This format carries measured conservative upper envelopes, not a default
 //! curve. Signature verification and signer trust belong to narf_firmware.
 use super::device_init::Factory;
+use crate::platform::capabilities::{Cap, NoopOp, Read};
+use crate::platform::firmware::FirmwareBlob;
+use crate::platform::firmware::FirmwareError;
 use alloc::{format, vec::Vec};
-use narf_capabilities::{Cap, NoopOp, Read};
-use narf_firmware::FirmwareBlob;
-use narf_firmware::FirmwareError;
 
 const HEADER: usize = 64;
 const ROW: usize = 260;
@@ -150,7 +150,7 @@ impl Calibration {
     }
     pub fn load_registered(factory: Factory, vid: u16, pid: u16) -> Result<Self, Error> {
         let name = Self::asset_name(factory);
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
         let auth = loader
             .derive()

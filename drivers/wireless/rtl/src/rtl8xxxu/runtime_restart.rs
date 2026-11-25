@@ -95,9 +95,13 @@ impl<I: ControlIo> Owner<I> {
         self.stage(Stage::Restarting);
         let result = executable
             .fence(async {
-                self.run_device_expected(&image, narf_time::Deadline::after_ms(30_000), expected)
-                    .await
-                    .map(|_| ())
+                self.run_device_expected(
+                    &image,
+                    crate::platform::time::Deadline::after_ms(30_000),
+                    expected,
+                )
+                .await
+                .map(|_| ())
             })
             .await;
         attempt.complete = true;

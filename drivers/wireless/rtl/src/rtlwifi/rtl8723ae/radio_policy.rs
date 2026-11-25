@@ -6,12 +6,12 @@
 //! packet caller. Its native ColdBinding constructor
 //! requires the exact original-box Bound from the registered capsule.
 use super::{adapter, envelope, factory, phy::PgStore, tables, txpower, version};
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::FirmwareBlob;
 use crate::rtlwifi::{channel_power, firmware_transport::Identity, prepare::Error};
 #[cfg(any(test, feature = "kernel-test"))]
 use alloc::boxed::Box;
 use alloc::{format, string::String, sync::Arc};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::FirmwareBlob;
 use narf_wireless::reg::RegulatoryDomain;
 
 const LENGTH: usize = 256;
@@ -274,7 +274,7 @@ impl QualifiedProgram {
     /// Bound recipe loader used by the retained native preparation supervisor.
     pub(super) fn registered(program: Program) -> Result<Self, Error> {
         program.invoke(|| Ok(()))?;
-        let authority = narf_firmware::trusted_loader_authority()
+        let authority = crate::platform::firmware::trusted_loader_authority()
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or_else(|| power(channel_power::Error::Authority))?;
         let source = crate::firmware_asset::load(&authority, &program.request().name, LENGTH, true)

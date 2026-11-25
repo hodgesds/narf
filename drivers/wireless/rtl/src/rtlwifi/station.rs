@@ -177,14 +177,14 @@ pub(crate) trait Environment: Send + Sync {
 pub(crate) struct Admission {
     pub(crate) closed: AtomicBool,
     pub(crate) abort: AtomicBool,
-    pub(crate) publication: narf_lib::sync::IrqSafeSpinLock<()>,
+    pub(crate) publication: crate::platform::lib::sync::IrqSafeSpinLock<()>,
 }
 impl Admission {
     pub(crate) fn new() -> Self {
         Self {
             closed: AtomicBool::new(false),
             abort: AtomicBool::new(false),
-            publication: narf_lib::sync::IrqSafeSpinLock::new(()),
+            publication: crate::platform::lib::sync::IrqSafeSpinLock::new(()),
         }
     }
     pub(crate) fn publish<T, E>(

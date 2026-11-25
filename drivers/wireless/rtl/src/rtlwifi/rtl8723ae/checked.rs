@@ -99,12 +99,12 @@ pub(super) struct QualifiedIo<I: Backend> {
 enum Policy {
     Native,
     #[cfg(any(test, feature = "kernel-test"))]
-    Fixture(Arc<narf_wireless::reg::db::Database>),
+    Fixture(Arc<crate::platform::regdb::Database>),
 }
 impl Policy {
     fn snapshot(&self) -> Option<Arc<narf_wireless::reg::RegulatoryDomain>> {
         match self {
-            Self::Native => narf_wireless::reg::db::snapshot(),
+            Self::Native => crate::platform::regdb::snapshot(),
             #[cfg(any(test, feature = "kernel-test"))]
             Self::Fixture(database) => database.snapshot(),
         }
@@ -171,7 +171,7 @@ impl<I: Backend> QualifiedIo<I> {
         root: Arc<Retained<I>>,
         identity: Identity,
         program: Arc<QualifiedProgram>,
-        database: Arc<narf_wireless::reg::db::Database>,
+        database: Arc<crate::platform::regdb::Database>,
     ) -> Result<Arc<Self>, Error> {
         // A selected fixture DB never falls back to global policy.
         let domain = database.snapshot().ok_or(Error::State)?;

@@ -22,9 +22,9 @@
 //! the DM watchdog independently of the TX descriptor) but with DISFB set
 //! the firmware never applies it to a DATA frame.
 use super::{channel_power::Calibration, prepare::Error};
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::{FirmwareBlob, FirmwareError};
 use alloc::{format, string::String, sync::Arc};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
 pub(super) const LENGTH: usize = 128;
 const SOURCE: &[u8] = b"source base.c rtl_get_tcb_desc station DATA rix!=0 disable_ratefallback=0 ratr_index=sta_entry->ratr_index; rtl8188ee trx.c rtl88ee_tx_fill_desc use_driver_rate forced USE_RATE DW4.8 DISABLE_FB DW4.10 clear RATE_ID DW1.16-19=ratr_index MACID0; mgmt/control/EAPOL/report/BA keep USE_RATE DISFB; hw.c rtl88ee_update_hal_rate_mask H2C_88E_RA_MASK 0x84 levels INIT/HIGH/MIDDLE/LOW; firmware RA falls back within the bound mask; payload byte0 1, others zero";
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +90,7 @@ impl Grant {
         firmware: super::firmware_transport::Identity,
         channel: u8,
     ) -> Result<Option<Arc<Self>>, Error> {
-        let authority = narf_firmware::trusted_loader_authority()
+        let authority = crate::platform::firmware::trusted_loader_authority()
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or(Error::Power(super::channel_power::Error::Authority))?;
         let source = match crate::firmware_asset::load(

@@ -1087,6 +1087,55 @@ PCIe and rtw89 (registration-only ids), USB reset/rejoin/IPS/system PM,
 halt recovery and WoW. QEMU has no Realtek USB Wi-Fi device; bring-up
 through the module is unproven on hardware.
 
+## Loadable rtl (rtlwifi PCIe + rtl8xxxu USB)
+
+`rtl.ko` was registration-only: its probe returned `-ENOSYS`. Now both
+legacy Realtek drivers build from one source, either built in or as
+`rtl.ko`, and the module runs them over the KABI (spec §4.9).
+
+- **rtlwifi (PCIe), all ten ids.** The whole driver runs in the module:
+  - identification and admissibility;
+  - the authenticated firmware owner;
+  - native preparation: LLT, rings, RF/BB/MAC calibration;
+  - BT coexistence, thermal tracking and runtime power save;
+  - the station with its in-driver WPA2-PSK supplicant.
+
+  It publishes `wlan%d` and a wiphy through the netif bridge and the
+  `WIFI` v2 host, so nl80211 scan, connect and disconnect reach the
+  driver's own station.
+- **rtl8xxxu (USB), all 23 ids.** The family chain runs unchanged:
+  firmware, calibration, admission and station for RTL8188EU, RTL8192EU
+  and RTL8723BU. The USB station gets a netdev but no wiphy, because the
+  `WIFI` host is bound to a PCI device capability. Its SME is driven by
+  `rtl.ssid=` / `rtl.psk=` / `rtl.passphrase=`, as in `rtw88.ko`.
+- **KABI.** Added: `narf_bar_map_control` and the 8/16-bit `narf_mmio_*`
+  accessors. Also used from other branches: `narf_pci_command`,
+  `narf_wireless_regdomain`, and the `narf_usb_*` poller and netif.
+- **Module-only build.** `narf-drivers-wireless/rtl-module-only` leaves
+  the built-in tables to the module.
+- **Build.** The `.ko` links for x86_64 and aarch64, and every undefined
+  symbol is a KABI export.
+- **e2e.** `modules/e2e/rtl` checks:
+  - load to Live;
+  - the exact PCI claim, not rtw88's `b822`;
+  - with a USB stack, the exact USB claim;
+  - refusal of a probe with no device context;
+  - clean unload.
+
+  The test is written but has not been run.
+
+Not in the module:
+
+- system suspend and WoWLAN;
+- ASPM enable;
+- removal's DMA-quiescence proof (DMA is retained);
+- the userspace SME;
+- on USB, nl80211 control and endpoint-halt recovery.
+
+`rtl.ko` registers 23 USB matches, which fit beside `rtw88.ko`'s 50 in the
+128-entry module USB match table. QEMU has no Realtek Wi-Fi device, and no
+hardware boot of `rtl.ko` has run.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

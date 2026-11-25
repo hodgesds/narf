@@ -47,6 +47,10 @@
 
 #![allow(dead_code)]
 
+// One driver source in both builds. Only the PCI binding differs: built in,
+// `pci::probe` / `firmware_native::PciIo` use `narf-bus` and the function's
+// live capability; in `rtl.ko`, `pci_kabi` and `firmware_native_kabi` provide
+// the same names over the KABI (`crate::platform`).
 mod aspm;
 pub mod btcoex;
 pub mod channel;
@@ -54,11 +58,16 @@ pub mod channel_power;
 pub mod dma;
 pub mod efuse;
 mod fallback;
+#[cfg(feature = "builtin")]
+mod firmware_native;
+#[cfg(feature = "module")]
+#[path = "firmware_native_kabi.rs"]
 mod firmware_native;
 pub mod firmware_transport;
 pub mod fw;
 pub mod h2c;
 mod ht;
+pub mod identity;
 mod interface;
 mod power_runtime;
 mod probe_scan;
@@ -100,13 +109,20 @@ pub mod rtl8723ae;
 pub mod rtl8723be;
 pub mod rtl8821ae;
 
+// The module build's PCI binding (`rtl.ko`).
+#[cfg(feature = "module")]
+pub mod pci_kabi;
+
 pub use interface::set_inactive_power_save;
 pub use interface::set_leisure_power_save;
 pub use interface::set_pcie_aspm;
-pub use pci::{name_for, probe, register_pci_driver, RtlwifiDevice};
-pub use regs::{ALL_DEV_IDS, REALTEK_VENDOR};
+pub use pci::RtlwifiDevice;
+#[cfg(feature = "builtin")]
+pub use pci::{probe, register_pci_driver};
+pub use regs::{name_for, ALL_DEV_IDS, REALTEK_VENDOR};
 
 /// Entry point invoked from `drivers/wireless/src/lib.rs`.
+#[cfg(feature = "builtin")]
 pub fn register() {
     register_pci_driver();
 }

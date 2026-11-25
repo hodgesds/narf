@@ -80,6 +80,23 @@ pub const ALL_DEV_IDS: &[u16] = &[
     RTL_DEV_8821AE,
 ];
 
+/// Human-readable driver name for a given device ID.
+pub const fn name_for(did: u16) -> &'static str {
+    match did {
+        RTL_DEV_8188EE => "rtlwifi-8188ee",
+        RTL_DEV_8192CE => "rtlwifi-8192ce",
+        RTL_DEV_8192CE_ALT => "rtlwifi-8192ce-alt",
+        RTL_DEV_8192CE_8177 => "rtlwifi-8192ce-8177",
+        RTL_DEV_8192CE_8191 => "rtlwifi-8192ce-8191",
+        RTL_DEV_8192DE => "rtlwifi-8192de",
+        RTL_DEV_8192EE => "rtlwifi-8192ee",
+        RTL_DEV_8723AE => "rtlwifi-8723ae",
+        RTL_DEV_8723BE => "rtlwifi-8723be",
+        RTL_DEV_8821AE => "rtlwifi-8821ae",
+        _ => "rtlwifi",
+    }
+}
+
 // ── System / power-control (BAR0 low-byte block) ───────────────────────────
 //
 // These exist at the same offsets across every chip in the family.
@@ -192,6 +209,17 @@ pub const REG_HIMRE: u64 = 0x00B8;
 
 /// `REG_HISRE` — extended host interrupt status. `reg.h:0x00BC`.
 pub const REG_HISRE: u64 = 0x00BC;
+
+/// `REG_HIMR` / `REG_HIMRE` of the RTL8192CE family (`rtl8192ce/reg.h`) and
+/// RTL8192DE (`rtl8192de/reg.h`): the chips' `REG_HIMR` aliases these.
+pub const REG_HIMR_92C: u16 = 0x0120;
+pub const REG_HIMRE_92C: u16 = 0x0128;
+
+/// The RTL8723AE interrupt-mask literals `rtl8723ae/hw.c` actually writes
+/// (`rtl8723ae::irq::MASK0` / `MASK1` alias these; `reg.h`'s HIMR macros
+/// are unused by that path).
+pub const REG_HIMR_8723AE: u16 = 0x3a8;
+pub const REG_HIMRE_8723AE: u16 = 0x3ac;
 
 // ── MAC command register (CR) ─────────────────────────────────────────────
 //
