@@ -5100,7 +5100,7 @@ fn usb4_adapter() -> [u8; 0x32] {
 /// `drm_dp_tunnel_enable_bw_alloc` (`DP_DPTX_BW_ALLOCATION_MODE_CONTROL`
 /// 0xc0) the tunnel's UHBR10, HBR3 x2 and 2250000 kBps make
 /// `intel_dp_compute_link_config_wide` pick UHBR10 x2 at 24 bpp (HBR3 x2
-/// carries 1296000 kBps, the mode needs 1782000; UHBR10 x2's 2417750 is
+/// carries 1620000 kBps, the mode needs 1782000; UHBR10 x2's 2417750 is
 /// capped at 2250000). Before the port, `drm_dp_tunnel_alloc_bw` asks for
 /// `DIV_ROUND_UP(1782000, 31250)` = 58 units; the port clock is the
 /// fabric's `XELPDP_DDI_CLOCK_SELECT_TBT_312_5` (0x18 in the five-bit field)
@@ -5252,9 +5252,12 @@ kernel_test_in!(
 /// BW-allocation tunnel hands the tunnel back at probe
 /// (`DP_DPTX_BW_ALLOCATION_MODE_CONTROL` 0xc0, then 0x00); a tunnel
 /// without the 128b/132b lane 0 mapping drops the two-lane UHBR
-/// configurations (`intel_dp_tunnel_uhbr_lanes_wa_apply`), so nothing
-/// carries 4K60 and the DSC-less sink stays over budget; display 14 never
-/// reads the tunnel and a UHBR rate there is the typed `Tbt` refusal.
+/// configurations (`intel_dp_tunnel_uhbr_lanes_wa_apply`), so no UHBR link
+/// carries 4K60 (the tunnel's HBR3 x2 at 18 bpp would), the tunnel is
+/// handed back and the 8b/10b route, on the DPRX's own HBR2 x2, stays over
+/// budget (Linux would keep BW allocation and run HBR3 x2); display 14
+/// never reads the tunnel and a UHBR rate there is the typed `Tbt`
+/// refusal.
 fn smoke_external_uhbr_tbt_tunnel_refusals() -> TestResult {
     let port = XeLpgPort::Tc2;
     let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd);

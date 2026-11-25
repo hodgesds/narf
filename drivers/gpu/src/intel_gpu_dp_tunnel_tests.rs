@@ -212,7 +212,7 @@ kernel_test_in!(
 /// DPRX caps from the tunnel (UHBR10, so `max_dprx_rate` 1000000; two
 /// lanes) and the group's available bandwidth (72 x 31250 = 2250000 kBps),
 /// which `intel_dp_max_link_data_rate` caps at: UHBR10 x2 (2417750) reads
-/// 2250000, HBR3 x2 (1296000) stays. A DPRX lane count that is not a power
+/// 2250000, HBR3 x2 (1620000) stays. A DPRX lane count that is not a power
 /// of two fails verification and clears the mode again.
 fn smoke_uhbr_tunnel_bw_alloc_enable_and_caps() -> TestResult {
     let mut a = adapter();
@@ -243,7 +243,7 @@ fn smoke_uhbr_tunnel_bw_alloc_enable_and_caps() -> TestResult {
         return TestResult::Fail("the tunnel's DPRX caps and available BW differ");
     }
     if t.max_link_data_rate(1_000_000, 2) != 2_250_000
-        || t.max_link_data_rate(810_000, 2) != 1_296_000
+        || t.max_link_data_rate(810_000, 2) != 1_620_000
         || t.uhbr_lane_mask() != 0
     {
         return TestResult::Fail("intel_dp_max_link_data_rate must cap at the tunnel BW");

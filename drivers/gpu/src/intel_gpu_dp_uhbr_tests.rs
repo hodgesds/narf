@@ -111,10 +111,8 @@ impl AuxChannel for Dp20Sink<'_> {
                     .borrow_mut()
                     .push(Ev::Write(req.address, req.data.to_vec()));
                 if self.nack_writes.contains(&(req.address, req.data[0])) {
-                    return Ok(AuxResponse {
-                        status: AuxStatus::Nack,
-                        data: &reply[..0],
-                    });
+                    // As the display AUX transport reports a NACK reply.
+                    return Err(AuxError::Nacked);
                 }
                 let data = req.data.to_vec();
                 self.set(req.address, &data);
