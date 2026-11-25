@@ -128,6 +128,9 @@ still read Open for work the code now has (LNL/PTL FBC, i915
   beside RCS0;
 - fixed-mode KMS beside a running GT on Meteor/Arrow Lake desktops and on
   Nova Lake-S (`narf.intel.nvl_display=1`, display-preserving GT start);
+- the Nova Lake-S owned eDP route (`narf.intel.nvl_modeset=1`): an owned
+  console with the display-35 KMS owner, the panel off before system
+  suspend and its LT-PHY relight on resume;
 - the devcoredump wall-clock snapshot time, and the guilty context's
   process (`narf_filesystem::caller`, installed by userspace);
 - fixed-mode KMS on Gen9 and Gen11 desktops;
@@ -144,9 +147,9 @@ Still open, each needing its own grounding first:
 
 - Gen9 DC-state wiring (Skylake and Gen9 LP): the cores carry the masks
   and targets; no `DC_off` service arms them on Gen9.
-- Nova Lake-S beyond the opted-in eDP takeover (`narf.intel.nvl_modeset=1`):
-  external DP/HDMI and Type-C on the LT PHY, a display-35 relight owner for
-  system suspend, and the DMC/DC states.
+- Nova Lake-S beyond the opted-in eDP takeover and its suspend relight
+  (`narf.intel.nvl_modeset=1`): external DP/HDMI and Type-C on the LT PHY,
+  and the DMC/DC states.
 - PXP and HDCP. The MEI GSC proxy client they sit behind is in
   `drivers/platform/src/mei_gsc_proxy.rs` and joins the media GT's GSC
   worker through `narf_drivers::gsc_proxy`.

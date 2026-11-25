@@ -556,8 +556,19 @@ panel's EDID mode on the unchanged firmware surface, with the port PLL,
 transmitters and signal levels on the LT PHY (eDP tables) and the display-35
 CDCLK, DBUF, watermark and bandwidth owners. It requires a VBT naming port A
 eDP, no CMTG on transcoder A, an XR24 primary and a preferred mode of the
-primary's size; each refusal precedes every write outside AUX. System suspend
-stays refused (no display-35 relight owner).
+primary's size; each refusal precedes every write outside AUX and keeps the
+firmware fixed-mode route, which still refuses system suspend. A successful
+takeover continues on the integrated display path as display 30 does: Pipe A
+claimed, the console moved to an owned GGTT surface (Xe2 PTEs at the firmware
+surface's PAT0) and the display-35 KMS owner (`Display30` with
+`DisplayIp::NovaLakeS`, PHY/AUX through `intel_gpu_xe3plpd::View`) beside the
+display-preserving GT (`DisplayOwner::NovaLakeOwned`, `admit_display_nvl`).
+That owned case admits system suspend: the KMS quiesce turns the panel's crtc
+off after restoring the console (`drm_atomic_helper_suspend`), and resume
+relights it through `intel_gpu_xe3plpd::relight` (`pps_init_registers` with the
+probe's sequencer delays, then the cold panel-on through the LT PHY), refused
+without the panel-off record. A refused console handoff keeps the firmware
+surface as fixed-mode KMS with the firmware route's GT owner.
 WCL uses its separate C10/C20 route.
 `intel_gpu_nvl_resources` supplies the pure ownership boundary for that future
 owner. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT

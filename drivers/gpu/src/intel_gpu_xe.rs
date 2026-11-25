@@ -379,12 +379,15 @@ impl XeFile {
                 // SCANOUT (2) is admitted where a WC system object satisfies
                 // it: the iGPU. Arc display is not supported. An integrated
                 // Xe2/Xe3 function has no scanout (or FlatCCS) representation
-                // on its headless profile; the Lunar Lake display-20 and Panther
-                // Lake display-30 routes' display-preserving profiles take XE_BO_FLAG_SCANOUT
+                // on its headless profile; the Lunar Lake display-20, Panther
+                // Lake display-30 and Nova Lake-S owned display-35 routes'
+                // display-preserving profiles take XE_BO_FLAG_SCANOUT
                 // (xe_bo.c::xe_gem_create_ioctl) as a WC system object.
                 let supported_flags = match info.platform {
                     _ if info.platform.is_headless_integrated() => {
-                        if (info.platform.is_lnl() || info.platform.is_ptl())
+                        if (info.platform.is_lnl()
+                            || info.platform.is_ptl()
+                            || info.platform == crate::intel_gpu_gt::GtPlatform::NovaLakeS)
                             && info
                                 .backend
                                 .as_ref()

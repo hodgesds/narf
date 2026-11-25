@@ -164,8 +164,10 @@ impl MmioWindow for Nova {
             let v = self.mode.read32(r);
             v | ((v >> 1) & (1 << 22))
         } else if r == 0x64000 {
+            // XE2LPD_DDI_BUF_D2D_LINK_STATE follows its enable; a
+            // read-modify-write carrying it back must not latch it.
             let v = self.mode.read32(r);
-            v | ((v >> 1) & (1 << 28))
+            (v & !(1 << 28)) | ((v >> 1) & (1 << 28))
         } else {
             self.mode.read32(r)
         }
@@ -337,4 +339,115 @@ fn smoke_nvl_takeover_refuses_before_destructive_writes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3plpd_modeset",
     smoke_nvl_takeover_refuses_before_destructive_writes
+);
+
+/// System suspend and resume on display 35 (`drm_atomic_helper_suspend`,
+/// then `xe_display_pm_resume`). The owned panel's crtc goes off through the
+/// LT PHY (`intel_lt_phy_pll_disable`) and leaves the panel-off record.
+/// After the power loss the relight reprograms the sequencer delays the
+/// probe kept (`pps_init_registers`: the BIOS power-up, power-down and cycle
+/// fields, T8/T9 forced to 1 as `pps_init_delays` does) before
+/// `intel_pps_on`, then lights the panel through the LT PHY with the D2D
+/// link enable carried in `DDI_BUF_CTL` (`mtl_ddi_prepare_link_retrain` 6.i)
+/// and the plane on the new console surface.
+fn smoke_nvl_suspend_relight_round_trip_through_the_lt_phy() -> TestResult {
+    use crate::intel_gpu_edp::{PP_CONTROL, PP_OFF_DELAYS, PP_ON_DELAYS};
+    use crate::intel_gpu_modeset_xelpg::{forget_panel_off, owned_panel_mode, panel_off_record};
+    forget_panel_off();
+    let io = Nova::new();
+    io.mode.model_panel_power();
+    // The firmware sequencer: T1-T3 210 ms, T8 and T9 50 ms, T10 500 ms, a
+    // 700 ms power cycle; the panel powered with its backlight gate open.
+    io.mode.write32(PP_ON_DELAYS, (2100 << 16) | 500);
+    io.mode.write32(PP_OFF_DELAYS, (5000 << 16) | 500);
+    io.mode.write32(PP_CONTROL, (7 << 4) | 4 | 1);
+    let mode = Mode::VESA_1024X768_60;
+    assert_eq!(io.run(), Ok(mode));
+    let delays = record_panel_delays(&io);
+    assert_eq!(panel_delays(), Some(delays));
+
+    // Suspend: the planes, then the rest of hsw_crtc_disable.
+    let view = View(&io);
+    let mut ms = panel_orchestrator(&view);
+    assert_eq!(ms.disable_planes(), Ok(()));
+    let off = ms.panel_off().unwrap();
+    assert_eq!(off.port, crate::intel_gpu_xelpg::XeLpgPort::A);
+    assert_eq!(off.mode, Some(mode));
+    assert_eq!(panel_off_record(), Some(off));
+    assert_eq!(owned_panel_mode(), None);
+    // DDI_CTL_DE and the D2D link off, panel power off, MacCLK released.
+    assert_eq!(io.get(0x64000) & ((1 << 31) | (3 << 28)), 0);
+    assert_eq!(io.get(PP_CONTROL) & 1, 0);
+    assert_eq!(io.get(0x16fa60) & (3 << 30), 0);
+    assert!(io.strays.borrow().is_empty(), "{:x?}", io.strays.borrow());
+
+    // System suspend loses the sequencer's registers.
+    for reg in [PP_ON_DELAYS, PP_OFF_DELAYS, PP_CONTROL] {
+        io.mode.write32(reg, 0);
+    }
+    io.writes.borrow_mut().clear();
+
+    let console = Framebuffer {
+        phys_addr: 0x200_0000,
+        stride_bytes: 4096,
+        format: PixelFormat::Xrgb8888,
+    };
+    assert_eq!(relight(&View(&io), &console, &mode, delays), Ok(mode));
+    let writes = io.writes.borrow().clone();
+    let first = |f: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(r, v)| f(r, v));
+    let pp_on = first(&|r, v| r == PP_ON_DELAYS && v == (2100 << 16) | 1);
+    let pp_off = first(&|r, v| r == PP_OFF_DELAYS && v == (5000 << 16) | 1);
+    let cycle = first(&|r, v| r == PP_CONTROL && (v >> 4) & 0x1f == 7);
+    let power = first(&|r, v| r == PP_CONTROL && v & 1 != 0);
+    let pll = first(&|r, _| lt_reg(r));
+    let (Some(pp_on), Some(pp_off), Some(cycle), Some(power), Some(pll)) =
+        (pp_on, pp_off, cycle, power, pll)
+    else {
+        return TestResult::Fail("the relight must reprogram the sequencer and the LT PLL");
+    };
+    assert!(pp_on < power && pp_off < power && cycle < power);
+    assert!(power < pll, "intel_pps_on precedes the port PLL");
+    // DDI_CTL_DE with DDI_PORT_WIDTH(4) and the display-20+ D2D enable.
+    assert!(writes
+        .iter()
+        .any(|&(r, v)| r == 0x64000 && v == (1 << 31) | (1 << 29) | (3 << 1)));
+    // The plane scans out the new console surface; the record is gone.
+    assert_eq!(
+        io.written(0x7019c).last(),
+        Some(&(console.phys_addr as u32))
+    );
+    assert_eq!(panel_off_record(), None);
+    assert_eq!(owned_panel_mode(), Some(mode));
+    assert!(io.strays.borrow().is_empty(), "{:x?}", io.strays.borrow());
+    forget_panel_off();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3plpd_modeset",
+    smoke_nvl_suspend_relight_round_trip_through_the_lt_phy
+);
+
+/// The relight refuses before any write: without the panel-off record (the
+/// panel was not turned off before suspend, so only the warm modeset of a
+/// DDI system suspend powered down would remain), or on another display IP.
+fn smoke_nvl_relight_refusals_write_nothing() -> TestResult {
+    crate::intel_gpu_modeset_xelpg::forget_panel_off();
+    let delays = crate::intel_gpu_edp::PanelDelays::SPEC_DEFAULTS;
+    let mode = Mode::VESA_1024X768_60;
+    let io = Nova::new();
+    assert_eq!(
+        relight(&View(&io), &Nova::fb(), &mode, delays),
+        Err(RelightRefusal::PanelNotOff)
+    );
+    io.values.borrow_mut().insert(0x510a0, 30 << 22);
+    assert_eq!(
+        relight(&View(&io), &Nova::fb(), &mode, delays),
+        Err(RelightRefusal::Modeset(ModesetError::UnsupportedGeneration))
+    );
+    assert!(io.writes.borrow().is_empty(), "{:x?}", io.writes.borrow());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3plpd_modeset",
+    smoke_nvl_relight_refusals_write_nothing
 );

@@ -319,6 +319,13 @@ pub(crate) trait Platform:
     fn panel_on<'a>(&'a self, _console: &'a ActiveScanout) -> PanelWait<'a> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
+    /// Whether system suspend turns the panel's crtc off once the console is
+    /// restored (`drm_atomic_helper_suspend`), so that resume relights it
+    /// from a panel this driver turned off. Default: the panel stays as it
+    /// is until power is lost.
+    fn suspend_panel_off(&self) -> bool {
+        false
+    }
 }
 
 /// The Pipe-A eDP sink as an AUX channel over a platform window.
@@ -364,8 +371,9 @@ pub(crate) struct Physical {
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     window: crate::intel_gpu_gt_hw::AuthorizedWindow,
     generation: Generation,
-    /// Panther/Wildcat Lake only: the install proved the exact display-30 IP
-    /// behind its opted-in route. `None` on every other generation.
+    /// Panther/Wildcat Lake and Nova Lake-S only: the install proved the
+    /// exact display-30 or display-35 IP behind its opted-in route. `None`
+    /// on every other generation.
     display30: Option<Display30>,
     /// Discrete Arc display IP proved by [`DiscreteDisplayIp::identify`].
     discrete_display: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
@@ -376,10 +384,12 @@ pub(crate) struct Physical {
     /// The off-path FBC CFB carve, shared by every clone.
     fbc_carve: Arc<crate::intel_gpu_stolen::CarveSlot>,
 }
-/// What a Panther/Wildcat Lake KMS owner's install proved about display 30.
+/// What a Panther/Wildcat or Nova Lake KMS owner's install proved about its
+/// display-30-family IP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Display30 {
-    /// Exact GMD identity: 30.00 (Panther Lake) or 30.02 (Wildcat Lake).
+    /// Exact GMD identity: 30.00 (Panther Lake), 30.02 (Wildcat Lake) or
+    /// 35.00 (Nova Lake-S).
     ip: crate::intel_gpu_xe2lpd::DisplayIp,
     /// Wa_15015404425 still applies (`intel_gpu_xe3lpd::wa_15015404425`:
     /// a media GT before B0).
@@ -387,6 +397,14 @@ struct Display30 {
 }
 
 impl Physical {
+    /// The install proved Nova Lake-S display 35.00: its PHY and AUX
+    /// registers take [`crate::intel_gpu_xe3plpd::View`], with the LT PHY
+    /// behind every port, never the display-30 Cx0 view.
+    fn nova(&self) -> bool {
+        self.display30
+            .is_some_and(|display| display.ip == crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS)
+    }
+
     fn integrated_display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
         if self.discrete_display.is_some() {
             return None;
@@ -919,6 +937,11 @@ impl Platform for Physical {
                 crate::intel_gpu_aux::IntelAux::new(&pica, crate::intel_gpu_ddi::Ddi::A)
                     .transact(request, reply)
             }
+            Generation::PantherLake if self.nova() => {
+                let view = crate::intel_gpu_xe3plpd::View(self);
+                crate::intel_gpu_aux::IntelAux::new(&view, crate::intel_gpu_ddi::Ddi::A)
+                    .transact(request, reply)
+            }
             Generation::PantherLake => {
                 let flush = self.display30.is_some_and(|d30| d30.flush);
                 let view = crate::intel_gpu_xe3lpd::View::new(self, flush);
@@ -965,6 +988,13 @@ impl Platform for Physical {
             panel_power_on(self, console).await
         })
     }
+    /// Display 35 resumes only through the cold panel-on
+    /// ([`crate::intel_gpu_xe3plpd::relight`]): its crtc goes off before
+    /// suspend, as Linux's `intel_display_driver_pm_suspend` turns every crtc
+    /// off.
+    fn suspend_panel_off(&self) -> bool {
+        self.nova()
+    }
 }
 
 pub(crate) fn panel_generation_supported(generation: Generation, has_display30: bool) -> bool {
@@ -1009,6 +1039,13 @@ fn with_panel_modeset<R>(
         }
         Generation::PantherLake => {
             let d30 = io.display30.ok_or(FsError::Unsupported)?;
+            if d30.ip == DisplayIp::NovaLakeS {
+                // Display 35: the PICA view with the LT PHY behind port A.
+                let nvl = crate::intel_gpu_xe3plpd::View(io);
+                let view: &dyn MmioWindow = &nvl;
+                let mut ms = crate::intel_gpu_xe3plpd::panel_orchestrator(view);
+                return f(&mut ms).map_err(panel_modeset_error);
+            }
             let ptl = View::new(io, d30.flush);
             let view: &dyn MmioWindow = &ptl;
             let mut ms = XeLpgModeset::new(view, XeLpgPort::A).with_display_ip(d30.ip);
@@ -1031,6 +1068,11 @@ fn panel_pps_backlight_on(
         Generation::LunarLake => {
             let flushed = Flushed(io);
             let view: &dyn MmioWindow = &flushed;
+            PanelPowerSequencer::with_delays(view, delays).backlight_on()
+        }
+        Generation::PantherLake if io.nova() => {
+            let nvl = crate::intel_gpu_xe3plpd::View(io);
+            let view: &dyn MmioWindow = &nvl;
             PanelPowerSequencer::with_delays(view, delays).backlight_on()
         }
         Generation::PantherLake => {
@@ -1372,6 +1414,8 @@ impl<M: Platform> LegacyGuard<'_, M> {
         self.state.console = console.clone();
         *self.geometry.lock() = scanout_geometry(console);
         self.platform.console_published(console);
+        // The relight that replaced the console lit the panel's crtc.
+        self.state.panel_off = false;
         self.state.blocked = false;
     }
 }
@@ -1391,21 +1435,36 @@ pub(crate) fn install(
     // linear, X-tiled and Tile4
     // primary flips through DPT, the 64x64 cursor, CTM and double-buffered LUTs,
     // and DSB transactions on the console's Pipe A. XR30, FBC and PSR are not offered.
+    // Nova Lake-S display 35.00 shares that profile behind its own owned route
+    // (`narf.intel.nvl_modeset=1`), its panel driven through the LT PHY.
     let display30 = if generation == Generation::PantherLake {
         if !crate::intel_gpu_xe2lpd::route_owns_pipe_a() {
             return;
         }
         let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
-        let flush = crate::intel_gpu_xe3lpd::wa_15015404425_active(&window);
         use crate::intel_gpu_gt::GtPlatform;
         use crate::intel_gpu_xe2lpd::DisplayIp;
-        let expected = match GtPlatform::from_pci(device.id.vendor, device.id.device) {
-            Some(GtPlatform::Integrated(Generation::PantherLake)) => DisplayIp::Xe3Lpd,
-            Some(GtPlatform::WildcatLake) => DisplayIp::WildcatLake,
+        let platform = GtPlatform::from_pci(device.id.vendor, device.id.device);
+        // Nova Lake-S display 35.00 behind its owned route: the LT-PHY view,
+        // and no Wa_15015404425 (xe_device_wa_oob.rules: PLATFORM(PANTHERLAKE)).
+        let flush = platform != Some(GtPlatform::NovaLakeS)
+            && crate::intel_gpu_xe3lpd::wa_15015404425_active(&window);
+        let (expected, ip) = match platform {
+            Some(GtPlatform::Integrated(Generation::PantherLake)) => (
+                DisplayIp::Xe3Lpd,
+                DisplayIp::read_all(&crate::intel_gpu_xe3lpd::View::new(&window, flush)),
+            ),
+            Some(GtPlatform::WildcatLake) => (
+                DisplayIp::WildcatLake,
+                DisplayIp::read_all(&crate::intel_gpu_xe3lpd::View::new(&window, flush)),
+            ),
+            Some(GtPlatform::NovaLakeS) => (
+                DisplayIp::NovaLakeS,
+                DisplayIp::read_all(&crate::intel_gpu_xe3plpd::View(&window)),
+            ),
             _ => return,
         };
-        if DisplayIp::read_all(&crate::intel_gpu_xe3lpd::View::new(&window, flush)) != Ok(expected)
-        {
+        if ip != Ok(expected) {
             return;
         }
         Some(Display30 {
@@ -2069,6 +2128,10 @@ impl<M: Platform> Device<M> {
         }
         Ok(guard)
     }
+    /// System-suspend quiesce: the console restored and its colour released,
+    /// the panel's crtc off where the platform resumes only from a dark panel
+    /// ([`Platform::suspend_panel_off`]), then admission closed until the
+    /// resume relight replaces the console ([`LegacyGuard::console_replaced`]).
     pub(crate) async fn quiesce(&self) -> Result<(), FsError> {
         let state = self.state.lock().await;
         let _power = self.platform.display_power()?;
@@ -2080,6 +2143,9 @@ impl<M: Platform> Device<M> {
         };
         guard.restore_console().await?;
         self.platform.color_restored();
+        if self.platform.suspend_panel_off() {
+            guard.panel_off().await?;
+        }
         guard.state.blocked = true;
         Ok(())
     }

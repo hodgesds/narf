@@ -21,6 +21,13 @@
 //! and the display-35 CDCLK, DBUF and watermark owners (Linux 7.4-rc4). A
 //! CMTG left armed by firmware is refused, as is a primary the modeset cannot
 //! scan out unchanged. Nothing here has run on silicon.
+//!
+//! After a successful [`probe_takeover`] the probe moves the console to an
+//! owned surface and installs the KMS owner over [`View`]. System suspend
+//! then turns the panel's crtc off through [`panel_orchestrator`]
+//! (`drm_atomic_helper_suspend`, `intel_lt_phy_pll_disable`), and resume runs
+//! [`relight`]: the sequencer delays [`record_panel_delays`] kept, then the
+//! cold panel-on through the LT PHY (`xe_display_pm_resume`).
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
@@ -559,6 +566,34 @@ pub(crate) enum TakeoverRefusal {
     PortANotEdp,
     /// [`takeover`] refused or failed.
     Modeset(ModesetError),
+    /// Memory decode with bus mastering, or the BAR0 mapping, was refused.
+    PciAccess,
+}
+
+/// The probe's owned route on the Nova Lake-S function the firmware route
+/// proved lit: BAR0 decoded with bus mastering, [`take_over_for_probe`] over
+/// the function's window with the ACPI OpRegion's VBT, then the panel's
+/// sequencer delays kept for the resume relight ([`record_panel_delays`]).
+pub(crate) fn probe_takeover(
+    device: &narf_bus::BusDevice,
+    cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    primary: &FirmwarePrimary,
+) -> Result<Mode, TakeoverRefusal> {
+    use narf_bus::pci::{self, cmd};
+    pci::set_command(
+        cap,
+        device,
+        cmd::MEM_SPACE | cmd::BUS_MASTER | cmd::INTX_DISABLE,
+    )
+    .map_err(|_| TakeoverRefusal::PciAccess)?;
+    // SAFETY: the PCI probe grants exclusive ownership of this function's
+    // BAR0; an identical later mapping reuses the same typed VA.
+    let bar = unsafe { narf_bus::bar::map_bar(device, 0) }.map_err(|_| TakeoverRefusal::PciAccess)?;
+    let asls = pci::read_config32(cap, device, crate::intel_gpu_vbt::ASLS).ok();
+    let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, *cap);
+    let mode = take_over_for_probe(&window, primary, asls)?;
+    record_panel_delays(&window);
+    Ok(mode)
 }
 
 /// The probe's owned-modeset step. Port A must be the VBT's eDP output
@@ -608,6 +643,77 @@ pub(crate) fn takeover<M: MmioWindow + ?Sized>(
         return Err(ModesetError::InvalidFramebuffer);
     }
     ms.modeset_fixed(&fb, &mode)
+}
+
+// ── System suspend and resume of the owned panel ─────────────────
+
+/// The panel's power-sequencer delays as the owned route found them at
+/// probe. `pps_init_delays` reads the firmware-programmed `PP_ON_DELAYS`,
+/// `PP_OFF_DELAYS` and the `PP_CONTROL` cycle field once and keeps them for
+/// every later `pps_init_registers`, the resume one included.
+static PANEL_DELAYS: narf_lib::sync::IrqSafeSpinLock<Option<crate::intel_gpu_edp::PanelDelays>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Read and keep the lit panel's sequencer delays (read-only). The owned
+/// route's probe calls this after a successful [`takeover`].
+pub(crate) fn record_panel_delays(
+    io: &(impl MmioWindow + ?Sized),
+) -> crate::intel_gpu_edp::PanelDelays {
+    let delays = crate::intel_gpu_edp::PanelPowerSequencer::new(&View(io)).delays();
+    *PANEL_DELAYS.lock() = Some(delays);
+    delays
+}
+
+/// The delays [`record_panel_delays`] kept; `None` before the owned route ran.
+pub(crate) fn panel_delays() -> Option<crate::intel_gpu_edp::PanelDelays> {
+    *PANEL_DELAYS.lock()
+}
+
+/// The orchestrator the KMS owner turns the panel off and on with, over
+/// `mmio` (a [`View`]): the Pipe-A eDP on port A, dispatched on display 35.
+pub(crate) fn panel_orchestrator<M: MmioWindow + ?Sized>(
+    mmio: &M,
+) -> crate::intel_gpu_modeset_xelpg::XeLpgModeset<'_, M> {
+    orchestrator(mmio)
+}
+
+/// Why the resume relight of the owned panel refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelightRefusal {
+    /// No panel-off record names port A: this driver did not turn the
+    /// panel's crtc off before suspend (`drm_atomic_helper_suspend`), so the
+    /// only modeset left would be the warm one, which needs the DDI that
+    /// system suspend powered down. Nothing was written.
+    PanelNotOff,
+    /// The admission or the panel-on modeset refused or failed.
+    Modeset(ModesetError),
+}
+
+/// The system-resume relight of the owned panel at `mode`, scanning out
+/// `fb`. `xe_display_pm_resume` runs `drm_mode_config_reset`, whose
+/// `intel_ddi_encoder_reset` reprograms the power sequencer
+/// (`intel_pps_encoder_reset`: `pps_init_registers` with the delays kept at
+/// probe), and `__intel_display_driver_resume` then commits the crtc state
+/// saved at suspend: here the panel-on modeset of a panel this driver turned
+/// off, through the LT PHY (`intel_lt_phy_pll_enable`). Admitted read-only
+/// as [`modeset`] is, and refused before any write unless the panel-off
+/// record of port A exists. `mmio` must be a [`View`].
+pub(crate) fn relight<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    fb: &Framebuffer,
+    mode: &Mode,
+    delays: crate::intel_gpu_edp::PanelDelays,
+) -> Result<Mode, RelightRefusal> {
+    admit(mmio).map_err(RelightRefusal::Modeset)?;
+    if crate::intel_gpu_modeset_xelpg::panel_off_record()
+        .is_none_or(|off| off.port != crate::intel_gpu_xelpg::XeLpgPort::A)
+    {
+        return Err(RelightRefusal::PanelNotOff);
+    }
+    crate::intel_gpu_edp::PanelPowerSequencer::with_delays(mmio, delays).init_registers();
+    orchestrator(mmio)
+        .modeset_fixed(fb, mode)
+        .map_err(RelightRefusal::Modeset)
 }
 
 #[cfg(feature = "kernel-test")]

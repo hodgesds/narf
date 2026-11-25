@@ -606,6 +606,19 @@ fn ptl_console_handoff(
     route_console_handoff(dev, mode, pat)
 }
 
+/// The Nova Lake-S display-35 console handoff: the Lunar Lake pattern
+/// (`lnl_console_handoff`) through the display-35 view, after the owned
+/// route's in-place takeover. Nova's graphics 30.03-30.05 takes Linux's
+/// `xe3_lpg_pat_table` (`xe_pat_init_early`, graphics 30), whose PAT0 is
+/// Xe2's, and the surface's PTEs are Xe2's.
+fn nvl_console_handoff(dev: &mut IntelGpu, mode: &crate::intel_gpu_modeset::Mode) -> bool {
+    let pat = {
+        let window = dev.mode_window();
+        firmware_console_pat(&crate::intel_gpu_xe3plpd::View(&window))
+    };
+    route_console_handoff(dev, mode, pat)
+}
+
 /// The PAT index of the firmware's lit Pipe-A surface PTE, which the owned
 /// console must reuse (`intel_gpu_xe2lpd::console_pat`); `None` refuses.
 fn firmware_console_pat(io: &impl crate::intel_gpu_aux::MmioWindow) -> Option<u8> {
@@ -846,32 +859,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // cannot be reconstructed: PCI parking and the headless GT's driver FLR
     // would destroy the state this option exists to keep. A primary that is
     // the boot framebuffer becomes fixed-mode KMS beside a display-preserving
-    // GT; anything else is only observed.
+    // GT; anything else is only observed. With `narf.intel.nvl_modeset=1`
+    // the owned display-35 takeover runs first, in place at the panel's EDID
+    // mode through the LT PHY; only its success continues on the integrated
+    // display path below (an owned console, KMS, suspend and relight), and
+    // each refusal before its first write outside AUX keeps the firmware
+    // route.
+    let mut nvl_owned = None;
     if let Some(result) = crate::intel_gpu_lt_phy::probe_firmware_primary(platform, &device, &cap) {
         use core::fmt::Write as _;
-        match result {
-            Ok(primary) => {
-                if let Some(fb) = nvl_boot_framebuffer(&primary) {
-                    log_probe(
-                        "display 35: retaining the firmware primary for fixed-mode KMS",
-                        &device,
-                    );
-                    return crate::intel_gpu_gt_runtime::probe_nvl_display(
-                        device, cap, fb, primary,
-                    );
-                }
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "intel-gpu {:04x}:{:04x} firmware Pipe A {}x{} {:?}, pitch {} bytes, GGTT {:#x}",
-                    device.id.vendor,
-                    device.id.device,
-                    primary.geometry.width,
-                    primary.geometry.height,
-                    primary.format,
-                    primary.geometry.pitch,
-                    primary.gtt_offset,
-                );
-            }
+        let primary = match result {
+            Ok(primary) => primary,
             Err(reason) => {
                 let _ = writeln!(
                     narf_console::Writer,
@@ -879,18 +877,64 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     device.id.vendor,
                     device.id.device,
                 );
+                return Ok(());
+            }
+        };
+        let Some(fb) = nvl_boot_framebuffer(&primary) else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "intel-gpu {:04x}:{:04x} firmware Pipe A {}x{} {:?}, pitch {} bytes, GGTT {:#x}",
+                device.id.vendor,
+                device.id.device,
+                primary.geometry.width,
+                primary.geometry.height,
+                primary.format,
+                primary.geometry.pitch,
+                primary.gtt_offset,
+            );
+            return Ok(());
+        };
+        if !crate::intel_gpu_xe3plpd::modeset_requested(narf_boot::args()) {
+            log_probe(
+                "display 35: retaining the firmware primary for fixed-mode KMS",
+                &device,
+            );
+            return crate::intel_gpu_gt_runtime::probe_nvl_display(device, cap, fb);
+        }
+        match crate::intel_gpu_xe3plpd::probe_takeover(&device, &cap, &primary) {
+            Ok(mode) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu {:04x}:{:04x} display 35 owned eDP modeset complete on Pipe A ({}x{}, LT PHY)",
+                    device.id.vendor,
+                    device.id.device,
+                    mode.h_active,
+                    mode.v_active,
+                );
+                nvl_owned = Some((mode, fb));
+            }
+            Err(reason) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu {:04x}:{:04x} display 35 owned modeset refused ({reason:?}); firmware primary retained for fixed-mode KMS",
+                    device.id.vendor,
+                    device.id.device,
+                );
+                return crate::intel_gpu_gt_runtime::probe_nvl_display(device, cap, fb);
             }
         }
-        return Ok(());
     }
     // Normalize every admitted Intel graphics function before any route
     // probe maps or reads BAR0. Firmware may hand an integrated or discrete
     // GPU to us in D3hot, where the transition back to D0 can clear BARs.
     // `prepare_memory_probe` restores those BARs while leaving memory decode
     // and bus mastering parked; the selected path below enables only what it
-    // owns.
-    narf_bus::pci::prepare_memory_probe(&cap, &device)
-        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // owns. The owned display-35 function was proved in D0 with a stable,
+    // decoded BAR0 and now scans out the owned panel: parking it is skipped.
+    if nvl_owned.is_none() {
+        narf_bus::pci::prepare_memory_probe(&cap, &device)
+            .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    }
     // A Lunar Lake function whose display-20 route is admitted (requested,
     // GMD 20.00, Pipe A fused in and lit by firmware) takes the integrated
     // display path below and never the headless profile's driver FLR;
@@ -901,7 +945,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // `narf.intel.wcl_display=1`) likewise takes the integrated display path
     // and never the headless driver FLR. Without its option it reads nothing.
     let ptl_display = !lnl_display && crate::intel_gpu_xe3lpd::probe_route(&device, &cap);
-    if !lnl_display && !ptl_display && (platform.is_discrete() || platform.is_headless_integrated())
+    if !lnl_display
+        && !ptl_display
+        && nvl_owned.is_none()
+        && (platform.is_discrete() || platform.is_headless_integrated())
     {
         return crate::intel_gpu_gt_runtime::probe_discrete(device, cap);
     }
@@ -1353,6 +1400,31 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             );
         }
         panel_mode = mode;
+    } else if let Some((mode, fb)) = nvl_owned {
+        // Nova Lake-S display 35.00 (Xe3P_LPD), owned per device: the probe's
+        // in-place takeover lit the eDP panel through the LT PHY. Pipe A is
+        // the route's, and the console moves to an owned surface as on
+        // display 30, which installs the display-35 KMS owner below. A
+        // refused handoff keeps the firmware surface as fixed-mode KMS, with
+        // the firmware route's GT owner (no system suspend).
+        let _ = crate::intel_gpu_multipipe::claim_pipe(
+            crate::intel_gpu_pipes::Pipe::A,
+            crate::intel_gpu_multipipe::PipeOwner {
+                ddi: crate::intel_gpu_ddi::Ddi::A,
+                used_for: crate::intel_gpu_multipipe::PipeUse::InternalPanel,
+            },
+        );
+        if nvl_console_handoff(&mut dev, &mode) {
+            log_probe("display 35 console moved to an owned Pipe-A surface", &device);
+        } else {
+            log_probe(
+                "display 35 console handoff refused; firmware surface retained for fixed-mode KMS",
+                &device,
+            );
+            firmware_scanout = Some(fb);
+            dev.firmware_display = true;
+        }
+        panel_mode = Some(mode);
     } else {
         // Identification is real, but this exact display family has no
         // validated programming sequence in the admitted path yet.
@@ -1619,6 +1691,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::intel_gpu_gt_runtime::install_ptl_display(
             card_index, gt_card, device, cap, gt_bar, panel_mode,
         )
+    } else if nvl_owned.is_some() {
+        // The owned console is the relight owner of system suspend; a
+        // retained firmware surface keeps the firmware route's profile.
+        crate::intel_gpu_gt_runtime::install_nvl_display(
+            card_index,
+            gt_card,
+            device,
+            cap,
+            gt_bar,
+            panel_mode,
+            owns_scanout,
+        )
     } else if owns_scanout
         || stopped_display_gt
         || below_arena_gt
@@ -1709,11 +1793,25 @@ pub(crate) fn relight_display_locked(
     mode: &crate::intel_gpu_modeset::Mode,
 ) -> Option<ActiveScanout> {
     let display = with_display_info(|display| *display)?;
+    let kms = crate::intel_gpu_kms::display_for_bar(&display.gtt_mmadr);
     let xe_lpd_route = matches!(
         display.chip.generation,
         Generation::LunarLake | Generation::PantherLake
-    ) && crate::intel_gpu_kms::display_for_bar(&display.gtt_mmadr).is_some();
+    ) && kms.is_some();
+    // Nova Lake-S shares the Panther Lake generation; only the KMS owner's
+    // proved display 35.00 selects its LT-PHY relight.
+    let nova = kms.as_ref().and_then(|kms| kms.integrated_display_ip())
+        == Some(crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS);
+    drop(kms);
     if !display.chip.generation.display_supported() && !xe_lpd_route {
+        return None;
+    }
+    // Its relight needs the probe's sequencer delays and the panel turned off
+    // before suspend: refuse before the surface is allocated otherwise.
+    if nova
+        && (crate::intel_gpu_xe3plpd::panel_delays().is_none()
+            || crate::intel_gpu_modeset_xelpg::panel_off_record().is_none())
+    {
         return None;
     }
     if !external_routes_stopped(&display.gtt_mmadr) {
@@ -1747,6 +1845,17 @@ pub(crate) fn relight_display_locked(
     let window = ModeWindow::new(display.gtt_mmadr, display.device, display.cap);
     let applied = if display.chip.generation == Generation::LunarLake {
         crate::intel_gpu_xe2lpd::modeset(&window, &fb, Some(mode)).ok()?
+    } else if nova {
+        // Display 35 relights the panel its suspend turned off, through the
+        // LT PHY, after reprogramming the sequencer with the probe's delays.
+        let delays = crate::intel_gpu_xe3plpd::panel_delays()?;
+        crate::intel_gpu_xe3plpd::relight(
+            &crate::intel_gpu_xe3plpd::View(&window),
+            &fb,
+            mode,
+            delays,
+        )
+        .ok()?
     } else if display.chip.generation == Generation::PantherLake {
         crate::intel_gpu_xe3lpd::modeset(&window, &fb, Some(mode)).ok()?
     } else {
@@ -2982,6 +3091,11 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
             }
             _ => return false,
         };
+        // Display 35's ports take the LT PHY, which no external route drives
+        // yet: its hotplug sources are left untouched.
+        if display_ip == crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS {
+            return false;
+        }
         let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_ip(display_ip);
         let window = gpu.mode_window();
         // The owned panel the route adopts next to it, and the display-14/20/30

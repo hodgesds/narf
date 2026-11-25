@@ -201,6 +201,27 @@ enum DisplayOwner {
     /// (`narf.intel.nvl_display`): fixed-mode KMS, and the GT starts
     /// display-preserving beside it, never with the headless driver FLR.
     NovaLake,
+    /// Nova Lake-S display 35 owned by its route (`narf.intel.nvl_modeset`):
+    /// the panel lit through the LT PHY, an owned console with its KMS owner,
+    /// and the display-preserving GT beside it. Turns the panel off before
+    /// system suspend and relights it on resume (`intel_gpu_xe3plpd::relight`).
+    NovaLakeOwned,
+}
+
+/// Whether a GT owner beside `display` may take part in system suspend. A
+/// retained firmware surface (a Gen12 GOP or Nova's firmware primary) has no
+/// S3 relight owner; Nova's owned route does.
+const fn display_suspend_admitted(display: DisplayOwner, smallbar: bool) -> bool {
+    !matches!(
+        display,
+        DisplayOwner::Firmware(_) | DisplayOwner::NovaLake
+    ) && system_suspend_admitted(
+        smallbar,
+        matches!(
+            display,
+            DisplayOwner::LunarLake | DisplayOwner::PantherLake | DisplayOwner::NovaLakeOwned
+        ),
+    )
 }
 
 struct Pending {
@@ -219,16 +240,7 @@ struct Pending {
 
 impl Pending {
     fn allows_system_suspend(&self) -> bool {
-        !matches!(
-            self.display,
-            DisplayOwner::Firmware(_) | DisplayOwner::NovaLake
-        ) && system_suspend_admitted(
-            self.smallbar,
-            matches!(
-                self.display,
-                DisplayOwner::LunarLake | DisplayOwner::PantherLake
-            ),
-        )
+        display_suspend_admitted(self.display, self.smallbar)
     }
 }
 
@@ -281,10 +293,29 @@ pub(crate) fn ptl_profile(
     }
 }
 
+/// [`lnl_profile`] for Nova Lake-S's owned display-35 route: the
+/// display-preserving profile only for Nova Lake-S with the owned route and
+/// its lit mode; `Headless` for every function without the route.
+pub(crate) fn nvl_profile(
+    platform: GtPlatform,
+    nvl_owned: bool,
+    has_mode: bool,
+) -> Option<LnlProfile> {
+    if !platform.is_headless_integrated() {
+        return None;
+    }
+    match (nvl_owned, platform == GtPlatform::NovaLakeS && has_mode) {
+        (false, _) => Some(LnlProfile::Headless),
+        (true, true) => Some(LnlProfile::DisplayPreserving),
+        (true, false) => None,
+    }
+}
+
 /// Small-BAR discrete profiles remain D0-only until aperture-free CPU/GTT
-/// eviction lands; Display 20 (Lunar Lake) and Display 30 (Panther Lake)
-/// own panel power-off/on and relight across S3.
-pub(crate) fn system_suspend_admitted(smallbar: bool, _lnl_display: bool) -> bool {
+/// eviction lands; Display 20 (Lunar Lake), Display 30 (Panther Lake) and
+/// Nova Lake-S's owned display 35 own panel power-off/on and relight across
+/// S3.
+pub(crate) const fn system_suspend_admitted(smallbar: bool, _lnl_display: bool) -> bool {
     !smallbar
 }
 
@@ -1087,6 +1118,9 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 || (matches!(owner.pending.display, DisplayOwner::PantherLake)
                     && ptl_profile(self.platform, true, owner.pending.mode.is_some())
                         == Some(LnlProfile::DisplayPreserving))
+                || (matches!(owner.pending.display, DisplayOwner::NovaLakeOwned)
+                    && nvl_profile(self.platform, true, owner.pending.mode.is_some())
+                        == Some(LnlProfile::DisplayPreserving))
         })
     }
     fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
@@ -1569,6 +1603,41 @@ pub(crate) fn install_ptl_display(
         mode,
         DisplayOwner::PantherLake,
     )
+}
+
+/// The Nova Lake-S display-35 route's GT owner after the owned takeover:
+/// with the owned console (`owned`), the display-preserving profile beside
+/// the panel's `mode`, admitting system suspend; with the firmware surface
+/// retained, the firmware route's owner. Refused for anything that is not
+/// Nova Lake-S with a lit mode.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_nvl_display(
+    index: u32,
+    card: Arc<IntelGpuCard>,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: narf_bus::bar::MmioRegion,
+    mode: Option<crate::intel_gpu_modeset::Mode>,
+    owned: bool,
+) -> bool {
+    let profile = GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .and_then(|platform| nvl_profile(platform, true, mode.is_some()));
+    if profile != Some(LnlProfile::DisplayPreserving) {
+        return false;
+    }
+    if owned {
+        install_profile(
+            index,
+            card,
+            device,
+            cap,
+            bar,
+            mode,
+            DisplayOwner::NovaLakeOwned,
+        )
+    } else {
+        install_profile(index, card, device, cap, bar, None, DisplayOwner::NovaLake)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2141,10 +2210,21 @@ impl Owner {
                 GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
                     .map_err(|_| RuntimeError::State)?,
             )
-        } else if matches!(p.display, DisplayOwner::NovaLake) {
-            // Nova Lake-S display 35 on its firmware primary: the
-            // display-preserving cold start (GT-only GuC and full reset, no
-            // driver FLR), admitted while only Pipe A's primary fetches.
+        } else if matches!(
+            p.display,
+            DisplayOwner::NovaLake | DisplayOwner::NovaLakeOwned
+        ) {
+            // Nova Lake-S display 35 on its firmware primary or its owned
+            // console: the display-preserving cold start (GT-only GuC and
+            // full reset, no driver FLR), admitted while only Pipe A's
+            // primary fetches. The owned route must still hold Pipe A.
+            if matches!(p.display, DisplayOwner::NovaLakeOwned)
+                && (nvl_profile(platform, true, p.mode.is_some())
+                    != Some(LnlProfile::DisplayPreserving)
+                    || !crate::intel_gpu_xe2lpd::route_owns_pipe_a())
+            {
+                return Err(RuntimeError::Configuration);
+            }
             let receipt = crate::intel_gpu_gt::lnl::Receipt::admit_display_nvl(
                 p.device,
                 p.bar,
@@ -3842,6 +3922,13 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             drop(state);
             if result.is_err() {
                 let _ = crate::intel_dpcd_bl::resume_for_bar(&self.pending.bar);
+                // Nova's quiesce turned the panel off; the function is still
+                // in D0, so the resume relight lights it again in place.
+                if let (DisplayOwner::NovaLakeOwned, Some(mode)) =
+                    (self.pending.display, self.pending.mode)
+                {
+                    let _ = crate::intel_gpu::relight_display(&mode);
+                }
             } else if let Some(awake) = awake {
                 let old = self.system_awake.lock().replace(awake);
                 drop(old);
@@ -4003,12 +4090,13 @@ fn seed_discrete_display_card(
 /// The Nova Lake-S display-35 route (`narf.intel.nvl_display=1`) once the
 /// firmware primary matched the boot framebuffer `fb`: register fixed-mode
 /// KMS over it (the CPU copies each flip into it, as for an external-only
-/// Gen12 board) and install the display-preserving GT owner beside it.
+/// Gen12 board) and install the display-preserving GT owner beside it. The
+/// probe takes this route without `narf.intel.nvl_modeset=1`, or after the
+/// owned takeover refused; system suspend stays refused on it.
 pub(crate) fn probe_nvl_display(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     fb: narf_graphics_driver::generic::GenericFb,
-    primary: crate::intel_gpu_xe3plpd::FirmwarePrimary,
 ) -> Result<(), narf_bus::ProbeError> {
     if GtPlatform::from_pci(device.id.vendor, device.id.device) != Some(GtPlatform::NovaLakeS) {
         return Err(narf_bus::ProbeError::NotForThisDriver);
@@ -4032,35 +4120,6 @@ pub(crate) fn probe_nvl_display(
     // SAFETY: the PCI probe grants exclusive ownership of this function's BAR0.
     let bar = unsafe { narf_bus::bar::map_bar(&device, 0) }
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
-    // `narf.intel.nvl_modeset=1`: the owned display-35 eDP modeset at the
-    // panel's EDID mode on the firmware primary, through the LT PHY, before
-    // the GT starts beside it. The surface and its size are unchanged, so
-    // the fixed-mode card below and the GT's display-preserving admission
-    // (Pipe A lit, only its primary fetching) still describe the display.
-    // A refusal before the first destructive write leaves the firmware
-    // display as it was.
-    if crate::intel_gpu_xe3plpd::modeset_requested(narf_boot::args()) {
-        use core::fmt::Write as _;
-        let asls = narf_bus::pci::read_config32(&cap, &device, crate::intel_gpu_vbt::ASLS).ok();
-        let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
-        let outcome = crate::intel_gpu_xe3plpd::take_over_for_probe(&window, &primary, asls);
-        let _ = match outcome {
-            Ok(mode) => writeln!(
-                narf_console::Writer,
-                "intel-gpu {:04x}:{:04x} display 35 owned eDP modeset complete on Pipe A ({}x{}, LT PHY)",
-                device.id.vendor,
-                device.id.device,
-                mode.h_active,
-                mode.v_active,
-            ),
-            Err(reason) => writeln!(
-                narf_console::Writer,
-                "intel-gpu {:04x}:{:04x} display 35 owned modeset refused ({reason:?})",
-                device.id.vendor,
-                device.id.device,
-            ),
-        };
-    }
     let index = crate::drm_registry::count() as u32;
     let card = Arc::new(IntelGpuCard::new(
         alloc::format!("card{index}"),
@@ -4505,5 +4564,36 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_gt_discrete_display_admits_fetches_below_the_arena
+    );
+
+    /// Nova Lake-S: only the owned display-35 route (an owned console with
+    /// its resume relight) admits system suspend; the firmware primary keeps
+    /// refusing it. The owned route's display-preserving profile needs Nova
+    /// Lake-S and a lit mode.
+    fn smoke_gt_nvl_owned_display_admits_system_suspend() -> TestResult {
+        assert!(!display_suspend_admitted(DisplayOwner::NovaLake, false));
+        assert!(display_suspend_admitted(DisplayOwner::NovaLakeOwned, false));
+        assert!(!display_suspend_admitted(DisplayOwner::NovaLakeOwned, true));
+        assert!(display_suspend_admitted(DisplayOwner::PantherLake, false));
+        assert!(display_suspend_admitted(DisplayOwner::Standard, false));
+        let nvl = GtPlatform::NovaLakeS;
+        assert_eq!(
+            nvl_profile(nvl, true, true),
+            Some(LnlProfile::DisplayPreserving)
+        );
+        assert_eq!(nvl_profile(nvl, true, false), None);
+        assert_eq!(nvl_profile(nvl, false, true), Some(LnlProfile::Headless));
+        let ptl = GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
+        assert_eq!(nvl_profile(ptl, true, true), None);
+        assert_eq!(nvl_profile(ptl, false, true), Some(LnlProfile::Headless));
+        assert_eq!(nvl_profile(GtPlatform::Battlemage, true, true), None);
+        // Neither the display-30 nor the display-20 route admits Nova.
+        assert_eq!(ptl_profile(nvl, true, true), None);
+        assert_eq!(lnl_profile(nvl, true, true), None);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_gt_nvl_owned_display_admits_system_suspend
     );
 }

@@ -168,8 +168,9 @@ impl Receipt {
         )
     }
 
-    /// Keep Nova Lake-S display 35.00 scanning the firmware primary while
-    /// the GT starts: the same proof, with the firmware owning Pipe A.
+    /// Keep Nova Lake-S display 35.00 scanning while the GT starts: the same
+    /// proof, with Pipe A on the firmware primary or on the owned route's
+    /// console.
     pub(crate) fn admit_display_nvl(
         device: narf_bus::BusDevice,
         bar: narf_bus::bar::MmioRegion,
