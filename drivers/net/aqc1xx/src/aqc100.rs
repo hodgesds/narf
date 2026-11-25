@@ -475,6 +475,10 @@ pub(crate) const fn reg_glb_cpu_sem(sem: u64) -> u64 {
 }
 /// Global CPU scratchpad register `n`
 /// (`HW_ATL_GLB_CPU_SCRATCH_SCP_ADR(n)` = `0x300 + n*4`).
+/// Naming trap: Linux's `hw_atl_scrpad25_get` /
+/// `hw_atl_scrpad12_get` are 1-based names — they read indices
+/// `0x18` (24, `0x360`, the mailbox address) and `0xB` (11,
+/// `0x32C`, the RPC completion flag), not indices 25/12.
 pub(crate) const fn reg_glb_cpu_scratch(n: u64) -> u64 {
     REG_GLB_CPU_SCRATCH_BASE + n * 4
 }
@@ -1206,31 +1210,35 @@ fn soft_reset_rbl(regs: &impl RegIo) -> Result<(), NicError> {
 /// Discover the firmware mailbox/RPC addresses, mirroring the
 /// `init` half of the `aq_fw_*_ops`:
 /// - FW 1.x (`hw_atl_utils_mpi_create` = `init_ucp` +
-///   `fw_rpc_init`): seed UCP `0x370`, write scratchpad 25 to
-///   0, poll it for the mailbox address (10 ms), poll the RPC
-///   address register for the RPC address (100 ms). The RPC
-///   tid handshake (`fw_rpc_init`) is deferred (see the module
-///   header), so the RPC address is best-effort here — but the
-///   mailbox address is required by `MPI_RESET`, so its poll
-///   is fatal.
+///   `fw_rpc_init`): seed UCP `0x370`, write scratchpad index 25
+///   (`0x364`) to 0, poll scratchpad index 24 (`0x360`,
+///   Linux's `hw_atl_scrpad25_get` — the "25" in that name is
+///   1-based, the index is `0x18`) for the mailbox address
+///   (10 ms), poll the RPC address register for the RPC address
+///   (100 ms). The RPC tid handshake (`fw_rpc_init`) is
+///   deferred (see the module header), so the RPC address is
+///   best-effort here — but the mailbox address is required by
+///   `MPI_RESET`, so its poll is fatal.
 /// - FW 2.x (`aq_fw2x_init`): poll the mailbox address (10 ms)
 ///   and the RPC address (100 ms); the settings fetch is
 ///   deferred with the FW config upload. Neither address is
 ///   needed by the Stage-2 datapath, so both polls are
-///   best-effort.
+///   best-effort. FW2x never writes scratchpad index 25:
+///   `0x364` is its efuse-address register, so the clear is
+///   FW1x-only.
 ///
 /// Returns `(mbox_addr, rpc_addr)`; either may be 0 on the
 /// FW2x path.
 pub(crate) fn fw_mpi_init(regs: &impl RegIo, fw_gen: FwGen) -> Result<(u32, u32), NicError> {
     if fw_gen == FwGen::Fw1x {
         seed_ucp_0x370(regs);
+        regs.write32(reg_glb_cpu_scratch(25), 0x0);
     }
-    regs.write32(reg_glb_cpu_scratch(25), 0x0);
     let mbox_ok = narf_scheduler::responsive_spin_until(
-        || regs.read32(reg_glb_cpu_scratch(25)) != 0,
+        || regs.read32(REG_SCRPAD_MBOX_ADDR) != 0,
         narf_time::Deadline::after_ms(10),
     );
-    let mbox_addr = regs.read32(reg_glb_cpu_scratch(25));
+    let mbox_addr = regs.read32(REG_SCRPAD_MBOX_ADDR);
     let rpc_ok = narf_scheduler::responsive_spin_until(
         || regs.read32(REG_MPI_RPC_ADDR) != 0,
         narf_time::Deadline::after_ms(100),

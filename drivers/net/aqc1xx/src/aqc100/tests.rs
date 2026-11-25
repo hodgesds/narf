@@ -142,12 +142,17 @@ impl FakeRegs {
     }
 
     /// Preload the two efuse MAC dwords at `efuse_addr + 160`.
+    /// Linux's `hw_atl_utils_get_mac_permanent` byte-swaps each
+    /// downloaded dword and copies the bytes in order, so the MAC
+    /// is the big-endian bytes of the first dword followed by
+    /// the big-endian bytes of the second: word 0 holds bytes
+    /// 0..4, word 1 holds bytes 4..6 in its top half.
     fn preload_efuse_mac(&self, mac: [u8; 6]) {
-        let hi = ((mac[0] as u32) << 8) | mac[1] as u32;
-        let lo = ((mac[2] as u32) << 24)
-            | ((mac[3] as u32) << 16)
-            | ((mac[4] as u32) << 8)
-            | mac[5] as u32;
+        let lo = ((mac[0] as u32) << 24)
+            | ((mac[1] as u32) << 16)
+            | ((mac[2] as u32) << 8)
+            | mac[3] as u32;
+        let hi = ((mac[4] as u32) << 24) | ((mac[5] as u32) << 16);
         self.mif_write(self.efuse_addr + 160, lo);
         self.mif_write(self.efuse_addr + 164, hi);
     }
@@ -414,8 +419,11 @@ fn smoke_aqc100_chip_features() -> TestResult {
 kernel_test_in!("drivers/net/aqc100", smoke_aqc100_chip_features);
 
 fn smoke_aqc100_mac_efuse_and_fallback() -> TestResult {
-    // mif_mem stores the efuse words in memory order: low dword first.
-    let mac = decode_mac_efuse(&[0x00ABCDEF, 0x00005254]);
+    // The efuse words are the MAC's big-endian bytes: word 0
+    // holds bytes 0..4, word 1 holds bytes 4..6 in its top half
+    // (Linux byte-swaps each downloaded dword, then copies the
+    // bytes in order — see `decode_mac_efuse`).
+    let mac = decode_mac_efuse(&[0x525400AB, 0xCDEF0000]);
     kt_assert_eq!(mac, [0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF]);
     // All-zero efuse words decode to an all-zero MAC.
     kt_assert_eq!(decode_mac_efuse(&[0, 0]), [0; 6]);
@@ -435,7 +443,7 @@ fn smoke_aqc100_mac_efuse_and_fallback() -> TestResult {
     );
     // A valid efuse MAC must not be replaced by the fallback.
     kt_assert!(!mac_needs_fallback(decode_mac_efuse(&[
-        0x00ABCDEF, 0x00005254
+        0x525400AB, 0xCDEF0000
     ])));
     TestResult::Pass
 }
@@ -469,7 +477,11 @@ fn smoke_aqc100_link_status_decode() -> TestResult {
     kt_assert_eq!(link_status_1x_decode(st(32, 2)).mbps, 100);
     kt_assert!(!link_status_1x_decode(st(0, 2)).carrier);
     kt_assert!(!link_status_1x_decode(st(64, 2)).carrier);
-    kt_assert!(!link_status_1x_decode(st(1, 0)).carrier);
+    // Linux decodes the speed field only (`hw_atl_utils_mpi_get_link_status`
+    // never looks at the state field; the caller treats mbps != 0 as
+    // carrier) — a DEINIT state with a valid speed code still reads up.
+    kt_assert!(link_status_1x_decode(st(1, 0)).carrier);
+    kt_assert_eq!(link_status_1x_decode(st(1, 0)).mbps, 10000);
     // FW2x: rate bits in MPI_STATE 0x370, priority 10G > 5G > 2G5 > 1G > 100M.
     kt_assert_eq!(link_status_2x_decode(0x800).mbps, 10000);
     kt_assert_eq!(link_status_2x_decode(0x400).mbps, 5000);
@@ -502,8 +514,15 @@ fn smoke_aqc100_register_offsets() -> TestResult {
     kt_assert_eq!(reg_glb_cpu_sem(3), 0x3AC);
     kt_assert_eq!(reg_glb_cpu_sem(4), 0x3B0);
     kt_assert_eq!(REG_GLB_CPU_SCRATCH_BASE, 0x300);
-    kt_assert_eq!(reg_glb_cpu_scratch(25), 0x360);
-    kt_assert_eq!(reg_glb_cpu_scratch(12), 0x32C);
+    // Scratchpad index n is at 0x300 + n*4 — and Linux's
+    // `hw_atl_scrpad25_get` / `hw_atl_scrpad12_get` names are
+    // 1-based, so they read indices 24 (0x360, the mailbox
+    // address) and 11 (0x32C, the RPC completion flag), not
+    // indices 25/12.
+    kt_assert_eq!(reg_glb_cpu_scratch(25), 0x364);
+    kt_assert_eq!(reg_glb_cpu_scratch(24), 0x360);
+    kt_assert_eq!(reg_glb_cpu_scratch(12), 0x330);
+    kt_assert_eq!(reg_glb_cpu_scratch(11), 0x32C);
     kt_assert_eq!(REG_SCRPAD_MBOX_ADDR, 0x360);
     kt_assert_eq!(REG_MPI_BOOT_EXIT_CODE, 0x388);
     kt_assert_eq!(REG_MPI_DAISY_CHAIN_STATUS, 0x704);
@@ -906,8 +925,12 @@ fn smoke_aqc100_fake_boot_failures() -> TestResult {
     kt_assert!(matches!(soft_reset(&fake), Err(NicError::Other(_))));
 
     // FW1x DEINIT never completes: the 10ms poll times out.
+    // The fake boots at MPI state DEINIT (0), so the poll would
+    // pass immediately unless the state starts elsewhere — park
+    // it at INIT so the frozen transition has to time out.
     let mut fake = FakeRegs::new();
     fake.mpi_state_frozen = true;
+    *fake.mpi_state.borrow_mut() = MPI_INIT;
     kt_assert!(matches!(soft_reset(&fake), Err(NicError::FwTimeout)));
 
     // MIF downloads never complete: FW2x MAC fetch fails, FW1x falls back.
