@@ -5768,6 +5768,12 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/brcmfmac.ko".into(), bytes)),
             Err(e) => println!("xtask: brcmfmac driver module unavailable ({e})"),
         }
+
+        // The rtw88 driver as a `.ko` (RTL8821CU/RTL8822BU over the USB KABI).
+        match build_module_fixture("narf-drivers-wireless-rtw", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/rtw88.ko".into(), bytes)),
+            Err(e) => println!("xtask: rtw88 driver module unavailable ({e})"),
+        }
     }
 
     if !fixtures.is_empty() {

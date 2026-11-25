@@ -19,6 +19,9 @@
 //! transport" for the remaining admission blockers.
 
 use super::power::Command;
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_drivers_usb, narf_drivers_wireless_rtl_usb};
 use alloc::vec::Vec;
 use narf_drivers_usb::device::UsbError;
 use narf_drivers_wireless_rtl_usb::ControlIo;
@@ -1114,10 +1117,12 @@ impl<C: ControlIo> Registers<C> {
 /// `rtw_usb_rx_resubmit`). `URB_ZERO_PACKET` is the controller's job; the
 /// reserved-page path avoids the case altogether (see
 /// [`reserved_page_packet`]).
+#[cfg(feature = "builtin")]
 pub(super) struct Bulk<'a> {
     pub device: &'a narf_drivers_usb::device::USBDevice,
     pub endpoints: Endpoints,
 }
+#[cfg(feature = "builtin")]
 impl Bulk<'_> {
     pub(super) async fn write_port(&self, qsel: u8, packet: &[u8]) -> Result<(), Error> {
         let ep = self.endpoints.out_for(qsel).ok_or(Error::Endpoints)?;

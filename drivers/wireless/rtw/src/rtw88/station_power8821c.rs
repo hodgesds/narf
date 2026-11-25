@@ -2,6 +2,9 @@
 //! C21 full awake legacy station qualification, distinct from parked N21P.
 //! No asset or physical power/response measurement is supplied by this driver.
 use super::{calibration8821c::Error as QError, firmware_transport::Error, operating8821c};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_capabilities, narf_firmware, narf_wireless};
 #[cfg(any(test, feature = "kernel-test"))]
 use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};

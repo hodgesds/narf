@@ -2,6 +2,9 @@
 //! Signed per-device qualification for the initial awake ch1/basic1Mbps
 //! RTL8822CE profile. Indices never stand in for a measured dBm envelope.
 use super::{efuse::Factory, hardware::Features, phy};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_capabilities, narf_firmware, narf_net, narf_wireless};
 use alloc::format;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError};

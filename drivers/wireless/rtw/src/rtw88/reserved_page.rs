@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Persistent PCIe beacon-DMA reserved-page owner, Linux rtw88/{fw,pci,tx}.c.
 use super::firmware_transport::{self, Error};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_net, narf_wireless};
 use alloc::boxed::Box;
 #[path = "runtime_ps_page.rs"]
 mod runtime_ps_page;

@@ -4,6 +4,9 @@
 
 use super::power_tables::*;
 use super::regs::*;
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_bus, narf_capabilities, narf_scheduler, narf_time};
 use narf_bus::MmioRegion;
 use narf_time::Deadline;
 
@@ -299,6 +302,7 @@ pub unsafe fn power_on(mmio: &MmioRegion, did: u16) -> Result<(), PowerError> {
 }
 /// Fixed original native source, never a caller-provided validator. Denial
 /// sticks for the entire one-shot transition, including source loss in a wait.
+#[cfg(feature = "builtin")]
 pub(super) struct RecoveryIo<'a> {
     mmio: &'a MmioRegion,
     device: &'a narf_bus::BusDevice,
@@ -306,6 +310,7 @@ pub(super) struct RecoveryIo<'a> {
     claim: &'a super::functions::ResetClaim,
     denied: bool,
 }
+#[cfg(feature = "builtin")]
 impl RecoveryIo<'_> {
     fn access<T>(&mut self, op: impl FnOnce(&MmioRegion) -> T) -> Option<T> {
         if self.denied {
@@ -331,6 +336,7 @@ impl RecoveryIo<'_> {
         }
     }
 }
+#[cfg(feature = "builtin")]
 impl<'a> RecoveryIo<'a> {
     /// # Safety
     /// Exact exclusively reserved original BAR, following actual retirement.
@@ -349,6 +355,7 @@ impl<'a> RecoveryIo<'a> {
         }
     }
 }
+#[cfg(feature = "builtin")]
 impl super::efuse::EfuseIo for RecoveryIo<'_> {
     fn read8(&mut self, a: u64) -> u8 {
         Io::read8(self, a)
@@ -363,6 +370,7 @@ impl super::efuse::EfuseIo for RecoveryIo<'_> {
         Io::write32(self, a, v);
     }
 }
+#[cfg(feature = "builtin")]
 impl super::system_pm_wire::Registers for RecoveryIo<'_> {
     fn write16(&mut self, address: u64, value: u16) {
         self.access(|mmio| {
@@ -372,6 +380,7 @@ impl super::system_pm_wire::Registers for RecoveryIo<'_> {
         });
     }
 }
+#[cfg(feature = "builtin")]
 impl Io for RecoveryIo<'_> {
     fn permission(&mut self) -> bool {
         self.access(|_| ()).is_some()

@@ -2,6 +2,11 @@
 //! RTL8821CE/RTL8822CE section firmware lifecycle, Linux rtw88/mac.c/fw.c.
 //! Requires an exclusively retained, pristine PCIe reserved-page DMA backend.
 //! It does not itself enable PCI bus mastering or supply a packet runtime.
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{
+    narf_capabilities, narf_firmware, narf_net, narf_scheduler, narf_time, narf_wireless,
+};
 use alloc::boxed::Box;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::FirmwareError;

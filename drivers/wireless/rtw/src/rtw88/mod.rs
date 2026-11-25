@@ -19,6 +19,16 @@
 //! retains diagnostic identification. Physical validation and genuine measured
 //! deployment board/power assets remain separate gates.
 //!
+//! ## Loadable module
+//!
+//! With `--features module` this same tree builds into `rtw88.ko` for the
+//! RTL8821CU / RTL8822BU USB functions: `platform` supplies the kernel
+//! crates' names over `narf-module-rt` and the KABI, `usb_kabi.rs` binds
+//! the USB function (the KABI side of `usb_driver.rs`) and
+//! `iface_module.rs` publishes the station shell's netdev. PCI, system PM
+//! and USB recovery are `builtin`-only. See
+//! `drivers/wireless/specification/spec.md` §4.8.
+//!
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later)
 //!
 //! - Linux `drivers/net/wireless/realtek/rtw88/pci.c`
@@ -71,28 +81,41 @@ mod fallback;
 #[cfg(feature = "kernel-test")]
 mod fallback_tests;
 mod firmware_lifecycle;
+#[cfg(feature = "builtin")]
 mod firmware_native;
 mod firmware_transport;
+#[cfg(feature = "builtin")]
 mod functions;
+#[cfg(feature = "builtin")]
 pub mod fw;
 mod hardware;
 mod ht;
 mod ht40;
+#[cfg(feature = "builtin")]
 pub mod operating_reset;
 mod vht;
+#[cfg(feature = "builtin")]
 pub use operating_reset::{reset_function, Error as OperatingResetError};
+#[cfg(feature = "builtin")]
 mod rejoin;
+#[cfg(feature = "builtin")]
 mod runtime_idle;
 mod runtime_ps_scope;
 mod runtime_ps_wire;
+#[cfg(feature = "builtin")]
 pub use firmware_transport::runtime_lps::{
     lps_function, lps_request_function, lps_request_usb, lps_usb, Error as RuntimeSleepError,
 };
+#[cfg(feature = "builtin")]
 pub use runtime_idle::{idle_function, RuntimeIdle};
+#[cfg(feature = "builtin")]
 mod system_pm;
+#[cfg(feature = "builtin")]
 mod system_pm_native;
+#[cfg(feature = "builtin")]
 mod system_pm_wire;
 mod system_pm_worker;
+#[cfg(feature = "builtin")]
 pub use rejoin::{rejoin_function, Error as RejoinError};
 mod rx_ba;
 mod rx_ba_power;
@@ -119,12 +142,14 @@ mod operating8822b;
 pub(super) mod packet_core;
 pub(super) mod packet_format;
 mod packet_phy;
+#[cfg(feature = "builtin")]
 mod pci_firmware;
 mod phy;
 #[path = "phy/rtl8821c.rs"]
 mod phy8821c;
 mod phy8822b;
 mod power_policy;
+#[cfg(feature = "builtin")]
 mod probe_guard;
 mod protection;
 #[cfg(feature = "kernel-test")]
@@ -136,6 +161,7 @@ pub use protection::Request as RtsRequest;
 mod publication;
 mod qualification;
 pub use qualification::Request as ContinuationRequest;
+#[cfg(feature = "builtin")]
 mod native8822b;
 mod radio;
 mod radio8821c;
@@ -145,6 +171,7 @@ mod scan;
 #[cfg(feature = "kernel-test")]
 mod scan_tests;
 mod security_cam;
+#[cfg(feature = "builtin")]
 mod sibling;
 mod station;
 pub(super) mod station_control;
@@ -162,6 +189,7 @@ mod usb_firmware_tests;
 mod usb_packet;
 #[cfg(feature = "kernel-test")]
 mod usb_packet_tests;
+#[cfg(feature = "builtin")]
 /// RTL8821CU USB reset, rejoin, IPS and system sleep (Linux rtw88 core
 /// restart over usb.c).
 pub mod usb_recovery;
@@ -185,7 +213,9 @@ pub use radio8821c::StationInfo as C21StationRadioInfo;
 pub use station_power8821c::Request as C21StationRequest;
 pub use station_profile::Request as C22LegacyWmmRequest;
 pub use station_profile::Request as C21LegacyWmmRequest;
+#[cfg(feature = "builtin")]
 pub mod pci;
+#[cfg(feature = "builtin")]
 pub mod pci_park;
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -194,14 +224,46 @@ pub mod power;
 mod power_tables;
 pub mod regs;
 
+#[cfg(feature = "builtin")]
 pub use pci::{name_for, probe, provision, provision_function, register_pci_driver, Rtw88Device};
 pub use regs::{REALTEK_VENDOR, RTL_DEV_8821CE, RTL_DEV_8822BE, RTL_DEV_8822CE};
 
+/// The module build's netdev and `WIFI` host glue (`interface::publish`'s
+/// kernel registration built in).
+#[cfg(feature = "module")]
+mod iface_module;
+/// What the driver needs from the kernel, under the kernel crates' own names
+/// in the module build (see the module docs).
+#[cfg(feature = "module")]
+pub(crate) mod platform;
+/// The module build's USB binding: id registration, probe, the USB KABI
+/// transport and the provisioning loop (`usb_driver.rs` built in).
+#[cfg(feature = "module")]
+mod usb_kabi;
+
+/// `narf_module_init`: install the kernel DRBG as the protocol code's
+/// entropy source, then register the USB matches. The rest happens in probe.
+#[cfg(feature = "module")]
+pub fn register_module() {
+    platform::install_entropy();
+    usb_kabi::register();
+}
+
 /// Entry point invoked from the wireless crate's `register_initcalls`
 /// (one level up in `drivers/wireless/src/lib.rs`).
+#[cfg(feature = "builtin")]
 pub fn register() {
-    register_pci_driver();
+    register_without_usb();
     usb_driver::register();
+}
+
+/// [`register`] without the RTL8821CU/RTL8822BU USB class driver: the
+/// configuration in which `rtw88.ko` owns the USB functions
+/// (`narf-drivers-wireless/rtw88-module-only`). The PCIe driver and the
+/// family's system-PM fan-out stay built in.
+#[cfg(feature = "builtin")]
+pub fn register_without_usb() {
+    register_pci_driver();
     narf_power::system_pm::register_async_system_pm(
         "rtw88",
         alloc::sync::Arc::new(system_pm::SystemPm),

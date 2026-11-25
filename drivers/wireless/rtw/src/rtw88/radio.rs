@@ -8,6 +8,9 @@ use super::{
     firmware_transport::{Error, Io},
     power_policy,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::boxed::Box;
 use narf_drivers_wireless_rtl_chip::radio::c22;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

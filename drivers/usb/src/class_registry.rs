@@ -653,6 +653,22 @@ pub(crate) fn module_candidates(
         .collect()
 }
 
+#[doc(hidden)]
+/// Test-only: the first module match accepting `(vid, pid)` with
+/// configuration descriptor `config`, as `(name, probe)`. Lets a module's
+/// e2e load test (`modules/e2e/rtw88`) check its id table and call its
+/// probe without a device.
+pub fn __module_probe_for_test(
+    vid: u16,
+    pid: u16,
+    config: &[u8],
+) -> Option<(&'static str, narf_bus::ModuleProbeFn)> {
+    module_candidates(vid, pid, config)
+        .into_iter()
+        .next()
+        .map(|(_, name, probe)| (name, probe))
+}
+
 /// Return the number of currently registered class drivers.
 /// Mainly useful for smoke tests.
 pub fn registered_count() -> usize {

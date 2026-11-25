@@ -10,6 +10,9 @@
 //! for this path and mac80211 subtracts its own preq IEs from that budget.
 //! Random source addresses are not part of this plan.
 use super::packet_format::MAX_MPDU;
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::vec::Vec;
 use narf_wireless::{ScanRequest, WirelessError};
 

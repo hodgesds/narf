@@ -8,6 +8,11 @@ use super::{
     station_control::Admission,
     station_profile,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{
+    narf_capabilities, narf_firmware, narf_scheduler, narf_time, narf_wireless,
+};
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::FirmwareBlob;

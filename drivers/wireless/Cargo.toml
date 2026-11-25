@@ -99,6 +99,12 @@ ath9k-module-only = []
 # hooks) unclaimed so an early-loaded brcm `.ko` (brcmfmac.ko) owns the
 # device. CYW43439 over SDIO/gSPI stays built in.
 brcmfmac-module-only = []
+
+# Leave the built-in rtw88's RTL8821CU/RTL8822BU USB ids unclaimed so a loaded
+# rtw88.ko owns those functions (USB module matches are offered only devices
+# no built-in driver claimed). rtw88 PCIe and rtw89 stay built in: the .ko's
+# PCIe ids are registration-only.
+rtw88-module-only = []
 kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test", "narf-drivers-wireless-iwlwifi/kernel-test", "narf-drivers-wireless-rtl-usb/kernel-test", "narf-drivers-wireless-rtw/kernel-test", "narf-drivers-wireless-ath-core/kernel-test", "narf-drivers-wireless-ath9k/kernel-test", "narf-drivers-wireless-ath10k/kernel-test", "narf-drivers-wireless-ath11k/kernel-test", "narf-drivers-wireless-brcm/kernel-test", "narf-drivers-wireless-rtl/kernel-test"]
 
 [lints]

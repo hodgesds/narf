@@ -12,6 +12,9 @@
 //! caller must run the cold full restart (`system_pm_native` resume) rather
 //! than trusting the station that was armed.
 use super::firmware_transport::{Error as NativeError, PreparedImage};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::{boxed::Box, vec::Vec};
 use narf_wireless::{WowlanConfig, WowlanPattern, WowlanSupport};
 

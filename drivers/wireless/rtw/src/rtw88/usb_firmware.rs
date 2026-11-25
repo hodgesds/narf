@@ -35,6 +35,11 @@ use super::firmware_transport::{self, Error};
 use super::packet_core::{self, Step};
 use super::usb::{self, Endpoints, Registers, Speed};
 use super::usb_packet;
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{
+    narf_drivers_usb, narf_drivers_wireless_rtl_usb, narf_net, narf_time, narf_wireless,
+};
 use alloc::{boxed::Box, collections::VecDeque};
 use narf_drivers_wireless_rtl_usb::ControlIo;
 use narf_drivers_wireless_rtl_usb::Io as Bulk;

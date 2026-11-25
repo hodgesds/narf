@@ -5,6 +5,9 @@ use super::{
     firmware_transport::Error,
     power_policy::{self, Gate},
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_capabilities, narf_firmware, narf_wireless};
 #[cfg(any(test, feature = "kernel-test"))]
 use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};

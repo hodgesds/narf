@@ -9,6 +9,9 @@
 //! distinct and can never be used for this chip, nor this one for them.
 use super::efuse::{mac_is_valid, EfuseError, EfuseIo};
 use super::regs::RTL_DEV_8822BE;
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_bus;
 use narf_bus::MmioRegion;
 
 /// `struct rtw8822b_efuse` field offsets in the 768-byte logical map.

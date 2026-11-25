@@ -6,6 +6,9 @@
 //! firmware swap poisons it (`Phase::Failed`) and later calls refuse, so the
 //! caller can only take the cold full-restart path.
 use super::{Error, Io, Owner, Phase, PreparedImage};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::boxed::Box;
 
 impl<I: Io> Owner<I> {

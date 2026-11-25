@@ -16,6 +16,9 @@ use super::{
     firmware_transport::{Error, Io},
     phy8822b::{self, Info},
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use narf_drivers_wireless_rtl_chip::radio::b22;
 
 pub(super) use b22::{rf18, Init, TXSCALE};

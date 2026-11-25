@@ -7,6 +7,9 @@ use super::{
     qualification::{self, Kind, PAYLOAD},
     station_control::ReceiveEpoch,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_net;
 use alloc::sync::Arc;
 
 pub(super) static KIND: Kind = Kind {

@@ -29,6 +29,9 @@
 //! | 56..120 | kind payload, admitted by [`Kind::admit`] |
 //! | 120..128 | zero |
 use super::{firmware_transport::Error, power_policy::Gate};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_capabilities, narf_firmware};
 #[cfg(any(test, feature = "kernel-test"))]
 use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};

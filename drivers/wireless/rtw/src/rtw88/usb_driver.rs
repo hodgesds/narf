@@ -33,6 +33,7 @@
 //! like `pci.rs::schedule_owner` while the firmware or signed records are
 //! not yet registered. An unprovisioned RTL8821CU (no `rtw8821cu-*` N21Q
 //! record) stops at the calibration stage and is never admitted for radio TX.
+#[cfg_attr(feature = "module", allow(unused_imports))]
 use super::{
     efuse::{self, Factory8821c},
     efuse8822b::Factory8822b,
@@ -42,30 +43,47 @@ use super::{
     usb::{self, Endpoints, Speed},
     usb_firmware,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{
+    narf_console, narf_drivers_usb, narf_drivers_wireless_rtl_usb, narf_lib, narf_net,
+    narf_scheduler, narf_time,
+};
+#[cfg_attr(feature = "module", allow(unused_imports))]
 use alloc::{sync::Arc, vec::Vec};
+#[cfg(feature = "builtin")]
 use narf_drivers_usb::{
     class_registry::{UsbClassMatch, UsbProbeError},
     device::USBDevice,
     xhci::EndpointConfig,
 };
+#[cfg(feature = "builtin")]
 use narf_drivers_wireless_rtl_usb::{UsbControl, UsbIo};
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[cfg(feature = "builtin")]
 pub(super) type Backend = usb_firmware::Backend<UsbControl, UsbIo>;
-type Station = interface::Device<Backend>;
+/// The module build's backend: the same `usb_firmware::Backend` over the
+/// USB KABI transport (`usb_kabi.rs`).
+#[cfg(feature = "module")]
+pub(super) type Backend = usb_firmware::Backend<super::usb_kabi::Control, super::usb_kabi::Bulk>;
+pub(super) type Station = interface::Device<Backend>;
 
 /// USB 2.0 §9.4.7 SET_CONFIGURATION.
-const SET_CONFIGURATION: u8 = 0x09;
+pub(super) const SET_CONFIGURATION: u8 = 0x09;
 /// Largest configuration descriptor accepted (as `r8152.rs`).
-const CONFIG_MAX: usize = 4096;
+pub(super) const CONFIG_MAX: usize = 4096;
 /// `pci.rs::schedule_owner`'s retry budget: 120 attempts, 500 ms apart.
-const ATTEMPTS: usize = 120;
+pub(super) const ATTEMPTS: usize = 120;
 
+#[cfg(feature = "builtin")]
 const N: usize = usb::RTL8821CU_IDS.len();
+#[cfg(feature = "builtin")]
 const N22B: usize = usb::RTL8822BU_IDS.len();
 /// `rtw_8821cu_id_table` / `rtw_8822bu_id_table`:
 /// `USB_DEVICE_AND_INTERFACE_INFO(vid, pid, 0xff, 0xff, 0xff)` for every
 /// entry.
+#[cfg(feature = "builtin")]
 const fn id_table<const M: usize>(ids: &[(u16, u16)]) -> [UsbClassMatch; M] {
     let mut out = [UsbClassMatch::vid_pid(0xffff, 0xffff); M];
     let mut i = 0;
@@ -82,7 +100,9 @@ const fn id_table<const M: usize>(ids: &[(u16, u16)]) -> [UsbClassMatch; M] {
     }
     out
 }
+#[cfg(feature = "builtin")]
 pub(super) static RTW8821CU_USB_IDS: [UsbClassMatch; N] = id_table(usb::RTL8821CU_IDS);
+#[cfg(feature = "builtin")]
 pub(super) static RTW8822BU_USB_IDS: [UsbClassMatch; N22B] = id_table(usb::RTL8822BU_IDS);
 
 /// The factory map of one claimed function: `rtw8821cu_efuse_parsing` or
@@ -111,6 +131,7 @@ pub(super) fn chip(vendor: u16, product: u16) -> Option<u16> {
     }
 }
 
+#[cfg(feature = "builtin")]
 struct Bound {
     device: Arc<USBDevice>,
     station: Option<Arc<Station>>,
@@ -125,6 +146,7 @@ struct Bound {
 /// What `rtw_usb_probe` learned once (`rtw_usb_intf_init`, the bus speed
 /// and the factory MAC); `usb_recovery.rs` restarts over it.
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "builtin")]
 pub(super) struct Origin {
     /// 0xc821 (RTL8821CU) or 0xb822 (RTL8822BU).
     pub(super) did: u16,
@@ -134,16 +156,19 @@ pub(super) struct Origin {
 }
 
 /// The current generation of one bound slot.
+#[cfg(feature = "builtin")]
 pub(super) struct Current {
     pub(super) device: Arc<USBDevice>,
     pub(super) station: Arc<Station>,
     pub(super) lifecycle: Arc<Lifecycle<Backend>>,
     pub(super) origin: Origin,
 }
+#[cfg(feature = "builtin")]
 static BOUND: IrqSafeSpinLock<Vec<Bound>> = IrqSafeSpinLock::new(Vec::new());
 
 /// `module_usb_driver(rtw_8821cu_driver)` and
 /// `module_usb_driver(rtw_8822bu_driver)`.
+#[cfg(feature = "builtin")]
 pub(super) fn register() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "rtw88-8821cu-usb-ids", || {
@@ -169,6 +194,7 @@ pub(super) fn register() {
 /// `rtw_8821cu_probe` / `rtw_8822bu_probe`: claim the function and start
 /// the asynchronous `rtw_usb_probe` body; a second probe of the same handle
 /// is a no-op.
+#[cfg(feature = "builtin")]
 pub(super) fn probe(
     device: Arc<USBDevice>,
     _hub_port: Option<(u8, u8)>,
@@ -209,6 +235,7 @@ pub(super) fn probe(
 /// `rtw_usb_disconnect`: withdraw the published shell (`rtw_unregister_hw`)
 /// and retire the owner (`Lifecycle::remove` stops every retained bulk
 /// receipt). Idempotent; other slots are untouched.
+#[cfg(feature = "builtin")]
 fn unbind(controller: u8, slot_id: u8) -> Result<(), ()> {
     let bound = {
         let mut all = BOUND.lock();
@@ -232,7 +259,7 @@ fn unbind(controller: u8, slot_id: u8) -> Result<(), ()> {
 }
 
 /// Linux driver name of chip `did` on USB.
-fn driver_name(did: u16) -> &'static str {
+pub(super) fn driver_name(did: u16) -> &'static str {
     if did == 0xb822 {
         "rtw8822bu"
     } else {
@@ -241,6 +268,7 @@ fn driver_name(did: u16) -> &'static str {
 }
 
 /// The published RTL8821CU/RTL8822BU station shell claimed on USB `slot_id`.
+#[cfg(feature = "builtin")]
 pub(super) fn station(slot_id: u8) -> Option<Arc<Station>> {
     BOUND
         .lock()
@@ -250,6 +278,7 @@ pub(super) fn station(slot_id: u8) -> Option<Arc<Station>> {
 }
 
 /// True while `device` is still bound and `station` is its generation.
+#[cfg(feature = "builtin")]
 pub(super) fn is_current(device: &Arc<USBDevice>, station: &Arc<Station>) -> bool {
     BOUND.lock().iter().any(|b| {
         Arc::ptr_eq(&b.device, device)
@@ -258,6 +287,7 @@ pub(super) fn is_current(device: &Arc<USBDevice>, station: &Arc<Station>) -> boo
 }
 
 /// The slot's current generation, once attach published one.
+#[cfg(feature = "builtin")]
 pub(super) fn current(slot_id: u8) -> Option<Current> {
     BOUND
         .lock()
@@ -274,6 +304,7 @@ pub(super) fn current(slot_id: u8) -> Option<Current> {
 }
 
 /// The slot's provisioning lock (`Rtw88Device::provisioning`).
+#[cfg(feature = "builtin")]
 pub(super) fn provisioning(slot_id: u8) -> Option<Arc<narf_lib::mutex::Mutex<()>>> {
     BOUND
         .lock()
@@ -283,6 +314,7 @@ pub(super) fn provisioning(slot_id: u8) -> Option<Arc<narf_lib::mutex::Mutex<()>
 }
 
 /// Every bound slot with a published generation (system PM fan-out).
+#[cfg(feature = "builtin")]
 pub(super) fn slots() -> Vec<u8> {
     BOUND
         .lock()
@@ -295,6 +327,7 @@ pub(super) fn slots() -> Vec<u8> {
 /// xHCI endpoint contexts for the pipes rtw88 submits on: the bulk-IN pipe
 /// (`rtw_usb_rx_resubmit`) and every bulk-OUT pipe in `out` order
 /// (`rtw_usb_write_port`). The interrupt-IN pipe is parsed but never used.
+#[cfg(feature = "builtin")]
 pub(super) fn endpoint_configs(endpoints: &Endpoints) -> Vec<EndpointConfig> {
     use narf_drivers_usb::device::{bulk_in_ep, bulk_out_ep};
     let mut out = Vec::with_capacity(1 + usize::from(endpoints.out_count));
@@ -312,6 +345,7 @@ pub(super) fn endpoint_configs(endpoints: &Endpoints) -> Vec<EndpointConfig> {
 }
 
 /// `rtw_usb_intf_init` + host endpoint configuration.
+#[cfg(feature = "builtin")]
 async fn interface_init(device: &USBDevice) -> Result<Endpoints, Error> {
     let mut header = [0u8; 9];
     let n = device
@@ -402,6 +436,7 @@ async fn power_on<
         .map_err(usb_firmware::usb_error)
 }
 
+#[cfg(feature = "builtin")]
 async fn attach(device: Arc<USBDevice>, did: u16) -> Result<(), Error> {
     let endpoints = interface_init(&device).await?;
     let speed = Speed::from_port(device.speed());
@@ -486,6 +521,7 @@ async fn attach(device: Arc<USBDevice>, did: u16) -> Result<(), Error> {
 /// shell over a powered backend whose factory map was just read. Restarts
 /// (`usb_recovery.rs`) replace the whole generation, as `pci.rs::bring_up`
 /// does for a reset function; nothing of the old owner is reused.
+#[cfg(feature = "builtin")]
 pub(super) struct Generation {
     device: Arc<USBDevice>,
     pub(super) lifecycle: Arc<Lifecycle<Backend>>,
@@ -495,6 +531,7 @@ pub(super) struct Generation {
     /// firmware image is registered; until then it stays here, unclaimed.
     pending: IrqSafeSpinLock<Option<Backend>>,
 }
+#[cfg(feature = "builtin")]
 impl Generation {
     /// Publish the fresh shell (`rtw_register_hw`) under `name`, then make it
     /// the slot's generation iff the slot is still bound to `old`'s
@@ -591,6 +628,7 @@ impl Generation {
 /// configured, as Linux keeps the interface bound), `rtw_mac_power_on`,
 /// REG_C2HEVT and a fresh factory map whose MAC must equal the original
 /// (`pci.rs::bring_up_mode`'s identity re-read).
+#[cfg(feature = "builtin")]
 pub(super) async fn power_up(
     device: &Arc<USBDevice>,
     origin: &Origin,
@@ -614,7 +652,7 @@ pub(super) async fn power_up(
 }
 
 /// `pci.rs::retryable` for the USB owner: B22 `Calibrated` awaits `N2BP`.
-fn retryable(lifecycle: &Lifecycle<Backend>, station: &Station) -> bool {
+pub(super) fn retryable(lifecycle: &Lifecycle<Backend>, station: &Station) -> bool {
     let stage = lifecycle.status().stage;
     (matches!(
         stage,
@@ -628,7 +666,7 @@ fn retryable(lifecycle: &Lifecycle<Backend>, station: &Station) -> bool {
 
 /// `sibling.rs::Sibling::provision` + `pci.rs::provision_owner`'s station
 /// activation, over the USB backend.
-async fn provision(
+pub(super) async fn provision(
     lifecycle: &Lifecycle<Backend>,
     station: &Station,
     factory: &Factory,

@@ -1060,6 +1060,33 @@ needs a signed `wireless-regulatory.bin`). QEMU has no Broadcom Wi-Fi, so
 bring-up, firmware boot, scan and association through the module are
 unverified until run on hardware.
 
+## Loadable rtw88 (RTL8821CU / RTL8822BU)
+
+The rtw88 driver now builds from one source either built in or as
+`rtw88.ko` (`narf-drivers-wireless-rtw --features module`). For the USB
+parts the module runs the driver's own code over the KABI: the
+`usb_firmware` backend, the factory read, firmware, MAC, PHY, calibration
+and station stages, the `interface::Device` station shell and its in-driver
+Open / WPA2-PSK SME. Kernel services come from `src/rtw88/platform/`, which
+supplies the kernel crates' names over `narf-module-rt`; PCI types are
+uninhabited there. The hand-written `module_usb.rs` reimplementation is
+retired.
+
+New KABI exports serve USB Wi-Fi modules: `narf_usb_spawn_poller`,
+`narf_usb_netif_register_with_context`, `narf_usb_netif_rx` and
+`narf_wireless_regdomain`. `narf-drivers-wireless/rtw88-module-only` steps
+the built-in USB claim aside. `modules/e2e/rtw88` loads the real `.ko` and
+checks relocations and init, the `rtw.*` parameters, the USB and PCI
+claims, refusal of a probe with no USB context and clean unload (written,
+not yet run).
+
+There is no nl80211 wiphy for a USB function's module: the `WIFI` family
+host binds to bus device contexts only. The station joins from
+`rtw.ssid=` / `rtw.psk=` / `rtw.passphrase=`. Not in the module build: rtw88
+PCIe and rtw89 (registration-only ids), USB reset/rejoin/IPS/system PM,
+halt recovery and WoW. QEMU has no Realtek USB Wi-Fi device; bring-up
+through the module is unproven on hardware.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

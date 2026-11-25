@@ -7,6 +7,11 @@ use super::{
     station::{self, Environment},
     station_control::Admission,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{
+    narf_console, narf_io, narf_ipc, narf_lib, narf_net, narf_scheduler, narf_time, narf_wireless,
+};
 use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
@@ -1287,6 +1292,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         result.map_err(error)
     }
 }
+#[cfg(feature = "builtin")]
 pub(super) type Native = Device<super::pci_firmware::Transport>;
 impl<I: Io + 'static> super::endpoints::Endpoint for Device<I> {
     fn send(&self, b: &[u8], m: narf_net::TxMeta) -> Result<(), ()> {
@@ -1304,6 +1310,29 @@ impl<I: Io + 'static> Drop for Delivery<'_, I> {
         }
     }
 }
+/// The module build's publication: the same shell checks, then the netdev
+/// through the KABI (`iface_module`; there is no wiphy for a USB function's
+/// module) and the same asynchronous stack worker.
+#[cfg(feature = "module")]
+pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Error> {
+    if device.withdrawn() || device.published.load(Ordering::Acquire) {
+        return Err(Error::State);
+    }
+    let cookie =
+        super::endpoints::insert(&device.name, device.clone()).map_err(|_| Error::State)?;
+    super::iface_module::publish(device.clone(), device.local, cookie)?;
+    device.link(None, false);
+    device.published.store(true, Ordering::Release);
+    crate::watchdog_work::start(&device, WATCHDOG_PERIOD_MS);
+    narf_scheduler::spawn(async move {
+        while !device.withdrawn() {
+            device.drain_async().await;
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+        }
+    });
+    Ok(())
+}
+#[cfg(feature = "builtin")]
 pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Error> {
     if device.withdrawn() || device.published.load(Ordering::Acquire) {
         return Err(Error::State);

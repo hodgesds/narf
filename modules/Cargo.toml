@@ -33,6 +33,8 @@ narf-crypto       = { path = "../crypto" }
 narf-wireless     = { path = "../wireless" }
 # `narf_usb_netif_*`: USB Wi-Fi station interfaces.
 narf-net          = { path = "../net" }
+# `modules/e2e/rtw88`: the USB module match table the rtw88 `.ko` fills.
+narf-drivers-usb  = { path = "../drivers/usb" }
 # `narf_smbios_read`: the firmware SMBIOS table, for drivers whose board data
 # is keyed on an OEM structure (ath11k's type-0xF8 BDF variant).
 narf-firmware-smbios = { path = "../firmware/smbios" }
