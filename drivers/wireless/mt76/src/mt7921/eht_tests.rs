@@ -196,14 +196,16 @@ fn local_caps() -> Result<(), &'static str> {
     if wide160(narrow) {
         return Err("wide160 chip gate");
     }
-    // mt7925_init_eht_caps, 2 NSS, 5 GHz, 160 MHz.
+    // mt7925_init_eht_caps, 2 NSS, 5 GHz, 160 MHz. capability_body()
+    // includes the extension-ID octet (108) — the constants above are
+    // whole elements, so the comparison starts at [2..], not [3..].
     let body = local_eht(info, true, true).map_err(|_| "local EHT 160")?;
-    if body.capability_body() != LOCAL_EHT160[3..] {
+    if body.capability_body() != LOCAL_EHT160[2..] {
         return Err("local EHT 160 capability bytes");
     }
     // 80 MHz-only 5 GHz: no 160 set, MCS15 up to 80 MHz.
     let body = local_eht(info, true, false).map_err(|_| "local EHT 80")?;
-    if body.capability_body() != LOCAL_EHT80[3..] {
+    if body.capability_body() != LOCAL_EHT80[2..] {
         return Err("local EHT 80 capability bytes");
     }
     // One stream: 0x11 sets, no sounding dimensions above 80 MHz.

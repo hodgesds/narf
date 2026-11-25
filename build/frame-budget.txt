@@ -40,7 +40,6 @@
 9512 narf_drivers_net_igb::igb::vmdq::VtState::set_vf_vlan_admin
 9160 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::search_config
 9096 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::composition
-9048 narf_drivers_wireless_mt76::mt7921::association::JoinPlan::prepare_native
 8984 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prepare_media_transport
 8904 narf_drivers_wireless_brcm::brcmfmac::native_runtime::provision_using::{{closure}}
 8856 narf_drivers_wireless_ath11k::ath11k::pci::mhi_task::{{closure}}
