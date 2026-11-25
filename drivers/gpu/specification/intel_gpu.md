@@ -2814,9 +2814,7 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
   scrambling/SCDC and the computed SNPS C10 / C20 HDMI PLL states are
   owned by `intel_gpu_xelpg_hdmi`, §20), DP 2.0
   UHBR rates (the DP stack tops out at HBR3), a second external
-  route at once (one `MtlExternalService` route; MST streams aside),
-  linetime/pipe-chicken/frame-start-delay programming
-  of Pipes B–D, and
+  route at once (one `MtlExternalService` route; MST streams aside), and
   CDCLK notifications on the display-14 inherited path (display 14
   has no PCODE CDCLK mailbox; only the owned transaction sends
   PM demand — the Gen12 inherited path does send them, via
@@ -4566,17 +4564,6 @@ as busy and suspend fails if that proof is missing. A retained media GuC leaves
 GT0 failed instead of rebuilding the GGTT arena underneath firmware that may still
 translate through it.
 
-Remaining for this workstream:
-- A media scheduler with media-only ADS engine classes. GT0's scheduler currently
-  requires HWCONFIG, which Linux reads only on GT0.
-- Media engine enablement, default contexts and the per-engine reset policy.
-- VCS/VECS interrupt routing.
-- CT-based GGTT invalidation once media submission is enabled.
-- Native Xe exposure of gt_id 1, after which the GT1-unpublished conversation is
-  replaced by positive and negative publication tests.
-- GSC-loaded HuC (`huc_gsc`), which needs the GSC firmware/proxy path and stays
-  unadvertised.
-
 Four further fixtures register under `intel_gpu_media_gt`:
 - Media GuC boot, CT enable and stop on the GuC model, writing only GT1
   registers.
@@ -4664,8 +4651,7 @@ entry (gt_id 1, GT1's own clock and GMD_ID). The engine query adds VCS/VECS on
 gt_id 1, and queue creation resolves placements per gt_id in
 xe_exec_queue_create_ioctl's errno order. EXEC submits to the media GuC under
 GT1's epoch. With the option off, or before publication, the UAPI is GT0-only
-exactly as before. The engine cycles and topology queries, width > 1 media
-queues and GSC-loaded HuC remain open, along with silicon and Mesa acceptance.
+exactly as before. Silicon and Mesa acceptance remain open.
 
 New fixtures register under `intel_gpu_media_gt`:
 - `smoke_media_gt_sched_engines_prime_probe_publish_and_stop` and
@@ -4733,7 +4719,7 @@ reply and pending-handle rules, the GSC_HECI_CMD_PKT and GSC_FW_LOAD batches,
 the MKHI compatibility query and the PXP 4.3 NEW_HUC_AUTH packet. Each refusal
 carries the errno of its source branch.
 
-Three source facts shape the remaining work.
+Three source facts shape the HuC and GSC work.
 - Linux sets the MTL HuC running after a DMA upload from its embedded CSS
   followed by media-GuC authentication (xe_uc_load_hw). That state is what
   query_uc_fw_version reports. GSC authentication is a second, PXP-oriented
@@ -4743,15 +4729,6 @@ Three source facts shape the remaining work.
   scope for HuC.
 - Linux's separate huc_firmware_path and gsc_firmware_path parameters make
   HuC and GSC independently optional.
-
-The next wired slice is the MTL HuC on the media GuC: registry open, staging
-with WOPCM, DMA from the CSS offset, the AUTHENTICATE_HUC action and the
-GSI-adjusted HUC_KERNEL_LOAD_INFO. It should sit behind both the media-GT
-option and the HuC option, and it needs no GSC. GSCCS bring-up, GSC load with
-its stolen private object, Wa_14015076503 when NARF itself loads the GSC, and
-GSC HuC authentication follow, behind a separate GSC option. Until then,
-scheduling still refuses while GSC firmware is loaded, and HuC stays
-unadvertised on MTL.
 
 New fixtures register under `intel_gpu_media_gt`:
 - `smoke_media_gt_topology_reads_gt1_fuse_mirrors_under_gt_wake` and
@@ -4823,8 +4800,8 @@ and NARF issues no GSC authentication. TGL keeps its sticky exposure until full
 Gen12 reset. The GSC module is split accordingly. The HuC parts are now
 production and lose the dead-code allowance. The GSC image, its load batch and
 the HECI/MKHI/PXP packets move to `intel_gpu_gsc_heci.rs` and keep it. GSCCS,
-GSC firmware load, Wa_14015076503 and GSC HuC authentication remain out of
-scope, and scheduling still refuses while GSC firmware reports loaded.
+GSC firmware load, Wa_14015076503 and GSC HuC authentication are the GSC
+sections below.
 
 GT1's topology now follows Linux for its L3 banks too. xe_gt_topology_init
 runs load_l3_bank_mask on the media GT. xe_gt_topology_report_l3 keeps a media
@@ -4833,8 +4810,8 @@ MIRROR_FUSE3 and XEHP_FUSE4 are read with its other fuses and expanded by the
 graphics 12.70 rule: each GT_L3_EXC_MASK bit selects a two-bank pair, repeated
 every four bits for each MEML3_EN node. The 8-byte DRM_XE_TOPO_L3_BANK entry
 sits between GT1's compute and EU entries. Mesa reads only gt_id 0, so this
-changes no Mesa result. GT0's entries stay byte-identical; GT0 still reports no
-L3 bank entry, a separate existing gap.
+changes no Mesa result. GT0's own L3 bank entry is "Main-GT L3 bank topology
+entry" below.
 
 New fixtures register under `intel_gpu_media_gt`:
 - `smoke_media_huc_guc_upload_auth_reload_and_xe_query` covers the WOPCM, DMA,
@@ -4948,8 +4925,9 @@ Refused and remaining work:
       that is conservative and loses compression in the meantime.
     - Reading `GSCPSMI_BASE` without media forcewake can return 0. That is
       treated, as xe treats it, as "workaround not applied".
-- **PSR2 selective fetch and panel replay remain unqualified** (§10). PSR1
-  is covered by the next subsection.
+- **Panel replay remains unqualified** (§10). PSR1 is covered by the next
+  subsection, PSR2 selective update by "Display-14 PSR2 selective update and
+  frame damage".
 - **Other remaining display power work:** per-well reference counts beyond
   DC_off, the xelpdp AUX power-request mechanism, display-core uninit and DC9
   at suspend, DC3CO, and display stepping. Pipe DMC programs are loaded and
@@ -5014,11 +4992,11 @@ pipe stays off either way. The owned modeset uses a single Pipe-A request
 (primary plus budgeted hidden cursor) and reserves the HBR3 port clock it
 may enable before training, which also sets voltage level 1. CDCLK may now
 fall below a faster firmware clock. The multi-pipe
-computation is real, but a modeset that enables several pipes is not yet
-wired. Nothing is advertised beyond the existing single-pipe profile.
+computation drives the Pipes B–D owner ("External outputs on Pipes B–D
+beside the lit panel").
 
-Refused or not implemented: scalers, planar formats, async-flip
-minimum watermarks, bigjoiner, DSC, VRR and Xe2+ clock/MDCLK changes.
+Refused or not implemented: planar formats and async-flip minimum
+watermarks.
 Requests outside the qualified bounds are refused before any write and keep the
 inherited path. Thirteen new native fixtures cover latency decoding, levels
 and refusals, vblank limiting, DBUF tables, multi-pipe DDB, CDCLK plans and
@@ -5136,15 +5114,11 @@ Lake). Sources are Linux b90c984d `intel_tc.c` (`xelpdp_tc_phy_ops`),
   retrain, and re-detect. KMS suspend and GT-reset retirement tear down the
   route and the hotplug sources.
 
-Remaining: the periodic runtime caller of `service_mtl_external` and
-scanout publication still need to be added to the display runtime glue,
-because this slice does not own `intel_gpu.rs`. Also open: concurrent
-multi-pipe external use (DBUF/watermark repartition), UHBR (C20 MPLLA tables
-and 128b/132b), HDMI TMDS/FRL on C10/C20, MST, DSC/FEC, audio, lane
-reversal, TBT-alt tunnels, pin-assignment-D lane-0 ownership, a VBT
-legacy-port source, the PW_2/PW_A fuse-distribution waits, per-iteration
-source pattern/level updates during training, and PSR2/panel replay (worker
-D). Native fixtures cover these paths. They are not physical Type-C, sink or
+Remaining: UHBR (C20 MPLLA tables and 128b/132b), HDMI FRL, audio, the
+PW_2/PW_A fuse-distribution waits and panel replay. Later sections add the
+runtime caller and publication, multi-pipe repartition, HDMI TMDS, MST,
+DSC/FEC, lane reversal, TBT-alt tunnels, pin assignment D, VBT legacy ports
+and PSR2. Native fixtures cover these paths. They are not physical Type-C, sink or
 visible-pixel acceptance.
 
 New native tests: `drivers/gpu/intel_gpu_xelpg` (4),
@@ -5190,12 +5164,12 @@ Follow-up in the same slice:
   clocks, clocks without a source table (the SNPS C10 and computed C20
   algorithms are not implemented; the latter needs the MTL-U/ARL-S
   `tx_misc` fact), Type-C DP-alt, and Type-C DDC (pins 9-12 are not
-  representable by the shared Gen12 pin-pair encoder). HDMI is not yet
-  selected by the hotplug service, which still activates DP only.
-- Thunderbolt-alt stays refused. The display side (TBT clock request, TBT
-  DDI clock select, AUX TBT_IO, IO_SELECT_TBT) does not by itself carry a
-  stream: the DP tunnel through the USB4/Thunderbolt router is established
-  by a connection manager this tree does not have.
+  representable by the shared Gen12 pin-pair encoder). The hotplug
+  service selects HDMI ("MTL external outputs: HDMI selection" below).
+- Thunderbolt-alt: the display side (TBT clock request, TBT DDI clock
+  select, AUX TBT_IO, IO_SELECT_TBT) does not by itself carry a stream. It
+  consumes a DP-IN tunnel that the USB4 connection manager or firmware has
+  provisioned ("USB-C display transports").
 
 New native tests: `drivers/gpu/intel_gpu`
 (`smoke_mtl_external_hook_pass_allocates_publishes_and_withdraws`) and
@@ -5274,12 +5248,9 @@ are Linux b90c984d `intel_ddi.c` (`intel_ddi_init`, `intel_ddi_enable_hdmi`,
   594 MHz. Linux only logs an SCDC failure; here a stream that needs
   scrambling fails activation and is stopped locally. FRL stays refused.
 
-Remaining: a VBT parser (port facts, DDC pin overrides, dual-mode and
-`max_tmds_clock` caps), E-DDC segments 1+ (the per-call GMBUS transport
-cannot hold the segment pointer across a repeated START), HDMI FRL,
-computed C10/C20 HDMI PLL states, audio, deep colour and YCbCr, and the
-DC-state join. The Gen12 HDMI session still uses its older DDC engine and
-SCDC sequence, so only its pin numbering changed. Native fixtures cover
+Remaining: HDMI FRL, audio, deep colour and YCbCr 4:4:4. The VBT parser,
+E-DDC, the computed C10/C20 HDMI PLL states, YCbCr 4:2:0 and the DC-state
+join are later sections. Native fixtures cover
 these paths. They are not physical sink or visible-pixel acceptance.
 
 New native tests: `drivers/gpu/intel_gpu_xelpg_external` (5),
@@ -5348,8 +5319,9 @@ the DDI. With no VBT, Meteor Lake keeps `NO_VBT` (`init_vbt_missing_defaults`)
 and Gen12 keeps `gen12_ddc_pin`. The eDP, PSR and backlight panel facts are
 exposed (`edp_panel`, `psr_panel`, `backlight_panel`, `panel_type`) for the
 panel and PSR owners; the eDP HOBL / low-vswing bits are consumed by the
-Gen12 combo-PHY table selection (`VbtEdpSignal`, installed at probe), while
-the remaining panel facts are not yet consumed.
+Gen12 combo-PHY table selection (`VbtEdpSignal`, installed at probe), the
+PSR facts by the display-14 PSR gate and `edp.bpp` by the 6 bpc pipe limit
+(both below).
 
 Gen12 DDC corrections. The Gen12 HDMI session now runs on `GmbusBus`, whose
 new `xfer` is `do_gmbus_xfer`. Each message ends in the wait phase so the next
@@ -5366,9 +5338,9 @@ blocks 2 and 3. The MTL HDMI route now reads those blocks too. SCDC follows
 Gen12 records the scrambler status after the stream runs and resets SCDC on
 disconnect; MTL uses the same helper.
 
-Remaining: VBT consumers for the panel (PPS, eDP link, PSR, backlight) and for
-the VBT `max_tmds_clock`, DP rate and lane caps; driving a VBT AUX remap, lane
-reversal or a dedicated-external Type-C port; PnP-ID and OpRegion (SWSCI)
+Remaining: VBT consumers for the panel (PPS, eDP link, backlight) and for
+the VBT `max_tmds_clock`, DP rate and lane caps; driving a VBT AUX remap or a
+dedicated-external Type-C port; PnP-ID and OpRegion (SWSCI)
 panel-type selection; the PCI option ROM mapping; Gen12 port existence from
 the VBT; Gen12 SCDC for scrambling-capable sinks at or below 340 MHz, as Linux
 writes them; and GMBUS burst reads above 511 bytes. Native fixtures cover all
@@ -5446,12 +5418,12 @@ discipline as FBC.
   PSR is therefore wired but inert on hardware today.
 - **Probe:** Gen12 probe-time PSR no longer runs on display 14; it would
   have programmed the TGL `PSR2_CTL` layout.
-- **Remaining:** PSR2 selective fetch, early transport and cursor SU; Panel
-  Replay stays refused. DIRTYFB clips are discarded today, so PSR2 would
-  need the clip plumbing first.
+- **Remaining:** early transport; Panel Replay stays refused. PSR2
+  selective update and the damage clips that drive it are "Display-14 PSR2
+  selective update and frame damage" below.
 
-Twelve native fixtures are registered under `drivers/gpu/intel_gpu_psr` and
-were not executed in this slice. Six are register/sink models:
+Twelve native fixtures are registered under `drivers/gpu/intel_gpu_psr`.
+Six are register/sink models:
 `smoke_psr_sink_caps_decode_and_refusals`,
 `smoke_psr_qualify_follows_compute_config`,
 `smoke_psr_enable_conversation_is_linux_ordered`,
@@ -5678,15 +5650,11 @@ no longer looks like "not stopped" to Gen12 relight, device PM or the DC
 gates. `external_route_blocks_dc()` still reads the service itself: a busy
 service, or a live or quarantined route, keeps DC5/DC6 refused.
 
-Remaining: KMS flips and the cursor on Pipe A refuse while an external is
-lit, because their fixed profile is the single-pipe layout. An active FBC or
-DSB on the panel refuses the external route (`Pipe(Busy)`). The external is
-refused next to an inherited, non-owned panel layout. PSR on the panel is not
-coordinated with the live repartition. Releasing the last pipe with no panel
-leaves CDCLK and PM demand raised until the next commit. Only one external
-route runs at a time. Linetime watermarks, pipe chicken and frame-start delay
-are not programmed for Pipes B–D. Production pipe-DMC calls are covered by
-the DC service's own smokes and are inert without that service.
+Remaining: the external is refused next to an inherited, non-owned panel
+layout, and only one external route runs at a time. The panel's KMS, cursor,
+FBC/DSB and PSR beside a lit external are "The panel's KMS services beside a
+lit external" below. Production pipe-DMC calls are covered by the DC
+service's own smokes and are inert without that service.
 
 Fixtures and tests: `ExtFake` now models TRANSCONF, frame counter and LIVE
 surface for every pipe, the PM demand and DBUF acknowledgements, the CDCLK
@@ -5986,7 +5954,7 @@ panel flip is unlatched, until the owner's next call completes it. The MBUS
 join is left as it was after the last release; the next all-off commit
 rewrites it. Physical Intel acceptance is open.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 
 - `drivers/gpu/intel_gpu_xelpg_external`:
   `smoke_mtl_panel_profile_proves_its_share_beside_external`.
@@ -6250,15 +6218,13 @@ hardware ignores it there. The Pipe A modeset and the Pipes B–D owner now
 do the same. The display-14 DSB timing proof compares only the end field;
 the Gen12 proof is unchanged.
 
-Remaining: 6 bpc output, the joiner, more than four slices, YCbCr DSC and
-fractional-bpp limits beyond the sink's increment, UHBR DSC, MST DSC,
-`DP_LINK_RATE_SET` training for eDP panels that publish a rate table,
-the VBT's `edp.bpp` clamp, the DSC throughput quirk of branch devices
-(branches refuse), and the panel fitter's wiring. The Gen12 orchestrator
-still writes the display-12 `TRANS_VBLANK` value on display-13 ADL.
-Physical Intel acceptance is open.
+Remaining: the joiner, more than four slices, YCbCr DSC and fractional-bpp
+limits beyond the sink's increment, UHBR DSC, MST DSC and the DSC throughput
+quirk of branch devices (branches refuse). 6 bpc output, `DP_LINK_RATE_SET`
+training, the VBT's `edp.bpp` clamp and display 13's `TRANS_VBLANK` are the
+next section. Physical Intel acceptance is open.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 
 - `drivers/gpu/drm_dsc`: `smoke_drm_dsc_rc_buf_thresh_and_pps_sdp_header`.
 - `drivers/gpu/intel_gpu_xelpg_dsc`:
@@ -6426,17 +6392,13 @@ provider, and the PCI layer stops at D3hot. The VRAM threshold (300 MiB,
 rounded up per MiB) is implemented and tested, but no production function
 reaches it.
 
-**What remains.** No producer turns the internal panel off. Atomic
-`ACTIVE=0` and `SETCRTC` without a framebuffer restore the console by
-design. `FBIOBLANK` is a no-op in `fb/`, and there is no connector DPMS
-property. A panel-off transition is a full crtc disable: PSR, backlight,
-transcoder, DDI, PHY, PPS, pipe DMC, then the PM demand, DBUF and CDCLK
-lowering. That belongs to the display-14 and Gen12 modeset owners. Once a
-producer reports the pipe dark, the hooks above park the function. A Gen12
-producer must first give its display conversations wakerefs, and must park
-the PWM backlight. VRAM revocation, D3cold with eviction and the full
-restore path, additional flush consumers and media-GT power management
-remain open. Linux's DMI quirk for BMG on NUC13RNG is not modelled, since
+**What remains.** The display-14 panel-off producer is "Display-14 panel
+off and on" below (atomic `ACTIVE=0`, `SETCRTC` off, `FBIOBLANK`); there is
+no connector DPMS property. Once a producer reports the pipe dark, the hooks
+above park the function. A Gen12 producer must first give its display
+conversations wakerefs, and must park the PWM backlight. D3cold with
+eviction and the full restore path, and additional flush consumers, remain
+open. Linux's DMI quirk for BMG on NUC13RNG is not modelled, since
 D3cold is never capable here.
 
 Native fixtures:
@@ -6519,14 +6481,14 @@ the 4 MiB GSC private object and the CSME end of the GSC proxy. It covers:
 - XE_FW_GSC around each run, the SW_PROXY and GSC_ER_COMPLETE actions, and
   the ER timer check that declares the GSC wedged.
 
-NARF has no MEI client, so the worker behaves as Linux built without
+Without a bound CSME component the worker behaves as Linux built without
 CONFIG_INTEL_MEI_GSC_PROXY. xe_gsc_proxy_init's ENODEV is tolerated, the
 firmware loads and authenticates the HuC, and then xe_gsc_proxy_start fails
 with ENODEV after enabling and disabling the proxy interrupt. gsc_work
 records LOAD_FAIL, an error state in which no later GT reset or resume
-reloads the GSC. With a CSME component (a native model only), the proxy
-reaches PROXY_STATE_NORMAL, the GSC is RUNNING, and a GSC lost across resume
-is reloaded in full.
+reloads the GSC. With the component (the MEI GSC proxy client below), the
+proxy reaches PROXY_STATE_NORMAL, the GSC is RUNNING, and a GSC lost across
+resume is reloaded in full.
 
 NARF deviations, all fail-closed: lost MMIO (all ones) is never a set bit; an
 unacknowledged GSC wake ends the run (Linux proceeds without it); a GSCCS job
@@ -6534,21 +6496,8 @@ that never retires blocks later submissions (Linux queues behind it); a
 missing or malformed image or an unavailable private object leaves the GSC
 unavailable where Linux fails the MTL probe.
 
-The worker is not wired into the runtime. Three pieces are missing:
-- GSCCS0 is not a scheduled engine of the media GuC. That needs its
-  xe_hw_engine entry (class OTHER, GuC GSC_OTHER class, instance 6, base
-  0x11a000, XE_FW_GSC wake), its reg_sr (RING_CMD_CCTL and the MTL GSCCS
-  IDLE MSG pair) in the ADS saves, its golden LRC, GUNIT_GSC_INTR_ENABLE/MASK
-  and the 600 ms preemption floor, plus a kernel queue for GGTT jobs.
-- There is no device-lifetime GSC private object. Linux places it in stolen
-  memory (XE_BO_FLAG_STOLEN) because the GSC may touch it after the kernel has
-  suspended the device. The GSC keeps using that memory until an FLR, so its
-  DSM range and its GGTT DM mapping must never be released or reused by a
-  later GT0 incarnation. NARF's DSM placer serves display FBC only, and NARF
-  writes no DM PTE today.
-- There is no MEI GSC proxy component (below).
-Until all three exist, NARF hands no memory to the GSC and submits nothing to
-GSCCS.
+The runtime supplies all three: GSCCS0, the stolen private object and the
+CSME component ("MTL GSC in production" below).
 
 Without `narf.intel.pxp=1` PXP stays refused with Linux's errnos. Linux
 supports PXP only with CONFIG_INTEL_MEI_GSC_PROXY (xe_pxp_is_supported);
@@ -6568,17 +6517,15 @@ narf.intel.pxp=1" below):
   body, so EFAULT and EINVAL keep Linux's order.
 - VM_BIND already accepted DRM_XE_VM_BIND_FLAG_CHECK_PXP; with no protected
   object it has no effect, as in Linux.
-More than 16 GEM_CREATE extensions is Linux's E2BIG, which `FsError` cannot
-carry, so it is EINVAL. Before this change PXP_TYPE was ENOSYS, the PXP query
-EINVAL and every GEM_CREATE extension EINVAL. The low-latency queue fixture
-stops asserting ENOSYS for PXP_TYPE NONE, which Linux accepts; the new PXP
-fixture pins every PXP_TYPE errno.
+More than 16 GEM_CREATE extensions is Linux's E2BIG
+(`FsError::ArgumentListTooLong`).
 
 The GSC proxy cannot be completed over GSCCS alone: the GSC asks the driver to
 relay its messages to CSME and back. PXP needs that relay (xe_gsc_proxy_init_done
-gates xe_pxp's readiness), so protected queues stay unadvertised. The missing
-interface is the MEI GSC proxy client (Linux
-drivers/misc/mei/gsc_proxy/mei_gsc_proxy.c, `i915_gsc_proxy_component_ops`):
+gates xe_pxp's readiness). The relay is the MEI GSC proxy client
+(`drivers/platform/src/mei_gsc_proxy.rs` over `mei.rs`'s client message
+layer, after Linux drivers/misc/mei/gsc_proxy/mei_gsc_proxy.c and
+`i915_gsc_proxy_component_ops`):
 - Bind the CSME HECI1 PCI function (MTL-M 0x7E70, ARL-S 0x7F68, ARL-H 0x7770,
   MEI_ME_PCH15_CFG) to the integrated display device on bus 0.
 - Find the firmware client with UUID f73db04-97ab-4125-b893-e904ad0d5464 by
@@ -6586,10 +6533,8 @@ drivers/misc/mei/gsc_proxy/mei_gsc_proxy.c, `i915_gsc_proxy_component_ops`):
   control (mei_cldev_enable).
 - Provide a blocking `send(buf, len)` (mei_cldev_send) and a
   `recv(buf, 32 KiB)` (mei_cldev_recv) that return bytes or a negative errno.
-That client now exists (`drivers/platform/src/mei_gsc_proxy.rs` over
-`mei.rs`'s client message layer) and registers with `narf_drivers::gsc_proxy`,
-which the worker's `CsmeProxy` binds; PXP above it runs only with
-`narf.intel.pxp=1`.
+It registers with `narf_drivers::gsc_proxy`, which the worker's `CsmeProxy`
+binds; PXP above it runs only with `narf.intel.pxp=1`.
 
 Threat assumptions. Without `narf.intel.pxp=1`, NARF writes no KCR register,
 starts no session, creates no protected object or queue and offers no key to
@@ -6600,8 +6545,7 @@ GSC-owned until an FLR. The proxy relays opaque GSC/CSME messages and checks
 only their headers and sizes. HuC authentication through the GSC exercises
 the PXP firmware client but starts no PXP session.
 
-Fixtures (`drivers/gpu/intel_gpu_media_gt`), all new and unexecuted in this
-slice:
+Fixtures (`drivers/gpu/intel_gpu_media_gt`):
 - `smoke_media_gt_gsc_wa_14015076503_brackets_stop_and_admits_scheduling` and
   `smoke_media_gt_gsc_without_option_retains_and_failed_reset_clears` (the
   media GuC model).
@@ -6615,22 +6559,11 @@ slice:
 - `smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos` (native Xe on the
   MTL GuC model).
 
-The existing refusal fixture still pins the option-off sequence, and
-`smoke_xe_low_latency_raw_config_flags_refusals_and_copyout_rollback` no
-longer lists PXP_TYPE among its ENOSYS properties. None of this is physical
-Intel evidence.
+None of this is physical Intel evidence.
 
-Integration (onto the rebased branch): the code conflicted with the
-media-GT power unit in `GuCGt` and in the GuC model's test-module list. The
-fields and modules are independent, so the GSC reset-workaround fields sit
-beside `media_power`, and `media_gt_gsc` sits beside `media_gt_power`. In the
-combined stop, `media_power_down` (`xe_uc_gucrc_disable`) comes first, then
-the GuC stop, then the Wa_14015076503-bracketed GRDOM_FULL, which is Linux's
-`gt_reset_worker` order. The Media GT ledger row keeps both units' text.
-One targeted release run passed 188 tests with no failures. It covered, under
-`drivers/gpu/`: `intel_gpu_media_gt` 48, `intel_gpu_media` 10,
-`intel_gpu_user` 49, `intel_gpu_xe` 6, `intel_gpu_bcs8` 5, `intel_gpu_guc_gt`
-39, `intel_gpu_gt` 17, `intel_gpu_gt_recovery` 6 and `intel_gpu_huc` 8.
+In the combined stop, `media_power_down` (`xe_uc_gucrc_disable`) comes first,
+then the GuC stop, then the Wa_14015076503-bracketed GRDOM_FULL, which is
+Linux's `gt_reset_worker` order.
 
 Review against Linux b90c984d agreed on the following:
 - `query_pxp_status`: size 0 negotiates 8; any other size is EINVAL; the exact
@@ -6647,12 +6580,6 @@ Review against Linux b90c984d agreed on the following:
 - Media scheduling beside loaded GSC firmware is admitted only with
   `narf.intel.gsc=1`.
 
-The E2BIG gap (more than `MAX_USER_EXTENSIONS` GEM extensions returning
-EINVAL instead of E2BIG) is closed by the follow-up E2BIG unit, which adds
-`FsError::ArgumentListTooLong`.
-`intel_gpu_gsc::load` carries a temporary module-level dead-code allowance
-outside kernel-test builds until a platform owner supplies its GSCCS queue,
-stolen object and CSME component.
 
 ### MTL GSC in production: GSCCS0, the stolen private object and the worker
 
@@ -6713,8 +6640,8 @@ Linux without CONFIG_INTEL_MEI_GSC_PROXY:
 - proxy start fails with ENODEV and the GSC is LOAD_FAIL, which no GT reset
   or resume reloads.
 `intel_gpu_gt::register_csme_proxy` / `unregister_csme_proxy` expose the
-`CsmeProxy` send/recv hook for the MEI client being built in
-drivers/platform.
+`CsmeProxy` send/recv hook; `sync_csme_proxy` binds the MEI GSC proxy client
+(drivers/platform) through `narf_drivers::gsc_proxy` when it registers.
 
 Fixtures, all under `drivers/gpu/intel_gpu_media_gt`:
 - `smoke_media_gt_gsccs_identity_policy_and_reserved_exclusion` and
@@ -6736,32 +6663,12 @@ These fixtures are native models only: none has been run on physical Intel
 hardware. Still open are GSC ER-timeout recovery beyond wedging and silicon
 acceptance; PXP above the GSC is the next section.
 
-Integration: S2 was written before the media-GT power unit and was never run
-before integration. Its targeted run found two production bugs and one
-fixture defect, each fixed in its own commit:
-- Registering the kernel GSCCS0 context took the UAPI logical mask, which
-  refuses reserved engines, so the first GSC job panicked the kernel.
-  REGISTER_CONTEXT now uses `EngineSet::registration_mask`, which maps a
-  kernel-only engine to `BIT(logical_instance)`, as
-  `xe_gsc_init_post_hwconfig` creates the kernel GSC queue. UAPI admission
-  keeps the filtering mask.
-- `route_gsc` probed both mask registers for lost MMIO, but all-ones is
-  their valid `gt_irq_reset` value, so every re-route after a GT reset
-  failed. Access is now proved on the enable register only.
-- The GSC owner fixtures restarted the media GuC with start time 0 while
-  polling it from the last incarnation's end, which tripped the 50 ms wake
-  deadline. The shared model also kept the last incarnation's executed
-  contexts at the GGTT bases the arena reuses. `start_media_at`,
-  `media_huc::start_at` and `Hw::new_incarnation` fix both; no assertion
-  changed.
-Two more fixes were Clippy only: a block scope instead of `drop` on a
-non-Drop queue, and the stolen claim snapshot type alias. Both intermediate
-code commits compile on their own. One targeted release run passed 198
-tests with no failures. It covered these prefixes, all under `drivers/gpu/`:
-`intel_gpu_media_gt`, `intel_gpu_stolen`, `intel_gpu_fbc`, `intel_gpu_gt_irq`,
-`intel_gpu_engine`, `intel_gpu_rcs`, `intel_gpu_gtt`, `intel_gpu_ggtt_tlb`,
-`intel_gpu_guc_gt`, `intel_gpu_gen12`, `intel_gpu_multi_ccs` and
-`intel_gpu_huc`.
+REGISTER_CONTEXT for the kernel GSCCS0 context uses
+`EngineSet::registration_mask`, which maps a kernel-only engine to
+`BIT(logical_instance)`, as `xe_gsc_init_post_hwconfig` creates the kernel GSC
+queue; UAPI admission keeps the filtering mask. `route_gsc` proves access on
+the enable register only, since all-ones is the mask registers' valid
+`gt_irq_reset` value.
 
 Review against Linux b90c984d agreed on the following:
 - GSCCS0 is at `GSCCS_RING_BASE` 0x11a000, GuC class 5
@@ -6770,16 +6677,10 @@ Review against Linux b90c984d agreed on the following:
 - `MTL GSCCS IDLE MSG enable` applies to MEDIA_VERSION(1300) class OTHER.
 - Class OTHER is reserved (`xe_hw_engine_is_reserved`).
 
-Open item, not caused by this unit: `GuCGt::poll_inner` checked the wake
-deadline before the acknowledgement, so a late poll with the ack already
-present timed out. Linux's wait checks the condition once more after the
-timeout. The condition-before-deadline unit closes it.
-
 Known stall: copying the 4 MiB GSC image into stolen memory is about 1M
 uncached BAR2 writes in one GT-worker poll. It happens once at load, off
 any present path. With `media_gt=1` and `gsc=0`, the 0/~0 GSC interrupt pair
-is not written, per the options-off rule. The MEI↔GSC proxy join waits for
-the MEI unit.
+is not written, per the options-off rule.
 
 ### MTL/Arrow PXP behind narf.intel.pxp=1
 
@@ -6914,7 +6815,7 @@ Threat assumptions with the option:
   CHECK_PXP stay allowed, as in Linux.
 - The CSME proxy relays opaque GSC/CSME messages, as before.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 - `drivers/gpu/intel_gpu_pxp` (a GSC firmware and KCR model):
   `smoke_pxp_option_grammar_and_linux_formats`,
   `smoke_pxp_arb_session_start_sends_the_linux_init_session_packet`,
@@ -7045,7 +6946,7 @@ NARF bounds and differences from the source:
   directory and no `observation_paranoid` sysctl.
 - Media-GT OAM, OAM_SAG and MERT units, PTL and Gen12 are not published.
 
-Fixtures, all new and unexecuted in this slice, are in
+Fixtures are in
 `drivers/gpu/intel_gpu_oa`:
 
 - `smoke_oa_query_units_formats_and_timestamp`
@@ -7255,7 +7156,7 @@ unchanged apart from the version.
 **i915 perf.** PERF_OPEN, PERF_ADD_CONFIG, PERF_REMOVE_CONFIG, query item 3 and
 GETPARAM 54/57 remain as recorded in the previous subsection.
 
-New fixtures, all unexecuted in this slice:
+Fixtures:
 
 - `smoke_guc_capture_ads_lists_follow_prep_lists_per_family`
 - `smoke_guc_capture_extracts_groups_matches_and_acknowledges`
@@ -7344,7 +7245,7 @@ facts. GETPARAM 54 (PERF_REVISION) stays 0 while PERF_OPEN is absent.
   kernel-command submission yet.
 - DRM_I915_PERF_OPEN, ADD_CONFIG, REMOVE_CONFIG and query item 3.
 
-Fixtures, all unexecuted in this slice:
+Fixtures:
 
 - `smoke_abi_private_pfn_mmap_readonly_dontcopy_dontexpand` (new,
   `syscall_abi`). It drives `sys_mmap`, `mprotect`, `mremap`, fork
@@ -7442,7 +7343,7 @@ reference, and every conversation runs inside the session's.
 joiner or the splitter; early transport and DC3CO (display 20+, or disabled
 in Linux); and hardware validation of the frame-change wake on display 14.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 
 - `drivers/gpu/drm/fb_legacy`: `dirtyfb_checks_follow_drm_mode_dirtyfb_ioctl_order`,
   `dirtyfb_damage_follows_drm_atomic_helper_dirtyfb` and
@@ -7538,14 +7439,8 @@ timing proof compared the whole register, so the DSB owner now takes a
 display-13 flag from the KMS family and proves only VBLANK_END there; TGL
 keeps the full proof.
 
-Remaining: the panel fitter's wiring. That needs a separate pipe source
-size in the Pipe A modeset (`PIPE_SRCSZ` and the primary from the source,
-the transcoder from the panel's native timing), a source size and the
-scaler's prefill lines in `PipeRequest`, `skl_pfit_enable` and
-`skl_scaler_disable` in the modeset and its teardown, and every KMS
-owner that sizes the primary from the transcoder timing (the profile
-capture, the retained primary, the cursor, PSR, FBC and the DSB arms)
-reading `PIPE_SRCSZ` instead. Also open: Gen12 eDP rate-table panels still
+Remaining: a production caller of the panel fitter, which
+`XeLpgModeset::with_panel_fit` plumbs through the modeset. Also open: Gen12 eDP rate-table panels still
 train with `DP_LINK_BW_SET`; the VBT 263+ `edp_data_rate_override` and the
 `QUIRK_EDP_LIMIT_RATE_HBR2` platform quirk do not filter the sink rates; a
 VBT that picks its panel by PnP ID gives no `edp.bpp` clamp; branch
@@ -7556,7 +7451,7 @@ keeps requiring an 8 bpc route; the EDID bpc is known only after the
 modeset has read the panel's EDID once; ADL's `TRANS_SET_CONTEXT_LATENCY`
 is not written. Physical Intel acceptance is open.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 
 - `drivers/gpu/intel_gpu_xelpg_dsc`:
   `smoke_xelpg_dsc_edid_bpc_follows_update_display_info`,
@@ -7674,7 +7569,7 @@ and its PWM backlight a park. The 8 bpc legacy eDP sequence keeps its
 existing order (D2D and levels before TPS1). Gen12 eDP `DP_LINK_RATE_SET`
 training is not added. None of this is physical Intel evidence.
 
-Native fixtures, new and unexecuted in this slice:
+Native fixtures:
 
 - `drivers/gpu/intel_gpu_modeset_xelpg`:
   `smoke_mtl_panel_off_follows_hsw_crtc_disable_order`,
@@ -7729,7 +7624,7 @@ DRM flips (no GT owner, no Xe2 scanout PAT policy), no DMC load or
 DC5/DC6, no PSR or FBC, no backlight PWM or VBT, and no external outputs.
 None of this has run on silicon.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 
 - `drivers/gpu/intel_gpu_xe2lpd`:
   `smoke_xe2lpd_gmd_decode_and_typed_refusals`,
@@ -7794,7 +7689,7 @@ the lit panel and publish render/compute to userspace, move the console to
 the owned surface, flip linear WC framebuffers on Pipe A, and enter DC6
 when idle if `xe2lpd_dmc.bin` is present. None of this has run on silicon.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 
 - `drivers/gpu/intel_gpu_xe2lpd_gt`:
   `smoke_xe2lpd_gt_display_admission_reads_display_only_and_never_flrs`,
@@ -7855,7 +7750,7 @@ create scanout objects with the Xe flag, draw a hardware cursor, apply CTM
 and gamma/degamma LUTs (through the DSB when active), and flip X/Tile4
 framebuffers through the owned DPT. None of this has run on silicon.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 
 - `drivers/gpu/intel_gpu_xe2lpd_kms`:
   `smoke_xe2lpd_kms_cursor_and_dsb_pages_map_xe2_pat3`,
@@ -7928,7 +7823,7 @@ LINUX-GAP: only requests on the same hardware context raise a job. Linux's
 priority inheritance through object and fence dependencies on other
 contexts' requests is not modelled.
 
-New fixtures, all unexecuted in this slice:
+Fixtures:
 
 - `smoke_i915_priority_maps_to_guc_client_bands`
 - `smoke_userspace_priority_update_follows_guc_context_set_prio`
@@ -8006,7 +7901,7 @@ below.
 runtime resume) was not part of this slice. It landed later; see "VRAM CPU
 mappings across runtime suspend" below.
 
-Fixtures, all new and unexecuted in this slice:
+Fixtures:
 
 - `memory`: `smoke_mmu_notifier_registration_range_filter_and_removal`,
   `smoke_mmu_notifier_sorted_scan_and_per_space_cap`,
@@ -8053,7 +7948,7 @@ deciding under the region lock that pins are taken under:
   and each owner's repoint rechecks the pin before it moves.
 
 The paths are x86_64-only (aarch64 has no swap PTEs, and its `MADV_FREE` is
-eager). Fixtures, new and unexecuted in this slice:
+eager). Fixtures:
 `memory::smoke_dma_pin_swap_out_skips_pinned_page`,
 `smoke_dma_pin_swap_commit_refuses_racing_pin` (a kernel-test seam lands the
 pin between commit and publication),
@@ -8104,7 +7999,7 @@ new VRAM mapping made while suspended starts unmapped and faults on first
 touch. The synchronous i915 ioctl entry cannot resume the function, so a
 VRAM PREAD/PWRITE through it is `EBUSY` while suspended.
 
-Fixtures, new and unexecuted in this slice:
+Fixtures:
 
 - `memory`: `smoke_device_revoke_removes_leaves_and_masks_installers` and
   `smoke_device_refault_waits_then_reinstalls_same_frame` (x86_64 and
