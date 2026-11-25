@@ -36,7 +36,9 @@
 //! - Pin D retains a two-lane main-link ceiling and lends only PHY lane 0
 //!   to display; PLL/TX/stop callers retain that ownership shape.
 //! - Live TBT HPD admits a fabric-owned route without taking the PHY or
-//!   requesting TCSS power. Missing live HPD returns TunnelUnavailable.
+//!   requesting TCSS power; display >= 20 powers `PICA_PW_CTL` for its
+//!   AUX_TBT and DDI-lane domains. Missing live HPD returns
+//!   TunnelUnavailable.
 //! - The TC-cold block itself (`POWER_DOMAIN_TC_COLD_OFF`) maps to no
 //!   Xe-LPDP power well; the TCSS power request below is the hardware
 //!   side of the block.
@@ -634,10 +636,17 @@ fn connect_mode<M: MmioWindow + ?Sized>(
 ) -> Result<TcConnection, TcError> {
     match mode {
         TcMode::TbtAlt => {
-            // The live PICA bit proves the fabric's DP-IN route; its AUX
-            // path and PLL belong to USB4, never to the display PHY owner.
+            // The live PICA bit proves the fabric's DP-IN route; its PHY
+            // and PLL belong to USB4, never to the display PHY owner
+            // (`xelpdp_tc_phy_connect` takes no TCSS power or ownership).
             if live_status_mask(io, tc, legacy_port)? & TcMode::TbtAlt.bit() == 0 {
                 return Err(TcError::TunnelUnavailable);
+            }
+            // Display >= 20 still powers PICA_TC: `xe2lpd_pwdoms_pica_tc`
+            // carries AUX_TBT1-4 and the TC DDI lanes, the domains the
+            // tunnel's AUX (`intel_aux_power_domain`) and main link take.
+            if profile.uses_pica() {
+                crate::intel_gpu_xe2lpd::pica_enable(io).map_err(|_| TcError::TcssPowerTimeout)?;
             }
             return Ok(TcConnection {
                 port,
@@ -741,14 +750,17 @@ pub fn connect_for<M: MmioWindow + ?Sized>(
 
 /// `xelpdp_tc_phy_disconnect` for a display-owned connection: release PHY
 /// ownership, then drop the TCSS power request and wait for it to settle.
-/// Display >= 20 profiles also drop `PICA_PW_CTL`.
+/// Display >= 20 profiles also drop `PICA_PW_CTL`, which a TBT-alt
+/// connection (no PHY ownership, no TCSS request) holds alone.
 pub fn disconnect<M: MmioWindow + ?Sized>(io: &M, conn: &TcConnection) -> Result<(), TcError> {
     if conn.mode == TcMode::TbtAlt {
-        return if io.display_access_ok() {
-            Ok(())
-        } else {
-            Err(TcError::AccessLost)
-        };
+        if !io.display_access_ok() {
+            return Err(TcError::AccessLost);
+        }
+        if conn.profile.uses_pica() {
+            crate::intel_gpu_xe2lpd::pica_disable(io).map_err(|_| TcError::TcssPowerTimeout)?;
+        }
+        return Ok(());
     }
     take_ownership(io, conn.port, false)?;
     enable_tcss_power(io, conn.port, conn.tc, false, conn.mode, conn.profile)?;
