@@ -2925,7 +2925,12 @@ fn module_cfg_offset_ok(offset: u16) -> bool {
 /// Write config dword `offset` of a module-owned PCI function: inside
 /// 0x40..0x100, dword-aligned, and outside every kernel-owned capability
 /// structure (`-EPERM` otherwise).
-pub fn module_pci_config_write32(owner: u64, token: u64, offset: u16, value: u32) -> Result<(), i32> {
+pub fn module_pci_config_write32(
+    owner: u64,
+    token: u64,
+    offset: u16,
+    value: u32,
+) -> Result<(), i32> {
     if !module_cfg_offset_ok(offset) {
         return Err(-22);
     }
@@ -2941,7 +2946,6 @@ pub fn module_pci_config_write32(owner: u64, token: u64, offset: u16, value: u32
         _ => Err(-5),
     }
 }
-
 
 #[cfg(feature = "kernel-test")]
 fn smoke_module_pci_cfg_window_validates() -> narf_kernel_test::TestResult {

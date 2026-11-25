@@ -2149,7 +2149,11 @@ fn smoke_kabi_softmac_exports() -> TestResult {
     let (sizing, sized, copied) = unsafe {
         let sizing = narf_wireless_regdomain(core::ptr::null_mut(), 0, &mut len);
         let sized = len;
-        (sizing, sized, narf_wireless_regdomain(record.as_mut_ptr(), record.len(), &mut len))
+        (
+            sizing,
+            sized,
+            narf_wireless_regdomain(record.as_mut_ptr(), record.len(), &mut len),
+        )
     };
     match saved {
         Some(saved) => db::set_domain(saved),
