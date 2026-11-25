@@ -1587,8 +1587,13 @@ fn install_profile(
         .and_then(crate::intel_gpu_legacy_gt::LegacyGt::for_platform)
         .is_some()
     {
-        let revision = narf_bus::pci::read_config32(&cap, &device, 0x08).map_or(0, |v| v as u8);
-        return crate::intel_gpu_legacy_owner::install(index, card, &device, revision, bar);
+        let config = |offset| narf_bus::pci::read_config32(&cap, &device, offset).ok();
+        let revision = config(0x08).map_or(0, |v| v as u8);
+        // INTEL_BSM and SNB_GMCH_CTRL: the DSM Gen9 LP's BIOS RC6 setup uses.
+        let dsm = config(0x5c)
+            .zip(config(0x50))
+            .and_then(|(bsm, gmch)| crate::intel_gpu_legacy_power::gen9_dsm(bsm, gmch));
+        return crate::intel_gpu_legacy_owner::install(index, card, &device, revision, dsm, bar);
     }
     // A graphics 9 or 11 part without an execlists profile never takes the
     // GuC start below, though it has a GuC blob: i915 submits through the

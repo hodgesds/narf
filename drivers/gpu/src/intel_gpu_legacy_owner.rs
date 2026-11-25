@@ -36,7 +36,8 @@ use crate::intel_gpu_legacy_gt::{
     MCR_SELECTOR,
 };
 use crate::intel_gpu_legacy_power::{
-    rc6_disable, rc6_enable, rc6_park, rc6_unpark, rps_enable, rps_request, Caps, Governor, Step,
+    rc6_disable, rc6_enable, rc6_park, rc6_supported, rc6_unpark, rps_enable, rps_request, Caps,
+    Governor, Step,
 };
 use crate::intel_gpu_rcs::{BarWindow, ContextId, RcsEngine, SharedArena, SubmitError};
 use crate::intel_gpu_user::{UserBackend, UserBatch, UserContext, UserJob, UserStatus};
@@ -652,6 +653,9 @@ pub(crate) struct Owner {
     revision: u8,
     /// PCI device ID (`WaRsDisableCoarsePowerGating`'s Skylake GT3/GT4).
     device: u16,
+    /// The data stolen memory from PCI config, which Gen9 LP's BIOS RC6
+    /// check places the RC6 context in.
+    dsm: Option<(u64, u64)>,
     bar: narf_bus::bar::MmioRegion,
     card: Arc<crate::drm_devfs_bridge::IntelGpuCard>,
     state: Mutex<Option<Runtime>>,
@@ -795,22 +799,35 @@ impl Owner {
         } else {
             log(self.index, "no RP_STATE_CAP; GPU frequency left to the PCU");
         }
-        let rc6 = rc6_enable(gt, self.device, |r, v| window.write32(r, v));
-        if let Some(ctl) = rc6 {
-            rc6_unpark(ctl, |r, v| window.write32(r, v));
-        }
-        // BCS0, VCS0 and VECS0: each its own execlists engine on the shared
-        // arena. An engine that does not come up is left out of the
-        // published set; RCS0 still runs.
+        // BCS0, VCS0 and VECS0, with their media wells held from here:
+        // intel_rc6_enable (and Gen9 LP's BIOS check) reach every engine's
+        // idle count under FORCEWAKE_ALL. A lane whose well is refused is
+        // left out.
         let mut media_fw = MediaForcewake::new();
-        let mut xcs = Vec::new();
-        for (which, spec) in xcs_engines(gt, |r| window.read32(r)) {
-            if let Some(domain) = media_domain(gt, which) {
-                if media_fw.acquire(&window, domain).is_err() {
+        let lanes: Vec<_> = xcs_engines(gt, |r| window.read32(r))
+            .into_iter()
+            .filter(|&(which, _)| match media_domain(gt, which) {
+                Some(domain) if media_fw.acquire(&window, domain).is_err() => {
                     log(self.index, "media forcewake refused; engine left out");
-                    continue;
+                    false
                 }
-            }
+                _ => true,
+            })
+            .collect();
+        let bases: Vec<u64> = core::iter::once(RCS)
+            .chain(lanes.iter().map(|(_, spec)| spec.base))
+            .collect();
+        let rc6 = rc6_supported(gt, self.dsm, |r| window.read32(r))
+            .then(|| rc6_enable(gt, self.device, &bases, |r, v| window.write32(r, v)));
+        match rc6 {
+            Some(ctl) => rc6_unpark(ctl, |r, v| window.write32(r, v)),
+            None => log(self.index, "RC6 and powersaving disabled by BIOS"),
+        }
+        // Each lane is its own execlists engine on the shared arena. An
+        // engine that does not come up is left out of the published set;
+        // RCS0 still runs.
+        let mut xcs = Vec::new();
+        for (which, spec) in lanes {
             resume_xcs(&window, gt, which, spec.base);
             let lane = RcsEngine::with_spec_for_generation(
                 spec,
@@ -1136,6 +1153,7 @@ pub(crate) fn install(
     card: Arc<crate::drm_devfs_bridge::IntelGpuCard>,
     device: &narf_bus::BusDevice,
     revision: u8,
+    dsm: Option<(u64, u64)>,
     bar: narf_bus::bar::MmioRegion,
 ) -> bool {
     let Some(platform) = GtPlatform::from_pci(device.id.vendor, device.id.device) else {
@@ -1155,6 +1173,7 @@ pub(crate) fn install(
         wa,
         revision,
         device: device.id.device,
+        dsm,
         bar,
         card,
         state: Mutex::new(None),

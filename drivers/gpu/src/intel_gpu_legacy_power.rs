@@ -48,9 +48,21 @@ const PMINTRMSK: u64 = 0xa168;
 const PG_ENABLE: u64 = 0xa210;
 /// `GUC_MAX_IDLE_COUNT`.
 const GUC_MAX_IDLE_COUNT: u64 = 0xc3e4;
-/// `RING_MAX_IDLE` for RCS0 and BCS0 (`base + 0x54`), the engines this
-/// owner keeps powered.
-const RING_MAX_IDLE: [u64; 2] = [0x2054, 0x22054];
+/// `RING_MAX_IDLE(base)` (`PWRCTX_MAXCNT`), with `IDLE_TIME_MASK`.
+const RING_MAX_IDLE: u64 = 0x54;
+const IDLE_TIME_MASK: u32 = 0xf_ffff;
+
+/// `RC6_LOCATION` (`RC6_CTX_IN_DRAM` bit 0) and `RC6_CTX_BASE`.
+const RC6_LOCATION: u64 = 0xd40;
+const RC6_CTX_BASE: u64 = 0xd48;
+/// `GEN6_STOLEN_RESERVED`: enable [0], base [31:20], Gen8 size [8:7].
+const STOLEN_RESERVED: u64 = 0x1082c0;
+/// `GEN8_PUSHBUS_CONTROL`, `_ENABLE`, `_SHIFT`; `GEN6_GFXPAUSE`;
+/// `GEN8_MISC_CTRL0`: BIOS power-management setup Gen9 LP RC6 relies on.
+const BIOS_PM_SETUP: [u64; 5] = [0xa248, 0xa250, 0xa25c, 0xa000, 0xa180];
+/// The render, video, copy and enhancement engines `bxt_check_bios_rc6_setup`
+/// reads the idle counts of.
+const LP_RC6_ENGINES: [u64; 4] = [0x2000, 0x12000, 0x22000, 0x1a000];
 
 /// `GEN6_RC_CTL_RC6_ENABLE`, `GEN6_RC_CTL_EI_MODE(1)`, `GEN6_RC_CTL_HW_ENABLE`.
 const RC_CTL_RC6_ENABLE: u32 = 1 << 18;
@@ -167,21 +179,84 @@ pub(crate) fn rps_enable(gt: LegacyGt, caps: Caps, clock_hz: u64, mut write: imp
     write(RP_CONTROL, turbo | 2 << 9 | 1 << 8 | 1 << 7 | 2 << 3 | 2);
 }
 
-/// `gen9_rc6_enable` / `gen11_rc6_enable`: the RC6 and power-gating timers.
-/// Returns `ctl_enable`, the `RC_CONTROL` value [`rc6_unpark`] restores:
-/// zero on Gen9, whose RC6 context-corruption workaround leaves only the
-/// software entry at park (`NEEDS_RC6_CTX_CORRUPTION_WA`), and hardware RC6
-/// on Gen11. `None` when RC6 is not supported (`rc6_supported` false): the
-/// owner then never parks into RC6 nor writes the RC6 controls. Gen9 LP is
-/// `None` until its BIOS setup check (`bxt_check_bios_rc6_setup`) exists.
+/// A Gen9 part's data stolen memory from PCI config (`gen3_stolen_base`,
+/// `gen9_stolen_size`): `INTEL_BSM` [31:20] and `SNB_GMCH_CTRL`'s GMS
+/// [15:8], 32 MiB steps below 0xf0 and 4 MiB steps from 4 MiB above.
+pub(crate) fn gen9_dsm(bsm: u32, gmch_ctrl: u32) -> Option<(u64, u64)> {
+    if bsm == u32::MAX || gmch_ctrl == u32::MAX {
+        return None;
+    }
+    let base = u64::from(bsm & 0xfff0_0000);
+    let gms = u64::from((gmch_ctrl >> 8) & 0xff);
+    let size = if gms < 0xf0 {
+        gms * (32 << 20)
+    } else {
+        (gms - 0xf0) * (4 << 20) + (4 << 20)
+    };
+    (base != 0 && size != 0).then_some((base, size))
+}
+
+/// `init_reserved_stolen` with `chv_get_stolen_reserved`, Gen9 LP's decode:
+/// the enable bit, the base and a 1, 2, 4 or 8 MiB size. Linux records no
+/// reserved range when it is disabled, based at zero or outside the DSM.
+fn lp_stolen_reserved(dsm: (u64, u64), reg: u32) -> Option<(u64, u64)> {
+    let base = u64::from(reg & 0xfff0_0000);
+    let size = 1u64 << (20 + ((reg >> 7) & 3));
+    if reg & 1 == 0 || base == 0 {
+        return None;
+    }
+    (base >= dsm.0 && base + size <= dsm.0 + dsm.1).then_some((base, size))
+}
+
+/// `rc6_supported`: every Gen9 big-core and Gen11 part; Gen9 LP only when
+/// `bxt_check_bios_rc6_setup` finds the BIOS's RC6 setup: the RC6 context in
+/// DRAM, a page of it inside the reserved stolen range of `dsm`, every
+/// engine's idle count above one, and the push-bus, GFX pause and GPM
+/// controls programmed. An unreadable register fails the check.
+pub(crate) fn rc6_supported(
+    gt: LegacyGt,
+    dsm: Option<(u64, u64)>,
+    mut read: impl FnMut(u64) -> u32,
+) -> bool {
+    if gt != LegacyGt::Gen9Lp {
+        return true;
+    }
+    let mut read = |reg| Some(read(reg)).filter(|&v| v != u32::MAX);
+    let Some(location) = read(RC6_LOCATION) else {
+        return false;
+    };
+    let reserved = dsm.and_then(|dsm| lp_stolen_reserved(dsm, read(STOLEN_RESERVED)?));
+    // The exact context size is unknown on BXT; Linux checks one page
+    // against the inclusive end of the reserved resource.
+    let context = read(RC6_CTX_BASE).map(|base| u64::from(base & 0xffff_fff0));
+    let in_reserved = match (reserved, context) {
+        (Some((start, size)), Some(base)) => base >= start && base + 4096 < start + size - 1,
+        _ => false,
+    };
+    location & 1 != 0
+        && in_reserved
+        && LP_RC6_ENGINES
+            .iter()
+            .all(|base| read(base + RING_MAX_IDLE).is_some_and(|v| v & IDLE_TIME_MASK > 1))
+        && BIOS_PM_SETUP
+            .iter()
+            .all(|&reg| read(reg).is_some_and(|v| v != 0))
+}
+
+/// `gen9_rc6_enable` / `gen11_rc6_enable`: the RC6 and power-gating timers,
+/// with every engine's idle count (`engines`, the mmio bases). Returns
+/// `ctl_enable`, the `RC_CONTROL` value [`rc6_unpark`] restores: zero on
+/// Gen9, big core and LP, whose RC6 context-corruption workaround leaves
+/// only the software entry at park (`NEEDS_RC6_CTX_CORRUPTION_WA`), and
+/// hardware RC6 on Gen11. Callers enable only where [`rc6_supported`].
 pub(crate) fn rc6_enable(
     gt: LegacyGt,
     device: u16,
+    engines: &[u64],
     mut write: impl FnMut(u64, u32),
-) -> Option<u32> {
+) -> u32 {
     match gt {
-        LegacyGt::Gen9Lp => None,
-        LegacyGt::Gen9 => {
+        LegacyGt::Gen9 | LegacyGt::Gen9Lp => {
             // WaRsDoubleRc6WrlWithCoarsePowerGating: Skylake doubles it.
             let skylake = crate::intel_gpu::DEVICE_TABLE
                 .iter()
@@ -192,8 +267,8 @@ pub(crate) fn rc6_enable(
             );
             write(RC_EVALUATION_INTERVAL, 125_000);
             write(RC_IDLE_HYSTERSIS, 25);
-            for ring in RING_MAX_IDLE {
-                write(ring, 10);
+            for base in engines {
+                write(base + RING_MAX_IDLE, 10);
             }
             write(GUC_MAX_IDLE_COUNT, 0xa);
             write(RC_SLEEP, 0);
@@ -203,15 +278,15 @@ pub(crate) fn rc6_enable(
             if !SKL_GT3_GT4.contains(&device) {
                 write(PG_ENABLE, 0x3); // RENDER_PG | MEDIA_PG
             }
-            Some(0)
+            0
         }
         LegacyGt::Gen11 => {
             write(RC6_WAKE_RATE_LIMIT, 54 << 16 | 85);
             write(MEDIA_WAKE_RATE_LIMIT, 150);
             write(RC_EVALUATION_INTERVAL, 125_000);
             write(RC_IDLE_HYSTERSIS, 25);
-            for ring in RING_MAX_IDLE {
-                write(ring, 10);
+            for base in engines {
+                write(base + RING_MAX_IDLE, 10);
             }
             write(GUC_MAX_IDLE_COUNT, 0xa);
             write(RC_SLEEP, 0);
@@ -219,7 +294,7 @@ pub(crate) fn rc6_enable(
             write(MEDIA_PG_IDLE_HYSTERESIS, 60);
             write(RENDER_PG_IDLE_HYSTERESIS, 60);
             write(PG_ENABLE, 0x7); // RENDER_PG | MEDIA_PG | MEDIA_SAMPLER_PG
-            Some(RC_CTL_HW_RC6)
+            RC_CTL_HW_RC6
         }
     }
 }
@@ -340,6 +415,55 @@ pub mod tests {
     use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 
+    const ENGINES: [u64; 4] = [0x2000, 0x12000, 0x22000, 0x1a000];
+
+    /// The Gen9 DSM from PCI config, and bxt_check_bios_rc6_setup against
+    /// it: one passing setup, then each check failing alone.
+    fn smoke_legacy_power_lp_bios_rc6() -> TestResult {
+        kt_assert_eq!(gen9_dsm(0x7c00_0001, 0x0200), Some((0x7c00_0000, 64 << 20)));
+        kt_assert_eq!(gen9_dsm(0x7c00_0000, 0xf100), Some((0x7c00_0000, 8 << 20)));
+        kt_assert_eq!(gen9_dsm(0x7c00_0000, 0), None);
+        kt_assert_eq!(gen9_dsm(u32::MAX, 0x0200), None);
+        let dsm = Some((0x7c00_0000, 64 << 20));
+        // 8 MiB reserved at the top of the DSM, the context in it.
+        let good: alloc::vec::Vec<(u64, u32)> = [
+            (RC6_LOCATION, 1),
+            (STOLEN_RESERVED, 0x7f80_0000 | 3 << 7 | 1),
+            (RC6_CTX_BASE, 0x7fe0_0000),
+        ]
+        .into_iter()
+        .chain(ENGINES.iter().map(|base| (base + RING_MAX_IDLE, 0x10)))
+        .chain(BIOS_PM_SETUP.iter().map(|&reg| (reg, 1)))
+        .collect();
+        let supported = |changes: &[(u64, u32)], dsm| {
+            rc6_supported(LegacyGt::Gen9Lp, dsm, |reg| {
+                changes
+                    .iter()
+                    .chain(good.iter())
+                    .find(|(r, _)| *r == reg)
+                    .map_or(0, |(_, v)| *v)
+            })
+        };
+        kt_assert!(supported(&[], dsm));
+        kt_assert!(!supported(&[], None));
+        kt_assert!(!supported(&[(RC6_LOCATION, 0)], dsm));
+        kt_assert!(!supported(&[(RC6_CTX_BASE, 0x7fff_f000)], dsm));
+        kt_assert!(!supported(&[(RC6_CTX_BASE, 0x7f00_0000)], dsm));
+        kt_assert!(!supported(&[(STOLEN_RESERVED, 0x7f80_0000 | 3 << 7)], dsm));
+        kt_assert!(!supported(&[(STOLEN_RESERVED, 0x8000_0000 | 1)], dsm));
+        kt_assert!(!supported(&[(0x1a000 + RING_MAX_IDLE, 1)], dsm));
+        kt_assert!(!supported(&[(0xa000, 0)], dsm));
+        kt_assert!(!supported(&[(0xa25c, u32::MAX)], dsm));
+        // Big-core Gen9 and Gen11 need no BIOS setup.
+        kt_assert!(rc6_supported(LegacyGt::Gen9, None, |_| 0));
+        kt_assert!(rc6_supported(LegacyGt::Gen11, None, |_| 0));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_power",
+        smoke_legacy_power_lp_bios_rc6
+    );
+
     /// RP_STATE_CAP 0x0009_1122 (RP0 0x22 = 1.7 GHz, RP1 0x11 = 850 MHz,
     /// RPn 9 = 450 MHz) in 16.67 MHz units; Gen11 takes RP1 from RPe.
     fn smoke_legacy_power_caps() -> TestResult {
@@ -435,32 +559,38 @@ pub mod tests {
     fn smoke_legacy_power_rc6_enable() -> TestResult {
         let mut writes = Vec::new();
         kt_assert_eq!(
-            rc6_enable(LegacyGt::Gen9, 0x1912, |r, v| writes.push((r, v))),
-            Some(0)
+            rc6_enable(LegacyGt::Gen9, 0x1912, &ENGINES, |r, v| writes.push((r, v))),
+            0
         );
+        // for_each_engine: every engine's idle count.
+        for base in ENGINES {
+            kt_assert!(writes.contains(&(base + RING_MAX_IDLE, 10)));
+        }
         kt_assert_eq!(writes.first(), Some(&(RC6_WAKE_RATE_LIMIT, 108 << 16)));
         kt_assert_eq!(writes.last(), Some(&(PG_ENABLE, 3)));
         kt_assert!(writes.contains(&(RC6_THRESHOLD, 37_500)));
         let mut writes = Vec::new();
-        rc6_enable(LegacyGt::Gen9, 0x193b, |r, v| writes.push((r, v)));
+        rc6_enable(LegacyGt::Gen9, 0x193b, &ENGINES, |r, v| writes.push((r, v)));
         kt_assert!(writes.iter().all(|(r, _)| *r != PG_ENABLE));
         let mut writes = Vec::new();
-        rc6_enable(LegacyGt::Gen9, 0x5916, |r, v| writes.push((r, v)));
+        rc6_enable(LegacyGt::Gen9, 0x5916, &ENGINES, |r, v| writes.push((r, v)));
         kt_assert_eq!(writes.first(), Some(&(RC6_WAKE_RATE_LIMIT, 54 << 16)));
         let mut writes = Vec::new();
         kt_assert_eq!(
-            rc6_enable(LegacyGt::Gen11, 0x8a52, |r, v| writes.push((r, v))),
-            Some(0x8804_0000)
+            rc6_enable(LegacyGt::Gen11, 0x8a52, &ENGINES, |r, v| writes
+                .push((r, v))),
+            0x8804_0000
         );
         kt_assert_eq!(writes.last(), Some(&(PG_ENABLE, 7)));
         kt_assert!(writes.contains(&(RC6_WAKE_RATE_LIMIT, 0x0036_0055)));
-        // Gen9 LP leaves RC6 to the BIOS until its setup check exists.
+        // Gen9 LP takes gen9_rc6_enable (not Skylake's wake rate limit).
         let mut writes = Vec::new();
         kt_assert_eq!(
-            rc6_enable(LegacyGt::Gen9Lp, 0x3185, |r, v| writes.push((r, v))),
-            None
+            rc6_enable(LegacyGt::Gen9Lp, 0x3185, &ENGINES, |r, v| writes
+                .push((r, v))),
+            0
         );
-        kt_assert!(writes.is_empty());
+        kt_assert_eq!(writes.first(), Some(&(RC6_WAKE_RATE_LIMIT, 54 << 16)));
         let mut writes = Vec::new();
         rc6_park(|r, v| writes.push((r, v)));
         kt_assert_eq!(
