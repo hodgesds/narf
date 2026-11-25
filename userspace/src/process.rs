@@ -593,7 +593,16 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     address_space.set_stack_top(stack_top_v);
 
     let total_pages = (DEFAULT_USER_STACK_RESERVED >> 12) as usize;
-    let commit_pages = ((DEFAULT_USER_STACK_BYTES + 0xFFF) >> 12) as usize;
+    // The argument block is written through the direct map, so all of it
+    // must be committed: the usual window plus the strings and pointer
+    // arrays (execve bounds them at 6 MiB, `bprm_stack_limits`). Never past
+    // the jittered top's share of the region; a block that cannot fit fails
+    // as `StackOverflow` in `init_sysv_stack`.
+    let jitter_pages = ((stack_region_top - stack_top_v) >> 12) as usize;
+    let commit_pages = core::cmp::min(
+        ((DEFAULT_USER_STACK_BYTES + arg_block_bytes(argv, envp, execfn) + 0xFFF) >> 12) as usize,
+        total_pages.saturating_sub(jitter_pages),
+    );
     // Pages above the jittered top: reserved VA that the initial stack never
     // uses. Clamped so a future widening of the jitter window can't eat into
     // the committed window.
@@ -1091,6 +1100,20 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
 // startup code expects argv followed by envp at increasing addresses;
 // process-title helpers use the span from argv[0] through the final
 // environment string as one contiguous, positively sized buffer.
+
+/// Bytes of the initial argument block below the stack top: every argv and
+/// envp string with its NUL, `AT_EXECFN`'s copy, and the two NULL-terminated
+/// pointer arrays at native width. The auxv and the AT_RANDOM block are a few
+/// hundred bytes and come out of the committed window's headroom.
+fn arg_block_bytes(argv: &[&str], envp: &[&str], execfn: Option<&str>) -> u64 {
+    let strings: u64 = argv
+        .iter()
+        .chain(envp)
+        .chain(execfn.as_ref())
+        .map(|s| s.len() as u64 + 1)
+        .sum();
+    strings + (argv.len() as u64 + envp.len() as u64 + 2) * 8
+}
 
 /// Errors `init_sysv_stack` can surface.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

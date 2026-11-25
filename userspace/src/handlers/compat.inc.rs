@@ -2838,24 +2838,18 @@ fn do_execve_resolved(
     // Step 2: copy argv + envp — each a NUL-terminated array of
     // user-mode `char *`, walked until the first null pointer.
     // An i386 execve/execveat (`compat_sys_execve`) passes arrays of 32-bit
-    // pointers.
+    // pointers. Bounded as `do_execveat_common` bounds them: by the stack
+    // rlimit (`bprm_stack_limits`), not by an entry count.
     let compat_arrays = ctx.in_ia32_syscall();
-    let argv_strs = match copy_user_strarr(argv_uptr, 1024, compat_arrays) {
-        Some(v) => v,
-        None => {
-            // Faulting argv array pointer → EFAULT.
-            ctx.set_return(errno_ret(EFAULT));
-            return;
-        }
-    };
-    let envp_strs = match copy_user_strarr(envp_uptr, 4096, compat_arrays) {
-        Some(v) => v,
-        None => {
-            // Faulting envp array pointer → EFAULT.
-            ctx.set_return(errno_ret(EFAULT));
-            return;
-        }
-    };
+    let limit = exec_arg_limit(read_rlimit(current_task_id(), RLIMIT_STACK).map(|r| r.cur));
+    let (argv_strs, envp_strs) =
+        match copy_exec_args(argv_uptr, envp_uptr, compat_arrays, path.len(), limit) {
+            Ok(args) => args,
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
+                return;
+            }
+        };
     let envp_refs: alloc::vec::Vec<&str> = envp_strs.iter().map(|s| s.as_str()).collect();
 
     // Resolve an image under the caller's chroot and read its sniffing
@@ -3825,7 +3819,7 @@ pub(crate) fn copy_user_cstr_checked(
     ptr: u64,
     max_len: usize,
 ) -> Result<alloc::string::String, i64> {
-    if ptr == 0 || max_len == 0 || max_len > 65536 {
+    if ptr == 0 || max_len == 0 || max_len > MAX_ARG_STRLEN {
         return Err(EFAULT);
     }
     // Bulk-reading `max_len` blindly would walk past the NUL into
@@ -3878,39 +3872,126 @@ pub(crate) fn copy_user_cstr_checked(
     Err(ENAMETOOLONG)
 }
 
-/// Walk a NULL-terminated user array of `char *` (e.g. argv or
-/// envp). Each element points to a C string copied via
-/// [`copy_user_cstr`]. Returns `None` on any copy fault or if
-/// the array doesn't terminate within `max_entries`.
+/// `MAX_ARG_STRLEN` (`include/uapi/linux/binfmts.h`): one argv/envp string,
+/// NUL included.
+const MAX_ARG_STRLEN: usize = 32 * 4096;
+
+/// `ARG_MAX` (`include/uapi/linux/limits.h`): the floor of the argument
+/// budget, whatever the stack rlimit.
+const ARG_MAX: u64 = 131072;
+
+/// The argument budget of `fs/exec.c::bprm_stack_limits`: a quarter of the
+/// stack rlimit, at most three quarters of `_STK_LIM`, at least `ARG_MAX`.
+/// It covers the strings and the argv/envp pointer arrays together.
+///
+/// ```text
+/// limit = _STK_LIM / 4 * 3;
+/// limit = min(limit, bprm->rlim_stack.rlim_cur / 4);
+/// limit = max_t(unsigned long, limit, ARG_MAX);
+/// ```
+fn exec_arg_limit(stack_rlimit: Option<u64>) -> u64 {
+    let quarter = stack_rlimit.unwrap_or(STK_LIM) / 4;
+    (STK_LIM / 4 * 3).min(quarter).max(ARG_MAX)
+}
+
+/// Count a NULL-terminated user array of `char *` (`fs/exec.c::count`):
+/// `EFAULT` for an unreadable slot.
+///
+/// The walk stops with `E2BIG` once `already + count` pointers alone fill
+/// `limit`, where Linux counts on to `MAX_ARG_STRINGS` and only then fails
+/// `bprm_stack_limits`; the two differ only for an array that would also
+/// fault past that point (Linux: `EFAULT`).
 ///
 /// `compat`: the array belongs to an i386 call, whose elements are 32-bit
 /// `compat_uptr_t` (`get_user_arg_ptr` under `in_compat_syscall()`).
-fn copy_user_strarr(
-    arr_ptr: u64,
-    max_entries: usize,
-    compat: bool,
-) -> Option<alloc::vec::Vec<alloc::string::String>> {
+fn count_user_strarr(arr_ptr: u64, compat: bool, already: u64, limit: u64) -> Result<u64, i64> {
     if arr_ptr == 0 {
         // POSIX permits argv=NULL to mean "no args"; envp=NULL
         // similarly. Treat as empty rather than rejecting.
-        return Some(alloc::vec::Vec::new());
+        return Ok(0);
     }
-    let slot_len: usize = if compat { 4 } else { 8 };
-    let mut out = alloc::vec::Vec::new();
-    for i in 0..max_entries {
-        let slot_ptr = arr_ptr.checked_add((i as u64) * slot_len as u64)?;
+    let slot_len: u64 = if compat { 4 } else { 8 };
+    let mut count = 0u64;
+    loop {
+        if (already + count + 1) * 8 >= limit {
+            return Err(E2BIG);
+        }
+        let slot_ptr = arr_ptr.checked_add(count * slot_len).ok_or(EFAULT)?;
         let mut slot_bytes = [0u8; 8];
         // SAFETY: SMAP bracket inside copy_from_user.
-        unsafe { copy_from_user(&mut slot_bytes[..slot_len], slot_ptr) }.ok()?;
-        let element_ptr = u64::from_le_bytes(slot_bytes);
-        if element_ptr == 0 {
-            // NULL terminator → end of array.
-            return Some(out);
+        unsafe { copy_from_user(&mut slot_bytes[..slot_len as usize], slot_ptr) }
+            .map_err(|_| EFAULT)?;
+        if u64::from_le_bytes(slot_bytes) == 0 {
+            return Ok(count);
         }
-        out.push(copy_user_cstr(element_ptr, 4096)?);
+        count += 1;
     }
-    // Array didn't terminate — reject rather than truncate silently.
-    None
+}
+
+/// Copy the first `count` strings of a user `char *` array
+/// (`fs/exec.c::copy_strings`). Each string, NUL included, is at most
+/// `MAX_ARG_STRLEN` (else `E2BIG`); together they draw down `budget` (else
+/// `E2BIG`); an unreadable slot or string is `EFAULT`.
+fn copy_user_strarr(
+    arr_ptr: u64,
+    count: u64,
+    compat: bool,
+    budget: &mut u64,
+) -> Result<alloc::vec::Vec<alloc::string::String>, i64> {
+    let slot_len: u64 = if compat { 4 } else { 8 };
+    let mut out = alloc::vec::Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let slot_ptr = arr_ptr.checked_add(i * slot_len).ok_or(EFAULT)?;
+        let mut slot_bytes = [0u8; 8];
+        // SAFETY: SMAP bracket inside copy_from_user.
+        unsafe { copy_from_user(&mut slot_bytes[..slot_len as usize], slot_ptr) }
+            .map_err(|_| EFAULT)?;
+        // A slot nulled since the count is an unreadable string: EFAULT, as
+        // Linux's `strnlen_user` on it reports.
+        let element_ptr = u64::from_le_bytes(slot_bytes);
+        let arg = copy_user_cstr_checked(element_ptr, MAX_ARG_STRLEN).map_err(|errno| {
+            if errno == ENAMETOOLONG {
+                E2BIG
+            } else {
+                errno
+            }
+        })?;
+        *budget = budget.checked_sub(arg.len() as u64 + 1).ok_or(E2BIG)?;
+        out.push(arg);
+    }
+    Ok(out)
+}
+
+/// An execve's `(argv, envp)`.
+type ExecArgs = (
+    alloc::vec::Vec<alloc::string::String>,
+    alloc::vec::Vec<alloc::string::String>,
+);
+
+/// argv and envp of an execve, bounded as `do_execveat_common` bounds them:
+/// count both arrays, reserve their pointers out of `limit`
+/// (`bprm_stack_limits`: `(max(argc, 1) + envc) * sizeof(void *)`), then
+/// copy the filename's, envp's and argv's strings out of what remains.
+fn copy_exec_args(
+    argv_ptr: u64,
+    envp_ptr: u64,
+    compat: bool,
+    filename_len: usize,
+    limit: u64,
+) -> Result<ExecArgs, i64> {
+    let argc = count_user_strarr(argv_ptr, compat, 0, limit)?;
+    let envc = count_user_strarr(envp_ptr, compat, argc, limit)?;
+    let ptr_size = (argc.max(1) + envc) * 8;
+    if limit <= ptr_size {
+        return Err(E2BIG);
+    }
+    // `copy_string_kernel(bprm->filename, bprm)`: AT_EXECFN's copy.
+    let mut budget = (limit - ptr_size)
+        .checked_sub(filename_len as u64 + 1)
+        .ok_or(E2BIG)?;
+    let envp = copy_user_strarr(envp_ptr, envc, compat, &mut budget)?;
+    let argv = copy_user_strarr(argv_ptr, argc, compat, &mut budget)?;
+    Ok((argv, envp))
 }
 
 /// Like `copy_user_path` but never applies the chroot rewrite. Used
