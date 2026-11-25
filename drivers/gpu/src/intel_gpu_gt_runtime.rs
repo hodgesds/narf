@@ -3562,16 +3562,18 @@ impl Owner {
                 }
             }
         }
+        let events = irq.as_ref().map_or(0, |irq| irq.take_kcr_events());
         // xe_pxp_pm_resume once GT1 runs again and no GSC load is pending.
+        // KCR causes latched before it belong to the stopped GT1 and are
+        // dropped, as xe_pm_runtime_get_if_active drops them.
         if !owner.pxp.live() {
             if !gsc.idle() {
                 return;
             }
             pxp::kcr_set(&media, true);
             owner.pxp.resume(true);
-        }
-        if let Some(irq) = irq.as_ref() {
-            owner.pxp.irq(irq.take_kcr_events());
+        } else {
+            owner.pxp.irq(events);
         }
         // The HuC is in error once either authentication failed.
         let huc_error = gsc.huc() == Some(false) || guc.huc_outcome() == Some(false);
@@ -3612,7 +3614,11 @@ impl Owner {
                         .engine
                         .quiesce(&owner.pxp, now, &mut PxpQueue::new(guc, now), &media)
                 }
-                None => false,
+                // GT1 no longer runs: the job can never finish.
+                None => {
+                    owner.engine.abort(&owner.pxp);
+                    true
+                }
             };
             if !done {
                 if wait {
