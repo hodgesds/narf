@@ -4008,6 +4008,7 @@ pub(crate) fn probe_nvl_display(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     fb: narf_graphics_driver::generic::GenericFb,
+    primary: crate::intel_gpu_xe3plpd::FirmwarePrimary,
 ) -> Result<(), narf_bus::ProbeError> {
     if GtPlatform::from_pci(device.id.vendor, device.id.device) != Some(GtPlatform::NovaLakeS) {
         return Err(narf_bus::ProbeError::NotForThisDriver);
@@ -4031,6 +4032,35 @@ pub(crate) fn probe_nvl_display(
     // SAFETY: the PCI probe grants exclusive ownership of this function's BAR0.
     let bar = unsafe { narf_bus::bar::map_bar(&device, 0) }
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // `narf.intel.nvl_modeset=1`: the owned display-35 eDP modeset at the
+    // panel's EDID mode on the firmware primary, through the LT PHY, before
+    // the GT starts beside it. The surface and its size are unchanged, so
+    // the fixed-mode card below and the GT's display-preserving admission
+    // (Pipe A lit, only its primary fetching) still describe the display.
+    // A refusal before the first destructive write leaves the firmware
+    // display as it was.
+    if crate::intel_gpu_xe3plpd::modeset_requested(narf_boot::args()) {
+        use core::fmt::Write as _;
+        let asls = narf_bus::pci::read_config32(&cap, &device, crate::intel_gpu_vbt::ASLS).ok();
+        let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
+        let outcome = crate::intel_gpu_xe3plpd::take_over_for_probe(&window, &primary, asls);
+        let _ = match outcome {
+            Ok(mode) => writeln!(
+                narf_console::Writer,
+                "intel-gpu {:04x}:{:04x} display 35 owned eDP modeset complete on Pipe A ({}x{}, LT PHY)",
+                device.id.vendor,
+                device.id.device,
+                mode.h_active,
+                mode.v_active,
+            ),
+            Err(reason) => writeln!(
+                narf_console::Writer,
+                "intel-gpu {:04x}:{:04x} display 35 owned modeset refused ({reason:?})",
+                device.id.vendor,
+                device.id.device,
+            ),
+        };
+    }
     let index = crate::drm_registry::count() as u32;
     let card = Arc::new(IntelGpuCard::new(
         alloc::format!("card{index}"),

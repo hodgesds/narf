@@ -856,7 +856,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                         "display 35: retaining the firmware primary for fixed-mode KMS",
                         &device,
                     );
-                    return crate::intel_gpu_gt_runtime::probe_nvl_display(device, cap, fb);
+                    return crate::intel_gpu_gt_runtime::probe_nvl_display(
+                        device, cap, fb, primary,
+                    );
                 }
                 let _ = writeln!(
                     narf_console::Writer,

@@ -539,6 +539,49 @@ pub(crate) fn modeset<M: MmioWindow + ?Sized>(
     }
 }
 
+/// The boot option requesting the owned display-35 modeset on top of the
+/// firmware route ([`crate::intel_gpu_lt_phy::OPT_IN`]).
+pub(crate) const MODESET_OPT_IN: &str = "narf.intel.nvl_modeset";
+
+/// `narf.intel.nvl_modeset=1`, with the strict grammar of Intel's other
+/// destructive route gates.
+pub(crate) fn modeset_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, MODESET_OPT_IN)
+}
+
+/// Why the probe kept the firmware display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakeoverRefusal {
+    /// No VBT in the ACPI OpRegion: port A's output type is unknown.
+    NoVbt,
+    /// The VBT gives port A no eDP output (a desktop board may route a DP
+    /// connector there); the orchestrator drives only an eDP panel.
+    PortANotEdp,
+    /// [`takeover`] refused or failed.
+    Modeset(ModesetError),
+}
+
+/// The probe's owned-modeset step. Port A must be the VBT's eDP output
+/// (`intel_dp_is_port_edp`): the orchestrator sequences the panel's PPS,
+/// takes the eDP link rates and the LT PHY's eDP signal table. Then
+/// [`takeover`] over `io`, the function's BAR window.
+pub(crate) fn take_over_for_probe(
+    io: &(impl MmioWindow + ?Sized),
+    primary: &FirmwarePrimary,
+    asls: Option<u32>,
+) -> Result<Mode, TakeoverRefusal> {
+    use crate::intel_gpu_vbt::{discover, port, VbtPlatform};
+    let (vbt, _) = asls.and_then(discover).ok_or(TakeoverRefusal::NoVbt)?;
+    // Display 35 takes `xelpd_port_mapping`, as Meteor Lake does.
+    if !vbt
+        .encoder(VbtPlatform::MeteorLake, port::A)
+        .is_some_and(|encoder| encoder.edp)
+    {
+        return Err(TakeoverRefusal::PortANotEdp);
+    }
+    takeover(&View(io), primary).map_err(TakeoverRefusal::Modeset)
+}
+
 /// Take over the firmware primary in place: the owned modeset at the panel's
 /// EDID preferred mode, scanning out the firmware surface unchanged. A
 /// preferred mode of another size, or a primary the owned plane cannot
@@ -851,6 +894,31 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xe3plpd",
         smoke_nvl_display35_ip_dispatch
+    );
+
+    /// `narf.intel.nvl_modeset=1` is its own strict option: the firmware
+    /// route's option does not request it.
+    fn smoke_nvl_modeset_opt_in_grammar() -> TestResult {
+        use narf_boot::args::KernelCmdline;
+        assert!(modeset_requested(KernelCmdline::new(
+            "quiet narf.intel.nvl_display=1 narf.intel.nvl_modeset=1"
+        )));
+        for line in [
+            "",
+            "narf.intel.nvl_display=1",
+            "narf.intel.nvl_modeset",
+            "narf.intel.nvl_modeset=0",
+            "narf.intel.nvl_modeset=01",
+            "-- narf.intel.nvl_modeset=1",
+            "narf.intel.nvl_modeset=1 narf.intel.nvl_modeset=1",
+        ] {
+            assert!(!modeset_requested(KernelCmdline::new(line)), "{line}");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_modeset_opt_in_grammar
     );
 
     /// Display 35 reads its latencies without the reported level 0, and its

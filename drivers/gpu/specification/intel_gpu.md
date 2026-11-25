@@ -1,6 +1,8 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v1.13** (v1.13 computes Nova Lake primary and cursor DBUF/DDB
+> Status: **v1.14** (v1.14 admits Nova Lake display 35.00 as an operational
+> `DisplayIp` and adds its opted-in owned eDP modeset through the LT PHY;
+> v1.13 computes Nova Lake primary and cursor DBUF/DDB
 > images across the available pipes. v1.12 sequences Nova port preparation and retryable
 > teardown; v1.11 gives Nova's disconnected plan an ordered main-well
 > lease with partial-grant rollback and foreign-request preservation; v1.10 gives it an exact
@@ -547,7 +549,15 @@ production route supplies those preconditions. On Nova Lake-S,
 `narf.intel.nvl_display=1` reports the firmware primary at PCI probe and skips
 the headless GT reset for that boot, including when readout fails. For an
 enabled SST output on port A it checks two live scanout snapshots and reports
-the format, dimensions, byte pitch and GGTT offset. Firmware keeps the panel.
+the format, dimensions, byte pitch and GGTT offset. Firmware keeps the panel
+unless `narf.intel.nvl_modeset=1` is also given: then, before the GT starts,
+the probe runs the display-14 orchestrator on `DisplayIp::NovaLakeS` at the
+panel's EDID mode on the unchanged firmware surface, with the port PLL,
+transmitters and signal levels on the LT PHY (eDP tables) and the display-35
+CDCLK, DBUF, watermark and bandwidth owners. It requires a VBT naming port A
+eDP, no CMTG on transcoder A, an XR24 primary and a preferred mode of the
+primary's size; each refusal precedes every write outside AUX. System suspend
+stays refused (no display-35 relight owner).
 WCL uses its separate C10/C20 route.
 `intel_gpu_nvl_resources` supplies the pure ownership boundary for that future
 owner. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT
