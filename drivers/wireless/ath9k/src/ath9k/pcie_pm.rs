@@ -2,6 +2,8 @@
 //! AR9285/AR9287/AR9280 and AR5418 PCIe power-save workarounds. Linux ath9k pci.c::ath_pci_aspm_init,
 //! ar9002_hw.c::ar9002_hw_configpcipowersave and ar9002_initvals.h.
 use super::identity::{BringUpError, RegisterIo};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_bus, narf_capabilities};
 
 pub(super) fn enabled(
     device: &narf_bus::BusDevice,

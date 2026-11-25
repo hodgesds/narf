@@ -2,6 +2,10 @@
 //! Explicit AR9485 manual sharing. N48D is a separate measured complete
 //! program, never an upgrade of N48A or an inference from PCI flags.
 use super::Profile;
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{
+    narf_bus, narf_capabilities, narf_firmware, narf_lib, narf_scheduler,
+};
 use crate::ath9k::{
     admission,
     calibration::Permission,
@@ -219,7 +223,7 @@ impl Base {
             }
         }
         h.update(&plan.temp_slope.to_le_bytes());
-        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+        let domain = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
         h.update(&domain.country_code);
         let mac = r.mac;
         let base = Self {
@@ -254,7 +258,8 @@ impl Base {
     fn invoke<T>(&self, action: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         self.grant
             .invoke(|| {
-                let domain = narf_wireless::reg::db::snapshot().ok_or(BringUpError::Policy)?;
+                let domain =
+                    crate::ath9k::platform::regdb::snapshot().ok_or(BringUpError::Policy)?;
                 if !self.permission.current_dual_in(&domain) {
                     return Err(BringUpError::Policy);
                 }
@@ -345,7 +350,7 @@ impl Grant {
                     Ok((self.0)())
                 }
             }
-            let host = narf_wireless::reg::db::snapshot()
+            let host = crate::ath9k::platform::regdb::snapshot()
                 .and_then(|d| Permission::from_domain_dual(&d, self.base.frequency).ok())
                 .ok_or(Error::Access)?;
             if i32::from(self.peak) + i32::from(self.antenna)

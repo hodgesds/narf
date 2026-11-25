@@ -979,6 +979,54 @@ Not in the module build: AP/P2P/ROC, WoW and system PM, power-save control,
 the userspace SME and DT/NVMEM calibration. QEMU has no Atheros Wi-Fi, so bring-up, scan and
 association through the module are unverified.
 
+## Loadable ath9k
+
+The ath9k driver now builds from one source either built in or as
+`ath9k.ko`. The module runs every chip owner's whole station path over the
+KABI:
+
+- AR5008, AR9280, AR9285/AR2427, AR9287 and the AR9300 family;
+- identity and EEPROM, signed board admission, INI/PLL/RF and
+  signed-policy calibration;
+- the MAC, packet DMA and rate control;
+- the qualification grants, MCI coexistence and the in-driver WPA2
+  supplicant;
+- one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
+  family host;
+- device removal on unload (`narf_module_exit` runs the owner's own
+  `remove` and its DMA-stop proof).
+
+ath9k is softMAC: it enforces the host regulatory domain and gates its own
+bus mastering. It uses the shared KABI exports `narf_pci_command` (mt76),
+`narf_wireless_regdomain` (rtw88: an NRGD record of the host domain), and
+`narf_pcie_state` and `narf_pci_config_read32` (read-only), which were
+added for ath9k.
+
+It claims the built-in driver's fifteen `168c:*` ids.
+`narf-drivers-wireless/ath9k-module-only` leaves the built-in driver
+unregistered. The module builds for x86_64 and aarch64, and every
+undefined symbol is a KABI export.
+
+`modules/e2e/ath9k` loads the real `.ko` and checks:
+
+- relocations and init;
+- the exact PCI claim;
+- refusal of a probe with no device context;
+- clean unload.
+
+`smoke_kabi_softmac_exports` covers the softMAC exports. Both tests are
+written but have not yet run in the combined suite.
+
+Not in the module build:
+
+- system suspend/resume (there is no module device-PM export);
+- WoW, nl80211 power-save control and the userspace SME (`WIFI` v2 carries
+  none of them);
+- hot removal while loaded.
+
+QEMU has no Atheros Wi-Fi, so bring-up, calibration, scan and association
+through the module are unverified until a hardware run.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

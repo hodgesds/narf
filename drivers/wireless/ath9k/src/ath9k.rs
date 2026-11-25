@@ -3,6 +3,10 @@
 //! Linux ath9k is the reference. The one-shot selected-channel analog/AGC/IQ owner
 //! retains partial attempts through native DMA, host RSNA and station service.
 
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{
+    narf_bus, narf_capabilities, narf_console, narf_lib, narf_net, narf_scheduler, narf_time,
+};
 use alloc::sync::Arc;
 use core::fmt::Write as _;
 use narf_bus::{BusAddr, BusDevice, BusDeviceCap, MmioRegion};
@@ -36,12 +40,19 @@ mod packet_native;
 mod pcie_pm;
 mod periodic;
 mod phy;
+/// Kernel services, the same names in both builds (see its module docs).
+pub(crate) mod platform;
 mod ps;
 mod qos;
 mod rates;
 mod rx_ba;
 mod station;
 mod tx_ba;
+// The module build's PCI binding and netdev (`ath9k.ko`).
+#[cfg(feature = "module")]
+pub(crate) mod iface_module;
+#[cfg(feature = "module")]
+mod pci_kabi;
 pub use ar9003::ani::Request as PeriodicAniQualificationRequest;
 pub use ar9003::antenna::manual::Request as ManualBtSharingQualificationRequest;
 pub use ar9300_owner::{
@@ -371,7 +382,8 @@ where
     Err(last_err)
 }
 async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
-    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+    let domain =
+        crate::ath9k::platform::regdb::ensure_domain().map_err(|_| BringUpError::Policy)?;
     let mut controller = owner.state.try_lock().ok_or(BringUpError::BadState)?;
     let frequency = controller.baseband.reference_frequency;
     if controller.baseband.geometry.is_wide() {
@@ -416,7 +428,7 @@ async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpEr
             };
             let mut future = core::pin::pin!(future);
             core::future::poll_fn(|cx| {
-                if narf_wireless::reg::db::snapshot()
+                if crate::ath9k::platform::regdb::snapshot()
                     .is_none_or(|domain| !permission.current_in(&domain))
                 {
                     return core::task::Poll::Ready(Err(BringUpError::Policy));
@@ -465,7 +477,8 @@ async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpEr
     } else {
         let mut future = core::pin::pin!(future);
         core::future::poll_fn(|cx| {
-            if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_in(&d)) {
+            if crate::ath9k::platform::regdb::snapshot().is_none_or(|d| !permission.current_in(&d))
+            {
                 return core::task::Poll::Ready(Err(BringUpError::Policy));
             }
             core::future::Future::poll(future.as_mut(), cx)
@@ -633,7 +646,7 @@ async fn reset_owner_geometry(
         let geometry = selected.unwrap_or(controller.baseband.geometry.twenty());
         if selected.is_some() && !geometry.is_wide() {
             let domain =
-                narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+                crate::ath9k::platform::regdb::ensure_domain().map_err(|_| BringUpError::Policy)?;
             let permission = calibration::Permission::from_domain_at(&domain, geometry.control())?;
             phy::rates::checked_plan_at(
                 &controller.calibration,
@@ -808,6 +821,7 @@ async fn supervise(owner: Arc<Retained>) {
 /// required, then the chip is disabled and forced into FULL_SLEEP. A held
 /// owner lock reports Busy so the orchestrator aborts; unproven DMA pins the
 /// owner and fails suspend rather than powering down a mastering device.
+#[cfg(feature = "builtin")]
 fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     use narf_power::device_pm::DeviceSuspendError;
     let _control = CONTROL.try_lock().ok_or(DeviceSuspendError::Busy)?;
@@ -855,6 +869,7 @@ fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
 /// `pci.c::ath_pci_resume`: re-disable PCI RETRY_TIMEOUT (config 0x41) that
 /// suspend reset, then a generation reset (power-on reset, identical EEPROM,
 /// INI/PLL/RF, calibration) republishes the station.
+#[cfg(feature = "builtin")]
 fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     use narf_power::device_pm::DeviceSuspendError;
     let Some(owner) = CONTROLLER.lock().clone() else {
@@ -935,6 +950,7 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
     });
 }
 
+#[cfg(feature = "builtin")]
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if !ar9285_silicon(&device.id) {
         return Err(narf_bus::ProbeError::NotForThisDriver);
@@ -958,6 +974,20 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         ));
     }
     let mmio = narf_drivers_wireless_ath_core::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
+    bring_up(device, cap, mmio)
+}
+
+/// Everything after the bus binding reserved the address, parked the
+/// function and mapped BAR0 (Linux `ath_pci_probe` → `ath9k_init_device`):
+/// identity and the factory EEPROM, the INI/PLL/RF tables, the PCIe
+/// workarounds, the retained owner, then the calibration/publication task.
+/// The same in both builds; built in, [`probe`] binds through `narf_bus`,
+/// and in the module `pci_kabi.rs` binds through the KABI.
+pub(crate) fn bring_up(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    mmio: MmioRegion,
+) -> Result<(), narf_bus::ProbeError> {
     if mmio.len < phy::REQUIRED_BAR {
         return Err(narf_bus::ProbeError::BadDevice);
     }
@@ -991,7 +1021,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         identity.mac,
         identity.eeprom_version
     );
+    #[cfg(feature = "builtin")]
     let vendor = device.id.vendor;
+    #[cfg(feature = "builtin")]
     let device_id = device.id.device;
     let retained = Arc::new(Retained {
         state: Mutex::new(Ath9k {
@@ -1016,6 +1048,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         idle: idle::Owner::new(),
     });
     *CONTROLLER.lock() = Some(retained.clone());
+    #[cfg(feature = "builtin")]
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(
             DEVICES
@@ -1059,6 +1092,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
+#[cfg(feature = "builtin")]
 pub fn register() {
     for (device, name, _) in DEVICES {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -1136,4 +1170,20 @@ pub fn register() {
         ar5008_owner::pm_suspend,
         ar5008_owner::pm_resume,
     );
+}
+
+/// `narf_module_init`: install the kernel DRBG as the protocol code's
+/// entropy source, then register every owner's PCI ids. The rest happens
+/// in probe.
+#[cfg(feature = "module")]
+pub fn register_module() {
+    platform::install_entropy();
+    pci_kabi::register();
+}
+
+/// `narf_module_exit`: the bound owner's `remove` (Linux `ath_pci_remove`),
+/// then the executor stops.
+#[cfg(feature = "module")]
+pub fn exit_module() {
+    pci_kabi::exit();
 }

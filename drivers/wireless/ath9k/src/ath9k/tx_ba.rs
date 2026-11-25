@@ -5,6 +5,8 @@ use super::{
     ht,
     packet::{Error, Port},
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_capabilities, narf_firmware};
 #[cfg(feature = "kernel-test")]
 use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};
@@ -179,7 +181,7 @@ impl Grant {
                 Ok((|| {
                     let (antenna, base) = self.0.base.ba_limit();
                     let mut limit = self.0.ceiling.min(base);
-                    let d = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+                    let d = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
                     for r in &d.rules {
                         if r.freq_start_mhz < self.0.base.span().1
                             && r.freq_end_mhz > self.0.base.span().0

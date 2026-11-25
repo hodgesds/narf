@@ -2765,6 +2765,134 @@ kernel-free.
   QEMU emulates no Atheros Wi-Fi, so bring-up, scan and association through
   the module are unverified until a hardware run.
 
+### 4.6 `ath9k.ko`: the softMAC driver as a loadable module
+
+`narf-drivers-wireless-ath9k --no-default-features --features module` is the
+whole ath9k driver built into a `.ko` (x86_64 and aarch64) from the same
+source as the built-in. Every chip owner is included:
+
+- AR5008: AR5416/AR5418/AR9160;
+- AR9280;
+- AR9285/AR2427;
+- AR9287;
+- the AR9300 family: AR9380/AR9485/AR9580/AR9462/AR9565.
+
+For each owner the module carries identity and the EEPROM, signed board
+admission, the INI/PLL/RF tables, signed-policy calibration, the MAC and
+key cache, packet DMA, rate control, the HT/BA/QoS/PS/ANI/BT-sharing
+qualification grants, AR9003 MCI coexistence, idle FULL_SLEEP, generation
+reset, and the station with its in-driver WPA2 supplicant.
+
+There is no firmware: the driver programs the MAC/PHY and enforces the host
+regulatory domain itself. So it needs more from the kernel than a FullMAC
+driver.
+
+- **Platform.** The driver names the kernel crates: `narf_bus`, `narf_lib`,
+  `narf_time`, `narf_scheduler`, `narf_io`, `narf_capabilities`,
+  `narf_firmware`, `narf_net`, `narf_ipc`, `narf_console`, `narf_interrupts`
+  and `narf_power`.
+  - Built in, they are the real crates.
+  - In the module, `src/ath9k/platform/kabi.rs` provides modules with the
+    same names: the subset of each API the driver uses, over
+    `narf-module-rt` and the KABI. A driver file imports them under
+    `#[cfg(feature = "module")]`, so the driver logic is unchanged.
+  - Two names differ in path, so they come from the platform in both
+    builds: `regdb` (`narf_wireless::reg::db`) and `WirelessNetIface`.
+  - `narf-crypto`, `narf-wireless` and `narf-drivers-wireless-ath-core` are
+    linked kernel-free.
+  - A device capability handle is live only while its token is the bound
+    device. A firmware handle is live only while its record is open.
+- **Claim.** The built-in tables, unchanged: fifteen `168c:*` ids.
+  `narf-drivers-wireless/ath9k-module-only` leaves the built-in driver
+  unregistered, so an early-loaded `ath9k.ko` owns the devices.
+- **Probe** (`pci_kabi.rs`). This is the built-in probes' shared bus half,
+  in Linux `ath_pci_probe` order.
+  1. `narf_pci_identity`, and the owner for the device id.
+  2. The singleton reservation (`CLAIMED_ADDRESS`), as built in. A failed
+     attempt keeps it.
+  3. `narf_pci_prepare_probe`, then the owners' own park through
+     `narf_pci_command`: Bus Master and Memory Space off, INTx Disable on,
+     read back.
+  4. BAR0 mapped with decode parked, then Memory Space on and the policy
+     read back.
+  5. Packet DMA retained on teardown.
+  6. The 1 ms device poller (the executor's heartbeat).
+  7. The owner's `bring_up`. Each built-in `probe` was split into its bus
+     half and this shared `bring_up`, which is unchanged.
+
+  Bus mastering is turned on later by the packet owner itself, after its
+  rings are in place, exactly as built in.
+- **Removal.** `narf_module_exit` runs the bound owner's built-in `remove`
+  (Linux `ath_pci_remove`).
+  - The kernel has already stopped the module's callbacks, so exit drives
+    the executor itself, for up to 5 s, until `remove` releases the
+    reservation. `remove` releases it only after its DMA-stop proof.
+  - Only then is the teardown DMA retention lifted. An unproven stop leaves
+    the buffers quarantined.
+- **KABI.** The shared `narf_pci_command` (added for mt76) clears and sets
+  Memory Space, Bus Master and INTx Disable, then reads the register back.
+  The DMA-stop proofs gate Bus Master around every generation reset with
+  it. Additive for ath9k (`modules/DATAPATH_ABI_DESIGN.md`, "softMAC PCI
+  control and host regulatory policy"):
+  - `narf_pcie_state`: Device/Link Capabilities, Control and Status, and the
+    upstream bridge's Link Control. These choose the SerDes workarounds
+    (`ath_pci_aspm_init`) and drive the relaxed-ordering check.
+  - `narf_pci_config_read32`: read-only, `0x40..=0xffc`. It is used for
+    AR9462's L1-entry-latency word at `0x70c`.
+  - The shared `narf_wireless_regdomain` (added for rtw88) returns the
+    host's regulatory domain as one NRGD v1 record, bootstrapping the
+    staged signed policy when none is installed. `platform::regdb` parses
+    it with `narf_wireless::reg::parse_domain_record` (`parse_policy`'s
+    checks, also accepting the world domain's `"00"`). Every
+    calibration, retune and transmit admission reads a fresh record, and an
+    unchanged record reuses its last parse. With no domain (`-ENODATA`),
+    admission closes.
+- **MSI.** One plain-MSI vector via `narf_msi_enable`, with a task-context
+  callback. It is taken on first use and reused by later generations.
+  Without it, the owner stays polled, as built in.
+- **DMA.** All coherent memory comes from `narf_dma_alloc_mapped`, with
+  4–64 KiB size-class pools carved from 1 MiB chunks, because KABI handles
+  are never reused. The mapping is coherent, so the driver's cache syncs are
+  ordering fences.
+- **Signed records.** Board admission and the qualification grants are read
+  through `narf_firmware_open`/`_read`. They are admitted only when
+  `narf_firmware_signed` reports a verified signer, as built in.
+- **Netdev and wiphy** (`iface_module.rs`). It is the same `interface.rs`
+  netdev, with its kernel edges swapped: the same generations, rings,
+  carrier and station.
+  - The netif bridge names the netdev `wlan%d`. Stack TX goes to the
+    built-in `send`. RX the netdev hands the stack goes out through
+    `narf_netif_rx`.
+  - `REGISTER_WIPHY` (§4.1) advertises the attached generation's permitted
+    2.4/5 GHz channels, its HT grant, CCMP and `PSK_OFFLOAD |
+    REPORTS_DISCONNECT`.
+  - `SCAN_REQUEST`, `CONNECT` and `DISCONNECT` run the netdev's built-in
+    `scan`, `associate` and `disassociate`. A `CONNECT` without a BSSID
+    takes the strongest matching network of the last scan. Security is open
+    or in-driver WPA2-PSK, as built in; SAE is not advertised.
+  - A carrier loss the netdev reports (the built-in `notify_disconnect`)
+    goes out as `DISCONNECTED`.
+- **Not carried (built-in only).**
+  - System suspend/resume: there is no module device-PM export, so the
+    owners' `pm_suspend`/`pm_resume` and their PCI retry-timeout write
+    (`0x40`) stay built in.
+  - WoW, nl80211 power-save control and the userspace SME: the `WIFI` v2
+    host carries none of them.
+  - Hot removal while loaded: the bus has no module remove callback, so
+    removal is unload.
+
+  General config space is still not writable from a module.
+- **Proof.** `modules/e2e/ath9k` loads the real `.ko`. It checks:
+  - the relocations resolve and init runs;
+  - exactly the fifteen ath9k ids are claimed, and none of ath10k's;
+  - a probe with no device context is refused;
+  - unload (exit with nothing bound) leaves no match.
+
+  `modules/kabi` `smoke_kabi_softmac_exports` checks the new exports' cap
+  gating, bounds and regulatory record. QEMU emulates no Atheros Wi-Fi, so
+  bring-up, calibration, scan and association through the module are
+  unverified until a hardware run.
+
 ## 5. Buffer Management
 
 - **Data Path**: Uses standard `DmaBuffer` caps provided by `io/spec`.

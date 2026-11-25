@@ -50,6 +50,8 @@ use super::mci;
 use crate::ath9k::descriptor::{self, TxStatus as LegacyStatus, WORDS};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
 use crate::ath9k::packet::{Delivery, Error, Phase, Port, ReceiveStep};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::narf_io;
 use crate::ath9k::station::ResetType;
 use alloc::vec::Vec;
 use narf_io::DmaBuffer;

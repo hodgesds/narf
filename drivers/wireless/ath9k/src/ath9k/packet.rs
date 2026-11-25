@@ -16,6 +16,8 @@
  */
 //! Retained AR9285 non-EDMA ownership. Rings end in NULL, never self-link.
 use super::descriptor::{self, Mpdu, TxStatus, WORDS};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_io, narf_scheduler, narf_time};
 use alloc::vec::Vec;
 use narf_io::DmaBuffer;
 const STRIDE: usize = 128; // a96-byte descriptor never straddles a4KiB boundary.

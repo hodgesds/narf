@@ -41,7 +41,7 @@ impl Base {
         if device != 0x0034 || report.frequency_mhz >= 4000 || !mci_enabled {
             return Ok(None);
         }
-        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+        let domain = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
         let r = grant.request();
         let exact_permission = Permission::from_domain_dual(&domain, report.frequency_mhz)
             .map_err(|_| Error::Access)?
@@ -183,7 +183,7 @@ impl Base {
         self.grant
             .invoke(|| {
                 Ok((|| {
-                    let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+                    let domain = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
                     if !self.permission.current_dual_in(&domain)
                         || self.grant.ceiling < self.permission.budget()
                     {

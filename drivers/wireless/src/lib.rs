@@ -196,6 +196,8 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "ath9k", || {
+        // With `ath9k-module-only`, ath9k.ko owns every ath9k PCI id.
+        #[cfg(not(feature = "ath9k-module-only"))]
         ath9k::register();
         InitResult::Ok
     });

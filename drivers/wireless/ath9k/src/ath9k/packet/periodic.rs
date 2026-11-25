@@ -3,6 +3,8 @@
 //! No healthy partial mutation escapes this bounded source continuation.
 use super::*;
 use crate::ath9k::periodic::{self, Context as PeriodicContext, Io};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_scheduler, narf_time};
 struct Raw<'a, P>(&'a P);
 impl<P: Port> Io for Raw<'_, P> {
     fn read(&self, register: u64) -> Result<u32, Error> {

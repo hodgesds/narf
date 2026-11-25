@@ -2,6 +2,8 @@
 //! Linux ath9k `hw.c`, `pci.c::ath_pci_eeprom_read`, `eeprom.c` and
 //! `eeprom_4k.c`: AR9285 reset and the complete factory calibration map.
 
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_bus, narf_capabilities, narf_scheduler, narf_time};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Write};
 

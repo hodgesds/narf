@@ -4,6 +4,8 @@
 //! sharing needs the separate explicit N48D owner; baseline profiles keep it off.
 //! `Binding` exposes no unchecked MMIO, borrowed RX status or fresh grant.
 use super::{eeprom::field, power::Image, Chip};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_bus, narf_io, narf_lib};
 use crate::ath9k::{
     admission::Grant,
     identity::BringUpError,

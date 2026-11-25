@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Original-controller idle and retained cold wake, distinct from station PS.
 use super::*;
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_bus, narf_scheduler, narf_time};
 use alloc::{boxed::Box, task::Wake, vec::Vec};
 use core::{
     future::Future,

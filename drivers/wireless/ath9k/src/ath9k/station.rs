@@ -4,6 +4,8 @@ use super::{
     descriptor::Mpdu,
     packet::{self, Packet, Port},
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_lib, narf_time};
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{
     future::Future,

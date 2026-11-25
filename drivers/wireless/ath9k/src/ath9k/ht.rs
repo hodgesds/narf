@@ -8,6 +8,8 @@ use super::{
     phy::{self, Prepared},
     EEPROM_4K_BYTES,
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_bus, narf_capabilities, narf_firmware};
 use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
@@ -272,7 +274,7 @@ impl Grant {
             type Output = Result<T, Error>;
             fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
                 Ok((|| {
-                    let d = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+                    let d = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
                     let p = Permission::from_domain_at(&d, self.0.facts.report.frequency_mhz)
                         .map_err(|_| Error::Access)?;
                     if !p.allows_report(self.0.facts.report) {

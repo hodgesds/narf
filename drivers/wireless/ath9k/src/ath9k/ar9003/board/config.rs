@@ -6,6 +6,8 @@
 //! suppression. Manual BT antenna sharing remains disabled.
 use super::super::Chip;
 use crate::ath9k::identity::BringUpError;
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::narf_bus;
 use narf_bus::DeviceId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
