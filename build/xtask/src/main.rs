@@ -4392,7 +4392,13 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     let roots = module_defined_globals(&own)?;
     let (linker, linker_args) = module_linker(root)?;
     let mut link = Command::new(&linker);
-    link.args(&linker_args).arg("-r").arg("-o").arg(&out);
+    link.args(&linker_args);
+    // A large crate roots thousands of globals (`-u` below). On a host with
+    // a small exec argument limit (a NARF host refuses ~120 KiB of argv
+    // with EFAULT) that does not fit, so everything after the flavor goes
+    // through an lld response file instead — the same arguments, in order.
+    let mut link_args: Vec<std::ffi::OsString> = Vec::new();
+    link_args.extend(["-r".into(), "-o".into(), out.clone().into_os_string()]);
     // Section GC, rooted at every global the crate's own objects define. An
     // extracted archive member is a whole codegen unit, most of which the
     // module never reaches — and some of which references helpers the
@@ -4403,16 +4409,40 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     // `.modinfo`, a `.narf_kparams` static — come from `#[used]` statics,
     // which rustc emits `SHF_GNU_RETAIN`, so GC keeps them; a
     // `.narf_kparams` attached with objcopy after the link is untouched.
-    link.arg("--gc-sections");
+    link_args.push("--gc-sections".into());
     for name in &roots {
-        link.arg("-u").arg(name);
+        link_args.push("-u".into());
+        link_args.push(name.into());
     }
-    link.args(&own);
+    link_args.extend(own.iter().map(|o| o.clone().into_os_string()));
     // The archive last: its members are lazy, extracted only to resolve a
     // symbol the crate's own objects (or an already-extracted member) leave
     // undefined. This is how out-of-line `core`/`alloc`/dependency code
     // reaches the `.ko` without dragging in the whole sysroot.
-    link.arg(&archive);
+    link_args.push(archive.clone().into_os_string());
+    let arg_bytes: usize = link_args.iter().map(|a| a.len() + 1).sum();
+    if arg_bytes > 64 * 1024 {
+        // lld response-file quoting: each argument on its own line, quoted,
+        // with `\` and `"` escaped.
+        let mut rsp = String::new();
+        for arg in &link_args {
+            let arg = arg
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            rsp.push('"');
+            rsp.push_str(&arg);
+            rsp.push_str("\"\n");
+        }
+        let rsp_path = work.join("link.rsp");
+        std::fs::write(&rsp_path, rsp)
+            .with_context(|| format!("writing {}", rsp_path.display()))?;
+        let mut at = std::ffi::OsString::from("@");
+        at.push(rsp_path.as_os_str());
+        link.arg(at);
+    } else {
+        link.args(&link_args);
+    }
     if !link
         .status()
         .with_context(|| format!("failed to run `{linker} -r`"))?
