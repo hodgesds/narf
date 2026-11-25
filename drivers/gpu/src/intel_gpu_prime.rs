@@ -177,6 +177,11 @@ impl Attachment {
     pub(crate) fn object(&self) -> &Arc<GemObject> {
         &self.object
     }
+    /// `attach->peer2peer`, with the path the oracle chose.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn peer2peer(&self) -> Option<P2pMapType> {
+        self.peer2peer
+    }
     pub(crate) fn pinned(&self) -> bool {
         self.pinned.load(Ordering::Acquire)
     }
@@ -247,8 +252,8 @@ impl Attachment {
             while offset < self.object.size() {
                 let len = (self.object.size() - offset).min(SZ_2G);
                 // dma_map_resource; dma_mapping_error is -ENOMEM.
-                let dma = narf_io::iommu::map_phys(base + offset)
-                    .map_err(|_| FsError::OutOfMemory)?;
+                let dma =
+                    narf_io::iommu::map_phys(base + offset).map_err(|_| FsError::OutOfMemory)?;
                 segments.push(Segment {
                     dma,
                     len: len as u32,
@@ -358,8 +363,8 @@ pub(crate) fn import_foreign(
     exporter_card: u32,
     object: &Arc<GemObject>,
 ) -> Result<u32, FsError> {
-    let importer = crate::intel_gpu_render::DeviceInfo::for_card(importer_card)
-        .ok_or(FsError::InvalidData)?;
+    let importer =
+        crate::intel_gpu_render::DeviceInfo::for_card(importer_card).ok_or(FsError::InvalidData)?;
     if !importer
         .backend
         .as_ref()
@@ -370,8 +375,8 @@ pub(crate) fn import_foreign(
     if let Some(handle) = gem.imported_handle(object) {
         return Ok(handle);
     }
-    let exporter = crate::intel_gpu_render::DeviceInfo::for_card(exporter_card)
-        .ok_or(FsError::InvalidData)?;
+    let exporter =
+        crate::intel_gpu_render::DeviceInfo::for_card(exporter_card).ok_or(FsError::InvalidData)?;
     let backend = exporter.backend.clone().ok_or(FsError::InvalidData)?;
     let allow_peer2peer = crate::intel_gpu_gt::boot_opt_in(narf_boot::args(), P2P_OPTION);
     let attachment = attach(
@@ -388,3 +393,57 @@ pub(crate) fn import_foreign(
     gem.import_attachment(Import::new(exporter_card, attachment))
 }
 
+/// A modelled PCIe fabric for native fixtures (no live registry): the
+/// exporter and a peer below two downstream ports of one switch (Linux
+/// `calc_map_type_and_dist` distance 4 over bus addresses), and a distant
+/// function below a second root port of a host bridge off the p2pdma
+/// whitelist, on a CPU that is not AMD Zen (no peer path).
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) mod fixture {
+    use narf_io::p2pdma::{HostBridgeDev, P2pTopology};
+
+    /// Root port 0 -> switch upstream port 1 -> downstream ports 2 and 3;
+    /// root port 6 -> 7.
+    const PARENT: [Option<u8>; 8] = [
+        None,
+        Some(0),
+        Some(1),
+        Some(1),
+        Some(2),
+        Some(3),
+        None,
+        Some(6),
+    ];
+    pub(crate) const EXPORTER: u8 = 4;
+    pub(crate) const PEER: u8 = 5;
+    pub(crate) const DISTANT: u8 = 7;
+
+    #[derive(Debug)]
+    pub(crate) struct Fabric;
+
+    impl P2pTopology for Fabric {
+        type Node = u8;
+        fn same(&self, a: u8, b: u8) -> bool {
+            a == b
+        }
+        fn upstream_bridge(&self, node: u8) -> Option<u8> {
+            PARENT.get(usize::from(node)).copied().flatten()
+        }
+        fn acs_redirect(&self, _node: u8) -> bool {
+            false
+        }
+        fn host_bridge(&self, _node: u8) -> u64 {
+            0
+        }
+        /// An Intel client host bridge outside `pci_p2pdma_whitelist`.
+        fn host_bridge_dev(&self, _node: u8) -> Option<HostBridgeDev> {
+            Some(HostBridgeDev {
+                vendor: 0x8086,
+                device: 0x4660,
+            })
+        }
+        fn cpu_supports_p2pdma(&self) -> bool {
+            false
+        }
+    }
+}

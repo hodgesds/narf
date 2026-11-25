@@ -2675,3 +2675,6 @@ mod lr {
 mod vram_evict {
     include!("intel_gpu_vram_evict_tests.rs");
 }
+mod prime {
+    include!("intel_gpu_prime_tests.rs");
+}
