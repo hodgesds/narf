@@ -20,7 +20,7 @@ pub(super) trait Raw {
     fn now(&self) -> u64;
     fn wait_on(&mut self, register: u64) -> Result<(), BmiError> {
         let mut failure = None;
-        let complete = narf_scheduler::responsive_spin_until(
+        let complete = crate::ath10k::platform::responsive_spin_until(
             || match self.read(register) {
                 Ok(u32::MAX) => {
                     failure = Some(BmiError::DeviceGone);
@@ -33,7 +33,7 @@ pub(super) trait Raw {
                     true
                 }
             },
-            narf_time::Deadline::after_us(WAKE_US),
+            crate::ath10k::platform::time::Deadline::after_us(WAKE_US),
         );
         match failure {
             Some(error) => Err(error),
@@ -75,7 +75,7 @@ impl<I: Ath10kMmio> Raw for Authorized<'_, I> {
         self.access(register, Some(value)).map(|_| ())
     }
     fn now(&self) -> u64 {
-        narf_time::wall::monotonic_ns()
+        crate::ath10k::platform::time::monotonic_ns()
     }
 }
 
@@ -395,7 +395,7 @@ impl<I: Ath10kMmio> Mmio<I> {
     }
     pub(super) fn power_quiet(&mut self, signal: u64) -> Result<(), BmiError> {
         if let Some(owner) = &mut self.power {
-            owner.quiet(narf_time::wall::monotonic_ns(), signal)?;
+            owner.quiet(crate::ath10k::platform::time::monotonic_ns(), signal)?;
         }
         Ok(())
     }
@@ -498,11 +498,11 @@ impl super::PciBoot {
         let cap = self.mmio.cap;
         let device = self.device;
         let clear = || {
-            narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
-                let value =
-                    narf_bus::pci::read_config32(&cap, &device, 0x40).map_err(|_| BmiError::Pci)?;
+            crate::ath10k::platform::pci::invoke(&cap, || {
+                let value = crate::ath10k::platform::pci::read_config32(&cap, &device, 0x40)
+                    .map_err(|_| BmiError::Pci)?;
                 if let Some(cleared) = crate::ath10k::pm::retry_timeout(value) {
-                    narf_bus::pci::write_config32(&cap, &device, 0x40, cleared)
+                    crate::ath10k::platform::pci::write_config32(&cap, &device, 0x40, cleared)
                         .map_err(|_| BmiError::Pci)?;
                 }
                 Ok(())
@@ -522,21 +522,22 @@ impl super::PciBoot {
             let cap = self.mmio.cap;
             let device = self.device;
             let restore = || {
-                narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
-                    narf_bus::pci_express::clear_and_set_link_control(
+                crate::ath10k::platform::pci::invoke(&cap, || {
+                    crate::ath10k::platform::pci::clear_and_set_link_control(
                         &cap,
                         &device,
-                        narf_bus::pci_express::LNKCTL_ASPMC,
-                        link & narf_bus::pci_express::LNKCTL_ASPMC,
+                        crate::ath10k::platform::pci::LNKCTL_ASPMC,
+                        link & crate::ath10k::platform::pci::LNKCTL_ASPMC,
                     )
                     .map_err(|_| BmiError::Pci)?;
                     // Same helper with a zero update reads back the actual
                     // configuration word without inventing an ASPM receipt.
-                    let actual =
-                        narf_bus::pci_express::clear_and_set_link_control(&cap, &device, 0, 0)
-                            .map_err(|_| BmiError::Pci)?;
-                    if actual & narf_bus::pci_express::LNKCTL_ASPMC
-                        != link & narf_bus::pci_express::LNKCTL_ASPMC
+                    let actual = crate::ath10k::platform::pci::clear_and_set_link_control(
+                        &cap, &device, 0, 0,
+                    )
+                    .map_err(|_| BmiError::Pci)?;
+                    if actual & crate::ath10k::platform::pci::LNKCTL_ASPMC
+                        != link & crate::ath10k::platform::pci::LNKCTL_ASPMC
                     {
                         return Err(BmiError::Pci);
                     }

@@ -2666,6 +2666,105 @@ services come from `src/platform/`: `kernel.rs` re-exports the kernel crates;
   refused, and unload leaves no match. QEMU emulates no MediaTek Wi-Fi, so
   bring-up, firmware download and RF behavior are first proven on hardware.
 
+### 4.5 `ath10k.ko`: the QCA988X–QCA9377 driver as a loadable module
+
+`narf-drivers-wireless-ath10k --no-default-features --features module` is
+the PCIe driver — reset, BMI, firmware/board/OTP/calibration download, CE,
+HTC, WMI, HTT and the retained station radio with its in-driver WPA2-PSK
+and WPA3-SAE supplicant — built into a `.ko` (x86_64 and aarch64) from the
+same source as the built-in, following §4.2. Kernel services come from
+`src/ath10k/platform/` (`kernel.rs` re-exports the kernel crates; `kabi.rs`
+provides the same names over `narf-module-rt` and the KABI). `narf-crypto`,
+`narf-wireless` and `narf-drivers-wireless-ath-core` are linked
+kernel-free.
+
+- **Claim.** Every PCIe id the built-in driver binds: QCA988X (`168c:003c`,
+  Ubiquiti `0777:11ac`), QCA9887 (`0050`), QCA6174 (`003e`), QCA6164
+  (`0041`), QCA99X0 (`0040`), QCA9888 (`0056`), QCA9984 (`0046`), QCA9377
+  (`0042`). Not AR9462 (`0034`), which the built-in only registers to refuse
+  as ath9k's. ath10k has no SDIO/USB/SNOC binder in NARF, so there is
+  nothing else to carry. `narf-drivers-wireless/ath10k-module-only` leaves
+  the built-in ids (and its system-PM hook) unregistered so an early-loaded
+  `ath10k.ko` owns the function.
+- **Probe** (`pci_kabi.rs`, the built-in `probe` + `bring_up` order).
+  1. `narf_pci_identity`; AR9462 and unknown ids are refused.
+  2. DMA retained on teardown (rings and host memory are published to the
+     firmware from power-up on).
+  3. `narf_pci_prepare_probe`, memory decode on, BAR0 mapped; the BAR must
+     cover the family's PCI-local, chip-id, SoC and last-CE windows.
+  4. Target wake and chip id (`pci::identify`, shared with the built-in).
+  5. The 1 ms poller starts the module executor, which runs the built-in
+     `pci::boot_task` unchanged: reset, ASPM off, bus master, BMI, firmware
+     and board download, BMI_DONE, MSI, HTC, WMI, HTT, the radio, then the
+     station publication.
+- **PCI from the transport.** Bus mastering on is `narf_pci_enable`; off
+  and every command read-back are the shared `narf_pci_command` (`clear =
+  bits` to disable, `clear = set = 0` to read). ASPM is `narf_pcie_aspm`.
+  The PCIe Device Control read behind the built-in DMA-reclamation proof
+  (no Relaxed Ordering) is `narf_pcie_state`; the config `0x40`
+  retry-timeout dword is `narf_pci_config_read32`/`_write32`. MSI is one
+  plain vector (`narf_msi_enable(1)`) whose task-context callback raises
+  the same signal the built-in hard-IRQ handler raises and runs the
+  executor.
+- **DMA.** Rings, bounce buffers and WMI/HTT host memory are allocated once
+  per generation, so they are direct `narf_dma_alloc_mapped` allocations
+  (no pool), DMA32 as built in.
+- **Firmware.** Through `narf_firmware_open`/`_read` under the module's
+  `Firmware` manifest cap, with the built-in signer policy (board,
+  pre-cal/cal inputs must be signed). The module's loader record
+  (`firmware_source_module.rs`) keeps the bounded input log and the seal,
+  but holds no per-blob capability: revocation of an input after it was
+  read is not observable from a `.ko`. No Devicetree reaches a module, so
+  DT/NVMEM calibration sources are absent; the SMBIOS BDF variant comes from
+  `narf_smbios_read`.
+- **Regulatory.** The kernel's installed domain (the one the built-in
+  driver reads, with its `iw reg set` and Country-IE changes), copied by
+  `narf_wireless_regdomain` as an NRGD v1 record on every policy check and
+  decoded with `narf_wireless::reg::parse_domain_record` (which accepts the
+  world domain "00"). An unchanged record keeps the
+  previous snapshot, so snapshot identity still follows a change of the
+  installed domain.
+- **Netdev and wiphy** (`iface_module.rs`).
+  - `narf_wireless_open_with_event` (§4.1), then the netdev (`wlan%d`),
+    then `REGISTER_WIPHY`: the radio's station channels, HT/VHT, CCMP, and
+    `PSK_OFFLOAD | SAE_OFFLOAD | REPORTS_DISCONNECT`.
+  - Scan (active, passive, and the associated dwell scan with the data path
+    kept serviced), connect (open, in-driver PSK, in-driver SAE; a `CONNECT`
+    without a BSSID takes the strongest match of the last scan) and
+    disconnect are the built-in `Device` paths over the same `Radio`. The
+    built-in awake power-save default is submitted after association; the
+    `WIFI` host has no power-save control.
+  - One service worker: failed-scan cleanup, the data drain (RX through
+    `narf_netif_rx`, queued TX into HTT, carrier) and the PMF management
+    flush, then a wait on the interrupt signal or the polling backstop.
+  - As built in, a disconnect or an abandoned association closes the
+    retained radio owner; a later association needs a fresh generation.
+- **Recovery.** The built-in automatic recovery (`pci.rs`, `restart.rs`)
+  runs unchanged in the module: a firmware crash (FW_IND_EVENT_PENDING) or a
+  failed scan cleanup retires the generation (CEs halted, bus mastering off
+  through `narf_pci_command` and read back, the ordered flush read) and
+  boots a fresh-ROM one, at most three per load. A generation whose
+  quiescence is not proven keeps its DMA pinned, as built in. The netdev,
+  session and wiphy outlive the generation (`ieee80211_restart_hw`); the
+  next generation rebinds them and replays the retained association
+  (scan for the BSS, then associate with the retained credentials) like the
+  built-in `replay_retained`. An operator disconnect forgets it.
+- **AP/ROC authorities.** The radio's AP, P2P and remain-on-channel code is
+  compiled unchanged, but its `narf_wireless::ap_control` authorities are
+  unconstructible in the module (a private uninhabited field), so nothing in
+  the `.ko` can start those paths.
+- **Not carried (built-in only).** AP/P2P/ROC, WoW and system PM
+  (suspend/resume), power-save control, the userspace SME, DT/NVMEM
+  calibration and the PCI-only diagnostic entry points (`pci::scan_passive`
+  … `pci::poll_ethernet`).
+- **KABI.** Only shared exports; ath10k adds none of its own.
+
+- **Proof.** `modules/e2e/ath10k` loads the real `.ko`: relocations resolve,
+  init runs to Live, exactly the nine ath10k ids are claimed (not AR9462),
+  a probe with no device context is refused, and unload leaves no match.
+  QEMU emulates no Atheros Wi-Fi, so bring-up, scan and association through
+  the module are unverified until a hardware run.
+
 ## 5. Buffer Management
 
 - **Data Path**: Uses standard `DmaBuffer` caps provided by `io/spec`.

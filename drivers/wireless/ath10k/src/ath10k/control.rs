@@ -321,7 +321,7 @@ impl<T: Hif> Session<T> {
         Ok(())
     }
     async fn control(&mut self, expected: u16) -> Result<Packet, Error> {
-        let deadline = narf_time::Deadline::after_ms(1000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(1000);
         loop {
             if deadline.expired() {
                 return Err(Error::Transport(BmiError::Timeout));
@@ -475,7 +475,7 @@ impl<T: Hif> Session<T> {
         }
         self.failed = true;
         let credits = (payload.len() + 8).div_ceil(usize::from(self.credit_size)) as u16;
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         while self.endpoints[self.wmi as usize].credits < credits {
             if deadline.expired() {
                 return Err(Error::Transport(BmiError::Timeout));
@@ -637,7 +637,7 @@ impl<T: Hif> Session<T> {
             return Err(Error::Failed);
         }
         self.failed = true;
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         loop {
             if deadline.expired() {
                 return Err(Error::Transport(BmiError::Timeout));

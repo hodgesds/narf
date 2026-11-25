@@ -60,7 +60,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // Reserve before any native wait. Cancellation cannot return the
         // still-programmed owner to ordinary packet admission.
         self.failed = true;
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         let mut drained = false;
         for _ in 0..4096 {
             if deadline.expired() {
@@ -95,7 +95,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 drained = true;
                 break;
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !drained {
             return Err(Error::Exhausted);
@@ -138,7 +138,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if !matches!(event, htt::Event::Progress) {
                 self.queue(event)?;
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !settled {
             return Err(Error::Exhausted);

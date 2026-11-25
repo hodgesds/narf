@@ -10,48 +10,58 @@
 //! its `ath10k_pci_irq_pending` cause check.
 use super::*;
 use crate::ath10k::irq::{self, Program, Service, Signal};
+use crate::ath10k::platform::IrqSafeSpinLock;
 use alloc::sync::Arc;
-use narf_lib::sync::IrqSafeSpinLock;
 
-#[derive(Debug)]
-pub(super) struct Msi {
-    config: narf_bus::msi::MsiConfig,
-    vector: u8,
-    signal: Arc<Signal>,
-}
+#[cfg(feature = "builtin")]
+mod native {
+    //! The kernel interrupt core: a vector, a hard-IRQ handler and MSI
+    //! programmed through `narf-bus`.
+    use super::*;
 
-/// Single-function vector slot (one retained ath10k controller per boot,
-/// as `pci.rs::CONTROLLER`).
-static SIGNAL: IrqSafeSpinLock<Option<Arc<Signal>>> = IrqSafeSpinLock::new(None);
+    #[derive(Debug)]
+    pub(in crate::ath10k) struct Msi {
+        pub(super) config: narf_bus::msi::MsiConfig,
+        pub(super) vector: u8,
+        pub(super) signal: Arc<Signal>,
+    }
 
-fn vector_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
-    let signal = { SIGNAL.lock().clone() };
-    match signal {
-        Some(signal) => {
-            signal.raise();
-            narf_interrupts::IrqStatus::Handled
+    /// Single-function vector slot (one retained ath10k controller per boot,
+    /// as `pci.rs::CONTROLLER`).
+    pub(super) static SIGNAL: IrqSafeSpinLock<Option<Arc<Signal>>> = IrqSafeSpinLock::new(None);
+
+    pub(super) fn vector_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
+        let signal = { SIGNAL.lock().clone() };
+        match signal {
+            Some(signal) => {
+                signal.raise();
+                narf_interrupts::IrqStatus::Handled
+            }
+            None => narf_interrupts::IrqStatus::None,
         }
-        None => narf_interrupts::IrqStatus::None,
+    }
+
+    pub(super) fn quarantine(msi: &Msi) {
+        narf_interrupts::disable_irq(msi.vector);
+        narf_interrupts::dispatch::clear_all_wakers(msi.vector);
+        narf_interrupts::synchronize_irq(msi.vector);
+    }
+    pub(super) fn release(msi: Msi) {
+        narf_interrupts::disable_irq(msi.vector);
+        let _ = narf_interrupts::remove_handler(msi.vector, "ath10k", 0);
+        narf_interrupts::dispatch::clear_all_wakers(msi.vector);
+        narf_interrupts::synchronize_irq(msi.vector);
+        let _ = narf_interrupts::vector::free(msi.vector);
+        let mut signal = SIGNAL.lock();
+        if signal.as_ref().is_some_and(|s| Arc::ptr_eq(s, &msi.signal)) {
+            *signal = None;
+        }
     }
 }
+#[cfg(feature = "builtin")]
+pub(super) use native::*;
 
-fn quarantine(msi: &Msi) {
-    narf_interrupts::disable_irq(msi.vector);
-    narf_interrupts::dispatch::clear_all_wakers(msi.vector);
-    narf_interrupts::synchronize_irq(msi.vector);
-}
-fn release(msi: Msi) {
-    narf_interrupts::disable_irq(msi.vector);
-    let _ = narf_interrupts::remove_handler(msi.vector, "ath10k", 0);
-    narf_interrupts::dispatch::clear_all_wakers(msi.vector);
-    narf_interrupts::synchronize_irq(msi.vector);
-    let _ = narf_interrupts::vector::free(msi.vector);
-    let mut signal = SIGNAL.lock();
-    if signal.as_ref().is_some_and(|s| Arc::ptr_eq(s, &msi.signal)) {
-        *signal = None;
-    }
-}
-
+#[cfg(feature = "builtin")]
 impl PciBoot {
     /// Discover, program and install one MSI vector with delivery still
     /// disabled at the function. Any failure leaves polled service.
@@ -110,6 +120,64 @@ impl PciBoot {
             core::mem::forget(msi);
         }
     }
+}
+
+/// The module build's vector: the KABI's plain MSI (`platform::msi`), whose
+/// task-context callback raises the same signal the built-in hard-IRQ
+/// handler raises and then runs the module executor.
+#[cfg(feature = "module")]
+#[derive(Debug)]
+pub(super) struct Msi {
+    vector: u16,
+    signal: Arc<Signal>,
+}
+
+#[cfg(feature = "module")]
+static SIGNAL: IrqSafeSpinLock<Option<Arc<Signal>>> = IrqSafeSpinLock::new(None);
+
+#[cfg(feature = "module")]
+fn vector_callback() {
+    let signal = { SIGNAL.lock().clone() };
+    if let Some(signal) = signal {
+        signal.raise();
+    }
+}
+
+#[cfg(feature = "module")]
+impl PciBoot {
+    /// Bind the vector with delivery still disabled, then enable MSI at
+    /// the function. Any failure leaves polled service.
+    fn arm_msi(&mut self) -> Option<Msi> {
+        use crate::ath10k::platform::msi;
+        if SIGNAL.lock().is_some() {
+            return None;
+        }
+        let signal = self.signal.clone();
+        *SIGNAL.lock() = Some(signal.clone());
+        let Some(vector) = msi::arm(vector_callback) else {
+            *SIGNAL.lock() = None;
+            return None;
+        };
+        let msi = Msi { vector, signal };
+        if !msi::set_enabled(true) {
+            self.drop_msi(msi);
+            return None;
+        }
+        Some(msi)
+    }
+    /// Clear MSI Enable and detach the signal. The KABI keeps the vector
+    /// granted for the device's lifetime (teardown frees it).
+    fn drop_msi(&mut self, msi: Msi) {
+        let _ = crate::ath10k::platform::msi::set_enabled(false);
+        crate::ath10k::platform::msi::disarm();
+        let mut signal = SIGNAL.lock();
+        if signal.as_ref().is_some_and(|s| Arc::ptr_eq(s, &msi.signal)) {
+            *signal = None;
+        }
+    }
+}
+
+impl PciBoot {
     /// `ath10k_pci_hif_start`: called once firmware runs after BMI_DONE.
     pub(super) fn start_interrupts(&mut self) {
         let Some(program) = Program::for_hw(self.hardware) else {

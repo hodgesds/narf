@@ -14,8 +14,10 @@ use super::{beacon, wire, Error, Management, ScanEvent};
 use crate::ath10k::regulatory::Factory;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(test, feature = "kernel-test"))]
+use narf_wireless::reg::db;
 use narf_wireless::reg::witness::{self, BeaconWitness, ScanGeneration};
-use narf_wireless::reg::{db, RegulatoryDomain};
+use narf_wireless::reg::RegulatoryDomain;
 
 const FREQUENCIES: [u16; 25] = [
     5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825, 5260, 5280, 5300, 5320, 5500, 5520, 5540,
@@ -58,7 +60,7 @@ impl core::fmt::Debug for Policy {
 impl Policy {
     fn snapshot(&self) -> Option<Arc<RegulatoryDomain>> {
         match self {
-            Self::Installed => db::snapshot(),
+            Self::Installed => crate::ath10k::platform::reg::snapshot(),
             #[cfg(any(test, feature = "kernel-test"))]
             Self::Scoped(database) => database.snapshot(),
         }

@@ -654,7 +654,7 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         }
         self.failed = true;
         self.wmi.htc.send_htt(&[0, 0, 0, 0]).await?;
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         let version = loop {
             if deadline.expired() {
                 return Err(Error::Timeout);

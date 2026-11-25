@@ -947,6 +947,38 @@ roaming, CQM/survey/station statistics, power-save control and the userspace
 SME. QEMU has no MediaTek Wi-Fi, so firmware download, scan and association
 through the module are unverified until a hardware boot.
 
+## Loadable ath10k (QCA988X–QCA9377)
+
+The ath10k driver now builds from one source either built in or as
+`ath10k.ko`, following ath11k. The module runs the whole PCIe station path
+over the KABI:
+
+- reset, BMI, firmware/board/OTP/calibration download, CE, HTC, WMI, HTT;
+- the retained station radio with its in-driver WPA2-PSK/WPA3-SAE
+  supplicant;
+- one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
+  family host.
+
+It claims the nine ath10k PCIe ids the built-in binds (not AR9462).
+`narf-drivers-wireless/ath10k-module-only` steps the built-in claim aside.
+The transport uses only the shared KABI: `narf_pci_command` turns bus
+mastering off and reads it back, `narf_pcie_state` supplies the DMA
+reclamation proof, and `narf_wireless_regdomain` the kernel's regulatory
+domain. The module links on
+x86_64 and aarch64, and every undefined symbol is a KABI export.
+
+`modules/e2e/ath10k` loads the real `.ko` and checks relocations and init,
+the exact PCI claim, refusal of a probe with no device context and clean
+unload (written; not yet run in the combined suite).
+
+The built-in automatic recovery runs in the module too: a firmware crash
+retires the generation and boots a fresh one (at most three per load), and
+the same `wlan%d` rebinds and replays the retained association.
+
+Not in the module build: AP/P2P/ROC, WoW and system PM, power-save control,
+the userspace SME and DT/NVMEM calibration. QEMU has no Atheros Wi-Fi, so bring-up, scan and
+association through the module are unverified.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

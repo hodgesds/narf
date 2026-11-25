@@ -84,6 +84,11 @@ ath11k-module-only = []
 # an early-loaded mt76.ko owns the function. The private mt76 copy-mode family
 # host stays registered.
 mt76-module-only = []
+
+# Leave the built-in ath10k's PCI ids (and its system-PM hook) unregistered
+# so an early-loaded ath10k.ko owns the QCA988X/9887/6174/6164/99X0/9888/
+# 9984/9377 function (the ath11k-module-only precedent).
+ath10k-module-only = []
 kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test", "narf-drivers-wireless-iwlwifi/kernel-test", "narf-drivers-wireless-rtl-usb/kernel-test", "narf-drivers-wireless-rtw/kernel-test", "narf-drivers-wireless-ath-core/kernel-test", "narf-drivers-wireless-ath9k/kernel-test", "narf-drivers-wireless-ath10k/kernel-test", "narf-drivers-wireless-ath11k/kernel-test", "narf-drivers-wireless-brcm/kernel-test", "narf-drivers-wireless-rtl/kernel-test"]
 
 [lints]

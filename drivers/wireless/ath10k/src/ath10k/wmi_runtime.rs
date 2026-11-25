@@ -30,6 +30,7 @@ mod associated_scan;
 mod dwell_scan;
 pub(in crate::ath10k) use active_scan::checked as checked_policy;
 pub(in crate::ath10k) use associated_scan::receive_permission;
+#[cfg(feature = "builtin")]
 pub(in crate::ath10k) use dwell_scan::ScanPolicy;
 #[path = "wmi_runtime/beacon_hints.rs"]
 pub(in crate::ath10k) mod beacon_hints;
@@ -49,6 +50,7 @@ mod p2p_device;
 // Role owners (P2P device/client/GO) bind these codecs in later steps.
 #[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 mod p2p;
+#[cfg(feature = "builtin")]
 pub(in crate::ath10k) use p2p::CombinationFacts;
 mod power_save;
 mod protection;
@@ -248,14 +250,14 @@ impl<T: Hif + HostMemory + HttMemory> Drop for ClientScope<'_, T> {
 /// path it calls runs on the client vdev and nothing else observes the
 /// exchanged state.
 pub(in crate::ath10k) struct StationGuard<'a, T: Hif + HostMemory + HttMemory> {
-    guard: narf_lib::mutex::MutexGuard<'a, Radio<T>>,
+    guard: crate::ath10k::platform::MutexGuard<'a, Radio<T>>,
     client: bool,
 }
 impl<'a, T: Hif + HostMemory + HttMemory> StationGuard<'a, T> {
     /// `None` for a client owner whose slot does not exist (not yet
     /// created, or already deleted).
     pub(in crate::ath10k) fn new(
-        mut guard: narf_lib::mutex::MutexGuard<'a, Radio<T>>,
+        mut guard: crate::ath10k::platform::MutexGuard<'a, Radio<T>>,
         client: bool,
     ) -> Option<Self> {
         if client {
@@ -301,7 +303,7 @@ pub(super) struct Radio<T> {
     in_client_scope: bool,
     ap: Option<alloc::boxed::Box<ap::Session>>,
     ap_staging: Option<alloc::boxed::Box<ap::Staging>>,
-    ap_history: Option<alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<ap_key::History>>>,
+    ap_history: Option<alloc::sync::Arc<crate::ath10k::platform::IrqSafeSpinLock<ap_key::History>>>,
     ap_sequence: u32,
     ap_dirty_wmm: bool,
     pub htt: htt::Runtime<T>,
@@ -649,9 +651,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .await?;
             }
         }
-        let deadline = narf_time::Deadline::after_ms(25_000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(25_000);
         loop {
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             validate()?;
             if deadline.expired() {
                 return Err(Error::Timeout);
@@ -744,7 +746,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         self.queue(htt::Event::Wmi(bytes))?;
                     }
                 }
-                htt::Event::Idle | htt::Event::Progress => narf_scheduler::yield_now().await,
+                htt::Event::Idle | htt::Event::Progress => {
+                    crate::ath10k::platform::yield_now().await
+                }
                 // Keep peer/BA/packet events for the future station worker.
                 // No event can raise a link or open the controlled port here.
                 event => self.queue(event)?,

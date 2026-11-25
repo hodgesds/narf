@@ -355,6 +355,16 @@ system PM) are woven through its shared owner: `src/platform/kabi.rs` gives
 those types an unconstructible stand-in, so the owner code links unchanged
 and the paths that need them cannot be reached. `modules/e2e/mt76` loads it.
 
+`drivers/wireless/ath10k` follows the same shape and adds two patterns. Its
+transport was written against `narf-bus` types (`BusDevice`,
+`Cap<BusDeviceCap, Write>`, `MmioRegion`, the `pci`/`pci_express` config
+helpers); the module platform provides those names over the KABI
+(`narf_pci_command`, `narf_pcie_state`, the device-specific config dwords),
+so the transport code is unchanged. Kernel-only authorities the radio code merely
+carries (`narf_wireless::ap_control`) become structs with a private
+uninhabited field, so the code compiles unchanged and no value can exist in
+the `.ko`. `modules/e2e/ath10k` loads it.
+
 ## Lifecycle symbols
 
 Every NARF module exports two C-ABI symbols the kernel calls:

@@ -50,6 +50,13 @@ NARF evidence: `ath9k.rs::{register,probe}`, `ath9k/identity.rs`,
 `profile.rs::PROFILES/select`, `htt_runtime.rs::data_profile`,
 `wmi_runtime/{station,data,active_scan,power_save}.rs`, `boot/recovery.rs`.
 
+Loadable build: the nine candidate ath10k tuples above (every row marked `L`
+and QCA9887) are also claimed by `ath10k.ko`, which is the same driver
+source over the KABI; the AR9462 rejection tuple is not registered by the
+module. It carries the station path with automatic recovery: no
+AP/P2P/ROC, WoW, power-save control, userspace SME or DT/NVMEM calibration
+(`drivers/wireless/specification/spec.md` §4.5).
+
 ## Capability inventory and actual missing software
 
 AR9285 is a2.4GHz HT device with EEPROM-limited chains. No5GHz/VHT/HE/EHT

@@ -95,7 +95,7 @@ async fn byte(io: &mut impl Ath10kMmio, address: u16) -> Result<Option<u8>, BmiE
     write(io, SI_BASE + SI_CS, SI_CS_READ_ONE)?;
     // Linux bounds the wait at 100000 polls of 10 us. Sleep between polls
     // rather than spinning on the SI register.
-    let deadline = narf_time::Deadline::after_ms(1000);
+    let deadline = crate::ath10k::platform::time::Deadline::after_ms(1000);
     let status = loop {
         let status = read(io, SI_BASE + SI_CS)?;
         if status & SI_CS_DONE_INT != 0 {
@@ -104,7 +104,7 @@ async fn byte(io: &mut impl Ath10kMmio, address: u16) -> Result<Option<u8>, BmiE
         if deadline.expired() {
             return Ok(None);
         }
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(20_000)).await;
+        crate::ath10k::platform::time::sleep_ns(20_000).await;
     };
     write(io, SI_BASE + SI_CS, status)?; // Clear DONE_INT (write-one).
     if status & SI_CS_DONE_ERR != 0 {

@@ -693,9 +693,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.send_all(&commands).await?;
         self.failed = false;
         // ath10k_mac_wait_tx_complete: a timeout is only a Linux warning.
-        let deadline = narf_time::Deadline::after_ms(FLUSH_MS);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(FLUSH_MS);
         while self.tx_in_flight() != 0 && !deadline.expired() {
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             // The host stack is quiescing for system sleep; frames received
             // during this flush are not delivered.
             let _ = self.poll_ethernet(&current()?).await?;
@@ -704,7 +704,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.failed = true;
         let _ = self.htt.wmi.htc.take_suspend_complete();
         self.send_all(core::slice::from_ref(&enable)).await?;
-        let deadline = narf_time::Deadline::after_ms(WOW_MS);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(WOW_MS);
         loop {
             if self.htt.wmi.htc.take_suspend_complete() {
                 break;
@@ -712,7 +712,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             let event = self.station_progress().await?;
             match event {
                 htt::Event::Idle | htt::Event::Progress => {}
@@ -740,12 +740,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // later suspend to inherit; only a wake report spends it.
         let nlo_vdev = self.nlo_vdev.take();
         self.send_all(core::slice::from_ref(&command)).await?;
-        let deadline = narf_time::Deadline::after_ms(WOW_MS);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(WOW_MS);
         loop {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             let event = self.station_progress().await?;
             match event {
                 htt::Event::Idle | htt::Event::Progress => {}
