@@ -112,6 +112,17 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn media_gt(&self) -> Option<MediaGtStatus> {
         None
     }
+    /// `xe->pxp`: Xe PXP on the media GT, published with `narf.intel.pxp=1`
+    /// once xe_pxp_init succeeded. Default: none, so xe_pxp_is_enabled is
+    /// false and every protected request keeps Linux's no-PXP errnos.
+    fn pxp(&self) -> Option<Arc<crate::intel_gpu_gt::media::pxp::Pxp>> {
+        None
+    }
+    /// xe_pm_runtime_get for PXP: the function resumes and stays in D0 while
+    /// the returned reference lives. Default: nothing to hold.
+    fn pxp_wakeref(&self) -> FsFuture<'_, Box<dyn core::any::Any + Send>> {
+        Box::pin(async { Ok(Box::new(()) as Box<dyn core::any::Any + Send>) })
+    }
     /// Confirmed SLPC status (limits, range, profile) for the standalone media GT (GT1).
     fn media_gt_slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
         None

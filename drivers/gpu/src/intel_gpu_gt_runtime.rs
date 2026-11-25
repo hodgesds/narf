@@ -131,6 +131,21 @@ struct State {
     gsc_reported: Option<crate::intel_gpu_gt::media::gsc::load::Status>,
     /// Routing the GSC sources onto GT0's delivery failed; the GSC is polled.
     gsc_irq_failed: bool,
+    /// `narf.intel.pxp=1` beside the GSC: struct xe_pxp and its hardware
+    /// half for the device's lifetime, once xe_pxp_init succeeded.
+    pxp: Option<PxpOwner>,
+    /// xe_pxp_init ran (once per device, on the first eligible GT1).
+    pxp_tried: bool,
+    /// Routing the KCR causes failed: terminations then never complete and
+    /// a start that needs one times out.
+    kcr_irq_failed: bool,
+}
+
+/// `struct xe_pxp`: the state the uAPI shares, and the worker's engine over
+/// the GSC client object.
+struct PxpOwner {
+    pxp: Arc<crate::intel_gpu_gt::media::pxp::Pxp>,
+    engine: crate::intel_gpu_gt::media::pxp::Engine<crate::intel_gpu_gt::media::pxp::GemClient>,
 }
 
 type GscOwner = crate::intel_gpu_gt::media::gsc::owner::GscOwner<
@@ -339,6 +354,8 @@ struct Owner {
     user_engines: Arc<core::sync::atomic::AtomicU32>,
     /// Published standalone media GT (native Xe gt_id 1), opt-in only.
     user_media: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::MediaGtStatus>>>,
+    /// `xe->pxp` once xe_pxp_init succeeded (`narf.intel.pxp=1`).
+    user_pxp: IrqSafeSpinLock<Option<Arc<crate::intel_gpu_gt::media::pxp::Pxp>>>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     eu_info: IrqSafeSpinLock<Option<crate::intel_gpu_eu_stall::Info>>,
     oa_info: IrqSafeSpinLock<Option<crate::intel_gpu_oa::Device>>,
@@ -1187,6 +1204,19 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             })
         })
     }
+    fn pxp(&self) -> Option<Arc<crate::intel_gpu_gt::media::pxp::Pxp>> {
+        self.owner.upgrade()?.user_pxp.lock().clone()
+    }
+    fn pxp_wakeref(&self) -> narf_filesystem::FsFuture<'_, Box<dyn core::any::Any + Send>> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let awake = owner.pxp_wakeref().await?;
+            Ok(Box::new(awake) as Box<dyn core::any::Any + Send>)
+        })
+    }
     fn media_gt(&self) -> Option<crate::intel_gpu_user::MediaGtStatus> {
         // GT1 is only addressable beside a live GT0 user epoch.
         if self.epoch.load(Ordering::Acquire) == 0 {
@@ -1832,6 +1862,9 @@ pub(crate) fn start_pending() {
                 gsc: None,
                 gsc_reported: None,
                 gsc_irq_failed: false,
+                pxp: None,
+                pxp_tried: false,
+                kcr_irq_failed: false,
             }),
             suspended: AtomicBool::new(false),
             user_epoch,
@@ -1840,6 +1873,7 @@ pub(crate) fn start_pending() {
             user_version: Arc::new(AtomicU32::new(0)),
             user_engines: Arc::new(core::sync::atomic::AtomicU32::new(0)),
             user_media: Arc::new(IrqSafeSpinLock::new(None)),
+            user_pxp: IrqSafeSpinLock::new(None),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
             eu_info: IrqSafeSpinLock::new(None),
             oa_info: IrqSafeSpinLock::new(None),
@@ -3276,6 +3310,13 @@ impl Owner {
             if let Some(irq) = state.irq.as_ref() {
                 irq.unroute_media();
                 irq.unroute_gsc();
+                irq.unroute_kcr();
+            }
+            // GT1 is not running: a PXP job in flight cannot finish, and
+            // the next GT1 start resumes PXP (xe_pxp_pm_suspend/resume).
+            if let Some(owner) = state.pxp.as_mut() {
+                owner.engine.abort(&owner.pxp);
+                owner.pxp.suspend();
             }
         } else if let Some(publication) = guc.publication() {
             // Every engine executed and retired its private PPGTT job.
@@ -3427,18 +3468,181 @@ impl Owner {
                 if gsc.wedged() { ", wedged" } else { "" }
             );
         }
+        self.service_pxp(state, now);
+    }
+
+    /// `narf.intel.pxp=1` beside a running GT1 with GSCCS0: xe_pxp_init
+    /// once, xe_pxp_pm_resume after every later GT1 start, the KCR route,
+    /// the readiness the uAPI reads, and the worker's PXP hardware steps.
+    /// Without the option nothing here runs.
+    fn service_pxp(&self, state: &mut State, now: u64) {
+        use crate::intel_gpu_gt::media::{pxp, MediaGucState, MediaWindow, PxpQueue};
+        use core::fmt::Write as _;
+        let platform =
+            GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device);
+        if !pxp::admitted(platform, narf_boot::args()) {
+            return;
+        }
+        let Some(platform) = platform else {
+            return;
+        };
+        let State {
+            gsc,
+            media_guc,
+            irq,
+            pxp: owner,
+            pxp_tried,
+            kcr_irq_failed,
+            ..
+        } = state;
+        let (Some(gsc), Some(guc)) = (gsc.as_mut(), media_guc.as_mut()) else {
+            return;
+        };
+        if guc.state() != MediaGucState::Running || !guc.gsccs_scheduled() {
+            return;
+        }
+        let media = MediaWindow::new(&self.pending.window);
+        if owner.is_none() {
+            if core::mem::replace(pxp_tried, true) {
+                return;
+            }
+            // xe_pxp_init: GSCCS0, loadable GSC firmware and (below media
+            // 35) loadable HuC firmware, then a VCS for terminations.
+            let gsc_ok = gsc.status().loadable();
+            let huc_ok = guc.huc_object().is_some();
+            if !gsc_ok || !huc_ok || guc.pxp_vcs().is_none() {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gt card{}: PXP skipped: unsatisfied deps (GSC {}, HuC {}, VCS {})",
+                    self.pending.index,
+                    gsc_ok,
+                    huc_ok,
+                    guc.pxp_vcs().is_some()
+                );
+                return;
+            }
+            pxp::kcr_set(&media, true);
+            let client = match pxp::GemClient::new(platform) {
+                Ok(client) => client,
+                Err(error) => {
+                    // out_kcr_disable; Linux then fails the probe.
+                    pxp::kcr_set(&media, false);
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "intel-gt card{}: PXP initialization failed ({}); PXP disabled",
+                        self.pending.index,
+                        error.errno()
+                    );
+                    return;
+                }
+            };
+            // xe_gsc_create_host_session_id: a random handle (never logged).
+            let session = narf_memory::kaslr::random_u64().0;
+            let shared = pxp::Pxp::new();
+            *owner = Some(PxpOwner {
+                pxp: shared.clone(),
+                engine: pxp::Engine::new(client, session),
+            });
+            *self.user_pxp.lock() = Some(shared);
+            log(self.pending.index, "PXP initialized; KCR enabled");
+        }
+        let owner = owner.as_mut().expect("PXP owner");
+        // xe_irq_enable_hwe's KCR pair, beside the GSC sources.
+        if let Some(irq) = irq.as_ref() {
+            if !irq.kcr_routed() && !*kcr_irq_failed {
+                if let Err(error) = irq.route_kcr() {
+                    *kcr_irq_failed = true;
+                    irq.unroute_kcr();
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "intel-gt card{}: KCR IRQ routing refused ({:?}); PXP terminations cannot complete",
+                        self.pending.index,
+                        error
+                    );
+                }
+            }
+        }
+        // xe_pxp_pm_resume once GT1 runs again and no GSC load is pending.
+        if !owner.pxp.live() {
+            if !gsc.idle() {
+                return;
+            }
+            pxp::kcr_set(&media, true);
+            owner.pxp.resume(true);
+        }
+        if let Some(irq) = irq.as_ref() {
+            owner.pxp.irq(irq.take_kcr_events());
+        }
+        // The HuC is in error once either authentication failed.
+        let huc_error = gsc.huc() == Some(false) || guc.huc_outcome() == Some(false);
+        owner
+            .pxp
+            .publish(pxp::readiness(gsc.status().error(), huc_error, &media));
+        // New PXP work waits while the GSC worker runs; work in flight goes on.
+        let begin = gsc.idle();
+        let _ = owner.engine.poll(
+            &owner.pxp,
+            now,
+            &mut PxpQueue::new(guc, now),
+            &media,
+            begin,
+        );
+    }
+
+    /// xe_pxp_pm_suspend before GT1 stops: the worker's PXP job finishes
+    /// (each step is bounded) or, when the stop cannot `wait`, fails as its
+    /// job would; then queues are killed and keys invalidated. `false`
+    /// while a job still runs.
+    fn suspend_pxp(&self, state: &mut State, now: u64, wait: bool) -> bool {
+        use crate::intel_gpu_gt::media::{MediaGucState, MediaWindow, PxpQueue};
+        let State {
+            pxp, media_guc, ..
+        } = state;
+        let Some(owner) = pxp.as_mut() else {
+            return true;
+        };
+        if !owner.engine.idle() {
+            let media = MediaWindow::new(&self.pending.window);
+            let done = match media_guc
+                .as_mut()
+                .filter(|guc| guc.state() == MediaGucState::Running)
+            {
+                Some(guc) => {
+                    owner
+                        .engine
+                        .quiesce(&owner.pxp, now, &mut PxpQueue::new(guc, now), &media)
+                }
+                None => false,
+            };
+            if !done {
+                if wait {
+                    return false;
+                }
+                owner.engine.abort(&owner.pxp);
+            }
+        }
+        owner.pxp.suspend();
+        true
     }
 
     /// Release the media GT owner's wake requests and advance a verified
     /// media GuC stop before any GT0 stop, park, suspend or fault cleanup.
     fn retire_media(&self, state: &mut State, now: u64) -> MediaRetire {
+        // xe_pxp_pm_suspend first: a PXP job in flight finishes before the
+        // media GuC stops, or fails when fault cleanup cannot wait.
+        let wait = !matches!(state.phase, Phase::Failed | Phase::Cleaning);
+        if !self.suspend_pxp(state, now, wait) {
+            return MediaRetire::Pending;
+        }
         *self.user_media.lock() = None;
         if let Some(irq) = state.irq.as_ref() {
             irq.unroute_media();
             irq.unroute_gsc();
+            irq.unroute_kcr();
         }
         state.media_irq_failed = false;
         state.gsc_irq_failed = false;
+        state.kcr_irq_failed = false;
         state.media_reported = false;
         state.media_guc_tried = false;
         state.media_recovered = false;
@@ -3475,6 +3679,12 @@ impl Owner {
     /// Await a proven media stop before GT0 leaves D0. False leaves the media
     /// GuC retained; the caller must not power down or rebuild the arena.
     async fn stop_media(&self, state: &mut State) -> bool {
+        // xe_pxp_pm_suspend: let a PXP job finish (bounded by its own
+        // deadlines) before the media GuC stops.
+        while !self.suspend_pxp(state, narf_time::monotonic_ns(), true) {
+            narf_scheduler::yield_now().await;
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(1000).as_instant()).await;
+        }
         // xe_gsc_stop_prepare: wait for a running GSC load (bounded by its
         // own step deadlines) before the media GuC stops.
         loop {
@@ -3673,6 +3883,14 @@ impl Owner {
     /// accessible: the function is in D0 and any runtime-resume bring-up has
     /// finished, its publication having reopened local memory. A resume that
     /// failed leaves local memory closed: `NoDevice`.
+    /// xe_pm_runtime_get for PXP: the function resumes and stays in D0 while
+    /// the reference lives (a PXP queue on the list, a readiness query).
+    async fn pxp_wakeref(&self) -> Result<Awake, narf_filesystem::FsError> {
+        let awake = Awake::take(self).await?;
+        drop(self.lock_running().await);
+        Ok(awake)
+    }
+
     async fn vram_wakeref(&self) -> Result<Awake, narf_filesystem::FsError> {
         let awake = Awake::take(self).await?;
         let state = self.lock_running().await;
