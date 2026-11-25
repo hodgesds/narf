@@ -117,8 +117,21 @@ include!("intel_gpu_xelpg_hdmi_tables.rs");
 pub const MAX_TMDS_KHZ_UNSCRAMBLED: u32 = 340_000;
 /// Lowest HDMI TMDS clock (`intel_c20_get_hdmi_rate` range floor).
 pub const MIN_TMDS_KHZ: u32 = 25_000;
-/// `intel_hdmi_is_frl` clocks.
+/// `intel_hdmi_is_frl` clocks: 3, 6, 8, 10 and 12 Gbps per lane.
 const FRL_CLOCKS_KHZ: [u32; 5] = [300_000, 600_000, 800_000, 1_000_000, 1_200_000];
+
+/// `intel_hdmi_is_frl`: `clock_khz` is an FRL rate within
+/// `intel_dpll_clock_matches`' 1 kHz.
+pub const fn is_frl(clock_khz: u32) -> bool {
+    let mut i = 0;
+    while i < FRL_CLOCKS_KHZ.len() {
+        if clock_khz.abs_diff(FRL_CLOCKS_KHZ[i]) <= 1 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
 
 /// `PIPE_FRMCOUNT_G4X`, primary `PLANE_SURF` / `PLANE_SURFLIVE`, relative
 /// to [`Pipe::base`].
@@ -139,6 +152,16 @@ pub enum HdmiError {
     UnsupportedClock(u32),
     /// The clock is an FRL rate or FRL-ambiguous.
     FrlClock(u32),
+    /// The mode's TMDS clock is above the 600 MHz source maximum and the
+    /// sink declares HDMI 2.1 FRL. Linux 7.4 has no native FRL link
+    /// training for the source (`intel_hdmi_mode_valid` prunes these
+    /// modes; its FRL path is a DP PCON's), so the stream is refused.
+    FrlUnsupported {
+        /// The mode's TMDS clock in kHz.
+        clock_khz: u32,
+        /// `intel_hdmi_sink_max_frl_rate` in Gbps.
+        sink_max_frl_gbps: u32,
+    },
     /// The clock is above 340 MHz and the sink declares no scrambling
     /// (no SCDC or no Max_TMDS_Character_Rate in its HF-VSDB/HF-SCDB).
     ScramblingRequired(u32),
@@ -228,6 +251,29 @@ pub struct SinkScdc {
 /// `cea_db_collection_size` bounds (bytes 4..d, d in 4..=127).
 pub fn parse_sink_scdc(edid: &[u8]) -> SinkScdc {
     let mut out = SinkScdc::default();
+    for_each_forum_block(edid, |hf| {
+        if hf[6] & 0x80 != 0 {
+            out.scdc = true;
+        }
+        if hf[5] != 0 {
+            let max = u32::from(hf[5]) * 5_000;
+            if max > MAX_TMDS_KHZ_UNSCRAMBLED {
+                out.max_tmds_clock_khz = max;
+            }
+            if out.scdc {
+                out.scrambling = true;
+                if hf[6] & 0x08 != 0 {
+                    out.low_rates = true;
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Run `f` on every HDMI Forum block (header byte first, at least eight
+/// bytes) of `edid`'s valid revision 3+ CTA extensions.
+fn for_each_forum_block(edid: &[u8], mut f: impl FnMut(&[u8])) {
     for ext in edid.chunks_exact(128).skip(1) {
         let sum = ext.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
         if ext[0] != CEA_EXT || ext[1] < 3 || sum != 0 {
@@ -249,26 +295,11 @@ pub fn parse_sink_scdc(edid: &[u8]) -> SinkScdc {
                 && ((tag == CTA_DB_VENDOR && hf[1..4] == HDMI_FORUM_OUI)
                     || (tag == CTA_DB_EXTENDED_TAG && hf[1] == CTA_EXT_DB_HF_SCDB));
             if forum {
-                if hf[6] & 0x80 != 0 {
-                    out.scdc = true;
-                }
-                if hf[5] != 0 {
-                    let max = u32::from(hf[5]) * 5_000;
-                    if max > MAX_TMDS_KHZ_UNSCRAMBLED {
-                        out.max_tmds_clock_khz = max;
-                    }
-                    if out.scdc {
-                        out.scrambling = true;
-                        if hf[6] & 0x08 != 0 {
-                            out.low_rates = true;
-                        }
-                    }
-                }
+                f(hf);
             }
             index += 1 + len;
         }
     }
-    out
 }
 
 /// The TMDS link state the source drives: `crtc_state->hdmi_scrambling`
@@ -303,6 +334,158 @@ pub fn tmds_link(clock_khz: u32, sink: &SinkScdc) -> Result<TmdsLink, HdmiError>
         scrambling: sink.scrambling && (sink.low_rates || high),
         high_tmds_clock_ratio: sink.scrambling && high,
     })
+}
+
+// ── HDMI 2.1 FRL facts ───────────────────────────────────────────────
+//
+// Linux 7.4 has no native HDMI FRL link training for the source: the SCDC
+// FRL registers (`SCDC_CONFIG_1`, `SCDC_FLT_READY`, `SCDC_STATUS_FLAGS_1`)
+// are only read by `drm_scdc_read_state` for debugfs, i915 never writes
+// them, and `intel_hdmi_mode_valid` prunes every mode above 600 MHz
+// ("Current platforms do not support FRL"). What it has is the rate
+// detection (`intel_hdmi_is_frl`, `intel_hdmi_sink_max_frl_rate`,
+// `intel_hdmi_sink_dsc_max_frl_rate`, used by the DP PCON path) and the
+// PHY half: the FRL entries of `mtl_c20_hdmi_tables[]`, the FRL VDR
+// parameters ([`crate::intel_gpu_xelpg::C20Vdr::hdmi`]), the DIV18CLK
+// clock select ([`crate::intel_gpu_xelpg::ddi_clock_select`]) and the
+// FRL link symbol clock
+// ([`crate::intel_gpu_xelpg::hdmi_link_symbol_clock_khz`]). Those are
+// carried here; an FRL stream stays a typed refusal
+// ([`HdmiError::FrlUnsupported`], [`HdmiError::FrlClock`]).
+
+/// The sink's FRL capability as `drm_parse_hdmi_forum_scds` records it
+/// (`drm_get_max_frl_rate` of `hf_scds[7]` bits 7:4, and of `hf_scds[12]`
+/// when `hf_scds[11]` declares DSC).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SinkFrl {
+    /// `hdmi.max_lanes`.
+    pub max_lanes: u8,
+    /// `hdmi.max_frl_rate_per_lane` (Gbps).
+    pub max_frl_rate_per_lane: u8,
+    /// `hdmi.dsc_cap.max_lanes`.
+    pub dsc_max_lanes: u8,
+    /// `hdmi.dsc_cap.max_frl_rate_per_lane` (Gbps).
+    pub dsc_max_frl_rate_per_lane: u8,
+}
+
+impl SinkFrl {
+    /// `intel_hdmi_sink_max_frl_rate`: lanes × rate per lane (Gbps).
+    pub const fn max_frl_rate(&self) -> u32 {
+        self.max_lanes as u32 * self.max_frl_rate_per_lane as u32
+    }
+
+    /// `intel_hdmi_sink_dsc_max_frl_rate`: 0 unless both DSC fields are set.
+    pub const fn dsc_max_frl_rate(&self) -> u32 {
+        if self.dsc_max_lanes == 0 || self.dsc_max_frl_rate_per_lane == 0 {
+            0
+        } else {
+            self.dsc_max_lanes as u32 * self.dsc_max_frl_rate_per_lane as u32
+        }
+    }
+}
+
+/// `drm_get_max_frl_rate`: (lanes, Gbps per lane) of a `Max_FRL_Rate` code.
+pub const fn max_frl_rate(code: u8) -> (u8, u8) {
+    match code {
+        1 => (3, 3),
+        2 => (3, 6),
+        3 => (4, 6),
+        4 => (4, 8),
+        5 => (4, 10),
+        6 => (4, 12),
+        7 => (4, 16),
+        8 => (4, 20),
+        9 => (4, 24),
+        _ => (0, 0),
+    }
+}
+
+/// Parse the FRL fields of `edid`'s HDMI Forum blocks (the HF-VSDB or
+/// HF-SCDB [`parse_sink_scdc`] walks).
+pub fn parse_sink_frl(edid: &[u8]) -> SinkFrl {
+    let mut out = SinkFrl::default();
+    for_each_forum_block(edid, |hf| {
+        if hf[7] != 0 {
+            (out.max_lanes, out.max_frl_rate_per_lane) = max_frl_rate(hf[7] >> 4);
+        }
+        // cea_db_payload_len(hf_scds) >= 11 && hf_scds[11]: drm_parse_dsc_info,
+        // whose max FRL rate needs a payload of 12 and a nonzero hf_scds[12].
+        if hf.len() > 11 && hf[11] != 0 && hf.len() > 12 && hf[12] != 0 {
+            (out.dsc_max_lanes, out.dsc_max_frl_rate_per_lane) = max_frl_rate(hf[12] >> 4);
+        }
+    });
+    out
+}
+
+/// The FRL entries of Linux 7.4 `mtl_c20_hdmi_tables[]` (`mtl_c20_hdmi_300`
+/// .. `mtl_c20_hdmi_1200`), hand-transcribed: (port clock kHz, PLL state).
+/// No route programs them.
+pub const C20_HDMI_FRL_TABLES: [(u32, C20PllState); 5] = [
+    (
+        300_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x309C, 0x2110, 0xCA06, 0xBE40, 0x0000, 0x0000, 0x2200, 0x0001, 0x2000, 0x0000,
+                0x0004,
+            ],
+        },
+    ),
+    (
+        600_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x109C, 0x2108, 0xCA06, 0xBE40, 0x0000, 0x0000, 0x2200, 0x0001, 0x2000, 0x0000,
+                0x0004,
+            ],
+        },
+    ),
+    (
+        800_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x10D0, 0x2108, 0x4A06, 0xBE40, 0x0000, 0x0000, 0x2200, 0x0003, 0x2AAA, 0x0002,
+                0x0004,
+            ],
+        },
+    ),
+    (
+        1_000_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x1104, 0x2108, 0x0A06, 0xBE40, 0x0000, 0x0000, 0x2200, 0x0003, 0x3555, 0x0001,
+                0x0004,
+            ],
+        },
+    ),
+    (
+        1_200_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x1138, 0x2108, 0x5486, 0xFE40, 0x0000, 0x0000, 0x2200, 0x0001, 0x4000, 0x0000,
+                0x0004,
+            ],
+        },
+    ),
+];
+
+/// The C20 FRL PLL state and VDR parameters for an FRL port clock (the
+/// table entry and `intel_c20_calc_vdr_params`); `None` for any other
+/// clock.
+pub fn c20_hdmi_frl_state(port_clock_khz: u32) -> Option<(C20PllState, C20Vdr)> {
+    let (_, state) = C20_HDMI_FRL_TABLES
+        .iter()
+        .find(|(clock, _)| *clock == port_clock_khz)?;
+    Some((*state, C20Vdr::hdmi(port_clock_khz)?))
 }
 
 // ── SCDC (drm_scdc_helper.c over the GMBUS transport) ─────────────────
@@ -650,7 +833,7 @@ pub fn hdmi_pll_request_kind(
     legacy: bool,
     c20_tx_cfg1: Option<u16>,
 ) -> Result<PllRequest, HdmiError> {
-    if FRL_CLOCKS_KHZ.contains(&clock_khz) {
+    if is_frl(clock_khz) {
         return Err(HdmiError::FrlClock(clock_khz));
     }
     if clock_khz < MIN_TMDS_KHZ {
@@ -912,12 +1095,34 @@ fn output_for<M: MmioWindow + ?Sized>(
     let y420 = parse_ycbcr420(edid);
     let vic = vic_for_mode(mode);
     let allowed = parse_hdmi_vsdb(edid).is_some() && !ip.is_display30() && mode.h_active <= 8192;
-    if allowed && y420.only(vic) {
-        return link_for(SinkFormat::Ycbcr420);
-    }
-    match link_for(SinkFormat::Rgb) {
-        Err(e) if allowed && y420.also(vic) => link_for(SinkFormat::Ycbcr420).map_err(|_| e),
-        result => result,
+    let result = if allowed && y420.only(vic) {
+        link_for(SinkFormat::Ycbcr420)
+    } else {
+        match link_for(SinkFormat::Rgb) {
+            Err(e) if allowed && y420.also(vic) => link_for(SinkFormat::Ycbcr420).map_err(|_| e),
+            result => result,
+        }
+    };
+    result.map_err(|e| frl_refusal(e, edid))
+}
+
+/// A clock above the 600 MHz source maximum on a sink that declares FRL
+/// (`intel_hdmi_sink_max_frl_rate` nonzero) is [`HdmiError::FrlUnsupported`]:
+/// only FRL could carry it, and Linux has no native FRL training.
+fn frl_refusal(e: HdmiError, edid: &[u8]) -> HdmiError {
+    match e {
+        HdmiError::UnsupportedClock(clock_khz) | HdmiError::FrlClock(clock_khz)
+            if clock_khz > SOURCE_MAX_TMDS_KHZ =>
+        {
+            match parse_sink_frl(edid).max_frl_rate() {
+                0 => e,
+                sink_max_frl_gbps => HdmiError::FrlUnsupported {
+                    clock_khz,
+                    sink_max_frl_gbps,
+                },
+            }
+        }
+        e => e,
     }
 }
 

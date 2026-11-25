@@ -1043,3 +1043,161 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_hdmi",
     smoke_c10_hdmi_snps_pll_matches_linux
 );
+
+/// HF-VSDB with the FRL and DSC bytes (`hf_scds[7]`, `[11]`, `[12]`):
+/// payload 12, rate 120 (600 MHz), SCDC.
+fn hf_vsdb_frl(frl: u8, dsc: u8, dsc_frl: u8) -> [u8; 13] {
+    [
+        (3 << 5) | 12,
+        0xD8,
+        0x5D,
+        0xC4,
+        1,
+        120,
+        0x80,
+        frl,
+        0,
+        0,
+        0,
+        dsc,
+        dsc_frl,
+    ]
+}
+
+/// The HDMI 2.1 FRL facts Linux 7.4 carries, pinned against its sources:
+/// `intel_hdmi_is_frl` (with `intel_dpll_clock_matches`' 1 kHz),
+/// `drm_get_max_frl_rate` / `intel_hdmi_sink_max_frl_rate` /
+/// `intel_hdmi_sink_dsc_max_frl_rate`, the FRL entries of
+/// `mtl_c20_hdmi_tables[]`, `intel_c20_calc_vdr_params` /
+/// `intel_c20_get_hdmi_rate`, `intel_program_port_clock_ctl`'s DIV18CLK and
+/// `intel_ddi_link_symbol_clock`. The route still refuses FRL: a mode above
+/// the source's 600 MHz on an FRL sink is `FrlUnsupported`.
+fn smoke_xe_hdmi_frl_facts_and_refusal() -> TestResult {
+    use crate::intel_gpu_xelpg::{
+        c20_hdmi_rate, ddi_clock_select, hdmi_link_symbol_clock_khz, C20_SERDES_IS_HDMI_FRL,
+        DDI_CLOCK_SELECT_DIV18CLK,
+    };
+    for (clock, frl) in [
+        (300_000, true),
+        (299_999, true),
+        (600_001, true),
+        (800_000, true),
+        (1_000_000, true),
+        (1_200_001, true),
+        (299_998, false),
+        (297_000, false),
+        (594_000, false),
+    ] {
+        if is_frl(clock) != frl {
+            return TestResult::Fail("intel_hdmi_is_frl takes the five rates within 1 kHz");
+        }
+    }
+    // An FRL-ambiguous TMDS clock refuses with the 1 kHz tolerance too.
+    if hdmi_pll_request(XeLpgPort::B, 299_999, false) != Err(HdmiError::FrlClock(299_999)) {
+        return TestResult::Fail("an FRL clock within 1 kHz must refuse as FRL");
+    }
+    // drm_get_max_frl_rate: code 6 is 4 lanes x 12 Gbps, code 3 is 4 x 6.
+    let frl = parse_sink_frl(&edid_with_cta(edid_4k60(), &hf_vsdb_frl(0x60, 0x80, 0x30)));
+    if frl
+        != (SinkFrl {
+            max_lanes: 4,
+            max_frl_rate_per_lane: 12,
+            dsc_max_lanes: 4,
+            dsc_max_frl_rate_per_lane: 6,
+        })
+        || frl.max_frl_rate() != 48
+        || frl.dsc_max_frl_rate() != 24
+    {
+        return TestResult::Fail("the HF-VSDB FRL fields must decode as drm_edid does");
+    }
+    // Code 1 is 3 lanes x 3 Gbps; no DSC byte, no DSC rate.
+    let frl = parse_sink_frl(&edid_with_cta(edid_4k60(), &hf_vsdb_frl(0x10, 0, 0x30)));
+    if frl.max_frl_rate() != 9 || frl.dsc_max_frl_rate() != 0 {
+        return TestResult::Fail("a 3x3 FRL sink without DSC must decode as 9 Gbps, no DSC");
+    }
+    if parse_sink_frl(&edid_with_cta(edid_4k60(), &hf_vsdb(120, 0x80))) != SinkFrl::default() {
+        return TestResult::Fail("an HF-VSDB without FRL must declare none");
+    }
+    // The C20 FRL tables and VDR parameters.
+    match c20_hdmi_frl_state(1_000_000) {
+        Some((state, vdr))
+            if state.tx == [0xBE98, 0x8800, 0x0000]
+                && state.mpllb[0] == 0x1104
+                && state.mpllb[8] == 0x3555
+                && vdr.custom_width == 1
+                && vdr.serdes_rate == C20_SERDES_IS_HDMI_FRL
+                && vdr.hdmi_rate == Some(3) => {}
+        _ => return TestResult::Fail("mtl_c20_hdmi_1000 and its FRL VDR differ from Linux"),
+    }
+    match c20_hdmi_frl_state(1_200_000) {
+        Some((state, vdr)) if state.mpllb[3] == 0xFE40 && vdr.hdmi_rate == Some(1) => {}
+        _ => return TestResult::Fail("mtl_c20_hdmi_1200 and its HDMI rate differ from Linux"),
+    }
+    if c20_hdmi_frl_state(594_000).is_some()
+        || C20Vdr::hdmi(800_000).and_then(|v| v.hdmi_rate) != Some(2)
+        || C20Vdr::hdmi(148_500) != Some(C20Vdr::hdmi_tmds())
+        // Linux: 300 MHz is FRL for the width/serdes byte, TMDS for the rate.
+        || C20Vdr::hdmi(300_000)
+            != Some(C20Vdr {
+                custom_width: 1,
+                serdes_rate: C20_SERDES_IS_HDMI_FRL,
+                hdmi_rate: Some(0),
+            })
+        || C20Vdr::hdmi(25_000).is_some()
+        || c20_hdmi_rate(1_100_000).is_some()
+    {
+        return TestResult::Fail("intel_c20_calc_vdr_params' HDMI cases differ from Linux");
+    }
+    // DIV18CLK and the 18-bit FRL symbol clock; TMDS keeps maxPCLK.
+    let mut req = hdmi_pll_request(XeLpgPort::B, 594_000, false).unwrap();
+    if ddi_clock_select(&req) != DDI_CLOCK_SELECT_MAXPCLK {
+        return TestResult::Fail("TMDS must select maxPCLK");
+    }
+    req.port_clock_khz = 1_200_000;
+    if ddi_clock_select(&req) != DDI_CLOCK_SELECT_DIV18CLK
+        || hdmi_link_symbol_clock_khz(1_200_000) != 666_667
+        || hdmi_link_symbol_clock_khz(800_000) != 444_444
+        || hdmi_link_symbol_clock_khz(594_000) != 594_000
+    {
+        return TestResult::Fail("FRL must select DIV18CLK and an 18-bit symbol clock");
+    }
+    // A 640 MHz mode on a 48 Gbps FRL sink: only FRL could carry it.
+    let edid = edid_with_cta(
+        edid_for(640_000, 3840, 560, 176, 88, 2160, 90, 8, 10),
+        &hf_vsdb_frl(0x60, 0, 0),
+    );
+    let io = ddi_b_hdmi_sink(&edid);
+    match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
+        Err(HdmiError::FrlUnsupported {
+            clock_khz: 640_000,
+            sink_max_frl_gbps: 48,
+        }) => {}
+        _ => return TestResult::Fail("a mode only FRL carries must refuse FrlUnsupported"),
+    }
+    // Without FRL in the sink it stays an unsupported clock.
+    let edid = edid_with_cta(
+        edid_for(640_000, 3840, 560, 176, 88, 2160, 90, 8, 10),
+        &hf_vsdb(120, 0x80),
+    );
+    let io = ddi_b_hdmi_sink(&edid);
+    match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
+        Err(HdmiError::UnsupportedClock(640_000)) => TestResult::Pass,
+        _ => TestResult::Fail("a TMDS sink's 640 MHz mode must stay UnsupportedClock"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_xe_hdmi_frl_facts_and_refusal
+);

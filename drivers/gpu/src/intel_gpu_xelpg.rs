@@ -370,6 +370,8 @@ fn ddi_clock_select_mask<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
 }
 /// Clock select for a PHY PLL output (maxPCLK): the DP value.
 pub const DDI_CLOCK_SELECT_MAXPCLK: u32 = 0x8 << 12;
+/// `XELPDP_DDI_CLOCK_SELECT_DIV18CLK`: the HDMI FRL clock select.
+pub const DDI_CLOCK_SELECT_DIV18CLK: u32 = 0x9 << 12;
 
 pub const TBT_CLOCK_REQUEST: u32 = 1 << 19;
 pub const TBT_CLOCK_ACK: u32 = 1 << 18;
@@ -1377,6 +1379,50 @@ impl C20Vdr {
             hdmi_rate: Some(0),
         }
     }
+    /// HDMI at `port_clock_khz` (`intel_c20_calc_vdr_params` with `is_dp`
+    /// false): an FRL rate (`intel_hdmi_is_frl`) takes custom width 1
+    /// (`intel_get_c20_custom_width`) and `PHY_C20_IS_HDMI_FRL`, and every
+    /// clock takes `intel_c20_get_hdmi_rate`. `None` for a clock that
+    /// function has no case for. Linux classifies 300 and 600 MHz as FRL
+    /// here while `intel_c20_get_hdmi_rate` returns their TMDS rate 0; the
+    /// TMDS route refuses both clocks before any PHY write.
+    pub fn hdmi(port_clock_khz: u32) -> Option<Self> {
+        let frl = crate::intel_gpu_xelpg_hdmi::is_frl(port_clock_khz);
+        Some(Self {
+            custom_width: if frl { 1 } else { 0 },
+            serdes_rate: if frl { C20_SERDES_IS_HDMI_FRL } else { 0 },
+            hdmi_rate: Some(c20_hdmi_rate(port_clock_khz)?),
+        })
+    }
+}
+
+/// `PHY_C20_IS_HDMI_FRL` (bit 7 of the serdes-rate byte).
+pub const C20_SERDES_IS_HDMI_FRL: u8 = 1 << 7;
+
+/// `intel_c20_get_hdmi_rate`: 0 for the TMDS range 25.175–600 MHz, then
+/// the FRL rates by exact clock (3, 6 and 12 Gbps: 1; 8 Gbps: 2; 10 Gbps:
+/// 3). `None` where Linux hits `MISSING_CASE`.
+pub const fn c20_hdmi_rate(port_clock_khz: u32) -> Option<u8> {
+    if port_clock_khz >= 25_175 && port_clock_khz <= 600_000 {
+        return Some(0);
+    }
+    match port_clock_khz {
+        300_000 | 600_000 | 1_200_000 => Some(1),
+        800_000 => Some(2),
+        1_000_000 => Some(3),
+        _ => None,
+    }
+}
+
+/// `intel_ddi_link_symbol_clock` for an HDMI port clock: an FRL rate
+/// carries `DIV_ROUND_CLOSEST(clock * 10, 18)` (18-bit FRL characters),
+/// TMDS the port clock itself. It is what `DDI_CLK_VALFREQ` carries.
+pub const fn hdmi_link_symbol_clock_khz(port_clock_khz: u32) -> u32 {
+    if crate::intel_gpu_xelpg_hdmi::is_frl(port_clock_khz) {
+        ((port_clock_khz as u64 * 10 + 9) / 18) as u32
+    } else {
+        port_clock_khz
+    }
 }
 
 /// `PHY_C20_VDR_HDMI_RATE`.
@@ -1881,9 +1927,19 @@ pub struct PllRequest {
     pub protocol_switch: bool,
 }
 
+/// `intel_program_port_clock_ctl`'s clock select: DIV18CLK for an HDMI
+/// FRL port clock (`!is_dp && intel_hdmi_is_frl`), maxPCLK otherwise.
+pub fn ddi_clock_select(req: &PllRequest) -> u32 {
+    if req.hdmi && crate::intel_gpu_xelpg_hdmi::is_frl(req.port_clock_khz) {
+        DDI_CLOCK_SELECT_DIV18CLK
+    } else {
+        DDI_CLOCK_SELECT_MAXPCLK
+    }
+}
+
 /// `intel_cx0pll_enable` for an explicit PLL state (DP or HDMI TMDS):
-/// PORT_CLOCK_CTL (forward ungate, maxPCLK — FRL's DIV18CLK is not
-/// admitted — SSC on PLLB only when requested), lane reset, P2 ready,
+/// PORT_CLOCK_CTL (forward ungate, maxPCLK — DIV18CLK for an HDMI FRL
+/// clock, which no caller admits — SSC on PLLB only when requested), lane reset, P2 ready,
 /// message-bus timer, PLL state, TX enables, `DDI_CLK_VALFREQ`, PCLK PLL
 /// request/ACK and, for HDMI on C10, the Wa_13013502646 P0→P2 toggle.
 pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
@@ -1926,7 +1982,7 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
             | SSC_ENABLE_PLLA
             | SSC_ENABLE_PLLB,
         FORWARD_CLOCK_UNGATE
-            | DDI_CLOCK_SELECT_MAXPCLK
+            | ddi_clock_select(req)
             | ssc
             | if req.lanes.reversed {
                 LANE1_PHY_CLOCK_SELECT
@@ -1958,7 +2014,7 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
         mmio.write32(
             off,
             if req.hdmi {
-                req.port_clock_khz
+                hdmi_link_symbol_clock_khz(req.port_clock_khz)
             } else {
                 dp_link_symbol_clock_khz(req.port_clock_khz)
             },
