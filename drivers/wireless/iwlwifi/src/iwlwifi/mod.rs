@@ -86,7 +86,6 @@ pub use bootstrap::gen2_shared_memory_configuration;
 pub use bootstrap::gen2_transmit_power_request;
 #[cfg(feature = "builtin")]
 pub use bootstrap::{provision, provision_state, ProvisionState};
-#[cfg(feature = "builtin")]
 pub use mvm_boot::PowerRequest as Gen2TransmitPowerRequest;
 mod gen2_smem;
 pub use gen2_smem::SharedMemory as Gen2SharedMemory;
@@ -123,13 +122,10 @@ mod mld_power;
 mod mld_regulatory;
 mod mld_start;
 pub mod mlme;
-#[cfg(feature = "builtin")]
 mod mvm_boot;
-#[cfg(feature = "builtin")]
 mod mvm_d3;
 #[cfg(feature = "builtin")]
 mod mvm_device;
-#[cfg(feature = "builtin")]
 mod mvm_publication;
 mod native_band;
 #[cfg(feature = "builtin")]
@@ -155,6 +151,7 @@ pub mod pnvm;
 mod progress;
 pub mod qos;
 pub mod rates;
+mod reg_source;
 pub mod regs;
 pub mod rekey;
 pub mod runtime;
@@ -195,7 +192,7 @@ pub mod module;
 /// Roles the module build does not carry, under the names the shared station
 /// code uses (`module/absent.rs`).
 #[cfg(feature = "module")]
-use module::absent::{mvm_boot, p2p_client, p2p_go};
+use module::absent::{p2p_client, p2p_go};
 
 #[cfg(feature = "builtin")]
 use alloc::boxed::Box;
@@ -1662,7 +1659,7 @@ pub fn register() {
 /// Whether `iwlwifi.ko` carries `chip`: the one predicate behind the module's
 /// PCI claim and `register_builtin_only`, so the two never disagree.
 pub fn module_carries(chip: &ChipConfig) -> bool {
-    chip.generation == Generation::Gen3
+    matches!(chip.generation, Generation::Gen2 | Generation::Gen3)
 }
 
 /// `narf-drivers-wireless/iwlwifi-module-only`: register every id except the

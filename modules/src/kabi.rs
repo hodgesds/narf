@@ -1975,6 +1975,35 @@ kernel_abi! {
     }
 
     // ── end rtl.ko block ───────────────────────────────────────────────
+
+    // ── Firmware signer identity (iwlwifi.ko) ───────────────────────────
+    //
+    // Additive. `narf_firmware_signed` answers whether a blob is signed;
+    // iwlwifi's Gen2 power programs also bind the signer key itself, as its
+    // built-in `firmware_asset::Asset::signer` does.
+
+    /// Copy the verified signer key of open firmware `handle` (32 bytes) into
+    /// `out`. Returns 0, `-ENODATA` when the blob is unsigned, `-EINVAL` for a
+    /// null or short output, or `-EBADF`.
+    ///
+    /// # Safety
+    /// `out` must name `len` writable bytes for the call.
+    requires narf_capabilities::CapKind::Firmware;
+    fn narf_firmware_signer(handle: u64, out: *mut u8, len: usize) -> i32 {
+        if out.is_null() || len < 32 {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_firmware::module_fetch::signer(owner, handle) {
+            Ok(Some(key)) => {
+                // SAFETY: non-null and at least 32 writable bytes.
+                unsafe { core::ptr::copy_nonoverlapping(key.as_ptr(), out, 32) };
+                0
+            }
+            Ok(None) => -61,
+            Err(errno) => errno,
+        }
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -2750,3 +2779,32 @@ fn smoke_kabi_pci_cfg_window_exports_validate() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_pci_cfg_window_exports_validate);
+
+// ── narf_firmware_signer (iwlwifi.ko) ──────────────────────────────────
+
+/// `narf_firmware_signer` refuses a null or short output before any lookup,
+/// answers `-EBADF` for a handle the caller does not hold, and needs the
+/// `Firmware` cap to link.
+fn smoke_kabi_firmware_signer_validates_arguments() -> TestResult {
+    use narf_capabilities::CapKind;
+    let mut key = [0x5au8; 32];
+    // SAFETY: the pointer is null (to prove rejection) or names 32 bytes.
+    let ok = unsafe {
+        narf_firmware_signer(1, core::ptr::null_mut(), 32) == -22
+            && narf_firmware_signer(1, key.as_mut_ptr(), 31) == -22
+            && narf_firmware_signer(u64::MAX, key.as_mut_ptr(), 32) == -9
+    };
+    if !ok || key != [0x5a; 32] {
+        return TestResult::Fail("narf_firmware_signer accepted a malformed output or handle");
+    }
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    match crate::symbols::resolve("narf_firmware_signer", None, &denied) {
+        Err(crate::symbols::ResolveError::CapMissing(CapKind::Firmware)) => TestResult::Pass,
+        _ => TestResult::Fail("narf_firmware_signer resolved without the Firmware cap"),
+    }
+}
+kernel_test_in!(
+    "modules/kabi",
+    smoke_kabi_firmware_signer_validates_arguments
+);

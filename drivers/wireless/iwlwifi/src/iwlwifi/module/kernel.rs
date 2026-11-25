@@ -98,6 +98,272 @@ pub mod narf_net {
     }
 }
 
+/// `narf_firmware`: the loader authority and its error type. A module's
+/// firmware authority is its manifest `Firmware` cap, which the kernel checks
+/// at every `narf_firmware_open`; the loads go through `module::firmware_asset`.
+pub mod narf_firmware {
+    use super::narf_capabilities::{Cap, Read};
+
+    /// Marker for a firmware blob's authority.
+    #[derive(Clone, Copy, Debug)]
+    pub struct FirmwareBlob;
+    /// Marker for the firmware registry's authority.
+    #[derive(Clone, Copy, Debug)]
+    pub struct FirmwareRegistry;
+
+    /// Why a firmware file could not be had (the kernel type's variants).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FirmwareError {
+        NotFound,
+        SignatureInvalid,
+        BadFormat,
+        OutOfMemory,
+        AuthorityRevoked,
+        UnsignedRejected,
+        InvalidName,
+        BufferTooSmall,
+    }
+
+    /// The loader authority: always present for a module (see above).
+    pub fn trusted_loader_authority() -> Option<Cap<FirmwareRegistry, Read>> {
+        Some(Cap::device())
+    }
+}
+
+/// `narf_firmware_smbios`: the SMBIOS BIOS (type 0), system (type 1) and
+/// baseboard (type 2) records, parsed from the same raw table the kernel
+/// parses (`narf_smbios_read` returns its boot table) with the kernel
+/// parser's rules: strings by 1-based pool index, truncated into fixed
+/// zero-padded fields, at most one BIOS and system record and four
+/// baseboards. Read once, on first use.
+pub mod narf_firmware_smbios {
+    use super::narf_lib::sync::IrqSafeSpinLock;
+    use alloc::vec::Vec;
+
+    mod ffi {
+        unsafe extern "C" {
+            pub fn narf_smbios_read(
+                off: usize,
+                buf: *mut u8,
+                len: usize,
+                out_total: *mut usize,
+            ) -> i32;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SmbiosBios {
+        pub vendor: [u8; 64],
+        pub version: [u8; 64],
+        pub release_date: [u8; 16],
+        pub rom_size: u8,
+    }
+    impl SmbiosBios {
+        pub const ZERO: Self = Self {
+            vendor: [0; 64],
+            version: [0; 64],
+            release_date: [0; 16],
+            rom_size: 0,
+        };
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SmbiosSystem {
+        pub manufacturer: [u8; 64],
+        pub product_name: [u8; 64],
+        pub version: [u8; 64],
+        pub serial_number: [u8; 64],
+        pub uuid: [u8; 16],
+        pub wake_up_type: u8,
+    }
+    impl SmbiosSystem {
+        pub const ZERO: Self = Self {
+            manufacturer: [0; 64],
+            product_name: [0; 64],
+            version: [0; 64],
+            serial_number: [0; 64],
+            uuid: [0; 16],
+            wake_up_type: 0,
+        };
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SmbiosBaseboard {
+        pub manufacturer: [u8; 64],
+        pub product: [u8; 64],
+        pub version: [u8; 64],
+        pub serial: [u8; 64],
+    }
+    impl SmbiosBaseboard {
+        pub const ZERO: Self = Self {
+            manufacturer: [0; 64],
+            product: [0; 64],
+            version: [0; 64],
+            serial: [0; 64],
+        };
+    }
+
+    /// The kernel parser's per-type limits.
+    const MAX_BIOS: usize = 1;
+    const MAX_SYSTEM: usize = 1;
+    const MAX_BASEBOARD: usize = 4;
+
+    struct Tables {
+        bios: Vec<SmbiosBios>,
+        system: Vec<SmbiosSystem>,
+        baseboards: Vec<SmbiosBaseboard>,
+    }
+
+    static TABLES: IrqSafeSpinLock<Option<Option<Tables>>> = IrqSafeSpinLock::new(None);
+
+    fn raw_table() -> Option<Vec<u8>> {
+        let mut total = 0usize;
+        // SAFETY: sizing call — null buffer, zero length, live `total`.
+        if unsafe { ffi::narf_smbios_read(0, core::ptr::null_mut(), 0, &mut total) } != 0
+            || total == 0
+        {
+            return None;
+        }
+        let mut table = alloc::vec![0u8; total];
+        // SAFETY: `table` names `total` writable bytes.
+        if unsafe { ffi::narf_smbios_read(0, table.as_mut_ptr(), total, &mut total) } != 0 {
+            return None;
+        }
+        table.truncate(total);
+        Some(table)
+    }
+
+    /// The kernel's `lookup_string`.
+    fn lookup_string(pool: &[u8], idx: u8) -> &[u8] {
+        if idx == 0 {
+            return &[];
+        }
+        let mut start = 0usize;
+        let mut count = 0u8;
+        while start < pool.len() {
+            let end = match pool[start..].iter().position(|&b| b == 0) {
+                Some(off) => start + off,
+                None => return &[],
+            };
+            count += 1;
+            if count == idx {
+                return &pool[start..end];
+            }
+            start = end + 1;
+        }
+        &[]
+    }
+
+    /// The kernel's `copy_truncated`.
+    fn copy_truncated(dst: &mut [u8], src: &[u8]) {
+        let n = src.len().min(dst.len());
+        dst[..n].copy_from_slice(&src[..n]);
+        for slot in &mut dst[n..] {
+            *slot = 0;
+        }
+    }
+
+    /// The kernel's `pool_end`.
+    fn pool_end(pool: &[u8]) -> usize {
+        let mut i = 0;
+        while i + 1 < pool.len() {
+            if pool[i] == 0 && pool[i + 1] == 0 {
+                return i + 2;
+            }
+            i += 1;
+        }
+        pool.len()
+    }
+
+    /// The kernel's `parse_stream`, types 0/1/2 only.
+    fn parse(bytes: &[u8]) -> Tables {
+        let mut t = Tables {
+            bios: Vec::new(),
+            system: Vec::new(),
+            baseboards: Vec::new(),
+        };
+        let mut cur = 0usize;
+        let mut count = 0u32;
+        while cur + 4 <= bytes.len() {
+            let kind = bytes[cur];
+            let len = bytes[cur + 1] as usize;
+            if kind == 127 {
+                break;
+            }
+            if len < 4 || cur + len > bytes.len() {
+                break;
+            }
+            let fmt = &bytes[cur..cur + len];
+            let pool = &bytes[cur + len..];
+            let pool_len = pool_end(pool);
+            match kind {
+                0 if fmt.len() >= 9 && t.bios.len() < MAX_BIOS => {
+                    let mut rec = SmbiosBios::ZERO;
+                    copy_truncated(&mut rec.vendor, lookup_string(pool, fmt[4]));
+                    copy_truncated(&mut rec.version, lookup_string(pool, fmt[5]));
+                    copy_truncated(&mut rec.release_date, lookup_string(pool, fmt[8]));
+                    rec.rom_size = if fmt.len() > 9 { fmt[9] } else { 0 };
+                    t.bios.push(rec);
+                }
+                1 if fmt.len() >= 25 && t.system.len() < MAX_SYSTEM => {
+                    let mut rec = SmbiosSystem::ZERO;
+                    copy_truncated(&mut rec.manufacturer, lookup_string(pool, fmt[4]));
+                    copy_truncated(&mut rec.product_name, lookup_string(pool, fmt[5]));
+                    copy_truncated(&mut rec.version, lookup_string(pool, fmt[6]));
+                    copy_truncated(&mut rec.serial_number, lookup_string(pool, fmt[7]));
+                    rec.uuid.copy_from_slice(&fmt[8..24]);
+                    rec.wake_up_type = fmt[24];
+                    t.system.push(rec);
+                }
+                2 if fmt.len() >= 9 && t.baseboards.len() < MAX_BASEBOARD => {
+                    let mut rec = SmbiosBaseboard::ZERO;
+                    copy_truncated(&mut rec.manufacturer, lookup_string(pool, fmt[4]));
+                    copy_truncated(&mut rec.product, lookup_string(pool, fmt[5]));
+                    copy_truncated(&mut rec.version, lookup_string(pool, fmt[6]));
+                    copy_truncated(&mut rec.serial, lookup_string(pool, fmt[7]));
+                    t.baseboards.push(rec);
+                }
+                _ => {}
+            }
+            cur += len + pool_len;
+            count += 1;
+            if count > 1024 {
+                break;
+            }
+        }
+        t
+    }
+
+    fn with<R>(f: impl FnOnce(Option<&Tables>) -> R) -> R {
+        let mut cache = TABLES.lock();
+        if cache.is_none() {
+            *cache = Some(raw_table().map(|bytes| parse(&bytes)));
+        }
+        f(cache.as_ref().and_then(Option::as_ref))
+    }
+
+    /// The kernel parsed an SMBIOS table.
+    pub fn is_known() -> bool {
+        with(|t| t.is_some())
+    }
+
+    fn copy_out<T: Copy>(src: &[T], out: &mut [T]) -> usize {
+        let n = src.len().min(out.len());
+        out[..n].copy_from_slice(&src[..n]);
+        n
+    }
+
+    pub fn copy_bios(out: &mut [SmbiosBios]) -> usize {
+        with(|t| t.map_or(0, |t| copy_out(&t.bios, out)))
+    }
+    pub fn copy_system(out: &mut [SmbiosSystem]) -> usize {
+        with(|t| t.map_or(0, |t| copy_out(&t.system, out)))
+    }
+    pub fn copy_baseboard(out: &mut [SmbiosBaseboard]) -> usize {
+        with(|t| t.map_or(0, |t| copy_out(&t.baseboards, out)))
+    }
+}
+
 /// `narf_console`: the boot console.
 pub mod narf_console {
     pub use narf_module_rt::console::Console as Writer;
@@ -125,6 +391,10 @@ pub mod narf_time {
         }
         pub fn expired(&self) -> bool {
             self.0.expired()
+        }
+        /// "Cycles" (nanoseconds) left, zero once expired.
+        pub fn remaining_cycles(&self) -> u64 {
+            self.0.remaining_ns()
         }
     }
 
@@ -264,6 +534,10 @@ pub mod narf_capabilities {
         /// The probed device's authority.
         pub const fn device() -> Self {
             Self(PhantomData)
+        }
+        /// A child authority: the same unit authority.
+        pub fn derive(&self) -> Result<Self, CapError> {
+            Ok(*self)
         }
         /// Run `op` (the KABI enforces the token underneath).
         pub fn invoke<O: CapOp<T, R>>(&self, op: O) -> Result<O::Output, CapError> {

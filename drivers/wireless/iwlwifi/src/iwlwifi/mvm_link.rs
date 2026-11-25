@@ -144,7 +144,8 @@ impl Owner {
     /// preparation. The AP station and its management queue remain TX-disabled.
     pub async fn activate_link(&mut self) -> Result<(), &'static str> {
         self.activate_link_using(|| {
-            narf_wireless::reg::db::get_domain().ok_or("MVM current active-link policy unavailable")
+            crate::iwlwifi::reg_source::get_domain()
+                .ok_or("MVM current active-link policy unavailable")
         })
         .await
     }

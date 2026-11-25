@@ -62,7 +62,7 @@ use super::kernel::narf_time;
 use super::regulatory;
 
 /// KABI exports the netdev glue calls.
-mod ffi {
+pub(super) mod ffi {
     unsafe extern "C" {
         pub fn narf_netif_register_with_context(
             dev: u64,
@@ -98,7 +98,7 @@ mod ffi {
 }
 
 /// `WIFI` family host, version 2 (`wireless/src/module_host.rs`).
-mod wifi {
+pub(super) mod wifi {
     pub const FAMILY: u32 = 0x7769_6669;
     pub const VERSION: u32 = 2;
     pub const OP_REGISTER_WIPHY: u32 = 0x01;
@@ -215,7 +215,7 @@ fn radio() -> Option<Arc<Radio>> {
     RADIO.lock().clone()
 }
 
-fn log(args: core::fmt::Arguments<'_>) {
+pub(super) fn log(args: core::fmt::Arguments<'_>) {
     let _ = writeln!(Writer, "  iwlwifi.ko: {}", args);
 }
 
@@ -232,11 +232,13 @@ impl From<WirelessError> for ScanError {
 }
 
 /// A `CONNECT` event, decoded.
-struct ConnectRequest {
-    bssid: [u8; 6],
-    frequency_mhz: u32,
-    ssid: Vec<u8>,
-    auth: AuthMethod,
+pub(super) struct ConnectRequest {
+    pub(super) bssid: [u8; 6],
+    pub(super) frequency_mhz: u32,
+    pub(super) ssid: Vec<u8>,
+    /// The request's extra association IEs.
+    pub(super) ie: Vec<u8>,
+    pub(super) auth: AuthMethod,
 }
 
 /// `Device::step_owned`'s station-branch output.
@@ -1195,9 +1197,10 @@ extern "C" fn tx_callback(_dev: u64, frame: *const u8, len: usize) -> i32 {
 
 /// Family-host events: queue the work on the executor and accept it; the
 /// outcome is reported when it completes.
-extern "C" fn event_callback(_dev: u64, event: u32, payload: *const u8, len: usize) -> i32 {
+extern "C" fn event_callback(dev: u64, event: u32, payload: *const u8, len: usize) -> i32 {
+    // One session per device: a Gen2 (MVM) radio takes the same events.
     let Some(radio) = radio() else {
-        return ENODEV;
+        return super::mvm_netdev::event_callback(dev, event, payload, len);
     };
     let bytes = if len == 0 || payload.is_null() {
         Vec::new()
@@ -1291,7 +1294,7 @@ async fn connect_and_report(radio: &Radio, request: ConnectRequest) {
 
 // ── Wire records (`WIFI` v2, little-endian; `module_host.rs`) ─────────────
 
-fn encode_connect_result(status: u16, bssid: [u8; 6], frequency_mhz: u32) -> Vec<u8> {
+pub(super) fn encode_connect_result(status: u16, bssid: [u8; 6], frequency_mhz: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(&status.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -1301,7 +1304,7 @@ fn encode_connect_result(status: u16, bssid: [u8; 6], frequency_mhz: u32) -> Vec
     out
 }
 
-fn encode_disconnected(reason: u16, local: bool) -> [u8; 4] {
+pub(super) fn encode_disconnected(reason: u16, local: bool) -> [u8; 4] {
     let r = reason.to_le_bytes();
     [r[0], r[1], u8::from(local), 0]
 }
@@ -1316,7 +1319,7 @@ fn security_wire(s: BssSecurity) -> u8 {
     }
 }
 
-fn encode_scan_result(bss: &BssInfo, ies: &[u8]) -> Vec<u8> {
+pub(super) fn encode_scan_result(bss: &BssInfo, ies: &[u8]) -> Vec<u8> {
     let ssid = &bss.ssid[..bss.ssid.len().min(32)];
     let ies = &ies[..ies.len().min(2048)];
     let mut out = Vec::with_capacity(20 + ssid.len() + ies.len());
@@ -1334,7 +1337,7 @@ fn encode_scan_result(bss: &BssInfo, ies: &[u8]) -> Vec<u8> {
     out
 }
 
-fn decode_scan_request(b: &[u8]) -> Option<ScanRequest> {
+pub(super) fn decode_scan_request(b: &[u8]) -> Option<ScanRequest> {
     if b.len() < 8 {
         return None;
     }
@@ -1370,7 +1373,7 @@ fn decode_scan_request(b: &[u8]) -> Option<ScanRequest> {
 
 /// Decode `CONNECT` (`module_host::encode_connect`): Open, a 32-byte PMK, or
 /// an SAE password.
-fn decode_connect(b: &[u8]) -> Option<ConnectRequest> {
+pub(super) fn decode_connect(b: &[u8]) -> Option<ConnectRequest> {
     if b.len() < 20 || b[7] != 0 || b[13] != 0 || b[18..20] != [0, 0] {
         return None;
     }
@@ -1382,6 +1385,7 @@ fn decode_connect(b: &[u8]) -> Option<ConnectRequest> {
     let ie_len = usize::from(u16::from_le_bytes([b[14], b[15]]));
     let secret_len = usize::from(u16::from_le_bytes([b[16], b[17]]));
     let ssid = b.get(20..20 + ssid_len)?.to_vec();
+    let ie = b.get(20 + ssid_len..20 + ssid_len + ie_len)?.to_vec();
     let secret_at = 20 + ssid_len + ie_len;
     let secret = b.get(secret_at..secret_at + secret_len)?;
     if secret_at + secret_len != b.len() {
@@ -1399,6 +1403,7 @@ fn decode_connect(b: &[u8]) -> Option<ConnectRequest> {
         bssid,
         frequency_mhz,
         ssid,
+        ie,
         auth,
     })
 }

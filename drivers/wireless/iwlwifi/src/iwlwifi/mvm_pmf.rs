@@ -174,7 +174,7 @@ impl Owner {
             SaePwe::Both,
             |join, own, peer| fresh_session(join, &ssid_owned, &password, own, peer),
             || {
-                narf_wireless::reg::db::get_domain()
+                crate::iwlwifi::reg_source::get_domain()
                     .ok_or("MVM current authentication policy unavailable")
             },
         )

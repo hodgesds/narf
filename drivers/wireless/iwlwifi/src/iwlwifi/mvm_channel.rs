@@ -115,7 +115,7 @@ impl Owner {
     /// inactive link0. This is an ownership prerequisite, not RX/TX service.
     /// A prepared channel must be released before another scan/preparation.
     pub async fn prepare_inactive_channel(&mut self, channel: u8) -> Result<(), &'static str> {
-        let domain = narf_wireless::reg::db::get_domain()
+        let domain = crate::iwlwifi::reg_source::get_domain()
             .ok_or("missing authenticated MVM regulatory policy")?;
         self.prepare_channel_in_domain(channel, &domain).await
     }

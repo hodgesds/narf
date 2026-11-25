@@ -12,8 +12,8 @@
 //! 4. The CSR MAC/RF identity selects the native profile and its firmware
 //!    name ([`Discovery`], the built-in `bootstrap::Owner::candidates`),
 //!    never installed-file order: Sc reads its core ladder, Bz its core103
-//!    image, Ty/So/Ma their API89 image. A refused identity refuses the
-//!    probe.
+//!    image, Ty/So/Ma their API89 image, Qu/QuZ/CC (Gen2) their exact API77
+//!    image. A refused identity refuses the probe.
 //! 5. The 1 ms poller and the startup task are spawned; probe returns.
 //!
 //! The startup task resolves the executable and PNVM through
@@ -29,15 +29,17 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+use super::super::transport::IwlMmio as _;
 use super::super::{
-    bz_profile, chip_config_for_pci_id, firmware_identity, gen3_profile, mld_start, mmio,
-    parse_ucode, pci_subsystem_claimed, runtime::Hardware, rx_rfh::CompletionFormat, ChipConfig,
-    IwlMmioImpl, MacFamily, ParsedUcode, INTEL_VENDOR, PCI_DIDS,
+    bz_profile, chip_config_for_pci_id, firmware_identity, gen2_profile, gen3_profile, mld_start,
+    mmio, parse_ucode, pci_subsystem_claimed, regs, runtime::Hardware, rx_rfh::CompletionFormat,
+    ChipConfig, IwlMmioImpl, MacFamily, ParsedUcode, INTEL_VENDOR, PCI_DIDS,
 };
-use super::firmware_asset::Asset;
+use super::firmware_asset::{self, Asset};
 use super::kernel::narf_bus::{BusAddr, BusDevice, BusDeviceCap, DeviceId, MmioRegion};
 use super::kernel::narf_capabilities::{Cap, Write};
 use super::kernel::narf_console::Writer;
+use super::kernel::narf_firmware;
 use super::kernel::narf_lib::sync::IrqSafeSpinLock;
 use super::kernel::narf_time;
 
@@ -55,24 +57,9 @@ mod ffi {
         pub fn narf_spawn_poller(dev: u64, callback: usize, cookie: u64) -> i32;
         pub fn narf_dma_retain_on_teardown(dev: u64, retain: u32) -> i32;
         pub fn narf_random_bytes(buf: *mut u8, len: usize) -> i32;
-        pub fn narf_firmware_open(
-            name: *const u8,
-            name_len: usize,
-            out_handle: *mut u64,
-            out_size: *mut usize,
-        ) -> i32;
-        pub fn narf_firmware_read(
-            handle: u64,
-            offset: u64,
-            buf: *mut u8,
-            len: usize,
-            out_read: *mut usize,
-        ) -> i32;
-        pub fn narf_firmware_close(handle: u64) -> i32;
     }
 }
 
-const ENOENT: i32 = -2;
 const EIO: i32 = -5;
 const EBUSY: i32 = -16;
 const ENODEV: i32 = -19;
@@ -116,6 +103,8 @@ enum Discovery {
     Bz(bz_profile::Profile),
     /// Ty/So/Ma: the API89 profile.
     Api89(gen3_profile::Profile),
+    /// Qu/QuZ/CC (AX200/AX201): the exact API77 MVM profile.
+    Gen2(gen2_profile::Profile),
 }
 
 impl Discovery {
@@ -141,7 +130,12 @@ impl Discovery {
                 let name = alloc::format!("iwlwifi/{}-89.ucode", profile.prefix);
                 Ok((Self::Api89(profile), alloc::vec![name]))
             }
-            _ => Err("generation not carried by iwlwifi.ko"),
+            MacFamily::QuB0 | MacFamily::QuC0 | MacFamily::QuZA0 => {
+                let profile = gen2_profile::select(did, io.read(regs::CSR_HW_REV), io.read(0x9c))
+                    .map_err(|_| "unsupported discovered MVM PCI/MAC/RF identity")?;
+                let name = alloc::format!("iwlwifi/{}-{}.ucode", profile.prefix, gen2_profile::API);
+                Ok((Self::Gen2(profile), alloc::vec![name]))
+            }
         }
     }
 
@@ -163,6 +157,17 @@ impl Discovery {
                 profile.check(did, io)
             }
             Self::Sc(identity) => identity.check(io),
+            Self::Gen2(profile) => {
+                if gen2_profile::firmware_api(parsed) != gen2_profile::API {
+                    return Err("MVM selected API/source incompatible");
+                }
+                if gen2_profile::select(did, io.read(regs::CSR_HW_REV), io.read(0x9c)).ok()
+                    != Some(*profile)
+                {
+                    return Err("MVM discovered identity changed");
+                }
+                Ok(())
+            }
         }
     }
 
@@ -383,6 +388,9 @@ impl Startup {
     /// `bootstrap::Owner::start` for the Gen3 profiles, then
     /// `device::Device::initialize`'s firmware half and the publication.
     async fn start(&self) -> Result<(), Failure> {
+        if let Discovery::Gen2(_) = self.discovery {
+            return self.start_mvm().await;
+        }
         let input = resolve(&self.ladder)?;
         let mut parsed =
             parse_ucode(&input.firmware.bytes).map_err(|_| "invalid Intel firmware")?;
@@ -444,13 +452,53 @@ impl Startup {
     }
 }
 
+impl Startup {
+    /// `bootstrap::Owner::start_mvm`: the exact discovered API77 image (no
+    /// PNVM), the Gen2 transport, then the MVM station
+    /// ([`super::mvm_netdev`]).
+    async fn start_mvm(&self) -> Result<(), Failure> {
+        let expected = self
+            .ladder
+            .first()
+            .ok_or("MVM discovered identity absent")?;
+        let authority = narf_firmware::trusted_loader_authority()
+            .ok_or(Failure::Fatal("firmware authority unavailable"))?;
+        let firmware = match firmware_asset::load(&authority, expected, FIRMWARE_MAX, false) {
+            Ok(asset) => asset,
+            Err(narf_firmware::FirmwareError::NotFound) => return Err(Failure::NotStaged),
+            Err(_) => return Err(Failure::Fatal("MVM exact API77 firmware unavailable")),
+        };
+        let parsed = parse_ucode(&firmware.bytes).map_err(|_| "invalid exact MVM firmware")?;
+        let _ = super::regulatory::ensure_snapshot();
+        self.discovery.admit(
+            self.device.id.device,
+            &parsed,
+            &mut IwlMmioImpl::new(self.region, self.cap),
+        )?;
+        let mut hardware = Hardware::new(
+            self.device,
+            self.cap,
+            self.region,
+            &parsed,
+            CompletionFormat::Qu,
+            None,
+        )?;
+        hardware.bind_sources(&firmware, None)?;
+        drop(parsed);
+        super::mvm_netdev::start(self.session, hardware, firmware).await?;
+        Ok(())
+    }
+}
+
 /// `bootstrap::resolve`: the first staged executable of the ladder and, when
 /// its TLVs carry no PNVM, the matching `.pnvm` file.
 fn resolve(candidates: &[String]) -> Result<Inputs, Failure> {
+    let authority = narf_firmware::trusted_loader_authority()
+        .ok_or(Failure::Fatal("firmware authority unavailable"))?;
     for name in candidates {
-        let firmware = match load(name) {
-            Ok(bytes) => Asset { bytes },
-            Err(ENOENT) => continue,
+        let firmware = match firmware_asset::load(&authority, name, FIRMWARE_MAX, false) {
+            Ok(asset) => asset,
+            Err(narf_firmware::FirmwareError::NotFound) => continue,
             Err(_) => {
                 return Err(Failure::Fatal(
                     "Intel firmware source authority/extent failed",
@@ -460,13 +508,16 @@ fn resolve(candidates: &[String]) -> Result<Inputs, Failure> {
         let parsed = parse_ucode(&firmware.bytes).map_err(|_| "invalid Intel firmware")?;
         let pnvm = if parsed.api.pnvm.is_none() {
             match name.rsplit_once('-') {
-                Some((prefix, _)) => match load(&alloc::format!("{prefix}.pnvm")) {
-                    Ok(bytes) => Some(Asset { bytes }),
-                    Err(ENOENT) => None,
-                    Err(_) => {
-                        return Err(Failure::Fatal("Intel PNVM source authority/extent failed"))
+                Some((prefix, _)) => {
+                    let name = alloc::format!("{prefix}.pnvm");
+                    match firmware_asset::load(&authority, &name, FIRMWARE_MAX, false) {
+                        Ok(asset) => Some(asset),
+                        Err(narf_firmware::FirmwareError::NotFound) => None,
+                        Err(_) => {
+                            return Err(Failure::Fatal("Intel PNVM source authority/extent failed"))
+                        }
                     }
-                },
+                }
                 None => None,
             }
         } else {
@@ -475,42 +526,4 @@ fn resolve(candidates: &[String]) -> Result<Inputs, Failure> {
         return Ok(Inputs { firmware, pnvm });
     }
     Err(Failure::NotStaged)
-}
-
-/// The whole firmware file through `narf_firmware_open` / `_read`. `-ENOENT`
-/// for a file that is not staged (yet); any other error is terminal.
-fn load(name: &str) -> Result<Vec<u8>, i32> {
-    /// The KABI reads at most this much per call.
-    const CHUNK: usize = 64 * 1024;
-    let (mut handle, mut size) = (0u64, 0usize);
-    // SAFETY: `name` is a live `&str`; both outputs are live locals.
-    let rc = unsafe { ffi::narf_firmware_open(name.as_ptr(), name.len(), &mut handle, &mut size) };
-    if rc != 0 {
-        return Err(if rc == ENOENT { ENOENT } else { EIO });
-    }
-    let result = (|| {
-        if size == 0 || size > FIRMWARE_MAX {
-            return Err(EIO);
-        }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size).map_err(|_| EIO)?;
-        bytes.resize(size, 0);
-        let mut at = 0usize;
-        while at < size {
-            let want = (size - at).min(CHUNK);
-            let mut got = 0usize;
-            // SAFETY: `bytes[at..at + want]` is writable and in bounds.
-            let rc = unsafe {
-                ffi::narf_firmware_read(handle, at as u64, bytes[at..].as_mut_ptr(), want, &mut got)
-            };
-            if rc != 0 || got == 0 {
-                return Err(EIO);
-            }
-            at += got;
-        }
-        Ok(bytes)
-    })();
-    // SAFETY: closing our own open handle once.
-    let _ = unsafe { ffi::narf_firmware_close(handle) };
-    result
 }

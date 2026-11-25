@@ -22,7 +22,7 @@ use super::super::runtime::Hardware;
 use super::kernel::narf_net::native_emission::Lifetime;
 
 /// No value: the role does not exist in the module build.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::iwlwifi) enum Never {}
 
 /// The P2P client role (`p2p_client.rs` built in).
@@ -35,11 +35,21 @@ pub(in crate::iwlwifi) mod p2p_client {
 
     /// A P2P client association plan. Never constructed in the module.
     pub(in crate::iwlwifi) struct Plan {
+        pub own: [u8; 6],
         pub channel: Channel,
         pub elements: Vec<u8>,
         never: Never,
     }
     impl Plan {
+        /// Built in: a plan from a P2P GO's beacon. The module carries no P2P
+        /// client role.
+        pub fn new(
+            _own: [u8; 6],
+            _beacon: &super::super::super::connection::Beacon,
+            _elements: &[u8],
+        ) -> Result<Self, &'static str> {
+            Err("P2P client is built-in only")
+        }
         pub fn binding(&self) -> [u8; 32] {
             match self.never {}
         }
@@ -86,6 +96,14 @@ pub(in crate::iwlwifi) mod p2p_client {
 /// has no P2P role, so P2P is never permitted on any channel.
 pub(in crate::iwlwifi) mod p2p_go {
     use super::*;
+    /// A P2P GO's device identity. Never constructed in the module.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::iwlwifi) struct Identity(Never);
+    impl Identity {
+        pub fn binding(&self, _own: [u8; 6], _channel: Channel) -> [u8; 32] {
+            match self.0 {}
+        }
+    }
     pub(in crate::iwlwifi) fn host_allows(_domain: &RegulatoryDomain, _channel: Channel) -> bool {
         false
     }
@@ -200,8 +218,47 @@ impl Hardware {
     ) -> Result<super::super::sc_mlo::FwIds, &'static str> {
         Err("further MLD links are built-in only")
     }
+    /// No P2P client owner is installed.
+    pub(in crate::iwlwifi) fn p2p_client_native(&self) -> Option<Arc<p2p_client::Native>> {
+        None
+    }
+    /// No P2P client receive filter awaits a native receipt.
+    pub(in crate::iwlwifi) fn client_filter_pending(&self) -> bool {
+        false
+    }
+    /// The Gen2 boot owner offers its AP and P2P wire adapters for those
+    /// roles; the module carries neither, so nothing is retained.
+    pub(in crate::iwlwifi) fn retain_gen2_ap_adapter(
+        &mut self,
+        _api: &super::super::firmware_api::FirmwareApi<'_>,
+        _nvm: &super::super::station_api::Nvm,
+    ) {
+    }
+    pub(in crate::iwlwifi) fn retain_gen2_p2p_adapter(
+        &mut self,
+        _api: &super::super::firmware_api::FirmwareApi<'_>,
+        _nvm: &super::super::station_api::Nvm,
+    ) {
+    }
+    /// No Gen2 P2P adapter is selected.
+    pub(in crate::iwlwifi) fn p2p_gen2_selected(&self) -> bool {
+        false
+    }
     /// The association link's PHY only (no P2P DEVICE session holds PHY1).
     pub(in crate::iwlwifi) fn mld_phy_ids(&self) -> super::super::sc_mlo::PhyIds {
         super::super::sc_mlo::PhyIds::station()
+    }
+}
+
+/// The Gen2 owner's AP and P2P capability (`mvm_ap.rs`, `mvm_p2p.rs` built
+/// in). Built in both require the retained API77 AP/P2P wire adapter, which
+/// the module never retains (`retain_gen2_*_adapter` above), so both answer
+/// as the built-in does without one.
+impl super::super::mvm_boot::Owner {
+    pub(in crate::iwlwifi) fn ap_capable(&self) -> bool {
+        false
+    }
+    pub(in crate::iwlwifi) fn p2p_capable(&self) -> bool {
+        false
     }
 }

@@ -7,6 +7,8 @@ use super::{
     Owner, Phase,
 };
 use crate::firmware_asset::Asset;
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     future::{poll_fn, Future},

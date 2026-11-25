@@ -5,24 +5,26 @@
 //! [`kernel`] provides under the same names over `narf-module-rt` and the
 //! KABI. What differs in shape, not just in name, lives here:
 //!
-//! - [`pci`] — the PCI binding: identity, the Sc profile, firmware, the
-//!   driver's [`super::runtime::Hardware`] boot to ALIVE, NVM and the
-//!   runtime configuration commands;
-//! - [`netdev`] — the station (`Device`'s station subset over the same
-//!   `Hardware` and `connection::Connection`): one `wlan%d` netdev and wiphy
-//!   through the netif bridge and the `WIFI` family host (version 2), scan,
-//!   association with the in-driver supplicant, the data path, link loss;
-//! - [`regulatory`] — the kernel's regulatory domain, read through the host;
+//! - [`pci`] — the PCI binding: identity, the per-family profile and its
+//!   firmware, the driver's [`super::runtime::Hardware`];
+//! - [`netdev`] — the Gen3 (Ty/So/Ma/Bz/Sc) station: `Device`'s station
+//!   subset over the same `Hardware` and `connection::Connection`;
+//! - [`mvm_netdev`] — the Gen2 (AX200/AX201) station: `mvm_device`'s station
+//!   subset over the same `mvm_boot::Owner`;
+//!   both publish one `wlan%d` netdev and wiphy through the netif bridge and
+//!   the `WIFI` family host (version 2): scan, association with the
+//!   in-driver supplicant, the data path, link loss;
+//! - [`firmware_asset`] — firmware with its verified signer and digest;
+//! - [`regulatory`] — the kernel's regulatory domain (`narf_wireless_regdomain`);
 //! - [`absent`] — the roles the module does not carry, as uninhabited types.
 //!
-//! Scope is the Sc MAC (BE20x/BE21x): the profile the built-in driver's MLD
-//! station path targets, and the one seen on silicon (MS-03 `8086:e340`).
-//! Built in only: AP/P2P/monitor, scheduled scan, MLO further links,
-//! roaming, WoWLAN and system PM, BIOS SAR/PPAG, and the Gen2/Ty/So/Ma/Bz
-//! profiles.
+//! Scope is every id of the built-in table. Built in only: AP/P2P/monitor,
+//! scheduled scan, MLO further links, roaming, WoWLAN/D3 and system PM, and
+//! BIOS SAR/PPAG.
 
 pub(crate) mod absent;
 pub mod kernel;
+pub(crate) mod mvm_netdev;
 pub(crate) mod netdev;
 pub(crate) mod pci;
 pub(crate) mod regulatory;
@@ -54,26 +56,5 @@ pub fn register() {
     pci::register_pci_driver();
 }
 
-/// The firmware loader, under the name the transport's source binding uses
-/// (`crate::firmware_asset`).
-pub mod firmware_asset {
-    use alloc::vec::Vec;
-
-    /// One loaded firmware file. Built in, an `Asset` also carries the
-    /// revocable registry capability the transport re-checks on every
-    /// operation; a module's firmware authority is its manifest `Firmware`
-    /// cap, checked by the kernel at `narf_firmware_open`, so the bytes are
-    /// the whole asset.
-    #[derive(Debug)]
-    pub struct Asset {
-        pub bytes: Vec<u8>,
-    }
-
-    impl Asset {
-        /// Built in: the registry capability still names these bytes.
-        /// Module: always (the bytes are a private copy).
-        pub fn current(&self) -> bool {
-            true
-        }
-    }
-}
+/// The firmware loader, under the name the driver uses (`crate::firmware_asset`).
+pub mod firmware_asset;

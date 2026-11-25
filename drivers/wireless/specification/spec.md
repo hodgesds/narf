@@ -2579,86 +2579,100 @@ feature off).
   leaves no match. QEMU emulates no WCN6855, so bring-up and RF behavior
   are first proven on hardware (`docs/BOOTING_ON_CACHYOS.md`).
 
-### 4.x `iwlwifi.ko`: the Sc MLD station as a loadable module
+### 4.3 `iwlwifi.ko`: the iwlwifi stations as a loadable module
 
 `narf-drivers-wireless-iwlwifi --no-default-features --features module` is
-the driver's Sc (BE20x/BE21x) station built into a `.ko` (x86_64 and
-aarch64) from the same source as the built-in: the PCIe transport
-(`runtime::Hardware`), the firmware TLV/PNVM loader, the MLD command
-profile and the station (`connection::Connection`, with the in-driver
-WPA2-PSK / WPA3-SAE supplicant and 802.11w). `narf-crypto` and
-`narf-wireless` are linked kernel-free.
+the driver's station for every id of its built-in table, built into a `.ko`
+(x86_64 and aarch64) from the same source as the built-in. `narf-crypto` and
+`narf-wireless` are linked kernel-free. Two stations, as built in:
+
+- **Gen3** (Ty AX210, So/Ma AX211, Bz BE200/BE20x, Sc BE20x/BE21x): the
+  PCIe transport (`runtime::Hardware`, which selects the API89, Bz or MLD
+  profile), the firmware TLV/PNVM loader and the MLD station
+  (`connection::Connection`, with the in-driver WPA2-PSK / WPA3-SAE
+  supplicant and 802.11w), orchestrated by `module/netdev.rs` as
+  `device::Device` does.
+- **Gen2** (Qu/QuZ AX201, CC AX200): the same transport on its 22000 path
+  and the retained API77 MVM owner (`mvm_boot::Owner`, with the native
+  WPA2-PSK four-way owner or host SAE plus PMF, and its signed per-platform
+  TX-power programs), orchestrated by `module/mvm_netdev.rs` as
+  `mvm_device::Device` does, under the same publication fences.
 
 - **Platform.** `src/iwlwifi/module/kernel.rs` defines modules named like
   the kernel crates (`narf_time`, `narf_io`, `narf_lib`, `narf_bus`,
-  `narf_capabilities`, `narf_console`, `narf_scheduler`, `narf_net`) with
-  the subset of each API the module-built files use, over `narf-module-rt`
-  and the KABI. Each such file imports them under `cfg(feature = "module")`,
-  shadowing the absent extern crates, so the driver text is the same in both
-  builds. A `Cap` is the probe token there: the kernel checks it on every
-  KABI call and revokes it at teardown. Kernel-bound halves have module
-  variants: `module/mmio.rs` (BAR/PCI command), `module/msix.rs` (two
-  `narf_msix_claim` vectors for the RX and non-RX table entries; the
-  task-context callbacks latch the causes the built-in hard IRQ latches),
-  `module/source.rs` (firmware bytes are a private copy, so the source fence
-  is the PCI authority) and `module/platform_power.rs`.
+  `narf_capabilities`, `narf_console`, `narf_scheduler`, `narf_net`,
+  `narf_firmware`, `narf_firmware_smbios`) with the subset of each API the
+  module-built files use, over `narf-module-rt` and the KABI. Each such file
+  imports them under `cfg(feature = "module")`, shadowing the absent extern
+  crates, so the driver text is the same in both builds. A `Cap` is the probe
+  token there: the kernel checks it on every KABI call and revokes it at
+  teardown. Kernel-bound halves have module variants:
+  - `module/mmio.rs`: BAR0 and the built-in PCI command sequences with their
+    read-back checks, over `narf_pci_command`;
+  - `module/msix.rs`: two `narf_msix_claim` vectors for the RX and non-RX
+    table entries; the task-context callbacks latch the causes the built-in
+    hard IRQ latches;
+  - `module/source.rs`: firmware bytes are a private copy, so the source
+    fence is the PCI authority;
+  - `module/firmware_asset.rs`: assets carry their verified signer
+    (`narf_firmware_signer`) and SHA-256, as built in, so the Gen2 signed
+    power programs are admitted on the same evidence;
+  - `narf_firmware_smbios`: the SMBIOS system/board/BIOS records the Gen2
+    power binding digests, parsed from the kernel's own table
+    (`narf_smbios_read`) with the kernel parser's rules;
+  - `module/platform_power.rs`: see below.
 - **Roles not carried** are uninhabited types under the names the shared code
-  uses (`module/absent.rs`: the P2P client, the Gen2 MVM power owners, and
-  the transport's AP/P2P hooks answered as the built-in answers them with no
-  such role installed), so the station code compiles unchanged and the
-  compiler proves those paths unreachable. AP/P2P/scheduled-scan owners,
-  `device`, `mvm_*` and `bootstrap` are `cfg(builtin)`.
-- **Claim.** The six Sc ids (`8086:6e70/9327/d240/d340/e340/e440`), the
-  profile the built-in MLD station targets and the one seen on silicon (MS-03
-  `e340`). `narf-drivers-wireless/iwlwifi-module-only` leaves them to the
-  `.ko`; the Gen2/Ty/So/Ma/Bz ids stay built in.
+  uses (`module/absent.rs`: the P2P client, the P2P GO identity, and the
+  transport's and the Gen2 owner's AP/P2P hooks answered as the built-in
+  answers them with no such role installed), so the station code compiles
+  unchanged and the compiler proves those paths unreachable. AP/P2P/
+  scheduled-scan owners, `device`, `mvm_device`, `bootstrap` and the ACPI
+  platform readers are `cfg(builtin)`.
+- **Claim.** All 28 ids of the built-in table (`iwlwifi::module_carries`).
+  `narf-drivers-wireless/iwlwifi-module-only` leaves exactly those to the
+  `.ko`.
 - **Probe** (`module/pci.rs`, the built-in `probe` + `bootstrap` order).
   1. `narf_pci_identity`, the chip table and subsystem qualification.
   2. Firmware-owned DMA retained on teardown.
-  3. `narf_pci_prepare_probe`, BAR0, memory decode on, bus master off.
-  4. The CSR MAC/RF identity selects the firmware ladder; a refused identity
+  3. `narf_pci_prepare_probe`, park, BAR0, memory decode on, bus master off.
+  4. The CSR MAC/RF identity selects the profile and its firmware
+     (`bootstrap::Owner::candidates`): the Sc core ladder, Bz's core103
+     image, the API89 image, or Gen2's exact API77 image. A refused identity
      refuses the probe.
   5. The `WIFI` session, the 1 ms poller and the startup task.
-  The startup task resolves the executable and PNVM through
-  `narf_firmware_open` (120 x 500 ms retries while not staged), parses the
-  TLVs and runs `Hardware`: boot DMA, MSI-X, context info and IML, ALIVE,
-  PNVM, PHY configuration; then the MLD profile check and the configuration
-  commands (`mld_start.rs`, shared with `Device`).
-- **Regulatory.** The station derives its MCC and TX-power program from the
+  The startup task loads the firmware (120 x 500 ms retries while not
+  staged), admits the parsed executable and re-reads the identity as
+  `bootstrap::Owner::start` / `start_mvm` do, and boots the transport: Gen3
+  through `mld_start.rs` (shared with `Device`), Gen2 through
+  `Owner::initialize`.
+- **Regulatory.** Both stations derive their TX-power program from the
   kernel's regulatory domain. `module/regulatory.rs` copies it through the
-  shared `narf_wireless_regdomain` KABI export (one NRGD v1 record, parsed
-  by the kernel-free `narf_wireless::reg::parse_policy`) and caches one
-  snapshot until the domain changes; the service re-reads it every second,
-  and a change fails the station fence and drops carrier, as a built-in
-  reinstall does. Without a domain the station refuses association and
-  scans passively, as built in.
+  shared `narf_wireless_regdomain` KABI export (one NRGD v1 record, decoded
+  by the kernel-free `narf_wireless::reg::parse_domain_record`, which accepts
+  the boot-time world domain "00" as the built-in read does) and caches one
+  snapshot until the domain changes; the services re-read it every second,
+  and a change fails the station fences and drops carrier, as a built-in
+  reinstall does. Without a domain the stations refuse association and scan passively,
+  as built in.
 - **Platform power.** The module has no KABI for the device's ACPI
-  WRDS/EWRD/WGDS/PPAG objects, so it takes Linux's absent-tables path:
-  nothing is published and the firmware keeps its own limits.
-- **Netdev and wiphy** (`module/netdev.rs`, `Device`'s station subset).
-  - `wlan%d` through the netif bridge; `REGISTER_WIPHY` from the NVM:
-    channels, HT/VHT/HE/EHT, CCMP, `PSK_OFFLOAD | SAE_OFFLOAD |
-    REPORTS_DISCONNECT`.
-  - Scan: `Device::scan`'s firmware jobs (legacy bands, then the 6 GHz RNR
-    plan), active at the regulatory ceiling when asked and a domain is
-    installed, passive otherwise.
-  - Connect: `Device::associate_links` for one link (policy transaction,
-    `Connection::associate_links_in_domain`, station fence, carrier). A
-    `CONNECT` without a BSSID takes the strongest matching network of the
-    last scan.
-  - Service: `Device::step`'s station branch (RX, reorder timer, EAPOL
-    rekeying, BA maintenance, TX publication under queue credit, beacon and
-    policy loss reported as `DISCONNECTED`), and a transport stop with a
-    firmware restart before the next operation after any failure.
-  - Disconnect: `Device::close_locked`.
-- **Not carried (built-in only).** AP, P2P, monitor and virtual
-  interfaces; scheduled scan; MLO further links; roaming; WoWLAN and system
-  PM; CQM events; checksum offload; BIOS SAR/PPAG.
+  WRDS/EWRD/WGDS/PPAG objects, so the Gen3 owner takes Linux's absent-tables
+  path: nothing is published and the firmware keeps its own limits. The Gen2
+  owner needs no ACPI: its power comes from the signed per-platform programs.
+- **Netdev and wiphy.** `wlan%d` through the netif bridge; `REGISTER_WIPHY`
+  from the NVM (channels, HT/VHT/HE/EHT, CCMP, and the SME offloads the
+  station supports). Scan, connect (a `CONNECT` without a BSSID takes the
+  strongest matching network of the last scan), the service loop (RX,
+  rekeying, BA maintenance, TX under queue credit or publication fences,
+  beacon and policy loss as `DISCONNECTED`), disconnect, and a firmware
+  restart before the next operation after any failure.
+- **Not carried (built-in only).** AP, P2P, monitor and virtual interfaces;
+  scheduled scan; MLO further links; roaming; WoWLAN/D3 and system PM; CQM
+  events; checksum offload; BIOS SAR/PPAG (ACPI).
 - **Proof.** `modules/e2e/iwlwifi` loads the real `.ko`: relocations and
-  init, exactly the six Sc ids claimed and none of the built-in-only ones,
-  refusal of a probe with no device context, clean unload. QEMU emulates no
-  Intel Wi-Fi device, so firmware boot, scan and association through the
-  module are unverified until run on hardware.
+  init, exactly the 28 ids claimed and no other Intel id, refusal of a probe
+  with no device context, clean unload. QEMU emulates no Intel Wi-Fi device,
+  so firmware boot, scan and association through the module are unverified
+  until run on hardware.
 
 ## 5. Buffer Management
 
