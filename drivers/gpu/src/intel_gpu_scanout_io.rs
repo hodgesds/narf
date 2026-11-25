@@ -113,6 +113,9 @@ pub(crate) const fn owned_status_for(
     discrete: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
 ) -> u32 {
     match discrete {
+        Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg1) => {
+            owned_status(Generation::TigerLake)
+        }
         Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg2) => {
             owned_status(Generation::AlderLake)
         }
@@ -144,7 +147,8 @@ pub(crate) fn display_pat_programmed_for(
     discrete: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
 ) -> bool {
     match discrete {
-        Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg2)
+        Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg1)
+        | Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg2)
         | Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Xe2Hpd) => true,
         None => display_pat_programmed_ip(io, generation, ip),
     }

@@ -4481,6 +4481,16 @@ pub(crate) fn probe_nvl_display(
     Ok(())
 }
 
+/// The boot option that installs DG1's KMS owner over its firmware-lit
+/// Pipe A, as DG2 and Battlemage get theirs (default off).
+pub const DG1_KMS_OPT_IN: &str = "narf.intel.dg1_kms";
+
+/// `narf.intel.dg1_kms=1`, with the strict grammar every Intel opt-in uses
+/// ([`crate::intel_gpu_gt::boot_opt_in`]).
+pub fn dg1_kms_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, DG1_KMS_OPT_IN)
+}
+
 pub(crate) fn probe_discrete(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
@@ -4530,8 +4540,11 @@ pub(crate) fn probe_discrete(
         unsafe { card.install_lmem_bar(lmem) };
     }
     let display_window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
-    let discrete_display = platform
-        .has_display()
+    // DG1's display gets its KMS owner only with `narf.intel.dg1_kms=1`
+    // (default off: its lit display keeps the GT-only profile, as before).
+    let admitted = platform != GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1)
+        || dg1_kms_requested(narf_boot::args());
+    let discrete_display = (platform.has_display() && admitted)
         .then(|| crate::intel_gpu_xe2lpd::DiscreteDisplayIp::identify(&display_window, platform))
         .and_then(Result::ok);
     let discrete_console = discrete_display

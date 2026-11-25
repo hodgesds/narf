@@ -1531,6 +1531,8 @@ pub(crate) fn install_discrete(
     console: ActiveScanout,
 ) {
     let generation = match ip {
+        // DG1's display 12 is the Tiger Lake display (`XE_D_DISPLAY`).
+        crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg1 => Generation::TigerLake,
         crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg2 => Generation::AlderLake,
         crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Xe2Hpd => Generation::MeteorLake,
     };
@@ -2729,10 +2731,14 @@ impl<M: Platform> Guard<'_, M> {
                 self.state.cursor.as_ref().is_some_and(|c| c.exposed()),
             );
         }
+        // The retained Gen12 primary is the integrated panel console; a
+        // discrete display (DG1 reports a Gen12 family too) has none, so it
+        // is refused as DG2's is.
         let family = self
             .device
             .platform
             .gen12_family()
+            .filter(|_| self.device.platform.discrete_display().is_none())
             .ok_or(FsError::Unsupported)?;
         if (self.device.generation == Generation::TigerLake)
             != (family == crate::intel_gpu_gt::Gen12Platform::TigerLake)

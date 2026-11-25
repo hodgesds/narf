@@ -960,6 +960,49 @@ fn smoke_discrete_arc_display_identify_and_vram_pte() -> TestResult {
         Err(IpError::Unqualified { ver: 14, rel: 1 })
     );
 
+    // DG1 (display 12, `dg1_display`): identified from its PCI identity
+    // with Pipe A unfused, Gen12 PTEs with `GEN12_GGTT_PTE_LM` and the
+    // Tiger Lake status profile; a fused Pipe A and an integrated Gen12
+    // part refuse. The probe admits it only with `narf.intel.dg1_kms=1`.
+    {
+        use crate::intel_gpu_gt::Gen12Platform;
+        use narf_boot::args::KernelCmdline;
+        let dg1 = MockPlatform::new();
+        assert_eq!(
+            DiscreteDisplayIp::identify(&dg1, GtPlatform::Gen12(Gen12Platform::Dg1)),
+            Ok(DiscreteDisplayIp::Dg1)
+        );
+        assert_eq!(
+            (DiscreteDisplayIp::Dg1.ver(), DiscreteDisplayIp::Dg1.rel()),
+            (12, 0)
+        );
+        assert_eq!(
+            display_pte_for(Generation::TigerLake, None, Some(DiscreteDisplayIp::Dg1)),
+            Some((PteFormat::Gen12, 0))
+        );
+        assert_eq!(
+            owned_status_for(Generation::TigerLake, None, Some(DiscreteDisplayIp::Dg1)),
+            0x8200_0088
+        );
+        let fused = MockPlatform::new();
+        fused.set(0x51000, 1 << 30);
+        assert_eq!(
+            DiscreteDisplayIp::identify(&fused, GtPlatform::Gen12(Gen12Platform::Dg1)),
+            Err(IpError::Unqualified { ver: 12, rel: 0 })
+        );
+        assert!(matches!(
+            DiscreteDisplayIp::identify(&dg1, GtPlatform::Gen12(Gen12Platform::TigerLake)),
+            Err(IpError::Unqualified { .. })
+        ));
+        assert_eq!(crate::intel_gpu_gt_runtime::DG1_KMS_OPT_IN, "narf.intel.dg1_kms");
+        assert!(crate::intel_gpu_gt_runtime::dg1_kms_requested(KernelCmdline::new(
+            "narf.intel.dg1_kms=1"
+        )));
+        assert!(!crate::intel_gpu_gt_runtime::dg1_kms_requested(
+            KernelCmdline::new("")
+        ));
+    }
+
     // VRAM GGTT PTE sets PTE_DM | PTE_PRESENT.
     assert_eq!(
         encode_display_vram_pte(PteFormat::Gen12, 0x1234_5000, 0),
