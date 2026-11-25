@@ -1776,7 +1776,8 @@ kernel_abi! {
     /// Copy the kernel's installed regulatory domain (the one built-in
     /// drivers read from `narf_wireless::reg::db`) into `buf` as one NRGD v1
     /// record — `narf_wireless::reg::parse_policy`'s layout, with the world
-    /// domain's country "00" allowed — and store its length through
+    /// domain's country "00" allowed; decode it with
+    /// `narf_wireless::reg::parse_domain_record` — and store its length through
     /// `out_len`. `-ENOBUFS` (nothing copied, required length stored) when
     /// `len` is too small, so `len = 0` sizes it; `-ENODATA` when no domain
     /// is installed and none can be bootstrapped; `-EOVERFLOW` for a domain
@@ -2076,7 +2077,7 @@ kernel_test_in!("modules/kabi", smoke_kabi_netif_exports_require_cap);
 
 /// The softMAC exports (ath9k.ko) and the regulatory record: link-time cap
 /// gated like their neighbours, bounded to their fields, and the record
-/// (NRGD v1) parses back to the host's active domain.
+/// (NRGD v1) parses back to the host's active domain, world domain included.
 fn smoke_kabi_softmac_exports() -> TestResult {
     use narf_wireless::reg::{db, RegFlags, RegRule, RegulatoryDomain};
     register_all();
@@ -2162,8 +2163,17 @@ fn smoke_kabi_softmac_exports() -> TestResult {
     if sizing != -105 || copied != 0 || sized != 12 + 2 * 16 || len != sized {
         return TestResult::Fail("narf_wireless_regdomain sizing is wrong");
     }
-    if narf_wireless::reg::parse_policy(&record[..len]) != Ok(domain) {
+    if narf_wireless::reg::parse_domain_record(&record[..len]) != Ok(domain) {
         return TestResult::Fail("narf_wireless_regdomain record differs from the domain");
+    }
+    // The world domain the database holds before any policy is installed
+    // parses as a record, never as a deployment policy.
+    let mut world = record;
+    world[6..8].copy_from_slice(b"00");
+    if narf_wireless::reg::parse_domain_record(&world[..len]).map(|d| d.country_code) != Ok(*b"00")
+        || narf_wireless::reg::parse_policy(&world[..len]).is_ok()
+    {
+        return TestResult::Fail("the world domain's record is not parsed as a record only");
     }
     TestResult::Pass
 }

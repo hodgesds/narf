@@ -227,7 +227,7 @@ So the surface is small and grows deliberately. Today:
 | `narf_module_param` | `(*const u8, usize, *mut u8, usize, *mut usize) -> i32` | the calling module's parameter value (see [Module parameters](#module-parameters)); `-2` undeclared, `-105` with the needed length |
 | `narf_pcie_state` | `(u64, *mut u8, usize) -> i32` | 20-byte LE record: Device Caps/Control/Status, Link Caps/Status, upstream Link Control + presence flag; requires `BusDevice` |
 | `narf_pci_config_read32` | `(u64, u16, *mut u32) -> i32` | read-only aligned config dword at `0x40..=0xffc` (never the standard header); requires `BusDevice` |
-| `narf_wireless_regdomain` | `(*mut u8, usize, *mut usize) -> i32` | the host's installed regulatory domain as one NRGD v1 record (`narf_wireless::reg::parse_policy`'s layout); `-61` none, `-105` with the needed length; requires `NetIface` |
+| `narf_wireless_regdomain` | `(*mut u8, usize, *mut usize) -> i32` | the host's installed regulatory domain as one NRGD v1 record (decode with `narf_wireless::reg::parse_domain_record`, which accepts the world domain "00"); `-61` none, `-105` with the needed length; requires `NetIface` |
 
 | `narf_bar_map_control` | `(u64, u8) -> u64` | as `narf_bar_map`, but Device attributes even on a prefetchable BAR (control registers); same handle space |
 | `narf_mmio_read8` | `(u64, u64, u64, *mut u8) -> i32` | bounded 8-bit BAR read |

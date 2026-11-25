@@ -759,7 +759,9 @@ which has neither, and those exports refuse USB tokens (`-ENODEV`).
   kernel's regulatory database holds (bootstrapping the staged signed policy
   if none is installed, as a built-in driver's `ensure_domain` does) as one
   NRGD v1 record — `narf_wireless::reg::parse_policy`'s layout, with the
-  world domain's "00" allowed. Read-only: a module cannot install a domain.
+  world domain's "00" allowed; `narf_wireless::reg::parse_domain_record`
+  decodes it (`parse_policy` refuses "00", which no deployment policy may
+  select). Read-only: a module cannot install a domain.
   `-ENOBUFS` sizes the buffer; `-ENODATA` when there is none.
 
 **Not provided: a wiphy for a USB function.** The wireless broker
