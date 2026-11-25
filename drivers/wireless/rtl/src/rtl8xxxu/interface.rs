@@ -8,14 +8,14 @@ use super::{
     receive_runtime::{Permission as ReceivePermission, Receiver},
     service_runtime::{self, Environment, Service},
 };
+use crate::platform::ipc::{Consumer, Producer};
+use crate::platform::lib::{mutex::Mutex, sync::IrqSafeSpinLock};
+use crate::platform::net::{Frame, Interface, RX_RING_N, TX_RING_N};
+use crate::platform::wireless::WirelessNetIface;
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use narf_ipc::{Consumer, Producer};
-use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
-use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessConfig, WirelessError,
-    WirelessNetIface,
 };
 use zeroize::Zeroizing;
 #[path = "interface_power.rs"]
@@ -24,7 +24,7 @@ mod interface_power;
 pub struct NativeEnvironment;
 impl Environment for NativeEnvironment {
     fn now_ms(&self) -> u64 {
-        narf_time::wall::monotonic_ns() / 1_000_000
+        crate::platform::time::wall::monotonic_ns() / 1_000_000
     }
     fn fresh_nonce(&self) -> Result<[u8; 32], service_runtime::Error> {
         let mut nonce = [0; 32];
@@ -33,7 +33,8 @@ impl Environment for NativeEnvironment {
         Ok(nonce)
     }
     async fn pause(&self) {
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+        crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(1_000_000))
+            .await;
     }
 }
 struct State<C: ControlIo, B: PacketIo, E: Environment> {
@@ -134,8 +135,8 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
     fn from_boxed_service(name: &str, mut service: Box<Service<C, B, E>>) -> Self {
         let parked = service.phase() == service_runtime::Phase::Parked;
         let mac = service.local();
-        let (rx, rx_consumer) = narf_ipc::channel();
-        let (tx_producer, tx) = narf_ipc::channel();
+        let (rx, rx_consumer) = crate::platform::ipc::channel();
+        let (tx_producer, tx) = crate::platform::ipc::channel();
         let rx_consumer = Arc::new(IrqSafeSpinLock::new(Some(rx_consumer)));
         let retire = rx_consumer.clone();
         service.set_retirement(Arc::new(move || {
@@ -182,7 +183,7 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
         // invokes an administrative open/stop hook under retained locks.
         let published = self.publish_carrier(up);
         if was_up && !up && published {
-            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            crate::platform::wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
     }
     /// Locks are released before stack dispatch: ARP/ND may immediately call
@@ -201,7 +202,7 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
     fn refresh_receive(&self, state: &mut State<C, B, E>) {
         if let Some((_, generation)) = state.service.receive_epoch() {
             if state.epoch != generation {
-                let (producer, consumer) = narf_ipc::channel();
+                let (producer, consumer) = crate::platform::ipc::channel();
                 state.rx = producer;
                 *self.rx.lock() = Some(consumer);
                 state.epoch = generation;
@@ -240,9 +241,10 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             return None;
         }
         for bytes in &frames {
-            if let Ok(buffer) =
-                narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
-            {
+            if let Ok(buffer) = crate::platform::io::alloc_coherent(
+                bytes.len(),
+                crate::platform::lib::id::DomainId::DRIVER_0,
+            ) {
                 let mut frame = Frame::new(buffer, bytes.len() as u32);
                 frame.payload_mut().copy_from_slice(bytes);
                 if authority
@@ -268,7 +270,11 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             authority,
         })
     }
-    pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    pub(super) fn enqueue(
+        &self,
+        bytes: &[u8],
+        meta: crate::platform::net::TxMeta,
+    ) -> Result<(), ()> {
         if !self.up.load(Ordering::Acquire)
             || self.closed.load(Ordering::Acquire)
             || self.failed.load(Ordering::Acquire)
@@ -286,8 +292,11 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             let (epoch, generation) = state.service.receive_epoch().ok_or(())?;
             (authority, epoch, generation)
         };
-        let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
-            .map_err(|_| ())?;
+        let buffer = crate::platform::io::alloc_coherent(
+            bytes.len(),
+            crate::platform::lib::id::DomainId::DRIVER_0,
+        )
+        .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
         frame.set_tx_meta(meta);
@@ -342,7 +351,7 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
         }
     }
     pub(super) fn drain(&self) -> bool {
-        self.dispatch_with(|frame| narf_net::iface::on_rx_frame_from(&self.name, frame))
+        self.dispatch_with(|frame| crate::platform::net::iface::on_rx_frame_from(&self.name, frame))
     }
     pub(super) fn dispatch_with(&self, mut callback: impl FnMut(&mut [u8])) -> bool {
         let Some(batch) = self.progress_batch() else {
@@ -391,13 +400,13 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
     }
 }
 trait Endpoint: Send + Sync {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
+    fn send(&self, bytes: &[u8], meta: crate::platform::net::TxMeta) -> Result<(), ()>;
     fn drain(&self) -> bool;
 }
 impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Endpoint
     for Device<C, B, E>
 {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    fn send(&self, bytes: &[u8], meta: crate::platform::net::TxMeta) -> Result<(), ()> {
         self.enqueue(bytes, meta)
     }
     fn drain(&self) -> bool {
@@ -406,7 +415,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> En
 }
 static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
 static CLAIMED: AtomicBool = AtomicBool::new(false);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+fn send(bytes: &[u8], meta: crate::platform::net::TxMeta) -> Result<(), ()> {
     let active = ACTIVE.lock().clone().ok_or(())?;
     active.send(bytes, meta)
 }
@@ -417,7 +426,7 @@ fn drain() -> bool {
 fn authenticated_domain() -> Result<narf_wireless::reg::RegulatoryDomain, service_runtime::Error> {
     // This profile requires a fresh signed deployment artifact per attach;
     // preserve that stronger contract instead of consulting the shared cache.
-    narf_wireless::reg::policy::load().map_err(|_| service_runtime::Error::Profile)
+    crate::platform::regpolicy::load().map_err(|_| service_runtime::Error::Profile)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Admission {
@@ -427,25 +436,25 @@ pub(super) enum Admission {
 pub(super) fn classify_attach_admission(
     has_net_authority: bool,
     has_loader_authority: bool,
-    domain: Result<narf_wireless::reg::RegulatoryDomain, narf_wireless::reg::policy::Error>,
+    domain: Result<narf_wireless::reg::RegulatoryDomain, crate::platform::regpolicy::Error>,
     calibration: Result<power_policy::Calibration, power_policy::Error>,
 ) -> Result<Admission, service_runtime::Error> {
     let domain = match domain {
         Ok(_) => true,
-        Err(narf_wireless::reg::policy::Error::Firmware(
-            narf_firmware::FirmwareError::NotFound,
+        Err(crate::platform::regpolicy::Error::Firmware(
+            crate::platform::firmware::FirmwareError::NotFound,
         )) => false,
-        Err(narf_wireless::reg::policy::Error::Authority) if !has_loader_authority => false,
+        Err(crate::platform::regpolicy::Error::Authority) if !has_loader_authority => false,
         Err(_) => return Err(service_runtime::Error::Profile),
     };
     let calibration = match calibration {
         Ok(_) => true,
-        Err(power_policy::Error::Firmware(narf_firmware::FirmwareError::NotFound)) => false,
-        Err(power_policy::Error::Firmware(narf_firmware::FirmwareError::AuthorityRevoked))
-            if !has_loader_authority =>
-        {
+        Err(power_policy::Error::Firmware(crate::platform::firmware::FirmwareError::NotFound)) => {
             false
         }
+        Err(power_policy::Error::Firmware(
+            crate::platform::firmware::FirmwareError::AuthorityRevoked,
+        )) if !has_loader_authority => false,
         Err(_) => return Err(service_runtime::Error::Profile),
     };
     if has_net_authority && domain && calibration {
@@ -468,17 +477,20 @@ pub async fn wait_attach(
         let (vid, pid) = firmware
             .usb_identity()
             .ok_or(service_runtime::Error::State)?;
-        let has_loader = narf_firmware::trusted_loader_authority().is_some();
-        let has_net = narf_net::trusted_net_authority().is_some();
+        let has_loader = crate::platform::firmware::trusted_loader_authority().is_some();
+        let has_net = crate::platform::net::trusted_net_authority().is_some();
         match classify_attach_admission(
             has_net,
             has_loader,
-            narf_wireless::reg::policy::load(),
+            crate::platform::regpolicy::load(),
             power_policy::Calibration::load_registered(factory, vid, pid),
         )? {
             Admission::Ready => return crate::future_heap::build(|| attach(firmware)).await,
             Admission::PendingAssets => {
-                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
+                crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                    500_000_000,
+                ))
+                .await;
             }
         }
     }
@@ -496,7 +508,8 @@ pub async fn attach(
         return Err(service_runtime::Error::State);
     }
     let usb = firmware.usb_device();
-    let authority = narf_net::trusted_net_authority()
+    #[cfg(feature = "builtin")]
+    let authority = crate::platform::net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(service_runtime::Error::Profile)?;
     let domain = authenticated_domain()?;
@@ -531,25 +544,45 @@ pub async fn attach(
     // register_netdevice starts IFF_DOWN. Finish actual USB/MAC/card park
     // before publication, rather than leave an RX stream running under DOWN.
     crate::future_heap::build(|| service.park()).await?;
-    let name = narf_net::iface::reserve_name("wlan%d");
+    let name = crate::platform::net::iface::reserve_name("wlan%d");
     let device = Arc::new(Device::from_boxed_service(name, service));
-    narf_net::registry()
-        .register(&authority, Registered(device.clone()))
+    #[cfg(feature = "builtin")]
+    {
+        crate::platform::net::registry()
+            .register(&authority, Registered(device.clone()))
+            .map_err(|_| service_runtime::Error::Profile)?;
+        *ACTIVE.lock() = Some(device.clone());
+        crate::platform::net::iface::register(name, device.mac, send);
+        crate::platform::net::iface::set_link_state(name, false);
+        let registration =
+            crate::platform::net::iface::lookup(name).ok_or(service_runtime::Error::State)?;
+        device.bind_admin(registration)?;
+        crate::platform::net::iface::install_rx_drain(drain);
+        narf_wireless::registry::register(device.clone());
+    }
+    // `rtl.ko`: the module netdev (no wiphy for a USB function), its TX
+    // entering through the same send hook; the device stays unbound from
+    // an administrative target, so it is open from publication on.
+    #[cfg(feature = "module")]
+    {
+        *ACTIVE.lock() = Some(device.clone());
+        crate::platform::scheduler::spawn(device.clone().module_open());
+        crate::module_netdev::attach_usb(
+            device.clone(),
+            alloc::boxed::Box::new(|bytes| send(bytes, crate::platform::net::TxMeta::default())),
+        )
         .map_err(|_| service_runtime::Error::Profile)?;
-    *ACTIVE.lock() = Some(device.clone());
-    narf_net::iface::register(name, device.mac, send);
-    narf_net::iface::set_link_state(name, false);
-    let registration = narf_net::iface::lookup(name).ok_or(service_runtime::Error::State)?;
-    device.bind_admin(registration)?;
-    narf_net::iface::install_rx_drain(drain);
-    narf_wireless::registry::register(device.clone());
+    }
     crate::watchdog_work::start(&device, WATCHDOG_MS);
     let worker = device.clone();
-    narf_scheduler::spawn(async move {
+    crate::platform::scheduler::spawn(async move {
         loop {
             worker.drain();
             worker.maintain().await;
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                1_000_000,
+            ))
+            .await;
         }
     });
     Ok(device)
@@ -897,7 +930,7 @@ fn bss_info(b: Candidate) -> BssInfo {
         security,
     }
 }
-fn offloads_admitted(meta: narf_net::TxMeta) -> bool {
+fn offloads_admitted(meta: crate::platform::net::TxMeta) -> bool {
     meta.csum_l4.is_none() && meta.tso_mss.is_none() && meta.vlan_tag.is_none()
 }
 fn transmit_admitted(bytes: &[u8], own: [u8; 6]) -> bool {

@@ -13,9 +13,9 @@
 //! narrowed. No board value is shipped.
 use super::rtl8192e_radio::{channel_geometry, Width};
 use super::rtl8723b_init::Factory;
+use crate::platform::capabilities::{Cap, NoopOp, Read};
+use crate::platform::firmware::{FirmwareBlob, FirmwareError};
 use alloc::{format, vec::Vec};
-use narf_capabilities::{Cap, NoopOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
 
 pub(super) const MAGIC: [u8; 4] = *b"N8BP";
 pub(super) const HEADER: usize = 128;
@@ -217,7 +217,7 @@ impl Calibration {
 
     pub fn load_registered(factory: &Factory, vid: u16, pid: u16) -> Result<Self, Error> {
         let name = Self::asset_name(factory);
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
         let auth = loader
             .derive()

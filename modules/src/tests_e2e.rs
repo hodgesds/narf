@@ -1838,11 +1838,17 @@ fn e2e_rtl_module_registration() -> TestResult {
     // The match a foreign owner can take before load decides whether this
     // kernel has a USB stack to check against.
     let usb_stack = rtl_e2e_foreign_usb_claim(USB_IDS[0].0, USB_IDS[0].1) != -19;
-    let module = match sys_init_module(&image) {
+    let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
         Ok(module) => module,
         Err(_) => return TestResult::Fail("rtl.ko failed to load or run init"),
     };
     let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    // The USB station's parameter-driven SME.
+    let params = ["ssid", "psk", "passphrase"]
+        .iter()
+        .all(|name| crate::params::find(&module.params, name).is_some())
+        && crate::params::find(&module.params, "ssid").is_some_and(|s| s.read() == "narf-e2e")
+        && crate::params::find(&module.params, "psk").is_some_and(|s| s.read().is_empty());
     let installed = count().saturating_sub(before);
     let pci_claims = module.name() == "rtl"
         && installed == PCI_DEVICES.len()
@@ -1868,6 +1874,9 @@ fn e2e_rtl_module_registration() -> TestResult {
     }
     if !live {
         return TestResult::Fail("rtl.ko not Live after init");
+    }
+    if !params {
+        return TestResult::Fail("rtl.ko parameters missing or the load argument not applied");
     }
     if !pci_claims {
         narf_console::write_str(&format!(

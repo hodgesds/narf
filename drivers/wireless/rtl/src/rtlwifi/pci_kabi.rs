@@ -114,7 +114,10 @@ extern "C" fn poll(_cookie: u64) -> i32 {
 /// Probe thunk the kernel's PCI match calls (task context, module domain).
 extern "C" fn probe_c(dev: u64, _reserved: u64) -> i32 {
     // Every device export takes the bound token (`platform::device`): a
-    // second function must not replace it.
+    // second function, PCI or USB, must not replace it.
+    if platform::device() != 0 {
+        return EBUSY;
+    }
     if BOUND
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()

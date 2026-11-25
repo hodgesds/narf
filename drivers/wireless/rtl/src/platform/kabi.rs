@@ -1147,6 +1147,12 @@ pub mod net {
         ) -> &super::IrqSafeSpinLock<Option<super::ipc::Producer<Frame, TX_RING_N>>>;
     }
 
+    /// `narf_net::trusted_net_authority`: the module's `NetIface` manifest
+    /// grant is its net authority, current while the module is loaded.
+    pub fn trusted_net_authority() -> Option<()> {
+        Some(())
+    }
+
     /// `narf_net::iface`: the calls a published device makes on its netdev.
     pub mod iface {
         /// The netif bridge names the module's netdev (`wlan%d`) when it
@@ -1155,13 +1161,76 @@ pub mod net {
             "wlan"
         }
         /// Deliver one received Ethernet frame (`narf_netif_rx`).
-        pub fn on_rx_frame_from(name: &str, bytes: &mut alloc::vec::Vec<u8>) {
+        pub fn on_rx_frame_from(name: &str, bytes: &mut [u8]) {
             crate::module_netdev::rx(name, bytes);
         }
         /// Carrier follows the association (`CONNECT_RESULT`/`DISCONNECTED`
         /// reports are the module netdev's).
-        pub fn set_link_metadata(name: &str, up: bool, _speed: Option<u32>, _duplex: Option<bool>) {
+        pub fn set_link_metadata(
+            name: &str,
+            up: bool,
+            _speed: Option<u32>,
+            _duplex: Option<bool>,
+        ) -> bool {
             crate::module_netdev::link(name, up);
+            true
+        }
+
+        /// `narf_net::iface::NetIfaceSnapshot`. The bridge owns the module's
+        /// netdev, so no administrative binding exists: [`lookup`] finds
+        /// none, and a device without a binding is administratively open
+        /// (the module has no IFF_UP event; the station opens at publish).
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct NetIfaceSnapshot {
+            pub name: alloc::string::String,
+            pub mac: [u8; 6],
+            pub link_up: bool,
+        }
+
+        /// `narf_net::iface::OpenStopEvent` (never delivered to a module).
+        #[derive(Clone, Debug)]
+        pub struct OpenStopEvent {
+            name: alloc::string::String,
+            up: bool,
+        }
+        impl OpenStopEvent {
+            pub fn name(&self) -> &str {
+                &self.name
+            }
+            pub fn up(&self) -> bool {
+                self.up
+            }
+            pub fn current(&self) -> bool {
+                false
+            }
+        }
+
+        /// `narf_net::iface::OpenStopTarget`.
+        pub trait OpenStopTarget: Send + Sync {
+            fn transition(&self, event: OpenStopEvent);
+        }
+
+        pub fn lookup(_name: &str) -> Option<NetIfaceSnapshot> {
+            None
+        }
+        pub fn set_link_metadata_for(
+            binding: &NetIfaceSnapshot,
+            up: bool,
+            _speed: Option<u32>,
+            _duplex: Option<bool>,
+        ) -> bool {
+            crate::module_netdev::link(&binding.name, up);
+            true
+        }
+        pub fn withdraw_link_metadata_for(binding: &NetIfaceSnapshot) -> bool {
+            crate::module_netdev::link(&binding.name, false);
+            true
+        }
+        pub fn set_open_stop_target(
+            _binding: &NetIfaceSnapshot,
+            _target: alloc::sync::Arc<dyn OpenStopTarget>,
+        ) -> bool {
+            false
         }
     }
 }
@@ -1337,6 +1406,36 @@ pub mod regdb {
         pub fn snapshot(&self) -> Option<Arc<RegulatoryDomain>> {
             self.domain.lock().clone()
         }
+    }
+}
+
+/// The shared Realtek USB transport over the `narf_usb_*` KABI.
+#[path = "usb_kabi.rs"]
+pub mod rtl_usb;
+
+/// `narf_drivers_usb` names rtl8xxxu uses.
+pub mod usb {
+    pub use super::rtl_usb::{USBDevice, UsbError};
+}
+
+/// `narf_wireless::reg::policy`: the signed deployment policy rtl8xxxu's
+/// admission reads. A module sees the kernel's installation, which the
+/// kernel bootstraps from that same policy (`narf_wireless_regdomain`); no
+/// installation reads as the policy asset not being staged yet.
+pub mod regpolicy {
+    use super::firmware::FirmwareError;
+    use narf_wireless::reg::RegulatoryDomain;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Error {
+        Authority,
+        Firmware(FirmwareError),
+        Unsigned,
+        Format(&'static str),
+    }
+
+    pub fn load() -> Result<RegulatoryDomain, Error> {
+        super::regdb::get_domain().ok_or(Error::Firmware(FirmwareError::NotFound))
     }
 }
 

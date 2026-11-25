@@ -20,6 +20,14 @@ pub use narf_net as net;
 pub use narf_scheduler as scheduler;
 pub use narf_time as time;
 pub use narf_wireless::reg::db as regdb;
+pub use narf_wireless::reg::policy as regpolicy;
+
+pub use narf_drivers_wireless_rtl_usb as rtl_usb;
+
+/// `narf_drivers_usb` names rtl8xxxu uses.
+pub mod usb {
+    pub use narf_drivers_usb::device::{USBDevice, UsbError};
+}
 
 pub use narf_drivers_wireless_core::{firmware_asset, future_heap, watchdog_work};
 

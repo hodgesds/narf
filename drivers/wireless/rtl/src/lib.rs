@@ -11,21 +11,23 @@
 //! kernel-free Realtek chip core (`narf_drivers_wireless_rtl_chip::efuse`) that
 //! `rtlwifi::efuse` calls directly so the `.ko` can link it.
 //!
-//! Built in, [`rtl8xxxu`] and [`rtlwifi`] are the whole drivers. The `module`
-//! build (`rtl.ko`) runs the drivers' own code inside the `.ko` over
-//! `narf-module-rt` and the KABI (kernel services come from [`platform`], the
-//! same names in both builds), as far as it is carried today:
+//! One source builds both ways. Built in, [`rtl8xxxu`] and [`rtlwifi`] use
+//! the kernel's crates. As `rtl.ko` the same drivers run over
+//! `narf-module-rt` and the KABI: kernel services come from [`platform`]
+//! under the same names in both builds, and only the bus bindings differ
+//! (`rtlwifi::pci_kabi`, `rtlwifi::firmware_native` over the KABI,
+//! `rtl8xxxu::usb_kabi`, the shared USB transport in `platform::rtl_usb`).
 //!
-//! - **rtlwifi (PCIe)** — every rtlwifi id. Probe runs the built-in probe's
-//!   identification stage ([`rtlwifi::identity`]: BAR2 checks, ASPM off,
-//!   the chip's NIC-enable power table, interrupt masking, the factory EFUSE
-//!   map and MAC), then publishes `wlan%d` and its wiphy through the netif
-//!   bridge and the `WIFI` family host. That is the built-in's diagnostic
-//!   profile: firmware, native preparation and the station are not carried
-//!   yet, so scan and connect are refused.
-//! - **rtl8xxxu (USB)** — every `RTL8XXXU_USB_IDS` row. Probe classifies the
-//!   dongle with the driver's own chip-family table and claims it, as the
-//!   built-in probe does; the firmware/station owners are not carried yet.
+//! - **rtlwifi (PCIe)** — every rtlwifi id: identification, firmware,
+//!   native preparation and the station, published as `wlan%d` with a
+//!   wiphy through the netif bridge and the `WIFI` family host
+//!   (`module_netdev`).
+//! - **rtl8xxxu (USB)** — every `RTL8XXXU_USB_IDS` row: the family chain
+//!   unchanged; the USB station gets a netdev (no wiphy: the `WIFI` host is
+//!   bound to PCI device authority) and its SME is driven by `rtl.ssid=` /
+//!   `rtl.psk=` / `rtl.passphrase=`.
+//!
+//! See `drivers/wireless/specification/spec.md` §4.3.
 //!
 //! ## Hardware validation is gated
 //!
@@ -55,15 +57,7 @@ use narf_driver_macros::narf_driver;
 // `crate::watchdog_work` references resolve unchanged in both builds.
 pub(crate) use platform::{firmware_asset, future_heap, watchdog_work};
 
-#[cfg(feature = "builtin")]
 pub mod rtl8xxxu;
-
-/// The module build's rtl8xxxu: the chip-family table and the USB binding.
-#[cfg(feature = "module")]
-pub mod rtl8xxxu {
-    pub mod regs;
-    pub mod usb_kabi;
-}
 
 pub mod rtlwifi;
 
@@ -90,6 +84,15 @@ fn do_register() {
     rtl8xxxu::register();
     rtlwifi::register();
 }
+
+/// The USB station's parameter-driven SME (`module_netdev::autoconnect`):
+/// `rtl.ssid=` / `rtl.psk=` (64 hex digits) / `rtl.passphrase=`, applied
+/// from the kernel command line and the load's own arguments. Empty = not
+/// given. A PCIe station is driven by nl80211 through its wiphy instead.
+#[cfg(feature = "module")]
+#[used]
+#[link_section = ".narf_kparams"]
+static KPARAMS: [u8; 23] = *b"ssid=\npsk=\npassphrase=\n";
 
 #[cfg(feature = "module")]
 fn do_register() {

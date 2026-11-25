@@ -4,10 +4,10 @@ use super::{
     power_policy::{Calibration, Permission},
     receive_runtime::Error,
 };
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::FirmwareBlob;
 use alloc::sync::Arc;
 use core::{future::Future, task::Poll};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::FirmwareBlob;
 #[cfg(any(test, feature = "kernel-test"))]
 use narf_wireless::reg::RegulatoryDomain;
 use narf_wireless::wmm::Parameters;
@@ -49,7 +49,7 @@ pub(super) struct Proof {
     cap: Cap<FirmwareBlob, Read>,
     country: [u8; 2],
     #[cfg(any(test, feature = "kernel-test"))]
-    model: Option<Arc<narf_lib::sync::IrqSafeSpinLock<RegulatoryDomain>>>,
+    model: Option<Arc<crate::platform::lib::sync::IrqSafeSpinLock<RegulatoryDomain>>>,
 }
 impl Proof {
     pub(super) fn calibration(&self) -> &Calibration {
@@ -63,7 +63,7 @@ impl Proof {
         if let Some(model) = &self.model {
             return Ok(model.lock().clone());
         }
-        narf_wireless::reg::db::get_domain().ok_or(Error::Policy)
+        crate::platform::regdb::get_domain().ok_or(Error::Policy)
     }
     pub(super) fn registered(
         factory: Factory,
@@ -74,7 +74,7 @@ impl Proof {
         let calibration = Calibration::load_registered(factory, vid, pid).map_err(Error::Power)?;
         let cap = calibration.authority().ok_or(Error::State)?;
         // Only this explicit pre-attempt boundary may bootstrap policy.
-        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?;
+        let domain = crate::platform::regdb::ensure_domain().map_err(|_| Error::Policy)?;
         if calibration
             .permission(&domain, permission.channel())
             .map_err(Error::Power)?
@@ -96,7 +96,7 @@ impl Proof {
         calibration: Calibration,
         permission: Permission,
         cap: Cap<FirmwareBlob, Read>,
-        domain: Arc<narf_lib::sync::IrqSafeSpinLock<RegulatoryDomain>>,
+        domain: Arc<crate::platform::lib::sync::IrqSafeSpinLock<RegulatoryDomain>>,
     ) -> Arc<Self> {
         let country = domain.lock().country_code;
         Arc::new(Self {
@@ -112,10 +112,10 @@ impl Proof {
         let domain = if let Some(model) = &self.model {
             Some(model.lock().clone())
         } else {
-            narf_wireless::reg::db::get_domain()
+            crate::platform::regdb::get_domain()
         };
         #[cfg(not(any(test, feature = "kernel-test")))]
-        let domain = narf_wireless::reg::db::get_domain();
+        let domain = crate::platform::regdb::get_domain();
         let domain = domain.ok_or(Error::Policy)?;
         if domain.country_code != self.country
             || self
@@ -163,7 +163,7 @@ impl Proof {
             })
             .map_err(|_| {
                 Error::Power(super::power_policy::Error::Firmware(
-                    narf_firmware::FirmwareError::AuthorityRevoked,
+                    crate::platform::firmware::FirmwareError::AuthorityRevoked,
                 ))
             })?
     }

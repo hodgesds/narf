@@ -9,8 +9,8 @@ use super::{
     device_init::Endpoints,
     packet_codec::{self, Kind, Record, MAX_TRANSFER},
 };
+use crate::platform::usb::UsbError;
 use alloc::vec::Vec;
-use narf_drivers_usb::device::UsbError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -42,7 +42,7 @@ pub struct Recovery {
     pub transmit_lost: bool,
 }
 // `Io`/`UsbIo` moved to `narf_drivers_wireless_rtl_usb` (shared with rtw88).
-pub use narf_drivers_wireless_rtl_usb::{Io, UsbIo};
+pub use crate::platform::rtl_usb::{Io, UsbIo};
 struct Transmit<R> {
     receipt: R,
     bytes: usize,

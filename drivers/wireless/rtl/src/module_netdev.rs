@@ -51,6 +51,13 @@ mod ffi {
             out_ifindex: *mut u32,
         ) -> i32;
         pub fn narf_netif_rx(dev: u64, ifindex: u32, frame: *mut u8, len: usize) -> i32;
+        pub fn narf_usb_netif_register_with_context(
+            dev: u64,
+            mac: *const u8,
+            tx_callback: usize,
+            out_ifindex: *mut u32,
+        ) -> i32;
+        pub fn narf_usb_netif_rx(dev: u64, ifindex: u32, frame: *mut u8, len: usize) -> i32;
         pub fn narf_wireless_open(
             dev: u64,
             family: u32,
@@ -139,6 +146,8 @@ pub enum Error {
 /// The bound netdev (one function per module).
 struct Netdev {
     ifindex: u32,
+    /// A USB function: the `narf_usb_netif_*` exports, and no wiphy.
+    usb: bool,
     session: u64,
     /// The station's TX entry (none: diagnostic).
     send: Option<Send>,
@@ -191,21 +200,26 @@ fn report(session: u64, opcode: u32, request: &[u8]) -> i32 {
 /// `narf_net::iface::on_rx_frame_from`: hand one received Ethernet frame to
 /// the stack. The device's internal RX ring has no consumer in the module
 /// (frames go out here), so its consumer side is dropped.
-pub(crate) fn rx(_name: &str, bytes: &mut Vec<u8>) {
+pub(crate) fn rx(_name: &str, bytes: &mut [u8]) {
     let Some(netdev) = netdev() else {
         return;
     };
     if let Some(device) = &netdev.device {
         drop(device.rx_ring().lock().take());
     }
-    // SAFETY: `bytes` names `len` bytes the call may rewrite in place.
+    let (dev, ifindex, frame, len) = (
+        platform::device(),
+        netdev.ifindex,
+        bytes.as_mut_ptr(),
+        bytes.len(),
+    );
+    // SAFETY: `frame` names `len` bytes the call may rewrite in place.
     let _ = unsafe {
-        ffi::narf_netif_rx(
-            platform::device(),
-            netdev.ifindex,
-            bytes.as_mut_ptr(),
-            bytes.len(),
-        )
+        if netdev.usb {
+            ffi::narf_usb_netif_rx(dev, ifindex, frame, len)
+        } else {
+            ffi::narf_netif_rx(dev, ifindex, frame, len)
+        }
     };
 }
 
@@ -220,6 +234,10 @@ pub(crate) fn link(_name: &str, up: bool) {
 pub(crate) fn disconnected(_name: &str, reason: u16, local: bool) {
     if let Some(netdev) = netdev() {
         netdev.frequency.store(0, Ordering::Release);
+        if netdev.usb {
+            log(format_args!("link lost (reason {reason})"));
+            return;
+        }
         let _ = report(
             netdev.session,
             wifi::OP_DISCONNECTED,
@@ -615,6 +633,7 @@ fn register(
     let wiphy = encode_register_wiphy(ifindex, mac, device.as_deref());
     *NETDEV.lock() = Some(Arc::new(Netdev {
         ifindex,
+        usb: false,
         session,
         send,
         device,
@@ -639,6 +658,9 @@ pub fn publish_diagnostic(mac: [u8; 6]) -> Result<Published, Error> {
 /// A station's publication in the module (the drivers' `publish` /
 /// `attach`): its netdev and wiphy, TX entering through `send`.
 pub(crate) fn attach(device: Arc<Station>, send: Send) -> Result<Published, Error> {
+    if netdev().is_some() {
+        return Err(Error::Netdev(-16));
+    }
     let mac = device.mac();
     let published = register(mac, Some(device), Some(send))?;
     log(format_args!(
@@ -654,4 +676,163 @@ pub fn describe() -> String {
         || String::from("wlan?"),
         |n| alloc::format!("wlan (ifindex {})", n.ifindex),
     )
+}
+
+// ── USB stations (rtl8xxxu) ───────────────────────────────────────────
+
+/// A USB station's publication: its netdev through the USB netif bridge
+/// (`narf_usb_netif_register_with_context`), TX entering through `send`.
+///
+/// A USB function has no wiphy: the `WIFI` host binds a session to a bus
+/// device context's `Cap<BusDeviceCap>`, which a USB function does not
+/// have. So nl80211 cannot drive it. The driver's own SME is driven instead
+/// by the module's parameters (`rtl.ssid=`, `rtl.psk=` / `rtl.passphrase=`),
+/// as `rtw88.ko` does: [`autoconnect`] scans for the SSID and associates
+/// through the station's own `WirelessNetIface` methods, and reconnects
+/// after a link loss.
+pub(crate) fn attach_usb(device: Arc<Station>, send: Send) -> Result<Published, Error> {
+    if netdev().is_some() {
+        return Err(Error::Netdev(-16));
+    }
+    let mac = device.mac();
+    let mut ifindex = 0u32;
+    // SAFETY: `mac` names six readable bytes; `tx_callback` is a valid
+    // extern "C" fn in this image; `ifindex` is a live local.
+    let rc = unsafe {
+        ffi::narf_usb_netif_register_with_context(
+            platform::device(),
+            mac.as_ptr(),
+            tx_callback as usize,
+            &mut ifindex,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::Netdev(rc));
+    }
+    let netdev = Arc::new(Netdev {
+        ifindex,
+        usb: true,
+        session: 0,
+        send: Some(send),
+        device: Some(device.clone()),
+        up: AtomicBool::new(false),
+        frequency: AtomicU32::new(0),
+        last_scan: IrqSafeSpinLock::new(Vec::new()),
+    });
+    *NETDEV.lock() = Some(netdev.clone());
+    log(format_args!(
+        "USB station published (ifindex {ifindex}; no wiphy)"
+    ));
+    platform::scheduler::spawn(autoconnect(netdev, device));
+    Ok(Published {
+        ifindex,
+        session: 0,
+    })
+}
+
+/// A load parameter's value, empty when not given.
+fn param(name: &str) -> String {
+    narf_module_rt::param::get(name).unwrap_or_default()
+}
+
+/// 64 hex digits as a 32-byte PSK.
+fn hex_psk(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut psk = [0u8; 32];
+    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+        let hi = char::from(pair[0]).to_digit(16)?;
+        let lo = char::from(pair[1]).to_digit(16)?;
+        psk[i] = (hi * 16 + lo) as u8;
+    }
+    Some(psk)
+}
+
+/// The station's security from the parameters: a hex PSK, else a WPA2
+/// passphrase (8-63 bytes, PBKDF2 over the SSID), else open.
+fn security_from_params(ssid: &[u8]) -> Option<SecurityConfig> {
+    let psk = param("psk");
+    if !psk.is_empty() {
+        return hex_psk(&psk).map(|psk| SecurityConfig::Wpa2 { psk });
+    }
+    let passphrase = param("passphrase");
+    if !passphrase.is_empty() {
+        if !(8..=63).contains(&passphrase.len()) {
+            return None;
+        }
+        let psk = narf_crypto::pbkdf2_sha1::wpa2_pmk(passphrase.as_bytes(), ssid);
+        return Some(SecurityConfig::Wpa2 { psk });
+    }
+    Some(SecurityConfig::Open)
+}
+
+/// Retry interval of the parameter-driven SME.
+const AUTOCONNECT_RETRY_NS: u64 = 5_000_000_000;
+
+async fn autoconnect(netdev: Arc<Netdev>, device: Arc<Station>) {
+    let ssid = param("ssid");
+    if ssid.is_empty() {
+        log(format_args!(
+            "no rtl.ssid= given; the USB station stays idle"
+        ));
+        return;
+    }
+    let ssid = ssid.into_bytes();
+    // Derived once: a passphrase's PBKDF2 is the expensive part.
+    let psk = match security_from_params(&ssid) {
+        Some(SecurityConfig::Wpa2 { psk }) => Some(psk),
+        Some(_) => None,
+        None => {
+            log(format_args!(
+                "ignoring rtl.psk= / rtl.passphrase=: malformed"
+            ));
+            return;
+        }
+    };
+    loop {
+        if device.connected_bssid().is_none() {
+            let request = ScanRequest {
+                ssids: alloc::vec![ssid.clone()],
+                frequencies_mhz: Vec::new(),
+                channels: Vec::new(),
+                active: true,
+                random_mac: None,
+                colocated_6ghz: false,
+                duration_tu: None,
+                duration_mandatory: false,
+                extra_ies: Vec::new(),
+            };
+            match device.scan(request).await {
+                Ok(results) => *netdev.last_scan.lock() = results,
+                Err(error) => log(format_args!("autoconnect scan failed: {error:?}")),
+            }
+            let request = AssociateRequest {
+                bssid: [0; 6],
+                ssid: ssid.clone(),
+                frequency_mhz: 0,
+                channel: 0,
+                security: match psk {
+                    Some(psk) => SecurityConfig::Wpa2 { psk },
+                    None => SecurityConfig::Open,
+                },
+                ie: Vec::new(),
+            };
+            match resolve_bss(&netdev, request) {
+                Some(request) => {
+                    let frequency = request.frequency_mhz;
+                    match device.associate(request).await {
+                        Ok(()) => {
+                            netdev.frequency.store(frequency, Ordering::Release);
+                            log(format_args!("associated ({frequency} MHz)"));
+                        }
+                        Err(error) => log(format_args!("autoconnect failed: {error:?}")),
+                    }
+                }
+                None => log(format_args!("autoconnect: SSID not found")),
+            }
+        }
+        platform::time::sleep_cycles(AUTOCONNECT_RETRY_NS).await;
+    }
 }
