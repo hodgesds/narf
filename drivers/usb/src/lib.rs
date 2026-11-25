@@ -42,6 +42,9 @@ pub mod uac;
 pub mod uac_card;
 pub mod uas;
 pub mod uhci;
+pub mod usb_sysfs;
+#[cfg(feature = "kernel-test")]
+mod usb_sysfs_tests;
 pub mod usbdev;
 #[cfg(feature = "kernel-test")]
 mod usbdev_tests;
@@ -80,6 +83,15 @@ pub fn register_initcalls() {
     class_registry::install_module_host();
     // Install devfs hooks so /dev/ttyUSB<N> nodes resolve.
     // Linux ref: `drivers/usb/serial/usb-serial.c:usb_serial_register_drivers`.
+    // /sys/devices/.../usbN for every root hub, once the controllers have
+    // probed (Stage::Device), so empty buses are listed too.
+    narf_init::register(Stage::Late, "usb-sysfs-root-hubs", || {
+        if usb_sysfs::publish_all_root_hubs() == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
     narf_init::register(Stage::Subsys, "usb-serial-devfs", || {
         narf_filesystem::devfs::install_tty_usb_hooks(
             serial::devfs_bridge::lookup_tty_usb,

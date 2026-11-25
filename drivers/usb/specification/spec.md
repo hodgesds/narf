@@ -1262,6 +1262,24 @@ also consult upstream Linux GPL sources.
   - **Lifecycle:** `dispatch_after_address` registers the device after
     its device descriptor read; `release_slot` and controller recovery
     remove it.
+- `usb_sysfs` publishes the Linux topology under the xHCI's PCI
+  kobject:
+  - **Root hubs (`usbN`):** published at Stage::Late, so empty buses
+    are listed. Each carries Linux's synthesized identity: 1d6b:0002 /
+    0003, bcdDevice = kernel version, "Linux <release> xhci-hcd", and
+    the PCI slot as serial. Its `descriptors` are
+    `usbdev::root_hub_descriptors` (single TT, remote wakeup, 4-byte
+    status endpoint).
+  - **Devices:** nested under their hub, with the `usb_device`
+    attributes of drivers/usb/core/sysfs.c and a uevent carrying
+    MAJOR=189/MINOR/DEVNAME=bus/usb/BBB/DDD/DEVTYPE/PRODUCT/TYPE/
+    BUSNUM/DEVNUM.
+  - **Interfaces of the active configuration (`<dev>:<cfg>.<if>`):**
+    their attributes, `modalias`, and the INTERFACE/MODALIAS uevent.
+  - **Links and events:** devices and root hubs are linked from
+    `/sys/bus/usb/devices` and `/sys/dev/char/189:<minor>`; interfaces
+    from `/sys/bus/usb/devices`. Add and remove uevents are emitted.
+  - **Removal:** it follows the recorded publish path, children first.
 - `attach::settle_outcome` runs after the class cascade:
   - **A binder took the device:** it records configuration index 0 (the
     binders' choice), claims the interfaces the binder holds (its one

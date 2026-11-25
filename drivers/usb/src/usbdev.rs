@@ -302,6 +302,42 @@ pub fn devpath(rh_port: u8, route: u32) -> String {
     s
 }
 
+/// A root hub's descriptors as Linux synthesizes them (`hcd.c`): the
+/// USB 2 or USB 3 root-hub device descriptor and its one configuration,
+/// one hub interface with a 4-byte status-change endpoint (plus the SS
+/// companion on USB 3). As `rh_call_control` patches them for xHCI, the
+/// USB 2 descriptor reports an integrated single TT (protocol 1 in
+/// `bDeviceProtocol`) and the configuration remote wakeup
+/// (`bmAttributes` 0xe0).
+/// `bcdDevice` is the kernel version.
+pub fn root_hub_descriptors(hub: &RootHub) -> Vec<u8> {
+    let [bcd_lo, bcd_hi] = crate::usb_sysfs::ROOT_HUB_BCD_DEVICE.to_le_bytes();
+    let mut d = if hub.usb3 {
+        alloc::vec![
+            0x12, 0x01, 0x00, 0x03, 0x09, 0x00, 0x03, 0x09, 0x6b, 0x1d, 0x03, 0x00, bcd_lo, bcd_hi,
+            0x03, 0x02, 0x01, 0x01,
+        ]
+    } else {
+        alloc::vec![
+            0x12, 0x01, 0x00, 0x02, 0x09, 0x00, 0x01, 0x40, 0x6b, 0x1d, 0x02, 0x00, bcd_lo, bcd_hi,
+            0x03, 0x02, 0x01, 0x01,
+        ]
+    };
+    // wMaxPacketSize = (USB_MAXCHILDREN + 1 + 7) / 8 = 4.
+    let hub_if: [u8; 25] = [
+        0x09, 0x02, 0x19, 0x00, 0x01, 0x01, 0x00, 0xe0, 0x00, // configuration
+        0x09, 0x04, 0x00, 0x00, 0x01, 0x09, 0x00, 0x00, 0x00, // hub interface
+        0x07, 0x05, 0x81, 0x03, 0x04, 0x00, 0x0c, // status-change endpoint
+    ];
+    d.extend_from_slice(&hub_if);
+    if hub.usb3 {
+        d.extend_from_slice(&[0x06, 0x30, 0x00, 0x00, 0x02, 0x00]);
+        // wTotalLength 0x1f with the companion.
+        d[18 + 2] = 0x1f;
+    }
+    d
+}
+
 // ── Device numbers ───────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -426,12 +462,16 @@ pub async fn register(
         }),
     });
     DEVICES.lock().push(dev.clone());
+    crate::usb_sysfs::publish_device(xhci, &dev);
     Some(dev)
 }
 
 /// Forget `(controller, slot)` (`usb_disconnect`), freeing its device
 /// number.
 pub fn remove(controller: u8, slot: u8) -> Option<Arc<UsbDev>> {
+    if let Some(dev) = find(controller, slot) {
+        crate::usb_sysfs::unpublish_device(&dev);
+    }
     let removed = {
         let mut g = DEVICES.lock();
         let i = g
@@ -445,6 +485,10 @@ pub fn remove(controller: u8, slot: u8) -> Option<Arc<UsbDev>> {
 
 /// Forget every device on `controller` (controller recovery).
 pub fn remove_controller(controller: u8) -> Vec<Arc<UsbDev>> {
+    // Children attach after their hubs: unpublish newest first.
+    for dev in all().iter().rev().filter(|d| d.controller == controller) {
+        crate::usb_sysfs::unpublish_device(dev);
+    }
     let removed: Vec<Arc<UsbDev>> = {
         let mut g = DEVICES.lock();
         let (gone, keep): (Vec<_>, Vec<_>) = g.drain(..).partition(|d| d.controller == controller);

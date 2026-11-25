@@ -1320,6 +1320,7 @@ async fn settle_outcome(
                 let _ = usb.claim(iface, owner.clone());
             }
         }
+        crate::usb_sysfs::publish_interfaces(&usb);
         hid::raw::bind_unclaimed(xhci_dev, &usb).await;
         return outcome;
     }
@@ -1337,6 +1338,7 @@ async fn settle_outcome(
             .await;
         if set.is_ok() {
             usb.set_config_value(value);
+            crate::usb_sysfs::publish_interfaces(&usb);
         }
     }
     if hid::raw::bind_unclaimed(xhci_dev, &usb).await > 0 {
