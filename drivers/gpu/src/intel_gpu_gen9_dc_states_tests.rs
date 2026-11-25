@@ -179,6 +179,42 @@ impl Gen9DcOff for LocalDc {
     }
 }
 
+/// The fixture core's system-suspend steps, on the holder's window; a
+/// scheduled re-entry lands in `deadline`.
+impl Gen9DcSuspend for LocalDc {
+    fn present(&self) -> bool {
+        true
+    }
+    fn suspend_begin(&self, regs: &dyn MmioWindow) -> Result<(), DcError> {
+        self.core.lock().suspend_begin(regs)
+    }
+    fn suspend_abort(&self, now: u64) {
+        if let Some(at) = self.core.lock().suspend_abort(now) {
+            self.deadline.store(at, Ordering::Relaxed);
+        }
+    }
+    fn uninit_admit(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        self.core.lock().uninit_admit(regs)
+    }
+    fn dc9_admit(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        self.core.lock().dc9_admit(regs)
+    }
+    fn enter_dc9(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        self.core.lock().enter_dc9(regs)
+    }
+    fn dc9_abort(&self) {
+        self.core.lock().dc9_abort();
+    }
+    fn resume_begin(&self, regs: &dyn MmioWindow) -> Result<bool, DcError> {
+        self.core.lock().resume_begin(regs)
+    }
+    fn resume_finish(&self, loaded: bool, now: u64) {
+        if let Some(at) = self.core.lock().resume_finish(loaded, now) {
+            self.deadline.store(at, Ordering::Relaxed);
+        }
+    }
+}
+
 fn smoke_gen9_dc_service_register_facts() -> TestResult {
     // intel_display_regs.h: HSW_PWR_WELL_CTL1..4 at 0x45400..0x4540C,
     // SKL_PW_CTL_IDX_PW_2 = 15, REQ(i) = 0x2 << 2i, STATE(i) = 0x1 << 2i;

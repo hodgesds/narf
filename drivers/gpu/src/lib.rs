@@ -881,6 +881,8 @@ pub mod intel_gpu_gen9_irq;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gen9_sagv;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_gen9_suspend;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gen9_wm;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_ggtt_ranges;

@@ -166,7 +166,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -1013,6 +1013,38 @@ impl Gen9DcCore {
         }
     }
 
+    /// A system-suspend preparation that will not complete (the display
+    /// suspend owner refused it, before any DC9 write): the fence lifted and
+    /// the Suspend reference dropped, as if the suspend had not begun.
+    /// Returns the re-entry deadline.
+    pub fn suspend_abort(&mut self, now: u64) -> Option<u64> {
+        if self.dc9 {
+            return None;
+        }
+        self.fenced = false;
+        if self.refs(Gen9DcUser::Suspend) == 0 {
+            return None;
+        }
+        self.put(Gen9DcUser::Suspend, now)
+    }
+
+    /// Display 9 proper, after [`Self::suspend_begin`]: whether the
+    /// display-core uninit (`skl_display_core_uninit`) may run, read-only.
+    /// It needs the Suspend reference, no holder in its conversation but
+    /// Init, Suspend and the GT's `GT_IRQ` hold (the GT touches no display
+    /// hardware), and the display dark ([`display_dark`]).
+    pub fn uninit_admit<M: MmioWindow + ?Sized>(&self, regs: &M) -> Result<(), Dc9Block> {
+        let suspend = self.refs(Gen9DcUser::Suspend);
+        if suspend == 0 {
+            return Err(Dc9Block::NotSuspending);
+        }
+        let quiet = suspend + self.refs(Gen9DcUser::Init) + self.refs(Gen9DcUser::GtIrq);
+        if self.total() != quiet {
+            return Err(Dc9Block::Busy);
+        }
+        display_dark(regs, self.lp, self.platform == Gen9Platform::Broxton)
+    }
+
     /// First half of the resume (`intel_display_power_resume_early`):
     /// `gen9_sanitize_dc_state`, then `bxt_disable_dc9` or the display-core
     /// init's `DC_STATE_DISABLE` whenever a DC state reads enabled, and the
@@ -1347,6 +1379,61 @@ pub trait Gen9DcOff: Sync {
     fn get(&self, regs: &dyn MmioWindow, user: Gen9DcUser) -> Result<bool, DcError>;
     /// Release a reference `get` counted.
     fn put(&self, user: Gen9DcUser);
+}
+
+/// The system-suspend steps of a Gen9 `DC_off` service as the Gen9 display
+/// suspend owner (`intel_gpu_gen9_suspend`) drives them around its panel-off
+/// and relight: the production service of one BAR ([`ServiceDcSuspend`],
+/// absent where none is installed), none ([`NoDcSuspend`]) or a fixture's
+/// own core. `regs` is the caller's window; the production service uses its
+/// own authorized window.
+pub trait Gen9DcSuspend: Sync {
+    /// Whether a service exists.
+    fn present(&self) -> bool;
+    /// [`Gen9DcCore::suspend_begin`]; `Ok` without a service.
+    fn suspend_begin(&self, regs: &dyn MmioWindow) -> Result<(), DcError>;
+    /// [`Gen9DcCore::suspend_abort`], scheduling the re-entry it returns.
+    fn suspend_abort(&self, now: u64);
+    /// [`Gen9DcCore::uninit_admit`].
+    fn uninit_admit(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block>;
+    /// [`Gen9DcCore::dc9_admit`].
+    fn dc9_admit(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block>;
+    /// [`Gen9DcCore::enter_dc9`].
+    fn enter_dc9(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block>;
+    /// [`Gen9DcCore::dc9_abort`].
+    fn dc9_abort(&self);
+    /// [`Gen9DcCore::resume_begin`].
+    fn resume_begin(&self, regs: &dyn MmioWindow) -> Result<bool, DcError>;
+    /// [`Gen9DcCore::resume_finish`], scheduling the re-entry it returns.
+    fn resume_finish(&self, loaded: bool, now: u64);
+}
+
+/// No Gen9 `DC_off` service: nothing to hold, nothing to enter.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoDcSuspend;
+
+impl Gen9DcSuspend for NoDcSuspend {
+    fn present(&self) -> bool {
+        false
+    }
+    fn suspend_begin(&self, _regs: &dyn MmioWindow) -> Result<(), DcError> {
+        Ok(())
+    }
+    fn suspend_abort(&self, _now: u64) {}
+    fn uninit_admit(&self, _regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        Err(Dc9Block::NotSuspending)
+    }
+    fn dc9_admit(&self, _regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        Err(Dc9Block::NotSuspending)
+    }
+    fn enter_dc9(&self, _regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        Err(Dc9Block::NotSuspending)
+    }
+    fn dc9_abort(&self) {}
+    fn resume_begin(&self, _regs: &dyn MmioWindow) -> Result<bool, DcError> {
+        Ok(false)
+    }
+    fn resume_finish(&self, _loaded: bool, _now: u64) {}
 }
 
 /// The caller's window as a `dyn MmioWindow` (register access only).
@@ -1792,6 +1879,95 @@ impl Gen9DcOff for ServiceDcOff {
     }
 }
 
+/// The BAR (its physical base) whose Gen9 display suspend owner drives this
+/// service's system-suspend steps; 0 when none does.
+static SUSPEND_OWNER: AtomicU64 = AtomicU64::new(0);
+
+/// The Gen9 display suspend owner for `bar` is installed: from now on it
+/// drives the Suspend reference, the late step and the resume
+/// ([`ServiceDcSuspend`]), and the service's own system-sleep hooks stand
+/// aside.
+pub(crate) fn hand_suspend_to_owner(bar: &narf_bus::MmioRegion) {
+    SUSPEND_OWNER.store(bar.phys.raw(), Ordering::Release);
+}
+
+fn owner_drives(service: &Gen9Service) -> bool {
+    SUSPEND_OWNER.load(Ordering::Acquire) == service.bar.phys.raw()
+}
+
+/// The production [`Gen9DcSuspend`]: the service installed for `bar`, if
+/// any, through its own authorized window.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ServiceDcSuspend {
+    pub(crate) bar: narf_bus::MmioRegion,
+}
+
+impl Gen9DcSuspend for ServiceDcSuspend {
+    fn present(&self) -> bool {
+        service_for(&self.bar).is_some()
+    }
+    fn suspend_begin(&self, _regs: &dyn MmioWindow) -> Result<(), DcError> {
+        let Some(service) = service_for(&self.bar) else {
+            return Ok(());
+        };
+        let mut core = service.core.lock();
+        core.suspend_begin(&service.window)
+    }
+    fn suspend_abort(&self, now: u64) {
+        let Some(service) = service_for(&self.bar) else {
+            return;
+        };
+        let due = service.core.lock().suspend_abort(now);
+        if due.is_some() {
+            schedule_arm(&service);
+        }
+    }
+    fn uninit_admit(&self, _regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        let Some(service) = service_for(&self.bar) else {
+            return Err(Dc9Block::NotSuspending);
+        };
+        let core = service.core.lock();
+        core.uninit_admit(&service.window)
+    }
+    fn dc9_admit(&self, _regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        let Some(service) = service_for(&self.bar) else {
+            return Err(Dc9Block::NotSuspending);
+        };
+        let mut core = service.core.lock();
+        core.dc9_admit(&service.window)
+    }
+    fn enter_dc9(&self, _regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        let Some(service) = service_for(&self.bar) else {
+            return Err(Dc9Block::NotSuspending);
+        };
+        let mut core = service.core.lock();
+        core.enter_dc9(&service.window)
+    }
+    fn dc9_abort(&self) {
+        if let Some(service) = service_for(&self.bar) {
+            service.core.lock().dc9_abort();
+        }
+    }
+    fn resume_begin(&self, _regs: &dyn MmioWindow) -> Result<bool, DcError> {
+        let Some(service) = service_for(&self.bar) else {
+            return Ok(false);
+        };
+        let mut core = service.core.lock();
+        core.resume_begin(&service.window)
+    }
+    fn resume_finish(&self, loaded: bool, now: u64) {
+        let Some(service) = service_for(&self.bar) else {
+            return;
+        };
+        let due = service.core.lock().resume_finish(loaded, now);
+        if due.is_some() {
+            schedule_arm(&service);
+        } else if !loaded {
+            log("Gen9 DC states held off after resume: the DMC program did not reload");
+        }
+    }
+}
+
 fn gates(service: &Gen9Service) -> Gen9ArmGates {
     Gen9ArmGates {
         external_route_active: !crate::intel_gpu::external_routes_stopped(&service.bar),
@@ -1950,6 +2126,10 @@ fn suspend_begin() -> Result<(), DcError> {
     let Some(service) = service() else {
         return Ok(());
     };
+    // The Gen9 display suspend owner drives these steps itself.
+    if owner_drives(&service) {
+        return Ok(());
+    }
     let mut core = service.core.lock();
     core.suspend_begin(&service.window)
 }
@@ -1958,6 +2138,10 @@ fn suspend_late() {
     let Some(service) = service() else {
         return;
     };
+    // The Gen9 display suspend owner drives these steps itself.
+    if owner_drives(&service) {
+        return;
+    }
     // Gen9 LP: bxt_display_core_uninit, then bxt_enable_dc9
     // (intel_display_power_suspend_late). A refusal leaves DC0 and the
     // suspend proceeds.
@@ -2000,6 +2184,10 @@ fn resume_after_suspend() {
     let Some(service) = service() else {
         return;
     };
+    // The Gen9 display suspend owner drives these steps itself.
+    if owner_drives(&service) {
+        return;
+    }
     // bxt_disable_dc9 / the display-core init's DC_STATE_DISABLE.
     let (pending, platform, vco, resident) = {
         let mut core = service.core.lock();

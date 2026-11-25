@@ -1764,6 +1764,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // (DC5/DC6 may be entered once idle) only with the DMC loaded and the
     // internal panel owned on Pipe A; inert without the Gen9 service.
     crate::intel_gpu_gen9_dc_states::probe_complete(&gt_bar, owns_scanout && panel_mode.is_some());
+    // Gen9 display system suspend (`narf.intel.gen9_suspend=1`, default
+    // off): the owned panel turns off before system sleep and is relit after
+    // it. Without the option nothing is installed.
+    if let Some(chip) = with_controller(|gpu| gpu.chip).filter(|_| owns_scanout) {
+        crate::intel_gpu_gen9_suspend::install(
+            crate::intel_gpu_gen9_suspend::requested(narf_boot::args()),
+            chip,
+            gt_bar,
+            device,
+            cap,
+            panel_mode,
+        );
+    }
 
     // Power management (Q9, #1015): retain the PCI authority,
     // note the takeover mode for resume re-light, and register
