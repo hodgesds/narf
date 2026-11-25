@@ -2569,6 +2569,9 @@ fn open_impl_reserved(
                         narf_filesystem::FsError::TimedOut => 62,         // ETIME
                         narf_filesystem::FsError::TransferTimedOut => 110, // ETIMEDOUT
                         narf_filesystem::FsError::OutOfRange => 34,       // ERANGE
+                        narf_filesystem::FsError::NotATty => 25,          // ENOTTY
+                        narf_filesystem::FsError::Protocol => 71,         // EPROTO
+                        narf_filesystem::FsError::Overflow => 75,         // EOVERFLOW
                         narf_filesystem::FsError::Canceled => 125,        // ECANCELED
                         narf_filesystem::FsError::Interrupted => 4,       // EINTR
                         narf_filesystem::FsError::NoSpace => 28,
@@ -5714,6 +5717,9 @@ pub(crate) fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::TimedOut => 62,  // ETIME
         narf_filesystem::FsError::TransferTimedOut => 110, // ETIMEDOUT
         narf_filesystem::FsError::OutOfRange => 34,  // ERANGE
+        narf_filesystem::FsError::NotATty => 25,     // ENOTTY
+        narf_filesystem::FsError::Protocol => 71,    // EPROTO
+        narf_filesystem::FsError::Overflow => 75,    // EOVERFLOW
         narf_filesystem::FsError::Canceled => 125, // ECANCELED
         narf_filesystem::FsError::Interrupted => EINTR,
     }

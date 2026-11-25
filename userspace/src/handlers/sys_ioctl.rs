@@ -2220,6 +2220,9 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::NoDeviceAddress) => ctx.set_return(errno_ret(6)),
         Err(narf_filesystem::FsError::TransferTimedOut) => ctx.set_return(errno_ret(110)),
         Err(narf_filesystem::FsError::OutOfRange) => ctx.set_return(errno_ret(34)),
+        Err(narf_filesystem::FsError::NotATty) => ctx.set_return(errno_ret(ENOTTY)),
+        Err(narf_filesystem::FsError::Protocol) => ctx.set_return(errno_ret(71)),
+        Err(narf_filesystem::FsError::Overflow) => ctx.set_return(errno_ret(75)),
         Err(narf_filesystem::FsError::OutOfMemory) => {
             ctx.set_return(errno_ret(ENOMEM));
         }

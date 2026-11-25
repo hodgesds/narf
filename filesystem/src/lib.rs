@@ -885,6 +885,18 @@ pub enum FsError {
     /// A numeric value does not fit the type it is parsed into — a sysfs
     /// store whose `kstrtol` overflowed `long`. Maps to `ERANGE`.
     OutOfRange,
+    /// The ioctl is not one this file answers, where Linux's handler
+    /// answers `-ENOTTY` (usbfs's `usbdev_do_ioctl` default). Distinct
+    /// from [`FsError::Unsupported`], which the ioctl path reports as
+    /// `EINVAL` (evdev's answer). Maps to `ENOTTY`.
+    NotATty,
+    /// The bus reported a protocol error for a transfer: a USB
+    /// transaction error (CRC, bit stuffing, missing handshake). Linux
+    /// returns `-EPROTO`. Maps to `EPROTO`.
+    Protocol,
+    /// The device sent more data than the transfer asked for (USB
+    /// babble). Linux returns `-EOVERFLOW`. Maps to `EOVERFLOW`.
+    Overflow,
     /// The work was abandoned without running to completion — a GPU job
     /// queued behind one that hung, or any job of a context that caused a
     /// hang (`-ECANCELED`). Maps to `ECANCELED`.
