@@ -366,6 +366,41 @@ narf_module_param(name:*const u8, name_len:usize, out:*mut u8, cap:usize, out_le
 applied `<module>.<param>=` from the kernel command line and then the load's
 own arguments (`modules/MODULE_AUTHORING.md`, "Module parameters").
 
+## Device-specific PCI configuration window
+
+Status: **implemented**; brcmfmac (`brcm` `.ko`, Broadcom FullMAC PCIe) is
+the first consumer. Broadcom parts select the backplane address their BAR0
+window decodes, and ring their firmware mailbox, through vendor registers in
+PCI configuration space (Linux `brcmf_pcie_select_core` writes
+`BRCMF_PCIE_BAR0_WINDOW` = 0x80, `brcmf_pcie_send_mb_data` writes
+`BRCMF_PCIE_REG_SBMBX` = 0x98), and park decode and bus mastering around BAR
+sizing and firmware download. Reads use the softMAC
+`narf_pci_config_read32` and Command parking the shared `narf_pci_command`
+(both below); the one export added here is primitive-only and requires
+`BusDevice`:
+
+```text
+narf_pci_config_write32(dev:u64, offset:u16, value:u32)->i32
+```
+
+- **Window.** Writes reach only the device-specific region 0x40..0x100,
+  dword-aligned (`-EINVAL` otherwise): never the standard header (BARs,
+  Command, the capability pointer), never extended space.
+- **Writes** are further refused (`-EPERM`) for any dword overlapping a
+  structure the kernel owns there: the Power Management (8 bytes), MSI
+  (sized from its Message Control), MSI-X (12 bytes) and PCI Express
+  (0x3C bytes) capabilities, and the header dword of every other capability
+  (the list links and vendor-specific length). Vendor-specific capability
+  bodies, where Broadcom's window registers live, stay writable. The list
+  is walked through the cap-gated accessors on every write. ASPM remains
+  `narf_pcie_aspm`'s; interrupt routing remains the MSI exports'.
+- **Errors.** `-ENODEV` for a token with no context of this module,
+  `-EOPNOTSUPP` off PCI, `-EIO` when the device cap is revoked or the
+  device is gone.
+- **Versioning.** New names only; no existing export changed. A module
+  built against them fails to resolve on an older kernel instead of being
+  called with the wrong layout.
+
 ## Wireless copy-mode host services
 
 The wireless extension uses permanent family host adapters. The loadable

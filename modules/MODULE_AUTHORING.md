@@ -196,6 +196,8 @@ So the surface is small and grows deliberately. Today:
 | `narf_msi_enable` | `(u64, u16, *mut u16, *mut u16, *mut u64, *mut u32) -> i32` | exactly `want` (power of two ≤ 32) aligned plain-MSI vectors, delivery left off; writes count, first kernel vector, Message Address and vector 0's Data; `-28` ask for fewer, `-95` no MSI, `-16` MSI/MSI-X already set up; requires `BusDevice` |
 | `narf_msi_set_enabled` | `(u64, u32) -> i32` | flip MSI delivery for that block |
 | `narf_pcie_aspm` | `(u64, u16, *mut u16) -> i32` | set Link Control's ASPM field (bits 1:0) only; writes the previous field |
+| `narf_pci_config_write32` | `(u64, u16, u32) -> i32` | config dword in the device-specific window 0x40..0x100 (dword-aligned); `-1` (EPERM) inside the PM, MSI, MSI-X or PCI Express capability or any capability header; vendor-specific bodies writable; requires `BusDevice` |
+| `narf_pci_command` | `(u64, u16, u16, *mut u16) -> i32` | clear then set Command bits (decode 0x2, master 0x4, INTx disable 0x400 only) and write the readback; requires `BusDevice` |
 | `narf_msix_enable` | `(u64) -> i32` | discover/retain MSI-X; `-95` when unsupported; requires `BusDevice` |
 | `narf_msix_claim` | `(u64, *mut u16) -> i32` | allocate/program one kernel IRQ vector |
 | `narf_irq_set_handler` | `(u64, u16, usize, u64) -> i32` | attach `extern "C" fn(u64) -> i32`; callback runs in task context |

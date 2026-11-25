@@ -1862,6 +1862,31 @@ kernel_abi! {
         }
     }
     // ── end ath9k.ko block ───────────────────────────────────────────────
+
+    // ── Device-specific PCI configuration window (brcmfmac.ko) ──────────
+    //
+    // FullMAC PCIe parts select their BAR0 backplane window and ring their
+    // mailbox doorbell through vendor registers in config space. Reads use
+    // `narf_pci_config_read32`; decode/bus-master parking around BAR sizing
+    // and firmware download uses the shared `narf_pci_command`. See
+    // `modules/DATAPATH_ABI_DESIGN.md`, "Device-specific PCI configuration
+    // window". Additive: no existing export changes.
+
+    /// Write config dword `offset` of the probed PCI function: the
+    /// device-specific region 0x40..0x100, dword-aligned, outside the PM,
+    /// MSI, MSI-X and PCI Express capabilities and every capability header
+    /// (`-EPERM` for those). Vendor-specific capability bodies are writable.
+    ///
+    /// # Safety
+    /// `dev` must be the live token supplied to the current module callback.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pci_config_write32(dev: u64, offset: u16, value: u32) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pci_config_write32(owner, dev, offset, value) {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        }
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -2587,3 +2612,40 @@ fn smoke_kabi_pci_command_validates_arguments() -> TestResult {
     }
 }
 kernel_test_in!("modules/kabi", smoke_kabi_pci_command_validates_arguments);
+
+// ── Device-specific PCI configuration window (brcmfmac.ko) ─────────────
+
+/// The config-window write and the Command export refuse a null output, an
+/// out-of-window or unaligned offset, a Command bit outside
+/// decode/master/INTx-disable and a token with no device context, and
+/// resolve only with the BusDevice cap.
+/// The owned-context write policy is `bus`'s
+/// `smoke_module_pci_cfg_window_validates`.
+fn smoke_kabi_pci_cfg_window_exports_validate() -> TestResult {
+    use narf_capabilities::CapKind;
+    const UNKNOWN: u64 = (0x58u64 << 56) | 0xFEFF;
+    let mut command = 0x5a5au16;
+    // SAFETY: each pointer is null (to prove rejection) or names a live local.
+    let ok = unsafe {
+        narf_pci_config_write32(UNKNOWN, 0x10, 0) == -22
+            && narf_pci_config_write32(UNKNOWN, 0x100, 0) == -22
+            && narf_pci_config_write32(UNKNOWN, 0x81, 0) == -22
+            && narf_pci_config_write32(UNKNOWN, 0x80, 0) == -19
+            && narf_pci_command(UNKNOWN, 0, 0, core::ptr::null_mut()) == -22
+            && narf_pci_command(UNKNOWN, 0x1, 0, &mut command) == -22
+            && narf_pci_command(UNKNOWN, 0, 0x4, &mut command) == -19
+    };
+    if !ok || command != 0x5a5a {
+        return TestResult::Fail("a PCI config-window export accepted a malformed argument");
+    }
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    for name in ["narf_pci_config_write32", "narf_pci_command"] {
+        match crate::symbols::resolve(name, None, &denied) {
+            Err(crate::symbols::ResolveError::CapMissing(CapKind::BusDevice)) => {}
+            _ => return TestResult::Fail("a PCI config-window export resolved without BusDevice"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_pci_cfg_window_exports_validate);
