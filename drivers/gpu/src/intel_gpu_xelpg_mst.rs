@@ -655,4 +655,118 @@ mod tests {
         "drivers/gpu/intel_gpu_xelpg_mst",
         smoke_mtl_mst_missing_act_retains_failed_route_and_blocks_release
     );
+
+    /// Nova Lake-S MST over LT port B beside the lit display-35 panel,
+    /// through the display-35 view. The first stream owns the link, so the
+    /// LT PHY is enabled for it alone (`intel_lt_phy_pll_enable` at the
+    /// shared link's DP 1.4 image, `xe3plpd_lt_dp_tables`) and carries its
+    /// trained `xe3plpd_lt_trans_dp14` levels; every LT access precedes the
+    /// second stream, which takes only Pipe C, its transcoder and payload
+    /// against the transcoder-B transport. The stop runs the second stream
+    /// first and releases MacCLK with the first (`intel_lt_phy_pll_disable`),
+    /// then the release returns AUX. No display-14 PHY offset or Cx0
+    /// transaction is reached.
+    fn smoke_nvl_mst_two_streams_over_lt_port_b() -> TestResult {
+        use crate::intel_gpu_lt_phy::{dp_pll_state, signal_level, LtDpRate, LtSignalProtocol};
+        use crate::intel_gpu_xelpg::lane_pclk_pll_request;
+        use crate::intel_gpu_xelpg_external::tests::nova::{nova_lt_lit, NovaExt};
+        let port = XeLpgPort::B;
+        let io = NovaExt::new(ExtFake::new(port, DpSink::new(0x14, edid())));
+        let Some(panel) = io.ext.light_panel_ip(DisplayIp::NovaLakeS) else {
+            return TestResult::Fail("the fixture must light the display-35 panel");
+        };
+        let view = crate::intel_gpu_xe3plpd::View(&io);
+        let profile = ExternalDisplayProfile::for_ip(DisplayIp::NovaLakeS);
+        let Ok(link) = probe_link_profile(&view, profile, port, false) else {
+            return TestResult::Fail("Nova DDI B must read the branch's DPCD over PICA AUX");
+        };
+        let mut aux = branch(&io.ext);
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        let mut index = 0;
+        let mut owner = match MtlMstRoute::connect_aux(
+            &view,
+            link,
+            MtlPortDecl::COMBO_DP_HDMI,
+            &display,
+            &mut |mode| Some(fb(mode, &mut index)),
+            &mut aux,
+        ) {
+            Ok(owner) => owner,
+            Err((_, error)) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "Nova MST connect: {error:?}");
+                return TestResult::Fail("Nova MST must light two remote-EDID sinks");
+            }
+        };
+        if owner.stream_count() != 2
+            || owner.streams[0].route.pipe != Pipe::B
+            || owner.streams[1].route.pipe != Pipe::C
+            || owner
+                .streams
+                .iter()
+                .any(|s| s.vcpi != s.route.pipe as u8 + 1)
+        {
+            return TestResult::Fail("Nova MST needs Pipes B and C with the pipe's VCPI");
+        }
+        if io.ext.read32(0x61540) & ((1 << 27) | (1 << 18)) != 1 << 27
+            || io.ext.read32(0x62540) & (1 << 31) != 0
+            || io.ext.read32(0x62400) & (3 << 10) != 1 << 10
+        {
+            return TestResult::Fail("only transcoder B may own the shared MST transport");
+        }
+        let first = &owner.streams[0].route;
+        let Some(rate) = LtDpRate::from_clock_khz(link_clock_khz(first.trained.rate))
+            .filter(|rate| !rate.is_uhbr())
+        else {
+            return TestResult::Fail("the MST link trains at a DP 1.4 rate");
+        };
+        let levels: Vec<_> = first.trained.vswing_pe.lanes[..usize::from(first.trained.lanes)]
+            .iter()
+            .map(|lane| {
+                signal_level(
+                    LtSignalProtocol::Dp14,
+                    crate::intel_gpu_xelpg::preset_index(lane.swing, lane.pre_emph),
+                )
+                .unwrap()
+            })
+            .collect();
+        if let Err(e) = nova_lt_lit(&io, dp_pll_state(rate), &levels) {
+            return TestResult::Fail(e);
+        }
+        let second = io
+            .ext
+            .first_write(|r, _| r == trans_clk_sel(Transcoder::C));
+        let last_lt = io.ext.last_write(|r, _| io.lt_reg(r));
+        if !matches!((last_lt, second), (Some(l), Some(c)) if l < c) {
+            return TestResult::Fail("the second stream must not reach the LT PHY");
+        }
+        io.ext.writes.borrow_mut().clear();
+        if owner.stop_aux(&view, &mut aux).is_err() || !owner.stopped() {
+            return TestResult::Fail("Nova MST must stop both streams");
+        }
+        let second_off = io.ext.first_write(|r, v| {
+            r == trans_ddi_func_ctl(Transcoder::C) && v & TRANS_DDI_FUNC_ENABLE == 0
+        });
+        let macclk_off = io
+            .ext
+            .first_write(|r, v| r == 0x16_fc60 && v & lane_pclk_pll_request(0) == 0);
+        if !matches!((second_off, macclk_off), (Some(s), Some(m)) if s < m)
+            || view.read32(port.port_clock_ctl()) & (3 << 30) != 0
+            || view.read32(port.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
+            || !io.strays.borrow().is_empty()
+        {
+            return TestResult::Fail("the first stream's stop must release the LT PHY last");
+        }
+        if owner.release(&view).is_err() {
+            return TestResult::Fail("Nova MST must release AUX after the proven stop");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_nvl_mst_two_streams_over_lt_port_b
+    );
 }

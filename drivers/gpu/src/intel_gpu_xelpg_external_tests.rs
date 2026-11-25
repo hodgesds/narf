@@ -4589,7 +4589,7 @@ kernel_test_in!(
 // ── Nova Lake-S display 35: the routes through the LT PHY ───────────
 
 #[cfg(feature = "kernel-test")]
-mod nova {
+pub(crate) mod nova {
     use super::*;
 
     /// Display 35 around [`ExtFake`], behind which the route runs through the
@@ -4600,14 +4600,14 @@ mod nova {
     /// relocated PHY/AUX registers map back to the display-14 offsets the model
     /// answers at, and an access to DDI B's display-14 PHY offsets is a stray.
     /// AUX power status follows its request (the LT handshake).
-    struct NovaExt {
-        ext: ExtFake,
-        lt: crate::intel_gpu_lt_phy::tests::FakeLtMmio,
-        strays: RefCell<Vec<u64>>,
+    pub(crate) struct NovaExt {
+        pub(crate) ext: ExtFake,
+        pub(crate) lt: crate::intel_gpu_lt_phy::tests::FakeLtMmio,
+        pub(crate) strays: RefCell<Vec<u64>>,
     }
 
     impl NovaExt {
-        fn new(ext: ExtFake) -> Self {
+        pub(crate) fn new(ext: ExtFake) -> Self {
             Self {
                 ext,
                 lt: crate::intel_gpu_lt_phy::tests::FakeLtMmio::default(),
@@ -4623,7 +4623,7 @@ mod nova {
                 _ => 0,
             }
         }
-        fn lt_reg(&self, r: u64) -> bool {
+        pub(crate) fn lt_reg(&self, r: u64) -> bool {
             let base = self.pica_base();
             base != 0
                 && [0x04, 0x34, 0x40, 0x44, 0x48, 0x4c, 0x60, 0xa0, 0xa4]
@@ -4693,7 +4693,7 @@ mod nova {
     /// acknowledged on lane 0 (`intel_lt_phy_pll_enable`), and each link lane's
     /// main cursor from its `levels` entry; no display-14 PHY access
     /// and no Cx0 message-bus transaction on the display-14 model.
-    fn nova_lt_lit(
+    pub(crate) fn nova_lt_lit(
         io: &NovaExt,
         image: &crate::intel_gpu_lt_phy::LtPllState,
         levels: &[crate::intel_gpu_lt_phy::LtTxLevel],
