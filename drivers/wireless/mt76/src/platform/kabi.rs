@@ -504,55 +504,69 @@ pub mod power {
 ///
 /// Built in, this is the kernel's regulatory database (a signed deployment
 /// policy, else world `00` from the Linux database authenticated at image
-/// build). A module cannot reach either, so it uses cfg80211's own built-in
-/// world domain (`world_regdom`, net/wireless/reg.c) — what Linux falls back
-/// to before any country is known. Channel 14 (NO-OFDM) and 60 GHz are left
-/// out, so nothing outside the world rules can be enabled. Every 5 GHz rule
-/// is NO_IR: the station may only join an AP it heard beacon there.
+/// build). The module reads that same installed domain through
+/// `narf_wireless_regdomain` (one NRGD v1 record, decoded by
+/// `narf_wireless::reg::parse_domain_record`), so its grants and power
+/// limits come from the policy the built-in driver would use. The record is
+/// read again on every query, as built in reads the database; an unchanged
+/// record keeps the same snapshot, and the station owner compares domains by
+/// value, so a policy change re-admits or revokes the link as it does built
+/// in.
+///
+/// When the kernel has no domain to give (`-ENODATA`: nothing installed and
+/// nothing to bootstrap), or the record does not decode, there is no
+/// snapshot: the driver fails closed exactly as built in does with an empty
+/// database — no transmit permission, no active scan, no join.
 pub mod reg_db {
     use super::*;
-    use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
+    use narf_wireless::reg::RegulatoryDomain;
 
-    static WORLD: IrqSafeSpinLock<Option<Arc<RegulatoryDomain>>> = IrqSafeSpinLock::new(None);
-
-    fn rule(start: u32, end: u32, bandwidth: u32, flags: RegFlags) -> RegRule {
-        RegRule {
-            freq_start_mhz: start,
-            freq_end_mhz: end,
-            max_bandwidth_mhz: bandwidth,
-            max_power_dbm: 20,
-            flags,
-        }
+    unsafe extern "C" {
+        fn narf_wireless_regdomain(buf: *mut u8, len: usize, out_len: *mut usize) -> i32;
     }
 
-    fn world() -> RegulatoryDomain {
-        let no_ir = RegFlags::NO_IR;
-        RegulatoryDomain {
-            country_code: *b"00",
-            rules: alloc::vec![
-                // IEEE 802.11b/g, channels 1..11.
-                rule(2402, 2472, 40, RegFlags::empty()),
-                // Channels 12..13.
-                rule(2457, 2482, 20, no_ir | RegFlags::AUTO_BW),
-                // Channels 36..48.
-                rule(5170, 5250, 80, no_ir | RegFlags::AUTO_BW),
-                // Channels 52..64, DFS.
-                rule(5250, 5330, 80, no_ir | RegFlags::AUTO_BW | RegFlags::DFS),
-                // Channels 100..144, DFS.
-                rule(5490, 5730, 160, no_ir | RegFlags::DFS),
-                // Channels 149..165.
-                rule(5735, 5835, 80, no_ir),
-            ],
-        }
+    /// Largest NRGD v1 record: 12-byte header, at most 64 16-byte rules.
+    const MAX_RECORD: usize = 12 + 64 * 16;
+
+    struct Cached {
+        record: Vec<u8>,
+        domain: Arc<RegulatoryDomain>,
     }
 
-    /// The installed domain snapshot (installed on first use).
+    /// The last decoded record, so an unchanged domain keeps its snapshot.
+    static CACHE: IrqSafeSpinLock<Option<Cached>> = IrqSafeSpinLock::new(None);
+
+    /// The kernel's installed domain, or `None` (fail closed).
     pub fn snapshot() -> Option<Arc<RegulatoryDomain>> {
-        let mut slot = WORLD.lock();
-        Some(slot.get_or_insert_with(|| Arc::new(world())).clone())
+        let mut record = [0u8; MAX_RECORD];
+        let mut len = 0usize;
+        // SAFETY: `record` names `MAX_RECORD` writable bytes; `len` is a
+        // live local.
+        let rc = unsafe { narf_wireless_regdomain(record.as_mut_ptr(), record.len(), &mut len) };
+        let mut cache = CACHE.lock();
+        if rc != 0 || len > record.len() {
+            *cache = None;
+            return None;
+        }
+        let record = &record[..len];
+        if let Some(cached) = cache.as_ref() {
+            if cached.record == record {
+                return Some(cached.domain.clone());
+            }
+        }
+        let Ok(domain) = narf_wireless::reg::parse_domain_record(record) else {
+            *cache = None;
+            return None;
+        };
+        let domain = Arc::new(domain);
+        *cache = Some(Cached {
+            record: record.to_vec(),
+            domain: domain.clone(),
+        });
+        Some(domain)
     }
 
-    /// The domain, installing the world domain on first use.
+    /// The installed domain; `Err` (fail closed) when there is none.
     pub fn ensure_domain() -> Result<RegulatoryDomain, ()> {
         snapshot().map(|d| (*d).clone()).ok_or(())
     }
