@@ -5,6 +5,9 @@
 //! `rtw8822b.h`, and `rtw8822c.h`. Physical bytes are programming records,
 //! not a direct-addressed logical EEPROM image.
 
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_bus, narf_scheduler, narf_time};
 use narf_bus::MmioRegion;
 use narf_time::Deadline;
 

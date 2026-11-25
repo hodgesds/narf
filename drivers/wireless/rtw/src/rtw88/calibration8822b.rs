@@ -14,6 +14,9 @@
 //! packet or station authority follows from this record.
 pub use super::calibration8821c::Error;
 use super::{efuse8822b::Factory8822b, hardware::Features, mac, phy8822b};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_capabilities, narf_firmware, narf_wireless};
 #[cfg(any(test, feature = "kernel-test"))]
 use alloc::vec::Vec;
 use alloc::{format, string::String};

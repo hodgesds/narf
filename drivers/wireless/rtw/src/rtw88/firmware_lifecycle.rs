@@ -1,5 +1,8 @@
 //! Retain the exact native firmware owner before its first device publication.
 use super::firmware_transport::{Error, Info, Io, Owner};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_lib, narf_wireless};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};

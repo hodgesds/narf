@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Explicit bounded nondeep LPS under the exact original retained station.
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_bus, narf_net};
 use crate::rtw88::{
     firmware_transport::{Error as NativeError, Io, Owner, PsSubmit},
     runtime_ps_scope::{Bound, KIND},
@@ -7,7 +10,9 @@ use crate::rtw88::{
     station::State,
     station_control::Admission,
 };
+#[cfg_attr(feature = "module", allow(unused_imports))]
 use narf_bus::BusAddr;
+#[cfg_attr(feature = "module", allow(unused_imports))]
 use narf_net::{native_emission::Lifetime, Interface};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -34,6 +39,7 @@ impl Drop for Attempt {
 }
 /// Describe the distinct complete nondeep LPS program for this retained
 /// function. The returned metadata grants no sleep/RF or DMA authority.
+#[cfg(feature = "builtin")]
 pub async fn lps_request_function(
     address: BusAddr,
 ) -> Result<crate::rtw88::ContinuationRequest, Error> {
@@ -47,6 +53,7 @@ pub async fn lps_request_function(
 /// firmware awake before ordinary DATA can resume. No low-clock/PG/WoW mode.
 /// Cancellation or an ambiguous native transition closes the old station;
 /// explicit confirmed reset/rejoin is required for its next generation.
+#[cfg(feature = "builtin")]
 pub async fn lps_function(address: BusAddr, milliseconds: u32) -> Result<(), Error> {
     if !(1..=100).contains(&milliseconds) {
         return Err(Error::Unsupported);
@@ -77,6 +84,7 @@ pub async fn lps_function(address: BusAddr, milliseconds: u32) -> Result<(), Err
 }
 
 /// [`lps_request_function`] for the RTL8821CU claimed on USB `slot_id`.
+#[cfg(feature = "builtin")]
 pub async fn lps_request_usb(slot_id: u8) -> Result<crate::rtw88::ContinuationRequest, Error> {
     let station = crate::rtw88::usb_driver::station(slot_id).ok_or(Error::Generation)?;
     let mut retained = station.lifecycle.retained.lock().await;
@@ -87,6 +95,7 @@ pub async fn lps_request_usb(slot_id: u8) -> Result<crate::rtw88::ContinuationRe
 /// bounded nondeep LPS window over the USB backend (station TXBUF upload on
 /// the bulk BEACON queue, PS H2C through EP0 HMEBOX). The claimed function
 /// and the UP interface must stay the same across the whole window.
+#[cfg(feature = "builtin")]
 pub async fn lps_usb(slot_id: u8, milliseconds: u32) -> Result<(), Error> {
     if !(1..=100).contains(&milliseconds) {
         return Err(Error::Unsupported);

@@ -12,6 +12,9 @@
 //! TRX restarts; host PN/replay state never leaves `station_security`.
 use super::firmware_transport::Error as NativeError;
 use super::wow::{Error, Io, KeyType};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::vec::Vec;
 use narf_wireless::station_security::SuspendKeys;
 use zeroize::Zeroizing;

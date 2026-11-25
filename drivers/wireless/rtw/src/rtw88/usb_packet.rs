@@ -28,6 +28,9 @@ use super::{
     packet_format as format,
     usb::{self, Endpoints, EP_MAX, MAX_RECVBUF, QSEL_HIGH},
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_drivers_usb, narf_drivers_wireless_rtl_usb};
 use alloc::{collections::VecDeque, vec::Vec};
 use narf_drivers_wireless_rtl_usb::Io;
 

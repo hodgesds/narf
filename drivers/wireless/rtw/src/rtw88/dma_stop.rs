@@ -8,6 +8,9 @@
 //! controller powered, so instead it proves every DMA engine idle under
 //! closed bus mastering before any published mapping may be released.
 use super::firmware_transport::Error;
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_scheduler;
 use alloc::boxed::Box;
 
 /// TX buffer-descriptor index registers (`rtw_pci_tx_queue_idx_addr`):

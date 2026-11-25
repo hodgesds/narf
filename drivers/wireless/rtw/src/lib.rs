@@ -6,14 +6,18 @@
 //! crate (inner module paths `rtw88`/`rtw89` preserved). rtw88's USB datapath
 //! reuses the shared transport in `narf-drivers-wireless-rtl-usb`.
 //!
-//! The real drivers in [`rtw88`]/[`rtw89`] compile only for the built-in
-//! build. The `module` build registers both drivers' Realtek PCI ids through
-//! the `narf_register_pci_driver` KSYMTAB export; the probe thunk returns
-//! `-ENOSYS` (registration-only proof), matching the net and iwlwifi `.ko`s.
+//! Built in, [`rtw88`] and [`rtw89`] are the whole drivers. The `module`
+//! build is the same rtw88 source running inside the `.ko` for its USB
+//! parts (RTL8821CU / RTL8822BU): it registers their USB ids through
+//! `narf_register_usb_driver` and drives the function through the USB KABI
+//! (`narf_usb_*`), with the kernel services the driver names supplied by
+//! `rtw88::platform` over `narf-module-rt` and the KABI. The rtw88 and
+//! rtw89 PCIe ids stay registration-only in the module (`module_probe`,
+//! probe `-ENOSYS`); rtw89 does not build into the `.ko` at all.
 //!
 //! ## Hardware validation is gated
 //!
-//! QEMU emulates no Realtek Wi-Fi PCIe device, so chip bring-up and
+//! QEMU emulates no Realtek Wi-Fi device (PCIe or USB), so chip bring-up and
 //! association cannot run here. Validation is dual builds, fixtures and the
 //! gated station/AP tests on both architectures; these do not establish RF
 //! acceptance.
@@ -21,18 +25,22 @@
 #![no_std]
 #![allow(dead_code)]
 
-#[cfg(feature = "builtin")]
 extern crate alloc;
 
 use narf_driver_macros::narf_driver;
 
 // Shared, driver-agnostic helpers live in `narf-drivers-wireless-core`.
 // Re-exported at the crate root so the inner drivers' `crate::future_heap` and
-// `crate::watchdog_work` references resolve unchanged after promotion.
+// `crate::watchdog_work` references resolve unchanged after promotion. The
+// module build supplies the same names over its own executor.
 #[cfg(feature = "builtin")]
 pub(crate) use narf_drivers_wireless_core::{future_heap, watchdog_work};
+#[cfg(feature = "module")]
+pub(crate) use rtw88::platform::watchdog_work;
 
-#[cfg(feature = "builtin")]
+/// The rtw88 driver. One source tree in both builds: kernel services come
+/// from the kernel's crates built in and from `rtw88::platform` in the
+/// `.ko`.
 pub mod rtw88;
 
 #[cfg(feature = "builtin")]
@@ -40,12 +48,6 @@ pub mod rtw89;
 
 #[cfg(feature = "module")]
 mod module_probe;
-
-// Stage 1 of the rtw88-USB loadable-module datapath (enumerate + Realtek
-// control proof over `narf_usb_*`). See
-// drivers/wireless/specification/rtw88-usb-module-datapath.md.
-#[cfg(feature = "module")]
-mod module_usb;
 
 narf_driver! {
     name: "rtw",
@@ -66,8 +68,17 @@ fn do_register() {
     rtw89::register();
 }
 
+/// The station bring-up parameters (`rtw88::iface_module::autoconnect`):
+/// `rtw.ssid=` / `rtw.psk=` / `rtw.passphrase=` / `rtw.scan=`, declared so
+/// the loader applies them from the kernel command line (and the load's
+/// own arguments) before init. Empty = not given.
+#[cfg(feature = "module")]
+#[used]
+#[link_section = ".narf_kparams"]
+static KPARAMS: [u8; 29] = *b"ssid=\npsk=\npassphrase=\nscan=\n";
+
 #[cfg(feature = "module")]
 fn do_register() {
     module_probe::register();
-    module_usb::register();
+    rtw88::register_module();
 }

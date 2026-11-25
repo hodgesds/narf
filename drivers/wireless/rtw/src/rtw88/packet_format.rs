@@ -2,6 +2,9 @@
 // Copyright(c) 2018-2019 Realtek Corporation
 //! RTL8822CE PCI legacy packet formats, from Linux rtw88/{pci,tx,rx,fw}.
 //! Parsing supplies no DMA, channel, peer, key or controlled-port authority.
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::vec::Vec;
 use core::ops::Range;
 

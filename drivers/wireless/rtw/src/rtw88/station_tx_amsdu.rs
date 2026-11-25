@@ -6,6 +6,9 @@
 //! Aggregation never grants PHY, BA, key or queue authority: every frame is
 //! still admitted by the current profile, BA owner and native queue credit.
 use super::*;
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use narf_wireless::amsdu::Limit;
 
 /// Ethernet frames considered for one aggregate (the interface FIFO prefix).

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Host recipient BA. Linux rtw88 RX_START/STOP are no-ops; no H2C ACK exists.
 use super::{packet_core::Frame, station::Error};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::{collections::VecDeque, vec, vec::Vec};
 use narf_wireless::{reorder::Reorder, station_security::RawFrame};
 

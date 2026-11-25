@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Per-generation netdev dispatch. Cookies are never reused during a boot;
 //! a copied send hook from a retired shell cannot target its replacement.
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_lib, narf_net};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use narf_lib::sync::IrqSafeSpinLock;
 

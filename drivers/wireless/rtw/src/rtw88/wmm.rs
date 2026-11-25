@@ -6,6 +6,9 @@ use super::{
     packet_format::DataProfile,
     station_control::Admission,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_scheduler, narf_wireless};
 use narf_wireless::wmm::Parameters;
 pub(super) async fn readback(
     mut read: impl super::firmware_transport::Read32,
