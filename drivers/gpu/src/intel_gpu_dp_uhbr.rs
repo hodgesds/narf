@@ -57,9 +57,14 @@
 //!   DSC: slice-aware overhead, implicit FEC, the display-14 DPT limit),
 //!   through `crate::intel_gpu_xelpg_dsc::compute_with`.
 //!
+//! - **MST** ([`mst_stream`]): the 64-slot MTP from slot 0 with
+//!   `drm_dp_get_vc_payload_bw`'s 128b/132b PBN divider, the remote PBN
+//!   with the SSC margin and the remote TU.
+//!
 //! Not implemented, refused typed ([`UhbrRefusal`]) instead of running a
-//! link Linux would not: 128b/132b MST, and Thunderbolt-alt UHBR on display
-//! 14/20 (no TBT UHBR clock select).
+//! link Linux would not: 128b/132b MST over Thunderbolt (the tunnel's
+//! per-stream bandwidth), and Thunderbolt-alt UHBR on display 14/20 (no TBT
+//! UHBR clock select).
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_modeset::Mode;
@@ -952,6 +957,88 @@ fn mtp(rate: UhbrRate, lanes: u8, mode: &Mode, bpp_x16: u32, dsc_slices: u32) ->
     })
 }
 
+// ── 128b/132b MST ────────────────────────────────────────────────
+
+/// `drm_dp_get_vc_payload_bw` on 128b/132b: PBN per MTP time slot as 20.12
+/// fixed point, `link_rate * lanes * 96.71% / ((1000000 * 8 * 5400) >> 12)`.
+pub fn vc_payload_bw(rate: UhbrRate, lanes: u8) -> u64 {
+    u64::from(rate.link_rate()) * u64::from(lanes) * 967_100 / ((1_000_000u64 * 8 * 5400) >> 12)
+}
+
+/// `drm_dp_mst_update_slots(DP_CAP_ANSI_128B132B)`: the 64 slots from
+/// slot 0 (8b/10b reserves slot 0 for the MTP header and has 63).
+pub const MST_START_SLOT: u8 = 0;
+pub const MST_TOTAL_SLOTS: u32 = 64;
+
+/// One 128b/132b MST stream (`mst_stream_compute_link_config`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MstUhbrStream {
+    /// `crtc_state->pipe_bpp`: 24, or 18 when only that fits.
+    pub pipe_bpp: u32,
+    /// `payload->pbn`: the PBN the ALLOCATE_PAYLOAD sideband message and the
+    /// path bandwidth check carry (`remote_tu * pbn_div`, truncated).
+    pub pbn: u32,
+    /// `payload->time_slots` (`drm_dp_atomic_find_time_slots`), the DPCD
+    /// payload table's slot count.
+    pub slots: u8,
+    /// The stream's `TU_SIZE` (the remote TU) and M/N.
+    pub stream: UhbrStream,
+}
+
+/// `mst_stream_compute_link_config` -> `intel_dp_mtp_tu_compute_config`
+/// (`dsc` false) for a 128b/132b MST stream at `rate` x `lanes` (Linux's
+/// MST link is the highest-bandwidth common configuration): from the pipe
+/// maximum (at most 24, `intel_dp_compute_config_limits` for MST) down in
+/// steps of 6 to 18, the local M/N (`intel_dp_mst_bw_overhead` without
+/// SSC), the remote PBN (`intel_dp_mst_calc_pbn` with the SSC margin,
+/// `DIV_ROUND_UP(rate * 64, 54000)`), `remote_tu = DIV_ROUND_UP(pbn,
+/// pbn_div)` aligned to `4 / lanes` as the TU, the PBN realigned to it,
+/// and the time slots `drm_dp_atomic_find_time_slots` derives, at most 64.
+pub fn mst_stream(rate: UhbrRate, lanes: u8, mode: &Mode, max_bpp: u32) -> Option<MstUhbrStream> {
+    let l = u32::from(lanes);
+    if !matches!(l, 1 | 2 | 4) {
+        return None;
+    }
+    let div = vc_payload_bw(rate, lanes);
+    let data_n = max_link_data_rate(rate, l);
+    if div == 0 || data_n == 0 {
+        return None;
+    }
+    let (clock, hactive) = (mode.pixel_clock_khz, u32::from(mode.h_active));
+    let max_bpp = max_bpp.min(dsc::PIPE_BPP);
+    let mut bpp = max_bpp - max_bpp % 6;
+    while bpp >= dsc::MIN_PIPE_BPP {
+        let bpp_x16 = bpp * 16;
+        let local = bw_overhead_with(l, hactive, 0, bpp_x16, true, false);
+        let data_m = effective_data_rate(clock, bpp_x16, local);
+        let remote = bw_overhead_with(l, hactive, 0, bpp_x16, true, true);
+        let pbn = (effective_data_rate(clock, bpp_x16, remote) * 64).div_ceil(54 * 1000);
+        let align = u64::from(4 / l);
+        let tu = (pbn << 12).div_ceil(div).div_ceil(align) * align;
+        let pbn_alloc = (tu * div) >> 12;
+        let slots = (pbn_alloc << 12).div_ceil(div);
+        if tu != 0 && tu <= 64 && slots != 0 && slots <= u64::from(MST_TOTAL_SLOTS) {
+            let (dm, dn) = compute_m_n(data_m, data_n, 0x800_0000);
+            let (lm, ln) = compute_m_n(
+                u64::from(clock),
+                u64::from(rate.symbol_clock_khz()),
+                0x8_0000,
+            );
+            return Some(MstUhbrStream {
+                pipe_bpp: bpp,
+                pbn: pbn_alloc as u32,
+                slots: slots as u8,
+                stream: UhbrStream {
+                    tu: tu as u8,
+                    m_n: [((tu as u32 - 1) << 25) | dm, dn, lm, ln],
+                },
+            });
+        }
+        bpp -= 6;
+    }
+    None
+}
+
 /// `intel_dp_compute_min_hblank` for an uncompressed 128b/132b SST stream
 /// on display 30 (`DP_MIN_HBLANK_CTL`): the blanking symbol cycles at the
 /// fixed four-lane count, at least the 3 of BS/VBID/BE, minus 2 for the
@@ -1407,13 +1494,9 @@ pub fn poll_act_handled<A: AuxChannel + ?Sized, C: Clock>(aux: &mut A, clock: &m
 /// (nothing was programmed unless noted).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UhbrRefusal {
-    /// The link is MST and its hub supports a common UHBR rate: Linux runs
-    /// 128b/132b MST (`intel_dp_mst_compute_link_config` takes the
-    /// highest-bandwidth link), which is not implemented: MTP slots from 0
-    /// of 64 (`drm_dp_mst_update_slots`) with `drm_dp_get_vc_payload_bw`'s
-    /// 128b/132b PBN divider, the primary's 128b/132b training without the
-    /// SST payload, and each stream's `TRANS_DP2_CTL`, VFREQ and
-    /// 128b/132b function on the master's MST transport.
+    /// A 128b/132b MST link over Thunderbolt alt mode: Linux accounts each
+    /// stream's bandwidth in the DP tunnel's group
+    /// (`drm_dp_tunnel_atomic_set_stream_bw`), which is not implemented.
     Mst,
     /// The stream needs UHBR over Thunderbolt alt mode on display 14 or 20:
     /// `intel_mtl_tbt_clock_select` has no UHBR10/20 select below display

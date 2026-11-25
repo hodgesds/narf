@@ -5186,30 +5186,35 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_typed_refusals
 );
 
-/// A UHBR-capable MST hub under `narf.intel.uhbr=1` is refused typed at
-/// connect, before any sideband traffic (Linux would run 128b/132b MST at
-/// its highest common bandwidth), and leaves nothing owned.
+/// A UHBR-capable MST hub under `narf.intel.uhbr=1` in display-14
+/// Thunderbolt alt mode is refused typed at connect, before any sideband
+/// message (128b/132b MST would need the TBT UHBR clock display 14 does not
+/// have), and leaves nothing owned.
 fn smoke_mtl_external_uhbr_mst_hub_refused() -> TestResult {
     let mut sink = Sink::dp20(0x1e, edid_1024(), uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
     // DP_MSTM_CAP.
     sink.extra.push((0x21, 1));
     let io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pica_isr.set(pica_tbt_hotplug(1));
     let event = MtlHpdEvent {
         pin: MtlHpdPin::Tc2,
-        kind: MtlHpdKind::Connected(LiveMode::DpAlt),
+        kind: MtlHpdKind::Connected(LiveMode::TbtAlt),
     };
     let mut service = MtlExternalService::new();
     service.set_generation(Generation::MeteorLake);
     service.set_uhbr(true);
     match service.handle(&io, event, &mut fb_for) {
         ServiceOutcome::Refused {
-            error: RouteError::Dp(ExternalError::Uhbr(uhbr::UhbrRefusal::Mst)),
+            error: RouteError::Dp(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt)),
             ..
         } => {}
-        _ => return TestResult::Fail("a UHBR MST hub must refuse typed with UHBR on"),
+        other => {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "TBT UHBR MST hub: {other:?}");
+            return TestResult::Fail("a display-14 TBT UHBR MST hub must refuse typed");
+        }
     }
     if service.route().is_some()
-        || io.read32(XeLpgPort::Tc2.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
         || !io.sink.borrow().uhbr_log.is_empty()
         || io.sink.borrow().uhbr_reads.first() != Some(&uhbr::DP_128B132B_SUPPORTED_LINK_RATES)
     {

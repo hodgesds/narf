@@ -148,8 +148,10 @@
 //! 128b/132b training and handed back transparent at the stop.
 //! A stream that fits nothing uncompressed compresses over 128b/132b
 //! when Linux 7.4's DSC search lands there (FEC implicit: no
-//! `DP_FEC_READY`, no `DP_TP_CTL` FEC). 128b/132b MST and Thunderbolt UHBR
-//! on display 14/20 are refused typed
+//! `DP_FEC_READY`, no `DP_TP_CTL` FEC). A UHBR-capable MST hub runs
+//! 128b/132b MST (`intel_gpu_xelpg_mst.rs`) at its highest-bandwidth
+//! configuration. Thunderbolt UHBR on display 14/20 and 128b/132b MST over
+//! Thunderbolt are refused typed
 //! ([`ExternalError::Uhbr`]). HDCP takes a 128b/132b SST route as DP SST
 //! ([`hdcp_route_of`]). Without the option no 128b/132b register is
 //! touched.
@@ -444,6 +446,19 @@ pub(crate) const fn ddi_enable_value(ip: DisplayIp, lanes: u8) -> u32 {
         } else {
             0
         }
+}
+
+/// The two halves of an MST stream's payload allocation
+/// (`drm_dp_add_payload_part1` / `_part2`) the activation calls back for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PayloadStep {
+    /// The first branch's DPCD payload table, before the stream's function
+    /// and ACT (`mst_stream_pre_enable`).
+    Part1,
+    /// After the source sent the ACT: the sink's ACT handled
+    /// (`drm_dp_check_act_status`) and the ALLOCATE_PAYLOAD sideband
+    /// message (`mst_stream_enable`).
+    Part2,
 }
 
 /// Typed refusal or failure of the MTL external route.
@@ -1487,6 +1502,82 @@ fn plan_uhbr_dsc(
     }))
 }
 
+/// The 128b/132b MST link Linux would run (`intel_dp_compute_config_limits`
+/// for MST: the highest-bandwidth common configuration,
+/// `intel_dp_link_caps_get_max_config` in `INTEL_DP_LINK_CAPS_ORDER_KEY_BW`
+/// order), with the 8b/10b rates and lanes bounded as for SST (the LTTPR
+/// caps mask the UHBR rates).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct UhbrMstLink {
+    pub rate: uhbr::UhbrRate,
+    pub lanes: u8,
+    pub post_lt_adj_req: bool,
+    pub caps: uhbr::LinkCaps,
+}
+
+/// [`UhbrMstLink`] for a hub on `link`: `Ok(None)` when its best common
+/// configuration is 8b/10b (the 8b/10b MST route stands), a typed refusal
+/// over Thunderbolt alt mode (display 14/20: no TBT UHBR clock; display
+/// 30+: the tunnel's per-stream bandwidth is not accounted).
+fn uhbr_mst_link<M: MmioWindow + ?Sized>(
+    io: &M,
+    link: &LinkProbe,
+) -> Result<Option<UhbrMstLink>, ExternalError> {
+    let source = uhbr::source_rates(link.display_ip, c10_phy(io, link.port));
+    if source == 0 {
+        return Ok(None);
+    }
+    let sink = uhbr::read_sink(&mut link.aux(io), &link.raw)
+        .map_err(|e| ExternalError::Link(LinkError::AuxFailure(e)))?;
+    let common = sink.rates & source;
+    if common == 0 {
+        return Ok(None);
+    }
+    let caps = DpcdCaps::decode(&link.raw);
+    let ceiling = if TrainRate::Hbr3.rate_kbps() <= caps.max_rate.rate_kbps() {
+        TrainRate::Hbr3
+    } else {
+        caps.max_rate
+    };
+    let mut limits = dsc::LinkLimits::standard(
+        link_clock_khz(ceiling),
+        link.tc.map_or(4, |tc| tc.max_lanes).min(caps.max_lanes),
+    );
+    let lttpr_rate = uhbr::lttpr_max_link_rate(&sink.lttpr_caps);
+    let lttpr_lanes = uhbr::lttpr_max_lanes(&sink.lttpr_caps);
+    if lttpr_rate != 0 || lttpr_lanes != 0 {
+        limits = limits.capped(
+            if lttpr_rate != 0 { lttpr_rate } else { u32::MAX },
+            if lttpr_lanes != 0 { lttpr_lanes } else { 4 },
+        );
+    }
+    let link_caps = uhbr::LinkCaps::new(&limits, common);
+    let (order, n) = link_caps.ordered(uhbr::FallbackOrder::Bw);
+    let Some(&(rate, lanes)) = order[..n]
+        .iter()
+        .rev()
+        .find(|&&(r, l)| link_caps.allowed(r, l))
+    else {
+        return Ok(None);
+    };
+    let Some(rate) = uhbr::UhbrRate::from_link_rate(rate) else {
+        return Ok(None);
+    };
+    if link.tbt() {
+        return Err(ExternalError::Uhbr(if link.display_ip.is_display30() {
+            uhbr::UhbrRefusal::Mst
+        } else {
+            uhbr::UhbrRefusal::Tbt
+        }));
+    }
+    Ok(Some(UhbrMstLink {
+        rate,
+        lanes,
+        post_lt_adj_req: sink.post_lt_adj_req,
+        caps: link_caps,
+    }))
+}
+
 /// `intel_dp_tunnel_atomic_alloc_bw` before the 128b/132b port is
 /// programmed: the stream's `intel_dp_config_required_rate`. Linux only
 /// queues a re-detect after a failed request and enables the stream
@@ -1915,7 +2006,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
     fb: Framebuffer,
     display: &MtlDisplay,
 ) -> Result<MtlExternalRoute, ActivateError> {
-    activate_with_payload(io, probe, fb, display, None, &mut |_| Ok(()))
+    activate_with_payload(io, probe, fb, display, None, &mut |_, _| Ok(()))
 }
 
 /// [`activate`] beside a live sibling route: the new pipe joins the
@@ -1928,7 +2019,7 @@ pub(crate) fn activate_beside<M: MmioWindow + ?Sized>(
     display: &MtlDisplay,
     beside: Option<Pipes>,
 ) -> Result<MtlExternalRoute, ActivateError> {
-    activate_with_payload(io, probe, fb, display, beside, &mut |_| Ok(()))
+    activate_with_payload(io, probe, fb, display, beside, &mut |_, _| Ok(()))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1937,9 +2028,10 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
     probe: MtlSinkProbe,
     fb: Framebuffer,
     display: &MtlDisplay,
-    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
+    beside: Option<Pipes>,
+    payload: &mut dyn FnMut(Transcoder, PayloadStep) -> Result<(), ExternalError>,
 ) -> Result<MtlExternalRoute, ActivateError> {
-    match activate_once(io, probe, fb, display, payload) {
+    match activate_once(io, probe, fb, display, beside.clone(), payload) {
         // intel_dp_start_link_train's failure on a 128b/132b link:
         // intel_dp_get_link_train_fallback_values and the modeset retry,
         // once, from the proven stop.
@@ -1947,7 +2039,7 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
             if route.state == RouteState::Stopped =>
         {
             match uhbr_fallback(&route.probe) {
-                Some(next) => activate_once(io, next, fb, display, payload),
+                Some(next) => activate_once(io, next, fb, display, beside, payload),
                 None => Err(ActivateError::Failed(
                     route,
                     ExternalError::Uhbr(uhbr::UhbrRefusal::Training(f)),
@@ -1969,8 +2061,9 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
 /// prune the mode).
 fn uhbr_fallback(probe: &MtlSinkProbe) -> Option<MtlSinkProbe> {
     // A compressed 128b/132b stream's retry would recompute the DSC
-    // configuration too (Linux reruns intel_dp_compute_config); not run.
-    if probe.dsc.is_some() {
+    // configuration too (Linux reruns intel_dp_compute_config), and an MST
+    // link's retry the whole topology (the BW-order fallback); not run.
+    if probe.dsc.is_some() || probe.mst.is_some() {
         return None;
     }
     let plan = *probe.uhbr.as_deref()?;
@@ -2032,7 +2125,7 @@ fn activate_once<M: MmioWindow + ?Sized>(
     fb: Framebuffer,
     display: &MtlDisplay,
     beside: Option<Pipes>,
-    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
+    payload: &mut dyn FnMut(Transcoder, PayloadStep) -> Result<(), ExternalError>,
 ) -> Result<MtlExternalRoute, ActivateError> {
     if let Err(e) = probe.phy_lanes() {
         return Err(ActivateError::Refused(probe, e));
@@ -2138,7 +2231,7 @@ fn program<M: MmioWindow + ?Sized>(
     choice: PipeChoice,
     ext: &ExternalPipe,
     dmc: &'static (dyn PipeDmc + Sync),
-    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
+    payload: &mut dyn FnMut(Transcoder, PayloadStep) -> Result<(), ExternalError>,
 ) -> Result<(), ExternalError> {
     // 1. Power wells (intel_modeset_get_crtc_power_domains), then the
     // pre-plane update and the first step of hsw_crtc_enable
@@ -2324,7 +2417,7 @@ fn enable_port<M: MmioWindow + ?Sized>(
 fn uhbr_func(probe: &MtlSinkProbe, trans: Transcoder, lanes: u8) -> u32 {
     (dp_func(probe.port, lanes, probe.pipe_bpp) & !TRANS_DDI_MODE_MASK)
         | TRANS_DDI_MODE_128B132B
-        | trans_ddi_mst_transport(trans)
+        | trans_ddi_mst_transport(probe.mst.map_or(trans, |mst| mst.master))
 }
 
 /// `encoder->set_signal_levels` on a 128b/132b link: each lane's TX FFE
@@ -2553,8 +2646,10 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
     // 6.n intel_dp_stop_link_train: the normal pattern, then the intra-hop
     // indication (Linux only logs one that does not clear).
     let _ = uhbr::stop_train(&mut aux, &mut source, &mut clock)?;
-    // 7.a 128b/132b SST: VCPID 1, start slot 0, tu slots.
-    let sink_payload = uhbr::write_payload(&mut aux, &mut clock, 1, 0, plan.stream.tu);
+    // 7.a 128b/132b SST: VCPID 1, start slot 0, tu slots (an MST stream's
+    // payload is drm_dp_add_payload_part1's, at its activation).
+    let sink_payload = probe.mst.is_none()
+        && uhbr::write_payload(&mut aux, &mut clock, 1, 0, plan.stream.tu);
     let lttpr_count = route.uhbr.map_or(0, |state| state.lttpr_count);
     route.uhbr = Some(UhbrTrained {
         presets,
@@ -2562,7 +2657,7 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
         vc_payload: false,
         lttpr_count,
     });
-    if !sink_payload {
+    if !sink_payload && route.probe.mst.is_none() {
         return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Payload));
     }
     Ok(())
@@ -2772,7 +2867,7 @@ fn finish<M: MmioWindow + ?Sized>(
     io: &M,
     route: &mut MtlExternalRoute,
     trained: &TrainedLink,
-    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
+    payload: &mut dyn FnMut(Transcoder, PayloadStep) -> Result<(), ExternalError>,
 ) -> Result<(), ExternalError> {
     let mode = route.probe.mode;
     let pll_rate = crate::intel_gpu_modeset::to_pll_rate(trained.rate);
@@ -2883,17 +2978,22 @@ fn finish<M: MmioWindow + ?Sized>(
             (mn & !(0x7F << 25)) | (u32::from(mst.slots - 1) << 25),
         )?;
         func |= 1 << 8;
+        // drm_dp_add_payload_part1 (an 8b/10b stream's ran before its
+        // activation), intel_ddi_enable_transcoder_func, the ACT, then
+        // drm_dp_check_act_status and drm_dp_add_payload_part2.
+        payload(trans, PayloadStep::Part1)?;
         write(io, trans_ddi_func_ctl(trans), func & !(1 << 8))?;
         mst::source_payload(io, trans, master, true)?;
-        payload(trans)?;
+        payload(trans, PayloadStep::Part2)?;
     }
     write(io, trans_ddi_func_ctl(trans), func)?;
     // Display 30 always scans out through the VRR timing generator. Linux
     // programs and enables it after TRANS_DDI_FUNC_CTL and before TRANSCONF.
     rp.pipes.enable_fixed_tg(io, pipe)?;
     // 128b/132b SST: intel_ddi_clear_act_sent, TRANS_DDI_DP_VC_PAYLOAD_ALLOC,
-    // intel_ddi_wait_for_act_sent, then the sink's ACT handled.
-    if uhbr_plan.is_some() {
+    // intel_ddi_wait_for_act_sent, then the sink's ACT handled (MST ran its
+    // own above).
+    if uhbr_plan.is_some() && route.probe.mst.is_none() {
         if let Some(state) = route.uhbr.as_mut() {
             state.vc_payload = true;
         }
@@ -4147,31 +4247,31 @@ impl MtlExternalService {
             };
         }
         let uhbr_on = self.uhbr_on();
+        // Linux runs an MST link at its highest common bandwidth
+        // (INTEL_DP_LINK_CAPS_ORDER_KEY_BW); with narf.intel.uhbr=1 a hub
+        // with a common UHBR rate runs 128b/132b MST.
+        let mut mst_uhbr = None;
         if cap[0] & 1 != 0 && uhbr_on {
-            // Linux runs an MST link at its highest common bandwidth
-            // (INTEL_DP_LINK_CAPS_ORDER_KEY_BW): a hub with a common UHBR
-            // rate would carry 128b/132b MST, which is not implemented.
-            let source = uhbr::source_rates(link.display_ip, c10_phy(io, port));
-            let sink = if source == 0 {
-                Ok(uhbr::UhbrSink::default())
-            } else {
-                uhbr::read_sink(&mut link.aux(io), &link.raw)
-            };
-            let error = match sink {
-                Ok(sink) if sink.rates & source == 0 => None,
-                Ok(_) => Some(ExternalError::Uhbr(uhbr::UhbrRefusal::Mst)),
-                Err(e) => Some(ExternalError::Link(LinkError::AuxFailure(e))),
-            };
-            if let Some(error) = error {
-                let _ = link.release(io);
-                return ServiceOutcome::Refused {
-                    port,
-                    error: RouteError::Dp(error),
-                };
+            match uhbr_mst_link(io, &link) {
+                Ok(found) => mst_uhbr = found,
+                Err(error) => {
+                    let _ = link.release(io);
+                    return ServiceOutcome::Refused {
+                        port,
+                        error: RouteError::Dp(error),
+                    };
+                }
             }
         }
         if cap[0] & 1 != 0 {
-            match MtlMstRoute::connect(io, link, self.policy.decl(port), &self.display, alloc) {
+            match MtlMstRoute::connect(
+                io,
+                link,
+                self.policy.decl(port),
+                &self.display,
+                alloc,
+                mst_uhbr,
+            ) {
                 Ok(route) => {
                     let (pipe, mode, fb) = route.first().expect("live MST has a first stream");
                     self.routes[slot] = Some(MtlRoute::Mst(route));
