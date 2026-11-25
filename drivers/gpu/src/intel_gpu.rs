@@ -1083,6 +1083,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // to the end of probe (`skl_display_core_init`'s DC_STATE_DISABLE,
         // `POWER_DOMAIN_INIT`). Without the option nothing is written.
         crate::intel_gpu_gen9_dc_states::install(platform, dev.gtt_mmadr, cap);
+        // Gen9 shared-DPLL arbitration between external outputs
+        // (`narf.intel.gen9_dpll=1`, default off: every external output
+        // takes DPLL1 without it).
+        crate::intel_gpu_gen9_dpll::set_arbitration(
+            !platform.is_lp()
+                && crate::intel_gpu_gen9_dpll::arbitration_requested(narf_boot::args()),
+        );
         let window = dev.mode_window();
         let authority: Option<Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>> =
             narf_firmware::trusted_loader_authority().and_then(|write| write.derive().ok());

@@ -554,6 +554,14 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// Whether [`Self::rkl_dpll`] is another port's PLL, shared at this
     /// state.
     rkl_dpll_shared: bool,
+    /// The Gen9 SKL DPLL this run took and whether it is another live
+    /// port's, shared at this state ([`Self::gen9_dpll_for`]): clock routing
+    /// and a mid-training retune use it.
+    gen9_dpll: Option<(crate::intel_gpu_gen9_dpll::SklDpllId, bool)>,
+    /// Arbitrate DPLL1-3 between Gen9 external outputs
+    /// (`narf.intel.gen9_dpll=1`, [`crate::intel_gpu_gen9_dpll::find_dpll`]);
+    /// clear, an external output takes DPLL1 as before.
+    gen9_dpll_arbitration: bool,
     /// HDMI to a DVI sink (`!has_hdmi_sink`): the transcoder runs
     /// `TRANS_DDI_MODE_SELECT_DVI`.
     hdmi_dvi: bool,
@@ -609,12 +617,76 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             gen11_dpll: None,
             rkl_dpll: None,
             rkl_dpll_shared: false,
+            gen9_dpll: None,
+            gen9_dpll_arbitration: crate::intel_gpu_gen9_dpll::arbitration(),
             hdmi_dvi: false,
             hdmi_bpc: 8,
             hdmi_ycbcr420: false,
             shared_cdclk: false,
             gen9_dc: &crate::intel_gpu_gen9_dc_states::ServiceDcOff,
         }
+    }
+
+    /// Arbitrate the Gen9 external DPLL pool for this run (the
+    /// `narf.intel.gen9_dpll=1` behaviour) regardless of the boot option.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn set_gen9_dpll_arbitration(&mut self, enabled: bool) {
+        self.gen9_dpll_arbitration = enabled;
+    }
+
+    /// The Gen9 SKL DPLL this run took, and whether it is shared.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn gen9_dpll(&self) -> Option<(crate::intel_gpu_gen9_dpll::SklDpllId, bool)> {
+        self.gen9_dpll
+    }
+
+    /// `skl_get_dpll` for this run at `state`: eDP keeps DPLL0. An external
+    /// output takes the first of DPLL1/2/3 without arbitration (the default)
+    /// or, with `narf.intel.gen9_dpll=1`, the DPLL `find_dpll` arbitrates
+    /// (shared with another live port already running `state`, else the
+    /// first free one; every DPLL held at another state refuses). The pick
+    /// is recorded for the clock routing and a retune.
+    fn gen9_dpll_for(
+        &mut self,
+        state: &crate::intel_gpu_gen9_dpll::SklDpllState,
+    ) -> Result<(crate::intel_gpu_gen9_dpll::SklDpllId, bool), ModesetError> {
+        use crate::intel_gpu_gen9_dpll::{dpll_pool, find_dpll, DpllError, SklDpllId};
+        let pick = if self.ddi != Ddi::A && self.gen9_dpll_arbitration {
+            find_dpll(self.mmio, self.ddi, state).map_err(|error| match error {
+                DpllError::Busy => ModesetError::DisplayResourceUnavailable,
+                _ => ModesetError::PllLockTimeout,
+            })?
+        } else {
+            let id = dpll_pool(self.ddi == Ddi::A)
+                .first()
+                .copied()
+                .unwrap_or(SklDpllId::Dpll0);
+            (id, false)
+        };
+        self.gen9_dpll = Some(pick);
+        Ok(pick)
+    }
+
+    /// Program the arbitrated Gen9 DPLL `id` with `state`: a shared DPLL
+    /// already runs it and is left alone (Linux enables a shared PLL once);
+    /// a free DPLL a stopped output left enabled is disabled first
+    /// (`skl_ddi_pll_disable`), then `skl_ddi_pll_enable`.
+    fn enable_gen9_dpll(
+        &self,
+        (id, shared): (crate::intel_gpu_gen9_dpll::SklDpllId, bool),
+        state: &crate::intel_gpu_gen9_dpll::SklDpllState,
+    ) -> Result<(), ModesetError> {
+        use crate::intel_gpu_gen9_dpll::{ctl_reg, pll_disable, pll_enable, SklDpllId, PLL_ENABLE};
+        if shared {
+            return Ok(());
+        }
+        if self.gen9_dpll_arbitration
+            && id != SklDpllId::Dpll0
+            && self.mmio.read32(ctl_reg(id)) & PLL_ENABLE != 0
+        {
+            pll_disable(self.mmio, id).map_err(|_| ModesetError::PllLockTimeout)?;
+        }
+        pll_enable(self.mmio, id, state).map_err(|_| ModesetError::PllLockTimeout)
     }
 
     /// Hold `dc` as this run's Gen9 `DC_off` well instead of the production
@@ -2029,24 +2101,21 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// of DPLL1/2/3 through the same pool call —
     /// `program_dpclka_routing` makes the same pick, so the
     /// DPLL program and the clock routing agree on the id.
-    /// Multi-external arbitration (two simultaneous external
-    /// outputs would both take DPLL1) is a remainder.
+    /// Without arbitration two simultaneous external outputs
+    /// both take DPLL1; `narf.intel.gen9_dpll=1` arbitrates
+    /// DPLL1-3 between them ([`Self::gen9_dpll_for`]).
     fn program_dpll_gen9(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
-        use crate::intel_gpu_gen9_dpll::{dp_state, dpll_pool, pll_enable, SklDpllId};
+        use crate::intel_gpu_gen9_dpll::dp_state;
         if let Some(glk) = self.gen9_lp() {
             let port_clock = crate::intel_gpu_gen12_combo_phy::port_clock_khz(rate)
                 .ok_or(ModesetError::PllLockTimeout)?;
             return self.program_dpll_bxt(glk, port_clock, false);
         }
-        let is_edp = self.ddi == Ddi::A;
-        let id = dpll_pool(is_edp)
-            .first()
-            .copied()
-            .unwrap_or(SklDpllId::Dpll0);
         let port_clock = crate::intel_gpu_gen12_combo_phy::port_clock_khz(rate)
             .ok_or(ModesetError::PllLockTimeout)?;
         let state = dp_state(port_clock).ok_or(ModesetError::PllLockTimeout)?;
-        pll_enable(self.mmio, id, &state).map_err(|_| ModesetError::PllLockTimeout)
+        let pick = self.gen9_dpll_for(&state)?;
+        self.enable_gen9_dpll(pick, &state)
     }
 
     /// Bring the Gen9 SKL DPLL up for an HDMI mode:
@@ -2060,18 +2129,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// make, so the WRPLL program and the clock routing agree.
     fn program_dpll_gen9_hdmi(&mut self, pixel_clock_khz: u32) -> Result<(), ModesetError> {
         use crate::intel_gpu_gen9_cdclk::REFCLK_KHZ;
-        use crate::intel_gpu_gen9_dpll::{dpll_pool, hdmi_state, pll_enable, SklDpllId};
+        use crate::intel_gpu_gen9_dpll::hdmi_state;
         if let Some(glk) = self.gen9_lp() {
             return self.program_dpll_bxt(glk, pixel_clock_khz, true);
         }
-        let is_edp = self.ddi == Ddi::A;
-        let id = dpll_pool(is_edp)
-            .first()
-            .copied()
-            .unwrap_or(SklDpllId::Dpll0);
         let (state, _actual) =
             hdmi_state(pixel_clock_khz, REFCLK_KHZ).ok_or(ModesetError::HdmiClockUnsupported)?;
-        pll_enable(self.mmio, id, &state).map_err(|_| ModesetError::PllLockTimeout)
+        let pick = self.gen9_dpll_for(&state)?;
+        self.enable_gen9_dpll(pick, &state)
     }
 
     /// Program the Gen9 HDMI signal levels: the SKL HDMI
@@ -2572,6 +2637,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
         };
         use crate::intel_gpu_gen9_dpll::{dp_state, dpll_pool, pll_disable, pll_enable, SklDpllId};
+        // A DPLL another live port shares cannot be retuned under it
+        // (Linux's fallback is a full modeset that re-arbitrates): refuse
+        // before any write.
+        if self.gen9_lp().is_none() && matches!(self.gen9_dpll, Some((_, true))) {
+            return Err(ModesetError::DisplayResourceUnavailable);
+        }
         let off = self.ddi.base() + DDI_BUF_CTL_OFFSET;
         let cur = self.mmio.read32(off);
         self.mmio.write32(off, cur & !DDI_BUF_CTL_ENABLE);
@@ -2596,11 +2667,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             return pll::enable(self.mmio, glk, port, &state)
                 .map_err(|_| ModesetError::PllLockTimeout);
         }
-        let is_edp = self.ddi == Ddi::A;
-        let id = dpll_pool(is_edp)
-            .first()
-            .copied()
-            .unwrap_or(SklDpllId::Dpll0);
+        // The DPLL this run took (never a shared one, refused above).
+        let id = match self.gen9_dpll {
+            Some((id, _)) => id,
+            None => dpll_pool(self.ddi == Ddi::A)
+                .first()
+                .copied()
+                .unwrap_or(SklDpllId::Dpll0),
+        };
         let port_clock = crate::intel_gpu_gen12_combo_phy::port_clock_khz(rate)
             .ok_or(ModesetError::PllLockTimeout)?;
         let state = dp_state(port_clock).ok_or(ModesetError::PllLockTimeout)?;
@@ -2874,10 +2948,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         }
         if self.gen9_platform.is_some() {
             self.enable_ddi_io_well(self.ddi)?;
-            let id = crate::intel_gpu_gen9_dpll::dpll_pool(self.ddi == Ddi::A)
-                .first()
-                .copied()
-                .unwrap_or(crate::intel_gpu_gen9_dpll::SklDpllId::Dpll0);
+            // The DPLL this run's PLL step took (`gen9_dpll_for`).
+            let id = match self.gen9_dpll {
+                Some((id, _)) => id,
+                None => crate::intel_gpu_gen9_dpll::dpll_pool(self.ddi == Ddi::A)
+                    .first()
+                    .copied()
+                    .unwrap_or(crate::intel_gpu_gen9_dpll::SklDpllId::Dpll0),
+            };
             crate::intel_gpu_gen9_dpll::enable_clock(self.mmio, self.ddi, id);
             return Ok(());
         }
@@ -6645,6 +6723,93 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_gen9_modeset_refuses_without_dmc
+    );
+
+    /// Gen9 shared-DPLL arbitration in the modeset (`narf.intel.gen9_dpll=1`,
+    /// `skl_get_dpll` → `intel_find_dpll`): with port B live on DPLL1 at
+    /// HBR2, an HDMI output on port C takes DPLL2 (the WRPLL programmed
+    /// there, DPLL1's CTL and CTRL1 field untouched) and routes its clock to
+    /// DPLL2 while B's routing stays on DPLL1; a DP output on port D at B's
+    /// HBR2 shares DPLL1 without a write, and its mid-training retune
+    /// refuses before any write. Without the option the HDMI output takes
+    /// DPLL1, as before.
+    fn smoke_gen9_modeset_arbitrates_external_dplls() -> TestResult {
+        use crate::intel_gpu_gen11_dpll::DPLL_CTRL1;
+        use crate::intel_gpu_gen9_dpll::{
+            ctl_reg, ctrl2_clk_sel, ctrl2_clk_sel_mask, ctrl2_sel_override, dp_state, SklDpllId,
+            DPLL_CTRL2, PLL_ENABLE,
+        };
+        use crate::intel_gpu_gt::Gen9Platform;
+        let hbr2 = dp_state(540_000).unwrap();
+        let seed = |sink: &ScriptedSinkMmio| {
+            sink.write32(ctl_reg(SklDpllId::Dpll1), PLL_ENABLE);
+            sink.write32(DPLL_CTRL1, hbr2.ctrl1 << 6);
+            sink.write32(
+                DPLL_CTRL2,
+                ctrl2_clk_sel(Ddi::B, SklDpllId::Dpll1) | ctrl2_sel_override(Ddi::B),
+            );
+            sink.write32(Ddi::B.base(), 1 << 31);
+            sink.writes.borrow_mut().clear();
+        };
+        let sink = ScriptedSinkMmio::new(1 << 29);
+        seed(&sink);
+        let mut c = Modeset::new(&sink, Ddi::C);
+        c.set_gen9_platform(Gen9Platform::Skylake);
+        c.set_gen9_dpll_arbitration(true);
+        if c.program_dpll_gen9_hdmi(148_500).is_err()
+            || c.gen9_dpll() != Some((SklDpllId::Dpll2, false))
+        {
+            return TestResult::Fail("HDMI beside a live DPLL1 must take DPLL2");
+        }
+        if !sink.writes_to(ctl_reg(SklDpllId::Dpll1)).is_empty()
+            || (sink.read32(DPLL_CTRL1) >> 6) & 0x3f != hbr2.ctrl1
+            || sink
+                .writes_to(ctl_reg(SklDpllId::Dpll2))
+                .last()
+                .is_none_or(|v| v & PLL_ENABLE == 0)
+            || sink.writes_to(0x6C048).is_empty()
+        {
+            return TestResult::Fail("only DPLL2 may be programmed for the HDMI output");
+        }
+        if c.program_dpclka_routing().is_err() {
+            return TestResult::Fail("the clock routing must follow the arbitrated DPLL");
+        }
+        let ctrl2 = sink.read32(DPLL_CTRL2);
+        if ctrl2 & ctrl2_clk_sel_mask(Ddi::C) != ctrl2_clk_sel(Ddi::C, SklDpllId::Dpll2)
+            || ctrl2 & ctrl2_clk_sel_mask(Ddi::B) != ctrl2_clk_sel(Ddi::B, SklDpllId::Dpll1)
+        {
+            return TestResult::Fail("port C must route DPLL2 and port B keep DPLL1");
+        }
+        sink.writes.borrow_mut().clear();
+        let mut d = Modeset::new(&sink, Ddi::D);
+        d.set_gen9_platform(Gen9Platform::Skylake);
+        d.set_gen9_dpll_arbitration(true);
+        if d.program_dpll_gen9(LinkRate::DpHbr2).is_err()
+            || d.gen9_dpll() != Some((SklDpllId::Dpll1, true))
+            || !sink.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("DP at B's HBR2 must share DPLL1 without a write");
+        }
+        if d.gen9_retune_dpll(LinkRate::DpRbr) != Err(ModesetError::DisplayResourceUnavailable)
+            || !sink.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("a shared DPLL must not be retuned");
+        }
+        let sink = ScriptedSinkMmio::new(1 << 29);
+        seed(&sink);
+        let mut c = Modeset::new(&sink, Ddi::C);
+        c.set_gen9_platform(Gen9Platform::Skylake);
+        c.set_gen9_dpll_arbitration(false);
+        if c.program_dpll_gen9_hdmi(148_500).is_err()
+            || c.gen9_dpll() != Some((SklDpllId::Dpll1, false))
+        {
+            return TestResult::Fail("without narf.intel.gen9_dpll=1 HDMI takes DPLL1");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen9_modeset_arbitrates_external_dplls
     );
 
     /// Gen9: the full first-light run over the scripted sink —
