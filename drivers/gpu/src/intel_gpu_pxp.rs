@@ -1318,6 +1318,43 @@ impl<C: Client> Engine<C> {
     }
 }
 
+// ── Display: protected planes ───────────────────────────────────────
+
+/// The PXP the display checks plane keys against (`xe->pxp` as
+/// `xe_pxp_obj_key_check` reaches it): published when PXP initializes on
+/// the media GT, withdrawn with it.
+static DISPLAY_PXP: IrqSafeSpinLock<Option<Weak<Pxp>>> = IrqSafeSpinLock::new(None);
+
+/// Publish (or withdraw) the PXP whose key the display checks.
+pub(crate) fn set_display_pxp(pxp: Option<&Arc<Pxp>>) {
+    *DISPLAY_PXP.lock() = pxp.map(Arc::downgrade);
+}
+
+/// What a plane does with its framebuffer's object
+/// (`skl_universal_plane.c::check_protection`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PlaneProtection {
+    /// `plane_state->decrypt`: `intel_bo_key_check(obj) == 0`.
+    pub decrypt: bool,
+    /// `plane_state->force_black`: protected but not decryptable.
+    pub force_black: bool,
+}
+
+/// `check_protection` for an object marked with key `instance` (0: not
+/// protected). Without a published PXP a protected object's key cannot be
+/// valid (`xe_pxp_obj_key_check`: -ENODEV), so it scans out black.
+pub(crate) fn plane_protection(instance: u32) -> PlaneProtection {
+    if instance == 0 {
+        return PlaneProtection::default();
+    }
+    let pxp = DISPLAY_PXP.lock().as_ref().and_then(Weak::upgrade);
+    let decrypt = pxp.is_some_and(|p| p.key_check(instance).is_ok());
+    PlaneProtection {
+        decrypt,
+        force_black: !decrypt,
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 impl Pxp {
     /// Fixture: publish readiness and settle in ACTIVE, as a completed
@@ -1330,6 +1367,14 @@ impl Pxp {
         core.termination_done = true;
         core.events = 0;
         core.live = true;
+    }
+
+    /// Fixture: a KCR termination interrupt (`KCR_PXP_STATE_TERMINATED`)
+    /// and the events work's pxp_terminate prep: an ACTIVE session's key
+    /// iteration moves on.
+    pub(crate) fn terminate_for_test(&self) {
+        self.irq(KCR_PXP_STATE_TERMINATED);
+        let _ = self.next_work();
     }
 }
 

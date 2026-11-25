@@ -1642,6 +1642,10 @@ async fn execute_plan<B: Backend>(
             // The crtc enable of a commit that lights it again.
             backend.panel_on().await?;
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;
+            // A PXP-protected frame only ever reaches the plane, which
+            // decrypts it or shows it black; a CPU copy would put its
+            // ciphertext on the console.
+            let protected = protected(fb);
             let direct = fb.intel.as_ref().filter(|i| {
                 fb.format == PixelFormat::Xrgb8888
                     && !i.object.is_userptr()
@@ -1668,7 +1672,7 @@ async fn execute_plan<B: Backend>(
                         // The display owner uses Unsupported only for admission
                         // before arm. A hard/lost/pending hardware error must keep
                         // its owners and cannot silently turn into CPU presentation.
-                        Err(FsError::Unsupported) => {
+                        Err(FsError::Unsupported) if !protected => {
                             backend.surface().await?;
                             backend.copy(fb, mode).await?;
                             backend.vblank().await?
@@ -1676,6 +1680,8 @@ async fn execute_plan<B: Backend>(
                         Err(error) => return Err(error),
                     },
                 );
+            } else if protected {
+                return Err(FsError::Unsupported);
             } else {
                 backend.surface().await?;
                 backend.copy(fb, mode).await?;
@@ -1704,6 +1710,9 @@ async fn execute_plan<B: Backend>(
                         .await?,
                 );
             } else {
+                if plan.framebuffer.as_ref().is_some_and(protected) {
+                    return Err(FsError::Unsupported);
+                }
                 backend.surface().await?;
                 if let Some(fb) = &plan.framebuffer {
                     backend.copy(fb, mode).await?;
@@ -1813,6 +1822,11 @@ async fn execute_plan<B: Backend>(
         ns: narf_time::monotonic_ns(),
         sequence: 0,
     }))
+}
+
+/// A PXP-protected framebuffer (`xe_bo_is_protected`).
+fn protected(fb: &Framebuffer) -> bool {
+    fb.intel.as_ref().is_some_and(|i| i.object.pxp_key() != 0)
 }
 
 /// The registry index of the card whose state is `mode`.

@@ -3546,6 +3546,12 @@ impl Owner {
                 pxp: shared.clone(),
                 engine: pxp::Engine::new(client, session),
             });
+            // The display checks protected planes' keys against it
+            // (xe_pxp_obj_key_check).
+            crate::intel_gpu_gt::media::pxp::set_display_pxp(Some(&shared));
+            if let Some(mode) = crate::drm_registry::mode_state(self.pending.index) {
+                mode.lock().intel_pxp_planes = true;
+            }
             *self.user_pxp.lock() = Some(shared);
             log(self.pending.index, "PXP initialized; KCR enabled");
         }
