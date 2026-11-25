@@ -1044,6 +1044,30 @@
       ]
     },
     {
+      "id": "mt7925",
+      "family": "mt7921",
+      "assets": [
+        {
+          "role": "patch",
+          "required": true,
+          "candidates": [
+            "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin"
+          ]
+        },
+        {
+          "role": "RAM",
+          "required": true,
+          "candidates": [
+            "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin"
+          ]
+        }
+      ],
+      "requirements": [
+        "Match supported CONNAC3 silicon and exact patch/RAM pair; qualify actual EEPROM/board calibration and reset/radio transport.",
+        "Production NRFW signatures/trusted keys and deployment wireless-regulatory.bin policy are provisioned separately; payload presence grants no TX authority."
+      ]
+    },
+    {
       "id": "rtl8188eu",
       "family": "rtl8xxxu",
       "assets": [
