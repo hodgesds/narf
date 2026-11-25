@@ -770,8 +770,15 @@ pub(crate) mod tests {
     }
     impl Fake {
         fn new() -> Self {
+            // RESPONSE starts nonzero: Linux's
+            // `dcn32_smu_send_msg_with_param` waits for the response
+            // register to be ready before the first message, so real
+            // hardware always has a nonzero value here, and the DCN 3.0
+            // fake models the same initial state (`response: 1`).
+            let mut values = vec![0; 0x300];
+            values[RESPONSE as usize] = 1;
             Self {
-                values: vec![0; 0x300],
+                values,
                 writes: Vec::new(),
                 gone: false,
                 script: Vec::new(),

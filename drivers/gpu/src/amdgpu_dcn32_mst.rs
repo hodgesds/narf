@@ -74,6 +74,12 @@ pub struct HpoSource {
 impl HpoSource {
     /// Bind link encoder `link` (0..1). The VC-rate registers live in
     /// this encoder's DPHY block.
+    ///
+    /// Consumed only by the kernel-test suite below, which clippy's
+    /// lib/test configs do not enable; do not delete — this is the
+    /// owner's constructor, wired by the modeset lane that lands the
+    /// 3.2 MST path.
+    #[allow(dead_code)]
     pub(crate) fn new(regs: Regs, dcn2: u64, link: u8) -> Self {
         Self { regs, dcn2, link }
     }
@@ -211,7 +217,7 @@ pub(crate) mod tests {
         // Rows 0/1 carry the streams; rows 2/3 are cleared; SAT_UPDATE
         // fired with trigger; the STATUS pending bits read clear.
         let at = |reg: u64| bench.get(d2(0) + reg as u32);
-        if at(SAT_VC0) != 0 | 10 << 8
+        if at(SAT_VC0) != 10 << 8
             || at(SAT_VC0 + 1) != 2 | 20 << 8
             || at(SAT_VC0 + 2) != 0
             || at(SAT_VC0 + 3) != 0
