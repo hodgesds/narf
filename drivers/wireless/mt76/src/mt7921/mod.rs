@@ -76,8 +76,8 @@ pub use pci::{
     firmware_blobs_for, l1_remap, name_for, probe, register_pci_driver, Mt7921Device, ProbeError,
 };
 pub use regs::{
-    ALL_DEV_IDS, ITTIM_VENDOR, MTK_DEV_MT7920, MTK_DEV_MT7921, MTK_DEV_MT7921_ALT, MTK_DEV_MT7922,
-    MTK_DEV_MT7925, MTK_DEV_MT7925_ALT, MTK_DEV_MT7961, MTK_VENDOR,
+    is_mt7925_did, ALL_DEV_IDS, ITTIM_VENDOR, MTK_DEV_MT7920, MTK_DEV_MT7921, MTK_DEV_MT7921_ALT,
+    MTK_DEV_MT7922, MTK_DEV_MT7925, MTK_DEV_MT7925_ALT, MTK_DEV_MT7961, MTK_VENDOR,
 };
 
 /// Entry point invoked from the wireless crate's `register_initcalls`
