@@ -4935,7 +4935,7 @@ Refused and remaining work:
 
 Twenty-eight native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc`
 there are four:
-`smoke_xelpdp_dmc_parse_skips_pipe_programs`,
+`smoke_xelpdp_dmc_parse_bounds_pipe_programs`,
 `smoke_xelpdp_dmc_parse_refusals`, `smoke_xelpdp_dmc_load_conversation` and
 `smoke_xelpdp_dmc_disable_and_geometry`. In
 `drivers/gpu/intel_gpu_dc_states` there are fifteen:
@@ -7166,7 +7166,7 @@ Fixtures:
 - `smoke_hardware_guc_capture_ads_g2h_extraction_and_guc_engine_snapshot`
 - `smoke_hardware_guc_capture_timeout_manual_fallback_snapshot`
 - `smoke_hardware_guc_capture_option_off_unchanged`
-- `smoke_oa_mmap_source_checks_and_private_pfn_refusal`
+- `smoke_oa_mmap_source_checks_then_private_pfn_backing`
 - `smoke_oa_metrics_sysfs_uuid_id_follows_registry`
 - `smoke_observation_paranoid_sysctl_range_and_gate`
 
@@ -7593,36 +7593,26 @@ rate, then lanes, to `LinkTrainingExhausted`.
 
 ### Lunar Lake display 20 (Xe2_LPD) — native fixtures added
 
-This slice starts the display part of the Additional platforms workstream.
-Lunar Lake's display 20.00 now has an owned eDP Pipe-A modeset. The
-display-14 chain is dispatched on a typed display IP instead of copied
-(§17, 10.5). The modeset is reached only through an opted-in, read-only
-per-device route (`narf.intel.lnl_display=1`). Every other Lunar Lake
-function keeps the headless main-GT profile, and that profile's driver FLR
-is never run on a display-owning function.
+Lunar Lake's display 20.00 is driven only through the opted-in, read-only
+per-device route (`narf.intel.lnl_display=1`); every other Lunar Lake
+function keeps the headless main-GT profile and its driver FLR. §17, 10.5
+states the contract: the owned eDP modeset, the display-preserving GT owner,
+the KMS owner with cursor, color, DSB, tiled primaries and `SCANOUT`, the DC
+service, PSR1, FBC, tiled panning, suspend and relight, and the external
+outputs. The display-14 chain is dispatched on a typed display IP instead of
+copied. None of this has run on silicon.
 
-What changed, by file. `intel_gpu_xe2lpd` (new) holds the GMD decode, the
+Modules. `intel_gpu_xe2lpd` holds the GMD decode, the
 route, `XE2LPD_DE_CAP`, the CDCLK table, the MDCLK-ratio,
 DBUF/MBUS/DBOX and package-C values, the PICA well model, the display-20
 D2D link and the pipe-DMC flip-queue and interrupt programming. The
-display-14 files gained version dispatch: `intel_gpu_xelpg_cdclk` `_ip`
+display-14 files carry the version dispatch: `intel_gpu_xelpg_cdclk` `_ip`
 variants; `intel_gpu_xelpg_resources` `compute_ip`, `State::ip` and the
 IP-aware DBUF/MBUS/DBOX images, ratio ordering and restoration;
 `intel_gpu_display_resources` IP reads, no no-DPT chicken on display 20 and
 the running-clock proof; `intel_gpu_modeset_xelpg::with_display_ip`;
 `intel_gpu_dmc` `DmcPlatform::Xe2Lpd`; and probe routing in `intel_gpu`.
-Display-14 register conversations are unchanged: no display-14 path gains
-a read or a write.
-
-What a real Lunar Lake would complete, opted in, with GOP lighting the
-panel: route admission, panel power sequencing, EDID, the display-20
-resource transaction (PM demand, CDCLK, MDCLK ratio, DBUF, MBUS,
-watermarks), the C10 port PLL, link training on DDI A, the transcoder and
-primary enable on the firmware surface and the package-C latency. The
-console keeps drawing on that surface. Nothing past that runs: no KMS or
-DRM flips (no GT owner, no Xe2 scanout PAT policy), no DMC load or
-DC5/DC6, no PSR or FBC, no backlight PWM or VBT, and no external outputs.
-None of this has run on silicon.
+Display-14 register conversations are unchanged.
 
 Fixtures:
 
@@ -7644,53 +7634,6 @@ Fixtures:
 - `drivers/gpu/intel_gpu_xe2lpd_dmc`:
   `smoke_xe2lpd_dmc_parse_ceiling_and_load_order` and
   `smoke_xe2lpd_pipe_dmc_flip_queue_and_interrupts`.
-
-The display-preserving Lunar Lake GT/KMS owner, display-20 resource profile,
-FBC count, PSR1 deltas and TC1–TC4 Type-C/PICA external route described by
-this workstream are implemented, as are DP and HDMI TMDS on combo DDI B (and
-HDMI on declared legacy Type-C ports) through the display-20 D2D/DDI_BUF_CTL
-programming. Remaining output work includes UHBR. Panther Lake's additional
-display-30 deltas are recorded in
-`intel_gpu_xe3lpd`.
-
-### Lunar Lake display 20: GT owner, KMS flips and DC6 — native fixtures added
-
-This slice continues the Lunar Lake display-20 route (§17, 10.5). Everything
-stays behind `narf.intel.lnl_display=1`, and every Lunar Lake function
-without the route keeps the headless main-GT profile and its driver FLR
-unchanged.
-
-The route's function now has a GT owner. Linux xe never runs a driver FLR at
-probe; it makes a GT fresh with the GuC reset and, on reset and shutdown,
-`do_gt_reset`'s `GRDOM_FULL`, while display keeps running. NARF's GT
-bring-up already issues that pair on the primary and media GTs before its
-first GGTT PTE, so the display-preserving profile replaces only the FLR. A
-read-only admission proves no FLR is in flight, display 20.00 with Pipe A
-lit, and no inherited display DMA outside the route's primary. It clears one
-stale FLR status bit so that any later FLR fails every PTE write. The
-profile refuses system suspend, because display-20 relight is not owned.
-
-Probe then moves the console onto an owned surface mapped at the firmware
-surface's own PAT index, which must be 0, and installs the KMS owner for
-display 20. Linear fixed-mode Pipe-A flips map GEM pages with Xe2 PAT3, the
-uncached display index of Linux xe, admitted only once the GT owner has
-programmed it. The owner keeps the display-20 pipe status bits, the FBC A–D
-and five-plane fetcher inventory, and the LNL dummy-write workaround before
-every read. Console restoration and GT-reset recovery run through the
-existing owner. The DC service also runs on display 20: after GT
-publication it loads `xe2lpd_dmc.bin` under the display-20 rules, enables
-Pipe A's DMC and enters DC6. PSR1 stays refused, with its display-20 deltas
-recorded in §17. The cursor, color, DSB transactions, tiled primaries and FBC
-are not offered yet.
-
-What a real Lunar Lake would do, opted in, beyond the previous slice: start
-its GT (GuC, engines, private VMs and the startup execution proofs) beside
-the lit panel and publish render/compute to userspace, move the console to
-the owned surface, flip linear WC framebuffers on Pipe A, and enter DC6
-when idle if `xe2lpd_dmc.bin` is present. None of this has run on silicon.
-
-Fixtures:
-
 - `drivers/gpu/intel_gpu_xe2lpd_gt`:
   `smoke_xe2lpd_gt_display_admission_reads_display_only_and_never_flrs`,
   `smoke_xe2lpd_gt_hardware_init_resets_gt_only` and
@@ -7699,59 +7642,10 @@ Fixtures:
   `smoke_xe2lpd_kms_pte_profile_and_owned_status`,
   `smoke_xe2lpd_kms_linear_flip_maps_pat3_and_restores_console`,
   `smoke_xe2lpd_kms_fetcher_inventory_and_refused_services` and
-  `smoke_xe2lpd_kms_psr1_refused_on_display20`.
+  `smoke_xe2lpd_kms_psr1_enabled_on_display20`.
 - `drivers/gpu/intel_gpu_xe2lpd_dc`:
   `smoke_xe2lpd_dc_service_profile_and_firmware` and
   `smoke_xe2lpd_dc_service_loads_xe2lpd_dmc_and_enters_dc6`.
-
-Remaining for the workstream, in order: the cursor and DSB owners' display
-PTE profile (their GGTT pages still use the display-14 format and PAT1),
-then cursor, color and DSB on display 20; the Xe `SCANOUT` create flag on
-the display profile; Wa_15015404425 on the route's probe-time modeset
-window; display-20 relight and suspend; PSR1's display-20 deltas; FBC on the
-HDR planes; and Type-C/PICA externals.
-
-### Lunar Lake display 20: cursor, color, DSB, tiled primaries and SCANOUT — native fixtures added
-
-This slice continues the Lunar Lake display-20 route (§17, 10.5), still only
-behind `narf.intel.lnl_display=1`. It closes the first four items the
-previous slice left.
-
-The cursor and DSB owners now map their pages with the IP's display GGTT
-profile: Xe2 PTEs at PAT3, admitted only while the GT owner's
-`PAT_INDEX(3)` reads 0x3c. With that, the KMS owner offers the display-14
-cursor, CTM, gamma and degamma LUTs and DSB transactions on display 20.
-intel_cursor.c, intel_dsb.c and intel_color.c have no branch between
-displays 14 and 20 at the pinned revision, so the register conversations
-are unchanged. The cursor's fault mask is the display-20 one, without the
-PIPEDMC faults.
-
-X and Tile4 primaries are now owned on display 20. Display 20 has no
-no-DPT chicken, so the presenter builds a display page table for each
-tiled surface, laid out like Linux's power-of-two remap, and maps it at a
-2 MiB-aligned GGTT address that `PLANE_SURF` names. Only a source stride
-that fits the DPT stride is owned, and panning a tiled primary is refused.
-Tiled admission reads no new display-14 register. Display 14 still checks
-its chicken; display 20 skips it.
-
-The Xe `SCANOUT` create flag is admitted on the display-preserving
-profile as xe takes it, a WC system object marked for scanout. The
-route's probe-time modeset window, panel power sequencing through the
-backlight gate, now applies Wa_15015404425 like the rest of the display-20
-paths.
-
-Meteor Lake and Gen12 register conversations are unchanged. Two existing
-display-20 fixtures assert the new contract: the cursor is refused before
-any write without a proved display-20 layout, and an X-tiled display-20
-primary proves the linear watermark image.
-
-What a real Lunar Lake would do, opted in, beyond the previous slice:
-create scanout objects with the Xe flag, draw a hardware cursor, apply CTM
-and gamma/degamma LUTs (through the DSB when active), and flip X/Tile4
-framebuffers through the owned DPT. None of this has run on silicon.
-
-Fixtures:
-
 - `drivers/gpu/intel_gpu_xe2lpd_kms`:
   `smoke_xe2lpd_kms_cursor_and_dsb_pages_map_xe2_pat3`,
   `smoke_xe2lpd_kms_cursor_fault_mask_drops_pipedmc`,
@@ -7763,11 +7657,6 @@ Fixtures:
   `smoke_xe2lpd_gt_scanout_create_flag_follows_display_profile`.
 - `drivers/gpu/intel_gpu_xe2lpd_modeset`:
   `smoke_xe2lpd_probe_window_flushes_every_read`.
-
-Remaining for the workstream, in order: display-20 suspend and relight
-(display power and DMC restore, the GT owner's resume without an FLR and
-the KMS restore); PSR1's display-20 deltas, recorded in §17; FBC on display
-20; panning of a tiled display-20 primary; and Type-C/PICA externals.
 
 ### i915 context priority through GuC registration — native fixtures added
 
