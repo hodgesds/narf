@@ -117,8 +117,14 @@ support. Physical maxima remain gated on actual capability replies.
 | PCI14e4:4433 | BCM4387 | P | F8/F9 then D-SEED |
 
 NARF does not currently match upstream MT7902, BCM43602 raw DID, CY54591,
-upstream subsystem-specific4355/4365 entries, MT7925/CONNAC3 or arbitrary
+upstream subsystem-specific4355/4365 entries, or arbitrary
 USB/SDIO Broadcom families. They are outside these counts and estimates.
+MT7925/CONNAC3 is now implemented (waves 1–3 of #2494, merged): PCI
+registration for `0x7925`/`0x0717`, firmware catalog, FWDL, the 51-window
+CONNAC3 fixed map, the 5-ring DMA layout, and the UNI/MLO TLV layer —
+see `drivers/wireless/mt76/src/mt7925.md`. It remains fixture-validated,
+not hardware-proven (open gates: Q1 chip-id read, Q2 blob staging, the
+`0x25` trailer byte, DMA TX-slot order).
 The loadable MT module is ID-registration-only, not the built-in native owner.
 
 Loadable build (supersedes the line above): every `14c3`/`0e8d` tuple in the

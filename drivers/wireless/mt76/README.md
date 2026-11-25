@@ -1,7 +1,7 @@
-# drivers/wireless/mt76 — MediaTek CONNAC2 Wi-Fi
+# drivers/wireless/mt76 — MediaTek CONNAC2/CONNAC3 Wi-Fi
 
-`narf-drivers-wireless-mt76` is the MediaTek CONNAC2 Wi-Fi driver for
-MT7921 / MT7922 / MT7961 / MT7920, promoted from the former
+`narf-drivers-wireless-mt76` is the MediaTek CONNAC2/CONNAC3 Wi-Fi driver
+for MT7921 / MT7922 / MT7961 / MT7920 and MT7925, promoted from the former
 `drivers/wireless/src/mt7921/` module. It is dual-build (built-in or
 loadable `.ko`).
 
@@ -14,7 +14,10 @@ only through `src/platform/`: the kernel crates built in, `narf-module-rt`
 plus the KABI in the `module` build. As `mt76.ko` the same driver runs
 inside the module: `src/mt7921/pci_kabi.rs` binds the function and
 `src/iface_module.rs` publishes the station netdev and wiphy through the
-generic `WIFI` family host (wireless spec §4.4). The private copy-mode
+generic `WIFI` family host (wireless spec §4.4). The CONNAC3-specific UNI/MLO
+layer lives in `src/mt7925/` (`mcu.rs`), documented in
+[`src/mt7925.md`](src/mt7925.md); the shared probe, BAR/L1 windows,
+WFDMA and firmware transport in `src/mt7921/` select on the PCI id. The private copy-mode
 family (`src/module_protocol.rs` / `src/module_host.rs`) stays registered
 in the built-in build for compatibility; no in-tree `.ko` uses it.
 

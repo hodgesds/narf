@@ -1,5 +1,5 @@
-//! MediaTek CONNAC2 Wi-Fi (MT7921 / MT7922 / MT7961 / MT7920) — dual-build
-//! (built-in or loadable `.ko`).
+//! MediaTek CONNAC2/CONNAC3 Wi-Fi (MT7921 / MT7922 / MT7961 / MT7920 +
+//! MT7925) — dual-build (built-in or loadable `.ko`).
 //!
 //! Promoted from the former `drivers/wireless/src/mt7921/` module. See
 //! `drivers/net/i40e/` for the reference dual-build shape and `PLAN.md` at the
