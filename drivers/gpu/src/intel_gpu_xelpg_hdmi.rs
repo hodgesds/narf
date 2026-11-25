@@ -8,7 +8,10 @@
 //! D2D link in `DDI_BUF_CTL` (kept set by the full DDI write,
 //! `intel_ddi_enable_hdmi`'s `XE2LPD_DDI_BUF_D2D_LINK_ENABLE`), the IP's
 //! pipe resources and Type-C profile, and on display 30 the fixed-refresh
-//! VRR timing generator. Wildcat Lake's 30.02 profile has no HDMI route. The
+//! VRR timing generator. Nova Lake-S display 35 runs the same route on LT
+//! port B and legacy TC1/TC2 with the LT PHY's TMDS PLL
+//! (`xe3plpd_lt_hdmi_tables` or its computed image) and the DP 1.4 table's
+//! HDMI level. Wildcat Lake's 30.02 profile has no HDMI route. The
 //! pipe side (power wells, resource transaction, pipe DMC, timings, plane
 //! arm, release) is the shared Pipe B–D owner
 //! ([`crate::intel_gpu_xelpg_pipes`]) through the DP route's helpers.
@@ -694,6 +697,31 @@ pub fn hdmi_pll_request_kind(
     })
 }
 
+/// The LT-PHY TMDS request at `clock_khz` (display 35): the source
+/// envelope and the shared request fields of [`hdmi_pll_request_kind`],
+/// admitted only when `intel_lt_phy_pll_calc_state` has an image for the
+/// clock (`xe3plpd_lt_hdmi_tables`, then `intel_lt_phy_calculate_hdmi_state`).
+/// The request's Cx0 state is never programmed: the route enables the LT PLL
+/// from its port clock ([`crate::intel_gpu_lt_phy::LtPhy::enable_hdmi_tmds`]).
+fn lt_hdmi_request(clock_khz: u32) -> Result<PllRequest, HdmiError> {
+    let request = hdmi_pll_request_kind(PhyKind::C10, clock_khz, false, None)?;
+    crate::intel_gpu_lt_phy::hdmi_pll_state(clock_khz)
+        .ok_or(HdmiError::UnsupportedClock(clock_khz))?;
+    Ok(request)
+}
+
+/// The LT PHY behind `port` for a TMDS route on display 35; `None` on a
+/// Cx0 view. HDMI drives all four transmitters, natively (legacy Type-C
+/// included), with the VBT's board reversal.
+fn hdmi_lt_phy<'a, M: MmioWindow + ?Sized>(
+    io: &'a M,
+    port: XeLpgPort,
+    pll: &PllRequest,
+) -> Result<Option<crate::intel_gpu_lt_phy::LtPhy<'a, M>>, HdmiError> {
+    crate::intel_gpu_xelpg_external::lt_phy(io, port, false, HDMI_LANES, pll.lanes.reversed())
+        .map_err(HdmiError::Route)
+}
+
 /// The DDC pin of an HDMI-capable MTL port, valid in `gmbus_pins_mtp`.
 /// DDI B is `intel_hdmi_default_ddc_pin`'s `dg1_encoder_to_ddc_pin`
 /// (`PCH_MTL >= PCH_DG1`: PHY B + 1 = `GMBUS_PIN_2_BXT`, "dpb"). That
@@ -791,6 +819,9 @@ pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
     if port == XeLpgPort::A || !profile.admits_port(port) {
         return Err(ExternalError::UnsupportedPort.into());
     }
+    if !profile.admits_view(io) {
+        return Err(ExternalError::UnsupportedGeneration.into());
+    }
     let type_c = port.tc_index().is_some();
     if type_c && !legacy_port {
         return Err(HdmiError::NotLegacy);
@@ -868,9 +899,14 @@ fn output_for<M: MmioWindow + ?Sized>(
         parse_hdmi_vsdb, parse_ycbcr420, tmds_clock_for, vic_for_mode, SinkFormat,
     };
     let kind = crate::intel_gpu_xelpg::phy_kind(io, port);
+    let lt = io.has_lt_phy();
     let link_for = |format| {
         let clock = tmds_clock_for(mode.pixel_clock_khz, 8, format);
-        let pll = hdmi_pll_request_kind(kind, clock, type_c, io.c20_hdmi_tx_cfg1())?;
+        let pll = if lt {
+            lt_hdmi_request(clock)?
+        } else {
+            hdmi_pll_request_kind(kind, clock, type_c, io.c20_hdmi_tx_cfg1())?
+        };
         Ok((format, pll, tmds_link(clock, sink)?))
     };
     let y420 = parse_ycbcr420(edid);
@@ -1043,8 +1079,17 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     );
     let rp = reservation(route)?;
     let (pipe, trans) = (rp.pipe, rp.transcoder());
-    // intel_ddi_pre_enable_hdmi: PLL, transcoder clock, infoframes.
-    enable_port_pll_state(io, port, &pll).map_err(phy_err)?;
+    // intel_ddi_pre_enable_hdmi: PLL (intel_lt_phy_pll_enable on display
+    // 35), transcoder clock, infoframes.
+    match hdmi_lt_phy(io, port, &pll)? {
+        Some(lt) => lt
+            .enable_hdmi_tmds(crate::intel_gpu_lt_phy::LtHdmiEnable {
+                clock_khz: pll.port_clock_khz,
+                lane_count: HDMI_LANES,
+            })
+            .map_err(phy_err)?,
+        None => enable_port_pll_state(io, port, &pll).map_err(phy_err)?,
+    }
     wr(io, trans_clk_sel(trans), trans_clk_sel_port(port))?;
     crate::intel_gpu_hdmi::write_avi_infoframe(
         io,
@@ -1089,7 +1134,21 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     // display 20+, where the DDI_BUF_CTL write keeps it set
     // (XE2LPD_DDI_BUF_D2D_LINK_ENABLE in intel_ddi_enable_hdmi's buf_ctl).
     enable_d2d(io, ip, port).map_err(d2d_err)?;
-    set_signal_levels_hdmi(&Cx0Phy::with_lanes(io, port, pll.lanes)).map_err(phy_err)?;
+    match hdmi_lt_phy(io, port, &pll)? {
+        // intel_lt_phy_set_signal_levels: the DP 1.4 table at
+        // intel_ddi_hdmi_level on every transmitter (no VBT level here).
+        Some(lt) => {
+            let (level, _) = crate::intel_gpu_lt_phy::hdmi_signal_level(None);
+            lt.program_signal_levels(
+                crate::intel_gpu_lt_phy::LtSignalProtocol::Hdmi,
+                &[level; HDMI_LANES as usize],
+            )
+            .map_err(phy_err)?
+        }
+        None => {
+            set_signal_levels_hdmi(&Cx0Phy::with_lanes(io, port, pll.lanes)).map_err(phy_err)?
+        }
+    }
     let buf = rd(io, port.buf_ctl1())?;
     wr(
         io,
@@ -1203,7 +1262,10 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     wait_port_buf_idle(io, port).map_err(|_| stop_failed)?;
     disable_d2d(io, ip, port).map_err(|_| stop_failed)?;
     wr(io, trans_clk_sel(trans), 0)?;
-    disable_port_pll_complete(io, port).map_err(|_| stop_failed)?;
+    match hdmi_lt_phy(io, port, &route.probe.pll).map_err(|_| stop_failed)? {
+        Some(lt) => lt.disable().map_err(|_| stop_failed)?,
+        None => disable_port_pll_complete(io, port).map_err(|_| stop_failed)?,
+    }
     let ddi = rd(io, port.ddi_buf_ctl())?;
     let buf = rd(io, port.buf_ctl1())?;
     let clock = rd(io, port.port_clock_ctl())?;

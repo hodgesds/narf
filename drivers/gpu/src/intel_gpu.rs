@@ -3091,11 +3091,6 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
             }
             _ => return false,
         };
-        // Display 35's ports take the LT PHY, which no external route drives
-        // yet: its hotplug sources are left untouched.
-        if display_ip == crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS {
-            return false;
-        }
         let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_ip(display_ip);
         let window = gpu.mode_window();
         // The owned panel the route adopts next to it, and the display-14/20/30
@@ -3130,6 +3125,23 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
             })
         };
         match gpu.chip.generation {
+            // Display 35: port B and TC1/TC2 through the LT PHY, over the
+            // display-35 view (PICA-relocated DDI B, no Wa_15015404425).
+            Generation::PantherLake
+                if display_ip == crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS =>
+            {
+                let view = crate::intel_gpu_xe3plpd::View(&window);
+                mtl_external_pass_profile(
+                    &view,
+                    profile,
+                    gtt.phys.raw(),
+                    &display,
+                    before_event,
+                    after_event,
+                    &mut alloc_fn,
+                    &mut mtl_publish,
+                )
+            }
             Generation::LunarLake => {
                 let view = crate::intel_gpu_xe2lpd::PicaFlushed(&window);
                 mtl_external_pass_profile(
@@ -3242,10 +3254,19 @@ pub(crate) async fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_fil
         ),
         None => None,
     };
-    let done = crate::intel_gpu_xelpg_external::teardown_mtl_external(
-        &gpu.mode_window(),
-        gpu.chip.generation,
-    );
+    // Display 35's route stops through the view it was lit over: DDI B's
+    // PHY and AUX in PICA, the LT PHY behind it.
+    let nova = display.as_ref().and_then(|display| display.integrated_display_ip())
+        == Some(crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS);
+    let window = gpu.mode_window();
+    let done = if nova {
+        crate::intel_gpu_xelpg_external::teardown_mtl_external(
+            &crate::intel_gpu_xe3plpd::View(&window),
+            gpu.chip.generation,
+        )
+    } else {
+        crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, gpu.chip.generation)
+    };
     if !crate::intel_gpu_xelpg_external::route_live() {
         let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
         if serial != 0 {

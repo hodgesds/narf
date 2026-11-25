@@ -985,16 +985,21 @@ mod tests {
         );
         assert!(crate::intel_gpu_xe3lpd::dc_off_domains(ip)
             .contains(&crate::intel_gpu_xe3lpd::Domain::Aux));
-        // No external route drives an LT port.
+        // External routes take LT port B and TC1/TC2; port A is the panel's
+        // and Nova Lake-S has no TC3/TC4.
+        use crate::intel_gpu_xelpg::XeLpgPort;
         let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_ip(ip);
-        for port in [
-            crate::intel_gpu_xelpg::XeLpgPort::A,
-            crate::intel_gpu_xelpg::XeLpgPort::B,
-            crate::intel_gpu_xelpg::XeLpgPort::Tc1,
-            crate::intel_gpu_xelpg::XeLpgPort::Tc2,
+        for (port, admitted) in [
+            (XeLpgPort::A, false),
+            (XeLpgPort::B, true),
+            (XeLpgPort::Tc1, true),
+            (XeLpgPort::Tc2, true),
+            (XeLpgPort::Tc3, false),
+            (XeLpgPort::Tc4, false),
         ] {
-            assert!(!profile.admits_port(port));
+            assert_eq!(profile.admits_port(port), admitted, "{port:?}");
         }
+        assert!(!profile.c20_port_b());
         TestResult::Pass
     }
     kernel_test_in!(

@@ -568,7 +568,13 @@ off after restoring the console (`drm_atomic_helper_suspend`), and resume
 relights it through `intel_gpu_xe3plpd::relight` (`pps_init_registers` with the
 probe's sequencer delays, then the cold panel-on through the LT PHY), refused
 without the panel-off record. A refused console handoff keeps the firmware
-surface as fixed-mode KMS with the firmware route's GT owner.
+surface as fixed-mode KMS with the firmware route's GT owner. Beside the owned
+panel, the display-14 external route drives LT port B (DP 1.4 and HDMI TMDS on
+Pipes B-D) and TC1/TC2 (DP-alt, declared legacy HDMI) over the same view: PLL
+enable/disable and signal levels on the LT PHY (`ExternalDisplayProfile::
+admits_port` opens B/TC1/TC2 for `NovaLakeS`, and `admits_view` refuses a
+profile whose PHY family the view does not report). UHBR, Thunderbolt alt
+mode (`ExternalError::LtTbtAlt`) and HDMI FRL stay refused.
 WCL uses its separate C10/C20 route.
 `intel_gpu_nvl_resources` supplies the pure ownership boundary for that future
 owner. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT
