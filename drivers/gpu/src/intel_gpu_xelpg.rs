@@ -2373,7 +2373,7 @@ pub struct SnpsTrans {
     pub post_cursor: u8,
 }
 
-const fn snps(vswing: u8, pre_cursor: u8, post_cursor: u8) -> SnpsTrans {
+pub const fn snps(vswing: u8, pre_cursor: u8, post_cursor: u8) -> SnpsTrans {
     SnpsTrans {
         vswing,
         pre_cursor,
@@ -2534,15 +2534,27 @@ pub fn set_signal_levels_uhbr<M: MmioWindow + ?Sized>(
     lane_count: u8,
     presets: &[u8; 4],
 ) -> Result<(), Cx0Error> {
+    set_signal_levels_uhbr_table(phy, lane_count, presets, &C20_TRANS_UHBR)
+}
+
+/// [`set_signal_levels_uhbr`] from `table`: `intel_ddi_buf_trans_get`
+/// returns the VBT's override (`mtl_get_c20_buf_trans_override`) when the
+/// port has one, else `mtl_c20_trans_uhbr`.
+pub fn set_signal_levels_uhbr_table<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    lane_count: u8,
+    presets: &[u8; 4],
+    table: &[SnpsTrans; 16],
+) -> Result<(), Cx0Error> {
     if phy.kind() != PhyKind::C20 {
         return Err(Cx0Error::UnsupportedRate);
     }
     if !phy.lanes.admits(lane_count) {
         return Err(Cx0Error::ProtocolMismatch);
     }
-    let mut entries = [C20_TRANS_UHBR[0]; 4];
+    let mut entries = [table[0]; 4];
     for (entry, &preset) in entries.iter_mut().zip(presets) {
-        *entry = C20_TRANS_UHBR[usize::from(preset & 0xF)];
+        *entry = table[usize::from(preset & 0xF)];
     }
     phy.program_msgbus_timer();
     phy.msgbus_access_begin(phy.lanes.owned)?;

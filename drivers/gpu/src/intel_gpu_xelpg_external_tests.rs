@@ -2362,6 +2362,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
                 hdmi: true,
                 legacy: true,
                 ddc_pin: None,
+                c20_uhbr_vspeo: None,
             },
             Legacy,
             RoutePlan::DpThenHdmi,
@@ -2388,6 +2389,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
         hdmi: true,
         legacy: false,
         ddc_pin: None,
+        c20_uhbr_vspeo: None,
     };
     if !hdmi_only.legacy_effective() || MtlPortDecl::COMBO_DP_HDMI.legacy_effective() {
         return TestResult::Fail("effective legacy flag must follow intel_ddi_init");
@@ -2780,6 +2782,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
             hdmi: true,
             legacy: false,
             ddc_pin: Some(PinPair::Pin2Bxt),
+            c20_uhbr_vspeo: None,
         },
         tc: [
             MtlPortDecl::USB_C,
@@ -2789,6 +2792,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
                 hdmi: true,
                 legacy: true,
                 ddc_pin: Some(PinPair::Pin10Tc2),
+                c20_uhbr_vspeo: None,
             },
             MtlPortDecl {
                 lane_reversal: false,
@@ -2796,6 +2800,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
                 hdmi: true,
                 legacy: false,
                 ddc_pin: Some(PinPair::Pin11Tc3),
+                c20_uhbr_vspeo: None,
             },
             MtlPortDecl::NONE,
         ],
@@ -4483,6 +4488,101 @@ fn smoke_mtl_external_uhbr_tc_route_lights_and_stops() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_uhbr_tc_route_lights_and_stops
+);
+
+/// `BDB_VSWING_PREEMPH` with `tables` tables of sixteen rows and `columns`
+/// columns: table `t`, row `r` is (0x1_0000 + 20 + r + t, t, r), then 0xee
+/// in any further column (the high bits are lost to the `snps` bytes).
+pub(crate) fn vspeo_block(tables: usize, columns: usize) -> Vec<u8> {
+    let mut b = alloc::vec![tables as u8, columns as u8];
+    for t in 0..tables as u32 {
+        for r in 0..16u32 {
+            for c in 0..columns {
+                let v = match c {
+                    0 => 0x1_0000 + 20 + r + t,
+                    1 => t,
+                    2 => r,
+                    _ => 0xee,
+                };
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    b
+}
+
+/// `mtl_get_c20_buf_trans_override` on a 128b/132b C20 link: a VBT whose
+/// TC2 DP child sets `use_vbt_vswing` (218+) and carries
+/// `BDB_VSWING_PREEMPH` gives the port table 5
+/// (`intel_bios_get_c20_vspeo(..., is_uhbr = true)`); the service hands it
+/// to the probe and `intel_ddi_buf_trans_get` takes it over
+/// `mtl_c20_trans_uhbr`, so the sink's TX FFE presets 4 and 9 program rows
+/// 4 (29, 5, 4) and 9 (34, 5, 9) as [pre, swing, post] on PHY lane 0's TX1
+/// and TX2.
+fn smoke_mtl_external_uhbr_vbt_c20_override() -> TestResult {
+    use crate::intel_gpu_vbt::tests::{general_definitions, Child, VbtImage};
+    use crate::intel_gpu_vbt::{block, device_type, dp_aux, dvo_port, Vbt};
+    let child = Child::new(device_type::DP, dvo_port::DPG)
+        .aux(dp_aux::G)
+        .typec()
+        .byte(23, 1 << 5);
+    let image = VbtImage::new(250)
+        .block(block::GENERAL_DEFINITIONS, general_definitions(44, &[child]))
+        .block(block::VSWING_PREEMPH, vspeo_block(6, 3))
+        .build();
+    let Ok(vbt) = Vbt::parse(&image) else {
+        return TestResult::Fail("the VBT must parse");
+    };
+    let policy = MtlPortPolicy::from_vbt(&vbt);
+    let Some(table) = policy.tc[1].c20_uhbr_vspeo else {
+        return TestResult::Fail("TC2's DP child must carry the C20 UHBR override");
+    };
+    for (r, e) in table.iter().enumerate() {
+        let r = r as u8;
+        if *e != crate::intel_gpu_xelpg::snps(25 + r, 5, r) {
+            return TestResult::Fail("the override must be table 5, truncated to bytes");
+        }
+    }
+    if policy.tc[0].c20_uhbr_vspeo.is_some() || !policy.tc[1].dp {
+        return TestResult::Fail("only the requesting DP child gets an override");
+    }
+    let io = uhbr_tc();
+    let mut service = MtlExternalService::new();
+    service.set_generation(Generation::MeteorLake);
+    service.set_uhbr(true);
+    if !service.set_policy(policy) {
+        return TestResult::Fail("the policy must install with no route");
+    }
+    let event = MtlHpdEvent {
+        pin: MtlHpdPin::Tc2,
+        kind: MtlHpdKind::Connected(LiveMode::DpAlt),
+    };
+    match service.handle(&io, event, &mut fb_for) {
+        ServiceOutcome::Activated { .. } => {}
+        other => {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "override route: {other:?}");
+            return TestResult::Fail("the 128b/132b route must light with the override");
+        }
+    }
+    let vdr = |a: u16| io.phy.vdr_get(0, a);
+    if [vdr(0xD80), vdr(0xD81), vdr(0xD82)] != [5, 29, 4]
+        || [vdr(0xD90), vdr(0xD91), vdr(0xD92)] != [5, 34, 9]
+    {
+        return TestResult::Fail("presets 4 and 9 must take the VBT rows, not mtl_c20_trans_uhbr");
+    }
+    match service.route() {
+        Some(MtlRoute::Dp(r)) if r.probe.c20_uhbr_vspeo.as_deref() == Some(&table) => {}
+        _ => return TestResult::Fail("the probe must keep the port's override"),
+    }
+    if !service.teardown(&io) {
+        return TestResult::Fail("the override route must stop and release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_vbt_c20_override
 );
 
 /// HDCP on a live 128b/132b SST route (`_intel_hdcp_enable` outside

@@ -132,7 +132,9 @@
 //! `TRANS_DP2_CTL`, `TRANS_DDI_FUNC_CTL` in 128b/132b mode with its own MST
 //! transport, `DP_TP_CTL` in MST mode, the 40-bit `PORT_BUF_CTL1` and
 //! `DDI_CTL_DE`, the 128b/132b training with TX FFE presets
-//! ([`uhbr::train`]), the sink's VC payload and its ACT, the MTP M/N, the
+//! ([`uhbr::train`]; on C20 from the port's VBT override when it has one,
+//! [`MtlPortDecl::c20_uhbr_vspeo`]), the sink's VC payload and its ACT, the
+//! MTP M/N, the
 //! `TRANS_DP2_VFREQ` pair and, on display 30+, `DP_MIN_HBLANK_CTL`. The stop
 //! reverses it and hands the sink back to 8b/10b channel coding. On
 //! display 30+ Thunderbolt alt mode the link runs through the DP tunnel's BW
@@ -214,7 +216,7 @@ use crate::intel_gpu_xe2lpd::{disable_d2d, enable_d2d, DisplayIp, DDI_BUF_D2D_LI
 use crate::intel_gpu_xelpg::{
     disable_port_pll_lanes, disable_tbt_clock, dp_pll_request, dp_uhbr_pll_request,
     enable_port_pll_state, enable_tbt_clock, program_port_buf_ctl, program_port_buf_ctl_width,
-    set_signal_levels, set_signal_levels_uhbr, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
+    set_signal_levels, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
     Cx0Phy, PhyKind, PhyLaneConfig, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
@@ -1022,6 +1024,9 @@ pub struct MtlSinkProbe {
     /// (`narf.intel.hdmi14_ext=1`, `intel_dp_has_audio`: every display-12+
     /// port, a sink that declares basic audio or audio descriptors).
     pub audio: Option<alloc::boxed::Box<[u8; audio::MAX_ELD_BYTES]>>,
+    /// The port's VBT C20 UHBR override ([`MtlPortDecl::c20_uhbr_vspeo`]),
+    /// applied by the service; `None` takes `mtl_c20_trans_uhbr`.
+    pub c20_uhbr_vspeo: Option<alloc::boxed::Box<[crate::intel_gpu_xelpg::SnpsTrans; 16]>>,
 }
 
 /// A 128b/132b SST route (`intel_dp_is_uhbr`).
@@ -1633,6 +1638,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         uhbr: uhbr_plan,
         output,
         audio,
+        c20_uhbr_vspeo: None,
     })
 }
 
@@ -2121,10 +2127,16 @@ fn uhbr_levels<M: MmioWindow + ?Sized>(
             )
             .map_err(phy_err)
         }
-        None => set_signal_levels_uhbr(
+        // intel_ddi_buf_trans_get: the VBT override first (C20 only; the LT
+        // PHY has no override, xe3plpd_get_lt_buf_trans).
+        None => crate::intel_gpu_xelpg::set_signal_levels_uhbr_table(
             &Cx0Phy::with_lanes(io, probe.port, probe.phy_lanes()?),
             lanes,
             presets,
+            probe
+                .c20_uhbr_vspeo
+                .as_deref()
+                .unwrap_or(&crate::intel_gpu_xelpg::C20_TRANS_UHBR),
         )
         .map_err(phy_err),
     }
@@ -3088,6 +3100,10 @@ pub struct MtlPortDecl {
     /// for a hand declaration, which uses the port's
     /// [`crate::intel_gpu_xelpg_hdmi::ddc_pin`].
     pub ddc_pin: Option<PinPair>,
+    /// The VBT's C20 UHBR vswing/pre-emphasis override
+    /// (`intel_bios_get_c20_vspeo(devdata, has_dp, true)`), which a
+    /// 128b/132b link on a C20 port takes instead of `mtl_c20_trans_uhbr`.
+    pub c20_uhbr_vspeo: Option<[crate::intel_gpu_xelpg::SnpsTrans; 16]>,
 }
 
 impl MtlPortDecl {
@@ -3098,6 +3114,7 @@ impl MtlPortDecl {
         hdmi: false,
         legacy: false,
         ddc_pin: None,
+        c20_uhbr_vspeo: None,
     };
     /// `init_vbt_missing_defaults` for a non-TC port other than A and E:
     /// `DEVICE_TYPE_TMDS_DVI_SIGNALING | DEVICE_TYPE_DISPLAYPORT_OUTPUT`.
@@ -3107,6 +3124,7 @@ impl MtlPortDecl {
         hdmi: true,
         legacy: false,
         ddc_pin: None,
+        c20_uhbr_vspeo: None,
     };
     /// A USB-C connector: DP-alt only.
     pub const USB_C: Self = Self {
@@ -3115,6 +3133,7 @@ impl MtlPortDecl {
         hdmi: false,
         legacy: false,
         ddc_pin: None,
+        c20_uhbr_vspeo: None,
     };
     /// A Type-C PHY wired to a native HDMI connector.
     pub const LEGACY_HDMI: Self = Self {
@@ -3123,6 +3142,7 @@ impl MtlPortDecl {
         hdmi: true,
         legacy: true,
         ddc_pin: None,
+        c20_uhbr_vspeo: None,
     };
 
     /// `intel_ddi_init`: a Type-C port declared non-legacy but with HDMI
@@ -3178,7 +3198,13 @@ impl MtlPortPolicy {
                 6 => XeLpgPort::Tc4,
                 _ => continue,
             };
-            let decl = decl_from_encoder(port, &encoder);
+            let mut decl = decl_from_encoder(port, &encoder);
+            // mtl_get_c20_buf_trans_override (validate_vspeo: DP only).
+            if decl.dp {
+                decl.c20_uhbr_vspeo = vbt.c20_vspeo(&encoder, true).map(|rows| {
+                    rows.map(|(v, pre, post)| crate::intel_gpu_xelpg::snps(v, pre, post))
+                });
+            }
             match port.tc_index() {
                 Some(tc) => policy.tc[tc as usize] = decl,
                 None => policy.ddi_b = decl,
@@ -3249,6 +3275,7 @@ pub fn decl_from_encoder(port: XeLpgPort, encoder: &VbtEncoder) -> MtlPortDecl {
         hdmi,
         legacy: type_c && encoder.tc_legacy,
         ddc_pin: encoder.hdmi_ddc,
+        c20_uhbr_vspeo: None,
     }
 }
 
@@ -3914,6 +3941,11 @@ impl MtlExternalService {
                 }
                 Ok(mut probe) => {
                     probe.lane_reversal = self.policy.decl(port).lane_reversal;
+                    probe.c20_uhbr_vspeo = self
+                        .policy
+                        .decl(port)
+                        .c20_uhbr_vspeo
+                        .map(alloc::boxed::Box::new);
                     probe.ssc = dp_ssc_enabled(self.policy.use_ssc, probe.max_downspread);
                     self.connect_dp(io, slot, probe, alloc)
                 }

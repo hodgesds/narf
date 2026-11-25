@@ -976,6 +976,77 @@ fn vbt_edp_hobl_from_lfp_power() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/intel_gpu_vbt", vbt_edp_hobl_from_lfp_power);
 
+/// `parse_vswing_preemph_override` and `intel_bios_get_c20_vspeo`: version
+/// 218+, a child with `use_vbt_vswing` (byte 23 bit 5), sixteen rows per
+/// table on display 14+, table 5 for UHBR and 4 otherwise at a row stride
+/// of `num_columns`, each u32 truncated to its `snps` byte. Before 218 the
+/// block and the bit are ignored; a child without the bit has no override;
+/// a block too short for table 5 yields none (Linux reads past it).
+fn vbt_c20_vspeo_tables_follow_intel_bios() -> TestResult {
+    use crate::intel_gpu_xelpg_external::tests::vspeo_block;
+    let vbt = |version: u16, bit: bool, block_data: Vec<u8>| {
+        let child = Child::new(device_type::DP, dvo_port::DPF)
+            .aux(dp_aux::F)
+            .typec()
+            .byte(23, if bit { 1 << 5 } else { 0 });
+        let image = VbtImage::new(version)
+            .block(block::GENERAL_DEFINITIONS, general_definitions(44, &[child]))
+            .block(block::VSWING_PREEMPH, block_data)
+            .build();
+        Vbt::parse(&image).ok()
+    };
+    let rows = |t: u8| {
+        let mut want = [(0u8, 0u8, 0u8); VSPEO_ROWS_DISPLAY14];
+        for (r, w) in want.iter_mut().enumerate() {
+            *w = (20 + r as u8 + t, t, r as u8);
+        }
+        want
+    };
+    let lookup = |v: &Vbt, uhbr: bool| {
+        let e = v.encoder(VbtPlatform::MeteorLake, 3)?;
+        v.c20_vspeo(&e, uhbr)
+    };
+    let Some(v) = vbt(250, true, vspeo_block(6, 3)) else {
+        return TestResult::Fail("the VBT must parse");
+    };
+    if !v
+        .encoder(VbtPlatform::MeteorLake, 3)
+        .is_some_and(|e| e.use_vbt_vswing)
+        || lookup(&v, true) != Some(rows(5))
+        || lookup(&v, false) != Some(rows(4))
+    {
+        return TestResult::Fail("UHBR takes table 5, DP 1.4 table 4");
+    }
+    // A fourth column only widens the row stride.
+    let Some(v) = vbt(250, true, vspeo_block(6, 4)) else {
+        return TestResult::Fail("the VBT must parse");
+    };
+    if lookup(&v, true) != Some(rows(5)) {
+        return TestResult::Fail("rows advance by num_columns");
+    }
+    // Five tables: no table 5.
+    let Some(v) = vbt(250, true, vspeo_block(5, 3)) else {
+        return TestResult::Fail("the VBT must parse");
+    };
+    if lookup(&v, true).is_some() || lookup(&v, false) != Some(rows(4)) {
+        return TestResult::Fail("a short block must not yield table 5");
+    }
+    let (Some(old), Some(off)) = (
+        vbt(217, true, vspeo_block(6, 3)),
+        vbt(250, false, vspeo_block(6, 3)),
+    ) else {
+        return TestResult::Fail("the VBTs must parse");
+    };
+    if lookup(&old, true).is_some() || lookup(&off, true).is_some() {
+        return TestResult::Fail("version 217 or no use_vbt_vswing has no override");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vbt",
+    vbt_c20_vspeo_tables_follow_intel_bios
+);
+
 fn vbt_psr_block_and_enable_sources() -> TestResult {
     let panel = 2usize;
     let mut s = alloc::vec![0u8; 100];

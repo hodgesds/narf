@@ -79,6 +79,8 @@ pub mod block {
     pub const LFP_POWER: u8 = 44;
     /// `BDB_MIPI_SEQUENCE` (its v3+ size field is a u32 at +4).
     pub const MIPI_SEQUENCE: u8 = 53;
+    /// `BDB_VSWING_PREEMPH` (218+).
+    pub const VSWING_PREEMPH: u8 = 57;
 }
 
 /// `sizeof` of each parsed block structure (the `bdb_blocks[].min_size`
@@ -100,6 +102,9 @@ pub mod block_size {
     pub const LFP_BACKLIGHT: usize = 305;
     /// `struct bdb_lfp_power`.
     pub const LFP_POWER: usize = 136;
+    /// `struct bdb_vswing_preemph` (`num_tables`, `num_columns`; the
+    /// `u32 tables[]` follow).
+    pub const VSWING_PREEMPH: usize = 2;
 }
 
 /// `sizeof(struct child_device_config)`.
@@ -354,6 +359,10 @@ impl ChildDevice {
     /// `lane_reversal` (184+, read unconditionally as Linux does).
     pub fn lane_reversal(&self) -> bool {
         self.raw[23] & (1 << 1) != 0
+    }
+    /// `intel_bios_encoder_requests_vspeo`: `use_vbt_vswing` (218+).
+    pub fn use_vbt_vswing(&self) -> bool {
+        self.version >= 218 && self.raw[23] & (1 << 5) != 0
     }
     /// `lspcon` (192+).
     pub fn lspcon(&self) -> bool {
@@ -853,6 +862,9 @@ pub struct VbtEncoder {
     pub dp_max_link_rate_khz: u32,
     /// `intel_bios_dp_max_lane_count` (0: no VBT limit).
     pub dp_max_lane_count: u8,
+    /// `intel_bios_encoder_requests_vspeo`: the child asks for the VBT's
+    /// vswing/pre-emphasis tables (`use_vbt_vswing`, 218+).
+    pub use_vbt_vswing: bool,
 }
 
 // ── Panel facts (intel_bios_init_panel) ─────────────────────────────
@@ -1025,7 +1037,11 @@ pub struct Vbt {
     lfp_options: Option<Vec<u8>>,
     lfp_backlight: Option<Vec<u8>>,
     lfp_power: Option<Vec<u8>>,
+    vswing_preemph: Option<Vec<u8>>,
 }
+
+/// `vswing_preemph_num_rows` on display 14+: sixteen levels per table.
+pub const VSPEO_ROWS_DISPLAY14: usize = 16;
 
 impl Vbt {
     /// Validate (`intel_bios_is_valid_vbt`) and parse a VBT image.
@@ -1049,7 +1065,49 @@ impl Vbt {
             lfp_options: padded_block(bdb, block::LFP_OPTIONS, block_size::LFP_OPTIONS),
             lfp_backlight: padded_block(bdb, block::LFP_BACKLIGHT, block_size::LFP_BACKLIGHT),
             lfp_power: padded_block(bdb, block::LFP_POWER, block_size::LFP_POWER),
+            // parse_vswing_preemph_override: only from version 218.
+            vswing_preemph: if version >= 218 {
+                padded_block(bdb, block::VSWING_PREEMPH, block_size::VSWING_PREEMPH)
+            } else {
+                None
+            },
         })
+    }
+
+    /// `intel_bios_get_c20_vspeo` for a DP output on display 14+: when the
+    /// encoder requests it ([`VbtEncoder::use_vbt_vswing`]) and the VBT
+    /// carries `BDB_VSWING_PREEMPH`, the sixteen (vswing, pre-cursor,
+    /// post-cursor) rows of table 5 for a UHBR link (`is_uhbr`), table 4
+    /// otherwise, at row stride `num_columns` (each value truncated to the
+    /// `snps` byte, as Linux's assignment does). Linux reads the rows
+    /// without a bound; `None` here for a block too short to hold them.
+    pub fn c20_vspeo(
+        &self,
+        encoder: &VbtEncoder,
+        is_uhbr: bool,
+    ) -> Option<[(u8, u8, u8); VSPEO_ROWS_DISPLAY14]> {
+        if !encoder.use_vbt_vswing {
+            return None;
+        }
+        let b = self.vswing_preemph.as_deref()?;
+        let columns = usize::from(b[1]);
+        let tables = &b[block_size::VSWING_PREEMPH..];
+        let at = |i: usize| -> Option<u32> {
+            let raw = tables.get(i * 4..i * 4 + 4)?;
+            Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        };
+        let idx = if is_uhbr { 5 } else { 4 };
+        let mut offset = idx * VSPEO_ROWS_DISPLAY14 * columns;
+        let mut rows = [(0u8, 0u8, 0u8); VSPEO_ROWS_DISPLAY14];
+        for row in rows.iter_mut() {
+            *row = (
+                at(offset)? as u8,
+                at(offset + 1)? as u8,
+                at(offset + 2)? as u8,
+            );
+            offset += columns;
+        }
+        Some(rows)
     }
 
     /// The BDB version (`display->vbt.version`).
@@ -1333,6 +1391,7 @@ impl Vbt {
                 hdmi_max_tmds_khz: child.hdmi_max_tmds_clock_khz(),
                 dp_max_link_rate_khz: child.dp_max_link_rate_khz(),
                 dp_max_lane_count: child.dp_max_lane_count(),
+                use_vbt_vswing: child.use_vbt_vswing(),
             };
             if child.supports_dsi() {
                 out.push(VbtEncoder { dsi: true, ..base });
