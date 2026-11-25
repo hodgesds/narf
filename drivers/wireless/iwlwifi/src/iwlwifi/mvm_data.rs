@@ -9,6 +9,8 @@ use super::super::{
     scan_api,
 };
 use super::{AssociationStatus, Owner, Phase};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{vec, vec::Vec};
 use core::{
     future::{poll_fn, Future},
@@ -194,7 +196,7 @@ impl Owner {
     /// checked again; historical queue/association metadata cannot open it.
     pub fn legacy_data_port_open(&mut self) -> bool {
         self.data_port_using(|| {
-            narf_wireless::reg::db::get_domain().ok_or("MVM data policy unavailable")
+            crate::iwlwifi::reg_source::get_domain().ok_or("MVM data policy unavailable")
         })
     }
 
@@ -238,7 +240,7 @@ impl Owner {
 
     pub async fn prepare_legacy_data(&mut self) -> Result<LegacyDataStatus, &'static str> {
         self.prepare_data_using(|| {
-            narf_wireless::reg::db::get_domain().ok_or("MVM data policy unavailable")
+            crate::iwlwifi::reg_source::get_domain().ok_or("MVM data policy unavailable")
         })
         .await
     }
@@ -532,7 +534,7 @@ impl Owner {
 
     pub async fn transmit_legacy_ethernet(&mut self, ethernet: &[u8]) -> Result<(), &'static str> {
         self.transmit_data_using(ethernet, || {
-            narf_wireless::reg::db::get_domain().ok_or("MVM data policy unavailable")
+            crate::iwlwifi::reg_source::get_domain().ok_or("MVM data policy unavailable")
         })
         .await
     }
@@ -730,7 +732,7 @@ impl Owner {
     /// protected port; an active RSNA owner captures EAPOL privately.
     pub fn poll_legacy_receive(&mut self) -> Result<Option<LegacyReceive>, &'static str> {
         self.receive_data_using(|| {
-            narf_wireless::reg::db::get_domain().ok_or("MVM data policy unavailable")
+            crate::iwlwifi::reg_source::get_domain().ok_or("MVM data policy unavailable")
         })
     }
 

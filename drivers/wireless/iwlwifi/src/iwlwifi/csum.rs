@@ -17,12 +17,16 @@
 //! and never transmitted partially checksummed. RX verdicts are reported only
 //! when the hardware's result proves the checksum; an unverifiable result
 //! leaves software verification in place.
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::narf_net::{L4CsumKind, RxMeta};
+#[cfg(feature = "builtin")]
 use narf_net::{L4CsumKind, OffloadCapabilities, RxMeta};
 
 /// Advertised frame-ring offloads: L4 checksum generation and RX checksum
 /// verdicts. TSO is a driver-side A-MSDU segmentation in Linux
 /// (`iwl_mld_tx_tso_segment`), not a firmware offload; VLAN insertion is
 /// not supported.
+#[cfg(feature = "builtin")]
 pub const OFFLOADS: OffloadCapabilities = OffloadCapabilities {
     tx_checksum: true,
     rx_checksum: true,
@@ -205,6 +209,7 @@ pub(super) fn complete_prepared(eth: &mut [u8], assist: u32) -> Result<(), &'sta
 
 /// Validate a TX metadata request for this offload contract without
 /// changing the frame. Used before an Ethernet frame is queued.
+#[cfg(feature = "builtin")]
 pub fn tx_admissible(eth: &[u8], meta: narf_net::TxMeta) -> bool {
     meta.tso_mss.is_none()
         && meta.vlan_tag.is_none()

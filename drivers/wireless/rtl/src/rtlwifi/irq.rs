@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use narf_bus::MmioRegion;
+use crate::platform::{IrqSafeSpinLock, MmioRegion};
 
 use super::regs::*;
 
@@ -104,20 +104,9 @@ pub unsafe fn disable_interrupts(mmio: &MmioRegion) {
 pub const fn imr_pair(did: u16) -> (u64, u64) {
     if did == super::regs::RTL_DEV_8723AE {
         // Actual hw.c literals; reg.h's HIMR macros are unused by this path.
-        (
-            super::rtl8723ae::irq::MASK0 as u64,
-            super::rtl8723ae::irq::MASK1 as u64,
-        )
-    } else if super::rtl8192ce::is_8192ce(did) {
-        (
-            super::rtl8192ce::mac::REG_HIMR as u64,
-            super::rtl8192ce::mac::REG_HIMRE as u64,
-        )
-    } else if did == super::regs::RTL_DEV_8192DE {
-        (
-            super::rtl8192de::mac::REG_HIMR as u64,
-            super::rtl8192de::mac::REG_HIMRE as u64,
-        )
+        (REG_HIMR_8723AE as u64, REG_HIMRE_8723AE as u64)
+    } else if super::rtl8192ce::is_8192ce(did) || did == super::regs::RTL_DEV_8192DE {
+        (REG_HIMR_92C as u64, REG_HIMRE_92C as u64)
     } else {
         (REG_HIMR, REG_HIMRE)
     }
@@ -258,13 +247,13 @@ pub(crate) struct Recognized {
 /// The top half never touches BAR2; recognition happens in the worker.
 pub(crate) struct Signal {
     count: core::sync::atomic::AtomicU64,
-    waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
+    waker: IrqSafeSpinLock<Option<core::task::Waker>>,
 }
 impl Signal {
     pub(crate) fn new() -> alloc::sync::Arc<Self> {
         alloc::sync::Arc::new(Self {
             count: core::sync::atomic::AtomicU64::new(0),
-            waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            waker: IrqSafeSpinLock::new(None),
         })
     }
     /// Vector top half (or explicit stack-TX wake): count and wake.

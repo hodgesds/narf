@@ -6,6 +6,8 @@ use super::super::{
     scan_api,
 };
 use super::{AuthenticationStatus, Owner, Phase};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::vec::Vec;
 use narf_wireless::{
     association::{Bss, JoinPlan, SecurityMode},
@@ -108,7 +110,7 @@ impl Owner {
         security: SecurityMode,
     ) -> Result<AssociationStatus, &'static str> {
         self.associate_legacy_using(ssid, security, || {
-            narf_wireless::reg::db::get_domain().ok_or("MVM association policy unavailable")
+            crate::iwlwifi::reg_source::get_domain().ok_or("MVM association policy unavailable")
         })
         .await
     }

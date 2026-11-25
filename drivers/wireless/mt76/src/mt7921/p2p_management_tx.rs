@@ -3,7 +3,7 @@
 use super::p2p_management_power::Plan;
 use super::station::Command;
 use super::*;
-use narf_wireless::ap_control::RadioControlAuthority;
+use crate::platform::ap_control::RadioControlAuthority;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Emission {

@@ -1,5 +1,7 @@
 //! Exact firmware/PCI and qualified-power authority around a publication.
 use super::{mvm_boot::PowerFence, runtime::Authority};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_capabilities::{Cap, CapError, CapOp, Read};
@@ -36,14 +38,18 @@ pub(super) struct Publication {
 }
 pub(super) enum Power {
     Station(PowerFence),
+    #[cfg(feature = "builtin")]
     Ap(Ap),
 }
+#[cfg(feature = "builtin")]
 pub(super) struct Ap(alloc::vec::Vec<ApProof>);
+#[cfg(feature = "builtin")]
 struct ApProof {
     source: super::runtime::source::Fence,
     receive: super::runtime::rx_epoch::Publication,
     data: super::ap_owner::DataPublication,
 }
+#[cfg(feature = "builtin")]
 impl Ap {
     pub(super) fn new(
         source: super::runtime::source::Fence,
@@ -82,6 +88,7 @@ impl Power {
     ) -> Result<T, &'static str> {
         match self {
             Self::Station(power) => power.invoke(domain, operation),
+            #[cfg(feature = "builtin")]
             Self::Ap(ap) => ap.0[0].source.invoke(|| {
                 if !ap.current() {
                     return Err("MVM AP native receive/key epoch retired");
@@ -96,6 +103,7 @@ impl Publication {
         self.generation.0.load(Ordering::Acquire) == self.generation.1
             && match self.power.as_ref() {
                 Power::Station(_) => true,
+                #[cfg(feature = "builtin")]
                 Power::Ap(ap) => ap.current(),
             }
     }

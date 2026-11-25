@@ -7,6 +7,8 @@ use super::{
     data_queue::DataQueue,
     scan_api,
 };
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::vec::Vec;
 
 pub const MAX_WINDOW: u16 = 64;

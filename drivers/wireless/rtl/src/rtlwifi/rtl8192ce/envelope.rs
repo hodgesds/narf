@@ -44,12 +44,12 @@ use super::phy::PgStore;
 use super::tables;
 use super::txpower::{self, Efuse, RATES};
 use super::version::RfType;
+use crate::platform::capabilities::{Cap, NoopOp, Read};
+use crate::platform::firmware::FirmwareBlob;
 use crate::rtlwifi::channel_power::Error;
 use crate::rtlwifi::efuse::Factory;
 pub use crate::rtlwifi::rtl8192ee::envelope::{Operating, Width};
 use alloc::{format, vec::Vec};
-use narf_capabilities::{Cap, NoopOp, Read};
-use narf_firmware::FirmwareBlob;
 
 pub const MAGIC: [u8; 4] = *b"N92C";
 const HEADER: usize = 96;
@@ -210,7 +210,7 @@ impl Calibration {
         &self,
         operation: impl FnOnce() -> Result<T, crate::rtlwifi::prepare::Error>,
     ) -> Result<T, crate::rtlwifi::prepare::Error> {
-        use narf_capabilities::{CapError, CapOp};
+        use crate::platform::capabilities::{CapError, CapOp};
         struct Invoke<F>(F);
         impl<T, F: FnOnce() -> Result<T, crate::rtlwifi::prepare::Error>> CapOp<FirmwareBlob, Read>
             for Invoke<F>
@@ -239,7 +239,7 @@ impl Calibration {
             "rtlwifi/rtl8192ce-cal-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
             m[0], m[1], m[2], m[3], m[4], m[5]
         );
-        let authority = narf_firmware::trusted_loader_authority()
+        let authority = crate::platform::firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive::<Read>().ok())
             .ok_or(Error::Authority)?;
         let asset = crate::firmware_asset::load(

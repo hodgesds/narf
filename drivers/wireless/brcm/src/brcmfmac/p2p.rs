@@ -597,7 +597,7 @@ impl Device {
         if self.next_af_subtype != wire::PAF_SUBTYPE_INVALID {
             self.waiting_next_af = true;
         }
-        let start_ns = narf_time::wall::monotonic_ns();
+        let start_ns = crate::platform::time::wall::monotonic_ns();
         let overflow = |now: u64| {
             requested_dwell & wire::CUSTOM_RETRY_MASK != 0
                 && now.saturating_sub(start_ns) / 1_000_000
@@ -606,7 +606,7 @@ impl Device {
         let mut ack = false;
         let mut retry = 0;
         let result: Result<(), Error> = async {
-            let mut dwell_overflow = overflow(narf_time::wall::monotonic_ns());
+            let mut dwell_overflow = overflow(crate::platform::time::wall::monotonic_ns());
             while !self.block_gon_req_tx && !ack && retry < wire::AF_TX_MAX_RETRY && !dwell_overflow
             {
                 if wire::af_channel(&params) != 0 {
@@ -614,7 +614,7 @@ impl Device {
                 }
                 ack = self.tx_action_frame(runtime, owner, &params).await?;
                 retry += 1;
-                dwell_overflow = overflow(narf_time::wall::monotonic_ns());
+                dwell_overflow = overflow(crate::platform::time::wall::monotonic_ns());
             }
             Ok(())
         }
@@ -658,7 +658,7 @@ impl Device {
         if let Some(sending) = self.sending.as_mut() {
             sending.af_sent_channel = channel;
         }
-        let deadline = narf_time::Deadline::after_ms(wire::AF_MAX_WAIT_TIME_MS);
+        let deadline = crate::platform::time::Deadline::after_ms(wire::AF_MAX_WAIT_TIME_MS);
         loop {
             runtime.poll()?;
             self.service(runtime, owner).await?;
@@ -693,5 +693,8 @@ impl Device {
 }
 
 async fn sleep_ms(ms: u64) {
-    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(ms.saturating_mul(1_000_000))).await;
+    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+        ms.saturating_mul(1_000_000),
+    ))
+    .await;
 }

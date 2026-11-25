@@ -1,4 +1,6 @@
 //! Private periodic-scan publication ordering; no firmware or RF authority.
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use narf_lib::sync::IrqSafeSpinLock;
 
 pub(super) struct Epoch(IrqSafeSpinLock<u64>);

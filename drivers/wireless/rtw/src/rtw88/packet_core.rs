@@ -3,6 +3,9 @@
 //! native rings stay in their original firmware backend. No reset,
 //! descriptor-owner reconstruction or IRQ service.
 use super::packet_format::{self as format, Queue};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_io, narf_wireless};
 use alloc::{collections::VecDeque, vec::Vec};
 use narf_io::DmaBuffer;
 

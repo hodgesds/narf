@@ -6,14 +6,14 @@
 //! No example record or measured value is supplied by this source.
 
 use super::envelope::{Calibration, Permission, Width};
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::{FirmwareBlob, FirmwareError};
 use crate::rtlwifi::{
     channel_power::Error as PowerError, efuse::Factory, firmware_transport::Identity,
     prepare::Error,
 };
 use alloc::{format, string::String, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
 
 const LENGTH: usize = 256;
 const RECIPE: &[u8] = b"NARF RTL8821AE N21C1 original linked DMA owner, MACID0, actual EFUSE C3 BIT0 antenna1/2 and MULTI_FUNC_CTRL18; actual shared 8821 byte H2C/EXT box first; source halbtc8821a1ant 20130816/41 and halbtc8821a2ant 20130618/5050 complete non-debug notifications, Ctx common exact; own 8821 RF1T1R pathA LSSI/HSSI, BT RF RPC via actual C2H BT_MP, no 8723 hardware recipe; actual single original RX ring, complete18byte C2H, arrival/deferred separated, ordinary RX bytes/PHY retained without PN consumption during MP wait; actual BT patch version/nonzero and build observed by GET_BT_VERSION before grant; all source antenna/RF LPF/AGC/BB/DAC/TXlimit/TDMA/LPS/static/transition emissions and every rate in exact permission measured together; 20MHz exact primary and immutable selected NAPC gain indices/swing, softwareCCMP, existing RA/HT20 admission only, no wider channel, no coex WoW or reset replay; partial/cancel is terminal, original history/backups/DMA retained";
@@ -230,7 +230,7 @@ impl Program {
         bt: BtIdentity,
     ) -> Result<Option<Arc<Self>>, Error> {
         let req = request(&base, firmware, factory, permission, bt)?;
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive::<Read>().ok())
             .ok_or(power(PowerError::Authority))?;
         let asset = match crate::firmware_asset::load(&loader, &req.name, LENGTH, true) {
@@ -349,7 +349,7 @@ impl Program {
                             return Err(power(PowerError::Identity));
                         }
                         let domain =
-                            narf_wireless::reg::db::snapshot().ok_or(power(PowerError::Policy))?;
+                            crate::platform::regdb::snapshot().ok_or(power(PowerError::Policy))?;
                         if self
                             .base
                             .permission_for(&domain, self.permission.operating())

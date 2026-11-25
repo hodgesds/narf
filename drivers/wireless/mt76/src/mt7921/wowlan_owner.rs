@@ -1,6 +1,6 @@
 //! Retained public-owner WoW entry points over the concrete transport.
 use super::*;
-use narf_power::system_pm::SystemSleepState;
+use crate::platform::power::SystemSleepState;
 use narf_wireless::{GtkRekeyData, WowlanConfig};
 
 /// Query actual endpoint/firmware-owned ACPI routing under current caps.

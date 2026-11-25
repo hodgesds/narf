@@ -69,7 +69,7 @@ pub(super) struct State {
     acm: [bool; 4],
     failed: bool,
     authorized: bool,
-    last_peer: narf_time::Deadline,
+    last_peer: crate::ath10k::platform::time::Deadline,
     /// Newer AP WMM parameter set from a beacon, awaiting `ath10k_conf_tx`.
     wmm_update: Option<narf_wireless::wmm::Parameters>,
     /// Changed beacon ERP `use_cts_prot`, awaiting `BSS_CHANGED_ERP_CTS_PROT`.
@@ -180,7 +180,7 @@ impl State {
         if let Some(now) = self.receive_time {
             return now;
         }
-        narf_time::wall::monotonic_ns()
+        crate::ath10k::platform::time::monotonic_ns()
     }
     fn queue_ready(&mut self, frames: Vec<Incoming>) -> Result<(), Error> {
         if self.incoming.len().saturating_add(frames.len()) > INCOMING_FRAMES {
@@ -389,7 +389,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         data.key_in_flight = Some(hw_keys::InFlight {
             token: key.token,
             pairwise: key.pairwise,
-            deadline: narf_time::Deadline::after_ms(hw_keys::INSTALL_TIMEOUT_MS),
+            deadline: crate::ath10k::platform::time::Deadline::after_ms(
+                hw_keys::INSTALL_TIMEOUT_MS,
+            ),
         });
         drop(key);
         self.htt
@@ -488,7 +490,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::ath10k) fn expire_data_for_test(&mut self) {
         if let Some(data) = &mut self.station.data {
-            data.last_peer = narf_time::Deadline::after_ms(0);
+            data.last_peer = crate::ath10k::platform::time::Deadline::after_ms(0);
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -787,7 +789,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     tid,
                     addresses,
                     &mut rx_ba,
-                    narf_time::wall::monotonic_ns(),
+                    crate::ath10k::platform::time::monotonic_ns(),
                     false,
                 )? {
                     if plaintext_eapol(&frame, addresses) {
@@ -830,7 +832,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .map_or([false; 4], tx_qos::admission),
             failed: false,
             authorized: !associated.protected,
-            last_peer: narf_time::Deadline::after_ms(5000),
+            last_peer: crate::ath10k::platform::time::Deadline::after_ms(5000),
             wmm_update: None,
             protection_update: None,
             management: None,
@@ -840,7 +842,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             amsdu: Vec::new(),
         });
         self.failed = true;
-        let deadline = narf_time::Deadline::after_ms(5000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(5000);
         for _ in 0..65536 {
             if deadline.expired() {
                 return Err(Error::Timeout);
@@ -850,7 +852,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 self.failed = false;
                 return self.station_link().ok_or(Error::Failed);
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Err(Error::Timeout)
     }
@@ -1152,7 +1154,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 self.failed = false;
                 return Ok(frames);
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Err(Error::Exhausted)
     }
@@ -1390,7 +1392,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         {
                             return Err(Error::Unsupported);
                         }
-                        data.last_peer = narf_time::Deadline::after_ms(5000);
+                        data.last_peer = crate::ath10k::platform::time::Deadline::after_ms(5000);
                         // mac80211 ieee80211_handle_bss_capability (2.4 GHz):
                         // use_cts_prot = ERP present && Use_Protection; a
                         // change raises BSS_CHANGED_ERP_CTS_PROT.
@@ -1622,7 +1624,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     if data.received.len().saturating_add(frames.len()) > RECEIVED_FRAMES {
                         return Err(Error::Exhausted);
                     }
-                    data.last_peer = narf_time::Deadline::after_ms(5000);
+                    data.last_peer = crate::ath10k::platform::time::Deadline::after_ms(5000);
                     data.received.extend(frames);
                 }
                 continue;
@@ -1636,7 +1638,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 match received.map_err(security_error)? {
                     Rx::Ignored => None,
                     Rx::Data(frame) => {
-                        data.last_peer = narf_time::Deadline::after_ms(5000);
+                        data.last_peer = crate::ath10k::platform::time::Deadline::after_ms(5000);
                         Some(frame)
                     }
                     Rx::ReplyReady => {
@@ -1647,7 +1649,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         data.rx_ba.flush();
                         data.incoming
                             .retain(|incoming| plaintext_eapol(&incoming.frame, addresses));
-                        data.last_peer = narf_time::Deadline::after_ms(5000);
+                        data.last_peer = crate::ath10k::platform::time::Deadline::after_ms(5000);
                         break;
                     }
                 }
@@ -1655,7 +1657,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 Some(frame.0)
             };
             if let Some(frame) = normalized.and_then(|f| ethernet(&f, own, bssid)) {
-                data.last_peer = narf_time::Deadline::after_ms(5000);
+                data.last_peer = crate::ath10k::platform::time::Deadline::after_ms(5000);
                 if data.received.len() == RECEIVED_FRAMES {
                     return Err(Error::Exhausted);
                 }

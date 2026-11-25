@@ -23,7 +23,7 @@
 
 #![allow(dead_code)]
 
-use narf_bus::MmioRegion;
+use crate::platform::bus::MmioRegion;
 
 use super::regs::*;
 

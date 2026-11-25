@@ -1087,6 +1087,54 @@ pub fn module_pci_enable(owner: u64, token: u64, bits: u16) -> i32 {
     }
 }
 
+// ── PCI command register read/clear (mt76.ko) ───────────────────────────
+
+/// Command bits [`module_pci_command`] may change: memory decode, bus
+/// mastering and the INTx disable. I/O decode, SERR, parity and the rest stay
+/// the kernel's.
+const MODULE_COMMAND_BITS: u16 =
+    crate::pci::cmd::MEM_SPACE | crate::pci::cmd::BUS_MASTER | crate::pci::cmd::INTX_DISABLE;
+
+/// Clear, then set, command bits of a module-owned function and return the
+/// register read back (`clear = set = 0` only reads it). A driver whose
+/// stop/reset sequence must prove bus mastering is off (Linux
+/// `pci_clear_master`, then reading `PCI_COMMAND`) needs both the clear and
+/// the read, which [`module_pci_enable`] lacks. Bits outside
+/// [`MODULE_COMMAND_BITS`] are refused with `-EINVAL`. Reached from
+/// `narf_pci_command`.
+pub fn module_pci_command(owner: u64, token: u64, clear: u16, set: u16) -> Result<u16, i32> {
+    if (clear | set) & !MODULE_COMMAND_BITS != 0 || clear & set != 0 {
+        return Err(-22);
+    }
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        return Err(-19);
+    };
+    if !matches!(ctx.device.addr, BusAddr::Pcie(_)) {
+        return Err(-95);
+    }
+    let result = ctx.cap.invoke(DeviceOp(|| {
+        if clear != 0 {
+            crate::pci::clear_command(&ctx.cap, &ctx.device, clear)?;
+        }
+        if set != 0 {
+            crate::pci::set_command(&ctx.cap, &ctx.device, set)?;
+        }
+        crate::pci::read_command(&ctx.cap, &ctx.device)
+    }));
+    match result {
+        Ok(Ok(command)) => {
+            // Teardown clears the decode and mastering still enabled
+            // through this context; INTx disable is not a grant to undo.
+            const TRACKED: u16 = crate::pci::cmd::MEM_SPACE | crate::pci::cmd::BUS_MASTER;
+            ctx.enabled_bits = (ctx.enabled_bits & !(clear & TRACKED)) | (set & TRACKED);
+            Ok(command)
+        }
+        Ok(Err(_)) => Err(-5),
+        Err(_) => Err(-19),
+    }
+}
+
 /// Map a BAR of a module-owned device and return a 1-based handle (0 = fail).
 /// Reached from `narf_bar_map`.
 pub fn module_bar_map(owner: u64, token: u64, idx: u8) -> u64 {
@@ -1212,6 +1260,97 @@ pub fn module_mmio_wait32(
     })
     .unwrap_or(-19)
 }
+
+// ── rtlwifi (rtl.ko): control-BAR mapping and 8/16-bit MMIO ────────────
+//
+// Additive, for byte- and word-addressed register files (Realtek's SYS /
+// EFUSE / power-sequence registers): a read-modify-write of the enclosing
+// dword would also write back neighbouring write-1-to-clear and trigger
+// bytes. Same owner/token/handle resolution and bounds rules as the 32-bit
+// accessors above.
+
+/// Map a BAR of a module-owned device with Device attributes even when the
+/// BAR is prefetchable (`bar::map_bar_control`, what built-in drivers use
+/// for control registers), and return a 1-based handle shared with
+/// `module_bar_map` (0 = fail). Reached from `narf_bar_map_control`.
+pub fn module_bar_map_control(owner: u64, token: u64, idx: u8) -> u64 {
+    let (device, cap) = {
+        let g = DEVICE_CTXS.lock();
+        match g.iter().find(|c| c.owner == owner && c.token == token) {
+            Some(c) => (c.device, c.cap),
+            None => return 0,
+        }
+    };
+    let region = match cap.invoke(DeviceOp(|| {
+        // SAFETY: the live device cap gates the exclusive cfg-space ownership
+        // required by `map_bar_control`.
+        unsafe { crate::bar::map_bar_control(&device, idx) }
+    })) {
+        Ok(Ok(region)) => region,
+        _ => return 0,
+    };
+    let mut g = DEVICE_CTXS.lock();
+    match g.iter_mut().find(|c| c.owner == owner && c.token == token) {
+        Some(c) => {
+            c.bars.push(region);
+            c.bars.len() as u64
+        }
+        None => 0,
+    }
+}
+
+/// `off..off + width` lies inside the region and `off` is width-aligned.
+fn sized_access_ok(region: &crate::bar::MmioRegion, off: u64, width: u64) -> bool {
+    off % width == 0 && off.checked_add(width).is_some_and(|end| end <= region.len)
+}
+
+/// Read an 8-bit register. Reached from `narf_mmio_read8`. `None` on a bad
+/// token/handle/offset.
+pub fn module_mmio_read8(owner: u64, token: u64, handle: u64, off: u64) -> Option<u8> {
+    with_bar(owner, token, handle, |region| {
+        // SAFETY: offset bounds-checked against the mapped region length.
+        sized_access_ok(region, off, 1).then(|| unsafe { region.read8(off) })
+    })
+    .flatten()
+}
+
+/// Read a naturally aligned 16-bit register. Reached from `narf_mmio_read16`.
+pub fn module_mmio_read16(owner: u64, token: u64, handle: u64, off: u64) -> Option<u16> {
+    with_bar(owner, token, handle, |region| {
+        // SAFETY: aligned, bounds-checked against the mapped region length.
+        sized_access_ok(region, off, 2).then(|| unsafe { region.read16(off) })
+    })
+    .flatten()
+}
+
+/// Write an 8-bit register. Reached from `narf_mmio_write8`. 0 or `-EINVAL`.
+pub fn module_mmio_write8(owner: u64, token: u64, handle: u64, off: u64, val: u8) -> i32 {
+    with_bar(owner, token, handle, |region| {
+        if !sized_access_ok(region, off, 1) {
+            return -22;
+        }
+        // SAFETY: offset bounds-checked against the mapped region length.
+        unsafe { region.write8(off, val) };
+        0
+    })
+    .unwrap_or(-22)
+}
+
+/// Write a naturally aligned 16-bit register. Reached from
+/// `narf_mmio_write16`. 0 or `-EINVAL`.
+pub fn module_mmio_write16(owner: u64, token: u64, handle: u64, off: u64, val: u16) -> i32 {
+    with_bar(owner, token, handle, |region| {
+        if !sized_access_ok(region, off, 2) {
+            return -22;
+        }
+        // SAFETY: aligned, bounds-checked against the mapped region length.
+        unsafe { region.write16(off, val) };
+        0
+    })
+    .unwrap_or(-22)
+}
+
+// ── end rtl.ko block ───────────────────────────────────────────────────
 
 /// Allocate coherent DMA memory in the module's effective domain and return a
 /// 1-based opaque handle (`0` on failure). The module never receives the CPU
@@ -1909,6 +2048,89 @@ pub fn module_pcie_aspm(owner: u64, token: u64, aspmc: u16) -> Result<u16, i32> 
         Err(_) => Err(-19),
     }
 }
+
+// ── ath9k.ko: PCIe link state and a read-only config dword (additive) ──
+//
+// A softMAC driver reads the upstream link's ASPM policy to choose its
+// SerDes workarounds (`ath_pci_aspm_init`) and one device-specific config
+// word (AR9462's L1-entry latency). Both are read-only; there is still no
+// general config-space write. (Its bus-master gating uses the shared
+// `module_pci_command`.)
+
+/// Length of the [`module_pcie_state`] record.
+pub const MODULE_PCIE_STATE_LEN: usize = 20;
+
+/// The function's PCI Express state as a 20-byte little-endian record:
+///
+/// | Offset | Size | Field |
+/// |---|---|---|
+/// | 0 | 4 | Device Capabilities |
+/// | 4 | 2 | Device Control |
+/// | 6 | 2 | Device Status |
+/// | 8 | 4 | Link Capabilities |
+/// | 12 | 2 | Link Status |
+/// | 14 | 2 | upstream bridge's Link Control (0 when absent) |
+/// | 16 | 1 | flags: bit 0 = the upstream Link Control is present |
+/// | 17 | 3 | reserved, zero |
+///
+/// Read only. `-EOPNOTSUPP` for a function without a PCI Express capability.
+pub fn module_pcie_state(owner: u64, token: u64) -> Result<[u8; MODULE_PCIE_STATE_LEN], i32> {
+    let (cap, device) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return Err(-19);
+        };
+        (ctx.cap, ctx.device)
+    };
+    let read = cap.derive::<narf_capabilities::Read>().map_err(|_| -19)?;
+    let status = match cap.invoke(DeviceOp(|| crate::pci_express::read_status(&read, &device))) {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => return Err(-95),
+        Err(_) => return Err(-19),
+    };
+    let parent = crate::pci_express::parent_link_control(&read, &device).map_err(|_| -19)?;
+    let mut out = [0u8; MODULE_PCIE_STATE_LEN];
+    out[0..4].copy_from_slice(&status.device_caps.to_le_bytes());
+    out[4..6].copy_from_slice(&status.device_control.to_le_bytes());
+    out[6..8].copy_from_slice(&status.device_status.to_le_bytes());
+    out[8..12].copy_from_slice(&status.link_caps.to_le_bytes());
+    out[12..14].copy_from_slice(&status.link_status.to_le_bytes());
+    if let Some(control) = parent {
+        out[14..16].copy_from_slice(&control.to_le_bytes());
+        out[16] = 1;
+    }
+    Ok(out)
+}
+/// First config offset [`module_pci_config_read32`] reads: the
+/// device-dependent region and PCI Express extended space only. The
+/// standard header is the bus's (identity, BARs, Command).
+pub const MODULE_PCI_CONFIG_READ_FIRST: u16 = 0x40;
+
+/// Read one aligned config dword at `offset` (0x40 ..= 0xffc) of a
+/// module-owned function. Read only: there is still no general config-space
+/// write. ath9k reads AR9462's L1-entry-latency word at `0x70c`
+/// (`ath_pci_aspm_init`). `-EINVAL` for a header, unaligned or out-of-range
+/// offset; `-EIO` when the function's config window does not reach it.
+pub fn module_pci_config_read32(owner: u64, token: u64, offset: u16) -> Result<u32, i32> {
+    if !(MODULE_PCI_CONFIG_READ_FIRST..=0xffc).contains(&offset) || offset % 4 != 0 {
+        return Err(-22);
+    }
+    let (cap, device) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return Err(-19);
+        };
+        (ctx.cap, ctx.device)
+    };
+    match cap.invoke(DeviceOp(|| {
+        crate::pci::read_config32(&cap, &device, offset)
+    })) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(-5),
+        Err(_) => Err(-19),
+    }
+}
+// ── end ath9k.ko block ─────────────────────────────────────────────────
 
 /// A coherent DMA buffer whose CPU mapping the module may dereference.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2615,3 +2837,134 @@ fn smoke_module_dma_quarantine_survives_context_teardown() -> narf_kernel_test::
     narf_kernel_test::TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!("bus", smoke_module_dma_quarantine_survives_context_teardown);
+
+// ── Device-specific PCI configuration window (FullMAC PCIe drivers) ──────
+//
+// brcmfmac selects its BAR0 backplane window, rings the SBMBX doorbell and
+// parks/enables decode through PCI configuration space (Linux
+// `brcmf_pcie_select_core`, `brcmf_pcie_send_mb_data`, `brcmf_pcie_probe`).
+// These entries give a module exactly that: dword access to the
+// device-specific region 0x40..0x100, never the standard header (BARs, the
+// capability pointer), and never a write into the structures the kernel owns
+// there — the PM, MSI, MSI-X and PCI Express capabilities and every
+// capability header (the list links). Vendor-specific capability bodies,
+// where Broadcom's window registers live, stay writable. The Command
+// register is reachable only for decode, bus mastering and INTx disable.
+// Reached from `narf_pci_config_write32` /
+// `narf_pci_command`.
+
+/// First and one-past-last offsets of the module configuration window.
+const MODULE_CFG_START: u16 = 0x40;
+const MODULE_CFG_END: u16 = 0x100;
+
+fn module_cfg_ctx(owner: u64, token: u64) -> Result<(Cap<BusDeviceCap, Write>, BusDevice), i32> {
+    let g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+        return Err(-19);
+    };
+    if !matches!(ctx.device.addr, BusAddr::Pcie(_)) {
+        return Err(-95);
+    }
+    Ok((ctx.cap, ctx.device))
+}
+
+/// Whether a dword write at `offset` stays clear of every kernel-owned
+/// capability structure (see the block comment). Walks the standard
+/// capability list through the cap-gated config accessors; called inside
+/// the device invocation.
+fn module_cfg_write_allowed(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+    offset: u16,
+) -> Result<bool, crate::pci::PciError> {
+    let status = crate::pci::read_config32(cap, device, 0x04)? >> 16;
+    if status == 0xFFFF {
+        return Err(crate::pci::PciError::NotReady);
+    }
+    if status & (1 << 4) == 0 {
+        return Ok(true);
+    }
+    let mut next = (crate::pci::read_config32(cap, device, 0x34)? & 0xFC) as u16;
+    let (lo, hi) = (offset, offset + 4);
+    for _ in 0..48 {
+        if next < MODULE_CFG_START {
+            break;
+        }
+        let header = crate::pci::read_config32(cap, device, next)?;
+        if header == u32::MAX {
+            return Err(crate::pci::PciError::NotReady);
+        }
+        let id = header as u8;
+        let control = (header >> 16) as u16;
+        let len: u16 = match id {
+            crate::pci_cap::id::POWER_MGMT => 8,
+            crate::pci_cap::id::MSI => match (control & (1 << 7) != 0, control & (1 << 8) != 0) {
+                (false, false) => 12,
+                (true, false) => 16,
+                (false, true) => 20,
+                (true, true) => 24,
+            },
+            crate::pci_cap::id::MSI_X => 12,
+            crate::pci_cap::id::PCI_EXPRESS => 0x3C,
+            // Every other capability: its header dword (id, next, and the
+            // vendor-specific length byte) stays the kernel's.
+            _ => 4,
+        };
+        if lo < next + len && next < hi {
+            return Ok(false);
+        }
+        next = ((header >> 8) & 0xFC) as u16;
+    }
+    Ok(true)
+}
+
+fn module_cfg_offset_ok(offset: u16) -> bool {
+    offset % 4 == 0 && (MODULE_CFG_START..MODULE_CFG_END).contains(&offset)
+}
+
+/// Write config dword `offset` of a module-owned PCI function: inside
+/// 0x40..0x100, dword-aligned, and outside every kernel-owned capability
+/// structure (`-EPERM` otherwise).
+pub fn module_pci_config_write32(
+    owner: u64,
+    token: u64,
+    offset: u16,
+    value: u32,
+) -> Result<(), i32> {
+    if !module_cfg_offset_ok(offset) {
+        return Err(-22);
+    }
+    let (cap, device) = module_cfg_ctx(owner, token)?;
+    match cap.invoke(DeviceOp(|| {
+        if !module_cfg_write_allowed(&cap, &device, offset)? {
+            return Ok(false);
+        }
+        crate::pci::write_config32(&cap, &device, offset, value).map(|()| true)
+    })) {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err(-1),
+        _ => Err(-5),
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+fn smoke_module_pci_cfg_window_validates() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const UNKNOWN: u64 = (0x57u64 << 56) | 0xFEFF;
+    // Offsets outside the window or unaligned, and bits outside the allowed
+    // Command set, are refused before the context lookup; an unknown token
+    // after it.
+    if module_pci_config_write32(1, UNKNOWN, 0x10, 0) != Err(-22)
+        || module_pci_config_write32(1, UNKNOWN, 0x100, 0) != Err(-22)
+        || module_pci_config_write32(1, UNKNOWN, 0x82, 0) != Err(-22)
+        || module_pci_config_write32(1, UNKNOWN, 0x80, 0) != Err(-19)
+        || module_pci_command(1, UNKNOWN, 0x0001, 0) != Err(-22)
+        || module_pci_command(1, UNKNOWN, 0x0004, 0x0004) != Err(-22)
+        || module_pci_command(1, UNKNOWN, 0, 0x0004) != Err(-19)
+    {
+        return TestResult::Fail("module PCI config window accepted a bad offset, bit or token");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("bus", smoke_module_pci_cfg_window_validates);

@@ -3,10 +3,10 @@
 //! authorizes these on-air effects. NASR includes its own measured worst-case
 //! station/coexistence power curves, not a reinterpretation of old NAPC rows.
 use super::{envelope, irq, supervision::Binding, txpower};
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::FirmwareBlob;
 use crate::rtlwifi::{channel_power::Error as PowerError, prepare::Error};
 use alloc::{format, string::String, sync::Arc};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::FirmwareBlob;
 use narf_wireless::reg::RegulatoryDomain;
 const HEADER: usize = 256;
 const LENGTH: usize = HEADER + 3 * 64 * 2;
@@ -167,14 +167,16 @@ impl Program {
         })
     }
     pub(super) fn registered(prepared: Arc<Binding>) -> Result<Arc<Self>, Error> {
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or(failure(PowerError::Authority))?;
         for profile in [Profile::Ht20Aspm, Profile::Ht20, Profile::Legacy20] {
             let request = Self::request_for(&prepared, profile)?;
             let source = match crate::firmware_asset::load(&loader, &request.name, LENGTH, true) {
                 Ok(source) => source,
-                Err(narf_firmware::FirmwareError::NotFound) if profile != Profile::Legacy20 => {
+                Err(crate::platform::firmware::FirmwareError::NotFound)
+                    if profile != Profile::Legacy20 =>
+                {
                     continue
                 }
                 Err(error) => return Err(failure(PowerError::Firmware(error))),

@@ -914,6 +914,264 @@ WCN6855, so bring-up through the module (MHI, FW_READY, scan, association)
 is first proven on the Lenovo 21ME (`docs/BOOTING_ON_CACHYOS.md`); that boot
 has not yet run.
 
+## Loadable mt76 (MT7921/MT7922)
+
+The mt76 driver now builds from one source either built in or as `mt76.ko`.
+Until now the `.ko` was a thin frontend over the private mt76 copy-mode host,
+which kept MCU/WFDMA execution in the kernel. The module now runs the PCI
+station path itself over the KABI:
+
+- PCI binding, WFDMA rings, MCU and patch/RAM firmware download;
+- NIC/EFUSE/MAC initialization;
+- the station join with its in-driver WPA2/WPA3 supplicant, and the packet
+  path;
+- one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
+  family host.
+
+It claims the built-in table (`14c3:{7961,7922,0608,0616,7920,7925,0717}`,
+`0e8d:7922`); as built in, the chip-id gate still refuses MT7925 silicon.
+`narf-drivers-wireless/mt76-module-only`
+steps the built-in PCI claim aside. The shared `narf_pci_command` export lets
+the stop/reset sequences clear and re-read bus mastering, and
+`narf_wireless_regdomain` gives the module the kernel's installed regulatory
+domain, the one the built-in driver uses. With no installed domain the module
+fails closed (no transmission, no join), exactly as built in; it has no
+regulatory fallback of its own. The private mt76 family host stays
+registered; no in-tree `.ko` uses it now.
+
+`modules/e2e/mt76` loads the real `.ko` and checks relocations and init, the
+`debug` parameter, the exact PCI claim, refusal of a probe with no device
+context, and clean unload. The test is written; it has not been run yet.
+
+Not in the module build: AP/P2P/monitor, WoW and system PM, scheduled scan,
+roaming, CQM/survey/station statistics, power-save control and the userspace
+SME. QEMU has no MediaTek Wi-Fi, so firmware download, scan and association
+through the module are unverified until a hardware boot.
+
+## Loadable ath10k (QCA988X–QCA9377)
+
+The ath10k driver now builds from one source either built in or as
+`ath10k.ko`, following ath11k. The module runs the whole PCIe station path
+over the KABI:
+
+- reset, BMI, firmware/board/OTP/calibration download, CE, HTC, WMI, HTT;
+- the retained station radio with its in-driver WPA2-PSK/WPA3-SAE
+  supplicant;
+- one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
+  family host.
+
+It claims the nine ath10k PCIe ids the built-in binds (not AR9462).
+`narf-drivers-wireless/ath10k-module-only` steps the built-in claim aside.
+The transport uses only the shared KABI: `narf_pci_command` turns bus
+mastering off and reads it back, `narf_pcie_state` supplies the DMA
+reclamation proof, and `narf_wireless_regdomain` the kernel's regulatory
+domain. The module links on
+x86_64 and aarch64, and every undefined symbol is a KABI export.
+
+`modules/e2e/ath10k` loads the real `.ko` and checks relocations and init,
+the exact PCI claim, refusal of a probe with no device context and clean
+unload (written; not yet run in the combined suite).
+
+The built-in automatic recovery runs in the module too: a firmware crash
+retires the generation and boots a fresh one (at most three per load), and
+the same `wlan%d` rebinds and replays the retained association.
+
+Not in the module build: AP/P2P/ROC, WoW and system PM, power-save control,
+the userspace SME and DT/NVMEM calibration. QEMU has no Atheros Wi-Fi, so bring-up, scan and
+association through the module are unverified.
+
+## Loadable ath9k
+
+The ath9k driver now builds from one source either built in or as
+`ath9k.ko`. The module runs every chip owner's whole station path over the
+KABI:
+
+- AR5008, AR9280, AR9285/AR2427, AR9287 and the AR9300 family;
+- identity and EEPROM, signed board admission, INI/PLL/RF and
+  signed-policy calibration;
+- the MAC, packet DMA and rate control;
+- the qualification grants, MCI coexistence and the in-driver WPA2
+  supplicant;
+- one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
+  family host;
+- device removal on unload (`narf_module_exit` runs the owner's own
+  `remove` and its DMA-stop proof).
+
+ath9k is softMAC: it enforces the host regulatory domain and gates its own
+bus mastering. It uses the shared KABI exports `narf_pci_command` (mt76),
+`narf_wireless_regdomain` (rtw88: an NRGD record of the host domain), and
+`narf_pcie_state` and `narf_pci_config_read32` (read-only), which were
+added for ath9k.
+
+It claims the built-in driver's fifteen `168c:*` ids.
+`narf-drivers-wireless/ath9k-module-only` leaves the built-in driver
+unregistered. The module builds for x86_64 and aarch64, and every
+undefined symbol is a KABI export.
+
+`modules/e2e/ath9k` loads the real `.ko` and checks:
+
+- relocations and init;
+- the exact PCI claim;
+- refusal of a probe with no device context;
+- clean unload.
+
+`smoke_kabi_softmac_exports` covers the softMAC exports. Both tests are
+written but have not yet run in the combined suite.
+
+Not in the module build:
+
+- system suspend/resume (there is no module device-PM export);
+- WoW, nl80211 power-save control and the userspace SME (`WIFI` v2 carries
+  none of them);
+- hot removal while loaded.
+
+QEMU has no Atheros Wi-Fi, so bring-up, calibration, scan and association
+through the module are unverified until a hardware run.
+
+## Loadable brcmfmac (Broadcom FullMAC PCIe)
+
+The brcmfmac PCIe driver now builds from one source either built in or as
+the `brcm` `.ko`. The module runs the driver's own code over the KABI:
+
+- AI core discovery through the BAR0 config window, CR4/CA7 firmware
+  download into BAR2 TCM, the msgbuf common and flow rings, one MSI vector;
+- signed NBSP board selection and asset checks, and the signed regulatory
+  policy;
+- the shared FullMAC station (firmware SME and supplicant: open, WPA2-PSK
+  from the PMK, WPA3-SAE where firmware offers it), with one `wlan%d`
+  netdev and wiphy through the netif bridge and the `WIFI` v2 host;
+- firmware reset recovery on the same netdev, with a rejoin.
+
+It claims the 26 FullMAC PCIe ids of the built-in table under its own match
+name. `narf-drivers-wireless/brcmfmac-module-only` steps the built-in PCI
+claim aside; CYW43439 (SDIO/gSPI) stays built in. The config window uses the
+shared `narf_pci_config_write32`, `narf_pci_config_read32` and
+`narf_pci_command` exports. The module links on x86_64 and aarch64, and every
+undefined symbol is a KABI export.
+
+`modules/e2e/brcmfmac` loads the real `.ko` and checks relocations and init,
+the declared `brcm.*` parameters, the exact PCI claim, refusal of a probe
+with no device context and clean unload (written; not yet run).
+
+Not in the module build: AP/monitor/P2P and virtual interfaces, WoWL and
+system PM, power-save control, firmware roaming, the host supplicant and
+PMKSA entries (the v2 host carries none of these), explicit kernel board
+registrations, and the Linux-database world-domain fallback (the module
+needs a signed `wireless-regulatory.bin`). QEMU has no Broadcom Wi-Fi, so
+bring-up, firmware boot, scan and association through the module are
+unverified until run on hardware.
+
+## Loadable rtw88 (RTL8821CU / RTL8822BU)
+
+The rtw88 driver now builds from one source either built in or as
+`rtw88.ko` (`narf-drivers-wireless-rtw --features module`). For the USB
+parts the module runs the driver's own code over the KABI: the
+`usb_firmware` backend, the factory read, firmware, MAC, PHY, calibration
+and station stages, the `interface::Device` station shell and its in-driver
+Open / WPA2-PSK SME. Kernel services come from `src/rtw88/platform/`, which
+supplies the kernel crates' names over `narf-module-rt`; PCI types are
+uninhabited there. The hand-written `module_usb.rs` reimplementation is
+retired.
+
+New KABI exports serve USB Wi-Fi modules: `narf_usb_spawn_poller`,
+`narf_usb_netif_register_with_context`, `narf_usb_netif_rx` and
+`narf_wireless_regdomain`. `narf-drivers-wireless/rtw88-module-only` steps
+the built-in USB claim aside. `modules/e2e/rtw88` loads the real `.ko` and
+checks relocations and init, the `rtw.*` parameters, the USB and PCI
+claims, refusal of a probe with no USB context and clean unload (written,
+not yet run).
+
+There is no nl80211 wiphy for a USB function's module: the `WIFI` family
+host binds to bus device contexts only. The station joins from
+`rtw.ssid=` / `rtw.psk=` / `rtw.passphrase=`. Not in the module build: rtw88
+PCIe and rtw89 (registration-only ids), USB reset/rejoin/IPS/system PM,
+halt recovery and WoW. QEMU has no Realtek USB Wi-Fi device; bring-up
+through the module is unproven on hardware.
+
+## Loadable rtl (rtlwifi PCIe + rtl8xxxu USB)
+
+`rtl.ko` was registration-only: its probe returned `-ENOSYS`. Now both
+legacy Realtek drivers build from one source, either built in or as
+`rtl.ko`, and the module runs them over the KABI (spec §4.9).
+
+- **rtlwifi (PCIe), all ten ids.** The whole driver runs in the module:
+  - identification and admissibility;
+  - the authenticated firmware owner;
+  - native preparation: LLT, rings, RF/BB/MAC calibration;
+  - BT coexistence, thermal tracking and runtime power save;
+  - the station with its in-driver WPA2-PSK supplicant.
+
+  It publishes `wlan%d` and a wiphy through the netif bridge and the
+  `WIFI` v2 host, so nl80211 scan, connect and disconnect reach the
+  driver's own station.
+- **rtl8xxxu (USB), all 23 ids.** The family chain runs unchanged:
+  firmware, calibration, admission and station for RTL8188EU, RTL8192EU
+  and RTL8723BU. The USB station gets a netdev but no wiphy, because the
+  `WIFI` host is bound to a PCI device capability. Its SME is driven by
+  `rtl.ssid=` / `rtl.psk=` / `rtl.passphrase=`, as in `rtw88.ko`.
+- **KABI.** Added: `narf_bar_map_control` and the 8/16-bit `narf_mmio_*`
+  accessors. Also used from other branches: `narf_pci_command`,
+  `narf_wireless_regdomain`, and the `narf_usb_*` poller and netif.
+- **Module-only build.** `narf-drivers-wireless/rtl-module-only` leaves
+  the built-in tables to the module.
+- **Build.** The `.ko` links for x86_64 and aarch64, and every undefined
+  symbol is a KABI export.
+- **e2e.** `modules/e2e/rtl` checks:
+  - load to Live;
+  - the exact PCI claim, not rtw88's `b822`;
+  - with a USB stack, the exact USB claim;
+  - refusal of a probe with no device context;
+  - clean unload.
+
+  The test is written but has not been run.
+
+Not in the module:
+
+- system suspend and WoWLAN;
+- ASPM enable;
+- removal's DMA-quiescence proof (DMA is retained);
+- the userspace SME;
+- on USB, nl80211 control and endpoint-halt recovery.
+
+`rtl.ko` registers 23 USB matches, which fit beside `rtw88.ko`'s 50 in the
+128-entry module USB match table. QEMU has no Realtek Wi-Fi device, and no
+hardware boot of `rtl.ko` has run.
+
+## Loadable iwlwifi (all generations)
+
+The iwlwifi driver now builds from one source either built in or as
+`iwlwifi.ko`, and the module runs the driver's own code over the KABI for
+every id of the built-in table:
+
+- Gen3 (AX210, AX211, BE200/BE20x, BE21x): the PCIe transport (boot DMA,
+  MSI-X, context info/IML, ALIVE, PNVM), the MLD configuration and NVM, and
+  the `Connection` station: scan (active at the regulatory ceiling, else
+  passive), association with the in-driver WPA2-PSK/WPA3-SAE supplicant and
+  802.11w, rekeying, BA, the data path, link loss and disconnect;
+- Gen2 (AX200, AX201): the same transport's 22000 path and the API77 MVM
+  owner with its native four-way / host SAE station, signed per-platform
+  TX-power programs, BA pipeline and A-MSDU TX;
+- one `wlan%d` netdev and wiphy per radio through the netif bridge and the
+  `WIFI` v2 host.
+
+It claims all 28 ids; `narf-drivers-wireless/iwlwifi-module-only` steps the
+built-in claim aside for them. The stations read the kernel's regulatory
+domain through the shared `narf_wireless_regdomain` export; the transport
+parks, stops and verifies bus mastering through `narf_pci_command`; signed
+firmware assets carry their verified signer through the new additive
+`narf_firmware_signer` export. The module links on x86_64 and aarch64 and
+every undefined symbol is a KABI export.
+
+`modules/e2e/iwlwifi` loads the real `.ko` and checks relocations and init,
+the exact 28-id claim, refusal of a probe with no device context and clean
+unload (written; not yet run in the combined pass).
+
+Not in the module build: AP/P2P/monitor, scheduled scan, MLO further links,
+roaming, WoWLAN/D3 and system PM, CQM events, checksum offload, and BIOS
+SAR/PPAG (no KABI for the device's ACPI objects). QEMU has no Intel Wi-Fi
+device: firmware boot, scan and association through the module are
+unverified until run on hardware.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

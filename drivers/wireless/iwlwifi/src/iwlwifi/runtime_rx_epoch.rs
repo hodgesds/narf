@@ -160,17 +160,22 @@ impl Hardware {
         // Ordinary Qu station/BAID retirement retains its original MVM
         // receiver. Only the complete selected API77 AP consumer with its
         // original current START role uses this common EMPTY/sync1 path.
+        #[cfg(feature = "builtin")]
         let legacy_ap = baid.is_none()
             && self.ap_legacy_selected()
             && self
                 .ap_owner
                 .as_ref()
                 .is_some_and(|owner| owner.check().is_ok());
+        // The module build carries no AP or P2P client owner.
+        #[cfg(feature = "module")]
+        let (legacy_ap, legacy_client) = (false, false);
         // A retained, closing SESSION1 lease may retire its own physical
         // prefix after the emitting source dies. This complete adapter's
         // actual original DMA/session owner is separate from ordinary Qu
         // station/BAID service, which keeps its original refusal below.
         let legacy_p2p = baid.is_none() && self.p2p_gen2_prefix();
+        #[cfg(feature = "builtin")]
         let legacy_client = baid.is_none()
             && self.ap_legacy_selected()
             && self

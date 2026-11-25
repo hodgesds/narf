@@ -57,6 +57,8 @@ use super::{
         ar9287::{power, Prepared},
     },
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_bus, narf_capabilities, narf_firmware};
 #[cfg(feature = "kernel-test")]
 use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};

@@ -8,10 +8,10 @@ use super::{
     receive_runtime::Error,
     wmm_runtime::Proof,
 };
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::{FirmwareBlob, FirmwareError};
 use alloc::{format, string::String, sync::Arc};
 use core::future::Future;
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
 use narf_wireless::association::phy::{LocalHt, LocalPhy};
 
 #[path = "ht40_geometry.rs"]
@@ -90,7 +90,7 @@ impl Grant {
         executable: Executable,
         maximum: u8,
     ) -> Result<Option<Arc<Self>>, Error> {
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or(Error::Policy)?;
         let source = match crate::firmware_asset::load(

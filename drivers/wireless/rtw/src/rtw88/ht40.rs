@@ -64,6 +64,9 @@ use super::{
     power_policy::Gate,
     qualification::{Kind, PAYLOAD},
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use narf_wireless::reg::RegulatoryDomain;
 
 pub(super) static KIND: Kind = Kind {

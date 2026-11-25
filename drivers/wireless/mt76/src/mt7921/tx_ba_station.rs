@@ -89,7 +89,7 @@ impl<B: Backend> Session<B> {
                     self.station.tx_ba.get_mut(tid)?.abandon();
                     break;
                 }
-                narf_scheduler::yield_now().await;
+                crate::platform::yield_now().await;
             }
             if !self.station.tx_ba.get(tid)?.offered() {
                 self.retire_transmit_ba_tid(tid, true).await?;

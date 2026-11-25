@@ -2,10 +2,10 @@
 //! Source-bound Action subscriptions and retained native WMI copies. Metadata
 //! registration grants no RF owner; only current FOREIGN_CHANNEL opens copies.
 use super::*;
+use crate::ath10k::platform::ap_control::{PreparedRadioManagementEvent, RadioReceiveFence};
+use crate::ath10k::platform::IrqSafeSpinLock;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_wireless::ap_control::{PreparedRadioManagementEvent, RadioReceiveFence};
 
 #[derive(Clone, Debug)]
 struct Filter {
@@ -139,7 +139,7 @@ impl Subscriptions {
 struct CapturePolicy {
     plan: active_scan::Plan,
     caps: wmi_boot::Capabilities,
-    deadline: narf_time::Deadline,
+    deadline: crate::ath10k::platform::time::Deadline,
 }
 #[derive(Debug)]
 pub(in crate::ath10k) struct Captured {
@@ -153,7 +153,7 @@ pub(in crate::ath10k) struct Captured {
     io: Option<crate::ath10k::firmware_source::Source>,
 }
 impl Captured {
-    pub(in crate::ath10k) fn prepare<I: narf_wireless::WirelessNetIface + ?Sized>(
+    pub(in crate::ath10k) fn prepare<I: crate::ath10k::platform::WirelessNetIface + ?Sized>(
         &self,
         iface: &I,
     ) -> Result<PreparedRadioManagementEvent, Error> {
@@ -256,7 +256,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<RetiredSubscriptions, Error> {
         let subscriptions = self.management_subscriptions.clone().ok_or(Error::Failed)?;
         self.close_roc_capture()?;
-        let deadline = narf_time::Deadline::after_ms(1500);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
         let mut idle = false;
         for _ in 0..4096 {
             validate()?;
@@ -278,7 +278,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if !matches!(event, htt::Event::Progress | htt::Event::Tx(_)) {
                 self.queue(event)?;
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !idle {
             return Err(Error::Exhausted);

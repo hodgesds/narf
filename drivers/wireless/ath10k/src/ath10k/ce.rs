@@ -52,7 +52,7 @@ use super::hw::*;
 // the CE setup code is unit-testable against a mock.
 
 /// 32-bit MMIO surface against the ath10k BAR0. Real impl wraps
-/// `narf_bus::MmioRegion`; tests use the in-memory mock.
+/// `crate::ath10k::platform::pci::MmioRegion`; tests use the in-memory mock.
 pub trait Ath10kMmio {
     /// Current authority before descriptor/bounce publication. Pure models
     /// have no revocation source; the physical owner checks its real cap.
@@ -260,7 +260,7 @@ pub fn halt_pipe<M: Ath10kMmio>(mmio: &mut M, hw_rev: HwRev, pipe: u8) -> Result
     // a few cycles in practice. Cap at 1000 reads so a faulty mock
     // doesn't wedge a test.
     let mut gone = false;
-    let halted = narf_scheduler::responsive_spin_until(
+    let halted = crate::ath10k::platform::responsive_spin_until(
         || {
             let v = mmio.read32(base + CE_CMD_HALT_STATUS_OFFSET);
             if v == 0xFFFF_FFFF {
@@ -269,7 +269,7 @@ pub fn halt_pipe<M: Ath10kMmio>(mmio: &mut M, hw_rev: HwRev, pipe: u8) -> Result
             }
             v & CE_CMD_HALT_STATUS_HALTED != 0
         },
-        narf_time::Deadline::after_ms(10),
+        crate::ath10k::platform::time::Deadline::after_ms(10),
     );
     if halted && !gone {
         Ok(())

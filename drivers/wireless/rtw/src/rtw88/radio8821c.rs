@@ -9,6 +9,9 @@ use super::{
     firmware_transport::{Error, Io},
     mac, phy8821c,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::boxed::Box;
 use narf_drivers_wireless_rtl_chip::radio::c21;
 

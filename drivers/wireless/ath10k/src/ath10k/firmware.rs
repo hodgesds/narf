@@ -46,13 +46,15 @@ pub trait Files {
 }
 
 pub(super) async fn staging_pause() {
-    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
+    crate::ath10k::platform::time::sleep_ns(500_000_000).await;
 }
 
+#[cfg(feature = "builtin")]
 pub(super) struct RegistryFiles {
     authority: narf_capabilities::Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     source: super::firmware_source::Source,
 }
+#[cfg(feature = "builtin")]
 impl RegistryFiles {
     #[cfg(feature = "kernel-test")]
     pub(super) fn with_authority(
@@ -92,6 +94,7 @@ impl RegistryFiles {
         }
     }
 }
+#[cfg(feature = "builtin")]
 impl Files for RegistryFiles {
     fn load(&mut self, name: &str) -> Result<Vec<u8>, Error> {
         self.source
@@ -113,6 +116,66 @@ impl Files for RegistryFiles {
                 narf_firmware::FirmwareError::OutOfMemory => Error::NoMemory,
                 _ => Error::Authority,
             })
+    }
+    async fn wait_missing(&mut self) -> Result<(), Error> {
+        self.source
+            .invoke_boot(|| ())
+            .map_err(|_| Error::Authority)?;
+        staging_pause().await;
+        self.source
+            .invoke_boot(|| ())
+            .map_err(|_| Error::Authority)?;
+        Ok(())
+    }
+}
+
+/// The module build's registry files: copies through the firmware KABI
+/// (`narf_firmware_open`/`_read`, `_signed` for board inputs), under the
+/// module's `Firmware` manifest cap. Same names, same signer policy, same
+/// staging wait as built in; the record is `firmware_source_module.rs`.
+#[cfg(feature = "module")]
+pub(super) struct RegistryFiles {
+    source: super::firmware_source::Source,
+}
+#[cfg(feature = "module")]
+impl RegistryFiles {
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self {
+            source: super::firmware_source::Source::new(),
+        })
+    }
+    pub fn source(&self) -> super::firmware_source::Source {
+        self.source.clone()
+    }
+    pub fn seal(&self) -> Result<(), Error> {
+        self.source.seal().map_err(|_| Error::Authority)
+    }
+    /// The module's manifest cap is its authority: nothing to wait for.
+    pub async fn wait_authority() -> Result<Self, Error> {
+        Self::new()
+    }
+}
+#[cfg(feature = "module")]
+impl Files for RegistryFiles {
+    fn load(&mut self, name: &str) -> Result<Vec<u8>, Error> {
+        use crate::ath10k::platform::firmware::{load, FwError};
+        self.source
+            .invoke_boot(|| ())
+            .map_err(|_| Error::Authority)?;
+        let board = calibration::signed_input(name);
+        let bytes = load(name, 16 * 1024 * 1024, board).map_err(|error| match error {
+            FwError::NotFound => Error::Missing,
+            FwError::NoMemory => Error::NoMemory,
+            FwError::Invalid => Error::Authority,
+        })?;
+        let image = name
+            .rsplit('/')
+            .next()
+            .is_some_and(|n| n.starts_with("firmware-") && n.ends_with(".bin"));
+        self.source
+            .retain(name, image, board)
+            .map_err(|_| Error::Authority)?;
+        Ok(bytes)
     }
     async fn wait_missing(&mut self) -> Result<(), Error> {
         self.source

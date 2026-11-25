@@ -1660,6 +1660,350 @@ kernel_abi! {
         let side = crate::module_block::Endpoint::Module(dst as usize);
         crate::module_block::copy(owner, dev, request, side, req_off..end, false)
     }
+
+    // ── PCI command register read/clear (mt76.ko) ──────────────────────────
+
+    /// Clear, then set, PCI command bits on the module's device and write the
+    /// register read back through `out_cmd` (`clear = set = 0` only reads
+    /// it). Only memory decode, bus mastering and INTx disable may change
+    /// (`-EINVAL` otherwise). For stop/reset sequences that must prove bus
+    /// mastering off (Linux `pci_clear_master`). Returns 0, `-ENODEV` or
+    /// `-EIO`.
+    ///
+    /// # Safety
+    /// `out_cmd` must point to writable `u16` storage.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pci_command(dev: u64, clear: u16, set: u16, out_cmd: *mut u16) -> i32 {
+        if out_cmd.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pci_command(owner, dev, clear, set) {
+            Ok(command) => {
+                // SAFETY: non-null; the module promises writable storage.
+                unsafe { out_cmd.write(command) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    // ── USB Wi-Fi modules: device heartbeat and regulatory domain ────────
+    //
+    // Additive exports whose first consumer is rtw88.ko (RTL8821CU /
+    // RTL8822BU over the USB KABI). See `modules/DATAPATH_ABI_DESIGN.md`,
+    // "USB device poller and the regulatory domain".
+
+    /// Spawn one 1 ms periodic task-context callback for the USB function
+    /// behind `dev` (the token a USB probe received): the USB counterpart of
+    /// [`narf_spawn_poller`], which serves PCI/MMIO device contexts only. The
+    /// first run is immediate. The poller stops when `callback` returns
+    /// non-zero, when the USB context goes away (detach, declined probe,
+    /// unload), or when a later call for the same device replaces it.
+    /// `-ENODEV` without a live USB context of this module for `dev`.
+    ///
+    /// # Safety
+    /// `callback` has the same lifetime/signature contract as
+    /// [`narf_irq_set_handler`].
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_spawn_poller(dev: u64, callback: usize, cookie: u64) -> i32 {
+        if callback == 0 {
+            return -22;
+        }
+        // SAFETY: same callback contract as `narf_irq_set_handler`.
+        let callback: narf_bus::ModuleCallbackFn = unsafe { core::mem::transmute(callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        crate::usb_wifi::spawn_poller(owner, dev, callback, cookie)
+    }
+
+    /// Register one copy-mode Wi-Fi station interface (`wlan%d`) for the USB
+    /// function behind `dev`: the USB counterpart of
+    /// [`narf_netif_register_with_context`], which serves PCI/MMIO device
+    /// contexts only. `tx_callback` is an `extern "C" fn(dev_token, frame,
+    /// len) -> i32` the stack calls (module gate, task context) with one
+    /// borrowed Ethernet frame. The interface is withdrawn when the USB
+    /// context goes away (detach, declined probe, unload). Stores the
+    /// ifindex through `out_ifindex`. `-ENODEV` without a live USB context
+    /// of this module for `dev`; `-EBUSY` if it already has one.
+    ///
+    /// # Safety
+    /// `mac` names six readable bytes; `out_ifindex` names writable `u32`
+    /// storage; `tx_callback` stays mapped until unload.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_usb_netif_register_with_context(
+        dev: u64,
+        mac: *const u8,
+        tx_callback: usize,
+        out_ifindex: *mut u32,
+    ) -> i32 {
+        if mac.is_null() || tx_callback == 0 || out_ifindex.is_null() {
+            return -22;
+        }
+        let mut mac_bytes = [0u8; 6];
+        // SAFETY: the module promises six readable bytes.
+        mac_bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(mac, 6) });
+        // SAFETY: the callback address has the documented C signature and the
+        // interface is withdrawn before module text is unmapped.
+        let tx_callback: narf_bus::ModuleTxCtxFn = unsafe { core::mem::transmute(tx_callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        match crate::usb_wifi::netif_register(owner, dev, mac_bytes, tx_callback) {
+            Ok(ifindex) => {
+                // SAFETY: non-null above; caller promises writable storage.
+                unsafe { out_ifindex.write(ifindex) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Deliver one received Ethernet frame (`len` bytes at `frame`, copied
+    /// before return) to the stack on the interface
+    /// [`narf_usb_netif_register_with_context`] registered for `dev`.
+    ///
+    /// # Safety
+    /// `frame` names `len` readable and writable bytes.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_usb_netif_rx(dev: u64, ifindex: u32, frame: *mut u8, len: usize) -> i32 {
+        if frame.is_null() || len == 0 || len > 65_535 {
+            return -22;
+        }
+        // SAFETY: the module promises `len` bytes for the duration of the call.
+        let frame = unsafe { core::slice::from_raw_parts_mut(frame, len) };
+        let owner = crate::symbols::current_execution_id().0;
+        crate::usb_wifi::netif_rx(owner, dev, ifindex, frame)
+    }
+
+    /// Copy the kernel's installed regulatory domain (the one built-in
+    /// drivers read from `narf_wireless::reg::db`) into `buf` as one NRGD v1
+    /// record — `narf_wireless::reg::parse_policy`'s layout, with the world
+    /// domain's country "00" allowed; decode it with
+    /// `narf_wireless::reg::parse_domain_record` — and store its length through
+    /// `out_len`. `-ENOBUFS` (nothing copied, required length stored) when
+    /// `len` is too small, so `len = 0` sizes it; `-ENODATA` when no domain
+    /// is installed and none can be bootstrapped; `-EOVERFLOW` for a domain
+    /// the record cannot carry. Read-only: a module cannot install a domain.
+    ///
+    /// # Safety
+    /// `buf` names `len` writable bytes (null when `len` is 0); `out_len`
+    /// names writable, aligned `usize` storage.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_wireless_regdomain(buf: *mut u8, len: usize, out_len: *mut usize) -> i32 {
+        if out_len.is_null() || (len != 0 && buf.is_null()) {
+            return -22;
+        }
+        let record = match crate::usb_wifi::regdomain_record() {
+            Ok(record) => record,
+            Err(errno) => return errno,
+        };
+        // SAFETY: writable aligned output, per the export contract.
+        unsafe { out_len.write(record.len()) };
+        if len < record.len() {
+            return -105;
+        }
+        // SAFETY: `buf` names at least `record.len()` writable bytes.
+        unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), buf, record.len()) };
+        0
+    }
+
+    // ── ath9k.ko: softMAC PCIe state and config reads ────────────────────
+    //
+    // Additive exports for a softMAC PCIe driver (ath9k is the first
+    // consumer; `modules/DATAPATH_ABI_DESIGN.md`, "softMAC PCI control and
+    // host regulatory policy"). A softMAC chip has no firmware between the
+    // driver and the radio: the driver picks SerDes workarounds from the
+    // upstream link's ASPM policy and enforces the host regulatory domain
+    // itself. (Its bus-master gating uses the shared `narf_pci_command`.)
+
+    /// Fill `out` with the function's 20-byte PCI Express state record
+    /// (Device Capabilities/Control/Status, Link Capabilities/Status and the
+    /// upstream bridge's Link Control; layout in
+    /// `narf_bus::driver_match::module_pcie_state`). `len` must be at least
+    /// 20. Returns 0, `-EINVAL`, `-EOPNOTSUPP` (not PCI Express) or
+    /// `-ENODEV`.
+    ///
+    /// # Safety
+    /// `out` must name `len` writable bytes for the call.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pcie_state(dev: u64, out: *mut u8, len: usize) -> i32 {
+        if out.is_null() || len < narf_bus::driver_match::MODULE_PCIE_STATE_LEN {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pcie_state(owner, dev) {
+            Ok(record) => {
+                // SAFETY: non-null and at least `record.len()` writable bytes.
+                unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len()) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Read one aligned config dword at `offset` (`0x40 ..= 0xffc`: the
+    /// device-dependent region and extended space, never the standard
+    /// header) of the module's device into `out`. Read only. Returns 0,
+    /// `-EINVAL`, `-EIO` (beyond the function's config window) or
+    /// `-ENODEV`.
+    ///
+    /// # Safety
+    /// `out` must point to writable `u32` storage.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pci_config_read32(dev: u64, offset: u16, out: *mut u32) -> i32 {
+        if out.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pci_config_read32(owner, dev, offset) {
+            Ok(value) => {
+                // SAFETY: non-null; the module promises writable storage.
+                unsafe { out.write(value) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+    // ── end ath9k.ko block ───────────────────────────────────────────────
+
+    // ── Device-specific PCI configuration window (brcmfmac.ko) ──────────
+    //
+    // FullMAC PCIe parts select their BAR0 backplane window and ring their
+    // mailbox doorbell through vendor registers in config space. Reads use
+    // `narf_pci_config_read32`; decode/bus-master parking around BAR sizing
+    // and firmware download uses the shared `narf_pci_command`. See
+    // `modules/DATAPATH_ABI_DESIGN.md`, "Device-specific PCI configuration
+    // window". Additive: no existing export changes.
+
+    /// Write config dword `offset` of the probed PCI function: the
+    /// device-specific region 0x40..0x100, dword-aligned, outside the PM,
+    /// MSI, MSI-X and PCI Express capabilities and every capability header
+    /// (`-EPERM` for those). Vendor-specific capability bodies are writable.
+    ///
+    /// # Safety
+    /// `dev` must be the live token supplied to the current module callback.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pci_config_write32(dev: u64, offset: u16, value: u32) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pci_config_write32(owner, dev, offset, value) {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        }
+    }
+
+    // ── Control-BAR mapping and 8/16-bit MMIO (rtl.ko) ──────────────────
+    //
+    // Additive. The first consumer is rtlwifi (`rtl.ko`), whose SYS, EFUSE
+    // and power-sequence registers are byte- and word-addressed: emulating
+    // them with a read-modify-write of the enclosing dword would also write
+    // back neighbouring write-1-to-clear and trigger bytes. Same handle,
+    // owner and bounds rules as `narf_mmio_read32`/`_write32`; 16-bit
+    // offsets must be 2-byte aligned. See `modules/DATAPATH_ABI_DESIGN.md`,
+    // "Control BARs and 8/16-bit MMIO".
+
+    /// Map BAR `bar_idx` like `narf_bar_map`, but with Device (uncached,
+    /// unmerged) attributes even when the BAR is prefetchable — the mapping
+    /// built-in drivers use for control registers. Returns a 1-based BAR
+    /// handle shared with `narf_bar_map`'s, or 0 on failure.
+    ///
+    /// # Safety
+    /// `dev` must be the token the module's probe was invoked with.
+    fn narf_bar_map_control(dev: u64, bar_idx: u8) -> u64 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_bar_map_control(owner, dev, bar_idx)
+    }
+
+    /// Read the 8-bit device register at `off` in BAR handle `bar` into
+    /// `out`. Returns 0, or `-EINVAL` for a bad handle/offset/pointer.
+    ///
+    /// # Safety
+    /// `out` must point to a writable `u8`. `dev`/`bar` identify a mapped BAR.
+    fn narf_mmio_read8(dev: u64, bar: u64, off: u64, out: *mut u8) -> i32 {
+        if out.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_mmio_read8(owner, dev, bar, off) {
+            Some(v) => {
+                // SAFETY: `out` is non-null; the module promises it is writable.
+                unsafe { out.write(v) };
+                0
+            }
+            None => -22,
+        }
+    }
+
+    /// Read the 2-byte-aligned 16-bit device register at `off` in BAR handle
+    /// `bar` into `out`. Returns 0, or `-EINVAL` for a bad handle, offset,
+    /// alignment or pointer.
+    ///
+    /// # Safety
+    /// `out` must point to a writable, aligned `u16`. `dev`/`bar` identify a
+    /// mapped BAR.
+    fn narf_mmio_read16(dev: u64, bar: u64, off: u64, out: *mut u16) -> i32 {
+        if out.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_mmio_read16(owner, dev, bar, off) {
+            Some(v) => {
+                // SAFETY: `out` is non-null; the module promises it is writable.
+                unsafe { out.write(v) };
+                0
+            }
+            None => -22,
+        }
+    }
+
+    /// Write `val` to the 8-bit device register at `off` in BAR handle `bar`.
+    /// Returns 0, or `-EINVAL` for a bad handle/offset.
+    ///
+    /// # Safety
+    /// `dev`/`bar` identify a mapped BAR of the module's device.
+    fn narf_mmio_write8(dev: u64, bar: u64, off: u64, val: u8) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_mmio_write8(owner, dev, bar, off, val)
+    }
+
+    /// Write `val` to the 2-byte-aligned 16-bit device register at `off` in
+    /// BAR handle `bar`. Returns 0, or `-EINVAL` for a bad handle, offset or
+    /// alignment.
+    ///
+    /// # Safety
+    /// `dev`/`bar` identify a mapped BAR of the module's device.
+    fn narf_mmio_write16(dev: u64, bar: u64, off: u64, val: u16) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_mmio_write16(owner, dev, bar, off, val)
+    }
+
+    // ── end rtl.ko block ───────────────────────────────────────────────
+
+    // ── Firmware signer identity (iwlwifi.ko) ───────────────────────────
+    //
+    // Additive. `narf_firmware_signed` answers whether a blob is signed;
+    // iwlwifi's Gen2 power programs also bind the signer key itself, as its
+    // built-in `firmware_asset::Asset::signer` does.
+
+    /// Copy the verified signer key of open firmware `handle` (32 bytes) into
+    /// `out`. Returns 0, `-ENODATA` when the blob is unsigned, `-EINVAL` for a
+    /// null or short output, or `-EBADF`.
+    ///
+    /// # Safety
+    /// `out` must name `len` writable bytes for the call.
+    requires narf_capabilities::CapKind::Firmware;
+    fn narf_firmware_signer(handle: u64, out: *mut u8, len: usize) -> i32 {
+        if out.is_null() || len < 32 {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_firmware::module_fetch::signer(owner, handle) {
+            Ok(Some(key)) => {
+                // SAFETY: non-null and at least 32 writable bytes.
+                unsafe { core::ptr::copy_nonoverlapping(key.as_ptr(), out, 32) };
+                0
+            }
+            Ok(None) => -61,
+            Err(errno) => errno,
+        }
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -1759,6 +2103,110 @@ fn smoke_kabi_netif_exports_require_cap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_netif_exports_require_cap);
+
+/// The softMAC exports (ath9k.ko) and the regulatory record: link-time cap
+/// gated like their neighbours, bounded to their fields, and the record
+/// (NRGD v1) parses back to the host's active domain, world domain included.
+fn smoke_kabi_softmac_exports() -> TestResult {
+    use narf_wireless::reg::{db, RegFlags, RegRule, RegulatoryDomain};
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    for (name, kind) in [
+        ("narf_pcie_state", narf_capabilities::CapKind::BusDevice),
+        (
+            "narf_pci_config_read32",
+            narf_capabilities::CapKind::BusDevice,
+        ),
+        (
+            "narf_wireless_regdomain",
+            narf_capabilities::CapKind::NetIface,
+        ),
+    ] {
+        match crate::symbols::resolve(name, None, &denied) {
+            Err(crate::symbols::ResolveError::CapMissing(missing)) if missing == kind => {}
+            _ => return TestResult::Fail("softMAC export resolved without its cap declaration"),
+        }
+    }
+    let mut state = [0u8; 20];
+    // SAFETY: live locals; no device context exists for this token.
+    let (short, no_state) = unsafe {
+        (
+            narf_pcie_state(0x5eed, state.as_mut_ptr(), 19),
+            narf_pcie_state(0x5eed, state.as_mut_ptr(), state.len()),
+        )
+    };
+    if short != -22 || no_state != -19 {
+        return TestResult::Fail("narf_pcie_state accepted an out-of-bounds request");
+    }
+    let mut word = 0u32;
+    // SAFETY: live local; no device context exists for this token.
+    let (header, unaligned, beyond, no_cfg) = unsafe {
+        (
+            narf_pci_config_read32(0x5eed, 0x04, &mut word),
+            narf_pci_config_read32(0x5eed, 0x702, &mut word),
+            narf_pci_config_read32(0x5eed, 0x1000, &mut word),
+            narf_pci_config_read32(0x5eed, 0x70c, &mut word),
+        )
+    };
+    if header != -22 || unaligned != -22 || beyond != -22 || no_cfg != -19 {
+        return TestResult::Fail("narf_pci_config_read32 accepted an out-of-bounds read");
+    }
+
+    let saved = db::get_domain();
+    let domain = RegulatoryDomain {
+        country_code: *b"DE",
+        rules: alloc::vec![
+            RegRule {
+                freq_start_mhz: 2400,
+                freq_end_mhz: 2483,
+                max_bandwidth_mhz: 40,
+                max_power_dbm: 20,
+                flags: RegFlags::empty(),
+            },
+            RegRule {
+                freq_start_mhz: 5250,
+                freq_end_mhz: 5330,
+                max_bandwidth_mhz: 80,
+                max_power_dbm: 20,
+                flags: RegFlags::NO_IR | RegFlags::AUTO_BW,
+            },
+        ],
+    };
+    db::set_domain(domain.clone());
+    let mut len = 0usize;
+    let mut record = [0u8; 64];
+    // SAFETY: live locals; a sizing call, then a copy into `record`.
+    let (sizing, sized, copied) = unsafe {
+        let sizing = narf_wireless_regdomain(core::ptr::null_mut(), 0, &mut len);
+        let sized = len;
+        (
+            sizing,
+            sized,
+            narf_wireless_regdomain(record.as_mut_ptr(), record.len(), &mut len),
+        )
+    };
+    match saved {
+        Some(saved) => db::set_domain(saved),
+        None => db::clear_domain(),
+    }
+    if sizing != -105 || copied != 0 || sized != 12 + 2 * 16 || len != sized {
+        return TestResult::Fail("narf_wireless_regdomain sizing is wrong");
+    }
+    if narf_wireless::reg::parse_domain_record(&record[..len]) != Ok(domain) {
+        return TestResult::Fail("narf_wireless_regdomain record differs from the domain");
+    }
+    // The world domain the database holds before any policy is installed
+    // parses as a record, never as a deployment policy.
+    let mut world = record;
+    world[6..8].copy_from_slice(b"00");
+    if narf_wireless::reg::parse_domain_record(&world[..len]).map(|d| d.country_code) != Ok(*b"00")
+        || narf_wireless::reg::parse_policy(&world[..len]).is_ok()
+    {
+        return TestResult::Fail("the world domain's record is not parsed as a record only");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_softmac_exports);
 
 /// Registration is idempotent: a second call must not duplicate entries,
 /// because the ABI hash sums over the table and would change.
@@ -2266,3 +2714,97 @@ fn smoke_kabi_runtime_services_behave() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_runtime_services_behave);
+
+// ── narf_pci_command (mt76.ko) ─────────────────────────────────────────
+
+/// `narf_pci_command` refuses a null output, bits outside decode/mastering/
+/// INTx, and a token with no device context, and needs `BusDevice` to link.
+fn smoke_kabi_pci_command_validates_arguments() -> TestResult {
+    use narf_capabilities::CapKind;
+    const UNKNOWN: u64 = (0x56u64 << 56) | 0xFF00;
+    let mut command = 0x5a5a_u16;
+    // SAFETY: the pointer is null (to prove rejection) or names a live local.
+    let ok = unsafe {
+        narf_pci_command(UNKNOWN, 0, 0, core::ptr::null_mut()) == -22
+            && narf_pci_command(UNKNOWN, 0x1, 0, &mut command) == -22
+            && narf_pci_command(UNKNOWN, 0, 0x100, &mut command) == -22
+            && narf_pci_command(UNKNOWN, 0x4, 0x2, &mut command) == -19
+            && narf_pci_command(UNKNOWN, 0, 0, &mut command) == -19
+    };
+    if !ok || command != 0x5a5a {
+        return TestResult::Fail("narf_pci_command accepted a malformed argument or token");
+    }
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    match crate::symbols::resolve("narf_pci_command", None, &denied) {
+        Err(crate::symbols::ResolveError::CapMissing(CapKind::BusDevice)) => TestResult::Pass,
+        _ => TestResult::Fail("narf_pci_command resolved without BusDevice"),
+    }
+}
+kernel_test_in!("modules/kabi", smoke_kabi_pci_command_validates_arguments);
+
+// ── Device-specific PCI configuration window (brcmfmac.ko) ─────────────
+
+/// The config-window write and the Command export refuse a null output, an
+/// out-of-window or unaligned offset, a Command bit outside
+/// decode/master/INTx-disable and a token with no device context, and
+/// resolve only with the BusDevice cap.
+/// The owned-context write policy is `bus`'s
+/// `smoke_module_pci_cfg_window_validates`.
+fn smoke_kabi_pci_cfg_window_exports_validate() -> TestResult {
+    use narf_capabilities::CapKind;
+    const UNKNOWN: u64 = (0x58u64 << 56) | 0xFEFF;
+    let mut command = 0x5a5au16;
+    // SAFETY: each pointer is null (to prove rejection) or names a live local.
+    let ok = unsafe {
+        narf_pci_config_write32(UNKNOWN, 0x10, 0) == -22
+            && narf_pci_config_write32(UNKNOWN, 0x100, 0) == -22
+            && narf_pci_config_write32(UNKNOWN, 0x81, 0) == -22
+            && narf_pci_config_write32(UNKNOWN, 0x80, 0) == -19
+            && narf_pci_command(UNKNOWN, 0, 0, core::ptr::null_mut()) == -22
+            && narf_pci_command(UNKNOWN, 0x1, 0, &mut command) == -22
+            && narf_pci_command(UNKNOWN, 0, 0x4, &mut command) == -19
+    };
+    if !ok || command != 0x5a5a {
+        return TestResult::Fail("a PCI config-window export accepted a malformed argument");
+    }
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    for name in ["narf_pci_config_write32", "narf_pci_command"] {
+        match crate::symbols::resolve(name, None, &denied) {
+            Err(crate::symbols::ResolveError::CapMissing(CapKind::BusDevice)) => {}
+            _ => return TestResult::Fail("a PCI config-window export resolved without BusDevice"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_pci_cfg_window_exports_validate);
+
+// ── narf_firmware_signer (iwlwifi.ko) ──────────────────────────────────
+
+/// `narf_firmware_signer` refuses a null or short output before any lookup,
+/// answers `-EBADF` for a handle the caller does not hold, and needs the
+/// `Firmware` cap to link.
+fn smoke_kabi_firmware_signer_validates_arguments() -> TestResult {
+    use narf_capabilities::CapKind;
+    let mut key = [0x5au8; 32];
+    // SAFETY: the pointer is null (to prove rejection) or names 32 bytes.
+    let ok = unsafe {
+        narf_firmware_signer(1, core::ptr::null_mut(), 32) == -22
+            && narf_firmware_signer(1, key.as_mut_ptr(), 31) == -22
+            && narf_firmware_signer(u64::MAX, key.as_mut_ptr(), 32) == -9
+    };
+    if !ok || key != [0x5a; 32] {
+        return TestResult::Fail("narf_firmware_signer accepted a malformed output or handle");
+    }
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    match crate::symbols::resolve("narf_firmware_signer", None, &denied) {
+        Err(crate::symbols::ResolveError::CapMissing(CapKind::Firmware)) => TestResult::Pass,
+        _ => TestResult::Fail("narf_firmware_signer resolved without the Firmware cap"),
+    }
+}
+kernel_test_in!(
+    "modules/kabi",
+    smoke_kabi_firmware_signer_validates_arguments
+);

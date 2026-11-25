@@ -3,8 +3,8 @@
 //! This identifies source inputs, not a signed executable, compiler/toolchain
 //! identity, full dependency graph, calibration measurement or physical proof.
 //! Even a nonfunctional edit of an included source invalidates old NASR.
+use crate::platform::lib::sync::OnceLock;
 use narf_crypto::sha256::Sha256;
-use narf_lib::sync::OnceLock;
 
 // Explicit scope: no filesystem access, build script, generated binary,
 // external dependency or whole-repository fingerprint. Include the shared

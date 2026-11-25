@@ -8,14 +8,14 @@ use super::{
     init::Radio,
     iqk,
 };
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::{FirmwareBlob, FirmwareError};
 use crate::rtlwifi::{
     channel_power,
     firmware_transport::{Identity, Io},
     prepare::Error,
 };
 use alloc::{format, string::String, sync::Arc};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
 use narf_wireless::reg::RegulatoryDomain;
 pub(crate) mod source;
 mod tables;
@@ -286,7 +286,7 @@ impl Grant {
         firmware: Identity,
         facts: Facts,
     ) -> Result<Option<Arc<Self>>, Error> {
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or(Error::Power(channel_power::Error::Authority))?;
         let asset = match crate::firmware_asset::load(

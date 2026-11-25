@@ -3,6 +3,8 @@
 //! with the same host reorder and retirement owner (Linux mvm/sta.c).
 use super::super::{boot_context::put16, scan_api};
 use super::{Owner, Phase};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicUsize;
 use narf_wireless::{reg::RegulatoryDomain, reorder::Reorder};

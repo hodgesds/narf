@@ -366,6 +366,87 @@ narf_module_param(name:*const u8, name_len:usize, out:*mut u8, cap:usize, out_le
 applied `<module>.<param>=` from the kernel command line and then the load's
 own arguments (`modules/MODULE_AUTHORING.md`, "Module parameters").
 
+**Additive (iwlwifi.ko):**
+
+```text
+narf_firmware_signer(handle:u64, out:*mut u8, len:usize)->i32   // 32-byte verified signer key
+```
+
+`narf_firmware_signed` says whether a blob is signed; a driver that binds a
+signed input to its signer (iwlwifi's Gen2 per-platform TX-power programs,
+whose built-in `Asset` carries `signer`) needs the key itself. Returns 0,
+`-ENODATA` for an unsigned blob, `-EINVAL` for a null or short output, or
+`-EBADF`. Requires `Firmware`, like the other firmware exports.
+
+## Device-specific PCI configuration window
+
+Status: **implemented**; brcmfmac (`brcm` `.ko`, Broadcom FullMAC PCIe) is
+the first consumer. Broadcom parts select the backplane address their BAR0
+window decodes, and ring their firmware mailbox, through vendor registers in
+PCI configuration space (Linux `brcmf_pcie_select_core` writes
+`BRCMF_PCIE_BAR0_WINDOW` = 0x80, `brcmf_pcie_send_mb_data` writes
+`BRCMF_PCIE_REG_SBMBX` = 0x98), and park decode and bus mastering around BAR
+sizing and firmware download. Reads use the softMAC
+`narf_pci_config_read32` and Command parking the shared `narf_pci_command`
+(both below); the one export added here is primitive-only and requires
+`BusDevice`:
+
+```text
+narf_pci_config_write32(dev:u64, offset:u16, value:u32)->i32
+```
+
+- **Window.** Writes reach only the device-specific region 0x40..0x100,
+  dword-aligned (`-EINVAL` otherwise): never the standard header (BARs,
+  Command, the capability pointer), never extended space.
+- **Writes** are further refused (`-EPERM`) for any dword overlapping a
+  structure the kernel owns there: the Power Management (8 bytes), MSI
+  (sized from its Message Control), MSI-X (12 bytes) and PCI Express
+  (0x3C bytes) capabilities, and the header dword of every other capability
+  (the list links and vendor-specific length). Vendor-specific capability
+  bodies, where Broadcom's window registers live, stay writable. The list
+  is walked through the cap-gated accessors on every write. ASPM remains
+  `narf_pcie_aspm`'s; interrupt routing remains the MSI exports'.
+- **Errors.** `-ENODEV` for a token with no context of this module,
+  `-EOPNOTSUPP` off PCI, `-EIO` when the device cap is revoked or the
+  device is gone.
+- **Versioning.** New names only; no existing export changed. A module
+  built against them fails to resolve on an older kernel instead of being
+  called with the wrong layout.
+
+## Control BARs and 8/16-bit MMIO
+
+Status: **implemented**; rtlwifi (`rtl.ko`) is the first consumer. Additive
+exports, all primitive-only, in their own block of `modules/src/kabi.rs`:
+
+```text
+narf_bar_map_control(dev:u64, bar_idx:u8)->u64
+narf_mmio_read8(dev:u64, bar:u64, off:u64, out:*mut u8)->i32
+narf_mmio_read16(dev:u64, bar:u64, off:u64, out:*mut u16)->i32
+narf_mmio_write8(dev:u64, bar:u64, off:u64, val:u8)->i32
+narf_mmio_write16(dev:u64, bar:u64, off:u64, val:u16)->i32
+```
+
+- **Why the widths.** Realtek's SYS, EFUSE and power-sequence registers are
+  addressed by byte and by word. Linux drives them with
+  `rtl_read_byte`/`rtl_write_word`. Emulating a byte write with a
+  read-modify-write of the enclosing dword also writes back the neighbouring
+  bytes. Some of those are write-1-to-clear status or self-clearing
+  triggers, such as `REG_EFUSE_CTRL+3`'s read strobe and `APS_FSMCO`'s power
+  request. Stage 1's "add widths only with a concrete driver" condition is
+  met by this one.
+- **Rules.** The handle, owner and bounds resolution is
+  `narf_mmio_read32`/`_write32`'s. A 16-bit offset must also be 2-byte
+  aligned, matching `MmioRegion::read16`'s contract. A bad handle, offset or
+  alignment is `-EINVAL`, and a write is then not issued.
+- **Control mapping.** `narf_bar_map` maps a prefetchable BAR
+  write-combining. A register BAR must not be mapped that way: posted writes
+  could merge and reorder. `narf_bar_map_control` is the built-in
+  `map_bar_control` with Device attributes. It shares `narf_bar_map`'s
+  handle space, `narf_bar_len` and teardown.
+- **No new authority.** No config-space read or write is added. A module
+  still learns its function only through `narf_pci_identity` and changes
+  config only through `narf_pci_enable` / `narf_pcie_aspm`.
+
 ## Wireless copy-mode host services
 
 The wireless extension uses permanent family host adapters. The loadable
@@ -650,3 +731,101 @@ requests waited with `narf_usb_wait`, at most 4 KiB per command (one
 transfer). `narf-drivers-usb/msc-module-only` steps the built-in binder
 aside. `usb-storage-module-block-smoke` proves it with the same
 write/read-back/image check as the NVMe smoke, over QEMU's `usb-storage`.
+
+## USB device poller and the regulatory domain
+
+Status: **implemented; `rtw88.ko` (`drivers/wireless/rtw`, RTL8821CU /
+RTL8822BU) is the first consumer.** Additive exports, in their own block at
+the end of `kabi.rs`:
+
+```text
+narf_usb_spawn_poller(dev, callback, cookie) -> i32                 BusDevice
+narf_usb_netif_register_with_context(dev, mac, tx_callback, out_ifindex) -> i32
+                                                                     NetIface
+narf_usb_netif_rx(dev, ifindex, frame, len) -> i32                   NetIface
+narf_wireless_regdomain(buf, len, out_len) -> i32                    NetIface
+```
+
+A driver written against `async` (a `narf-module-rt` executor) needs a
+heartbeat, a netdev and, for Wi-Fi, the regulatory domain. A PCI module gets
+the first two from its bus device context (`narf_spawn_poller`,
+`narf_netif_register_with_context`). A USB function's context lives in the
+USB stack instead (see [USB transfer datapath](#usb-transfer-datapath)),
+which has neither, and those exports refuse USB tokens (`-ENODEV`).
+
+- **Same authority as the USB datapath.** Every call resolves the caller
+  through the module call gate and requires a live USB context of that
+  module for `dev` (`narf_bus::module_usb::context_live`) — at spawn and
+  registration, and again before every poller run, every TX callback and
+  every RX delivery. Module text is entered only through the lifecycle /
+  domain gate, which refuses once unload began.
+- **Retirement with the context.** Pollers and interfaces are kept per
+  `(module, token)` in `modules/src/usb_wifi.rs` and retired by the
+  module-context-retired hook (which already retires module disks) when the
+  USB context goes away: detach, declined probe or unload, all before
+  module text is unmapped. A second `narf_usb_spawn_poller` for the same
+  device replaces the first.
+- **Netdev.** `wlan%d`, copy mode, no offloads, like the bus netif bridge;
+  the TX callback has `narf_netif_register_with_context`'s signature.
+- **Regulatory domain.** `narf_wireless_regdomain` copies the domain the
+  kernel's regulatory database holds (bootstrapping the staged signed policy
+  if none is installed, as a built-in driver's `ensure_domain` does) as one
+  NRGD v1 record — `narf_wireless::reg::parse_policy`'s layout, with the
+  world domain's "00" allowed; `narf_wireless::reg::parse_domain_record`
+  decodes it (`parse_policy` refuses "00", which no deployment policy may
+  select). Read-only: a module cannot install a domain.
+  `-ENOBUFS` sizes the buffer; `-ENODATA` when there is none.
+
+**Not provided: a wiphy for a USB function.** The wireless broker
+(`narf_bus::module_wireless`) and the `WIFI` family host bind a session to a
+bus device context's `Cap<BusDeviceCap, Write>`, which a USB function does
+not have (`BusAddr` has no USB variant, and minting a device capability for
+it is a capability-model decision). So a USB Wi-Fi module publishes a
+netdev but no nl80211 wiphy; `rtw88.ko` drives its in-driver SME from module
+parameters instead. Extending the broker to USB functions is open.
+
+Proof: `modules/e2e/rtw88` loads the real `rtw88.ko` (relocations, init,
+USB/PCI claims, refusal of a probe without a USB context, clean unload).
+QEMU emulates no Realtek USB Wi-Fi device, so the poller, netdev and
+regulatory paths run first on hardware.
+
+## softMAC PCI state and config reads
+
+Status: **implemented**; ath9k (every chip owner) is the first consumer. A
+softMAC chip has no firmware between the driver and the radio. The driver
+gates its own bus mastering around every DMA-stop proof, picks its SerDes
+workarounds from the upstream link's ASPM policy, and enforces the host
+regulatory domain itself, which it reads through the shared
+`narf_wireless_regdomain` (NRGD v1; "USB device poller and the regulatory
+domain" above). The bus-master gating uses the shared
+`narf_pci_command` (clear, then set, Memory Space / Bus Master / INTx
+Disable, and the register read back), added for mt76. The additive
+exports here, all primitive-only:
+
+```text
+narf_pcie_state(dev:u64, out:*mut u8, len:usize)->i32                         // BusDevice
+narf_pci_config_read32(dev:u64, offset:u16, out:*mut u32)->i32               // BusDevice
+```
+
+- **PCIe state** is a fixed 20-byte little-endian record:
+  - Device Capabilities u32
+  - Device Control u16
+  - Device Status u16
+  - Link Capabilities u32
+  - Link Status u16
+  - the upstream bridge's Link Control u16
+  - flags u8 (bit 0: that Link Control is present)
+  - 3 reserved bytes
+
+  It is read-only. `-EOPNOTSUPP` means the function has no PCI Express
+  capability.
+- **Config read** returns one aligned dword at `0x40..=0xffc`: the
+  device-dependent region and extended space, never the standard header
+  (identity, BARs and Command are the bus's). It is read-only. `-EIO` means
+  the offset is beyond the function's config window. ath9k reads AR9462's
+  L1-entry-latency word at `0x70c`.
+`modules/kabi` (`smoke_kabi_softmac_exports`) covers the cap gating, the
+state-record and config-read bounds, refusal without a device context, and
+and an NRGD regulatory record that parses back to the installed domain. There is still no
+general config-space write. Existing exports keep their signatures and
+semantics.

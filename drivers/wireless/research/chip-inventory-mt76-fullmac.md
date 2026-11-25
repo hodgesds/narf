@@ -121,6 +121,13 @@ upstream subsystem-specific4355/4365 entries, MT7925/CONNAC3 or arbitrary
 USB/SDIO Broadcom families. They are outside these counts and estimates.
 The loadable MT module is ID-registration-only, not the built-in native owner.
 
+Loadable build (supersedes the line above): every `14c3`/`0e8d` tuple in the
+MT table is also claimed by `mt76.ko`, which is the same driver source over
+the KABI. It carries the station subset only: no AP/P2P/monitor, WoW, system
+PM, scheduled scan, roaming or userspace SME
+(`drivers/wireless/specification/spec.md` §4.4). MT7925 stays unmatched in
+both builds.
+
 ## Remaining shared work packages
 
 | Package | Deliverable and dependency |
@@ -181,6 +188,14 @@ NARF match/admission evidence:
   `native_runtime.rs::start` returns without continuation for chip!=43602 or
   missing BAR2. `boot.rs::BoardProfile::admits` explicitly requires43602.
   `provision.rs` accepts only exact signed Pcie43602/Sdio43439 selectors.
+- Loadable build: all 26 Broadcom PCI tuples are also claimed by the `brcm`
+  `.ko` (`brcmfmac/pcie_kabi.rs`), the same driver source over the KABI
+  with the same admission: the tuples that reach a retained continuation
+  built in (BAR2 plus a covered chip profile) reach it in the module, the
+  rest stay parked. It carries the station path only, needs a signed
+  regulatory policy, and has no AP/monitor/P2P, WoWL or host supplicant
+  (`drivers/wireless/specification/spec.md` §4.7). The two CYW SDIO tuples
+  stay built-in only.
 
 Local primary implementation references:
 

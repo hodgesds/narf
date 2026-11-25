@@ -41,7 +41,7 @@ struct Entry {
     id: u16,
     role: Role,
     length: usize,
-    deadline: narf_time::Deadline,
+    deadline: crate::ath10k::platform::time::Deadline,
 }
 /// Terminal outcome of one native HTT ID (Linux `htt_tx_compl_state`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +120,7 @@ impl Pipeline {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn expire_for_test(&mut self) {
         for entry in &mut self.entries {
-            entry.deadline = narf_time::Deadline::after_cycles(0);
+            entry.deadline = crate::ath10k::platform::time::Deadline::after_cycles(0);
         }
     }
     /// Record a freshly published HTT ID. Admission was checked before the
@@ -137,7 +137,7 @@ impl Pipeline {
             id,
             role,
             length,
-            deadline: narf_time::Deadline::after_ms(TIMEOUT_MS),
+            deadline: crate::ath10k::platform::time::Deadline::after_ms(TIMEOUT_MS),
         });
         Ok(())
     }

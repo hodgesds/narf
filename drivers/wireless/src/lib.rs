@@ -131,11 +131,20 @@ pub fn register_initcalls() {
     });
     // Register wireless drivers with the bus dispatcher.
     narf_init::register(Stage::Subsys, "iwlwifi", || {
+        #[cfg(not(feature = "iwlwifi-module-only"))]
         iwlwifi::register();
+        // iwlwifi.ko owns the Sc ids; the other generations stay built in.
+        #[cfg(feature = "iwlwifi-module-only")]
+        iwlwifi::register_builtin_only();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "mt76", || {
+        #[cfg(not(feature = "mt76-module-only"))]
         mt76::register();
+        // mt76.ko owns the CONNAC2 PCI ids; the private copy-mode family
+        // host stays registered for frontends built against it.
+        #[cfg(feature = "mt76-module-only")]
+        mt76::register_host_only();
         // Actual S0Idle/S3 targets reach the retained mt76 wake owner.
         narf_power::system_pm::register_async_system_pm(
             "mt76",
@@ -147,16 +156,23 @@ pub fn register_initcalls() {
         cyw43439::register();
         InitResult::Ok
     });
+    // rtl.ko owns both tables under `rtl-module-only`.
+    #[cfg(not(feature = "rtl-module-only"))]
     narf_init::register(Stage::Subsys, "rtl8xxxu", || {
         rtl8xxxu::register();
         InitResult::Ok
     });
+    #[cfg(not(feature = "rtl-module-only"))]
     narf_init::register(Stage::Subsys, "rtlwifi", || {
         rtlwifi::register();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "rtw88", || {
+        #[cfg(not(feature = "rtw88-module-only"))]
         rtw88::register();
+        // rtw88.ko owns the RTL8821CU/RTL8822BU USB ids; PCIe stays built in.
+        #[cfg(feature = "rtw88-module-only")]
+        rtw88::register_without_usb();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "rtw89", || {
@@ -164,6 +180,9 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "brcmfmac", || {
+        // brcmfmac.ko owns the Broadcom PCIe ids (and with them the PCIe
+        // system-PM hooks); CYW43439 SDIO/gSPI stays built in.
+        #[cfg(not(feature = "brcmfmac-module-only"))]
         brcmfmac::register();
         InitResult::Ok
     });
@@ -185,10 +204,14 @@ pub fn register_initcalls() {
         }
     });
     narf_init::register(Stage::Subsys, "ath10k", || {
+        #[cfg(not(feature = "ath10k-module-only"))]
         ath10k::register();
+        // ath10k.ko owns every ath10k PCI id (AR9462 is ath9k's either way).
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "ath9k", || {
+        // With `ath9k-module-only`, ath9k.ko owns every ath9k PCI id.
+        #[cfg(not(feature = "ath9k-module-only"))]
         ath9k::register();
         InitResult::Ok
     });

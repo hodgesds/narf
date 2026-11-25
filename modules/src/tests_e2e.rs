@@ -1763,6 +1763,666 @@ fn e2e_ath11k_module_registration() -> TestResult {
 }
 kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
 
+// ── mt76.ko ────────────────────────────────────────────────────────────
+
+/// The real mt76 `.ko` (`narf-drivers-wireless-mt76 --features module`: the
+/// MT7921/MT7922 driver — PCI binding, WFDMA rings, MCU, firmware download,
+/// the station join with its supplicant and the packet path — over
+/// `narf-module-rt` and the KABI). Its relocations resolve and init runs to
+/// Live; the `debug` parameter is declared and a load argument applies; it
+/// claims exactly the eight PCI ids the built-in table names (MT7925 and
+/// its 0717 alias included; the chip-id gate still refuses MT7925 silicon,
+/// as built in); a probe with no device context is refused before any
+/// device access; unload leaves no match behind. QEMU emulates no MediaTek Wi-Fi,
+/// so bring-up itself is proven on hardware.
+fn e2e_mt76_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const MTK: u16 = 0x14c3;
+    const ITTIM: u16 = 0x0e8d;
+    const IDS: [(u16, u16); 8] = [
+        (MTK, 0x7961),
+        (MTK, 0x7922),
+        (MTK, 0x0608),
+        (MTK, 0x0616),
+        (MTK, 0x7920),
+        (MTK, 0x7925),
+        (MTK, 0x0717),
+        (ITTIM, 0x7922),
+    ];
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/mt76.ko")
+    else {
+        return TestResult::Fail("mt76 module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("mt76 module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module_with_params(&image, "debug=1") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("mt76.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let applied = crate::params::find(&module.params, "debug").is_some_and(|s| s.read() == "1");
+    let claims = module.name() == "mt76"
+        && count() == before + IDS.len()
+        && IDS
+            .iter()
+            .all(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
+        // The ITTIM vendor id only carries the MT7922 SKU.
+        && __module_thunk_for_test(ITTIM, 0x7925).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let refused = __module_thunk_for_test(MTK, 0x7922).is_some_and(|thunk| thunk(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("mt76").is_err() {
+        return TestResult::Fail("could not unload mt76.ko");
+    }
+    if !live || !applied {
+        return TestResult::Fail("mt76.ko not Live, or its debug parameter missing or not applied");
+    }
+    if !claims {
+        return TestResult::Fail("mt76.ko did not claim exactly the CONNAC2 PCI ids");
+    }
+    if !refused {
+        return TestResult::Fail("mt76.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || IDS
+            .iter()
+            .any(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
+    {
+        return TestResult::Fail("mt76.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/mt76", e2e_mt76_module_registration);
+
+/// The real ath10k `.ko` (`narf-drivers-wireless-ath10k --features module`:
+/// the whole PCIe driver — BMI, firmware/board/OTP download, CE, HTC, WMI,
+/// HTT and the station radio with its in-driver supplicant — over
+/// `narf-module-rt` and the shared KABI, including `narf_pci_command`,
+/// `narf_pcie_state` and `narf_wireless_regdomain`). Its relocations
+/// resolve and init runs; it claims
+/// every ath10k PCIe id the built-in driver binds and not AR9462 (ath9k's),
+/// refuses a probe with no device context before any device access, and
+/// unloads leaving no match behind. QEMU has no Atheros Wi-Fi, so bring-up
+/// itself is proven on hardware.
+fn e2e_ath10k_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const ATHEROS: u16 = 0x168c;
+    const CLAIMED: [(u16, u16); 9] = [
+        (ATHEROS, 0x003c), // QCA988X
+        (0x0777, 0x11ac),  // QCA988X (Ubiquiti)
+        (ATHEROS, 0x0050), // QCA9887
+        (ATHEROS, 0x003e), // QCA6174
+        (ATHEROS, 0x0041), // QCA6164
+        (ATHEROS, 0x0040), // QCA99X0
+        (ATHEROS, 0x0056), // QCA9888
+        (ATHEROS, 0x0046), // QCA9984
+        (ATHEROS, 0x0042), // QCA9377
+    ];
+    const AR9462: u16 = 0x0034;
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath10k.ko")
+    else {
+        return TestResult::Fail("ath10k module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("ath10k module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module(&image) {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("ath10k.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let claims = module.name() == "ath10k"
+        && count() == before + CLAIMED.len()
+        && CLAIMED
+            .iter()
+            .all(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
+        && __module_thunk_for_test(ATHEROS, AR9462).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let (vendor, device) = CLAIMED[0];
+    let refused = __module_thunk_for_test(vendor, device).is_some_and(|thunk| thunk(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("ath10k").is_err() {
+        return TestResult::Fail("could not unload ath10k.ko");
+    }
+    if !live {
+        return TestResult::Fail("ath10k.ko did not reach Live");
+    }
+    if !claims {
+        return TestResult::Fail("ath10k.ko did not claim exactly the ath10k PCIe ids");
+    }
+    if !refused {
+        return TestResult::Fail("ath10k.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || CLAIMED
+            .iter()
+            .any(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
+    {
+        return TestResult::Fail("ath10k.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/ath10k", e2e_ath10k_module_registration);
+
+/// The real ath9k `.ko` (`narf-drivers-wireless-ath9k --features module`:
+/// every chip owner — AR5008, AR9280, AR9285, AR9287 and the AR9300 family:
+/// identity/EEPROM, board admission, INI/PLL/RF, calibration, MAC, packet
+/// DMA and the station with its WPA2 supplicant — over `narf-module-rt` and
+/// the KABI, including the softMAC exports `narf_pci_command`,
+/// `narf_pcie_state`, `narf_pci_config_read32` and
+/// `narf_wireless_regdomain`). The relocations resolve and init runs; the
+/// module claims exactly the built-in driver's fifteen Atheros ids, under
+/// its own match name `ath9k-module`, and none
+/// of ath10k's; a probe with no device context is refused before any
+/// device access; and unload (whose exit runs the owners' removal with
+/// nothing bound) leaves no match behind. QEMU has no Atheros Wi-Fi, so
+/// bring-up itself is proven on hardware.
+fn e2e_ath9k_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count, registered};
+    const ATHEROS: u16 = 0x168c;
+    /// AR5416/AR5418/AR9160, AR9280 PCI/PCIe, AR9285, AR2427, AR9287
+    /// PCI/PCIe, AR9380, AR9485, AR9580, AR9462, AR9565, AR9462/AR1111.
+    const CLAIMED: [u16; 15] = [
+        0x0023, 0x0024, 0x0027, 0x0029, 0x002a, 0x002b, 0x002c, 0x002d, 0x002e, 0x0030, 0x0032,
+        0x0033, 0x0034, 0x0036, 0x0037,
+    ];
+    /// QCA988X and QCA9887: ath10k's, never ath9k's.
+    const BUILT_IN: [u16; 2] = [0x003c, 0x0050];
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath9k.ko")
+    else {
+        return TestResult::Fail("ath9k module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("ath9k module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module(&image) {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("ath9k.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    // Under its own match name: a built-in per-chip name would replace the
+    // built-in entry instead of adding one (whether the built-in driver has
+    // registered by now depends on the tests that ran before this one).
+    let own_matches = registered()
+        .iter()
+        .filter(|m| m.name == "ath9k-module")
+        .count();
+    let claims = module.name() == "ath9k"
+        && own_matches == CLAIMED.len()
+        && count() == before + CLAIMED.len()
+        && CLAIMED
+            .iter()
+            .all(|&id| __module_thunk_for_test(ATHEROS, id).is_some())
+        && BUILT_IN
+            .iter()
+            .all(|&id| __module_thunk_for_test(ATHEROS, id).is_none());
+    // A bogus token (no device context): the identity read fails first.
+    let refused = CLAIMED
+        .iter()
+        .all(|&id| __module_thunk_for_test(ATHEROS, id).is_some_and(|thunk| thunk(0, 0) != 0));
+    drop(module);
+    if sys_delete_module("ath9k").is_err() {
+        return TestResult::Fail("could not unload ath9k.ko");
+    }
+    if !live {
+        return TestResult::Fail("ath9k.ko not Live after init");
+    }
+    if !claims {
+        return TestResult::Fail("ath9k.ko did not claim exactly the built-in ath9k PCI ids");
+    }
+    if !refused {
+        return TestResult::Fail("ath9k.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || CLAIMED
+            .iter()
+            .any(|&id| __module_thunk_for_test(ATHEROS, id).is_some())
+    {
+        return TestResult::Fail("ath9k.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/ath9k", e2e_ath9k_module_registration);
+
+/// The real brcmfmac `.ko` (`narf-drivers-wireless-brcm --features module`,
+/// module name `brcm`: the brcmfmac chip discovery, CR4/CA7 firmware
+/// download, msgbuf common rings and the shared FullMAC station over
+/// `narf-module-rt` and the KABI, including `narf_pci_config_write32`).
+/// The relocations resolve and init runs; the module declares the
+/// autoconnect parameters and takes a load argument; it claims every
+/// Broadcom FullMAC PCIe id of the built-in table under its own match name
+/// (so the built-in entries survive), refuses a probe with no device
+/// context before any device access, and unloads leaving no match behind.
+/// QEMU has no Broadcom Wi-Fi, so bring-up itself is proven on hardware.
+fn e2e_brcmfmac_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const BROADCOM: u16 = 0x14e4;
+    // `brcmfmac::pcie_ids::ALL_DEV_IDS` (Linux `brcmf_pcie_devid_table`).
+    const IDS: [u16; 26] = [
+        0x43A3, 0x43DF, 0x4354, 0x43DC, 0x43EC, 0x43D3, 0x43D9, 0xAA31, 0x43E9, 0x43EF, 0x43BA,
+        0x43BB, 0x43BC, 0x4464, 0x43CA, 0x43CB, 0x43CC, 0x43C3, 0x43C4, 0x43C5, 0x440D, 0x4415,
+        0x449D, 0x4488, 0x4425, 0x4433,
+    ];
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/brcmfmac.ko")
+    else {
+        return TestResult::Fail("brcmfmac module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("brcmfmac module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("brcmfmac.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let declared = ["ssid", "psk", "passphrase"]
+        .iter()
+        .all(|name| crate::params::find(&module.params, name).is_some());
+    let applied = crate::params::find(&module.params, "ssid")
+        .is_some_and(|s| s.read() == "narf-e2e")
+        && crate::params::find(&module.params, "passphrase").is_some_and(|s| s.read().is_empty());
+    let claims = module.name() == "brcm"
+        && count() == before + IDS.len()
+        && IDS
+            .iter()
+            .all(|&id| __module_thunk_for_test(BROADCOM, id).is_some())
+        // Not a Broadcom FullMAC PCIe id: the SoftMAC BCM4313.
+        && __module_thunk_for_test(BROADCOM, 0x4727).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let refused = __module_thunk_for_test(BROADCOM, 0x43BA).is_some_and(|thunk| thunk(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("brcm").is_err() {
+        return TestResult::Fail("could not unload brcmfmac.ko");
+    }
+    if !live || !declared || !applied {
+        return TestResult::Fail("brcmfmac.ko not Live, or its parameters missing or not applied");
+    }
+    if !claims {
+        return TestResult::Fail("brcmfmac.ko did not claim exactly the FullMAC PCIe id table");
+    }
+    if !refused {
+        return TestResult::Fail("brcmfmac.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || IDS
+            .iter()
+            .any(|&id| __module_thunk_for_test(BROADCOM, id).is_some())
+    {
+        return TestResult::Fail("brcmfmac.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/brcmfmac", e2e_brcmfmac_module_registration);
+
+/// The real rtw `.ko` (`narf-drivers-wireless-rtw --features module`: the
+/// rtw88 driver source — USB transport, firmware, MAC/PHY/RF, calibration,
+/// the station shell and its in-driver SME — over `narf-module-rt`, the
+/// kernel-free protocol crates and the KABI). Relocations resolve and init
+/// runs; the station parameters are declared and a load argument applies;
+/// the module claims the RTL8821CU / RTL8822BU USB ids on their
+/// vendor-specific interface (and not a Realtek id rtw88 does not drive, nor
+/// the same id on another interface class), keeps the rtw88 / rtw89 PCIe
+/// ids registration-only; a USB probe with no device context is refused
+/// before any device access; unload leaves no USB or PCI match behind. QEMU
+/// has no Realtek Wi-Fi device, so bring-up itself is proven on hardware.
+fn e2e_rtw88_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    use narf_drivers_usb::class_registry::{__module_probe_for_test, module_match_count};
+    const REALTEK: u16 = 0x10ec;
+    /// RTL8821CU (0bda:c811), RTL8822BU (0bda:b812), and RTL8188EU
+    /// (0bda:8179, rtl8xxxu's) — the last is not rtw88's.
+    const RTL8821CU: (u16, u16) = (0x0bda, 0xc811);
+    const RTL8822BU: (u16, u16) = (0x0bda, 0xb812);
+    const RTL8188EU: (u16, u16) = (0x0bda, 0x8179);
+    /// The id tables' entry counts (`rtw88::usb::RTL8821CU_IDS`,
+    /// `RTL8822BU_IDS`).
+    const USB_IDS: usize = 15 + 35;
+    /// A configuration descriptor with one interface of class
+    /// `class`/`class`/`class`.
+    fn config(class: u8) -> [u8; 18] {
+        [
+            9, 2, 18, 0, 1, 1, 0, 0x80, 50, // configuration
+            9, 4, 0, 0, 0, class, class, class, 0, // interface 0
+        ]
+    }
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/rtw88.ko")
+    else {
+        return TestResult::Fail("rtw88 module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("rtw88 module has no ABI placeholder");
+    };
+    let (pci_before, usb_before) = (count(), module_match_count());
+    let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("rtw88.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let declared = ["ssid", "psk", "passphrase", "scan"]
+        .iter()
+        .all(|name| crate::params::find(&module.params, name).is_some());
+    let applied = crate::params::find(&module.params, "ssid")
+        .is_some_and(|s| s.read() == "narf-e2e")
+        && crate::params::find(&module.params, "psk").is_some_and(|s| s.read().is_empty());
+    let vendor = config(0xff);
+    let probe_8821cu = __module_probe_for_test(RTL8821CU.0, RTL8821CU.1, &vendor);
+    let usb_claims = module.name() == "rtw"
+        && module_match_count() == usb_before + USB_IDS
+        && probe_8821cu.is_some_and(|(name, _)| name == "rtw8821cu")
+        && __module_probe_for_test(RTL8822BU.0, RTL8822BU.1, &vendor)
+            .is_some_and(|(name, _)| name == "rtw8822bu")
+        && __module_probe_for_test(RTL8188EU.0, RTL8188EU.1, &vendor).is_none()
+        && __module_probe_for_test(RTL8821CU.0, RTL8821CU.1, &config(0x08)).is_none();
+    let pci_claims = count() > pci_before
+        && __module_thunk_for_test(REALTEK, 0xc821).is_some()
+        && __module_thunk_for_test(REALTEK, 0x8852).is_some();
+    // A bogus token (no USB context): the configuration read fails first.
+    let refused = probe_8821cu.is_some_and(|(_, probe)| probe(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("rtw").is_err() {
+        return TestResult::Fail("could not unload rtw88.ko");
+    }
+    if !live || !declared || !applied {
+        return TestResult::Fail("rtw88.ko not Live, or its parameters missing or not applied");
+    }
+    if !usb_claims {
+        return TestResult::Fail("rtw88.ko did not claim exactly the RTL8821CU/RTL8822BU USB ids");
+    }
+    if !pci_claims {
+        return TestResult::Fail("rtw88.ko did not register the rtw88/rtw89 PCIe ids");
+    }
+    if !refused {
+        return TestResult::Fail("rtw88.ko probe accepted a token with no USB context");
+    }
+    if module_match_count() != usb_before
+        || count() != pci_before
+        || __module_probe_for_test(RTL8821CU.0, RTL8821CU.1, &vendor).is_some()
+    {
+        return TestResult::Fail("rtw88.ko unload left a USB or PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/rtw88", e2e_rtw88_module_registration);
+
+// ── rtl.ko (legacy Realtek rtlwifi PCIe + rtl8xxxu USB) ───────────────
+
+/// The id tables `rtl.ko` registers from. The module crate uses this same
+/// file, so the expected rows follow the table.
+#[path = "../../drivers/wireless/rtl/src/module_ids.rs"]
+#[allow(dead_code)]
+mod rtl_module_ids;
+
+/// A USB probe that must never run: the test registers it under a foreign
+/// owner only to observe which USB matches `rtl.ko` holds (`-EBUSY`).
+extern "C" fn rtl_e2e_foreign_usb_probe(_dev: u64, _reserved: u64) -> i32 {
+    -19
+}
+
+/// An owner id no loaded module has.
+const RTL_E2E_FOREIGN_OWNER: u64 = u64::MAX - 0x7274_6c00;
+
+/// Register `(vid, pid)` under [`RTL_E2E_FOREIGN_OWNER`]: `-EBUSY` while
+/// another module holds the match, `-ENODEV` with no USB stack, 0 (then
+/// withdrawn again) when the match is free.
+fn rtl_e2e_foreign_usb_claim(vid: u16, pid: u16) -> i32 {
+    use narf_bus::module_usb::{
+        register_module_usb_driver, unregister_module_usb_drivers, ModuleUsbMatch,
+        MATCH_VENDOR_PRODUCT,
+    };
+    let Ok(m) = ModuleUsbMatch::from_flags(MATCH_VENDOR_PRODUCT, vid, pid, 0, 0, 0) else {
+        return -22;
+    };
+    // SAFETY: the probe is kernel text that stays mapped; the match is
+    // withdrawn below before this function returns.
+    let rc = unsafe {
+        register_module_usb_driver(
+            RTL_E2E_FOREIGN_OWNER,
+            "rtl-e2e-foreign",
+            m,
+            rtl_e2e_foreign_usb_probe as usize,
+        )
+    };
+    unregister_module_usb_drivers(RTL_E2E_FOREIGN_OWNER);
+    rc
+}
+
+/// The real `rtl.ko` (`narf-drivers-wireless-rtl --features module`: the
+/// whole rtlwifi PCIe driver — identification, firmware, native preparation
+/// and the station with its `wlan%d`/wiphy — plus rtl8xxxu, over
+/// `narf-module-rt` and the KABI). Relocations for ~6.8 MB of driver,
+/// `core`/`alloc` and protocol code resolve and
+/// init runs to Live; the module claims exactly the rtlwifi PCI table (not
+/// rtw88's RTL8822BE) and, where the kernel has a USB stack, every rtl8xxxu
+/// VID/PID (not rtw88's RTL8821CU); a probe with no device context is
+/// refused before any device access; unload leaves no match. QEMU emulates
+/// no Realtek Wi-Fi device, so bring-up itself is proven on hardware.
+fn e2e_rtl_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    use rtl_module_ids::{PCI_DEVICES, PCI_VENDOR, USB_IDS};
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/rtl.ko")
+    else {
+        return TestResult::Fail("rtl module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("rtl module has no ABI placeholder");
+    };
+    let before = count();
+    // The match a foreign owner can take before load decides whether this
+    // kernel has a USB stack to check against.
+    let usb_stack = rtl_e2e_foreign_usb_claim(USB_IDS[0].0, USB_IDS[0].1) != -19;
+    let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("rtl.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    // The USB station's parameter-driven SME.
+    let params = ["ssid", "psk", "passphrase"]
+        .iter()
+        .all(|name| crate::params::find(&module.params, name).is_some())
+        && crate::params::find(&module.params, "ssid").is_some_and(|s| s.read() == "narf-e2e")
+        && crate::params::find(&module.params, "psk").is_some_and(|s| s.read().is_empty());
+    let installed = count().saturating_sub(before);
+    let pci_claims = module.name() == "rtl"
+        && installed == PCI_DEVICES.len()
+        && PCI_DEVICES
+            .iter()
+            .all(|&did| __module_thunk_for_test(PCI_VENDOR, did).is_some())
+        // RTL8822BE belongs to rtw88.
+        && __module_thunk_for_test(PCI_VENDOR, 0xB822).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let refused = PCI_DEVICES
+        .iter()
+        .filter_map(|&did| __module_thunk_for_test(PCI_VENDOR, did))
+        .all(|thunk| thunk(0, 0) != 0);
+    let usb_claims = !usb_stack
+        || (USB_IDS
+            .iter()
+            .all(|&(vid, pid)| rtl_e2e_foreign_usb_claim(vid, pid) == -16)
+            // RTL8821CU belongs to rtw88.
+            && rtl_e2e_foreign_usb_claim(0x0BDA, 0xC811) == 0);
+    drop(module);
+    if sys_delete_module("rtl").is_err() {
+        return TestResult::Fail("could not unload rtl.ko");
+    }
+    if !live {
+        return TestResult::Fail("rtl.ko not Live after init");
+    }
+    if !params {
+        return TestResult::Fail("rtl.ko parameters missing or the load argument not applied");
+    }
+    if !pci_claims {
+        narf_console::write_str(&format!(
+            "rtl: module installed {installed} PCI matches, table has {}\n",
+            PCI_DEVICES.len()
+        ));
+        return TestResult::Fail("rtl.ko did not claim exactly the rtlwifi PCI table");
+    }
+    if !refused {
+        return TestResult::Fail("rtl.ko probe accepted a token with no device context");
+    }
+    if !usb_claims {
+        return TestResult::Fail("rtl.ko did not hold exactly the rtl8xxxu USB table");
+    }
+    if count() != before
+        || PCI_DEVICES
+            .iter()
+            .any(|&did| __module_thunk_for_test(PCI_VENDOR, did).is_some())
+    {
+        return TestResult::Fail("rtl.ko unload left a PCI match");
+    }
+    if usb_stack
+        && USB_IDS
+            .iter()
+            .any(|&(vid, pid)| rtl_e2e_foreign_usb_claim(vid, pid) != 0)
+    {
+        return TestResult::Fail("rtl.ko unload left a USB match");
+    }
+    if !usb_stack {
+        narf_console::write_str("rtl: no USB stack in this kernel; USB claims not checked\n");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/rtl", e2e_rtl_module_registration);
+
+// ── iwlwifi.ko ──────────────────────────────────────────────────────────
+
+/// The real iwlwifi `.ko` (`narf-drivers-wireless-iwlwifi --features
+/// module`: the driver's PCIe transport, firmware loader, MLD station path and
+/// in-driver supplicant over `narf-module-rt` and the KABI). The relocations
+/// for the driver, `core`/`alloc` and the protocol crates resolve and init
+/// runs; the module claims exactly the 28 ids of the built-in table (Gen2
+/// Qu/QuZ/CC and Gen3 Ty, So, Ma, Bz and Sc) and no other Intel id; a probe
+/// with no device context is refused before any device access; and unload
+/// leaves no match. QEMU has no Intel Wi-Fi device, so bring-up itself is
+/// proven on hardware.
+fn e2e_iwlwifi_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const INTEL: u16 = 0x8086;
+    const CLAIMED: [u16; 28] = [
+        0x2723, 0x02f0, 0x06f0, 0x34f0, 0x3df0, 0x4df0, 0x43f0, 0xa0f0, 0x7df0, 0x2725, 0x51f0,
+        0x51f1, 0x54f0, 0x7a70, 0x7af0, 0x7f70, 0x2729, 0x7e40, 0x272b, 0x7740, 0x4d40, 0xa840,
+        0x6e70, 0x9327, 0xd240, 0xd340, 0xe340, 0xe440,
+    ];
+    // Intel Wi-Fi ids the built-in table does not match either (9260, 9560,
+    // AX101): nothing claims them.
+    const UNCLAIMED: [u16; 3] = [0x2526, 0x9df0, 0xa0f1];
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/iwlwifi.ko")
+    else {
+        return TestResult::Fail("iwlwifi module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("iwlwifi module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module_with_params(&image, "") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("iwlwifi.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let claims = module.name() == "iwlwifi"
+        && count() == before + CLAIMED.len()
+        && CLAIMED
+            .iter()
+            .all(|&did| __module_thunk_for_test(INTEL, did).is_some())
+        && UNCLAIMED
+            .iter()
+            .all(|&did| __module_thunk_for_test(INTEL, did).is_none());
+    // A bogus token (no device context): the identity read fails first.
+    let refused = CLAIMED
+        .iter()
+        .all(|&did| __module_thunk_for_test(INTEL, did).is_some_and(|thunk| thunk(0, 0) != 0));
+    drop(module);
+    if sys_delete_module("iwlwifi").is_err() {
+        return TestResult::Fail("could not unload iwlwifi.ko");
+    }
+    if !live {
+        return TestResult::Fail("iwlwifi.ko did not reach Live");
+    }
+    if !claims {
+        return TestResult::Fail("iwlwifi.ko did not claim exactly the built-in table's PCI ids");
+    }
+    if !refused {
+        return TestResult::Fail("iwlwifi.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || CLAIMED
+            .iter()
+            .any(|&did| __module_thunk_for_test(INTEL, did).is_some())
+    {
+        return TestResult::Fail("iwlwifi.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/iwlwifi", e2e_iwlwifi_module_registration);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]

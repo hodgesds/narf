@@ -25,7 +25,7 @@
 
 #![allow(dead_code)]
 
-use narf_bus::MmioRegion;
+use crate::platform::bus::MmioRegion;
 
 use super::rf::{write_rfreg, RfPath, RF_LC_TRIM};
 
@@ -91,7 +91,7 @@ pub unsafe fn set_channel(
         }
     }
     // Linux waits 10 µs between channel-change writes; honour it.
-    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(10 * 1_000));
+    crate::platform::time::busy_wait_cycles(crate::platform::time::ns_to_cycles(10 * 1_000));
 
     let _ = RF_LC_TRIM;
     Ok(freq)

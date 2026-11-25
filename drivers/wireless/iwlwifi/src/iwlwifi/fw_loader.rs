@@ -29,6 +29,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::vec::Vec;
 
 use super::transport::IML_SECTION_SENTINEL;

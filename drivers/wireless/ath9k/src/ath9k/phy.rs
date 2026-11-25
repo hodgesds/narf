@@ -9,6 +9,8 @@ use super::{
     initvals::*,
     EEPROM_4K_BYTES,
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_bus, narf_capabilities};
 
 /// Registers prepared on a quiescent device, including modal/RF and the
 /// EEPROM detector/rate tables and legacy20 mode/chain/synth/slope/spur setup.

@@ -12,6 +12,8 @@
 //! `IWL_MVM_STATUS_HW_RESTART_REQUESTED`.
 use super::super::mvm_d3::{self as d3, D3Api, Wake, WakeReport};
 use super::{Owner, Phase};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::vec::Vec;
 
 /// `IWL_MVM_D3_NOTIF_TIMEOUT` (HZ / 3).

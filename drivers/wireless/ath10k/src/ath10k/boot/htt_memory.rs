@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! HTT RX, continuous fragments and PFC memory remain with mission-mode DMA.
 use super::{allocate, PciBoot};
+use crate::ath10k::platform::dma::DmaBuffer;
+use crate::ath10k::platform::pci::BusDeviceCap;
+use crate::ath10k::platform::pci::{Cap, CapError, CapOp, Write};
 use crate::ath10k::{
     ce::Ath10kMmio,
     dma::barrier,
     htt_runtime::{storage::Storage, Config, DmaConfig, Error, HttMemory},
 };
-use narf_bus::BusDeviceCap;
-use narf_capabilities::{Cap, CapError, CapOp, Write};
-use narf_io::DmaBuffer;
 
 struct PublishQueue<'a> {
     storage: &'a mut Storage<DmaBuffer>,

@@ -34,11 +34,11 @@
 
 use super::power_limit::Bandwidth;
 use super::txpower::{self, ByRate, Factory as FactoryPower};
+use crate::platform::capabilities::{Cap, NoopOp, Read};
+use crate::platform::firmware::FirmwareBlob;
 use crate::rtlwifi::channel_power::{domain_ceiling, Error};
 use crate::rtlwifi::efuse::Factory;
 use alloc::{format, vec::Vec};
-use narf_capabilities::{Cap, NoopOp, Read};
-use narf_firmware::FirmwareBlob;
 
 const HEADER: usize = 96;
 const ROW: usize = 4 + 3 * 64 * 2;
@@ -354,7 +354,7 @@ impl Calibration {
         &self,
         operation: impl FnOnce() -> Result<T, crate::rtlwifi::prepare::Error>,
     ) -> Result<T, crate::rtlwifi::prepare::Error> {
-        use narf_capabilities::{CapError, CapOp};
+        use crate::platform::capabilities::{CapError, CapOp};
         struct Invoke<F>(F);
         impl<T, F: FnOnce() -> Result<T, crate::rtlwifi::prepare::Error>> CapOp<FirmwareBlob, Read>
             for Invoke<F>
@@ -384,12 +384,12 @@ impl Calibration {
                 version, m[0], m[1], m[2], m[3], m[4], m[5]
             )
         };
-        let authority = narf_firmware::trusted_loader_authority()
+        let authority = crate::platform::firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive::<Read>().ok())
             .ok_or(Error::Authority)?;
         let asset =
             match crate::firmware_asset::load(&authority, &name(2), HEADER + V2_ROWS * ROW, true) {
-                Err(narf_firmware::FirmwareError::NotFound) => {
+                Err(crate::platform::firmware::FirmwareError::NotFound) => {
                     crate::firmware_asset::load(&authority, &name(1), HEADER + 11 * ROW, true)
                 }
                 other => other,

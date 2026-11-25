@@ -219,6 +219,7 @@ mod tests;
 
 #[path = "mvm_active_scan.rs"]
 mod active_scan;
+#[cfg(feature = "builtin")]
 #[path = "mvm_scheduled.rs"]
 pub(super) mod scheduled;
 #[path = "mvm_smem.rs"]
@@ -246,7 +247,9 @@ mod amsdu;
 mod ba;
 #[path = "mvm_phy.rs"]
 mod phy;
+#[cfg(feature = "builtin")]
 pub(super) use phy::local_ht;
+#[cfg(feature = "builtin")]
 pub(super) use phy::{local_ht_for, local_vht_for};
 #[path = "mvm_ap_power.rs"]
 mod ap_power;
@@ -259,13 +262,17 @@ pub(in crate::iwlwifi) type ApPowerPlan = ap_power::Plan;
 pub(in crate::iwlwifi) type ApPreparedPower = power::Prepared;
 pub(in crate::iwlwifi) type P2pPower = p2p_power::Fence;
 pub(in crate::iwlwifi) type P2pPowerPlan = p2p_power::Plan;
+#[cfg(feature = "builtin")]
 #[path = "mvm_ap.rs"]
 mod ap;
+#[cfg(feature = "builtin")]
 #[path = "mvm_p2p.rs"]
 mod p2p;
+#[cfg(feature = "builtin")]
 pub(in crate::iwlwifi) type P2pPreparation = p2p::Preparation;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
+#[cfg(feature = "builtin")]
 pub(super) use power::feature as feature_bits;
 pub(super) use power::Emission as PowerEmission;
 
@@ -306,10 +313,12 @@ mod wowlan;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) use rsna::tests::Device as SecurityModel;
 pub(in crate::iwlwifi) use station::Credential;
+#[cfg(feature = "builtin")]
 pub(super) use wowlan::Resumed as WowlanResumed;
 
 #[path = "mvm_rx_multi.rs"]
 mod rx_multi;
 
+#[cfg(feature = "builtin")]
 #[path = "mvm_client_control.rs"]
 mod client_control;

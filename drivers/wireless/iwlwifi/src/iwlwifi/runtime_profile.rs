@@ -152,6 +152,7 @@ impl Hardware {
         self.command(3, 0xa, &peer[..length]).await?;
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) fn install_ap_owner(
         &mut self,
         owner: alloc::sync::Arc<super::super::ap_owner::Owner>,
@@ -163,6 +164,7 @@ impl Hardware {
         self.ap_owner = Some(owner);
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn ap_tlc(
         &mut self,
         body: &[u8; 44],
@@ -179,6 +181,7 @@ impl Hardware {
         }
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn ap_peer(
         &mut self,
         peer: &[u8; 104],
@@ -199,6 +202,7 @@ impl Hardware {
         }
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn ap_phy(
         &mut self,
         canonical: &[u8; 32],

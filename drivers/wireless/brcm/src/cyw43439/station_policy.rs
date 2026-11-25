@@ -7,20 +7,25 @@ use core::{
     future::{poll_fn, Future},
     task::Poll,
 };
-use narf_wireless::reg::{db::Database, RegulatoryDomain};
+#[cfg(feature = "builtin")]
+use narf_wireless::reg::db::Database;
+use narf_wireless::reg::RegulatoryDomain;
 
 /// A trusted policy installer supplies an immutable current snapshot or
 /// absence. This seam does not authenticate arbitrary caller-created domains.
 pub trait PolicySource: Send + Sync {
     fn snapshot(&self) -> Option<Arc<RegulatoryDomain>>;
 }
+#[cfg(feature = "builtin")]
 impl PolicySource for Database {
     fn snapshot(&self) -> Option<Arc<RegulatoryDomain>> {
         Database::snapshot(self)
     }
 }
+#[cfg(feature = "builtin")]
 #[derive(Debug)]
 pub struct GlobalPolicy;
+#[cfg(feature = "builtin")]
 impl PolicySource for GlobalPolicy {
     fn snapshot(&self) -> Option<Arc<RegulatoryDomain>> {
         narf_wireless::reg::db::snapshot()

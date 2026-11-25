@@ -1,6 +1,7 @@
 //! Retained native P2P-device work; dropping the borrowed CLI waiter never
 //! drops a published command, actual BSS owner or serialization lease.
 use super::*;
+use crate::platform::ap_control::RadioControlAuthority;
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
@@ -9,7 +10,6 @@ use core::{
     future::Future,
     sync::atomic::{AtomicBool, Ordering},
 };
-use narf_wireless::ap_control::RadioControlAuthority;
 #[path = "boot_p2p_management.rs"]
 pub(crate) mod management;
 #[path = "boot_p2p_management_tx.rs"]
@@ -58,7 +58,7 @@ pub(crate) async fn request(
         .ok_or(Error::Authority)?
         .request_current(&authority)
         .map_err(|_| Error::Authority)?;
-    let result = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
+    let result = Arc::new(crate::platform::IrqSafeSpinLock::new(None));
     let generation;
     {
         let Some(mut work) = KEY_WORK.try_lock() else {
@@ -104,7 +104,7 @@ pub(crate) async fn request(
 pub(crate) async fn delete(
     iface: Weak<crate::iface::p2p::P2pDeviceIface>,
     authority: Arc<RadioControlAuthority>,
-) -> Result<narf_wireless::ap_control::RadioControlRetirement, Error> {
+) -> Result<crate::platform::ap_control::RadioControlRetirement, Error> {
     let concrete = iface.upgrade().ok_or(Error::Authority)?;
     concrete
         .request_current(&authority)
@@ -117,7 +117,7 @@ pub(crate) async fn delete(
         terminal: false,
     };
     let _ = finish_boot_keys().await;
-    let result = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
+    let result = Arc::new(crate::platform::IrqSafeSpinLock::new(None));
     let generation;
     {
         let Some(mut work) = KEY_WORK.try_lock() else {
@@ -164,7 +164,7 @@ pub(super) async fn delete_session<B: Backend>(
     authority: Arc<RadioControlAuthority>,
     alive: Arc<AtomicBool>,
     expected_mac: [u8; 6],
-) -> Result<narf_wireless::ap_control::RadioControlRetirement, Error> {
+) -> Result<crate::platform::ap_control::RadioControlRetirement, Error> {
     let completed = run_session(
         session,
         iface.clone(),

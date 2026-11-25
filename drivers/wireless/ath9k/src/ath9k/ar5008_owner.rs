@@ -29,12 +29,19 @@
 //! `CONTROL` or the station mutex and the MSI handler never touches the
 //! BAR. DFS, NO_IR and indoor-only 5 GHz channels are refused by
 //! `Permission::from_domain_dual`. HT stays AR9285-only.
+use super::pcie_pm;
 use super::{
     admission, calibration, channels,
     chips::{Chip, Revision},
-    identity, interface, mac, packet, packet_native, pcie_pm, phy, station, BringUpError,
-    RetainedRadio, CLAIMED_ADDRESS, CONTROL,
+    identity, interface, mac, packet, packet_native, phy, station, BringUpError, RetainedRadio,
+    CONTROL,
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{
+    narf_bus, narf_capabilities, narf_console, narf_lib, narf_net, narf_scheduler, narf_time,
+};
+// The singleton reservation probe takes and remove releases.
+use super::CLAIMED_ADDRESS;
 use alloc::{boxed::Box, sync::Arc};
 use core::fmt::Write as _;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
@@ -192,14 +199,14 @@ fn bad(device: u16, stage: &str, error: BringUpError) -> narf_bus::ProbeError {
     narf_bus::ProbeError::BadDevice
 }
 
+#[cfg(feature = "builtin")]
 pub(super) fn probe(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
-    let Some(chip) = matches(&device.id) else {
+    if matches(&device.id).is_none() {
         return Err(narf_bus::ProbeError::NotForThisDriver);
-    };
-    let id = device.id.device;
+    }
     // Same singleton reservation as AR9285, before any hardware access.
     let previous = {
         let mut claimed = CLAIMED_ADDRESS.lock();
@@ -217,6 +224,22 @@ pub(super) fn probe(
         ));
     }
     let mmio = narf_drivers_wireless_ath_core::qualcomm_pci::map_bar_control(&device, &cap, 0)?;
+    bring_up(device, cap, mmio)
+}
+
+/// Everything after the bus binding reserved the address, parked the
+/// function and mapped BAR0: the same in both builds. Built in, [`probe`]
+/// binds through `narf_bus`; in the module, `pci_kabi.rs` binds through
+/// the KABI and calls this.
+pub(super) fn bring_up(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    mmio: MmioRegion,
+) -> Result<(), narf_bus::ProbeError> {
+    let Some(chip) = matches(&device.id) else {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    };
+    let id = device.id.device;
     if mmio.len < phy::REQUIRED_BAR {
         return Err(narf_bus::ProbeError::BadDevice);
     }
@@ -276,7 +299,9 @@ pub(super) fn probe(
         identity.rx_chainmask,
         identity.tx_chainmask
     );
-    let (vendor, device_id) = (device.id.vendor, device.id.device);
+    #[cfg(feature = "builtin")]
+    let vendor = device.id.vendor;
+    let device_id = device.id.device;
     let owner = Arc::new(Mutex::new(Owner {
         mmio,
         device,
@@ -301,6 +326,7 @@ pub(super) fn probe(
         pinned: false,
     }));
     *OWNER.lock() = Some(owner.clone());
+    #[cfg(feature = "builtin")]
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(
             DEVICES
@@ -354,7 +380,8 @@ pub(super) fn probe(
 
 /// Calibrate under the signed ceiling, then compose the native owners.
 async fn initialize(owner: &Mutex<Owner>) -> Result<calibration::ar5008::Report, BringUpError> {
-    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+    let domain =
+        crate::ath9k::platform::regdb::ensure_domain().map_err(|_| BringUpError::Policy)?;
     if narf_net::trusted_net_authority().is_none() {
         return Err(BringUpError::Policy);
     }
@@ -390,7 +417,9 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<calibration::ar5008::Report,
         };
         let mut future = core::pin::pin!(future);
         core::future::poll_fn(|cx| {
-            if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_dual_in(&d)) {
+            if crate::ath9k::platform::regdb::snapshot()
+                .is_none_or(|d| !permission.current_dual_in(&d))
+            {
                 return core::task::Poll::Ready(Err(BringUpError::Policy));
             }
             grant
@@ -515,7 +544,7 @@ async fn reset(
         let target = selected.unwrap_or(o.primary);
         if selected.is_some() {
             let domain =
-                narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+                crate::ath9k::platform::regdb::ensure_domain().map_err(|_| BringUpError::Policy)?;
             calibration::Permission::from_domain_dual(&domain, target)?;
         }
         // An absent, unsigned or foreign record for the target never
@@ -706,6 +735,7 @@ async fn retire(o: &mut Owner) -> bool {
 /// (`pcie_pm::configure_ar5008` D3 word, ASPM AR5418 only) and FULL_SLEEP,
 /// which keeps the AR5416 RTC out of reset (`identity::sleep_ar5008`). A generation reset in flight
 /// holds `CONTROL` and reports Busy.
+#[cfg(feature = "builtin")]
 pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     use narf_power::device_pm::DeviceSuspendError;
     let _control = CONTROL.try_lock().ok_or(DeviceSuspendError::Busy)?;
@@ -741,6 +771,7 @@ pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendErr
 /// suspend reset, then a warm generation reset (power-on reset, identical
 /// revision/radio/identity/map, INI/PLL/RF and board values, three-chain TX
 /// power, calibration) republishes the station at the retained primary.
+#[cfg(feature = "builtin")]
 pub(super) fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     use narf_power::device_pm::DeviceSuspendError;
     let Some(owner) = OWNER.lock().clone() else {

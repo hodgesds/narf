@@ -393,7 +393,7 @@ impl<B: Bus> Cr4<B> {
         Chip::reset_core(&mut self.bus, self.arm, 0x20, 0, 0).map_err(Error::Chip)?;
         let mut shared = sentinel;
         let mut failure = None;
-        let ready = narf_scheduler::responsive_spin_until(
+        let ready = crate::platform::responsive_spin_until(
             || match read32(&mut self.bus, tail) {
                 Ok(value) => {
                     shared = value;
@@ -404,7 +404,7 @@ impl<B: Bus> Cr4<B> {
                     true
                 }
             },
-            narf_time::Deadline::after_ms(5_000),
+            crate::platform::time::Deadline::after_ms(5_000),
         );
         if let Some(error) = failure {
             return Err(error);

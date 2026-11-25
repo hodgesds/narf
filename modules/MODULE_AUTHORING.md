@@ -196,6 +196,8 @@ So the surface is small and grows deliberately. Today:
 | `narf_msi_enable` | `(u64, u16, *mut u16, *mut u16, *mut u64, *mut u32) -> i32` | exactly `want` (power of two ≤ 32) aligned plain-MSI vectors, delivery left off; writes count, first kernel vector, Message Address and vector 0's Data; `-28` ask for fewer, `-95` no MSI, `-16` MSI/MSI-X already set up; requires `BusDevice` |
 | `narf_msi_set_enabled` | `(u64, u32) -> i32` | flip MSI delivery for that block |
 | `narf_pcie_aspm` | `(u64, u16, *mut u16) -> i32` | set Link Control's ASPM field (bits 1:0) only; writes the previous field |
+| `narf_pci_config_write32` | `(u64, u16, u32) -> i32` | config dword in the device-specific window 0x40..0x100 (dword-aligned); `-1` (EPERM) inside the PM, MSI, MSI-X or PCI Express capability or any capability header; vendor-specific bodies writable; requires `BusDevice` |
+| `narf_pci_command` | `(u64, u16, u16, *mut u16) -> i32` | clear then set Command bits (decode 0x2, master 0x4, INTx disable 0x400 only) and write the readback; requires `BusDevice` |
 | `narf_msix_enable` | `(u64) -> i32` | discover/retain MSI-X; `-95` when unsupported; requires `BusDevice` |
 | `narf_msix_claim` | `(u64, *mut u16) -> i32` | allocate/program one kernel IRQ vector |
 | `narf_irq_set_handler` | `(u64, u16, usize, u64) -> i32` | attach `extern "C" fn(u64) -> i32`; callback runs in task context |
@@ -223,6 +225,15 @@ So the surface is small and grows deliberately. Today:
 | `narf_smbios_read` | `(usize, *mut u8, usize, *mut usize) -> i32` | copy the firmware SMBIOS structure table from an offset; writes its total length; `-61` with no table |
 | `narf_firmware_signed` | `(u64) -> i32` | 1/0: whether an open firmware handle carries a verified signer; requires `Firmware` |
 | `narf_module_param` | `(*const u8, usize, *mut u8, usize, *mut usize) -> i32` | the calling module's parameter value (see [Module parameters](#module-parameters)); `-2` undeclared, `-105` with the needed length |
+| `narf_pcie_state` | `(u64, *mut u8, usize) -> i32` | 20-byte LE record: Device Caps/Control/Status, Link Caps/Status, upstream Link Control + presence flag; requires `BusDevice` |
+| `narf_pci_config_read32` | `(u64, u16, *mut u32) -> i32` | read-only aligned config dword at `0x40..=0xffc` (never the standard header); requires `BusDevice` |
+| `narf_wireless_regdomain` | `(*mut u8, usize, *mut usize) -> i32` | the host's installed regulatory domain as one NRGD v1 record (decode with `narf_wireless::reg::parse_domain_record`, which accepts the world domain "00"); `-61` none, `-105` with the needed length; requires `NetIface` |
+
+| `narf_bar_map_control` | `(u64, u8) -> u64` | as `narf_bar_map`, but Device attributes even on a prefetchable BAR (control registers); same handle space |
+| `narf_mmio_read8` | `(u64, u64, u64, *mut u8) -> i32` | bounded 8-bit BAR read |
+| `narf_mmio_read16` | `(u64, u64, u64, *mut u16) -> i32` | bounded, 2-byte-aligned 16-bit BAR read |
+| `narf_mmio_write8` | `(u64, u64, u64, u8) -> i32` | bounded 8-bit BAR write |
+| `narf_mmio_write16` | `(u64, u64, u64, u16) -> i32` | bounded, 2-byte-aligned 16-bit BAR write |
 
 Declare them as you would any foreign function:
 
@@ -337,6 +348,44 @@ services sit behind one `platform` module that re-exports the kernel crates
 (built in) or `narf-module-rt` plus KABI wrappers (module) under the same
 names. Pure protocol crates are linked with their `kernel` feature off.
 `modules/e2e/ath11k` loads it.
+
+`drivers/wireless/mt76` (`mt76.ko`, MT7921/MT7922) follows the same shape
+for a driver whose kernel-only features (AP/P2P control authorities, WoW,
+system PM) are woven through its shared owner: `src/platform/kabi.rs` gives
+those types an unconstructible stand-in, so the owner code links unchanged
+and the paths that need them cannot be reached. `modules/e2e/mt76` loads it.
+
+`drivers/wireless/ath10k` follows the same shape and adds two patterns. Its
+transport was written against `narf-bus` types (`BusDevice`,
+`Cap<BusDeviceCap, Write>`, `MmioRegion`, the `pci`/`pci_express` config
+helpers); the module platform provides those names over the KABI
+(`narf_pci_command`, `narf_pcie_state`, the device-specific config dwords),
+so the transport code is unchanged. Kernel-only authorities the radio code merely
+carries (`narf_wireless::ap_control`) become structs with a private
+uninhabited field, so the code compiles unchanged and no value can exist in
+the `.ko`. `modules/e2e/ath10k` loads it.
+
+`drivers/wireless/rtw` (rtw88 USB) is the USB full-driver example. A driver
+that names many kernel crates directly can keep its bodies unchanged: its
+`platform` module defines modules with the kernel crates' own names
+(`platform::narf_time`, ...), and each driver file imports them under
+`#[cfg(feature = "module")]`. Import them explicitly, not with a glob: a
+glob import that shadows a crate also in the extern prelude (a kernel-free
+`narf_wireless`) is ambiguous (E0659). PCI types the USB build cannot have
+are uninhabited enums, so shared PCI-only branches compile and are provably
+unreachable. A USB function's heartbeat and netdev come from
+`narf_usb_spawn_poller` and `narf_usb_netif_*` (the bus-context exports
+refuse USB tokens). `modules/e2e/rtw88` loads it.
+
+`drivers/wireless/iwlwifi` takes the same split for a driver whose files name
+the kernel crates directly. Its `src/iwlwifi/module/kernel.rs` defines
+modules named like the kernel crates (`narf_time`, `narf_io`, ...) holding the
+subset the module-built files use, and each such file adds
+`#[cfg(feature = "module")] use crate::iwlwifi::module::kernel::*;`, which
+shadows the absent extern crates; the built-in build is untouched. Roles the
+module does not carry are uninhabited types under the shared code's names
+(`module/absent.rs`), so that code compiles unchanged and the unreachable
+paths are proven so by the type checker. `modules/e2e/iwlwifi` loads it.
 
 ## Lifecycle symbols
 

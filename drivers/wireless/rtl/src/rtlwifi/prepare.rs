@@ -753,7 +753,7 @@ pub(crate) mod station;
 /// This is the actual native worker's shared storage/await boundary. An async
 /// mutex, unlike an IRQ-disabling guard, may span the self-driven LLT wait.
 pub(super) async fn retain_and_prepare<I: Io, M: Memory>(
-    retained: &narf_lib::mutex::Mutex<Option<Prepared<I, M>>>,
+    retained: &crate::platform::lib::mutex::Mutex<Option<Prepared<I, M>>>,
     prepared: Prepared<I, M>,
 ) -> Result<(), Error> {
     let mut storage = retained.lock().await;

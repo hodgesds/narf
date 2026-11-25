@@ -2624,6 +2624,748 @@ feature off).
   leaves no match. QEMU emulates no WCN6855, so bring-up and RF behavior
   are first proven on hardware (`docs/BOOTING_ON_CACHYOS.md`).
 
+### 4.3 `iwlwifi.ko`: the iwlwifi stations as a loadable module
+
+`narf-drivers-wireless-iwlwifi --no-default-features --features module` is
+the driver's station for every id of its built-in table, built into a `.ko`
+(x86_64 and aarch64) from the same source as the built-in. `narf-crypto` and
+`narf-wireless` are linked kernel-free. Two stations, as built in:
+
+- **Gen3** (Ty AX210, So/Ma AX211, Bz BE200/BE20x, Sc BE20x/BE21x): the
+  PCIe transport (`runtime::Hardware`, which selects the API89, Bz or MLD
+  profile), the firmware TLV/PNVM loader and the MLD station
+  (`connection::Connection`, with the in-driver WPA2-PSK / WPA3-SAE
+  supplicant and 802.11w), orchestrated by `module/netdev.rs` as
+  `device::Device` does.
+- **Gen2** (Qu/QuZ AX201, CC AX200): the same transport on its 22000 path
+  and the retained API77 MVM owner (`mvm_boot::Owner`, with the native
+  WPA2-PSK four-way owner or host SAE plus PMF, and its signed per-platform
+  TX-power programs), orchestrated by `module/mvm_netdev.rs` as
+  `mvm_device::Device` does, under the same publication fences.
+
+- **Platform.** `src/iwlwifi/module/kernel.rs` defines modules named like
+  the kernel crates (`narf_time`, `narf_io`, `narf_lib`, `narf_bus`,
+  `narf_capabilities`, `narf_console`, `narf_scheduler`, `narf_net`,
+  `narf_firmware`, `narf_firmware_smbios`) with the subset of each API the
+  module-built files use, over `narf-module-rt` and the KABI. Each such file
+  imports them under `cfg(feature = "module")`, shadowing the absent extern
+  crates, so the driver text is the same in both builds. A `Cap` is the probe
+  token there: the kernel checks it on every KABI call and revokes it at
+  teardown. Kernel-bound halves have module variants:
+  - `module/mmio.rs`: BAR0 and the built-in PCI command sequences with their
+    read-back checks, over `narf_pci_command`;
+  - `module/msix.rs`: two `narf_msix_claim` vectors for the RX and non-RX
+    table entries; the task-context callbacks latch the causes the built-in
+    hard IRQ latches;
+  - `module/source.rs`: firmware bytes are a private copy, so the source
+    fence is the PCI authority;
+  - `module/firmware_asset.rs`: assets carry their verified signer
+    (`narf_firmware_signer`) and SHA-256, as built in, so the Gen2 signed
+    power programs are admitted on the same evidence;
+  - `narf_firmware_smbios`: the SMBIOS system/board/BIOS records the Gen2
+    power binding digests, parsed from the kernel's own table
+    (`narf_smbios_read`) with the kernel parser's rules;
+  - `module/platform_power.rs`: see below.
+- **Roles not carried** are uninhabited types under the names the shared code
+  uses (`module/absent.rs`: the P2P client, the P2P GO identity, and the
+  transport's and the Gen2 owner's AP/P2P hooks answered as the built-in
+  answers them with no such role installed), so the station code compiles
+  unchanged and the compiler proves those paths unreachable. AP/P2P/
+  scheduled-scan owners, `device`, `mvm_device`, `bootstrap` and the ACPI
+  platform readers are `cfg(builtin)`.
+- **Claim.** All 28 ids of the built-in table (`iwlwifi::module_carries`).
+  `narf-drivers-wireless/iwlwifi-module-only` leaves exactly those to the
+  `.ko`.
+- **Probe** (`module/pci.rs`, the built-in `probe` + `bootstrap` order).
+  1. `narf_pci_identity`, the chip table and subsystem qualification.
+  2. Firmware-owned DMA retained on teardown.
+  3. `narf_pci_prepare_probe`, park, BAR0, memory decode on, bus master off.
+  4. The CSR MAC/RF identity selects the profile and its firmware
+     (`bootstrap::Owner::candidates`): the Sc core ladder, Bz's core103
+     image, the API89 image, or Gen2's exact API77 image. A refused identity
+     refuses the probe.
+  5. The `WIFI` session, the 1 ms poller and the startup task.
+  The startup task loads the firmware (120 x 500 ms retries while not
+  staged), admits the parsed executable and re-reads the identity as
+  `bootstrap::Owner::start` / `start_mvm` do, and boots the transport: Gen3
+  through `mld_start.rs` (shared with `Device`), Gen2 through
+  `Owner::initialize`.
+- **Regulatory.** Both stations derive their TX-power program from the
+  kernel's regulatory domain. `module/regulatory.rs` copies it through the
+  shared `narf_wireless_regdomain` KABI export (one NRGD v1 record, decoded
+  by the kernel-free `narf_wireless::reg::parse_domain_record`, which accepts
+  the boot-time world domain "00" as the built-in read does) and caches one
+  snapshot until the domain changes; the services re-read it every second,
+  and a change fails the station fences and drops carrier, as a built-in
+  reinstall does. Without a domain the stations refuse association and scan passively,
+  as built in.
+- **Platform power.** The module has no KABI for the device's ACPI
+  WRDS/EWRD/WGDS/PPAG objects, so the Gen3 owner takes Linux's absent-tables
+  path: nothing is published and the firmware keeps its own limits. The Gen2
+  owner needs no ACPI: its power comes from the signed per-platform programs.
+- **Netdev and wiphy.** `wlan%d` through the netif bridge; `REGISTER_WIPHY`
+  from the NVM (channels, HT/VHT/HE/EHT, CCMP, and the SME offloads the
+  station supports). Scan, connect (a `CONNECT` without a BSSID takes the
+  strongest matching network of the last scan), the service loop (RX,
+  rekeying, BA maintenance, TX under queue credit or publication fences,
+  beacon and policy loss as `DISCONNECTED`), disconnect, and a firmware
+  restart before the next operation after any failure.
+- **Not carried (built-in only).** AP, P2P, monitor and virtual interfaces;
+  scheduled scan; MLO further links; roaming; WoWLAN/D3 and system PM; CQM
+  events; checksum offload; BIOS SAR/PPAG (ACPI).
+- **Proof.** `modules/e2e/iwlwifi` loads the real `.ko`: relocations and
+  init, exactly the 28 ids claimed and no other Intel id, refusal of a probe
+  with no device context, clean unload. QEMU emulates no Intel Wi-Fi device,
+  so firmware boot, scan and association through the module are unverified
+  until run on hardware.
+
+### 4.4 `mt76.ko`: the MT7921/MT7922 driver as a loadable module
+
+`narf-drivers-wireless-mt76 --no-default-features --features module` is the
+CONNAC2 PCI station driver built into a `.ko` (x86_64 and aarch64) from the
+same source as the built-in: the L1 register planner, WFDMA rings, MCU
+framing, patch/RAM firmware download, the post-firmware NIC/EFUSE/MAC
+initialization, the station join with its in-driver WPA2/WPA3 supplicant
+(SAE, PMF, rekeys), BA/reorder/defragmentation and the packet path. Kernel
+services come from `src/platform/`: `kernel.rs` re-exports the kernel crates;
+`kabi.rs` implements the same names over `narf-module-rt` and the KABI.
+`narf-crypto` and `narf-wireless` are linked kernel-free.
+
+- **Claim.** The built-in table: `14c3:{7961,7922,0608,0616,7920,7925,0717}`
+  and `0e8d:7922`. Both builds match MT7925 (`14c3:7925` and its `0717`
+  alias, CONNAC3), and both chip-id gates still refuse it: what
+  `MT_HW_CHIPID` reads on that silicon is open (#2494).
+  `narf-drivers-wireless/mt76-module-only` leaves the built-in PCI ids
+  unclaimed so an early-loaded `mt76.ko` owns the function; the private
+  family host below stays registered.
+- **Probe** (`mt7921/pci_kabi.rs`, the built-in `bring_up_current`).
+  1. `narf_pci_identity` against the table; firmware-owned DMA is retained
+     on teardown from the start.
+  2. `narf_pci_prepare_probe`; the parked command register is verified
+     through `narf_pci_command`.
+  3. BAR0 mapped; every identity/power register must lie inside it.
+  4. Memory decode with INTx disabled, bus mastering off (the function may
+     carry WFDMA ring bases from firmware or a previous OS).
+  5. ASPM off (`narf_pcie_aspm`).
+  6. Chip id/revision/bond and the MT7961 → MT7920 retag.
+  7. Driver ownership and the WFSYS reset.
+  8. The 1 ms poller drives the module executor, which runs the built-in
+     `boot_radio` task: firmware download, radio initialization, netdev
+     publication, then the built-in retry/recovery schedule.
+  Bus mastering is granted only by the firmware transport after it has
+  programmed its own rings; stop/reset sequences clear and re-read it
+  through `narf_pci_command` (memory decode, bus master and INTx disable
+  only; a bit in both masks is refused). Every call keeps the masks
+  disjoint: restoring the bus clears bus mastering while it sets decode and
+  INTx disable.
+- **DMA and interrupts.** Rings and frame buffers come from
+  `narf_dma_alloc_mapped` (a 4–64 KiB size-class pool over 1 MiB chunks:
+  KABI DMA handles are never reused). The memory is untranslated, so the
+  IOMMU block/restore steps are no-ops and the device-side evidence is the
+  stop proof, as built in outside `IommuMode::PerDomain`. On x86_64 one MSI
+  vector (`narf_msi_enable` + `narf_irq_set_handler`) raises the driver's
+  interrupt line and runs the executor; elsewhere the owner stays polled, as
+  built in.
+- **Firmware and regulatory.** Patch and RAM code are read with
+  `narf_firmware_open`/`_read` (the `Firmware` manifest cap) under the
+  built-in 16 MiB bound. The regulatory domain is the kernel's installed one
+  (the built-in driver's), read through `narf_wireless_regdomain` as an
+  NRGD v1 record and decoded with `narf_wireless::reg::parse_domain_record`.
+  It is read again on every query, as built in reads the database; the
+  station owner compares domains by value, so a policy change re-admits or
+  revokes the link as built in. When the kernel has no domain (`-ENODATA`)
+  or the record does not decode, the module fails closed exactly as built
+  in: no transmit permission, no active scan, no join. It has no
+  regulatory fallback of its own.
+- **Netdev and wiphy** (`iface_module.rs`).
+  - The netif bridge names the netdev `wlan%d`.
+  - `REGISTER_WIPHY` (§4.1) advertises the firmware-reported bands, HT/VHT,
+    the built-in eight cipher suites and `PSK_OFFLOAD | SAE_OFFLOAD |
+    REPORTS_DISCONNECT`, four scan SSIDs and 600 bytes of scan IEs.
+  - Scan, connect (open, PSK, SAE) and disconnect run the same boot-owner
+    entry points and scan/join helpers (`iface_station.rs`) as the built-in
+    netdev. A `CONNECT` without a BSSID or frequency takes the strongest
+    matching network of the last scan.
+  - The service task is the built-in worker pass: sources masked and
+    acknowledged, one packet step, key service, unmask. RX goes through
+    `narf_netif_rx` under the receive-epoch publication gate; TX frames are
+    queued and serviced on the next pass. Peer loss is reported as
+    `DISCONNECTED` with the AP's reason; a firmware failure resets the radio
+    on the built-in 1 s / 5 s / 30 s schedule.
+- **Parameters.** `.narf_kparams` declares `debug`; `mt76.debug=1` enables
+  the routine traces the built-in prints under `mt76.dyndbg=+p`.
+- **Not carried (built-in only).** AP, P2P and monitor roles (the AP/P2P
+  owner code is linked but no authority can be minted); WoW and system PM;
+  scheduled scan; roaming; CQM, survey and station statistics; power-save
+  control; the association-comeback event; the userspace SME.
+- **Private family.** The mt76 copy-mode family (`0x6d74_3736`, version 1,
+  `module_host.rs`) stays registered unchanged in the built-in build. No
+  in-tree `.ko` opens it any more; it can be retired once no out-of-tree
+  frontend depends on it.
+- **Proof.** `modules/e2e/mt76` loads the real `.ko`: relocations resolve,
+  init runs to Live, the `debug` parameter is declared and applies, exactly
+  the eight ids are claimed, a probe with no device context is
+  refused, and unload leaves no match. QEMU emulates no MediaTek Wi-Fi, so
+  bring-up, firmware download and RF behavior are first proven on hardware.
+
+### 4.5 `ath10k.ko`: the QCA988X–QCA9377 driver as a loadable module
+
+`narf-drivers-wireless-ath10k --no-default-features --features module` is
+the PCIe driver — reset, BMI, firmware/board/OTP/calibration download, CE,
+HTC, WMI, HTT and the retained station radio with its in-driver WPA2-PSK
+and WPA3-SAE supplicant — built into a `.ko` (x86_64 and aarch64) from the
+same source as the built-in, following §4.2. Kernel services come from
+`src/ath10k/platform/` (`kernel.rs` re-exports the kernel crates; `kabi.rs`
+provides the same names over `narf-module-rt` and the KABI). `narf-crypto`,
+`narf-wireless` and `narf-drivers-wireless-ath-core` are linked
+kernel-free.
+
+- **Claim.** Every PCIe id the built-in driver binds: QCA988X (`168c:003c`,
+  Ubiquiti `0777:11ac`), QCA9887 (`0050`), QCA6174 (`003e`), QCA6164
+  (`0041`), QCA99X0 (`0040`), QCA9888 (`0056`), QCA9984 (`0046`), QCA9377
+  (`0042`). Not AR9462 (`0034`), which the built-in only registers to refuse
+  as ath9k's. ath10k has no SDIO/USB/SNOC binder in NARF, so there is
+  nothing else to carry. `narf-drivers-wireless/ath10k-module-only` leaves
+  the built-in ids (and its system-PM hook) unregistered so an early-loaded
+  `ath10k.ko` owns the function.
+- **Probe** (`pci_kabi.rs`, the built-in `probe` + `bring_up` order).
+  1. `narf_pci_identity`; AR9462 and unknown ids are refused.
+  2. DMA retained on teardown (rings and host memory are published to the
+     firmware from power-up on).
+  3. `narf_pci_prepare_probe`, memory decode on, BAR0 mapped; the BAR must
+     cover the family's PCI-local, chip-id, SoC and last-CE windows.
+  4. Target wake and chip id (`pci::identify`, shared with the built-in).
+  5. The 1 ms poller starts the module executor, which runs the built-in
+     `pci::boot_task` unchanged: reset, ASPM off, bus master, BMI, firmware
+     and board download, BMI_DONE, MSI, HTC, WMI, HTT, the radio, then the
+     station publication.
+- **PCI from the transport.** Bus mastering on is `narf_pci_enable`; off
+  and every command read-back are the shared `narf_pci_command` (`clear =
+  bits` to disable, `clear = set = 0` to read). ASPM is `narf_pcie_aspm`.
+  The PCIe Device Control read behind the built-in DMA-reclamation proof
+  (no Relaxed Ordering) is `narf_pcie_state`; the config `0x40`
+  retry-timeout dword is `narf_pci_config_read32`/`_write32`. MSI is one
+  plain vector (`narf_msi_enable(1)`) whose task-context callback raises
+  the same signal the built-in hard-IRQ handler raises and runs the
+  executor.
+- **DMA.** Rings, bounce buffers and WMI/HTT host memory are allocated once
+  per generation, so they are direct `narf_dma_alloc_mapped` allocations
+  (no pool), DMA32 as built in.
+- **Firmware.** Through `narf_firmware_open`/`_read` under the module's
+  `Firmware` manifest cap, with the built-in signer policy (board,
+  pre-cal/cal inputs must be signed). The module's loader record
+  (`firmware_source_module.rs`) keeps the bounded input log and the seal,
+  but holds no per-blob capability: revocation of an input after it was
+  read is not observable from a `.ko`. No Devicetree reaches a module, so
+  DT/NVMEM calibration sources are absent; the SMBIOS BDF variant comes from
+  `narf_smbios_read`.
+- **Regulatory.** The kernel's installed domain (the one the built-in
+  driver reads, with its `iw reg set` and Country-IE changes), copied by
+  `narf_wireless_regdomain` as an NRGD v1 record on every policy check and
+  decoded with `narf_wireless::reg::parse_domain_record` (which accepts the
+  world domain "00"). An unchanged record keeps the
+  previous snapshot, so snapshot identity still follows a change of the
+  installed domain.
+- **Netdev and wiphy** (`iface_module.rs`).
+  - `narf_wireless_open_with_event` (§4.1), then the netdev (`wlan%d`),
+    then `REGISTER_WIPHY`: the radio's station channels, HT/VHT, CCMP, and
+    `PSK_OFFLOAD | SAE_OFFLOAD | REPORTS_DISCONNECT`.
+  - Scan (active, passive, and the associated dwell scan with the data path
+    kept serviced), connect (open, in-driver PSK, in-driver SAE; a `CONNECT`
+    without a BSSID takes the strongest match of the last scan) and
+    disconnect are the built-in `Device` paths over the same `Radio`. The
+    built-in awake power-save default is submitted after association; the
+    `WIFI` host has no power-save control.
+  - One service worker: failed-scan cleanup, the data drain (RX through
+    `narf_netif_rx`, queued TX into HTT, carrier) and the PMF management
+    flush, then a wait on the interrupt signal or the polling backstop.
+  - As built in, a disconnect or an abandoned association closes the
+    retained radio owner; a later association needs a fresh generation.
+- **Recovery.** The built-in automatic recovery (`pci.rs`, `restart.rs`)
+  runs unchanged in the module: a firmware crash (FW_IND_EVENT_PENDING) or a
+  failed scan cleanup retires the generation (CEs halted, bus mastering off
+  through `narf_pci_command` and read back, the ordered flush read) and
+  boots a fresh-ROM one, at most three per load. A generation whose
+  quiescence is not proven keeps its DMA pinned, as built in. The netdev,
+  session and wiphy outlive the generation (`ieee80211_restart_hw`); the
+  next generation rebinds them and replays the retained association
+  (scan for the BSS, then associate with the retained credentials) like the
+  built-in `replay_retained`. An operator disconnect forgets it.
+- **AP/ROC authorities.** The radio's AP, P2P and remain-on-channel code is
+  compiled unchanged, but its `narf_wireless::ap_control` authorities are
+  unconstructible in the module (a private uninhabited field), so nothing in
+  the `.ko` can start those paths.
+- **Not carried (built-in only).** AP/P2P/ROC, WoW and system PM
+  (suspend/resume), power-save control, the userspace SME, DT/NVMEM
+  calibration and the PCI-only diagnostic entry points (`pci::scan_passive`
+  … `pci::poll_ethernet`).
+- **KABI.** Only shared exports; ath10k adds none of its own.
+
+- **Proof.** `modules/e2e/ath10k` loads the real `.ko`: relocations resolve,
+  init runs to Live, exactly the nine ath10k ids are claimed (not AR9462),
+  a probe with no device context is refused, and unload leaves no match.
+  QEMU emulates no Atheros Wi-Fi, so bring-up, scan and association through
+  the module are unverified until a hardware run.
+
+### 4.6 `ath9k.ko`: the softMAC driver as a loadable module
+
+`narf-drivers-wireless-ath9k --no-default-features --features module` is the
+whole ath9k driver built into a `.ko` (x86_64 and aarch64) from the same
+source as the built-in. Every chip owner is included:
+
+- AR5008: AR5416/AR5418/AR9160;
+- AR9280;
+- AR9285/AR2427;
+- AR9287;
+- the AR9300 family: AR9380/AR9485/AR9580/AR9462/AR9565.
+
+For each owner the module carries identity and the EEPROM, signed board
+admission, the INI/PLL/RF tables, signed-policy calibration, the MAC and
+key cache, packet DMA, rate control, the HT/BA/QoS/PS/ANI/BT-sharing
+qualification grants, AR9003 MCI coexistence, idle FULL_SLEEP, generation
+reset, and the station with its in-driver WPA2 supplicant.
+
+There is no firmware: the driver programs the MAC/PHY and enforces the host
+regulatory domain itself. So it needs more from the kernel than a FullMAC
+driver.
+
+- **Platform.** The driver names the kernel crates: `narf_bus`, `narf_lib`,
+  `narf_time`, `narf_scheduler`, `narf_io`, `narf_capabilities`,
+  `narf_firmware`, `narf_net`, `narf_ipc`, `narf_console`, `narf_interrupts`
+  and `narf_power`.
+  - Built in, they are the real crates.
+  - In the module, `src/ath9k/platform/kabi.rs` provides modules with the
+    same names: the subset of each API the driver uses, over
+    `narf-module-rt` and the KABI. A driver file imports them under
+    `#[cfg(feature = "module")]`, so the driver logic is unchanged.
+  - Two names differ in path, so they come from the platform in both
+    builds: `regdb` (`narf_wireless::reg::db`) and `WirelessNetIface`.
+  - `narf-crypto`, `narf-wireless` and `narf-drivers-wireless-ath-core` are
+    linked kernel-free.
+  - A device capability handle is live only while its token is the bound
+    device. A firmware handle is live only while its record is open.
+- **Claim.** The built-in tables' ids, unchanged: fifteen `168c:*` ids,
+  under the module's own match name `ath9k-module`. The match table is keyed
+  on (name, id), so a built-in per-chip name would replace the built-in
+  entry, and unload would remove it. `narf-drivers-wireless/ath9k-module-only`
+  leaves the built-in driver unregistered, so an early-loaded `ath9k.ko`
+  owns the devices.
+- **Probe** (`pci_kabi.rs`). This is the built-in probes' shared bus half,
+  in Linux `ath_pci_probe` order.
+  1. `narf_pci_identity`, and the owner for the device id.
+  2. The singleton reservation (`CLAIMED_ADDRESS`), as built in. A failed
+     attempt keeps it.
+  3. `narf_pci_prepare_probe`, then the owners' own park through
+     `narf_pci_command`: Bus Master and Memory Space off, INTx Disable on,
+     read back.
+  4. BAR0 mapped with decode parked, then Memory Space on and the policy
+     read back.
+  5. Packet DMA retained on teardown.
+  6. The 1 ms device poller (the executor's heartbeat).
+  7. The owner's `bring_up`. Each built-in `probe` was split into its bus
+     half and this shared `bring_up`, which is unchanged.
+
+  Bus mastering is turned on later by the packet owner itself, after its
+  rings are in place, exactly as built in.
+- **Removal.** `narf_module_exit` runs the bound owner's built-in `remove`
+  (Linux `ath_pci_remove`).
+  - The kernel has already stopped the module's callbacks, so exit drives
+    the executor itself, for up to 5 s, until `remove` releases the
+    reservation. `remove` releases it only after its DMA-stop proof.
+  - Only then is the teardown DMA retention lifted. An unproven stop leaves
+    the buffers quarantined.
+- **KABI.** The shared `narf_pci_command` (added for mt76) clears and sets
+  Memory Space, Bus Master and INTx Disable, then reads the register back.
+  The DMA-stop proofs gate Bus Master around every generation reset with
+  it. Additive for ath9k (`modules/DATAPATH_ABI_DESIGN.md`, "softMAC PCI
+  control and host regulatory policy"):
+  - `narf_pcie_state`: Device/Link Capabilities, Control and Status, and the
+    upstream bridge's Link Control. These choose the SerDes workarounds
+    (`ath_pci_aspm_init`) and drive the relaxed-ordering check.
+  - `narf_pci_config_read32`: read-only, `0x40..=0xffc`. It is used for
+    AR9462's L1-entry-latency word at `0x70c`.
+  - The shared `narf_wireless_regdomain` (added for rtw88) returns the
+    host's regulatory domain as one NRGD v1 record, bootstrapping the
+    staged signed policy when none is installed. `platform::regdb` parses
+    it with `narf_wireless::reg::parse_domain_record` (`parse_policy`'s
+    checks, also accepting the world domain's `"00"`). Every
+    calibration, retune and transmit admission reads a fresh record, and an
+    unchanged record reuses its last parse. With no domain (`-ENODATA`),
+    admission closes.
+- **MSI.** One plain-MSI vector via `narf_msi_enable`, with a task-context
+  callback. It is taken on first use and reused by later generations.
+  Without it, the owner stays polled, as built in.
+- **DMA.** All coherent memory comes from `narf_dma_alloc_mapped`, with
+  4–64 KiB size-class pools carved from 1 MiB chunks, because KABI handles
+  are never reused. The mapping is coherent, so the driver's cache syncs are
+  ordering fences.
+- **Signed records.** Board admission and the qualification grants are read
+  through `narf_firmware_open`/`_read`. They are admitted only when
+  `narf_firmware_signed` reports a verified signer, as built in.
+- **Netdev and wiphy** (`iface_module.rs`). It is the same `interface.rs`
+  netdev, with its kernel edges swapped: the same generations, rings,
+  carrier and station.
+  - The netif bridge names the netdev `wlan%d`. Stack TX goes to the
+    built-in `send`. RX the netdev hands the stack goes out through
+    `narf_netif_rx`.
+  - `REGISTER_WIPHY` (§4.1) advertises the attached generation's permitted
+    2.4/5 GHz channels, its HT grant, CCMP and `PSK_OFFLOAD |
+    REPORTS_DISCONNECT`.
+  - `SCAN_REQUEST`, `CONNECT` and `DISCONNECT` run the netdev's built-in
+    `scan`, `associate` and `disassociate`. A `CONNECT` without a BSSID
+    takes the strongest matching network of the last scan. Security is open
+    or in-driver WPA2-PSK, as built in; SAE is not advertised.
+  - A carrier loss the netdev reports (the built-in `notify_disconnect`)
+    goes out as `DISCONNECTED`.
+- **Not carried (built-in only).**
+  - System suspend/resume: there is no module device-PM export, so the
+    owners' `pm_suspend`/`pm_resume` and their PCI retry-timeout write
+    (`0x40`) stay built in.
+  - WoW, nl80211 power-save control and the userspace SME: the `WIFI` v2
+    host carries none of them.
+  - Hot removal while loaded: the bus has no module remove callback, so
+    removal is unload.
+
+  General config space is still not writable from a module.
+- **Proof.** `modules/e2e/ath9k` loads the real `.ko`. It checks:
+  - the relocations resolve and init runs;
+  - exactly the fifteen ath9k ids are claimed, and none of ath10k's;
+  - a probe with no device context is refused;
+  - unload (exit with nothing bound) leaves no match.
+
+  `modules/kabi` `smoke_kabi_softmac_exports` checks the new exports' cap
+  gating, bounds and regulatory record. QEMU emulates no Atheros Wi-Fi, so
+  bring-up, calibration, scan and association through the module are
+  unverified until a hardware run.
+
+### 4.7 `brcmfmac.ko`: the Broadcom FullMAC PCIe driver as a loadable module
+
+`narf-drivers-wireless-brcm --no-default-features --features module` builds
+the brcmfmac PCIe driver into a `.ko` (module name `brcm`; x86_64 and
+aarch64) from the same source as the built-in. Kernel services come from
+`src/platform/`: `kernel.rs` re-exports the kernel crates, `kabi.rs`
+implements the same names over `narf-module-rt` and the KABI. `narf-crypto`,
+`narf-wireless` and `narf-drivers-wireless-ath-core` are linked kernel-free.
+The driver's own code runs in the `.ko`: AI core discovery (`chip.rs`), the
+CR4/CA7 passive/download/active sequence (`boot.rs`), the msgbuf common and
+flow rings (`runtime.rs`), the station transport (`station_transport.rs`)
+and the shared FullMAC station (`cyw43439/station*.rs`). CYW43439 (SDIO and
+gSPI) stays built-in only: no SDIO I/O KABI exists.
+
+- **Claim.** Every Broadcom FullMAC PCIe id of the built-in table
+  (`pcie_ids::ALL_DEV_IDS`, 26 ids, `14e4:43a3`..`14e4:4433`), under the
+  match name `brcmfmac-module` so the built-in per-id entries are not
+  replaced. `narf-drivers-wireless/brcmfmac-module-only` leaves the built-in
+  PCI claim (and its PCIe system-PM hooks) aside so an early-loaded `.ko`
+  owns the device; CYW43439 stays built in.
+- **Probe** (`brcmfmac/pcie_kabi.rs`, the built-in `pcie.rs::probe` and
+  `native_runtime.rs` order).
+  1. `narf_pci_identity`; the id must be in the table.
+  2. `narf_pci_prepare_probe`; decode and bus mastering must read back off.
+  3. BAR0 (at least 4 KiB) is mapped, and BAR2 for the ids the built-in
+     boots (BCM43602, or a chip-profile PCI row with an implemented vendor
+     path); memory decode on with INTx disable kept.
+  4. `Chip::discover` through the BAR0 window, then `park_pcie`.
+  5. A chip without a covered profile or BAR2 stays parked and bound, as
+     built in. Otherwise the provisioning task runs on the module's executor
+     and is retried every 500 ms for a minute while no hardware attempt has
+     started: the signed NBSP board selection
+     (`brcm/wifi-board-selection-v1.bin`), its assets with exact length and
+     SHA-256, the signed regulatory policy, then the CR4/CA7 boot, ring
+     attach, data enable, the station transport and the station.
+- **Bus seams** (`KabiBackplane`). BAR0 window select (`0x80`) and the SBMBX
+  doorbell (`0x98`) are written with `narf_pci_config_write32`
+  (`modules/DATAPATH_ABI_DESIGN.md`, "Device-specific PCI configuration
+  window") and read back with `narf_pci_config_read32`; Command-register
+  parking and bus mastering go through `narf_pci_command`; Link Control ASPM through `narf_pcie_aspm`. TCM is
+  accessed in dwords (partial dwords read-merge-write; the dongle CPU is
+  halted). DMA comes from `narf_dma_alloc_mapped` below 4 GiB, per-frame
+  buffers from a 4–64 KiB size-class pool; the device context retains DMA
+  on teardown. One plain MSI vector raises the runtime's signal and runs
+  the executor; without it the 1 ms poller keeps service. The IOMMU block is
+  reported `Untranslated`.
+- **Provisioning differences.** Explicit kernel board registrations
+  (`native_runtime::register_board_profile`) do not exist in the module;
+  only the signed manifest selects a board. The KABI exposes no firmware
+  blob identity, so a module `Proof` re-opens each file and refuses a
+  missing file or a changed size or signedness; the bytes are hashed once at
+  load. The regulatory domain must come from a staged, signed
+  `wireless-regulatory.bin`: the built-in fallback to the Linux database's
+  world domain is kernel-resident and unreachable from a module, so without
+  that policy the device stays parked.
+- **Netdev and wiphy** (`cyw43439/interface_module.rs`).
+  - The netif bridge names the netdev `wlan%d`.
+  - `REGISTER_WIPHY` (§4.1) advertises the station's policy-admitted 2.4
+    and 5 GHz channels, HT/VHT as firmware reports them, the built-in
+    shell's ciphers (CCMP, plus AES-CMAC with firmware MFP) and the
+    firmware SME: `PSK_OFFLOAD` with the firmware supplicant (`sup_wpa`),
+    `SAE_OFFLOAD` where `cap` lists `sae` with MFP, and
+    `REPORTS_DISCONNECT`.
+  - FullMAC maps onto the v2 SME-offload model directly: `SCAN_REQUEST`
+    runs the station's escan, `CONNECT` the firmware join (open, PMK, or
+    SAE password; a zero BSSID resolves to the strongest matching BSS of
+    the last scan) and `DISCONNECT` the firmware disassociation.
+  - The station's event poll drives carrier; a firmware deauth, disassoc or
+    link-down is reported as `DISCONNECTED`.
+  - TX frames are admitted as built in (Ethernet II from this station,
+    never EAPOL), prioritized with `classify8021d` and sent on the flow
+    rings; RX goes through `narf_netif_rx`.
+- **Recovery.** A terminal transport (firmware halt, a fatal protocol or
+  access error) is reset as the built-in `Generation::recover` does it
+  (Linux `brcmf_fw_crashed` -> `brcmf_pcie_reset`): carrier off, the
+  confirmed stop, the device reset and a fresh download of the re-verified
+  signed assets, a re-initialized station on the same netdev, then a rejoin
+  of the retained association. At most 64 resets; an unproven stop releases
+  nothing (the mappings stay pinned).
+- **Parameters.** `.narf_kparams` declares `ssid`, `psk` (64 hex digits)
+  and `passphrase`; `brcm.ssid=` on the kernel command line scans and joins
+  after the station is up.
+- **Not carried (built-in only).** AP, monitor, P2P and virtual interfaces;
+  WoWL and system PM; power-save control; firmware roaming (off by default
+  built in too: the v2 host has no roam report); the host supplicant
+  (`SecurityConfig::External`) and nl80211 PMKSA entries (the firmware list
+  is kept empty, as built in without any); device removal (the device
+  context retains every DMA mapping at unload); CYW43439.
+- **Proof.** `modules/e2e/brcmfmac` loads the real `.ko`: the relocations
+  resolve, init runs, the parameters are declared and a load argument
+  applies, exactly the 26 FullMAC PCIe ids are claimed under the module's
+  match name, a probe with no device context is refused, and unload leaves
+  no match. QEMU emulates no Broadcom Wi-Fi, so bring-up, firmware boot,
+  scan and association through the module are unverified until run on
+  hardware.
+
+### 4.8 `rtw88.ko`: the RTL8821CU / RTL8822BU driver as a loadable module
+
+`narf-drivers-wireless-rtw --no-default-features --features module` builds
+the rtw88 driver tree (`src/rtw88/`) into a `.ko` (x86_64 and aarch64) from
+the same source as the built-in, for its USB parts. rtw89 does not build
+into the module; the rtw88 and rtw89 PCIe ids stay registration-only
+(`module_probe.rs`, probe `-ENOSYS`).
+
+- **Platform** (`src/rtw88/platform/`). rtw88 names some twenty kernel
+  crates directly (`narf_scheduler`, `narf_time`, `narf_wireless::reg`,
+  `narf_net::iface`, ...). In the module build `platform` provides **the
+  same names** — `platform::narf_time`, `platform::narf_net`, ... — and each
+  driver file imports them under `#[cfg(feature = "module")]`, so the
+  driver bodies are unchanged and the built-in build is untouched:
+  - runtime: the module executor, `narf-module-rt` clock, sleeps and locks;
+  - firmware: `narf_firmware_open`/`_read`/`_signed`, each file read once
+    and kept for the module's lifetime (a signed file's view reports a
+    signer; the KABI does not name the key, and rtw88 only requires that a
+    record is signed); the firmware capability types are plain tokens, the
+    module's `Firmware:Read` grant being the authority;
+  - the regulatory domain: the kernel's, read once per probe through
+    `narf_wireless_regdomain` (the signed per-board records are checked
+    against it, as built in);
+  - USB: the `ControlIo` / `Io` transport traits `usb_firmware::Backend`
+    is written against;
+  - stack hooks: `narf_net::iface::{lookup, set_link_metadata,
+    on_rx_frame_from}`, `nl80211::notify_disconnect` and the shell's
+    withdrawal land on the module netdev (`iface_module.rs`);
+  - PCI types (`BusDevice`, `MmioRegion`, `BusAddr`): uninhabited, so every
+    PCI-only branch of the shared code builds and is statically unreachable.
+  PCI, PCI power/recovery, system PM, runtime idle, rejoin and the B22 PCI
+  owner are `builtin`-only.
+- **Probe** (`usb_kabi.rs`, Linux `rtw_usb_probe` order). Every
+  RTL8821CU / RTL8822BU VID:PID (50 entries, vendor-specific interface
+  0xff/0xff/0xff) is registered with `narf_register_usb_driver`. Probe reads
+  the configuration descriptor and parses the endpoints
+  (`usb::Endpoints::parse`) — a token without a USB context is refused
+  here, before device access — then starts the 1 ms heartbeat
+  (`narf_usb_spawn_poller`) and the attach task:
+  1. GET_DESCRIPTOR(DEVICE) for the VID:PID (the probe thunk carries none),
+     then the chip (`usb_driver::chip`);
+  2. SET_CONFIGURATION and the bulk endpoint contexts (`narf_usb_configure`);
+  3. the port speed from the bulk-IN `wMaxPacketSize` (the KABI carries no
+     speed);
+  4. from here on the driver's own code: `Backend::new_for`,
+     `usb_driver::power_and_factory_for` (`rtw_mac_power_on`, the factory
+     map), the B22 `phy_cfg` / `switch_mode`;
+  5. the station shell (`interface::Device`) is published (below) and
+     `usb_driver::provision` runs the lifecycle — firmware, MAC, PHY, the
+     C21 calibration / operating / station stages or the B22 `N2BQ` / `N2BP`
+     / `N2BS` stages — to `station.activate()`, retried 120 × 500 ms while
+     the firmware or signed records are not registered, as built in.
+- **Transport.** EP0 register access is `narf_usb_control`; register delays
+  ≤ 1 ms busy-wait (`narf_udelay`). Bulk pipes: the KABI moves at most 4 KiB
+  per request and one request per endpoint, while rtw88 posts 32 KiB
+  receive buffers, 4.1 KiB firmware pages and queued sends. A transfer is a
+  chain of ≤ 4 KiB requests on a per-endpoint FIFO: OUT splits on 4 KiB
+  boundaries (a multiple of every bulk max packet, so the wire packets are
+  one transfer's), IN completes on the first short chunk or when full.
+  Every completion and the poller run the executor.
+- **Netdev** (`iface_module.rs`). `narf_usb_netif_register_with_context`
+  registers `wlan%d`; the stack's TX goes to the shell's built-in send hook
+  (`endpoints::send` → `Device::enqueue`), the shell's RX delivery leaves
+  through `narf_usb_netif_rx`. The netdev is open from registration; its
+  provider lifetime is the shell's native emission identity.
+- **Control plane.** No wiphy: the `WIFI` host (§4.1) binds sessions to bus
+  device contexts only, so nl80211 cannot reach a USB function's module.
+  The station is driven by the same in-driver SME nl80211 calls built in
+  (`WirelessNetIface::scan` / `associate`: Open and WPA2-PSK with the
+  driver's own 4-way handshake and CCMP) from `rtw.ssid=` / `rtw.psk=` /
+  `rtw.passphrase=` (PBKDF2-SHA1 to the PMK) / `rtw.scan=`, declared in
+  `.narf_kparams`; it rejoins after link loss.
+- **Configuration.** `narf-drivers-wireless/rtw88-module-only` leaves the
+  built-in USB class driver unregistered so a loaded `rtw88.ko` is offered
+  the functions (module matches see only devices no built-in driver
+  claimed); rtw88 PCIe and rtw89 stay built in.
+- **Not carried (built-in only).** nl80211 / wiphy and the userspace SME;
+  USB reset, rejoin, runtime idle and system PM (`usb_recovery.rs`); USB
+  CLEAR_FEATURE(HALT) recovery (no host endpoint reset in the KABI); WoW.
+- **Proof.** `modules/e2e/rtw88` loads the real `.ko`: relocations, init,
+  the declared parameters and an applied load argument, the USB claim (both
+  chips' ids on the vendor interface, not rtl8xxxu's id, not another
+  interface class), the registration-only PCIe ids, refusal of a USB probe
+  with no context, and an unload that leaves no match. QEMU emulates no
+  Realtek USB Wi-Fi device, so bring-up, RF and association through the
+  module are unproven until run on hardware.
+
+### 4.9 `rtl.ko`: rtlwifi (PCIe) and rtl8xxxu (USB) as a loadable module
+
+`narf-drivers-wireless-rtl --no-default-features --features module` builds
+`rtl.ko` for x86_64 and aarch64. The rtlwifi and rtl8xxxu sources build both
+ways: built in they are unchanged, and in the `.ko` they run over
+`narf-module-rt` and the KABI.
+
+- **Platform.** Kernel services come from `src/platform/`, one name in
+  both builds.
+  - `kernel.rs` re-exports the kernel crates (`narf_time` as `time`,
+    `narf_lib` as `lib`, ...), so a built-in path is the kernel's own item.
+  - `kabi.rs` implements the paths the drivers use: locks and the async
+    mutex, `OnceLock`, the clock, sleeps and `timeout`, spawn and
+    `block_on`, coherent DMA, frame channels, firmware assets, the
+    regulatory domain, and the `Interface` / `WirelessNetIface` traits.
+  - `usb_kabi.rs` implements the shared Realtek USB transport
+    (`ControlIo`, `Io`) over `narf_usb_*`.
+  - The kernel-free crates are linked with their `kernel` feature off:
+    `narf-crypto`, `narf-wireless`, `narf-drivers-wireless-ath-core` and
+    `narf-drivers-wireless-rtl-chip`.
+- **Claim.** The tables are in `src/module_ids.rs`. A kernel test pins them
+  to `ALL_DEV_IDS` / `RTL8XXXU_USB_IDS`, and the e2e test reads the same
+  file.
+  - PCI: all ten rtlwifi ids, `10ec:{8179, 8178, 8176, 8177, 8191, 8193,
+    818b, 8723, b723, 8821}`. RTL8822BE (`b822`) is rtw88's.
+  - USB: all 23 `RTL8XXXU_USB_IDS` rows. RTL8821CU / RTL8822BU are
+    rtw88's.
+  - `narf-drivers-wireless/rtl-module-only` leaves both built-in tables to
+    an early-loaded `rtl.ko`, giving up the built-in drivers.
+  - One device binds per module.
+- **PCI probe** (`rtlwifi/pci_kabi.rs`, the built-in `probe` / `bring_up`
+  order).
+  1. `narf_pci_identity`: an rtlwifi id, and its PCI function.
+  2. `narf_pci_prepare_probe`.
+  3. BAR2 sized and mapped with Device attributes while decode is off
+     (`narf_bar_map_control`), then memory decode on, the built-in
+     `map_bar_control` order. Its length is checked by
+     `identity::control_bar_ok`.
+  4. ASPM off.
+  5. `identity::identify` (NIC-enable power table, IRQ masks, the
+     RTL8723AE EFUSE bank, the factory map and MAC), then
+     `identity::admissible`. Both are the functions `pci::bring_up` calls.
+  6. `pci::assemble` and `pci::bind`, also shared with the built-in:
+     - the authenticated firmware owner, the preparation slot and (for
+       RTL8723AE) the original cold owner;
+     - the native station device;
+     - publication;
+     - the native preparation task.
+
+  The kernel's 1 ms device poller and the MSI upcall drive the module's
+  executor. DMA is retained on teardown (`narf_dma_retain_on_teardown`).
+- **PCI authority** (`rtlwifi/firmware_native_kabi.rs`, the module's
+  `PciIo` with the built-in API).
+  - Every access passes the built-in `command_gate` on `narf_pci_command`
+    (read with clear = set = 0): absent function, decode, INTx disabled,
+    and bus mastering only in packet mode.
+  - Every access also re-checks `narf_pci_identity`.
+  - Bus mastering is set and cleared through `narf_pci_command`, read
+    back.
+  - Register widths go through `narf_mmio_read8/16/32` and
+    `narf_mmio_write8/16/32`.
+  - MSI: one vector (`narf_msi_enable`) whose upcall raises the device's
+    signal. A withdrawn vector stays granted with delivery off and is
+    reused.
+  - ASPM: the endpoint policy is "off" (`narf_pcie_aspm`). A module
+    cannot see the parent link's policy, and off is the built-in answer
+    for an unknown bridge.
+- **DMA.** `narf_dma_alloc_mapped` under each allocation's address limit,
+  from a 4-64 KiB size-class pool carved from 1 MiB chunks, as in
+  `ath11k.ko`. KABI mapped DMA is cache-coherent, so `DmaBuffer::sync` is
+  an ordering fence.
+- **Firmware and signed records.** `narf_firmware_open/read/signed`. A
+  retained asset's `Cap<FirmwareBlob, Read>` is its open handle, and
+  `invoke` re-checks it before every enclosed effect. Every
+  calibration/envelope record still requires a verified signer, as built
+  in. The KABI reports only that one exists, not which.
+- **Regulatory domain.** `narf_wireless_regdomain` returns the kernel's
+  installation (bootstrapped from the signed policy, or Linux world `00`,
+  as `reg::db::ensure_domain` does). The module decodes the record with the
+  shared `narf_wireless::reg::parse_domain_record`. rtl8xxxu's
+  `reg::policy::load` reads the same installation.
+- **PCIe station** (`module_netdev.rs`, through `interface::publish`). The
+  worker loop, MSI, watchdog and runtime power save (IPS/LPS) are shared
+  with the built-in.
+  - The netdev is `wlan%d` (`narf_netif_register_with_context`). TX enters
+    the device's own send hook. RX goes from the device's drain to
+    `narf_netif_rx`.
+  - `REGISTER_WIPHY` (§4.1) is built from the device's own bands, HT/VHT,
+    ciphers (CCMP) and `PSK_OFFLOAD | REPORTS_DISCONNECT`.
+  - The host's `SCAN_REQUEST` / `CONNECT` / `DISCONNECT` events run the
+    device's `scan` / `associate` / `disassociate`, which includes the
+    in-driver WPA2-PSK supplicant. A `CONNECT` without a BSSID takes the
+    strongest match of the last scan.
+  - Unsolicited link loss is reported as `DISCONNECTED`.
+  - A function whose native station is not admitted is published as the
+    built-in diagnostic profile: no event channel, so scan and connect
+    answer `NotSupported`.
+- **USB** (`rtl8xxxu/usb_kabi.rs`, the built-in `rtl8xxxu_probe`).
+  1. Classify the dongle with `ChipFamily::from_usb_id` and refuse an
+     unknown family.
+  2. Start the device poller (`narf_usb_spawn_poller`).
+  3. Configure the configuration's bulk/interrupt endpoints
+     (`narf_usb_configure`).
+  4. Run the family's chain unchanged (`rtl8xxxu::start`). RTL8188EU,
+     RTL8192EU and RTL8723BU go through firmware, calibration and
+     admission to the station. The others are detection-only.
+
+  The station publishes a netdev through `narf_usb_netif_register_with_context`
+  and runs `run_admin`'s UP branch at once (`module_open`), because the
+  bridge delivers no `IFF_UP`.
+
+  A USB function has no wiphy. The `WIFI` host binds sessions to a bus
+  context's `Cap<BusDeviceCap>`, and minting one for USB would be a
+  capability-model change. Its in-driver SME is therefore driven by
+  `rtl.ssid=` and `rtl.psk=` (64 hex digits) / `rtl.passphrase=`
+  (`.narf_kparams`), as in `rtw88.ko`: scan for the SSID, associate to the
+  strongest match, and retry every 5 s while unassociated.
+- **KABI.** Added by this module, in its own block:
+  - `narf_bar_map_control`;
+  - `narf_mmio_read8`, `narf_mmio_read16`;
+  - `narf_mmio_write8`, `narf_mmio_write16`.
+
+  Used from other branches: `narf_pci_command` (mt76),
+  `narf_wireless_regdomain`, `narf_usb_spawn_poller`,
+  `narf_usb_netif_register_with_context` and `narf_usb_netif_rx` (rtw88).
+- **Not carried (built-in only).**
+  - System suspend and WoWLAN: D-states, PME wake, config save/restore.
+  - ASPM enable.
+  - Removal's DMA-quiescence proof (DMA stays retained).
+  - The userspace SME.
+  - On USB: nl80211 control (no wiphy), and endpoint-halt recovery (the
+    KABI has no clear-halt, so a stalled bulk pipe ends the attempt).
+- **Match budget.** `rtl.ko` registers 23 USB matches. With `rtw88.ko`'s
+  50 that fits the 128-entry module USB table.
+- **Proof.** `modules/e2e/rtl` loads the real `.ko` and checks:
+  - init runs to Live;
+  - exactly the PCI table is claimed, and not `b822`;
+  - with a USB stack, every rtl8xxxu row is held (a foreign registration
+    gets `-EBUSY`), and not `0bda:c811`;
+  - a probe with no device context is refused;
+  - unload leaves no match.
+
+  QEMU emulates no Realtek Wi-Fi device. Bring-up, firmware, calibration,
+  association and data on silicon are unverified until a hardware boot.
+
 ## 5. Buffer Management
 
 - **Data Path**: Uses standard `DmaBuffer` caps provided by `io/spec`.

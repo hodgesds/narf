@@ -5,8 +5,7 @@
 //! dual-MAC offsets are selected by `rtl8192d/hw_common.c`.
 
 use super::regs::*;
-use narf_bus::MmioRegion;
-use narf_time::Deadline;
+use crate::platform::{responsive_spin_until, Deadline, MmioRegion};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EfuseError {
@@ -30,7 +29,7 @@ pub(super) trait Io {
     fn write16(&mut self, addr: u64, value: u16);
     fn read32(&mut self, addr: u64) -> u32;
     fn settle(&mut self) {
-        narf_scheduler::responsive_spin_until(|| false, Deadline::after_us(50));
+        responsive_spin_until(|| false, Deadline::after_us(50));
     }
 }
 
@@ -116,7 +115,7 @@ pub(super) fn read_factory_with(
             let value = io.read8(REG_EFUSE_CTRL + 3);
             io.write8(REG_EFUSE_CTRL + 3, value & 0x7f);
             let mut last = 0;
-            if !narf_scheduler::responsive_spin_until(
+            if !responsive_spin_until(
                 || {
                     last = io.read32(REG_EFUSE_CTRL);
                     last & EFUSE_CTRL_VALID != 0
@@ -137,11 +136,13 @@ pub(super) fn read_factory_with(
     }
     result?;
     let mut logical = [0xff; 512];
-    narf_drivers_wireless_rtw::rtw88::efuse::decode_map(
+    // The shared Realtek chip core's sparse decode (rtw88's `decode_map`
+    // forwards to the same function), which the `.ko` links kernel-free.
+    narf_drivers_wireless_rtl_chip::efuse::decode_map(
         &raw[..physical],
         &mut logical[..logical_size],
     )
-    .map_err(|_| EfuseError::MalformedMap)?;
+    .map_err(|()| EfuseError::MalformedMap)?;
     let mut mac = [0; 6];
     mac.copy_from_slice(&logical[mac_offset..mac_offset + 6]);
     if !mac_is_valid(mac) {

@@ -250,11 +250,25 @@ impl RegRule {
 /// flags:u8, flags2:u8, reserved:u8), all integers little-endian. flags2
 /// carries `RegFlags` bits 8.. (AUTO_BW, NO_160MHZ); unknown bits reject.
 pub fn parse_policy(bytes: &[u8]) -> Result<RegulatoryDomain, &'static str> {
+    parse_nrgd(bytes, false)
+}
+
+/// Decode an NRGD v1 record of an installed domain, as the
+/// `narf_wireless_regdomain` module export copies it out. The layout and
+/// rule checks are [`parse_policy`]'s; the one difference is that the world
+/// domain's country `"00"` is accepted, since the database holds it until a
+/// policy is installed. A deployment policy can never select it.
+pub fn parse_domain_record(bytes: &[u8]) -> Result<RegulatoryDomain, &'static str> {
+    parse_nrgd(bytes, true)
+}
+
+fn parse_nrgd(bytes: &[u8], allow_world: bool) -> Result<RegulatoryDomain, &'static str> {
+    let country_ok = |c: &[u8]| c.iter().all(u8::is_ascii_uppercase) || (allow_world && c == b"00");
     if bytes.len() < 12
         || &bytes[..4] != b"NRGD"
         || bytes[4..6] != [1, 0]
         || bytes[10..12] != [0; 2]
-        || !bytes[6..8].iter().all(u8::is_ascii_uppercase)
+        || !country_ok(&bytes[6..8])
     {
         return Err("invalid regulatory policy header");
     }

@@ -10,8 +10,9 @@
 #     facade, registered from the kernel's Stage::Subsys initcall.
 #   * `module`: built to a loadable `.ko` via `cargo xtask build-module
 #     --package narf-drivers-wireless-ath10k --no-default-features --features
-#     module`. Registration-only: the probe thunk returns -ENOSYS; it
-#     registers the QCA PCI ids through `narf_register_pci_driver`.
+#     module`. The same driver source runs inside the `.ko` over
+#     `narf-module-rt` and the KABI (`src/ath10k/platform/`): BMI, firmware
+#     and board download, CE, HTC, WMI, HTT and the station path, PCIe only.
 #
 # Tests gate on a dedicated `kernel-test` feature implying `builtin`.
 
@@ -38,8 +39,15 @@ builtin = [
     "dep:narf-ipc", "dep:narf-lib", "dep:narf-memory", "dep:narf-net",
     "dep:narf-power", "dep:narf-scheduler", "dep:narf-time",
     "dep:narf-wireless", "dep:zeroize",
+    "narf-crypto/kernel", "narf-wireless/kernel",
+    "narf-drivers-wireless-ath-core/kernel",
 ]
-module = []
+# The loadable driver: the kernel-free protocol crates and the module
+# runtime, linked into the `.ko`; everything else comes through the KABI.
+module = [
+    "dep:narf-module-rt", "dep:narf-crypto", "dep:narf-wireless",
+    "dep:narf-drivers-wireless-ath-core", "dep:zeroize",
+]
 kernel-test = [
     "builtin",
     "dep:narf-kernel-test", "dep:narf-wifi-fixtures",
@@ -55,9 +63,9 @@ async-trait        = "0.1"
 narf-bus          = { path = "../../../bus", optional = true }
 narf-capabilities = { path = "../../../capabilities", optional = true }
 narf-console      = { path = "../../../console", optional = true }
-narf-crypto       = { path = "../../../crypto", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true, default-features = false }
 narf-drivers      = { path = "../..", optional = true }
-narf-drivers-wireless-ath-core = { path = "../ath-core", optional = true }
+narf-drivers-wireless-ath-core = { path = "../ath-core", optional = true, default-features = false }
 narf-drivers-wireless-core = { path = "../core", optional = true }
 narf-firmware     = { path = "../../../firmware", optional = true }
 narf-firmware-fdt = { path = "../../../firmware/fdt", optional = true }
@@ -70,8 +78,9 @@ narf-net          = { path = "../../../net", optional = true }
 narf-power        = { path = "../../../power", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-time         = { path = "../../../time", optional = true }
-narf-wireless     = { path = "../../../wireless", optional = true }
+narf-wireless     = { path = "../../../wireless", optional = true, default-features = false }
 zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
+narf-module-rt = { path = "../../../modules/rt", optional = true }
 
 narf-kernel-test   = { path = "../../../verification/kernel-test", optional = true }
 narf-wifi-fixtures = { path = "../../../verification/wifi-fixtures", optional = true }

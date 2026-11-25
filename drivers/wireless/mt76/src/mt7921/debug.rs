@@ -24,7 +24,13 @@ pub(crate) fn enabled() -> bool {
         ON => true,
         OFF => false,
         _ => {
+            // Built in: `mt76.dyndbg=+p` on the kernel command line. A module
+            // has no command-line export; its `debug=1` parameter (applied
+            // from `mt76.debug=1` or the load arguments) is the same switch.
+            #[cfg(feature = "builtin")]
             let on = narf_boot::args().dyndbg_print("mt76");
+            #[cfg(feature = "module")]
+            let on = narf_module_rt::param::get("debug").is_ok_and(|value| value == "1");
             STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
             on
         }

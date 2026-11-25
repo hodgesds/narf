@@ -4392,7 +4392,13 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     let roots = module_defined_globals(&own)?;
     let (linker, linker_args) = module_linker(root)?;
     let mut link = Command::new(&linker);
-    link.args(&linker_args).arg("-r").arg("-o").arg(&out);
+    link.args(&linker_args);
+    // A large crate roots thousands of globals (`-u` below). On a host with
+    // a small exec argument limit (a NARF host refuses ~120 KiB of argv
+    // with EFAULT) that does not fit, so everything after the flavor goes
+    // through an lld response file instead — the same arguments, in order.
+    let mut link_args: Vec<std::ffi::OsString> = Vec::new();
+    link_args.extend(["-r".into(), "-o".into(), out.clone().into_os_string()]);
     // Section GC, rooted at every global the crate's own objects define. An
     // extracted archive member is a whole codegen unit, most of which the
     // module never reaches — and some of which references helpers the
@@ -4403,16 +4409,43 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     // `.modinfo`, a `.narf_kparams` static — come from `#[used]` statics,
     // which rustc emits `SHF_GNU_RETAIN`, so GC keeps them; a
     // `.narf_kparams` attached with objcopy after the link is untouched.
-    link.arg("--gc-sections");
+    link_args.push("--gc-sections".into());
     for name in &roots {
-        link.arg("-u").arg(name);
+        link_args.push("-u".into());
+        link_args.push(name.into());
     }
-    link.args(&own);
+    link_args.extend(own.iter().map(|o| o.clone().into_os_string()));
     // The archive last: its members are lazy, extracted only to resolve a
     // symbol the crate's own objects (or an already-extracted member) leave
     // undefined. This is how out-of-line `core`/`alloc`/dependency code
     // reaches the `.ko` without dragging in the whole sysroot.
-    link.arg(&archive);
+    link_args.push(archive.clone().into_os_string());
+    // Inline only a small command line: the NARF host refuses an exec at
+    // about 1023 argv entries or 64 KiB of arguments (EFAULT), so a link
+    // near either bound goes through a response file.
+    let arg_bytes: usize = link_args.iter().map(|a| a.len() + 1).sum();
+    if arg_bytes > 32 * 1024 || link_args.len() > 512 {
+        // lld response-file quoting: each argument on its own line, quoted,
+        // with `\` and `"` escaped.
+        let mut rsp = String::new();
+        for arg in &link_args {
+            let arg = arg
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            rsp.push('"');
+            rsp.push_str(&arg);
+            rsp.push_str("\"\n");
+        }
+        let rsp_path = work.join("link.rsp");
+        std::fs::write(&rsp_path, rsp)
+            .with_context(|| format!("writing {}", rsp_path.display()))?;
+        let mut at = std::ffi::OsString::from("@");
+        at.push(rsp_path.as_os_str());
+        link.arg(at);
+    } else {
+        link.args(&link_args);
+    }
     if !link
         .status()
         .with_context(|| format!("failed to run `{linker} -r`"))?
@@ -5711,6 +5744,48 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
         match build_module_fixture("narf-drivers-wireless-ath11k", args.arch, &root) {
             Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath11k.ko".into(), bytes)),
             Err(e) => println!("xtask: ath11k driver module unavailable ({e})"),
+        }
+        // The whole mt76 driver as a `.ko` (MT7921/MT7922 over the KABI).
+        match build_module_fixture("narf-drivers-wireless-mt76", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/mt76.ko".into(), bytes)),
+            Err(e) => println!("xtask: mt76 driver module unavailable ({e})"),
+        }
+
+        // The whole ath10k driver as a `.ko` (QCA988X..QCA9377 over the KABI).
+        match build_module_fixture("narf-drivers-wireless-ath10k", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath10k.ko".into(), bytes)),
+            Err(e) => println!("xtask: ath10k driver module unavailable ({e})"),
+        }
+
+        // The whole ath9k driver as a `.ko` (every chip owner over the KABI).
+        match build_module_fixture("narf-drivers-wireless-ath9k", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath9k.ko".into(), bytes)),
+            Err(e) => println!("xtask: ath9k driver module unavailable ({e})"),
+        }
+
+        // The brcmfmac PCIe driver as a `.ko` (module `brcm`, over the KABI).
+        match build_module_fixture("narf-drivers-wireless-brcm", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/brcmfmac.ko".into(), bytes)),
+            Err(e) => println!("xtask: brcmfmac driver module unavailable ({e})"),
+        }
+
+        // The rtw88 driver as a `.ko` (RTL8821CU/RTL8822BU over the USB KABI).
+        match build_module_fixture("narf-drivers-wireless-rtw", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/rtw88.ko".into(), bytes)),
+            Err(e) => println!("xtask: rtw88 driver module unavailable ({e})"),
+        }
+
+        // rtl.ko: the rtlwifi PCIe driver and rtl8xxxu over the KABI
+        // (`modules/e2e/rtl`).
+        match build_module_fixture("narf-drivers-wireless-rtl", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/rtl.ko".into(), bytes)),
+            Err(e) => println!("xtask: rtl driver module unavailable ({e})"),
+        }
+
+        // The iwlwifi driver as a `.ko` (Sc / BE20x-BE21x over the KABI).
+        match build_module_fixture("narf-drivers-wireless-iwlwifi", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/iwlwifi.ko".into(), bytes)),
+            Err(e) => println!("xtask: iwlwifi driver module unavailable ({e})"),
         }
     }
 

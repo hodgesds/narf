@@ -14,6 +14,8 @@ use super::{
     },
     EEPROM_4K_BYTES,
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_bus, narf_capabilities, narf_firmware};
 #[cfg(feature = "kernel-test")]
 use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};
@@ -239,7 +241,7 @@ impl Grant {
             type Output = Result<T, Error>;
             fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
                 Ok((|| {
-                    let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+                    let domain = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
                     let current = Permission::from_domain(&domain, self.0.facts.geometry)
                         .map_err(|_| Error::Access)?;
                     // This fixed full program uses the same nominal budget in

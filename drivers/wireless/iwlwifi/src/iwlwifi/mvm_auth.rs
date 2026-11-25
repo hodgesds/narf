@@ -4,6 +4,8 @@
 //! Only this private producer may use the temporary station0/TID15 TX window.
 use super::super::{boot_context::put32, frame_api, rates::Rates, scan_api};
 use super::{Owner, Phase};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use core::{
     future::{poll_fn, Future},
     pin::pin,
@@ -60,7 +62,7 @@ impl Owner {
     /// This is not the shared station/SME interface and cannot submit data.
     pub async fn authenticate_open(&mut self) -> Result<AuthenticationStatus, &'static str> {
         self.authenticate_open_using(|| {
-            narf_wireless::reg::db::get_domain()
+            crate::iwlwifi::reg_source::get_domain()
                 .ok_or("MVM current authentication policy unavailable")
         })
         .await

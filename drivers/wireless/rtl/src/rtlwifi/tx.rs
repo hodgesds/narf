@@ -14,7 +14,7 @@
 
 #![allow(dead_code)]
 
-use narf_bus::MmioRegion;
+use crate::platform::bus::MmioRegion;
 
 use super::dma::{ring_tx_doorbell, DmaError, TxRing};
 use super::regs::*;

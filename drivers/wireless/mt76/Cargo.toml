@@ -11,9 +11,10 @@
 #   * `module`: built to a relocatable `.ko` via
 #     `cargo xtask build-module --package narf-drivers-wireless-mt76 \
 #        --no-default-features --features module`. The kernel crates drop from
-#     the graph; the driver registers through the `narf_register_pci_driver`
-#     KSYMTAB exports. The loadable frontend owns service/control operation
-#     handles; the versioned copy-mode host retains native MCU/WFDMA execution.
+#     the graph. The same driver source runs inside the `.ko` over the KABI
+#     (`src/platform/`): PCI binding, WFDMA rings, MCU, firmware download,
+#     the station join with its in-driver WPA2/WPA3 supplicant and the packet
+#     path, published through the netif bridge and the generic `WIFI` host.
 #
 # Named `mt76` (the upstream mt76-*family* driver) rather than `mt7921`, so the
 # sibling CONNAC2/CONNAC3 parts (MT7925/MT7996) can land in the same crate. The
@@ -47,10 +48,16 @@ builtin = [
     "dep:narf-firmware", "dep:narf-interrupts", "dep:narf-io", "dep:narf-ipc",
     "dep:narf-kernel-test", "dep:narf-wifi-fixtures", "dep:narf-lib", "dep:narf-memory", "dep:narf-net",
     "dep:narf-scheduler", "dep:narf-time", "dep:narf-wireless", "dep:narf-crypto", "dep:narf-power", "dep:zeroize", "dep:subtle",
+    "narf-crypto/kernel", "narf-wireless/kernel",
 ]
-# Module: NO kernel crates. The only undefined symbols in the `.ko` are the
-# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
-module = []
+# Module: NO kernel crates. The kernel-free protocol crates and the module
+# runtime are linked into the `.ko`; everything else comes through the KABI.
+# The only undefined symbols in the `.ko` are the C-ABI KSYMTAB exports;
+# `xtask build-module`'s `nm -u` gate enforces that.
+module = [
+    "dep:narf-module-rt", "dep:narf-crypto", "dep:narf-wireless",
+    "dep:zeroize", "dep:subtle",
+]
 
 [dependencies]
 narf-init = { path = "../../../init", optional = true }
@@ -64,7 +71,7 @@ narf-boot         = { path = "../../../boot", optional = true }
 narf-bus          = { path = "../../../bus", optional = true }
 narf-capabilities = { path = "../../../capabilities", optional = true }
 narf-console      = { path = "../../../console", optional = true }
-narf-crypto       = { path = "../../../crypto", optional = true }
+narf-crypto       = { path = "../../../crypto", optional = true, default-features = false }
 narf-driver-runtime = { path = "../../runtime", optional = true, default-features = false, features = ["kernel"] }
 narf-drivers      = { path = "../..", optional = true }
 narf-firmware     = { path = "../../../firmware", optional = true }
@@ -79,7 +86,8 @@ narf-net          = { path = "../../../net", optional = true }
 narf-power        = { path = "../../../power", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-time         = { path = "../../../time", optional = true }
-narf-wireless     = { path = "../../../wireless", optional = true }
+narf-wireless     = { path = "../../../wireless", optional = true, default-features = false }
+narf-module-rt    = { path = "../../../modules/rt", optional = true }
 async-trait       = "0.1"
 zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
 subtle = { version = "2", default-features = false, optional = true }

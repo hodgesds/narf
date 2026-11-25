@@ -21,6 +21,9 @@ use super::{
     phy8821c::Host,
     radio8822b,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_capabilities, narf_firmware, narf_scheduler, narf_wireless};
 #[cfg(any(test, feature = "kernel-test"))]
 use alloc::vec::Vec;
 use alloc::{format, string::String, sync::Arc};

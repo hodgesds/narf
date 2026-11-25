@@ -6,6 +6,9 @@ use super::{
     power_policy::Gate,
     qualification,
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_capabilities, narf_firmware, narf_lib};
 use alloc::{format, string::String, sync::Arc};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::FirmwareBlob;

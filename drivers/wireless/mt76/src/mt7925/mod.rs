@@ -50,4 +50,5 @@
 
 pub mod mcu;
 
+#[cfg(feature = "builtin")]
 mod mcu_tests;

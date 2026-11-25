@@ -7,6 +7,9 @@
 //! retained `packet_open`ed USB owner (cleared on close/stop/failure) is the
 //! host-side condition.
 use super::{firmware_transport::Error, power_policy::Gate};
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_bus, narf_capabilities, narf_lib, narf_wireless};
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 #[derive(Clone)]
@@ -109,20 +112,7 @@ impl Publication {
         }
         self.gate.invoke(|| {
             let (device, cap) = self.native.as_ref().ok_or(Error::State)?;
-            super::pci_park::invoke(cap, || {
-                use narf_bus::pci::{
-                    self,
-                    cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE},
-                };
-                let command = pci::read_command(cap, device).map_err(|_| Error::Access)?;
-                if command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
-                    != (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
-                {
-                    return Err(Error::Prerequisite);
-                }
-                operation()
-            })
-            .map_err(|_| Error::Access)?
+            native_invoke(device, cap, operation)
         })
     }
     pub(super) fn with_epoch(mut self, epoch: super::station_control::ReceiveEpoch) -> Self {
@@ -134,4 +124,39 @@ impl Publication {
             .as_ref()
             .is_none_or(super::station_control::ReceiveEpoch::current)
     }
+}
+
+/// One operation under the native PCI function's live command register
+/// (memory decode, bus master and INTx-off all still set).
+#[cfg(feature = "builtin")]
+fn native_invoke<T>(
+    device: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    operation: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    super::pci_park::invoke(cap, || {
+        use narf_bus::pci::{
+            self,
+            cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE},
+        };
+        let command = pci::read_command(cap, device).map_err(|_| Error::Access)?;
+        if command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+            != (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+        {
+            return Err(Error::Prerequisite);
+        }
+        operation()
+    })
+    .map_err(|_| Error::Access)?
+}
+
+/// The module carries no PCI function: its `BusDevice` is uninhabited, so
+/// a native publication cannot exist and this is never called.
+#[cfg(feature = "module")]
+fn native_invoke<T>(
+    device: &BusDevice,
+    _cap: &Cap<BusDeviceCap, Write>,
+    _operation: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    match device.addr {}
 }

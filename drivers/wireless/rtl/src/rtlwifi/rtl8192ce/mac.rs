@@ -24,9 +24,9 @@ pub const RCR_ACRC32_AICV: u32 = (1 << 8) | (1 << 9);
 /// `transmit_config`: CFENDFORM | BIT(12) | BIT(13).
 pub const TCR: u32 = 0x0000_3200;
 
-pub const REG_HIMR: u16 = 0x0120;
+pub const REG_HIMR: u16 = crate::rtlwifi::regs::REG_HIMR_92C;
 pub const REG_HISR: u16 = 0x0124;
-pub const REG_HIMRE: u16 = 0x0128;
+pub const REG_HIMRE: u16 = crate::rtlwifi::regs::REG_HIMRE_92C;
 pub const REG_HISRE: u16 = 0x012c;
 pub const REG_TRXDMA_CTRL: u16 = 0x010c;
 pub const REG_TRXFF_BNDY: u16 = 0x0114;

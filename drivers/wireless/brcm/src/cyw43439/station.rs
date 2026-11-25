@@ -465,7 +465,7 @@ impl<R: Fullmac> Station<R> {
             .await?;
         self.check_receive_policy(&channels)?;
         self.check_grants(&grants)?;
-        let deadline = narf_time::Deadline::after_ms(15000);
+        let deadline = crate::platform::time::Deadline::after_ms(15000);
         let outcome = async {
             loop {
                 self.check_receive_policy(&channels)?;
@@ -754,7 +754,7 @@ impl<R: Fullmac> Station<R> {
             join[44..48].copy_from_slice(&1u32.to_le_bytes());
             join[48..50].copy_from_slice(&occupied.chanspec().to_le_bytes());
             self.tx_command(grant, 26, &join).await?;
-            let deadline = narf_time::Deadline::after_ms(15000);
+            let deadline = crate::platform::time::Deadline::after_ms(15000);
             // A host supplicant runs the 4-way after link-up: SET_SSID alone.
             let (mut associated, mut keys) = (false, !secure || host_supplicant);
             let mut protection_verified = false;
@@ -911,7 +911,7 @@ impl<R: Fullmac> Station<R> {
             self.checked_command(&[], &[], 52, &[]).await?;
         }
         if let Some(peer) = peer {
-            let deadline = narf_time::Deadline::after_ms(2000);
+            let deadline = crate::platform::time::Deadline::after_ms(2000);
             'complete: loop {
                 self.refresh_policy()?;
                 if let Some(grant) = grant {
@@ -992,7 +992,9 @@ impl<R: Fullmac> Station<R> {
 
 #[path = "station_policy.rs"]
 mod policy;
-pub use policy::{GlobalPolicy, PolicySource};
+#[cfg(feature = "builtin")]
+pub use policy::GlobalPolicy;
+pub use policy::PolicySource;
 #[path = "station_ap.rs"]
 pub(crate) mod ap;
 #[path = "station_monitor.rs"]
@@ -1079,7 +1081,7 @@ fn validate_association_ies(
     Ok(())
 }
 async fn wait() {
-    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(1_000_000)).await;
 }
 async fn set_int<R: Fullmac>(runtime: &mut R, command: u32, value: u32) -> Result<(), Error> {
     runtime

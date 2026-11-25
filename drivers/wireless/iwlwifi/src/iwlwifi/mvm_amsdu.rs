@@ -5,6 +5,8 @@ use super::super::{
     frame_api::{self, Replay},
     scan_api::Mpdu,
 };
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{collections::VecDeque, vec::Vec};
 
 fn ethernet_allowed(frame: &[u8], local: [u8; 6]) -> bool {

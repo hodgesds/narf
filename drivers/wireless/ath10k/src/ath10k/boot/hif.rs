@@ -17,7 +17,7 @@ pub(super) struct Pipe<B> {
     pub maximum: u16,
     pub ring: Ring<B>,
     pub buffer: B,
-    pub pending: Option<narf_time::Deadline>,
+    pub pending: Option<crate::ath10k::platform::time::Deadline>,
 }
 #[derive(Debug)]
 pub(super) struct Runtime<B> {
@@ -145,7 +145,7 @@ fn begin_send<B: Memory>(
     }
     // Occupancy is checked before touching the still-device-owned bounce.
     // Store the terminal deadline before any descriptor becomes visible.
-    pipe.pending = Some(narf_time::Deadline::after_ms(3000));
+    pipe.pending = Some(crate::ath10k::platform::time::Deadline::after_ms(3000));
     for (at, &byte) in bytes.iter().enumerate() {
         pipe.buffer.write(at, byte);
     }
@@ -195,7 +195,7 @@ async fn send<B: Memory>(
     }
     barrier();
     ring.post(io, buffer.dma_address() as u32, bytes.len() as u16)?;
-    let deadline = narf_time::Deadline::after_ms(3000);
+    let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
     loop {
         if ring.completion(io)?.is_some() {
             *poisoned = false;
@@ -391,7 +391,7 @@ impl PciBoot {
             return Err(BmiError::BadResponse);
         }
         self.poisoned = true; // A cancelled protocol wait requires reset, not replay.
-        let deadline = narf_time::Deadline::after_ms(budget_ms);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(budget_ms);
         let (signal, delivered) = self.interrupt();
         loop {
             let seen = signal.count();

@@ -34,6 +34,7 @@ pub(crate) const SCHED_LIMITS: SchedScanSupport = SchedScanSupport {
     ..LIMITS
 };
 
+#[cfg(feature = "builtin")]
 #[path = "wowlan_nlo_tests.rs"]
 mod tests;
 

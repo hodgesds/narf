@@ -4,7 +4,8 @@ use super::{
     ap::{self, Session},
     ap_wire, Error, Hif, HostMemory, HttMemory, Radio,
 };
-use narf_wireless::{ap_control::ApEmissionAuthority, StationConfig};
+use crate::ath10k::platform::ap_control::ApEmissionAuthority;
+use narf_wireless::StationConfig;
 
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) async fn ap_add_station(

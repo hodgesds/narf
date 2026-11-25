@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Retain the real parked hardware receipt in a background owner. Cancelling
 //! the foreground PM waiter requests rollback; it cannot drop DMA retirement.
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_lib, narf_power};
 use alloc::{boxed::Box, sync::Arc};
 use core::{
     sync::atomic::{AtomicBool, AtomicU8, Ordering},

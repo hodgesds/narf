@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! One shared retained AR9285 station for async control and synchronous stack
 //! progress. The radio supplies the actual DMA/host-close publication gate.
+use super::platform::WirelessNetIface;
 use super::{
     packet::{Packet, Port},
     station::{self, Engine, Environment, Phase, Radio},
+};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{
+    narf_io, narf_ipc, narf_lib, narf_net, narf_scheduler, narf_time,
 };
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,7 +16,6 @@ use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessConfig, WirelessError,
-    WirelessNetIface,
 };
 use zeroize::Zeroizing;
 type Error = station::Error;
@@ -223,7 +227,11 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         // invokes an administrative open/stop hook under retained locks.
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if previous && !up {
+            #[cfg(feature = "builtin")]
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            // The module reports carrier through the `WIFI` host.
+            #[cfg(feature = "module")]
+            super::iface_module::link_lost(1);
         }
     }
     fn link(&self, peer: Option<[u8; 6]>) {
@@ -659,12 +667,17 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         if let Some(mut state) = self.rings.state.try_lock() {
             state.clear();
         }
-        narf_wireless::registry::unregister(&self.name);
-        narf_net::registry().unregister(&self.name);
-        // Reserve while still registered so no other wlan%d allocation can
-        // take the name between unregister and reservation.
-        narf_net::iface::reserve_name(&self.name);
-        narf_net::iface::unregister(&self.name);
+        // A standalone generation (tests) owns its registry entries; the
+        // module's generations are always seated on its one netdev.
+        #[cfg(feature = "builtin")]
+        {
+            narf_wireless::registry::unregister(&self.name);
+            narf_net::registry().unregister(&self.name);
+            // Reserve while still registered so no other wlan%d allocation
+            // can take the name between unregister and reservation.
+            narf_net::iface::reserve_name(&self.name);
+            narf_net::iface::unregister(&self.name);
+        }
     }
     pub(super) fn drain(&self) -> bool {
         let (epoch, frames) = self.progress();
@@ -1024,7 +1037,7 @@ async fn discover(
     Ok(())
 }
 fn permitted(frequency: u16) -> bool {
-    narf_wireless::reg::db::snapshot().is_some_and(|domain| {
+    crate::ath9k::platform::regdb::snapshot().is_some_and(|domain| {
         // Dual-band span rule (DFS / NO_IR / indoor refuse); a 5 GHz
         // frequency is only reachable through an AR9280 mask.
         super::calibration::Permission::from_domain_dual(&domain, frequency).is_ok()
@@ -1272,9 +1285,13 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
             device.retire_host();
         }
         self.seat.advance();
-        narf_wireless::registry::unregister(self.name);
-        narf_net::registry().unregister(self.name);
-        narf_net::iface::unregister(self.name);
+        // The module's netdev leaves with its device context (unload).
+        #[cfg(feature = "builtin")]
+        {
+            narf_wireless::registry::unregister(self.name);
+            narf_net::registry().unregister(self.name);
+            narf_net::iface::unregister(self.name);
+        }
     }
     /// The current generation, waiting for a reset/wake/resume in flight to
     /// attach the next one.
@@ -1433,9 +1450,16 @@ type NativeNetdev = Netdev<
 >;
 /// The single published ath9k netdev (one bound function at a time).
 static NETDEV: IrqSafeSpinLock<Option<Arc<NativeNetdev>>> = IrqSafeSpinLock::new(None);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+/// The stack's TX entry (built in: `narf_net::iface::register`; in the
+/// module: the netif bridge's TX callback).
+pub(super) fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = current().ok_or(())?;
     device.enqueue(bytes, meta)
+}
+/// The published netdev (what nl80211 drives built in, and the `WIFI` host
+/// events drive in the module).
+pub(super) fn netdev() -> Option<Arc<NativeNetdev>> {
+    NETDEV.lock().clone()
 }
 fn drain() -> bool {
     current().is_some_and(|device| device.drain())
@@ -1444,6 +1468,7 @@ fn drain() -> bool {
 /// The first generation creates and registers the netdev (`wlan%d`); every
 /// later generation of the same MAC attaches to it under the same name.
 pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error> {
+    #[cfg(feature = "builtin")]
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
@@ -1454,16 +1479,18 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
             Some(netdev) if netdev.own == own => (netdev.clone(), false),
             Some(_) => return Err(Error::State),
             None => {
-                let netdev = NativeNetdev::new(
-                    narf_net::iface::reserve_name("wlan%d"),
-                    own,
-                    Some(leave_idle),
-                );
+                #[cfg(feature = "builtin")]
+                let name = narf_net::iface::reserve_name("wlan%d");
+                // The netif bridge names the module's netdev (`wlan%d`).
+                #[cfg(feature = "module")]
+                let name = "wlan";
+                let netdev = NativeNetdev::new(name, own, Some(leave_idle));
                 *slot = Some(netdev.clone());
                 (netdev, true)
             }
         }
     };
+    #[cfg(feature = "builtin")]
     if fresh {
         if narf_net::registry()
             .register(&authority, Registered(netdev.clone()))
@@ -1476,7 +1503,18 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
         narf_wireless::registry::register(netdev.clone());
         narf_net::iface::install_rx_drain(drain);
     }
+    // The module's netdev: a `WIFI` host session, then the netif bridge.
+    #[cfg(feature = "module")]
+    if fresh && super::iface_module::open(own).is_err() {
+        *NETDEV.lock() = None;
+        return Err(Error::Profile);
+    }
     let device = netdev.attach(radio)?;
+    // The wiphy describes the attached generation's channels and HT grant.
+    #[cfg(feature = "module")]
+    if fresh {
+        super::iface_module::register_wiphy(netdev.get_wireless_info());
+    }
     device.link(None);
     device.admitted.store(true, Ordering::Release);
     {

@@ -3,6 +3,8 @@
 //! actual access; only this serialized owner bypasses its changing ANI
 //! receipt. All fixed power/clock/RFkill/PCI receipts remain required.
 use super::*;
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::narf_time;
 use crate::ath9k::{ar9003::ani, periodic::Io};
 pub(super) struct Unchecked<'a> {
     pub(super) native: &'a Native,

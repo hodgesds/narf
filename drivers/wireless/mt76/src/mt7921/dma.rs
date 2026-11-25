@@ -65,8 +65,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use narf_bus::MmioRegion;
-use narf_io::DmaBuffer;
+use crate::platform::bus::MmioRegion;
+use crate::platform::dma::DmaBuffer;
 
 use super::regs::*;
 
@@ -357,8 +357,9 @@ impl Ring {
             // we push a 0-len placeholder allocation. This costs one
             // page per ring slot — at the bring-up baseline (16
             // entries) that's 64 KiB across all rings, acceptable.
-            let placeholder = narf_io::alloc_coherent(64, narf_lib::id::DomainId::DRIVER_0)
-                .expect("dma placeholder alloc");
+            let placeholder =
+                crate::platform::dma::alloc_coherent(64, crate::platform::dma::DomainId::DRIVER_0)
+                    .expect("dma placeholder alloc");
             self.buffers.push(placeholder);
         }
         // Swap-in: dropping the old buffer frees its page via Drop.
@@ -375,7 +376,9 @@ impl Ring {
             return None;
         }
         // Swap with a placeholder so the Vec retains its slots.
-        let placeholder = narf_io::alloc_coherent(64, narf_lib::id::DomainId::DRIVER_0).ok()?;
+        let placeholder =
+            crate::platform::dma::alloc_coherent(64, crate::platform::dma::DomainId::DRIVER_0)
+                .ok()?;
         let old = core::mem::replace(&mut self.buffers[slot], placeholder);
         Some(old)
     }
@@ -390,9 +393,11 @@ pub fn alloc_tx_ring(q_idx: u8, depth: usize) -> Result<Ring, DmaError> {
     if depth == 0 || depth > MT7921_BASELINE_RING_DEPTH {
         return Err(DmaError::DepthExceedsPage);
     }
-    let desc_mem =
-        narf_io::alloc_coherent(depth * MT76_DESC_SIZE, narf_lib::id::DomainId::DRIVER_0)
-            .map_err(|_| DmaError::BufferAllocFailed)?;
+    let desc_mem = crate::platform::dma::alloc_coherent(
+        depth * MT76_DESC_SIZE,
+        crate::platform::dma::DomainId::DRIVER_0,
+    )
+    .map_err(|_| DmaError::BufferAllocFailed)?;
 
     Ok(Ring {
         q_idx,
@@ -413,14 +418,17 @@ pub fn alloc_rx_ring(q_idx: u8, depth: usize, buf_len: usize) -> Result<Ring, Dm
     if depth == 0 || depth > MT7921_BASELINE_RING_DEPTH {
         return Err(DmaError::DepthExceedsPage);
     }
-    let desc_mem =
-        narf_io::alloc_coherent(depth * MT76_DESC_SIZE, narf_lib::id::DomainId::DRIVER_0)
-            .map_err(|_| DmaError::BufferAllocFailed)?;
+    let desc_mem = crate::platform::dma::alloc_coherent(
+        depth * MT76_DESC_SIZE,
+        crate::platform::dma::DomainId::DRIVER_0,
+    )
+    .map_err(|_| DmaError::BufferAllocFailed)?;
 
     let mut buffers = Vec::with_capacity(depth);
     for _ in 0..depth {
-        let buf = narf_io::alloc_coherent(buf_len, narf_lib::id::DomainId::DRIVER_0)
-            .map_err(|_| DmaError::BufferAllocFailed)?;
+        let buf =
+            crate::platform::dma::alloc_coherent(buf_len, crate::platform::dma::DomainId::DRIVER_0)
+                .map_err(|_| DmaError::BufferAllocFailed)?;
         buffers.push(buf);
     }
 
@@ -508,10 +516,10 @@ pub const DMA_BUSY_POLL_MS: u64 = 100;
 /// # Safety
 /// `mmio` is the live BAR0 region; driver owns the device.
 pub unsafe fn dma_disable(mmio: &MmioRegion) -> Result<(), DmaError> {
-    use narf_time::Deadline;
+    use crate::platform::time::Deadline;
     let deadline = Deadline::after_ms(DMA_BUSY_POLL_MS);
     let busy_mask = MT_WFDMA0_GLO_CFG_TX_DMA_BUSY | MT_WFDMA0_GLO_CFG_RX_DMA_BUSY;
-    let cleared = narf_scheduler::responsive_spin_until(
+    let cleared = crate::platform::responsive_spin_until(
         || {
             // SAFETY: BAR0 mapped + owned.
             let v = unsafe { mmio.read32(MT_WFDMA0_GLO_CFG as u64) };
@@ -569,8 +577,8 @@ pub unsafe fn dma_reset(mmio: &MmioRegion) {
     unsafe { mmio.write32(MT_WFDMA0_RST as u64, bits) };
     // Brief settle — Linux uses `udelay(1)` here; we use a 1 ms
     // responsive-spin which is conservative.
-    let deadline = narf_time::Deadline::after_ms(1);
-    narf_scheduler::responsive_spin_until(|| false, deadline);
+    let deadline = crate::platform::time::Deadline::after_ms(1);
+    crate::platform::responsive_spin_until(|| false, deadline);
     // SAFETY: same.
     unsafe { mmio.write32(MT_WFDMA0_RST as u64, 0) };
 }

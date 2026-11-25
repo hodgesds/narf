@@ -57,6 +57,7 @@ pub mod sign;
 pub mod symbols;
 pub mod syscalls;
 pub mod sysfs_module;
+pub mod usb_wifi;
 
 #[cfg(test)]
 mod tests;
@@ -240,7 +241,14 @@ fn install_bus_call_gate() {
     narf_bus::set_module_callback_call_gate(module_callback_call_gate);
     narf_bus::set_module_tx_call_gate(module_tx_call_gate);
     narf_bus::set_module_wireless_event_call_gate(module_wireless_event_call_gate);
-    narf_bus::set_module_context_retired_hook(module_block::retire_token);
+    narf_bus::set_module_context_retired_hook(module_context_retired);
+}
+
+/// A module device context (bus or USB) went away: retire every sink tied
+/// to it — module disks, and USB Wi-Fi interfaces and pollers.
+fn module_context_retired(owner: u64, token: u64) {
+    module_block::retire_token(owner, token);
+    usb_wifi::retire_token(owner, token);
 }
 
 /// Per-name registry of loaded modules. Acts as the single source

@@ -37,9 +37,9 @@ use super::group_link::PendingOwner;
 use super::{Backend, CapturedData, Error, Session, Stage, State};
 use crate::mt7921::association::ap::Plan;
 use crate::mt7921::vif_slots::Vif;
+use crate::platform::ap_control::ApControlAuthority;
 use alloc::sync::Arc;
 use core::ops::{Deref, DerefMut};
-use narf_wireless::ap_control::ApControlAuthority;
 
 /// Captured packets the GO may hold before the oldest drop.
 const DEMUX_DEPTH: usize = 64;
@@ -627,6 +627,7 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    #[cfg(feature = "builtin")]
     /// Run one AP control request (beacon, stations, keys, management or
     /// control-port TX) on the GO. Every failure stays in the GO role.
     pub(super) async fn go_request(

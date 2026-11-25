@@ -7,7 +7,6 @@ use narf_wireless::association::JoinPlan as ManagementPlan;
 pub use narf_wireless::association::{validate_sme_ies, Error, Phase, SecurityMode};
 #[cfg(any(test, feature = "builtin"))]
 use narf_wireless::rsn::{self, RsnIe, Suite};
-#[cfg(any(test, feature = "builtin"))]
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 
 #[path = "ap_plan.rs"]

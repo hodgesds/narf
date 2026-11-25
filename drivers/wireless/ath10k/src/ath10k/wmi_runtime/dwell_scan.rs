@@ -20,7 +20,7 @@ pub(super) struct Work {
 pub(in crate::ath10k) struct ScanPolicy {
     plan: Plan,
     caps: wmi_boot::Capabilities,
-    deadline: narf_time::Deadline,
+    deadline: crate::ath10k::platform::time::Deadline,
 }
 impl ScanPolicy {
     pub fn check(&self, domain: &RegulatoryDomain) -> Result<(), Error> {
@@ -158,7 +158,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             policy: Arc::new(ScanPolicy {
                 plan,
                 caps,
-                deadline: narf_time::Deadline::after_ms(25_000),
+                deadline: crate::ath10k::platform::time::Deadline::after_ms(25_000),
             }),
             report,
             complete: false,

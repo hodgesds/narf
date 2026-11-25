@@ -12,7 +12,7 @@ use super::{
     firmware_transport::{Error, Io},
     power::*,
 };
-use narf_time::Deadline;
+use crate::platform::time::Deadline;
 
 async fn update(io: &impl Io, at: u16, clear: u8, set: u8) -> Result<(), Error> {
     let value = io.read8(at)?;

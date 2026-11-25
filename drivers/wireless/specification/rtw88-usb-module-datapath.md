@@ -1,7 +1,22 @@
 # rtw88-USB loadable-module datapath — design
 
-Status: **proposal / for review** (2026-11-20). First consumer of the wireless
-module datapath. Sets the contract later Wi-Fi `.ko`s reuse.
+Status: **superseded (2026-11-24) — the driver's own source runs in the
+`.ko`.** Kept as history. The Model A plan below (a hand-written C-ABI
+reimplementation in `module_usb.rs`, with register programming extracted
+into `narf-drivers-wireless-rtl-chip` piece by piece) reached MAC/FIFO
+bring-up and stopped there: PHY/RF/IQK, the station, the netdev and the
+control plane were still ahead, against an ~86k-line driver. Since then
+`narf-module-rt` and kernel-free builds of `narf-crypto` / `narf-wireless`
+made the ath11k approach possible, and rtw88 now follows it: the real
+`rtw88/` tree (`usb_firmware::Backend`, `usb_driver`'s factory read and
+provisioning, `firmware_lifecycle`, `interface::Device` and the in-driver
+SME) builds into the module over `src/rtw88/platform/` and the USB KABI
+(`usb_kabi.rs`, `iface_module.rs`). `module_usb.rs` is retired. The current
+design is `drivers/wireless/specification/spec.md` §4.8; the KABI it added
+is `modules/DATAPATH_ABI_DESIGN.md`, "USB device poller and the regulatory
+domain".
+
+Original status: proposal / for review (2026-11-20).
 
 ## Problem
 

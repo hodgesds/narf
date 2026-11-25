@@ -13,7 +13,7 @@ pub(super) struct State {
     secondary: u16,
     channels: Vec<u16>,
     interval: u64,
-    deadline: narf_time::Deadline,
+    deadline: crate::ath10k::platform::time::Deadline,
     pub allow_wide: bool,
     trigger: bool,
     report_channels: u16,
@@ -88,7 +88,7 @@ impl State {
             secondary,
             channels,
             interval,
-            deadline: narf_time::Deadline::after_ms(interval),
+            deadline: crate::ath10k::platform::time::Deadline::after_ms(interval),
             allow_wide: true,
             trigger: false,
             report_channels: 0,
@@ -148,7 +148,7 @@ impl State {
             self.observe(bss)?;
         }
         self.report_pending = true;
-        self.deadline = narf_time::Deadline::after_ms(self.interval);
+        self.deadline = crate::ath10k::platform::time::Deadline::after_ms(self.interval);
         self.force_scan = false;
         Ok(())
     }
@@ -480,7 +480,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             old.check(domain)?;
             permission.check(domain)
         };
-        let deadline = narf_time::Deadline::after_ms(5000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(5000);
         let mut drained = false;
         for _ in 0..4096 {
             if deadline.expired() {
@@ -505,7 +505,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 drained = true;
                 break;
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !drained {
             return Err(Error::Exhausted);
@@ -553,7 +553,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     break;
                 }
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !restarted {
             return Err(Error::Timeout);
@@ -579,7 +579,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 settled = true;
                 break;
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !settled {
             return Err(Error::Exhausted);
@@ -717,7 +717,7 @@ mod tests;
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn expire_coexistence_for_test(&mut self) {
         if let Some(state) = &mut self.station.coexistence {
-            state.deadline = narf_time::Deadline::after_ms(0);
+            state.deadline = crate::ath10k::platform::time::Deadline::after_ms(0);
         }
     }
 }

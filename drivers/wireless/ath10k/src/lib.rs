@@ -7,10 +7,14 @@
 //! `narf-drivers-wireless-ath-core`; see `drivers/wireless/iwlwifi/` for the
 //! reference dual-build shape.
 //!
-//! The real driver in [`ath10k`] compiles only for the built-in build. The
-//! `module` build registers the QCA PCI ids through the
-//! `narf_register_pci_driver` KSYMTAB export; its probe thunk returns
-//! `-ENOSYS` (registration-only proof), matching the net and iwlwifi `.ko`s.
+//! One driver source tree in both builds. Built in, [`ath10k`] binds every
+//! QCA988X/9887/6174/6164/99X0/9888/9984/9377 PCI id through `narf-bus`. The
+//! `module` build is the same driver running inside the `.ko`: it registers
+//! the same ids through `narf_register_pci_driver` and drives the card
+//! through the KABI (BAR access, PCI command, plain MSI, ASPM, mapped DMA,
+//! firmware), with its station netdev and wiphy published through the netif
+//! bridge and the `WIFI` family host. Kernel services come from
+//! [`ath10k::platform`].
 //!
 //! ## Hardware validation is gated
 //!
@@ -22,7 +26,6 @@
 #![no_std]
 #![allow(dead_code)]
 
-#[cfg(feature = "builtin")]
 extern crate alloc;
 
 use narf_driver_macros::narf_driver;
@@ -33,11 +36,10 @@ use narf_driver_macros::narf_driver;
 #[cfg(feature = "builtin")]
 pub(crate) use narf_drivers_wireless_core::firmware_asset;
 
-#[cfg(feature = "builtin")]
+/// The driver. One source tree in both builds: kernel services come from
+/// [`ath10k::platform`], which is the kernel's crates built in and
+/// `narf-module-rt` + the KABI in the `.ko`.
 pub mod ath10k;
-
-#[cfg(feature = "module")]
-mod module_probe;
 
 narf_driver! {
     name: "ath10k",
@@ -47,7 +49,7 @@ narf_driver! {
         author: "narf",
         description: "Qualcomm Atheros ath10k PCIe Wi-Fi",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write,Firmware:Read",
     },
     register: do_register,
 }
@@ -59,5 +61,5 @@ fn do_register() {
 
 #[cfg(feature = "module")]
 fn do_register() {
-    module_probe::register();
+    ath10k::register_module();
 }

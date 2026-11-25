@@ -4,7 +4,7 @@
 //! Signed registry inputs retain the same source owner as executable/BDF data.
 use super::platform::{Platform, Source};
 use super::*;
-use narf_bus::PcieAddr;
+use crate::ath10k::platform::pci::PcieAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {

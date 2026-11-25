@@ -12,6 +12,7 @@
 //! the owner keeps its 1 ms polled service (INTx stays disabled: the retained
 //! command register keeps `INTX_DISABLE` set and NARF has no shared
 //! level-triggered GSI route that could clear `MAILBOXINT` from hard IRQ).
+use crate::platform::IrqSafeSpinLock;
 use alloc::sync::Arc;
 use core::{
     future::Future,
@@ -19,7 +20,6 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll, Waker},
 };
-use narf_lib::sync::IrqSafeSpinLock;
 
 /// Edge-latched wake shared by the vector handler and the service owner.
 pub struct Signal {
@@ -101,6 +101,7 @@ pub const fn fallback_ms(delivered: bool) -> u64 {
     }
 }
 
+#[cfg(feature = "builtin")]
 /// One retained MSI binding (single BCM43602 owner per boot, as
 /// `pcie.rs::OWNED`).
 #[derive(Debug)]
@@ -110,8 +111,10 @@ pub(super) struct Msi {
     signal: Arc<Signal>,
 }
 
+#[cfg(feature = "builtin")]
 static SIGNAL: IrqSafeSpinLock<Option<Arc<Signal>>> = IrqSafeSpinLock::new(None);
 
+#[cfg(feature = "builtin")]
 fn vector_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
     let signal = { SIGNAL.lock().clone() };
     match signal {
@@ -123,6 +126,7 @@ fn vector_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
     }
 }
 
+#[cfg(feature = "builtin")]
 fn release(msi: Msi) {
     narf_interrupts::disable_irq(msi.vector);
     let _ = narf_interrupts::remove_handler(msi.vector, "brcmfmac", 0);
@@ -135,6 +139,7 @@ fn release(msi: Msi) {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl super::pcie::PcieBackplane {
     /// `pci_enable_msi` + `request_threaded_irq`: discover, program and
     /// install one vector with MSI Enable set only after the handler exists.

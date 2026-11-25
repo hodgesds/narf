@@ -117,7 +117,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(5000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(5000);
         loop {
             validate()?;
             if deadline.expired() {
@@ -127,7 +127,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 htt::Event::Wmi(bytes) if wire::word(&bytes, 0)? & 0xffffff == DELETE_RESPONSE => {
                     return Ok(());
                 }
-                htt::Event::Idle | htt::Event::Progress => narf_scheduler::yield_now().await,
+                htt::Event::Idle | htt::Event::Progress => {
+                    crate::ath10k::platform::yield_now().await
+                }
                 event => self.queue(event)?,
             }
         }

@@ -10,6 +10,8 @@ use super::super::{
 use super::phy::Span;
 use super::{Owner, Phase};
 use crate::firmware_asset::Asset;
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_wireless::reg::RegulatoryDomain;
@@ -861,7 +863,7 @@ impl Owner {
         let source = crate::firmware_asset::load(&authority, &request.name, RECORD_LEN, true)
             .map_err(|_| "MVM signed platform power qualification unavailable")?;
         self.prepare_power_using(source, request.binding, || {
-            narf_wireless::reg::db::get_domain()
+            crate::iwlwifi::reg_source::get_domain()
                 .ok_or("MVM current host transmit policy unavailable")
         })
         .await

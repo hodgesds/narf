@@ -6,6 +6,9 @@ use super::{
     packet_core::{self as packet, Frame as Mpdu, Receipt},
     station_control::{self, Admission},
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::{narf_time, narf_wireless};
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use narf_wireless::{
     association::{self, JoinPlan, ObservedBss, SecurityMode},

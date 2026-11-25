@@ -509,9 +509,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // Consume maps/unmaps/completions already received with the command
         // receipts before reporting the configured peer; never revive a lost
         // peer. Flood/cancellation keeps this same owner closed.
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         for _ in 0..4096 {
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
@@ -660,11 +660,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             self.send_station_command(command, validate).await?;
         }
-        let deadline = narf_time::Deadline::after_ms(5_000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(5_000);
         let mut started = false;
         for _ in 0..65_536 {
             // Continuous ready events must not monopolize the retained owner.
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
@@ -678,7 +678,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                         break;
                     }
                 }
-                htt::Event::Idle => narf_scheduler::yield_now().await,
+                htt::Event::Idle => crate::ath10k::platform::yield_now().await,
                 htt::Event::Progress => {}
                 // The radio observers and a sibling slot's PEER_MAP/UNMAP see
                 // the event once here (`station_event` parks the sibling's),
@@ -693,10 +693,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Timeout);
         }
         self.send_station_command(&create, validate).await?;
-        let deadline = narf_time::Deadline::after_ms(5_000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(5_000);
         for _ in 0..65_536 {
             // Continuous ready events must not monopolize the retained owner.
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
@@ -715,7 +715,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             maximum_power_dbm: permission.half_dbm / 2,
                         });
                     }
-                    narf_scheduler::yield_now().await;
+                    crate::ath10k::platform::yield_now().await;
                 }
                 htt::Event::Progress => {}
                 other => self.queue(other)?,
@@ -860,12 +860,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             self.transmit_management(domain, frame).await?;
         }
         self.failed = true;
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         for _ in 0..65_536 {
             // Native CE/HTC polling may stay immediately ready under a
             // management RX flood. Every iteration must yield with this
             // same failed/retained owner, including discarded responses.
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }

@@ -17,7 +17,7 @@
 //! with the page in the high half and lands it at `0x130000`
 //! (upstream `mt7921/regs.h:63-70` vs `mt7925/regs.h:80-90`).
 use super::regs::*;
-use narf_bus::MmioRegion;
+use crate::platform::bus::MmioRegion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {

@@ -2,12 +2,10 @@
 //! is inferred from command completion; the interface publishes separately.
 use super::{station::Command, Backend, Error, RadioInfo, Session, Stage, State};
 use crate::mt7921::{ap_wire, association::ap::Plan, channel, cmd};
+use crate::platform::ap_control::{ApControlAuthority, ApInterfaceIdentity};
 use alloc::{sync::Arc, vec};
 use core::future::Future;
-use narf_wireless::{
-    ap_control::{ApControlAuthority, ApInterfaceIdentity},
-    ApConfig,
-};
+use narf_wireless::ApConfig;
 
 #[derive(Debug)]
 pub(super) struct Owner {

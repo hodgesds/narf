@@ -33,6 +33,9 @@ use super::{
     power_policy::Gate,
     qualification::{Grant, Kind, PAYLOAD},
 };
+#[cfg(feature = "module")]
+#[allow(unused_imports)]
+use crate::rtw88::platform::narf_wireless;
 use alloc::{format, string::String};
 use narf_wireless::reg::{RegFlags, RegulatoryDomain};
 

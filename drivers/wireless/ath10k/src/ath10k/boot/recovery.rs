@@ -141,8 +141,12 @@ impl PciBoot {
             self.stop_interrupts();
             // A failed wake/reference proof never skips the last available
             // PCI-only BME-off attempt. No allocation is reclaimable here.
-            let _ = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
-                narf_bus::pci::clear_command(&cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
+            let _ = crate::ath10k::platform::pci::invoke(&cap, || {
+                crate::ath10k::platform::pci::clear_command(
+                    &cap,
+                    &self.device,
+                    crate::ath10k::platform::pci::cmd::BUS_MASTER,
+                )
             });
             return Err(error);
         }
@@ -156,12 +160,16 @@ impl PciBoot {
         let cap = self.retire_scope()?;
         let device = self.device;
         let halted = silence(&mut self.mmio, self.hardware, || {
-            narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
-                narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
+            crate::ath10k::platform::pci::invoke(&cap, || {
+                crate::ath10k::platform::pci::clear_command(
+                    &cap,
+                    &device,
+                    crate::ath10k::platform::pci::cmd::BUS_MASTER,
+                )
+                .map_err(|_| BmiError::Pci)?;
+                let command = crate::ath10k::platform::pci::read_command(&cap, &device)
                     .map_err(|_| BmiError::Pci)?;
-                let command =
-                    narf_bus::pci::read_command(&cap, &device).map_err(|_| BmiError::Pci)?;
-                if command & narf_bus::pci::cmd::BUS_MASTER != 0 {
+                if command & crate::ath10k::platform::pci::cmd::BUS_MASTER != 0 {
                     return Err(BmiError::Pci);
                 }
                 Ok(())
@@ -183,12 +191,16 @@ impl PciBoot {
         let cap = self.retire_scope()?;
         let device = self.device;
         park(&mut self.mmio, self.hardware, || {
-            narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
-                narf_bus::pci::clear_command(&cap, &device, narf_bus::pci::cmd::BUS_MASTER)
+            crate::ath10k::platform::pci::invoke(&cap, || {
+                crate::ath10k::platform::pci::clear_command(
+                    &cap,
+                    &device,
+                    crate::ath10k::platform::pci::cmd::BUS_MASTER,
+                )
+                .map_err(|_| BmiError::Pci)?;
+                let command = crate::ath10k::platform::pci::read_command(&cap, &device)
                     .map_err(|_| BmiError::Pci)?;
-                let command =
-                    narf_bus::pci::read_command(&cap, &device).map_err(|_| BmiError::Pci)?;
-                if command & narf_bus::pci::cmd::BUS_MASTER != 0 {
+                if command & crate::ath10k::platform::pci::cmd::BUS_MASTER != 0 {
                     return Err(BmiError::Pci);
                 }
                 Ok(())

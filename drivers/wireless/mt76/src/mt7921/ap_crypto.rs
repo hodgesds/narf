@@ -302,5 +302,6 @@ fn shape(header: &[u8]) -> Result<(usize, u8), Error> {
     }
 }
 
+#[cfg(feature = "builtin")]
 #[path = "ap_crypto_tests.rs"]
 mod tests;

@@ -2,6 +2,8 @@
 //! The allocation command exposes DMA
 //! addresses, so the queue must be retained even if that command times out.
 
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{vec, vec::Vec};
 use narf_io::DmaBuffer;
 
@@ -316,6 +318,7 @@ impl DataQueue {
     /// actual host crypto (`control.hw_key == NULL`). Retain that distinction:
     /// this entry borrows the real GO host key/PN owner, while send_ap_assisted
     /// continues to refuse a raw Protected frame with firmware crypto disabled.
+    #[cfg(feature = "builtin")]
     pub(super) fn send_go_group(
         &mut self,
         mmio: &mut impl IwlMmio,

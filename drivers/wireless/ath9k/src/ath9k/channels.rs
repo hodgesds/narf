@@ -2,6 +2,8 @@
 //! Driver-owned cold channel generations. A public waiter cannot cancel RF
 //! reset/calibration after the old generation has been physically retired.
 use super::*;
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::narf_scheduler;
 use alloc::{boxed::Box, task::Wake, vec::Vec};
 use core::{
     future::Future,

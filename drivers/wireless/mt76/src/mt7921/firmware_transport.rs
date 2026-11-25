@@ -19,8 +19,11 @@ mod ap_packet;
 mod ap_peer;
 #[path = "ap_rx.rs"]
 mod ap_rx;
+// The boot-owner AP/P2P entry points take the built-in netdevs.
+#[cfg(feature = "builtin")]
 #[path = "boot_ap.rs"]
 pub(crate) mod boot_ap;
+#[cfg(feature = "builtin")]
 #[path = "boot_p2p.rs"]
 pub(crate) mod boot_p2p;
 #[path = "p2p_management.rs"]
@@ -84,6 +87,7 @@ mod system_pm;
 mod wowlan;
 #[path = "wowlan_owner.rs"]
 mod wowlan_owner;
+#[cfg(feature = "builtin")]
 pub(super) use join::{extract_eapol, wrap_eapol_frame};
 pub use monitor::{validate_channel as validate_monitor_channel, Capture as MonitorCapture};
 pub use wowlan_owner::{boot_validate_rekey_data, boot_wake_route_available, suspend_boot_wowlan};
@@ -92,13 +96,13 @@ pub use wowlan_owner::{boot_validate_rekey_data, boot_wake_route_available, susp
 mod hardware;
 pub use hardware::Transport;
 
-static BOOT_OWNER: narf_lib::mutex::Mutex<Option<Transport>> = narf_lib::mutex::Mutex::new(None);
+static BOOT_OWNER: crate::platform::Mutex<Option<Transport>> = crate::platform::Mutex::new(None);
 /// Set once the boot-time firmware initcall ran; later probes provision
 /// themselves.
 static BOOT_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 // Serializes publication and initial preparation. The work itself lives in
 // KEY_WORK, so cancelling a provisioning caller never drops a started owner.
-static PROVISION: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
+static PROVISION: crate::platform::Mutex<()> = crate::platform::Mutex::new(());
 
 type KeyFuture<T> = core::pin::Pin<
     alloc::boxed::Box<dyn core::future::Future<Output = (T, Result<(), Error>)> + Send>,
@@ -138,8 +142,8 @@ impl<T> KeyWork<T> {
 
 // Rekey/reset work owns the transport across executor polls. Both the normal
 // task and a synchronous network drain may advance the retained future.
-static KEY_WORK: narf_lib::mutex::Mutex<Option<KeyWork<Transport>>> =
-    narf_lib::mutex::Mutex::new(None);
+static KEY_WORK: crate::platform::Mutex<Option<KeyWork<Transport>>> =
+    crate::platform::Mutex::new(None);
 
 /// The bound of a parked owner wait: an interrupt-driven owner re-polls at
 /// least this often (a lost event or a hung MCU still reaches the wait's own
@@ -148,7 +152,9 @@ const PACE_MS: u64 = 10;
 
 /// One owner wait's sleep of [`PACE_MS`].
 #[derive(Default)]
-pub(super) struct Pace(Option<core::pin::Pin<alloc::boxed::Box<narf_time::SleepUntil>>>);
+pub(super) struct Pace(
+    Option<core::pin::Pin<alloc::boxed::Box<crate::platform::time::SleepUntil>>>,
+);
 
 impl core::fmt::Debug for Pace {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -162,9 +168,9 @@ impl Pace {
     pub(super) fn sleep(&mut self, cx: &mut core::task::Context<'_>) -> bool {
         use core::future::Future;
         let timer = self.0.get_or_insert_with(|| {
-            alloc::boxed::Box::pin(narf_time::sleep_until(narf_time::Deadline::after_ms(
-                PACE_MS,
-            )))
+            alloc::boxed::Box::pin(crate::platform::time::sleep_until(
+                crate::platform::time::Deadline::after_ms(PACE_MS),
+            ))
         });
         if timer.as_mut().poll(cx).is_ready() {
             self.0 = None;
@@ -186,8 +192,8 @@ pub(super) fn polled_park(pace: &mut Pace, cx: &mut core::task::Context<'_>) -> 
 /// The owner-lock waits of one async [`finish_boot_keys`].
 #[derive(Default)]
 struct KeyLocks {
-    work: Option<narf_lib::mutex::LockFuture<'static, Option<KeyWork<Transport>>>>,
-    owner: Option<narf_lib::mutex::LockFuture<'static, Option<Transport>>>,
+    work: Option<crate::platform::LockFuture<'static, Option<KeyWork<Transport>>>>,
+    owner: Option<crate::platform::LockFuture<'static, Option<Transport>>>,
 }
 
 /// Without `wait`, `mutex_trylock`. With it, `mutex_lock`: queue on the
@@ -195,10 +201,10 @@ struct KeyLocks {
 /// re-polling every executor round while another party (a synchronous
 /// network drain advancing the work, a scan holding the owner) has it.
 fn acquire<T: 'static>(
-    mutex: &'static narf_lib::mutex::Mutex<T>,
-    wait: Option<&mut Option<narf_lib::mutex::LockFuture<'static, T>>>,
+    mutex: &'static crate::platform::Mutex<T>,
+    wait: Option<&mut Option<crate::platform::LockFuture<'static, T>>>,
     cx: &mut core::task::Context<'_>,
-) -> Option<narf_lib::mutex::MutexGuard<'static, T>> {
+) -> Option<crate::platform::MutexGuard<'static, T>> {
     use core::future::Future;
     let Some(wait) = wait else {
         return mutex.try_lock();
@@ -302,7 +308,7 @@ pub(super) fn retire_for_removal(generation: u64) -> bool {
             }
         }
     }
-    narf_scheduler::spawn(async move {
+    crate::platform::spawn(async move {
         // Drive retained work to completion: its stale generation makes
         // poll_boot_keys retire instead of republish.
         loop {
@@ -320,7 +326,7 @@ pub(super) fn retire_for_removal(generation: u64) -> bool {
                 }
                 return;
             }
-            narf_scheduler::yield_now().await;
+            crate::platform::yield_now().await;
         }
     });
     false
@@ -332,14 +338,14 @@ pub(super) fn provision_after_reprobe() {
     if !BOOT_STARTED.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
-    narf_scheduler::spawn(async {
+    crate::platform::spawn(async {
         use core::fmt::Write;
         let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+            crate::platform::time::sleep_ns(500_000_000)
         })
         .await;
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: reprobe provisioning {:?}; retained {:?}",
             outcome.map(|_| ()),
             boot_status()
@@ -358,12 +364,14 @@ async fn finish_boot_keys() -> Result<(), Error> {
 /// requires the separate verified-reset recovery path, never a fresh claim.
 /// Repeating this on an initialized radio preserves its current station state.
 pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
+    #[cfg(feature = "builtin")]
     if crate::module_host::owns_discovery() {
         return Err(Error::Busy);
     }
     provision_radio_inner().await
 }
 
+#[cfg(feature = "builtin")]
 pub(crate) async fn provision_module_radio_once() -> Result<RadioInfo, Error> {
     provision_radio_inner().await
 }
@@ -419,7 +427,15 @@ async fn provision_radio_inner() -> Result<RadioInfo, Error> {
             owner.as_ref().and_then(|owner| owner.p2p_profile().ok()),
         )
     };
+    #[cfg(feature = "builtin")]
     crate::iface::register_scan_iface_profile(info, profile).map_err(|_| Error::Authority)?;
+    // The module build publishes the station netdev and wiphy through the
+    // netif bridge and the WIFI family host; it carries no P2P profile.
+    #[cfg(feature = "module")]
+    {
+        let _ = profile;
+        crate::iface_module::register(info).map_err(|_| Error::Authority)?;
+    }
     Ok(info)
 }
 
@@ -445,6 +461,7 @@ pub fn boot_status() -> BootStatus {
     }
 }
 
+#[cfg(feature = "builtin")]
 /// Copy only the executable images already opened and validated for the
 /// current native transport. There is no arbitrary registry name or new
 /// registry authority at the module boundary.
@@ -533,7 +550,7 @@ pub async fn stop_boot_monitor() -> Result<(), Error> {
 }
 /// Start a host scheduled scan on the retained idle station.
 pub async fn start_boot_sched_scan(config: &narf_wireless::NetDetectConfig) -> Result<(), Error> {
-    narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+    crate::platform::reg_db::ensure_domain().map_err(|_| Error::Authority)?;
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
@@ -566,7 +583,7 @@ pub async fn stop_boot_sched_scan() -> Result<(), Error> {
 }
 
 pub fn step_boot_monitor() -> Result<MonitorCapture, Error> {
-    let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
+    let domain = crate::platform::reg_db::get_domain().ok_or(Error::Authority)?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
         return Err(Error::Busy);
     };
@@ -834,8 +851,8 @@ pub(crate) enum PmksaRequest {
     Bssid([u8; 6]),
     Pmkid([u8; 16]),
 }
-pub(crate) static BOOT_PMKSA_REQUESTS: narf_lib::sync::IrqSafeSpinLock<Vec<PmksaRequest>> =
-    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+pub(crate) static BOOT_PMKSA_REQUESTS: crate::platform::IrqSafeSpinLock<Vec<PmksaRequest>> =
+    crate::platform::IrqSafeSpinLock::new(Vec::new());
 
 /// Apply queued PMKSA requests to `cache`.
 pub(crate) fn apply_pmksa_requests(cache: &mut crate::mt7921::pmksa::Cache) {
@@ -1015,7 +1032,7 @@ pub(crate) fn close_boot_go() -> Result<(), Error> {
 /// START the GO beside the home station (`mt7921_add_interface` +
 /// `mt7921_start_ap` on the GO vif, no reset); returns its receive epoch.
 pub(crate) async fn start_boot_go(
-    authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+    authority: Arc<crate::platform::ap_control::ApControlAuthority>,
     config: narf_wireless::ApConfig,
     settings: narf_wireless::ApStartSettings,
 ) -> Result<u64, Error> {
@@ -1025,9 +1042,10 @@ pub(crate) async fn start_boot_go(
 pub(crate) async fn stop_boot_go() -> Result<(), Error> {
     boot_owner_call!(owner => owner.stop_go())
 }
+#[cfg(feature = "builtin")]
 /// One AP control request on the GO (beacon, stations, keys, TX).
 pub(crate) async fn boot_go_request(
-    authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+    authority: Arc<crate::platform::ap_control::ApControlAuthority>,
     request: boot_ap::Request,
 ) -> Result<boot_ap::Reply, Error> {
     boot_owner_call!(owner => owner.go_request(authority, request))
@@ -1220,6 +1238,7 @@ where
     Err(last_err)
 }
 
+#[cfg(feature = "builtin")]
 pub(super) fn start_boot() -> narf_init::InitResult {
     use narf_init::InitResult;
     BOOT_STARTED.store(true, core::sync::atomic::Ordering::Release);
@@ -1237,14 +1256,15 @@ pub(super) fn start_boot() -> narf_init::InitResult {
     // image's page-table entries (aarch64, under KASLR). Linux likewise runs
     // blocking device bring-up from a worker, not on the boot stack. The
     // future is boxed by `spawn`; the outcome is reported when it lands.
-    narf_scheduler::spawn(boot_radio());
+    crate::platform::spawn(boot_radio());
     InitResult::Ok
 }
 
 /// The radio's boot bring-up: the first firmware provisioning attempt, then
 /// background retry or verified-reset recovery when it fails. Runs as a
-/// kernel task ([`start_boot`]).
-async fn boot_radio() {
+/// kernel task ([`start_boot`]); in the module build, a task on the
+/// module's executor spawned by probe.
+pub(super) async fn boot_radio() {
     use core::fmt::Write;
     let result = provision_boot_radio().await;
     if let Ok(info) = &result {
@@ -1255,7 +1275,7 @@ async fn boot_radio() {
             alloc::string::String::from_utf8_lossy(&bytes[..end]).into_owned()
         };
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: ASIC revision: {:x}; WM Firmware Version: {}, Build Time: {}",
             info.chip_id,
             text(&info.firmware.version),
@@ -1265,7 +1285,7 @@ async fn boot_radio() {
     if result.is_ok() {
         if crate::mt7921::debug::enabled() {
             let _ = writeln!(
-                narf_console::PriorityWriter::<7>,
+                crate::platform::PriorityConsole::<7>,
                 "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
                 boot_status()
             );
@@ -1273,7 +1293,7 @@ async fn boot_radio() {
         return;
     }
     let _ = writeln!(
-        narf_console::PriorityWriter::<3>,
+        crate::platform::PriorityConsole::<3>,
         "mt76: firmware {result:?}; retained {:?}",
         boot_status()
     );
@@ -1286,16 +1306,16 @@ async fn boot_radio() {
         // staging complete, falling back to verified reset recovery if the
         // subsequent first hardware attempt fails.
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: firmware preflight failed; provisioning retries in the background"
         );
         let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+            crate::platform::time::sleep_ns(500_000_000)
         })
         .await;
         if outcome.is_ok() {
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::Console,
                 "mt76: staged firmware provisioned; retained {:?}",
                 boot_status()
             );
@@ -1309,15 +1329,15 @@ async fn boot_radio() {
         // interface yet. Keep ownership in the same retained worker and only
         // publish an interface after a successful fresh identity query.
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: firmware startup failed; owner retained, recovering"
         );
     }
     for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
+        crate::platform::time::sleep_ns(delay_ns).await;
         let result = reset_boot_transport(None).await;
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: initial radio recovery {result:?}"
         );
         if result.is_ok() {
@@ -1469,7 +1489,7 @@ pub enum State {
     WowSuspended {
         info: RadioInfo,
         association: Option<WakeAssociation>,
-        target: narf_power::system_pm::SystemSleepState,
+        target: crate::platform::power::SystemSleepState,
     },
     Failed {
         stage: Stage,
@@ -1605,6 +1625,7 @@ impl Firmware {
             release_features: super::fw_features::parse(ram),
         })
     }
+    #[cfg(feature = "builtin")]
     /// Copy verified registry payloads into this session's immutable ownership.
     pub fn open(
         did: u16,
@@ -1613,6 +1634,22 @@ impl Firmware {
         let (patch, ram) = super::pci::firmware_blobs_for(did);
         let patch = super::firmware_assets::load(auth, patch)?;
         let ram = super::firmware_assets::load(auth, ram)?;
+        Self::prepare(&patch, &ram)
+    }
+    /// The same two files through the module's `Firmware` manifest cap
+    /// (`narf_firmware_open`), under the built-in copy's 16 MiB bound.
+    #[cfg(feature = "module")]
+    pub fn open(did: u16) -> Result<Self, Error> {
+        use crate::platform::firmware::{load, FwError};
+        let (patch, ram) = super::pci::firmware_blobs_for(did);
+        let read = |name: &str| {
+            load(name, MAX_IMAGE).map_err(|error| match error {
+                FwError::NoMemory => Error::Allocation,
+                FwError::NotFound | FwError::Invalid => Error::InvalidFirmware,
+            })
+        };
+        let patch = read(patch)?;
+        let ram = read(ram)?;
         Self::prepare(&patch, &ram)
     }
     /// Optional WM release metadata, retained from this immutable artifact.
@@ -1696,7 +1733,7 @@ trait Backend {
     fn now_ns(&self) -> u64;
     fn check(&self) -> Result<(), Error>;
     fn regulatory_domain(&self) -> Result<Arc<narf_wireless::reg::RegulatoryDomain>, Error> {
-        narf_wireless::reg::db::snapshot().ok_or(Error::Authority)
+        crate::platform::reg_db::snapshot().ok_or(Error::Authority)
     }
     fn check_tx_permission(
         &self,
@@ -1736,13 +1773,13 @@ trait Backend {
     fn firmware_owned(&mut self) -> Result<bool, Error>;
     fn prepare_wake_route(
         &mut self,
-        _target: narf_power::system_pm::SystemSleepState,
+        _target: crate::platform::power::SystemSleepState,
     ) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
     }
     fn arm_wake_route(
         &mut self,
-        _target: narf_power::system_pm::SystemSleepState,
+        _target: crate::platform::power::SystemSleepState,
     ) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
     }
@@ -2555,5 +2592,6 @@ impl<B: Backend> Session<B> {
     }
 }
 
+#[cfg(feature = "builtin")]
 #[path = "firmware_transport_tests.rs"]
 mod tests;

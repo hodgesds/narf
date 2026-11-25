@@ -48,7 +48,7 @@ fn note_link_loss(peer: [u8; 6], why: &str, reason: u16, from_ap: bool) {
     use core::fmt::Write;
     let by = if from_ap { "by AP" } else { "locally" };
     let _ = writeln!(
-        narf_console::Writer,
+        crate::platform::Console,
         "mt76: AP {} {why} - disconnect (Reason: {reason}, {by})",
         Mac(peer)
     );
@@ -146,10 +146,13 @@ fn note_comeback(bssid: [u8; 6], tu: u32) {
     use core::fmt::Write;
     let ms = u64::from(tu) * 1024 / 1000;
     let _ = writeln!(
-        narf_console::Writer,
+        crate::platform::Console,
         "mt76: {} rejected association temporarily; comeback duration {tu} TU ({ms} ms)",
         Mac(bssid)
     );
+    // NL80211_CMD_ASSOC_COMEBACK: the WIFI family host (version 2) carries
+    // no such event, so the module build reports the line above only.
+    #[cfg(feature = "builtin")]
     crate::iface::report_assoc_comeback(bssid, tu);
 }
 
@@ -158,7 +161,7 @@ fn note_comeback(bssid: [u8; 6], tu: u32) {
 #[inline(never)]
 pub(super) fn note_join_step(step: &str, bssid: [u8; 6]) {
     use core::fmt::Write;
-    let _ = writeln!(narf_console::Writer, "mt76: {step} {}", Mac(bssid));
+    let _ = writeln!(crate::platform::Console, "mt76: {step} {}", Mac(bssid));
 }
 
 /// mac80211's per-try line (`send auth to %pM (try %d/%d)`), here only for a
@@ -173,7 +176,7 @@ fn note_mlme_try(step: &str, attempt: u8, why: &str) {
         "giving up"
     };
     let _ = writeln!(
-        narf_console::Writer,
+        crate::platform::Console,
         "mt76: {step} try {attempt}/{MLME_MAX_TRIES}: {why}; {next}"
     );
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! System sleep and inactive power save share the retained transition owner.
 use super::*;
+#[cfg(feature = "builtin")]
 use narf_power::{
     device_pm::DevicePmError,
     system_pm::{AsyncSystemPm, SystemPmFuture},
@@ -243,6 +244,7 @@ where
     }
 }
 
+#[cfg(feature = "builtin")]
 pub(super) struct SystemPm {
     pub(super) device: Weak<Native>,
     pub(super) config: IrqSafeSpinLock<Option<narf_bus::pci::SavedPciConfig>>,
@@ -250,12 +252,14 @@ pub(super) struct SystemPm {
     /// while this is held.
     pub(super) wake: IrqSafeSpinLock<Option<narf_power::pci_wake::PciWake>>,
 }
+#[cfg(feature = "builtin")]
 async fn pci_settle() {
     narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
         narf_bus::pci::PM_D3HOT_DELAY_MS * 1_000_000,
     ))
     .await;
 }
+#[cfg(feature = "builtin")]
 impl SystemPm {
     async fn transition(&self, operation: supervisor::Operation) -> Result<(), DevicePmError> {
         let Some(device) = self.device.upgrade() else {
@@ -270,6 +274,7 @@ impl SystemPm {
             .map_err(|_| DevicePmError::DriverError)
     }
 }
+#[cfg(feature = "builtin")]
 impl narf_power::device_pm::DevicePmOps for SystemPm {
     fn suspend(&self) -> Result<(), DevicePmError> {
         let Some(device) = self.device.upgrade() else {
@@ -314,6 +319,7 @@ impl narf_power::device_pm::DevicePmOps for SystemPm {
         Ok(())
     }
 }
+#[cfg(feature = "builtin")]
 impl AsyncSystemPm for SystemPm {
     fn prepare_suspend<'a>(&'a self) -> SystemPmFuture<'a> {
         Box::pin(async move {

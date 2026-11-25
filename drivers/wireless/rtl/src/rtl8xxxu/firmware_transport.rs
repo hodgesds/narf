@@ -13,9 +13,9 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use narf_drivers_usb::device::{USBDevice, UsbError};
-use narf_firmware::FirmwareError;
-use narf_lib::sync::IrqSafeSpinLock;
+use crate::platform::firmware::FirmwareError;
+use crate::platform::lib::sync::IrqSafeSpinLock;
+use crate::platform::usb::{USBDevice, UsbError};
 
 use super::regs::*;
 
@@ -156,7 +156,7 @@ pub fn parse_image(chip: ChipFamily, blob: &[u8]) -> Result<(FirmwareInfo, &[u8]
 }
 
 // `ControlIo`/`UsbControl` moved to `narf_drivers_wireless_rtl_usb` (shared with rtw88).
-pub use narf_drivers_wireless_rtl_usb::{ControlIo, UsbControl};
+pub use crate::platform::rtl_usb::{ControlIo, UsbControl};
 /// A retained, one-shot initialization attempt. A failed or cancelled owner
 /// cannot replay register writes; recovery requires a fresh device lifecycle.
 pub struct Owner<I: ControlIo> {
@@ -189,20 +189,33 @@ pub struct Owner<I: ControlIo> {
 #[derive(Clone, Copy)]
 pub(super) struct Executable {
     pub(super) digest: [u8; 32],
-    source: Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>,
+    source: Option<
+        crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareBlob,
+            crate::platform::capabilities::Read,
+        >,
+    >,
     inert_fixture: bool,
 }
 impl Executable {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn source_cap(
         &self,
-    ) -> Option<narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>> {
+    ) -> Option<
+        crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareBlob,
+            crate::platform::capabilities::Read,
+        >,
+    > {
         self.source
     }
     fn new(
         bytes: &[u8],
         source: Option<
-            narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+            crate::platform::capabilities::Cap<
+                crate::platform::firmware::FirmwareBlob,
+                crate::platform::capabilities::Read,
+            >,
         >,
         inert_fixture: bool,
     ) -> Self {
@@ -215,11 +228,14 @@ impl Executable {
         }
     }
     pub(super) fn invoke<T>(&self, operation: impl FnOnce() -> T) -> Result<T, Error> {
-        use narf_capabilities::{Cap, CapError, CapOp, Read};
+        use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
         struct Current<F>(F);
-        impl<T, F: FnOnce() -> T> CapOp<narf_firmware::FirmwareBlob, Read> for Current<F> {
+        impl<T, F: FnOnce() -> T> CapOp<crate::platform::firmware::FirmwareBlob, Read> for Current<F> {
             type Output = T;
-            fn execute(self, _: &Cap<narf_firmware::FirmwareBlob, Read>) -> Result<T, CapError> {
+            fn execute(
+                self,
+                _: &Cap<crate::platform::firmware::FirmwareBlob, Read>,
+            ) -> Result<T, CapError> {
                 Ok((self.0)())
             }
         }
@@ -341,7 +357,7 @@ impl<I: ControlIo> Owner<I> {
         if self.started.load(Ordering::Acquire) {
             return Err(Error::AlreadyStarted);
         }
-        let loader = narf_firmware::trusted_loader_authority()
+        let loader = crate::platform::firmware::trusted_loader_authority()
             .ok_or(Error::Firmware(FirmwareError::AuthorityRevoked))?;
         let authority = loader
             .derive()
@@ -356,7 +372,7 @@ impl<I: ControlIo> Owner<I> {
                     if !self.started.load(Ordering::Acquire)
                         && firmware_missing(
                             error,
-                            narf_firmware::trusted_loader_authority().is_some(),
+                            crate::platform::firmware::trusted_loader_authority().is_some(),
                         ) =>
                 {
                     self.io.delay_us(500_000).await;
@@ -367,9 +383,9 @@ impl<I: ControlIo> Owner<I> {
     }
     pub(super) async fn initialize_registered_from(
         &self,
-        authority: &narf_capabilities::Cap<
-            narf_firmware::FirmwareRegistry,
-            narf_capabilities::Read,
+        authority: &crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareRegistry,
+            crate::platform::capabilities::Read,
         >,
         name: &str,
     ) -> Result<FirmwareInfo, Error> {
@@ -386,7 +402,10 @@ impl<I: ControlIo> Owner<I> {
         let executable = Executable::new(&asset.bytes, Some(asset.cap), false);
         *self.executable.lock() = Some(executable);
         let result = executable
-            .fence(self.run_device_before(&asset.bytes, narf_time::Deadline::after_ms(30_000)))
+            .fence(self.run_device_before(
+                &asset.bytes,
+                crate::platform::time::Deadline::after_ms(30_000),
+            ))
             .await;
         self.finish(result)
     }
@@ -395,7 +414,7 @@ impl<I: ControlIo> Owner<I> {
     /// USB probe uses initialize_registered; this entry point supports tests
     /// and a caller that already owns authenticated firmware bytes.
     pub async fn initialize(&self, blob: &[u8]) -> Result<FirmwareInfo, Error> {
-        self.initialize_before(blob, narf_time::Deadline::after_ms(30_000))
+        self.initialize_before(blob, crate::platform::time::Deadline::after_ms(30_000))
             .await
     }
 
@@ -404,7 +423,7 @@ impl<I: ControlIo> Owner<I> {
     pub(super) async fn initialize_before(
         &self,
         blob: &[u8],
-        deadline: narf_time::Deadline,
+        deadline: crate::platform::time::Deadline,
     ) -> Result<FirmwareInfo, Error> {
         let _attempt = self.begin()?;
         let result = self.run_before(blob, deadline).await;
@@ -417,7 +436,7 @@ impl<I: ControlIo> Owner<I> {
     pub async fn initialize_device(&self, blob: &[u8]) -> Result<FirmwareInfo, Error> {
         let _attempt = self.begin()?;
         let result = self
-            .run_device_before(blob, narf_time::Deadline::after_ms(30_000))
+            .run_device_before(blob, crate::platform::time::Deadline::after_ms(30_000))
             .await;
         self.finish(result)
     }
@@ -486,7 +505,7 @@ impl<I: ControlIo> Owner<I> {
         let (vid, pid) = self.usb_identity().ok_or(Error::RuntimeState)?;
         let calibration = super::power_policy::Calibration::load_registered(factory, vid, pid)
             .map_err(|_| Error::RuntimeState)?;
-        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::RuntimeState)?;
+        let domain = crate::platform::regdb::ensure_domain().map_err(|_| Error::RuntimeState)?;
         let permission = calibration
             .permission(&domain, 1)
             .map_err(|_| Error::RuntimeState)?;
@@ -506,7 +525,7 @@ impl<I: ControlIo> Owner<I> {
         let (vid, pid) = self.usb_identity().ok_or(Error::RuntimeState)?;
         let calibration = super::power_policy::Calibration::load_registered(factory, vid, pid)
             .map_err(|_| Error::RuntimeState)?;
-        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::RuntimeState)?;
+        let domain = crate::platform::regdb::ensure_domain().map_err(|_| Error::RuntimeState)?;
         geometry.ceiling(&domain).map_err(|_| Error::RuntimeState)?;
         let permission = calibration
             .permission(&domain, primary)
@@ -551,7 +570,7 @@ impl<I: ControlIo> Owner<I> {
     async fn run_device_before(
         &self,
         blob: &[u8],
-        deadline: narf_time::Deadline,
+        deadline: crate::platform::time::Deadline,
     ) -> Result<FirmwareInfo, Error> {
         self.run_device_expected(blob, deadline, None).await
     }
@@ -559,7 +578,7 @@ impl<I: ControlIo> Owner<I> {
     async fn run_device_expected(
         &self,
         blob: &[u8],
-        deadline: narf_time::Deadline,
+        deadline: crate::platform::time::Deadline,
         expected: Option<(super::device_init::Factory, super::device_init::Endpoints)>,
     ) -> Result<FirmwareInfo, Error> {
         let (info, payload) = parse_image(self.chip, blob)?;
@@ -574,7 +593,7 @@ impl<I: ControlIo> Owner<I> {
             *self.runtime_image.lock() = Some(Arc::from(blob));
         }
         self.stage(Stage::Validated);
-        narf_time::timeout(deadline, async {
+        crate::platform::time::timeout(deadline, async {
             let mut config = alloc::vec![0; 4096];
             let count = self
                 .io
@@ -711,11 +730,11 @@ impl<I: ControlIo> Owner<I> {
     async fn run_before(
         &self,
         blob: &[u8],
-        deadline: narf_time::Deadline,
+        deadline: crate::platform::time::Deadline,
     ) -> Result<FirmwareInfo, Error> {
         let (info, payload) = parse_image(self.chip, blob)?;
         self.stage(Stage::Validated);
-        narf_time::timeout(deadline, async {
+        crate::platform::time::timeout(deadline, async {
             self.power_on().await?;
             self.stage(Stage::Powered);
             self.download(payload).await?;
