@@ -2058,21 +2058,22 @@ fn e2e_brcmfmac_module_registration() -> TestResult {
     else {
         return TestResult::Fail("brcmfmac module fixture absent from staged initramfs");
     };
-    // The regulatory domain is the kernel's: the import is in the symbol
-    // table (and must resolve for init to run), the signed policy file is
-    // not opened by name.
-    let names = |needle: &[u8]| staged.windows(needle.len()).any(|w| w == needle);
-    if !names(b"narf_wireless_regdomain\0") || names(b"wireless-regulatory.bin") {
-        return TestResult::Fail(
-            "brcmfmac.ko does not take its regulatory domain from narf_wireless_regdomain",
-        );
-    }
     fresh_state(0);
     let abi = crate::symbols::compute_abi_hash();
     crate::symbols::set_kernel_abi(abi);
     let Some(image) = stamp_fixture_abi(staged, abi) else {
         return TestResult::Fail("brcmfmac module has no ABI placeholder");
     };
+    // The regulatory domain is the kernel's: the import is in the symbol
+    // table (and must resolve for init to run), the signed policy file is
+    // not opened by name. Searched in the decompressed image: the staged
+    // fixture is LZ4.
+    let names = |needle: &[u8]| image.windows(needle.len()).any(|w| w == needle);
+    if !names(b"narf_wireless_regdomain\0") || names(b"wireless-regulatory.bin") {
+        return TestResult::Fail(
+            "brcmfmac.ko does not take its regulatory domain from narf_wireless_regdomain",
+        );
+    }
     let before = count();
     let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
         Ok(module) => module,
