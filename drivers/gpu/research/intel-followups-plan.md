@@ -75,13 +75,13 @@ work had.
 - DP 2.0 UHBR beyond the 128b/132b SST route behind `narf.intel.uhbr=1`
   (UHBR10/20 on C20 and LT ports, over display-30 Thunderbolt with DP
   tunnel BW allocation, through non-transparent LTTPRs, with the
-  reduced-parameter retry, HDCP as DP SST and the VBT C20 UHBR override;
-  native fixtures only): 128b/132b MST (MTP slots from 0 with the 128b/132b
-  PBN divider, per-stream `TRANS_DP2_CTL`/VFREQ and the 128b/132b MST
-  transport), DSC over UHBR (`intel_dp_mtp_tu_compute_config` with DSC
-  slices, implicit FEC, the display-14 DPT limit), per-hop 8b/10b LTTPR
-  training (`intel_dp_link_train_all_phys`), the VBT DP 1.4 C20 and C10
-  overrides, and a silicon run.
+  reduced-parameter retry, HDCP, the VBT C20 UHBR override, DSC over
+  128b/132b SST with the Linux 7.4 DSC search, and 128b/132b MST; native
+  fixtures only): DSC over 128b/132b MST, 128b/132b MST through a DP tunnel
+  (per-stream tunnel bandwidth), the reduced-parameter retry for compressed
+  and MST UHBR links, per-hop 8b/10b LTTPR training
+  (`intel_dp_link_train_all_phys`), the VBT DP 1.4 C20 and C10 overrides,
+  and a silicon run.
 - Older display: the Gen9 interrupt owner (`narf.intel.gen9_irq=1`), the
   execlists GT across system sleep (`narf.intel.execlists_suspend=1`),
   `PP_DIVISOR` on pre-CNP south displays (`narf.intel.pp_divisor=1`), Gen9
@@ -102,8 +102,7 @@ work had.
   big core, MEI HDCP 2.2 on Coffee/Comet Lake and Gen11 where the MEI
   driver binds) and the per-connector debugfs files exist; open are HDCP
   2.2 on the Gen9/Gen11 PCHs the MEI driver does not claim (SPT, KBP,
-  CNP-LP, ICP, JSP, MCC), a Gen9/Gen11 MST fixture, HDCP on 128b/132b
-  links, and a silicon run (the NUC12's GOP-lit route is the first
+  CNP-LP, ICP, JSP, MCC), a Gen9/Gen11 MST fixture, and a silicon run (the NUC12's GOP-lit route is the first
   target). The firmware-lit Gen12 route has no hotplug owner, so its HDCP
   2.2 waits still poll RxStatus every 10 ms.
 - VRAM PRIME/P2P beyond `intel_gpu_prime` (dynamic move-notify
