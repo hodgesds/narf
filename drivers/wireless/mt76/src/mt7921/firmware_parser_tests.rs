@@ -1,5 +1,10 @@
 //! Authored CONNAC2 headers/tables and inert payloads, entirely in Rust.
-use super::{firmware_transport::Firmware, fwdl::*};
+use super::{
+    firmware_transport::Firmware,
+    fwdl::*,
+    pci::firmware_blobs_for,
+    regs::{MT7925_FIRMWARE_WM, MT7925_ROM_PATCH, MTK_DEV_MT7925, MTK_DEV_MT7925_ALT},
+};
 use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -129,4 +134,55 @@ fn smoke_mt7921_authored_tables_do_not_substitute_for_missing_payloads() -> Test
 kernel_test_in!(
     "drivers/wireless/mt7921",
     smoke_mt7921_authored_tables_do_not_substitute_for_missing_payloads
+);
+
+/// MT7925 RAM image: same shape as `ram()`, but the trailer `chip_id`
+/// byte carries the MT7925 value. `0x25` is the low byte of `0x7925`,
+/// by the same convention as the `0x22` byte in `ram()` for MT7922 —
+/// a stated convention, NOT verified against a real MT7925 blob (the
+/// real-blob value is a hardware-validation item; see the MT7925
+/// programme record §5). `Firmware::prepare` does not gate on the
+/// trailer `chip_id` byte, so the 7925 value must be accepted exactly
+/// like the 7922 one.
+fn ram_mt7925() -> Vec<u8> {
+    let mut bytes = ram();
+    bytes[88] = 0x25;
+    bytes
+}
+
+fn smoke_mt7925_authored_ram_trailer_accepted_by_prepare() -> TestResult {
+    // Both 7925 DIDs resolve to the MT7925 patch/RAM pair (upstream
+    // `mt792x.h:51,59`: `MT7925_FIRMWARE_WM` / `MT7925_ROM_PATCH`).
+    // That pair is the input `Firmware::open` hands to `prepare`;
+    // the names are re-checked here so this test pins the whole
+    // 7925-blob-pair → CONNAC2-parser route, not just the trailer.
+    for &did in [MTK_DEV_MT7925, MTK_DEV_MT7925_ALT].iter() {
+        let (p, r) = firmware_blobs_for(did);
+        if p != MT7925_ROM_PATCH || r != MT7925_FIRMWARE_WM {
+            return TestResult::Fail("MT7925 firmware blob names drift");
+        }
+    }
+    let bytes = ram_mt7925();
+    let tail = parse_fw_trailer(&bytes).unwrap();
+    if tail.chip_id != 0x25
+        || tail.eco_code != 1
+        || tail.n_region != 2
+        || tail.format_ver != 2
+        || tail.format_flag != 3
+    {
+        return TestResult::Fail("MT7925 trailer fields differ from the authored fixture");
+    }
+    // The chip-agnostic CONNAC2 parsers accept a 7925 trailer: upstream
+    // `mt792x_load_firmware` (`mt792x_core.c:1097`) calls
+    // `mt76_connac2_load_patch` (:1117) and `mt76_connac2_load_ram`
+    // (:1134) for 7925, and there is no `mt76_connac3_patch_hdr` /
+    // `mt76_connac3_fw_trailer` — the CONNAC3 loaders are 7928-gated.
+    if Firmware::prepare(&patch(), &bytes).is_err() {
+        return TestResult::Fail("7925-trailer CONNAC2 input rejected by Firmware::prepare");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7925_authored_ram_trailer_accepted_by_prepare
 );
