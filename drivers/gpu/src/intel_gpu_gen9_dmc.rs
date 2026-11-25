@@ -292,7 +292,7 @@ fn load_for_display_inner<M: MmioWindow + ?Sized>(
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::intel_gpu_dmc::{
         CSS_HEADER_BYTES, CSS_HEADER_VER, CSS_MODULE_TYPE_DMC, CSS_VERSION_OFFSET, DC_STATE_DEBUG,
@@ -362,8 +362,8 @@ mod tests {
     /// EVT_CTL/HTP pair first: on Gen12 that pair would be
     /// rewritten to VBLANK_DELAYED_A by the TGL fixup and then
     /// disabled at load; on Gen9 both must pass through
-    /// verbatim.
-    fn fixture_dmc_blob() -> Vec<u8> {
+    /// verbatim. (Also the program the Gen9 `DC_off` fixtures load.)
+    pub(crate) fn fixture_dmc_blob() -> Vec<u8> {
         let package_size = PACKAGE_HEADER_BYTES + PACKAGE_V1_MAX_ENTRIES * FW_INFO_BYTES;
         let mut blob = alloc::vec![0u8; CSS_HEADER_BYTES + package_size];
         put32(&mut blob, 0, CSS_MODULE_TYPE_DMC);
