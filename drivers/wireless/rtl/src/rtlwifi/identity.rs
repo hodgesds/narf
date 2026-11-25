@@ -202,8 +202,11 @@ pub unsafe fn admissible(
     // (`REG_9346CR` BIT(5): an autoload-failed board has no power-group
     // store for the channel step) and the PROM mode
     // (`rtl92d_read_eeprom_info` `EEPROM_MAC_FUNCTION`) must give this
-    // function a bandset holding the 2.4 GHz station plan (a dual-dual
-    // MAC0 is 5 GHz only; the composed station is 2.4 GHz legacy).
+    // function a bandset holding channel 1, the cold bring-up channel
+    // `pci::assemble` starts every admitted function on. A dual-dual MAC0
+    // (5 GHz bandset only) is refused here; single and dual-single
+    // functions hold both bands and retune to 5 GHz through
+    // `native_channel`.
     admissible
         && (!rtl8192de || {
             use super::rtl8192de::{mode_from_prom, native_channel, version, Interface};

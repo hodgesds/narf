@@ -3,18 +3,15 @@
 //! The builtin rtw88 MAC/PHY/RF/station bring-up is a long sequence of chip
 //! register reads/writes with read-modify-write updates and busy-poll loops.
 //! It is written against an **async** register-I/O abstraction so the *same*
-//! sequences run from two transports:
+//! sequences run over every rtw88 transport (PCI MMIO and USB EP0), in both
+//! the builtin driver and the loadable `.ko`: both builds compile the rtw
+//! crate, whose `firmware_transport::Io` backends reach this core through
+//! the `rtw88::chip_bridge` newtypes: `IoReg`, and `GatedIoReg`, which also
+//! checks the native station gate before each access.
 //!
-//! - the **builtin** driver, over its native async `UsbControl`/MMIO transport
-//!   (its `firmware_transport::Io` is a superset of [`RegIo`], bridged by a
-//!   blanket impl in the rtw crate);
-//! - the **loadable `.ko`**, over the `narf_usb_*` EP0-control C-ABI — a
-//!   `RegIo` whose futures complete synchronously (`narf_usb_wait`), driven by
-//!   a tiny `no_std` executor.
-//!
-//! [`RegIo`] mirrors the async RPITIT shape of the builtin `Io` trait
-//! (`-> impl Future<Output = …> + Send`) so a `blanket impl<T: Io> RegIo for T`
-//! forwards with an error map. Only the six register widths + a delay are
+//! [`RegIo`] mirrors the async RPITIT shape of the rtw `Io` trait
+//! (`-> impl Future<Output = …> + Send`) so the newtypes forward each access
+//! 1:1 with an error map. Only the six register widths + a delay are
 //! required; the read-modify-write and poll helpers are free async functions
 //! (free fns sidestep the provided-async-trait-method `Send` pitfalls).
 //!
@@ -51,10 +48,10 @@ pub enum ChipError {
     Unsupported,
 }
 
-/// Async chip register access. One implementation wraps the builtin native
-/// transport; another the `.ko`'s synchronous `narf_usb_*` EP0 control path
-/// (whose futures are immediately ready). Mirrors the builtin `Io` trait's
-/// RPITIT shape so a blanket impl bridges them.
+/// Async chip register access. The implementations are the rtw crate's
+/// `chip_bridge::IoReg` and `chip_bridge::GatedIoReg`, which wrap a
+/// `firmware_transport::Io` backend (PCI or USB, builtin or `.ko`). Mirrors
+/// that `Io` trait's RPITIT shape so the newtypes forward each access 1:1.
 pub trait RegIo {
     fn read8(&mut self, reg: u16) -> impl Future<Output = Result<u8, ChipError>> + Send;
     fn read16(&mut self, reg: u16) -> impl Future<Output = Result<u16, ChipError>> + Send;

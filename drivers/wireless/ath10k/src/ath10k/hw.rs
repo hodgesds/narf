@@ -47,9 +47,11 @@ pub const QCA9888_DEVICE_ID: u16 = 0x0056;
 pub const QCA9984_DEVICE_ID: u16 = 0x0046;
 /// QCA9377 v1.0 — Wi-Fi 5 1x1, found on cheap laptops.
 pub const QCA9377_DEVICE_ID: u16 = 0x0042;
-/// AR9462 — pre-ath10k legacy chip; not actually ath10k-controlled
-/// in Linux (uses `ath9k` instead), but the task plan lists it as
-/// part of the match scope. Driver returns NotForThisDriver.
+/// AR9462 — AR9300-family chip driven by `ath9k`, in Linux and here
+/// (`ath9k::ar9300_owner` registers it as `ath9k-ar9462`; its board
+/// admission is the `N46A` record in `ath9k/admission.rs`). The built-in
+/// ath10k still matches it and its probe returns `NotForThisDriver`, so
+/// `narf_bus` hands the device on to ath9k; the module does not claim it.
 pub const AR9462_DEVICE_ID: u16 = 0x0034;
 
 /// Hardware revision tag. Same enumeration as Linux's
@@ -167,10 +169,9 @@ impl Registers {
     }
 }
 
-/// Every PCI ID this driver registers against. The legacy AR9462
-/// entry is included only so the parallel ath9k port doesn't end
-/// up with a vendor-only fallback — the probe path explicitly
-/// rejects it (see `pci.rs`).
+/// Every PCI ID the built-in driver registers against. The AR9462
+/// entry belongs to ath9k: the probe path declines it (see `pci.rs`)
+/// and the module's `module_matches` leaves it out.
 pub const ALL_PCI_MATCHES: &[(u16, u16)] = &[
     (ATHEROS_VENDOR, QCA988X_DEVICE_ID),
     (UBNT_VENDOR, QCA988X_UBNT_DEVICE_ID),

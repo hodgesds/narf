@@ -290,9 +290,10 @@ pub const ALL_DEV_IDS: &[u16] = &[
 ];
 
 /// PCI device IDs that run the retained reset/firmware/radio/station
-/// bootstrap: RTL8852BE (`rtw8852be.c`), RTL8852CE (`rtw8852ce.c`) and
-/// RTL8851BE (`rtw8851be.c` `rtw89_8851be_id_table`, radio_51 owner).
-/// Every other ID stays on the legacy diagnostic probe.
+/// bootstrap: RTL8852AE (`rtw8852ae.c`, both ids), RTL8852BE
+/// (`rtw8852be.c`, both ids), RTL8852CE (`rtw8852ce.c`) and RTL8851BE
+/// (`rtw8851be.c` `rtw89_8851be_id_table`, radio_51 owner). Every other ID
+/// stays on the legacy diagnostic probe.
 pub const fn bootstrap_did(did: u16) -> bool {
     matches!(
         did,
@@ -305,8 +306,10 @@ pub const fn bootstrap_did(did: u16) -> bool {
     )
 }
 
-/// Entry point invoked from the wireless crate's `register_initcalls`
-/// (one level up in `drivers/wireless/src/lib.rs`).
+/// Entry point invoked from the wireless facade's `register_initcalls`
+/// (the `rtw89` `Stage::Subsys` initcall in `drivers/wireless/src/lib.rs`).
+/// This crate's built-in `do_register` also calls it, but only through the
+/// `narf_driver!`-generated `register()`, which the facade does not call.
 pub fn register() {
     register_pci_driver();
     // Linux `rtw89_pm_ops` + mac80211 stop/start; retirement is async.

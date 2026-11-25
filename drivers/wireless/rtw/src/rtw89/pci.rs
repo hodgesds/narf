@@ -204,10 +204,12 @@ unsafe fn bring_up_registers(
     }
 
     let chip_id = ChipId::from_pci_did(device.id.device).ok_or(ProbeError::UnknownChip)?;
-    // RTL8922A is admitted here (chip-row step 5): its power-on
-    // prologue, factory read, and transport owner are the BE
-    // variants below. Ring programming itself stays with the future
-    // mac_pre_init owner (`Prepared8922a::program_rings`).
+    // RTL8922A arm (chip-row step 5): its power-on prologue, factory
+    // read, and transport owner are the BE variants below. No registered
+    // id reaches it today: `bring_up`, the only caller, refuses
+    // 0x8922/0x892b before this function runs. Ring programming itself
+    // stays with the future mac_pre_init owner
+    // (`Prepared8922a::program_rings`).
     let is_8922a = chip_id == ChipId::Rtl8922A;
 
     // SAFETY: BAR2 mapped + owned.
@@ -515,11 +517,10 @@ impl Rtw89Device {
 
     /// Drive the 8922A set_channel owner for an admitted station
     /// (`Prepared8922a::set_channel`): the MAC+BB channel program +
-    /// TX-power program for `profile` over BAR2. The station-path
-    /// caller is the follow-up (like `admit_station`, this entry
-    /// exists before any station-path driver calls it); bring-up
-    /// itself programs no channel — it has no admitted station,
-    /// container, or regulatory country.
+    /// TX-power program for `profile` over BAR2. Nothing calls it yet:
+    /// no station path drives it (`admit_station` is likewise reached
+    /// only from tests). Bring-up itself programs no channel — it has
+    /// no admitted station, container, or regulatory country.
     pub(super) fn set_channel_8922a(
         &self,
         macid: u8,
