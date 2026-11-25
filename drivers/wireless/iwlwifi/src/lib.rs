@@ -24,6 +24,10 @@
 //! architectures. These do not establish RF acceptance.
 
 #![no_std]
+// Crate-wide, not per item: without it the built-in build reports ~85
+// dead-code warnings, the `kernel-test` build ~35 and the `module` build
+// ~230. Most are protocol encoders and legacy Gen2 paths kept for tests or
+// for the other build. Each needs its own remove-or-cfg decision.
 #![allow(dead_code)]
 
 extern crate alloc;

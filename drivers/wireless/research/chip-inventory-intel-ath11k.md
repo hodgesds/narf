@@ -36,7 +36,7 @@ Intel profile codes used in every chip row:
 * **G3**: native deferred PCI startup is reachable, but `Device::validate_station_profile` admits only exact payload versions MAC3/LINK8/STA2/PHY6/queue3/antenna5. Its composed model is the **Sc c103** profile. That profile has actual station auth/association, Open/WPA2-PSK/SAE+PMF, keys/rekey/controlled port, management/data, BA/reorder and QoS, reconnect/reset recovery. PHY is legacy/HT20/40/VHT80, up to two NVM-selected chains/NSS; published bands are 2.4/5 GHz. STA only; HE/EHT, 6 GHz, 160/320 MHz, MLO, AP/P2P/monitor, multiple receive queues/RSS and runtime/system PM are missing. Reuse by another family requires its actual firmware command/payload/receipt and power contracts, not just a matching enum. A known generic Gen3 command-header-versus-payload-version audit remains open; Gen2's header0 contract was corrected in the preceding committed wave.
 * **G3?**: routes to the G3 startup implementation but the actual family's firmware/ABI has not been established by the Sc model; it may correctly reject before station startup. Do not count as working station support.
 
-NARF's `Generation::Gen2/Gen3` labels name its transport split; Linux's `iwl_mac_cfg.gen2` also includes AX210/Bz/Sc and is not the same taxonomy. The old `IwlDevice` facade has `control_plane_ready() == false`; its static HE/EHT/band flags are not reachable station capability evidence. Intel also has a one-radio `OWNED` singleton, so simultaneous Intel cards are another missing software capability.
+NARF's `Generation::Gen2/Gen3` labels name its transport split; Linux's `iwl_mac_cfg.gen2` also includes AX210/Bz/Sc and is not the same taxonomy. Intel also has a one-radio `OWNED` singleton, so simultaneous Intel cards are another missing software capability.
 
 ath11k profile codes:
 
@@ -122,7 +122,7 @@ remain outstanding; no calendar date follows from code volume.
 
 Paths below are repository-relative for NARF (short `iwlwifi/…` and `ath11k/…` paths are under `drivers/wireless/iwlwifi/src/` and `drivers/wireless/ath11k/src/`) and absolute for local Linux. Function names are the stable anchors.
 
-* **N1** `drivers/wireless/iwlwifi/src/iwlwifi/mod.rs::chip_config_for_pci_id`, `PCI_DIDS`, `probe`, `IwlDevice::control_plane_ready`; `rx_rfh.rs::CompletionFormat::for_mac`: every PCI match, singleton/park/startup routing and generation-specific descriptors.
+* **N1** `drivers/wireless/iwlwifi/src/iwlwifi/mod.rs::chip_config_for_pci_id`, `PCI_DIDS`, `probe`; `rx_rfh.rs::CompletionFormat::for_mac`: every PCI match, singleton/park/startup routing and generation-specific descriptors.
 * **N2** `iwlwifi/gen2_profile.rs::select`, `API`; `mvm_boot.rs::Owner::{new,initialize}`; `mvm_power.rs::Owner::prepare_transmit_power`; `mvm_link.rs::Owner::{activate_link,deactivate_link}`: exact API77 identity and retained authority/lifetime chain.
 * **N3** `iwlwifi/mvm_auth.rs::Owner::authenticate_open`, `qualified_management_transmit`; WIP `mvm_assoc.rs::Owner::{associate_legacy,association_response,clear_association}`; `mvm_{auth,assoc}_tests.rs`: actual management frame/TX receipt/RX response/control receipts, not encoder-only support.
 * **N4** `iwlwifi/bootstrap.rs::Owner::{candidates,provision_using,start}`; `device.rs::Device::{validate_station_profile,initialize,get_wireless_info,associate_in_domain,recover}`; `runtime.rs::Hardware::{command,command_with_header_version}`: deferred admission, exact payload gates and remaining Gen3 header contract.
