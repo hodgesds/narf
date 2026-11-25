@@ -68,6 +68,8 @@ struct Dp20Sink<'a> {
     next_status: usize,
     intra_hop_reads: u32,
     nack_reads: Vec<u32>,
+    /// Native writes of (address, first byte) the sink NACKs.
+    nack_writes: Vec<(u32, u8)>,
 }
 
 impl<'a> Dp20Sink<'a> {
@@ -79,6 +81,7 @@ impl<'a> Dp20Sink<'a> {
             next_status: 0,
             intra_hop_reads: 0,
             nack_reads: Vec::new(),
+            nack_writes: Vec::new(),
         }
     }
     fn set(&mut self, addr: u32, bytes: &[u8]) {
@@ -107,6 +110,12 @@ impl AuxChannel for Dp20Sink<'_> {
                 self.log
                     .borrow_mut()
                     .push(Ev::Write(req.address, req.data.to_vec()));
+                if self.nack_writes.contains(&(req.address, req.data[0])) {
+                    return Ok(AuxResponse {
+                        status: AuxStatus::Nack,
+                        data: &reply[..0],
+                    });
+                }
                 let data = req.data.to_vec();
                 self.set(req.address, &data);
                 if req.address == DP_PAYLOAD_TABLE_UPDATE_STATUS {
@@ -705,4 +714,150 @@ fn smoke_uhbr_link_choice_and_mn() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_dp_uhbr",
     smoke_uhbr_link_choice_and_mn
+);
+
+/// `intel_dp_init_lttpr_and_dprx_caps` and `drm_dp_lttpr_wake_timeout_setup`
+/// against scripted LTTPRs (`drm_dp_helper.c`, `intel_dp_link_training.c`):
+///
+/// - two repeaters (`DP_PHY_REPEATER_CNT` 0x40): the 0xf0000 probe, the
+///   receiver caps, the common caps, `DP_PHY_REPEATER_MODE` 0x55 then 0xaa,
+///   each repeater's three PHY cap bytes (0xf0020, 0xf0070), the receiver
+///   caps again; non-transparent, so the wake timeout reads
+///   `DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT` and grants 0x80;
+/// - a NACKed 0xaa rolls back to 0x55: transparent, no repeater, and the
+///   wake timeout takes the DPRX's 40 ms request (grant at 0x119); a 1 ms
+///   or unmapped request grants nothing;
+/// - a malformed count writes 0x55 only; no repeater writes nothing (and,
+///   with zeroed caps not reading 0x55, takes the non-transparent wake
+///   path as Linux does);
+/// - below DPCD 1.4 the common caps are read a byte at a time; caps below
+///   revision 1.4 are zeroed.
+fn smoke_uhbr_lttpr_non_transparent_init_and_wake_timeout() -> TestResult {
+    let caps = |count: u8| [0x20u8, 0x1e, count, 0x55, 4, 0x05, 1, 0x03];
+    fn sink_with(log: &RefCell<Vec<Ev>>, rev: u8, c: [u8; 8]) -> Dp20Sink<'_> {
+        let mut sink = Dp20Sink::new(log, vec![[0; 6]]);
+        sink.set(0x000, &[rev]);
+        sink.set(DP_LTTPR_COMMON_CAPS, &c);
+        sink
+    }
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x14, caps(0x40));
+    let init = init_lttpr_and_dprx_caps(&mut sink);
+    let mode = |v: u8| Ev::Write(DP_PHY_REPEATER_MODE, vec![v]);
+    let want = vec![
+        Ev::Read(DP_LTTPR_COMMON_CAPS, 1),
+        Ev::Read(0x000, 16),
+        Ev::Read(DP_LTTPR_COMMON_CAPS, 8),
+        mode(DP_PHY_REPEATER_MODE_TRANSPARENT),
+        mode(DP_PHY_REPEATER_MODE_NON_TRANSPARENT),
+        Ev::Read(0xf_0020, 3),
+        Ev::Read(0xf_0070, 3),
+        Ev::Read(0x000, 16),
+    ];
+    if *log.borrow() != want || init.count != 2 || init.transparent() {
+        return TestResult::Fail("two LTTPRs must go non-transparent with their PHY caps read");
+    }
+    log.borrow_mut().clear();
+    wake_timeout_setup(&mut sink, init.transparent());
+    if *log.borrow()
+        != vec![
+            Ev::Read(DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT, 1),
+            Ev::Write(
+                DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT,
+                vec![DP_EXTENDED_WAKE_TIMEOUT_GRANT],
+            ),
+        ]
+    {
+        return TestResult::Fail("a non-transparent repeater's wait request must be granted");
+    }
+    if lttpr_max_link_rate(&caps(0x40)) != 810_000 || lttpr_max_lanes(&caps(0x40)) != 4 {
+        return TestResult::Fail("drm_dp_lttpr_max_link_rate / _lane_count differ");
+    }
+    // Non-transparent NACKed: back to transparent.
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x14, caps(0x80));
+    sink.nack_writes
+        .push((DP_PHY_REPEATER_MODE, DP_PHY_REPEATER_MODE_NON_TRANSPARENT));
+    let init = init_lttpr_and_dprx_caps(&mut sink);
+    let writes: Vec<Ev> = log
+        .borrow()
+        .iter()
+        .filter(|e| matches!(e, Ev::Write(..)))
+        .cloned()
+        .collect();
+    if writes
+        != vec![
+            mode(DP_PHY_REPEATER_MODE_TRANSPARENT),
+            mode(DP_PHY_REPEATER_MODE_NON_TRANSPARENT),
+            mode(DP_PHY_REPEATER_MODE_TRANSPARENT),
+        ]
+        || init.count != 0
+        || !init.transparent()
+        || log.borrow().iter().any(|e| *e == Ev::Read(0xf_0020, 3))
+    {
+        return TestResult::Fail("a refused non-transparent mode must roll back to transparent");
+    }
+    for (request, grant) in [(0x02u8, true), (0x00, false), (0x07, false)] {
+        log.borrow_mut().clear();
+        sink.set(DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST, &[request]);
+        wake_timeout_setup(&mut sink, true);
+        let granted = log.borrow().contains(&Ev::Write(
+            DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_GRANT,
+            vec![DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED],
+        ));
+        if granted != grant
+            || log.borrow()[0] != Ev::Read(DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST, 1)
+        {
+            return TestResult::Fail("the transparent wake timeout follows timeout_mapping");
+        }
+    }
+    // A malformed count: the transparent write only.
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x14, caps(0x03));
+    let init = init_lttpr_and_dprx_caps(&mut sink);
+    if init.count != 0
+        || !init.transparent()
+        || log
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, Ev::Write(..)))
+            .cloned()
+            .collect::<Vec<_>>()
+            != vec![mode(DP_PHY_REPEATER_MODE_TRANSPARENT)]
+    {
+        return TestResult::Fail("a malformed count must only write transparent mode");
+    }
+    // No repeater: nothing written; zeroed caps take the non-transparent
+    // wake path.
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x14, [0x14, 0, 0, 0, 0, 0, 0, 0]);
+    let init = init_lttpr_and_dprx_caps(&mut sink);
+    if init.count != 0 || log.borrow().iter().any(|e| matches!(e, Ev::Write(..))) {
+        return TestResult::Fail("no repeater must write no mode");
+    }
+    log.borrow_mut().clear();
+    wake_timeout_setup(&mut sink, init.transparent());
+    if *log.borrow() != vec![Ev::Read(DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT, 1)] {
+        return TestResult::Fail("no repeater reads the repeater wait timeout, grants nothing");
+    }
+    // DPCD 1.2: one byte per read; caps revision 1.3: zeroed.
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x12, caps(0x80));
+    if read_lttpr_caps(&mut sink, 0x12) != caps(0x80)
+        || *log.borrow()
+            != (0..8)
+                .map(|i| Ev::Read(DP_LTTPR_COMMON_CAPS + i, 1))
+                .collect::<Vec<_>>()
+    {
+        return TestResult::Fail("below DPCD 1.4 the LTTPR caps are read a byte at a time");
+    }
+    let mut old = sink_with(&log, 0x14, [0x13, 0x1e, 0x80, 0x55, 4, 0, 0, 0]);
+    if read_lttpr_caps(&mut old, 0x14) != [0; 8] {
+        return TestResult::Fail("LTTPR caps below revision 1.4 are zeroed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_lttpr_non_transparent_init_and_wake_timeout
 );

@@ -33,12 +33,23 @@
 //!   ([`wide_link_capped`]); the port clock is the fabric's UHBR select
 //!   (`crate::intel_gpu_xelpg::enable_tbt_clock_khz`).
 //!
+//! - **LTTPRs** ([`init_lttpr_and_dprx_caps`], [`wake_timeout_setup`]): the
+//!   LTTPR common capabilities cap the link (`drm_dp_lttpr_max_link_rate`,
+//!   `drm_dp_lttpr_max_lane_count`) and mask the UHBR rates; the 128b/132b
+//!   route switches the repeaters to non-transparent mode
+//!   (`intel_dp_init_lttpr_and_dprx_caps`, `drm_dp_lttpr_init`), grants their
+//!   extended wake timeout and trains with the repeater count (the CDS
+//!   budget). 128b/132b training has no per-hop phase: Linux trains the
+//!   whole path from the DPRX's status. The 8b/10b route keeps the repeaters
+//!   transparent (the per-hop `intel_dp_link_train_all_phys` is not
+//!   implemented), so a 128b/132b route hands them back to transparent mode
+//!   when it stops.
+//!
 //! Not implemented, refused typed ([`UhbrRefusal`]) instead of running a
 //! link Linux would not: 128b/132b MST, DSC on a link whose common rates
 //! include UHBR, Thunderbolt-alt UHBR on display 14/20 (no TBT UHBR clock
-//! select), an LTTPR in the path (Linux trains through it in
-//! non-transparent mode), and the reduced-parameter retry after a failed
-//! 128b/132b training.
+//! select), and the reduced-parameter retry after a failed 128b/132b
+//! training.
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_modeset::Mode;
@@ -116,10 +127,33 @@ const DP_128B132B_TRAINING_AUX_RD_INTERVAL_MASK: u8 = 0x7f;
 /// `DP_LT_TUNABLE_PHY_REPEATER_FIELD_DATA_STRUCTURE_REV`: the eight-byte
 /// LTTPR common capabilities (`DP_LTTPR_COMMON_CAP_SIZE`).
 pub const DP_LTTPR_COMMON_CAPS: u32 = 0xf0000;
+const DP_MAX_LINK_RATE_PHY_REPEATER: usize = 1;
 const DP_PHY_REPEATER_CNT: usize = 2;
+/// `DP_PHY_REPEATER_MODE` (0xf0003) within the common capabilities.
+const DP_PHY_REPEATER_MODE_INDEX: usize = 3;
+const DP_MAX_LANE_COUNT_PHY_REPEATER: usize = 4;
 const DP_MAIN_LINK_CHANNEL_CODING_PHY_REPEATER: usize = 6;
 const DP_PHY_REPEATER_128B132B_SUPPORTED: u8 = 1 << 0;
 const DP_PHY_REPEATER_128B132B_RATES: usize = 7;
+/// `DP_PHY_REPEATER_MODE` and its two values.
+pub const DP_PHY_REPEATER_MODE: u32 = 0xf_0003;
+pub const DP_PHY_REPEATER_MODE_TRANSPARENT: u8 = 0x55;
+pub const DP_PHY_REPEATER_MODE_NON_TRANSPARENT: u8 = 0xaa;
+/// `DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT` and its request mask / grant.
+pub const DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT: u32 = 0xf_0005;
+const DP_EXTENDED_WAKE_TIMEOUT_REQUEST_MASK: u8 = 0x7f;
+pub const DP_EXTENDED_WAKE_TIMEOUT_GRANT: u8 = 1 << 7;
+/// `DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST` / `_GRANT` and
+/// `DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED`.
+pub const DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST: u32 = 0x2211;
+pub const DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_GRANT: u32 = 0x119;
+pub const DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED: u8 = 1 << 0;
+/// `DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1`, the first of the three
+/// `DP_LTTPR_PHY_CAP_SIZE` bytes, and the LTTPR register stride
+/// (`__DP_LTTPR2_BASE - __DP_LTTPR1_BASE`).
+pub const DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1: u32 = 0xf_0020;
+pub const DP_LTTPR_STRIDE: u32 = 0x50;
+const DP_LTTPR_PHY_CAP_SIZE: usize = 3;
 
 /// `DP_LINK_STATUS_SIZE`.
 pub const LINK_STATUS_SIZE: usize = 6;
@@ -211,8 +245,11 @@ pub struct UhbrSink {
     /// LTTPR that supports 128b/132b masks them with its own
     /// `DP_PHY_REPEATER_128B132B_RATES`, one that does not clears them.
     pub rates: u8,
-    /// `DP_PHY_REPEATER_CNT` reported an LTTPR (any non-zero count byte).
+    /// `drm_dp_lttpr_count` found one to eight repeaters (a malformed count
+    /// is none: Linux's LTTPR init resets it before the sink rates).
     pub lttpr: bool,
+    /// The LTTPR common capabilities ([`read_lttpr_caps`]).
+    pub lttpr_caps: [u8; 8],
     /// `drm_dp_post_lt_adj_req_supported`.
     pub post_lt_adj_req: bool,
 }
@@ -271,12 +308,11 @@ pub fn read_sink_rates<A: AuxChannel + ?Sized>(
             rates[0]
         }
     };
-    let mut lttpr = [0u8; 8];
-    if aux.dpcd_read(DP_LTTPR_COMMON_CAPS, &mut lttpr).is_err() {
-        lttpr = [0; 8];
-    }
+    let lttpr = read_lttpr_caps(aux, raw[0]);
     let mut rates = rates & (DP_UHBR10 | DP_UHBR13_5 | DP_UHBR20);
-    let present = lttpr_count(&lttpr) != Some(0);
+    // intel_dp_init_lttpr_phys resets a malformed count before the sink
+    // rates are set: no repeater then.
+    let present = lttpr_count(&lttpr).is_some_and(|n| n > 0);
     if present {
         if lttpr[0] >= 0x20
             && lttpr[DP_MAIN_LINK_CHANNEL_CODING_PHY_REPEATER] & DP_PHY_REPEATER_128B132B_SUPPORTED
@@ -290,8 +326,171 @@ pub fn read_sink_rates<A: AuxChannel + ?Sized>(
     Ok(UhbrSink {
         rates,
         lttpr: present,
+        lttpr_caps: lttpr,
         post_lt_adj_req,
     })
+}
+
+// ── LTTPRs ───────────────────────────────────────────────────────
+
+/// `drm_dp_read_lttpr_common_caps` and `intel_dp_read_lttpr_common_caps`:
+/// the eight bytes at 0xf0000, one byte per AUX read below DPCD 1.4
+/// (`drm_dp_read_lttpr_regs`: "the DELL P2715Q ... returns corrupted
+/// values"); a failed read or a revision below 1.4 is Linux's zeroed caps.
+pub fn read_lttpr_caps<A: AuxChannel + ?Sized>(aux: &mut A, dpcd_rev: u8) -> [u8; 8] {
+    let mut caps = [0u8; 8];
+    let ok = if dpcd_rev < 0x14 {
+        (0..caps.len()).all(|i| {
+            aux.dpcd_read(DP_LTTPR_COMMON_CAPS + i as u32, &mut caps[i..i + 1])
+                .is_ok()
+        })
+    } else {
+        aux.dpcd_read(DP_LTTPR_COMMON_CAPS, &mut caps).is_ok()
+    };
+    if !ok || caps[0] < 0x14 {
+        return [0; 8];
+    }
+    caps
+}
+
+/// `drm_dp_lttpr_max_link_rate` (`drm_dp_bw_code_to_link_rate` of
+/// `DP_MAX_LINK_RATE_PHY_REPEATER`; 0 for zeroed caps).
+pub const fn lttpr_max_link_rate(caps: &[u8; 8]) -> u32 {
+    caps[DP_MAX_LINK_RATE_PHY_REPEATER] as u32 * 27_000
+}
+
+/// `drm_dp_lttpr_max_lane_count`.
+pub const fn lttpr_max_lanes(caps: &[u8; 8]) -> u8 {
+    caps[DP_MAX_LANE_COUNT_PHY_REPEATER] & 0x1f
+}
+
+/// The LTTPR state of `intel_dp_init_lttpr_and_dprx_caps`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LttprInit {
+    /// The repeaters in non-transparent mode (0: none, or transparent).
+    pub count: u8,
+    /// `intel_dp->lttpr_common_caps` afterwards: its `DP_PHY_REPEATER_MODE`
+    /// byte holds the mode Linux set (`intel_dp_set_lttpr_transparent_mode`).
+    pub caps: [u8; 8],
+}
+
+impl LttprInit {
+    /// `intel_dp_lttpr_transparent_mode_enabled`.
+    pub fn transparent(&self) -> bool {
+        self.caps[DP_PHY_REPEATER_MODE_INDEX] == DP_PHY_REPEATER_MODE_TRANSPARENT
+    }
+}
+
+/// `intel_dp_init_lttpr_and_dprx_caps` on a link that is not active
+/// (non-eDP, display 10+): `intel_dp_read_dprx_caps` (the
+/// `drm_dp_dpcd_probe` of 0xf0000 and the receiver capabilities), then
+/// `intel_dp_init_lttpr`: the common caps, `drm_dp_lttpr_count` and
+/// `drm_dp_lttpr_init` — `DP_PHY_REPEATER_MODE` transparent, then
+/// non-transparent (DP 2.0 3.6.6.1), back to transparent when that fails;
+/// a malformed count stops after the transparent write — and each
+/// repeater's `drm_dp_read_lttpr_phy_caps`; then the receiver capabilities
+/// again ("The DPTX shall read the DPRX caps after LTTPR detection"). A
+/// failed DPRX read is Linux's `-EIO`, which `intel_dp_start_link_train`
+/// takes as no repeater.
+pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprInit {
+    let mut probe = [0u8];
+    let mut dpcd = [0u8; 16];
+    if aux.dpcd_read(DP_LTTPR_COMMON_CAPS, &mut probe).is_err()
+        || aux.dpcd_read(0x000, &mut dpcd).is_err()
+    {
+        return LttprInit::default();
+    }
+    let mut caps = read_lttpr_caps(aux, dpcd[0]);
+    let mut count = 0;
+    let found = lttpr_count(&caps);
+    if found != Some(0) {
+        // intel_dp_init_lttpr_phys with LTTPRs (or a malformed count).
+        let transparent = aux
+            .dpcd_write(DP_PHY_REPEATER_MODE, &[DP_PHY_REPEATER_MODE_TRANSPARENT])
+            .is_ok();
+        let non_transparent = match found {
+            Some(_) if transparent => {
+                if aux
+                    .dpcd_write(DP_PHY_REPEATER_MODE, &[DP_PHY_REPEATER_MODE_NON_TRANSPARENT])
+                    .is_ok()
+                {
+                    true
+                } else {
+                    let _ = aux
+                        .dpcd_write(DP_PHY_REPEATER_MODE, &[DP_PHY_REPEATER_MODE_TRANSPARENT]);
+                    false
+                }
+            }
+            _ => false,
+        };
+        if non_transparent {
+            caps[DP_PHY_REPEATER_MODE_INDEX] = DP_PHY_REPEATER_MODE_NON_TRANSPARENT;
+            count = found.unwrap_or(0);
+            for i in 0..u32::from(count) {
+                let base = DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1 + i * DP_LTTPR_STRIDE;
+                let mut phy = [0u8; DP_LTTPR_PHY_CAP_SIZE];
+                if dpcd[0] < 0x14 {
+                    for (j, b) in phy.iter_mut().enumerate() {
+                        if aux
+                            .dpcd_read(base + j as u32, core::slice::from_mut(b))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                } else {
+                    let _ = aux.dpcd_read(base, &mut phy);
+                }
+            }
+        } else {
+            // intel_dp_set_lttpr_transparent_mode(true) and
+            // intel_dp_reset_lttpr_count.
+            caps[DP_PHY_REPEATER_MODE_INDEX] = DP_PHY_REPEATER_MODE_TRANSPARENT;
+            caps[DP_PHY_REPEATER_CNT] = 0;
+        }
+    }
+    if aux.dpcd_read(0x000, &mut dpcd).is_err() {
+        return LttprInit::default();
+    }
+    LttprInit { count, caps }
+}
+
+/// `drm_dp_lttpr_wake_timeout_setup`: in transparent mode the DPRX's
+/// `DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST` (1, 20, 40, 60, 80 or 100 ms;
+/// anything else is 1) is granted when above 1 ms; in non-transparent mode
+/// any `DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT` request (units of 10 ms) is
+/// granted. A failed read grants nothing.
+pub fn wake_timeout_setup<A: AuxChannel + ?Sized>(aux: &mut A, transparent: bool) {
+    let mut value = [0u8];
+    if transparent {
+        const MAPPING: [u8; 6] = [1, 20, 40, 60, 80, 100];
+        if aux
+            .dpcd_read(DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST, &mut value)
+            .is_err()
+        {
+            return;
+        }
+        let ms = MAPPING.get(usize::from(value[0])).copied().unwrap_or(1);
+        if ms > 1 {
+            let _ = aux.dpcd_write(
+                DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_GRANT,
+                &[DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED],
+            );
+        }
+    } else {
+        if aux
+            .dpcd_read(DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT, &mut value)
+            .is_err()
+        {
+            return;
+        }
+        if value[0] & DP_EXTENDED_WAKE_TIMEOUT_REQUEST_MASK != 0 {
+            let _ = aux.dpcd_write(
+                DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT,
+                &[DP_EXTENDED_WAKE_TIMEOUT_GRANT],
+            );
+        }
+    }
 }
 
 // ── Bandwidth ────────────────────────────────────────────────────
@@ -942,9 +1141,6 @@ pub enum UhbrRefusal {
     /// The DP tunnel's bandwidth request for the 128b/132b stream failed
     /// (`drm_dp_tunnel_alloc_bw`; nothing past the tunnel was programmed).
     Tunnel(super::tunnel::TunnelError),
-    /// The stream needs UHBR through an LTTPR (non-transparent mode is not
-    /// owned).
-    Lttpr,
     /// No 64-slot MTP carries the stream (Linux then needs DSC).
     Slots,
     /// The 128b/132b training failed; Linux's reduced-parameter retry is not

@@ -211,7 +211,10 @@ impl Sink {
             }
             0xf_0000..=0xf_0007 => {
                 self.uhbr_reads.push(addr);
-                0
+                self.extra
+                    .iter()
+                    .find(|(a, _)| *a == addr)
+                    .map_or(0, |(_, v)| *v)
             }
             uhbr::DP_PAYLOAD_TABLE_UPDATE_STATUS => self.payload_status,
             0x202 => {
@@ -276,7 +279,7 @@ impl Sink {
                 self.pattern = value & 0x7;
                 self.polls = 0;
             }
-            0x100 | 0x107 | 0x108 | 0x121 | 0x1c0..=0x1c2 => {
+            0x100 | 0x107 | 0x108 | 0x119 | 0x121 | 0x1c0..=0x1c2 | 0xf_0003 | 0xf_0005 => {
                 self.uhbr_log.push((addr, value));
                 match addr {
                     0x100 => {
@@ -4490,6 +4493,105 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_tc_route_lights_and_stops
 );
 
+/// The 128b/132b route through one 128b/132b LTTPR (`DP_PHY_REPEATER_CNT`
+/// 0x80, revision 2.0, UHBR10/20, a 20 ms extended wait request):
+/// `mtl_ddi_pre_enable_dp` switches it non-transparent (0x55, 0xaa) and
+/// grants its wait (`DP_EXTENDED_WAKE_TIMEOUT_GRANT`), then
+/// `intel_dp_start_link_train` re-initializes it (0x55, 0xaa) before the
+/// 128b/132b channel coding; the stop hands it back transparent after the
+/// sink's 8b/10b coding.
+fn smoke_mtl_external_uhbr_lttpr_non_transparent_route() -> TestResult {
+    let io = uhbr_tc();
+    for (i, b) in [0x20u8, 0x1e, 0x80, 0x55, 4, 0x02, 1, 0x03]
+        .into_iter()
+        .enumerate()
+    {
+        io.sink
+            .borrow_mut()
+            .extra
+            .push((uhbr::DP_LTTPR_COMMON_CAPS + i as u32, b));
+    }
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the DP 2.0 sink must probe through its LTTPR");
+    };
+    if probe.uhbr.map(|p| (p.link.rate, p.link.lanes)) != Some((uhbr::UhbrRate::Uhbr10, 2)) {
+        return TestResult::Fail("the LTTPR keeps Linux's UHBR10 x2 link");
+    }
+    if !io.sink.borrow().uhbr_log.is_empty() {
+        return TestResult::Fail("the probe must not change the LTTPR mode");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) => route,
+        Err(_) => return TestResult::Fail("the route must light through the LTTPR"),
+    };
+    let mode = uhbr::DP_PHY_REPEATER_MODE;
+    let (t, n) = (
+        uhbr::DP_PHY_REPEATER_MODE_TRANSPARENT,
+        uhbr::DP_PHY_REPEATER_MODE_NON_TRANSPARENT,
+    );
+    {
+        let sink = io.sink.borrow();
+        let lttpr: Vec<(u32, u8)> = sink
+            .uhbr_log
+            .iter()
+            .copied()
+            .filter(|&(a, _)| a == mode || a == uhbr::DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT)
+            .collect();
+        let last_mode = sink.uhbr_log.iter().rposition(|&(a, _)| a == mode);
+        let coding = sink.uhbr_log.iter().position(|&e| {
+            e == (
+                uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET,
+                uhbr::DP_SET_ANSI_128B132B,
+            )
+        });
+        if lttpr
+            != [
+                (mode, t),
+                (mode, n),
+                (
+                    uhbr::DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT,
+                    uhbr::DP_EXTENDED_WAKE_TIMEOUT_GRANT,
+                ),
+                (mode, t),
+                (mode, n),
+            ]
+            || !matches!((last_mode, coding), (Some(m), Some(c)) if m < c)
+        {
+            return TestResult::Fail("the LTTPR must go non-transparent, then the 128b/132b coding");
+        }
+    }
+    if route.uhbr.map(|u| u.lttpr_count) != Some(1) {
+        return TestResult::Fail("the route must record its non-transparent LTTPR");
+    }
+    io.sink.borrow_mut().uhbr_log.clear();
+    if route.stop(&io).is_err() {
+        return TestResult::Fail("the route must stop");
+    }
+    {
+        let sink = io.sink.borrow();
+        let back = sink.uhbr_log.iter().position(|&e| {
+            e == (
+                uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET,
+                uhbr::DP_SET_ANSI_8B10B,
+            )
+        });
+        let transparent = sink.uhbr_log.iter().position(|&e| e == (mode, t));
+        if !matches!((back, transparent), (Some(b), Some(m)) if b < m) {
+            return TestResult::Fail("stop: 8b/10b coding, then the LTTPR transparent");
+        }
+    }
+    if route.release(&io).is_err() {
+        return TestResult::Fail("the route must release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_lttpr_non_transparent_route
+);
+
 /// `BDB_VSWING_PREEMPH` with `tables` tables of sixteen rows and `columns`
 /// columns: table `t`, row `r` is (0x1_0000 + 20 + r + t, t, r), then 0xee
 /// in any further column (the high bits are lost to the `snps` bytes).
@@ -4656,8 +4758,8 @@ impl crate::dp_aux::AuxChannel for Dpcd {
 
 /// The typed refusals of `plan_uhbr` (nothing programmed): a stream only
 /// DSC could carry with UHBR in the common rates (Linux's DSC search would
-/// consider them), UHBR over Thunderbolt alt mode, UHBR through an LTTPR;
-/// and what keeps the 8b/10b negotiation: no common UHBR rate, a C10 PHY or
+/// consider them), UHBR over display-14 Thunderbolt alt mode; an LTTPR that
+/// masks the rates to UHBR10; and what keeps the 8b/10b negotiation: no common UHBR rate, a C10 PHY or
 /// Wildcat Lake as the source, a DSC-less sink nothing fits.
 fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
     let mut raw = [0u8; 16];
@@ -4730,10 +4832,10 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
     {
         lttpr.0.push((uhbr::DP_LTTPR_COMMON_CAPS + i as u32, b));
     }
-    if plan_uhbr(&mut lttpr, &dp_alt, false, &limits, &uhd60, 24, false)
-        != refusal(uhbr::UhbrRefusal::Lttpr)
-    {
-        return TestResult::Fail("UHBR through an LTTPR must refuse typed");
+    // Through a 128b/132b LTTPR (UHBR10 only): UHBR10 x2.
+    match plan_uhbr(&mut lttpr, &dp_alt, false, &limits, &uhd60, 24, false) {
+        Ok(Some(plan)) if plan.link.rate == uhbr::UhbrRate::Uhbr10 && plan.link.lanes == 2 => {}
+        _ => return TestResult::Fail("an LTTPR masks the rates and keeps UHBR10 x2"),
     }
     // What leaves the 8b/10b route alone.
     let wcl = link(DisplayIp::WildcatLake, TcMode::DpAlt);

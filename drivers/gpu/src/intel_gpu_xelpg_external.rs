@@ -141,8 +141,10 @@
 //! allocation ([`tunnel`]): the tunnel supplies the DPRX's 128b/132b rates
 //! and caps the link, the stream's bandwidth is requested before the port
 //! and freed after it, and the port clock is the fabric's UHBR select.
-//! 128b/132b MST, DSC on a UHBR link, Thunderbolt UHBR on display 14/20,
-//! LTTPRs and a failed training's reduced retry are refused typed
+//! LTTPRs in the path are switched to non-transparent mode for the
+//! 128b/132b training and handed back transparent at the stop.
+//! 128b/132b MST, DSC on a UHBR link, Thunderbolt UHBR on display 14/20
+//! and a failed training's reduced retry are refused typed
 //! ([`ExternalError::Uhbr`]). HDCP takes a 128b/132b SST route as DP SST
 //! ([`hdcp_route_of`]). Without the option no 128b/132b register is
 //! touched.
@@ -1345,7 +1347,7 @@ fn plan_uhbr_link<A: crate::dp_aux::AuxChannel + ?Sized>(
     // With BW allocation, max_dprx_rate / max_dprx_lane_count are the
     // tunnel's and intel_dp_max_link_data_rate caps at its available BW;
     // intel_dp_tunnel_uhbr_lanes_wa_apply drops the narrow UHBR configs.
-    let (limits, cap, lane_mask) = match tunnel {
+    let (mut limits, cap, lane_mask) = match tunnel {
         Some(t) => (
             dsc::LinkLimits::standard(
                 t.max_dprx_rate.min(810_000),
@@ -1356,13 +1358,20 @@ fn plan_uhbr_link<A: crate::dp_aux::AuxChannel + ?Sized>(
         ),
         None => (*limits, None, 0),
     };
+    // intel_dp_set_dpcd_sink_rates / intel_dp_get_max_common_lane_count:
+    // the LTTPR common caps bound the 8b/10b rates and every lane count.
+    let lttpr_rate = uhbr::lttpr_max_link_rate(&sink.lttpr_caps);
+    let lttpr_lanes = uhbr::lttpr_max_lanes(&sink.lttpr_caps);
+    if lttpr_rate != 0 || lttpr_lanes != 0 {
+        limits = limits.capped(
+            if lttpr_rate != 0 { lttpr_rate } else { u32::MAX },
+            if lttpr_lanes != 0 { lttpr_lanes } else { 4 },
+        );
+    }
     match uhbr::wide_link_capped(&limits, common, mode, max_bpp, cap, lane_mask) {
         uhbr::WideLink::Uhbr(chosen) => {
             if link.tbt() && !link.display_ip.is_display30() {
                 return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt));
-            }
-            if sink.lttpr {
-                return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Lttpr));
             }
             let stream =
                 uhbr::mtp_tu(&chosen, mode).ok_or(ExternalError::Uhbr(uhbr::UhbrRefusal::Slots))?;
@@ -1701,6 +1710,8 @@ pub struct UhbrTrained {
     pub sink_payload: bool,
     /// `TRANS_DDI_DP_VC_PAYLOAD_ALLOC` is set.
     pub vc_payload: bool,
+    /// The LTTPRs this route switched to non-transparent mode.
+    pub lttpr_count: u8,
 }
 
 /// Why [`activate`] did not produce a live route.
@@ -2270,6 +2281,13 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
         }
         uhbr::Clock::sleep_us(&mut clock, 1_000);
     }
+    // The LTTPR mode Linux set at detect (intel_dp_init_lttpr_and_dprx_caps;
+    // this route defers it to here), then drm_dp_lttpr_wake_timeout_setup.
+    let lttpr = uhbr::init_lttpr_and_dprx_caps(&mut aux);
+    uhbr::wake_timeout_setup(&mut aux, lttpr.transparent());
+    if let Some(state) = route.uhbr.as_mut() {
+        state.lttpr_count = lttpr.count;
+    }
     // mtl_ddi_prepare_link_retrain.
     write(
         io,
@@ -2285,8 +2303,14 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
         ddi_enable_value(probe.display_ip, lanes) | DDI_BUF_PORT_DATA_40BIT,
     )?;
     wait_port_buf_active(io, port).map_err(phy_err)?;
-    // 6.k intel_dp_prepare_link_train (sink half) and the 128b/132b
-    // training; no LTTPR is in the path (refused at probe).
+    // 6.k intel_dp_start_link_train: the LTTPRs re-initialized ("to ensure
+    // that they are switched to non-transparent mode"),
+    // intel_dp_prepare_link_train (sink half) and the 128b/132b training
+    // with the repeater count.
+    let lttpr = uhbr::init_lttpr_and_dprx_caps(&mut aux);
+    if let Some(state) = route.uhbr.as_mut() {
+        state.lttpr_count = state.lttpr_count.max(lttpr.count);
+    }
     uhbr::prepare(&mut aux, rate, lanes, plan.post_lt_adj_req).map_err(link)?;
     let mut source = UhbrPort {
         io,
@@ -2295,7 +2319,7 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
         lanes,
         presets: [0; 4],
     };
-    let presets = match uhbr::train(&mut aux, &mut source, &mut clock, lanes, 0) {
+    let presets = match uhbr::train(&mut aux, &mut source, &mut clock, lanes, lttpr.count) {
         Ok(presets) => presets,
         Err(uhbr::TrainError::Link(failure)) => {
             return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Training(failure)))
@@ -2307,10 +2331,12 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
     let _ = uhbr::stop_train(&mut aux, &mut source, &mut clock)?;
     // 7.a 128b/132b SST: VCPID 1, start slot 0, tu slots.
     let sink_payload = uhbr::write_payload(&mut aux, &mut clock, 1, 0, plan.stream.tu);
+    let lttpr_count = route.uhbr.map_or(0, |state| state.lttpr_count);
     route.uhbr = Some(UhbrTrained {
         presets,
         sink_payload,
         vc_payload: false,
+        lttpr_count,
     });
     if !sink_payload {
         return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Payload));
@@ -2843,6 +2869,15 @@ fn disable_port<M: MmioWindow + ?Sized>(
             uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET,
             &[uhbr::DP_SET_ANSI_8B10B],
         );
+        // The 8b/10b route trains end to end: the repeaters this route made
+        // non-transparent go back to transparent mode (Linux keeps them
+        // non-transparent and trains 8b/10b per hop).
+        if route.uhbr.is_some_and(|state| state.lttpr_count != 0) {
+            let _ = aux.dpcd_write(
+                uhbr::DP_PHY_REPEATER_MODE,
+                &[uhbr::DP_PHY_REPEATER_MODE_TRANSPARENT],
+            );
+        }
     }
     // Sink to D3 before the port goes down (a NACK never replaces the
     // local idle proof).
