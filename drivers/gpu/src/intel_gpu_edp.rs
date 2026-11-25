@@ -1474,7 +1474,16 @@ pub fn panel_power_off(gpu: &crate::intel_gpu::IntelGpu) -> Result<(), PpsError>
         EDP_RUNTIME.lock().active = None;
     }
     let delays = delays.unwrap_or(PanelDelays::SPEC_DEFAULTS);
-    let mut pps = PanelPowerSequencer::with_delays(&window, delays);
+    // Gen9 LP has no PCH: its sequencer is the display engine's instance.
+    let lp = gpu.chip.generation == crate::intel_gpu::Generation::Broxton;
+    let pps_window = crate::intel_gpu_bxt_display::PpsWindow::new(&window, lp);
+    let mut pps = PanelPowerSequencer::with_delays(&pps_window, delays);
+    // bxt_power_sequencer_idx: a DC9 excursion lost the sequencer's
+    // registers (bxt_pps_reset_all); reprogram them from the delays kept at
+    // probe (pps_init_registers) before this first use.
+    if lp && crate::intel_gpu_gen9_dc_states::take_pps_reset_for_bar(&gpu.gtt_mmadr) {
+        pps.init_registers();
+    }
     // The runtime sequencer starts with backlight_on = false;
     // the gate may nevertheless be open from probe time, so
     // close it explicitly (with its T9 wait) before power drops.

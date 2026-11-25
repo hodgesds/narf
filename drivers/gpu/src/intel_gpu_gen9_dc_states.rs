@@ -62,8 +62,9 @@
 //! [`Gen9Dc::new_lp`] is the GLK/BXT arm of the same sources:
 //! `gen9_dc_mask` is UPTO_DC5 | DC9 (no DC6), `get_allowed_dc_mask` takes
 //! DC9 plus `max_dc = 1`'s UPTO_DC5, and the sanitized target falls from
-//! DC6 to DC5. DC9 stays out of the target here as well: it is the
-//! system-suspend state (`bxt_enable_dc9`), not a runtime one.
+//! DC6 to DC5. DC9 stays out of the runtime target here as well: it is the
+//! system-suspend state (`bxt_enable_dc9`), entered by the service's
+//! suspend preparation below.
 //!
 //! ## The `DC_off` service (`narf.intel.gen9_dc=1`)
 //!
@@ -119,10 +120,24 @@
 //! legacy guards (through the display-14 `DcRef`). The execlists GT owner
 //! holds a `GtIrq` reference while it is unparked (`__gt_unpark`'s
 //! `POWER_DOMAIN_GT_IRQ`, a latency workaround) and drops it at park, after
-//! which re-entry waits Linux's 100 ms async put. System suspend takes one
-//! first and keeps it unless the resident DMC program still verifies at
-//! resume. Panel brightness (the backlight crate's PWM writes) takes none,
-//! as in Linux.
+//! which re-entry waits Linux's 100 ms async put. Panel brightness (the
+//! backlight crate's PWM writes) takes none, as in Linux.
+//!
+//! System suspend (`intel_display_power_suspend_late`) takes the Suspend
+//! reference first. On Gen9 LP, with every transcoder off, power well 2
+//! not requested and no other holder in its conversation, it then runs the
+//! rest of `bxt_display_core_uninit` (DBUF off, CDCLK to the bypass with
+//! the DE PLL off, the PW_1 request dropped) and `bxt_enable_dc9`
+//! (`bxt_pps_reset_all`, then DC9); no reference is granted until the
+//! resume. Otherwise DC states stay disabled and the suspend proceeds.
+//! Resume (`intel_display_power_resume_early`) re-adopts the field, runs
+//! `bxt_disable_dc9` (or the display-core init's `DC_STATE_DISABLE`), the
+//! power half of `skl_display_core_init` / `bxt_display_core_init` (PW_1
+//! with its fuses, MISC IO on display 9 proper, the DBUF slice) and
+//! `intel_dmc_load_program` from the resident copy, and releases the
+//! Suspend reference only once the reloaded program verifies. The next eDP
+//! sequencer user after DC9 reprograms its registers first
+//! (`bxt_power_sequencer_idx`).
 //!
 //! Stricter than Linux, and why: every last release defers re-entry by 17
 //! ms, or 100 ms after GT_IRQ as in Linux (Linux releases GMBUS and INIT
@@ -131,10 +146,16 @@
 //! path) and any requester's PW_2 bit refuses, not only the driver's; the
 //! hotplug poll and the panel power-off, which Linux runs without
 //! `DC_off`, take a reference; a live external route refuses re-entry even
-//! with power well 2 off; a lost program is never re-entered and not
-//! reloaded; DC5/DC6 are disarmed for every system sleep target (Linux
-//! leaves display 9 in DC6 across s2idle) and DC9 is never entered; a DC
-//! exit refused at unpark leaves the GT running without `GT_IRQ`.
+//! with power well 2 off; a program lost at runtime is never re-entered
+//! (only the resume reloads it); DC5/DC6 are disarmed for every system
+//! sleep target (Linux leaves display 9 in DC6 across s2idle); DC9 is
+//! refused unless the display is dark (Linux only warns) and fences every
+//! holder; the resume's display-core init leaves CDCLK to the next modeset
+//! (`intel_cdclk_init_hw` is not run) and the PCH reset handshake as found;
+//! a DC exit refused at unpark leaves the GT running without `GT_IRQ`.
+//! Not checked, unlike Linux: `assert_can_enable_dc9`'s "interrupts
+//! disabled" (the async preparation runs with device interrupts live; the
+//! fence keeps every display holder out instead).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -315,7 +336,8 @@ pub const HSW_PWR_WELL_CTL4: u64 = 0x4540C;
 pub const SKL_PW_CTL_IDX_PW_2: u32 = 15;
 /// `HSW_PWR_WELL_CTL_REQ(SKL_PW_CTL_IDX_PW_2) |
 /// HSW_PWR_WELL_CTL_STATE(SKL_PW_CTL_IDX_PW_2)`: `0x2 << 30 | 0x1 << 30`.
-pub const PW_2_REQ_STATE: u32 = (0x2 << (SKL_PW_CTL_IDX_PW_2 * 2)) | (0x1 << (SKL_PW_CTL_IDX_PW_2 * 2));
+pub const PW_2_REQ_STATE: u32 =
+    (0x2 << (SKL_PW_CTL_IDX_PW_2 * 2)) | (0x1 << (SKL_PW_CTL_IDX_PW_2 * 2));
 /// `GEN8_CHICKEN_DCPR_1`.
 pub const GEN8_CHICKEN_DCPR_1: u64 = 0x46430;
 /// `SKL_SELECT_ALTERNATE_DC_EXIT` (Wa Display #1183).
@@ -351,8 +373,8 @@ pub enum Gen9DcUser {
     /// One panel power-sequencer conversation (stricter than Linux, whose
     /// PPS takes `POWER_DOMAIN_DISPLAY_CORE`, outside `DC_off`).
     Pps = 7,
-    /// System suspend preparation through the resume that re-verifies the
-    /// DMC program.
+    /// System suspend preparation through the resume that reloads the DMC
+    /// program.
     Suspend = 8,
     /// The GT while it is unparked (`__gt_unpark`'s `POWER_DOMAIN_GT_IRQ`,
     /// a `dc_off` domain on every Gen9 part): DMC DC-state transitions during
@@ -422,6 +444,69 @@ pub enum Gen9ArmBlock {
     Write(DcError),
 }
 
+/// `TRANSCONF` of transcoders A, B, C and EDP (`HSW_PIPE_OFFSETS` on Gen9
+/// LP: 0x70008, 0x71008, 0x72008, 0x7f008) and `TRANSCONF_ENABLE`.
+pub const TRANSCONF_REGS: [u64; 4] = [0x70008, 0x71008, 0x72008, 0x7f008];
+/// `TRANSCONF_ENABLE`.
+pub const TRANSCONF_ENABLE: u32 = 1 << 31;
+/// `SKL_PW_CTL_IDX_PW_1`.
+pub const SKL_PW_CTL_IDX_PW_1: u32 = 14;
+/// `SKL_PW_CTL_IDX_MISC_IO`.
+pub const SKL_PW_CTL_IDX_MISC_IO: u32 = 0;
+/// `SKL_FUSE_STATUS` and `SKL_FUSE_PG_DIST_STATUS(pg)` (bit `27 - pg`).
+pub const SKL_FUSE_STATUS: u64 = 0x42000;
+/// `DBUF_CTL_S(0)`, `DBUF_POWER_REQUEST` and `DBUF_POWER_STATE`.
+pub const DBUF_CTL_S1: u64 = 0x45008;
+/// `DBUF_POWER_REQUEST`.
+pub const DBUF_POWER_REQUEST: u32 = 1 << 31;
+/// `DBUF_POWER_STATE`.
+pub const DBUF_POWER_STATE: u32 = 1 << 30;
+
+/// `HSW_PWR_WELL_CTL_REQ(idx)`.
+pub const fn pw_req(idx: u32) -> u32 {
+    0x2 << (idx * 2)
+}
+/// `HSW_PWR_WELL_CTL_STATE(idx)`.
+pub const fn pw_state(idx: u32) -> u32 {
+    0x1 << (idx * 2)
+}
+/// `SKL_FUSE_PG_DIST_STATUS(pg)`.
+pub const fn fuse_pg_dist_status(pg: u32) -> u32 {
+    1 << (27 - pg)
+}
+
+/// Why Gen9 LP did not enter DC9 for a system suspend. Every refusal but
+/// [`Dc9Block::Uninit`] precedes any write; DC states then stay disabled
+/// (DC0) through the suspend, which proceeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dc9Block {
+    /// Not Broxton / Gemini Lake: DC9 is not in display 9's allowed mask.
+    NotLp,
+    /// No Suspend reference is held (preparation did not run).
+    NotSuspending,
+    /// A holder other than Init and Suspend is in its hardware conversation.
+    Busy,
+    /// A `DC_STATE_EN` write failed earlier (latched).
+    Faulted,
+    /// `DC_STATE_EN` already has DC9 (`assert_can_enable_dc9`).
+    AlreadyProgrammed,
+    /// `DC_STATE_EN` still has DC5 (`assert_can_enable_dc9`).
+    Dc5Programmed,
+    /// The driver requests power well 2 (`assert_can_enable_dc9`).
+    PowerWell2(u32),
+    /// A transcoder is still enabled (Linux's "mode set disable sequence was
+    /// followed" TODO, as a refusal): `reg` is its `TRANSCONF`.
+    DisplayActive { reg: u64, value: u32 },
+    /// A gate register read all-ones.
+    Unavailable,
+    /// `bxt_display_core_uninit`'s DBUF, CDCLK or PW_1 step did not
+    /// complete; the display core may be partly uninitialized (the resume's
+    /// display-core init restores it).
+    Uninit,
+    /// The DC9 write failed (and is latched).
+    Write(DcError),
+}
+
 /// The probe-time DMC container the service re-verifies before every
 /// re-entry, with its per-program payload ceiling.
 #[derive(Clone, Copy)]
@@ -447,10 +532,19 @@ pub struct Gen9DcCore {
     /// Broxton / Gemini Lake: GMBUS is a `DC_off` domain and Wa Display
     /// #1183 does not apply.
     lp: bool,
+    /// Gemini Lake (its CDCLK table).
+    glk: bool,
     refs: [u32; GEN9_DC_USER_COUNT],
     arm_at: Option<u64>,
     /// The GT_IRQ reference's 100 ms async put: no re-entry before it.
     gt_irq_until: Option<u64>,
+    /// No new reference is granted: DC9 is being entered or is entered.
+    fenced: bool,
+    /// DC9 entered by [`Self::enter_dc9`]; cleared by the resume's exit.
+    dc9: bool,
+    /// `bxt_pps_reset_all`: the eDP power sequencer lost its registers in
+    /// DC9 and is reprogrammed at its next use ([`Self::take_pps_reset`]).
+    pps_reset: bool,
     /// The probe-time DMC container.
     program: Option<Resident>,
     /// The main program stopped verifying: never re-entered again.
@@ -469,9 +563,13 @@ impl Gen9DcCore {
         Self {
             dc: if lp { Gen9Dc::new_lp() } else { Gen9Dc::new() },
             lp,
+            glk: platform == Gen9Platform::GeminiLake,
             refs: [0; GEN9_DC_USER_COUNT],
             arm_at: None,
             gt_irq_until: None,
+            fenced: false,
+            dc9: false,
+            pps_reset: false,
             program: None,
             lost: false,
             booted: false,
@@ -520,6 +618,24 @@ impl Gen9DcCore {
     pub fn program_lost(&self) -> bool {
         self.lost
     }
+    /// Whether DC9 is entered.
+    pub fn dc9(&self) -> bool {
+        self.dc9
+    }
+    /// Whether this is the Gemini Lake core.
+    pub fn glk(&self) -> bool {
+        self.glk
+    }
+    /// The probe-time DMC container and its payload ceiling, if handed over.
+    pub fn resident(&self) -> Option<(&'static [u8], usize)> {
+        self.program.map(|r| (r.blob, r.max))
+    }
+    /// `bxt_power_sequencer_idx`'s `bxt_pps_reset` test-and-clear: whether
+    /// the eDP sequencer must be reprogrammed (`pps_init_registers`) before
+    /// its next use, because DC9 lost its registers.
+    pub fn take_pps_reset(&mut self) -> bool {
+        core::mem::take(&mut self.pps_reset)
+    }
 
     /// Whether `user`'s hardware is in this platform's `DC_off` domains
     /// (every user but GMBUS on display 9).
@@ -556,6 +672,11 @@ impl Gen9DcCore {
     ) -> Result<bool, DcError> {
         if !self.needs_dc_off(user) {
             return Ok(false);
+        }
+        // DC9 (or its entry) fences the display: nothing is granted until
+        // the resume exits it.
+        if self.fenced {
+            return Err(DcError::Unavailable);
         }
         let next = self.refs[user as usize]
             .checked_add(1)
@@ -742,29 +863,288 @@ impl Gen9DcCore {
         self.get(regs, Gen9DcUser::Suspend).map(|_| ())
     }
 
-    /// Resume (`intel_display_power_resume_early` → `gen9_sanitize_dc_state`):
-    /// re-adopt the hardware field, keep DC states off, and release the
-    /// Suspend reference only if the resident main program still verifies.
-    /// A lost program (system power was removed) keeps the reference: DC
-    /// states stay disabled. Returns the re-entry deadline.
+    /// Gen9 LP system suspend, after [`Self::suspend_begin`]: whether DC9
+    /// may be entered (`assert_can_enable_dc9`, as refusals), read-only.
+    /// Admission also needs the display dark, every transcoder off (the
+    /// mode-set disable sequence Linux's assert leaves as a TODO), and no
+    /// holder but Init and Suspend. On `Ok` the core is fenced: no new
+    /// reference is granted until the resume, so the display-core uninit
+    /// and the DC9 write run alone. [`Self::dc9_abort`] lifts the fence.
+    pub fn dc9_admit<M: MmioWindow + ?Sized>(&mut self, regs: &M) -> Result<(), Dc9Block> {
+        if !self.lp {
+            return Err(Dc9Block::NotLp);
+        }
+        if self.refs(Gen9DcUser::Suspend) == 0 {
+            return Err(Dc9Block::NotSuspending);
+        }
+        if self.total() != self.refs(Gen9DcUser::Suspend) + self.refs(Gen9DcUser::Init) {
+            return Err(Dc9Block::Busy);
+        }
+        if self.dc.fault().is_some() {
+            return Err(Dc9Block::Faulted);
+        }
+        self.dc9_gates(regs)?;
+        for reg in TRANSCONF_REGS {
+            let value = regs.read32(reg);
+            if value == u32::MAX {
+                return Err(Dc9Block::Unavailable);
+            }
+            if value & TRANSCONF_ENABLE != 0 {
+                return Err(Dc9Block::DisplayActive { reg, value });
+            }
+        }
+        self.fenced = true;
+        Ok(())
+    }
+
+    /// `assert_can_enable_dc9`'s register checks.
+    fn dc9_gates<M: MmioWindow + ?Sized>(&self, regs: &M) -> Result<(), Dc9Block> {
+        let state = regs.read32(DC_STATE_EN);
+        let wells = regs.read32(HSW_PWR_WELL_CTL2);
+        if state == u32::MAX || wells == u32::MAX {
+            return Err(Dc9Block::Unavailable);
+        }
+        if state & crate::intel_gpu_dc_states::DC_STATE_EN_DC9 != 0 {
+            return Err(Dc9Block::AlreadyProgrammed);
+        }
+        if state & DC_STATE_EN_UPTO_DC5 != 0 {
+            return Err(Dc9Block::Dc5Programmed);
+        }
+        if wells & pw_req(SKL_PW_CTL_IDX_PW_2) != 0 {
+            return Err(Dc9Block::PowerWell2(wells));
+        }
+        Ok(())
+    }
+
+    /// `bxt_enable_dc9`, after [`Self::dc9_admit`] and the display-core
+    /// uninit ([`display_core_uninit_lp`]): the gates again, then
+    /// `bxt_pps_reset_all` (the eDP sequencer is reprogrammed at its next
+    /// use) and `gen9_set_dc_state(DC_STATE_EN_DC9)`. The fence stays up.
+    pub fn enter_dc9<M: MmioWindow + ?Sized>(&mut self, regs: &M) -> Result<(), Dc9Block> {
+        if !self.fenced {
+            return Err(Dc9Block::NotSuspending);
+        }
+        self.dc9_gates(regs)?;
+        self.pps_reset = true;
+        self.dc
+            .set_dc_state(regs, crate::intel_gpu_dc_states::DC_STATE_EN_DC9)
+            .map_err(Dc9Block::Write)?;
+        self.dc9 = true;
+        Ok(())
+    }
+
+    /// A DC9 attempt that stopped before the DC9 write: lift the fence.
+    /// Every reference stays as it was (Suspend held, DC0).
+    pub fn dc9_abort(&mut self) {
+        if !self.dc9 {
+            self.fenced = false;
+        }
+    }
+
+    /// First half of the resume (`intel_display_power_resume_early`):
+    /// `gen9_sanitize_dc_state`, then `bxt_disable_dc9` or the display-core
+    /// init's `DC_STATE_DISABLE` whenever a DC state reads enabled, and the
+    /// fence lifted. `Ok(true)` when a Suspend reference waits for the
+    /// display-core init and program reload ([`Self::resume_finish`]). A
+    /// failed exit keeps the fence and the Suspend reference.
+    pub fn resume_begin<M: MmioWindow + ?Sized>(&mut self, regs: &M) -> Result<bool, DcError> {
+        if self.refs(Gen9DcUser::Suspend) == 0 {
+            return Ok(false);
+        }
+        self.dc.sanitize(regs)?;
+        if self.dc9 || self.dc.tracked() != 0 {
+            self.dc.disable(regs)?;
+        }
+        self.dc9 = false;
+        self.fenced = false;
+        Ok(true)
+    }
+
+    /// Last half of the resume: with the program reloaded and verified
+    /// (`loaded`, `intel_dmc_load_program` from the display-core init),
+    /// release the Suspend reference and return the re-entry deadline;
+    /// otherwise the program is lost and DC states stay disabled.
+    pub fn resume_finish(&mut self, loaded: bool, now: u64) -> Option<u64> {
+        if self.refs(Gen9DcUser::Suspend) == 0 {
+            return None;
+        }
+        if !loaded {
+            self.lost = true;
+            return None;
+        }
+        self.lost = false;
+        self.put(Gen9DcUser::Suspend, now)
+    }
+
+    /// The whole resume on one window: [`Self::resume_begin`], the
+    /// display-core init ([`display_core_init`]), the program reload
+    /// ([`reload_program`]) and [`Self::resume_finish`]. Production runs the
+    /// middle two outside the service lock.
     pub fn resume<M: MmioWindow + ?Sized>(
         &mut self,
         regs: &M,
         now: u64,
     ) -> Result<Option<u64>, DcError> {
-        if self.refs(Gen9DcUser::Suspend) == 0 {
+        if !self.resume_begin(regs)? {
             return Ok(None);
         }
-        self.dc.sanitize(regs)?;
-        if self.dc.tracked() != 0 {
-            self.dc.disable(regs)?;
-        }
-        if !self.program_verifies(regs) {
-            self.lost = true;
-            return Ok(None);
-        }
-        Ok(self.put(Gen9DcUser::Suspend, now))
+        let loaded = display_core_init(regs, self.lp).is_ok()
+            && self
+                .resident()
+                .is_some_and(|(blob, max)| reload_program(regs, blob, max));
+        Ok(self.resume_finish(loaded, now))
     }
+}
+
+/// Why the display-core init or uninit around a system suspend stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreInitError {
+    /// A register read all-ones.
+    Unavailable,
+    /// A power well's state did not follow its request: its index.
+    Well(u32),
+    /// A fuse distribution status did not set: its power gate.
+    Fuse(u32),
+    /// The DBUF slice did not follow its request.
+    Dbuf,
+    /// CDCLK could not be moved to the bypass.
+    Cdclk,
+}
+
+fn wait_bits<M: MmioWindow + ?Sized>(regs: &M, reg: u64, mask: u32, want: u32, us: u64) -> bool {
+    let mut lost = false;
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            let value = regs.read32(reg);
+            lost = value == u32::MAX;
+            lost || value & mask == want
+        },
+        narf_time::Deadline::after_us(us),
+    );
+    done && !lost
+}
+
+/// `gen9_dbuf_slice_set`: request (or drop) slice S1, post, wait 10 us and
+/// check the state.
+fn dbuf_set<M: MmioWindow + ?Sized>(regs: &M, enable: bool) -> Result<(), CoreInitError> {
+    let value = regs.read32(DBUF_CTL_S1);
+    if value == u32::MAX {
+        return Err(CoreInitError::Unavailable);
+    }
+    let request = if enable { DBUF_POWER_REQUEST } else { 0 };
+    regs.write32(DBUF_CTL_S1, (value & !DBUF_POWER_REQUEST) | request);
+    let _ = regs.read32(DBUF_CTL_S1);
+    let want = if enable { DBUF_POWER_STATE } else { 0 };
+    if wait_bits(regs, DBUF_CTL_S1, DBUF_POWER_STATE, want, 10) {
+        Ok(())
+    } else {
+        Err(CoreInitError::Dbuf)
+    }
+}
+
+/// `hsw_power_well_enable` for PW_1 (with its fuses: PG0 before, PG1 after)
+/// or MISC IO (no fuses): request, then 1 ms for the state.
+fn well_enable<M: MmioWindow + ?Sized>(regs: &M, idx: u32) -> Result<(), CoreInitError> {
+    let fuses = idx == SKL_PW_CTL_IDX_PW_1;
+    if fuses
+        && !wait_bits(
+            regs,
+            SKL_FUSE_STATUS,
+            fuse_pg_dist_status(0),
+            fuse_pg_dist_status(0),
+            1_000,
+        )
+    {
+        return Err(CoreInitError::Fuse(0));
+    }
+    let value = regs.read32(HSW_PWR_WELL_CTL2);
+    if value == u32::MAX {
+        return Err(CoreInitError::Unavailable);
+    }
+    regs.write32(HSW_PWR_WELL_CTL2, value | pw_req(idx));
+    if !wait_bits(regs, HSW_PWR_WELL_CTL2, pw_state(idx), pw_state(idx), 1_000) {
+        return Err(CoreInitError::Well(idx));
+    }
+    if fuses
+        && !wait_bits(
+            regs,
+            SKL_FUSE_STATUS,
+            fuse_pg_dist_status(1),
+            fuse_pg_dist_status(1),
+            1_000,
+        )
+    {
+        return Err(CoreInitError::Fuse(1));
+    }
+    Ok(())
+}
+
+/// The rest of `bxt_display_core_uninit` before `bxt_enable_dc9`, with DC
+/// states already disabled and the display dark ([`Gen9DcCore::dc9_admit`]):
+/// `gen9_dbuf_disable`, `intel_cdclk_uninit_hw` (CDCLK to the 19.2 MHz
+/// bypass with the DE PLL off, `bxt_set_cdclk` with `INVALID_PIPE`) and the
+/// driver's PW_1 request dropped (`hsw_power_well_disable`: the state is
+/// waited for only when no other requester holds the well; the DMC may keep
+/// it), then the 10 us BSpec delay.
+pub fn display_core_uninit_lp<M: MmioWindow + ?Sized>(
+    regs: &M,
+    glk: bool,
+) -> Result<(), CoreInitError> {
+    dbuf_set(regs, false)?;
+    let current =
+        crate::intel_gpu_bxt_cdclk::Current::read(regs).map_err(|_| CoreInitError::Cdclk)?;
+    crate::intel_gpu_bxt_cdclk::program(regs, glk, current, crate::intel_gpu_bxt_cdclk::REF_KHZ)
+        .map_err(|_| CoreInitError::Cdclk)?;
+    let value = regs.read32(HSW_PWR_WELL_CTL2);
+    if value == u32::MAX {
+        return Err(CoreInitError::Unavailable);
+    }
+    regs.write32(HSW_PWR_WELL_CTL2, value & !pw_req(SKL_PW_CTL_IDX_PW_1));
+    let mut others = 0;
+    for reg in [HSW_PWR_WELL_CTL1, HSW_PWR_WELL_CTL3, HSW_PWR_WELL_CTL4] {
+        others |= regs.read32(reg) & pw_req(SKL_PW_CTL_IDX_PW_1);
+    }
+    if others == 0 {
+        // Bspec does not require the wait; Linux waits 1 ms and only logs.
+        let _ = wait_bits(
+            regs,
+            HSW_PWR_WELL_CTL2,
+            pw_state(SKL_PW_CTL_IDX_PW_1),
+            0,
+            1_000,
+        );
+    }
+    let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(10));
+    Ok(())
+}
+
+/// The power half of `skl_display_core_init` / `bxt_display_core_init`
+/// for a resume, after the DC exit and before the program reload: PW_1
+/// (and MISC IO on display 9 proper) requested, then the DBUF slice
+/// (`gen9_dbuf_enable`). CDCLK stays at whatever it reads: the next modeset
+/// programs its floor (`intel_cdclk_init_hw` is not run here), and the PCH
+/// reset handshake is left as found.
+pub fn display_core_init<M: MmioWindow + ?Sized>(regs: &M, lp: bool) -> Result<(), CoreInitError> {
+    well_enable(regs, SKL_PW_CTL_IDX_PW_1)?;
+    if !lp {
+        well_enable(regs, SKL_PW_CTL_IDX_MISC_IO)?;
+    }
+    dbuf_set(regs, true)
+}
+
+/// `intel_dmc_load_program` from the display-core init on resume: stream
+/// the resident container's programs and verify them (`assert_dmc_loaded`,
+/// as a refusal). `false` when the container no longer parses or the
+/// program does not read back.
+pub fn reload_program<M: MmioWindow + ?Sized>(regs: &M, blob: &[u8], max: usize) -> bool {
+    let Ok(firmware) = parse_dmc_firmware_gen9_max(blob, b'*', b'*', max) else {
+        return false;
+    };
+    if !firmware.has_main() {
+        return false;
+    }
+    crate::intel_gpu_dmc::load_program(regs, &firmware);
+    crate::intel_gpu_dmc::verify_loaded(regs, &firmware).is_ok()
 }
 
 /// A `DC_off` holder's view of the Gen9 service: the production service
@@ -1166,10 +1546,7 @@ impl Drop for Gen9DcRef {
 }
 
 fn release(service: &Arc<Gen9Service>, user: Gen9DcUser) {
-    let due = service
-        .core
-        .lock()
-        .put(user, narf_time::monotonic_ns());
+    let due = service.core.lock().put(user, narf_time::monotonic_ns());
     if due.is_some() {
         schedule_arm(service);
     }
@@ -1365,25 +1742,83 @@ fn suspend_begin() -> Result<(), DcError> {
     let Some(service) = service() else {
         return Ok(());
     };
-    let mut core = service.core.lock();
-    core.suspend_begin(&service.window)
+    service.core.lock().suspend_begin(&service.window)?;
+    // Gen9 LP: bxt_display_core_uninit, then bxt_enable_dc9
+    // (intel_display_power_suspend_late). A refusal leaves DC0 and the
+    // suspend proceeds.
+    let admitted = {
+        let mut core = service.core.lock();
+        if !core.lp() {
+            return Ok(());
+        }
+        core.dc9_admit(&service.window).map(|()| core.glk())
+    };
+    let outcome = match admitted {
+        Ok(glk) => match display_core_uninit_lp(&service.window, glk) {
+            Ok(()) => service.core.lock().enter_dc9(&service.window),
+            Err(_) => Err(Dc9Block::Uninit),
+        },
+        Err(block) => Err(block),
+    };
+    if outcome.is_err() {
+        service.core.lock().dc9_abort();
+    }
+    log(match outcome {
+        Ok(()) => "Gen9 LP display in DC9 for system suspend",
+        Err(Dc9Block::DisplayActive { .. }) => {
+            "Gen9 LP DC9 refused: a transcoder is still enabled; DC states held off"
+        }
+        Err(Dc9Block::Uninit) => {
+            "Gen9 LP DC9 refused: display-core uninit did not complete; DC states held off"
+        }
+        Err(_) => "Gen9 LP DC9 refused; DC states held off",
+    });
+    Ok(())
 }
 
 fn resume_after_suspend() {
     let Some(service) = service() else {
         return;
     };
-    let (result, lost) = {
+    // bxt_disable_dc9 / the display-core init's DC_STATE_DISABLE.
+    let (pending, lp, resident) = {
         let mut core = service.core.lock();
-        let result = core.resume(&service.window, narf_time::monotonic_ns());
-        (result, core.program_lost())
+        let pending = core.resume_begin(&service.window);
+        (pending, core.lp(), core.resident())
     };
-    match result {
-        Ok(Some(_)) => schedule_arm(&service),
-        Ok(None) if lost => log("Gen9 DC states held off after resume: the DMC program was lost"),
-        Ok(None) => {}
-        Err(_) => log("Gen9 DC states held off after resume: DC_STATE_EN unavailable"),
+    match pending {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            log("Gen9 DC states held off after resume: DC_STATE_EN unavailable");
+            return;
+        }
     }
+    // The display-core init's power wells and DBUF, then
+    // intel_dmc_load_program, outside the service lock.
+    let core_up = display_core_init(&service.window, lp);
+    let loaded = core_up.is_ok()
+        && resident.is_some_and(|(blob, max)| reload_program(&service.window, blob, max));
+    let due = service
+        .core
+        .lock()
+        .resume_finish(loaded, narf_time::monotonic_ns());
+    match (due, core_up) {
+        (Some(_), _) => schedule_arm(&service),
+        (None, Err(_)) => log("Gen9 DC states held off after resume: display-core init failed"),
+        (None, Ok(())) if resident.is_none() => {}
+        (None, Ok(())) => {
+            log("Gen9 DC states held off after resume: the DMC program did not reload")
+        }
+    }
+}
+
+/// `bxt_power_sequencer_idx`'s reset check for this BAR's display: whether
+/// a DC9 excursion lost the eDP sequencer's registers, so its next user
+/// reprograms them (`pps_init_registers`) first. Clears the flag; `false`
+/// without a Gen9 service.
+pub(crate) fn take_pps_reset_for_bar(bar: &narf_bus::MmioRegion) -> bool {
+    service_for(bar).is_some_and(|service| service.core.lock().take_pps_reset())
 }
 
 /// `__gt_unpark`'s `POWER_DOMAIN_GT_IRQ` for this BAR's display: a

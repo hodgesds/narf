@@ -2177,8 +2177,17 @@ correction:
   refused with power well 2 requested or on,
   the utility pin in PWM mode (DC6), a live external route,
   or a resident DMC program that no longer verifies. System
-  suspend holds DC states off; resume releases them only if
-  the program still verifies. DC9 is never entered.
+  suspend holds DC states off. On Gen9 LP with the display
+  dark (every transcoder off, PW_2 not requested, no other
+  holder) it then runs the rest of `bxt_display_core_uninit`
+  (DBUF off, CDCLK bypass with the DE PLL off, the PW_1
+  request dropped) and `bxt_enable_dc9` (PPS reset, DC9),
+  and grants no reference until the resume; otherwise it
+  stays in DC0. Resume exits DC9 (`bxt_disable_dc9`), runs
+  the power half of the display-core init (PW_1 with its
+  fuses, MISC IO on display 9 proper, DBUF) and reloads the
+  resident program, releasing the Suspend reference only
+  once it verifies.
 - Forcewake (`intel_gpu_forcewake`): the Gen9 domain table
   is the three aggregate domains — render 0xA278, media
   0xA270, blitter 0xA188, acks 0x0D84 / 0x0D88 / 0x130044 —

@@ -28,11 +28,18 @@ const PW2_BITS: u32 = 0xC000_0000;
 /// `UTIL_PIN_ENABLE | UTIL_PIN_MODE_PWM` (`intel_backlight_regs.h`).
 const UTIL_PWM: u32 = (1 << 31) | (1 << 24);
 
+/// A register file with a write log. The display-core wells model their
+/// hardware: a `HSW_PWR_WELL_CTL2` request reports its state, the DBUF
+/// slice's state follows its request, the PG0/PG1 fuses read distributed
+/// (unless `fuse_stuck`), the DE PLL locks while enabled, and the pcode
+/// mailbox completes at once. `drop_ram` drops DMC program-RAM writes.
 #[derive(Default)]
 pub(crate) struct Fake {
     regs: RefCell<BTreeMap<u64, u32>>,
     writes: RefCell<Vec<(u64, u32)>>,
     dead: Cell<bool>,
+    fuse_stuck: Cell<bool>,
+    drop_ram: Cell<bool>,
 }
 
 impl Fake {
@@ -62,10 +69,18 @@ impl Fake {
     }
 }
 
+/// `BXT_DE_PLL_ENABLE`, `BXT_DE_PLL_PLL_ENABLE` and `BXT_DE_PLL_LOCK`.
+const DE_PLL_ENABLE: u64 = 0x46070;
+const DE_PLL_ON: u32 = 1 << 31;
+const DE_PLL_LOCK: u32 = 1 << 30;
+
 impl MmioWindow for Fake {
     fn read32(&self, off: u64) -> u32 {
         if self.dead.get() {
             return u32::MAX;
+        }
+        if off == SKL_FUSE_STATUS && !self.fuse_stuck.get() {
+            return self.get(off) | (1 << 27) | (1 << 26);
         }
         self.get(off)
     }
@@ -74,16 +89,24 @@ impl MmioWindow for Fake {
             return;
         }
         self.writes.borrow_mut().push((off, val));
-        self.set(off, val);
+        let stored = match off {
+            HSW_PWR_WELL_CTL2 => (val & 0xAAAA_AAAA) | ((val & 0xAAAA_AAAA) >> 1),
+            DBUF_CTL_S1 if val & (1 << 31) != 0 => val | (1 << 30),
+            DBUF_CTL_S1 => val & !(1 << 30),
+            DE_PLL_ENABLE if val & DE_PLL_ON != 0 => val | DE_PLL_LOCK,
+            DE_PLL_ENABLE => val & !DE_PLL_LOCK,
+            crate::intel_gpu_pcode::PCODE_MAILBOX => 0,
+            _ if self.drop_ram.get() && (0x80000..0x8F000).contains(&off) => return,
+            _ => val,
+        };
+        self.set(off, stored);
     }
 }
 
 /// The Gen9 DMC fixture container, leaked for the service's `'static`
 /// resident copy (the production copy is leaked once per boot too).
 pub(crate) fn resident() -> &'static [u8] {
-    alloc::boxed::Box::leak(
-        crate::intel_gpu_gen9_dmc::tests::fixture_dmc_blob().into_boxed_slice(),
-    )
+    alloc::boxed::Box::leak(crate::intel_gpu_gen9_dmc::tests::fixture_dmc_blob().into_boxed_slice())
 }
 
 /// Stream the fixture program into `regs` with the production loader.
@@ -255,7 +278,8 @@ fn smoke_gen9_dc_refuses_without_dmc() -> TestResult {
     }
     // A reference taken and dropped by another user while Init is pinned:
     // the release is not the last one.
-    if core.get(&fake, Gen9DcUser::Modeset) != Ok(true) || core.put(Gen9DcUser::Modeset, 0).is_some()
+    if core.get(&fake, Gen9DcUser::Modeset) != Ok(true)
+        || core.put(Gen9DcUser::Modeset, 0).is_some()
     {
         return TestResult::Fail("Init must keep the well held across other users");
     }
@@ -298,7 +322,9 @@ fn smoke_gen9_dc_refuses_with_power_well_2() -> TestResult {
             fake.clear_log();
             match core.arm_if_due(&fake, due, Gen9ArmGates::default()) {
                 Err(Gen9ArmBlock::PowerWell2 { reg: r, .. }) if r == reg => {}
-                _ => return TestResult::Fail("a PW_2 request or state bit must refuse DC re-entry"),
+                _ => {
+                    return TestResult::Fail("a PW_2 request or state bit must refuse DC re-entry")
+                }
             }
             if !fake.log().is_empty() || fake.get(DC_STATE_EN) != 0 {
                 return TestResult::Fail("a PW_2 refusal must write nothing");
@@ -411,9 +437,12 @@ kernel_test_in!(
     smoke_gen9_dc_exit_before_hardware_and_deferral
 );
 
-/// System suspend disarms DC6 and holds DC states off; resume re-verifies
-/// the resident program: retained (s2idle) re-arms after the deferral,
-/// lost (S3 power loss) keeps the Suspend reference and DC0.
+/// System suspend disarms DC6 and holds DC states off. Resume runs the
+/// display-core init (`skl_display_core_init(resume)`: DC_STATE_DISABLE, PW_1
+/// with its PG0/PG1 fuses, MISC IO, the DBUF slice) and reloads the resident
+/// program (`intel_dmc_load_program`) before releasing the Suspend reference:
+/// DC6 returns 17 ms later whether the program survived (s2idle) or was lost
+/// with system power (S3).
 fn smoke_gen9_dc_suspend_disarms() -> TestResult {
     let fake = Fake::default();
     let mut core = armed(&fake, Gen9Platform::Skylake);
@@ -430,42 +459,256 @@ fn smoke_gen9_dc_suspend_disarms() -> TestResult {
     if core.arm_if_due(&fake, u64::MAX, Gen9ArmGates::default()) != Err(Gen9ArmBlock::Busy) {
         return TestResult::Fail("no re-entry while suspended");
     }
-    // Program retained: release and re-arm.
+    // Display 9 has no DC9: the LP-only step refuses before any write.
+    fake.clear_log();
+    if core.dc9_admit(&fake) != Err(Dc9Block::NotLp) || !fake.log().is_empty() {
+        return TestResult::Fail("DC9 is not a display-9 state");
+    }
+    // Program retained: reloaded anyway, released and re-armed.
     let Ok(Some(due)) = core.resume(&fake, 40 * MS) else {
-        return TestResult::Fail("a verified program must release the Suspend reference");
+        return TestResult::Fail("a reloaded program must release the Suspend reference");
     };
     if due != 57 * MS || core.arm_if_due(&fake, due, Gen9ArmGates::default()) != Ok(DC6) {
         return TestResult::Fail("DC6 must be re-entered 17 ms after resume");
     }
-    // Power loss across the suspend: the program is gone.
+    // Power loss across the suspend: the display-core init and the reload
+    // restore the program, then the Suspend reference is released.
     if core.suspend_begin(&fake).is_err() {
         return TestResult::Fail("second suspend preparation failed");
     }
     fake.power_loss();
     fake.clear_log();
-    if core.resume(&fake, 100 * MS) != Ok(None) {
-        return TestResult::Fail("a lost program must not release the Suspend reference");
+    let Ok(Some(due)) = core.resume(&fake, 100 * MS) else {
+        return TestResult::Fail("the post-S3 reload must release the Suspend reference");
+    };
+    let log = fake.log();
+    let pw1 = log
+        .iter()
+        .position(|(o, v)| *o == HSW_PWR_WELL_CTL2 && v & (1 << 29) != 0);
+    let misc_io = log
+        .iter()
+        .position(|(o, v)| *o == HSW_PWR_WELL_CTL2 && v & (1 << 1) != 0);
+    let dbuf = log
+        .iter()
+        .position(|(o, v)| *o == DBUF_CTL_S1 && v & (1 << 31) != 0);
+    let ram = log.iter().position(|(o, _)| (0x80000..0x8F000).contains(o));
+    match (pw1, misc_io, dbuf, ram) {
+        (Some(p), Some(m), Some(d), Some(r)) if p < m && m < d && d < r => {}
+        _ => return TestResult::Fail("PW_1, MISC IO and DBUF must precede the program reload"),
     }
-    if core.refs(Gen9DcUser::Suspend) != 1 || !core.program_lost() {
-        return TestResult::Fail("a lost program must keep DC states held off");
+    if core.program_lost()
+        || due != 117 * MS
+        || core.arm_if_due(&fake, due, Gen9ArmGates::default()) != Ok(DC6)
+    {
+        return TestResult::Fail("DC6 must be re-entered after the post-S3 reload");
     }
-    if fake.writes_to(DC_STATE_EN).iter().any(|v| *v != 0) || fake.get(DC_STATE_EN) != 0 {
-        return TestResult::Fail("resume without a program must leave DC0");
+    // A program RAM that drops the reload: lost, Suspend kept, DC0.
+    let _ = core.suspend_begin(&fake);
+    fake.power_loss();
+    fake.drop_ram.set(true);
+    if core.resume(&fake, 200 * MS) != Ok(None)
+        || core.refs(Gen9DcUser::Suspend) != 1
+        || !core.program_lost()
+        || fake.get(DC_STATE_EN) != 0
+    {
+        return TestResult::Fail("a reload that does not verify must keep DC states off");
+    }
+    // A PG1 fuse that never distributes: the init refuses and nothing is
+    // reloaded.
+    fake.drop_ram.set(false);
+    fake.fuse_stuck.set(true);
+    fake.power_loss();
+    fake.clear_log();
+    if core.resume(&fake, 300 * MS) != Ok(None)
+        || fake
+            .log()
+            .iter()
+            .any(|(o, _)| (0x80000..0x8F000).contains(o))
+    {
+        return TestResult::Fail("a failed display-core init must not reload the program");
     }
     // A DC9 bit left by firmware on Gen9 LP is cleared by the resume
-    // (gen9_dc_mask carries DC9 there).
+    // (gen9_dc_mask carries DC9 there); LP requests no MISC IO well.
     let lp = Fake::default();
     let mut core = armed(&lp, Gen9Platform::Broxton);
     let _ = core.suspend_begin(&lp);
     lp.set(DC_STATE_EN, DC_STATE_EN_DC9);
+    lp.clear_log();
     if core.resume(&lp, 0).is_err() || lp.get(DC_STATE_EN) & DC_STATE_EN_DC9 != 0 {
         return TestResult::Fail("resume must leave no DC state enabled");
+    }
+    if lp.get(HSW_PWR_WELL_CTL2) & (1 << 1) != 0 || core.refs(Gen9DcUser::Suspend) != 0 {
+        return TestResult::Fail("Gen9 LP resumes PW_1 alone and releases Suspend");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_gen9_dc_states",
     smoke_gen9_dc_suspend_disarms
+);
+
+/// Gen9 LP system suspend (`intel_display_power_suspend_late`): after the
+/// Suspend reference, with the display dark, `bxt_display_core_uninit`
+/// (DBUF off, CDCLK to the bypass with the DE PLL off, the PW_1 request
+/// dropped) and `bxt_enable_dc9` (`bxt_pps_reset_all`, then DC_STATE_EN =
+/// DC9). Nothing is granted while DC9 holds. Resume
+/// (`intel_display_power_resume_early`) runs `bxt_disable_dc9`, the
+/// display-core init and the reload, then DC5 returns.
+fn smoke_gen9_lp_dc9_suspend_and_resume() -> TestResult {
+    const DC9: u32 = 1 << 3;
+    for platform in [Gen9Platform::Broxton, Gen9Platform::GeminiLake] {
+        let fake = Fake::default();
+        let mut core = armed(&fake, platform);
+        // The display core as probe left it: PW_1 requested, DBUF powered,
+        // the DE PLL locked at 624 (BXT) or 316.8 MHz (GLK).
+        fake.write32(HSW_PWR_WELL_CTL2, 1 << 29);
+        fake.write32(DBUF_CTL_S1, 1 << 31);
+        fake.set(DE_PLL_ENABLE, DE_PLL_ON | DE_PLL_LOCK);
+        fake.set(
+            0x6d000,
+            if platform == Gen9Platform::GeminiLake {
+                33
+            } else {
+                65
+            },
+        );
+        if core.suspend_begin(&fake).is_err() || fake.get(DC_STATE_EN) != 0 {
+            return TestResult::Fail("suspend must exit DC5 first");
+        }
+        fake.clear_log();
+        if core.dc9_admit(&fake).is_err() || !fake.log().is_empty() {
+            return TestResult::Fail("a dark display must admit DC9 without a write");
+        }
+        if display_core_uninit_lp(&fake, core.glk()).is_err() {
+            return TestResult::Fail("the display-core uninit must complete");
+        }
+        if core.enter_dc9(&fake).is_err() || !core.dc9() || fake.get(DC_STATE_EN) != DC9 {
+            return TestResult::Fail("DC_STATE_EN must read DC9");
+        }
+        let log = fake.log();
+        let dbuf = log
+            .iter()
+            .position(|(o, v)| *o == DBUF_CTL_S1 && v & (1 << 31) == 0);
+        let pll = log.iter().position(|w| *w == (DE_PLL_ENABLE, 0));
+        let pw1 = log
+            .iter()
+            .position(|(o, v)| *o == HSW_PWR_WELL_CTL2 && v & (1 << 29) == 0);
+        let dc9 = log.iter().position(|w| *w == (DC_STATE_EN, DC9));
+        match (dbuf, pll, pw1, dc9) {
+            (Some(d), Some(p), Some(w), Some(c)) if d < p && p < w && w < c => {}
+            _ => return TestResult::Fail("DBUF, DE PLL, PW_1, then DC9"),
+        }
+        // CDCLK_CTL's decimal field: DIV_ROUND_CLOSEST(19200 - 1000, 500).
+        if fake.get(0x46000) & 0x7ff != 36 {
+            return TestResult::Fail("CDCLK must sit at the 19.2 MHz bypass");
+        }
+        // Fenced: no holder runs in DC9.
+        fake.clear_log();
+        if core.get(&fake, Gen9DcUser::Aux) != Err(DcError::Unavailable) || !fake.log().is_empty() {
+            return TestResult::Fail("no reference may be granted in DC9");
+        }
+        // bxt_pps_reset_all, consumed once by the next sequencer user.
+        if !core.take_pps_reset() || core.take_pps_reset() {
+            return TestResult::Fail("DC9 entry must flag the PPS for reprogramming once");
+        }
+        // Resume: DC9 exit, PW_1 and DBUF back, the program reloaded.
+        fake.power_loss();
+        fake.set(DC_STATE_EN, DC9);
+        fake.clear_log();
+        let Ok(Some(due)) = core.resume(&fake, 50 * MS) else {
+            return TestResult::Fail("the resume must release the Suspend reference");
+        };
+        let log = fake.log();
+        let exit = log.iter().position(|w| *w == (DC_STATE_EN, 0));
+        let pw1 = log
+            .iter()
+            .position(|(o, v)| *o == HSW_PWR_WELL_CTL2 && v & (1 << 29) != 0);
+        let ram = log.iter().position(|(o, _)| (0x80000..0x8F000).contains(o));
+        match (exit, pw1, ram) {
+            (Some(0), Some(p), Some(r)) if p < r => {}
+            _ => return TestResult::Fail("bxt_disable_dc9, then PW_1, then the reload"),
+        }
+        if core.dc9() || core.arm_if_due(&fake, due, Gen9ArmGates::default()) != Ok(DC5) {
+            return TestResult::Fail("DC5 must return after the resume");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_lp_dc9_suspend_and_resume
+);
+
+/// DC9 admission refuses before any write (`assert_can_enable_dc9`'s
+/// checks, the dark-display check, a busy holder), and the abort lifts the
+/// fence: the Suspend reference and DC0 stay.
+fn smoke_gen9_lp_dc9_refusals() -> TestResult {
+    let refuse = |setup: &dyn Fn(&Fake, &mut Gen9DcCore), want: Dc9Block| -> bool {
+        let fake = Fake::default();
+        let mut core = armed(&fake, Gen9Platform::Broxton);
+        if core.suspend_begin(&fake).is_err() {
+            return false;
+        }
+        setup(&fake, &mut core);
+        fake.clear_log();
+        let got = core.dc9_admit(&fake);
+        core.dc9_abort();
+        got == Err(want)
+            && fake.log().is_empty()
+            && core.get(&fake, Gen9DcUser::Kms) == Ok(true)
+            && core.refs(Gen9DcUser::Suspend) == 1
+    };
+    if !refuse(
+        &|fake, _| fake.set(0x70008, 1 << 31),
+        Dc9Block::DisplayActive {
+            reg: 0x70008,
+            value: 1 << 31,
+        },
+    ) || !refuse(
+        &|fake, _| fake.set(0x7f008, (1 << 31) | (1 << 30)),
+        Dc9Block::DisplayActive {
+            reg: 0x7f008,
+            value: (1 << 31) | (1 << 30),
+        },
+    ) {
+        return TestResult::Fail("an enabled transcoder must refuse DC9");
+    }
+    if !refuse(
+        &|fake, _| fake.set(HSW_PWR_WELL_CTL2, 1 << 31),
+        Dc9Block::PowerWell2(1 << 31),
+    ) {
+        return TestResult::Fail("a PW_2 request must refuse DC9");
+    }
+    if !refuse(
+        &|fake, _| fake.set(DC_STATE_EN, DC5),
+        Dc9Block::Dc5Programmed,
+    ) || !refuse(
+        &|fake, _| fake.set(DC_STATE_EN, DC_STATE_EN_DC9),
+        Dc9Block::AlreadyProgrammed,
+    ) {
+        return TestResult::Fail("DC5 or DC9 already programmed must refuse DC9");
+    }
+    if !refuse(
+        &|fake, core| {
+            let _ = core.get(fake, Gen9DcUser::Aux);
+        },
+        Dc9Block::Busy,
+    ) {
+        return TestResult::Fail("a holder in its conversation must refuse DC9");
+    }
+    // DC9 without the Suspend reference, and before any admission.
+    let fake = Fake::default();
+    let mut core = armed(&fake, Gen9Platform::GeminiLake);
+    if core.dc9_admit(&fake) != Err(Dc9Block::NotSuspending)
+        || core.enter_dc9(&fake) != Err(Dc9Block::NotSuspending)
+    {
+        return TestResult::Fail("DC9 needs the Suspend reference and an admission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_lp_dc9_refusals
 );
 
 /// `__gt_unpark` holds `POWER_DOMAIN_GT_IRQ` (in every Gen9 `dc_off` list)
@@ -489,7 +732,8 @@ fn smoke_gen9_dc_gt_irq_hold_while_unparked() -> TestResult {
     let mut core = armed(&fake, Gen9Platform::Skylake);
     fake.clear_log();
     // Unpark: DC6 exits before the GT touches anything.
-    if core.get(&fake, Gen9DcUser::GtIrq) != Ok(true) || fake.log().first() != Some(&(DC_STATE_EN, 0))
+    if core.get(&fake, Gen9DcUser::GtIrq) != Ok(true)
+        || fake.log().first() != Some(&(DC_STATE_EN, 0))
     {
         return TestResult::Fail("unpark must exit DC6");
     }
@@ -502,7 +746,8 @@ fn smoke_gen9_dc_gt_irq_hold_while_unparked() -> TestResult {
     if core.put(Gen9DcUser::GtIrq, 10 * MS) != Some(110 * MS) {
         return TestResult::Fail("the GT_IRQ release must defer re-entry 100 ms");
     }
-    if core.arm_if_due(&fake, 27 * MS, Gen9ArmGates::default()) != Err(Gen9ArmBlock::NotDue(110 * MS))
+    if core.arm_if_due(&fake, 27 * MS, Gen9ArmGates::default())
+        != Err(Gen9ArmBlock::NotDue(110 * MS))
     {
         return TestResult::Fail("no re-entry inside the GT_IRQ put");
     }
@@ -534,7 +779,7 @@ fn smoke_gen9_dc_gt_irq_hold_while_unparked() -> TestResult {
                 prefetchable: false,
             },
         };
-        if !gt_unparked(&bar).is_some_and(|r| r.service.is_none()) {
+        if !gt_unparked(&bar).is_some_and(|r| r.service.is_none()) || take_pps_reset_for_bar(&bar) {
             return TestResult::Fail("without a service the GT_IRQ hold must be inert");
         }
     }
@@ -723,7 +968,9 @@ fn armed_sink(
     let mut core = Gen9DcCore::new(Gen9Platform::Skylake);
     let _ = core.boot(sink);
     core.provide_program(blob, SKL_DMC_MAX_FW_SIZE);
-    let due = core.release_init(0).ok_or("Init must be released with a program")?;
+    let due = core
+        .release_init(0)
+        .ok_or("Init must be released with a program")?;
     if core.arm_if_due(sink, due, Gen9ArmGates::default()) != Ok(DC6) {
         return Err("the sink fixture must start in DC6");
     }
