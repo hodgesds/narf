@@ -542,10 +542,9 @@ static ATTACHED: IrqSafeSpinLock<Vec<u32>> = IrqSafeSpinLock::new(Vec::new());
 
 /// The DRM card of the probed Intel function.
 fn card_for_bar(bar: &narf_bus::MmioRegion) -> Option<u32> {
-    let (vendor, device) = crate::intel_gpu::with_display_info(|g| {
-        (g.gtt_mmadr.phys == bar.phys).then(|| g.pci_id())
-    })
-    .flatten()?;
+    let (vendor, device) =
+        crate::intel_gpu::with_display_info(|g| (g.gtt_mmadr.phys == bar.phys).then(|| g.pci_id()))
+            .flatten()?;
     (0..crate::drm_registry::count() as u32).find(|&i| {
         crate::drm_registry::driver_name(i) == Some("intel-gpu")
             && crate::drm_registry::pci_id(i) == Some((vendor, device))
@@ -822,8 +821,7 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
             Ok(r) => (r, None),
             Err(e) => (None, Some(e)),
         };
-        let next: Option<(OpKind, RouteDesc)> = if s.route.map(|r| r.key)
-            != current.map(|r| r.key)
+        let next: Option<(OpKind, RouteDesc)> = if s.route.map(|r| r.key) != current.map(|r| r.key)
         {
             if let Some(mut link) = s.link.take() {
                 if let Some(io) = io.as_ref() {
@@ -862,8 +860,7 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
                     } => Some((OpKind::Retype, r)),
                     Commit::Enable { .. } => Some((OpKind::Enable, r)),
                 }
-            } else if link.value == CpValue::Enabled
-                && narf_time::monotonic_ns() >= s.next_check_ns
+            } else if link.value == CpValue::Enabled && narf_time::monotonic_ns() >= s.next_check_ns
             {
                 Some((OpKind::Check, r))
             } else {
@@ -920,6 +917,32 @@ pub fn last_error(card: u32, connector: u32) -> Option<HdcpError> {
         .iter()
         .find(|s| s.card == card && s.connector == connector)
         .and_then(|s| s.last)
+}
+
+/// Test-only: queue a framed command for the GSC worker as the GSC
+/// transport does; returns its ticket.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __gsc_post_for_test(input: Vec<u8>, out_len: usize) -> u64 {
+    let ticket = GSC_TICKET.fetch_add(1, Ordering::Relaxed);
+    *GSC.lock() = GscSlot::Request {
+        ticket,
+        input,
+        out_len,
+    };
+    ticket
+}
+
+/// Test-only: take `ticket`'s completion, if the worker finished it.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __gsc_result_for_test(ticket: u64) -> Option<Result<Vec<u8>, i32>> {
+    let mut slot = GSC.lock();
+    match core::mem::replace(&mut *slot, GscSlot::Idle) {
+        GscSlot::Done { ticket: t, result } if t == ticket => Some(result),
+        other => {
+            *slot = other;
+            None
+        }
+    }
 }
 
 #[doc(hidden)]
