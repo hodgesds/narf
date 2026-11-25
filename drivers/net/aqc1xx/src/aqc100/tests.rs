@@ -907,7 +907,12 @@ fn smoke_aqc100_fake_rbl_boot() -> TestResult {
         return TestResult::Fail("rbl soft_reset");
     }
     kt_assert!(fake.logged(FAKE_BOOT_EXIT_CODE, FAKE_BOOT_MARKER));
-    let r = fake_bringup_fw1x_b1(&FakeRegs::with_boot(FakeBoot::Rbl(0x0001)));
+    // The bring-up helper reads the permanent MAC from efuse, so the
+    // second fake needs the same preload as the first — without it the
+    // efuse reads return 0 and get_mac_permanent falls back.
+    let bringup = FakeRegs::with_boot(FakeBoot::Rbl(0x0001));
+    bringup.preload_efuse_mac([0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF]);
+    let r = fake_bringup_fw1x_b1(&bringup);
     if !matches!(r, TestResult::Pass) {
         return r;
     }
