@@ -44,6 +44,12 @@ families and1 explicit AR9462 rejection. Its12 firmware-selection entries
 are all reachable. None of these counts is a driver count
 or completion percentage. Together with ath9k (AR9285 and AR2427) there are12 registered tuples.
 
+Loadable build: every ath9k id (AR5008, AR9280, AR9285/AR2427, AR9287 and
+the AR9300 family) is also claimed by `ath9k.ko`, which is the same driver
+source over the KABI. It carries the station path and removal on unload.
+It has no system PM, WoW or userspace SME
+(`drivers/wireless/specification/spec.md` §4.6).
+
 NARF evidence: `ath9k.rs::{register,probe}`, `ath9k/identity.rs`,
 `ath9k/calibration.rs`, `ath9k/packet.rs`, `ath9k/station.rs`,
 `ath10k/hw.rs::ALL_PCI_MATCHES`, `pci.rs::{register_pci_driver,probe}`,
