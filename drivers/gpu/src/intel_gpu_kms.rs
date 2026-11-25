@@ -730,6 +730,7 @@ impl Physical {
             }
             card.intel_x_tiled = gen12_x;
             card.intel_tile4 = false;
+            card.intel_ccs = None;
             if matches!(
                 self.generation,
                 Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake
@@ -749,6 +750,12 @@ impl Physical {
                     };
                     card.intel_x_tiled = x_tiled_profile(self, geometry, timing).is_ok();
                     card.intel_tile4 = tile4_profile(self, geometry, timing).is_ok();
+                    // narf.intel.ccs=1: the compressed Tile4 modifiers of
+                    // this display IP become framebuffer layouts.
+                    card.intel_ccs = self
+                        .integrated_display_ip()
+                        .map(crate::intel_gpu_xe2lpd::DisplayIp::ver)
+                        .filter(|_| card.intel_tile4 && crate::intel_gpu_scanout::ccs::opted_in());
                 }
             }
         }

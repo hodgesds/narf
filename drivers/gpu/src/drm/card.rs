@@ -285,6 +285,9 @@ impl Framebuffer {
 pub struct IntelFb {
     pub object: Arc<crate::intel_gpu_gem::GemObject>,
     pub owner: u64,
+    /// The compressed layout's AUX and clear-colour planes
+    /// (`narf.intel.ccs=1`).
+    pub ccs: Option<crate::intel_gpu_scanout::ccs::CcsPlanes>,
 }
 
 /// An amdgpu GEM buffer a framebuffer holds, and the open that made it:
@@ -1149,6 +1152,10 @@ pub struct Card {
     /// Fixed display14 Tile4 with retained primary WM/resource ownership.
     #[cfg(feature = "intel")]
     pub(crate) intel_tile4: bool,
+    /// `narf.intel.ccs=1`: the display version whose compressed Tile4
+    /// modifiers ADDFB2 takes (`crate::intel_gpu_scanout::ccs`).
+    #[cfg(feature = "intel")]
+    pub(crate) intel_ccs: Option<u16>,
     /// Fixed MTL/Arrow opaque XR30 LINEAR native input; no output-depth claim.
     #[cfg(feature = "intel")]
     pub(crate) intel_xr30: bool,
@@ -1502,6 +1509,7 @@ impl Card {
             intel_x_tiled: false,
             #[cfg(feature = "intel")]
             intel_tile4: false,
+            intel_ccs: None,
             #[cfg(feature = "intel")]
             intel_xr30: false,
             #[cfg(feature = "intel")]
@@ -2825,6 +2833,9 @@ impl Card {
         } else {
             0
         };
+        if crate::intel_gpu_scanout::ccs::Ccs::is_ccs_modifier(modifier) {
+            return self.addfb2_intel_ccs(cmd, object, owner, xe, modifier);
+        }
         let x_tiled = modifier == crate::intel_gpu_scanout::X_TILED_MODIFIER && self.intel_x_tiled;
         let tile4 = modifier == crate::intel_gpu_scanout::TILE4_MODIFIER && self.intel_tile4;
         let tiled = x_tiled || tile4;
@@ -2953,7 +2964,99 @@ impl Card {
             modifier,
             bo: None,
             creator: None,
-            intel: Some(IntelFb { object, owner }),
+            intel: Some(IntelFb {
+                object,
+                owner,
+                ccs: None,
+            }),
+        });
+        Ok(id)
+    }
+
+    /// [`Self::addfb2_intel`] for a compressed Tile4 modifier
+    /// (`narf.intel.ccs=1`): `intel_framebuffer_init` with the modifier's
+    /// CCS plane rules ([`crate::intel_gpu_scanout::ccs::check_planes`]),
+    /// the Tile4 stride and size limits, every used plane carrying the same
+    /// modifier, and the VRAM, import, SCANOUT and PXP rules of the plain
+    /// path. The AUX and clear-colour planes are kept on the framebuffer.
+    #[cfg(feature = "intel")]
+    fn addfb2_intel_ccs(
+        &mut self,
+        cmd: &crate::drm::fb_cmd::FbCmd,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        owner: u64,
+        xe: bool,
+        modifier: u64,
+    ) -> Result<u32, CardError> {
+        use crate::drm::fb_cmd::FB_MODIFIERS;
+        use crate::intel_gpu_scanout::ccs::{check_planes, Ccs, CcsRefusal};
+        let display_ver = self.intel_ccs.ok_or(CardError::UnknownFormat)?;
+        let ccs =
+            Ccs::from_modifier(modifier, display_ver, xe).map_err(|_| CardError::UnknownFormat)?;
+        if cmd.flags != FB_MODIFIERS
+            || (1..4).any(|i| cmd.modifier[i] != if i < ccs.planes() { modifier } else { 0 })
+        {
+            return Err(CardError::UnknownFormat);
+        }
+        if !(4..=5120).contains(&cmd.width) || cmd.height == 0 || cmd.height > 4320 {
+            return Err(CardError::InvalidDimensions);
+        }
+        let stride_limit = self
+            .intel_gen12_views
+            .map_or(128 * 1024, crate::intel_gpu_scanout::gen12_max_stride);
+        if cmd.pitches[0] > stride_limit || cmd.pitches[0] < cmd.width * 4 {
+            return Err(CardError::InvalidDimensions);
+        }
+        let planes = check_planes(
+            ccs,
+            cmd.pixel_format,
+            cmd.height,
+            cmd.handles,
+            cmd.pitches,
+            cmd.offsets,
+            object.size(),
+        )
+        .map_err(|e| match e {
+            CcsRefusal::Format | CcsRefusal::Modifier | CcsRefusal::Disabled => {
+                CardError::UnknownFormat
+            }
+            CcsRefusal::Planes | CcsRefusal::Bounds => CardError::InvalidDimensions,
+        })?;
+        let format = PixelFormat::from_fourcc(cmd.pixel_format).ok_or(CardError::UnknownFormat)?;
+        if (object.is_vram() && !self.intel_vram_scanout)
+            || (object.is_imported() && self.intel_vram_scanout)
+            || object.pxp_key() != 0
+        {
+            return Err(CardError::InvalidDimensions);
+        }
+        if xe && !object.scanout() {
+            if object.vm_bound() && !object.is_imported() {
+                return Err(CardError::InvalidDimensions);
+            }
+            object.mark_scanout();
+        }
+        if self.framebuffers.len() >= 4096 {
+            return Err(CardError::TooManyFbs);
+        }
+        let id = self.next_fb_id;
+        self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);
+        self.framebuffers.push(Framebuffer {
+            id,
+            width: cmd.width,
+            height: cmd.height,
+            format,
+            pitch: cmd.pitches[0],
+            gem_handle: cmd.handles[0],
+            offsets: [0, planes.aux.map_or(0, |(offset, _)| offset)],
+            chroma_pitch: planes.aux.map_or(0, |(_, pitch)| pitch),
+            modifier,
+            bo: None,
+            creator: None,
+            intel: Some(IntelFb {
+                object,
+                owner,
+                ccs: Some(planes),
+            }),
         });
         Ok(id)
     }

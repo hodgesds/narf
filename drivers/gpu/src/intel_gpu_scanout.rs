@@ -1797,3 +1797,6 @@ impl<M: ScanoutIo> Drop for Presenter<M> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_scanout_tests.rs"]
 mod tests;
+
+#[path = "intel_gpu_ccs_scanout.rs"]
+pub(crate) mod ccs;
