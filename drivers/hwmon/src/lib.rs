@@ -66,17 +66,39 @@ pub trait HwmonDevice: core::fmt::Debug {
     /// this surface regardless of the hardware's native units.
     fn set_fan(&self, label: &str, level: u8) -> bool;
 
-    /// The device's real high (`max`) and critical (`crit`) temperature
-    /// limits for `label`, in millidegrees Celsius, as the hardware
-    /// itself reports them — a Tjmax MSR, a programmed limit register,
-    /// and so on. Either component is `None` when the hardware exposes
-    /// no such limit for the label.
-    ///
-    /// The sysfs bridge publishes `temp<n>_max` / `temp<n>_crit` only
-    /// for components that return `Some` (#909): thresholds are never
-    /// invented constants. The default reports no limits.
-    fn temp_limits(&self, _label: &str) -> (Option<i32>, Option<i32>) {
-        (None, None)
+    /// Whether, and how, the temperature channel `label` publishes
+    /// `temp<n>_<attr>` — Linux's `hwmon_ops.is_visible` (0 / 0444 /
+    /// 0644). `None` means the attribute does not exist for this
+    /// channel. The sysfs bridge publishes exactly the attributes this
+    /// returns `Some` for, so a threshold or alarm is only ever the
+    /// hardware's own (#909). The default publishes none.
+    fn temp_attr_mode(&self, _label: &str, _attr: TempAttr) -> Option<AttrMode> {
+        None
+    }
+
+    /// Read `temp<n>_<attr>`: millidegrees Celsius for the limits, 0 or
+    /// 1 for the alarms and `enable` (Linux `hwmon_ops.read`). `None`
+    /// when the read fails.
+    fn read_temp_attr(&self, _label: &str, _attr: TempAttr) -> Option<i64> {
+        None
+    }
+
+    /// Write `temp<n>_<attr>` (Linux `hwmon_ops.write`). Only called for
+    /// attributes [`HwmonDevice::temp_attr_mode`] reports
+    /// [`AttrMode::ReadWrite`]; the value is what `kstrtol` parsed.
+    fn write_temp_attr(
+        &self,
+        _label: &str,
+        _attr: TempAttr,
+        _value: i64,
+    ) -> Result<(), HwmonError> {
+        Err(HwmonError::InvalidValue)
+    }
+
+    /// Whether `temp<n>_label` is published for `label` (Linux:
+    /// `HWMON_T_LABEL` in the channel's config). Default: yes.
+    fn temp_label_visible(&self, _label: &str) -> bool {
+        true
     }
 
     /// Read back the current PWM duty (0–255) of a fan channel, by the
@@ -100,6 +122,88 @@ pub trait HwmonDevice: core::fmt::Debug {
     /// List all sensor labels exposed by this device. The returned slice
     /// references static strings owned by the driver; no allocation.
     fn list_labels(&self) -> alloc::vec::Vec<&str>;
+}
+
+/// A temperature-channel attribute beside `temp<n>_input` and
+/// `temp<n>_label`, named by its Linux hwmon suffix
+/// (`Documentation/hwmon/sysfs-interface.rst`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TempAttr {
+    /// `temp<n>_enable`: 1 enabled, 0 disabled.
+    Enable,
+    /// `temp<n>_lcrit`: low critical limit, millidegrees.
+    Lcrit,
+    /// `temp<n>_min`: low limit, millidegrees.
+    Min,
+    /// `temp<n>_max`: high limit, millidegrees.
+    Max,
+    /// `temp<n>_crit`: high critical limit, millidegrees.
+    Crit,
+    /// `temp<n>_lcrit_alarm`.
+    LcritAlarm,
+    /// `temp<n>_min_alarm`.
+    MinAlarm,
+    /// `temp<n>_max_alarm`.
+    MaxAlarm,
+    /// `temp<n>_crit_alarm`.
+    CritAlarm,
+}
+
+impl TempAttr {
+    /// Every attribute, in Linux's `hwmon_temp_attr_templates` order.
+    pub const ALL: [Self; 9] = [
+        Self::Enable,
+        Self::Lcrit,
+        Self::Min,
+        Self::Max,
+        Self::Crit,
+        Self::LcritAlarm,
+        Self::MinAlarm,
+        Self::MaxAlarm,
+        Self::CritAlarm,
+    ];
+
+    /// The sysfs suffix after `temp<n>_`.
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Enable => "enable",
+            Self::Lcrit => "lcrit",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Crit => "crit",
+            Self::LcritAlarm => "lcrit_alarm",
+            Self::MinAlarm => "min_alarm",
+            Self::MaxAlarm => "max_alarm",
+            Self::CritAlarm => "crit_alarm",
+        }
+    }
+}
+
+/// How a published attribute may be accessed (Linux `is_visible`'s
+/// 0444 / 0644).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AttrMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Why a hwmon attribute write failed. Each variant is the errno the
+/// Linux driver's `write` returns, so the bridge can hand it back to
+/// `write(2)` unchanged.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HwmonError {
+    /// The value is not one the attribute accepts (`-EINVAL`).
+    InvalidValue,
+    /// The device did not answer (`-ENXIO`).
+    NoResponse,
+    /// The bus transaction timed out (`-ETIMEDOUT`).
+    Timeout,
+    /// The bus is owned elsewhere (`-EBUSY`).
+    Busy,
+    /// Arbitration was lost; retrying may succeed (`-EAGAIN`).
+    Again,
+    /// Any other transfer failure (`-EIO`).
+    Io,
 }
 
 /// Stage::Subsys initcalls for hardware-monitoring crate.

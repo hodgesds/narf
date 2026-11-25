@@ -204,16 +204,17 @@ impl crate::HwmonDevice for Coretemp {
         false
     }
 
-    fn temp_limits(&self, label: &str) -> (Option<i32>, Option<i32>) {
+    fn temp_attr_mode(&self, label: &str, attr: crate::TempAttr) -> Option<crate::AttrMode> {
         // Tjmax, decoded from MSR_TEMPERATURE_TARGET at probe, is the
         // junction critical limit by definition — Linux coretemp
         // publishes it as temp_crit and exposes no separate temp_max.
-        match label {
-            "Tpackage" | "Core0" | "Core1" | "Core2" | "Core3" => {
-                (None, Some((self.tjmax_c as i32) * 1000))
-            }
-            _ => (None, None),
-        }
+        let channel = matches!(label, "Tpackage" | "Core0" | "Core1" | "Core2" | "Core3");
+        (channel && attr == crate::TempAttr::Crit).then_some(crate::AttrMode::ReadOnly)
+    }
+
+    fn read_temp_attr(&self, label: &str, attr: crate::TempAttr) -> Option<i64> {
+        self.temp_attr_mode(label, attr)?;
+        Some(i64::from(self.tjmax_c) * 1000)
     }
 
     fn list_labels(&self) -> Vec<&str> {

@@ -1612,6 +1612,7 @@ version = "0.0.0"
 dependencies = [
  "narf-aml",
  "narf-arch",
+ "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-console",

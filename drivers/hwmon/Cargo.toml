@@ -25,6 +25,7 @@ narf-firmware-smbios = { path = "../../firmware/smbios" }
 narf-power        = { path = "../../power" }
 narf-aml          = { path = "../../aml" }
 narf-drivers-platform = { path = "../platform" }
+narf-block        = { path = "../../block" }
 
 [features]
 kernel-test = ["narf-bus/kernel-test"]

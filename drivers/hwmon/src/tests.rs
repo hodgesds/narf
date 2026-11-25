@@ -542,11 +542,16 @@ impl crate::HwmonDevice for FakeControlDevice {
         true
     }
 
-    fn temp_limits(&self, label: &str) -> (Option<i32>, Option<i32>) {
-        if label == "Tdie" {
-            (Some(85_000), Some(95_000))
-        } else {
-            (None, None)
+    fn temp_attr_mode(&self, label: &str, attr: crate::TempAttr) -> Option<crate::AttrMode> {
+        (label == "Tdie" && matches!(attr, crate::TempAttr::Max | crate::TempAttr::Crit))
+            .then_some(crate::AttrMode::ReadOnly)
+    }
+
+    fn read_temp_attr(&self, label: &str, attr: crate::TempAttr) -> Option<i64> {
+        match (label, attr) {
+            ("Tdie", crate::TempAttr::Max) => Some(85_000),
+            ("Tdie", crate::TempAttr::Crit) => Some(95_000),
+            _ => None,
         }
     }
 
