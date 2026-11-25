@@ -593,6 +593,12 @@ struct Runtime {
     /// `RC_CONTROL` while unparked (`rc6->ctl_enable`); `None` when RC6 is
     /// not supported, which leaves every RC6 control untouched.
     rc6: Option<u32>,
+    /// The function's BAR, for the display's Gen9 `DC_off` service.
+    bar: narf_bus::bar::MmioRegion,
+    /// `gt->awake`: the Gen9 `GT_IRQ` reference held while unparked
+    /// (`__gt_unpark`), inert without the Gen9 DC service (Gen11, or the
+    /// option clear) and `None` when its DC exit was refused.
+    gt_irq: Option<crate::intel_gpu_gen9_dc_states::Gen9DcRef>,
 }
 
 impl Runtime {
@@ -602,6 +608,11 @@ impl Runtime {
     fn unpark(&mut self) -> Result<(), FsError> {
         if !self.governor.parked() {
             return Ok(());
+        }
+        // __gt_unpark takes POWER_DOMAIN_GT_IRQ first: DC states stay off
+        // while the GT is awake (a latency workaround; best effort).
+        if self.gt_irq.is_none() {
+            self.gt_irq = crate::intel_gpu_gen9_dc_states::gt_unparked(&self.bar);
         }
         self.fw
             .acquire(&self.window, FwDomain::Render)
@@ -639,6 +650,8 @@ impl Runtime {
         self.release_media();
         let _ = self.fw.release(&self.window, FwDomain::Blitter);
         let _ = self.fw.release(&self.window, FwDomain::Render);
+        // __gt_park: GT_IRQ released last, with its 100 ms async put.
+        self.gt_irq = None;
     }
 
     /// Every media well a media lane needs; on failure nothing extra is held.
@@ -995,6 +1008,9 @@ impl Owner {
             governor: Governor::new(caps),
             steering,
             rc6,
+            bar: self.bar,
+            // Bring-up leaves the GT awake: __gt_unpark's GT_IRQ is held.
+            gt_irq: crate::intel_gpu_gen9_dc_states::gt_unparked(&self.bar),
         });
         self.epoch.store(epoch, Ordering::Release);
         Ok(())

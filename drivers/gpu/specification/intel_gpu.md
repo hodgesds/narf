@@ -2170,9 +2170,11 @@ correction:
   Gen9 DMC loaded and the internal Pipe-A panel is owned;
   the Gen9 modeset, AUX, GMBUS (Gen9 LP only), hotplug, the
   external pass, the panel power-off and KMS sessions hold
-  references; the last release re-enters DC6 (display 9,
-  Wa Display #1183 first) or DC5 (Broxton / Gemini Lake)
-  17 ms later, refused with power well 2 requested or on,
+  references, and the execlists GT holds `GT_IRQ` while
+  unparked (`__gt_unpark`); the last release re-enters DC6
+  (display 9, Wa Display #1183 first) or DC5 (Broxton /
+  Gemini Lake) 17 ms later (100 ms after the GT parks),
+  refused with power well 2 requested or on,
   the utility pin in PWM mode (DC6), a live external route,
   or a resident DMC program that no longer verifies. System
   suspend holds DC states off; resume releases them only if

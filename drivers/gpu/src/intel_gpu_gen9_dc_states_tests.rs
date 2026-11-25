@@ -468,6 +468,83 @@ kernel_test_in!(
     smoke_gen9_dc_suspend_disarms
 );
 
+/// `__gt_unpark` holds `POWER_DOMAIN_GT_IRQ` (in every Gen9 `dc_off` list)
+/// while the GT is awake; `__gt_park` drops it with the 100 ms async put.
+/// Re-entry after the GT parks waits those 100 ms even past a later 17 ms
+/// release; a new unpark takes the pending put over.
+fn smoke_gen9_dc_gt_irq_hold_while_unparked() -> TestResult {
+    for platform in [
+        Gen9Platform::Skylake,
+        Gen9Platform::Broxton,
+        Gen9Platform::GeminiLake,
+    ] {
+        if !Gen9DcCore::new(platform).needs_dc_off(Gen9DcUser::GtIrq) {
+            return TestResult::Fail("GT_IRQ is a dc_off domain on every Gen9 part");
+        }
+    }
+    if GT_IRQ_PUT_DELAY_NS != 100 * MS {
+        return TestResult::Fail("the GT_IRQ put is Linux's default 100 ms async put");
+    }
+    let fake = Fake::default();
+    let mut core = armed(&fake, Gen9Platform::Skylake);
+    fake.clear_log();
+    // Unpark: DC6 exits before the GT touches anything.
+    if core.get(&fake, Gen9DcUser::GtIrq) != Ok(true) || fake.log().first() != Some(&(DC_STATE_EN, 0))
+    {
+        return TestResult::Fail("unpark must exit DC6");
+    }
+    // Display work while the GT is awake never schedules re-entry.
+    let _ = core.get(&fake, Gen9DcUser::Kms);
+    if core.put(Gen9DcUser::Kms, 5 * MS).is_some() {
+        return TestResult::Fail("the awake GT must keep DC states off");
+    }
+    // Park at 10 ms: re-entry at 110 ms, not 27 ms.
+    if core.put(Gen9DcUser::GtIrq, 10 * MS) != Some(110 * MS) {
+        return TestResult::Fail("the GT_IRQ release must defer re-entry 100 ms");
+    }
+    if core.arm_if_due(&fake, 27 * MS, Gen9ArmGates::default()) != Err(Gen9ArmBlock::NotDue(110 * MS))
+    {
+        return TestResult::Fail("no re-entry inside the GT_IRQ put");
+    }
+    // A display release inside the put still waits for it.
+    let _ = core.get(&fake, Gen9DcUser::Kms);
+    if core.put(Gen9DcUser::Kms, 30 * MS) != Some(110 * MS) {
+        return TestResult::Fail("a 17 ms release must not shorten the GT_IRQ put");
+    }
+    // A new unpark takes the pending put over; its own park restarts it.
+    let _ = core.get(&fake, Gen9DcUser::GtIrq);
+    if core.put(Gen9DcUser::GtIrq, 200 * MS) != Some(300 * MS) {
+        return TestResult::Fail("the second park restarts the 100 ms put");
+    }
+    // Once it has passed, a display release is back to 17 ms.
+    let _ = core.get(&fake, Gen9DcUser::Kms);
+    if core.put(Gen9DcUser::Kms, 400 * MS) != Some(417 * MS) {
+        return TestResult::Fail("an elapsed GT_IRQ put must not delay later releases");
+    }
+    if core.arm_if_due(&fake, 417 * MS, Gen9ArmGates::default()) != Ok(DC6) {
+        return TestResult::Fail("DC6 must return once the GT is parked");
+    }
+    // Without a Gen9 service the production hold is inert.
+    if service().is_none() {
+        let bar = narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0xF000_0000),
+            virt: 0,
+            len: 0,
+            kind: narf_bus::BarKind::Mmio64 {
+                prefetchable: false,
+            },
+        };
+        if !gt_unparked(&bar).is_some_and(|r| r.service.is_none()) {
+            return TestResult::Fail("without a service the GT_IRQ hold must be inert");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_dc_gt_irq_hold_while_unparked
+);
+
 /// A program that stops verifying is never re-entered; an all-ones
 /// `DC_STATE_EN` refuses the reference with nothing counted.
 fn smoke_gen9_dc_lost_program_and_faults() -> TestResult {
@@ -615,6 +692,7 @@ fn smoke_gen9_dc_refuses_without_the_option() -> TestResult {
         || Gen9DcUser::from(DcUser::Aux) != Gen9DcUser::Aux
         || Gen9DcUser::from(DcUser::External) != Gen9DcUser::External
         || Gen9DcUser::from(DcUser::Suspend) != Gen9DcUser::Suspend
+        || Gen9DcUser::from(DcUser::Phy) != Gen9DcUser::Modeset
     {
         return TestResult::Fail("the display-14 users must map onto the Gen9 users");
     }

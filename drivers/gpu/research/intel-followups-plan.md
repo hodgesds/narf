@@ -149,10 +149,10 @@ Still open, each needing its own grounding first:
 
 - Gen9 DC states on hardware (Skylake and Gen9 LP): the `DC_off` service
   and its holders are wired behind `narf.intel.gen9_dc=1` (default off),
-  fixture-validated only. Left: a silicon run on each family, DC9 for
-  Gen9 LP system suspend (`bxt_enable_dc9`, with the PPS reset), the
-  post-S3 DMC reload (a lost program keeps DC states off), and the GT's
-  `GT_IRQ` hold while unparked (`__gt_unpark`).
+  fixture-validated only, with the GT's `GT_IRQ` hold while unparked
+  (`__gt_unpark`). Left: a silicon run on each family, DC9 for Gen9 LP
+  system suspend (`bxt_enable_dc9`, with the PPS reset), and the post-S3
+  DMC reload (a lost program keeps DC states off).
 - Nova Lake-S beyond the owned eDP route, its suspend relight, the LT
   external outputs and the display-35 DMC/DC6 service
   (`narf.intel.nvl_modeset=1`): UHBR and Thunderbolt alt mode on the LT PHY,

@@ -116,22 +116,25 @@
 //! on Gen9 LP, the hotplug poll and enable (`intel_gpu_dp`), the
 //! external-output pass (`intel_gpu::poll_dp_hpd_events`), the runtime
 //! panel power-off (`intel_gpu_edp::panel_power_off`), and KMS sessions and
-//! legacy guards (through the display-14 `DcRef`). System suspend takes one
+//! legacy guards (through the display-14 `DcRef`). The execlists GT owner
+//! holds a `GtIrq` reference while it is unparked (`__gt_unpark`'s
+//! `POWER_DOMAIN_GT_IRQ`, a latency workaround) and drops it at park, after
+//! which re-entry waits Linux's 100 ms async put. System suspend takes one
 //! first and keeps it unless the resident DMC program still verifies at
 //! resume. Panel brightness (the backlight crate's PWM writes) takes none,
 //! as in Linux.
 //!
 //! Stricter than Linux, and why: every last release defers re-entry by 17
-//! ms (Linux releases GMBUS and INIT synchronously and AUX after 100 ms);
+//! ms, or 100 ms after GT_IRQ as in Linux (Linux releases GMBUS and INIT
+//! synchronously and AUX after 100 ms);
 //! DC6 also requires power well 2 off (Linux checks it only on the DC5
 //! path) and any requester's PW_2 bit refuses, not only the driver's; the
 //! hotplug poll and the panel power-off, which Linux runs without
 //! `DC_off`, take a reference; a live external route refuses re-entry even
 //! with power well 2 off; a lost program is never re-entered and not
 //! reloaded; DC5/DC6 are disarmed for every system sleep target (Linux
-//! leaves display 9 in DC6 across s2idle) and DC9 is never entered. The GT
-//! does not hold `GT_IRQ` while unparked (Linux's `__gt_unpark` does, as a
-//! latency workaround only).
+//! leaves display 9 in DC6 across s2idle) and DC9 is never entered; a DC
+//! exit refused at unpark leaves the GT running without `GT_IRQ`.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -351,10 +354,19 @@ pub enum Gen9DcUser {
     /// System suspend preparation through the resume that re-verifies the
     /// DMC program.
     Suspend = 8,
+    /// The GT while it is unparked (`__gt_unpark`'s `POWER_DOMAIN_GT_IRQ`,
+    /// a `dc_off` domain on every Gen9 part): DMC DC-state transitions during
+    /// command submission cost interrupt latency. Released at park with
+    /// Linux's 100 ms async put ([`GT_IRQ_PUT_DELAY_NS`]).
+    GtIrq = 9,
 }
 
 /// Number of [`Gen9DcUser`]s.
-pub const GEN9_DC_USER_COUNT: usize = 9;
+pub const GEN9_DC_USER_COUNT: usize = 10;
+
+/// `__gt_park`'s `intel_display_power_put_async(.., POWER_DOMAIN_GT_IRQ, ..)`
+/// with the default delay (`__intel_display_power_put_async`: 100 ms).
+pub const GT_IRQ_PUT_DELAY_NS: u64 = 100_000_000;
 
 impl From<DcUser> for Gen9DcUser {
     /// The display-14 vocabulary the shared KMS / legacy-guard paths use,
@@ -437,6 +449,8 @@ pub struct Gen9DcCore {
     lp: bool,
     refs: [u32; GEN9_DC_USER_COUNT],
     arm_at: Option<u64>,
+    /// The GT_IRQ reference's 100 ms async put: no re-entry before it.
+    gt_irq_until: Option<u64>,
     /// The probe-time DMC container.
     program: Option<Resident>,
     /// The main program stopped verifying: never re-entered again.
@@ -457,6 +471,7 @@ impl Gen9DcCore {
             lp,
             refs: [0; GEN9_DC_USER_COUNT],
             arm_at: None,
+            gt_irq_until: None,
             program: None,
             lost: false,
             booted: false,
@@ -545,6 +560,10 @@ impl Gen9DcCore {
         let next = self.refs[user as usize]
             .checked_add(1)
             .ok_or(DcError::Overflow)?;
+        if user == Gen9DcUser::GtIrq {
+            // A new GT_IRQ reference takes over the pending async put.
+            self.gt_irq_until = None;
+        }
         if self.total() == 0 {
             self.arm_at = None;
             let value = regs.read32(DC_STATE_EN);
@@ -560,16 +579,22 @@ impl Gen9DcCore {
     }
 
     /// Release a reference. The last release schedules re-entry at
-    /// `now + 17 ms` and returns that deadline; nothing is written here.
-    /// An unbalanced release is ignored.
+    /// `now + 17 ms`, or later while a GT_IRQ async put is pending (100 ms
+    /// after the GT parked), and returns that deadline; nothing is written
+    /// here. An unbalanced release is ignored.
     pub fn put(&mut self, user: Gen9DcUser, now: u64) -> Option<u64> {
         let slot = &mut self.refs[user as usize];
         if *slot == 0 {
             return None;
         }
         *slot -= 1;
+        if user == Gen9DcUser::GtIrq && *slot == 0 {
+            self.gt_irq_until = Some(now.saturating_add(GT_IRQ_PUT_DELAY_NS));
+        }
         if self.total() == 0 {
-            let at = now.saturating_add(DC_REENABLE_DELAY_NS);
+            let at = now
+                .saturating_add(DC_REENABLE_DELAY_NS)
+                .max(self.gt_irq_until.unwrap_or(0));
             self.arm_at = Some(at);
             Some(at)
         } else {
@@ -1359,6 +1384,15 @@ fn resume_after_suspend() {
         Ok(None) => {}
         Err(_) => log("Gen9 DC states held off after resume: DC_STATE_EN unavailable"),
     }
+}
+
+/// `__gt_unpark`'s `POWER_DOMAIN_GT_IRQ` for this BAR's display: a
+/// [`Gen9DcUser::GtIrq`] reference held while the GT is unparked, released
+/// at park (re-entry then waits [`GT_IRQ_PUT_DELAY_NS`]). Best effort: the
+/// hold is a latency workaround, so a refused DC exit returns `None` and the
+/// GT runs without it. Inert without a Gen9 service.
+pub(crate) fn gt_unparked(bar: &narf_bus::MmioRegion) -> Option<Gen9DcRef> {
+    acquire_for_bar(bar, Gen9DcUser::GtIrq).ok()
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
