@@ -43,6 +43,7 @@ Boot options, each strict and default off:
 | `narf.intel.gen9_dpll=1` | Gen9 DPLL1-3 arbitration and sharing between external outputs |
 | `narf.intel.rkl_edp=1` | The Rocket Lake internal panel on the owned eDP route |
 | `narf.intel.dg1_kms=1` | The DG1 KMS owner over its firmware-lit Pipe A |
+| `narf.intel.hdmi14_ext=1` | Display 14+ external deep colour, YCbCr 4:4:4 into a DP PCON, and HDMI/DP audio with its component |
 
 ## Still open
 
@@ -58,15 +59,18 @@ work had.
   DC service and of a TBT dock. Thunderbolt alt mode on the LT PHY and the
   MST and DSC fixtures over LT ports have landed; the DMC wakelock is not
   used, and an inherited wakelock mode blocks DC6.
-- Display 14 and later: native HDMI FRL, HDMI audio, deep colour and
-  YCbCr 4:4:4. A second concurrent external route
-  (`narf.intel.ext_routes=2`), Panel Replay on the display-20/30 eDP
+- Display 14 and later: deep colour, YCbCr 4:4:4 into a 4:2:0 PCON and
+  HDMI/DP audio (`narf.intel.hdmi14_ext=1`), a second concurrent external
+  route (`narf.intel.ext_routes=2`), Panel Replay on the display-20/30 eDP
   (`narf.intel.panel_replay=1`) and compressed scanout (`narf.intel.ccs=1`)
-  have native fixtures only; still open are MST or
+  have native fixtures only. Still open: their silicon runs, an Intel HDMI
+  codec in the HDA driver to consume the audio component, deep colour
+  through a branch, UHBR, MST or DSC, MST audio, DP YCbCr 4:2:0, MST or
   UHBR beside a second route, Panel Replay on the external routes (their
   console scanout has no frontbuffer tracking to exit replay) and with the
-  AS SDP, region early transport, panned compressed views, and a silicon
-  run of compressed scanout.
+  AS SDP, region early transport, and panned compressed views. Native HDMI
+  FRL stays refused: Linux 7.4 has no source FRL link training (its rate
+  and PHY facts are carried).
 - DP 2.0 UHBR beyond the 128b/132b SST route behind `narf.intel.uhbr=1`
   (UHBR10/20 on C20 and LT ports, native fixtures only): 128b/132b MST, DSC
   over UHBR, UHBR over Thunderbolt alt mode (TBT 312.5/625 MHz clocks, DP
