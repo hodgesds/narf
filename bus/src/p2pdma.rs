@@ -97,14 +97,17 @@ impl P2pTopology for LiveTopology {
         let first = crate::registry::devices()
             .into_iter()
             .filter(|candidate| {
-                pcie(candidate).is_some_and(|addr| addr.segment == top.segment && addr.bus == top.bus)
+                pcie(candidate)
+                    .is_some_and(|addr| addr.segment == top.segment && addr.bus == top.bus)
             })
             .min_by_key(|candidate| pcie(candidate).map(|addr| (addr.device, addr.function)))?;
         let addr = pcie(&first)?;
-        ((addr.device == 0 && addr.function == 0) || is_root_port(&first)).then_some(HostBridgeDev {
-            vendor: first.id.vendor,
-            device: first.id.device,
-        })
+        ((addr.device == 0 && addr.function == 0) || is_root_port(&first)).then_some(
+            HostBridgeDev {
+                vendor: first.id.vendor,
+                device: first.id.device,
+            },
+        )
     }
 
     fn cpu_supports_p2pdma(&self) -> bool {
@@ -136,13 +139,17 @@ mod p2pdma_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    /// Every enumerated PCIe function is distance 0 from itself over bus
-    /// addresses (the `calc_map_type_and_dist` same-function case), and a
-    /// non-PCI client is refused.
+    /// An enumerated PCIe function without ACS redirection is distance 0
+    /// from itself over bus addresses (the `calc_map_type_and_dist`
+    /// same-function case; its own redirect would count), and a non-PCI
+    /// client is refused.
     fn smoke_p2pdma_live_same_function_and_non_pci_client() -> TestResult {
         let devices = crate::registry::devices();
-        let Some(device) = devices.iter().find(|d| pcie(d).is_some()) else {
-            return TestResult::Skip("no enumerated PCIe function");
+        let Some(device) = devices
+            .iter()
+            .find(|d| pcie(d).is_some() && !LiveTopology.acs_redirect(**d))
+        else {
+            return TestResult::Skip("no enumerated PCIe function without ACS redirect");
         };
         if distance(device, Some(device)) != Some(0)
             || map_type(device, device) != narf_io::p2pdma::P2pMapType::BusAddr
@@ -152,5 +159,8 @@ mod p2pdma_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("bus/p2pdma", smoke_p2pdma_live_same_function_and_non_pci_client);
+    kernel_test_in!(
+        "bus/p2pdma",
+        smoke_p2pdma_live_same_function_and_non_pci_client
+    );
 }
