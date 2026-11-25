@@ -1,192 +1,70 @@
-# Intel GPU follow-ups: plan of work
+# Intel GPU follow-ups
 
-Status: planned on `feat/intel-gpu-followups` (2026-11-23), cut from main
-at `f1d42f6f2`. This note gives the order of work and the decisions it
-rests on. Each lane lands its interface in `specification/spec.md` §3 and
-its facts in `specification/intel_gpu.md`, as the Gen9 and Gen11 lanes
-did.
+Status: the plan cut from main at `f1d42f6f2` (2026-11-23) has landed, in
+#2489 (`feat/intel-gpu-followups`) and #2511 (`feat/intel-gpu-remaining`).
+The facts are in `specification/intel_gpu.md` and the interfaces in
+`specification/spec.md` §3. Native fixtures, not silicon, validate the work.
 
-## Decisions
+## Landed
 
-- **Scope: everything listed.** That covers the Gen9 and Gen11
-  remainders (§12.3, §12.4), the display gaps the spec names, every
-  capability row still marked Open (§20 table), and the §6 out-of-scope
-  programmes.
-- **Comet Lake reads the PCI revision ID** (Q6). Revision 5 and above
-  take the `cml_*` GuC and HuC blobs; older parts take Kaby Lake's, as
-  `INTEL_REVID` selects in `gt/uc/intel_uc_fw.c`.
-- **Same grounding bar as the earlier lanes.** Each register,
-  sequence and table is checked against Linux i915/xe at the pinned
-  revision, and native fixtures pin it. Nothing here has run on silicon,
-  and each lane says so in the spec.
-- **One branch, lane by lane.** Each commit gets a type-check and fmt.
-  Clippy and the targeted QEMU suites run on both arches at the end.
+- #2489: Comet Lake GuC/HuC by PCI revision; Gen9 panel fitting; EHL/JSL
+  PORT_D PLL arbitration and 36-bit VMs; Ice Lake Type-C ownership, TBT
+  clocking, FIA lane count and USB-C DP alt mode; Gen11 and Gen9 external
+  DP/HDMI SST and MST; HDMI to DVI sinks, deep colour, YCbCr 4:2:0 on display
+  11 to 20, and FRL through a DP PCON; computed SNPS C10 and C20 HDMI clocks
+  on Meteor Lake; concurrent Gen12 external routes; Lunar and Panther Lake
+  combo DDI B DP and HDMI; Rocket Lake externals on DDI B and TC1/TC2; the
+  Gen9/Gen11 execlists GT owner with the golden render state; the GT started
+  beside lit discrete and desktop displays; DG1 VRAM.
+- #2511: Lunar Lake panel PHY/AUX in the PICA block; Gen9/Gen11 RPS and RC6,
+  per-engine reset, copy and media engines, timeslicing and priority
+  preemption on the execlists owner; fixed-mode KMS on Meteor/Arrow Lake,
+  Gen9 and Gen11 desktops; devcoredump wall-clock time and process names;
+  Broxton/Gemini Lake GT and display (DPIO PHY, CDCLK, port PLLs, eDP,
+  DP/HDMI, VBT HPD invert and backlight controller, HDMI PLL holes, Gemini
+  Lake YCbCr 4:2:0); Nova Lake-S display 35 (`DisplayIp::NovaLakeS`, the
+  owned eDP modeset through the LT PHY, suspend relight, external
+  DP/HDMI/DP-alt on the LT PHY, DMC/DC6); and the opt-in features below. The
+  MEI GSC proxy client had landed before.
 
-## Lanes, in order
+Boot options, each strict and default off:
 
-0. ~~**S4 gate leftovers.**~~ Freezer done; clippy and the stack-frame
-   budget get re-checked at the final gate. The aarch64 `verification/freezer` failure:
-   the own-stack model had no freeze point for a task running in user
-   mode. The tick preemption resumes the continuation straight back to
-   user mode, and the poll gate runs only on the first entry. Fix:
-   `freeze_on_user_tick`, which each arch's IRQ tail calls after the
-   tick's preemption. Main already fixed clippy (#2389, #2444) and the
-   image-file stack frame (#2445); the final gate re-checks both.
-1. ~~**Q6 Comet Lake revision.**~~ Done (`GtPlatform::guc_for_revision`,
-   `huc::firmware_name_for_revision`, `open_for_revision`).
-2. ~~**Gen9 pipe scaler and panel fitting.**~~ Done (`plan_display9`,
-   `Modeset::set_gen9_panel_fit`). Ground `skl_scaler.c`'s
-   display-9 branches: scaler count per pipe, the up/downscale and
-   source-size limits, and the `PS_CTRL` filter and mode bits. Wire them
-   into the Gen9 modeset the way `XeLpgModeset::with_panel_fit` does on
-   display 14.
-3. ~~**Gen11 Q8.**~~ Done: PORT_D pool arbitration, the 36-bit ceiling,
-   the ICL Type-C FIA handshake plus TBT clocking, the FIA lane count, and
-   USB-C DP alt mode on Ice Lake through the bridge.
-   - EHL/JSL PORT_D: arbitrate the {DPLL0, DPLL1, DPLL4} pool per
-     commit. PORT_D shares PHY A with PORT_A (`icl_get_combo_phy_dpll`,
-     `ehl_combo_pll_div_frac_wa_needed`).
-   - The EHL/JSL 36-bit PPGTT ceiling (`ppgtt_size = 36` in
-     `i915_pci.c`): a three-level walk and the VM-range refusals.
-   - Ice Lake TBT alt-mode and TCSS/FIA: the Type-C port ownership
-     handshake, live mode detection (legacy, DP-alt, TBT), and TBT PLL
-     routing through `DDI_CLK_SEL_TBT_*`. The TC code in
-     `display/intel_tc.c` is the source; the ICL branches use no FIA
-     HIP bank.
-4. ~~**Gen11 and Gen9 external sessions.**~~ Done: DP/HDMI SST
-   (`SourceFamily`, ICP and SPT hotplug banks, Gen11 and Gen9 DDC pins,
-   the hotplug glue, the display 9-11 stop proof, per-source DP rate caps)
-   and MST. Found on the way: the display 9-11 `TRANS_DDI_FUNC_CTL` port
-   select. Thread the families through
-   the session layer, which fails closed for them today: the
-   `DpConnection`/`HdmiConnection` family fields, VRR gating (neither
-   family has VRR), the DDC pin overrides, and the ICP and SPT/KBP
-   south hotplug profiles. MST session threading follows, after SST works.
-5. ~~**HDMI completeness.**~~ Done: DVI sinks, deep colour, YCbCr 4:2:0
-   on display 11/12, and FRL through a DP PCON (i915 has no native FRL).
-   4:2:0 on display 14 remains.
-   - DVI signalling, with no infoframes or SCDC.
-   - AVI and SPD infoframes for HDMI sinks.
-   - YCbCr 4:2:0 and deep colour (10 and 12 bpc): EDID caps, the
-     TMDS clock scaling, the `PIPE_MISC` and `TRANS_DDI_FUNC_CTL`
-     bits.
-   - Verify that the Xe-LPG text ("340 MHz, scrambling/SCDC not
-     owned") still holds. The output-support row says MTL HDMI 2.0
-     scrambling/SCDC reaches 594 MHz.
-   - FRL last.
-6. **Xe-LPG HDMI routing.** The hotplug service already selected HDMI
-   (the spec text was stale). The SNPS C10 and computed C20 clocks are
-   done. Type-C DDC on pins 9–12. HDMI clocks without a source table:
-   the SNPS C10 algorithm and the computed C20 algorithm
-   (`intel_snps_hdmi_pll.c`, `intel_cx0_phy.c`). TBT-alt stays refused
-   until lane 3's TC ownership work is generalised.
-7. **Multi-pipe modeset.** A second independent concurrent external
-   route. This is the general watermark/DBUF/CDCLK transaction the
-   atomic-display row names, beyond the fixed Pipe-A owner.
-8. **Display 20/30 externals.** Lunar Lake and Panther Lake combo DDI B
-   and HDMI, on the display-20 resources lane 7 generalises.
-9. **Rocket Lake and Nova Lake-S display.**
-   - RKL: its DPLL and clock sequence (`rkl_pll_mgr`, the
-     `RKL_DPLL_CFGCR*` and `DPCLKA_CFGCR0` port mapping, the PCH-port
-     DDI remap).
-   - NVL-S: the clock/PHY/modeset policy the spec gates programming
-     on.
-10. **Capability rows still Open**, one sub-lane per row, in table
-    order:
-    - VM/address mirrors: i915 `GEM_USERPTR`, fault-mode and CPU-mirror
-      VMs, long-running VMs.
-    - Local memory: nonvisible allocation beyond BMG headless,
-      eviction/migration, alias revocation, VRAM PRIME/P2P.
-    - Engine scheduling: further queue protocols. Protected queues
-      run with `narf.intel.pxp=1`.
-    - Media GT: PXP silicon acceptance (PXP itself is behind
-      `narf.intel.pxp=1`).
-    - Diagnostics: steered manual capture, coredump process/time facts.
-    - Atomic display: what lane 7 leaves, plus tiling/compression beyond
-      X/Tile4 and additional planes.
-    - Display services: colour, HDCP, Arc display.
-    - GT power: flush consumers, media power, D3cold where `_PR3`
-      exists.
-    - Additional platforms: LNL FBC, tiled panning, suspend/relight,
-      and PTL display.
-11. **The §6 programmes**, each its own grounding first:
-    - Gen9-LP BXT/GLK, with the DPIO PHY.
-    - Lunar Lake and Battlemage 3D.
-    - Discrete Arc beyond bring-up.
+| Option | Enables |
+| --- | --- |
+| `narf.intel.nvl_display=1` | Nova Lake-S display 35 kept lit as fixed-mode KMS beside a display-preserving GT |
+| `narf.intel.nvl_modeset=1` | With `nvl_display`: the owned eDP route, its relight, the LT externals and DC6 |
+| `narf.intel.gen9_dc=1` | Gen9 and Gen9 LP DC states; DC9 across suspend on Gen9 LP with the display dark |
+| `narf.intel.prime_p2p=1` | Peer-to-peer VRAM PRIME attachments |
+| `narf.intel.pxp=1` | Xe PXP on MTL/Arrow GT1 (with `media_gt=1` and `gsc=1`) |
+| `narf.intel.hdcp=1` | HDCP 1.4 and 2.2 on external SST DP and HDMI, display 12+ |
 
-    HDCP needs the same MEI/CSME client as PXP. The PUNIT blob stays
-    excluded: it is firmware NARF does not load.
+## Still open
 
-## Status after #2489 (`feat/intel-gpu-remaining`)
+Each item needs its own grounding against Linux i915/xe first, as the landed
+work had.
 
-#2489 landed lanes 0-8 and most of 9 and 10. Several §20 capability rows
-still read Open for work the code now has (LNL/PTL FBC, i915
-`GEM_USERPTR`). This branch then landed:
-
-- the Lunar Lake panel's PHY/AUX in the PICA block (and PTL's PSR AUX);
-- Gen9/Gen11 RPS and RC6 under a busy/idle governor, per-engine reset with
-  innocent replay, the golden render state (#2489) and BCS0/VCS0/VECS0
-  beside RCS0;
-- fixed-mode KMS beside a running GT on Meteor/Arrow Lake desktops and on
-  Nova Lake-S (`narf.intel.nvl_display=1`, display-preserving GT start);
-- the Nova Lake-S owned eDP route (`narf.intel.nvl_modeset=1`): an owned
-  console with the display-35 KMS owner, the panel off before system
-  suspend and its LT-PHY relight on resume; DP and HDMI TMDS on LT port B
-  and DP-alt on TC1/TC2 beside it;
-- the devcoredump wall-clock snapshot time, and the guilty context's
-  process (`narf_filesystem::caller`, installed by userspace);
-- fixed-mode KMS on Gen9 and Gen11 desktops;
-- Broxton and Gemini Lake: identity, the Gen9-LP GT profile on the
-  execlists owner (CHV PPAT, Broxton MOCS, LP workarounds, pooled EUs,
-  BXT RPS, RC6 behind the BIOS check), and the display: the DPIO PHY,
-  port PLLs and CDCLK, the eDP modeset, and DP/HDMI on DDI B and C with
-  the display-engine hotplug bank (fixed-mode KMS when no modeset runs);
-- Gen11 VCS0/VECS0 engine reset with the SFC lock;
-- Gen9/Gen11 timeslicing and priority-band preemption (Linux's execlists
-  preempt-to-busy model).
-
-Still open, each needing its own grounding first:
-
-- Gen9 DC states on hardware (Skylake and Gen9 LP): the `DC_off` service
-  and its holders are wired behind `narf.intel.gen9_dc=1` (default off),
-  fixture-validated only, with the GT's `GT_IRQ` hold while unparked
-  (`__gt_unpark`), Gen9 LP DC9 across system suspend (`bxt_enable_dc9` /
-  `bxt_disable_dc9` with the PPS reset, entered only with the display
-  dark) and the post-S3 display-core init and DMC reload. Left: a silicon
-  run on each family; a Gen9 display suspend owner that turns the panel
-  off and relights it (none exists, so a lit panel keeps DC9 refused);
-  `intel_cdclk_init_hw` and the PCH reset handshake on resume (the next
-  modeset owns CDCLK); BXT DSI transcoders in the dark-display check; and
+- Silicon runs of everything above. The Gen9 DC states also need a Gen9
+  display suspend owner that turns the panel off and relights it (a lit
+  panel keeps DC9 refused), `intel_cdclk_init_hw` and the PCH reset
+  handshake on resume, BXT DSI transcoders in the dark-display check, and
   `assert_can_enable_dc9`'s interrupts-off check.
-- Nova Lake-S beyond the owned eDP route, its suspend relight, the LT
-  external outputs and the display-35 DMC/DC6 service
-  (`narf.intel.nvl_modeset=1`): UHBR and Thunderbolt alt mode on the LT PHY,
-  Nova fixtures for MST and DSC over LT ports (they run the same
-  LT-dispatched route), DC3CO (it needs the CMTG and a LOBF, panel-replay or
-  PSR2 trigger), the DMC wakelock (`intel_dmc_wl`), and a silicon run of the
-  DC service.
-- PXP silicon acceptance. Xe PXP on MTL/Arrow runs behind
-  `narf.intel.pxp=1` (spec "MTL/Arrow PXP behind narf.intel.pxp=1") with
-  native fixtures only; protected-plane decryption is refused, and the
-  RUN_ALONE LRC bit and the runtime wiring have no native model.
-- HDCP beyond the landed SST DP/HDMI path (`narf.intel.hdcp=1`: HDCP 1.4,
-  HDCP 2.2 through the MEI HDCP client on display 12/13 and the GSC on
-  14+, the Content Protection properties): DP MST stream encryption,
-  `CP_IRQ` delivery, KMS-owner cards' property path, and a silicon run
-  (the NUC12's GOP-lit route is the first target).
+- Nova Lake-S: UHBR and Thunderbolt alt mode on the LT PHY, Nova fixtures for
+  MST and DSC over LT ports, DC3CO (it needs the CMTG and a LOBF,
+  panel-replay or PSR2 trigger) and the DMC wakelock (`intel_dmc_wl`).
+- Display 14 and later: UHBR, native HDMI FRL, HDMI audio, deep colour and
+  YCbCr 4:4:4, a second concurrent external route, panel replay, and
+  compressed primary layouts.
+- Older display: the Rocket Lake internal panel, a DG1 KMS owner, Gen9
+  DPLL arbitration between two external outputs, and the Gen9 interrupt
+  handler (`intel_gpu_gen9_irq` has no caller).
+- PXP: protected-plane decryption is refused, and the RUN_ALONE LRC bit and
+  the runtime wiring have no native model.
+- HDCP: DP MST stream encryption, `CP_IRQ` delivery (RxStatus is polled),
+  the KMS-owner cards' property path, the Gen9/Gen11 port-indexed HDCP
+  registers and the debugfs files.
+- VRAM PRIME beyond static attachments: dynamic importers with move
+  notification (`xe_dma_buf_move_notify`), system suspend with a pinned VRAM
+  export, CPU mmap and scanout of a foreign import, AMD exporters and
+  importers.
+- CPU-address-mirror VMs.
 - D3cold through `_PR3` power resources (NARF evaluates no AML).
-- VRAM PRIME/P2P beyond the static attachments in `intel_gpu_prime`
-  (peer-to-peer LMEM BAR mapping behind `narf.intel.prime_p2p=1`,
-  migration fallback, pinned, VRAM-only and nonvisible refusals, foreign
-  import binding): dynamic importers with move notification
-  (`xe_dma_buf_move_notify`), system suspend with a pinned VRAM export
-  (Linux evicts and restores it in place), CPU mmap and scanout of a
-  foreign import, AMD exporters and importers, and validation of the P2P
-  path on hardware.
-
-## Shared files
-
-The display session layer (`intel_gpu_modeset.rs`, the hotplug service)
-is Intel-only. Nothing here touches the AMD modules the Navi22 branch
-works in. Any change outside `drivers/gpu/src/intel_gpu*` gets flagged
-in the PR.
