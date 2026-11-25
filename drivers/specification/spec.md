@@ -475,6 +475,53 @@ under it, and AML is evaluated with no lock held.
 - the hidden `quiet` / `balanced-performance` choices, which have no slot in
   the single-backend list.
 
+### 3.10 HID transports (`narf_input::hid_device`)
+
+A HID transport registers every device it binds with the transport-neutral
+registry `narf_input::hid_device` (`register(HidInfo, Arc<dyn
+HidTransport>)`, Linux `hid_add_device`), hands every input report to
+`HidDevice::report_in` before parsing it, and calls `unregister` on unbind.
+The filesystem publishes each registered device as `/dev/hidrawN` plus its
+`/sys/bus/hid` device (filesystem spec §3.3.4).
+
+**Contract for `HidInfo::sysfs_parent`.** The path below `/sys` of the
+transport device the HID device hangs off — for USB the interface,
+`devices/pci0000:00/<root port>/<controller>/usbN/N-P/N-P:C.I`, without a
+leading `/` or `/sys/`. The publisher get-or-creates the path (it does not
+need the transport's kobjects to exist first) and puts
+`BBBB:VVVV:PPPP.NNNN/` under it. Empty means "no sysfs node": the publisher
+uses the platform parent `/sys/devices/platform/narf-hid`. A transport that
+removes its own kobjects on unplug should `unregister` first, so the HID
+device's `remove` uevents precede the parent's, as in Linux.
+
+**I2C-HID** (`narf_input_driver::i2c_hid_transport`). The bind pump
+registers each device once its report descriptor parses, with the identity
+`__i2c_hid_core_probe` gives it: `BUS_I2C`, the HID descriptor's
+vendor/product, `bcdVersion` as the version, `HID_NAME` `"<ACPI name>
+VVVV:PPPP"` and `HID_PHYS` `"i2c-<ACPI name>"`, the ACPI name being
+`acpi_device_set_name`'s `"<_HID>:%02x"` instance (`SYNA8018:00`). There is
+no I2C sysfs tree yet, so `sysfs_parent` is empty. The pump tees every
+input report it reads and unregisters when it exits.
+
+`I2cHidTransport` drives its own `I2cHidDriver` over the device's bus and
+descriptor:
+
+- `output_report` is `i2c_hid_output_report`: a plain output report to
+  `wOutputRegister`, `-ENOSYS` when `wMaxOutputLength == 0` (hidraw then
+  falls back to SET_REPORT);
+- `raw_request` is `i2c_hid_raw_request`: SET_REPORT for Feature and Output
+  reports (`-EINVAL` for Input, or when `buf[0]` is not the report ID),
+  GET_REPORT for Feature and Input (`-EINVAL` for Output), report 0's ID
+  stashed by hand.
+
+`I2cHidDriver` frames requests as i2c-hid does: report IDs of 15 and up as
+the `0x0F` sentinel plus a third byte; no ID byte for report 0; GET_REPORT
+as one write + repeated-START read sized to the transfer buffer, which is
+`i2c_hid_start`'s `max(HID_MIN_BUFFER_SIZE, longest report + ID + 2)`;
+data longer than the buffer is `-EINVAL`, and a response for another report
+ID `-EINVAL`. I2C timeouts are `ETIMEDOUT`; every other bus failure is
+`EIO` (`HidIoError` has no `EREMOTEIO`/`EAGAIN`/`EBUSY`/`EPROTO`).
+
 ## 4. ABI versioning
 
 Modelled directly on `userspace/syscall.rs`'s syscall versioning
