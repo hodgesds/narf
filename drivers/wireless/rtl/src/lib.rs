@@ -74,7 +74,7 @@ narf_driver! {
         author: "narf",
         description: "Legacy Realtek Wi-Fi (rtl8xxxu USB + rtlwifi PCIe)",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write,Firmware:Read",
     },
     register: do_register,
 }
