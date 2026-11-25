@@ -786,8 +786,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
             batches,
             batch_count: batch_count as u8,
             wq,
-            comm: None,
-            pid: None,
+            process: context
+                .user
+                .as_ref()
+                .and_then(crate::intel_gpu_user::UserJob::owner),
             snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
         })
     }
@@ -1857,8 +1859,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                                     now_ns: now,
                                     state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
                                     engines: self.engines,
-                                    process_name: None,
-                                    pid: None,
+                                    process: context
+                                        .user
+                                        .as_ref()
+                                        .and_then(crate::intel_gpu_user::UserJob::owner),
                                     snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
                                 },
                                 contexts,
@@ -2375,8 +2379,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             now_ns: now,
                             state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
                             engines: self.engines,
-                            process_name: None,
-                            pid: None,
+                            process: c
+                                .user
+                                .as_ref()
+                                .and_then(crate::intel_gpu_user::UserJob::owner),
                             snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
                         },
                         contexts,

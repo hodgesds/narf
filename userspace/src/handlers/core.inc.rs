@@ -18006,6 +18006,15 @@ pub(crate) fn current_fs_ids() -> (u32, u32) {
 /// inode when `/dev/ptmx` is opened (`fs/devpts/inode.c::devpts_pty_new`),
 /// and the node is mode 0620 — so these are what let a non-root session
 /// open its own terminal.
+/// The calling task's comm and initial-namespace PID (`task->comm`,
+/// `task->pid`), for drivers that name the process behind their work
+/// (`narf_filesystem::caller`). Non-blocking: the comm read never waits.
+pub fn caller_identity(comm: &mut [u8; 16]) -> (u64, usize) {
+    let task = current_task_id();
+    let pid = task_to_pid_raw(task).unwrap_or(task);
+    (pid, proc_comm_of_task_into(task, comm))
+}
+
 pub fn pty_open_fs_ids() -> (u32, u32) {
     let ids = read_uidgid(current_task_id());
     (ids.fsuid, ids.fsgid)

@@ -1052,8 +1052,8 @@ pub(crate) struct Queue {
     pub batches: [u64; QUEUE_LANES],
     pub batch_count: u8,
     pub wq: Option<Wq>,
-    pub comm: Option<&'static str>,
-    pub pid: Option<u32>,
+    /// The process that created the queue's context.
+    pub process: Option<narf_filesystem::caller::Caller>,
     pub snapshot_time: Option<(u64, u32)>,
 }
 /// xe_guc_submit.c's job timeout and the PREEMPTION_TIMEOUT policy NARF sends.
@@ -1061,9 +1061,8 @@ const JOB_TIMEOUT_MS: u32 = 5000;
 const PREEMPT_TIMEOUT_US: u32 = 500_000;
 impl Queue {
     #[allow(dead_code)]
-    pub(crate) fn with_process(mut self, name: &'static str, pid: u32) -> Self {
-        self.comm = Some(name);
-        self.pid = Some(pid);
+    pub(crate) fn with_process(mut self, name: &str, pid: u32) -> Self {
+        self.process = Some(narf_filesystem::caller::Caller::new(name, pid));
         self
     }
     #[allow(dead_code)]
@@ -1156,11 +1155,9 @@ pub(crate) fn print_dump(
         report.capture.now_ns / 1_000_000_000,
         report.capture.now_ns % 1_000_000_000
     )?;
-    let process = queue
-        .and_then(|q| q.comm.zip(q.pid))
-        .or_else(|| report.capture.process_name.zip(report.capture.pid));
+    let process = queue.and_then(|q| q.process).or(report.capture.process);
     match process {
-        Some((name, pid)) => writeln!(out, "Process: {name} [{pid}]")?,
+        Some(caller) => writeln!(out, "Process: {} [{}]", caller.comm(), caller.pid)?,
         None => writeln!(out, "Process: unavailable")?,
     }
     writeln!(out, "PCI ID: 0x{:04x}", device.device_id)?;

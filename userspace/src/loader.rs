@@ -334,6 +334,11 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
     if image.entry == 0 {
         return Err(LoadBytesError::Load(LoadError::BadEntry));
     }
+    // Any task that can open a device node was loaded here first, so the
+    // caller accessor drivers name their submitters with (a GPU
+    // devcoredump's "Process:") is installed here, lazily, as the mmap
+    // truncate hook is below.
+    narf_filesystem::caller::install_hook(crate::handlers::caller_identity);
 
     // Per-segment file and memory page counts, accounting for an in-page
     // offset. A PT_LOAD whose biased vaddr isn't 4 KiB-aligned

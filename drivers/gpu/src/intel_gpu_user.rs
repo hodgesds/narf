@@ -437,6 +437,9 @@ pub struct UserContext {
     placements: crate::intel_gpu_engine::EngineSet,
     parallel: Option<ParallelPlacements>,
     capture_policy: Option<Arc<CapturePolicy>>,
+    /// The process that created the context (`task->comm`, `task->pid` of
+    /// the ioctl caller), which a devcoredump names for its hang.
+    owner: Option<narf_filesystem::caller::Caller>,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -560,6 +563,7 @@ impl UserContext {
             placements,
             parallel,
             capture_policy,
+            owner: narf_filesystem::caller::current(),
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
                 busy: false,
@@ -1019,6 +1023,10 @@ pub(crate) struct UserJob {
     epoch: u64,
 }
 impl UserJob {
+    /// The process that created this job's context.
+    pub(crate) fn owner(&self) -> Option<narf_filesystem::caller::Caller> {
+        self.context.owner
+    }
     pub(crate) fn diagnostic_protected(&self) -> bool {
         self.context
             .capture_policy

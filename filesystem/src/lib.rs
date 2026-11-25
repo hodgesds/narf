@@ -67,6 +67,7 @@ extern crate alloc;
 
 pub mod bluetooth;
 pub mod bpffs;
+pub mod caller;
 pub mod killable;
 pub mod sync_wait;
 pub use sync_wait::wait_sync;
