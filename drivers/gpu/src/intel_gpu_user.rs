@@ -419,6 +419,9 @@ struct State {
     low_latency: bool,
     /// Bound VM runs in long-running mode (no 5s job watchdog timeout).
     lr: bool,
+    /// A PXP queue on RCS/CCS below graphics 20: every LRC runs alone
+    /// (xe_lrc.c XE_LRC_CREATE_RUNALONE, CTX_CTRL_RUN_ALONE).
+    run_alone: bool,
 }
 
 #[derive(Debug)]
@@ -593,6 +596,7 @@ impl UserContext {
                 staged: None,
                 low_latency: false,
                 lr: false,
+                run_alone: false,
             }),
         })
     }
@@ -801,6 +805,16 @@ impl UserContext {
         state.lr = true;
         Ok(())
     }
+    /// A PXP queue on RCS/CCS below graphics 20 (xe_exec_queue.c
+    /// __xe_exec_queue_init's XE_LRC_CREATE_RUNALONE): set before any claim.
+    pub(crate) fn configure_run_alone(&self) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        if state.epoch != 0 || state.busy {
+            return Err(FsError::Busy);
+        }
+        state.run_alone = true;
+        Ok(())
+    }
     pub(crate) fn banned(&self) -> bool {
         self.state.lock().banned
     }
@@ -997,6 +1011,10 @@ impl ContextClaim {
     /// submit time to program the image slot.
     pub(crate) fn oa_oactxcontrol(&self) -> Option<u32> {
         self.context.oa_oactxcontrol()
+    }
+    /// The context's LRC must carry CTX_CTRL_RUN_ALONE (a PXP RCS/CCS queue).
+    pub(crate) fn run_alone(&self) -> bool {
+        self.context.state.lock().run_alone
     }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
         self.restore_lane(image, 0);

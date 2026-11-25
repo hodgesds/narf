@@ -139,6 +139,9 @@ pub struct GemObject {
     system_ccs: Mutex<bool>,
     /// Published VM bindings naming this object (Linux xe_bo_is_vm_bound).
     vm_binds: core::sync::atomic::AtomicU32,
+    /// `bo->pxp_key_instance`: the PXP key iteration a HWDRM object was
+    /// created against (xe_pxp_key_assign); 0 for an unprotected object.
+    pxp_key: core::sync::atomic::AtomicU32,
     size: u64,
     offset: u64,
     vm_owner: Option<u64>,
@@ -258,6 +261,7 @@ impl GemObject {
             no_compression: AtomicBool::new(false),
             system_ccs: Mutex::new(false),
             vm_binds: core::sync::atomic::AtomicU32::new(0),
+            pxp_key: core::sync::atomic::AtomicU32::new(0),
             size,
             offset,
             vm_owner: None,
@@ -371,6 +375,16 @@ impl GemObject {
 
     pub(crate) fn mark_scanout(&self) {
         self.scanout.store(true, Ordering::Release);
+    }
+
+    /// xe_pxp_key_assign: mark a new HWDRM object with the current key.
+    pub(crate) fn set_pxp_key(&self, instance: u32) {
+        self.pxp_key.store(instance, Ordering::Release);
+    }
+
+    /// `bo->pxp_key_instance` (xe_bo_is_protected when nonzero).
+    pub(crate) fn pxp_key(&self) -> u32 {
+        self.pxp_key.load(Ordering::Acquire)
     }
 
     /// Bound in some VM's published mapping set (Linux xe_bo_is_vm_bound).

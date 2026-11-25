@@ -1011,6 +1011,7 @@ impl RenderFile {
                 cmd,
                 crate::intel_gpu_xe_uapi::DEVICE_QUERY
                     | crate::intel_gpu_xe_uapi::GEM_CREATE
+                    | crate::intel_gpu_xe_uapi::EXEC_QUEUE_CREATE
                     | crate::intel_gpu_xe_uapi::VM_BIND
                     | crate::intel_gpu_xe_uapi::EXEC
                     | crate::intel_gpu_xe_uapi::WAIT_USER_FENCE

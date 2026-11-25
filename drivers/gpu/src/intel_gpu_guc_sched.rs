@@ -1387,6 +1387,19 @@ impl<A: BootAllocator> GuCScheduler<A> {
         } else {
             context_image(&image, self.platform, ring.ggtt_offset());
         }
+        // xe_lrc.c XE_LRC_CREATE_RUNALONE: a PXP queue on RCS/CCS below
+        // graphics 20 keeps the EUs to itself. The masked enable joins the
+        // CTX_CONTEXT_CONTROL value after every restore above.
+        if user.as_ref().is_some_and(|claim| claim.run_alone())
+            && (engine == Engine::Rcs0 || engine.is_compute())
+        {
+            const CTX_CTRL_RUN_ALONE: u32 = 1 << 7;
+            let control = image.read32(REGS + 3 * 4);
+            image.write32(
+                REGS + 3 * 4,
+                control | CTX_CTRL_RUN_ALONE << 16 | CTX_CTRL_RUN_ALONE,
+            );
+        }
         // OACTXCONTROL image value (issue #1821): after the image is
         // built — and after any state restore above, which overwrites
         // the REGS page from the claim's snapshot — program the claim's

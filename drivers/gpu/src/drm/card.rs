@@ -2886,6 +2886,13 @@ impl Card {
         if u64::from(pitch) * u64::from(height) > object.size() {
             return Err(CardError::InvalidDimensions);
         }
+        // A PXP-protected object (xe_bo_is_protected; only with
+        // narf.intel.pxp=1): NARF programs no plane decryption, so it never
+        // becomes a framebuffer. Linux decrypts it, or shows black once its
+        // key is stale.
+        if object.pxp_key() != 0 {
+            return Err(CardError::InvalidDimensions);
+        }
         if self.framebuffers.len() >= 4096 {
             return Err(CardError::TooManyFbs);
         }

@@ -42,9 +42,6 @@
 //!   by the queue's list entry.
 //! - xe_pxp_init failing fails the Linux probe; here PXP stays disabled.
 
-// Wired into the GT runtime and the uAPI by the following changes.
-#![allow(dead_code)]
-
 use super::gsc::{check_and_update_pending, emit_header, read_out_header, GscError, HEADER};
 use crate::intel_gpu_aux::MmioWindow;
 use alloc::{
@@ -174,7 +171,11 @@ pub(crate) fn invalidate_stream_key(id: u32) -> [u8; INV_STREAM_KEY_IN] {
         PXP_CMDHDR_EXTDATA_SESSION_VALID
             | (id << PXP_CMDHDR_EXTDATA_SESSION_ID_SHIFT) & PXP_CMDHDR_EXTDATA_SESSION_ID_MASK,
     );
-    put32(&mut message, 12, (INV_STREAM_KEY_IN - PXP_CMD_HEADER) as u32);
+    put32(
+        &mut message,
+        12,
+        (INV_STREAM_KEY_IN - PXP_CMD_HEADER) as u32,
+    );
     message
 }
 
@@ -560,6 +561,7 @@ impl Pxp {
         })
     }
 
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn status(&self) -> Status {
         self.core.lock().status
     }
@@ -591,6 +593,7 @@ impl Pxp {
     }
 
     /// PXP queues on the list (each holds a runtime-PM reference).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn queues(&self) -> usize {
         self.core.lock().queues.len()
     }
@@ -766,8 +769,8 @@ impl Pxp {
                 // Abandoned above: no start ran.
                 Status::StartInProgress => {}
                 // PXP was never used since the last suspend.
-                Status::NeedsTermination
-                    if core.key_instance == core.last_suspend_key_instance => {}
+                Status::NeedsTermination if core.key_instance == core.last_suspend_key_instance => {
+                }
                 Status::NeedsTermination | Status::Active => {
                     core.key_instance = core.key_instance.wrapping_add(1);
                     core.needs_termination_on_resume = true;
@@ -1317,12 +1320,16 @@ impl<C: Client> Engine<C> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 impl Pxp {
-    /// Fixture: publish readiness and drive the status to ACTIVE as a
-    /// completed start would.
+    /// Fixture: publish readiness and settle in ACTIVE, as a completed
+    /// termination and start on a running GT1 would leave it.
     pub(crate) fn activate_for_test(&self) {
         let mut core = self.core.lock();
         core.readiness = Readiness::Ready;
         core.status = Status::Active;
+        core.activation_done = true;
+        core.termination_done = true;
+        core.events = 0;
+        core.live = true;
     }
 }
 

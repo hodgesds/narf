@@ -375,3 +375,230 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe",
     smoke_xe_exec_queue_extensions_follow_linux_check_order
 );
+
+/// A native Xe backend with `xe->pxp` published, as the GT runtime does with
+/// `narf.intel.pxp=1` after xe_pxp_init.
+#[derive(Debug)]
+struct PxpNative {
+    native: Native,
+    pxp: Arc<crate::intel_gpu_gt::media::pxp::Pxp>,
+}
+impl UserBackend for PxpNative {
+    fn status(&self) -> Option<UserStatus> {
+        self.native.status()
+    }
+    fn native_xe(&self) -> bool {
+        true
+    }
+    fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
+        self.native.device_facts()
+    }
+    fn pxp(&self) -> Option<Arc<crate::intel_gpu_gt::media::pxp::Pxp>> {
+        Some(self.pxp.clone())
+    }
+    fn submit<'a>(
+        &'a self,
+        context: Arc<UserContext>,
+        batch: UserBatch,
+    ) -> FsFuture<'a, Arc<CompletionFence>> {
+        self.native.submit(context, batch)
+    }
+}
+
+/// MIT Linux 7.4-rc4 with an enabled PXP: xe_query.c::query_pxp_status
+/// (status 0/1 with BIT(DRM_XE_PXP_TYPE_HWDRM), -EIO for a firmware error),
+/// exec_queue_set_pxp_type + xe_pxp_exec_queue_add (-EBUSY until ready),
+/// gem_create_set_pxp_type + xe_pxp_key_assign, xe_vm_bind_ioctl_validate_bo's
+/// DRM_XE_VM_BIND_FLAG_CHECK_PXP and xe_exec_ioctl's xe_vm_validate_protected
+/// on an object whose key a termination made stale. Linux's -ENOEXEC for a
+/// stale key is EINVAL here (`FsError` carries no ENOEXEC).
+fn smoke_xe_pxp_enabled_queues_objects_and_stale_key_checks() -> TestResult {
+    use crate::intel_gpu_gt::media::pxp::{Pxp, Readiness, Status};
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (mailbox, mut info) = setup(&mut gt, &w, platform);
+    let pxp = Pxp::new();
+    info.backend = Some(Arc::new(PxpNative {
+        native: Native {
+            mailbox,
+            facts: gt.device_facts().unwrap(),
+            media: None,
+        },
+        pxp: pxp.clone(),
+    }));
+    let file = RenderFile::new();
+    let user = Cpu::new();
+
+    // DRM_XE_DEVICE_QUERY_PXP_STATUS: in progress, ready, then -EIO.
+    let status = |user: &Cpu| {
+        let mut query = [0; 40];
+        put32(&mut query, 8, 9);
+        put32(&mut query, 12, 8);
+        put64(&mut query, 16, 4096);
+        user.wire.store(64, &query);
+        user.wire.store(4096, &[0xa5; 8]);
+        let result = invoke(&file, &info, user, xe::DEVICE_QUERY);
+        (result, user.wire.load(4096, 8))
+    };
+    assert_eq!(status(&user), (Ok(0), alloc::vec![0, 0, 0, 0, 2, 0, 0, 0]));
+    pxp.publish(Readiness::Error);
+    assert_eq!(
+        status(&user),
+        (Err(crate::intel_gpu_user::io_error()), alloc::vec![0xa5; 8])
+    );
+    pxp.publish(Readiness::Pending);
+    // Size negotiation and the wrong size are unchanged.
+    let mut query = [0; 40];
+    put32(&mut query, 8, 9);
+    user.wire.store(64, &query);
+    assert_eq!(invoke(&file, &info, &user, xe::DEVICE_QUERY), Ok(0));
+    assert_eq!(u32_at(&user.wire.load(64, 40), 12), 8);
+    put32(&mut query, 12, 16);
+    user.wire.store(64, &query);
+    assert_eq!(
+        invoke(&file, &info, &user, xe::DEVICE_QUERY),
+        Err(FsError::InvalidData)
+    );
+
+    let vm = create_vm(&file, &info, &user);
+    let queue = |class: u8, extensions: u64| {
+        user.wire.store(512, &[class, 0, 0, 0, 0, 0, 0, 0]);
+        let mut wire = [0; 48];
+        put64(&mut wire, 0, extensions);
+        put32(&mut wire, 8, 0x00010001);
+        put32(&mut wire, 12, vm);
+        put64(&mut wire, 24, 512);
+        user.wire.store(64, &wire);
+        let result = invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE);
+        (result, u32_at(&user.wire.load(64, 48), 20))
+    };
+    // Not ready: HWDRM is -EBUSY and publishes nothing; NONE still works.
+    pxp_extension(&user, 8192, 0, 0, 2, 1);
+    assert_eq!(queue(0, 8192), (Err(FsError::Busy), 0));
+    pxp_extension(&user, 8192, 0, 0, 2, 0);
+    let (result, plain) = queue(0, 8192);
+    assert_eq!(result, Ok(0));
+    assert_ne!(plain, 0);
+    assert_eq!(pxp.queues(), 0);
+    // Any other session type is still -EINVAL.
+    pxp_extension(&user, 8192, 0, 0, 2, 2);
+    assert_eq!(queue(0, 8192), (Err(FsError::InvalidData), 0));
+    // An error state is -EIO.
+    pxp.publish(Readiness::Error);
+    pxp_extension(&user, 8192, 0, 0, 2, 1);
+    assert_eq!(queue(0, 8192), (Err(crate::intel_gpu_user::io_error()), 0));
+
+    // Active: RCS0 (run alone) and BCS0 PXP queues join the list; a NONE
+    // after HWDRM keeps the queue protected.
+    pxp.activate_for_test();
+    assert_eq!(status(&user), (Ok(0), alloc::vec![1, 0, 0, 0, 2, 0, 0, 0]));
+    pxp_extension(&user, 8192, 8256, 0, 2, 1);
+    pxp_extension(&user, 8256, 0, 0, 2, 0);
+    let (result, render) = queue(0, 8192);
+    assert_eq!(result, Ok(0));
+    assert_ne!(render, 0);
+    assert_eq!(pxp.queues(), 1);
+    // Through the waiting path native Xe files take.
+    user.wire.store(512, &[1, 0, 0, 0, 0, 0, 0, 0]);
+    let mut wire = [0; 48];
+    put64(&mut wire, 0, 8192);
+    put32(&mut wire, 8, 0x00010001);
+    put32(&mut wire, 12, vm);
+    put64(&mut wire, 24, 512);
+    user.wire.store(64, &wire);
+    assert_eq!(
+        narf_scheduler::block_on_spin(file.dispatch_user(&info, xe::EXEC_QUEUE_CREATE, 64, &user)),
+        Some(Ok(0))
+    );
+    let copy = u32_at(&user.wire.load(64, 48), 20);
+    assert_ne!(copy, 0);
+    assert_eq!(pxp.queues(), 2);
+    // xe_exec_queue_destroy takes the queue off the list.
+    assert_eq!(
+        close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, copy),
+        Ok(0)
+    );
+    assert_eq!(pxp.queues(), 1);
+
+    // GEM_CREATE: HWDRM marks the object with the current key, NONE not.
+    let gem = |extensions: u64| {
+        let mut wire = [0; 56];
+        put64(&mut wire, 0, extensions);
+        put64(&mut wire, 8, 4096);
+        put32(&mut wire, 16, 1);
+        wire[32] = 1;
+        user.wire.store(64, &wire);
+        let result = invoke(&file, &info, &user, xe::GEM_CREATE);
+        (result, u32_at(&user.wire.load(64, 56), 28))
+    };
+    pxp_extension(&user, 8192, 0, 0, 0, 1);
+    let (result, stale) = gem(8192);
+    assert_eq!(result, Ok(0));
+    assert_eq!(file.gem.object(stale).unwrap().pxp_key(), 1);
+    pxp_extension(&user, 8192, 0, 0, 0, 0);
+    let (result, clear) = gem(8192);
+    assert_eq!(result, Ok(0));
+    assert_eq!(file.gem.object(clear).unwrap().pxp_key(), 0);
+    // A value other than NONE/HWDRM is still -EINVAL.
+    pxp_extension(&user, 8192, 0, 0, 0, 2);
+    assert_eq!(gem(8192), (Err(FsError::InvalidData), 0));
+
+    // VM_BIND with CHECK_PXP maps a protected object while its key is current.
+    let pat = batch_pat(platform);
+    bind_wire(&user, vm, &[mapping(stale, 0x10_0000, 0, 4096, pat, 0x10)], &[]);
+    assert_eq!(bind_now(&file, &info, &user), Ok(0));
+
+    // A termination (here xe_pxp_pm_suspend) kills the PXP queues and moves
+    // the key on; the session is started again later.
+    pxp.suspend();
+    pxp.resume(true);
+    assert_eq!(pxp.status(), Status::TerminationInProgress);
+    pxp.activate_for_test();
+    assert_eq!(pxp.queues(), 0);
+    assert_eq!(pxp.key_assign(), 2);
+    // The stale object no longer maps with CHECK_PXP; without it, and for an
+    // unprotected object, the bind is unaffected.
+    bind_wire(&user, vm, &[mapping(stale, 0x20_0000, 0, 4096, pat, 0x10)], &[]);
+    assert_eq!(bind_now(&file, &info, &user), Err(FsError::InvalidData));
+    bind_wire(&user, vm, &[mapping(clear, 0x30_0000, 0, 4096, pat, 0x10)], &[]);
+    assert_eq!(bind_now(&file, &info, &user), Ok(0));
+    pxp_extension(&user, 8192, 0, 0, 0, 1);
+    let (result, fresh) = gem(8192);
+    assert_eq!(result, Ok(0));
+    assert_eq!(file.gem.object(fresh).unwrap().pxp_key(), 2);
+    bind_wire(&user, vm, &[mapping(fresh, 0x40_0000, 0, 4096, pat, 0x10)], &[]);
+    assert_eq!(bind_now(&file, &info, &user), Ok(0));
+
+    // The killed queue is -ECANCELED; a new PXP queue on the same VM refuses
+    // to run while the VM still maps the stale object; a plain queue runs
+    // the same VM's checks without PXP's.
+    exec_wire(&user, render, false, &[]);
+    assert_eq!(
+        narf_scheduler::block_on_spin(file.dispatch_user(&info, xe::EXEC, 64, &user)),
+        Some(Err(FsError::Canceled))
+    );
+    pxp_extension(&user, 8192, 0, 0, 2, 1);
+    let (result, protected) = queue(0, 8192);
+    assert_eq!(result, Ok(0));
+    exec_wire(&user, protected, false, &[]);
+    assert_eq!(
+        narf_scheduler::block_on_spin(file.dispatch_user(&info, xe::EXEC, 64, &user)),
+        Some(Err(FsError::InvalidData))
+    );
+    assert_eq!(close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, protected), Ok(0));
+    assert_eq!(close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, render), Ok(0));
+    assert_eq!(close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, plain), Ok(0));
+    assert_eq!(pxp.queues(), 0);
+
+    drop(file);
+    drop(info);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_xe_pxp_enabled_queues_objects_and_stale_key_checks
+);

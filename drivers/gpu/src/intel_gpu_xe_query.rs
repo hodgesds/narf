@@ -52,6 +52,20 @@ pub(crate) async fn query_user(
             return user.write(data, &reply);
         }
     }
+    // xe_pxp_get_readiness_status holds a runtime-PM reference over its
+    // register checks: a PXP status query resumes the function, and the
+    // status reflects GT1 once the worker observed it again.
+    if u32_at(&wire, 8) == 9
+        && u32_at(&wire, 12) == 8
+        && wire[..8].iter().chain(&wire[24..40]).all(|byte| *byte == 0)
+    {
+        if let Some(backend) = info.backend.as_ref() {
+            if backend.pxp().is_some_and(|pxp| pxp.readiness().is_ok()) {
+                let _awake = backend.pxp_wakeref().await.ok();
+                return query_wire(info, address, user, &wire);
+            }
+        }
+    }
     if u32_at(&wire, 8) != 6 || u32_at(&wire, 12) == 0 {
         return query_wire(info, address, user, &wire);
     }
@@ -320,18 +334,33 @@ fn query_wire(
         // query_oa_units: zero units unless the OAG owner is published.
         8 => crate::intel_gpu_oa::query(info.backend.as_ref().and_then(|b| b.oa_device())),
         // xe_query.c::query_pxp_status: size negotiation, an exact
-        // drm_xe_query_pxp_status size, then xe_pxp_get_readiness_status,
-        // which is -ENODEV while xe->pxp is NULL. PXP needs the GSC proxy's
-        // MEI component (xe_pxp_is_supported), which NARF does not have.
+        // drm_xe_query_pxp_status size, then xe_pxp_get_readiness_status:
+        // -ENODEV while xe->pxp is NULL (no `narf.intel.pxp=1`, or
+        // xe_pxp_init did not run), -EIO for a GSC/HuC error state, else the
+        // status 0 or 1 with BIT(DRM_XE_PXP_TYPE_HWDRM) supported.
         9 => {
             let size = u32_at(wire, 12);
             if size != 0 {
                 if size != 8 {
                     return Err(FsError::InvalidData);
                 }
-                return Err(FsError::NoDevice);
+                let pxp = info
+                    .backend
+                    .as_ref()
+                    .and_then(|backend| backend.pxp())
+                    .ok_or(FsError::NoDevice)?;
+                let status = pxp.readiness().map_err(|error| error.fs())?;
+                let mut reply = vec![0; 8];
+                put32(&mut reply, 0, status);
+                put32(
+                    &mut reply,
+                    4,
+                    crate::intel_gpu_gt::media::pxp::SUPPORTED_SESSION_TYPES,
+                );
+                reply
+            } else {
+                vec![0; 8]
             }
-            vec![0; 8]
         }
         10 => crate::intel_gpu_eu_stall::query(
             info.backend
