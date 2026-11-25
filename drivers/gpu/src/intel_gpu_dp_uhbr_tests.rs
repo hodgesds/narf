@@ -298,10 +298,7 @@ fn smoke_uhbr_training_failures_leave_tps2_and_disable() -> TestResult {
         .count();
     if result != Err(TrainError::Link(TrainFailure::IntraHop))
         || reads != 1002
-        || log
-            .borrow()
-            .iter()
-            .any(|e| *e == Ev::Pattern(SourcePattern::Tps1))
+        || log.borrow().contains(&Ev::Pattern(SourcePattern::Tps1))
         || !tail(&log)
     {
         return TestResult::Fail("a stuck intra-hop must fail before TPS1, ending at TPS2");
