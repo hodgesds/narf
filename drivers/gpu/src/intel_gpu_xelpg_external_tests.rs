@@ -4643,6 +4643,118 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_fallback_to_8b10b_or_none
 );
 
+/// DSC over 128b/132b SST (Linux 7.4 `intel_dp_dsc_compute_config` with
+/// `intel_dp_mtp_tu_compute_config(dsc)`): a one-lane DP 2.0 sink (HBR2,
+/// UHBR10) with the monitor's DSC caps and a 3840x2160 594 MHz stream that
+/// fits nothing uncompressed (UHBR10 x1 carries 1208875 kBps; 24 and 18 bpp
+/// need 1782000 and 1336500). The compressed bpp walks down from 383/16:
+/// HBR2 x1 would need below 8 bpp with FEC; UHBR10 x1 first fits at 259/16
+/// bpp with two slices (the 340000 kP/s throughput floor), 64 slots,
+/// `DATA_M` = `TU_SIZE(64)` | 0x7fe2e3 at the slice-aware MST overhead of
+/// 1004891 ppm. The route enables the sink's decompression with no
+/// `DP_FEC_READY` and no `DP_TP_CTL` FEC (implicit on 128b/132b), runs both
+/// VDSC engines, and turns decompression off at the stop.
+fn smoke_mtl_external_uhbr_dsc_route_without_fec() -> TestResult {
+    use crate::intel_gpu_pipes::{
+        PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET,
+    };
+    let mut sink = Sink::dp20(0x14, edid_uhd(594_000), uhbr::DP_UHBR10);
+    sink.caps[2] = 1 | 0x40 | 0x80;
+    sink.dsc = MONITOR_DSC;
+    sink.fec_cap = dsc::DP_FEC_CAPABLE;
+    sink.ffe_request = [4, 0, 0, 0];
+    let io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let probe = match probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) {
+        Ok(probe) => probe,
+        Err(e) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "UHBR DSC probe: {e:?}");
+            return TestResult::Fail("the DSC DP 2.0 sink must probe with UHBR on");
+        }
+    };
+    let mn = [(63 << 25) | 0x7f_e2e3, 0x80_0000, 0xf_34d6, 0x8_0000];
+    match (probe.dsc, probe.uhbr.as_deref()) {
+        (Some(d), Some(u))
+            if d.link_rate == 1_000_000
+                && d.lanes == 1
+                && d.compressed_bpp_x16 == 259
+                && d.slice_count == 2
+                && d.num_streams == 2
+                && !d.fec
+                && d.pipe_bpp == 24
+                && u.link
+                    == (uhbr::UhbrLink {
+                        rate: uhbr::UhbrRate::Uhbr10,
+                        lanes: 1,
+                        pipe_bpp: 24,
+                    })
+                && u.stream.tu == 64
+                && u.stream.m_n == mn => {}
+        _ => return TestResult::Fail("the probe must compress over UHBR10 x1 at 259/16 bpp"),
+    }
+    let dss = probe.dsc.map(|d| d.dss_ctl()).unwrap_or_default();
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the compressed 128b/132b route must light"),
+    };
+    {
+        let sink = io.sink.borrow();
+        if !sink.dsc_log.contains(&(dsc::DP_DSC_ENABLE, dsc::DP_DECOMPRESSION_EN))
+            || sink
+                .dsc_log
+                .iter()
+                .any(|&(a, _)| a == dsc::DP_FEC_CONFIGURATION)
+        {
+            return TestResult::Fail("decompression on, and no DP_FEC_READY on 128b/132b");
+        }
+    }
+    if io
+        .writes_to(DP_TP_CTL_B)
+        .iter()
+        .any(|v| v & dsc::DP_TP_CTL_FEC_ENABLE != 0)
+    {
+        return TestResult::Fail("DP_TP_CTL must not enable FEC on 128b/132b");
+    }
+    let base = Transcoder::B.base();
+    let got = [
+        io.read32(base + PIPE_DATA_M1_OFFSET),
+        io.read32(base + PIPE_DATA_N1_OFFSET),
+        io.read32(base + PIPE_LINK_M1_OFFSET),
+        io.read32(base + PIPE_LINK_N1_OFFSET),
+    ];
+    if got != mn
+        || io.read32(dsc::dss_ctl1(Pipe::B)) != dss.0
+        || io.read32(dsc::dss_ctl2(Pipe::B)) != dss.1
+        || dss.1 & (dsc::VDSC0_ENABLE | dsc::VDSC1_ENABLE)
+            != dsc::VDSC0_ENABLE | dsc::VDSC1_ENABLE
+    {
+        return TestResult::Fail("the compressed MTP M/N and both VDSC engines must be live");
+    }
+    if route.stop(&io).is_err() || route.release(&io).is_err() {
+        return TestResult::Fail("the compressed 128b/132b route must stop and release");
+    }
+    let sink = io.sink.borrow();
+    let on = sink
+        .dsc_log
+        .iter()
+        .position(|&e| e == (dsc::DP_DSC_ENABLE, dsc::DP_DECOMPRESSION_EN));
+    let off = sink
+        .dsc_log
+        .iter()
+        .rposition(|&e| e == (dsc::DP_DSC_ENABLE, 0));
+    if !matches!((on, off), (Some(a), Some(b)) if a < b) {
+        return TestResult::Fail("stop: the sink's decompression off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_dsc_route_without_fec
+);
+
 /// The 128b/132b route through one 128b/132b LTTPR (`DP_PHY_REPEATER_CNT`
 /// 0x80, revision 2.0, UHBR10/20, a 20 ms extended wait request):
 /// `mtl_ddi_pre_enable_dp` switches it non-transparent (0x55, 0xaa) and
@@ -4906,9 +5018,9 @@ impl crate::dp_aux::AuxChannel for Dpcd {
     }
 }
 
-/// The typed refusals of `plan_uhbr` (nothing programmed): a stream only
-/// DSC could carry with UHBR in the common rates (Linux's DSC search would
-/// consider them), UHBR over display-14 Thunderbolt alt mode; an LTTPR that
+/// What `plan_uhbr` decides (nothing programmed): a stream only DSC carries
+/// compresses over UHBR (a branch device refuses), UHBR over display-14
+/// Thunderbolt alt mode is refused typed; an LTTPR that
 /// masks the rates to UHBR10; and what keeps the 8b/10b negotiation: no common UHBR rate, a C10 PHY or
 /// Wildcat Lake as the source, a DSC-less sink nothing fits.
 fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
@@ -4939,8 +5051,44 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
         ..uhd60
     };
     let dp_alt = link(DisplayIp::Xelpdp, TcMode::DpAlt);
-    let refusal = |r| Err::<Option<UhbrPlan>, _>(ExternalError::Uhbr(r));
-    // 4K120 fits neither HBR2 x2 nor UHBR10 x2 at 18 bpp: DSC territory.
+    let refusal = |r| Err::<Option<UhbrChoice>, _>(ExternalError::Uhbr(r));
+    // 4K120 fits neither HBR2 x2 nor UHBR10 x2 at 18 bpp: Linux 7.4's DSC
+    // search walks the compressed bpp down (four slices: the 340000 kP/s
+    // slice throughput; display 14's DPT limit is 17 bpp on UHBR10) and
+    // lands on UHBR10 x2 at 258/16 bpp, 64 slots (8b/10b HBR2 x2 would need
+    // 113/16 bpp, below the 8 bpp minimum).
+    let monitor = dsc::DpDscSink {
+        dsc: dsc::DscSink {
+            dpcd: dsc::DscDpcd(MONITOR_DSC),
+            is_edp: false,
+            fec_capable: true,
+        },
+        branch: false,
+    };
+    match plan_uhbr(
+        &mut rates(uhbr::DP_UHBR10),
+        &dp_alt,
+        false,
+        &limits,
+        &uhd120,
+        24,
+        Some(&monitor),
+    ) {
+        Ok(Some(c))
+            if c.dsc.is_some_and(|d| {
+                d.link_rate == 1_000_000
+                    && d.lanes == 2
+                    && !d.fec
+                    && d.compressed_bpp_x16 == 258
+                    && d.slice_count == 4
+            }) && c.plan.stream.tu == 64
+                && c.plan.link.lanes == 2 => {}
+        _ => return TestResult::Fail("4K120 must compress over UHBR10 x2 at 258/16 bpp"),
+    }
+    let branch = dsc::DpDscSink {
+        branch: true,
+        ..monitor
+    };
     if plan_uhbr(
         &mut rates(uhbr::DP_UHBR10),
         &dp_alt,
@@ -4948,8 +5096,8 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
         &limits,
         &uhd120,
         24,
-        true,
-    ) != refusal(uhbr::UhbrRefusal::Dsc)
+        Some(&branch),
+    ) != Err(ExternalError::Dsc(DscRefusal::BranchDevice))
         || plan_uhbr(
             &mut rates(uhbr::DP_UHBR10),
             &dp_alt,
@@ -4957,10 +5105,10 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
             &limits,
             &uhd120,
             24,
-            false,
+            None,
         ) != Ok(None)
     {
-        return TestResult::Fail("DSC over a UHBR common rate must refuse typed");
+        return TestResult::Fail("a branch device refuses, a DSC-less sink keeps 8b/10b");
     }
     let tbt = link(DisplayIp::Xelpdp, TcMode::TbtAlt);
     if plan_uhbr(
@@ -4970,7 +5118,7 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
         &limits,
         &uhd60,
         24,
-        false,
+        None,
     ) != refusal(uhbr::UhbrRefusal::Tbt)
     {
         return TestResult::Fail("UHBR over Thunderbolt alt mode must refuse typed");
@@ -4983,8 +5131,8 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
         lttpr.0.push((uhbr::DP_LTTPR_COMMON_CAPS + i as u32, b));
     }
     // Through a 128b/132b LTTPR (UHBR10 only): UHBR10 x2.
-    match plan_uhbr(&mut lttpr, &dp_alt, false, &limits, &uhd60, 24, false) {
-        Ok(Some(plan)) if plan.link.rate == uhbr::UhbrRate::Uhbr10 && plan.link.lanes == 2 => {}
+    match plan_uhbr(&mut lttpr, &dp_alt, false, &limits, &uhd60, 24, None) {
+        Ok(Some(c)) if c.plan.link.rate == uhbr::UhbrRate::Uhbr10 && c.plan.link.lanes == 2 => {}
         _ => return TestResult::Fail("an LTTPR masks the rates and keeps UHBR10 x2"),
     }
     // What leaves the 8b/10b route alone.
@@ -4996,7 +5144,7 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
         &limits,
         &uhd60,
         24,
-        false,
+        None,
     ) != Ok(None)
         || plan_uhbr(
             &mut rates(uhbr::DP_UHBR10),
@@ -5005,7 +5153,7 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
             &limits,
             &uhd60,
             24,
-            false,
+            None,
         ) != Ok(None)
         || plan_uhbr(
             &mut rates(uhbr::DP_UHBR10),
@@ -5014,7 +5162,7 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
             &limits,
             &uhd60,
             24,
-            false,
+            None,
         ) != Ok(None)
     {
         return TestResult::Fail("no common UHBR rate, a C10 or WCL source keeps 8b/10b");
@@ -5026,9 +5174,9 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
         &limits,
         &uhd60,
         24,
-        false,
+        None,
     ) {
-        Ok(Some(plan)) if plan.link.rate == uhbr::UhbrRate::Uhbr20 && plan.link.lanes == 1 => {}
+        Ok(Some(c)) if c.plan.link.rate == uhbr::UhbrRate::Uhbr20 && c.plan.link.lanes == 1 => {}
         _ => return TestResult::Fail("a UHBR20-only sink takes UHBR20 x1"),
     }
     TestResult::Pass

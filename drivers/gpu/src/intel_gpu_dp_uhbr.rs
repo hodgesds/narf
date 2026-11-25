@@ -52,10 +52,14 @@
 //!   `intel_dp_compute_link_config_wide` over what is still allowed
 //!   ([`wide_search`]), which may land on 8b/10b.
 //!
+//! - **DSC** ([`dsc_mtp_tu`]): Linux 7.4's `dsc_compute_link_config` with
+//!   the 128b/132b configurations (`intel_dp_mtp_tu_compute_config` with
+//!   DSC: slice-aware overhead, implicit FEC, the display-14 DPT limit),
+//!   through `crate::intel_gpu_xelpg_dsc::compute_with`.
+//!
 //! Not implemented, refused typed ([`UhbrRefusal`]) instead of running a
-//! link Linux would not: 128b/132b MST, DSC on a link whose common rates
-//! include UHBR, and Thunderbolt-alt UHBR on display 14/20 (no TBT UHBR
-//! clock select).
+//! link Linux would not: 128b/132b MST, and Thunderbolt-alt UHBR on display
+//! 14/20 (no TBT UHBR clock select).
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_modeset::Mode;
@@ -507,23 +511,57 @@ pub fn max_link_data_rate(rate: UhbrRate, lanes: u32) -> u64 {
     u64::from(rate.link_rate()) * 10 * u64::from(lanes) * 967_100 / (1_000_000 * 8)
 }
 
-/// `drm_dp_bw_overhead` for an uncompressed 128b/132b stream (32-bit
-/// symbols; MST alignment of the symbol cycles to `4 / lanes` when `mst`,
-/// as `intel_dp_mtp_tu_compute_config` asks), at least 100%. ppm.
-fn bw_overhead(lanes: u32, hactive: u32, bpp_x16: u32, mst: bool) -> u64 {
+/// `drm_dp_link_symbol_cycles` with 32-bit symbols: per slice
+/// (`dsc_slices`, 0 for an uncompressed stream) the data symbol cycles of
+/// its pixels (`drm_dp_link_data_symbol_cycles`, aligned to `4 / lanes`
+/// when `mst`) and, compressed, one EOC cycle (`4 / lanes` when `mst`).
+pub fn symbol_cycles(lanes: u32, pixels: u32, dsc_slices: u32, bpp_x16: u32, mst: bool) -> u64 {
+    let slices = dsc_slices.max(1);
+    let slice_pixels = pixels.div_ceil(slices);
+    let align = if mst { u64::from(4 / lanes) } else { 1 };
+    let data =
+        (u64::from(slice_pixels) * u64::from(bpp_x16)).div_ceil(16 * 32 * u64::from(lanes));
+    let data = data.div_ceil(align) * align;
+    let eoc = if dsc_slices == 0 {
+        0
+    } else if mst {
+        u64::from(4 / lanes)
+    } else {
+        1
+    };
+    u64::from(slices) * (data + eoc)
+}
+
+/// `intel_dp_link_bw_overhead` on 128b/132b (`DRM_DP_BW_OVERHEAD_UHBR`):
+/// `drm_dp_bw_overhead` with the MST symbol alignment when `mst` (as
+/// `intel_dp_mtp_tu_compute_config` asks, SST included), the 0.6% SSC /
+/// reference clock margin when `ssc` (the remote PBN of an MST stream) and
+/// the DSC slices, at least 100%. ppm.
+pub fn bw_overhead_with(
+    lanes: u32,
+    hactive: u32,
+    dsc_slices: u32,
+    bpp_x16: u32,
+    mst: bool,
+    ssc: bool,
+) -> u64 {
     if lanes == 0 || hactive == 0 || bpp_x16 == 0 {
         return 0;
     }
-    let cycles = (u64::from(hactive) * u64::from(bpp_x16)).div_ceil(16 * 32 * u64::from(lanes));
-    let align = if mst { u64::from(4 / lanes) } else { 1 };
-    let cycles = cycles.div_ceil(align) * align;
-    let overhead = (cycles * 32 * u64::from(lanes) * 1_000_000 * 16)
+    let base: u64 = if ssc { 1_006_000 } else { 1_000_000 };
+    let cycles = symbol_cycles(lanes, hactive, dsc_slices, bpp_x16, mst);
+    let overhead = (cycles * 32 * u64::from(lanes) * base * 16)
         .div_ceil(u64::from(hactive) * u64::from(bpp_x16));
     overhead.max(1_000_000)
 }
 
+/// [`bw_overhead_with`] for an uncompressed stream without SSC.
+fn bw_overhead(lanes: u32, hactive: u32, bpp_x16: u32, mst: bool) -> u64 {
+    bw_overhead_with(lanes, hactive, 0, bpp_x16, mst, false)
+}
+
 /// `intel_dp_effective_data_rate`, kBps.
-fn effective_data_rate(pixel_clock: u32, bpp_x16: u32, overhead: u64) -> u64 {
+pub fn effective_data_rate(pixel_clock: u32, bpp_x16: u32, overhead: u64) -> u64 {
     (u64::from(pixel_clock) * u64::from(bpp_x16) * overhead).div_ceil(1_000_000 * 16 * 8)
 }
 
@@ -853,15 +891,47 @@ pub struct UhbrStream {
 /// aligned to `4 / lanes`; `None` when it exceeds the 64 slots (Linux then
 /// needs DSC).
 pub fn mtp_tu(link: &UhbrLink, mode: &Mode) -> Option<UhbrStream> {
-    let lanes = u32::from(link.lanes);
+    mtp(link.rate, link.lanes, mode, link.pipe_bpp * 16, 0)
+}
+
+/// `intel_dp_mtp_tu_compute_config(dsc = true)` for a 128b/132b SST stream
+/// compressed to `bpp_x16` in `dsc_slices` slices: no FEC
+/// (`intel_dp_needs_8b10b_fec`), display 14's DSC->DPT interface limit
+/// (`intel_dp_mst_max_dpt_bpp`: `symbol_clock * 72 * 96.71% / (pixel clock *
+/// 103%)` whole bpp, which a `display14` port checks; display 20+ has none),
+/// then the MTP of [`mtp_tu`] with the slice-aware overhead. `None` without
+/// a slice count, past the DPT limit or past 64 slots.
+pub fn dsc_mtp_tu(
+    rate: UhbrRate,
+    lanes: u8,
+    mode: &Mode,
+    bpp_x16: u32,
+    dsc_slices: u8,
+    display14: bool,
+) -> Option<UhbrStream> {
+    if dsc_slices == 0 {
+        return None;
+    }
+    if display14 {
+        let dpt = u64::from(rate.symbol_clock_khz()) * 72 * 967_100
+            / (u64::from(mode.pixel_clock_khz) * 1_030_000).max(1);
+        if dpt != 0 && u64::from(bpp_x16) > dpt * 16 {
+            return None;
+        }
+    }
+    mtp(rate, lanes, mode, bpp_x16, u32::from(dsc_slices))
+}
+
+/// The MTP time slots and M/N of `intel_dp_mtp_tu_compute_config` for SST.
+fn mtp(rate: UhbrRate, lanes: u8, mode: &Mode, bpp_x16: u32, dsc_slices: u32) -> Option<UhbrStream> {
+    let lanes = u32::from(lanes);
     if !matches!(lanes, 1 | 2 | 4) {
         return None;
     }
-    let bpp_x16 = link.pipe_bpp * 16;
     let clock = mode.pixel_clock_khz;
-    let overhead = bw_overhead(lanes, u32::from(mode.h_active), bpp_x16, true);
+    let overhead = bw_overhead_with(lanes, u32::from(mode.h_active), dsc_slices, bpp_x16, true, false);
     let data_m = effective_data_rate(clock, bpp_x16, overhead);
-    let data_n = max_link_data_rate(link.rate, lanes);
+    let data_n = max_link_data_rate(rate, lanes);
     if data_n == 0 {
         return None;
     }
@@ -873,7 +943,7 @@ pub fn mtp_tu(link: &UhbrLink, mode: &Mode) -> Option<UhbrStream> {
     let (dm, dn) = compute_m_n(data_m, data_n, 0x800_0000);
     let (lm, ln) = compute_m_n(
         u64::from(clock),
-        u64::from(link.rate.symbol_clock_khz()),
+        u64::from(rate.symbol_clock_khz()),
         0x8_0000,
     );
     Some(UhbrStream {
@@ -887,11 +957,19 @@ pub fn mtp_tu(link: &UhbrLink, mode: &Mode) -> Option<UhbrStream> {
 /// fixed four-lane count, at least the 3 of BS/VBID/BE, minus 2 for the
 /// framing, at most the 3 the spec recommends.
 pub fn min_hblank(mode: &Mode, pipe_bpp: u32) -> u32 {
+    min_hblank_link(mode, pipe_bpp * 16, 0)
+}
+
+/// [`min_hblank`] for any 128b/132b stream: the link bpp (the compressed
+/// bpp under DSC) and the DSC slice count (`drm_dp_link_symbol_cycles` at
+/// four lanes; SST and MST agree there: the MST alignment and EOC are one
+/// cycle).
+pub fn min_hblank_link(mode: &Mode, link_bpp_x16: u32, dsc_slices: u8) -> u32 {
     let (hactive, htotal) = (u64::from(mode.h_active), u64::from(mode.h_total));
-    if hactive == 0 {
+    if hactive == 0 || link_bpp_x16 == 0 {
         return 0;
     }
-    let active = (hactive * u64::from(pipe_bpp * 16)).div_ceil(16 * 32 * 4);
+    let active = symbol_cycles(4, mode.h_active.into(), dsc_slices.into(), link_bpp_x16, false);
     let total = htotal * active / hactive;
     let blank = total.saturating_sub(active).max(3) - 2;
     blank.min(3) as u32
@@ -1337,13 +1415,6 @@ pub enum UhbrRefusal {
     /// SST payload, and each stream's `TRANS_DP2_CTL`, VFREQ and
     /// 128b/132b function on the master's MST transport.
     Mst,
-    /// The stream needs DSC and the common rates include UHBR: Linux's DSC
-    /// search would consider them (`dsc_compute_link_config` with
-    /// `intel_dp_mtp_tu_compute_config(dsc)`: slice-aware 32-bit symbol
-    /// overhead, implicit FEC, the display-14 DPT bpp limit). The
-    /// display-14 DSC search predates Linux 7.4's slice-aware one, so DSC
-    /// over 128b/132b is not implemented.
-    Dsc,
     /// The stream needs UHBR over Thunderbolt alt mode on display 14 or 20:
     /// `intel_mtl_tbt_clock_select` has no UHBR10/20 select below display
     /// 30 (Linux WARNs and programs the 162 MHz one).

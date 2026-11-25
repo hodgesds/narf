@@ -946,3 +946,49 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dp_uhbr",
     smoke_uhbr_link_caps_fallback_orders
 );
+
+/// `intel_dp_mtp_tu_compute_config(dsc = true)` for 128b/132b SST, from
+/// Linux 7.4's `drm_dp_bw_overhead` with DSC slices (per slice the MST-aligned
+/// data symbol cycles plus one EOC cycle of `4 / lanes`):
+///
+/// - 3840x2160 at 594 MHz on UHBR10 x1 in two slices: 259/16 bpp takes all
+///   64 slots (`DATA_M` = `TU_SIZE(64)` | 0x7fe2e3), 260/16 needs 65;
+/// - 4K120 (1188 MHz) on UHBR10 x4 in four slices at 383/16 bpp fits 48
+///   slots (`DATA_M` = `TU_SIZE(48)` | 0x5eddd2) but exceeds display 14's
+///   DSC->DPT limit (`312500 * 72 * 96.71% / (1188000 * 103%)` = 17 bpp);
+///   272/16 (17 bpp) passes it with 34 slots (`TU_SIZE(34)` | 0x439caa,
+///   the overhead 1011765 ppm);
+/// - no slice count, no MTP.
+fn smoke_uhbr_dsc_mtp_slices_and_dpt_limit() -> TestResult {
+    let uhd60 = mode(594_000, 3840, 4400, 2160, 2250);
+    let uhd120 = mode(1_188_000, 3840, 4400, 2160, 2250);
+    let r = UhbrRate::Uhbr10;
+    match dsc_mtp_tu(r, 1, &uhd60, 259, 2, true) {
+        Some(s) if s.tu == 64 && s.m_n == [(63 << 25) | 0x7f_e2e3, 0x80_0000, 0xf_34d6, 0x8_0000] => {}
+        _ => return TestResult::Fail("259/16 bpp on UHBR10 x1 takes the 64 slots"),
+    }
+    if dsc_mtp_tu(r, 1, &uhd60, 260, 2, true).is_some() {
+        return TestResult::Fail("260/16 bpp needs 65 slots");
+    }
+    match dsc_mtp_tu(r, 4, &uhd120, 383, 4, false) {
+        Some(s) if s.tu == 48 && s.m_n[0] == (47 << 25) | 0x5e_ddd2 => {}
+        _ => return TestResult::Fail("display 20+ has no DPT limit: 48 slots"),
+    }
+    if dsc_mtp_tu(r, 4, &uhd120, 383, 4, true).is_some() {
+        return TestResult::Fail("display 14's DPT limit caps the compressed bpp at 17");
+    }
+    match dsc_mtp_tu(r, 4, &uhd120, 272, 4, true) {
+        Some(s) if s.tu == 34 && s.m_n[0] == (33 << 25) | 0x43_9caa && s.m_n[2] == 0x1e_69ad => {}
+        _ => return TestResult::Fail("17 bpp passes the DPT limit with 34 slots"),
+    }
+    if bw_overhead_with(4, 3840, 4, 272, true, false) != 1_011_765
+        || dsc_mtp_tu(r, 1, &uhd60, 259, 0, true).is_some()
+    {
+        return TestResult::Fail("the slice-aware overhead or the slice-count rule differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_dsc_mtp_slices_and_dpt_limit
+);
