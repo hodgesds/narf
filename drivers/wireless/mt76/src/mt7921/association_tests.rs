@@ -597,3 +597,204 @@ kernel_test_in!(
     "drivers/wireless/mt7921/association",
     mt76_uni_bss_record_per_link
 );
+
+/// HT Capabilities (45) + HT Operation (61), copied from
+/// `ht20_tests::elements` (that module is private to `ht20.rs`).
+fn ht_elements(channel: u8) -> Vec<u8> {
+    let mut ht = [0; 26];
+    ht[0] = 0x77;
+    ht[2] = 30;
+    ht[3] = 0xff;
+    ht[4] = 0xff;
+    let mut operation = [0; 22];
+    operation[0] = channel;
+    operation[1] = 5;
+    operation[6] = 0xff;
+    let mut bytes = vec![45, 26];
+    bytes.extend_from_slice(&ht);
+    bytes.extend_from_slice(&[61, 22]);
+    bytes.extend_from_slice(&operation);
+    bytes
+}
+
+/// Walk the TLV stream in `body` starting at `start` (`len` is the
+/// total TLV size, header included — the same walk as
+/// `vht_tests::record`).
+fn find_tlv(body: &[u8], start: usize, tag: u16) -> Option<&[u8]> {
+    let mut offset = start;
+    while let Some(header) = body.get(offset..offset + 4) {
+        let len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if len < 4 {
+            return None;
+        }
+        let tlv = body.get(offset..offset + len)?;
+        if header[..2] == tag.to_le_bytes() {
+            return Some(tlv);
+        }
+        offset += len;
+    }
+    None
+}
+
+fn mt76_uni_station_join_caps_mirror() -> TestResult {
+    // HT-only open BSS: the UNI station update must carry the same
+    // HT + HW_AMSDU TLV bytes as the CONNAC2 peer record, and no
+    // EHT TLV (no EHT negotiated) and no WTBL TLV (no WTBL nesting
+    // on UNI).
+    let mut ies = bss(false).information_elements;
+    ies.extend_from_slice(&ht_elements(6));
+    let bss = ScanBss {
+        information_elements: ies,
+        ..bss(false)
+    };
+    let mut plan = JoinPlan::prepare(&bss, OWN, b"narf", Security::Open).unwrap();
+    plan.start_authentication().unwrap();
+    plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
+        .unwrap();
+    let mut body = vec![1, 0, 0, 0, 42, 0xc0, 1, 4, 0x82, 0x84, 0x8b, 0x96];
+    body.extend_from_slice(&ht_elements(6));
+    if plan.association_response(&reply(0x10, &body)) != Ok(Some(42)) {
+        return TestResult::Fail("HT association response rejected");
+    }
+    let uni = plan.peer_record_uni_on(Link::HOME, 42, true, None).unwrap();
+    let connac2 = plan.peer_record(42, true).unwrap();
+    let Some(uni_ht) = find_tlv(&uni, 8, 9) else {
+        return TestResult::Fail("UNI station record has no HT TLV");
+    };
+    let Some(c2_ht) = find_tlv(&connac2, 8, 9) else {
+        return TestResult::Fail("CONNAC2 peer record has no HT TLV");
+    };
+    if uni_ht != c2_ht {
+        return TestResult::Fail("UNI HT TLV differs from the CONNAC2 one");
+    }
+    let Some(uni_amsdu) = find_tlv(&uni, 8, 15) else {
+        return TestResult::Fail("UNI station record has no HW_AMSDU TLV");
+    };
+    let Some(c2_amsdu) = find_tlv(&connac2, 8, 15) else {
+        return TestResult::Fail("CONNAC2 peer record has no HW_AMSDU TLV");
+    };
+    if uni_amsdu != c2_amsdu {
+        return TestResult::Fail("UNI HW_AMSDU TLV differs from the CONNAC2 one");
+    }
+    if find_tlv(&uni, 8, 0x22).is_some() || find_tlv(&uni, 8, 13).is_some() {
+        return TestResult::Fail("UNI station record carries EHT or WTBL TLVs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_uni_station_join_caps_mirror
+);
+
+fn mt76_uni_key_records_v3() -> TestResult {
+    use narf_wireless::rsn;
+    let mut plan = JoinPlan::prepare(&bss(false), OWN, b"narf", Security::Open).unwrap();
+    plan.start_authentication().unwrap();
+    plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
+        .unwrap();
+    if plan.association_response(&reply(
+        0x10,
+        &[1, 0, 0, 0, 42, 0xc0, 1, 4, 0x82, 0x84, 0x8b, 0x96],
+    )) != Ok(Some(42))
+    {
+        return TestResult::Fail("key test association response rejected");
+    }
+    // Pairwise: its own STA_REC_UPDATE, one KEY_V3 TLV.
+    let key = [0xabu8; 16];
+    let rec = plan
+        .secure_peer_record_uni_on(Link::HOME, 42, &key, rsn::CIPHER_CCMP_128)
+        .unwrap();
+    if rec.len() != 76 || u16::from_le_bytes([rec[2], rec[3]]) != 1 {
+        return TestResult::Fail("pairwise KEY_V3 record length or tlv_num wrong");
+    }
+    let tlv = &rec[8..];
+    if tlv[0..2] != [0x27, 0]
+        || u16::from_le_bytes([tlv[2], tlv[3]]) != 68
+        || tlv[4] != 1
+        || tlv[5] != 1
+        || tlv[6] != 1
+        || tlv[7] != 0
+        || tlv[8..14] != AP
+        || tlv[14] != 0
+        || tlv[15] != 4
+        || tlv[16] != 0
+        || tlv[17] != 16
+        || tlv[18] != 1
+        || tlv[19] != 1
+        || tlv[20..36] != key
+        || tlv[36..52] != [0; 16]
+        || tlv[52..68] != [0; 16]
+    {
+        return TestResult::Fail("pairwise KEY_V3 TLV fields wrong");
+    }
+    // TKIP is refused (MIC swap not implemented) and short keys fail.
+    if plan
+        .secure_peer_record_uni_on(Link::HOME, 42, &[0x55; 32], rsn::CIPHER_TKIP)
+        .is_ok()
+        || plan
+            .secure_peer_record_uni_on(Link::HOME, 42, &[0x55; 15], rsn::CIPHER_CCMP_128)
+            .is_ok()
+    {
+        return TestResult::Fail("TKIP or short pairwise key accepted");
+    }
+    // Group: BMC WCID, tx_key/key_type 0, peer = BSSID, key_id = GTK index.
+    let gtk = [0x55u8; 16];
+    let grec =
+        JoinPlan::key_record_uni_on(Link::HOME, 19, 1, &gtk, rsn::CIPHER_CCMP_128, AP).unwrap();
+    let g = &grec[8..];
+    if grec.len() != 76
+        || g[4] != 1
+        || g[5] != 0
+        || g[6] != 0
+        || g[8..14] != AP
+        || g[15] != 4
+        || g[16] != 1
+        || g[17] != 16
+        || g[18] != 19
+        || g[20..36] != gtk
+    {
+        return TestResult::Fail("group KEY_V3 TLV fields wrong");
+    }
+    if JoinPlan::key_record_uni_on(Link::HOME, 1, 1, &gtk, rsn::CIPHER_CCMP_128, AP).is_ok() {
+        return TestResult::Fail("group key accepted on the peer WCID");
+    }
+    // IGTK: BIP batch, key = GTK(16) || IGTK(16), cipher 6.
+    let igtk = [0x66u8; 16];
+    let irec =
+        JoinPlan::igtk_record_uni_on(Link::HOME, 1, &gtk, rsn::CIPHER_CCMP_128, &igtk, AP).unwrap();
+    let i = &irec[8..];
+    if irec.len() != 76
+        || i[15] != 6
+        || i[16] != 1
+        || i[17] != 32
+        || i[18] != 19
+        || i[20..36] != gtk
+        || i[36..52] != igtk
+    {
+        return TestResult::Fail("IGTK KEY_V3 TLV fields wrong");
+    }
+    if JoinPlan::igtk_record_uni_on(Link::HOME, 1, &[0x55; 32], rsn::CIPHER_CCMP_256, &igtk, AP)
+        .is_ok()
+    {
+        return TestResult::Fail("256-bit group cipher accepted for the IGTK batch");
+    }
+    // Removal: add 0, cipher/key zeroed, peer + wcid kept.
+    let rrec = JoinPlan::key_remove_uni_on(Link::HOME, 1, AP);
+    let r = &rrec[8..];
+    if rrec.len() != 76
+        || r[4] != 0
+        || r[8..14] != AP
+        || r[15] != 0
+        || r[16] != 0
+        || r[17] != 0
+        || r[18] != 1
+        || r[20..52] != [0; 32]
+    {
+        return TestResult::Fail("KEY_V3 removal fields wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_uni_key_records_v3
+);

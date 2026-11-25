@@ -344,8 +344,13 @@ fn native80() -> Result<(), &'static str> {
     else {
         return Err("literal STA_REC_EHT");
     };
-    if super::vht_tests::record(peer, 0x15).is_none_or(|r| r[6] != 248) {
-        return Err("STA_REC_EHT / PHY_TYPE_BIT_BE");
+    // The 7925 join drives the UNI station update: no STA_REC_PHY
+    // (0x15) TLV and no WTBL nesting — the EHT record itself is
+    // the BE admission, and the update is BASIC + caps + STATE.
+    if super::vht_tests::record(peer, 0x15).is_some()
+        || super::vht_tests::record(peer, 13).is_some()
+    {
+        return Err("UNI STA update carries PHY or WTBL TLVs");
     }
     // EHT SU MCS13 two streams, EHT MU and EHT SU MCS14 DCM are admitted.
     s.backend.packets.push_back(eht_data(13, 13, 2, 0, 9));
@@ -391,6 +396,87 @@ fn mt76_eht_station_caps_records_rx_and_teardown() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921",
     mt76_eht_station_caps_records_rx_and_teardown
+);
+
+/// Scan the TLV stream of a Unified id-2 (BSS info) frame, the
+/// same walk as `vht_tests::record` for id-3 frames: the body
+/// starts at offset 48, the `bss_req_hdr` is 4 bytes, so the first
+/// TLV is at 52.
+fn record_bss(frame: &[u8], tag: u16) -> Option<&[u8]> {
+    if frame.get(34..36) != Some(&[2, 0]) || frame.get(43) != Some(&7) {
+        return None;
+    }
+    let mut offset = 52;
+    while let Some(header) = frame.get(offset..offset + 4) {
+        let len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if len < 4 {
+            return None;
+        }
+        let body = frame.get(offset..offset + len)?;
+        if header[..2] == tag.to_le_bytes() {
+            return Some(body);
+        }
+        offset += len;
+    }
+    None
+}
+
+fn uni_join_records() -> Result<(), &'static str> {
+    let (mut s, b, p) = prepared80_with(true, 0x7925, true);
+    if super::vht_tests::join(&mut s, &b, p, true) != Ok(42) {
+        return Err("native UNI association");
+    }
+    let f = &s.backend.frames;
+    // A Unified id-2 UNI BSS enable record: BASIC (tag 0), RLM
+    // (tag 2) and MLD (tag 26) TLVs. The pre-auth record has no
+    // RLM, so the RLM requirement selects the assoc-time one.
+    let Some((_, bss)) = f
+        .iter()
+        .find(|(_, f)| record_bss(f, 0).is_some() && record_bss(f, 2).is_some())
+    else {
+        return Err("no UNI BSS enable record");
+    };
+    if record_bss(bss, 26).is_none() {
+        return Err("UNI BSS record lacks MLD");
+    }
+    // A Unified id-3 UNI STA update with the negotiated EHT record
+    // and no WTBL nesting.
+    let Some((_, peer)) = f
+        .iter()
+        .find(|(_, f)| super::vht_tests::record(f, 0x22) == Some(&STA_REC_EHT80[..]))
+    else {
+        return Err("no UNI STA update with EHT record");
+    };
+    if super::vht_tests::record(peer, 13).is_some() {
+        return Err("UNI STA update carries a WTBL TLV");
+    }
+    // The pairwise key is its own STA_REC_UPDATE with one KEY_V3
+    // (CCMP, 16-byte key).
+    if !f.iter().any(|(_, f)| {
+        super::vht_tests::record(f, 0x27)
+            .is_some_and(|tlv| tlv.len() == 68 && tlv[15] == 4 && tlv[17] == 16)
+    }) {
+        return Err("no pairwise KEY_V3 record");
+    }
+    let before = s.backend.frames.len();
+    run(s.disassociate_station()).map_err(|_| "UNI teardown")?;
+    // Teardown sends a UNI remove (REMOVE + MLD_OFF) and no EHT record.
+    if !s.backend.frames[before..].iter().any(|(_, f)| {
+        super::vht_tests::record(f, 0x25).is_some() && super::vht_tests::record(f, 0x23).is_some()
+    }) || s.backend.frames[before..]
+        .iter()
+        .any(|(_, f)| super::vht_tests::record(f, 0x22).is_some())
+    {
+        return Err("UNI teardown remove or EHT record wrong");
+    }
+    Ok(())
+}
+fn mt76_mt7925_uni_station_join_records() -> TestResult {
+    uni_join_records().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    mt76_mt7925_uni_station_join_records
 );
 
 fn native160() -> Result<(), &'static str> {

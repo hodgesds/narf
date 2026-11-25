@@ -2013,6 +2013,13 @@ struct StationLink {
     /// disconnect record of that association (Linux `vif->p2p` is fixed per
     /// vif type).
     network: crate::mt7921::p2p_wire::Network,
+    /// This link's UNI BSS SEC identity captured at join (MT7925/
+    /// CONNAC3); retained for the exact BSS-disable record of that
+    /// association — the same "captured at join" pattern as
+    /// `network`. `None` until a 7925 join sets it; teardown on a
+    /// 7925 radio fails closed when it is missing rather than
+    /// guessing the SEC.
+    bss_sec: Option<crate::mt7925::mcu::UniBssSec>,
     permission: Option<crate::mt7921::association::TxPermission>,
     wmm: Option<crate::mt7921::association::wmm::Parameters>,
     wmm_pending: Option<crate::mt7921::association::wmm::Parameters>,
@@ -2075,6 +2082,7 @@ impl StationLink {
             bw_change: None,
             bss: None,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
+            bss_sec: None,
             permission: None,
             wmm: None,
             wmm_pending: None,

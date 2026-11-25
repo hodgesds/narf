@@ -2,8 +2,8 @@
 //! Channel/power authorization, MLME open authentication/association
 //! request/response loops, and peer record installation.
 use super::{
-    scan::rx_on_channel, station::Command, Backend, Error, ScanBss, Session, Stage, State,
-    TIMEOUT_MS,
+    scan::rx_on_channel, station::Command, Backend, Error, RadioInfo, ScanBss, Session, Stage,
+    State, TIMEOUT_MS,
 };
 use crate::mt7921::{
     association::{disconnect_record_on, JoinPlan, Security},
@@ -996,19 +996,39 @@ impl<B: Backend> Session<B> {
                     .as_ref()
                     .is_some_and(|security| !security.pending.is_empty()))
     }
-    /// Install `gtk` under the negotiated group `cipher`.
-    async fn install_group_key(&mut self, gtk: &Gtk, cipher: u8) -> Result<(), Error> {
+    /// Install `gtk` under the negotiated group `cipher`. `info` is
+    /// the associated radio (the UNI/CONNAC3 dispatch) and `peer` the
+    /// AP address (the group key's `peer_addr` on UNI).
+    async fn install_group_key(
+        &mut self,
+        gtk: &Gtk,
+        cipher: u8,
+        info: RadioInfo,
+        peer: [u8; 6],
+    ) -> Result<(), Error> {
         if gtk.rsc[6..] != [0, 0] {
             return Err(Error::MalformedEvent);
         }
-        let record = crate::mt7921::association::key_record_cipher_on(
-            self.station.link,
-            self.station.link.bmc(),
-            gtk.key_id,
-            Some(&gtk.key),
-            cipher,
-        )
-        .map_err(|_| Error::MalformedEvent)?;
+        let record = if crate::mt7921::mlo::is_connac3(info) {
+            crate::mt7921::association::JoinPlan::key_record_uni_on(
+                self.station.link,
+                self.station.link.bmc(),
+                gtk.key_id,
+                &gtk.key,
+                cipher,
+                peer,
+            )
+            .map_err(|_| Error::MalformedEvent)?
+        } else {
+            crate::mt7921::association::key_record_cipher_on(
+                self.station.link,
+                self.station.link.bmc(),
+                gtk.key_id,
+                Some(&gtk.key),
+                cipher,
+            )
+            .map_err(|_| Error::MalformedEvent)?
+        };
         self.exchange_station(Command::Unified { id: 3 }, &record)
             .await
             .map(|_| ())
@@ -1016,10 +1036,14 @@ impl<B: Backend> Session<B> {
 
     /// mt7921_set_key(WLAN_CIPHER_SUITE_AES_CMAC) after the GTK: the IGTK
     /// record repeats the installed GTK as its BIP batch `key[0]`.
+    /// `info` is the associated radio (the UNI/CONNAC3 dispatch)
+    /// and `peer` the AP address (the IGTK's `peer_addr` on UNI).
     async fn install_igtk(
         &mut self,
         security: &StationSecurity,
         igtk: &narf_wireless::eapol::Igtk,
+        info: RadioInfo,
+        peer: [u8; 6],
     ) -> Result<(), Error> {
         // mt7921_set_key takes only the AES-CMAC IGTK; mac80211 verifies
         // the other BIP suites in software (`commit_igtk`'s key).
@@ -1027,14 +1051,26 @@ impl<B: Backend> Session<B> {
             return Ok(());
         }
         let (gtk_id, gtk) = security.gtk().ok_or(Error::MalformedEvent)?;
-        let record = crate::mt7921::association::igtk_record_cipher_on(
-            self.station.link,
-            gtk_id,
-            gtk,
-            security.ciphers.group,
-            &igtk.key,
-        )
-        .map_err(|_| Error::MalformedEvent)?;
+        let record = if crate::mt7921::mlo::is_connac3(info) {
+            crate::mt7921::association::JoinPlan::igtk_record_uni_on(
+                self.station.link,
+                gtk_id,
+                gtk,
+                security.ciphers.group,
+                &igtk.key,
+                peer,
+            )
+            .map_err(|_| Error::MalformedEvent)?
+        } else {
+            crate::mt7921::association::igtk_record_cipher_on(
+                self.station.link,
+                gtk_id,
+                gtk,
+                security.ciphers.group,
+                &igtk.key,
+            )
+            .map_err(|_| Error::MalformedEvent)?
+        };
         self.exchange_station(Command::Unified { id: 3 }, &record)
             .await
             .map(|_| ())
@@ -1139,24 +1175,35 @@ impl<B: Backend> Session<B> {
                 )
                 .await?;
                 if let Some(tk) = tk {
-                    let record = crate::mt7921::association::key_record_cipher_on(
-                        self.station.link,
-                        self.station.link.peer(),
-                        0,
-                        Some(&tk),
-                        security.ciphers.pairwise,
-                    )
-                    .map_err(|_| Error::MalformedEvent)?;
+                    let record = if crate::mt7921::mlo::is_connac3(info) {
+                        crate::mt7921::association::pairwise_key_record_uni_on(
+                            self.station.link,
+                            &tk,
+                            security.ciphers.pairwise,
+                            peer,
+                        )
+                        .map_err(|_| Error::MalformedEvent)?
+                    } else {
+                        crate::mt7921::association::key_record_cipher_on(
+                            self.station.link,
+                            self.station.link.peer(),
+                            0,
+                            Some(&tk),
+                            security.ciphers.pairwise,
+                        )
+                        .map_err(|_| Error::MalformedEvent)?
+                    };
                     self.exchange_station(Command::Unified { id: 3 }, &record)
                         .await?;
                     security.commit_pairwise();
                 }
                 if let Some(gtk) = gtk {
-                    self.install_group_key(&gtk, security.ciphers.group).await?;
+                    self.install_group_key(&gtk, security.ciphers.group, info, peer)
+                        .await?;
                     security.commit_group(&gtk)?;
                 }
                 if let Some(igtk) = igtk.filter(|_| security.pmf) {
-                    self.install_igtk(&security, &igtk).await?;
+                    self.install_igtk(&security, &igtk, info, peer).await?;
                     security.commit_igtk(&igtk)?;
                 }
                 security.port_open = authorize;
@@ -2376,6 +2423,12 @@ impl<B: Backend> Session<B> {
         // No station BSS is live here, so the role cannot change under an
         // already published BSS record.
         self.station.network = network;
+        // The UNI BSS SEC identity for this join, retained for the
+        // exact BSS-disable record at teardown (see
+        // `StationLink::bss_sec`). Set for every radio; only the
+        // 7925 teardown reads it. Cleared with the rest of the
+        // join state on failure (below).
+        self.station.bss_sec = Some(crate::mt7921::association::uni_bss_sec_for(security));
         let six = crate::mt7921::association::is_six_ghz(bss);
         let band = if six {
             // MT_NIC_CAP_6G gates the 6 GHz band (mt7921/mcu.c:595).
@@ -2534,34 +2587,57 @@ impl<B: Backend> Session<B> {
             // Publish BSSID and enable the firmware AP WCID before management
             // or EAPOL RX, like Linux sta_add. Host data authorization remains
             // closed until MLME/RSNA completes; a scan-only BSS has no peer.
-            let mut bss_record =
+            let mut bss_record = if crate::mt7921::mlo::is_connac3(info) {
+                // UNI BSS record (pre-auth: no HE/RLM — the channel
+                // context rides the earlier channel-switch command).
+                crate::mt7921::mlo::uni_bss_record(
+                    &plan,
+                    self.station.link,
+                    bss,
+                    security,
+                    false,
+                    permission,
+                    info,
+                )
+                .map_err(|_| Error::Bounds)?
+            } else {
                 crate::mt7921::association::bss_record_qos_on(self.station.link, bss, false, false)
-                    .map_err(|_| Error::Bounds)?;
+                    .map_err(|_| Error::Bounds)?
+            };
             crate::mt7921::p2p_wire::group_bss(&mut bss_record, network)?;
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
-            // Match Linux `mt76_connac_mcu_uni_add_bss` -> `uni_set_chctx`.
-            let tx_streams = info.capabilities.phy.spatial_streams.min(2);
-            let chains = (1 << tx_streams) - 1;
-            let pre_auth_rlm = if six {
-                crate::mt7921::six_ghz::rlm(
-                    bss.channel,
-                    permission.center_channel(),
-                    permission.native_width(),
-                    tx_streams,
-                    chains,
+            if !crate::mt7921::mlo::is_connac3(info) {
+                // Match Linux `mt76_connac_mcu_uni_add_bss` -> `uni_set_chctx`.
+                // Skipped on 7925: the pre-auth RLM append is CONNAC2-only;
+                // the 7925 channel context rides the channel-switch
+                // command, and RLM rides the assoc-time enable record.
+                let tx_streams = info.capabilities.phy.spatial_streams.min(2);
+                let chains = (1 << tx_streams) - 1;
+                let pre_auth_rlm = if six {
+                    crate::mt7921::six_ghz::rlm(
+                        bss.channel,
+                        permission.center_channel(),
+                        permission.native_width(),
+                        tx_streams,
+                        chains,
+                    )
+                } else {
+                    crate::mt7921::csa::rlm(permission.chandef(), tx_streams, chains)
+                };
+                self.exchange_station(
+                    Command::Unified { id: 2 },
+                    &crate::mt7921::vif_slots::on_bss(self.station.link.vif(), pre_auth_rlm),
                 )
+                .await?;
+            }
+            let peer_record = if crate::mt7921::mlo::is_connac3(info) {
+                plan.peer_record_uni_on(self.station.link, 0, false, None)
+                    .map_err(|_| Error::Bounds)?
             } else {
-                crate::mt7921::csa::rlm(permission.chandef(), tx_streams, chains)
+                plan.peer_record_on(self.station.link, 0, false)
+                    .map_err(|_| Error::Bounds)?
             };
-            self.exchange_station(
-                Command::Unified { id: 2 },
-                &crate::mt7921::vif_slots::on_bss(self.station.link.vif(), pre_auth_rlm),
-            )
-            .await?;
-            let peer_record = plan
-                .peer_record_on(self.station.link, 0, false)
-                .map_err(|_| Error::Bounds)?;
             self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
 
@@ -2820,91 +2896,125 @@ impl<B: Backend> Session<B> {
                     self.check_station_tx()?;
                 }
             }
-            let mut bss_record = crate::mt7921::association::bss_record_ht20_on(
-                self.station.link,
-                bss,
-                plan.wmm().is_some(),
-                plan.ht20().is_some(),
-            )
-            .map_err(|_| Error::Bounds)?;
-            if plan.vht().is_some() {
-                bss_record[29] |= 1 << 5;
-            } // PHY_MODE_AC.
+            let mut bss_record = if crate::mt7921::mlo::is_connac3(info) {
+                // One UNI BSS record (enable): BASIC/SEC/RATE/QoS/
+                // MLD/IFS + HE/COLOR + RLM. The CONNAC2 HE/VHT/HT/6G
+                // follow-ups below are subsumed by its he/rlm
+                // parameters — and the CONNAC2 phy_mode patch at
+                // offset 29 must not touch the UNI BASIC TLV.
+                crate::mt7921::mlo::uni_bss_record(
+                    &plan,
+                    self.station.link,
+                    bss,
+                    security,
+                    true,
+                    permission,
+                    info,
+                )
+                .map_err(|_| Error::Bounds)?
+            } else {
+                let mut record = crate::mt7921::association::bss_record_ht20_on(
+                    self.station.link,
+                    bss,
+                    plan.wmm().is_some(),
+                    plan.ht20().is_some(),
+                )
+                .map_err(|_| Error::Bounds)?;
+                if plan.vht().is_some() {
+                    record[29] |= 1 << 5;
+                } // PHY_MODE_AC.
+                if let Some(he) = plan.he() {
+                    record[29] |= he.phy_mode();
+                }
+                record
+            };
             crate::mt7921::p2p_wire::group_bss(&mut bss_record, network)?;
-            if let Some(he) = plan.he() {
-                bss_record[29] |= he.phy_mode();
-            }
             self.exchange_station(Command::Unified { id: 2 }, &bss_record)
                 .await?;
             self.abort_join_roc(&mut join_roc).await?;
-            if let Some(he) = plan.he() {
-                // mt7921_mac_sta_event(ASSOC) -> uni_add_bss(enable = true):
-                // HE_BASIC + BSS_COLOR follow BASIC/QBSS once he_support is set.
-                self.exchange_station(
-                    Command::Unified { id: 2 },
-                    &crate::mt7921::vif_slots::on_bss(self.station.link.vif(), he.bss(true)),
-                )
-                .await?;
+            if !crate::mt7921::mlo::is_connac3(info) {
+                if let Some(he) = plan.he() {
+                    // mt7921_mac_sta_event(ASSOC) -> uni_add_bss(enable = true):
+                    // HE_BASIC + BSS_COLOR follow BASIC/QBSS once he_support is set.
+                    self.exchange_station(
+                        Command::Unified { id: 2 },
+                        &crate::mt7921::vif_slots::on_bss(self.station.link.vif(), he.bss(true)),
+                    )
+                    .await?;
+                }
+                if let Some(profile) = plan.vht() {
+                    self.exchange_station(
+                        Command::Unified { id: 2 },
+                        &crate::mt7921::vif_slots::on_bss(
+                            self.station.link.vif(),
+                            profile.rlm(
+                                bss.channel,
+                                (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                            ),
+                        ),
+                    )
+                    .await?;
+                } else if let Some(profile) = plan.ht20() {
+                    self.exchange_station(
+                        Command::Unified { id: 2 },
+                        &crate::mt7921::vif_slots::on_bss(
+                            self.station.link.vif(),
+                            profile.rlm(
+                                bss.channel,
+                                (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                            ),
+                        ),
+                    )
+                    .await?;
+                } else if six {
+                    // mt76_connac_mcu_uni_set_chctx with band = NL80211_BAND_6GHZ.
+                    self.exchange_station(
+                        Command::Unified { id: 2 },
+                        &crate::mt7921::vif_slots::on_bss(
+                            self.station.link.vif(),
+                            crate::mt7921::six_ghz::rlm(
+                                bss.channel,
+                                permission.center_channel(),
+                                permission.native_width(),
+                                plan.transmit_streams(),
+                                (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
+                            ),
+                        ),
+                    )
+                    .await?;
+                }
             }
-            if let Some(profile) = plan.vht() {
-                self.exchange_station(
-                    Command::Unified { id: 2 },
-                    &crate::mt7921::vif_slots::on_bss(
-                        self.station.link.vif(),
-                        profile.rlm(
-                            bss.channel,
-                            (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
-                        ),
-                    ),
-                )
-                .await?;
-            } else if let Some(profile) = plan.ht20() {
-                self.exchange_station(
-                    Command::Unified { id: 2 },
-                    &crate::mt7921::vif_slots::on_bss(
-                        self.station.link.vif(),
-                        profile.rlm(
-                            bss.channel,
-                            (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
-                        ),
-                    ),
-                )
-                .await?;
-            } else if six {
-                // mt76_connac_mcu_uni_set_chctx with band = NL80211_BAND_6GHZ.
-                self.exchange_station(
-                    Command::Unified { id: 2 },
-                    &crate::mt7921::vif_slots::on_bss(
-                        self.station.link.vif(),
-                        crate::mt7921::six_ghz::rlm(
-                            bss.channel,
-                            permission.center_channel(),
-                            permission.native_width(),
-                            plan.transmit_streams(),
-                            (1 << info.capabilities.phy.spatial_streams.min(2)) - 1,
-                        ),
-                    ),
-                )
-                .await?;
-            }
-            let peer_record = plan
-                .peer_record_on(self.station.link, aid, true)
-                .map_err(|_| Error::Bounds)?;
+            let peer_record = if crate::mt7921::mlo::is_connac3(info) {
+                plan.peer_record_uni_on(self.station.link, aid, true, None)
+                    .map_err(|_| Error::Bounds)?
+            } else {
+                plan.peer_record_on(self.station.link, aid, true)
+                    .map_err(|_| Error::Bounds)?
+            };
             self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
-            let group_record =
-                crate::mt7921::association::group_record_on(self.station.link, bss.bssid, aid)
-                    .map_err(|_| Error::Bounds)?;
-            self.exchange_station(Command::Unified { id: 3 }, &group_record)
-                .await?;
+            if !crate::mt7921::mlo::is_connac3(info) {
+                // No UNI equivalent: there is no BMC station record on
+                // UNI (WTBL programming is a separate path); the group
+                // keys go via KEY_V3 on the BMC WCID instead.
+                let group_record =
+                    crate::mt7921::association::group_record_on(self.station.link, bss.bssid, aid)
+                        .map_err(|_| Error::Bounds)?;
+                self.exchange_station(Command::Unified { id: 3 }, &group_record)
+                    .await?;
+            }
 
             // 7. Update STA_REC / perform WPA2 4-way handshake:
             match security {
                 Security::Open => {
                     self.stage(Stage::StaRecord);
-                    let sta_rec = plan
-                        .peer_record_on(self.station.link, aid, true)
-                        .map_err(|_| Error::MalformedEvent)?;
+                    let sta_rec = if crate::mt7921::mlo::is_connac3(info) {
+                        plan.peer_record_uni_on(self.station.link, aid, true, None)
+                            .map_err(|_| Error::MalformedEvent)?
+                    } else {
+                        plan.peer_record_on(self.station.link, aid, true)
+                            .map_err(|_| Error::MalformedEvent)?
+                    };
                     self.exchange_station(Command::Unified { id: 3 }, &sta_rec)
                         .await?;
                 }
@@ -2963,22 +3073,40 @@ impl<B: Backend> Session<B> {
                                 )
                                 .await?;
                                 self.stage(Stage::StaRecord);
-                                let record = plan
-                                    .secure_peer_record_cipher_on(
+                                let record = if crate::mt7921::mlo::is_connac3(info) {
+                                    // UNI pairwise key: its own STA_REC_UPDATE
+                                    // with one STA_REC_KEY_V3 (no full station
+                                    // record re-emission).
+                                    plan.secure_peer_record_uni_on(
                                         self.station.link,
                                         aid,
                                         m3.tk.as_deref().unwrap(),
                                         security.ciphers.pairwise,
                                     )
-                                    .map_err(|_| Error::MalformedEvent)?;
+                                    .map_err(|_| Error::MalformedEvent)?
+                                } else {
+                                    plan.secure_peer_record_cipher_on(
+                                        self.station.link,
+                                        aid,
+                                        m3.tk.as_deref().unwrap(),
+                                        security.ciphers.pairwise,
+                                    )
+                                    .map_err(|_| Error::MalformedEvent)?
+                                };
                                 self.exchange_station(Command::Unified { id: 3 }, &record)
                                     .await?;
                                 security.commit_pairwise();
                                 let gtk = m3.gtk.as_ref().unwrap();
-                                self.install_group_key(gtk, security.ciphers.group).await?;
+                                self.install_group_key(
+                                    gtk,
+                                    security.ciphers.group,
+                                    info,
+                                    bss.bssid,
+                                )
+                                .await?;
                                 security.commit_group(gtk)?;
                                 if let Some(igtk) = m3.igtk.as_ref().filter(|_| security.pmf) {
-                                    self.install_igtk(&security, igtk).await?;
+                                    self.install_igtk(&security, igtk, info, bss.bssid).await?;
                                     security.commit_igtk(igtk)?;
                                 }
                                 security.port_open = true;
@@ -3068,6 +3196,7 @@ impl<B: Backend> Session<B> {
                 self.station.wmm = None;
                 self.station.wmm_pending = None;
                 self.station.permission = None;
+                self.station.bss_sec = None;
                 self.station.ht20_rx = None;
                 self.station.ht20_profile = None;
                 self.station.vht_profile = None;
@@ -3144,29 +3273,61 @@ impl<B: Backend> Session<B> {
                 }
             }
         }
-        if keys {
-            for wcid in [link.peer(), link.bmc()] {
-                let record = crate::mt7921::association::key_record_on(link, wcid, 0, None)
-                    .map_err(|_| Error::Bounds)?;
+        if crate::mt7921::mlo::is_connac3(join.info) {
+            // UNI teardown: per-WCID KEY_V3 removals, the UNI
+            // station remove (REMOVE + MLD_OFF), then one
+            // BSS-disable record. The retained BSS SEC is required
+            // — failing closed when it is missing rather than
+            // guessing the SEC. No BMC station record exists on
+            // UNI, so the group disconnect is skipped, and HE rides
+            // the disable record with the color cleared.
+            if keys {
+                for wcid in [link.peer(), link.bmc()] {
+                    let record =
+                        crate::mt7921::association::JoinPlan::key_remove_uni_on(link, wcid, peer);
+                    self.exchange(Command::Unified { id: 3 }, &record).await?;
+                }
+            }
+            let record = crate::mt7921::association::sta_remove_uni_record(link);
+            self.exchange(Command::Unified { id: 3 }, &record).await?;
+            let sec = self.station.bss_sec.ok_or(Error::Bounds)?;
+            let mut record = crate::mt7921::mlo::uni_bss_disable(
+                link,
+                bss,
+                sec,
+                join.he.map(|he| he.uni_bss_he(false)),
+                join.info.capabilities.mac,
+                false,
+                link.bss(),
+            )
+            .map_err(|_| Error::Bounds)?;
+            crate::mt7921::p2p_wire::group_bss(&mut record, self.station.network)?;
+            self.exchange(Command::Unified { id: 2 }, &record).await?;
+        } else {
+            if keys {
+                for wcid in [link.peer(), link.bmc()] {
+                    let record = crate::mt7921::association::key_record_on(link, wcid, 0, None)
+                        .map_err(|_| Error::Bounds)?;
+                    self.exchange(Command::Unified { id: 3 }, &record).await?;
+                }
+            }
+            for record in [
+                disconnect_record_on(link, peer),
+                crate::mt7921::association::group_disconnect_record_on(link),
+            ] {
                 self.exchange(Command::Unified { id: 3 }, &record).await?;
             }
-        }
-        for record in [
-            disconnect_record_on(link, peer),
-            crate::mt7921::association::group_disconnect_record_on(link),
-        ] {
-            self.exchange(Command::Unified { id: 3 }, &record).await?;
-        }
-        let mut record = crate::mt7921::association::bss_record_qos_on(link, bss, false, false)
-            .map_err(|_| Error::Bounds)?;
-        crate::mt7921::p2p_wire::group_bss(&mut record, self.station.network)?;
-        self.exchange(Command::Unified { id: 2 }, &record).await?;
-        if let Some(he) = join.he {
-            self.exchange(
-                Command::Unified { id: 2 },
-                &crate::mt7921::vif_slots::on_bss(link.vif(), he.bss(false)),
-            )
-            .await?;
+            let mut record = crate::mt7921::association::bss_record_qos_on(link, bss, false, false)
+                .map_err(|_| Error::Bounds)?;
+            crate::mt7921::p2p_wire::group_bss(&mut record, self.station.network)?;
+            self.exchange(Command::Unified { id: 2 }, &record).await?;
+            if let Some(he) = join.he {
+                self.exchange(
+                    Command::Unified { id: 2 },
+                    &crate::mt7921::vif_slots::on_bss(link.vif(), he.bss(false)),
+                )
+                .await?;
+            }
         }
         self.notify(
             Command::Ce {
@@ -3273,37 +3434,72 @@ impl<B: Backend> Session<B> {
             // Retire keys before removing the station WCIDs. No cleanup ACK
             // is optional: uncertainty cannot become a reusable ready radio.
             let link = self.station.link;
-            if secure {
-                for wcid in [link.peer(), link.bmc()] {
-                    let record = crate::mt7921::association::key_record_on(link, wcid, 0, None)
-                        .map_err(|_| Error::Bounds)?;
+            if crate::mt7921::mlo::is_connac3(info) {
+                // UNI teardown, as in `leave_failed_join`: per-WCID
+                // KEY_V3 removals, the UNI station remove, then one
+                // BSS-disable record with the retained SEC. No BMC
+                // station record exists on UNI.
+                if secure {
+                    for wcid in [link.peer(), link.bmc()] {
+                        let record = crate::mt7921::association::JoinPlan::key_remove_uni_on(
+                            link, wcid, peer,
+                        );
+                        self.exchange(Command::Unified { id: 3 }, &record).await?;
+                    }
+                }
+                let record = crate::mt7921::association::sta_remove_uni_record(link);
+                self.exchange(Command::Unified { id: 3 }, &record).await?;
+                if let Some(bss) = &self.station.bss {
+                    let sec = self.station.bss_sec.ok_or(Error::Bounds)?;
+                    let mut record = crate::mt7921::mlo::uni_bss_disable(
+                        link,
+                        bss,
+                        sec,
+                        had_he.map(|he| he.uni_bss_he(false)),
+                        info.capabilities.mac,
+                        false,
+                        link.bss(),
+                    )
+                    .map_err(|_| Error::Bounds)?;
+                    crate::mt7921::p2p_wire::group_bss(&mut record, self.station.network)?;
+                    self.exchange(Command::Unified { id: 2 }, &record).await?;
+                }
+            } else {
+                if secure {
+                    for wcid in [link.peer(), link.bmc()] {
+                        let record = crate::mt7921::association::key_record_on(link, wcid, 0, None)
+                            .map_err(|_| Error::Bounds)?;
+                        self.exchange(Command::Unified { id: 3 }, &record).await?;
+                    }
+                }
+                for record in [
+                    disconnect_record_on(link, peer),
+                    crate::mt7921::association::group_disconnect_record_on(link),
+                ] {
                     self.exchange(Command::Unified { id: 3 }, &record).await?;
                 }
-            }
-            for record in [
-                disconnect_record_on(link, peer),
-                crate::mt7921::association::group_disconnect_record_on(link),
-            ] {
-                self.exchange(Command::Unified { id: 3 }, &record).await?;
-            }
-            if let Some(bss) = &self.station.bss {
-                let mut record = crate::mt7921::association::bss_record_qos_on(
-                    self.station.link,
-                    bss,
-                    false,
-                    false,
-                )
-                .map_err(|_| Error::Bounds)?;
-                crate::mt7921::p2p_wire::group_bss(&mut record, self.station.network)?;
-                self.exchange(Command::Unified { id: 2 }, &record).await?;
-                // mt76_connac_mcu_uni_add_bss(enable = false) still sends the
-                // HE request while he_support is set, with BSS color disabled.
-                if let Some(he) = had_he {
-                    self.exchange(
-                        Command::Unified { id: 2 },
-                        &crate::mt7921::vif_slots::on_bss(self.station.link.vif(), he.bss(false)),
+                if let Some(bss) = &self.station.bss {
+                    let mut record = crate::mt7921::association::bss_record_qos_on(
+                        self.station.link,
+                        bss,
+                        false,
+                        false,
                     )
-                    .await?;
+                    .map_err(|_| Error::Bounds)?;
+                    crate::mt7921::p2p_wire::group_bss(&mut record, self.station.network)?;
+                    self.exchange(Command::Unified { id: 2 }, &record).await?;
+                    // mt76_connac_mcu_uni_add_bss(enable = false) still sends the
+                    // HE request while he_support is set, with BSS color disabled.
+                    if let Some(he) = had_he {
+                        self.exchange(
+                            Command::Unified { id: 2 },
+                            &crate::mt7921::vif_slots::on_bss(
+                                self.station.link.vif(),
+                                he.bss(false),
+                            ),
+                        )
+                        .await?;
+                    }
                 }
             }
             if had_wmm {
@@ -3339,6 +3535,7 @@ impl<B: Backend> Session<B> {
             return Err(error);
         }
         self.station.bss = None;
+        self.station.bss_sec = None;
         self.station.network = crate::mt7921::p2p_wire::Network::Infrastructure;
         self.station.peer_lost = false;
         self.station.loss = None;
@@ -3359,6 +3556,7 @@ impl<B: Backend> Session<B> {
             .and_then(|permission| self.backend.check_tx_permission(permission));
         if let Err(error) = result {
             self.station.permission = None;
+            self.station.bss_sec = None;
             self.station.wmm = None;
             self.station.wmm_pending = None;
             self.station.security = None;
