@@ -146,16 +146,17 @@ caller's exact timing without replacing it with an EDID preferred mode.
 Probe takeover and `intel_gpu::relight_display` share generation dispatch:
 Tiger/Alder/Raptor Lake use Gen12; Meteor/Arrow Lake use Xe-LPG; Lunar Lake
 and Panther Lake (when Display 30 is proven) use their Xe2/Xe3_LPD KMS
-relight and modeset paths rather than refusing.
+relight and modeset paths rather than refusing, and Nova Lake-S's owned
+display 35 relights through `intel_gpu_xe3plpd::relight`.
 This dispatch does not enable Xe-LPG power management, which remains gated.
 The Xe-LPG modeset reports Pipe A's DMC dark after its crtc disable and lit
 before its port PLL (`XeLpgModeset::with_pipe_dmc` substitutes the sink), and
 `intel_gpu_modeset_xelpg::owned_panel_mode()` returns the mode whose owned
 display-14 resource profile the last successful modeset established (`None`
 once Pipe A goes dark or on an inherited layout).
-`Generation::external_display_supported` admits only Gen12: external
-DP/HDMI/MST sessions, combo HPD enable/poll and the USB-C DP bridge use
-that gate before register access. This necessary generation gate does not
+`Generation::external_display_supported` admits Gen12 (Rocket Lake
+included), Gen11, Gen9 and Gen9 LP: external DP/HDMI/MST sessions, combo HPD
+enable/poll and the USB-C DP bridge use that gate before register access. This necessary generation gate does not
 qualify every physical port: combo-B HPD/retained SST additionally needs the
 exact source family and observed PCH facts described below. Meteor/Arrow Lake
 internal-panel support does not admit the Gen12 external port sequence; the
@@ -999,7 +1000,8 @@ CLOCK_TAI and unadvertised engines are refused. Size-only queries need no
 payload pointer. Copyout touches only width/cycles/timestamp/delta, preserving
 the input fields even if userspace changes them while waiting. Sync kernel
 dispatch returns EAGAIN for a sample that needs the async owner.
-Protected execution and fault-mode capability remain unadvertised.
+Protected execution is advertised only with `narf.intel.pxp=1` (the
+MTL/Arrow GSC section); fault-mode capability remains unadvertised.
 
 Native Xe EXEC_QUEUE_CREATE accepts LOW_LATENCY_HINT (flags bit 0) for qualified
 hardware execution queues. CONFIG reports HAS_LOW_LATENCY (bit 1) only for a
@@ -1183,7 +1185,8 @@ including valid device address zero; bind, split, replace and unmap preserve
 read-only/PAT checks. VRAM objects export over PRIME; another native Xe
 card attaches peer-to-peer (opt-in `narf.intel.prime_p2p=1`) or after
 migration to system memory (`intel_gpu.md` §19, cross-device PRIME). i915
-residency, eviction/migration and dGPU scanout remain unsupported. GPU-only
+residency remains unsupported; VRAM eviction/migration and VRAM scanout are
+`intel_gpu.md` "Completion of Intel iGPU and Discrete Arc Support". GPU-only
 storage has the bounded opt-in exception below; other nonvisible/unmapped
 allocation remains unavailable.
 
@@ -1312,9 +1315,10 @@ without changing the request or publishing GPU work; the syscall bridge handles
 signal delivery and SA_RESTART. Completed/failed waits never request a park.
 Finite waits retain their original future/deadline instead of restarting a
 relative timeout on each repoll. Kernel callers without the hook await timers.
-Long-running/fault VMs, broader parallel queues and additional native Xe
-query/property families remain refused until their ownership and hardware
-contracts are implemented. OA observation is limited to the main-GT OAG
+Broader parallel queues and additional native Xe query/property families
+remain refused until their ownership and hardware contracts are implemented;
+LR_MODE/FAULT_MODE VMs are `intel_gpu.md` "Completion of Intel iGPU and
+Discrete Arc Support". OA observation is limited to the main-GT OAG
 profile described below.
 
 **BMG and exact LNL EU-stall observation.** The exact boot opt-in
@@ -4141,8 +4145,9 @@ transforms.
 
 `publication_step`, `arm_step`, `load_and_verify`, `open_firmware`,
 `write_dc_state_sticky` and `sanitize_target` are the composable steps that
-the production service uses. Crate-internal wiring (Meteor/Arrow Lake only;
-inert elsewhere):
+the production service uses. Crate-internal wiring (Meteor/Arrow Lake, and
+the display-20, -30 and -35 owners with their own DMC identity; inert
+elsewhere):
 
 - `intel_gpu_kms::Platform::display_power` (default: inert) backs every KMS
   session, legacy guard and recovery. A failed DC exit is an I/O error.
@@ -9451,8 +9456,9 @@ only the 255 cap and the guardband→pipeline_full derivation are
 fetched), the VBT `vrr_feature_enabled` per-panel bit layout (offset 56
 verified from Linux 6.12 VBT defs; bit 0 / panel 0 assumed), and which
 DPCD bit reports AS-SDP support (discovery passes `as_sdp = false`
-until resolved). Sequencing (modeset/push/disable), DPCD+PSR and
-CMRR remain separate lanes (#1769–#1771); readback landed in #1772.
+until resolved). Sequencing (modeset/push/disable, #1769), DPCD+PSR (#1770)
+and CMRR (#1771) are described in `intel_gpu.md` §20 (Atomic display row);
+readback (#1772) follows.
 
 VRR readback/sanitize at install/modeset setup (#1772):
 `readback_vrr` is the `intel_vrr_get_config` decode — one
