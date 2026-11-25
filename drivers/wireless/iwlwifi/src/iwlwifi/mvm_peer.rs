@@ -55,7 +55,7 @@ impl Owner {
     /// receive policy and firmware MCC apply; no platform TX/SAR policy is
     /// inferred and the inactive link/disabled station never authorizes TX.
     pub async fn prepare_ap_peer(&mut self, bssid: [u8; 6]) -> Result<(), &'static str> {
-        let domain = narf_wireless::reg::db::get_domain()
+        let domain = crate::iwlwifi::reg_source::get_domain()
             .ok_or("missing authenticated MVM peer receive policy")?;
         self.prepare_peer_in_domain(bssid, &domain).await
     }

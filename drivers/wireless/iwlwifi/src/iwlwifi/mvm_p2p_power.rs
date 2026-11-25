@@ -2,6 +2,8 @@
 //! source, original radio facts, actual child MAC and channel are bound;
 //! native SAR/device receipts must precede SESSION1 emission.
 use super::{power, Owner};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{format, string::String, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_wireless::reg::RegulatoryDomain;

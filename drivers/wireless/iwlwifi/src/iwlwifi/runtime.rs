@@ -1,6 +1,8 @@
 //! Owned DMA transport for AX210/Bz/Sc. Buffers belong to the transport
 //! until a matching completion, or until bus mastering is stopped.
 
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{vec, vec::Vec};
 use core::sync::atomic::{compiler_fence, Ordering};
 use narf_io::DmaBuffer;
@@ -639,16 +641,27 @@ pub struct Hardware {
     /// The actual installed6GHz AP power/HE snapshot. This constraint
     /// gate is checked after native credit waits at every TX publication.
     six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
+    #[cfg(feature = "builtin")]
     ap_owner: Option<alloc::sync::Arc<super::ap_owner::Owner>>,
+    #[cfg(feature = "builtin")]
     p2p_go: Option<alloc::sync::Arc<super::p2p_go::Native>>,
+    #[cfg(feature = "builtin")]
     p2p_client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
+    #[cfg(feature = "builtin")]
     client_request: Option<alloc::sync::Arc<super::p2p_client_request::Request>>,
+    #[cfg(feature = "builtin")]
     client_rx: Option<alloc::sync::Arc<super::p2p_client_rx::Host>>,
+    #[cfg(feature = "builtin")]
     client_receiver: Option<super::p2p_client_rx::Receiver>,
+    #[cfg(feature = "builtin")]
     client_rx_mvm: Option<alloc::sync::Arc<super::p2p_client_rx::MvmPower>>,
+    #[cfg(feature = "builtin")]
     client_copies: Vec<super::p2p_client_rx::Publication>,
+    #[cfg(feature = "builtin")]
     ap_request: Option<alloc::sync::Arc<super::ap_owner::Request>>,
+    #[cfg(feature = "builtin")]
     p2p: p2p::State,
+    #[cfg(feature = "builtin")]
     ap_gen2: Option<super::ap_gen2_wire::Adapter>,
     mld_link: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
     eht_source: Option<super::sc_eht::Source>,
@@ -771,16 +784,27 @@ impl Hardware {
             scan_six_capabilities: u8::from(parsed.api.has_capability(59))
                 | (u8::from(parsed.api.has_capability(10)) << 1),
             six_tx_profile: None,
+            #[cfg(feature = "builtin")]
             ap_owner: None,
+            #[cfg(feature = "builtin")]
             p2p_go: None,
+            #[cfg(feature = "builtin")]
             p2p_client: None,
+            #[cfg(feature = "builtin")]
             client_request: None,
+            #[cfg(feature = "builtin")]
             client_rx: None,
+            #[cfg(feature = "builtin")]
             client_receiver: None,
+            #[cfg(feature = "builtin")]
             client_rx_mvm: None,
+            #[cfg(feature = "builtin")]
             client_copies: Vec::new(),
+            #[cfg(feature = "builtin")]
             ap_request: None,
+            #[cfg(feature = "builtin")]
             p2p: p2p::State::new(&parsed.api),
+            #[cfg(feature = "builtin")]
             ap_gen2: None,
             mld_link: None,
             eht_source: None,
@@ -949,6 +973,7 @@ impl Hardware {
     }
 
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
+        #[cfg(feature = "builtin")]
         self.p2p.metadata(&parsed.api)?;
         self.prepare_station_profile(parsed)?;
         use core::{
@@ -1221,15 +1246,21 @@ impl Hardware {
         }
         // Fixed original source/provider observations only. A closed probe
         // subscriber must drive a native filter-clear receipt while idle.
+        #[cfg(feature = "builtin")]
         self.client_refresh_filter();
         let capture = self.rx_epoch.capture();
+        #[cfg(feature = "builtin")]
         let p2p_capture = self.p2p.copy_grant();
+        #[cfg(feature = "builtin")]
         let go_capture = self.p2p_go.clone();
+        #[cfg(feature = "builtin")]
         let client_capture = self.p2p_client.clone();
+        #[cfg(feature = "builtin")]
         let client_registrations = self
             .client_rx
             .as_ref()
             .map(|host| alloc::sync::Arc::new(host.snapshot()));
+        #[cfg(feature = "builtin")]
         let client_owner = client_capture.as_ref().and_then(|native| {
             if native.observation().is_err()
                 || self.format == rx_rfh::CompletionFormat::Qu && self.client_rx_mvm.is_none()
@@ -1258,14 +1289,17 @@ impl Hardware {
                 // copied from another physical ring cannot complete its DMA.
                 continue;
             }
+            #[cfg(feature = "builtin")]
             if self.p2p.observe(&packet, p2p_capture.as_ref())? {
                 continue;
             }
+            #[cfg(feature = "builtin")]
             if let Some(go) = &go_capture {
                 if go.receive(&packet)? {
                     continue;
                 }
             }
+            #[cfg(feature = "builtin")]
             if let Some(client) = &client_capture {
                 if packet.receive_queue == 0
                     && packet.header.group_id == 0
@@ -1290,6 +1324,7 @@ impl Hardware {
                 }
             }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc9 {
+                #[cfg(feature = "builtin")]
                 if let Some(client) = &self.p2p_client {
                     client.retire();
                     return Err("P2P client native MCC changed; reassociation required");
@@ -1600,16 +1635,20 @@ impl Hardware {
     }
 
     pub(super) fn clear_rf_policy(&mut self) {
-        self.p2p_go = None;
-        self.client_request = None;
-        self.client_rx_mvm = None;
-        self.client_copies.clear();
-        if let Some(client) = self.p2p_client.take() {
-            client.retire();
-        }
-        self.ap_request = None;
-        if let Some(owner) = self.ap_owner.take() {
-            owner.retire();
+        // The module build carries none of these AP/P2P role owners.
+        #[cfg(feature = "builtin")]
+        {
+            self.p2p_go = None;
+            self.client_request = None;
+            self.client_rx_mvm = None;
+            self.client_copies.clear();
+            if let Some(client) = self.p2p_client.take() {
+                client.retire();
+            }
+            self.ap_request = None;
+            if let Some(owner) = self.ap_owner.take() {
+                owner.retire();
+            }
         }
         self.six_tx_profile = None;
         self.mld_link = None;
@@ -1621,7 +1660,9 @@ impl Hardware {
     pub fn fail(&mut self) {
         self.failed = true;
         self.rx_epoch.deny();
+        #[cfg(feature = "builtin")]
         self.p2p.deny();
+        #[cfg(feature = "builtin")]
         if let Some(client) = &self.p2p_client {
             client.retire();
         }
@@ -1821,6 +1862,7 @@ impl Hardware {
         // transport armed and every allocation pinned if that ACK was lost.
         stopped?;
         self.armed = false;
+        #[cfg(feature = "builtin")]
         self.p2p.reset_after_dma_stop();
         self.notifications.clear();
         self.responses.clear();
@@ -1871,6 +1913,7 @@ impl Hardware {
         self.shared_memory = smem::State::new(parsed);
         self.receive_queues = rx_multi::State::new(parsed);
         self.rx_epoch.reset_after_dma_stop();
+        #[cfg(feature = "builtin")]
         self.p2p.reset_after_dma_stop();
         self.scan_mcc_watch = false;
         self.armed = false;
@@ -2345,10 +2388,22 @@ pub(super) mod rx_epoch;
 #[path = "runtime_rx_multi.rs"]
 mod rx_multi;
 
+#[cfg(feature = "builtin")]
 #[path = "runtime_source.rs"]
 pub(super) mod source;
+/// The module build's source fence: firmware bytes are a private copy and
+/// the KABI enforces the device token (`module/source.rs`).
+#[cfg(feature = "module")]
+#[path = "module/source.rs"]
+pub(super) mod source;
 
+#[cfg(feature = "builtin")]
 #[path = "runtime_mld_power.rs"]
+mod platform_power;
+/// The module build's platform-power owner: no ACPI tables, so nothing to
+/// publish (`module/platform_power.rs`).
+#[cfg(feature = "module")]
+#[path = "module/platform_power.rs"]
 mod platform_power;
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -2372,10 +2427,13 @@ mod bz_profile;
 #[path = "runtime_bz_tests.rs"]
 mod bz_tests;
 
+#[cfg(feature = "builtin")]
 #[path = "runtime_ap.rs"]
 mod ap;
 
+#[cfg(feature = "builtin")]
 #[path = "runtime_p2p.rs"]
 pub(in crate::iwlwifi) mod p2p;
+#[cfg(feature = "builtin")]
 #[path = "runtime_p2p_client.rs"]
 mod p2p_client_native;

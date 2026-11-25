@@ -1136,6 +1136,41 @@ Not in the module:
 128-entry module USB match table. QEMU has no Realtek Wi-Fi device, and no
 hardware boot of `rtl.ko` has run.
 
+## Loadable iwlwifi (all generations)
+
+The iwlwifi driver now builds from one source either built in or as
+`iwlwifi.ko`, and the module runs the driver's own code over the KABI for
+every id of the built-in table:
+
+- Gen3 (AX210, AX211, BE200/BE20x, BE21x): the PCIe transport (boot DMA,
+  MSI-X, context info/IML, ALIVE, PNVM), the MLD configuration and NVM, and
+  the `Connection` station: scan (active at the regulatory ceiling, else
+  passive), association with the in-driver WPA2-PSK/WPA3-SAE supplicant and
+  802.11w, rekeying, BA, the data path, link loss and disconnect;
+- Gen2 (AX200, AX201): the same transport's 22000 path and the API77 MVM
+  owner with its native four-way / host SAE station, signed per-platform
+  TX-power programs, BA pipeline and A-MSDU TX;
+- one `wlan%d` netdev and wiphy per radio through the netif bridge and the
+  `WIFI` v2 host.
+
+It claims all 28 ids; `narf-drivers-wireless/iwlwifi-module-only` steps the
+built-in claim aside for them. The stations read the kernel's regulatory
+domain through the shared `narf_wireless_regdomain` export; the transport
+parks, stops and verifies bus mastering through `narf_pci_command`; signed
+firmware assets carry their verified signer through the new additive
+`narf_firmware_signer` export. The module links on x86_64 and aarch64 and
+every undefined symbol is a KABI export.
+
+`modules/e2e/iwlwifi` loads the real `.ko` and checks relocations and init,
+the exact 28-id claim, refusal of a probe with no device context and clean
+unload (written; not yet run in the combined pass).
+
+Not in the module build: AP/P2P/monitor, scheduled scan, MLO further links,
+roaming, WoWLAN/D3 and system PM, CQM events, checksum offload, and BIOS
+SAR/PPAG (no KABI for the device's ACPI objects). QEMU has no Intel Wi-Fi
+device: firmware boot, scan and association through the module are
+unverified until run on hardware.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

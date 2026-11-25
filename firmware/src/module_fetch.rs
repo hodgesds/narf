@@ -117,6 +117,22 @@ pub fn signed(owner: u64, handle: u64) -> Result<bool, i32> {
     Ok(crate::view_of(&blob).map_err(errno)?.signer.is_some())
 }
 
+/// The verified signer key of `handle`'s blob (`FirmwareView::signer`), or
+/// `None` when it is unsigned. A module that binds signed inputs to their
+/// signer (iwlwifi's MVM power programs) needs the key itself, not only the
+/// fact that one exists.
+pub fn signer(owner: u64, handle: u64) -> Result<Option<[u8; 32]>, i32> {
+    let blob = {
+        let bindings = BINDINGS.lock();
+        bindings
+            .iter()
+            .find(|b| b.owner == owner && b.handle == handle)
+            .map(|b| b.blob)
+            .ok_or(EBADF)?
+    };
+    Ok(crate::view_of(&blob).map_err(errno)?.signer)
+}
+
 /// Release one handle. `-EBADF` when the owner holds no such handle.
 pub fn close(owner: u64, handle: u64) -> i32 {
     let mut bindings = BINDINGS.lock();

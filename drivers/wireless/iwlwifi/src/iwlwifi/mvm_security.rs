@@ -7,6 +7,8 @@ use super::super::{
     frame_api, security,
 };
 use super::{data::LegacyDataStatus, Owner, Phase};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{collections::VecDeque, vec::Vec};
 use narf_wireless::{
     eapol::{KeyFrame, KI_KEY_MIC, KI_KEY_TYPE_PAIRWISE},
@@ -314,7 +316,7 @@ impl Owner {
 
     pub async fn secure_legacy_wpa2(&mut self, pmk: [u8; 32]) -> Result<(), &'static str> {
         self.secure_using(pmk, security::fresh_nonce, || {
-            narf_wireless::reg::db::get_domain().ok_or("MVM WPA2 policy unavailable")
+            crate::iwlwifi::reg_source::get_domain().ok_or("MVM WPA2 policy unavailable")
         })
         .await
     }
@@ -345,7 +347,7 @@ impl Owner {
     /// IGTK, which is installed with MGMT_MCAST_KEY.
     pub async fn secure_legacy_sae(&mut self) -> Result<(), &'static str> {
         self.secure_sae_using(security::fresh_nonce, || {
-            narf_wireless::reg::db::get_domain().ok_or("MVM WPA3 policy unavailable")
+            crate::iwlwifi::reg_source::get_domain().ok_or("MVM WPA3 policy unavailable")
         })
         .await
     }
@@ -496,7 +498,7 @@ impl Owner {
     /// key slots, replay and current qualification owner. No caller RX bytes.
     pub async fn service_legacy_wpa2(&mut self) -> Result<(), &'static str> {
         self.service_security_using(security::fresh_nonce, || {
-            narf_wireless::reg::db::get_domain().ok_or("MVM WPA2 policy unavailable")
+            crate::iwlwifi::reg_source::get_domain().ok_or("MVM WPA2 policy unavailable")
         })
         .await
     }

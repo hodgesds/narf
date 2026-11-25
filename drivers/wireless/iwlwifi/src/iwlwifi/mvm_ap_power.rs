@@ -1,6 +1,8 @@
 //! Tag7 AP qualification: a planned ceiling is not an installed receipt.
 //! Only the native two-command transaction marks this power owner ready.
 use super::power;
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_wireless::reg::RegulatoryDomain;

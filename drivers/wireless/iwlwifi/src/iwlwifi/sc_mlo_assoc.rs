@@ -267,7 +267,7 @@ impl Admission<'_> {
             &permissions.channels,
         )
         .ok_or("native MLD further link span prohibited")?;
-        let ap = super::mld_power::ap_limit_in_ies(ies, beacon.capabilities, channel)?;
+        let ap = super::ap_power_limit::ap_limit_in_ies(ies, beacon.capabilities, channel)?;
         let max_power = ap.map_or(host, |limit| i16::from(host).min(limit) as i8);
         let rates = super::rates::Rates::parse_for_native_profiles(
             ies, channel, phy.mode, h2e, true, true,

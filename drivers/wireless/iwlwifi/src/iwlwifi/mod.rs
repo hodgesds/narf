@@ -49,27 +49,46 @@ use alloc::vec::Vec;
 use core::fmt;
 
 pub mod aggregation;
+#[cfg(feature = "builtin")]
 mod ap_gen2_wire;
+#[cfg(feature = "builtin")]
 mod ap_host;
+#[cfg(feature = "builtin")]
 mod ap_owner;
+mod ap_power_limit;
+#[cfg(feature = "builtin")]
 mod ap_session;
+#[cfg(feature = "builtin")]
 mod ap_wire;
 pub mod bcast;
 pub mod boot_context;
+#[cfg(feature = "builtin")]
 mod bootstrap;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_ap_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_ba_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_client_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_go_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_ht20_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_nested_ba_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_p2p_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_scan_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_shared_memory_configuration;
+#[cfg(feature = "builtin")]
 pub use bootstrap::gen2_transmit_power_request;
+#[cfg(feature = "builtin")]
 pub use bootstrap::{provision, provision_state, ProvisionState};
 pub use mvm_boot::PowerRequest as Gen2TransmitPowerRequest;
-pub use mvm_boot::SharedMemory as Gen2SharedMemory;
+mod gen2_smem;
+pub use gen2_smem::SharedMemory as Gen2SharedMemory;
 #[cfg(any(test, feature = "kernel-test"))]
 mod bz_fixture;
 mod bz_profile;
@@ -77,6 +96,7 @@ pub mod connection;
 mod context_v1;
 pub mod csum;
 pub mod data_queue;
+#[cfg(feature = "builtin")]
 pub mod device;
 pub mod firmware_api;
 mod firmware_identity;
@@ -94,33 +114,44 @@ pub mod handshake;
 pub mod ht_vht;
 pub mod iwl_msix;
 pub mod mac_ctx;
+#[cfg(feature = "builtin")]
 mod mld_platform;
 mod mld_policy;
+#[cfg(feature = "builtin")]
 mod mld_power;
 mod mld_regulatory;
+mod mld_start;
 pub mod mlme;
 mod mvm_boot;
 mod mvm_d3;
+#[cfg(feature = "builtin")]
 mod mvm_device;
 mod mvm_publication;
 mod native_band;
+#[cfg(feature = "builtin")]
 mod p2p_client;
 #[cfg(feature = "kernel-test")]
 mod p2p_client_fixture;
+#[cfg(feature = "builtin")]
 mod p2p_client_request;
+#[cfg(feature = "builtin")]
 mod p2p_client_rx;
 mod p2p_gen2_wire;
+#[cfg(feature = "builtin")]
 mod p2p_go;
 #[cfg(feature = "kernel-test")]
 mod p2p_go_fixture;
 mod p2p_go_key;
+#[cfg(feature = "builtin")]
 mod p2p_host;
+#[cfg(feature = "builtin")]
 mod p2p_owner;
 mod p2p_wire;
 pub mod pnvm;
 mod progress;
 pub mod qos;
 pub mod rates;
+mod reg_source;
 pub mod regs;
 pub mod rekey;
 pub mod runtime;
@@ -138,6 +169,7 @@ mod sc_ttlm_neg;
 mod sc_tx_amsdu;
 pub mod scan_api;
 mod scheduled_epoch;
+#[cfg(feature = "builtin")]
 mod scheduled_wire;
 pub mod security;
 mod six_ghz_power;
@@ -154,19 +186,40 @@ pub mod tx_gen2;
 mod protocol_tests;
 pub mod wpa;
 
+/// The loadable build's KABI platform, PCI binding and netdev (`iwlwifi.ko`).
+#[cfg(feature = "module")]
+pub mod module;
+/// Roles the module build does not carry, under the names the shared station
+/// code uses (`module/absent.rs`).
+#[cfg(feature = "module")]
+use module::absent::{p2p_client, p2p_go};
+
+#[cfg(feature = "builtin")]
 use alloc::boxed::Box;
+#[cfg(feature = "builtin")]
 use alloc::sync::Arc;
+#[cfg(feature = "builtin")]
 use core::fmt::Write as _;
+#[cfg(feature = "builtin")]
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "builtin")]
 use core::task::Waker;
 
+#[cfg(feature = "builtin")]
 use crate::iwlwifi::transport::IwlMmio;
+#[cfg(feature = "builtin")]
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
+#[cfg(feature = "builtin")]
 use narf_capabilities::{Cap, Write};
+#[cfg(feature = "builtin")]
 use narf_io::DmaBuffer;
+#[cfg(feature = "builtin")]
 use narf_ipc::{Consumer, Producer};
+#[cfg(feature = "builtin")]
 use narf_lib::sync::IrqSafeSpinLock;
+#[cfg(feature = "builtin")]
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
+#[cfg(feature = "builtin")]
 use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, WirelessConfig, WirelessError, WirelessIfaceInfo,
     WirelessNetIface,
@@ -176,6 +229,7 @@ pub const INTEL_VENDOR: u16 = 0x8086;
 
 // ── IwlDevice ──────────────────────────────────────────────────────
 
+#[cfg(feature = "builtin")]
 struct IwlDevice {
     cap: Cap<narf_bus::BusDeviceCap, Write>,
     mmio: MmioRegion,
@@ -197,6 +251,7 @@ struct IwlDevice {
     scan_waker: IrqSafeSpinLock<Option<Waker>>,
 }
 
+#[cfg(feature = "builtin")]
 // SAFETY: every interior-mutable field (`rx_q`, `tx_q0`, `bss_list`,
 // `scan_waker`, the atomics) is guarded by an `IrqSafeSpinLock` or is
 // an `Atomic*`, so concurrent access from multiple threads is
@@ -205,10 +260,12 @@ struct IwlDevice {
 // are only dereferenced under those locks. Hence sharing/sending an
 // `IwlDevice` across threads is sound.
 unsafe impl Send for IwlDevice {}
+#[cfg(feature = "builtin")]
 // SAFETY: see the `Send` impl above — all shared mutable state is
 // behind `IrqSafeSpinLock`/atomics, so `&IwlDevice` is safe to share.
 unsafe impl Sync for IwlDevice {}
 
+#[cfg(feature = "builtin")]
 impl IwlDevice {
     /// This historical diagnostic facade does not own a native firmware
     /// command, response, and completion lifecycle. The distinct retained
@@ -334,6 +391,7 @@ impl IwlDevice {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl core::fmt::Debug for IwlDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IwlDevice")
@@ -348,8 +406,10 @@ impl core::fmt::Debug for IwlDevice {
 /// it. Reserved the first time either view of the adapter needs it — the
 /// wireless-registry `IwlDevice` at probe or the netdev `device::Device` —
 /// and shared by both, so the card has one name.
+#[cfg(feature = "builtin")]
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
+#[cfg(feature = "builtin")]
 pub(crate) fn iwl_ifname() -> &'static str {
     let mut name = IFNAME.lock();
     if name.is_empty() {
@@ -358,6 +418,7 @@ pub(crate) fn iwl_ifname() -> &'static str {
     *name
 }
 
+#[cfg(feature = "builtin")]
 impl Interface for IwlDevice {
     fn name(&self) -> &str {
         iwl_ifname()
@@ -383,6 +444,7 @@ impl Interface for IwlDevice {
 ///
 /// All supported Intel chips cover 2.4 GHz (channels 1-13) and 5 GHz (channels 36-165).
 /// Wi-Fi 6E and Wi-Fi 7 chips (AX210, AX211, BE200) also cover 6 GHz (channels 1-233).
+#[cfg(feature = "builtin")]
 pub fn bands_for_chip(chip: &ChipConfig) -> Vec<narf_wireless::iface::WirelessBand> {
     let mut bands = alloc::vec![
         narf_wireless::iface::WirelessBand {
@@ -410,6 +472,7 @@ pub fn bands_for_chip(chip: &ChipConfig) -> Vec<narf_wireless::iface::WirelessBa
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "builtin")]
 impl WirelessNetIface for IwlDevice {
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
         WirelessIfaceInfo {
@@ -649,6 +712,7 @@ impl WirelessNetIface for IwlDevice {
     }
 }
 
+#[cfg(feature = "builtin")]
 fn spawn_pumps(
     device: Arc<IwlDevice>,
     rx_prod: Producer<Frame, RX_RING_N>,
@@ -665,13 +729,16 @@ fn spawn_pumps(
     });
 }
 
+#[cfg(feature = "builtin")]
 use narf_lib::id::DomainId;
 
+#[cfg(feature = "builtin")]
 struct IwlRxHandler {
     device: Arc<IwlDevice>,
     rx_prod: Producer<Frame, RX_RING_N>,
 }
 
+#[cfg(feature = "builtin")]
 impl rx::RxHandler for IwlRxHandler {
     fn handle(&mut self, kind: rx::RxKind, _hdr: rx::RxPacketHeader, payload: &[u8]) {
         match kind {
@@ -725,6 +792,7 @@ impl rx::RxHandler for IwlRxHandler {
     }
 }
 
+#[cfg(feature = "builtin")]
 async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>) {
     let _ = writeln!(narf_console::Writer, "  iwlwifi: RX pump started");
 
@@ -765,6 +833,7 @@ async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>
     }
 }
 
+#[cfg(feature = "builtin")]
 async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     let _ = writeln!(narf_console::Writer, "  iwlwifi: TX pump started");
 
@@ -814,6 +883,10 @@ async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RIN
 
 // ── MMIO implementation ────────────────────────────────────────────
 
+#[cfg(feature = "builtin")]
+mod mmio;
+#[cfg(feature = "module")]
+#[path = "module/mmio.rs"]
 mod mmio;
 use mmio::IwlMmioImpl;
 
@@ -1476,6 +1549,7 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
 /// PCI probe retains and parks the exact native binding, then defers all
 /// firmware resolution/startup to its retained executor-time continuation.
 /// Exact Gen2/API77 and supported Gen3 profiles use distinct retained owners.
+#[cfg(feature = "builtin")]
 static OWNED: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
 
 /// Linux 7.3 `pcie/drv.c` claims PCI 0xA840 only with these subsystem
@@ -1492,6 +1566,7 @@ pub fn pci_subsystem_claimed(device: u16, subsystem_id: u16) -> bool {
     device != 0xa840 || BZ_A840_SUBSYSTEMS.contains(&subsystem_id)
 }
 
+#[cfg(feature = "builtin")]
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     let chip = match chip_config_for_pci_id(device.id.vendor, device.id.device) {
         Some(c) if pci_subsystem_claimed(device.id.device, device.id.subsystem_id) => c,
@@ -1567,8 +1642,35 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// for all of them would collapse to just the last entry. The
 /// per-match names are `iwlwifi-<did>` (the canonical display
 /// name is still recorded via `record_bound("iwlwifi", ...)`).
+#[cfg(feature = "builtin")]
 pub fn register() {
     for &(did, name) in PCI_DIDS.iter() {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name,
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: INTEL_VENDOR,
+                device: did,
+            },
+            probe,
+        });
+    }
+}
+
+/// Whether `iwlwifi.ko` carries `chip`: the one predicate behind the module's
+/// PCI claim and `register_builtin_only`, so the two never disagree.
+pub fn module_carries(chip: &ChipConfig) -> bool {
+    matches!(chip.generation, Generation::Gen2 | Generation::Gen3)
+}
+
+/// `narf-drivers-wireless/iwlwifi-module-only`: register every id except the
+/// ones `iwlwifi.ko` claims ([`module_carries`]), so an early-loaded module
+/// owns those devices while any other generation stays built in.
+#[cfg(feature = "builtin")]
+pub fn register_builtin_only() {
+    for &(did, name) in PCI_DIDS.iter() {
+        if chip_config_for_pci_id(INTEL_VENDOR, did).is_some_and(|chip| module_carries(&chip)) {
+            continue;
+        }
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name,
             kind: narf_bus::MatchKind::VendorDevice {
@@ -1584,7 +1686,7 @@ pub fn register() {
 /// name used at registration. Names match `iwlwifi-<did>` pattern
 /// so registry lookups can find them by string. Sync with
 /// `chip_config_for_pci_id`.
-const PCI_DIDS: &[(u16, &str)] = &[
+pub(crate) const PCI_DIDS: &[(u16, &str)] = &[
     (0x2723, "iwlwifi-2723"),
     (0x02f0, "iwlwifi-02f0"),
     (0x06f0, "iwlwifi-06f0"),

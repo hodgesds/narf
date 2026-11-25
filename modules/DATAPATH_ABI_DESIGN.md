@@ -366,6 +366,18 @@ narf_module_param(name:*const u8, name_len:usize, out:*mut u8, cap:usize, out_le
 applied `<module>.<param>=` from the kernel command line and then the load's
 own arguments (`modules/MODULE_AUTHORING.md`, "Module parameters").
 
+**Additive (iwlwifi.ko):**
+
+```text
+narf_firmware_signer(handle:u64, out:*mut u8, len:usize)->i32   // 32-byte verified signer key
+```
+
+`narf_firmware_signed` says whether a blob is signed; a driver that binds a
+signed input to its signer (iwlwifi's Gen2 per-platform TX-power programs,
+whose built-in `Asset` carries `signer`) needs the key itself. Returns 0,
+`-ENODATA` for an unsigned blob, `-EINVAL` for a null or short output, or
+`-EBADF`. Requires `Firmware`, like the other firmware exports.
+
 ## Device-specific PCI configuration window
 
 Status: **implemented**; brcmfmac (`brcm` `.ko`, Broadcom FullMAC PCIe) is

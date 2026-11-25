@@ -1,5 +1,7 @@
 //! Composed legacy station lifecycle for the native API77 interface.
 use super::{Owner, Phase};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use crate::{firmware_asset::Asset, future_heap};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicBool;

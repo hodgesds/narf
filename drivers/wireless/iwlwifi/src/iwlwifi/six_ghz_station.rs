@@ -5,6 +5,8 @@ use super::{
     ht_vht::Local,
     native_band::{Band, Channel},
 };
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{sync::Arc, vec::Vec};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_wireless::{

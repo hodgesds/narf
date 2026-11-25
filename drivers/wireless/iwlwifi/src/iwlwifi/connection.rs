@@ -6,6 +6,8 @@ use super::{
     runtime::Hardware,
     scan_api, security, station_api,
 };
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -318,8 +320,7 @@ impl Connection {
         local_phy: super::ht_vht::Local,
         roam_from: Option<[u8; 6]>,
     ) -> Result<Box<Self>, &'static str> {
-        let domain = narf_wireless::reg::db::ensure_domain()
-            .map_err(|_| "wireless regulatory domain is not configured")?;
+        let domain = ensure_domain()?;
         let policy = super::mld_policy::Source::native();
         hw.install_rf_policy(super::mld_policy::Authority::Transaction(
             policy.transaction(&domain)?,
@@ -392,8 +393,7 @@ impl Connection {
         local_phy: super::ht_vht::Local,
         further: Vec<super::MldLinkCandidate>,
     ) -> Result<Box<Self>, &'static str> {
-        let domain = narf_wireless::reg::db::ensure_domain()
-            .map_err(|_| "wireless regulatory domain is not configured")?;
+        let domain = ensure_domain()?;
         let policy = super::mld_policy::Source::native();
         hw.install_rf_policy(super::mld_policy::Authority::Transaction(
             policy.transaction(&domain)?,
@@ -593,7 +593,7 @@ impl Connection {
         let ap_power = if six.is_some() {
             None
         } else {
-            super::mld_power::ap_limit_in_ies(
+            super::ap_power_limit::ap_limit_in_ies(
                 &beacon.information_elements,
                 beacon.capabilities,
                 beacon.channel,
@@ -2416,7 +2416,7 @@ impl Connection {
                     if let Some(body) = mpdu.body(24, 0) {
                         if let Some(ies) = body.get(12..) {
                             let capabilities = u16::from_le_bytes([body[10], body[11]]);
-                            if let Ok(Some(power)) = super::mld_power::ap_limit_in_ies(
+                            if let Ok(Some(power)) = super::ap_power_limit::ap_limit_in_ies(
                                 ies,
                                 capabilities,
                                 self.beacon.channel,
@@ -3721,6 +3721,7 @@ impl Connection {
         narf_wireless::mfp::protect_outbound(igtk, hdr_24, body).map_err(|_| "BIP protect failed")
     }
 
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn p2p_management(
         &mut self,
         hw: &mut Hardware,
@@ -4085,6 +4086,17 @@ pub(super) fn channel_power_width(
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "connection_tests.rs"]
 mod tests;
+
+/// The installed regulatory domain, bootstrapping the staged signed policy
+/// when none exists: `narf_wireless::reg::db` built in, the kernel's
+/// database through the `WIFI` host in the module build.
+fn ensure_domain() -> Result<narf_wireless::reg::RegulatoryDomain, &'static str> {
+    #[cfg(feature = "builtin")]
+    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| ());
+    #[cfg(feature = "module")]
+    let domain = super::module::regulatory::ensure_domain();
+    domain.map_err(|_| "wireless regulatory domain is not configured")
+}
 
 #[path = "connection_tx_amsdu.rs"]
 pub(super) mod tx_amsdu;

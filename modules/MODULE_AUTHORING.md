@@ -377,6 +377,16 @@ unreachable. A USB function's heartbeat and netdev come from
 `narf_usb_spawn_poller` and `narf_usb_netif_*` (the bus-context exports
 refuse USB tokens). `modules/e2e/rtw88` loads it.
 
+`drivers/wireless/iwlwifi` takes the same split for a driver whose files name
+the kernel crates directly. Its `src/iwlwifi/module/kernel.rs` defines
+modules named like the kernel crates (`narf_time`, `narf_io`, ...) holding the
+subset the module-built files use, and each such file adds
+`#[cfg(feature = "module")] use crate::iwlwifi::module::kernel::*;`, which
+shadows the absent extern crates; the built-in build is untouched. Roles the
+module does not carry are uninhabited types under the shared code's names
+(`module/absent.rs`), so that code compiles unchanged and the unreachable
+paths are proven so by the type checker. `modules/e2e/iwlwifi` loads it.
+
 ## Lifecycle symbols
 
 Every NARF module exports two C-ABI symbols the kernel calls:

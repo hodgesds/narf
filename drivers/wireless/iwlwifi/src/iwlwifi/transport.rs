@@ -52,6 +52,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::vec::Vec;
 use core::sync::atomic::{compiler_fence, Ordering};
 

@@ -8,6 +8,8 @@ use super::super::{
     scan_api,
 };
 use super::{Owner, Phase};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::vec::Vec;
 use narf_wireless::{reg::RegulatoryDomain, scan::BssSecurity, BssInfo};
 
@@ -177,7 +179,7 @@ impl Owner {
         // The native binding installs only a signed regulatory blob into the
         // existing trusted registry. Refresh the snapshot for every operation
         // rather than retaining a permissive country across later updates.
-        let policy = narf_wireless::reg::db::get_domain()
+        let policy = crate::iwlwifi::reg_source::get_domain()
             .ok_or("missing authenticated MVM regulatory policy")?;
         self.passive_scan_in_domain(channels, &policy).await
     }
