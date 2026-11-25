@@ -58,7 +58,8 @@ pub enum ProvisionState {
     Ready = 2,
     Failed = 3,
 }
-/// The published station generation of the retained BCM43602 owner.
+/// The published station generation of the retained PCIe owner (any
+/// `chip_profile::covered` chip).
 pub(super) type PcieGeneration = crate::cyw43439::interface::generation::Generation<
     super::station_transport::Adapter<PcieBackplane>,
 >;
@@ -106,7 +107,7 @@ where
     Wait: FnMut() -> WaitFut,
     WaitFut: core::future::Future<Output = ()>,
 {
-    let mut last_err = "signed BCM43602 board selection unavailable or mismatched";
+    let mut last_err = "signed board selection unavailable or mismatched";
     for attempt in 0..max_attempts {
         if attempt > 0 {
             wait().await;
@@ -146,23 +147,32 @@ pub(super) fn start(device: &mut BrcmfmacDevice) {
         generation: IrqSafeSpinLock::new(None),
     });
     *BOOTSTRAP.lock() = Some(owner);
-    narf_scheduler::spawn(async {
+    let (chip, revision) = (device.chip.id, device.chip.revision);
+    narf_scheduler::spawn(async move {
         if let Err(reason) = drive_scheduled(120, provision_state, provision, || {
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
         })
         .await
         {
-            let _ = writeln!(narf_console::Writer, "brcmfmac: {}", reason);
+            // Linux `brcmf_chip_name`: decimal ids outside 0x4000..=0xa000.
+            let _ = if !(0x4000..=0xa000).contains(&chip) {
+                writeln!(
+                    narf_console::Writer,
+                    "brcmfmac BCM{chip}/{revision}: {reason}"
+                )
+            } else {
+                writeln!(
+                    narf_console::Writer,
+                    "brcmfmac BCM{chip:x}/{revision}: {reason}"
+                )
+            };
         }
     });
 }
 /// Retry newly staged signed provisioning only before a hardware attempt.
 /// The exact parked bus remains retained; this never resets/rebuilds an owner.
 pub async fn provision() -> Result<(), &'static str> {
-    let owner = BOOTSTRAP
-        .lock()
-        .clone()
-        .ok_or("no retained BCM43602 owner")?;
+    let owner = BOOTSTRAP.lock().clone().ok_or("no retained PCIe owner")?;
     if narf_net::trusted_net_authority().is_none() {
         return Err("network registration authority unavailable");
     }
@@ -195,16 +205,16 @@ async fn provision_checked(
     policy: impl FnOnce() -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
     if owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8 {
-        return Err("BCM43602 provisioning already attempted");
+        return Err("PCIe provisioning already attempted");
     }
     let mut slot = owner.parked.lock().await;
     if owner.state.load(Ordering::Acquire) != ProvisionState::Parked as u8 {
-        return Err("BCM43602 provisioning already attempted");
+        return Err("PCIe provisioning already attempted");
     }
     if owner.removed.load(Ordering::Acquire) {
-        return Err("BCM43602 owner removed");
+        return Err("PCIe owner removed");
     }
-    let bus = slot.as_ref().ok_or("parked BCM43602 owner unavailable")?;
+    let bus = slot.as_ref().ok_or("parked PCIe owner unavailable")?;
     let pci = identity(&bus.device);
     let explicit = selected_profile(&bus.device);
     let retained = Reprovision {
@@ -219,14 +229,14 @@ async fn provision_checked(
     assets
         .proof
         .validate()
-        .map_err(|_| "BCM43602 provisioning revoked/replaced before boot")?;
+        .map_err(|_| "PCIe provisioning revoked/replaced before boot")?;
     // All provisioning failures above preserve the exact parked bus. From
     // this point cancellation/error is one-shot and the device claim survives.
     owner
         .state
         .store(ProvisionState::Starting as u8, Ordering::Release);
     let _attempt = Attempt(&owner.state);
-    let mut bus = slot.take().ok_or("parked BCM43602 owner unavailable")?;
+    let mut bus = slot.take().ok_or("parked PCIe owner unavailable")?;
     bus.proof = Some(assets.proof.clone());
     let boot = if let Some(profile) = explicit {
         boot::Cr4::claim(bus, pci, profile)
@@ -253,7 +263,7 @@ async fn provision_checked(
     let device =
         crate::cyw43439::interface::attach_runtime(name, alloc::boxed::Box::new(adapter), &[])
             .await
-            .map_err(|_| "BCM43602 station attachment failed")?;
+            .map_err(|_| "PCIe station attachment failed")?;
     *LAST_NAME.lock() = Some(name);
     let generation = Arc::new(PcieGeneration::with_publisher(
         device,
@@ -276,7 +286,7 @@ async fn provision_checked(
     drop(slot);
     Ok(())
 }
-/// System resume for the published BCM43602 generation, if any: hot
+/// System resume for the published PCIe generation, if any: hot
 /// D0_INFORM resume or, when the dongle lost power, the cold-resume
 /// generation swap (`Generation::resume`). `None` when no generation exists.
 pub(super) async fn resume() -> Option<Result<(), crate::cyw43439::runtime::Error>> {
@@ -327,7 +337,7 @@ impl Reprovision {
                     host,
                     None,
                 )
-                .map_err(|_| "signed BCM43602 board selection unavailable or mismatched")?,
+                .map_err(|_| "signed board selection unavailable or mismatched")?,
             )
         } else {
             None
@@ -337,21 +347,20 @@ impl Reprovision {
                 || self.revision >= 16
                 || profile.revision_mask & (1 << self.revision) == 0
             {
-                return Err("explicit BCM43602 chip/revision mismatch");
+                return Err("explicit board chip/revision mismatch");
             }
             super::provision::trusted_assets_using(authority, profile.firmware, profile.nvram)
                 .map_err(|_| "board-selected firmware/signed NVRAM unavailable")?
         } else {
             let selection = selection.as_ref().unwrap();
             if !selection.admits_chip(self.chip, self.revision) {
-                return Err("BCM43602 discovered chip/revision mismatch");
+                return Err("discovered chip/revision mismatch");
             }
             selection
                 .load_using(authority)
-                .map_err(|_| "selected BCM43602 asset signature/key/length/hash mismatch")?
+                .map_err(|_| "selected asset signature/key/length/hash mismatch")?
         };
-        let nvram =
-            boot::pack_nvram(&assets.nvram).map_err(|_| "invalid selected BCM43602 NVRAM")?;
+        let nvram = boot::pack_nvram(&assets.nvram).map_err(|_| "invalid selected NVRAM")?;
         Ok((assets, selection, nvram))
     }
 }
@@ -380,7 +389,7 @@ impl super::station_transport::Reboot<PcieBackplane> for Reprovision {
         runtime::Runtime::attach(booted).map_err(|error| (error, None))
     }
 }
-/// Linux v7.2 `pcie.c::brcmf_pcie_remove` for the retained BCM43602 owner:
+/// Linux v7.2 `pcie.c::brcmf_pcie_remove` for the retained PCIe owner:
 /// no later provisioning attempt may start, an in-flight attempt is waited
 /// out, and the published generation is withdrawn, stopped and released.
 /// Returns true when nothing remains mapped: no attempt published DMA, or

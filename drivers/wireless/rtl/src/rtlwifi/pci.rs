@@ -580,6 +580,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// controller slot or publication refused it.
 pub(super) fn bind(dev: RtlwifiDevice) -> bool {
     let name = dev.name;
+    let chip = name_for(dev.device_id);
     let address = dev.bus_addr;
     let mac = dev.mac;
     let native = dev.native.clone();
@@ -636,7 +637,8 @@ pub(super) fn bind(dev: RtlwifiDevice) -> bool {
                 use core::fmt::Write;
                 let _ = writeln!(
                     crate::platform::console::Writer,
-                    "rtlwifi-8188ee native preparation: {:?}",
+                    "{} native preparation: {:?}",
+                    chip,
                     error
                 );
             }
@@ -804,11 +806,13 @@ pub(super) fn assemble(
     if let Some(ae) = &ae {
         ae.attach_name(name).map_err(|_| ProbeError::PciAccess)?;
     }
-    // The lifecycle starts on the function's own band default: a
-    // dual-dual RTL8192DE MAC0 function starts on 5 GHz channel 36 (its
-    // Linux default), every other function on channel 1, so cold
-    // bring-up provisions MAC0 on 5 GHz with no explicit retune. An
-    // unreadable PROM falls back to channel 1 and the prepare layer
+    // The lifecycle starts on the function's own band default
+    // (`rtl8192de::default_channel`): 5 GHz channel 36 for a dual-dual
+    // RTL8192DE MAC0 function (its Linux default), channel 1 for every
+    // other function. `identity::admissible` refuses a dual-dual MAC0
+    // (its bandset lacks channel 1), so no admitted function reaches the
+    // channel-36 arm today and every native device starts on channel 1.
+    // An unreadable PROM falls back to channel 1 and the prepare layer
     // refuses, as before.
     let initial_channel = if did == RTL_DEV_8192DE {
         factory

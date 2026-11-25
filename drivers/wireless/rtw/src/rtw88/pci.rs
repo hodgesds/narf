@@ -4,10 +4,12 @@
 //! Linux `rtw88/pci.c::rtw_pci_io_mapping` (`bar_id = 2`). BAR2 is
 //! the register aperture; firmware bytes cannot be copied into it as SRAM.
 //!
-//! RTL8821CE/RTL8822CE publish one named station shell before retained firmware,
-//! MAC/PHY, signed power qualification, radio and packet continuation. Bounded
-//! polling drives the qualified awake channel1 profile with interrupts masked.
-//! Each chip retains its own factory/PHY/RF/power owner; C22B stays diagnostic.
+//! RTL8821CE/RTL8822CE/RTL8822BE publish one named station shell
+//! (`interface::Device`) before retained firmware, MAC/PHY, signed power
+//! qualification, radio and packet continuation. Bounded polling drives the
+//! qualified awake channel1 profile with interrupts masked. Each chip retains
+//! its own factory/PHY/RF/power owner (C22 `firmware`, C21 `sibling`, B22
+//! `b22`); a function with no owner registers only a diagnostic netdev.
 
 #![allow(dead_code)]
 
@@ -39,7 +41,7 @@ pub struct Rtw88Device {
     pub(crate) bus_addr: narf_bus::BusAddr,
     pub registers: MmioRegion,
     pub mac: [u8; MAC_ADDR_LEN],
-    /// PCI device id selecting the retained C21/C22 station or diagnostic C22B.
+    /// PCI device id selecting the retained C21, C22 or B22 station owner.
     pub device_id: u16,
     /// The exact post-power native owner, shared by controller and interface.
     pub(super) firmware: Option<Arc<super::firmware_native::Firmware>>,

@@ -29,8 +29,11 @@
 //! RF/BB stages run unchanged over the asynchronous register `Io`.
 //! TX A-MPDU binds the N21T record as PCI does; bursts are queued by
 //! `usb_packet::Owner::submit_batch` inside the gate's `invoke_batch`.
-//! Power-tracking maintenance and the PS RX quiet proof keep the trait's
-//! `Unsupported` defaults.
+//! N21W power-tracking maintenance (`station_power_tracking_*`) and the
+//! PS RX quiet proof (`ps_rx_quiet`, checked by `ps_mailbox_submit`)
+//! follow `pci_firmware.rs` over EP0 as well. The WoWLAN firmware swap
+//! (`claim_swap`/`end_swap`), `hci_stop`/`hci_restart` and `finish_radio`
+//! keep the trait's `Unsupported` defaults.
 use super::firmware_transport::{self, Error};
 use super::packet_core::{self, Step};
 use super::usb::{self, Endpoints, Registers, Speed};
