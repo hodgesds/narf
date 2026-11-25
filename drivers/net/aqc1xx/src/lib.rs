@@ -1,10 +1,10 @@
 //! Aquantia/Marvell AQC1xx (Atlantic) NIC family — dual-build.
 //!
-//! AQC113 first (`hw_atl2` generation in Linux's atlantic driver):
-//! probe + firmware-boot handshake + TX/RX rings + publication +
-//! carrier. The older AQC100/107/108/109/111/112 (`hw_atl` B1) and
-//! legacy D-series (`hw_atl` A0/B0) generations use a different
-//! register backend and are a remainder — see `aqc113.rs`.
+//! AQC113 (`hw_atl2` generation in Linux's atlantic driver) plus the
+//! older AQC100/107/108/109/111/112 (`hw_atl` B1) and legacy D-series
+//! (`hw_atl` A0/B0) generations — probe + firmware-boot handshake +
+//! TX/RX rings + publication + carrier. The older generations live
+//! in `aqc100.rs`; the AQC113 generation in `aqc113.rs`.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -19,6 +19,9 @@ extern crate alloc;
 pub use narf_drivers_net_core::*;
 
 #[cfg(feature = "builtin")]
+pub mod aqc100;
+
+#[cfg(feature = "builtin")]
 pub mod aqc113;
 
 #[cfg(feature = "module")]
@@ -30,7 +33,7 @@ narf_driver! {
         version: "0.1.0",
         license: "GPL-2.0-or-later",
         author: "narf",
-        description: "Aquantia/Marvell AQC113 (Atlantic) NIC family",
+        description: "Aquantia/Marvell AQC1xx (Atlantic) NIC family",
         target_domain: "net",
     },
     register: do_register,
@@ -40,6 +43,7 @@ narf_driver! {
 /// `Stage::Subsys` initcall.
 #[cfg(feature = "builtin")]
 fn do_register() {
+    aqc100::register_pci_driver();
     aqc113::register_pci_driver();
 }
 

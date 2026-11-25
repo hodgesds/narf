@@ -1,29 +1,36 @@
 # narf-drivers-net-aqc1xx — Aquantia/Marvell AQC1xx (Atlantic) NIC family
 
 Stage-2 driver for the AQC113 generation (`hw_atl2` in Linux's
-`drivers/net/ethernet/aquantia/atlantic/`): probe + firmware-boot
-handshake + TX/RX rings + publication + carrier, fixture-validated
-against a simulated device conversation. Only the silicon itself
-remains untested.
+`drivers/net/ethernet/aquantia/atlantic/`) and the older
+AQC100/107/108/109/111/112 (`hw_atl` B1) and legacy D-series
+(`hw_atl` A0/B0) generations: probe + firmware-boot handshake +
+TX/RX rings + publication + carrier, fixture-validated against a
+simulated device conversation. Only the silicon itself remains
+untested.
 
 ## Scope
 
-Registered PCI IDs (vendor `0x1D6A`, all `hw_atl2` per Linux's
-`aq_pci_tbl` / `hw_atl_boards`): AQC113DEV `0x00C0`, AQC113 `0x04C0`,
-AQC116C `0x11C0`, AQC115C `0x12C0`, AQC113C `0x14C0`, AQC113CA
-`0x34C0`, AQC114CS `0x93C0`, AQC113CS `0x94C0`.
+Registered PCI IDs (vendor `0x1D6A`, per Linux's `aq_pci_tbl` /
+`hw_atl_boards`):
 
-Remainder (separate lane): the AQC100/107/108/109/111/112 family
-(`hw_atl` B1 backend) and the legacy D100/D107/D108/D109 + `0x0001`
-(`hw_atl` A0/B0 backend) use a different register model — different
-init, no MIF shared-buffer firmware interface — and are not claimed
-here.
+- `hw_atl2` (AQC113 generation): AQC113DEV `0x00C0`, AQC113
+  `0x04C0`, AQC116C `0x11C0`, AQC115C `0x12C0`, AQC113C `0x14C0`,
+  AQC113CA `0x34C0`, AQC114CS `0x93C0`, AQC113CS `0x94C0`.
+- `hw_atl` B1: AQC100 `0x00B1`, AQC107 `0x07B1`, AQC108 `0x08B1`,
+  AQC109 `0x09B1`, AQC111 `0x11B1`, AQC112 `0x12B1`, plus the S
+  variants `0x80B1`, `0x87B1`, `0x88B1`, `0x89B1`, `0x91B1`,
+  `0x92B1`.
+- `hw_atl` A0/B0 (legacy D-series): `0x0001`, D100 `0xD100`,
+  D107 `0xD107`, D108 `0xD108`, D109 `0xD109`. The backend (A0/B0/B1)
+  is selected at runtime from the MIF ID register, not the PCI
+  revision, and the firmware generation (FW1x/FW2x) from the MPI
+  firmware version word.
 
 ## Reference
 
 Linux `drivers/net/ethernet/aquantia/atlantic/` (GPL-2.0; NARF is
 GPL-2.0-or-later, so adaptation is permitted), reference tree
-`~/workspace/scratch/ethernet/linux2` @ `cbbddb6`:
+`~/workspace/scratch/ethernet/linux-atlantic` @ `4dce97c6`:
 
 - `atlantic/aq_common.h` — PCI IDs, `AQ_NIC_RATE_*` bits.
 - `atlantic/aq_pci_func.c` — `aq_pci_tbl`, `hw_atl_boards`,
