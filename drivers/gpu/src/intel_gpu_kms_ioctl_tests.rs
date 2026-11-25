@@ -1129,3 +1129,178 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     intel_kms_present_on_a_dark_panel_lights_it_first
 );
+
+/// An Intel card in the DRM registry for the content-protection round
+/// trip (the KMS owner's requests reach HDCP through its index).
+#[derive(Debug)]
+struct HdcpCard;
+impl crate::drm_registry::DrmCard for HdcpCard {
+    fn name(&self) -> &str {
+        "intel-hdcp-fixture"
+    }
+    fn driver(&self) -> &str {
+        "intel-gpu"
+    }
+    fn vendor_id(&self) -> u16 {
+        0xf00d
+    }
+    fn device_id(&self) -> u16 {
+        0xcafe
+    }
+    fn subsystem_vendor(&self) -> u16 {
+        0
+    }
+    fn subsystem_device(&self) -> u16 {
+        0
+    }
+    fn vbios_version(&self) -> Option<&str> {
+        None
+    }
+    fn gpu_busy_percent(&self) -> Option<u32> {
+        None
+    }
+    fn power_state(&self) -> &str {
+        "D0"
+    }
+}
+
+/// "Content Protection" and "HDCP Content Type" through the Intel KMS
+/// owner (drm_atomic_connector_set_property → intel_hdcp_atomic_check →
+/// intel_hdcp_update_pipe), and the driver's ENABLED back to userspace
+/// with its connector property uevent (drm_hdcp_update_content_protection
+/// → drm_sysfs_connector_property_event: ACTION=change, HOTPLUG=1,
+/// CONNECTOR, PROPERTY).
+fn intel_kms_content_protection_round_trip() -> TestResult {
+    use crate::intel_hdcp::CpValue;
+    const CP: u32 = 0x84;
+    const TYPE: u32 = 0x85;
+    let mut card = Card::new("intel-gpu", "Intel test", (1, 0, 0));
+    card.native_atomic = true;
+    card.crtcs.push(Crtc {
+        id: 1,
+        mode: Some(crate::Mode {
+            width: 64,
+            height: 32,
+            refresh_hz: 60,
+            bpp: 32,
+        }),
+        enabled: true,
+        primary_fb: None,
+        x: 0,
+        y: 0,
+    });
+    card.connectors.push(crate::drm::card::Connector {
+        id: 3,
+        connector_type: crate::drm::card::ConnectorType::DisplayPort,
+        connector_type_id: 1,
+        status: crate::drm::card::ConnectorStatus::Connected,
+        encoder_id: None,
+        modes: Vec::new(),
+    });
+    card.master_open(7);
+    let index = crate::drm_registry::register_drm_card_with_state(Arc::new(HdcpCard), card);
+    let mode = crate::drm_registry::mode_state(index).unwrap();
+    crate::intel_hdcp_live::__attach_for_test(index);
+    if mode.lock().content_protection(3).map(|c| (c.value, c.content_type)) != Some((0, Some(0)))
+    {
+        return TestResult::Fail("connector without the property pair");
+    }
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    let out = OutFences::new(Vec::new());
+    let mut device = Device::new();
+    device.ready.store(true, Ordering::Release);
+    let run = |device: &mut Device, request| {
+        let mut call = core::pin::pin!(execute(
+            device,
+            &mode,
+            7,
+            request,
+            &cpu,
+            Some(&events),
+            Some(&out)
+        ));
+        call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    };
+    let atomic = |flags, props: Vec<u32>, values: Vec<u64>| {
+        Request::Atomic(OwnedAtomic {
+            flags,
+            cookie: 0,
+            objects: vec![3],
+            counts: vec![props.len() as u32],
+            props,
+            values,
+        })
+    };
+    // Legacy SETPROPERTY DESIRED: committed, and HDCP has the request.
+    let set = Request::Property {
+        object: 3,
+        kind: DRM_MODE_OBJECT_CONNECTOR,
+        prop: CP,
+        value: 1,
+    };
+    if run(&mut device, set) != Poll::Ready(Ok(0))
+        || mode.lock().content_protection(3).map(|c| c.value) != Some(1)
+        || crate::intel_hdcp_live::__uapi_for_test(index, 3) != Some((CpValue::Desired, 0, true))
+    {
+        return TestResult::Fail("SETPROPERTY Content Protection did not reach HDCP");
+    }
+    // Atomic type 1 beside the CRTC_ID the connector already has.
+    let both = atomic(0, vec![TYPE, CONNECTOR_CRTC_ID_PROP_ID], vec![1, 1]);
+    if run(&mut device, both) != Poll::Ready(Ok(0))
+        || mode.lock().content_protection(3).map(|c| c.content_type) != Some(Some(1))
+        || crate::intel_hdcp_live::__uapi_for_test(index, 3) != Some((CpValue::Desired, 1, true))
+    {
+        return TestResult::Fail("atomic HDCP Content Type did not reach HDCP");
+    }
+    // Userspace may not set ENABLED, nor a type outside the enum; a
+    // TEST_ONLY commit changes nothing.
+    for (prop, value) in [(CP, 2), (TYPE, 2)] {
+        if run(&mut device, atomic(0, vec![prop], vec![value]))
+            != Poll::Ready(Err(FsError::InvalidData))
+        {
+            return TestResult::Fail("ENABLED or a bad type accepted");
+        }
+    }
+    if run(&mut device, atomic(TEST_ONLY, vec![CP], vec![0])) != Poll::Ready(Ok(0))
+        || mode.lock().content_protection(3).map(|c| c.value) != Some(1)
+    {
+        return TestResult::Fail("TEST_ONLY committed Content Protection");
+    }
+    // Any other connector property stays refused.
+    if run(&mut device, atomic(0, vec![0x7f], vec![0])) != Poll::Ready(Err(FsError::Unsupported)) {
+        return TestResult::Fail("unknown connector property accepted");
+    }
+    // The driver reports ENABLED: the connector state and one uevent.
+    let node = narf_filesystem::sysfs::Kobject::new_root("intel-kms-hdcp-card");
+    crate::drm_sysfs_bridge::__set_card_node_for_test(index, &node);
+    let mut reader = narf_filesystem::UeventReader::new();
+    crate::intel_hdcp_live::__publish_for_test(index, 3, CpValue::Enabled);
+    crate::intel_hdcp_live::__publish_for_test(index, 3, CpValue::Enabled);
+    let events = reader.drain(8);
+    let want = [
+        (alloc::string::String::from("HOTPLUG"), alloc::string::String::from("1")),
+        (alloc::string::String::from("CONNECTOR"), alloc::string::String::from("3")),
+        (alloc::string::String::from("PROPERTY"), alloc::format!("{CP}")),
+    ];
+    if mode.lock().content_protection(3).map(|c| c.value) != Some(2)
+        || events.len() != 1
+        || events[0].action != narf_filesystem::UeventAction::Change
+        || events[0].subsystem != "drm"
+        || events[0].extras.get(..3) != Some(&want[..])
+    {
+        return TestResult::Fail("ENABLED not reported once with its property uevent");
+    }
+    // UNDESIRED from userspace reaches HDCP as a disable request.
+    if run(&mut device, atomic(0, vec![CP], vec![0])) != Poll::Ready(Ok(0))
+        || crate::intel_hdcp_live::__uapi_for_test(index, 3) != Some((CpValue::Undesired, 1, true))
+    {
+        return TestResult::Fail("UNDESIRED did not reach HDCP");
+    }
+    crate::intel_hdcp_live::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    intel_kms_content_protection_round_trip
+);

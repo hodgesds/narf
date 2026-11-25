@@ -952,6 +952,30 @@ pub(crate) fn __gsc_result_for_test(ticket: u64) -> Option<Result<Vec<u8>, i32>>
     }
 }
 
+/// Test-only: attach the property pair to `card`'s connectors as the first
+/// service pass does.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __attach_for_test(card: u32) {
+    attach(card);
+}
+
+/// Test-only: a connector's uAPI request as the service sees it
+/// (Content Protection, HDCP Content Type, not yet acted on).
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __uapi_for_test(card: u32, connector: u32) -> Option<(CpValue, u8, bool)> {
+    SLOTS
+        .lock()
+        .iter()
+        .find(|s| s.card == card && s.connector == connector)
+        .map(|s| (s.uapi.cp, s.uapi.content_type, s.dirty))
+}
+
+/// Test-only: a driver-side flip as `finish` reports it.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __publish_for_test(card: u32, connector: u32, value: CpValue) {
+    publish(card, connector, value);
+}
+
 #[doc(hidden)]
 /// Test-only: how many connectors carry the properties.
 pub fn __connector_count() -> usize {
