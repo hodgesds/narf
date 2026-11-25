@@ -124,6 +124,31 @@ const ICL_OUTPUT_CSC_ENABLE: u32 = 1 << 30;
 /// +0x18/+0x1c/+0x20 and the post-offsets at +0x24/+0x28/+0x2c.
 const PIPE_CSC_OUTPUT_COEFF_RY_GY: u64 = 0x49050;
 const PIPE_COLOR_STRIDE: u64 = 0x100;
+/// The pipe CSC display 10 converts with (`ilk_update_pipe_csc`):
+/// `PIPE_CSC_COEFF_RY_GY(pipe)` (`_PIPE_A_CSC_COEFF_RY_GY` 0x49010, the
+/// coefficients at +4 each), `PIPE_CSC_PREOFF_HI/ME/LO` (0x49030..38) and
+/// `PIPE_CSC_POSTOFF_HI/ME/LO` (0x49040..48).
+const PIPE_CSC_COEFF_RY_GY: u64 = 0x49010;
+const PIPE_CSC_PREOFF_HI: u64 = 0x49030;
+const PIPE_CSC_POSTOFF_HI: u64 = 0x49040;
+/// `CSC_BLACK_SCREEN_OFFSET` (`ilk_csc_mode` for a YCbCr output).
+const CSC_BLACK_SCREEN_OFFSET: u32 = 1 << 2;
+/// `PRE_CSC_GAMC_INDEX(pipe)` (0x4A484, pipe stride 0x800), its
+/// `PRE_CSC_GAMC_AUTO_INCREMENT`, and `PRE_CSC_GAMC_DATA` beside it.
+const PRE_CSC_GAMC_INDEX: u64 = 0x4a484;
+const PRE_CSC_GAMC_AUTO_INCREMENT: u32 = 1 << 10;
+/// GLK's degamma: `GLK_COLORS`' 33 entries, then two extended-range
+/// entries `glk_load_degamma_lut` clamps at 1.0 (`glk_degamma_lut_size` 35).
+const GLK_DEGAMMA_LUT_SIZE: u32 = 33;
+const GLK_DEGAMMA_HW_SIZE: u32 = 35;
+/// `SKL_BOTTOM_COLOR(pipe)` (0x70034, pipe stride 0x1000) and its
+/// `SKL_BOTTOM_COLOR_CSC_ENABLE`.
+const SKL_BOTTOM_COLOR: u64 = 0x70034;
+const SKL_BOTTOM_COLOR_CSC_ENABLE: u32 = 1 << 30;
+/// The primary plane's `PLANE_COLOR_CTL` (0x701CC) and its pre-ICL
+/// `PLANE_COLOR_PIPE_CSC_ENABLE`.
+const PLANE_COLOR_CTL_PRIMARY: u64 = 0x701cc;
+const PLANE_COLOR_PIPE_CSC_ENABLE: u32 = 1 << 23;
 const GEN9_DP_TP_CTL_ENABLE: u32 = 1 << 31;
 const GEN9_DP_TP_CTL_ENHANCED_FRAME_ENABLE: u32 = 1 << 18;
 const GEN9_DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
@@ -1117,16 +1142,19 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         {
             return Err(ModesetError::UnsupportedGeneration);
         }
-        // YCbCr 4:2:0 output is display 10+ (`ycbcr_420_allowed`), and the
-        // pipe scaler that downsamples it takes at most `skl_scaler_mode_valid`'s
-        // width (Linux compares hdisplay with the max source height).
+        // YCbCr 4:2:0 output is display 10+ (`ycbcr_420_allowed`): of Gen9,
+        // only Gemini Lake. The pipe scaler that downsamples it takes at most
+        // `skl_scaler_mode_valid`'s width (Linux compares hdisplay with the
+        // max source height: 4096 on display 10 and 11).
         if self.hdmi_ycbcr420 {
-            let max = if self.gen11_platform.is_some() {
+            let max = if self.gen11_platform.is_some() || self.gen9_platform.is_some() {
                 4096
             } else {
                 8192
             };
-            if self.gen9_platform.is_some() {
+            if self.gen9_platform.is_some()
+                && self.gen9_platform != Some(crate::intel_gpu_gt::Gen9Platform::GeminiLake)
+            {
                 return Err(ModesetError::UnsupportedGeneration);
             }
             if u32::from(mode.h_active) > max {
@@ -2257,15 +2285,24 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// in normal mode with the medium filter), and the output CSC converts
     /// to BT.709 limited-range YCbCr (`icl_assign_csc`'s
     /// `ilk_csc_matrix_rgb_to_ycbcr`, written by `icl_update_output_csc`,
-    /// enabled by `ICL_OUTPUT_CSC_ENABLE`).
+    /// enabled by `ICL_OUTPUT_CSC_ENABLE`). Gemini Lake has no output CSC
+    /// and converts in the pipe CSC ([`program_ycbcr420_pipe_glk`]).
     fn program_ycbcr420_output(&mut self, mode: &Mode) {
-        program_ycbcr420_pipe(self.mmio, self.pipe, mode);
+        if self.gen9_platform.is_some() {
+            program_ycbcr420_pipe_glk(self.mmio, self.pipe, mode);
+        } else {
+            program_ycbcr420_pipe(self.mmio, self.pipe, mode);
+        }
     }
 
     /// Undo [`Modeset::program_ycbcr420_output`] once the pipe is down
-    /// ([`clear_ycbcr420_pipe`]).
+    /// ([`clear_ycbcr420_pipe`], [`clear_ycbcr420_pipe_glk`]).
     pub(crate) fn clear_ycbcr420_output(&mut self) {
-        clear_ycbcr420_pipe(self.mmio, self.pipe);
+        if self.gen9_platform.is_some() {
+            clear_ycbcr420_pipe_glk(self.mmio, self.pipe);
+        } else {
+            clear_ycbcr420_pipe(self.mmio, self.pipe);
+        }
     }
 
     fn initialize_internal_color(&mut self) -> Result<(), ModesetError> {
@@ -3784,6 +3821,91 @@ pub(crate) fn program_ycbcr420_pipe<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe, 
     let csc_mode = PIPE_CSC_MODE + pipe as u64 * PIPE_COLOR_STRIDE;
     let cur = io.read32(csc_mode);
     io.write32(csc_mode, cur | ICL_OUTPUT_CSC_ENABLE);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Gemini Lake (display 10) YCbCr 4:2:0: the 1:1 pipe scaler as on display
+/// 11+, then the conversion in the single pipe CSC. `glk_color_check` sets
+/// `csc_enable` for a non-RGB output; `ilk_assign_csc` takes
+/// `ilk_csc_matrix_rgb_to_ycbcr` (BT.709, limited range), which
+/// `ilk_update_pipe_csc` writes; `ilk_csc_mode` is `CSC_BLACK_SCREEN_OFFSET`
+/// (the CSC after the LUT, the limited-range offsets on the output). On
+/// display 10 `csc_enable` also turns the pre-CSC degamma on, so
+/// `glk_load_degamma_lut` loads `create_linear_lut`'s 33 entries and clamps
+/// the two extended ones at 1.0. The enable itself is `SKL_BOTTOM_COLOR`'s
+/// (`skl_color_commit_arm`) and the primary's `PLANE_COLOR_CTL`
+/// (`glk_plane_color_ctl_crtc`).
+pub(crate) fn program_ycbcr420_pipe_glk<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe, mode: &Mode) {
+    for (reg, val) in ycbcr420_scaler(mode).enable_writes(pipe) {
+        io.write32(reg, val);
+    }
+    let p = pipe as u64;
+    const COEFF: [u32; 9] = [
+        0x1e08, 0x9cc0, 0xb528, 0x2ba8, 0x09d8, 0x37e8, 0xbce8, 0x9ad8, 0x1e08,
+    ];
+    const POSTOFF: [u32; 3] = [0x0800, 0x0100, 0x0800];
+    let pre = PIPE_CSC_PREOFF_HI + p * PIPE_COLOR_STRIDE;
+    for reg in [0u64, 4, 8] {
+        io.write32(pre + reg, 0);
+    }
+    let coeff = PIPE_CSC_COEFF_RY_GY + p * PIPE_COLOR_STRIDE;
+    for row in 0..3usize {
+        let reg = coeff + 8 * row as u64;
+        io.write32(reg, COEFF[row * 3] << 16 | COEFF[row * 3 + 1]);
+        io.write32(reg + 4, COEFF[row * 3 + 2] << 16);
+    }
+    let post = PIPE_CSC_POSTOFF_HI + p * PIPE_COLOR_STRIDE;
+    for (i, reg) in [0u64, 4, 8].into_iter().enumerate() {
+        io.write32(post + reg, POSTOFF[i]);
+    }
+    // glk_load_degamma_lut: index 0, then auto-increment from 0 (the
+    // hardware ignores the index when the auto-increment bit is set).
+    let index = PRE_CSC_GAMC_INDEX + p * 0x800;
+    io.write32(index, 0);
+    io.write32(index, PRE_CSC_GAMC_AUTO_INCREMENT);
+    for i in 0..GLK_DEGAMMA_HW_SIZE {
+        let value = if i < GLK_DEGAMMA_LUT_SIZE {
+            0xffff * i / (GLK_DEGAMMA_LUT_SIZE - 1)
+        } else {
+            1 << 16
+        };
+        io.write32(index + 4, value);
+    }
+    io.write32(index, 0);
+    io.write32(
+        PIPE_CSC_MODE + p * PIPE_COLOR_STRIDE,
+        CSC_BLACK_SCREEN_OFFSET,
+    );
+    let bottom = SKL_BOTTOM_COLOR + p * 0x1000;
+    let cur = io.read32(bottom);
+    io.write32(bottom, cur | SKL_BOTTOM_COLOR_CSC_ENABLE);
+    let plane = PLANE_COLOR_CTL_PRIMARY + p * 0x1000;
+    let cur = io.read32(plane);
+    io.write32(plane, cur | PLANE_COLOR_PIPE_CSC_ENABLE);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Undo [`program_ycbcr420_pipe_glk`] once the pipe is down: the scalers,
+/// the pipe CSC mode and both CSC enables, and the `PIPE_MISC` encoding.
+pub(crate) fn clear_ycbcr420_pipe_glk<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe) {
+    for (reg, val) in crate::intel_gpu_xelpg_scaler::disable_writes(pipe) {
+        io.write32(reg, val);
+    }
+    let p = pipe as u64;
+    io.write32(PIPE_CSC_MODE + p * PIPE_COLOR_STRIDE, 0);
+    for (reg, bit) in [
+        (SKL_BOTTOM_COLOR + p * 0x1000, SKL_BOTTOM_COLOR_CSC_ENABLE),
+        (
+            PLANE_COLOR_CTL_PRIMARY + p * 0x1000,
+            PLANE_COLOR_PIPE_CSC_ENABLE,
+        ),
+    ] {
+        let cur = io.read32(reg);
+        io.write32(reg, cur & !bit);
+    }
+    let misc = pipe.base() + 0x30;
+    let cur = io.read32(misc);
+    io.write32(misc, cur & !PIPE_MISC_YUV_MASK);
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -7133,6 +7255,111 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_gen9_hdmi_ddi_b_full_run
+    );
+
+    /// Gemini Lake YCbCr 4:2:0 on DDI B: 2160p60 at a 297 MHz TMDS clock,
+    /// the 1:1 scaler, the BT.709 matrix in the pipe CSC with
+    /// `CSC_BLACK_SCREEN_OFFSET` (never the ICL output CSC), the linear
+    /// degamma `csc_enable` turns on, both CSC enables and the `PIPE_MISC`
+    /// encoding; the teardown clears them. Broxton (display 9) refuses
+    /// 4:2:0 before any write, and so does a mode wider than the scaler's
+    /// 4096.
+    fn smoke_glk_hdmi_ycbcr420_pipe_csc() -> TestResult {
+        let mode = Mode {
+            pixel_clock_khz: 594_000,
+            h_active: 3840,
+            h_total: 4400,
+            h_sync_start: 4016,
+            h_sync_end: 4104,
+            v_active: 2160,
+            v_total: 2250,
+            v_sync_start: 2168,
+            v_sync_end: 2178,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        };
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 16384,
+            format: PixelFormat::Xrgb8888,
+        };
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(true);
+        let run = |platform, mode: &Mode| {
+            let mmio = ScriptedSinkMmio::new(1 << 29);
+            let mut ms = Modeset::for_pipe(&mmio, Ddi::B, Pipe::A);
+            ms.set_gen9_platform(platform);
+            ms.set_gen9_sku_family(crate::intel_gpu_gen9_ddi::SkuFamily::Ult);
+            ms.set_hdmi_bpc(8);
+            ms.set_hdmi_ycbcr420(true);
+            let result = ms.modeset_hdmi(&fb, mode, false, false);
+            let done = result.is_ok() && {
+                ms.clear_ycbcr420_output();
+                true
+            };
+            (result, done, mmio)
+        };
+        use crate::intel_gpu_gt::Gen9Platform;
+        let (bxt, _, bxt_io) = run(Gen9Platform::Broxton, &mode);
+        let wide = Mode {
+            h_active: 4098,
+            ..mode
+        };
+        let (too_wide, _, wide_io) = run(Gen9Platform::GeminiLake, &wide);
+        let (result, cleared, io) = run(Gen9Platform::GeminiLake, &mode);
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(false);
+        if bxt != Err(ModesetError::UnsupportedGeneration)
+            || !bxt_io.writes.borrow().is_empty()
+            || too_wide != Err(ModesetError::DisplayResourceUnavailable)
+            || !wide_io.writes.borrow().is_empty()
+        {
+            return TestResult::Fail("Broxton and a 4098-wide mode refuse 4:2:0 untouched");
+        }
+        if result != Ok(mode) || !cleared {
+            return TestResult::Fail("Gemini Lake 2160p60 4:2:0 must light");
+        }
+        let csc = [
+            (0x49010, 0x1e08_9cc0),
+            (0x49014, 0xb528_0000),
+            (0x49018, 0x2ba8_09d8),
+            (0x4901c, 0x37e8_0000),
+            (0x49020, 0xbce8_9ad8),
+            (0x49024, 0x1e08_0000),
+            (0x49030, 0),
+            (0x49040, 0x800),
+            (0x49044, 0x100),
+            (0x49048, 0x800),
+        ];
+        if csc.iter().any(|&(r, v)| io.writes_to(r) != [v])
+            || io.writes_to(0x49028).first() != Some(&(1 << 2))
+            || io.writes_to(0x49028).last() != Some(&0)
+            || (0x49050..0x49080)
+                .step_by(4)
+                .any(|r| !io.writes_to(r).is_empty())
+        {
+            return TestResult::Fail("the pipe CSC carries BT.709 RGB->YCbCr, no output CSC");
+        }
+        let mut degamma: alloc::vec::Vec<u32> = (0..33).map(|i| 0xffff * i / 32).collect();
+        degamma.extend([1 << 16, 1 << 16]);
+        if io.writes_to(0x4a484) != [0, 1 << 10, 0] || io.writes_to(0x4a488) != degamma {
+            return TestResult::Fail("the linear 33-entry degamma, extended entries at 1.0");
+        }
+        let bottom = io.writes_to(0x70034);
+        let plane_color = io.writes_to(0x701cc);
+        let misc = io.writes_to(Pipe::A.base() + 0x30);
+        if !bottom.iter().any(|v| v & (1 << 30) != 0)
+            || bottom.last().is_none_or(|v| v & (1 << 30) != 0)
+            || !plane_color.iter().any(|v| v & (1 << 23) != 0)
+            || plane_color.last().is_none_or(|v| v & (1 << 23) != 0)
+            || !misc.iter().any(|v| v & 0x0c00_0800 == 0x0c00_0800)
+            || misc.last().is_none_or(|v| v & 0x0c00_0800 != 0)
+        {
+            return TestResult::Fail("both CSC enables and PIPE_MISC, cleared on teardown");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_glk_hdmi_ycbcr420_pipe_csc
     );
 
     fn smoke_gen11_external_dp_ddi_b_full_run() -> TestResult {

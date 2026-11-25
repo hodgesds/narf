@@ -379,7 +379,12 @@ pub fn compute_bpc(
 
 /// `connector->base.ycbcr_420_allowed`: display 10+ (`intel_hdmi_init_connector`).
 pub const fn ycbcr420_allowed(family: crate::intel_gpu_aux::SourceFamily) -> bool {
-    !matches!(family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. })
+    match family {
+        crate::intel_gpu_aux::SourceFamily::Gen9 { platform, .. } => {
+            matches!(platform, crate::intel_gpu_gt::Gen9Platform::GeminiLake)
+        }
+        _ => true,
+    }
 }
 
 /// `intel_hdmi_compute_output_format`: a 4:2:0-only VIC goes out as 4:2:0

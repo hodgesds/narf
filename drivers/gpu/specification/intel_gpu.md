@@ -847,6 +847,9 @@ generation gates below.
   B/C with the display-engine hotplug bank (`HpdBank::Bxt`, its
   sense inversion from the VBT's `hpd_invert`). The backlight runs
   on the VBT panel's PWM controller (`BXT_BLC_PWM_*(controller)`).
+  HDMI refuses the DPLL ranges Gen9 LP cannot generate; Gemini Lake
+  reaches 594 MHz scrambled and runs YCbCr 4:2:0 through the pipe CSC
+  with a linear degamma (display 10 has no output CSC).
   A GOP framebuffer stays fixed-mode KMS when no modeset runs.
   Not run on silicon.
 - Arrow Lake display — identification landed (#1023, §5);

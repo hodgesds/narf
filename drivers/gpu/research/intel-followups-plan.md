@@ -142,8 +142,7 @@ still read Open for work the code now has (LNL/PTL FBC, i915
 
 Still open, each needing its own grounding first:
 
-- Gen9-LP display remainders: Gemini Lake's YCbCr 4:2:0 and HDMI 2.0
-  scrambling, DC states.
+- Gen9-LP display remainders: DC states.
 - Nova Lake-S beyond the opted-in eDP takeover (`narf.intel.nvl_modeset=1`):
   external DP/HDMI and Type-C on the LT PHY, a display-35 relight owner for
   system suspend, and the DMC/DC states.
