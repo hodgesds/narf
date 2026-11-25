@@ -3414,6 +3414,7 @@ dependencies = [
 name = "narf-input"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-drivers",
  "narf-init",
  "narf-kernel-test",
