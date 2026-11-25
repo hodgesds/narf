@@ -183,6 +183,9 @@ pub use mst::{MstFailure, MtlMstRoute};
 #[path = "intel_gpu_dp_uhbr.rs"]
 pub(crate) mod uhbr;
 
+#[path = "intel_gpu_xelpg_color.rs"]
+pub mod color;
+
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
 use crate::dp_link_training::{

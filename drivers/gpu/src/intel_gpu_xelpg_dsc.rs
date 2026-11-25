@@ -553,7 +553,18 @@ pub fn uncompressed_link(
     mode: &Mode,
     max_bpp: u32,
 ) -> Option<UncompressedLink> {
-    let max_bpp = max_bpp.min(PIPE_BPP);
+    uncompressed_link_upto(limits, mode, max_bpp.min(PIPE_BPP))
+}
+
+/// [`uncompressed_link`] without NARF's 8 bpc ceiling: the descent starts
+/// at `rounddown(max_bpp, 6)` (a deep-colour pipe of 30 or 36 bpp under
+/// `narf.intel.hdmi14_ext=1`; `intel_display_max_pipe_bpp` is 36).
+pub fn uncompressed_link_upto(
+    limits: &LinkLimits,
+    mode: &Mode,
+    max_bpp: u32,
+) -> Option<UncompressedLink> {
+    let max_bpp = max_bpp.min(36);
     let mut bpp = max_bpp - max_bpp % 6;
     while bpp >= MIN_PIPE_BPP {
         for rate in limits.rates() {
@@ -589,12 +600,21 @@ pub fn uncompressed_link(
 /// HDMI deep-color input Linux also parses for 1.3 sinks only ever yields
 /// 8 bpc or more, which this 8 bpc pipe treats as 8, so it is not read.
 pub fn edid_display_bpc(edid: &[u8]) -> u8 {
+    edid_display_bpc_cta(edid, 0)
+}
+
+/// [`edid_display_bpc`] with the bpc `drm_parse_cea_ext` left for a digital
+/// EDID 1.3+ sink (`cta_bpc`: what `drm_parse_hdmi_deep_color_info` sets
+/// from an HDMI VSDB, 0 without one): the DFP 1.x default applies only
+/// while it is 0, and EDID 1.4's color bit depth field replaces it.
+pub fn edid_display_bpc_cta(edid: &[u8], cta_bpc: u8) -> u8 {
     let (Some(&revision), Some(&input)) = (edid.get(19), edid.get(20)) else {
         return 0;
     };
     let mut bpc = 0;
     if revision >= 3 && input & EDID_INPUT_DIGITAL != 0 {
-        if revision == 3 && input & EDID_DIGITAL_DFP_1_X != 0 {
+        bpc = cta_bpc;
+        if bpc == 0 && revision == 3 && input & EDID_DIGITAL_DFP_1_X != 0 {
             bpc = 8;
         }
         if revision >= 4 {
@@ -675,30 +695,38 @@ pub fn max_pipe_bpp(display_bpc: u8, vbt_edp_bpp: u8) -> u32 {
 /// `PIPE_MISC_BPC_6`, `PIPE_MISC_DITHER_ENABLE`, `PIPE_MISC_DITHER_TYPE_SP`
 /// (0) and `PIPE_MISC_PIXEL_ROUNDING_TRUNC` (`intel_display_regs.h`).
 const PIPE_MISC_BPC_6: u32 = 2 << 5;
+/// `PIPE_MISC_BPC_10` and `PIPE_MISC_BPC_12_ADLP` (display 13+).
+const PIPE_MISC_BPC_10: u32 = 1 << 5;
+const PIPE_MISC_BPC_12_ADLP: u32 = 4 << 5;
 const PIPE_MISC_DITHER_ENABLE: u32 = 1 << 4;
 const PIPE_MISC_PIXEL_ROUNDING_TRUNC: u32 = 1 << 8;
 /// `PIPE_MISC` relative to the pipe block.
 pub const PIPE_MISC_OFFSET: u64 = 0x30;
 
-/// `bdw_set_pipe_misc` for an RGB pipe on display 14: `BPC_8` (0) or
-/// `BPC_6`; `crtc_state->dither` is `pipe_bpp == 6 * 3` (no compliance
-/// test forces it off), which adds `DITHER_ENABLE | DITHER_TYPE_SP`;
-/// `PIXEL_ROUNDING_TRUNC` on display 12+.
+/// `bdw_set_pipe_misc` for an RGB pipe on display 14: `BPC_8` (0), `BPC_6`,
+/// and for a deep-colour pipe (`narf.intel.hdmi14_ext=1`) `BPC_10` or
+/// `BPC_12_ADLP`; `crtc_state->dither` is `pipe_bpp == 6 * 3` (no
+/// compliance test forces it off), which adds `DITHER_ENABLE |
+/// DITHER_TYPE_SP`; `PIXEL_ROUNDING_TRUNC` on display 12+.
 pub const fn pipe_misc(pipe_bpp: u32) -> u32 {
-    if pipe_bpp == MIN_PIPE_BPP {
-        PIPE_MISC_BPC_6 | PIPE_MISC_DITHER_ENABLE | PIPE_MISC_PIXEL_ROUNDING_TRUNC
-    } else {
-        PIPE_MISC_PIXEL_ROUNDING_TRUNC
+    match pipe_bpp {
+        MIN_PIPE_BPP => {
+            PIPE_MISC_BPC_6 | PIPE_MISC_DITHER_ENABLE | PIPE_MISC_PIXEL_ROUNDING_TRUNC
+        }
+        30 => PIPE_MISC_BPC_10 | PIPE_MISC_PIXEL_ROUNDING_TRUNC,
+        36 => PIPE_MISC_BPC_12_ADLP | PIPE_MISC_PIXEL_ROUNDING_TRUNC,
+        _ => PIPE_MISC_PIXEL_ROUNDING_TRUNC,
     }
 }
 
-/// `TRANS_DDI_BPC_6` / `TRANS_DDI_BPC_8`
+/// `TRANS_DDI_BPC_6` / `_8` / `_10` / `_12`
 /// (`intel_ddi_transcoder_func_reg_val_get`).
 pub const fn trans_ddi_bpc(pipe_bpp: u32) -> u32 {
-    if pipe_bpp == MIN_PIPE_BPP {
-        2 << 20
-    } else {
-        0
+    match pipe_bpp {
+        MIN_PIPE_BPP => 2 << 20,
+        30 => 1 << 20,
+        36 => 3 << 20,
+        _ => 0,
     }
 }
 
@@ -706,14 +734,16 @@ pub const fn trans_ddi_bpc(pipe_bpp: u32) -> u32 {
 pub const TRANS_MSA_MISC_OFFSET: u64 = 0x410;
 
 /// `intel_ddi_set_dp_msa` for RGB without limited range or a VSC SDP:
-/// `DP_MSA_MISC_SYNC_CLOCK` with `DP_MSA_MISC_6_BPC` (0) or `_8_BPC`
-/// (1 << 5). An 18 bpp pipe is never limited range
+/// `DP_MSA_MISC_SYNC_CLOCK` with `DP_MSA_MISC_6_BPC` (0), `_8_BPC`
+/// (1 << 5), or for a deep-colour pipe `_10_BPC` (2 << 5) / `_12_BPC`
+/// (3 << 5). An 18 bpp pipe is never limited range
 /// (`intel_dp_limited_color_range`).
 pub const fn msa_misc(pipe_bpp: u32) -> u32 {
-    if pipe_bpp == MIN_PIPE_BPP {
-        1
-    } else {
-        1 | (1 << 5)
+    match pipe_bpp {
+        MIN_PIPE_BPP => 1,
+        30 => 1 | (2 << 5),
+        36 => 1 | (3 << 5),
+        _ => 1 | (1 << 5),
     }
 }
 
