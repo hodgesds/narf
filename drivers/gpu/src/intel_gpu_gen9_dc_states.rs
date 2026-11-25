@@ -126,6 +126,12 @@
 //! does not hold `GT_IRQ` while unparked (Linux's `__gt_unpark` does, as a
 //! latency workaround only).
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use narf_lib::sync::IrqSafeSpinLock;
+
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_dc_states::{
     sanitize_target, write_dc_state_sticky, DcError, DcUser, DC_REENABLE_DELAY_NS,
@@ -1039,6 +1045,274 @@ pub mod tests {
         "drivers/gpu/intel_gpu_gen9_dc_states",
         smoke_gen9_lp_dc_mask_and_target
     );
+}
+
+// ── Production service ──────────────────────────────────────────
+
+/// The boot option opting the Gen9 display into DC states.
+pub const OPT_IN: &str = "narf.intel.gen9_dc";
+
+/// `narf.intel.gen9_dc=1`, with the strict grammar every Intel opt-in uses
+/// ([`crate::intel_gpu_gt::boot_opt_in`]): exactly one `=1` before `--`.
+pub fn requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, OPT_IN)
+}
+
+/// Install-time core: `None` (and nothing written) without the option;
+/// otherwise a core for `platform`, booted on `regs` (`DC_STATE_DISABLE`,
+/// the Init reference held).
+pub fn boot_if_requested<M: MmioWindow + ?Sized>(
+    opted_in: bool,
+    platform: Gen9Platform,
+    regs: &M,
+) -> Option<Gen9DcCore> {
+    if !opted_in {
+        return None;
+    }
+    let mut core = Gen9DcCore::new(platform);
+    // A failed write is latched inside the core: Init stays held and DC
+    // states are never re-entered.
+    let _ = core.boot(regs);
+    Some(core)
+}
+
+/// The per-function service: one integrated Gen9 display exists, so one
+/// service does too.
+#[derive(Debug)]
+struct Gen9Service {
+    window: crate::intel_gpu_gt_hw::AuthorizedWindow,
+    bar: narf_bus::MmioRegion,
+    core: IrqSafeSpinLock<Gen9DcCore>,
+    arming: AtomicBool,
+}
+
+static SERVICE: IrqSafeSpinLock<Option<Arc<Gen9Service>>> = IrqSafeSpinLock::new(None);
+
+fn service() -> Option<Arc<Gen9Service>> {
+    SERVICE.lock().clone()
+}
+
+fn service_for(bar: &narf_bus::MmioRegion) -> Option<Arc<Gen9Service>> {
+    service().filter(|service| service.bar.phys == bar.phys)
+}
+
+fn log(text: &str) {
+    use core::fmt::Write as _;
+    let _ = writeln!(narf_console::Writer, "intel-gpu: {text}");
+}
+
+/// A held production reference. Dropping it releases the reference and,
+/// for the last one, schedules deferred re-entry; nothing is written to
+/// hardware on drop. Inert where no Gen9 service exists (the option is
+/// clear, or this is not a Gen9 display).
+#[must_use = "dropping the reference releases DC_off immediately"]
+pub(crate) struct Gen9DcRef {
+    service: Option<Arc<Gen9Service>>,
+    user: Gen9DcUser,
+}
+
+impl core::fmt::Debug for Gen9DcRef {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Gen9DcRef")
+            .field("user", &self.user)
+            .field("held", &self.service.is_some())
+            .finish()
+    }
+}
+
+impl Drop for Gen9DcRef {
+    fn drop(&mut self) {
+        if let Some(service) = self.service.take() {
+            release(&service, self.user);
+        }
+    }
+}
+
+fn release(service: &Arc<Gen9Service>, user: Gen9DcUser) {
+    let due = service
+        .core
+        .lock()
+        .put(user, narf_time::monotonic_ns());
+    if due.is_some() {
+        schedule_arm(service);
+    }
+}
+
+fn take(service: Option<Arc<Gen9Service>>, user: Gen9DcUser) -> Result<Gen9DcRef, DcError> {
+    let Some(service) = service else {
+        return Ok(Gen9DcRef {
+            service: None,
+            user,
+        });
+    };
+    let held = service.core.lock().get(&service.window, user)?;
+    Ok(Gen9DcRef {
+        service: held.then_some(service),
+        user,
+    })
+}
+
+/// Take `user`'s reference on the Gen9 service, if one is installed. On
+/// `Ok` DC states are off until the reference drops; `Err` means they could
+/// not be exited, and the caller runs nothing.
+pub(crate) fn acquire(user: Gen9DcUser) -> Result<Gen9DcRef, DcError> {
+    take(service(), user)
+}
+
+/// [`acquire`] for the service of exactly this BAR.
+pub(crate) fn acquire_for_bar(
+    bar: &narf_bus::MmioRegion,
+    user: Gen9DcUser,
+) -> Result<Gen9DcRef, DcError> {
+    take(service_for(bar), user)
+}
+
+/// The production [`Gen9DcOff`]: the installed Gen9 service through its
+/// own authorized window (the holder's window addresses the same BAR), and
+/// inert without one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServiceDcOff;
+
+impl Gen9DcOff for ServiceDcOff {
+    fn get(&self, _regs: &dyn MmioWindow, user: Gen9DcUser) -> Result<bool, DcError> {
+        let Some(service) = service() else {
+            return Ok(false);
+        };
+        let mut core = service.core.lock();
+        core.get(&service.window, user)
+    }
+    fn put(&self, user: Gen9DcUser) {
+        if let Some(service) = service() {
+            release(&service, user);
+        }
+    }
+}
+
+fn gates(service: &Gen9Service) -> Gen9ArmGates {
+    Gen9ArmGates {
+        external_route_active: !crate::intel_gpu::external_routes_stopped(&service.bar),
+    }
+}
+
+fn schedule_arm(service: &Arc<Gen9Service>) {
+    if service.arming.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let service = service.clone();
+    let _ = narf_scheduler::spawn(arm_task(service));
+}
+
+async fn arm_task(service: Arc<Gen9Service>) {
+    loop {
+        loop {
+            let Some(at) = service.core.lock().arm_deadline() else {
+                break;
+            };
+            let now = narf_time::monotonic_ns();
+            if now < at {
+                narf_time::SleepUntil::new(narf_time::Deadline::after_ns(at - now).as_instant())
+                    .await;
+                continue;
+            }
+            // The gates read other modules' state: evaluate them with no
+            // lock of ours held.
+            let gates = gates(&service);
+            let result =
+                service
+                    .core
+                    .lock()
+                    .arm_if_due(&service.window, narf_time::monotonic_ns(), gates);
+            match result {
+                Err(Gen9ArmBlock::NotDue(_)) => continue,
+                _ => break,
+            }
+        }
+        service.arming.store(false, Ordering::Release);
+        // A release that raced with this exit saw `arming` set and did not
+        // spawn; pick its deadline up here.
+        if service.core.lock().arm_deadline().is_none()
+            || service.arming.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+    }
+}
+
+/// Probe, before the Gen9 DMC load: with `narf.intel.gen9_dc=1`, create
+/// the service for this display, disable DC states and hold the Init
+/// reference, and register the system-suspend hook. Without the option
+/// nothing is created and nothing is written.
+pub(crate) fn install(
+    platform: Gen9Platform,
+    bar: narf_bus::MmioRegion,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) {
+    let opted_in = requested(narf_boot::args());
+    if !opted_in {
+        return;
+    }
+    let mut slot = SERVICE.lock();
+    if slot.is_some() {
+        return;
+    }
+    let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
+    let Some(core) = boot_if_requested(opted_in, platform, &window) else {
+        return;
+    };
+    *slot = Some(Arc::new(Gen9Service {
+        window,
+        bar,
+        core: IrqSafeSpinLock::new(core),
+        arming: AtomicBool::new(false),
+    }));
+    drop(slot);
+    narf_power::system_pm::register_async_system_pm(PM_NAME, Arc::new(SystemPm));
+}
+
+const PM_NAME: &str = "intel-gen9-dc";
+
+/// The system-suspend participant: DC states off before the platform
+/// transition, and back only with a program that survived it.
+#[derive(Debug)]
+struct SystemPm;
+
+impl narf_power::system_pm::AsyncSystemPm for SystemPm {
+    fn prepare_suspend(&self) -> narf_power::system_pm::SystemPmFuture<'_> {
+        Box::pin(async {
+            suspend_begin().map_err(|_| narf_power::device_pm::DeviceSuspendError::DriverError)
+        })
+    }
+    fn resume_from_suspend(&self) -> narf_power::system_pm::SystemPmFuture<'_> {
+        Box::pin(async {
+            resume_after_suspend();
+            Ok(())
+        })
+    }
+}
+
+fn suspend_begin() -> Result<(), DcError> {
+    let Some(service) = service() else {
+        return Ok(());
+    };
+    let mut core = service.core.lock();
+    core.suspend_begin(&service.window)
+}
+
+fn resume_after_suspend() {
+    let Some(service) = service() else {
+        return;
+    };
+    let (result, lost) = {
+        let mut core = service.core.lock();
+        let result = core.resume(&service.window, narf_time::monotonic_ns());
+        (result, core.program_lost())
+    };
+    match result {
+        Ok(Some(_)) => schedule_arm(&service),
+        Ok(None) if lost => log("Gen9 DC states held off after resume: the DMC program was lost"),
+        Ok(None) => {}
+        Err(_) => log("Gen9 DC states held off after resume: DC_STATE_EN unavailable"),
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

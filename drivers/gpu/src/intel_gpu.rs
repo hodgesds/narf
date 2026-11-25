@@ -1078,6 +1078,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // either way (GT / execlists still bind); the load logs its
     // own outcome.
     if let Some(platform) = crate::intel_gpu_modeset::gen9_family_for_chip(dev.chip) {
+        // Gen9 DC states (`narf.intel.gen9_dc=1`, default off): the
+        // `DC_off` service disables DC states and holds them off
+        // (`skl_display_core_init`'s DC_STATE_DISABLE, `POWER_DOMAIN_INIT`).
+        // Without the option nothing is written.
+        crate::intel_gpu_gen9_dc_states::install(platform, dev.gtt_mmadr, cap);
         let window = dev.mode_window();
         let authority: Option<Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>> =
             narf_firmware::trusted_loader_authority().and_then(|write| write.derive().ok());

@@ -1125,7 +1125,10 @@ pub fn external_live() -> bool {
 /// A held `DC_off` reference. Dropping it releases the reference and,
 /// for the last one, schedules deferred re-entry; nothing is written
 /// to hardware on drop. Inert (holds nothing) where no display-14
-/// service exists — every Gen12 path and every fixture platform.
+/// service exists — every Gen12 path and every fixture platform —
+/// except that, there, [`acquire`] and [`acquire_for_bar`] carry the Gen9
+/// service's reference (`intel_gpu_gen9_dc_states`, opted in with
+/// `narf.intel.gen9_dc=1`), itself inert without that service.
 ///
 /// Once the GT owner bound the function's runtime-PM device, a reference
 /// also holds a display wakeref (`intel_display_power_get` →
@@ -1137,6 +1140,9 @@ pub(crate) struct DcRef {
     user: DcUser,
     /// Dropped after [`Drop::drop`] released `DC_off`.
     _wakeref: Option<crate::intel_gpu_gt_runtime::display_rpm::Wakeref>,
+    /// The Gen9 service's reference, taken only where no display-14
+    /// service exists.
+    _gen9: Option<crate::intel_gpu_gen9_dc_states::Gen9DcRef>,
 }
 
 impl DcRef {
@@ -1146,7 +1152,21 @@ impl DcRef {
             service: None,
             user,
             _wakeref: None,
+            _gen9: None,
         }
+    }
+
+    /// No display-14 service: carry the Gen9 service's reference instead.
+    fn gen9(
+        user: DcUser,
+        gen9: Result<crate::intel_gpu_gen9_dc_states::Gen9DcRef, DcError>,
+    ) -> Result<Self, DcError> {
+        Ok(Self {
+            service: None,
+            user,
+            _wakeref: None,
+            _gen9: Some(gen9?),
+        })
     }
 }
 
@@ -1196,13 +1216,18 @@ fn take(service: Option<Arc<DcService>>, user: DcUser) -> Result<DcRef, DcError>
         service: Some(service),
         user,
         _wakeref: wakeref,
+        _gen9: None,
     })
 }
 
 /// Take a `DC_off` reference on the display-14 service, if one is
-/// installed. On `Ok` DC states are off until the reference drops.
+/// installed (otherwise on the Gen9 service, if that one is). On `Ok` DC
+/// states are off until the reference drops.
 pub(crate) fn acquire(user: DcUser) -> Result<DcRef, DcError> {
-    take(service(), user)
+    match service() {
+        Some(service) => take(Some(service), user),
+        None => DcRef::gen9(user, crate::intel_gpu_gen9_dc_states::acquire(user.into())),
+    }
 }
 
 /// [`acquire`] for the service of exactly this BAR.
@@ -1223,7 +1248,13 @@ pub(crate) fn acquire(user: DcUser) -> Result<DcRef, DcError> {
 /// An owner that prefers a held reference instead may keep a
 /// [`DcUser::ExternalRoute`] reference for the route's lifetime.
 pub(crate) fn acquire_for_bar(bar: &narf_bus::MmioRegion, user: DcUser) -> Result<DcRef, DcError> {
-    take(service_for(bar), user)
+    match service_for(bar) {
+        Some(service) => take(Some(service), user),
+        None => DcRef::gen9(
+            user,
+            crate::intel_gpu_gen9_dc_states::acquire_for_bar(bar, user.into()),
+        ),
+    }
 }
 
 /// A pipe owner lit `pipe` on this BAR's display (after enabling it, or

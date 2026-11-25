@@ -551,3 +551,66 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_gen9_dc_states",
     smoke_gen9_dc_guard_releases_what_it_took
 );
+
+/// The option is strict and default off: without exactly one
+/// `narf.intel.gen9_dc=1` before `--` no core is created and nothing is
+/// written; with it, install disables DC states (`skl_display_core_init`'s
+/// DC_STATE_DISABLE) and holds Init.
+fn smoke_gen9_dc_refuses_without_the_option() -> TestResult {
+    use narf_boot::args::KernelCmdline;
+    if !requested(KernelCmdline::new("quiet narf.intel.gen9_dc=1")) {
+        return TestResult::Fail("narf.intel.gen9_dc=1 must opt in");
+    }
+    for line in [
+        "",
+        "quiet",
+        "narf.intel.gen9_dc",
+        "narf.intel.gen9_dc=0",
+        "narf.intel.gen9_dc=yes",
+        "narf.intel.gen9_dc=1 narf.intel.gen9_dc=1",
+        "-- narf.intel.gen9_dc=1",
+    ] {
+        if requested(KernelCmdline::new(line)) {
+            return TestResult::Fail("only one exact narf.intel.gen9_dc=1 before -- opts in");
+        }
+    }
+    let fake = Fake::default();
+    fake.set(DC_STATE_EN, DC6);
+    if boot_if_requested(false, Gen9Platform::Skylake, &fake).is_some() {
+        return TestResult::Fail("no core may exist without the option");
+    }
+    if !fake.log().is_empty() || fake.get(DC_STATE_EN) != DC6 {
+        return TestResult::Fail("without the option nothing may be written");
+    }
+    let Some(core) = boot_if_requested(true, Gen9Platform::Skylake, &fake) else {
+        return TestResult::Fail("the option must create the core");
+    };
+    if fake.writes_to(DC_STATE_EN) != [0] || core.refs(Gen9DcUser::Init) != 1 || core.armed() {
+        return TestResult::Fail("install must write DC_STATE_DISABLE and hold Init");
+    }
+    // Probe with no service installed (every fixture boot, and every boot
+    // without the option): the production references hold nothing.
+    if service().is_none() {
+        match acquire(Gen9DcUser::Modeset) {
+            Ok(reference) if reference.service.is_none() => {}
+            _ => return TestResult::Fail("without a service the reference must be inert"),
+        }
+        if ServiceDcOff.get(&fake, Gen9DcUser::Aux) != Ok(false) {
+            return TestResult::Fail("without a service the hook must count nothing");
+        }
+    }
+    // The shared KMS/legacy-guard vocabulary lands on the matching users.
+    if Gen9DcUser::from(DcUser::Kms) != Gen9DcUser::Kms
+        || Gen9DcUser::from(DcUser::Modeset) != Gen9DcUser::Modeset
+        || Gen9DcUser::from(DcUser::Aux) != Gen9DcUser::Aux
+        || Gen9DcUser::from(DcUser::External) != Gen9DcUser::External
+        || Gen9DcUser::from(DcUser::Suspend) != Gen9DcUser::Suspend
+    {
+        return TestResult::Fail("the display-14 users must map onto the Gen9 users");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_dc_refuses_without_the_option
+);
