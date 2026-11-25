@@ -433,6 +433,43 @@ impl Vram {
         chosen
     }
 
+    /// Every live object tracked in this pool. The upgraded references are
+    /// collected before the list lock drops, and dropped after it.
+    fn resident_objects(&self) -> alloc::vec::Vec<Arc<crate::intel_gpu_gem::GemObject>> {
+        let mut resident = self.resident.lock();
+        resident.retain(|weak| weak.strong_count() != 0);
+        resident
+            .iter()
+            .filter_map(alloc::sync::Weak::upgrade)
+            .collect()
+    }
+
+    /// `xe->pinned.late.external`: this pool's VRAM objects a dma-buf
+    /// importer pins.
+    pub(crate) fn pinned_external(&self) -> alloc::vec::Vec<Arc<crate::intel_gpu_gem::GemObject>> {
+        let mut objects = self.resident_objects();
+        objects.retain(|object| object.in_vram_pool(self) && object.externally_pinned());
+        objects
+    }
+
+    /// Objects whose suspend backup awaits its in-place restore.
+    pub(crate) fn restore_pending(&self) -> alloc::vec::Vec<Arc<crate::intel_gpu_gem::GemObject>> {
+        let mut objects = self.resident_objects();
+        objects.retain(|object| object.in_vram_pool(self) && object.restore_pending());
+        objects
+    }
+
+    /// Allocated VRAM whose contents a system suspend would lose: every
+    /// allocation not covered by a pinned export's suspend backup.
+    pub(crate) fn unsaved_bytes(&self) -> u64 {
+        let saved = self
+            .resident_objects()
+            .iter()
+            .map(|object| object.suspend_saved_bytes(self))
+            .fold(0u64, u64::saturating_add);
+        self.used().saturating_sub(saved)
+    }
+
     /// Reopen kernel CPU access once the function is in D0 with a running GT.
     pub(crate) fn open_cpu_access(&self) {
         self.cpu_gate.lock().closed = false;

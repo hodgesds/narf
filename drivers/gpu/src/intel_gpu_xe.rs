@@ -1468,6 +1468,7 @@ impl XeFile {
                 validate_protected(&membership.pxp, &state.mappings)?;
             }
             if let Some(pool) = info.vram.as_ref() {
+                ensure_restored(backend.as_ref(), &state.mappings, status.epoch).await?;
                 ensure_vram_residency(backend.as_ref(), pool, &state.mappings, status.epoch, None)
                     .await;
             }
@@ -1609,6 +1610,58 @@ impl XeFile {
         }
         result
     }
+}
+
+/// `xe_bo_evict_all`'s pass over `xe->pinned.late.external`
+/// (`xe_bo_evict_pinned`), after the unpinned drain ([`evict_vram_for`]):
+/// save every dma-buf-pinned VRAM export of `pool` to system memory while
+/// its allocation stays reserved, for the in-place restore. Returns the
+/// VRAM bytes saved.
+pub(crate) async fn backup_pinned_vram(
+    backend: &dyn crate::intel_gpu_user::UserBackend,
+    pool: &Arc<crate::intel_gpu_vram::Vram>,
+    epoch: u64,
+) -> Result<u64, FsError> {
+    let mut saved = 0u64;
+    for object in pool.pinned_external() {
+        saved = saved.saturating_add(object.backup_pinned(backend, epoch).await?);
+    }
+    Ok(saved)
+}
+
+/// `xe_bo_restore_late`'s pass over `xe->pinned.late.external`
+/// (`xe_bo_restore_pinned`): copy every suspend backup in `pool` back to its
+/// unchanged VRAM placement. Returns how many were restored.
+pub(crate) async fn restore_pinned_vram(
+    backend: &dyn crate::intel_gpu_user::UserBackend,
+    pool: &Arc<crate::intel_gpu_vram::Vram>,
+    epoch: u64,
+) -> Result<usize, FsError> {
+    let mut restored = 0;
+    for object in pool.restore_pending() {
+        if object.restore_pinned(backend, epoch).await? {
+            restored += 1;
+        }
+    }
+    Ok(restored)
+}
+
+/// A pinned export a system resume has not restored yet is restored before
+/// a job's tables name its VRAM (the resume's own pass may still be waiting
+/// for the GT).
+async fn ensure_restored(
+    backend: &dyn UserBackend,
+    mappings: &[VmMapping],
+    epoch: u64,
+) -> Result<(), FsError> {
+    for object in mappings
+        .iter()
+        .filter_map(|m| m.object.as_ref())
+        .filter(|object| object.restore_pending())
+    {
+        object.restore_pinned(backend, epoch).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn evict_vram_for(

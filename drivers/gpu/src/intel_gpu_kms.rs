@@ -209,8 +209,10 @@ fn gen12_display13(io: &impl Platform) -> bool {
 }
 
 fn scanout_object_ok(object: &GemObject, vram_scanout: bool) -> bool {
+    // A pinned VRAM export awaiting its resume restore holds stale VRAM.
     object.scanout()
         && !object.is_userptr()
+        && !object.restore_pending()
         && ((vram_scanout && object.is_vram()) || object.is_wc())
 }
 

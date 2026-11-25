@@ -13,6 +13,11 @@
 //    importer first (xe_bo_move_notify -> dma_buf_invalidate_mappings ->
 //    xe_dma_buf_move_notify), whose binding has no pages until its next exec
 //    or VM_BIND maps the new placement (xe_bo_trigger_rebind).
+// 5. System suspend with a pinned VRAM export (xe_bo_evict_all ->
+//    xe_bo_evict_pinned, xe_bo_restore_late -> xe_bo_restore_pinned): the
+//    drain evicts unpinned VRAM; a pinned export keeps its allocation, its
+//    data saved to system memory, and the resume copies it back to the same
+//    device address.
 use super::vram_evict::{create_vram_bo, evict_fixture, EvictBackend};
 use super::*;
 use crate::intel_gpu_exec::vram_clear;
@@ -646,4 +651,157 @@ fn smoke_xe_prime_foreign_import_mmap_maps_exporter_bar_and_holds_placement() ->
 kernel_test_in!(
     "drivers/gpu/intel_gpu_prime",
     smoke_xe_prime_foreign_import_mmap_maps_exporter_bar_and_holds_placement
+);
+
+fn smoke_xe_prime_pinned_vram_export_survives_suspend_in_place() -> TestResult {
+    let (frame, pool, backend, info) = evict_fixture(GtPlatform::Battlemage, 0xdfc);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let epoch = backend.status().unwrap().epoch;
+    let handle = create_vram_bo(&file, &info, &user, BO, 3).unwrap();
+    let object = file.gem.object(handle).unwrap();
+    object.write(0, &pattern(17)).unwrap();
+    let other = file
+        .gem
+        .object(create_vram_bo(&file, &info, &user, BO, 3).unwrap())
+        .unwrap();
+    other.write(0, &pattern(19)).unwrap();
+    let dpa = object.pages().next().unwrap();
+    // A peer's static attachment pins the export in VRAM.
+    let peer = attach(
+        file.gem.export_object(handle).unwrap(),
+        exporter(&backend),
+        &Fabric,
+        Some(EXPORTER),
+        Some(PEER),
+        true,
+    )
+    .unwrap();
+    let sg = block_on_spin(peer.map()).unwrap();
+    assert!(object.externally_pinned() && object.is_vram());
+
+    // xe_bo_evict_all_user: the drain moves only the unpinned object, and
+    // the pinned one is all prepare_suspend's gate would lose.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::evict_vram_for(
+            backend.as_ref(),
+            &pool,
+            false,
+            0,
+            epoch,
+            true
+        )),
+        Ok(BO)
+    );
+    assert!(!other.is_vram() && object.is_vram());
+    assert_eq!(pool.unsaved_bytes(), BO);
+    // xe_bo_evict_pinned: saved to system memory, the allocation kept.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::backup_pinned_vram(
+            backend.as_ref(),
+            &pool,
+            epoch
+        )),
+        Ok(BO)
+    );
+    assert!(object.restore_pending() && object.is_vram());
+    assert_eq!(pool.used(), BO);
+    assert_eq!(pool.unsaved_bytes(), 0);
+    // A second pass keeps the backup that still holds the data.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::backup_pinned_vram(
+            backend.as_ref(),
+            &pool,
+            epoch
+        )),
+        Ok(BO)
+    );
+    // Until the restore nothing reaches the VRAM: no CPU copy or mapping,
+    // no eviction.
+    assert_eq!(object.read(0, &mut [0]), Err(FsError::WouldBlock));
+    assert_eq!(object.write(0, &[0]), Err(FsError::WouldBlock));
+    assert_eq!(object.backing(0, 4096).err(), Some(FsError::WouldBlock));
+    assert!(!object.is_evictable(true));
+
+    // S3 loses LMEM: poison the fixture aperture behind the object.
+    // SAFETY: the fixture exclusively owns its fake LMEM frames; nothing
+    // maps or accesses this object while its restore is pending.
+    unsafe {
+        core::ptr::write_bytes(
+            frame.start_address().kernel_mut_ptr::<u8>().add(dpa as usize),
+            0x5a,
+            BO as usize,
+        )
+    };
+    // xe_bo_restore_pinned: the same device address, the saved bytes.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::restore_pinned_vram(
+            backend.as_ref(),
+            &pool,
+            epoch
+        )),
+        Ok(1)
+    );
+    assert!(!object.restore_pending() && object.is_vram());
+    assert_eq!(object.pages().next(), Some(dpa));
+    let mut back = alloc::vec![0; BO as usize];
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(17));
+    // The peer's table names the same BAR addresses as before the suspend.
+    assert_eq!(block_on_spin(peer.map()).unwrap().segments, sg.segments);
+
+    // Another suspend: the importer's first use after resume restores the
+    // export before mapping it.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::backup_pinned_vram(
+            backend.as_ref(),
+            &pool,
+            epoch
+        )),
+        Ok(BO)
+    );
+    // SAFETY: as above.
+    unsafe {
+        core::ptr::write_bytes(
+            frame.start_address().kernel_mut_ptr::<u8>().add(dpa as usize),
+            0xa5,
+            BO as usize,
+        )
+    };
+    let importer = RenderFile::new();
+    let imported_handle = importer
+        .gem
+        .import_attachment(Import::new(EXPORTER_CARD, peer))
+        .unwrap();
+    let imported = importer.gem.object(imported_handle).unwrap();
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_prime::ensure_mapped(&imported)),
+        Ok(())
+    );
+    assert!(!object.restore_pending());
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(17));
+    let bus = frame.start_address().raw() + dpa;
+    assert_eq!(imported.pages().next(), Some(bus));
+
+    importer.gem.close(imported_handle).unwrap();
+    drop(imported);
+    drop(importer);
+    assert!(!object.externally_pinned());
+    // Unpinned, a later suspend drains it like any other object.
+    other.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(19));
+    drop(other);
+    drop(object);
+    drop(file);
+    drop(info);
+    drop(backend);
+    drop(pool);
+    vram_clear::fixture_finish();
+    narf_memory::frame::free_pages(frame, 6);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    smoke_xe_prime_pinned_vram_export_survives_suspend_in_place
 );

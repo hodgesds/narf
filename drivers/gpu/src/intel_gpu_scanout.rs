@@ -809,6 +809,7 @@ impl<M: ScanoutIo> Presenter<M> {
     fn scanout_backing_ok(&self, object: &GemObject) -> bool {
         object.scanout()
             && !object.is_userptr()
+            && !object.restore_pending()
             && ((self.vram_scanout && object.is_vram()) || object.is_wc())
     }
 

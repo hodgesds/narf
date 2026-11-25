@@ -49,8 +49,20 @@ struct GemBacking {
     /// The attachment's move count `foreign` was mapped at: a later move
     /// notification makes the pages stale until the import maps again.
     foreign_generation: u64,
+    /// `bo->backup_obj` of a dma-buf-pinned VRAM object across system
+    /// suspend ([`GemObject::backup_pinned`]): its data saved to system
+    /// memory while `vram` stays reserved, until the resume copies it back.
+    suspend_backup: Option<SuspendBackup>,
     /// `size` is charged to the system-memory LIVE_BYTES bound.
     charged: bool,
+}
+
+/// A pinned VRAM object's saved contents (`xe_bo_evict_pinned`): the data
+/// and, on Alchemist, its Flat-CCS metadata.
+#[derive(Clone, Debug)]
+struct SuspendBackup {
+    data: Arc<GemObject>,
+    ccs: Option<Arc<GemObject>>,
 }
 
 pub struct GemPages<'a> {
@@ -255,6 +267,7 @@ impl GemObject {
                 ccs_backup: None,
                 foreign: Vec::new(),
                 foreign_generation: 0,
+                suspend_backup: None,
                 charged: true,
             }),
             storage: AtomicU8::new(STORAGE_SYSTEM),
@@ -512,7 +525,7 @@ impl GemObject {
         if !allow_scanout && self.scanout() {
             return false;
         }
-        if self.externally_pinned() || !self.idle(true) {
+        if self.externally_pinned() || self.restore_pending() || !self.idle(true) {
             return false;
         }
         !cpu_mapping::has_active_aliases(self)
@@ -674,6 +687,112 @@ impl GemObject {
             self.evict_locked(backend, epoch, false).await?;
         }
         Ok(placement)
+    }
+    /// A suspend backup awaits [`Self::restore_pinned`]: until then the VRAM
+    /// holds nothing of this object's (S3 lost it), so no CPU access,
+    /// mapping, scanout, move or GPU use may reach it first.
+    pub(crate) fn restore_pending(&self) -> bool {
+        self.backing.lock().suspend_backup.is_some()
+    }
+    /// The bytes of `pool` a suspend backup of this object saved.
+    pub(crate) fn suspend_saved_bytes(&self, pool: &crate::intel_gpu_vram::Vram) -> u64 {
+        let backing = self.backing.lock();
+        match (&backing.suspend_backup, &backing.vram) {
+            (Some(_), Some(vram)) if vram.pool_is_ref(pool) => vram.size(),
+            _ => 0,
+        }
+    }
+    /// `xe_bo_evict_pinned` at system suspend for a VRAM object a dma-buf
+    /// importer pins (`xe->pinned.late.external`): copy its data (and DG2
+    /// Flat-CCS) into a new system backup with the eviction copy and keep
+    /// the VRAM allocation, so [`Self::restore_pinned`] puts it back in the
+    /// same placement. The importers keep their tables. Returns the VRAM
+    /// bytes saved: 0 for anything else, and the existing backup's size when
+    /// an earlier suspend's backup was never restored (it still holds the
+    /// data). Busy work or a live CPU alias refuses: S3 loses the BAR
+    /// contents a process would still see.
+    pub(crate) async fn backup_pinned(
+        self: &Arc<Self>,
+        backend: &dyn crate::intel_gpu_user::UserBackend,
+        epoch: u64,
+    ) -> Result<u64, FsError> {
+        let _migrating = self.migrating.lock().await;
+        if !self.is_vram() || !self.externally_pinned() {
+            return Ok(0);
+        }
+        let (requires_ccs, bytes) = {
+            let backing = self.backing.lock();
+            let Some(vram) = &backing.vram else {
+                return Ok(0);
+            };
+            if backing.suspend_backup.is_some() {
+                return Ok(vram.size());
+            }
+            (vram.requires_ccs_clear(), vram.size())
+        };
+        if !self.idle(true) || cpu_mapping::has_active_aliases(self) {
+            return Err(FsError::Busy);
+        }
+        let data = GemObject::private_system(self.size)?;
+        let ccs = if requires_ccs {
+            let ccs_bytes = ((self.size / 256).div_ceil(PAGE) * PAGE).max(PAGE);
+            Some(GemObject::private_system(ccs_bytes)?)
+        } else {
+            None
+        };
+        let request = crate::intel_gpu_exec::copy::CopyRequest::for_migration(
+            self.clone(),
+            data.clone(),
+            ccs.clone(),
+            self.size,
+        )?;
+        let fence = backend.copy_objects(request, epoch).await?;
+        if fence.wait().await.is_err() {
+            return Err(crate::intel_gpu_user::io_error());
+        }
+        {
+            // As the eviction swap: no writer may have overtaken the copy.
+            let _reservation = RESERVATIONS.lock();
+            if !self.idle(true) {
+                return Err(FsError::Busy);
+            }
+            self.backing.lock().suspend_backup = Some(SuspendBackup { data, ccs });
+        }
+        Ok(bytes)
+    }
+    /// `xe_bo_restore_pinned`: copy a suspend backup back into this
+    /// object's unchanged VRAM allocation (data and DG2 Flat-CCS), then drop
+    /// it. Returns whether a backup was restored.
+    pub(crate) async fn restore_pinned(
+        self: &Arc<Self>,
+        backend: &dyn crate::intel_gpu_user::UserBackend,
+        epoch: u64,
+    ) -> Result<bool, FsError> {
+        let _migrating = self.migrating.lock().await;
+        let backup = { self.backing.lock().suspend_backup.clone() };
+        let Some(backup) = backup else {
+            return Ok(false);
+        };
+        let request = crate::intel_gpu_exec::copy::CopyRequest::for_migration(
+            backup.data.clone(),
+            self.clone(),
+            backup.ccs.clone(),
+            self.size,
+        )?;
+        let fence = backend.copy_objects(request, epoch).await?;
+        if fence.wait().await.is_err() {
+            return Err(crate::intel_gpu_user::io_error());
+        }
+        let restored = self.backing.lock().suspend_backup.take();
+        drop(restored);
+        Ok(true)
+    }
+    /// Drop a suspend backup whose VRAM never lost power (the suspend was
+    /// refused after the save): the VRAM still holds the data.
+    pub(crate) async fn discard_backup(&self) {
+        let _migrating = self.migrating.lock().await;
+        let backup = self.backing.lock().suspend_backup.take();
+        drop(backup);
     }
     pub(crate) fn vram_page_size(&self) -> u64 {
         self.vram_page_sz.load(Ordering::Acquire)
@@ -845,6 +964,10 @@ impl GemObject {
         if self.is_gpu_only() || self.private_staging {
             return Err(FsError::Unsupported);
         }
+        // The BAR holds nothing of a pinned export until its resume restore.
+        if self.restore_pending() {
+            return Err(FsError::WouldBlock);
+        }
         if len == 0 || offset % PAGE != 0 {
             return Err(FsError::InvalidData);
         }
@@ -872,6 +995,9 @@ impl GemObject {
             return Err(FsError::Unsupported);
         }
         self.range(offset, bytes.len())?;
+        if self.restore_pending() {
+            return Err(FsError::WouldBlock);
+        }
         let snapshot = self.dma_buf.resv.snapshot();
         let _reservation = RESERVATIONS.lock();
         if !snapshot.is_current() || snapshot.has_fences(dma_resv_usage_rw(false)) {
@@ -989,6 +1115,9 @@ impl GemObject {
         }
         if self.is_read_only() {
             return Err(FsError::PermissionDenied);
+        }
+        if self.restore_pending() {
+            return Err(FsError::WouldBlock);
         }
         self.range(offset, bytes.len())?;
         let snapshot = self.dma_buf.resv.snapshot();
@@ -1115,7 +1244,12 @@ impl GemObject {
         if self.vm_owner.is_some() || self.private_staging || self.is_userptr() || self.is_wc() {
             return Err(FsError::Unsupported);
         }
-        if (!allow_scanout && self.scanout()) || self.externally_pinned() || !self.idle(true) {
+        // A suspend backup not yet restored holds the data, not the VRAM.
+        if (!allow_scanout && self.scanout())
+            || self.externally_pinned()
+            || self.restore_pending()
+            || !self.idle(true)
+        {
             return Err(FsError::Busy);
         }
         cpu_mapping::retire_object(self)?;

@@ -334,6 +334,21 @@ impl Attachment {
         Ok(())
     }
 
+    /// `xe_bo_restore_late` for this attachment's export when a system resume
+    /// has not restored it yet: an importer must not reach VRAM S3 cleared.
+    /// The copy runs in the exporter's epoch; without a running exporter GT
+    /// the use waits (`WouldBlock`).
+    pub(crate) async fn restore_export(&self) -> Result<(), FsError> {
+        if !self.object.restore_pending() {
+            return Ok(());
+        }
+        let epoch = self.exporter_epoch().ok_or(FsError::WouldBlock)?;
+        self.object
+            .restore_pinned(self.exporter.backend.as_ref(), epoch)
+            .await
+            .map(drop)
+    }
+
     /// `dma_buf_map_attachment` -> `xe_dma_buf_map`. A static attachment
     /// pins first (`dma_buf_pin_on_map`) and keeps one table for its life. A
     /// dynamic one validates the placement without a pin and caches its
@@ -495,6 +510,9 @@ pub(crate) async fn ensure_mapped(object: &Arc<GemObject>) -> Result<(), FsError
     let Some(import) = object.import() else {
         return Ok(());
     };
+    // A pinned export's tables stay valid across suspend; its contents come
+    // back only with the restore.
+    import.attachment().restore_export().await?;
     for _ in 0..MAP_RETRIES {
         if object.import_mapped() {
             return Ok(());
