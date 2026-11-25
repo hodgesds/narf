@@ -3044,9 +3044,9 @@ fn legacy_external_routes_stopped(bar: &MmioRegion) -> bool {
 // the serial-matched publication. The GTT allocator has no free path, so
 // one allocation is retained per BAR and reused whenever the next mode
 // fits; it lives in the pipe-B console GGTT window so it can never remap
-// the internal panel's pipe-A window. An MST route's further streams take
-// Pipe C's and D's windows (`mtl_scanout_window`), so no two lit surfaces
-// share one. Gen12 never reaches this glue: every
+// the internal panel's pipe-A window. Every other concurrently lit surface
+// (MST streams, a second route) takes its own window
+// (`mtl_scanout_window`), never a shared one. Gen12 never reaches this glue: every
 // entry returns before register access unless the probed generation is
 // Meteor Lake.
 
@@ -3072,6 +3072,24 @@ static MTL_SLOT_IMAGES: IrqSafeSpinLock<
 /// `MTL_EXTRA_SCANOUTS` key of the second route's surface (slot 1 never
 /// carries MST streams, which take keys 1..).
 const MTL_SECOND_SCANOUT_KEY: u8 = 0x80;
+
+/// The console GGTT window (`scanout_gtt_offset`) of stream `stream` of the
+/// route in slot `slot`. Every surface lit at the same time needs its own
+/// window: an allocation at a window's offset rewrites that window's PTEs,
+/// so two surfaces in one window would scan out the last one's pages. Slot
+/// 0's streams (one SST/HDMI route, or up to three MST streams) take Pipe
+/// B, C and D's windows in order; slot 1 (a second concurrent route, never
+/// beside MST) takes Pipe C's. `None` past the last window.
+fn mtl_scanout_window(slot: usize, stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
+    use crate::intel_gpu_pipes::Pipe;
+    match (slot, stream) {
+        (0, 0) => Some(Pipe::B),
+        (0, 1) => Some(Pipe::C),
+        (0, 2) => Some(Pipe::D),
+        (1, 0) => Some(Pipe::C),
+        _ => None,
+    }
+}
 
 /// The publication serial of route slot `slot`.
 fn mtl_slot_serial(slot: usize) -> &'static core::sync::atomic::AtomicU64 {
@@ -5065,27 +5083,34 @@ pub mod tests {
         smoke_mtl_external_hook_pass_publishes_and_retires_hdmi_route
     );
 
-    /// Every surface an MTL external pass lights at the same time gets its
-    /// own console GGTT window: the route's (or MST stream 0's) in Pipe B's,
-    /// MST streams 1 and 2 in Pipe C's and D's, none past that. The windows
-    /// are one `CONSOLE_SCANOUT_WINDOW_BYTES` stride apart above Pipe A's,
-    /// so an allocation in one never rewrites another's PTEs.
+    /// Every concurrently lit MTL external surface gets its own console
+    /// GGTT window: an MST route's streams in slot 0 take Pipe B, C and D's
+    /// (`alloc_contiguous_scanout_with_format` maps at the window's offset,
+    /// so a shared window would remap the earlier stream's pages), and a
+    /// second concurrent route takes Pipe C's, which MST never shares with
+    /// it (MST is refused beside a sibling route).
     fn smoke_mtl_external_streams_take_distinct_ggtt_windows() -> TestResult {
         use crate::intel_gpu_multipipe::scanout_gtt_offset;
         use crate::intel_gpu_pipes::Pipe;
-        let windows: alloc::vec::Vec<_> = (0..4).map(|stream| mtl_scanout_window(0, stream)).collect();
-        if windows != [Some(Pipe::B), Some(Pipe::C), Some(Pipe::D), None] {
-            return TestResult::Fail("streams 0..2 take Pipe B, C, D; stream 3 none");
+        let windows: alloc::vec::Vec<_> = (0..4).map(|s| mtl_scanout_window(0, s)).collect();
+        if windows != [Some(Pipe::B), Some(Pipe::C), Some(Pipe::D), None]
+            || mtl_scanout_window(1, 0) != Some(Pipe::C)
+            || mtl_scanout_window(1, 1).is_some()
+        {
+            return TestResult::Fail("streams must take Pipe B, C, D windows; slot 1 Pipe C");
         }
-        let stride = crate::intel_gpu_gtt::CONSOLE_SCANOUT_WINDOW_BYTES;
-        let base = crate::intel_gpu_gtt::SCANOUT_GTT_OFFSET_PIPE_A;
-        let offsets: alloc::vec::Vec<u64> = windows
-            .iter()
-            .flatten()
-            .map(|p| scanout_gtt_offset(*p))
+        // 16 MiB + 32 MiB per pipe: B, C, D at 48, 80 and 112 MiB, each a
+        // whole 32 MiB console window below the GEM scanout arena (160 MiB).
+        let offsets: alloc::vec::Vec<u64> = [Pipe::B, Pipe::C, Pipe::D]
+            .into_iter()
+            .map(scanout_gtt_offset)
             .collect();
-        if offsets != [base + stride, base + 2 * stride, base + 3 * stride] {
-            return TestResult::Fail("each window sits one stride above the last, above Pipe A's");
+        if offsets != [48 << 20, 80 << 20, 112 << 20]
+            || offsets
+                .iter()
+                .any(|o| o + crate::intel_gpu_gtt::CONSOLE_SCANOUT_WINDOW_BYTES > 160 << 20)
+        {
+            return TestResult::Fail("each window must be its own 32 MiB console range");
         }
         TestResult::Pass
     }
