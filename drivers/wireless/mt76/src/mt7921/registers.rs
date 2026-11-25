@@ -173,6 +173,14 @@ pub(super) fn plan(did: u16, addr: u32, len: u64) -> Result<Plan, Error> {
         // every other registered id keeps the CONNAC2 table. Unknown ids
         // fall back to CONNAC2, matching `firmware_blobs_for`'s default arm.
         let fixed = if is_mt7925(did) { FIXED_MT7925 } else { FIXED };
+        // A fixed window owns its tail word (`delta == size`): upstream
+        // treats it as a fixed-map hit (`ofs > size` skips, so `ofs ==
+        // size` matches in `__mt7925_reg_addr`), never as an L1
+        // address. NARF maps windows end-exclusively, so the tail word
+        // is rejected instead of mapped one word past the window — and
+        // it must not fall through to L1, whose ranges overlap the
+        // fixed windows (0x74030000 sits inside 0x70000000..0x78000000).
+        let mut tail = false;
         for &(base, offset, size) in fixed {
             if let Some(delta) = addr.checked_sub(base) {
                 if delta < size {
@@ -182,7 +190,13 @@ pub(super) fn plan(did: u16, addr: u32, len: u64) -> Result<Plan, Error> {
                     });
                     break;
                 }
+                if delta == size {
+                    tail = true;
+                }
             }
+        }
+        if mapped.is_none() && tail {
+            return Err(Error::Unsupported);
         }
     }
     let mapped = mapped

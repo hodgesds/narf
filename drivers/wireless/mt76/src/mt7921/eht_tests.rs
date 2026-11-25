@@ -184,7 +184,16 @@ fn local_caps() -> Result<(), &'static str> {
     if qualified(other, true) {
         return Err("MT7922 qualifies for EHT");
     }
-    if !wide160(info) || wide160(other) {
+    if !wide160(info) {
+        return Err("wide160 chip gate");
+    }
+    // The negative case is the 80 MHz-only MT7921, not the MT7922: upstream
+    // gates the 160 MHz HE caps on `is_mt7922()` (`mt76_chip(dev) ==
+    // 0x7922`, mt7921/main.c `mt7921_init_he_caps`), so the 7922 is a
+    // 160 MHz part too and `wide160` is true for it.
+    let mut narrow = info7925(2);
+    narrow.chip_id = 0x7921;
+    if wide160(narrow) {
         return Err("wide160 chip gate");
     }
     // mt7925_init_eht_caps, 2 NSS, 5 GHz, 160 MHz.
@@ -314,10 +323,16 @@ fn native80() -> Result<(), &'static str> {
     {
         return Err("native EHT association");
     }
+    // The request carries the station's full EHT caps, not the 80 MHz
+    // subset: upstream `mt7925_init_eht_caps` fills both the <=80 and
+    // the 160 MHz MCS sets unconditionally, so a 160 MHz-capable
+    // station advertises the 160 set even to an 80 MHz AP. The
+    // negotiated width shows up in the STA record below (EHT80), not
+    // by truncating the caps element.
     let f = &s.backend.frames;
     if !f
         .iter()
-        .any(|(_, f)| f.first() == Some(&0) && f.windows(17).any(|ie| ie == LOCAL_EHT80))
+        .any(|(_, f)| f.first() == Some(&0) && f.windows(20).any(|ie| ie == LOCAL_EHT160))
     {
         return Err("mt7925_init_eht_caps station EHT Capabilities in request");
     }
