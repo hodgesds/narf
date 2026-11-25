@@ -175,6 +175,19 @@ pub fn hdmi_port_clock_valid(tmds_khz: u32, limit_khz: u32, type_c: bool) -> boo
         && !(type_c && tmds_khz > 500_000 && tmds_khz < 532_800)
 }
 
+// ── DP ────────────────────────────────────────────────────────────────
+
+/// `DP_DOWNSTREAMPORT_PRESENT` in the receiver capability field and its
+/// `DP_DWN_STRM_PORT_PRESENT` bit.
+pub const DP_DOWNSTREAMPORT_PRESENT: usize = 0x005;
+const DP_DWN_STRM_PORT_PRESENT: u8 = 1 << 0;
+
+/// `drm_dp_is_branch` over the receiver capability field.
+pub fn dp_is_branch(dpcd: &[u8]) -> bool {
+    dpcd.get(DP_DOWNSTREAMPORT_PRESENT)
+        .is_some_and(|&b| b & DP_DWN_STRM_PORT_PRESENT != 0)
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_xelpg_color_tests.rs"]
 pub mod tests;

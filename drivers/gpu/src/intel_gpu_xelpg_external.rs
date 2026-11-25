@@ -208,7 +208,8 @@ use crate::intel_gpu_xelpg::{
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
-    activate_hdmi_beside, probe_hdmi_profile, release_hdmi_probe, HdmiError, HdmiRouteState, MtlHdmiRoute,
+    activate_hdmi_beside, probe_hdmi_profile_ext, release_hdmi_probe, HdmiError, HdmiRouteState,
+    MtlHdmiRoute,
 };
 use crate::intel_gpu_xelpg_hpd::{LiveMode, MtlHpdConfig, MtlHpdEvent, MtlHpdKind, MtlHpdPin};
 use crate::intel_gpu_xelpg_pipes::{ExternalPipe, PipeEnableError, Pipes};
@@ -1174,7 +1175,7 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
     legacy_port: bool,
 ) -> Result<MtlSinkProbe, ExternalError> {
     let link = probe_link(io, generation, port, legacy_port)?;
-    probe_sink_link(io, link, uhbr::opted_in())
+    probe_sink_link(io, link, uhbr::opted_in(), color::opted_in())
 }
 
 /// [`probe_sink`] for an exact source profile (Nova Lake-S has no
@@ -1199,7 +1200,21 @@ pub(crate) fn probe_sink_profile_uhbr<M: MmioWindow + ?Sized>(
     uhbr: bool,
 ) -> Result<MtlSinkProbe, ExternalError> {
     let link = probe_link_profile(io, profile, port, legacy_port)?;
-    probe_sink_link(io, link, uhbr)
+    probe_sink_link(io, link, uhbr, false)
+}
+
+/// [`probe_sink_profile`] with an explicit `narf.intel.hdmi14_ext` decision
+/// (UHBR off).
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn probe_sink_profile_ext<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    port: XeLpgPort,
+    legacy_port: bool,
+    ext: bool,
+) -> Result<MtlSinkProbe, ExternalError> {
+    let link = probe_link_profile(io, profile, port, legacy_port)?;
+    probe_sink_link(io, link, false, ext)
 }
 
 /// Whether `port`'s PHY is a C10 (`intel_encoder_is_c10phy`): DDI A/B on
@@ -1257,6 +1272,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     io: &M,
     link: LinkProbe,
     uhbr_on: bool,
+    ext: bool,
 ) -> Result<MtlSinkProbe, ExternalError> {
     let LinkProbe {
         display_ip,
@@ -1293,6 +1309,15 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     let sink = dsc::read_dp_sink(&mut aux, &raw)
         .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
     let max_bpp = dsc::max_pipe_bpp(dsc::edid_display_bpc(&edid[..edid_len]), 0);
+    // narf.intel.hdmi14_ext=1: Linux's pipe maximum without the 8 bpc
+    // ceiling (compute_sink_pipe_bpp with max_requested_bpc 12). A branch
+    // device keeps the 8 bpc search: Linux bounds its depth by the DFP's
+    // max bpc and TMDS clock (intel_dp_hdmi_compute_bpc), not modelled.
+    let deep_bpp = if ext && !color::dp_is_branch(&raw) {
+        color::max_pipe_bpp(color::sink_display_bpc(&edid[..edid_len]))
+    } else {
+        max_bpp
+    };
     let ceiling = if source.max_rate.rate_kbps() <= caps.max_rate.rate_kbps() {
         source.max_rate
     } else {
@@ -1335,7 +1360,8 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         };
         pipe_bpp = p.link.pipe_bpp;
     }
-    // A 6 bpc link: Linux's own (intel_dp_compute_link_config_wide).
+    // A 6 bpc (or, under narf.intel.hdmi14_ext=1, 10 or 12 bpc) link:
+    // Linux's own (intel_dp_compute_link_config_wide).
     let six_bpc = |link: dsc::UncompressedLink| {
         let rate = train_rate_for(link.link_rate)?;
         Some(NegotiatedLink {
@@ -1346,8 +1372,21 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
             over_budget: false,
         })
     };
+    // intel_dp_compute_link_config_wide above 24 bpp (deep colour): the
+    // deepest bpp an 8b/10b link carries, before any DSC. UHBR keeps its
+    // 24 bpp search (a deep stream is never planned onto 128b/132b here).
+    let deep = if uhbr_plan.is_none() && deep_bpp > dsc::PIPE_BPP {
+        dsc::uncompressed_link_upto(&limits, &mode, deep_bpp)
+            .filter(|link| link.pipe_bpp > dsc::PIPE_BPP)
+    } else {
+        None
+    };
     if uhbr_plan.is_some() {
         // The 128b/132b link above is Linux's choice.
+    } else if let Some(link) = deep {
+        negotiated = six_bpc(link)
+            .ok_or_else(|| rollback(ExternalError::Dsc(DscRefusal::LinkRateUnqualified)))?;
+        pipe_bpp = link.pipe_bpp;
     } else if !sink.dsc.dpcd.supports_dsc() && (negotiated.over_budget || max_bpp < dsc::PIPE_BPP) {
         // No DSC: 24 bpp that the negotiation carries keeps it; otherwise
         // the bpp descent, or the existing over-budget refusal.
@@ -3596,7 +3635,7 @@ impl MtlExternalService {
                 }
             }
         } else {
-            match probe_sink_link(io, link, uhbr_on) {
+            match probe_sink_link(io, link, uhbr_on, color::opted_in()) {
                 Ok(probe) if second && probe.uhbr.is_some() => {
                     let _ = release_probe(io, &probe);
                     ServiceOutcome::Refused {
@@ -3675,7 +3714,14 @@ impl MtlExternalService {
         let profile = self
             .profile
             .expect("HDMI connect follows a source-qualified route plan");
-        let mut probe = match probe_hdmi_profile(io, profile, port, legacy, ddc) {
+        let mut probe = match probe_hdmi_profile_ext(
+            io,
+            profile,
+            port,
+            legacy,
+            ddc,
+            color::opted_in(),
+        ) {
             Ok(probe) => probe,
             Err(e) => {
                 return ServiceOutcome::Refused {

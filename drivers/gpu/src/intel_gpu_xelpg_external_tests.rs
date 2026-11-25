@@ -3606,7 +3606,7 @@ fn smoke_xe3_external_dsc_confirms_fec_before_pps() -> TestResult {
         };
         let probe =
             match probe_link_profile(&io, ExternalDisplayProfile::for_ip(ip), io.port, false)
-                .and_then(|link| probe_sink_link(&io, link, false))
+                .and_then(|link| probe_sink_link(&io, link, false, false))
             {
                 Ok(probe) if probe.dsc.is_some_and(|plan| plan.fec) => probe,
                 _ => return TestResult::Fail("the USB-C sink must need DSC and FEC"),
@@ -5394,3 +5394,69 @@ pub(crate) mod nova {
         smoke_nvl_external_refusals_precede_mmio
     );
 }
+
+/// Deep colour on the display-14 DP route (`narf.intel.hdmi14_ext=1`): an
+/// EDID 1.4 digital 10 bpc and a 12 bpc 1080p60 sink on HBR2 x4 raise the
+/// pipe maximum to 30 and 36 bpp (`compute_sink_pipe_bpp`), and
+/// `intel_dp_compute_link_config_wide` takes the slowest, narrowest link
+/// that carries it: RBR x4 for 556875 kBps, HBR x4 for 668250 kBps. The
+/// route carries the depth in `TRANS_DDI_FUNC_CTL` (BPC_10 / _12),
+/// `PIPE_MISC` (BPC_10 / BPC_12_ADLP), the MSA (`DP_MSA_MISC_10_BPC` /
+/// `_12_BPC`) and `intel_link_compute_m_n` at its bpp; the stop restores
+/// the 8 bpc MSA. Without the option the same sinks run 24 bpp.
+fn smoke_mtl_external_dp_deep_colour_10_and_12_bpc() -> TestResult {
+    use crate::intel_gpu_xelpg_dsc::link_m_n;
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    for (input, bpp, rate, link_khz, func_bpc, misc, msa) in [
+        (0xB0u8, 30u32, TrainRate::Rbr, 162_000u32, 1u32 << 20, 0x120u32, 0x41u32),
+        (0xC0, 36, TrainRate::Hbr, 270_000, 3 << 20, 0x180, 0x61),
+    ] {
+        let mut edid = edid_1080();
+        edid[20] = input;
+        edid[127] = edid[127].wrapping_sub(input);
+        let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid.clone()));
+        let probe = match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, true) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("a deep-colour DP sink must probe"),
+        };
+        if probe.pipe_bpp != bpp
+            || probe.dsc.is_some()
+            || (probe.negotiated.rate, probe.negotiated.lanes) != (rate, 4)
+        {
+            return TestResult::Fail("the deep bpp must take Linux's slowest x4 link");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+            Ok(route) if route.state() == RouteState::Live => route,
+            _ => return TestResult::Fail("the deep-colour DP route must light"),
+        };
+        let mn = link_m_n(bpp * 16, 4, 148_500, link_khz, false);
+        if io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != func_bpc
+            || io.writes_to(0x7_1030) != [(1 << 23) | misc]
+            || io.writes_to(0x6_1410) != [msa]
+            || io.writes_to(0x6_1030) != [mn[0]]
+            || io.writes_to(0x6_1044) != [mn[3]]
+        {
+            return TestResult::Fail("Pipe B must carry the depth in FUNC_CTL, PIPE_MISC, MSA, M/N");
+        }
+        if route.stop(&io).is_err() || io.read32(0x6_1410) != 0x21 {
+            return TestResult::Fail("the deep route must stop and restore an 8 bpc MSA");
+        }
+        // narf.intel.hdmi14_ext off: 24 bpp.
+        let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid));
+        match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, false) {
+            Ok(p) if p.pipe_bpp == 24 => {}
+            _ => return TestResult::Fail("without the option the sink must run 24 bpp"),
+        }
+    }
+    // An 8 bpc sink stays at 24 bpp with the option.
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid_1080()));
+    match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, true) {
+        Ok(p) if p.pipe_bpp == 24 => TestResult::Pass,
+        _ => TestResult::Fail("an undefined-depth sink must stay at 24 bpp"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_deep_colour_10_and_12_bpc
+);
