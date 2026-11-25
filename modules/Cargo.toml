@@ -28,6 +28,11 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-filesystem   = { path = "../filesystem" }
 narf-initramfs    = { path = "../initramfs" }
 narf-crypto       = { path = "../crypto" }
+# `narf_wireless_regdomain`: the installed regulatory domain, for USB Wi-Fi
+# modules (rtw88.ko) that cannot reach the regulatory database otherwise.
+narf-wireless     = { path = "../wireless" }
+# `narf_usb_netif_*`: USB Wi-Fi station interfaces.
+narf-net          = { path = "../net" }
 # `narf_smbios_read`: the firmware SMBIOS table, for drivers whose board data
 # is keyed on an OEM structure (ath11k's type-0xF8 BDF variant).
 narf-firmware-smbios = { path = "../firmware/smbios" }

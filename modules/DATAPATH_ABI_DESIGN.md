@@ -650,3 +650,58 @@ requests waited with `narf_usb_wait`, at most 4 KiB per command (one
 transfer). `narf-drivers-usb/msc-module-only` steps the built-in binder
 aside. `usb-storage-module-block-smoke` proves it with the same
 write/read-back/image check as the NVMe smoke, over QEMU's `usb-storage`.
+
+## USB device poller and the regulatory domain
+
+Status: **implemented; `rtw88.ko` (`drivers/wireless/rtw`, RTL8821CU /
+RTL8822BU) is the first consumer.** Additive exports, in their own block at
+the end of `kabi.rs`:
+
+```text
+narf_usb_spawn_poller(dev, callback, cookie) -> i32                 BusDevice
+narf_usb_netif_register_with_context(dev, mac, tx_callback, out_ifindex) -> i32
+                                                                     NetIface
+narf_usb_netif_rx(dev, ifindex, frame, len) -> i32                   NetIface
+narf_wireless_regdomain(buf, len, out_len) -> i32                    NetIface
+```
+
+A driver written against `async` (a `narf-module-rt` executor) needs a
+heartbeat, a netdev and, for Wi-Fi, the regulatory domain. A PCI module gets
+the first two from its bus device context (`narf_spawn_poller`,
+`narf_netif_register_with_context`). A USB function's context lives in the
+USB stack instead (see [USB transfer datapath](#usb-transfer-datapath)),
+which has neither, and those exports refuse USB tokens (`-ENODEV`).
+
+- **Same authority as the USB datapath.** Every call resolves the caller
+  through the module call gate and requires a live USB context of that
+  module for `dev` (`narf_bus::module_usb::context_live`) — at spawn and
+  registration, and again before every poller run, every TX callback and
+  every RX delivery. Module text is entered only through the lifecycle /
+  domain gate, which refuses once unload began.
+- **Retirement with the context.** Pollers and interfaces are kept per
+  `(module, token)` in `modules/src/usb_wifi.rs` and retired by the
+  module-context-retired hook (which already retires module disks) when the
+  USB context goes away: detach, declined probe or unload, all before
+  module text is unmapped. A second `narf_usb_spawn_poller` for the same
+  device replaces the first.
+- **Netdev.** `wlan%d`, copy mode, no offloads, like the bus netif bridge;
+  the TX callback has `narf_netif_register_with_context`'s signature.
+- **Regulatory domain.** `narf_wireless_regdomain` copies the domain the
+  kernel's regulatory database holds (bootstrapping the staged signed policy
+  if none is installed, as a built-in driver's `ensure_domain` does) as one
+  NRGD v1 record — `narf_wireless::reg::parse_policy`'s layout, with the
+  world domain's "00" allowed. Read-only: a module cannot install a domain.
+  `-ENOBUFS` sizes the buffer; `-ENODATA` when there is none.
+
+**Not provided: a wiphy for a USB function.** The wireless broker
+(`narf_bus::module_wireless`) and the `WIFI` family host bind a session to a
+bus device context's `Cap<BusDeviceCap, Write>`, which a USB function does
+not have (`BusAddr` has no USB variant, and minting a device capability for
+it is a capability-model decision). So a USB Wi-Fi module publishes a
+netdev but no nl80211 wiphy; `rtw88.ko` drives its in-driver SME from module
+parameters instead. Extending the broker to USB functions is open.
+
+Proof: `modules/e2e/rtw88` loads the real `rtw88.ko` (relocations, init,
+USB/PCI claims, refusal of a probe without a USB context, clean unload).
+QEMU emulates no Realtek USB Wi-Fi device, so the poller, netdev and
+regulatory paths run first on hardware.

@@ -1687,6 +1687,122 @@ kernel_abi! {
             Err(errno) => errno,
         }
     }
+
+    // ── USB Wi-Fi modules: device heartbeat and regulatory domain ────────
+    //
+    // Additive exports whose first consumer is rtw88.ko (RTL8821CU /
+    // RTL8822BU over the USB KABI). See `modules/DATAPATH_ABI_DESIGN.md`,
+    // "USB device poller and the regulatory domain".
+
+    /// Spawn one 1 ms periodic task-context callback for the USB function
+    /// behind `dev` (the token a USB probe received): the USB counterpart of
+    /// [`narf_spawn_poller`], which serves PCI/MMIO device contexts only. The
+    /// first run is immediate. The poller stops when `callback` returns
+    /// non-zero, when the USB context goes away (detach, declined probe,
+    /// unload), or when a later call for the same device replaces it.
+    /// `-ENODEV` without a live USB context of this module for `dev`.
+    ///
+    /// # Safety
+    /// `callback` has the same lifetime/signature contract as
+    /// [`narf_irq_set_handler`].
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_usb_spawn_poller(dev: u64, callback: usize, cookie: u64) -> i32 {
+        if callback == 0 {
+            return -22;
+        }
+        // SAFETY: same callback contract as `narf_irq_set_handler`.
+        let callback: narf_bus::ModuleCallbackFn = unsafe { core::mem::transmute(callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        crate::usb_wifi::spawn_poller(owner, dev, callback, cookie)
+    }
+
+    /// Register one copy-mode Wi-Fi station interface (`wlan%d`) for the USB
+    /// function behind `dev`: the USB counterpart of
+    /// [`narf_netif_register_with_context`], which serves PCI/MMIO device
+    /// contexts only. `tx_callback` is an `extern "C" fn(dev_token, frame,
+    /// len) -> i32` the stack calls (module gate, task context) with one
+    /// borrowed Ethernet frame. The interface is withdrawn when the USB
+    /// context goes away (detach, declined probe, unload). Stores the
+    /// ifindex through `out_ifindex`. `-ENODEV` without a live USB context
+    /// of this module for `dev`; `-EBUSY` if it already has one.
+    ///
+    /// # Safety
+    /// `mac` names six readable bytes; `out_ifindex` names writable `u32`
+    /// storage; `tx_callback` stays mapped until unload.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_usb_netif_register_with_context(
+        dev: u64,
+        mac: *const u8,
+        tx_callback: usize,
+        out_ifindex: *mut u32,
+    ) -> i32 {
+        if mac.is_null() || tx_callback == 0 || out_ifindex.is_null() {
+            return -22;
+        }
+        let mut mac_bytes = [0u8; 6];
+        // SAFETY: the module promises six readable bytes.
+        mac_bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(mac, 6) });
+        // SAFETY: the callback address has the documented C signature and the
+        // interface is withdrawn before module text is unmapped.
+        let tx_callback: narf_bus::ModuleTxCtxFn = unsafe { core::mem::transmute(tx_callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        match crate::usb_wifi::netif_register(owner, dev, mac_bytes, tx_callback) {
+            Ok(ifindex) => {
+                // SAFETY: non-null above; caller promises writable storage.
+                unsafe { out_ifindex.write(ifindex) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Deliver one received Ethernet frame (`len` bytes at `frame`, copied
+    /// before return) to the stack on the interface
+    /// [`narf_usb_netif_register_with_context`] registered for `dev`.
+    ///
+    /// # Safety
+    /// `frame` names `len` readable and writable bytes.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_usb_netif_rx(dev: u64, ifindex: u32, frame: *mut u8, len: usize) -> i32 {
+        if frame.is_null() || len == 0 || len > 65_535 {
+            return -22;
+        }
+        // SAFETY: the module promises `len` bytes for the duration of the call.
+        let frame = unsafe { core::slice::from_raw_parts_mut(frame, len) };
+        let owner = crate::symbols::current_execution_id().0;
+        crate::usb_wifi::netif_rx(owner, dev, ifindex, frame)
+    }
+
+    /// Copy the kernel's installed regulatory domain (the one built-in
+    /// drivers read from `narf_wireless::reg::db`) into `buf` as one NRGD v1
+    /// record — `narf_wireless::reg::parse_policy`'s layout, with the world
+    /// domain's country "00" allowed — and store its length through
+    /// `out_len`. `-ENOBUFS` (nothing copied, required length stored) when
+    /// `len` is too small, so `len = 0` sizes it; `-ENODATA` when no domain
+    /// is installed and none can be bootstrapped; `-EOVERFLOW` for a domain
+    /// the record cannot carry. Read-only: a module cannot install a domain.
+    ///
+    /// # Safety
+    /// `buf` names `len` writable bytes (null when `len` is 0); `out_len`
+    /// names writable, aligned `usize` storage.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_wireless_regdomain(buf: *mut u8, len: usize, out_len: *mut usize) -> i32 {
+        if out_len.is_null() || (len != 0 && buf.is_null()) {
+            return -22;
+        }
+        let record = match crate::usb_wifi::regdomain_record() {
+            Ok(record) => record,
+            Err(errno) => return errno,
+        };
+        // SAFETY: writable aligned output, per the export contract.
+        unsafe { out_len.write(record.len()) };
+        if len < record.len() {
+            return -105;
+        }
+        // SAFETY: `buf` names at least `record.len()` writable bytes.
+        unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), buf, record.len()) };
+        0
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
