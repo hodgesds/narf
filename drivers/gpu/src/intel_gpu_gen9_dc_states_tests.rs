@@ -1362,3 +1362,119 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_gen9_dc_states",
     smoke_gen9_skl_display_core_uninit
 );
+
+/// DC9 admission on Gen9 LP refuses a lit DSI transcoder and live device
+/// interrupts before any write, then lifts its fence:
+/// - `bxt_get_dsi_transcoder_state`: behind `BXT_DSI_PLL_ENABLE` with
+///   `BXT_DSI_PLL_DO_ENABLE | BXT_DSI_PLL_LOCKED` (bits 31, 30) and the
+///   dividers `bxt_dsi_pll_is_enabled` accepts (`BXT_DSIA_16X_MASK` 3 << 8,
+///   and on Broxton `BXT_DSIC_16X_MASK` 3 << 10), `DPI_ENABLE` (bit 31) in
+///   `BXT_MIPI_PORT_CTRL(PORT_A)` 0x6b0c0 or `(PORT_C)` 0x6b8c0 refuses;
+///   with the PLL off the ports are not consulted; an enabled PLL with a
+///   rejected divider refuses (its ports cannot be read safely);
+/// - `assert_can_enable_dc9`'s "Interrupts not disabled yet":
+///   `GEN8_MASTER_IRQ` 0x44200 with `GEN8_MASTER_IRQ_CONTROL` (bit 31) set
+///   refuses, at admission and again at the DC9 write.
+fn smoke_gen9_lp_dc9_refuses_dsi_and_live_interrupts() -> TestResult {
+    const DSI_PLL: u32 = (1 << 31) | (1 << 30);
+    const DSIA_DSIC: u32 = (1 << 8) | (1 << 10);
+    let attempt = |platform, setup: &dyn Fn(&Fake)| {
+        let fake = Fake::default();
+        let mut core = armed(&fake, platform);
+        if core.suspend_begin(&fake).is_err() {
+            return (Err(Dc9Block::Unavailable), false);
+        }
+        setup(&fake);
+        fake.clear_log();
+        let got = core.dc9_admit(&fake);
+        core.dc9_abort();
+        let clean = fake.log().is_empty()
+            && core.get(&fake, Gen9DcUser::Kms) == Ok(true)
+            && core.refs(Gen9DcUser::Suspend) == 1;
+        (got, clean)
+    };
+    let lit = |fake: &Fake| {
+        fake.set(0x46080, DSI_PLL);
+        fake.set(0x161000, DSIA_DSIC);
+        fake.set(0x6b0c0, 1 << 31);
+    };
+    for platform in [Gen9Platform::Broxton, Gen9Platform::GeminiLake] {
+        let (got, clean) = attempt(platform, &lit);
+        if got
+            != Err(Dc9Block::DsiActive {
+                reg: 0x6b0c0,
+                value: 1 << 31,
+            })
+            || !clean
+        {
+            return TestResult::Fail("a DSI A port in video mode must refuse DC9 with no write");
+        }
+    }
+    let (got, clean) = attempt(Gen9Platform::Broxton, &|fake| {
+        fake.set(0x46080, DSI_PLL);
+        fake.set(0x161000, DSIA_DSIC);
+        fake.set(0x6b8c0, (1 << 31) | 0x10);
+    });
+    if got
+        != Err(Dc9Block::DsiActive {
+            reg: 0x6b8c0,
+            value: (1 << 31) | 0x10,
+        })
+        || !clean
+    {
+        return TestResult::Fail("a DSI C port in video mode must refuse DC9");
+    }
+    // Broxton validates both dividers, Gemini Lake DSI A's alone.
+    let half = |fake: &Fake| {
+        fake.set(0x46080, DSI_PLL);
+        fake.set(0x161000, 1 << 8);
+    };
+    if attempt(Gen9Platform::Broxton, &half).0 != Err(Dc9Block::DsiPllUnverified(1 << 8))
+        || attempt(Gen9Platform::GeminiLake, &half).0 != Ok(())
+    {
+        return TestResult::Fail("the DSI PLL dividers are checked as bxt_dsi_pll_is_enabled does");
+    }
+    // An unlocked DSI PLL: the ports are not read, so DPI_ENABLE left there
+    // by firmware does not count.
+    let (got, _) = attempt(Gen9Platform::Broxton, &|fake| {
+        fake.set(0x46080, 1 << 31);
+        fake.set(0x6b0c0, 1 << 31);
+    });
+    if got != Ok(()) {
+        return TestResult::Fail("DSI ports behind an unlocked PLL must not be consulted");
+    }
+    // A live master interrupt refuses admission ...
+    let (got, clean) = attempt(Gen9Platform::Broxton, &|fake| {
+        fake.set(0x44200, (1 << 31) | (1 << 16));
+    });
+    if got != Err(Dc9Block::InterruptsLive((1 << 31) | (1 << 16))) || !clean {
+        return TestResult::Fail("an enabled GEN8_MASTER_IRQ must refuse DC9 with no write");
+    }
+    // ... and one re-enabled after admission refuses the DC9 write itself.
+    let fake = Fake::default();
+    let mut core = armed(&fake, Gen9Platform::GeminiLake);
+    let _ = core.suspend_begin(&fake);
+    if core.dc9_admit(&fake).is_err() {
+        return TestResult::Fail("a dark, quiet display must admit DC9");
+    }
+    fake.set(0x44200, 1 << 31);
+    fake.clear_log();
+    if core.enter_dc9(&fake) != Err(Dc9Block::InterruptsLive(1 << 31))
+        || !fake.writes_to(DC_STATE_EN).is_empty()
+        || core.dc9()
+    {
+        return TestResult::Fail("the DC9 write must re-check the interrupts");
+    }
+    // The shared dark check alone: display 9 proper reads no DSI register.
+    let fake = Fake::default();
+    fake.set(0x46080, DSI_PLL);
+    fake.set(0x6b0c0, 1 << 31);
+    if display_dark(&fake, false, false) != Ok(()) {
+        return TestResult::Fail("display 9 proper has no DSI transcoders");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_lp_dc9_refuses_dsi_and_live_interrupts
+);
