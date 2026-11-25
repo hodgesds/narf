@@ -66,6 +66,11 @@ pub struct Sink {
     pub uhbr_log: Vec<(u32, u8)>,
     /// Native reads of the 128b/132b capability registers.
     pub uhbr_reads: Vec<u32>,
+    /// The last `DP_LINK_BW_SET`.
+    pub link_bw: u8,
+    /// A `DP_LINK_BW_SET` code at which 128b/132b training reports
+    /// `DP_128B132B_LT_FAILED` (0: never).
+    pub uhbr_lt_fail_bw: u8,
     /// Further DPCD bytes the sink reports.
     pub extra: Vec<(u32, u8)>,
     /// Native writes to `DP_PROTOCOL_CONVERTER_CONTROL_0..=2`, in order.
@@ -112,6 +117,8 @@ impl Sink {
             payload_status: 0,
             uhbr_log: Vec::new(),
             uhbr_reads: Vec::new(),
+            link_bw: 0,
+            uhbr_lt_fail_bw: 0,
             extra: Vec::new(),
             pcon_log: Vec::new(),
             tunnel: None,
@@ -178,6 +185,9 @@ impl Sink {
             match addr {
                 0x202 => return self.uhbr_status(0),
                 0x203 => return self.uhbr_status(1),
+                0x204 if self.uhbr_lt_fail_bw != 0 && self.link_bw == self.uhbr_lt_fail_bw => {
+                    return uhbr::DP_128B132B_LT_FAILED;
+                }
                 0x204 => {
                     return match (self.eq_locked, self.cr_locked) {
                         (true, true) => {
@@ -285,6 +295,7 @@ impl Sink {
                     0x100 => {
                         self.drop_lock();
                         self.polls = 0;
+                        self.link_bw = value;
                     }
                     0x108 => self.coding = value,
                     // DP_PAYLOAD_ALLOCATE_SET's last byte updates the table.
@@ -4491,6 +4502,145 @@ fn smoke_mtl_external_uhbr_tc_route_lights_and_stops() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_uhbr_tc_route_lights_and_stops
+);
+
+/// `intel_dp_start_link_train`'s failure on 128b/132b, then
+/// `intel_dp_get_link_train_fallback_values` and the modeset retry: a
+/// one-lane DP 2.0 sink (UHBR10/20) whose 3840x2160 495 MHz stream takes
+/// UHBR20 x1 at 24 bpp (`TU` 40) reports `DP_128B132B_LT_FAILED` there; the
+/// route stops, UHBR20 x1 is disabled with the limits at UHBR10 x1, and the
+/// retry lights UHBR10 x1 at 18 bpp: `TU` 60, `DATA_M` = `TU_SIZE(60)` |
+/// 0x75ed85, `LINK_M` 0xcac08 (495000 / 312500 at N 0x80000), the
+/// `TRANS_DDI_FUNC_CTL` BPC_6, the C20 UHBR10 image after the UHBR20 one.
+fn smoke_mtl_external_uhbr_training_fallback_retry() -> TestResult {
+    use crate::intel_gpu_pipes::{
+        PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET,
+    };
+    let mut sink = Sink::dp20(0x14, edid_uhd(495_000), uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+    sink.caps[2] = 1 | 0x40 | 0x80;
+    sink.uhbr_lt_fail_bw = 0x02;
+    sink.ffe_request = [4, 0, 0, 0];
+    let io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the one-lane DP 2.0 sink must probe");
+    };
+    match probe.uhbr {
+        Some(p)
+            if p.link
+                == (uhbr::UhbrLink {
+                    rate: uhbr::UhbrRate::Uhbr20,
+                    lanes: 1,
+                    pipe_bpp: 24,
+                })
+                && p.stream.tu == 40 => {}
+        _ => return TestResult::Fail("495 MHz on one lane plans UHBR20 x1 at 24 bpp"),
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        Ok(_) | Err(_) => return TestResult::Fail("the reduced retry must light the route"),
+    };
+    let mn = [(59 << 25) | 0x75_ed85, 0x80_0000, 0xc_ac08, 0x8_0000];
+    match route.probe.uhbr {
+        Some(p)
+            if p.link
+                == (uhbr::UhbrLink {
+                    rate: uhbr::UhbrRate::Uhbr10,
+                    lanes: 1,
+                    pipe_bpp: 18,
+                })
+                && p.stream.tu == 60
+                && p.stream.m_n == mn
+                && !p.caps.allowed(2_000_000, 1)
+                && p.caps.max_limits() == (1_000_000, 1) => {}
+        _ => return TestResult::Fail("the retry must run Linux's UHBR10 x1 at 18 bpp"),
+    }
+    if route.probe.pipe_bpp != 18 {
+        return TestResult::Fail("the retry's pipe runs 6 bpc");
+    }
+    {
+        let sink = io.sink.borrow();
+        let bw: Vec<u8> = sink
+            .uhbr_log
+            .iter()
+            .filter_map(|&(a, v)| (a == 0x100).then_some(v))
+            .collect();
+        if bw != [0x02, 0x01] {
+            return TestResult::Fail("training must try UHBR20, then UHBR10");
+        }
+    }
+    let valfreq = io.phy.writes_to(0x6_4430);
+    if valfreq.first() != Some(&625_000) || valfreq.last() != Some(&312_500) {
+        return TestResult::Fail("the C20 must run UHBR20, then UHBR10");
+    }
+    let base = Transcoder::B.base();
+    let got = [
+        io.read32(base + PIPE_DATA_M1_OFFSET),
+        io.read32(base + PIPE_DATA_N1_OFFSET),
+        io.read32(base + PIPE_LINK_M1_OFFSET),
+        io.read32(base + PIPE_LINK_N1_OFFSET),
+    ];
+    if got != mn
+        || io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != dsc::trans_ddi_bpc(18)
+    {
+        return TestResult::Fail("the retry's M/N and BPC_6 must be programmed");
+    }
+    let mut route = route;
+    if route.stop(&io).is_err() || route.release(&io).is_err() {
+        return TestResult::Fail("the retried route must stop and release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_training_fallback_retry
+);
+
+/// The modeset retry's link choice ([`uhbr_fallback`]): after UHBR10 x2
+/// fails for a 440 MHz 3840x2160 stream on an HBR2 x2 sink, the limits
+/// drop to HBR2 x2 (descending lane/rate order) and only 18 bpp fits
+/// (990000 <= 1080000 kBps): the probe goes back to the 8b/10b route at
+/// HBR2 x2, 6 bpc. The 594 MHz stream of [`uhbr_tc`] fits nothing after its
+/// fallback: no retry.
+fn smoke_mtl_external_uhbr_fallback_to_8b10b_or_none() -> TestResult {
+    let mut sink = Sink::dp20(0x14, edid_uhd(440_000), uhbr::DP_UHBR10);
+    sink.ffe_request = [4, 9, 0, 0];
+    let io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the DP 2.0 sink must probe");
+    };
+    if probe.uhbr.map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp))
+        != Some((uhbr::UhbrRate::Uhbr10, 2, 24))
+    {
+        return TestResult::Fail("440 MHz on two HBR2 lanes plans UHBR10 x2");
+    }
+    match uhbr_fallback(&probe) {
+        Some(next)
+            if next.uhbr.is_none()
+                && next.pipe_bpp == 18
+                && next.negotiated.rate == TrainRate::Hbr2
+                && next.negotiated.lanes == 2
+                && !next.negotiated.over_budget => {}
+        _ => return TestResult::Fail("the retry must hand the stream to 8b/10b HBR2 x2 at 18 bpp"),
+    }
+    let _ = release_probe(&io, &probe);
+    let io = uhbr_tc();
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the DP 2.0 sink must probe");
+    };
+    if uhbr_fallback(&probe).is_some() {
+        return TestResult::Fail("4K60 fits nothing below UHBR10 x2 on two lanes");
+    }
+    let _ = release_probe(&io, &probe);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_fallback_to_8b10b_or_none
 );
 
 /// The 128b/132b route through one 128b/132b LTTPR (`DP_PHY_REPEATER_CNT`

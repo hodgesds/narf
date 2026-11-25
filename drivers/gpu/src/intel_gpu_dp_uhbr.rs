@@ -45,11 +45,17 @@
 //!   implemented), so a 128b/132b route hands them back to transparent mode
 //!   when it stops.
 //!
+//! - **Fallback** ([`LinkCaps`]): `intel_dp_link_caps.c`'s configuration
+//!   orders, `intel_dp_get_link_train_fallback_values` after a failed
+//!   128b/132b training (the failed configuration disabled, the maximum
+//!   limits reduced), and the modeset retry's
+//!   `intel_dp_compute_link_config_wide` over what is still allowed
+//!   ([`wide_search`]), which may land on 8b/10b.
+//!
 //! Not implemented, refused typed ([`UhbrRefusal`]) instead of running a
 //! link Linux would not: 128b/132b MST, DSC on a link whose common rates
-//! include UHBR, Thunderbolt-alt UHBR on display 14/20 (no TBT UHBR clock
-//! select), and the reduced-parameter retry after a failed 128b/132b
-//! training.
+//! include UHBR, and Thunderbolt-alt UHBR on display 14/20 (no TBT UHBR
+//! clock select).
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_modeset::Mode;
@@ -562,61 +568,257 @@ pub enum WideLink {
 /// first that carries the mode wins.
 #[cfg(any(test, feature = "kernel-test"))]
 pub fn wide_link(limits: &dsc::LinkLimits, uhbr_rates: u8, mode: &Mode, max_bpp: u32) -> WideLink {
-    wide_link_capped(limits, uhbr_rates, mode, max_bpp, None, 0)
+    wide_link_caps(&LinkCaps::new(limits, uhbr_rates), mode, max_bpp, None)
 }
 
-/// [`wide_link`] with `intel_dp_max_link_data_rate`'s DP tunnel cap
-/// (`cap`, kBps: the tunnel's available bandwidth while BW allocation is
-/// enabled) on every configuration, and the UHBR lane counts the tunnel's
-/// `intel_dp_tunnel_uhbr_lanes_wa_apply` disabled (`uhbr_lane_mask`, bit
-/// `ilog2(lanes)`).
-pub fn wide_link_capped(
-    limits: &dsc::LinkLimits,
-    uhbr_rates: u8,
+/// [`wide_link`] over the allowed configurations of `caps` (the UHBR lane
+/// counts a DP tunnel's `intel_dp_tunnel_uhbr_lanes_wa_apply` disabled, a
+/// training fallback's disabled configuration and maximum limits) with
+/// `intel_dp_max_link_data_rate`'s DP tunnel cap (`cap`, kBps: the tunnel's
+/// available bandwidth while BW allocation is enabled).
+pub fn wide_link_caps(caps: &LinkCaps, mode: &Mode, max_bpp: u32, cap: Option<u64>) -> WideLink {
+    match wide_search(caps, mode, max_bpp, cap) {
+        Some(link) if link.link_rate >= 1_000_000 => match UhbrRate::from_link_rate(link.link_rate) {
+            Some(rate) => WideLink::Uhbr(UhbrLink {
+                rate,
+                lanes: link.lanes,
+                pipe_bpp: link.pipe_bpp,
+            }),
+            None => WideLink::None,
+        },
+        Some(_) => WideLink::EightTenB,
+        None => WideLink::None,
+    }
+}
+
+/// `intel_dp_compute_link_config_wide` itself: for each pipe bpp from
+/// `max_bpp` down in steps of 6 to 18, the allowed configurations of `caps`
+/// in `INTEL_DP_LINK_CAPS_ORDER_KEY_RATE_LANE` ascending order
+/// (`intel_dp_link_caps_connector_compute_order` for SST); the first whose
+/// `intel_dp_link_required` fits `intel_dp_max_link_data_rate` wins.
+pub fn wide_search(
+    caps: &LinkCaps,
     mode: &Mode,
     max_bpp: u32,
     cap: Option<u64>,
-    uhbr_lane_mask: u8,
-) -> WideLink {
+) -> Option<dsc::UncompressedLink> {
     let capped = |rate: u64| cap.map_or(rate, |cap| rate.min(cap));
     let max_bpp = max_bpp.min(dsc::PIPE_BPP);
-    let lanes = [1u8, 2, 4].into_iter().filter(|&l| l <= limits.max_lanes);
     let (clock, hdisplay) = (mode.pixel_clock_khz, u32::from(mode.h_active));
+    let (order, n) = caps.ordered(FallbackOrder::RateLane);
     let mut bpp = max_bpp - max_bpp % 6;
     while bpp >= dsc::MIN_PIPE_BPP {
         let bpp_x16 = bpp * 16;
+        for &(rate, lanes) in order[..n].iter().filter(|&&(r, l)| caps.allowed(r, l)) {
+            let l = u32::from(lanes);
+            let (need, avail) = if rate >= 1_000_000 {
+                (
+                    link_required(l, clock, hdisplay, bpp_x16),
+                    UhbrRate::from_link_rate(rate).map_or(0, |r| max_link_data_rate(r, l)),
+                )
+            } else {
+                (
+                    dsc::link_required(l, clock, hdisplay, bpp_x16, false),
+                    dsc::max_link_data_rate(rate, l),
+                )
+            };
+            if need <= capped(avail) {
+                return Some(dsc::UncompressedLink {
+                    pipe_bpp: bpp,
+                    link_rate: rate,
+                    lanes,
+                });
+            }
+        }
+        bpp -= 6;
+    }
+    None
+}
+
+// ── Link configurations and the training fallback ────────────────
+
+/// The orders of `enum intel_dp_link_caps_order_key`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FallbackOrder {
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_RATE_LANE`: rate, then lane count.
+    RateLane,
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_LANE_RATE`: lane count, then rate.
+    LaneRate,
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_BW`: `drm_dp_max_dprx_data_rate`, then
+    /// rate (`link_config_cmp_by_bw`).
+    Bw,
+}
+
+/// The most link configurations: four 8b/10b rates and three UHBR rates,
+/// with one, two and four lanes.
+const MAX_CONFIGS: usize = 7 * 3;
+
+/// `struct intel_dp_link_caps` for one sink: the common rates (the 8b/10b
+/// rates, then the UHBR rates, ascending), the lane counts 1, 2, 4 up to
+/// the common maximum, the configurations disabled for this sink
+/// (`enabled_configs`) and the maximum link limits (`max_limits`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LinkCaps {
+    rates: [u32; 7],
+    num_rates: u8,
+    max_lanes: u8,
+    /// Bit `rate index * 3 + ilog2(lanes)`.
+    disabled: u32,
+    max_rate: u32,
+    max_lane_count: u8,
+}
+
+impl LinkCaps {
+    /// `intel_dp_link_caps_update(reset = true)` from the 8b/10b common rates
+    /// and lane count of `limits` and the common UHBR rates.
+    pub fn new(limits: &dsc::LinkLimits, uhbr_rates: u8) -> Self {
+        let mut rates = [0u32; 7];
+        let mut n = 0;
         for rate in limits.rates.iter().copied().take_while(|&r| r != 0) {
-            for l in lanes.clone() {
-                let l = u32::from(l);
-                if dsc::link_required(l, clock, hdisplay, bpp_x16, false)
-                    <= capped(dsc::max_link_data_rate(rate, l))
-                {
-                    return WideLink::EightTenB;
-                }
+            if n < 4 {
+                rates[n] = rate;
+                n += 1;
             }
         }
         for rate in UhbrRate::ALL
             .into_iter()
             .filter(|r| uhbr_rates & r.rate_bit() != 0)
         {
-            for l in lanes
-                .clone()
-                .filter(|l| uhbr_lane_mask & (1 << l.trailing_zeros()) == 0)
-            {
-                if link_required(u32::from(l), clock, hdisplay, bpp_x16)
-                    <= capped(max_link_data_rate(rate, u32::from(l)))
-                {
-                    return WideLink::Uhbr(UhbrLink {
-                        rate,
-                        lanes: l,
-                        pipe_bpp: bpp,
-                    });
+            rates[n] = rate.link_rate();
+            n += 1;
+        }
+        let max_lanes = limits.max_lanes;
+        Self {
+            rates,
+            num_rates: n as u8,
+            max_lanes,
+            disabled: 0,
+            max_rate: if n == 0 { 0 } else { rates[n - 1] },
+            max_lane_count: max_lanes,
+        }
+    }
+
+    fn index(&self, rate: u32, lanes: u8) -> Option<usize> {
+        let r = self.rates[..usize::from(self.num_rates)]
+            .iter()
+            .position(|&x| x == rate)?;
+        let l = match lanes {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => return None,
+        };
+        (lanes <= self.max_lanes).then_some(r * 3 + l)
+    }
+
+    /// Whether `rate` x `lanes` is an allowed configuration: supported, not
+    /// disabled, and within the maximum link limits.
+    pub fn allowed(&self, rate: u32, lanes: u8) -> bool {
+        self.index(rate, lanes)
+            .is_some_and(|i| self.disabled & (1 << i) == 0)
+            && rate <= self.max_rate
+            && lanes <= self.max_lane_count
+    }
+
+    /// `intel_dp_link_caps_disable_config`.
+    pub fn disable(&mut self, rate: u32, lanes: u8) {
+        if let Some(i) = self.index(rate, lanes) {
+            self.disabled |= 1 << i;
+        }
+    }
+
+    /// `intel_dp_tunnel_uhbr_lanes_wa_apply`: every UHBR configuration whose
+    /// lane count is in `mask` (bit `ilog2(lanes)`) disabled.
+    pub fn disable_uhbr_lanes(&mut self, mask: u8) {
+        for i in 0..usize::from(self.num_rates) {
+            let rate = self.rates[i];
+            for lanes in [1u8, 2, 4] {
+                if rate >= 1_000_000 && mask & (1 << lanes.trailing_zeros()) != 0 {
+                    self.disable(rate, lanes);
                 }
             }
         }
-        bpp -= 6;
     }
-    WideLink::None
+
+    /// The maximum link limits (`intel_dp_link_caps_get_max_limits`).
+    pub fn max_limits(&self) -> (u32, u8) {
+        (self.max_rate, self.max_lane_count)
+    }
+
+    /// Every supported configuration, ascending in `order`.
+    pub fn ordered(&self, order: FallbackOrder) -> ([(u32, u8); MAX_CONFIGS], usize) {
+        let mut all = [(0u32, 0u8); MAX_CONFIGS];
+        let mut n = 0;
+        for &rate in &self.rates[..usize::from(self.num_rates)] {
+            for lanes in [1u8, 2, 4].into_iter().filter(|&l| l <= self.max_lanes) {
+                all[n] = (rate, lanes);
+                n += 1;
+            }
+        }
+        let key = |&(rate, lanes): &(u32, u8)| -> (u64, u32) {
+            match order {
+                FallbackOrder::RateLane => (u64::from(rate), u32::from(lanes)),
+                FallbackOrder::LaneRate => (u64::from(lanes), rate),
+                FallbackOrder::Bw => (config_bw(rate, lanes), rate),
+            }
+        };
+        all[..n].sort_unstable_by_key(key);
+        (all, n)
+    }
+
+    /// `intel_dp_get_link_train_fallback_values` for a non-eDP sink after a
+    /// failed training at `rate` x `lanes`: the maximum limits reset, then
+    /// `reduce_link_params` walks the enabled configurations in
+    /// `intel_dp_link_caps_connector_fallback_order` (descending
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_LANE_RATE` for SST,
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_BW` for MST) to the failed one and takes
+    /// the next; the failed configuration is disabled and the maximum limits
+    /// become the new one's. `None` (limits unchanged) when nothing follows.
+    pub fn fallback(&mut self, rate: u32, lanes: u8, mst: bool) -> Option<(u32, u8)> {
+        let saved = (self.max_rate, self.max_lane_count);
+        self.max_rate = self.rates[..usize::from(self.num_rates)]
+            .last()
+            .copied()
+            .unwrap_or(0);
+        self.max_lane_count = self.max_lanes;
+        let order = if mst {
+            FallbackOrder::Bw
+        } else {
+            FallbackOrder::LaneRate
+        };
+        let (all, n) = self.ordered(order);
+        let mut old_found = false;
+        let mut next = None;
+        for &(r, l) in all[..n].iter().rev().filter(|&&(r, l)| self.allowed(r, l)) {
+            if !old_found {
+                old_found = r == rate && l == lanes;
+                continue;
+            }
+            next = Some((r, l));
+            break;
+        }
+        match next {
+            Some((r, l)) => {
+                self.disable(rate, lanes);
+                self.max_rate = r;
+                self.max_lane_count = l;
+                Some((r, l))
+            }
+            None => {
+                (self.max_rate, self.max_lane_count) = saved;
+                None
+            }
+        }
+    }
+}
+
+/// `intel_dp_link_config_bw`: `drm_dp_max_dprx_data_rate` of the
+/// configuration.
+fn config_bw(rate: u32, lanes: u8) -> u64 {
+    match UhbrRate::from_link_rate(rate) {
+        Some(r) => max_link_data_rate(r, u32::from(lanes)),
+        None => dsc::max_link_data_rate(rate, u32::from(lanes)),
+    }
 }
 
 /// `compute_m_n` with a constant N, then `intel_reduce_m_n_ratio`.
@@ -1143,8 +1345,9 @@ pub enum UhbrRefusal {
     Tunnel(super::tunnel::TunnelError),
     /// No 64-slot MTP carries the stream (Linux then needs DSC).
     Slots,
-    /// The 128b/132b training failed; Linux's reduced-parameter retry is not
-    /// run (the route was stopped).
+    /// The 128b/132b training failed and the reduced-parameter retry either
+    /// had no configuration left that carries the stream or failed too (the
+    /// route was stopped).
     Training(TrainFailure),
     /// The sink's payload table or ACT did not acknowledge the 128b/132b
     /// SST payload (the route was stopped).

@@ -861,3 +861,90 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dp_uhbr",
     smoke_uhbr_lttpr_non_transparent_init_and_wake_timeout
 );
+
+/// `intel_dp_link_caps.c` and `intel_dp_get_link_train_fallback_values`
+/// over the common rates RBR..HBR3, UHBR10, UHBR20 and four lanes:
+///
+/// - SST falls back in descending `INTEL_DP_LINK_CAPS_ORDER_KEY_LANE_RATE`
+///   order: UHBR20 x4 -> UHBR10 x4 (the failed one disabled, the maximum
+///   limits 1000000 x 4), then -> HBR3 x4 past the disabled UHBR20 x4;
+///   RBR x4 -> UHBR20 x2; RBR x1 has nothing after it (limits unchanged);
+/// - MST falls back in descending `INTEL_DP_LINK_CAPS_ORDER_KEY_BW` order,
+///   equal bandwidths by descending rate (`link_config_cmp_by_bw`): UHBR20
+///   x4 -> UHBR20 x2 (both 4835500 kBps with UHBR10 x4), then -> UHBR10 x4;
+/// - `intel_dp_tunnel_uhbr_lanes_wa_apply` disables only UHBR configs;
+/// - the modeset retry: a 3840x2160 495 MHz stream on one lane takes
+///   UHBR20 x1 at 24 bpp (1485000 kBps; UHBR10 x1 carries 1208875), and
+///   after its failure UHBR10 x1 at 18 bpp (1113750).
+fn smoke_uhbr_link_caps_fallback_orders() -> TestResult {
+    let limits = dsc::LinkLimits::standard(810_000, 4);
+    let both = DP_UHBR10 | DP_UHBR20;
+    let mut caps = LinkCaps::new(&limits, both);
+    if caps.max_limits() != (2_000_000, 4) {
+        return TestResult::Fail("the maximum limits start at UHBR20 x4");
+    }
+    if caps.fallback(2_000_000, 4, false) != Some((1_000_000, 4))
+        || caps.max_limits() != (1_000_000, 4)
+        || caps.allowed(2_000_000, 4)
+        || caps.allowed(2_000_000, 2)
+        || !caps.allowed(1_000_000, 4)
+        || !caps.allowed(810_000, 4)
+    {
+        return TestResult::Fail("SST UHBR20 x4 falls back to UHBR10 x4");
+    }
+    if caps.fallback(1_000_000, 4, false) != Some((810_000, 4)) || caps.allowed(1_000_000, 4) {
+        return TestResult::Fail("the second SST fallback skips the disabled UHBR20 x4");
+    }
+    let mut caps = LinkCaps::new(&limits, both);
+    if caps.fallback(162_000, 4, false) != Some((2_000_000, 2)) {
+        return TestResult::Fail("SST RBR x4 falls back to the highest rate at two lanes");
+    }
+    let mut caps = LinkCaps::new(&limits, both);
+    if caps.fallback(162_000, 1, false).is_some() || caps.max_limits() != (2_000_000, 4) {
+        return TestResult::Fail("RBR x1 has no fallback and keeps the limits");
+    }
+    let mut caps = LinkCaps::new(&limits, both);
+    if caps.fallback(2_000_000, 4, true) != Some((2_000_000, 2))
+        || caps.fallback(2_000_000, 2, true) != Some((1_000_000, 4))
+    {
+        return TestResult::Fail("MST falls back by bandwidth, equal bandwidth by rate");
+    }
+    let mut caps = LinkCaps::new(&limits, both);
+    caps.disable_uhbr_lanes(0b11);
+    if caps.allowed(1_000_000, 1)
+        || caps.allowed(2_000_000, 2)
+        || !caps.allowed(1_000_000, 4)
+        || !caps.allowed(810_000, 1)
+    {
+        return TestResult::Fail("the tunnel workaround disables 1- and 2-lane UHBR only");
+    }
+    let mode = Mode {
+        pixel_clock_khz: 495_000,
+        h_active: 3840,
+        h_total: 4400,
+        h_sync_start: 3848,
+        h_sync_end: 3880,
+        v_active: 2160,
+        v_total: 2250,
+        v_sync_start: 2163,
+        v_sync_end: 2168,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let mut caps = LinkCaps::new(&dsc::LinkLimits::standard(540_000, 1), both);
+    let first = wide_search(&caps, &mode, 24, None);
+    if first.map(|l| (l.link_rate, l.lanes, l.pipe_bpp)) != Some((2_000_000, 1, 24)) {
+        return TestResult::Fail("495 MHz on one lane takes UHBR20 x1 at 24 bpp");
+    }
+    if caps.fallback(2_000_000, 1, false) != Some((1_000_000, 1))
+        || wide_search(&caps, &mode, 24, None).map(|l| (l.link_rate, l.lanes, l.pipe_bpp))
+            != Some((1_000_000, 1, 18))
+    {
+        return TestResult::Fail("the retry takes UHBR10 x1 at 18 bpp");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_link_caps_fallback_orders
+);

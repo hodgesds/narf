@@ -136,7 +136,10 @@
 //! [`MtlPortDecl::c20_uhbr_vspeo`]), the sink's VC payload and its ACT, the
 //! MTP M/N, the
 //! `TRANS_DP2_VFREQ` pair and, on display 30+, `DP_MIN_HBLANK_CTL`. The stop
-//! reverses it and hands the sink back to 8b/10b channel coding. On
+//! reverses it and hands the sink back to 8b/10b channel coding. A failed
+//! 128b/132b training stops the route and retries once at Linux's reduced
+//! configuration (`intel_dp_get_link_train_fallback_values`, then the
+//! modeset retry's link choice), which may be 8b/10b. On
 //! display 30+ Thunderbolt alt mode the link runs through the DP tunnel's BW
 //! allocation ([`tunnel`]): the tunnel supplies the DPRX's 128b/132b rates
 //! and caps the link, the stream's bandwidth is requested before the port
@@ -144,7 +147,7 @@
 //! LTTPRs in the path are switched to non-transparent mode for the
 //! 128b/132b training and handed back transparent at the stop.
 //! 128b/132b MST, DSC on a UHBR link, Thunderbolt UHBR on display 14/20
-//! and a failed training's reduced retry are refused typed
+//! are refused typed
 //! ([`ExternalError::Uhbr`]). HDCP takes a 128b/132b SST route as DP SST
 //! ([`hdcp_route_of`]). Without the option no 128b/132b register is
 //! touched.
@@ -1044,6 +1047,11 @@ pub struct UhbrPlan {
     /// The DP tunnel with BW allocation enabled that the 128b/132b link
     /// runs through (Thunderbolt alt mode, display 30+); `None` without one.
     pub tunnel: Option<tunnel::Tunnel>,
+    /// The sink's link configurations (`intel_dp->link.caps`), for the
+    /// training fallback.
+    pub caps: uhbr::LinkCaps,
+    /// The pipe's maximum bpp (`compute_sink_pipe_bpp`), for the retry.
+    pub max_bpp: u8,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1368,7 +1376,9 @@ fn plan_uhbr_link<A: crate::dp_aux::AuxChannel + ?Sized>(
             if lttpr_lanes != 0 { lttpr_lanes } else { 4 },
         );
     }
-    match uhbr::wide_link_capped(&limits, common, mode, max_bpp, cap, lane_mask) {
+    let mut caps = uhbr::LinkCaps::new(&limits, common);
+    caps.disable_uhbr_lanes(lane_mask);
+    match uhbr::wide_link_caps(&caps, mode, max_bpp, cap) {
         uhbr::WideLink::Uhbr(chosen) => {
             if link.tbt() && !link.display_ip.is_display30() {
                 return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt));
@@ -1380,6 +1390,8 @@ fn plan_uhbr_link<A: crate::dp_aux::AuxChannel + ?Sized>(
                 stream,
                 post_lt_adj_req: sink.post_lt_adj_req,
                 tunnel,
+                caps,
+                max_bpp: max_bpp.min(dsc::PIPE_BPP) as u8,
             }))
         }
         uhbr::WideLink::None if sink_dsc => Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Dsc)),
@@ -1410,12 +1422,20 @@ fn tunnel_alloc<M: MmioWindow + ?Sized>(
         plan.link.pipe_bpp * 16,
     );
     let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
-    let result = tunnel::alloc_bw(
-        &mut aux,
-        &mut uhbr::SystemClock,
-        &mut t,
-        u32::try_from(required).unwrap_or(u32::MAX),
-    );
+    // A retry after a stop (which handed the tunnel back) enables it again.
+    let result = if t.bw_alloc_enabled {
+        Ok(())
+    } else {
+        tunnel::enable_bw_alloc(&mut aux, &mut t)
+    }
+    .and_then(|()| {
+        tunnel::alloc_bw(
+            &mut aux,
+            &mut uhbr::SystemClock,
+            &mut t,
+            u32::try_from(required).unwrap_or(u32::MAX),
+        )
+    });
     plan.tunnel = Some(t);
     route.probe.uhbr = Some(plan);
     result.map_err(|e| ExternalError::Uhbr(uhbr::UhbrRefusal::Tunnel(e)))
@@ -1814,6 +1834,95 @@ pub(crate) fn activate_beside<M: MmioWindow + ?Sized>(
 #[allow(clippy::result_large_err)]
 fn activate_with_payload<M: MmioWindow + ?Sized>(
     io: &M,
+    probe: MtlSinkProbe,
+    fb: Framebuffer,
+    display: &MtlDisplay,
+    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
+) -> Result<MtlExternalRoute, ActivateError> {
+    match activate_once(io, probe, fb, display, payload) {
+        // intel_dp_start_link_train's failure on a 128b/132b link:
+        // intel_dp_get_link_train_fallback_values and the modeset retry,
+        // once, from the proven stop.
+        Err(ActivateError::Failed(route, ExternalError::Uhbr(uhbr::UhbrRefusal::Training(f))))
+            if route.state == RouteState::Stopped =>
+        {
+            match uhbr_fallback(&route.probe) {
+                Some(next) => activate_once(io, next, fb, display, payload),
+                None => Err(ActivateError::Failed(
+                    route,
+                    ExternalError::Uhbr(uhbr::UhbrRefusal::Training(f)),
+                )),
+            }
+        }
+        other => other,
+    }
+}
+
+/// The modeset retry after a failed 128b/132b training at the probe's
+/// link: [`uhbr::LinkCaps::fallback`] (SST order), then
+/// `intel_dp_compute_link_config_wide` over the configurations still
+/// allowed ([`uhbr::wide_search`], with the tunnel's cap). A 128b/132b
+/// result is a new plan (its MTP and M/N); an 8b/10b result hands the
+/// probe to the 8b/10b route at that rate, lane count and pipe bpp (the
+/// stop already returned the tunnel to its legacy allocation). `None` when
+/// nothing follows or nothing allowed carries the stream (Linux would
+/// prune the mode).
+fn uhbr_fallback(probe: &MtlSinkProbe) -> Option<MtlSinkProbe> {
+    let plan = probe.uhbr?;
+    let mut caps = plan.caps;
+    caps.fallback(plan.link.rate.link_rate(), plan.link.lanes, false)?;
+    let cap = plan
+        .tunnel
+        .filter(|t| t.bw_alloc_supported)
+        .and_then(|t| t.available_bw)
+        .map(u64::from);
+    let link = uhbr::wide_search(&caps, &probe.mode, u32::from(plan.max_bpp), cap)?;
+    let mode = probe.mode;
+    let mut next = probe.clone();
+    next.pipe_bpp = link.pipe_bpp;
+    match uhbr::UhbrRate::from_link_rate(link.link_rate) {
+        Some(rate) => {
+            let chosen = uhbr::UhbrLink {
+                rate,
+                lanes: link.lanes,
+                pipe_bpp: link.pipe_bpp,
+            };
+            let stream = uhbr::mtp_tu(&chosen, &mode)?;
+            let lanes = u32::from(link.lanes);
+            next.negotiated.lanes = link.lanes;
+            next.negotiated.demand_kbps = uhbr::link_required(
+                lanes,
+                mode.pixel_clock_khz,
+                u32::from(mode.h_active),
+                link.pipe_bpp * 16,
+            ) * 8;
+            next.negotiated.payload_kbps = uhbr::max_link_data_rate(rate, lanes) * 8;
+            next.uhbr = Some(UhbrPlan {
+                link: chosen,
+                stream,
+                caps,
+                ..plan
+            });
+        }
+        None => {
+            let rate = train_rate_for(link.link_rate)?;
+            next.uhbr = None;
+            next.negotiated = NegotiatedLink {
+                rate,
+                lanes: link.lanes,
+                demand_kbps: stream_demand_kbps(mode.pixel_clock_khz, link.pipe_bpp),
+                payload_kbps: rate.payload_kbps(link.lanes),
+                over_budget: false,
+            };
+        }
+    }
+    Some(next)
+}
+
+/// One activation attempt ([`activate_with_payload`] without the retry).
+#[allow(clippy::result_large_err)]
+fn activate_once<M: MmioWindow + ?Sized>(
+    io: &M,
     mut probe: MtlSinkProbe,
     fb: Framebuffer,
     display: &MtlDisplay,
@@ -1934,8 +2043,8 @@ fn program<M: MmioWindow + ?Sized>(
         // precedes the modeset enables).
         tunnel_alloc(io, route)?;
         // A 128b/132b link trains once at the planned rate and lanes; a
-        // failure stops the route (Linux's reduced-parameter retry is not
-        // run).
+        // failure stops the route and activate_with_payload runs Linux's
+        // reduced-parameter retry.
         enable_port_uhbr(io, route, &plan)?;
         let trained = TrainedLink {
             rate,
