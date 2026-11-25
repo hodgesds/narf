@@ -72,8 +72,8 @@ the token's identity/channel before programming gains and opening TX.
 
 Remaining physical input: acquire and qualify a per-device/board conservative
 power envelope and antenna bound, sign it with a trusted firmware-registry
-key, and install the exact MAC-bound artifact. No real curve is provided by
-this change. Synthetic test curves validate dimensional/policy arithmetic
+key, and install the exact MAC-bound artifact. No real curve is provided
+in-tree. Synthetic test curves validate dimensional/policy arithmetic
 only. Linux's RTL8188EU fops calls rtl8188f_set_tx_power, programming raw CCK
 and HT40 bases; its parser populates no per-rate differences and rtl8xxxu
 provides no dBm conversion. RTL8188EE's separate index conversion is not used.

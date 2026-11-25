@@ -25,9 +25,9 @@ existing trusted installer must replace or clear that policy.
 Linux v7.2 treats indoor operation as a separately supplied installation fact
 in [`regulatory_hint_indoor`](https://github.com/torvalds/linux/blob/v7.2/net/wireless/reg.c)
 and the nl80211 user regulatory hint. NARF supplies the corresponding fact
-through its signed deployment-policy contract. This continuation does not
-implement Linux's netlink-owner lifetime or claim that a country database
-alone proves installation location. `GET_REG` still reports the indoor-only
+through its signed deployment-policy contract. NARF does not implement
+Linux's netlink-owner lifetime or claim that a country database alone
+proves installation location. `GET_REG` still reports the indoor-only
 restriction as Linux `NO_OUTDOOR`; deployment metadata is not another Linux
 restriction flag.
 
@@ -58,6 +58,6 @@ and installation-fact loss during queued DATA and native credit waits.
 Existing unproven-indoor negatives remain. The test key is the public
 RFC8032 example, compiled only with tests; it is never a deployment key.
 
-Release compile/native acceptance is pending. Actual indoor installation,
-country policy, vendor calibration, signed assets and per-device RF/power
-acceptance remain deployment responsibilities.
+These cases pass on x86_64; aarch64 execution is pending. Actual indoor
+installation, country policy, vendor calibration, signed assets and
+per-device RF/power acceptance remain deployment responsibilities.

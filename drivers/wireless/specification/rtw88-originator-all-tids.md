@@ -1,8 +1,8 @@
 # RTW88 originator Block Ack on non-VO TIDs
 
 This is a source-complete software contract for retained RTL8821CE and
-RTL8822CE, channel1/HT20/one stream. New release/native execution and physical
-acceptance are pending. It supplies no production measurements or board asset.
+RTL8822CE, channel1/HT20/one stream. Physical acceptance is pending. It
+supplies no production measurements or board asset.
 
 `Rtw88Device::tx_ba_request()` retains the original v1 `identity`, `filename`
 and `mac`, and additionally returns `all_tids_identity` and
@@ -88,13 +88,14 @@ receipt, demanded TIDs can negotiate fresh globally unique dialogs without
 resetting PN/replay or the independent sequence producers. Existing opaque
 recipient BA, original receive/copy epochs and publication fences stay intact.
 
-Sixteen new native registrations are written: seven compositions per chip and
-two actual packet-Core cases. They cover Open/WPA2 with real kernel DHCP and
+Sixteen kernel tests cover it: seven compositions per chip
+(`drivers/wireless/rtw88/tx_ba_all_tids/rtl8821c` and `.../rtl8822c`) and two
+packet-Core cases. They cover Open/WPA2 with real kernel DHCP and
 all six independent non-VO agreements, actual per-ring WP/QSEL and four-buffer
 bursts, VO singles, public mixed-TID prefix order without SN/PN gaps, malformed
 v2/v1 identity isolation, TU/DELBA and genuine key replacement, held actual
 control CCX and wrong-TID response, current-Q fallback/partial-BD loss, and
 per-ring wrap/ordered consumed-prefix receipts. Fixture records are private
 synthetic measurements and the reactive AP reads real published DMA originals.
-All earlier native registrations and assertions remain. These new cases have
-not run; no over-air, RF, power or throughput result is claimed.
+These are software regressions; no over-air, RF, power or throughput result is
+claimed.

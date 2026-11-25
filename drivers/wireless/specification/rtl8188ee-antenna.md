@@ -1,10 +1,10 @@
 # RTL8188EE signed automatic antenna full-program qualification
 
 This is part of [rtlwifi §3](rtlwifi.md#3-public-interface). NEAN v1 and six
-composed native cases are implemented pending coordinated release compilation
-and final native validation. No antenna measurements, thermal curves, signed
-board deployment assets or physical RF acceptance are supplied. Existing
-NEPC, NEHT, NERT and NETH payload formats and recipe hashes are unchanged.
+composed native cases are implemented and pass the native software gates on
+x86_64 and aarch64. No antenna measurements, thermal curves, signed board
+deployment assets or physical RF acceptance are supplied. Existing NEPC,
+NEHT, NERT and NETH payload formats and recipe hashes are unchanged.
 
 NEAN is an optional extension for actual factory EFUSE0xc9 types1
 (CG_TRX_HW_ANTDIV),2 (CGCS_RX_HW_ANTDIV) and4 (CG_TRX_SMART_ANTDIV).
@@ -132,13 +132,11 @@ The pinned EE driver has no manual `set_antenna`/`get_antenna` callback.
 This continuation implements automatic selection and does not advertise
 manual nl80211 antenna masks. That absence is not replaced by an inert setter.
 
-Six new `drivers/wireless/rtlwifi/antenna` cases use actual retained
+Six `drivers/wireless/rtlwifi/antenna` cases use actual retained
 Firmware/PacketIo/Prepared/Device, native PHY/descriptor/peer/security owners
 and kernel DHCP: signed factory/payload identity and other-selector thermal
 holes; type1/2/HP initialization and real PHY average/tie/negative samples;
 SMART real deadline/own-target/no-sample/selection; HT40+RTS+NETH composition;
 qualification/MMIO/scheduler/cancellation/static-restore failures; and source
-revocation after real RX copy and during held M4 OWN. These cases are written
-but unexecuted. Release compilation and final native/full-matrix acceptance,
-external measurements/signing and physical antenna/RF/peer validation remain
-required.
+revocation after real RX copy and during held M4 OWN. External
+measurements/signing and physical antenna/RF/peer validation remain required.

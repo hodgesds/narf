@@ -7,7 +7,9 @@ do not compile Linux, run a second implementation or establish continuing
 equivalence with a current Linux checkout. No Python, C compiler, temporary
 `rustc` harness or source-to-Rust generator is required to build or test RTW88.
 
-The former extraction/comparison scripts have been removed. Changing a fixture
+No extraction or comparison script is kept. The one generator,
+`phy/gen_rtl8822b_tables.py`, records how the B22 table rows were selected
+from Linux and is not run by the build or the tests. Changing a fixture
 requires review of the cited hardware/source contract and an explanation of the
 changed expected behavior. Expected values must not be regenerated from the
 implementation being tested. Existing source fingerprints and firmware metadata
@@ -15,13 +17,17 @@ remain provenance for the captured data, not a regeneration recipe.
 
 All Linux paths below are relative to
 `drivers/net/wireless/realtek/rtw88/`, except the mac80211 reference.
+Stored paths are relative to `drivers/wireless/rtw/src/rtw88/`, except the
+`rtl-chip/` entries, which live in the shared
+`drivers/wireless/rtl-chip/` crate that the built-in driver and the `.ko`
+both link.
 
 | Stored data | Source contract | Native Rust coverage retained |
 |---|---|---|
 | `factory/*golden.rs`, `factory/power_values.rs` | `rtw8821c.h`, `rtw8822c.h`, `main.h`, `efuse.h`; power groups and regulatory-limit records in `phy.c`/`rtw8822c_table.c` | Sparse EFUSE decoding, exact packed offsets, raw factory bytes, gain/power bounds and erased-data rejection |
 | `firmware/golden.rs`, `firmware/rtl8821c_metadata.rs`, `firmware/rtl8822b_metadata.rs` | `mac.c` firmware callbacks; the named installed NIC firmware header and its recorded digest | Header/section bounds, same-owner page/IDDMA flow, checksum/ready receipts, faults and cancellation |
-| `mac/*golden.rs`, `mac/*values.rs` | `mac.c`, `rtw8821c.c`, `rtw8822c.c`, `reg.h` | Chip-specific FIFO/LLT/H2C setup, inactive register traces, access failures, stale receipts and replay refusal |
-| `phy/*golden.rs`, `phy/*tables.rs` | `phy.c`, `rtw8821c_table.c`, `rtw8822c_table.c`, `rtw8822b_table.c` (B22 rows regenerated verbatim by `phy/gen_rtl8822b_tables.py`), chip PHY callbacks | 56 C21 cut/package/RFE, 49 C22 cut/RFE and 48 B22 cut/RFE (2/3/5) profiles, table/callback digests, retained MAC/PHY ownership and closed gates |
+| `mac/*golden.rs`; `rtl-chip/src/mac/{values,rtl8821c_values}.rs` | `mac.c`, `rtw8821c.c`, `rtw8822c.c`, `reg.h` | Chip-specific FIFO/LLT/H2C setup, inactive register traces, access failures, stale receipts and replay refusal |
+| `phy/*golden.rs`, `phy/rtl8821c_tables.rs`; `rtl-chip/src/phy/tables.rs` (C22), `rtl-chip/src/phy_b22/tables.rs` (B22) | `phy.c`, `rtw8821c_table.c`, `rtw8822c_table.c`, `rtw8822b_table.c` (B22 rows generated verbatim by `phy/gen_rtl8822b_tables.py`), chip PHY callbacks | 56 C21 cut/package/RFE, 49 C22 cut/RFE and 48 B22 cut/RFE (2/3/5) profiles, table/callback digests, retained MAC/PHY ownership and closed gates |
 | `radio/golden.rs` | `rtw8822c.c` fresh DACK, channel/trim and IQK command paths | Bounded measurements, distinct-path restoration, signed/current power admission, native transport faults and cancellation |
 | `station_control/*golden.rs` | `fw.c`, `mac80211.c`; Linux `net/mac80211/wme.c` non-QoS defaults | Mailbox fields/receipts, source DCF defaults, peer/teardown/cancellation ownership |
 | `packet_format/golden.rs`, `packet_format/provenance.json` | `pci.c`, `pci.h`, `tx.c`, `tx.h`, `rx.c`, `rx.h`, `fw.h`, `main.h`, `mac.h` | Literal TXD/TXBD, RX and CCX vectors, malformed descriptors, separate DMA/security completion and current-capability publication |

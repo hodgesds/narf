@@ -5,7 +5,7 @@ existing wireless power-save frontend, PM signalling, manual TIM/DTIM wake,
 PS-Poll buffering and actual NETWORK_SLEEP/awake transitions. It requires a
 new externally measured and signed **N85S1** program. No board measurements,
 signed deployment asset, over-air interoperability, power savings or latency
-result is supplied. Eight native cases are written and await execution.
+result is supplied. Eight native cases pass on x86_64 and aarch64.
 
 ## Public setting and retained operation
 
@@ -158,5 +158,5 @@ signed inputs. They include Open/WPA2, held ACK/live QCU, true hardware
 sleep/ignored wake/shutdown, public desired-policy reversal and re-enable,
 TIM/MoreData/empty Null/CAB, actual current GTK delivery, eight original
 PN/sequence/PM frames and real Group2 receipt, and fresh20/40 calibration
-with both extensions. They are written, not executed. Hardware acceptance
-requires externally supplied measured assets and a physical radio.
+with both extensions; they pass on x86_64 and aarch64. Hardware
+acceptance requires externally supplied measured assets and a physical radio.

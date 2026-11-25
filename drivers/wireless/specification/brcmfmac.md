@@ -1,8 +1,8 @@
 # Broadcom FullMAC PCIe — software bring-up
 
 > Status: v0.9. Signed exact board provisioning, BCM43602 CR4 firmware, retained
-> PCIe control/flow/data rings and a constrained FullMAC station path are implemented. Recovery remains
-> software work; physical validation is pending.
+> PCIe control/flow/data rings and a constrained FullMAC station path are implemented,
+> with transport reset and system PM; physical validation is pending.
 
 ## 1. Purpose & scope
 
@@ -44,8 +44,8 @@ Non-AI interconnects and malformed/out-of-range maps are rejected.
 those callers validate their own CM3/RAM/D11/SDIO profile. `disable_core`
 and `reset_core` implement AI clock/reset/readback ordering with 300-us
 assert and 3-ms release deadlines. CYW43439 uses these live helpers; PCIe
-BCM43602 CR4 passive/active integration uses these same helpers; CA7 and
-other chip-specific lifecycle paths remain gated.
+BCM43602 CR4 passive/active integration uses these same helpers, as do the
+CR4/CA7 paths of "Additional PCIe chip profiles" below.
 
 `Chip::park_pcie` masks the PCIe interrupt and mailbox sources before
 acknowledging the sampled mailbox status. PCIe core revisions below 64
@@ -136,9 +136,11 @@ assets. Replacement alone does not revoke a previously pinned signed selection.
 No per-register name lookup mints additional firmware capabilities.
 
 `boot::Cr4<B: boot::Bus>::claim/boot` consumes exclusive backplane/TCM access.
-It admits BCM43602 only, halts CR4, disables discovered D11 cores, derives RAM
-from CR4 bank registers, applies bank5/7 PDA quirks, checks firmware/NVRAM
-nonoverlap, and uploads the reset vector at TCM0 before release. `pack_nvram`
+It admits BCM43602 and the covered chips of "Additional PCIe chip profiles"
+below (CR4 or CA7). For BCM43602 it halts CR4, disables discovered D11
+cores, derives RAM from CR4 bank registers, applies bank5/7 PDA quirks,
+checks firmware/NVRAM nonoverlap, and uploads the reset vector at TCM0
+before release. `pack_nvram`
 requires a selected single-board file with boardrev, adds the final list NUL,
 alignment, and complement token excluding the token bytes. Multi-device
 NVRAM is rejected until an actual selector exists. Shared readiness has a
@@ -171,10 +173,10 @@ current native source, controlled-port/key gates and actual matching TX
 terminal ownership remain mandatory. Unknown or malformed completions close
 the owner and retain uncertain DMA.
 
-Six new cases under `drivers/wireless/brcmfmac/prefix` are written, pending
-execution: preallocation admission, poisoned descriptor prefixes with actual
-control-ring wrap, explicit/shared RX offsets and stale/bad extents, matching
-TX terminal retention, and full Open/WPA2 scan/key/DHCP/IP conversations over
+Six cases under `drivers/wireless/brcmfmac/prefix` cover preallocation
+admission, poisoned descriptor prefixes with actual control-ring wrap,
+explicit/shared RX offsets and stale/bad extents, matching TX terminal
+retention, and full Open/WPA2 scan/key/DHCP/IP conversations over
 all four nonzero prefixes. The firmware fixture writes the original physical
 strides and real correlated receipts; it alternates explicit and fallback RX
 offsets. This is a bounded software implementation, with no physical target
@@ -215,8 +217,8 @@ combined outstanding packets/receipts are retained. A matching request ID plus
 flow ID and metadata-free classic16-byte TX completion retire exactly one body
 mapping after a CPU DMA-read release edge; `pop_tx_receipt` returns its result.
 `close_flow` refuses outstanding TX, then waits for the correlated delete ACK.
-Create/delete have2-second deadlines driven by the shared poller. At most8 (or
-the lower firmware maximum) flow mappings are retained concurrently. A successful
+Create/delete have2-second deadlines driven by the shared poller. The number of
+concurrent flow mappings follows the firmware budget ("Flow-ring budget"). A successful
 delete ACK after all exact TX completions fences firmware ownership and permits
 reusing that retained mapping and hardware ID; failed/timed-out deletes cannot.
 `FlowToken` includes a nonwrapping host generation so old software handles cannot
@@ -244,17 +246,23 @@ a peer. Link-down drains exact TX receipts and acknowledged flow deletions befor
 new-peer traffic. A bounded flow cache evicts idle destinations only through the
 same delete-ACK fence.
 
-For an exact signed or trusted-platform BCM43602 board profile, native bootstrap loads an existing
-authenticated regulatory domain or signed wireless-regulatory.bin, then calls the
-common station attach path and publishes a named wireless/net interface only after
-firmware initialization. This chip's Linux firmware embeds CLM; no SDIO glom or
-external CLM commands are sent. The current shared profile restricts scanning and
-joining to authenticated 2.4-GHz channels, Open or firmware-supported WPA2-PSK/CCMP,
-a fixed BSSID and roam_off=1. Missing firmware supplicant support rejects WPA2;
-there is no host-PSK fallback. Firmware MAC/channels, canonical RSN IE, key/link
-events, controlled-port Ethernet-II checks and synchronous bounded network drains
-come from the same station implementation as CYW43439. No physical acceptance or
-5-GHz/WPA3/AP support is implied.
+For an exact signed or trusted-platform BCM43602 board profile, native bootstrap
+requires the kernel regulatory domain (`narf_wireless::reg::db::ensure_domain`:
+an installed domain, else a staged signed `wireless-regulatory.bin`, else world
+`00` from the Linux database), then calls the common station attach path and
+publishes a named wireless/net interface only after firmware initialization.
+The station programs the firmware `country` iovar and refuses a domain without
+an uppercase alpha2, so world `00` alone never brings the station up. The
+loadable `brcm.ko` reads the same installed domain through
+`narf_wireless_regdomain` and loads no regulatory file itself
+(`spec.md` §4.7). This chip's Linux firmware embeds CLM; no SDIO glom or
+external CLM commands are sent. The base shared profile is Open or
+firmware-supported WPA2-PSK/CCMP with a fixed BSSID and roam_off=1; 5 GHz,
+PMF, SAE, AP and the other profiles below extend it. Missing firmware
+supplicant support rejects firmware-offload WPA2. Firmware MAC/channels,
+canonical RSN IE, key/link events, controlled-port Ethernet-II checks and
+synchronous bounded network drains come from the same station implementation
+as CYW43439. No physical acceptance is implied.
 
 The `runtime::Memory` contract separates CPU and DMA addresses and requires
 cache maintenance plus peripheral barriers at ownership transitions; the
@@ -335,23 +343,23 @@ idle precedes port publication. Current policy, cancellation, host close and
 receive epochs retain the same strong owner/publication fences. No uncertain
 command/packet DMA is released by an apparent policy or cryptographic flag.
 
-Eight `drivers/wireless/brcmfmac/optional_pmf` smokes pass on both architectures for shared5/6:
+Eight `drivers/wireless/brcmfmac/optional_pmf` smokes cover shared5/6:
 the complete policy/AP/capability matrix, actual RSN/default-BIP/absence and
 downgrade/duplicate/malformed evidence, mode/peer/length/OCV failures, foreign
 and genuine native key events, held mode/request/response cancellation,
 current policy loss at the actual response wait, raw Optional CONNECT and
 real Open/WPA2 protected/unprotected DHCP/IP, including occupied VHT80.
-Existing required-PMF coverage remains. These additions pass coordinated
-software gates and do not establish firmware-internal BIP or physical PMF.
+The required-PMF smokes above remain. None of this establishes
+firmware-internal BIP or physical PMF.
 
-MFPC APs omitting the response RSNE now complete as protected associations
+MFPC APs omitting the response RSNE complete as protected associations
 (Linux v7.2 `cfg80211.c::brcmf_configure_wpaie` trusts firmware's `mfp`; see
 [CYW §3](cyw43439.md) for the IEEE 802.11-2020 9.3.3.6/12.6.3 argument). The
 shared `optional_pmf` smokes cover that admission on both families.
 
 ### Firmware-qualified HT20/HT40 and short GI admission
 
-The common Station now uses actual native `nmode`/`rxchain` and the two
+The common Station uses actual native `nmode`/`rxchain` and the two
 native per-band `bw_cap` plus exact `chanspecs` inventory before constraining
 the firmware to20MHz for `WLC_UP`. Source HT capability bodies remain distinct
 on the real2.4/5GHz bands; HT40/SGI40 require native width and inventory support,
@@ -405,7 +413,7 @@ Linux `brcmf_setup_wiphybands` does (an unsupported query is zero) and adds
 (bits0/1), SU/MU beamformer from `..._BFR_CAP`, and, when either is nonzero
 with more than one TX stream, beamformee STS2, sounding dimensions
 `txstreams-1` and VHT MRQ/MFB link adaptation. Bits outside SU/MU are
-ignored. Code: `drivers/wireless/src/cyw43439/station_phy.rs::beamforming_capability`.
+ignored. Code: `drivers/wireless/brcm/src/cyw43439/station_phy.rs::beamforming_capability`.
 Firmware owns sounding, steering and its own association request; the host
 reports the capability on5GHz and the existing actual `assoc_req_ies` check
 now requires those same bits, so a request lacking them is a changed request
@@ -480,7 +488,7 @@ or publication guard across an await. Close can serialize against an actual
 native TX post without pretending to reclaim firmware-owned descriptors.
 Late key/link/control/PS receipts cannot reopen a closed or replaced lifetime.
 
-Eight new `drivers/wireless/brcmfmac/vht80` smokes pass for both shared5/6:
+Eight `drivers/wireless/brcmfmac/vht80` smokes cover both shared5/6:
 all eight literal sidebands, independent RX3/TX1..3 capability maps, exact native
 cap/chanspec/four-quarter queries, signed selected-board Open/WPA2/required-PMF
 real DHCP/bidirectional IP,80→40→20 fallback and remote-quarter power,
@@ -489,9 +497,8 @@ live remote-quarter revocation during queued data/held replies, cancellation,
 autonomous channel adoption, final IPC/callback policy loss and actual
 reentrant stack close/same-peer receive epochs. A bounded exhaustive80MHz
 codec smoke and two common CYW native publication/no-VHT smokes accompany
-them. These additions pass the coordinated both-architecture software gates;
-no hardware EEPROM/calibration/RF/AP/DMA acceptance or throughput result is
-claimed.
+them. No hardware EEPROM/calibration/RF/AP/DMA acceptance or throughput
+result is claimed.
 
 The exact BCM43602 `Fullmac::BAND_5GHZ` profile admits firmware-reported valid
 channels from Linux's 2.4/5 GHz tables, intersected with the retained host-policy
@@ -518,7 +525,7 @@ limit. Fixed-domain initialization retains its policy snapshot; native attachmen
 observes live shared DB replacement/clear as described below. Physical 5 GHz
 RF/width/power/AP acceptance is required in addition to these software results.
 
-The common FullMAC station now uses a live immutable host-policy source during
+The common FullMAC station uses a live immutable host-policy source during
 native attachment. Shared DB replacement/clear is observed around setup, control
 receipts, scan/join idle fences and host data progress; fixed-domain explicit
 initialization remains snapshot-only. Source loss, country change, channel
@@ -542,9 +549,9 @@ match (revision >= 32 invalid), `brcmf_pcie_devid_table` with its `drvdata`
 the `brcmf_pcie_read_otp` chip set. Covered chips: BCM43602 (retained), CR4
 BCM4350 (4350c2 below rev 8), 4356, 43567/43569/43570, 4358, 4359
 (rev-dependent base), 4371 at their Linux RAM bases, and CA7 BCM4365, 4366,
-43664, 43666, 43465, 43525 at 0x200000. Pass 2 covers BCM43752 and the
-Linux OTP chips 4355, 4364, 4377, 4378 and 4387 with no CPU table fact:
-the loader takes Linux's discovered-ARM dispatch (CR4 first, then CA7).
+43664, 43666, 43465, 43525 at 0x200000. BCM43752 and the Linux OTP chips
+4355, 4364, 4377, 4378 and 4387 are covered with no CPU table fact: the
+loader takes Linux's discovered-ARM dispatch (CR4 first, then CA7).
 Left out: BCM4354 (Linux binds raw
 PCI id 0x4354 but has no PCIe firmware row, so Linux itself stops at
 "Unknown chip"), CYW-vendor 43596/54591 (below) and chips without a
@@ -651,7 +658,7 @@ chains and `txstreams` up to four, and adds `SUPP_CHAN_WIDTH_160` and
 5 GHz D11AC 160 MHz chanspec. The firmware's own request then carries the
 160 bits, which the exact request comparison expects.
 
-160 MHz operation (pass 2, `wide_phy` only): with those two facts the
+160 MHz operation (`wide_phy` only): with those two facts the
 negotiation profile is `LocalPhy::vht160`, and the probe keeps every
 firmware-reported D11AC 160 chanspec (`0xe800`, `channel::Operating::decode160`)
 in the native inventory. `Operating::one_sixty` is Linux's
@@ -680,13 +687,13 @@ PCI host with vendor 0x14e4, no card, two assets, and an optional
 `antenna_sku` (bytes 96..112; `board` and keys may then contain `,`). The
 encoder only bounds fields; the kernel parser enforces the Linux tables.
 
-Pass-2 CA7 station run: the shared msgbuf station model's CA7 layout
+CA7 station model: the shared msgbuf station model's CA7 layout
 (`runtime_tests::ca7_layout`: CA7 + SYS_MEM cores, RAM image at the Linux
 base 0x200000 with every firmware-published TCM pointer relocated) boots
 BCM4366 (BCA id 0x43c3) through `brcmf_chip_ca7_*` and joins/tears down
 VHT80 like the BCM4356 CR4 run.
 
-Written, unexecuted (pass 2): `drivers/wireless/brcmfmac/chips`
+Smokes: `drivers/wireless/brcmfmac/chips`
 `smoke_brcmf_chip_profile_random_seed_footer_below_nvram`,
 `..._otp_parse_and_board_types`, `..._chipcommon_otp_read`,
 `..._station_vht160_join_geometry`, `..._station_ca7_bcm4366_end_to_end`;
@@ -695,8 +702,7 @@ Written, unexecuted (pass 2): `drivers/wireless/brcmfmac/chips`
 `drivers/wireless/brcmfmac/channel`
 `smoke_fullmac_occupied_vht160_literal_sidebands_and_exact_span`; xtask
 unit test `encodes_family_three_records_with_optional_antenna_sku`.
-
-Written, unexecuted: `drivers/wireless/brcmfmac/chips`
+Also in `drivers/wireless/brcmfmac/chips`:
 `smoke_brcmf_chip_profile_linux_rambase_and_firmware_rows`,
 `..._admission_and_asset_names`, `..._cr4_and_ca7_boot_transcripts`
 (BCM4350 CR4 / BCM4366 CA7 loader transcripts and refusals),
@@ -901,7 +907,7 @@ Linux v7.2 `pcie.c::brcmf_pcie_pm_leave_D3` resumes hot when `INTMASK`
 reads nonzero (D0_INFORM, below); otherwise the dongle lost power or
 firmware across suspend and Linux calls `brcmf_pcie_remove` followed by
 `brcmf_pcie_probe` on the same function. The `brcmfmac` system-PM resume
-hook now calls `native_runtime::resume` -> `Generation::resume`: the hot
+hook calls `native_runtime::resume` -> `Generation::resume`: the hot
 path is unchanged, and a `Failed` (cold) resume runs `Generation::recover`
 under the generation mutex, i.e. the dead-firmware stop (no D3 ack can
 come from lost firmware), `brcmf_pcie_reset_device`, a fresh signed
@@ -923,8 +929,7 @@ then capped at `BRCMF_FLOWRING_HASHSIZE - 1` (511) as
 `msgbuf.c::brcmf_proto_msgbuf_attach` does. Flow ring ids are
 `index + BRCMF_H2D_MSGRING_FLOWRING_IDSTART` (2) with TCM index slots
 `h2d_{w,r}_idx_ptr + id * 4`, and each 512 x 48-byte ring is allocated on
-create and recycled only after a delete completion. The former fixed host
-cap of eight flows is gone. Smoke:
+create and recycled only after a delete completion. Smoke:
 `smoke_brcmf_flow_budget_follows_firmware_max_flowrings` (12 firmware
 rings open ids 2..13 and refuse a 13th without failing the owner; a
 2-ring firmware still bounds at 2).
@@ -954,11 +959,8 @@ interrupt-gated device fan-out — mirroring Linux v7.2 `brcmf_pciedrvr_pm`
 Smokes: `smoke_brcmf_system_suspend_resume_d3_d0_handshake` (D3/D0 words,
 mask state, rings retained, second cycle with a lost dongle fails the
 owner without freeing DMA, vector released on teardown) and
-`smoke_brcmf_system_suspend_timeout_unwinds_usable`.
-
-Cold resume (Linux `cleanup:` -> `brcmf_pcie_remove` + `brcmf_pcie_probe`
-when `INTMASK` reads 0) is not replayed: the owner becomes terminal and the
-carrier stays down. See the `system_resume`/`transport_reset` rows.
+`smoke_brcmf_system_suspend_timeout_unwinds_usable`. Cold resume
+(`INTMASK` reads 0) is the generation swap in "Cold resume" above.
 
 ### IOMMU-backed quiescence
 
@@ -1013,8 +1015,7 @@ already translated before the blocking invalidation completed is ordered
 only by the IOMMU's completion-wait semantics (as on Linux); interrupt
 remapping is not enabled, so MSI writes are not blocked by the IOMMU.
 
-Smokes (written, unexecuted; `ModelIommu` backend, real NARF page tables,
-no AMD-Vi silicon): `smoke_brcmf_iommu_stop_blocks_then_frees`,
+Smokes (`ModelIommu` backend, real NARF page tables, no AMD-Vi silicon): `smoke_brcmf_iommu_stop_blocks_then_frees`,
 `smoke_brcmf_iommu_dead_firmware_blocks_before_reclaim`,
 `smoke_brcmf_iommu_unproven_stop_reclaims_only_behind_block`,
 `smoke_brcmf_identity_iommu_keeps_device_proof_order`; io:
@@ -1081,7 +1082,7 @@ with `Fullmac::wowl_config(true)` and resume calls `wowl_config(false)`
   `wowl_supported` from the capability. No physical WoW entry, wake
   latency, PME routing or power measurement is claimed.
 
-Tests (written, unexecuted) in `brcmfmac/wowl_tests.rs` under
+Smokes in `brcmfmac/wowl_tests.rs` under
 `drivers/wireless/brcmfmac/wow`:
 `smoke_brcmf_wowl_wire_layouts_and_wake_decode`,
 `smoke_brcmf_wowl_advertised_only_with_pme_and_firmware`,
@@ -1099,7 +1100,7 @@ and an actual original PCI/firmware source are available. Mode changes require
 an administratively down, disconnected, operation-free physical owner. A
 nonwrapping mode generation and exclusive native-control reservation bind
 each asynchronous public AP request. No virtual bsscfg, P2P or station-BSSID
-alias is created. CYW43439 SDIO now has its own native Card/CM3/SDPCM/BCDC composition
+alias is created. CYW43439 SDIO has its own native Card/CM3/SDPCM/BCDC composition
 (`cyw43439.md` §3); this PCIe composition itself grants no SDIO authority.
 
 `ap::Session` implements primary interface0/bsscfg0 legacy20 on admitted
@@ -1124,9 +1125,9 @@ doorbell publication. Ring setup and the actual native consumer-index read
 precede that final scope. A source retired during setup cannot publish an
 old command; a possibly issued index/doorbell failure closes the owner and
 pins its original DMA until actual whole-device stop. Ordinary station
-commands and denial-only AP Stop cleanup retain their existing paths. An
-additional native case covers real admin retirement at the setup boundary
-and a possibly visible native index failure; execution remains pending.
+commands and denial-only AP Stop cleanup retain their existing paths. A
+native case covers real admin retirement at the setup boundary and a
+possibly visible native index failure.
 
 Program SET also preserves and checks the actual completed native input
 prefix: bounded adapter progress retains every event/data record, and the
@@ -1183,7 +1184,7 @@ are dropped rather than failing the session. Its distinct preverification
 purpose cannot transmit or grant DATA/key/port authority. NEW_STATION is
 queued first; release moves the same original proof without recapture.
 Loss/reassociation/source retirement and STOP discard stale holds. The
-existing native RSN case now includes actual same-drain association and
+native RSN case includes actual same-drain association and
 EAPOL-Start, while retaining every later MIC/AES/key/port assertion.
 
 Host receive claims only consumed native descriptor/event plus retained
@@ -1208,8 +1209,7 @@ before the existing actual D3 handshake; resume does not replay its BSS/keys.
 Only a fresh START can create a new owner. Source-safe teardown/recovery keeps
 the existing confirmed-stop reclamation rules.
 
-Nine native AP cases are written, unexecuted pending coordinated validation.
-They compose actual CR4/common-ring IOCTL/event/flow/TX/RX records through the
+Nine native AP cases compose actual CR4/common-ring IOCTL/event/flow/TX/RX records through the
 public `Device` frontend: Open lifecycle and successor, staged keys/ports and
 SCB removal, real MIC/AES-wrapped userspace RSN with same-drain M2/M4, atomic
 admission/optional offloads, more than64 pending events before loss/TX, copied
@@ -1217,7 +1217,7 @@ SME peer replacement, independent preauth actors, cancelled native key input,
 and policy replacement/system PM. Firmware-internal DATA CCMP/replay and
 physical RF/board interoperability are not claimed by the fixture. Sources
 are local Linux7.3-rc4 `brcmfmac/{cfg80211,core,msgbuf}.c`, `fwil.h` and
-`fwil_types.h`; the handoff saves file hashes and exact source excerpts.
+`fwil_types.h`.
 
 ### Native flagged-radiotap monitor
 
@@ -1264,12 +1264,12 @@ quiescence proof. Cancelled or uncertain commands use the existing physical
 whole-device stop and pin/quarantine mappings without fabricated completion.
 System resume requires a fresh original UP; it never replays the old token.
 
-Seven written native cases in `drivers/wireless/brcmfmac/monitor` compose
+Seven native cases in `drivers/wireless/brcmfmac/monitor` compose
 actual CR4/msgbuf5/6/7, version7 prefixes1/4, public mode/channel/admin
 controls, literal native radiotap, original AF_PACKET delivery, policy/MAC
 retirement, invalid records, activation/cancel, control-prefix progress and
-system PM. Execution and software acceptance are pending; no physical RF or
-firmware qualification follows from these source fixtures.
+system PM. No physical RF or firmware qualification follows from these
+source fixtures.
 
 ### Virtual-interface wire foundation
 
@@ -1302,7 +1302,7 @@ data mapping, and `first_free_bsscfgidx` skips the P2P-reserved bsscfg1.
 
 #### Per-ifidx transport demultiplexing
 
-`Fullmac` now carries secondary firmware interfaces (ifidx
+`Fullmac` carries secondary firmware interfaces (ifidx
 1..`BRCMF_MAX_IFS`) beside, never through, the interface-0 methods:
 `VIF_DEMUX`, `vif_listen`, `vif_open`/`vif_close`, `pop_vif_event`,
 `pop_vif_data`, `send_vif_data` and `command_vif`. Both native transports
@@ -1333,8 +1333,8 @@ implement it over `brcmfmac::vif_demux` (`Demux`, `route`).
   an owner listens; otherwise they are dropped as Linux drops events for a
   bsscfg without `brcmf_if`.
 - Data for an ifidx that its owner has not opened is dropped
-  (`brcmf_proto_bcdc_hdrpull` `-EBADE`, msgbuf `brcmf_get_ifp` NULL);
-  previously any nonzero ifidx was a fatal protocol error. Interface-0
+  (`brcmf_proto_bcdc_hdrpull` `-EBADE`, msgbuf `brcmf_get_ifp` NULL).
+  Interface-0
   queues, flows, AP and monitor ownership are unchanged, and PCIe suspend
   is refused while a secondary interface is open or owns flows.
 - Exclusivity is per ifidx, as Linux keys msgbuf flow rings by
@@ -1345,9 +1345,9 @@ implement it over `brcmfmac::vif_demux` (`Demux`, `route`).
   `send_data_on` (SDIO) stay available during a primary AP. Monitor
   reservation remains device-wide.
 
-One written/unexecuted case: `drivers/wireless/cyw43439/runtime`
-`smoke_cyw_f2_secondary_ifidx_demux`. No PCIe msgbuf secondary-ifidx
-fixture exists yet.
+Smoke: `drivers/wireless/cyw43439/runtime`
+`smoke_cyw_f2_secondary_ifidx_demux`; the PCIe msgbuf secondary-ifidx case
+is under "Secondary station role" below.
 
 #### Interface create/remove command owner
 
@@ -1370,9 +1370,9 @@ that ifidx. `service` is the secondary event worker: IF events update the
 `Registry`; an unsolicited DEL or a stale-ADD replacement is queued on
 `pop_retired` (fweh default `brcmf_remove_interface`); other events are
 retained per live (bsscfg, generation) entry for `pop_event`. No netdev or
-role is registered by this owner. Three written/unexecuted cases in
+role is registered by this owner. Three cases in
 `drivers/wireless/brcmfmac/vif` (`vif_owner_tests.rs`) run over the
-scripted `fullmac_fixture`, which now implements the secondary seam.
+scripted `fullmac_fixture`, which implements the secondary seam.
 
 #### Secondary netdev registration/removal owner
 
@@ -1439,7 +1439,7 @@ fail-stop only that bsscfg; queue overflow in `service` fail-stops the
 transport as the primary worker does. AP Program, monitor, PM, reset and
 stop methods keep their refusing defaults. `Parked<R>` is the inert
 runtime a persistent secondary role is held over between operations.
-One written/unexecuted case in `drivers/wireless/brcmfmac/vif`:
+Smoke (`drivers/wireless/brcmfmac/vif`):
 `smoke_brcmf_vif_bsscfg_adapter_addresses_its_own_interface`.
 
 #### Secondary station role
@@ -1477,7 +1477,7 @@ firmware (`p2p`+`mchan` combo0, or the P2P combination). Like Linux
 (`num_different_channels` = 1 without mchan), channel agreement between
 the primary AP and a secondary STA is left to the firmware; no host
 multi-channel scheduling exists.
-One written/unexecuted case in `drivers/wireless/brcmfmac/vif`
+Smoke `drivers/wireless/brcmfmac/vif`
 (`smoke_brcmf_vif_secondary_station_joins_on_its_own_bsscfg`, both the
 SDIO and PCIe seam families): create, per-interface dcmds, an Open join
 whose dcmds go to ifidx 2 with `bsscfg:wpa_auth` at bsscfg 3, link
@@ -1486,13 +1486,13 @@ secondary DEAUTH closing only the secondary port. The BCM43602
 CR4/msgbuf model (`station_model.rs`: IF ADD/DEL for ifidx 1 bsscfg 1,
 per-IOCTL `msg.ifidx`, per-flow creating ifidx) backs
 `smoke_brcmf_msgbuf_secondary_ifidx_ioctl_events_flows_and_removal`
-(`vif_msgbuf_tests.rs`, written/unexecuted): IF registration on ifidx 0
+(`vif_msgbuf_tests.rs`): IF registration on ifidx 0
 with `BRCMF_E_IF` in the written mask, a secondary IOCTL with
 `msg.ifidx` 1 completed with a zero completion ifidx, a bsscfg-1 event
 reaching only its entry, a secondary flow ring sourced from the VIF
 address, and removal while that flow is live (IF DEL on ifidx 1, flow
-deleted after its TX status). Mock-seam cases (both families, written/
-unexecuted): `smoke_brcmf_vif_event_mask_is_the_union_of_live_owners`
+deleted after its TX status). Mock-seam cases (both families):
+`smoke_brcmf_vif_event_mask_is_the_union_of_live_owners`
 (primary STA + secondary AP need, roam-policy rewrite, removal) and
 `smoke_brcmf_vif_primary_ap_keeps_secondary_station_events`.
 The msgbuf station model answers ifidx 1 as its own interface
@@ -1501,12 +1501,12 @@ secondary `SET_SSID`/`DISASSOC` raises link events on bsscfg 1 only, and
 with `Handle::enable_vif_ap` the interface is created as an AP (IF ADD
 role 1) backed by its own `ap_model::Profile` (BSSID = the IF ADD
 address, SME events re-addressed to ifidx/bsscfg 1, TX of ifidx-1 flows).
-`smoke_brcmf_msgbuf_secondary_station_joins_on_ifidx_one` (written/
-unexecuted) joins a secondary STA over msgbuf: every join dcmd carries
+`smoke_brcmf_msgbuf_secondary_station_joins_on_ifidx_one` joins a
+secondary STA over msgbuf: every join dcmd carries
 `msg.ifidx` 1, `wpa_auth` goes out as `bsscfg:wpa_auth`, the link opens
 only the secondary port and a bsscfg-1 DEAUTH closes only it.
-`smoke_brcmf_msgbuf_primary_station_beside_secondary_ap` (written/
-unexecuted) is the combo0 concurrency case on the real PCIe transport:
+`smoke_brcmf_msgbuf_primary_station_beside_secondary_ap` is the combo0
+concurrency case on the real PCIe transport:
 primary STA joined on ifidx 0, `cap` = `ap sta mchan` parsed by
 `vif::discover`, a `VifDevice` AP shell created by the worker, START
 through `ApControlAuthority` with the Program entirely on ifidx 1 (no
@@ -1517,7 +1517,7 @@ The SDIO/BCDC AP device model (`sdio_ap_model.rs`,
 `sdio_ap_firmware.rs`) accepts `BCDC_DCMD_IF_SHIFT` ifidx 0/1 and BDC
 `flags2` ifidx 0/1, records each IOCTL's ifidx, and routes ifidx 1 to the
 same per-interface model. `smoke_cyw_vif_secondary_ap_on_actual_sdio_bcdc_ifidx_one`
-(`ap_native_sdio_tests.rs`, written/unexecuted) runs the secondary AP
+(`ap_native_sdio_tests.rs`) runs the secondary AP
 through the actual SDHCI/F2/SDPCM/BCDC stack beside an idle primary
 station with `cap` = `ap sta wme mchan`: Program entirely on ifidx 1 in
 the combo0 form, a bsscfg-1 peer reaching NEW_STATION, STOP retiring only
@@ -1529,12 +1529,12 @@ netdev. `sdio_ap_firmware::Firmware::station` (`Handle::station_primary`,
 the station model (no primary AP profile, `BRCMF_C_GET_AP` 0), so a
 primary STA join's `wsec`/`wpa_auth`/`sup_wpa` reach the station model.
 `smoke_cyw_vif_joined_primary_station_beside_secondary_ap_on_actual_sdio`
-(written/unexecuted) is the combo0 concurrency case on SDIO: primary STA
+is the combo0 concurrency case on SDIO: primary STA
 joined on ifidx 0, then the same secondary AP Program/peer/downlink/STOP
 checks, the composed `event_msgs` still holding the STA events and the
 primary still joined after STOP.
 `smoke_cyw_vif_secondary_station_joins_on_actual_sdio_bcdc_ifidx_one`
-(written/unexecuted, `cap` = `ap sta wme p2p mchan`) joins a secondary
+(`cap` = `ap sta wme p2p mchan`) joins a secondary
 STA through the actual SDIO/BCDC stack: IF ADD over the BCDC event
 channel, every join dcmd on `BCDC_DCMD_IF_SHIFT` ifidx 1 with
 `bsscfg:wpa_auth`, the bsscfg-1 link opening only the secondary port and
@@ -1672,7 +1672,7 @@ Linux). `create_p2p`/`remove_p2p` are the CLIENT/GO branches:
 `p2p_ifdis` and waits up to `BRCMF_P2P_DISABLE_TIMEOUT` for the GO
 bsscfg's `BRCMF_E_LINK`/`LINK_BSSCFG_DIS` (`vif_disabled`), then
 `p2p_ifdel` with the interface address, the IF DEL and the ifidx
-retirement. `Owner::create` now refuses P2P roles (they never use
+retirement. `Owner::create` refuses P2P roles (they never use
 `interface_create`).
 
 `brcmfmac::p2p::Device` is the discovery bsscfg owner
@@ -1698,7 +1698,7 @@ BSSID from the bsscfg's `BRCMF_C_GET_BSSID` or zero;
 phase filtered, needs the probe-request registration). Not mirrored, and
 unreachable in Linux as well without the P2P escan: the peer-channel
 search (`brcmf_p2p_af_searching_channel`) and the extra-listen WAR,
-although `my_listen_chan` is now recorded by the P2P escan.
+although `my_listen_chan` is recorded by the P2P escan.
 
 P2P escan (`cyw43439/station_p2p_scan.rs`, `Device::scan_prep`,
 `run_escan`, `service_escan`): with the P2P_DEVICE WDEV present, a primary
@@ -1750,7 +1750,7 @@ after `DOT11_MGMT_HDR_LEN + DOT11_BCN_PRB_FIXED_LEN` become the discovery
 vif's PRBRSP `vndr_ie` set and the TX status is ACK, as
 `brcmf_cfg80211_mgmt_tx` does (the firmware answers probes itself).
 
-Three written/unexecuted cases in `drivers/wireless/brcmfmac/p2p`
+Three cases in `drivers/wireless/brcmfmac/p2p`
 (`p2p_tests.rs`, both fixture families):
 `smoke_brcmf_p2p_wire_layouts_and_action_policy`,
 `smoke_brcmf_p2p_device_discovery_listen_and_action_frames` and
@@ -1850,7 +1850,7 @@ and 10 (async control WDEV), and the combinations are combo0
 {STA, AP, P2P_CLIENT, P2P_DEVICE} each <= 1, four interfaces, one
 channel. Without `p2p` the single STA + AP combination is unchanged.
 
-Written, unexecuted cases: `smoke_brcmf_p2p_escan_prep_search_and_probe_response_ies`
+Smokes: `smoke_brcmf_p2p_escan_prep_search_and_probe_response_ies`
 (`drivers/wireless/brcmfmac/p2p`, scripted seam, both families: P2P scan
 wire layout and classification, `scan_prep` listen-channel refusal,
 PRBREQ/PRBRSP `vndr_ie` del/add and dedup, `p2p_scan` on the discovery
@@ -1860,8 +1860,8 @@ bsscfg, escan diversion) and
 `p2p_ifadd`, `start_ap` P2P_GO program on ifidx 1, client association,
 `bss` disable, `p2p_ifdis`/`p2p_ifdel`/IF DEL).
 
-Transport-model P2P cases (written, unexecuted;
-`brcmfmac/p2p_transport_cases.rs`, run unmodified host
+Transport-model P2P cases (`brcmfmac/p2p_transport_cases.rs`, run
+unmodified host
 `Owner`/`p2p::Device`/`Station` code over each real transport). The
 shared firmware model (`station_model.rs`) answers `p2p_da_override`,
 `p2p_disc 1/0` (NOIF IF ADD/DEL of the discovery bsscfg on ifidx/bsscfg 1,
@@ -1885,8 +1885,8 @@ by `p2p_ifadd`, the `start_ap` P2P_GO program on BCDC ifidx 1 with
 `bsscfg:ssid` before `bss` enable, a client association, `bss` disable at
 STOP, `p2p_ifdis` + `p2p_ifdel` at DEL_INTERFACE; the primary stays an
 unassociated station here, unlike the msgbuf GO case).
-Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` are
-written for this foundation.
+Three literal wire/registry cases in `drivers/wireless/brcmfmac/vif` cover
+this foundation.
 
 ## 4. Invariants
 
@@ -1919,13 +1919,15 @@ x86_64 and aarch64; passing them does not establish physical operation.
 Implemented: PCI enumeration/exclusive authority, Device BAR0/BAR2,
 BCM43602 bank-derived CR4 boot, signed host/board/asset selection and retained
 pre-boot provisioning,
-shared 5/6 TCM indices, retained common/control/flow/RX/TX DMA, bounded correlated
+shared 5/6/7 TCM indices, retained common/control/flow/RX/TX DMA, bounded correlated
 IOCTL/events/data ownership, generation-safe retained flow recycling, shared
 station/control-port lifecycle and native probe-to-interface dispatch.
 
-The retained initial profile is shared 5/6, zero descriptor prefix, MSI or polled mailbox service,
-2.4/5 GHz Open or firmware-supplicant WPA2-PSK/CCMP, with one-shot terminal failure
-and retention of published DMA unless a confirmed stop proves it reclaimable. Its remaining deployment requirements
+The retained profile is shared 5/6/7 (shared-7 descriptor prefixes up to 4),
+MSI or polled mailbox service, 2.4/5 GHz Open or firmware-supplicant
+WPA2-PSK/CCMP, with published DMA retained unless a confirmed or dead-firmware
+stop proves it reclaimable; recovery is the generation swap in "Transport
+reset, generation swap and rejoin". Its remaining deployment requirements
 are real target identity/calibration/firmware assets, a verified selection manifest
 (or trusted platform registration), authenticated regulatory policy and physical
 station acceptance. No deployment board is manufactured by these tests.
@@ -1936,8 +1938,9 @@ an awake default and serialized/coalesced PM_FAST/PM_OFF plus the default
 recording applied state; rejection/partial transition closes carrier/queued TX
 and leaves uncertain DMA retained. Shared5/6 models check exact command bytes,
 duplicate policy, authorized-peer preservation and firmware refusal at either
-step; Open/WPA2 DHCP/IP conversations run while PS is enabled. This implements
-firmware station PS only; host-bus PM, suspend/WoW and reset replay remain open.
+step; Open/WPA2 DHCP/IP conversations run while PS is enabled. This is
+firmware station PS; system suspend, WoWL and reset replay are the separate
+sections above.
 
 The common FullMAC scan also installs caller Probe Request vendor IEs with
 the native `vndr_ie` iovar before escan (Linux `brcmf_vif_set_mgmt_ie`,
@@ -1956,13 +1959,12 @@ descriptor flags (`BRCMF_MSGBUF_PKT_FLAGS_PRIO_SHIFT`); a priority from a
 different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
 
 Additional software outside that retained profile remains: descriptor
-prefixes exceeding the admitted shared7 slack, other CPU/RAM/chip/OTP selectors
-(including 160 MHz-capable
-chips), HE/EHT profiles, monitor formats outside the bounded native
-radiotap owner above, AP, replayed
-recovery/system PM. IOMMU-backed quiescence is implemented pending
-validation ("IOMMU-backed quiescence").
-These do not expand the initial retained-failure acceptance claim.
+prefixes exceeding the admitted shared7 slack, chips outside the covered
+profiles (including the CYW-vendor 54591 event protocol), 4-stream fixture
+coverage, HE/EHT profiles and monitor formats outside the bounded native
+radiotap owner above. The AP, P2P, virtual-interface, chip-profile,
+recovery, system-PM and IOMMU-backed quiescence owners above are
+implemented pending validation.
 WPA3-SAE offload (WCC `WSEC_PMK` passphrase ABI), the PMKSA cache, firmware
 roaming/FT, per-AC telemetry and host-supplicant fallback are common FullMAC
 work shared with CYW; see [CYW §3](cyw43439.md).

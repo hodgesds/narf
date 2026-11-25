@@ -1,31 +1,28 @@
 # ath9k — Specification
 
-> Status: **AR9285 retained channel1 legacy station and optional measured
-> HT20/1SS long-GI, RX STBC1, native RTS/CTS protection and recipient BA
-> continuations implemented.** Native software functional validation passed in
-> the coordinated x86_64 and aarch64 scoped Wi-Fi suites. Physical EEPROM,
-> calibration, RF and DMA
-> acceptance remains pending. Wider bandwidths and other chips are separate.
-> The channel1–13 cold-generation continuation (§3.5) is source-complete; its
-> six new native cases have not run. Its coordinated seven-package release
-> Clippy/module checks passed before the separate full20/40 draft.
-> The distinct measured full20/40/SGI40 continuation (§3.6) is source-complete
-> with another six native cases written; coordinated release Clippy passed,
-> while native validation remains pending.
-> The additional bounded two-MPDU sender BA/A-MPDU continuation below is
-> implemented with ten new native smokes passing the coordinated validation
-> on both architectures. AR2427 (`168c:002c`, AR9285 silicon with HT bonded
-> out) shares the legacy owner with every HT/BA source closed.
-> The optional measured `N85Q` continuation (§3.4) adds four-AC EDCA on
-> QCU0..3 and eight-TID classification/scheduling on the same owner.
-> Distinct N85T4 larger3–8-member sender programs (§3.7) are source-complete;
-> seven new native cases, release compilation and physical acceptance are pending.
+> Status: **AR9285 retained legacy station with optional measured HT20/1SS
+> long-GI, RX STBC1, native RTS/CTS, recipient BA, two-MPDU and larger sender
+> BA, four-AC EDCA (§3.1–§3.4, §3.7), channel1–13 cold generations (§3.5),
+> full20/40 and SGI40 (§3.6), factory field order (§3.8), station
+> NETWORK_SLEEP (§3.9) and periodic calibration/ANI (§3.10).** These pass the
+> native software suites on x86_64 and aarch64. AR2427 (`168c:002c`, AR9285
+> silicon with HT bonded out) shares the legacy owner with every HT/BA source
+> closed. Idle FULL_SLEEP (§3.11) passes on x86_64; aarch64 is pending.
+> The AR5416/AR5418, AR9160, AR9280, AR9287 and AR9300 legacy20 stations
+> pass on x86_64 with aarch64 pending; AR9580 passes on both. AR9462,
+> AR9485/AR1111 and AR9565 remain in progress (§8). The crate builds
+> built-in or as the loadable `ath9k.ko` (§3). Physical EEPROM, calibration,
+> RF and DMA acceptance is pending for every part.
 
 ## 1. Purpose & scope
 
-The currently matched PCIe parts are AR9285 (`168c:002b`) and AR2427
-(`168c:002c`), Linux's AR9285 silicon with 802.11n bonded out. Broader ath9k
-families are not implemented merely because Linux supports them.
+The matched PCIe parts are AR9285 (`168c:002b`), AR2427 (`168c:002c`,
+Linux's AR9285 silicon with 802.11n bonded out), AR5416/AR5418
+(`0023`/`0024`), AR9160 (`0027`), AR9280 (`0029`/`002a`), AR9287
+(`002d`/`002e`) and the AR9003 family: AR9300 (`0030`), AR9485/AR1111
+(`0032`/`0037`), AR9580 (`0033`), AR9462 (`0034`) and AR9565 (`0036`).
+Each part has its own owner and scope (§8); a part is not implemented
+merely because Linux supports it.
 This is a soft-MAC radio: unlike ath10k it does not use a downloadable
 WLAN firmware to supply MLME and hardware programming.
 
@@ -40,18 +37,25 @@ AR9285-specific writes follow a checked silicon revision.
 
 ## 3. Public interface
 
-**Software acceptance at `6813a24c6`.** The admitted `additional_channels`,
-`channel_retuning`, `ht40`, `sgi40`, `larger_tx_aggregates`,
-`factory_profile_selection`, `station_network_sleep` and
-`periodic_calibration` continuations pass the checkpoint release/native gates
-on x86_64 and aarch64. Idle FULL_SLEEP and other chips receive no acceptance
-here. This supersedes implementation-time statements below that release/native
-execution or software acceptance is pending, only for the named feature
-scopes. Physical measurements, signed board/deployment programs and
-actual-device RF/power/interoperability acceptance remain separate.
+The admitted AR9285 `additional_channels`, `channel_retuning`, `ht40`,
+`sgi40`, `larger_tx_aggregates`, `factory_profile_selection`,
+`station_network_sleep` and `periodic_calibration` programs pass the release
+and native gates on x86_64 and aarch64. Physical measurements, signed
+board/deployment programs and actual-device RF/power/interoperability
+acceptance remain separate.
 
+- The crate builds built-in (the default `builtin` feature) or as the
+  loadable `ath9k.ko` (`--no-default-features --features module`). The module
+  runs the same chip owners over the KABI (`src/ath9k/platform/`) and
+  registers every built-in PCI ID under the single match name
+  `ath9k-module`, so loading it never replaces a built-in match. One radio is
+  bound at a time. Its netdev and wiphy reach the stack through the netif
+  bridge and the `WIFI` family host (`iface_module.rs`); nl80211 power-save
+  control, WoW, the userspace SME and system suspend/resume are built-in
+  only. Module unload runs the bound owner's removal.
 - `register()` installs the AR9285 (`ath9k`) and AR2427 (`ath9k-ar2427`)
-  PCI matches; `ar9285_silicon()` is the shared exact vendor/device gate.
+  PCI matches and every other owner's table (§8);
+  `ar9285_silicon()` is the shared exact AR9285/AR2427 vendor/device gate.
   Linux `hw.c::ath9k_hw_init` accepts `AR2427_DEVID_PCIE` with the same
   AR9285 silicon revision, `eeprom_4k.c` map and AR9002 reset/INI path, and
   `hw.c::ath9k_hw_fill_cap_info` clears `ATH9K_HW_CAP_HT` for that ID only.
@@ -457,9 +461,8 @@ cancel, source loss and uncertain tail never recycle published storage or
 fabricate bitmap/delivery. Open/WPA2 native fixtures consume genuine action,
 two-map DATA, partial retry and BAR descriptor traffic, including real kernel
 DHCP/IP bursts and coexistence with the separately qualified recipient BA.
-The ten new cases passed in the coordinated scoped Wi-Fi suites: x86_64
-2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip. Production boots and
-all btrfs postflights were clean. Physical N85T/BAR qualification remains open.
+These ten cases pass on x86_64 and aarch64. Physical N85T/BAR qualification
+remains open.
 
 ### 3.4 Optional measured four-AC EDCA and eight-TID scheduling
 
@@ -525,10 +528,9 @@ a frame held on QCU2 is reclaimed and a wedged DCU pins every mapping.
 Covered by `smoke_ar9285_qos_classify_downgrade_and_scheduler_order`,
 `smoke_ar9285_qos_signed_contract_and_missing_source_keeps_be_queue0`,
 `smoke_ar9285_qos_native_four_ac_program_tids_and_queues` and
-`smoke_ar9285_qos_teardown_revocation_and_invalid_ac_fallback`; the
-filtered `drivers/wireless/ath9k` kernel-test suites report 112 pass, 0 fail,
-0 skip on both x86_64 and aarch64. Physical N85Q qualification and over-air
-EDCA behaviour are unmeasured.
+`smoke_ar9285_qos_teardown_revocation_and_invalid_ac_fallback`, which pass
+in the `drivers/wireless/ath9k` kernel-test scope on x86_64 and aarch64.
+Physical N85Q qualification and over-air EDCA behaviour are unmeasured.
 
 The former reset-only `Ath9k::new` constructor is removed. Construction
 goes through the PCI authority and identification path. Successful probe
@@ -637,8 +639,8 @@ Six native cases in `interface_channel_tests.rs` exercise actual reset/EEPROM,
 PHY and calibration code before real MAC/Packet/Radio/Device composition,
 Open/WPA2 IP, all13 selected primaries, v1/v2 boundaries and foreign records,
 fresh discovery, multi-channel active/passive scan and RF restore, stale
-owner rejection and wedged DMA/policy preflight. These cases are written,
-not executed. They supply no physical EEPROM/RF/interoperability acceptance.
+owner rejection and wedged DMA/policy preflight. They pass on x86_64 and
+aarch64 and supply no physical EEPROM/RF/interoperability acceptance.
 
 ### 3.6 Optional measured full20/40 and directional SGI40
 
@@ -696,21 +698,21 @@ RF mode, synth, ten power registers and ADC/IQ remain current at actual
 DMA/payload/capture/copy boundaries. Full40 recipient BA, sender BA and QoS
 require distinct B/T/Q3 records bound to the complete H3 body and40 span.
 
-The existing cold-generation interface-name, association/key/BA/capture loss
-rules remain. Scans while associated are Busy. Unassociated off-channel
+The existing cold-generation netdev, association/key/BA/capture loss rules
+remain. Scans while associated are Busy. Unassociated off-channel
 scans may return a fresh20 generation at the original primary; they do not
 promise to restore40 width. Successful joins publish only the actual
 successor's link and port. Public HT capability metadata requires a current
 HT source; the actual Association Request carries the selected width and
 directional GI capabilities.
 
-Six new native cases in `interface_ht40_tests.rs` exercise real reset/PHY/
+Six native cases in `interface_ht40_tests.rs` exercise real reset/PHY/
 calibration/MAC/Packet/Radio/Device paths, both extension directions, Open and
 WPA2 kernel DHCP/IP, all8 MCS/GI modes and two actual DMA maps/tail receipts,
 peer20 and bad-receipt real fallback before M2/DATA, full-span policy, power
 lookup-center separation, signed/unknown/ignored-write rejection, directional
-RX GI, cancellation and revocation after actual copy. These cases are written,
-not executed. No physical RF or interoperability result is claimed.
+RX GI, cancellation and revocation after actual copy. They pass on x86_64
+and aarch64. No physical RF or interoperability result is claimed.
 
 ### 3.7 Optional measured larger sender aggregates
 
@@ -719,7 +721,7 @@ N85T4 request, with no emission or BA authority. The exact128-byte contract
 and Linux source chain are [AR9285 larger TX qualification](ar9285-larger-tx-aggregates.md).
 All accepted N85T1/T2/T3 requests,96-byte records and their two-map/4095-air
 program remain unchanged. Missing larger qualification keeps that behavior.
-The new record binds the complete current H1/H2/H3 body and geometry, measured
+The record binds the complete current H1/H2/H3 body and geometry, measured
 full-program peak, signed3–8 member maximum and air/window/retry bounds;
 current base/source caps, full-span policy and real native readbacks remain
 mandatory at publication, completion and copy boundaries.
@@ -743,20 +745,19 @@ invalidates every CPU retry and copied-packet authority. Failed DMA stop pins
 all original and expanded storage. No association or generation preservation
 is inferred.
 
-The source-complete eight-member baseline has seven additional native cases
-written, including real public IPC/kernel DHCP/IP and fresh actual H3
-calibration/40MHz/SGI40 composition. Release/native execution and external
-board measurements/signatures/physical acceptance remain pending.
+The eight-member baseline's seven native cases, including real public
+IPC/kernel DHCP/IP and fresh actual H3 calibration/40MHz/SGI40 composition,
+pass on x86_64 and aarch64. External board measurements/signatures and
+physical acceptance remain pending.
 
 ### 3.8 Factory field order and complete admitted profile selection
 
-The admitted AR9285 factory-profile matrix is source-complete. Linux selects
+The admitted AR9285 factory-profile matrix is complete. Linux selects
 only `eep_4k_ops` for this chip; all four normal/high/XE2 gain-table choices
-already use actual TXGAIN/SYNTH9. The additional concrete same-map path now
-handles big-endian EEPROM fields throughout live PHY/modal/detector/CTL/rate/
-spur preparation and actual20/40 calibration, alongside ordinary and
-magic-word-swapped storage. Exact layout/source facts and pending validation
-are [AR9285 factory fields](ar9285-factory-fields.md).
+use actual TXGAIN/SYNTH9. The same-map path handles big-endian EEPROM fields
+throughout live PHY/modal/detector/CTL/rate/spur preparation and actual20/40
+calibration, alongside ordinary and magic-word-swapped storage. Exact
+layout/source facts are [AR9285 factory fields](ar9285-factory-fields.md).
 
 The raw checksum-verified376-byte image, EEPMISC flag and source-hashed bytes
 are retained unchanged. Private factual word/dword readers honor field byte
@@ -766,21 +767,20 @@ LE writes and all H/B/T/Q qualification formats/request recipes remain.
 Foreign LE bodies cannot qualify a raw BE identity. Current calibration,
 power/policy/source/readback and terminal packet/copy/key/BA/DMA controls apply
 through the same real owner. No new generic board profile or chip is inferred.
-Five additional native cases are written; release/native and physical
-acceptance remain pending.
-
+Five native cases pass on x86_64 and aarch64; physical acceptance remains
+pending.
 
 ### 3.9 Optional source-qualified station NETWORK_SLEEP
 
 `Ath9k::power_save_qualification_request()` returns the factual optional
 N85S1 source identity/MAC/filename for the exact current H1/2/3 body and
 20/40 geometry. The existing `WirelessNetIface::power_save_default` and
-`set_power_save` methods now serve the real nl80211 setting. SET owns desired
+`set_power_save` methods serve the real nl80211 setting. SET owns desired
 configuration; actual PM notice, ACK/queue/RX-idle receipt, timer program and
 RTC transition finish in the retained Radio continuation. Default awake and
 unsupported-without-S behavior preserve existing deployments.
 
-The admitted AR9285 program is source-complete for PM1/PM0 non-QoS plaintext
+The admitted AR9285 program covers PM1/PM0 non-QoS plaintext
 Null, actual short PS-Poll descriptor/AID, current-beacon TIM/DTIM/CAB/MoreData,
 manual TIM_TIMER/MSI-or-polled wake, source-literal timers and bounded actual
 AWAKE/NETWORK_SLEEP readbacks. Shared DATA crypto is unchanged: controls
@@ -797,8 +797,8 @@ periodic-calibration operations are not authorized by S.
 
 The exact format, source references, controls, hardware ownership and pending
 acceptance are [AR9285 station power save](ar9285-station-power-save.md).
-Eight new native cases are written; release/native execution and physical
-acceptance remain pending.
+Eight native cases pass on x86_64 and aarch64; physical acceptance remains
+pending.
 
 ### 3.10 Optional measured periodic calibration and ANI
 
@@ -826,9 +826,9 @@ Failure closes CPU admission and independently attempts BME-off; unproved
 DMA stays pinned. P1 requires actual AWAKE and rejects S1 composition without
 reinterpreting its bytes. Existing suspend retires this generation.
 
-Six native cases are written, including actual fresh40/full-reset factory
-composition, native eight-original delivery and kernel DHCP. Release/native
-execution and physical qualification remain pending.
+Six native cases, including actual fresh40/full-reset factory composition,
+native eight-original delivery and kernel DHCP, pass on x86_64 and aarch64.
+Physical qualification remains pending.
 
 ### 3.11 Counted D0 idle FULL_SLEEP and retained cold wake
 
@@ -891,8 +891,8 @@ waits for the attached generation. Only the AR9285 original controller has an
 idle owner; the hook is a no-op for the other ath9k owners.
 
 The source contract and pinned Linux call chain are
-[AR9285 D0 idle FULL_SLEEP](ar9285-idle-full-sleep.md). Seven native cases are
-written, covering real Device/Radio/Packet/DMA, all-queue/RX retirement, current
+[AR9285 D0 idle FULL_SLEEP](ar9285-idle-full-sleep.md). Seven native cases
+cover real Device/Radio/Packet/DMA, all-queue/RX retirement, current
 physical sleep/readback negatives, counted control/association refusal,
 cancelled delay, fresh Open/WPA2/kernel DHCP and full40-above/below to actual20.
 `smoke_ath9k_idle_policy_and_activity_leave_idle` covers the production
@@ -901,11 +901,11 @@ predicate and the leave-idle use count, and
 idle (detached) netdev waking into a generation under the same name/ifindex.
 They compose the production lifetime helpers with complete model cold-reset
 primitives; they do not instantiate the singleton native PCI controller.
-Release/native execution and physical acceptance remain pending.
+They pass on x86_64; aarch64 execution and physical acceptance remain pending.
 
 ### 3.12 MCI Bluetooth coexistence (AR9462/AR9565)
 
-The MCI engine (`drivers/wireless/src/ath9k/ar9003/mci.rs`, ported from
+The MCI engine (`drivers/wireless/ath9k/src/ath9k/ar9003/mci.rs`, ported from
 Linux `drivers/net/wireless/ath/ath9k/ar9003_mci.c` @ `cbbddb6`) and its
 btcoex glue (`ar9003/btcoex.rs`, from `btcoex.c`) implement the MCI
 message exchange between WLAN and the on-chip BT controller.
@@ -1096,11 +1096,10 @@ on the fifth weak period. The later no-stomp edge still uses the configured
 profile stomp, rather than the temporary AUDIO choice. Native station over
 EDMA/GPM tests cover both chips, foreign/invalid observations, literal LPF
 boundaries, lifecycle history, new-peer reset and access failure. All three
-audio cases pass in the preceding coordinated x86_64 Wi-Fi run. The next
-calibrated-power/NETWORK_SLEEP continuation below is newly implemented and
-has not executed its tests; physical coexistence remains unmeasured.
+audio cases pass on x86_64. The calibrated-power and NETWORK_SLEEP work below
+awaits validation; physical coexistence remains unmeasured.
 
-The new concurrent-TX callback shares the associated-beacon RSSI LPF and
+The concurrent-TX callback shares the associated-beacon RSSI LPF and
 marker 127 with audio. Five consecutive periods at RSSI>=40 enable it and
 five below 40 withdraw it; opposite-sign history resets, while timer pauses
 and profile gaps preserve source history. Only 2GHz with the source config
@@ -1116,7 +1115,7 @@ real parked reset/calibration and full base-plan readback. Revised N46A/N65A
 identities bind both plans and this recipe, requiring fresh qualified records;
 magic, 128-byte layouts and filenames remain unchanged.
 
-FTP now consumes only the real N46S NETWORK_SLEEP observation in §3.13 and
+FTP consumes only the real N46S NETWORK_SLEEP observation in §3.13 and
 validated DATA-present counts. An awake interval or late elapsed time is
 not sleep credit. AR9565 config 0xa4c1 still disables FTP stomping;
 AR9462's 0x2201 permits its source path.
@@ -1129,12 +1128,12 @@ assigns `mci->wlan_ver_major/minor`, so the coex version response
 answers 0.0, kept verbatim. AIC is hard-disabled in Linux
 (`ar9003_aic.c` returns false), so the AIC states read 0.
 
-The new concurrent-power and N46S/FTP producers are linked, with 14 authored
-native cases and execution deferred until final validation. Native 2WIRE/
-3WIRE enable/init call sites remain separate work. MCI DMA/message/IRQ/reset/
-channel and periodic-check integration, plus the WoW flag, remain wired as
-described above; first and in-place reset now share the actual source MCI
-calibration handshake and close producers before mutation. Fixture tests cover the message exchange, capability
+The concurrent-power and N46S/FTP producers are linked; their 14 native
+cases await validation. Native 2WIRE/3WIRE enable/init call sites remain
+separate work. MCI DMA/message/IRQ/reset/channel and periodic-check
+integration, plus the WoW flag, are wired as described above; first and
+in-place reset share the actual source MCI calibration handshake and close
+producers before mutation. Fixture tests cover the message exchange, capability
 gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
 walk, the calibration handshake, and the BT profile list + duty-cycle
 scheme (profile add/update/remove, the SCO/ACL caps, status-update
@@ -1193,7 +1192,7 @@ new report facts may refresh. Successful same-channel recovery resyncs
 TIM/TSF and requires a fresh beacon. Bound N46S excludes separately
 qualified WoW; ordinary suspend still retires DMA through FULL_SLEEP.
 Existing WoW remains available when S was never bound. Bounded deadbeef
-wake polls now refuse ambiguous completion.
+wake polls refuse ambiguous completion.
 
 Raw sleep/wake reads and writes check the original EEPROM-decoded RFkill
 GPIO/polarity inside the current N46S/N46A/PCI invocation before the requested
@@ -1212,14 +1211,13 @@ filename is `ath9k/ar9462-sta-ps-v1-ch<N>-<mac>.bin`, loaded through current
 trusted firmware authority. Original N46A, N46S and current occupied-span
 policy all enclose effects. Power indices are not radiated measurements.
 
-Fourteen native cases are authored across concurrent power/RSSI, actual
-Native revoked-source refusal, legacy/WPA2 association/control/PSPoll/
-buffered DATA/replay/PN/wake order, real sleep-only FTP and late callback,
+Fourteen native cases cover concurrent power/RSSI, actual Native
+revoked-source refusal, legacy/WPA2 association/control/PSPoll/buffered
+DATA/replay/PN/wake order, real sleep-only FTP and late callback,
 supersession/source loss, malformed/cross-part/changed-calibration/current
-policy records, partial clock mutation and bounded deadbeef wake. They have
-not run. The complete production boundary passes the x86_64 library check
-with zero warnings; final strict/native/stack validation remains deferred,
-and physical board/transient/coexistence/suspend acceptance remains open.
+policy records, partial clock mutation and bounded deadbeef wake. They await
+validation, and physical board/transient/coexistence/suspend acceptance
+remains open.
 
 ### 3.14 Explicit AR9485 manual WLAN/BT RX antenna sharing
 
@@ -1287,8 +1285,7 @@ The separate AR9565 N65D scope is specified in §3.15. It uses actual MCI
 stop/cleanup and permanent producer retirement rather than treating
 STOMP_NONE weights as off. No missing EEPROM value is inferred, and no
 group2 alias is admitted.
-Three source/model regressions are written; execution is deferred to the
-coordinated final validation.
+Three source/model regressions cover this scope and await validation.
 
 ### 3.15 Explicit AR9565 local coexistence shutdown and group3 manual sharing
 
@@ -1349,7 +1346,7 @@ No remote acknowledgement or physical measurement is invented. The same
 dynamic latch covers earlier and later publication tokens; explicit disable
 retains N65D and never restarts MCI. Reset/retune/suspend/removal take the
 terminal retained-owner path from §3.14, with no plain N65A reconstruction.
-Three additional source/model regressions are written; no physical RF,
+Three more source/model regressions await validation; no physical RF,
 DMA terminal or system acceptance result is claimed.
 
 ### 3.16 Optional separately measured AR9462/AR9485/AR9565 ANI
@@ -1395,7 +1392,7 @@ Preserved fields survive each checked RMW, and live expected coefficients
 advance only after every actual write/readback and counter restart succeeds.
 
 The same stable physical latch used by native and captured host publication
-tokens now jointly invokes P/A/current host policy/PCI. Every later ordinary
+tokens jointly invokes P/A/current host policy/PCI. Every later ordinary
 native operation checks the installed ANI coefficients; only the serialized
 ANI adapter may mutate its changing receipt, retaining fixed power/clock/
 RFkill/PCI checks per scalar. Existing NF/IQ continues through its original
@@ -1403,9 +1400,9 @@ owner. P refuses N46S power-save binding and manual D requests before effects.
 P reset/retune/suspend/removal takes the retained terminal-owner path from
 §3.14; no plain A rebuild or DMA/RF terminal proof is inferred. Source,
 hardware or receipt loss closes later effects and keeps the original sources,
-address, MCI state and uncertain DMA owned. Two source/model regressions are
-authored for actual counter decisions/chip controls, zero listen, ignored
-writes and independent P-cap revocation; they have not been executed.
+address, MCI state and uncertain DMA owned. Two source/model regressions
+cover actual counter decisions/chip controls, zero listen, ignored writes
+and independent P-cap revocation; they await validation.
 
 ## 4. Invariants
 
@@ -1475,14 +1472,12 @@ supplies fallible entropy and AES-CCM, and `net/` owns DHCP/Ethernet delivery.
 
 ## 7. Stage assignment
 
-This wave's HT20, RX STBC1, RTS/CTS, original A-MSDU, recipient BA and
-receive/publication-epoch tests passed the coordinated native Wi-Fi functional
-validation. The full scoped Wi-Fi suites report **x86_64: 2317 passed, 0 failed,
-9 skipped; aarch64: 1847 passed, 0 failed, 3 skipped**. These are suite totals
-across the scoped Wi-Fi families, not ath9k-only counts; they do not attest
-physical EEPROM, calibration, RF, DMA or AP interoperability qualification.
+Stage 5. The HT20, RX STBC1, RTS/CTS, original A-MSDU, recipient BA and
+receive/publication-epoch tests pass the native Wi-Fi suites on x86_64 and
+aarch64; they do not attest physical EEPROM, calibration, RF, DMA or AP
+interoperability qualification.
 
-Stage 5 initial retained station profile. Traced smokes exercise the live
+For the initial retained station profile, Traced smokes exercise the live
 identification helper, complete EEPROM extent, reset register order,
 endianness/checksum/version validation and invalid/busy hardware cases.
 Independent hashes from Linux cover every address/value pair for all four
@@ -1505,10 +1500,11 @@ keep packet engines and bus mastering closed.
 
 Forty-eight channel cases cover channels 1/6/13, eight signed spur offsets and
 zero/nonzero inherited state, including Viterbi packing and boundary rejection.
-Production still invokes this sequence only for the inactive 2412 MHz reference;
-fast retuning remains open. Descriptor tests retain 72 TX vectors, ten RX-status
-vectors and ten MAC/PCU/queue/DMA traces. They check complete extents, status,
-current authority and terminal storage ownership independently of caller buffers.
+Cold retunes (§3.5) repeat this sequence for every admitted primary; fast
+channel change is deliberately not used. Descriptor tests retain 72 TX
+vectors, ten RX-status vectors and ten MAC/PCU/queue/DMA traces. They check
+complete extents, status, current authority and terminal storage ownership
+independently of caller buffers.
 
 The shared AP consumes actual descriptor/DMA bytes and produces RX descriptors.
 Device conversations run Open/WPA2 through the real kernel DHCP client and exact
@@ -1527,66 +1523,64 @@ measurements.
 
 ## 8. Remaining software and physical acceptance
 
-The initial one-shot channel1 calibration, polled packet owner and station
-profile are implemented. Hardware testing requires an exact EEPROM-bearing
-device, authenticated deployment policy and measured RF/calibration acceptance.
-No RF or AP interoperability has been demonstrated by the model tests.
+The AR9285 one-shot calibration, packet owner (MSI or 1 ms polling) and
+station profile are implemented. Hardware testing requires an exact
+EEPROM-bearing device, authenticated deployment policy and measured
+RF/calibration acceptance. No RF or AP interoperability has been demonstrated
+by the model tests.
 
-Additional AC/TID scheduling is implemented in §3.4. The remaining software
-rows and the tree facts that keep each open:
+The AR9285 feature rows and their current scope:
 
-- `additional_channels`, `channel_retuning` are source-complete for admitted
-  primary channels1–13/full-rate20 in §3.5. Release/native validation is
-  pending; Japan CCK-only channel14 remains unadvertised. The cold reset
-  replaces the netdev generation/name and drops keys, BA and association.
-- `ht40`, `sgi40` are source-complete for the exact measured AR9285
-  revision2 full20/40 program in §3.6. Version3 is distinct from every
-  accepted20-only v1/v2 contract; actual fresh40 calibration and real20
-  fallback before keys/DATA are mandatory. Release/native and physical
-  acceptance are pending.
-- `factory_profile_selection` is source-complete for the admitted AR9285
-  `eeprom_4k` map and all four TXGAIN/SYNTH9 gain choices in §3.8. The concrete
-  raw big-field consumer gap is repaired through actual20/40 factory/PHY/cal/
-  native paths; five new cases await execution. Linux names no additional
-  AR9285 map selector; other layouts remain separate chip rows. External
-  measured assets and physical acceptance are pending.
-- `periodic_calibration` is source-complete for the admitted distinct N85P1
-  always-awake full20/40 program in §3.10. Actual IQ/ADC, PA/NF and ANI
-  continuations retain the original native/key/BA/capture owners and separate
-  current full-program qualification; no static H or S1 tracking authority is
-  inferred. Six native cases are written; release/native and physical
-  acceptance remain pending.
-- `larger_tx_aggregates` is source-complete for distinct signed N85T4
-  bounded3–8-member AR9285 sender programs in §3.7. Actual N-slot DMA,
-  half-BAW/factor/air/4ms sizing, per-member BA/retry/BAR/key-epoch ownership
-  and public IPC are implemented. Legacy1/2/3 stay two-member;64-member
-  aggregation is unadvertised. Seven new native cases are written, with
-  release/native and physical qualification pending.
-- `tx_amsdu` (inapplicable, row removed 2026-10-28): Linux ath9k never sets `IEEE80211_HW_TX_AMSDU`
-  (`init.c::ath9k_set_hw_capab`), so mac80211 forms no TX A-MSDU for this
-  driver and there is no Linux reference path. Natively the TX maps are
-  `descriptor::MAX_MPDU + 2` (2306) bytes and `descriptor::transmit_ht`
-  rejects longer frames; `N85H` hashes "noTXAMSDU". The shared
-  `station_security::transmit_amsdu_qos` encoder exists but needs larger maps
-  and a separate measured record.
-- `idle_full_sleep` is source-complete for the admitted Passive/unassociated
+- `additional_channels`, `channel_retuning` cover admitted primary
+  channels1–13/full-rate20 in §3.5 and pass on x86_64 and aarch64; Japan
+  CCK-only channel14 remains unadvertised. The cold reset keeps the netdev
+  name and ifindex but drops keys, BA and association.
+- `ht40`, `sgi40` cover the exact measured AR9285 revision2 full20/40
+  program in §3.6 and pass on x86_64 and aarch64. Version3 is distinct from
+  every accepted20-only v1/v2 contract; actual fresh40 calibration and real20
+  fallback before keys/DATA are mandatory. Physical acceptance is pending.
+- `factory_profile_selection` covers the admitted AR9285 `eeprom_4k` map and
+  all four TXGAIN/SYNTH9 gain choices in §3.8, including raw big-endian
+  fields through actual20/40 factory/PHY/cal/native paths, and passes on
+  x86_64 and aarch64. Linux names no additional AR9285 map selector; other
+  layouts belong to their own chip rows. External measured assets and
+  physical acceptance are pending.
+- `periodic_calibration` covers the admitted distinct N85P1 always-awake
+  full20/40 program in §3.10. Actual IQ/ADC, PA/NF and ANI continuations
+  retain the original native/key/BA/capture owners and separate current
+  full-program qualification; no static H or S1 tracking authority is
+  inferred. Its six native cases pass on x86_64 and aarch64; physical
+  acceptance is pending.
+- `larger_tx_aggregates` covers distinct signed N85T4 bounded3–8-member
+  AR9285 sender programs in §3.7. Actual N-slot DMA, half-BAW/factor/air/4ms
+  sizing, per-member BA/retry/BAR/key-epoch ownership and public IPC are
+  implemented. Legacy1/2/3 stay two-member;64-member aggregation is
+  unadvertised. Its seven native cases pass on x86_64 and aarch64; physical
+  qualification is pending.
+- `tx_amsdu` is inapplicable and has no ledger row: Linux ath9k never sets
+  `IEEE80211_HW_TX_AMSDU` (`init.c::ath9k_set_hw_capab`), so mac80211 forms
+  no TX A-MSDU for this driver and there is no Linux reference path.
+  Natively the TX maps are `descriptor::MAX_MPDU + 2` (2306) bytes and
+  `descriptor::transmit_ht` rejects longer frames; `N85H` hashes
+  "noTXAMSDU". The shared `station_security::transmit_amsdu_qos` encoder
+  exists but needs larger maps and a separate measured record.
+- `idle_full_sleep` covers the admitted Passive/unassociated
   original-controller baseline in §3.11: counted native/control/wake users,
   public desired/status controls, retained100ms continuation, full terminal
   DMA/IRQ proof before actual D0 SHUTDOWN and fresh actual20 cold wake.
   Production-driven from the supervisor (unassociated + quiet netdev) and
-  left by netdev scan/connect/config activity (§3.11). Associated retention, runtime PCI D3 and physical board wake measurements are
-  not inferred. Nine cases are written; release/native and physical
-  acceptance remain pending.
-- `station_network_sleep` is source-complete for the admitted optional
-  AR9285 N85S1 program in §3.9: actual public desired setting, PM notice/
-  PS-Poll receipts, TIM/DTIM/CAB timers, source-qualified real awake/sleep
-  access and terminal DMA ownership. Eight new native cases are written;
-  release/native execution and external measured physical acceptance remain
-  pending. Missing S preserves default awake operation.
-- `host_bus_pm`: native implementation and x86_64/aarch64 software
-  validation completed2026-10-29. The family subtree passes114 native
-  smokes per architecture; bus/pcie also covers current child authority,
-  scoped ECAM fixtures and an absent parent capability list.
+  left by netdev scan/connect/config activity (§3.11). Associated retention,
+  runtime PCI D3 and physical board wake measurements are not inferred. Its
+  nine cases pass on x86_64; aarch64 and physical acceptance are pending.
+- `station_network_sleep` covers the admitted optional AR9285 N85S1 program
+  in §3.9: actual public desired setting, PM notice/PS-Poll receipts,
+  TIM/DTIM/CAB timers, source-qualified real awake/sleep access and terminal
+  DMA ownership. Its eight native cases pass on x86_64 and aarch64; external
+  measured physical acceptance is pending. Missing S preserves default awake
+  operation.
+- `host_bus_pm`: the native implementation passes on x86_64 and aarch64;
+  bus/pcie also covers current child authority, scoped ECAM fixtures and an
+  absent parent capability list.
   The read-only `narf_bus::pci_express::parent_link_control` runs inside
   the child's current capability invocation and reads its immediate
   registered bridge, without minting bridge authority or changing platform
@@ -1657,15 +1651,16 @@ force-wake clear, AR_RC AHB|HOSTIF, active-low RTC reset asserted). A held
 owner lock returns Busy so the orchestrator aborts; unproven DMA pins the
 owner and fails suspend. `pm_resume` (`ath_pci_resume`) re-disables PCI
 RETRY_TIMEOUT (config 0x41) and spawns a generation reset (power-on reset,
-identical EEPROM, INI/PLL/RF, calibration, republication). ASPM
-re-initialization belongs to the open `host_bus_pm` row. Covered by
+identical EEPROM, INI/PLL/RF, calibration, republication); that reset
+repeats the `host_bus_pm` parent-ASPM discovery and D0 workarounds. Covered by
 `smoke_ath9k_ar9285_suspend_disable_then_forced_full_sleep` plus the
 retirement smokes; physical S3 is unmeasured.
 
-Wake-on-WLAN is not applicable to the matched parts: `wow.c::ath9k_init_wow`
+Wake-on-WLAN is not applicable to AR9285/AR2427: `wow.c::ath9k_init_wow`
 requires PCI `driver_data` `ATH9K_PCI_WOW`, which `pci.c` sets only for
 `0x0034` (AR9462) subsystems, and the hardware programming lives in
-`ar9003_wow.c` (AR9003 family only). It belongs to AR9462 enablement.
+`ar9003_wow.c` (AR9003 family only). AR9462 WoW is described under
+`ar9462_enablement` below.
 
 DMA reclamation is implemented by the terminal stop described in §4 and
 covered by `smoke_ar9285_packet_dma_stop_proof_reclaims_storage` (held TX
@@ -1711,41 +1706,35 @@ generation's late carrier/TX/service pass never reaches the successor,
 removal unregisters). Physical chip reset and re-association after reset are
 unmeasured.
 
-Other ath9k devices need their own EEPROM maps, reset/PHY tables and
-descriptor/runtime variants before they can be claimed supported. The Linux
-`pci.c::ath_pci_id_table`/`hw.h` PCI inventory beyond AR9285/AR2427 is:
+Each further ath9k part has its own EEPROM map, reset/PHY tables and
+descriptor/runtime owner, described below. The Linux
+`pci.c::ath_pci_id_table`/`hw.h` PCI inventory beyond AR9285/AR2427 and the
+state of each row:
 
 - `ar5416_enablement`: AR5416 PCI `0x0023` / AR5418 PCIe `0x0024`
-  (AR5008 PHY ops, `eeprom_def.c`, `ar5008_initvals.h`).
+  (AR5008 PHY ops, `eeprom_def.c`, `ar5008_initvals.h`). Legacy20 station;
+  x86_64 tests pass, aarch64 pending.
 - `ar9160_enablement`: AR9160 PCI `0x0027` (AR9001, `eeprom_def.c`).
+  Legacy20 station; x86_64 tests pass, aarch64 pending.
 - `ar9280_enablement`: AR9280 PCI `0x0029` / PCIe `0x002a` (AR9002 dual-band,
-  `eeprom_def.c`, AR9280 INI).
+  `eeprom_def.c`, AR9280 INI). Legacy20 station; x86_64 tests pass, aarch64
+  pending.
 - `ar9287_enablement`: AR9287 PCI `0x002d` / PCIe `0x002e` (AR9002,
-  `eeprom_9287.c`).
+  `eeprom_9287.c`). Legacy20 station; x86_64 tests pass, aarch64 pending.
 - `ar9300_enablement`: AR9380/AR9390 PCIe `0x0030` (AR9003 EDMA descriptors,
-  `eeprom_9003.c`, `ar9003_2p2_initvals.h`).
-- `ar9485_enablement`: AR9485 `0x0032` and AR1111 `0x0037` (AR9003).
-- `ar9580_enablement`: AR9580 `0x0033` (AR9003).
+  `eeprom_9003.c`, `ar9003_2p2_initvals.h`). Legacy20 station; x86_64 tests
+  pass, aarch64 pending.
+- `ar9485_enablement`: AR9485 `0x0032` and AR1111 `0x0037` (AR9003). In
+  progress.
+- `ar9580_enablement`: AR9580 `0x0033` (AR9003). Legacy20 station; x86_64
+  and aarch64 tests pass.
 - `ar9462_enablement`: AR9462 `0x0034` (AR9003, BT coexistence MCI, WoW);
-  ath10k currently rejects this ID as wrong-driver.
-- `ar9565_enablement`: AR9565 `0x0036` (AR9003, MCI).
+  ath10k rejects this ID as wrong-driver. In progress.
+- `ar9565_enablement`: AR9565 `0x0036` (AR9003, MCI). In progress.
 
-Every chip row shares these tree blockers (lifted for AR9287 by the profile
-foundation and native owner below): `identity.rs::identify` rejects
-any `AR_SREV` macro version other than 0xC0 (AR9285) before the first write;
-`decode_identity` accepts only the 376-byte `ar5416_eeprom_4k` map with chain
-masks 1/1; `initvals.rs` carries only the AR9285_1_2 tables; `phy/` and
-`calibration.rs` implement only the single-chain AR9285 recipe
-(`ar9002_calib.c` AR9285 CL/PA paths); `descriptor.rs` is the AR9002
-non-EDMA format; and every signed record names device `0x002b`. Per row the
-Linux pieces still to port are: AR9287 (closest relative: AR9002, 2.4 GHz
-only) `eeprom_9287.c`, `ar9287_initvals.h` modes/common/TX-gain tables, the
-AR9287 calibration branches and two-chain masks; AR9280 `eeprom_def.c`,
-`ar9280_initvals` (AR9280_2) and 5 GHz; AR5416/AR9160 the AR5008 PHY
-(`ar5008_phy.c` analog RF banks) and `eeprom_def.c`; AR9380/AR9485/AR9580/
-AR9462/AR9565 the AR9003 EDMA TX-status/RX-FIFO path (`ar9003_mac.c`),
-`eeprom_9003.c`, per-chip `ar9003_*_initvals.h` and `ar9003_calib.c`.
-(MCI for AR9462/AR9565 is ported; see §3.12.)
+Physical acceptance is pending for every row. The AR9285 HT, BA, QoS, PS,
+periodic/ANI and idle programs stay AR9285-only; the other owners run the
+legacy20 station profile described with each part.
 
 **Per-chip profile foundation (`ar9287_enablement`).** `chips.rs` decodes `AR_SREV` exactly as
 `hw.c::ath9k_hw_read_revisions` (new `0xff` format: `(srev & 0xfffc0000) >> 12`
@@ -1782,7 +1771,7 @@ Japan bit and the AR9287 spur list offset, and finally
 `eeprom_9287.c::ath9k_hw_ar9287_set_board_values` (both chains' switch,
 IQ, attenuation/margin, settling, xPA timing, thresh62, the two
 `AR9287_AN_RF2G3` analog banks and `AR9287_AN_TOP2` xPA bias, each analog
-write followed by 100 µs). Kernel smokes (written, not executed):
+write followed by 100 µs). Kernel smokes:
 `smoke_ath9k_chip_revisions_follow_read_revisions`,
 `smoke_ath9k_ar9287_map_decode_two_chain_masks`,
 `smoke_ath9k_ar9287_identify_reads_map_at_word_128`,
@@ -1812,8 +1801,8 @@ six-bit fields never wrap. Closed-loop maps (`openLoopPwrCntl == 0`) are
 refused: with `AR9287_PD_GAIN_ICEPTS == 1` Linux's
 `ath9k_hw_fill_vpd_table` indexes `pPwrList[(u16)-1]` and
 `ath9k_hw_get_gain_boundaries_pdadcs` reads past a one-entry VPD table, so
-there is no defined detector table to mirror. Smokes (written, not
-executed): `smoke_ath9k_ar9287_txpower_two_chain_open_loop_and_ctl`,
+there is no defined detector table to mirror. Smokes:
+`smoke_ath9k_ar9287_txpower_two_chain_open_loop_and_ctl`,
 `smoke_ath9k_ar9287_txpower_one_chain_uses_first_edge_set`,
 `smoke_ath9k_ar9287_txpower_refuses_before_writes`.
 
@@ -1838,7 +1827,7 @@ is the HT40-only step. `olc_temp_compensation` is
 `ar9287_hw_olc_temp_compensation`: PD average against `initPDADC`, scaled by
 `tempSensSlope` (minor >= 2, otherwise no correction), written to both
 chains' `OLPC_TEMP_COMP`, nothing written before a frame has been sent.
-Smokes (written, not executed):
+Smokes:
 `smoke_ath9k_ar9287_calibration_two_chain_agc_nf_iq`,
 `smoke_ath9k_ar9287_calibration_one_chain_leaves_chain1`,
 `smoke_ath9k_ar9287_calibration_refusals`,
@@ -1857,8 +1846,8 @@ AR9285 44 MHz profile, `Clock::AsyncFifo` is `ath9k_hw_set_clockrate`'s
 the 64/48 us ACK/CTS workaround scale with the clock. `async_fifo_pcu` is
 the following `ath9k_hw_reset` block (logic-analyzer DISBUG20768, AHB
 custom burst 3, MISC_MODE2 AGGWEP) and `dma_txbuf` takes the chip's
-`AR_PCU_TXBUF_CTRL` usable size (0x380 AR9285, 0x700 otherwise). Smokes
-(written, not executed): `smoke_ath9k_ar9287_13_enables_async_fifo_before_ini`,
+`AR_PCU_TXBUF_CTRL` usable size (0x380 AR9285, 0x700 otherwise). Smokes:
+`smoke_ath9k_ar9287_13_enables_async_fifo_before_ini`,
 `smoke_ath9k_ar9287_async_fifo_mac_clock_and_pcu`.
 
 `descriptor::select_chains` is `xmit.c::ath_buf_set_rate`'s chain selection
@@ -1866,8 +1855,8 @@ for multi-chain AR9002 parts: on 2.4 GHz `ath_txchainmask_reduction` returns
 `ah->txchainmask` unchanged, encoded as `set11nChainSel` (ctl7
 `AR_ChainSel0..3`) for each populated series; series-less aggregate
 middle/last descriptors are untouched, masks outside 1..=3 are refused and
-a one-chain mask leaves the AR9285 encoding byte-identical. Smoke (written,
-not executed): `smoke_ath9k_two_chain_descriptor_chain_selection`.
+a one-chain mask leaves the AR9285 encoding byte-identical. Smoke:
+`smoke_ath9k_two_chain_descriptor_chain_selection`.
 
 `admission.rs` defines the AR9287 signed board admission record `N87A` v1
 (format only; no record or board value is supplied or inferred). `Facts`
@@ -1884,8 +1873,7 @@ measured antenna gain (half-dBi, at least the factory
 `Grant::ceiling` removes the measured antenna gain above the factory value
 from the host limit and bounds it by the record ceiling; `Grant::invoke`
 re-proves the record capability before each use. A missing, unsigned,
-foreign or out-of-envelope record leaves the device unadmitted. Smokes
-(written, not executed):
+foreign or out-of-envelope record leaves the device unadmitted. Smokes:
 `smoke_ath9k_ar9287_admission_record_binds_device_map_and_envelope`,
 `smoke_ath9k_ar9287_unprovisioned_or_foreign_record_stays_unadmitted`.
 
@@ -1934,8 +1922,8 @@ identity and factory map; runs `phy::ar9287::prepare` at the target and
 requires the record's preparation; bumps the generation and runs the same
 `initialize` (calibration under the target's `Grant::ceiling`, AR9287 TX
 power at the target, MAC, packet, station, publication). A failed reset
-leaves a fresh un-calibrated owner; old authorities never reopen. Smoke
-(written, not executed): `smoke_ath9k_ar9287_records_are_keyed_per_channel`.
+leaves a fresh un-calibrated owner; old authorities never reopen. Smoke:
+`smoke_ath9k_ar9287_records_are_keyed_per_channel`.
 
 `ar9287_owner.rs` registers `0x002d` (`ath9k-ar9287`) and `0x002e`
 (`ath9k-ar9287e`) with the same singleton address reservation as AR9285.
@@ -1985,16 +1973,17 @@ failures; `DeviceGone`/`BadState` stop it; a pinned or removed owner is
 never followed). System suspend takes `CONTROL` (Busy while a reset is in
 flight), retires the station and FULL_SLEEPs the chip; `pm_resume`
 (`pci.c::ath_pci_resume`) re-disables PCI RETRY_TIMEOUT (config 0x41) and
-spawns the same reset, which republishes a fresh generation. Smokes (written, not
-executed): `smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo`,
+spawns the same reset, which republishes a fresh generation. Smokes:
+`smoke_ath9k_ar9287_mac_profile_two_chain_async_fifo`,
 `smoke_ath9k_ar9287_periodic_nf_history_and_iq_restart`,
 `smoke_ath9k_ar9287_periodic_nf_load_timeout_requests_reset`,
 `smoke_ath9k_ar9287_native_profile_binds_admission_and_chains`.
 
 Known AR9287 gaps: ANI is not run; the probe requires the channel-1
 record as the initial primary; HT20/HT40 TX power and every HT owner are out of scope as for
-the AR9285 legacy base; closed-loop maps stay refused. No physical AR9287
-receipt exists.
+the AR9285 legacy base; closed-loop maps stay refused. The AR9287 smokes
+pass on x86_64; aarch64 execution is pending. No physical AR9287 receipt
+exists.
 
 **AR9280 dual-band profile (`ar9280_enablement`).** AR9280 (`0x0029` PCI,
 `0x002a` PCIe; `AR_SREV_9280_20` is any macVersion 0x80) reads the
@@ -2031,8 +2020,8 @@ below), OB/DB on `AR_AN_RF2G1_CH0/1` or `AR_AN_RF5G1_CH0/1`, `AR_AN_TOP2`
 xPA bias and LOCALBIAS, `FORCE_XPA_CFG`, settling, ADC size, xPA timing,
 `TX_END_TO_A2_RX_ON`, thresh62, the minor-2 `RF_CTL2` timings, minor-3 HT40
 settle, minor-19 CCK DAC scale and the minor-20 `DACIPMODE` (0 on 5 GHz with
-`dacHiPwrMode_5G`), TX clip and desired CCK scale. Smokes (written, not
-executed): `smoke_ath9k_ar9280_identify_reads_def_map_two_chains`,
+`dacHiPwrMode_5G`), TX clip and desired CCK scale. Smokes:
+`smoke_ath9k_ar9280_identify_reads_def_map_two_chains`,
 `smoke_ath9k_ar9280_ini_follows_linux_band_and_gain_selection` (FNV-1a
 oracles over the 547/560 selected Linux rows),
 `smoke_ath9k_ar9280_5ghz_synth_rfmode_and_spur_band`,
@@ -2063,7 +2052,7 @@ CCK registers on 5 GHz), `AR_PHY_POWER_TX_SUB` from
 the first write; a `pwr_table_offset` below -5 or a 128+ entry shift (Linux
 indexes outside `pdadcValues`), a rate that would wrap the six-bit
 `ATH9K_POW_SM` field, empty target lists and open-loop maps are refused.
-Smokes (written, not executed):
+Smokes:
 `smoke_ath9k_ar9280_txpower_two_chain_closed_loop_2ghz`,
 `smoke_ath9k_ar9280_txpower_5ghz_one_chain_and_table_offset`,
 `smoke_ath9k_ar9280_txpower_refuses_before_writes`.
@@ -2098,7 +2087,7 @@ refused). `calibration::ar9280::periodic` is the AR9287 periodic owner
 band's limits, the AR9280 version and no temperature step.
 `Permission::from_domain_dual` adds the 5 GHz 20 MHz channels of
 `phy::ar9280::channel_5ghz` under the same span rule, so DFS, NO_IR and
-indoor-only rules refuse the channel. Smokes (written, not executed):
+indoor-only rules refuse the channel. Smokes:
 `smoke_ath9k_ar9280_calibration_pwdadc_agc_two_chain_2ghz`,
 `smoke_ath9k_ar9280_calibration_5ghz_limits_and_pcie_workaround`,
 `smoke_ath9k_ar9280_calibration_refuses_before_writes`,
@@ -2116,7 +2105,7 @@ slot), ACK/CTS timeouts `slot + SIFS` on 5 GHz (the 64/48 us workaround is
 fast-clock INI carries `rx_lat` 41) and EIFS stay as the INI wrote them,
 exactly as Linux reads them back. The 5 GHz values equal the
 `ar9280Modes_fast_clock_9280_2` 5G_HT20 rows (0x268, 0x18c, 0x044c044c).
-Smoke (written, not executed):
+Smoke:
 `smoke_ath9k_ar9280_mac_profile_5ghz_fast_clock_sifs`.
 
 AR9280 admission (`admission::Facts::new_ar9280`): no AR9280 board has been
@@ -2132,8 +2121,7 @@ the closed-loop def plan at 40 half-dB (PD gains, per-chain TPCRG5 + PDADC,
 rate registers; `overlap` is the live TPCRG5 overlap below minor 2). The
 request filename is `ath9k/ar9280-admit-v1-ch<N>-<mac>.bin`. Format only:
 no record or board value is supplied. 5 GHz DFS/NO_IR/indoor channels never
-reach a record: `Permission::from_domain_dual` refuses them first. Smoke
-(written, not executed):
+reach a record: `Permission::from_domain_dual` refuses them first. Smoke:
 `smoke_ath9k_ar9280_admission_records_bind_band_channel_and_magic`.
 
 **AR9280 dual-band native station (`ar9280_enablement`).** Channel
@@ -2208,7 +2196,7 @@ then `identity::sleep_ar9280`: COLD reset, `pcie_pm::configure_ar9280(..,
 true)` (D3 word, ASPM parts only; `ath9k_stop` →
 `ath9k_hw_configpcipowersave(ah, true)`) and FULL_SLEEP; resume
 (`ath_pci_resume`) re-disables RETRY_TIMEOUT and spawns the reset.
-Smokes (written, not executed):
+Smokes:
 `smoke_ath9k_ar9280_native_profile_binds_band_admission_and_chains`,
 `smoke_ath9k_dual_band_channel_bits_roundtrip`.
 
@@ -2218,7 +2206,8 @@ the probe requires the channel-1 record as the initial primary (a
 5 GHz-only map cannot bind); ANI is not run; HT20/HT40 TX power and every
 HT owner are out of scope; open-loop maps stay refused; DFS, NO_IR and
 indoor-only channels are refused (no radar detection or passive-only
-handling). No physical AR9280 receipt exists.
+handling). The AR9280 smokes pass on x86_64; aarch64 execution is pending.
+No physical AR9280 receipt exists.
 
 **AR5008 PHY preparation (`ar9160_enablement`, `ar5416_enablement`).**
 AR5416 PCI `0x0023` / AR5418 PCIe `0x0024` (macVersion 0xd / 0xc, legacy
@@ -2257,7 +2246,7 @@ bit, AR5416's `ar5008_hw_force_bias` Bank 6 rewrite on 2.4 GHz and the
 `AR_PHY(0x37)` AR2133/AR5133 synthesizer word (AR9160 refsel 2 for 10 MHz
 centers). `ath9k_hw_apply_txpower` is the separate power plan. Open-loop
 maps, bands the map's `opCapFlags` do not enable and device/silicon
-mismatches are refused before any write. Smokes (written, not executed):
+mismatches are refused before any write. Smokes:
 `smoke_ath9k_ar5008_ini_follows_linux_revision_tables` (FNV-1a oracles over
 the 534/538 selected Linux rows),
 `smoke_ath9k_ar5008_rf_banks_synth_and_force_bias`,
@@ -2286,7 +2275,7 @@ chip), `pcie_pm::configure_ar5008(.., true)` (`ath9k_stop` →
 `ath9k_hw_configpcipowersave(ah, true)`, gated by `aspm_enabled`, so only an
 ASPM AR5418 writes the D3 word) and FULL_SLEEP that, on AR5416, leaves the
 RTC out of reset (`ath9k_set_power_sleep`).
-Smokes (written, not executed):
+Smokes:
 `smoke_ath9k_ar5008_identify_radio_pcie_and_cb71_masks`,
 `smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset`.
 
@@ -2303,7 +2292,7 @@ gain boundaries keep their computed values, the PDADC table is not
 realigned) and no `pwr_table_offset` removal from the rate registers.
 `program_chip` writes each chain's `AR_PHY_TPCRG5` + PDADC at
 `regChainOffset` (chains 1 and 2 swap to `+0x2000`/`+0x1000` when the
-effective RX or TX mask is 0x5). Smoke (written, not executed):
+effective RX or TX mask is 0x5). Smoke:
 `smoke_ath9k_ar5008_txpower_three_chain_closed_loop`.
 
 AR5008 calibration (`calibration::ar5008`): `ar9002_hw_init_cal` below
@@ -2328,7 +2317,7 @@ The initial run collects all 64 samples inside one `AR9002_CAL_MAX_TIME`;
 `calibration::ar5008::Periodic` (three-chain NF history, AR9160 IQ entry
 with per-tick collection and the 30 s timeout) is the `ar9002_hw_calibrate`
 state machine. ADC gain/DC are HT40-only and never run. The AR9287/AR9280
-single-sample paths are unchanged. Smokes (written, not executed):
+single-sample paths are unchanged. Smokes:
 `smoke_ath9k_ar5416_calibration_plain_agc_three_chain_nf_no_iq`,
 `smoke_ath9k_ar9160_calibration_multi_sample_iq_numchains`,
 `smoke_ath9k_ar9160_periodic_iq_collects_sixty_four_samples`,
@@ -2351,7 +2340,7 @@ else 0x7) — so a CB71 effective 0x5 against a map `rxMask` of 0x7 is
 accepted and the map is never rewritten. The two-chain profiles keep
 `Masks::Factory` (map masks == effective, 1..=3) byte-identically.
 `descriptor::select_chains` accepts TX masks 1..=7 (`AR_ChainSel` is three
-bits; the APM reduction is AR9003-only). Smoke (written, not executed):
+bits; the APM reduction is AR9003-only). Smoke:
 `smoke_ath9k_ar5008_mac_profile_5ghz_clock_mfp_and_cb71_masks`; the
 descriptor smoke now covers mask 7.
 
@@ -2364,7 +2353,7 @@ either band, and the effective (fixup / CB71) RX/TX masks (1..=7) in bytes
 `ar9002_hw_rf_claim` radio revision, the masks, band, MAC, the whole def
 map and the chip's `plan_chip` closed-loop plan at 40 half-dB. Filename
 `ath9k/ar5416-admit-v1-ch<N>-<mac>.bin` / `ath9k/ar9160-admit-v1-...`. No
-record or board value is supplied. Smoke (written, not executed):
+record or board value is supplied. Smoke:
 `smoke_ath9k_ar5008_admission_records_bind_chip_masks_and_channel`.
 
 **AR5416/AR5418/AR9160 native station (`ar5416_enablement`,
@@ -2427,7 +2416,7 @@ multi-sample IQ per short tick, three-chain NF history every long tick;
 AR5416 NF only). Suspend retires the station, then `identity::sleep_ar5008`
 (COLD `ath9k_hw_disable`, the ASPM AR5418 D3 word, FULL_SLEEP with the
 AR5416 RTC kept out of reset); resume (`ath_pci_resume`) re-disables
-RETRY_TIMEOUT and spawns the reset. Smokes (written, not executed):
+RETRY_TIMEOUT and spawns the reset. Smokes:
 `smoke_ath9k_ar5008_native_profile_binds_chip_band_and_masks`; the
 `smoke_ath9k_ar5416_full_sleep_keeps_rtc_out_of_reset` smoke now covers the
 ASPM D3 word.
@@ -2437,10 +2426,11 @@ Known AR5416/AR5418/AR9160 gaps: no such board has been measured, so no
 one is provisioned; a map whose initial primary record is absent cannot
 bind; ANI is not run; HT20/HT40 TX power and every HT owner are out of
 scope; open-loop maps stay refused; DFS, NO_IR and indoor-only channels are
-refused. No physical AR5416, AR5418 or AR9160 receipt exists.
+refused. The AR5008 smokes pass on x86_64; aarch64 execution is pending. No
+physical AR5416, AR5418 or AR9160 receipt exists.
 
-**AR9003 identity foundation (`ar9300_enablement`, in progress — not
-claimed).** `ar9003.rs` is a separate generation module, so `chips.rs`
+**AR9003 identity foundation (`ar9300_enablement`, implemented; validation
+pending).** `ar9003.rs` is a separate generation module, so `chips.rs`
 (`Revision::decode` still refuses macVersion 0x1c0) and every AR5008/AR9002
 trace are unchanged; the only shared edit is `identity::RegisterIo::wait_us`
 (`ath9k_hw_wait` with an explicit timeout; `wait` delegates to it with the
@@ -2485,8 +2475,8 @@ every table of `ar9003_2p2_initvals.h` (20 tables, 1638 rows, generated
 verbatim); `ar9003/ini.rs::Tables::ar9300` is `ar9003_hw_init_mode_regs`'
 AR9300 branch plus `ar9003_hw_init_mode_gain_regs` (TX gain modes 0–5 with
 type 5 only on `AR_SREV_9300_22`, modes 6/7/8+ and RX modes 2/3 keeping the
-lowest-ob/db and common defaults; `tx_gain_buffalo` is never set). Smokes
-(written, not executed): `smoke_ath9k_ar9300_identify_power_on_and_restore`,
+lowest-ob/db and common defaults; `tx_gain_buffalo` is never set). Smokes:
+`smoke_ath9k_ar9300_identify_power_on_and_restore`,
 `smoke_ath9k_ar9300_eeprom_restores_referenced_template_block`,
 `smoke_ath9k_ar9300_eeprom_otp_and_base_fallback_order`,
 `smoke_ath9k_ar9300_eeprom_refuses_template_fallbacks`,
@@ -2534,7 +2524,7 @@ correction/temperature/voltage and the `nf_2g`/`nf_5g` cal/power facts) is
 computed before any write. Policy over Linux: a ceiling above
 `MAX_RATE_POWER`, an empty or foreign TX mask and a transmit chain with no
 calibration pier within 1000 MHz (Linux presumes a zero correction) are
-refused. Smokes (written, not executed):
+refused. Smokes:
 `smoke_ath9k_ar9300_txpower_matches_linux_oracle` (FNV-1a over 100
 template × channel × CTL cases, plain and with synthetic pier data,
 against the `ar9003_eeprom.c` target/CTL/calibration functions compiled
@@ -2561,7 +2551,7 @@ flags, BA bitmap, retry counts and RSSI are returned). `set_rx_bufsize`,
 `add_rx_buffer` (`AR_HP_RXDP`/`AR_LP_RXDP`, queue depths 16/128) and
 `process_rx` (`ath9k_hw_process_rxdesc_edma` over the 48-byte
 `ar9003_rxs`, including the OFDM-restart-on-non-last-subframe rule) cover
-the receive FIFOs. Smokes (written, not executed):
+the receive FIFOs. Smokes:
 `smoke_ath9k_ar9300_edma_tx_control_and_status_ring`,
 `smoke_ath9k_ar9300_edma_rx_status`.
 
@@ -2604,8 +2594,8 @@ FATAL or a BB watchdog (`ath_isr` `goto chip_reset`) fails the owner, and
 RXEOL drops RXEOL|RXORN until `service_end`. Policy over Linux: an
 `rs_more` chain is dropped with its continuation buffers (no
 reassembly), a corrupt RX status or foreign status-ring entry fails the
-owner instead of being skipped, one frame is in flight. Smokes (written,
-not executed): `smoke_ath9k_ar9300_edma_packet_owner_tx_rx_and_stop`,
+owner instead of being skipped, one frame is in flight. Smokes:
+`smoke_ath9k_ar9300_edma_packet_owner_tx_rx_and_stop`,
 `smoke_ath9k_ar9300_edma_interrupt_mask_and_cause`.
 
 AR9003 station MAC profile (step 3c). `ar9003/mac.rs::prepare` is the
@@ -2625,8 +2615,8 @@ and the status ring belong to the EDMA packet owner). `rf_silent` decodes
 `EEP_RF_SILENT` (byte 35; reserved bits or a pin outside
 `AR9300_GPIO_MASK` refused), the input is configured through the AR9300
 `AR_GPIO_OE_OUT` 0x4050 (`AR_GPIO_OE_OUT_DRV_NO`) and `rf_kill_asserted`
-is `ath_is_rfkill_set` over the `AR_GPIO_IN` 0x404c bit. Smoke (written,
-not executed): `smoke_ath9k_ar9300_mac_profile_dma_clock_and_rf_silent`.
+is `ath_is_rfkill_set` over the `AR_GPIO_IN` 0x404c bit. Smoke:
+`smoke_ath9k_ar9300_mac_profile_dma_clock_and_rf_silent`.
 
 AR9003 calibration (step 4). `ar9003/calib.rs::Calibration::run` is
 `ar9003_hw_init_bb` (`AR_PHY_ACTIVE_EN`, `ath9k_hw_synth_delay` over
@@ -2698,7 +2688,7 @@ saves it when the AGC calibration reports `CLC_SUCCESS`, and only
 consumes it, because `ath9k_hw_reset` clears `TXCLCAL_DONE` before
 every full-reset `init_cal` (`hw.c:2029`) and zeroes the whole
 `caldata` when the channel changes, while the fast channel change
-returns from `ath9k_hw_reset` before that clear (`hw.c:1897`). Smokes (written, not executed):
+returns from `ath9k_hw_reset` before that clear (`hw.c:1897`). Smokes:
 `smoke_ath9k_ar9300_init_and_periodic_calibration`,
 `smoke_ath9k_ar9300_calibration_refusals`,
 `smoke_ath9k_ar9003_tx_iq_enabled_cals`,
@@ -2726,7 +2716,7 @@ gain-array rows), the `ath9k_regd_get_ctl` value and the
 `max_power_level`, per-chain correction/temperature/voltage/NF cal and
 power, temperature slope). The factory antenna gain is the band's
 `antennaGain` (negative counts as zero). No record or board value is
-supplied in-tree. Smoke (written, not executed):
+supplied in-tree. Smoke:
 `smoke_ath9k_ar9300_admission_records_bind_channel_ctl_and_magic`.
 
 AR9300 owner (`ar9300_enablement`, steps 5b-0..5b-4). Step 5b-0:
@@ -2878,17 +2868,18 @@ generation reset. Not ported: `ath_hw_check`'s AR9300
 `ath9k_hw_detect_mac_hang` and the `RESET_TYPE_TX_GTT` path. The AR9002
 owners (AR5008/AR9280/AR9285/AR9287) keep the generation reset for these
 causes: their packet owner carries HT/EDCA/QoS/BA/power-save programs that
-an in-place restart would have to re-apply. Smokes (written, not
-executed): `smoke_ath9k_ar9300_in_place_reset_keeps_rings_and_restarts_rx_tx`,
+an in-place restart would have to re-apply. Smokes:
+`smoke_ath9k_ar9300_in_place_reset_keeps_rings_and_restarts_rx_tx`,
 `smoke_ath9k_in_place_reset_keeps_association_and_keys`.
 The owner carries no HT, EDCA, QoS, block-ack, aggregation or power-save
-program, matching the AR9280 station scope; ANI is not ported. Smokes
-(written, not executed):
+program, matching the AR9280 station scope; ANI is not ported. Smokes:
 `smoke_ath9k_ar9300_expected_preparation_matches_prepare`,
-`smoke_ath9k_ar9300_disable_and_full_sleep`. No physical AR9380/AR9390
-board record or receipt exists in-tree.
+`smoke_ath9k_ar9300_disable_and_full_sleep`. The AR9300 smokes pass on
+x86_64; aarch64 execution is pending. No physical AR9380/AR9390 board
+record or receipt exists in-tree.
 
-**AR9580 (`ar9580_enablement`, implemented; validation pending).** Step 1
+**AR9580 (`ar9580_enablement`, implemented; physical validation pending).**
+Step 1
 (identity and INI): `ar9003::Chip::Ar9580` is PCIe `0x0033`
 (`hw.h::AR9300_DEVID_AR9580`, chip_chainmask 7). Linux tells it from an
 AR9300 only by `reg.h::AR_SREV_9580` (macVersion `AR_SREV_VERSION_9580`
@@ -2913,7 +2904,7 @@ each have an AR9580 table, mode 5 included; mode 7 keeps the low-ob/db
 default; index >= 8 is mode 0) and `ar9003_rx_gain_table_apply` (mode 1
 `ar9580_1p0_wo_xlna_rx_gain_table`; modes 2/3 keep the default);
 `phy::prepare`/`expected` use it. AR9300 tables and streams are
-unchanged. Smoke (written, not executed):
+unchanged. Smoke:
 `smoke_ath9k_ar9580_revision_split_and_ini_selection` (FNV-1a oracle over
 the 886 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
 computed from the local Linux headers).
@@ -2925,7 +2916,8 @@ tables and EEPROM board values, and runs the AR9300/AR9580
 in-place reset and retiring suspend/cold resume use that same owner.
 This completes the initial AR9300-equivalent legacy20 profile; ANI,
 HT/QoS/BA/power-save programs and physical board acceptance are outside
-that profile. Software and RF validation remain separate.
+that profile. The software tests pass on x86_64 and aarch64; RF validation
+remains separate.
 
 **AR9462 (`ar9462_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
@@ -3012,9 +3004,9 @@ WoW `mci_enabled` flag itself is wired at probe (§3.12). Smoke (written, not ex
 The per-chip EEPROM board values (`board.rs`, including `thermo_cal`
 and switch tables), noise limits and PCOEM calibration branches are
 implemented, including live MCI profile duty-cycle application (§3.12).
-Calibrated concurrent-TX and actual N46S NETWORK_SLEEP/FTP are now linked
-(§3.12–3.13), with new validation deferred. Distinct N46P now composes actual
-source ANI (§3.16), separately from N46S; validation is deferred. The current source's CUS217
+Calibrated concurrent-TX and actual N46S NETWORK_SLEEP/FTP are linked
+(§3.12–3.13) and await validation. Distinct N46P composes actual source ANI
+(§3.16), separately from N46S, and awaits validation. The current source's CUS217
 PCI matches (`pci.c:315..326`) add only a diagnostic in
 `init.c::ath9k_init_pcoem_platform`; they select no missing AR9462 GPIO,
 xatten, antenna or calibration program. Exact EEPROM board programming is
@@ -3077,8 +3069,8 @@ the fixed AR9300 list never runs on this chip; the HT40 form (range 19,
 takes `ar9003_hw_power_control_override`'s generic `AR_PHY_TPC_19`
 path (`ar9003_eeprom.c:4944`); its 2 GHz synth selection coincides with
 the AR9300 formula at the 40 MHz reference (`ar9003_phy.c:160`).
-The next continuation implements the source PCI board settings and retained
-legacy20 RX antenna owner. `board::Config::for_pci` derives the six exact
+The source PCI board settings and retained legacy20 RX antenna owner are
+implemented. `board::Config::for_pci` derives the six exact
 CUS198/CUS230 subsystem matches from the current PCI identity. It carries
 GPIO9, margin5, the extra chain0 `alt_mingainidx` RMW and the source
 `0x000bbb88` switch mask; that mask remains inactive while manual BT sharing
@@ -3114,21 +3106,21 @@ old signatures cannot authorize the expanded program. Fresh measured signed
 qualification remains required, with no record or firmware binary committed.
 
 Eleven antenna/controller cases plus two board cases and one admission case
-are written. They exercise source vectors, actual EDMA admission, current
+exercise source vectors, actual EDMA admission, current
 record/PCI revocation, saved-default readback and retained reset ownership.
-Execution is deferred until the final validation pass at the user's request.
+They await the final validation pass.
 N48A alone keeps manual BT sharing off. The explicit N48D continuation
 below composes its separate manual scope (§3.14); broader HT/AMPDU/control-frame
 sampling and physical PCI/PHY/system-suspend acceptance remain profile limits.
 
 **Source delta correction.** Group2 has scan-admission delta -9 and
 final LNA-selection switch delta -1 (`ar9003_phy.c:1512..1515`,
-`antenna.c:335,621,809`). These had been reversed in the first port.
-The production scanner and literal boundary/normal-scan expectations are
-corrected; an additional source marker enters N48A identity so an earlier
-signature cannot authorize the changed reachable scanner program.
+`antenna.c:335,621,809`). The production scanner and literal
+boundary/normal-scan expectations use these values; a source marker in the
+N48A identity keeps signatures over an earlier reversed program from
+authorizing the current scanner program.
 
-Manual sharing now has an explicit serialized native consumer and a separate
+Manual sharing has an explicit serialized native consumer and a separate
 N48D complete-program companion (§3.14). It establishes source3WIRE off by
 actual writes/readbacks, pauses/rebases the scanner and retains N48D in every
 old/new native and host publication token. Linux `init.c:720..728` supplies
@@ -3192,18 +3184,18 @@ WoW does not apply (Linux `pci.c` sets `ATH9K_PCI_WOW` only on
 `0x0034` subsystems). The per-chip EEPROM board values, noise limits,
 PCOEM calibration, saturated RX-IQ refusal and two-spur OFDM branch are
 implemented, including live MCI profile duty-cycle application (§3.12).
-Calibrated concurrent-TX is now linked (§3.12), with new validation deferred.
-The current canonical PCI board/antenna slice is also linked: Linux's generic
+Calibrated concurrent-TX is linked (§3.12) and awaits validation.
+The canonical PCI board/antenna slice is also linked: Linux's generic
 0036 row advertises BT_ANT_DIV, while its thirteen exact WB335 1-ANT rows
 without that flag suppress the otherwise fixed0xc9 combining capability
 (`pci.c:422..486`, `init.c:488..500`). Current PCI identity selects that
 suppression; it is part of the revised N65A identity. EEPROM byte124 does
 not override AR9565's fixed source0xc9. The actual no-manual-BT board path
-now preserves source order when clearing LNADIV/RX-protect/BT force-on,
+preserves source order when clearing LNADIV/RX-protect/BT force-on,
 retains fixed fast diversity, and performs the final combining write only
 for a capable board (`ar9003_eeprom.c:3739..3801`).
 
-The same native/current-N65A antenna Binding now retains AR9565's default
+The same native/current-N65A antenna Binding retains AR9565's default
 antenna count/history across reset and suspend. Its actual1p0/1p1 base has
 bias3; only a valid admitted EDMA MPDU can produce a copied observation,
 and three consecutive mismatches change the default. All combining-capable
@@ -3216,7 +3208,7 @@ deferred. Revised N65A keeps its128-byte layout but requires fresh measured
 qualification for this complete program and its transitions.
 
 CUS252 is diagnostic-only in `ath9k_init_pcoem_platform`; no additional
-GPIO/power delta can be inferred from its name. Explicit N65D now composes
+GPIO/power delta can be inferred from its name. Explicit N65D composes
 the actual local MCI shutdown/permanent producer retirement and distinct
 group3 manual program (§3.15), retaining all MCI storage and sources.
 Distinct N65P composes source ANI (§3.16) separately from manual N65D, with

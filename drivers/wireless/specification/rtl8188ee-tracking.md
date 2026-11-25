@@ -1,10 +1,10 @@
 # RTL8188EE signed thermal TXAGC full-program qualification
 
 This is part of [rtlwifi §3](rtlwifi.md#3-public-interface). The NETH v1
-continuation and six composed native cases are implemented pending coordinated
-release compilation and final native validation. No board measurements,
-thermal measurements, signed deployment assets or physical RF acceptance
-are supplied. Existing NEPC, NEHT and NERT formats and recipes are unchanged.
+continuation and six composed native cases are implemented and pass the native
+software gates on x86_64 and aarch64. No board measurements, thermal
+measurements, signed deployment assets or physical RF acceptance are
+supplied. Existing NEPC, NEHT and NERT formats and recipes are unchanged.
 
 The optional NETH record qualifies the complete actual private EE program:
 its exact factory map, retained executable, NEPC payload, measured NEHT payload
@@ -118,22 +118,20 @@ fresh current authority to restore the original point before selecting a new
 peer's width and qualification. Recovery creates a fresh owner and must
 resolve its actual measurements again.
 
-Six new `drivers/wireless/rtlwifi/tracking` cases use actual
+Six `drivers/wireless/rtlwifi/tracking` cases use actual
 Firmware/PacketIo/Prepared/Device, native DMA/peer/security fixtures and the
 kernel DHCP client: signed identity and all-plane holes; Open/WPA2 legacy
 and HT DHCP/IP with literal source reduction and average4 restoration;
 plus/minus HT40, response20 fallback and actual RTS fields; real IQK/LCK
 measurement/restoration; invalid qualification/sensor/write/scheduler/
 calibration failures; and revoked held M4 plus cancelled RF waits retaining
-actual ownership. They are written but have not executed. Coordinated
-release compilation and final native/full-matrix validation remain required.
+actual ownership.
 
 Dynamic antenna selection is a separate feature. Linux EE does implement
-CGCS_RX_HW_ANTDIV, CG_TRX_HW_ANTDIV and CG_TRX_SMART_ANTDIV. This thermal
-continuation retains the current static factory/OEM path and grants no
-per-antenna selection authority. Exact per-antenna measurements and the
-antenna descriptor/receive-statistics/calibration owner remain necessary
-for that separate continuation.
+CGCS_RX_HW_ANTDIV, CG_TRX_HW_ANTDIV and CG_TRX_SMART_ANTDIV. NETH alone
+retains the static factory/OEM path and grants no per-antenna selection
+authority; the per-antenna measurements and the antenna descriptor/
+receive-statistics/calibration owner belong to the NEAN continuation below.
 
 The separate [NEAN antenna continuation](rtl8188ee-antenna.md) can qualify
 this exact NETH payload for actual automatic selector0/1 behavior. NETH v1

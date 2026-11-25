@@ -1,7 +1,8 @@
 # RTL8821CE qualified thermal tracking
 
 This continuation implements `rf_power_tracking` for the admitted RTL8821CE
-type0, RF-A, channel1/HT20 station. It adds actual TXAGC/txscale compensation
+type0, RF-A HT station (channel1/HT20, with the HT40 and noninitial-channel
+variants described below). It adds actual TXAGC/txscale compensation
 and segmented associated IQK to the retained firmware/packet owner. RTL8822C
 keeps its existing N22D mechanism. All existing N21Q/P/S/L/H/R/T/X and N21D
 formats and identity recipes keep their original meaning. N21X is RTS;
@@ -65,6 +66,14 @@ so the tracking wrapper cannot create generic invocation recursion.
 ## Signed N21W v1
 
 Filename: `rtw88/rtw8821ce-power-track-v1-<12 lowercase MAC hex>.bin`.
+A 40MHz association uses `rtw88/rtw8821ce-power-track-v1-ht40-<mac>.bin`,
+whose identity additionally binds the bound N2xB record; on a noninitial
+primary the name is channel-scoped (`rtw88/rtw8821ce-chNN-power-track-...`,
+`channel_policy::scoped_filename`) and the identity binds that channel's N2xO
+base. Bytes54..56 stay `[1,20]` in every variant. RTL8821CU runs the same
+continuation over EP0 (`usb_firmware.rs`) under the host-keyed
+`rtw88/rtw8821cu-power-track-v1-...` name, whose bytes12..16 carry the USB
+VID/PID (rtw88.md, "RTL8821CU USB transport").
 The existing trusted firmware loader and nonempty authenticated signer are
 required. The public `Rtw88Device::rtl8821c_power_tracking_request()` returns
 measurement metadata for the exact already-bound C21 HT session; it grants
@@ -86,7 +95,7 @@ power indices. Dynamic RTS settings are inside the measured whole program.
 | 0..4 | `N21W` |
 | 4..8 | `[1,0,192,0]` |
 | 8..12 | 192 LE u32 |
-| 12..16 | PCI vendor/device `[ec,10,21,c8]` |
+| 12..16 | PCI vendor/device `[ec,10,21,c8]` (USB: VID/PID) |
 | 16..48 | Exact request identity |
 | 48..54 | Factory MAC |
 | 54..56 | `[1,20]`, channel1/HT20 |
@@ -129,14 +138,17 @@ the startup IQK image. Failed restore, cancellation, current base/PCI loss,
 ambiguous command ownership and physical readback failure also remain closed;
 only the existing stopped-DMA proof can release published allocations.
 
-## Written native cases
+## Kernel tests
 
-Eight cases use the actual C21 reserved firmware → IQK → power → awake →
-L/H → native Core → registered Device stack, real DMA/CCX and AP actor:
+Eight cases in `drivers/wireless/rtw88/power_tracking/rtl8821c`
+(`tracking8821c/native_tests.rs`) use the actual C21 reserved firmware →
+IQK → power → awake → L/H → native Core → registered Device stack, real
+DMA/CCX and AP actor:
 Open with kernel DHCP and applied IQK; WPA2 negative AGC/swing and retained
 keys; T2/Q/RTS with a nonselected MCS at its factory ceiling and copied-epoch
 retirement; invalid distinct assets/static H; held native DATA and power-only
 restore; failed writes/RX park/H2C/applied IQK; cancellation at a real await;
-and coding/actual RA fallback/D composition. These cases are written and
-remain unexecuted until the coordinated release/native validation. Physical
-radio, board power and antenna acceptance remain separate.
+and coding/actual RA fallback/D composition. A ninth,
+`smoke_rtw8821ce_power_tracking_ht40_selects_bw40_indices`, checks the HT40
+index selection. These are software regressions; physical radio, board power
+and antenna acceptance remain pending.

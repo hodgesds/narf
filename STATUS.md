@@ -91,789 +91,361 @@ current test results.
 
 ## WCN6855 source alignment
 
-The ath11k WCN6855 source path now includes Linux-shaped per-TID TXQs with
-the 4096-flow fq/CoDel scheduler, ECN handling and requested-TX-status drops,
-cfg80211's TKIP `MICHAEL_MIC_FAILURE` notification, and Linux-style managed
-station recovery: external-SME, Open and completed in-kernel RSN vdev/peer/
-BSS/EDCA/key replay without new auth or assoc frames (BA sessions reset).
-Beaconing AP/GO recovery likewise replays beacon and MBSSID state, group
-keys, clients, PTKs and authorization; shared-radio reconfiguration wakes
-queues only after every live vdev is rebuilt. `GET_STATION` now reports
-monitor-status PPDU combined/chain RSSI, Linux-style raw-RSSI EWMA,
-RX/TX duration and detailed HTT TX rate telemetry. Monitor mode, TX A-MSDU,
-AQL and airtime-fairness are not listed as open WCN6855 work because Linux
-ath11k does not expose those capabilities for this hardware. This is
-source-level implementation progress only: no build, emulation, or hardware
-validation was run while the equivalence work remained in progress.
+The ath11k WCN6855 path follows Linux for:
+
+- per-TID TXQs on the 4096-flow fq/CoDel scheduler, with ECN handling and
+  requested-TX-status drops;
+- cfg80211's TKIP `MICHAEL_MIC_FAILURE` notification;
+- managed station recovery: external-SME, Open and completed in-kernel RSN
+  vdev/peer/BSS/EDCA/key replay without new auth or assoc frames (BA
+  sessions reset);
+- beaconing AP/GO recovery, which replays beacon and MBSSID state, group
+  keys, clients, PTKs and authorization; shared-radio reconfiguration wakes
+  queues only after every live vdev is rebuilt;
+- `GET_STATION` with monitor-status PPDU combined/chain RSSI, Linux-style
+  raw-RSSI EWMA, RX/TX duration and detailed HTT TX rate telemetry.
+
+Monitor mode, TX A-MSDU, AQL and airtime fairness are not open WCN6855 work
+because Linux ath11k does not expose those capabilities for this hardware.
+QEMU has no WCN6855; no hardware validation is recorded.
 
 ## MT7921/MT7922 firmware bringup
 
-The x86_64 and aarch64 MT76 late init path now owns coherent WM/FWDL/MCU DMA rings and
-performs ROM restart, patch semaphore negotiation, patch/RAM download and
-firmware-ready verification. Post-firmware MCU commands obtain the real MAC
-and PHY, read EFUSE hardware identity, select embedded world country limits,
-select on-chip calibration and initialize MAC/WTBL/RTS. Unified device command
-framing now matches the local Linux reference. Waits are bounded and report the current stage;
-failed or cancelled attempts retain published DMA until verified shutdown.
-The retained RX ring and MCU scan path now support passive 2.4 GHz scans on
-channels 1–11. Successful radio initialization registers a wireless
-interface with the real MAC and supported regulatory channels.
+The x86_64 and aarch64 MT76 late init path owns coherent WM/FWDL/MCU DMA
+rings and performs ROM restart, patch semaphore negotiation, patch/RAM
+download and firmware-ready verification. Post-firmware MCU commands obtain
+the real MAC and PHY, read EFUSE hardware identity, select embedded world
+country limits, select on-chip calibration and initialize MAC/WTBL/RTS.
+Unified device command framing matches the Linux reference. Waits are
+bounded and report the current stage; failed or cancelled attempts retain
+published DMA until verified shutdown. Successful radio initialization
+registers a wireless interface with the real MAC and supported regulatory
+channels. When firmware or network authority arrives late, background
+preflight retries (`retry_preflight_until`, 120 attempts at 500 ms) run
+before falling back to verified reset recovery.
+
 The private cut-through management TX backend retains each payload until
 both descriptor completion and firmware token release. RX routing separates
-forwarded normal frames, MCU responses and TX releases on all rings.
-Live join dispatch is integrated with regulatory authorization, channel/power
-switching via `MCU_EXT_CMD_CHANNEL_SWITCH`, open-authentication/association MLME
-handshakes, and IEEE 802.11i WPA2-PSK 4-way handshakes (M1..M4) with HMAC-SHA1 MIC
-verification/generation. WTBL station records commit temporal keys with
-tag 0x12 (`STA_REC_KEY_V2`), cipher 6 (`MCU_CIPHER_AES_CCMP`), and `PORT_SECURE`.
-The retained legacy 2.4 GHz station profile now uses Linux's packed 76-byte
-channel request and UNI3 station/key commands. It installs the BSSID and
-unauthorized AP WTBL before authentication, then drives peer-bound RSNA with
-M3 RSNE/MIC/ANonce/KDE checks, pairwise/group keys and per-key/TID CCMP replay
-windows. Kernel transmit, capability frame rings and RX delivery share a
-bounded service step with synchronous network waiters; owned rekey work can
+forwarded normal frames, MCU responses and TX releases on all rings. Live
+join dispatch is integrated with regulatory authorization, channel/power
+switching via `MCU_EXT_CMD_CHANNEL_SWITCH` (which encodes the receive-chain
+count while RLM keeps its mask), open-authentication/association MLME and
+IEEE 802.11i WPA2-PSK 4-way handshakes (M1..M4) with HMAC-SHA1 MIC
+verification/generation. WTBL station records commit temporal keys with tag
+17 (`STA_REC_KEY_V2`), cipher 5 (`MCU_CIPHER_AES_CCMP`) and `PORT_SECURE`.
+The station path uses Linux's packed 76-byte channel request and UNI3
+station/key commands. It installs the BSSID and unauthorized AP WTBL before
+authentication, then drives peer-bound RSNA with M3 RSNE/MIC/ANonce/KDE
+checks, pairwise/group keys and per-key/TID CCMP replay windows.
+
+Kernel transmit, capability frame rings and RX delivery share a bounded
+service step with synchronous network waiters; owned rekey work can
 progress even when its original waiter is cancelled. Peer disconnect closes
-carrier and acknowledged key/WTBL/BSS cleanup precedes reuse. Verified WFSYS
-reset, DMA stop/retirement and firmware reload now recover failed/cancelled
-control without replaying station keys; failed quiescence retains allocations.
-Initial startup failure and registered-interface recovery use retained owned
-futures with bounded retry/backoff. Broader radio modes, removal and PM remain
-software work. No off-box radio, DHCP or AP interoperability has been demonstrated.
+carrier, and acknowledged key/WTBL/BSS cleanup precedes reuse. Verified
+WFSYS reset, DMA stop/retirement and firmware reload recover failed or
+cancelled control without replaying station keys; failed quiescence retains
+allocations. Initial startup failure and registered-interface recovery use
+retained owned futures with bounded retry/backoff. The coherent PCI backend
+and ownership models build on x86_64 and aarch64. No off-box radio, DHCP or
+AP interoperability has been demonstrated.
 
 ## Wi-Fi family software bring-up
 
-Wi-Fi and GPU now maintain native Rust implementations and validation. The
-ad-hoc Python/C reference-compilation, source-extraction and temporary Rust
-comparison harnesses have been removed. Hardware tables and fixed source-cited
-fixtures remain reviewed data; Rust tests exercise actual production functions,
-wire contracts, boundaries and failure/ownership behavior. Historical source
-hashes do not assert current Linux/Mesa equivalence or physical acceptance.
-Firmware parser cases are authored in Rust; extracted firmware metadata binaries,
-their regeneration commands and missing-file skip stubs are removed. Explicit
-deployment board-manifest encoding remains native Rust through
-`cargo xtask wifi-fixtures board-manifest`.
+The Wi-Fi drivers live in per-family crates under `drivers/wireless/`
+([README](drivers/wireless/README.md)). Every family crate with a PCI or USB
+function also builds as a loadable `.ko`; see the "Loadable …" sections
+below. Validation is native Rust: tests exercise production functions, wire
+contracts, boundaries and failure/ownership behavior. Hardware tables and
+fixed source-cited fixtures are reviewed data, and firmware parser cases are
+authored in Rust. Deployment board manifests are encoded with
+`cargo xtask wifi-fixtures board-manifest`. Source hashes recorded in the
+family specs do not assert current Linux equivalence or physical acceptance.
 
-All eleven in-tree families are covered by the current audit and dependency
-ledger in `drivers/wireless/specification/spec.md` and its family documents.
-The branch target is **all eleven Wi-Fi families with all hardware/firmware
-supported features ready for physical testing**. Each chip/revision, firmware API
-and board profile needs a feature inventory, reachable implementation and
-transition/failure evidence; PCI/USB matching alone is not support. The
-family software ledger in `drivers/wireless/specification/spec.md` records
-the open work. Recovery, wider PHY/chip coverage, security/roles and power
-management are part of this target where supported.
+### Target and ledger
 
-The initial station milestone is scan, Open/WPA2-PSK, DHCP and bidirectional IP,
-with controlled-port closure and safe transport ownership on disconnect/failure.
-Eleven families have composed kernel-DHCP paths (Intel Sc, MT76,
-ath11k, ath10k, AR9285, RTL8188EE, RTL8188EU, RTL8822CE, RTL8852B, CYW43439 and BCM43602); exact authenticated firmware,
-board/calibration/policy provisioning, reset/wiring handoff and physical
-validation remain required. The initial software paths are
-implemented; broader chip/PHY/feature/lifecycle coverage remains required before
-the branch target is met.
+The target is **all eleven families (iwlwifi, mt76, ath11k, ath10k, ath9k,
+brcmfmac, cyw43439, rtlwifi, rtl8xxxu, rtw88, rtw89) with every feature
+their hardware and firmware support ready for physical testing**. Readiness
+is assessed per chip/revision, firmware API and board profile, with a
+feature inventory, a reachable implementation and transition/failure
+evidence for each; PCI/USB matching alone is not support. Wider PHY/chip
+coverage, security modes, roles, recovery and power management are in
+scope where the hardware supports them. The family audit is
+`drivers/wireless/specification/spec.md` and its family documents.
 
-The 2026-11-16 remaining-row continuation starts from `4daa0b5a9` after
-checking open PRs for overlap. It adds a retained IPQ6018
-WLFW-to-core conversation and RTL8723BE native CFO/linked-ATC handling,
-and reconciles delivered chip work against the TSV. AR9580's initial
-signed legacy20 owner moves to implementation pending validation;
-broader radio profiles and physical acceptance remain open. The family
-specs and TSV retain the actual residuals, including MCI traffic/RSSI/power
-feedback, A/BE channel/station composition and platform host ports.
-IPQ6018 also moves to pending validation after the composed native
-conversation passes. The ledgers now hold 13 open rows and 94 implemented
-pending validation.
-The same branch now also applies AR9462/AR9565 profile GPMs through live
-MCI duty deadlines in the existing async worker, including weight/priorities,
-5 GHz suppression and reset/WoW/stop cancellation. Native regression tests
-exercise both chips' literal timer/weight images and failed-access handling.
-Large ath11k runtime/netdev and Gen2 station construction state moves off
-callers' stacks; AHB bring-up/recovery and the Qualcomm fixture runner
-retain their futures on the heap. Six reported Wi-Fi/SoC stack-budget
-failures are resolved and five obsolete exceptions are removed, with no
-budget increases. The expanded suites pass 563/0/2 on x86_64 (diagnostic
-QEMU) and 563/0/3 on aarch64; the full aarch64 ath9k suite also passes
-317/0/0. Scoped strict release clippy and debug checks pass on both
-architectures, and formatting passes. The earlier normal x86_64 launch
-was blocked only by the GPU RS64 frame overage from PR #2164. That fix
-has since merged; this branch is rebased onto `8b34296a0` without
-duplicating it. The final normal x86_64 gate passes 563/0/2, its stack
-budget check, production boot and both btrfs postflight checks; scoped
-strict clippy, debug checking and formatting also pass. The aarch64
-repeat after rebasing was skipped at the user's request; the preceding
-aarch64 results above are retained. Physical acceptance remains pending.
+The feature ledger is `drivers/wireless/research/remaining-features.tsv`
+(**11 open rows**) and `implemented-pending-validation.tsv` (**96 rows**),
+107 in all. A chip row stays open while a narrow qualified profile leaves
+broader native functionality unfinished. The open rows are:
 
-The next same-branch continuation composes RTL8723BE EDCA turbo with
-native unicast byte accounting, bounded associated-beacon vendor
-recognition and source Cisco/default contention values. It also makes a
-failed lazy DM initialization terminal. Four native regressions cover the
-policy, recognition, RX/TX-to-watchdog path and access failures; all four
-pass in x86 QEMU. The release kernel and stack gate, strict release clippy,
-debug checking and formatting pass. The broader rtlwifi run exposed stale
-RTL8192DE HT capability/timing expectations; their final width-filtered
-correction is included in the combined checkpoint below. A full wireless attempt also
-found RTL8723BU and Intel P2P fixture failures and stalled in the watchdog
-work smoke; those findings are resolved in that checkpoint. Aarch64 stays
-skipped as requested. No physical acceptance is claimed.
+- ath11k IPQ5018 and IPQ8074 AHB profiles: no end-to-end LiveAhb run past
+  `firmware_start` and no silicon run;
+- ath9k AR9462, AR9485 and AR9565: broader HT/aggregation/control-frame
+  profiles, optional board inputs and physical acceptance;
+- CYW43439 additional host ports: the exclusive gSPI host/shared-pad/stop
+  producer, signed gSPI host and board selection, and the platform SDHCI
+  aperture;
+- rtlwifi RTL8192DE (native software-LPS Null-PM/on-air-ACK, real RF
+  sleep/wake) and RTL8723AE (HT40/TX aggregation, IPS/LPS with real
+  Null-frame ACK, retune, reset/reclaim);
+- rtw89 RTL8852A (native periodic DIG/NHM/RF tracking, AP role,
+  aggregate/sleep owners), RTL8922A (ordinary activation, RX/IRQ, MLME,
+  station, AP and EHT publication) and EHT on RTL8922A.
 
-The parallel continuation now adds RTL8723AE native cold MAC/LLT ->
-firmware -> BB/RF/default setup, separate source IQK/RF6052 preparation
-owners, RTL8852A native MAC/BB/RF channel control with Programmed-only
-readiness, and AR9462/AR9565 associated-beacon audio coexistence feedback.
-The broad-run findings are addressed by the full-runtime RTL8723BU
-fixtures and hardware TX-mask validation, Intel RAM retained-stop cleanup,
-and a hermetic watchdog executor fixture. Native corrections retain exact
-Intel host-GTK/checksum, policy/client and firmware-marker owners, actual
-MediaTek peer WCIDs/GO receive epochs, RTL8852A fragment identity and
-FullMAC logical/physical response boundaries. CYW AP packets bind the
-original interface, and final RX publication invokes the SDIO source once
-while retaining peer/key epochs. Intel model fixtures use their own names
-instead of consuming the physical adapter's cached wlan reservation.
+The pending rows carry their own validation state (architectures run,
+assets and hardware still required).
 
-The 2026-11-17 combined x86_64 gate passes **4404/0/9** (pass/fail/expected
-physical-device skip). The release kernel and stack gate, strict release
-library Clippy for wireless and MT76, debug checks and formatting pass.
-The normal production boot and both btrfs postflight checks also pass with
-persistent disk writes. Ath10k retains station Security on the heap; its
-obsolete startup exception and one obsolete RTL8xxxU probe exception are
-removed without increasing any stack budget. Aarch64 is skipped at the
-user's request. The TSV remains 13 open rows and 94 implemented pending
-validation; calibrated radio/station prerequisites and physical acceptance
-remain open.
+### Station milestone
 
-The next same-branch continuation links AR9485 canonical PCI board settings
-and a retained qualified RX antenna scanner, AR9462/AR9565 calibrated
-concurrent-power transitions, AR9462 separately qualified NETWORK_SLEEP/
-PM-control/DTIM and sleep-only FTP feedback, and RTL8723AE's original retained
-legacy20 native station/coexistence handoff under separate NASR qualification.
-RTL8723BE now has separately qualified BBSWING thermal tracking with immutable
-original IQK/BB state and terminal lifecycle restoration. RTL8821AE has distinct
-one-/two-antenna source algorithms, original RX/H2C ownership and actual native
-scan/connect/EAPOL/LPS/watchdog/stop composition under optional fresh N21C.
-RTL8723BE and full RTL8821AE special frames require their own async preflight
-before native TX. BE/DE ASPM uses each chip's actual source recipe and PCI policy.
+The initial station milestone is scan, Open/WPA2-PSK, DHCP and
+bidirectional IP, with controlled-port closure and safe transport ownership
+on disconnect or failure. Every family composes it through the kernel DHCP
+client in native Rust conversations: Intel Sc (after firmware INIT) and
+Gen2 API77, MT76, ath11k, ath10k (all six firmware dialects), AR9285,
+RTL8188EE, RTL8188EU, RTL8822CE, RTL8821CE, RTL8852B, CYW43439 and
+BCM43602. The shared A2 conversation kit supplies a reactive legacy
+Open/WPA2 AP and a transaction-bound DHCP peer; CYW's WPA2 proof is
+firmware-offloaded key completion and does not simulate firmware-internal
+crypto. Exact authenticated firmware, board/calibration/policy
+provisioning, reset/wiring handoff and physical validation remain required
+for each. Synthetic board, calibration and firmware inputs are test-only.
 
-RTL8922A now retains a separately reserved, checked closed bootstrap, BE
-MAC/BB/gain/RF/C2H owners and distinct N22P partial/N22W WLAN-only complete
-radio profiles. Separate response-bound N22O inactive-ring and no-link BE
-initialization is implemented; ordinary packet/station publication remains
-closed. N22P/N22W supply no ordinary packet authority.
-CYW43439 has a coherent whole-CS gSPI protocol/loader seam, with native
-attachment closed pending its actual exclusive host and signed selection.
-RTL8852A now has source-complete initial TSSI/channel RFK, own native MAC/
-RX/LTR startup and pre-station retune dispatch under fresh N5AM/N5ABv2/N5AC.
-Live retune and incomplete periodic adapters remain closed. DE's unsupported TX-report
-bits are removed; native Null-PM/ACK and software sleep remain closed.
+### Family state
 
-Explicit N48D/N65D manual antenna-sharing programs now retain actual local
-coexistence-off receipts and joint ownership across old/new IRQ, DMA and
-publication paths. AR9565 uses its own local MCI shutdown and group3 scanner;
-original MCI storage remains retained without claiming remote RF or DMA stop.
-Distinct optional N46P/N48P/N65P now compose actual native counter-driven ANI
-with original NF/IQ and stable publication ownership; P and S/D combinations
-refuse before effects.
-AE additionally has a distinct NASR2 HT20/SGI20 recipient-BA/A-MSDU path and
-NASR3 complete HT20/ASPM program. Old legacy/HT20 records cannot upgrade to
-ASPM, and source descriptor completion never substitutes for on-air ACK.
-Production-only x86_64 checks pass at intermediate boundaries. New native
-regressions are authored; **all test execution is deferred until the very end
-at the user's request**. These changes are not covered by the preceding
-4404-pass checkpoint. Broader chip profiles and the exact TSV residuals remain
-open; Aarch64 stays skipped and no new physical acceptance is claimed.
-
-The current source ledger moves the delivered RTL8723BE thermal program and
-rtlwifi coexistence feature to implemented-pending-validation: **11 open rows,
-96 implemented pending validation, 107 total**. Chip rows remain open when a
-narrow qualified profile leaves broader native functionality unfinished.
-
-The first parallel feature wave adds retained API77 Intel management-queue
-ADD/REMOVE behind the inactive PHY/TX-disabled peer (including the actual native
-eight-byte removal response), MT7921/MT7922 active scans with four directed or
-wildcard SSIDs and current per-channel power/NO_IR policy, and a distinct
-RTL8821CE factory/firmware/inactive-MAC owner. Gen2 active station TX and C21
-PHY/RF/station admission remained gated after that wave on their documented
-prerequisites.
-The common FullMAC path now exposes BCM43602 firmware-reported 2.4/5 GHz
-channels with confirmed firmware 20 MHz caps, correct D11AC primary decoding
-and native Open/WPA2 DHCP/IP coverage on channels36/149. CYW43439 remains
-2.4 GHz only. Shared NRGD NO_IR policies preserve passive discovery while
-closing host-initiated TX. The second wave below adds live shared FullMAC
-policy replacement/clear observation.
-
-The second parallel feature wave implements retained Intel API77 v5
-SET_CHAINS/SET_LINK power preparation with a signed exact-platform static
-SAR/antenna-gain qualification, fresh firmware channel permissions and current
-host limits. It enables no Gen2 station TX. MT76 now has bounded native
-hardware-deaggregated A-MSDU receive ownership, atomic subframe release and a
-single CCMP PN commit per complete MPDU, with inactive HT20 receive preparation;
-production HT/WMM negotiation, STA_REC/WTBL/RA, EDCA and QoS TX remain open.
-RTL8821CE now reaches inactive PHY-table preparation using its own MAC/BB/AGC,
-optional BTG AGC and SIPI RF-A tables, exact package/RFE/cut/path selection and
-retained filter snapshots; emitting calibration/radio/station remain gated.
-
-Native CYW43439/BCM43602 FullMAC owners now observe live shared regulatory DB
-replacement/clear, including every resume of native control futures, actual
-receipt/idle fences and packet admission. Missing policy, country change,
-channel/NO_IR/DFS denial or a lower ceiling than acknowledged firmware power
-poisons the one-shot owner, closes host admission and clears queued host TX.
-Looser same-country policy preserves the original acknowledged power; reinstall
-and stale events cannot reopen a failed owner. An intervening clear also defeats
-an in-flight signed bootstrap. This does not automatically follow revocation of
-a cached policy firmware capability, retract in-flight RF or prove autonomous
-firmware radio quiescence; uncertain DMA remains retained.
-
-Ath10k now supports directed and wildcard active discovery through its retained
-HTC/WMI/HTT owner on all six firmware dialects. The initial channel1–11 legacy20
-profile advertises sixteen SSIDs and requires current host policy plus the
-existing factory CTL/power bounds. Ordered domain, minimum band-power and
-per-channel half-dBm limits precede probes; every command/receive poll rechecks
-policy, and matching completion restores the entire receive-only channel list
-before publishing results. Rust packet and native CE models cover probe replies,
-SSID bounds, cancellation, policy restriction, failed terminals and active-cache
-Open/WPA2 DHCP/IP/teardown. Associated/off-channel scanning, broader PHY/bands,
-reset/rejoin and physical acceptance remain open.
-
-The ath10k scan continuation adds caller probe information elements to the same
-six-dialect owner. Its 256-byte firmware budget now reaches nl80211 discovery
-and pre-dispatch validation through a per-driver limit; complete element checks
-and immutable plan ownership precede I/O. Authored Rust packets check raw versus
-padded lengths, binary/maximal content and all six dialects, while native CE
-Open/WPA2 DHCP/IP conversations include extra probe elements. Invalid input stays
-retryable; cancellation or policy loss after publication retains DMA and closes
-the owner. This does not expand the initial PHY/channel profile.
-
-The parallel driver continuation now adds Intel API77 active-link/deactivation
-with source-matched response rates and fresh power/MCC receipts, while retaining
-the TX-disabled peer and management/data gates. Gen2 Qu prerequisites now use
-native header0 independently of their negotiated payload versions; Gen3 is
-unchanged. MT76 negotiates driver-owned WMM
-Information/Parameter IEs, programs native BSS/peer/WTBL QoS and CE EDCA, and
-carries BE/TID0 QoS through actual Open/WPA2 DHCP/IP. HT/aggregation stays gated.
-Live policy clear/restriction fails old MT76 scan/station grants across command
-waits rather than reloading policy into them.
-RTL8821CE advances from inactive PHY tables through an exact-board signed
-calibration-only envelope, channel1/20 setup and real firmware IQK receipts;
-operating power/radio/station still need their separate grants. RTL8822CE's
-actual reserved backend now completes radio preparation through an explicit
-Continued lifecycle state, including failure/cancellation coverage.
-
-Ath10k manual recovery parks all CEs and verifies BME disable before scheduling
-fresh chip reset, authenticated ROM provisioning and a new runtime/interface.
-Retirement tokens, unique TX cookies and reserved old names fence cancelled
-control and late publication; old physical Drop cannot touch its successor.
-All old firmware/CE/WMI/HTT mappings remain pinned, with three attempts per boot
-bounding retained generations. Automatic/stable-interface recovery, DMA
-reclamation, broader PHY features and physical reset/RF acceptance remain open.
-
-The next parallel wave advances all eleven families: Intel Gen2 native Open
-authentication with acknowledged peer re-disable; ath11k physical PDEV power
-readback with reset/query fencing; MT76 response-bound HT20 MCS0–7 long-GI and
-bounded A-MSDU receive admission; AR9285 directed/wildcard active discovery;
-and ath10k six-dialect native station power-save intent before carrier.
-CYW43439/BCM43602 add firmware-owned WPA2 AP-required PMF with native capability,
-peer and association-RSNE readback, public cipher exposure and explicitly gated
-nl80211 PMK CONNECT admission. RTL8188EE, RTL8188EU and qualified RTL8852B
-add native response-bound WMM BE/TID0 QoS; the shared formatter constructs the
-QoS header before CCMP and preserves the installed key's TX packet-number
-sequence. RTL8821CE IQK now uses fresh hardware thermal conversions and a new
-signed recipe identity. Narrow PHY/security contracts and retained terminal
-ownership remain explicit in each family spec. Hardware acceptance and the
-remaining software ledger are still open.
-
-The combined selected Wi-Fi/shared-fixture QEMU gates pass 1848 / 0 fail / 9 skip
-on x86_64 and 1381 / 0 fail / 3 skip on aarch64, with clean production boots
-and btrfs postflights. Scoped production/kernel-test Clippy and workspace
-formatting pass; default release and debug kernels build on both architectures.
-This continuation adds 58 passing smokes on x86_64 and 54 on aarch64; four
-native ath11k physical-transport integration cases are x86_64-specific. Native
-PMF tests include real nl80211 parsing/dispatch through both FullMAC transports,
-with unsupported capability and additional-security requests rejected before I/O.
-Native Rust tests cover the queue and v5 power ABIs, active scan requests/power
-ordering, bounded A-MSDU conversion and C21 factory/MAC/PHY behavior using fixed
-reference data and explicit ownership invariants. D11AC coverage uses exhaustive
-geometry/round-trip checks and literal channel/sideband cases. The second wave adds 31 passing
-smokes on each architecture, including native control-credit policy changes,
-partial aggregation/replay cleanup and retained C21 DMA ownership. The payload catalog
-now contains 45 profiles across all eleven families, including the actual
-139472-byte RTL8821CE image; 15 required fixed payload entries remain absent.
-These are software/source/asset checks and do not establish physical acceptance
-or full hardware-feature completion.
-
-The subsequent continuation adds native Gen2 legacy association, ath11k sibling
-channel-reservation recovery, MT76 HT40/SGI and actual FullMAC HT20/SGI readbacks.
-AR9285 now has negotiated legacy rates, native four-series retries and adaptive
-terminal DATA feedback; ath10k admits fixed-country non-DFS 5-GHz legacy station
-and mixed-band active scanning across all six dialects. RTL8188EE/EU and
-qualified RTL8852B gain response-bound legacy DATA rates; RTL8821CE gains parked
-post-IQK operating-power preparation, with no station transmit grant.
-The combined Wi-Fi/shared-fixture suites pass 1887/0 fail/9 skip on x86_64 and
-1417/0 fail/3 skip on aarch64 with clean production boots and btrfs postflights.
-Scoped production/kernel-test Clippy, workspace formatting and release/debug
-builds pass on both architectures. The wave adds 39 passing x86_64 smokes and
-36 on aarch64; three native ath11k recovery cases are x86_64-specific.
-
-The following wave adds retained native Gen2 Open data ownership with DCF/TLC,
-TID0 DMA and receipt-fenced teardown, while automatic PCI/netdev/WPA2 keys remain
-gated. MT76 gains bounded recipient BA/reordering and ordered key retirement;
-native rekey tests also corrected KEY_V2 tag17/install0/remove1 ABI fields.
-Ath10k gains response-bound WMM/QoS and policy checks across native station and
-RSNA waits. RTL8821CE reaches native Open/WPA2 kernel DHCP/IP through its original
-reserved-DMA owner and distinct signed full-static thermal/power qualification.
-Real measured deployment assets and RF acceptance are still required.
-The wave adds 39 passing smokes per architecture: combined Wi-Fi/shared-fixture
-suites pass 1926/0 fail/9 skip on x86_64 and 1456/0 fail/3 skip on aarch64.
-Production boots/btrfs postflights, scoped production/kernel-test Clippy,
-workspace formatting and release/debug builds pass on both architectures.
-
-The next continuation adds native Gen2 WPA2 keys, authenticated EAPOL/M4
+**iwlwifi.** Gen3 (Sc/BE211) runs the MLD station: exact command/queue
+receipts, retained executable/PNVM authority, native scan/MLME/keys,
+EMPTY-marker receive epochs, encrypted data and rekeys, and versioned
+coexistence, SoC-latency and awake-power setup. Gen2 (API77, AX200/AX201)
+has a retained context-v1/RFH/TFH boot owner (APM, ALIVE6, unified NVM, MVM
+post-init); passive and active scans under current signed host policy and
+fresh MCC/LAR; management-queue ADD/REMOVE; v5 SET_CHAINS/SET_LINK power
+preparation under a signed exact-platform static SAR/antenna-gain
+qualification; and active-link/deactivation with fresh power/MCC receipts.
+Its station covers Open and WPA2 association with authenticated EAPOL/M4
 receipts, RX-epoch fencing, encrypted data and rekeys with key-before-queue
-retirement. Automatic Gen2 PCI/netdev publication remains gated. FullMAC
-HT40/SGI40 now requires actual firmware capability/inventory, negotiated AP
-facts and current power authority for both occupied channels, with 20 MHz fallback.
-RTL8822CE gains distinct signed N22L WMM/legacy-DATA-rate qualification and
-current source/PCI checks around final carrier and host-frame publication;
-RTL8821CE keeps its separate legacy grant. Shared native Intel test owners now
-live on the heap to bound nested aarch64 fixture construction. These advances
-remain software evidence; genuine assets, firmware/RF acceptance and the
-all-family feature backlog remain required.
+retirement; WMM/HT20/SISO through EDCA/peer/TLC with QoS CCMP;
+firmware-deaggregated and nested RX A-MSDU-in-A-MPDU; BA/pipelining; and
+GTK reconnect history. Exact API77 PCI discovery connects to the retained
+native station worker through kernel DHCP and ordered local retirement.
+Qu prerequisites use native header0 independently of their negotiated
+payload versions. EAPOL outer protocol versions 1–3 are accepted with exact
+WPA2 descriptor, MIC, replay and no-reinstall checks. Host nonces and SAE
+use fallible hardware entropy; validated M1 renewal alone requests a fresh
+SNonce. Full system entropy-pool/health services remain open.
 
-This wave adds 39 passing smokes per architecture: combined Wi-Fi/shared-fixture
-suites pass 1965/0 fail/9 skip on x86_64 and 1495/0 fail/3 skip on aarch64.
-Production boots/btrfs postflights, scoped production/kernel-test Clippy,
-workspace formatting and release/debug builds pass on both architectures.
+**mt76 (MT7921/MT7922).** The firmware and control path is described above.
+Built in, the station runs legacy/HT20/40 on 2.4 and 5 GHz and 5-GHz
+VHT20/40/80, with VHT MCS8 at 20 MHz and MCS9 at 40/80/160 MHz. Contiguous
+160 MHz requires an actual `MT_HW_CHIPID` 0x7922 plus checked NIC facts and
+domain/SKU/power grants for all eight occupied channels; PCI aliases and the
+opaque NIC max_bw byte grant no 160. One or two RX/TX streams follow
+NIC/AP qualification, with directional LDPC, one-stream RX STBC and HT
+greenfield. Driver-owned WMM IEs program native BSS/peer/WTBL QoS and EDCA;
+valid AP WMM contention updates pause new DATA until old native tokens
+drain. Recipient BA keeps exact negotiated windows 1–64 through 12-bit
+wrap. Hardware-deaggregated A-MSDU and A-MSDU-in-A-MPDU receive commit one
+CCMP PN per complete MPDU after reorder. TID0 transmit BA uses real ADDBA
+and WTBL/STA receipts. Active scans carry up to four directed or wildcard
+SSIDs and complete optional Probe Request elements in the native 600-byte
+field, under current per-channel power/NO_IR policy; per-request MAC
+randomization uses fallible secure host entropy and keeps passive NO_IR.
+Receive batches carry station/key epochs through kernel callbacks and IPC
+publication, and the RSNA owner keeps ordinary RX/TX and BA setup closed
+between a replacement M2 and M3 until actual M4/key receipts. AP, P2P,
+monitor, WoW and system PM are in the built-in driver
+(`drivers/wireless/specification/mt7921.md`). MT7925 (CONNAC3) UNI, MLO
+and KEY_V3 code is in the same crate, but the probe's chip-id gate still
+refuses MT7925 silicon (`drivers/wireless/mt76/src/mt7925.md`). Open: TX
+A-MSDU, a complete late firmware/MAC/FIFO key-retirement proof and wider
+PHY/role work.
 
-The [per-chip inventory](drivers/wireless/research/chip-inventory.md) audits all
-102 registered bus identities. Tokei measures 316,060 Rust code lines including
-tests/tables in the specified scopes, compared with 1,177,080 C/header lines in
-broader local Linux driver and mac80211/cfg80211 directories. These are footprint
-counts, not completion percentages. Initial remaining-LOC forecasts were
-withdrawn after review found overlapping work; a delivery date remains uncalibrated.
+**ath11k.** WCN6855 is described above. QCA6390 uses its native IPQ8074 RX
+descriptors and four-vdev resources. Native PDEV power readback has
+reset/query fencing, and sibling channel reservations recover. The driver
+waits for its complete AMSS/M3/signed-board bundle before MHI power-up.
+Large runtime/netdev state and AHB bring-up/recovery futures live on the
+heap. QCN9074, WCN6750 and IPQ6018 are implemented pending validation;
+IPQ5018 and IPQ8074 are open rows.
 
-The next feature checkpoint connects exact API77 Gen2 PCI discovery to the
-retained native station worker, passive scan, Open/WPA2 DHCP/IP, rekeys and
-ordered local retirement with current firmware/power/PCI/generation fences.
-Scan freshness conservatively starts before native publication. MT76 adds
-fresh-peer TID0 transmit BA with real ADDBA and WTBL/STA receipts, eight owned
-packets with separate DMA/TX-free proofs, refusal fallback and key/BA retirement.
-RTL8821CE adds distinct measured N21L legacy-rate/WMM qualification through
-its original C21 radio and reserved DMA. Ath10k adds response-bound HT20,
-native RX BA/PPDU ownership and reorder before PN, bounded authenticated
-A-MSDU receive and final current-policy/port publication checks.
-Shared Rust A-MSDU and opaque reorder owners preserve the default receive
-contracts and make whole-aggregate validation, sequence wrap/BAR/hole expiry
-and receive-epoch retirement reusable. These are software advances; the
-all-chip/all-feature inventory and real assets/firmware/RF acceptance remain open.
+**ath10k.** One retained HTC/WMI/HTT owner serves all six firmware dialects:
+owned CE/BMI firmware/BDF/OTP, PLL and code-swap preparation, versioned WMI
+service-ready/host-memory/INIT/READY, HTT RX buffers and native
+TX/management completion. Firmware, board/extended-board, per-MAC
+calibration and regulatory checkpoints wait without repeating completed
+ROM/PLL/OTP work. Passive and active scans (sixteen SSIDs, caller probe
+elements within the 256-byte firmware budget, mixed-band) require current
+host policy and the factory CTL/power bounds; every command and receive
+poll rechecks policy. Station context intersects immutable factory
+regulatory limits with authenticated host policy and an observed BSS. The
+RAW-capable, non-PFC station composes shared host RSNA/CCMP with exact HTT
+delivery receipts (M4 waits for its HTT receipt), netdev attachment, kernel
+DHCP and connection-loss closure. It adds response-bound WMM/QoS, HT20,
+HT40 with independently gated SGI40, RX BA/PPDU ownership with reorder
+before PN, bounded authenticated A-MSDU receive, fixed-country non-DFS
+5-GHz operation and station power-save intent before carrier. RAW transmit
+aggregation is capped at one MPDU. Terminal teardown drives native
+DOWN/DELETE, every sparse-ID UNMAP and STOP/STOPPED with receive
+quiescence, and retains DMA. Recovery parks all CEs and verifies BME
+disable before a fresh chip reset, authenticated ROM provisioning and a new
+runtime/interface; retirement tokens, unique TX cookies and reserved old
+names fence cancelled control and late publication, and three attempts per
+boot bound the retained generations. AP, P2P, PFC, VHT160, WoW, DFS client,
+hardware keys, credential replay after recovery and DT/NVMEM calibration
+are implemented pending validation.
 
-This checkpoint adds 93 passing smokes per architecture: selected Wi-Fi/shared
-fixtures pass 2058/0 fail/9 skip on x86_64 and 1588/0 fail/3 skip on aarch64.
-Production boots and both btrfs postflights, scoped production/kernel-test
-Clippy, workspace formatting and release/debug builds pass on both architectures.
+**ath9k.** AR9285 programs PHY/PLL/RF INI, EEPROM modal and PDADC tables;
+factory CTL edges and target power bound the rate-power registers.
+Signed-policy calibration composes SerDes, synth settling,
+AGC/carrier-leakage retry, PA, noise-floor and IQ correction, checked
+against original Linux C traces and IQ vectors. The station continues
+through native MAC/PCU, cleared hardware keys and 32-bit non-EDMA packet
+rings into shared MLME, RSNA/CCMP and the kernel DHCP client, with
+negotiated legacy rates, four-series retries, adaptive DATA feedback,
+directed/wildcard active discovery, HT20 MCS0–7, recipient BA, RX STBC1,
+RTS/CTS and a separately qualified two-MPDU sender BA with BAR recovery.
+AR9285 operates on admitted channels 1–13 with cold retuning. AR5416,
+AR9160, AR9280, AR9287, AR9300 and AR9580 are implemented pending
+validation. AR9462 and AR9565 apply profile GPMs through live MCI duty
+deadlines (weights/priorities, 5-GHz suppression, reset/WoW/stop
+cancellation) and associated-beacon audio coexistence feedback. AR9462 adds
+NETWORK_SLEEP/PM-control/DTIM; AR9485 adds canonical PCI board settings and
+a retained RX antenna scanner; explicit N48D/N65D manual antenna sharing and
+optional N46P/N48P/N65P counter-driven ANI are separate qualifications.
+Those three chips remain open rows.
 
-Shared typed HT/VHT admission now binds membership requirements and directional
-MCS/GI limits to the original BSS and one atomic association response. Intel
-Gen2 adds native WMM/HT20/SISO through response-bound EDCA/peer/TLC, QoS CCMP,
-staged firmware-deaggregated A-MSDU and actual ADDBA declines. Its distinct
-emission tag 2 qualification cannot reuse the preceding legacy-only power record.
-MT76 adds 5 GHz VHT20/40/80 with four-channel policy/power receipts, native VHT
-records, coherent width retuning and the existing TX/RX BA and packet owners.
-RTL8821CE/RTL8822CE add separately qualified HT20, exact chip gain/readback
-paths, native PHY-status checks before crypto, authenticated A-MSDU up to 3839
-bytes and per-callback receive-epoch fencing across rekey. Shared nl80211
-cache and connection-owner lifetimes distinguish replacement netdev identities
-and socket-owner grants, including delayed control work and socket release.
-Native Rust conversations
-exercise Open/WPA2 DHCP/IP; real qualification assets, firmware/RF acceptance
-and the broader all-family software ledger remain required.
+**rtlwifi.** RTL8188EE runs from its firmware owner (`rtl8188efw.bin`)
+through LLT, linked TX/RX rings, complete MAC/BB/AGC/RF tables and 1T
+IQK/LCK. Its channel/power owner binds factory EFUSE/PG indices to an
+authenticated exact-board curve, current host policy and the Linux EE world
+ceiling. A polled packet core, firmware power-mode/mailbox and reserved
+beacon support shared MLME/RSNA/CCMP and kernel DHCP. Response-bound WMM
+BE/TID0 QoS, legacy DATA rates, separately qualified HT20/LGI MCS0–7,
+bounded A-MSDU and native ADDBA refusal extend it. RTL8723BE has native
+CFO/linked ATC, EDCA turbo, separately qualified BBSWING thermal tracking,
+async special-frame preflight and its own ASPM recipe; RTL8821AE has
+distinct one-/two-antenna coexistence algorithms. RTL8192CE/EE, RTL8723BE,
+RTL8821AE, 5 GHz, VHT and WoWLAN rows are pending validation; RTL8192DE and
+RTL8723AE are open rows.
 
-This continuation adds 88 passing smokes per architecture. Selected Wi-Fi/shared
-fixtures pass 2146/0 fail/9 skip on x86_64 and 1676/0 fail/3 skip on aarch64.
-Production boots and both btrfs postflights, scoped production/kernel-test
-Clippy, workspace formatting and release/debug builds pass on both architectures.
-The native MT76 channel-switch command now encodes receive-chain count while
-RLM retains its mask; literal and retained-control tests cover their distinction.
+**rtl8xxxu.** RTL8188EU keeps a retained factory/FIFO/firmware/MAC/BB/RF/LLT
+and LC/IQK worker and a persistent native packet receipt/stop owner. Signed
+exact-board calibration gates native transmit gains and MAC TX activation;
+missing qualification keeps TX closed. The channel-1 station service
+composes USB management/data, authentication/association, RSNA and CCMP
+with Narf-Rings and kernel DHCP; the exact terminal M4 receipt precedes
+key/port commit. Response-bound WMM and legacy DATA rates and a separately
+signed N8HT HT20/LGI MCS0–7 profile with whole RX A-MSDU extend it. The
+shared host CCMP/RSNA owner lives in `wireless`; RTL8188EU keeps
+compatibility re-exports. Reset/rejoin generations, broader channels/rates
+and PMF remain open; RTL8192EU, RTL8723BU and the rtw88-driven RTL8821CU and
+RTL8822BU are pending validation.
 
-The `codex/wifi-aggregation-next` checkpoint passed the coordinated Wi-Fi
-suites: x86_64 2317 pass,0 fail,9 skip; aarch64 1847 pass,0 fail,3 skip.
-The selected scope is `drivers/wireless,wireless,verification/wifi-fixtures`.
-Production boots and both btrfs postflight checks were clean on each
-architecture. Debug/release builds, strict production/test Clippy, exact CI
-feature-context Clippy, workspace formatting and whitespace checks passed.
-MT76 code now extends VHT to
-MCS8 at20MHz and MCS9 at40/80/160MHz, actual NIC RX1/2 with TX1 and the matching
-HT receive companion, directional LDPC and one-data-stream receive STBC.
-Contiguous160 is gated by actual MT_HW_CHIPID0x7922 plus checked NIC facts;
-native domain/SKU/power grants retain all eight occupied channels. Revised
-and deprecated AP encodings, truthful primary80 fallback and response retune
-are implemented, with native Open/WPA2 RX2/BA/nested-A-MSDU DHCP/IP vectors
-passing in those suites. PCI aliases and the opaque NIC max_bw byte grant no160.
-Recipient BA now retains exact negotiated windows1–64 with independent
-sequence slots through12-bit wrap, including non-power-of-two sizes.
-Recipient A-MSDU-in-A-MPDU now binds the actual request/native STA/response
-bit, whole native assembly and post-reorder PN; the shared aggregate parser
-supplies atomic subframe and VLAN control-port checks before delivery.
-Active scanning now carries complete optional Probe Request elements in the
-native600-byte field with preflight and the existing power/cancellation owner.
-Per-request scan randomization resolves the source-defined mask with fallible
-secure host entropy while preserving the original station MAC and passive NO_IR.
-MT76 receive batches now carry current station/key epochs through unlocked
-kernel callbacks and serialized IPC publication, retiring stale batches and
-receive queues across key service and peer/transport replacement.
-Native normal/forwarded copies now retain their original epoch and port
-admission through command/TX waiters and a bounded completed-ring prefix.
-The RSNA owner keeps ordinary RX/TX and BA setup closed between replacement
-M2 and M3 until actual M4/key receipts. The direct async receive API also
-rechecks its original epoch after key service. Native software vectors pass;
-a complete late firmware/MAC/FIFO key-retirement proof remains separate work.
-Native records preserve scan/response directional bounds and width-specific
-mandatory maps; RX metadata is checked before replay-PN commit. Shared typed
-PHY constructors retain default-off optional coding for other drivers.
-The shared software security formatter now retains sixteen independent QoS
-sequence counters and a checked non-consuming SSN sample, separate from
-non-QoS/EAPOL sequences and the shared monotonically increasing key PN.
-An explicit shared BlockAck-policy A-MSDU entry preserves the original CCMP
-header and whole-aggregate PN transaction after native BA/reorder proof;
-default aggregate methods retain their stricter normal-ACK profile.
-The preceding green totals describe earlier merged checkpoints. The Intel
-milestone now includes Gen2 native BA/pipelining,
-retained GTK reconnect history, exact Gen3 command/queue receipts, retained
-executable/PNVM authority and native EMPTY-marker receive epochs. C21/C22
-recipient BA and separately qualified four-slot transmit BA/pipelining pass
-the same native software suites. AR9285 HT20, recipient BA, directional
-RX STBC1 and native RTS/CTS protection are covered too; transmit aggregation
-and wider profiles remain open. Peer review closed stale direct receive and
-IPC-queue paths across native key-owner replacement, plus terminal handling
-of lost notification prefixes. Family specifications retain the exact
-chip, source, qualification and remaining-feature contracts.
-These changes do not close the all-family feature
-ledger or establish physical acceptance.
+**rtw88.** RTL8822CE retains an authenticated section-firmware attempt
+through all-ring-owned beacon reserved pages and IDDMA, then MAC/LLT/FIFO,
+logical EFUSE and protected OTP, the firmware hardware-feature response,
+source-selected BB/AGC/RFK/RF tables and a signed exact-board power
+qualification, fresh DACK/IQK and H2C. TXBD consumption plus the matching
+CCX ACK and DMA bytes gate security replies. RTL8821CE runs from its
+factory/firmware/MAC owner through PHY tables, an exact-board signed
+calibration envelope, firmware IQK with fresh thermal readings and a
+distinct signed full-static thermal/power qualification to Open/WPA2 kernel
+DHCP over its original reserved-DMA owner. Both chips
+add separately qualified WMM/legacy rates, HT20, recipient BA, four-slot
+sender BA and RTS threshold control. No measured gain curve or transmit
+permission is inferred from factory indices. 5 GHz, HT40, VHT, LPS, WoW,
+reset/rejoin, RTL8822BE and the other rows are pending validation.
 
-The following same-branch continuation passed the coordinated Wi-Fi suites:
-x86_64 2360 pass,0 fail,9 skip; aarch64 1890 pass,0 fail,3 skip, adding43 native
-smokes per architecture over `3fbdfa9c2`. Debug/release builds, strict
-production/test and exact CI feature-context Clippy, workspace formatting,
-provisioning diagnostics, both production boots and all four btrfs postflights
-passed. Intel Gen2 adds separately qualified nested RX A-MSDU-in-A-MPDU with
-whole-original bundle reorder before PN admission. C21/C22 add separately
-qualified native RTS threshold control with CCX/FIFO ownership and EAPOL
-exclusion. AR9285 adds qualified two-MPDU sender BA, exact native tail bitmap
-receipts, original ciphertext retries and BAR recovery through actual native
-TX status. MT76 retains valid AP WMM contention updates, pauses new DATA until
-old native tokens drain, and orders EDCA through its checked PSE read before
-resuming the existing peer/key/BA owners. Open/WPA2 DHCP/IP, cancellation,
-current authority and key transitions pass native Rust cases. Real measured
-qualification records, physical acceptance and the broader feature ledger
-remain open. Tokei15 measures4,767 net additional Rust code lines, including
-tests, across `drivers/wireless`, `wireless` and `verification/wifi-fixtures`;
-the total rises from364,095 to368,862. These counts are not a completion fraction.
+**rtw89.** RTL8852B composes AX firmware selection, cold power/DDV,
+fuse-selected download plans, the WCPU loader, BDRAM, DLE/HFC and AX PCIe
+policy (checked against original Linux C cases), post-WCPU SCC MAC setup,
+36-bit RXBD/RPQ/C2H ownership, RF table H2C uploads, NCTL/RCK/DACK/RXDCK and
+IQK/TSSI/DPK with exact source power under a signed measured v2 envelope.
+Peer controls, BE/MGMT packet rings, host RSNA/CCMP and kernel DHCP follow.
+Generic probe uses FLR before cold discovery; the platform entry requires an
+independently verified temporal reset handoff. The first profile is awake
+and polled on channel 1/20 MHz, TX-A/RX-AB; separately qualified WMM
+BE/TID0, native EDCA and legacy DATA rates extend it. Other AX/BE profiles
+keep diagnostic storage without activating rings, IRQs or a NIC. RTL8851B,
+RTL8852C and the RTL8852B wide-channel, 5/6 GHz, sleep and WoW rows are
+pending validation; RTL8852A, RTL8922A and EHT are open rows.
 
-The new `codex/wifi-feature-completion` branch continues from merged PR#1090
-(`267146076`). Its validated software checkpoint adds ath10k HT40 with retained
-firmware/BDF authority and native protection, separately qualified RTL8188EE
-HT20, BCM43602 VHT80 with final receive-publication fences, and MT76 actual
-NIC/AP-qualified TX2 with full native rate maps, RF/RLM setup and conservative
-power headroom. Shared native PHY snapshots preserve original offer/response
-limits. Native Rust cases and existing Open/WPA2 DHCP/IP compositions pass:
-x86_64 2419/0 fail/9 skip; aarch64 1949/0 fail/3 skip, adding59 smokes per arch.
-All-family feature completion and physical acceptance remain open.
+**brcmfmac and cyw43439.** BCM43602 connects explicit board-selected
+CR4/msgbuf transport to the common FullMAC station, with signed exact-host
+board selection, retained asset staging and generation-safe flow-ring reuse
+after delete acknowledgment. It exposes firmware-reported 2.4/5 GHz
+channels, decodes D11AC chanspecs, and admits HT40/SGI40 and 5-GHz VHT80
+only with actual firmware capability/inventory, AP facts and power
+authority for every occupied channel. CYW43439 connects standard PCI SDHCI
+PIO enumeration or an explicit platform card through trusted
+firmware/NVRAM/CLM loading, mailbox/F2 control, scan, Open/WPA2 and bounded
+RX/TX; it is 2.4 GHz only. Both transports implement required and bounded
+optional PMF WPA2 and firmware station power save. Native owners observe
+live shared regulatory replacement or clear: missing policy, a country
+change, channel/NO_IR/DFS denial or a lower ceiling poisons the one-shot
+owner, closes host admission and clears queued host TX. Association fences
+host port publication on a zero-consumption FIFO/completion-ring poll.
+Optional PMF with an MFPC AP that omits the response RSNE stays open.
+CYW43439 board clocks/pins/regulators and the gSPI host remain open;
+other brcmfmac chips, AP, P2P, monitor, WoWL and the CYW43439
+reset/PM rows are pending validation.
 
-Debug/release builds, strict production/test and exact CI feature-context
-Clippy, workspace formatting, metadata diagnostics, both production boots
-and all four btrfs postflights pass. Tokei15 measures6,859 net additional
-Rust code lines, including tests, across `drivers/wireless`, `wireless` and
-`verification/wifi-fixtures`:368,862 to375,721. No binary assets were added.
+### Shared components
 
-The same-branch continuation adds independently gated ath10k SGI40, separately
-signed RTL8188EU HT20/LGI MCS0–7 with whole RX A-MSDU, directional MediaTek HT
-greenfield/native mode3, and bounded CYW43439/BCM43602 optional-PMF CONNECT.
-Native request/response, actual executable/factory/program authority, occupied
-power, key/replay and final receive-publication checks remain mandatory.
-Optional PMF with an MFPC AP omitting response RSNE remains open until a genuine
-native negotiated-state proof exists. Wider software features and physical
-qualification remain open.
+- `wireless` holds the host CCMP/RSNA key, PN/replay, no-reinstall and
+  terminal-M4 owner; typed HT/VHT admission bound to the original BSS and
+  one atomic association response; the legacy join plan, which intersects
+  response rates with the offered set and keeps beacon-mandatory rates;
+  reusable A-MSDU and opaque reorder owners; and the software security
+  formatter with sixteen independent QoS sequence counters.
+- Passive-only wiphys advertise `NL80211_ATTR_MAX_NUM_SCAN_SSIDS = 0`,
+  reject active SSID lists at `TRIGGER_SCAN` and scan passively on
+  `CONNECT` cache misses. Intel (20) and ath10k/ath11k/FullMAC (16)
+  advertise their active probe limits. nl80211 cache and connection-owner
+  lifetimes distinguish replacement netdev identities and socket owners.
+- Removed interfaces retire their IPv4 address, gateway and DNS bindings,
+  so a reused name starts clean. Intel, RTL8188EU and the FullMAC drivers
+  repeat carrier closure under the device state mutex during disconnect.
+- The regulatory bootstrap (`wireless/src/reg/policy.rs`) loads a signed
+  deployment policy, `wireless-regulatory.bin`, when one is staged; only its
+  absence selects world `00` from the Linux database authenticated at image
+  build. A malformed, unsigned or inaccessible policy never falls back.
+  Built-in drivers read this database directly; modules read the installed
+  domain through `narf_wireless_regdomain`.
+- `wireless::register_initcalls()` installs the bootstrap
+  `trusted_net_authority` before `Stage::Device` probes. iwlwifi, cyw43439,
+  brcmfmac, ath9k, rtlwifi (RTL8188EE) and rtw88 (RTL8822CE) retry
+  provisioning from their parked checkpoints with `drive_scheduled` (120
+  attempts at 500 ms) and resume from completed radio/PHY preparation.
+- USB keeps published address/configuration/control/bulk DMA, checks slot
+  generations and fences the supported bulk profile with Stop/Set-Dequeue;
+  halt/reset/replug and broader reclamation remain open. Scoped native PCIe
+  PHY/DBI operations give bounded MDIO/RAC access.
 
-All45 new native/shared smokes pass on each architecture. ARM's complete selected
-scope passes1994/0 fail/3 skip. X86 has2464 distinct passing cases and9 skips
-across the complete scope and affected-family reruns: three fixture failures
-were corrected without weakening production gates, including actual old-key
-CCMP and proposed-key MIC verification during USB rekey. Both production boots,
-all four btrfs postflights, both-architecture debug/release builds, strict
-production/test and CI-context Clippy, formatting and metadata diagnostics pass.
-Tokei15 measures4,427 net additional Rust code lines including tests in the same
-scope:375,721 to380,148 across855 Rust files. No binary assets were added.
+### Firmware and provisioning
 
-The preceding station power-save continuation added ordinary firmware station power save to the
-common CYW43439/BCM43602 owner. PM_FAST/PM_OFF and the default sleep-retention
-commands are serialized with station control; partial failure or cancellation
-closes packet admission without releasing uncertain DMA. Seven new native
-power-save smokes cover both transports, and the existing Open/WPA2 DHCP/IP
-conversations run with power save enabled. Its initial all-family wireless
-and shared-fixture QEMU suites passed: x86_64 1672 pass / 0 fail / 9 skip;
-aarch64 1209 pass / 0 fail / 3 skip. These remain software checks; actual
-power/DTIM behavior and system suspend/wake need their separate acceptance.
-The PS/disconnect-overlap regression also passed the focused FullMAC
-suites (x86_64 168 pass / 0 fail / 1 skip; aarch64 115 pass / 0 fail / 0 skip):
-an older firmware power receipt cannot reopen host admission closed by disconnect.
-The provisioning catalog now names the current EE/8822CE/8852B measured board
-artifacts and B reset handoff. Its local audit covers 44 profiles across all
-eleven families, with 15 required fixed payload entries absent (12 Intel and
-three CYW43439); payload presence does not establish signing/board qualification.
+`cargo xtask wifi-firmware` audits the payload catalog
+`verification/data/wifi-firmware/profiles.json` (47 profiles across all
+eleven families) against the local firmware tree and fails when a required
+fixed-name payload is missing; payload presence is not signing or board
+qualification. The importer preserves board NVRAM text, maps flat Intel
+names onto canonical registry keys, bounds raw and zstd input and resolves
+duplicate aliases deterministically. See
+[the firmware evidence and provisioning guide](verification/data/wifi-firmware/README.md).
+Signed board calibration, policy and exact board/PNVM matching are separate
+gates.
 
-Intel now sends versioned coexistence, SoC latency and awake-power setup.
-A retained Gen2 context-v1/RFH/TFH boot owner now covers APM, ALIVE6, unified
-NVM and MVM post-init configuration. Its API77 passive-scan owner now composes
-current signed host policy, fresh MCC/LAR, conditional DQA, versioned MAC/link
-receipts and scan15 channel records; automatic Gen2 station admission remains
-gated. An inactive PHY/link owner now checks receive-channel policy, programs
-the API77 PHY/RLC commands and requires acknowledged unbind/remove before reuse.
-A subsequent retained AP-peer owner validates current receive policy/MCC, emits
-the exact API77 TX-disabled legacy station entry and requires native ADD status
-and REMOVE receipt before identity reuse. It keeps packet queues, keys and
-active station admission closed.
-Host nonce and SAE paths require fallible hardware entropy instead of
-the old timing seed; validated RSNA M1 renewal alone requests a fresh SNonce.
-Full system entropy-pool/health services remain open.
-Its retained maintenance work progresses through synchronous packet service;
-stalled TX credit no longer prevents RX and cancelled waiters retain EAPOL work.
-MT76 retains cancelled work through bounded WFSYS reset, firmware reload and
-radio reinitialization, without replaying association or keys. Its coherent
-PCI backend and ownership models now build on x86_64 and aarch64; unsupported
-per-domain IOMMU mapping remains rejected. Its legacy 2.4/5 GHz path now binds
-RX to the selected channel, carries band-specific firmware settings, selects
-the AP basic TX rate and checks optional SME association/security IEs.
-CYW43439 now connects standard PCI SDHCI PIO/card enumeration or an explicitly
-supplied platform card through trusted firmware/NVRAM/CLM loading, mailbox/F2
-control, scan, Open/WPA2 and bounded RX/TX. Board clocks/pins/regulators, gSPI
-host support and reset/reload/PM remain software work. Qualcomm ath10k reaches
-owned CE/BMI firmware/BDF/OTP, PLL and code-swap preparation, retained HTC
-runtime and versioned WMI service-ready/host-memory/INIT/READY, followed by
-retained HTT RX buffers and native TX/management completion. A retained WMI
-radio session now performs correlated passive scans across six dialects while
-servicing HTT completions. Station-context preparation now intersects immutable
-factory regulatory limits with authenticated host policy and an observed BSS,
-then waits for correlated vdev-start and sparse HTT peer-map completion.
-Initial Open authentication/association exchanges now use the actual dialect's
-inline WMI, retained referenced WMI or HTT management path, with peer-bound RX
-and bounded progress under unrelated-event floods. Shared JoinPlan now drives
-native PEER_ASSOC/VDEV_UP and rejects queued peer loss before reporting success.
-Response-negotiated legacy rates now reach native PEER_ASSOC. Terminal station
-teardown drives native DOWN/DELETE, every sparse-ID UNMAP and conditional TLV
-delete ACK, then STOP/STOPPED with receive quiescence. Even confirmed teardown
-retains DMA and stays closed until a future full reset/generation owner.
-A RAW-capable, non-PFC legacy station owner now composes descriptor/peer/TID
-admission, shared host RSNA/CCMP, exact native HTT delivery receipts and
-bidirectional Ethernet/IP across all six dialects. Firmware RAW INIT and
-A-MSDU1 are required before software crypto; opaque native-WiFi RX is not
-treated as ciphertext. The same retained native owner now implements bounded
-synchronous CE/HTC/HTT packet progress, netdev attachment, kernel DHCP and
-connection-loss closure. All six dialects compose Open/WPA2 with a reactive
-AP through a real lease and exact bidirectional IP. Current signed policy is
-resampled before control and packet progress; tightening or removal closes
-the initial profile permanently. Publication is serialized with terminal
-closure, while M4 waits for its exact HTT receipt rather than CE consumption.
-PFC, broader RX/security profiles and reset/rejoin remain separate follow-ups.
-Ath9k programs AR9285 inactive PHY/PLL/RF INI, EEPROM modal and PDADC detector
-tables with current-capability register access. Factory CTL edges and target
-power now bound the rate-power registers under an explicit zero-dBm ceiling.
-Native legacy20 mode/timeouts, single-chain masks, delta slope and EEPROM
-spur filtering now match 48 original Linux C traces after full INI setup;
-signed-policy channel1 calibration now additionally composes SerDes, synth
-settling, AGC/carrier-leakage retry, PA, noise-floor and IQ correction. Thirty-two
-original Linux C traces and 35 IQ vectors cover that sequence; per-access
-failures, deadlines, cancellation and revocation leave the same retained
-attempt closed. The same AR9285 owner now continues through native MAC/PCU,
-cleared hardware keys and 32-bit non-EDMA packet rings into shared MLME,
-RSNA/CCMP, a retained Device and the actual kernel DHCP client. Open/WPA2
-conversations check exact IP, native M4 bytes/receipt, genuine RX-idle fencing,
-publication/close races, current policy, factory RF-silent GPIO and retained
-DMA after terminal failure. Seventy-two fixed Rust TX descriptor vectors, ten RX
-status vectors and ten MAC traces independently check native formats.
-The initial channel1/basic1Mbps profile is polled, awake and terminal on
-disconnect; wider PHY, IRQ mode and reset/rejoin remain separate.
-Ath11k QCA6390 has
-its native IPQ8074 RX path and four-vdev resources; QCN9074 remains gated.
-Realtek has per-family identity/power work, a retained RTL8188EU factory/FIFO/
-firmware/MAC/BB/RF/LLT plus LC/IQK worker and bounded native RTW89 TX ownership.
-Production AES-CCM, shared CCMP AAD/replay corrections and checked per-key/TID
-station wrappers provide software crypto prerequisites; channel/power and
-native station paths remain incomplete. The retained host CCMP/RSNA key,
-PN/replay, no-reinstall and terminal-M4 owner now lives in shared wireless;
-RTL8188EU keeps compatibility reexports and its exact raw-profile checks.
-RTL8188EU now has a persistent native
-packet receipt/stop owner, channel1/XTAL initialization and a bounded shared
-management association plan. Signed, exact-board calibration artifacts now
-gate native transmit gains and MAC TX activation; missing qualification keeps
-TX closed. The initial channel1 station service now composes native USB
-management/data, authentication/association, RSNA and CCMP with Narf-Rings and
-synchronous packet progression; the exact terminal M4 receipt precedes key/port
-commit. Signed board curves and deployment policy are required for publication.
-Reset/rejoin generations, broader channels/rates and PMF remain software work.
-RTL8188EE now carries a one-shot continuation from its exact firmware owner
-through LLT and distinct linked TX/RX ring preparation, retained before native
-publication. Its factory-qualified continuation now programs complete native
-MAC/BB/AGC/RF tables and runs 1T IQK/LCK with retained matrix and per-rate PG
-offsets. Native C traces cover the full register/delay sequence, while failure
-and cancellation keep DMA parked. Its channel/power owner now binds factory
-EFUSE/PG indices to an authenticated exact-board curve, current host policy and
-the independent Linux EE world ceiling. A native polled packet core retains
-those same linked descriptors and buffers through publication and stop. Its
-EE-only ring map, complete DMA extents, terminal OWN receipts and RX admission
-are checked independently. The same retained owner now supplies firmware
-power-mode/mailbox and reserved-beacon prerequisites, shared MLME/RSNA/CCMP,
-native Device attachment and actual kernel DHCP with exact bidirectional IP.
-Native M4 receipts and bytes, real RX-idle fences, current policy and serialized
-publication/closure gate authorization. Tests hold DMA, CAM and mailbox work
-across close/cancel and preserve storage plus terminal state. The initial
-channel1/basic1Mbps profile stays awake and requires a fresh lifecycle after
-terminal closure; measured board-power qualification remains mandatory.
-RTL8822CE now retains an authenticated section-firmware attempt through native
-all-ring-owned beacon reserved pages and IDDMA. Success parks DMA; ambiguous or
-cancelled mappings stay pinned. It continues through inactive MAC/LLT/FIFO setup,
-complete logical factory EFUSE and protected OTP, an actual firmware hardware
-feature response, source-selected BB/AGC/RFK-init/RF tables and a signed exact-board
-power qualification. Forty-nine cut/RFE traces check table application. It now
-continues through fresh bounded DACK/IQK, H2C, awake software-crypto setup and
-the same registered Device through scan, Open/WPA2, actual kernel DHCP and
-exact bidirectional IP. Actual TXBD consumption plus matching CCX ACK and DMA
-bytes gate security replies; a genuine RX-idle fence excludes queued peer loss.
-Current policy and the signed v2 calibration/response envelope are checked at
-publication. No measured gain curve or transmit permission is inferred from
-factory indices. RTL8821CE/RTL8822BE remain identification-only profiles.
-RTW89 has checked owned AX firmware selection, cold-power/DDV primitives and
-fuse-selected immutable header/section download plans with host blacklist
-enforcement. Power-off/normalization and DLE/HFC primitives now have Linux-C
-trace coverage. Native CH12 commands now retain DMA through the multi-tag
-delay and use corrected hardware/host index fields. A retained WCPU loader
-now follows Linux reset, secure IDMEM and header/section progression and waits
-for initialized firmware. Internal AX BDRAM preparation now stops and checks
-DMA idle, configures exact per-chip partitions, clears/resets hardware indices
-and gates CH12 ring-base publication on its retained Ready receipt. Native
-preparation now retains DLFW DLE/HFC, exact AX PCIe policy/PHY quirks and the
-stopped mode/BDRAM sequence together before CH12 ring configuration. Forty
-original Linux C cases cover all four AX profiles, cuts, PHY generations and
-inherited fields. The private cold path now composes actual cut/factory reads,
-confirmed power-off qualification, complete PCI basic/PHY policy and TX-only
-CH12/WCPU startup with RX closed and PCI bus mastering last. Another 40 Linux C
-cases cover PCI basic configuration. The RTL8852B continuation now reads actual
-physical PHY-cap trims and composes post-WCPU SCC MAC setup with retained
-36-bit RXBD/RPQ/C2H ownership. Source C vectors check actual RX envelopes,
-release records and index wrap. RF-v1 access, original conditional BB/gain/
-RF table execution and actual runtime RF-table H2C uploads share that owner.
-Signed measured basic-calibration qualification, firmware-confirmed WLAN-only
-coexistence and bounded NCTL/RCK/DACK/RXDCK keep global CMAC TX disabled.
-The RTL8852B initial path now continues through actual firmware PHY capability,
-static operating setup, channel/BB/RF, IQK/TSSI/DPK and exact source power
-configuration under a separate signed measured v2 envelope. The same retained
-startup reaches source peer controls and fresh BE/MGMT packet rings, with
-joint TXBD/RPQ retirement, host RSNA/CCMP, public Device and kernel DHCP/IP
-models. Generic probe uses actual FLR before cold discovery; a separate unsafe
-platform entry requires an independently verified temporal reset handoff.
-The first profile is awake/polled, fixed1Mbps, channel1/20MHz TX-A/RX-AB and
-bounded to512 identities per queue. Terminal closure requires a fresh claim.
-Other AX/BE profiles retain diagnostic storage without
-activating rings, IRQs or a NIC.
-Scoped native PCIe PHY/DBI operations now provide bounded MDIO/RAC access with
-retained failure/cancellation exclusion.
-EU, CYW/common FullMAC and Intel teardown now repeat carrier closure under
-the device state mutex, preventing a waiting old publisher from raising stale
-carrier during disconnect. Deterministic interleaving tests check the actual
-teardown result before any later maintenance poll repairs state.
-USB retains published address/configuration/control/bulk DMA, checks slot
-generations and implements explicit Stop/Set-Dequeue fencing for the supported
-bulk profile; halt/reset/replug and broader reclamation remain software work.
-Broadcom BCM43602 now connects explicit board-selected CR4/msgbuf transport to
-the common CYW FullMAC station/security lifecycle, with generation-safe retained
-flow-ring reuse after delete acknowledgment. Signed exact-host board selection
-and retained asset staging are implemented; actual deployment assets and
-physical validation remain. Broader silicon, reset/recovery and PM remain
-software follow-ups outside the initial profile.
+The [per-chip inventory](drivers/wireless/research/chip-inventory.md)
+audits all 102 registered bus identities and records the measured source
+footprint. Footprint counts are not completion percentages, and a delivery
+date remains uncalibrated.
 
-The shared A2 conversation kit now supplies a reactive legacy Open/WPA2 AP
-and a transaction-bound DHCP peer. MT76 uses the shared management/EAPOL peer;
-ath11k's native TCL/REO-ring model and CYW's SDPCM/BDC FullMAC model reuse its
-DHCP server. All three compose association to a lease and exact bidirectional
-Ethernet data. CYW's WPA2 proof is firmware-offloaded key completion; it does
-not simulate firmware-internal crypto. The fixtures also cover controlled-port
-closure, real carrier metadata and interface-local IPv4 binding retirement.
-This work publishes missing MT76/CYW carrier changes and prevents removed
-interfaces from leaving their IPv4 address/gateway/DNS behind for name reuse.
-It does not close the remaining driver stages or establish physical acceptance.
+### Validation
 
-Phase A3 adds parser goldens from 36 SHA256-pinned vendor originals, retaining
-only 60,371 bytes of structural metadata and independently decoded facts.
-Sixteen new kernel smokes cover Intel, MediaTek, Qualcomm, Broadcom and Realtek
-layouts plus bounded replay construction; no synthetic replay enters a registry
-or device loader. RTL8188EE now requests `rtl8188efw.bin`, and MT7920 selects its
-distinct `WIFI_RAM_CODE_MT7961_1a.bin` RAM image. The firmware importer preserves
-board NVRAM text, maps flat Intel names into canonical registry keys, bounds raw
-and zstd input, and resolves duplicate aliases deterministically. The new
-`cargo xtask wifi-firmware` audit covers 44 payload profiles across all eleven
-families. This host has 60 assets present and 15 required assets missing
-(twelve Intel firmware combinations and the three CYW43439 assets); signed
-board calibration, policy and exact board/PNVM matching remain separate gates.
-See [the firmware evidence and provisioning guide](verification/data/wifi-firmware/README.md).
-
-The preceding station checkpoint added 21 software smokes. The shared legacy join
-plan now intersects successful response rates with the offered set, preserves
-beacon-mandatory rates and rejects unsupported response requirements before
-committing AID/rates. MT76 reads that negotiated state for its native peer/RA
-records and chooses the actual lowest basic bit rate, including mixed CCK/OFDM
-sets. Independent Linux C layout/trace checks cover the Intel peer, ath10k
-teardown and RTW89 BDRAM prerequisites described above. Full station, IRQ,
-reset/rejoin and physical acceptance still require the remaining family work.
-
-The native-station checkpoint adds 20 software smokes. New conversations cover
-Intel Sc c103 after firmware INIT, RTL8188EU's channel1/20-MHz/basic1Mbps USB
-profile and BCM43602's shared5/6 zero-prefix msgbuf profile. Each composes its native
-transport, production station owner and kernel DHCP client through exact
-bidirectional IP, plus withheld completions, controlled-port closure and
-retained ownership on cancellation/disconnect failure. Intel and RTL8188EU
-now publish actual carrier metadata, which their previous administrative
-link updates did not supply. Intel accepts EAPOL outer protocol versions 1–3
-while preserving exact WPA2 descriptor, MIC, replay and no-reinstall checks.
-The shared AP's basic1Mbps option keeps RTL8188EU within its admitted rate
-profile. Synthetic board/calibration and firmware inputs remain test-only.
-
-A shared regulatory bootstrap now loads `wireless-regulatory.bin` through
-current firmware capability invocation, requires a verified signer even in
-unsigned development builds, and publishes only a complete decoded policy.
-Intel, MT76, ath10k and both FullMAC transports can obtain that policy without
-another Wi-Fi driver having probed first. Missing or invalid assets grant no
-new transmit permission; an existing caller-installed domain keeps the
-documented cached-domain contract. Isolated real-registry tests cover signed
-loading, revocation, failure, cache reuse and concurrent caller policy.
-
-The latest software checkpoint passes the filtered Wi-Fi, SDIO, USB, shared
-wireless, network, crypto, RNG, firmware and shared-fixture QEMU gates:
-x86_64 reports 2962 pass / 0 fail / 22 skip; aarch64 reports
-2258 pass / 0 fail / 16 skip. The latest continuation adds62 smokes covering
-RTL8852B temporal reset/probe ownership, actual firmware PHY capability, static
-operating and full radio/current-power qualification, source peer controls,
-native packet/Device DHCP/IP, exact M4 and whole-rekey/disconnect ownership;
-all pass on both architectures alongside the prior coverage.
-Passive-only wiphys now advertise `NL80211_ATTR_MAX_NUM_SCAN_SSIDS = 0`, reject
-active SSID lists at `TRIGGER_SCAN` and use passive discovery on `CONNECT` cache
-misses, while Intel (20) and ath11k/FullMAC (16) advertise their active probe
-limits. Common FullMAC (`cyw43439`/`brcmfmac`) association now fences host port
-publication on an actual zero-consumption FIFO/completion-ring poll so backlog
-beyond a single RX budget is drained and late peer loss or cancellation is
-observed before opening carrier. `ath10k` and `rtl8xxxu` now wait at their pure
-firmware, board/extended-board, per-MAC calibration and regulatory checkpoints
-without repeating completed ROM/PLL/OTP or USB table/IQK initialization, and
-`ath11k` waits for its complete AMSS/M3/signed-board bundle before MHI power-up.
-`wireless::register_initcalls()` now installs the bootstrap `trusted_net_authority` into `narf_net`
-at boot before `Stage::Device` probes any driver. MT76 / MT7921 now drives background preflight retry
-via `retry_preflight_until` across 120 attempts with 500 ms intervals when firmware or net authority
-arrives late, falling back to verified reset recovery. `iwlwifi`, `cyw43439`, `brcmfmac`, `ath9k`,
-`rtlwifi` (RTL8188EE), and `rtw88` (RTL8822CE) now drive background provisioning retries via
-`drive_scheduled` across 120 attempts with 500 ms intervals while in their pure pre-attempt parked
-checkpoints, verifying network registration authority and resuming from completed radio/PHY preparation
-checkpoints when policy or calibration arrives late.
-Both include a clean production boot and btrfs interoperability postflight.
-Host tests, release/debug builds, targeted Clippy across the kernel feature
-contexts, workspace formatting, and MT76 module build/Clippy pass.
-These are software/model checks. Expected skips include missing physical
-devices and unsigned-development firmware fixtures in the signed configuration;
-physical acceptance and the documented wider-profile follow-ups remain open.
+All of the above is software evidence from native Rust tests in QEMU.
+Expected skips are missing physical devices and unsigned-development
+firmware fixtures in the signed configuration. Physical acceptance (RF,
+interoperability, power and system suspend/wake) and the wider-profile
+work in the ledger remain open for every family.
 
 ## Loadable e1000 datapath
 
@@ -888,8 +460,9 @@ lifetime, and deterministic descriptor injection.
 
 ## Loadable ath11k (WCN6855)
 
-The ath11k driver now builds from one source either built in or as
-`ath11k.ko`. The module runs the whole PCI station path over the KABI:
+The ath11k driver builds from one source either built in or as `ath11k.ko`
+(`narf-drivers-wireless-ath11k --no-default-features --features module`).
+The module runs the whole PCI station path over the KABI:
 
 - MHI, QMI/WLFW, CE, HTC, WMI, DP and the MAC;
 - the in-driver WPA2/WPA3 supplicant;
@@ -900,10 +473,13 @@ It claims `17cb:1103` only. `narf-drivers-wireless/ath11k-module-only`
 steps the built-in PCI claim aside; AHB stays built in. The module links on
 x86_64 and aarch64, and every undefined symbol is a KABI export.
 
-`modules/e2e/ath11k` loads the real `.ko` and checks:
+`modules/e2e/ath11k` loads the real module, staged LZ4-compressed in the
+kernel-test initramfs as `lib/modules/test-fixtures/ath11k.ko.lz4` (all
+Wi-Fi module fixtures below are staged the same way), and checks:
 
 - relocations and init;
-- the declared `ath11k.*` parameters;
+- the declared `ssid`/`psk`/`passphrase`/`scan` parameters and a load
+  argument;
 - the exact PCI claim;
 - refusal of a probe with no device context;
 - clean unload.
@@ -911,15 +487,13 @@ x86_64 and aarch64, and every undefined symbol is a KABI export.
 Not in the module build: firmware crash recovery, AP/P2P/monitor, WoW and
 system PM, power save, checksum offload and the userspace SME. QEMU has no
 WCN6855, so bring-up through the module (MHI, FW_READY, scan, association)
-is first proven on the Lenovo 21ME (`docs/BOOTING_ON_CACHYOS.md`); that boot
-has not yet run.
+needs a hardware boot; `docs/BOOTING_ON_CACHYOS.md` has the QCNFA765
+module pass. No such boot is recorded.
 
 ## Loadable mt76 (MT7921/MT7922)
 
-The mt76 driver now builds from one source either built in or as `mt76.ko`.
-Until now the `.ko` was a thin frontend over the private mt76 copy-mode host,
-which kept MCU/WFDMA execution in the kernel. The module now runs the PCI
-station path itself over the KABI:
+The mt76 driver builds from one source either built in or as `mt76.ko`.
+The module runs the PCI station path itself over the KABI:
 
 - PCI binding, WFDMA rings, MCU and patch/RAM firmware download;
 - NIC/EFUSE/MAC initialization;
@@ -936,12 +510,12 @@ the stop/reset sequences clear and re-read bus mastering, and
 `narf_wireless_regdomain` gives the module the kernel's installed regulatory
 domain, the one the built-in driver uses. With no installed domain the module
 fails closed (no transmission, no join), exactly as built in; it has no
-regulatory fallback of its own. The private mt76 family host stays
-registered; no in-tree `.ko` uses it now.
+regulatory fallback of its own. The private mt76 copy-mode family host stays
+registered in the built-in build; no in-tree `.ko` uses it.
 
 `modules/e2e/mt76` loads the real `.ko` and checks relocations and init, the
 `debug` parameter, the exact PCI claim, refusal of a probe with no device
-context, and clean unload. The test is written; it has not been run yet.
+context, and clean unload.
 
 Not in the module build: AP/P2P/monitor, WoW and system PM, scheduled scan,
 roaming, CQM/survey/station statistics, power-save control and the userspace
@@ -950,9 +524,8 @@ through the module are unverified until a hardware boot.
 
 ## Loadable ath10k (QCA988X–QCA9377)
 
-The ath10k driver now builds from one source either built in or as
-`ath10k.ko`, following ath11k. The module runs the whole PCIe station path
-over the KABI:
+The ath10k driver builds from one source either built in or as
+`ath10k.ko`. The module runs the whole PCIe station path over the KABI:
 
 - reset, BMI, firmware/board/OTP/calibration download, CE, HTC, WMI, HTT;
 - the retained station radio with its in-driver WPA2-PSK/WPA3-SAE
@@ -970,7 +543,7 @@ x86_64 and aarch64, and every undefined symbol is a KABI export.
 
 `modules/e2e/ath10k` loads the real `.ko` and checks relocations and init,
 the exact PCI claim, refusal of a probe with no device context and clean
-unload (written; not yet run in the combined suite).
+unload.
 
 The built-in automatic recovery runs in the module too: a firmware crash
 retires the generation and boots a fresh one (at most three per load), and
@@ -982,9 +555,8 @@ association through the module are unverified.
 
 ## Loadable ath9k
 
-The ath9k driver now builds from one source either built in or as
-`ath9k.ko`. The module runs every chip owner's whole station path over the
-KABI:
+The ath9k driver builds from one source either built in or as `ath9k.ko`.
+The module runs every chip owner's whole station path over the KABI:
 
 - AR5008, AR9280, AR9285/AR2427, AR9287 and the AR9300 family;
 - identity and EEPROM, signed board admission, INI/PLL/RF and
@@ -998,15 +570,14 @@ KABI:
   `remove` and its DMA-stop proof).
 
 ath9k is softMAC: it enforces the host regulatory domain and gates its own
-bus mastering. It uses the shared KABI exports `narf_pci_command` (mt76),
-`narf_wireless_regdomain` (rtw88: an NRGD record of the host domain), and
-`narf_pcie_state` and `narf_pci_config_read32` (read-only), which were
-added for ath9k.
+bus mastering. It uses the shared KABI exports `narf_pci_command`,
+`narf_wireless_regdomain` (an NRGD record of the host domain), and the
+read-only `narf_pcie_state` and `narf_pci_config_read32`.
 
-It claims the built-in driver's fifteen `168c:*` ids.
-`narf-drivers-wireless/ath9k-module-only` leaves the built-in driver
-unregistered. The module builds for x86_64 and aarch64, and every
-undefined symbol is a KABI export.
+It claims the built-in driver's fifteen `168c:*` ids under its own match
+name, `ath9k-module`. `narf-drivers-wireless/ath9k-module-only` leaves the
+built-in driver unregistered. The module builds for x86_64 and aarch64, and
+every undefined symbol is a KABI export.
 
 `modules/e2e/ath9k` loads the real `.ko` and checks:
 
@@ -1015,8 +586,7 @@ undefined symbol is a KABI export.
 - refusal of a probe with no device context;
 - clean unload.
 
-`smoke_kabi_softmac_exports` covers the softMAC exports. Both tests are
-written but have not yet run in the combined suite.
+`smoke_kabi_softmac_exports` (`modules/kabi`) covers the softMAC exports.
 
 Not in the module build:
 
@@ -1030,14 +600,17 @@ through the module are unverified until a hardware run.
 
 ## Loadable brcmfmac (Broadcom FullMAC PCIe)
 
-The brcmfmac PCIe driver now builds from one source either built in or as
-the `brcm` `.ko`. The module runs the driver's own code over the KABI:
+The brcmfmac PCIe driver builds from one source either built in or as the
+`brcm` module (`narf-drivers-wireless-brcm --no-default-features
+--features module`; its test fixture is `brcmfmac.ko.lz4`). The module runs
+the driver's own code over the KABI:
 
 - AI core discovery through the BAR0 config window, CR4/CA7 firmware
   download into BAR2 TCM, the msgbuf common and flow rings, one MSI vector;
 - signed NBSP board selection and asset checks, and the kernel's live
-  regulatory domain through `narf_wireless_regdomain` (no domain, or one
-  naming no country such as world `00`, keeps the device parked);
+  regulatory domain through `narf_wireless_regdomain`; the module loads no
+  `wireless-regulatory.bin` of its own (no domain, or one naming no country
+  such as world `00`, keeps the device parked, as built in);
 - the shared FullMAC station (firmware SME and supplicant: open, WPA2-PSK
   from the PMK, WPA3-SAE where firmware offers it), with one `wlan%d`
   netdev and wiphy through the netif bridge and the `WIFI` v2 host;
@@ -1052,8 +625,10 @@ The module links on x86_64 and aarch64, and every undefined symbol is a KABI
 export.
 
 `modules/e2e/brcmfmac` loads the real `.ko` and checks relocations and init,
-the declared `brcm.*` parameters, the exact PCI claim, refusal of a probe
-with no device context and clean unload (written; not yet run).
+the declared autoconnect parameters and a load argument, that the
+decompressed image imports `narf_wireless_regdomain` and names no
+`wireless-regulatory.bin`, the exact PCI claim, refusal of a probe with no
+device context and clean unload.
 
 Not in the module build: AP/monitor/P2P and virtual interfaces, WoWL and
 system PM, power-save control, firmware roaming, the host supplicant and
@@ -1064,23 +639,22 @@ unverified until run on hardware.
 
 ## Loadable rtw88 (RTL8821CU / RTL8822BU)
 
-The rtw88 driver now builds from one source either built in or as
-`rtw88.ko` (`narf-drivers-wireless-rtw --features module`). For the USB
-parts the module runs the driver's own code over the KABI: the
-`usb_firmware` backend, the factory read, firmware, MAC, PHY, calibration
-and station stages, the `interface::Device` station shell and its in-driver
-Open / WPA2-PSK SME. Kernel services come from `src/rtw88/platform/`, which
+The rtw88 driver builds from one source either built in or as the `rtw`
+module (`narf-drivers-wireless-rtw --no-default-features --features
+module`; its test fixture is `rtw88.ko.lz4`). For the USB parts the module
+runs the driver's own code over the KABI: the `usb_firmware` backend, the
+factory read, firmware, MAC, PHY, calibration and station stages, the
+`interface::Device` station shell and its in-driver Open / WPA2-PSK SME.
+Kernel services come from `drivers/wireless/rtw/src/rtw88/platform/`, which
 supplies the kernel crates' names over `narf-module-rt`; PCI types are
-uninhabited there. The hand-written `module_usb.rs` reimplementation is
-retired.
+uninhabited there.
 
-New KABI exports serve USB Wi-Fi modules: `narf_usb_spawn_poller`,
+KABI exports for USB Wi-Fi modules: `narf_usb_spawn_poller`,
 `narf_usb_netif_register_with_context`, `narf_usb_netif_rx` and
 `narf_wireless_regdomain`. `narf-drivers-wireless/rtw88-module-only` steps
 the built-in USB claim aside. `modules/e2e/rtw88` loads the real `.ko` and
 checks relocations and init, the `rtw.*` parameters, the USB and PCI
-claims, refusal of a probe with no USB context and clean unload (written,
-not yet run).
+claims, refusal of a probe with no USB context and clean unload.
 
 There is no nl80211 wiphy for a USB function's module: the `WIFI` family
 host binds to bus device contexts only. The station joins from
@@ -1091,8 +665,7 @@ through the module is unproven on hardware.
 
 ## Loadable rtl (rtlwifi PCIe + rtl8xxxu USB)
 
-`rtl.ko` was registration-only: its probe returned `-ENOSYS`. Now both
-legacy Realtek drivers build from one source, either built in or as
+Both legacy Realtek drivers build from one source, either built in or as
 `rtl.ko`, and the module runs them over the KABI (spec §4.9).
 
 - **rtlwifi (PCIe), all ten ids.** The whole driver runs in the module:
@@ -1110,8 +683,8 @@ legacy Realtek drivers build from one source, either built in or as
   and RTL8723BU. The USB station gets a netdev but no wiphy, because the
   `WIFI` host is bound to a PCI device capability. Its SME is driven by
   `rtl.ssid=` / `rtl.psk=` / `rtl.passphrase=`, as in `rtw88.ko`.
-- **KABI.** Added: `narf_bar_map_control` and the 8/16-bit `narf_mmio_*`
-  accessors. Also used from other branches: `narf_pci_command`,
+- **KABI.** `narf_bar_map_control` and the 8/16-bit `narf_mmio_*`
+  accessors serve this module; it also uses `narf_pci_command`,
   `narf_wireless_regdomain`, and the `narf_usb_*` poller and netif.
 - **Module-only build.** `narf-drivers-wireless/rtl-module-only` leaves
   the built-in tables to the module.
@@ -1124,8 +697,6 @@ legacy Realtek drivers build from one source, either built in or as
   - refusal of a probe with no device context;
   - clean unload.
 
-  The test is written but has not been run.
-
 Not in the module:
 
 - system suspend and WoWLAN;
@@ -1136,11 +707,11 @@ Not in the module:
 
 `rtl.ko` registers 23 USB matches, which fit beside `rtw88.ko`'s 50 in the
 128-entry module USB match table. QEMU has no Realtek Wi-Fi device, and no
-hardware boot of `rtl.ko` has run.
+hardware boot of `rtl.ko` is recorded.
 
 ## Loadable iwlwifi (all generations)
 
-The iwlwifi driver now builds from one source either built in or as
+The iwlwifi driver builds from one source either built in or as
 `iwlwifi.ko`, and the module runs the driver's own code over the KABI for
 every id of the built-in table:
 
@@ -1159,13 +730,13 @@ It claims all 28 ids; `narf-drivers-wireless/iwlwifi-module-only` steps the
 built-in claim aside for them. The stations read the kernel's regulatory
 domain through the shared `narf_wireless_regdomain` export; the transport
 parks, stops and verifies bus mastering through `narf_pci_command`; signed
-firmware assets carry their verified signer through the new additive
+firmware assets carry their verified signer through the additive
 `narf_firmware_signer` export. The module links on x86_64 and aarch64 and
 every undefined symbol is a KABI export.
 
 `modules/e2e/iwlwifi` loads the real `.ko` and checks relocations and init,
 the exact 28-id claim, refusal of a probe with no device context and clean
-unload (written; not yet run in the combined pass).
+unload.
 
 Not in the module build: AP/P2P/monitor, scheduled scan, MLO further links,
 roaming, WoWLAN/D3 and system PM, CQM events, checksum offload, and BIOS

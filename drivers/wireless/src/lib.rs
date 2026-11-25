@@ -3,8 +3,8 @@
 extern crate alloc;
 
 // Shared, driver-agnostic helpers promoted to `narf-drivers-wireless-core`.
-// Re-exported at the crate root so the still-inlined drivers' existing
-// `crate::firmware_asset` / `crate::future_heap` references keep resolving.
+// Re-exported at the crate root so the facade's tests' existing
+// `crate::firmware_asset` references keep resolving.
 pub use narf_drivers_wireless_core::{firmware_asset, future_heap, watchdog_work};
 
 // Qualcomm Atheros ath9k PCIe Wi-Fi. Promoted out of the former
@@ -37,9 +37,7 @@ pub use narf_drivers_wireless_ath10k::ath10k;
 // `cyw43439::register()` initcalls keep resolving.
 pub use narf_drivers_wireless_brcm::{brcmfmac, cyw43439};
 // Shared Atheros/Qualcomm code promoted to `narf-drivers-wireless-ath-core`.
-// Re-exported at the crate root so the still-inlined ath9k/ath10k/ath11k
-// drivers' `crate::qualcomm_pci` / `crate::qualcomm_regulatory` references
-// keep resolving.
+// Re-exported at the crate root under their pre-split paths.
 pub use narf_drivers_wireless_ath_core::{qualcomm_pci, qualcomm_regulatory};
 // Legacy Realtek Wi-Fi family. Promoted out of the former
 // `src/{rtl8xxxu,rtlwifi}/` modules into the standalone dual-build family

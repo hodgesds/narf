@@ -4,7 +4,7 @@
 48 RX metadata cases and 512 CCX results. Their captured source provenance is
 Linux `drivers/net/wireless/realtek/rtw88/{pci,tx,rx}.{c,h}`, `fw.h`, `main.h`
 and `mac.h`; `provenance.json` preserves source and extracted-function SHA256
-records. The compiler/extraction pipeline has been removed. These are stored
+records. No compiler/extraction pipeline is kept. These are stored
 regression data, not an ongoing C-equivalence check or a regeneration target.
 
 Native Rust kernel tests compare the driver with those literal vectors. They

@@ -7,7 +7,7 @@ they do not compile Linux or prove continuing equivalence with a current Linux
 checkout. No Python, C compiler, temporary `rustc` comparison harness or
 source-to-Rust generator is part of this family’s build or validation workflow.
 
-The former extraction/compiler scripts have been removed. Source SHA256 comments
+The family keeps no extraction or compiler scripts. Source SHA256 comments
 remain attached to captured fixtures, register constants and recipes. They record
 provenance, not a regeneration dependency. Fixture changes require source/hardware
 contract review and an explanation of the changed expected behavior; deriving new

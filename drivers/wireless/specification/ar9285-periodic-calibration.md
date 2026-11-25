@@ -7,8 +7,8 @@ program at its actual full-rate20 or exact40 geometry. It adds the source
 ADC/IQ, PA, noise-floor and ANI continuations to an unchanged current H1/H2/H3
 owner. No signed production asset or physical measurement is supplied.
 
-The software and six native composition cases are written. Release/native
-execution and physical acceptance are pending. Existing H/B/T/Q/S formats
+The software and its six native composition cases pass on x86_64 and
+aarch64. Physical acceptance is pending. Existing H/B/T/Q/S formats
 retain their bytes and behavior when P is absent.
 
 ## 2. Source and physical assumptions
@@ -148,7 +148,7 @@ association/key/BA/capture loss rules.
 
 ## 7. Native cases and validation
 
-Six unexecuted native cases use actual Device/Radio/Packet/DMA/IPC paths.
+Six native cases use actual Device/Radio/Packet/DMA/IPC paths.
 They cover source shape/current authority and absent-P preservation; Open/
 WPA2 traffic during measurement, actual IQ completion and kernel DHCP;
 actual ANI counters, PA/NF/load and20min restart; held original/QCU, timeout,
@@ -161,5 +161,5 @@ Fixture assets and register inputs authorize isolated models only.
 
 No production board measurement, temperature/supply sweep, RF qualification
 or physical AP result is claimed. Those inputs must supply the matching
-signed complete-program record. Release/native results remain pending;
-the source implementation does not replace physical qualification.
+signed complete-program record. The software results do not replace
+physical qualification.

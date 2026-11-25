@@ -1,9 +1,9 @@
 # RTL8188EE signed RTS/CTS full-program qualification
 
 This is part of [rtlwifi §3](rtlwifi.md#3-public-interface). The NERT v1
-continuation and six native cases are implemented pending coordinated
-release compilation and final native validation. No board measurements,
-physical control-frame observations or signed deployment data are supplied.
+continuation and six native cases are implemented and pass the native
+software gates on x86_64 and aarch64. No board measurements, physical
+control-frame observations or signed deployment data are supplied.
 
 The existing NEPC and NEHT programs exclude RTS/CTS emissions. NERT is a
 separate optional signed extension over the exact current factory/NEPC,
@@ -108,8 +108,8 @@ kernel DHCP and IP; threshold boundary/RTS precedence; HT40 descriptor and
 software-security composition; refusal before authentication when measured
 data is absent or unknown; and live ERP changes plus revocation while the
 actual native M4 OWN is held. Only hardware/DMA/AP and dimensional signed
-metadata are inert. The cases are written but unexecuted; physical RF
-interoperability and power qualification remain external gates.
+metadata are inert. Physical RF interoperability and power qualification
+remain external gates.
 
 The separately signed [NETH thermal continuation](rtl8188ee-tracking.md) can
 extend this exact measured NERT payload with bounded TXAGC reductions and

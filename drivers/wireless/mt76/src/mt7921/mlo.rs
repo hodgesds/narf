@@ -146,7 +146,7 @@ impl EmlCaps {
 /// the single-link join/teardown uses; it is reachable in
 /// fixtures (where `RadioInfo` is constructed with `0x7925`)
 /// and on hardware only once Q1 opens (the probe gate at
-/// `pci.rs:441` and `chip_id()` in `firmware_transport_hw.rs`
+/// `pci.rs:406` and `chip_id()` in `firmware_transport_hw.rs`
 /// still reject 7925 today).
 pub(crate) fn is_connac3(info: RadioInfo) -> bool {
     info.chip_id == 0x7925

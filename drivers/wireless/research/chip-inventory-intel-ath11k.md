@@ -4,7 +4,9 @@
 > they used uncalibrated allowances and overlapping shared/backend/chip work.
 > The chip/path audit and measured LOC remain useful; packages describe scope.
 
-Snapshot: 2026-10-25, branch `codex/ath10k-active-scan`, HEAD `e8fe43e7b`, plus the frozen working tree. This is a planning audit, not a new hardware acceptance result. Local primary reference: `/usr/src/linux` reports Linux **7.3.0-rc4** (`Makefile`). No Cargo/QEMU was run for this inventory. Implementation is frozen.
+Snapshot: 2026-10-25 at `e8fe43e7b` plus work then uncommitted. This is a planning audit, not a hardware acceptance result. Local primary reference: `/usr/src/linux` reports Linux **7.3.0-rc4** (`Makefile`). No Cargo/QEMU was run for this inventory.
+
+> Superseded since the snapshot (current state is in `drivers/wireless/specification/ath11k.md` and the feature ledger in `remaining-features.tsv` / `implemented-pending-validation.tsv`): QCN9074 (`1104`) is now admitted by probe, with fixture-tested multi-pdev runtime and monitor mode, so its **Q** label and package A2 describe the snapshot only; the AHB/SoC profiles (IPQ8074, IPQ6018, IPQ5018, WCN6750) have NARF AHB glue (`ath11k.md` §3.12, fixture-tested only); the **A-WIP** recovery channel reservations are committed (`recovery_channel_tests.rs`). The Intel G2/G3 rows below are not re-audited here; see `iwlwifi.md`.
 
 ## What the LOC measurement means
 
@@ -14,7 +16,7 @@ Measured with `/root/.cargo/bin/tokei` **15.0.0**:
 tokei drivers/wireless/src/iwlwifi drivers/wireless/src/ath11k --output json
 ```
 
-Raw result: `/tmp/narf-intel-ath11k-tokei.json`.
+The paths are those of the snapshot; the code now lives in the per-family crates `drivers/wireless/iwlwifi/src/iwlwifi` and `drivers/wireless/ath11k/src/ath11k`. The raw result was a temporary file and is not kept.
 
 | Scope | Rust files | Rust code LOC | Comment LOC | Blank LOC | Test-named code LOC | Other-file code LOC |
 |---|---:|---:|---:|---:|---:|---:|
@@ -118,19 +120,19 @@ remain outstanding; no calendar date follows from code volume.
 
 ## Exact source references
 
-Paths below are repository-relative for NARF and absolute for local Linux. Function names are the stable anchors; line positions may move as other agents finish their owned files.
+Paths below are repository-relative for NARF (short `iwlwifi/…` and `ath11k/…` paths are under `drivers/wireless/iwlwifi/src/` and `drivers/wireless/ath11k/src/`) and absolute for local Linux. Function names are the stable anchors.
 
-* **N1** `drivers/wireless/src/iwlwifi/mod.rs::chip_config_for_pci_id`, `PCI_DIDS`, `probe`, `IwlDevice::control_plane_ready`; `rx_rfh.rs::CompletionFormat::for_mac`: every PCI match, singleton/park/startup routing and generation-specific descriptors.
+* **N1** `drivers/wireless/iwlwifi/src/iwlwifi/mod.rs::chip_config_for_pci_id`, `PCI_DIDS`, `probe`, `IwlDevice::control_plane_ready`; `rx_rfh.rs::CompletionFormat::for_mac`: every PCI match, singleton/park/startup routing and generation-specific descriptors.
 * **N2** `iwlwifi/gen2_profile.rs::select`, `API`; `mvm_boot.rs::Owner::{new,initialize}`; `mvm_power.rs::Owner::prepare_transmit_power`; `mvm_link.rs::Owner::{activate_link,deactivate_link}`: exact API77 identity and retained authority/lifetime chain.
 * **N3** `iwlwifi/mvm_auth.rs::Owner::authenticate_open`, `qualified_management_transmit`; WIP `mvm_assoc.rs::Owner::{associate_legacy,association_response,clear_association}`; `mvm_{auth,assoc}_tests.rs`: actual management frame/TX receipt/RX response/control receipts, not encoder-only support.
 * **N4** `iwlwifi/bootstrap.rs::Owner::{candidates,provision_using,start}`; `device.rs::Device::{validate_station_profile,initialize,get_wireless_info,associate_in_domain,recover}`; `runtime.rs::Hardware::{command,command_with_header_version}`: deferred admission, exact payload gates and remaining Gen3 header contract.
 * **N5** `iwlwifi/connection.rs::Connection::{associate_in_domain,stop_rx_ba}`, `install_key`, `remove_key`; `security.rs`; `ht_vht.rs::Local::{from_nvm,capabilities}`, `Negotiated::{parse,apply_phy,apply_peer,apply_link,apply_tlc}`; `dhcp_composition_tests.rs`: actual station/security/width and native model evidence.
 * **N6** `iwlwifi/firmware_identity.rs::Sc::{read,rf,ladder,check}`; `mod.rs::RF_SC_A0_CANDIDATES`: fused identity restrictions and core filename ladder.
-* **N7** `drivers/wireless/src/ath11k/hw.rs::{ALL_DEV_IDS,refine_hw_rev,HwRev::params}`; `pci.rs::validate_runtime_profile`: every actual matched/refined profile and preactivation rejection.
+* **N7** `drivers/wireless/ath11k/src/ath11k/hw.rs::{ALL_DEV_IDS,refine_hw_rev,HwRev::params}`; `pci.rs::validate_runtime_profile`: every actual matched/refined profile and preactivation rejection.
 * **N8** `ath11k/core.rs::CoreConfig::for_hw`; `dp_ring.rs::DpHwParams::for_rev`; `mhi.rs::config_for`: complete admitted profiles versus QCN's incomplete HAL/core/DP.
-* **N9** `ath11k/runtime.rs::DpHooks`, `Shared::rebuild_after_transport_reset`; `iface.rs::Interface::{recover_one,rebuild_after_radio_recovery}`; `integration_tests.rs`; WIP `recovery_channel_tests.rs`: real reset/replay ownership and native composition scope.
+* **N9** `ath11k/runtime.rs::DpHooks`, `Shared::rebuild_after_transport_reset`; `iface.rs::Interface::{recover_one,rebuild_after_radio_recovery}`; `integration_tests.rs`; `recovery_channel_tests.rs`: real reset/replay ownership and native composition scope.
 * **N10** `ath11k/mac.rs::{Mac::associate,Mac::assoc_success,Mac::authorize,Mac::set_tx_bitrate_mask,Mac::twt_changed_for_service,Mac::prepare_wowlan,Mac::finish_wowlan_resume,Mac::ap_peer_associate}`; `mac_peer.rs::{own_caps,sta_rx_nss}`; `iface.rs::Ath11kNetdev::fragmentation_threshold`: reachable MAC controls, not mere WMI encoders.
-* **N11** `ath11k/mac_reg.rs`, `wmi.rs` SERVICE_READY/EXT parsing, `dp_peer.rs`, `tx_offload.rs`, `iface.rs` WirelessInterface/Interface implementation; `integration_tests.rs` x86-only module cfg: capability-qualified PHY/security/DP/netdev publication.
+* **N11** `ath11k/mac_reg.rs`, `wmi.rs` SERVICE_READY/EXT parsing, `dp_peer.rs`, `tx_offload.rs`, `iface.rs` WirelessInterface/Interface implementation; `integration_tests.rs`: capability-qualified PHY/security/DP/netdev publication.
 * **L1** `/usr/src/linux/drivers/net/wireless/intel/iwlwifi/cfg/22000.c::{iwl_22000_base,iwl_qu_mac_cfg,iwl_qu_long_latency_mac_cfg,iwl_ax200_mac_cfg}`: API77 and native transport/platform profile; no API100 basis here.
 * **L2** `.../intel/iwlwifi/cfg/ax210.c::{iwl_ax210_base,iwl_ty_mac_cfg,iwl_so_mac_cfg,iwl_ma_mac_cfg}`, `IWL_MA_A_GF_A_FW_PRE`, `IWL_MA_B_GF_A_FW_PRE`: Ty/So/Ma API89.
 * **L3** `.../intel/iwlwifi/cfg/bz.c::iwl_bz_base`, `IWL_BZ_UCODE_CORE_{MIN,MAX}`: encoded-core102..107 and Bz/Gl RF names.
