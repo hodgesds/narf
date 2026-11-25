@@ -1038,9 +1038,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // intel_ddi_init_dp_buf_reg's value, then the buffer active
         // (PORT_BUF_CTL1 PHY_IDLE clear), before the DPCD training.
         if let Some(off) = cold {
+            // Display >= 20 carries the D2D link enable of step 6.f in this
+            // write (`XE2LPD_DDI_BUF_D2D_LINK_ENABLE` in `intel_dp->DP`).
+            let d2d = if xe2 {
+                crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+            } else {
+                0
+            };
             self.mmio.write32(
                 inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?,
-                off.buf_ctl | ddi_port_width(lanes) | DDI_BUF_CTL_ENABLE,
+                off.buf_ctl | ddi_port_width(lanes) | d2d | DDI_BUF_CTL_ENABLE,
             );
             compiler_fence(Ordering::SeqCst);
             crate::intel_gpu_xelpg::wait_port_buf_active(self.mmio, self.port)
