@@ -35,6 +35,7 @@ mod tests;
 
 pub mod acpi_notify;
 pub mod addr;
+pub mod amd_smn;
 pub mod bar;
 pub mod cxl;
 pub mod device;
