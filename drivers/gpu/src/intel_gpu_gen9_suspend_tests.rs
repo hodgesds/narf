@@ -87,6 +87,17 @@ impl MmioWindow for Machine {
             }
             // SKL_FUSE_STATUS: PG0 and PG1 distributed.
             0x42000 => sink.read32(off) | (1 << 27) | (1 << 26),
+            // LCPLL1_CTL: LOCK is status and follows ENABLE both ways
+            // (`skl_dpll0_disable` writes back the LOCK bit it read).
+            crate::intel_gpu_gen9_cdclk::LCPLL1_CTL => {
+                use crate::intel_gpu_gen9_cdclk::{LCPLL_PLL_ENABLE, LCPLL_PLL_LOCK};
+                let v = sink.read32(off);
+                if v & LCPLL_PLL_ENABLE == 0 {
+                    v & !LCPLL_PLL_LOCK
+                } else {
+                    v | LCPLL_PLL_LOCK
+                }
+            }
             _ => sink.read32(off),
         }
     }
