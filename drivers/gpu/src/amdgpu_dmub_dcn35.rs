@@ -197,12 +197,18 @@ pub(crate) mod tests {
     struct Regs {
         words: [u32; 0x400],
         writes: Vec<(u32, u32)>,
+        /// Emulate the DMCUB firmware acking a GPINT command by clearing
+        /// the command's status bit (STOP_CMD reads back as STOP_ACK).
+        /// Real hardware does this; a dumb store would leave the ack
+        /// poll in `reset()` spinning until its deadline.
+        ack_gpint: bool,
     }
     impl Regs {
         fn new() -> Self {
             Self {
                 words: [0; 0x400],
                 writes: Vec::new(),
+                ack_gpint: true,
             }
         }
     }
@@ -211,7 +217,12 @@ pub(crate) mod tests {
             self.words[reg as usize]
         }
         fn write(&mut self, reg: u32, value: u32) {
-            self.words[reg as usize] = value;
+            let stored = if reg == GPINT_DATAIN1 && value == STOP_CMD && self.ack_gpint {
+                STOP_ACK
+            } else {
+                value
+            };
+            self.words[reg as usize] = stored;
             self.writes.push((reg, value));
         }
     }
@@ -284,7 +295,8 @@ pub(crate) mod tests {
     fn dcn35_reset_times_out_when_firmware_never_halts() -> TestResult {
         let mut io = Regs::new();
         io.words[CNTL as usize] = ENABLE;
-        // GPINT never acks the STOP_FW.
+        // GPINT never acks the STOP_FW: the ack poll in loop 1 times out.
+        io.ack_gpint = false;
         match narf_scheduler::block_on_spin(reset(&mut io)) {
             Err(Error::Timeout) => TestResult::Pass,
             _ => TestResult::Fail("unresponsive firmware must time out"),

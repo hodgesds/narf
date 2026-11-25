@@ -964,10 +964,31 @@ pub(crate) mod tests {
         if prepared.stage(&mut staged).is_err() || &staged[offset..offset + bios.len()] != bios {
             return TestResult::Fail("platform VBIOS not copied to DMUB image");
         }
+        // DCN 3.5.0 is admitted past the version gate (the revoked
+        // authority is what refuses it here, not the version): the blob
+        // name is `dcn_3_5_dmcub.bin`.
         gpu.ip_blocks[0].minor = 5;
         gpu.ip_blocks[0].revision = 0;
-        if !matches!(Firmware::open(&gpu, &read), Err(FirmwareError::Unsupported)) {
-            return TestResult::Fail("DCN35 used the DCN314 firmware path");
+        if !matches!(
+            Firmware::open(&gpu, &read),
+            Err(FirmwareError::Registry(
+                narf_firmware::FirmwareError::AuthorityRevoked
+            ))
+        ) {
+            return TestResult::Fail("DCN 3.5 firmware path refused at the gate");
+        }
+        // Unlike 3.2, `prepare_dcn35` pins the image header to (3, 5),
+        // so the fixture's minor version is patched from 1 to 5 first.
+        let mut bytes35 = crate::amdgpu_dmub_firmware::tests::combined(256, 4);
+        bytes35[14] = 5;
+        let firmware35 = Firmware { bytes: bytes35 };
+        let prepared = match firmware35.prepare_from_gpu(&gpu) {
+            Ok(prepared) => prepared,
+            Err(_) => return TestResult::Fail("DCN 3.5 image preparation refused"),
+        };
+        let mut staged = alloc::vec![0; prepared.layout().size() as usize];
+        if prepared.stage(&mut staged).is_err() {
+            return TestResult::Fail("DCN 3.5 image staging refused");
         }
         // DCN 3.2.0 / 3.2.1 are admitted past the version gate (the revoked
         // authority is what refuses them here, not the version): the blob
