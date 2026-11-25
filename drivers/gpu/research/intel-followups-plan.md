@@ -52,13 +52,21 @@ work had.
 - Silicon runs of everything above, including the Gen9 display suspend
   owner (`narf.intel.gen9_suspend=1`) and Gen9 LP DC9.
 - Nova Lake-S: DC3CO (a typed refusal until the route has a LOBF,
-  panel-replay or PSR2 trigger and owns the CMTG), and silicon runs of the
+  panel-replay or PSR2 trigger and owns the CMTG; Panel Replay is qualified
+  on display 20/30 only and never with the AS SDP its trigger needs, and
+  the CMTG is not implemented), and silicon runs of the
   DC service and of a TBT dock. Thunderbolt alt mode on the LT PHY and the
   MST and DSC fixtures over LT ports have landed; the DMC wakelock is not
   used, and an inherited wakelock mode blocks DC6.
 - Display 14 and later: native HDMI FRL, HDMI audio, deep colour and
-  YCbCr 4:4:4, a second concurrent external route, panel replay, and
-  compressed primary layouts.
+  YCbCr 4:4:4. A second concurrent external route
+  (`narf.intel.ext_routes=2`), Panel Replay on the display-20/30 eDP
+  (`narf.intel.panel_replay=1`) and compressed framebuffers at ADDFB2
+  (`narf.intel.ccs=1`) have native fixtures only; still open are MST or
+  UHBR beside a second route, Panel Replay on the external routes (their
+  console scanout has no frontbuffer tracking to exit replay) and with the
+  AS SDP, region early transport, and compressed scanout through the KMS
+  presenter (the plane programming exists, the presenter refuses CCS).
 - DP 2.0 UHBR beyond the 128b/132b SST route behind `narf.intel.uhbr=1`
   (UHBR10/20 on C20 and LT ports, native fixtures only): 128b/132b MST, DSC
   over UHBR, UHBR over Thunderbolt alt mode (TBT 312.5/625 MHz clocks, DP
