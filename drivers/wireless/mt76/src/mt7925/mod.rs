@@ -34,7 +34,7 @@
 //!   (`regs::MT7925_TXQ_MCU_WM` = 15, `regs::MT7925_RXQ_MCU_WM` = 0).
 //!   UNI commands travel on TX MCU_WM (15) and their responses arrive
 //!   on RX MCU_WM (0); the live send path will use the DMA `RingMap`.
-//! - The chip-id gate (`pci.rs:441`) stays closed for MT7925 pending
+//! - The chip-id gate (`pci.rs:406`) stays closed for MT7925 pending
 //!   Q1 (#2494): what `MT_HW_CHIPID` reads on the 14c3:0717 card.
 //!
 //! ## Provenance

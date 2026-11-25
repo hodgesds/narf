@@ -2,8 +2,7 @@
 //! MT7925) — dual-build (built-in or loadable `.ko`).
 //!
 //! Promoted from the former `drivers/wireless/src/mt7921/` module. See
-//! `drivers/net/i40e/` for the reference dual-build shape and `PLAN.md` at the
-//! worktree root for the promotion rationale.
+//! `drivers/net/i40e/` for the reference dual-build shape.
 //!
 //! One source tree, two builds. The driver in [`mt7921`] (L1 remap, WFDMA
 //! rings, MCU framing, firmware download, the station join with its in-driver

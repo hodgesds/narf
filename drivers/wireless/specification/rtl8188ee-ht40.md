@@ -1,9 +1,9 @@
 # RTL8188EE signed HT20/40 full-program qualification
 
 This contract is part of [rtlwifi §3](rtlwifi.md#3-public-interface).
-NEHT v4 is implemented with eight native regressions; coordinated release
-compilation and execution are pending. No physical board measurements,
-signed deployment artifacts or silicon/RF acceptance are supplied.
+NEHT v4 is implemented with eight native regressions and passes the native
+software gates on x86_64 and aarch64. No physical board measurements, signed
+deployment artifacts or silicon/RF acceptance are supplied.
 
 `RtlwifiDevice::ht40_request(primary, secondary)` returns the optional
 filename and exact recipe SHA256 from the current firmware and NEPC
@@ -117,8 +117,8 @@ native DHCP/IP/descriptors; initial/response20 fallback; wrong native width
 or SGI40 with valid same-PN retry; current secondary-span restrictions and
 v4 revocation while DATA OWN is held; cancellation/source loss at actual
 RF HSSI waits; and actual BB readback/full32-bit scheduler terminal failure.
-Only hardware/MMIO/DMA and AP inputs are inert. These cases require root's
-coordinated native execution; they establish no physical RF measurements.
+Only hardware/MMIO/DMA and AP inputs are inert; the cases establish no
+physical RF measurements.
 
 The separate [NETH thermal continuation](rtl8188ee-tracking.md) can extend
 this exact measured v4 payload with bounded gain reductions and restoration,

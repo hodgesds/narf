@@ -1,9 +1,10 @@
 # RTL8188EU signed HT20/40 full-program qualification
 
 This contract is part of [rtl8xxxu §3](rtl8xxxu.md#3-public-interface).
-Implementation and eight native regressions are present; coordinated release
-compilation and native execution are pending. No real board measurements,
-signed deployment artifact or physical radio acceptance are supplied.
+Implementation and eight native regressions are present; the regressions
+run in the kernel test suite on both architectures. No real board
+measurements, signed deployment artifact or physical radio acceptance are
+supplied.
 
 `firmware_transport::Owner::ht40_request(primary, secondary)` returns the
 exact optional filename and recipe binding using the current executable and

@@ -25,7 +25,7 @@
 
 [package]
 name         = "narf-drivers-wireless-mt76"
-description  = "MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920) — built-in or loadable module."
+description  = "MediaTek CONNAC2/CONNAC3 Wi-Fi (MT7921/MT7922/MT7961/MT7920/MT7925) — built-in or loadable module."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

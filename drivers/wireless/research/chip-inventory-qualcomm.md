@@ -4,10 +4,19 @@
 > they used uncalibrated allowances and overlapping shared/backend/chip work.
 > The chip/path audit and measured LOC remain useful; packages describe scope.
 
-Audit: 2026-10-25, `codex/ath10k-active-scan`, committed baseline
-`e8fe43e7b` plus unvalidated work. Local reference is Linux7.3.0-rc4 in
-`/usr/src/linux`; that tree has no Git metadata. This inventories reachable
-software and known source capabilities, not physical-card qualification.
+Audit: 2026-10-25 at `e8fe43e7b` plus work then uncommitted. Local reference
+is Linux7.3.0-rc4 in `/usr/src/linux`; that tree has no Git metadata. This
+inventories reachable software and known source capabilities at that snapshot,
+not physical-card qualification. "WIP" and "combined gate pending" below refer
+to the snapshot.
+
+> Superseded since the snapshot: ath9k now also matches the AR5008, AR9280,
+> AR9287 and AR9003 families (AR9300, AR9462 `0x0034`, AR9485, AR9565,
+> AR9580; `ath9k/admission.rs`), so the AR9462 row and the "ath9k matches only
+> AR9285" statements below describe the snapshot; the ath10k capability list
+> (5 GHz, HT/VHT, DFS, AP, WoW and others) has also moved. Current state is in
+> `drivers/wireless/specification/ath9k.md`, `ath10k.md` and the feature
+> ledger (`remaining-features.tsv`, `implemented-pending-validation.tsv`).
 
 ## Actual matches and firmware profiles
 

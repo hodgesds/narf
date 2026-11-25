@@ -6,10 +6,9 @@
 # FullMAC pair (cyw43439 reuses brcmfmac's chip/event/provision/vif/ap code and
 # brcmfmac reuses cyw43439's fullmac/station/runtime), so they share a crate
 # (inner module paths `brcmfmac`/`cyw43439` preserved). Built-in or a loadable
-# `.ko`; the `.ko` registers BOTH buses — the CYW43439 SDIO id via
-# `narf_register_sdio_driver` (the Tier-2 SDIO shim) and the brcmfmac PCIe ids
-# via `narf_register_pci_driver`. Registration-only: the probe thunk returns
-# -ENOSYS until the Wi-Fi device datapath ABI lands.
+# `.ko` (module name `brcm`); the `.ko` runs the brcmfmac PCIe driver over the
+# KABI, registering the Broadcom PCIe ids via `narf_register_pci_driver`.
+# CYW43439 (SDIO/gSPI) is built-in only: no SDIO I/O KABI exists.
 
 [package]
 name         = "narf-drivers-wireless-brcm"

@@ -1,10 +1,13 @@
 # Wi-Fi chip inventory and measured footprint
 
-Snapshot: 2026-10-25 local / 2026-10-26 UTC, branch `codex/ath10k-active-scan`,
-baseline `e8fe43e7b` plus the current implementation wave.
+Measurement snapshot: 2026-10-25 at `e8fe43e7b` plus work then uncommitted.
+The LOC figures, the generated CSV/JSON files and the per-chip inventories
+describe that snapshot. Current feature state is the ledger in
+[remaining-features.tsv](remaining-features.tsv) (open rows) and
+[implemented-pending-validation.tsv](implemented-pending-validation.tsv).
 
-The registered-match audit covers all eleven driver families and **102 bus
-identities**. That is a match-table count, including aliases and explicit
+At the snapshot the registered-match audit covered all eleven driver families
+and **102 bus identities**. That is a match-table count, including aliases and explicit
 rejections, not 102 independent chips or 102 working radios. Per-board firmware,
 RF/revision and capability discovery are still needed before claiming every
 hardware-supported feature has been inventoried.
@@ -16,11 +19,8 @@ The per-chip findings remain useful; the numeric forecasts and derived
 engineer-day totals have been removed. There is no defensible all-feature
 completion date or percentage in this audit.
 
-The inventory's WIP labels describe its inspection snapshot. Subsequent combined
-validation of this wave passed 1887/0 fail/9 skip on x86_64 and
-1417/0 fail/3 skip on aarch64, with clean production boots/btrfs postflights,
-scoped production/kernel-test Clippy, workspace formatting and release/debug
-builds on both architectures. No physical-card acceptance is claimed.
+The inventories' WIP labels describe that snapshot. No physical-card
+acceptance is claimed.
 
 ## Measured source
 
@@ -78,9 +78,9 @@ capability is not evidence that the feature is inapplicable.
 | Inventory | Registered identities | Main gaps |
 |---|---:|---|
 | [Intel / ath11k](chip-inventory-intel-ath11k.md) | Intel16 PCI + ath11k3 PCI refined into6 profiles | Intel Gen2 automatic data/security startup; exact non-Sc firmware ABIs; Intel wider PHY/roles/PM; QCN9074 native HAL/DP |
-| [MT76 / FullMAC](chip-inventory-mt76-fullmac.md) | MT6 PCI + CYW2 SDIO + BCM26 PCI | MT BA/aggregation/HE/security/roles/PM; 23 BCM identities stop at discovery/parking; FullMAC vendor ABI/width/roles/reset/PM |
+| [MT76 / FullMAC](chip-inventory-mt76-fullmac.md) | MT6 PCI + CYW2 SDIO + BCM26 PCI (mt76 now registers 8 PCI tuples: MT7925 `0x7925`/`0x0717` added) | MT BA/aggregation/HE/security/roles/PM; 3 BCM identities (`0x43df`, `0x4354`, `0x4415`) have no Linux firmware row and stay parked, the other covered chips boot after signed board admission (`brcmfmac.md` "Additional PCIe chip profiles"); FullMAC vendor ABI/width/roles/reset/PM |
 | [Realtek](chip-inventory-realtek.md) | 19 PCI +20 USB | Four narrow conditional station chains; other matched chips, richer PHY/security/roles, IRQ/recovery/PM; wrong USB mappings identified |
-| [ath9k / ath10k](chip-inventory-qualcomm.md) | ath9k1 PCI + ath10k9 PCI | HT/VHT/aggregation, IRQ/recovery/PM/roles; AR9462 is an explicit wrong-driver rejection; catalog-only QCA9887 excluded |
+| [ath9k / ath10k](chip-inventory-qualcomm.md) | ath9k1 PCI + ath10k9 PCI (ath9k has since added the AR5008/AR9280/AR9287/AR9003 families) | HT/VHT/aggregation, IRQ/recovery/PM/roles; at the snapshot AR9462 was an ath10k wrong-driver rejection (ath9k now matches it); catalog-only QCA9887 excluded |
 
 These 102 identities include recognized devices that fail closed before
 activation. Firmware catalog entries are not a second support count. Aliases
@@ -88,12 +88,12 @@ share implementation while requiring actual board qualification. Remaining
 work is described by concrete package/driver paths rather than multiplying a
 full-driver estimate by each marketing label.
 
-## Planning and implementation order
+## Planning
 
-Continue independent native feature packages in parallel: Intel Gen2 normal
-data/controlled-port ownership; MT76 RX BA/reordering before TX aggregation;
-RTL8821CE operating radio/packet/station after calibration and power. Root
-coordinates shared APIs, Qualcomm work and combined gates.
+Open feature work is tracked per row in
+[remaining-features.tsv](remaining-features.tsv); implemented rows awaiting
+validation are in
+[implemented-pending-validation.tsv](implemented-pending-validation.tsv).
 
 A tighter time estimate needs a closed per-profile acceptance checklist and
 measured implementation/review/integration cycles for representative aggregation,

@@ -1,6 +1,6 @@
 [package]
 name         = "narf-drivers-wireless"
-description  = "Hardware Wireless drivers (MT7921) skeleton — Stage-4."
+description  = "Wi-Fi driver facade: re-exports the per-family Wi-Fi driver crates for the built-in kernel."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

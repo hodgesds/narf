@@ -1,6 +1,6 @@
 # ath10k — Specification
 
-> Status: **Retained RAW station; bounded 5-GHz HT40/source/protection extension
+> Status: **Retained RAW station; HT40/VHT/source/protection extensions
 > validated in native software suites; physical acceptance pending.**
 > The live PCI task obtains BMI identity, selects trusted firmware/BDF,
 > runs OTP calibration and downloads the image. It retains runtime CE DMA
@@ -9,37 +9,16 @@
 > scan vdev follow, with policy-authorized directed/wildcard active discovery.
 > Raw-capable non-PFC images can publish a retained legacy/HT20
 > station interface with Open/WPA2, bounded native packet progress and terminal
-> disconnect. This checkpoint adds conditional non-DFS SISO HT40 with LGI40,
-> retained executable/BDF authority and native RTS/CTS intent. Those preceding cases
-> pass both-architecture native suites; matched IDs confer no board qualification.
-> The separately gated SGI40 extension passes nine native cases on both
-> architectures; physical qualification remains open.
-> A later chain/NSS/TX-STBC extension is source complete with four new
-> unexecuted cases; release compilation and native validation are pending.
-> A subsequent 2.4-GHz HT40/20–40 coexistence extension is source complete
-> with seven new cases written; its release compilation and native execution
-> are pending. Physical RF/power acceptance is still separate.
-
-> A subsequent 80+80 extension is source complete for the qualified QCA9984/
-> QCA9888 10.4 station owner. Six new cases are written and unexecuted;
-> release compilation, native suites and physical acceptance are pending.
-> Contiguous VHT160 (ch36–64 / ch100–128) later followed in §3 on top of the
-> station-client DFS witness and the shared AUTO_BW regulatory run; its new
-> cases are written and unexecuted.
->
-> A later host-bus PM continuation is source complete for MSI-backed
-> QCA6174/6164 and QCA9377 runtime owners. Seven new cases are written and
-> unexecuted; release compilation, native suites and physical acceptance are
-> pending. A released host wake vote is not a firmware-sleep acknowledgement.
-
-> The later bounded RAW/10.4 PFC station continuation is source complete.
-> Six new cases are written but unexecuted; coordinated release compilation,
-> native execution and physical firmware/board acceptance remain pending.
-
-> A later native Beacon-hint continuation is source complete for the existing
-> non-DFS 5 GHz World-factory inventory. Six new cases are written and
-> unexecuted; coordinated release/native validation and physical acceptance
-> remain pending. Signed host restrictions remain independent authority.
+> disconnect. Conditional non-DFS SISO HT40 with LGI40, separately gated
+> SGI40, retained executable/BDF authority, native RTS/CTS intent,
+> chain/NSS/TX-STBC, 2.4-GHz HT40/20–40 coexistence, the bounded QCA9984/
+> QCA9888 80+80 owner and managed off-channel scan pass the native suites on
+> x86_64 and aarch64. Contiguous VHT160, host-bus PM, bounded RAW/10.4 PFC,
+> World-layer Beacon hints, indoor policy, station DFS, hardware keys, WoWLAN,
+> the legacy AP, P2P roles, automatic credential replay and DT/NVMEM
+> calibration pass on x86_64, with aarch64 pending. Matched IDs confer no
+> board qualification. The crate builds built-in or as the loadable
+> `ath10k.ko` (§3).
 
 ## 1. Purpose & scope
 
@@ -61,16 +40,30 @@ Host-bus/system power transitions remain separate profiles.
 
 ## 3. Public interface
 
-**Software acceptance at `6813a24c6`.** The admitted
-`multiple_spatial_streams`, `tx_stbc`, `ht40_2ghz`, `ht2040_coexistence`,
-bounded `vht80p80` and managed Public Action `offchannel_scan` continuations
-pass the checkpoint release/native gates on x86_64 and aarch64. Contiguous160,
-host-bus PM, wake offload and native AP/P2P roles keep their separate
-remaining rows. This supersedes implementation-time statements below that
-release/native execution or software acceptance is pending, only for the named
-feature scopes. Physical measurements, signed board/deployment programs and
-actual-device RF/power/interoperability acceptance remain separate.
+The admitted `multiple_spatial_streams`, `tx_stbc`, `ht40_2ghz`,
+`ht2040_coexistence`, bounded `vht80p80` and managed Public Action
+`offchannel_scan` programs pass the release and native gates on x86_64 and
+aarch64. The rows in `implemented-pending-validation.tsv` (contiguous160,
+host-bus PM, PFC, Beacon hints, indoor policy, DFS, hardware keys, wake
+offload, AP, P2P, credential replay, alternate calibration) pass on x86_64
+and await aarch64 and hardware. Physical measurements, signed
+board/deployment programs and actual-device RF/power/interoperability
+acceptance remain separate.
 
+- The crate builds built-in (the default `builtin` feature, registered from
+  the `narf-drivers-wireless` facade) or as the loadable `ath10k.ko`
+  (`cargo xtask build-module --package narf-drivers-wireless-ath10k
+  --no-default-features --features module`). The module runs the same BMI,
+  firmware/board download, CE, HTC, WMI, HTT and station source over the
+  KABI (`src/ath10k/platform/`) and registers every built-in PCI ID except
+  AR9462 under the match name `ath10k`. Firmware arrives as copies through
+  `narf_firmware_open`/`_read`, so revoking an input after it was read is
+  not observable from the `.ko`; the regulatory domain is the kernel's live
+  one, read through `narf_wireless_regdomain`. Its netdev and wiphy reach the
+  stack through the netif bridge and the `WIFI` family host
+  (`iface_module.rs`); automatic recovery and credential replay run as built
+  in. AP/P2P/ROC, WoW and system PM, power-save control and the userspace
+  SME are built-in only.
 - `register()` / `register_pci_driver()` publish exact PCI matches.
 - `pci::probe` disables inherited bus mastering, wakes and identifies the
   chip, retains its metadata and schedules the boot task. Bound-driver
@@ -350,10 +343,10 @@ actual-device RF/power/interoperability acceptance remain separate.
   `sme_proc_obss_scan`, `wpa_obss_scan_freqs_list`, `sme_sched_obss_scan`;
   `hw_features_common.c::check_40mhz_2g4` at commit
   `f43a200a87e4d4bd578de6eb56b4b527f9e01880` confirms the center ±25MHz edge.
-  Seven new native/source cases are written, including all six dialects,
-  Open/WPA2 DHCP/IP, both extension directions, timed scans/reports, initial
-  real20 fallback, exact native narrowing, same-PN admission and held restart
-  cancellation. They remain unexecuted; release compilation is pending.
+  Seven native/source cases cover all six dialects, Open/WPA2 DHCP/IP, both
+  extension directions, timed scans/reports, initial real20 fallback, exact
+  native narrowing, same-PN admission and held restart cancellation. They
+  pass on x86_64 and aarch64.
 - HT LDPC and one-stream RX STBC (`wmi_runtime::ht::{ldpc,rx_stbc,Profile}`)
   follow Linux `mac.c::ath10k_get_ht_cap`: IEEE LDPC_CODING (0x0001) is
   advertised only for SERVICE_READY `WMI_HT_CAP_LDPC` (0x0040) or the pair
@@ -593,7 +586,7 @@ actual-device RF/power/interoperability acceptance remain separate.
   ch165–177 are outside the factory/board inventory. The receipt keeps the
   80+80 shape: `center` is the primary80 half and `center2` the adjacent half
   (80 MHz away; 802.11 forbids adjacent 80+80 segments, so distance alone
-  separates the shapes and 80+80 now refuses an adjacent segment). Each half
+  separates the shapes and 80+80 refuses an adjacent segment). Each half
   is an ordinary 80 MHz receipt, so every radar 20 MHz constituent needs the
   station client's heard Beacon (§ DFS client below); additionally every rule
   overlapping the whole 160 MHz block must allow 160
@@ -601,7 +594,7 @@ actual-device RF/power/interoperability acceptance remain separate.
   rule, or an `AUTO_BW` run across the 5250 MHz boundary as wireless-regdb
   `US` declares it; `NO_160MHZ` closes it), mirroring cfg80211
   `reg_get_max_bandwidth` and `cfg80211_chandef_usable`. Per-rule bandwidth
-  for every width now follows that effective value. The peer VHT width set is
+  for every width follows that effective value. The peer VHT width set is
   mac80211's own-width intersection (`ieee80211_vht_cap_ie_to_sta_vht_cap`);
   a 160-only station facing an AP that advertises only 160+80+80 is refused
   (mac80211 would hold that peer at 80 MHz) and falls back to primary80.
@@ -615,8 +608,9 @@ actual-device RF/power/interoperability acceptance remain separate.
   `WMI_CHAN_FLAG_DFS_CFREQ2` (bit15) when `center2 - 10` is a radar channel;
   no station START carries `WMI_CHAN_FLAG_DFS`. The channel list lists all
   eight rows, radar rows `PASSIVE | DFS`. `PeerPrepared` reports the cfg80211
-  chandef (160 MHz centre, no second segment, bandwidth 160). Tests (written,
-  unexecuted): `smoke_ath10k_vht160_contiguous_auto_bw_and_radar_constituents`,
+  chandef (160 MHz centre, no second segment, bandwidth 160). Tests (pass on
+  x86_64; aarch64 pending):
+  `smoke_ath10k_vht160_contiguous_auto_bw_and_radar_constituents`,
   `smoke_ath10k_vht160_direct_rule_upper_radar_span`,
   `smoke_ath10k_vht160_profile_primary80_and_second_center`,
   `smoke_ath10k_vht160_phymodes_and_nss_override`,
@@ -633,12 +627,12 @@ actual-device RF/power/interoperability acceptance remain separate.
   facts select an actual primary80 request, native start and peer profile.
   There is no live retune or late width alias. Native source admission and
   existing terminal/cancellation/key ownership remain mandatory.
-  Six new cases cover the two actual chip/NSS profiles, both segment orders
-  and operation encodings, Open/WPA2 kernel DHCP/IP, unequal span power,
-  real primary80 fallback, original encrypted same-PN PHY rejection,
+  Six 80+80 cases cover the two actual chip/NSS profiles, both segment
+  orders and operation encodings, Open/WPA2 kernel DHCP/IP, unequal span
+  power, real primary80 fallback, original encrypted same-PN PHY rejection,
   directional highest-rate hints, second-span final-copy revocation and
-  response center2 replacement. They have not run; release compilation and
-  physical RF/interoperability acceptance are pending.
+  response center2 replacement. They pass on x86_64 and aarch64; physical
+  RF/interoperability acceptance is pending.
 - WPA2-PMF and WPA3-SAE (`wmi_runtime/station_pmf.rs`, `data.rs`,
   `management.rs`; smokes under `drivers/wireless/ath10k/pmf` and
   `drivers/wireless/ath10k/wpa3`). Linux v7.2 sets `MFP_CAPABLE`
@@ -683,10 +677,10 @@ actual-device RF/power/interoperability acceptance remain separate.
   on either band; NO_P2P alone does not restrict STA. Cancellation or a late
   successful receipt cannot reopen the host, commit a failed M4 or release
   uncertain DMA. Passive receive keeps its distinct non-transmit permission.
-- The older public `wmi` MAIN-dialect codec now uses Linux's group IDs
+- The older public `wmi` MAIN-dialect codec uses Linux's group IDs
   starting at index 1, with distinct scan/debug events and correct
   `VDEV_SET_PARAM` (0x5008), RTS, fragmentation, beacon and DTIM parameter
-  IDs. The nonexistent `vdev_param::MAC_ADDR` constant is removed. These
+  IDs. There is no `vdev_param::MAC_ADDR` constant (Linux has none). These
   helpers remain MAIN-only; the retained runtime selects each firmware
   dialect separately.
 - `regulatory::Factory::from_eeprom` resolves the bounded SERVICE_READY
@@ -723,8 +717,10 @@ actual-device RF/power/interoperability acceptance remain separate.
   be scanned/replaced until owned teardown/reset is implemented. Any ambiguous
   command, cancellation, malformed map or failed response closes its owner
   while retaining DMA. Station prepare, management exchange and association
-  bootstrap a staged signed `wireless-regulatory.bin` through
-  `reg::db::ensure_domain()` when the caller has not installed a domain.
+  bootstrap a staged signed `wireless-regulatory.bin` (or, when none is
+  staged, the Linux database's world `00`) through `reg::db::ensure_domain()`
+  when the caller has not installed a domain; the `.ko` instead reads the
+  kernel's installed domain through `narf_wireless_regdomain`.
   Missing/invalid policy fails before station publication; another driver
   is not required to initialize regulatory state.
 - `pci::exchange_initial_management(frame)` exchanges initial unprotected
@@ -869,7 +865,8 @@ actual-device RF/power/interoperability acceptance remain separate.
   from its network block; mac80211's in-place `ieee80211_reconfig` (re-adding
   the station and keys without an over-the-air exchange) is not modelled,
   so PN/replay state and keys restart with the new RSNA. One attempt per
-  generation; no retry/backoff policy. Composed case (written, unexecuted):
+  generation; no retry/backoff policy. Composed case (passes on x86_64;
+  aarch64 pending):
   `smoke_ath10k_recovery_replays_retained_credentials_on_rebound_generation`
   (main and TLV: down netdev skipped, replay with a fresh FakeAp 4-way,
   bidirectional data, operator disconnect forgets); shared
@@ -954,8 +951,9 @@ actual-device RF/power/interoperability acceptance remain separate.
   retired Drop never supplies a delayed hardware-cleanup attempt.
   Seven source cases cover real cap revocation/RTC/vote/refcount edges, retained
   native CE and management tickets, explicit defer versus genuine empty
-  receive, and unassociated current-source/input ownership. They are written
-  but unexecuted. No target power, wake latency or board measurement is claimed.
+  receive, and unassociated current-source/input ownership. They pass on
+  x86_64; aarch64 execution is pending. No target power, wake latency or
+  board measurement is claimed.
 - Interrupt service (`irq.rs`, `boot/interrupts.rs`). Linux v6.10
   `pci.c::ath10k_pci_init_irq` tries MSI first; `ath10k_pci_hif_start`
   calls `ath10k_pci_irq_enable`. Here `PciBoot::done_complete` (BMI_DONE
@@ -1110,7 +1108,7 @@ actual-device RF/power/interoperability acceptance remain separate.
   Carrier starts closed and opens only after actual authorization. Disconnect,
   cancelled control operations, peer loss, malformed state and native progress
   failure close carrier permanently; another join requires a future reset owner.
-- **Associated scans:** the Device now has a retained scan receipt owner for
+- **Associated scans:** the Device has a retained scan receipt owner for
   passive or directed/wildcard active scans on an authorized station vdev.
   Firmware's normal WMI scan scheduler handles home/off-channel PS and dwell,
   following Linux `mac.c::ath10k_hw_scan`. Twelve native conversation cases
@@ -1166,8 +1164,8 @@ actual-device RF/power/interoperability acceptance remain separate.
   requires the original halt plus ordered-flush proof; otherwise DMA stays
   pinned. A stale request cannot retire a successor. Physical grant loss may
   deny the attempt; no timeout or reset submission asserts physical RF quiet.
-- **Bounded ROC, implicit FRAME wait and Public Action responses (source
-  implementation; execution pending):** actual managed vdev0 can acquire one
+- **Bounded ROC, implicit FRAME wait and Public Action responses:** actual
+  managed vdev0 can acquire one
   receive-only or separately TX-qualified channel for1..500ms through typed Radio control. It never creates
   a P2P interface or borrows an AP/GO owner. A live original socket/grant,
   registered IFINDEX and immutable physical generation remain required. The
@@ -1231,14 +1229,14 @@ actual-device RF/power/interoperability acceptance remain separate.
   is not advertised here. Robust SME/PMF injection and P2P device/client/GO roles
   remain separate capabilities. A 2.4GHz NO_CCK request still refuses without an
   actual restorable per-request native rate receipt;5GHz uses its native rate.
-  The bounded managed-vdev `offchannel_scan` contract is source implemented.
-  Ten new native cases cover six dialects, real delegated source/registration,
+  The bounded managed-vdev `offchannel_scan` contract is implemented.
+  Ten native cases cover six dialects, real delegated source/registration,
   actual FOREIGN/home receipts, Open/WPA2 DHCP/IP after DATA suspension, old/new
   HTT and WMI-reference terminal/peer ownership, multicast TX, timed/cancelled
   STOP holds, source/cap/daemon/policy loss, pure/inline/NO_IR refusals, implicit
   wait, actual WMI responses and callback-time filter/policy/source/expiry loss.
   Four shared cases cover exact IFINDEX/deferred status/registration and fixed
-  Radio-kind prepared-event fences. All14 are written but unexecuted; no RF,
+  Radio-kind prepared-event fences. All14 pass on x86_64 and aarch64; no RF,
   timing or board qualification is claimed.
 - RAW station images without firmware `NO_PS` expose an awake station
   power-save default and `WirelessNetIface::set_power_save`. The synchronous
@@ -1345,8 +1343,8 @@ actual-device RF/power/interoperability acceptance remain separate.
   `smoke_ath10k_nvmem_cell_failures_are_terminal_sources`,
   `smoke_ath10k_calibration_source_precedence_matches_linux` and
   `smoke_ath10k_platform_nvmem_pre_cal_and_dt_cal_drive_native_bmi` (synthetic
-  DTBs and BMI target) are written but unexecuted; no physical board or
-  platform DTB is claimed.
+  DTBs and BMI target) pass on x86_64; aarch64 execution is pending. No
+  physical board or platform DTB is claimed.
 - `firmware::Image::{parse, load}` own the API 2–6 container and expose
   bounded image/OTP/code-swap slices, feature bits and WMI/HTT operation
   versions. `Files` supplies owned immutable bytes and `Files::wait_missing`
@@ -1392,7 +1390,7 @@ actual-device RF/power/interoperability acceptance remain separate.
   code/key erasure claims.
 - `hw::HwRev::registers()` returns the correct per-family windows;
   `Registers::ce_base(pipe)` rejects an out-of-range CE index. The RTC
-  chip-ID helper now returns the complete BAR-relative address.
+  chip-ID helper returns the complete BAR-relative address.
 - `ce::RingConfig` includes `hw_rev`. Sizes are **entry counts**, not byte
   counts; source DMAX and byte-swap controls preserve unrelated bits.
   `host_int_disabled` controls `HOST_IE`, never destination byte swap.
@@ -1581,8 +1579,8 @@ The same permission checks cover native probes, association, terminal peer
 admission and packet/copy/control progress. Removing the fact while retaining
 the indoor-only restriction closes old admission; restoring it cannot revive
 a terminal old radio. See [the exact policy and native contract](ath10k-indoor-regulatory.md).
-Source and native cases are written; coordinated release/native acceptance
-remains pending. This adds no country inference or generic nl80211 indoor hint.
+Source and native cases pass on x86_64; aarch64 execution is pending. This
+adds no country inference or generic nl80211 indoor hint.
 
 ### 3.2 Native Beacon hints for the factory World layer
 
@@ -1622,8 +1620,8 @@ bandwidth/power limit and existing factory/hardware limit still applies.
 The firmware receives its real factory pair/CTL plus host power ceiling;
 neither a country nor a firmware/RF receipt is invented. Two ownership/parser
 cases and four native CE/HTT/Open/WPA2/DHCP/IP, false-observation, host/span
-and policy-wait/copied-DATA cases are written; coordinated release/native
-validation and actual-device qualification remain pending.
+and policy-wait/copied-DATA cases pass on x86_64; aarch64 execution and
+actual-device qualification remain pending.
 
 ### 3.3 Native legacy AP and userspace authenticator
 
@@ -1733,14 +1731,15 @@ packet becomes a replacement BSS.
 Primary command/event/rate/descriptor sources are the local Linux7.3-rc4
 `ath10k/{mac.c,wmi.c,wmi.h,wmi-tlv.c,wmi-tlv.h,htt_tx.c,htt_rx.c,htt.h,hw.h,
 rx_desc.h}`. The earlier pinned7.2 files remain separately recorded where
-identical. Ten independent native cases are written for actual CE/HTT/AP
+identical. Ten independent native cases cover actual CE/HTT/AP
 start/peer/teardown, TIM/DTIM/templates, staging and PN continuity, terminal
 hold/cancel, known-peer copy replacement, long queued-loss prefixes,
 prepublication MAP and malformed-message denial, source/policy retirement,
 real AES-CCMP port/MIC/replay and copied-data fences, U-APSD native words and
 userspace M1–M4 with real MIC/AES wrap before native keys/port/DATA.
-Compilation, native execution and actual firmware/board/RF interoperability
-acceptance are pending; these cases are not physical evidence.
+They pass on x86_64; aarch64 execution and actual firmware/board/RF
+interoperability acceptance are pending. These cases are not physical
+evidence.
 
 ### 3.4 Station hardware key offload (RAW + `cryptmode=0`)
 
@@ -1748,11 +1747,11 @@ acceptance are pending; these cases are not physical evidence.
 default `cryptmode=0` beside `rawmode=1`) keeps `station_security::Security`
 as the sole RSNA/PN/replay owner, built `with_hardware_keys`, and layers
 firmware key offload over the unchanged software path
-(`wmi_runtime/hw_keys.rs`, `wmi_runtime/data.rs`). The earlier plan to move
-ath10k onto a bare `eapol::Supplicant` (ath11k `mac/sec.rs`) was not taken:
-the retained owner already carries the M4/group-reply commit fence, key-reuse
-history, A-MSDU/SPP and SAE/PMF state the RAW path depends on, so the shared
-crate gained only an opt-in offload surface (`wireless/` spec §3).
+(`wmi_runtime/hw_keys.rs`, `wmi_runtime/data.rs`). ath10k does not use a
+bare `eapol::Supplicant` as ath11k does: the retained owner carries the
+M4/group-reply commit fence, key-reuse history, A-MSDU/SPP and SAE/PMF state
+the RAW path depends on, so the shared crate exposes only an opt-in offload
+surface (`wireless/` spec §3).
 
 - **Install.** Each PTK/GTK whose material changes at a reply's terminal
   delivery (PTK before GTK; an identical re-delivery installs nothing, as
@@ -1803,7 +1802,8 @@ crate gained only an opt-in offload surface (`wireless/` spec §3).
 - Not offloaded: TKIP/WEP/GCMP (not admitted by the station profile), MLD
   owners, AP-side keys (§3.3 keeps its software owner) and fragments.
 
-Native cases (written, unexecuted): `smoke_ath10k_hw_keys_install_struct_dialects`,
+Native cases (pass on x86_64; aarch64 pending):
+`smoke_ath10k_hw_keys_install_struct_dialects`,
 `smoke_ath10k_hw_keys_install_tlv`, `smoke_ath10k_hw_keys_peer_pmf_flag_map`,
 `smoke_ath10k_hw_keys_security_indication` (ath10k) and
 `smoke_station_ccmp_offload_header_only_shares_tx_pn`,
@@ -1826,9 +1826,8 @@ of slot 2 whose second install is held (a frame the firmware decrypts under
 the stale GTK is dropped, an undecrypted frame under the new GTK takes the
 software path, the released `SEC_IND` re-admits decrypted traffic), and a
 replayed then fresh firmware-decrypted protected deauthentication.
-Coordinated release compilation, native execution and physical
-firmware/board acceptance are pending; no physical key-cache behaviour is
-claimed.
+Physical firmware/board acceptance is pending; no physical key-cache
+behaviour is claimed.
 
 ### 3.5 DFS
 
@@ -1836,7 +1835,7 @@ claimed.
 inventory already lists ch52–64 and ch100–144 as `WMI_CHAN_FLAG_PASSIVE` rows
 and `receive_permission` admits host DFS rules for receive-only scans. The
 station inventory (`Permission::station_frequency` = non-DFS profile plus
-`Permission::dfs_frequency`) now exposes those channels to the interface
+`Permission::dfs_frequency`) exposes those channels to the interface
 scan/associate/band surface; AP (`ap_wire`), off-channel and active-probe
 paths keep `profile_frequency` and an ordinary `Owner::receipt`, which never
 carries radar, so none of them can transmit first on a radar channel. An
@@ -1871,7 +1870,7 @@ channel-list rows (`station_ht40_channels`, the associated-scan home row) are
 (`ch->passive |= ch->chan_radar`). A station VDEV_START carries no DFS flag
 (Linux sets `chan_radar` only for `WMI_VDEV_TYPE_AP` in
 `ath10k_vdev_start_restart`). A STA performs no radar detection in Linux;
-neither does this one. Test (written, unexecuted):
+neither does this one. Test (passes on x86_64; aarch64 pending):
 `smoke_ath10k_dfs_client_needs_radar_beacon_in_current_scan`.
 
 **AP radar detection, CAC/NOP and radar-triggered CSA are gated out of
@@ -1915,7 +1914,7 @@ DFS channel-state machine (USABLE/UNAVAILABLE/AVAILABLE, CAC, NOP) belongs to
 `narf_wireless::reg` when a driver whose upstream enables radar detection by
 default needs it; it is not an ath10k obligation.
 
-### 3.6 Station WoWLAN (implementation; validation pending)
+### 3.6 Station WoWLAN
 
 **Admission (`wow.c::ath10k_wow_init`).** Only `wmi-tlv.c` implements the
 `gen_wow_*` WMI ops, so MAIN/10.x/10.4 images never advertise WoWLAN.
@@ -2003,7 +2002,8 @@ recovery budget (Linux RESTARTING + `ieee80211_reconfig`); the rebound
 netdev then replays the retained credentials. PCI PME/wake-enable of the
 function belongs to the system-PM owner and is not claimed here.
 
-**Tests (written, unexecuted).** `wmi_runtime/wow_tests.rs` (fixed command
+**Tests (pass on x86_64; aarch64 pending).** `wmi_runtime/wow_tests.rs`
+(fixed command
 layouts, ADD_WAKE_PATTERN layout, program/event mask and 802.3 conversion,
 wake-event decode) and `wmi_boot/wow_conversation_tests.rs` (composed WPA2
 station with hardware keys: magic suspend→wake→resume with exact Linux
@@ -2019,7 +2019,7 @@ start, NLO_DETECTED only, ENABLE, HOSTWAKEUP, NLO stop on the home vdev,
 then a normal join). No physical WoW
 entry, wake latency, PME routing or power measurement is claimed.
 
-### 3.7 Native-WiFi decap station (implementation; validation pending)
+### 3.7 Native-WiFi decap station
 
 Linux's default ath10k frame mode is `ATH10K_HW_TXRX_NATIVE_WIFI`
 (`rawmode=0`, core.c `ath10k_core_init_firmware_features`: INIT
@@ -2071,11 +2071,12 @@ unchanged; no board fact is added.
 - **WoW** (§3.6): the native-WiFi owner satisfies `wowlan_support`, so
   QCA6174 hw3.0 firmware-4/-6 and QCA9377 firmware-6 advertise
   disconnect/magic plus 22 native-WiFi patterns (`WOW_MAX_REDUCE`).
-- **Descriptor offset fix.** DECAP_FORMAT is `rx_msdu_start_common.info1`
-  (byte 32, after `flow_id_crc`); the RAW station and AP admissions read
-  byte 28 before and now read 32, as does the data fixture.
+- **Descriptor offset.** DECAP_FORMAT is `rx_msdu_start_common.info1`
+  (byte 32, after `flow_id_crc`); the RAW station and AP admissions and the
+  data fixture read byte 32.
 
-Tests (written, unexecuted): `wmi_runtime/nwifi_tests.rs`
+Tests (pass on x86_64 with the wake-offload row; aarch64 pending):
+`wmi_runtime/nwifi_tests.rs`
 (`smoke_ath10k_nwifi_transmit_strips_qos_control`,
 `smoke_ath10k_nwifi_undecap_single_decrypted_msdu`,
 `smoke_ath10k_nwifi_undecap_amsdu_aggregate`) and the composed
@@ -2088,16 +2089,16 @@ firmware encrypts, and a group frame under the new GTK;
 `smoke_ath10k_nwifi_wowlan_advertised_with_patterns`). The model firmware
 (`data_tests.rs` `native_frame`/`native_rx_msdu`) rebuilds QoS from the
 descriptor TID and encrypts at its own PN, and delivers decryptable data as
-native-WiFi MSDUs. Release compilation passed clippy on both arches; native
-execution and physical QCA6174/QCA9377 acceptance are pending, and no
+native-WiFi MSDUs. Physical QCA6174/QCA9377 acceptance is pending, and no
 physical native-WiFi behaviour is claimed.
 
-### 3.8 P2P roles (groundwork; not advertised)
+### 3.8 P2P roles (TLV)
 
-**Status: partial. No P2P interface type, combination or control opt-in is
-advertised; the ledger row stays open.** `wmi_runtime/p2p.rs` holds the
-per-vdev identity and native P2P codecs that the P2P device/client/GO owners
-will bind; none of them grants RF, peer, key or data authority.
+**Status: TLV firmware without NO_P2P advertises P2P_CLIENT, P2P_GO and the
+P2P_DEVICE control wdev (Advertisement, below); other dialects advertise
+none.** `wmi_runtime/p2p.rs` holds the per-vdev identity and native P2P
+codecs that the P2P device/client/GO owners bind; none of them grants RF,
+peer, key or data authority.
 
 - **Vdev roles.** `Role` maps nl80211 STATION2/AP3/P2P_CLIENT8/P2P_GO9/
   P2P_DEVICE10 to `WMI_VDEV_TYPE_*` and subtype exactly as
@@ -2106,7 +2107,7 @@ will bind; none of them grants RF, peer, key or data authority.
   P2P_DEV1, P2P_CLI2, P2P_GO3. `Vdev::create` is the single
   `WMI_VDEV_CREATE` builder for all dialects (`wmi.c::ath10k_wmi_op_gen_vdev_create`,
   TLV tag 86); the existing station (`Wire::create`) and TLV AP
-  (`ap_wire::create`) vdev0 builders now delegate to it byte-identically
+  (`ap_wire::create`) vdev0 builders delegate to it byte-identically
   (the AP builder additionally refuses a zero/multicast own address).
 - **Vdev ids.** `VdevMap` mirrors `ar->free_vdev_map` (INIT `num_vdevs`,
   lowest free bit as `__ffs64`); exhaustion is `Exhausted` (Linux
@@ -2464,7 +2465,7 @@ will bind; none of them grants RF, peer, key or data authority.
   netdev, a second P2P client or GO (one slot each, one AP session),
   host-programmed CTWindow/OppPS (`supports_p2p_go_power_save` false,
   as Linux ath10k) and the MAIN-dialect P2P path.
-Tests (written, unexecuted): `wmi_runtime/p2p_tests.rs`
+Tests (pass on x86_64; aarch64 pending): `wmi_runtime/p2p_tests.rs`
 `smoke_ath10k_p2p_vdev_create_roles`,
 `smoke_ath10k_p2p_vdev_map_lowest_free`,
 `smoke_ath10k_p2p_go_beacon_ie_moves_to_firmware`,
@@ -2544,7 +2545,7 @@ containers or failed OTP execution do not proceed to image activation.
 
 ## 7. Stage assignment
 
-Boot transport groundwork in Stage 5. Software regressions cover corrected
+Stage 5. Software regressions cover corrected
 CE programming, ring completion/wrap/reuse, DMA bounds, BMI chunking,
 short responses and the DONE transition. Composed ROM fixtures execute the
 production BMI orchestration and verify selected BDF bytes, OTP parameters,
@@ -2594,14 +2595,14 @@ protection change; a changed HT Operation still closes the station
 (`matches_beacon`). Smoke:
 `smoke_ath10k_beacon_erp_protection_reprograms_cts_all_six_dialects`.
 
-**TSPEC is inapplicable** (row removed 2026-10-28): ath10k never sets
+**TSPEC is inapplicable** (no ledger row): ath10k never sets
 `NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`, so `nl80211_add_tx_ts` refuses
 ADD_TX_TS and mac80211 never originates ADDTS; ACM ACs keep the
 `ieee80211_downgrade_queue` behaviour in `tx_qos.rs`. (Of the upstream
 wireless drivers only iwlwifi mvm/mld set that feature.)
 
-**Station U-APSD is not reachable upstream** (row folded into `ap`
-2026-10-28): mac80211 starts every station with
+**Station U-APSD is not reachable upstream** (covered by the `ap` row):
+mac80211 starts every station with
 `IEEE80211_DEFAULT_UAPSD_QUEUES` 0, no driver sets `hw.uapsd_queues`, and
 only the mac80211 debugfs `uapsd_queues` file changes it, so
 `IEEE80211_STA_UAPSD_ENABLED` is never set and `ath10k_conf_tx_uapsd` only
@@ -2616,9 +2617,10 @@ file, firmware advertising RAW_MODE_SUPPORT, non-PFC HTT, legacy/HT20 station on
 host-permitted channels1–11 or the matching fixed-country non-DFS 5-GHz profile,
 passive/active scan, Open or WPA2-PSK/CCMP, DHCP and
 bidirectional IP. Peer/vdev retirement is terminal; firmware and DMA allocations
-remain owned until full-device reset. Interrupts remain masked and the bounded
-polling path is the initial packet service. No country, real calibration data,
-firmware asset or credential is invented by the driver or its models.
+remain owned until full-device reset. Packet service uses the MSI vector when
+the function has one and bounded 1 ms polling otherwise. No country, real
+calibration data, firmware asset or credential is invented by the driver or
+its models.
 
 Native composition tests consume actual generic CE descriptors, HTT DMA payloads
 and RX descriptors through the retained Radio and Device. One independent AP
@@ -2634,7 +2636,7 @@ concurrent closure and preference replacement. `NO_PS` images reject requests
 before I/O. These checks establish submitted control intent; physical DTIM,
 buffering, wake latency and energy behavior remain hardware acceptance work.
 
-The preceding checkpoint added 22 native smokes: nine under
+Twenty-two native smokes cover HT40, source and protection: nine under
 `drivers/wireless/ath10k/ht40`, eight under
 `drivers/wireless/ath10k/source` and five under
 `drivers/wireless/ath10k/protection`. HT40 cases compose all six dialects with
@@ -2647,8 +2649,8 @@ actual capability revocation/reinstall, native BMI/MMIO and held M4/CE/HTT
 storage. They prove no deployable board permissions. Protection cases check
 all dialects and bound HT modes, real old-packet terminal drain, preserved
 following RX, each command's cancellation/current-source/current-policy fence
-and threshold 0/2347/disabled bounds. All22 new cases pass the coordinated
-both-architecture software suites; no physical or performance result is claimed.
+and threshold 0/2347/disabled bounds. All22 pass on x86_64 and aarch64; no
+physical or performance result is claimed.
 
 The SGI40 extension passes nine more native smokes on both architectures under
 `drivers/wireless/ath10k/sgi40`. Actual
@@ -2686,47 +2688,38 @@ not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
 | QCA6174,168c:003e |05010000 / QCA6174/hw2.1 | R; H conditional; native CE1 HTT route and actual board/image required. |
 | QCA6174,168c:003e |05020000 / QCA6174/hw3.0 | R; H conditional; actual revision/OTP/image selection retained. |
 | QCA6174,168c:003e |05030000 / QCA6174/hw3.0 | R; H conditional; existing chip-specific PLL sequence precedes native mission startup. |
-| QCA99X0,168c:0040 |01000000 / QCA99X0/hw2.0 | R; H conditional; 12-pipe hardware/firmware host-memory profile remains exact, chain/NSS extension is source complete, software execution and physical acceptance pending. |
-| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. The bounded10.4 80+80, contiguous160 and chain/NSS extensions await software execution and board qualification. |
+| QCA99X0,168c:0040 |01000000 / QCA99X0/hw2.0 | R; H conditional; 12-pipe hardware/firmware host-memory profile remains exact, chain/NSS extension passes the native suites; physical acceptance pending. |
+| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. The bounded10.4 80+80 and chain/NSS extensions pass the native suites and contiguous160 passes on x86_64; board qualification is pending. |
 | QCA9888,168c:0056 |01000000 / QCA9888/hw2.0 | R; H conditional; distinct board/OTP identity is required despite shared CE family. |
 | QCA9377,168c:0042 |05020000 / QCA9377/hw1.0 | R; H conditional; actual RAW/non-PFC image and CE1 routing required. |
 | QCA9377,168c:0042 |05020001 / QCA9377/hw1.0 | R; H conditional; existing revision-specific PLL path and exact board data retained. |
 | QCA9887,168c:0050 |4100016d / QCA9887/hw1.0 | R; H conditional. QCA988X-family register/reset route plus SI EEPROM calibration with board-file/OTP fallback; single-chain board facts and actual RAW/non-PFC image required. |
 | AR9462,168c:0034 | none | Explicit pre-MMIO rejection; ath9k ownership, not a missing ath10k station implementation. |
 
-The chain/NSS/TX-STBC extension is source complete under the contract in §3.
-Four new source cases under `drivers/wireless/ath10k/chains` cover all six
-dialects, actual SERVICE_READY/INIT limits, native CE-held partial publication,
-two-stream HT plus TX-STBC through real RSNA/DHCP/IP, and rejected MCS/NSTS
-before a valid same-PN packet. Existing coding/SGI/VHT cases retain their
-assertions with the newly selected local masks; the VHT PPDU case now admits
-actual two-stream traffic and rejects three streams. None of these changed
-cases has been executed yet; coordinated release compile/native gates remain
-pending. No physical board or over-air STBC result is claimed.
+The chain/NSS/TX-STBC extension follows the contract in §3. Four source
+cases under `drivers/wireless/ath10k/chains` cover all six dialects, actual
+SERVICE_READY/INIT limits, native CE-held partial publication, two-stream HT
+plus TX-STBC through real RSNA/DHCP/IP, and rejected MCS/NSTS before a valid
+same-PN packet. The coding/SGI/VHT cases assert the selected local masks;
+the VHT PPDU case admits actual two-stream traffic and rejects three
+streams. These pass on x86_64 and aarch64. No physical board or over-air
+STBC result is claimed.
 
-The bounded 2.4-GHz HT40/HT20–40 coexistence continuation is source complete
-as described in §3; seven new cases and its release/native validation are
-pending. This makes no additional per-chip physical RF or power claim.
+The bounded 2.4-GHz HT40/HT20–40 coexistence owner in §3 and its seven cases
+pass on x86_64 and aarch64. This makes no additional per-chip physical RF or
+power claim.
 
-Across the reached rows, concrete remaining software packages are
-DFS qualification (VHT20/40/80, the bounded 80+80 owner and contiguous VHT160
-are implemented; contiguous VHT160 awaits release/native validation); physical acceptance of the §3.4 hardware key offload;
-P2P roles; wake offload is implemented in §3.6 (TLV + WOWLAN + RAW images;
-net-detect implemented on the associated WoW path, disconnected
-net-detect open) and awaits release/native validation;
-DT/NVMEM calibration sources are implemented (nvmem-rmem provider only) and await native validation.
-Automatic credential replay after recovery is implemented (§ recovery, rebind)
-and awaits coordinated release/native acceptance.
-The signed indoor installation continuation is implemented in §3.1 and awaits
-coordinated release/native acceptance.
-The native World-layer Beacon continuation is implemented in §3.2 and awaits
-coordinated release/native acceptance; host and physical qualification remain
-separate.
-The bounded TLV legacy AP and source-qualified AP-side U-APSD owner is
-implemented in §3.3, with ten new native cases written and unexecuted.
-Coordinated release compilation, native suites and physical firmware/RF/board
-acceptance remain pending. Other dialects/PFC/optional AP PHY and security
-roles are refused rather than inferred from an AP-capable PCI identity.
+Across the reached rows, the following are implemented and pass on x86_64,
+with aarch64 execution and physical acceptance pending: station DFS for
+VHT20/40/80, the bounded 80+80 owner and contiguous VHT160 (§3.5); the §3.4
+hardware key offload; P2P roles (§3.8); wake offload (§3.6, TLV + WOWLAN
+images, associated and disconnected net-detect); DT/NVMEM calibration sources
+(nvmem-rmem provider only); automatic credential replay after recovery
+(§ recovery, rebind); the signed indoor installation policy (§3.1); the
+native World-layer Beacon hints (§3.2), with host and physical qualification
+separate; and the bounded TLV legacy AP with source-qualified AP-side U-APSD
+(§3.3). Other dialects/PFC/optional AP PHY and security roles are refused
+rather than inferred from an AP-capable PCI identity.
 
 Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting
 are implemented above, beside the bounded RX BA/reorder and RAW A-MSDU receiver. Unsupported role, width, stream,
@@ -2742,15 +2735,15 @@ image; `vht160` (MODE_11AC_VHT160, `WMI_PEER_160MHZ`) and `vht80p80`
 160/80+80 and the `peer_bw_rxnss_override` NSS map bounded by the per-chip
 `vht160_mcs_{rx,tx}_highest` in `core.c::ath10k_hw_params_list`, nonzero only
 for QCA9984 (1560) and QCA9888 (780). Other reached tuples cannot claim 160 or
-80+80 from a PCI ID. The new80+80 owner implements the second independent
+80+80 from a PCI ID. The 80+80 owner implements the second independent
 occupied-power receipt and actual center2 as described in§3. Contiguous160
 is implemented for ch36–64 and ch100–128 (§3 contiguous VHT160): the radar
 half is admitted only by the station client's per-constituent Beacon witness
 and the 5250 MHz rule boundary only by an AUTO_BW run or a direct 160 MHz
 rule. The upper 149–177 span stays out: it extends beyond the current
 admitted inventory and has no established per-board/factory/host authority
-here. Release compilation of the new cases and native/physical validation
-remain pending.
+here. Its cases pass on x86_64; aarch64 and physical validation remain
+pending.
 
 Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,
@@ -2759,8 +2752,8 @@ revocation and terminal teardown without DMA reuse. No such run is recorded.
 An image lacking RAW support or a PFC image outside the explicit native
 queue/peer/TID/request geometry above remains a diagnostic scan owner and must
 not be counted as a usable station under this profile. The bounded RAW/PFC
-continuation is source complete with six new cases written; release compilation,
-native execution and actual-device interoperability are still pending.
+owner's six cases pass on x86_64; aarch64 execution and actual-device
+interoperability are pending.
 
 The table and packages above remain open beyond the bounded R/H profiles. The
-family is not feature-complete or physically qualified after this checkpoint.
+family is not feature-complete or physically qualified.

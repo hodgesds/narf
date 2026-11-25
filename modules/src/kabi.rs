@@ -1808,8 +1808,8 @@ kernel_abi! {
     // ── ath9k.ko: softMAC PCIe state and config reads ────────────────────
     //
     // Additive exports for a softMAC PCIe driver (ath9k is the first
-    // consumer; `modules/DATAPATH_ABI_DESIGN.md`, "softMAC PCI control and
-    // host regulatory policy"). A softMAC chip has no firmware between the
+    // consumer; `modules/DATAPATH_ABI_DESIGN.md`, "softMAC PCI state and
+    // config reads"). A softMAC chip has no firmware between the
     // driver and the radio: the driver picks SerDes workarounds from the
     // upstream link's ASPM policy and enforces the host regulatory domain
     // itself. (Its bus-master gating uses the shared `narf_pci_command`.)

@@ -1,9 +1,8 @@
 # AR9285 exact-channel generations and N85H/B/T/Q v2
 
 This is an externally supplied measurement contract. The implementation
-supplies no physical measurements, signed asset or board acceptance. Its
-source-complete channel1–13 continuation and six new native cases are pending
-release/native validation.
+supplies no physical measurements, signed asset or board acceptance. The
+channel1–13 program and its six native cases pass on x86_64 and aarch64.
 
 The admitted program is the retained AR9285 revision2 one-chain
 `eeprom_4k` owner, full-rate20, legacy CCK/OFDM and optional HT20 MCS0–7 long
@@ -61,15 +60,16 @@ permission to reuse another report or silently rewrite lower power under an
 old qualification.
 
 A cold transition owns and completes physical retirement independently of its
-public waiter. It withdraws the old interface, clears software queues and
-capture, fails keys, retires both BA directions and proves all TX/RX DMA
-quiescent. Only then does it reset the same function, re-read identical
-factory identity and image, and create a newly calibrated station. Old names
-stay reserved; the successor has a fresh name and fresh closed/publication
-and receive-epoch tokens. Association is lost. The caller must discover the
-new interface; successful multi-channel scan restores the original RF
-primary with another fresh generation, not the old objects. Failed or
-cancelled scans promise terminal ownership, not restoration.
+public waiter. It detaches the old generation from the netdev, clears
+software queues and capture, fails keys, retires both BA directions and
+proves all TX/RX DMA quiescent. Only then does it reset the same function,
+re-read identical factory identity and image, and create a newly calibrated
+station. The successor attaches to the same netdev (name, ifindex, MAC and
+rings unchanged) under a fresh `Seat` token, with fresh closed/publication
+and receive-epoch tokens; the old generation can no longer publish under
+the name. Association is lost. Successful multi-channel scan restores the
+original RF primary with another fresh generation, not the old objects.
+Failed or cancelled scans promise terminal ownership, not restoration.
 
 The Linux7.2 implementation chain is `main.c::ath9k_config` →
 `channel.c::ath_chanctx_set_channel` → `channel.c::ath_set_channel` /
@@ -79,5 +79,4 @@ The Linux7.2 implementation chain is `main.c::ath9k_config` →
 `eeprom_4k.c::ath9k_hw_4k_set_txpower` and `ar9002_calib.c` initial
 calibration. NARF deliberately uses the full reset path, not fastcc or a
 replayed one-shot calibration. Linux's channel14 Japan CCK-control bit is a
-separate unadvertised profile. Exact local source hashes and function lines
-are preserved in `target/wifi-validation-evidence/ath9k-channel-source-pins.json`.
+separate unadvertised profile.

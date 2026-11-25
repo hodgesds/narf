@@ -71,7 +71,7 @@ pub const ALL_DEV_IDS: &[u16] = &[
 /// True when `did` is an MT7925 PCI id — `0x7925` or its `0x0717`
 /// alias. Per-chip branches (DMA layout, register map) key off this,
 /// not off the raw `MT_HW_CHIPID` value: the probe's chip-id gate
-/// (`pci.rs:441`) is still closed for MT7925 pending the Q1 hardware
+/// (`pci.rs:406`) is still closed for MT7925 pending the Q1 hardware
 /// read, so the PCI id is the only 7925 identity the driver can
 /// trust today.
 pub const fn is_mt7925_did(did: u16) -> bool {

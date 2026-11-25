@@ -1,9 +1,9 @@
 # AR9285 factory map and field byte order
 
-The admitted AR9285 revision2 factory lane is source-complete, including
-little-endian fields, big-endian fields, and magic-driven word-swapped storage.
-Five new native cases are written; release compilation and native execution
-are pending. No new physical measurements or signed board assets are supplied.
+The admitted AR9285 revision2 factory lane covers little-endian fields,
+big-endian fields and magic-driven word-swapped storage. Its five native
+cases pass on x86_64 and aarch64. No physical measurements or signed board
+assets are supplied.
 The gain, calibration, policy and exact source qualification limits remain.
 
 Linux7.2 `eeprom.c::ath9k_hw_eeprom_init` selects `eep_4k_ops` for AR9285;
@@ -16,10 +16,10 @@ actual `SYNTH9 & 7 == 1` and factory `txGainType == 1`; a silicon revision
 nibble does not stand in for the XE2 RF identity. Existing source-native tests
 independently hash every655 INI writes for all four selections.
 
-The remaining concrete same-map input gap was that identity decoded big-endian
-base scalars, while several later consumers read the raw bytes as little
-endian. Linux distinguishes two transformations: `ath9k_hw_nvram_swap_data`
-normalizes EEPROM words according to magic, then checks `EEPMISC_BIG_ENDIAN`;
+Every multibyte EEPROM consumer, not only the identity decoder's base
+scalars, must honor the field byte order. Linux distinguishes two
+transformations: `ath9k_hw_nvram_swap_data` normalizes EEPROM words according
+to magic, then checks `EEPMISC_BIG_ENDIAN`;
 `eeprom_4k.c::ath9k_hw_4k_check_eeprom` validates the raw checksum and converts
 specific multibyte fields. Its `EEPROM_FIELD_SWAB16/32` macros explicitly
 leave MAC/U8 calibration, target and CTL tables as byte arrays.
@@ -29,7 +29,7 @@ normalization, including its original EEPMISC flag and checksum. Private
 `identity::eeprom_word/eeprom_dword` readers interpret an actual EEPROM
 multibyte field according to that flag. They do not mutate the image, its
 checksum, Identity provenance or the bytes hashed by signed qualification.
-Live consumers now consistently use them for:
+Live consumers use them for:
 
 - Modal version, antenna-chain/common switch controls and minor-version gates.
 - Detector overlap selection (minor1 uses native INI overlap; minor>=2 uses
@@ -60,12 +60,12 @@ signer-supplied expected receipt, with real20 fallback and terminal generation,
 key/BA/capture/DMA ownership unchanged. Revocation at an actual copied-packet
 boundary still closes delivery and the host link.
 
-Five new cases in `calibration/factory_tests.rs` and
+The five cases in `calibration/factory_tests.rs` and
 `interface_factory_tests.rs` cover actual reset/EEPROM reads, all four gains,
 minor1/2/3, asymmetric modal/spur values, paired LE/BE and word-swapped BE
 hardware/register/report equivalence, narrow1/6/13 and both40 extensions,
 Open/WPA2 Device/kernel DHCP/IP, full40 signed child composition, foreign LE
 body rejection, checksum/endian/version/domain negatives and current source
 revocation after actual DMA copy. The tests use synthetic model-only images
-and signatures; production data is external. No native pass or physical RF,
+and signatures; production data is external. No physical RF,
 interoperability or performance result is claimed.

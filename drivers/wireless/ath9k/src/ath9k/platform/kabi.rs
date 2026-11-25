@@ -1083,9 +1083,9 @@ pub mod compat {
                 }
             }
 
-            /// Config writes are not exported to modules: the only ones ath9k
-            /// makes (the PCI retry-timeout clear) are in its system-PM path,
-            /// which the module does not carry.
+            /// The module makes no config writes: the only ones ath9k makes
+            /// (the PCI retry-timeout clear) are in its system-PM path, which
+            /// the module does not carry.
             pub fn write_config32(
                 _cap: &Cap<BusDeviceCap, Write>,
                 _device: &BusDevice,

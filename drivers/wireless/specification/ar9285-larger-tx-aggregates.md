@@ -1,9 +1,9 @@
 # AR9285 N85T4 bounded larger sender aggregates
 
-This is a software contract for external board qualification. The complete
-source and seven native cases are written; release compilation and native
-execution of this continuation are pending. No measured peak, signature,
-physical RF/interoperability result or performance claim is supplied.
+This is a software contract for external board qualification. The
+implementation and its seven native cases pass on x86_64 and aarch64. No
+measured peak, signature, physical RF/interoperability result or
+performance claim is supplied.
 
 The admitted radio remains AR9285 revision2, one chain, with current exact
 N85H1/H2 HT20 or N85H3 full20/40 qualification and its actual calibration,
@@ -122,7 +122,7 @@ FIRST/MIDDLE/LAST; `ar9002_mac.c::ar9002_set_txdesc` encodes each descriptor,
 AggrLen and8-bit PadDelim fields. Exact file hashes/line anchors are persisted
 with the implementation evidence.
 
-Seven written native cases cover distinct/unknown/unsigned v4 and unchanged
+Seven native cases cover distinct/unknown/unsigned v4 and unchanged
 legacy2; all3..8 counts/MCS/CCMP PNs and actual separate maps, padding and
 queue/tail fences; half-BAW/factor/signed air/4ms prefix limits before SC
 consumption and actual >8191-air chains; all eight bitmap positions and
@@ -130,5 +130,5 @@ immutable hole retries/BAR/wrap; middle-control/payload/source corruption,
 rekey and pinned failure ownership; public IPC eight-original Open/WPA2
 kernel DHCP/IP with recipient BA and an independent nonzero-TID single
 between two eight-frame chains; and actual freshly calibrated H3 both
-extensions, LGI/SGI40,16us density, current SGI loss and DHCP. They have not
-run. Hardware qualification remains an external requirement.
+extensions, LGI/SGI40,16us density, current SGI loss and DHCP.
+Hardware qualification remains an external requirement.

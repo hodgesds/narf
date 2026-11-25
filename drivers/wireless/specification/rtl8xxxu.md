@@ -1,20 +1,26 @@
 # rtl8xxxu — Specification
 
-> Status: runtime RTL8188EU factory/FIFO/firmware/MAC/BB/RF + LC/IQK implemented;
-> retained channel1 Open/WPA2 station service implemented; qualified legacy
-> channels1–13 and idle passive scans pass native software acceptance.
-> Administrative cold park/wake passes native software acceptance.
-> Qualified idle active probe scanning passes native software acceptance.
-> Associated passive scans and plaintext Null/QoS Null pass native software acceptance.
-> Associated active scans are implemented pending their own native acceptance.
-> Broader profiles and physical acceptance remain incomplete. A separately
-> qualified RTL8188EU HT20/LGI SISO continuation passes14 native regressions
-> on both architectures; exact-device qualification remains external.
+> Status: RTL8188EU factory/FIFO/firmware/MAC/BB/RF + LC/IQK and the
+> retained Open/WPA2 station service are implemented, with qualified legacy
+> channels1–13, idle and associated passive/active scans, plaintext Null/QoS
+> Null, administrative cold park/wake and the separately qualified HT20/LGI
+> and HT20/40 continuations. RTL8192EU and RTL8723BU run the shared gen2
+> station composition. These are covered by kernel tests on both
+> architectures; physical acceptance and exact-device qualification remain
+> external.
 
 ## 1. Purpose & scope
 
-Owns the Realtek USB match table, register/packet helpers and retained
-RTL8188EU async firmware owner. Other matched families remain detection-only.
+Owns the Realtek USB match table, register/packet helpers and the retained
+async firmware owners for RTL8188EU, RTL8192EU and RTL8723BU, which run to
+the station. Other matched families remain detection-only; RTL8821CU and
+RTL8822BU belong to rtw88.
+
+The driver builds in (`narf-drivers-wireless-rtl`, default `builtin`) or as
+the loadable `rtl.ko` (`--no-default-features --features module`), from the
+same source over `src/platform/`; the module's USB probe, its in-driver SME
+parameters and what it does not carry are specified in
+`drivers/wireless/specification/spec.md` §4.9.
 
 ## 2. Assumptions
 
@@ -25,19 +31,18 @@ MAC TX/RX stays closed until the separately admitted retained service starts.
 The initial service requires signed per-device board qualification and signed
 deployment policy; broader software prerequisites are listed below.
 Policy decoding uses `narf_wireless::reg::policy::load()` inside current
-firmware capability invocation. Each attach still requires a fresh signed
-artifact rather than accepting the shared cached regulatory domain.
+firmware capability invocation, reloading on each attach rather than
+accepting the shared cached regulatory domain. It returns a staged signed
+`wireless-regulatory.bin` NRGD policy or, when none is staged, Linux world
+`00` from the database authenticated at image build; a malformed or unsigned
+staged policy fails. In `rtl.ko` it reads the kernel's installed domain
+(`narf_wireless_regdomain`).
 
 ## 3. Public interface
 
-**Software acceptance at `6813a24c6`.** The separately qualified RTL8188EU
-`ht40` continuation passes the checkpoint release/native gates on x86_64 and
-aarch64. Broader PHY, other chips and unrelated role/power continuations
-receive no acceptance here. This supersedes implementation-time statements
-below that release/native execution or software acceptance is pending, only
-for the named feature scopes. Physical measurements, signed board/deployment
-programs and actual-device RF/power/interoperability acceptance remain
-separate.
+Software acceptance below means the named kernel tests on x86_64 and
+aarch64. Physical measurements, signed board/deployment programs and
+actual-device RF/power/interoperability acceptance remain separate.
 
 `rtl8xxxu_probe` retains the handle and `firmware_transport::Owner<UsbControl>`.
 For RTL8188EU it spawns `wait_initialize_registered()` and `interface::wait_attach()`
@@ -45,9 +50,10 @@ after releasing the device registry lock, logging the discovered eFuse calibrati
 key `power_policy::Calibration::asset_name(factory)`. That production path continues
 through factory identity, FIFO/queue boundaries, firmware, MAC/BB/AGC/RF tables
 and checked post-table MAC/LC/IQK initialization, pausing at the pre-attempt
-`Detected` and post-IQK `RadioReady` checkpoints when `rtlwifi/rtl8188eufw.bin`,
-`rtl8xxxu/rtl8188eu-cal-v1-<mac>.bin` or `wireless-regulatory.bin` has not been
-staged yet while failing immediately on invalid or unsigned artifacts. Duplicate
+`Detected` and post-IQK `RadioReady` checkpoints when `rtlwifi/rtl8188eufw.bin`
+or `rtl8xxxu/rtl8188eu-cal-v1-<mac>.bin` has not been staged yet (or no
+regulatory domain is available, §2) while failing immediately on invalid or
+unsigned artifacts. Duplicate
 registration compares the retained Arc identity, instead of conflating equal slot numbers on different USB controllers.
 
 `Owner::status()` reports detected, validated, factory-ready, powered,
@@ -179,9 +185,9 @@ does not publish a station or open the controlled port.
 
 `interface::attach` now composes the production RTL8188EU path after probe's
 successful firmware/table/full-IQK attempt. It requires current network
-registration authority, exact-device signed power calibration and a signed
-`wireless-regulatory.bin` NRGD policy; the mutable global domain alone does
-not authenticate deployment policy. Missing/invalid artifacts retain the
+registration authority, exact-device signed power calibration and the
+`reg::policy::load` domain (§2); the mutable global domain alone does not
+authenticate deployment policy. Missing/invalid artifacts retain the
 diagnostic radio without publishing a netdev. Native bulk traffic derives
 its USB handle directly from `Owner<UsbControl>`: EP0 and packets cannot be
 paired with different controllers, slots or generations. The first admitted
@@ -551,16 +557,15 @@ proof. Reentrant held or fully completed rekey retires the rest of an old
 aggregate; ordinary TX-credit backpressure does not retire receive authorization.
 Observed authority loss is terminal, including after explicit policy reinstall.
 
-Fourteen passing native Rust smokes cover actual registered executable
+Fourteen native Rust smokes cover actual registered executable
 retention, measurement identity/unknown bounds, parked EP0 error/cancellation,
 all8 source descriptor rates and real CCMP, Open/WPA2 kernel DHCP/exact IP,
 whole3839 aggregates, bad native PHY/MIC/tail with same-PN retry, malformed bound
 responses, actual held ADDBA/M4 receipts, closed captures, each current source,
-policy loss and reentrant key/ordinary-credit publication. These cases pass
-both-architecture native QEMU and coordinated build/Clippy gates. Physical
+policy loss and reentrant key/ordinary-credit publication. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
 SGI20, broader bands and coexistence remain software work. The separate
-HT20/40 v2 continuation below is implemented pending native acceptance.
+HT20/40 v2 continuation is specified below.
 
 #### Host rate adaptation and rate fallback (implemented)
 
@@ -738,12 +743,9 @@ CONNECT after a cold transition requires a fresh actual target-channel beacon,
 without refreshing an old cache entry's age. Eight native cases cover actual
 Open/WPA2 channel6 DHCP, multi-channel dwell/home restoration, old device FIFO
 copies, fresh-observation admission, cancellation/source loss, missing row and
-RXDMA/MAC-off receipts, and literal factory/occupied-band limits. All eight
-native cases pass on both architectures at `62b62ea68`, within full integration
-results of4294/0/13 on x86_64 and3935/0/7 on aarch64. Release CI, formatting,
-ordinary boots and both btrfs postflights also pass on that exact checkpoint.
-Physical-board acceptance remains separate. Administrative-PM and idle active
-scan continuations are accepted below at their own later checkpoint.
+RXDMA/MAC-off receipts, and literal factory/occupied-band limits
+(`drivers/wireless/rtl8xxxu/channels`). Physical-board acceptance remains
+separate.
 
 ### Administrative radio park/wake (software-validated)
 
@@ -804,10 +806,7 @@ WoWLAN, autosuspend or USB LPM modes absent from this family's source contract.
 Eight separate `drivers/wireless/rtl8xxxu/runtime_pm` native cases cover actual
 registration/queued ownership, initial DOWN, Open/WPA2 down/up with native DHCP
 and fresh PTK, held EP0 reversals, caller/source loss, registration replacement
-and failed bulk Stop. All eight pass on both architectures at `0eb084197`,
-within integration results of4326/0/13 on x86_64 and3967/0/7 on aarch64.
-Resolved release CI, formatting, ordinary boots and both btrfs postflights
-pass at that checkpoint. Physical-board acceptance remains separate.
+and failed bulk Stop. Physical-board acceptance remains separate.
 
 ### Idle active probe scanning (software-validated)
 
@@ -872,9 +871,8 @@ native wait, old FIFO responses and home restoration. The independent device
 model withholds its response until delayed PHY consumption while MAC TX stays
 enabled, and holds SCH_TX_CMD separately from host completion. Early MAC TX
 closure loses the response; maximum IE timing and missing device terminals
-have literal negative cases. All eight pass on both architectures at
-`0eb084197`, with the complete release gates recorded above. Physical
-AP/USB inputs remain inert, and physical qualification remains separate.
+have literal negative cases. Physical AP/USB inputs remain inert, and
+physical qualification remains separate.
 
 ### Associated passive scanning and Null functions (software-validated)
 
@@ -968,11 +966,7 @@ SCH terminal, preserved RX/TX BA and away high-PN/replayed home rejection.
 One focused shared Security native case encrypts DATA before/after a reserved
 plaintext Null slot across SN4094/4095/0, requires consecutive PN1/2, decrypts
 with a persistent replay window, and verifies old-PN rejection and unchanged
-QoS counters. All nine pass on both architectures at `a7797583a`, within
-4,349/0/13 x86_64 and 3,990/0/7 aarch64 native results. Resolved release CI,
-formatting, ordinary boots and both btrfs postflights pass on each architecture.
-Physical RF/USB qualification remains separate. Associated active scanning
-below retains its own pending native gate beyond this passive/Null acceptance.
+QoS counters. Physical RF/USB qualification remains separate.
 
 ### Associated active scanning (software-validated)
 
@@ -1016,7 +1010,7 @@ windows; the software makes no physical switching-latency guarantee.
 Cancellation, current policy/source loss, short USB or missing device
 terminal state leaves a terminal owner with its actual receipts retained.
 
-Eight new `drivers/wireless/rtl8xxxu/associated_active_scan` native cases
+Eight `drivers/wireless/rtl8xxxu/associated_active_scan` native cases
 compose actual retained firmware/USB/Device/MLME/RSNA and DHCP. They cover
 Open and WPA2/HT home/away scans, same-channel cold generations, directed and
 wildcard probes, maximum extra IEs, exact private descriptors and shared SN
@@ -1024,15 +1018,11 @@ ownership, retained host and buffered peer packets, pure timing/power/IE
 refusal, held Probe cancellation/source loss, independent USB/PHY/SCH
 terminals, old FIFO rejection and current home policy/HT loss during actual
 native work. Only hardware/firmware execution and peer inputs are inert.
-The eight earlier associated-passive cases remain separate registrations.
-The eight active cases pass release acceptance at `aa6b98463` on both
-architectures. The combined suites pass4,369/0/13 on x86_64 and4,010/0/7
-on aarch64, preserving every prior named case/status and adding exactly20.
-Resolved release Clippy, formatting, ordinary boots and both btrfs
-postflights pass on each architecture. Physical qualification remains
-separate from the supplied firmware/USB/peer execution in these fixtures.
+They are separate from the eight associated-passive cases. Physical
+qualification remains separate from the supplied firmware/USB/peer execution
+in these fixtures.
 
-### Separately qualified RTL8188EU HT20/40/LGI (implemented, validation pending)
+### Separately qualified RTL8188EU HT20/40/LGI (implemented)
 
 The optional signed N8HT v2 contract is specified in
 [rtl8188eu-ht40.md](rtl8188eu-ht40.md). `Owner::ht40_request(primary, secondary)`
@@ -1063,14 +1053,12 @@ The SISO MCS0–7/LGI path composes with software CCMP, BA/replay, host rate
 adaptation and whole A-MSDU. Scans and park/wake retain exact home geometry;
 away receivers stay NOHT. SGI, MCS32 and2SS are not advertised by this subset.
 
-Eight additional native regressions are registered under
+Eight native regressions are registered under
 `drivers/wireless/rtl8xxxu/ht40`: signed identity/primary power group,
 literal plus/minus geometry and Open/WPA2 DHCP,20MHz fallback and response
 narrowing, same-primary FIFO cuts and copied full-span policy retirement,
 held DATA/source loss, BA/replay retention, and active-scan/cold EP0 restore.
-They await coordinated release compilation and native execution; all prior
-v1/scan registrations remain required. Hardware measurements and physical
-USB/RF interoperability remain external.
+Hardware measurements and physical USB/RF interoperability remain external.
 
 ### RTL8192EU native owner
 
@@ -1155,8 +1143,7 @@ EP0 transfer/executable-cap discipline; chip steps live in
   `Error::Calibration` and the owner fails before the post-calibration tail;
   Linux silently keeps the power-on matrix. The outcome (`Iqk` +
   `PostCalibration`) is retained as `Owner::radio_8192e()`; the owner then
-  reaches `RadioReady` (not packet readiness). The former placeholder IQK
-  skeleton in `rtl8192e.rs` is removed.
+  reaches `RadioReady` (not packet readiness).
 - Channel (`rtl8192e_radio::config_channel`, `rtl8xxxu_gen2_config_channel`
   over both RF paths): 20 MHz (HT or non-HT) and 40 MHz with the secondary
   above (RF channel +2, subchannel 2) or below (−2, subchannel 1), CCK
@@ -1223,9 +1210,8 @@ EP0 transfer/executable-cap discipline; chip steps live in
 - USB IDs: the bind/classification tables carry exactly the Linux
   `core.c::dev_table` `rtl8192eu_fops` rows (0bda:818b, 0bda:818c,
   2357:0107/0108/0109/0126, 2001:3319/3312, 2019:ab33, 2c4e:0100/0104).
-  2357:0135 and 7392:b722 are `rtl8192fu_fops` in Linux; they were
-  wrongly listed as RTL8192EU and are now unbound/Unknown (no RTL8192FU
-  owner exists).
+  2357:0135 and 7392:b722 are `rtl8192fu_fops` in Linux and classify as
+  Unknown (no RTL8192FU owner exists).
 
 #### RTL8192EU signed records (`N92P` v1)
 
@@ -1277,10 +1263,10 @@ exact factory/VID/PID/channel/width before programming. Synthetic test
 records validate format/arithmetic only.
 
 The owner reaches `RadioReady` for RTL8192EU after calibration. The production
-probe (`rtl8xxxu_probe`) now starts the RTL8192EU owner like RTL8188EU:
+probe (`rtl8xxxu_probe`) starts the RTL8192EU owner like RTL8188EU:
 `wait_initialize_registered()` waits for `rtlwifi/rtl8192eu_nic.bin`, then
 `rtl8192e_admission::wait_admit` waits for the signed `N92P` record, the
-signed `wireless-regulatory.bin` policy and the network authority. Missing
+regulatory domain (`reg::policy::load`, §2) and the network authority. Missing
 assets keep the radio unadmitted and retry every 500 ms; unsigned, invalid,
 mismatched-identity or unqualified-initial-channel records are terminal
 (`Profile`). Admission yields the record, domain and the channel-1 HT20
@@ -1393,7 +1379,7 @@ and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
   RF PA table/`0xed`/`0x43 = 0x300bd` and `BT_WLAN_CALIBRATION(0)`.
   Deviation: no candidate, or a candidate without a path-A TX result, is
   `Error::Calibration` after that restore tail (Linux keeps the power-on
-  matrix). The zero-valued IQK/LC skeleton in `rtl8723b.rs` is removed.
+  matrix).
 - Post-calibration (`rtl8723b_radio::post_calibration`): gen2 thermal meter
   (`RF_A 0x42 = 0x37cf8`), `NAV_UPPER`, mgmt ACK, `0xa9c[17]` and
   `0xd2c[11]` retained. The outcome is `Owner::radio_8723b()` and the owner
@@ -1435,8 +1421,7 @@ and the gen2 pieces of `rtl8192e_init` (SIE/no-SIE queue decode,
   (`rtl8xxxu_gen2_report_rssi` truncates for RTL8723B) in
   `Owner::ra_watchdog_8723b`.
 
-- BT coexistence (`rtl8xxxu/btcoex.rs`, replacing an invented decision
-  matrix with zero-valued tables): exactly Linux rtl8xxxu, which has no
+- BT coexistence (`rtl8xxxu/btcoex.rs`): exactly Linux rtl8xxxu, which has no
   vendor halbtc engine. `bt_info` takes byte 1 of a `C2H_8723B_BT_INFO`
   (id 9) body; `Coex::update_link_info` is `rtl8723bu_update_bt_link_info`
   (status ConnectedIdle/ScoBusy/AclBusy/Max, profile bits, `hid_only`, and
@@ -1501,7 +1486,7 @@ Production probe (`rtl8xxxu_probe`): the RTL8723BU owner starts like the
 RTL8192EU: `wait_initialize_registered()` waits for
 `rtlwifi/rtl8723bu_nic.bin`, the owner runs to `RadioReady`, then
 `rtl8723b_admission::wait_admit` waits for the signed `N8BP` record, the
-signed `wireless-regulatory.bin` and the network authority (missing assets
+regulatory domain (`reg::policy::load`, §2) and the network authority (missing assets
 retry every 500 ms; unsigned/invalid/mismatched/unqualified-initial-channel
 records are terminal `Profile`). Admission yields the channel-1 HT20
 `Permission`; it publishes no netdev and opens no MAC TX/RX.
@@ -1515,7 +1500,7 @@ The RTL8723BU station, its C2H BT-info/RA routing and `restart_parked` are
 the shared gen2 station composition below. USB IDs are exactly Linux
 `core.c::dev_table` `rtl8723bu_fops` rows (0bda:b720, 7392:a611).
 
-Regressions (written, unexecuted) in `rtl8xxxu/rtl8723b_tests.rs`
+Regressions in `rtl8xxxu/rtl8723b_tests.rs`
 (`drivers/wireless/rtl8xxxu/8723bu`): identity/EFUSE/page budget,
 power + firmware + tables + calibration lifecycle against a register
 model, no-SIE fallback and test-silicon refusal, table/antenna/PHY-LCK/
@@ -1675,8 +1660,7 @@ Parameter Set Count is checked and applied in the next `step` through the
 same writes (unchanged count ignored; WMM loss is peer loss). Scan Nulls use
 QoS Null TID7/SN0 for a WMM peer; a scan `rejoin` reprograms the installed
 EDCA rows after the cold restart. TSPEC/U-APSD stay inapplicable as for
-RTL8188EU. Regression (written, unexecuted):
-`smoke_rtl8xxxu_gen2_wmm_qos_data_queues`.
+RTL8188EU. Regression: `smoke_rtl8xxxu_gen2_wmm_qos_data_queues`.
 
 #### Gen2 optional HT20 (SGI_20, A-MPDU/BA)
 
@@ -1747,11 +1731,10 @@ falls back to a 20 MHz offer; a Forty geometry without a matching wide
 grant, or a widen failure, fails the association rather than silently
 falling back. A Forty rejoin re-programs the retained wide grant. A
 1T2R RTL8191EU advertises one RX stream (Linux
-`rf_paths = 2`); active-scan Probe Requests carry no HT Capabilities; no
-BlockAckReq (RX filter passes none, as RTL8188EU). A distinct MCS32
+`rf_paths = 2`); no BlockAckReq (RX filter passes none, as RTL8188EU). A distinct MCS32
 rxdesc rate byte, if silicon reports one, is unobserved and remains a
 follow-up rate case, not a silent drop; DSSS/CCK40 is not advertised.
-Regressions (written, unexecuted): `smoke_rtl8xxxu_gen2_ht20_rx_admission`,
+Regressions: `smoke_rtl8xxxu_gen2_ht20_rx_admission`,
 `smoke_rtl8xxxu_gen2_ht40_rx_admission`,
 `smoke_rtl8xxxu_gen2_ht_local_capability` (`gen2_radio_tests.rs`),
 `smoke_rtl8xxxu_gen2_ht40_negotiation_and_secondary`
@@ -1793,8 +1776,7 @@ the retained host TX/RX rings are not
 serviced on away visits (home grace services one Ethernet frame per step);
 no station power-save
 nullfunc beyond the scan PM1/PM0 indications (Linux rtl8xxxu does not set
-`SUPPORTS_PS`); BT-info records are processed only while a station is being
-serviced; one gen2 netdev per boot. Regressions (written, unexecuted):
+`SUPPORTS_PS`); one gen2 netdev per boot. Regressions:
 `gen2_radio_tests.rs` (C2H routing, RSSI match, rxdesc24 → `Mpdu`),
 `gen2_station_tests.rs` (legacy RA peer and admission refusal, open DATA
 header) and `gen2_interface_tests.rs` (scan request admission, candidate
@@ -1828,24 +1810,22 @@ registry blobs; scheduler/time provide async execution and bounded waits.
 
 ## 7. Stage assignment
 
-RTL8188EU now reaches the retained channel1 Open/WPA2 station service through
-the production probe when exact-device signed qualification/deployment data
-is present. No real board curve has been acquired, qualified or installed by
-this software work. The initial profile needs physical validation. Qualified
-legacy idle channel changes and passive scans pass native software gates; broader
-rates and endpoint reset remain software work. Connected active scanning
-passes native software gates at `aa6b98463`.
-Administrative cold park/wake passes native software gates at `0eb084197`.
-Idle active probe scanning passes native software gates at `0eb084197`.
-Associated passive scanning/Null functions pass native software gates at `a7797583a`.
+RTL8188EU reaches the retained Open/WPA2 station service through the
+production probe when exact-device signed qualification/deployment data is
+present; RTL8192EU and RTL8723BU reach the gen2 station the same way. No real
+board curve has been acquired, qualified or installed. Every profile needs
+physical validation. Qualified legacy channels, idle and associated
+passive/active scans, Null functions and administrative cold park/wake are
+covered by kernel tests on both architectures; SGI20 on RTL8188EU and
+controller-proven EP0 reset remain software work.
 
 ## 8. Open questions / remaining software
 
 | Prerequisite | State |
 |---|---|
 | RTL8188EU power + EP0 firmware lifecycle | Implemented; shared-path regressions |
-| RTL8192EU runtime initialization | Identity/EFUSE/power/firmware/H2C and MAC/BB/RF tables + TX power implemented; post-table MAC, gen2 channel/bandwidth, IQK/LCK, TX/RX, RA, signed records and station missing |
-| RTL8723BU runtime initialization | Identity/EFUSE/power/firmware/HMTFR, antenna selection, MAC/BB/RF tables + PHY LCK and TX power implemented; post-table MAC, calibration, TX/RX, RA, BT coexistence, signed records and station missing |
+| RTL8192EU runtime initialization | Implemented through the gen2 station: identity/EFUSE/power/firmware/H2C, tables, post-table MAC, channel/bandwidth, IQK/LCK, TX/RX, firmware RA and signed `N92P` records; physical validation pending |
+| RTL8723BU runtime initialization | Implemented through the gen2 station: identity/EFUSE/power/firmware/HMTFR, antenna selection, tables + PHY LCK, post-table MAC, calibration, TX/RX, RA, BT coexistence and signed `N8BP` records; physical validation pending |
 | RTL8821CU / RTL8822BU runtime initialization | Bound by rtw88 (see rtw88.md) |
 | EFUSE identity/calibration read through retained async owner | Implemented; chip/geometry/failure coverage |
 | Endpoint-descriptor selection and MAC FIFO/LLT | Implemented with retained RX filter/MAC activation |
@@ -1855,10 +1835,10 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 | Signed board power artifact and checked native TX gate | Implemented software contract; real qualified per-device data must be acquired/signed/installed |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
 | Native beacon/management preparation and peer-bound transitions | Implemented basic1Mbps shared plan; qualified channels1–13 pass native software gates |
-| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration passes native gates; idle active and associated passive/Null pass native gates; signed board/deployment admission required; connected active scans pass native software gates at `aa6b98463` |
+| Production scan/MLME service and policy-admitted management TX | Idle passive/active and associated passive/active scans with home restoration and Null functions pass native gates; signed board/deployment admission required |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
-| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning pass native software gates. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. The separate v2 HT20/40 LGI continuation above is implemented pending native acceptance; SGI, broader bands and coexistence remain missing |
+| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning pass native software gates. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. The separate v2 HT20/40 LGI continuation above is implemented; SGI, broader bands and coexistence remain missing on RTL8188EU |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; a completed disconnect returns to Passive (safe rejoin) |
@@ -1866,12 +1846,8 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
-BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20 and controller-proven EP0 reset remain software work; the separate v2
-HT20/40 continuation above is implemented pending native acceptance.
-Associated active scanning passes native software gates at `aa6b98463`. Qualified idle passive
-multi-channel scanning passes native software gates; associated passive scans
-and Null functions pass native software gates at `a7797583a`.
+BT/S0S1. EU's separately qualified HT20/LGI and v2 HT20/40 continuations are
+implemented above; SGI20 and controller-proven EP0 reset remain software work.
 Full WMM AC/TID routing is implemented.
 
 Power-management inventory (upstream `rtl8xxxu/core.c`): `rtl8xxxu_probe`
@@ -1885,8 +1861,8 @@ and `fops->power_off` at disconnect. There are no PM submodes beyond that
 interface start/stop radio power path (implemented as retained administrative
 cold park/wake above and accepted by the native software gates);
 LPS/IPS/WoWLAN/USB autosuspend/LPM
-are inapplicable to this family. 8192EU/8723BU first need their own retained power/firmware/radio/
-packet/station compositions, including2-chain or coexistence dependencies.
+are inapplicable to this family; RTL8192EU/RTL8723BU follow the same
+start/stop/park path through the gen2 composition above.
 The repository's matched8821CU/8822BU profiles need the actual upstream
 `rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;
 EU descriptor/register helpers cannot establish those VHT runtimes. The
