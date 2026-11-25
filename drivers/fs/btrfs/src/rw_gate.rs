@@ -681,5 +681,6 @@ fn report_with(fsid: &[u8; 16], profile: Profile, why: &Refusal, outcome: &str) 
         );
     }
     let _ = writeln!(narf_console::Writer, "{line}");
+    narf_filesystem::rw_refusal::record(&line);
     *LAST_REFUSAL.lock() = Some(line);
 }

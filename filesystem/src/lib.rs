@@ -109,6 +109,7 @@ pub mod procfs;
 pub mod root_bootlog;
 pub mod root_mount;
 pub mod root_selector;
+pub mod rw_refusal;
 pub mod super_magic;
 pub mod sync_all;
 pub mod sysfs;

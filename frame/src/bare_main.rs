@@ -3986,7 +3986,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     policy.as_str(),
                                     e
                                 );
-                                if let Some(why) = narf_drivers_fs_btrfs::rw_gate::last_refusal() {
+                                if let Some(why) = narf_filesystem::rw_refusal::last() {
                                     let _ = writeln!(console::Writer, "  root-mount: {why}");
                                 }
                                 let _ = writeln!(console::Writer, "{rule}");
