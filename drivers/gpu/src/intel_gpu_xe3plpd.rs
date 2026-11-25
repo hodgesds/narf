@@ -638,4 +638,202 @@ mod tests {
         "drivers/gpu/intel_gpu_xe3plpd",
         smoke_nvl_display35_core_and_color_capabilities
     );
+
+    use crate::intel_gpu_xe2lpd::DisplayIp;
+    use crate::intel_gpu_xelpg_cdclk::{self as cdclk, Current, Step};
+    use crate::intel_gpu_xelpg_resources as res;
+    use crate::intel_gpu_xelpg_wm::{self as wm, Latency};
+
+    /// A register file that only answers reads.
+    struct Regs(alloc::collections::BTreeMap<u64, u32>);
+    impl crate::intel_gpu_aux::MmioWindow for Regs {
+        fn read32(&self, off: u64) -> u32 {
+            self.0.get(&off).copied().unwrap_or(0)
+        }
+        fn write32(&self, _: u64, _: u32) {}
+    }
+
+    /// 35.00 is admitted only by the widened decoder; it shares every
+    /// display-30 branch and takes the `xe3p_lpd_cdclk_table`.
+    fn smoke_nvl_display35_ip_dispatch() -> TestResult {
+        let gmd = 35 << 22;
+        assert_eq!(DisplayIp::decode_all(gmd), Ok(DisplayIp::NovaLakeS));
+        assert!(DisplayIp::decode(gmd).is_err());
+        let ip = DisplayIp::NovaLakeS;
+        assert_eq!(ip.ver(), 35);
+        assert!(ip.is_display30() && ip.is_display35() && ip.xe2_plus());
+        assert!(!DisplayIp::Xe3Lpd.is_display35());
+        assert_eq!(ip.pipe_count(), 4);
+        assert_eq!(cdclk::max_cdclk_khz(ip), 787_200);
+        assert_eq!(cdclk::voltage_level_ip(ip, 787_200), 0);
+        for khz in [0, 151_200, 300_000, 787_200] {
+            assert_eq!(
+                cdclk::calc_cdclk_ip(ip, khz),
+                cdclk::calc_nova_lake_cdclk(khz)
+            );
+        }
+        assert_eq!(cdclk::calc_cdclk_ip(ip, 787_201), None);
+        let low = cdclk::calc_cdclk_ip(ip, 0).unwrap();
+        assert_eq!(
+            (low.cdclk_khz, low.ratio, low.waveform),
+            (151_200, 21, 0xa4a4)
+        );
+        assert_eq!(
+            cdclk::ctl_value_ip(ip, low),
+            crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL
+        );
+        // Wa_13012396614 covers 35.00: CD2XCLK before the PLL disable.
+        let unknown = Current {
+            known: None,
+            pll: 0x8000_0022,
+            squash: 0,
+            ctl: 0x0200_0517,
+            actual_khz: 652_800,
+        };
+        assert_eq!(
+            cdclk::plan_ip(ip, &unknown, low),
+            alloc::vec![
+                Step::MdclkCd2x,
+                Step::PllDisable,
+                Step::PllEnable { ratio: 21 },
+                Step::Squash { waveform: 0xa4a4 },
+                Step::Ctl { value: 1 << 25 },
+            ]
+        );
+        assert_eq!(
+            crate::intel_gpu_pmdemand::Layout::for_ip(ip),
+            crate::intel_gpu_pmdemand::Layout::Xe3
+        );
+        assert_eq!(
+            crate::intel_gpu_xe3lpd::parent(ip, crate::intel_gpu_xe3lpd::Well::PwB),
+            Some(crate::intel_gpu_xe3lpd::Well::Pw1)
+        );
+        assert!(crate::intel_gpu_xe3lpd::dc_off_domains(ip)
+            .contains(&crate::intel_gpu_xe3lpd::Domain::Aux));
+        // No external route drives an LT port.
+        let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_ip(ip);
+        for port in [
+            crate::intel_gpu_xelpg::XeLpgPort::A,
+            crate::intel_gpu_xelpg::XeLpgPort::B,
+            crate::intel_gpu_xelpg::XeLpgPort::Tc1,
+            crate::intel_gpu_xelpg::XeLpgPort::Tc2,
+        ] {
+            assert!(!profile.admits_port(port));
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_ip_dispatch
+    );
+
+    /// Display 35 reads its latencies without the reported level 0, and its
+    /// QGV decode takes Wa_16030862157 and refuses ECC that costs display
+    /// bandwidth; display 30 keeps the raw level 0 and the 8-channel cap.
+    fn smoke_nvl_display35_latency_and_qgv() -> TestResult {
+        let lpddr5_16ch = (2 << 8) | (0xf << 4) | 2;
+        let regs = Regs(
+            [
+                (wm::LATENCY_REGS[0], (4 << 16) | 9),
+                (wm::LATENCY_REGS[1], (12 << 16) | 8),
+                (wm::LATENCY_REGS[2], (30 << 16) | 20),
+                (wm::LATENCY_SAGV, 11),
+                (crate::intel_gpu_xelpg_bw::MEM_SS_INFO_GLOBAL, lpddr5_16ch),
+                (crate::intel_gpu_xelpg_bw::QGV_POINT_BASE, 0x0a0a_0060),
+                (crate::intel_gpu_xelpg_bw::QGV_POINT_BASE + 4, 0x0000_2010),
+                (crate::intel_gpu_xelpg_bw::QGV_POINT_BASE + 8, 0x0a0a_0080),
+                (crate::intel_gpu_xelpg_bw::QGV_POINT_BASE + 12, 0x0000_2010),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let nova = Latency::read_ip(&regs, DisplayIp::NovaLakeS).unwrap();
+        let ptl = Latency::read_ip(&regs, DisplayIp::Xe3Lpd).unwrap();
+        // Level 0 dropped: WaWmMemoryReadLatency adds 6 us to every level.
+        assert_eq!(nova.levels, [6, 10, 14, 18, 26, 36]);
+        assert_eq!(ptl.levels, [9, 9, 9, 12, 20, 30]);
+        assert_eq!(nova.sagv_block_us, 11);
+        let (n, p) = (nova.qgv.unwrap(), ptl.qgv.unwrap());
+        assert_eq!((n.num_channels, n.max_numchannels), (16, 16));
+        assert_eq!((p.num_channels, p.max_numchannels), (15, 8));
+        let mut ecc = regs;
+        ecc.0.insert(
+            crate::intel_gpu_xelpg_bw::MEM_SS_INFO_GLOBAL,
+            lpddr5_16ch | ECC_IMPACTING_DE,
+        );
+        assert_eq!(
+            Latency::read_ip(&ecc, DisplayIp::NovaLakeS),
+            Err(narf_filesystem::FsError::Unsupported)
+        );
+        assert!(Latency::read_ip(&ecc, DisplayIp::Xe3Lpd).is_ok());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_latency_and_qgv
+    );
+
+    /// The operational resource computation on display 35 agrees with the
+    /// display-35 buffer plan for one unscaled XR24 primary: CDCLK, every
+    /// plane/cursor WM and DDB image, the DBUF trackers and the DBOX.
+    fn smoke_nvl_display35_resource_state_matches_dbuf_plan() -> TestResult {
+        use crate::intel_gpu_modeset::Mode;
+        use crate::intel_gpu_nvl_dbuf::{NovaDbufPlan, NovaScanout};
+        let mode = Mode::VESA_1024X768_60;
+        let guardband = 38;
+        let raw = [99, 0, 0, 0, 0, 0];
+        let plan = NovaDbufPlan::compute(
+            &[
+                Some(NovaScanout {
+                    mode,
+                    tiling: Tiling::Linear,
+                    guardband,
+                    cursor_visible: false,
+                }),
+                None,
+                None,
+                None,
+            ],
+            0xf,
+            raw,
+            20,
+            0,
+        )
+        .unwrap();
+        let latency = Latency::adjust_display35(raw, 20);
+        let mut request = crate::intel_gpu_display_resources::request(&mode, Tiling::Linear, 0);
+        if let Some(pipe) = request.pipes[0].as_mut() {
+            pipe.combo_phy = None;
+        }
+        let state = res::compute_ip_vblank(
+            DisplayIp::NovaLakeS,
+            &request,
+            &latency,
+            [Some(mode.v_total - guardband), None, None, None],
+        )
+        .unwrap();
+        assert_eq!(state.cdclk, plan.clock);
+        assert_eq!(state.ip, DisplayIp::NovaLakeS);
+        let registers = state.plane_registers().unwrap();
+        assert_eq!(registers.len(), plan.plane_registers.len());
+        for (reg, value) in &plan.plane_registers {
+            assert_eq!(
+                registers.iter().find(|(r, _)| r == reg).map(|(_, v)| *v),
+                Some(*value),
+                "{reg:#x}"
+            );
+        }
+        for slice in 0..4 {
+            assert_eq!(
+                Some(state.dbuf_ctl(slice, 0x407f_0010, state.dbuf.enabled_slices)),
+                plan.dbuf_ctl(slice, 0x407f_0010)
+            );
+        }
+        assert_eq!(Some(state.dbox(0)), plan.dbox(Pipe::A));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_resource_state_matches_dbuf_plan
+    );
 }

@@ -206,7 +206,11 @@ impl ExternalDisplayProfile {
         let generation = match display_ip {
             DisplayIp::Xelpdp => Generation::MeteorLake,
             DisplayIp::Xe2Lpd => Generation::LunarLake,
-            DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => Generation::PantherLake,
+            // Nova Lake-S has no generation of its own; its profile admits
+            // no external port (see `admits_port`).
+            DisplayIp::Xe3Lpd | DisplayIp::WildcatLake | DisplayIp::NovaLakeS => {
+                Generation::PantherLake
+            }
         };
         Self {
             display_ip,
@@ -230,6 +234,7 @@ impl ExternalDisplayProfile {
             DisplayIp::Xe2Lpd => TcDisplayProfile::Xe2Lpd,
             DisplayIp::Xe3Lpd => TcDisplayProfile::Xe3Lpd,
             DisplayIp::WildcatLake => TcDisplayProfile::WildcatLake,
+            DisplayIp::NovaLakeS => TcDisplayProfile::NovaLakeS,
         }
     }
 
@@ -253,6 +258,9 @@ impl ExternalDisplayProfile {
             DisplayIp::WildcatLake => {
                 matches!(port, XeLpgPort::Tc1 | XeLpgPort::Tc2)
             }
+            // Display 35's ports drive the LT PHY, which no external route
+            // here programs: the Cx0 sequences must never reach them.
+            DisplayIp::NovaLakeS => false,
         }
     }
 }

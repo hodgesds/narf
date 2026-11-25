@@ -486,11 +486,21 @@ fn program_clock(io: &(impl MmioWindow + ?Sized), target: &State) -> Result<(), 
         .known
         .is_none_or(|_| target.cdclk.cdclk_khz > now.actual_khz);
     if target.ip.xe2_plus() && lowering {
-        crate::intel_gpu_xelpg_resources::program_ratio(io, target.cdclk, target.dbuf.joined)?;
+        crate::intel_gpu_xelpg_resources::program_ratio(
+            io,
+            target.ip,
+            target.cdclk,
+            target.dbuf.joined,
+        )?;
     }
     cdclk::program_ip(io, target.ip, &now, target.cdclk)?;
     if target.ip.xe2_plus() && raising {
-        crate::intel_gpu_xelpg_resources::program_ratio(io, target.cdclk, target.dbuf.joined)?;
+        crate::intel_gpu_xelpg_resources::program_ratio(
+            io,
+            target.ip,
+            target.cdclk,
+            target.dbuf.joined,
+        )?;
     }
     Ok(())
 }
@@ -627,11 +637,11 @@ fn undo(
                     let now = cdclk::Current::read_ip(io, old.ip)?;
                     let lowering = snap.cdclk.actual_khz < now.actual_khz;
                     if lowering {
-                        crate::intel_gpu_xelpg_resources::restore_ratio(io, snap)?;
+                        crate::intel_gpu_xelpg_resources::restore_ratio(io, old.ip, snap)?;
                     }
                     cdclk::restore_ip(io, old.ip, &snap.cdclk)?;
                     if !lowering {
-                        crate::intel_gpu_xelpg_resources::restore_ratio(io, snap)?;
+                        crate::intel_gpu_xelpg_resources::restore_ratio(io, old.ip, snap)?;
                     }
                 } else {
                     cdclk::restore(io, &snap.cdclk)?;
@@ -651,7 +661,7 @@ fn undo(
                     checked(io, dbuf::dbox_ctl(pipe), *v)?;
                 }
                 let keep = if old.ip.xe2_plus() {
-                    crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK
+                    crate::intel_gpu_xe2lpd::mbus_throttle_mask(old.ip)
                 } else {
                     0
                 };
@@ -720,7 +730,7 @@ pub(crate) fn commit_live(
     }
     let mbus = read(io, dbuf::MBUS_CTL)?;
     let ratio_mask = if old.ip.xe2_plus() {
-        crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK
+        crate::intel_gpu_xe2lpd::mbus_throttle_mask(old.ip)
     } else {
         0
     };

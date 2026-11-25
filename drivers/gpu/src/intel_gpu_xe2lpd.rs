@@ -92,6 +92,16 @@
 //! and admitted only for the exact [`crate::intel_gpu_gt::GtPlatform::WildcatLake`]
 //! route. It keeps the source three-pipe topology and C10/C20 PHY split; it
 //! is not an LT-PHY platform.
+//!
+//! ## Nova Lake-S (display 35.00, Xe3P_LPD)
+//!
+//! [`DisplayIp::NovaLakeS`] is decoded only by [`DisplayIp::decode_all`]
+//! and admitted only through the exact opted-in Nova Lake-S route
+//! ([`crate::intel_gpu_xe3plpd`]). It shares every display-30 branch
+//! (`DISPLAY_VER >= 30`) and adds the display-35 deltas: the
+//! `xe3p_lpd_cdclk_table`, level-0 latency ignored and linear method 2 in
+//! the watermarks, the Xe3P MBUS throttle field, no `TRANS_VSYNCSHIFT` or
+//! interlace field, and the LT PHY behind ports A, B, TC1 and TC2.
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_xelpg::XeLpgPort;
@@ -122,14 +132,18 @@ pub(crate) enum DisplayIp {
     /// descriptor. Only the exact opted-in Wildcat Lake route constructs it;
     /// broad Panther Lake generation dispatch remains insufficient.
     WildcatLake,
+    /// 35.00 (`xe3p_lpd`): Nova Lake-S, reached only through
+    /// [`DisplayIp::decode_all`] and the opted-in Nova Lake-S route
+    /// ([`crate::intel_gpu_xe3plpd`]). Its ports drive the LT PHY.
+    NovaLakeS,
 }
 
 /// Exact `GMD_ID_DISPLAY` identities published by Linux's
 /// `gmdid_display_map`.
 ///
 /// This is deliberately wider than [`DisplayIp`]: recognizing a live IP is
-/// not authority to program it. In particular, Nova Lake-S 35.00 remains a
-/// read-only reset/admission proof outside every operational modeset route.
+/// not authority to program it. Nova Lake-S 35.00 is programmed only by its
+/// opted-in route; elsewhere it remains a read-only admission proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayIdentity {
     /// 14.00, `xe_lpdp_display`.
@@ -433,6 +447,7 @@ impl DisplayIp {
             DisplayIdentity::Xe2Lpd => Ok(Self::Xe2Lpd),
             DisplayIdentity::Xe3Lpd if display30 => Ok(Self::Xe3Lpd),
             DisplayIdentity::WildcatLake if display30 => Ok(Self::WildcatLake),
+            DisplayIdentity::NovaLakeS if display30 => Ok(Self::NovaLakeS),
             other => {
                 let (ver, rel) = other.version();
                 Err(IpError::Unqualified { ver, rel })
@@ -457,10 +472,11 @@ impl DisplayIp {
         }
     }
 
-    /// [`DisplayIp::decode`] widened by display 30.00 and 30.02. Only the
-    /// display-30 route and the per-IP owners behind it use it; the Meteor
-    /// Lake and Lunar Lake entries keep [`DisplayIp::decode`], so 30.00
-    /// and 30.02 stay typed refusals there. 30.02 (`wcl_display`: three
+    /// [`DisplayIp::decode`] widened by display 30.00, 30.02 and 35.00. Only
+    /// the display-30 and display-35 routes and the per-IP owners behind them
+    /// use it; the Meteor Lake and Lunar Lake entries keep
+    /// [`DisplayIp::decode`], so 30.00, 30.02 and 35.00 stay typed refusals
+    /// there, and each route compares the result with its exact platform. 30.02 (`wcl_display`: three
     /// pipes, C10 on PHY A and B, `xe3lpd_3002_dmc.bin`, a 480 MHz CDCLK
     /// ceiling and `xe3lpd_3002_sa_info`) belongs to the exact Wildcat Lake
     /// route; decoding it here does not bypass that platform admission.
@@ -497,13 +513,20 @@ impl DisplayIp {
             Self::Xelpdp => 14,
             Self::Xe2Lpd => 20,
             Self::Xe3Lpd | Self::WildcatLake => 30,
+            Self::NovaLakeS => 35,
         }
     }
 
     /// `DISPLAY_VER >= 30`: the mandatory VRR timing generator, Xe3 PM
-    /// demand fields and display-30 watermark programming.
+    /// demand fields and display-30 watermark programming. Display 35
+    /// shares every one of these branches.
     pub(crate) const fn is_display30(self) -> bool {
-        matches!(self, Self::Xe3Lpd | Self::WildcatLake)
+        matches!(self, Self::Xe3Lpd | Self::WildcatLake | Self::NovaLakeS)
+    }
+
+    /// `DISPLAY_VER >= 35`: the Xe3P_LPD deltas on top of display 30.
+    pub(crate) const fn is_display35(self) -> bool {
+        matches!(self, Self::NovaLakeS)
     }
 
     /// Source `pipe_mask` width. Wildcat Lake has only A-C; the other
@@ -511,7 +534,7 @@ impl DisplayIp {
     pub(crate) const fn pipe_count(self) -> usize {
         match self {
             Self::WildcatLake => 3,
-            Self::Xelpdp | Self::Xe2Lpd | Self::Xe3Lpd => 4,
+            Self::Xelpdp | Self::Xe2Lpd | Self::Xe3Lpd | Self::NovaLakeS => 4,
         }
     }
 
@@ -523,12 +546,12 @@ impl DisplayIp {
         !matches!(self, Self::Xelpdp)
     }
 
-    /// Number of FBC instances (`fbc_mask`): A–B on 14.00, A–D on 20.00
-    /// and 30.00, and A–C on Wildcat Lake 30.02.
+    /// Number of FBC instances (`fbc_mask`): A–B on 14.00, A–D on 20.00,
+    /// 30.00 and 35.00, and A–C on Wildcat Lake 30.02.
     pub(crate) const fn fbc_instances(self) -> u64 {
         match self {
             Self::Xelpdp => 2,
-            Self::Xe2Lpd | Self::Xe3Lpd => 4,
+            Self::Xe2Lpd | Self::Xe3Lpd | Self::NovaLakeS => 4,
             Self::WildcatLake => 3,
         }
     }
@@ -540,16 +563,18 @@ impl DisplayIp {
     }
 
     /// `get_allowed_dc_mask` (display parameters at their defaults):
-    /// `max_dc` 4 on display 12–19 (DC3CO | DC6), 2 on display >= 20 (DC6),
-    /// with DC9 always allowed on display >= 11. The DC service targets DC6
-    /// on both; this records the display-20 cap for its install.
+    /// `max_dc` 4 on display 12–19 and >= 35 (DC3CO | DC6), 2 on display
+    /// 20–30 (DC6), with DC9 always allowed on display >= 11. The DC service
+    /// targets DC6 on each; this records the cap for its install.
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) const fn allowed_dc_mask(self) -> u32 {
         use crate::intel_gpu_dc_states::{
             DC_STATE_EN_DC3CO, DC_STATE_EN_DC9, DC_STATE_EN_UPTO_DC6,
         };
         match self {
-            Self::Xelpdp => DC_STATE_EN_DC9 | DC_STATE_EN_DC3CO | DC_STATE_EN_UPTO_DC6,
+            Self::Xelpdp | Self::NovaLakeS => {
+                DC_STATE_EN_DC9 | DC_STATE_EN_DC3CO | DC_STATE_EN_UPTO_DC6
+            }
             Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake => {
                 DC_STATE_EN_DC9 | DC_STATE_EN_UPTO_DC6
             }
@@ -567,6 +592,7 @@ impl DisplayIp {
                 XE2LPD_DMC_MAX_FW_SIZE,
             ),
             Self::WildcatLake => ("i915/xe3lpd_3002_dmc.bin", XE2LPD_DMC_MAX_FW_SIZE),
+            Self::NovaLakeS => ("i915/xe3p_lpd_dmc.bin", XE2LPD_DMC_MAX_FW_SIZE),
         }
     }
 
@@ -574,7 +600,9 @@ impl DisplayIp {
     pub(crate) const fn chicken_trans(self) -> (u32, u32) {
         match self {
             Self::Xelpdp => (DP_DSC_INSERT_SF_AT_EOL_WA, DP_FEC_BS_JITTER_WA),
-            Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake => (DP_DSC_INSERT_SF_AT_EOL_WA, 0),
+            Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake | Self::NovaLakeS => {
+                (DP_DSC_INSERT_SF_AT_EOL_WA, 0)
+            }
         }
     }
 
@@ -587,7 +615,7 @@ impl DisplayIp {
                 crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_ENABLE,
                 crate::intel_gpu_xelpg::PORT_BUF_D2D_LINK_STATE,
             ),
-            Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake => (
+            Self::Xe2Lpd | Self::Xe3Lpd | Self::WildcatLake | Self::NovaLakeS => (
                 ddi_buf_ctl(port),
                 DDI_BUF_D2D_LINK_ENABLE,
                 DDI_BUF_D2D_LINK_STATE,
@@ -958,30 +986,71 @@ pub(crate) fn mdclk_cdclk_ratio(r: Rung) -> u32 {
 }
 
 /// `MBUS_TRANSLATION_THROTTLE_MIN(ratio - 1)`.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn mbus_throttle(ratio: u32) -> u32 {
     (ratio.saturating_sub(1) << 13) & MBUS_THROTTLE_MASK
 }
 
 /// `DBUF_MIN_TRACKER_STATE_SERVICE(ratio - 1)`, the ratio doubled when the
 /// MBUS is joined.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn dbuf_min_tracker(ratio: u32, joined: bool) -> u32 {
+    dbuf_min_tracker_ip(DisplayIp::Xe2Lpd, ratio, joined)
+}
+
+/// `intel_dbuf_mdclk_cdclk_ratio_update`'s `MBUS_CTL` field for `ip`:
+/// `XE3P_MBUS_TRANSLATION_THROTTLE_MIN_MASK` (16:13) on display >= 35,
+/// `MBUS_TRANSLATION_THROTTLE_MIN_MASK` (15:13) on display 20-34.
+pub(crate) const fn mbus_throttle_mask(ip: DisplayIp) -> u32 {
+    if ip.is_display35() {
+        crate::intel_gpu_xelpg_cdclk::NOVA_LAKE_MBUS_THROTTLE_MASK
+    } else {
+        MBUS_THROTTLE_MASK
+    }
+}
+
+/// The `DBUF_CTL_S` minimum tracker for `ip`:
+/// `XE3P_DBUF_MIN_TRACKER_STATE_SERVICE_MASK` (20:16) on display >= 35,
+/// `DBUF_MIN_TRACKER_STATE_SERVICE_MASK` (18:16) before.
+pub(crate) const fn dbuf_min_tracker_mask(ip: DisplayIp) -> u32 {
+    if ip.is_display35() {
+        crate::intel_gpu_xelpg_cdclk::NOVA_LAKE_DBUF_MIN_TRACKER_MASK
+    } else {
+        DBUF_MIN_TRACKER_MASK
+    }
+}
+
+/// [`mbus_throttle`] in `ip`'s field.
+pub(crate) fn mbus_throttle_ip(ip: DisplayIp, ratio: u32) -> u32 {
+    (ratio.saturating_sub(1) << 13) & mbus_throttle_mask(ip)
+}
+
+/// [`dbuf_min_tracker`] in `ip`'s field.
+pub(crate) fn dbuf_min_tracker_ip(ip: DisplayIp, ratio: u32, joined: bool) -> u32 {
     let ratio = if joined { ratio * 2 } else { ratio };
-    (ratio.saturating_sub(1) << 16) & DBUF_MIN_TRACKER_MASK
+    (ratio.saturating_sub(1) << 16) & dbuf_min_tracker_mask(ip)
 }
 
 /// `DBUF_CTL_S(slice)` on display 20 over `old`: the power request for
 /// `enabled` and the MDCLK minimum tracker at `ratio`. The tracker state
 /// service field (23:19) is preserved: Linux programs it only on display
 /// 12 and DG2 (`gen12_dbuf_slices_config`).
-pub(crate) fn dbuf_ctl(slice: usize, old: u32, enabled: u8, ratio: u32, joined: bool) -> u32 {
+pub(crate) fn dbuf_ctl(
+    ip: DisplayIp,
+    slice: usize,
+    old: u32,
+    enabled: u8,
+    ratio: u32,
+    joined: bool,
+) -> u32 {
     let request = if enabled & (1 << slice) != 0 {
         1 << 31
     } else {
         0
     };
-    (old & !((1 << 31) | (1 << 30) | DBUF_MIN_TRACKER_MASK))
+    (old & !((1 << 31) | (1 << 30) | dbuf_min_tracker_mask(ip)))
         | request
-        | dbuf_min_tracker(ratio, joined)
+        | dbuf_min_tracker_ip(ip, ratio, joined)
 }
 
 /// `pipe_mbus_dbox_ctl` for display 20: the display >= 14 credits without
@@ -996,11 +1065,23 @@ pub(crate) fn dbox(joined: bool) -> u32 {
 /// `intel_dbuf_mdclk_cdclk_ratio_update` on display 20 for `target`:
 /// read-modify-write the MBUS throttle and every slice's minimum tracker.
 /// Every write is read back.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn program_mdclk_ratio(
     io: &(impl MmioWindow + ?Sized),
     target: Rung,
     joined: bool,
 ) -> Result<(), IpError> {
+    program_mdclk_ratio_ip(io, DisplayIp::Xe2Lpd, target, joined)
+}
+
+/// [`program_mdclk_ratio`] in `ip`'s throttle and tracker fields.
+pub(crate) fn program_mdclk_ratio_ip(
+    io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
+    target: Rung,
+    joined: bool,
+) -> Result<(), IpError> {
+    let (throttle_mask, tracker_mask) = (mbus_throttle_mask(ip), dbuf_min_tracker_mask(ip));
     let ratio = mdclk_cdclk_ratio(target);
     let read = |r| {
         let v = io.read32(r);
@@ -1011,16 +1092,16 @@ pub(crate) fn program_mdclk_ratio(
         }
     };
     let mbus = crate::intel_gpu_xelpg_dbuf::MBUS_CTL;
-    let value = (read(mbus)? & !MBUS_THROTTLE_MASK) | mbus_throttle(ratio);
+    let value = (read(mbus)? & !throttle_mask) | mbus_throttle_ip(ip, ratio);
     io.write32(mbus, value);
-    if read(mbus)? & MBUS_THROTTLE_MASK != value & MBUS_THROTTLE_MASK {
+    if read(mbus)? & throttle_mask != value & throttle_mask {
         return Err(IpError::NoDevice);
     }
     for r in crate::intel_gpu_xelpg_dbuf::DBUF_CTL {
         let old = read(r)?;
-        let value = (old & !(DBUF_MIN_TRACKER_MASK | (1 << 30))) | dbuf_min_tracker(ratio, joined);
+        let value = (old & !(tracker_mask | (1 << 30))) | dbuf_min_tracker_ip(ip, ratio, joined);
         io.write32(r, value);
-        if read(r)? & DBUF_MIN_TRACKER_MASK != value & DBUF_MIN_TRACKER_MASK {
+        if read(r)? & tracker_mask != value & tracker_mask {
             return Err(IpError::NoDevice);
         }
     }
@@ -1061,7 +1142,8 @@ pub(crate) fn raise_cdclk_floor_ip(
     if joined == u32::MAX {
         return Err(CdclkError::NoDevice);
     }
-    program_mdclk_ratio(io, target, joined & (1 << 31) != 0).map_err(|_| CdclkError::Readback)
+    program_mdclk_ratio_ip(io, ip, target, joined & (1 << 31) != 0)
+        .map_err(|_| CdclkError::Readback)
 }
 
 // ── Package C latency ────────────────────────────────────────────

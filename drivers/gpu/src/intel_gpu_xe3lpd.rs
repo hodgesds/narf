@@ -468,14 +468,17 @@ impl Well {
 }
 
 /// The power-gate parent of `well` (the comment above
-/// `xe3lpd_power_wells`: PG1 → PGA, PGB, PG2; PG2 → PGC, PGD), against
+/// `xe3lpd_power_wells`, also `xe3plpd_power_wells`' main wells: PG1 → PGA,
+/// PGB, PG2; PG2 → PGC, PGD), against
 /// display 14/20 where PW_2 also parents PW_B (`XELPDP_PW_2_POWER_DOMAINS`
 /// includes `XELPD_PW_B_POWER_DOMAINS`).
 pub(crate) const fn parent(ip: DisplayIp, well: Well) -> Option<Well> {
     match (ip, well) {
         (_, Well::Pw1) => None,
         (_, Well::Pw2 | Well::PwA) => Some(Well::Pw1),
-        (DisplayIp::Xe3Lpd | DisplayIp::WildcatLake, Well::PwB) => Some(Well::Pw1),
+        (DisplayIp::Xe3Lpd | DisplayIp::WildcatLake | DisplayIp::NovaLakeS, Well::PwB) => {
+            Some(Well::Pw1)
+        }
         (DisplayIp::Xelpdp | DisplayIp::Xe2Lpd, Well::PwB) => Some(Well::Pw2),
         (_, Well::PwC | Well::PwD) => Some(Well::Pw2),
     }
@@ -498,14 +501,28 @@ pub(crate) enum Domain {
     DdiLanesTc,
     AudioMmio,
     AudioPlayback,
+    /// Every AUX channel (A, B, USBC1-4, TBT1-4).
+    Aux,
 }
 
 /// The domains of DC_off beyond `POWER_DOMAIN_DC_OFF` and `INIT`:
 /// `xe2lpd_pwdoms_dc_off` (`XELPD_PW_C/D_POWER_DOMAINS`, `AUDIO_MMIO`) on
 /// display 20, `xe3lpd_pwdoms_dc_off` (`XE3LPD_PW_2/C/D_POWER_DOMAINS`,
-/// `AUDIO_MMIO`, `AUDIO_PLAYBACK`) on display 30.
+/// `AUDIO_MMIO`, `AUDIO_PLAYBACK`) on display 30, and `xe3plpd_pwdoms_dc_off`
+/// (display 30's plus every AUX channel) on display 35.
 pub(crate) const fn dc_off_domains(ip: DisplayIp) -> &'static [Domain] {
     match ip {
+        DisplayIp::NovaLakeS => &[
+            Domain::PipeC,
+            Domain::PipeD,
+            Domain::TranscoderC,
+            Domain::TranscoderD,
+            Domain::Vga,
+            Domain::DdiLanesTc,
+            Domain::AudioMmio,
+            Domain::AudioPlayback,
+            Domain::Aux,
+        ],
         DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => &[
             Domain::PipeC,
             Domain::PipeD,

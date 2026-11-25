@@ -779,7 +779,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // (intel_vrr_compute_guardband) is known before the first
         // destructive write, and a mode it cannot describe is refused.
         let guardband = if self.ip.is_display30() {
-            let latency = crate::intel_gpu_xelpg_wm::Latency::read(self.mmio)
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read_ip(self.mmio, self.ip)
                 .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
             Some(
                 crate::intel_gpu_xe3lpd::vrr_guardband_for(
@@ -1071,7 +1071,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 vtotal: u32::from(mode.v_total),
                 vblank_start: u32::from(mode.v_active),
             };
-            let latency = crate::intel_gpu_xelpg_wm::Latency::read(self.mmio)
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read_ip(self.mmio, self.ip)
                 .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
             let linetime = crate::intel_gpu_xelpg_wm::linetime(timing)
                 .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
@@ -1694,9 +1694,14 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             .iter()
             .any(|reg| self.mmio.read32(*reg) & (PIPECONF_ENABLE | PIPECONF_STATE) != 0);
         let settled = !others_lit
-            && crate::intel_gpu_xelpg_wm::Latency::read(self.mmio).is_ok_and(|latency| {
-                crate::intel_gpu_xelpg_resources::settle_all_off(self.mmio, &latency).is_ok()
-            });
+            && crate::intel_gpu_xelpg_wm::Latency::read_ip(self.mmio, self.ip).is_ok_and(
+                |latency| {
+                    crate::intel_gpu_xelpg_resources::settle_all_off_ip(
+                        self.mmio, self.ip, &latency,
+                    )
+                    .is_ok()
+                },
+            );
         let record = PanelOff {
             port: self.port,
             mode,
@@ -2128,8 +2133,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// The VRR IP for this run's display IP (MTL/ARL 14.00, LNL
-    /// 20.00). Display 30 (PTL) is `None`: its always-on VRR timing
-    /// generator is owned by `intel_gpu_xe3lpd`, not the generic VRR
+    /// 20.00). Display 30 (PTL) and 35 (NVL-S) are `None`: their always-on
+    /// VRR timing generator is owned by `intel_gpu_xe3lpd`, not the generic VRR
     /// path — the generic hooks below must never run on it.
     fn vrr_ip(&self) -> Option<crate::intel_gpu_vrr::DisplayVrrIp> {
         match self.ip {
@@ -2140,7 +2145,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 Some(crate::intel_gpu_vrr::DisplayVrrIp::Display20)
             }
             crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd
-            | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => None,
+            | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake
+            | crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS => None,
         }
     }
 

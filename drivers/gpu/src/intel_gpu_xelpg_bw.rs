@@ -65,7 +65,20 @@ pub(crate) struct Qgv {
 
 impl Qgv {
     /// `None` when SAGV cannot be controlled or described.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Option<Self>, FsError> {
+        Self::read_ip(io, crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp)
+    }
+
+    /// [`Qgv::read`] under `ip`'s `xelpdp_get_dram_info`. Display 35 adds
+    /// Wa_16030862157 (a saturated populated-channel field is 16 channels,
+    /// and LPDDR4/5 reach 16) and `XE3P_ECC_IMPACTING_DE`: Linux has no
+    /// bandwidth rule for ECC that costs display bandwidth and only warns,
+    /// so it is refused here (`Unsupported`) and no owned layout runs.
+    pub(crate) fn read_ip(
+        io: &(impl MmioWindow + ?Sized),
+        ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    ) -> Result<Option<Self>, FsError> {
         let read = |r: u64| {
             let v = io.read32(r);
             if v == u32::MAX || !io.display_access_ok() {
@@ -75,12 +88,17 @@ impl Qgv {
             }
         };
         let global = read(MEM_SS_INFO_GLOBAL)?;
+        let xe3p = ip.is_display35();
+        if xe3p && global & crate::intel_gpu_xe3plpd::ECC_IMPACTING_DE != 0 {
+            return Err(FsError::Unsupported);
+        }
+        let lpddr_channels = if xe3p { 16 } else { 8 };
         // icl_get_qgv_points, display >= 14.
         let (t_bl, max_numchannels, channel_width, deinterleave) = match global & 0xf {
-            0 => (4, 2, 64, 2),  // DDR4
-            1 => (8, 4, 32, 2),  // DDR5
-            2 => (16, 8, 16, 4), // LPDDR5
-            3 => (16, 8, 16, 4), // LPDDR4
+            0 => (4, 2, 64, 2),               // DDR4
+            1 => (8, 4, 32, 2),               // DDR5
+            2 => (16, lpddr_channels, 16, 4), // LPDDR5
+            3 => (16, lpddr_channels, 16, 4), // LPDDR4
             _ => return Ok(None),
         };
         let num_points = ((global >> 8) & 0xf) as u8;
@@ -109,7 +127,10 @@ impl Qgv {
             max_numchannels,
             channel_width,
             deinterleave,
-            num_channels: ((global >> 4) & 0xf) as u8,
+            num_channels: match ((global >> 4) & 0xf) as u8 {
+                0xf if xe3p => 16,
+                n => n,
+            },
             num_points,
             points,
         }))
@@ -130,12 +151,15 @@ pub(crate) fn bw_info(q: &Qgv) -> Option<[Group; GROUPS]> {
     bw_info_limit(q, DEPROGBWLIMIT_GBPS)
 }
 
-/// `intel_bw_init_hw`'s `sa_info` for `ip`: display 30.00 takes
-/// `xe3lpd_sa_info` (65 GB/s) and display 30.02 takes
+/// `intel_bw_init_hw`'s `sa_info` for `ip`: display 30.00 and Nova Lake's
+/// 35.00 take `xe3lpd_sa_info` (65 GB/s) and display 30.02 takes
 /// `xe3lpd_3002_sa_info` (22 GB/s), against `mtl_sa_info`'s 38 GB/s.
 const fn deprogbwlimit_gbps(ip: crate::intel_gpu_xe2lpd::DisplayIp) -> i64 {
     match ip {
-        crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd => crate::intel_gpu_xe3lpd::DEPROGBWLIMIT_GBPS,
+        crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd
+        | crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS => {
+            crate::intel_gpu_xe3lpd::DEPROGBWLIMIT_GBPS
+        }
         crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => {
             crate::intel_gpu_xe3lpd::WCL_DEPROGBWLIMIT_GBPS
         }

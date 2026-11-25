@@ -488,10 +488,22 @@ fn smoke_xe2lpd_mdclk_ratio_dbuf_mbus_and_dbox() -> TestResult {
     // DBUF_CTL: request per slice, tracker state service (23:19) kept,
     // POWER_STATE never written back.
     assert_eq!(
-        dbuf_ctl(0, 0x00f8_0000 | (1 << 30), 1, 2, true),
+        dbuf_ctl(DisplayIp::Xe2Lpd, 0, 0x00f8_0000 | (1 << 30), 1, 2, true),
         0x80fb_0000
     );
-    assert_eq!(dbuf_ctl(1, 0x8007_0000, 1, 4, false), 0x0003_0000);
+    assert_eq!(
+        dbuf_ctl(DisplayIp::Xe2Lpd, 1, 0x8007_0000, 1, 4, false),
+        0x0003_0000
+    );
+    // Display 35 widens the tracker to 20:16 and the throttle to 16:13: a
+    // joined ratio of 24 fits there and is truncated on display 20.
+    assert_eq!(
+        dbuf_ctl(DisplayIp::NovaLakeS, 0, 0, 1, 12, true),
+        0x8017_0000
+    );
+    assert_eq!(dbuf_ctl(DisplayIp::Xe2Lpd, 0, 0, 1, 12, true), 0x8007_0000);
+    assert_eq!(mbus_throttle_ip(DisplayIp::NovaLakeS, 12), 11 << 13);
+    assert_eq!(mbus_throttle_ip(DisplayIp::Xe2Lpd, 12), 3 << 13);
     // pipe_mbus_dbox_ctl without the 14.00 BW credits (15:14).
     assert_eq!(dbox(true), 0x0103_0a4c);
     assert_eq!(dbox(false), 0x0103_0a48);
