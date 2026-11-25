@@ -465,6 +465,12 @@ fn smoke_xe_prime_move_notify_invalidates_and_rebinds_dynamic_import() -> TestRe
     );
     assert!(object.is_vram() && !imported.import_mapped());
     assert_eq!(imported.import().unwrap().attachment().moves(), moves + 1);
+    bind_wire(
+        &user,
+        vm,
+        &[mapping(imported_handle, 0x1234_0000_0000, 0, BO, PAT_2WAY, 0)],
+        &[],
+    );
     assert_eq!(bind_now(&importer, &info, &user), Ok(0));
     assert_eq!(imported.pages().collect::<Vec<_>>(), bar(&object));
     let mut back = alloc::vec![0; BO as usize];
