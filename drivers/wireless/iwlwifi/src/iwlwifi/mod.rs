@@ -1659,14 +1659,19 @@ pub fn register() {
     }
 }
 
+/// Whether `iwlwifi.ko` carries `chip`: the one predicate behind the module's
+/// PCI claim and `register_builtin_only`, so the two never disagree.
+pub fn module_carries(chip: &ChipConfig) -> bool {
+    chip.generation == Generation::Gen3
+}
+
 /// `narf-drivers-wireless/iwlwifi-module-only`: register every id except the
-/// Sc (BE20x/BE21x) ones `iwlwifi.ko` claims, so an early-loaded module owns
-/// those devices while the other generations stay built in.
+/// ones `iwlwifi.ko` claims ([`module_carries`]), so an early-loaded module
+/// owns those devices while any other generation stays built in.
 #[cfg(feature = "builtin")]
 pub fn register_builtin_only() {
     for &(did, name) in PCI_DIDS.iter() {
-        if chip_config_for_pci_id(INTEL_VENDOR, did).is_some_and(|chip| chip.mac == MacFamily::ScA0)
-        {
+        if chip_config_for_pci_id(INTEL_VENDOR, did).is_some_and(|chip| module_carries(&chip)) {
             continue;
         }
         narf_bus::register_pci_driver(narf_bus::PciMatch {

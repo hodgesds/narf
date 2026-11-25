@@ -1,17 +1,19 @@
 //! The module build's PCI binding (`iwlwifi.ko`).
 //!
-//! Probe is the built-in `iwlwifi::probe` + `bootstrap` sequence for the Sc
-//! profile, over the KABI:
+//! Probe is the built-in `iwlwifi::probe` + `bootstrap` sequence over the
+//! KABI:
 //!
 //! 1. `narf_pci_identity`; the driver's own chip table and subsystem
 //!    qualification ([`super::super::chip_config_for_pci_id`],
-//!    [`super::super::pci_subsystem_claimed`]); only the Sc MAC is claimed.
+//!    [`super::super::pci_subsystem_claimed`]).
 //! 2. Firmware-owned DMA is retained on teardown from the start.
 //! 3. `narf_pci_prepare_probe` parks inherited decode/mastering; BAR0 is
 //!    mapped and memory decode enabled with bus mastering off (`mmio::map`).
-//! 4. The Sc MAC/RF identity is read from CSR and selects the firmware
-//!    ladder ([`super::super::firmware_identity::Sc`]), never installed-file
-//!    order. A refused identity refuses the probe.
+//! 4. The CSR MAC/RF identity selects the native profile and its firmware
+//!    name ([`Discovery`], the built-in `bootstrap::Owner::candidates`),
+//!    never installed-file order: Sc reads its core ladder, Bz its core103
+//!    image, Ty/So/Ma their API89 image. A refused identity refuses the
+//!    probe.
 //! 5. The 1 ms poller and the startup task are spawned; probe returns.
 //!
 //! The startup task resolves the executable and PNVM through
@@ -28,9 +30,9 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use super::super::{
-    chip_config_for_pci_id, firmware_identity, mld_start, mmio, parse_ucode, pci_subsystem_claimed,
-    runtime::Hardware, rx_rfh::CompletionFormat, ChipConfig, IwlMmioImpl, MacFamily, INTEL_VENDOR,
-    PCI_DIDS,
+    bz_profile, chip_config_for_pci_id, firmware_identity, gen3_profile, mld_start, mmio,
+    parse_ucode, pci_subsystem_claimed, runtime::Hardware, rx_rfh::CompletionFormat, ChipConfig,
+    IwlMmioImpl, MacFamily, ParsedUcode, INTEL_VENDOR, PCI_DIDS,
 };
 use super::firmware_asset::Asset;
 use super::kernel::narf_bus::{BusAddr, BusDevice, BusDeviceCap, DeviceId, MmioRegion};
@@ -90,14 +92,90 @@ fn log(args: core::fmt::Arguments<'_>) {
     let _ = writeln!(Writer, "  iwlwifi.ko: {}", args);
 }
 
-/// The PCI device ids `iwlwifi.ko` claims: the built-in table's Sc entries.
-pub(crate) fn module_device_ids() -> impl Iterator<Item = u16> {
-    PCI_DIDS.iter().map(|&(did, _)| did).filter(|&did| {
-        chip_config_for_pci_id(INTEL_VENDOR, did).is_some_and(|chip| chip.mac == MacFamily::ScA0)
-    })
+/// Whether `iwlwifi.ko` carries `chip` (`iwlwifi::module_carries`).
+pub(crate) fn carried(chip: &ChipConfig) -> bool {
+    super::super::module_carries(chip)
 }
 
-/// Register the Sc PCI ids; the kernel calls [`probe_c`] for a match.
+/// The PCI device ids `iwlwifi.ko` claims: the built-in table's entries of
+/// every carried generation.
+pub(crate) fn module_device_ids() -> impl Iterator<Item = u16> {
+    PCI_DIDS
+        .iter()
+        .map(|&(did, _)| did)
+        .filter(|&did| chip_config_for_pci_id(INTEL_VENDOR, did).is_some_and(|c| carried(&c)))
+}
+
+/// The native profile CSR discovery selected, and the firmware it names
+/// (`bootstrap::Owner::candidates`).
+#[derive(Clone, Copy, Debug)]
+enum Discovery {
+    /// Sc: the core-release ladder bound to the fused MAC/RF/step.
+    Sc(firmware_identity::Sc),
+    /// Bz: the exact core103 profile.
+    Bz(bz_profile::Profile),
+    /// Ty/So/Ma: the API89 profile.
+    Api89(gen3_profile::Profile),
+}
+
+impl Discovery {
+    /// Identity-only discovery (memory decode on, bus mastering off).
+    fn read(
+        chip: &ChipConfig,
+        did: u16,
+        io: &mut IwlMmioImpl,
+    ) -> Result<(Self, Vec<String>), &'static str> {
+        match chip.mac {
+            MacFamily::ScA0 => {
+                let identity = firmware_identity::Sc::read(io)?;
+                let ladder = identity.ladder(chip)?;
+                Ok((Self::Sc(identity), ladder))
+            }
+            MacFamily::BzA0 => {
+                let profile = bz_profile::Profile::read(did, io)?;
+                let name = alloc::format!("iwlwifi/{}-c103.ucode", profile.prefix);
+                Ok((Self::Bz(profile), alloc::vec![name]))
+            }
+            MacFamily::TyA0 | MacFamily::SoA0 | MacFamily::MaA0 | MacFamily::MaB0 => {
+                let profile = gen3_profile::Profile::read(did, io)?;
+                let name = alloc::format!("iwlwifi/{}-89.ucode", profile.prefix);
+                Ok((Self::Api89(profile), alloc::vec![name]))
+            }
+            _ => Err("generation not carried by iwlwifi.ko"),
+        }
+    }
+
+    /// `bootstrap::Owner::start`'s admission of the parsed executable and the
+    /// re-read of the identity it was selected for.
+    fn admit(
+        &self,
+        did: u16,
+        parsed: &ParsedUcode<'_>,
+        io: &mut IwlMmioImpl,
+    ) -> Result<(), &'static str> {
+        match self {
+            Self::Bz(profile) => {
+                profile.validate(parsed)?;
+                profile.check(did, io)
+            }
+            Self::Api89(profile) => {
+                profile.validate(parsed)?;
+                profile.check(did, io)
+            }
+            Self::Sc(identity) => identity.check(io),
+        }
+    }
+
+    /// The Sc identity `Hardware` binds (none for the other profiles).
+    fn sc(&self) -> Option<firmware_identity::Sc> {
+        match self {
+            Self::Sc(identity) => Some(*identity),
+            _ => None,
+        }
+    }
+}
+
+/// Register the carried PCI ids; the kernel calls [`probe_c`] for a match.
 pub(crate) fn register_pci_driver() {
     const NAME: &[u8] = b"iwlwifi";
     for did in module_device_ids() {
@@ -184,8 +262,7 @@ fn probe_device(dev: u64) -> i32 {
         return ENODEV;
     };
     let Some(chip) = chip_config_for_pci_id(device.id.vendor, device.id.device).filter(|chip| {
-        chip.mac == MacFamily::ScA0
-            && pci_subsystem_claimed(device.id.device, device.id.subsystem_id)
+        carried(chip) && pci_subsystem_claimed(device.id.device, device.id.subsystem_id)
     }) else {
         return ENODEV;
     };
@@ -202,15 +279,9 @@ fn probe_device(dev: u64) -> i32 {
         }
     };
     // Identity-only discovery: memory decode on, bus mastering off.
-    let identity = match firmware_identity::Sc::read(&mut IwlMmioImpl::new(region, cap)) {
-        Ok(identity) => identity,
-        Err(reason) => {
-            log(format_args!("{}: {reason}", chip.display_name));
-            return ENODEV;
-        }
-    };
-    let ladder = match identity.ladder(&chip) {
-        Ok(ladder) => ladder,
+    let mut io = IwlMmioImpl::new(region, cap);
+    let (discovery, ladder) = match Discovery::read(&chip, device.id.device, &mut io) {
+        Ok(found) => found,
         Err(reason) => {
             log(format_args!("{}: {reason}", chip.display_name));
             return ENODEV;
@@ -242,7 +313,7 @@ fn probe_device(dev: u64) -> i32 {
         cap,
         region,
         chip,
-        identity,
+        discovery,
         ladder,
         session,
     };
@@ -257,7 +328,7 @@ struct Startup {
     cap: Cap<BusDeviceCap, Write>,
     region: MmioRegion,
     chip: ChipConfig,
-    identity: firmware_identity::Sc,
+    discovery: Discovery,
     ladder: Vec<String>,
     /// The device's `WIFI` session.
     session: u64,
@@ -309,7 +380,7 @@ impl Startup {
         ));
     }
 
-    /// `bootstrap::Owner::start` for the Sc profile, then
+    /// `bootstrap::Owner::start` for the Gen3 profiles, then
     /// `device::Device::initialize`'s firmware half and the publication.
     async fn start(&self) -> Result<(), Failure> {
         let input = resolve(&self.ladder)?;
@@ -324,15 +395,18 @@ impl Startup {
         let _ = super::regulatory::ensure_snapshot();
         let format = CompletionFormat::for_mac(self.chip.mac)
             .ok_or("unsupported native completion profile")?;
-        self.identity
-            .check(&mut IwlMmioImpl::new(self.region, self.cap))?;
+        self.discovery.admit(
+            self.device.id.device,
+            &parsed,
+            &mut IwlMmioImpl::new(self.region, self.cap),
+        )?;
         let mut hardware = Hardware::new(
             self.device,
             self.cap,
             self.region,
             &parsed,
             format,
-            Some(self.identity),
+            self.discovery.sc(),
         )?;
         hardware.bind_sources(&input.firmware, input.pnvm.as_ref())?;
         hardware.prepare_station_profile(&parsed)?;

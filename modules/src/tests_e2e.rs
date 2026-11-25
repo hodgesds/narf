@@ -1769,17 +1769,22 @@ kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
 /// module`: the driver's PCIe transport, firmware loader, MLD station path and
 /// in-driver supplicant over `narf-module-rt` and the KABI). The relocations
 /// for the driver, `core`/`alloc` and the protocol crates resolve and init
-/// runs; the module claims exactly the six Sc (BE20x/BE21x) ids of the
-/// built-in table and none of the built-in-only Gen2/Ty/So/Ma/Bz ids; a probe
-/// with no device context is refused before any device access; and unload
-/// leaves no match. QEMU has no Intel Wi-Fi device, so bring-up itself is
-/// proven on hardware.
+/// runs; the module claims exactly the Gen3 ids of the built-in table (Ty,
+/// So, Ma, Bz and Sc) and none of the built-in-only Gen2 ids; a probe with no
+/// device context is refused before any device access; and unload leaves no
+/// match. QEMU has no Intel Wi-Fi device, so bring-up itself is proven on
+/// hardware.
 fn e2e_iwlwifi_module_registration() -> TestResult {
     use narf_bus::driver_match::{__module_thunk_for_test, count};
     const INTEL: u16 = 0x8086;
-    const SC: [u16; 6] = [0x6e70, 0x9327, 0xd240, 0xd340, 0xe340, 0xe440];
-    // AX200, AX201, AX210, AX211 (So/Ma), BE200 (Bz): built in only.
-    const BUILTIN_ONLY: [u16; 6] = [0x2723, 0x02f0, 0x2725, 0x51f0, 0x2729, 0x272b];
+    const CLAIMED: [u16; 19] = [
+        0x2725, 0x51f0, 0x51f1, 0x54f0, 0x7a70, 0x7af0, 0x7f70, 0x2729, 0x7e40, 0x272b, 0x7740,
+        0x4d40, 0xa840, 0x6e70, 0x9327, 0xd240, 0xd340, 0xe340, 0xe440,
+    ];
+    // AX200 and AX201 (Gen2): built in only.
+    const BUILTIN_ONLY: [u16; 9] = [
+        0x2723, 0x02f0, 0x06f0, 0x34f0, 0x3df0, 0x4df0, 0x43f0, 0xa0f0, 0x7df0,
+    ];
 
     let Some(initramfs) = narf_initramfs::staged() else {
         return TestResult::Skip("kernel booted without a test initramfs");
@@ -1803,15 +1808,15 @@ fn e2e_iwlwifi_module_registration() -> TestResult {
     };
     let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
     let claims = module.name() == "iwlwifi"
-        && count() == before + SC.len()
-        && SC
+        && count() == before + CLAIMED.len()
+        && CLAIMED
             .iter()
             .all(|&did| __module_thunk_for_test(INTEL, did).is_some())
         && BUILTIN_ONLY
             .iter()
             .all(|&did| __module_thunk_for_test(INTEL, did).is_none());
     // A bogus token (no device context): the identity read fails first.
-    let refused = SC
+    let refused = CLAIMED
         .iter()
         .all(|&did| __module_thunk_for_test(INTEL, did).is_some_and(|thunk| thunk(0, 0) != 0));
     drop(module);
@@ -1822,13 +1827,13 @@ fn e2e_iwlwifi_module_registration() -> TestResult {
         return TestResult::Fail("iwlwifi.ko did not reach Live");
     }
     if !claims {
-        return TestResult::Fail("iwlwifi.ko did not claim exactly the Sc PCI ids");
+        return TestResult::Fail("iwlwifi.ko did not claim exactly the Gen3 PCI ids");
     }
     if !refused {
         return TestResult::Fail("iwlwifi.ko probe accepted a token with no device context");
     }
     if count() != before
-        || SC
+        || CLAIMED
             .iter()
             .any(|&did| __module_thunk_for_test(INTEL, did).is_some())
     {
