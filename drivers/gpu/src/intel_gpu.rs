@@ -3385,6 +3385,11 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
         };
         let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_ip(display_ip);
         let window = gpu.mode_window();
+        // narf.intel.hdmi14_ext=1: the display-14+ audio component
+        // (intel_audio_component_init + _bind) for the HDA side.
+        if crate::intel_gpu_xelpg_external::color::opted_in() {
+            crate::intel_gpu_xelpg_external::audio::bind_production_component(&window);
+        }
         // The owned panel the route adopts next to it, and the display-14/20/30
         // DC service's pipe-DMC sink.
         let display = crate::intel_gpu_xelpg_external::MtlDisplay::production(

@@ -78,8 +78,12 @@
 //! at 8 bpc on display 14 and 20 (a Y420VDB VIC, or a Y420CMDB VIC whose RGB
 //! link is invalid): half the TMDS clock, the 1:1 pipe scaler in the
 //! resource transaction's prefill, the BT.709 output CSC, `PIPE_MISC` YUV
-//! and the Y420 AVI infoframe; display 30 keeps RGB. Audio, deep color,
-//! YCbCr 4:4:4 and HDMI 2.1 FRL remain out of scope.
+//! and the Y420 AVI infoframe; display 30 keeps RGB. Under
+//! `narf.intel.hdmi14_ext=1` the route also takes Linux's deep colour (10
+//! and 12 bpc with the GCP, [`crate::intel_gpu_xelpg_external::color`]) and
+//! HDMI audio ([`crate::intel_gpu_xelpg_external::audio`]). Linux never
+//! drives YCbCr 4:4:4 over HDMI, and HDMI 2.1 FRL stays refused: Linux 7.4
+//! has no source FRL link training (its FRL facts are below).
 //!
 //! DDC pins come from the corrected GMBUS numbering
 //! ([`crate::intel_gpu_gmbus::PinPair`], `gmbus_pins_mtp`): DDI B is pin 2
@@ -957,6 +961,10 @@ pub struct MtlHdmiProbe {
     /// General Control Packet to an HDMI sink
     /// (`intel_hdmi_compute_gcp_infoframe`).
     pub ext: bool,
+    /// The sink's ELD when the route enables audio
+    /// (`narf.intel.hdmi14_ext=1`, `intel_hdmi_has_audio`: an HDMI sink
+    /// with audio descriptors).
+    pub audio: Option<alloc::boxed::Box<narf_drivers_sound::display_audio::DisplayAudioPublication>>,
     /// EDID bytes (`edid_len` valid).
     pub edid: alloc::boxed::Box<[u8; crate::intel_gpu_hdmi::EDID_CAPACITY]>,
     /// Valid EDID length.
@@ -1085,9 +1093,24 @@ pub(crate) fn probe_hdmi_profile_ext<M: MmioWindow + ?Sized>(
         format,
         bpc,
         ext,
+        audio: hdmi_audio(&edid[..edid_len], ext).map(alloc::boxed::Box::new),
         edid: alloc::boxed::Box::new(edid),
         edid_len,
     })
+}
+
+/// `intel_hdmi_has_audio` under `narf.intel.hdmi14_ext=1`: an HDMI sink
+/// whose CTA extension carries audio descriptors gets audio; its ELD is the
+/// shared builder's (Port ID 0, as `drm_edid_to_eld` leaves it).
+fn hdmi_audio(
+    edid: &[u8],
+    ext: bool,
+) -> Option<narf_drivers_sound::display_audio::DisplayAudioPublication> {
+    use narf_drivers_sound::display_audio::{build_eld, DisplayConnector};
+    if !ext || !crate::intel_gpu_hdmi::is_hdmi_sink(edid) {
+        return None;
+    }
+    build_eld(edid, DisplayConnector::Hdmi, 0)
 }
 
 /// The output an HDMI probe resolves: format, pipe bpc, PLL request and
@@ -1232,6 +1255,9 @@ pub struct MtlHdmiRoute {
     /// The Pipe B–D owner as the proven release left it, until a sibling
     /// route adopts it.
     retired: Option<Pipes>,
+    /// The audio stream `intel_audio_codec_enable` started, until its
+    /// disable.
+    audio: Option<crate::intel_gpu_xelpg_external::audio::AudioStream>,
 }
 
 fn wr<M: MmioWindow + ?Sized>(io: &M, off: u64, value: u32) -> Result<(), HdmiError> {
@@ -1316,6 +1342,7 @@ pub(crate) fn activate_hdmi_beside<M: MmioWindow + ?Sized>(
     if probe.format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420 {
         ext.scaler = Some(crate::intel_gpu_modeset::ycbcr420_scaler(&probe.mode));
     }
+    ext.audio = probe.audio.is_some();
     if let Err(e) = choice.pipes.admit(io, &ext) {
         return Err((Err(probe), e.into()));
     }
@@ -1326,10 +1353,11 @@ pub(crate) fn activate_hdmi_beside<M: MmioWindow + ?Sized>(
         pipe: choice.pipe,
         reservation: None,
         retired: None,
+        audio: None,
     };
     let dmc = display.pipe_dmc;
     let result = request_pipe_wells(io, ext.pipe)
-        .and_then(|()| reserve_pipe(io, choice, &ext, dmc))
+        .and_then(|()| reserve_audio_pipe(io, choice, &ext, dmc))
         .map_err(HdmiError::from)
         .and_then(|rp| {
             route.reservation = Some(rp);
@@ -1348,6 +1376,26 @@ pub(crate) fn activate_hdmi_beside<M: MmioWindow + ?Sized>(
             Err((Ok(route), e))
         }
     }
+}
+
+/// [`reserve_pipe`] bracketed, for a pipe with audio, by
+/// `intel_audio_cdclk_change_pre` / `_post` (the transaction may move
+/// CDCLK, and `AUD_TS_CDCLK_M/N` follow it).
+pub(crate) fn reserve_audio_pipe<M: MmioWindow + ?Sized>(
+    io: &M,
+    choice: crate::intel_gpu_xelpg_external::PipeChoice,
+    ext: &crate::intel_gpu_xelpg_pipes::ExternalPipe,
+    dmc: &'static (dyn crate::intel_gpu_dc_states::PipeDmc + Sync),
+) -> Result<RoutePipe, ExternalError> {
+    use crate::intel_gpu_xelpg_external::audio;
+    if ext.audio {
+        audio::cdclk_change_pre(io).map_err(|_| ExternalError::AccessLost)?;
+    }
+    let result = reserve_pipe(io, choice, ext, dmc);
+    if ext.audio {
+        let _ = audio::cdclk_change_post(io);
+    }
+    result
 }
 
 fn reservation(route: &mut MtlHdmiRoute) -> Result<&mut RoutePipe, HdmiError> {
@@ -1459,7 +1507,39 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     wait_port_buf_active(io, port).map_err(phy_err)?;
     // intel_update_crtc: the primary, armed under vblank evasion.
     rp.pipes.arm_primary(io, pipe)?;
-    observe_hdmi(io, route, func, start)
+    observe_hdmi(io, route, func, start)?;
+    // intel_post_plane_update: intel_encoders_audio_enable.
+    let Some(publication) = route.probe.audio.clone() else {
+        return Ok(());
+    };
+    use crate::intel_gpu_xelpg_external::audio;
+    let stream = audio::AudioStream {
+        trans,
+        pipe,
+        port: port.port_enum() as i32,
+        dp: false,
+        uhbr: false,
+        crtc_clock_khz: mode.pixel_clock_khz,
+        port_clock_khz: pll.port_clock_khz,
+        pipe_bpp: u32::from(bpc) * 3,
+        lane_count: HDMI_LANES,
+        h_active: mode.h_active,
+        h_total: mode.h_total,
+        v_active: mode.v_active,
+        dsc_bpp_x16: None,
+        ycbcr420: format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420,
+        wa_14020863754: audio::needs_wa_14020863754(ip),
+    };
+    let eld = audio::compute_eld(
+        &publication,
+        &route.probe.edid[..route.probe.edid_len],
+        &stream,
+    );
+    // The stream is the route's to disable from here on, even if a step
+    // of the enable failed.
+    route.audio = Some(stream);
+    audio::audio_codec_enable(io, &stream, &eld, *publication)
+        .map_err(|_| ExternalError::AccessLost.into())
 }
 
 fn observe_hdmi<M: MmioWindow + ?Sized>(
@@ -1531,6 +1611,12 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     );
     let stop_failed: HdmiError =
         ExternalError::Modeset(ModesetError::PipelineStopUnavailable).into();
+    // intel_pre_plane_update: intel_encoders_audio_disable, before the
+    // planes go (best effort: the stop proof is the pipe's).
+    let had_audio = route.probe.audio.is_some();
+    if let Some(stream) = route.audio.take() {
+        let _ = crate::intel_gpu_xelpg_external::audio::audio_codec_disable(io, &stream);
+    }
     let Some(rp) = route.reservation.as_mut() else {
         return Ok(());
     };
@@ -1572,7 +1658,7 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     if ddi & DDI_BUF_CTL_ENABLE != 0 || buf & PORT_BUF_PHY_IDLE == 0 || clock & 0xCC00_0000 != 0 {
         return Err(stop_failed);
     }
-    rp.pipes.release(io, pipe, rp.dmc)?;
+    crate::intel_gpu_xelpg_external::release_audio_pipe(io, rp, had_audio)?;
     route.retired = route.reservation.take().map(|rp| rp.pipes);
     Ok(())
 }

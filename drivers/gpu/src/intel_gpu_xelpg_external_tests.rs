@@ -5546,3 +5546,64 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_dp_ycbcr444_pcon_route
 );
+
+/// The DP route's ELD/audio enable sequence with a scripted HDA side
+/// (`narf.intel.hdmi14_ext=1`): after the plane update the route runs
+/// `enable_audio_dsc_wa`'s `HBLANK_EARLY_ENABLE_TGL` for Transcoder B,
+/// raises `AUDIO_OUTPUT_ENABLE`, sets `N_VALUE_INDEX` (hardware Maud/Naud)
+/// and notifies `pin_eld_notify(PORT_B, -1)`; the codec reads the unpruned
+/// DP ELD (three SADs) through pin 0x6. The stop latches the timestamps off
+/// (`N_PROG_ENABLE | N_VALUE_INDEX`) and withdraws the ELD.
+fn smoke_mtl_external_dp_audio_route_with_scripted_hda() -> TestResult {
+    use crate::intel_gpu_audio::{aud_cfg_off, AUD_CONFIG_N_PROG_ENABLE, AUD_CONFIG_N_VALUE_INDEX};
+    use crate::intel_gpu_xelpg_external::audio::{self, tests as at};
+    use core::sync::atomic::Ordering as AtomicOrdering;
+    use narf_drivers_sound::display_audio as acomp;
+    audio::reset_for_test();
+    acomp::register_display_audio_codec(&at::SCRIPTED_HDA);
+    let result = (|| {
+        let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, at::audio_edid()));
+        let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+        let probe = match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, true) {
+            Ok(p) if p.audio.is_some() => p,
+            _ => return TestResult::Fail("a DP sink with SADs must probe with audio"),
+        };
+        let fb = fb_for(&probe.mode).unwrap();
+        let before = at::NOTIFY_COUNT.load(AtomicOrdering::SeqCst);
+        let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+            Ok(route) if route.state() == RouteState::Live => route,
+            _ => return TestResult::Fail("the DP audio route must light"),
+        };
+        if io.writes_to(audio::AUD_CONFIG_BE) != [audio::hblank_early_enable_tgl(Transcoder::B)]
+            || io.writes_to(aud_cfg_off(Transcoder::B)) != [AUD_CONFIG_N_VALUE_INDEX]
+            || at::NOTIFY_COUNT.load(AtomicOrdering::SeqCst) != before + 1
+            || at::NOTIFY_PORT.load(AtomicOrdering::SeqCst) != 1
+            || at::NOTIFY_PIPE.load(AtomicOrdering::SeqCst) != -1
+        {
+            return TestResult::Fail("the DP route must enable audio and notify PORT_B");
+        }
+        let component = audio::XelpgAudioComponent { io: &io };
+        let mut buf = [0u8; 128];
+        match acomp::acomp_get_eld(Some(&component), Some(&at::SCRIPTED_HDA), 0x6, 0, &mut buf) {
+            Ok((true, _)) if buf[5] >> 4 == 3 && buf[5] & (3 << 2) == 1 << 2 => {}
+            _ => return TestResult::Fail("the codec must read the DP ELD on pin 0x6"),
+        }
+        if route.stop(&io).is_err()
+            || io.writes_to(aud_cfg_off(Transcoder::B)).last()
+                != Some(&(AUD_CONFIG_N_VALUE_INDEX | AUD_CONFIG_N_PROG_ENABLE))
+            || at::NOTIFY_COUNT.load(AtomicOrdering::SeqCst) != before + 2
+            || acomp::acomp_get_eld(Some(&component), Some(&at::SCRIPTED_HDA), 0x6, 0, &mut buf)
+                .is_ok()
+        {
+            return TestResult::Fail("the DP stop must disable audio and withdraw the ELD");
+        }
+        TestResult::Pass
+    })();
+    acomp::unregister_display_audio_codec();
+    audio::reset_for_test();
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_audio_route_with_scripted_hda
+);

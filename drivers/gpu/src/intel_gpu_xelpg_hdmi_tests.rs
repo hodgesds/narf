@@ -277,6 +277,7 @@ fn hdmi_probe_b() -> MtlHdmiProbe {
         format: crate::intel_gpu_hdmi::SinkFormat::Rgb,
         bpc: 8,
         ext: false,
+        audio: None,
         edid: alloc::boxed::Box::new([0; crate::intel_gpu_hdmi::EDID_CAPACITY]),
         edid_len: 0,
     }
@@ -1315,4 +1316,87 @@ fn smoke_xe_hdmi_deep_colour_10_and_12_bpc_routes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_hdmi",
     smoke_xe_hdmi_deep_colour_10_and_12_bpc_routes
+);
+
+// ── HDMI audio (narf.intel.hdmi14_ext=1) ────────────────────────────────
+
+/// The HDMI route's ELD/audio enable sequence with a scripted HDA side
+/// (`intel_post_plane_update` → `intel_audio_codec_enable`): the probe
+/// builds the sink's ELD, the live route raises `AUDIO_OUTPUT_ENABLE` for
+/// Transcoder B and invalidates its ELD_VALID (never sets it), programs the
+/// HDMI `AUD_CONFIG` (138.5 MHz: field 1, automatic N), brackets the
+/// resource transaction with `AUD_TS_CDCLK`, and notifies
+/// `pin_eld_notify(PORT_B, -1)`; the codec reads the pruned ELD through pin
+/// 0x6. The stop disables audio before the planes and notifies again.
+fn smoke_xe_hdmi_audio_route_with_scripted_hda() -> TestResult {
+    use crate::intel_gpu_xelpg_external::audio::{self, tests as at};
+    use narf_drivers_sound::display_audio as acomp;
+    audio::reset_for_test();
+    acomp::register_display_audio_codec(&at::SCRIPTED_HDA);
+    let result = (|| {
+        let io = ddi_b_hdmi_sink(&at::audio_edid());
+        let probe = match probe_deep(&io, true) {
+            Ok(p) if p.audio.is_some() && p.bpc == 8 => p,
+            _ => return TestResult::Fail("an HDMI sink with SADs must probe with audio"),
+        };
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 1920 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+        let before = at::NOTIFY_COUNT.load(core::sync::atomic::Ordering::SeqCst);
+        let mut route = match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
+            Ok(route) if route.state() == HdmiRouteState::Live => route,
+            _ => return TestResult::Fail("the HDMI audio route must light"),
+        };
+        let pin = io.writes_to(crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD);
+        let output = crate::intel_gpu_audio::aud_output_enable(Transcoder::B);
+        if pin.first() != Some(&output)
+            || pin.iter().any(|v| v & crate::intel_gpu_audio::aud_eld_valid(Transcoder::B) != 0)
+            || io.writes_to(crate::intel_gpu_audio::aud_cfg_off(Transcoder::B)) != [1 << 16]
+            || io.writes_to(audio::AUD_TS_CDCLK_M).last()
+                != Some(&(60 | audio::AUD_TS_CDCLK_M_EN))
+            || at::NOTIFY_COUNT.load(core::sync::atomic::Ordering::SeqCst) != before + 1
+            || at::NOTIFY_PORT.load(core::sync::atomic::Ordering::SeqCst) != 1
+            || at::NOTIFY_PIPE.load(core::sync::atomic::Ordering::SeqCst) != -1
+        {
+            return TestResult::Fail("the route must enable audio and notify PORT_B");
+        }
+        // The audio enable follows the armed primary and its witness.
+        match (
+            position(&io, |o, _| o == PLANE_SURF_1 + Pipe::B.base()),
+            position(&io, |o, _| o == crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD),
+        ) {
+            (Some(plane), Some(audio)) if plane < audio => {}
+            _ => return TestResult::Fail("audio must start after the plane update"),
+        }
+        let component = audio::XelpgAudioComponent { io: &io };
+        let mut buf = [0u8; 128];
+        match acomp::acomp_get_eld(Some(&component), Some(&at::SCRIPTED_HDA), 0x6, 0, &mut buf) {
+            // Two SADs survive the 160-clock blanking.
+            Ok((true, _)) if buf[5] >> 4 == 2 => {}
+            _ => return TestResult::Fail("the codec must read the pruned ELD on pin 0x6"),
+        }
+        if route.stop(&io).is_err()
+            || at::NOTIFY_COUNT.load(core::sync::atomic::Ordering::SeqCst) != before + 2
+            || acomp::acomp_get_eld(Some(&component), Some(&at::SCRIPTED_HDA), 0x6, 0, &mut buf)
+                .is_ok()
+            || io.writes_to(crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD).last() != Some(&0)
+        {
+            return TestResult::Fail("the stop must disable audio and withdraw the ELD");
+        }
+        // Without the option: no ELD, no audio register.
+        let io = ddi_b_hdmi_sink(&at::audio_edid());
+        match probe_deep(&io, false) {
+            Ok(p) if p.audio.is_none() => TestResult::Pass,
+            _ => TestResult::Fail("without the option the probe must not take audio"),
+        }
+    })();
+    acomp::unregister_display_audio_codec();
+    audio::reset_for_test();
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_xe_hdmi_audio_route_with_scripted_hda
 );

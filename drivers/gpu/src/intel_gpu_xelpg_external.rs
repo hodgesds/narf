@@ -83,7 +83,8 @@
 //! C10/C20 tables in [`crate::intel_gpu_xelpg`]; a stream that neither
 //! bpp carries refuses unless the sink decompresses DSC (below).
 //! DP 2.0 UHBR (128b/132b) runs only under `narf.intel.uhbr=1` (below);
-//! audio remains unadvertised. Live TBT
+//! deep colour, the YCbCr 4:4:4 PCON route ([`color`]) and SST audio
+//! ([`audio`]) only under `narf.intel.hdmi14_ext=1`. Live TBT
 //! routes select fabric-owned AUX/clocking. MST uses the shared sideband
 //! manager and a single primary transport across independent Pipe B-D
 //! streams. Native/legacy VBT lane reversal reaches the PHY; DP-alt cable
@@ -185,6 +186,9 @@ pub(crate) mod uhbr;
 
 #[path = "intel_gpu_xelpg_color.rs"]
 pub mod color;
+
+#[path = "intel_gpu_xelpg_audio.rs"]
+pub mod audio;
 
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
@@ -805,6 +809,7 @@ pub(crate) fn external_pipe(
         pipe_bpp,
         scaler: None,
         min_hblank: 0,
+        audio: false,
     })
 }
 
@@ -823,6 +828,24 @@ pub(crate) fn reserve_pipe<M: MmioWindow + ?Sized>(
         pipes,
         dmc,
     })
+}
+
+/// The post-plane release of `rp`'s pipe, bracketed for a pipe with audio
+/// by `intel_audio_cdclk_change_pre` / `_post` (the release may lower
+/// CDCLK, and `AUD_TS_CDCLK_M/N` follow it).
+pub(crate) fn release_audio_pipe<M: MmioWindow + ?Sized>(
+    io: &M,
+    rp: &mut RoutePipe,
+    audio_pipe: bool,
+) -> Result<(), PipeEnableError> {
+    if audio_pipe {
+        let _ = audio::cdclk_change_pre(io);
+    }
+    let result = rp.pipes.release(io, rp.pipe, rp.dmc);
+    if audio_pipe {
+        let _ = audio::cdclk_change_post(io);
+    }
+    result
 }
 
 /// The DP port clock of `rate` in kHz (`crtc_state->port_clock`).
@@ -988,6 +1011,10 @@ pub struct MtlSinkProbe {
     /// (`narf.intel.hdmi14_ext=1`, [`color::dp_output`]); RGB with no PCON
     /// writes otherwise.
     pub output: color::DpOutput,
+    /// The sink's ELD when the SST route enables audio
+    /// (`narf.intel.hdmi14_ext=1`, `intel_dp_has_audio`: every display-12+
+    /// port, a sink with audio descriptors).
+    pub audio: Option<alloc::boxed::Box<narf_drivers_sound::display_audio::DisplayAudioPublication>>,
 }
 
 /// A 128b/132b SST route (`intel_dp_is_uhbr`).
@@ -1450,6 +1477,18 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
             payload_kbps: negotiated.payload_kbps,
         }));
     }
+    // intel_dp_audio_compute_config (intel_dp_has_audio: every display-12+
+    // port; a sink with audio descriptors).
+    let audio = if ext {
+        narf_drivers_sound::display_audio::build_eld(
+            &edid[..edid_len],
+            narf_drivers_sound::display_audio::DisplayConnector::DisplayPort,
+            0,
+        )
+        .map(alloc::boxed::Box::new)
+    } else {
+        None
+    };
     // intel_dp_min_bpp: a YCbCr output has no 6 bpc pipe.
     if output.ycbcr444 && pipe_bpp < dsc::PIPE_BPP {
         return Err(rollback(ExternalError::Color(
@@ -1476,6 +1515,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         pipe_bpp,
         uhbr: uhbr_plan,
         output,
+        audio,
     })
 }
 
@@ -1524,6 +1564,9 @@ pub struct MtlExternalRoute {
     awaiting_fec_stop: bool,
     /// A 128b/132b route's trained TX FFE presets and payload state.
     pub uhbr: Option<UhbrTrained>,
+    /// The audio stream `intel_audio_codec_enable` started, until its
+    /// disable.
+    audio: Option<audio::AudioStream>,
 }
 
 /// What a 128b/132b route has trained and allocated.
@@ -1698,6 +1741,7 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
     if probe.uhbr.is_some() && probe.display_ip.is_display30() {
         ext.min_hblank = uhbr::min_hblank(&probe.mode, probe.pipe_bpp);
     }
+    ext.audio = probe.audio.is_some() && probe.mst.is_none();
     if let Err(e) = choice.pipes.admit(io, &ext) {
         return Err(ActivateError::Refused(probe, e.into()));
     }
@@ -1716,6 +1760,7 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
         retired: None,
         awaiting_fec_stop: false,
         uhbr: route_uhbr,
+        audio: None,
     };
     match program(io, &mut route, choice, &ext, display.pipe_dmc, payload) {
         Ok(()) => {
@@ -1746,7 +1791,9 @@ fn program<M: MmioWindow + ?Sized>(
     // pre-plane update and the first step of hsw_crtc_enable
     // (intel_dmc_enable_pipe). 2. PM demand is part of the reservation.
     request_pipe_wells(io, ext.pipe)?;
-    route.reservation = Some(reserve_pipe(io, choice, ext, dmc)?);
+    route.reservation = Some(crate::intel_gpu_xelpg_hdmi::reserve_audio_pipe(
+        io, choice, ext, dmc,
+    )?);
     let (rate, lanes) = (route.probe.negotiated.rate, route.probe.negotiated.lanes);
     if let Some(plan) = route.probe.uhbr {
         // A 128b/132b link trains once at the planned rate and lanes; a
@@ -2484,7 +2531,35 @@ fn finish<M: MmioWindow + ?Sized>(
         }
     }
     rp.pipes.arm_primary(io, pipe)?;
-    observe_live(io, route, func, start)
+    observe_live(io, route, func, start)?;
+    // intel_post_plane_update: intel_encoders_audio_enable (SST only).
+    let Some(publication) = route.probe.audio.clone().filter(|_| route.probe.mst.is_none())
+    else {
+        return Ok(());
+    };
+    let stream = audio::AudioStream {
+        trans,
+        pipe,
+        port: route.probe.port.port_enum() as i32,
+        dp: true,
+        uhbr: uhbr_plan.is_some(),
+        crtc_clock_khz: mode.pixel_clock_khz,
+        port_clock_khz: match uhbr_plan {
+            Some(u) => u.link.rate.link_rate(),
+            None => link_clock_khz(trained.rate),
+        },
+        pipe_bpp,
+        lane_count: uhbr_plan.map_or(lanes, |u| u.link.lanes),
+        h_active: mode.h_active,
+        h_total: mode.h_total,
+        v_active: mode.v_active,
+        dsc_bpp_x16: plan.map(|p| u32::from(p.compressed_bpp_x16)),
+        ycbcr420: false,
+        wa_14020863754: audio::needs_wa_14020863754(route.probe.display_ip),
+    };
+    let eld = audio::compute_eld(&publication, &route.probe.edid[..route.probe.edid_len], &stream);
+    route.audio = Some(stream);
+    audio::audio_codec_enable(io, &stream, &eld, *publication).map_err(|_| ExternalError::AccessLost)
 }
 
 /// Bounded fresh-frame witness: the primary LIVE surface equals the
@@ -2710,6 +2785,12 @@ fn stop_local<M: MmioWindow + ?Sized>(
     route: &mut MtlExternalRoute,
 ) -> Result<(), ExternalError> {
     let stop_failed = ExternalError::Modeset(ModesetError::PipelineStopUnavailable);
+    // intel_pre_plane_update: intel_encoders_audio_disable, before the
+    // planes go (best effort: the stop proof is the pipe's).
+    let audio_pipe = route.probe.audio.is_some() && route.probe.mst.is_none();
+    if let Some(stream) = route.audio.take() {
+        let _ = audio::audio_codec_disable(io, &stream);
+    }
     let Some(rp) = route.reservation.as_mut() else {
         return Ok(());
     };
@@ -2737,7 +2818,7 @@ fn stop_local<M: MmioWindow + ?Sized>(
         .reservation
         .as_mut()
         .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
-    rp.pipes.release(io, rp.pipe, rp.dmc)?;
+    release_audio_pipe(io, rp, audio_pipe)?;
     route.retired = route.reservation.take().map(|rp| rp.pipes);
     Ok(())
 }

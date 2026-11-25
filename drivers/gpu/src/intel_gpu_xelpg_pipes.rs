@@ -121,6 +121,9 @@ pub(crate) struct ExternalPipe {
     /// `crtc_state->min_hblank` (`intel_dp_compute_min_hblank`): zero for
     /// 8b/10b SST and HDMI, the 128b/132b value for a UHBR route.
     pub(crate) min_hblank: u32,
+    /// `crtc_state->has_audio` (`narf.intel.hdmi14_ext=1`): the request's
+    /// CDCLK floor takes `intel_audio_min_cdclk`.
+    pub(crate) audio: bool,
 }
 
 /// Typed pipe-owner failures.
@@ -462,6 +465,25 @@ impl Pipes {
         Ok(())
     }
 
+    /// `intel_audio_min_cdclk` over the external pipes a request keeps (the
+    /// reserved ones without `drop`, with `add`): twice the 96 MHz BCLK
+    /// when any carries audio, else no floor.
+    fn audio_min_cdclk(&self, add: Option<&ExternalPipe>, drop: Option<usize>) -> u32 {
+        let audio = self
+            .reserved
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != drop)
+            .filter_map(|(_, ext)| ext.as_ref())
+            .chain(add)
+            .any(|ext| ext.audio);
+        if audio {
+            crate::intel_gpu_xelpg_external::audio::AUDIO_MIN_CDCLK_KHZ
+        } else {
+            0
+        }
+    }
+
     fn request_with(&self, change: impl FnOnce(&mut res::Request)) -> res::Request {
         let mut request = res::Request {
             pipes: self.state.as_deref().map_or([None; 4], |s| s.requests),
@@ -540,7 +562,10 @@ impl Pipes {
         Self::compute(
             fresh.ip,
             io,
-            &fresh.request_with(|r| r.pipes[p] = Some(request(ext))),
+            &fresh.request_with(|r| {
+                r.pipes[p] = Some(request(ext));
+                r.min_cdclk_khz = fresh.audio_min_cdclk(Some(ext), None);
+            }),
             vblank_start,
         )
         .map(|state| (state, vblank_start))
@@ -860,7 +885,10 @@ impl Pipes {
         self.sync_panel(io)?;
         self.refresh_panel(io)?;
         dmc.disable_pipe(p as u32);
-        let request = self.request_with(|r| r.pipes[p] = None);
+        let request = self.request_with(|r| {
+            r.pipes[p] = None;
+            r.min_cdclk_khz = self.audio_min_cdclk(None, Some(p));
+        });
         let mut vblank_start = self.vblank_start;
         vblank_start[p] = None;
         if request.pipes.iter().all(Option::is_none) {

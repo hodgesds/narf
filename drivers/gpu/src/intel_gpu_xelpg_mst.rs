@@ -252,6 +252,7 @@ impl MtlMstRoute {
                 pipe_bpp: 24,
                 uhbr: None,
                 output: super::color::DpOutput::default(),
+                audio: None,
             };
             // Copy the EDID straight into the probe's own buffer: a
             // separate 512-byte staging array is a second stack slot in
@@ -480,6 +481,7 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
         awaiting_fec_stop: false,
         state: RouteState::Stopped,
         uhbr: None,
+        audio: None,
     };
     let result = (|| {
         request_pipe_wells(io, pipe)?;
