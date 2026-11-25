@@ -126,7 +126,7 @@ impl<R: Fullmac> Station<R> {
         device
             .run_escan(&mut self.runtime, state, &chanspecs)
             .await?;
-        let deadline = narf_time::Deadline::after_ms(15000);
+        let deadline = crate::platform::time::Deadline::after_ms(15000);
         let mut diverted = Vec::new();
         let outcome = async {
             loop {

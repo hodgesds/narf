@@ -2,10 +2,26 @@
 //! Signed deployment board selection. A chip filename is never board authority.
 //! NBSP v1 binds immutable host/card facts to exact registry payloads. It grants
 //! no clocks, GPIOs, regulators, PCI rights or firmware protocol extensions.
+use crate::platform::bus::HostIdentity;
 use alloc::{string::String, sync::Arc, vec::Vec};
+#[cfg(feature = "builtin")]
 use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_drivers_sdio::pio::HostIdentity;
+#[cfg(feature = "builtin")]
 use narf_firmware::{FirmwareBlob, FirmwareRegistry};
+/// Module build: the same selection and asset reads over the KABI firmware
+/// exports (`narf_firmware_open` / `_signed`), with module receipts.
+#[cfg(feature = "module")]
+#[path = "provision_kabi.rs"]
+mod kabi;
+/// `cyw43439::firmware::MAX_IMAGE_SIZE` (the SDIO loader is built-in only).
+#[cfg(feature = "builtin")]
+use crate::cyw43439::firmware::MAX_IMAGE_SIZE as SDIO_MAX_IMAGE;
+#[cfg(feature = "module")]
+use kabi::Receipt;
+#[cfg(feature = "module")]
+pub(crate) use kabi::{select_kabi, Proof};
+#[cfg(feature = "module")]
+const SDIO_MAX_IMAGE: usize = 4 * 1024 * 1024;
 pub const MANIFEST: &str = "brcm/wifi-board-selection-v1.bin";
 const HEADER: usize = 16;
 const RECORD: usize = 616;
@@ -37,6 +53,7 @@ struct Asset {
     length: usize,
     sha256: [u8; 32],
 }
+#[cfg(feature = "builtin")]
 #[derive(Clone, Debug)]
 struct Receipt {
     cap: Cap<FirmwareBlob, Read>,
@@ -45,6 +62,7 @@ struct Receipt {
     signer: Option<[u8; 32]>,
     registry_digest: [u8; 32],
 }
+#[cfg(feature = "builtin")]
 /// Current source instances remain tied to the immutable payloads selected
 /// at bootstrap. Hot replacement preserves these pinned bytes under the
 /// registry contract; actual cap revocation fails before later bus access.
@@ -52,6 +70,7 @@ struct Receipt {
 pub(crate) struct Proof {
     receipts: Vec<Receipt>,
 }
+#[cfg(feature = "builtin")]
 impl Proof {
     pub(crate) fn validate(&self) -> Result<(), Error> {
         for receipt in &self.receipts {
@@ -63,7 +82,9 @@ impl Proof {
         Ok(())
     }
 }
+#[cfg(feature = "builtin")]
 struct Check<'a>(&'a Receipt);
+#[cfg(feature = "builtin")]
 impl CapOp<FirmwareBlob, Read> for Check<'_> {
     type Output = Result<(), Error>;
     fn execute(self, cap: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
@@ -140,9 +161,11 @@ impl Selection {
             _ => false,
         }
     }
+    #[cfg(feature = "builtin")]
     pub fn load(&self) -> Result<Assets, Error> {
         self.load_using(&authority()?)
     }
+    #[cfg(feature = "builtin")]
     pub(crate) fn load_using(
         &self,
         authority: &Cap<FirmwareRegistry, Read>,
@@ -184,18 +207,22 @@ pub struct Assets {
     pub(crate) clm: Vec<u8>,
     pub(crate) proof: Arc<Proof>,
 }
+#[cfg(feature = "builtin")]
 struct Open<'a>(&'a str);
+#[cfg(feature = "builtin")]
 impl CapOp<FirmwareRegistry, Read> for Open<'_> {
     type Output = Result<Cap<FirmwareBlob, Read>, narf_firmware::FirmwareError>;
     fn execute(self, cap: &Cap<FirmwareRegistry, Read>) -> Result<Self::Output, CapError> {
         Ok(narf_firmware::open(self.0, cap))
     }
 }
+#[cfg(feature = "builtin")]
 struct CopyBlob<'a> {
     key: &'a str,
     asset: Option<&'a Asset>,
     signed: bool,
 }
+#[cfg(feature = "builtin")]
 impl CapOp<FirmwareBlob, Read> for CopyBlob<'_> {
     type Output = Result<(Vec<u8>, Receipt), Error>;
     fn execute(self, cap: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
@@ -239,14 +266,17 @@ impl CapOp<FirmwareBlob, Read> for CopyBlob<'_> {
         })())
     }
 }
+#[cfg(feature = "builtin")]
 pub(crate) fn authority() -> Result<Cap<FirmwareRegistry, Read>, Error> {
     narf_firmware::trusted_loader_authority()
         .and_then(|cap| cap.derive::<Read>().ok())
         .ok_or(Error::Access)
 }
+#[cfg(feature = "builtin")]
 fn read(key: &str, asset: Option<&Asset>, signed: bool) -> Result<(Vec<u8>, Receipt), Error> {
     read_using(&authority()?, key, asset, signed)
 }
+#[cfg(feature = "builtin")]
 fn read_using(
     authority: &Cap<FirmwareRegistry, Read>,
     key: &str,
@@ -260,12 +290,14 @@ fn read_using(
     cap.invoke(CopyBlob { key, asset, signed })
         .map_err(|_| Error::Access)?
 }
+#[cfg(feature = "builtin")]
 /// Trusted compiled platform registration remains an explicit board policy.
 /// Its NVRAM still requires a verified signer; executable unsigned policy is
 /// solely the existing firmware registry/build decision.
 pub(super) fn trusted_assets(firmware: &str, nvram: &str) -> Result<Assets, Error> {
     trusted_assets_using(&authority()?, firmware, nvram)
 }
+#[cfg(feature = "builtin")]
 pub(super) fn trusted_assets_using(
     authority: &Cap<FirmwareRegistry, Read>,
     firmware: &str,
@@ -285,6 +317,7 @@ pub(super) fn trusted_assets_using(
         proof,
     })
 }
+#[cfg(feature = "builtin")]
 pub fn select(
     family: Family,
     host: HostIdentity,
@@ -292,6 +325,7 @@ pub fn select(
 ) -> Result<Selection, Error> {
     select_using(&authority()?, MANIFEST, family, host, card)
 }
+#[cfg(feature = "builtin")]
 pub(crate) fn select_using(
     authority: &Cap<FirmwareRegistry, Read>,
     name: &str,
@@ -369,7 +403,7 @@ fn executable_shape(family: Family, length: usize) -> Result<(), Error> {
     if length == 0
         || match family {
             Family::Pcie43602 | Family::PcieFullmac => length < 4,
-            Family::Sdio43439 => length > crate::cyw43439::firmware::MAX_IMAGE_SIZE,
+            Family::Sdio43439 => length > SDIO_MAX_IMAGE,
         }
     {
         return Err(Error::Invalid);
@@ -403,7 +437,7 @@ fn parse_asset(bytes: &[u8], role: u8, comma: bool) -> Result<Asset, Error> {
 fn fullmac_firmware(
     chip: u16,
     revisions: u16,
-    host: &narf_bus::DeviceId,
+    host: &crate::platform::bus::DeviceId,
 ) -> Result<&'static str, Error> {
     let mut base = None;
     for revision in (0..16u8).filter(|r| revisions & (1 << r) != 0) {
@@ -457,7 +491,7 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
                 if address >> 40 != 0 || address & 255 > 7 || address >> 8 & 255 > 31 {
                     return Err(Error::Invalid);
                 }
-                narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(
+                crate::platform::bus::BusAddr::Pcie(crate::platform::bus::PcieAddr::new(
                     (address >> 24) as u16,
                     (address >> 16) as u8,
                     (address >> 8) as u8,
@@ -465,13 +499,13 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
                 ))
             }
             2 if family == Family::Sdio43439 && address != 0 && address & 3 == 0 => {
-                narf_bus::BusAddr::Mmio(narf_memory::PhysAddr::new(address))
+                crate::platform::bus::BusAddr::Mmio(crate::platform::bus::PhysAddr::new(address))
             }
             _ => return Err(Error::Invalid),
         };
         let host = HostIdentity {
             address,
-            id: narf_bus::DeviceId {
+            id: crate::platform::bus::DeviceId {
                 vendor: half(raw, 16),
                 device: half(raw, 18),
                 subsystem_vendor: half(raw, 20),
@@ -505,7 +539,7 @@ fn parse(bytes: &[u8]) -> Result<Vec<Selection>, Error> {
             return Err(Error::Invalid);
         }
         if family == Family::Sdio43439
-            && matches!(address, narf_bus::BusAddr::Pcie(_))
+            && matches!(address, crate::platform::bus::BusAddr::Pcie(_))
             && !matches!(host.id.class, 0x080500 | 0x080501)
         {
             return Err(Error::Invalid);

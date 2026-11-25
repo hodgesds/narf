@@ -198,7 +198,7 @@ pub const PCI_DEVICES: &[PciMatch] = &[
 ];
 
 /// `pci_match_id(brcmf_pcie_devid_table, pdev)` for a full PCI identity.
-pub fn pci_match(id: &narf_bus::DeviceId) -> Option<PciMatch> {
+pub fn pci_match(id: &crate::platform::bus::DeviceId) -> Option<PciMatch> {
     if id.class & 0xffff00 != 0x028000 {
         return None;
     }
@@ -450,7 +450,11 @@ pub fn profile(chip: u16, chiprev: u8) -> Option<Profile> {
 /// admitted profile only when Linux would bind this PCI id with a vendor
 /// whose path NARF implements (WCC/BCA). The PCI row's `seed` is separate:
 /// Linux keys the footer on the PCI id, not on the chip.
-pub fn admit(chip: u16, chiprev: u8, pci: &narf_bus::DeviceId) -> Option<(Profile, FwVendor)> {
+pub fn admit(
+    chip: u16,
+    chiprev: u8,
+    pci: &crate::platform::bus::DeviceId,
+) -> Option<(Profile, FwVendor)> {
     let matched = pci_match(pci)?;
     if !implemented(matched) {
         return None;

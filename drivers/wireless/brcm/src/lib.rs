@@ -8,12 +8,15 @@
 //! bidirectional dependency that cannot be split across crates — so they share
 //! a crate (inner module paths `brcmfmac`/`cyw43439` preserved).
 //!
-//! The real drivers in [`brcmfmac`]/[`cyw43439`] compile only for the built-in
-//! build. The `module` build registers BOTH buses — brcmfmac's Broadcom PCIe
-//! ids through `narf_register_pci_driver` and the CYW43439 SDIO id through
-//! `narf_register_sdio_driver` (the Tier-2 SDIO shim) — with a probe thunk that
-//! returns `-ENOSYS` (registration-only proof), matching the net and iwlwifi
-//! `.ko`s.
+//! Built in, [`brcmfmac`] binds the Broadcom PCIe FullMAC ids and
+//! [`cyw43439`] the CYW43439 SDIO/gSPI functions. The `module` build is the
+//! brcmfmac PCIe driver running inside the `.ko` (module name `brcm`): it
+//! registers the Broadcom PCIe ids through `narf_register_pci_driver` and
+//! drives the card through the KABI (config window, BAR0/BAR2, plain MSI,
+//! mapped DMA, signed firmware), with the shared FullMAC station
+//! ([`cyw43439::station`]) and its netdev/wiphy published through the netif
+//! bridge and the `WIFI` family host. Kernel services come from
+//! [`platform`]. CYW43439 is built-in only: no SDIO I/O KABI exists.
 //!
 //! ## Hardware validation is gated
 //!
@@ -25,25 +28,29 @@
 #![no_std]
 #![allow(dead_code)]
 
-#[cfg(feature = "builtin")]
 extern crate alloc;
 
 use narf_driver_macros::narf_driver;
 
 // Shared, driver-agnostic helpers live in `narf-drivers-wireless-core`.
 // Re-exported at the crate root so the inner drivers' `crate::future_heap`
-// references resolve unchanged after promotion.
+// references resolve unchanged after promotion. The module build carries its
+// own copy (the wireless-core crate is kernel-resident).
 #[cfg(feature = "builtin")]
 pub(crate) use narf_drivers_wireless_core::future_heap;
+#[cfg(feature = "module")]
+mod future_heap;
 
-#[cfg(feature = "builtin")]
+/// Kernel services under one name in both builds: the kernel's crates built
+/// in, `narf-module-rt` + the KABI in the `.ko`.
+pub mod platform;
+
 pub mod brcmfmac;
 
-#[cfg(feature = "builtin")]
+/// CYW43439 and the shared FullMAC station. The module build carries only
+/// the bus-independent station, event, IOCTL and runtime layers the PCIe
+/// path drives.
 pub mod cyw43439;
-
-#[cfg(feature = "module")]
-mod module_probe;
 
 narf_driver! {
     name: "brcm",
@@ -53,7 +60,7 @@ narf_driver! {
         author: "narf",
         description: "Broadcom/Infineon FullMAC Wi-Fi (brcmfmac PCIe + CYW43439 SDIO)",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write,Firmware:Read",
     },
     register: do_register,
 }
@@ -64,7 +71,16 @@ fn do_register() {
     cyw43439::register();
 }
 
+/// The autoconnect bring-up aid's `brcm.ssid=` / `brcm.psk=` /
+/// `brcm.passphrase=` ([`cyw43439::interface_module`]), declared so the loader
+/// applies them from the kernel command line (and the load's own arguments)
+/// before init. Empty = not given.
+#[cfg(feature = "module")]
+#[used]
+#[link_section = ".narf_kparams"]
+static KPARAMS: [u8; 23] = *b"ssid=\npsk=\npassphrase=\n";
+
 #[cfg(feature = "module")]
 fn do_register() {
-    module_probe::register();
+    brcmfmac::register_module();
 }

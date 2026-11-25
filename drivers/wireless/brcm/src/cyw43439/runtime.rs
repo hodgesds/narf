@@ -111,6 +111,7 @@ impl<T: PacketTransport> core::fmt::Debug for Runtime<T> {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl Runtime<super::host_ports::gspi_port::GspiPackets> {
     /// Called only by the consumed boot-ready gSPI protocol owner. The source
     /// seeds one initial control credit; every subsequent window comes from RX.
@@ -493,7 +494,7 @@ impl<T: PacketTransport> Runtime<T> {
             runtime: self,
             finished: false,
         };
-        let deadline = narf_time::Deadline::after_ms(2000);
+        let deadline = crate::platform::time::Deadline::after_ms(2000);
         while transaction.runtime.credits() == 0 {
             transaction.runtime.poll()?;
             if deadline.expired() {
@@ -709,7 +710,7 @@ impl<T: PacketTransport> Runtime<T> {
 }
 
 async fn delay() {
-    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(1_000_000)).await;
 }
 
 struct Transaction<'a, T: PacketTransport> {

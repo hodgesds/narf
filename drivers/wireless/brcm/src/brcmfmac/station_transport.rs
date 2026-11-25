@@ -24,7 +24,7 @@ struct Tx {
     id: u32,
     /// Firmware interface whose flow published this packet.
     ifidx: u8,
-    deadline: narf_time::Deadline,
+    deadline: crate::platform::time::Deadline,
     ap_terminal: Option<alloc::sync::Weak<super::ap_tx::Terminal>>,
 }
 /// Retained firmware authority of one function: downloads and attaches a
@@ -525,7 +525,7 @@ where
             return Err(Error::Busy);
         }
         self.set_link(None);
-        let deadline = narf_time::Deadline::after_ms(2000);
+        let deadline = crate::platform::time::Deadline::after_ms(2000);
         loop {
             self.poll()?;
             if self.flows.is_empty() && self.tx.is_empty() && !self.closing {
@@ -534,7 +534,10 @@ where
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                1_000_000,
+            ))
+            .await;
         }
         self.inner
             .as_mut()
@@ -1187,7 +1190,7 @@ where
         self.tx.push(Tx {
             id,
             ifidx,
-            deadline: narf_time::Deadline::after_ms(2000),
+            deadline: crate::platform::time::Deadline::after_ms(2000),
             ap_terminal: None,
         });
         Ok(id)

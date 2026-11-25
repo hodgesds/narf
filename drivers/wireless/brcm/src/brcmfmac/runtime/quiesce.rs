@@ -61,8 +61,8 @@ impl<B: Bus> Runtime<B> {
             return Ok(());
         }
         match self.bus.block_dma()? {
-            narf_io::iommu::DmaBlock::Blocked => self.iommu_blocked = true,
-            narf_io::iommu::DmaBlock::Untranslated => {}
+            crate::platform::DmaBlock::Blocked => self.iommu_blocked = true,
+            crate::platform::DmaBlock::Untranslated => {}
         }
         Ok(())
     }
@@ -94,7 +94,10 @@ impl<B: Bus> Runtime<B> {
         for _ in 0..MB_PENDING_TRIES {
             match self.try_send_mb_data(value) {
                 Err(Error::Busy) => {
-                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(10_000_000)).await
+                    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                        10_000_000,
+                    ))
+                    .await
                 }
                 other => return other,
             }
@@ -136,7 +139,7 @@ impl<B: Bus> Runtime<B> {
     }
     async fn await_d3_ack(&mut self) -> Result<(), Error> {
         self.send_mb_data(H2D_HOST_D3_INFORM).await?;
-        let deadline = narf_time::Deadline::after_ms(MBDATA_TIMEOUT_MS);
+        let deadline = crate::platform::time::Deadline::after_ms(MBDATA_TIMEOUT_MS);
         loop {
             // A vector or the fallback poll services MAILBOXINT/FN0 here.
             if let Err(error) = self.service_mailbox() {
@@ -149,7 +152,10 @@ impl<B: Bus> Runtime<B> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                1_000_000,
+            ))
+            .await;
         }
     }
     /// `brcmf_pcie_pm_leave_D3` hot path. `Err(Failed)` means the dongle

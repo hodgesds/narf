@@ -66,32 +66,48 @@
 
 #![allow(dead_code)]
 
+#[cfg(feature = "builtin")]
 pub mod backplane;
+#[cfg(feature = "builtin")]
 pub mod bootstrap;
 pub(crate) mod channel;
+#[cfg(feature = "builtin")]
 pub mod chipclk;
+#[cfg(feature = "builtin")]
 pub mod core;
 pub mod events;
+#[cfg(feature = "builtin")]
 pub mod firmware;
 pub mod fullmac;
+#[cfg(feature = "builtin")]
 pub mod gspi;
+#[cfg(feature = "builtin")]
 pub mod host_ports;
+#[cfg(feature = "builtin")]
 pub mod interface;
+#[cfg(feature = "module")]
+pub mod interface_module;
 pub mod ioctl;
 pub mod iovar;
 pub mod runtime;
+#[cfg(feature = "builtin")]
 pub mod sdio;
+#[cfg(feature = "builtin")]
 mod sdio_ap_discovery;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod sdio_ap_model;
+#[cfg(feature = "builtin")]
 pub mod sdio_bridge;
+#[cfg(feature = "builtin")]
 mod sdio_passive;
+#[cfg(feature = "builtin")]
 pub mod sdio_reset;
 pub mod sdpcm;
 pub mod station;
 pub mod telemetry;
 pub mod transport;
 
+#[cfg(feature = "builtin")]
 pub use firmware::{build_nvram_blob, FirmwareLoader, LoadError, LoadStep};
 pub use ioctl::{build_request, parse_response, Direction, ParseError, Response};
 pub use iovar::{build_region_cmd, COUNTRY_WORLDWIDE, VAR_COUNTRY, WL_COUNTRY_T_SIZE};
@@ -127,6 +143,7 @@ pub const CYW43439_SDIO_DEVICE: u16 = 0xA9AF;
 
 /// Register exact CYW43439 SDIO function matches and the standard PCI
 /// SDHCI host entry. Firmware initialization precedes network publication.
+#[cfg(feature = "builtin")]
 pub fn register() {
     bootstrap::register();
     // Linux `brcmf_sdio_pm_ops`: the bus suspend/resume and the
@@ -138,7 +155,9 @@ pub fn register() {
     );
 }
 
+#[cfg(feature = "builtin")]
 struct SdioSystemPm;
+#[cfg(feature = "builtin")]
 impl narf_power::system_pm::AsyncSystemPm for SdioSystemPm {
     fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async { interface::suspend_sdio().await.map_err(sdio_pm_error) })
@@ -147,6 +166,7 @@ impl narf_power::system_pm::AsyncSystemPm for SdioSystemPm {
         alloc::boxed::Box::pin(async { interface::resume_sdio().await.map_err(sdio_pm_error) })
     }
 }
+#[cfg(feature = "builtin")]
 fn sdio_pm_error(error: runtime::Error) -> narf_power::device_pm::DevicePmError {
     match error {
         runtime::Error::Busy => narf_power::device_pm::DevicePmError::Busy,
