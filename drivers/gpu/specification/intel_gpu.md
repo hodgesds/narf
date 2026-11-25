@@ -819,12 +819,19 @@ generation gates below.
   LCPLL, the SKL WRPLL + CFGCR1/2, the SKL watermarks /
   DBUF geometry, and the `DDI_BUF_TRANS` swing tables —
   that is the Gen9 Lane 4 programme, not an exclusion.
-- **Gen9-LP (Broxton / Gemini Lake)** — explicitly out of
-  scope for the Gen9 programme (§12.4, Q3). 7 IDs (BXT
-  0A84/1A84/1A85/5A84/5A85, GLK 3184/3185), a different
-  DPIO PHY, and different DBUF geometry (512−4 / 1024−4
-  blocks, Linux `display/intel_display_device.c:848,863`).
-  A follow-up programme, not a Gen9 lane.
+- **Gen9-LP (Broxton / Gemini Lake)** — out of scope for
+  the Gen9 programme (§12.4, Q3), and since taken up as its
+  own follow-up for the GT only. The 7 IDs (BXT
+  0A84/1A84/1A85/5A84/5A85, GLK 3184/3185) are
+  `Generation::Broxton`; the execlists owner runs them as
+  `LegacyGt::Gen9Lp` (CHV snooping PPAT, Broxton MOCS, the LP
+  workarounds, one slice of three subslices with pooled EUs,
+  the 19.2 MHz crystal, `BXT_RP_STATE_CAP`, RC6 behind
+  `bxt_check_bios_rc6_setup`). The display stays out: its DPIO
+  PHY and DBUF geometry (512−4 / 1024−4 blocks, Linux
+  `display/intel_display_device.c:848,863`) are not modelled,
+  so a GOP framebuffer is kept only as fixed-mode KMS.
+  Not run on silicon.
 - Arrow Lake display — identification landed (#1023, §5);
   display support rides #1016's Xe-LPG family via the shared
   Meteor Lake classification, not a separate Arrow Lake path.

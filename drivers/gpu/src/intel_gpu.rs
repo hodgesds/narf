@@ -1388,12 +1388,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // panel (a desktop, or a panel takeover that failed) still scanning the
     // GOP framebuffer: retain it for fixed-mode KMS, as an external-only
     // Gen12 board does, and keep hotplug modesets and system suspend off the
-    // inherited pipe. Displays 9 and 11 have three pipes. On Gen9/Gen11 the
-    // execlists owner already starts beside it (its planes fetch below the
-    // GT arena); Meteor Lake's GuC owner takes the firmware handoff below.
+    // inherited pipe. Broxton and Gemini Lake, whose DPIO PHY display is
+    // never programmed, have only this route, panel or not. Displays 9 to 11
+    // have three pipes, with Skylake's universal-plane registers. On
+    // Gen9/Gen11 the execlists owner already starts beside it (its planes
+    // fetch below the GT arena); Meteor Lake's GuC owner takes the firmware
+    // handoff below.
     let fixed_pipes = match dev.chip.generation {
         Generation::MeteorLake => Some(4),
-        Generation::IceLake | Generation::Skylake => Some(3),
+        Generation::IceLake | Generation::Skylake | Generation::Broxton => Some(3),
         _ => None,
     };
     if let Some(pipes) =
