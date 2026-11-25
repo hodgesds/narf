@@ -1763,6 +1763,86 @@ fn e2e_ath11k_module_registration() -> TestResult {
 }
 kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
 
+/// The real brcmfmac `.ko` (`narf-drivers-wireless-brcm --features module`,
+/// module name `brcm`: the brcmfmac chip discovery, CR4/CA7 firmware
+/// download, msgbuf common rings and the shared FullMAC station over
+/// `narf-module-rt` and the KABI, including `narf_pci_config_write32`).
+/// The relocations resolve and init runs; the module declares the
+/// autoconnect parameters and takes a load argument; it claims every
+/// Broadcom FullMAC PCIe id of the built-in table under its own match name
+/// (so the built-in entries survive), refuses a probe with no device
+/// context before any device access, and unloads leaving no match behind.
+/// QEMU has no Broadcom Wi-Fi, so bring-up itself is proven on hardware.
+fn e2e_brcmfmac_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const BROADCOM: u16 = 0x14e4;
+    // `brcmfmac::pcie_ids::ALL_DEV_IDS` (Linux `brcmf_pcie_devid_table`).
+    const IDS: [u16; 26] = [
+        0x43A3, 0x43DF, 0x4354, 0x43DC, 0x43EC, 0x43D3, 0x43D9, 0xAA31, 0x43E9, 0x43EF, 0x43BA,
+        0x43BB, 0x43BC, 0x4464, 0x43CA, 0x43CB, 0x43CC, 0x43C3, 0x43C4, 0x43C5, 0x440D, 0x4415,
+        0x449D, 0x4488, 0x4425, 0x4433,
+    ];
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/brcmfmac.ko")
+    else {
+        return TestResult::Fail("brcmfmac module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("brcmfmac module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("brcmfmac.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let declared = ["ssid", "psk", "passphrase"]
+        .iter()
+        .all(|name| crate::params::find(&module.params, name).is_some());
+    let applied = crate::params::find(&module.params, "ssid")
+        .is_some_and(|s| s.read() == "narf-e2e")
+        && crate::params::find(&module.params, "passphrase").is_some_and(|s| s.read().is_empty());
+    let claims = module.name() == "brcm"
+        && count() == before + IDS.len()
+        && IDS
+            .iter()
+            .all(|&id| __module_thunk_for_test(BROADCOM, id).is_some())
+        // Not a Broadcom FullMAC PCIe id: the SoftMAC BCM4313.
+        && __module_thunk_for_test(BROADCOM, 0x4727).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let refused = __module_thunk_for_test(BROADCOM, 0x43BA).is_some_and(|thunk| thunk(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("brcm").is_err() {
+        return TestResult::Fail("could not unload brcmfmac.ko");
+    }
+    if !live || !declared || !applied {
+        return TestResult::Fail("brcmfmac.ko not Live, or its parameters missing or not applied");
+    }
+    if !claims {
+        return TestResult::Fail("brcmfmac.ko did not claim exactly the FullMAC PCIe id table");
+    }
+    if !refused {
+        return TestResult::Fail("brcmfmac.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || IDS
+            .iter()
+            .any(|&id| __module_thunk_for_test(BROADCOM, id).is_some())
+    {
+        return TestResult::Fail("brcmfmac.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/brcmfmac", e2e_brcmfmac_module_registration);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]

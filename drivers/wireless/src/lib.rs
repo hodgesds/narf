@@ -164,6 +164,9 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "brcmfmac", || {
+        // brcmfmac.ko owns the Broadcom PCIe ids (and with them the PCIe
+        // system-PM hooks); CYW43439 SDIO/gSPI stays built in.
+        #[cfg(not(feature = "brcmfmac-module-only"))]
         brcmfmac::register();
         InitResult::Ok
     });

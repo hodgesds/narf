@@ -5745,6 +5745,11 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath11k.ko".into(), bytes)),
             Err(e) => println!("xtask: ath11k driver module unavailable ({e})"),
         }
+        // The brcmfmac PCIe driver as a `.ko` (module `brcm`, over the KABI).
+        match build_module_fixture("narf-drivers-wireless-brcm", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/brcmfmac.ko".into(), bytes)),
+            Err(e) => println!("xtask: brcmfmac driver module unavailable ({e})"),
+        }
     }
 
     if !fixtures.is_empty() {
