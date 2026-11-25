@@ -809,17 +809,19 @@ becomes active only after its primary-plane register program is armed.
 
 Takeover and relight share generation dispatch (Gen12 versus Xe-LPG),
 with Lunar Lake and Panther Lake refused before MMIO (an admitted Lunar
-Lake display takes its own display-20 entry instead, §17). Restore uses `modeset_fixed` on
+or Panther Lake display takes its own display-20 or display-30 entry
+instead, §17). Restore uses `modeset_fixed` on
 the selected orchestrator, preserving the saved timing used to size the
 new allocation even if EDID now advertises a different preferred mode.
 Plane geometry, pitch and the complete 32-bit GGTT surface extent are
 validated before pipeline teardown. This does not enable Xe-LPG PM or
 establish physical display/suspend acceptance.
-The external-session gate is separate: combo HPD enable/poll, DP, HDMI,
-MST and USB-C DP Alt Mode stay off Xe-LPG until their port sequences
-exist. Gen12, Gen11 and Gen9 sources arm combo HPD, DP SST (with the
-display 9-11 stop order), HDMI and MST through `SourceFamily::of`; USB-C
-DP Alt Mode stays Gen12-only. Unsupported generations return before HPD
+The external-session gate is separate: Xe-LPG and later displays never
+enter this session layer; they run their own external route (§20, "MTL
+external outputs"). Gen12, Gen11 and Gen9 sources arm combo HPD, DP SST (with the
+display 9-11 stop order), HDMI and MST through `SourceFamily::of`; the
+USB-C DP Alt Mode bridge drives Gen12 Dekel and Ice Lake MG ports.
+Unsupported generations return before HPD
 register access; enabling the Xe-LPG internal panel must not enable Gen12
 ports.
 The Gen12 gate is necessary but insufficient: physical combo-B HPD/SST also
@@ -934,11 +936,11 @@ the trim is first-silicon work) at the pre-Gen11 ring bases
 (0x12000 / 0x1c000 / 0x1a000), driven through the aggregate
 media forcewake domain (Lane 6's `GEN9_FW_DOMAINS` table:
 0xA270, ack 0x0D88) since Gen9 has
-no per-VDBox sub-domains. The WA page allocation and its
-engine-init wiring (`lrc_init_wa_ctx` equivalent, including
-the GT scratch dword the coherent-L3 workaround saves to)
-is a follow-up; until it lands the template's indirect
-pointer slot stays zero and the WA batch is inert.
+no per-VDBox sub-domains. `install_gen9_wa_bb` builds the WA
+batch once per engine against a GT scratch page (the
+`lrc_init_wa_ctx` equivalent, including the dword the
+coherent-L3 workaround saves to), and `create_context` points
+each Gen9 RCS context's indirect-context slot at it.
 Public interface:
 
 - `RcsEngine::new(mmio, alloc)` — allocate the engine status
@@ -1618,9 +1620,9 @@ Gen11 idle power, verified against Linux 7.4-rc2 (commit
   0x88040000 is correct for a driver with no GuC
   (`intel_guc_rc_enable` *enables* GuC RC and returns 0 on
   success, so the host-only branch is the failure arm).
-  `enable_gen11` has no production caller yet — the Gen12 PM
-  seam owns the only live enable; the Gen11 PM wiring calls
-  it when it lands.
+  `enable_gen11` has no production caller: the Gen11
+  execlists owner enables RC6 through `intel_gpu_legacy_power`
+  (`gen11_rc6_enable`, §12.5).
 - DC states (`intel_gpu_gen11_dc_states`): display 11 has its
   own mask, derived from
   `display/intel_display_power_well.c::gen9_dc_mask`
@@ -1714,8 +1716,7 @@ register pins below.
   fixed rows (`icl_tbt_pll_24MHz_values` /
   `icl_tbt_pll_19_2MHz_values`: 24 MHz → DCO 0x151/0x4000,
   19.2/38.4 MHz → 0x1A5/0x7000, P/5 K/1) at CFGCR0/1
-  0x164100/0x164104 with `TBT_PLL_ENABLE` 0x46020. Alt-mode
-  entry/exit (the TC subsystem side) is not in this lane.
+  0x164100/0x164104 with `TBT_PLL_ENABLE` 0x46020.
 - **MG PHY** (`intel_gpu_gen11_mg_phy::MgPort`): the Dekel
   port's public shape (`enable` / `route_clock` /
   `start_training` / `training_update` / `stop_transport` /
@@ -1749,105 +1750,27 @@ register pins below.
   programs. The install's controller-1 hardcoding is
   pre-existing Gen12 behavior (Linux takes the VBT
   controller, defaulting to 0).
-- **Remainders**: the HPD / external-session layer
-  threading for Gen11 (`DpConnection` / `HdmiConnection`
-  family fields, VRR gating, `Gen12DdcOverrides`, the ICP
-  HPD profile) is a follow-up lane — the session layer
-  fails closed for Gen11 today. EHL/JSL PORT_D has no fixed
-  DPLL assignment (shares PHY A; Linux arbitrates the
-  {0, 1, 4} pool per commit) and refuses. TBT alt-mode
-  entry/exit, the MG `CRI_LOADGEN_SEL` FIXME (Linux does
-  not program it either), and the VBT AFC-startup `div0`
-  override are unmodelled. The EHL div-frac WA stays off
-  (38.4 MHz ref on EHL B0+, stepping unmodelled).
+- **Sessions and remainders**: the HPD / external-session
+  layer admits Gen11 through `SourceFamily::Gen11` with the
+  ICP hotplug bank (§7). EHL/JSL PORT_D shares PHY A and
+  takes a PLL from the {DPLL4, DPLL1, DPLL0} pool per commit
+  (`arbitrate_combo_dpll`, `icl_get_combo_phy_dpll`). Ice
+  Lake TC ports claim the PHY through the FIA
+  (`icl_tc_phy_ops`) for the DP-alt bridge; the TBT-alt
+  clock route (`route_tbt_clock`) has no production caller.
+  The MG `CRI_LOADGEN_SEL` FIXME (Linux does not program it
+  either) and the VBT AFC-startup `div0` override are
+  unmodelled. The EHL div-frac WA stays off (38.4 MHz ref on
+  EHL B0+, stepping unmodelled).
 
 ### 12.4 Gen9 scope (Lane 0)
 
 Gen9 (Skylake / Kaby Lake / Coffee Lake / Whiskey Lake /
-Comet Lake, display 9) is the second pre-Gen12 family
-admitted, after Gen11. Grounding:
-`~/workspace/queue/gen9-lane-grounding.md` (tip 7c66b42,
-re-validating the 2026-11-19 older-hardware audit at tip
-a9fc6637); every citation below was re-verified against
-the live tip at authoring time. This section is the
-scope anchor the implementation lanes extend the same way
-§8, §12.2 and §12.3 anchor the Gen11 lanes — each Gen9
-lane adds its per-lane section here or in its own
-section, it does not re-litigate scope.
+Comet Lake, display 9) is admitted lane by lane on the Gen11
+pattern: identity and probe (§5), execlists (§8), power
+(§12.5), the modeset (§12.6) and the external outputs
+(§12.7). Gen9 LP (Broxton / Gemini Lake) is described in §5.
 
-- **Lane plan** (Gen11 numbering reused where the scope
-  matches, so the two programmes diff lane by lane).
-  Lane 0 scope + spec (this section, no code). Lane 1
-  identity + probe: one `Generation` variant carrying
-  SKL–CML with a `Gen9Platform` sub-platform per product
-  (Skylake | KabyLake | CometLake; CFL rides the KBL
-  firmware family), 86 ID consts + `DEVICE_TABLE` rows
-  in `intel_gpu_pci_ids.rs` (§5 census), the pre-GMD
-  presence arm, `RegionGeneration::Gen9`, `PteFormat::Gen8`
-  + 39-bit DMA wiring, the VBT install arm. Lane 2 GT
-  bring-up: Gen9 arms at both exec sites
-  (`PteFormat::Gen8`, leaf 1, table policy 0) + fixtures.
-  Lane 3 execlists: `build_gen9_reg_state` from
-  `gen9_rcs_offsets`, 0x26 indirect offset, 6-entry CSB,
-  22-page render image, `gen9_init_indirectctx_bb` WA
-  batch, `GEN9_MEDIA_ENGINES` (VCS0/VCS1/VECS0) + the
-  small Gen9 forcewake domain table. Lane 4 display
-  clocks + DPLL + watermarks: `intel_gpu_gen9_cdclk.rs`
-  (SKL CDCLK via LCPLL), the SKL WRPLL + CFGCR1/2
-  (`intel_gpu_gen9_dpll.rs`), `intel_gpu_gen9_wm.rs` (Gen9 DBUF geometry), and
-  `intel_gpu_gen9_ddi.rs` (`DDI_BUF_TRANS` swing tables)
-  + the SPT GMBUS pin table. Lane 5 modeset: the Gen9
-  branches in `intel_gpu_modeset.rs` in Linux's SKL
-  order, first light on the internal display. Lane 6
-  power: `enable_gen9` (RC6 hysteresis 250),
-  `intel_gpu_gen9_dc_states.rs` (display-9 mask),
-  the Gen9 SAGV primitive (pcode 0x21). Lane 7 GuC/HuC
-  (deferrable, after Lane 3): the SKL/KBL/CML firmware
-  profiles + 1 MiB WOPCM. Lane 8 external outputs +
-  tests: the Gen9 DDI A–E port map, Gen9 IRQ routing,
-  and the Gen9 fixture families. Dependencies: Lane 1
-  blocks all. Lane 2 blocks Lane 3. Lane 4 blocks
-  Lane 5. Lanes 3 and 4 are independent of each other.
-  Lane 6 can run in parallel with Lanes 4/5. Lane 7 is
-  independent once Lane 3 lands. Lane 8 follows Lanes 5
-  and 3.
-- **What Gen9 inherits from Gen11's work** (no new code,
-  a Gen9 arm at the existing seam): the pre-GMD Stage-1
-  presence test (PCI config-space re-read, never 0xD8C /
-  0xFF8); the BAR0 16 MiB / GTT-at-8 MiB partitioning
-  (new `RegionGeneration::Gen9` arm, same contents);
-  `PteFormat::Gen8` legacy PPAT encode + both exec-site
-  wirings, GGTT with no PAT bits (`gen8_ggtt_pte_encode`),
-  the 39-bit DMA mask, and the 48-bit four-level PPGTT
-  walk (no VA-ceiling work — the EHL/JSL 36-bit note in
-  §5 is Gen11-only); the SKL plane admission rule
-  (256 KiB surface alignment, 32 KiB stride cap,
-  `intel_gpu_scanout.rs:74-92`); the forcewake engine
-  with the Gen9-named registers already modelled
-  (0xA278 / 0xA270 / 0xA188); the GMBUS block + protocol
-  (0xC5100); `DDI_BUF_CTL` addressing (0x64000, stride
-  0x100), DDI A–E a subset of the existing enum; the SKL
-  pcode CDCLK-notify protocol (cmd 0x7, pre 0x3, ready
-  0x1); the transcribed `DPLL_CTRL1` register (0x6C058)
-  + DP/HDMI ctrl1 computation
-  (`intel_gpu_gen11_dpll.rs:711-830`); the SKL watermark
-  algorithm core (`intel_gpu_gen11_wm.rs`); the
-  `gen9_dc_mask` source + the Gen11 DC module shape;
-  the DMC parse/load/verify machinery; the GuC 70.1.1
-  minimum-version profile shape; D3cold / runtime PM
-  (generation-independent, no arm); the VBT install path
-  (new Gen9 arm); the modeset dispatch pattern
-  (`gen11_platform` field, per-step branches,
-  `UnsupportedGeneration` hook).
-- **Genuinely new for Gen9** (no in-tree ancestor): the
-  86 IDs + `Generation` / `Gen9Platform`; `gen9_rcs_offsets`
-  + `build_gen9_reg_state`; the 6-entry CSB; the 0x26
-  indirect offset; the 22-page render image;
-  `gen9_init_indirectctx_bb`; SKL CDCLK via LCPLL; the
-  SKL WRPLL + CFGCR1/2; the SKL `DDI_BUF_TRANS` tables +
-  programming; the Gen9 media engine table (VCS0/VCS1/
-  VECS0); Gen9 IRQ routing; the Gen9 SAGV primitive;
-  the Gen9 DC mask/target; RC6 hysteresis 250.
 - **Gen11-only, do NOT carry to Gen9**: the ICL combo
   PLL (CFGCR0 0x164000) + MG PLL + TBT PLL; the ICL
   CDCLK table / voltage levels; the ICL/EHL/JSL DDI
@@ -1856,18 +1779,7 @@ section, it does not re-litigate scope.
   ICL/EHL GuC/HuC blobs; the QGV-point SAGV (0xe);
   per-VDBOX/VEBOX forcewake; the 36-bit PPGTT note
   (EHL/JSL only).
-- **Defaults and remainders** (open questions from the
-  grounding, §16 — recorded here with defaults so no
-  lane blocks on Daniel; he answers when he has a
-  minute):
-  - Q2 hardware target list: REMAINDER, unknown. The
-    lanes need at least one known test device per family;
-    GT1/GT2 vs GT3 matters (the GT3+ engine mask carries
-    VCS1, `i915_pci.c:497-500`; the GT1/GT2 mask is itself
-    a Lane 3 remainder below). Daniel's bringup testing
-    is his lane; the implementation lanes need the list.
-  - Q3 BXT/GLK (Gen9-LP): OUT of scope for this
-    programme — see §6. A follow-up, not a Gen9 lane.
+- **Recorded defaults**:
   - Q4 GuC requirement: DEFAULT execlists-only
     submission, GuC-optional, mirroring Gen11 (Lane 7
     after Lane 3). GuC submission stays optional on
@@ -1890,62 +1802,13 @@ section, it does not re-litigate scope.
     a 0x3000 per-program ceiling (`BXT_DMC_MAX_FW_SIZE`,
     half the ICL 0x6000). DMC gates DC5/DC6 entry, so a
     modeset that claims power states without it is
-    incomplete; if Daniel overrules to best-effort, the
-    Gen9 DMC lane records it the Gen11 way instead.
-  - Q6 CML revision split: RESOLVED (Daniel: read the
-    PCI revision ID). CML rev ≥ 5 takes the `cml_*`
-    blobs, rev < 5 the KBL blobs
+    incomplete.
+  - Q6 CML revision split: the PCI revision ID. CML
+    rev ≥ 5 takes the `cml_*` blobs, rev < 5 the KBL blobs
     (`intel_uc_fw.c:106-107,127-128`); the GT runtime
     passes the probe-read revision to the GuC and HuC
     opens (`open_for_revision`). Silicon untested: no
     rev ≥ 5 part has booted.
-  - Q7 display-vs-headless first: REMAINDER. Lanes 3
-    and 4 are independent, so either order works; the
-    answer sets which lane lands first, not the design.
-  - Q8 Gen11 follow-ups (EHL/JSL PORT_D + TBT alt-mode
-    + TCSS/FIA, the EHL/JSL 36-bit PPGTT ceiling, §5):
-    stay behind Gen9 rather than interleaving.
-- **Unverified items the lanes must settle** (grounding
-  §17 — each names its oracle; none is assumed here):
-  the 86-ID census per-ID (Lane 1 re-verifies each row
-  against `include/drm/intel/pciids.h`); the Gen9
-  context-descriptor upper-dword format (Lane 3 grounds
-  it against `gt/intel_lrc.c` descriptor construction —
-  do not copy the Gen11+ descriptor blindly); the Gen9
-  HWS CSB write-pointer dword (Lane 3 checks the Gen8
-  equivalent against `CNL_HWS_CSB_WRITE_INDEX`); the
-  Gen9 non-render context-image size (Lane 3 reads the
-  full switch in `gt/intel_engine_cs.c:274+` — the
-  `OTHER_IMAGE_PAGES = 2` "shared by every Gen8+"
-  claim is unverified for Gen9); the Gen9 GT1/GT2
-  engine mask (Lane 3 reads the per-SKU `*_info` blocks);
-  the Gen9 watermark level count (Lane 4 read
-  `skl_setup_wm_latency` in `display/skl_watermark.c` — 8, the same
-  as Gen11: the 6-level arm needs `HAS_HW_SAGV_WM`, DISPLAY_VER >=
-  13, which Gen9 does not have); the
-  display-9 `max_dc` / allowed-DC mask (Lane 6 reads
-  `display/intel_display_power.c::get_allowed_dc_mask` —
-  CLOSED by Lane 6: `max_dc` is 2, the allowed mask is
-  UPTO_DC6 = 0x2, the target is DC6, and the mask itself
-  is UPTO_DC5 | UPTO_DC6 = 0x3 — the grounding's "UPTO_DC5
-  alone" missed the `else` arm of `gen9_dc_mask`, which
-  adds UPTO_DC6 for display 9. DC9 is NOT allowed on
-  display 9; see §12.5);
-  the Gen9 scaler limits (Lane 5 or a scaler follow-up
-  reads `display/skl_scaler.c`'s display-9 branches —
-  panel fitting is not on the first-modeset path);
-  Gen9 interrupt routing register-by-register (Lane 8
-  grounds against `display/intel_display_irq.c` and
-  `gt/intel_gt_irq.c` — CLOSED by Lane 8: §12.7; the
-  register map, reset/post-install sequences and decode
-  are pinned by `intel_gpu_gen9_irq.rs` fixtures, verified
-  against the Linux sources line by line, and the xe-era
-  0x190000 block is asserted untouched).
-- **Stale pointer, not edited here**: §5's Gen11
-  paragraph still ends "Gen9 stays excluded (§6)".
-  That sentence is stale as of this lane; Lane 1 owns
-  §5 and updates it when it adds the Gen9 census —
-  do not edit §5 in a Lane 0 follow-up.
 
 ### 12.5 Gen9 power (Lane 6)
 
@@ -1983,9 +1846,16 @@ correction:
   pre-zeroed value). The park target stays 4 on Gen9:
   `has_rc6p` is 0 (Gen9 inherits `G75_FEATURES` via
   `GEN8_FEATURES`, "RC6p removed-by HSW") and `HAS_RC6pp`
-  is always false. `enable_gen9` has no production caller
-  yet — the Gen12 PM seam owns the only live enable; the
-  Gen9 PM wiring calls it when it lands, as with Gen11's.
+  is always false. `enable_gen9` has no production caller:
+  the execlists owner's RC6 and frequency requests are
+  `intel_gpu_legacy_power` (`gen9_rc6_enable`,
+  `gen11_rc6_enable`, `gen9_rps_enable`), which takes the
+  SKL GT3/GT4 coarse power-gating WA from the PCI ID and
+  steers the frequency from the job queue in place of RPS
+  interrupts (efficient on unpark, RP0 after one busy
+  up-evaluation interval, park after 5 ms idle). Gen9 LP
+  reads `BXT_RP_STATE_CAP` and enables RC6 only behind
+  `bxt_check_bios_rc6_setup`.
 - DC states (`intel_gpu_gen9_dc_states`): display 9 has
   its own mask, derived from
   `display/intel_display_power_well.c::gen9_dc_mask` (the
@@ -2080,8 +1950,6 @@ outputs; see §12.7.
   on it with `ModesetError::DmcUnavailable` before any register
   is touched. The probe itself continues either way — GT /
   execlists still bind — and only the display modeset refuses.
-  Fallback if Daniel rules the other way on Q5: Gen11-style
-  best-effort/non-fatal (display still modesets).
 - Transcoder: the EDP transcoder binds the internal panel
   (timing base 0x6F000, conf base 0x7F000 — not aliased to the
   pipe block, unlike Gen12). Pipe A needs no power well
@@ -2119,18 +1987,12 @@ outputs; see §12.7.
   panel runs plain eDP. The VRR placeholder maps Skylake to
   the Gen12 arm for exhaustiveness only — no VRR timings can
   be computed (range is `None`) and no VRR path can fire.
-- Scaler DEFERRED (named remainder): the display-14 scaler
-  module is not wired. Verified display-9 limits from
-  `display/skl_scaler.c` (Linux 7.4-rc2): max src 4096×4096,
-  max dst 4096×4096; `calculate_max_scale` non-YUV 3.0× both
-  axes (0x30000−1), YUV semiplanar 2.0× (0x20000−1); NV12
-  scaler mode `SKL_PS_SCALER_MODE_NV12`. Panel fitting is not
-  on the first-light path (native-resolution modeset).
-- Lane 3 remainder (named): the WA-page allocation +
-  `lrc_init_wa_ctx`-equivalent bring-up — the template
-  indirect slot stays zero and the WA batch is inert until
-  then. First modeset does not need it (display-side; no GT
-  execution on the modeset path). Owned by Lane 3.
+- Panel fitting: `Modeset::set_gen9_panel_fit` runs the
+  display-9 pipe scaler (`intel_gpu_xelpg_scaler::plan_display9`)
+  with the `display/skl_scaler.c` limits (Linux 7.4-rc2): max
+  src 4096×4096, max dst 4096×4096; `calculate_max_scale`
+  non-YUV 3.0× both axes (0x30000−1), YUV semiplanar 2.0×
+  (0x20000−1); NV12 scaler mode `SKL_PS_SCALER_MODE_NV12`.
 - VBT boost levels are unplumbed caller inputs (Lane 4
   remainder): `dp_boost` is false for first light and the
   VBT boost level is not consumed.
@@ -2208,16 +2070,12 @@ programme's last lane; `external_display_supported()` and
   — the module is register-level routing only. Live
   IRQ-handler wiring is a named remainder (no
   interrupt-domain registration exists in this crate yet).
-- HPD / external-session threading (named remainder, same
-  as Gen11): the session layer (`enable_external_hpd`,
-  `poll_external_hpd`, `dp_connect` / `hdmi_connect` /
-  `mst_connect`) is Gen12-gated — its `ModeWindow` impl
-  returns `None` for Gen9 — so flipping
-  `external_display_supported` arms no session path by
-  construction. The HPD sources are the DE_PORT hotplug bits
-  plus SDE, and `decode_port_iir` is the decode the future
-  threading consumes; threading them into the session layer
-  (and MST session threading) is the follow-up lane.
+- HPD / external sessions: the session layer
+  (`enable_external_hpd`, `poll_external_hpd`, `dp_connect` /
+  `hdmi_connect` / `mst_connect`) admits Gen9 through
+  `SourceFamily::Gen9`, with the SPT-class south hotplug bank
+  (`HpdBank::Spt`, polled) and the SPT DDC pins, and MST runs
+  on the same sources. `intel_gpu_gen9_irq` has no caller.
 - Backlight: Skylake drives the SPT PWM block
   (`intel_bl.rs` `PwmLayout::Spt`: max = `BLC_PWM_PCH_CTL2`
   0xC8254 >> 16, duty RMW into CTL2's low 16 bits,
@@ -2354,9 +2212,10 @@ for irreconstructible state).
 DMC firmware sourcing: `register_dmc_firmware` is the
 seam (parse-validated at registration, wildcard stepping
 selection — probe's `ChipInfo` carries no stepping
-readout in this tree); no production caller fetches a
-Gen12 blob yet, so the Gen12 reload path is fixture-proven
-and inert until the probe-time fetch lands. Display 14 does
+readout in this tree). The probe-time Gen12, Gen11 and Gen9
+DMC loads (`intel_gpu_gen12_dmc`, `intel_gpu_gen11_dmc`,
+`intel_gpu_gen9_dmc`) register their resident blob there, so
+resume reloads it. Display 14 does
 not use this core: its container is acquired, loaded and
 restored across suspend by the DC service (§12.1), next to
 the GT runtime owner that handles its system PM. RC6 enable-at-probe is
