@@ -1104,6 +1104,9 @@ impl crate::intel_gpu_user::UserBackend for Backend {
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         Some(self.power_controls.clone())
     }
+    fn cpu_addr_mirror(&self) -> bool {
+        crate::intel_gpu_xe_vm::svm::opted_in()
+    }
     fn native_xe(&self) -> bool {
         // Fixed-mode KMS becomes usable at probe, before this GT has even
         // observed its two firmware frames. Advertise Mesa submission on

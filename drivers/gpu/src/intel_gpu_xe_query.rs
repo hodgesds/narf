@@ -219,6 +219,10 @@ fn query_wire(
             if info.vram.is_some() {
                 config_flags |= 1; // DRM_XE_QUERY_CONFIG_FLAG_HAS_VRAM
             }
+            // has_usm && IS_ENABLED(CONFIG_DRM_XE_GPUSVM): narf.intel.svm=1.
+            if crate::intel_gpu_xe_vm::svm::admitted(info) {
+                config_flags |= crate::intel_gpu_xe_vm::svm::QUERY_CONFIG_HAS_CPU_ADDR_MIRROR;
+            }
             put64(&mut reply, 16, config_flags);
             put64(&mut reply, 24, 4096);
             put64(&mut reply, 32, 48);

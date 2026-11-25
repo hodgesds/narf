@@ -7,6 +7,9 @@
 //! pinning, and the pins it publishes carry the interval sequence they were
 //! collected under. Exec re-collects every binding invalidated since
 //! (`xe_vm_userptr_pin`) before building a job's private tables.
+//!
+//! CPU-address-mirror VMAs and their SVM ranges (`narf.intel.svm=1`) live in
+//! [`svm`].
 use crate::{
     intel_gpu_exec::VmMapping,
     intel_gpu_fence::CompletionFence,
@@ -24,6 +27,9 @@ use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_memory::mmu_notifier::{
     MmuInterval, MmuIntervalNotifier, MmuIntervalNotifierOps, MmuNotifierRange,
 };
+
+#[path = "intel_gpu_xe_svm.rs"]
+pub(crate) mod svm;
 
 static NEXT_VM: AtomicU64 = AtomicU64::new(1);
 pub(crate) const MAX_MAPPINGS: usize = 4096;
@@ -47,6 +53,9 @@ pub(crate) struct Vm {
     /// The VM's interval-notifier consumer; holds no VM reference, so the
     /// registry never keeps a destroyed VM alive.
     userptr_ops: Arc<UserptrNotifier>,
+    /// `vm->svm`: the CPU-address-mirror state of a fault-mode VM on a USM
+    /// device under `narf.intel.svm=1`. Without it a mirror bind is EINVAL.
+    pub svm: Option<svm::Svm>,
 }
 #[derive(Debug)]
 pub(crate) struct State {
@@ -54,7 +63,21 @@ pub(crate) struct State {
     pub active: Vec<Arc<CompletionFence>>,
 }
 impl Vm {
+    /// A VM without a mirror (the native fixtures' constructor).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub fn new(scratch: bool, lr: bool, fault: bool) -> Result<Arc<Self>, FsError> {
+        Self::with_svm(scratch, lr, fault, None)
+    }
+
+    /// A VM whose fault mode mirrors the address space `svm` names
+    /// (`xe_svm_init` with `current->mm`); `None`, or a VM without fault
+    /// mode, has no mirror.
+    pub fn with_svm(
+        scratch: bool,
+        lr: bool,
+        fault: bool,
+        svm: Option<u64>,
+    ) -> Result<Arc<Self>, FsError> {
         let identity = NEXT_VM
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
             .map_err(|_| FsError::OutOfMemory)?;
@@ -70,6 +93,7 @@ impl Vm {
             }),
             userptrs: IrqSafeSpinLock::new(Vec::new()),
             userptr_ops: Arc::new(UserptrNotifier),
+            svm: svm.filter(|_| fault).map(svm::Svm::new),
         }))
     }
     pub fn check(&self) -> Result<(), FsError> {
@@ -186,6 +210,72 @@ impl Vm {
         });
         Ok((mappings, fresh))
     }
+
+    /// The published CPU-address-mirror VMAs, with `state` held; none without
+    /// a mirror.
+    pub fn svm_vmas(&self, state: &State) -> Vec<svm::MirrorVma> {
+        self.svm
+            .as_ref()
+            .map_or_else(Vec::new, |svm| svm.vmas(state))
+    }
+
+    /// Publish a prepared mapping and mirror-VMA set together, with `state`
+    /// held. A VM without a mirror never prepares a mirror VMA.
+    pub fn publish(&self, state: &mut State, prepared: Prepared) {
+        state.publish(prepared.mappings);
+        if let Some(svm) = &self.svm {
+            svm.set_vmas(state, prepared.mirrors);
+        }
+    }
+
+    /// `xe_svm_garbage_collector`, with `state` held: forget the SVM ranges
+    /// a CPU unmap removed before the VMA set changes or a job is built.
+    pub fn svm_collect_garbage(&self, state: &State) {
+        if let Some(svm) = &self.svm {
+            svm.collect_garbage(state);
+        }
+    }
+
+    /// `xe_svm_has_mapping` over `[start, end)`.
+    pub fn svm_has_mapping(&self, start: u64, end: u64) -> bool {
+        self.svm
+            .as_ref()
+            .is_some_and(|svm| svm.has_mapping(start, end))
+    }
+
+    /// The SVM ranges a job built now maps, with `state` held; empty without
+    /// a mirror. See [`svm::Svm::job_mappings`].
+    pub fn svm_job_mappings(&self, state: &State, user: &dyn IoctlContext) -> Vec<VmMapping> {
+        self.svm
+            .as_ref()
+            .map_or_else(Vec::new, |svm| svm.job_mappings(self, state, user))
+    }
+
+    /// A bound SVM range was invalidated after the job's tables took it.
+    pub fn svm_stale(&self) -> bool {
+        self.svm.as_ref().is_some_and(svm::Svm::stale)
+    }
+
+    /// `prefetch_ranges` over the mirror VMAs a PREFETCH covers, with `state`
+    /// held; nothing without a mirror.
+    pub fn svm_prefetch(
+        &self,
+        state: &State,
+        bind: &Bind,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
+        match &self.svm {
+            Some(svm) => svm.prefetch(
+                self,
+                state,
+                bind.address,
+                bind.length,
+                bind.prefetch_region,
+                user,
+            ),
+            None => Ok(()),
+        }
+    }
 }
 
 /// The VM's interval-notifier consumer (`vma_userptr_invalidate`). It runs
@@ -276,6 +366,9 @@ pub(crate) struct Bind {
     pub mirror: Option<Userptr>,
     /// DRM_XE_VM_BIND_OP_PREFETCH target memory region (0 = sysmem, 1 = VRAM).
     pub prefetch_region: u32,
+    /// A MAP with DRM_XE_VM_BIND_FLAG_CPU_ADDR_MIRROR: the mirror VMA it
+    /// reserves (`op` 0, no `mapping`).
+    pub mirror_vma: Option<svm::MirrorVma>,
 }
 
 /// One programmed PAT index (xe_pat.c): whether it snoops CPU caches
@@ -366,8 +459,27 @@ impl Bind {
         let op = u32_at(wire, 40);
         let flags = u32_at(wire, 44);
         // op > DRM_XE_VM_BIND_OP_PREFETCH is EINVAL; PREFETCH itself is a
-        // valid operation that this VM does not implement.
-        if flags & !0x1f != 0 || u32_at(wire, 48) != 0 || op > 4 {
+        // valid operation that this VM does not implement. CPU_ADDR_MIRROR
+        // and MADVISE_AUTORESET exist only where a mirror can: a fault-mode
+        // VM of a USM device under narf.intel.svm=1 (vm_bind_ioctl_check_args
+        // refuses a mirror without xe_vm_in_fault_mode or GPUSVM). DECOMPRESS
+        // stays refused.
+        let svm_flags = svm::BIND_FLAG_CPU_ADDR_MIRROR | svm::BIND_FLAG_MADVISE_AUTORESET;
+        let supported = if vm.svm.is_some() {
+            0x1f | svm_flags
+        } else {
+            0x1f
+        };
+        if flags & !supported != 0 || u32_at(wire, 48) != 0 || op > 4 {
+            return Err(FsError::InvalidData);
+        }
+        // A mirror is a MAP with neither object nor cpu_addr_mirror_offset;
+        // AUTORESET needs a mirror MAP. NARF also refuses NULL on a mirror,
+        // which Linux admits.
+        let mirror = flags & svm::BIND_FLAG_CPU_ADDR_MIRROR != 0;
+        if flags & svm_flags != 0
+            && (!mirror || op != 0 || object != 0 || offset != 0 || flags & svm::BIND_FLAG_NULL != 0)
+        {
             return Err(FsError::InvalidData);
         }
         if op == 3 {
@@ -383,6 +495,7 @@ impl Bind {
                 userptr: None,
                 mirror: None,
                 prefetch_region: 0,
+                mirror_vma: None,
             });
         }
         if address % 4096 != 0
@@ -405,6 +518,7 @@ impl Bind {
                 userptr: None,
                 mirror: None,
                 prefetch_region: 0,
+                mirror_vma: None,
             });
         }
         if op == 2 {
@@ -436,6 +550,7 @@ impl Bind {
                 userptr: Some(offset),
                 mirror: None,
                 prefetch_region: 0,
+                mirror_vma: None,
             });
         }
         if op == 4 {
@@ -457,10 +572,37 @@ impl Bind {
                 userptr: None,
                 mirror: None,
                 prefetch_region: offset as u32,
+                mirror_vma: None,
             });
         }
         if op != 0 {
             return Err(FsError::InvalidData);
+        }
+        if mirror {
+            // The mirror maps nothing, but its SVM ranges take the VMA's PAT
+            // index: an iGPU refuses XE_COH_NONE, as for USERPTR. NARF also
+            // refuses compressed indices, which Linux admits: no flat-CCS
+            // metadata is cleared for user pages.
+            let entry = pat_entry(platform, pat).ok_or(FsError::InvalidData)?;
+            if (!platform.is_discrete() && !entry.coherent) || entry.compressed {
+                return Err(FsError::InvalidData);
+            }
+            return Ok(Self {
+                object: None,
+                address,
+                length,
+                op,
+                mapping: None,
+                userptr: None,
+                mirror: None,
+                prefetch_region: 0,
+                mirror_vma: Some(svm::MirrorVma {
+                    start: address,
+                    end: address + length,
+                    pat: pat as u8,
+                    read_only: flags & 1 != 0,
+                }),
+            });
         }
         let null = flags & 4 != 0;
         let entry = pat_entry(platform, pat);
@@ -511,6 +653,7 @@ impl Bind {
             userptr: None,
             mirror: None,
             prefetch_region: 0,
+            mirror_vma: None,
         })
     }
 
@@ -537,6 +680,13 @@ impl Bind {
         self.mirror = Some(mirror);
         Ok(())
     }
+}
+
+/// A VM's next mapping and mirror-VMA sets, published together.
+#[derive(Debug)]
+pub(crate) struct Prepared {
+    pub mappings: Vec<VmMapping>,
+    pub mirrors: Vec<svm::MirrorVma>,
 }
 
 /// Remove an interval, preserving left/right slices and their object offsets.
@@ -578,16 +728,30 @@ impl State {
         self.mappings = mappings;
     }
 
+    /// The mapping set `binds` leave; [`Self::prepare_all`] without mirrors.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub fn prepare(&self, binds: &[Bind], scratch: bool) -> Result<Vec<VmMapping>, FsError> {
+        self.prepare_all(binds, scratch, &[], &|_, _| false)
+            .map(|prepared| prepared.mappings)
+    }
+
+    /// The mapping and mirror-VMA sets `binds` leave from these mappings and
+    /// the published `mirrors`, applied in order. `svm_mapping` is
+    /// `xe_svm_has_mapping`: removing part of a mirror VMA that still holds an
+    /// SVM range is -EBUSY, except by a mirror MAP, which also absorbs the
+    /// adjacent mirror VMAs.
+    pub fn prepare_all(
+        &self,
+        binds: &[Bind],
+        scratch: bool,
+        mirrors: &[svm::MirrorVma],
+        svm_mapping: &dyn Fn(u64, u64) -> bool,
+    ) -> Result<Prepared, FsError> {
         let mut mappings = self.mappings.clone();
+        let mut mirrors = mirrors.to_vec();
         for bind in binds {
             if bind.op == 4 {
-                if !crate::intel_gpu_exec::mappings_cover_any(
-                    &mappings,
-                    bind.address,
-                    bind.length,
-                    false,
-                ) {
+                if !svm::covered(&mappings, &mirrors, bind.address, bind.length) {
                     return Err(FsError::InvalidData);
                 }
                 continue;
@@ -615,12 +779,21 @@ impl State {
                 if let Some(mapping) = &bind.mapping {
                     mappings.push(mapping.clone());
                 }
+                let end = bind.address + bind.length;
+                if let Some(vma) = bind.mirror_vma {
+                    let (start, end) = svm::merge_extent(&mirrors, bind.address, end);
+                    svm::carve(&mut mirrors, start, end, None)?;
+                    mirrors.push(svm::MirrorVma { start, end, ..vma });
+                } else {
+                    svm::carve(&mut mirrors, bind.address, end, Some(svm_mapping))?;
+                }
             }
-            if mappings.len() > MAX_MAPPINGS {
+            if mappings.len() + mirrors.len() > MAX_MAPPINGS {
                 return Err(FsError::OutOfMemory);
             }
         }
         mappings.sort_unstable_by_key(|m| m.va);
+        mirrors.sort_unstable_by_key(|vma| vma.start);
         let bytes = mappings
             .iter()
             .filter(|m| m.object.is_some() || !scratch)
@@ -629,7 +802,7 @@ impl State {
         if bytes > 512 * 1024 * 1024 {
             return Err(FsError::OutOfMemory);
         }
-        Ok(mappings)
+        Ok(Prepared { mappings, mirrors })
     }
 
     pub async fn retire(&mut self) -> Result<(), FsError> {
@@ -710,6 +883,7 @@ mod tests {
             userptr: None,
             mirror: None,
             prefetch_region: 0,
+            mirror_vma: None,
         };
         let mapped = state.prepare(&[unmap], true).unwrap();
         assert_eq!(
@@ -742,6 +916,7 @@ mod tests {
             userptr: None,
             mirror: None,
             prefetch_region: 0,
+            mirror_vma: None,
         };
         let mapped = state.prepare(&[replace], true).unwrap();
         assert_eq!(mapped.len(), 3);
@@ -758,6 +933,7 @@ mod tests {
             userptr: None,
             mirror: None,
             prefetch_region: 0,
+            mirror_vma: None,
         };
         gem.close(handle).unwrap();
         let mapped = state.prepare(&[all], true).unwrap();

@@ -601,10 +601,17 @@ impl XeFile {
                 }
                 let id = names.next_vm;
                 let next = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
-                let vm = Vm::new(
+                // xe_svm_init: a fault-mode VM mirrors its creator's address
+                // space (current->mm) once GPUSVM is admitted.
+                let fault = flags & 4 != 0;
+                let mirror = (fault && crate::intel_gpu_xe_vm::svm::admitted(info))
+                    .then(|| user.address_space_identity())
+                    .flatten();
+                let vm = Vm::with_svm(
                     flags & 1 != 0 || info.platform == crate::intel_gpu_gt::GtPlatform::Battlemage,
                     flags & 2 != 0,
-                    flags & 4 != 0,
+                    fault,
+                    mirror,
                 )?;
                 put32(&mut wire, 12, id);
                 user.write(address, &wire)?;
@@ -1314,13 +1321,21 @@ impl XeFile {
         if let Some(queue) = &queue {
             queue.check()?;
         }
-        let mappings = state.prepare(&binds, vm.scratch)?;
+        // xe_svm_garbage_collector: CPU unmaps are processed first, so a
+        // range they removed cannot make the VMA change below -EBUSY.
+        vm.svm_collect_garbage(&state);
+        let prepared = state.prepare_all(
+            &binds,
+            vm.scratch,
+            &vm.svm_vmas(&state),
+            &|start, end| vm.svm_has_mapping(start, end),
+        )?;
         state.retire().await?;
         vm.check()?;
         if let Some(queue) = &queue {
             queue.check()?;
         }
-        state.publish(mappings);
+        vm.publish(&mut state, prepared);
         // Adopt the new MAP_USERPTR bindings and forget the replaced ones
         // under the same VM lock, so exec always checks what it maps.
         let fresh = binds
@@ -1330,6 +1345,11 @@ impl XeFile {
         vm.adopt_userptrs(&state.mappings, fresh);
         if binds.iter().any(|b| b.op == 4) {
             vm.revalidate_userptrs(&mut state, user)?;
+            // prefetch_ranges: PREFETCH over mirror VMAs faults their CPU
+            // pages in (system memory: there is no pagemap).
+            for bind in binds.iter().filter(|b| b.op == 4) {
+                vm.svm_prefetch(&state, bind, user)?;
+            }
             if let (Some(pool), Some(backend)) = (info.vram.as_ref(), info.backend.as_ref()) {
                 if let Some(epoch) = backend
                     .status()
@@ -1435,6 +1455,17 @@ impl XeFile {
             // xe_vm_userptr_pin: re-collect invalidated MAP_USERPTR bindings
             // before this job's private tables are built from the mappings.
             queue.vm.revalidate_userptrs(&mut state, user)?;
+            // The SVM ranges still valid, or refaulted here, map beside the
+            // VMAs; a range the CPU invalidated is never in a new job's tables
+            // with its old pages (xe_svm_invalidate's zap).
+            let ranges = queue.vm.svm_job_mappings(&state, user);
+            let joined: Vec<VmMapping>;
+            let job_mappings: &[VmMapping] = if ranges.is_empty() {
+                &state.mappings
+            } else {
+                joined = [state.mappings.as_slice(), ranges.as_slice()].concat();
+                &joined
+            };
             // xe_vm_validate_rebind: a foreign import whose exporter moved
             // (xe_dma_buf_move_notify) maps its attachment again, so the
             // tables below are built from the new pages.
@@ -1475,7 +1506,7 @@ impl XeFile {
             let built = if parallel.is_some() {
                 ResidentBatch::from_vm_parallel(
                     status.platform,
-                    &state.mappings,
+                    job_mappings,
                     addresses.as_deref(),
                     width,
                     queue.vm.scratch,
@@ -1484,7 +1515,7 @@ impl XeFile {
             } else {
                 ResidentBatch::from_vm(
                     status.platform,
-                    &state.mappings,
+                    job_mappings,
                     batch,
                     queue.vm.scratch,
                     sync.user_fence,
@@ -1502,7 +1533,10 @@ impl XeFile {
             // invalidated while the tables were built is re-collected and the
             // tables rebuilt (xe_exec_ioctl's -EAGAIN retry). A move notified
             // to an import meanwhile does the same.
-            if queue.vm.userptrs_stale() || crate::intel_gpu_prime::imports_stale(&imports) {
+            if queue.vm.userptrs_stale()
+                || queue.vm.svm_stale()
+                || crate::intel_gpu_prime::imports_stale(&imports)
+            {
                 continue;
             }
             // Per-batch OA query (issue #1774): refuse to submit while
@@ -1514,7 +1548,7 @@ impl XeFile {
             // change between them.
             if let Some(sampler) = queue.context.query_sampler() {
                 if !crate::intel_gpu_exec::mappings_cover(
-                    &state.mappings,
+                    job_mappings,
                     sampler.address(),
                     u64::from(sampler.size()),
                 ) {
