@@ -140,9 +140,10 @@
 //! and caps the link, the stream's bandwidth is requested before the port
 //! and freed after it, and the port clock is the fabric's UHBR select.
 //! 128b/132b MST, DSC on a UHBR link, Thunderbolt UHBR on display 14/20,
-//! LTTPRs, a failed training's reduced retry and HDCP are refused typed
-//! ([`ExternalError::Uhbr`]) or not offered. Without the option no
-//! 128b/132b register is touched.
+//! LTTPRs and a failed training's reduced retry are refused typed
+//! ([`ExternalError::Uhbr`]). HDCP takes a 128b/132b SST route as DP SST
+//! ([`hdcp_route_of`]). Without the option no 128b/132b register is
+//! touched.
 //!
 //! ## DSC with FEC
 //!
@@ -4454,14 +4455,26 @@ pub fn event_slot(port: XeLpgPort) -> usize {
 /// unless a pass holds the service. An MST route reports its streams, the
 /// master's first, and `transcoder` is the master's.
 pub(crate) fn hdcp_route() -> Option<crate::intel_hdcp_live::XelpgRoute> {
-    use crate::intel_hdcp_live::{MstStreams, RouteLink, XelpgRoute};
     let service = SERVICE.try_lock()?;
     // HDCP follows the first owned route; a second concurrent route is not
     // offered it.
-    let route = service.route().filter(|r| r.live())?;
+    hdcp_route_of(service.route().filter(|r| r.live())?)
+}
+
+/// [`hdcp_route`] for one live route. A 128b/132b (UHBR) SST route is
+/// offered as DP SST on its own transcoder, as Linux does: neither
+/// `intel_hdcp.c` nor `intel_dp_hdcp.c` distinguishes the channel coding,
+/// `_intel_hdcp_enable` takes the SST shim (`intel_dp_hdcp_shim`, no
+/// `stream_encryption`) because the CRTC is not `INTEL_OUTPUT_DP_MST`
+/// (`stream_transcoder` stays `INVALID_TRANSCODER`), and the route's MST
+/// transport select is its own `cpu_transcoder` (`mst_master_transcoder`),
+/// whose `HDCP2_CTL`/`HDCP2_STATUS` carry the link encryption. HDCP 1.4 is
+/// whatever the sink's `DP_AUX_HDCP_BCAPS` offers (a DP 2.0 sink that only
+/// does HDCP 2.3 reports none). The per-stream encryption
+/// (`intel_dp_mst_hdcp2_stream_encryption`) belongs to MST routes only.
+pub(crate) fn hdcp_route_of(route: &MtlRoute) -> Option<crate::intel_hdcp_live::XelpgRoute> {
+    use crate::intel_hdcp_live::{MstStreams, RouteLink, XelpgRoute};
     let (protocol, link, mst) = match route {
-        // HDCP is not offered on a 128b/132b route.
-        MtlRoute::Dp(r) if r.probe.uhbr.is_some() => return None,
         MtlRoute::Dp(r) => (
             crate::intel_hdcp::Protocol::Dp,
             RouteLink::Dp(crate::intel_hdcp_shim::AuxPort::XeLpdp {

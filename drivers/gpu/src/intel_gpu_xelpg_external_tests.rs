@@ -4485,6 +4485,49 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_tc_route_lights_and_stops
 );
 
+/// HDCP on a live 128b/132b SST route (`_intel_hdcp_enable` outside
+/// `INTEL_OUTPUT_DP_MST`): the DP SST shim on the route's own CPU
+/// transcoder (B), its port and native AUX, no MST streams (no
+/// `stream_encryption`); the stopped route offers nothing.
+fn smoke_mtl_external_uhbr_route_offers_sst_hdcp() -> TestResult {
+    use crate::intel_hdcp_live::{MstStreams, RouteLink, XelpgRoute};
+    let io = uhbr_tc();
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the DP 2.0 sink must probe with UHBR on");
+    };
+    let fb = fb_for(&probe.mode).unwrap();
+    let route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.probe.uhbr.is_some() && route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the 128b/132b route must light"),
+    };
+    let mut route = MtlRoute::Dp(route);
+    let want = XelpgRoute {
+        port: XeLpgPort::Tc2 as u8,
+        transcoder: Transcoder::B as u8,
+        protocol: crate::intel_hdcp::Protocol::Dp,
+        link: RouteLink::Dp(crate::intel_hdcp_shim::AuxPort::XeLpdp {
+            base: XeLpgPort::Tc2.aux_base(),
+            tbt_io: false,
+        }),
+        mst: MstStreams::default(),
+    };
+    if hdcp_route_of(&route) != Some(want) {
+        return TestResult::Fail("a 128b/132b SST route must be offered as DP SST HDCP");
+    }
+    let MtlRoute::Dp(r) = &mut route else {
+        return TestResult::Fail("the route is DP");
+    };
+    if r.stop(&io).is_err() || route.live() {
+        return TestResult::Fail("the route must stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_route_offers_sst_hdcp
+);
+
 /// A sparse DPCD image for [`plan_uhbr`].
 struct Dpcd(Vec<(u32, u8)>);
 
