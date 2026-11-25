@@ -34,7 +34,7 @@ pub(crate) fn local80(info: RadioInfo) -> Result<LocalPhy, Error> {
     LocalPhy::vht80(local_ht(info), local_vht(info, false)?).map_err(|_| Error::UnsupportedFirmware)
 }
 pub(crate) fn wide160(info: RadioInfo) -> bool {
-    qualified(info) && info.chip_id == 0x7922
+    qualified(info) && matches!(info.chip_id, 0x7922 | 0x7925)
 }
 fn local_vht(info: RadioInfo, allow160: bool) -> Result<LocalVht, Error> {
     let mut vht = LocalVht::new(rx_map(info), rx_map(info), true, true, 0)

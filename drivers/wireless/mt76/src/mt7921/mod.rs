@@ -42,6 +42,7 @@ pub mod cmd;
 pub(crate) mod csa;
 pub(crate) mod debug;
 pub mod dma;
+pub(crate) mod eht;
 mod firmware_assets;
 mod firmware_parser_tests;
 pub mod firmware_transport;

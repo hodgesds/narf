@@ -219,6 +219,7 @@ pub struct JoinPlan {
     ht20: Option<super::ht20::Profile>,
     vht: Option<super::vht::Profile>,
     he: Option<super::he::Profile>,
+    eht: Option<super::eht::Profile>,
     ap_phy: Option<narf_wireless::association::phy::ApElements>,
 }
 impl core::ops::Deref for JoinPlan {
@@ -337,6 +338,7 @@ impl JoinPlan {
             ht20: None,
             vht: None,
             he: None,
+            eht: None,
             ap_phy: None,
         })
     }
@@ -377,8 +379,8 @@ impl JoinPlan {
                 own,
                 ssid,
                 mode,
-                Some(super::he::with_he(
-                    super::vht::local(info)?,
+                Some(super::eht::with_eht(
+                    super::he::with_he(super::vht::local(info)?, info, true, true)?,
                     info,
                     true,
                     true,
@@ -400,8 +402,8 @@ impl JoinPlan {
                     own,
                     ssid,
                     mode,
-                    Some(super::he::with_he(
-                        super::vht::local80(info)?,
+                    Some(super::eht::with_eht(
+                        super::he::with_he(super::vht::local80(info)?, info, true, false)?,
                         info,
                         true,
                         false,
@@ -436,7 +438,12 @@ impl JoinPlan {
             let local = super::vht::ht_fallback(info, permission.native_width() != 0)?;
             // mt7921_init_he_caps also registers 2.4GHz HE on the HT companion.
             let local = if bss.channel <= 14 {
-                super::he::with_he(local, info, false, false)?
+                super::eht::with_eht(
+                    super::he::with_he(local, info, false, false)?,
+                    info,
+                    false,
+                    false,
+                )?
             } else {
                 local
             };
@@ -456,6 +463,7 @@ impl JoinPlan {
             ht20: None,
             vht: None,
             he: None,
+            eht: None,
             ap_phy: None,
         };
         if permission.native_width() >= super::cmd::CH_BW_80
@@ -507,6 +515,16 @@ impl JoinPlan {
             grant.rule(),
         )
         .map_err(|_| NativeError::UnsupportedFirmware)?;
+        // EHT on top of HE when the firmware reports it. The grant
+        // (`six_ghz::local`) negotiates the same profile, so grant and
+        // join agree on the EHT width.
+        let local = if super::eht::qualified(info, true) {
+            local
+                .with_eht(super::eht::local_eht(info, true, true)?)
+                .map_err(|_| NativeError::UnsupportedFirmware)?
+        } else {
+            local
+        };
         let wmm =
             wmm::Parameters::parse(&bss.information_elements).map_err(|_| NativeError::Bounds)?;
         let common = ManagementPlan::prepare_6ghz(bss, own, ssid, security.mode(), &local, options)
@@ -528,6 +546,7 @@ impl JoinPlan {
             ht20: None,
             vht: None,
             he: None,
+            eht: None,
             ap_phy: None,
         })
     }
@@ -664,6 +683,17 @@ impl JoinPlan {
                     return Err(Error::Protocol);
                 }
             }
+            // EHT on top of the 6 GHz HE profile, when the plan negotiated it.
+            self.eht = match six.eht() {
+                Some(e) => match super::eht::Profile::from_eht(e, six.he()) {
+                    Ok(profile) => Some(profile),
+                    Err(_) => {
+                        self.cancel();
+                        return Err(Error::Protocol);
+                    }
+                },
+                None => None,
+            };
         } else if let Some(n) = self.common.negotiated_phy() {
             if n.vht().is_none() {
                 let width = match n.width() {
@@ -706,6 +736,18 @@ impl JoinPlan {
             } else {
                 None
             };
+            // EHT on top of HE, when the plan negotiated it.
+            self.eht = if n.eht().is_some() {
+                match super::eht::Profile::negotiated(n) {
+                    Ok(profile) => Some(profile),
+                    Err(_) => {
+                        self.cancel();
+                        return Err(Error::Protocol);
+                    }
+                }
+            } else {
+                None
+            };
             self.ap_phy = Some(narf_wireless::association::phy::ApElements::parse(
                 &bytes[30..],
             )?);
@@ -727,6 +769,7 @@ impl JoinPlan {
         self.ht20 = None;
         self.vht = None;
         self.he = None;
+        self.eht = None;
         self.ap_phy = None;
         self.wmm_association.clear();
         self.common.cancel();
@@ -739,6 +782,9 @@ impl JoinPlan {
     }
     pub(crate) fn he(&self) -> Option<super::he::Profile> {
         self.he
+    }
+    pub(crate) fn eht(&self) -> Option<super::eht::Profile> {
+        self.eht
     }
     pub(crate) fn ap_phy(&self) -> Option<narf_wireless::association::phy::ApElements> {
         self.ap_phy
@@ -874,6 +920,13 @@ impl JoinPlan {
                 out.extend_from_slice(&he.sta_v2());
                 out[2] += 2;
             }
+            // mt7925_mcu_sta_eht_tlv: STA_REC_EHT after HE/HE_V2, and
+            // PHY_TYPE_BIT_BE (get_phy_mode_v2) for an EHT peer.
+            if let Some(eht) = self.eht {
+                out[phy + 6] |= super::eht::PHY_TYPE_BIT_BE;
+                out.extend_from_slice(&eht.sta());
+                out[2] += 1;
+            }
         } else if let (Some(six), Some(he), true) = (six, self.he, associated) {
             // mt76_connac_mcu_sta_cmd for a 6 GHz HE peer: no HT/VHT
             // capability, so WTBL_HT/WTBL_VHT come from he_6ghz_capa
@@ -903,6 +956,13 @@ impl JoinPlan {
             out.extend_from_slice(&he.sta_v2());
             out.extend_from_slice(&super::six_ghz::sta_he_6g(peer));
             out[2] += 4;
+            // mt7925_mcu_sta_eht_tlv: STA_REC_EHT after the 6 GHz HE
+            // records, and PHY_TYPE_BIT_BE for an EHT peer.
+            if let Some(eht) = self.eht {
+                out[phy + 6] |= super::eht::PHY_TYPE_BIT_BE;
+                out.extend_from_slice(&eht.sta());
+                out[2] += 1;
+            }
         }
         Ok(out)
     }
