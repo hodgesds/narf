@@ -59,9 +59,8 @@ const GRDOM_FULL: u32 = 1;
 const GRDOM_RENDER: u32 = 1 << 1;
 
 /// The `GDRST` domain resetting `which` alone (`gen6_hw_engine_mask`,
-/// `gen11_hw_engine_mask`). Gen11 video and enhancement engines take none:
-/// their reset must first lock the SFC they may share (`gen11_lock_sfc`),
-/// which this owner does not model, so they reset with the whole GT.
+/// `get_reset_domain`'s Gen11 table). A Gen11 video or enhancement engine's
+/// reset also locks the SFC it may be using ([`sfc_lock`]).
 pub(crate) const fn engine_reset_domain(gt: LegacyGt, which: HwEngine) -> Option<u32> {
     match (gt, which) {
         (_, HwEngine::Rcs0) => Some(GRDOM_RENDER),
@@ -69,6 +68,57 @@ pub(crate) const fn engine_reset_domain(gt: LegacyGt, which: HwEngine) -> Option
         (LegacyGt::Gen9 | LegacyGt::Gen9Lp, HwEngine::Vcs0) => Some(1 << 2),
         (LegacyGt::Gen9 | LegacyGt::Gen9Lp, HwEngine::Vecs0) => Some(1 << 4),
         (LegacyGt::Gen11, HwEngine::Bcs0) => Some(1 << 2),
+        // GEN11_GRDOM_MEDIA, GEN11_GRDOM_VECS.
+        (LegacyGt::Gen11, HwEngine::Vcs0) => Some(1 << 5),
+        (LegacyGt::Gen11, HwEngine::Vecs0) => Some(1 << 13),
+        _ => None,
+    }
+}
+
+/// `GEN11_GRDOM_SFC0`: VCS0's (`GEN11_VCS_SFC_RESET_BIT(0)`) and VECS0's
+/// (`GEN11_VECS_SFC_RESET_BIT(0)`) scaler and format converter.
+const GRDOM_SFC0: u32 = 1 << 17;
+
+/// `get_sfc_forced_lock_data`: an engine's SFC forced-lock request, its
+/// acknowledgement, the engine's SFC usage flag and the `GDRST` bit that
+/// resets the SFC with the engine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SfcLock {
+    lock: u64,
+    lock_bit: u32,
+    ack: u64,
+    ack_bit: u32,
+    usage: u64,
+    usage_bit: u32,
+    reset_bit: u32,
+}
+
+/// The SFC lock of the engine at `base`: Gen11 VCS0 (logical VDBox 0, which
+/// Gen11 always hooks to an SFC, `gen11_vdbox_has_sfc`) and VECS0, both on
+/// SFC 0. `None` for any engine without an SFC to lock.
+pub(crate) const fn sfc_lock(gt: LegacyGt, which: HwEngine, base: u64) -> Option<SfcLock> {
+    match (gt, which) {
+        // GEN11_VCS_SFC_FORCED_LOCK, GEN11_VCS_SFC_LOCK_STATUS (usage [0],
+        // ack [1]).
+        (LegacyGt::Gen11, HwEngine::Vcs0) => Some(SfcLock {
+            lock: base + 0x88c,
+            lock_bit: 1,
+            ack: base + 0x890,
+            ack_bit: 1 << 1,
+            usage: base + 0x890,
+            usage_bit: 1,
+            reset_bit: GRDOM_SFC0,
+        }),
+        // GEN11_VECS_SFC_FORCED_LOCK, _LOCK_ACK, _USAGE.
+        (LegacyGt::Gen11, HwEngine::Vecs0) => Some(SfcLock {
+            lock: base + 0x201c,
+            lock_bit: 1,
+            ack: base + 0x2018,
+            ack_bit: 1,
+            usage: base + 0x2014,
+            usage_bit: 1,
+            reset_bit: GRDOM_SFC0,
+        }),
         _ => None,
     }
 }
@@ -97,6 +147,7 @@ enum ResetPhase {
     Start,
     Stopping,
     Preparing,
+    Locking,
     Resetting,
 }
 
@@ -111,8 +162,12 @@ pub(crate) struct Reset {
     deadline: u64,
     /// The engine whose CS is stopped and whose reset handshake is asked.
     base: u64,
-    /// The `GDRST` domain pulsed: the full GT, or one engine.
+    /// The `GDRST` domain pulsed: the full GT, or one engine (and its SFC
+    /// once locked to it).
     domain: u32,
+    /// The engine's SFC lock ([`sfc_lock`]), and whether it was requested.
+    sfc: Option<SfcLock>,
+    sfc_requested: bool,
 }
 
 impl Reset {
@@ -128,7 +183,36 @@ impl Reset {
             deadline: 0,
             base,
             domain,
+            sfc: None,
+            sfc_requested: false,
         }
+    }
+
+    /// `__gen11_reset_engines`' SFC handling: when the engine is using its
+    /// SFC, force-lock it (1 ms for the ack) and reset it with the engine;
+    /// an SFC released meanwhile is left alone; an unacknowledged lock fails
+    /// the engine reset. The lock is released after the pulse either way.
+    pub(crate) const fn with_sfc(mut self, sfc: Option<SfcLock>) -> Self {
+        self.sfc = sfc;
+        self
+    }
+
+    /// `gen6_hw_domain_reset`: pulse the domain and wait up to 500 ms.
+    fn pulse(&mut self, mmio: &impl MmioWindow, now: u64) -> Poll<Result<(), InitError>> {
+        mmio.write32(GDRST, self.domain);
+        self.phase = ResetPhase::Resetting;
+        self.deadline = now + 500_000_000;
+        Poll::Pending
+    }
+
+    /// `gen11_unlock_sfc` for a requested lock, then
+    /// `gen8_engine_reset_cancel`.
+    fn finish(&mut self, mmio: &impl MmioWindow) {
+        if let Some(sfc) = self.sfc.filter(|_| self.sfc_requested) {
+            let lock = mmio.read32(sfc.lock);
+            mmio.write32(sfc.lock, lock & !sfc.lock_bit);
+        }
+        mmio.write32(self.base + (RESET_CTL - RCS), masked_disable(REQUEST_RESET));
     }
 
     pub(crate) fn poll(&mut self, mmio: &impl MmioWindow, now: u64) -> Poll<Result<(), InitError>> {
@@ -159,10 +243,36 @@ impl Reset {
                 {
                     return Poll::Pending;
                 }
-                mmio.write32(GDRST, self.domain);
-                self.phase = ResetPhase::Resetting;
-                self.deadline = now + 500_000_000;
-                Poll::Pending
+                match self.sfc {
+                    Some(sfc) if mmio.read32(sfc.usage) & sfc.usage_bit != 0 => {
+                        let lock = mmio.read32(sfc.lock);
+                        mmio.write32(sfc.lock, lock | sfc.lock_bit);
+                        self.sfc_requested = true;
+                        self.phase = ResetPhase::Locking;
+                        self.deadline = now + 1_000_000;
+                        Poll::Pending
+                    }
+                    _ => self.pulse(mmio, now),
+                }
+            }
+            ResetPhase::Locking => {
+                let Some(sfc) = self.sfc else {
+                    return self.pulse(mmio, now);
+                };
+                let acked = mmio.read32(sfc.ack) & sfc.ack_bit != 0;
+                if !acked && now < self.deadline {
+                    return Poll::Pending;
+                }
+                // Released while locking: the engine resets alone.
+                if mmio.read32(sfc.usage) & sfc.usage_bit == 0 {
+                    return self.pulse(mmio, now);
+                }
+                if !acked {
+                    self.finish(mmio);
+                    return Poll::Ready(Err(InitError::ResetTimeout));
+                }
+                self.domain |= sfc.reset_bit;
+                self.pulse(mmio, now)
             }
             ResetPhase::Resetting => {
                 let status = mmio.read32(GDRST);
@@ -173,10 +283,10 @@ impl Reset {
                     if now < self.deadline {
                         return Poll::Pending;
                     }
-                    mmio.write32(self.base + (RESET_CTL - RCS), masked_disable(REQUEST_RESET));
+                    self.finish(mmio);
                     return Poll::Ready(Err(InitError::ResetTimeout));
                 }
-                mmio.write32(self.base + (RESET_CTL - RCS), masked_disable(REQUEST_RESET));
+                self.finish(mmio);
                 Poll::Ready(Ok(()))
             }
         }
@@ -1007,7 +1117,7 @@ impl Owner {
         };
         let base = lane.map_or(RCS, |i| runtime.xcs[i].engine.spec().base);
         runtime.unpark().map_err(|_| InitError::Forcewake)?;
-        let mut reset = Reset::engine(base, domain);
+        let mut reset = Reset::engine(base, domain).with_sfc(sfc_lock(runtime.gt, which, base));
         loop {
             match reset.poll(&runtime.window, narf_time::monotonic_ns()) {
                 Poll::Pending => sleep_us(20).await,
@@ -1491,8 +1601,8 @@ pub mod tests {
             (LegacyGt::Gen9, HwEngine::Vecs0, Some(1 << 4)),
             (LegacyGt::Gen11, HwEngine::Rcs0, Some(1 << 1)),
             (LegacyGt::Gen11, HwEngine::Bcs0, Some(1 << 2)),
-            (LegacyGt::Gen11, HwEngine::Vcs0, None),
-            (LegacyGt::Gen11, HwEngine::Vecs0, None),
+            (LegacyGt::Gen11, HwEngine::Vcs0, Some(1 << 5)),
+            (LegacyGt::Gen11, HwEngine::Vecs0, Some(1 << 13)),
         ];
         if expect
             .iter()
@@ -1519,6 +1629,63 @@ pub mod tests {
             || writes.iter().any(|&(r, _)| r == MI_MODE || r == RESET_CTL)
         {
             return TestResult::Fail("BCS0 reset uses BCS0's CS and only the blitter domain");
+        }
+        // Gen11 VCS0 at 0x1c0000 using its SFC: force-lock, reset the SFC
+        // with the engine once acknowledged, then unlock.
+        let run = |usage: u32, ack: bool| {
+            let regs = Regs::default();
+            regs.values.borrow_mut().insert(0x1c0890, usage);
+            let sfc = sfc_lock(LegacyGt::Gen11, HwEngine::Vcs0, 0x1c0000);
+            let mut reset = Reset::engine(0x1c0000, 1 << 5).with_sfc(sfc);
+            let mut now = 0;
+            let done = loop {
+                if let Poll::Ready(result) = reset.poll(&regs, now) {
+                    break result;
+                }
+                let locked = regs.writes.borrow().contains(&(0x1c088c, 1));
+                if locked && ack {
+                    regs.values.borrow_mut().insert(0x1c0890, usage | 1 << 1);
+                }
+                regs.values.borrow_mut().insert(GDRST, 0);
+                now += 100_000;
+            };
+            let writes = regs.writes.borrow().clone();
+            (done, writes)
+        };
+        let at = |writes: &[(u64, u32)], write| writes.iter().position(|w| *w == write);
+        let (done, writes) = run(1, true);
+        let (lock, pulse, unlock) = (
+            at(&writes, (0x1c088c, 1)),
+            at(&writes, (GDRST, 1 << 5 | 1 << 17)),
+            at(&writes, (0x1c088c, 0)),
+        );
+        if done != Ok(())
+            || !(lock < pulse && pulse < unlock && lock.is_some())
+            || at(&writes, (0x1c00d0, masked_disable(REQUEST_RESET))) < unlock
+        {
+            return TestResult::Fail("a used SFC is locked, reset with VCS0 and unlocked");
+        }
+        let (done, writes) = run(0, true);
+        if done != Ok(())
+            || writes.iter().any(|&(r, _)| r == 0x1c088c)
+            || at(&writes, (GDRST, 1 << 5)).is_none()
+        {
+            return TestResult::Fail("an idle SFC is left alone");
+        }
+        let (done, writes) = run(1, false);
+        if done != Err(InitError::ResetTimeout)
+            || writes.iter().any(|&(r, _)| r == GDRST)
+            || at(&writes, (0x1c088c, 0)).is_none()
+        {
+            return TestResult::Fail("an unacknowledged SFC lock fails the engine reset");
+        }
+        let vecs = sfc_lock(LegacyGt::Gen11, HwEngine::Vecs0, 0x1c8000).unwrap();
+        if (vecs.lock, vecs.ack, vecs.usage, vecs.reset_bit)
+            != (0x1ca01c, 0x1ca018, 0x1ca014, 1 << 17)
+            || sfc_lock(LegacyGt::Gen9, HwEngine::Vcs0, 0x12000).is_some()
+            || sfc_lock(LegacyGt::Gen11, HwEngine::Bcs0, 0x22000).is_some()
+        {
+            return TestResult::Fail("SFC lock registers follow get_sfc_forced_lock_data");
         }
         TestResult::Pass
     }
