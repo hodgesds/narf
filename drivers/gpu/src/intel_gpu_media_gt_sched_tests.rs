@@ -41,6 +41,11 @@ pub(super) struct Hw {
     pub(super) gsc_jobs: Vec<Vec<u32>>,
     /// GSCCS0 rings that carried no GSC instruction (priming jobs).
     pub(super) gsc_empty: usize,
+    /// The PPGTT root of each `gsc_jobs` entry (0 for a GGTT kernel job).
+    pub(super) gsc_roots: Vec<u64>,
+    /// Kernel commands a VCS/VECS ring carried inline ahead of its
+    /// breadcrumb, with the engine base.
+    pub(super) media_prefix: Vec<(u32, Vec<u32>)>,
 }
 
 /// Hardware side of one tick: forcewake acknowledgements follow requests,
@@ -139,6 +144,10 @@ pub(super) fn execute_media(w: &Window, base: u32, hw: &mut Hw) {
                     && v[4..] == [0x01000000, 0x04000001, 0x02800000]
             })
             .expect("video breadcrumb");
+        if root == 0 && at > 1 {
+            assert_eq!(words[0], 0x04000001);
+            hw.media_prefix.push((engine, words[1..at].to_vec()));
+        }
         words[at + 3]
     };
     assert_ne!(stamp, 0);
@@ -183,7 +192,7 @@ pub(super) fn execute_gsc(w: &Window, base: u32, hw: &mut Hw) {
     let d = w.0.borrow();
     assert!(d.synced.contains(&base));
     let image = d.memory[&base].clone();
-    let (tail, ring_base) = {
+    let (tail, ring_base, root) = {
         let data = image.borrow();
         assert_eq!(data.len(), 2048, "GSCCS LRC is PPHWSP + one page");
         assert_eq!(
@@ -191,8 +200,8 @@ pub(super) fn execute_gsc(w: &Window, base: u32, hw: &mut Hw) {
             &[0, 0x1108101d, 0x11a244, data[1027], 0x11a034, 0, 0x11a030]
         );
         assert_eq!((data[1024 + 28], data[1024 + 30]), (0x11a120, 0x11a124));
-        assert_eq!((data[1024 + 0x31], data[1024 + 0x33]), (0, 0), "no PPGTT");
-        (data[1024 + 7], data[1024 + 9])
+        let root = (u64::from(data[1024 + 0x31]) << 32) | u64::from(data[1024 + 0x33]);
+        (data[1024 + 7], data[1024 + 9], root)
     };
     assert!(d.synced.contains(&ring_base));
     let ring = d.memory[&ring_base].borrow().clone();
@@ -210,10 +219,16 @@ pub(super) fn execute_gsc(w: &Window, base: u32, hw: &mut Hw) {
             })
             .expect("GSCCS breadcrumb");
         assert_eq!(words[0], 0x04000001);
+        // Only PXP's gsc_res.q runs a PPGTT batch, through
+        // __emit_job_gen12_simple's TLB-invalidating start and BB_START.
+        let ppgtt = words[1] == 0x02800101 && words.get(7) == Some(&0x18800101);
+        assert_eq!(root != 0, ppgtt, "a PPGTT root exactly for a PPGTT batch");
         if at == 1 {
+            assert_eq!(root, 0);
             hw.gsc_empty += 1;
         } else {
             hw.gsc_jobs.push(words[1..at].to_vec());
+            hw.gsc_roots.push(root);
         }
         words[at + 3]
     };
