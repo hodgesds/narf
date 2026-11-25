@@ -127,10 +127,6 @@ pub struct Firmware {
     dmub: Option<dmub::Prepared>,
 }
 impl Firmware {
-    /// The validated IP firmware images (not the SOS or DMCUB preparation).
-    pub(crate) fn images(&self) -> Result<[gfx::Image<'_>; 11], Error> {
-        self.gfx.images().map_err(Error::Firmware)
-    }
     /// Parse one firmware image, without materializing the whole
     /// `[Image; 11]` set. `draw_inputs` needs only the PFP version, and
     /// building all eleven images (3872 bytes, measured) in its frame put

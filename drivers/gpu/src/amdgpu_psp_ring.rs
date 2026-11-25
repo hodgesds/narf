@@ -1642,8 +1642,14 @@ impl Psp {
         firmware: &crate::amdgpu_navi48_firmware::Firmware,
     ) -> Result<(), Error> {
         self.check_navi48_firmware(firmware)?;
-        let images = firmware.images().map_err(|_| Error::Invalid)?;
-        let smc = images[0].payloads().next().ok_or(Error::Invalid)?;
+        // Only the SMC image is needed (`Source::ALL[0]`); parsing one
+        // 352-byte `Image` instead of the whole `[Image; 11]` set (3872
+        // bytes) keeps this future under the 8 KiB frame budget. Same
+        // species as #2163's `Starts::from_firmware` fix.
+        let image = firmware
+            .image(crate::amdgpu_navi48_firmware::Source::Smc)
+            .map_err(|_| Error::Invalid)?;
+        let smc = image.payloads().next().ok_or(Error::Invalid)?;
         self.session.load_smc(smc.bytes()).await
     }
     /// Load GC12 RS64, MES12, IMU, RLC, SDMA7 and media payloads in UCODE_ID
@@ -1654,8 +1660,12 @@ impl Psp {
         firmware: &crate::amdgpu_navi48_firmware::Firmware,
     ) -> Result<(), Error> {
         self.check_navi48_firmware(firmware)?;
-        let images = firmware.images().map_err(|_| Error::Invalid)?;
-        self.session.load_gfx12(&images).await
+        // `load_gfx12` needs the whole `[Image; 11]` set (3872 bytes), so
+        // it lives on the heap: holding the array in this future put its
+        // frame over the 8 KiB budget (8568 bytes). The box holds only a
+        // pointer across the await; the array is borrowed, never copied.
+        let images = alloc::boxed::Box::new(firmware.images().map_err(|_| Error::Invalid)?);
+        self.session.load_gfx12(&*images).await
     }
     /// Check GC12's own RLC status register after the accepted autoload.
     pub async fn wait_gfx_boot_navi48(&mut self) -> Result<GfxBootStatus, Error> {
