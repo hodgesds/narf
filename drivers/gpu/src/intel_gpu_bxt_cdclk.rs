@@ -211,6 +211,71 @@ pub(crate) fn program(
     Ok(after)
 }
 
+/// `BXT_CDCLK_CD2X_PIPE_MASK` [21:20] and its `PIPE_NONE`.
+const CD2X_PIPE_MASK: u32 = 3 << 20;
+const CD2X_PIPE_NONE: u32 = 3 << 20;
+
+/// `bxt_sanitize_cdclk` (display 9/10): `None` when the clock must be
+/// programmed from scratch, otherwise what was kept. A legal table CDCLK on
+/// its VCO whose `CDCLK_CTL` matches `bxt_cdclk_ctl(.., INVALID_PIPE)` once
+/// the CD2X pipe field is ignored is kept; a wrong decimal field alone is
+/// rewritten.
+fn sanitize(
+    io: &(impl MmioWindow + ?Sized),
+    glk: bool,
+    hw: Current,
+) -> Result<Option<crate::intel_gpu_gen9_cdclk::InitOutcome>, CdclkError> {
+    use crate::intel_gpu_gen9_cdclk::InitOutcome;
+    if hw.vco == 0 || hw.cdclk_khz == REF_KHZ {
+        return Ok(None);
+    }
+    // "Make sure this is a legal cdclk value for the platform" and "the VCO
+    // is correct for the cdclk".
+    if calc_cdclk(glk, hw.cdclk_khz) != Some(hw.cdclk_khz)
+        || pll_vco(glk, hw.cdclk_khz) != Some(hw.vco)
+    {
+        return Ok(None);
+    }
+    let expected = cdclk_ctl(hw.cdclk_khz, hw.vco, None);
+    // "Let's ignore the pipe field" (`has_cd2x_pipe_select`).
+    let cdctl = (read(io, CDCLK_CTL)? & !CD2X_PIPE_MASK) | CD2X_PIPE_NONE;
+    if cdctl == expected {
+        return Ok(Some(InitOutcome::Kept));
+    }
+    let fixed = (cdctl & !CDCLK_FREQ_DECIMAL_MASK) | (expected & CDCLK_FREQ_DECIMAL_MASK);
+    if fixed != expected {
+        return Ok(None);
+    }
+    io.write32(CDCLK_CTL, expected);
+    Ok(Some(InitOutcome::DecimalFixed))
+}
+
+/// `intel_cdclk_init_hw` on Broxton / Gemini Lake (`bxt_cdclk_init_hw`),
+/// run by the display-core init (`bxt_display_core_init`): a clock that
+/// passes `bxt_sanitize_cdclk` is kept; otherwise the DE PLL is re-locked
+/// ("force full PLL disable + enable") at the lowest table CDCLK
+/// (`bxt_calc_cdclk(display, 0)`: 144 MHz on Broxton, 79.2 MHz on Gemini
+/// Lake) and its VCO.
+pub(crate) fn init_hw(
+    io: &(impl MmioWindow + ?Sized),
+    glk: bool,
+) -> Result<crate::intel_gpu_gen9_cdclk::InitOutcome, CdclkError> {
+    let hw = Current::read(io)?;
+    if let Some(kept) = sanitize(io, glk, hw)? {
+        return Ok(kept);
+    }
+    let cdclk_khz = calc_cdclk(glk, 0).ok_or(CdclkError::Readback)?;
+    let forced = Current {
+        vco: u32::MAX,
+        cdclk_khz: 0,
+    };
+    let after = program(io, glk, forced, cdclk_khz)?;
+    Ok(crate::intel_gpu_gen9_cdclk::InitOutcome::Programmed {
+        vco: after.vco,
+        cdclk_khz: after.cdclk_khz,
+    })
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
