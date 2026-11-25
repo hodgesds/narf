@@ -508,7 +508,10 @@ fn map_hid_error(e: I2cHidError) -> TransportError {
         I2cHidError::Bus(_) => TransportError::Protocol,
         I2cHidError::ShortReport | I2cHidError::BufferTooSmall => TransportError::Short,
         I2cHidError::NotInitialised => TransportError::NotReady,
-        I2cHidError::BadDescriptor | I2cHidError::BadPowerState => TransportError::Protocol,
+        I2cHidError::BadDescriptor
+        | I2cHidError::BadPowerState
+        | I2cHidError::InvalidRequest
+        | I2cHidError::NoOutputRegister => TransportError::Protocol,
     }
 }
 

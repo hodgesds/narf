@@ -160,6 +160,9 @@ mod abi_filemap_tests;
 mod abi_fsx2_tests;
 mod abi_fsx_tests;
 mod abi_futex_tests;
+// The FIDO authenticator behind the fake transport is a test fixture.
+#[cfg(feature = "kernel-test")]
+mod abi_hidraw_tests;
 mod abi_inode_identity_tests;
 mod abi_ioerrno_tests;
 mod abi_ipc_tests;

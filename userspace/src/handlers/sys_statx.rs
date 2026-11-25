@@ -268,8 +268,13 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // dev_t (small encoding (major<<8)|minor) → statx major/minor fields.
-    let (rdev_major, rdev_minor) = (((rdev >> 8) & 0xfff) as u32, (rdev & 0xff) as u32);
+    // dev_t (Linux `new_encode_dev`: minor bits 8+ live at bit 20) →
+    // statx major/minor (`new_decode_dev`). Minors above 255 are real:
+    // usbfs's `(bus - 1) * 128 + dev - 1` passes 255 from bus 3 on.
+    let (rdev_major, rdev_minor) = (
+        ((rdev & 0xfff00) >> 8) as u32,
+        ((rdev & 0xff) | ((rdev >> 12) & 0xfff00)) as u32,
+    );
 
     let ftype_bits: u16 = match s.mode.file_type {
         narf_filesystem::FileType::File => 0o100000,

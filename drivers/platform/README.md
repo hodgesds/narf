@@ -43,9 +43,14 @@ vendor-neutral userspace surfaces at the late stage: an rfkill
 registry (`/sys/class/rfkill/`) that turns the airplane-mode key
 and the HP rfkill2 firmware table into radio state, and a
 platform-profile registry (`/sys/firmware/acpi/platform_profile`)
-backed by whichever vendor driver — HP, IdeaPad, or ASUS — owns
-the machine's profile. A Think-LMI module implements Lenovo's
-BIOS-settings WMI protocol for ThinkPads.
+backed by whichever driver — HP, IdeaPad, ASUS, or AMD PMF — owns
+the machine's profile. AMD PMF (`amd_pmf`) is the static power
+slider on Rembrandt/Phoenix/Strix-class AMD laptops: it reads the
+BIOS's per-profile, per-power-source limit tables over the `APMF`
+method and pushes them to the SMU through the mailbox it shares
+with `amd_pmc` (`amd_smu`), re-pushing on every AC change. A
+Think-LMI module implements Lenovo's BIOS-settings WMI protocol for
+ThinkPads.
 
 Much of the crate is inherently x86-specific. The embedded
 controller reaches its registers through x86 I/O ports, the Intel

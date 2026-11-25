@@ -143,7 +143,7 @@ pub fn decode_usb_string_descriptor(buf: &[u8]) -> Option<String> {
 /// Fetch one string descriptor (`index`) via `GET_DESCRIPTOR(STRING)`,
 /// mirroring `cdc_ncm::fetch_mac_string`: LANGID from string-0,
 /// falling back to en-US (0x0409). Returns `None` on any failure.
-async fn fetch_product_string(xhci: &Xhci, slot_id: u8, index: u8) -> Option<String> {
+pub(crate) async fn fetch_product_string(xhci: &Xhci, slot_id: u8, index: u8) -> Option<String> {
     if index == 0 {
         return None;
     }

@@ -1210,7 +1210,10 @@ also consult upstream Linux GPL sources.
   the bytes go out at once (Linux `usb_serial_generic_write` /
   `acm_tty_write`). The pumps send one 64-byte chunk per pass and kick
   again while bytes remain and output is not stopped.
-- `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
+- The in-kernel CCID binding is behind the `usb-ccid` feature, which is off
+  by default. As on Linux, pcscd drives smart-card readers itself through
+  usbfs, so a reader's interface is left unclaimed. With the feature on,
+  `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The
   node is clone-on-open: `write` submits one raw APDU via
@@ -1226,29 +1229,140 @@ also consult upstream Linux GPL sources.
   `CcidReader::get_slot_status`. The bridge depends on the narrow
   `CcidTransport` seam (production: the bound reader over xHCI);
   fixtures drive the published surface against a modelled card.
-- FIDO2 authenticators (CTAP2 over USB HID, issue #999) bind via
-  `ctap::try_bind_ctap_already_addressed`, late in the attach
-  cascade after CCID. Discrimination is the fetched HID report
-  descriptor, not the interface class: a token is an interface
-  whose report descriptor declares the FIDO Alliance usage page
-  (0xF1D0, usage 0x01) with 64-byte Input and Output fields and
-  no report IDs (`ctap::descriptor_is_fido`); every HID
-  interface on a composite device is scanned. The binder
-  requires a 64-byte interrupt IN/OUT endpoint pair
-  (`ctap::find_fido_endpoints`), issues SET_CONFIGURATION,
-  configures both endpoints, arms the first interrupt-IN TRB,
-  and registers the token in `ctap::CTAP_TOKENS` (append-only,
-  mirroring `CCID_READERS`; detach removal is the #748
-  follow-up, the slot itself is reclaimed by `detach_slot`).
-  `ctap::open_client(token)` builds a `narf_ctap2::Client` over
-  `ctap::XhciHidPipe` with `ctap::CryptoRandom` (narf-crypto's
-  HW-entropy-gated fill) for the suspend service. Interrupt-OUT
-  transfers are `Xhci::arm_interrupt_out` /
-  `Xhci::poll_interrupt_out`, the mirror of the interrupt-IN
-  pair: one Normal TRB carries one 64-byte report from the
-  endpoint's DMA page; polling reports bytes consumed or a
-  controller error; the pipe bounds its poll loop and surfaces
-  exhaustion as a CTAP Timeout rather than blocking.
+- FIDO2 authenticators (CTAP2 over USB HID, issue #999) are no
+  longer bound by a cascade binder. A FIDO interface is a HID
+  interface whose report descriptor declares the FIDO Alliance usage
+  page (0xF1D0, usage 0x01) with 64-byte Input and Output fields and
+  no report IDs (`ctap::descriptor_is_fido`).
+  - Like every HID interface no input binder takes, it binds as raw
+    HID in `attach::settle_outcome` and is served as `/dev/hidrawN`.
+  - `ctap::fido_devices` finds authenticators in the
+    `narf_input::hid_device` registry.
+  - `ctap::open_client(dev)` builds a `narf_ctap2::Client` over
+    `ctap::HidDevicePipe` with `ctap::CryptoRandom` (narf-crypto's
+    HW-entropy-gated fill) for the suspend service.
+  - The pipe reads 64-byte input reports from a
+    `HidDevice::subscribe` sink, pumping the endpoint itself
+    (`hid::raw::pump_device`), so it works with no other task running.
+    It writes `0 + report` through the transport's `output_report`.
+    The interrupt pair therefore has one owner, the raw binding.
+- The device registry (`usbdev`) keeps Linux's `struct usb_device`
+  bookkeeping for every addressed device:
+  - **Bus numbers:** per controller in probe order, the USB 2 root hub
+    then the USB 3 root hub when there are USB 3 ports.
+  - **Root-hub-relative port numbers.**
+  - **`choose_devnum` device numbers:** round-robin from `devnum_next`,
+    with the root hub at 1.
+  - **`devpath` and the name `busnum-devpath`.**
+  - **Descriptors and strings:** the device descriptor, every
+    configuration descriptor, and the manufacturer, product and serial
+    strings.
+  - **The active configuration, per-interface claims and current
+    alternate settings.** A claim is held by a usbfs file or by a kernel
+    driver under its Linux name (`attach::driver_name`: `usbhid`,
+    `usb-storage`, `cdc_acm`, `hub`, ...; `narf_*` for binders Linux
+    leaves to libusb).
+  - **Lifecycle:** `dispatch_after_address` registers the device after
+    its device descriptor read; `release_slot` and controller recovery
+    remove it, and removal runs usbfs's `usbdev_remove`.
+- `usb_sysfs` publishes the Linux topology under the xHCI's PCI
+  kobject:
+  - **Root hubs (`usbN`):** published at Stage::Late, so empty buses
+    are listed. Each carries Linux's synthesized identity: 1d6b:0002 /
+    0003, bcdDevice = kernel version, "Linux <release> xhci-hcd", and
+    the PCI slot as serial. Its `descriptors` are
+    `usbdev::root_hub_descriptors` (single TT, remote wakeup, 4-byte
+    status endpoint).
+  - **Devices:** nested under their hub, with the `usb_device`
+    attributes of drivers/usb/core/sysfs.c and a uevent carrying
+    MAJOR=189/MINOR/DEVNAME=bus/usb/BBB/DDD/DEVTYPE/PRODUCT/TYPE/
+    BUSNUM/DEVNUM.
+  - **Interfaces of the active configuration (`<dev>:<cfg>.<if>`):**
+    their attributes, `modalias`, and the INTERFACE/MODALIAS uevent.
+  - **Links and events:** devices and root hubs are linked from
+    `/sys/bus/usb/devices` and `/sys/dev/char/189:<minor>`; interfaces
+    from `/sys/bus/usb/devices`. Add and remove uevents are emitted.
+  - **Removal:** it follows the recorded publish path, children first.
+- `attach::settle_outcome` runs after the class cascade:
+  - **A binder took the device:** it records configuration index 0 (the
+    binders' choice), claims the interfaces the binder holds (its one
+    HID interface for HID binders, every non-HID interface otherwise),
+    then binds the remaining HID interfaces as raw HID.
+  - **No binder took it:** the device is no longer released. Its
+    configuration is chosen as `usb_choose_configuration` chooses (the
+    first whose first interface is not vendor-specific on a non-vendor
+    device, else the first) and set. Its HID interfaces bind as raw HID
+    (`AttachOutcome::RawHid`), or the device stays addressed for usbfs
+    (`AttachOutcome::Unbound`). The supervisor counts both as claimed.
+- `hid::raw` is usbhid's raw half:
+  - `parse_interface` reads the HID class descriptor and the interrupt
+    endpoints.
+  - Binding: SET_IDLE(0), GET_DESCRIPTOR(REPORT), configure the
+    endpoints, arm interrupt IN for `hid_find_max_report` bytes (at
+    least the max packet). It then registers a `hid_device` with
+    usbhid's identity: name manufacturer + product or `HID vvvv:pppp`,
+    phys `usb-<pci slot>-<devpath>/input<n>`, uniq the serial, version
+    bcdHID, the country code, and `sysfs_parent` the interface's path.
+  - `UsbHidTransport` is `usbhid_output_report` (interrupt OUT, a
+    leading 0 ID not sent but counted) and `usbhid_raw_request`
+    (GET/SET_REPORT, with ID 0 kept in `buf[0]` and counted).
+  - Raw-bound devices stay out of idle suspend.
+  - The boot-keyboard binding also registers its interface
+    (`register_binder_interface`) and tees every report, so a
+    keyboard's hidraw node exists beside its evdev node (a YubiKey's
+    OTP interface for ykman).
+  - `unbind_interface` releases one interface's binding (usbfs
+    DISCONNECT).
+- `usbfs` is Linux `drivers/usb/core/devio.c`:
+  - **Nodes:** `/dev/bus/usb/BBB/DDD` for every root hub (devnum 1) and
+    registered device, from a devfs provider (`usbfs-devfs`,
+    Stage::Subsys). Character major 189, minor `(bus - 1) * 128 +
+    dev - 1`. Nodes start at devtmpfs's `0600 root:root`; udev's mode,
+    owner and `system.posix_acl_access` persist per device until it is
+    removed.
+  - **`read`:** the device descriptor, then every configuration
+    descriptor, at the file offset.
+  - **ioctls,** each with devio.c's checks in its order: CONTROL, BULK,
+    SUBMITURB, DISCARDURB, REAPURB, REAPURBNDELAY, CLAIMINTERFACE,
+    RELEASEINTERFACE, SETINTERFACE, SETCONFIGURATION, GETDRIVER,
+    CONNECTINFO, CONNINFO_EX, GET_SPEED, CLEAR_HALT, RESETEP, RESET,
+    IOCTL (DISCONNECT, CONNECT, the hub's HUB_PORTINFO), DISCONNECT_CLAIM,
+    CLAIM_PORT, RELEASE_PORT, DISCSIGNAL, DROP_PRIVILEGES,
+    GET_CAPABILITIES, ALLOC_STREAMS, FREE_STREAMS, FORBID_SUSPEND,
+    ALLOW_SUSPEND, WAIT_FOR_RESUME. A fd without write access gets EPERM;
+    reaping works after disconnect; unknown commands are ENOTTY.
+  - **GET_CAPABILITIES** is ZERO_PACKET, NO_PACKET_SIZE_LIM,
+    REAP_AFTER_DISCONNECT, DROP_PRIVILEGES and CONNINFO_EX: no MMAP, no
+    streams, no scatter-gather, no BULK_CONTINUATION (as on every xHCI
+    host), and no SUSPEND (suspend ioctls behave as on a `!CONFIG_PM`
+    kernel).
+  - **URB engine (`usbfs::engine`):** per-file queue, ordered per
+    endpoint; the oldest URB of an endpoint is posted in page-sized TDs
+    with bulk receipts (`Xhci::begin_bulk_*` / `begin_interrupt_*`), so
+    every URB can be stopped (DISCARDURB, a sync timeout, release). A
+    short IN packet ends a URB (`-EREMOTEIO` with SHORT_NOT_OK);
+    ZERO_PACKET adds a zero-length packet. A failed bulk transfer unlinks
+    its queued continuation URBs (`-ECONNRESET`) and refuses more with
+    EREMOTEIO until a new transfer. A STALL, babble or transaction error
+    recovers the endpoint's host side (Reset Endpoint + Set TR Dequeue)
+    before the next TD, as the Linux xHCI driver does. Disconnect gives
+    every pending URB back with `-ESHUTDOWN`. Buffers count against a
+    16 MiB budget (`usbfs_memory_mb`), ENOMEM beyond it. Control URBs and
+    CONTROL run to completion in the submitting ioctl.
+  - **Endpoints:** an interface's current-setting endpoints are
+    programmed when a file first claims it; SETINTERFACE and
+    SETCONFIGURATION drop the old endpoints (`Xhci::drop_endpoints_*`)
+    and program the new.
+  - **Root hubs:** standard requests are emulated (`rh_call_control`'s
+    device part); interface 0 belongs to `hub`, which answers
+    HUB_PORTINFO.
+  - **Gaps (`// LINUX-GAP`):** no isochronous URBs (EINVAL after Linux's
+    checks); RESET of a device is EIO (no in-place port reset yet);
+    control stages keep the controller's fixed 250 ms bound; DISCSIGNAL
+    and URB `signr` signals are not sent; kernel drivers are not probed
+    against a new configuration; DISCONNECT releases only raw-HID
+    bindings (EBUSY for a device-wide binding); NARF hub enumeration
+    does not skip a claimed port.
 - WBDI fingerprint readers (issue #919): `wbdi` recognises a
   sensor by its MS OS 2.0 Compatible-ID (WINUSB with a WBDI
   sub-compatible-ID) and runs last in the attach cascade, after

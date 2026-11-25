@@ -1591,6 +1591,8 @@ pub mod rmi4;
 /// The evdev layer sits between drivers (which call `evdev::ROUTER.dispatch`)
 /// and consumers (which call `evdev::ROUTER.open_reader`).
 pub mod evdev;
+pub mod hid_device;
+pub mod hid_scan;
 
 /// Userspace synthetic input device (analogous to Linux uinput).
 pub mod uinput;

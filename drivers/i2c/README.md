@@ -34,6 +34,17 @@ module bridges the gap to ACPI: it installs a dispatcher so that AML
 through the I2C registry, an inverted-dependency hook that avoids a cycle
 between the ACPI interpreter and this crate.
 
+Beside raw I2C transfers, the bus contract carries SMBus protocol
+transactions and an adapter functionality mask, modelled on Linux's
+`smbus_xfer` / `functionality`: controllers that only speak raw I2C get
+the SMBus sizes emulated, while SMBus-only hosts (piix4, i801) run them
+natively. The piix4 driver follows Linux for AMD KERNCZ FCHs: the main
+host's multiplexed ports, the auxiliary host, the SMBus semaphore and
+the IMC handshake. A small client registry stands in for Linux's
+`i2c_client`, and `spd` instantiates SPD EEPROM clients from SMBIOS
+memory devices (`i2c_register_spd`) for drivers such as hwmon's
+`spd5118` to bind.
+
 Probing is initcall-driven; the per-controller probes run as independent
 initcalls so a no-match or failure in one backend never gates the
 others, and a platform with no matching controller reports absence

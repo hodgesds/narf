@@ -7,9 +7,11 @@
 //!
 //! - `name`             — chip name, e.g. `"k10temp\n"`
 //! - `temp<i>_input`   — temperature in millidegrees C
-//! - `temp<i>_label`   — human label, e.g. `"Tdie\n"`
-//! - `temp<i>_max`     — high threshold (only when the device reports one)
-//! - `temp<i>_crit`    — critical threshold (only when the device reports one)
+//! - `temp<i>_label`   — human label, e.g. `"Tdie\n"` (unless the device
+//!   says the channel has none)
+//! - `temp<i>_{enable,lcrit,min,max,crit}` and
+//!   `temp<i>_{lcrit,min,max,crit}_alarm` — each only when the device
+//!   publishes it ([`HwmonDevice::temp_attr_mode`]), read-only or writable
 //! - `fan<i>_input`    — tachometer reading in RPM
 //! - `fan<i>_label`    — fan label
 //! - `pwm<i>`          — writable fan duty 0–255 (only for channels the
@@ -18,14 +20,18 @@
 //! - `in<i>_label`     — voltage label
 //! - `update_interval` — milliseconds between hardware reads (stub 1000)
 //!
-//! ## Thresholds
+//! ## Thresholds, alarms and enable
 //!
-//! `temp<i>_max` / `temp<i>_crit` are published only when
-//! [`HwmonDevice::temp_limits`] reports a real hardware limit for the
-//! label (a Tjmax MSR, a programmed limit register) — never a
-//! bridge-invented constant (#909). The show re-reads the limit live,
-//! so a failed limit read renders empty under the same rule as a
-//! failed sensor read below.
+//! The temperature attributes beyond `_input`/`_label` follow Linux's
+//! `hwmon_ops`: the device's [`HwmonDevice::temp_attr_mode`] decides
+//! which exist and whether they are writable (`is_visible`),
+//! [`HwmonDevice::read_temp_attr`] renders them and
+//! [`HwmonDevice::write_temp_attr`] stores them. A limit is therefore
+//! always the hardware's own (a Tjmax MSR, a programmed limit register),
+//! never a bridge-invented constant (#909). Shows re-read live, so a
+//! failed read renders empty under the same rule as a failed sensor
+//! read below. Stores parse the buffer as Linux `kstrtol` does
+//! (`-EINVAL` / `-ERANGE`) and return the driver's errno.
 //!
 //! ## Fan control
 //!
@@ -248,39 +254,104 @@ fn add_temp_attrs(
         });
     }
 
-    // temp<n>_label
-    {
+    // temp<n>_label — only for channels that carry one (HWMON_T_LABEL).
+    if dev.temp_label_visible(label_owned) {
         let attr_name = intern(format!("temp{}_label", n));
         kobject_add_attr(kobj, attr_name, move || format!("{}\n", label_owned));
     }
 
-    // temp<n>_max / temp<n>_crit — published only when the device
-    // reports a real hardware limit for this label (#909); there is
-    // no generic TJ_MAX constant to fall back on. Existence is probed
-    // once here; the show re-reads the limit live and renders empty
-    // if it has become unreadable (the failed-read rule above).
-    // Linux: hwmon_temp_max (drivers/hwmon/hwmon.c:186),
-    //        hwmon_temp_crit (drivers/hwmon/hwmon.c:194).
-    let (max_mc, crit_mc) = dev.temp_limits(label_owned);
-    if max_mc.is_some() {
-        let attr_name = intern(format!("temp{}_max", n));
-        let dev2 = dev.clone();
-        kobject_add_attr(kobj, attr_name, move || {
-            match dev2.temp_limits(label_owned).0 {
-                Some(mc) => format!("{}\n", mc),
-                None => String::new(),
+    // temp<n>_{enable,lcrit,min,max,crit,*_alarm} — exactly the
+    // attributes the device's `temp_attr_mode` reports (#909: a limit
+    // or alarm is the hardware's own, never an invented constant).
+    // Shows read live and render empty on a failed read; stores parse
+    // with `kstrtol` and pass the driver's errno through.
+    // Linux: hwmon_attr_show / hwmon_attr_store (drivers/hwmon/hwmon.c).
+    for attr in crate::TempAttr::ALL {
+        let Some(mode) = dev.temp_attr_mode(label_owned, attr) else {
+            continue;
+        };
+        let attr_name = intern(format!("temp{}_{}", n, attr.suffix()));
+        let dev_show = dev.clone();
+        let show = move || match dev_show.read_temp_attr(label_owned, attr) {
+            Some(v) => format!("{}\n", v),
+            None => String::new(),
+        };
+        match mode {
+            crate::AttrMode::ReadOnly => kobject_add_attr(kobj, attr_name, show),
+            crate::AttrMode::ReadWrite => {
+                let dev_store = dev.clone();
+                kobject_add_writable_attr(kobj, attr_name, show, move |buf| {
+                    let value = kstrtol(buf)?;
+                    dev_store
+                        .write_temp_attr(label_owned, attr, value)
+                        .map_err(hwmon_error_to_fs)
+                });
             }
-        });
+        }
     }
-    if crit_mc.is_some() {
-        let attr_name = intern(format!("temp{}_crit", n));
-        let dev2 = dev.clone();
-        kobject_add_attr(kobj, attr_name, move || {
-            match dev2.temp_limits(label_owned).1 {
-                Some(mc) => format!("{}\n", mc),
-                None => String::new(),
-            }
-        });
+}
+
+/// Linux `kstrtol(buf, 10, &val)` (lib/kstrtox.c) over a sysfs store
+/// buffer: an optional `+`/`-`, decimal digits, at most one trailing
+/// newline, ending at the first NUL. No digits or trailing junk is
+/// `-EINVAL`; a value outside `long` is `-ERANGE`.
+pub(crate) fn kstrtol(buf: &[u8]) -> Result<i64, FsError> {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = &buf[..end];
+    let (negative, digits) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let mut acc: u64 = 0;
+    let mut overflow = false;
+    let mut n = 0usize;
+    for &c in digits {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        match acc
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(c - b'0')))
+        {
+            Some(v) => acc = v,
+            None => overflow = true,
+        }
+        n += 1;
+    }
+    if overflow {
+        return Err(FsError::OutOfRange);
+    }
+    if n == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut rest = &digits[n..];
+    if rest.first() == Some(&b'\n') {
+        rest = &rest[1..];
+    }
+    if !rest.is_empty() {
+        return Err(FsError::InvalidData);
+    }
+    if negative {
+        if acc > 1u64 << 63 {
+            return Err(FsError::OutOfRange);
+        }
+        Ok((acc as i64).wrapping_neg())
+    } else {
+        i64::try_from(acc).map_err(|_| FsError::OutOfRange)
+    }
+}
+
+/// The errno each [`crate::HwmonError`] stands for, as an `FsError`.
+fn hwmon_error_to_fs(e: crate::HwmonError) -> FsError {
+    use crate::HwmonError;
+    match e {
+        HwmonError::InvalidValue => FsError::InvalidData, // EINVAL
+        HwmonError::NoResponse => FsError::NoDeviceAddress, // ENXIO
+        HwmonError::Timeout => FsError::TransferTimedOut, // ETIMEDOUT
+        HwmonError::Busy => FsError::Busy,                // EBUSY
+        HwmonError::Again => FsError::WouldBlock,         // EAGAIN
+        HwmonError::Io => FsError::Io(narf_block::BlockError::IOError), // EIO
     }
 }
 

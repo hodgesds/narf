@@ -42,6 +42,13 @@ pub mod uac;
 pub mod uac_card;
 pub mod uas;
 pub mod uhci;
+pub mod usb_sysfs;
+#[cfg(feature = "kernel-test")]
+mod usb_sysfs_tests;
+pub mod usbdev;
+#[cfg(feature = "kernel-test")]
+mod usbdev_tests;
+pub mod usbfs;
 pub mod uvc;
 pub mod wbdi;
 pub mod xhci;
@@ -77,6 +84,21 @@ pub fn register_initcalls() {
     class_registry::install_module_host();
     // Install devfs hooks so /dev/ttyUSB<N> nodes resolve.
     // Linux ref: `drivers/usb/serial/usb-serial.c:usb_serial_register_drivers`.
+    // /sys/devices/.../usbN for every root hub, once the controllers have
+    // probed (Stage::Device), so empty buses are listed too.
+    // /dev/bus/usb (usbfs): resolves per lookup, so one registration
+    // serves devices that attach later.
+    narf_init::register(Stage::Subsys, "usbfs-devfs", || {
+        usbfs::register_devfs();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Late, "usb-sysfs-root-hubs", || {
+        if usb_sysfs::publish_all_root_hubs() == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
     narf_init::register(Stage::Subsys, "usb-serial-devfs", || {
         narf_filesystem::devfs::install_tty_usb_hooks(
             serial::devfs_bridge::lookup_tty_usb,
@@ -343,6 +365,9 @@ fn pump_bound_devices(controller: &xhci::Xhci) {
     // and a bound-but-unpumped generic device would be silently
     // dead. Pump it alongside the other HID classes.
     hid::generic::pump_all(controller);
+    // Raw HID (FIDO, vendor HID): every interface no input binder
+    // took, feeding /dev/hidrawN.
+    hid::raw::pump_all(controller);
     cdc_acm::pump_all(controller);
     serial::port::pump_all(controller);
     xpad::pump_all(controller);
@@ -649,7 +674,8 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     | AttachOutcome::WbdiFingerprint
                     | AttachOutcome::Fingerprint
                     | AttachOutcome::CcidReader
-                    | AttachOutcome::CtapToken
+                    | AttachOutcome::RawHid
+                    | AttachOutcome::Unbound
                     | AttachOutcome::UsbClassDriver
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
@@ -819,7 +845,8 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                         | AttachOutcome::WbdiFingerprint
                         | AttachOutcome::Fingerprint
                         | AttachOutcome::CcidReader
-                        | AttachOutcome::CtapToken
+                        | AttachOutcome::RawHid
+                        | AttachOutcome::Unbound
                         | AttachOutcome::UsbClassDriver
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;

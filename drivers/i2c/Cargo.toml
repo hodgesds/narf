@@ -24,6 +24,8 @@ narf-scheduler    = { path = "../../scheduler" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-bus          = { path = "../../bus" }
 narf-capabilities = { path = "../../capabilities" }
+narf-time         = { path = "../../time" }
+narf-firmware-smbios = { path = "../../firmware/smbios" }
 async-trait       = "0.1"
 
 [features]

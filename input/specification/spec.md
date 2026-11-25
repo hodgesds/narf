@@ -110,6 +110,30 @@ All code is derived strictly from the references below.
   Device Control byte builder + Device Status decoder, F$11 finger
   parser (12-bit X/Y packing, touch widths) and multi-finger
   Touchpad Report decoder. F$34 command-code constants.
+- `hid_device`: the transport-neutral HID device registry (Linux
+  `struct hid_device` + `hid_ll_driver`). A transport registers each
+  bound device with `register(HidInfo, Arc<dyn HidTransport>)` —
+  bus, 32-bit vendor/product/version, country, name/phys/uniq, the
+  raw report descriptor (capped at `HID_MAX_DESCRIPTOR_SIZE`) and the
+  sysfs path of its transport parent (empty = publisher's platform
+  fallback) — tees every input report, unparsed and report ID first,
+  into `HidDevice::report_in`, and calls `unregister` on unbind.
+  `HidTransport::output_report` is `hid_hw_output_report`
+  (`Err(Unsupported)` = no interrupt-OUT path, which makes hidraw fall
+  back to SET_REPORT); `raw_request` is `hid_hw_raw_request` with
+  `buf[0]` the report ID. `HidIoError` carries the transport errno.
+  The one change hook (`set_change_hook`, installed by the
+  filesystem's hidraw publisher) sees `Added` / `Removed`, with
+  devices registered before it replayed; it runs with no registry
+  lock held.
+- `hid_scan::scan_group(rdesc, vendor, product)`: Linux
+  `hid_scan_report` — the `HID_GROUP_*` a report descriptor implies
+  (GENERIC, MULTITOUCH for a non-constant Contact ID input,
+  MULTITOUCH_WIN_8 with the Win8 certification feature, SENSOR_HUB,
+  VIVALDI, and the Wacom / Synaptics-RMI vendor rules). It is the `g`
+  field of the HID device's `MODALIAS`. Malformed items are skipped as
+  Linux skips them. LINUX-GAP: no quirk table, so
+  `HID_QUIRK_HAVE_SPECIAL_DRIVER` devices are scanned too.
 
 ### Out of scope (deferred)
 - F$12 next-generation touchpad function (extends F$11 with

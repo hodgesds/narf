@@ -49,6 +49,9 @@ narf-linux-perf-uapi = { path = "../compat/linux-perf-uapi" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-modules      = { path = "../modules" }
 narf-power        = { path = "../power" }
+# hidraw ABI tests: a CTAPHID authenticator behind a scripted HID transport.
+narf-ctap2        = { path = "../ctap2", optional = true }
+async-trait       = { version = "0.1", optional = true }
 
 [features]
 # Native Bootstrap/RingKick ABI and per-task sessions. Off by default.
@@ -83,11 +86,13 @@ hotpath-bench = []
 
 # In-kernel test harness build. The `abi_*_tests.rs` modules are compiled
 # unconditionally (they register into the `narf.tests` link section), so
-# this feature does NOT gate them. What it gates is
+# this feature does NOT gate them — except `abi_hidraw_tests`, whose FIDO
+# authenticator (`narf-ctap2/fixture-token`) must never reach a production
+# build. What it otherwise gates is
 # `handlers::with_kernel_buffers` — the narrowly-scoped opt-in that lets a
 # test hand a kernel-half pointer to a syscall handler. Off (and therefore
 # a no-op, with no bypass code compiled at all) in every production build.
-kernel-test = ["narf-scheduler/kernel-test", "narf-abi/kernel-test", "dep:narf-ipc"]
+kernel-test = ["narf-scheduler/kernel-test", "narf-abi/kernel-test", "dep:narf-ipc", "dep:narf-ctap2", "narf-ctap2/fixture-token", "dep:async-trait"]
 
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
 # don't trip the unexpected_cfgs lint. The frame crate's

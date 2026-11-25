@@ -1294,6 +1294,8 @@ fn gen_devices() -> Vec<u8> {
     let _ = writeln!(s, "226 drm");
     let _ = writeln!(s, "234 nvme");
     let _ = writeln!(s, "235 ttyUSB");
+    // `hidraw_init` `alloc_chrdev_region(..., "hidraw")`.
+    let _ = writeln!(s, "{} hidraw", crate::hidraw::HIDRAW_MAJOR);
     let _ = writeln!(s);
     let _ = writeln!(s, "Block devices:");
     let _ = writeln!(s, "  1 ramdisk");
@@ -1741,11 +1743,15 @@ fn smoke_devices_has_both_sections() -> TestResult {
         Ok(t) => t,
         Err(_) => return TestResult::Fail("devices not utf-8"),
     };
-    if text.contains("Character devices:") && text.contains("Block devices:") {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("devices: missing Character or Block section")
+    if !text.contains("Character devices:") || !text.contains("Block devices:") {
+        return TestResult::Fail("devices: missing Character or Block section");
     }
+    // `hidraw_init`'s `alloc_chrdev_region` name, at the major the hidraw
+    // nodes report.
+    if !text.contains("\n243 hidraw\n") {
+        return TestResult::Fail("devices: no 243 hidraw entry");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
     "filesystem/procfs/aggregate",

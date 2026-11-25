@@ -21,8 +21,8 @@
 //! `notify(0x80)` which fans out to all subscribers. Polling
 //! consumers (e.g. UI status bar) call `present()` instead.
 
-use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_aml::eval::evaluate_method;
@@ -100,7 +100,7 @@ pub fn present() -> bool {
 
 // ── Notification fan-out ────────────────────────────────────────────
 
-type Subscriber = Box<dyn Fn(&AcEvent) + Send + Sync + 'static>;
+type Subscriber = Arc<dyn Fn(&AcEvent) + Send + Sync + 'static>;
 
 /// Subscribers + cached last-known-state. The cache lets `notify`
 /// fire the right event variant (Plugged vs Unplugged) without an
@@ -134,7 +134,7 @@ pub fn subscribe<F>(cb: F)
 where
     F: Fn(&AcEvent) + Send + Sync + 'static,
 {
-    STATE.lock().subscribers.push(Box::new(cb));
+    STATE.lock().subscribers.push(Arc::new(cb));
 }
 
 /// Number of registered subscribers. Mostly for tests.
@@ -205,16 +205,32 @@ pub fn notify_with(event: AcEvent) {
 }
 
 fn fanout(event: &AcEvent) {
-    // Hold the lock across callbacks. AC events are low-volume
-    // (plug/unplug) and the documented contract says "keep
-    // callbacks short". Snapshot-then-drop would require either
-    // cloning `Box<dyn Fn>` (not cheap; trait objects aren't Clone
-    // without an explicit impl) or stealing the Vec out and
-    // restoring it after — fragile if a callback re-subscribes.
-    let g = STATE.lock();
-    for cb in &g.subscribers {
+    // Snapshot the subscribers and call them with the lock dropped: the
+    // lock masks interrupts, and a subscriber may evaluate AML or talk
+    // to firmware (amd_pmf re-pushes power limits). A callback that
+    // subscribes again during delivery lands in the next event.
+    let subscribers: Vec<Subscriber> = STATE.lock().subscribers.clone();
+    for cb in &subscribers {
         cb(event);
     }
+}
+
+/// `acpi_ac_notify`: every Notify on an AC adapter (status change 0x80,
+/// bus check, device check, or anything else — Linux falls through to the
+/// same refresh) re-reads `_PSR` and fans the result out.
+fn ac_notify(_target: &str, _value: u64) {
+    notify();
+}
+
+/// Route ACPI `Notify` on every `ACPI0003` adapter to [`notify`], as
+/// Linux's AC driver does. Returns how many adapters were wired. Call
+/// once, after the namespace is loaded.
+pub fn install_notify_handlers() -> usize {
+    let adapters = enumerate();
+    for adapter in &adapters {
+        narf_aml::sync::register_notify_handler(&adapter.path, ac_notify);
+    }
+    adapters.len()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

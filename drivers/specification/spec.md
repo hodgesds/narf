@@ -280,6 +280,248 @@ Existing AMD FCH, LPSS, PL022 and Cadence legacy methods do not implement
 this contract by implication. CYW43439 diagnostics require the actual
 whole-CS/shared-pad session and refuse the unsupported default.
 
+### 3.8 SMBus transactions, I2C clients and SPD sensors
+
+`narf_drivers_i2c::I2cBus` carries Linux's adapter split:
+
+- `transfer` runs raw I2C messages (`master_xfer`).
+- `smbus_xfer(addr, SmbusOp)` runs one SMBus protocol transaction:
+  quick, receive/send byte, byte/word data, block read/write.
+- `functionality()` returns an `I2cFunc` mask, bit-compatible with
+  `I2C_FUNC_*`.
+
+The default `smbus_xfer` is `smbus::emulate`, which builds the messages
+`i2c_smbus_xfer_emulated` builds and runs them through `transfer`. The
+default `functionality` is `I2cFunc::EMULATED`: raw I2C plus every SMBus
+size except quick and block read. SMBus-only hosts override both.
+
+- **piix4** has no raw I2C: `transfer` returns `Unsupported`.
+- **i801** reports the sizes its `transfer` mapping executes, without raw I2C.
+
+`I2cError` maps one-to-one onto Linux errnos:
+
+| `I2cError` | Linux errno |
+|---|---|
+| `Nack` | `-ENXIO` |
+| `Timeout` | `-ETIMEDOUT` |
+| `Busy` | `-EBUSY` |
+| `Unsupported` | `-EOPNOTSUPP` |
+| `InvalidArgs` | `-EINVAL` |
+| `Protocol` | `-EPROTO` |
+| `Abort` | `-EIO` (piix4 failed transaction or bus collision) |
+| `ArbLost` | `-EAGAIN` |
+
+**The piix4 KERNCZ (`1022:790b`) driver** ports `i2c-piix4.c`:
+
+- **Base discovery.** The SMBus host base comes from PM DecodeEn for
+  revision ≥ `0x49`, otherwise from PM `0x2c`/`0x28`. The revision is read
+  from config offset `0x08`.
+- **PM register access.** Revision ≥ `0x51` reaches the PM registers
+  through the `0xFED80300` MMIO window, mapped with `ioremap` because
+  sysfs reads run on user page tables. Lower revisions use the
+  `0xCD6`/`0xCD7` index/data pair.
+- **Adapters.** It registers Linux's adapters under Linux's names:
+  `SMBus PIIX4 adapter port 0 at <base>`, `… port 2 at <base>` and, unless
+  `\_SB.ASFC` exists, the aux host `… port 1 at <base|0x20>`.
+- **Port multiplexing.** The two main-host adapters share one host lock.
+  Each of their transactions:
+  1. takes the SMBSLVCNT semaphore (500 tries, then `Busy`);
+  2. selects its port in PM `0x02` bits 4:3;
+  3. runs;
+  4. restores the previous selection;
+  5. releases the semaphore.
+- **IMC handshake.** When LPC `00:14.3` config `0x40` bit 7 reports an
+  active IMC, a block transaction is bracketed by IMC mailbox command
+  `0x96`. A failed handshake turns notification off for good.
+
+**I2C clients** (`client`) model `struct i2c_client`:
+
+- `new_client_device` rejects the general-call address `0x00` and
+  anything over 7 bits (`InvalidArgs`), then occupied addresses (`Busy`).
+- `new_scanned_device` probes candidates with `i2c_default_probe`:
+  receive byte in `0x30-0x37` and `0x50-0x5f`, quick write elsewhere.
+- Client drivers enumerate `clients_of_kind`. A client stays registered
+  whether or not a driver binds it.
+
+`spd::register_spd_write_enable` is `i2c_register_spd`. From the SMBIOS
+type 17 records it picks the client type:
+
+| Memory types | Client type |
+|---|---|
+| DDR, DDR2, DDR3, LPDDR, LPDDR2, LPDDR3 | `spd` |
+| DDR4, LPDDR4 | `ee1004` |
+| DDR5, LPDDR5 | `spd5118` (only on a write-enabled bus) |
+
+It then probes `0x50..0x50+min(slots, 8)` until every populated module
+has answered. It does nothing when the memory types are mixed or no slot
+is populated. piix4 runs it on main port 0 and on the aux adapter.
+
+**`narf_drivers_hwmon::spd5118`** binds every `spd5118` client at
+Stage::Device, after `pci-probe-all`. The probe is `spd5118_i2c_init` plus
+`spd5118_common_probe`: MR0:MR1 must read `0x5118` byte-swapped, with a
+page-0 repair through MR11, and the hub needs a temperature sensor and a
+JEP106-parity-valid vendor. A hub in 16-bit addressing mode is refused.
+
+It publishes:
+
+- `temp1_input`;
+- writable `temp1_{lcrit,min,max,crit,enable}`;
+- read-only `temp1_{lcrit,min,max,crit}_alarm`, cleared through MR19 on
+  read;
+- no `temp1_label`.
+
+The hwmon contract behind this is `HwmonDevice::temp_attr_mode` /
+`read_temp_attr` / `write_temp_attr` (Linux `is_visible` / `read` /
+`write`). It replaces `temp_limits`. Stores parse with `kstrtol`
+semantics: `-EINVAL`, or `-ERANGE` via `FsError::OutOfRange`. A driver
+error reaches `write(2)` as its Linux errno:
+
+| `HwmonError` | errno |
+|---|---|
+| `InvalidValue` | `EINVAL` |
+| `NoResponse` | `ENXIO` |
+| `Timeout` | `ETIMEDOUT`, via `FsError::TransferTimedOut` |
+| `Busy` | `EBUSY` |
+| `Again` | `EAGAIN` |
+| `Io` | `EIO` |
+
+Not ported from Linux spd5118: the nvmem EEPROM view, thermal-zone
+registration, and the register cache across suspend.
+
+### 3.9 AMD PMF static power slider (`narf_drivers_platform::amd_pmf`)
+
+`amd_pmf` ports the static-slider ("SPS") part of Linux
+`drivers/platform/x86/amd/pmf`.
+
+**Binding.** It binds the first present (`_STA` bit 0) ACPI device whose
+HID is one of `AMDI0102`, `AMDI0103`, `AMDI0105`, `AMDI0107` or `AMDI0108`.
+`AMDI0100` binds only with `amd_pmf.force_load`, which is parsed like
+`param_set_bool`. The root complex `00:00.0` must be Rembrandt, Phoenix or a
+1Ah M20H/M60H part.
+
+**SMU mailbox.** `amd_smu` holds the mailbox that `amd_pmc` and `amd_pmf`
+share:
+
+- the window is reached through SMN `0x13B102E8`/`EC`, plus `0x10000`, over
+  a 4 KiB page;
+- the protocol is `amd_*_send_cmd` with a 1 s response timeout;
+- `SmuError::{Timeout, Busy, Unknown, Failed}` cover the response codes.
+
+PMF's registers in that window are message `0xA18`, argument `0xA58` and
+response `0xA78`. SMN reads go through `narf_bus::amd_smn::read`, the single
+locked index/data path (`amd_smn_read`). k10temp and amd_pmc use it too.
+
+**Probe.** Probe reads these APMF functions:
+
+| Function | Name | Use |
+|---|---|---|
+| 0 | `VERIFY_INTERFACE` | interface version, notification mask, supported-function bitmap (bit `n-1` = function `n`) |
+| 1 | `GET_SYS_PARAMS` | heartbeat interval |
+| 9 | `STATIC_SLIDER_GRANULAR` | the power-limit tables |
+
+Every buffer is checked as `apmf_if_call_store_buffer` checks it. The
+tables come in two forms:
+
+- **Interface v1:** six limit sets, one per source (AC/DC) and mode
+  (performance / balanced / power-saver).
+- **Interface v2:** per-(source, mode) indices into the 16-entry
+  `APTS(1, i, 0)` table.
+
+The log line names the version, the bitmap, and the advertised functions
+this driver does not handle.
+
+**`amd-pmf` platform-profile backend.** The choices are `low-power`,
+`balanced` and `performance`. It starts in `balanced`, and probe pushes
+that slider's limits.
+
+A profile change follows `amd_pmf_profile_set`:
+
+1. tell the BIOS through `OS_POWER_SLIDER_UPDATE` (function 8; slider bits
+   `DC_BEST_PERF`..`AC_BETTER_BATTERY`);
+2. push the table row to the SMU:
+   - **v1:** `SET_SPL`, `FPPT`, `SPPT`, `SPPT_APU_ONLY`, `STT_MIN` and the
+     Q8.8 APU/HS2 skin limits;
+   - **v2:** `SET_PMF_PPT`, `PMF_PPT_APU_ONLY`, `STT_MIN` and the two skin
+     limits.
+
+SMU rejections are logged, and the rest of the row is still sent, as in
+Linux.
+
+**Power-source changes.** An AC transition (`narf_power::ac` events, now
+raised by ACPI `Notify(ACPI0003, 0x00/0x01/0x80)`) re-pushes the row for the
+new source, then re-tells the BIOS. The power source follows
+`power_supply_is_system_supplied`: on AC if any adapter is online, or if
+there is no adapter at all.
+
+**Heartbeats.** A v1 BIOS with a non-zero interval gets the function-4
+heartbeat every interval until a call fails. A BIOS with function 16 gets
+the v2 load heartbeat.
+
+**Locking.** Mailbox batches hold the mailbox lock. No AML method runs
+under it, and AML is evaluated with no lock held.
+
+**Deviations from Linux.**
+
+- If a table is advertised but unreadable, no limits are pushed. Linux
+  copies an uninitialised buffer in that case.
+
+**Not ported:**
+
+- Auto Mode and CnQF (their transitions and the metrics table);
+- Smart PC (it needs the PSP TEE);
+- SBIOS request notifications;
+- suspend/resume heartbeats;
+- the debugfs `current_power_limits`;
+- the hidden `quiet` / `balanced-performance` choices, which have no slot in
+  the single-backend list.
+
+### 3.10 HID transports (`narf_input::hid_device`)
+
+A HID transport registers every device it binds with the transport-neutral
+registry `narf_input::hid_device` (`register(HidInfo, Arc<dyn
+HidTransport>)`, Linux `hid_add_device`), hands every input report to
+`HidDevice::report_in` before parsing it, and calls `unregister` on unbind.
+The filesystem publishes each registered device as `/dev/hidrawN` plus its
+`/sys/bus/hid` device (filesystem spec §3.3.4).
+
+**Contract for `HidInfo::sysfs_parent`.** The path below `/sys` of the
+transport device the HID device hangs off — for USB the interface,
+`devices/pci0000:00/<root port>/<controller>/usbN/N-P/N-P:C.I`, without a
+leading `/` or `/sys/`. The publisher get-or-creates the path (it does not
+need the transport's kobjects to exist first) and puts
+`BBBB:VVVV:PPPP.NNNN/` under it. Empty means "no sysfs node": the publisher
+uses the platform parent `/sys/devices/platform/narf-hid`. A transport that
+removes its own kobjects on unplug should `unregister` first, so the HID
+device's `remove` uevents precede the parent's, as in Linux.
+
+**I2C-HID** (`narf_input_driver::i2c_hid_transport`). The bind pump
+registers each device once its report descriptor parses, with the identity
+`__i2c_hid_core_probe` gives it: `BUS_I2C`, the HID descriptor's
+vendor/product, `bcdVersion` as the version, `HID_NAME` `"<ACPI name>
+VVVV:PPPP"` and `HID_PHYS` `"i2c-<ACPI name>"`, the ACPI name being
+`acpi_device_set_name`'s `"<_HID>:%02x"` instance (`SYNA8018:00`). There is
+no I2C sysfs tree yet, so `sysfs_parent` is empty. The pump tees every
+input report it reads and unregisters when it exits.
+
+`I2cHidTransport` drives its own `I2cHidDriver` over the device's bus and
+descriptor:
+
+- `output_report` is `i2c_hid_output_report`: a plain output report to
+  `wOutputRegister`, `-ENOSYS` when `wMaxOutputLength == 0` (hidraw then
+  falls back to SET_REPORT);
+- `raw_request` is `i2c_hid_raw_request`: SET_REPORT for Feature and Output
+  reports (`-EINVAL` for Input, or when `buf[0]` is not the report ID),
+  GET_REPORT for Feature and Input (`-EINVAL` for Output), report 0's ID
+  stashed by hand.
+
+`I2cHidDriver` frames requests as i2c-hid does: report IDs of 15 and up as
+the `0x0F` sentinel plus a third byte; no ID byte for report 0; GET_REPORT
+as one write + repeated-START read sized to the transfer buffer, which is
+`i2c_hid_start`'s `max(HID_MIN_BUFFER_SIZE, longest report + ID + 2)`;
+data longer than the buffer is `-EINVAL`, and a response for another report
+ID `-EINVAL`. I2C timeouts are `ETIMEDOUT`; every other bus failure is
+`EIO` (`HidIoError` has no `EREMOTEIO`/`EAGAIN`/`EBUSY`/`EPROTO`).
+
 ## 4. ABI versioning
 
 Modelled directly on `userspace/syscall.rs`'s syscall versioning

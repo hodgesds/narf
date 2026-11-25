@@ -11,14 +11,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 use narf_bus::{BusDevice, BusDeviceCap, BusKind, MatchKind, PciMatch, ProbeError};
 use narf_capabilities::{Cap, Write};
-use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
 use crate::{registry, HwmonDevice};
-
-/// Protect the complete index/data pair, including reads from other CPUs.
-/// No allocation, callbacks or waiting takes place while this lock is held.
-static SMN_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 pub const AMD_VENDOR: u16 = 0x1022;
 // Linux's Data Fabric function-3 IDs (not function 0 or function 4).
@@ -32,8 +27,6 @@ pub const AMD_STRIX_NB: u16 = 0x16fb;
 
 /// Zen reported-temperature-control register, shared by Tctl and Tdie.
 pub const SMN_TDIE: u32 = 0x0005_9800;
-pub const SMN_INDEX_ADDR: u8 = 0x60;
-pub const SMN_DATA_ADDR: u8 = 0x64;
 pub const RAW_STEP_MC: i32 = 125;
 pub const RAW_SHIFT: u32 = 21;
 const TEMP_RANGE_SELECT: u32 = 1 << 19;
@@ -188,25 +181,10 @@ impl K10temp {
         self
     }
 
+    /// An SMN read through the root complex, on the shared locked
+    /// index/data path ([`narf_bus::amd_smn::read`]).
     pub fn smn_read(&self, smn_addr: u32) -> Option<u32> {
-        let cfg = self.cfg_phys?;
-        if cfg.raw() & 0xfff != 0 {
-            return None;
-        }
-        let index = narf_bus::ecam::ptr_for(cfg, SMN_INDEX_ADDR as u64)? as *mut u32;
-        let data = narf_bus::ecam::ptr_for(cfg, SMN_DATA_ADDR as u64)? as *const u32;
-        // Check the complete data word is mapped before dereferencing it.
-        narf_bus::ecam::ptr_for(cfg, SMN_DATA_ADDR as u64 + 3)?;
-        let raw = {
-            let _guard = SMN_LOCK.lock();
-            // SAFETY: the aligned words lie within the live ECAM mapping.
-            // SMN_LOCK serializes the entire index/data transaction.
-            unsafe {
-                core::ptr::write_volatile(index, smn_addr);
-                core::ptr::read_volatile(data)
-            }
-        };
-        (raw != u32::MAX).then_some(raw)
+        narf_bus::amd_smn::read(self.cfg_phys?, smn_addr)
     }
 }
 

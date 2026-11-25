@@ -2560,13 +2560,24 @@ fn open_impl_reserved(
                         // `lookup_open`'s `if (!dir_inode->i_op->create)
                         // { error = -EACCES; ... }` — sysfs answers EACCES.
                         narf_filesystem::FsError::Unsupported => 13,      // EACCES
-                        narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun => 32,       // EPIPE
+                        narf_filesystem::FsError::BrokenPipe
+                        | narf_filesystem::FsError::StreamXrun
+                        | narf_filesystem::FsError::Stalled => 32, // EPIPE
                         narf_filesystem::FsError::BadFileState => 77,
                         narf_filesystem::FsError::StreamSuspended => 86,
                         narf_filesystem::FsError::NoDeviceAddress => 6,
                         narf_filesystem::FsError::BadFd => 9,             // EBADF
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
                         narf_filesystem::FsError::TimedOut => 62,         // ETIME
+                        narf_filesystem::FsError::TransferTimedOut => 110, // ETIMEDOUT
+                        narf_filesystem::FsError::OutOfRange => 34,       // ERANGE
+                        narf_filesystem::FsError::NotATty => 25,          // ENOTTY
+                        narf_filesystem::FsError::Protocol => 71,         // EPROTO
+                        narf_filesystem::FsError::Overflow => 75,         // EOVERFLOW
+                        narf_filesystem::FsError::NoData => 61,           // ENODATA
+                        narf_filesystem::FsError::HostUnreachable => 113, // EHOSTUNREACH
+                        narf_filesystem::FsError::IsADirectory => 21,     // EISDIR
+                        narf_filesystem::FsError::RemoteIo => 121,        // EREMOTEIO
                         narf_filesystem::FsError::Canceled => 125,        // ECANCELED
                         narf_filesystem::FsError::Interrupted => 4,       // EINTR
                         narf_filesystem::FsError::NoSpace => 28,
@@ -5703,13 +5714,24 @@ pub(crate) fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::ArgumentListTooLong => 7, // E2BIG
         // ENOTCONN — see `FsError::NotConnected`.
         narf_filesystem::FsError::NotConnected => 107,
-        narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun => 32,
+        narf_filesystem::FsError::BrokenPipe
+        | narf_filesystem::FsError::StreamXrun
+        | narf_filesystem::FsError::Stalled => 32,
         narf_filesystem::FsError::BadFd => 9,
         narf_filesystem::FsError::BadFileState => 77,
         narf_filesystem::FsError::StreamSuspended => 86,
         narf_filesystem::FsError::NoDeviceAddress => 6,
         narf_filesystem::FsError::WouldBlock => EAGAIN,
         narf_filesystem::FsError::TimedOut => 62,  // ETIME
+        narf_filesystem::FsError::TransferTimedOut => 110, // ETIMEDOUT
+        narf_filesystem::FsError::OutOfRange => 34,  // ERANGE
+        narf_filesystem::FsError::NotATty => 25,     // ENOTTY
+        narf_filesystem::FsError::Protocol => 71,    // EPROTO
+        narf_filesystem::FsError::Overflow => 75,    // EOVERFLOW
+        narf_filesystem::FsError::NoData => 61,      // ENODATA
+        narf_filesystem::FsError::HostUnreachable => 113, // EHOSTUNREACH
+        narf_filesystem::FsError::IsADirectory => 21, // EISDIR
+        narf_filesystem::FsError::RemoteIo => 121,   // EREMOTEIO
         narf_filesystem::FsError::Canceled => 125, // ECANCELED
         narf_filesystem::FsError::Interrupted => EINTR,
     }

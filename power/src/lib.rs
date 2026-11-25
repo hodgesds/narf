@@ -392,7 +392,9 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "acpi-ac-enum", || {
-        let n = ac::enumerate().len();
+        // Plug/unplug Notify reaches `ac::notify` subscribers (amd_pmf's
+        // power-source switch) the way Linux's AC driver relays it.
+        let n = ac::install_notify_handlers();
         let _ = writeln!(narf_console::Writer, "  acpi-ac-enum: {} adapter(s)", n);
         if n == 0 {
             InitResult::NotPresent

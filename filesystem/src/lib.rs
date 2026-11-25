@@ -90,6 +90,7 @@ pub mod fs_registry;
 pub mod fsopts;
 pub mod fuse;
 pub mod fuse_conn;
+pub mod hidraw;
 pub mod inode_id;
 pub mod memfs;
 pub mod mmap_relocation;
@@ -119,6 +120,7 @@ mod devfs_block_tests;
 mod devfs_pty_tests;
 mod e2e_tests;
 mod fs_mount_e2e_tests;
+mod hidraw_tests;
 mod memfs_tests;
 mod mqueuefs_tests;
 mod page_cache_tests;
@@ -839,6 +841,12 @@ pub enum FsError {
     /// PCM underrun or overrun (EPIPE), without the SIGPIPE side effect of
     /// writing to a pipe or socket whose peer closed.
     StreamXrun,
+    /// The device stalled the request: a USB endpoint STALL, which Linux
+    /// returns as `-EPIPE` from `usb_control_msg` / `usb_interrupt_msg` and
+    /// hidraw hands to userspace unchanged. Maps to `EPIPE`, without the
+    /// SIGPIPE that [`FsError::BrokenPipe`] raises — a write to a device is
+    /// not a write to a pipe.
+    Stalled,
     /// A suspended PCM stream needs RESUME or PREPARE (ESTRPIPE).
     StreamSuspended,
     /// The operation ran against a descriptor whose open mode forbids it —
@@ -876,6 +884,43 @@ pub enum FsError {
     /// The device gave up on the work after its timeout: a GPU job that
     /// hung (Linux sets the job fence's error to `-ETIME`). Maps to `ETIME`.
     TimedOut,
+    /// A bus transaction timed out before the device answered — an SMBus
+    /// host whose busy bit never cleared, a USB control transfer past its
+    /// timeout (Linux drivers return `-ETIMEDOUT`). Distinct from
+    /// [`FsError::TimedOut`], which is the GPU-job `ETIME`. Maps to
+    /// `ETIMEDOUT`.
+    TransferTimedOut,
+    /// A numeric value does not fit the type it is parsed into — a sysfs
+    /// store whose `kstrtol` overflowed `long`. Maps to `ERANGE`.
+    OutOfRange,
+    /// The ioctl is not one this file answers, where Linux's handler
+    /// answers `-ENOTTY` (usbfs's `usbdev_do_ioctl` default). Distinct
+    /// from [`FsError::Unsupported`], which the ioctl path reports as
+    /// `EINVAL` (evdev's answer). Maps to `ENOTTY`.
+    NotATty,
+    /// The bus reported a protocol error for a transfer: a USB
+    /// transaction error (CRC, bit stuffing, missing handshake). Linux
+    /// returns `-EPROTO`. Maps to `EPROTO`.
+    Protocol,
+    /// The device sent more data than the transfer asked for (USB
+    /// babble). Linux returns `-EOVERFLOW`. Maps to `EOVERFLOW`.
+    Overflow,
+    /// The object has no data of the kind asked for: an interface with no
+    /// driver bound (usbfs `GETDRIVER` / `DISCONNECT`). Linux returns
+    /// `-ENODATA`. Maps to `ENODATA`.
+    NoData,
+    /// The device is not in a state that can reach its interfaces: a USB
+    /// device that is not configured (usbfs `checkintf`). Linux returns
+    /// `-EHOSTUNREACH`. Maps to `EHOSTUNREACH`.
+    HostUnreachable,
+    /// The operation does not apply to this kind of object: a USB reset
+    /// of a root hub (`usb_reset_device`). Linux returns `-EISDIR`. Maps to
+    /// `EISDIR`.
+    IsADirectory,
+    /// A transfer that must be one piece was refused: usbfs rejects a bulk
+    /// continuation URB after its transfer failed (`proc_do_submiturb`).
+    /// Linux returns `-EREMOTEIO`. Maps to `EREMOTEIO`.
+    RemoteIo,
     /// The work was abandoned without running to completion — a GPU job
     /// queued behind one that hung, or any job of a context that caused a
     /// hang (`-ECANCELED`). Maps to `ECANCELED`.

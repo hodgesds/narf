@@ -1,39 +1,34 @@
-//! FIDO2 authenticator binding: CTAP2 over USB HID (issue #999,
-//! power-suspend lane P3).
+//! FIDO2 authenticators: CTAP2 over raw HID (issue #999, power-suspend
+//! lane P3).
 //!
-//! A FIDO authenticator is a HID-class device whose report
+//! A FIDO authenticator is a HID-class interface whose report
 //! descriptor declares the FIDO Alliance usage page (0xF1D0) with
-//! 64-byte Input and Output reports — that descriptor check, not
-//! the interface class alone, is the discrimination: keyboards
-//! and CCID readers both fall through to their own binders.
+//! 64-byte Input and Output reports. That descriptor check, not the
+//! interface class alone, is the discrimination.
 //!
-//! This module owns only the *binding*: descriptor walk,
-//! report-descriptor fetch + FIDO verification, endpoint
-//! configuration, and the token registry. The protocol itself
-//! lives in the `narf-ctap2` crate; [`XhciHidPipe`] is the
-//! transport seam between the two (an xHCI interrupt endpoint
-//! pair, one 64-byte report per TRB — interrupt-OUT support was
-//! added to `xhci` alongside this module, mirroring the existing
-//! interrupt-IN pair).
+//! FIDO interfaces bind like every other HID interface no input binder
+//! claims: as raw HID (`hid::raw`), published in the
+//! `narf_input::hid_device` registry and served to userspace as
+//! `/dev/hidrawN` (browsers, libfido2). The interrupt endpoint pair has
+//! that one owner.
 //!
-//! Service surface for the suspend service (lane P1):
-//! [`bound_token`] hands out the registered token; [`open_client`]
-//! builds a ready `narf_ctap2::Client` over a fresh pipe with
-//! production randomness (`narf_crypto::try_fill_random_bytes`,
-//! the P0 entropy surface). Registry removal on detach follows
-//! the CCID precedent — class registries are append-only today
-//! and are covered by the #748 follow-up; the slot itself is
-//! disabled/reclaimed by `attach::detach_slot` as usual.
+//! This module finds the authenticators in that registry
+//! ([`fido_devices`]) and runs the `narf-ctap2` protocol over the same
+//! device ([`HidDevicePipe`], [`open_client`]) for the suspend service.
+//! The pipe takes input reports from the device's report stream and
+//! sends output reports through its transport.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use narf_input::hid_device::{self, HidDevice};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use narf_ctap2::ctaphid::{HidPipe, REPORT_LEN};
 use narf_ctap2::Client;
 
 use crate::hid::report_descriptor::{parse, FieldKind};
-use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
+use crate::xhci::{EndpointConfig, EndpointKind};
 
 /// HID usage page: FIDO Alliance (CTAP2 spec, HID binding).
 pub const FIDO_USAGE_PAGE: u16 = 0xF1D0;
@@ -48,8 +43,6 @@ pub const HID_DESC_TYPE_REPORT: u8 = 0x22;
 /// bmRequestType for GET_DESCRIPTOR to an interface:
 /// device-to-host | standard | interface.
 pub const RT_DEV_TO_HOST_STD_IFACE: u8 = 0x81;
-/// USB standard request SET_CONFIGURATION.
-const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 
 /// Upper bound on a FIDO report descriptor fetch (the canonical
 /// descriptor is 34 bytes; real tokens stay well under 512).
@@ -78,48 +71,27 @@ pub enum CtapError {
     NoController,
 }
 
-/// A bound FIDO authenticator.
-#[derive(Debug)]
-pub struct CtapToken {
-    pub slot_id: u8,
-    pub iface_num: u8,
-    pub in_ep: EndpointConfig,
-    pub out_ep: EndpointConfig,
-    /// Index of the xHCI controller the token is on
-    /// ([`crate::xhci::Xhci::id`]); `slot_id` is only unique within it.
-    pub controller: u8,
+/// Every registered USB HID device with the FIDO report shape, in
+/// registration order.
+pub fn fido_devices() -> Vec<Arc<HidDevice>> {
+    hid_device::devices()
+        .into_iter()
+        .filter(|d| {
+            d.info().bus == narf_input::evdev::bus::USB
+                && descriptor_is_fido(&d.info().report_descriptor)
+        })
+        .collect()
 }
 
-impl CtapToken {
-    /// DCI for the interrupt-IN endpoint (§4.8.1: num*2 + 1).
-    pub fn in_dci(&self) -> u8 {
-        (self.in_ep.ep_addr & 0x0F) * 2 + 1
-    }
-    /// DCI for the interrupt-OUT endpoint (§4.8.1: num*2).
-    pub fn out_dci(&self) -> u8 {
-        (self.out_ep.ep_addr & 0x0F) * 2
-    }
-}
-
-/// Global registry of bound FIDO tokens. Append-only, mirroring
-/// `ccid::CCID_READERS` (removal is the #748 follow-up).
-pub static CTAP_TOKENS: IrqSafeSpinLock<Vec<Arc<CtapToken>>> = IrqSafeSpinLock::new(Vec::new());
-
-/// Number of FIDO tokens currently registered.
+/// Number of FIDO authenticators currently bound.
 pub fn attached_count() -> usize {
-    CTAP_TOKENS.lock().len()
+    fido_devices().len()
 }
 
-/// The first bound token, if any (the suspend service's common
-/// case: tokens are enumerated by the service when more than one
-/// is present, via [`CTAP_TOKENS`] indices).
-pub fn bound_token(index: usize) -> Option<Arc<CtapToken>> {
-    CTAP_TOKENS.lock().get(index).cloned()
-}
-
-#[doc(hidden)]
-pub fn __reset_ctap_for_test() {
-    CTAP_TOKENS.lock().clear();
+/// The `index`th bound authenticator (the suspend service's common case
+/// is index 0).
+pub fn bound_token(index: usize) -> Option<Arc<HidDevice>> {
+    fido_devices().into_iter().nth(index)
 }
 
 // ── Configuration-descriptor walkers ────────────────────────────
@@ -279,180 +251,100 @@ impl narf_ctap2::RandomSource for CryptoRandom {
     }
 }
 
-/// The xHCI-backed HID pipe for one bound token. One TRB per
-/// 64-byte report in each direction; completions are polled
-/// (see [`MAX_POLLS_PER_REPORT`]).
-pub struct XhciHidPipe {
-    xhci: Arc<Xhci>,
-    slot_id: u8,
-    in_dci: u8,
-    out_dci: u8,
+/// Reports buffered for one pipe; a CTAPHID exchange keeps a handful
+/// in flight at most.
+const PIPE_QUEUE: usize = 64;
+
+/// A CTAPHID pipe over one registered authenticator. Input reports
+/// arrive through a [`HidDevice::subscribe`] sink; output reports go
+/// through the device's transport. Reads pump the device's endpoint
+/// themselves, so the pipe works where no other task runs (the resume
+/// path, P5).
+pub struct HidDevicePipe {
+    dev: Arc<HidDevice>,
+    queue: Arc<IrqSafeSpinLock<VecDeque<[u8; REPORT_LEN]>>>,
+    sink: u64,
 }
 
-impl core::fmt::Debug for XhciHidPipe {
+impl core::fmt::Debug for HidDevicePipe {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("XhciHidPipe")
-            .field("slot_id", &self.slot_id)
-            .field("in_dci", &self.in_dci)
-            .field("out_dci", &self.out_dci)
-            .finish_non_exhaustive()
+        f.debug_struct("HidDevicePipe")
+            .field("dev", &self.dev.sysfs_name())
+            .field("queued", &self.queue.lock().len())
+            .finish()
     }
 }
 
-impl XhciHidPipe {
-    pub fn new(xhci: Arc<Xhci>, token: &CtapToken) -> Self {
-        Self {
-            xhci,
-            slot_id: token.slot_id,
-            in_dci: token.in_dci(),
-            out_dci: token.out_dci(),
-        }
-    }
-}
-
-impl HidPipe for XhciHidPipe {
-    fn write_report(&mut self, report: &[u8; REPORT_LEN]) -> Result<(), narf_ctap2::Error> {
-        self.xhci
-            .arm_interrupt_out(self.slot_id, self.out_dci, report)
-            .map_err(|_| narf_ctap2::Error::Transport)?;
-        for _ in 0..MAX_POLLS_PER_REPORT {
-            match self
-                .xhci
-                .poll_interrupt_out(self.slot_id, self.out_dci, REPORT_LEN as u32)
-            {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => core::hint::spin_loop(),
-                Err(_) => return Err(narf_ctap2::Error::Transport),
+impl HidDevicePipe {
+    pub fn new(dev: Arc<HidDevice>) -> Self {
+        let queue: Arc<IrqSafeSpinLock<VecDeque<[u8; REPORT_LEN]>>> =
+            Arc::new(IrqSafeSpinLock::new(VecDeque::new()));
+        let q = queue.clone();
+        let sink = dev.subscribe(Arc::new(move |data: &[u8]| {
+            if data.len() != REPORT_LEN {
+                return;
             }
+            let mut report = [0u8; REPORT_LEN];
+            report.copy_from_slice(data);
+            let mut g = q.lock();
+            if g.len() == PIPE_QUEUE {
+                g.pop_front();
+            }
+            g.push_back(report);
+        }));
+        Self { dev, queue, sink }
+    }
+}
+
+impl Drop for HidDevicePipe {
+    fn drop(&mut self) {
+        self.dev.unsubscribe(self.sink);
+    }
+}
+
+impl HidPipe for HidDevicePipe {
+    fn write_report(&mut self, report: &[u8; REPORT_LEN]) -> Result<(), narf_ctap2::Error> {
+        // The FIDO shape has no report IDs: a leading 0, as a hidraw
+        // writer sends it.
+        let mut wire = [0u8; REPORT_LEN + 1];
+        wire[1..].copy_from_slice(report);
+        match narf_scheduler::block_on_spin(self.dev.transport().output_report(&wire)) {
+            Ok(n) if n == wire.len() => Ok(()),
+            Ok(_) => Err(narf_ctap2::Error::Transport),
+            Err(narf_input::hid_device::HidIoError::Timeout) => Err(narf_ctap2::Error::Timeout),
+            Err(_) => Err(narf_ctap2::Error::Transport),
         }
-        Err(narf_ctap2::Error::Timeout)
     }
 
     fn read_report(&mut self, out: &mut [u8; REPORT_LEN]) -> Result<(), narf_ctap2::Error> {
         for _ in 0..MAX_POLLS_PER_REPORT {
-            match self.xhci.poll_interrupt_in(self.slot_id, self.in_dci, out) {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => core::hint::spin_loop(),
-                Err(_) => return Err(narf_ctap2::Error::Transport),
+            if let Some(report) = self.queue.lock().pop_front() {
+                *out = report;
+                return Ok(());
             }
+            if !self.dev.is_alive() {
+                return Err(narf_ctap2::Error::Transport);
+            }
+            crate::hid::raw::pump_device(&self.dev);
+            core::hint::spin_loop();
         }
         Err(narf_ctap2::Error::Timeout)
     }
 }
 
-/// Open a CTAP2 client over a bound token, ready for the suspend
-/// service: fresh pipe + CTAPHID INIT + getInfo (inside
+/// Open a CTAP2 client over a bound authenticator, ready for the
+/// suspend service: fresh pipe + CTAPHID INIT + getInfo (inside
 /// `Client::connect`).
 pub fn open_client(
-    token: &Arc<CtapToken>,
-) -> Result<Client<XhciHidPipe, CryptoRandom>, narf_ctap2::Error> {
-    let xhci =
-        crate::xhci::controller_by_id(token.controller).ok_or(narf_ctap2::Error::Transport)?;
-    let pipe = XhciHidPipe::new(xhci, token);
-    Client::connect(pipe, CryptoRandom)
-}
-
-// ── Bind path ───────────────────────────────────────────────────
-
-/// Attempt to bind an already-addressed device as a FIDO
-/// authenticator. Returns the registry index on success.
-///
-/// **Slot lifecycle**: does NOT call `disable_slot` on failure;
-/// the dispatcher in `attach.rs` owns the slot.
-pub async fn try_bind_ctap_already_addressed(
-    xhci_dev: &Xhci,
-    slot_id: u8,
-    cfg: &[u8],
-) -> Result<usize, CtapError> {
-    if find_hid_interface(cfg).is_none() {
-        return Err(CtapError::NotFido);
-    }
-    // SET_CONFIGURATION once, before any class request (they
-    // STALL without it). Idempotent across the dispatch cascade.
-    let config_value = if cfg.len() >= 6 { cfg[5] } else { 1 };
-    xhci_dev
-        .control_out(
-            slot_id,
-            0x00,
-            STD_REQ_SET_CONFIGURATION,
-            config_value as u16,
-            0,
-            &[],
-        )
-        .await
-        .map_err(|_| CtapError::Transfer)?;
-
-    // Scan every HID interface: on composite tokens the FIDO
-    // interface is not necessarily the first HID one. The
-    // report-descriptor FIDO check is the discrimination — a
-    // non-FIDO HID interface just costs one descriptor fetch.
-    let mut scan_from = 0usize;
-    while let Some((iface_num, iface_off)) = find_hid_interface_from(cfg, scan_from) {
-        scan_from = iface_off + 9;
-        let Ok((in_ep, out_ep)) = find_fido_endpoints(cfg, iface_off) else {
-            continue;
-        };
-        let Some(report_len) = report_descriptor_length(cfg, iface_off) else {
-            continue;
-        };
-        if report_len == 0 || report_len as usize > MAX_REPORT_DESCRIPTOR {
-            continue;
-        }
-        let mut blob = alloc::vec![0u8; report_len as usize];
-        xhci_dev
-            .control_in(
-                slot_id,
-                RT_DEV_TO_HOST_STD_IFACE,
-                crate::xhci::USB_REQ_GET_DESCRIPTOR,
-                (HID_DESC_TYPE_REPORT as u16) << 8,
-                iface_num as u16,
-                &mut blob,
-            )
-            .await
-            .map_err(|_| CtapError::Transfer)?;
-        if !descriptor_is_fido(&blob) {
-            continue;
-        }
-
-        // Configure the interrupt pair and arm the first IN.
-        xhci_dev
-            .configure_endpoints(slot_id, &[in_ep, out_ep])
-            .await
-            .map_err(|_| CtapError::Transfer)?;
-        let token = Arc::new(CtapToken {
-            slot_id,
-            iface_num,
-            in_ep,
-            out_ep,
-            controller: xhci_dev.id(),
-        });
-        xhci_dev
-            .arm_interrupt_in(slot_id, token.in_dci(), REPORT_LEN as u32)
-            .map_err(|_| CtapError::Transfer)?;
-
-        {
-            use core::fmt::Write as _;
-            let _ = writeln!(
-                narf_console::Writer,
-                "  usb-ctap: FIDO token on slot={} iface={} (CTAP2/HID)",
-                slot_id,
-                iface_num,
-            );
-        }
-        let idx = {
-            let mut g = CTAP_TOKENS.lock();
-            let idx = g.len();
-            g.push(token);
-            idx
-        };
-        return Ok(idx);
-    }
-    Err(CtapError::NotFido)
+    dev: &Arc<HidDevice>,
+) -> Result<Client<HidDevicePipe, CryptoRandom>, narf_ctap2::Error> {
+    Client::connect(HidDevicePipe::new(dev.clone()), CryptoRandom)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     macro_rules! check {
@@ -611,38 +503,105 @@ mod tests {
     }
     kernel_test_in!("drivers/usb/ctap", smoke_small_endpoint_is_not_fido);
 
-    fn smoke_registry_publish_lookup() -> TestResult {
-        __reset_ctap_for_test();
-        check_eq!(attached_count(), 0, "registry starts empty");
-        let token = Arc::new(CtapToken {
-            slot_id: 7,
-            iface_num: 0,
-            in_ep: EndpointConfig {
-                ep_addr: 0x81,
-                max_packet: 64,
-                kind: EndpointKind::InterruptIn,
-                interval: 1,
-            },
-            out_ep: EndpointConfig {
-                ep_addr: 0x01,
-                max_packet: 64,
-                kind: EndpointKind::InterruptOut,
-                interval: 1,
-            },
-            controller: 0,
-        });
-        check_eq!(token.in_dci(), 3, "in DCI");
-        check_eq!(token.out_dci(), 2, "out DCI");
-        CTAP_TOKENS.lock().push(token);
-        check_eq!(attached_count(), 1, "one token registered");
-        check_eq!(
-            bound_token(0).map(|t| t.slot_id),
-            Some(7),
+    /// A transport that records output reports and answers nothing.
+    #[derive(Debug)]
+    struct Recorder {
+        sent: IrqSafeSpinLock<Vec<Vec<u8>>>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                sent: IrqSafeSpinLock::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl narf_input::hid_device::HidTransport for Recorder {
+        async fn output_report(
+            &self,
+            data: &[u8],
+        ) -> Result<usize, narf_input::hid_device::HidIoError> {
+            self.sent.lock().push(data.to_vec());
+            Ok(data.len())
+        }
+        async fn raw_request(
+            &self,
+            _id: u8,
+            _buf: &mut [u8],
+            _kind: narf_input::hid_device::ReportType,
+            _set: bool,
+        ) -> Result<usize, narf_input::hid_device::HidIoError> {
+            Err(narf_input::hid_device::HidIoError::Unsupported)
+        }
+    }
+
+    fn info(bus: u16, rdesc: &[u8]) -> narf_input::hid_device::HidInfo {
+        narf_input::hid_device::HidInfo {
+            bus,
+            vendor: 0x1050,
+            product: 0x0407,
+            report_descriptor: rdesc.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn smoke_fido_devices_come_from_the_hid_registry() -> TestResult {
+        hid_device::__reset_for_test();
+        let usb = narf_input::evdev::bus::USB;
+        let kbd = hid_device::register(
+            info(usb, KEYBOARD_REPORT_DESCRIPTOR),
+            Arc::new(Recorder::new()),
+        );
+        let recorder = Arc::new(Recorder::new());
+        let fido = hid_device::register(info(usb, FIDO_REPORT_DESCRIPTOR), recorder.clone());
+        // The same descriptor on another bus is not a USB token.
+        let _i2c = hid_device::register(
+            info(narf_input::evdev::bus::I2C, FIDO_REPORT_DESCRIPTOR),
+            Arc::new(Recorder::new()),
+        );
+        check_eq!(attached_count(), 1, "only the USB FIDO device counts");
+        check!(
+            bound_token(0).is_some_and(|d| Arc::ptr_eq(&d, &fido)),
             "lookup by index"
         );
         check!(bound_token(1).is_none(), "no second token");
-        __reset_ctap_for_test();
+
+        // A pipe writes 0 + report through the transport and reads the
+        // device's 64-byte input reports, ignoring other sizes.
+        let mut pipe = HidDevicePipe::new(fido.clone());
+        let mut report = [0u8; REPORT_LEN];
+        report[0] = 0xff;
+        check!(
+            pipe.write_report(&report).is_ok(),
+            "write through transport"
+        );
+        check!(
+            recorder
+                .sent
+                .lock()
+                .first()
+                .is_some_and(|w| w.len() == REPORT_LEN + 1 && w[0] == 0 && w[1] == 0xff),
+            "output report carries a leading 0 report ID"
+        );
+        fido.report_in(&[1, 2, 3]);
+        let mut answer = [0u8; REPORT_LEN];
+        answer[0] = 0x42;
+        fido.report_in(&answer);
+        let mut got = [0u8; REPORT_LEN];
+        check!(pipe.read_report(&mut got).is_ok(), "read the queued report");
+        check_eq!(got[0], 0x42, "the 64-byte report, not the short one");
+        drop(pipe);
+
+        hid_device::unregister(&fido);
+        check_eq!(attached_count(), 0, "an unregistered token is gone");
+        let _ = kbd;
+        hid_device::__reset_for_test();
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usb/ctap", smoke_registry_publish_lookup);
+    kernel_test_in!(
+        "drivers/usb/ctap",
+        smoke_fido_devices_come_from_the_hid_registry
+    );
 }

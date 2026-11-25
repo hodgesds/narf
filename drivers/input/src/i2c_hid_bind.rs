@@ -34,6 +34,11 @@
 //!   `narf_hid::ptp::detect`. When present, pump-decoded contact
 //!   deltas are pushed as `narf_input::PointerEvent`s on the
 //!   global ring.
+//! - Registers the device with the HID registry
+//!   (`narf_input::hid_device`, Linux `hid_add_device`) over an
+//!   [`I2cHidTransport`](crate::i2c_hid_transport::I2cHidTransport), so
+//!   it appears as `/dev/hidrawN`, and tees every input report into it
+//!   before decoding; the pump's exit unregisters it.
 //! - Loops: wait on the wake flag (set by the GPIO ISR) — or, if
 //!   no GPIO IRQ is wired, yield + retry — read one input report,
 //!   decode, push. Bus errors back off, then escalate to a
@@ -477,8 +482,10 @@ fn bind_one(path: &str) -> bool {
     // ACPI _HID names the device, the ACPI leaf names its slot in the
     // I2C topology. Vendor/product/version join them once the pump
     // reads the HID descriptor.
+    let acpi_hid = narf_aml::device_hid(path).unwrap_or_else(|| String::from("PNP0C50"));
     let identity = I2cHidIdentity {
-        acpi_hid: narf_aml::device_hid(path).unwrap_or_else(|| String::from("PNP0C50")),
+        client_name: crate::i2c_hid_transport::acpi_device_name(path, &acpi_hid),
+        acpi_hid,
         phys: {
             let leaf = path
                 .trim_end_matches('\\')
@@ -506,7 +513,20 @@ fn bind_one(path: &str) -> bool {
 #[derive(Clone, Debug)]
 struct I2cHidIdentity {
     acpi_hid: String,
+    /// The ACPI device name the I2C client takes (`SYNA8018:00`), which
+    /// names the HID device (`HID_NAME`, `HID_PHYS`).
+    client_name: String,
     phys: String,
+}
+
+/// A device's place in the HID registry for as long as its pump runs:
+/// dropping it is `hid_destroy_device`, so every pump exit unregisters.
+struct HidRegistration(Arc<narf_input::hid_device::HidDevice>);
+
+impl Drop for HidRegistration {
+    fn drop(&mut self) {
+        narf_input::hid_device::unregister(&self.0);
+    }
 }
 
 impl I2cHidIdentity {
@@ -725,6 +745,28 @@ async fn pump_task_inner(
             return;
         }
     };
+    // `i2c_hid_start`: size the transfer buffer for the longest report,
+    // then `hid_add_device` — the device joins the HID registry with the
+    // identity `__i2c_hid_core_probe` gives it. The transport drives its
+    // own driver over the same bus and descriptor.
+    driver.set_bufsize(crate::i2c_hid_transport::bufsize_for(&parsed));
+    let hid = HidRegistration(narf_input::hid_device::register(
+        crate::i2c_hid_transport::hid_info(
+            &identity.client_name,
+            &hid_desc,
+            report_desc_blob.clone(),
+        ),
+        Arc::new(crate::i2c_hid_transport::I2cHidTransport::new({
+            let mut raw = I2cHidDriver::from_descriptor(
+                driver.bus().clone(),
+                driver.addr(),
+                driver.hid_desc_register(),
+                hid_desc,
+            );
+            raw.set_bufsize(driver.bufsize());
+            raw
+        })),
+    ));
     let ptp = narf_hid::ptp::detect(&parsed);
     let touchscreen = narf_hid::touchscreen::detect(&parsed);
     let pen = narf_hid::pen::detect(&parsed);
@@ -1101,6 +1143,9 @@ async fn pump_task_inner(
         }
 
         let payload = &buf[..n];
+        // Every report, unparsed, to raw HID users first
+        // (`hid_input_report` → `hidraw_report_event`).
+        hid.0.report_in(payload);
         // Route by report id when the descriptor uses them. Keyboard,
         // consumer, PTP, Touch Screen and pen are distinct top-level
         // collections with distinct report ids, so the branches are
