@@ -51,8 +51,8 @@
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_dmc::{
-    load_program, parse_dmc_firmware_gen9, verify_loaded, DmcError, DmcId, DmcVerifyError,
-    KBL_DMC_FIRMWARE, SKL_DMC_FIRMWARE,
+    load_program, verify_loaded, DmcError, DmcId, DmcVerifyError, KBL_DMC_FIRMWARE,
+    SKL_DMC_FIRMWARE,
 };
 use crate::intel_gpu_gt::Gen9Platform;
 use crate::intel_gpu_pm::{register_dmc_firmware, PmError};
@@ -183,22 +183,35 @@ fn log_load_outcome(outcome: &Result<Gen9DmcLoaded, Gen9DmcLoadError>, family: G
 /// `assert_dmc_loaded` readback. Returns the CSS version and
 /// the program bitmask. No registry, no PM-core registration:
 /// the seam the fixture tests drive.
+#[cfg(any(test, feature = "kernel-test"))]
 pub fn load_from_bytes<M: MmioWindow + ?Sized>(
     mmio: &M,
     bytes: &[u8],
 ) -> Result<(u32, u8), Gen9DmcLoadError> {
-    let fw = parse_dmc_firmware_gen9(bytes, b'*', b'*').map_err(|error| match error {
-        // `parse_for` reports a main-less container as
-        // `NoMainProgram`; surface it as the load error of the
-        // same name instead of burying it under `Parse` —
-        // otherwise the `has_main()` gate below is unreachable
-        // (a successful parse always carries a main program)
-        // and callers cannot tell "no main program" from a
-        // malformed container. All other parse refusals stay
-        // `Parse`.
-        DmcError::NoMainProgram => Gen9DmcLoadError::NoMainProgram,
-        error => Gen9DmcLoadError::Parse(error),
-    })?;
+    load_from_bytes_max(mmio, bytes, crate::intel_gpu_dmc::SKL_DMC_MAX_FW_SIZE)
+}
+
+/// [`load_from_bytes`] under the platform's payload ceiling (Gemini Lake's
+/// is larger).
+pub fn load_from_bytes_max<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    bytes: &[u8],
+    max: usize,
+) -> Result<(u32, u8), Gen9DmcLoadError> {
+    let fw = crate::intel_gpu_dmc::parse_dmc_firmware_gen9_max(bytes, b'*', b'*', max).map_err(
+        |error| match error {
+            // `parse_for` reports a main-less container as
+            // `NoMainProgram`; surface it as the load error of the
+            // same name instead of burying it under `Parse` —
+            // otherwise the `has_main()` gate below is unreachable
+            // (a successful parse always carries a main program)
+            // and callers cannot tell "no main program" from a
+            // malformed container. All other parse refusals stay
+            // `Parse`.
+            DmcError::NoMainProgram => Gen9DmcLoadError::NoMainProgram,
+            error => Gen9DmcLoadError::Parse(error),
+        },
+    )?;
     if !fw.has_main() {
         return Err(Gen9DmcLoadError::NoMainProgram);
     }
@@ -253,7 +266,12 @@ fn load_for_display_inner<M: MmioWindow + ?Sized>(
         narf_firmware::FirmwareError::AuthorityRevoked => Gen9DmcLoadError::Revoked,
         error => Gen9DmcLoadError::Registry(error),
     })?;
-    let (version, programs) = load_from_bytes(mmio, view.bytes)?;
+    let max = if family == Gen9Platform::GeminiLake {
+        crate::intel_gpu_dmc::GLK_DMC_MAX_FW_SIZE
+    } else {
+        crate::intel_gpu_dmc::SKL_DMC_MAX_FW_SIZE
+    };
+    let (version, programs) = load_from_bytes_max(mmio, view.bytes, max)?;
     // The PM core reloads from the registered bytes at resume,
     // so the copy must outlive this call — the same shape as
     // i915 keeping the firmware in memory after init. Leaked

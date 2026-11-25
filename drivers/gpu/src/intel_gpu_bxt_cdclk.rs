@@ -13,10 +13,6 @@
 //! before (0x80000000) and after (the voltage level) a change. Nothing here
 //! has run on silicon.
 
-// The Gen9-LP display modeset is its consumer; until it lands, only the
-// fixtures call in.
-#![cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gen9_cdclk::{decimal, CdclkError, CDCLK_CTL, CDCLK_FREQ_DECIMAL_MASK};
 use crate::intel_gpu_pcode::{pcode_write, PCODE_CMD_DE_WRITE_FREQ_REQ};

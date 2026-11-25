@@ -790,6 +790,28 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.gen9_platform = Some(platform);
     }
 
+    /// Gen9 LP: `Some(true)` on Gemini Lake, `Some(false)` on Broxton.
+    /// Its DPIO PHY, port PLLs and CDCLK replace the big-core DDI tables,
+    /// DPLLs and LCPLL CDCLK; the pipe, plane and transcoder path is
+    /// Skylake's.
+    fn gen9_lp(&self) -> Option<bool> {
+        use crate::intel_gpu_gt::Gen9Platform;
+        self.gen9_platform
+            .filter(|p| p.is_lp())
+            .map(|p| p == Gen9Platform::GeminiLake)
+    }
+
+    /// The Gen9 LP port of this run's DDI.
+    fn bxt_port(&self) -> Result<crate::intel_gpu_bxt_phy::Port, ModesetError> {
+        use crate::intel_gpu_bxt_phy::Port;
+        match self.ddi {
+            Ddi::A => Ok(Port::A),
+            Ddi::B => Ok(Port::B),
+            Ddi::C => Ok(Port::C),
+            _ => Err(ModesetError::UnsupportedGeneration),
+        }
+    }
+
     pub(crate) fn set_gen9_sku_family(&mut self, family: crate::intel_gpu_gen9_ddi::SkuFamily) {
         self.gen9_sku_family = Some(family);
     }
@@ -1661,7 +1683,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// paths, whose IO wells are owned by the combo/MG PHY
     /// bring-up.
     fn enable_ddi_io_well(&mut self, ddi: Ddi) -> Result<(), ModesetError> {
-        if self.gen9_platform.is_none() {
+        // Broxton has no DDI IO wells (Gemini Lake's take the SKL indices).
+        if self.gen9_platform.is_none() || self.gen9_lp() == Some(false) {
             return Ok(());
         }
         let idx = match ddi {
@@ -1935,6 +1958,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// outputs would both take DPLL1) is a remainder.
     fn program_dpll_gen9(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
         use crate::intel_gpu_gen9_dpll::{dp_state, dpll_pool, pll_enable, SklDpllId};
+        if let Some(glk) = self.gen9_lp() {
+            let port_clock = crate::intel_gpu_gen12_combo_phy::port_clock_khz(rate)
+                .ok_or(ModesetError::PllLockTimeout)?;
+            return self.program_dpll_bxt(glk, port_clock, false);
+        }
         let is_edp = self.ddi == Ddi::A;
         let id = dpll_pool(is_edp)
             .first()
@@ -1958,6 +1986,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     fn program_dpll_gen9_hdmi(&mut self, pixel_clock_khz: u32) -> Result<(), ModesetError> {
         use crate::intel_gpu_gen9_cdclk::REFCLK_KHZ;
         use crate::intel_gpu_gen9_dpll::{dpll_pool, hdmi_state, pll_enable, SklDpllId};
+        if let Some(glk) = self.gen9_lp() {
+            return self.program_dpll_bxt(glk, pixel_clock_khz, true);
+        }
         let is_edp = self.ddi == Ddi::A;
         let id = dpll_pool(is_edp)
             .first()
@@ -1983,6 +2014,13 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             hdmi_level, program_hdmi_buffer, select_table, set_iboost_for_level,
             wa1143_training_override_pulse,
         };
+        // Gen9 LP: the BXT HDMI table's default (last) entry through the PHY.
+        if let Some(glk) = self.gen9_lp() {
+            use crate::intel_gpu_bxt_phy::{buf_trans, set_signal_levels, Output};
+            let entry = buf_trans(Output::Hdmi)[9];
+            set_signal_levels(self.mmio, glk, self.bxt_port()?, 4, entry);
+            return Ok(());
+        }
         let (platform, sku, _) = self.gen9_dp_inputs()?;
         let table = select_table(platform, sku, Output::Hdmi, false);
         let level = hdmi_level(None);
@@ -2349,6 +2387,15 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         use crate::intel_gpu_gen9_ddi::{
             dp_entry_count, program_dp_buffers, select_table, set_iboost_for_level,
         };
+        // Gen9 LP: no DDI_BUF_TRANS table; the lane latency optimization
+        // (`intel_ddi_pre_enable_dp`), then the levels through the PHY.
+        if let Some(glk) = self.gen9_lp() {
+            use crate::intel_gpu_bxt_phy::{lane_lat_optim_mask, set_lane_optim_mask};
+            set_lane_optim_mask(self.mmio, glk, self.bxt_port()?, lane_lat_optim_mask(lanes));
+            self.gen9_set_levels(_rate, &[(0, 0); 4], lanes)?;
+            self.enable_dp_tp_ctl_gen9();
+            return Ok(());
+        }
         let (platform, sku, is_edp) = self.gen9_dp_inputs()?;
         let output = if is_edp { Output::Edp } else { Output::Dp };
         let table = select_table(platform, sku, output, self.edp_low_vswing);
@@ -2360,6 +2407,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // (`skl_ddi_set_iboost`'s `PORT_A && max_lanes == 4`).
         let also_port_e = self.ddi == Ddi::A && lanes == 4;
         set_iboost_for_level(self.mmio, self.ddi, table, 0, 0, also_port_e);
+        self.enable_dp_tp_ctl_gen9();
+        Ok(())
+    }
+
+    /// `DP_TP_CTL` on, enhanced framing, scrambling off, pattern cleared.
+    fn enable_dp_tp_ctl_gen9(&self) {
         let tp = self.ddi.base() + GEN9_DP_TP_CTL_OFFSET;
         let cur = self.mmio.read32(tp);
         self.mmio.write32(
@@ -2370,7 +2423,6 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 | GEN9_DP_TP_CTL_SCRAMBLE_DISABLE,
         );
         compiler_fence(Ordering::SeqCst);
-        Ok(())
     }
 
     /// Apply the sink's requested levels for `state.rate`:
@@ -2387,6 +2439,26 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         use crate::intel_gpu_gen11_ddi::Output;
         use crate::intel_gpu_gen9_ddi::{select_table, set_iboost_for_level};
         use crate::intel_gpu_xelpg::preset_index;
+        // Gen9 LP: `bxt_dpio_phy_set_signal_levels` at lane 0's level from
+        // the BXT DP table (the low-vswing eDP table with the VBT flag).
+        if let Some(glk) = self.gen9_lp() {
+            use crate::intel_gpu_bxt_phy::{buf_trans, set_signal_levels, Output as BxtOutput};
+            let output = if self.ddi == Ddi::A && self.edp_low_vswing {
+                BxtOutput::EdpLowVswing
+            } else {
+                BxtOutput::Dp
+            };
+            let (swing, pre) = levels[0];
+            let level = preset_index(swing, pre).min(9);
+            set_signal_levels(
+                self.mmio,
+                glk,
+                self.bxt_port()?,
+                lanes,
+                buf_trans(output)[level],
+            );
+            return Ok(());
+        }
         let (platform, sku, is_edp) = self.gen9_dp_inputs()?;
         let output = if is_edp { Output::Edp } else { Output::Dp };
         let table = select_table(platform, sku, output, self.edp_low_vswing);
@@ -2427,6 +2499,19 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         let tp_cur = self.mmio.read32(tp);
         self.mmio.write32(tp, tp_cur & !GEN9_DP_TP_CTL_ENABLE);
         compiler_fence(Ordering::SeqCst);
+        if let Some(glk) = self.gen9_lp() {
+            use crate::intel_gpu_bxt_dpll as pll;
+            let port = self.bxt_port()?;
+            let clock = u64::from(
+                crate::intel_gpu_gen12_combo_phy::port_clock_khz(rate)
+                    .ok_or(ModesetError::PllLockTimeout)?,
+            );
+            let state = pll::hw_state(clock, &pll::dp_dividers(clock))
+                .ok_or(ModesetError::PllLockTimeout)?;
+            pll::disable(self.mmio, glk, port).map_err(|_| ModesetError::PllLockTimeout)?;
+            return pll::enable(self.mmio, glk, port, &state)
+                .map_err(|_| ModesetError::PllLockTimeout);
+        }
         let is_edp = self.ddi == Ddi::A;
         let id = dpll_pool(is_edp)
             .first()
@@ -2698,6 +2783,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // (`skl_ddi_enable_clock`) — but the port's DDI IO well
         // comes first (`intel_ddi_pre_enable_dp` takes the IO
         // well before any DDI buffer programming).
+        // Gen9 LP: each port has its own PLL, so there is no clock mux;
+        // only Gemini Lake has DDI IO wells.
+        if self.gen9_lp().is_some() {
+            return self.enable_ddi_io_well(self.ddi);
+        }
         if self.gen9_platform.is_some() {
             self.enable_ddi_io_well(self.ddi)?;
             let id = crate::intel_gpu_gen9_dpll::dpll_pool(self.ddi == Ddi::A)
@@ -2774,6 +2864,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Gen9: the SKL CDCLK model (VCO-aware ladders,
         // `skl_set_cdclk`), not the TGL frequency-request
         // model below.
+        if let Some(glk) = self.gen9_lp() {
+            return self.program_cdclk_floor_bxt(mode, glk);
+        }
         if let Some(platform) = self.gen9_platform {
             return self.program_cdclk_floor_gen9(mode, platform);
         }
@@ -2845,6 +2938,60 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             Err(cdclk::CdclkError::Pcode(_) | cdclk::CdclkError::PcodeNotReady) => Ok(()),
             Err(_) => Err(ModesetError::CdclkUnavailable),
         }
+    }
+
+    /// Gen9 LP CDCLK floor (`intel_gpu_bxt_cdclk`): `intel_pixel_rate_to_cdclk`
+    /// (one pixel per clock on Broxton, two on Gemini Lake), the lowest table
+    /// rung above it, and `bxt_set_cdclk` with the DE PLL. A refused pcode
+    /// notify leaves the firmware clock, as on the other generations; a floor
+    /// past the table does too.
+    fn program_cdclk_floor_bxt(&mut self, mode: &Mode, glk: bool) -> Result<(), ModesetError> {
+        use crate::intel_gpu_bxt_cdclk as cdclk;
+        let current =
+            cdclk::Current::read(self.mmio).map_err(|_| ModesetError::CdclkUnavailable)?;
+        let floor_khz = cdclk::min_cdclk_for_pixel_rate(glk, mode.pixel_clock_khz);
+        if current.cdclk_khz >= floor_khz {
+            return Ok(());
+        }
+        self.refuse_shared_cdclk(Some(current.cdclk_khz), mode)?;
+        let Some(target) = cdclk::calc_cdclk(glk, floor_khz) else {
+            return Ok(());
+        };
+        match cdclk::program(self.mmio, glk, current, target) {
+            Ok(_) => Ok(()),
+            Err(crate::intel_gpu_gen9_cdclk::CdclkError::Pcode(_)) => Ok(()),
+            Err(_) => Err(ModesetError::CdclkUnavailable),
+        }
+    }
+
+    /// Power the Gen9 LP port's DPIO PHY (its `dpio-common` power well,
+    /// which carries the port's lanes and AUX) and, on Gemini Lake, its AUX
+    /// well.
+    fn power_bxt_port(&mut self, glk: bool) -> Result<(), ModesetError> {
+        let port = self.bxt_port()?;
+        crate::intel_gpu_bxt_display::power_port(self.mmio, glk, port)
+            .map_err(|_| ModesetError::PowerWellTimeout)
+    }
+
+    /// The Gen9 LP port PLL for `port_clock` (`bxt_ddi_pll_enable`), with
+    /// the PHY powered first: the PLL lives in it.
+    fn program_dpll_bxt(
+        &mut self,
+        glk: bool,
+        port_clock: u32,
+        hdmi: bool,
+    ) -> Result<(), ModesetError> {
+        use crate::intel_gpu_bxt_dpll as pll;
+        self.power_bxt_port(glk)?;
+        let clock = u64::from(port_clock);
+        let dividers = if hdmi {
+            pll::hdmi_dividers(clock).ok_or(ModesetError::HdmiClockUnsupported)?
+        } else {
+            pll::dp_dividers(clock)
+        };
+        let state = pll::hw_state(clock, &dividers).ok_or(ModesetError::PllLockTimeout)?;
+        pll::enable(self.mmio, glk, self.bxt_port()?, &state)
+            .map_err(|_| ModesetError::PllLockTimeout)
     }
 
     /// Gen11 CDCLK floor: the same shape as the Gen12 floor
@@ -3147,8 +3294,15 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// when the pcode latency read fails or level 0 is unusable.
     fn program_watermarks_gen9(&mut self, mode: &Mode, fb: &Framebuffer) {
         use crate::intel_gpu_gen9_wm::{
-            adjust_latencies, compute_plane_watermarks, encode_plane_buf_cfg, encode_wm_level,
-            validate_watermarks, WmParams, PRIMARY_DDB_END, PRIMARY_DDB_START,
+            adjust_latencies, compute_plane_watermarks_for, encode_plane_buf_cfg, encode_wm_level,
+            validate_watermarks, WmParams, BXT_DBUF_TOTAL_BLOCKS, GLK_DBUF_TOTAL_BLOCKS,
+            PRIMARY_DDB_END, PRIMARY_DDB_START,
+        };
+        // Gen9 LP's smaller DBUF; Gemini Lake takes the display-10 rules.
+        let (ddb_end, display10) = match self.gen9_lp() {
+            Some(true) => (GLK_DBUF_TOTAL_BLOCKS, true),
+            Some(false) => (BXT_DBUF_TOTAL_BLOCKS, false),
+            None => (PRIMARY_DDB_END, false),
         };
         if let Some((start, end)) = self.dbuf_share {
             write_wm_block_skl(
@@ -3171,11 +3325,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 width_px: mode.h_active as u32,
                 cpp: fb.format.bits_per_pixel() / 8,
             };
-            let mut wm = compute_plane_watermarks(&params, &latencies);
+            let mut wm = compute_plane_watermarks_for(&params, &latencies, display10);
             if !wm.levels[0].enable {
                 return None;
             }
-            validate_watermarks(&mut wm, PRIMARY_DDB_END - PRIMARY_DDB_START);
+            validate_watermarks(&mut wm, ddb_end - PRIMARY_DDB_START);
             if !wm.levels[0].enable {
                 return None;
             }
@@ -3200,7 +3354,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.mmio.write32(wm_base + PLANE_WM_TRANS_OFFSET, 0);
         self.mmio.write32(
             self.pipe.base() + PLANE_BUF_CFG_OFFSET,
-            encode_plane_buf_cfg(PRIMARY_DDB_START, PRIMARY_DDB_END),
+            encode_plane_buf_cfg(PRIMARY_DDB_START, ddb_end),
         );
         compiler_fence(Ordering::SeqCst);
     }
@@ -3724,7 +3878,7 @@ pub(crate) fn gen9_family_for_chip(
     use crate::intel_gpu::Generation;
     match crate::intel_gpu_gt::GtPlatform::from_pci(chip.vid, chip.did) {
         Some(crate::intel_gpu_gt::GtPlatform::Gen9(platform))
-            if chip.generation == Generation::Skylake =>
+            if matches!(chip.generation, Generation::Skylake | Generation::Broxton) =>
         {
             Some(platform)
         }
@@ -3764,7 +3918,10 @@ pub(crate) fn modeset_display_for_chip<M: MmioWindow + ?Sized>(
     // the SKL CDCLK VCO rule and DDI table selection need the
     // exact product — and so is the SKU family, which picks
     // the U/Y DDI tables from the PCI device ID.
-    let (gen9, gen9_sku) = if chip.generation == crate::intel_gpu::Generation::Skylake {
+    let (gen9, gen9_sku) = if matches!(
+        chip.generation,
+        crate::intel_gpu::Generation::Skylake | crate::intel_gpu::Generation::Broxton
+    ) {
         let platform = match gen9_family_for_chip(chip) {
             Some(platform) => platform,
             None => return Err(ModesetError::UnsupportedGeneration),
@@ -3850,7 +4007,9 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
                 None => ms.modeset(fb, None),
             }
         }
-        Generation::Skylake => {
+        // Gen9 LP (Broxton / Gemini Lake) takes the same panel path with its
+        // DPIO PHY, port PLL and CDCLK (`Modeset::gen9_lp`).
+        Generation::Skylake | Generation::Broxton => {
             // Gen9 internal-panel modeset (Lane 5): the SKL
             // CDCLK / DPLL / watermark / DDI-table path in the
             // Linux SKL order, fixture-validated, silicon
@@ -3869,10 +4028,13 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
             if !crate::intel_gpu_gen9_dmc::gen9_dmc_loaded() {
                 return Err(ModesetError::DmcUnavailable);
             }
-            let sku = gen9_sku.ok_or(ModesetError::UnsupportedGeneration)?;
             let mut ms = Modeset::new(mmio, Ddi::A);
             ms.set_gen9_platform(platform);
-            ms.set_gen9_sku_family(sku);
+            // The SKU family picks the big-core DDI tables; Gen9 LP's
+            // swing tables are per output, not per SKU.
+            if !platform.is_lp() {
+                ms.set_gen9_sku_family(gen9_sku.ok_or(ModesetError::UnsupportedGeneration)?);
+            }
             let edp_signal = crate::intel_gpu_gen12_combo_phy::installed_edp_signal();
             ms.set_edp_low_vswing(edp_signal.low_vswing());
             match mode {
@@ -3893,10 +4055,9 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
         // Rocket Lake / Lunar Lake / Panther Lake have no
         // panel modeset in this module (owned routes elsewhere
         // or not modeled).
-        Generation::RocketLake
-        | Generation::LunarLake
-        | Generation::PantherLake
-        | Generation::Broxton => Err(ModesetError::UnsupportedGeneration),
+        Generation::RocketLake | Generation::LunarLake | Generation::PantherLake => {
+            Err(ModesetError::UnsupportedGeneration)
+        }
     };
     if let Ok(committed) = &result {
         // Per-modeset VRR/CMRR compute for the panel (#1771): a
@@ -5479,6 +5640,29 @@ pub mod tests {
                     }
                     v
                 }
+                // Gen9 LP DPIO PHYs: power good once the PUNIT bit is set,
+                // GRC calibration done (`bxt_dpio_phy_init`'s polls).
+                0x6c000 | 0x162000 | 0x163000 => {
+                    if self.get(crate::intel_gpu_bxt_phy::DISP_PWRON) != 0 {
+                        1 << 16
+                    } else {
+                        0
+                    }
+                }
+                0x6c18c | 0x16218c | 0x16318c => 1 << 22,
+                // Gen9 LP port PLLs: LOCK follows ENABLE, POWER_STATE
+                // follows POWER_ENABLE.
+                0x46074 | 0x46078 | 0x4607c => {
+                    let stored = self.get(off);
+                    let mut v = stored & !(1 << 30 | 1 << 25);
+                    if stored & 1 << 31 != 0 {
+                        v |= 1 << 30;
+                    }
+                    if stored & 1 << 26 != 0 {
+                        v |= 1 << 25;
+                    }
+                    v
+                }
                 o if o == crate::intel_gpu_gen12_cdclk::DE_PLL_ENABLE => {
                     // CDCLK PLL LOCK follows ENABLE (same shape as
                     // the DPLL arm above).
@@ -6516,6 +6700,82 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_gen9_modeset_full_run_scripted_sink
+    );
+
+    /// Broxton eDP over the scripted sink: the DPIO PHY powered and the
+    /// port PLL locked at HBR2, the BXT CDCLK on the DE PLL, the PHY swing
+    /// levels, Broxton's 508-block DBUF, and none of the big-core DPLL,
+    /// clock-mux, DDI_BUF_TRANS or IO-well writes.
+    fn smoke_gen9_lp_modeset_full_run_scripted_sink() -> TestResult {
+        use crate::intel_gpu::{ChipInfo, Generation};
+        use crate::intel_gpu_bxt_phy::{tx_dw2, Channel, Phy, DISP_PWRON};
+        use crate::intel_gpu_gen11_dpll::DPLL_CTRL1;
+        use crate::intel_gpu_gen9_cdclk::CDCLK_CTL;
+        use crate::intel_gpu_gen9_ddi::ddi_buf_trans_lo;
+        use crate::intel_gpu_gen9_dpll::DPLL_CTRL2;
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(true);
+        let chip = ChipInfo {
+            vid: 0x8086,
+            did: 0x5a85,
+            generation: Generation::Broxton,
+            asic: "broxton",
+        };
+        let sink = ScriptedSinkMmio::new(1 << 29);
+        let mode = match modeset_display_for_chip(&sink, chip, &fb_1080p(), None) {
+            Ok(mode) => mode,
+            Err(_) => return TestResult::Fail("Broxton full run failed"),
+        };
+        if mode.pixel_clock_khz != 148_500 || mode.h_active != 1920 {
+            return TestResult::Fail("Broxton commits the EDID preferred mode");
+        }
+        // 148.5 MHz needs 288 MHz on Broxton (one pixel per clock): VCO 1152
+        // (ratio 60), divider 2, PIPE_NONE, decimal 574.
+        if sink
+            .writes_to(crate::intel_gpu_bxt_cdclk::DE_PLL_CTL)
+            .last()
+            != Some(&60)
+            || sink.writes_to(CDCLK_CTL).last() != Some(&0x00b0_023e)
+        {
+            return TestResult::Fail("Broxton CDCLK 288 MHz on the DE PLL");
+        }
+        // PHY1 (port A) powered; the port A PLL enabled with HBR2's P1 2, P2 1.
+        if sink.writes_to(DISP_PWRON).iter().all(|w| w & 1 << 1 == 0)
+            || sink.writes_to(0x46074).iter().all(|w| w & 1 << 31 == 0)
+            || sink.writes_to(0x162034).last().map(|w| w & 0xff00) != Some(0x4100)
+        {
+            return TestResult::Fail("PHY1 and the port A PLL at HBR2");
+        }
+        // Training's lane 0 level 4 (swing 1, pre-emphasis 0): margin 77,
+        // scale 0x9a.
+        if sink
+            .writes_to(tx_dw2(Phy::Phy1, Channel::Ch0, 0))
+            .last()
+            .map(|w| w & 0xffff00)
+            != Some(77 << 16 | 0x9a << 8)
+        {
+            return TestResult::Fail("BXT DP swing through the PHY");
+        }
+        if sink.writes_to(Pipe::A.base() + PLANE_BUF_CFG_OFFSET) != [0x01fb_0000] {
+            return TestResult::Fail("PLANE_BUF_CFG is Broxton's 508-block DBUF");
+        }
+        if !sink.writes_to(DPLL_CTRL1).is_empty()
+            || !sink.writes_to(DPLL_CTRL2).is_empty()
+            || !sink.writes_to(ddi_buf_trans_lo(Ddi::A, 0)).is_empty()
+            || !sink.writes_to(PWR_WELL_CTL2).is_empty()
+        {
+            return TestResult::Fail("no big-core DPLL, clock mux, BUF_TRANS or IO well");
+        }
+        if sink.writes_to(0x64000).last().map(|w| w >> 31) != Some(1)
+            || sink.writes_to(0x64040).last() != Some(&0x8004_0300)
+        {
+            return TestResult::Fail("DDI A enabled and DP_TP_CTL normal");
+        }
+        crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(false);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen9_lp_modeset_full_run_scripted_sink
     );
 
     /// Gen9: the external-DP plan path on DDI B (Lane 8) —

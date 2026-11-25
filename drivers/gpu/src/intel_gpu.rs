@@ -152,6 +152,7 @@ impl Generation {
                 | Generation::MeteorLake
                 | Generation::IceLake
                 | Generation::Skylake
+                | Generation::Broxton
         )
     }
 
@@ -208,6 +209,7 @@ impl Generation {
                 | Generation::AlderLake
                 | Generation::IceLake
                 | Generation::Skylake
+                | Generation::Broxton
         )
     }
 }
@@ -1074,7 +1076,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // panel that fails its sequence is left powered-down:
         // no backlight install, no takeover, no scanout move.
         let window = crate::intel_gpu_edp::BarWindow(&dev.gtt_mmadr);
-        let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::new(&window);
+        // Gen9 LP has no PCH: its power sequencer is in the display engine,
+        // and the eDP port's AUX channel needs the port's DPIO PHY powered
+        // (Linux powers every PHY at display init).
+        let lp = dev.chip.generation == Generation::Broxton;
+        if lp {
+            let glk = dev.chip.asic == "geminilake";
+            if crate::intel_gpu_bxt_display::power_port(
+                &window,
+                glk,
+                crate::intel_gpu_bxt_phy::Port::A,
+            )
+            .is_err()
+            {
+                log_probe("eDP port PHY did not power up", &device);
+            }
+        }
+        let pps_window = crate::intel_gpu_bxt_display::PpsWindow::new(&window, lp);
+        let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::new(&pps_window);
         pps.init_registers();
         crate::intel_gpu_edp::runtime_install_panel(
             pps.delays(),
@@ -1106,6 +1125,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // gated on the backlight composition lane, PR #1037).
             // Gen9 Skylake drives the SPT PWM layout, Gen11/Gen12
             // the BXT layout (Lane 8).
+            // Gen9 LP's backlight controller is the BXT layout itself.
             if dev.chip.generation.backlight_supported() {
                 if dev.chip.generation == Generation::Skylake {
                     narf_drivers_backlight::intel_bl::install_spt(dev.gtt_mmadr);
@@ -1361,6 +1381,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             && dev.chip.generation != Generation::MeteorLake
             && dev.chip.generation != Generation::IceLake
             && dev.chip.generation != Generation::Skylake
+            && dev.chip.generation != Generation::Broxton
     }) {
         crate::intel_gpu_edp::enable_psr_for_panel(&dev, &mode);
     }
@@ -4013,14 +4034,15 @@ pub mod tests {
         {
             return TestResult::Fail("Gen9 must admit regions + display + external + backlight");
         }
-        // Gen9 LP: the Gen9 register map, pre-GMD, and no display path.
-        if Generation::Broxton.display_supported()
+        // Gen9 LP: the Gen9 register map, pre-GMD, the internal panel and
+        // its BXT-layout backlight; no external outputs yet.
+        if !Generation::Broxton.display_supported()
             || Generation::Broxton.external_display_supported()
-            || Generation::Broxton.backlight_supported()
+            || !Generation::Broxton.backlight_supported()
             || Generation::Broxton.region_generation() != Some(RegionGeneration::Gen9)
             || Generation::Broxton.has_gmd_id()
         {
-            return TestResult::Fail("Gen9 LP is a pre-GMD GT with no display path");
+            return TestResult::Fail("Gen9 LP drives its internal panel only");
         }
         // Gen11 (Lanes 5 + 8): identity + probe + internal-panel
         // modeset + external outputs + backlight. The BAR0 region

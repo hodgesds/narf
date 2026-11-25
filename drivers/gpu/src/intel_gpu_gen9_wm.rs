@@ -130,6 +130,10 @@ pub const NUM_WM_LEVELS: usize = 8;
 pub const DBUF_BLOCK_SIZE: u32 = 512;
 /// Total DBUF blocks on Gen9 (`skl_display`: 896 - 4).
 pub const DBUF_TOTAL_BLOCKS: u16 = 892;
+/// Broxton's DBUF (`bxt_display`: 512 - 4).
+pub const BXT_DBUF_TOTAL_BLOCKS: u16 = 508;
+/// Gemini Lake's DBUF (`glk_display`: 1024 - 4).
+pub const GLK_DBUF_TOTAL_BLOCKS: u16 = 1020;
 /// Blocks per DBUF slice on Gen9 (one slice holds them all).
 pub const DBUF_SLICE_BLOCKS: u16 = 892;
 /// Number of DBUF slices on Gen9 (S1 only).
@@ -288,7 +292,13 @@ fn fx_ceil(fx: u64) -> u64 {
 /// the previous level's result for the monotonic clamp (a
 /// zeroed level for level 0). `level` is the level index: it
 /// decides the lines rule and the Wa #1126 block.
-fn compute_level(params: &WmParams, latency_us: u32, level: usize, prev: &RawLevel) -> RawLevel {
+fn compute_level(
+    params: &WmParams,
+    latency_us: u32,
+    level: usize,
+    prev: &RawLevel,
+    display10: bool,
+) -> RawLevel {
     const REJECTED: RawLevel = RawLevel {
         enable: false,
         blocks: 0,
@@ -302,9 +312,10 @@ fn compute_level(params: &WmParams, latency_us: u32, level: usize, prev: &RawLev
     let pixel_rate = params.pixel_rate_khz as u64;
     let pbpl = params.plane_blocks_per_line() as u64;
 
-    // method1: latency * pixel_rate * cpp / (1000 * block_size).
-    // No +1 — that is a DISPLAY_VER >= 10 rule.
-    let method1 = (lat * pixel_rate * params.cpp as u64) * FX_ONE / (1000 * DBUF_BLOCK_SIZE as u64);
+    // method1: latency * pixel_rate * cpp / (1000 * block_size), plus one
+    // block from display 10 (Gemini Lake).
+    let method1 = (lat * pixel_rate * params.cpp as u64) * FX_ONE / (1000 * DBUF_BLOCK_SIZE as u64)
+        + if display10 { FX_ONE } else { 0 };
     // method2: ceil(latency * pixel_rate / (htotal * 1000)) *
     // plane_blocks_per_line.
     let method2 = (lat * pixel_rate).div_ceil(params.htotal as u64 * 1000) * pbpl * FX_ONE;
@@ -322,8 +333,9 @@ fn compute_level(params: &WmParams, latency_us: u32, level: usize, prev: &RawLev
         method1
     };
 
-    let has_lines = level > 0; // skl_wm_has_lines: ver < 10,
-                               // level 0 has no lines.
+    // skl_wm_has_lines: from display 10 every level has lines; below,
+    // level 0 has none.
+    let has_lines = display10 || level > 0;
     let mut blocks = fx_ceil(selected) + 1;
     // With lines in use, blocks cover at least one line. At
     // level 0 there is no floor.
@@ -385,10 +397,20 @@ pub fn compute_plane_watermarks(
     params: &WmParams,
     latencies: &[u16; NUM_WM_LEVELS],
 ) -> PlaneWatermarks {
+    compute_plane_watermarks_for(params, latencies, false)
+}
+
+/// [`compute_plane_watermarks`] for display 9 (`display10` false) or
+/// Gemini Lake's display 10: method 1 gains a block and level 0 has lines.
+pub fn compute_plane_watermarks_for(
+    params: &WmParams,
+    latencies: &[u16; NUM_WM_LEVELS],
+    display10: bool,
+) -> PlaneWatermarks {
     let mut raw_levels = [RawLevel::default(); NUM_WM_LEVELS];
     let mut prev = RawLevel::default();
     for (level, raw) in raw_levels.iter_mut().enumerate() {
-        *raw = compute_level(params, latencies[level] as u32, level, &prev);
+        *raw = compute_level(params, latencies[level] as u32, level, &prev, display10);
         prev = *raw;
     }
 

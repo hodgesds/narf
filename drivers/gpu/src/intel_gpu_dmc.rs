@@ -220,6 +220,8 @@ pub const KBL_DMC_MAX_FW_SIZE: usize = 0x3000;
 pub const SKL_DMC_FIRMWARE: &str = "i915/skl_dmc_ver1_27.bin";
 /// The display-9 Kaby Lake DMC container name (`KBL_DMC_PATH`).
 pub const KBL_DMC_FIRMWARE: &str = "i915/kbl_dmc_ver1_04.bin";
+/// `GLK_DMC_MAX_FW_SIZE`, in bytes.
+pub const GLK_DMC_MAX_FW_SIZE: usize = 0x4000;
 /// `BXT_DMC_PATH` = `DMC_LEGACY_PATH(bxt, 1, 07)`.
 pub const BXT_DMC_FIRMWARE: &str = "i915/bxt_dmc_ver1_07.bin";
 /// `GLK_DMC_PATH` = `DMC_LEGACY_PATH(glk, 1, 04)`.
@@ -932,13 +934,19 @@ pub fn parse_dmc_firmware_gen9(
     stepping: u8,
     substepping: u8,
 ) -> Result<DmcFirmware<'_>, DmcError> {
-    parse_for(
-        blob,
-        DmcPlatform::Gen9,
-        stepping,
-        substepping,
-        SKL_DMC_MAX_FW_SIZE,
-    )
+    parse_dmc_firmware_gen9_max(blob, stepping, substepping, SKL_DMC_MAX_FW_SIZE)
+}
+
+/// [`parse_dmc_firmware_gen9`] with the platform's payload ceiling: Gemini
+/// Lake's is [`GLK_DMC_MAX_FW_SIZE`], every other display-9 part's
+/// `BXT_DMC_MAX_FW_SIZE` (0x3000).
+pub fn parse_dmc_firmware_gen9_max(
+    blob: &[u8],
+    stepping: u8,
+    substepping: u8,
+    max: usize,
+) -> Result<DmcFirmware<'_>, DmcError> {
+    parse_for(blob, DmcPlatform::Gen9, stepping, substepping, max)
 }
 
 /// Parse and validate a display-14 (Meteor Lake / Arrow Lake)

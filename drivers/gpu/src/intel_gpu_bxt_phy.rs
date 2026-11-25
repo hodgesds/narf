@@ -15,10 +15,6 @@
 //! calibrated GRC code. Swing levels are programmed per lane in the PHY,
 //! not through `DDI_BUF_TRANS`. Nothing here has run on silicon.
 
-// The Gen9-LP display modeset is its consumer; until it lands, only the
-// fixtures call in.
-#![cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-
 use crate::intel_gpu_aux::MmioWindow;
 
 /// A DPIO PHY.

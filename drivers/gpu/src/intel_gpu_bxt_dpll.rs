@@ -13,10 +13,6 @@
 //! HDMI searches P1/P2 for the closest dot clock. Nothing here has run on
 //! silicon.
 
-// The Gen9-LP display modeset is its consumer; until it lands, only the
-// fixtures call in.
-#![cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_bxt_phy::{channel, lane_offset, port_to_phy_channel, Channel, Phy, Port};
 
@@ -204,6 +200,7 @@ pub(crate) fn hw_state(port_clock: u64, d: &Dividers) -> Option<State> {
 }
 
 /// `bxt_ddi_pll_get_freq`: the port clock a state produces.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn get_freq(state: &State) -> u64 {
     let mut m2 = (state.pll0 & 0xff) << 22;
     if state.pll3 & PORT_PLL_M2_FRAC_ENABLE != 0 {

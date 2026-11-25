@@ -789,6 +789,8 @@ pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_bxt_cdclk;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_bxt_display;
+#[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_bxt_dpll;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_bxt_phy;

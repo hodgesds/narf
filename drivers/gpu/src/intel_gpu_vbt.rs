@@ -1836,7 +1836,7 @@ pub fn install_for_probe(
         // requires its own `has_vrr` input, so no VRR timing
         // is ever computed from the installed flag; the Gen9
         // modeset (Lane 5) reads only the low-vswing bit.
-        Generation::Skylake => true,
+        Generation::Skylake | Generation::Broxton => true,
         _ => false,
     };
     if !applicable {
