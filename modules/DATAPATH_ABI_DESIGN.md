@@ -553,19 +553,6 @@ Modes are the `WirelessModes` bits (STATION=1, AP=2, MONITOR=4, P2P=8);
 `hw_caps` bits are HT=1, VHT=2, HE=4, EHT=8. Perf class: no hot path
 (control plane only; frames never pass through the host).
 
-**Additive opcodes (version 2).** Appended without renumbering; an older
-host answers `-EOPNOTSUPP` and the module must fail closed.
-
-| Opcode | Request | Reply |
-|---|---|---|
-|6 GET_REGULATORY (iwlwifi.ko)|mode u8 (0 = installed domain, 1 = also bootstrap the staged signed policy when none is installed), reserved u8[3]|revision u64 (`reg::db::revision()`), country u8[2], rule count u16 <= 128, reserved u32; per rule start MHz u32, end MHz u32, max bandwidth MHz u32, max power dBm i8, reserved u8[3], `RegFlags` bits u32. `-ENOENT` with no domain; `-E2BIG` past 128 rules (never truncated)|
-
-`GET_REGULATORY` needs no wiphy. It exists for a module that programs
-regulatory TX power itself (the iwlwifi MLD station derives its MCC/power
-program from the domain): the module caches the reply and re-reads it, and a
-changed revision invalidates every fence bound to the old domain, as a
-built-in reinstall does. Unknown flag bits are a restriction the module
-cannot honour, so it rejects the reply.
 
 ## USB transfer datapath
 

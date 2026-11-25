@@ -930,7 +930,7 @@ KABI:
 
 It claims the six Sc ids; `narf-drivers-wireless/iwlwifi-module-only` steps
 the built-in claim aside for them. The station's regulatory program reads the
-kernel's domain through a new additive `WIFI` opcode, `GET_REGULATORY`, and
+kernel's domain through the shared `narf_wireless_regdomain` export, and
 the transport parks, stops and verifies bus mastering through
 `narf_pci_command`, with the built-in's read-back checks. The module links on
 x86_64 and aarch64 and every undefined symbol is a KABI export.

@@ -1451,7 +1451,7 @@ fn encode_register_wiphy(radio: &Radio) -> Vec<u8> {
 }
 
 /// Open the device's `WIFI` session (before the netdev, so the bridge names
-/// it `wlan%d`) and bind the regulatory queries to it. `None` when refused.
+/// it `wlan%d`). `None` when refused.
 pub(crate) fn open_session() -> Option<u64> {
     let mut session = 0u64;
     // SAFETY: `event_callback` is a valid extern "C" fn in this image;
@@ -1471,7 +1471,6 @@ pub(crate) fn open_session() -> Option<u64> {
         ));
         return None;
     }
-    regulatory::set_session(session);
     Some(session)
 }
 

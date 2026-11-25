@@ -2302,11 +2302,6 @@ services").
   AUTHENTICATE/ASSOCIATE, control-port EAPOL, key installation) is refused;
   so are AP/P2P/monitor roles, power save and station statistics. Those are
   a later protocol version.
-- **Regulatory query (additive opcode 6).** `GET_REGULATORY` returns the
-  kernel's installed regulatory domain and its revision (optionally
-  bootstrapping the staged signed policy), for a module that programs
-  regulatory TX power itself (`iwlwifi.ko`, §4.x "`iwlwifi.ko`"). It needs no wiphy. An older
-  host answers `-EOPNOTSUPP` and the module fails closed.
 - **Perf class:** no hot path. TX/RX frames never pass through the host.
 
 The implemented high-level control trait is `narf_wireless::WirelessNetIface`.
@@ -2630,12 +2625,13 @@ WPA2-PSK / WPA3-SAE supplicant and 802.11w). `narf-crypto` and
   PNVM, PHY configuration; then the MLD profile check and the configuration
   commands (`mld_start.rs`, shared with `Device`).
 - **Regulatory.** The station derives its MCC and TX-power program from the
-  kernel's regulatory domain. `module/regulatory.rs` reads it through the
-  host's additive `GET_REGULATORY` opcode (§4.1, and
-  `modules/DATAPATH_ABI_DESIGN.md`) and caches one snapshot per kernel
-  revision; the service re-reads it every second, and a change fails the
-  station fence and drops carrier, as a built-in reinstall does. Without a
-  domain the station refuses association and scans passively, as built in.
+  kernel's regulatory domain. `module/regulatory.rs` copies it through the
+  shared `narf_wireless_regdomain` KABI export (one NRGD v1 record, parsed
+  by the kernel-free `narf_wireless::reg::parse_policy`) and caches one
+  snapshot until the domain changes; the service re-reads it every second,
+  and a change fails the station fence and drops carrier, as a built-in
+  reinstall does. Without a domain the station refuses association and
+  scans passively, as built in.
 - **Platform power.** The module has no KABI for the device's ACPI
   WRDS/EWRD/WGDS/PPAG objects, so it takes Linux's absent-tables path:
   nothing is published and the firmware keeps its own limits.
