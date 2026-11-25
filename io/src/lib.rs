@@ -21,6 +21,7 @@ mod iommu_e2e_tests;
 pub mod iommu_model;
 mod iommu_perdomain_tests;
 pub mod iova;
+pub mod p2pdma;
 pub mod pool;
 pub mod sg;
 mod tests;

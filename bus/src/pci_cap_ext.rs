@@ -852,6 +852,32 @@ pub fn read_acs(
     }))
 }
 
+/// The ACS Control word of any registered function, or `None` without an
+/// ACS extended capability (Linux reads `pdev->acs_cap` + `PCI_ACS_CTRL` in
+/// `pci_bridge_has_acs_redir`). Read-only fabric metadata for the P2P
+/// distance oracle (`crate::p2pdma`), which must inspect bridges and peers
+/// the caller holds no capability for, as
+/// [`crate::pci::upstream_bridge_commands`] does for bridge Command words.
+pub(crate) fn acs_control(device: &BusDevice) -> Option<u16> {
+    let BusKind::Pcie { cfg_phys, .. } = device.kind else {
+        return None;
+    };
+    let walk = ExtCapIter {
+        cfg: cfg_phys,
+        next: EXT_CAP_BASE,
+        hops: 0,
+    };
+    for header in walk {
+        if header.id == id::ACS {
+            // SAFETY: the registered function's identity-mapped config
+            // window; the walker bounded the header offset below 4 KiB.
+            let dword = unsafe { cfg_read32(cfg_phys, header.offset + acs_off::CAP) };
+            return Some((dword >> 16) as u16);
+        }
+    }
+    None
+}
+
 // ── PASID (Process Address Space ID) — PCIe Base §7.9.6 ───────────
 //
 // PASID lets an endpoint tag its DMA requests with a process-
