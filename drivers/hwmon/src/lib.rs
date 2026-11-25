@@ -33,9 +33,13 @@ pub mod k10temp;
 pub mod nct6775;
 pub mod power_providers;
 pub mod registry;
+pub mod spd5118;
 pub mod sysfs_bridge;
 
 mod tests;
+
+#[cfg(feature = "kernel-test")]
+mod spd5118_tests;
 
 /// Shared hwmon device trait. Every hardware-monitoring driver exposes
 /// temperatures, fan speeds, and voltages through this interface.
@@ -238,6 +242,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "hwmon-jc42", || {
         jc42::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "hwmon-spd5118", || {
+        spd5118::register_initcalls();
         InitResult::Ok
     });
     // Stage::Late: sysfs bridge runs after all Stage::Subsys driver probes.

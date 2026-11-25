@@ -28,6 +28,9 @@ carry most board-level fan and voltage sensing. `dell_smm` speaks the Dell
 System Management Mode interface over the i8042 path for fan and temperature
 control on Dell laptops. `applesmc` reaches the Apple System Management
 Controller, and `jc42` handles JC-42.4 temperature sensors on memory modules.
+`spd5118` drives the temperature sensor in DDR5 modules' SPD hubs, binding the
+SMBus clients the I2C crate instantiates from SMBIOS, with Linux's writable
+limits, latched alarms and enable switch.
 
 The drivers probe through NARF's driver and bus machinery rather than appearing
 by magic: hwmon registers its probes as `Stage::Subsys` initcalls (PCI for

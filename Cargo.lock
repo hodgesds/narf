@@ -1610,12 +1610,14 @@ dependencies = [
 name = "narf-drivers-hwmon"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-aml",
  "narf-arch",
  "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-drivers-i2c",
  "narf-drivers-platform",
  "narf-filesystem",
  "narf-firmware-smbios",
@@ -1624,6 +1626,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-power",
+ "narf-scheduler",
 ]
 
 [[package]]

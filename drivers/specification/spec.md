@@ -280,6 +280,114 @@ Existing AMD FCH, LPSS, PL022 and Cadence legacy methods do not implement
 this contract by implication. CYW43439 diagnostics require the actual
 whole-CS/shared-pad session and refuse the unsupported default.
 
+### 3.8 SMBus transactions, I2C clients and SPD sensors
+
+`narf_drivers_i2c::I2cBus` carries Linux's adapter split:
+
+- `transfer` runs raw I2C messages (`master_xfer`).
+- `smbus_xfer(addr, SmbusOp)` runs one SMBus protocol transaction:
+  quick, receive/send byte, byte/word data, block read/write.
+- `functionality()` returns an `I2cFunc` mask, bit-compatible with
+  `I2C_FUNC_*`.
+
+The default `smbus_xfer` is `smbus::emulate`, which builds the messages
+`i2c_smbus_xfer_emulated` builds and runs them through `transfer`. The
+default `functionality` is `I2cFunc::EMULATED`: raw I2C plus every SMBus
+size except quick and block read. SMBus-only hosts override both.
+
+- **piix4** has no raw I2C: `transfer` returns `Unsupported`.
+- **i801** reports the sizes its `transfer` mapping executes, without raw I2C.
+
+`I2cError` maps one-to-one onto Linux errnos:
+
+| `I2cError` | Linux errno |
+|---|---|
+| `Nack` | `-ENXIO` |
+| `Timeout` | `-ETIMEDOUT` |
+| `Busy` | `-EBUSY` |
+| `Unsupported` | `-EOPNOTSUPP` |
+| `InvalidArgs` | `-EINVAL` |
+| `Protocol` | `-EPROTO` |
+| `Abort` | `-EIO` (piix4 failed transaction or bus collision) |
+| `ArbLost` | `-EAGAIN` |
+
+**The piix4 KERNCZ (`1022:790b`) driver** ports `i2c-piix4.c`:
+
+- **Base discovery.** The SMBus host base comes from PM DecodeEn for
+  revision ≥ `0x49`, otherwise from PM `0x2c`/`0x28`. The revision is read
+  from config offset `0x08`.
+- **PM register access.** Revision ≥ `0x51` reaches the PM registers
+  through the `0xFED80300` MMIO window, mapped with `ioremap` because
+  sysfs reads run on user page tables. Lower revisions use the
+  `0xCD6`/`0xCD7` index/data pair.
+- **Adapters.** It registers Linux's adapters under Linux's names:
+  `SMBus PIIX4 adapter port 0 at <base>`, `… port 2 at <base>` and, unless
+  `\_SB.ASFC` exists, the aux host `… port 1 at <base|0x20>`.
+- **Port multiplexing.** The two main-host adapters share one host lock.
+  Each of their transactions:
+  1. takes the SMBSLVCNT semaphore (500 tries, then `Busy`);
+  2. selects its port in PM `0x02` bits 4:3;
+  3. runs;
+  4. restores the previous selection;
+  5. releases the semaphore.
+- **IMC handshake.** When LPC `00:14.3` config `0x40` bit 7 reports an
+  active IMC, a block transaction is bracketed by IMC mailbox command
+  `0x96`. A failed handshake turns notification off for good.
+
+**I2C clients** (`client`) model `struct i2c_client`:
+
+- `new_client_device` rejects the general-call address `0x00` and
+  anything over 7 bits (`InvalidArgs`), then occupied addresses (`Busy`).
+- `new_scanned_device` probes candidates with `i2c_default_probe`:
+  receive byte in `0x30-0x37` and `0x50-0x5f`, quick write elsewhere.
+- Client drivers enumerate `clients_of_kind`. A client stays registered
+  whether or not a driver binds it.
+
+`spd::register_spd_write_enable` is `i2c_register_spd`. From the SMBIOS
+type 17 records it picks the client type:
+
+| Memory types | Client type |
+|---|---|
+| DDR, DDR2, DDR3, LPDDR, LPDDR2, LPDDR3 | `spd` |
+| DDR4, LPDDR4 | `ee1004` |
+| DDR5, LPDDR5 | `spd5118` (only on a write-enabled bus) |
+
+It then probes `0x50..0x50+min(slots, 8)` until every populated module
+has answered. It does nothing when the memory types are mixed or no slot
+is populated. piix4 runs it on main port 0 and on the aux adapter.
+
+**`narf_drivers_hwmon::spd5118`** binds every `spd5118` client at
+Stage::Device, after `pci-probe-all`. The probe is `spd5118_i2c_init` plus
+`spd5118_common_probe`: MR0:MR1 must read `0x5118` byte-swapped, with a
+page-0 repair through MR11, and the hub needs a temperature sensor and a
+JEP106-parity-valid vendor. A hub in 16-bit addressing mode is refused.
+
+It publishes:
+
+- `temp1_input`;
+- writable `temp1_{lcrit,min,max,crit,enable}`;
+- read-only `temp1_{lcrit,min,max,crit}_alarm`, cleared through MR19 on
+  read;
+- no `temp1_label`.
+
+The hwmon contract behind this is `HwmonDevice::temp_attr_mode` /
+`read_temp_attr` / `write_temp_attr` (Linux `is_visible` / `read` /
+`write`). It replaces `temp_limits`. Stores parse with `kstrtol`
+semantics: `-EINVAL`, or `-ERANGE` via `FsError::OutOfRange`. A driver
+error reaches `write(2)` as its Linux errno:
+
+| `HwmonError` | errno |
+|---|---|
+| `InvalidValue` | `EINVAL` |
+| `NoResponse` | `ENXIO` |
+| `Timeout` | `ETIMEDOUT`, via `FsError::TransferTimedOut` |
+| `Busy` | `EBUSY` |
+| `Again` | `EAGAIN` |
+| `Io` | `EIO` |
+
+Not ported from Linux spd5118: the nvmem EEPROM view, thermal-zone
+registration, and the register cache across suspend.
+
 ## 4. ABI versioning
 
 Modelled directly on `userspace/syscall.rs`'s syscall versioning

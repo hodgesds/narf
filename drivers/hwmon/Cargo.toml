@@ -25,7 +25,10 @@ narf-firmware-smbios = { path = "../../firmware/smbios" }
 narf-power        = { path = "../../power" }
 narf-aml          = { path = "../../aml" }
 narf-drivers-platform = { path = "../platform" }
+narf-drivers-i2c  = { path = "../i2c" }
 narf-block        = { path = "../../block" }
+narf-scheduler    = { path = "../../scheduler" }
+async-trait       = "0.1"
 
 [features]
 kernel-test = ["narf-bus/kernel-test"]
