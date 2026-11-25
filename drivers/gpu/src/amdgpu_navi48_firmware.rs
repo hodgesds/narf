@@ -159,6 +159,11 @@ impl Firmware {
     pub(crate) fn target(&self) -> Target {
         self.target
     }
+    // Out of line: inlined, its eleven-image build (3872 bytes) and parse
+    // temporaries landed in every caller's frame, putting publish_cp_firmware
+    // and the PSP load futures over the 8 KiB budget after unrelated
+    // codegen-unit changes.
+    #[inline(never)]
     pub fn images(&self) -> Result<[Image<'_>; 11], Error> {
         let mut result = [Image::EMPTY; 11];
         for ((slot, bytes), source) in result.iter_mut().zip(&self.bytes).zip(Source::ALL) {
