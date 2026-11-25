@@ -287,13 +287,23 @@ fn fixture() -> Fx {
     }
 }
 
+/// Drive an ioctl or read to completion. `block_on_spin`, not `block_on`:
+/// the synchronous transfers (CONTROL/BULK) poll their URB between
+/// `sleep_ms(1)` waits until their timeout, and under kernel-test the BSP
+/// keeps its timer masked, so a `block_on` waiting for the timer IRQ never
+/// returns. `block_on_spin` runs the hrtimer softirq itself (as
+/// `hub_tests.rs` does for the same reason).
+fn run<F: core::future::Future>(f: F) -> F::Output {
+    narf_scheduler::block_on_spin(f)
+}
+
 impl Fx {
     fn ioctl(&self, cmd: u32, arg: u64) -> Result<u64, FsError> {
-        narf_scheduler::block_on(self.file.ioctl_user(cmd, arg, &self.mem))
+        run(self.file.ioctl_user(cmd, arg, &self.mem))
     }
 
     fn ioctl_on(&self, file: &Arc<UsbfsFile>, cmd: u32, arg: u64) -> Result<u64, FsError> {
-        narf_scheduler::block_on(file.ioctl_user(cmd, arg, &self.mem))
+        run(file.ioctl_user(cmd, arg, &self.mem))
     }
 
     /// An ioctl taking an `unsigned int` argument.
@@ -385,17 +395,17 @@ fn smoke_usbfs_read_descriptors() -> TestResult {
     let fx = fixture();
     let r = (|| {
         let mut buf = [0u8; 256];
-        let n = narf_scheduler::block_on(fx.file.read(0, &mut buf)).map_err(|_| "read")?;
+        let n = run(fx.file.read(0, &mut buf)).map_err(|_| "read")?;
         let cfg = config();
         if n != 18 + cfg.len() || buf[..18] != fx.dev.descriptor || buf[18..n] != cfg[..] {
             return Err("read is the device descriptor, then every configuration");
         }
         let mut tail = [0u8; 4];
-        let n = narf_scheduler::block_on(fx.file.read(20, &mut tail)).map_err(|_| "read")?;
+        let n = run(fx.file.read(20, &mut tail)).map_err(|_| "read")?;
         if n != 4 || tail[..] != cfg[2..6] {
             return Err("a read at an offset continues inside the configuration");
         }
-        let n = narf_scheduler::block_on(fx.file.read(18 + cfg.len() as u64, &mut tail))
+        let n = run(fx.file.read(18 + cfg.len() as u64, &mut tail))
             .map_err(|_| "read")?;
         if n != 0 {
             return Err("a read past the last configuration is EOF");
@@ -486,7 +496,7 @@ fn smoke_usbfs_readonly_is_eperm() -> TestResult {
             USBDEVFS_REAPURBNDELAY,
             USBDEVFS_GET_CAPABILITIES,
         ] {
-            let got = narf_scheduler::block_on(ro.ioctl_user(cmd, BASE, &mem));
+            let got = run(ro.ioctl_user(cmd, BASE, &mem));
             if !matches!(got, Err(FsError::OperationNotPermitted)) {
                 return Err("an fd without FMODE_WRITE gets EPERM before anything else");
             }
@@ -1009,7 +1019,7 @@ fn smoke_usbfs_device_removal() -> TestResult {
         }
         let mut buf = [0u8; 18];
         if !matches!(
-            narf_scheduler::block_on(fx.file.read(0, &mut buf)),
+            run(fx.file.read(0, &mut buf)),
             Err(FsError::NoDevice)
         ) {
             return Err("read of a removed device is ENODEV");
@@ -1105,15 +1115,15 @@ fn smoke_usbfs_node_names_and_metadata() -> TestResult {
         if node.stat().mode.perms != 0o600 || node.owners() != (0, 0) {
             return Err("a node starts at devtmpfs's 0600 root:root");
         }
-        narf_scheduler::block_on(node.set_perms(0o664)).map_err(|_| "chmod")?;
-        narf_scheduler::block_on(node.set_owners(0, 85)).map_err(|_| "chown")?;
+        run(node.set_perms(0o664)).map_err(|_| "chmod")?;
+        run(node.set_owners(0, 85)).map_err(|_| "chown")?;
         let again = lookup_node(3, 5).ok_or("relookup")?;
         if again.stat().mode.perms != 0o664 || again.owners() != (0, 85) {
             return Err("udev's chmod/chown survive a new lookup");
         }
-        narf_scheduler::block_on(again.set_xattr(ACL_XATTR, &[2, 0, 0, 0], 0))
+        run(again.set_xattr(ACL_XATTR, &[2, 0, 0, 0], 0))
             .map_err(|_| "acl")?;
-        if narf_scheduler::block_on(lookup_node(3, 5).ok_or("acl node")?.get_xattr(ACL_XATTR)).ok()
+        if run(lookup_node(3, 5).ok_or("acl node")?.get_xattr(ACL_XATTR)).ok()
             != Some(alloc::vec![2, 0, 0, 0])
         {
             return Err("the uaccess ACL persists");
@@ -1142,11 +1152,11 @@ fn smoke_usbfs_root_hub() -> TestResult {
     let other = __open_for_test(Target::RootHub(hub), None, true);
     let mem = Mem::new();
     let io = |f: &Arc<UsbfsFile>, cmd: u32, arg: u64| {
-        narf_scheduler::block_on(f.ioctl_user(cmd, arg, &mem))
+        run(f.ioctl_user(cmd, arg, &mem))
     };
     let r = (|| {
         let mut buf = [0u8; 18];
-        narf_scheduler::block_on(file.read(0, &mut buf)).map_err(|_| "read")?;
+        run(file.read(0, &mut buf)).map_err(|_| "read")?;
         if buf[..] != usbdev::root_hub_descriptors(&hub)[..18] {
             return Err("a root hub reads as its hcd.c descriptors");
         }
