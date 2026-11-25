@@ -375,7 +375,7 @@ impl Firmware {
 ///
 /// DCN 2.1 rides the same sequence for the same reason: `dmub_srv.c`
 /// gives `DMUB_ASIC_DCN21` the DCN 2.0 functions (`dmub_srv_dcn20_regs`
-/// + dcn20 funcs, with only the register table swapped to
+/// and dcn20 funcs, with only the register table swapped to
 /// `dmub_srv_dcn21_regs`), and every DMCUB register both tables define
 /// sits at the same offset in `dcn_2_1_0_offset.h` as in
 /// `dcn_2_0_0_offset.h`. The 2.1-specific reset and mailbox setup live

@@ -519,7 +519,7 @@ enum Kind {
     /// PSP 12.0 (Renoir MP0 11.0.3, Cezanne/Green Sardine MP0 12.0.1):
     /// Linux's `psp_v12_0`, which loads ASD + TA only — no TOC, no SOS
     /// upload (`psp_v12_0_init_microcode` calls `psp_init_asd_microcode`
-    /// + `psp_init_ta_microcode`; the TOC mechanism is PSP v13+ only).
+    /// and `psp_init_ta_microcode`; the TOC mechanism is PSP v13+ only).
     /// The ring protocol is version-identical to Phoenix/Raphael: the
     /// MP0 C2PMSG registers sit at the same offsets on `_BASE_IDX` 0
     /// (`mp_12_0_0_offset.h`).
