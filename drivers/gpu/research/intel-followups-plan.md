@@ -60,11 +60,12 @@ work had.
   MST and DSC fixtures over LT ports have landed; the DMC wakelock is not
   used, and an inherited wakelock mode blocks DC6.
 - Display 14 and later: deep colour, YCbCr 4:4:4 into a 4:2:0 PCON and
-  HDMI/DP audio (`narf.intel.hdmi14_ext=1`), a second concurrent external
+  HDMI/DP audio with the HDA driver's Intel HDMI codec on the audio
+  component (`narf.intel.hdmi14_ext=1`), a second concurrent external
   route (`narf.intel.ext_routes=2`), Panel Replay on the display-20/30 eDP
   (`narf.intel.panel_replay=1`) and compressed scanout (`narf.intel.ccs=1`)
-  have native fixtures only. Still open: their silicon runs, an Intel HDMI
-  codec in the HDA driver to consume the audio component, deep colour
+  have native fixtures only. Still open: their silicon runs, the HDA probe
+  deferral when the display binds after the HDA controller, deep colour
   through a branch, UHBR, MST or DSC, MST audio, DP YCbCr 4:2:0, MST or
   UHBR beside a second route, Panel Replay on the external routes (their
   console scanout has no frontbuffer tracking to exit replay) and with the

@@ -8283,9 +8283,10 @@ and `sound/hda/codecs/hdmi/intelhdmi.c`.
   HDMI SAD pruning, A/V sync delay), `find_audio_state`, `get_power`,
   `codec_wake_override`, `sync_audio_rate`, `get_eld`, `AUD_TS_CDCLK`
   around CDCLK changes and the 192 MHz `intel_audio_min_cdclk` floor. MST
-  routes take no audio. The component's power ops hold no power well (the
-  live route holds PW_2). NARF's HDA driver models no Intel HDMI codec, so
-  nothing consumes the component yet; the fixtures script `intel_pin2port`.
+  routes take no audio. The ELD is Linux's connector ELD (`drm_edid_to_eld`),
+  so a sink that declares only basic audio gets audio with a SAD-less ELD.
+  The component is bound at GPU probe and holds no power well (the live
+  route holds PW_2). The HDA driver's Intel HDMI codec consumes it.
 - HDMI FRL: Linux 7.4 has no native FRL link training for the source, so
   FRL stays refused (`HdmiError::FrlUnsupported` above 600 MHz on an FRL
   sink). Carried: `intel_hdmi_is_frl`, the sink's max FRL rate, the C20 FRL

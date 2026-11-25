@@ -143,7 +143,8 @@ with `register_display_audio_codec`, and the display side calls
 `sound/hda/core/component.c` over explicit halves (`ComponentError::NoDevice`
 for `-ENODEV`, `Invalid` for `-EINVAL`). No lock is held across a call into
 either half. The Intel display-14+ routes bind a component under
-`narf.intel.hdmi14_ext=1`; no HDA codec registers yet.
+`narf.intel.hdmi14_ext=1`, and the HDA driver's Intel HDMI codec registers
+the codec half when it binds to it.
 
 ### 3.1 Linux ALSA PCM and control ABI
 
