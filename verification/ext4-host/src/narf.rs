@@ -27,6 +27,7 @@ fn register_fstypes() {
 pub fn mount(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, String> {
     register_fstypes();
     narf_block::registry::__reset_for_test();
+    narf_drivers_fs_ext2::registry::__reset_for_test();
     disk_policy::__reset_root_for_test();
     disk_policy::__set_policy_for_test(Some(DiskPolicy::All));
     narf_block::register_partition_device(
@@ -118,5 +119,54 @@ pub fn walk(root: &Arc<dyn DirOps>) -> Result<Model, String> {
             }
         }
         Ok(m)
+    })
+}
+
+/// The image's filesystem UUID (`s_uuid`).
+pub fn image_uuid(image: &std::path::Path) -> [u8; 16] {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(image).expect("open image");
+    let mut uuid = [0u8; 16];
+    f.read_exact_at(&mut uuid, 1024 + 0x68)
+        .expect("read s_uuid");
+    uuid
+}
+
+/// What a `narf.disks=root-rw root=UUID=<uuid> rw` boot does: register the
+/// partition with its filesystem UUID, designate it as the root, then mount
+/// it through the named `ext4` constructor with a read-write request.
+pub fn mount_root_rw(
+    dev: Arc<dyn BlockDeviceSync>,
+    uuid: &[u8; 16],
+) -> Result<Arc<dyn FsInstance>, FsError> {
+    register_fstypes();
+    narf_block::registry::__reset_for_test();
+    narf_drivers_fs_ext2::registry::__reset_for_test();
+    disk_policy::__reset_root_for_test();
+    disk_policy::__set_policy_for_test(Some(DiskPolicy::RootRw));
+    let text = narf_block::partition::format_uuid_bytes(uuid).to_ascii_lowercase();
+    disk_policy::__set_root_arg_for_test(Some(Some(&format!("UUID={text}"))));
+    narf_block::register_partition_device(
+        PART,
+        "nvme0n1",
+        dev,
+        Some(narf_block::registry::PartitionMetadata {
+            fs_uuid: text,
+            partlabel: "root".into(),
+            ..Default::default()
+        }),
+    );
+    disk_policy::designate_root(PART, *uuid).map_err(|_| FsError::PermissionDenied)?;
+    let fstype = narf_filesystem::lookup_fstype("ext4").ok_or(FsError::NotFound)?;
+    let source = format!("/dev/{PART}");
+    fstype.init(&narf_filesystem::MountRequest {
+        fs_type: "ext4",
+        source: &source,
+        options: "",
+        uid: 0,
+        gid: 0,
+        umask: 0o022,
+        initial_namespace: true,
+        read_only: false,
     })
 }

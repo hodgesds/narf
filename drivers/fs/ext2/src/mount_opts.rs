@@ -155,7 +155,12 @@ fn kind_accepts(kind: Kind, value: Option<&str>) -> bool {
 /// supported" where Linux says "invalid argument", and `mount -o remount`
 /// prints that errno verbatim.)
 pub fn validate_remount(options: &str) -> Result<(), FsError> {
-    for item in options.split(',').filter(|s| !s.is_empty()) {
+    // `ro` / `rw` are superblock flags the VFS takes before the filesystem
+    // parses anything (`vfs_parse_sb_flag`); ext4 never sees them.
+    for item in options
+        .split(',')
+        .filter(|s| !s.is_empty() && *s != "ro" && *s != "rw")
+    {
         let (key, value) = match item.split_once('=') {
             Some((key, value)) => (key, Some(value)),
             None => (item, None),

@@ -37,6 +37,25 @@ registry without constructing a volume. Both mount syscall APIs invoke the
 registered constructor with a block source and options, then attach its returned
 `Arc<dyn FsInstance>` in the caller's namespace.
 
+The constructor takes the whole `MountRequest`:
+- **One volume per device** (`registry::mount`, Linux `get_tree_bdev`). A
+  second mount of the same device shares the first one's volume; one that
+  would change its read-only state fails with EBUSY.
+- **A read-only request** (`MS_RDONLY`, or `ro` in the data) mounts without
+  writing a byte.
+- **A read-write request the volume cannot honour** fails as Linux's does:
+  - EINVAL for a read-only-compatible feature Linux does not know
+    (`ext4_feature_set_ok`);
+  - a read-only mount without error for the READONLY feature;
+  - EROFS for a filesystem Linux would write and NARF does not, or a device
+    `narf.disks=` keeps read-only. libmount then retries read-only.
+- **The write gate** (`volume::sb_state::rw_refusal`) decides. Each refusal
+  is logged and recorded in `narf_filesystem::rw_refusal` for the
+  `narf.disks=root-rw` failure banner.
+- **Remount** (`reconfigure_sb_async`): `SB_RDONLY` (or `ro`) writes
+  everything back, flushes and marks the filesystem clean; clearing it runs
+  the gate again over the on-disk superblock.
+
 The driver implements `narf_filesystem::FsInstance` for `Ext2Volume`.
 Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 `DirOps`.

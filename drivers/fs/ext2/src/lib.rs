@@ -39,6 +39,7 @@ pub mod journal;
 pub mod metadata_csum;
 pub mod mount_opts;
 pub mod node;
+pub mod registry;
 pub mod superblock;
 #[doc(hidden)]
 pub mod testing;
@@ -87,33 +88,50 @@ pub fn register_initcalls() {
 fn ext_factory(
     dev: alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
-    use alloc::sync::Arc;
-    use narf_block::SyncBlock;
-    use narf_driver_runtime::DomainId;
-
-    // SyncBlock::new returns Arc<SyncBlock> — exactly the
-    // `Arc<B: BlockDevice>` shape Ext2Volume::mount expects.
-    let async_dev = SyncBlock::new(dev);
-    let volume = narf_filesystem::fs_registry::mount_wait(volume::Ext2Volume::mount(
-        async_dev,
-        DomainId::DRIVER_0,
-    ))?;
-    Ok(volume as Arc<dyn narf_filesystem::FsInstance>)
+    let read_only = dev.is_read_only();
+    let volume = registry::mount(dev, read_only)?;
+    Ok(volume as alloc::sync::Arc<dyn narf_filesystem::FsInstance>)
 }
 
 /// Register named mount constructors without mounting a volume.
 pub fn register_fstypes() {
-    narf_filesystem::register_block_fstype("ext2", build_named);
-    narf_filesystem::register_block_fstype("ext3", build_named);
-    narf_filesystem::register_block_fstype("ext4", build_named);
+    narf_filesystem::register_block_fstype_ctx("ext2", build_named);
+    narf_filesystem::register_block_fstype_ctx("ext3", build_named);
+    narf_filesystem::register_block_fstype_ctx("ext4", build_named);
 }
 
+/// `mount -t ext4 <source>`: the device's volume, honouring a read-only
+/// request (`MS_RDONLY`, or `ro` in the data). A read-write request the
+/// volume cannot honour fails the way Linux's does:
+/// - a feature Linux does not know: `ext4_fill_super`'s EINVAL;
+/// - the READONLY feature: Linux mounts read-only without an error, and so
+///   does this;
+/// - a filesystem Linux would write and NARF does not, or a read-only
+///   device under `narf.disks=`: EROFS, which makes libmount retry
+///   read-only ("write-protected, mounted read-only"), so mountinfo stays
+///   truthful.
 fn build_named(
-    source: &str,
-    options: &str,
+    request: &narf_filesystem::MountRequest<'_>,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
-    mount_opts::validate_remount(options)?;
-    let name = source.strip_prefix("/dev/").unwrap_or(source);
-    let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
-    ext_factory(dev)
+    use narf_filesystem::FsError;
+    use volume::sb_state::Refusal;
+
+    mount_opts::validate_remount(request.options)?;
+    let read_only = request.read_only || request.options.split(',').any(|o| o == "ro");
+    let name = request
+        .source
+        .strip_prefix("/dev/")
+        .unwrap_or(request.source);
+    let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
+    let volume = registry::mount(dev, read_only)?;
+    if !read_only && volume.is_read_only() {
+        return match volume.refusal() {
+            Some(Refusal::ReadOnlyFeature) => {
+                Ok(volume as alloc::sync::Arc<dyn narf_filesystem::FsInstance>)
+            }
+            Some(Refusal::Unsupported(_)) => Err(FsError::InvalidData),
+            Some(Refusal::Gate(_)) | None => Err(FsError::ReadOnly),
+        };
+    }
+    Ok(volume as alloc::sync::Arc<dyn narf_filesystem::FsInstance>)
 }

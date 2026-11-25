@@ -545,7 +545,7 @@ pub fn try_mount_root_with_options(
         if options.designate
             && !options.read_only
             && !options.tmpfs_overlay
-            && detect == FsType::Btrfs
+            && matches!(detect, FsType::Btrfs | FsType::Ext)
             && narf_boot::args().has_flag("narf.rootlog")
         {
             crate::root_bootlog::start(fs.as_ref());

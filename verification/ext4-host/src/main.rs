@@ -31,7 +31,8 @@ USAGE: narf-ext4-host [OPTIONS]
   --seed N          first workload seed (default 1)
   --seeds N         seeds per scenario (default 2)
   --ops N           operations per run (default 1500)
-  --scenario LIST   comma-separated subset of: baseline (default all)
+  --scenario LIST   comma-separated subset of: baseline,lifecycle,gate
+                    (default all)
   --workdir DIR     scratch directory (default target/ext4-host)
   --keep            keep the images of passing runs
 ";
@@ -129,17 +130,131 @@ fn baseline(o: &Opts, seed: u64) -> Result<String, String> {
         max_file: 256 * 1024,
     })?;
     host::block_on(fs.root().syncfs()).map_err(|e| format!("final syncfs: {e:?}"))?;
+    // The workload's directory handles hold the volume: let go of them too,
+    // so the last unmount marks the filesystem clean.
+    let (model, counts) = (w.model.clone(), format!("{:?}", w.counts));
+    drop(w);
     drop(fs);
     narf_block::registry::__reset_for_test();
+    if sb_field(&fx.image, "Filesystem state") != "clean" {
+        return Err("the last unmount did not mark the filesystem clean".into());
+    }
     verdict(
         &fx.image,
-        &w.model,
+        &model,
         &o.workdir.join(format!("baseline-{seed}/rdump")),
     )?;
     if !o.keep {
         let _ = std::fs::remove_dir_all(o.workdir.join(format!("baseline-{seed}")));
     }
-    Ok(format!("{:?}", w.counts))
+    Ok(counts)
+}
+
+fn sb_field(image: &Path, name: &str) -> String {
+    check::superblock(image)
+        .get(name)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn debugfs_w(image: &Path, cmd: &str) {
+    let ok = std::process::Command::new("debugfs")
+        .args(["-w", "-R", cmd])
+        .arg(image)
+        .output()
+        .expect("run debugfs")
+        .status
+        .success();
+    assert!(ok, "debugfs -w {cmd}");
+}
+
+/// The superblock across a root-rw mount: "not clean" while mounted, one
+/// more mount counted, "clean" again after a remount read-only, and e2fsck
+/// finds nothing.
+fn lifecycle(o: &Opts, seed: u64) -> Result<String, String> {
+    use narf_filesystem::sb_flags::RDONLY;
+    let name = format!("lifecycle-{seed}");
+    let fx = fixture::build(&o.workdir, &name, &fixture::Spec::root(), seed);
+    let model = Model::load_host(&fx.tree);
+    let mounts_before: u32 = sb_field(&fx.image, "Mount count").parse().unwrap_or(0);
+    let uuid = narf::image_uuid(&fx.image);
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+    let fs = narf::mount_root_rw(dev, &uuid).map_err(|e| format!("root-rw mount: {e:?}"))?;
+    let dirty = sb_field(&fx.image, "Filesystem state");
+    let mounts: u32 = sb_field(&fx.image, "Mount count").parse().unwrap_or(0);
+    if dirty != "not clean" || mounts != mounts_before + 1 {
+        return Err(format!(
+            "mounted: state {dirty:?}, mount count {mounts} (was {mounts_before})"
+        ));
+    }
+    let mut w = Workload::new(seed, model, fs.root());
+    w.run(&Params {
+        ops: o.ops / 4,
+        roots: vec!["/work".into()],
+        hot_dirs: Vec::new(),
+        max_file: 128 * 1024,
+    })?;
+    host::block_on(fs.root().syncfs()).map_err(|e| format!("syncfs: {e:?}"))?;
+    if sb_field(&fx.image, "Filesystem state") != "not clean" {
+        return Err("syncfs must not mark the filesystem clean".into());
+    }
+    host::block_on(fs.reconfigure_sb_async(RDONLY, RDONLY, ""))
+        .map_err(|e| format!("remount read-only: {e:?}"))?;
+    let clean = sb_field(&fx.image, "Filesystem state");
+    if clean != "clean" {
+        return Err(format!("after remount read-only the state is {clean:?}"));
+    }
+    let (model, counts) = (w.model.clone(), format!("{:?}", w.counts));
+    drop(w);
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    verdict(&fx.image, &model, &o.workdir.join(format!("{name}/rdump")))?;
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+    }
+    Ok(counts)
+}
+
+/// root-rw refuses what e2fsck has not checked: an unclean filesystem, one
+/// with recorded errors, one with an orphan list. Each read-write request
+/// fails with EROFS and leaves the image bit-identical.
+fn gate(o: &Opts, seed: u64) -> Result<String, String> {
+    let name = format!("gate-{seed}");
+    let spec = fixture::Spec {
+        lib_files: 50,
+        packages: 10,
+        ..fixture::Spec::root()
+    };
+    let fx = fixture::build(&o.workdir, &name, &spec, seed);
+    let uuid = narf::image_uuid(&fx.image);
+    for (cmd, what) in [
+        ("ssv state 0", "an unclean filesystem"),
+        ("ssv state 3", "a filesystem with errors"),
+        ("ssv last_orphan 12", "an orphan list"),
+    ] {
+        let image = o.workdir.join(format!("{name}/case.img"));
+        std::fs::copy(&fx.image, &image).unwrap();
+        debugfs_w(&image, cmd);
+        let before = std::fs::read(&image).unwrap();
+        let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&image, 512));
+        match narf::mount_root_rw(dev, &uuid) {
+            Err(narf_filesystem::FsError::ReadOnly) => {}
+            other => {
+                return Err(format!(
+                    "{what}: root-rw must refuse with EROFS, got {:?}",
+                    other.map(|_| "a writable mount")
+                ))
+            }
+        }
+        narf_block::registry::__reset_for_test();
+        if std::fs::read(&image).unwrap() != before {
+            return Err(format!("{what}: a refused mount changed the image"));
+        }
+    }
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+    }
+    Ok("3 refusals".into())
 }
 
 fn main() {
@@ -147,7 +262,11 @@ fn main() {
     host::init();
     std::fs::create_dir_all(&o.workdir).unwrap();
     type Scenario = fn(&Opts, u64) -> Result<String, String>;
-    let all: [(&str, Scenario); 1] = [("baseline", baseline)];
+    let all: [(&str, Scenario); 3] = [
+        ("baseline", baseline),
+        ("lifecycle", lifecycle),
+        ("gate", gate),
+    ];
     let mut failed = 0;
     for (name, run) in all {
         if !o.scenarios.is_empty() && !o.scenarios.iter().any(|s| s == name) {

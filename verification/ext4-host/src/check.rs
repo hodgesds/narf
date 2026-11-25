@@ -38,7 +38,6 @@ pub fn debugfs_tree(image: &Path, scratch: &Path) -> Model {
     m
 }
 
-#[allow(dead_code)] // used by the gate and lifecycle scenarios
 /// `dumpe2fs -h` fields by name ("Filesystem state", "Mount count", ...).
 pub fn superblock(image: &Path) -> std::collections::BTreeMap<String, String> {
     let out = Command::new("dumpe2fs")

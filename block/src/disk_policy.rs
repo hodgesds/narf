@@ -12,7 +12,7 @@
 //! | `all`       | every device (the default; what QEMU test boots rely on)    |
 //! | `boot-only` | only the disk positively identified as the boot medium      |
 //! | `root-ro`   | nothing; the designated root may be mounted read-only       |
-//! | `root-rw`   | designated btrfs root and its verified EFI partition        |
+//! | `root-rw`   | designated btrfs/ext4 root and its verified EFI partition   |
 //!
 //! `boot-only`:
 //! - The guard rejects every [`BlockDeviceSync::write`] with
@@ -30,8 +30,9 @@
 //!   re-reads the UUID from the device itself, requires it to equal the
 //!   command line's, requires it to be unique among every registered device
 //!   (a cloned disk or a multi-device btrfs carries the same UUID: refused),
-//!   refuses an ESP / vfat partition, and under `root-rw` requires btrfs (the
-//!   one writer with a mount-time write-safety gate). It can succeed once.
+//!   refuses an ESP / vfat partition, and under `root-rw` requires btrfs or
+//!   ext4 (the writers with a mount-time write-safety gate: btrfs `rw_gate`,
+//!   ext4 `sb_state`). It can succeed once.
 //! - Under `root-rw` the designated partition's guard — identified by
 //!   its never-reused [`DevId`], never by name — passes writes. The whole
 //!   disk device and every other disk stay read-only. The root's unique,
@@ -84,8 +85,8 @@ pub enum DiskPolicy {
     /// Nothing is writable. The partition named by `root=UUID=` may be
     /// mounted read-only once designated ([`designate_root`]).
     RootRo,
-    /// The designated root (`root=UUID=`, btrfs) and its verified ESP
-    /// may be written.
+    /// The designated root (`root=UUID=`, btrfs or ext4) and its verified
+    /// ESP may be written.
     RootRw,
 }
 
@@ -448,10 +449,11 @@ pub enum PolicyError {
     /// multi-device btrfs).
     Ambiguous,
     /// The root candidate is an ESP or vfat filesystem. An ESP can only be
-    /// authorized separately, after a btrfs root has been designated.
+    /// authorized separately, after a root has been designated.
     EfiOrVfat,
-    /// `root-rw` requires btrfs, the writer with a write-safety gate.
-    NotBtrfs,
+    /// `root-rw` requires a filesystem whose writer has a write-safety gate:
+    /// btrfs (`rw_gate`) or ext4 (`sb_state`).
+    UnsupportedRootFs,
     /// A root was already designated this boot.
     AlreadyDesignated,
     /// An earlier designation was revoked; nothing is designated again.
@@ -559,8 +561,9 @@ pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), Policy
 }
 
 /// Designate a LUKS container by its outer UUID. The read-write policy also
-/// verifies that its authenticated decrypted view contains btrfs, while the
-/// original partition identity and uniqueness checks remain in force.
+/// verifies that its authenticated decrypted view contains btrfs or ext4,
+/// while the original partition identity and uniqueness checks remain in
+/// force.
 pub fn designate_encrypted_root(
     device_name: &str,
     container_uuid: [u8; 16],
@@ -610,15 +613,20 @@ fn designate_root_inner(
     if meta.is_efi_system_partition() || entry_is_vfat(entry) {
         return Err(PolicyError::EfiOrVfat);
     }
-    let root_is_btrfs = if let Some(view) = view {
+    let root_fs = if let Some(view) = view {
         crate::fs_detect::detect_filesystem_sync(view)
     } else {
         crate::fs_detect::detect_filesystem(&entry.dev)
     };
     if policy == DiskPolicy::RootRw
-        && !matches!(root_is_btrfs, Ok(Some(crate::fs_detect::FsType::Btrfs)))
+        && !matches!(
+            root_fs,
+            Ok(Some(
+                crate::fs_detect::FsType::Btrfs | crate::fs_detect::FsType::Ext
+            ))
+        )
     {
-        return Err(PolicyError::NotBtrfs);
+        return Err(PolicyError::UnsupportedRootFs);
     }
     // Unique by the registry's identity index (a duplicated partition UUID
     // yields no match) and by every whole-disk entry's own superblock.
@@ -658,10 +666,10 @@ fn designate_root_inner(
         return Err(PolicyError::Ambiguous);
     }
     let uuid = format_uuid_bytes(&fs_uuid);
-    let identity_kind = if view.is_some() {
-        "LUKS container"
-    } else {
-        "btrfs"
+    let identity_kind = match (view.is_some(), &root_fs) {
+        (true, _) => "LUKS container",
+        (false, Ok(Some(crate::fs_detect::FsType::Ext))) => "ext4",
+        (false, _) => "btrfs",
     };
     framed(&match policy {
         DiskPolicy::RootRw => alloc::format!(

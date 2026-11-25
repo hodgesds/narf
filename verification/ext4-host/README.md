@@ -26,4 +26,13 @@ Scenarios:
 
 - `baseline`: create, write, append, truncate, unlink, mkdir, rmdir, fast
   and slow symlinks, renames (within and across directories), fsync and
-  syncfs, under `/work` (linear directories).
+  syncfs, under `/work` (linear directories). The last unmount must leave
+  the filesystem clean.
+- `lifecycle`: the image mounted the way a `narf.disks=root-rw` boot mounts
+  it (registered, designated by `root=UUID=`, named `ext4` constructor).
+  While mounted, `dumpe2fs` must say "not clean" with one more mount
+  counted, `syncfs` must not change that, and a remount read-only must say
+  "clean".
+- `gate`: root-rw must refuse, with EROFS and without changing a byte, an
+  unclean filesystem (`ssv state 0`), one with recorded errors
+  (`ssv state 3`), and one with an orphan list (`ssv last_orphan 12`).
