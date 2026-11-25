@@ -358,9 +358,11 @@ pub const DDI_CLOCK_SELECT_MASK: u32 = 0xF << 12;
 /// 312.5/625 MHz selects need the fifth bit).
 pub const XE3_DDI_CLOCK_SELECT_MASK: u32 = 0x1F << 12;
 
-/// `XELPDP_DDI_CLOCK_SELECT_MASK(display)` for the window's display.
+/// `XELPDP_DDI_CLOCK_SELECT_MASK(display)` for the window's display: the
+/// five-bit field on display >= 30, which is Panther/Wildcat Lake's Cx0 view
+/// and Nova Lake's LT view.
 fn ddi_clock_select_mask<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
-    if mmio.cx0_xe3() {
+    if mmio.cx0_xe3() || mmio.has_lt_phy() {
         XE3_DDI_CLOCK_SELECT_MASK
     } else {
         DDI_CLOCK_SELECT_MASK
@@ -373,7 +375,12 @@ pub const TBT_CLOCK_REQUEST: u32 = 1 << 19;
 pub const TBT_CLOCK_ACK: u32 = 1 << 18;
 
 /// `intel_mtl_tbt_pll_enable_clock`: use the fabric's clock, with no
-/// C20 reset, SRAM or message-bus transaction against the USB-owned PHY.
+/// C20 or LT reset, SRAM or message-bus transaction against the USB-owned
+/// PHY. The clock mux takes `intel_mtl_tbt_clock_select` for the DP 1.4
+/// rates in the display's select field (five bits on display >= 30, where
+/// Linux also has the UHBR10/20 selects; UHBR is not routed here), then
+/// `DDI_CLK_VALFREQ` takes `intel_ddi_link_symbol_clock`, which is the port
+/// clock for an 8b/10b rate.
 pub fn enable_tbt_clock<M: MmioWindow + ?Sized>(
     mmio: &M,
     port: XeLpgPort,
@@ -405,10 +412,16 @@ pub fn enable_tbt_clock<M: MmioWindow + ?Sized>(
     if !wait_for(mmio, off, TBT_CLOCK_ACK, true, 100_000) || !mmio.display_access_ok() {
         return Err(Cx0Error::Timeout);
     }
+    // 7. DDI_CLK_VALFREQ to the intended DDI clock.
+    if let Some(valfreq) = port.clk_valfreq() {
+        mmio.write32(valfreq, rate.megabits_per_sec() * 100);
+        compiler_fence(Ordering::SeqCst);
+    }
     Ok(())
 }
 
 /// `intel_mtl_tbt_pll_disable_clock`; the fabric keeps its PHY and tunnel.
+/// The request drops, then the mux is gated and `DDI_CLK_VALFREQ` cleared.
 pub fn disable_tbt_clock<M: MmioWindow + ?Sized>(
     mmio: &M,
     port: XeLpgPort,
@@ -427,6 +440,11 @@ pub fn disable_tbt_clock<M: MmioWindow + ?Sized>(
         ddi_clock_select_mask(mmio) | FORWARD_CLOCK_UNGATE,
         0,
     );
+    // 6. DDI_CLK_VALFREQ to 0.
+    if let Some(valfreq) = port.clk_valfreq() {
+        mmio.write32(valfreq, 0);
+        compiler_fence(Ordering::SeqCst);
+    }
     Ok(())
 }
 /// `XELPDP_FORWARD_CLOCK_UNGATE` (PORT_CLOCK_CTL bit 10).
