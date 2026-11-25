@@ -26,6 +26,7 @@ pub mod amd_aoac;
 pub mod amd_asf;
 pub mod amd_pmc;
 pub mod amd_pmc_quirks;
+pub mod amd_smu;
 /// Battery / lid / buttons all consume the EC's platform-event
 /// feed. On aarch64 the equivalent path goes through SoC-specific
 /// PMIC drivers (not yet ported) — gate these on x86_64 too.

@@ -51,7 +51,7 @@ impl Fake {
         out
     }
 }
-impl Mailbox for Fake {
+impl SmuMailbox for Fake {
     fn read32(&mut self, offset: u32) -> u32 {
         self.regs[offset as usize / 4]
     }
@@ -73,6 +73,8 @@ impl Mailbox for Fake {
         self.delayed_us += us;
         self.now += us * 1000;
     }
+}
+impl Mailbox for Fake {
     fn map_table(&mut self, phys: u64) -> bool {
         self.table = Some(phys);
         phys != 0

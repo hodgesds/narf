@@ -46,17 +46,11 @@ const REGISTER_MSG_1AH_20H: u32 = 0x938; // linux: AMD_PMC_REGISTER_MSG_1AH_20H
 const REGISTER_MSG_1AH_80H: u32 = 0xa10; // linux: AMD_PMC_REGISTER_MSG_1AH_80H
 const REGISTER_ARG_1AH_80H: u32 = 0xa18; // linux: AMD_PMC_REGISTER_ARG_1AH_80H
 const REGISTER_RSP_1AH_80H: u32 = 0xa14; // linux: AMD_PMC_REGISTER_RSP_1AH_80H
-/// The window size and its offset from the SMN-reported base.
-pub const MAPPING_SIZE: u64 = 0x1000; // linux: AMD_PMC_MAPPING_SIZE
-pub const BASE_ADDR_OFFSET: u64 = 0x1_0000; // linux: AMD_PMC_BASE_ADDR_OFFSET
-pub const BASE_ADDR_LO: u32 = 0x13b1_02e8; // linux: AMD_PMC_BASE_ADDR_LO
-pub const BASE_ADDR_HI: u32 = 0x13b1_02ec; // linux: AMD_PMC_BASE_ADDR_HI
-const BASE_ADDR_LO_MASK: u32 = 0xffff; // linux: AMD_PMC_BASE_ADDR_LO_MASK
-const BASE_ADDR_HI_MASK: u32 = 0xfff0_0000; // linux: AMD_PMC_BASE_ADDR_HI_MASK
-
-const RESULT_OK: u32 = 0x01; // linux: AMD_PMC_RESULT_OK
-const RESULT_CMD_REJECT_BUSY: u32 = 0xfc; // linux: AMD_PMC_RESULT_CMD_REJECT_BUSY
-const RESULT_CMD_UNKNOWN: u32 = 0xfe; // linux: AMD_PMC_RESULT_CMD_UNKNOWN
+                                         // The window (AMD_PMC_MAPPING_SIZE, AMD_PMC_BASE_ADDR_*) and the response
+                                         // codes are shared with amd_pmf and live in `amd_smu`.
+use crate::amd_smu::{self, SmuError, SmuMailbox, BASE_ADDR_HI, BASE_ADDR_LO, MAPPING_SIZE};
+#[cfg(feature = "kernel-test")]
+use crate::amd_smu::{window, RESULT_OK};
 
 /// `enum amd_pmc_def`.
 const MSG_OS_HINT_PCO: u32 = 0x02; // linux: MSG_OS_HINT_PCO
@@ -82,11 +76,6 @@ pub const METRICS_SIZE: u64 = 4 * 4 + 8 * 8 + 2 * 32 * 8;
 // struct smu_metrics offsets.
 const METRICS_S0I3_LAST_ENTRY_STATUS: u64 = 8; // linux: n/a (offsetof(struct smu_metrics, s0i3_last_entry_status))
 const METRICS_TIMEIN_S0I3_LASTCAPTURE: u64 = 48; // linux: n/a (offsetof(struct smu_metrics, timein_s0i3_lastcapture))
-
-/// `readx_poll_timeout(..., PMC_MSG_DELAY_MIN_US, PMC_MSG_DELAY_MIN_US *
-/// RESPONSE_REGISTER_LOOP_MAX)`: 1 s.
-// linux: n/a (PMC_MSG_DELAY_MIN_US 50 * RESPONSE_REGISTER_LOOP_MAX 20000)
-const RESPONSE_TIMEOUT_NS: u64 = 50 * 20_000 * 1_000;
 
 /// `PCI_DEVICE_ID_AMD_CPU_ID_*` and the 1Ah root complexes.
 pub mod cpu_id {
@@ -114,6 +103,18 @@ pub struct CpuInfo {
     /// `scratch_reg`, for the idle mask; none on Picasso and Van Gogh.
     pub scratch: Option<u32>,
 }
+
+impl CpuInfo {
+    /// The PMC mailbox's registers in the shared SMU window.
+    pub const fn regs(&self) -> amd_smu::MailboxRegs {
+        amd_smu::MailboxRegs {
+            message: self.message,
+            argument: self.argument,
+            response: self.response,
+        }
+    }
+}
+
 const PCO_INFO: CpuInfo = CpuInfo {
     message: REGISTER_MESSAGE,
     argument: REGISTER_ARGUMENT,
@@ -189,27 +190,21 @@ pub fn cpu_info(root_device: u16) -> Result<CpuInfo, PmcError> {
     }
 }
 
-/// `amd_pmc_probe`'s base: the SMN words, masked as Linux masks them (the
-/// low word keeps bits 31:20, the high word bits 15:0), plus the offset.
-pub fn window(lo: u32, hi: u32) -> u64 {
-    let base = (u64::from(hi & BASE_ADDR_LO_MASK) << 32) | u64::from(lo & BASE_ADDR_HI_MASK);
-    base + BASE_ADDR_OFFSET
-}
-
-/// The hardware a PMC session reaches: the mailbox registers, the SMU's
-/// metrics table, and the FCH PM scratch byte.
-pub trait Mailbox {
-    fn read32(&mut self, offset: u32) -> u32;
-    fn write32(&mut self, offset: u32, value: u32);
-    /// Nanoseconds on a clock that runs through the park.
-    fn now_ns(&mut self) -> u64;
-    /// `usleep_range`/`msleep`: spin `us` microseconds.
-    fn delay_us(&mut self, us: u64) {
-        let end = self.now_ns().saturating_add(us * 1000);
-        while self.now_ns() < end {
-            core::hint::spin_loop();
+impl From<SmuError> for PmcError {
+    fn from(e: SmuError) -> Self {
+        match e {
+            SmuError::Timeout => PmcError::Timeout,
+            SmuError::Busy => PmcError::Busy,
+            SmuError::Unknown => PmcError::Unknown,
+            SmuError::Failed(code) => PmcError::Failed(code),
         }
     }
+}
+
+/// The hardware a PMC session reaches beyond the shared mailbox
+/// registers ([`SmuMailbox`]): the SMU's metrics table and the FCH PM
+/// scratch byte.
+pub trait Mailbox: SmuMailbox {
     /// `devm_ioremap` of the metrics table at `phys`; false if it failed.
     fn map_table(&mut self, phys: u64) -> bool;
     /// A u32 of the mapped table; 0 when nothing is mapped.
@@ -221,35 +216,12 @@ pub trait Mailbox {
     fn clear_fch_scratch_bit0(&mut self);
 }
 
-fn wait_response(mb: &mut impl Mailbox, info: &CpuInfo) -> Result<u32, PmcError> {
-    let deadline = mb.now_ns().saturating_add(RESPONSE_TIMEOUT_NS);
-    loop {
-        let value = mb.read32(info.response);
-        if value != 0 {
-            return Ok(value);
-        }
-        if mb.now_ns() >= deadline {
-            return Err(PmcError::Timeout);
-        }
-        core::hint::spin_loop();
-    }
+/// `amd_pmc_send_cmd` without a data reply, on this CPU's PMC mailbox
+/// ([`amd_smu::send`]).
+pub fn send(mb: &mut impl Mailbox, info: &CpuInfo, arg: u32, msg: u32) -> Result<(), PmcError> {
+    amd_smu::send(mb, &info.regs(), arg, msg).map_err(PmcError::from)
 }
 
-/// `amd_pmc_send_cmd` without a data reply: wait for the previous
-/// response, clear it, write the argument and the message, then wait for
-/// and decode the new response.
-pub fn send(mb: &mut impl Mailbox, info: &CpuInfo, arg: u32, msg: u32) -> Result<(), PmcError> {
-    wait_response(mb, info)?;
-    mb.write32(info.response, 0);
-    mb.write32(info.argument, arg);
-    mb.write32(info.message, msg);
-    match wait_response(mb, info)? {
-        RESULT_OK => Ok(()),
-        RESULT_CMD_REJECT_BUSY => Err(PmcError::Busy),
-        RESULT_CMD_UNKNOWN => Err(PmcError::Unknown),
-        other => Err(PmcError::Failed(other)),
-    }
-}
 /// `amd_pmc_send_cmd` with a data reply: the argument register, read after
 /// PMFW's `DELAY_MIN_US`.
 pub fn send_read(
@@ -258,9 +230,7 @@ pub fn send_read(
     arg: u32,
     msg: u32,
 ) -> Result<u32, PmcError> {
-    send(mb, info, arg, msg)?;
-    mb.delay_us(DELAY_MIN_US);
-    Ok(mb.read32(info.argument))
+    amd_smu::send_read(mb, &info.regs(), arg, msg, DELAY_MIN_US).map_err(PmcError::from)
 }
 
 /// `amd_pmc.delay_suspend` and `amd_pmc.disable_workarounds`.
@@ -488,10 +458,7 @@ struct Mmio {
     regs: u64,
     table: Option<u64>,
 }
-fn raw_ns() -> u64 {
-    narf_time::cycles_to_ns(narf_time::raw_cycles())
-}
-impl Mailbox for Mmio {
+impl SmuMailbox for Mmio {
     fn read32(&mut self, offset: u32) -> u32 {
         // SAFETY: the window is this driver's `ioremap` of the PMC's 4 KiB
         // (Device attributes), and every mailbox offset is inside it.
@@ -502,8 +469,10 @@ impl Mailbox for Mmio {
         unsafe { core::ptr::write_volatile((self.regs + u64::from(offset)) as *mut u32, value) }
     }
     fn now_ns(&mut self) -> u64 {
-        raw_ns()
+        amd_smu::raw_ns()
     }
+}
+impl Mailbox for Mmio {
     fn map_table(&mut self, phys: u64) -> bool {
         // SAFETY: PMFW owns the table at `phys` and hands its address out
         // for exactly this read-only use; Device attributes keep it
@@ -628,21 +597,6 @@ fn log(args: core::fmt::Arguments<'_>) {
     let _ = writeln!(narf_console::Writer, "amd_pmc: {args}");
 }
 
-/// An SMN read through the root complex's config window (`amd_smn_read`:
-/// index 0x60, data 0x64), serialized by the caller.
-fn smn_read(cfg: narf_memory::PhysAddr, address: u32) -> Option<u32> {
-    let index = narf_bus::ecam::ptr_for(cfg, 0x60)? as *mut u32;
-    let data = narf_bus::ecam::ptr_for(cfg, 0x64)? as *const u32;
-    narf_bus::ecam::ptr_for(cfg, 0x67)?;
-    // SAFETY: both aligned words lie within the root complex's live ECAM
-    // mapping; the probe runs once, before any other SMN user here.
-    let value = unsafe {
-        core::ptr::write_volatile(index, address);
-        core::ptr::read_volatile(data)
-    };
-    (value != u32::MAX).then_some(value)
-}
-
 /// `amd_pmc_probe` with `amd_pmc_quirks_init`: bind once, register the
 /// LPS0 hooks.
 pub fn init() -> Result<(), PmcError> {
@@ -664,9 +618,9 @@ pub fn init() -> Result<(), PmcError> {
     let narf_bus::BusKind::Pcie { cfg_phys, .. } = root.kind else {
         return Err(PmcError::Absent);
     };
-    let lo = smn_read(cfg_phys, BASE_ADDR_LO).ok_or(PmcError::Absent)?;
-    let hi = smn_read(cfg_phys, BASE_ADDR_HI).ok_or(PmcError::Absent)?;
-    let phys = window(lo, hi);
+    let lo = narf_bus::amd_smn::read(cfg_phys, BASE_ADDR_LO).ok_or(PmcError::Absent)?;
+    let hi = narf_bus::amd_smn::read(cfg_phys, BASE_ADDR_HI).ok_or(PmcError::Absent)?;
+    let phys = amd_smu::window(lo, hi);
     // SAFETY: the PMC's mailbox window is device MMIO that no other owner
     // maps; Device attributes keep the accesses uncached and ordered.
     let mapping = unsafe {
