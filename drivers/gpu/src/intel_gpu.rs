@@ -2440,6 +2440,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             }
         }
         HpdEvent::RetrainRequired(ddi) => {
+            hdcp_short_pulse(ddi);
             if mst_session_ddi() == Some(ddi) {
                 // MST links don't revalidate per-lane status the
                 // SST way; branch notifications are the change
@@ -2452,6 +2453,26 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             // Fresh retrain/activation remains a separate resource transaction.
         }
     }
+}
+
+/// HDCP's share of a DP short pulse on `ddi`: the live SST session's
+/// (`intel_dp_short_pulse`) or the MST session's (`intel_dp_mst_hpd_irq`)
+/// CP_IRQ goes to `intel_hdcp_handle_cp_irq`. Inert without
+/// `narf.intel.hdcp=1`.
+fn hdcp_short_pulse(ddi: crate::intel_gpu_ddi::Ddi) {
+    let sst = DP_SESSION
+        .lock()
+        .as_ref()
+        .is_some_and(|state| state.conn.ddi == ddi && state.live());
+    let mst = !sst && mst_session_ddi() == Some(ddi);
+    if !sst && !mst {
+        return;
+    }
+    with_display_info(|gpu| {
+        let window = gpu.mode_window();
+        let mut aux = crate::intel_gpu_aux::IntelAux::new(&window, ddi);
+        crate::intel_hdcp_live::short_pulse(&mut aux, crate::intel_hdcp_live::gen12_key(ddi), mst);
+    });
 }
 
 /// Tear down whichever session owns `ddi` after its sink went away.
@@ -2842,6 +2863,9 @@ pub(crate) fn service_external_sst(bar: &MmioRegion) {
         poll_external_hpd(&io, gpu.chip.generation)
     })
     .flatten();
+    if let Some(crate::intel_gpu_dp::HpdEvent::RetrainRequired(ddi)) = event {
+        hdcp_short_pulse(ddi);
+    }
     let stop = DP_SESSION.lock().as_ref().is_some_and(|state| {
         event == Some(crate::intel_gpu_dp::HpdEvent::Disconnected(state.conn.ddi))
     });

@@ -109,6 +109,11 @@ impl MtlMstRoute {
     pub fn stream_count(&self) -> usize {
         self.streams.len()
     }
+    /// The primary branch's AUX, for HDCP (its DPCD and the short pulse's
+    /// CP_IRQ in ESI0).
+    pub(crate) fn link_aux<'a, M: MmioWindow + ?Sized>(&self, io: &'a M) -> IntelAux<'a, M> {
+        self.link.aux(io)
+    }
 
     pub(super) fn connect<M: MmioWindow + ?Sized>(
         io: &M,

@@ -15,6 +15,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -26,6 +27,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::*;
 use crate::intel_hdcp_msg::{self as msg, GscFraming, GscPacketPort, HdcpPortData};
 use crate::intel_hdcp_shim::{self as shim, Ddc, DpShim, Dpcd, HdmiShim};
+use crate::intel_hdcp_live as live;
 
 // ── Driving ──────────────────────────────────────────────────────────
 
@@ -285,6 +287,11 @@ struct DpSink {
     fifo_at: usize,
     rx_status: u8,
     reads: Vec<u32>,
+    /// The CP_IRQs the sink raised so far; `None`: none delivered.
+    cp_irq: Option<u32>,
+    /// Announce H' (after AKE_No_Stored_km) and the pairing info (once H'
+    /// is read) by RxStatus and CP_IRQ, as a sink computing them does.
+    announce: bool,
 }
 
 impl DpSink {
@@ -339,6 +346,10 @@ impl Dpcd for DpSink {
             buf[0] = self.rx_status;
             return Ok(());
         }
+        if self.announce && addr == shim::DP_HDCP_2_2_REG_HPRIME_OFFSET {
+            self.rx_status |= 1 << 2;
+            self.cp_irq = self.cp_irq.map(|n| n + 1);
+        }
         let got = self.got(addr, buf.len());
         buf.copy_from_slice(&got);
         Ok(())
@@ -353,7 +364,15 @@ impl Dpcd for DpSink {
         if addr == shim::DP_AUX_HDCP_AKSV {
             self.fifo_at = 0;
         }
+        if self.announce && addr + data.len() as u32 == shim::DP_HDCP_2_2_REG_EKPUB_KM_OFFSET + 128
+        {
+            self.rx_status |= 1 << 1;
+            self.cp_irq = self.cp_irq.map(|n| n + 1);
+        }
         Ok(())
+    }
+    fn cp_irq_count(&mut self) -> Option<u32> {
+        self.cp_irq
     }
 }
 
@@ -1220,6 +1239,246 @@ fn smoke_intel_hdcp22_dp_mei() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp22_dp_mei);
 
+/// A DP AUX model of the device service IRQ vectors for
+/// [`shim::take_cp_irq`].
+struct IrqAux {
+    mem: BTreeMap<u32, u8>,
+    writes: Vec<(u32, Vec<u8>)>,
+}
+
+impl crate::dp_aux::AuxChannel for IrqAux {
+    fn transact<'a>(
+        &mut self,
+        req: &crate::dp_aux::AuxRequest<'_>,
+        reply: &'a mut [u8],
+    ) -> Result<crate::dp_aux::AuxResponse<'a>, crate::dp_aux::AuxError> {
+        use crate::dp_aux::{AuxCommand, AuxResponse, AuxStatus};
+        reply[0] = 0;
+        let n = match req.cmd {
+            AuxCommand::NativeRead => {
+                for i in 0..req.data.len() {
+                    reply[1 + i] = self.mem.get(&(req.address + i as u32)).copied().unwrap_or(0);
+                }
+                req.data.len()
+            }
+            AuxCommand::NativeWrite => {
+                self.writes.push((req.address, req.data.to_vec()));
+                0
+            }
+            _ => return Err(crate::dp_aux::AuxError::Nacked),
+        };
+        Ok(AuxResponse {
+            status: AuxStatus::Ack,
+            data: &reply[1..1 + n],
+        })
+    }
+}
+
+/// `intel_dp_short_pulse` / `intel_dp_mst_hpd_irq`: CP_IRQ in
+/// DP_DEVICE_SERVICE_IRQ_VECTOR (0x201) or ESI0 (0x2003) is acknowledged
+/// alone; no CP_IRQ, no write.
+fn smoke_intel_hdcp_cp_irq_vector() -> TestResult {
+    // SST: CP_IRQ beside AUTOMATED_TEST_REQUEST (bit 1).
+    let mut aux = IrqAux {
+        mem: BTreeMap::from([(0x201, 0x06)]),
+        writes: Vec::new(),
+    };
+    if shim::take_cp_irq(&mut aux, false) != Ok(true) || aux.writes != [(0x201, vec![0x04])] {
+        return TestResult::Fail("SST CP_IRQ not acknowledged alone");
+    }
+    // MST: ESI0, and a vector without CP_IRQ leaves the sink alone.
+    let mut aux = IrqAux {
+        mem: BTreeMap::from([(0x201, 0x04), (0x2003, 0x10)]),
+        writes: Vec::new(),
+    };
+    if shim::take_cp_irq(&mut aux, true) != Ok(false) || !aux.writes.is_empty() {
+        return TestResult::Fail("MST ESI0 without CP_IRQ written");
+    }
+    aux.mem.insert(0x2003, 0x14);
+    if shim::take_cp_irq(&mut aux, true) != Ok(true) || aux.writes != [(0x2003, vec![0x04])] {
+        return TestResult::Fail("MST CP_IRQ not acknowledged in ESI0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp_cp_irq_vector);
+
+/// The count of the shim's CP_IRQ waits and RxStatus reads.
+fn cp_irq_waits(env: &Env) -> usize {
+    env.delays.iter().filter(|&&d| d == CP_IRQ_WAIT_MS).count()
+}
+fn rx_status_reads(sink: &DpSink) -> usize {
+    sink.reads
+        .iter()
+        .filter(|&&a| a == shim::DP_HDCP_2_2_REG_RXSTATUS_OFFSET)
+        .count()
+}
+
+/// HDCP 2.2 over DP with CP_IRQ delivery (`intel_dp_hdcp2_wait_for_msg`):
+/// H' and the pairing info each end their wait at the sink's CP_IRQ and
+/// read RxStatus once; a lost CP_IRQ waits out the message timeout and
+/// then reads RxStatus once. A CP_IRQ that carries REAUTH_REQ runs the
+/// link check at once (`intel_hdcp_handle_cp_irq`), which takes the link
+/// to DESIRED; the next enable authenticates again.
+fn hdcp22_dp_cp_irq() -> TestResult {
+    let regs = Regs::new(1);
+    let d = Hdcp2Data::new(false);
+    let mut sink = DpSink::hdcp22(&d);
+    sink.rx_status = 0;
+    sink.cp_irq = Some(0);
+    sink.announce = true;
+    let mut s = DpShim::new(sink);
+    let mut fw = FwModel::new(&regs, 1, msg::HDCP_PROTOCOL_DP, Hdcp2Data::new(false));
+    let mut env = Env::default();
+    let mut link = HdcpLink::new(Protocol::Dp, 1, LineRekey::None, true);
+    let r = {
+        let mut cx = Ctx {
+            io: &regs,
+            shim: &mut s,
+            fw: Some(&mut fw),
+            env: &mut env,
+        };
+        drive(link.enable(&mut cx, 0))
+    };
+    if let Some(bad) = fw.bad {
+        return TestResult::Fail(bad);
+    }
+    if r != Some(Ok(())) || link.value != CpValue::Enabled || !link.hdcp2_encrypted {
+        return TestResult::Fail("HDCP 2.2 enable over CP_IRQ failed");
+    }
+    if rx_status_reads(&s.dpcd) != 2
+        || cp_irq_waits(&env) != 0
+        || env.delays.contains(&shim::DP_POLL_MS)
+    {
+        return TestResult::Fail("H' / pairing not taken at their CP_IRQ");
+    }
+    // The sink asks for re-authentication and raises CP_IRQ.
+    let mut card = crate::drm::card::Card::new("intel-gpu", "HDCP CP_IRQ", (1, 0, 0));
+    card.connectors.push(crate::drm::card::Connector {
+        id: 3,
+        connector_type: crate::drm::card::ConnectorType::DisplayPort,
+        connector_type_id: 1,
+        status: crate::drm::card::ConnectorStatus::Connected,
+        encoder_id: None,
+        modes: Vec::new(),
+    });
+    let index =
+        crate::drm_registry::register_drm_card_with_state(Arc::new(LiveCard), card);
+    live::__attach_for_test(index);
+    let key = live::xelpg_key(1, 1);
+    let route = live::RouteDesc {
+        key,
+        protocol: Protocol::Dp,
+        transcoder: 1,
+        link: live::RouteLink::Dp(shim::AuxPort::XeLpdp {
+            base: 0x16_4000,
+            tbt_io: false,
+        }),
+        display_ver: 14,
+        rekey: LineRekey::None,
+        cp_irq: true,
+    };
+    live::__bind_for_test(index, 3, route, link.clone(), u64::MAX);
+    s.dpcd.rx_status |= 1 << 3;
+    if live::__cp_irq_for_test(key) != 1 || live::__next_check_for_test(index, 3) != Some(0) {
+        return TestResult::Fail("CP_IRQ did not run the link check at once");
+    }
+    live::__reset_for_test();
+    let r = {
+        let mut cx = Ctx {
+            io: &regs,
+            shim: &mut s,
+            fw: Some(&mut fw),
+            env: &mut env,
+        };
+        drive(link.check_link(&mut cx))
+    };
+    if r != Some(Err(HdcpError::LinkStopped)) || link.value != CpValue::Desired {
+        return TestResult::Fail("REAUTH_REQ did not take the link to DESIRED");
+    }
+    // Userspace commits DESIRED again: a fresh authentication, announced
+    // by CP_IRQ as before.
+    s.dpcd.rx_status = 0;
+    let inits = fw.log.iter().filter(|&&c| c == 0x0003_1000).count();
+    let reads = rx_status_reads(&s.dpcd);
+    let r = {
+        let mut cx = Ctx {
+            io: &regs,
+            shim: &mut s,
+            fw: Some(&mut fw),
+            env: &mut env,
+        };
+        drive(link.enable(&mut cx, 0))
+    };
+    if r != Some(Ok(()))
+        || link.value != CpValue::Enabled
+        || fw.log.iter().filter(|&&c| c == 0x0003_1000).count() != inits + 1
+        || rx_status_reads(&s.dpcd) != reads + 2
+        || cp_irq_waits(&env) != 0
+    {
+        return TestResult::Fail("re-authentication after the CP_IRQ failed");
+    }
+    // A lost CP_IRQ: H' (1 s unpaired) and pairing (200 ms) are waited out
+    // in 1 ms steps, then RxStatus is read once each.
+    let regs = Regs::new(1);
+    let mut sink = DpSink::hdcp22(&d);
+    sink.cp_irq = Some(0);
+    let mut s = DpShim::new(sink);
+    let mut fw = FwModel::new(&regs, 1, msg::HDCP_PROTOCOL_DP, Hdcp2Data::new(false));
+    let mut env = Env::default();
+    let mut link = HdcpLink::new(Protocol::Dp, 1, LineRekey::None, true);
+    let r = {
+        let mut cx = Ctx {
+            io: &regs,
+            shim: &mut s,
+            fw: Some(&mut fw),
+            env: &mut env,
+        };
+        drive(link.enable(&mut cx, 0))
+    };
+    if r != Some(Ok(())) || rx_status_reads(&s.dpcd) != 2 || cp_irq_waits(&env) < 1150 {
+        return TestResult::Fail("a lost CP_IRQ did not wait out the timeouts");
+    }
+    TestResult::Pass
+}
+
+fn smoke_intel_hdcp22_dp_cp_irq() -> TestResult {
+    hdcp22_dp_cp_irq()
+}
+kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp22_dp_cp_irq);
+
+/// An Intel card in the DRM registry for the live service's fixtures.
+#[derive(Debug)]
+struct LiveCard;
+impl crate::drm_registry::DrmCard for LiveCard {
+    fn name(&self) -> &str {
+        "intel-hdcp-live-fixture"
+    }
+    fn driver(&self) -> &str {
+        "intel-gpu"
+    }
+    fn vendor_id(&self) -> u16 {
+        0xf00d
+    }
+    fn device_id(&self) -> u16 {
+        0xcaff
+    }
+    fn subsystem_vendor(&self) -> u16 {
+        0
+    }
+    fn subsystem_device(&self) -> u16 {
+        0
+    }
+    fn vbios_version(&self) -> Option<&str> {
+        None
+    }
+    fn gpu_busy_percent(&self) -> Option<u32> {
+        None
+    }
+    fn power_state(&self) -> &str {
+        "D0"
+    }
+}
+
 /// The HDMI sink script for an HDCP 2.2 repeater with one device.
 fn hdmi_repeater(d: &Hdcp2Data) -> HdmiSink {
     let mut s = HdmiSink::default();
@@ -1617,7 +1876,6 @@ kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp_aksv_transports);
 // ── Refusals ─────────────────────────────────────────────────────────
 
 fn smoke_intel_hdcp_refusals_without_option() -> TestResult {
-    use crate::intel_hdcp_live as live;
     // The fixture kernel boots without narf.intel.hdcp=1.
     if live::enabled() || opted_in() {
         return TestResult::Skip("narf.intel.hdcp=1 on the test command line");

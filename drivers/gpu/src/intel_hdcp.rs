@@ -167,6 +167,9 @@ pub const HDCP_CHECK_PERIOD_MS: u64 = 128 * 16;
 pub const HDCP2_CHECK_PERIOD_MS: u64 = 500;
 /// `HDCP_2_2_DELAY_BEFORE_ENCRYPTION_EN`.
 pub const DELAY_BEFORE_ENCRYPTION_MS: u64 = 200;
+/// How often a CP_IRQ wait looks at the shim's CP_IRQ count (the wait
+/// queue of `intel_dp_hdcp_wait_for_cp_irq`); no sink access.
+pub const CP_IRQ_WAIT_MS: u64 = 1;
 
 /// `DRM_HDCP_DDC_BCAPS` bits, `DRM_HDCP_MAX_DEVICE_EXCEEDED`,
 /// `DRM_HDCP_MAX_CASCADE_EXCEEDED`, `DRM_HDCP_NUM_DOWNSTREAM`.
@@ -381,6 +384,18 @@ pub trait HdcpShim: Send {
     fn config_stream_type(&mut self, is_repeater: bool, content_type: u8) -> Result<(), HdcpError>;
     /// `check_2_2_link`.
     fn check_2_2_link(&mut self) -> Result<LinkCheck, HdcpError>;
+    /// `intel_dp_hdcp_wait_for_cp_irq`'s condition: whether the sink raised
+    /// a CP_IRQ since the last message was read
+    /// (`cp_irq_count_cached != cp_irq_count`). `None` where nothing
+    /// delivers the sink's CP_IRQ (HDMI, or a DP route without a hotplug
+    /// owner): detectable messages are then polled every
+    /// [`MsgTiming::poll_ms`].
+    fn cp_irq_pending(&mut self) -> Option<bool> {
+        None
+    }
+    /// `hdcp->cp_irq_count_cached = atomic_read(&hdcp->cp_irq_count)`, once
+    /// a message is ready to read.
+    fn cp_irq_consume(&mut self) {}
 }
 
 /// Time, randomness and revocation for the engine.
@@ -1207,7 +1222,10 @@ impl HdcpLink {
     }
 
     /// `read_2_2_msg`: wait for the message as the shim's timing says,
-    /// then read it.
+    /// then read it. A detectable message on a shim that delivers CP_IRQ
+    /// waits for the sink's CP_IRQ up to the message timeout and then
+    /// checks its availability once (`intel_dp_hdcp2_wait_for_msg`); one
+    /// without CP_IRQ polls the availability every `poll_ms`.
     async fn read_msg<M, S, T, E>(
         &self,
         cx: &mut Ctx<'_, M, S, T, E>,
@@ -1221,7 +1239,17 @@ impl HdcpLink {
         E: HdcpEnv,
     {
         let timing = cx.shim.msg_timing(msg_id, self.is_paired)?;
-        let available = if timing.detectable {
+        let available = if timing.detectable && cx.shim.cp_irq_pending().is_some() {
+            let start = cx.env.now_us();
+            while cx.shim.cp_irq_pending() == Some(false)
+                && cx.env.now_us().saturating_sub(start) < timing.timeout_ms * 1000
+            {
+                cx.env.delay_ms(CP_IRQ_WAIT_MS).await;
+            }
+            cx.shim
+                .msg_available(msg_id)?
+                .ok_or(HdcpError::MsgTimeout)?
+        } else if timing.detectable {
             let start = cx.env.now_us();
             loop {
                 if let Some(size) = cx.shim.msg_available(msg_id)? {
@@ -1238,6 +1266,7 @@ impl HdcpLink {
             }
             0
         };
+        cx.shim.cp_irq_consume();
         let start = cx.env.now_us();
         let size = cx.shim.read_2_2_msg(msg_id, available, buf)?;
         if timing.read_timeout_ms > 0

@@ -3504,6 +3504,16 @@ impl MtlExternalService {
             MtlHpdKind::Connected(_) => ServiceOutcome::Unchanged,
             MtlHpdKind::Disconnected if owns => self.withdraw(io),
             MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::DpMst)) => {
+                // The sink's CP_IRQ to HDCP first (`intel_dp_mst_hpd_irq`).
+                if let Some(MtlRoute::Mst(route)) = self.route.as_ref() {
+                    let key = crate::intel_hdcp_live::xelpg_key(
+                        port as u8,
+                        self.route
+                            .as_ref()
+                            .map_or(0, |r| r.pipe().transcoder() as u8),
+                    );
+                    crate::intel_hdcp_live::short_pulse(&mut route.link_aux(io), key, true);
+                }
                 let unchanged = match self.route.as_mut() {
                     Some(MtlRoute::Mst(route)) => route.unchanged(io) == Ok(true),
                     _ => false,
@@ -3520,6 +3530,20 @@ impl MtlExternalService {
             }
             // HDMI has no IRQ_HPD (`intel_hdmi` installs no hpd_pulse).
             MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::Dp)) => {
+                // The sink's CP_IRQ to HDCP first (`intel_dp_short_pulse`'s
+                // device service IRQ).
+                if let Some(MtlRoute::Dp(route)) = self.route.as_ref() {
+                    let mut aux =
+                        IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
+                    crate::intel_hdcp_live::short_pulse(
+                        &mut aux,
+                        crate::intel_hdcp_live::xelpg_key(
+                            route.port() as u8,
+                            route.pipe().transcoder() as u8,
+                        ),
+                        false,
+                    );
+                }
                 let healthy = match self.route.as_ref() {
                     Some(MtlRoute::Dp(route)) => Some(route.link_ok(io)),
                     _ => None,
