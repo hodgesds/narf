@@ -150,6 +150,9 @@ use core::sync::atomic::{compiler_fence, AtomicU8, Ordering};
 mod mst;
 pub use mst::{MstFailure, MtlMstRoute};
 
+#[path = "intel_gpu_dp_uhbr.rs"]
+pub(crate) mod uhbr;
+
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
 use crate::dp_link_training::{
