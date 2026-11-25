@@ -1803,6 +1803,65 @@ kernel_abi! {
         unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), buf, record.len()) };
         0
     }
+
+    // ── ath9k.ko: softMAC PCIe state and config reads ────────────────────
+    //
+    // Additive exports for a softMAC PCIe driver (ath9k is the first
+    // consumer; `modules/DATAPATH_ABI_DESIGN.md`, "softMAC PCI control and
+    // host regulatory policy"). A softMAC chip has no firmware between the
+    // driver and the radio: the driver picks SerDes workarounds from the
+    // upstream link's ASPM policy and enforces the host regulatory domain
+    // itself. (Its bus-master gating uses the shared `narf_pci_command`.)
+
+    /// Fill `out` with the function's 20-byte PCI Express state record
+    /// (Device Capabilities/Control/Status, Link Capabilities/Status and the
+    /// upstream bridge's Link Control; layout in
+    /// `narf_bus::driver_match::module_pcie_state`). `len` must be at least
+    /// 20. Returns 0, `-EINVAL`, `-EOPNOTSUPP` (not PCI Express) or
+    /// `-ENODEV`.
+    ///
+    /// # Safety
+    /// `out` must name `len` writable bytes for the call.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pcie_state(dev: u64, out: *mut u8, len: usize) -> i32 {
+        if out.is_null() || len < narf_bus::driver_match::MODULE_PCIE_STATE_LEN {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pcie_state(owner, dev) {
+            Ok(record) => {
+                // SAFETY: non-null and at least `record.len()` writable bytes.
+                unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len()) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Read one aligned config dword at `offset` (`0x40 ..= 0xffc`: the
+    /// device-dependent region and extended space, never the standard
+    /// header) of the module's device into `out`. Read only. Returns 0,
+    /// `-EINVAL`, `-EIO` (beyond the function's config window) or
+    /// `-ENODEV`.
+    ///
+    /// # Safety
+    /// `out` must point to writable `u32` storage.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pci_config_read32(dev: u64, offset: u16, out: *mut u32) -> i32 {
+        if out.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pci_config_read32(owner, dev, offset) {
+            Ok(value) => {
+                // SAFETY: non-null; the module promises writable storage.
+                unsafe { out.write(value) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+    // ── end ath9k.ko block ───────────────────────────────────────────────
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -1902,6 +1961,97 @@ fn smoke_kabi_netif_exports_require_cap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_netif_exports_require_cap);
+
+/// The softMAC exports (ath9k.ko) and the regulatory record: link-time cap
+/// gated like their neighbours, bounded to their fields, and the record
+/// (NRGD v1) parses back to the host's active domain.
+fn smoke_kabi_softmac_exports() -> TestResult {
+    use narf_wireless::reg::{db, RegFlags, RegRule, RegulatoryDomain};
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    for (name, kind) in [
+        ("narf_pcie_state", narf_capabilities::CapKind::BusDevice),
+        (
+            "narf_pci_config_read32",
+            narf_capabilities::CapKind::BusDevice,
+        ),
+        (
+            "narf_wireless_regdomain",
+            narf_capabilities::CapKind::NetIface,
+        ),
+    ] {
+        match crate::symbols::resolve(name, None, &denied) {
+            Err(crate::symbols::ResolveError::CapMissing(missing)) if missing == kind => {}
+            _ => return TestResult::Fail("softMAC export resolved without its cap declaration"),
+        }
+    }
+    let mut state = [0u8; 20];
+    // SAFETY: live locals; no device context exists for this token.
+    let (short, no_state) = unsafe {
+        (
+            narf_pcie_state(0x5eed, state.as_mut_ptr(), 19),
+            narf_pcie_state(0x5eed, state.as_mut_ptr(), state.len()),
+        )
+    };
+    if short != -22 || no_state != -19 {
+        return TestResult::Fail("narf_pcie_state accepted an out-of-bounds request");
+    }
+    let mut word = 0u32;
+    // SAFETY: live local; no device context exists for this token.
+    let (header, unaligned, beyond, no_cfg) = unsafe {
+        (
+            narf_pci_config_read32(0x5eed, 0x04, &mut word),
+            narf_pci_config_read32(0x5eed, 0x702, &mut word),
+            narf_pci_config_read32(0x5eed, 0x1000, &mut word),
+            narf_pci_config_read32(0x5eed, 0x70c, &mut word),
+        )
+    };
+    if header != -22 || unaligned != -22 || beyond != -22 || no_cfg != -19 {
+        return TestResult::Fail("narf_pci_config_read32 accepted an out-of-bounds read");
+    }
+
+    let saved = db::get_domain();
+    let domain = RegulatoryDomain {
+        country_code: *b"DE",
+        rules: alloc::vec![
+            RegRule {
+                freq_start_mhz: 2400,
+                freq_end_mhz: 2483,
+                max_bandwidth_mhz: 40,
+                max_power_dbm: 20,
+                flags: RegFlags::empty(),
+            },
+            RegRule {
+                freq_start_mhz: 5250,
+                freq_end_mhz: 5330,
+                max_bandwidth_mhz: 80,
+                max_power_dbm: 20,
+                flags: RegFlags::NO_IR | RegFlags::AUTO_BW,
+            },
+        ],
+    };
+    db::set_domain(domain.clone());
+    let mut len = 0usize;
+    let mut record = [0u8; 64];
+    // SAFETY: live locals; a sizing call, then a copy into `record`.
+    let (sizing, sized, copied) = unsafe {
+        let sizing = narf_wireless_regdomain(core::ptr::null_mut(), 0, &mut len);
+        let sized = len;
+        (sizing, sized, narf_wireless_regdomain(record.as_mut_ptr(), record.len(), &mut len))
+    };
+    match saved {
+        Some(saved) => db::set_domain(saved),
+        None => db::clear_domain(),
+    }
+    if sizing != -105 || copied != 0 || sized != 12 + 2 * 16 || len != sized {
+        return TestResult::Fail("narf_wireless_regdomain sizing is wrong");
+    }
+    if narf_wireless::reg::parse_policy(&record[..len]) != Ok(domain) {
+        return TestResult::Fail("narf_wireless_regdomain record differs from the domain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_softmac_exports);
 
 /// Registration is idempotent: a second call must not duplicate entries,
 /// because the ABI hash sums over the table and would change.

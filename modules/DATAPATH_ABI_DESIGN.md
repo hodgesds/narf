@@ -705,3 +705,44 @@ Proof: `modules/e2e/rtw88` loads the real `rtw88.ko` (relocations, init,
 USB/PCI claims, refusal of a probe without a USB context, clean unload).
 QEMU emulates no Realtek USB Wi-Fi device, so the poller, netdev and
 regulatory paths run first on hardware.
+
+## softMAC PCI state and config reads
+
+Status: **implemented**; ath9k (every chip owner) is the first consumer. A
+softMAC chip has no firmware between the driver and the radio. The driver
+gates its own bus mastering around every DMA-stop proof, picks its SerDes
+workarounds from the upstream link's ASPM policy, and enforces the host
+regulatory domain itself, which it reads through the shared
+`narf_wireless_regdomain` (NRGD v1; "USB device poller and the regulatory
+domain" above). The bus-master gating uses the shared
+`narf_pci_command` (clear, then set, Memory Space / Bus Master / INTx
+Disable, and the register read back), added for mt76. The additive
+exports here, all primitive-only:
+
+```text
+narf_pcie_state(dev:u64, out:*mut u8, len:usize)->i32                         // BusDevice
+narf_pci_config_read32(dev:u64, offset:u16, out:*mut u32)->i32               // BusDevice
+```
+
+- **PCIe state** is a fixed 20-byte little-endian record:
+  - Device Capabilities u32
+  - Device Control u16
+  - Device Status u16
+  - Link Capabilities u32
+  - Link Status u16
+  - the upstream bridge's Link Control u16
+  - flags u8 (bit 0: that Link Control is present)
+  - 3 reserved bytes
+
+  It is read-only. `-EOPNOTSUPP` means the function has no PCI Express
+  capability.
+- **Config read** returns one aligned dword at `0x40..=0xffc`: the
+  device-dependent region and extended space, never the standard header
+  (identity, BARs and Command are the bus's). It is read-only. `-EIO` means
+  the offset is beyond the function's config window. ath9k reads AR9462's
+  L1-entry-latency word at `0x70c`.
+`modules/kabi` (`smoke_kabi_softmac_exports`) covers the cap gating, the
+state-record and config-read bounds, refusal without a device context, and
+and an NRGD regulatory record that parses back to the installed domain. There is still no
+general config-space write. Existing exports keep their signatures and
+semantics.

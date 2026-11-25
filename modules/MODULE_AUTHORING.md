@@ -223,6 +223,9 @@ So the surface is small and grows deliberately. Today:
 | `narf_smbios_read` | `(usize, *mut u8, usize, *mut usize) -> i32` | copy the firmware SMBIOS structure table from an offset; writes its total length; `-61` with no table |
 | `narf_firmware_signed` | `(u64) -> i32` | 1/0: whether an open firmware handle carries a verified signer; requires `Firmware` |
 | `narf_module_param` | `(*const u8, usize, *mut u8, usize, *mut usize) -> i32` | the calling module's parameter value (see [Module parameters](#module-parameters)); `-2` undeclared, `-105` with the needed length |
+| `narf_pcie_state` | `(u64, *mut u8, usize) -> i32` | 20-byte LE record: Device Caps/Control/Status, Link Caps/Status, upstream Link Control + presence flag; requires `BusDevice` |
+| `narf_pci_config_read32` | `(u64, u16, *mut u32) -> i32` | read-only aligned config dword at `0x40..=0xffc` (never the standard header); requires `BusDevice` |
+| `narf_wireless_regdomain` | `(*mut u8, usize, *mut usize) -> i32` | the host's installed regulatory domain as one NRGD v1 record (`narf_wireless::reg::parse_policy`'s layout); `-61` none, `-105` with the needed length; requires `NetIface` |
 
 Declare them as you would any foreign function:
 

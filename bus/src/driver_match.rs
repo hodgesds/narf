@@ -1953,6 +1953,89 @@ pub fn module_pcie_aspm(owner: u64, token: u64, aspmc: u16) -> Result<u16, i32> 
     }
 }
 
+// ── ath9k.ko: PCIe link state and a read-only config dword (additive) ──
+//
+// A softMAC driver reads the upstream link's ASPM policy to choose its
+// SerDes workarounds (`ath_pci_aspm_init`) and one device-specific config
+// word (AR9462's L1-entry latency). Both are read-only; there is still no
+// general config-space write. (Its bus-master gating uses the shared
+// `module_pci_command`.)
+
+/// Length of the [`module_pcie_state`] record.
+pub const MODULE_PCIE_STATE_LEN: usize = 20;
+
+/// The function's PCI Express state as a 20-byte little-endian record:
+///
+/// | Offset | Size | Field |
+/// |---|---|---|
+/// | 0 | 4 | Device Capabilities |
+/// | 4 | 2 | Device Control |
+/// | 6 | 2 | Device Status |
+/// | 8 | 4 | Link Capabilities |
+/// | 12 | 2 | Link Status |
+/// | 14 | 2 | upstream bridge's Link Control (0 when absent) |
+/// | 16 | 1 | flags: bit 0 = the upstream Link Control is present |
+/// | 17 | 3 | reserved, zero |
+///
+/// Read only. `-EOPNOTSUPP` for a function without a PCI Express capability.
+pub fn module_pcie_state(owner: u64, token: u64) -> Result<[u8; MODULE_PCIE_STATE_LEN], i32> {
+    let (cap, device) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return Err(-19);
+        };
+        (ctx.cap, ctx.device)
+    };
+    let read = cap.derive::<narf_capabilities::Read>().map_err(|_| -19)?;
+    let status = match cap.invoke(DeviceOp(|| crate::pci_express::read_status(&read, &device))) {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => return Err(-95),
+        Err(_) => return Err(-19),
+    };
+    let parent = crate::pci_express::parent_link_control(&read, &device).map_err(|_| -19)?;
+    let mut out = [0u8; MODULE_PCIE_STATE_LEN];
+    out[0..4].copy_from_slice(&status.device_caps.to_le_bytes());
+    out[4..6].copy_from_slice(&status.device_control.to_le_bytes());
+    out[6..8].copy_from_slice(&status.device_status.to_le_bytes());
+    out[8..12].copy_from_slice(&status.link_caps.to_le_bytes());
+    out[12..14].copy_from_slice(&status.link_status.to_le_bytes());
+    if let Some(control) = parent {
+        out[14..16].copy_from_slice(&control.to_le_bytes());
+        out[16] = 1;
+    }
+    Ok(out)
+}
+/// First config offset [`module_pci_config_read32`] reads: the
+/// device-dependent region and PCI Express extended space only. The
+/// standard header is the bus's (identity, BARs, Command).
+pub const MODULE_PCI_CONFIG_READ_FIRST: u16 = 0x40;
+
+/// Read one aligned config dword at `offset` (0x40 ..= 0xffc) of a
+/// module-owned function. Read only: there is still no general config-space
+/// write. ath9k reads AR9462's L1-entry-latency word at `0x70c`
+/// (`ath_pci_aspm_init`). `-EINVAL` for a header, unaligned or out-of-range
+/// offset; `-EIO` when the function's config window does not reach it.
+pub fn module_pci_config_read32(owner: u64, token: u64, offset: u16) -> Result<u32, i32> {
+    if !(MODULE_PCI_CONFIG_READ_FIRST..=0xffc).contains(&offset) || offset % 4 != 0 {
+        return Err(-22);
+    }
+    let (cap, device) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return Err(-19);
+        };
+        (ctx.cap, ctx.device)
+    };
+    match cap.invoke(DeviceOp(|| {
+        crate::pci::read_config32(&cap, &device, offset)
+    })) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(-5),
+        Err(_) => Err(-19),
+    }
+}
+// ── end ath9k.ko block ─────────────────────────────────────────────────
+
 /// A coherent DMA buffer whose CPU mapping the module may dereference.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ModuleMappedDma {
