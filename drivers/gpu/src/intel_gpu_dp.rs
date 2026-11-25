@@ -106,6 +106,9 @@ struct HpdPort {
     enable: u32,
     status: u32,
     long: u32,
+    /// The port's sense-inversion bit in `ctl` (Gen9 LP's
+    /// `BXT_DDI*_HPD_INVERT`; 0 elsewhere).
+    invert: u32,
 }
 
 /// ICP class, combo B: `SDE_DDI_HOTPLUG_ICP(HPD_PORT_B)`, `SHOTPLUG_CTL_DDI`
@@ -117,6 +120,7 @@ const ICP_B: HpdPort = HpdPort {
     enable: 0x80,
     status: 0x30,
     long: 0x20,
+    invert: 0,
 };
 /// ICP class, Rocket Lake TC1 (DDI D) with TGP (`tgl_hpd_pin`):
 /// `SDE_TC_HOTPLUG_ICP(HPD_PORT_TC1)`, `SHOTPLUG_CTL_TC` bits 3:0.
@@ -127,6 +131,7 @@ const ICP_TC1: HpdPort = HpdPort {
     enable: 0x8,
     status: 0x3,
     long: 0x2,
+    invert: 0,
 };
 /// ICP class, Rocket Lake TC2 (DDI E): `SHOTPLUG_CTL_TC` bits 7:4.
 const ICP_TC2: HpdPort = HpdPort {
@@ -136,6 +141,7 @@ const ICP_TC2: HpdPort = HpdPort {
     enable: 0x80,
     status: 0x30,
     long: 0x20,
+    invert: 0,
 };
 /// SPT class, port B: `SDE_PORTB_HOTPLUG_CPT`, `PCH_PORT_HOTPLUG` bits 4
 /// and 1:0.
@@ -146,6 +152,7 @@ const SPT_B: HpdPort = HpdPort {
     enable: 1 << 4,
     status: 0x3,
     long: 0x2,
+    invert: 0,
 };
 /// SPT class, Rocket Lake TC1 (DDI D) with CMP (`rkl_hpd_pin`:
 /// `HPD_PORT_C`): `SDE_PORTC_HOTPLUG_CPT`, bits 12 and 9:8.
@@ -156,6 +163,7 @@ const SPT_C: HpdPort = HpdPort {
     enable: 1 << 12,
     status: 0x300,
     long: 0x200,
+    invert: 0,
 };
 /// SPT class, Rocket Lake TC2 (DDI E) with CMP (`HPD_PORT_D`):
 /// `SDE_PORTD_HOTPLUG_CPT`, bits 20 and 17:16.
@@ -166,6 +174,7 @@ const SPT_D: HpdPort = HpdPort {
     enable: 1 << 20,
     status: 0x3_0000,
     long: 0x2_0000,
+    invert: 0,
 };
 
 /// Gen9 LP, port B: `GEN8_DE_PORT_HOTPLUG(HPD_PORT_B)` (bit 4),
@@ -177,6 +186,7 @@ const BXT_B: HpdPort = HpdPort {
     enable: 1 << 4,
     status: 0x3,
     long: 0x2,
+    invert: 1 << 3,
 };
 /// Gen9 LP, port C: DE port bit 5, `PCH_PORT_HOTPLUG` bits 12 and 9:8.
 const BXT_C: HpdPort = HpdPort {
@@ -186,6 +196,7 @@ const BXT_C: HpdPort = HpdPort {
     enable: 1 << 12,
     status: 0x300,
     long: 0x200,
+    invert: 1 << 11,
 };
 
 impl HpdBank {
@@ -496,6 +507,25 @@ impl HpdMonitor {
         }
         (sde, regs)
     }
+    /// The owned ports' invert bits in `reg` and the VBT's choice of them
+    /// (`bxt_hotplug_enables`), as (mask, value). Only Gen9 LP has any.
+    fn invert(&self, reg: u64) -> (u32, u32) {
+        let vbt = crate::intel_gpu_vbt::gen9_lp();
+        let mut mask = 0;
+        let mut value = 0;
+        for port in self.ports().iter().filter(|p| p.ctl == reg) {
+            mask |= port.invert;
+            let set = match port.ddi {
+                Ddi::B => vbt.hpd_invert_b,
+                Ddi::C => vbt.hpd_invert_c,
+                _ => false,
+            };
+            if set {
+                value |= port.invert;
+            }
+        }
+        (mask, value)
+    }
     fn qualify<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
         let Some(profile) = io.gen12_hpd_profile() else {
             if self.profile.is_some() {
@@ -561,7 +591,13 @@ impl HpdMonitor {
                 self.uncertain = true;
                 return;
             }
-            io.write32(reg, (ctl & !bank.all_status(reg)) | (ctl & status) | enable);
+            // bxt_hpd_detection_setup: each owned port's invert bit is the
+            // VBT's (`intel_hpd_hotplug_mask` clears it with the enable).
+            let (invert_mask, invert) = self.invert(reg);
+            io.write32(
+                reg,
+                (ctl & !bank.all_status(reg) & !invert_mask) | (ctl & status) | enable | invert,
+            );
         }
         let observed_ier = io.read32(sde_ier);
         let observed_imr = io.read32(sde_imr);
@@ -573,8 +609,10 @@ impl HpdMonitor {
                 continue;
             }
             let observed_ctl = io.read32(reg);
+            let (invert_mask, invert) = self.invert(reg);
             ok &= observed_ctl != u32::MAX
                 && observed_ctl & enable == enable
+                && observed_ctl & invert_mask == invert
                 && observed_ctl & status == 0;
         }
         if !ok || !io.display_access_ok() {
@@ -2805,6 +2843,46 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_gen9_lp_de_port_bank);
+
+    /// `bxt_hpd_detection_setup`: the VBT's invert bits replace firmware's.
+    /// Firmware left DDI B inverted; the VBT inverts only DDI C.
+    fn smoke_hpd_gen9_lp_vbt_invert() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gt::Gen9Platform;
+        use crate::intel_gpu_vbt::{install_gen9_lp_for_test, Gen9LpVbt};
+        let family = SourceFamily::Gen9 {
+            platform: Gen9Platform::GeminiLake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        let Some(profile) = HpdProfile::observed_for_source(family, 0, &[]) else {
+            return TestResult::Fail("Gemini Lake hotplug profile");
+        };
+        let io = DePortHpd {
+            profile,
+            level: Default::default(),
+            iir: Default::default(),
+            regs: Default::default(),
+            writes: Default::default(),
+        };
+        io.regs.borrow_mut().insert(super::SHOTPLUG, 1 << 3);
+        install_gen9_lp_for_test(Gen9LpVbt {
+            hpd_invert_b: false,
+            hpd_invert_c: true,
+            backlight_controller: 0,
+        });
+        let mut monitor = HpdMonitor::new();
+        let _ = monitor.poll(&io);
+        install_gen9_lp_for_test(Gen9LpVbt::default());
+        let ctl = io.read32(super::SHOTPLUG);
+        if monitor.uncertain()
+            || ctl & ((1 << 3) | (1 << 11)) != 1 << 11
+            || ctl & ((1 << 4) | (1 << 12)) != (1 << 4) | (1 << 12)
+        {
+            return TestResult::Fail("VBT invert bits replace firmware's");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_gen9_lp_vbt_invert);
 
     /// A power-well block whose STATE bits follow REQUEST in the driver
     /// AUX and DDI request registers.

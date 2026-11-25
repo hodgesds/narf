@@ -1129,6 +1129,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             if dev.chip.generation.backlight_supported() {
                 if dev.chip.generation == Generation::Skylake {
                     narf_drivers_backlight::intel_bl::install_spt(dev.gtt_mmadr);
+                } else if dev.chip.generation == Generation::Broxton {
+                    narf_drivers_backlight::intel_bl::install_bxt(
+                        dev.gtt_mmadr,
+                        crate::intel_gpu_vbt::gen9_lp().backlight_controller,
+                    );
                 } else {
                     narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
                 }

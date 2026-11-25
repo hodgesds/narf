@@ -1105,6 +1105,56 @@ fn vbt_backlight_block_by_version() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/intel_gpu_vbt", vbt_backlight_block_by_version);
 
+/// Gen9 LP: DDI B/C's `hpd_invert` from the first child on each port
+/// (`port_mapping`), and the LFP options' panel's backlight controller.
+fn vbt_gen9_lp_hpd_invert_and_backlight_controller() -> TestResult {
+    use device_type::*;
+    let children = [
+        Child::new(EDP, dvo_port::DPA).byte(23, 1 << 4),
+        Child::new(DP, dvo_port::DPB),
+        Child::new(HDMI, dvo_port::HDMIC).byte(23, 1 << 4),
+        // parse_ddi_port keeps the first child of a port.
+        Child::new(DP, dvo_port::DPB).byte(23, 1 << 4),
+    ];
+    let mut options = alloc::vec![0u8; 34];
+    options[0] = 2;
+    let mut backlight = alloc::vec![0u8; 305];
+    backlight[0] = 6;
+    backlight[1 + 6 * 2] = 2;
+    backlight[113 + 2] = 2 | (1 << 4);
+    let image = |version: u16, backlight: &Vec<u8>| {
+        VbtImage::new(version)
+            .block(
+                block::GENERAL_DEFINITIONS,
+                general_definitions(44, &children),
+            )
+            .block(block::LFP_OPTIONS, options.clone())
+            .block(block::LFP_BACKLIGHT, backlight.clone())
+            .build()
+    };
+    let facts = Gen9LpVbt::from_vbt(&Vbt::parse(&image(239, &backlight)).unwrap());
+    if facts
+        != (Gen9LpVbt {
+            hpd_invert_b: false,
+            hpd_invert_c: true,
+            backlight_controller: 1,
+        })
+    {
+        return TestResult::Fail("Gen9 LP invert and controller facts");
+    }
+    // Before BDB 191 the controller is 0; without a backlight block too.
+    let old = Gen9LpVbt::from_vbt(&Vbt::parse(&image(190, &backlight)).unwrap());
+    let none = Gen9LpVbt::from_vbt(&Vbt::parse(&image(239, &alloc::vec![7u8; 305])).unwrap());
+    if old.backlight_controller != 0 || none.backlight_controller != 0 {
+        return TestResult::Fail("controller 0 without a BDB 191+ backlight entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vbt",
+    vbt_gen9_lp_hpd_invert_and_backlight_controller
+);
+
 // ── OpRegion and option ROM ──────────────────────────────────────────
 
 fn opregion(major: u8, minor: u8, mboxes: u32) -> Vec<u8> {

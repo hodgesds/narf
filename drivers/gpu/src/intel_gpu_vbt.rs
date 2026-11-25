@@ -1706,6 +1706,64 @@ fn copy_firmware_ram(phys: u64, len: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Gen9 LP's VBT facts (`intel_bios_init` on Broxton / Gemini Lake).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gen9LpVbt {
+    /// `intel_bios_encoder_hpd_invert` for DDI B and C (`bxt_hotplug_enables`).
+    pub hpd_invert_b: bool,
+    pub hpd_invert_c: bool,
+    /// `vbt.backlight.controller` of the panel (`bxt_setup_backlight`): 0
+    /// before BDB 191, without a backlight block, or for a panel type
+    /// resolved only through the EDID PnP ID.
+    pub backlight_controller: u8,
+}
+
+impl Gen9LpVbt {
+    /// Linux's direct `port_mapping` (DVO HDMI/DP B and C), the first child
+    /// per port as `parse_ddi_port` keeps it.
+    pub fn from_vbt(vbt: &Vbt) -> Self {
+        let mut out = Self::default();
+        let (mut seen_b, mut seen_c) = (false, false);
+        for child in vbt.children() {
+            match child.dvo_port() {
+                dvo_port::HDMIB | dvo_port::DPB if !seen_b => {
+                    seen_b = true;
+                    out.hpd_invert_b = child.hpd_invert();
+                }
+                dvo_port::HDMIC | dvo_port::DPC if !seen_c => {
+                    seen_c = true;
+                    out.hpd_invert_c = child.hpd_invert();
+                }
+                _ => {}
+            }
+        }
+        if let PanelType::Index(panel) = vbt.panel_type(false) {
+            out.backlight_controller = vbt
+                .backlight_panel(panel)
+                .map_or(0, |backlight| backlight.controller);
+        }
+        out
+    }
+}
+
+static GEN9_LP_VBT: narf_lib::sync::IrqSafeSpinLock<Gen9LpVbt> =
+    narf_lib::sync::IrqSafeSpinLock::new(Gen9LpVbt {
+        hpd_invert_b: false,
+        hpd_invert_c: false,
+        backlight_controller: 0,
+    });
+
+/// Install `facts` as the probe would (tests only).
+#[cfg(any(test, feature = "kernel-test"))]
+pub fn install_gen9_lp_for_test(facts: Gen9LpVbt) {
+    *GEN9_LP_VBT.lock() = facts;
+}
+
+/// The installed Gen9 LP facts (all clear without a VBT, as in Linux).
+pub fn gen9_lp() -> Gen9LpVbt {
+    *GEN9_LP_VBT.lock()
+}
+
 /// `intel_bios_get_vbt` for an integrated part: the ACPI OpRegion named by
 /// `asls` (PCI config 0xFC), RVDA first, then mailbox #4. `None` leaves
 /// every consumer on its `init_vbt_missing_defaults` behaviour.
@@ -1864,6 +1922,13 @@ pub fn install_for_probe(
         crate::intel_gpu_gen12_combo_phy::VbtEdpSignal::Missing,
         |(vbt, _)| crate::intel_gpu_gen12_combo_phy::VbtEdpSignal::from_vbt(vbt),
     ));
+    // Gen9 LP: the DDI B/C hotplug sense inversion and the panel's
+    // backlight controller; without a VBT both stay at Linux's defaults.
+    if generation == Generation::Broxton {
+        *GEN9_LP_VBT.lock() = found
+            .as_ref()
+            .map_or(Gen9LpVbt::default(), |(vbt, _)| Gen9LpVbt::from_vbt(vbt));
+    }
     // The Pipe-A eDP PSR facts (intel_bios_init_panel's parse_psr and PSR
     // enable); without a VBT, psr.enable stays false as in Linux.
     if generation == Generation::MeteorLake {
