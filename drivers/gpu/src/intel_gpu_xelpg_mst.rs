@@ -109,6 +109,19 @@ impl MtlMstRoute {
     pub fn stream_count(&self) -> usize {
         self.streams.len()
     }
+    /// HDCP (`crate::intel_hdcp_live`): the primary branch's AUX (its
+    /// base and Thunderbolt mode) and the live streams as (CPU transcoder,
+    /// VCPI), the master's first.
+    pub(crate) fn hdcp_streams(&self) -> (u64, bool, Vec<(u8, u8)>) {
+        (
+            self.link.port.aux_base(),
+            self.link.tbt(),
+            self.streams
+                .iter()
+                .map(|s| (s.route.pipe().transcoder() as u8, s.vcpi))
+                .collect(),
+        )
+    }
     /// The primary branch's AUX, for HDCP (its DPCD and the short pulse's
     /// CP_IRQ in ESI0).
     pub(crate) fn link_aux<'a, M: MmioWindow + ?Sized>(&self, io: &'a M) -> IntelAux<'a, M> {

@@ -24,11 +24,13 @@
 //!
 //! ## Scope and refusals
 //!
-//! Display 12 and later, single-stream DP (not eDP) and HDMI, on a
-//! transcoder A–D: the `TRANS_HDCP` register layout (`TRANS_HDCP(display)`
-//! = `DISPLAY_VER >= 12`). Older displays, DP MST and every other
-//! transcoder are refused with [`HdcpError::Unsupported`] before any
-//! register access. HDCP 2.2 needs the firmware: the MEI HDCP client on
+//! Display 12 and later, DP (not eDP) and HDMI, on a transcoder A–D: the
+//! `TRANS_HDCP` register layout (`TRANS_HDCP(display)` =
+//! `DISPLAY_VER >= 12`). DP MST streams are [`mst::MstHdcp`]: the link
+//! on the master transcoder, each stream's encryption by its own
+//! transcoder's HDCP select. Older displays and every other transcoder
+//! are refused with [`HdcpError::Unsupported`] before any register
+//! access. HDCP 2.2 needs the firmware: the MEI HDCP client on
 //! display 12/13, the GSC on display 14 and later; without it the enable
 //! falls back to HDCP 1.4 for type-0 content, exactly as
 //! `intel_hdcp2_prerequisite` makes Linux do.
@@ -593,6 +595,37 @@ pub struct HdcpLink {
     /// `dig_port->hdcp.mst_type1_capable`.
     pub mst_type1_capable: bool,
     pub port_data: HdcpPortData,
+    /// `hdcp->stream_transcoder` of the DP MST stream being operated on;
+    /// `None` (`INVALID_TRANSCODER`) for SST and HDMI.
+    pub stream_transcoder: Option<u8>,
+    /// `dig_port->hdcp.num_streams`: the port's ENABLED connectors.
+    pub num_streams: u8,
+    /// The port's MST streams' payload IDs, in stream order
+    /// (`intel_hdcp_required_content_stream`'s stream IDs).
+    pub mst_vcpis: Vec<u8>,
+}
+
+/// Which HDCP versions an enable may use.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Versions {
+    pub hdcp2: bool,
+    pub hdcp1: bool,
+}
+
+impl Versions {
+    /// `_intel_hdcp_enable`: HDCP 2.2 when it can, else HDCP 1.4.
+    pub const ANY: Self = Self {
+        hdcp2: true,
+        hdcp1: true,
+    };
+    pub const HDCP2: Self = Self {
+        hdcp2: true,
+        hdcp1: false,
+    };
+    pub const HDCP1: Self = Self {
+        hdcp2: false,
+        hdcp1: true,
+    };
 }
 
 impl HdcpLink {
@@ -615,7 +648,24 @@ impl HdcpLink {
             auth_status: false,
             mst_type1_capable: false,
             port_data: HdcpPortData::gen12(protocol.fw()),
+            stream_transcoder: None,
+            num_streams: 0,
+            mst_vcpis: Vec::new(),
         }
+    }
+
+    /// `intel_hdcp_update_value`: the value, and the port's count of
+    /// ENABLED connectors.
+    pub fn update_value(&mut self, value: CpValue) {
+        if self.value == value {
+            return;
+        }
+        if self.value == CpValue::Enabled {
+            self.num_streams = self.num_streams.saturating_sub(1);
+        } else if value == CpValue::Enabled {
+            self.num_streams = self.num_streams.saturating_add(1);
+        }
+        self.value = value;
     }
 }
 
@@ -1081,6 +1131,10 @@ impl HdcpLink {
             HDCP_STATUS_ENC,
             ENCRYPT_STATUS_CHANGE_TIMEOUT_MS,
         )?;
+        // DP MST Auth Part 1 Step 2.a and 2.b: this stream's encryption.
+        if let Some(stream) = self.stream_transcoder {
+            self.mst_stream_encryption(cx, stream, true)?;
+        }
         if repeater {
             return self.auth_downstream(cx).await;
         }
@@ -1095,6 +1149,14 @@ impl HdcpLink {
         T: HdcpTransport + ?Sized,
         E: HdcpEnv,
     {
+        // An MST stream's encryption first; the link stays up while other
+        // connectors on the port use it.
+        if let Some(stream) = self.stream_transcoder {
+            self.mst_stream_encryption(cx, stream, false)?;
+            if self.num_streams > 0 {
+                return Ok(());
+            }
+        }
         self.hdcp_encrypted = false;
         cx.write(self.conf(), 0);
         cx.wait(self.status(), !0, 0, ENCRYPT_STATUS_CHANGE_TIMEOUT_MS)?;
@@ -1156,7 +1218,7 @@ impl HdcpLink {
             return Err(HdcpError::NotEnabled);
         }
         if cx.read(self.status()) & HDCP_STATUS_ENC == 0 {
-            self.value = CpValue::Desired;
+            self.update_value(CpValue::Desired);
             return Err(HdcpError::LinkStopped);
         }
         let good = match cx.shim.check_link_status() {
@@ -1167,11 +1229,11 @@ impl HdcpLink {
             return Ok(());
         }
         if let Err(e) = self.hdcp1_disable(cx) {
-            self.value = CpValue::Desired;
+            self.update_value(CpValue::Desired);
             return Err(e);
         }
         if let Err(e) = self.hdcp1_enable(cx).await {
-            self.value = CpValue::Desired;
+            self.update_value(CpValue::Desired);
             return Err(e);
         }
         Ok(())
@@ -1614,6 +1676,38 @@ impl HdcpLink {
             self.port_data.k = 0;
             return Err(HdcpError::LinkNotEncrypted);
         }
+        if let Some(stream) = self.stream_transcoder {
+            self.mst_stream_2_2_encryption(cx, stream, true)?;
+        }
+        Ok(())
+    }
+
+    /// `intel_hdcp_prepare_streams`: one stream of the content type for
+    /// SST and HDMI; for DP MST `intel_hdcp_required_content_stream`, every
+    /// stream of the port (the first only when it is the port's one stream),
+    /// all type 1 when the topology is type-1 capable and all type 0
+    /// otherwise. Nothing changes once the port is authenticated.
+    fn prepare_streams(&mut self) -> Result<(), HdcpError> {
+        if self.stream_transcoder.is_none() {
+            self.port_data.k = 1;
+            self.port_data.streams[0] = (0, self.content_type);
+            return Ok(());
+        }
+        if self.auth_status {
+            return Ok(());
+        }
+        if self.mst_vcpis.is_empty() || self.mst_vcpis.len() > msg::MAX_CONTENT_STREAMS {
+            return Err(HdcpError::Unsupported);
+        }
+        let ty = if self.mst_type1_capable {
+            msg::STREAM_TYPE1
+        } else {
+            msg::STREAM_TYPE0
+        };
+        for (i, &vcpi) in self.mst_vcpis.iter().enumerate() {
+            self.port_data.streams[i] = (vcpi, ty);
+        }
+        self.port_data.k = self.mst_vcpis.len() as u16;
         Ok(())
     }
 
@@ -1635,9 +1729,10 @@ impl HdcpLink {
             }
             ret = self.authenticate_sink(cx).await;
             if ret.is_ok() {
-                // intel_hdcp_prepare_streams for SST and HDMI.
-                self.port_data.k = 1;
-                self.port_data.streams[0] = (0, self.content_type);
+                ret = self.prepare_streams();
+                if ret.is_err() {
+                    break;
+                }
                 ret = self.propagate(cx).await;
                 if ret.is_err() {
                     break;
@@ -1686,10 +1781,13 @@ impl HdcpLink {
         Ok(())
     }
 
-    /// `_intel_hdcp2_disable`.
+    /// `_intel_hdcp2_disable`: an MST stream's encryption first; the link
+    /// stays up while other connectors use it, unless this is link
+    /// recovery.
     async fn hdcp2_disable<M, S, T, E>(
         &mut self,
         cx: &mut Ctx<'_, M, S, T, E>,
+        recovery: bool,
     ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
@@ -1697,6 +1795,12 @@ impl HdcpLink {
         T: HdcpTransport + ?Sized,
         E: HdcpEnv,
     {
+        if let Some(stream) = self.stream_transcoder {
+            self.mst_stream_2_2_encryption(cx, stream, false)?;
+            if self.num_streams > 0 && !recovery {
+                return Ok(());
+            }
+        }
         let ret = self.disable_encryption(cx);
         let _ = self.deauthenticate(cx).await;
         self.hdcp2_encrypted = false;
@@ -1720,11 +1824,18 @@ impl HdcpLink {
             return Err(HdcpError::NotEnabled);
         }
         if cx.read(self.hdcp2_status()) & LINK_ENCRYPTION_STATUS == 0 {
-            let _ = self.hdcp2_disable(cx).await;
-            self.value = CpValue::Desired;
+            let _ = self.hdcp2_disable(cx, true).await;
+            self.update_value(CpValue::Desired);
             return Err(HdcpError::LinkStopped);
         }
-        match cx.shim.check_2_2_link() {
+        // intel_dp_mst_hdcp2_check_link: only the connector that
+        // authenticated the port reads the sink's link status.
+        let check = if self.stream_transcoder.is_none() || self.is_repeater {
+            cx.shim.check_2_2_link()
+        } else {
+            Ok(LinkCheck::Protected)
+        };
+        match check {
             Ok(LinkCheck::Protected) => return Ok(()),
             Ok(LinkCheck::TopologyChange) => {
                 if self.repeater_topology(cx).await.is_ok() {
@@ -1733,8 +1844,8 @@ impl HdcpLink {
             }
             _ => {}
         }
-        let ret = self.hdcp2_disable(cx).await;
-        self.value = CpValue::Desired;
+        let ret = self.hdcp2_disable(cx, true).await;
+        self.update_value(CpValue::Desired);
         ret.and(Err(HdcpError::LinkStopped))
     }
 }
@@ -1755,17 +1866,37 @@ impl HdcpLink {
         T: HdcpTransport + ?Sized,
         E: HdcpEnv,
     {
+        self.enable_with(cx, content_type, Versions::ANY).await
+    }
+
+    /// [`HdcpLink::enable`] limited to `versions`.
+    pub async fn enable_with<M, S, T, E>(
+        &mut self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+        content_type: u8,
+        versions: Versions,
+    ) -> Result<(), HdcpError>
+    where
+        M: MmioWindow + Sync + ?Sized,
+        S: HdcpShim,
+        T: HdcpTransport + ?Sized,
+        E: HdcpEnv,
+    {
         self.content_type = content_type;
         self.port_data.hdcp_transcoder = msg::hdcp_transcoder(self.transcoder);
         let mut ret = Err(HdcpError::Type1Unavailable);
-        if !self.force_hdcp14 && self.hdcp2_capable(cx) {
+        if versions.hdcp2 && !self.force_hdcp14 && self.hdcp2_capable(cx) {
             ret = self.hdcp2_enable(cx).await;
         }
-        if ret.is_err() && self.content_type != msg::STREAM_TYPE1 && Self::hdcp1_capable(cx.shim) {
+        if ret.is_err()
+            && versions.hdcp1
+            && self.content_type != msg::STREAM_TYPE1
+            && Self::hdcp1_capable(cx.shim)
+        {
             ret = self.hdcp1_enable(cx).await;
         }
         if ret.is_ok() {
-            self.value = CpValue::Enabled;
+            self.update_value(CpValue::Enabled);
         }
         ret
     }
@@ -1785,9 +1916,9 @@ impl HdcpLink {
         if self.value == CpValue::Undesired {
             return Ok(());
         }
-        self.value = CpValue::Undesired;
+        self.update_value(CpValue::Undesired);
         if self.hdcp2_encrypted {
-            self.hdcp2_disable(cx).await
+            self.hdcp2_disable(cx, false).await
         } else if self.hdcp_encrypted {
             self.hdcp1_disable(cx)
         } else {
@@ -1845,7 +1976,7 @@ impl HdcpLink {
         self.auth_status = false;
         self.port_data.k = 0;
         if self.value == CpValue::Enabled {
-            self.value = CpValue::Desired;
+            self.update_value(CpValue::Desired);
         }
         session
     }
@@ -1875,9 +2006,14 @@ pub enum Commit {
 
 /// `intel_hdcp_update_pipe`'s decision for `uapi` against the link.
 pub fn update_pipe(link: &HdcpLink, uapi: Uapi) -> Commit {
-    let type_changed = uapi.content_type != link.content_type && uapi.cp != CpValue::Undesired;
+    update_pipe_for(link.value, link.content_type, uapi)
+}
+
+/// [`update_pipe`] against a connector's `value` and `content_type`.
+pub fn update_pipe_for(value: CpValue, content_type: u8, uapi: Uapi) -> Commit {
+    let type_changed = uapi.content_type != content_type && uapi.cp != CpValue::Undesired;
     if uapi.cp == CpValue::Undesired {
-        return if link.value == CpValue::Undesired {
+        return if value == CpValue::Undesired {
             Commit::Keep
         } else {
             Commit::Disable
@@ -1889,7 +2025,7 @@ pub fn update_pipe(link: &HdcpLink, uapi: Uapi) -> Commit {
         };
     }
     if uapi.cp == CpValue::Desired {
-        return if link.value != CpValue::Enabled {
+        return if value != CpValue::Enabled {
             Commit::Enable {
                 disable_first: false,
             }
@@ -1903,7 +2039,12 @@ pub fn update_pipe(link: &HdcpLink, uapi: Uapi) -> Commit {
 /// `intel_hdcp_enable`'s condition at encoder enable: DESIRED, or ENABLED
 /// that the driver has not (yet) enabled.
 pub fn enable_on_route(link: &HdcpLink, uapi: Uapi) -> bool {
-    uapi.cp == CpValue::Desired || (uapi.cp == CpValue::Enabled && link.value == CpValue::Undesired)
+    enable_on_route_for(link.value, uapi)
+}
+
+/// [`enable_on_route`] against a connector's `value`.
+pub fn enable_on_route_for(value: CpValue, uapi: Uapi) -> bool {
+    uapi.cp == CpValue::Desired || (uapi.cp == CpValue::Enabled && value == CpValue::Undesired)
 }
 
 /// `intel_hdcp_atomic_check`'s rule for a connector losing its CRTC (its
@@ -1939,6 +2080,9 @@ pub fn report(uapi: &mut Uapi, value: CpValue) -> bool {
 /// (`drm_cp_enum_list`, `drm_hdcp_content_type_enum_list`).
 pub const CONTENT_PROTECTION_NAME: &[u8] = b"Content Protection";
 pub const HDCP_CONTENT_TYPE_NAME: &[u8] = b"HDCP Content Type";
+
+#[path = "intel_hdcp_mst.rs"]
+pub mod mst;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_hdcp_tests.rs"]

@@ -28,6 +28,7 @@ use super::*;
 use crate::intel_hdcp_msg::{self as msg, GscFraming, GscPacketPort, HdcpPortData};
 use crate::intel_hdcp_shim::{self as shim, Ddc, DpShim, Dpcd, HdmiShim};
 use crate::intel_hdcp_live as live;
+use super::mst;
 
 // ── Driving ──────────────────────────────────────────────────────────
 
@@ -67,6 +68,8 @@ struct RegState {
     expect_v: [u32; 5],
     sha_done: bool,
     writes: Vec<(u64, u32)>,
+    /// An MST stream transcoder whose encryption never confirms.
+    stuck_stream: Option<u8>,
 }
 
 struct Regs(IrqSafeSpinLock<RegState>);
@@ -114,6 +117,34 @@ impl MmioWindow for Regs {
             return s.an[1];
         }
         let v = *s.regs.get(&off).unwrap_or(&0);
+        // DP MST: a stream is encrypted while its TRANS_DDI_FUNC_CTL HDCP
+        // select is set on an encrypted link (the master's
+        // LINK_ENCRYPTION_STATUS, or its HDCP 1.4 ENC).
+        for x in 0..4u8 {
+            let select = s.regs.get(&trans_ddi_func_ctl(x)).copied().unwrap_or(0)
+                & mst::TRANS_DDI_HDCP_SELECT
+                != 0
+                && s.stuck_stream != Some(x);
+            if off == mst::trans_hdcp2_stream_status(x) {
+                let link = s.regs.get(&trans_hdcp2_status(t)).copied().unwrap_or(0)
+                    & LINK_ENCRYPTION_STATUS
+                    != 0;
+                return v | if select && link {
+                    mst::STREAM_ENCRYPTION_STATUS
+                } else {
+                    0
+                };
+            }
+            if off == trans_hdcp_status(x) {
+                let enc = s.regs.get(&trans_hdcp_status(t)).copied().unwrap_or(0) & HDCP_STATUS_ENC
+                    != 0;
+                return v | if select && enc {
+                    mst::hdcp_status_stream_enc(x)
+                } else {
+                    0
+                };
+            }
+        }
         if off == HDCP_REP_CTL {
             let mut v = v | HDCP_SHA1_READY;
             if s.sha_done {
@@ -482,6 +513,9 @@ struct FwModel<'r> {
     fail: Option<(u32, u32, u32)>,
     log: Vec<u32>,
     bad: Option<&'static str>,
+    /// The (stream ID, type) pairs a DP MST port manages; `None` for SST
+    /// and HDMI (stream 0 of the content type).
+    mst_streams: Option<Vec<(u8, u8)>>,
 }
 
 impl core::fmt::Debug for FwModel<'_> {
@@ -502,6 +536,7 @@ impl<'r> FwModel<'r> {
             fail: None,
             log: Vec::new(),
             bad: None,
+            mst_streams: None,
         }
     }
 
@@ -555,7 +590,11 @@ impl<'r> FwModel<'r> {
                 out.extend(&self.d.riv);
             }
             0x0003_1007 => {
-                self.check(p == [self.content_type], "enable_auth stream_type");
+                let ty = self
+                    .mst_streams
+                    .as_ref()
+                    .map_or(self.content_type, |s| s[0].1);
+                self.check(p == [ty], "enable_auth stream_type");
                 if status == 0 {
                     self.regs
                         .set_bits(trans_hdcp2_status(self.t), LINK_AUTH_STATUS);
@@ -573,10 +612,18 @@ impl<'r> FwModel<'r> {
                 out.extend(&self.d.v);
             }
             0x0003_1009 => {
-                // seq_num_m 0 (be24), M', k = 1 (be16), {stream 0, type}.
+                // seq_num_m 0 (be24), M', k (be16), {stream ID, type}[k]:
+                // stream 0 of the content type for SST and HDMI.
+                let streams = self
+                    .mst_streams
+                    .clone()
+                    .unwrap_or_else(|| vec![(0, self.content_type)]);
                 let mut want = vec![0, 0, 0];
                 want.extend(&self.d.mprime);
-                want.extend([0, 1, 0, self.content_type]);
+                want.extend((streams.len() as u16).to_be_bytes());
+                for (id, ty) in streams {
+                    want.extend([id, ty]);
+                }
                 self.check(p == &want[..], "repeater_auth_stream_req payload");
             }
             0x0003_100a => {}
@@ -1376,6 +1423,7 @@ fn hdcp22_dp_cp_irq() -> TestResult {
         display_ver: 14,
         rekey: LineRekey::None,
         cp_irq: true,
+        mst: live::MstStreams::default(),
     };
     live::__bind_for_test(index, 3, route, link.clone(), u64::MAX);
     s.dpcd.rx_status |= 1 << 3;
@@ -1944,3 +1992,6 @@ kernel_test_in!(
     "drivers/gpu/intel_hdcp",
     smoke_intel_hdcp_refusals_without_option
 );
+
+#[path = "intel_hdcp_mst_tests.rs"]
+mod mst_tests;

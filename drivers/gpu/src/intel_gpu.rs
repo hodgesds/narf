@@ -2910,6 +2910,22 @@ pub(crate) fn hdcp_gen12_sessions(
     out
 }
 
+/// HDCP (`crate::intel_hdcp_live`): the live Gen12 MST session on `bar` as
+/// its DDI and streams (CPU transcoder index, VCPI), the master's first.
+pub(crate) fn hdcp_gen12_mst(
+    bar: &MmioRegion,
+) -> Option<(crate::intel_gpu_ddi::Ddi, alloc::vec::Vec<(u8, u8)>)> {
+    let session = MST_SESSION.lock();
+    let state = session.as_ref().filter(|s| s.bar == bar.phys.raw())?;
+    let streams: alloc::vec::Vec<(u8, u8)> = state
+        .link
+        .streams()
+        .iter()
+        .map(|s| (s.pipe.transcoder() as u8, s.vcpi))
+        .collect();
+    (!streams.is_empty()).then(|| (state.link.ddi(), streams))
+}
+
 /// No stop is inferred for unsupported HDMI/MST. Stopped SST leases remain
 /// permanently reserved; this is an admission fact, never permission to reuse.
 fn unsupported_external_for_bar(bar: &MmioRegion) -> bool {

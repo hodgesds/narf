@@ -3806,13 +3806,14 @@ pub fn route_live() -> bool {
     PRESENCE.live()
 }
 
-/// HDCP (`crate::intel_hdcp_live`): the live SST DP or HDMI route, unless
-/// a pass holds the service. MST is not reported.
+/// HDCP (`crate::intel_hdcp_live`): the live DP, HDMI or DP MST route,
+/// unless a pass holds the service. An MST route reports its streams, the
+/// master's first, and `transcoder` is the master's.
 pub(crate) fn hdcp_route() -> Option<crate::intel_hdcp_live::XelpgRoute> {
-    use crate::intel_hdcp_live::{RouteLink, XelpgRoute};
+    use crate::intel_hdcp_live::{MstStreams, RouteLink, XelpgRoute};
     let service = SERVICE.try_lock()?;
     let route = service.route.as_ref().filter(|r| r.live())?;
-    let (protocol, link) = match route {
+    let (protocol, link, mst) = match route {
         // HDCP is not offered on a 128b/132b route.
         MtlRoute::Dp(r) if r.probe.uhbr.is_some() => return None,
         MtlRoute::Dp(r) => (
@@ -3821,18 +3822,32 @@ pub(crate) fn hdcp_route() -> Option<crate::intel_hdcp_live::XelpgRoute> {
                 base: r.probe.port.aux_base(),
                 tbt_io: r.probe.tbt(),
             }),
+            MstStreams::default(),
         ),
         MtlRoute::Hdmi(r) => (
             crate::intel_hdcp::Protocol::Hdmi,
             RouteLink::Hdmi(r.probe.ddc),
+            MstStreams::default(),
         ),
-        MtlRoute::Mst(_) => return None,
+        MtlRoute::Mst(r) => {
+            let (base, tbt_io, streams) = r.hdcp_streams();
+            (
+                crate::intel_hdcp::Protocol::Dp,
+                RouteLink::Dp(crate::intel_hdcp_shim::AuxPort::XeLpdp { base, tbt_io }),
+                MstStreams::new(&streams)?,
+            )
+        }
+    };
+    let transcoder = match mst.as_slice().first() {
+        Some(&(master, _)) => master,
+        None => route.pipe().transcoder() as u8,
     };
     Some(XelpgRoute {
         port: route.port() as u8,
-        transcoder: route.pipe().transcoder() as u8,
+        transcoder,
         protocol,
         link,
+        mst,
     })
 }
 

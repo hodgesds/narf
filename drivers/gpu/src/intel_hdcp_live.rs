@@ -15,11 +15,12 @@
 //! NARF's Intel card has one connector for the output that owns it. With
 //! the option, the first service pass attaches the pair to that connector
 //! unless it is eDP, and binds it to the single live HDCP-capable external
-//! route of the function: a Gen12 HPD SST DP or HDMI session, a display
-//! 14+ SST DP or HDMI route, or, on a Tiger/Alder Lake card that kept the
-//! firmware's display, the route the firmware lit (read back from
-//! `TRANS_DDI_FUNC_CTL`). No route, or more than one, leaves the request
-//! as it is (`HdcpError::NoRoute`). DP MST is refused.
+//! route of the function: a Gen12 HPD SST DP, HDMI or DP MST session, a
+//! display 14+ SST DP, HDMI or DP MST route, or, on a Tiger/Alder Lake
+//! card that kept the firmware's display, the route the firmware lit (read
+//! back from `TRANS_DDI_FUNC_CTL`). No route, or more than one, leaves the
+//! request as it is (`HdcpError::NoRoute`). A DP MST route protects every
+//! one of its streams (`crate::intel_hdcp::mst::MstHdcp`).
 //!
 //! A DP route's short pulses reach HDCP ([`short_pulse`]): the sink's
 //! CP_IRQ (`DP_DEVICE_SERVICE_IRQ_VECTOR`, ESI0 on MST) is acknowledged,
@@ -65,6 +66,7 @@ use crate::drm::card::{ConnectorType, ContentProtection};
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_gmbus::PinPair;
+use crate::intel_hdcp::mst::MstHdcp;
 use crate::intel_hdcp::{
     self as hdcp, Commit, CpValue, Ctx, HdcpEnv, HdcpError, HdcpLink, LineRekey, Protocol, Srm,
     Uapi,
@@ -98,7 +100,38 @@ pub enum RouteLink {
     Hdmi(PinPair),
 }
 
-/// One live external SST route, as HDCP needs it.
+/// A DP MST route's streams as (CPU transcoder, VCPI), the master's
+/// first; empty for SST and HDMI.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MstStreams {
+    n: u8,
+    streams: [(u8, u8); MAX_MST_STREAMS],
+}
+
+/// `HDCP_2_2_MAX_CONTENT_STREAMS_CNT`, and transcoders A–D.
+const MAX_MST_STREAMS: usize = crate::intel_hdcp_msg::MAX_CONTENT_STREAMS;
+
+impl MstStreams {
+    /// `None` for more streams than a port can protect, or a stream on a
+    /// transcoder past D.
+    pub fn new(streams: &[(u8, u8)]) -> Option<Self> {
+        if streams.len() > MAX_MST_STREAMS || streams.iter().any(|&(t, _)| t > 3) {
+            return None;
+        }
+        let mut out = Self::default();
+        out.streams[..streams.len()].copy_from_slice(streams);
+        out.n = streams.len() as u8;
+        Some(out)
+    }
+    pub fn as_slice(&self) -> &[(u8, u8)] {
+        &self.streams[..usize::from(self.n)]
+    }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+}
+
+/// One live external route, as HDCP needs it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RouteDesc {
     /// Identity of the route (its port and pipe); a different key is a
@@ -114,6 +147,8 @@ pub struct RouteDesc {
     /// The route's short pulses reach [`short_pulse`] (a hotplug owner
     /// polls its port), so the sink's CP_IRQ ends the message waits.
     pub cp_irq: bool,
+    /// A DP MST route's streams (`transcoder` is the first, the master).
+    pub mst: MstStreams,
 }
 
 /// A display-14+ route as `intel_gpu_xelpg_external::hdcp_route` reports
@@ -124,6 +159,8 @@ pub struct XelpgRoute {
     pub transcoder: u8,
     pub protocol: Protocol,
     pub link: RouteLink,
+    /// A DP MST route's streams; empty for SST and HDMI.
+    pub mst: MstStreams,
 }
 
 /// The key of a Gen12 route on `ddi`.
@@ -205,6 +242,7 @@ pub fn inherited_gen12_route<M: MmioWindow + Sync + ?Sized>(
             display_ver: 12,
             rekey: LineRekey::None,
             cp_irq: false,
+            mst: MstStreams::default(),
         });
     }
     Ok(found)
@@ -271,6 +309,21 @@ fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
             display_ver: 12,
             rekey: LineRekey::None,
             cp_irq: true,
+            mst: MstStreams::default(),
+        });
+    }
+    if let Some((ddi, streams)) = crate::intel_gpu::hdcp_gen12_mst(bar) {
+        let mst = MstStreams::new(&streams).ok_or(HdcpError::Unsupported)?;
+        let master = mst.as_slice().first().ok_or(HdcpError::NoRoute)?.0;
+        out.push(RouteDesc {
+            key: gen12_key(ddi),
+            protocol: Protocol::Dp,
+            transcoder: master,
+            link: RouteLink::Dp(AuxPort::Gen12(ddi)),
+            display_ver: 12,
+            rekey: LineRekey::None,
+            cp_irq: true,
+            mst,
         });
     }
     if let Some(r) = crate::intel_gpu_xelpg_external::hdcp_route() {
@@ -283,6 +336,7 @@ fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
             display_ver: ver,
             rekey,
             cp_irq: true,
+            mst: r.mst,
         });
     }
     let firmware = crate::intel_gpu::with_controller(|g| g.firmware_display).unwrap_or(false);
@@ -568,6 +622,49 @@ fn firmware(display_ver: u8) -> Option<Box<dyn HdcpTransport>> {
 
 // ── Connectors and operations ────────────────────────────────────────
 
+/// The HDCP state behind one connector: one link (SST DP, HDMI) or every
+/// stream of a DP MST route.
+#[derive(Clone, Debug)]
+enum Engine {
+    Sst(HdcpLink),
+    Mst(MstHdcp),
+}
+
+impl Engine {
+    /// `intel_hdcp_init` for the route's connector(s).
+    fn for_route(r: &RouteDesc) -> Self {
+        if r.mst.is_empty() {
+            Self::Sst(HdcpLink::new(r.protocol, r.transcoder, r.rekey, true))
+        } else {
+            Self::Mst(MstHdcp::new(r.transcoder, r.mst.as_slice(), r.rekey, true))
+        }
+    }
+    fn value(&self) -> CpValue {
+        match self {
+            Self::Sst(l) => l.value,
+            Self::Mst(m) => m.value(),
+        }
+    }
+    fn content_type(&self) -> u8 {
+        match self {
+            Self::Sst(l) => l.content_type,
+            Self::Mst(m) => m.content_type(),
+        }
+    }
+    fn check_period_ms(&self) -> u64 {
+        match self {
+            Self::Sst(l) => l.check_period_ms(),
+            Self::Mst(m) => m.check_period_ms(),
+        }
+    }
+    fn force_off<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
+        match self {
+            Self::Sst(l) => l.force_off(io),
+            Self::Mst(m) => m.force_off(io),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum OpKind {
     Enable,
@@ -579,7 +676,7 @@ enum OpKind {
 
 #[derive(Debug)]
 struct OpDone {
-    link: HdcpLink,
+    link: Engine,
     kind: OpKind,
     result: Result<(), HdcpError>,
 }
@@ -593,7 +690,7 @@ struct Slot {
     dirty: bool,
     route: Option<RouteDesc>,
     /// `None` while an operation owns it.
-    link: Option<HdcpLink>,
+    link: Option<Engine>,
     op: Option<Op>,
     next_check_ns: u64,
     last: Option<HdcpError>,
@@ -723,7 +820,7 @@ fn publish(card: u32, connector: u32, value: CpValue) {
     }
 }
 
-fn start(kind: OpKind, mut link: HdcpLink, route: RouteDesc, content_type: u8) -> Op {
+fn start(kind: OpKind, mut link: Engine, route: RouteDesc, content_type: u8) -> Op {
     Box::pin(async move {
         let Some(io) = crate::intel_gpu::with_display_info(|g| g.mode_window()) else {
             return OpDone {
@@ -763,10 +860,10 @@ fn start(kind: OpKind, mut link: HdcpLink, route: RouteDesc, content_type: u8) -
     })
 }
 
-/// One operation on the link.
+/// One operation on the connector's link(s).
 async fn run<M, S, T, E>(
     kind: OpKind,
-    link: &mut HdcpLink,
+    engine: &mut Engine,
     cx: &mut Ctx<'_, M, S, T, E>,
     content_type: u8,
 ) -> Result<(), HdcpError>
@@ -776,6 +873,21 @@ where
     T: HdcpTransport + ?Sized,
     E: HdcpEnv,
 {
+    let link = match engine {
+        Engine::Sst(link) => link,
+        Engine::Mst(mst) => {
+            return match kind {
+                OpKind::Enable => mst.enable(cx, content_type).await,
+                OpKind::Disable => mst.disable(cx).await,
+                OpKind::Retype => {
+                    let _ = mst.disable(cx).await;
+                    mst.mark_desired();
+                    mst.enable(cx, content_type).await
+                }
+                OpKind::Check => mst.check_link(cx).await,
+            };
+        }
+    };
     match kind {
         OpKind::Enable => link.enable(cx, content_type).await,
         OpKind::Disable => link.disable(cx).await,
@@ -826,7 +938,7 @@ pub fn route_stopping<M: MmioWindow + ?Sized>(io: &M, key: u64) {
                     link.force_off(io);
                 }
                 (None, Some(r)) if cancelled => {
-                    HdcpLink::new(r.protocol, r.transcoder, r.rekey, true).force_off(io);
+                    Engine::for_route(&r).force_off(io);
                 }
                 _ => {}
             }
@@ -863,7 +975,7 @@ pub fn service(bar: &narf_bus::MmioRegion) {
                 || s.op.is_some()
                 || s.link
                     .as_ref()
-                    .is_some_and(|l| l.value != CpValue::Undesired))
+                    .is_some_and(|l| l.value() != CpValue::Undesired))
     });
     if !wanted {
         return;
@@ -907,8 +1019,8 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
             Ok(r) => (r, None),
             Err(e) => (None, Some(e)),
         };
-        let next: Option<(OpKind, RouteDesc)> = if s.route.map(|r| r.key) != current.map(|r| r.key)
-        {
+        // A different route, or the same MST route with other streams.
+        let next: Option<(OpKind, RouteDesc)> = if s.route != current {
             if let Some(mut link) = s.link.take() {
                 if let Some(io) = io.as_ref() {
                     link.force_off(io);
@@ -920,9 +1032,9 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
             s.last = error;
             match current {
                 Some(r) => {
-                    let link = HdcpLink::new(r.protocol, r.transcoder, r.rekey, true);
+                    let link = Engine::for_route(&r);
                     // intel_hdcp_enable at the route's encoder enable.
-                    let enable = hdcp::enable_on_route(&link, s.uapi);
+                    let enable = hdcp::enable_on_route_for(link.value(), s.uapi);
                     s.link = Some(link);
                     s.dirty = false;
                     enable.then_some((OpKind::Enable, r))
@@ -932,10 +1044,10 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
         } else if let (Some(r), Some(link)) = (s.route, s.link.as_ref()) {
             if s.dirty {
                 s.dirty = false;
-                match hdcp::update_pipe(link, s.uapi) {
+                match hdcp::update_pipe_for(link.value(), link.content_type(), s.uapi) {
                     Commit::Keep => None,
                     Commit::Report => {
-                        if hdcp::report(&mut s.uapi, link.value) {
+                        if hdcp::report(&mut s.uapi, link.value()) {
                             flip = Some(s.uapi.cp);
                         }
                         None
@@ -946,7 +1058,7 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
                     } => Some((OpKind::Retype, r)),
                     Commit::Enable { .. } => Some((OpKind::Enable, r)),
                 }
-            } else if link.value == CpValue::Enabled && narf_time::monotonic_ns() >= s.next_check_ns
+            } else if link.value() == CpValue::Enabled && narf_time::monotonic_ns() >= s.next_check_ns
             {
                 Some((OpKind::Check, r))
             } else {
@@ -986,7 +1098,7 @@ fn finish(i: usize, done: OpDone) {
             s.next_check_ns = now + done.link.check_period_ms() * 1_000_000;
         }
         s.last = done.result.err();
-        let changed = hdcp::report(&mut s.uapi, done.link.value);
+        let changed = hdcp::report(&mut s.uapi, done.link.value());
         s.link = Some(done.link);
         changed.then_some((s.card, s.connector, s.uapi.cp))
     };
@@ -1072,7 +1184,7 @@ pub(crate) fn __bind_for_test(
         .find(|s| s.card == card && s.connector == connector)
     {
         s.route = Some(route);
-        s.link = Some(link);
+        s.link = Some(Engine::Sst(link));
         s.next_check_ns = next_check_ns;
     }
 }
