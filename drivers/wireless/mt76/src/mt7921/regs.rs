@@ -49,6 +49,13 @@ pub const MTK_DEV_MT7921: u16 = 0x0608;
 pub const MTK_DEV_MT7921_ALT: u16 = 0x0616;
 /// MT7920 (DBDC variant). Cited at line 26 of `mt7921_pci_device_table`.
 pub const MTK_DEV_MT7920: u16 = 0x7920;
+/// MT7925 (Wi-Fi 7 2x2, CONNAC3). Cited as `0x7925` in upstream
+/// `mt7925/pci.c::mt7925_pci_device_table`.
+pub const MTK_DEV_MT7925: u16 = 0x7925;
+/// MT7925 alternate SKU — the PCI device id on Daniel's Alder Lake card
+/// (`14c3:0717`). Cited as `0x0717` in upstream
+/// `mt7925/pci.c::mt7925_pci_device_table`.
+pub const MTK_DEV_MT7925_ALT: u16 = 0x0717;
 
 /// Every PCI device id we register a match for. Sync with `name_for`.
 pub const ALL_DEV_IDS: &[u16] = &[
@@ -57,6 +64,8 @@ pub const ALL_DEV_IDS: &[u16] = &[
     MTK_DEV_MT7921,
     MTK_DEV_MT7921_ALT,
     MTK_DEV_MT7920,
+    MTK_DEV_MT7925,
+    MTK_DEV_MT7925_ALT,
 ];
 
 // ── Identity / revision (absolute addresses) ───────────────────────
@@ -209,6 +218,12 @@ pub const MT7961_ROM_PATCH: &str = "mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin";
 pub const MT7920_ROM_PATCH: &str = "mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin";
 /// ROM patch blob for MT7922.
 pub const MT7922_ROM_PATCH: &str = "mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin";
+/// Runtime ("WM") firmware blob name for MT7925-class silicon. Per
+/// upstream `mt792x.h:51` (`MT7925_FIRMWARE_WM`).
+pub const MT7925_FIRMWARE_WM: &str = "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin";
+/// ROM patch blob for MT7925. Per upstream `mt792x.h:59`
+/// (`MT7925_ROM_PATCH`).
+pub const MT7925_ROM_PATCH: &str = "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin";
 
 // ── EFUSE access ───────────────────────────────────────────────────
 //

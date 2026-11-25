@@ -554,6 +554,10 @@ pub const fn name_for(did: u16) -> &'static str {
         // bound-driver/log label aligned with the firmware and raw chip ID.
         MTK_DEV_MT7921_ALT => "mt7922-0616",
         MTK_DEV_MT7920 => "mt7921-7920",
+        MTK_DEV_MT7925 => "mt7921-7925",
+        // 0717 is a PCI alias for MT7925, not an MT7921 variant. Keep the
+        // bound-driver/log label aligned with the firmware and raw chip ID.
+        MTK_DEV_MT7925_ALT => "mt7925-0717",
         _ => "mt7921",
     }
 }
@@ -564,6 +568,7 @@ pub fn firmware_blobs_for(did: u16) -> (&'static str, &'static str) {
     match did {
         MTK_DEV_MT7922 | MTK_DEV_MT7921_ALT => (MT7922_ROM_PATCH, MT7922_FIRMWARE_WM),
         MTK_DEV_MT7920 => (MT7920_ROM_PATCH, MT7920_FIRMWARE_WM),
+        MTK_DEV_MT7925 | MTK_DEV_MT7925_ALT => (MT7925_ROM_PATCH, MT7925_FIRMWARE_WM),
         // MT7921 + MT7961 share the 7961 patch and RAM code.
         _ => (MT7961_ROM_PATCH, MT7961_FIRMWARE_WM),
     }

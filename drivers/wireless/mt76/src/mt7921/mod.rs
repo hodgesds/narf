@@ -77,7 +77,7 @@ pub use pci::{
 };
 pub use regs::{
     ALL_DEV_IDS, ITTIM_VENDOR, MTK_DEV_MT7920, MTK_DEV_MT7921, MTK_DEV_MT7921_ALT, MTK_DEV_MT7922,
-    MTK_DEV_MT7961, MTK_VENDOR,
+    MTK_DEV_MT7925, MTK_DEV_MT7925_ALT, MTK_DEV_MT7961, MTK_VENDOR,
 };
 
 /// Entry point invoked from the wireless crate's `register_initcalls`

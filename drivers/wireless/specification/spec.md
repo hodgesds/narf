@@ -957,8 +957,17 @@ PCI discovery does not publish a zero-MAC netdev/wiphy. Firmware, radio and
 station initialization precede packet admission through the retained transport. The legacy
 `full_bring_up` boundary returns `NotImplemented` without allocating or
 programming rings until it can retain every published allocation.
-PCI alias `14c3:0616` selects the MT7922 firmware pair. Register translation
-and selector encoding follow the local Linux reference at `ecd997b0189a`.
+PCI alias `14c3:0616` selects the MT7922 firmware pair. MT7925 is
+registered the same way: PCI ids `14c3:7925` and `14c3:0717` match
+(`name_for` gives `mt7921-7925` / `mt7925-0717`), and both select the
+MT7925 patch/RAM pair (`mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin`,
+`mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin`, per upstream
+`mt792x.h:51,59`). The probe's chip-id gate still rejects anything
+outside `{0x7961, 0x7922, 0x7920}`: no verified `MT_HW_CHIPID` value
+exists for the `14c3:0717` card yet (upstream has no explicit MT7925
+chip-id constant, only a `case 0x7925` firmware-name expectation), so
+real-hardware probe stays closed until that value is read off the card.
+Register translation and selector encoding follow the local Linux reference at `ecd997b0189a`.
 
 ### MT76 MCU/DMA firmware transport
 
