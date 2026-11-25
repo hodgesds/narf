@@ -14,7 +14,11 @@
 //!   `intel_hdcp_update_pipe`, `intel_hdcp_atomic_check` and the
 //!   property value updates (`intel_hdcp_update_value`,
 //!   `intel_hdcp_prop_work`).
-//! - `intel_hdcp_regs.h`: the display-12+ transcoder HDCP registers.
+//! - `intel_hdcp_regs.h`: the display-12+ transcoder HDCP registers and the
+//!   port-indexed ones of display 9 to 11 (`TRANS_HDCP(display)`), the
+//!   HDCP 1.4 repeater control (`intel_hdcp_get_repeater_ctl`), the key
+//!   load (`intel_hdcp_load_keys`: the pcode mailbox on Gen9 big core) and
+//!   PW_1 (`hdcp_key_loadable`) by display version ([`HdcpHw`]).
 //! - `drivers/gpu/drm/display/drm_hdcp_helper.c`: SRM parsing and
 //!   `drm_hdcp_check_ksvs_revoked` ([`Srm`]).
 //! - The sink side (`intel_hdcp_shim.h`) is [`HdcpShim`]; its DP and HDMI
@@ -24,14 +28,17 @@
 //!
 //! ## Scope and refusals
 //!
-//! Display 12 and later, DP (not eDP) and HDMI, on a transcoder A–D: the
+//! DP (not eDP) and HDMI on a transcoder A–D. Display 12 and later use the
 //! `TRANS_HDCP` register layout (`TRANS_HDCP(display)` =
-//! `DISPLAY_VER >= 12`). DP MST streams are [`mst::MstHdcp`]: the link
-//! on the master transcoder, each stream's encryption by its own
-//! transcoder's HDCP select. Older displays and every other transcoder
-//! are refused with [`HdcpError::Unsupported`] before any register
-//! access. HDCP 2.2 needs the firmware: the MEI HDCP client on
-//! display 12/13, the GSC on display 14 and later; without it the enable
+//! `DISPLAY_VER >= 12`); display 9 to 11 use the DDI port's `PORT_HDCP`
+//! block, on ports A to D only (`is_hdcp_supported`: `port < PORT_E`).
+//! DP MST streams are [`mst::MstHdcp`]: the link on the master transcoder,
+//! each stream's encryption by its own transcoder's HDCP select. Every
+//! other display, port and transcoder is refused with
+//! [`HdcpError::Unsupported`] before any register access. HDCP 2.2 needs
+//! the firmware and a platform `is_hdcp2_supported` admits: the MEI HDCP
+//! client below display 14 (display 10+, and Kaby/Coffee/Comet Lake on
+//! display 9), the GSC on display 14 and later; without it the enable
 //! falls back to HDCP 1.4 for type-0 content, exactly as
 //! `intel_hdcp2_prerequisite` makes Linux do.
 //!
@@ -131,6 +138,181 @@ pub const fn trans_hdcp2_ctl(t: u8) -> u64 {
 }
 pub const fn trans_hdcp2_status(t: u8) -> u64 {
     trans_reg(t, 0x664b4)
+}
+
+/// `_PORT_HDCP_AUTHENC(port, 0)` = `_PORT_HDCP2_BASE(port, 0)`: the
+/// `_PICK` of ports A to F (0x66800, 0x66500, 0x66600, 0x66700, 0x66a00,
+/// 0x66900) for display 9 to 11.
+pub const fn port_hdcp_base(port: u8) -> u64 {
+    match port {
+        0 => 0x66800,
+        1 => 0x66500,
+        2 => 0x66600,
+        3 => 0x66700,
+        4 => 0x66a00,
+        _ => 0x66900,
+    }
+}
+/// `PIPE_HDCP2_STREAM_STATUS(pipe)`: `_PICK` of 0x668c0, 0x665c0, 0x666c0,
+/// 0x667c0 (what `HDCP2_STREAM_STATUS` names below display 12).
+pub const fn pipe_hdcp2_stream_status(pipe: u8) -> u64 {
+    match pipe {
+        0 => 0x668c0,
+        1 => 0x665c0,
+        2 => 0x666c0,
+        _ => 0x667c0,
+    }
+}
+/// `PORT_HDCP2_AUTH_STREAM(port)`: `_MMIO_PORT(port, 0x66f00, 0x66f04)`.
+pub const fn port_hdcp2_auth_stream(port: u8) -> u64 {
+    0x66f00 + port as u64 * 4
+}
+
+/// `HDCP_DDIx_REP_PRESENT | HDCP_DDIx_SHA1_M0`, the HDCP 1.4 repeater
+/// control of a display 9-11 port (`intel_hdcp_get_repeater_ctl`): A is
+/// bit 29 | 2 << 20, B bit 30 | 1 << 20, C bit 28 | 3 << 20, D bit 27 |
+/// 4 << 20, E bit 25 | 6 << 20; Linux has no entry for F (0).
+pub const fn port_repeater_ctl(port: u8) -> u32 {
+    match port {
+        0 => 1 << 29 | 2 << 20,
+        1 => 1 << 30 | 1 << 20,
+        2 => 1 << 28 | 3 << 20,
+        3 => 1 << 27 | 4 << 20,
+        4 => 1 << 25 | 6 << 20,
+        _ => 0,
+    }
+}
+
+/// Where a link's HDCP registers sit (`TRANS_HDCP(display)`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HdcpRegs {
+    /// Display 12+: the CPU transcoder's `TRANS_HDCP_*` block.
+    Transcoder,
+    /// Display 9 to 11: the DDI port's `PORT_HDCP_*` block (port A = 0).
+    Port(u8),
+}
+
+impl HdcpRegs {
+    const fn at(self, t: u8, trans_a: u64, x: u64) -> u64 {
+        match self {
+            Self::Transcoder => trans_reg(t, trans_a),
+            Self::Port(port) => port_hdcp_base(port) + x,
+        }
+    }
+    /// `HDCP_CONF(display, trans, port)`.
+    pub const fn conf(self, t: u8) -> u64 {
+        self.at(t, 0x66400, 0x0)
+    }
+    /// `HDCP_ANINIT`.
+    pub const fn aninit(self, t: u8) -> u64 {
+        self.at(t, 0x66404, 0x4)
+    }
+    /// `HDCP_ANLO`.
+    pub const fn anlo(self, t: u8) -> u64 {
+        self.at(t, 0x66408, 0x8)
+    }
+    /// `HDCP_ANHI`.
+    pub const fn anhi(self, t: u8) -> u64 {
+        self.at(t, 0x6640c, 0xc)
+    }
+    /// `HDCP_BKSVLO`.
+    pub const fn bksvlo(self, t: u8) -> u64 {
+        self.at(t, 0x66410, 0x10)
+    }
+    /// `HDCP_BKSVHI`.
+    pub const fn bksvhi(self, t: u8) -> u64 {
+        self.at(t, 0x66414, 0x14)
+    }
+    /// `HDCP_RPRIME`.
+    pub const fn rprime(self, t: u8) -> u64 {
+        self.at(t, 0x66418, 0x18)
+    }
+    /// `HDCP_STATUS`.
+    pub const fn status(self, t: u8) -> u64 {
+        self.at(t, 0x6641c, 0x1c)
+    }
+    /// `HDCP2_AUTH`.
+    pub const fn hdcp2_auth(self, t: u8) -> u64 {
+        self.at(t, 0x66498, 0x98)
+    }
+    /// `HDCP2_CTL`.
+    pub const fn hdcp2_ctl(self, t: u8) -> u64 {
+        self.at(t, 0x664b0, 0xb0)
+    }
+    /// `HDCP2_STATUS`.
+    pub const fn hdcp2_status(self, t: u8) -> u64 {
+        self.at(t, 0x664b4, 0xb4)
+    }
+    /// `HDCP2_STREAM_STATUS(display, cpu_transcoder, pipe)` of the stream
+    /// on transcoder (and pipe) `t`.
+    pub const fn hdcp2_stream_status(self, t: u8) -> u64 {
+        match self {
+            Self::Transcoder => trans_reg(t, 0x664c0),
+            Self::Port(_) => pipe_hdcp2_stream_status(t),
+        }
+    }
+    /// `HDCP2_AUTH_STREAM(display, cpu_transcoder, port)`.
+    pub const fn hdcp2_auth_stream(self, t: u8) -> u64 {
+        match self {
+            Self::Transcoder => 0x66f00 + t as u64 * 4,
+            Self::Port(port) => port_hdcp2_auth_stream(port),
+        }
+    }
+    /// `intel_hdcp_get_repeater_ctl` for the link on transcoder `t`.
+    pub const fn repeater_ctl(self, t: u8) -> u32 {
+        match self {
+            Self::Transcoder => HdcpLink::repeater_ctl(t),
+            Self::Port(port) => port_repeater_ctl(port),
+        }
+    }
+}
+
+/// `SKL_PCODE_LOAD_HDCP_KEYS` (`intel_pcode_regs.h`).
+pub const SKL_PCODE_LOAD_HDCP_KEYS: u32 = 0x5;
+/// `SKL_PW_CTL_IDX_PW_1` (display 9) and `ICL_PW_CTL_IDX_PW_1` (11+).
+pub const SKL_PW_CTL_IDX_PW_1: u8 = 14;
+pub const ICL_PW_CTL_IDX_PW_1: u8 = 0;
+
+/// What `intel_hdcp.c` decides by display version for one port.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HdcpHw {
+    /// The register block (`TRANS_HDCP(display)`).
+    pub regs: HdcpRegs,
+    /// `intel_hdcp_load_keys`: display 9 except Broxton (and Gemini Lake,
+    /// display 10) starts the fuse load through the pcode mailbox
+    /// (`SKL_PCODE_LOAD_HDCP_KEYS`); every other display writes
+    /// `HDCP_KEY_LOAD_TRIGGER`.
+    pub pcode_key_load: bool,
+    /// PW_1's index in `HSW_PWR_WELL_CTL*` (`hdcp_key_loadable`).
+    pub pw1_idx: u8,
+}
+
+impl HdcpHw {
+    /// Display 12 and later.
+    pub const TRANSCODER: Self = Self {
+        regs: HdcpRegs::Transcoder,
+        pcode_key_load: false,
+        pw1_idx: ICL_PW_CTL_IDX_PW_1,
+    };
+
+    /// A display 9-11 port `port` (A = 0): `None` past D
+    /// (`is_hdcp_supported`). `display_ver` 9 is Skylake-family or
+    /// Broxton (`big_core` false), 10 Gemini Lake, 11 Ice/Elkhart/Jasper
+    /// Lake.
+    pub const fn legacy(display_ver: u8, big_core: bool, port: u8) -> Option<Self> {
+        if port > 3 || !matches!(display_ver, 9..=11) {
+            return None;
+        }
+        Some(Self {
+            regs: HdcpRegs::Port(port),
+            pcode_key_load: display_ver == 9 && big_core,
+            pw1_idx: if display_ver == 11 {
+                ICL_PW_CTL_IDX_PW_1
+            } else {
+                SKL_PW_CTL_IDX_PW_1
+            },
+        })
+    }
 }
 pub const AUTH_LINK_AUTHENTICATED: u32 = 1 << 31;
 pub const AUTH_LINK_TYPE: u32 = 1 << 30;
@@ -255,7 +437,8 @@ pub struct MsgTiming {
 pub enum HdcpError {
     /// `narf.intel.hdcp=1` is not set.
     Disabled,
-    /// Not a display-12+ SST DP/HDMI port on transcoder A–D.
+    /// Not an HDCP-capable DP/HDMI port on transcoder A–D (display 12+,
+    /// or a display 9-11 port A–D).
     Unsupported,
     /// No live route behind the connector (or several).
     NoRoute,
@@ -577,6 +760,8 @@ pub struct HdcpLink {
     pub protocol: Protocol,
     /// `hdcp->cpu_transcoder` (0..=3).
     pub transcoder: u8,
+    /// The display version's registers, key load and PW_1.
+    pub hw: HdcpHw,
     pub rekey: LineRekey,
     /// `hdcp->hdcp2_supported`: the platform has the HDCP 2.2 firmware.
     pub hdcp2_supported: bool,
@@ -635,6 +820,7 @@ impl HdcpLink {
             value: CpValue::Undesired,
             protocol,
             transcoder,
+            hw: HdcpHw::TRANSCODER,
             rekey,
             hdcp2_supported: hdcp2,
             force_hdcp14: false,
@@ -652,6 +838,18 @@ impl HdcpLink {
             num_streams: 0,
             mst_vcpis: Vec::new(),
         }
+    }
+
+    /// The port's HDCP hardware. A display 9-11 port's firmware data names
+    /// its DDI (`initialize_hdcp_port_data`: `intel_get_hdcp_ddi_index`)
+    /// and keeps the transcoder invalid forever.
+    pub fn with_hw(mut self, hw: HdcpHw) -> Self {
+        self.hw = hw;
+        self.port_data.hdcp_ddi = match hw.regs {
+            HdcpRegs::Transcoder => msg::HDCP_DDI_INVALID_PORT,
+            HdcpRegs::Port(port) => msg::hdcp_ddi_index(port),
+        };
+        self
     }
 
     /// `intel_hdcp_update_value`: the value, and the port's count of
@@ -747,10 +945,14 @@ where
 
 impl HdcpLink {
     fn conf(&self) -> u64 {
-        trans_hdcp_conf(self.transcoder)
+        self.hw.regs.conf(self.transcoder)
     }
     fn status(&self) -> u64 {
-        trans_hdcp_status(self.transcoder)
+        self.hw.regs.status(self.transcoder)
+    }
+    /// `intel_hdcp_get_repeater_ctl` for this link.
+    fn rep_ctl(&self) -> u32 {
+        self.hw.regs.repeater_ctl(self.transcoder)
     }
 
     /// `intel_hdcp_get_repeater_ctl` for display 12+.
@@ -758,13 +960,16 @@ impl HdcpLink {
         (1 << (31 - transcoder as u32)) | ((transcoder as u32 + 1) << 20)
     }
 
-    /// `hdcp_key_loadable`: PW_1 on. Linux checks its own driver request
-    /// and the state bit; a display NARF inherited from the firmware has
-    /// PW_1 on by the BIOS request, so the state bit of either request
+    /// `hdcp_key_loadable`: PW_1 (`SKL_DISP_PW_1`) on. Linux checks its
+    /// own driver request and the state bit, ORing in the BIOS request on
+    /// Gen9 big core (the DMC bug in `hsw_power_well_enabled`); a display
+    /// NARF inherited from the firmware has PW_1 on by the BIOS request, so
+    /// the state bit (`HSW_PWR_WELL_CTL_STATE(pw_idx)`) of either request
     /// register is taken.
-    fn key_loadable<M: MmioWindow + ?Sized>(io: &M) -> bool {
+    fn key_loadable<M: MmioWindow + ?Sized>(&self, io: &M) -> bool {
         let (bios, driver) = (io.read32(HSW_PWR_WELL_CTL1), io.read32(HSW_PWR_WELL_CTL2));
-        bios != u32::MAX && driver != u32::MAX && (bios | driver) & PW1_STATE != 0
+        let state = PW1_STATE << (2 * u32::from(self.hw.pw1_idx));
+        bios != u32::MAX && driver != u32::MAX && (bios | driver) & state != 0
     }
 
     /// `intel_hdcp_clear_keys`.
@@ -786,8 +991,10 @@ impl HdcpLink {
         );
     }
 
-    /// `intel_hdcp_load_keys` (display 12+: the `HDCP_KEY_CONF` trigger).
-    fn load_keys<M, S, T, E>(cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    /// `intel_hdcp_load_keys`: the `HDCP_KEY_CONF` trigger, or on Gen9 big
+    /// core `SKL_PCODE_LOAD_HDCP_KEYS` with data 1 through the pcode
+    /// mailbox (`intel_parent_pcode_write`; its failure is the load's).
+    fn load_keys<M, S, T, E>(&self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -798,7 +1005,12 @@ impl HdcpLink {
         if val & HDCP_KEY_LOAD_DONE != 0 && val & HDCP_KEY_LOAD_STATUS != 0 {
             return Ok(());
         }
-        cx.write(HDCP_KEY_CONF, HDCP_KEY_LOAD_TRIGGER);
+        if self.hw.pcode_key_load {
+            crate::intel_gpu_pcode::pcode_write(cx.io, SKL_PCODE_LOAD_HDCP_KEYS, 0, 0, 1, 0)
+                .map_err(|_| HdcpError::KeyLoad)?;
+        } else {
+            cx.write(HDCP_KEY_CONF, HDCP_KEY_LOAD_TRIGGER);
+        }
         let val = cx.wait(HDCP_KEY_STATUS, HDCP_KEY_LOAD_DONE, HDCP_KEY_LOAD_DONE, 1)?;
         if val & HDCP_KEY_LOAD_STATUS == 0 {
             return Err(HdcpError::KeyLoad);
@@ -913,7 +1125,7 @@ impl HdcpLink {
         let mut sha_idx: usize = 0;
         let mut sha_text: u32 = 0;
         let mut leftovers: usize = 0;
-        let rep_ctl = Self::repeater_ctl(self.transcoder);
+        let rep_ctl = self.rep_ctl();
         cx.write(HDCP_REP_CTL, rep_ctl | HDCP_SHA1_TEXT_32);
         for i in 0..num {
             let ksv = &ksv_fifo[i * 5..i * 5 + 5];
@@ -1069,7 +1281,7 @@ impl HdcpLink {
         T: HdcpTransport + ?Sized,
         E: HdcpEnv,
     {
-        let t = self.transcoder;
+        let (t, regs) = (self.transcoder, self.hw.regs);
         // HDCP over DP requires the capability check before An is written.
         if let Some(capable) = cx.shim.hdcp_capable() {
             if !capable? {
@@ -1078,13 +1290,13 @@ impl HdcpLink {
         }
         for _ in 0..2 {
             let r = cx.env.random_u32();
-            cx.write(trans_hdcp_aninit(t), r);
+            cx.write(regs.aninit(t), r);
         }
         cx.write(self.conf(), HDCP_CONF_CAPTURE_AN);
         cx.wait(self.status(), HDCP_STATUS_AN_READY, HDCP_STATUS_AN_READY, 1)?;
         let mut an = [0u8; 8];
-        an[..4].copy_from_slice(&cx.read(trans_hdcp_anlo(t)).to_le_bytes());
-        an[4..].copy_from_slice(&cx.read(trans_hdcp_anhi(t)).to_le_bytes());
+        an[..4].copy_from_slice(&cx.read(regs.anlo(t)).to_le_bytes());
+        an[4..].copy_from_slice(&cx.read(regs.anhi(t)).to_le_bytes());
         cx.shim.write_an_aksv(&an)?;
         let r0_start = cx.env.now_us();
         let bksv = Self::read_valid_bksv(cx.shim)?;
@@ -1092,13 +1304,13 @@ impl HdcpLink {
             return Err(HdcpError::Revoked);
         }
         cx.write(
-            trans_hdcp_bksvlo(t),
+            regs.bksvlo(t),
             u32::from_le_bytes([bksv[0], bksv[1], bksv[2], bksv[3]]),
         );
-        cx.write(trans_hdcp_bksvhi(t), u32::from(bksv[4]));
+        cx.write(regs.bksvhi(t), u32::from(bksv[4]));
         let repeater = cx.shim.repeater_present()?;
         if repeater {
-            cx.write(HDCP_REP_CTL, Self::repeater_ctl(t));
+            cx.write(HDCP_REP_CTL, self.rep_ctl());
         }
         self.toggle_signalling(cx, true);
         cx.write(self.conf(), HDCP_CONF_AUTH_AND_ENC);
@@ -1113,7 +1325,7 @@ impl HdcpLink {
         let mut matched = false;
         for _ in 0..3 {
             let ri = cx.shim.read_ri_prime()?;
-            cx.write(trans_hdcp_rprime(t), u32::from(u16::from_le_bytes(ri)));
+            cx.write(regs.rprime(t), u32::from(u16::from_le_bytes(ri)));
             if cx
                 .poll_any(self.status(), HDCP_STATUS_RI_MATCH | HDCP_STATUS_ENC, 1000)
                 .is_ok()
@@ -1160,7 +1372,7 @@ impl HdcpLink {
         self.hdcp_encrypted = false;
         cx.write(self.conf(), 0);
         cx.wait(self.status(), !0, 0, ENCRYPT_STATUS_CHANGE_TIMEOUT_MS)?;
-        cx.rmw(HDCP_REP_CTL, Self::repeater_ctl(self.transcoder), 0);
+        cx.rmw(HDCP_REP_CTL, self.rep_ctl(), 0);
         self.toggle_signalling(cx, false);
         Ok(())
     }
@@ -1176,12 +1388,12 @@ impl HdcpLink {
         T: HdcpTransport + ?Sized,
         E: HdcpEnv,
     {
-        if !Self::key_loadable(cx.io) {
+        if !self.key_loadable(cx.io) {
             return Err(HdcpError::KeyNotLoadable);
         }
         let mut ret = Err(HdcpError::KeyLoad);
         for _ in 0..KEY_LOAD_TRIES {
-            ret = Self::load_keys(cx);
+            ret = self.load_keys(cx);
             if ret.is_ok() {
                 break;
             }
@@ -1254,7 +1466,7 @@ impl HdcpLink {
                 continue;
             };
             cx.write(
-                trans_hdcp_rprime(self.transcoder),
+                self.hw.regs.rprime(self.transcoder),
                 u32::from(u16::from_le_bytes(ri)),
             );
             if cx.wait(self.status(), mask, mask, 1).is_ok() {
@@ -1269,11 +1481,11 @@ impl HdcpLink {
 
 impl HdcpLink {
     fn hdcp2_status(&self) -> u64 {
-        trans_hdcp2_status(self.transcoder)
+        self.hw.regs.hdcp2_status(self.transcoder)
     }
 
     /// `intel_hdcp2_prerequisite` + `intel_hdcp2_get_capability`.
-    fn hdcp2_capable<M, S, T, E>(&self, cx: &mut Ctx<'_, M, S, T, E>) -> bool
+    pub fn hdcp2_capable<M, S, T, E>(&self, cx: &mut Ctx<'_, M, S, T, E>) -> bool
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1624,7 +1836,11 @@ impl HdcpLink {
     {
         self.toggle_signalling(cx, true);
         if cx.read(self.hdcp2_status()) & LINK_AUTH_STATUS != 0 {
-            cx.rmw(trans_hdcp2_ctl(self.transcoder), 0, CTL_LINK_ENCRYPTION_REQ);
+            cx.rmw(
+                self.hw.regs.hdcp2_ctl(self.transcoder),
+                0,
+                CTL_LINK_ENCRYPTION_REQ,
+            );
         }
         let ret = cx
             .wait(
@@ -1647,7 +1863,11 @@ impl HdcpLink {
         T: HdcpTransport + ?Sized,
         E: HdcpEnv,
     {
-        cx.rmw(trans_hdcp2_ctl(self.transcoder), CTL_LINK_ENCRYPTION_REQ, 0);
+        cx.rmw(
+            self.hw.regs.hdcp2_ctl(self.transcoder),
+            CTL_LINK_ENCRYPTION_REQ,
+            0,
+        );
         let _ = cx.wait(
             self.hdcp2_status(),
             LINK_ENCRYPTION_STATUS,
@@ -1883,7 +2103,10 @@ impl HdcpLink {
         E: HdcpEnv,
     {
         self.content_type = content_type;
-        self.port_data.hdcp_transcoder = msg::hdcp_transcoder(self.transcoder);
+        // Display 12+ only: below it the transcoder stays invalid.
+        if self.hw.regs == HdcpRegs::Transcoder {
+            self.port_data.hdcp_transcoder = msg::hdcp_transcoder(self.transcoder);
+        }
         let mut ret = Err(HdcpError::Type1Unavailable);
         if versions.hdcp2 && !self.force_hdcp14 && self.hdcp2_capable(cx) {
             ret = self.hdcp2_enable(cx).await;
@@ -1960,12 +2183,12 @@ impl HdcpLink {
     /// `_intel_hdcp_disable` and `hdcp2_disable_encryption` write.
     /// Returns `true` when the firmware session may still be open.
     pub fn force_off<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
-        let t = self.transcoder;
-        io.write32(trans_hdcp_conf(t), 0);
-        let ctl = io.read32(trans_hdcp2_ctl(t));
-        io.write32(trans_hdcp2_ctl(t), ctl & !CTL_LINK_ENCRYPTION_REQ);
+        let (t, regs) = (self.transcoder, self.hw.regs);
+        io.write32(regs.conf(t), 0);
+        let ctl = io.read32(regs.hdcp2_ctl(t));
+        io.write32(regs.hdcp2_ctl(t), ctl & !CTL_LINK_ENCRYPTION_REQ);
         let rep = io.read32(HDCP_REP_CTL);
-        io.write32(HDCP_REP_CTL, rep & !Self::repeater_ctl(t));
+        io.write32(HDCP_REP_CTL, rep & !self.rep_ctl());
         if self.protocol == Protocol::Hdmi {
             let f = io.read32(trans_ddi_func_ctl(t));
             io.write32(trans_ddi_func_ctl(t), f & !TRANS_DDI_HDCP_SIGNALLING);

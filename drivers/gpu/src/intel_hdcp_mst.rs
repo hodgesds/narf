@@ -46,8 +46,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use super::{
-    trans_ddi_func_ctl, trans_hdcp_status, CpValue, Ctx, HdcpEnv, HdcpError, HdcpLink, HdcpShim,
-    LineRekey, Protocol, Versions, ENCRYPT_STATUS_CHANGE_TIMEOUT_MS,
+    trans_ddi_func_ctl, CpValue, Ctx, HdcpEnv, HdcpError, HdcpHw, HdcpLink, HdcpShim, LineRekey,
+    Protocol, Versions, ENCRYPT_STATUS_CHANGE_TIMEOUT_MS,
 };
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_hdcp_msg::HdcpTransport;
@@ -116,8 +116,10 @@ impl HdcpLink {
         if bit == 0 {
             return Err(HdcpError::Unsupported);
         }
+        // HDCP_STATUS(display, stream transcoder, port): below display 12
+        // the port's one status register carries every stream's bit.
         cx.wait(
-            trans_hdcp_status(stream),
+            self.hw.regs.status(stream),
             bit,
             if enable { bit } else { 0 },
             ENCRYPT_STATUS_CHANGE_TIMEOUT_MS,
@@ -141,8 +143,9 @@ impl HdcpLink {
         E: HdcpEnv,
     {
         self.toggle_stream_select(cx, stream, enable);
+        // HDCP2_STREAM_STATUS(display, stream transcoder, pipe).
         cx.wait(
-            trans_hdcp2_stream_status(stream),
+            self.hw.regs.hdcp2_stream_status(stream),
             STREAM_ENCRYPTION_STATUS,
             if enable { STREAM_ENCRYPTION_STATUS } else { 0 },
             ENCRYPT_STATUS_CHANGE_TIMEOUT_MS,
@@ -228,6 +231,12 @@ impl MstHdcp {
                 })
                 .collect(),
         }
+    }
+
+    /// The port's HDCP hardware ([`HdcpLink::with_hw`]).
+    pub fn with_hw(mut self, hw: HdcpHw) -> Self {
+        self.link = self.link.with_hw(hw);
+        self
     }
 
     /// The route's one connector: ENABLED when every stream is, UNDESIRED

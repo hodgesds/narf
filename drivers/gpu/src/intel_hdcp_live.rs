@@ -141,8 +141,12 @@ pub struct RouteDesc {
     /// The CPU transcoder, A–D (0..=3).
     pub transcoder: u8,
     pub link: RouteLink,
-    /// Display IP major version (12, 13, 14, 20, 30, 35).
+    /// Display IP major version (9, 10, 11, 12, 13, 14, 20, 30, 35).
     pub display_ver: u8,
+    /// The port's HDCP registers, key load and PW_1 by display version.
+    pub hw: hdcp::HdcpHw,
+    /// `is_hdcp2_supported`: the platform may use the HDCP 2.2 firmware.
+    pub hdcp2: bool,
     pub rekey: LineRekey,
     /// The route's short pulses reach [`short_pulse`] (a hotplug owner
     /// polls its port), so the sink's CP_IRQ ends the message waits.
@@ -240,6 +244,8 @@ pub fn inherited_gen12_route<M: MmioWindow + Sync + ?Sized>(
             transcoder: t,
             link: route.1,
             display_ver: 12,
+            hw: hdcp::HdcpHw::TRANSCODER,
+            hdcp2: true,
             rekey: LineRekey::None,
             cp_irq: false,
             mst: MstStreams::default(),
@@ -287,11 +293,67 @@ fn display_rekey<M: MmioWindow + ?Sized>(io: &M) -> (u8, LineRekey) {
     (ver, LineRekey::for_display(ver, rel, step))
 }
 
-/// The function's live HDCP-capable routes on `bar`.
+/// The display of a pre-Gen12 Intel function as HDCP needs it: the
+/// display version (Gemini Lake is 10), Gen9 big core (the pcode key
+/// load), and `is_hdcp2_supported` with the MEI client
+/// (`DISPLAY_VER >= 10 || kabylake || coffeelake || cometlake`; NARF's
+/// `KabyLake` covers Coffee and Whiskey Lake). `None` on any other
+/// platform.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LegacyDisplay {
+    pub display_ver: u8,
+    pub big_core: bool,
+    pub hdcp2: bool,
+}
+
+impl LegacyDisplay {
+    pub const fn of(platform: crate::intel_gpu_gt::GtPlatform) -> Option<Self> {
+        use crate::intel_gpu_gt::{Gen9Platform as G9, GtPlatform};
+        match platform {
+            GtPlatform::Gen9(p) => Some(Self {
+                display_ver: if matches!(p, G9::GeminiLake) { 10 } else { 9 },
+                big_core: !p.is_lp(),
+                hdcp2: matches!(p, G9::KabyLake | G9::CometLake | G9::GeminiLake),
+            }),
+            GtPlatform::Gen11(_) => Some(Self {
+                display_ver: 11,
+                big_core: false,
+                hdcp2: true,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The route of a display 9-11 session on `ddi`, CPU transcoder `t`:
+    /// the port-indexed registers of DDI A–D (`is_hdcp_supported`), no
+    /// line rekeying (display 14+ only); `None` for any other port.
+    pub fn route(self, ddi: Ddi, transcoder: u8, protocol: Protocol, link: RouteLink, mst: MstStreams) -> Option<RouteDesc> {
+        let hw = hdcp::HdcpHw::legacy(self.display_ver, self.big_core, ddi as u8)?;
+        Some(RouteDesc {
+            key: gen12_key(ddi),
+            protocol,
+            transcoder,
+            link,
+            display_ver: self.display_ver,
+            hw,
+            hdcp2: self.hdcp2,
+            rekey: LineRekey::None,
+            cp_irq: true,
+            mst,
+        })
+    }
+}
+
+/// The function's live HDCP-capable routes on `bar`. The external DP, HDMI
+/// and MST sessions take the port-indexed registers on Gen9 and Gen11
+/// ([`LegacyDisplay`]) and the transcoder ones everywhere else.
 fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
     let Some(io) = crate::intel_gpu::with_display_info(|g| g.mode_window()) else {
         return Ok(Vec::new());
     };
+    let platform = crate::intel_gpu::with_display_info(|g| g.pci_id())
+        .and_then(|(vendor, device)| crate::intel_gpu_gt::GtPlatform::from_pci(vendor, device));
+    let legacy = platform.and_then(LegacyDisplay::of);
     let mut out = Vec::new();
     for (ddi, transcoder, pin) in crate::intel_gpu::hdcp_gen12_sessions(bar) {
         if transcoder > 3 {
@@ -301,12 +363,23 @@ fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
             Some(pin) => (Protocol::Hdmi, RouteLink::Hdmi(pin)),
             None => (Protocol::Dp, RouteLink::Dp(AuxPort::Gen12(ddi))),
         };
+        if let Some(legacy) = legacy {
+            // is_hdcp_supported: no HDCP on DDI E or later below display 12.
+            out.push(
+                legacy
+                    .route(ddi, transcoder, protocol, link, MstStreams::default())
+                    .ok_or(HdcpError::Unsupported)?,
+            );
+            continue;
+        }
         out.push(RouteDesc {
             key: gen12_key(ddi),
             protocol,
             transcoder,
             link,
             display_ver: 12,
+            hw: hdcp::HdcpHw::TRANSCODER,
+            hdcp2: true,
             rekey: LineRekey::None,
             cp_irq: true,
             mst: MstStreams::default(),
@@ -315,16 +388,27 @@ fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
     if let Some((ddi, streams)) = crate::intel_gpu::hdcp_gen12_mst(bar) {
         let mst = MstStreams::new(&streams).ok_or(HdcpError::Unsupported)?;
         let master = mst.as_slice().first().ok_or(HdcpError::NoRoute)?.0;
-        out.push(RouteDesc {
-            key: gen12_key(ddi),
-            protocol: Protocol::Dp,
-            transcoder: master,
-            link: RouteLink::Dp(AuxPort::Gen12(ddi)),
-            display_ver: 12,
-            rekey: LineRekey::None,
-            cp_irq: true,
-            mst,
-        });
+        let link = RouteLink::Dp(AuxPort::Gen12(ddi));
+        if let Some(legacy) = legacy {
+            out.push(
+                legacy
+                    .route(ddi, master, Protocol::Dp, link, mst)
+                    .ok_or(HdcpError::Unsupported)?,
+            );
+        } else {
+            out.push(RouteDesc {
+                key: gen12_key(ddi),
+                protocol: Protocol::Dp,
+                transcoder: master,
+                link,
+                display_ver: 12,
+                hw: hdcp::HdcpHw::TRANSCODER,
+                hdcp2: true,
+                rekey: LineRekey::None,
+                cp_irq: true,
+                mst,
+            });
+        }
     }
     if let Some(r) = crate::intel_gpu_xelpg_external::hdcp_route() {
         let (ver, rekey) = display_rekey(&io);
@@ -334,6 +418,8 @@ fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
             transcoder: r.transcoder,
             link: r.link,
             display_ver: ver,
+            hw: hdcp::HdcpHw::TRANSCODER,
+            hdcp2: true,
             rekey,
             cp_irq: true,
             mst: r.mst,
@@ -603,8 +689,9 @@ impl GscPacketPort for LiveGsc {
     }
 }
 
-/// The HDCP 2.2 firmware for a route, when it is there: MEI on display
-/// 12/13, the GSC on 14+.
+/// The HDCP 2.2 firmware for a route, when it is there: MEI below display
+/// 14 (on the platforms `is_hdcp2_supported` admits; the link checks
+/// that), the GSC on 14+.
 fn firmware(display_ver: u8) -> Option<Box<dyn HdcpTransport>> {
     if display_ver < 14 {
         let me = crate::intel_gpu_gt::media::gsc::load::INTEL_DISPLAY_COMPONENT;
@@ -634,9 +721,9 @@ impl Engine {
     /// `intel_hdcp_init` for the route's connector(s).
     fn for_route(r: &RouteDesc) -> Self {
         if r.mst.is_empty() {
-            Self::Sst(HdcpLink::new(r.protocol, r.transcoder, r.rekey, true))
+            Self::Sst(HdcpLink::new(r.protocol, r.transcoder, r.rekey, r.hdcp2).with_hw(r.hw))
         } else {
-            Self::Mst(MstHdcp::new(r.transcoder, r.mst.as_slice(), r.rekey, true))
+            Self::Mst(MstHdcp::new(r.transcoder, r.mst.as_slice(), r.rekey, r.hdcp2).with_hw(r.hw))
         }
     }
     fn value(&self) -> CpValue {

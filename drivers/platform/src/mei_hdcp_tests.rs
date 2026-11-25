@@ -88,9 +88,19 @@ fn smoke_mei_hdcp_component_match() -> TestResult {
     if hdcp::component_match(&d) {
         return TestResult::Fail("non-VGA display matched");
     }
-    // Display 12/13 PCHs only: Meteor Lake and later use the GSC.
-    if hdcp::HDCP_HECI_IDS != [0xA0E0, 0x43E0, 0x7AE8, 0x7A60, 0x51E0, 0x54E0, 0x7A68] {
-        return TestResult::Fail("HDCP HECI ids differ from TGP / ADP / RPL");
+    // Display 12/13 PCHs, then the claimed display 9 PCHs whose platforms
+    // is_hdcp2_supported admits (CNP-H 0xA360, CMP-LP 0x02E0, CMP-H
+    // 0x06E0): Meteor Lake and later use the GSC.
+    if hdcp::HDCP_HECI_IDS
+        != [0xA0E0, 0x43E0, 0x7AE8, 0x7A60, 0x51E0, 0x54E0, 0x7A68, 0xA360, 0x02E0, 0x06E0]
+    {
+        return TestResult::Fail("HDCP HECI ids differ from TGP / ADP / RPL / CNP-H / CMP");
+    }
+    if hdcp::HDCP_HECI_IDS
+        .iter()
+        .any(|&did| !mei::is_supported_device(did))
+    {
+        return TestResult::Fail("HDCP HECI id the MEI driver does not claim");
     }
     if hdcp::heci_carries_hdcp(mei::MEI_DEV_MTL_M) || hdcp::heci_carries_hdcp(mei::MEI_DEV_PTL_H) {
         return TestResult::Fail("HDCP client bound on a GSC-era HECI");
