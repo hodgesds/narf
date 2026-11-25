@@ -134,7 +134,12 @@
 //! verify is not enabled. DC3CO and DC9 are never targeted. Program
 //! loss found at re-entry is repaired by a reload before the next
 //! attempt. The DMC wakelock (`intel_dmc_wl`, on by default on display
-//! >= 30) is not used: every display access holds `DC_off` instead.
+//! >= 30) is not used: every display access holds `DC_off` instead. The
+//! wakelock is only required once its mode is enabled in `DMC_WAKELOCK_CFG`
+//! (Linux's DOC comment), which only the driver does when it enables
+//! DC5/DC6, so with the mode off a `DC_STATE_EN` write still exits the DC
+//! state. Display 35 refuses re-entry while an earlier owner left the mode
+//! on ([`ArmBlock::DmcWakelock`]).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -204,6 +209,10 @@ pub const DC_STATE_EN_UPTO_DC5_DC6_MASK: u32 = 0x3;
 /// `gen9_dc_mask` for display >= 12.
 pub const GEN12_DC_MASK: u32 =
     DC_STATE_EN_UPTO_DC5 | DC_STATE_EN_DC3CO | DC_STATE_EN_UPTO_DC6 | DC_STATE_EN_DC9;
+/// `DMC_WAKELOCK_CFG` (`intel_dmc_regs.h`, display >= 20).
+pub const DMC_WAKELOCK_CFG: u64 = 0x8f1b0;
+/// `DMC_WAKELOCK_CFG_ENABLE`.
+pub const DMC_WAKELOCK_CFG_ENABLE: u32 = 1 << 31;
 /// `UTIL_PIN_CTL`.
 pub const UTIL_PIN_CTL: u64 = 0x48400;
 /// `UTIL_PIN_ENABLE`.
@@ -567,6 +576,9 @@ pub enum ArmBlock {
     UnownedPipeDmc(u32),
     /// The utility pin drives PWM (`assert_can_enable_dc6`).
     UtilPinPwm,
+    /// Display 35: `DMC_WAKELOCK_CFG` has the DMC wakelock mode on, which
+    /// this driver never enables (`intel_dmc_wl_enable`) and does not run.
+    DmcWakelock,
     /// A gate register read all-ones.
     Unavailable,
     /// The target write failed (and is latched).
@@ -929,6 +941,22 @@ impl DcCore {
             if util & (UTIL_PIN_ENABLE | UTIL_PIN_MODE_MASK) == UTIL_PIN_ENABLE | UTIL_PIN_MODE_PWM
             {
                 return Err(ArmBlock::UtilPinPwm);
+            }
+        }
+        // The DMC wakelock (`intel_dmc_wl.c`, on by default from display 30)
+        // is a mode the driver opts into through `DMC_WAKELOCK_CFG` as it
+        // enables DC5/DC6 (`intel_dmc_wl_enable`). With it on, an access in
+        // its ranges, `DC_STATE_EN` included, must hold `DMC_WAKELOCK1_CTL`
+        // to exit the DC state. This driver never enables it and exits DC
+        // states through `DC_off` alone, which is correct only while the
+        // mode is off: a mode left on by an earlier owner keeps DC0.
+        if self.platform == DmcPlatform::Xe3pLpd {
+            let wakelock = regs.read32(DMC_WAKELOCK_CFG);
+            if wakelock == u32::MAX {
+                return Err(ArmBlock::Unavailable);
+            }
+            if wakelock & DMC_WAKELOCK_CFG_ENABLE != 0 {
+                return Err(ArmBlock::DmcWakelock);
             }
         }
         // assert_main_dmc_loaded, as a refusal. Only the main program:
