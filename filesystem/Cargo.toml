@@ -32,6 +32,7 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-efi          = { path = "../efi" }
 narf-rcu          = { path = "../rcu" }
 narf-observability = { path = "../observability" }
+async-trait       = "0.1"
 
 [features]
 # Kernel-test builds: a wait that would spin inside a plain task's poll

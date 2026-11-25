@@ -3513,6 +3513,10 @@ fn builtin_providers() -> Vec<SysfsProvider> {
             populate: populate_input_class
         },
         SysfsProvider {
+            name: "hidraw",
+            populate: crate::hidraw::populate_hidraw_class
+        },
+        SysfsProvider {
             name: "tty",
             populate: populate_tty_class
         },

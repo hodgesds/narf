@@ -3165,6 +3165,7 @@ dependencies = [
 name = "narf-filesystem"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-arch",
  "narf-block",
  "narf-boot",

@@ -1113,6 +1113,82 @@ discipline and foreground-group machinery (`filesystem/src/console_tty.rs`).
   accessors are stubs and PL011 registers nothing, so the table is
   empty there in practice.
 
+### 3.3.4 Raw HID (`/dev/hidraw<N>`, `filesystem/src/hidraw.rs`)
+
+Linux `drivers/hid/hidraw.c` for every device in
+`narf_input::hid_device`. `populate_hidraw_class` (a builtin sysfs
+provider, so `mount_sysfs` installs it) registers the `hidraw` devfs
+provider and the registry's change hook; devices registered earlier are
+replayed.
+
+- **Numbers.** Char major 243 (`HIDRAW_MAJOR`; Linux allocates it
+  dynamically, and 243 is what the target laptops get), listed in
+  `/proc/devices` as `243 hidraw`. Minors are the lowest free of
+  `HIDRAW_MAX_DEVICES` = 64; a device past that keeps its sysfs HID
+  device but has no hidraw node. A minor stays reserved after unplug
+  until its last open closes (`drop_ref`), so it is never reused under
+  an open fd. `st_rdev` = `linux_makedev(243, N)`; `st_ino` =
+  `char_device_inode(rdev)`.
+- **Node.** Devfs resolves exactly `hidraw<N>` while the device exists;
+  lookup returns a prototype on the per-device node, `open(2)` mints a
+  per-open `HidrawList` (`open_instance_checked`, `-ENODEV` once the
+  device is gone). Owner, mode (devtmpfs default `root:root 0600`) and
+  the `system.posix_acl_access` xattr (udev `uaccess` for FIDO tokens;
+  missing = ENODATA, other names EOPNOTSUPP) live on the node, so they
+  persist across opens and die with the device.
+- **read.** One report per call, cut to `count`, consumed whole; zero-
+  length reports are skipped. Each open buffers at most
+  `HIDRAW_BUFFER_SIZE - 1` = 63 reports and drops newer ones when full.
+  Empty: `EIO` once the device is gone, else would-block (`EAGAIN` for
+  O_NONBLOCK; a blocking read parks on the open's `Readiness`).
+  Revoked: `ENODEV`.
+- **write / HIDIOCS{FEATURE,INPUT,OUTPUT}.** `hidraw_send_report`:
+  `ENODEV` (gone / revoked), `EINVAL` for `count > HID_MAX_BUFFER_SIZE`
+  or `< 2`, then (ioctls) `EFAULT`; an output report tries
+  `HidTransport::output_report` and falls back to
+  `raw_request(buf[0], Output, SET)` only on `Unsupported` (`-ENOSYS`);
+  feature/input reports are SET_REPORT. Transport errors map as
+  `NoDevice`→ENODEV, `Stall`→EPIPE (`FsError::Stalled`, no SIGPIPE),
+  `Timeout`→ETIMEDOUT, `Unsupported`→ENOSYS, `InvalidArgs`→EINVAL,
+  `Io`→EIO.
+- **ioctl.** `hidraw_ioctl`'s order: `ENODEV` (gone / revoked), `EINVAL`
+  for a type other than `'H'`, `ENOTTY` for nr 0 or > `0x0D`, the
+  fixed-size commands (`HIDIOCGRDESCSIZE`; `HIDIOCGRDESC`, `EINVAL` for
+  `len > 4095`, copying `min(rsize, len)`; `HIDIOCGRAWINFO` with
+  16-bit-truncated vendor/product; `HIDIOCREVOKE`, `EINVAL` for a
+  non-NULL argument), then by direction: read/write →
+  `HIDIOC[SG]{FEATURE,INPUT,OUTPUT}(len)`, read →
+  `HIDIOCGRAW{NAME,PHYS,UNIQ}(len)` (`min(len, strlen + 1)` bytes of
+  the field cut to `hid_device`'s 127/63/63 bytes), anything else
+  `EINVAL`. `HIDIOCG*` reads the report number from the user, calls
+  `raw_request(.., GET)` with a `count`-byte buffer and copies
+  `min(ret, count)` back.
+- **poll.** `POLLOUT|POLLWRNORM` always; `POLLIN|POLLRDNORM` while
+  reports are queued (every report is a wake, so edge-triggered epoll
+  sees each); `POLLERR|POLLHUP` once the device is gone or the fd
+  revoked.
+- **sysfs.** `<parent>/BBBB:VVVV:PPPP.NNNN/` with `uevent` (`HID_ID`,
+  `HID_NAME`, `HID_PHYS`, `HID_UNIQ`, `MODALIAS=hid:b..g..v..p..` with
+  the group from `narf_input::hid_scan`), `modalias`, `country`,
+  `report_descriptor` (bin), `subsystem` → `bus/hid`, and
+  `/sys/bus/hid/devices/<name>`; under it `hidraw/hidraw<N>/` with
+  `dev`, `uevent` (`MAJOR`/`MINOR`/`DEVNAME`), `subsystem` →
+  `class/hidraw`, `device` → the HID device; `/sys/class/hidraw/hidraw<N>`
+  and `/sys/dev/char/243:<N>` link to it. `<parent>` is
+  `HidInfo::sysfs_parent` (a path below `/sys`, get-or-created) or,
+  when empty, the platform device `/sys/devices/platform/narf-hid`
+  (with `subsystem` → `bus/platform` and a `/sys/bus/platform/devices`
+  entry for udev's `path_id`). Hot-plug emits `add` for the HID device
+  then for `hidraw<N>`, and `remove` in the reverse order.
+- **Documented gaps.** A signal pending on entry to a read of an empty,
+  unplugged device gives `EIO` (Linux: `ERESTARTSYS` first); a report
+  whose copy-out faults is consumed; `write(2)` copies its buffer before
+  the size checks (`EFAULT` beats `EINVAL` for an unreadable 1-byte
+  write); an unknown `_IOW('H', nr > 0x0D)` with a bad pointer is
+  `EFAULT` (the syscall relay copies it first); `HIDIOCREVOKE` wakes the
+  fd's waiters; no `SIGIO`, no `hid_hw_open`/`hid_hw_power` on first
+  open, no `DRIVER=`.
+
 ### 3.4 Directory operations
 
 ```rust
