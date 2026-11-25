@@ -3803,6 +3803,7 @@ version = "0.0.0"
 name = "narf-userspace"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-abi",
  "narf-arch",
  "narf-block",
@@ -3813,6 +3814,7 @@ dependencies = [
  "narf-bpf-verifier",
  "narf-capabilities",
  "narf-console",
+ "narf-ctap2",
  "narf-drivers-fs-9p",
  "narf-drivers-fs-btrfs",
  "narf-drivers-fs-exfat",
