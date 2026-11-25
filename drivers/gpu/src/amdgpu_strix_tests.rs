@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// Strix Point (0x150E) is its own family — GFX 11.5.0, DCN 3.5,
-/// PSP 14.0.1 — not a Phoenix variant, and an APU by id and by GC version.
+/// PSP 14.0.0 — not a Phoenix variant, and an APU by id and by GC version.
 fn strix_identity_matches_linux() -> TestResult {
     if amdgpu::STRIX_POINT != 0x150E {
         return TestResult::Fail("Strix Point is 0x150E in pci.ids");
@@ -47,7 +47,7 @@ fn strix_firmware_bundle_matches_linux() -> TestResult {
     };
     let names: Vec<&str> = info.fw_list.iter().map(|e| e.name).collect();
     let expected: [&str; 12] = [
-        "amdgpu/psp_14_0_1_toc.bin",
+        "amdgpu/psp_14_0_0_toc.bin",
         "amdgpu/sdma_6_1_0.bin",
         "amdgpu/gc_11_5_0_pfp.bin",
         "amdgpu/gc_11_5_0_me.bin",
@@ -58,10 +58,10 @@ fn strix_firmware_bundle_matches_linux() -> TestResult {
         "amdgpu/gc_11_5_0_rlc.bin",
         "amdgpu/vcn_4_0_5.bin",
         "amdgpu/dcn_3_5_dmcub.bin",
-        "amdgpu/psp_14_0_1_ta.bin",
+        "amdgpu/psp_14_0_0_ta.bin",
     ];
     if names != expected {
-        return TestResult::Fail("Strix bundle is not the audited 14.0.1 set in load order");
+        return TestResult::Fail("Strix bundle is not the audited 14.0.0 set in load order");
     }
     if names
         .iter()

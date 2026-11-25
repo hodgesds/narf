@@ -2344,7 +2344,7 @@ struct Display {
     retired_phoenix: Vec<crate::amdgpu_phoenix_boot::PhoenixColdBoot>,
     /// Strix's graphics engines, same retention policy as Phoenix's.
     /// Unreachable until the firmware lane lands `Firmware::open_strix`
-    /// + the Strix `set_graphics` arm: no Strix set can be loaded today,
+    /// and the Strix `set_graphics` arm: no Strix set can be loaded today,
     /// so `start()` never fills this in.
     graphics_strix: Option<crate::amdgpu_strix_boot::StrixColdBoot>,
     /// Strix owners a mode 2 recovery replaced; same quarantine policy.

@@ -288,6 +288,11 @@ impl Layout {
         ) {
             return Err(Error::Unsupported);
         }
+        // The strap dword is only defined for the listed NBIO versions;
+        // an unlisted version (e.g. 7.11.6) fails closed here, before any
+        // bank is resolved — the same gate `read_strix` applies at the
+        // strap read.
+        strap_dword(gpu)?;
         // Every topology register is identical between GC 11.0.0 and
         // 11.5.0 (`gc_11_5_0_offset.h`), so the bank bounds are the
         // Phoenix ones; only the strap dword differs (see `strap_dword`).
