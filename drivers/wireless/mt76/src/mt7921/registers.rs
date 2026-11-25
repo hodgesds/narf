@@ -5,7 +5,7 @@
 //! L1 transactions preserve the unrelated selector bits, flush the posted
 //! selector write before accessing the window, and restore the prior selector.
 use super::regs::*;
-use narf_bus::MmioRegion;
+use crate::platform::bus::MmioRegion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {

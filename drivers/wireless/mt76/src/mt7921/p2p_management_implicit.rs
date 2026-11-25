@@ -2,8 +2,8 @@
 //! The host cookie and admission plan never substitute for a CNM grant.
 use super::p2p_management_power::Plan;
 use super::*;
+use crate::platform::ap_control::RadioControlAuthority;
 use core::sync::atomic::{AtomicBool, Ordering};
-use narf_wireless::ap_control::RadioControlAuthority;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Owner {

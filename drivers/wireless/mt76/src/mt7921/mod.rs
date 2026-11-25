@@ -36,13 +36,16 @@
 
 pub(crate) mod ap_wire;
 pub mod association;
+#[cfg(feature = "builtin")]
 pub mod bringup;
 pub(crate) mod channel;
 pub mod cmd;
 pub(crate) mod csa;
 pub(crate) mod debug;
 pub mod dma;
+#[cfg(feature = "builtin")]
 mod firmware_assets;
+#[cfg(feature = "builtin")]
 mod firmware_parser_tests;
 pub mod firmware_transport;
 mod fw_features;
@@ -53,14 +56,24 @@ pub(crate) mod irq;
 pub(crate) mod link_stats;
 pub mod mac;
 mod mac_power;
+#[cfg(feature = "builtin")]
 mod mac_power_tests;
+#[cfg(feature = "builtin")]
 pub mod mcu;
 mod p2p_cnm;
 mod p2p_wire;
 mod packet_tx;
+/// The PCI binding: the kernel bus built in, the KABI in the `.ko`. Both
+/// provide the names the firmware transport uses (claim, generation).
+#[cfg(feature = "builtin")]
 pub mod pci;
+#[cfg(feature = "module")]
+#[path = "pci_kabi.rs"]
+pub mod pci;
+mod pci_common;
 pub(crate) mod pmksa;
 mod registers;
+#[cfg(feature = "builtin")]
 mod registers_tests;
 pub mod regs;
 pub(crate) mod six_ghz;
@@ -72,9 +85,9 @@ pub(crate) mod vif_slots;
 pub(crate) mod wowlan;
 pub(crate) mod wowlan_nlo;
 
-pub use pci::{
-    firmware_blobs_for, l1_remap, name_for, probe, register_pci_driver, Mt7921Device, ProbeError,
-};
+pub use pci::{firmware_blobs_for, l1_remap, name_for, ProbeError};
+#[cfg(feature = "builtin")]
+pub use pci::{probe, register_pci_driver, Mt7921Device};
 pub use regs::{
     ALL_DEV_IDS, ITTIM_VENDOR, MTK_DEV_MT7920, MTK_DEV_MT7921, MTK_DEV_MT7921_ALT, MTK_DEV_MT7922,
     MTK_DEV_MT7961, MTK_VENDOR,
@@ -82,6 +95,7 @@ pub use regs::{
 
 /// Entry point invoked from the wireless crate's `register_initcalls`
 /// (one level up in `drivers/wireless/src/lib.rs`).
+#[cfg(feature = "builtin")]
 pub fn register() {
     register_pci_driver();
     narf_init::register_with_budget(
@@ -92,8 +106,9 @@ pub fn register() {
     );
 }
 
-// Co-located smokes. The whole `mt7921` module compiles only under the
-// crate's `builtin` feature, which pulls `narf-kernel-test`, so the smokes are
-// always available here — they register into `narf.tests` via `kernel_test_in!`
-// (same shape as `drivers/net/i40e/src/i40e/tests.rs`).
+// Co-located smokes. They compile under the crate's `builtin` feature, which
+// pulls `narf-kernel-test` (the `.ko` build has no test harness); they
+// register into `narf.tests` via `kernel_test_in!` (same shape as
+// `drivers/net/i40e/src/i40e/tests.rs`).
+#[cfg(feature = "builtin")]
 pub mod tests;

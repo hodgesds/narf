@@ -5,7 +5,7 @@ use super::{
     p2p_management_capture::{Captured, Spec},
     p2p_management_filters::{Install, Shared},
 };
-use narf_wireless::ap_control::RadioControlAuthority;
+use crate::platform::ap_control::RadioControlAuthority;
 #[derive(Debug, Default)]
 pub(super) struct Management {
     pub filters: Option<Shared>,

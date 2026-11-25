@@ -86,6 +86,7 @@ static HOST: narf_bus::module_wireless::Host = narf_bus::module_wireless::Host {
     close,
 };
 
+#[cfg(feature = "builtin")]
 #[path = "module_tests.rs"]
 mod tests;
 

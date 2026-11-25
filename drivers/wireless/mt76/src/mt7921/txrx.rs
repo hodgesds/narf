@@ -367,7 +367,7 @@ use super::dma::{
     ring_dma_index, ring_doorbell, Ring, RingRegs, MT_DMA_CTL_BURST, MT_DMA_CTL_DMA_DONE,
     MT_DMA_CTL_LAST_SEC0, MT_DMA_CTL_SD_LEN0_MASK, MT_DMA_CTL_SD_LEN0_SHIFT,
 };
-use narf_bus::MmioRegion;
+use crate::platform::bus::MmioRegion;
 
 /// Errors raised by the live TX/RX submit + drain paths.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -418,8 +418,11 @@ pub unsafe fn submit_tx_frame(
     // Allocate a coherent buffer for this frame. The descriptor's
     // buf0 will point at it, so it stays live until the next time
     // this slot is reused (reap_tx).
-    let mut buf = narf_io::alloc_coherent(total_len.max(64), narf_lib::id::DomainId::DRIVER_0)
-        .map_err(|_| TxRxError::BufferAllocFailed)?;
+    let mut buf = crate::platform::dma::alloc_coherent(
+        total_len.max(64),
+        crate::platform::dma::DomainId::DRIVER_0,
+    )
+    .map_err(|_| TxRxError::BufferAllocFailed)?;
     let phys = buf.dma_addr().raw();
     {
         let bytes = buf.as_mut_slice();

@@ -2,7 +2,7 @@
 //! Linux reference: ecd997b0189a mt792x_dma.c.
 //!
 //! Descriptor rings and frame buffers are allocated with
-//! `narf_io::alloc_coherent_for` against the function's firmware DMA
+//! `crate::platform::dma::alloc_coherent_for` against the function's firmware DMA
 //! configuration (`narf_bus::dma::configure`, Linux `dma_alloc_coherent`):
 //! write-back RAM on a snooping interconnect, the device's reserved
 //! non-cacheable pool on a non-coherent one, and refusal otherwise.
@@ -10,20 +10,25 @@ use super::{
     Backend, CapturedData, Error, Firmware, RadioInfo, Report, Retained, Session, State, MAX_FRAME,
 };
 use crate::mt7921::{packet_tx, registers, regs::*};
+use crate::platform::bus::{BusDevice, DeviceCap, MmioRegion};
+use crate::platform::dma::DmaBuffer;
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 #[cfg(not(target_arch = "aarch64"))]
 use core::sync::atomic::fence;
 use core::sync::atomic::Ordering;
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, Write};
-use narf_io::DmaBuffer;
 
 #[path = "ap_timing.rs"]
 mod ap_timing;
 #[path = "p2p_management_hw.rs"]
 mod p2p_management;
 
+#[cfg(feature = "builtin")]
 #[path = "wowlan_hardware.rs"]
+mod wake;
+// A module takes part in no system PM transition: no wake route, and MMIO is
+// always ready.
+#[cfg(feature = "module")]
+#[path = "wowlan_hardware_module.rs"]
 mod wake;
 
 // A CPU atomic fence is inner-shareable on ARM. Device ownership also needs
@@ -58,7 +63,7 @@ fn dropped_report(kind: &str, rxd0: u32, error: Error) {
         .wrapping_add(1);
     if count.is_power_of_two() {
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: dropped unusable {kind} report rxd0={rxd0:#010x} ({error:?}); {count} dropped"
         );
     }
@@ -76,7 +81,7 @@ fn coredump_report() {
     let count = FRAGMENTS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if count.is_power_of_two() {
         let _ = writeln!(
-            narf_console::PriorityWriter::<3>,
+            crate::platform::PriorityConsole::<3>,
             "mt76: firmware coredump event (firmware assert); {count} fragment(s) dropped"
         );
     }
@@ -86,7 +91,7 @@ fn coredump_report() {
 fn register_access_error(operation: &str, addr: u32, error: registers::Error) -> Error {
     use core::fmt::Write;
     let _ = writeln!(
-        narf_console::Writer,
+        crate::platform::Console,
         "mt76: register {operation} {addr:#010x} failed: {error:?}"
     );
     Error::Register
@@ -120,22 +125,27 @@ struct Ring {
 impl Ring {
     /// [`Self::allocate_for`] on a coherent device.
     fn allocate(base: u32, rx: bool, depth: usize) -> Result<Self, Error> {
-        Self::allocate_for(&narf_io::DmaDevice::coherent(), base, rx, depth)
+        Self::allocate_for(
+            &crate::platform::dma::DmaDevice::coherent(),
+            base,
+            rx,
+            depth,
+        )
     }
     /// Linux `mt76_dma_alloc_queue`: descriptors and per-slot frame buffers
     /// from `dma_alloc_coherent(dev, …)`. The device writes DONE bits into
     /// 16-byte descriptors that share cache lines, so a non-coherent device
     /// must get its reserved non-cacheable pool; without one this fails.
     fn allocate_for(
-        dma: &narf_io::DmaDevice,
+        dma: &crate::platform::dma::DmaDevice,
         base: u32,
         rx: bool,
         depth: usize,
     ) -> Result<Self, Error> {
-        let descriptors = narf_io::alloc_coherent_for(
+        let descriptors = crate::platform::dma::alloc_coherent_for(
             dma,
             depth * 16,
-            narf_lib::id::DomainId::DRIVER_0,
+            crate::platform::dma::DomainId::DRIVER_0,
             u64::from(u32::MAX),
         )
         .map_err(|_| Error::Allocation)?;
@@ -155,9 +165,13 @@ impl Ring {
             // establish a wider device mask. Apply the same ceiling to
             // physical addresses in Identity mode and to IOMMU IOVAs.
             let mask = u64::from(u32::MAX);
-            let buffer =
-                narf_io::alloc_coherent_for(dma, MAX_FRAME, narf_lib::id::DomainId::DRIVER_0, mask)
-                    .map_err(|_| Error::Allocation)?;
+            let buffer = crate::platform::dma::alloc_coherent_for(
+                dma,
+                MAX_FRAME,
+                crate::platform::dma::DomainId::DRIVER_0,
+                mask,
+            )
+            .map_err(|_| Error::Allocation)?;
             if buffer
                 .dma_addr()
                 .raw()
@@ -252,7 +266,10 @@ pub(super) fn dma_layout(device: u16) -> DmaLayout {
 
 /// Every ring of the owner, sized by `layout`, from `dma` (as
 /// `mt76_dma_alloc_queue` allocates each).
-fn allocate_storage(dma: &narf_io::DmaDevice, layout: DmaLayout) -> Result<Storage, Error> {
+fn allocate_storage(
+    dma: &crate::platform::dma::DmaDevice,
+    layout: DmaLayout,
+) -> Result<Storage, Error> {
     Ok(Storage {
         wm: Ring::allocate_for(dma, TX_WM, false, DEPTH)?,
         fwdl: Ring::allocate_for(dma, TX_FWDL, false, DEPTH)?,
@@ -322,30 +339,20 @@ impl Storage {
         dma_barrier();
     }
 }
-/// IOMMU requester ID of `device`; `narf_bus::dma::configure` attaches
-/// only PCI segment 0 functions to a default domain.
-fn iommu_bdf(device: &BusDevice) -> Option<narf_io::iommu::Bdf> {
-    match device.kind {
-        narf_bus::BusKind::Pcie { addr, .. } if addr.segment == 0 => Some(
-            narf_io::iommu::Bdf::new(addr.bus, addr.device, addr.function),
-        ),
-        _ => None,
-    }
-}
+
 /// Re-attach a function blocked by an earlier generation's stop/reset to
 /// its retained default domain before the first allocation (Linux
 /// `pci_dev_reset_iommu_done`). The caller holds the stop proof: bus
 /// mastering verified off and exclusive device ownership. A no-op outside
 /// `PerDomain` and for a function that is not blocked.
 fn restore_function_dma(device: &BusDevice) -> Result<(), Error> {
-    if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
-        return Ok(());
-    }
-    let bdf = iommu_bdf(device).ok_or(Error::Allocation)?;
-    if !narf_io::iommu::device_dma_blocked(bdf) {
-        return Ok(());
-    }
-    narf_io::iommu::restore_device_dma(bdf).map_err(|_| Error::Authority)
+    crate::platform::iommu::restore(device).map_err(|no_requester| {
+        if no_requester {
+            Error::Allocation
+        } else {
+            Error::Authority
+        }
+    })
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SequenceReset {
@@ -358,7 +365,7 @@ enum SequenceReset {
 struct Hardware {
     mmio: MmioRegion,
     device: BusDevice,
-    authority: Cap<BusDeviceCap, Write>,
+    authority: DeviceCap,
     owner: Retained<Storage>,
     /// Linux `wcid->amsdu` for the station peer (TXD7 HW_AMSDU).
     hw_amsdu: bool,
@@ -392,13 +399,15 @@ impl Hardware {
     /// firmware/BAR proof: a dead or revoked generation must still be
     /// blockable. Outside `PerDomain` this is `Untranslated` and touches no
     /// hardware; the device-side evidence is then the only proof.
-    fn block_dma(&self) -> Result<narf_io::iommu::DmaBlock, Error> {
-        if narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain {
-            return Ok(narf_io::iommu::DmaBlock::Untranslated);
-        }
-        let bdf = iommu_bdf(&self.device).ok_or(Error::Authority)?;
+    fn block_dma(&self) -> Result<crate::platform::iommu::DmaBlock, Error> {
         // A detach timeout means the device may still translate.
-        narf_io::iommu::block_device_dma(bdf).map_err(|_| Error::Timeout)
+        crate::platform::iommu::block(&self.device).map_err(|no_requester| {
+            if no_requester {
+                Error::Authority
+            } else {
+                Error::Timeout
+            }
+        })
     }
     /// Re-attach the retained default domain before rings are published
     /// again (Linux `pci_dev_reset_iommu_done`). Only the holder of the
@@ -421,7 +430,7 @@ impl Hardware {
         if !self.owner.published || self.owner.storage.is_none() {
             return false;
         }
-        if self.block_dma() != Ok(narf_io::iommu::DmaBlock::Blocked) {
+        if self.block_dma() != Ok(crate::platform::iommu::DmaBlock::Blocked) {
             return false;
         }
         self.owner.published = false;
@@ -903,7 +912,7 @@ impl Hardware {
         if !self.wake.mmio_ready() {
             return Err(Error::Busy);
         }
-        crate::mt7921::pci::invoke(&self.authority, || {
+        crate::platform::bus::invoke(&self.authority, || {
             // SAFETY: exclusive retained aperture/L1 latch inside current invocation.
             let value = unsafe { registers::read32(&self.mmio, addr) }
                 .map_err(|error| register_access_error("read", addr, error))?;
@@ -919,7 +928,7 @@ impl Hardware {
         if !self.wake.mmio_ready() {
             return Err(Error::Busy);
         }
-        crate::mt7921::pci::invoke(&self.authority, || {
+        crate::platform::bus::invoke(&self.authority, || {
             // SAFETY: bounded register plan and current retained PCI invocation.
             unsafe { registers::write32(&self.mmio, addr, value) }
                 .map_err(|error| register_access_error("write", addr, error))
@@ -930,16 +939,8 @@ impl Hardware {
         if !self.wake.mmio_ready() {
             return Err(Error::Busy);
         }
-        crate::mt7921::pci::invoke(&self.authority, || {
-            if clear != 0 {
-                narf_bus::pci::clear_command(&self.authority, &self.device, clear)
-                    .map_err(|_| Error::Authority)?;
-            }
-            if set != 0 {
-                narf_bus::pci::set_command(&self.authority, &self.device, set)
-                    .map_err(|_| Error::Authority)?;
-            }
-            let value = narf_bus::pci::read_command(&self.authority, &self.device)
+        crate::platform::bus::invoke(&self.authority, || {
+            let value = crate::platform::bus::command(&self.authority, &self.device, clear, set)
                 .map_err(|_| Error::Authority)?;
             if value == u16::MAX {
                 Err(Error::DeviceGone)
@@ -1007,7 +1008,7 @@ impl Hardware {
         use core::fmt::Write;
         let own = self.read(0x18060010);
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: boot timeout seq={seq} queued_events={queued_events} own={own:x?}"
         );
         // Only HIF ownership is safe to inspect while firmware owns the
@@ -1016,7 +1017,7 @@ impl Hardware {
             return;
         }
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: boot timeout pci={:x?} dma={:x?} irq={:x?} fw={:x?}",
             self.command(0, 0),
             self.read(GLOBAL),
@@ -1040,7 +1041,7 @@ impl Hardware {
             };
             dma_barrier();
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::Console,
                 "mt76: boot ring {name} base={:#x} desc={:#x} cidx={:x?} didx={:x?} index={} pending={} slot={slot} ctrl={:#010x} buffer={:#x}",
                 ring.base,
                 ring.descriptors.dma_addr().raw(),
@@ -1066,7 +1067,7 @@ impl Hardware {
     ) {
         use core::fmt::Write;
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: associate timeout stage={stage:?} step={step} dma={:x?} irq={:x?} events={queued_events} data={pending_data}",
             self.read(GLOBAL),
             self.read(MT_WFDMA0_HOST_INT_STA),
@@ -1075,7 +1076,7 @@ impl Hardware {
             return;
         };
         let _ = writeln!(
-            narf_console::Writer,
+            crate::platform::Console,
             "mt76: associate tokens={:?} pending_events={} pending_data={} rx_open={}",
             storage.tokens.pending_head(),
             storage.pending_events.len(),
@@ -1100,7 +1101,7 @@ impl Hardware {
             };
             dma_barrier();
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::Console,
                 "mt76: associate ring {name} cidx={:x?} didx={:x?} index={} pending={} slot={slot} ctrl={:#010x}",
                 self.read(ring.base + 8),
                 self.read(ring.base + 12),
@@ -1122,7 +1123,7 @@ impl Hardware {
                     });
                 }
                 let _ = writeln!(
-                    narf_console::Writer,
+                    crate::platform::Console,
                     "mt76: associate tx-header slot={slot} txd={:08x?} txp={:08x?}",
                     &header[..8],
                     &header[8..],
@@ -1198,20 +1199,23 @@ impl Backend for Hardware {
     fn progress(&mut self, stage: super::Stage) {
         use core::fmt::Write;
         if stage == super::Stage::RecoveryPark {
-            let _ = writeln!(narf_console::Writer, "mt76: chip reset (firmware recovery)");
+            let _ = writeln!(
+                crate::platform::Console,
+                "mt76: chip reset (firmware recovery)"
+            );
         }
         if crate::mt7921::debug::enabled() {
             let _ = writeln!(
-                narf_console::PriorityWriter::<7>,
+                crate::platform::PriorityConsole::<7>,
                 "mt76: firmware {stage:?}"
             );
         }
     }
     fn now_ns(&self) -> u64 {
-        narf_time::wall::monotonic_ns()
+        crate::platform::time::monotonic_ns()
     }
     fn check(&self) -> Result<(), Error> {
-        crate::mt7921::pci::invoke(&self.authority, || ()).map_err(|_| Error::Authority)
+        crate::platform::bus::invoke(&self.authority, || ()).map_err(|_| Error::Authority)
     }
     fn chip_id(&self) -> Result<u16, Error> {
         let chip = (self.read(MT_HW_CHIPID)? & 0xffff) as u16;
@@ -1224,7 +1228,7 @@ impl Backend for Hardware {
         permission: crate::mt7921::association::TxPermission,
     ) -> Result<(), Error> {
         self.check()?;
-        super::current_station_permission(permission, narf_wireless::reg::db::snapshot())
+        super::current_station_permission(permission, crate::platform::reg_db::snapshot())
     }
     fn tx_rate_report(&self) -> Option<crate::mt7921::tx_sequence::RateReport> {
         self.owner
@@ -1247,13 +1251,13 @@ impl Backend for Hardware {
     }
     fn prepare_wake_route(
         &mut self,
-        target: narf_power::system_pm::SystemSleepState,
+        target: crate::platform::power::SystemSleepState,
     ) -> Result<(), Error> {
         Hardware::prepare_wake_route(self, target)
     }
     fn arm_wake_route(
         &mut self,
-        target: narf_power::system_pm::SystemSleepState,
+        target: crate::platform::power::SystemSleepState,
     ) -> Result<(), Error> {
         Hardware::arm_wake_route(self, target)
     }
@@ -1276,7 +1280,7 @@ impl Backend for Hardware {
         Hardware::disarm_wake_route(self)
     }
     fn restore_bus(&mut self) -> Result<(), Error> {
-        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        use crate::platform::bus::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
         // Bus mastering returns only once retained rings are proven current.
         let command = self.command(BUS_MASTER, MEM_SPACE | INTX_DISABLE)?;
         if command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE {
@@ -1300,12 +1304,10 @@ impl Backend for Hardware {
     fn resume_dma(&mut self) -> Result<(), Error> {
         // A blocked function lost its stop proof's rings; only a verified
         // reinit/recovery (initialize) restores it.
-        if !self.owner.published
-            || iommu_bdf(&self.device).is_some_and(narf_io::iommu::device_dma_blocked)
-        {
+        if !self.owner.published || crate::platform::iommu::blocked(&self.device) {
             return Err(Error::Busy);
         }
-        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        use crate::platform::bus::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
         if self.command(0, BUS_MASTER)? & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
             != BUS_MASTER | MEM_SPACE | INTX_DISABLE
         {
@@ -1316,7 +1318,10 @@ impl Backend for Hardware {
         self.enable_host_interrupts()
     }
     fn park_bus_master(&mut self) -> Result<(), Error> {
-        if self.command(narf_bus::pci::cmd::BUS_MASTER, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
+        if self.command(crate::platform::bus::cmd::BUS_MASTER, 0)?
+            & crate::platform::bus::cmd::BUS_MASTER
+            != 0
+        {
             return Err(Error::Busy);
         }
         // Recovery parks before the WFSYS reset; block there too, so a
@@ -1363,7 +1368,7 @@ impl Backend for Hardware {
         if self.owner.published || !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
             return Err(Error::Busy);
         }
-        if self.command(0, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
+        if self.command(0, 0)? & crate::platform::bus::cmd::BUS_MASTER != 0 {
             return Err(Error::Busy);
         }
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
@@ -1443,7 +1448,7 @@ impl Backend for Hardware {
         self.update(WFDMA_DUMMY_CR, 0, WFDMA_NEED_REINIT)?;
         self.update(MT_PCIE_MAC_PM, 0, MT_PCIE_MAC_PM_L0S_DIS)?;
         // All published addresses are owned and bounded before enabling DMA.
-        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+        use crate::platform::bus::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
         if self.command(0, BUS_MASTER)? & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
             != BUS_MASTER | MEM_SPACE | INTX_DISABLE
         {
@@ -1810,13 +1815,15 @@ pub struct Transport {
     generation: u64,
 }
 
+#[cfg(feature = "builtin")]
 #[path = "firmware_transport_hw_tests.rs"]
 mod tests;
 impl Transport {
+    #[cfg(feature = "builtin")]
     pub(crate) async fn transmit_p2p_management(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
-        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        authority: Arc<crate::platform::ap_control::RadioControlAuthority>,
         cookie: u64,
         request: narf_wireless::MgmtTxRequest,
         alive: Arc<core::sync::atomic::AtomicBool>,
@@ -1833,10 +1840,11 @@ impl Transport {
         )
         .await
     }
+    #[cfg(feature = "builtin")]
     pub(crate) fn register_p2p_management(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
-        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        authority: Arc<crate::platform::ap_control::RadioControlAuthority>,
         frame_type: u16,
         prefix: &[u8],
         expected_mac: [u8; 6],
@@ -1855,6 +1863,7 @@ impl Transport {
         self.session.firmware.p2p_profile()
     }
 
+    #[cfg(feature = "builtin")]
     pub(crate) fn module_firmware_chunk(
         &self,
         image: u8,
@@ -1884,10 +1893,11 @@ impl Transport {
         self.session.backend.check()?;
         Ok(reply)
     }
+    #[cfg(feature = "builtin")]
     pub(crate) async fn run_p2p_request(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
-        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        authority: Arc<crate::platform::ap_control::RadioControlAuthority>,
         operation: super::boot_p2p::Request,
         alive: Arc<core::sync::atomic::AtomicBool>,
         expected_mac: [u8; 6],
@@ -1902,6 +1912,7 @@ impl Transport {
         )
         .await
     }
+    #[cfg(feature = "builtin")]
     pub(crate) async fn maintain_p2p_device(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
@@ -1909,37 +1920,38 @@ impl Transport {
     ) -> Result<(), Error> {
         super::boot_p2p::maintain_session(&mut self.session, iface, expected_mac).await
     }
+    #[cfg(feature = "builtin")]
     pub(crate) async fn run_p2p_delete(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
-        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        authority: Arc<crate::platform::ap_control::RadioControlAuthority>,
         alive: Arc<core::sync::atomic::AtomicBool>,
         expected_mac: [u8; 6],
-    ) -> Result<narf_wireless::ap_control::RadioControlRetirement, Error> {
+    ) -> Result<crate::platform::ap_control::RadioControlRetirement, Error> {
         super::boot_p2p::delete_session(&mut self.session, iface, authority, alive, expected_mac)
             .await
     }
     pub(crate) async fn start_p2p_device(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        authority: Arc<crate::platform::ap_control::RadioControlAuthority>,
     ) -> Result<(), Error> {
         self.session.start_p2p_device(authority).await
     }
     pub(crate) fn commit_p2p_device(
         &mut self,
-        authority: &narf_wireless::ap_control::RadioControlAuthority,
-    ) -> Result<narf_wireless::ap_control::RadioInterfaceIdentity, Error> {
+        authority: &crate::platform::ap_control::RadioControlAuthority,
+    ) -> Result<crate::platform::ap_control::RadioInterfaceIdentity, Error> {
         self.session.commit_p2p_device(authority)
     }
     pub(crate) async fn stop_p2p_device(
         &mut self,
-        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        authority: &crate::platform::ap_control::RadioControlAuthority,
     ) -> Result<(), Error> {
         self.session.stop_p2p_device(authority).await
     }
     pub(crate) async fn acquire_p2p_roc(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        authority: Arc<crate::platform::ap_control::RadioControlAuthority>,
         cookie: u64,
         frequency_mhz: u32,
         duration_ms: u32,
@@ -1950,7 +1962,7 @@ impl Transport {
     }
     pub(crate) fn commit_p2p_roc(
         &mut self,
-        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        authority: &crate::platform::ap_control::RadioControlAuthority,
     ) -> Result<super::p2p::RocReceipt, Error> {
         self.session.commit_p2p_roc(authority)
     }
@@ -1962,15 +1974,16 @@ impl Transport {
     }
     pub(crate) async fn cancel_p2p_roc(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        authority: Arc<crate::platform::ap_control::RadioControlAuthority>,
         cookie: u64,
     ) -> Result<(), Error> {
         self.session.cancel_p2p_roc(authority, cookie).await
     }
+    #[cfg(feature = "builtin")]
     pub(crate) async fn run_ap_request(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::Mt76Iface>,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         request: super::boot_ap::Request,
         alive: Arc<core::sync::atomic::AtomicBool>,
         expected_mac: [u8; 6],
@@ -2026,19 +2039,20 @@ impl Transport {
     pub unsafe fn new(
         mmio: MmioRegion,
         device: BusDevice,
-        authority: Cap<BusDeviceCap, Write>,
+        authority: DeviceCap,
         firmware: Firmware,
         generation: u64,
     ) -> Result<Self, Error> {
-        let mut transport = crate::mt7921::pci::invoke(&authority, || {
+        let mut transport = crate::platform::bus::invoke(&authority, || {
             authority.check_live().map_err(|_| Error::Authority)?;
             if !matches!(device.id.vendor, 0x14c3 | 0x0e8d)
                 || !matches!(device.id.device, 0x0616 | 0x0608 | 0x7922 | 0x7961 | 0x7920)
             {
                 return Err(Error::Bounds);
             }
-            if narf_bus::pci::read_command(&authority, &device).map_err(|_| Error::Authority)?
-                & narf_bus::pci::cmd::BUS_MASTER
+            if crate::platform::bus::command(&authority, &device, 0, 0)
+                .map_err(|_| Error::Authority)?
+                & crate::platform::bus::cmd::BUS_MASTER
                 != 0
             {
                 return Err(Error::Busy);
@@ -2052,7 +2066,8 @@ impl Transport {
             // A function blocked by the previous generation's stop is
             // re-attached before its first mapping (bus mastering off).
             restore_function_dma(&device)?;
-            let dma = narf_bus::dma::configure(&device).map_err(|_| Error::Allocation)?;
+            let dma = crate::platform::bus::dma_device(&device).map_err(|_| Error::Allocation)?;
+
             let storage = allocate_storage(&dma, dma_layout(device.id.device))?;
             Ok(Self {
                 session: Session::new_boxed(
@@ -2128,14 +2143,14 @@ impl Transport {
     /// Host peer/packet admission is a separate interface publication.
     pub async fn start_ap(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         config: narf_wireless::ApConfig,
     ) -> Result<(), Error> {
         self.session.start_ap(authority, config).await
     }
     pub(crate) async fn start_ap_with_settings(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         config: narf_wireless::ApConfig,
         settings: narf_wireless::ApStartSettings,
     ) -> Result<(), Error> {
@@ -2146,7 +2161,7 @@ impl Transport {
     /// Stop the AP and verify a fresh MAC/FW generation before returning.
     pub async fn stop_ap(
         &mut self,
-        authority: &narf_wireless::ap_control::ApControlAuthority,
+        authority: &crate::platform::ap_control::ApControlAuthority,
     ) -> Result<(), Error> {
         self.session.stop_ap(authority).await
     }
@@ -2154,20 +2169,20 @@ impl Transport {
     /// and its own current authority/identity check; no peer port opens here.
     pub(crate) fn commit_ap_start(
         &mut self,
-        authority: &narf_wireless::ap_control::ApControlAuthority,
+        authority: &crate::platform::ap_control::ApControlAuthority,
     ) -> Result<u64, Error> {
         self.session.commit_ap_start(authority)
     }
     pub(crate) async fn add_ap_station(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         config: narf_wireless::StationConfig,
     ) -> Result<(), Error> {
         self.session.ap_add_station(authority, config).await
     }
     pub(crate) fn authorize_ap_station(
         &mut self,
-        authority: &narf_wireless::ap_control::ApControlAuthority,
+        authority: &crate::platform::ap_control::ApControlAuthority,
         peer: [u8; 6],
         authorized: bool,
     ) -> Result<(), Error> {
@@ -2176,7 +2191,7 @@ impl Transport {
     }
     pub(crate) async fn delete_ap_station(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         peer: Option<[u8; 6]>,
     ) -> Result<(), Error> {
         self.session.ap_delete_station(authority, peer).await
@@ -2185,7 +2200,7 @@ impl Transport {
     /// Even a never-polled operation erases the moved temporal key.
     pub(crate) fn add_ap_key(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         key: narf_wireless::KeyParams,
     ) -> impl core::future::Future<Output = Result<(), Error>> + '_ {
         let key = super::ap_crypto::Install::prepare(key).map_err(|_| Error::Bounds);
@@ -2193,7 +2208,7 @@ impl Transport {
     }
     pub(crate) fn add_owned_ap_key(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         key: narf_wireless::OwnedKey,
     ) -> impl core::future::Future<Output = Result<(), Error>> + '_ {
         let key = super::ap_crypto::Install::from_params(key.params()).map_err(|_| Error::Bounds);
@@ -2201,7 +2216,7 @@ impl Transport {
     }
     pub(crate) async fn delete_ap_key(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         index: u8,
         pairwise: bool,
         peer: Option<[u8; 6]>,
@@ -2212,7 +2227,7 @@ impl Transport {
     }
     pub(crate) async fn default_ap_key(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         index: u8,
     ) -> Result<(), Error> {
         self.session.ap_default_key(authority, index).await
@@ -2246,28 +2261,28 @@ impl Transport {
     }
     pub(crate) async fn transmit_ap_management(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         frame: &[u8],
     ) -> Result<bool, Error> {
         self.session.ap_send_management(authority, frame).await
     }
     pub(crate) async fn transmit_ap_control(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         request: narf_wireless::ControlPortTxRequest,
     ) -> Result<bool, Error> {
         self.session.ap_send_control(authority, request).await
     }
     pub(crate) async fn update_ap_station(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         config: narf_wireless::StationConfig,
     ) -> Result<(), Error> {
         self.session.ap_update_station(authority, config).await
     }
     pub(crate) async fn update_ap_beacon(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         head: Option<Vec<u8>>,
         tail: Option<Vec<u8>>,
         probe: Option<Vec<u8>>,
@@ -2320,11 +2335,11 @@ impl Transport {
         // Bootstrap only at this explicit admission boundary. The running
         // scan must observe a cleared installation rather than reload it.
         if !ssids.is_empty() {
-            narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+            crate::platform::reg_db::ensure_domain().map_err(|_| Error::Authority)?;
         }
         self.session
             .scan_with_options_and_policy(channels, ssids, options, || {
-                narf_wireless::reg::db::get_domain().ok_or(Error::Authority)
+                crate::platform::reg_db::get_domain().ok_or(Error::Authority)
             })
             .await
     }
@@ -2377,7 +2392,7 @@ impl Transport {
         network: crate::mt7921::p2p_wire::Network,
         heard_beacon: bool,
     ) -> Result<u16, Error> {
-        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+        let domain = crate::platform::reg_db::ensure_domain().map_err(|_| Error::Authority)?;
         let info = match self.session.state {
             State::RadioReady(info) | State::ScanReady(info) => info,
             _ => return Err(Error::Busy),
@@ -2461,7 +2476,7 @@ impl Transport {
     pub async fn suspend_wowlan(
         &mut self,
         config: &narf_wireless::WowlanConfig,
-        target: narf_power::system_pm::SystemSleepState,
+        target: crate::platform::power::SystemSleepState,
     ) -> Result<(), Error> {
         self.session.suspend_wowlan(config, target).await
     }
@@ -2511,10 +2526,10 @@ impl Transport {
         &mut self,
         channel: narf_wireless::monitor::Channel,
     ) -> Result<(), Error> {
-        narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+        crate::platform::reg_db::ensure_domain().map_err(|_| Error::Authority)?;
         self.session
             .start_monitor_with_policy(channel, || {
-                narf_wireless::reg::db::get_domain().ok_or(Error::Authority)
+                crate::platform::reg_db::get_domain().ok_or(Error::Authority)
             })
             .await
     }
@@ -2657,7 +2672,7 @@ impl Transport {
         extra_ies: &[u8],
         network: crate::mt7921::p2p_wire::Network,
     ) -> Result<u16, Error> {
-        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+        let domain = crate::platform::reg_db::ensure_domain().map_err(|_| Error::Authority)?;
         let info = match self.session.group_state() {
             Some(State::RadioReady(info) | State::ScanReady(info)) => info,
             _ => return Err(Error::Busy),
@@ -2721,7 +2736,7 @@ impl Transport {
     /// START the GO beside the home station; returns its receive epoch.
     pub(crate) async fn start_go(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         config: narf_wireless::ApConfig,
         settings: narf_wireless::ApStartSettings,
     ) -> Result<u64, Error> {
@@ -2734,9 +2749,10 @@ impl Transport {
     pub(crate) fn close_go(&mut self) -> Result<(), Error> {
         self.session.close_go()
     }
+    #[cfg(feature = "builtin")]
     pub(crate) async fn go_request(
         &mut self,
-        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        authority: Arc<crate::platform::ap_control::ApControlAuthority>,
         request: super::boot_ap::Request,
     ) -> Result<super::boot_ap::Reply, Error> {
         self.session.go_request(authority, request).await

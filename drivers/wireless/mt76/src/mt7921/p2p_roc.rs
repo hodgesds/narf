@@ -4,8 +4,8 @@ use crate::mt7921::{
     p2p_cnm::Phase,
     p2p_wire::{self, Kind},
 };
+use crate::platform::ap_control::RadioEventAuthority;
 use alloc::vec::Vec;
-use narf_wireless::ap_control::RadioEventAuthority;
 #[path = "p2p_channel.rs"]
 mod admission;
 use admission::Listen;

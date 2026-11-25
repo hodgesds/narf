@@ -2,7 +2,7 @@
 //! A default model has no platform route; fixture
 //! admission never becomes a production backend input or Power grant.
 use super::*;
-use narf_power::system_pm::SystemSleepState;
+use crate::platform::power::SystemSleepState;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) enum Power {
