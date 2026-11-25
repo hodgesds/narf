@@ -293,13 +293,20 @@ impl Registers {
         // DCN 3.1.5: display_rq_dlg_calc_31.c ignores the VBA value and
         // programs the vblank start, `v_total - v_front_porch`
         // (`dest.vblank_start`, dcn20_fpu.c).
+        // DCN 3.2: `display_mode_vba_32.c` computes MIN_DST_Y_NEXT_START
+        // from the VBA value plus WritebackDelay and TSetup terms the
+        // fixed-point core does not model, and no DCN 3.2 register layer
+        // consumes this yet — the vblank start is the conservative stand-in
+        // until one does.
         let min_dst_y_next_start = match config.dcn {
             crate::amdgpu_dml::Dcn::Dcn314 => (config.timing.v_total as u64
                 + config.timing.v_total as u64)
                 .saturating_sub(config.timing.v_front_porch as u64)
                 .saturating_sub(config.timing.v_active as u64)
                 .saturating_sub(prefetch.max_v_startup as u64),
-            crate::amdgpu_dml::Dcn::Dcn315 => {
+            crate::amdgpu_dml::Dcn::Dcn315
+            | crate::amdgpu_dml::Dcn::Dcn320
+            | crate::amdgpu_dml::Dcn::Dcn321 => {
                 (config.timing.v_total as u64).saturating_sub(config.timing.v_front_porch as u64)
             }
         };

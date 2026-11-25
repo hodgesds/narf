@@ -57,7 +57,7 @@ pub enum Divider {
     By4,
 }
 impl Divider {
-    fn code(self) -> u32 {
+    pub(crate) fn code(self) -> u32 {
         match self {
             Divider::By1 => 0, // linux: n/a (DCN 3.1.4 path: enum pixel_rate_div)
             Divider::By2 => 1, // linux: n/a (DCN 3.1.4 path: enum pixel_rate_div)

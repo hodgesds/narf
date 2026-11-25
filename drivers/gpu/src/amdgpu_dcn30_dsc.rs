@@ -130,11 +130,23 @@ pub struct Plan {
 /// count divided by the ODM segments. One engine takes at most four
 /// slices and 5184 pixels.
 pub fn plan(t: &Timing, config: &DscConfig, odm: bool) -> Result<Plan, Error> {
+    plan_for(t, config, odm, MAX_IMAGE_WIDTH)
+}
+
+/// [`plan`] with the engine's maximum image width supplied by the caller:
+/// 5184 on DCN 2.0, 6016 on DCN 3.2 (`dcn3_2_ip.max_dsc_input_width` via
+/// `dcn32_resource.c`'s `res_cap_dcn32`).
+pub fn plan_for(
+    t: &Timing,
+    config: &DscConfig,
+    odm: bool,
+    max_image_width: u32,
+) -> Result<Plan, Error> {
     let segments = if odm { 2 } else { 1 };
     if config.slices_h % segments != 0
         || config.slices_h / segments > 4
         || t.h_active % segments != 0
-        || t.h_active / segments > MAX_IMAGE_WIDTH
+        || t.h_active / segments > max_image_width
     {
         return Err(Error::Unsupported);
     }
@@ -285,12 +297,19 @@ fn optc_mode(r: &DscRegisters) -> u32 {
 }
 
 /// The DSC engines, the OPTCs' DSC halves and the DIO's DSC/FEC halves.
+///
+/// `pg_config` / `ip_request_cntl` are the power-gate and IP-request
+/// registers, which moved between DCN generations: 0x00a1 / 0x00b2 on
+/// DCN 3.0/3.1, 0x0089 / 0x0095 on DCN 3.2 (`dcn_3_2_0_offset.h`).
+/// Everything else in this engine is identical across them.
 #[derive(Clone, Copy, Debug)]
 pub struct Dsc {
     regs: Regs,
     dcn2: u64,
     capacity: u8,
     power_gating: bool,
+    pg_config: u64,
+    ip_request_cntl: u64,
 }
 impl Dsc {
     pub(crate) fn new(regs: Regs, dcn2: u64) -> Self {
@@ -299,11 +318,21 @@ impl Dsc {
             dcn2,
             capacity: 6,
             power_gating: true,
+            pg_config: DOMAIN16_PG_CONFIG,
+            ip_request_cntl: DC_IP_REQUEST_CNTL,
         }
     }
     pub(crate) fn for_profile(mut self, profile: crate::amdgpu_dcn_profile::Profile) -> Self {
         self.capacity = profile.pipes();
         self.power_gating = profile.has_plane_power_gating();
+        if matches!(
+            profile,
+            crate::amdgpu_dcn_profile::Profile::Dcn320 | crate::amdgpu_dcn_profile::Profile::Dcn321
+        ) {
+            // linux: mmDOMAIN16_PG_CONFIG / mmDC_IP_REQUEST_CNTL on 3.2.0.
+            self.pg_config = 0x0089;
+            self.ip_request_cntl = 0x0095;
+        }
         self
     }
     fn at(&self, reg: u64) -> u64 {
@@ -327,12 +356,12 @@ impl Dsc {
         if !self.power_gating {
             return Ok(true);
         }
-        let request = self.at(DC_IP_REQUEST_CNTL);
+        let request = self.at(self.ip_request_cntl);
         let original = self.regs.read(request)? & 1;
         if original == 0 {
             self.regs.write(request, 1)?;
         }
-        let config = self.at(DOMAIN16_PG_CONFIG + 2 * u64::from(dsc));
+        let config = self.at(self.pg_config + 2 * u64::from(dsc));
         let result = async {
             self.regs
                 .update(config, POWER_GATE, if on { 0 } else { POWER_GATE })?;
