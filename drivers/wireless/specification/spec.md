@@ -2579,7 +2579,7 @@ feature off).
   leaves no match. QEMU emulates no WCN6855, so bring-up and RF behavior
   are first proven on hardware (`docs/BOOTING_ON_CACHYOS.md`).
 
-### 4.3 `rtl.ko`: rtlwifi (PCIe) and rtl8xxxu (USB) as a loadable module
+### 4.9 `rtl.ko`: rtlwifi (PCIe) and rtl8xxxu (USB) as a loadable module
 
 `narf-drivers-wireless-rtl --no-default-features --features module` builds
 `rtl.ko` for x86_64 and aarch64. The rtlwifi and rtl8xxxu sources build both
@@ -2657,8 +2657,9 @@ ways: built in they are unchanged, and in the `.ko` they run over
   in. The KABI reports only that one exists, not which.
 - **Regulatory domain.** `narf_wireless_regdomain` returns the kernel's
   installation (bootstrapped from the signed policy, or Linux world `00`,
-  as `reg::db::ensure_domain` does). rtl8xxxu's `reg::policy::load` reads
-  the same installation.
+  as `reg::db::ensure_domain` does). The module decodes the record with the
+  shared `narf_wireless::reg::parse_domain_record`. rtl8xxxu's
+  `reg::policy::load` reads the same installation.
 - **PCIe station** (`module_netdev.rs`, through `interface::publish`). The
   worker loop, MSI, watchdog and runtime power save (IPS/LPS) are shared
   with the built-in.
@@ -2710,9 +2711,8 @@ ways: built in they are unchanged, and in the `.ko` they run over
   - The userspace SME.
   - On USB: nl80211 control (no wiphy), and endpoint-halt recovery (the
     KABI has no clear-halt, so a stalled bulk pipe ends the attempt).
-- **Match budget.** `rtl.ko` registers 23 USB matches. The module USB table
-  holds 64 entries across all modules, so `rtl.ko` and `rtw88.ko` (50)
-  cannot both be loaded.
+- **Match budget.** `rtl.ko` registers 23 USB matches. With `rtw88.ko`'s
+  50 that fits the 128-entry module USB table.
 - **Proof.** `modules/e2e/rtl` loads the real `.ko` and checks:
   - init runs to Live;
   - exactly the PCI table is claimed, and not `b822`;

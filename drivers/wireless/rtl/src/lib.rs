@@ -27,7 +27,7 @@
 //!   bound to PCI device authority) and its SME is driven by `rtl.ssid=` /
 //!   `rtl.psk=` / `rtl.passphrase=`.
 //!
-//! See `drivers/wireless/specification/spec.md` §4.3.
+//! See `drivers/wireless/specification/spec.md` §4.9.
 //!
 //! ## Hardware validation is gated
 //!

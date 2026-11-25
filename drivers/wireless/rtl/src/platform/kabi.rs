@@ -1319,7 +1319,7 @@ pub mod wireless {
 /// through `narf_wireless_regdomain` as an NRGD record.
 pub mod regdb {
     use alloc::sync::Arc;
-    use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
+    use narf_wireless::reg::RegulatoryDomain;
 
     use super::*;
 
@@ -1333,30 +1333,10 @@ pub mod regdb {
     /// The largest NRGD record: 12-byte header, 64 rules of 16 bytes.
     const MAX: usize = 12 + 64 * 16;
 
+    /// The shared NRGD record decoder (`parse_policy`'s layout, world `00`
+    /// accepted), the one the kernel's own smokes parse the export with.
     fn decode(bytes: &[u8]) -> Result<RegulatoryDomain, Error> {
-        if bytes.len() < 12 || &bytes[..4] != b"NRGD" || bytes[4..6] != [1, 0] {
-            return Err(Error::Format("invalid regulatory record header"));
-        }
-        let count = usize::from(u16::from_le_bytes([bytes[8], bytes[9]]));
-        if bytes.len() != 12 + count * 16 {
-            return Err(Error::Format("invalid regulatory rule count"));
-        }
-        let mut rules = Vec::with_capacity(count);
-        for raw in bytes[12..].chunks_exact(16) {
-            let word = |i: usize| u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]);
-            rules.push(RegRule {
-                freq_start_mhz: word(0),
-                freq_end_mhz: word(4),
-                max_bandwidth_mhz: word(8),
-                max_power_dbm: raw[12] as i8,
-                flags: RegFlags::from_bits(u32::from(raw[13]) | u32::from(raw[14]) << 8)
-                    .ok_or(Error::Format("unknown regulatory flags"))?,
-            });
-        }
-        Ok(RegulatoryDomain {
-            country_code: [bytes[6], bytes[7]],
-            rules,
-        })
+        narf_wireless::reg::parse_domain_record(bytes).map_err(Error::Format)
     }
 
     /// The kernel's current installation, if one exists.

@@ -918,7 +918,7 @@ has not yet run.
 
 `rtl.ko` was registration-only: its probe returned `-ENOSYS`. Now both
 legacy Realtek drivers build from one source, either built in or as
-`rtl.ko`, and the module runs them over the KABI (spec §4.3).
+`rtl.ko`, and the module runs them over the KABI (spec §4.9).
 
 - **rtlwifi (PCIe), all ten ids.** The whole driver runs in the module:
   - identification and admissibility;
@@ -959,9 +959,9 @@ Not in the module:
 - the userspace SME;
 - on USB, nl80211 control and endpoint-halt recovery.
 
-`rtl.ko` (23 USB matches) and `rtw88.ko` (50) together exceed the 64-entry
-module USB match table. QEMU has no Realtek Wi-Fi device, and no hardware
-boot of `rtl.ko` has run.
+`rtl.ko` registers 23 USB matches, which fit beside `rtw88.ko`'s 50 in the
+128-entry module USB match table. QEMU has no Realtek Wi-Fi device, and no
+hardware boot of `rtl.ko` has run.
 
 ## i40e recovery, RSS and offloads
 
