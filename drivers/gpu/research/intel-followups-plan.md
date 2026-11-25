@@ -48,12 +48,18 @@ work had.
   panel keeps DC9 refused), `intel_cdclk_init_hw` and the PCH reset
   handshake on resume, BXT DSI transcoders in the dark-display check, and
   `assert_can_enable_dc9`'s interrupts-off check.
-- Nova Lake-S: UHBR and Thunderbolt alt mode on the LT PHY, Nova fixtures for
+- Nova Lake-S: Thunderbolt alt mode on the LT PHY, Nova fixtures for
   MST and DSC over LT ports, DC3CO (it needs the CMTG and a LOBF,
   panel-replay or PSR2 trigger) and the DMC wakelock (`intel_dmc_wl`).
-- Display 14 and later: UHBR, native HDMI FRL, HDMI audio, deep colour and
+- Display 14 and later: native HDMI FRL, HDMI audio, deep colour and
   YCbCr 4:4:4, a second concurrent external route, panel replay, and
   compressed primary layouts.
+- DP 2.0 UHBR beyond the 128b/132b SST route behind `narf.intel.uhbr=1`
+  (UHBR10/20 on C20 and LT ports, native fixtures only): 128b/132b MST, DSC
+  over UHBR, UHBR over Thunderbolt alt mode (TBT 312.5/625 MHz clocks, DP
+  tunnel BW allocation), LTTPR non-transparent mode, the reduced-parameter
+  retry after a failed 128b/132b training, HDCP on 128b/132b, VBT C20
+  vswing overrides, and a silicon run.
 - Older display: the Rocket Lake internal panel, a DG1 KMS owner, Gen9
   DPLL arbitration between two external outputs, and the Gen9 interrupt
   handler (`intel_gpu_gen9_irq` has no caller).
