@@ -779,7 +779,7 @@ fn smoke_gen9_dc_gt_irq_hold_while_unparked() -> TestResult {
                 prefetchable: false,
             },
         };
-        if !gt_unparked(&bar).is_some_and(|r| r.service.is_none()) || take_pps_reset_for_bar(&bar) {
+        if gt_unparked(&bar).is_none_or(|r| r.service.is_some()) || take_pps_reset_for_bar(&bar) {
             return TestResult::Fail("without a service the GT_IRQ hold must be inert");
         }
     }
