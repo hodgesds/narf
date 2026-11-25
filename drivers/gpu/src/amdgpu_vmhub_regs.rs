@@ -206,6 +206,52 @@ pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
     cntl_shift: 0,
 };
 
+// ── GFX11 GFXHUB v11.5.0 (Strix Point, GC 11.5.0) ───────────────────
+// gc_11_5_0_offset.h: every register 0x4 above the 11.0.0 table
+// (CONTEXT0_CNTL 0x168c vs 0x1688, PT_BASE 0x16f7 vs 0x16f3), with the
+// same +0x12 REQ→ACK layout (ENG0 REQ 0x16af, ACK 0x16c1, SEM 0x169d;
+// ENG17 REQ 0x16c0, ACK 0x16d2, SEM 0x16ae).
+pub const GFXHUB_V11_5_0: VmHubRegs = VmHubRegs {
+    ctx0_pt_base_lo: 0x16f7,
+    ctx0_pt_base_hi: 0x16f8,
+    ctx0_pt_start_lo: 0x1717,
+    ctx0_pt_start_hi: 0x1718,
+    ctx0_pt_end_lo: 0x1737,
+    ctx0_pt_end_hi: 0x1738,
+    ctx_addr_distance: 2,
+    ctx0_cntl: 0x168c,
+    ctx_distance: 1,
+    inv_eng0_req: 0x16af,
+    inv_eng0_ack: 0x16c1,
+    inv_eng0_sem: 0x169d,
+    eng_distance: 1,
+    semaphore: false,
+    cntl_shift: 0,
+};
+
+// ── MMHUB v3.0.2 ───────────────────────────────────────────────────
+// mmhub_3_0_2_offset.h: the whole block 0x80 below the 3.0.0/3.0.1 table
+// (CONTEXT0_CNTL 0x06c0 vs 0x0740, PT_BASE 0x072b vs 0x07ab), on BASE_IDX 0,
+// with the same +0x12 REQ→ACK layout (ENG0 REQ 0x06e3, ACK 0x06f5,
+// SEM 0x06d1; ENG17 REQ 0x06f4, ACK 0x0706, SEM 0x06e2).
+pub const MMHUB_V3_0_2: VmHubRegs = VmHubRegs {
+    ctx0_pt_base_lo: 0x072b,
+    ctx0_pt_base_hi: 0x072c,
+    ctx0_pt_start_lo: 0x074b,
+    ctx0_pt_start_hi: 0x074c,
+    ctx0_pt_end_lo: 0x076b,
+    ctx0_pt_end_hi: 0x076c,
+    ctx_addr_distance: 2,
+    ctx0_cntl: 0x06c0,
+    ctx_distance: 1,
+    inv_eng0_req: 0x06e3,
+    inv_eng0_ack: 0x06f5,
+    inv_eng0_sem: 0x06d1,
+    eng_distance: 1,
+    semaphore: true,
+    cntl_shift: 0,
+};
+
 // ── GFX10.3 GFXHUB (Renoir) ───────────────────────────────────────
 //
 // mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 = 0x1667

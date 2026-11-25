@@ -32,6 +32,24 @@ pub(crate) const NBIO_VERSIONS: &[(u8, u8, u8)] = &[
     (7, 7, 1),
 ];
 
+/// NBIO 7.11 (Strix Point): the `BIF_BX1_PCIE_INDEX2` / `_DATA2` pair is
+/// at the same dwords (0x000e / 0x000f, BASE_IDX 0) in both headers Linux
+/// drives for it — `nbio_7_11_0_offset.h` for 7.11.0–7.11.3
+/// (`nbio_v7_11_funcs`, `amdgpu_discovery.c`) and `nbio_7_11_5_offset.h`
+/// for 7.11.4–7.11.5 (`nbio_v7_11_5_funcs`). The BX0 pair (0x800e/0x800f)
+/// is a different instance and is NOT this pair. Only the strap dword
+/// differs between the two headers (`RCC_STRAP1_RCC_DEV0_EPF0_STRAP0`
+/// 0x0015 vs 0x0021) — that is the topology reader's concern, not the
+/// SMN read's.
+pub(crate) const NBIO_VERSIONS_711: &[(u8, u8, u8)] = &[
+    (7, 11, 0),
+    (7, 11, 1),
+    (7, 11, 2),
+    (7, 11, 3),
+    (7, 11, 4),
+    (7, 11, 5),
+];
+
 /// `regBIF_BX_PF0_RSMU_INDEX` / `_DATA` at NBIO `_BASE_IDX 1` in
 /// `nbio_7_2_0_offset.h` (`nbio_v7_2_get_pcie_port_index_offset`).
 pub(crate) const RSMU_INDEX: u64 = 0x00; // linux: regBIF_BX_PF0_RSMU_INDEX

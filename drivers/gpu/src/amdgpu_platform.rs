@@ -836,20 +836,20 @@ async fn graphics_boot(
     firmware: Option<crate::amdgpu_info_navi22::Firmware>,
 ) -> Option<crate::amdgpu_raphael_boot::ColdBoot> {
     use core::fmt::Write as _;
-    // Strix has no ColdBoot owner yet: its SMU is 14.0.1, whose PPSMC
-    // message map is ungrounded (no `smu14/` sources in the ref tree),
-    // and the GFX11 pieces it would stand on (lane 5's Phoenix PTE,
-    // lane 4's SDMA 6.0 bring-up) do not exist yet. Refuse by name
-    // instead of falling through to the Raphael owner's profile check,
-    // whose error would mislabel the chip. Display still comes up; only
-    // the graphics engines stay down.
+    // Strix is dispatched to `graphics_boot_strix`, not here: its owner
+    // is the Strix Point ColdBoot (SMU 14.0.0, driver-IF 0x7 — the
+    // 14.0.1/0x6 grounding in #2486 was Strix Halo, corrected by the
+    // ColdBoot owner lane, #2467). Refuse by name instead of falling
+    // through to the Raphael owner's profile check, whose error would
+    // mislabel the chip. Display still comes up; only the graphics
+    // engines stay down.
     let is_strix =
         crate::amdgpu::with_controller(|gpu| gpu.chip.family == crate::amdgpu::Family::Strix)
             .unwrap_or(false);
     if is_strix {
         let _ = writeln!(
             narf_console::Writer,
-            "amdgpu: strix graphics refused: no ColdBoot owner yet (SMU 14.0.1 grounding outstanding, #2467)"
+            "amdgpu: strix graphics refused: Raphael path does not serve Strix (see graphics_boot_strix)"
         );
         return None;
     }
@@ -1020,11 +1020,10 @@ async unsafe fn run_graphics_phoenix(boot: &mut crate::amdgpu_phoenix_boot::Phoe
 /// `mes_start` is the MES program-counter entry points (sched + KIQ) from
 /// the loader; see `Loader::mes_start_addrs`.
 ///
-/// The DID dispatch (not `Family::Strix`, which does not exist yet) is in
-/// `start`'s spawn task, checked before the Phoenix branch: Strix maps to
-/// `Family::Phoenix` today, so the Phoenix branch would claim it first.
-/// Until the GMC/IH/SDMA/GFX/MES lanes land, `run` fails closed at
-/// MemoryHubs and this returns a failed owner.
+/// The DID dispatch is in `start`'s spawn task, checked before the Phoenix
+/// branch: Strix is its own family (`Family::Strix`), so the Phoenix branch
+/// must not claim it. All sixteen stages have owners now; `run` executes
+/// them and this returns the owner either way.
 async fn graphics_boot_strix(
     pool: &Pool,
     mes_start: [u64; 2],
@@ -1980,17 +1979,17 @@ async fn gate_graphics_phoenix(graphics: &mut crate::amdgpu_phoenix_boot::Phoeni
     }
 }
 /// `amdgpu_device_ip_late_init`'s `set_pg_state(GATE)` for Strix GFX,
-/// once clients are served. There is no GFXOFF/GfxOff owner yet, so this is
-/// a remainder no-op that says so; graphics stays up with GFX powered.
+/// once clients are served: power gating on and GFXOFF allowed after its
+/// delay. There is no clock-gating owner yet, so the clocks stay ungated.
+/// Failure is reported; graphics stays up with GFX powered.
 async fn gate_graphics_strix(graphics: &mut crate::amdgpu_strix_boot::StrixColdBoot) {
     use core::fmt::Write as _;
     if !graphics.queues_verified() {
         return;
     }
-    let _ = writeln!(
-        narf_console::Writer,
-        "amdgpu: strix GFX gate: no GFXOFF owner yet; GFX stays powered"
-    );
+    if let Err(error) = graphics.gate_gfx().await {
+        let _ = writeln!(narf_console::Writer, "amdgpu: strix GFX gate {error:?}");
+    }
 }
 /// `gfx_off_delay_work`: deliver `allow` [`DELAY_MS`] from now to the
 /// coordinator that scheduled it. A disable request in between, or a newer
@@ -2077,6 +2076,24 @@ pub(crate) fn schedule_gfx_off_phoenix(allow: crate::amdgpu_raphael_gfxoff::Allo
                     narf_console::Writer,
                     "amdgpu: phoenix GFXOFF allow {error:?}"
                 );
+            }
+        }
+    });
+}
+/// `gfx_off_delay_work` for a Strix coordinator: deliver `allow`
+/// [`DELAY_MS`] from now. A disable request in between, or a newer
+/// coordinator lifetime, makes it a no-op.
+///
+/// [`DELAY_MS`]: crate::amdgpu_raphael_gfxoff::DELAY_MS
+pub(crate) fn schedule_gfx_off_strix(allow: crate::amdgpu_raphael_gfxoff::Allow) {
+    narf_scheduler::spawn(async move {
+        use core::fmt::Write as _;
+        let delay = crate::amdgpu_raphael_gfxoff::DELAY_MS;
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(delay).as_instant()).await;
+        let mut owner = graphics_owner().await;
+        if let Some(boot) = owner.get_strix() {
+            if let Err(error) = boot.delayed_gfx_off(allow).await {
+                let _ = writeln!(narf_console::Writer, "amdgpu: strix GFXOFF allow {error:?}");
             }
         }
     });
@@ -2328,8 +2345,7 @@ struct Display {
     /// Strix's graphics engines, same retention policy as Phoenix's.
     /// Unreachable until the firmware lane lands `Firmware::open_strix`
     /// + the Strix `set_graphics` arm: no Strix set can be loaded today,
-    ///   so `start()` never fills this in. Until the GMC/IH/SDMA/GFX/MES
-    ///   lanes land, a run fails closed at MemoryHubs.
+    /// so `start()` never fills this in.
     graphics_strix: Option<crate::amdgpu_strix_boot::StrixColdBoot>,
     /// Strix owners a mode 2 recovery replaced; same quarantine policy.
     /// Unread until the Strix recovery lane lands (`recover()` has no
@@ -2359,6 +2375,9 @@ impl Graphics {
         &mut self,
     ) -> Option<&mut crate::amdgpu_phoenix_boot::PhoenixColdBoot> {
         self.0.as_mut()?.graphics_phoenix.as_deref_mut()
+    }
+    pub(crate) fn get_strix(&mut self) -> Option<&mut crate::amdgpu_strix_boot::StrixColdBoot> {
+        self.0.as_mut()?.graphics_strix.as_mut()
     }
     /// The coordinator with the PSP session that loaded its VCN.
     pub(crate) fn media(
@@ -2449,11 +2468,11 @@ pub(crate) fn start() -> bool {
             if display.loader.graphics_booted() {
                 // Boxed: these futures hold the whole bring-up, which inline
                 // would make this task's own frame and future too large.
-                // Strix first: it maps to Family::Phoenix today, so the
-                // Phoenix branch below would claim it. Checked by DID, not
-                // by family — Family::Strix does not exist yet (the
-                // parallel bringup lane owns it); when it lands, this
-                // check can switch to the family.
+                // Strix first, checked by DID: the Phoenix branch below
+                // matches on family, and Strix is its own family
+                // (Family::Strix), so the order is defense in depth —
+                // the DID check is the exact admission (one DID) and
+                // stays even though the family check now agrees.
                 let is_strix = crate::amdgpu::pci_device().is_some_and(|d| {
                     (d.id.vendor, d.id.device)
                         == (crate::amdgpu::AMD_VENDOR, crate::amdgpu::STRIX_POINT)

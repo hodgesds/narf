@@ -782,3 +782,22 @@ kernel_test_in!(
     "drivers/gpu/raphael-gating",
     raphael_gating_resolves_raphaels_blocks
 );
+
+/// Strix Point's CG/PG flags are Phoenix's plus the `soc21.c` 11.5.0
+/// arm's deltas: `GFX_3D_CGCG`, `GFX_3D_CGLS`, `HDP_DS`, `HDP_SD` in,
+/// `HDP_MGCG` out; `JPEG_DPG` in. `GFX_PG` stays set: `gfx_v11_cntl_pg`
+/// runs only with it.
+fn strix_gating_flags_match_soc21_11_5_0() -> TestResult {
+    if STRIX_CG != (PHOENIX_CG | cg::GFX_3D_CGCG | cg::GFX_3D_CGLS | cg::HDP_DS | cg::HDP_SD)
+        || STRIX_CG & cg::HDP_MGCG != 0
+        || STRIX_PG != (PHOENIX_PG | pg::JPEG_DPG)
+        || STRIX_PG & pg::GFX_PG == 0
+    {
+        return TestResult::Fail("Strix CG/PG flags");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/strix-gating",
+    strix_gating_flags_match_soc21_11_5_0
+);

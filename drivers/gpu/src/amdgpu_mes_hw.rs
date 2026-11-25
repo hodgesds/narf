@@ -524,6 +524,38 @@ pub const PHOENIX_TOPOLOGY: MesTopology = MesTopology {
     db_start_dw_offset: 0,
 };
 
+/// Strix Point, with the stock module parameters.
+///
+/// `gfx_v11_0_sw_init` puts GC IP_VERSION(11, 5, 0) in the SAME arm as
+/// Phoenix (11.0.0–11.0.4): `num_me = 1`, rs64 → `num_pipe_per_me = 1`,
+/// `num_queue_per_pipe = 2`, `num_mec = 1`, `num_pipe_per_mec = 4`,
+/// `num_queue_per_pipe = 4`, and `num_compute_rings =
+/// min(amdgpu_gfx_get_num_kcq(), 8)` — the same 8 the Phoenix table rests
+/// on, with the same caveat (`get_num_kcq` is not in the ref checkout; the
+/// 8 rests on the shared-arm argument, as `RDNA3_TOPOLOGY`'s doc records
+/// for the discrete parts). Every value is therefore identical to
+/// [`PHOENIX_TOPOLOGY`]; the separate const exists so the Strix
+/// coordinator names its own topology and a future divergence has a place
+/// to land.
+///
+/// `num_sdma_instances` is 1 and comes from the discovery table at runtime;
+/// it is here as the Strix value for the test, not as something to trust —
+/// no Strix discovery table has been read, and Phoenix hardcodes 1 the
+/// same way.
+pub const STRIX_TOPOLOGY: MesTopology = MesTopology {
+    num_me: 1,
+    num_pipe_per_me: 1,
+    num_queue_per_pipe_gfx: 2,
+    num_gfx_rings: 1,
+    num_mec: 1,
+    num_pipe_per_mec: 4,
+    num_queue_per_pipe_compute: 4,
+    num_compute_rings: 8,
+    num_sdma_instances: 1,
+    first_kfd_vmid: 8,
+    db_start_dw_offset: 0,
+};
+
 /// `mes->sdma_hqd_mask[i] = 0xfc` — a literal in `amdgpu_mes_init`, not
 /// derived from anything. Queues 2..7 of each SDMA instance; 0 and 1 are the
 /// driver's own.

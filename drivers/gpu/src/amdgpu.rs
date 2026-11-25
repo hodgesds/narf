@@ -115,7 +115,7 @@ pub const PHOENIX1: u16 = 0x15BF;
 /// Phoenix2 — the cut-down Phoenix die (Ryzen 7x40U low end). Same IP set.
 pub const PHOENIX2: u16 = 0x15C8;
 /// Strix Point (Radeon 880M / 890M). GFX **11.5.0**, DCN **3.5**,
-/// PSP 14.0.1 — a different IP stack from Phoenix, not a Phoenix variant.
+/// PSP 14.0.0 — a different IP stack from Phoenix, not a Phoenix variant.
 pub const STRIX_POINT: u16 = 0x150E;
 /// Rembrandt (Radeon 680M, Ryzen 6000 series). GFX **10.3.3**
 /// (`AMDGPU_FAMILY_YC`, "yellow_carp"), DCN 3.1.2 — RDNA2, one whole
@@ -460,9 +460,10 @@ pub enum Family {
     /// DCN 3.1.4 register layout differs from DCN 3.2 (Navi31).
     Phoenix,
     /// Strix Point / Strix Halo — Zen5 APUs, GFX 11.5.0 with DCN 3.5
-    /// (`dcn_3_5_0_offset.h`), PSP 14.0.1. A distinct family from
+    /// (`dcn_3_5_0_offset.h`), PSP 14.0.0 (Strix Point; 14.0.1 on Strix
+    /// Halo). A distinct family from
     /// Phoenix: the PSP TOC branch, the DCN register layout and the
-    /// firmware set all differ (Linux: `psp_v13_0` TOC for MP0 14.0.1,
+    /// firmware set all differ (Linux: `psp_v13_0` TOC for MP0 14.0.0,
     /// `gfx_v11_0` for GC 11.5.x, `vcn_v4_0_5` for VCN 4.0.5).
     Strix,
     /// Navi 4x — RDNA4. Separate from both the RDNA3 APUs and Navi3.
@@ -729,14 +730,14 @@ impl FwEntry {
 /// `amdgpu_dm_dmub.h` (`FIRMWARE_DCN_314_DMUB`).
 ///
 /// This table previously held the **Strix** bundle — GFX 11.5, DCN 3.5,
-/// PSP 14.0.1 — under a doc comment that said so. Phoenix is RDNA3 and
+/// PSP 14.0.0 — under a doc comment that said so. Phoenix is RDNA3 and
 /// Strix is RDNA3.5; they share no firmware file.
 ///
 /// There is deliberately **no SMU entry**. Phoenix is an APU and its PMFW
 /// is BIOS-resident, loaded by the PSP — exactly as `RENOIR_FW` notes for
 /// GFX9 APUs. linux-firmware ships `smu_*.bin` only for discrete parts
 /// (13_0_0, 13_0_6, 13_0_7, 13_0_10, 13_0_14, 14_0_2, 14_0_3); neither
-/// `smu_13_0_4.bin` nor `smu_14_0_1.bin` exists anywhere, so the entry this
+/// `smu_13_0_4.bin` nor `smu_14_0_0.bin` exists anywhere, so the entry this
 /// table used to carry could never have opened.
 /// The ORDER is Linux's, and it is a hardware contract rather than a
 /// preference. `psp_load_non_psp_fw` walks `adev->firmware.ucode[]`, which is
@@ -828,14 +829,14 @@ fn is_rlc_blob(name: &str) -> bool {
     name.ends_with("_rlc.bin")
 }
 
-/// Strix Point — GFX **11.5.0**, DCN **3.5**, PSP **14.0.1**, SDMA 6.1.0,
+/// Strix Point — GFX **11.5.0**, DCN **3.5**, PSP **14.0.0**, SDMA 6.1.0,
 /// VCN 4.0.5. This is the bundle that used to sit in `PHOENIX_FW`.
 ///
 /// No SMU entry, for the same reason Phoenix has none: Strix is an APU and
-/// `smu_14_0_1.bin` does not exist in linux-firmware.
+/// `smu_14_0_0.bin` does not exist in linux-firmware.
 ///
 /// Every name is Linux's `MODULE_FIRMWARE` for this IP set: `psp_v13_0.c`
-/// (TOC + TA for MP0 14.0.1, the `psp_v13_0` TOC branch), `sdma_v6_0.c`,
+/// (TOC + TA for MP0 14.0.0, the `psp_v13_0` TOC branch), `sdma_v6_0.c`,
 /// `gfx_v11_0.c` (GC 11.5.0 → `gfx_v11_0`), `mes_v11_0.c` (11.5.0 takes
 /// `mes_2` + `mes1`, no `mes.bin`), `amdgpu_vcn.c`
 /// (`FIRMWARE_VCN4_0_5`), `amdgpu_dm_dmub.h` (`FIRMWARE_DCN_35_DMUB`).
@@ -846,7 +847,7 @@ fn is_rlc_blob(name: &str) -> bool {
 /// of the graphics firmwares so the PSP autoload fires only once the rest
 /// have landed.
 static STRIX_FW: &[FwEntry] = &[
-    FwEntry::toc("amdgpu/psp_14_0_1_toc.bin"),
+    FwEntry::toc("amdgpu/psp_14_0_0_toc.bin"),
     FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
@@ -857,7 +858,7 @@ static STRIX_FW: &[FwEntry] = &[
     FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
     FwEntry::ip_fw("amdgpu/vcn_4_0_5.bin"),
     FwEntry::ip_fw("amdgpu/dcn_3_5_dmcub.bin"),
-    FwEntry::ta("amdgpu/psp_14_0_1_ta.bin"),
+    FwEntry::ta("amdgpu/psp_14_0_0_ta.bin"),
 ];
 
 /// Rembrandt — GFX **10.3.3**, DCN **3.1.2**, PSP **13.0.1**/**13.0.3**, SDMA 5.2.3,
@@ -1015,10 +1016,10 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             "amdgpu/phoenix.bin",
             PHOENIX_FW,
         ),
-        // Strix is its own family (GFX 11.5 / DCN 3.5 / PSP 14.0.1): a
+        // Strix is its own family (GFX 11.5 / DCN 3.5 / PSP 14.0.0): a
         // different IP stack from Phoenix, with its own firmware table.
-        // Its ColdBoot owner does not exist yet — `graphics_boot` refuses
-        // Strix until one lands — but the display path (PSP TOC + DMCUB)
+        // Its ColdBoot owner is `amdgpu_strix_boot`
+        // (`graphics_boot_strix`); the display path (PSP TOC + DMCUB)
         // is live.
         STRIX_POINT => (Family::Strix, "strix", "amdgpu/strix.bin", STRIX_FW),
         // Rembrandt is RDNA2 (GFX 10.3.3 / DCN 3.1.2) — not Phoenix. Its
@@ -3268,10 +3269,13 @@ impl AmdGpu {
     /// compiled to talk to, per family. Renoir = SMU 12.0,
     /// Phoenix = SMU 13.0.4, Navi3 = SMU 13.0.0. Other families
     /// don't have an SMU bring-up path in this scaffold. Strix
-    /// is an explicit `None`: its SMU is 14.0.1 and the 14.0.1
-    /// driver-interface version is ungrounded (no `smu14/`
-    /// sources in the ref tree); Navi48's 0x2e is 14.0.2's, not
-    /// 14.0.1's, and must not be copied across.
+    /// is an explicit `None`: its SMU is 14.0.0 (driver-IF 0x07,
+    /// grounded by the Strix SMU owner in `amdgpu_smu_strix` — the
+    /// 14.0.1/0x6 grounding in #2486 was Strix Halo), but the generic
+    /// `bring_up` path here does not run that owner's
+    /// `FIRMWARE_FLAGS` check, so Strix SMU bring-up lives in the
+    /// ColdBoot owner, not in `initialize()`; Navi48's 0x2e is
+    /// 14.0.2's, not 14.0.0's, and must not be copied across.
     pub fn expected_smu_driver_if_version(&self) -> Option<u32> {
         use crate::amdgpu_smu::{
             SMU12_DRIVER_IF_VERSION, SMU_13_0_0_DRIVER_IF_VERSION, SMU_13_0_4_DRIVER_IF_VERSION,

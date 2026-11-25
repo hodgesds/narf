@@ -642,6 +642,16 @@ pub trait SmuMmio {
     fn read(&mut self, mp1_base_plus_offset: u32) -> u32;
     /// Write `mp1_base + offset`.
     fn write(&mut self, mp1_base_plus_offset: u32, value: u32);
+    /// Read an SMN address through the NBIO `PCIE_INDEX2`/`DATA2` pair
+    /// (`amdgpu_smn::read`). Only mailboxes whose engine resolves an NBIO
+    /// bank implement this: the default is no SMN path, returning 0, so
+    /// any firmware-status check built on it fails closed rather than
+    /// reading the wrong register. Phoenix's mailbox never calls it
+    /// (Linux skips the flags check for 13.0.4); Strix's does, for
+    /// `MP1_FIRMWARE_FLAGS`.
+    fn read_smn(&mut self, _address: u32) -> u32 {
+        0
+    }
 }
 
 /// Maximum iterations the handshake / response polls take before
@@ -752,7 +762,8 @@ pub fn send_message_void<M: SmuMmio>(
 //   smu_v12_0.h:        SMU12_DRIVER_IF_VERSION   (Renoir / Lucienne / Cezanne)
 //   smu_v13_0_4.h:      SMU_13_0_4_DRIVER_IF_VERSION (Phoenix / HawkPoint1)
 //   smu13_driver_if_v13_0_0.h: SMU_13_0_0_DRIVER_IF_VERSION (Navi31/32/33 discrete)
-//   smu_v14_0_0_ppt.c:  SMU14_DRIVER_IF_VERSION_SMU_V14_0_1 (Strix Point, MP1 14.0.1)
+//   smu_v14_0_0_ppt.c:  SMU14_DRIVER_IF_VERSION_SMU_V14_0_0 (Strix Point, MP1 14.0.0)
+//   smu_v14_0_0_ppt.c:  SMU14_DRIVER_IF_VERSION_SMU_V14_0_1 (Strix Halo, MP1 14.0.1)
 
 /// Renoir / Lucienne / Cezanne (SMU 12.0). Matches Linux
 /// `drivers/gpu/drm/amd/pm/swsmu/inc/smu_v12_0.h`.
@@ -767,13 +778,21 @@ pub const SMU_13_0_4_DRIVER_IF_VERSION: u32 = 0x07;
 /// carries 0x07 for Phoenix above — the Phoenix value predates that bump
 /// and is NOT changed here; it needs its own lane + CI verdict.
 pub const SMU_13_0_0_DRIVER_IF_VERSION: u32 = 0x3D;
-/// Strix Point (SMU 14.0.1). Matches Linux
+/// Strix Point (SMU 14.0.0). Matches Linux
+/// `drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c:68`
+/// (`#define SMU14_DRIVER_IF_VERSION_SMU_V14_0_0 0x7`, Linux 7.4-rc2),
+/// assigned when MP1 reports 14.0.0 (`smu_v14_0_0_set_ppt_funcs`); MP1
+/// 14.0.4 / 14.0.5 report the same 0x7 and share the v14_0_0 message
+/// table, but are different parts (Krackan Point / Strix Halo stepping),
+/// not admitted by the Strix owner.
+pub const SMU_14_0_0_DRIVER_IF_VERSION: u32 = 0x07;
+/// Strix Halo (SMU 14.0.1). Matches Linux
 /// `drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c:69`
 /// (`#define SMU14_DRIVER_IF_VERSION_SMU_V14_0_1 0x6`, Linux 7.4-rc2),
-/// assigned when MP1 reports 14.0.1 (`smu_v14_0_0_set_ppt_funcs`); MP1
-/// 14.0.0 / 14.0.4 / 14.0.5 use the same v14_0_0 message table but report
-/// 0x7 (`SMU14_DRIVER_IF_VERSION_SMU_V14_0_0`) and are different parts,
-/// not admitted by the Strix owner.
+/// assigned when MP1 reports 14.0.1 (`smu_v14_0_0_set_ppt_funcs`).
+/// NOT Strix Point: the merged #2486 SMU owner gated on 14.0.1 / 0x6,
+/// which is the Halo part; real Strix Point reports 14.0.0 / 0x7 (the
+/// APU ASIC info table in `Documentation/gpu/amdgpu/apu-asic-info-table.csv`).
 pub const SMU_14_0_1_DRIVER_IF_VERSION: u32 = 0x06;
 
 // ── Bring-up sequence ──────────────────────────────────────────────

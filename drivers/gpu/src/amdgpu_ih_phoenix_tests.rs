@@ -86,6 +86,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
             oss: OSS,
             gc: GC,
             nbio: NBIO,
+            fb_base: 0x1678,
+            fb_top: 0x1679,
         },
         memory: pool.reserve(BYTES).unwrap(),
         state: State::Prepared,
@@ -436,18 +438,11 @@ fn ih_phoenix_layout_resolves_only_phoenix() -> TestResult {
     if layout.oss != 0x14000 * 4 || layout.gc != 0x4000 * 4 {
         return TestResult::Fail("Phoenix IH banks");
     }
-    let mut strix = gpu();
-    strix.chip = crate::amdgpu::__test_chip_info_for_pci_id(
-        crate::amdgpu::AMD_VENDOR,
-        crate::amdgpu::STRIX_POINT,
-    )
-    .unwrap();
     let mut oss7 = gpu();
     oss7.ip_blocks[0].major = 7;
     let mut gc110 = gpu();
     gc110.ip_blocks[1].revision = 0;
     for (bad, why) in [
-        (strix, "IH6 layout admitted Strix"),
         (oss7, "IH6 layout admitted OSSSYS 7.0"),
         (gc110, "IH6 layout admitted GC 11.0.0"),
     ] {
@@ -461,3 +456,53 @@ kernel_test_in!(
     "drivers/gpu/ih-phoenix",
     ih_phoenix_layout_resolves_only_phoenix
 );
+
+/// Strix Point resolves the same IH layout with GC 11.5.0 and the
+/// 0x167c/0x167d FB aperture registers; a Strix DID reporting GC 11.0.1
+/// is refused.
+fn ih_phoenix_layout_resolves_strix() -> TestResult {
+    use crate::amdgpu_discovery as d;
+    let gpu = || {
+        let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(
+            crate::amdgpu::AMD_VENDOR,
+            crate::amdgpu::STRIX_POINT,
+        )
+        .unwrap();
+        let template = gpu.ip_blocks[0];
+        let ip = |id, v: (u8, u8, u8), base: u32| {
+            let mut block = template;
+            block.hw_id = id;
+            (block.major, block.minor, block.revision) = v;
+            block.num_bases = 1;
+            block.base_addrs[0] = base;
+            block
+        };
+        let mut nbif = ip(d::HW_ID_NBIF, (7, 7, 1), 0);
+        nbif.num_bases = 3;
+        nbif.base_addrs[2] = 0x3000;
+        gpu.ip_blocks = vec![
+            ip(d::HW_ID_OSSSYS, (6, 0, 0), 0x14000),
+            ip(d::HW_ID_GC, (11, 5, 0), 0x4000),
+            nbif,
+        ];
+        gpu
+    };
+    let layout = match Layout::resolve(&gpu()) {
+        Ok(layout) => layout,
+        Err(_) => return TestResult::Fail("Strix IH layout refused"),
+    };
+    if layout.oss != 0x14000 * 4 || layout.gc != 0x4000 * 4 {
+        return TestResult::Fail("Strix IH banks");
+    }
+    if layout.fb_base != 0x167c || layout.fb_top != 0x167d {
+        return TestResult::Fail("Strix IH FB registers");
+    }
+    let mut gc110 = gpu();
+    (gc110.ip_blocks[1].minor, gc110.ip_blocks[1].revision) = (0, 1);
+    if Layout::resolve(&gc110).is_ok() {
+        return TestResult::Fail("IH6 layout admitted GC 11.0.1 on Strix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/ih-phoenix", ih_phoenix_layout_resolves_strix);

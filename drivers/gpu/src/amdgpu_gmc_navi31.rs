@@ -1,10 +1,11 @@
-//! GFX11 (Navi31/32/33 + Phoenix) GMC v11 owner: VMID0 bring-up for an
-//! owned VRAM test aperture, client VMID setup, TLB flush, and PASID
-//! mapping.
+//! GFX11 (Navi31/32/33 + Phoenix + Strix Point) GMC v11 owner: VMID0
+//! bring-up for an owned VRAM test aperture, client VMID setup, TLB flush,
+//! and PASID mapping.
 //!
 //! Linux `gmc_v11_0.c` / `gfxhub_v3_0.c` (+ `gfxhub_v3_0_3.c` for Navi32)
-//! / `mmhub_v3_0.c` (+ `mmhub_v3_0_1.c` for Phoenix). No clock gating,
-//! KIQ/MES invalidation, retry-fault recovery, GART bind/unbind, or
+//! / `mmhub_v3_0.c` (+ `mmhub_v3_0_1.c` for Phoenix) (+ `gfxhub_v11_5_0.c`
+//! / `mmhub_v3_0_1.c` or `mmhub_v3_0_2.c` for Strix Point). No clock
+//! gating, KIQ/MES invalidation, retry-fault recovery, GART bind/unbind, or
 //! implicit reset — the GART table and the GPUVM stack are the follow-up;
 //! this owner brings up VMID0, arms the client VMIDs, and owns the
 //! TLB/PASID surface the submitter will use.
@@ -17,6 +18,7 @@
 //! | Navi32  | 11.0.3     | `gfxhub_v3_0_3` (`GFXHUB_V3_0_3`) | 3.0.0 |
 //! | Navi33  | 11.0.2     | `gfxhub_v3_0` (`GFXHUB_V3_0`) | 3.0.0 |
 //! | Phoenix | 11.0.1     | `gfxhub_v3_0` (`GFXHUB_V3_0`) | 3.0.1, BASE_IDX 1 |
+//! | Strix   | 11.5.0     | `gfxhub_v11_5_0` (`GFXHUB_V11_5_0`) | 3.0.1, BASE_IDX 1, or 3.0.2, BASE_IDX 0 |
 //!
 //! Navi33 shares the 11.0.0 function table because
 //! `gmc_v11_0_set_gfxhub_funcs` selects the default `gfxhub_v3_0_funcs`
@@ -30,6 +32,15 @@
 //! differs from `mmhub_v3_0.c` only in its client-ID table — the
 //! programming backend and register offsets are the same, so Phoenix
 //! reuses the `MM` table and the `MMHUB_V3_0` VM-hub table.
+//! Strix's GFX hub is `gfxhub_v11_5_0` (`gmc_v11_0_set_gfxhub_funcs`
+//! selects it for 11.5.0): every register 0x4 above the 11.0.0 table
+//! except `FB_OFFSET` and the system-aperture defaults. Its MMHUB is
+//! 3.0.1 on BASE_IDX 1 or 3.0.2 on BASE_IDX 0 — the same programming
+//! backend, the whole block 0x80 lower on 3.0.2 (`mmhub_v3_0_2.c`, split
+//! from `v3_0` in 2022 for a Navi33-era part; `gmc_v11_0_set_mmhub_funcs`
+//! selects it for 3.0.2). Which one a Strix Point reports is unpinned
+//! from any product source, so both are accepted and the resolved table
+//! travels with the layout; anything else fails closed.
 //!
 //! ## VMID split (`gmc_v11_0_sw_init`)
 //!
@@ -56,14 +67,17 @@ use crate::{
     amdgpu_discovery as ip,
     amdgpu_psp_ring::bank,
     amdgpu_vm::Geometry as VmGeometry,
-    amdgpu_vmhub_regs::{self as hub, VmHubRegs, GFXHUB_V3_0, GFXHUB_V3_0_3, MMHUB_V3_0},
+    amdgpu_vmhub_regs::{
+        self as hub, VmHubRegs, GFXHUB_V11_5_0, GFXHUB_V3_0, GFXHUB_V3_0_3, MMHUB_V3_0,
+        MMHUB_V3_0_2,
+    },
     amdgpu_vram::{Pool, Reservation},
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 #[path = "amdgpu_gmc_navi31_regs.rs"]
 mod regs;
-use regs::{HubRegs, GFX, GFX_11_0_3, MM};
+use regs::{HubRegs, GFX, GFX_11_0_3, GFX_11_5_0, MM, MM_3_0_2};
 
 /// `gmc_v11_0_mc_init`: `amdgpu_gmc_set_gart_size(adev, SZ_512M)`.
 pub const GART_SIZE: u64 = 512 << 20;
@@ -83,14 +97,16 @@ pub enum Gfx11Die {
     Navi32,
     Navi33,
     Phoenix,
+    Strix,
 }
 
 impl Gfx11Die {
     /// All GC versions Linux's `gmc_v11_0` drives: the discrete RDNA3
-    /// dies plus Phoenix 11.0.1, whose GMC programming reuses the same
-    /// GFXHUB tables and aperture registers (only the MMHUB version and
-    /// window differ — see `Layout::resolve`).
-    pub const GC_VERSIONS: &[(u8, u8, u8)] = &[(11, 0, 0), (11, 0, 2), (11, 0, 3), (11, 0, 1)];
+    /// dies plus Phoenix 11.0.1 and Strix Point 11.5.0, whose GMC
+    /// programming reuses the same GFXHUB tables and aperture registers
+    /// (only the MMHUB version and window differ — see `Layout::resolve`).
+    pub const GC_VERSIONS: &[(u8, u8, u8)] =
+        &[(11, 0, 0), (11, 0, 2), (11, 0, 3), (11, 0, 1), (11, 5, 0)];
 
     pub const fn from_gc(version: (u8, u8, u8)) -> Option<Self> {
         match version {
@@ -98,6 +114,7 @@ impl Gfx11Die {
             (11, 0, 3) => Some(Self::Navi32),
             (11, 0, 2) => Some(Self::Navi33),
             (11, 0, 1) => Some(Self::Phoenix),
+            (11, 5, 0) => Some(Self::Strix),
             _ => None,
         }
     }
@@ -108,6 +125,7 @@ impl Gfx11Die {
             Self::Navi32 => (11, 0, 3),
             Self::Navi33 => (11, 0, 2),
             Self::Phoenix => (11, 0, 1),
+            Self::Strix => (11, 5, 0),
         }
     }
 
@@ -129,9 +147,8 @@ impl Gfx11Die {
     /// refused even with GFX11 discovery: the identity would be
     /// self-contradictory — a Navi3 DID reporting GC 11.0.1, or a
     /// Phoenix DID reporting a discrete GC version, is refused the same
-    /// way. Phoenix is DID-gated on top of the family check: Strix
-    /// shares `Family::Phoenix` but is RDNA3.5, not GC 11.0.1, and must
-    /// not take this path.
+    /// way. Strix is its own family (`Family::Strix`, GFX 11.5.0) and
+    /// takes its own arm; a Strix DID reporting GC 11.0.1 is refused.
     pub fn of(gpu: &AmdGpu) -> Option<Self> {
         if gpu.chip.vid != crate::amdgpu::AMD_VENDOR {
             return None;
@@ -139,7 +156,7 @@ impl Gfx11Die {
         let die = Self::from_ip_blocks(&gpu.ip_blocks)?;
         match crate::amdgpu::family_for_pci_id(gpu.chip.vid, gpu.chip.did)? {
             crate::amdgpu::Family::Navi3 => {
-                if die == Self::Phoenix {
+                if die == Self::Phoenix || die == Self::Strix {
                     return None;
                 }
                 Some(die)
@@ -153,6 +170,12 @@ impl Gfx11Die {
                             | crate::amdgpu::PHOENIX2
                     )
                 {
+                    return None;
+                }
+                Some(die)
+            }
+            crate::amdgpu::Family::Strix => {
+                if die != Self::Strix || gpu.chip.did != crate::amdgpu::STRIX_POINT {
                     return None;
                 }
                 Some(die)
@@ -257,27 +280,48 @@ impl Layout {
             bank(gpu, id, versions, index, last).map_err(|_| Error::Unsupported)
         };
         // Highest dword the owner touches through each base: the GFX
-        // hub's PT_END (0x1733 on 11.0.0/11.0.1/11.0.2, 0x1743 on 11.0.3),
-        // the MM hub's L1 TLB control (0x08f3).
+        // hub's PT_END (0x1733 on 11.0.0/11.0.1/11.0.2, 0x1743 on 11.0.3,
+        // 0x1737 on 11.5.0), the MM hub's L1 TLB control (0x08f3 on
+        // 3.0.0/3.0.1, 0x0873 on 3.0.2).
         let gfx_last = match die {
             Gfx11Die::Navi32 => 0x1743,
+            Gfx11Die::Strix => 0x1737,
             _ => 0x1733,
         };
         let (gfx, gfx_vmhub) = match die {
             Gfx11Die::Navi32 => (GFX_11_0_3, GFXHUB_V3_0_3),
+            Gfx11Die::Strix => (GFX_11_5_0, GFXHUB_V11_5_0),
             _ => (GFX, GFXHUB_V3_0),
         };
         // Phoenix's MMHUB is 3.0.1 on BASE_IDX 1; the discrete dies are
         // 3.0.0 on BASE_IDX 0. Same offsets either way (see module docs).
-        let mmhub = match die {
-            Gfx11Die::Phoenix => reg(ip::HW_ID_MMHUB, &[(3, 0, 1)], 1, 0x08f3)?,
-            _ => reg(ip::HW_ID_MMHUB, &[(3, 0, 0)], 0, 0x08f3)?,
+        // Strix is 3.0.1 on BASE_IDX 1 or 3.0.2 on BASE_IDX 0: try the
+        // 3.0.1 window first, then the 3.0.2 one — the resolved table
+        // travels with the layout, so the 3.0.2 arm reads its own
+        // registers in `initialize_inner` and `prepare_clients`.
+        let (mmhub, mm, mm_vmhub) = match die {
+            Gfx11Die::Strix => reg(ip::HW_ID_MMHUB, &[(3, 0, 1)], 1, 0x08f3)
+                .map(|base| (base, MM, MMHUB_V3_0))
+                .or_else(|_| {
+                    reg(ip::HW_ID_MMHUB, &[(3, 0, 2)], 0, 0x0873)
+                        .map(|base| (base, MM_3_0_2, MMHUB_V3_0_2))
+                })?,
+            Gfx11Die::Phoenix => (
+                reg(ip::HW_ID_MMHUB, &[(3, 0, 1)], 1, 0x08f3)?,
+                MM,
+                MMHUB_V3_0,
+            ),
+            _ => (
+                reg(ip::HW_ID_MMHUB, &[(3, 0, 0)], 0, 0x08f3)?,
+                MM,
+                MMHUB_V3_0,
+            ),
         };
         Ok(Self {
             die,
             bases: [reg(ip::HW_ID_GC, &[die.gc_version()], 0, gfx_last)?, mmhub],
-            hubs: [gfx, MM],
-            vmhub: [gfx_vmhub, MMHUB_V3_0],
+            hubs: [gfx, mm],
+            vmhub: [gfx_vmhub, mm_vmhub],
             nbio: nbio_bank(gpu)?,
             osssys: reg(ip::HW_ID_OSSSYS, &[(6, 0, 0)], 0, 0x1f)?,
         })
@@ -416,8 +460,12 @@ fn update<I: Io>(io: &mut I, base: u64, reg: u32, mask: u32, value: u32) -> Resu
 /// aperture off, invalidation ranges, VMID0 context.
 ///
 /// The L1/L2/fault literals are computed from `gc_11_0_0_sh_mask.h` /
-/// `mmhub_3_0_0_sh_mask.h` — the two headers agree on every field this
-/// programs, so one value serves both hubs (as on Navi22):
+/// `mmhub_3_0_0_sh_mask.h` — the headers agree on every field this
+/// programs, so one value serves both hubs (as on Navi22). The agreement
+/// holds for Strix too: `gc_11_5_0_sh_mask.h` agrees with `gc_11_0_0` on
+/// all ten register groups, and `mmhub_3_0_2_sh_mask.h` agrees with
+/// `mmhub_3_0_0`/`mmhub_3_0_1` on all ten — only the register addresses
+/// move (GFX +0x4, MMHUB 3.0.2 −0x80), never the field values.
 ///
 /// - L1 (`init_tlb_regs`): ENABLE_L1_TLB=1, SYSTEM_ACCESS_MODE=3,
 ///   ENABLE_ADVANCED_DRIVER_MODEL=1, SYSTEM_APERTURE_UNMAPPED_ACCESS=0,
@@ -430,9 +478,10 @@ fn update<I: Io>(io: &mut I, base: u64, reg: u32, mask: u32, value: u32) -> Resu
 ///   the Navi22 precedent (clear) is kept → mask 0x03fc0903, value
 ///   0x80001.
 /// - L2_CNTL3: default 0x80100007 (`mmhub_v3_0.c:33`,
-///   `gfxhub_v3_0_3.c:32`; `gc_11_0_0_default.h` says 0x80120007 — the
-///   difference is a BIGK bit the mask erases, so the result is the
-///   same), BANK_SELECT 9, BIGK_FRAGMENT_SIZE 6 (no `translate_further`).
+///   `gfxhub_v3_0_3.c:32`, `gfxhub_v11_5_0.c:33`, `mmhub_v3_0_2.c:33`;
+///   `gc_11_0_0_default.h` says 0x80120007 — the difference is a BIGK bit
+///   the mask erases, so the result is the same), BANK_SELECT 9,
+///   BIGK_FRAGMENT_SIZE 6 (no `translate_further`).
 /// - L2_CNTL4 default 0xc1 with the VMC_TAP bits cleared; L2_CNTL5
 ///   default 0x3fe0 with SMALLK_FRAGMENT_SIZE 0.
 /// - Fault control (`set_fault_enable_default(true)`): all eleven
@@ -676,11 +725,17 @@ impl<I: Io> Engine<I> {
             // Both hubs must agree on the inherited FB base and offset.
             // TOP is read on the GFX hub only (gmc_v11_0_vram_gtt_location
             // uses MEMSIZE for the end; the fixture's TOP must agree).
-            if u64::from(checked(io.read(layout.bases[1] + u64::from(MM.fb_base) * 4))? & 0xffffff)
-                << 24
+            // The MM hub's registers come from the resolved layout table,
+            // not the 3.0.0/3.0.1 one: a Strix part reporting MMHUB 3.0.2
+            // reads its FB base at 0x086c, not 0x08ec.
+            if u64::from(
+                checked(io.read(layout.bases[1] + u64::from(layout.hubs[1].fb_base) * 4))?
+                    & 0xffffff,
+            ) << 24
                 != g.fb
                 || u64::from(
-                    checked(io.read(layout.bases[1] + u64::from(MM.fb_offset) * 4))? & 0xffffff,
+                    checked(io.read(layout.bases[1] + u64::from(layout.hubs[1].fb_offset) * 4))?
+                        & 0xffffff,
                 ) << 24
                     != g.offset
             {
@@ -863,10 +918,12 @@ pub struct Gmc {
     engine: Engine<Mmio>,
 }
 impl Gmc {
-    /// Reserve backing pages without I/O. Only a physical Navi31/32/33 PF
-    /// or a Phoenix APU is supported: AMD vendor, a GFX11 GC version
-    /// (11.0.0 / 11.0.2 / 11.0.3 discrete, 11.0.1 Phoenix), MMHUB 3.0.0
-    /// (3.0.1 on BASE_IDX 1 for Phoenix), OSSSYS 6.0.0.
+    /// Reserve backing pages without I/O. Only a physical Navi31/32/33 PF,
+    /// a Phoenix APU or a Strix Point APU is supported: AMD vendor, a GFX11
+    /// GC version (11.0.0 / 11.0.2 / 11.0.3 discrete, 11.0.1 Phoenix,
+    /// 11.5.0 Strix Point), MMHUB 3.0.0 (3.0.1 on BASE_IDX 1 for Phoenix;
+    /// 3.0.1 on BASE_IDX 1 or 3.0.2 on BASE_IDX 0 for Strix Point),
+    /// OSSSYS 6.0.0.
     /// # Safety
     /// Caller owns both hubs, HDP, VRAM and the matching permanent pool,
     /// with no active GPU queues/VMs, GFXOFF, hub gating, reset or PM transition.
