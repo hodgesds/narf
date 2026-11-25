@@ -300,6 +300,8 @@ rules apply.
 | coffeelake (Gen9) | 3E90, 3E91, 3E92, 3E93, 3E94, 3E96, 3E98, 3E99, 3E9A, 3E9B, 3E9C, 3EA5, 3EA6, 3EA7, 3EA8, 3EA9, 87CA |
 | whiskeylake (Gen9) | 3EA0, 3EA1, 3EA2, 3EA3, 3EA4 |
 | cometlake (Gen9) | 9B21, 9B41, 9BA2, 9BA4, 9BA5, 9BA8, 9BAA, 9BAC, 9BC2, 9BC4, 9BC5, 9BC6, 9BC8, 9BCA, 9BCC, 9BE6, 9BF6 |
+| broxton (Gen9 LP; display not programmed) | 0A84, 1A84, 1A85, 5A84, 5A85 |
+| geminilake (Gen9 LP; display not programmed) | 3184, 3185 |
 | icelake (Gen11) | 8A50, 8A51, 8A52, 8A53, 8A54, 8A56, 8A57, 8A58, 8A59, 8A5A, 8A5B, 8A5C, 8A5D, 8A70, 8A71 |
 | elkhartlake (Gen11) | 4541, 4551, 4555, 4557, 4570, 4571 |
 | jasperlake (Gen11) | 4E51, 4E55, 4E57, 4E61, 4E71 |

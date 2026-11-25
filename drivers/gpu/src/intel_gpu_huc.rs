@@ -51,6 +51,10 @@ const EHL_NAME: &str = "i915/ehl_huc_9.0.0.bin";
 /// `kbl_huc` blob too — at rev < 5. Comet Lake at rev >= 5 takes
 /// `i915/cml_huc_4.0.0.bin` (`huc_mmp(cml, 4, 0, 0)`).
 const SKL_NAME: &str = "i915/skl_huc_2.0.0.bin";
+/// `fw_def(BROXTON, 0, huc_mmp(bxt, 2, 0, 0))`.
+const BXT_NAME: &str = "i915/bxt_huc_2.0.0.bin";
+/// `fw_def(GEMINILAKE, 0, huc_mmp(glk, 4, 0, 0))`.
+const GLK_NAME: &str = "i915/glk_huc_4.0.0.bin";
 const KBL_NAME: &str = "i915/kbl_huc_4.0.0.bin";
 const CML_NAME: &str = "i915/cml_huc_4.0.0.bin";
 const FIRST: u16 = 0x4000;
@@ -76,6 +80,8 @@ pub(crate) fn firmware_name(platform: GtPlatform) -> Option<&'static str> {
         GtPlatform::Gen11(Gen11Platform::IceLake) => Some(ICL_NAME),
         GtPlatform::Gen11(Gen11Platform::ElkhartLake | Gen11Platform::JasperLake) => Some(EHL_NAME),
         GtPlatform::Gen9(Gen9Platform::Skylake) => Some(SKL_NAME),
+        GtPlatform::Gen9(Gen9Platform::Broxton) => Some(BXT_NAME),
+        GtPlatform::Gen9(Gen9Platform::GeminiLake) => Some(GLK_NAME),
         GtPlatform::Gen9(Gen9Platform::KabyLake | Gen9Platform::CometLake) => Some(KBL_NAME),
         _ => None,
     }

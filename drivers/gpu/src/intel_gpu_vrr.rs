@@ -145,7 +145,8 @@ impl DisplayVrrIp {
             Generation::IceLake
             | Generation::TigerLake
             | Generation::RocketLake
-            | Generation::Skylake => Self::Gen12,
+            | Generation::Skylake
+            | Generation::Broxton => Self::Gen12,
             Generation::AlderLake => Self::Display13,
             Generation::MeteorLake => Self::Display14,
             Generation::LunarLake => Self::Display20,

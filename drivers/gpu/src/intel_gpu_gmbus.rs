@@ -321,6 +321,10 @@ pub enum GmbusPinTable {
     /// callers that know the PCH pass this table to
     /// [`gen9_ddc_pin`] directly.
     Cnp,
+    /// `gmbus_pins_bxt` (Broxton and Gemini Lake, which have no PCH):
+    /// pins 1-3, "dpb" / "dpc" / "misc". No Gen9-LP display path runs; the
+    /// arm keeps the table selection honest.
+    Bxt,
 }
 
 impl GmbusPinTable {
@@ -346,6 +350,7 @@ impl GmbusPinTable {
             // this arm only keeps the table selection honest now
             // that the generation exists.
             Generation::Skylake => GmbusPinTable::Spt,
+            Generation::Broxton => GmbusPinTable::Bxt,
             Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
                 GmbusPinTable::Mtp
             }
@@ -355,15 +360,16 @@ impl GmbusPinTable {
     /// `gmbus_pins_*[pin].name`, or `None` when the table has no such
     /// pin (`intel_gmbus_is_valid_pin` false).
     pub const fn name(self, pin: PinPair) -> Option<&'static str> {
-        use GmbusPinTable::{Cnp, Dg1, Dg2, Icp, Mtp, Spt};
+        use GmbusPinTable::{Bxt, Cnp, Dg1, Dg2, Icp, Mtp, Spt};
         Some(match (self, pin) {
             // SPT has no pins 1-3 — the wildcard arms below
             // would wrongly admit them.
             (Spt, PinPair::Pin1Bxt | PinPair::Pin2Bxt | PinPair::Pin3Bxt) => return None,
             // CNP renames pins 1-3: "dpb" / "dpc" / "misc".
-            (Cnp, PinPair::Pin1Bxt) => "dpb",
-            (Cnp, PinPair::Pin2Bxt) => "dpc",
-            (Cnp, PinPair::Pin3Bxt) => "misc",
+            (Cnp | Bxt, PinPair::Pin1Bxt) => "dpb",
+            (Cnp | Bxt, PinPair::Pin2Bxt) => "dpc",
+            (Cnp | Bxt, PinPair::Pin3Bxt) => "misc",
+            (Bxt, _) => return None,
             (Cnp, PinPair::Pin4Cnp) => "dpd",
             // SPT old numbering: 4 "dpc", 5 "dpb", 6 "dpd".
             (Spt, PinPair::Pin4Cnp) => "dpc",

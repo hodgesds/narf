@@ -95,6 +95,10 @@ pub fn dmc_firmware_name(family: Gen9Platform) -> &'static str {
     match family {
         Gen9Platform::Skylake => SKL_DMC_FIRMWARE,
         Gen9Platform::KabyLake | Gen9Platform::CometLake => KBL_DMC_FIRMWARE,
+        // `dmc_firmware_default`'s Gen9-LP arms. No Gen9-LP display path
+        // loads it today (the DPIO PHY display is not programmed).
+        Gen9Platform::Broxton => crate::intel_gpu_dmc::BXT_DMC_FIRMWARE,
+        Gen9Platform::GeminiLake => crate::intel_gpu_dmc::GLK_DMC_FIRMWARE,
     }
 }
 

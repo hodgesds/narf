@@ -96,7 +96,9 @@ impl Generation {
     /// are never conflated.
     pub const fn region_generation(self) -> Option<RegionGeneration> {
         match self {
-            Generation::Skylake => Some(RegionGeneration::Gen9),
+            // Gen9 LP shares the Gen9 register surface and forcewake table
+            // (`intel_uncore.c`: every graphics 9 part takes `__gen9_fw_ranges`).
+            Generation::Skylake | Generation::Broxton => Some(RegionGeneration::Gen9),
             Generation::IceLake => Some(RegionGeneration::Gen11),
             Generation::TigerLake | Generation::RocketLake | Generation::AlderLake => {
                 Some(RegionGeneration::Gen12)
@@ -115,7 +117,10 @@ impl Generation {
     /// spuriously). Stage-1 presence for Gen11/Gen9 re-reads PCI
     /// config space instead.
     pub const fn has_gmd_id(self) -> bool {
-        !matches!(self, Generation::IceLake | Generation::Skylake)
+        !matches!(
+            self,
+            Generation::IceLake | Generation::Skylake | Generation::Broxton
+        )
     }
 
     /// Whether this lane programs the display engine for the
@@ -1968,7 +1973,8 @@ impl crate::intel_gpu_aux::MmioWindow for ModeWindow {
             self.device.id.vendor,
             self.device.id.device,
         ) {
-            Some(crate::intel_gpu_gt::GtPlatform::Gen9(platform)) => Some((
+            // Gen9 LP's display (DPIO PHY) has none of the big-core tables.
+            Some(crate::intel_gpu_gt::GtPlatform::Gen9(platform)) if !platform.is_lp() => Some((
                 platform,
                 crate::intel_gpu_gen9_ddi::sku_family_for_did(self.device.id.device),
             )),
@@ -3538,6 +3544,13 @@ pub mod tests {
             (0x9BCC, "cometlake"),
             (0x9BE6, "cometlake"),
             (0x9BF6, "cometlake"),
+            (0x0A84, "broxton"),
+            (0x1A84, "broxton"),
+            (0x1A85, "broxton"),
+            (0x5A84, "broxton"),
+            (0x5A85, "broxton"),
+            (0x3184, "geminilake"),
+            (0x3185, "geminilake"),
             (0x8A50, "icelake"),
             (0x8A51, "icelake"),
             (0x8A52, "icelake"),
@@ -3996,6 +4009,15 @@ pub mod tests {
             || Generation::Skylake.has_gmd_id()
         {
             return TestResult::Fail("Gen9 must admit regions + display + external + backlight");
+        }
+        // Gen9 LP: the Gen9 register map, pre-GMD, and no display path.
+        if Generation::Broxton.display_supported()
+            || Generation::Broxton.external_display_supported()
+            || Generation::Broxton.backlight_supported()
+            || Generation::Broxton.region_generation() != Some(RegionGeneration::Gen9)
+            || Generation::Broxton.has_gmd_id()
+        {
+            return TestResult::Fail("Gen9 LP is a pre-GMD GT with no display path");
         }
         // Gen11 (Lanes 5 + 8): identity + probe + internal-panel
         // modeset + external outputs + backlight. The BAR0 region

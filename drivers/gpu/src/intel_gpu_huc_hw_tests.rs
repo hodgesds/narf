@@ -1192,6 +1192,10 @@ fn smoke_gen9_huc_profile_selection() -> TestResult {
     if huc::firmware_name(skl) != Some("i915/skl_huc_2.0.0.bin")
         || huc::firmware_name(kbl) != Some("i915/kbl_huc_4.0.0.bin")
         || huc::firmware_name(cml) != Some("i915/kbl_huc_4.0.0.bin")
+        || huc::firmware_name(GtPlatform::Gen9(Gen9Platform::Broxton))
+            != Some("i915/bxt_huc_2.0.0.bin")
+        || huc::firmware_name(GtPlatform::Gen9(Gen9Platform::GeminiLake))
+            != Some("i915/glk_huc_4.0.0.bin")
         || huc::firmware_name(huc::PLATFORM) != Some("i915/tgl_huc.bin")
         || huc::firmware_name(GtPlatform::Gen12(Gen12Platform::RocketLake)).is_some()
         || huc::firmware_name(GtPlatform::Integrated(

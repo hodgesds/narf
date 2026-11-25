@@ -3893,9 +3893,10 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
         // Rocket Lake / Lunar Lake / Panther Lake have no
         // panel modeset in this module (owned routes elsewhere
         // or not modeled).
-        Generation::RocketLake | Generation::LunarLake | Generation::PantherLake => {
-            Err(ModesetError::UnsupportedGeneration)
-        }
+        Generation::RocketLake
+        | Generation::LunarLake
+        | Generation::PantherLake
+        | Generation::Broxton => Err(ModesetError::UnsupportedGeneration),
     };
     if let Ok(committed) = &result {
         // Per-modeset VRR/CMRR compute for the panel (#1771): a

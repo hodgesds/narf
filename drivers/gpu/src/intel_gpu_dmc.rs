@@ -220,6 +220,10 @@ pub const KBL_DMC_MAX_FW_SIZE: usize = 0x3000;
 pub const SKL_DMC_FIRMWARE: &str = "i915/skl_dmc_ver1_27.bin";
 /// The display-9 Kaby Lake DMC container name (`KBL_DMC_PATH`).
 pub const KBL_DMC_FIRMWARE: &str = "i915/kbl_dmc_ver1_04.bin";
+/// `BXT_DMC_PATH` = `DMC_LEGACY_PATH(bxt, 1, 07)`.
+pub const BXT_DMC_FIRMWARE: &str = "i915/bxt_dmc_ver1_07.bin";
+/// `GLK_DMC_PATH` = `DMC_LEGACY_PATH(glk, 1, 04)`.
+pub const GLK_DMC_FIRMWARE: &str = "i915/glk_dmc_ver1_04.bin";
 /// Load address for v1 programs (no start field in v1).
 pub const DMC_V1_LOAD_ADDR: u32 = 0x80000;
 /// MMIO sanity range for v1 headers (any id).

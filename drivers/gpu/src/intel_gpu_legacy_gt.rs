@@ -30,6 +30,8 @@ pub(crate) enum LegacyGt {
 impl LegacyGt {
     pub(crate) const fn for_platform(platform: GtPlatform) -> Option<Self> {
         match platform {
+            // Gen9 LP needs its own cache, workaround and power profile.
+            GtPlatform::Gen9(p) if p.is_lp() => None,
             GtPlatform::Gen9(_) => Some(Self::Gen9),
             GtPlatform::Gen11(_) => Some(Self::Gen11),
             _ => None,

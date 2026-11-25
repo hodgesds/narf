@@ -1590,6 +1590,19 @@ fn install_profile(
         let revision = narf_bus::pci::read_config32(&cap, &device, 0x08).map_or(0, |v| v as u8);
         return crate::intel_gpu_legacy_owner::install(index, card, &device, revision, bar);
     }
+    // A graphics 9 or 11 part without an execlists profile never takes the
+    // GuC start below, though it has a GuC blob: i915 submits through the
+    // GuC only from graphics 12 (`uc_expand_default_options`).
+    if matches!(
+        GtPlatform::from_pci(device.id.vendor, device.id.device),
+        Some(GtPlatform::Gen9(_) | GtPlatform::Gen11(_))
+    ) {
+        log(
+            index,
+            "no execlists profile for this graphics 9 part; GT not started",
+        );
+        return false;
+    }
     if GtPlatform::from_pci(device.id.vendor, device.id.device)
         .and_then(GtPlatform::guc)
         .is_none()

@@ -603,7 +603,10 @@ impl Rc6 {
     ) -> Result<(), Rc6Error> {
         let wake_rate_limit = match platform {
             Gen9Platform::Skylake => RC6_WAKE_RATE_LIMIT_VALUE_GEN9_SKL,
-            Gen9Platform::KabyLake | Gen9Platform::CometLake => RC6_WAKE_RATE_LIMIT_VALUE_GEN9,
+            Gen9Platform::KabyLake
+            | Gen9Platform::CometLake
+            | Gen9Platform::Broxton
+            | Gen9Platform::GeminiLake => RC6_WAKE_RATE_LIMIT_VALUE_GEN9,
         };
         let pg_enable = if wa_disable_coarse_pg {
             None
