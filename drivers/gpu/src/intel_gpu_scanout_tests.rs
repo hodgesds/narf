@@ -1032,3 +1032,83 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_scanout",
     scanout_pxp_protected_plane_decrypts_then_goes_black
 );
+
+// ADDFB and scanout of a foreign dma-buf import on an integrated display:
+// xe_display_bo_framebuffer_lookup admits an sg BO, framebuffer_init sets
+// no FORCE_WC on it (so a bound import may become a framebuffer), and
+// __xe_pin_fb_vma validates it, mapping its attachment, before the GGTT
+// names its pages. NARF pins the export for the plane (dma_buf_pin) until
+// the import drops. A discrete display pins to VRAM0, which an sg BO
+// cannot: refused.
+fn scanout_foreign_import_framebuffer_maps_pinned_exporter_pages() -> TestResult {
+    use crate::drm::card::Card;
+    use crate::drm::fb_cmd::FbCmd;
+    let gem = GemState::new();
+    let exporter = gem
+        .object(gem.create(16384, |_, _| Ok(())).expect("exporter"))
+        .expect("exporter object");
+    let (importer, handle, imported) =
+        crate::intel_gpu_prime::fixture::foreign_import(&exporter, 778);
+    let cmd = FbCmd {
+        width: 64,
+        height: 32,
+        pixel_format: 0x3432_5258,
+        handles: [handle, 0, 0, 0],
+        pitches: [256, 0, 0, 0],
+        ..Default::default()
+    };
+    let mut discrete = Card::new("intel-gpu", "Intel test", (1, 0, 0));
+    discrete.intel_vram_scanout = true;
+    if discrete
+        .addfb2_intel(&cmd, imported.clone(), 7, true)
+        .is_ok()
+    {
+        return TestResult::Fail("a discrete display took a foreign import");
+    }
+    let mut card = Card::new("intel-gpu", "Intel test", (1, 0, 0));
+    imported.vm_bind();
+    let fb = card.addfb2_intel(&cmd, imported.clone(), 7, true);
+    imported.vm_unbind();
+    if fb.is_err() || !imported.scanout() {
+        return TestResult::Fail("ADDFB refused a bound foreign import");
+    }
+    let model = Model::new();
+    let mut owner = presenter(&model);
+    if owner.prepare(imported.clone(), geometry()) != Err(ScanoutError::Unsupported)
+        || !model.0.borrow().writes.is_empty()
+    {
+        return TestResult::Fail("an unmapped import reached the GGTT");
+    }
+    if narf_scheduler::block_on_spin(crate::intel_gpu_prime::pin_for_scanout(&imported)).is_err()
+        || !exporter.externally_pinned()
+        || !imported.import_mapped()
+    {
+        return TestResult::Fail("scanout pin did not map and pin the export");
+    }
+    let pages: Vec<u64> = exporter.pages().collect();
+    if owner.prepare(imported.clone(), geometry()).is_err()
+        || model.read32(0x850000) != pages[0] as u32 | 1
+        || model.read32(0x850004) != (pages[0] >> 32) as u32
+        || model.read32(0x850008) != pages[1] as u32 | 1
+        || model.read32(0x850010) != 0
+    {
+        return TestResult::Fail("GGTT does not name the exporter's pages");
+    }
+    // The plane's surface and the framebuffer keep the import, and with it
+    // the pin, after the handle closes.
+    importer.close(handle).expect("close import handle");
+    drop(imported);
+    drop(card);
+    if !exporter.externally_pinned() {
+        return TestResult::Fail("export unpinned under a live surface");
+    }
+    shutdown(&mut owner);
+    if exporter.externally_pinned() {
+        return TestResult::Fail("released surface left the export pinned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    scanout_foreign_import_framebuffer_maps_pinned_exporter_pages
+);

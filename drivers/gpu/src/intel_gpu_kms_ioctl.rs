@@ -927,7 +927,8 @@ impl Plan {
                     || !object.object.scanout()
                     || object.object.is_userptr()
                     || !((card.intel_vram_scanout && object.object.is_vram())
-                        || object.object.is_wc())
+                        || object.object.is_wc()
+                        || (!card.intel_vram_scanout && object.object.is_imported()))
                 {
                     return Err(FsError::Unsupported);
                 }
@@ -1415,6 +1416,11 @@ where
         // The transaction owner resolves writer dependencies before obtaining
         // the display session, so reset recovery never waits behind a fence.
 
+        // A foreign import's pages are DMA addresses of another card's
+        // memory or BAR, not CPU frames: only the plane may fetch them.
+        if intel.object.is_imported() {
+            return Err(FsError::Unsupported);
+        }
         if !intel.object.sync_for_cpu_read() {
             return Err(crate::intel_gpu_user::io_error());
         }
@@ -1650,7 +1656,9 @@ async fn execute_plan<B: Backend>(
                 fb.format == PixelFormat::Xrgb8888
                     && !i.object.is_userptr()
                     && i.object.scanout()
-                    && ((backend.allows_vram_scanout() && i.object.is_vram()) || i.object.is_wc())
+                    && ((backend.allows_vram_scanout() && i.object.is_vram())
+                        || i.object.is_wc()
+                        || (!backend.allows_vram_scanout() && i.object.is_imported()))
             });
             let direct = if direct.is_some() {
                 match backend.check(plan.geometry) {

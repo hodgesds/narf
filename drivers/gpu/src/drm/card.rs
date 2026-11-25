@@ -2868,13 +2868,18 @@ impl Card {
         }
         // On integrated GPUs VRAM pages have no display-DMA backing here;
         // discrete Arc display (`intel_vram_scanout`) scans directly from VRAM.
-        // A foreign dma-buf import (another card's memory or BAR) is not
-        // scanned out here.
-        if (object.is_vram() && !self.intel_vram_scanout) || object.is_imported() {
+        // A foreign dma-buf import (another card's memory or BAR) is scanned
+        // out only by an integrated display: a discrete one pins to VRAM0
+        // (`__xe_pin_fb_vma` -> `xe_bo_migrate`), which an sg BO cannot.
+        if (object.is_vram() && !self.intel_vram_scanout)
+            || (object.is_imported() && self.intel_vram_scanout)
+        {
             return Err(CardError::InvalidDimensions);
         }
         if xe && !xr30 && !object.scanout() {
-            if object.vm_bound() {
+            // xe_display_bo_framebuffer_init sets FORCE_WC only on a BO it
+            // owns: an sg import keeps its caching, so binding is no bar.
+            if object.vm_bound() && !object.is_imported() {
                 return Err(CardError::InvalidDimensions);
             }
             object.mark_scanout();

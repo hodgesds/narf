@@ -334,6 +334,22 @@ impl Attachment {
         Ok(())
     }
 
+    /// `dma_buf_pin` of a dynamic attachment, which the dma-buf core keeps
+    /// for scanout: the export stays in its pinned placement, with no more
+    /// move notifications, until the attachment drops. Pinning may migrate
+    /// the object first (`xe_dma_buf_pin`), which notifies this importer
+    /// too; the caller maps again afterwards.
+    pub(crate) async fn pin(&self) -> Result<(), FsError> {
+        let _serial = self.serial.lock().await;
+        if self.pinned() {
+            return Ok(());
+        }
+        if self.peer2peer.is_none() && !self.object.can_migrate_to_system() {
+            return Err(FsError::Unsupported);
+        }
+        self.pin_locked().await
+    }
+
     /// `xe_bo_restore_late` for this attachment's export when a system resume
     /// has not restored it yet: an importer must not reach VRAM S3 cleared.
     /// The copy runs in the exporter's epoch; without a running exporter GT
@@ -530,6 +546,23 @@ pub(crate) async fn ensure_mapped(object: &Arc<GemObject>) -> Result<(), FsError
     Err(FsError::WouldBlock)
 }
 
+/// `__xe_pin_fb_vma` of a foreign import for an integrated display's plane:
+/// Linux validates the sg BO (`xe_bo_validate`, which maps its attachment)
+/// and counts a pin on it. NARF also pins the export itself (`dma_buf_pin`):
+/// a plane cannot follow a move notification, and the exporter would
+/// otherwise move the pages the GGTT names (Linux's importer only warns
+/// when `xe_bo_evict` of its pinned sg BO fails). The pin lasts for the
+/// import's life. Then the import's pages are mapped for the GGTT. Not an
+/// import: nothing to do.
+pub(crate) async fn pin_for_scanout(object: &Arc<GemObject>) -> Result<(), FsError> {
+    let Some(import) = object.import() else {
+        return Ok(());
+    };
+    import.attachment().restore_export().await?;
+    import.attachment().pin().await?;
+    ensure_mapped(object).await
+}
+
 /// Whether any import in `objects` was notified of a move since its pages
 /// were installed: page tables built from them are stale
 /// (`xe_exec_ioctl`'s retry after `xe_vm_validate_rebind`).
@@ -594,7 +627,54 @@ pub(crate) fn import_foreign(
 /// whitelist, on a CPU that is not AMD Zen (no peer path).
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod fixture {
+    use alloc::sync::Arc;
+    use narf_filesystem::FsError;
     use narf_io::p2pdma::{HostBridgeDev, P2pTopology};
+
+    use crate::intel_gpu_gem::{GemObject, GemState};
+
+    /// An exporting card with no running GT: enough for a system-memory
+    /// export, which an attachment never migrates.
+    #[derive(Debug)]
+    pub(crate) struct NoGt;
+    impl crate::intel_gpu_user::UserBackend for NoGt {
+        fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+            None
+        }
+        fn submit<'a>(
+            &'a self,
+            _: Arc<crate::intel_gpu_user::UserContext>,
+            _: crate::intel_gpu_user::UserBatch,
+        ) -> narf_filesystem::FsFuture<'a, Arc<crate::intel_gpu_fence::CompletionFence>> {
+            alloc::boxed::Box::pin(async { Err(FsError::NoDevice) })
+        }
+    }
+
+    /// `xe_gem_prime_import` of a system `exporter` from card `card`: a
+    /// dynamic host attachment and the importing open's sg object.
+    pub(crate) fn foreign_import(
+        exporter: &Arc<GemObject>,
+        card: u32,
+    ) -> (GemState, u32, Arc<GemObject>) {
+        let attachment = super::attach_dynamic(
+            exporter.clone(),
+            super::Exporter {
+                platform: crate::intel_gpu_gt::GtPlatform::Battlemage,
+                backend: Arc::new(NoGt),
+            },
+            &Fabric,
+            Some(EXPORTER),
+            Some(DISTANT),
+            false,
+        )
+        .expect("host attachment of a system export");
+        let importer = GemState::new();
+        let handle = importer
+            .import_attachment(super::Import::new(card, attachment))
+            .expect("foreign import");
+        let imported = importer.object(handle).expect("imported object");
+        (importer, handle, imported)
+    }
 
     /// Root port 0 -> switch upstream port 1 -> downstream ports 2 and 3;
     /// root port 6 -> 7.

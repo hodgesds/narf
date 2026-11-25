@@ -402,47 +402,6 @@ kernel_test_in!(
     smoke_intel_prime_mapping_and_shared_fences_outlive_handles_and_descriptors
 );
 
-/// An exporting card with no running GT: enough for a system-memory export,
-/// which an attachment never migrates.
-#[derive(Debug)]
-struct NoGt;
-impl crate::intel_gpu_user::UserBackend for NoGt {
-    fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
-        None
-    }
-    fn submit<'a>(
-        &'a self,
-        _: Arc<crate::intel_gpu_user::UserContext>,
-        _: crate::intel_gpu_user::UserBatch,
-    ) -> narf_filesystem::FsFuture<'a, Arc<CompletionFence>> {
-        alloc::boxed::Box::pin(async { Err(FsError::NoDevice) })
-    }
-}
-
-/// `xe_gem_prime_import` of `exporter` from another card: a dynamic host
-/// attachment and the importing open's sg object.
-fn foreign_import(exporter: &Arc<GemObject>) -> (GemState, u32, Arc<GemObject>) {
-    use crate::intel_gpu_prime::fixture::{Fabric, DISTANT, EXPORTER};
-    let attachment = crate::intel_gpu_prime::attach_dynamic(
-        exporter.clone(),
-        crate::intel_gpu_prime::Exporter {
-            platform: crate::intel_gpu_gt::GtPlatform::Battlemage,
-            backend: Arc::new(NoGt),
-        },
-        &Fabric,
-        Some(EXPORTER),
-        Some(DISTANT),
-        false,
-    )
-    .unwrap();
-    let importer = GemState::new();
-    let handle = importer
-        .import_attachment(crate::intel_gpu_prime::Import::new(778, attachment))
-        .unwrap();
-    let imported = importer.object(handle).unwrap();
-    (importer, handle, imported)
-}
-
 // CPU mmap of a foreign import: xe gives the import a fake offset
 // (xe_gem_mmap_offset_ioctl), TTM refuses to fault an sg BO's pages
 // (ttm_bo_vm_reserve, TTM_TT_FLAG_EXTERNAL) and the redirect is
@@ -456,7 +415,7 @@ fn smoke_intel_prime_foreign_import_mmap_maps_exporter_pages_under_cpu_sync() ->
         .object(gem.create(4 * PAGE, |_, _| Ok(())).unwrap())
         .unwrap();
     exporter.write(PAGE, &[0x5a; 16]).unwrap();
-    let (importer, handle, imported) = foreign_import(&exporter);
+    let (importer, handle, imported) = crate::intel_gpu_prime::fixture::foreign_import(&exporter, 778);
     let offset = importer.mmap_offset(handle).unwrap();
     let pages: Vec<u64> = exporter.pages().collect();
     let view = importer

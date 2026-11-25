@@ -209,11 +209,29 @@ fn gen12_display13(io: &impl Platform) -> bool {
 }
 
 fn scanout_object_ok(object: &GemObject, vram_scanout: bool) -> bool {
-    // A pinned VRAM export awaiting its resume restore holds stale VRAM.
+    // A pinned VRAM export awaiting its resume restore holds stale VRAM. A
+    // foreign import scans out on an integrated display once
+    // [`pin_import_for_scanout`] mapped and pinned it.
     object.scanout()
         && !object.is_userptr()
         && !object.restore_pending()
-        && ((vram_scanout && object.is_vram()) || object.is_wc())
+        && ((vram_scanout && object.is_vram())
+            || object.is_wc()
+            || (!vram_scanout && object.is_imported() && object.import_mapped()))
+}
+
+/// `__xe_pin_fb_vma` for a foreign import: an integrated display maps and
+/// pins its attachment ([`crate::intel_gpu_prime::pin_for_scanout`]); a
+/// discrete one pins framebuffers to VRAM0, which an sg BO cannot reach
+/// (`xe_bo_migrate` -EINVAL). Anything else: nothing to do.
+async fn pin_import_for_scanout(object: &Arc<GemObject>, vram_scanout: bool) -> Result<(), FsError> {
+    if !object.is_imported() {
+        return Ok(());
+    }
+    if vram_scanout {
+        return Err(FsError::Unsupported);
+    }
+    crate::intel_gpu_prime::pin_for_scanout(object).await
 }
 
 /// The production implementation retains PCI authority and a permanent UC
@@ -2927,6 +2945,7 @@ impl<M: Platform> Guard<'_, M> {
         if self.state.color_unpublished || self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
+        pin_import_for_scanout(&object, self.device.platform.vram_scanout()).await?;
         if !scanout_object_ok(&object, self.device.platform.vram_scanout()) {
             return Err(FsError::Unsupported);
         }
@@ -4136,6 +4155,7 @@ impl<M: Platform> Guard<'_, M> {
         if self.state.color_unpublished || self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
+        pin_import_for_scanout(&object, self.device.platform.vram_scanout()).await?;
         if !scanout_object_ok(&object, self.device.platform.vram_scanout()) {
             return Err(FsError::Unsupported);
         }

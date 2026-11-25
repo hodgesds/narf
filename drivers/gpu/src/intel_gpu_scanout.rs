@@ -806,11 +806,16 @@ impl<M: ScanoutIo> Presenter<M> {
         self
     }
 
+    /// A foreign import is fetched from its mapped attachment's pages
+    /// (another card's memory or BAR), only on an integrated display and
+    /// only once `intel_gpu_prime::pin_for_scanout` pinned and mapped it.
     fn scanout_backing_ok(&self, object: &GemObject) -> bool {
         object.scanout()
             && !object.is_userptr()
             && !object.restore_pending()
-            && ((self.vram_scanout && object.is_vram()) || object.is_wc())
+            && ((self.vram_scanout && object.is_vram())
+                || object.is_wc()
+                || (!self.vram_scanout && object.is_imported() && object.import_mapped()))
     }
 
     fn encode_surface_pte(

@@ -9753,7 +9753,9 @@ fn intel_frame(_fb: &crate::drm::card::Framebuffer) -> Option<IntelFrame> {
 #[cfg(feature = "intel")]
 fn present_intel_frame(card_index: u32, frame: &IntelFrame) -> Result<(), FsError> {
     // Native-only input: refuse before fence waits, CPU sync or console copy.
-    if frame.format == crate::drm::card::PixelFormat::Xrgb2101010 {
+    // A foreign import's pages are another card's DMA addresses, not CPU
+    // frames this copy may read.
+    if frame.format == crate::drm::card::PixelFormat::Xrgb2101010 || frame.object.is_imported() {
         return Err(FsError::Unsupported);
     }
     const GPU_FENCE_TIMEOUT_MS: u64 = 15_000;
