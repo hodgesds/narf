@@ -8,12 +8,13 @@
 //! The driver in [`iwlwifi`] (PCIe gen2/gen3 transport, firmware TLV parsing
 //! and the filename ladder, the MLD station control/data path) is one source
 //! tree in both builds. Built in, all of it runs. The `module` build compiles
-//! the identity, firmware and transport layers kernel-free and runs them
-//! inside the `.ko` for the Sc (BE20x/BE21x) ids over `narf-module-rt` and
-//! the KABI ([`iwlwifi::module`]): firmware boot to ALIVE, NVM and the
-//! runtime commands, one `wlan%d` netdev and wiphy through the netif bridge
-//! and the `WIFI` family host, and passive scan. Association, the data path,
-//! AP/P2P and the Gen2/Ty/So/Ma/Bz profiles stay built in.
+//! the identity, firmware, transport and station layers kernel-free and runs
+//! them inside the `.ko` for the Sc (BE20x/BE21x) ids over `narf-module-rt`
+//! and the KABI ([`iwlwifi::module`]): firmware boot, the MLD configuration,
+//! scan, association with the in-driver WPA2/WPA3 supplicant and the data
+//! path, with one `wlan%d` netdev and wiphy through the netif bridge and the
+//! `WIFI` family host. AP/P2P, scheduled scan, MLO, WoWLAN and the
+//! Gen2/Ty/So/Ma/Bz profiles stay built in.
 //!
 //! ## Hardware validation is gated
 //!

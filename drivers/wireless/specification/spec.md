@@ -2302,6 +2302,11 @@ services").
   AUTHENTICATE/ASSOCIATE, control-port EAPOL, key installation) is refused;
   so are AP/P2P/monitor roles, power save and station statistics. Those are
   a later protocol version.
+- **Regulatory query (additive opcode 6).** `GET_REGULATORY` returns the
+  kernel's installed regulatory domain and its revision (optionally
+  bootstrapping the staged signed policy), for a module that programs
+  regulatory TX power itself (`iwlwifi.ko`, §4.x "`iwlwifi.ko`"). It needs no wiphy. An older
+  host answers `-EOPNOTSUPP` and the module fails closed.
 - **Perf class:** no hot path. TX/RX frames never pass through the host.
 
 The implemented high-level control trait is `narf_wireless::WirelessNetIface`.
@@ -2578,6 +2583,86 @@ feature off).
   id is claimed, a probe with no device context is refused, and unload
   leaves no match. QEMU emulates no WCN6855, so bring-up and RF behavior
   are first proven on hardware (`docs/BOOTING_ON_CACHYOS.md`).
+
+### 4.x `iwlwifi.ko`: the Sc MLD station as a loadable module
+
+`narf-drivers-wireless-iwlwifi --no-default-features --features module` is
+the driver's Sc (BE20x/BE21x) station built into a `.ko` (x86_64 and
+aarch64) from the same source as the built-in: the PCIe transport
+(`runtime::Hardware`), the firmware TLV/PNVM loader, the MLD command
+profile and the station (`connection::Connection`, with the in-driver
+WPA2-PSK / WPA3-SAE supplicant and 802.11w). `narf-crypto` and
+`narf-wireless` are linked kernel-free.
+
+- **Platform.** `src/iwlwifi/module/kernel.rs` defines modules named like
+  the kernel crates (`narf_time`, `narf_io`, `narf_lib`, `narf_bus`,
+  `narf_capabilities`, `narf_console`, `narf_scheduler`, `narf_net`) with
+  the subset of each API the module-built files use, over `narf-module-rt`
+  and the KABI. Each such file imports them under `cfg(feature = "module")`,
+  shadowing the absent extern crates, so the driver text is the same in both
+  builds. A `Cap` is the probe token there: the kernel checks it on every
+  KABI call and revokes it at teardown. Kernel-bound halves have module
+  variants: `module/mmio.rs` (BAR/PCI command), `module/msix.rs` (two
+  `narf_msix_claim` vectors for the RX and non-RX table entries; the
+  task-context callbacks latch the causes the built-in hard IRQ latches),
+  `module/source.rs` (firmware bytes are a private copy, so the source fence
+  is the PCI authority) and `module/platform_power.rs`.
+- **Roles not carried** are uninhabited types under the names the shared code
+  uses (`module/absent.rs`: the P2P client, the Gen2 MVM power owners, and
+  the transport's AP/P2P hooks answered as the built-in answers them with no
+  such role installed), so the station code compiles unchanged and the
+  compiler proves those paths unreachable. AP/P2P/scheduled-scan owners,
+  `device`, `mvm_*` and `bootstrap` are `cfg(builtin)`.
+- **Claim.** The six Sc ids (`8086:6e70/9327/d240/d340/e340/e440`), the
+  profile the built-in MLD station targets and the one seen on silicon (MS-03
+  `e340`). `narf-drivers-wireless/iwlwifi-module-only` leaves them to the
+  `.ko`; the Gen2/Ty/So/Ma/Bz ids stay built in.
+- **Probe** (`module/pci.rs`, the built-in `probe` + `bootstrap` order).
+  1. `narf_pci_identity`, the chip table and subsystem qualification.
+  2. Firmware-owned DMA retained on teardown.
+  3. `narf_pci_prepare_probe`, BAR0, memory decode on, bus master off.
+  4. The CSR MAC/RF identity selects the firmware ladder; a refused identity
+     refuses the probe.
+  5. The `WIFI` session, the 1 ms poller and the startup task.
+  The startup task resolves the executable and PNVM through
+  `narf_firmware_open` (120 x 500 ms retries while not staged), parses the
+  TLVs and runs `Hardware`: boot DMA, MSI-X, context info and IML, ALIVE,
+  PNVM, PHY configuration; then the MLD profile check and the configuration
+  commands (`mld_start.rs`, shared with `Device`).
+- **Regulatory.** The station derives its MCC and TX-power program from the
+  kernel's regulatory domain. `module/regulatory.rs` reads it through the
+  host's additive `GET_REGULATORY` opcode (§4.1, and
+  `modules/DATAPATH_ABI_DESIGN.md`) and caches one snapshot per kernel
+  revision; the service re-reads it every second, and a change fails the
+  station fence and drops carrier, as a built-in reinstall does. Without a
+  domain the station refuses association and scans passively, as built in.
+- **Platform power.** The module has no KABI for the device's ACPI
+  WRDS/EWRD/WGDS/PPAG objects, so it takes Linux's absent-tables path:
+  nothing is published and the firmware keeps its own limits.
+- **Netdev and wiphy** (`module/netdev.rs`, `Device`'s station subset).
+  - `wlan%d` through the netif bridge; `REGISTER_WIPHY` from the NVM:
+    channels, HT/VHT/HE/EHT, CCMP, `PSK_OFFLOAD | SAE_OFFLOAD |
+    REPORTS_DISCONNECT`.
+  - Scan: `Device::scan`'s firmware jobs (legacy bands, then the 6 GHz RNR
+    plan), active at the regulatory ceiling when asked and a domain is
+    installed, passive otherwise.
+  - Connect: `Device::associate_links` for one link (policy transaction,
+    `Connection::associate_links_in_domain`, station fence, carrier). A
+    `CONNECT` without a BSSID takes the strongest matching network of the
+    last scan.
+  - Service: `Device::step`'s station branch (RX, reorder timer, EAPOL
+    rekeying, BA maintenance, TX publication under queue credit, beacon and
+    policy loss reported as `DISCONNECTED`), and a transport stop with a
+    firmware restart before the next operation after any failure.
+  - Disconnect: `Device::close_locked`.
+- **Not carried (built-in only).** AP, P2P, monitor and virtual
+  interfaces; scheduled scan; MLO further links; roaming; WoWLAN and system
+  PM; CQM events; checksum offload; BIOS SAR/PPAG.
+- **Proof.** `modules/e2e/iwlwifi` loads the real `.ko`: relocations and
+  init, exactly the six Sc ids claimed and none of the built-in-only ones,
+  refusal of a probe with no device context, clean unload. QEMU emulates no
+  Intel Wi-Fi device, so firmware boot, scan and association through the
+  module are unverified until run on hardware.
 
 ## 5. Buffer Management
 

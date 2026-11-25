@@ -55,6 +55,7 @@ mod ap_gen2_wire;
 mod ap_host;
 #[cfg(feature = "builtin")]
 mod ap_owner;
+mod ap_power_limit;
 #[cfg(feature = "builtin")]
 mod ap_session;
 #[cfg(feature = "builtin")]
@@ -87,12 +88,11 @@ pub use bootstrap::gen2_transmit_power_request;
 pub use bootstrap::{provision, provision_state, ProvisionState};
 #[cfg(feature = "builtin")]
 pub use mvm_boot::PowerRequest as Gen2TransmitPowerRequest;
-#[cfg(feature = "builtin")]
-pub use mvm_boot::SharedMemory as Gen2SharedMemory;
+mod gen2_smem;
+pub use gen2_smem::SharedMemory as Gen2SharedMemory;
 #[cfg(any(test, feature = "kernel-test"))]
 mod bz_fixture;
 mod bz_profile;
-#[cfg(feature = "builtin")]
 pub mod connection;
 mod context_v1;
 pub mod csum;
@@ -117,7 +117,6 @@ pub mod iwl_msix;
 pub mod mac_ctx;
 #[cfg(feature = "builtin")]
 mod mld_platform;
-#[cfg(feature = "builtin")]
 mod mld_policy;
 #[cfg(feature = "builtin")]
 mod mld_power;
@@ -163,33 +162,22 @@ pub mod rx;
 mod rx_multi;
 pub mod rx_rfh;
 mod sc_eht;
-#[cfg(feature = "builtin")]
 mod sc_emlsr;
 mod sc_he;
-#[cfg(feature = "builtin")]
 mod sc_mlo;
-#[cfg(feature = "builtin")]
 mod sc_mlo_assoc;
-#[cfg(feature = "builtin")]
 pub use sc_mlo_assoc::MldLinkCandidate;
-#[cfg(feature = "builtin")]
 mod sc_security;
-#[cfg(feature = "builtin")]
 mod sc_ttlm_neg;
-#[cfg(feature = "builtin")]
 mod sc_tx_amsdu;
 pub mod scan_api;
 mod scheduled_epoch;
 #[cfg(feature = "builtin")]
 mod scheduled_wire;
 pub mod security;
-#[cfg(feature = "builtin")]
 mod six_ghz_power;
-#[cfg(feature = "builtin")]
 mod six_ghz_scan;
-#[cfg(feature = "builtin")]
 mod six_ghz_span;
-#[cfg(feature = "builtin")]
 mod six_ghz_station;
 pub mod sta;
 pub mod station_api;
@@ -204,6 +192,10 @@ pub mod wpa;
 /// The loadable build's KABI platform, PCI binding and netdev (`iwlwifi.ko`).
 #[cfg(feature = "module")]
 pub mod module;
+/// Roles the module build does not carry, under the names the shared station
+/// code uses (`module/absent.rs`).
+#[cfg(feature = "module")]
+use module::absent::{mvm_boot, p2p_client, p2p_go};
 
 #[cfg(feature = "builtin")]
 use alloc::boxed::Box;
@@ -262,6 +254,7 @@ struct IwlDevice {
     scan_waker: IrqSafeSpinLock<Option<Waker>>,
 }
 
+#[cfg(feature = "builtin")]
 // SAFETY: every interior-mutable field (`rx_q`, `tx_q0`, `bss_list`,
 // `scan_waker`, the atomics) is guarded by an `IrqSafeSpinLock` or is
 // an `Atomic*`, so concurrent access from multiple threads is
@@ -269,11 +262,10 @@ struct IwlDevice {
 // device memory the driver holds exclusively; raw pointers into them
 // are only dereferenced under those locks. Hence sharing/sending an
 // `IwlDevice` across threads is sound.
-#[cfg(feature = "builtin")]
 unsafe impl Send for IwlDevice {}
+#[cfg(feature = "builtin")]
 // SAFETY: see the `Send` impl above — all shared mutable state is
 // behind `IrqSafeSpinLock`/atomics, so `&IwlDevice` is safe to share.
-#[cfg(feature = "builtin")]
 unsafe impl Sync for IwlDevice {}
 
 #[cfg(feature = "builtin")]

@@ -23,6 +23,7 @@
 //! | `SCAN_DONE` | status i32 (0, or a negative errno for an aborted scan) | empty |
 //! | `CONNECT_RESULT` | 802.11 status, BSSID, frequency ([`decode_connect_result`]) | empty |
 //! | `DISCONNECTED` | reason u16, locally-generated u8, reserved u8 | empty |
+//! | `GET_REGULATORY` (additive, 0x06) | mode u8 (0 current, 1 ensure), reserved [u8; 3] | the current domain ([`encode_regulatory`]); needs no wiphy |
 //!
 //! Native → module, through the session's event callback (registered by
 //! `narf_wireless_open_with_event`; the callback's return is the module's
@@ -87,6 +88,13 @@ pub const OP_SCAN_RESULT: u32 = 0x02;
 pub const OP_SCAN_DONE: u32 = 0x03;
 pub const OP_CONNECT_RESULT: u32 = 0x04;
 pub const OP_DISCONNECTED: u32 = 0x05;
+
+// ── Additive opcodes (version 2, appended; unknown to an older host, which
+//    answers -EOPNOTSUPP and the module fails closed) ───────────────────────
+
+/// The kernel's current regulatory domain, for a module that programs
+/// regulatory TX power itself (iwlwifi.ko). See [`get_regulatory`].
+pub const OP_GET_REGULATORY: u32 = 0x06;
 
 /// Native → module events (a separate namespace from the opcodes).
 pub const EVENT_SCAN_REQUEST: u32 = 0x01;
@@ -950,6 +958,68 @@ fn encode_disconnect(reason: u16) -> [u8; 4] {
     out
 }
 
+// ── GET_REGULATORY (additive) ────────────────────────────────────────────
+
+/// Rules one `GET_REGULATORY` reply carries at most.
+pub const MAX_REGULATORY_RULES: usize = 128;
+/// Bytes of one encoded rule.
+pub const REGULATORY_RULE_LEN: usize = 20;
+
+/// Decode `GET_REGULATORY`: `mode u8 | reserved [u8; 3]`. Mode 0 reads the
+/// installed domain (`reg::db::snapshot`); mode 1 first bootstraps the
+/// staged signed policy when none is installed (`reg::db::ensure_snapshot`,
+/// what a built-in driver's initial request does). Returns `ensure`.
+fn decode_get_regulatory(request: &[u8]) -> Result<bool, i32> {
+    match request {
+        [mode @ (0 | 1), 0, 0, 0] => Ok(*mode == 1),
+        _ => Err(-22),
+    }
+}
+
+/// Encode the current regulatory domain:
+///
+/// ```text
+/// revision u64 | country [u8; 2] | rule count u16 | reserved u32
+/// per rule: start MHz u32 | end MHz u32 | max bandwidth MHz u32
+///           | max power dBm i8 | reserved [u8; 3] | RegFlags bits u32
+/// ```
+///
+/// `revision` is `reg::db::revision()`, read after the snapshot: a module
+/// re-reads when it changes. `-ENOENT` when no domain is installed; `-E2BIG`
+/// for more than [`MAX_REGULATORY_RULES`] rules (never truncated, since a
+/// missing rule would permit what the domain forbids).
+pub fn encode_regulatory(
+    domain: &crate::reg::RegulatoryDomain,
+    revision: u64,
+) -> Result<Vec<u8>, i32> {
+    if domain.rules.len() > MAX_REGULATORY_RULES {
+        return Err(-7);
+    }
+    let mut out = Vec::with_capacity(16 + domain.rules.len() * REGULATORY_RULE_LEN);
+    out.extend_from_slice(&revision.to_le_bytes());
+    out.extend_from_slice(&domain.country_code);
+    out.extend_from_slice(&(domain.rules.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for rule in &domain.rules {
+        out.extend_from_slice(&rule.freq_start_mhz.to_le_bytes());
+        out.extend_from_slice(&rule.freq_end_mhz.to_le_bytes());
+        out.extend_from_slice(&rule.max_bandwidth_mhz.to_le_bytes());
+        out.push(rule.max_power_dbm as u8);
+        out.extend_from_slice(&[0; 3]);
+        out.extend_from_slice(&rule.flags.bits().to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn get_regulatory(ensure: bool) -> Result<Vec<u8>, i32> {
+    let domain = if ensure {
+        crate::reg::db::ensure_snapshot().map_err(|_| -2)?
+    } else {
+        crate::reg::db::snapshot().ok_or(-2)?
+    };
+    encode_regulatory(&domain, crate::reg::db::revision())
+}
+
 /// Malformed/unsupported requests cause no allocation, native I/O, queue
 /// mutation or operation-id publication.
 fn validate(opcode: u32, request: &[u8]) -> Result<(), i32> {
@@ -959,6 +1029,7 @@ fn validate(opcode: u32, request: &[u8]) -> Result<(), i32> {
         OP_SCAN_DONE => decode_scan_done(request).map(|_| ()),
         OP_CONNECT_RESULT => decode_connect_result(request).map(|_| ()),
         OP_DISCONNECTED => decode_disconnected(request).map(|_| ()),
+        OP_GET_REGULATORY => decode_get_regulatory(request).map(|_| ()),
         _ => Err(-95),
     }
 }
@@ -974,6 +1045,11 @@ fn alloc_wiphy_id() -> Result<u64, i32> {
 fn execute(session: &Arc<Session>, opcode: u32, request: &[u8]) -> Result<Vec<u8>, i32> {
     if opcode == OP_REGISTER_WIPHY {
         return register_wiphy(session, request);
+    }
+    // A query, not a report: it needs no wiphy (a module reads the policy
+    // before it can transmit, possibly before it registers one).
+    if opcode == OP_GET_REGULATORY {
+        return get_regulatory(decode_get_regulatory(request)?);
     }
     // Every report needs the wiphy it reports on.
     let shell = session.wiphy.lock().clone().ok_or(-22)?;

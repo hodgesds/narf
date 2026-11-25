@@ -914,6 +914,37 @@ WCN6855, so bring-up through the module (MHI, FW_READY, scan, association)
 is first proven on the Lenovo 21ME (`docs/BOOTING_ON_CACHYOS.md`); that boot
 has not yet run.
 
+## Loadable iwlwifi (Sc / BE20x-BE21x)
+
+The iwlwifi driver now builds from one source either built in or as
+`iwlwifi.ko`. For the Sc MAC the module runs the driver's own code over the
+KABI:
+
+- the PCIe transport: boot DMA, MSI-X, context info/IML, ALIVE, PNVM;
+- the MLD configuration commands and NVM;
+- the station: scan (active at the regulatory ceiling, else passive),
+  association with the in-driver WPA2-PSK/WPA3-SAE supplicant and 802.11w,
+  rekeying, BA, the data path, link loss and disconnect;
+- one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
+  host.
+
+It claims the six Sc ids; `narf-drivers-wireless/iwlwifi-module-only` steps
+the built-in claim aside for them. The station's regulatory program reads the
+kernel's domain through a new additive `WIFI` opcode, `GET_REGULATORY`, and
+the transport stops bus mastering through a new additive export,
+`narf_pci_disable`. The module links on x86_64 and aarch64 and every
+undefined symbol is a KABI export.
+
+`modules/e2e/iwlwifi` loads the real `.ko` and checks relocations and init,
+the exact six-id claim, refusal of a probe with no device context and clean
+unload (written; not yet run in the combined pass).
+
+Not in the module build: AP/P2P/monitor, scheduled scan, MLO further links,
+roaming, WoWLAN and system PM, CQM events, checksum offload, BIOS SAR/PPAG
+(no KABI for the device's ACPI objects), and the Gen2/Ty/So/Ma/Bz profiles.
+QEMU has no Intel Wi-Fi device: firmware boot, scan and association through
+the module are unverified until run on hardware (MS-03 `8086:e340`).
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

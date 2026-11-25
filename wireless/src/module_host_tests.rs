@@ -777,3 +777,94 @@ kernel_test_in!(
     "wireless/module-host",
     smoke_module_host_shell_refusal_disconnect_and_unsupported
 );
+
+// ── GET_REGULATORY (additive opcode) ──────────────────────────────────────
+
+/// The wire layout of `GET_REGULATORY`: request validation, the exact reply
+/// record for a two-rule domain, and the rule-count bound (no truncation).
+fn smoke_module_host_get_regulatory_wire() -> TestResult {
+    use crate::reg::{RegFlags, RegRule, RegulatoryDomain};
+    if decode_get_regulatory(&[0, 0, 0, 0]) != Ok(false)
+        || decode_get_regulatory(&[1, 0, 0, 0]) != Ok(true)
+        || decode_get_regulatory(&[2, 0, 0, 0]).is_ok()
+        || decode_get_regulatory(&[0, 1, 0, 0]).is_ok()
+        || decode_get_regulatory(&[0, 0, 0]).is_ok()
+        || validate(OP_GET_REGULATORY, &[0; 5]) != Err(-22)
+    {
+        return TestResult::Fail("GET_REGULATORY request validation");
+    }
+    let rule = |start, end, bw, power, flags| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: bw,
+        max_power_dbm: power,
+        flags,
+    };
+    let domain = RegulatoryDomain {
+        country_code: *b"DE",
+        rules: alloc::vec![
+            rule(2400, 2483, 40, 20, RegFlags::empty()),
+            rule(5250, 5330, 80, 20, RegFlags::DFS | RegFlags::AUTO_BW),
+        ],
+    };
+    let Ok(bytes) = encode_regulatory(&domain, 0x0102_0304_0506_0708) else {
+        return TestResult::Fail("GET_REGULATORY refused a two-rule domain");
+    };
+    let flags = (RegFlags::DFS | RegFlags::AUTO_BW).bits().to_le_bytes();
+    let second = &bytes[16 + REGULATORY_RULE_LEN..];
+    if bytes.len() != 16 + 2 * REGULATORY_RULE_LEN
+        || bytes[..8] != 0x0102_0304_0506_0708u64.to_le_bytes()
+        || &bytes[8..10] != b"DE"
+        || bytes[10..12] != 2u16.to_le_bytes()
+        || bytes[12..16] != [0; 4]
+        || bytes[16..20] != 2400u32.to_le_bytes()
+        || second[..4] != 5250u32.to_le_bytes()
+        || second[8..12] != 80u32.to_le_bytes()
+        || second[12] != 20
+        || second[13..16] != [0; 3]
+        || second[16..20] != flags
+    {
+        return TestResult::Fail("GET_REGULATORY reply layout");
+    }
+    let huge = RegulatoryDomain {
+        country_code: *b"US",
+        rules: alloc::vec![rule(2400, 2483, 40, 20, RegFlags::empty()); MAX_REGULATORY_RULES + 1],
+    };
+    if encode_regulatory(&huge, 1) != Err(-7) {
+        return TestResult::Fail("GET_REGULATORY truncated an oversized domain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/module-host",
+    smoke_module_host_get_regulatory_wire
+);
+
+/// `GET_REGULATORY` through a real session, before any wiphy exists: it
+/// answers the installed domain (or `-ENOENT` when there is none) and never
+/// needs a registered wiphy, unlike the reports.
+fn smoke_module_host_get_regulatory_session() -> TestResult {
+    let Some(f) = fixture(None) else {
+        return TestResult::Fail("module-host fixture unavailable");
+    };
+    let Ok(operation) = submit(f.id, OP_GET_REGULATORY, &[0, 0, 0, 0]) else {
+        return TestResult::Fail("GET_REGULATORY refused before a wiphy existed");
+    };
+    let mut reply = alloc::vec![0u8; 16 + MAX_REGULATORY_RULES * REGULATORY_RULE_LEN];
+    let (status, _, len) = poll_with(f.id, operation, &mut reply);
+    match crate::reg::db::snapshot() {
+        None if status == -2 => TestResult::Pass,
+        Some(domain)
+            if status == 0
+                && len == 16 + domain.rules.len() * REGULATORY_RULE_LEN
+                && reply[8..10] == domain.country_code =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("GET_REGULATORY disagrees with the installed domain"),
+    }
+}
+kernel_test_in!(
+    "wireless/module-host",
+    smoke_module_host_get_regulatory_session
+);

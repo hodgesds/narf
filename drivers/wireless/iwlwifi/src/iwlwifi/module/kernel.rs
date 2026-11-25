@@ -66,6 +66,38 @@ pub mod narf_lib {
     }
 }
 
+/// `narf_net`: the frame metadata the station code produces. The module's
+/// frames go through the netif bridge (`narf_netif_rx`), which takes bytes
+/// only, so RX verdicts are computed and then dropped at the bridge — the
+/// stack verifies checksums in software, as for any non-offloading netdev.
+pub mod narf_net {
+    /// Per-frame receive metadata (the kernel type's fields).
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct RxMeta {
+        pub timestamp_ns: Option<u64>,
+        pub csum_l3: bool,
+        pub csum_l4: bool,
+        pub vlan_tag: Option<u16>,
+        pub gro_segs: u16,
+        pub rx_hash: u32,
+    }
+
+    /// The L4 checksum a transmit asks the hardware for.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum L4CsumKind {
+        Tcp,
+        Udp,
+        Sctp,
+    }
+
+    pub mod native_emission {
+        /// A native emitting role's lifetime (P2P/AP). The module carries no
+        /// such role, so no value exists (see `module/absent.rs`).
+        #[derive(Debug)]
+        pub enum Lifetime {}
+    }
+}
+
 /// `narf_console`: the boot console.
 pub mod narf_console {
     pub use narf_module_rt::console::Console as Writer;

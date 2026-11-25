@@ -232,6 +232,11 @@ fn probe_device(dev: u64) -> i32 {
     if unsafe { ffi::narf_spawn_poller(dev, poll as usize, 0) } != 0 {
         return EIO;
     }
+    // The WIFI session first: the regulatory queries need it, and the netif
+    // bridge names a netdev `wlan%d` only on a device with a session.
+    let Some(session) = super::netdev::open_session() else {
+        return EIO;
+    };
     let startup = Startup {
         device,
         cap,
@@ -239,6 +244,7 @@ fn probe_device(dev: u64) -> i32 {
         chip,
         identity,
         ladder,
+        session,
     };
     let _ = super::EXEC.spawn(startup.run());
     let _ = super::EXEC.run();
@@ -253,6 +259,8 @@ struct Startup {
     chip: ChipConfig,
     identity: firmware_identity::Sc,
     ladder: Vec<String>,
+    /// The device's `WIFI` session.
+    session: u64,
 }
 
 /// A startup step's failure: retried only before the transport is touched.
@@ -310,6 +318,10 @@ impl Startup {
         if parsed.api.pnvm.is_none() {
             parsed.api.pnvm = input.pnvm.as_ref().map(|asset| asset.bytes.as_slice());
         }
+        // Policy absence still permits firmware/receive setup (as built in);
+        // station TX and active scan retry the authenticated policy later
+        // and fail shut without it.
+        let _ = super::regulatory::ensure_snapshot();
         let format = CompletionFormat::for_mac(self.chip.mac)
             .ok_or("unsupported native completion profile")?;
         self.identity
@@ -353,7 +365,7 @@ impl Startup {
             executable: input.firmware.bytes,
             pnvm,
         };
-        super::netdev::publish(hardware, mac, nvm, firmware);
+        super::netdev::publish(self.session, hardware, mac, nvm, firmware);
         Ok(())
     }
 }

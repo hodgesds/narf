@@ -1,27 +1,31 @@
 //! iwlwifi as a loadable module (`iwlwifi.ko`).
 //!
-//! The driver's identity, firmware and PCIe transport layers are the same
-//! source in both builds. What a `.ko` cannot link — the kernel crates —
+//! The driver's identity, firmware, PCIe transport and station layers are the
+//! same source in both builds. What a `.ko` cannot link — the kernel crates —
 //! [`kernel`] provides under the same names over `narf-module-rt` and the
 //! KABI. What differs in shape, not just in name, lives here:
 //!
 //! - [`pci`] — the PCI binding: identity, the Sc profile, firmware, the
 //!   driver's [`super::runtime::Hardware`] boot to ALIVE, NVM and the
 //!   runtime configuration commands;
-//! - [`netdev`] — one `wlan%d` netdev and wiphy through the netif bridge and
-//!   the `WIFI` family host (version 2), and the firmware's passive scan.
+//! - [`netdev`] — the station (`Device`'s station subset over the same
+//!   `Hardware` and `connection::Connection`): one `wlan%d` netdev and wiphy
+//!   through the netif bridge and the `WIFI` family host (version 2), scan,
+//!   association with the in-driver supplicant, the data path, link loss;
+//! - [`regulatory`] — the kernel's regulatory domain, read through the host;
+//! - [`absent`] — the roles the module does not carry, as uninhabited types.
 //!
 //! Scope is the Sc MAC (BE20x/BE21x): the profile the built-in driver's MLD
-//! station path targets, and the one verified on silicon (MS-03 `8086:e340`).
-//! Not carried yet, all built in only: association and the data path (they
-//! need the signed regulatory database and the ACPI/SMBIOS platform power
-//! inputs, which have no KABI), active scan, AP/P2P, scheduled scan, WoWLAN
-//! and system PM, firmware crash recovery, and the Gen2/Ty/So/Ma/Bz
+//! station path targets, and the one seen on silicon (MS-03 `8086:e340`).
+//! Built in only: AP/P2P/monitor, scheduled scan, MLO further links,
+//! roaming, WoWLAN and system PM, BIOS SAR/PPAG, and the Gen2/Ty/So/Ma/Bz
 //! profiles.
 
+pub(crate) mod absent;
 pub mod kernel;
 pub(crate) mod netdev;
 pub(crate) mod pci;
+pub(crate) mod regulatory;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_module_rt::exec::Executor;

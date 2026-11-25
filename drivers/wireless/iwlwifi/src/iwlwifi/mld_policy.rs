@@ -2,7 +2,11 @@
 //! Current host policy for native MLD station publication. A cached MCC
 //! map is bound to its host country and already-programmed span/ceiling;
 //! it is never a replacement for SAR or measured platform qualification.
-use alloc::sync::{Arc, Weak};
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
+use alloc::sync::Arc;
+#[cfg(feature = "builtin")]
+use alloc::sync::Weak;
 use core::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_wireless::reg::RegulatoryDomain;
@@ -24,8 +28,12 @@ impl Source {
     /// missing selected Database is absence of authority, never a fallback.
     pub fn request_snapshot(&self) -> Result<Arc<RegulatoryDomain>, &'static str> {
         self.request_snapshot_with(|| {
-            narf_wireless::reg::db::ensure_snapshot()
-                .map_err(|_| "Intel initial regulatory policy unavailable")
+            #[cfg(feature = "builtin")]
+            let snapshot = narf_wireless::reg::db::ensure_snapshot().map_err(|_| ());
+            // The module asks the kernel's database through the WIFI host.
+            #[cfg(feature = "module")]
+            let snapshot = super::module::regulatory::ensure_snapshot();
+            snapshot.map_err(|_| "Intel initial regulatory policy unavailable")
         })
     }
     fn request_snapshot_with(
@@ -42,7 +50,10 @@ impl Source {
     }
     pub fn snapshot(&self) -> Result<Arc<RegulatoryDomain>, &'static str> {
         let snapshot = match &self.0 {
+            #[cfg(feature = "builtin")]
             Provider::Native => narf_wireless::reg::db::snapshot(),
+            #[cfg(feature = "module")]
+            Provider::Native => super::module::regulatory::snapshot(),
             #[cfg(any(test, feature = "kernel-test"))]
             Provider::Database(database) => database.snapshot(),
         };
@@ -182,14 +193,17 @@ impl Validity {
 /// Actual scanner requester and policy retained by native MLD ownership.
 /// Currentness validation does not acquire native state; no user callback
 /// runs while the short MCC fact cell is locked.
+#[cfg(feature = "builtin")]
 #[derive(Clone)]
 pub(super) struct ScanAuthority(Arc<ScanProof>);
+#[cfg(feature = "builtin")]
 struct ScanProof {
     policy: Transaction,
     device: Weak<super::device::Device>,
     event: narf_wireless::ap_control::RadioEventAuthority,
     cancel: Arc<AtomicBool>,
 }
+#[cfg(feature = "builtin")]
 impl ScanAuthority {
     pub fn new(
         policy: Transaction,
@@ -230,7 +244,11 @@ impl ScanAuthority {
 pub(super) enum Authority {
     Transaction(Transaction),
     Station(Fence),
-    StationAndScan { home: Fence, scan: ScanAuthority },
+    #[cfg(feature = "builtin")]
+    StationAndScan {
+        home: Fence,
+        scan: ScanAuthority,
+    },
 }
 impl Authority {
     pub fn domain(&self) -> Result<Arc<RegulatoryDomain>, &'static str> {
@@ -238,6 +256,7 @@ impl Authority {
         match self {
             Self::Transaction(t) => Ok(t.initial.clone()),
             Self::Station(f) => f.source.snapshot(),
+            #[cfg(feature = "builtin")]
             Self::StationAndScan { scan, .. } => Ok(scan.0.policy.initial.clone()),
         }
     }
@@ -245,6 +264,7 @@ impl Authority {
         match self {
             Self::Transaction(t) => t.check(),
             Self::Station(f) => f.check(),
+            #[cfg(feature = "builtin")]
             Self::StationAndScan { home, scan } => {
                 home.check()?;
                 scan.check()
@@ -255,11 +275,13 @@ impl Authority {
         match self {
             Self::Transaction(t) => t.validity.clone(),
             Self::Station(f) => f.program.validity.clone(),
+            #[cfg(feature = "builtin")]
             Self::StationAndScan { home, .. } => home.program.validity.clone(),
         }
     }
     pub fn invalidate(&self) {
         self.validity().invalidate();
+        #[cfg(feature = "builtin")]
         if let Self::StationAndScan { scan, .. } = self {
             scan.invalidate();
         }

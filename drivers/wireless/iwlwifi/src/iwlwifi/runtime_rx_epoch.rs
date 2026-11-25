@@ -1,6 +1,5 @@
 //! All-owned-RFH MLD BAID retirement. Firmware echoes an opaque host cookie,
 //! type and BAID after each queue's prefix (Linux mld/{agg,rx}.c,rx.h).
-#[cfg(feature = "builtin")]
 use super::super::scan_api;
 use super::*;
 use alloc::sync::Arc;
@@ -138,7 +137,6 @@ impl Hardware {
     }
     /// MLD EMPTY (type0) is an ordered all-owned-RFH prefix proof, not a
     /// temporarily empty descriptor ring or a key-command acknowledgement.
-    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn synchronize_receive_epoch(
         &mut self,
     ) -> Result<Vec<Packet>, &'static str> {
@@ -152,29 +150,32 @@ impl Hardware {
     /// Only a matching native marker permits host BAID/window reuse. Return
     /// bounded original management packets for the Connection's existing
     /// peer/PHY/PMF checks; discard old data without committing its PN.
-    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn synchronize_rx_baid(
         &mut self,
         baid: u8,
     ) -> Result<Vec<Packet>, &'static str> {
         self.synchronize_rx(Some(baid)).await
     }
-    #[cfg(feature = "builtin")]
     async fn synchronize_rx(&mut self, baid: Option<u8>) -> Result<Vec<Packet>, &'static str> {
         // Ordinary Qu station/BAID retirement retains its original MVM
         // receiver. Only the complete selected API77 AP consumer with its
         // original current START role uses this common EMPTY/sync1 path.
+        #[cfg(feature = "builtin")]
         let legacy_ap = baid.is_none()
             && self.ap_legacy_selected()
             && self
                 .ap_owner
                 .as_ref()
                 .is_some_and(|owner| owner.check().is_ok());
+        // The module build carries no AP or P2P client owner.
+        #[cfg(feature = "module")]
+        let (legacy_ap, legacy_client) = (false, false);
         // A retained, closing SESSION1 lease may retire its own physical
         // prefix after the emitting source dies. This complete adapter's
         // actual original DMA/session owner is separate from ordinary Qu
         // station/BAID service, which keeps its original refusal below.
         let legacy_p2p = baid.is_none() && self.p2p_gen2_prefix();
+        #[cfg(feature = "builtin")]
         let legacy_client = baid.is_none()
             && self.ap_legacy_selected()
             && self
@@ -203,7 +204,6 @@ impl Hardware {
             }
         }
     }
-    #[cfg(feature = "builtin")]
     async fn rx_baid_marker(
         &mut self,
         baid: Option<u8>,

@@ -12,10 +12,11 @@
 #   * `module`: built to a relocatable `.ko` via
 #     `cargo xtask build-module --package narf-drivers-wireless-iwlwifi \
 #        --no-default-features --features module`. The kernel crates drop from
-#     the graph. For the Sc (BE20x/BE21x) ids the driver's own identity,
-#     firmware and PCIe transport code runs inside the `.ko` over
-#     `narf-module-rt` and the KABI: firmware boot, NVM, the netdev/wiphy
-#     through the `WIFI` family host and passive scan (`src/iwlwifi/module/`).
+#     the graph. For the Sc (BE20x/BE21x) ids the driver's own transport,
+#     firmware and MLD station code runs inside the `.ko` over
+#     `narf-module-rt` and the KABI: firmware boot, scan, association with
+#     the in-driver supplicant and the data path, with the netdev/wiphy
+#     through the `WIFI` family host (`src/iwlwifi/module/`).
 #
 # Unlike mt76, tests gate on a dedicated `kernel-test` feature (which implies
 # `builtin`) rather than on `builtin` itself, so the driver's ~160 test modules
