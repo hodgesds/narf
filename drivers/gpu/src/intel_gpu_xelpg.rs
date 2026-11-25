@@ -376,28 +376,85 @@ pub const DDI_CLOCK_SELECT_DIV18CLK: u32 = 0x9 << 12;
 pub const TBT_CLOCK_REQUEST: u32 = 1 << 19;
 pub const TBT_CLOCK_ACK: u32 = 1 << 18;
 
+/// `XELPDP_DDI_CLOCK_SELECT_TBT_312_5` / `_TBT_625`: the fabric's UHBR10 and
+/// UHBR20 clocks (the 32-bit symbol clock), which only the display-30
+/// five-bit select field can hold.
+pub const DDI_CLOCK_SELECT_TBT_312_5: u32 = 0x18;
+pub const DDI_CLOCK_SELECT_TBT_625: u32 = 0x19;
+
+/// `intel_mtl_tbt_clock_select` for a Linux port clock (10 kbps units): the
+/// DP 1.4 rates on every display, UHBR10 and UHBR20 only on display >= 30.
+/// `None` where Linux WARNs and programs the 162 MHz select instead: a UHBR
+/// rate below display 30 ("UHBR10/20 not supported for the platform"), or a
+/// clock with no fabric select.
+pub const fn tbt_clock_select(port_clock_khz: u32, display30: bool) -> Option<u32> {
+    match port_clock_khz {
+        162_000 => Some(0xC),
+        270_000 => Some(0xD),
+        540_000 => Some(0xE),
+        810_000 => Some(0xF),
+        1_000_000 if display30 => Some(DDI_CLOCK_SELECT_TBT_312_5),
+        2_000_000 if display30 => Some(DDI_CLOCK_SELECT_TBT_625),
+        _ => None,
+    }
+}
+
+/// `intel_mtl_tbt_calc_port_clock`: the port clock a `PORT_CLOCK_CTL` value
+/// selects, through `XELPDP_DDI_CLOCK_SELECT_GET` (the five-bit field on
+/// display >= 30). `None` for Linux's `MISSING_CASE` (which reads 162000).
+pub const fn tbt_port_clock_khz(port_clock_ctl: u32, display30: bool) -> Option<u32> {
+    let mask = if display30 {
+        XE3_DDI_CLOCK_SELECT_MASK
+    } else {
+        DDI_CLOCK_SELECT_MASK
+    };
+    match (port_clock_ctl & mask) >> 12 {
+        0xC => Some(162_000),
+        0xD => Some(270_000),
+        0xE => Some(540_000),
+        0xF => Some(810_000),
+        DDI_CLOCK_SELECT_TBT_312_5 => Some(1_000_000),
+        DDI_CLOCK_SELECT_TBT_625 => Some(2_000_000),
+        _ => None,
+    }
+}
+
+/// Whether the window's display has the five-bit select field.
+fn tbt_display30<M: MmioWindow + ?Sized>(mmio: &M) -> bool {
+    ddi_clock_select_mask(mmio) == XE3_DDI_CLOCK_SELECT_MASK
+}
+
 /// `intel_mtl_tbt_pll_enable_clock`: use the fabric's clock, with no
 /// C20 or LT reset, SRAM or message-bus transaction against the USB-owned
 /// PHY. The clock mux takes `intel_mtl_tbt_clock_select` for the DP 1.4
-/// rates in the display's select field (five bits on display >= 30, where
-/// Linux also has the UHBR10/20 selects; UHBR is not routed here), then
-/// `DDI_CLK_VALFREQ` takes `intel_ddi_link_symbol_clock`, which is the port
-/// clock for an 8b/10b rate.
+/// rates in the display's select field ([`enable_tbt_clock_khz`] also takes
+/// the display-30 UHBR selects), then `DDI_CLK_VALFREQ` takes
+/// `intel_ddi_link_symbol_clock`, which is the port clock for an 8b/10b
+/// rate.
 pub fn enable_tbt_clock<M: MmioWindow + ?Sized>(
     mmio: &M,
     port: XeLpgPort,
     rate: LinkRate,
 ) -> Result<(), Cx0Error> {
+    // The HDMI rates have no fabric select (UnsupportedRate).
+    enable_tbt_clock_khz(mmio, port, rate.megabits_per_sec() * 100)
+}
+
+/// [`enable_tbt_clock`] at a Linux port clock: the DP 1.4 rates, and on
+/// display >= 30 UHBR10 (`XELPDP_DDI_CLOCK_SELECT_TBT_312_5`) and UHBR20
+/// (`_TBT_625`) with `DDI_CLK_VALFREQ` at the 32-bit symbol clock (312500 /
+/// 625000 kHz). A clock [`tbt_clock_select`] has no select for refuses
+/// before any write (Linux would program the 162 MHz select).
+pub fn enable_tbt_clock_khz<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    port_clock_khz: u32,
+) -> Result<(), Cx0Error> {
     if port.tc_index().is_none() || !mmio.display_access_ok() {
         return Err(Cx0Error::ProtocolMismatch);
     }
-    let select = match rate {
-        LinkRate::DpRbr => 0xC,
-        LinkRate::DpHbr => 0xD,
-        LinkRate::DpHbr2 => 0xE,
-        LinkRate::DpHbr3 => 0xF,
-        _ => return Err(Cx0Error::UnsupportedRate),
-    };
+    let select =
+        tbt_clock_select(port_clock_khz, tbt_display30(mmio)).ok_or(Cx0Error::UnsupportedRate)?;
     let off = port.port_clock_ctl();
     rmw(
         mmio,
@@ -416,7 +473,7 @@ pub fn enable_tbt_clock<M: MmioWindow + ?Sized>(
     }
     // 7. DDI_CLK_VALFREQ to the intended DDI clock.
     if let Some(valfreq) = port.clk_valfreq() {
-        mmio.write32(valfreq, rate.megabits_per_sec() * 100);
+        mmio.write32(valfreq, dp_link_symbol_clock_khz(port_clock_khz));
         compiler_fence(Ordering::SeqCst);
     }
     Ok(())
