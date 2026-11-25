@@ -5,7 +5,13 @@
 //! In the `.ko` the kernel holds that capability: each `narf_mmio_*` /
 //! `narf_pci_*` call is checked against the probe token, and device teardown
 //! revokes it (every later access then reads all-ones and writes nothing).
+//! The command-register sequences and their read-back checks are the
+//! built-in's, over `narf_pci_command` (`module/kernel.rs`'s `narf_bus::pci`).
 use super::transport::IwlMmio;
+use crate::iwlwifi::module::kernel::narf_bus::pci::{
+    self,
+    cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE},
+};
 use crate::iwlwifi::module::kernel::narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use crate::iwlwifi::module::kernel::narf_capabilities::{Cap, CapError, Write};
 use crate::iwlwifi::module::{device, kernel::narf_bus};
@@ -14,27 +20,31 @@ use crate::iwlwifi::module::{device, kernel::narf_bus};
 mod ffi {
     unsafe extern "C" {
         pub fn narf_pci_prepare_probe(dev: u64) -> i32;
-        pub fn narf_pci_enable(dev: u64, cmd_bits: u16) -> i32;
-        pub fn narf_pci_disable(dev: u64, cmd_bits: u16) -> i32;
         pub fn narf_bar_map(dev: u64, bar_idx: u8) -> u64;
         pub fn narf_bar_len(dev: u64, bar: u64, out_len: *mut u64) -> i32;
     }
 }
 
-/// `PCI_COMMAND_MEMORY` / `_MASTER`.
-const MEM_SPACE: u16 = 0x2;
-const BUS_MASTER: u16 = 0x4;
-
-/// Park inherited decode and mastering (`narf_pci_prepare_probe` also puts
-/// the function in D0). Valid only before the context owns resources, which
+/// Park inherited decode and mastering with INTx disabled, verified by read
+/// back (the built-in `park`). `narf_pci_prepare_probe` also puts the
+/// function in D0; it is valid only before the context owns resources, which
 /// is the only place the module calls it: probe.
 pub(super) fn park(
-    _device: &BusDevice,
-    _cap: &Cap<BusDeviceCap, Write>,
+    device_: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<(), &'static str> {
     // SAFETY: argument-only call on our probe token.
     if unsafe { ffi::narf_pci_prepare_probe(device()) } != 0 {
         return Err("cannot park Wi-Fi PCI");
+    }
+    pci::clear_command(cap, device_, BUS_MASTER | MEM_SPACE)
+        .map_err(|_| "cannot park Wi-Fi PCI")?;
+    pci::set_command(cap, device_, INTX_DISABLE).map_err(|_| "cannot park Wi-Fi INTx")?;
+    if pci::read_command(cap, device_).map_err(|_| "cannot read Wi-Fi PCI")?
+        & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+        != INTX_DISABLE
+    {
+        return Err("Wi-Fi PCI parking readback failed");
     }
     Ok(())
 }
@@ -53,30 +63,30 @@ pub(super) fn map(
     if bar == 0 || unsafe { ffi::narf_bar_len(device(), bar, &mut len) } != 0 {
         return Err("cannot map Wi-Fi BAR0");
     }
-    // SAFETY: argument-only call on our probe token.
-    if unsafe { ffi::narf_pci_enable(device(), MEM_SPACE) } != 0 {
-        return Err("cannot enable Wi-Fi memory decode");
-    }
+    pci::set_command(cap, device_, MEM_SPACE | INTX_DISABLE)
+        .map_err(|_| "cannot enable Wi-Fi memory decode")?;
     set_master(device_, cap, false)?;
     Ok(narf_bus::MmioRegion { len, bar })
 }
 
-/// Bus mastering on or off, verified by the kernel's readback.
+/// Bus mastering on or off, verified by read back (the built-in
+/// `set_master`).
 pub(super) fn set_master(
-    _device: &BusDevice,
-    _cap: &Cap<BusDeviceCap, Write>,
+    device_: &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
     enabled: bool,
 ) -> Result<(), &'static str> {
-    // SAFETY: argument-only calls on our probe token.
-    let rc = unsafe {
-        if enabled {
-            ffi::narf_pci_enable(device(), BUS_MASTER)
-        } else {
-            ffi::narf_pci_disable(device(), BUS_MASTER)
-        }
-    };
-    if rc != 0 {
-        return Err("cannot change Wi-Fi bus mastering");
+    if enabled {
+        pci::set_command(cap, device_, BUS_MASTER)
+    } else {
+        pci::clear_command(cap, device_, BUS_MASTER)
+    }
+    .map_err(|_| "cannot change Wi-Fi bus mastering")?;
+    let command = pci::read_command(cap, device_).map_err(|_| "cannot read Wi-Fi PCI")?;
+    if command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+        != MEM_SPACE | INTX_DISABLE | if enabled { BUS_MASTER } else { 0 }
+    {
+        return Err("Wi-Fi PCI command readback failed");
     }
     Ok(())
 }

@@ -931,9 +931,9 @@ KABI:
 It claims the six Sc ids; `narf-drivers-wireless/iwlwifi-module-only` steps
 the built-in claim aside for them. The station's regulatory program reads the
 kernel's domain through a new additive `WIFI` opcode, `GET_REGULATORY`, and
-the transport stops bus mastering through a new additive export,
-`narf_pci_disable`. The module links on x86_64 and aarch64 and every
-undefined symbol is a KABI export.
+the transport parks, stops and verifies bus mastering through
+`narf_pci_command`, with the built-in's read-back checks. The module links on
+x86_64 and aarch64 and every undefined symbol is a KABI export.
 
 `modules/e2e/iwlwifi` loads the real `.ko` and checks relocations and init,
 the exact six-id claim, refusal of a probe with no device context and clean

@@ -2305,9 +2305,6 @@ impl Authority {
         operation: impl FnOnce() -> Result<T, &'static str>,
     ) -> Result<T, &'static str> {
         super::mmio::invoke(&self.cap, || {
-            // A module cannot read PCI config space; the kernel keeps the
-            // command state it set and revokes the token at teardown.
-            #[cfg(feature = "builtin")]
             if self.native {
                 use narf_bus::pci::{
                     self,

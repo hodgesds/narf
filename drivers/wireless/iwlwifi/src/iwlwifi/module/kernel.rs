@@ -297,6 +297,64 @@ pub mod narf_bus {
         pub subsystem_id: u16,
     }
 
+    /// PCI command register access over `narf_pci_command`: clear, then set,
+    /// then the register read back, on the probe token.
+    pub mod pci {
+        use super::super::narf_capabilities::{Cap, Write};
+        use super::{BusDevice, BusDeviceCap};
+
+        mod ffi {
+            unsafe extern "C" {
+                pub fn narf_pci_command(dev: u64, clear: u16, set: u16, out_cmd: *mut u16) -> i32;
+            }
+        }
+
+        /// `PCI_COMMAND` bits.
+        pub mod cmd {
+            pub const MEM_SPACE: u16 = 1 << 1;
+            pub const BUS_MASTER: u16 = 1 << 2;
+            pub const INTX_DISABLE: u16 = 1 << 10;
+        }
+
+        /// A refused or failed command-register access (the KABI errno).
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct PciError(pub i32);
+
+        fn command(clear: u16, set: u16) -> Result<u16, PciError> {
+            let mut value = 0u16;
+            // SAFETY: `value` is a live local.
+            match unsafe {
+                ffi::narf_pci_command(super::super::super::device(), clear, set, &mut value)
+            } {
+                0 => Ok(value),
+                errno => Err(PciError(errno)),
+            }
+        }
+
+        pub fn read_command(
+            _cap: &Cap<BusDeviceCap, Write>,
+            _device: &BusDevice,
+        ) -> Result<u16, PciError> {
+            command(0, 0)
+        }
+
+        pub fn set_command(
+            _cap: &Cap<BusDeviceCap, Write>,
+            _device: &BusDevice,
+            bits: u16,
+        ) -> Result<u16, PciError> {
+            command(0, bits)
+        }
+
+        pub fn clear_command(
+            _cap: &Cap<BusDeviceCap, Write>,
+            _device: &BusDevice,
+            bits: u16,
+        ) -> Result<u16, PciError> {
+            command(bits, 0)
+        }
+    }
+
     /// The probed function, as the driver's owners carry it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct BusDevice {
