@@ -227,16 +227,14 @@ enum DisplayOwner {
 /// retained firmware surface (a Gen12 GOP or Nova's firmware primary) has no
 /// S3 relight owner; Nova's owned route does.
 const fn display_suspend_admitted(display: DisplayOwner, smallbar: bool) -> bool {
-    !matches!(
-        display,
-        DisplayOwner::Firmware(_) | DisplayOwner::NovaLake
-    ) && system_suspend_admitted(
-        smallbar,
-        matches!(
-            display,
-            DisplayOwner::LunarLake | DisplayOwner::PantherLake | DisplayOwner::NovaLakeOwned
-        ),
-    )
+    !matches!(display, DisplayOwner::Firmware(_) | DisplayOwner::NovaLake)
+        && system_suspend_admitted(
+            smallbar,
+            matches!(
+                display,
+                DisplayOwner::LunarLake | DisplayOwner::PantherLake | DisplayOwner::NovaLakeOwned
+            ),
+        )
 }
 
 struct Pending {
@@ -3310,13 +3308,18 @@ impl Owner {
             if let Some(irq) = state.irq.as_ref() {
                 irq.unroute_media();
                 irq.unroute_gsc();
-                irq.unroute_kcr();
             }
-            // GT1 is not running: a PXP job in flight cannot finish, and
-            // the next GT1 start resumes PXP (xe_pxp_pm_suspend/resume).
-            if let Some(owner) = state.pxp.as_mut() {
-                owner.engine.abort(&owner.pxp);
-                owner.pxp.suspend();
+            // GT1 left Running (a poll may also be pending while it runs): a
+            // PXP job in flight cannot finish, and the next GT1 start
+            // resumes PXP (xe_pxp_pm_suspend/resume).
+            if guc.state() != MediaGucState::Running {
+                if let Some(irq) = state.irq.as_ref() {
+                    irq.unroute_kcr();
+                }
+                if let Some(owner) = state.pxp.as_mut() {
+                    owner.engine.abort(&owner.pxp);
+                    owner.pxp.suspend();
+                }
             }
         } else if let Some(publication) = guc.publication() {
             // Every engine executed and retired its private PPGTT job.
@@ -3582,13 +3585,9 @@ impl Owner {
             .publish(pxp::readiness(gsc.status().error(), huc_error, &media));
         // New PXP work waits while the GSC worker runs; work in flight goes on.
         let begin = gsc.idle();
-        let _ = owner.engine.poll(
-            &owner.pxp,
-            now,
-            &mut PxpQueue::new(guc, now),
-            &media,
-            begin,
-        );
+        let _ = owner
+            .engine
+            .poll(&owner.pxp, now, &mut PxpQueue::new(guc, now), &media, begin);
     }
 
     /// xe_pxp_pm_suspend before GT1 stops: the worker's PXP job finishes
@@ -3597,9 +3596,7 @@ impl Owner {
     /// while a job still runs.
     fn suspend_pxp(&self, state: &mut State, now: u64, wait: bool) -> bool {
         use crate::intel_gpu_gt::media::{MediaGucState, MediaWindow, PxpQueue};
-        let State {
-            pxp, media_guc, ..
-        } = state;
+        let State { pxp, media_guc, .. } = state;
         let Some(owner) = pxp.as_mut() else {
             return true;
         };
