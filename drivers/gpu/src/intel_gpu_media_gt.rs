@@ -1851,6 +1851,11 @@ where
 #[path = "intel_gpu_gsc.rs"]
 pub(crate) mod gsc;
 
+/// Xe PXP (protected content) over this media GT's GSC, KCR and VCS, with
+/// `narf.intel.pxp=1` beside the GSC option.
+#[path = "intel_gpu_pxp.rs"]
+pub(crate) mod pxp;
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_media_gt_tests.rs"]
 mod tests;
