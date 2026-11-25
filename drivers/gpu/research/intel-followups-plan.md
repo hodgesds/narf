@@ -98,8 +98,9 @@ did.
     - Local memory: nonvisible allocation beyond BMG headless,
       eviction/migration, alias revocation, VRAM PRIME/P2P.
     - Engine scheduling: further queue protocols. Protected queues
-      need PXP and so the MEI proxy.
-    - Media GT: PXP behind the (landed) MEI GSC proxy client.
+      run with `narf.intel.pxp=1`.
+    - Media GT: PXP silicon acceptance (PXP itself is behind
+      `narf.intel.pxp=1`).
     - Diagnostics: steered manual capture, coredump process/time facts.
     - Atomic display: what lane 7 leaves, plus tiling/compression beyond
       X/Tile4 and additional planes.
@@ -156,7 +157,11 @@ Still open, each needing its own grounding first:
   external outputs (`narf.intel.nvl_modeset=1`): UHBR and Thunderbolt alt
   mode on the LT PHY, Nova fixtures for MST and DSC over LT ports (they
   run the same LT-dispatched route), and the DMC/DC states.
-- PXP and HDCP. The MEI GSC proxy client they sit behind is in
+- PXP silicon acceptance. Xe PXP on MTL/Arrow runs behind
+  `narf.intel.pxp=1` (spec "MTL/Arrow PXP behind narf.intel.pxp=1") with
+  native fixtures only; protected-plane decryption is refused, and the
+  RUN_ALONE LRC bit and the runtime wiring have no native model.
+- HDCP. The MEI GSC proxy client it sits behind, as PXP does, is in
   `drivers/platform/src/mei_gsc_proxy.rs` and joins the media GT's GSC
   worker through `narf_drivers::gsc_proxy`.
 - D3cold through `_PR3` power resources (NARF evaluates no AML).

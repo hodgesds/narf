@@ -4136,8 +4136,8 @@ a late poll that finds the condition met progresses instead of timing out.
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE/VIDEO (VCS/VECS) lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
-| Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification. Multi-lane parallel queues (width > 1) supported for Copy, VCS, VECS, and Compute engines (classes 1..=4). Protected queues stay unadvertised: PXP_TYPE, the PXP status query and BO PXP_TYPE now refuse with Linux's no-PXP errnos (HWDRM ENODEV, NONE accepted); PXP needs the GSC proxy's MEI/CSME client, which NARF lacks. GSCCS0 is now a kernel-only (reserved) engine of the MTL/Arrow media GuC under both media and GSC options, never queryable or placeable |
-| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503, GSCCS0 is scheduled beside VCS/VECS, the GSC private object lives in a device-lifetime stolen claim behind a fixed GGTT DM window, and the runtime runs the GSC worker: firmware load, compatibility query and HuC authentication via the GSC, then proxy start fails with ENODEV (LOAD_FAIL) exactly as Linux without the MEI proxy; a `CsmeProxy` registration hook is ready. Media-GT OAM Unit 1 streams with MPEC formats and VCS/VECS exec queues, and GT1 frequency/idle sysfs (`gt1/` and `tile0/gt1/{freq0,gtidle}/` with live `MTL_MEDIA_MC6` residency and `MTL_MIRROR_TARGET_WP1` CAGF readout) implemented with native fixtures. The MEI GSC proxy client, PXP and silicon acceptance remain |
+| Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification. Multi-lane parallel queues (width > 1) supported for Copy, VCS, VECS, and Compute engines (classes 1..=4). Protected queues: without `narf.intel.pxp=1` PXP_TYPE, the PXP status query and BO PXP_TYPE refuse with Linux's no-PXP errnos (HWDRM ENODEV, NONE accepted); with it, MTL/Arrow HWDRM queues, objects, CHECK_PXP binds and the status query follow Linux's enabled-PXP paths (see "MTL/Arrow PXP behind narf.intel.pxp=1"), with native fixtures only. GSCCS0 is now a kernel-only (reserved) engine of the MTL/Arrow media GuC under both media and GSC options, never queryable or placeable |
+| Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503, GSCCS0 is scheduled beside VCS/VECS, the GSC private object lives in a device-lifetime stolen claim behind a fixed GGTT DM window, and the runtime runs the GSC worker: firmware load, compatibility query and HuC authentication via the GSC, then proxy start fails with ENODEV (LOAD_FAIL) exactly as Linux without the MEI proxy; a `CsmeProxy` registration hook is ready. Media-GT OAM Unit 1 streams with MPEC formats and VCS/VECS exec queues, and GT1 frequency/idle sysfs (`gt1/` and `tile0/gt1/{freq0,gtidle}/` with live `MTL_MEDIA_MC6` residency and `MTL_MIRROR_TARGET_WP1` CAGF readout) implemented with native fixtures. The MEI GSC proxy client is in drivers/platform; with `narf.intel.pxp=1` GT1 also runs Xe PXP (KCR, the ARB session through the GSC, terminations on IRQ, GT1 stop and resume) with native fixtures. Silicon acceptance remains |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; opt-in (`narf.intel.devcoredump=1`) GuC error-capture lists, STATE_CAPTURE extraction/matching, the manual timeout fallback and the version-4 coredump text (header, exec-queue policy, job batch addresses, HW-engine registers) implemented with native fixtures; OA mmap (read-only private PFN mapping with VM_DONTCOPY/VM_DONTEXPAND semantics in the syscall layer), `metrics/<uuid>/id`, `dev.xe.observation_paranoid` and i915 GETPARAM 57 implemented; legacy i915 perf UAPI compatibility (PERF_OPEN, ADD_CONFIG, REMOVE_CONFIG, stream ioctls ENABLE/DISABLE/CONFIG, sample header prepending, query item 3 DRM_I915_QUERY_PERF_CONFIG, GETPARAM 54 PERF_REVISION) implemented with native fixtures; OA syncs (`DRM_XE_OA_CAPS_SYNCS`, in-fence waiting, out-fence and user-fence release on stream open and CONFIG), media-GT OAM UAPI coverage with synthetic independent GT owners (MPEC formats 8/9, VCS/VECS mapping, concurrent stream permits), and parallel queue creation across Copy, Compute, and Video engines (classes 1..=4) implemented with native fixtures; OAR/OAC exec-queue streams with per-context OAR/OAC programming at enable/disable retiring on the bound queue through the trusted-submit-on-user-context entry point, RING_CONTEXT_CONTROL reaching the queue's saved state, implemented with native fixtures; steered manual capture, and coredump process/time facts remain |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); display-14 6 bpc pipes landed (EDID bpc and VBT `edp.bpp` limits, 18 bpp before DSC, dithered `PIPE_MISC`, BPC_6 and the 6 bpc MSA on Pipe A and Pipes B-D); ADL-P/N write display 13's `TRANS_VBLANK`; the display-14 pipe-scaler panel fitter (`XeLpgModeset::with_panel_fit`, aspect/center/fullscreen scaling, filter selection, `PIPE_SRCSZ`, `SKL_PS_*`, sized framebuffer validation) and bigjoiner master/slave programming (`XeLpgModeset::with_bigjoiner`, `ICL_PIPE_DSS_CTL1` master/secondary joiner enable, watermark scaler prefill lines) wired with native fixtures; VRR foundation landed (#1768): honest sink capability (DPCD Ignore-MSA + EDID range spread > 10 Hz, VBT vrr gate for eDP, per-connector vrr_capable published instead of the hardcoded Some(true)), vrr_enabled in atomic CrtcState forcing a full modeset on toggle (Intel only), and per-modeset VRR timing recompute from the committed mode + sink range (Linux vmin-from-max_vfreq / flipline semantics, vmin>=vmax / interlace / joiner bails, late guardband phase + Gen12 pipeline_full). VRR readback landed (#1772): GOP-left state decoded into VRR_STATE at install/modeset setup, fixed-RR TGs disabled (CMRR exempt), reconciled enable surfaced to the atomic Card::vrr_enabled slot. VRR sequencing landed (#1769): VRR timings programmed in the Gen12 and Xe-LPG (non-Xe3) modesets from the committed mode + stored sink range (`intel_vrr_set_transcoder_timings` during transcoder configuration), TG enabled after the transcoder (`intel_vrr_enable`), VRR disabled before the transcoder stop (`intel_vrr_disable`, timed 1000 ms wait surfacing `TimedOut`, `TRANS_VRR_VSYNC` cleared on AS-SDP displays), push writes `TRANS_PUSH_EN | TRANS_PUSH_SEND` with an `is_push_sent` readback, `on_plane_flip` takes the CRTC from the owning display instead of hardcoding 1, and `request_vrr_enabled` returns hardware failures instead of swallowing them (the request stays retained in `VRR_STATE` for the next modeset when the controller is not up or no timings are stored).. CMRR landed (#1771): `is_cmrr_frac_required` tolerance check (0.10 Hz, Linux `intel_vrr.c`) + eDP auto-enable in the per-modeset compute with the built-in-panel modeset wired in (no sink range required — eDP discovery publishes none yet), `CmrrTimings::compute` reconciled with Linux `cmrr_get_vtotal` (derived vtotal, /1001 video multipliers resolving Linux's open TODO), and CMRR stays sysfs-only for manual control (no DRM-visible control — Linux has no CMRR property) DPCD+PSR landed (#1770): DPCD MSA-ignore programming (`DP_DOWNSPREAD_CTRL` 0x107 bit 7, read-modify-write preserving SSC, sink-advertised + not fixed-RR, synced on VRR/CMRR toggle and every Pipe-A modeset) and PSR×VRR mutual exclusion (PSR refused while the VRR TG runs variable-rate, fixed-RR TG relaxation via CMRR, re-evaluated at every latch since the refusal is not latched, SCL floor 1 with the VRR TG per wa_14015401596 with the guardband computed against it) || Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz; YCbCr 4:2:0 on display 14/20) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); PSR2 with selective fetch on that panel implemented (§20), driven by FB_DAMAGE_CLIPS and DIRTYFB damage and falling back to PSR1 with a typed reason; 6 bpc eDP and DP outputs and `DP_LINK_RATE_SET` training of display-14 eDP rate-table panels implemented with native fixtures (§20); the MTL/Arrow panel's full crtc disable and enable (PPS, DDI, PLL) and Linux's link-training fallback ladder on the panel implemented with native fixtures (§20); DP-alt pin D, native/legacy board reversal, live TBT DP-IN display routing and display-14 MST now have native implementations (USB-C display checkpoint below); HDMI FRL, UHBR, a second independent concurrent external route and Panel Replay remain open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
@@ -7389,9 +7389,11 @@ The worker is not wired into the runtime. Three pieces are missing:
 Until all three exist, NARF hands no memory to the GSC and submits nothing to
 GSCCS.
 
-PXP stays refused with Linux's errnos. Linux supports PXP only with
-CONFIG_INTEL_MEI_GSC_PROXY (xe_pxp_is_supported); without it xe->pxp is NULL,
-and NARF now matches that case on every native Xe device:
+Without `narf.intel.pxp=1` PXP stays refused with Linux's errnos. Linux
+supports PXP only with CONFIG_INTEL_MEI_GSC_PROXY (xe_pxp_is_supported);
+without it xe->pxp is NULL, and NARF matches that case on every native Xe
+device without the option (with it, see "MTL/Arrow PXP behind
+narf.intel.pxp=1" below):
 - DRM_XE_DEVICE_QUERY_PXP_STATUS negotiates sizeof(drm_xe_query_pxp_status)
   (8). Any other nonzero size is EINVAL, and the exact size is ENODEV with
   nothing copied out.
@@ -7425,15 +7427,17 @@ drivers/misc/mei/gsc_proxy/mei_gsc_proxy.c, `i915_gsc_proxy_component_ops`):
   `recv(buf, 32 KiB)` (mei_cldev_recv) that return bytes or a negative errno.
 That client now exists (`drivers/platform/src/mei_gsc_proxy.rs` over
 `mei.rs`'s client message layer) and registers with `narf_drivers::gsc_proxy`,
-which the worker's `CsmeProxy` binds; PXP above it remains refused.
+which the worker's `CsmeProxy` binds; PXP above it runs only with
+`narf.intel.pxp=1`.
 
-Threat assumptions. While PXP is refused, NARF writes no KCR register, starts
-no session, creates no protected object or queue and offers no key to
-invalidate. The GSC firmware is trusted, hardware-authenticated code: NARF
-checks only the image layout and the compatibility major. The private object
-it receives is GSC-owned until an FLR. The proxy relays opaque GSC/CSME
-messages and checks only their headers and sizes. HuC authentication through
-the GSC exercises the PXP firmware client but starts no PXP session.
+Threat assumptions. Without `narf.intel.pxp=1`, NARF writes no KCR register,
+starts no session, creates no protected object or queue and offers no key to
+invalidate (the PXP section below states what changes with it). The GSC
+firmware is trusted, hardware-authenticated code: NARF checks only the image
+layout and the compatibility major. The private object it receives is
+GSC-owned until an FLR. The proxy relays opaque GSC/CSME messages and checks
+only their headers and sizes. HuC authentication through the GSC exercises
+the PXP firmware client but starts no PXP session.
 
 Fixtures (`drivers/gpu/intel_gpu_media_gt`), all new and unexecuted in this
 slice:
@@ -7568,8 +7572,8 @@ Fixtures, all under `drivers/gpu/intel_gpu_media_gt`:
   reset, D3hot re-classification, D3cold reload with a model CSME component,
   and an interrupted load.
 These fixtures are native models only: none has been run on physical Intel
-hardware. Still open are PXP, GSC ER-timeout recovery beyond wedging, and
-silicon acceptance.
+hardware. Still open are GSC ER-timeout recovery beyond wedging and silicon
+acceptance; PXP above the GSC is the next section.
 
 Integration: S2 was written before the media-GT power unit and was never run
 before integration. Its targeted run found two production bugs and one
@@ -7615,6 +7619,159 @@ uncached BAR2 writes in one GT-worker poll. It happens once at load, off
 any present path. With `media_gt=1` and `gsc=0`, the 0/~0 GSC interrupt pair
 is not written, per the options-off rule. The MEI↔GSC proxy join waits for
 the MEI unit.
+
+### MTL/Arrow PXP behind narf.intel.pxp=1
+
+`narf.intel.pxp=1` is a new strict default-off option with the shared
+pre-`--` grammar. It is admitted only with `narf.intel.media_gt=1` and
+`narf.intel.gsc=1`. Without it nothing below runs: no KCR register, KCR
+interrupt route or GSC client object is touched, and every uAPI refusal of
+the previous section stays as
+`smoke_xe_pxp_type_query_and_bo_refuse_with_linux_errnos` pins it. `intel_gpu_gt::media::pxp` ports Linux 7.4-rc4 xe_pxp.c and
+xe_pxp_submit.c.
+
+Init and resources (xe_pxp_init). Once per device, on the first GT1 that
+runs with GSCCS0 scheduled, PXP starts when the GSC firmware is loadable, a
+HuC is staged on the media GuC (below media 35 PXP needs the HuC, so
+`narf.intel.huc=1` is in effect required) and GT1 has a VCS. Otherwise it
+logs the unsatisfied dependency and `xe->pxp` stays NULL (ENODEV, as Linux's
+"Skipping PXP due to unsatisfied FW deps"). Init writes KCR_INIT's masked
+ALLOW_DISPLAY_ME_WRITES enable (0x40004000), allocates the GSC client object
+(three private system pages: batch, msg_in, msg_out) and a random host
+session handle with bits 56..63 clear. A failed allocation disables KCR
+again; Linux then fails the probe, NARF leaves PXP disabled. The status
+starts at NEEDS_TERMINATION with key instance 1.
+
+Submissions. The media GuC gains xe_pxp's two kernel queues, one job at a
+time:
+- GSCCS0 runs the client's GSC_HECI_CMD_PKT batch from its own private PPGTT
+  (pxp_pkt_submit on gsc_res.q), started by __emit_job_gen12_simple as
+  ring_ops_gen12_gsc does. The object sits at PPGTT 0x100000 (Linux: 0,
+  which NARF's PPGTT builder keeps unmapped); the packet names msg_in and
+  msg_out at +4 KiB and +8 KiB.
+- GT1's first VCS runs xe_pxp_submit_session_termination's stream (MFX_WAIT,
+  PXP off, MI_SET_APPID, PXP on with the PPHWSP 0x100 scratch store,
+  CRYPTO_KEY_EXCHANGE, MFX_WAIT) inline in a kernel context's ring; Linux
+  runs it as a GGTT batch. Both are privileged. Only that exact stream of one
+  session is admitted.
+gsccs_send_message writes the GSC header (HECI_MEADDRESS_PXP 17, the host
+session handle) and message, poisons the reply header, waits HZ for the job
+(ETIME), retries 40 times 50 ms apart while the GSC replies pending (handing
+its message handle back; EAGAIN after the last), checks the reply header
+(xe_gsc_read_out_header) and poisons msg_in again. Only the reply's status is
+read; a nonzero one is EIO.
+
+State machine. The status, the activation and termination completions, the
+key instance and the queue list follow xe_pxp.c. pxp_start runs in the
+ioctl: readiness (EBUSY while not ready), then the wait_for_idle loop with
+its 500 ms termination and 300 ms activation bounds (ETIMEDOUT; FsError has
+no ETIMEDOUT, so the ioctl sees ETIME). The hardware half runs in the GT
+runtime worker, the only owner of the media GuC's queues: the ioctl posts the
+start or termination it owes and waits for its outcome, which carries the
+Linux errno back.
+- __pxp_start_arb_session: KCR_SIP bit 15 already set is EEXIST; PXP 4.3
+  INIT_SESSION (api 0x00040003, command 0x36, stream_id APPID(0xf) | VALID,
+  buffer_len 60, protection mode ARB); then KCR_SIP bit 15 within 250 us
+  (ETIMEDOUT). ACTIVE on success, ERROR otherwise.
+- pxp_terminate_hw: the VCS termination (HZ, ETIMEDOUT), KCR_SIP bit 15
+  clear within 250 us, KCR_GLOBAL_TERMINATE = 1, then INVALIDATE_STREAM_KEY
+  (command 7, stream_id SESSION_VALID | SESSION_ID(0xf), buffer_len 12). A
+  failure is ERROR with the termination complete; success waits for
+  KCR_PXP_STATE_RESET_COMPLETE.
+- The tile IRQ owner routes CRYPTO_RSVD_INTR_ENABLE = 0xe << 16 and
+  CRYPTO_RSVD_INTR_MASK = ~(0xe << 16), decodes the bank-0 GEN11_KCR (19)
+  identity as class OTHER, OTHER_KCR_INSTANCE (4), and resets both as
+  gt_irq_reset does. KCR_PXP_STATE_TERMINATED and
+  KCR_APP_TERMINATED_PER_FW_REQ run pxp_terminate (the key instance moves on
+  if a session was active, every PXP queue is killed, the hardware
+  terminates); RESET_COMPLETE runs pxp_terminate_complete. A request while
+  one runs needs an additional termination; a completion that arrives with a
+  request is dropped. Without the KCR route terminations never complete and a
+  start that needs one is ETIMEDOUT.
+- Readiness (xe_pxp_get_readiness_status) is the worker's observation of a
+  running GT1: EIO for a GSC or HuC firmware error state, 1 once
+  HECI1_FWSTS5 HUC_AUTH_DONE and HECI1_FWSTS1 PROXY_STATE_NORMAL are both
+  set, else 0. Lost MMIO reads as not done. A stopped GT1 reports 0.
+
+GT1 stop and start. Every GT1 stop (GT0 reset or recovery, runtime park,
+system suspend, fault cleanup, a media GuC that leaves Running) first runs
+xe_pxp_pm_suspend: a PXP job in flight finishes (each step is bounded) or,
+when the stop cannot wait or GT1 already left Running, fails as its job
+would. An ACTIVE session (or a used NEEDS_TERMINATION) moves the key on,
+kills every PXP queue and marks a termination for resume; the status becomes
+SUSPENDED and readiness 0. A start an ioctl posted but the worker never began
+is abandoned (its waiter sees EIO). Pending KCR causes are dropped, and a
+termination still awaiting its KCR completion counts as complete: GT1's
+GRDOM_FULL ends it and resume always leaves NEEDS_TERMINATION. The next GT1
+start runs xe_pxp_pm_resume once the GSC worker is idle: KCR enabled again,
+NEEDS_TERMINATION, and the deferred termination as the ON_RESUME events work.
+Linux runs the suspend only for system and runtime suspend; NARF also runs it
+for a media GT reset, which loses the KCR state the same way.
+
+uAPI with `xe->pxp` published:
+- DRM_XE_DEVICE_QUERY_PXP_STATUS: size 0 negotiates 8, another size is
+  EINVAL, the exact size returns status 0/1 with supported_session_types
+  BIT(DRM_XE_PXP_TYPE_HWDRM), or EIO. The async path holds a runtime-PM
+  reference over it, as Linux's guard does.
+- EXEC_QUEUE_CREATE with PXP_TYPE HWDRM (a later NONE keeps it) runs
+  xe_pxp_exec_queue_add under a runtime-PM reference: pxp_start, then
+  __exec_queue_add, which retries while PXP is not ACTIVE. Errors keep their
+  errno (EBUSY, EIO, EEXIST, ETIME, EAGAIN as EWOULDBLOCK). The queue then
+  holds that reference on the PXP list, so the function never runtime
+  suspends under it; destroy takes it off. Native Xe files now take
+  EXEC_QUEUE_CREATE through the async dispatch; the synchronous path answers
+  a start still running as EBUSY. RCS/CCS PXP queues get CTX_CTRL_RUN_ALONE
+  in every LRC (XE_LRC_CREATE_RUNALONE, graphics below 20); a parallel
+  compute PXP queue, impossible with MTL's single CCS, is EOPNOTSUPP.
+- GEM_CREATE's SET_PROPERTY HWDRM marks the object with the current key
+  instance (xe_pxp_key_assign).
+- VM_BIND MAP with DRM_XE_VM_BIND_FLAG_CHECK_PXP of a protected object whose
+  key is stale, and EXEC on a PXP queue whose VM maps such an object
+  (xe_vm_validate_protected), are Linux's ENOEXEC, which FsError cannot
+  carry: NARF answers EINVAL. UNMAP and UNMAP_ALL are never checked.
+- A killed queue is ECANCELED on EXEC, as Linux's reset_status reports.
+- A protected object is refused as a framebuffer (drm/card.rs): NARF programs
+  no plane decryption. Linux decrypts a current one and shows black for a
+  stale one.
+
+Threat assumptions with the option:
+- Key material never reaches NARF. The GSC firmware and KCR hold every
+  session key; the driver sees only the key-instance counter, the session
+  state and the host session handle, an identifier that is random and never
+  logged. Logs name dependencies and errnos only.
+- The GSC firmware is trusted, hardware-authenticated code. NARF checks only
+  the reply header and the status word; it interprets no other reply byte.
+- Failures fail closed: any failed start or termination is ERROR, and every
+  later PXP request is EIO until the next GT1 stop and start clears it (as
+  Linux's suspend may clear it).
+- Killing a PXP queue closes its admission but does not preempt a job
+  already running; the invalidated key makes such a job's output useless.
+  Linux also cancels the GuC context.
+- Key checks race with terminations by design, as Linux notes: one
+  submission or bind may pass just before a termination.
+- A protected object's pages hold ciphertext; CPU mmap and binds without
+  CHECK_PXP stay allowed, as in Linux.
+- The CSME proxy relays opaque GSC/CSME messages, as before.
+
+Fixtures, all new and unexecuted in this slice:
+- `drivers/gpu/intel_gpu_pxp` (a GSC firmware and KCR model):
+  `smoke_pxp_option_grammar_and_linux_formats`,
+  `smoke_pxp_arb_session_start_sends_the_linux_init_session_packet`,
+  `smoke_pxp_terminates_on_suspend_and_resume`,
+  `smoke_pxp_key_check_refuses_a_stale_object_after_termination`,
+  `smoke_pxp_start_failures_keep_linux_errnos` and
+  `smoke_pxp_stop_quiesces_or_aborts_hardware_work`.
+- `drivers/gpu/intel_gpu_media_gt`:
+  `smoke_mtl_media_gt_kcr_irq_enables_decodes_and_resets` (the IRQ model),
+  `smoke_media_gt_pxp_jobs_run_on_gsccs_ppgtt_and_the_first_vcs` (the media
+  GuC model) and `smoke_xe_pxp_enabled_queues_objects_and_stale_key_checks`
+  (native Xe with a published `xe->pxp`).
+The packet bytes, termination words, register values and errnos are the
+Linux ABI's, never recorded from this implementation. Nothing here has run
+on physical Intel hardware. Not covered natively: the RUN_ALONE bit in a
+submitted LRC, the runtime's init/suspend/resume wiring (no runtime model),
+and the real GSC firmware's acceptance of NARF's PPGTT address and inline
+VCS termination.
 
 ### Xe OA streams on the main-GT OAG unit — native fixtures added
 
