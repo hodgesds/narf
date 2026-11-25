@@ -791,7 +791,7 @@ fn smoke_uhbr_lttpr_non_transparent_init_and_wake_timeout() -> TestResult {
         ]
         || init.count != 0
         || !init.transparent()
-        || log.borrow().iter().any(|e| *e == Ev::Read(0xf_0020, 3))
+        || log.borrow().contains(&Ev::Read(0xf_0020, 3))
     {
         return TestResult::Fail("a refused non-transparent mode must roll back to transparent");
     }

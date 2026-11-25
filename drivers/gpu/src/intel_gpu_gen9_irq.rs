@@ -1121,10 +1121,9 @@ pub(crate) fn install(
         inner: narf_lib::sync::IrqSafeSpinLock::new((window, Gen9IrqCore::new(platform.is_lp()))),
     });
     if route.program(vector).is_err() {
+        // Uncertain PCI delivery (the disable did not take) keeps its vector.
         if route.disable() {
             let _ = narf_interrupts::vector::free(vector);
-        } else {
-            core::mem::forget(route);
         }
         return false;
     }

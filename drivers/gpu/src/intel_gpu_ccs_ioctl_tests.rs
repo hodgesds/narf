@@ -73,7 +73,6 @@ fn frame(mode: &ModeState, modifier: u64) -> Option<Result<u32, ()>> {
         } else {
             [modifier, 0, 0, 0]
         },
-        ..Default::default()
     };
     Some(
         mode.lock()

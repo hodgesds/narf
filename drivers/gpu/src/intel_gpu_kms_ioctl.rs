@@ -949,9 +949,8 @@ impl Plan {
                 };
                 if target.modifier == X_TILED_MODIFIER {
                     view.layout = Layout::X;
-                } else if target.modifier == TILE4_MODIFIER {
-                    view.layout = Layout::Tile4;
-                } else if compressed.is_some() {
+                } else if target.modifier == TILE4_MODIFIER || compressed.is_some() {
+                    // A compressed modifier is Tile4 with its CCS planes.
                     view.layout = Layout::Tile4;
                 }
                 view.ccs = compressed;
