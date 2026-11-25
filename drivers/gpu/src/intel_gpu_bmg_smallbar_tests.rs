@@ -673,10 +673,9 @@ fn smoke_bmg_smallbar_cpu_export_alias_and_profile_refusals() -> TestResult {
     assert_eq!(object.write(0, &[1]), Err(FsError::Unsupported));
     assert_eq!(object.backing(0, 4096).err(), Some(FsError::Unsupported));
     assert_eq!(file.gem.mmap_offset(handle), Err(FsError::Unsupported));
-    assert_eq!(
-        file.gem.export_object(handle).err(),
-        Some(FsError::NotImplemented)
-    );
+    // xe_gem_prime_export admits a VRAM object; attachments decide
+    // peer-to-peer or migration (intel_gpu_prime).
+    assert!(Arc::ptr_eq(&file.gem.export_object(handle).unwrap(), &object));
     let mut wire = [0; 40];
     put32(&mut wire, 8, handle);
     user.wire.store(64, &wire);

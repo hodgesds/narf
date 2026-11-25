@@ -1537,6 +1537,25 @@ impl narf_filesystem::mmap_relocation::DeviceFrameRefault for VramRefault {
 static PENDING: IrqSafeSpinLock<Vec<Pending>> = IrqSafeSpinLock::new(Vec::new());
 static OWNERS: IrqSafeSpinLock<Vec<Arc<Owner>>> = IrqSafeSpinLock::new(Vec::new());
 
+/// The PCI function behind DRM card `card`, when a GT owner (started or
+/// still pending) holds it: the provider or client of a cross-device dma-buf
+/// attachment's P2P distance (`crate::intel_gpu_prime`).
+pub(crate) fn pci_function(card: u32) -> Option<BusDevice> {
+    if let Some(device) = OWNERS
+        .lock()
+        .iter()
+        .find(|owner| owner.pending.index == card)
+        .map(|owner| owner.pending.device)
+    {
+        return Some(device);
+    }
+    PENDING
+        .lock()
+        .iter()
+        .find(|pending| pending.index == card)
+        .map(|pending| pending.device)
+}
+
 /// Probe installs only identity and authority. Late spawns survive executor
 /// startup; firmware scanning completes before these tasks start polling.
 pub(crate) fn install(

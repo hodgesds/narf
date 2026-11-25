@@ -952,6 +952,11 @@ impl XeFile {
         // before any clear is submitted.
         extensions?;
         mark(&pending.object());
+        // No system region: xe_bo_can_migrate(bo, XE_PL_TT) is false, which
+        // decides a non-P2P dma-buf attachment (crate::intel_gpu_prime).
+        if placement & 1 == 0 {
+            pending.object().mark_vram_only();
+        }
         let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
         let epoch = backend
             .status()
@@ -1071,6 +1076,15 @@ impl XeFile {
             {
                 ensure_system_ccs(info, object).await?;
             }
+        }
+        // A foreign dma-buf import is validated (its attachment mapped and
+        // pinned) before its first PTE, as xe_bo_validate maps an sg BO.
+        for object in binds
+            .iter()
+            .filter_map(|bind| bind.mapping.as_ref()?.object.as_ref())
+            .filter(|object| object.is_imported())
+        {
+            crate::intel_gpu_prime::ensure_mapped(object).await?;
         }
         let _order = match &queue {
             Some(queue) => Some(queue.context.serial.lock().await),

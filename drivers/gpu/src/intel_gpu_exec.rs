@@ -74,6 +74,9 @@ impl ExecRequest {
             entry.object.is_vram()
                 || entry.object.is_wc()
                 || entry.object.vm_owner().is_some()
+                // A foreign dma-buf is bound only through native Xe VM_BIND,
+                // which maps its attachment first.
+                || entry.object.is_imported()
                 || (asynchronous && entry.object.is_userptr())
         }) {
             return Err(FsError::InvalidData);
@@ -513,7 +516,11 @@ impl ExecRequest {
             // PAT for every leaf. Shared Xe handles retain explicit native
             // cache placement and optional VM ownership; passing a handle
             // through softpin cannot grant a different VM or cache policy.
-            if entry.object.is_vram() || entry.object.is_wc() || entry.object.vm_owner().is_some() {
+            if entry.object.is_vram()
+                || entry.object.is_wc()
+                || entry.object.vm_owner().is_some()
+                || entry.object.is_imported()
+            {
                 return Err(FsError::InvalidData);
             }
             space.objects.push((entry.object.clone(), entry.writable));

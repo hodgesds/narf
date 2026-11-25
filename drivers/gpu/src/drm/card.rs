@@ -2838,7 +2838,9 @@ impl Card {
         }
         // On integrated GPUs VRAM pages have no display-DMA backing here;
         // discrete Arc display (`intel_vram_scanout`) scans directly from VRAM.
-        if object.is_vram() && !self.intel_vram_scanout {
+        // A foreign dma-buf import (another card's memory or BAR) is not
+        // scanned out here.
+        if (object.is_vram() && !self.intel_vram_scanout) || object.is_imported() {
             return Err(CardError::InvalidDimensions);
         }
         if xe && !xr30 && !object.scanout() {

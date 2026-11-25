@@ -217,10 +217,9 @@ fn smoke_dg2_vram_create_requires_actual_ccs_clear_before_handle_and_reuse() -> 
                 rig.gt.user_epoch().unwrap()
             )
             .is_err());
-        assert_eq!(
-            file.gem.export_object(handle).err(),
-            Some(FsError::NotImplemented)
-        );
+        // xe_gem_prime_export admits a VRAM object; attachments decide
+        // peer-to-peer or migration (intel_gpu_prime).
+        assert!(Arc::ptr_eq(&file.gem.export_object(handle).unwrap(), &object));
         object.write(0, &[0xa5; 16]).unwrap();
         drop(object);
         assert_eq!(

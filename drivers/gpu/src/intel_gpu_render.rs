@@ -4153,8 +4153,10 @@ pub(crate) mod tests {
             {
                 return Err("PRIME import replaced another handle or copied identity");
             }
+            // Another card attaches only as a registered native Xe card
+            // (intel_gpu_prime::import_foreign); an unregistered one refuses.
             if crate::drm_devfs_bridge::intel_prime_import(3, &importer, &prime) != Ok(imported)
-                || crate::drm_devfs_bridge::intel_prime_import(4, &importer, &prime)
+                || crate::drm_devfs_bridge::intel_prime_import(u32::MAX, &importer, &prime)
                     != Err(FsError::InvalidData)
             {
                 return Err("PRIME reimport identity or cross-card admission");
