@@ -135,7 +135,8 @@ fn domain_rig(
     dev: &DmaDevice,
 ) -> Result<(Vec<u32>, Hardware, usize), &'static str> {
     let addr = narf_bus::PcieAddr::new(0, bdf.0, bdf.1, bdf.2);
-    let (words, hw) = super::rig_with(dev, addr).map_err(|_| "rig allocation")?;
+    // CONNAC2 fixture: PCI id 0x0616 with the 1 MiB probe BAR.
+    let (words, hw) = super::rig_with(dev, addr, 0x0616, 0x100000).map_err(|_| "rig allocation")?;
     Ok((words, hw, 6 * (1 + DEPTH)))
 }
 

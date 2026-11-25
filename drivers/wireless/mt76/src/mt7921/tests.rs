@@ -242,12 +242,15 @@ kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_l1_remap_high_window);
 
 /// MT7925 (CONNAC3) `l1_remap` selects the per-chip fixed table: the
 /// new windows resolve, the shrunk PCIe MAC window rejects its old
-/// tail, and the shared identity/ownership windows agree with CONNAC2.
+/// tail, and the shared ownership window agrees with CONNAC2. The
+/// identity register routes through the per-chip L1 window instead:
+/// 0x130200 on MT7925 (selector 0x155024, slab 0x130000) vs 0x40200
+/// on CONNAC2.
 fn smoke_mt7925_l1_remap_connac3_windows() -> TestResult {
     if l1_remap(MTK_DEV_MT7925, 0x830c0000) != 0
         || l1_remap(MTK_DEV_MT7925_ALT, 0x830c0000) != 0
         || l1_remap(MTK_DEV_MT7925, 0x7c500000) != 0x60000
-        || l1_remap(MTK_DEV_MT7925, MT_HW_CHIPID) != 0x40200
+        || l1_remap(MTK_DEV_MT7925, MT_HW_CHIPID) != 0x130200
         || l1_remap(MTK_DEV_MT7925, MT_CONN_ON_LPCTL) != 0xe0010
         || l1_remap(MTK_DEV_MT7925, 0x74031000) != u32::MAX
         || l1_remap(MTK_DEV_MT7922, 0x74031000) != 0x11000
@@ -804,12 +807,18 @@ fn smoke_mt7921_l1_remap_helper() -> TestResult {
     // accessing absolute address 0x7c060010 lands at BAR0 offset
     // MT_HIF_REMAP_BASE_L1 + (addr & MT_HIF_REMAP_L1_MASK)
     //                     = 0x40000 + 0x0010 = 0x40010.
-    let off = l1_remapped_offset(MT_CONN_ON_LPCTL);
+    let off = l1_remapped_offset(MTK_DEV_MT7922, MT_CONN_ON_LPCTL);
     if off & MT_HIF_REMAP_L1_BASE != MT_HIF_REMAP_BASE_L1 {
         return TestResult::Fail("L1 remap base bits wrong");
     }
     if off & MT_HIF_REMAP_L1_MASK != (MT_CONN_ON_LPCTL & MT_HIF_REMAP_L1_MASK) {
         return TestResult::Fail("L1 remap offset bits wrong");
+    }
+    // MT7925 lands the same window at 0x130000 instead.
+    if l1_remapped_offset(MTK_DEV_MT7925, MT_CONN_ON_LPCTL) != 0x130010
+        || l1_remapped_offset(MTK_DEV_MT7925_ALT, MT_CONN_ON_LPCTL) != 0x130010
+    {
+        return TestResult::Fail("MT7925 L1 remap window wrong");
     }
     TestResult::Pass
 }

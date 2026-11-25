@@ -470,3 +470,124 @@ kernel_test_in!(
     "drivers/wireless/mt7921/association",
     mt76_response_rates_reach_peer_records_and_management_rate
 );
+
+fn mt76_uni_station_records_per_link() -> TestResult {
+    use crate::mt7925::mcu::{
+        MldLink, MldLinks, STA_REC_BASIC_TLV_SIZE, STA_REC_STATE_TLV_SIZE, STA_REQ_HDR_SIZE,
+    };
+    let mut plan = JoinPlan::prepare(&bss(false), OWN, b"narf", Security::Open).unwrap();
+    // Pre-association add: BASIC + STATE, tlv_num 2, STATE NONE.
+    let add = plan.peer_record_uni_on(Link::HOME, 0, false, None).unwrap();
+    if add.len() != STA_REQ_HDR_SIZE + STA_REC_BASIC_TLV_SIZE + STA_REC_STATE_TLV_SIZE
+        || u16::from_le_bytes([add[2], add[3]]) != 2
+        || add[16] != 2
+        || add[36] != 0
+    {
+        return TestResult::Fail("UNI pre-association station record wrong");
+    }
+    // Associated add before the AP response is Busy, as for CONNAC2.
+    if plan.peer_record_uni_on(Link::HOME, 42, true, None) != Err(Error::Busy) {
+        return TestResult::Fail("UNI station record associated before AP response");
+    }
+    plan.start_authentication().unwrap();
+    plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
+        .unwrap();
+    if plan.association_response(&reply(0x10, &[1, 0, 0, 0, 42, 0xc0, 1, 2, 0x96, 0x8c]))
+        != Ok(Some(42))
+    {
+        return TestResult::Fail("UNI test association response rejected");
+    }
+    let mld = MldLinks {
+        own_mac: OWN,
+        primary: MldLink {
+            wcid_idx: 1,
+            bss_idx: 0,
+        },
+        secondary: Some(MldLink {
+            wcid_idx: 2,
+            bss_idx: 1,
+        }),
+        eml_cap: 0,
+        emlsr: false,
+    };
+    let assoc = plan
+        .peer_record_uni_on(Link::HOME, 42, true, Some(mld))
+        .unwrap();
+    if assoc.len() != 84 || u16::from_le_bytes([assoc[2], assoc[3]]) != 4 || assoc[36] != 2 {
+        return TestResult::Fail("UNI associated MLD station record wrong");
+    }
+    // Remove: hdr + REMOVE + MLD_OFF, valid from any phase.
+    let remove = plan.sta_remove_uni_on(Link::HOME);
+    if remove.len() != 20 || u16::from_le_bytes([remove[2], remove[3]]) != 2 {
+        return TestResult::Fail("UNI station remove record wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_uni_station_records_per_link
+);
+
+fn mt76_uni_bss_record_per_link() -> TestResult {
+    use crate::mt7925::mcu::{
+        UniBssHe, UniBssMld, UniBssRlm, UniBssSec, BSS_SEC_MODE_OPEN, RLM_BAND_2G, RLM_BW_20,
+        UNI_BSS_UPDATE_BOUND,
+    };
+    let sec = UniBssSec {
+        mode: BSS_SEC_MODE_OPEN,
+        status: 1,
+        cipher: 0,
+    };
+    let mld = UniBssMld {
+        is_mld: false,
+        link_id: 0,
+        primary_bss_idx: 0,
+        own_mac: OWN,
+        eml_enable: false,
+    };
+    // Disconnected (disable) with no HE: no HE/COLOR/RLM/MBSSID,
+    // conn_state 1. Bound minus HE 16, COLOR 8, RLM 16, MBSSID 8.
+    let off = bss_record_uni_on(Link::HOME, &bss(false), false, sec, mld, None, None, 20).unwrap();
+    if off.len() != UNI_BSS_UPDATE_BOUND - 48 || off[4 + 12] != 1 {
+        return TestResult::Fail("UNI BSS record (disable) wrong");
+    }
+    // Connected 2.4 GHz: BASIC phymode 6, non-HT 3, basic rate 0x000f.
+    let rlm = UniBssRlm {
+        control_channel: 6,
+        center_chan: 6,
+        center_chan2: 0,
+        bw: RLM_BW_20,
+        tx_streams: 2,
+        rx_streams: 2,
+        band: RLM_BAND_2G,
+    };
+    let on = bss_record_uni_on(
+        Link::HOME,
+        &bss(false),
+        true,
+        sec,
+        mld,
+        Some(UniBssHe {
+            pe_duration: 4,
+            rts_thres: 1023,
+            max_nss_mcs: [0, 0, 0],
+            color_enabled: false,
+            color: 0,
+        }),
+        Some(rlm),
+        20,
+    )
+    .unwrap();
+    if on.len() != UNI_BSS_UPDATE_BOUND || on[4 + 12] != 0 {
+        return TestResult::Fail("UNI BSS record (enable) wrong");
+    }
+    // BASIC at 4: phymode 6 at +25, nonht 3 at +28..30, link_idx 0.
+    if on[4 + 25] != 6 || u16::from_le_bytes([on[4 + 28], on[4 + 29]]) != 3 {
+        return TestResult::Fail("UNI BSS record 2.4 GHz PHY fields wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/association",
+    mt76_uni_bss_record_per_link
+);

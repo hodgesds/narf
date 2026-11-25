@@ -26,6 +26,19 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
     rig_with(
         &narf_io::DmaDevice::coherent(),
         narf_bus::PcieAddr::new(0, 0, 0, 0),
+        0x0616,
+        0x100000,
+    )
+}
+
+/// [`rig`] for an MT7925 function: PCI id `0x0717` with the real
+/// 2 MiB BAR0 (the 7925 L1 selector at `0x155024` needs it).
+fn rig_7925() -> Result<(Vec<u32>, Hardware), Error> {
+    rig_with(
+        &narf_io::DmaDevice::coherent(),
+        narf_bus::PcieAddr::new(0, 0, 0, 0),
+        0x0717,
+        0x200000,
     )
 }
 
@@ -34,13 +47,15 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
 fn rig_with(
     dma: &narf_io::DmaDevice,
     addr: narf_bus::PcieAddr,
+    did: u16,
+    bar_len: u64,
 ) -> Result<(Vec<u32>, Hardware), Error> {
-    let mut words = vec![0u32; 0x100000 / 4];
+    let mut words = vec![0u32; bar_len as usize / 4];
     let device = BusDevice {
         addr: narf_bus::BusAddr::Pcie(addr),
         id: narf_bus::DeviceId {
             vendor: 0x14c3,
-            device: 0x0616,
+            device: did,
             class: 0x028000,
             subsystem_vendor: 0,
             subsystem_id: 0,
@@ -53,7 +68,7 @@ fn rig_with(
     let mmio = MmioRegion {
         phys: narf_memory::PhysAddr::new(0),
         virt: words.as_mut_ptr() as u64,
-        len: 0x100000,
+        len: bar_len,
         kind: narf_bus::BarKind::Mmio32 {
             prefetchable: false,
         },
@@ -294,6 +309,33 @@ fn mt76_wfsys_reset_uses_real_register_bits_and_preserves_neighbors() -> TestRes
 kernel_test_in!(
     "drivers/wireless/mt7921/recovery",
     mt76_wfsys_reset_uses_real_register_bits_and_preserves_neighbors
+);
+
+/// Same reset sequence on MT7925: the transport asserts/releases the
+/// CONNAC3 register (`0x7c000140`, L1 window `0x130140`), never the
+/// CONNAC2 one. Upstream `mt7925/regs.h:92` at torvalds/linux
+/// 8d7fe9885c62.
+fn mt76_mt7925_wfsys_reset_uses_connac3_register() -> TestResult {
+    let (_words, mut hw) = match rig_7925() {
+        Ok(rig) => rig,
+        Err(_) => return TestResult::Fail("reset register fixture allocation"),
+    };
+    if hw.write(0x7c000140, 0xaabb0001).is_err()
+        || hw.assert_reset().is_err()
+        || hw.read(0x7c000140) != Ok(0xaabb0000)
+        || hw.release_reset().is_err()
+        || hw.read(0x7c000140) != Ok(0xaabb0001)
+        || hw.reset_done() != Ok(false)
+        || hw.write(0x7c000140, 0xaabb0011).is_err()
+        || hw.reset_done() != Ok(true)
+    {
+        return TestResult::Fail("MT7925 WFSYS reset touched the CONNAC2 address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/recovery",
+    mt76_mt7925_wfsys_reset_uses_connac3_register
 );
 
 fn mcu_dma_production_rx_copies_before_rearm_and_checks_lengths() -> TestResult {

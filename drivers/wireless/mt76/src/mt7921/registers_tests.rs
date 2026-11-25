@@ -33,7 +33,7 @@ impl Io for Model {
     fn read(&mut self, offset: u32) -> u32 {
         assert!(u64::from(offset) + 4 <= self.len);
         self.ops.push(Op::Read(offset));
-        if offset == MT_HIF_REMAP_L1 {
+        if offset == MT_HIF_REMAP_L1 || offset == MT7925_HIF_REMAP_L1 {
             self.selector
         } else {
             0x7922
@@ -42,7 +42,7 @@ impl Io for Model {
     fn write(&mut self, offset: u32, value: u32) {
         assert!(u64::from(offset) + 4 <= self.len);
         self.ops.push(Op::Write(offset, value));
-        if offset == MT_HIF_REMAP_L1 && !self.refuse_selector {
+        if (offset == MT_HIF_REMAP_L1 || offset == MT7925_HIF_REMAP_L1) && !self.refuse_selector {
             self.selector = value;
         }
     }
@@ -83,6 +83,48 @@ fn mt76_ownership_access_uses_fixed_window_without_l1() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921",
     mt76_ownership_access_uses_fixed_window_without_l1
+);
+
+/// MT7925 L1 golden: the probe's `MT_HW_CHIPID` read programs the
+/// 7925 selector (`0x155024`, page in the HIGH half) and lands the
+/// slab at `0x130000` — not the CONNAC2 selector/window. Both 7925
+/// PCI ids behave the same. Upstream `mt7925/pci.c:141-156`
+/// (`mt7925_reg_map_l1`) at torvalds/linux 8d7fe9885c62.
+fn mt76_mt7925_l1_transaction_uses_high_half_page_and_130000_window() -> TestResult {
+    for did in [MTK_DEV_MT7925, MTK_DEV_MT7925_ALT] {
+        let mut io = Model::new();
+        // Real 7925 BAR0 is 2 MiB; the 7925 selector 0x155024 needs it.
+        io.len = 0x200000;
+        // MT_HW_CHIPID (0x70010200): page 0x7001, offset 0x0200.
+        // Initial selector 0xabcd1234: high half becomes the page,
+        // low half is preserved.
+        if registers::transaction(did, &mut io, MT_HW_CHIPID, None) != Ok(0x7922)
+            || io.selector != 0xabcd1234
+            || io.ops
+                != vec![
+                    Op::Read(0x155024),
+                    Op::Write(0x155024, 0x70011234),
+                    Op::Read(0x155024),
+                    Op::Read(0x130200),
+                    Op::Write(0x155024, 0xabcd1234),
+                    Op::Read(0x155024),
+                ]
+        {
+            return TestResult::Fail("MT7925 L1 selector, page field, or window wrong");
+        }
+    }
+    // The 7925 selector past a 1 MiB BAR fails closed with no I/O.
+    let mut io = Model::new();
+    if registers::transaction(MTK_DEV_MT7925, &mut io, MT_HW_CHIPID, None) != Err(Error::Bounds)
+        || !io.ops.is_empty()
+    {
+        return TestResult::Fail("MT7925 L1 past the mapped BAR was attempted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    mt76_mt7925_l1_transaction_uses_high_half_page_and_130000_window
 );
 
 fn mt76_invalid_register_accesses_issue_no_io() -> TestResult {
@@ -398,10 +440,12 @@ fn mt76_mt7925_plan_uses_connac3_windows() -> TestResult {
     {
         return TestResult::Fail("dropped 0x820cd000 window does not route via PP");
     }
-    // Shared windows agree on both chips.
-    for did in [MTK_DEV_MT7925, MTK_DEV_MT7922] {
+    // The identity register routes through L1 on both chips: same page
+    // (0x7001), but the window base is per-chip (0x40000 CONNAC2,
+    // 0x130000 MT7925). The ownership CSR is a fixed window on both.
+    for (did, expected) in [(MTK_DEV_MT7922, 0x40200), (MTK_DEV_MT7925, 0x130200)] {
         if registers::plan(did, MT_HW_CHIPID, len).map(|plan| (plan.offset, plan.page))
-            != Ok((0x40200, Some(0x7001)))
+            != Ok((expected, Some(0x7001)))
             || registers::plan(did, MT_CONN_ON_LPCTL, len).map(|plan| (plan.offset, plan.page))
                 != Ok((0xe0010, None))
         {

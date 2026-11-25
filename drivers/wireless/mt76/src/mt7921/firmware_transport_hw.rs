@@ -1329,8 +1329,11 @@ impl Backend for Hardware {
     }
     fn assert_reset(&mut self) -> Result<(), Error> {
         self.sequence_reset = SequenceReset::None;
-        self.update(MT_WFSYS_SW_RST_B, 1, 0)?;
-        if self.read(MT_WFSYS_SW_RST_B)? & 1 != 0 {
+        // Per-chip reset register: 0x18000140 on CONNAC2, 0x7c000140
+        // on MT7925 (upstream `mt7921/regs.h:72` vs `mt7925/regs.h:92`).
+        let rst = wfsys_sw_rst_b(self.device.id.device);
+        self.update(rst, 1, 0)?;
+        if self.read(rst)? & 1 != 0 {
             return Err(Error::Register);
         }
         self.sequence_reset = SequenceReset::Asserted;
@@ -1343,8 +1346,9 @@ impl Backend for Hardware {
         Ok(self.read(MT_CONN_ON_LPCTL)? & PCIE_LPCR_HOST_OWN_SYNC == 0)
     }
     fn release_reset(&mut self) -> Result<(), Error> {
-        self.update(MT_WFSYS_SW_RST_B, 0, 1)?;
-        if self.read(MT_WFSYS_SW_RST_B)? & 1 == 0 {
+        let rst = wfsys_sw_rst_b(self.device.id.device);
+        self.update(rst, 0, 1)?;
+        if self.read(rst)? & 1 == 0 {
             return Err(Error::Register);
         }
         self.sequence_reset = if self.sequence_reset == SequenceReset::Asserted {
@@ -1355,7 +1359,7 @@ impl Backend for Hardware {
         Ok(())
     }
     fn reset_done(&mut self) -> Result<bool, Error> {
-        let ready = self.read(MT_WFSYS_SW_RST_B)? & (1 << 4) != 0;
+        let ready = self.read(wfsys_sw_rst_b(self.device.id.device))? & (1 << 4) != 0;
         if ready && self.sequence_reset == SequenceReset::Released {
             self.sequence_reset = SequenceReset::Ready;
         }
@@ -1471,8 +1475,26 @@ impl Backend for Hardware {
         Hardware::finish_ap_timing(self, five, short_slot)
     }
     fn configure_mac(&mut self) -> Result<(), Error> {
-        self.update(0x820cd004, 0xfff8, 1536 << 3)?;
-        self.update(0x820cd000, 0, (1 << 15) | (1 << 19))?;
+        // MDP (MAC datapath) base moved on MT7925: upstream
+        // `mt7925/regs.h:9` puts MT_MDP_BASE at 0x820cc800, while
+        // CONNAC2 (`mt7921/regs.h:9`) puts it at 0x820cd000. On
+        // MT7925, 0x820cd000 is the tail of the PP window
+        // (0x820cc000 len 0x2000), not MDP — writing the CONNAC2
+        // addresses there would poke an unrelated PP register.
+        // Upstream `mt7925_mac_init` (`mt7925/init.c:82-84`) programs
+        // the same two fields at the new base, and sets DAMSDU_EN
+        // (bit 15) only — RX_HDR_TRANS_EN (bit 19) is never set by
+        // mt7925 code, so the 7925 DCR0 write drops it. The per-band
+        // loop below is already upstream-shared code
+        // (`mt792x_mac_init_band`, `mt792x_mac.c:290-317`): the same
+        // LMAC blocks exist at the same addresses on both chips.
+        let (mdp_dcr0, mdp_dcr1, mdp_dcr0_set) = if is_mt7925_did(self.device.id.device) {
+            (0x820cc800, 0x820cc804, 1 << 15)
+        } else {
+            (0x820cd000, 0x820cd004, (1 << 15) | (1 << 19))
+        };
+        self.update(mdp_dcr1, 0xfff8, 1536 << 3)?;
+        self.update(mdp_dcr0, 0, mdp_dcr0_set)?;
         for band in [0u32, 0x10000] {
             self.update(0x820e40f4 + band, 0x3f, 0x3f | (3 << 17))?;
             self.update(0x820e53c4 + band, 0, 1 << 30)?;
@@ -2049,7 +2071,10 @@ impl Transport {
                 return Err(Error::Busy);
             }
             // Highest programmed register and the L1 selector must be mapped.
-            for addr in [0xd46ff, MT_HIF_REMAP_L1] {
+            // The selector is per-chip (0xfe24c CONNAC2, 0x155024 MT7925):
+            // checking the 7921 selector would pass a 1 MiB BAR that does
+            // not cover the 7925 selector.
+            for addr in [0xd46ff, L1Remap::for_chip(device.id.device).selector] {
                 if u64::from(addr) + 4 > mmio.len {
                     return Err(Error::Bounds);
                 }

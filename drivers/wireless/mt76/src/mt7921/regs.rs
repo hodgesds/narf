@@ -414,6 +414,79 @@ pub const MT_HIF_REMAP_BASE_L1: u32 = 0x40000;
 /// `MT_WFSYS_SW_RST_B` — Wi-Fi subsystem soft-reset.
 pub const MT_WFSYS_SW_RST_B: u32 = 0x18000140;
 
+// ── MT7925 (CONNAC3) L1 remap + reset (mt7925/regs.h:80..92) ───────
+//
+// Verified against torvalds/linux 8d7fe9885c62. The 7925 values are
+// NOT the 7921 values shifted: the selector is a literal `0x155024`
+// (not `MT_INFRA(0x24c)` — 7925's `MT_INFRA_CFG_BASE` is `0xd1000`,
+// so that would be `0xd124c`), the page field sits in the HIGH half
+// of the selector (`GENMASK(31, 16)`, where 7921 uses the low half),
+// and the remapped slab lands at `0x130000`, not `0x40000`.
+// `MT_HIF_REMAP_L1_OFFSET` (`GENMASK(15, 0)`) is the same on both
+// chips, so the window offset is `base + (addr & 0xffff)` either way.
+
+/// `MT_HIF_REMAP_L1` on MT7925 — upstream `mt7925/regs.h:83`.
+pub const MT7925_HIF_REMAP_L1: u32 = 0x155024;
+/// `MT_HIF_REMAP_L1_MASK` on MT7925 — `GENMASK(31, 16)`.
+pub const MT7925_HIF_REMAP_L1_MASK: u32 = 0xFFFF_0000;
+/// `MT_HIF_REMAP_BASE_L1` on MT7925.
+pub const MT7925_HIF_REMAP_BASE_L1: u32 = 0x130000;
+/// `MT_WFSYS_SW_RST_B` on MT7925 — upstream `mt7925/regs.h:92`.
+pub const MT7925_WFSYS_SW_RST_B: u32 = 0x7c000140;
+
+/// Per-chip L1 remap geometry: selector BAR0 offset, selector field
+/// mask, and window base. Both chips take the page from the same
+/// bits of the chip address (`addr >> 16`); only where the field
+/// lands in the selector differs, so [`L1Remap::field`] shifts the
+/// page to the mask's low bit (`FIELD_PREP(mask, page)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct L1Remap {
+    /// BAR0 offset of the L1 selector register.
+    pub selector: u32,
+    /// Selector field mask holding the page (`GENMASK(15, 0)` on
+    /// CONNAC2, `GENMASK(31, 16)` on MT7925).
+    pub mask: u32,
+    /// BAR0 offset where the L1-remapped slab lands.
+    pub base: u32,
+}
+impl L1Remap {
+    /// L1 geometry for `did`: MT7925 ids select the CONNAC3 values,
+    /// every other registered id keeps the CONNAC2 values.
+    pub const fn for_chip(did: u16) -> Self {
+        if is_mt7925_did(did) {
+            Self {
+                selector: MT7925_HIF_REMAP_L1,
+                mask: MT7925_HIF_REMAP_L1_MASK,
+                base: MT7925_HIF_REMAP_BASE_L1,
+            }
+        } else {
+            Self {
+                selector: MT_HIF_REMAP_L1,
+                mask: MT_HIF_REMAP_L1_MASK,
+                base: MT_HIF_REMAP_BASE_L1,
+            }
+        }
+    }
+    /// `FIELD_PREP(mask, page)`: the page value placed in the
+    /// selector field, preserving the unrelated selector bits
+    /// outside the mask when ORed in by the caller.
+    pub const fn field(&self, page: u16) -> u32 {
+        (page as u32) << self.mask.trailing_zeros()
+    }
+}
+
+/// WFSYS soft-reset chip address for `did`: MT7925 ids select the
+/// CONNAC3 address, every other registered id keeps the CONNAC2 one.
+/// Both addresses route through the per-chip L1/fixed map in
+/// `registers::plan`, so callers pass the chip address unchanged.
+pub const fn wfsys_sw_rst_b(did: u16) -> u32 {
+    if is_mt7925_did(did) {
+        MT7925_WFSYS_SW_RST_B
+    } else {
+        MT_WFSYS_SW_RST_B
+    }
+}
+
 // ── Extra MCU command opcodes (mt76_connac_mcu.h:1215..L1313) ──────
 
 /// `MCU_EXT_CMD_PM_STATE_CTRL`.

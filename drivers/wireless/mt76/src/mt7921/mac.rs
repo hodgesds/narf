@@ -67,6 +67,11 @@ impl super::mac_power::Io for ProbePower<'_> {
             );
         }
     }
+    fn sw_rst_b(&self) -> u32 {
+        // Per-chip reset register: 0x18000140 on CONNAC2, 0x7c000140
+        // on MT7925 (upstream `mt7921/regs.h:72` vs `mt7925/regs.h:92`).
+        wfsys_sw_rst_b(self.did)
+    }
     fn read(&mut self, address: u32) -> Result<u32, PowerError> {
         // SAFETY: the enclosing probe owns the mapped BAR and L1 selector.
         unsafe { registers::read32(self.did, self.mmio, address) }
