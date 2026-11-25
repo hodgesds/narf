@@ -572,7 +572,7 @@ fn smoke_usbfs_control() -> TestResult {
         fx.pipe.0.lock().control_stall = true;
         if !matches!(
             control(&fx, 0x80, 0x06, 0x0100, 0, 18),
-            Err(FsError::BrokenPipe)
+            Err(FsError::Stalled)
         ) {
             return Err("a stalled request is EPIPE");
         }

@@ -169,7 +169,8 @@ fn fs_error(errno: i32) -> FsError {
         EISDIR => FsError::IsADirectory,
         EINVAL => FsError::InvalidData,
         ENOTTY => FsError::NotATty,
-        32 => FsError::BrokenPipe,
+        // A STALL: EPIPE without the SIGPIPE a pipe write raises.
+        32 => FsError::Stalled,
         ENOSYS => FsError::NotImplemented,
         ENODATA => FsError::NoData,
         71 => FsError::Protocol,
