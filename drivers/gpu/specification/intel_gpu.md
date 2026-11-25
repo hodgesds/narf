@@ -1589,10 +1589,9 @@ publication after resume reloads the retained container before release. Any
 acquisition, validation or verification failure keeps Init held: DC0, wells up.
 
 Not done here: PW_1, PW_A and AUX wells stay enabled by the modeset and are
-never released (only DC_off is reference-counted). The pinned tree powers
-display-14 AUX wells through `XELPDP_DP_AUX_CH_CTL` bit 19 (status bit 18); the
-existing modeset's `PWR_WELL_CTL_AUX2` request is a divergence left to the AUX
-owner. Suspend does not run display-core uninit (DBUF, CDCLK, PW_1 or the
+never released (only DC_off is reference-counted). Display-14 AUX wells are
+powered, as in the pinned tree, through the per-channel `XELPDP_DP_AUX_CH_CTL`
+request bit 19 (status bit 18; `intel_gpu_xelpg_tc::aux_power_enable`). Suspend does not run display-core uninit (DBUF, CDCLK, PW_1 or the
 `HOLD_PHY` latches) or DC9. DC3CO, flip queues, pipe DMC event
 reconfiguration and display-stepping selection are not implemented. PCI runtime autosuspend with a
 lit panel stays refused, as Linux's display wakeref keeps the function in D0;
@@ -4929,8 +4928,8 @@ Refused and remaining work:
   subsection, PSR2 selective update by "Display-14 PSR2 selective update and
   frame damage".
 - **Other remaining display power work:** per-well reference counts beyond
-  DC_off, the xelpdp AUX power-request mechanism, display-core uninit and DC9
-  at suspend, DC3CO, and display stepping. Pipe DMC programs are loaded and
+  DC_off, display-core uninit and DC9 at suspend, DC3CO, and display
+  stepping. Pipe DMC programs are loaded and
   enabled with their pipes (§12.1).
 
 Twenty-eight native fixtures cover this slice. In `drivers/gpu/intel_gpu_dmc`
